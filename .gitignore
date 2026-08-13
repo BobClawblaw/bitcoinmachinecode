@@ -73,3 +73,7 @@ asm/daemon/check_chain
 asm/daemon/dumpblock
 asm/tests/serve_test
 asm/tests/test_idx
+asm/tests/test_idx
+asm/tests/test_serve
+asm/bitcoin_idx.o
+asm/bitcoin_serve.o
