@@ -1,5 +1,17 @@
 # Bitcoin Machine Code
 
+> ## ⚠️ WARNING — UNTRUSTED, EXPERIMENTAL CODE
+>
+> **This is actively developed, highly experimental software.** It implements
+> Bitcoin node functionality as hand-rolled x86-64 assembly produced by an AI. It
+> has NOT been audited by any independent third party. **You should treat this
+> code as untrusted and dangerous.** A bug in consensus, cryptographic, or
+> networking logic can cause loss of funds, chain divergence, resource
+> exhaustion, or exposure of your machine to the network. Do **not** run it with
+> real funds, on a production machine, or on an internet-exposed host, and do
+> not rely on it for any security-sensitive purpose — until it has undergone an
+> independent security audit. Use at your own risk.
+
 A Bitcoin node for Linux built as **100% AI-generated machine code** — every line of
 assembly is authored by an AI assistant, none by a human. The security-critical
 crypto (SHA-256, secp256k1 field/point/scalar/ECDSA) is written directly in x86-64
@@ -168,6 +180,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_cons.asm       # full-block consensus check (cons_verify)
 |   +-- bitcoin_cli.asm        # S6 CLI: query the store (cli_main)
 |   +-- bitcoin_addrmgr.asm    # persisted peer address book + addr v1 codecs
+|   +-- bitcoin_idx.asm        # O(1) block hash->height index for serving (idx_*)
 |   +-- build.sh              # assemble + build + run every verification harness
 |   +-- Makefile              # make asm | test | clean
 |   +-- tests/                # C harnesses proving the machine code correct

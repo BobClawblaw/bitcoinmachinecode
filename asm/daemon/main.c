@@ -59,51 +59,31 @@ extern int  hst_get_at(void* hst, unsigned long long height, void* out);
 static unsigned char store_buf[4096];
 
 /* ---- block hash -> height index (for O(1) getdata/by-hash serving). ----
- * Built once at serve startup from index.dat (skipping zero-holes); lets us
- * serve a requested block by hash without a linear scan of every height (which
- * is unusable for a ~1M-block archive). Open-addressing table. */
+ * The table itself is 100% assembly (asm/bitcoin_idx.asm: idx_init/idx_put/
+ * idx_get/idx_count, an open-addressing hash table with full 32-byte keys).
+ * The build loop here is thin file orchestration over index.dat. This lets us
+ * serve a requested block by hash in O(1) instead of a linear height scan. */
 #define HT_SLOTS (8u<<20)
-static long  ht_ht[HT_SLOTS];          /* -1 = empty */
-static unsigned int ht_key[HT_SLOTS];  /* first 4 bytes of the hash */
-static long  ht_height[HT_SLOTS];
-static long ht_n=0;
-static unsigned ht_idx(const unsigned char* h){
-    /* FNV-ish from first 8 bytes */
-    unsigned v=2166136261u;
-    for(int i=0;i<8;i++){ v^=h[i]; v*=16777619u; }
-    return v & (HT_SLOTS-1);
-}
-static int ht_put(const unsigned char* h, long height){
-    unsigned i=ht_idx(h);
-    while(ht_ht[i]!=-1){
-        if(ht_key[i]==(h[0]|h[1]<<8|h[2]<<16|h[3]<<24) && ht_ht[i]==*(long*)(void*)h) return 0; /* dup */
-        i=(i+1)&(HT_SLOTS-1);
-    }
-    ht_ht[i]=*(long*)(void*)h; memcpy(&ht_key[i],h,4); ht_height[i]=height; ht_n++;
-    return 1;
-}
-static long ht_get(const unsigned char* h, long* height){
-    unsigned i=ht_idx(h);
-    while(ht_ht[i]!=-1){
-        if(ht_key[i]==(h[0]|h[1]<<8|h[2]<<16|h[3]<<24) && ht_ht[i]==*(long*)(void*)h){ *height=ht_height[i]; return 1; }
-        i=(i+1)&(HT_SLOTS-1);
-    }
-    return 0;
-}
+static unsigned char* ht_idx;            /* 24 + HT_SLOTS*48 bytes */
+extern void idx_init(void* idx, unsigned long slots);
+extern int  idx_put(void* idx, const unsigned char hash[32], long height);
+extern int  idx_get(void* idx, const unsigned char hash[32], long* height);
+extern long idx_count(void* idx);
 static int build_hash_index(void){
-    for(unsigned i=0;i<HT_SLOTS;i++) ht_ht[i]=-1;
-    ht_n=0;
+    ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);   /* last slot may need a full --- actually over-allocate */
+    if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
+    idx_init(ht_idx, HT_SLOTS);
     FILE* f=fopen("index.dat","rb"); if(!f){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
     fseek(f,0,SEEK_END); long n=ftell(f)/48; fseek(f,0,SEEK_SET);
-    unsigned char rec[48]; long cur=0;
+    unsigned char rec[48];
     for(long h=0;h<n;h++){
         if(fread(rec,1,48,f)!=48) break;
         if(rec[0]==0&&rec[1]==0&&rec[2]==0&&rec[3]==0) continue; /* hole */
-        ht_put(rec,h); cur++;
+        idx_put(ht_idx,rec,h);
         if(h%100000==0){ fprintf(stderr,"[hashidx] %ld/%ld\n",h,n); }
     }
     fclose(f);
-    fprintf(stderr,"[hashidx] indexed %ld stored heights\n", ht_n);
+    fprintf(stderr,"[hashidx] indexed %ld stored heights\n", (long)idx_count(ht_idx));
     return 0;
 }
 
@@ -250,7 +230,7 @@ static int serve_loop(int fd, int lfd){
                         if(type!=2 || off+32>=plen) continue;
                         long gl=-1;
                         long fh;
-                        if(ht_get(pl+off+4, &fh)){
+                        if(idx_get(ht_idx, pl+off+4, &fh)){
                             static unsigned char sb[8<<20];
                             long L = node_serve_block(store_buf, fh, sb, sizeof sb);
                             if(L>0){ gl=L; memcpy(out,sb,(size_t)L); }
@@ -267,7 +247,7 @@ static int serve_loop(int fd, int lfd){
             int from=-1;
             if(plen>=5){ int tip = *(int*)(store_buf+24);
                 long fh;
-                if(ht_get(pl+5,&fh)){ from=(int)fh+1; }
+                if(idx_get(ht_idx, pl+5,&fh)){ from=(int)fh+1; }
                 if(from<0 && tip>0) from=0;   /* unknown locator: from genesis */
             }
             if(from>=0){ int tip=*(int*)(store_buf+24); unsigned char hp[2000*81+4]; int p=1;
@@ -292,7 +272,7 @@ static int serve_loop(int fd, int lfd){
                     unsigned int type=pl[off]|pl[off+1]<<8|pl[off+2]<<16|pl[off+3]<<24;
                     if(type==2 && off+32<plen){
                         /* duplicate check via O(1) hash index */
-                        long fh; int have = ht_get(pl+off+4, &fh)?1:0;
+                        long fh; int have = idx_get(ht_idx, pl+off+4, &fh)?1:0;
                         if(!have){
                             /* build real getdata payload with the hash */
                             static unsigned char gd[37]; gd[0]=1; gd[1]=2; gd[2]=0; gd[3]=0; gd[4]=0;

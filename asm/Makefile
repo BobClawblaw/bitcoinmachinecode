@@ -14,7 +14,7 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoin_headers.o bitcoin_addrmgr.o
+OBJS := sha256.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o
 
 # bitcoin_hash.asm (sha256d/block-hash/merkle/pow) depends on sha256.o
 HASHOBJS := sha256.o bitcoin_hash.o
@@ -146,13 +146,18 @@ ADMRGOBJS := bitcoin_addrmgr.o
 tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_addrmgr.c $(ADMRGOBJS)
 
+# bitcoin_idx.asm: O(1) hash->height index for serving (standalone deps).
+IDXOBJS := bitcoin_idx.o
+tests/test_idx: tests/test_idx.c $(IDXOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_idx.c $(IDXOBJS)
+
 # bitcoin_store.asm shared-append: concurrent-safe single-store write (standalone).
 tests/test_shared: tests/test_shared.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2
+test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx
 	./tests/test_sha256
 	./tests/test_fe
 	./tests/test_point
@@ -180,6 +185,7 @@ test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/tes
 	./tests/test_addrmgr
 	./tests/test_shared
 	./tests/test_shared2
+	./tests/test_idx
 
 clean:
 	rm -f $(OBJS) bitcoind.o tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2
