@@ -69,3 +69,4 @@ asm/tests/test_addrmgr
 asm/daemon/chainctl
 asm/tests/test_shared
 asm/tests/test_shared2
+asm/daemon/check_chain

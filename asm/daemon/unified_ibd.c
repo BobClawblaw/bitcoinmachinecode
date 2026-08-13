@@ -1,20 +1,22 @@
-/* daemon/unified_ibd.c -- full-chain download into a SINGLE unified store.
+/* daemon/unified_ibd.c -- full-chain download into ONE directory (no worker dirs).
  *
- * Addresses the "w0..w7 shard-dir clutter" concern: the durable archive is ONE
- * store at <dir>/blk00000.dat.. + index.dat, and NO w<w>/ shard dirs are ever
- * left behind. Parallelism is preserved for the network download; the write(s)
- * into the unified store are sequential (correct for a height-ordered archive).
+ * The durable archive is a SINGLE store at <dir>/blk00000.dat.. + index.dat +
+ * headers.dat; NO w<w>/ shard dirs ever exist. Parallelism is preserved for the
+ * download; writes into the one store are concurrent-safe.
  *
- * Flow (all block loop + append in ASM):
- *   1. Connect >=8 DISTINCT peers (claim table) + persist the whole header
- *      chain into <dir>/headers.dat via asm node_ibd_headers.
- *   2. Split [start_h, end_h] into 8 disjoint ranges; each worker runs the asm
- *      node_ibd_blocks_x loop into a TRANSIENT scratch dir /tmp/<run>_w<w>
- *      (used only for the download, rolled blk files inside).
- *   3. A single sequential merge re-appends every worker shard into <dir> via
- *      the asm store_append in real-height order (continuing from the store's
- *      existing tip +1 -- so it resumes into the same unified archive).
- *   4. Delete the transient scratch dirs.
+ * Flow (download+write loops in ASM):
+ *   1. Header phase: persist the whole chain into <dir>/headers.dat.
+ *   2. Rank a verified trusted pool of >=nw DISTINCT up peers.
+ *   3. Split [start_h,end_h] into nw disjoint ranges; each worker downloads its
+ *      shard via node_ibd_blocks_s and writes EVERY block DIRECTLY into <dir>
+ *      through store_append_shared (flock-serialized on append.lock; block at the
+ *      true file end of rolling blkNNNNN.dat; 48-byte index record positionally at
+ *      height*48; index.dat pre-sized to end_h+1). No worker block dirs.
+ *   4. Each worker keeps a PRIVATE /tmp header file (hst state never collides).
+ *      Peers are distinct (flock peerclaims).
+ *
+ * Resumable: a rerun reads the existing tip from index.dat, then worker shards
+ * only cover the zero/missing heights after it; index pre-size grows to end_h.
  *
  * Usage: unified_ibd <dir> <num_workers> <start_h> <end_h>
  *   peers auto-load from good_internet_peers.txt; header peer = local node.
@@ -224,6 +226,20 @@ int main(int argc,char**argv){
     }
     if(nhdr<=0){ fprintf(stderr,"header failed\n"); return 1; }
     if(end_h>nhdr-1) end_h=nhdr-1;
+    /* ---- RESUME: detect the existing store tip (highest non-zero index
+     * record) so a rerun continues from it instead of re-downloading. ---- */
+    {
+        char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
+        FILE* ix=fopen(ip,"rb");
+        if(ix){ fseek(ix,0,SEEK_END); long sz=ftell(ix)/48; fclose(ix);
+            /* scan for highest non-zero record */
+            long mh=-1; FILE* ix2=fopen(ip,"rb"); static unsigned char rec[48];
+            /* index may be large; scan backward from top */
+            if(ix2){ long h=sz-1; while(h>=0){ if(fseek(ix2,h*48,SEEK_SET)==0 && fread(rec,1,48,ix2)==48 && (rec[0]||rec[1]||rec[2]||rec[3])){ mh=h; break; } h--; } fclose(ix2); }
+            if(mh>=0 && mh+1>start_h){ start_h=mh+1; printf("resume: existing tip %ld, continuing from %ld\n", mh, start_h); }
+        }
+    }
+    if(start_h>end_h){ printf("archive already complete through %ld; nothing to do\n", end_h); return 0; }
     long span=end_h-start_h+1;
     printf("downloading heights [%ld,%ld] (%ld blocks), %d workers\n", start_h,end_h,span,nw);
 

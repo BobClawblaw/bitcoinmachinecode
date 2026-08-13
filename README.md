@@ -102,18 +102,21 @@ now real too: a new asm `node_accept_handshake` answers a genuine inbound node's
 `version` and serves stored blocks (verified end to end), where the old serve
 path reused the outbound handshake and hung on an inbound peer.
 
-**Full-chain download as a unified single store (>= 8 DISTINCT peers, no shard
-dirs):** `daemon/unified_ibd.c` downloads the whole chain in parallel — the asm
-`node_ibd_headers` persists the header chain, then `node_ibd_blocks_x` runs per
-worker to download / `cons_verify` / store each block entirely in assembly. A
-single-writer `store_append` consolidates every block into **one** archive
-(`blk00000.dat`..`blkNNNNN.dat` + `index.dat`, rolling at 128 MiB like Bitcoin
-Core) in real-height order, and removes the transient download scratch — no
-`w0..w7` shard dirs ever persist. Resumable: rerunning continues from the store
-tip. Peer distinctness is guaranteed across the whole run via a flock-locked
-`peerclaims` table, so no two workers ever use the same peer (verified 8/8
-distinct over an entire 2000-block run). Real-mainnet header-continuity bug
-found and fixed (see LOG #12).
+**Full-chain download into ONE directory (>= 8 DISTINCT peers, NO worker dirs):**
+`daemon/unified_ibd.c` downloads the whole chain in parallel — the asm
+`node_ibd_headers` persists the header chain, then each worker runs
+`node_ibd_blocks_s` (asm) to download / `cons_verify` / validate per block. Every
+block is written **directly into the single archive** in `data/` via the
+concurrent-safe asm `store_append_shared`: each append is flock-serialized on
+`append.lock`, the block lands at the true file end of the rolling
+`blkNNNNN.dat`, and the index record goes positionally at `height*48` (index.dat
+pre-sized). No per-worker block directories exist — the archive is one
+directory holding only `blk00000.dat`..`blkNNNNN.dat`, `index.dat`, `headers.dat`.
+Workers each keep a private `/tmp` header-store file (never touching
+`data/headers.dat`), which fixed a deterministic worker-boundary corruption bug.
+Peer distinctness is guaranteed across the whole run via a flock-locked
+`peerclaims` table (no two workers on the same peer). Real-mainnet
+header-continuity bug found and fixed (see LOG #12).
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
