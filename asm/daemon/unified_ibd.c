@@ -227,24 +227,30 @@ int main(int argc,char**argv){
     if(nhdr<=0){ fprintf(stderr,"header failed\n"); return 1; }
     if(end_h>nhdr-1) end_h=nhdr-1;
     /* ---- RESUME: detect the existing store tip (highest non-zero index
-     * record) so a rerun continues from it instead of re-downloading. ---- */
+     * record) so a rerun continues from it instead of re-downloading.
+     * BACKFILL: if the requested range lies entirely BELOW the current tip
+     * (a catch-up pass for early heights), keep the requested [start,end] and
+     * do NOT jump forward to the tip, and do NOT shrink the index. ---- */
+    long existing_tip=-1; long idx_records=0;
     {
         char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
         FILE* ix=fopen(ip,"rb");
-        if(ix){ fseek(ix,0,SEEK_END); long sz=ftell(ix)/48; fclose(ix);
-            /* scan for highest non-zero record */
+        if(ix){ fseek(ix,0,SEEK_END); idx_records=ftell(ix)/48; fclose(ix);
             long mh=-1; FILE* ix2=fopen(ip,"rb"); static unsigned char rec[48];
-            /* index may be large; scan backward from top */
-            if(ix2){ long h=sz-1; while(h>=0){ if(fseek(ix2,h*48,SEEK_SET)==0 && fread(rec,1,48,ix2)==48 && (rec[0]||rec[1]||rec[2]||rec[3])){ mh=h; break; } h--; } fclose(ix2); }
-            if(mh>=0 && mh+1>start_h){ start_h=mh+1; printf("resume: existing tip %ld, continuing from %ld\n", mh, start_h); }
+            if(ix2){ long h=idx_records-1; while(h>=0){ if(fseek(ix2,h*48,SEEK_SET)==0 && fread(rec,1,48,ix2)==48 && (rec[0]||rec[1]||rec[2]||rec[3])){ mh=h; break; } h--; } fclose(ix2); }
+            existing_tip=mh;
+            if(mh>=0 && mh+1>start_h && !(end_h < mh)){ start_h=mh+1; printf("resume: existing tip %ld, continuing from %ld\n", mh, start_h); }
+            else if(end_h < mh){ printf("backfill: range [%ld,%ld] is below existing tip %ld; preserving requested range\n", start_h,end_h,mh); }
         }
     }
     if(start_h>end_h){ printf("archive already complete through %ld; nothing to do\n", end_h); return 0; }
     long span=end_h-start_h+1;
     printf("downloading heights [%ld,%ld] (%ld blocks), %d workers\n", start_h,end_h,span,nw);
 
-    /* claimpath */
-    snprintf(claimpath,sizeof claimpath,"%s/peerclaims",dir); remove(claimpath);
+    /* claimpath: per-process (PID) so a concurrent forward chainctl and a
+     * backfill pass each own a distinct claim table (never clobber each other's
+     * distinct-peer bookkeeping while both write the same store). */
+    snprintf(claimpath,sizeof claimpath,"%s/peerclaims.%ld",dir,(long)getpid()); remove(claimpath);
 
     /* establish a ROBUST trusted pool of confirmed-up DISTINCT peers.
      * Probe the full list in parallel (a forked child per peer, bounded time),
@@ -296,6 +302,9 @@ int main(int argc,char**argv){
         int ix=open(ip,O_RDWR|O_CREAT,0644);
         if(ix<0){ perror("open index.dat"); return 1; }
         long need=((long)end_h+1)*48;
+        /* GROW-ONLY: never shrink the index (a backfill pass covers low heights
+         * while the forward archive already occupies higher slots). */
+        if(need < idx_records*48) need=idx_records*48;
         if(ftruncate(ix,need)){ perror("ftruncate index.dat"); return 1; }
         close(ix);
         char lp[640]; snprintf(lp,sizeof lp,"%s/append.lock",dir);
