@@ -142,4 +142,116 @@ p2p_headers_count:
     pop  rbp
     ret
 
+; ============================================================================
+; p2p_inv_count(payload, plen) -> # inventory entries (CompactSize), or -1.
+;   inv payload = [count varint][per item 36B = type u32 LE + hash32].
+;   Validates that plen holds count*36 + varintlen.
+; ============================================================================
+global p2p_inv_count
+p2p_inv_count:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    mov  r12, rsi                ; plen
+    cmp  rsi, 1
+    jb   .err
+    mov  al, [rdi]               ; first varint byte
+    mov  r8, 1
+    xor  ecx, ecx
+    movzx ecx, al
+    cmp  al, 0xfd
+    jb   .chk
+    cmp  al, 0xfe
+    je   .err                    ; 0xfe/0xff (u32/u64) not used for inv
+    cmp  al, 0xfd
+    jne  .err
+    cmp  rsi, 3
+    jb   .err
+    movzx ecx, word [rdi+1]      ; count (LE u16)
+    mov  r8, 3
+.chk:
+    mov  rax, rcx
+    imul rax, 36
+    add  rax, r8
+    cmp  rax, r12
+    ja   .err
+    mov  rax, rcx
+    jmp  .ret
+.err:
+    mov  rax, -1
+.ret:
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; p2p_inv_get(payload, i, out_type, out_hash32) -> 1 ok / 0 (i out of range).
+;   Returns the i-th inventory item's wire type (u32 LE) and 32-byte hash.
+;   Assumes count validated by p2p_inv_count (varint is 1 or 3 bytes).
+; ============================================================================
+global p2p_inv_get
+p2p_inv_get:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  r12, rdi                ; payload
+    mov  r13, rsi                ; i
+    mov  r14, rdx                ; out_type*
+    mov  r15, rcx                ; out_hash*
+    ; parse the count varint and bounds-check i < count
+    mov  al, [r12]
+    xor  r10, r10
+    mov  r8, 1                   ; varint len (default 1)
+    mov  r10b, al
+    movzx r10, r10b              ; count (1-byte path)
+    cmp  al, 0xfd
+    jb   .cok
+    cmp  al, 0xfe
+    je   .err                    ; 0xfe not used for inv
+    ; 0xfd u16
+    mov  r8, 3
+    movzx r10, word [r12+1]
+.cok:
+    ; if i >= count -> out of range
+    cmp  r13, r10
+    jae  .err
+    ; item offset = varintlen + i*36
+    mov  rax, r13
+    imul rax, 36
+    add  rax, r8
+    add  rax, r12                 ; &type
+    ; type u32 LE
+    mov  edx, [rax]
+    mov  [r14], edx
+    ; hash at +4
+    lea  rdx, [rax+4]
+    ; copy 32 bytes hash -> out_hash
+    xor  ecx, ecx
+.hloop:
+    cmp  rcx, 32
+    jae  .hdone
+    mov  r9b, byte [rdx+rcx]
+    mov  byte [r15+rcx], r9b
+    inc  rcx
+    jmp  .hloop
+.hdone:
+    mov  eax, 1
+    jmp  .ret
+.err:
+    xor  eax, eax
+.ret:
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -156,13 +156,18 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_s
 tests/test_serve: tests/test_serve.c $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVEOBJS)
 
+# bitcoin_p2p.asm inv parsers (incoming protocol codecs).
+P2PINVOBS := bitcoin_p2p.o bitcoin_net.o bitcoin_hash.o sha256.o
+tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
+	$(CC) -no-pie -O0 -o $@ tests/test_p2p_inv.c $(P2PINVOBS)
+
 # bitcoin_store.asm shared-append: concurrent-safe single-store write (standalone).
 tests/test_shared: tests/test_shared.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve
+test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv
 	./tests/test_sha256
 	./tests/test_fe
 	./tests/test_point
@@ -192,6 +197,7 @@ test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/tes
 	./tests/test_shared2
 	./tests/test_idx
 	./tests/test_serve
+	./tests/test_p2p_inv
 
 clean:
 	rm -f $(OBJS) bitcoind.o tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2
