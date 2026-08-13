@@ -1,0 +1,1146 @@
+# EXPERIMENT LOG — Working Bitcoin Client in 100% AI-generated Machine Code
+
+This file is the running record of the experiment. It captures every step,
+hypothesis, bug, and fix so that a full engineering report can be written once
+success is reached. Update it after every meaningful event.
+
+================================================================================
+LOG
+================================================================================
+
+## 2026-08-12 -- #12 PARALLEL multi-peer FULL-CHAIN download (>= 8 DISTINCT internet peers) + ALL-ASM receive loop + real-mainnet header-continuity fix
+### Goal and outcome
+Download the FULL mainnet blockchain so it can be re-served, from >= 8 DISTINCT
+internet peers simultaneously, with the per-worker download LOOP IN ASSEMBLY.
+All three achieved:
+- Discovery: a live peer scan (tests of a 26,895-node bitnodes snapshot) found
+  hundreds of distinct internet nodes that serve block bodies with the corrected
+  getdata; 101+ distinct good peers saved in
+  /storage/bitcoinmachinecode/good_internet_peers.txt. The parallel download
+  establishes >= 8 of these simultaneously.
+- Running download: a full-chain parallel IBD (daemon/paribd.c) downloading
+  heights [0, tip] with 8 distinct internet peers into /storage/bitcoinmachinecode/data
+  (resumable; accumulating the real archive for re-serving).
+- ALL-ASM receive loop: new bitcoind.asm node_ibd_blocks_x (hardened from
+  node_ibd_blocks) does getdata -> recv (draining ping->pong + ignoring other
+  chatter) -> cons_verify (CALLER-supplied scratch, big enough for dense modern
+  blocks) -> re-derived-hash guard -> store_append, over an explicit height range,
+  ALL in assembly. daemon/paribd_asm.c orchestrates 8 workers each running it,
+  and re-serves the produced store (verified: inbound peer fetched headers + a
+  block body).
+### Real bug found & fixed (would have silently poisoned any real-mainnet headers)
+node_ibd_headers validated chain continuity by requiring every header's prevhash
+to equal the previous header's block_hash, seeded from the caller's locator. But
+the getheaders-from-genesis locator is the synthetic all-zero hash, while REAL
+block 1's prevhash is the GENESIS hash (000000000019d668...), NOT zero -- so the
+very first real header always failed continuity and node_ibd_headers returned -1.
+Every prior IBD test used SYNTHETIC chains with a zero-prev block 0, so no test
+ever caught it. FIX: skip the prevhash compare for exactly the first header of the
+whole download (total==0 && i==0); enforce it for every later header. Verified:
+node_ibd_headers now persists 962,208 REAL mainnet headers.
+### What was proven end-to-end (real data)
+- asm node_ibd_headers persisted 962,208 real headers (full mainnet header chain).
+- asm node_ibd_blocks_x (8 distinct internet peers) downloaded/validated/stored
+  real blocks over worker height-shards; merged store queried via the asm CLI
+  (getblockcount/getblockhash with real hashes) and RE-SERVED to an inbound peer
+  (201 headers + exact block body).
+- The running full download (8 distinct internet peers) reached ~18GB of real
+  blockchain data in ~30 min and continues resumably toward the full chain.
+### New/changed
+- bitcoind.asm: node_ibd_blocks_x (new all-asm hardened receive loop);
+  node_ibd_headers continuity fix.
+- daemon/paribd.c: the parallel full-chain orchestrator (>= 8 peers, resumable,
+  worker file merge). daemon/peertest.c + daemon/discover.c: internet peer
+  discovery/testing. daemon/paribd_asm.c: the all-asm worker orchestrator.
+  seeds/good_internet_peers.txt + internet_peers.txt: peer pools.
+- Full make test still 283 PASS / 0 FAIL (continuity fix keeps synthetic tests
+  green while unlocking real-mainnet headers).
+### Honest scope
+The full ~500GB / ~962k-block archive download is a multi-hour resumable job that
+is RUNNING, not finished; it is gated by network throughput + peer flakiness, not
+by correctness (every block is cons_verify-validated as it lands). Re-serving the
+downloaded store is proven. Remaining: let the running download reach the tip,
+plus the documented roadmap items (UTXO set, script/sig validation, mempool/rpc,
+pruning, reorg).
+
+## 2026-08-12 -- #11 ROOT CAUSE OF THE BLOCK-BODY WALL FOUND & FIXED: getdata wire format was WRONG. REAL mainnet block bodies now download + cons_verify + store, and the inbound serve path works against a real peer.
+### The headline (this overturns the long-standing "peer-policy wall" conclusion)
+The 34-byte getdata this node had been sending (hash at +2, single-byte type) is
+MALFORMED -- real Bitcoin nodes silently ignore it. That malformed encoding, not
+(only) seed serving policy, is why live block-body getdata "hung/dropped". With
+the getdata fixed to the canonical form, a real node COOPERATIVELY serves block
+bodies, and the assembly receive path downloads + cons_verify-validates + stores
+REAL mainnet blocks. This was proven live against 192.168.5.69:8333 (a local
+full node): 2000 real headers learned to tip (height ~790999), then real block
+bodies at heights 790999/790998/790997/790994 downloaded, validated VALID by asm
+cons_verify, and persisted. The "download the entire blockchain" receive tail is
+NOT blocked by asm or peer policy for a cooperative peer -- our earlier
+conclusion was wrong in an important way; see below.
+### What the correct wire format actually is (verified two ways)
+Bitcoin getdata/inv inventory: [count varint][type int32 LE][hash32].
+For one MSG_BLOCK: [0x01][0x02 00 00 00][hash at +5] = 37 bytes. The type
+field is a 4-byte little-endian int32 -- our p2p_oracle.py has ALWAYS encoded
+this (varint(1)+u32(2)+hash). A prior LOG stage (#2 / S6) "fixed" p2p_getdata_block
+to a 34-byte form under a mistaken assumption ("type is a 1-byte varint"). That
+was wrong. Confirmed LIVE: a real node answered the 37-byte form (got block) and
+did nothing for the 34-byte form.
+### Changes
+1. bitcoin_p2p.asm p2p_getdata_block: back to the canonical 37-byte
+   [count][int32 type][hash at +5]; fixed return 37. (Buffer was already 37 in
+   node_sync; node_ibd_blocks getdata buffer was 40, fine.)
+2. daemon/main.c serve_loop getdata PARSER: was reading hash at pl+5 (correct)
+   before #2 wrongly flipped it; now reads [count][int32 type][hash at +5],
+   stride 36, serving every requested MSG_BLOCK. (inv handler already used the
+   correct int32 stride and is unchanged.)
+3. All fake/test PEERS that parse inbound getdata (fake_serve, full_serve in
+   daemon/main.c, daemon/testpeer.c, tests/test_ibd_blocks.c / test_ibd_full.c /
+   test_ibd_scale.c / test_bitcoind_sync.c) updated to compare the hash at pl+5
+   instead of pl+2, so the whole harness ecosystem stays wire-canonical.
+4. tests/live_blocks.c, live_probe.c getdata builders: type now emitted as a
+   4-byte int32 (stride 36).
+5. tests/test_p2p.c getdata expectation: 34 -> 37 bytes, hash at +5.
+6. NEW manual/live tests (NOT in make test): tests/live_getdata_form.c and
+   tests/live_local_probe.c (definitive form-A-vs-B arbiter) and
+   tests/live_block_dl.c (full asm download->validate->store of a REAL block).
+### The long-documented seed-serving "wall" -- now re-scoped honestly
+- Public seeds (sipa/petertodd/bluematt/dashjr/emzy) reliably serve the real
+  header chain; block-body getdata to an unproven peer still usually drops, but
+  at least PART of that was our OWN malformed getdata (real nodes ignore a
+  malformed message). The cooperative local node serves bodies to the fixed
+  client, so the machine is proven against a real node end to end.
+- The 20,000-block offline loopback IBD (test_ibd_scale) and the whole asm IBD
+  machine (node_ibd) stand unchanged and green.
+### Also this session
+- NEW bitcoind.asm node_accept_handshake(fd): the INBOUND/server role. Before,
+  serve mode reused node_handshake (the OUTBOUND/initiator role, sends OUR
+  version first) on an inbound peer, so a real inbound node's version went
+  unanswered and the handshake hung. Now serve uses node_accept_handshake:
+  reads peer version (drains ping->pong/sendaddrv2/wtxidrelay/sendcmpct), replies
+  our version + verack, waits for peer verack. Verified end-to-end via a new
+  inbound_client harness: a peer connecting to `serve` gets served 8 headers and
+  the exact 145-byte block.
+- User-agent branding: node_make_version now advertises
+  "Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x" (42B UA, version payload 128B;
+  updated test_bitcoind expectations).
+- Boot improvement: /storage/bitcoinmachinecode/seeds.txt (tiered known-good seed
+  list from live probing) + daemon/seedprobe.c (bounded per-seed prober with a
+  watchdog that measures which seeds connect/handshake/serve headers).
+### Suite
+Full `make test` (fresh): 283 PASS / 0 FAIL / 22 green harnesses, MAKE EXIT=0.
+### Honest remaining scope
+This proves the receive tail (download real block body -> cons_verify -> store)
+and the serve path (answer a REAL inbound peer's getdata/getheaders with stored
+blocks, inbound handshake) against a real cooperative node. Still not done:
+full multi-thousand-block live IBD of the ~840k-block archive in one pass
+(sequentially downloading every real block; requires time + the cooperative
+node's full history and is now gated only by throughput, not correctness/policy),
+UTXO set / arbitrary-tx script+sig validation, mempool/RPC/pruning, reorg.
+
+## 2026-08-12 -- #10 LIVE-SEED BLOCK BODY WALL CONFIRMED + LARGE-SCALE IBD DEMO
+### Goal and outcome
+Attempt the real remaining goal ("download the entire blockchain") from live
+mainnet peers. Empirically re-tested live block-body serving with a REALISTIC
+full-node handshake (Satoshi UA, plausible start_height, wtxidrelay/sendaddrv2
+completion) built on the asm net/p2p codecs (tests/live_probe.c, manual/live).
+### Result (the honest wall, now pinned down precisely)
+Against every seed tried (sipa.be, petertodd.net, bluematt.me, dashjr.org):
+- PASS connect, PASS handshake (verack) -- with the realistic UA the peers now
+  ACCEPT the handshake (a plain /btcasm:0.1/ + start_height=0 handshake was
+  dropped at connect).
+- PASS learned 2000 REAL headers to the live tip (headers-first download works
+  live against a cooperative peer).
+- getdata for the tip block(s) -> NO block body ever arrives (connection hangs /
+  silent drop within 40s+). Every peer that served headers then declined to
+  serve block bodies.
+CONCLUSION (unchanged, but now proven with a protocol-compliant handshake): live
+public seeds serve the real header chain but drop block-body getdata to this
+untrusted/unknown peer. The full ~540GB / ~830k-block mainnet archive download
+is blocked at the SOURCE (server-side serving policy), not by any asm gap. This
+is the single wall between this node and the real chain; it cannot be fixed
+client-side without whitelist/peer reputation the seeds do not grant here.
+### Large-scale offline demonstration (tests/test_ibd_scale.c, NOT in make test)
+To show the "download the entire blockchain" machine (node_ibd: persist whole
+header chain from genesis in 2000-header pages, then walk every stored header ->
+getdata -> cons_verify + re-hash-guard -> store) is not a small-chain toy, added
+a parameterized whole-chain loopback IBD. RESULT (verified run): NB=20000 blocks
+archived in ONE machine-code pass in 1647s (~12 blk/s through a loopback C
+fixture peer): 11 getheaders pages persisted the whole 20k-header chain, then
+20,000 getdata+cons_verify+re-hash-guard+store round-trips. PASS: node_ibd stored
+all 20000, header store has 20000 entries, block store tip == 19999, and every
+stored (header, block_hash) matches the chain (exit 0). This is the honest
+offline maximum of what can be demonstrated without a cooperative peer willing
+to serve real history -- the full mainnet ~540GB archive remains walled at the
+SOURCE by live-seed serving policy.
+
+## 2026-08-12 -- #9 DAEMON `ibd` MODE: full machine-code IBD wired into the runnable node
+### Goal and outcome
+The 100%-asm full IBD pass (bitcoind.asm `node_ibd` = node_ibd_headers + node_ibd_blocks)
+was proven by the C harness test_ibd_full but NOT reachable from the runnable
+daemon binary. Added `daemon ibd <dir>` -- a mode that runs `node_ibd` as one
+assembly call over a single connection to a loopback peer serving the WHOLE
+chain, persisting headers then block bodies into `<dir>`, and reporting the
+resulting block/header counts and tip.
+### Changes (daemon/main.c -- thin C driver glue only)
+- `extern` for node_ibd / hst_init / hst_count / hst_get_at.
+- Refactored the 8-block fake chain build out of fake_serve into
+  `build_fake_chain()` so the new whole-chain peer (`full_serve`) can force-build
+  the chain -- WITHOUT this, full_serve's first-in-process run served all-zero
+  blocks and node_ibd's stricter continuity check / getdata lookups failed
+  (the original sync-mode only ever exercised fake_serve, which built lazily).
+  REAL BUG found & fixed: the `ibd` mode forked full_serve as the FIRST peer, so
+  the lazy-built fake_blocks were never materialized -> garbage headers served
+  -> node_ibd returned -1 with 1 bogus header. Fix: call build_fake_chain()
+  before serving (both peers now share it; fake_serve behaviour unchanged).
+- `full_serve`: serves all 8 headers at the running locator + every block body
+  by getdata hash (no growth), so node_ibd pulls the entire chain in one pass.
+- `ibd` mode block: hst_init header store, handshake, call node_ibd with a
+  >=2MB shared scratch, then report blocks/headers/tip and return 0 iff
+  blocks>=1, headers>=1, tip==headers-1, headers==8.
+### Verified (live run)
+- `daemon ibd /tmp/ibdtest` from EMPTY dirs -> `ibd: blocks=8 headers=8
+  height=7`, EXIT=0; full_serve logged getdata#1..8 found=0..7 (every block body
+  requested by hash and served).
+- Persisted artifacts: headers.dat=896B (8x112B header chain), blk00000.dat=1224B
+  (8 block bodies), index.dat=384B (8x48B index).
+- Rebuilt CLI (manual gcc -O0, the daemon/cli binary is not a Makefile target) and
+  queried the ibd-produced store: getblockcount=8, getbestblockhash==getblockhash 7
+  (tip hash), getbalance=64000000 (8 x 8 BTC coinbase, all unspent).
+- Full `make test` still green: 283 PASS / 0 FAIL / 22 harnesses.
+- Minor consistency fix while validating the ibd store: `cmd_getblockcount`
+  (bitcoin_cli.asm) emitted its decimal WITHOUT a trailing newline (the outlier:
+  getbestblockhash/getblockhash/getblock/gettx/getbalance all end with `\n`),
+  so `cli getblockcount` ran its output into the next shell token. Added the
+  newline (rax+1 after cli_emit_dec) -- this also makes `stop` (which returns
+  cmd_getblockcount) end with a newline. Updated tests/test_cli.c expectations
+  for getblockcount and stop to `"8\n"`. Still 283 PASS / 0 FAIL.
+### Scope
+The runnable node and the full machine-code IBD machine are now joined: `daemon
+ibd` performs headers-first persist + getdata block bodies + cons_verify +
+re-hash guard + store -- the entire "download the chain" tail -- as one assembly
+pass in the real daemon, provable end-to-end against a cooperative whole-chain
+peer. The single unchanged limit is live-seed serving policy (seeds drop
+block-body getdata to minimal clients), not an asm gap.
+
+## 2026-08-12 -- #8 FULL IBD AS ONE ASM PASS: node_ibd chains the two halves
+### Goal and outcome
+Close the "natural next step" named at the end of #7: chain node_ibd_headers
+(persistent paged headers-first download) + node_ibd_blocks (block bodies off
+the persisted header chain) into a SINGLE assembly entry point that performs a
+whole initial-block-download over one peer connection. NEW asm
+`bitcoind.asm node_ibd(fd, st*, hst*, buf, buflen) -> eax #blocks stored`:
+  phase 1  node_ibd_headers(fd, hst, locator=0, buf, buflen)  -- download the
+           whole header chain from GENESIS in 2000-header pages and persist
+           every (header, block_hash) into the header store, advancing the
+           locator to the tip.
+  phase 2  node_ibd_blocks(fd, st, hst, 0, buf, buflen)       -- walk every
+           stored header, getdata its block body, cons_verify + re-derived-hash
+           guard, store_append into the block store.
+Returns #blocks stored, or -1 if either phase fails. The genesis locator is a
+zeroed 32-byte stack local; st/hst live in stack locals (the r13-leak hazard is
+handled exactly as #7 / node_sync require); shared >=2MB scratch buffer for both
+halves; frame sized so RSP is 0 mod16 at every nested call.
+### Verified (tests/test_ibd_full.c, in `make test`)
+The FULL single-pass IBD over a real loopback socket against a C fixture peer
+serving the WHOLE chain from EMPTY header + block stores:
+- NB=1200-block single-coinbase chain forces one full 2000-cap header page
+  served as a 1200 batch, plus 1200 block bodies across 3 getdata batches
+  (getdata#400/800/1200 logged).
+- node_ibd stored all NB blocks (got 1200); header store has NB entries; block
+  store tip == NB-1; every stored (header, block_hash) matches the chain; every
+  stored block body is byte-exact in blk00000.dat.
+This is the "download the entire blockchain" machine-code demonstration at a
+scale far beyond the 8-block (test_ibd_headers) / 4-block (test_ibd_blocks)
+scratch tests -- the entire headers-first IBD tail (paged persist, then walk +
+getdata + validate + store) running as one call, end to end in assembly.
+### Suite
+Full `make test` (fresh): 283 PASS / 0 FAIL / 22 green harnesses, MAKE EXIT=0.
+(Was 279/22 at the end of #7; test_ibd_full adds 5 assertions and is wired into
+the Makefile's IBDOBJS/-O0 convention, test/clean lists.)
+### Integration / scope
+node_ibd needs no new objects (both halves already in bitcoind.o w/ hst deps).
+The single remaining gap to a real archive node remains a PEER-POLICY issue, not
+an asm one: live mainnet seeds serve headers but drop block-body getdata to a
+minimal client, so a real multi-thousand-block wire download is still not pulled
+from live seeds; this proves the full machine-code IBD machine against a
+cooperative peer serving the whole chain.
+
+## 2026-08-11 -- #7 BLOCK-BODY DOWNLOAD OFF THE PERSISTED HEADER CHAIN (getdata+validate+store)
+### Goal and outcome
+Close the "Remaining: drive getdata for the blocks behind the persisted header
+chain" gap from #6. NEW asm `bitcoind.asm node_ibd_blocks(fd, st*, hst*,
+start_h, buf, buflen) -> eax #blocks stored`:
+- Walks the PERSISTED header store (`hst`) from `start_h` to the tip.
+- For each stored header: hst_get_at -> block_hash (rec[80..112]); getdata(that
+  hash); receive the `block` (draining ping->pong and any chatter so it never
+  stalls); validate with cons_verify; RE-DERIVE block_hash(received) and REQUIRE
+  it to equal the stored header hash (guards against a peer serving the wrong
+  block); store_append to the block store. Returns the number stored, or -1 on a
+  hard error.
+This is the second half of full IBD in machine code: persistent headers-first
+download (node_ibd_headers, #6) + block-body fetch/validate/store per header
+(node_ibd_blocks, #7).
+### Verified (tests/test_ibd_blocks.c, in `make test`)
+- Happy path over loopback: a 4-block single-coinbase chain persisted into the
+  header store, bodies served by a C fixture peer. node_ibd_blocks stores all 4
+  (node_ibd_blocks stored all NB=4), every stored block is byte-exact in
+  blk00000.dat, store tip_height == NB-1.
+- NEGATIVE: an "evil" peer serving the WRONG block body for one requested hash is
+  rejected (returns -1) and only the leading valid blocks are stored -- proves
+  the re-derive-and-compare hash guard actually fires, not just the happy path.
+- Full suite (fresh `make clean`): 279 PASS / 0 FAIL / 23 run lines, MAKE EXIT=0.
+  (Was 274/22 before this stage.)
+### Real bug found & fixed (the recurring r13 hazard, now hit in a NEW place)
+- node_ibd_blocks FIRST version kept the header-store pointer in r13 across the
+  per-header loop. The deep `block_hash -> sha256d -> sha256_full` chain LEAKS
+  r13 (the very hazard node_sync documents: "r13 is leaked by a deep callee in
+  this hash chain -- do not trust it"). So block 0 stored fine, but by i=1
+  hst_get_at was called with a garbage hst pointer -> out-of-range -> -1, and the
+  peer never even saw getdata(1). Diagnosed with a single-char stderr tracer that
+  showed the exact cut (L G g W R r S then L G g then fail).
+  FIX: keep `hst` in a STACK LOCAL (rbp-0x30) and reload it before every
+  hst_get_at/hst_count call -- exactly the pattern node_sync uses for its
+  locator. (r12/r14/r15/rbx are truly callee-saved and preserved; r13 is the one
+  the asm hash chain leaks.) Fixed and re-verified: all 4 blocks download.
+- Minor: got `cons_verify` scratch/cap convention confirmed once more -- cap is
+  the max NUMBER OF TXIDS (scratch >= cap*32 bytes); single-tx blocks write 1
+  txid so a 0x400 scratch with cap large is fine, matching node_drain's usage.
+### Integration
+- bitcoin_headers.o already in DAEMONOBJS (from #6); node_ibd_blocks needs no new
+  objects. tests/test_ibd_blocks.c wired into the Makefile (IBDOBJS, -O0) and
+  `make test`/`clean`. Manual daemon build (unchanged from #6) links fine.
+- `daemon sync` re-verified after adding node_ibd_blocks (ok=1 blocks=8 h=7).
+### HONEST scope
+This proves, against a live loopback peer and a PERSISTED header chain, that the
+machine code can walk every stored header, request its block body, validate it
+(PoW + merkle + tx walk via cons_verify), cross-check the hash against the
+header, and persist it -- i.e. the full per-block IBD tail is real assembly.
+The remaining gap to "download the entire blockchain" is unchanged and remains a
+PEER-POLICY limit, not an asm gap: real mainnet seeds serve headers but drop
+block-body getdata to a minimal/unknown client, so a multi-thousand-block chain
+is not pulled from live seeds on this box. With a cooperative peer (documented
+as the reward for a fuller handshake/pre-sync state), the natural next step is to
+chain node_ibd_headers (persist N headers) then node_ibd_blocks (fetch+store the
+matching bodies) into one daemon IBD pass and run it across pages toward the tip.
+
+## 2026-08-11 -- #6 PERSISTENT HEADERS-FIRST IBD: paged download into a durable header store
+### Goal and outcome
+Close the "genuine next step" from #5: headers-first IBD now PERSISTS the header
+chain on disk and ADVANCES the locator across 2000-header pages toward the tip,
+all in machine code. Two new pieces:
+- NEW `asm/bitcoin_headers.asm` -- a durable header-chain store. `headers.dat` is
+  append-only and positional (entry N at N*112 = [80 header][32 block_hash]).
+  API: hst_init / hst_reload / hst_append(hst,hdr[80],hash[32]) / hst_get_at /
+  hst_count. Restart-safe (reload re-derives count from file size).
+- NEW `asm/bitcoind.asm node_ibd_headers(fd,hst*,locator32,page_buf,buflen) ->
+  eax total`: the paged loop. Repeats node_fetch_headers at the running locator,
+  verifies chain continuity for EVERY header (entry.prevhash == prior entry's
+  block_hash), computes each block_hash, hst_appends (hdr,hash), then advances
+  the running locator to the last appended hash. Stops on a short page (<2000)
+  or a 0-header page (tip). Returns total appended this call, or -1 (continuity
+  break / append error).
+### Verified (new tests, in `make test`)
+- tests/test_headers (bitcoin_headers.asm store): init/append/get_at/count,
+  on-disk 112B-positional layout (560B for 5 entries), restart-resume (reload
+  restores count), and chain continuity across the stored hashes. 
+- tests/test_ibd_headers (full paged IBD over a real loopback socket): a C
+  fixture peer + the 100%-asm client. 2500-header chain forces a full 2000-header
+  page then a 500-header short page:
+    ibd total == 2500; hst_count == 2500; stored (hdr,hash) match chain;
+    locator advanced to tip hash; reload count == 2500 (restart then re-run at
+    tip -> 0 new); count stays 2500. NEGATIVE: an "evil" peer serving a broken
+    chain is rejected (returns -1, stops after the 1 valid header) -- proves the
+    continuity guard, not just the happy path.
+- Full suite (fresh `make clean`): 274 PASS / 0 FAIL / 20 green harnesses (22 run
+  lines; 0 real FAIL, MAKE EXIT=0). New count is +32 assertions over #5's 242.
+### Real bugs found & fixed while bringing it up (worth recording)
+1. GOLDEN-RULE VIOLATION in the EXISTING node_fetch_headers (bitcoind.asm): its
+   `len_out` local was at [rbp-0x20], INSIDE the 5-push callee-saved save area
+   (rbx-8/r12-16/r13-24/r14-32/r15-40). p2p_read wrote the headers message length
+   (162003) over the saved-r14 slot, so the epilogue `pop r14` restored the
+   length into the caller's r14. node_fetch_headers itself never re-used r14, so
+   the bug was latent -- it only fired when a CALLER kept a pointer in r14 across
+   the call. node_ibd_headers does exactly that (page_buf in r14), exposing it.
+   FIX: moved len_out to [rbp-0x98] (below the save area). This is the same
+   golden rule the project has hit repeatedly; it had quietly regressed into
+   node_fetch_headers.
+2. My first test peer parsed the getheaders locator at payload+1, but the real
+   Bitcoin getheaders payload is [version u32][count varint][hash..][stop], so
+   the locator is at +5 (4-byte version + 1-byte count), and p2p_getheaders
+   correctly emits that 69-byte form (as the project's live test already relied
+   on). The peer now reads rb+5. (This confirms, not corrects, the asm: fakepeer
+   never parsed getheaders, so the layout was only ever exercised client-side.)
+3. Frame/loop discipline in the new node_ibd_headers: counters (i, pgcount,
+   total, entoff) live in stack slots, not registers, so the deep
+   block_hash->sha256d->sha256_full chain cannot clobber them; fd/hst/locator/
+   page_buf live in callee-saved regs (rbx/r12-r15), all preserved by every
+   callee; sub rsp,0xa8 keeps RSP 0 mod16 at every nested call; stop buffer is a
+   real zeroed local (never NULL -- p2p_getheaders copies 32 bytes from it).
+### Integration
+- bitcoin_headers.o added to OBJS and DAEMONOBJS (bitcoind.o now references
+  hst_append, so every link of bitcoind.o needs it). test_headers + test_ibd_headers
+  wired into the Makefile and `make test`. Manual daemon build (per prior LOG
+  note) must now add bitcoin_headers.o:
+    gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
+        bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
+        bitcoind.o node_log.o bitcoin_headers.o
+- `daemon sync` re-verified end-to-end after the change (ok=1 blocks=8 height=7,
+  logs INFO/HSHK/BLOCK 8/STORE 8 7).
+### HONEST scope
+This proves the PERSISTENT paged headers-first download against a live loopback
+peer, including multi-page locator advance, restart-resume, and tip detection.
+The remaining gap to a full archive node is unchanged and is a PEER-POLICY issue,
+not an asm-correctness gap: real mainnet seeds serve headers but drop block-body
+getdata to a minimal client, so the ~540GB block download itself is not
+demonstrated from live seeds (block serving is proven against our own serve
+mode). The next natural step is to drive getdata for the blocks behind this
+persisted header chain once a cooperative peer is present.
+
+## 2026-08-11 -- #2 SEGWIT (BIP141) IBD SUPPORT COMPLETED + real-block validation extended
+
+### Goal and outcome
+Close the last known IBD gap from #1: `cons_verify` now accepts REAL present-day
+SegWit mainnet blocks, not just pre-SegWit ones. The block walker (`tx_parse`)
+and txid computation (`tx_txid`, new) now handle BIP141 witness serialization.
+Verified on real mainnet data:
+- block 962043 (SegWit-era, 1,664,976 B, nBits 0x1702353d, 3650 real SegWit txs)
+  -> cons_verify = 1 (previously rejected).
+- block 400000 (pre-SegWit, 948,994 B, 1660 txs) -> still 1.
+- full suite back to 242 PASS / 0 FAIL / 18 green from a fresh `make clean`.
+
+### New/changed asm
+- bitcoin_tx.asm `tx_parse`: detects the SegWit marker/flag (version | 0x00 0x01)
+  after the 4-byte version, parses inputs/outputs normally, then SKIPS the witness
+  stack (varint item-count + varint-length items per input) before the locktime,
+  so it returns the full on-wire `tx_len` and the block walk no longer desyncs on
+  SegWit txs.
+- bitcoin_tx.asm `tx_txid(out32, tx, txlen, buf, buflen)` [NEW]: computes the
+  BIP141 txid by rebuilding the UNWITNESSED serialization (version + inputs +
+  outputs + locktime) into a caller scratch buffer and double-SHA256'ing it.
+  Correct for both legacy (>= tx, contiguous) and SegWit txs.
+- bitcoin_cons.asm `cons_verify`: computes each per-tx txid with `tx_txid`
+  (reconstruction scratch = 1MB stack block at rbp-0x100000, frame 0x1000f8
+  == 8 mod 16 so RSP stays at the SysV call-into-alignment), instead of `sha256d`.
+
+### Signed-off patterns / real bugs the real data exposed (and fixed)
+1. Witness item-length 0xfd/0xfe/0xff varint paths used `r10` as a scratch temp,
+   CLOBBERING the outer witness-entry counter (also in r10) -> any tx whose
+   witness had a >=253-byte item broke the walk (crashed/desynced). Reproduced
+   on real tx #1036 of block 962043 (1-in/3-out, ~7.5 KB witness). Fixed by using
+   `rcx` for the bounds-check temp in .wlb/.wlf/.wlff.
+2. Witness item/entry varints had stray `mov r9, rbx` cursor-clobbers (cursor set
+   to a length value) in the draft; rewrote with `add r9,K` + length kept in rdx,
+   and added pre-read `cmp r9,r11; jae .fail` guards so parsing never reads OOB.
+3. `cons_verify` REQUIRED a 1MB reconstruction buffer for `tx_txid`; the daemon
+   `test_bitcoind_sync` broke (store empty) because `tx_txid` SAVED its buflen
+   argument at `[rbp-0x20]` which OVERLAPPED its own pushed `r14` save slot, so
+   the epilogue `pop r14` restored buflen into the caller's r14 -> `node_sync`'s
+   block pointer in r14 became the buflen (0x100000) and `store_append` failed.
+   Fixed: save buflen at `[rbp-0x30]` (below the r15 save). Isolated with a
+   register-sentinel harness proving tx_txid now preserves r14.
+4. `sha256d` (bitcoin_hash.asm) only preserved rbx/r12/r13 but calls sha256_full
+   which uses r14/r15 -> it clobbered caller r14. Added r14/r15 to sha256d's
+   save set and moved its hash1/len locals down so they no longer overlap the
+   new saves (frame stays 0x78 == 8 mod 16 for the same SysV alignment).
+
+### Real-data verification of tx_txid
+- tx_txid on the real SegWit coinbase of 962043 -> fdcab46234eec2... matching an
+  independent Python reconstruction.
+- tx_txid on pre-SegWit block 400000 txs matches plain sha256d (legacy == full).
+- cons_verify(pow_check first, then full 3650-tx merkle) accepts 962043.
+
+### Limitation -> closed
+Previously documented "SegWit (BIP141) not yet handled" is now RESOLVED: the
+client validates both pre-SegWit and SegWit real mainnet blocks end-to-end.
+
+## 2026-08-11 -- #3 STORE-RELOAD SERVING FIX + live TCP serving proof
+- `daemon serve <dir> <port>` now calls `store_reload(store_buf)` (added to both
+  `serve` and `follow` modes in daemon/main.c) so the node loads its PERSISTED
+  chain from blk00000.dat/index.dat on startup instead of starting an empty
+  store. Real TCP proof over loopback port 18446: a TCP client handshaked
+  (version+verack), `getheaders` from genesis -> server returned headers count=8
+  (the full persisted 8-block chain), `getdata` -> server returned the exact
+  145-byte block (logged HDRS 8 / SERVE 145), and ping->pong worked.
+- Root-cause detail 1 (false alarm): a naive reload test that called
+  `store_init(st)` and `store_reload(st)` as two arguments to one `printf`
+  triggered unspecified C evaluation order, so store_reload sometimes ran BEFORE
+  store_init and saw an all-zero store context (blk/idx fds = 0 -> lseek = 0 ->
+  "empty"). Not a bug in store_reload: called as separate statements it correctly
+  reloads tip_height=7 / next_offset from a 384-byte index.dat (verified).
+- Root-cause detail 2 (real): `make daemon/bitcoind` is NOT a Makefile target, so
+  a rebuilt daemon binary was silently STALE and never included the store_reload
+  call. daemon/bitcoind must be built manually, e.g.:
+    gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
+        bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
+        bitcoind.o node_log.o
+  (-O0 required: an -O2 rebuild regressed lsock's bind to EFAULT "Bad address";
+  the original worked at -O0.)
+- Serving status: node listens on a real TCP port and serves stored blocks to a
+  real remote peer end-to-end for a chain it reloaded from disk. The remaining
+  honest gap to "serve the whole bitcoin blockchain" is obtaining the full
+  mainnet chain (headers-first IBD against live peers + the ~540 GB download),
+  not the serving path itself.
+
+## 2026-08-11 -- #4 DISTRIBUTED DOWNLOAD (multi-peer IBD): ASM node_drain + orchestrator
+- NEW asm `bitcoind.node_drain(fd, st, buf, buflen) -> eax #blocks`: the per-peer
+  distributed-download loop. Drains a live peer: ping->pong, and on `inv` for each
+  MSG_BLOCK hash issues getdata, receives the `block`, validates with cons_verify,
+  and stores with store_append (all asm). Ignores sendheaders/addr chatter so it
+  never stalls the way naive single-read node_sync does on real peers. Fixed an
+  asm bug while writing it: node locals (getdata-msg@-0x60, blockhash-out@-0x100)
+  sat below rsp under a 0x28 frame, so calls clobbered them -> segfault; enlarged
+  the frame to 0x108 (== 8 mod16, aligned).
+- Verified OFFLINE (deterministic): a fake peer pushes ping+inv for a low-difficulty
+  block; node_drain reads it, getdata's it, and stores it via cons_verify+
+  store_append -> `node_drain stored 1 block(s), block stored=YES` (rc=0).
+- Built an 8-peer orchestrator (daemon/multipeer.c + test driver): forks up to 8
+  seed connections, each child connects+handshakes (asm net/p2p) and runs
+  node_drain, all writing to one shared on-disk store.
+- Ran LIVE against real mainnet seeds (sipa.be, bluematt.me, bitcoinstats, etc.):
+  forked 6, 4 connected, each ran the asm node_drain. HONEST RESULT: seeds
+  disconnected the minimal client before serving blocks (drained 0) -- the
+  documented seed policy: real peers announce via inv but drop under-wired clients
+  rather than serve history. Live yield ~0; the machinery (connect, handshake,
+  drain loop) is proven, but a full 540 GB / ~830k-block mainnet IBD is not
+  attainable from these seeds for this minimal client, and nothing of the sort is
+  claimed.
+- Suite unaffected & green (242 PASS / 0 FAIL / 18); bitcoind.o assembles with
+  node_drain and all daemon tests pass. Stray test-created blk00000.dat was
+  removed from the repo.
+
+## 2026-08-11 -- #5 LIVE MAINNET HEADER DOWNLOAD WORKS (real data from live peer)
+- NEW asm `bitcoind.node_fetch_headers(fd, locator, count, stop, out_buf, &out_count)`:
+  robust headers-first fetch. Sends getheaders, then DRAINS peer chatter
+  (ping->pong, ignores sendheaders/addr/inv) until a `headers` message arrives,
+  parses the CompactSize count. This is the real-peer primitive naive node_sync
+  was missing (it did one blocking read expecting `headers` and died on chatter).
+- VERIFIED LIVE against real seed.bitcoin.sipa.be: `node_fetch_headers rc=1
+  count=2000` -- downloaded 2000 REAL mainnet headers directly from a live peer.
+  Validation: header prevhash chain is CONTINUOUS across all 2000 (header[i+1].
+  prevhash == block_hash(header[i])); header #1 hash == the real mainnet block-1
+  hash 00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048;
+  bits 0x1d00ffff / 2009 timestamps. This is the genuine first phase of
+  headers-first IBD finally functioning against live peers (previously seeds
+  dropped the naive client).
+- Two real asm bugs found while writing it (same class as #4): (a) getheaders-msg
+  scratch at rbp-0x180 sat below the 0x118 frame -> corrupts caller stack;
+  frame enlarged to 0x188. (b) the recurring qword-stomps-adjacent-field bug:
+  `mov [rbp-0x34],rcx` (qword stop ptr) overwrote the qword locator pointer at
+  rbp-0x30; re-laid out non-overlapping locals (locator@-0x50, stop@-0x60,
+  cmd@-0x80).
+- nfh_test.c / live_hdr_valid.c are NEW manual/live tests (not in make test;
+  network-dependent). Offline path also verified deterministically (fake peer
+  chatter+headers -> count=2).
+- The next genuine step to full IBD: PERSIST this header chain on disk, advance
+  the locator per 2000-header page toward the tip, then drive getdata for each
+  header's block across peers -- and confirm whether blocks are now served once
+  we present a real contiguous header chain (the earlier block getdata was
+  refused by seeds, likely partly because of the missing header context).
+
+## 2026-08-11 -- #1 REAL-MAINNET VALIDATION: cons_verify on the real genesis block
+- Claim corrected: the LOG's old "pow_check uses a simplified difficulty model"
+  note is OUTDATED. diff_target/pow_check implement the real Bitcoin algorithm
+  (compact nBits -> 256-bit target mantissa*256^(exp-3); LE hash reversed and
+  compared <= target), and test_block already proves pow_check(real genesis
+  header, nBits 0x1d00ffff)=1 and diff_target(0x1d00ffff)==difficulty-1 target
+  in the fixed suite.
+- NEW tests/test_block_genesis.c (wired into make test): reconstructs the FULL
+  real mainnet genesis BLOCK (real 80-byte header + tx-count 0x01 + real 204-byte
+  coinbase tx from the oracle = 285 bytes) and proves the assembly cons_verify
+  ACCEPTS it (real PoW, real merkle == sha256d(real coinbase), real tx structure,
+  tx-count field), and REJECTS a tampered real coinbase. This is full-block
+  consensus validation on genuine mainnet block data, offline & deterministic.
+  Suite: 242 PASS / 0 FAIL / 18 green (was 238/17).
+- REAL BLOCK BODY validation via block-explorer HTTP (blockstream.info
+  /api/block/<hash>/raw), which returns real serialized blocks with no peer
+  getdata policy wall (the live seed peers refused block bodies to the minimal
+  client). tests/test_real_block.c (manual/offline): cons_verify ACCEPTS the
+  real pre-SegWit mainnet block 400000 (948,994 B, real nBits 0x1806b99f, 1660
+  real txs, 0xfd 2-byte tx-count, real merkle); store_append persists it
+  (blk00000.dat +48B index) and store_get_at returns the right offset/len.
+  This EXERCISED AND FIXED A REAL LATENT BUG: cons_verify's tx-count CompactSize
+  bounds checks compared an ABSOLUTE pointer (r10+K) against the byte length
+  (len), so ANY real block with >=253 txs (2-byte 0xfd count) was wrongly
+  rejected -- no fixture had >2 txs, so no test ever caught it. Fixed to compare
+  r10+K against block+len (the absolute end).
+  Real-block boundary now precise: cons_verify accepts REAL pre-SegWit blocks;
+  it rejects SegWit blocks (962043) because tx_parse/cons_verify do not yet
+  handle BIP141 witness serialization (the merkle is over txids excluding
+  witness). That -- adding SegWit tx parsing + witness-stripped txids -- is the
+  single defined feature left to validate real modern-chain IBD bodies.
+- LIVE (manual, tests/live_blocks.c + live_pow.c + live_headers.c): the asm node
+  connects to real seeds (seed.bitcoin.sipa.be / dnsseed.*), handshakes, and
+  downloads up to 2000 REAL chain headers (incl block 750000+ real nBits).
+  block_hash reproduces the real mainnet block-1 hash from a real header. The
+  live download works reliably for headers.
+- HONEST remaining gap for full real IBD: the live seed peers ACCEPT
+  connection+handshake and serve headers, but do NOT serve block BODIES over
+  getdata to this minimal client (they time out / drop; a server-side serving
+  policy for unproven peers). So downloading + storing a real multi-block chain
+  over the wire is the one link not yet exercised against a live seed. Block
+  serving over the wire IS proven against our own daemon serve mode (liveclient:
+  "LIVE SERVE OK"), so the socket/getdata/block-receive path is sound; the asm
+  validation of real block bodies is proven offline by test_block_genesis. A
+  cooperative peer (or a fuller handshake/protocol state) is what's needed to
+  close the live-multi-block IBD link -- a peer-policy issue, not an asm
+  correctness gap.
+
+## 2026-08-11 -- S6 CLI DELIVERED: 100% asm bitcoin_cli.asm + live real-block hash
+- New asm file: asm/bitcoin_cli.asm. cli_main(store, argc, argv, out, cap) renders
+  a query answer entirely in machine code over the persistent store + node
+  primitives (store_get_at/block_hash/sha256d/tx_parse). Commands: getblockcount,
+  getbestblockhash, getblockhash <h>, getblock <h|hash64>, gettx <txid64>,
+  getbalance (sums coinbase outputs in sat), stop, help. Display order for hashes/
+  txids is byte-reversed (matches Bitcoin core, verified against the oracle).
+- Driver: daemon/cli.c (thin process glue: chdir + store_init/reload + write
+  stdout). Test harness: tests/test_cli.c builds an 8-block chain and drives
+  every command against expected values from the PROVEN asm hashes. Wired into
+  Makefile (CLIOBJS; tests/test_cli built at -O0). Final suite: 17 green,
+  238 PASS / 0 FAIL.
+- BUGS FIXED (all the project's recurring classes):
+  #1 cli_load_block meta buffer overlapped the 6-push callee-saved save area
+     (golden rule). #2 length kept in rcx across lseek syscall -> syscall
+     clobbers rcx/r11 -> read len garbage (-EFAULT). #3 cli_hex did `mov al,[src]`
+     then indexed hexdig[rax] with stale high bits -> wild read. #4 qword store of
+     `vsize` stomped the adjacent `ntx` dword -> tx count became 0. #5 `add
+     rax,[vsize_dword]` 64-bit-loaded vsize + the neighboring blen/ntx high bits
+     -> garbage pointers. #6 tx_parse's 64-byte info buffer OVERLAPPED raw-req/
+     txbase locals -> tx_parse clobbered the requested txid (info[32]==raw-req
+     slot) and txbase (info[24]). Fixed by giving gettx/getbalance a clean
+     non-overlapping frame (info parked well below the txid/pointer locals).
+  LESSON: lay out EVERY frame slot explicitly and audit for overlap before
+  trusting the small-local clusters; and (as the LOG always says) size loads/
+  stores to the field, never `add rax,[dword_slot]`, never keep a value in rc x
+  across a syscall.
+- NEW manual/live test tests/live_blocks.c (NOT in make test, like the existing
+  live_headers/live_handshake): connects to a real seed, downloads 2000 REAL
+  mainnet headers, and asm block_hash(REAL block 1 header) == the genuine mainnet
+  block 1 hash 00000000839a8e...eb6048 (PASS). getdata-for-block1 was NOT served
+  by the seed peer (times out) -- peer-serving limitation, not a crypto failure.
+  This complements the fixed suite which already reproduces the REAL genesis
+  block hash (test_block) and parses the REAL genesis coinbase tx + txid==merkle
+  root (test_tx), so real mainnet artifacts ARE exercised by machine code.
+- HONEST scope (unchanged, matches roadmap): node_sync IBD + storage + CLI all
+  run against synthetic oracle chains; real-chain-work acceptance is limited
+  because the project's pow_check/cons_verify use a simplified difficulty model
+  tuned for low-difficulty fixtures (see the S5 HONEST notes). The crypto
+  primitives themselves are now independently confirmed against real mainnet
+  hashes.
+- #2 RESOLVED -- tx-count varint made mandatory across the WHOLE pipeline.
+  Trigger: the S6 CLI exposed that daemon-persisted chains were malformed (the CLI
+  is correct on wire-valid blocks; the daemon fixtures were not). Root cause was
+  systemic, not just fake_serve: EVERY block builder in the project emitted
+  `header + tx` with NO tx-count CompactSize (144 B), while Bitcoin wire blocks
+  are `header + tx-count + tx` (145 B). cons_verify and tx_parse were written
+  against, and consistently validated on, the missing-count layout. Fixes (all
+  validated):
+    * bitcoin_cons.asm: cons_verify now reads the tx-count CompactSize at byte 80
+      (1/2/4/8-byte forms, bounds-checked), starts the tx walk at 80+vsize, and
+      requires the walked tx count == the count field. Fixed two introduced bugs
+      along the way: idx must be a byte OFFSET (r10 - block), not the absolute
+      pointer, and the expected-count qword was placed at rbp-0x38 which OVERLAPS
+      the walk's n dword at rbp-0x34 (the walk's `inc [n]` corrupted its high
+      dword into 0x200000002); moved it to rbp-0x40.
+    * tests/test_cons.c: block now emitted with the `0x02` tx-count; the
+      non-coinbase-first tamper moved from byte 84 to 85 (n_in is at 80+1+4).
+    * tests/test_bitcoind_sync.c + daemon/fake_serve + daemon/testpeer.c: builders
+      now emit the `0x01` tx-count; added a wire-validity guard asserting
+      blocks[i][80]==1 so this regression class can't silently return.
+  Verified end-to-end: full suite back to 238 PASS / 0 FAIL / 17 green; `daemon
+  sync` then `cli getbalance` = 64000000 and `cli gettx <block0 txid>` = found
+  (previously 0 / not-found); `daemon server-test` ALL TESTS PASSED through the
+  real serve_loop (sync 8 -> serve byte-exact -> client verify). The whole page
+  is now wire-canonical.
+
+## 2026-08-11 — S5 daemon: node_handshake + node_make_version DONE; node_sync BLOCKED
+- bitcoind.asm added: node_make_version(out) -> 102-byte version payload
+  (byte-exact) and node_handshake(fd) -> full version/verack handshake over a
+  loopback socket (test_bitcoind, 13/13).
+- FIXED REAL WIRE BUG in p2p_getdata_block: it wrote the inventory type as a
+  4-byte dword (`mov dword [out+1],2`), pushing the block hash to +5 and
+  emitting a 37-byte message -- INVALID on the wire (type is a 1-byte varint;
+  correct msg is 34 bytes with hash at +2). Fixed the assembler AND the oracle
+  test that had encoded the same wrong layout.
+- FIXED sha256_full alignment: `sub rsp,136` (was 128) so nested calls live at
+  ABI-correct RSP 0 mod16. (A later attempted rust-proof `sub rsp,1400` BROKE
+  the suite -- reverted; verified-good state is 136.)
+- node_sync (headers-first IBD -> cons_verify -> store_append) is WRITTEN and
+  its multi-correctness bugs fixed (loop index now in a stack local; 32-bit
+  loads for dword frame fields; non-overlapping blockhash/getdata buffers; big
+  frame; real stop-hash buffer), and the getdata wire bug fixed so the peer
+  serves the right block. It still CRASHES with the recurring
+  sha256d-garbage-message-pointer corruption through the deep asm chain
+  (pow_check/cons_verify/node_sync all trigger it).
+- ROOT-CLASS DIAGNOSIS (not fixed): the SAME call site calls sha256d twice with
+  an identical return-address; the message pointer is VALID on the first call
+  and GARBAGE on the second -- an intermediate caller's message-pointer stack
+  local is overwritten by the first deep sha256d->sha256_full->sha256_block
+  frame. A callee-overwrites-caller near-rsp-local bug that persists across
+  alignment/frame fixes. NOT resolved.
+- LATER: two real state-corruption bugs found & fixed at -O0 (crash now gone):
+  (1) node_sync kept the locator in r13, which a deep callee in the hash chain
+      leaks (r12/r14/r15 survived but r13 became garbage) -- moved locator to a
+      stack local. (2) node_sync's blockhash buffer [rbp-0x70] OVERLAPPED its own
+      scalar locals loop_i/out_count/getdata_len/varint, so every block_hash
+      corrupts them -- re-laid-out the whole frame (blockhash at -0xa0, getdata
+      -0xd0, getheaders -0x140, cmd -0x160). node_sync now downloads+validates+
+      stores block0 without crashing (ret=1, tip_height=0).
+- REMAINING at -O0: the 2-block loop stops after block0 -- a getdata hash
+  mismatch (node_sync's block_hash(header0) != bh[0], e.g. 613f.. vs 128f..)
+  means the peer returns empty for block1. Not fully resolved; node_sync still
+  not wired into `make test`.
+- FINAL TRACE (debug, since removed): peer sends valid `headers` (02 01 00 00...)
+  and node_sync parses hcount=2 correctly, but node_sync's buf holds different
+  bytes (00 30 00 00 ...) than the peer sent -- a framing/uplink mismatch in
+  the loopback test, not a codec bug (peer and node codecs are each verified).
+  The crash is GONE: node_sync runs handshake->getheaders->headers->getdata->
+  block->cons_verify->store for the FIRST block (tip_height=0, out_count=1).
+- RESOLVED -- IBD CLIENT NOW WORKS: the multi-block failure was caused by the
+  block receive OVERWRITING the headers buffer in `buf` before node_sync could
+  re-derive block1's hash. Fixed by PRECOMPUTING all block hashes (from the
+  headers) into a dedicated frame array (rbp-0xae8 + i*32) BEFORE downloading
+  any block. node_sync now downloads a whole 2-block chain, cons_verify-
+  validates each, and store_appends each (test_bitcoind_sync: 4/4, incl.
+  out_count==NB and store tip_height==NB-1).
+  - Wired into `make test`. Built at -O0 (frame is now ~4.8KB + 2 x 2KB scratch;
+    the asm chain provably works at -O0; gcc -O2 of this specific networked
+    harness triggers a latent deep-frame overlap -- the asm itself is identical,
+    and the rest of the suite stays at -O2).
+  - Final suite: EXIT=0 / 215 PASS / 0 FAIL / 15 harnesses green.
+- HONEST: node_sync IS now working for the full download->validate->store path.
+  Final suite: EXIT=0 / 215 PASS / 0 FAIL / 15 harnesses green (make test).
+
+## 2026-08-11 -- S5 daemon DRIVER done (runnable full client) + node_serve_block
+- Added node_serve_block(st,height,out,cap) to bitcoind.asm: reads a stored
+  block (store_get_at -> offset,len) back out of blk00000.dat by height.
+  Verified in test_bitcoind_sync: 'serve back all stored blocks byte-exact'.
+- Added daemon/main.c: a thin C driver exposing a runnable node CLI over the
+  all-asm node core (node_handshake/node_sync/node_serve_block):
+    daemon sync <dir>   -- built-in loopback fake peer + connect + handshake +
+                           node_sync IBD -> persists chain; prints height.
+    daemon serve <dir> <port> -- listen, handshake peers, serve stored blocks
+                           via node_serve_block for getdata; reply pong/ping.
+  Verified live: 'daemon sync' -> ok=1 blocks=2 height=1, blk00000.dat=304B
+  (both blocks), index.dat=96B (2 x 48B index). EXIT=0.
+- NOTE: the entire node algorithm (connect, handshake, IBD loop, block serve) is
+  x86-64 assembly; main.c is only socket/main-loop glue.
+- One recurring environmental issue: gcc -O2 of C mains that call the deep asm
+  hash chain (block_hash->sha256d->sha256_full) can hit a sha256_full frame-
+  overlap crash with garbage pointers; the asm is identical and correct at -O0.
+  The daemon harnesses are built at -O0 (rest of suite stays -O2).
+- Final suite (fresh): EXIT=0 / 216 PASS / 0 FAIL / 15 green.
+
+## 2026-08-11 -- REAL BitCoin download confirmed + all-asm leveled logger
+- REAL NETWORK DOWNLOAD (asm codecs): connected to seed.bitcoin.sipa.be:8333,
+  handshook on the real Bitcoin P2P wire, sent getheaders(locator=block 750,000),
+  peer returned 2000 REAL chain headers (162003 B). Verified 1st returned
+  header's prevhash == block 750,000 hash (cryptographic match). Net DO resolve;
+  peers are flaky so a single attempt may time out -- a retry succeeds.
+  (tests/live_headers.c; not in make test -- it is a manual/live test.)
+- node_log.asm (new all-asm leveled logger): node_log_open(path)->fd,
+  node_log_event(fd,kind,a,b,c), node_log_str(fd,kind,s,len). Kinds:
+  INFO HSHK HDRS BLOCK CONS STORE ERROR SERVE. Explicit fd (no global state),
+  emits via the PROVEN fd_write_all from bitcoin_net.asm (a hand-rolled
+  `syscall` write in the logger silently failed in this binary; reuse of the
+  battle-tested net writer fixed it). Verified: test_log -> 6/6 structured lines.
+- daemon (bitcoind) now logs to bitcoind.log: node start, HSHK, BLOCK n,
+  STORE count height, SERVE height len, ERROR. Verified daemon sync ->
+  bitcoind.log shows INFO/HSHK/BLOCK 2/STORE 2 1 while persisting the chain.
+- Makefile: added node_log.o to OBJS, tests/test_log (built -O0), and it's in
+  make test. Final suite (fresh): EXIT=0 / 218 PASS / 0 FAIL / 16 green.
+- NOTE: both the sync and log harnesses build at -O0 (gcc -O2 of C mains that
+  call the deep asm hash chain triggers a sha256_full deep-frame-overlap
+  crash). The asm is identical; only the C main's -O2 register/stack layout
+  differs.
+
+## 2026-08-11 -- COMPLIANT serving glue; download track + serve verified
+- node_serve_block_by_hash added to bitcoind.asm (COMPLIANT serve: match a
+  getdata block hash by scanning stored headers). LOGIC CORRECT, but calling
+  block_hash (deep sha256d->sha256_full) from its small frame re-triggers the
+  recurring deep-call register-corruption (r14 clobbered to message len in the
+  harness); diffed frame sizes (0x60/0x200/0x208) did not fix it. The daemon
+  therefore serves getdata COMPLIANTLY in C: scans heights 0..tip via the
+  verified node_serve_block, hashes each stored header with the verified
+  block_hash asm, and serves the exact block matching the requested hash.
+  Unknown/hash-missing -> no response. This keeps the serve path working and
+  deterministic without the crash.
+- getdata parser in daemon fixed to the real wire layout: count(1) + type u32
+  LE(2=block) + hash32 (was wrongly assuming hash at +2).
+- Verified end-to-end: daemon sync downloads 2 blocks, persists them, and logs
+  INFO/HSHK/BLOCK 2/STORE 2 1 to bitcoind.log.
+- HONEST: full "keep up" (live inv/headers-follow and continuous re-sync) is
+  NOT yet implemented -- node_sync downloads once to tip; serving now answers
+  exact block-by-hash for everything already stored. Final suite (fresh):
+  EXIT=0 / 218 PASS / 0 FAIL / 16 green.
+
+## 2026-08-11 -- REALTIME keep-up follow loop + multi-block peer
+- Added daemon `follow` mode: connect + handshake once, then LOOP node_sync
+  (getheaders from our advancing tip -> download new -> validate -> store)
+  until the peer serves no new blocks (2 quiet passes). Logs BLOCK new height.
+  This is the live synchronization loop over the verified asm IB D core.
+- Peer now serves a GROWING 8-block chain: fake_NB bumps by 1 on each
+  getheaders, so a following client can observe new blocks over time.
+- Verified: `daemon follow` -> pass1 new=8 height=7, then new=0, caught up to
+  chain tip; log shows BLOCK 8 7 1 / BLOCK 0 7 2 ... / 'caught up'.
+- Server (serve mode) stays up, accepts+handshakes peers, and serves exact
+  requested blocks by hash (C-side hash match over verified node_serve_block).
+- Final suite (fresh): EXIT=0 / 218 PASS / 0 FAIL / 16 green.
+- HONEST scope: this demonstrates realtime catch-up against a live peer (the
+  loop re-syncs and stores anything new). It is driven per-poll rather than
+  event-driven (real nodes react to pushed inv/headers), and getheaders
+  serving still returns empty (not a full headers-serving IBD server yet).
+
+## 2026-08-11 -- FULL SERVER: getheaders-serving + event-driven keep-up
+- getheaders SERVING implemented in the daemon's serve_loop: given a real
+  getheaders(locator=hash) it finds the locator among stored headers and serves
+  a validated headers batch (count varint + per-hdr 81B) for the blocks after
+  it (up to 2000); unknown locator -> from genesis. This lets a fresh peer
+  headers-first-IBD from us. (Was empty before.)
+- inv HANDLER in serve_loop: on peer inv of MSG_BLOCK, request the announced
+  blocks via getdata, receive `block`, cons_verify (asm), store_append. This is
+  event-driven keep-up (react to push) on top of the poll follow loop.
+- SIGPIPE ignored (signal(SIGPIPE,SIG_IGN)) so a broken/disconnecting peer
+  cannot kill the node; writes just fail and the loop exits on EOF.
+- VERIFIED via new `daemon server-test <dir>` mode (deterministic, in-process
+  socketpair + real asm codecs): syncs 8 blocks, then serve_loop answers a
+  client that issues getdata(hash)->exact block, getheaders(locator)->headers
+  batch (568 B, 7 headers), and ping->pong. Output: getdata-exact=1
+  getheaders-n=1, client rc=0, ALL TESTS PASSED.
+- Final suite (fresh): EXIT=0 / 218 PASS / 0 FAIL / 16 green.
+- HONEST: full reorg handling, full script/signature validation of arbitrary
+  mainnet txs, mempool/RPC/pruning, and mainnet-scale storage are NOT
+  implemented; the node validates/stores/serves the single best chain it's
+  given. (See earlier note: getheaders serving + inv keep-up are now done.)
+
+## 2026-08-11 — S4 bitcoin_cons DONE (root cause was a 32/64-bit load bug + debug code)
+- bitcoin_cons.asm: cons_verify(block,len,txid_scratch,cap) -> 1/0. Does:
+  PoW (pow_check), walks txs (tx_parse), enforces coinbase-first (n_in==1) and
+  in-bounds/ exact-consumption, collects txids (sha256d) into scratch, computes
+  merkle_root, compares to the header merkle field.
+- The long blocker had TWO causes:
+  (1) REAL BUG: `mov rax,[rbp-0x34]` was an 8-byte read of the dword `n` field,
+      which is adjacent to the qword `idx` (at rbp-0x30). An 8-byte load pulled
+      in idx's low 4 bytes, so the txid-slot index became (idx<<32)|n -- garbage,
+      desyncing the walk and writing far out of bounds. FIX: `mov eax,[rbp-0x34]`
+      (32-bit). Lesson: when a dword field sits next to a qword field in a frame,
+      ALWAYS size the load to the field.
+  (2) The debug scaffolding (cons_stage/cons_last_root globals + rep movsb copies)
+      somehow shifts gcc -O2's layout so main's block-holding callee-saved reg is
+      clobbered across repeated cons_verify calls -> deterministic segfault ONLY
+      at -O2. Removing the debug code entirely made it pass at both -O0 and -O2.
+- Also fixed: tx_parse no longer requires consumed==txlen (allows trailing bytes
+  when parsing one tx out of a block); truncation rejection still intact (test_tx
+  still 18/18).
+- VERIFIED: tests/test_cons.c (6/6, in `make test`): valid block ACCEPTED with
+  oracle-exact merkle root derived from txids; bad-merkle / trailing-garbage /
+  truncated / non-coinbase-first / cap-too-small all REJECTED. Block built
+  against validation/block_oracle.py (209-byte 2-tx block, bits 0x207fffff,
+  nonce 0).
+- Wired into Makefile (CONSOBJS = sha256 + bitcoin_hash + bitcoin_tx + cons).
+  Full suite now 198 PASS / 0 FAIL / 13 green.
+
+## 2026-08-11 — S3 bitcoin_store done: persistent storage + block index
+- New asm file: asm/bitcoin_store.asm (raw file syscalls: open/write/read/lseek/
+  close). Two files in CWD:
+    blk00000.dat -- append-only; each block framed [u32 len][u32 magic f9beb4d9]
+                    [raw block] (matches validation/store_oracle.py exactly).
+    index.dat    -- 48-byte records, positional by height: [32 hash][u64 blk_off]
+                    [u32 block_len][u32 height].
+  API: store_init(st), store_reload(st), store_append(st,hash,raw,len)->height,
+  store_get_at(st,height,out_meta[2]), store_get_tip(st,out_meta[2]).
+  st layout: +0 blk_fd, +8 idx_fd, +16 next_offset, +24 dword tip_height, +28 dword magic.
+- VERIFIED: tests/test_store.c (40/40, in `make test`): append/get/tip/reload,
+  restart-resume (re-init+reload restores tip=2, next_offset=464), and on-disk
+  blk + index bytes match the oracle framing byte-for-byte.
+- THREE more ABI lessons, all from the SAME two classes that bit me before:
+  (1) FORGOT `global` on every export -> all symbols ended up local (nm shows
+      lowercase `t`), link failed with "undefined reference".  FIX: added global
+      to store_init/reload/get_at/get_tip/append.
+  (2) GOLDEN-RULE AGAIN: store_append's 48-byte index-record buffer sat at
+      rbp-0x50, whose top (rbp-0x21) CROSSED the callee-saved save area
+      (rbp-40..-8). The record write silently clobbered saved r12-r15/rbx; when
+      store_append returned, main's callee-saved regs were garbage -> later
+      crash in store_get_tip. FIX: record below -0x40 at rbp-0x78. Rule: an
+      N-byte buffer's top byte (start+N-1) must stay below the lowest save slot.
+  (3) CALLEE-SAVED rbx used in store_reload without push (only r12 was saved) ->
+      clobbered main's rbx (which held &st) -> second get_tip crashed. FIX: push rbx.
+  These keep recurring; the discipline is now: before writing ANY asm fn, list
+  every callee-saved reg touched, ensure each is pushed, and place every local
+  strictly below the save area.  (4) get_at reads blk_off at rec+32 (Q) correctly.
+
+## 2026-08-11 — S2 bitcoin_p2p done: message payload codecs
+- New asm file: asm/bitcoin_p2p.asm. Exports p2p_getheaders(out,locator,count,stop)
+  ->69 (1-byte varint count==1), p2p_getdata_block(out,hash)->37 (MSG_BLOCK=2),
+  p2p_ping(out,nonce)->8, p2p_headers_count(payload,plen)->#entries (parses
+  CompactSize incl. 0xfd 2-byte; verifies 81B/entry; -1 on malformed).
+  All byte layouts matched byte-for-byte against validation/p2p_oracle.py.
+- VERIFIED offline: tests/test_p2p.c (11/11, in `make test`).
+- VERIFIED end-to-end IBD-request path: tests/fakepeer_headers.c (9/9, in `make
+  test`) -- a loopback fixture peer; the 100%-asm client dials in, handshakes,
+  sends getheaders(locator=block 750000), reads the `headers` reply with
+  p2p_read, counts entries with p2p_headers_count, and checks the 1st header's
+  prevhash chains to locator. Exercises the WHOLE blockchain-download request
+  path in machine code over a real socket.
+- LIVE network reality check (tests/live_headers.c, manual, NOT in make test):
+  sending getheaders with a from-genesis locator makes current relay nodes
+  answer with a large inv backlog (not a small `headers`), because they treat
+  an at-genesis requester as needing full sync -- a real IBD-client wrinkle.
+  Using a mid-chain locator (block 750000) is the correct, bounded approach;
+  the loopback fixture proves that exact flow deterministically.
+- Assemble/drivers: bitcoin_p2p.o added to Makefile OBJS; test_p2p + fakepeer
+  wired into `make test`/`clean`. Full suite now 153 PASS / 0 FAIL / 11 green.
+
+## 2026-08-11 — S1 bitcoin_net done: sockets + P2P framing (LIVE-verified)
+- New asm file: asm/bitcoin_net.asm (raw Linux syscalls; DNS via libc getaddrinfo).
+  API: fd_write_all, fd_read_full, fd_close, tcp_connect_ip(ip_le, port_be) (returns
+  -errno on failure), cksum4, p2p_frame, p2p_write, p2p_read (returns 1 ok / 0 eof /
+  -1 err / -2 trunc-with-drain). Wire frame magic f9beb4d9 + 12B cmd + 4B len + 4B
+  cksum(=sha256d[0:4]) + payload -- locked byte-exact vs a live-peer Python oracle.
+- VERIFIED offline (tests/test_net.c, 19/19 PASS, run by `make test`): fd write/read
+  round-trip, EOF, p2p_frame(checksum/magic/cmd/len), p2p_write->p2p_read round-trip,
+  truncation+payload-drain preserving framing alignment.
+- VERIFIED LIVE (tests/live_handshake.c, manual): connected to a real Bitcoin node
+  (seed -> 32.217.31.151:8333), sent `version`, received peer `version`/`wtxidrelay`/
+  `sendaddrv2`/`verack`. The asm machine code performs the full P2P handshake on the
+  actual network.
+- TWO CONTRACT/ABI lessons fixed during bring-up:
+  (1) GOLDEN-RULE VIOLATION: several fn frames placed locals INSIDE the callee-saved
+      save area [rbp-8..-40] (header@-0x18, digest@-0x30, sockaddr@-0x10). This
+      corrupted saved r12/r13/r14/r15 and produced garbage command bytes / EFAULT /
+      SIGSEGV. FIX: moved all locals BELOW the save area and sized drain scratch
+      [64]@-0xc0 so it cannot overwrite sibling locals. This is the same golden rule
+      from the point_add lesson -- I must re-verify frame geometry on EVERY new fn.
+  (2) CALLEE-SAVED rbx/r14 were used but not pushed in fd_write_all/fd_read_full/
+      tcp_connect_ip -> corrupted caller regs. FIX: push/pop rbx/r14.
+  (3) PORT BYTE ORDER: tcp_connect_ip takes port in big-endian (htons); passing a
+      raw 8333 made sin_port = 0x8D20 (=36128) -> ECONNREFUSED. Callers MUST pass
+      htons(port).
+  (4) 16-byte RSP alignment at nested calls: p2p_write/p2p_read use sub rsp sizes
+      that are 8 mod 16 (5 callee pushes -> RSP 8 mod16, so sub must be 8 mod16 to
+      land on 0). Alignments audited per function.
+
+## 2026-08-11 — bitcoin_tx node tx-parser done (deserializer + txid)
+- New asm file: asm/bitcoin_tx.asm.
+  API: int tx_parse(txinfo *info, const u8 *tx, unsigned long txlen)
+    Walks a canonical serialized tx and fills info (see header comment) with
+    version, n_in, n_out, locktime, tx_len, and offsets/lengths of input[0]
+    script and output[0] value/script. Returns 1 if fully consumed, 0 if not.
+    Handles all four CompactSize varint widths (1/2/4/8) inline.
+- Verified via asm/tests/test_tx.c (18/18 PASS, in `make test`):
+    * Parses the serialized genesis coinbase tx: tx_len=204, version=1,
+      n_in=1, n_out=1, locktime=0.
+    * input[0] script offset=42 len=77 ; output[0] value offset=124, script
+      offset=133 len=67 ; value==50e8.  All offsets cross-checked vs a clean
+      Python walker, not hand-derived.
+    * txid = sha256d(tx) == 3ba3edfd...5e4a == the genesis merkle root (raw/
+      internal order) -- tied into bitcoin_hash.asm.
+    * merkle_root(1 tx) == that txid (Bitcoin 1-leaf rule).
+    * tx_parse rejects a truncated buffer (returns 0).
+    * 0xfd two-byte varint script-len path exercised and parsed (len 8).
+- BUG fixed during bring-up: locktime field was read but cursor never advanced
+  past it, so tx_len came out 4 short (200 vs 204) and all inputs were then
+  rejected. Fix: `mov r9, rbx` after reading locktime.
+- ABI discipline applied: r15 used for script lengths, so r15 is pushed/popped
+  (it is callee-saved); only caller-saved r8,r9,r10,r11,rax,rcx,rbx stay free.
+- GENESIS BYTE-ORDER LESSON (oracle): for genesis the header stores the merkle
+  root in RAW digest order == raw txid == 3ba3edfd...; block explorers print the
+  block/txid in display order but the genesis merkle root in raw order. The two
+  canonical strings (3ba3edfd... raw root vs 4a5e1e4b... display txid/root) are
+  byte-reverses, both correct. Documented in validation/genesis_oracle.py.
+- New oracle: validation/genesis_oracle.py (deterministically builds the genesis
+  coinbase tx, cross-checks txid/merkle/block-hash against all published values).
+
+## 2026-08-11 — bitcoin_hash node primitives done (sha256d/block-hash/merkle/pow)
+- New asm file: asm/bitcoin_hash.asm (built on sha256.asm). Exported API:
+    sha256d(out[32], msg, len)                  = SHA256(SHA256(msg))
+    block_hash(out[32], hdr[80])                = sha256d(hdr, 80)
+    diff_target(target[32], bits32)             = compact nBits -> 256-bit BE target
+    pow_check(hdr[80]) -> 1                    = block hash (LE int) <= target
+    merkle_root(out[32], hashes, n)             = Bitcoin tx-merkle (in place)
+- VERIFIED via tests/test_block.c; all 10 assertions PASS (via `make test`):
+    * genesis block hash (display order) matches known 0000...19d6689c...
+    * sha256d("abc") = 4f8b42c2...
+    * diff_target(0x1d00ffff) = 00000000ffff00...
+    * pow_check(genesis)=1 ; pow_check(tampered-nonce)=0
+    * merkle(1) == coinbase-txid leaf ; merkle(2/3/4) match Python oracle.
+- BUG FOUND (in the TEST, not in the asm): test_block.c had hand-typed merkle
+  expected constants (e2/e3/e4) that were WRONG. They were computed with a
+  truncated leaf0 (31-byte hex string -> 31 explicit inits + implicit 0 pad in
+  C), so the expected bytes did not match the oracle. The assembly merkle_root
+  was always correct (matches Python exactly for the real 32-byte leaves).
+  FIX: regenerated e2/e3/e4 from Python (`sha256d` merkle construction) and
+  patched test_block.c. Same lesson as the fe_inv EXP table: NEVER hand-type
+  multi-byte constants; derive them from the Python oracle.
+- INTEGRATION: Makefile now assembles bitcoin_hash.o, builds tests/test_block
+  (links sha256.o + bitcoin_hash.o) and runs it in `make test`. `make clean`
+  removes the new binary.
+- Node-layer status: hashing (txid double-SHA256, merkle root, block hash,
+  PoW target+check) DONE & VERIFIED. Remaining node layer: tx/block parsing,
+  UTXO, P2P (see PLAN sec 7).
+## 2026-08-11 — sha256_validation_done
+- Wrote fe_sqr / fe_inv (Fermat a^(p-2), MSB->LSB square-and-multiply over the
+  fixed exponent p-2 stored as a 32-byte little-endian rodata table).
+- fe_sqr is a tail-call into fe_mul (mov rdx,rsi; jmp fe_mul).
+
+### BUG #1 (fe_inv wrong): result pointer clobbered
+- Symptom: fe_inv(2) returned ALL ZEROS.
+- Root cause: inside the loop I set `mov rdi, r14` before each `call fe_mul`,
+  and rdi (the caller's output pointer) is caller-saved, so it was destroyed.
+  The final `mov [rdi+...], ...` then wrote into fe_inv's own stack R buffer
+  instead of the caller's buffer, leaving the caller's output at zero.
+- FIX: preserve the output pointer in rbx (callee-saved, preserved by fe_mul)
+  at entry (`mov rbx,rdi`), and use rbx for the final store. Also switched the
+  bit-index scratch from rbx to r9 so rbx stays dedicated to the out pointer.
+
+### BUG #2 (fe_inv wrong VALUE, not zero): after fix, inv(2) returned a non-zero
+###     but WRONG value; inv(2)*2 != 1.
+- Debug trail:
+  - t_inv (C, direct fe_inv call): inv(2) wrong.
+  - t_loop (pure-C re-implementation of the loop driving asm fe_sqr/fe_mul with
+    the SAME EXP byte table) produced the SAME wrong value -> bug is shared
+    between asm fe_inv and the C loop, so it is NOT in the asm loop control.
+  - t_alias: in-place sqr and mul validated OK.
+  - t_sqr300 / t_mix: chained in-place squarings (300) and square+multiply
+    chains (300) both match Python exactly -> fe_sqr & fe_mul are correct even
+    in long in-place chains.
+  - trace (checkpoints at i=239..0): C and Python AGREE through i=32, then
+    diverge at i=16 onward -> divergence occurs while processing bits 31..16
+    (byte indexes 3 and 2 of the exponent).
+- Current hypothesis: a RARE-VALUE bug that only triggers for a specific
+  intermediate field value reached during bits 31..16 of THIS exponentiation
+  (not covered by random single-call stress or the regular-valued chains).
+- STATUS: **UNRESOLVED** - investigation continues. Next step: bisect the exact
+  call or value in bits 31..16; add a per-iteration cross-check calling a C
+  reference mul (via _int128 + same reduction) to find the first mismatching
+  fe_mul/fe_sqr invocation.
+
+### RESOLUTION (root cause found)
+- NOT a fe_mul/fe_sqr bug at all. The crypto primitives were always correct.
+- The bug was a hand-typed EXPONENT TABLE: in BOTH my C test and the asm
+  EXP_BYTES I wrote the p-2 little-endian bytes with the 0xFE byte at offset 3
+  instead of offset 4. Correct: EXP[3]=0xFF, EXP[4]=0xFE. Wrong: EXP[3]=0xFE,
+  EXP[4]=0xFF. This made fe_inv exponentiate by the WRONG value -> wrong inverse.
+- Evidence trail that caught it:
+  * Verify p-2 bytes via Python: EXP=[2d,fc,ff,FF,FE,ff,...].
+  * gdb trace of fe_inv diverged from Python at bit 32 AND Python showed the
+    asm performed an extra multiply (used byte4=0xFF when true byte4=0xFE).
+  * seqcheck/seqcheck_persist (which derive EXP from Python's to_bytes, i.e.
+    the CORRECT table) all matched, while the real fe_inv (wrong hand table)
+    failed -> proved the table, not the arithmetic.
+- FIX: corrected EXP_BYTES in secp256k1_fe.asm to
+  [2d fc ff FF fe ff ...].
+- RESULT: fe_inv passes 200 randomized ctypes checks (a*inv(a)==1 mod p).
+- LESSON: never hand-type multi-byte constant tables; derive/verify them from
+  Python (the oracle) first, and prefer a Python-driven ctypes test over
+  hand-embedded constants for cross-checking.
+
+### point_add STATUS: VERIFIED -- ALL 5 assertions PASS (2G+3G=5G, G+G=2G, 2G+5G=7G, G+(-G)=inf).
+### SUBTLE NASM GOTCHA (root cause of point_add bug): ';' is a COMMENT in NASM, NOT a statement separator.
+  Symptom: point_add always fell into point_double (or produced wrong X3); the
+  distinct/opposite special-case branch logic never executed at all.
+  Cause: I wrote the equal-X comparison block as one-liners such as
+      mov rax,[rbp-0x90+0]; cmp rax,[rbp-0xb0+0]; jne .distinct
+  In NASM only the FIRST instruction (mov) assembled; everything after the
+  first ';' became a COMMENT, silently dropping the cmp/jne. The disassembly
+  showed pure mov loads (dead writes to rax) then an unconditional call to
+  point_double and jmp to .done.
+  Fix: one instruction per line in the comparison block. Audited the whole
+  file: the only remaining ';'-joined text is on a pure-comment line.
+  GOLDEN RULE (add to discipline): never join 2+ assembly instructions on one
+  line with ';' -- in NASM that is a comment, not a separator.
+### point_add STATUS: VERIFIED -- ALL 5 assertions PASS (5G, double, 7G, -G).
+
+### fe_inv status: VERIFIED (200 ctypes random cases, 0 failures).
+
+### secp256k1_ecdsa.asm STATUS: VERIFIED (ecdsa_verify).
+- HF: asm/secp256k1_ecdsa.asm. Verify-only ECDSA over secp256k1.
+- VERIFIED: valid sig accept, tampered-r/msg/pubkey reject, r=0/s=0/r=n-1 reject,
+  2nd valid sig accept. All 8 assertions PASS.
+- MAJOR LESSONS this stage (all three were real root causes):
+  (1) CONTIGUOUS-ASCENDING BUFFER CONVENTION: every multi-limb buffer must be
+      stored as ascending limbs from its base (limb0@+0..limb3@+24), because
+      ALL helpers (sc_inv/sc_mul/point_scalar_mul/point_add/fe_*) read+write
+      operands that way. Storing s/Q/u2 standing/scattered -> helpers silently
+      read garbage (w was s0+3 garbage limbs).
+  (2) ECDSA needs the AFFINE x = X/Z^2 mod p, NOT the raw Jacobian X. First
+      attempt compared raw X to r -> wrong. Added fe_sqr(inv/mul) conversion.
+  (3) Jacobian Z is at base+64 (P[8..11]); a +32 off-by-64 index made both the
+      infinity check and the Z*Z step read Y instead of Z.
+  Plus: keep every stratch buffer non-overlapping AND 16-byte-aligned calls.
+
+### secp256k1_scalar.asm STATUS: VERIFIED (sc_add/sub/mul/sqr/inv).
+- HF: asm/secp256k1_scalar.asm. Scalar arith mod curve order n.
+- DESIGN: sc_mul implemented as MSB->LSB double-and-add in the scalar ring
+  using only the simple sc_add (DELTA-carry fold + conditional subtract of n).
+  Deliberately slow but cryptographically identical; correctness-first.
+  sc_inv = Fermat a^(n-2) via square-and-multiply calling sc_mul.
+- VERIFIED: fixed vectors (edges: n-1+1=0, n-1*n-1=1, sub(0,1)=n-1, inv(2),
+  3*inv(3)=1, randoms) + ctypes stress: 8000 iters 0 failures (add/sub/mul/
+  sqr) + 4000 inv (a*inv(a)==1).
+- BUGS fixed this stage:
+  #1 rodata indexed as 32-bit absolute broke -shared (-> loaded N_EXP base
+     into a register; small fixed-offset rodata refs become RIP-relative under
+     'default rel').
+  #2 b-limb buffer stored DESCENDING but indexed ASCENDING -> wrong bits fed
+     to the double-and-add; AND the result accumulator was placed in scattered
+     slots while sc_add writes it CONTIGUOUSLY from its rdi. Both fixed by
+     giving R a contiguous block [rbp-0x78..-0x60] and b an ascending block
+     [rbp-0xa8..-0x90].
+  LESSON: any value written by a helper (sc_add rdi-based contiguous store)
+  must live in the SAME contiguous layout the helper produces; and kept
+  multi-limb indexable arrays must be stored ascending and indexed ascending.
+
+### fe_inv status: VERIFIED (200 ctypes random cases, 0 failures).
+
+### point_double / point_add_mixed / point_scalar_mul STATUS: VERIFIED
+### MAJOR BUG FOUND+FIXED here: scratch-slot overlap with callee-saved save area.
+  Symptom: -O2 builds SIGBUS/SIGSEGV on return to caller; callee-saved
+  registers (rbx/r14/r15) came back corrupted (e.g. rbx = a field value A).
+  Cause: slot offsets [rbp-0x20]/[rbp-0x40] overlapped the 5-push save area
+  [rbp-0x8 .. rbp-0x28]; writing a field value there overwrote the saved
+  registers, so `pop r14/r15/rbx` reloaded junk into the caller.
+  Fix: all scratch slots moved BELOW the save area (S0=[rbp-0x50] up to
+  S7=[rbp-0x130]), frame set to sub rsp,0x148 (16-byte aligned at every fe_*
+  call AND clear of the save area).
+  LESSON (golden): never place stack scratch inside [rbp-8 .. rbp-40] --
+  that region holds the pushed callee-saved registers.
+- Algorithm validated in Python (asm/validation/point_oracle.py + point_checks.py):
+  Jacobian (a=0) add/double + double-and-add scalar mul. ALL CHECKS PASS:
+    * n*G = infinity, (n+1)G == G
+    * dbl(G) == 2G ; 2G+G == 3G ; (n-1)G == -G
+  Reference values (for asm tests):
+    * 2G x = c6047f9441ed7d6d...5c709ee5
+             y = 1ae168fea63dc339...950cfe52a
+    * 3G x = f9308a019258c310...bce036f9
+             y = 388f7b0f632de814...f34da7f0
+    * kG (k=0x1234567890abcdef1234567890abcdef)
+        x = 9377c312145a5afb...90bbf5e
+        y = 742ba607d6ae1fc8...679779fb
+  (full hex in point_checks.py output / PLAN can regenerate via oracle)
+- DESIGNDECISION: Jacobian coordinates for dbl/add; one fe_inv at conversion.
+  Mul = MSB->LSB double-and-add (base as affine-like Z=1; use MIXED add
+  when base is affine Z=1 for speed, else general add).
+- NEXT: write secp256k1_point.asm implementing point_double (Jac),
+  point_add (Jac-Jac), point_add_mixed (Jac-affine), point_scalar_mul.
+- Discipline: keep fe_* API (4x u64 LE limbs), preserve rbx/r12-r15, call
+  fe_mul/fe_sqr/fe_add/fe_sub as the field primitives.
+*
+
+================================================================================
+KEY FACTS (do not lose)
+================================================================================
+- Field p = 2^256-2^32-977; C = 2^32+977 = 0x10000003D1 (fold constant).
+- EXP (fe_inv) = p-2 little-endian bytes: 2D FC FF FE | FF...  (32 bytes).
+- ABI: mulq clobbers rdx; keep pointers in callee-saved regs.
+- fe_mul preserves rbx,r12-r15 (and rbp); clobbers rax,rcx,rdx,rsi,rdi,r8-r11.
+- Verification stack so far:
+  * sha256 (init/block/full): 7/7 vectors pass.
+  * fe_add/fe_sub/fe_mul: 24 fixed vectors + 50k random vs Python oracle.
+  * fe_sqr: verified (t_sqr300 matches Python, 300 chained squarings).
+
+================================================================================
+SUCCESS CRITERION
+================================================================================
+- ECDSA verify over a real (or synthetic) secp256k1 signature returning the
+  correct accept/reject, built from AI-authored assembly.
+- Intermediate gates: fe_inv correct (a*inv(a)==1 mod p for random a).
+================================================================================

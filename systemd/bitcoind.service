@@ -1,0 +1,19 @@
+[Unit]
+Description=Bitcoin Core Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=root
+Group=root
+ExecStart=/usr/bin/bitcoind \
+  -daemon \
+  -conf=/storage/bitcoinmachinecode/config/bitcoin.conf \
+  -datadir=/storage/bitcoinmachinecode/data
+ExecStop=/usr/bin/bitcoin-cli -datadir=/storage/bitcoinmachinecode/data stop
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

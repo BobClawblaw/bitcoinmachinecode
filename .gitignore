@@ -1,0 +1,62 @@
+# ---- Build artifacts ----
+*.o
+*.so
+*.a
+
+# ---- Compiled binaries (tests + daemon) ----
+asm/tests/fakepeer_headers
+asm/tests/live_block_dl
+asm/tests/live_blocks
+asm/tests/live_getdata_form
+asm/tests/live_handshake
+asm/tests/live_headers
+asm/tests/live_local_probe
+asm/tests/live_probe
+asm/tests/parconn_test
+asm/tests/test_add
+asm/tests/test_addm
+asm/tests/test_bitcoind
+asm/tests/test_bitcoind_sync
+asm/tests/test_block
+asm/tests/test_block_genesis
+asm/tests/test_cli
+asm/tests/test_cons
+asm/tests/test_ecdsa
+asm/tests/test_fe
+asm/tests/test_headers
+asm/tests/test_ibd_blocks
+asm/tests/test_ibd_full
+asm/tests/test_ibd_headers
+asm/tests/test_ibd_scale
+asm/tests/test_log
+asm/tests/test_net
+asm/tests/test_p2p
+asm/tests/test_point
+asm/tests/test_scalar
+asm/tests/test_scalarmul
+asm/tests/test_sha256
+asm/tests/test_store
+asm/tests/test_tx
+asm/daemon/bitcoind
+asm/daemon/cli
+asm/daemon/discover
+asm/daemon/inbound_client
+asm/daemon/paribd
+asm/daemon/paribd_asm
+asm/daemon/peertest
+asm/daemon/seedprobe
+asm/daemon/testpeer
+asm/daemon/verify
+
+# ---- Runtime / blockchain data ----
+*.dat
+*.log
+data/
+
+# ---- Peer scan artifacts (regenerable; large) ----
+internet_peers.txt
+good_internet_peers.txt
+
+# ---- Python ----
+__pycache__/
+*.pyc

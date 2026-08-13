@@ -1,0 +1,484 @@
+; ============================================================================
+; bitcoin_net.asm -- POSIX sockets + Bitcoin P2P message framing (raw syscalls).
+;   100% AI-authored x86-64 assembly.
+;
+;   Layer boundaries:
+;     - Sockets/tcp use raw Linux syscalls (no libc for the data path).
+;     - The P2P frame cksum = sha256d(payload)[0..4) (calls sha256d from
+;       bitcoin_hash.asm).
+;     - DNS name -> address is delegated to libc getaddrinfo (the OS resolver);
+;       everything else is raw machine code.
+;
+;   Wire frame (from the live peer oracle):
+;     magic[4]=f9 be b4 d9 | command[12] | length[4 LE] | checksum[4] | payload
+;
+;   Exported API (System V AMD64):
+;     long fd_write_all(int fd, const void* buf, size_t n)   -> n or -1
+;     long fd_read_full (int fd, void* buf, size_t n)        -> n on success,
+;                                                              or < n on eof,
+;                                                              -1 on error
+;     int  fd_close(int fd)
+;     int  tcp_connect_ip(u32 ip_le, u16 port_be)            -> fd or -1
+;     long p2p_frame(u8* out, const char* cmd, u32 cmdlen,
+;                    const void* payload, u32 plen)          -> 24+plen (bytes)
+;     long p2p_write(int fd, const char* cmd, u32 cmdlen,
+;                    const void* payload, u32 plen)          -> total sent or -1
+;     int  p2p_read(int fd, char cmd_out[12], void* payload,
+;                   u32 cap, u32* plen_out)                  -> 1 ok / 0 eof /
+;                                                              -1 err / -2 trunc
+;
+;   NOTE: payload buffers for p2p_read must be >= cap. If the announced length
+;   exceeds cap the excess is drained from the socket (so framing stays aligned)
+;   and -2 is returned after reporting the announced length.
+; ============================================================================
+default rel
+
+extern sha256d
+
+section .text
+
+; ============================================================================
+; fd_write_all(fd, buf, n) -> total written or -1
+; ============================================================================
+global fd_write_all
+fd_write_all:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov  r12, rdi            ; fd
+    mov  r13, rsi            ; buf
+    mov  r14, rdx            ; n
+    xor  rbx, rbx            ; done
+.wa:
+    cmp  rbx, r14
+    jae  .done
+    mov  rdi, r12
+    lea  rsi, [r13+rbx]
+    mov  rdx, r14
+    sub  rdx, rbx
+    mov  eax, 1              ; write
+    syscall
+    test rax, rax
+    jg   .ok
+    mov  rax, -1
+    jmp  .ret
+.ok:
+    add  rbx, rax
+    jmp  .wa
+.done:
+    mov  rax, rbx
+.ret:
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; fd_read_full(fd, buf, n) -> bytes read (< n only on eof), or -1 on error
+; ============================================================================
+global fd_read_full
+fd_read_full:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov  r12, rdi            ; fd
+    mov  r13, rsi            ; buf
+    mov  r14, rdx            ; n
+    xor  rbx, rbx            ; got
+.ra:
+    cmp  rbx, r14
+    jae  .done
+    mov  rdi, r12
+    lea  rsi, [r13+rbx]
+    mov  rdx, r14
+    sub  rdx, rbx
+    mov  eax, 0              ; read
+    syscall
+    test rax, rax
+    jg   .ok
+    je   .eof
+    mov  rax, -1
+    jmp  .ret
+.ok:
+    add  rbx, rax
+    jmp  .ra
+.eof:
+    mov  rax, rbx
+.ret:
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+.done:
+    mov  rax, rbx
+    jmp  .ret
+
+; ============================================================================
+; fd_close(fd)
+; ============================================================================
+global fd_close
+fd_close:
+    mov  eax, 3              ; close
+    syscall
+    ret
+
+; ============================================================================
+; tcp_connect_ip(ip_le, port_be) -> fd or -1
+;   ip_le   = ipv4 address as a native little-endian u32 (i.e. the value you get
+;             from sin_addr.s_addr / the dotted quad parsed to network order).
+;   port_be = port in big-endian (htons).
+; ============================================================================
+global tcp_connect_ip
+tcp_connect_ip:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    push rbx
+    mov  r12d, edi          ; ip
+    mov  r13w, si           ; port
+    ; socket(AF_INET=2, SOCK_STREAM=1, 0)
+    mov  edi, 2
+    mov  esi, 1
+    xor  edx, edx
+    mov  eax, 41
+    syscall
+    test rax, rax
+    jl   .ret
+    mov  rbx, rax           ; fd
+    ; sockaddr_in on stack (16 bytes) BELOW save area
+    sub  rsp, 0x40            ; rsp = rbp-0x40 ; sockaddr at rbp-0x40..-0x31
+    xor  eax, eax
+    lea  rdi, [rsp]
+    mov  rcx, 16
+    rep  stosb               ; zero 16 bytes
+    mov  word [rsp+0], 2        ; AF_INET
+    mov  word [rsp+2], r13w     ; port
+    mov  dword [rsp+4], r12d    ; ip
+    mov  rdi, rbx
+    mov  rsi, rsp
+    mov  edx, 16
+    mov  eax, 42            ; connect
+    syscall
+    add  rsp, 0x40
+    test rax, rax
+    jl   .close
+    mov  rax, rbx
+    jmp  .ret
+.close:
+    mov  r14, rax           ; keep -errno before close
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+    mov  rax, r14           ; return the raw -errno for diagnosis
+.ret:
+    pop  rbx
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; cksum4(out4, payload, plen): writes sha256d(payload)[0:4] to out4
+; ============================================================================
+cksum4:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    sub  rsp, 0x48          ; digest[32] at rbp-0x48..rbp-0x29 (BELOW save area
+                            ; rbp-0x08..rbp-0x20)
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  r14, rdx
+    lea  rdi, [rbp-0x48]
+    mov  rsi, r13
+    mov  rdx, r14
+    call sha256d
+    mov  eax, [rbp-0x48]
+    mov  [r12], eax
+    add  rsp, 0x48
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; p2p_frame(out, cmd, cmdlen, payload, plen) -> 24+plen
+;   SysV: rdi=out rsi=cmd rdx=cmdlen rcx=payload r8=plen
+; ============================================================================
+global p2p_frame
+p2p_frame:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  r14, rdx
+    mov  r15, rcx
+    mov  rbx, r8
+    ; out[0..4] magic
+    mov  dword [r12], 0xd9b4bef9
+    ; out[4..16] command (zero then copy <=12)
+    lea  rdi, [r12+4]
+    xor  eax, eax
+    mov  rcx, 12
+    rep  stosb
+    mov  rcx, r14
+    cmp  rcx, 12
+    jbe  .cok
+    mov  rcx, 12
+.cok:
+    lea  rdi, [r12+4]
+    mov  rsi, r13
+    rep  movsb
+    ; out[16..20] length
+    mov  [r12+16], ebx
+    ; out[20..24] checksum
+    lea  rdi, [r12+20]
+    mov  rsi, r15
+    mov  rdx, rbx
+    call cksum4
+    ; out[24..] payload
+    lea  rdi, [r12+24]
+    mov  rsi, r15
+    mov  rcx, rbx
+    rep  movsb
+    mov  rax, rbx
+    add  rax, 24
+    pop  rbx
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; p2p_write(fd, cmd, cmdlen, payload, plen) -> total sent or -1
+;   SysV: rdi=fd rsi=cmd rdx=cmdlen rcx=payload r8=plen
+;   Writes 24-byte header then payload in two syscalls (no big intermediate copy).
+; ============================================================================
+global p2p_write
+p2p_write:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    sub  rsp, 0x68          ; frame locals BELOW save area (rbp-0x08..-0x40);
+                            ; 0x68==8 mod 16 keeps RSP 0 mod 16 at nested calls
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  r14, rdx
+    mov  r15, rcx
+    mov  rbx, r8
+    ; header buffer at rbp-0x58 .. rbp-0x41 (24 bytes)
+    mov  dword [rbp-0x58], 0xd9b4bef9
+    lea  rdi, [rbp-0x54]
+    xor  eax, eax
+    mov  rcx, 12
+    rep  stosb
+    mov  rcx, r14
+    cmp  rcx, 12
+    jbe  .cok
+    mov  rcx, 12
+.cok:
+    lea  rdi, [rbp-0x54]
+    mov  rsi, r13
+    rep  movsb
+    mov  [rbp-0x48], ebx
+    lea  rdi, [rbp-0x44]
+    mov  rsi, r15
+    mov  rdx, rbx
+    call cksum4
+    ; send header
+    mov  rdi, r12
+    lea  rsi, [rbp-0x58]
+    mov  rdx, 24
+    call fd_write_all
+    cmp  rax, 24
+    jne  .fail
+    ; send payload
+    mov  rdi, r12
+    mov  rsi, r15
+    mov  rdx, rbx
+    call fd_write_all
+    cmp  rax, rbx
+    jne  .fail
+    mov  rax, rbx
+    add  rax, 24
+    jmp  .ret
+.fail:
+    mov  rax, -1
+.ret:
+    add  rsp, 0x68
+    pop  rbx
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; p2p_read(fd, cmd_out[12], payload, cap, plen_out) -> 1 ok / 0 eof / -1 err / -2 trunc
+;   SysV: rdi=fd rsi=cmd_out rdx=payload rcx=cap r8=plen_out
+;   Frame stack locals (BELOW the save area):
+;     rbp-0x18 .. rbp+0x8 : 24-byte header
+;     rbp-0x20            : announced length (u32)
+;     rbp-0x24            : tocopy          (u32)
+;     rbp-0x30            : 8-byte drain scratch
+;   Callee-saved: r12=fd r13=cmd_out r14=payload r15=cap rbx=plen_out
+; ============================================================================
+global p2p_read
+p2p_read:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbx
+    sub  rsp, 0xd8          ; locals BELOW save area (rbp-0x08..-0x40):
+                            ; hdr[24]@-0x58, announced@-0x64, tocopy@-0x68,
+                            ; drain scratch[64]@-0xc0.  0xd8==8 mod 16 -> RSP 0 mod 16
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  r14, rdx
+    mov  r15, rcx
+    mov  rbx, r8
+
+    ; --- read 24-byte header ---
+    mov  rdi, r12
+    lea  rsi, [rbp-0x58]
+    mov  rdx, 24
+    call fd_read_full
+    cmp  rax, 24
+    jne  .eof_or_err
+
+    ; --- verify magic ---
+    mov  eax, [rbp-0x58]
+    cmp  eax, 0xd9b4bef9
+    jne  .eof_or_err
+
+    ; --- copy command (12B) to cmd_out ---
+    mov  rdi, r13
+    lea  rsi, [rbp-0x54]
+    mov  rcx, 12
+    rep  movsb
+
+    ; --- announced length ---
+    mov  eax, [rbp-0x48]
+    mov  [rbp-0x64], eax       ; announced
+
+    ; --- tocopy = min(announced, cap) ---
+    mov  ecx, r15d
+    cmp  eax, ecx
+    jbe  .small
+    mov  eax, r15d
+.small:
+    mov  [rbp-0x68], eax       ; tocopy
+
+    ; --- read tocopy payload bytes ---
+    test eax, eax
+    jz   .no_copy
+    mov  rdi, r12
+    mov  rsi, r14
+    mov  edx, [rbp-0x68]
+    call fd_read_full
+    ; recompute tocopy to compare with what we asked for
+    mov  eax, [rbp-0x64]
+    mov  ecx, r15d
+    cmp  eax, ecx
+    jbe  .small2
+    mov  eax, r15d
+.small2:
+    cmp  eax, [rbp-0x68]
+    jne  .eof_or_err           ; short read
+.no_copy:
+
+    ; --- drain excess (announced - tocopy) if any ---
+    mov  eax, [rbp-0x64]       ; announced
+    mov  ecx, [rbp-0x68]       ; tocopy
+    cmp  eax, ecx
+    jbe  .no_drain             ; announced <= tocopy -> nothing to drain
+    sub  eax, ecx              ; remaining to drain
+.drain:
+    test eax, eax
+    jz   .no_drain
+    ; requested = min(remaining, 64)
+    mov  edx, eax
+    cmp  edx, 64
+    jbe  .dr_amt
+    mov  edx, 64
+.dr_amt:
+    ; save remaining and requested on the stack across the call
+    push rax                  ; [rsp+8]=remaining ; [rsp]=requested
+    push rdx                  ; [rsp]=requested
+    mov  rdi, r12
+    lea  rsi, [rbp-0xc0]
+    mov  rdx, [rsp]           ; ask for exactly `requested` bytes
+    call fd_read_full         ; rax = actual bytes read
+    pop  rcx                  ; requested (discard)
+    pop  rdx                  ; remaining
+    test rax, rax
+    jle  .no_drain            ; peer closed / error -> stop draining here
+    sub  rdx, rax             ; remaining -= actual read
+    mov  rax, rdx
+    jmp  .drain
+.no_drain:
+
+    ; --- report announced length ---
+    mov  eax, [rbp-0x64]
+    mov  [rbx], eax
+
+    ; --- return code ---
+    mov  eax, [rbp-0x64]
+    mov  ecx, [rbp-0x68]
+    cmp  eax, ecx
+    ja   .trunc
+    mov  rax, 1
+    jmp  .ret
+.trunc:
+    mov  rax, -2
+    jmp  .ret
+
+.eof_or_err:
+    test rax, rax
+    js   .err
+    mov  rax, 0                ; eof (or short read)
+    jmp  .ret
+.err:
+    mov  rax, -1
+.ret:
+    add  rsp, 0xd8
+    pop  rbx
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+section .note.GNU-stack noalloc noexec nowrite progbits

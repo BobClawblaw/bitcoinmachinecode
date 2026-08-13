@@ -1,0 +1,370 @@
+# PROJECT PLAN — Bitcoin Node in 100% AI-generated Machine Code
+
+# Location: /storage/bitcoinmachinecode
+# Goal: a working Bitcoin client for Linux implemented as x86-64 assembly,
+#       every line authored by an AI (no human code). Option B chosen:
+#       security-critical crypto in raw assembly.
+#
+# This file exists so work can resume after a context loss. It records the
+# verified state, algorithm decisions, exact conventions, and concrete next
+# steps. READ THIS FIRST, then continue.
+
+### 0. RESUME / COMMANDS
+
+cd /storage/bitcoinmachinecode/asm
+
+# Assemble every .asm into .o, then build+run the C test harness(es):
+./build.sh            # assemble all + run `make test` + rebuild shared libs
+# or just the suite:
+make test             # builds+links all harnesses against current .o and runs them
+# incremental single harness, e.g.:
+nasm -f elf64 -o bitcoin_hash.o bitcoin_hash.asm
+gcc -no-pie -O2 -o tests/test_block tests/test_block.c sha256.o bitcoin_hash.o && ./tests/test_block
+# Makefile targets: make asm | make test | make clean
+# Randomized ctypes stress (shared libs, optional):
+python3 tests/inv_stress.py        # fe_inv: 10k iters
+python3 tests/stress_scalar.py     # scalar arith: 3k iters
+# Manual daemon rebuild (bitcoind.o + node_log.o + bitcoin_headers.o are NOT
+# Makefile targets; the daemon binary must be rebuilt by hand), e.g.:
+gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
+    bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
+    bitcoind.o node_log.o bitcoin_headers.o
+# Toolchain here: nasm 2.16.01, gcc 13.3, GNU ld 2.42, x86_64.
+
+### 1. STATUS — DONE & VERIFIED
+
+[ DONE ] sha256.asm : full SHA-256 (init, one-block compression, one-shot with
+         padding). VERIFIED 7/7 PASS (exit 0): empty string, "abc",
+         "abcdbcdecdef...nopq", bytes(range(56)), bytes(range(100)) multiblock,
+         bytes(range(120)) extra-len-block, bytes(range(119)) resid-55.
+         HF: asm/sha256.asm (~497 lines).
+         API: sha256_init(state[8]), sha256_block(state[8],block[64]),
+              sha256_full(out[32],msg,len).
+
+[ DONE ] secp256k1_fe.asm : FULL FIELD ARITHMETIC (add, sub, mul).
+         HF: asm/secp256k1_fe.asm
+         API (4 x little-endian u64 limbs): fe_add(r,a,b), fe_sub(r,a,b),
+              fe_mul(r,a,b).
+         fe_mul = schoolbook 256x256->512 (row method, mulq) + 2-fold
+         reduction mod p (C = 2^32+977), then one conditional subtract of p.
+         REGISTER GOTCHA: mulq clobbers rdx, so keep b[] in a callee-saved
+         reg (r14); a[] in r13; multiplier limb in rbx.
+         VERIFIED: 24 fixed-vector asserts (incl. 1*1, (p-1)*1, (p-1)^2,
+         0*0) + 50,000 random cases vs Python big-int oracle, 0 failures.
+         Stress harness: tests/stress_fe.py (ctypes into libsecpfe.so).
+         Build .so: gcc -shared -fPIC -o libsecpfe.so secp256k1_fe.o
+
+[ DONE ] secp256k1_point.asm : POINT ARITHMETIC over secp256k1 (100% AI).
+         HF: asm/secp256k1_point.asm
+         API (Jacobian point = 3 field elts = 12 u64 LE limbs; affine = 8):
+           point_double(r[12], p[12])
+           point_add_mixed(r[12], p[12], xy[8])   (p + affine point)
+           point_scalar_mul(r[12], xy[8], k[4])   (MSB->LSB double-and-add)
+           point_add(r[12], p[12], q[12])         (Jac+Jac, a=0)
+         Curve y^2 = x^3+7. Jacobian avoids per-op inversion; one fe_inv at
+         affine conversion.
+         VERIFIED (all at -O2, vs Python big-int oracle): point_double(G)=2G;
+         add_mixed(2G,G)=3G and (G,G)=2G (double path); scalar_mul 1G/2G/3G/
+         128-bit kG exact, nG==infinity; point_add 2G+3G=5G, G+G=2G,
+         2G+5G=7G, G+(-G)=infinity. Full suite passes via `make test`.
+         STACK GOTCHA: scratch slots MUST live below the callee-saved save
+         area ([rbp-8..-40]); keep 16-byte RSP alignment at every fe_* call.
+         NASM GOTCHA: ';' is a COMMENT, never join 2+ instructions on one line.
+         (Both logged in LOG.md, golden rules added below.)
+
+[ DONE ] secp256k1_scalar.asm : SCALAR ARITHMETIC mod curve order n.
+         HF: asm/secp256k1_scalar.asm
+         API: sc_add, sc_sub, sc_mul, sc_sqr, sc_inv (4 x u64 LE limbs mod n).
+         VERIFIED: fixed edge vectors + ctypes stress (8000 iters 0 fail;
+         4000 inv). sc_mul = double-and-add (slow, correctness-first).
+
+[ DONE ] secp256k1_ecdsa.asm : ECDSA SIGNATURE VERIFICATION.
+         HF: asm/secp256k1_ecdsa.asm. Verify-only (low-S ECDSA): range-check
+         r/s, w=s^-1, u1=z*w, u2=r*w, P=u1G+u2Q, affine x=P.x/Z^2, compare
+         (x mod n)==r. VERIFIED vs Python oracle: 8/8 assertions (incl.
+         tamper + edge rejections). Key lessons logged (ascending-buffer
+         convention; affine-vs-Jacobian x; Z at base+64).
+
+[ DONE ] bitcoin_hash.asm : NODE-LAYER HASHING PRIMITIVES (built on sha256).
+         HF: asm/bitcoin_hash.asm
+         API: sha256d(out,msg,len), block_hash(out,hdr[80]),
+              diff_target(target,bits32), pow_check(hdr[80])->0/1,
+              merkle_root(out,hashes,n)  (Bitcoin tx-merkle, in place).
+         VERIFIED via tests/test_block.c (10/10 PASS, run by `make test`):
+         genesis display hash, sha256d("abc"), diff_target(1d00ffff),
+         pow_check(genesis)=1 & tampered=0, merkle(1/2/3/4) vs Python oracle.
+         GOTCHA (test, not asm): the merkle expected constants e2/e3/e4 were
+         hand-typed from a truncated leaf0 (31 explicit inits + implicit 0 pad
+         -> 32 bytes) so they did not match; asm was always correct. Re-derived
+         expecteds from Python. Lesson reaffirmed: derive byte constants from
+         the oracle, never by hand.
+
+[ DONE ] bitcoin_tx.asm : TRANSACTION DESERIALIZER (node layer).
+         HF: asm/bitcoin_tx.asm
+         API: int tx_parse(txinfo *info, const u8 *tx, unsigned long txlen)
+              fills info: version, n_in, n_out, locktime, tx_len, offsets/
+              lengths of input[0] script and output[0] value/script; returns
+              1 on full consumption, 0 on truncation. CompactSize varints
+              1/2/4/8 inline.
+         VERIFIED via tests/test_tx.c (18/18 PASS, in `make test`): genesis
+         coinbase tx (204B) all fields + offsets vs a clean Python walker;
+         txid = sha256d(tx) == genesis merkle root (raw); merkle(1)=txid;
+         truncation rejected; 0xfd 2-byte varint path.
+         GOTCHA fixed: locktime read but cursor not advanced -> tx_len 4 short.
+         BUG-LESSON (oracle): genesis merkle root is stored/printed in RAW
+         digest order (3ba3edfd...) while txid/block-hash print in display
+         order (4a5e1e4b...); they are byte-reverses. See
+         validation/genesis_oracle.py.
+
+[ DONE ] Node-layer roadmap items (a)-(e) from the original TODO, per stage
+         S1-S6 + S5b: (a) full genesis BLOCK parsed and hash+merkle reproduced
+         (test_block / test_block_genesis); (b) merkle over multiple real txids
+         (cons_verify on 2-tx + real mainnet blocks, incl. SegWit tx_txid);
+         (c) PoW difficulty->target retargeting (diff_target/pow_check, proven on
+         real nBits); (e) P2P sockets + framer + codecs + handshake + headers
+         IBD (live), persistent paged headers IBD (test_ibd_headers); and the
+         FULL IBD pass node_ibd = headers-first persist + getdata block bodies +
+         validate + store over one peer connection (test_ibd_full, 1200 blocks).
+         Store / CLI / block-consensus are in-place; real block BODY download
+         from live seeds remains a peer-policy gap (seeds drop getdata to
+         minimal clients), not an asm gap.
+[ TODO ] Node layer remaining: (d) UTXO set (add/del + balance via index currently
+         walks the chain), full script/signature validation of arbitrary txs,
+         mempool / RPC / pruning, and mainnet-scale (540 GB) storage. The
+         machine-code IBD + store + CLI machine is complete and proven against a
+         cooperative peer; pulling genuine thousands-of-blocks mainnet chains
+         over the wire is hindered only by live-seed serving policy. Final
+         deliverable ties all crypto together.
+
+### 2. FIELD p AND KEY CONSTANTS (secp256k1)
+
+p = 2^256 - 2^32 - 977
+  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+  Encoding: 4 x u64 limbs, LITTLE-endian (limb0 = lowest 64 bits).
+  P_LIMBS (in secp256k1_fe.asm .rodata):
+     limb0 = 0xFFFFFFFEFFFFFC2F
+     limb1 = 0xFFFFFFFFFFFFFFFF
+     limb2 = 0xFFFFFFFFFFFFFFFF
+     limb3 = 0xFFFFFFFFFFFFFFFF
+  C = 2^32 + 977 = 0x00000001000003D1   (reduction fold constant)
+
+Curve: y^2 = x^3 + 7  (a=0, b=7)
+Section n (curve order), base point G:
+  n  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+  Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+  Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+
+### 3. FIELD ELEMENT CONVENTIONS / ABI (keep consistent everywhere)
+
+- Field element = 4 consecutive u64, little-endian limb order.
+- System V AMD64 ABI: args rdi, rsi, rdx; rax returns integer.
+- Callee-saved to push: rbx, r12, r13, r14, r15 (rsp becomes rbp-48).
+- CALLER-SAVED (free to clobber, NO preserve needed): rax, rcx, rdx, rsi,
+  rdi, r8, r9, r10, r11.  Use r8-r11 freely; push only rbx,r12-r15.
+- fe_add/fe_sub already follow this: fe_add pushes rbx,r12,r13,r14;
+  fe_sub uses only r8-r11 (no pushes needed).
+
+### 4. fe_mul DESIGN — NEXT IMMEDIATE TASK
+
+Goal: r[4] = (a[4] * b[4]) mod p.
+
+STEP A — 256x256 -> 512-bit schoolbook multiply.
+  out[0..7] = 8 x u64 little-endian product limbs.
+  out[k] = sum over i+j=k of a[i]*b[j]  (each 64x64->128 via 'mul' -> rax:rdx)
+  Concrete schedule:
+    out0 = a0*b0
+    out1 = a1*b0 + a0*b1
+    out2 = a2*b0 + a1*b1 + a0*b2
+    out3 = a3*b0 + a2*b1 + a1*b2 + a0*b3
+    out4 = a3*b1 + a2*b2 + a1*b3
+    out5 = a3*b2 + a2*b3
+    out6 = a3*b3
+    (out7 = carry-out; product < 2^512 so 8 limbs enough)
+  Accumulate each diagonal with ADDC to propagate carry. Keep the 8 product
+  limbs either in regs (r8-r11 + others) or, simpler to verify, in a 64-byte
+  stack scratch area.
+
+STEP B — REDUCTION (verified: 2 folds suffice; see /tmp/fold_probe.py).
+  t = t1*2^256 + t0 (t0 = out0..3, t1 = out4..7).
+  Since 2^256 == C (mod p):  t mod p == t0 + t1*C  (mod p)
+  Each fold: value := (value & MASK256) + ((value>>256) * C)
+  PROBE (max bits): product 512; fold0 ~288; fold1 <=256.
+  So after fold 1 value < 2^256; p > 2^255, value < 2p, so ONE final
+  conditional subtract of p yields canonical [0,p).
+
+  ONE FOLD in limb arithmetic:
+    In: 8 limbs r0..r7 (r0 lowest). low = r0..r3, high = r4..r7.
+    C = 0x10000003D1 (single 64-bit constant).
+    acc = low + (high*C); high*C is 4 limbs * 33-bit -> up to 289 bits.
+    Do hi[i] = r[i+4]*C (64x64->128 via mul) and add with carry into the
+    new low limbs. Result < 2^290 (up to 5 limbs). Feed into next fold.
+  SAFEST implementable form: a 9-limb (72-byte) stack scratch + helper
+  fold256(), looped twice, then conditional subtract. Verify against Python.
+
+  FINAL: after 2 folds value < 2^256. tmp = val - p; borrow -> keep val else
+  use tmp (same cmovc trick as fe_add).
+
+STEP C — VERIFICATION: add tests/test_fe.c with
+  - a tiny xorshift64 PRNG in C,
+  - call fe_mul and compare to (a*b) mod p computed in C (via __int128) or
+    via embedded constants precomputed by Python,
+  - also test fe_add/fe_sub against C reference.
+  Embed fixed vectors as hex constants so C needs no big-int library.
+
+### 5. NEXT: secp256k1_scalar.asm (scalars mod curve order n)
+
+- Same 4 x u64 little-endian convention.
+- Scalar reduction mod n; validate method in Python first (same procedure as
+  sec 4 STEP B), using constants derived from n.
+- Provide sc_add, sc_sub, sc_mul for ECDSA math.
+- Verify against Python pow/mod.
+
+### 6. NEXT: ECDSA verify + point arithmetic over secp256k1
+
+- Point ops (affine or Jacobian): point_double, point_add, point_mul
+  (double-and-add). Coordinates as 4-limb field elements. Inversion via
+  Fermat: inv(x) = x^(p-2) (square-and-multiply over fe_mul/fe_sqr).
+- ECDSA verify (r,s) vs pubkey Q and msg hash z:
+      w  = s^-1 mod n
+      u1 = z*w mod n ; u2 = r*w mod n
+      X  = u1*G + u2*Q
+      valid iff r == X.x mod n
+- Verify against a known-valid Bitcoin signature and a known-invalid one.
+
+### 7. NODE LAYER (what "working Bitcoin client" ultimately means)
+
+Status: hashing + tx parsing + PoW primitives DONE & VERIFIED (S1-S4). The node
+daemon path -- sockets/P2P codecs (S1-S2), persistent blk store + block index
+(S3), full-block consensus incl. SegWit txids (S4), the daemon driver + CLI
+(S5-S6), and the persistent headers-first IBD + block-body download (S5b/S5c) --
+is DONE & VERIFIED against synthetic chains, real mainnet headers, and real
+validated/hashed blocks. The one honest gap is downloading + storing a real
+MULTI-BLOCK chain over the wire: live seeds serve headers but drop block-body
+getdata to a minimal client (a peer-policy limit, not an asm limit). See
+COMPLETION ROADMAP below.
+
+### 10. COMPLETION ROADMAP (node that downloads/serves + full CLI)
+
+Goal: a fully functional Bitcoin node in 100% AI-authored assembly that
+performs headers-first IBD, downloads/validates/stores blocks, serves peers,
+plus a separate CLI binary. All AI-authored; C/Python are only oracles/tests.
+Chain tip while building ~961k. Live network reachable from this box (verified:
+TCP 8333 to seed.bitcoin.sipa.be; P2P handshake done in Python oracle).
+
+Order of stages (each end-to-end verified before the next):
+  S1  bitcoin_net.asm   POSIX sockets (socket/connect/bind/listen/accept/recv/
+                        send/close/select) + DNS + P2P msg framer (magic f9beb4d9,
+                        12B cmd, 4B len, 4B cksum=sha256d[0:4]). [DONE] -- built,
+                        offline test (19/19) + LIVE handshake vs a real node OK.
+                        API: fd_write_all/fd_read_full/fd_close/tcp_connect_ip/
+                        p2p_frame/p2p_write/p2p_read (raw syscalls; DNS via libc).
+  S2  bitcoin_p2p.asm   Message codecs: version/verack/ping/pong/addr, headers,
+                        getheaders, inv, getdata, block, tx.  [DONE] builders +
+                        headers parser. Byte-exact vs validation/p2p_oracle.py.
+                        p2p_getheaders/p2p_getdata_block/p2p_ping/p2p_headers_count.
+                        Offline test (11/11) + loopback end-to-end IBD header
+                        download (fakepeer_headers, 9/9).
+  S3  bitcoin_store.asm Append-only blk file writer, block index (height->offset/
+                        len/hash), UTXO add/del/serialize to disk.  [DONE]
+                        blk00000.dat framing + positional index.dat (48B/record).
+                        store init/reload/append/get_at/get_tip. Verified
+                        (test_store, 40/40) incl. restart-resume + oracle bytes.
+  S4  bitcoin_cons.asm Wire-true block/tx validation: txid+merkle recheck, PoW
+                        (pow_check), coinbase rules, difficulty from bits, chain
+                        reorg select.  [DONE] cons_verify: PoW + tx-walk + txid
+                        collect + merkle compare + coinbase-first. Verified
+                        (test_cons, 6/6) at -O2: valid block accepted w/ oracle
+                        merkle, bad merkle/trailing/truncated/non-coinbase/cap
+                        rejected. Requires the lenient tx_parse (trailing bytes).
+  S5  bitcoind_main.asm Daemon main loop: connect seeds, version handshake,
+                        getheaders IBD (headers-first), then getdata blocks,
+                        validate+store; serve peers (reply to ping, getheaders,
+                        getdata with stored blocks, send inv on new).
+  S5b bitcoin_headers.asm + node_ibd_headers  [DONE] PERSISTENT PAGED headers-
+                        first IBD. bitcoin_headers.asm is a restart-safe
+                        positional (header, block_hash) store (headers.dat,
+                        112B/entry): hst_init/reload/append/get_at/count.
+                        bitcoind.asm node_ibd_headers(fd,hst*,locator32,
+                        page_buf,buflen) loops node_fetch_headers at a running
+                        locator, verifies per-header chain continuity, computes
+                        block_hash, hst_appends, and advances the locator to the
+                        tip; stops on short/empty pages. Verified by test_headers
+                        + test_ibd_headers (2500-header chain across a full
+                        2000-page + 500 short page, locator advance, restart-
+                        resume, tip detection, tamper rejection). Fixed a latent
+                        golden-rule bug in node_fetch_headers (len_out sat inside
+                        the callee-saved save area, clobbering caller r14).
+  S5c bitcoind.asm node_ibd_blocks  [DONE] BLOCK-BODY download OFF the persisted
+                        header chain: node_ibd_blocks(fd,st*,hst*,start_h,buf,
+                        buflen) walks every stored header, getdata its block_hash,
+                        receives the block, cons_verify-validates it, re-derives
+                        the hash and requires it to equal the stored header hash
+                        (wrong-block guard), then store_appends it. Verified by
+                        test_ibd_blocks (4-block chain stored byte-exact over
+                        loopback + negative wrong-body rejection). Fixed the
+                        recurring r13 hazard (hst now kept in a stack local --
+                        r13 is leaked by the deep block_hash chain). Together
+                        with node_ibd_headers this is the full headers-first IBD
+                        tail end-to-end in machine code.
+  S5c2 bitcoind.asm node_ibd  [DONE] FULL IBD AS ONE ASM PASS over a single peer
+                        connection: node_ibd(fd,st*,hst*,buf,buflen) chains
+                        node_ibd_headers (persist whole header chain from genesis)
+                        then node_ibd_blocks (walk every stored header -> getdata
+                        -> cons_verify + re-hash-guard -> store_append). Verified
+                        by test_ibd_full (1200-block chain byte-exact in one call)
+                        AND wired into the runnable daemon as `daemon ibd <dir>`
+                        (runs node_ibd over a loopback whole-chain peer; verified
+                        live: blocks=8 headers=8 height=7, store + CLI query OK).
+                        Suite 283 PASS / 22 green.
+  S5d wire-format fix + REAL mainnet block download + inbound serve  [DONE]
+                        (2026-08-12 #11): the long-standing "live seeds drop
+                        block-body getdata" wall was ROOT-CAUSED by OUR OWN
+                        malformed getdata -- p2p_getdata_block emitted a 34-byte
+                        msg (type as a 1-byte varint) that real nodes ignore. The
+                        canonical Bitcoin getdata/inv is [count varint][type
+                        int32 LE][hash32] = 37 B, hash at +5 (our p2p_oracle.py
+                        always encoded this; a prior stage wrongly "fixed" it).
+                        Fixed to 37 B and confirmed LIVE: a real node served the
+                        37-B form and ignored the 34-B form. The assembly receive
+                        path now downloads REAL mainnet block bodies (verified at
+                        heights 790999..790994), cons_verify-validates them VALID,
+                        and store_appends them. Also NEW bitcoind.asm
+                        node_accept_handshake (INBOUND/server role -- serve mode
+                        previously reused the outbound node_handshake and hung on
+                        an inbound peer): verified serving 8 headers + exact block
+                        to a real inbound peer. Boot: seeds.txt tiered list +
+                        daemon/seedprobe.c bounded prober. User-agent now
+                        "Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x".
+  S6  bitcoin_cli.asm   CLI binary: talks to daemon over a local Unix socket
+                        (or loopback TCP RPC), commands like: getblockcount,
+                        getbestblockhash, getblockhash <h>, getblock <h|hash>,
+                        gettx, getbalance(utxo), stop, help.
+
+Each stage delivers a working .asm + C harness verified by `make test` and/or a
+live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
+
+### 8. RULES / DISCIPLINE (do not regress)
+
+- EVERY line of code/assembly is AI-authored. No human edits.
+- Docs/plans (like this file) and C test harnesses are allowed as non-node
+  scaffolding; harnesses exist only to prove the machine code correct.
+- Before tricky assembly, validate the ALGORITHM in Python (big-int) first,
+  as done for SHA-256 and the fe reduction.
+- Keep limb/register conventions of section 3 consistent across files.
+- Assemble + run tests after EVERY new .asm function.
+
+### 9. GOLDEN RULES (hard-won; do not regress)
+
+- NEVER write stack scratch inside [rbp-8..-40] -- that is the callee-saved
+  register save area (5 pushes); a scratch slot there silently corrupts the
+  saved rbx/r12/r13/r14/r15 and crashes the caller (esp. at -O2).
+  Keep all scratch BELOW it and keep RSP 16-byte aligned at every nested call.
+- NEVER join 2+ assembly instructions on one line with ';' -- in NASM ';'
+  starts a COMMENT, so everything after the first ';' is silently dropped.
+  One instruction per line, always.
+- Use CALLEE-SAVED registers (r12-r15) for pointers/counters that must
+  survive calls to fe_* (which preserve them) and point functions.
+- Every point_* frame: push rbp/rbx/r12..r15, then sub rsp,<multiples of 16
+  per slot need>; reverse-pops exactly in epilogue (pop r15,r14,r13,r12,rbx,rbp).
+
+===== END PLAN =====

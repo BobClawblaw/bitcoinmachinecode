@@ -1,0 +1,38 @@
+# Bootstrapping seed list for the Bitcoin machine-code node.
+#
+# Sources: empirical live probing (connect + version/verack handshake + getheaders
+# serving) against real mainnet seeds, conducted 2026-08-12 using tests/live_probe
+# (the assembly net/p2p codecs). Seeds nearer the top served the REAL header chain
+# (2000 headers to the live tip) most reliably in probing.
+#
+# Format: one DNS hostname (or IP) per line. Lines beginning with '#' are ignored.
+# The bootstrapper resolves each and connects to TCP 8333 (mainnet).
+#
+# NOTE on block bodies (UPDATED 2026-08-12 #11): a long-standing "seeds drop
+# block-body getdata" wall was root-caused to OUR OWN malformed getdata (a
+# 34-byte msg real nodes ignore) -- now fixed to the canonical 37-byte form.
+# Real mainnet block bodies have since been downloaded + cons_verify-validated
+# from the cooperative local node below. Public seeds reliably serve the real
+# header chain; block-body serving to an unproven peer is still intermittent.
+
+# --- KNOWN COOPERATIVE NODE (serves header chain AND block bodies; best boot) ---
+192.168.5.69
+
+# --- TIER 1: served the real header chain in live probing (preferred boot order) ---
+dnsseed.bluematt.me
+seed.bitcoin.jonasschnelli.ch
+seed.btc.petertodd.net
+dnsseed.bitcoin.dashjr.org
+dnsseed.emzy.de
+
+# --- TIER 2: connect + handshake OK, header serving flaky (retry candidates) ---
+seed.bitcoin.sipa.be
+seed.bitcoin.sprovoost.nl
+
+# --- TIER 3 (historical/known, unverified or intermittent this run; keep for fallback) ---
+# seed.bitcoinstats.com       (connect refused -113 in probing)
+# seed.bitcoin.wiz.biz         (connect refused -111 in probing)
+# seed.bitcharcoal.com         (getaddrinfo failed)
+# seed.bitcoinbase.com         (getaddrinfo failed)
+# seed.bcoin.ctc               (getaddrinfo failed)
+# seed.bitnodes.io             (no response in probing)
