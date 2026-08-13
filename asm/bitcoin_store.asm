@@ -539,6 +539,201 @@ store_append:
     pop  rbp
     ret
 
+; ============================================================================
+; store_append_shared(st, height, hash[32], raw, len) -- CONCURRENT-SAFE append
+;   into ONE shared store from many processes (used to write directly into the
+;   single archive with NO per-worker shard directories).
+;   st+40 = flock fd on <dir>/append.lock (caller opens it). Each append runs
+;   entirely under that flock, so parallel workers can never interleave a frame.
+;   The block is written at the TRUE current end of the block file (lseek
+;   SEEK_END under the lock) and the 48-byte index record at height*48 -- so
+;   workers writing DISJOINT heights land each record at its own slot and the
+;   block payload at a consistent sequential offset. Index.dat must be
+;   PRE-SIZED to (end+1)*48 by the caller.
+;   Returns height on success, -1 on error.
+;   Frame: 5 pushes (rbx,r12-r15) -> save area rbp-8..-0x28; locals below.
+; ============================================================================
+global store_append_shared
+store_append_shared:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x120           ; locals BELOW the 5-push save area [rbp-8..-0x28]
+    mov  r12, rdi            ; st
+    mov  r13, rsi            ; height
+    mov  r14, rdx            ; hash
+    mov  r15, rcx            ; raw
+    mov  [rbp-0x30], r8      ; len (below save area)
+    ; ---- acquire shared append lock ----
+    mov  rdi, [r12+40]
+    test rdi, rdi
+    js   .hlock
+    mov  eax, 73             ; flock (x86-64 syscall #73, not fcntl #72!)
+    mov  esi, 2              ; LOCK_EX
+    syscall
+.hlock:
+    ; ---- ensure idx_fd/blk_fd open ----
+    mov  rax, [r12+8]
+    test rax, rax
+    jns  .hidx
+    mov  rdi, r12
+    call open_idx_close      ; (defined below: reopen index.dat)
+.hidx:
+    mov  rax, [r12]
+    test rax, rax
+    jns  .hblk
+    mov  rdi, r12
+    mov  esi, [r12+28]
+    call open_file
+    test rax, rax
+    jl   .herr
+.hblk:
+    ; ---- find TRUE end of current blk file (self-healing position) ----
+.repos:
+    mov  rdi, [r12]
+    xor  esi, esi
+    mov  edx, 2              ; SEEK_END
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .herr
+.roll_ck:
+    mov  [rbp-0x38], rax     ; true file length
+    ; if cur_file_pos (len of this file) + 8 + len > MAX_FILE -> roll
+    mov  eax, [rbp-0x38]
+    mov  ecx, [rbp-0x30]
+    lea  eax, [rax+rcx+8]
+    cmp  eax, MAX_FILE
+    jbe  .nroll
+    ; close current, cur_file_no++, reopen new file, goto repos (new file len=0)
+    mov  rdi, [r12]
+    mov  eax, 3
+    syscall
+    mov  dword [r12], -1
+    mov  eax, [r12+28]
+    add  eax, 1
+    mov  [r12+28], eax
+    mov  rdi, r12
+    mov  esi, eax
+    call open_file
+    test rax, rax
+    jl   .herr
+    jmp  .repos
+.nroll:
+    mov  rax, [rbp-0x38]
+    mov  [rbp-0x40], rax     ; data_pos = true end
+    ; save file_no for the index record
+    mov  eax, [r12+28]
+    mov  [rbp-0x48], eax
+    ; build frame header [u32 len][u32 magic] at rbp-0x60
+    mov  eax, [rbp-0x30]
+    mov  dword [rbp-0x60], eax
+    mov  eax, [r12+36]
+    mov  [rbp-0x5c], eax
+    ; lseek(blk_fd, data_pos); write frame (8); write raw
+    mov  rdi, [r12]
+    mov  rax, [rbp-0x40]
+    mov  rsi, rax
+    xor  edx, edx
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .herr
+    mov  rdi, [r12]
+    lea  rsi, [rbp-0x60]
+    mov  edx, 8
+    mov  eax, 1
+    syscall
+    cmp  rax, 8
+    jne  .herr
+    mov  rdi, [r12]
+    mov  rsi, r15
+    mov  edx, [rbp-0x30]
+    mov  eax, 1
+    syscall
+    cmp  rax, [rbp-0x30]
+    jne  .herr
+    ; ---- write index record at height*48: [hash32][file_no u32][pos u64][size u32]
+    lea  rdi, [rbp-0x90]
+    mov  rsi, r14
+    mov  rcx, 32
+    rep  movsb
+    mov  eax, [rbp-0x48]
+    mov  [rbp-0x90+32], eax
+    mov  rax, [rbp-0x40]
+    mov  [rbp-0x90+36], rax
+    mov  eax, [rbp-0x30]
+    mov  [rbp-0x90+44], eax
+    mov  rdi, [r12+8]
+    mov  rax, r13
+    imul rax, 48
+    mov  rsi, rax
+    xor  edx, edx
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .herr
+    mov  rdi, [r12+8]
+    lea  rsi, [rbp-0x90]
+    mov  edx, 48
+    mov  eax, 1
+    syscall
+    cmp  rax, 48
+    jne  .herr
+    ; ---- release lock ----
+    mov  rdi, [r12+40]
+    test rdi, rdi
+    js   .hlkdone
+    mov  eax, 73             ; flock
+    mov  esi, 8              ; LOCK_UN
+    syscall
+.hlkdone:
+    mov  rax, r13
+    jmp  .hret
+.herr:
+    mov  rdi, [r12+40]
+    test rdi, rdi
+    js   .hlkerr2
+    mov  eax, 73             ; flock
+    mov  esi, 8
+    syscall
+.hlkerr2:
+    mov  rax, -1
+.hret:
+    add  rsp, 0x120
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; open_idx_close(st): reopen index.dat (used when idx_fd is stale).
+open_idx_close:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    sub  rsp, 0x20
+    mov  r12, rdi
+    lea  rdi, [rel idxname]
+    mov  esi, 2 | 0x40
+    mov  edx, 0o644
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .oer
+    mov  [r12+8], rax
+.oer:
+    add  rsp, 0x20
+    pop  r12
+    pop  rbp
+    ret
+
 section .rodata
 blkname: db "blk00000.dat", 0   ; (fmt_blkname builds actual names at runtime)
 idxname: db "index.dat", 0
