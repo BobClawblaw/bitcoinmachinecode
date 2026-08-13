@@ -83,10 +83,15 @@ header + tx-count + coinbase, real nBits 0x1d00ffff, real merkle root) via
 test_block_genesis (offline, in make test); pow_check/diff_target implement the
 real Bitcoin difficulty algorithm and are proven against real mainnet nBits;
 and the node reproduces a live-downloaded real block-1 hash. **The block-body
-download + store tail is now exercised end to end against a REAL node
-(192.168.5.69:8333): real mainnet block bodies are downloaded, cons_verify-
-validated as VALID, and stored.** The long-standing "seeds drop block-body
-getdata" wall was root-caused to our own malformed getdata: `p2p_getdata_block`
+download + store tail is now exercised end to end against a REAL node: real
+mainnet block bodies are downloaded, cons_verify-validated as VALID, and
+stored.** (The initial live proof used the cooperative local node
+192.168.5.69:8333, but the production download no longer depends on it — block
+bodies come from a large pool of verified **internet** peers via distinct-peer
+selection, and while a local node is still tried first only as a *header* source,
+the bulk of the chain is pulled in parallel from internet peers.) The
+long-standing "seeds drop block-body getdata" wall was root-caused to our own
+malformed getdata: `p2p_getdata_block`
 emitted a 34-byte message (type as a 1-byte varint) that real nodes silently
 ignore. The canonical Bitcoin getdata/inv inventory is `[count varint][type int32
 LE][hash32]` = 37 bytes with the hash at +5 (the p2p_oracle always encoded this;
