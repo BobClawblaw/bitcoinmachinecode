@@ -1469,6 +1469,156 @@ node_ibd_blocks_x:
     ret
 
 ; ============================================================================
+; node_ibd_blocks_s(fd, st*, hst*, lo_real, nloc, buf, buflen, scratch, cap)
+;   SAME receive/validate loop as node_ibd_blocks_x, but each block is written
+;   via CONCURRENT-SAFE store_append_shared(st, lo_real+i, hash, buf, plen), so
+;   many workers write DIRECTLY into ONE shared store (single directory), with
+;   no per-worker shard dirs. hst holds nloc LOCAL headers for real heights
+;   [lo_real .. lo_real+nloc-1].
+;   Frame mirrors node_ibd_blocks_x (0x280 stack, locals below save area).
+; ============================================================================
+extern store_append_shared
+global node_ibd_blocks_s
+node_ibd_blocks_s:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x280
+    mov  rbx, rdi           ; fd
+    mov  r12, rsi           ; st
+    mov  [rbp-0x30], rdx    ; hst (local)
+    mov  [rbp-0x38], rcx    ; lo_real
+    mov  [rbp-0x40], r8     ; nloc
+    mov  r14, r9            ; buf
+    mov  rax, [rbp+16]
+    mov  r15, rax           ; buflen
+    mov  rax, [rbp+24]
+    mov  [rbp-0x58], rax    ; scratch
+    mov  eax, [rbp+32]
+    mov  [rbp-0x60], eax    ; scratch_cap
+    mov  qword [rbp-0x50], 0        ; total = 0
+    mov  qword [rbp-0x48], 0        ; i (local) = 0
+    mov  qword [rbp-0x258], 0       ; skip budget
+.loop_s:
+    mov  rax, [rbp-0x48]
+    mov  rcx, [rbp-0x40]
+    cmp  rax, rcx
+    jae  .done_s
+    ; hst_get_at(hst, i, rec@-0x140)
+    mov  rdi, [rbp-0x30]
+    mov  rsi, rax
+    lea  rdx, [rbp-0x140]
+    call hst_get_at
+    test eax, eax
+    jle  .done_s
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0x140+80]
+    call p2p_getdata_block
+    mov  r8d, eax
+    mov  rdi, rbx
+    lea  rsi, [rel _getdata]
+    mov  edx, 7
+    lea  rcx, [rbp-0xa0]
+    call p2p_write
+    cmp  rax, 24
+    jl   .fail_s
+.receive_s:
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x70]
+    mov  rdx, r14
+    mov  ecx, r15d
+    lea  r8,  [rbp-0x64]
+    call p2p_read
+    test rax, rax
+    jle  .fail_s
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [rel _ping]
+    mov  ecx, 4
+    repe cmpsb
+    jne  .not_ping_s
+    mov  rdi, rbx
+    lea  rsi, [rel _pong]
+    mov  edx, 4
+    mov  rcx, r14
+    mov  r8d, 8
+    call p2p_write
+    jmp  .receive_s
+.not_ping_s:
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [rel _block]
+    mov  ecx, 5
+    repe cmpsb
+    jne  .receive_s
+    mov  rdi, r14
+    mov  esi, [rbp-0x64]
+    mov  rdx, [rbp-0x58]
+    mov  ecx, [rbp-0x60]
+    call cons_verify
+    test eax, eax
+    jz   .fail_s
+    lea  rdi, [rbp-0xc0]
+    mov  rsi, r14
+    call block_hash
+    lea  rdi, [rbp-0xc0]
+    lea  rsi, [rbp-0x140+80]
+    mov  ecx, 32
+    repe cmpsb
+    jne  .skip_block_s
+    ; chain-link guard (i>0): block prevhash == hdr hash at local i-1
+    cmp  qword [rbp-0x48], 0
+    je   .chain_ok_s
+    mov  rdi, [rbp-0x30]
+    mov  rax, [rbp-0x48]
+    lea  rsi, [rax-1]
+    lea  rdx, [rbp-0x1b0]
+    call hst_get_at
+    test eax, eax
+    jle  .fail_s
+    lea  rdi, [r14+4]
+    lea  rsi, [rbp-0x1b0+80]
+    mov  ecx, 32
+    repe cmpsb
+    jne  .fail_s
+.chain_ok_s:
+    ; store_append_shared(st, lo_real + i, blockhash, buf, plen)
+    mov  rax, [rbp-0x38]
+    add  rax, [rbp-0x48]    ; real_height
+    mov  rdi, r12
+    mov  rsi, rax           ; height
+    lea  rdx, [rbp-0xc0]    ; hash
+    mov  rcx, r14           ; raw
+    mov  r8d, [rbp-0x64]    ; len (zero-extended)
+    call store_append_shared
+    cmp  rax, -1
+    je   .fail_s
+    inc  qword [rbp-0x50]
+    inc  qword [rbp-0x48]
+    jmp  .loop_s
+.skip_block_s:
+    inc  qword [rbp-0x258]
+    cmp  qword [rbp-0x258], 64
+    ja   .fail_s
+    jmp  .receive_s
+.done_s:
+    mov  rax, [rbp-0x50]
+    jmp  .ret_s
+.fail_s:
+    mov  rax, -1
+.ret_s:
+    add  rsp, 0x280
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
 ; node_ibd(fd, st*, hst*, buf, buflen) -> eax = # blocks stored (or -1)
 ;   FULL headers-first Initial Block Download as ONE assembly pass over a single
 ;   peer connection, stitching the two verified halves:

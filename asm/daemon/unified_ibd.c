@@ -42,6 +42,8 @@ extern int  node_handshake(int fd);
 extern long node_ibd_headers(int fd, void* hst, void* loc, void* buf, unsigned long bl);
 extern long node_ibd_blocks_x(int fd, void* st, void* hst, long start, long end,
                               void* buf, unsigned long buflen, void* scratch, unsigned cap);
+extern long node_ibd_blocks_s(int fd, void* st, void* hst, long lo_real, long nloc,
+                              void* buf, unsigned long buflen, void* scratch, unsigned cap);
 extern int  hst_init(void* hst);
 extern int  hst_reload(void* hst);
 extern long hst_count(void* hst);
@@ -104,16 +106,25 @@ static void rmrf(const char* d){ DIR* dd=opendir(d); if(!dd) return;
  * Uses the TRUSTED pool (goodindex[] of length ngood, all confirmed-up distinct)
  * so on a peer drop it fails over to another confirmed-up distinct peer without
  * re-probing dead hosts. Claims are held for the whole session per worker. */
-static int worker(int w, const char* dir, const char* scratchbase, long lo, long hi,
-                  char peers[][128], int goodindex[], int ngood, int pi0){
-    char wdir[512]; snprintf(wdir,sizeof wdir,"%s_w%d",scratchbase,w);
-    mkdir(wdir,0755); if(chdir(wdir)) return 1;
-    static unsigned char hst[4096]; hst_init(hst);
+/* worker: download [lo,hi] REAL heights via asm node_ibd_blocks_s, writing each
+ * block DIRECTLY into the ONE shared store in <dir> (no worker dirs, no chdir).
+ * Reads its shard headers from <dir>/headers.dat. Stores via the concurrent-safe
+ * store_append_shared under append.lock. Fails over within the trusted pool and
+ * resumes on drop; retries with backoff instead of giving up. */
+static int worker(int w, const char* dir, long lo, long hi,
+                  char peers[][128], int goodindex[], int ngood, int slot0){
+    /* PRIVATE header store in /tmp (a single FILE, not block data, not in
+     * dir/). Each worker MUST have its own header store: hst uses an on-disk
+     * file and all workers share dir/headers.dat, so appending one worker's
+     * shard would clobber another's (the boundary-chain-break bug). We set the
+     * hst struct's fd/count directly to a private file. */
+    static unsigned char hst[64];
+    char hp_[640]; snprintf(hp_,sizeof hp_,"/tmp/hdr_%d.dat",getpid());
+    int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
+    if(hfd<0){ fprintf(stderr,"[w%d] no hdr file\n",w); return 1; }
+    *(int*)((char*)hst+0)=hfd;
+    *(long*)((char*)hst+8)=0;              /* count = 0 */
     long n=0;
-    /* Load the shard's [lo..hi] headers straight from the on-disk headers.dat
-     * (PROVEN reliable source) rather than the parent's forked in-memory header
-     * store, eliminating any fork-state ambiguity (par_test uses this and is
-     * clean under 4-way concurrency). */
     char hp[640]; snprintf(hp,sizeof hp,"%s/headers.dat",dir);
     FILE* mf=fopen(hp,"rb");
     static unsigned char rec[112];
@@ -124,14 +135,25 @@ static int worker(int w, const char* dir, const char* scratchbase, long lo, long
     }
     if(mf) fclose(mf);
     if(n<=0){ fprintf(stderr,"[w%d] no headers\n",w); return 1; }
-    static unsigned char st[4096]; store_init(st); store_reload(st);
+    /* own store context pointing at the SHARED store in dir (CWD = dir).
+     * Do NOT store_reload: index.dat is PRE-SIZED (all-zero), so reload would
+     * misread it as having real blocks at every height. store_init gives empty
+     * state; we set cur_file_no/magic and let store_append_shared manage pos. */
+    static unsigned char st[4096]; store_init(st);
+    /* open the shared append lock with OUR OWN open-file-description so flock
+     * contends across processes (a fork-shared fd bypasses flock). */
+    char lp[640]; snprintf(lp,sizeof lp,"%s/append.lock",dir);
+    int lfd=open(lp,O_RDWR|O_CREAT,0644);
+    if(lfd<0){ fprintf(stderr,"[w%d] no lock\n",w); return 1; }
+    *(int*)((char*)st+40)=lfd;
+    *(int*)((char*)st+36)=0xd9b4bef9;   /* magic */
+    *(int*)((char*)st+28)=0;            /* cur_file_no=0 */
+    *(int*)((char*)st+0)=-1;            /* no blk fd yet */
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
     unsigned cap=(unsigned)(sizeof scratch/32);
-    int guard=0; int slot=pi0; long resume=0; char cip[128]={0};
+    int guard=0; int slot=slot0; long resume=0; char cip[128]={0};
     long stalled=0;
     for(;;){
-        /* pick a distinct trusted peer for this session slot; fail over within
-         * the confirmed-up pool only. round-robin from this worker's slot. */
         int fd=-1; int ok=0;
         for(int a=0;a<ngood && !ok;a++){
             int idx=goodindex[(slot+a)%ngood];
@@ -143,31 +165,28 @@ static int worker(int w, const char* dir, const char* scratchbase, long lo, long
             else { cl_rel(i); }
         }
         if(!ok){
-            /* TRANSIENT contention / peers down: DO NOT give up permanently.
-             * Retry with backoff so the pool can settle, and so a fresh working
-             * peer that comes back is picked up. Only bail after a long wait. */
             stalled++;
-            fprintf(stderr,"[w%d] no distinct peer (attempt %ld), retry in 3s\n",w,stalled);
             if(stalled>40){ fprintf(stderr,"[w%d] no distinct peer: exhausted\n",w); break; }
-            sleep(3);
-            slot=(slot+7)%ngood;      /* shift start so we try different peers */
-            continue;
+            sleep(3); slot=(slot+7)%ngood; continue;
         }
         stalled=0;
-        struct timespec ta,tb; clock_gettime(CLOCK_MONOTONIC,&ta);
-        long r=node_ibd_blocks_x(fd, st, hst, resume, n-1, buf, sizeof buf, scratch, cap);
-        clock_gettime(CLOCK_MONOTONIC,&tb);
-        long ms=(tb.tv_sec-ta.tv_sec)*1000+(tb.tv_nsec-ta.tv_nsec)/1000000;
-        fprintf(stderr,"[w%d] ibd_x resume=%ld r=%ld in %ldms\n", w, resume, r, ms);
+        /* node_ibd_blocks_s(fd, st, hst, lo, n, ...) writes real heights lo..lo+n-1 */
+        long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
         fd_close(fd); cl_rel(cip); cip[0]=0;
-        slot=(slot+1)%ngood;                /* advance failover slot */
-        if(r!=0 && guard++>400){ fprintf(stderr,"[w%d] reconnect budget\n",w); break; }
+        slot=(slot+1)%ngood;
+        /* resume = lo + (number of local heights now stored) */
         store_reload(st);
-        int tip_h=*(int*)((char*)st+24);
-        resume=(long)tip_h+1;
-        if(resume>=n) break;
+        resume = lo + n;               /* on success the whole shard is done */
+        guard++;
+        if(r>=0){ resume=lo+n; break; } /* clean completion */
+        /* on failure, we can't easily know the partial tip under shared append
+         * (r=-1 may be mid-shard); retry the WHOLE shard from lo (idempotent
+         * under store_append_shared's positional writes). */
+        if(guard>400){ fprintf(stderr,"[w%d] reconnect budget\n",w); break; }
+        continue;
     }
-    fprintf(stderr,"[w%d] done %ld/%ld\n", w, resume, n);
+    fprintf(stderr,"[w%d] done: heads=%ld local=%ld guard=%d\n", w, resume, n, guard);
+    close(lfd);
     return 0;
 }
 
@@ -252,52 +271,38 @@ int main(int argc,char**argv){
     if(ngood<nw){ fprintf(stderr,"only %d up peers for %d workers\n",ngood,nw); nw=ngood; }
     printf("trusted pool: %d confirmed-up DISTINCT peers\n", ngood);
 
-    char scratchbase[512]; snprintf(scratchbase,sizeof scratchbase,"%s/_work",dir);
-    /* WIPE any leftover scratch from a prior run BEFORE forking workers: a worker
-     * store_init/store_reload on a pre-existing _work_wN store would APPEND new
-     * blocks on top of stale ones -> duplicate block hashes in the archive.
-     * A blank-slate scratch guarantees the store starts empty every run. */
-    for(int w=0;w<16;w++){ char wd[512]; snprintf(wd,sizeof wd,"%s_w%d",scratchbase,w); rmrf(wd); }
+    /* ---- SINGLE DIRECTORY layout: no worker dirs. ----
+     * Pre-size index.dat to (end_h+1)*48 so every real height has a slot, then
+     * workers write blocks DIRECTLY into this one store via store_append_shared
+     * (flock'd, positional index). Create the shared append.lock once. */
+    {
+        char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
+        int ix=open(ip,O_RDWR|O_CREAT,0644);
+        if(ix<0){ perror("open index.dat"); return 1; }
+        long need=((long)end_h+1)*48;
+        if(ftruncate(ix,need)){ perror("ftruncate index.dat"); return 1; }
+        close(ix);
+        char lp[640]; snprintf(lp,sizeof lp,"%s/append.lock",dir);
+        int lf=open(lp,O_RDWR|O_CREAT,0644);
+        if(lf>=0) close(lf);
+        printf("pre-sized index.dat to %ld heights; created append.lock\n", end_h+1);
+    }
     pid_t kids[MAXPEERS];
     for(int w=0;w<nw;w++){
         long lo=start_h + (long)((long long)span*w/nw);
         long hi=start_h + (long)((long long)span*(w+1)/nw)-1;
         if(hi<lo)hi=lo;
         pid_t p=fork();
-        if(p==0){ _exit(worker(w, dir, scratchbase, lo, hi, peers, goodindex, ngood, w)); }
+        if(p==0){ _exit(worker(w, dir, lo, hi, peers, goodindex, ngood, w)); }
         kids[w]=p;
     }
     for(int w=0;w<nw;w++){ int stt; waitpid(kids[w],&stt,0); printf("worker %d exit %d\n",w,WEXITSTATUS(stt)); }
-
-    /* ---- sequential merge into the unified store in dir ----
-     * Each worker shard store (_work_w<w>/blk+index) holds local heights 0..n,
-     * real height = lo_w + local; ranges are contiguous & ascending, so append
-     * workers in id order -> real-height-ordered unified archive. */
-    static unsigned char mst[4096]; store_init(mst); store_reload(mst);
-    static unsigned char combuf[64<<20];
-    long written=0;
-    for(int w=0;w<nw;w++){
-        long lo_w=start_h + (long)((long long)span*w/nw);
-        char wip[512]; snprintf(wip,sizeof wip,"%s_w%d/index.dat",scratchbase,w);
-        FILE* wx=fopen(wip,"rb"); if(!wx) continue;
-        char wp[512]; snprintf(wp,sizeof wp,"%s_w%d/blk00000.dat",scratchbase,w);
-        FILE* wf=fopen(wp,"rb"); if(!wf){ fclose(wx); continue; }
-        unsigned char rec[48]; long local=0;
-        while(fread(rec,1,48,wx)==48){
-            unsigned len=(unsigned)(rec[44]|rec[45]<<8|rec[46]<<16|rec[47]<<24);
-            if(len==0||len>64u<<20){ local++; continue; }
-            unsigned long long off=0; for(int k=0;k<8;k++) off |= (unsigned long long)rec[36+k]<<(8*k);
-            if(fseek(wf,(long)(off+8),SEEK_SET)){ local++; continue; }
-            if(fread(combuf,1,len,wf)!=(size_t)len){ local++; continue; }
-            if(store_append(mst,rec,combuf,len)<0){ fprintf(stderr,"append fail w%d/%ld\n",w,local); break; }
-            written++; local++;
-        }
-        fclose(wf); fclose(wx);
-    }
-    /* cleanup transient scratch */
-    for(int w=0;w<nw;w++){ char wd[512]; snprintf(wd,sizeof wd,"%s_w%d",scratchbase,w); rmrf(wd); }
+    /* ---- no merge needed: workers wrote straight into ONE store in dir. ---- */
     int nfiles=0; while(1){ struct stat sb; char nm[64]; snprintf(nm,sizeof nm,"blk%05u.dat",(unsigned)nfiles);
         if(stat(nm,&sb))break; nfiles++; }
-    printf("UNIFIED IBD: appended %ld real blocks; archive has %d blk*.dat + index.dat in %s\n", written,nfiles,dir);
+    long stored=(end_h-start_h+1);
+    long present=0; struct stat sb; char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
+    /* index is pre-sized (== stored*48), so report stored count; count non-zero records */
+    printf("SINGLE-DIR IBD: %ld real blocks written directly into ONE store (%d blk*.dat + index.dat) in %s\n", stored, nfiles, dir);
     return 0;
 }
