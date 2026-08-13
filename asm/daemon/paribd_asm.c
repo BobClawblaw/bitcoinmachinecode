@@ -95,6 +95,55 @@ static int connect_peer(const char* host){
 }
 
 /* ---------------- worker: all-asm block loop over its shard ---------------- */
+/* ---------------- global distinct-peer claims ----------------
+ * All workers are separate processes (fork), so to guarantee NO TWO workers
+ * ever use the same peer IP we keep a SHARED claim table at an ABSOLUTE path
+ * passed in (dir/peerclaims), one IP per line. Claims are taken under an
+ * flock-ed lock, so they are atomic across processes. A worker acquires a
+ * claim on an IP before using it and releases it when the peer drops, so
+ * failover always lands on a peer no other worker is using. */
+#include <sys/file.h>
+static char claimpath[512];
+static FILE* claimfile=NULL;
+static void claim_open(void){ if(!claimfile){ claimfile=fopen(claimpath,"a+"); } }
+static void claim_lock(void){ claim_open(); if(claimfile){ flock(fileno(claimfile),LOCK_EX); } }
+static void claim_unlock(void){ if(claimfile){ flock(fileno(claimfile),LOCK_UN); } }
+static int claim_has(const char* ip){
+    /* caller holds lock. returns nonzero if ip already in the table. */
+    rewind(claimfile); char line[256];
+    while(fgets(line,sizeof line,claimfile)){
+        char* nl=strchr(line,'\n'); if(nl)*nl=0;
+        if(!strcmp(line,ip)) return 1;
+    }
+    return 0;
+}
+static int claim_take(const char* ip){
+    claim_lock();
+    if(!claimfile){ claim_unlock(); return 0; }
+    int dup=claim_has(ip);
+    if(!dup){ fseek(claimfile,0,SEEK_END); fprintf(claimfile,"%s\n",ip); fflush(claimfile); }
+    claim_unlock();
+    return !dup;
+}
+static void claim_release(const char* ip){
+    claim_lock();
+    if(claimfile){
+        char tmp[540]; snprintf(tmp,sizeof tmp,"%s.tmp",claimpath);
+        FILE* in=fopen(claimpath,"r"); FILE* out=fopen(tmp,"w");
+        char line[256];
+        if(in&&out){
+            while(fgets(line,sizeof line,in)){
+                char* nl=strchr(line,'\n'); if(nl)*nl=0;
+                if(strcmp(line,ip)==0) continue;
+                fprintf(out,"%s\n",line);
+            }
+        }
+        if(in)fclose(in); if(out)fclose(out);
+        rename(tmp,claimpath);
+    }
+    claim_unlock();
+}
+
 static int worker(int w, const char* dir, long lo_w, long hi_w, void* mhst,
                   char peers[][128], int np, int pi0){
     char wdir[512]; snprintf(wdir,sizeof wdir,"%s/w%d",dir,w);
@@ -123,17 +172,25 @@ static int worker(int w, const char* dir, long lo_w, long hi_w, void* mhst,
     int guard=0;
     int pi=pi0;
     long resume=0;               /* local height to resume from */
+    char claimed_ip[128]={0};
     for(;;){
-        /* connect to a peer, failing over across the pool on errors */
-        int fd=-1;
-        for(int a=0; a<np*3 && fd<0; a++){
-            fd=connect_peer(peers[(pi+a)%np]);
-            if(fd<0) usleep(150000);
+        /* connect to a DISTINCT peer: only use peers whose IP we can CLAIM in
+         * the shared table (so no two workers ever share a host), failing over
+         * across the pool. Release the claim when the peer drops. */
+        int fd=-1; int got_claimed=0;
+        for(int a=0; a<np*3+40 && !got_claimed; a++){
+            const char* cand=peers[(pi+a)%np];
+            char cip[128]; snprintf(cip,sizeof cip,"%s",cand); char* col=strchr(cip,':'); if(col)*col=0;
+            if(!claim_take(cip)) continue;                  /* taken by another worker */
+            int fdc=connect_peer(cand);
+            if(fdc>=0){ strncpy(claimed_ip,cip,sizeof claimed_ip); claimed_ip[sizeof claimed_ip-1]=0; fd=fdc; got_claimed=1; }
+            else { claim_release(cip); usleep(150000); }
         }
-        if(fd<0){ fprintf(stderr,"[w%d] all peers unreachable, giving up\n",w); break; }
+        if(!got_claimed){ fprintf(stderr,"[w%d] no distinct peer reachable, giving up\n",w); break; }
         /* run the ASM receive loop over [resume, n-1]; -1 (peer dropped) -> resume */
         long r=node_ibd_blocks_x(fd, st, hst, resume, n-1, buf, sizeof buf, scratch, cap);
         fd_close(fd);
+        claim_release(claimed_ip); claimed_ip[0]=0;
         if(r!=0 && guard++>3000){ fprintf(stderr,"[w%d] reconnect budget exhausted\n",w); break; }
         /* resume from stored tip + 1 (worker local heights 0.. in its own store) */
         store_reload(st);
@@ -212,6 +269,8 @@ int main(int argc,char**argv){
 
     /* ---- phase 1: ASM header download via node_ibd_headers into master hst ---- */
     if(chdir(dir)!=0){ perror("chdir"); return 1; }
+    snprintf(claimpath,sizeof claimpath,"%s/peerclaims",dir);   /* absolute: workers chdir into w<w> */
+    remove(claimpath);
     static unsigned char mhst[4096];
     hst_init(mhst);
     static unsigned char zp[32];  /* genesis locator = 0 */
