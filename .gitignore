@@ -80,3 +80,5 @@ asm/bitcoin_serve.o
 asm/tests/test_p2p_inv
 asm/tests/test_sha512
 asm/sha512.o
+asm/tests/test_hmac
+asm/bitcoin_hmac.o
