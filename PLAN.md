@@ -366,5 +366,10 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   survive calls to fe_* (which preserve them) and point functions.
 - Every point_* frame: push rbp/rbx/r12..r15, then sub rsp,<multiples of 16
   per slot need>; reverse-pops exactly in epilogue (pop r15,r14,r13,r12,rbx,rbp).
+- When building a runtime filename/string, ALWAYS write the terminating NUL byte
+  EXPLICITLY (mov byte [..],0). A `mov dword` store covers only 4 bytes -- the
+  classic `.dat\0` written as `mov dword [b+8],0x007461642E` silently drops the
+  NUL, so open() reads past the end into stack garbage and creates corrupted long
+  filenames (bitcoin_store fmt_blkname bug, #13). Size every store to its full field.
 
 ===== END PLAN =====

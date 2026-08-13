@@ -8,6 +8,48 @@ success is reached. Update it after every meaningful event.
 LOG
 ================================================================================
 
+## 2026-08-13 -- #13 STORE REFACTOR RECONCILED + root-caused a REAL corrupted-filename bug; full suite back to 283 PASS-equiv (22 green, 0 FAIL)
+### Context
+On resuming, `make test` showed `test_bitcoind_sync` failing (`store tip_height == NB-1
+got=0 exp=1`) and `test_cli` failing 6 assertions (`getbestblockhash`/`getblockhash 3`/
+`getblock 2`/`getblock by-hash`/`gettx`/`getbalance` -> "height out of range"/"not
+found"). Both traced to an UNLOGGED, PARTIALLY-PROPAGATED refactor of bitcoin_store.asm
+(timestamps 07:18/07:29, after the last 283-PASS baseline) that added multi-file 128MB
+rollover blk%05d.dat support and changed the store struct layout.
+### Root cause #1 -- store struct layout mismatch (+24 semantics)
+New bitcoin_store.asm moved state around so that `+24` was `cur_file_no` and tip height
+was only derivable as `+16 idx_len/48-1`. But the verified consumer ecosystem
+(bitcoind.asm node_serve_block_by_hash, bitcoind.asm node_sync, bitcoin_cli.asm ~10
+sites, paribd_asm.c worker resume, test_bitcoind_sync.c) all read `+24` as the tip
+height. FIX: keep the multi-file feature but fix `+24` to mean tip_height in the store's
+OWN struct so every existing consumer is correct with ZERO edits:
+    +0 cur_blk_fd, +8 idx_fd, +16 idx_len, +24 dword tip_height (-1 empty),
+    +28 dword cur_file_no, +32 dword cur_file_pos, +36 dword magic.
+store_init sets tip=-1; store_append sets tip=newheight; store_reload restores tip from
+the last index record. Updated test_store.c's struct mirror + added `reload tip_height 2`.
+No consumer files needed changing (they already read +24 as tip).
+### Root cause #2 -- the REAL bug hiding underneath: corrupted reopened filename
+After #1, test_cli still failed: every cli_load_block/store_get_file_fd open created a
+file with a CORRUPTED long name (`blk00000.dat<garbage>`), so reads found 0 bytes.
+strace showed the name was missing its NUL: `open("blk00000.dat\375\177"...)`,
+`open("blk00000.dat%%%%..."...)` -- stack garbage read past the end of "blk00000.dat".
+ROOT CAUSE: fmt_blkname wrote the suffix with `mov dword [r12+8], 0x007461642E`
+intending ".dat\0" -- but a dword store is only FOUR bytes (".dat"), so the 5th byte
+(the NUL at +12) was NEVER written. The old single-file store opened the fixed rodata
+string `blk00000.dat\0` (already NUL-terminated), so this bug is NEW to the multi-file
+refactor. FIX: write `.dat` then an explicit `mov byte [r12+12], 0`. Verified in
+objdump (movb $0x0,0xc(%r12)) and by ls: only clean `blk00000.dat`/`index.dat` remain.
+### Lesson (add to golden rules)
+"blk00000.dat" is 13 bytes ("blk"+5 digits+".dat"+NUL). Writing a filename suffix with a
+DWORD store covers only 4 bytes -- ALWAYS write the terminating NUL explicitly when
+building a runtime filename, or open() will read past the end into stack garbage and
+create corrupted long filenames. (Same class as the "size every load to the field" rule:
+size every store to the full field, incl. the NUL.)
+### Result
+make test: 22/22 green, 0 FAIL, MAKE EXIT=0. Ubuntu full suite restored and RED:
+test_store (incl. reload tip) and test_cli fully pass. Committed to the new GitHub repo
+BobClawblaw/bitcoinmachinecode.
+
 ## 2026-08-12 -- #12 PARALLEL multi-peer FULL-CHAIN download (>= 8 DISTINCT internet peers) + ALL-ASM receive loop + real-mainnet header-continuity fix
 ### Goal and outcome
 Download the FULL mainnet blockchain so it can be re-served, from >= 8 DISTINCT

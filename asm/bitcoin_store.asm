@@ -21,10 +21,11 @@
 ;   +0    qword cur_blk_fd      (open fd of the CURRENT block file)
 ;   +8    qword idx_fd          (open fd of index.dat)
 ;   +16   qword idx_len         (bytes in index.dat; height = idx_len/48 - 1)
-;   +24   dword cur_file_no     (current block file number)
-;   +28   dword cur_file_pos    (bytes written in the current block file so far)
-;   +32   dword magic           (mainnet 0xd9b4bef9)
-;   +36   dword pad             (reserved / alignment)
+;   +24   dword tip_height      (0-indexed highest stored height; -1 when empty)
+;   +28   dword cur_file_no     (current block file number)
+;   +32   dword cur_file_pos    (bytes written in the current block file so far)
+;   +36   dword magic           (mainnet 0xd9b4bef9)
+;   +40   dword pad             (reserved / alignment)
 ;
 ; Exports:
 ;   int store_init(void* st)                    -> 1 ok / -errno
@@ -90,8 +91,11 @@ fmt_blkname:                 ; rdi=buf(>=13), esi=file_no
     mov  eax, edx
     add  al, '0'
     mov  [r12+7], al        ; ones
-    ; ".dat\0"
-    mov  dword [r12+8], 0x007461642E  ; ".dat\0"
+    ; ".dat" then NUL terminator (must write the 0 explicitly -- a dword
+    ; store only covers 4 bytes, so [r12+12] would otherwise hold stale
+    ; stack garbage and open() would read a corrupted long filename)
+    mov  dword [r12+8], 0x7461642E  ; ".dat" -> 2E 64 61 74
+    mov  byte  [r12+12], 0          ; NUL terminator
     add  rsp, 0x10
     pop  r12
     pop  rbx
@@ -118,10 +122,11 @@ store_init:
     mov  [r12+8], rax           ; idx_fd
     mov  qword [r12+0], -1      ; cur_blk_fd = none yet
     mov  qword [r12+16], 0      ; idx_len = 0
-    mov  dword [r12+24], 0      ; cur_file_no = 0
-    mov  dword [r12+28], 0      ; cur_file_pos = 0
-    mov  dword [r12+32], 0xd9b4bef9
-    mov  dword [r12+36], 0
+    mov  dword [r12+24], -1     ; tip_height = -1 (empty)
+    mov  dword [r12+28], 0      ; cur_file_no = 0
+    mov  dword [r12+32], 0      ; cur_file_pos = 0
+    mov  dword [r12+36], 0xd9b4bef9
+    mov  dword [r12+40], 0
     mov  rax, 1
     pop  r12
     pop  rbp
@@ -230,16 +235,17 @@ store_reload:
     jne  .err
     ; file_no = rec[32..35]
     mov  eax, [rbp-0x50+32]
-    mov  dword [r12+24], eax      ; cur_file_no
+    mov  dword [r12+28], eax      ; cur_file_no
     ; data_pos, data_size -> cur_file_pos = pos + 8 + size
     mov  rax, [rbp-0x50+36]
     add  rax, 8
     mov  edx, [rbp-0x50+44]
     add  rax, rdx
-    mov  [r12+28], eax            ; cur_file_pos
-    ; open the current block file
+    mov  [r12+32], eax            ; cur_file_pos
+    ; tip_height = rbx (the tip computed above); reopen the current block file
+    mov  dword [r12+24], ebx
     mov  rdi, r12
-    mov  esi, [r12+24]
+    mov  esi, [r12+28]
     call open_file
     test rax, rax
     jl   .err
@@ -252,8 +258,9 @@ store_reload:
     pop  rbp
     ret
 .empty:
-    mov  dword [r12+24], 0
-    mov  dword [r12+28], 0
+    mov  dword [r12+24], -1     ; tip_height = -1 (empty)
+    mov  dword [r12+28], 0      ; cur_file_no = 0
+    mov  dword [r12+32], 0      ; cur_file_pos = 0
     mov  qword [r12+0], -1
     mov  rax, 1
     add  rsp, 0x50
@@ -412,13 +419,13 @@ store_append:
     test rax, rax
     jns  .have_fd
     mov  rdi, r12
-    mov  esi, [r12+24]
+    mov  esi, [r12+28]       ; cur_file_no
     call open_file
     test rax, rax
     jl   .err
 .have_fd:
     ; rollover check: if cur_file_pos + 8+len > MAX_FILE, roll to next file
-    mov  eax, [r12+28]       ; cur_file_pos
+    mov  eax, [r12+32]       ; cur_file_pos
     add  eax, 8
     mov  edx, r15d
     add  eax, edx
@@ -429,10 +436,10 @@ store_append:
     mov  eax, 3
     syscall
     mov  dword [r12+0], -1
-    mov  eax, [r12+24]
+    mov  eax, [r12+28]
     add  eax, 1
-    mov  [r12+24], eax
-    mov  dword [r12+28], 0
+    mov  [r12+28], eax       ; cur_file_no++
+    mov  dword [r12+32], 0   ; cur_file_pos = 0
     mov  rdi, r12
     mov  esi, eax
     call open_file
@@ -440,17 +447,17 @@ store_append:
     jl   .err
 .no_roll:
     ; record file_no / pos before appending
-    mov  eax, [r12+28]       ; data_pos = cur_file_pos (dword, zero-extends into rax)
+    mov  eax, [r12+32]       ; data_pos = cur_file_pos (dword, zero-extends into rax)
     mov  [rbp-0x38], rax     ; save pos (qword) -- BELOW the idx-record region
-    mov  eax, [r12+24]
+    mov  eax, [r12+28]       ; cur_file_no
     mov  [rbp-0x40], eax     ; save file_no (dword) -- BELOW the idx-record region
     ; write frame header [u32 len][u32 magic] at cur_file_pos
     mov  dword [rbp-0x80], r15d
-    mov  eax, [r12+32]
+    mov  eax, [r12+36]       ; magic
     mov  [rbp-0x7c], eax
     ; lseek(cur_blk_fd, cur_file_pos)
     mov  rdi, [r12]
-    mov  eax, [r12+28]
+    mov  eax, [r12+32]
     mov  rsi, rax
     xor  edx, edx
     mov  eax, 8
@@ -473,10 +480,10 @@ store_append:
     cmp  rax, r15
     jne  .err
     ; advance cur_file_pos by 8+len
-    mov  eax, [r12+28]
+    mov  eax, [r12+32]
     add  eax, 8
     add  eax, r15d
-    mov  [r12+28], eax
+    mov  [r12+32], eax
     ; new height = idx_len/48 (append)
     mov  rax, [r12+16]
     xor  edx, edx
@@ -511,6 +518,7 @@ store_append:
     mov  rax, [r12+16]
     add  rax, 48
     mov  [r12+16], rax       ; idx_len += 48
+    mov  dword [r12+24], ebx ; tip_height = new height (rbx)
     mov  rax, rbx
     add  rsp, 0x80
     pop  rbx

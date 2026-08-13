@@ -23,10 +23,11 @@ struct St {
     unsigned long long cur_blk_fd;   /* +0  */
     unsigned long long idx_fd;       /* +8  */
     unsigned long long idx_len;      /* +16 */
-    int cur_file_no;                 /* +24 */
-    int cur_file_pos;                /* +28 */
-    int magic;                       /* +32 */
-    int pad;                         /* +36 */
+    int tip_height;                  /* +24 */
+    int cur_file_no;                 /* +28 */
+    int cur_file_pos;                /* +32 */
+    int magic;                       /* +36 */
+    int pad;                         /* +40 */
 };
 
 int main(void){
@@ -83,6 +84,7 @@ int main(void){
     cki("re-init (existing files)", store_init(&st2), 1);
     cki("reload ok", store_reload(&st2), 1);
     cki("reload idx_len 144", st2.idx_len, 144);
+    cki("reload tip_height 2", st2.tip_height, 2);
     cki("reload cur_file_pos 464", st2.cur_file_pos, 464);
     cki("reload get_tip ok", store_get_tip(&st2,meta), 1);
     cki("reload get_tip pos", meta[0], 366);
