@@ -372,4 +372,20 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   NUL, so open() reads past the end into stack garbage and creates corrupted long
   filenames (bitcoin_store fmt_blkname bug, #13). Size every store to its full field.
 
+### CURRENT STATE (LAST UPDATED) -- single-directory downloader
+- Downloader: daemon/unified_ibd.c writes blocks DIRECTLY into ONE directory
+  (<dir>/blk*.dat + index.dat + headers.dat; NO w<w>/ worker dirs). 8 workers
+  each run asm node_ibd_blocks_s -> store_append_shared (flock append.lock;
+  block at true blk-file SEEK_END; 48B index record positionally at height*48;
+  index pre-sized to end_h+1). Each worker uses a PRIVATE /tmp hdr file so hst
+  never collides (fixes worker-boundary chain-breaks).
+- Verified: 8 workers x 8000 blocks = 0 dups, 8000/8000 hash-match, CHAIN
+  VERIFIED. check_chain audits; chainctl (8w, 16k chunks, audited) drives the
+  full forward download from the archive's current tip.
+- RESUME: unified_ibd reads highest non-zero index record and resumes from tip+1.
+- KNOWN: archive currently starts at height ~30000 (test data), so heights
+  0..~29999 are NOT downloaded. BACKFILL those after the forward download
+  reaches the tip: run unified_ibd <dir> 8 0 37999 (disjoint, positional-
+  idempotent, will not disturb the already-present 30000-37999).
+
 ===== END PLAN =====
