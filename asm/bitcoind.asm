@@ -1316,7 +1316,8 @@ node_ibd_blocks_x:
     push r13
     push r14
     push r15
-    sub  rsp, 0x148
+    sub  rsp, 0x220          ; rec@-0x140 (112B), prevrec@-0x1b0 (112B), misc above;
+                             ; +0x220 keeps RSP aligned for nested calls
     mov  rbx, rdi           ; fd
     mov  r12, rsi           ; st (block store)
     mov  [rbp-0x30], rdx    ; hst (stack local)
@@ -1405,6 +1406,31 @@ node_ibd_blocks_x:
     mov  ecx, 32
     repe cmpsb
     jne  .fail              ; peer served the wrong block
+    ; ---- CHAIN-LINK GUARD (node_ibd_blocks_x): prevents storing a block at the
+    ; wrong local height (root cause of duplicate hashes). The incoming block's
+    ; prevhash (buf[4..36]) MUST equal the stored header hash at local height i-1.
+    ; For i==start_h (shard's first local height) the prior real header is outside
+    ; this shard's header store, so the check is skipped; for every resume step
+    ; (i>start_h) it is enforced, so a repeated/out-of-order block can never be
+    ; appended under two heights. ----
+    mov  rax, [rbp-0x48]    ; i
+    mov  rcx, [rbp-0x38]    ; start_h
+    cmp  rax, rcx
+    je   .chain_ok
+    ; prevrec@rbp-0x1b0 = hst_get_at(hst, i-1)
+    mov  rdi, [rbp-0x30]
+    lea  rsi, [rax-1]
+    lea  rdx, [rbp-0x1b0]
+    call hst_get_at
+    test eax, eax
+    jle  .fail              ; prior header missing -> cannot trust, drop
+    ; require buf+4 .. buf+36 == prevrec+80 .. prevrec+112
+    lea  rdi, [r14+4]
+    lea  rsi, [rbp-0x1b0+80]
+    mov  ecx, 32
+    repe cmpsb
+    jne  .fail              ; block does NOT chain from the previous local height
+.chain_ok:
     ; store_append(st, blockhash, buf, plen)
     mov  rdi, r12
     lea  rsi, [rbp-0xc0]
@@ -1422,7 +1448,7 @@ node_ibd_blocks_x:
 .fail:
     mov  rax, -1
 .ret:
-    add  rsp, 0x148
+    add  rsp, 0x220
     pop  r15
     pop  r14
     pop  r13

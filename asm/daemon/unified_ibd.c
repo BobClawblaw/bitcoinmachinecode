@@ -192,6 +192,11 @@ int main(int argc,char**argv){
     printf("established %d/%d DISTINCT\n",ngood,nw);
 
     char scratchbase[512]; snprintf(scratchbase,sizeof scratchbase,"%s/_work",dir);
+    /* WIPE any leftover scratch from a prior run BEFORE forking workers: a worker
+     * store_init/store_reload on a pre-existing _work_wN store would APPEND new
+     * blocks on top of stale ones -> duplicate block hashes in the archive.
+     * A blank-slate scratch guarantees the store starts empty every run. */
+    for(int w=0;w<16;w++){ char wd[512]; snprintf(wd,sizeof wd,"%s_w%d",scratchbase,w); rmrf(wd); }
     pid_t kids[MAXPEERS];
     for(int w=0;w<nw;w++){
         long lo=start_h + (long)((long long)span*w/nw);
