@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 extern int  tcp_connect_ip(unsigned, unsigned short);
 extern long p2p_write(int,const char*,unsigned,const void*,unsigned);
@@ -85,6 +86,10 @@ static unsigned resolve(const char* host){
 static int connect_peer(const char* host){
     unsigned ip=resolve(host); if(ip==0) return -1;
     int fd=tcp_connect_ip(ip,PORT_BE); if(fd<0) return -1;
+    /* short recv timeout so a peer that connects but stalls on the handshake
+     * fails fast instead of blocking peer probing for seconds each */
+    struct timeval tv; tv.tv_sec=4; tv.tv_usec=0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if(node_handshake(fd)!=1){ fd_close(fd); return -1; }
     return fd;
 }
@@ -187,6 +192,7 @@ static int merge_all(const char* dir, long start_h, long end_h, int nw){
 }
 
 int main(int argc,char**argv){
+    setbuf(stdout,NULL);
     if(argc<5){ fprintf(stderr,"usage: %s <dir> <num_workers> <start_h> <end_h> [peerIP...]\n",argv[0]); return 2; }
     const char* dir=argv[1];
     int nw=atoi(argv[2]); if(nw<1)nw=1; if(nw>MAXPEERS-4)nw=MAXPEERS-4;
@@ -211,33 +217,65 @@ int main(int argc,char**argv){
     static unsigned char zp[32];  /* genesis locator = 0 */
     memset(zp,0,32);
     static unsigned char hdrbuf[2<<20];
-    int hfd=connect_peer(peers[0]);
-    if(hfd<0){ fprintf(stderr,"cannot connect header peer\n"); return 1; }
-    long nhdr = node_ibd_headers(hfd, mhst, zp, hdrbuf, sizeof hdrbuf);
-    fd_close(hfd);
-    printf("asm header download: %ld headers persisted\n", nhdr);
-    if(nhdr<=0){ fprintf(stderr,"header download failed\n"); return 1; }
+    /* header phase: try the reliable local node first, then each pool peer
+     * (distinct by IP), forking each attempt with a hard timeout so a peer that
+     * connects but never serves headers can't hang the run. */
+    long nhdr=0; int hpeer_index=-1;
+    unsigned hseen[MAXPEERS]; int hseen_n=0;
+    char* htry[MAXPEERS]; long htryn=0;
+    /* local node first if present */
+    int have_local=0;
+    for(int i=0;i<np;i++){ char* col=strstr(peers[i],"192.168.5.69"); if(col){ htry[htryn++]=peers[i]; have_local=1; } }
+    if(!have_local){ static char localhost[]="192.168.5.69"; htry[htryn++]=(char*)localhost; }
+    for(int i=0;i<np;i++){ int d=0; for(int k=0;k<htryn;k++) if(!strcmp(htry[k],peers[i])){d=1;break;} if(!d) htry[htryn++]=peers[i]; }
+    for(int i=0;i<htryn && nhdr<=0;i++){
+        char hb[128]; snprintf(hb,sizeof hb,"%s",htry[i]); char* col=strchr(hb,':'); if(col)*col=0;
+        struct in_addr hia; if(inet_pton(AF_INET,hb,&hia)!=1) continue;
+        unsigned hip=hia.s_addr; int hdup=0; for(int k=0;k<hseen_n;k++) if(hseen[k]==hip){hdup=1;break;}
+        if(hdup){ printf("header peer[%d] %s SKIP-duplicate\n",i,htry[i]); continue; }
+        pid_t hp=fork();
+        if(hp==0){
+            int hfd=connect_peer(htry[i]);
+            if(hfd<0) _exit(2);
+            long h = node_ibd_headers(hfd, mhst, zp, hdrbuf, sizeof hdrbuf);
+            _exit((h>0)?0:1);
+        }
+        int hst; pid_t wr=-1; time_t h0=time(NULL);
+        while(time(NULL)-h0 < 60){ wr=waitpid(hp,&hst,WNOHANG); if(wr==hp) break; usleep(200000); }
+        if(wr!=hp){ kill(hp,SIGKILL); waitpid(hp,&hst,0); printf("header peer[%d] %s TIMEOUT\n",i,htry[i]); continue; }
+        hst_reload(mhst);                    /* child wrote headers.dat; re-sync parent count from disk */
+        long h = (WIFEXITED(hst)&&WEXITSTATUS(hst)==0) ? hst_count(mhst) : 0;
+        if(h>0){ nhdr=h; hpeer_index=i; hseen[hseen_n++]=hip; printf("header peer[%d] %s served %ld headers\n",i,htry[i],h); }
+        else printf("header peer[%d] %s served 0 headers\n",i,htry[i]);
+    }
+    if(nhdr<=0){ fprintf(stderr,"header download failed (no peer served headers)\n"); return 1; }
     if(end_h>nhdr-1) end_h=nhdr-1;
     long span=end_h-start_h+1;
     printf("downloading real heights [%ld,%ld] (%ld blocks) via ASM loop across %d peers\n",
            start_h,end_h,span,nw);
 
-    /* ---- phase 2: establish >=8 simultaneous distinct peer connections ----
-     * Probe the WHOLE pool (up to np peers) and keep the first nw that are UP,
-     * so every worker gets a distinct live peer (>= nw workers). */
+    /* ---- phase 2: establish >=8 simultaneous DISTINCT peer connections ----
+     * Probe the WHOLE pool and keep the first nw DISTINCT-by-IP peers that are
+     * UP, so no two workers share the same host (dedup by resolved IPv4). */
     int workers = nw;                        /* how many distinct UP peers we secure */
     int goodindex[MAXPEERS]; int ngood=0;
-    for(int i=0;i<np;i++){
+    unsigned chosen_ip[MAXPEERS]; int nchosen=0;
+    for(int i=0;i<np && ngood<nw;i++){
+        /* resolve first so we can dedupe before connecting */
+        char hostbuf[128]; snprintf(hostbuf,sizeof hostbuf,"%s",peers[i]);
+        char* colon=strchr(hostbuf,':'); if(colon) *colon=0;
+        struct in_addr ia; if(inet_pton(AF_INET,hostbuf,&ia)!=1) continue;
+        unsigned ip = ia.s_addr;
+        int dup=0; for(int k=0;k<nchosen;k++) if(chosen_ip[k]==ip){ dup=1; break; }
+        if(dup){ printf("peer[%d] %s SKIP-duplicate\n", i, peers[i]); continue; }
         int fd=connect_peer(peers[i]);
         int up= fd>=0;
         if(fd>=0) fd_close(fd);
         printf("peer[%d] %s %s\n", i, peers[i], up?"UP":"DOWN");
-        if(up && ngood<nw){ goodindex[ngood++]=i; }
-        /* keep probing until we secure nw UP peers or exhaust the pool */
-        if(ngood>=nw) break;
+        if(up){ goodindex[ngood++]=i; chosen_ip[nchosen++]=ip; }
     }
-    if(ngood<nw){ workers=ngood; }           /* fewer up than requested */
-    printf("established %d/%d simultaneous peer connections\n", ngood, nw);
+    if(ngood<nw){ workers=ngood; }           /* fewer distinct up than requested */
+    printf("established %d/%d DISTINCT peer connections\n", ngood, nw);
 
     /* ---- phase 3: fork workers (worker w uses UP peer goodindex[w]) ---- */
     pid_t kids[MAXPEERS];
