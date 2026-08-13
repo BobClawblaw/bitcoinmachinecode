@@ -50,6 +50,7 @@ extern long hst_count(void* hst);
 extern int  hst_get_at(void* hst, unsigned long long height, void* out);
 extern int  store_init(void* st);
 extern int  store_reload(void* st);
+extern long store_append(void* st, const unsigned char hash[32], const void* raw, unsigned long long len);
 extern long store_get_tip(void* st, void* out_meta);
 extern void fd_close(int fd);
 
@@ -71,10 +72,13 @@ static int load_peers(const char* fname, char peers[][128], int max){
     fclose(f); return n;
 }
 static unsigned resolve(const char* host){
-    unsigned ip4=0; if(inet_pton(AF_INET,host,&ip4)==1) return ip4;
+    /* allow "ip" or "ip:port" -- strip any :port suffix before resolving */
+    char buf[128]; snprintf(buf,sizeof buf,"%s",host);
+    char* colon=strchr(buf,':'); if(colon) *colon=0;
+    unsigned ip4=0; if(inet_pton(AF_INET,buf,&ip4)==1) return ip4;
     struct addrinfo h,*res=0; memset(&h,0,sizeof h);
     h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(host,NULL,&h,&res)!=0) return 0;
+    if(getaddrinfo(buf,NULL,&h,&res)!=0) return 0;
     unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res); return ip;
 }
@@ -138,18 +142,18 @@ static int worker(int w, const char* dir, long lo_w, long hi_w, void* mhst,
     return 0;
 }
 
-/* ---------------- parent: merge per-worker stores into blk00000.dat + index.dat ---
+/* ---------------- parent: merge per-worker stores into a ROLLING store ---
  * Each worker store (w<w>/blk00000.dat + index.dat) holds its shard at LOCAL
- * heights 0..n-1; real height = lo_w + local. Concatenate all workers in id order
- * (ranges are contiguous & ascending) into the final positional store. */
+ * heights 0..n-1; real height = lo_w + local. Concatenate all workers in id
+ * order (ranges are contiguous & ascending) into the final store by feeding
+ * every block body through the ASM store_append, so the merged archive rolls
+ * naturally across blk00000.dat, blk00001.dat, ... at the 128 MiB boundary --
+ * the same on-disk multi-file layout Bitcoin Core keeps for a full archive. */
 static int merge_all(const char* dir, long start_h, long end_h, int nw){
-    char mbp[512], mip[512];
-    snprintf(mbp,sizeof mbp,"%s/blk00000.dat",dir);
-    snprintf(mip,sizeof mip,"%s/index.dat",dir);
-    FILE* mb=fopen(mbp,"wb"); if(!mb) return 1;
-    FILE* mi=fopen(mip,"wb"); if(!mi){ fclose(mb); return 1; }
+    static unsigned char mst[4096];
+    store_init(mst);                          /* opens CWD index.dat + blk00000.dat */
     static unsigned char combuf[24<<20];
-    unsigned long long cur=0; long written=0;
+    long written=0; long long totalbytes=0;
     for(int w=0; w<nw; w++){
         long lo_w = start_h + (long)((long long)(end_h-start_h+1)*w/nw);
         char wd[512]; snprintf(wd,sizeof wd,"%s/w%d",dir,w);
@@ -159,44 +163,40 @@ static int merge_all(const char* dir, long start_h, long end_h, int nw){
         FILE* wf=fopen(wp,"rb"); if(!wf){ fclose(wx); continue; }
         unsigned char rec[48]; long local=0;
         while(fread(rec,1,48,wx)==48){
-            unsigned len=(unsigned)(rec[40]|rec[41]<<8|rec[42]<<16|rec[43]<<24);
-            if(len==0) { local++; continue; }            /* stub */
+            /* worker index record (asm store format): hash[0..31] file_no u32
+               [32..35] data_pos u64 [36..43] data_size u32 [44..47] */
+            unsigned len=(unsigned)(rec[44]|rec[45]<<8|rec[46]<<16|rec[47]<<24);
+            if(len==0) { local++; continue; }            /* stub (notfound) */
             unsigned long long off=0;
-            for(int k=0;k<8;k++) off |= (unsigned long long)rec[32+k]<<(8*k);
+            for(int k=0;k<8;k++) off |= (unsigned long long)rec[36+k]<<(8*k);
             if(fseek(wf,(long)(off+8),SEEK_SET)!=0){ fclose(wf); break; }
             if(len>sizeof combuf){ fclose(wf); break; }
             if(fread(combuf,1,len,wf)!=(size_t)len){ fclose(wf); break; }
-            unsigned real = (unsigned)(lo_w + local);
-            unsigned char hdr[8]; u32(hdr,len); u32(hdr+4,0xd9b4bef9);
-            fwrite(hdr,1,8,mb); fwrite(combuf,1,len,mb);
-            unsigned char or[48]; memcpy(or,rec,32);
-            for(int k=0;k<8;k++) or[32+k]=(unsigned char)(cur>>(8*k));
-            or[40]=(unsigned char)len; or[41]=(unsigned char)(len>>8);
-            or[42]=(unsigned char)(len>>16); or[43]=(unsigned char)(len>>24);
-            or[44]=(unsigned char)real; or[45]=(unsigned char)(real>>8);
-            or[46]=(unsigned char)(real>>16); or[47]=(unsigned char)(real>>24);
-            fseek(mi,(long)real*48,SEEK_SET);
-            fwrite(or,1,48,mi);
-            cur += 8+len; written++;
-            local++;
+            /* ASM store_append rolls blk files at 128 MiB; hash is rec[0..31] */
+            long nh = store_append(mst, rec /*hash*/, combuf, len);
+            if(nh<0){ fclose(wf); fclose(wx); printf("store_append failed at w%d/%ld\n",w,local); return 1; }
+            written++; totalbytes += 8+len; local++;
         }
         fclose(wf); fclose(wx);
     }
-    fclose(mb); fclose(mi);
-    printf("merged %ld real blocks (blk00000.dat %llu bytes)\n", written, cur);
+    /* count resulting block files */
+    int nfiles=0; while(1){ struct stat sb; char nm[64]; snprintf(nm,sizeof nm,"blk%05u.dat",(unsigned)nfiles);
+        if(stat(nm,&sb)!=0) break; nfiles++; }
+    printf("merged %ld real blocks (%lld bytes) across %d blk*.dat files\n", written, totalbytes, nfiles);
     return 0;
 }
 
 int main(int argc,char**argv){
-    if(argc<5){ fprintf(stderr,"usage: %s <dir> <num_workers> <end_h> <peerIP> [peerIP...]\n",argv[0]); return 2; }
+    if(argc<5){ fprintf(stderr,"usage: %s <dir> <num_workers> <start_h> <end_h> [peerIP...]\n",argv[0]); return 2; }
     const char* dir=argv[1];
     int nw=atoi(argv[2]); if(nw<1)nw=1; if(nw>MAXPEERS-4)nw=MAXPEERS-4;
-    long end_h=atol(argv[3]);
+    long start_h=atol(argv[3]);
+    long end_h=atol(argv[4]);
     mkdir(dir,0755);
 
-    /* peers from argv[4..] OR default good-internet list */
+    /* peers from argv[5..] OR default good-internet list */
     char peers[MAXPEERS][128]; int np=0;
-    for(int i=4;i<argc && np<MAXPEERS;i++){ strncpy(peers[np],argv[i],127);peers[np][127]=0;np++; }
+    for(int i=5;i<argc && np<MAXPEERS;i++){ strncpy(peers[np],argv[i],127);peers[np][127]=0;np++; }
     if(np==0){
         np=load_peers("/storage/bitcoinmachinecode/good_internet_peers.txt",peers,MAXPEERS);
     }
@@ -218,7 +218,7 @@ int main(int argc,char**argv){
     printf("asm header download: %ld headers persisted\n", nhdr);
     if(nhdr<=0){ fprintf(stderr,"header download failed\n"); return 1; }
     if(end_h>nhdr-1) end_h=nhdr-1;
-    long start_h=0, span=end_h-start_h+1;
+    long span=end_h-start_h+1;
     printf("downloading real heights [%ld,%ld] (%ld blocks) via ASM loop across %d peers\n",
            start_h,end_h,span,nw);
 

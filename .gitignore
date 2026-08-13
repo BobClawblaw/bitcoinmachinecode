@@ -13,6 +13,7 @@ asm/tests/live_headers
 asm/tests/live_local_probe
 asm/tests/live_probe
 asm/tests/parconn_test
+asm/tests/live_five
 asm/tests/test_add
 asm/tests/test_addm
 asm/tests/test_bitcoind
