@@ -90,7 +90,7 @@ static unsigned resolve(const char* host){
 static int connect_peer(const char* host){
     unsigned ip=resolve(host); if(!ip) return -1;
     int fd=tcp_connect_ip(ip,PORT_BE); if(fd<0) return -1;
-    struct timeval tv; tv.tv_sec=3; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     if(node_handshake(fd)!=1){ fd_close(fd); return -1; }
     return fd;
 }
@@ -104,15 +104,25 @@ static void rmrf(const char* d){ DIR* dd=opendir(d); if(!dd) return;
  * Uses the TRUSTED pool (goodindex[] of length ngood, all confirmed-up distinct)
  * so on a peer drop it fails over to another confirmed-up distinct peer without
  * re-probing dead hosts. Claims are held for the whole session per worker. */
-static int worker(int w, const char* scratchbase, long lo, long hi, void* mhst,
+static int worker(int w, const char* dir, const char* scratchbase, long lo, long hi,
                   char peers[][128], int goodindex[], int ngood, int pi0){
     char wdir[512]; snprintf(wdir,sizeof wdir,"%s_w%d",scratchbase,w);
     mkdir(wdir,0755); if(chdir(wdir)) return 1;
     static unsigned char hst[4096]; hst_init(hst);
     long n=0;
-    for(long k=lo;k<=hi;k++){ unsigned char rec[112];
-        if(hst_get_at(mhst,k,rec)!=1) break;
-        if(hst_append(hst,rec,rec+80)<0) break; n++; }
+    /* Load the shard's [lo..hi] headers straight from the on-disk headers.dat
+     * (PROVEN reliable source) rather than the parent's forked in-memory header
+     * store, eliminating any fork-state ambiguity (par_test uses this and is
+     * clean under 4-way concurrency). */
+    char hp[640]; snprintf(hp,sizeof hp,"%s/headers.dat",dir);
+    FILE* mf=fopen(hp,"rb");
+    static unsigned char rec[112];
+    for(long k=lo;k<=hi;k++){
+        if(mf && fseek(mf,k*112,SEEK_SET)==0 && fread(rec,1,112,mf)==112){
+            if(hst_append(hst,rec,rec+80)<0) break; n++;
+        } else break;
+    }
+    if(mf) fclose(mf);
     if(n<=0){ fprintf(stderr,"[w%d] no headers\n",w); return 1; }
     static unsigned char st[4096]; store_init(st); store_reload(st);
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
@@ -144,7 +154,11 @@ static int worker(int w, const char* scratchbase, long lo, long hi, void* mhst,
             continue;
         }
         stalled=0;
+        struct timespec ta,tb; clock_gettime(CLOCK_MONOTONIC,&ta);
         long r=node_ibd_blocks_x(fd, st, hst, resume, n-1, buf, sizeof buf, scratch, cap);
+        clock_gettime(CLOCK_MONOTONIC,&tb);
+        long ms=(tb.tv_sec-ta.tv_sec)*1000+(tb.tv_nsec-ta.tv_nsec)/1000000;
+        fprintf(stderr,"[w%d] ibd_x resume=%ld r=%ld in %ldms\n", w, resume, r, ms);
         fd_close(fd); cl_rel(cip); cip[0]=0;
         slot=(slot+1)%ngood;                /* advance failover slot */
         if(r!=0 && guard++>400){ fprintf(stderr,"[w%d] reconnect budget\n",w); break; }
@@ -250,7 +264,7 @@ int main(int argc,char**argv){
         long hi=start_h + (long)((long long)span*(w+1)/nw)-1;
         if(hi<lo)hi=lo;
         pid_t p=fork();
-        if(p==0){ _exit(worker(w,scratchbase,lo,hi,mhst,peers,goodindex,ngood,w)); }
+        if(p==0){ _exit(worker(w, dir, scratchbase, lo, hi, peers, goodindex, ngood, w)); }
         kids[w]=p;
     }
     for(int w=0;w<nw;w++){ int stt; waitpid(kids[w],&stt,0); printf("worker %d exit %d\n",w,WEXITSTATUS(stt)); }

@@ -1316,8 +1316,8 @@ node_ibd_blocks_x:
     push r13
     push r14
     push r15
-    sub  rsp, 0x220          ; rec@-0x140 (112B), prevrec@-0x1b0 (112B), misc above;
-                             ; +0x220 keeps RSP aligned for nested calls
+    sub  rsp, 0x280          ; rec@-0x140 (112B), prevrec@-0x1b0 (112B),
+                             ; skip budget @-0x258; +0x280 keeps RSP aligned
     mov  rbx, rdi           ; fd
     mov  r12, rsi           ; st (block store)
     mov  [rbp-0x30], rdx    ; hst (stack local)
@@ -1331,6 +1331,7 @@ node_ibd_blocks_x:
     mov  eax, [rbp+32]
     mov  [rbp-0x60], eax    ; scratch_cap
     mov  qword [rbp-0x50], 0        ; total = 0
+    mov  qword [rbp-0x258], 0       ; skip budget = 0 (out-of-order drain guard)
     ; i = start_h
     mov  rax, [rbp-0x38]
     mov  [rbp-0x48], rax
@@ -1397,7 +1398,8 @@ node_ibd_blocks_x:
     call cons_verify
     test eax, eax
     jz   .fail              ; invalid block body
-    ; block_hash(received) -> blockhash@-0xc0; require == stored header hash (rec+80)
+    ; block_hash(received) -> blockhash@-0xc0; the received block is only the
+    ; block for the CURRENT height if it matches rec+80 (stored header hash).
     lea  rdi, [rbp-0xc0]
     mov  rsi, r14
     call block_hash
@@ -1405,7 +1407,7 @@ node_ibd_blocks_x:
     lea  rsi, [rbp-0x140+80]
     mov  ecx, 32
     repe cmpsb
-    jne  .fail              ; peer served the wrong block
+    jne  .skip_block_x        ; out-of-order/late block: drain it, keep waiting
     ; ---- CHAIN-LINK GUARD (node_ibd_blocks_x): prevents storing a block at the
     ; wrong local height (root cause of duplicate hashes). The incoming block's
     ; prevhash (buf[4..36]) MUST equal the stored header hash at local height i-1.
@@ -1442,13 +1444,22 @@ node_ibd_blocks_x:
     inc  qword [rbp-0x50]   ; total++
     inc  qword [rbp-0x48]   ; i++
     jmp  .block_loop_x
+.skip_block_x:
+    ; Out-of-order / late block that doesn't match the CURRENT height: drain it
+    ; (do NOT store, do NOT kill the connection) and keep waiting for the block
+    ; we asked for. Under concurrent load peers may deliver a nearby block first.
+    ; Guard with a bounded budget so a genuinely useless peer still times out.
+    inc  qword [rbp-0x258]
+    cmp  qword [rbp-0x258], 64
+    ja   .fail              ; too many wasted deliveries -> reconnect
+    jmp  .receive_x
 .done:
     mov  rax, [rbp-0x50]
     jmp  .ret
 .fail:
     mov  rax, -1
 .ret:
-    add  rsp, 0x220
+    add  rsp, 0x280
     pop  r15
     pop  r14
     pop  r13
