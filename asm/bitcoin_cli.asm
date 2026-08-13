@@ -445,10 +445,8 @@ cmd_getbestblockhash:
     push r13
     push r14
     push r15
-    sub  rsp, 0x2d0        ; blockbuf[384] base rbp-0x2b0 (ends rbp-0x130)
-                           ;   hbuf[32] rbp-0x40, rev[32] rbp-0x60
-                           ;   sub ≡0 (mod16): block_hash called at rsp%16=8,
-                           ;   the parity the deep sha256d chain provably needs.
+    sub  rsp, 0x8008        ; blockbuf[0x4000=16KB] base rbp-0x4000 (ends rbp-0x8000)
+                            ;   hbuf[32] rbp-0x40, rev[32] rbp-0x60
     mov  r12, rdi           ; st
     mov  r13, rsi           ; out
     mov  r14, rdx           ; cap
@@ -457,15 +455,15 @@ cmd_getbestblockhash:
     je   .fail
     mov  rdi, r12
     mov  esi, eax
-    lea  rdx, [rbp-0x2b0]
-    mov  rcx, 0x180
+    lea  rdx, [rbp-0x4000]
+    mov  rcx, 0x4000
     call cli_load_block
     test rax, rax
     jle  .fail
     cmp  rax, 80
     jb   .fail
     lea  rdi, [rbp-0x40]
-    lea  rsi, [rbp-0x2b0]
+    lea  rsi, [rbp-0x4000]
     call block_hash
     lea  rdi, [rbp-0x60]
     lea  rsi, [rbp-0x40]
@@ -480,7 +478,7 @@ cmd_getbestblockhash:
 .fail:
     mov  rax, -1
 .done:
-    add  rsp, 0x2d0
+    add  rsp, 0x8008
     pop  r15
     pop  r14
     pop  r13
@@ -501,8 +499,8 @@ cmd_getblockhash:
     push r13
     push r14
     push r15
-    sub  rsp, 0x2c8        ; blockbuf[384] base rbp-0x2b0 (ends rbp-0x130),
-                           ;   hbuf[32] rbp-0x40, rev[32] rbp-0x60
+    sub  rsp, 0x1008        ; blockbuf[0x800=2048] base rbp-0x800 (ends rbp-0x1000),
+                            ;   hbuf[32] rbp-0x40, rev[32] rbp-0x60
     mov  r12, rdi           ; st
     mov  r13, rsi           ; hstr
     mov  r14, rdx           ; out
@@ -517,15 +515,15 @@ cmd_getblockhash:
     ja   .fail
     mov  rdi, r12
     mov  rsi, rbx
-    lea  rdx, [rbp-0x2b0]
-    mov  rcx, 0x180
+    lea  rdx, [rbp-0x800]
+    mov  rcx, 0x800
     call cli_load_block
     test rax, rax
     jle  .fail
     cmp  rax, 80
     jb   .fail
     lea  rdi, [rbp-0x40]
-    lea  rsi, [rbp-0x2b0]
+    lea  rsi, [rbp-0x800]
     call block_hash
     lea  rdi, [rbp-0x60]
     lea  rsi, [rbp-0x40]
@@ -540,7 +538,7 @@ cmd_getblockhash:
 .fail:
     mov  rax, -1
 .done:
-    add  rsp, 0x2c8
+    add  rsp, 0x1008
     pop  r15
     pop  r14
     pop  r13
