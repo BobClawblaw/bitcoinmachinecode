@@ -2,8 +2,8 @@
 
 # Location: /storage/bitcoinmachinecode
 # Goal: a working Bitcoin client for Linux implemented as x86-64 assembly,
-#       every line authored by an AI (no human code). Option B chosen:
-#       security-critical crypto in raw assembly.
+#       every line authored by an AI (no human code). The security-critical
+#       crypto (SHA-256, secp256k1, ECDSA) lives in raw assembly.
 #
 # This file exists so work can resume after a context loss. It records the
 # verified state, algorithm decisions, exact conventions, and concrete next

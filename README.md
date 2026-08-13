@@ -1,8 +1,9 @@
 # Bitcoin Machine Code
 
 A Bitcoin node for Linux built as **100% AI-generated machine code** — every line of
-assembly is authored by an AI assistant, none by a human. Per the chosen approach
-(Option B), the security-critical crypto is written directly in x86-64 assembly.
+assembly is authored by an AI assistant, none by a human. The security-critical
+crypto (SHA-256, secp256k1 field/point/scalar/ECDSA) is written directly in x86-64
+assembly.
 
 ## Status
 
