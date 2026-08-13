@@ -25,7 +25,7 @@ int main(int argc,char**argv){
     fclose(f);
 
     long stored=0, holes=0, hashbad=0, unreadable=0, consbad=0, first_problem=-1, chainbreak=0;
-    unsigned char prevhash[32]; int have_prev=0;
+    unsigned char prevhash[32]; int have_prev=0; long prev_height=-1;
     int cur_fno=-1; FILE* blk=NULL;
     static unsigned char blkbuf[16<<20]; static unsigned char scratch[64<<20];
     for(long h=0;h<n;h++){
@@ -45,8 +45,11 @@ int main(int argc,char**argv){
         }
         unsigned char hh[32]; block_hash(hh,blkbuf);
         if(memcmp(rec,hh,32)){ if(first_problem<0)first_problem=h; hashbad++; }
-        if(have_prev && memcmp(blkbuf+4,prevhash,32)){ if(first_problem<0)first_problem=h; chainbreak++; }
-        memcpy(prevhash,hh,32); have_prev=1;
+        /* chain-link: only meaningful between CONSECUTIVE stored heights (skip
+         * zero-holes). A hole between h-1 and h is NOT a corruption; it just
+         * hasn't been downloaded yet. */
+        if(have_prev && (long)(prev_height)==h-1 && memcmp(blkbuf+4,prevhash,32)){ if(first_problem<0)first_problem=h; chainbreak++; }
+        memcpy(prevhash,hh,32); have_prev=1; prev_height=h;
         if(deep && !cons_verify(blkbuf,sz,scratch,(unsigned)(sizeof scratch/32)))
             { if(first_problem<0)first_problem=h; consbad++; }
     }
