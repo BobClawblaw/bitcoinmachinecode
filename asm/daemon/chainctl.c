@@ -1,15 +1,17 @@
-/* daemon/chainctl.c -- follow-to-tip orchestrator for the unified store.
+/* daemon/chainctl.c -- full-chain download/audit orchestrator for the
+ * single-directory (pre-sized positional index) archive.
  *
- * Continuously keeps ONE unified archive (<dir>/blk00000.dat.. + index.dat) in
- * sync with the chain tip. Each pass:
- *   1. reads the current store tip (getblockcount) via the asm store.
- *   2. asks the header source for the current header count (headers.dat).
- *   3. runs the parallel unified_ibd for exactly [tip+1, header_count-1].
- *   4. sleeps briefly and loops, so new blocks that arrive are fetched too.
- * Thus an archive node keeps following the live chain rather than downloading a
- * fixed range once.
+ * Each pass:
+ *   1. find the real archive tip = highest NON-ZERO index record (the pre-sized
+ *      positional index has zero-fill holes for not-yet-fetched heights, so the
+ *      size-based tip is wrong -- scan for the last real record).
+ *   2. ask the header source for the current header count (headers.dat).
+ *   3. run unified_ibd for the next bounded CHUNK [tip+1, min(tip+CHUNK, headers-1)]
+ *      (bounded so each segment completes in reasonable time and self-resumes).
+ *   4. run check_chain to audit the segment (dups/gaps/corruption).
+ *   5. loop until the archive reaches the header tip, then follow new blocks.
  *
- * Usage: chainctl <dir> <num_workers> [sleep_seconds]
+ * Usage: chainctl <dir> <num_workers> [chunk] [sleep_sec]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,40 +21,48 @@
 #include <sys/wait.h>
 #include <time.h>
 
-extern int  store_init(void* st);
-extern int  store_reload(void* st);
 static long archive_tip(const char* dir){
-    /* The unified store has index.dat: 48 bytes per height. tip = records-1. */
+    /* highest height with a non-zero 48-byte index record (positional format). */
     char p[600]; snprintf(p,sizeof p,"%s/index.dat",dir);
-    struct stat sb; if(stat(p,&sb)) return -1;
-    return (long)(sb.st_size/48) - 1;
+    struct stat sb; if(stat(p,&sb)||sb.st_size<48) return -1;
+    long n=sb.st_size/48;
+    FILE* f=fopen(p,"rb"); if(!f) return -1;
+    unsigned char rec[48]; long mh=-1;
+    for(long h=n-1;h>=0;h--){ if(fseek(f,h*48,SEEK_SET)==0 && fread(rec,1,48,f)==48 && (rec[0]||rec[1]||rec[2]||rec[3])){ mh=h; break; } }
+    fclose(f);
+    return mh;
 }
 static long header_count(const char* dir){
-    /* headers.dat: 112 bytes per header (80 hdr + 32 hash). */
     char p[600]; snprintf(p,sizeof p,"%s/headers.dat",dir);
     struct stat sb; if(stat(p,&sb)) return -1;
     return (long)(sb.st_size/112);
 }
 int main(int argc,char**argv){
     setbuf(stdout,NULL);
-    if(argc<3){ fprintf(stderr,"usage: %s <dir> <num_workers> [sleep_sec]\n",argv[0]); return 2; }
+    if(argc<3){ fprintf(stderr,"usage: %s <dir> <num_workers> [chunk] [sleep_sec]\n",argv[0]); return 2; }
     const char* dir=argv[1];
-    int nw=atoi(argv[2]); int sleep_sec= argc>3? atoi(argv[3]) : 30;
+    int nw=atoi(argv[2]);
+    long chunk = argc>3? atol(argv[3]) : 8000;
+    int sleep_sec = argc>4? atoi(argv[4]) : 30;
     char cwd[600]; getcwd(cwd,sizeof cwd);
     for(int pass=1;;pass++){
         long tip=archive_tip(dir);
         long nh=header_count(dir);
-        printf("[pass %d] archive tip=%ld headers=%ld\n", pass, tip, nh);
+        printf("\n[pass %d] archive tip=%ld headers=%ld (need %ld more)\n", pass, tip, nh, nh-1-tip);
         if(nh<0){ printf("[pass %d] no headers yet; retry in %ds\n",pass,sleep_sec); sleep(sleep_sec); continue; }
         if(tip<nh-1){
-            printf("[pass %d] downloading [%ld,%ld] (%ld blocks)\n", pass, tip+1, nh-1, nh-1-tip);
-            chdir(cwd);
-            char cmd[700]; snprintf(cmd,sizeof cmd,"./daemon/unified_ibd %s %d %ld %ld", dir, nw, tip+1, nh-1);
+            long end = tip+chunk < nh-1 ? tip+chunk : nh-1;
+            printf("[pass %d] downloading chunk [%ld,%ld] (%ld blocks)\n", pass, tip+1, end, end-tip);
+            char cmd[700]; snprintf(cmd,sizeof cmd,"./daemon/unified_ibd %s %d %ld %ld", dir, nw, tip+1, end);
             printf("[pass %d] $ %s\n", pass, cmd);
             fflush(stdout);
-            if(system(cmd)!=0){ printf("[pass %d] unified_ibd returned error; retry in %ds\n",pass,sleep_sec); }
-        } else {
-            printf("[pass %d] archive is current (tip=%ld >= headers-1=%ld); ... %ds\n", pass, tip, nh-1, sleep_sec);
+            int rc=system(cmd);
+            printf("[pass %d] unified_ibd rc=%d; auditing...\n", pass, rc);
+            fflush(stdout);
+            char acmd[700]; snprintf(acmd,sizeof acmd,"./daemon/check_chain %s", dir);
+            system(acmd);
+        } else if(tip>=nh-1){
+            printf("[pass %d] archive is current at the chain tip (block %ld). Following for new blocks...\n", pass, tip);
         }
         sleep(sleep_sec);
     }
