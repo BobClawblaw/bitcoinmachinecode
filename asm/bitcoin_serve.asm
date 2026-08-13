@@ -56,6 +56,8 @@ s_n:      dq 0
 s_served: dq 0
 s_tip:    dq 0
 s_from:   dq 0
+s_htidx:  dq 0     ; stable copy of ht_idx (a callee clobbers r15; store it once)
+s_st:     dq 0     ; stable copy of the store context (r14 also at risk)
 
 section .text
 
@@ -86,7 +88,9 @@ node_serve_loop:
     mov  r13, rsi            ; lfd
     mov  r14, rdx            ; st
     mov  r15, rcx            ; ht_idx
-    mov  qword [s_served], 0 ; served count (dedicated slot, below save area)
+    mov  [s_htidx], rcx      ; keep a stable copy (a downstream callee clobbers r15)
+    mov  [s_st], rdx         ; stable copy of st
+    mov  qword [s_served], 0 ; served count
 
     mov  rbx, 10000          ; outer loop bound
 .outer:
@@ -220,7 +224,7 @@ node_serve_loop:
     jne  .gd_next
     ; hash at rbx+4; idx_get(ht_idx, hash, &fh)
     mov  [s_ptr], rbx
-    mov  rdi, r15
+    mov  rdi, [s_htidx]      ; use the stable copy (a callee clobbers r15)
     lea  rsi, [rbx+4]
     lea  rdx, [s_fh]
     call idx_get
@@ -229,7 +233,7 @@ node_serve_loop:
     jz   .gd_next
     ; node_serve_block(st, fh, sb_buf, cap)
     mov  [s_ptr], rbx
-    mov  rdi, r14
+    mov  rdi, [s_st]         ; stable copy of st
     mov  rsi, [s_fh]
     lea  rdx, [sb_buf]
     mov  rcx, (8<<20)
@@ -270,7 +274,7 @@ node_serve_loop:
     jb   .gh_zero
     lea  rsi, [pl_buf+5]
     ; idx_get(ht_idx, pl+5, &fh)
-    mov  rdi, r15
+    mov  rdi, [s_htidx]      ; stable copy
     ; rsi already = pl+5
     lea  rdx, [s_fh]
     call idx_get

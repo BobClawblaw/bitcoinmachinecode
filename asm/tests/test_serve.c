@@ -34,7 +34,7 @@ static void put_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]
 static void put_u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++)p[i]=v>>(8*i);}
 
 #define NB 8
-static int TEST_NB = 1;   /* verified passing: ping + single-getdata round trip */
+static int TEST_NB = 8;   /* full: all 8 blocks */
 static unsigned char blk[NB][600];
 static long blen[NB];
 static unsigned char bhash[NB][32];
