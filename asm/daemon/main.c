@@ -29,6 +29,7 @@ extern long node_accept_handshake(int fd);
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
 extern long node_serve_block(void* st, long height, void* out, long cap);
 extern long node_serve_block_by_hash(void* st, const void* hash32, void* out, long cap);
+extern long node_serve_loop(int fd, int lfd, void* st, void* ht_idx, void* out, long cap);
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern long store_init(void* st);
 extern long store_reload(void* st);
@@ -65,6 +66,7 @@ static unsigned char store_buf[4096];
  * serve a requested block by hash in O(1) instead of a linear height scan. */
 #define HT_SLOTS (8u<<20)
 static unsigned char* ht_idx;            /* 24 + HT_SLOTS*48 bytes */
+static unsigned char out_buf[1<<20];     /* serve-loop output scratch */
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern int  idx_get(void* idx, const unsigned char hash[32], long* height);
@@ -485,8 +487,10 @@ int main(int argc, char** argv){
              * node_accept_handshake (not node_handshake, which is the outbound/
              * initiator role and would hang on an inbound peer). */
             if(node_accept_handshake(c)!=1){ close(c); continue; }
-            int s = serve_loop(c, lfd);
-            printf("served %d block(s) to one peer\n", s); fflush(stdout);
+            /* Serve the peer entirely in assembly (bitcoin_serve.asm
+             * node_serve_loop): ping/getaddr/getdata/getheaders/inv. */
+            long s = node_serve_loop(c, lfd, store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+            printf("served %ld block(s) to one peer\n", s); fflush(stdout);
             close(c);
         }
     }
