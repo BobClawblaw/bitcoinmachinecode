@@ -45,10 +45,21 @@ int main(int argc,char**argv){
     long chunk = argc>3? atol(argv[3]) : 8000;
     int sleep_sec = argc>4? atoi(argv[4]) : 30;
     char cwd[600]; getcwd(cwd,sizeof cwd);
+    time_t t_start=time(NULL); long first_tip=-1;
     for(int pass=1;;pass++){
         long tip=archive_tip(dir);
         long nh=header_count(dir);
-        printf("\n[pass %d] archive tip=%ld headers=%ld (need %ld more)\n", pass, tip, nh, nh-1-tip);
+        if(first_tip<0) first_tip=tip>0?tip:0;
+        long t_el=time(NULL)-t_start;
+        double secs_per_block = (t_el>0 && tip>first_tip)? (double)t_el/(tip-first_tip) : 0;
+        printf("\n[pass %d] archive tip=%ld headers=%ld (need %ld more) elapsed=%lds",
+               pass, tip, nh, nh-1-tip, t_el);
+        if(secs_per_block>0){
+            long rem=nh-1-tip;
+            double eta_s=secs_per_block*rem;
+            printf("  ~%d blk/s  ETA ~%dh%02dm", (int)(1.0/secs_per_block), (int)(eta_s/3600), ((int)eta_s/60)%60);
+        }
+        printf("\n");
         if(nh<0){ printf("[pass %d] no headers yet; retry in %ds\n",pass,sleep_sec); sleep(sleep_sec); continue; }
         if(tip<nh-1){
             long end = tip+chunk < nh-1 ? tip+chunk : nh-1;
