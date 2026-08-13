@@ -14,7 +14,7 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoin_headers.o
+OBJS := sha256.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoin_headers.o bitcoin_addrmgr.o
 
 # bitcoin_hash.asm (sha256d/block-hash/merkle/pow) depends on sha256.o
 HASHOBJS := sha256.o bitcoin_hash.o
@@ -141,7 +141,12 @@ tests/test_ibd_blocks: tests/test_ibd_blocks.c $(IBDOBJS)
 tests/test_ibd_full: tests/test_ibd_full.c $(IBDOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_full.c $(IBDOBJS)
 
-test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full
+# bitcoin_addrmgr.asm: peer address book + addr v1 codec (standalone deps).
+ADMRGOBJS := bitcoin_addrmgr.o
+tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_addrmgr.c $(ADMRGOBJS)
+
+test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr
 	./tests/test_sha256
 	./tests/test_fe
 	./tests/test_point
@@ -166,6 +171,7 @@ test: tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/tes
 	./tests/test_ibd_headers
 	./tests/test_ibd_blocks
 	./tests/test_ibd_full
+	./tests/test_addrmgr
 
 clean:
-	rm -f $(OBJS) bitcoind.o tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full
+	rm -f $(OBJS) bitcoind.o tests/test_sha256 tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr

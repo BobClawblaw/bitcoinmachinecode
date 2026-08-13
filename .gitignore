@@ -44,7 +44,9 @@ asm/daemon/discover
 asm/daemon/inbound_client
 asm/daemon/paribd
 asm/daemon/paribd_asm
+asm/daemon/unified_ibd
 asm/daemon/crawler
+asm/daemon/addrgather
 asm/daemon/merge_only
 asm/daemon/peertest
 asm/daemon/seedprobe
@@ -63,3 +65,4 @@ good_internet_peers.txt
 # ---- Python ----
 __pycache__/
 *.pyc
+asm/tests/test_addrmgr
