@@ -206,11 +206,22 @@ int main(int argc,char**argv){
     if(chdir(dir)){ perror("chdir"); return 1; }
     for(int i=0;i<np;i++) printf("peer[%d] %s\n",i,peers[i]);
 
-    /* header phase: local node first, then pool, forked with timeout */
+    /* header phase: reuse an already-complete on-disk headers.dat when present
+     * (the forward downloader maintains the full header chain there), which is
+     * BOTH faster and -- critically -- lets a backfill pass reuse the shared
+     * header file WITHOUT rewriting it, so it can coexist with a concurrently
+     * running forward chainctl (no header-phase race on dir/headers.dat). */
     static unsigned char mhst[4096]; hst_init(mhst);
+    {
+        char hpf[640]; snprintf(hpf,sizeof hpf,"%s/headers.dat",dir);
+        struct stat hs; if(stat(hpf,&hs)==0 && hs.st_size>=((long)end_h+1)*112){
+            hst_reload(mhst); long c=hst_count(mhst);
+            if(c>0){ printf("reusing existing headers.dat (%ld headers)\n", c); }
+        }
+    }
     static unsigned char zp[32]; memset(zp,0,32);
     static unsigned char hdrbuf[2<<20];
-    long nhdr=0;
+    long nhdr=hst_count(mhst);
     char* htry[MAXPEERS]; long htryn=0; int hl=0;
     for(int i=0;i<np;i++) if(strstr(peers[i],"192.168.5.69")){ htry[htryn++]=peers[i]; hl=1; }
     if(!hl){ static char lo[]="192.168.5.69"; htry[htryn++]=(char*)lo; }
