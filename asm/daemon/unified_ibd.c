@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/file.h>
@@ -89,7 +90,7 @@ static unsigned resolve(const char* host){
 static int connect_peer(const char* host){
     unsigned ip=resolve(host); if(!ip) return -1;
     int fd=tcp_connect_ip(ip,PORT_BE); if(fd<0) return -1;
-    struct timeval tv; tv.tv_sec=5; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    struct timeval tv; tv.tv_sec=3; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     if(node_handshake(fd)!=1){ fd_close(fd); return -1; }
     return fd;
 }
@@ -99,9 +100,12 @@ static void rmrf(const char* d){ DIR* dd=opendir(d); if(!dd) return;
         snprintf(p,sizeof p,"%s/%s",d,e->d_name); remove(p); } closedir(dd); rmdir(d); }
 
 /* worker: download [lo,hi] real heights via asm node_ibd_blocks_x into a
- * transient scratch store dir. Re-indexes master [lo,hi] -> local hst. */
+ * transient scratch store dir. Re-indexes master [lo,hi] -> local hst.
+ * Uses the TRUSTED pool (goodindex[] of length ngood, all confirmed-up distinct)
+ * so on a peer drop it fails over to another confirmed-up distinct peer without
+ * re-probing dead hosts. Claims are held for the whole session per worker. */
 static int worker(int w, const char* scratchbase, long lo, long hi, void* mhst,
-                  char peers[][128], int np, int pi0){
+                  char peers[][128], int goodindex[], int ngood, int pi0){
     char wdir[512]; snprintf(wdir,sizeof wdir,"%s_w%d",scratchbase,w);
     mkdir(wdir,0755); if(chdir(wdir)) return 1;
     static unsigned char hst[4096]; hst_init(hst);
@@ -113,25 +117,41 @@ static int worker(int w, const char* scratchbase, long lo, long hi, void* mhst,
     static unsigned char st[4096]; store_init(st); store_reload(st);
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
     unsigned cap=(unsigned)(sizeof scratch/32);
-    int guard=0; int pi=pi0; long resume=0; char cip[128]={0};
+    int guard=0; int slot=pi0; long resume=0; char cip[128]={0};
+    long stalled=0;
     for(;;){
+        /* pick a distinct trusted peer for this session slot; fail over within
+         * the confirmed-up pool only. round-robin from this worker's slot. */
         int fd=-1; int ok=0;
-        for(int a=0;a<np*3+40 && !ok;a++){
-            const char* cand=peers[(pi+a)%np];
+        for(int a=0;a<ngood && !ok;a++){
+            int idx=goodindex[(slot+a)%ngood];
+            const char* cand=peers[idx];
             char i[128]; snprintf(i,sizeof i,"%s",cand); char*c=strchr(i,':'); if(c)*c=0;
             if(!cl_take(i)) continue;
             int fdc=connect_peer(cand);
-            if(fdc>=0){ strncpy(cip,i,sizeof cip); fd=fdc; ok=1; } else { cl_rel(i); }
+            if(fdc>=0){ strncpy(cip,i,sizeof cip); fd=fdc; ok=1; slot=(slot+a+1)%ngood; }
+            else { cl_rel(i); }
         }
-        if(!ok){ fprintf(stderr,"[w%d] no distinct peer\n",w); break; }
+        if(!ok){
+            /* TRANSIENT contention / peers down: DO NOT give up permanently.
+             * Retry with backoff so the pool can settle, and so a fresh working
+             * peer that comes back is picked up. Only bail after a long wait. */
+            stalled++;
+            fprintf(stderr,"[w%d] no distinct peer (attempt %ld), retry in 3s\n",w,stalled);
+            if(stalled>40){ fprintf(stderr,"[w%d] no distinct peer: exhausted\n",w); break; }
+            sleep(3);
+            slot=(slot+7)%ngood;      /* shift start so we try different peers */
+            continue;
+        }
+        stalled=0;
         long r=node_ibd_blocks_x(fd, st, hst, resume, n-1, buf, sizeof buf, scratch, cap);
         fd_close(fd); cl_rel(cip); cip[0]=0;
-        if(r!=0 && guard++>3000){ fprintf(stderr,"[w%d] reconnect budget\n",w); break; }
+        slot=(slot+1)%ngood;                /* advance failover slot */
+        if(r!=0 && guard++>400){ fprintf(stderr,"[w%d] reconnect budget\n",w); break; }
         store_reload(st);
         int tip_h=*(int*)((char*)st+24);
         resume=(long)tip_h+1;
         if(resume>=n) break;
-        pi=(pi+1)%np;
     }
     fprintf(stderr,"[w%d] done %ld/%ld\n", w, resume, n);
     return 0;
@@ -177,19 +197,46 @@ int main(int argc,char**argv){
     /* claimpath */
     snprintf(claimpath,sizeof claimpath,"%s/peerclaims",dir); remove(claimpath);
 
-    /* establish nw DISTINCT up peers */
+    /* establish a ROBUST trusted pool of confirmed-up DISTINCT peers.
+     * Probe the full list in parallel (a forked child per peer, bounded time),
+     * collecting confirmed-up distinct IPs. We want >= 3*nw for deep failover so
+     * no worker ever starves when its current peer drops. */
     int goodindex[MAXPEERS]; int ngood=0; unsigned chosen_ip[MAXPEERS]; int nch=0;
-    for(int i=0;i<np && ngood<nw;i++){
-        char hb[128]; snprintf(hb,sizeof hb,"%s",peers[i]); char*c=strchr(hb,':'); if(c)*c=0;
-        struct in_addr ia; if(inet_pton(AF_INET,hb,&ia)!=1) continue;
-        int dup=0; for(int k=0;k<nch;k++) if(chosen_ip[k]==ia.s_addr){dup=1;break;}
-        if(dup){ printf("peer[%d] %s SKIP-duplicate\n",i,peers[i]); continue; }
-        int fd=connect_peer(peers[i]); int up=fd>=0; if(fd>=0) fd_close(fd);
-        printf("peer[%d] %s %s\n",i,peers[i],up?"UP":"DOWN");
-        if(up){ goodindex[ngood++]=i; chosen_ip[nch++]=ia.s_addr; }
+    {
+        /* parallel probe: forked children connect+handshake; parent REAPs */
+        unsigned char alive[MAXPEERS]; memset(alive,0,MAXPEERS);
+        pid_t pids[MAXPEERS]; memset(pids,0,sizeof pids);
+        for(int i=0;i<np && i<MAXPEERS;i++){
+            pid_t p=fork();
+            if(p==0){
+                char hb[128]; snprintf(hb,sizeof hb,"%s",peers[i]); char*c=strchr(hb,':'); if(c)*c=0;
+                struct in_addr ia; if(inet_pton(AF_INET,hb,&ia)!=1) _exit(0);
+                int fd=connect_peer(peers[i]);
+                if(fd>=0){ fd_close(fd); _exit(1); }
+                _exit(0);
+            }
+            pids[i]=p;
+        }
+        int done=0; time_t t0=time(NULL);
+        while(done<=0 && time(NULL)-t0<20){
+            int all=1; for(int i=0;i<np && i<MAXPEERS;i++){ if(pids[i] && waitpid(pids[i],NULL,WNOHANG)==0){ all=0; break; } }
+            if(all) done=1; else usleep(100000);
+        }
+        for(int i=0;i<np && i<MAXPEERS;i++){ if(done==0 && pids[i]) kill(pids[i],SIGKILL); }
+        for(int i=0;i<np && i<MAXPEERS;i++){ if(pids[i]){ int st; waitpid(pids[i],&st,0); alive[i]=WIFEXITED(st)&&WEXITSTATUS(st)==1?1:0; } }
+        for(int i=0;i<np && i<MAXPEERS;i++){ char hb[128]; snprintf(hb,sizeof hb,"%s",peers[i]); char*c=strchr(hb,':'); if(c)*c=0;
+            if(!alive[i]){ printf("pool peer[%d] %s DOWN\n",i,peers[i]); continue; }
+            struct in_addr ia; if(inet_pton(AF_INET,hb,&ia)!=1) continue;
+            int dup=0; for(int k=0;k<nch;k++) if(chosen_ip[k]==ia.s_addr){dup=1;break;}
+            if(dup){ printf("pool peer[%d] %s SKIP-duplicate\n",i,peers[i]); continue; }
+            goodindex[ngood]=i; chosen_ip[nch++]=ia.s_addr; ngood++;
+            printf("pool peer[%d] %s UP\n",i,peers[i]);
+        }
     }
-    if(ngood<nw)nw=ngood;
-    printf("established %d/%d DISTINCT\n",ngood,nw);
+    /* trusted pool may be large; cap worker count to what we can support with
+     * deep failover. We need at least nw up peers; prefer up to nw*3. */
+    if(ngood<nw){ fprintf(stderr,"only %d up peers for %d workers\n",ngood,nw); nw=ngood; }
+    printf("trusted pool: %d confirmed-up DISTINCT peers\n", ngood);
 
     char scratchbase[512]; snprintf(scratchbase,sizeof scratchbase,"%s/_work",dir);
     /* WIPE any leftover scratch from a prior run BEFORE forking workers: a worker
@@ -203,7 +250,7 @@ int main(int argc,char**argv){
         long hi=start_h + (long)((long long)span*(w+1)/nw)-1;
         if(hi<lo)hi=lo;
         pid_t p=fork();
-        if(p==0){ _exit(worker(w,scratchbase,lo,hi,mhst,peers,np,goodindex[w])); }
+        if(p==0){ _exit(worker(w,scratchbase,lo,hi,mhst,peers,goodindex,ngood,w)); }
         kids[w]=p;
     }
     for(int w=0;w<nw;w++){ int stt; waitpid(kids[w],&stt,0); printf("worker %d exit %d\n",w,WEXITSTATUS(stt)); }
