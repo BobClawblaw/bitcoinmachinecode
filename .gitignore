@@ -82,3 +82,5 @@ asm/tests/test_sha512
 asm/sha512.o
 asm/tests/test_hmac
 asm/bitcoin_hmac.o
+asm/tests/test_bip32_master
+asm/bitcoin_bip32.o
