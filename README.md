@@ -116,7 +116,16 @@ Workers each keep a private `/tmp` header-store file (never touching
 `data/headers.dat`), which fixed a deterministic worker-boundary corruption bug.
 Peer distinctness is guaranteed across the whole run via a flock-locked
 `peerclaims` table (no two workers on the same peer). Real-mainnet
-header-continuity bug found and fixed (see LOG #12).
+header-continuity bug found and fixed (see LOG #12). `daemon/chainctl.c` drives
+the whole chain forward in audited chunks (16k, resumable from the archive tip,
+per-chunk `check_chain` audit + throughput/ETA). **Backfill:** because the
+forward pass resumes from the existing tip, the missing early heights can be
+fetched by a `unified_ibd <dir> N <lo> <hi>` run whose range lies BELOW the tip:
+the loader detects this as a backfill, preserves the requested range, keeps the
+index grow-only (never truncates the forward archive), uses a per-process
+peerclaims table, and reuses the existing `headers.dat` (no rewrite) so it can
+run CONCURRENTLY with the forward chainctl — the two fill the archive from both
+ends with zero duplicate blocks.
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
@@ -125,10 +134,20 @@ peers via getaddr->addr/addrv2 and fold them into the book; `daemon/peertest.c`
 verifies which peers actually serve block bodies. Combined with the distinct-peer
 selection this is the basis for self-directed discovery.
 
-**The durable archive** is currently a single unified store (`data/blk00000.dat`..
-`blk00764.dat` + `index.dat`, ~96 GB, 237k+ blocks at last snapshot) that is
-queryable via the asm CLI and served to real inbound peers (handshake + headers +
-exact block bodies).
+**The durable archive** is a single unified store (`data/blk00000.dat`.. + `index.dat` +
+`headers.dat` — one directory, no worker shards) that is queryable via the asm CLI
+and served to real inbound peers. Serving was rebuilt around an **O(1) in-memory
+hash→height index** built at startup from `index.dat` (a linear per-height scan
+never finished on a large archive and a single hole aborted it) — `getdata`,
+`getheaders`-locator, and `inv`-dedup now look up by hash directly, and the
+headserve buffers plus `getheaders` response buffer were sized for modern
+(up to 4 MB) blocks (fixing a stack-smash). Verified byte-identical block delivery
+to a peer at multiple heights, and, as both the forward pass and the early-height
+backfill converge, the archive now reaches **block 0 (the 2009 genesis block)**
+upward — `verify` on the contiguous stored runs reports 100% hash-match /
+chain-link / PoW / consensus (`CHAIN VERIFIED`). One-shot health: `daemon/nodecheck.sh`
+(audit + progress + serve round-trip) and `daemon/chainprogress.sh` (coverage
+toward a complete 0..tip archive).
 
 ## Layout
 
@@ -154,11 +173,16 @@ bitcoinmachinecode/
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
-|       +-- unified_ibd.c     # full-chain download into a unified single store
+|       +-- unified_ibd.c     # full-chain download into a unified single store (forward + backfill)
+|       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
+|       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
+|       +-- verify.c          # full chain validation (hash/chain/PoW/consensus)
+|       +-- dumpblock.c       # inspect a stored block (raw bytes / header summary)
+|       +-- nodecheck.sh      # one-shot health: audit + progress + serve round-trip
+|       +-- chainprogress.sh  # coverage toward a complete 0..tip archive
 |       +-- crawler.c         # parallel getaddr peer harvester
 |       +-- addrgather.c      # getaddr -> addr/addrv2 -> peers.dat address book
 |       +-- peertest.c        # verify which peers serve block bodies
-|       +-- merge_only.c      # consolidate shard snapshots (manual/serving)
 |       +-- main.c            # daemon: sync / ibd / follow / serve / server-test
 |       +-- cli.c             # thin driver for the asm cli_main
 +-- data/                    # durable chain storage: ONE unified archive
@@ -182,9 +206,18 @@ cd /storage/bitcoinmachinecode/asm/daemon
                                                      # getdata block bodies +
                                                      # validate + store)
 # full-chain download into a UNIFIED single store (parallel, >=8 DISTINCT peers,
-# no shard dirs, resumable from store tip):
+# no shard dirs, resumable from the store tip):
 ./unified_ibd /storage/bitcoinmachinecode/data 8 <start_h> <end_h>
-./cli /storage/bitcoinmachinecode/data getblockcount # query the stored chain
+# chunked full-chain orchestrator (forward to tip, resuming + auditing each chunk):
+./chainctl /storage/bitcoinmachinecode/data 8 16000 20
+# backfill early heights below the existing tip (runs safely alongside chainctl):
+./unified_ibd /storage/bitcoinmachinecode/data 8 0 29999
+# health / progress / audit / serve round-trip:
+./nodecheck.sh /storage/bitcoinmachinecode/data        # audit + progress + serve
+./chainprogress.sh /storage/bitcoinmachinecode/data    # coverage toward 0..tip
+./check_chain /storage/bitcoinmachinecode/data         # dups/holes/corruption audit
+./verify /storage/bitcoinmachinecode/data <lo> <hi>    # hash/chain/PoW/consensus
+./cli /storage/bitcoinmachinecode/data getblockcount   # query the stored chain
 ```
 
 ## Build & verify
