@@ -96,15 +96,30 @@ now real too: a new asm `node_accept_handshake` answers a genuine inbound node's
 `version` and serves stored blocks (verified end to end), where the old serve
 path reused the outbound handshake and hung on an inbound peer.
 
-**Parallel full-chain download (>= 8 distinct internet peers) + all-asm receive
-loop:** Peer discovery (`daemon/peertest.c` / `daemon/discover.c`, scanning a
-26,895-node snapshot) finds many distinct internet nodes that serve block bodies;
-`daemon/paribd.c` and `daemon/paribd_asm.c` download the full chain in parallel.
-The per-worker receive loop (`bitcoind.asm node_ibd_headers` + `node_ibd_blocks_x`)
-downloads / `cons_verify`s / stores each block entirely in assembly. Verified:
-962,208 real headers persisted, real blocks downloaded/stored and re-served to an
-inbound peer. A real-mainnet header-continuity bug was found and fixed (see LOG
-#12). A resumable full-chain download runs into `data/`.
+**Full-chain download as a unified single store (>= 8 DISTINCT peers, no shard
+dirs):** `daemon/unified_ibd.c` downloads the whole chain in parallel — the asm
+`node_ibd_headers` persists the header chain, then `node_ibd_blocks_x` runs per
+worker to download / `cons_verify` / store each block entirely in assembly. A
+single-writer `store_append` consolidates every block into **one** archive
+(`blk00000.dat`..`blkNNNNN.dat` + `index.dat`, rolling at 128 MiB like Bitcoin
+Core) in real-height order, and removes the transient download scratch — no
+`w0..w7` shard dirs ever persist. Resumable: rerunning continues from the store
+tip. Peer distinctness is guaranteed across the whole run via a flock-locked
+`peerclaims` table, so no two workers ever use the same peer (verified 8/8
+distinct over an entire 2000-block run). Real-mainnet header-continuity bug
+found and fixed (see LOG #12).
+
+**Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
+is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
+(verified by `test_addrmgr`). `daemon/crawler.c` / `daemon/addrgather.c` harvest
+peers via getaddr->addr/addrv2 and fold them into the book; `daemon/peertest.c`
+verifies which peers actually serve block bodies. Combined with the distinct-peer
+selection this is the basis for self-directed discovery.
+
+**The durable archive** is currently a single unified store (`data/blk00000.dat`..
+`blk00764.dat` + `index.dat`, ~96 GB, 237k+ blocks at last snapshot) that is
+queryable via the asm CLI and served to real inbound peers (handshake + headers +
+exact block bodies).
 
 ## Layout
 
@@ -124,11 +139,21 @@ bitcoinmachinecode/
 |   +-- bitcoin_headers.asm    # persistent header chain (hdr, block_hash) store
 |   +-- bitcoin_cons.asm       # full-block consensus check (cons_verify)
 |   +-- bitcoin_cli.asm        # S6 CLI: query the store (cli_main)
+|   +-- bitcoin_addrmgr.asm    # persisted peer address book + addr v1 codecs
 |   +-- build.sh              # assemble + build + run every verification harness
 |   +-- Makefile              # make asm | test | clean
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
-+-- data/                    # durable chain storage (blk00000.dat, index.dat, log)
+|   +-- daemon/               # C orchestration + peer discovery/serving tools
+|       +-- unified_ibd.c     # full-chain download into a unified single store
+|       +-- crawler.c         # parallel getaddr peer harvester
+|       +-- addrgather.c      # getaddr -> addr/addrv2 -> peers.dat address book
+|       +-- peertest.c        # verify which peers serve block bodies
+|       +-- merge_only.c      # consolidate shard snapshots (manual/serving)
+|       +-- main.c            # daemon: sync / ibd / follow / serve / server-test
+|       +-- cli.c             # thin driver for the asm cli_main
++-- data/                    # durable chain storage: ONE unified archive
+|                           # (blk00000.dat..blkNNNNN.dat + index.dat + headers.dat)
 +-- README.md
 ```
 
@@ -147,6 +172,9 @@ cd /storage/bitcoinmachinecode/asm/daemon
                                                      # (headers-first persist +
                                                      # getdata block bodies +
                                                      # validate + store)
+# full-chain download into a UNIFIED single store (parallel, >=8 DISTINCT peers,
+# no shard dirs, resumable from store tip):
+./unified_ibd /storage/bitcoinmachinecode/data 8 <start_h> <end_h>
 ./cli /storage/bitcoinmachinecode/data getblockcount # query the stored chain
 ```
 
