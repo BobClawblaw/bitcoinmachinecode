@@ -71,3 +71,4 @@ asm/tests/test_shared
 asm/tests/test_shared2
 asm/daemon/check_chain
 asm/daemon/dumpblock
+asm/tests/serve_test

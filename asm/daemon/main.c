@@ -204,7 +204,7 @@ static void full_serve(int cfd){
     }
 }
 static int serve_loop(int fd, int lfd){
-    char cmd[12]; unsigned char pl[65536]; unsigned plen=0; unsigned char out[65536];
+    char cmd[12]; static unsigned char pl[8<<20]; unsigned plen=0; static unsigned char out[8<<20];
     int served=0;
     for(int n=0; n<10000; n++){
         plen=0;
@@ -251,7 +251,7 @@ static int serve_loop(int fd, int lfd){
                         long gl=-1;
                         long fh;
                         if(ht_get(pl+off+4, &fh)){
-                            static unsigned char sb[65536];
+                            static unsigned char sb[8<<20];
                             long L = node_serve_block(store_buf, fh, sb, sizeof sb);
                             if(L>0){ gl=L; memcpy(out,sb,(size_t)L); }
                         }
@@ -270,8 +270,8 @@ static int serve_loop(int fd, int lfd){
                 if(ht_get(pl+5,&fh)){ from=(int)fh+1; }
                 if(from<0 && tip>0) from=0;   /* unknown locator: from genesis */
             }
-            if(from>=0){ int tip=*(int*)(store_buf+24); unsigned char hp[16384]; int p=1;
-                int n=0; for(int h=from; h<=tip && n<2000; h++,n++){ static unsigned char sb[65536];
+            if(from>=0){ int tip=*(int*)(store_buf+24); unsigned char hp[2000*81+4]; int p=1;
+                int n=0; for(int h=from; h<=tip && n<2000; h++,n++){ static unsigned char sb[8<<20];
                     long L=node_serve_block(store_buf,h,sb,sizeof sb); if(L<0)break;
                     memcpy(hp+p, sb, 80); hp[p+80]=0; p+=81;                  /* hdr + tx-count */
                 }
@@ -298,7 +298,7 @@ static int serve_loop(int fd, int lfd){
                             static unsigned char gd[37]; gd[0]=1; gd[1]=2; gd[2]=0; gd[3]=0; gd[4]=0;
                             memcpy(gd+5, pl+off+4, 32);
                             p2p_write(fd,"getdata",7,gd,37);
-                            char c2[12]; unsigned char blk[65536]; unsigned bl=0;
+                            char c2[12]; static unsigned char blk[8<<20]; unsigned bl=0;
                             int rr=p2p_read(fd,c2,blk,sizeof blk,&bl);
                             if(rr>0 && strncmp(c2,"block",5)==0){
                                 static unsigned char scratch[2048];
