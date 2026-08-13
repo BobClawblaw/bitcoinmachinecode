@@ -148,18 +148,23 @@ selection this is the basis for self-directed discovery.
 
 **The durable archive** is a single unified store (`data/blk00000.dat`.. + `index.dat` +
 `headers.dat` — one directory, no worker shards) that is queryable via the asm CLI
-and served to real inbound peers. Serving was rebuilt around an **O(1) in-memory
-hash→height index** built at startup from `index.dat` (a linear per-height scan
-never finished on a large archive and a single hole aborted it) — `getdata`,
-`getheaders`-locator, and `inv`-dedup now look up by hash directly, and the
-headserve buffers plus `getheaders` response buffer were sized for modern
-(up to 4 MB) blocks (fixing a stack-smash). Verified byte-identical block delivery
-to a peer at multiple heights, and, as both the forward pass and the early-height
-backfill converge, the archive now reaches **block 0 (the 2009 genesis block)**
-upward — `verify` on the contiguous stored runs reports 100% hash-match /
-chain-link / PoW / consensus (`CHAIN VERIFIED`). One-shot health: `daemon/nodecheck.sh`
-(audit + progress + serve round-trip) and `daemon/chainprogress.sh` (coverage
-toward a complete 0..tip archive).
+and **served entirely in assembly**. Serving was rebuilt around an **O(1) in-memory
+hash→height index** built in assembly (`asm/bitcoin_idx.asm`: `idx_init/put/get`,
+open-addressing, full 32-byte keys) — a linear per-height scan never finished on a
+large archive and a single hole aborted it. `asm/bitcoin_serve.asm`
+(`node_serve_loop`) is the per-connection server message loop in pure machine
+code: ping→pong, getaddr→addr (address book), getdata→block (O(1) lookup +
+`node_serve_block`), getheaders (2000x81B pages), inv. The serve daemon
+(`./bitcoind serve`) calls it after `node_accept_handshake`, so both halves of the
+node's core run in assembly (outbound download `node_ibd_*` + inbound server
+`node_serve_loop`). Verified live against the daemon: 8 real mainnet blocks served
+byte-exact on one connection, each hashing back to the requested hash. The buffer
+sizing is hardened for modern (up to 4 MB) blocks. One-shot health:
+`daemon/nodecheck.sh` (audit + progress + serve round-trip) and
+`daemon/chainprogress.sh` (coverage toward a complete 0..tip archive). As the
+forward pass and the early-height backfill converge, the archive reaches **block 0
+(the 2009 genesis block)** upward — `verify` on contiguous runs reports 100%
+hash-match / chain-link / PoW / consensus (`CHAIN VERIFIED`).
 
 ## Layout
 
@@ -181,6 +186,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_cli.asm        # S6 CLI: query the store (cli_main)
 |   +-- bitcoin_addrmgr.asm    # persisted peer address book + addr v1 codecs
 |   +-- bitcoin_idx.asm        # O(1) block hash->height index for serving (idx_*)
+|   +-- bitcoin_serve.asm      # inbound server message loop (node_serve_loop)
 |   +-- build.sh              # assemble + build + run every verification harness
 |   +-- Makefile              # make asm | test | clean
 |   +-- tests/                # C harnesses proving the machine code correct
