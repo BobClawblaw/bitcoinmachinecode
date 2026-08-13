@@ -39,6 +39,10 @@ extern void node_log_event(int fd, int kind, unsigned a, unsigned b, unsigned c)
 extern void node_log_str(int fd, int kind, const char* s, long len);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
+extern int  amr_init(void* ab);
+extern long amr_count(void* ab);
+extern int  amr_get_i(void* ab, long i, void* out);
+extern long p2p_addr_v1(void* out, const void* src, long n);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
 extern long node_ibd(int fd, void* st, void* hst, void* buf, long buflen); /* bitcoind.asm */
@@ -160,6 +164,25 @@ static int serve_loop(int fd, int lfd){
         cmd[11]=0;
         if(memcmp(cmd,"ping",4)==0){
             p2p_write(fd,"pong",4, pl, (plen>=8)?8:0);   /* echo nonce */
+        } else if(memcmp(cmd,"getaddr",7)==0){
+            /* A connected peer asked us for our address book. Reply with an
+             * `addr` message built from peers.dat via the asm address manager
+             * (amr_* + p2p_addr_v1). This is the addr-relay half of recursive
+             * peer discovery -- answering makes the network treat us as a real
+             * full client and reciprocate. */
+            static unsigned char ab[64];
+            if(amr_init(ab)==1){
+                static unsigned char rec[18]; long cnt = amr_count(ab);
+                long n= cnt>1000?1000:cnt;           /* cap a single addr msg */
+                static unsigned char src[1000*18];
+                long have=0;
+                for(long i=0;i<n;i++){ if(amr_get_i(ab,i,rec)==1) memcpy(src+have*18,rec,18), have++; }
+                if(have>0){
+                    static unsigned char ah[1000*30+4];
+                    long L = p2p_addr_v1(ah, src, have);
+                    p2p_write(fd,"addr",4, ah, (unsigned)L);
+                }
+            }
         } else if(memcmp(cmd,"getdata",7)==0){
             /* payload: count varint then per item: [type int32 LE][hash32].
              * The wire inventory `type` is a 4-byte little-endian int32
