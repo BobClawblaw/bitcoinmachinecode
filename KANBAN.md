@@ -11,7 +11,9 @@ Status legend: [ ] todo · [~] in-progress · [x] done · [!] blocked
 | [x] | pubkey_parse: comp/uncomp aff coords + fe_pow sqrt (bitcoin_pubkey.asm) |
 | [x] | legacy SIGHASH_ALL preimage builder (bitcoin_sighash.asm)            |
 | [x] | der_parse_sig + be_to_limbs (bitcoin_script.asm, toward P2PKH)        |
-| [ ] | verify_p2pkh: full signature check (sighash+der+pubkey+ecdsa)         |
+| [x] | verify_p2pkh: full signature check (sighash+der+pubkey+ecdsa)         |
+| [ ] | UTXO store: track prevout value/script for validation                 |
+| [ ] | tx_validator: validate a whole tx (all inputs) + double-spend/fee      |
 
 ## Node (complete)
 | Status | Task |
