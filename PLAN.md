@@ -216,6 +216,14 @@ only prove correctness). Commits: `a062d78`..`5dbe238`.
   deterministic nonce). `test_wallet` 9/9 + independent Python verification.
 - **bech32/bech32m codec** — `asm/bech32.asm` (BIP173/350), verified against every
   BIP vector + real mainnet segwit addresses.
+- **P2SH / multisig** — `asm/bitcoin_multisig.asm`: `p2sh_hash` =
+  RIPEMD160(SHA256(redeemScript)) and `multisig_verify` = OP_CHECKMULTISIG
+  evaluation over the verified sighash/pubkey/ecdsa chain. `test_multisig`
+  (8/8) cross-checked by the independent pure-Python `ecdsa` oracle
+  (`asm/validation/p2sh_oracle.py`): a self-consistent spend whose DER sig
+  verifies over the legacy SIGHASH_ALL preimage (redeem script as signing
+  script), plus negative (tampered-sig, wrong-pubkey) cases and known p2sh
+  hashes.
 
 Suite: `make test` green, 40/40 PASS. The node can now validate and sign real
 transactions in machine code.
@@ -430,5 +438,51 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
 - NEXT (natural wallet steps, not yet started): (a) BIP32 derive full path +
   extended key (xprv/xpub) encoding, (b) BIP39 mnemonic<->seed, (c) P2SH/multisig.
   P2SH/multisig (OP_CHECKMULTISIG) is also on the kanban backlog.
+
+### 11. COMPLIANCE TARGET — "fully compliant" is a DEFINED, MEASUREABLE SCOPE
+
+**Definition (final, agreed 2026-08-14):** the project is *fully compliant* when
+its ASM node is a **fully functional headless CLI Bitcoin node, 100% compatible
+with the current version of Bitcoin Core (master@storage/bitcoin-core-source)**,
+covering **consensus, validation/mempool, P2P, and wallet-core + CLI/RPC**.
+**Explicitly OUT of scope** (NOT needed): the Qt GUI, hardware-wallet (HWI/BIP174
+PSBT-for-GUI) surface, and non-core surplus RPCs. "Compatible" = **behavioral
+parity** with Core on real mainnet for the in-scope surfaces; every consensus
+result on shared blocks/txs must be bit-identical or the node must refuse
+(rather than diverge).
+
+**Status against the in-scope surface (base = Core master):**
+
+| Area | Status | Tracking |
+|------|--------|----------|
+| Crypto primitives (SHA256/RIPEMD160/secp256k1/ECDSA/addrmgr/bech32) | DONE, verified | sections above |
+| Tx deserialize / txid (legacy + segwit v0 BIP141) | DONE | bitcoin_tx.asm |
+| Block consensus (PoW, merkle, coinbase, store) | DONE | bitcoin_cons.asm |
+| P2P core (sockets, codecs, IBD, serve, multi-peer, relay) | DONE | S1-S6 |
+| P2PKH spend validation (sighash + ecdsa + UTXO in-mem) | DONE | wallet/validation bridge |
+| mempool policy / RBF / fee | DONE | bitcoin_mempool_policy.c |
+| P2SH / multisig (OP_CHECKMULTISIG) | DONE | bitcoin_multisig.asm |
+| BIP32 full-path + xprv/xpub | queued (card 2) | this batch |
+| BIP39 mnemonic <-> seed | queued (card 3) | this batch |
+| Persistent UTXO to disk | queued (card 4) | this batch |
+| sighash_all real-spend end-to-end | queued (card 5) | this batch |
+| Full script interpreter (all opcodes incl. tapscript/BIP342) | OPEN — largest asm item | post-batch |
+| Taproot / segwit v1 validation (BIP341/340) | OPEN | post-batch |
+| Full wallet-core + bitcoin-cli/RPC surface (getnewaddress, sendtoaddress, signrawtransaction, getbalance, createrawtransaction, etc.) | OPEN | post-batch |
+| Higher-level P2P parity (compact blocks, sendheaders, feefilter, handshake nitpicks) | OPEN | post-batch |
+| Consensus bit-exactness on mainnet edge cases (BIP16/30, 2-of-3 P2SH, height-gated rules) | OPEN — requires differential testing vs Core | post-batch |
+| RPC, pruning, mainnet-scale (540 GB) storage | OPEN | post-batch |
+
+**Compliance gate (how we know it's done):** differential test the ASM node
+against Core — feed the same real mainnet blocks/txs and compare every verdict
+byte-for-byte for consensus, validation, mempool acceptance, and CLI/RPC
+responses. "100% compatible" is reached only when the ASM result equals Core's
+on the shared inputs and divergences are zero.
+
+**Honest trajectory note:** this is a months-scale target, not days. Biggest
+drivers: the full script interpreter incl. tapscript, taproot/segsig validation,
+the full wallet-cli/RPC surface, and bit-exact consensus on mainnet edge cases.
+Rate is unproven (we are one card into a five-card batch); revisit the day
+estimate once 3-5 cards have measured durations.
 
 ===== END PLAN =====

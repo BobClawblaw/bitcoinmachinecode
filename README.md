@@ -212,6 +212,15 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   0x2bc830a3 switch, 8<->5 bit regroup, encode/decode), verified against every
   authoritative BIP173/BIP350 vector plus exact real mainnet segwit addresses
   (P2WPKH bc1qw508..., P2WSH bc1qrp33..., P2TR bech32m bc1p...).
+- **P2SH / multisig** (`asm/bitcoin_multisig.asm`) — `p2sh_hash`
+  (RIPEMD160(SHA256(redeemScript))) and `multisig_verify` (OP_CHECKMULTISIG
+  evaluation: walk the scriptSig pushes, take the push before the target
+  pubkey as that signer's DER sig, and ECDSA-verify it against the legacy
+  SIGHASH_ALL preimage with the redeem script as the signing script).
+  `test_multisig` (8/8) is cross-checked by the independent pure-Python
+  `ecdsa` oracle (`asm/validation/p2sh_oracle.py`): known p2sh hashes, a
+  self-consistent spend that verifies, and tampered-sig / wrong-pubkey
+  negatives.
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
@@ -266,6 +275,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_script.asm     # der_parse_sig + verify_p2pkh (end-to-end P2PKH validate)
 |   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script)
 |   +-- bech32.asm             # BIP173/350 bech32/bech32m address codec
+|   +-- bitcoin_multisig.asm   # p2sh_hash + multisig_verify (OP_CHECKMULTISIG)
 |   +-- wallet_core.c          # wallet primitives glue over asm crypto
 |   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer over mempool + UTXO
 |   +-- build.sh              # assemble + build + run every verification harness
