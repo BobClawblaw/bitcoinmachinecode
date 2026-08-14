@@ -14,9 +14,12 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o
+OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o
 # bitcoin_hash.asm (sha256d/block-hash/merkle/pow) depends on sha256.o
 HASHOBJS := sha256.o bitcoin_hash.o
+# Full script interpreter (bitcoin_interp.asm over bitcoin_scriptcodec.asm) plus
+# its hashing deps (OP_SHA256/HASH160/HASH256/RIPEMD160).
+INTERPOBJS := bitcoin_interp.o bitcoin_scriptcodec.o sha256.o ripemd160.o bitcoin_hash.o
 # bitcoin_tx.asm parser harness also exercises sha256d/merkle_root.
 TXOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o
 # bitcoin_net.asm framing needs sha256d (checksum).
@@ -331,6 +334,16 @@ MULTISIGOBJS := bitcoin_multisig.o bitcoin_script.o bitcoin_sighash.o \
 tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_multisig.c $(MULTISIGOBJS)
 
+# Full script interpreter harnesses (bitcoin_interp.asm + codec + hashing).
+tests/smoke_interp: tests/smoke_interp.c $(INTERPOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/smoke_interp.c $(INTERPOBJS)
+tests/test_interp: tests/test_interp.c $(INTERPOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_interp.c $(INTERPOBJS)
+tests/test_tapscript_interp: tests/test_tapscript_interp.c $(INTERPOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_tapscript_interp.c $(INTERPOBJS)
+tests/run_batch: tests/run_batch.c $(INTERPOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/run_batch.c $(INTERPOBJS)
+
 # Wallet CLI: generate key, show address, sign a P2PKH tx, and -- via BIP39 +
 # BIP32 -- produce/restore recoverable seeds.
 # asm/wallet_core.c glues the VERIFIED asm primitives (scalar_to_pubkey,
@@ -379,7 +392,7 @@ tests/test_shared: tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send \
+test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch \
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -417,6 +430,9 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_wrpc_send
 	./tests/test_txval
 	./tests/test_multisig
+	./tests/smoke_interp
+	./tests/test_interp
+	./tests/test_tapscript_interp
 	./tests/test_block
 	./tests/test_tx
 	./tests/test_net

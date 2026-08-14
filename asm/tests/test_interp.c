@@ -107,9 +107,10 @@ static const struct vec VECS[] = {
   {"5176", 1, "1 DUP -> 1 1"},
   {"517551", 1, "1 DROP 1"},
   {"51527c", 1, "1 2 SWAP -> 2 1"},
-  {"51527b", 1, "1 2 3 ROT -> 2 3 1"},
+  {"5152537b", 1, "1 2 3 ROT -> 2 3 1"},
   /* IF/ELSE/ENDIF */
-  {"5163516a67 00 68", 1, "IF ... ENDIF (empty)"},  /* 51 63 ... 6a? no OP_RETURN */
+  {"516368", 1, "1 IF ENDIF (empty true body)"},   /* OP_1 OP_IF OP_ENDIF */
+  {"006368", 1, "0 IF ENDIF (empty false body)"}, /* OP_0 OP_IF OP_ENDIF */
   {"0151", 0, "placeholder"},
   /* size */
   {"5182", 1, "1 SIZE -> 1 1"},

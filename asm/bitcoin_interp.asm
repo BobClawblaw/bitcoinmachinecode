@@ -163,8 +163,10 @@
 %define SCRIPT_VERIFY_MINIMALIF (1<<13)
 %define SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY (1<<9)
 %define SCRIPT_VERIFY_CHECKSEQUENCEVERIFY (1<<10)
+%define SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS (1<<18)
 
 %define SCRIPT_ERR_OK 0
+%define SCRIPT_ERR_EVAL_FALSE 2
 %define SCRIPT_ERR_OP_RETURN 3
 %define SCRIPT_ERR_SCRIPT_SIZE 4
 %define SCRIPT_ERR_PUSH_SIZE 5
@@ -185,6 +187,8 @@
 %define SCRIPT_ERR_UNSATISFIED_LOCKTIME 23
 %define SCRIPT_ERR_TAPSCRIPT_MINIMALIF 50
 %define SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG 51
+%define SCRIPT_ERR_DISCOURAGE_OP_SUCCESS 52
+%define SCRIPT_ERR_CLEANSTACK 53
 
 section .bss
 align 16
@@ -213,7 +217,7 @@ script_eval:
     mov   r12, rdi            ; state
 
     ; script size limit for BASE/WITNESS_V0
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_TAPSCRIPT
     je    .ss_ok
     mov   rax, [r12+40]
@@ -233,6 +237,44 @@ script_eval:
     mov   qword [rbp-0x28], 0
     mov   qword [rbp-0x30], 0
     call  vfexec_sp_reset
+
+    ; ---- tapscript OP_SUCCESSx pre-scan (BIP342 / ExecuteWitnessScript) ----
+    mov   eax, dword [r12+48]
+    cmp   rax, SIGVERSION_TAPSCRIPT
+    jne   .prescan_done
+    ; scan a temporary pc through the script; find any OP_SUCCESSx
+    mov   [rbp-0x50], rax      ; (unused slot)
+    mov   rax, [r12+32]
+    mov   [rbp-0x50], rax      ; scan pc
+    mov   rax, [r12+32]
+    add   rax, [r12+40]
+    mov   [rbp-0x58], rax      ; scan pend
+.prescan_loop:
+    lea   rdi, [rbp-0x50]
+    mov   rsi, [rbp-0x58]
+    call  get_op
+    test  rax, rax
+    jz    .prescan_done        ; end of script or bad opcode -> no successx found
+    dec   rax                   ; opcode
+    call  is_opsuccess
+    test  rax, rax
+    jz    .prescan_loop
+    ; found an OP_SUCCESSx
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS
+    jnz   .prescan_discourage
+    ; success immediately
+    mov   rax, [r12+80]
+    test  rax, rax
+    jz    .prescan_ret1
+    mov   qword [rax], SCRIPT_ERR_OK
+.prescan_ret1:
+    mov   eax, 1
+    jmp   .done
+.prescan_discourage:
+    mov   rax, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS
+    jmp   .err_ret0
+.prescan_done:
 
 .loop:
     mov   rax, [rbp-0x10]
@@ -262,7 +304,7 @@ script_eval:
 .ps_ok:
 
     ; opcount
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_TAPSCRIPT
     je    .oc_skip
     mov   rax, [rbp-0x38]
@@ -526,7 +568,7 @@ script_eval:
     call  stack_top_ptr
     mov   r13, rax
     ; tapscript minimal-if
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_TAPSCRIPT
     jne   .if_tapd
     mov   r14d, [r13]
@@ -540,7 +582,7 @@ script_eval:
     mov   rax, SCRIPT_ERR_TAPSCRIPT_MINIMALIF
     jmp   .err_ret0
 .if_tapd:
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_WITNESS_V0
     jne   .if_minif_ok
     mov   rax, [r12+56]
@@ -1666,7 +1708,7 @@ script_eval:
     cmp   rax, OP_CHECKSIGVERIFY
     jne   .next_op
     ; tapscript forbids CHECKSIGVERIFY
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_TAPSCRIPT
     je    .bad_opcode
     lea   rdi, [r12+8]
@@ -1689,7 +1731,7 @@ script_eval:
     jmp   .err_ret0
 
 .op_checksigadd:
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_TAPSCRIPT
     je    .csa_go
     mov   rax, SCRIPT_ERR_BAD_OPCODE
@@ -1734,7 +1776,7 @@ script_eval:
 
 .op_checkmultisig:
 .op_checkmultisigverify:
-    mov   rax, [r12+48]
+    mov   eax, dword [r12+48]
     cmp   rax, SIGVERSION_TAPSCRIPT
     jne   .cms_go
     mov   rax, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG
@@ -1821,8 +1863,41 @@ script_eval:
 .loop_done:
     call  vfexec_depth
     test  rax, rax
-    jz    .final_ok
+    jz    .cstack
     mov   rax, SCRIPT_ERR_UNBALANCED_CONDITIONAL
+    jmp   .err_ret0
+.cstack:
+    ; Tapscript (BIP342 ExecuteWitnessScript) enforces cleanstack: the final
+    ; stack must have exactly one element (else CLEANSTACK) and that element
+    ; must CastToBool to true (else EVAL_FALSE). BASE/WITNESS_V0 leave
+    ; cleanstack/truthiness to the outer VerifyScript, so only gate on
+    ; SIGVERSION_TAPSCRIPT here. The "empty-stack treatment": a tapscript that
+    ; evaluates to an empty (or multi-item / false) stack must be rejected.
+    mov   eax, dword [r12+48]
+    cmp   rax, SIGVERSION_TAPSCRIPT
+    jne   .final_ok
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  stack_depth
+    cmp   rax, 1
+    jne   .cstack_fail          ; stack.size() != 1 -> CLEANSTACK
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  stack_top_ptr
+    mov   r13, rax
+    mov   r14d, [r13]
+    add   r13, ELEM_DATA_OFF
+    mov   rdi, r14
+    mov   rsi, r13
+    call  cast_to_bool
+    test  rax, rax
+    jz    .evalfalse           ; !CastToBool(top) -> EVAL_FALSE
+    jmp   .final_ok
+.cstack_fail:
+    mov   rax, SCRIPT_ERR_CLEANSTACK
+    jmp   .err_ret0
+.evalfalse:
+    mov   rax, SCRIPT_ERR_EVAL_FALSE
     jmp   .err_ret0
 .final_ok:
     mov   rax, [r12+80]
@@ -1849,6 +1924,65 @@ script_eval:
     pop   rbx
     pop   rbp
     ret
+
+; ============================================================================
+; is_opsuccess(opcode in rax) -> rax = 1 if OP_SUCCESSx else 0.
+;   Bitcoin Core IsOpSuccess (script.cpp:365), BIP342:
+;     opcode==80(OP_RESERVED) || opcode==98(OP_VER) ||
+;     (126..129)=CAT/SUBSTR/LEFT/RIGHT ||
+;     (131..134)=INVERT/AND/OR/XOR || (137..138)=RESERVED1/RESERVED2 ||
+;     (141..142)=2MUL/2DIV || (149..153)=MUL/DIV/MOD/LSHIFT/RSHIFT ||
+;     (187..254)=undefined tapscript opcodes (starts at OP_NOP11=0xbb=187).
+;   Leaf; uses only rax/rcx/rdx so callee-saved (rbx,r12-r15) stay untouched.
+; ============================================================================
+global is_opsuccess
+is_opsuccess:
+    cmp   rax, 80
+    je    .yes
+    cmp   rax, 98
+    je    .yes
+    cmp   rax, 126
+    jb    .r131
+    cmp   rax, 129
+    jbe   .yes
+.r131:
+    cmp   rax, 131
+    jb    .r137
+    cmp   rax, 134
+    jbe   .yes
+.r137:
+    cmp   rax, 137
+    jb    .r141
+    cmp   rax, 138
+    jbe   .yes
+.r141:
+    cmp   rax, 141
+    jb    .r149
+    cmp   rax, 142
+    jbe   .yes
+.r149:
+    cmp   rax, 149
+    jb    .r187
+    cmp   rax, 153
+    jbe   .yes
+.r187:
+    cmp   rax, 187
+    jb    .no
+    cmp   rax, 254
+    jbe   .yes
+.no:
+    xor   eax, eax
+    ret
+.yes:
+    mov   eax, 1
+    ret
+
+; is_opsuccess_c(int opcode) : C-ABI wrapper (opcode in edi per SysV) that
+; tail-calls into the rax-based is_opsuccess logic above. Used by C harnesses.
+global is_opsuccess_c
+is_opsuccess_c:
+    mov   rax, rdi
+    jmp   is_opsuccess
 
 ; ============================================================================
 ; interp_swap_recs(a=rdi, b=rsi)  : swap two element records pointed by r13,r14

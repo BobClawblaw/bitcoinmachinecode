@@ -113,6 +113,9 @@ asm/tests/test_wrpc_utxo
 asm/tests/test_wrpc_decoderaw
 asm/tests/test_wrpc_sign
 asm/tests/test_wrpc_send
+asm/tests/smoke_interp
+asm/tests/test_interp
+asm/tests/test_tapscript_interp
 asm/daemon/wallet_cli
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----
