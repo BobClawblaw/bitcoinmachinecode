@@ -157,7 +157,7 @@ tests/test_idx: tests/test_idx.c $(IDXOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_idx.c $(IDXOBJS)
 
 # bitcoin_serve.asm: inbound (server) message loop over p2p + idx + serve_block.
-SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o sha256.o
+SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o sha256.o bitcoin_mempool.o
 tests/test_serve: tests/test_serve.c $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVEOBJS)
 
@@ -201,7 +201,8 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # (an -O2 rebuild regressed lsock's bind to EFAULT).
 DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
               bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
-              bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o
+              bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o \
+              bitcoin_mempool.o
 daemon/bitcoind: daemon/main.c $(DAEMONOBJS)
 	$(CC) -no-pie -O0 -o $@ daemon/main.c $(DAEMONOBJS)
 

@@ -31,6 +31,11 @@ default rel
     extern node_serve_block
     extern node_log_event
     extern block_hash
+    extern mpool_init
+    extern mpool_put
+    extern mpool_get
+    extern mpool_count
+    extern tx_txid
 section .data
 align 16
 pl_buf:    times (8<<20) db 0     ; receive buffer
@@ -41,6 +46,13 @@ cn_addr:   db "addr",0
 cn_block:  db "block",0
 cn_head:   db "headers",0
 cn_inv:    db "inv",0
+cn_tx:     db "tx",0
+; ---- mempool for tx relay (static; initialized once in node_serve_loop) ----
+; struct+slots: 40 + slots*48 ; use 1024 slots
+MP_SLOTS equ 1024
+mp_area:   times (40 + 1024*48 + 8) db 0
+mp_blob:   times (2<<20) db 0           ; 2 MiB tx storage
+mp_initdone: db 0
 amr_ab:    times 64 db 0
 ah_buf:    times (1000*30+8) db 0
 src_buf:   times (1000*18) db 0
@@ -59,6 +71,7 @@ s_served: dq 0
 s_tip:    dq 0
 s_from:   dq 0
 s_htidx:  dq 0     ; stable copy of ht_idx (a callee clobbers r15; store it once)
+s_txid:   times 32 db 0 ; inbound tx's computed BIP141 txid
 s_st:     dq 0     ; stable copy of the store context (r14 also at risk)
 
 section .text
@@ -94,6 +107,17 @@ node_serve_loop:
     mov  [s_st], rdx         ; stable copy of st
     mov  qword [s_served], 0 ; served count
 
+    ; init the tx-relay mempool once (static; shared across connections)
+    cmp  byte [mp_initdone], 1
+    je   .mpready
+    mov  rdi, mp_area
+    mov  rsi, MP_SLOTS
+    lea  rdx, [mp_blob]
+    mov  rcx, (2<<20)
+    call mpool_init
+    mov  byte [mp_initdone], 1
+.mpready:
+
     ; Outer-loop counter lives in r15. r15 is written ONLY here (entry); all
     ; handlers avoid it and reuse rbx as scratch (getdata item pointer etc.).
     ; r15 is callee-saved so the external calls (p2p_read, idx_get,
@@ -127,6 +151,8 @@ node_serve_loop:
     je   .maybe_getblocks
     cmp  dword [s_cmd], 0x00766e69   ; "inv"
     je   .do_inv
+    cmp  dword [s_cmd], 0x00007874   ; "tx\0\0"
+    je   .do_tx
     jmp  .next
 
 .do_verack:
@@ -151,6 +177,29 @@ node_serve_loop:
 
 .do_inv:
     ; inbound inv: acknowledged implicitly; keep-up is the downloader's job.
+    jmp  .next
+
+.do_tx:
+    ; inbound tx: compute its BIP141 txid and store it in the mempool so we can
+    ; relay it (answer later getdata(MSG_TX)). tx at pl_buf, len = s_plen.
+    mov  rax, [s_plen]
+    cmp  rax, 10            ; version(4)+1in+1out+locktime(4) min
+    jb   .next
+    ; tx_txid(s_txid, pl_buf, s_plen, hp_buf, cap)
+    lea  rdi, [s_txid]
+    lea  rsi, [pl_buf]
+    mov  rdx, [s_plen]
+    lea  rcx, [hp_buf]      ; unwitnessed serialization scratch (hp_buf idle here)
+    mov  r8, (2000*81+8)
+    call tx_txid
+    test rax, rax
+    jz   .next
+    ; mpool_put(mp_area, s_txid, pl_buf, s_plen)
+    mov  rdi, mp_area
+    lea  rsi, [s_txid]
+    lea  rdx, [pl_buf]
+    mov  rcx, [s_plen]
+    call mpool_put
     jmp  .next
 
 .maybe_getaddr:
@@ -226,8 +275,10 @@ node_serve_loop:
     test rax, rax
     jle  .next
     mov  rbx, [s_ptr]     ; item ptr (rbx is free here -- outer counter saved in the loop bound)
-    ; type at rbx (u32 LE); if != MSG_BLOCK(2) or bounds exceeded, skip
+    ; type at rbx (u32 LE): 2=MSG_BLOCK -> serve block; 1=MSG_TX -> mempool tx
     mov  r9d, [rbx]
+    cmp  r9d, 1
+    je   .gd_tx
     cmp  r9d, 2
     jne  .gd_next
     ; hash at rbx+4; idx_get(ht_idx, hash, &fh)
@@ -260,8 +311,32 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     ; served++
     add  qword [s_served], 1
-    ; (node_log_event skipped during bring-up debugging -- lfd=-1 path under test)
     mov  rbx, [s_ptr]
+    jmp  .gd_next
+
+.gd_tx:
+    ; txid at rbx+4; mpool_get(mp_area, txid, &s_n) -> ptr or 0
+    mov  [s_ptr], rbx
+    mov  rdi, mp_area
+    lea  rsi, [rbx+4]
+    lea  rdx, [s_n]          ; out_len slot
+    call mpool_get
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jz   .gd_next
+    ; p2p_write(fd,"tx",2, ptr, len)
+    mov  [s_ptr], rbx
+    mov  rdi, r12
+    lea  rsi, [cn_tx]
+    mov  rdx, 2
+    mov  rcx, rax            ; tx bytes (mp_blob ptr)
+    mov  r8, [s_n]           ; length
+    push rbx
+    call p2p_write
+    pop  rbx
+    add  qword [s_served], 1
+    mov  rbx, [s_ptr]
+    jmp  .gd_next
 .gd_next:
     ; advance item pointer by 36 and decrement counter
     mov  rax, [s_ptr]
