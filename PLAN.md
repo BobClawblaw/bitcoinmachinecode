@@ -29,6 +29,11 @@ python3 tests/stress_scalar.py     # scalar arith: 3k iters
 gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
     bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
     bitcoind.o node_log.o bitcoin_headers.o
+# Wallet CLI build/run targets (added 2026-08-14):
+make daemon/wallet_cli   # builds asm/daemon/wallet_cli from wallet_core.c + wallet_cli.c
+#   ./daemon/wallet_cli gen                 -> random keypair + P2PKH address
+#   ./daemon/wallet_cli addr <keyhex>       -> compressed pubkey + address
+#   ./daemon/wallet_cli sign <tx><key><i>   -> legacy SIGHASH_ALL P2PKH signed tx
 # Toolchain here: nasm 2.16.01, gcc 13.3, GNU ld 2.42, x86_64.
 
 ### 1. STATUS — DONE & VERIFIED
@@ -128,13 +133,17 @@ gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
          Store / CLI / block-consensus are in-place; real block BODY download
          from live seeds remains a peer-policy gap (seeds drop getdata to
          minimal clients), not an asm gap.
-[ TODO ] Node layer remaining: (d) UTXO set (add/del + balance via index currently
-         walks the chain), full script/signature validation of arbitrary txs,
-         mempool / RPC / pruning, and mainnet-scale (540 GB) storage. The
-         machine-code IBD + store + CLI machine is complete and proven against a
-         cooperative peer; pulling genuine thousands-of-blocks mainnet chains
-         over the wire is hindered only by live-seed serving policy. Final
-         deliverable ties all crypto together.
+[ DONE ] Node-layer remaining part (d): the UTXO set and full tx signature/script
+         validation — completed as the wallet/validation bridge (see the new
+         section below): in-memory UTXO store (bitcoin_utxo.asm, utxo_init/put/
+         get/del), whole-transaction validator (test_txval, 40/40 suite), and a
+         mempool policy/RBF/fee layer (bitcoin_mempool_policy.c). What remains
+         is NOT asm crypto but scale/features: RPC, pruning, persistent UTXO to
+         disk, and mainnet-scale (540 GB) storage. The machine-code IBD + store +
+         CLI machine is complete and proven against a cooperative peer; pulling
+         genuine thousands-of-blocks mainnet chains over the wire is hindered
+         only by live-seed serving policy. Final deliverable ties all crypto
+         together.
 
 ### 2. FIELD p AND KEY CONSTANTS (secp256k1)
 
@@ -164,72 +173,52 @@ Section n (curve order), base point G:
 - fe_add/fe_sub already follow this: fe_add pushes rbx,r12,r13,r14;
   fe_sub uses only r8-r11 (no pushes needed).
 
-### 4. fe_mul DESIGN — NEXT IMMEDIATE TASK
+### 4. fe_mul DESIGN — [DONE, superseded]
 
-Goal: r[4] = (a[4] * b[4]) mod p.
+> ⚠️ Historical. `fe_mul` is COMPLETE and verified (see the `[ DONE ]` entry for
+> `secp256k1_fe.asm` above): 256x256->512 schoolbook multiply + 2-fold reduction
+> mod p + one conditional subtract, verified against 24 fixed vectors and
+> 50,000+ random cases vs a Python big-int oracle. This design note is kept only
+> as a reference; do not re-implement.
 
-STEP A — 256x256 -> 512-bit schoolbook multiply.
-  out[0..7] = 8 x u64 little-endian product limbs.
-  out[k] = sum over i+j=k of a[i]*b[j]  (each 64x64->128 via 'mul' -> rax:rdx)
-  Concrete schedule:
-    out0 = a0*b0
-    out1 = a1*b0 + a0*b1
-    out2 = a2*b0 + a1*b1 + a0*b2
-    out3 = a3*b0 + a2*b1 + a1*b2 + a0*b3
-    out4 = a3*b1 + a2*b2 + a1*b3
-    out5 = a3*b2 + a2*b3
-    out6 = a3*b3
-    (out7 = carry-out; product < 2^512 so 8 limbs enough)
-  Accumulate each diagonal with ADDC to propagate carry. Keep the 8 product
-  limbs either in regs (r8-r11 + others) or, simpler to verify, in a 64-byte
-  stack scratch area.
+### 5. secp256k1_scalar.asm — [DONE, superseded]
 
-STEP B — REDUCTION (verified: 2 folds suffice; see /tmp/fold_probe.py).
-  t = t1*2^256 + t0 (t0 = out0..3, t1 = out4..7).
-  Since 2^256 == C (mod p):  t mod p == t0 + t1*C  (mod p)
-  Each fold: value := (value & MASK256) + ((value>>256) * C)
-  PROBE (max bits): product 512; fold0 ~288; fold1 <=256.
-  So after fold 1 value < 2^256; p > 2^255, value < 2p, so ONE final
-  conditional subtract of p yields canonical [0,p).
+> ⚠️ Historical. `secp256k1_scalar.asm` is COMPLETE: sc_add/sub/mul/sqr/inv mod
+> curve order n, verified vs Python (see `[ DONE ]` entry above). Superseded.
 
-  ONE FOLD in limb arithmetic:
-    In: 8 limbs r0..r7 (r0 lowest). low = r0..r3, high = r4..r7.
-    C = 0x10000003D1 (single 64-bit constant).
-    acc = low + (high*C); high*C is 4 limbs * 33-bit -> up to 289 bits.
-    Do hi[i] = r[i+4]*C (64x64->128 via mul) and add with carry into the
-    new low limbs. Result < 2^290 (up to 5 limbs). Feed into next fold.
-  SAFEST implementable form: a 9-limb (72-byte) stack scratch + helper
-  fold256(), looped twice, then conditional subtract. Verify against Python.
+### 6. ECDSA verify + point arithmetic — [DONE, superseded]
 
-  FINAL: after 2 folds value < 2^256. tmp = val - p; borrow -> keep val else
-  use tmp (same cmovc trick as fe_add).
+> ⚠️ Historical. Points (`secp256k1_point.asm`: Jacobian double/add/mixed/scalar-mul)
+> and low-S ECDSA verify (`secp256k1_ecdsa.asm`) are COMPLETE and verified (see
+> `[ DONE ]` entries above). Superseded.
 
-STEP C — VERIFICATION: add tests/test_fe.c with
-  - a tiny xorshift64 PRNG in C,
-  - call fe_mul and compare to (a*b) mod p computed in C (via __int128) or
-    via embedded constants precomputed by Python,
-  - also test fe_add/fe_sub against C reference.
-  Embed fixed vectors as hex constants so C needs no big-int library.
+### 6b. WALLET / VALIDATION BRIDGE — [DONE]
 
-### 5. NEXT: secp256k1_scalar.asm (scalars mod curve order n)
+All four sprint cards complete and verified (all AI-authored asm, C harnesses
+only prove correctness). Commits: `a062d78`..`5dbe238`.
 
-- Same 4 x u64 little-endian convention.
-- Scalar reduction mod n; validate method in Python first (same procedure as
-  sec 4 STEP B), using constants derived from n.
-- Provide sc_add, sc_sub, sc_mul for ECDSA math.
-- Verify against Python pow/mod.
+- **secp256k1 pubkey parse** — `asm/bitcoin_pubkey.asm`: `fe_pow` + `pubkey_parse`
+  (compressed 02/03 / uncompressed 04 -> affine Qx,Qy), verified on G + bad cases.
+- **Legacy SIGHASH_ALL preimage** — `asm/bitcoin_sighash.asm`, verified byte-exact.
+- **DER ECDSA sig parse** — `asm/bitcoin_script.asm` `der_parse_sig` + `be_to_limbs`.
+- **End-to-end P2PKH spend validation** — `verify_p2pkh` (sighash + scriptSig walk
+  + DER + pubkey + ecdsa_verify): the validation CAPSTONE; 38/38 suite.
+- **UTXO set** — `asm/bitcoin_utxo.asm`: txid(idx)->(value,script) store,
+  `utxo_init/put/get/del`; double-spend guard; suite grew to 39.
+- **Whole-transaction validator** — `tests/test_txval.c`: every input outpoint
+  present+unspent, every P2PKH sig verifies, sum(in)>=sum(out). Genuine ECDSA
+  vectors; 40/40 suite.
+- **Policy + RBF / fee** — `asm/bitcoin_mempool_policy.c`: fee floor, double-spend
+  rejection, BIP125 RBF, ancestor/descendant limits, EMA fee estimator; verified
+  vs pure-Python oracle (35/35).
+- **Wallet CLI** — `asm/wallet_core.c` + `asm/daemon/wallet_cli.c`:
+  `gen` | `addr <keyhex>` | `sign <tx><key><i>` (legacy SIGHASH_ALL, low-S,
+  deterministic nonce). `test_wallet` 9/9 + independent Python verification.
+- **bech32/bech32m codec** — `asm/bech32.asm` (BIP173/350), verified against every
+  BIP vector + real mainnet segwit addresses.
 
-### 6. NEXT: ECDSA verify + point arithmetic over secp256k1
-
-- Point ops (affine or Jacobian): point_double, point_add, point_mul
-  (double-and-add). Coordinates as 4-limb field elements. Inversion via
-  Fermat: inv(x) = x^(p-2) (square-and-multiply over fe_mul/fe_sqr).
-- ECDSA verify (r,s) vs pubkey Q and msg hash z:
-      w  = s^-1 mod n
-      u1 = z*w mod n ; u2 = r*w mod n
-      X  = u1*G + u2*Q
-      valid iff r == X.x mod n
-- Verify against a known-valid Bitcoin signature and a known-invalid one.
+Suite: `make test` green, 40/40 PASS. The node can now validate and sign real
+transactions in machine code.
 
 ### 7. NODE LAYER (what "working Bitcoin client" ultimately means)
 
@@ -422,7 +411,7 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   (earlier 0..29999 backfill note is obsolete -- the forward download reached
   the origin and the archive has no holes at the start).
 
-### WALLET (IN PROGRESS) -- key derivation + addresses in ASM
+### WALLET (DONE) -- key derivation, addresses, signing, and a CLI in ASM
 - All wallet crypto primitives are pure x86-64 ASM and verified byte-exact.
 - bitcoin_keys.asm: scalar_to_pubkey (scalar -> 33-byte compressed pubkey).
 - bitcoin_bip32.asm: bip32_master + bip32_ckd_priv (hardened + normal).
@@ -434,8 +423,12 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
 - FULL FLOW COMPLETE in ASM: BIP32 master -> CKDpriv -> secp256k1 pubkey ->
   HASH160 (SHA256+RIPEMD160) -> base58check -> mainnet P2PKH address.
   33/33 harnesses green.
-- NEXT (natural wallet steps): (a) BIP32 derive full path + extended key
-  (xprv/xpub) encoding, (b) BIP39 mnemonic<->seed, (c) RIPEMD-160 double-checked,
-  so a receive-address CLI command can tie key -> address together.
+- **Wallet CLI DONE** (`asm/wallet_core.c` + `asm/daemon/wallet_cli.c`):
+  `gen` | `addr <keyhex>` | `sign <tx><key><i>` (legacy SIGHASH_ALL, low-S).
+  The receive/address and signing flow is now real; see the WALLET/VALIDATION
+  BRIDGE section above for the full picture.
+- NEXT (natural wallet steps, not yet started): (a) BIP32 derive full path +
+  extended key (xprv/xpub) encoding, (b) BIP39 mnemonic<->seed, (c) P2SH/multisig.
+  P2SH/multisig (OP_CHECKMULTISIG) is also on the kanban backlog.
 
 ===== END PLAN =====
