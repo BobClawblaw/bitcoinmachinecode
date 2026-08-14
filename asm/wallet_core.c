@@ -259,6 +259,180 @@ static unsigned long get_varint(const unsigned char* p, unsigned long* consumed)
     { unsigned long long v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long long)p[1+i] << (8*i); return (unsigned long)v; }
 }
 
+/* ============================================================================
+ * Wallet-core/RPC surface (address + raw-tx commands), building toward
+ * bitcoin-cli parity. Kept in C over the verified asm crypto (wallet_ prefix).
+ * ==========================================================================*/
+
+/* base58 alphabet index lookup: returns 0..57 or -1 for an invalid char. */
+static int b58_val(char c) {
+    const char* A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    for (int i = 0; i < 58; i++) if (A[i] == c) return i;
+    return -1;
+}
+
+/* base58check_decode(out, cap, &outlen, str): decode a base58check string to
+ * its raw payload bytes (version||hash, e.g. 25 bytes for P2PKH). Verifies the
+ * trailing 4-byte double-SHA256 checksum and leading '1' (zero) preservation.
+ * Returns 1 on a valid, checksum-correct string (outlen = payload length);
+ * 0 on any failure. out must hold at least cap bytes. */
+int wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str) {
+    long slen = (long)strlen(str);
+    if (slen == 0 || slen > 128) return 0;
+    /* count leading '1's */
+    long zeros = 0;
+    while (zeros < slen && str[zeros] == '1') zeros++;
+    /* convert remainder base58->big-endian bytes: number = sum(digit_i * 58^i) */
+    unsigned char buf[128];
+    long blen = 0;                      /* number of significant bytes */
+    for (long i = zeros; i < slen; i++) {
+        int d = b58_val(str[i]);
+        if (d < 0) return 0;
+        unsigned carry = (unsigned)d;
+        for (long j = 0; j < blen; j++) {
+            unsigned t = (unsigned)buf[j] * 58u + carry;
+            buf[j] = (unsigned char)(t & 0xff);
+            carry = t >> 8;
+        }
+        while (carry) { buf[blen++] = (unsigned char)(carry & 0xff); carry >>= 8; }
+    }
+    /* total payload = zeros leading-zero bytes + blen significant bytes */
+    long total = zeros + blen;
+    if (total < 5 || total > cap) return 0;
+    /* assemble payload bytes big-endian: [zeros zeros...][signif reversed] */
+    unsigned char* pay = out;           /* caller's buffer is the payload dst */
+    for (long i = 0; i < zeros; i++) pay[i] = 0;
+    for (long i = 0; i < blen; i++) pay[zeros + i] = buf[blen - 1 - i];
+    long paylen = total - 4;            /* payload = all but last 4 checksum bytes */
+    /* verify checksum: sha256d(pay, paylen)[0..4] == last 4 bytes */
+    unsigned char chk[32];
+    sha256d(chk, pay, paylen);
+    if (chk[0] != pay[paylen] || chk[1] != pay[paylen+1] ||
+        chk[2] != pay[paylen+2] || chk[3] != pay[paylen+3]) return 0;
+    *outlen = paylen;
+    return 1;
+}
+
+/* bech32 externs (verified asm codec) */
+extern void bech32_init(void);
+extern long long bech32_encode(char* out, const char* hrp, long long hrplen,
+                               const unsigned char* data5, long long datalen, long long spec);
+extern long long bech32_convert_bits(unsigned char* out, const unsigned char* in,
+                                     long long inlen, long long frombits,
+                                     long long tobits, long long pad);
+extern long long bech32_decode(unsigned char* out5, char* out_hrp,
+                               long long hrp_cap, const char* in);
+extern long long bech32_verify_checksum(const char* hrp, long long hrplen,
+                                        const unsigned char* data5,
+                                        long long datalen, long long spec);
+
+/* Encode the bech32 (BIP173) witness-v0 P2WPKH address "bc1" + 20-byte h160.
+ * Returns string length or -1. */
+long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]) {
+    unsigned char d5[40];
+    long long n5 = bech32_convert_bits(d5, h160, 20, 8, 5, 1);
+    if (n5 < 0) return -1;
+    unsigned char data[40];
+    long long dl = 0;
+    data[dl++] = 0;                     /* witness version v0 */
+    for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
+    bech32_init();
+    long long sl = bech32_encode(out, "bc", 2, data, dl, 0);  /* spec 0 = bech32 */
+    return (sl >= 0 && sl < cap) ? (long)sl : -1;
+}
+
+/* Encode the bech32m (BIP350) P2PKH-style ... unused here; keep P2WPKH only. */
+
+/* Build the 22-byte P2WPKH scriptPubKey: OP_0 PUSH20 <h160>. */
+int wallet_p2wpkh_script_pubkey(unsigned char out[22], const unsigned char h160[20]) {
+    out[0] = 0x00; out[1] = 0x14;
+    memcpy(out + 2, h160, 20);
+    return 22;
+}
+
+/* Derive the BIP84 native-segwit m/84'/0'/0'/index/0 receive keypath from a seed
+ * and render its P2WPKH bech32 address. index >= 0. Returns string length or -1. */
+long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64],
+                                  unsigned index) {
+    unsigned indexes[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, index, 0};
+    unsigned char k[32], c[32], pub[33], h[20];
+    if (bip32_derive_path(k, c, seed, 64, indexes, 5) != 1) return -1;
+    scalar_to_pubkey(pub, k);
+    hash160(h, pub, 33);
+    return wallet_p2wpkh_address(out, cap, h);
+}
+
+/* Derive the BIP84 change-keypath m/84'/0'/0'/index/1 P2WPKH address. */
+long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64],
+                                 unsigned index) {
+    unsigned indexes[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, index, 1};
+    unsigned char k[32], c[32], pub[33], h[20];
+    if (bip32_derive_path(k, c, seed, 64, indexes, 5) != 1) return -1;
+    scalar_to_pubkey(pub, k);
+    hash160(h, pub, 33);
+    return wallet_p2wpkh_address(out, cap, h);
+}
+
+/* Reported address type from wallet_validate_address. */
+enum wal_addr_type { WAL_ADDR_INVALID = 0, WAL_ADDR_P2PKH, WAL_ADDR_P2WPKH,
+                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_UNKNOWN };
+
+/* Parse + validate an address string. Fills:
+ *   *type_   - WAL_ADDR_P2PKH / WAL_ADDR_P2WPKH / WAL_ADDR_P2SH / WAL_ADDR_P2WSH
+ *              / WAL_ADDR_UNKNOWN (valid but unclassified) / WAL_ADDR_INVALID (bad).
+ *   version[1] - base58 version byte (P2PKH address->1) for base58 types.
+ *   h160[20]   - the 20-byte hash (P2PKH h160 / P2WPKH h160 / P2SH redeem-hash).
+ * Returns 1 if the string is a CHECKSUM-VALID address (any recognized type), 0 if not. */
+int wallet_validate_address(const char* str, int* type_, unsigned char* version,
+                            unsigned char h160[20]) {
+    long plen;
+    unsigned char pay[128];
+    /* try base58check first */
+    if (wallet_base58check_decode(pay, (long)sizeof pay, &plen, str)) {
+        version[0] = pay[0];
+        if (plen == 21) {                       /* version + 20 hash */
+            memcpy(h160, pay + 1, 20);
+            *type_ = (pay[0] == 0x00) ? WAL_ADDR_P2PKH
+                   : (pay[0] == 0x05) ? WAL_ADDR_P2SH : WAL_ADDR_UNKNOWN;
+            return 1;
+        }
+        *type_ = WAL_ADDR_UNKNOWN;
+        return 1;                               /* checksum ok, odd payload size */
+    }
+    /* try bech32 (P2WPKH/P2WSH) -- bech32_decode gives data5 WITHOUT verifying
+     * the checksum; accept only checksum-valid (verifies as bech32, spec 0). */
+    bech32_init();
+    unsigned char d5[256];
+    char hrp[32];
+    long long n5 = bech32_decode(d5, hrp, (long long)sizeof hrp, str);
+    if (n5 >= 0) {
+        /* normalize HRP to lowercase for the checksum + "bc" match */
+        for (char* p = hrp; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p + 32);
+        long long hrplen = (long long)strlen(hrp);
+        if (bech32_verify_checksum(hrp, hrplen, d5, n5, 0) == 1 &&
+            hrplen == 2 && hrp[0] == 'b' && hrp[1] == 'c' && n5 >= 8 && d5[0] == 0) {
+            /* witness v0: convert 5-bit to 8-bit (no pad). d5[0] is the witness
+             * version (0), the LAST SIX groups are the checksum, and the rest
+             * is the 5-bit program: 32 groups for P2WPKH (160 bit -> 20 byte),
+             * 52 for P2WSH (260 bit -> 32 byte). */
+            unsigned char bytes[64];
+            long long bl = bech32_convert_bits(bytes, d5 + 1, n5 - 7, 5, 8, 0);
+            if (bl == 20) {                         /* P2WPKH */
+                memcpy(h160, bytes, 20);
+                *type_ = WAL_ADDR_P2WPKH;
+                return 1;
+            }
+            if (bl == 32) {                         /* P2WSH */
+                *type_ = WAL_ADDR_P2WSH;
+                return 1;
+            }
+        }
+    }
+    *type_ = WAL_ADDR_INVALID;
+    return 0;
+}
+
+
 /* Sign a P2PKH tx: replace the scriptSig of input `input_index` with
  *   <push> <DER sig> 0x01 <push> <33-byte pubkey>
  * and write the complete re-serialized tx to `out_tx` (caller sizes: cap).

@@ -32,6 +32,9 @@ extern long wallet_send_tx(unsigned char* out_tx, long cap,
                            const unsigned char priv_be[32], unsigned long locktime);
 extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
 extern unsigned long long wallet_get_balance(const unsigned long long* tval, unsigned long n);
+extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
+extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
+extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20]);
 /* BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets). */
 extern int  wallet_mnemonic_generate(char out[256]);
 extern int  wallet_mnemonic_validate(const char* mn);
@@ -173,6 +176,51 @@ static int cmd_send(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_getnewaddress(int argc, char** argv, int is_change) {
+    /* usage: wallet_cli getnewaddress <seed_hex64> [index]   (P2WPKH receive)
+     *        wallet_cli getrawchangeaddress <seed_hex64> [index]   (change) */
+    if (argc < 3) {
+        fprintf(stderr, "usage: wallet_cli %s <seed_hex64> [index]\n",
+                is_change ? "getrawchangeaddress" : "getnewaddress");
+        return 2;
+    }
+    unsigned char seed[64];
+    if (!hex_to_bytes(seed, argv[2], 128)) { fprintf(stderr, "bad seed hex\n"); return 1; }
+    unsigned index = (argc >= 4) ? (unsigned)strtoul(argv[3], NULL, 10) : 0;
+    char out[96];
+    long n = is_change ? wallet_derive_p2wpkh_change(out, 96, seed, index)
+                       : wallet_derive_p2wpkh_address(out, 96, seed, index);
+    if (n < 0) { fprintf(stderr, "derive failed\n"); return 1; }
+    printf("%s\n", out);
+    return 0;
+}
+
+static int cmd_validateaddress(int argc, char** argv, int info) {
+    /* usage: wallet_cli validateaddress <addr>   or  getaddressinfo <addr> */
+    if (argc < 3) {
+        fprintf(stderr, "usage: wallet_cli %s <address>\n", info ? "getaddressinfo" : "validateaddress");
+        return 2;
+    }
+    int type; unsigned char ver, h160[20];
+    int ok = wallet_validate_address(argv[2], &type, &ver, h160);
+    const char* tn = (type == 1) ? "p2pkh" : (type == 2) ? "p2wpkh"
+                   : (type == 3) ? "p2sh" : (type == 4) ? "p2wsh" : "unknown";
+    if (!info) { /* validateaddress: isvalid + type */
+        printf("isvalid: %s\n", ok ? "true" : "false");
+        if (ok) printf("scriptPubKey-type: %s\n", tn);
+        return 0;
+    }
+    /* getaddressinfo: full detail */
+    printf("isvalid: %s\n", ok ? "true" : "false");
+    if (ok) {
+        printf("type: %s\n", tn);
+        printf("version: %d\n", ver);
+        printf("hash(hex): ");
+        print_hex(h160, 20); printf("\n");
+    }
+    return 0;
+}
+
 static int cmd_balance(int argc, char** argv) {
     /* usage: wallet_cli balance <value_sat> ...  -> sum of the wallet's UTXOs */
     if (argc < 3) {
@@ -238,7 +286,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -254,6 +302,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[1], "send")) return cmd_send(argc, argv);
     if (!strcmp(argv[1], "balance")) return cmd_balance(argc, argv);
+    if (!strcmp(argv[1], "getnewaddress")) return cmd_getnewaddress(argc, argv, 0);
+    if (!strcmp(argv[1], "getrawchangeaddress")) return cmd_getnewaddress(argc, argv, 1);
+    if (!strcmp(argv[1], "validateaddress")) return cmd_validateaddress(argc, argv, 0);
+    if (!strcmp(argv[1], "getaddressinfo")) return cmd_validateaddress(argc, argv, 1);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }
