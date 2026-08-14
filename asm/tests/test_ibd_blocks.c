@@ -182,6 +182,45 @@ int main(void){
     /* only the leading valid block(s) before the mismatch get stored (block0 ok) */
     cki("evil: only leading blocks stored", ((struct St*)stb2)->tip, 0);
 
+    /* ---- NEGATIVE (REORG): peer feeds a block whose prevhash does NOT chain
+     * ---- from our stored chain (a divergent branch) -> node must reject it,
+     * ---- never store out-of-chain data. Build a fake 'forked' block at height
+     * ---- 2 whose prevhash != stored block-1's hash. */
+    {
+        static unsigned char stb3[256], hstb3[256];
+        hst_init(hstb3); store_init(stb3);
+        for(int i=0;i<3;i++) hst_append(hstb3, blocks[i], bh[i]);  /* chain: blocks 0,1,2 */
+        /* a forked height-2 block using a bogus prevhash (NOT bh[1]) */
+        static unsigned char forkb[256];
+        unsigned char bogusprev[32]; memset(bogusprev,0xAB,32);
+        long fblen = build_cb_block(forkb, bogusprev, 2);
+        /* peer: read each getdata, serve the block matching the requested hash,
+         * EXCEPT serve the forked (non-chaining) blob for the height-2 hash. */
+        int ls3=socket(AF_INET,SOCK_STREAM,0);
+        struct sockaddr_in a3; memset(&a3,0,sizeof a3); a3.sin_family=AF_INET; a3.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        bind(ls3,(struct sockaddr*)&a3,sizeof a3); socklen_t al3=sizeof a3; getsockname(ls3,(struct sockaddr*)&a3,&al3);
+        listen(ls3,2);
+        pid_t pid3=fork();
+        if(pid3==0){ int c=accept(ls3,0,0);
+            char cmd[12]; static unsigned char pl[4096]; unsigned plen=0;
+            while(p2p_read(c,cmd,pl,sizeof pl,&plen)>0){
+                if(strncmp(cmd,"getdata",7)==0){
+                    /* requested hash at pl+5 */
+                    unsigned char rh[32]; memcpy(rh,pl+5,32);
+                    if(memcmp(rh,bh[0],32)==0) p2p_write(c,"block",5,blocks[0],blen[0]);
+                    else if(memcmp(rh,bh[1],32)==0) p2p_write(c,"block",5,blocks[1],blen[1]);
+                    else p2p_write(c,"block",5,forkb,(unsigned)fblen);  /* h2 -> forked */
+                }
+            }
+            close(c); _exit(0); }
+        int fd3=tcp_connect_ip(htonl(INADDR_LOOPBACK), a3.sin_port);
+        static unsigned char buf3[65536];
+        long nst3 = node_ibd_blocks(fd3, stb3, hstb3, 0, buf3, sizeof buf3);
+        close(fd3); waitpid(pid3,0,0); close(ls3);
+        cki("reorg divergent prevhash -> rejected (-1)", nst3, -1);
+        cki("reorg: forked block NOT stored (store tip stays 1)", ((struct St*)stb3)->tip, 1);
+    }
+
     chdir(prev_cwd);
     char rm[300]; snprintf(rm,sizeof rm,"rm -rf %s", path); system(rm);
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

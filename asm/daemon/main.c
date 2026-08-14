@@ -419,6 +419,20 @@ int main(int argc, char** argv){
             long cnt=0;
             long ok = node_sync(fd, store_buf, gen, buf, sizeof buf, &cnt);
             int tip = *(int*)(store_buf+24);
+            /* announce new tip to the peer via inv (proactive relay keep-up):
+             * if we synced new blocks, send inv for the new tip block hash
+             * (wire/LE order) so the peer knows our chain advanced. */
+            if(cnt>0){
+                static unsigned char hd[80], th[32], le[32], invm[37];
+                long L = node_serve_block(store_buf, tip, hd, sizeof hd);
+                if(L>=80){
+                    block_hash(th, hd);
+                    for(int k=0;k<32;k++) le[k]=th[31-k];   /* display->LE wire */
+                    invm[0]=1; invm[1]=2; invm[2]=0; invm[3]=0; invm[4]=0;
+                    memcpy(invm+5, le, 32);
+                    p2p_write(fd, "inv", 3, invm, sizeof invm);
+                }
+            }
             node_log_event(lfd, L_BLOCK, (unsigned)(ok?cnt:0), (unsigned)tip, (unsigned)pass);
             printf("follow pass %d: ok=%ld new=%ld height=%d\n", pass, ok, cnt, tip); fflush(stdout);
             if(tip==last) same++; else same=0;

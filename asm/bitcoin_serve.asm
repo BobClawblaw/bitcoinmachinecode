@@ -47,6 +47,7 @@ cn_block:  db "block",0
 cn_head:   db "headers",0
 cn_inv:    db "inv",0
 cn_tx:     db "tx",0
+cn_getdata: db "getdata",0
 ; ---- mempool for tx relay (static; initialized once in node_serve_loop) ----
 ; struct+slots: 40 + slots*48 ; use 1024 slots
 MP_SLOTS equ 1024
@@ -176,8 +177,57 @@ node_serve_loop:
     jmp  .next
 
 .do_inv:
-    ; inbound inv: acknowledged implicitly; keep-up is the downloader's job.
-    jmp  .next
+    ; Inbound inv: for each MSG_BLOCK entry, if we don't already have it,
+    ; send a getdata to fetch it (relay keep-up). inv payload:
+    ;   count(1) | (type u32 LE + hash32) x count   (36B per entry)
+    movzx rax, byte [pl_buf]
+    mov  [s_cnt], rax
+    test rax, rax
+    jle  .next
+    lea  rax, [pl_buf+1]
+    mov  [s_ptr], rax        ; entry pointer (stable slot; survives calls)
+.inv_loop:
+    mov  rax, [s_cnt]
+    test rax, rax
+    jle  .next
+    mov  rbx, [s_ptr]
+    mov  r9d, [rbx]          ; type
+    cmp  r9d, 2              ; MSG_BLOCK only (skip tx inv for now)
+    jne  .inv_next
+    ; have it? idx_get(ht_idx, rbx+4, &s_fh)
+    mov  [s_ptr], rbx
+    mov  rdi, [s_htidx]
+    lea  rsi, [rbx+4]
+    lea  rdx, [s_fh]
+    call idx_get
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jnz  .inv_next           ; already have it -> don't re-request
+    ; build & send getdata: [count=1][type u32=2][hash32] = 37 bytes
+    mov  byte  [src_buf], 1
+    mov  dword [src_buf+1], 2
+    ; copy hash (rbx+4) into src_buf+5 (memcpy_len length arg is RDX)
+    mov  rdx, 32
+    lea  rdi, [src_buf+5]
+    lea  rsi, [rbx+4]
+    push rbx
+    call memcpy_len
+    pop  rbx
+    mov  [s_ptr], rbx
+    mov  rdi, r12
+    lea  rsi, [cn_getdata]
+    mov  rdx, 7
+    lea  rcx, [src_buf]
+    mov  r8d, 37
+    push rbx
+    call p2p_write
+    pop  rbx
+.inv_next:
+    mov  rbx, [s_ptr]
+    add  rbx, 36
+    mov  [s_ptr], rbx
+    dec  qword [s_cnt]
+    jmp  .inv_loop
 
 .do_tx:
     ; inbound tx: compute its BIP141 txid and store it in the mempool so we can
