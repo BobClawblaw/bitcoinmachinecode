@@ -85,6 +85,38 @@ Downloader healthy throughout: ~277k blocks stored (99.7%), contiguous from
 genesis.
 ================================================================================
 
+## SESSION (2026-08-13): NODE -- SERVE LOOP MULTI-GETDATA / LOOP-STABILITY FIX
+
+Returned to the long-open "multi-getdata" serve bug. Root cause found on re-read
+of bitcoin_serve.asm: rbx was used for BOTH the persistent outer-loop counter
+(.next: dec rbx; jg .outer) AND the getdata item pointer (.gd_loop: mov rbx,
+[s_ptr]; ... reloaded from [s_ptr] at 231/241/252/256). So after the first
+getdata the loop bound became the item-pointer address; the loop only stopped
+on peer close, and bookkeeping was corrupt exactly where the old crash lived.
+
+Fix: run the outer-loop counter in r15, written only at function entry (ht_idx
+now lives solely in the static s_htidx slot; r15 is callee-saved so every
+p2p_read/idx_get/node_serve_block/p2p_write preserves it across all handlers).
+rbx is now free as pure handler scratch.
+
+To prove it (not just smoke-test): extended test_serve.c into a real stress
+suite:
+  - a single multi-inv getdata message requesting all 8 blocks -> served
+    byte-exact (exercises .gd_loop iterating several items in one message);
+  - 25x ping/pong AFTER serving -> proves the outer loop keeps running on the
+    counter, independent of socket close.
+All 33 harnesses green. Commit 96f102f, pushed.
+
+Note: also spotted a hygiene linker warning (node_log.o missing .note.GNU-stack
+=> executable stack). Cosmetic, not correctness; can add the section later.
+
+Next node items: (1) batch/range block serving (getblocks/getheaders range) so a
+syncing peer can pull the whole chain from us; (2) the bitcoin_store multi-file
+tip_height(+24) layout regression still failing test_bitcoind_sync/test_cli;
+(3) wire the finished ASM key->HASH160->base58check wallet path into a CLI
+getnewaddress.
+================================================================================
+
 ## 2026-08-13 -- #13 STORE REFACTOR RECONCILED + root-caused a REAL corrupted-filename bug; full suite back to 283 PASS-equiv (22 green, 0 FAIL)
 ### Context
 On resuming, `make test` showed `test_bitcoind_sync` failing (`store tip_height == NB-1
