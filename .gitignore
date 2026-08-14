@@ -93,3 +93,4 @@ asm/tests/test_gh_real
 asm/tests/test_nsb_range
 asm/tests/test_mempool
 asm/tests/test_txtxid
+asm/tests/test_pubkey
