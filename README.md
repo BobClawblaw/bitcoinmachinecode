@@ -207,6 +207,19 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   (compressed pubkey + address), and `sign <tx><key><i>` (legacy SIGHASH_ALL P2PKH
   sign, deterministic nonce k=sha256d(z||priv), low-S DER). `test_wallet` 9/9,
   plus an independent Python verification of the signature.
+- **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
+  full wallet->validator path exercised as ONE integrated test across a real
+  process boundary, not isolated pre-generated vectors: it builds a genuine
+  unsigned P2PKH tx in memory, hands it to the ACTUAL `daemon/wallet_cli sign`
+  binary (legacy SIGHASH_ALL, low-S, deterministic nonce) and captures its
+  real `signed-tx:` stdout, then feeds that CLI-signed tx through the whole-tx
+  validator (UTXO presence/double-spend + `verify_p2pkh` per input + fee) and
+  requires it to pass. The CLI signature is additionally cross-checked as a
+  genuine spend through the repo's independently-verified `ecdsa_verify`. Live
+  negative cases round it out: the CLI signs a negative-fee tx (valid sig) that
+  the validator rejects on `[fee]`; an output-value tamper invalidates the
+  SIGHASH_ALL digest -> rejected; a corrupted DER byte -> rejected; and the
+  same signed tx against an empty UTXO set -> double-spend rejected. 9/9.
 - **BIP32 full-path derivation + extended keys (xprv/xpub)** (`asm/bitcoin_bip32.asm`)
   — three new functions on top of the verified `bip32_master`/`bip32_ckd_priv`:
   `bip32_derive_path` (derive a full path `m/44'/0'/0'/0/0` from a seed in one

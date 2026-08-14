@@ -222,6 +222,17 @@ only prove correctness). Commits: `a062d78`..`5dbe238`.
 - **Wallet CLI** — `asm/wallet_core.c` + `asm/daemon/wallet_cli.c`:
   `gen` | `addr <keyhex>` | `sign <tx><key><i>` (legacy SIGHASH_ALL, low-S,
   deterministic nonce). `test_wallet` 9/9 + independent Python verification.
+- **Live-wire end-to-end sighash spend** — `tests/test_e2e_sighash.c`: one
+  integrated test that ties the wallet signer to the whole-tx validator across
+  a real process boundary (no isolated pre-generated vectors). Builds a genuine
+  unsigned P2PKH tx, signs it by invoking the ACTUAL `daemon/wallet_cli sign`
+  binary (captures its real `signed-tx:` stdout), then validates the CLI-signed
+  tx with the whole-tx validator (UTXO presence/double-spend + per-input
+  `verify_p2pkh` + fee). CLI signature cross-checked as a genuine spend via the
+  repo's independent `ecdsa_verify`. Live negatives: negative-fee tx signed by
+  the CLI rejected on `[fee]`; output-value tamper breaks the SIGHASH_ALL
+  digest -> rejected; corrupted DER byte -> rejected; signed tx vs empty UTXO
+  set -> double-spend rejected. 9/9.
 - **bech32/bech32m codec** — `asm/bech32.asm` (BIP173/350), verified against every
   BIP vector + real mainnet segwit addresses.
 - **P2SH / multisig** — `asm/bitcoin_multisig.asm`: `p2sh_hash` =
@@ -483,7 +494,7 @@ result on shared blocks/txs must be bit-identical or the node must refuse
 | BIP32 full-path + xprv/xpub | DONE | bitcoin_bip32.asm (derive_path/fingerprint/extkey_serialize) |
 | BIP39 mnemonic <-> seed | DONE | bitcoin_bip39.asm (gen/validate/PBKDF2 seed) |
 | Persistent UTXO to disk | DONE | bitcoin_utxo_store.asm (WAL utxo.dat + idx checkpoint, restart-resume) |
-| sighash_all real-spend end-to-end | queued (card 5) | this batch |
+| sighash_all real-spend end-to-end | DONE | test_e2e_sighash.c (wallet CLI signs -> whole-tx validator accepts)
 | Full script interpreter (all opcodes incl. tapscript/BIP342) | OPEN — largest asm item | post-batch |
 | Taproot / segwit v1 validation (BIP341/340) | OPEN | post-batch |
 | Full wallet-core + bitcoin-cli/RPC surface (getnewaddress, sendtoaddress, signrawtransaction, getbalance, createrawtransaction, etc.) | OPEN | post-batch |
