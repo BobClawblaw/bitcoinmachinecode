@@ -14,7 +14,7 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o
+OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o
 
 # bitcoin_hash.asm (sha256d/block-hash/merkle/pow) depends on sha256.o
 HASHOBJS := sha256.o bitcoin_hash.o
@@ -194,6 +194,11 @@ TXIDOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o
 tests/test_txtxid: tests/test_txtxid.c $(TXIDOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_txtxid.c $(TXIDOBJS)
 
+# secp256k1 public-key parsing/decompression (affine-limb recovery for ecdsa_verify).
+PUBKEYOBJS := bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o
+tests/test_pubkey: tests/test_pubkey.c $(PUBKEYOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_pubkey.c $(PUBKEYOBJS)
+
 # bitcoin_p2p.asm inv parsers (incoming protocol codecs).
 P2PINVOBS := bitcoin_p2p.o bitcoin_net.o bitcoin_hash.o sha256.o
 tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
@@ -224,7 +229,7 @@ tests/test_shared: tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv
+test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -242,6 +247,7 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_addr
 	./tests/test_mempool
 	./tests/test_txtxid
+	./tests/test_pubkey
 	./tests/test_block
 	./tests/test_tx
 	./tests/test_net
@@ -266,4 +272,4 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_p2p_inv
 
 clean:
-	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip32.o ripemd160.o bitcoin_addr.o tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_...[truncated]
+	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip32.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_...[truncated]
