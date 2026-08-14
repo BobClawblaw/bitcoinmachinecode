@@ -17,5 +17,16 @@ int main(){
     int r = tx_txid(out, tx, 64, buf, sizeof buf);
     printf("tx_txid valid=%d\n", r);
     for(int i=0;i<8;i++) printf("%02x", out[i]); printf("...\n");
+    /* a valid 1-in/1-out legacy tx MUST parse */
+    if(r!=1){ printf("FAIL: tx_txid rejected a valid tx\n"); return 1; }
+    /* txid must equal sha256d(raw) for a legacy tx (no witness) */
+    unsigned char want[32];
+    { /* sha256d of the 64 bytes */
+        /* use sha256 twice through the asm one-shot? we'll compute via sha256d */
+        extern void sha256d(unsigned char out[32], const unsigned char* in, unsigned long len);
+        sha256d(want, tx, 64);
+    }
+    if(memcmp(out, want, 32)!=0){ printf("FAIL: txid != sha256d(raw)\n"); return 1; }
+    printf("tx_txid matches sha256d(raw) for legacy tx\n");
     return 0;
 }

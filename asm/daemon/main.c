@@ -329,6 +329,7 @@ static int serve_loop(int fd, int lfd){
 
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
+    signal(SIGCHLD, SIG_IGN);   /* fork-per-peer workers: auto-reap, no zombies */
     if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }
     const char* mode = argv[1]; const char* dir = argv[2];
     if(chdir(dir)!=0){ perror("chdir"); return 1; }
@@ -508,19 +509,28 @@ int main(int argc, char** argv){
         int l = lsock(port);
         if(l<0) return 1;
         printf("serving on port %d...\n", port); fflush(stdout);
+        /* MULTI-PEER: fork a worker per accepted connection. Each child shares
+         * the inherited (copy-on-write) store + hash index + mempool statics and
+         * runs the single-connection asm node_serve_loop; the parent keeps
+         * accepting. This gives concurrent inbound serving without rewriting the
+         * single-fd serve loop into a select() multiplexer. */
         for(;;){
             int c = accept(l,0,0);
             if(c<0){ perror("accept"); continue; }
+            pid_t w = fork();
+            if(w<0){ perror("fork"); close(c); continue; }
+            if(w>0){ close(c); continue; }   /* parent: drop peer fd, keep accepting */
+            /* child: serve this one peer, then exit */
+            close(l);
             /* Inbound role: a real peer connecting to us sends ITS version first
-             * and expects us to answer with our own version + verack. Use
-             * node_accept_handshake (not node_handshake, which is the outbound/
-             * initiator role and would hang on an inbound peer). */
-            if(node_accept_handshake(c)!=1){ close(c); continue; }
+             * and expects us to answer with our own version + verack. */
+            if(node_accept_handshake(c)!=1){ _exit(0); }
             /* Serve the peer entirely in assembly (bitcoin_serve.asm
-             * node_serve_loop): ping/getaddr/getdata/getheaders/inv. */
+             * node_serve_loop): ping/getaddr/getdata/getheaders/getblocks/tx. */
             long s = node_serve_loop(c, lfd, store_buf, ht_idx, out_buf, (long)sizeof out_buf);
-            printf("served %ld block(s) to one peer\n", s); fflush(stdout);
+            node_log_event(lfd, L_BLOCK, (unsigned)(s>0?s:0), 0, 0);
             close(c);
+            _exit(0);
         }
     }
     return 2;

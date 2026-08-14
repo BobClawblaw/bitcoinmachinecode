@@ -91,3 +91,5 @@ asm/tests/gh_client
 asm/tests/live_serve_check
 asm/tests/test_gh_real
 asm/tests/test_nsb_range
+asm/tests/test_mempool
+asm/tests/test_txtxid
