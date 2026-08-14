@@ -432,6 +432,79 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
     return 0;
 }
 
+/* ---- UTXO-query surface: gettxout / listunspent -------------------------- */
+
+/* Render the ADDRESS for a scriptPubKey if it is a recognized P2PKH (25-byte
+ * OP_DUP HASH160 PUSH20 h160 EQUALVERIFY CHECKSIG) or P2WPKH (22-byte
+ * OP_0 PUSH20 h160) script. Fills out (>= 96 bytes) and returns the address
+ * type (WAL_ADDR_P2PKH / WAL_ADDR_P2WPKH / WAL_ADDR_INVALID=0). */
+int wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen) {
+    if (slen == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 &&
+        script[23] == 0x88 && script[24] == 0xac) {
+        /* P2PKH: version 0x00 || h160 */
+        unsigned char payload[21];
+        payload[0] = 0x00;
+        memcpy(payload + 1, script + 3, 20);
+        base58check_encode(out, payload, 21);
+        return WAL_ADDR_P2PKH;
+    }
+    if (slen == 22 && script[0] == 0x00 && script[1] == 0x14) {
+        /* P2WPKH */
+        if (wallet_p2wpkh_address(out, cap, script + 2) < 0) return WAL_ADDR_INVALID;
+        return WAL_ADDR_P2WPKH;
+    }
+    return WAL_ADDR_INVALID;
+}
+
+/* extern in-memory UTXO set primitives */
+extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
+extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long value, const unsigned char* script, unsigned long slen);
+extern long utxo_del(void* u, const unsigned char txid[32], unsigned long index);
+
+/* gettxout: query the outpoint (txid, index) in the UTXO store. On a hit fills
+ * value / script (points into the store) / slen, and (if addr != NULL and the
+ * script classifies) the address string. Returns 1 on a live unspent outpoint,
+ * 0 if absent/spent (like Core's gettxout null), -1 on error. */
+int wallet_gettxout(void* u, const unsigned char txid[32], unsigned long index,
+                    unsigned long long* value, const unsigned char** script, unsigned long* slen,
+                    char* addr, long addr_cap) {
+    unsigned long long v; const unsigned char* s; unsigned long sl;
+    long r = utxo_get(u, txid, index, &v, &s, &sl);
+    if (r != 1) return 0;
+    if (value) *value = v;
+    if (script) *script = s;
+    if (slen)   *slen   = sl;
+    if (addr) {
+        int t = wallet_script_to_address(addr, addr_cap, s, (long)sl);
+        if (t == WAL_ADDR_INVALID) addr[0] = 0;   /* unspendable/other script */
+    }
+    return 1;
+}
+
+/* One listunspent entry renderer: given an outpoint + resolved value + its
+ * scriptPubKey, render a single line like Core's listunspent:
+ *   <txid> <vout> <amount_sat> <scriptPubKey_hex> <address>
+ * The caller enumerates the wallet's owned UTXOs (the wallet tracks its own
+ * outputs; the in-memory store is an outpoint hash-map with no all-scan).
+ * Returns bytes written to out (not incl. NUL). */
+long wallet_listunspent_entry(char* out, long cap,
+                              const unsigned char txid[32], unsigned long index,
+                              unsigned long long value,
+                              const unsigned char* script, unsigned long slen) {
+    char addr[96];
+    int t = (script && slen) ? wallet_script_to_address(addr, 96, script, (long)slen) : WAL_ADDR_INVALID;
+    if (t == WAL_ADDR_INVALID) addr[0] = 0;
+    long n = 0;
+    for (int i = 0; i < 32; i++) n += snprintf(out + n, (size_t)(cap - n), "%02x", txid[i]);
+    n += snprintf(out + n, (size_t)(cap - n), " %lu %llu ", index, value);
+    for (unsigned long i = 0; i < slen && n < cap - 3; i++) n += snprintf(out + n, (size_t)(cap - n), "%02x", script[i]);
+    n += snprintf(out + n, (size_t)(cap - n), " %s", addr);
+    return n;
+}
+
 
 /* Sign a P2PKH tx: replace the scriptSig of input `input_index` with
  *   <push> <DER sig> 0x01 <push> <33-byte pubkey>

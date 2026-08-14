@@ -35,6 +35,20 @@ extern unsigned long long wallet_get_balance(const unsigned long long* tval, uns
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20]);
+extern int  wallet_gettxout(void* u, const unsigned char txid[32], unsigned long index,
+                            unsigned long long* value, const unsigned char** script,
+                            unsigned long* slen, char* addr, long addr_cap);
+extern long wallet_listunspent_entry(char* out, long cap,
+                                     const unsigned char txid[32], unsigned long index,
+                                     unsigned long long value,
+                                     const unsigned char* script, unsigned long slen);
+extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
+/* wallet address-type enum mirrors (asm/wallet_core.c) */
+#define WAL_ADDR_INVALID 0
+#define WAL_ADDR_P2PKH   1
+#define WAL_ADDR_P2WPKH  2
+#define WAL_ADDR_P2SH    3
+#define WAL_ADDR_P2WSH   4
 /* BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets). */
 extern int  wallet_mnemonic_generate(char out[256]);
 extern int  wallet_mnemonic_validate(const char* mn);
@@ -221,6 +235,63 @@ static int cmd_validateaddress(int argc, char** argv, int info) {
     return 0;
 }
 
+/* shared helper: dump value + unspendable script when no address classifies */
+static int ck_script_dump(const unsigned char* script, int slen, unsigned long long value) {
+    printf("value: %llu\n", value);
+    printf("scriptPubKey (hex): ");
+    for (int i = 0; i < slen; i++) printf("%02x", script[i]);
+    printf("\n");
+    printf("address: (unrecognized)\n");
+    return 0;
+}
+
+static int cmd_gettxout(int argc, char** argv) {
+    /* usage: wallet_cli gettxout <txid_hex64> <vout> <value_sat> <script_hex> */
+    if (argc < 6) { fprintf(stderr, "usage: wallet_cli gettxout <txid_hex64> <vout> <value> <script_hex>\n"); return 2; }
+    unsigned char txid[32];
+    if (!hex_to_bytes(txid, argv[2], 64)) { fprintf(stderr, "bad txid hex\n"); return 1; }
+    unsigned long vout = strtoul(argv[3], NULL, 10);
+    unsigned long long value = strtoull(argv[4], NULL, 10);
+    unsigned char script[128];
+    int sl = (int)strlen(argv[5]);
+    if (sl % 2 || sl / 2 > 128 || !hex_to_bytes(script, argv[5], sl)) { fprintf(stderr, "bad script hex\n"); return 1; }
+    char addr[96];
+    int t = wallet_script_to_address(addr, 96, script, sl / 2);
+    if (t == WAL_ADDR_INVALID) addr[0] = 0;
+    unsigned char* u = (unsigned char*)&value; /* gettxout semantics: value+script+address */
+    (void)u;
+    if (t != WAL_ADDR_INVALID) {
+        printf("value: %llu\n", value);
+        printf("scriptPubKey: %s\n", argv[5]);
+        printf("address: %s\n", addr);
+    } else {
+        ck_script_dump(script, sl / 2, value);
+    }
+    return 0;
+}
+
+static int cmd_listunspent(int argc, char** argv) {
+    /* usage: wallet_cli listunspent <txid:idx:value:script_hex> [...] */
+    if (argc < 3) { fprintf(stderr, "usage: wallet_cli listunspent <txid:idx:value:script_hex> [...]\n"); return 2; }
+    char line[512];
+    for (int i = 2; i < argc; i++) {
+        char* s = argv[i];
+        char* c1 = strchr(s, ':'); if (!c1) { fprintf(stderr, "bad entry\n"); return 1; } *c1 = 0;
+        char* c2 = strchr(c1 + 1, ':'); if (!c2) { fprintf(stderr, "bad entry\n"); return 1; } *c2 = 0;
+        char* c3 = strchr(c2 + 1, ':'); if (!c3) { fprintf(stderr, "bad entry\n"); return 1; } *c3 = 0;
+        unsigned char txid[32];
+        if (!hex_to_bytes(txid, s, 64)) { fprintf(stderr, "bad txid\n"); return 1; }
+        unsigned long idx = strtoul(c1 + 1, NULL, 10);
+        unsigned long long value = strtoull(c2 + 1, NULL, 10);
+        unsigned char script[128];
+        int hl = (int)strlen(c3 + 1);
+        if (hl % 2 || hl / 2 > 128 || !hex_to_bytes(script, c3 + 1, hl)) { fprintf(stderr, "bad script\n"); return 1; }
+        long n = wallet_listunspent_entry(line, 512, txid, idx, value, script, (unsigned long)(hl / 2));
+        if (n > 0) printf("%s\n", line);
+    }
+    return 0;
+}
+
 static int cmd_balance(int argc, char** argv) {
     /* usage: wallet_cli balance <value_sat> ...  -> sum of the wallet's UTXOs */
     if (argc < 3) {
@@ -286,7 +357,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -306,6 +377,8 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "getrawchangeaddress")) return cmd_getnewaddress(argc, argv, 1);
     if (!strcmp(argv[1], "validateaddress")) return cmd_validateaddress(argc, argv, 0);
     if (!strcmp(argv[1], "getaddressinfo")) return cmd_validateaddress(argc, argv, 1);
+    if (!strcmp(argv[1], "gettxout")) return cmd_gettxout(argc, argv);
+    if (!strcmp(argv[1], "listunspent")) return cmd_listunspent(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }
