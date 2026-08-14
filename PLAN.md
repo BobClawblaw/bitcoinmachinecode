@@ -205,6 +205,14 @@ only prove correctness). Commits: `a062d78`..`5dbe238`.
   + DER + pubkey + ecdsa_verify): the validation CAPSTONE; 38/38 suite.
 - **UTXO set** — `asm/bitcoin_utxo.asm`: txid(idx)->(value,script) store,
   `utxo_init/put/get/del`; double-spend guard; suite grew to 39.
+- **Persistent UTXO store** — `asm/bitcoin_utxo_store.asm`: crash-safe on-disk
+  layer over the in-memory set, mirroring the append-only store/index pattern of
+  the block archive (`utxo.dat` WAL of framed PUSH/DEL records + `utxo.idx`
+  checkpoint snapshot + log offset; `utxo_store_put/del` WAL-first then apply in
+  mem, `utxo_store_sync` checkpoints + fsyncs, `utxo_store_reload` restores the
+  checkpoint O(n) then replays the WAL tail = restart-resume). `test_utxo_store`
+  verifies put/spend/dedup, full-WAL reload, checkpoint + crash-tail restart-resume,
+  and on-disk framing. Closes the persistent-UTXO correctness/scale gap.
 - **Whole-transaction validator** — `tests/test_txval.c`: every input outpoint
   present+unspent, every P2PKH sig verifies, sum(in)>=sum(out). Genuine ECDSA
   vectors; 40/40 suite.
@@ -474,7 +482,7 @@ result on shared blocks/txs must be bit-identical or the node must refuse
 | P2SH / multisig (OP_CHECKMULTISIG) | DONE | bitcoin_multisig.asm |
 | BIP32 full-path + xprv/xpub | DONE | bitcoin_bip32.asm (derive_path/fingerprint/extkey_serialize) |
 | BIP39 mnemonic <-> seed | DONE | bitcoin_bip39.asm (gen/validate/PBKDF2 seed) |
-| Persistent UTXO to disk | queued (card 4) | this batch |
+| Persistent UTXO to disk | DONE | bitcoin_utxo_store.asm (WAL utxo.dat + idx checkpoint, restart-resume) |
 | sighash_all real-spend end-to-end | queued (card 5) | this batch |
 | Full script interpreter (all opcodes incl. tapscript/BIP342) | OPEN — largest asm item | post-batch |
 | Taproot / segwit v1 validation (BIP341/340) | OPEN | post-batch |

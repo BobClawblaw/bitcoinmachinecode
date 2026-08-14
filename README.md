@@ -233,6 +233,17 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   `hashlib.pbkdf2_hmac`). The wallet CLI now reports a recoverable seed end to
   end: `wallet_cli mnemonic` `->` `wallet_cli seed "<words>" [pass]` yields the
   mnemonic, 64-byte seed, master `xprv`, and `m/44'/0'/0'/0/0` address.
+- **Persistent UTXO store** (`asm/bitcoin_utxo_store.asm`) — a crash-safe,
+  reloadable on-disk layer over the in-memory UTXO set, mirroring the proven
+  append-only store/index pattern of the block archive: a write-ahead operation
+  log `utxo.dat` (framed PUSH/DEL records; the durable source of truth) plus a
+  checkpoint index `utxo.idx` (a snapshot of the live set + the log offset it
+  covers). `utxo_store_put/del` append the op to the WAL first, then apply it in
+  memory; `utxo_store_sync` writes a checkpoint and fsyncs both files;
+  `utxo_store_reload` restores the checkpoint O(n) and replays the WAL tail past
+  it (restart-resume), recovering a crash between checkpoints exactly like the
+  block store's resume. `test_utxo_store` verifies put/spend/dedup, full-WAL
+  reload, checkpoint + crash-tail restart-resume, and on-disk framing.
 - **bech32 / bech32m codec** (`asm/bech32.asm`) — BIP173/350 address codec
   (`bech32_polymod` 30-bit CRC, create/verify checksum with the XOR-1 vs
   0x2bc830a3 switch, 8<->5 bit regroup, encode/decode), verified against every
@@ -300,6 +311,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_sighash.asm    # legacy SIGHASH_ALL preimage builder
 |   +-- bitcoin_script.asm     # der_parse_sig + verify_p2pkh (end-to-end P2PKH validate)
 |   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script)
+|   +-- bitcoin_utxo_store.asm # PERSISTENT UTXO: WAL utxo.dat + idx checkpoint
 |   +-- bech32.asm             # BIP173/350 bech32/bech32m address codec
 |   +-- bitcoin_bip32.asm      # BIP32 master/CKD/derive_path + xprv/xpub
 |   +-- bitcoin_bip39.asm      # BIP39 mnemonic<->seed (PBKDF2-HMAC-SHA512)
