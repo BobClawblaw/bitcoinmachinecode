@@ -332,6 +332,241 @@ long wallet_sign_tx(unsigned char* out_tx, long cap,
     return pos;
 }
 
+/* ---- public "send" layer: createrawtx + sign-all-inputs ---- */
+
+/* Public P2PKH prevout-script builder for a given compressed private key
+ * (25-byte script): OP_DUP HASH160 PUSH20 <h160> EQUALVERIFY CHECKSIG. */
+void wallet_make_p2pkh_script(unsigned char script[25], const unsigned char priv_be[32]) {
+    wallet_p2pkh_script(script, priv_be);
+}
+
+/* Encode a P2PKH output script for a RAW destination pubkey hash:
+ *   OP_DUP 0x76 OP_HASH160 0xa9 PUSH20 <h20> OP_EQUALVERIFY 0x88 OP_CHECKSIG 0xac
+ * Returns 25 (the script length). */
+int wallet_p2pkh_output_script(unsigned char out[25], const unsigned char h160[20]) {
+    out[0] = 0x76; out[1] = 0xa9; out[2] = 0x14;
+    memcpy(out + 3, h160, 20);
+    out[23] = 0x88; out[24] = 0xac;
+    return 25;
+}
+
+/* HASH160(pubkey) of a compressed private key (the P2PKH address hash). */
+void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]) {
+    unsigned char pub[33];
+    scalar_to_pubkey(pub, priv_be);
+    hash160(h, pub, 33);
+}
+
+/* Sum a wallet's unspent prevout values (satoshis). The caller supplies the
+ * wallet's UTXO set (the resolution of "which outputs are ours" lives in the
+ * caller that owns the UTXO store). Returns the total. */
+unsigned long long wallet_get_balance(const unsigned long long* tval, unsigned long n) {
+    unsigned long long sum = 0;
+    for (unsigned long i = 0; i < n; i++) sum += tval[i];
+    return sum;
+}
+
+/* Build an UNSIGNED P2PKH transaction that spends `n` inputs, paying `amount`
+ * to a destination P2PKH script (`to_script`, 25 bytes = wallet_p2pkh_output_script)
+ * and returning change (sum(inputs) - amount - fee) to our own change script.
+ *
+ * Inputs  : toutid[i][32] == prevout txid, tidx[i] == prevout index,
+ *           tval[i]       == prevout value (for the fee/change math)
+ * Caller  : passes explicit prevout values; the wallet resolves them from its
+ *           UTXO set (that resolution lives in the CLI, which owns the store).
+ *          Each input's scriptSig is left EMPTY (to be filled by
+ *          wallet_sign_all_inputs).
+ *
+ * Returns the unsigned tx length, or -1 on error (fee>0 required, and change
+ * must be >= 0; coinbase-like zero outputs are allowed but discouraged).
+ */
+long wallet_createrawtx(unsigned char* out_tx, long cap,
+                        const unsigned char toutid[][32], const unsigned long* tidx,
+                        const unsigned long long* tval, unsigned long n,
+                        const unsigned char to_script[25], unsigned long long amount,
+                        const unsigned char change_script[25],
+                        unsigned long long fee, unsigned long locktime) {
+    unsigned long long total_in = 0;
+    for (unsigned long i = 0; i < n; i++) total_in += tval[i];
+    if (fee == 0 || total_in < amount + fee) return -1;      /* underfunded / no-fee */
+    unsigned long long change = total_in - amount - fee;
+    if (change > 0 && change == (unsigned long long)-1) return -1;
+
+    unsigned char* t = out_tx;
+    long pos = 0;
+    /* version */
+    t[pos++] = (unsigned char)(locktime & 0xff);
+    t[pos++] = (unsigned char)((locktime >> 8) & 0xff);
+    t[pos++] = (unsigned char)((locktime >> 16) & 0xff);
+    t[pos++] = (unsigned char)((locktime >> 24) & 0xff);
+    /* vin count */
+    pos += put_varint(t + pos, n);
+    for (unsigned long i = 0; i < n && pos + 41 < cap; i++) {
+        memcpy(t + pos, toutid[i], 32); pos += 32;           /* prev txid */
+        t[pos++] = (unsigned char)(tidx[i] & 0xff);          /* prev index LE */
+        t[pos++] = (unsigned char)((tidx[i] >> 8) & 0xff);
+        t[pos++] = (unsigned char)((tidx[i] >> 16) & 0xff);
+        t[pos++] = (unsigned char)((tidx[i] >> 24) & 0xff);
+        t[pos++] = 0;                                        /* scriptSig len = 0 */
+        t[pos++] = 0xff; t[pos++] = 0xff; t[pos++] = 0xff; t[pos++] = 0xff; /* seq */
+    }
+    if (n && pos + 1 >= cap) return -1;
+    /* vout count */
+    pos += put_varint(t + pos, (change > 0) ? 2 : 1);
+    /* output 0: destination */
+    {
+        for (int j = 0; j < 8; j++) t[pos++] = (unsigned char)((amount >> (8*j)) & 0xff);
+        pos += put_varint(t + pos, 25);
+        memcpy(t + pos, to_script, 25); pos += 25;
+    }
+    /* output 1: change (if any) */
+    if (change > 0) {
+        for (int j = 0; j < 8; j++) t[pos++] = (unsigned char)((change >> (8*j)) & 0xff);
+        pos += put_varint(t + pos, 25);
+        memcpy(t + pos, change_script, 25); pos += 25;
+    }
+    /* locktime */
+    t[pos++] = (unsigned char)(locktime & 0xff);
+    t[pos++] = (unsigned char)((locktime >> 8) & 0xff);
+    t[pos++] = (unsigned char)((locktime >> 16) & 0xff);
+    t[pos++] = (unsigned char)((locktime >> 24) & 0xff);
+    if (pos > cap) return -1;
+    return pos;
+}
+
+/* Sign EVERY input of an unsigned P2PKH tx in place, replacing each scriptSig
+ * with <push><DER sig><sighash-all><push><pubkey>. All inputs are signed with
+ * `priv_be` (same key owns all our inputs). Each input's SIGHASH_ALL digest is
+ * built against the pure-unsigned tx (all other scriptSigs empty) with that
+ * input's prevout script -- the standard legacy multi-input signing procedure.
+ *
+ * `prevout_script[i]` must be each input's 25-byte P2PKH script.
+ *
+ * Returns the final signed tx length, or -1 on error.
+ */
+long wallet_sign_all_inputs(unsigned char* tx, long txlen, long cap,
+                            const unsigned char priv_be[32],
+                            const unsigned char prevout_script[][25], unsigned long n) {
+    /* parse the unsigned tx: version, vin count, per-input outpoint, then out */
+    unsigned long pos = 4;
+    unsigned long n_in = get_varint(tx + pos, &pos);
+    if (n_in != n) return -1;
+    /* We must rebuild the tx once per input. Sign every input against the
+     * pure-unsigned form (all scriptSigs empty), stashing each resulting
+     * scriptSig, then assemble the final signed tx.
+     */
+    unsigned char* signedtx = malloc(4096);
+    long* sizes = malloc(sizeof(long) * (n + 1));
+    unsigned char** bodies = malloc(sizeof(unsigned char*) * (n + 1));
+    if (!signedtx || !sizes || !bodies) {
+        free(signedtx); free(sizes); free(bodies); return -1;
+    }
+    /* First pass: produce and stash all scriptSigs (from the unsigned tx). */
+    for (unsigned long i = 0; i < n; i++) {
+        unsigned char* body = malloc(200);
+        if (!body) { for (unsigned long j = 0; j < i; j++) free(bodies[j]); free(signedtx); free(sizes); free(bodies); return -1; }
+        bodies[i] = body;
+        /* z = sighash_all(unsigned tx, input i, prevout_script i) */
+        unsigned char z[32];
+        if (!wallet_sighash(z, tx, (unsigned long)txlen, i, prevout_script[i], 25)) {
+            free(body); for (unsigned long j = 0; j < i; j++) free(bodies[j]); free(signedtx); free(sizes); free(bodies); return -1;
+        }
+        uint64_t r[4], sval[4];
+        wallet_ecdsa_sign(r, sval, z, priv_be);
+        int dl = der_signature(body, r, sval);
+        /* body = <push dl+1> <DER><0x01> <push 33> <pubkey 33> */
+        unsigned char tmp[200];
+        int tl = 0;
+        tmp[tl++] = (unsigned char)(dl + 1);
+        memcpy(tmp + tl, body, dl); tl += dl;
+        tmp[tl++] = 0x01;                          /* SIGHASH_ALL */
+        tmp[tl++] = 0x21;
+        scalar_to_pubkey(tmp + tl, priv_be); tl += 33;
+        memcpy(body, tmp, tl);
+        sizes[i] = tl;
+    }
+
+    /* Second pass: assemble the final tx. Copy input forward from the unsigned
+     * tx; when reaching input i, write sizes[i] as the scriptSig len and the
+     * body instead of the empty slot. */
+    {
+        unsigned long rp = 4;
+        memcpy(signedtx, tx, 4); long slen = 4;   /* version */
+        unsigned long cc;
+        unsigned long vi = get_varint(tx + rp, &cc);
+        rp += cc;                                  /* advance past vin-count varint */
+        slen += put_varint(signedtx + slen, vi);  /* vin count */
+        for (unsigned long i = 0; i < n; i++) {
+            memcpy(signedtx + slen, tx + rp, 36); slen += 36; rp += 36; /* outpoint */
+            unsigned long sl = get_varint(tx + rp, &cc); rp += cc;     /* sig len varint */
+            /* write our sig length + body */
+            slen += put_varint(signedtx + slen, (unsigned long)sizes[i]);
+            memcpy(signedtx + slen, bodies[i], sizes[i]); slen += sizes[i];
+            rp += sl;                              /* skip original sig (empty) */
+            memcpy(signedtx + slen, tx + rp, 4); slen += 4; rp += 4;  /* seq */
+        }
+        /* outputs + locktime verbatim (up to the unsigned tx's true length) */
+        memcpy(signedtx + slen, tx + rp, (unsigned long)txlen - rp);
+        slen += (long)((unsigned long)txlen - rp);
+        for (unsigned long j = 0; j < n; j++) free(bodies[j]);
+        free(sizes); free(bodies);
+        if (slen > cap) { free(signedtx); return -1; }
+        memcpy(tx, signedtx, (size_t)slen);
+        free(signedtx);
+        return slen;
+    }
+}
+
+/* One-call "send": build an unsigned P2PKH tx spending `n` of our UTXOs to a
+ * destination and back to our change address (fee = total_in - amount), then
+ * sign every input. `cap` bounds both the intermediate unsigned tx and the
+ * final signed tx. Returns the signed tx length, or -1.
+ *
+ *   toutid[][32]/tidx[]/tval[]  -- the prevouts to spend (resolved by caller
+ *                                  from its UTXO store).
+ *   to_h160[20]                 -- destination P2PKH address hash.
+ *   amount / fee                -- recipient amount and (exact) fee in sat.
+ *   priv_be[32]                 -- the spending key (owns every prevout script
+ *                                  = standard P2PKH pubkey-hash of priv_be).
+ *   locktime                    -- 0 for a normal payment.
+ */
+long wallet_send_tx(unsigned char* out_tx, long cap,
+                    const unsigned char toutid[][32], const unsigned long* tidx,
+                    const unsigned long long* tval, unsigned long n,
+                    const unsigned char to_h160[20],
+                    unsigned long long amount, unsigned long long fee,
+                    const unsigned char priv_be[32], unsigned long locktime) {
+    /* our own change script (spending key's P2PKH) */
+    unsigned char change_script[25];
+    wallet_p2pkh_script(change_script, priv_be);
+    /* destination output script */
+    unsigned char to_script[25];
+    wallet_p2pkh_output_script(to_script, to_h160);
+
+    unsigned char* raw = malloc((size_t)cap + 1024);
+    if (!raw) return -1;
+    long rawlen = wallet_createrawtx(raw, cap, toutid, tidx, tval, n,
+                                     to_script, amount, change_script, fee, locktime);
+    if (rawlen < 0) { free(raw); return -1; }
+
+    /* per-input prevout scripts: all are the spending key's P2PKH script */
+    unsigned char (*prev)[25] = malloc((size_t)n * 25);
+    if (!prev) { free(raw); return -1; }
+    for (unsigned long i = 0; i < n; i++) wallet_p2pkh_script(prev[i], priv_be);
+
+    unsigned char* signedtx = malloc((size_t)cap + 1024);
+    if (!signedtx) { free(raw); free(prev); return -1; }
+    memcpy(signedtx, raw, (size_t)rawlen);
+    long slen = wallet_sign_all_inputs(signedtx, rawlen, cap + 1024, priv_be, prev, n);
+
+    free(raw); free(prev);
+    if (slen < 0) { free(signedtx); return -1; }
+    if (slen > cap) { free(signedtx); return -1; }
+    memcpy(out_tx, signedtx, (size_t)slen);
+    free(signedtx);
+    return slen;
+}
+
 /* ============================================================================
  * BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets).
  * ==========================================================================*/

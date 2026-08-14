@@ -24,6 +24,14 @@ extern int  wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
 extern long wallet_sign_tx(unsigned char* out_tx, long cap,
                            const unsigned char* tx, unsigned long txlen,
                            long input_index, const unsigned char priv_be[32]);
+extern long wallet_send_tx(unsigned char* out_tx, long cap,
+                           const unsigned char toutid[][32], const unsigned long* tidx,
+                           const unsigned long long* tval, unsigned long n,
+                           const unsigned char to_h160[20],
+                           unsigned long long amount, unsigned long long fee,
+                           const unsigned char priv_be[32], unsigned long locktime);
+extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
+extern unsigned long long wallet_get_balance(const unsigned long long* tval, unsigned long n);
 /* BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets). */
 extern int  wallet_mnemonic_generate(char out[256]);
 extern int  wallet_mnemonic_validate(const char* mn);
@@ -120,6 +128,67 @@ static int cmd_sign(const char* txhex, const char* keyhex, const char* idxhex) {
     return 0;
 }
 
+static int cmd_send(int argc, char** argv) {
+    /* usage: wallet_cli send <priv_hex> <dest_h160_hex> <amount> <fee> <txid:idx:value> ... */
+    if (argc < 7) {
+        fprintf(stderr, "usage: wallet_cli send <priv_hex> <dest_h160_hex40> "
+                        "<amount_sat> <fee_sat> <txid_hex64:idx:value_sat> [...more inputs]\n");
+        return 2;
+    }
+    unsigned char priv[32];
+    if (!hex_to_bytes(priv, argv[2], 64)) { fprintf(stderr, "send: bad private key hex\n"); return 1; }
+    unsigned char to_h[20];
+    if (!hex_to_bytes(to_h, argv[3], 40)) { fprintf(stderr, "send: bad destination h160\n"); return 1; }
+    long long amount = strtoll(argv[4], NULL, 10);
+    long long fee    = strtoll(argv[5], NULL, 10);
+    if (amount < 0 || fee < 0) { fprintf(stderr, "send: negative amount/fee\n"); return 1; }
+
+    int n = argc - 6;
+    unsigned char (*tid)[32] = malloc(n * 32);
+    unsigned long*    tidx   = malloc(n * sizeof(unsigned long));
+    unsigned long long* tval = malloc(n * sizeof(unsigned long long));
+    if (!tid || !tidx || !tval) { free(tid); free(tidx); free(tval); fprintf(stderr, "send: oom\n"); return 1; }
+    for (int i = 0; i < n; i++) {
+        char* s = argv[6 + i];
+        char* c1 = strchr(s, ':');
+        if (!c1) { fprintf(stderr, "send: input %d must be <txid>:<idx>:<value>\n", i); return 1; }
+        *c1 = 0;
+        char* c2 = strchr(c1 + 1, ':');
+        if (!c2) { fprintf(stderr, "send: input %d must be <txid>:<idx>:<value>\n", i); return 1; }
+        *c2 = 0;
+        if (!hex_to_bytes(tid[i], s, 64)) { fprintf(stderr, "send: input %d bad txid hex\n", i); return 1; }
+        tidx[i] = (unsigned long)strtoul(c1 + 1, NULL, 10);
+        tval[i] = (unsigned long long)strtoull(c2 + 1, NULL, 10);
+    }
+
+    unsigned char signedtx[16384];
+    long sl = wallet_send_tx(signedtx, (long)sizeof signedtx, tid, tidx, tval,
+                             (unsigned long)n, to_h, (unsigned long long)amount,
+                             (unsigned long long)fee, priv, 0);
+    free(tid); free(tidx); free(tval);
+    if (sl < 0) { fprintf(stderr, "send: could not build/sign (underfunded or bad inputs?)\n"); return 1; }
+    printf("signed-tx (%ld bytes):\n", sl);
+    print_hex(signedtx, (int)sl);
+    printf("\n");
+    return 0;
+}
+
+static int cmd_balance(int argc, char** argv) {
+    /* usage: wallet_cli balance <value_sat> ...  -> sum of the wallet's UTXOs */
+    if (argc < 3) {
+        fprintf(stderr, "usage: wallet_cli balance <utxo_value_sat> [...more]  (sums your unspent prevout values)\n");
+        return 2;
+    }
+    unsigned long long n = (unsigned long)(argc - 2);
+    unsigned long long* v = malloc(n * sizeof(unsigned long long));
+    if (!v) return 1;
+    for (unsigned long i = 0; i < n; i++) v[i] = (unsigned long long)strtoull(argv[2 + i], NULL, 10);
+    unsigned long long tot = wallet_get_balance(v, n);
+    free(v);
+    printf("%llu\n", tot);
+    return 0;
+}
+
 static int cmd_mnemonic(void) {
     /* produce a fresh recoverable seed: random mnemonic -> seed -> BIP32. */
     char mn[256];
@@ -169,7 +238,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -183,6 +252,8 @@ int main(int argc, char** argv) {
         if (argc < 5) { fprintf(stderr, "usage: wallet_cli sign <tx_hex> <privkey_hex> <input_idx>\n"); return 2; }
         return cmd_sign(argv[2], argv[3], argv[4]);
     }
+    if (!strcmp(argv[1], "send")) return cmd_send(argc, argv);
+    if (!strcmp(argv[1], "balance")) return cmd_balance(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }

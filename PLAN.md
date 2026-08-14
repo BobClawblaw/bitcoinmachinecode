@@ -497,7 +497,7 @@ result on shared blocks/txs must be bit-identical or the node must refuse
 | sighash_all real-spend end-to-end | DONE | test_e2e_sighash.c (wallet CLI signs -> whole-tx validator accepts)
 | Full script interpreter (all opcodes incl. tapscript/BIP342) | OPEN — largest asm item | post-batch |
 | Taproot / segwit v1 validation (BIP341/340) | OPEN | post-batch |
-| Full wallet-core + bitcoin-cli/RPC surface (getnewaddress, sendtoaddress, signrawtransaction, getbalance, createrawtransaction, etc.) | OPEN | post-batch |
+| Full wallet-core + bitcoin-cli/RPC surface (getnewaddress, sendtoaddress, signrawtransaction, getbalance, createrawtransaction, etc.) | PARTIAL — createrawtransaction/send/balance DONE (wallet_core.c wallet_createrawtx/wallet_sign_all_inputs/wallet_send_tx/wallet_get_balance + wallet_cli send/balance, test_send); full RPC plumbing + the address/UTXO-resolver commands remain | this batch + post-batch |
 | Higher-level P2P parity (compact blocks, sendheaders, feefilter, handshake nitpicks) | OPEN | post-batch |
 | Consensus bit-exactness on mainnet edge cases (BIP16/30, 2-of-3 P2SH, height-gated rules) | OPEN — requires differential testing vs Core | post-batch |
 | RPC, pruning, mainnet-scale (540 GB) storage | OPEN | post-batch |

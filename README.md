@@ -207,6 +207,21 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   (compressed pubkey + address), and `sign <tx><key><i>` (legacy SIGHASH_ALL P2PKH
   sign, deterministic nonce k=sha256d(z||priv), low-S DER). `test_wallet` 9/9,
   plus an independent Python verification of the signature.
+- **createrawtransaction + send** (`asm/wallet_core.c`, `tests/test_send.c`) —
+  the wallet now *builds and sends* a real tx, not just signs a supplied one.
+  `wallet_createrawtx` selects our prevouts, pays a destination P2PKH output and
+  returns change (`sum(inputs) − amount − fee`; rejects underfunded / zero-fee,
+  omits the change output when change is 0); `wallet_sign_all_inputs` signs
+  EVERY input (legacy SIGHASH_ALL over the pure-unsigned form, low-S DER);
+  `wallet_send_tx` is the one-call send; `wallet_get_balance` sums the wallet's
+  unspent prevouts. CLI: `wallet_cli send <priv> <dest_h160> <amount> <fee>
+  <txid:idx:value>...` prints the signed tx, `wallet_cli balance <v> [v...]`
+  prints the wallet UTXO sum. `test_send` (48th harness) feeds the signed tx
+  through the SAME whole-tx validator as test_txval (UTXO presence/double-spend
+  + per-input verify_p2pkh + fee): multi-input send VALID with correct
+  outpoint/amount/change/fee, exact-balance send (no change output),
+  underfunded and zero-fee REJECTED, send-vs-empty-UTXO rejected, and balance
+  math — 6 cases / 18 checks ALL PASS.
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine
@@ -337,7 +352,7 @@ bitcoinmachinecode/
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
-|       +-- wallet_cli.c      # wallet CLI: gen/addr/sign + mnemonic/seed (recoverable)
+|       +-- wallet_cli.c      # wallet CLI: gen/addr/sign/send/balance + mnemonic/seed (recoverable)
 |       +-- unified_ibd.c     # full-chain download into a unified single store (forward + backfill)
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
 |       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
