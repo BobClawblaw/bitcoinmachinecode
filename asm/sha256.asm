@@ -230,98 +230,95 @@ sha256_block:
     ; computing the new head-and-tail:
     ;   (h,g,f,e,d,c,b,a) <- (g,f,e,d+T1,c,b,a,T1+T2)
     ;
-    ; TEMP REGISTER PLAN (avoids any push/pop or stack spill inside the loop):
+    ; TEMP REGISTER PLAN (no push/pop or stack spill inside the loop):
     ;   eax, edx : build the sigma functions by rotating a single source word
     ;              via two copies and re-reading memory. Never hold live data.
-    ;   rbx      : running accumulator for T1, and later holds T1 for the final
-    ;              state update. Free again once T1 is consumed.
+    ;   rsi      : second scratch word (needed by Ch and Maj). After the W[0..15]
+    ;              fill loop the block pointer in rsi is dead, so rsi is free to
+    ;              serve as a register temp for the whole round phase -- this is
+    ;              what removes the old per-round push/pop(ebx) stack trip.
+    ;   rbx      : running accumulator/register holding T1 across the T2 math.
     ;   rcX      : round counter i, also the index into K[] and W[].
     ;
     ; The state update is done ONLY at the very end of the round, using the
     ; still-unmodified old values in r8d..r15d, so ordering is safe.
-    ; ========================================================================
-    xor ecx, ecx            ; round index i = 0..63
+    ; ================================================================================
+        xor ecx, ecx            ; round index i = 0..63
 
-.round:
-    ; ------------------------------------------------------------------------
-    ; Compute T1 = h + S1(e) + Ch(e,f,g) + K[i] + W[i], accumulated in eax
-    ; ------------------------------------------------------------------------
-    ; -- S1(e) = ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25) --
-    mov eax, r12d           ; copy of e for the first rotate
-    mov edx, r12d           ; copy of e for the second rotate
-    ror eax, 6              ; ROTR(e,6)
-    ror edx, 11             ; ROTR(e,11)
-    xor eax, edx
-    mov edx, r12d           ; reload e for the third rotate
-    ror edx, 25             ; ROTR(e,25)
-    xor eax, edx            ; eax = S1(e)
-    add eax, r15d           ; eax = S1(e) + h           (h is r15d)
+    .round:
+        ; ------------------------------------------------------------------------
+        ; Compute T1 = h + S1(e) + Ch(e,f,g) + K[i] + W[i], accumulated in eax
+        ; ------------------------------------------------------------------------
+        ; -- S1(e) = ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25) --
+        mov eax, r12d           ; e (first rotate)
+        mov edx, r12d           ; e (second rotate)
+        ror eax, 6
+        ror edx, 11
+        xor eax, edx
+        mov edx, r12d           ; e (third rotate)
+        ror edx, 25
+        xor eax, edx            ; eax = S1(e)
+        add eax, r15d           ; eax = S1(e) + h
 
-    ; -- Ch(e,f,g) = (e AND f) XOR (NOT e AND g) --
-    mov edx, r12d           ; e
-    and edx, r13d           ; e AND f  (f is r13d)
-    mov ebx, r12d           ; e
-    not ebx                 ; NOT e   (only low bits used)
-    and ebx, r14d           ; NOT e AND g  (g is r14d)
-    xor edx, ebx            ; edx = Ch(e,f,g)
-    add eax, edx            ; eax = ... + Ch
+        ; -- Ch(e,f,g) = (e AND f) XOR (NOT e AND g) --
+        mov edx, r12d
+        and edx, r13d           ; e AND f
+        mov esi, r12d
+        not esi
+        and esi, r14d           ; NOT e AND g
+        xor edx, esi            ; edx = Ch(e,f,g)
+        add eax, edx            ; eax = ... + Ch
 
-    ; -- add K[i] and W[i] --
-    lea rdx, [K256]         ; base address of the constant table
-    add eax, [rdx + rcx*4]  ; eax += K[i]
-    add eax, [rsp + rcx*4]  ; eax += W[i]
-    mov rbx, rax            ; rbx = T1  (move out of the way for T2 work)
+        ; -- add K[i] and W[i] --
+        lea rdx, [K256]
+        add eax, [rdx + rcx*4]  ; eax += K[i]
+        add eax, [rsp + rcx*4]  ; eax += W[i]
+        mov ebx, eax            ; rbx = T1  (parked in a register, no stack)
 
-    ; ------------------------------------------------------------------------
-    ; Compute T2 = S0(a) + Maj(a,b,c), result in eax
-    ; ------------------------------------------------------------------------
-    ; -- S0(a) = ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22) --
-    mov eax, r8d            ; copy of a for first rotate
-    mov edx, r8d            ; copy of a for second rotate
-    ror eax, 2              ; ROTR(a,2)
-    ror edx, 13             ; ROTR(a,13)
-    xor eax, edx
-    mov edx, r8d            ; reload a for third rotate
-    ror edx, 22             ; ROTR(a,22)
-    xor eax, edx            ; eax = S0(a)
+        ; ------------------------------------------------------------------------
+        ; Compute T2 = S0(a) + Maj(a,b,c), result in eax
+        ; ------------------------------------------------------------------------
+        ; -- S0(a) = ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22) --
+        mov eax, r8d            ; a (first rotate)
+        mov edx, r8d            ; a (second rotate)
+        ror eax, 2
+        ror edx, 13
+        xor eax, edx
+        mov edx, r8d            ; a (third rotate)
+        ror edx, 22
+        xor eax, edx            ; eax = S0(a)
 
-    ; -- Maj(a,b,c) = (a AND b) XOR (a AND c) XOR (b AND c) --
-    ; T1 is still in rbx and must survive; S0(a) is in eax (the future T2
-    ; accumulator). To free a scratch register we spill T1 to the stack now
-    ; and pop it back afterwards, keeping rsp balanced within the round.
-    push rbx                ; spill T1 (rbx holds T1) onto the stack
-    mov edx, r8d            ; a
-    and edx, r9d            ; a AND b   (b is r9d)
-    mov ebx, r8d            ; a  (rbx now free scratch)
-    and ebx, r10d           ; a AND c   (c is r10d)
-    xor edx, ebx            ; (a&b) XOR (a&c)
-    mov ebx, r9d            ; b
-    and ebx, r10d           ; b AND c
-    xor edx, ebx            ; edx = Maj(a,b,c)
-    add eax, edx            ; eax = S0(a) + Maj = T2
-    pop rbx                 ; rbx = T1  (restore the spilled value)
+        ; -- Maj(a,b,c) = (a AND b) XOR (a AND c) XOR (b AND c) --
+        ; T1 stays in rbx; rsi serves as the second scratch word.
+        mov edx, r8d
+        and edx, r9d            ; a AND b
+        mov esi, r8d
+        and esi, r10d           ; a AND c
+        xor edx, esi            ; (a&b) XOR (a&c)
+        mov esi, r9d
+        and esi, r10d           ; b AND c
+        xor edx, esi            ; edx = Maj(a,b,c)
+        add eax, edx            ; eax = S0(a) + Maj = T2
 
-    ; ------------------------------------------------------------------------
-    ; State update: slide the working window right by one and set new head/tail
-    ;   (h,g,f,e,d,c,b,a) <- (g, f, e, d+T1, c, b, a, T1+T2)
-    ; Current live regs: eax = T2, rbx = T1, rcx = i, r8d..r15d = old a..h.
-    ; Every destination reads only values that have not been rewritten yet,
-    ; so the ordering below is dependency-safe.
-    ; ------------------------------------------------------------------------
-    add r11d, ebx           ; r11d = d + T1        (will become new e)
-    mov r15d, r14d          ; h' = old g
-    mov r14d, r13d          ; g' = old f
-    mov r13d, r12d          ; f' = old e
-    mov r12d, r11d          ; e' = d + T1
-    mov r11d, r10d          ; d' = old c
-    mov r10d, r9d           ; c' = old b
-    mov r9d,  r8d           ; b' = old a
-    add eax, ebx            ; a' = T1 + T2
-    mov r8d, eax            ; store T1+T2 into a
+        ; ------------------------------------------------------------------------
+        ; State update: slide the working window right by one and set new head/tail
+        ;   (h,g,f,e,d,c,b,a) <- (g, f, e, d+T1, c, b, a, T1+T2)
+        ; Current live regs: eax = T2, rbx = T1, rcx = i, r8d..r15d = old a..h.
+        ; ------------------------------------------------------------------------
+        add r11d, ebx           ; r11d = d + T1        (will become new e)
+        mov r15d, r14d          ; h' = old g
+        mov r14d, r13d          ; g' = old f
+        mov r13d, r12d          ; f' = old e
+        mov r12d, r11d          ; e' = d + T1
+        mov r11d, r10d          ; d' = old c
+        mov r10d, r9d           ; c' = old b
+        mov r9d,  r8d           ; b' = old a
+        add eax, ebx            ; a' = T1 + T2
+        mov r8d, eax            ; store T1+T2 into a
 
-    inc ecx                 ; advance to the next round
-    cmp ecx, 64
-    jb  .round              ; continue while i < 64
+        inc ecx                 ; advance to the next round
+        cmp ecx, 64
+        jb  .round              ; continue while i < 64
 
     ; ========================================================================
     ; PHASE 5: Fold the working state back into the running hash state.
