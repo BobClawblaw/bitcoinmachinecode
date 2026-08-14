@@ -121,9 +121,11 @@ utxo_put:
     mov  r14, rdx       ; index
     mov  r15, rcx       ; value
     ; value is 64-bit in rcx; script in r8, slen in r9
+    ; NOTE: save area is [rbp-8..-0x28] (5 pushes); locals live at
+    ; [rbp-0x30] and below so the saved callee-saved regs are not clobbered.
     mov  rax, [rbp+16]
-    mov  [rbp-0x28], r8     ; script
-    mov  [rbp-0x30], r9     ; slen
+    mov  [rbp-0x30], r8     ; script
+    mov  [rbp-0x38], r9     ; slen
     ; ---- find slot ----
     mov  rdi, r13
     mov  rsi, r14
@@ -179,7 +181,7 @@ utxo_put:
     pop  rbx
     ; ---- allocate blob record ----
     mov  rax, [r12+32]         ; fill = record offset
-    mov  rcx, [rbp-0x30]       ; slen
+    mov  rcx, [rbp-0x38]       ; slen
     lea  rcx, [rcx+16]         ; + value(8) + slen(8)
     lea  rdx, [rax+rcx]
     cmp  rdx, [r12+24]         ; blob_cap
@@ -193,17 +195,17 @@ utxo_put:
     ; write value, slen
     mov  r8, r15
     mov  [rcx], r8             ; value
-    mov  r8, [rbp-0x30]
+    mov  r8, [rbp-0x38]
     mov  [rcx+8], r8           ; script_len
     ; copy script into record+16
     lea  rdi, [rcx+16]
-    mov  rsi, [rbp-0x28]
+    mov  rsi, [rbp-0x30]
     push rbx
-    mov  rcx, [rbp-0x30]
+    mov  rcx, [rbp-0x38]
     call memcpy_asm
     pop  rbx
     ; fill += 16 + slen ; n++
-    mov  r8, [rbp-0x30]
+    mov  r8, [rbp-0x38]
     lea  r8, [r8+16]
     add  qword [r12+32], r8
     inc  qword [r12]
@@ -235,13 +237,15 @@ utxo_get:
     push r13
     push r14
     push r15
-    sub  rsp, 0x20
+    sub  rsp, 0x30
     mov  r12, rdi
     mov  r13, rsi
     mov  r14, rdx
-    mov  [rbp-0x28], rcx    ; &value
-    mov  [rbp-0x30], r8     ; &script
-    mov  [rbp-0x38], r9     ; &slen
+    ; NOTE: save area is [rbp-8..-0x28] (5 pushes); locals live BELOW it
+    ; at [rbp-0x40..] so the saved callee-saved regs are not clobbered.
+    mov  [rbp-0x40], rcx    ; &value
+    mov  [rbp-0x48], r8     ; &script
+    mov  [rbp-0x50], r9     ; &slen
     mov  rdi, r13
     mov  rsi, r14
     mov  rdx, [r12+8]
@@ -283,15 +287,15 @@ utxo_get:
     mov  rax, [r12+16]      ; blob base
     add  rax, rdx           ; record
     ; value
-    mov  rdx, [rbp-0x28]
+    mov  rdx, [rbp-0x40]
     mov  r8, [rax]
     mov  [rdx], r8
     ; script ptr
-    mov  rdx, [rbp-0x30]
+    mov  rdx, [rbp-0x48]
     lea  r8, [rax+16]
     mov  [rdx], r8
     ; slen
-    mov  rdx, [rbp-0x38]
+    mov  rdx, [rbp-0x50]
     mov  r8, [rax+8]
     mov  [rdx], r8
     mov  eax, 1
@@ -299,7 +303,7 @@ utxo_get:
 .miss:
     xor  eax, eax
 .done2:
-    add  rsp, 0x20
+    add  rsp, 0x30
     pop  r15
     pop  r14
     pop  r13

@@ -56,6 +56,7 @@ asm/daemon/verify
 
 # ---- Runtime / blockchain data ----
 *.dat
+*.idx
 *.log
 data/
 
@@ -99,6 +100,7 @@ asm/tests/test_sighash
 asm/tests/test_script
 asm/tests/test_p2pkh
 asm/tests/test_utxo
+asm/tests/test_utxo_store
 asm/tests/test_txval
 asm/tests/test_multisig
 asm/tests/test_bip32_extkey
