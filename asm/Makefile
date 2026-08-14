@@ -217,6 +217,29 @@ UTXOOBJS := bitcoin_utxo.o
 tests/test_utxo: tests/test_utxo.c $(UTXOOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_utxo.c $(UTXOOBJS)
 
+# Whole-transaction validator (test_txval.c): tx_parse + UTXO store +
+# P2PKH spend verification (verify_p2pkh + its sighash/pubkey/ecdsa chain).
+TXVALOBJS := bitcoin_utxo.o bitcoin_tx.o bitcoin_script.o bitcoin_sighash.o \
+             bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o \
+             secp256k1_ecdsa.o secp256k1_point.o bitcoin_hash.o sha256.o
+tests/test_txval: tests/test_txval.c tests/txval_vec.h $(TXVALOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_txval.c $(TXVALOBJS)
+
+# Wallet CLI: generate key, show address, sign a P2PKH tx.
+# asm/wallet_core.c glues the VERIFIED asm primitives (scalar_to_pubkey,
+# hash160, base58check_encode, sighash_all, ecdsa_verify) plus the verified
+# scalar/point/field ops (sc_*, point_scalar_mul, fe_*) used to construct
+# ECDSA signatures.
+WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o \
+               bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
+               bitcoin_hash.o sha256.o ripemd160.o
+daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c $(WALLETPRIMS)
+	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c $(WALLETPRIMS)
+
+tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
+	$(CC) -no-pie -O0 -o $@ tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
+
+
 # bitcoin_p2p.asm inv parsers (incoming protocol codecs).
 P2PINVOBS := bitcoin_p2p.o bitcoin_net.o bitcoin_hash.o sha256.o
 tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
@@ -247,7 +270,7 @@ tests/test_shared: tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo 
+test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_txval tests/test_wallet \
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -270,6 +293,8 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_script
 	./tests/test_p2pkh
 	./tests/test_utxo
+	./tests/test_wallet
+	./tests/test_txval
 	./tests/test_block
 	./tests/test_tx
 	./tests/test_net
@@ -294,4 +319,4 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_p2p_inv
 
 clean:
-	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip32.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo  tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_...[truncated]
+	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip32.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_ripemd160 tests/test_addr tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_txval tests/test_wallet daemon/wallet_cli

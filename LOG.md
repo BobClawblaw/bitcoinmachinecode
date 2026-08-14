@@ -7,6 +7,37 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-14 -- WALLET CLI: GENERATE KEY / SHOW ADDRESS / SIGN A P2PKH TX (t_9f55dbe5)
+### Goal and outcome
+Wire the VERIFIED wallet primitives (secp256k1, BIP32, hash160, base58check,
+pubkey_parse, ECDSA + the scalar/point/field ops) into a runnable CLI:
+  `wallet_cli gen`                -> random keypair + P2PKH mainnet address
+  `wallet_cli addr <keyhex>`      -> compressed pubkey + address for a key
+  `wallet_cli sign <txhex> <keyhex> <input_idx>` -> sign a P2PKH tx (legacy SIGHASH_ALL)
+### New/changed
+- asm/wallet_core.c   : C glue over the verified ASM primitives. ECDSA signing is done
+  in C on top of the repo's verified sc_mul / sc_inv / point_scalar_mul / fe_* / G_AFF
+  (r = (kG).x mod n, s = k^-1 (z + r d) mod n, low-S normalized; deterministic nonce
+  k = sha256d(z || priv)). Also does DER encoding + full tx re-serialization.
+- asm/daemon/wallet_cli.c : thin CLI front-end (gen/addr/sign).
+- asm/tests/test_wallet.c : end-to-end test (address known-vector, sign->verify roundtrip
+  with ecdsa_verify, signed-tx structure).
+- asm/Makefile : wallet CLI + test_wallet targets.
+### Verified (hard evidence)
+- addr(key=1) == 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH; addr(bip32 master) ==
+  15mKKb2eos1hWa6tisdPwwDC1a5J1y9nma  (both match independent Python oracle).
+- tests/test_wallet: 9/9 PASS. The embedded signature verifies BOTH with the repo's
+  ecdsa_verify AND independently with Python `cryptography`/secp256k1 against an
+  independently recomputed SIGHASH_ALL preimage (z matched the CLI byte-for-byte).
+- live CLI: `sign` on an unsigned 1-in/1-out tx produced a 107-byte scriptSig
+  (push72 DER||01, push33 compressed pubkey) that independently verifies.
+### Honest scope
+- Signing uses a deterministic RFC6979-style-ish nonce k = sha256d(z||priv) reduced
+  mod n (not full RFC6979; fine for a CLI/demo, not for production key custody).
+- The pre-existing `test_txval` (whole-tx validator, card t_ef86a54a) still has 2
+  failing cases (real-sig spends) — SEPARATE in-progress sprint item, not this card.
+  This card's `test_wallet` is green and runs before test_txval in `make test`.
+
 ## SESSION (2026-08-14): NODE SERVER SERVES THE REAL CHAIN (getdata + getheaders)
 Made the ASM inbound server genuinely answer peers against the real on-disk
 archive, by exercising `bitcoind serve <dir> <port>` live over loopback with

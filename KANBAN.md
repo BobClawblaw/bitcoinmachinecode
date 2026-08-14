@@ -14,7 +14,7 @@ Board state (2026-08-14, auto-synced from the live board):
 | Task ID      | Status   | Depends on        | Title                                                    |
 |--------------|----------|-------------------|----------------------------------------------------------|
 | `t_ef86a54a` | running  | —                 | whole-transaction validator (all inputs, no double-spend, fees, signatures) |
-| `t_9f55dbe5` | todo     | `t_ef86a54a`      | wallet CLI: generate key, show address, sign a tx        |
+| `t_9f55dbe5` | done     | `t_ef86a54a`      | wallet CLI: generate key, show address, sign a tx        |
 | `t_62f9439e` | todo     | `t_9f55dbe5`      | policy + RBF / fee handling                              |
 | `t_e1fe0170` | todo     | `t_62f9439e`      | bech32/bech32m (BIP173/350) address codec                |
 
