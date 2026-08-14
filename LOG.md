@@ -46,6 +46,45 @@ Downloader still healthy in parallel: 245,494/246,000 blocks stored (99.79%),
 contiguous from genesis, 1 chainctl running.
 ================================================================================
 
+## SESSION (2026-08-13): RIPEMD-160 + HASH160 + base58check ADDRESSES
+
+Finished the wallet address path. This closes the loop so a real mainnet
+Bitcoin address drops out of pure ASM end to end.
+
+1. ripemd160.asm -- complete RIPEMD-160. Held me up for a while: my digest was
+   deterministically wrong in BOTH my asm and a Python transcription that
+   agreed with it, yet every table/constant matched canonical. The way out was
+   fetching the authoritative pycryptodome src/RIPEMD160.c and reading the
+   FINAL MIXING stage literally: the left/right line terms are crossed in the
+   reference (h1 + CL + DR, not h1 + cc + d as I had it). Fixed the compose;
+   the asm then matched pycryptodome and hashlib on every vector.
+   Also fixed: little-endian message words (RIPEMD uses LE, unlike SHA-256's
+   BE -- I had bswap'd, copying the SHA habit), a carry/round-counter register
+   conflict, and callee-saved preservation. Verified: standard vectors +
+   padding boundaries (len 55/56/63/64/65/120) + multi-block (1000/4096/65536)
+   vs pycryptodome digests.
+
+2. bitcoin_addr.asm -- hash160 = RIPEMD160(SHA256(x)), and base58check_encode
+   (double-SHA256 checksum + repeated-divide-by-58 base58 with leading-'1'
+   preservation). Bug found: hash160 read its SHA-256 intermediate from the
+   wrong local offset ([rbp-0x58] instead of [rbp-0x30]) -- fixed. base58
+   digit order was also reversed (need to accumulate LSB-first then emit
+   reversed); and a buffer-overlap between the work and digit buffers plus a
+   data buffer that reached into the callee-save area caused corruption.
+
+Verified real mainnet P2PKH addresses byte-exact:
+   1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH  (compressed generator pubkey G)
+   1PRTTaJesdNovgne6Ehcdu1fpEdX7913CK  (Bitcoin-wiki test pubkey)
+plus the canonical all-zero base58check string.
+
+NOW COMPLETE IN ASM, all verified: BIP32 master -> CKDpriv -> secp256k1
+pubkey -> HASH160 (SHA256+RIPEMD160) -> base58check -> mainnet P2PKH address.
+33/33 harnesses green. Commit db328db, pushed.
+
+Downloader healthy throughout: ~277k blocks stored (99.7%), contiguous from
+genesis.
+================================================================================
+
 ## 2026-08-13 -- #13 STORE REFACTOR RECONCILED + root-caused a REAL corrupted-filename bug; full suite back to 283 PASS-equiv (22 green, 0 FAIL)
 ### Context
 On resuming, `make test` showed `test_bitcoind_sync` failing (`store tip_height == NB-1
