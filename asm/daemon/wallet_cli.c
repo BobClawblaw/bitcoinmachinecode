@@ -43,6 +43,10 @@ extern long wallet_listunspent_entry(char* out, long cap,
                                      unsigned long long value,
                                      const unsigned char* script, unsigned long slen);
 extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
+extern long wallet_signrawtx_withkeys(unsigned char* out_tx, long cap,
+    const unsigned char* tx, unsigned long txlen,
+    const unsigned char keys[][32], unsigned long nkeys,
+    const unsigned char prevout[][25], unsigned long n_in, unsigned char* signed_mask_out);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 /* wallet address-type enum mirrors (asm/wallet_core.c) */
 #define WAL_ADDR_INVALID 0
@@ -311,6 +315,45 @@ static int cmd_decoderawtx(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_signraw(int argc, char** argv) {
+    /* usage: wallet_cli signrawtransactionwithkey <tx_hex> <in>...  where each
+     * <in> = <privkey_hex64>:<prevout_p2pkh_script_hex50> (one per input). */
+    if (argc < 4) { fprintf(stderr, "usage: wallet_cli signrawtransactionwithkey <tx_hex> <priv:prevout_script_hex50> [<priv:prevout_script_hex50> ...]\n"); return 2; }
+    int hl = (int)strlen(argv[2]);
+    if (hl % 2 || hl / 2 > 16384) { fprintf(stderr, "bad tx hex\n"); return 1; }
+    unsigned char* tx = malloc((size_t)(hl / 2));
+    if (!tx) return 1;
+    if (!hex_to_bytes(tx, argv[2], hl)) { free(tx); fprintf(stderr, "bad tx hex\n"); return 1; }
+    int nin = argc - 3;
+    unsigned char (*keys)[32] = malloc(nin * 32);
+    unsigned char (*prev)[25] = malloc(nin * 25);
+    if (!keys || !prev) { free(tx); free(keys); free(prev); return 1; }
+    for (int i = 0; i < nin; i++) {
+        char* s = argv[3 + i];
+        char* c = strchr(s, ':');
+        if (!c) { fprintf(stderr, "entry %d must be <priv>:<prevout_script50>\n", i); return 1; }
+        *c = 0;
+        if (!hex_to_bytes(keys[i], s, 64)) { fprintf(stderr, "entry %d bad key hex\n", i); return 1; }
+        if (!hex_to_bytes(prev[i], c + 1, 50)) { fprintf(stderr, "entry %d bad 25-byte prevout script hex\n", i); return 1; }
+    }
+    unsigned char* out = malloc(32768);
+    if (!out) { free(tx); free(keys); free(prev); return 1; }
+    unsigned char mask[32]; memset(mask, 0, sizeof mask);
+    long sl = wallet_signrawtx_withkeys(out, 32768, tx, (unsigned long)(hl / 2),
+                                        keys, (unsigned long)nin, prev, (unsigned long)nin, mask);
+    free(tx); free(keys); free(prev);
+    if (sl < 0) { free(out); fprintf(stderr, "signraw: failed\n"); return 1; }
+    int n_signed = 0;
+    for (int i = 0; i < nin; i++) if (mask[i]) n_signed++;
+    printf("complete: %s\n", (n_signed == nin) ? "true" : "false");
+    printf("signed-inputs: %d/%d\n", n_signed, nin);
+    printf("signed-tx (%ld bytes):\n", sl);
+    print_hex(out, (int)sl);
+    printf("\n");
+    free(out);
+    return 0;
+}
+
 static int cmd_balance(int argc, char** argv) {
     /* usage: wallet_cli balance <value_sat> ...  -> sum of the wallet's UTXOs */
     if (argc < 3) {
@@ -376,7 +419,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -399,6 +442,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "gettxout")) return cmd_gettxout(argc, argv);
     if (!strcmp(argv[1], "listunspent")) return cmd_listunspent(argc, argv);
     if (!strcmp(argv[1], "decoderawtransaction")) return cmd_decoderawtx(argc, argv);
+    if (!strcmp(argv[1], "signrawtransactionwithkey")) return cmd_signraw(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }

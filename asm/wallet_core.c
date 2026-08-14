@@ -882,6 +882,122 @@ long wallet_send_tx(unsigned char* out_tx, long cap,
 }
 
 /* ============================================================================
+ * signrawtransactionwithkey -- sign selected inputs of an arbitrary raw tx with
+ * provided private keys (legacy SIGHASH_ALL, low-S). Mirrors Core's
+ * signrawtransactionwithkey within our P2PKH scope.
+ *
+ *   tx / txlen            -- the raw tx (unsigned scriptSigs, or partially
+ *                            signed; already-signed inputs are left untouched).
+ *   keys[][32]            -- candidate private keys (big-endian bytes).
+ *   nkeys                 -- number of keys.
+ *   prevout[][25]         -- per-INPUT prevout P2PKH script (n_in entries); all
+ *                            provided by the caller (the prevout script is what
+ *                            SIGHASH_ALL is committed over). NULL entries mean
+ *                            the input's prevout is not a P2PKH we can sign.
+ *   out_tx / cap          -- destination for the signed tx.
+ *   signed_mask_out       -- optional bitmask: bit i set if input i now carries
+ *                            a (re)built signature; caller may use for detail.
+ *
+ * Returns the signed tx length, or -1 on error. Inputs whose scriptSig is
+ * already non-empty are treated as already signed and left as-is. Keys are
+ * tried in order for each blank input; the first key whose P2PKH h160 matches
+ * is used (we sign with every matching key's signature, which for P2PKH is just
+ * the one signature). Because SIGHASH_ALL commits over the whole tx, each
+ * signature is built against the CURRENT tx (other inputs' existing scriptSigs
+ * preserved, this input's slot = its prevout script) then re-serialized.
+ * ========================================================================== */
+long wallet_signrawtx_withkeys(unsigned char* out_tx, long cap,
+                               const unsigned char* tx, unsigned long txlen,
+                               const unsigned char keys[][32], unsigned long nkeys,
+                               const unsigned char prevout[][25], unsigned long n_in,
+                               unsigned char* signed_mask_out) {
+    if (n_in == 0 || !prevout) return -1;
+    /* working copy grows to <= cap + 1024 (sigs add ~108 B/input) */
+    unsigned char* work = malloc((size_t)cap + 2048);
+    unsigned char* next = malloc((size_t)cap + 2048);
+    if (!work || !next) { free(work); free(next); return -1; }
+    memcpy(work, tx, (size_t)txlen);
+    long wlen = (long)txlen;
+    unsigned long payload_msk = 0;
+
+    for (unsigned long i = 0; i < n_in; i++) {
+        /* locate input i scriptSig len offset in `work` */
+        unsigned long p = 4, cc;
+        unsigned long ni = get_varint(work + p, &cc); p += cc;
+        if (ni != n_in) { free(work); free(next); return -1; }
+        unsigned long sig_off = 0, sig_len = 0, siglen_pos = 0;
+        for (unsigned long k = 0; k < n_in; k++) {
+            if (p + 36 > (unsigned long)wlen) { free(work); free(next); return -1; }
+            p += 36;
+            siglen_pos = p;
+            unsigned long sl = get_varint(work + p, &cc);
+            if (k == i) { sig_off = p; sig_len = sl; }
+            p += cc + sl + 4;
+        }
+        /* if already signed (non-empty scriptSig), skip */
+        if (sig_len > 0) continue;
+        /* find a key that owns this input's prevout P2PKH */
+        const unsigned char* key = NULL;
+        unsigned char want_h[20], kh[20];
+        memcpy(want_h, prevout[i] + 3, 20);   /* P2PKH h160 in prevout script */
+        for (unsigned long kk = 0; kk < nkeys; kk++) {
+            wallet_key_h160(kh, keys[kk]);
+            if (memcmp(kh, want_h, 20) == 0) { key = keys[kk]; break; }
+        }
+        if (!key) continue;                    /* no key owns this input */
+
+        /* build SIGHASH_ALL sig over the CURRENT tx (this input's slot replaced
+         * by its prevout script; others preserved) */
+        unsigned char z[32];
+        if (!wallet_sighash(z, work, (unsigned long)wlen, i, prevout[i], 25))
+            { free(work); free(next); return -1; }
+        uint64_t r[4], s[4];
+        wallet_ecdsa_sign(r, s, z, key);
+        unsigned char der[80];
+        int dl = der_signature(der, r, s);
+        unsigned char body[200];
+        int bl = 0;
+        body[bl++] = (unsigned char)(dl + 1);
+        memcpy(body + bl, der, (unsigned long)dl); bl += dl;
+        body[bl++] = 0x01;                     /* SIGHASH_ALL */
+        body[bl++] = 0x21;
+        scalar_to_pubkey(body + bl, key); bl += 33;
+
+        /* rebuild tx with input i's scriptSig = <push bl> body */
+        unsigned char* np = next;
+        unsigned long rp = 4;
+        long nn = 0;
+        memcpy(np + nn, work, 4); nn += 4;
+        unsigned long nv = get_varint(work + rp, &cc); rp += cc;
+        nn += put_varint(np + nn, nv);
+        for (unsigned long k = 0; k < n_in; k++) {
+            memcpy(np + nn, work + rp, 36); nn += 36; rp += 36;
+            unsigned long osl = get_varint(work + rp, &cc); rp += cc;
+            if (k == i) {
+                nn += put_varint(np + nn, (unsigned long)bl);
+                memcpy(np + nn, body, (unsigned long)bl); nn += bl;
+            } else {
+                memcpy(np + nn, work + rp - cc, cc); nn += cc;
+                memcpy(np + nn, work + rp, osl); nn += (long)osl;
+            }
+            rp += osl;
+            memcpy(np + nn, work + rp, 4); nn += 4; rp += 4;
+        }
+        memcpy(np + nn, work + rp, (unsigned long)wlen - rp); nn += (long)((unsigned long)wlen - rp);
+        /* swap work <-> next */
+        unsigned char* t = work; work = next; next = t;
+        wlen = nn;
+        if (signed_mask_out) signed_mask_out[i] = 1;
+        payload_msk |= (1UL << i);
+    }
+
+    if (wlen > cap) { free(work); free(next); return -1; }
+    memcpy(out_tx, work, (size_t)wlen);
+    free(work); free(next);
+    return wlen;
+}
+
+/* ============================================================================
  * BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets).
  * ==========================================================================*/
 
