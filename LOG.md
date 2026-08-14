@@ -6,6 +6,44 @@ success is reached. Update it after every meaningful event.
 
 ================================================================================
 LOG
+----------------------------------------------------------------------------
+## SESSION (2026-08-13): WALLET KEY DERIVATION IN ASM (BIP32)
+Reached the wallet stage. Built two new verified primitives in pure x86-64:
+
+1. bitcoin_keys.asm -- scalar_to_pubkey(k) -> compressed 33-byte pubkey:
+   point_scalar_mul(R,G,k) -> Jacobian (X,Y,Z); affinize via fe_inv(z2),fe_inv(z3):
+   x=X/z2, y=Y/z3; prefix 0x02/0x03 by Y parity; serialize X as 32 BE bytes.
+   Verified: G(k=1) exact, BIP32 master pubkey exact, scalar range checks.
+   Bug found & fixed: byte extraction shifted by (b&7) instead of 8*(b&7) --
+   missing *8, gave wrong BE bytes for nonzero scalars.
+
+2. bitcoin_bip32.asm -- bip32_master + bip32_ckd_priv (hardened + normal):
+   hardened: HMAC-SHA512(cpar, 0x00||kpar||ser32(i)); normal: HMAC-SHA512(cpar,
+   compressed_pubkey(kpar)||ser32(i)) using scalar_to_pubkey. Then
+   k_i=(IL+kpar) mod n, c_i=IR, validate 0<k<n.
+
+   THREE subtle asm bugs found & fixed:
+   (a) hardened input layout: k_par written at input[1] (was input[-1], an
+       off-by-one BELOW the 0x00 padding byte) -- silently garbage-shifted the
+       whole HMAC input.
+   (b) ser32(i) big-endian index bytes: written LSB-first (little-endian order)
+       instead of MSB-first; also needed to start at input[33] not input[30].
+   (c) the mod-n add/sub used DEC (clobbers CF) or TST (clobbers CF) between
+       ADC/SBB bytes, breaking carry/borrow propagation -> now LOOP (no flag
+       writes) + DEC r8 (DEC preserves CF in x86).
+   (d) 257th carry bit of (IL+kpar) overflows 32 bytes; captured in a dedicated
+       carry slot. Debt-row bug: the carry byte was placed at [rbp-0x119] which
+       IS the sum's LSB byte, silently overwriting it -> moved to [rbp-0x118].
+
+   Verified: test_bip32_chain walks the OFFICIAL BIP32 test-vector-1 chain
+   m -> m/0' -> m/0'/1 -> m/0'/1/2' -> m/0'/1/2'/2 -> .../1000000000,
+   all six steps byte-exact for both child key AND chain code.
+
+Full suite: 29 -> 31 harnesses green (added test_keys, test_bip32_chain,
+test_bip32_master). Commit 9fc36c4, pushed.
+
+Downloader still healthy in parallel: 245,494/246,000 blocks stored (99.79%),
+contiguous from genesis, 1 chainctl running.
 ================================================================================
 
 ## 2026-08-13 -- #13 STORE REFACTOR RECONCILED + root-caused a REAL corrupted-filename bug; full suite back to 283 PASS-equiv (22 green, 0 FAIL)

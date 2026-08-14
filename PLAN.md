@@ -383,9 +383,22 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   VERIFIED. check_chain audits; chainctl (8w, 16k chunks, audited) drives the
   full forward download from the archive's current tip.
 - RESUME: unified_ibd reads highest non-zero index record and resumes from tip+1.
-- KNOWN: archive currently starts at height ~30000 (test data), so heights
-  0..~29999 are NOT downloaded. BACKFILL those after the forward download
-  reaches the tip: run unified_ibd <dir> 8 0 37999 (disjoint, positional-
-  idempotent, will not disturb the already-present 30000-37999).
+- ARCHIVE IS NOW CONTIGUOUS FROM GENESIS: heights [0, ~219k] verified contiguous
+  (earlier 0..29999 backfill note is obsolete -- the forward download reached
+  the origin and the archive has no holes at the start).
+
+### WALLET (IN PROGRESS) -- BIP32 key derivation in ASM
+- All wallet crypto primitives are pure x86-64 ASM and verified byte-exact.
+- bitcoin_keys.asm: scalar_to_pubkey (scalar -> 33-byte compressed pubkey via
+  point_scalar_mul + fe_inv affinization + BE serialization).
+- bitcoin_bip32.asm: bip32_master (HMAC-SHA512 "Bitcoin seed") and
+  bip32_ckd_priv (hardened + normal CKDpriv, mod-n addition with 257-bit
+  carry, 0<k<n validation).
+- Verified: test_bip32_chain walks the OFFICIAL BIP32 test vector-1 chain
+  m -> m/0' -> m/0'/1 -> m/0'/1/2' -> m/0'/1/2'/2 -> .../1000000000, byte-exact
+  at every step (keys + chain codes). 31/31 harnesses green.
+- NEXT (natural wallet steps): (a) BIP32 derive path + ext-key (xprv) encode,
+  (b) BIP39 mnemonic<->seed, (c) address generation: pubkey -> HASH160 ->
+  base58check P2PKH (needs RIPEMD-160 + base58 in ASM).
 
 ===== END PLAN =====
