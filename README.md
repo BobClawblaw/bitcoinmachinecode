@@ -207,6 +207,17 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   (compressed pubkey + address), and `sign <tx><key><i>` (legacy SIGHASH_ALL P2PKH
   sign, deterministic nonce k=sha256d(z||priv), low-S DER). `test_wallet` 9/9,
   plus an independent Python verification of the signature.
+- **BIP32 full-path derivation + extended keys (xprv/xpub)** (`asm/bitcoin_bip32.asm`)
+  — three new functions on top of the verified `bip32_master`/`bip32_ckd_priv`:
+  `bip32_derive_path` (derive a full path `m/44'/0'/0'/0/0` from a seed in one
+  call), `bip32_fingerprint` (HASH160(pub)[0..4], the BIP32 parent fingerprint),
+  and `bip32_extkey_serialize` (build the 78-byte xprv/xpub payload). Combined
+  with the verified base58check encoder this yields real `xprv`/`xpub` strings,
+  tying key -> address -> extended key together. `test_bip32_extkey` verifies the
+  BIP32 vector-1 chain end, a BIP44 and a BIP84 path, and the master extended
+  keys byte-exact against an independent `bip32` Python oracle. (The base58
+  encoder's digit-work buffers were enlarged to hold 78-byte payloads; the
+  25-byte address path is unchanged and still green.)
 - **bech32 / bech32m codec** (`asm/bech32.asm`) — BIP173/350 address codec
   (`bech32_polymod` 30-bit CRC, create/verify checksum with the XOR-1 vs
   0x2bc830a3 switch, 8<->5 bit regroup, encode/decode), verified against every

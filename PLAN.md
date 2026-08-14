@@ -422,22 +422,24 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
 ### WALLET (DONE) -- key derivation, addresses, signing, and a CLI in ASM
 - All wallet crypto primitives are pure x86-64 ASM and verified byte-exact.
 - bitcoin_keys.asm: scalar_to_pubkey (scalar -> 33-byte compressed pubkey).
-- bitcoin_bip32.asm: bip32_master + bip32_ckd_priv (hardened + normal).
+- bitcoin_bip32.asm: bip32_master + bip32_ckd_priv (hardened + normal), plus
+  bip32_derive_path (full path), bip32_fingerprint, bip32_extkey_serialize.
 - ripemd160.asm: full RIPEMD-160 (the HASH160 second half). Verified against
   standard vectors + padding boundaries + multi-block lengths vs pycryptodome.
 - bitcoin_addr.asm: hash160(RIPEMD160(SHA256)) and base58check_encode for
   P2PKH addresses. Verified real mainnet addresses for G and the Bitcoin-wiki
   pubkey (1BgGZ9tc..., 1PRTTaJes...), byte-exact.
-- FULL FLOW COMPLETE in ASM: BIP32 master -> CKDpriv -> secp256k1 pubkey ->
-  HASH160 (SHA256+RIPEMD160) -> base58check -> mainnet P2PKH address.
-  33/33 harnesses green.
+- FULL FLOW COMPLETE in ASM: BIP32 master -> full-path CKDpriv -> secp256k1
+  pubkey -> HASH160 -> base58check -> P2PKH address, and the full-path node ->
+  BIP32 extended key (xprv/xpub base58check). Verified against the independent
+  `bip32` Python oracle (vector-1 chain, BIP44/BIP84, master extkeys).
 - **Wallet CLI DONE** (`asm/wallet_core.c` + `asm/daemon/wallet_cli.c`):
   `gen` | `addr <keyhex>` | `sign <tx><key><i>` (legacy SIGHASH_ALL, low-S).
   The receive/address and signing flow is now real; see the WALLET/VALIDATION
   BRIDGE section above for the full picture.
-- NEXT (natural wallet steps, not yet started): (a) BIP32 derive full path +
-  extended key (xprv/xpub) encoding, (b) BIP39 mnemonic<->seed, (c) P2SH/multisig.
-  P2SH/multisig (OP_CHECKMULTISIG) is also on the kanban backlog.
+- NEXT (natural wallet steps, not yet started): (b) BIP39 mnemonic<->seed.
+  (BIP32 full-path + extended-key xprv/xpub encoding is DONE; P2SH/multisig
+  (OP_CHECKMULTISIG) is also DONE -- see the compliance table above.)
 
 ### 11. COMPLIANCE TARGET — "fully compliant" is a DEFINED, MEASUREABLE SCOPE
 
@@ -462,7 +464,7 @@ result on shared blocks/txs must be bit-identical or the node must refuse
 | P2PKH spend validation (sighash + ecdsa + UTXO in-mem) | DONE | wallet/validation bridge |
 | mempool policy / RBF / fee | DONE | bitcoin_mempool_policy.c |
 | P2SH / multisig (OP_CHECKMULTISIG) | DONE | bitcoin_multisig.asm |
-| BIP32 full-path + xprv/xpub | queued (card 2) | this batch |
+| BIP32 full-path + xprv/xpub | DONE | bitcoin_bip32.asm (derive_path/fingerprint/extkey_serialize) |
 | BIP39 mnemonic <-> seed | queued (card 3) | this batch |
 | Persistent UTXO to disk | queued (card 4) | this batch |
 | sighash_all real-spend end-to-end | queued (card 5) | this batch |

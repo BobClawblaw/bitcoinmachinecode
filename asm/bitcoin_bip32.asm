@@ -1,8 +1,14 @@
 ; ============================================================================
 ; bitcoin_bip32.asm -- BIP32 hierarchical-deterministic key management, x86-64.
-;   First wallet-derivation piece: the BIP32 MASTER key.
+;   Wallet-derivation pieces built on the verified secp256k1/HMAC/SHA-512 core:
 ;
-;   master = HMAC-SHA512(key = "Bitcoin seed" (12 bytes), data = seed)
+;   bip32_master          : HMAC-SHA512("Bitcoin seed") -> master (k, c)
+;   bip32_ckd_priv        : child private key (hardened + normal)
+;   bip32_derive_path     : derive a FULL path (m/44'/0'/...) from a seed
+;   bip32_fingerprint     : HASH160(pub)[0..4] (BIP32 parent fingerprint)
+;   bip32_extkey_serialize: build the 78-byte extended-key (xprv/xpub) payload
+;
+;   master     = HMAC-SHA512(key = "Bitcoin seed" (12 bytes), data = seed)
 ;     -> first 32 bytes  = master private key k (big-endian scalar)
 ;     -> last  32 bytes  = master chain code c
 ;
@@ -27,6 +33,7 @@ section .text
 extern hmac_sha512
 extern scalar_to_pubkey
 extern scalar_small_nonzero
+extern hash160
 
 ; ============================================================================
 ; bip32_master(k[32], c[32], seed, seedlen)
@@ -302,6 +309,225 @@ bip32_ckd_priv:
     xor  eax, eax
 .done:
     add  rsp, 0x150
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; bip32_derive_path(k[32], c[32], seed, seedlen, indexes[4*n], n)
+;   Derive a FULL BIP32 path from a seed, on top of the verified
+;   bip32_master + bip32_ckd_priv primitives:
+;       node = bip32_master(k,c,seed,seedlen)
+;       for i in 0..n-1: node = bip32_ckd_priv(k,c, k,c, indexes[i])
+;   `indexes` is an array of n u32 child indexes (native little-endian, as
+;   declared by a C unsigned[] caller; hardened indexes are already OR'd with
+;   0x80000000 -- i.e. the caller resolves the path "m/44'/0'/0'/0/0" into the
+;   u32 array {0x8000002c, 0x80000000, ...}). n may be 0 (master only). In-place
+;   (k,c are both input and output) is safe because bip32_ckd_priv snapshots
+;   k_par/c_par to stack locals before writing its outputs. Returns 1 on
+;   success, 0 on an invalid derived key.
+;
+; PUBLIC ABI (System V AMD64)
+;   int bip32_derive_path(u8 k[32], u8 c[32], const u8* seed, i64 seedlen,
+;                         const u32* indexes, i64 n)
+; ============================================================================
+global bip32_derive_path
+bip32_derive_path:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x50
+    mov  rbx, rdi            ; k
+    mov  r12, rsi            ; c
+    mov  r13, rdx            ; seed
+    mov  r14, rcx            ; seedlen
+    mov  [rbp-0x30], r8      ; indexes
+    mov  [rbp-0x38], r9      ; n
+
+    ; ---- master ----
+    mov  rdi, rbx            ; k
+    mov  rsi, r12            ; c
+    mov  rdx, r13            ; seed
+    mov  rcx, r14            ; seedlen
+    call bip32_master
+    test eax, eax
+    jz   .fail
+
+    ; ---- walk the path ----
+    xor  r15d, r15d          ; cur = 0
+.loop:
+    mov  rax, [rbp-0x38]     ; n
+    cmp  r15, rax
+    jae  .ok
+    ; load index at indexes[cur]. The array is DECLARED in C as unsigned[]
+    ; (native little-endian dwords), so a plain mov gives the value directly.
+    mov  rax, [rbp-0x30]
+    mov  ecx, r15d
+    shl  ecx, 2
+    mov  r8d, dword [rax+rcx]
+    ; in-place child derivation: (k,c) = ckd_priv(k,c,k,c,index)
+    mov  rdi, rbx            ; k out
+    mov  rsi, r12            ; c out
+    mov  rdx, rbx            ; k_par
+    mov  rcx, r12            ; c_par
+    call bip32_ckd_priv      ; r8d = index (read at callee entry)
+    test eax, eax
+    jz   .fail
+    inc  r15d
+    jmp  .loop
+.ok:
+    mov  eax, 1
+    jmp  .done
+.fail:
+    xor  eax, eax
+.done:
+    add  rsp, 0x50
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; bip32_fingerprint(fp[4], pub[33])
+;   BIP32 parent fingerprint = the first 4 bytes of HASH160(compressed pubkey).
+;   Used to tie a derived node back to its parent in extended keys / HD paths.
+;
+; PUBLIC ABI
+;   void bip32_fingerprint(u8 fp[4], const u8 pub[33])
+; ============================================================================
+global bip32_fingerprint
+bip32_fingerprint:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    sub  rsp, 0x30           ; h160 at [rbp-0x20]
+    mov  rbx, rdi            ; fp
+    mov  r12, rsi            ; pub
+    ; hash160(h160, pub, 33)
+    lea  rdi, [rbp-0x20]
+    mov  rsi, r12
+    mov  rdx, 33
+    call hash160
+    mov  eax, [rbp-0x20]
+    mov  [rbx], eax
+    add  rsp, 0x30
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; bip32_extkey_serialize(ser[78], is_priv, depth, parent_fp[4], child, c[32],
+;                        key[], keylen)
+;   Build the 78-byte BIP32 extended-key payload (the thing that gets
+;   base58check-encoded into xprv / xpub):
+;       ser[0..3]   = version   0x0488ADE4 (xprv) / 0x0488B21E (xpub)
+;       ser[4]      = depth
+;       ser[5..8]   = parent fingerprint (4 bytes, as given)
+;       ser[9..12]  = child number (u32, big-endian)
+;       ser[13..44] = chain code (32 bytes)
+;       ser[45..77] = key: 0x00 || key32 (is_priv, keylen=32)
+;                      or         pub33  (is_pub,  keylen=33)
+;   Returns 78. key/keylen are the 7th/8th args (on the stack).
+;
+; PUBLIC ABI
+;   int bip32_extkey_serialize(u8 ser[78], int is_priv, u8 depth,
+;                              const u8 parent_fp[4], u32 child,
+;                              const u8 c[32], const u8* key, i64 keylen)
+; ============================================================================
+global bip32_extkey_serialize
+bip32_extkey_serialize:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x40
+    mov  rbx, rdi            ; ser
+    mov  r12d, esi           ; is_priv
+    mov  r13b, dl            ; depth
+    mov  r14, rcx            ; parent_fp
+    mov  r15d, r8d           ; child
+    mov  [rbp-0x30], r9      ; c
+
+    ; ---- version (4 big-endian bytes: 0x0488ADE4 xprv / 0x0488B21E xpub) ----
+    test r12d, r12d
+    jz   .v_pub
+    mov  byte [rbx+0], 0x04
+    mov  byte [rbx+1], 0x88
+    mov  byte [rbx+2], 0xAD
+    mov  byte [rbx+3], 0xE4
+    jmp  .v_done
+.v_pub:
+    mov  byte [rbx+0], 0x04
+    mov  byte [rbx+1], 0x88
+    mov  byte [rbx+2], 0xB2
+    mov  byte [rbx+3], 0x1E
+.v_done:
+    mov  byte [rbx+4], r13b     ; depth
+    mov  eax, [r14]             ; parent fingerprint (4 bytes, verbatim)
+    mov  [rbx+5], eax
+    ; ---- child number, big-endian ----
+    mov  eax, r15d
+    mov  byte [rbx+12], al
+    shr  eax, 8
+    mov  byte [rbx+11], al
+    shr  eax, 8
+    mov  byte [rbx+10], al
+    shr  eax, 8
+    mov  byte [rbx+9], al
+    ; ---- chain code (32 bytes) ----
+    mov  rax, [rbp-0x30]
+    lea  rdi, [rbx+13]
+    mov  rsi, rax
+    mov  ecx, 32
+    rep  movsb
+    ; ---- key data ----
+    mov  rax, [rbp+16]          ; key ptr
+    mov  ecx, [rbp+24]          ; keylen
+    test r12d, r12d
+    jz   .k_pub
+    ; priv: ser[45]=0x00, then 32-byte key at 46..77
+    mov  byte [rbx+45], 0
+    lea  rdi, [rbx+46]
+    mov  rsi, rax
+    xor  r8d, r8d
+.kpriv:
+    cmp  r8, rcx
+    jae  .done
+    mov  al, byte [rsi+r8]
+    mov  byte [rdi+r8], al
+    inc  r8
+    jmp  .kpriv
+.k_pub:
+    ; pub: 33-byte compressed pubkey at 45..77
+    lea  rdi, [rbx+45]
+    mov  rsi, rax
+    xor  r8d, r8d
+.kpub:
+    cmp  r8, rcx
+    jae  .done
+    mov  al, byte [rsi+r8]
+    mov  byte [rdi+r8], al
+    inc  r8
+    jmp  .kpub
+.done:
+    mov  eax, 78
+    add  rsp, 0x40
     pop  r15
     pop  r14
     pop  r13

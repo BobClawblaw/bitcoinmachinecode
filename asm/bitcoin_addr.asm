@@ -95,9 +95,14 @@ base58check_encode:
     push r13
     push r14
     push r15
-    sub  rsp, 0xc0           ; locals [rbp-0x30..-0xe8], buffers fully below -0x28
-                             ; data[0x58..0x40] checksum[0x78..0x5a] work[0xa0..0x88]
-                             ; digitRev[0xc8..0xa1]  -- all non-overlapping
+    sub  rsp, 0x200           ; locals [rbp-0x30..-0x228], buffers below -0x28
+                             ; data[0x58..0x07] checksum[0xf0..0xd1] work[0x140..0xef]
+                             ; digitRev[0x1c0..0x14d]
+                             ; Sized for the LARGEST payload we encode: the 78-byte
+                             ; BIP32 extended key (xprv/xpub) -> data is 82 bytes,
+                             ; up to ~112 base58 digits (40 was only enough for
+                             ; 25-byte P2PKH addresses and overflowed on xprv/xpub).
+                             ; All buffers non-overlapping.
 
     mov  r13, rdi            ; out
     ; persistent regs: out(rbx), payload(r14), paylen(r15) -- all callee-saved
@@ -117,13 +122,13 @@ base58check_encode:
     inc  r11
     jmp  .cp1
 .cp1_done:
-    ; checksum = sha256d(out=[rbp-0x78], in=payload(r14), len(r15))
-    lea  rdi, [rbp-0x78]
+    ; checksum = sha256d(out=[rbp-0xf0], in=payload(r14), len(r15))
+    lea  rdi, [rbp-0xf0]
     mov  rsi, r14
     mov  rdx, r15
     call sha256d
     ; append first 4 checksum bytes at data+paylen
-    lea  rsi, [rbp-0x78]
+    lea  rsi, [rbp-0xf0]
     lea  rdi, [rbp-0x58]
     add  rdi, r15
     mov  rax, [rsi]
@@ -154,8 +159,8 @@ base58check_encode:
     inc  r11
     jmp  .ez
 .ez_done:
-    ; ---- copy data to work [rbp-0xa0], then repeatedly divide by 58 ----
-    lea  rdi, [rbp-0xa0]
+    ; ---- copy data to work [rbp-0x140], then repeatedly divide by 58 ----
+    lea  rdi, [rbp-0x140]
     lea  rsi, [rbp-0x58]
     mov  rcx, r15
     xor  r8, r8
@@ -170,8 +175,8 @@ base58check_encode:
     mov  r9, r15              ; length of work number
     xor  r14, r14             ; ndigits (in r14; r14's payload value no longer needed)
 .divloop:
-    ; is work [[rbp-0xa0]..+r9) all zero?
-    lea  rsi, [rbp-0xa0]
+    ; is work [[rbp-0x140]..+r9) all zero?
+    lea  rsi, [rbp-0x140]
     xor  r11, r11
     xor  rcx, rcx
 .iszero:
@@ -190,7 +195,7 @@ base58check_encode:
     ; final remainder is the base58 digit for this pass.
     xor  eax, eax             ; rem
     xor  r11, r11             ; index
-    lea  rsi, [rbp-0xa0]
+    lea  rsi, [rbp-0x140]
 .dv:
     cmp  r11, r9
     jae  .dv_done
@@ -208,15 +213,15 @@ base58check_encode:
     ; eax = remainder = least-significant base58 digit now
     lea  r8, [ALPHABET]
     movzx ecx, byte [r8 + rax]      ; base58 char
-    lea  r8, [rbp-0xc8]             ; digitRev buffer (accumulate LSB-first)
+    lea  r8, [rbp-0x1c0]             ; digitRev buffer (accumulate LSB-first)
     mov  [r8 + r14], cl
     inc  r14                        ; ndigits++
     jmp  .divloop
 .divide_done:
-    ; reverse-copy ndigits(r14) chars from [rbp-0xc8] into out after the '1's
+    ; reverse-copy ndigits(r14) chars from [rbp-0x1c0] into out after the '1's
     mov  rdi, rbx
     add  rdi, r12                   ; past the leading '1's
-    lea  rsi, [rbp-0xc8]
+    lea  rsi, [rbp-0x1c0]
     mov  r8, r14                    ; count
 .rv:
     test r8, r8
@@ -228,7 +233,7 @@ base58check_encode:
     jmp  .rv
 .rv_done:
     mov  byte [rdi], 0
-    add  rsp, 0xc0
+    add  rsp, 0x200
     pop  r15
     pop  r14
     pop  r13
