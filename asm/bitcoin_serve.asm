@@ -30,6 +30,7 @@ default rel
     extern idx_get
     extern node_serve_block
     extern node_log_event
+    extern block_hash
 section .data
 align 16
 pl_buf:    times (8<<20) db 0     ; receive buffer
@@ -39,6 +40,7 @@ cn_pong:   db "pong",0
 cn_addr:   db "addr",0
 cn_block:  db "block",0
 cn_head:   db "headers",0
+cn_inv:    db "inv",0
 amr_ab:    times 64 db 0
 ah_buf:    times (1000*30+8) db 0
 src_buf:   times (1000*18) db 0
@@ -121,6 +123,8 @@ node_serve_loop:
     je   .maybe_getdata
     cmp  dword [s_cmd], 0x68746567   ; "geth..." (getheaders)
     je   .maybe_getheaders
+    cmp  dword [s_cmd], 0x62746567   ; "getb..." (getblocks)
+    je   .maybe_getblocks
     cmp  dword [s_cmd], 0x00766e69   ; "inv"
     je   .do_inv
     jmp  .next
@@ -423,6 +427,142 @@ node_serve_loop:
     mov  rdi, r12
     lea  rsi, [cn_head]
     mov  rdx, 7
+    lea  rcx, [hp_buf]
+    call p2p_write
+    jmp  .next
+
+.maybe_getblocks:
+    ; "getblocks" = g e t b l o c k s. dword0 dispatch already guarantees "getb";
+    ; confirm cmd[4..7]="lock" (getheaders has "ead\u...." there). Note we must
+    ; compare all FOUR bytes: 'k' sits at cmd[7], so the LE dword is 0x6b636f6c.
+    cmp  dword [s_cmd+4], 0x6b636f6c ; "lock"
+    jne  .next
+    ; payload: version(4) count(1) locator-hash(32) stop(32) ; locator at pl+5
+    mov  rax, [s_plen]
+    cmp  rax, 37
+    jb   .gb_from0
+    mov  rdi, [s_htidx]
+    lea  rsi, [pl_buf+5]
+    lea  rdx, [s_fh]
+    call idx_get
+    test rax, rax
+    jz   .gb_from0
+    mov  rax, [s_fh]
+    inc  rax
+    jmp  .gb_havefrom
+.gb_from0:
+    xor  eax, eax
+.gb_havefrom:
+    mov  [s_fh], rax        ; from
+    ; tip = st[24]
+    mov  eax, [r14+24]
+    mov  [s_cnt], rax
+    mov  rax, [s_fh]
+    cmp  rax, [s_cnt]
+    ja   .gb_empty
+    ; build inv: reserve 3 bytes for count varint at hp_buf[0..2], entries at
+    ; hp_buf[3..]. Each entry = type u32 (2=MSG_BLOCK) + hash32 (LE wire order).
+    mov  qword [s_p], 3
+    mov  qword [s_n], 0
+.gbl_loop:
+    mov  rax, [s_fh]
+    cmp  rax, [s_cnt]
+    ja   .gb_done
+    mov  rax, [s_n]
+    cmp  rax, 500
+    jae  .gb_done
+    ; node_serve_block(st, h, sb_buf, cap) -> rax = len
+    mov  rdi, r14
+    mov  rsi, [s_fh]
+    lea  rdx, [sb_buf]
+    mov  rcx, (8<<20)
+    call node_serve_block
+    test rax, rax
+    jle  .gb_done
+    ; block_hash(hh, sb_buf)
+    lea  rdi, [sb_buf+0x200000]  ; scratch hash slot inside sb_buf (see below)
+    lea  rsi, [sb_buf]
+    call block_hash
+    ; reverse the hash into hp_buf at offset [s_p]+4 (after the type u32)
+    mov  rdx, [s_p]
+    add  rdx, 4
+    ; type = 2 (MSG_BLOCK) at hp_buf[rdx-4 .. rdx-1]
+    mov  dword [hp_buf + rdx - 4], 2
+    lea  r10, [sb_buf + 0x200000 + 31]  ; last byte of the hash output
+    lea  r11, [hp_buf + rdx]            ; dest base (type u32 already written)
+    xor  ecx, ecx
+.gbl_rev:
+    cmp  rcx, 32
+    jae  .gbl_rev_done
+    mov  r9, rcx
+    neg  r9                  ; -rcx
+    mov  al, [r10 + r9]      ; sb_buf+0x200000+31-rcx  (base + index)
+    mov  [r11 + rcx], al     ; hp_buf+rdx+rcx
+    inc  rcx
+    jmp  .gbl_rev
+.gbl_rev_done:
+    add  qword [s_p], 36
+    mov  rax, [s_n]
+    inc  rax
+    mov  [s_n], rax
+    mov  rax, [s_fh]
+    inc  rax
+    mov  [s_fh], rax
+    jmp  .gbl_loop
+.gb_done:
+    ; emit canonical count varint from [s_n]
+    mov  rax, [s_n]
+    cmp  rax, 253
+    jae  .gb_varint16
+    ; compact entries from hp_buf+3 down to hp_buf+1, count byte at [0]
+    ; bytes = n*36
+    imul rax, 36
+    xor  rcx, rcx
+.gb_comp:
+    cmp  rcx, rax
+    jae  .gb_comp_done
+    mov  dl, [hp_buf + 3 + rcx]
+    mov  [hp_buf + 1 + rcx], dl
+    inc  rcx
+    jmp  .gb_comp
+.gb_comp_done:
+    mov  rax, [s_n]
+    mov  byte [hp_buf], al
+    mov  rax, [s_n]
+    imul rax, 36
+    add  rax, 1
+    mov  [s_p], rax        ; final len = 1 + n*36
+    jmp  .gb_send
+.gb_varint16:
+    mov  byte [hp_buf], 0xFD
+    mov  rax, [s_n]
+    mov  byte [hp_buf+1], al
+    shr  rax, 8
+    mov  byte [hp_buf+2], al
+    mov  rax, [s_n]
+    imul rax, 36
+    add  rax, 3
+    mov  [s_p], rax        ; final len = 3 + n*36
+.gb_send:
+    ; p2p_write(fd,"inv",3,hp_buf,s_p)
+    mov  r8d, [s_p]
+    mov  rdi, r12
+    lea  rsi, [cn_inv]
+    mov  rdx, 3
+    lea  rcx, [hp_buf]
+    call p2p_write
+    ; count served into s_served (like blocks served)
+    mov  rax, [s_served]
+    add  rax, [s_n]
+    mov  [s_served], rax
+    jmp  .next
+.gb_empty:
+    ; send empty inv (count 0)
+    mov  byte [hp_buf], 0
+    mov  r8d, 1
+    mov  rdi, r12
+    lea  rsi, [cn_inv]
+    mov  rdx, 3
     lea  rcx, [hp_buf]
     call p2p_write
     jmp  .next
