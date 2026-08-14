@@ -98,3 +98,4 @@ asm/tests/test_sighash
 asm/tests/test_script
 asm/tests/test_p2pkh
 asm/tests/test_utxo
+asm/tests/test_txval
