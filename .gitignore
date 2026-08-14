@@ -95,3 +95,4 @@ asm/tests/test_mempool
 asm/tests/test_txtxid
 asm/tests/test_pubkey
 asm/tests/test_sighash
+asm/tests/test_script
