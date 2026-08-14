@@ -14,7 +14,7 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o sha512.o bitcoin_hmac.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o
+OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o
 
 # bitcoin_hash.asm (sha256d/block-hash/merkle/pow) depends on sha256.o
 HASHOBJS := sha256.o bitcoin_hash.o
@@ -146,6 +146,11 @@ ADMRGOBJS := bitcoin_addrmgr.o
 tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_addrmgr.c $(ADMRGOBJS)
 
+# bitcoin_keys.asm (secp256k1 pubkey derivation for wallet/BIP32).
+KEYSOBJS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o bitcoin_keys.o
+tests/test_keys: tests/test_keys.c $(KEYSOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_keys.c $(KEYSOBJS)
+
 # bitcoin_idx.asm: O(1) hash->height index for serving (standalone deps).
 IDXOBJS := bitcoin_idx.o
 tests/test_idx: tests/test_idx.c $(IDXOBJS)
@@ -164,6 +169,13 @@ tests/test_sha512: tests/test_sha512.c sha512.o
 HMACOBJS := sha512.o bitcoin_hmac.o
 tests/test_hmac: tests/test_hmac.c $(HMACOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_hmac.c $(HMACOBJS)
+
+# bitcoin_bip32.asm (BIP32 master + CKDpriv; secp256k1 + HMAC + SHA-512).
+BIP32OBJS := bitcoin_bip32.o bitcoin_hmac.o sha512.o bitcoin_keys.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o
+tests/test_bip32_master: tests/test_bip32_master.c $(BIP32OBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_bip32_master.c $(BIP32OBJS)
+tests/test_bip32_chain: tests/test_bip32_chain.c $(BIP32OBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_bip32_chain.c $(BIP32OBJS)
 
 # bitcoin_p2p.asm inv parsers (incoming protocol codecs).
 P2PINVOBS := bitcoin_p2p.o bitcoin_net.o bitcoin_hash.o sha256.o
@@ -184,7 +196,7 @@ tests/test_shared: tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv
+test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -195,6 +207,9 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_add
 	./tests/test_scalar
 	./tests/test_ecdsa
+	./tests/test_keys
+	./tests/test_bip32_master
+	./tests/test_bip32_chain
 	./tests/test_block
 	./tests/test_tx
 	./tests/test_net
@@ -219,4 +234,4 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_p2p_inv
 
 clean:
-	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2
+	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip32.o tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_...[truncated]
