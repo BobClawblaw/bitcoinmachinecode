@@ -335,6 +335,41 @@ Order of stages (each end-to-end verified before the next):
                         to a real inbound peer. Boot: seeds.txt tiered list +
                         daemon/seedprobe.c bounded prober. User-agent now
                         "Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x".
+  S5e ASM server serves the REAL chain over TCP (getdata + getheaders)  [DONE]
+                        (2026-08-14, commit 32279a0): the `serve` mode now
+                        answers a real peer end-to-end in assembly:
+                        node_accept_handshake -> node_serve_loop. Both service
+                        paths are verified LIVE against the on-disk archive
+                        (not fake blocks) with byte-exact results:
+                          * getdata: real mainnet block by hash served verbatim
+                            (height-1 215B, h=2 215B, h=50000 647B, plus h=100/200k
+                            multi-KB) requested-hash-match=YES over loopback TCP.
+                          * getheaders: canonical headers message whose
+                            CompactSize count MATCHES the payload, headers form a
+                            contiguous chain (each header's prev == double-sha256
+                            of the previous header), starting from the requested
+                            locator; verified for locators at h=1, h=200000,
+                            h=293300 (2000 headers each, count==2000).
+                        Five real bugs had to be found and fixed (only live
+                        testing exposed them): (a) daemon had no Makefile target
+                        (ad-hoc stale command); (b) server-test never built the
+                        hash index -> getdata could not resolve a hash;
+                        (c) build_hash_index keyed on display-BE but the wire
+                        hash is LE -> getdata missed; (d) getheaders dispatch
+                        checked cmd[4]/[8] for "head"/"ers" but getHEADers has
+                        "head" at cmd[3..6] ("g e t h e a d e r s") -> never
+                        dispatched; (e) open_file LEAKED an fd per serve and
+                        node_serve_block reopens per block -> EMFILE at ~1024
+                        serves truncated chain serving; close-before-open fixed
+                        it (node_serve_block now serves 0..309998). THE CRASH:
+                        the getheaders header copy called memcpy_len with the
+                        length in r8, but memcpy_len reads its length from RDX
+                        (verified by disassembly) -> it copied [s_p] bytes
+                        instead of 80, sweeping through .bss into the relocated
+                        stdout/stderr copies (0x143e6a0) and segfaulting main's
+                        printf. Found with a hardware write watchpoint on the
+                        stdout slot. Fixed: len goes in RDX. Server stays alive
+                        after serving; suite still 33/33 green.
   S6  bitcoin_cli.asm   CLI binary: talks to daemon over a local Unix socket
                         (or loopback TCP RPC), commands like: getblockcount,
                         getbestblockhash, getblockhash <h>, getblock <h|hash>,

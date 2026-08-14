@@ -114,6 +114,35 @@ now real too: a new asm `node_accept_handshake` answers a genuine inbound node's
 `version` and serves stored blocks (verified end to end), where the old serve
 path reused the outbound handshake and hung on an inbound peer.
 
+**ASM inbound server serves the REAL chain over TCP — getdata AND getheaders**
+(from commit `32279a0`): `bitcoind serve <dir> <port>` answers a peer entirely
+in assembly (`node_accept_handshake` -> `node_serve_loop`) against the on-disk
+archive. Verified LIVE over loopback against real mainnet data:
+- **getdata** — a real block by hash served verbatim (height-1 215 B, height-2
+  215 B, height-50000 647 B, plus multi-KB blocks at h=100k/200k),
+  `requested-hash-match=YES`.
+- **getheaders** — a *canonical* `headers` message whose CompactSize count
+  equals the payload length, whose headers form a contiguous chain (each
+  header's prev is the double-SHA256 of the previous header), starting from the
+  requested locator (verified for locators at h=1, h=200000, h=293300, 2000
+  headers each). The server stays alive after serving.
+
+The live work exposed and fixed five real bugs that fake-block unit tests could
+not catch: (1) the daemon had no Makefile target (ad-hoc stale command);
+(2) `server-test` never built the hash index, so getdata couldn't resolve a
+hash; (3) `build_hash_index` keyed on display (BE) order while the wire hash is
+LE, so getdata missed; (4) the getheaders dispatch checked `cmd[4]/[8]` for
+`"head"/"ers"` but getheaders is `g e t h e a d e r s` ("head" is at cmd[3..6])
+so it never fired; (5) `open_file` leaked an fd per serve (`EMFILE` at ~1024
+serves truncated the chain) — fixed with close-before-open, so serving spans
+heights 0..309998. **The crash** was the getheaders header copy passing the
+length in `r8` while `memcpy_len` reads its length from `RDX` (verified by
+disassembly): it copied `[s_p]` bytes instead of 80, sweeping through `.bss`
+into the relocated `stdout`/`stderr` copies (0x143e6a0) and segfaulting `main`'s
+printf. Found with a hardware write watchpoint on the stdout slot; fixed by
+loading the length into `RDX`. The test suite stays 33/33 green throughout.
+
+
 **Full-chain download into ONE directory (>= 8 DISTINCT peers, NO worker dirs):**
 `daemon/unified_ibd.c` downloads the whole chain in parallel — the asm
 `node_ibd_headers` persists the header chain, then each worker runs

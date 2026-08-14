@@ -7,6 +7,64 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## SESSION (2026-08-14): NODE SERVER SERVES THE REAL CHAIN (getdata + getheaders)
+Made the ASM inbound server genuinely answer peers against the real on-disk
+archive, by exercising `bitcoind serve <dir> <port>` live over loopback with
+REAL mainnet data (not fake blocks). That immediately surfaced five latent bugs
+(unit tests can't see them) plus a nasty segfault. All fixed & verified.
+
+Root-cause summary of the live session:
+1. daemon/bitcoind had NO Makefile target -- built by an ad-hoc gcc command that
+   silently went STALE. Added a real target linking every needed object at -O0.
+2. daemon server-test FAILED getdata->block: the socketpair serve path synced an
+   in-memory chain but never built the O(1) hash index. Added
+   build_inmem_hash_index(); server-test now passes (getdata-exact, getheaders,
+   ALL TESTS PASSED).
+3. build_hash_index() keyed the hash->height index with the WRONG byte order:
+   index.dat stores hashes in BE display order but the getdata/inv wire hash is
+   LE. getdata therefore missed every hash. Reverse before idx_put. After the
+   fix, live getdata served REAL blocks by hash: h=1 (215B), h=2 (215B),
+   h=50000 (647B) all requested-hash-match=YES.
+4. getheaders dispatch was OFF-BY-ONE: node_serve_loop checked cmd[4..8] for
+   "head"/"ers" but the message is "getheaders" = g-e-t-h-e-a-d-e-r-s, so "head"
+   is at cmd[3..6] and "ers\0" at cmd[7..10]. gdb proved the outer dispatch
+   matched (s_cmd=0x68746567) but the inner check always failed, so getheaders
+   never served. Fixed offsets to +3/+7.
+5. open_file LEAKED an fd on every call: node_serve_block opens the block file
+   fresh for each block served and never closed the previous cur_blk_fd. After
+   ~1024 serves the process hit EMFILE (open -> -24) and serving truncated at
+   ~1016 blocks / returned -1 for high heights (isolated test: store_get_file_fd
+   = -24 at h>=1019). Added close-before-open; node_serve_block now serves 3200+
+   consecutive heights and every height 0..309998.
+
+THE CRASH (segfault in main's printf, stdout/stderr=null, main's r14 held the
+ascii "(serve mode"): the getheaders header copy called memcpy_len with the
+length in r8, but memcpy_len reads its LENGTH from RDX (confirmed by
+disassembly: `cmp %rdx,%rcx`). So it copied [s_p] (the growing page offset)
+bytes instead of 80, sweeping through hp_buf and past .bss into the relocated
+stdout/stderr copies (0x143e6a0 // stdout, 0x143e6c0 // stderr), zeroing libc
+stdout/stderr and crashing the print after node_serve_loop returned. Found with
+a HARDWARE WRITE WATCHPOINT on the stdout slot -> caught the exact corrupting
+instruction (memcpy_len.c at 0x40823b doing `inc %rcx` as it walked over the
+slot). Fixed: load the 80-byte header length into RDX. Server stays alive.
+
+getheaders count now derives from the byte pointer (the loop counter rcx was
+clobbered by memcpy_len/node_serve_block) and emits a CANONICAL CompactSize
+varint (0xFD+2-byte for count>=253, single byte with headers compacted down
+otherwise). Serving loop tracks height/count in statics (immune to callee
+clobbering).
+
+VERIFIED LIVE after the fixes (port 8355, server stayed ALIVE):
+- getheaders h=1 locator: 2000 headers, count-varint(size3)=2000, inferred-from-
+  len=2000 MATCH=YES, chainlink=True (each header's prev == double-sha256 of the
+  previous), hdr0.prev == the h=1 locator (serves from height 2). Same for
+  locators at h=200000 and h=293300.
+- getdata still correct.
+
+No regression: make test 33/33 green. Commits pushed (32279a0 for the code, docs
+in this session). Downloader healthy: ~309,012 stored (99.68%), near tip.
+================================================================================
+
 ## SESSION (2026-08-13): WALLET KEY DERIVATION IN ASM (BIP32)
 Reached the wallet stage. Built two new verified primitives in pure x86-64:
 
