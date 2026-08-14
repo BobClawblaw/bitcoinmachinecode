@@ -23,9 +23,14 @@
 
     section .bss
 align 16
+global elem_tmp0, elem_tmp1, elem_tmp2, elem_tmp3
 elem_tmp0:  resb ELEM_SIZE
 elem_tmp1:  resb ELEM_SIZE
+elem_tmp2:  resb ELEM_SIZE
+elem_tmp3:  resb ELEM_SIZE
 scriptnum_buf: resb 16
+global scriptnum_buf
+global snum_overflow
 snum_overflow: resq 1
 
 ; vfExec condition stack
@@ -478,7 +483,7 @@ get_op:
     inc   r13
     ; if opcode > OP_PUSHDATA4 (0x4e) -> not a push
     cmp   eax, 0x4e
-    ja    .done               ; plain opcode
+    ja    .plain              ; plain opcode
     ; it's a push: determine nSize
     xor   edx, edx
     cmp   eax, 0x4c
@@ -493,6 +498,9 @@ get_op:
     mov   edx, [r13]          ; LE 4-byte
     add   r13, 4
     jmp   .sized
+.plain:
+    xor   edx, edx            ; non-push: pushlen = 0
+    jmp   .done
 .direct:
     mov   rdx, rax
     jmp   .sized
@@ -517,6 +525,7 @@ get_op:
     ; opcode stays the original (in eax)
 .done:
     mov   [r12], r13          ; *pc = advanced
+    inc   rax                 ; return opcode+1 (so OP_0=0x00 -> rax=1, distinct from fail 0)
     pop   r13
     pop   r12
     pop   rbx
@@ -773,4 +782,12 @@ stack_insert_index:
     pop   r14
     pop   r13
     pop   r12
+    ret
+
+; ============================================================================
+; vfexec_sp_reset() -- zero the condition-stack pointer (start of a script eval)
+; ============================================================================
+global vfexec_sp_reset
+vfexec_sp_reset:
+    mov   qword [rel vfexec_sp], 0
     ret
