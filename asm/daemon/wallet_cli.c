@@ -42,6 +42,7 @@ extern long wallet_listunspent_entry(char* out, long cap,
                                      const unsigned char txid[32], unsigned long index,
                                      unsigned long long value,
                                      const unsigned char* script, unsigned long slen);
+extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 /* wallet address-type enum mirrors (asm/wallet_core.c) */
 #define WAL_ADDR_INVALID 0
@@ -292,6 +293,24 @@ static int cmd_listunspent(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_decoderawtx(int argc, char** argv) {
+    /* usage: wallet_cli decoderawtransaction <tx_hex> */
+    if (argc < 3) { fprintf(stderr, "usage: wallet_cli decoderawtransaction <tx_hex>\n"); return 2; }
+    int hl = (int)strlen(argv[2]);
+    if (hl % 2 || hl / 2 > 16384) { fprintf(stderr, "bad tx hex\n"); return 1; }
+    unsigned char* tx = malloc((size_t)(hl / 2));
+    if (!tx) return 1;
+    if (!hex_to_bytes(tx, argv[2], hl)) { free(tx); fprintf(stderr, "bad tx hex\n"); return 1; }
+    char* dump = malloc(65536);
+    if (!dump) { free(tx); return 1; }
+    long n = wallet_decoderawtx(dump, 65536, tx, (unsigned long)(hl / 2));
+    free(tx);
+    if (n < 0) { free(dump); fprintf(stderr, "decoderaw: malformed tx\n"); return 1; }
+    printf("%s", dump);
+    free(dump);
+    return 0;
+}
+
 static int cmd_balance(int argc, char** argv) {
     /* usage: wallet_cli balance <value_sat> ...  -> sum of the wallet's UTXOs */
     if (argc < 3) {
@@ -357,7 +376,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -379,6 +398,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "getaddressinfo")) return cmd_validateaddress(argc, argv, 1);
     if (!strcmp(argv[1], "gettxout")) return cmd_gettxout(argc, argv);
     if (!strcmp(argv[1], "listunspent")) return cmd_listunspent(argc, argv);
+    if (!strcmp(argv[1], "decoderawtransaction")) return cmd_decoderawtx(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }

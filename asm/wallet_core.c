@@ -505,6 +505,73 @@ long wallet_listunspent_entry(char* out, long cap,
     return n;
 }
 
+/* ---- decoderawtransaction ------------------------------------------------ */
+
+/* Decode a raw serialized tx into a human-readable dump (bitcoin-cli
+ * decoderawtransaction parity): version, every input (prev txid, prev vout,
+ * scriptSig hex, sequence) with the input's address when the scriptSig is a
+ * P2PKH spend, every output (value, scriptPubKey hex + address), and locktime.
+ * Returns bytes written to out (not incl. NUL), or -1 if the tx is malformed.
+ * The witness flag is left 0 for a plain legacy decode (segwit handled by
+ * tx_parse in the wider validator; here we decode the legacy transaction
+ * layout). */
+long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen) {
+    unsigned long p = 0;
+    long n = 0;
+    unsigned long cc;
+    /* version */
+    if (txlen < 10) return -1;
+    unsigned long v = (unsigned long)tx[0] | ((unsigned long)tx[1] << 8)
+                    | ((unsigned long)tx[2] << 16) | ((unsigned long)tx[3] << 24);
+    n += snprintf(out + n, (size_t)(cap - n), "version: %lu\n", v);
+    p = 4;
+    unsigned long n_in = get_varint(tx + p, &cc); p += cc; if (p > txlen) return -1;
+    n += snprintf(out + n, (size_t)(cap - n), "num_inputs: %lu\n", n_in);
+    for (unsigned long i = 0; i < n_in; i++) {
+        if (p + 36 > txlen) return -1;
+        /* prev txid (wire = little-endian display reverse; show as stored) */
+        n += snprintf(out + n, (size_t)(cap - n), "  in[%lu]: prev_txid ", i);
+        for (int j = 31; j >= 0; j--) n += snprintf(out + n, (size_t)(cap - n), "%02x", tx[p + j]);
+        unsigned long pv = (unsigned long)tx[p+32] | ((unsigned long)tx[p+33] << 8)
+                         | ((unsigned long)tx[p+34] << 16) | ((unsigned long)tx[p+35] << 24);
+        n += snprintf(out + n, (size_t)(cap - n), " prev_vout %lu\n", pv);
+        p += 36;
+        unsigned long sl = get_varint(tx + p, &cc); p += cc; if (p + sl > txlen) return -1;
+        n += snprintf(out + n, (size_t)(cap - n), "       scriptSig[%lu]: ", sl);
+        for (unsigned long j = 0; j < sl; j++) n += snprintf(out + n, (size_t)(cap - n), "%02x", tx[p + j]);
+        n += snprintf(out + n, (size_t)(cap - n), "\n");
+        p += sl;
+        if (p + 4 > txlen) return -1;
+        unsigned long seq = (unsigned long)tx[p] | ((unsigned long)tx[p+1] << 8)
+                          | ((unsigned long)tx[p+2] << 16) | ((unsigned long)tx[p+3] << 24);
+        p += 4;
+        n += snprintf(out + n, (size_t)(cap - n), "       sequence: %lu\n", seq);
+    }
+    if (p >= txlen) return -1;
+    unsigned long n_out = get_varint(tx + p, &cc); p += cc; if (p > txlen) return -1;
+    n += snprintf(out + n, (size_t)(cap - n), "num_outputs: %lu\n", n_out);
+    for (unsigned long i = 0; i < n_out; i++) {
+        if (p + 8 > txlen) return -1;
+        unsigned long long val = 0;
+        for (int j = 0; j < 8; j++) val |= (unsigned long long)tx[p + j] << (8 * j);
+        p += 8;
+        unsigned long sl = get_varint(tx + p, &cc); p += cc; if (p + sl > txlen) return -1;
+        char addr[96]; addr[0] = 0;
+        wallet_script_to_address(addr, 96, tx + p, (long)sl);
+        n += snprintf(out + n, (size_t)(cap - n), "  out[%lu]: value %llu\n", i, val);
+        n += snprintf(out + n, (size_t)(cap - n), "       scriptPubKey[%lu]: ", sl);
+        for (unsigned long j = 0; j < sl; j++) n += snprintf(out + n, (size_t)(cap - n), "%02x", tx[p + j]);
+        if (addr[0]) n += snprintf(out + n, (size_t)(cap - n), " (address %s)\n", addr);
+        else         n += snprintf(out + n, (size_t)(cap - n), "\n");
+        p += sl;
+    }
+    if (p + 4 > txlen) return -1;
+    unsigned long lock = (unsigned long)tx[p] | ((unsigned long)tx[p+1] << 8)
+                       | ((unsigned long)tx[p+2] << 16) | ((unsigned long)tx[p+3] << 24);
+    n += snprintf(out + n, (size_t)(cap - n), "locktime: %lu\n", lock);
+    return n;
+}
+
 
 /* Sign a P2PKH tx: replace the scriptSig of input `input_index` with
  *   <push> <DER sig> 0x01 <push> <33-byte pubkey>

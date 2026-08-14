@@ -110,6 +110,7 @@ asm/tests/test_e2e_sighash
 asm/tests/test_send
 asm/tests/test_wrpc_addr
 asm/tests/test_wrpc_utxo
+asm/tests/test_wrpc_decoderaw
 asm/daemon/wallet_cli
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----
