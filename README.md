@@ -222,6 +222,32 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   outpoint/amount/change/fee, exact-balance send (no change output),
   underfunded and zero-fee REJECTED, send-vs-empty-UTXO rejected, and balance
   math — 6 cases / 18 checks ALL PASS.
+- **Wallet-core + CLI/RPC surface (bitcoin-cli parity, batch complete)** —
+  five cards (`t_wrpc_getaddr`..`t_wrpc_send`) delivered a coherent
+  Core-aligned command layer on top of the verified asm crypto (in
+  `asm/wallet_core.c` + `asm/daemon/wallet_cli.c` + harnesses
+  `test_wrpc_addr/utxo/decoderaw/sign/send`):
+  - `getnewaddress` / `getrawchangeaddress` — BIP84 `m/84'/0'/0'/i/0` and `.../1`
+    P2WPKH bech32 receive/change addresses from a seed.
+  - `getaddressinfo` / `validateaddress` — parse + classify base58check
+    (P2PKH/P2SH) and bech32 (P2WPKH/P2WSH) addresses, report version + hash.
+  - `listunspent` / `gettxout` — enumerate a wallet's unspent outputs and query
+    an outpoint, each with value + scriptPubKey + address.
+  - `decoderawtransaction` — full human-readable decode of a raw tx (version,
+    every input outpoint/scriptSig/sequence, outputs value/scriptPubKey/address,
+    locktime).
+  - `signrawtransactionwithkey` — sign selected inputs with provided private
+    keys (legacy SIGHASH_ALL, low-S), per-input key-ownership matching,
+    already-signed inputs left untouched, signed-input masking.
+  - `sendtoaddress` + `getbalance` — greedy input selection over the wallet's
+    own UTXOs, build + sign a send, report change/fee/new-balance; getbalance
+    sums the wallet UTXOs.
+  All five harnesses ALL PASS (known-vector addresses/base58 decode round-trip,
+  corrupt-checksum rejection, gettxout found/absent, full tx decode, two-key
+  sign ACCEPT/wrong-key REJECT/partial REJECT, greedy send + insufficient-funds +
+  exact-balance). This is the in-scope wallet-core + bitcoin-cli/RPC surface
+  (behavioral parity target); the full RPC transport and the remaining
+  address/UTXO-resolver commands remain for a later RPC/bitcoin-cli layer.
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine
@@ -352,7 +378,7 @@ bitcoinmachinecode/
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
-|       +-- wallet_cli.c      # wallet CLI: gen/addr/sign/send/balance + mnemonic/seed (recoverable)
+|       +-- wallet_cli.c      # wallet CLI: addr/sign/send/sendtoaddress/balance/getnewaddress/getrawchangeaddress/getaddressinfo/validateaddress/gettxout/listunspent/decoderawtransaction/signrawtransactionwithkey + mnemonic/seed
 |       +-- unified_ibd.c     # full-chain download into a unified single store (forward + backfill)
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
 |       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)

@@ -882,6 +882,72 @@ long wallet_send_tx(unsigned char* out_tx, long cap,
 }
 
 /* ============================================================================
+ * sendtoaddress -- pay `amount` to a destination from the wallet's own UTXOs,
+ * doing greedy input selection (Core sendtoaddress within our wallet model).
+ * Picks a subset of the wallet's UNSPENT P2PKH outputs (provided as a list of
+ * caller-obtained UTXOs: outpoint txid/index + value) whose combined value
+ * covers amount + fee, then builds + signs the send (wallet_send_tx) and
+ * reports the change and the selected-input count/value.
+ *
+ *   our_txid[][32] / our_idx[] / our_val[] -- the wallet's own unspent prevouts
+ *                                             (e.g. from gettxout/listunspent).
+ *   n_ours -- count.
+ *   to_h160[20] -- destination P2PKH address hash.
+ *   amount / fee -- recipient amount and exact miner fee (sat).
+ *   priv_be[32] -- the wallet spending key (owns every our P2PKH output).
+ *   out_tx / cap -- destination for the signed tx.
+ *   *out_change -- receives the change value (may be 0).
+ *   *out_picked / *out_picked_val -- receives how many inputs / total value
+ *                                    were selected (for reporting).
+ *
+ * Returns the signed tx length, or -1 if the wallet lacks enough UTXOs to cover
+ * amount + fee (insufficient funds) or a rebuild fails.
+ * ========================================================================== */
+long wallet_sendtoaddress(unsigned char* out_tx, long cap,
+                          const unsigned char our_txid[][32], const unsigned long* our_idx,
+                          const unsigned long long* our_val, unsigned long n_ours,
+                          const unsigned char to_h160[20],
+                          unsigned long long amount, unsigned long long fee,
+                          const unsigned char priv_be[32],
+                          unsigned long long* out_change,
+                          unsigned long* out_picked, unsigned long long* out_picked_val) {
+    size_t maxin = (n_ours < 16) ? n_ours : 16;
+    /* greedy: take the largest-value outputs first until they cover amount+fee */
+    unsigned long pick[16];
+    unsigned long np = 0;
+    unsigned long long sum = 0;
+    /* index sort desc by value */
+    unsigned long order[16];
+    for (unsigned long i = 0; i < n_ours && i < 16; i++) order[i] = i;
+    for (unsigned long i = 0; i < n_ours && i < 16; i++)
+        for (unsigned long j = i + 1; j < n_ours && j < 16; j++)
+            if (our_val[order[j]] > our_val[order[i]]) { unsigned long t = order[i]; order[i] = order[j]; order[j] = t; }
+    for (unsigned long k = 0; k < maxin && sum < amount + fee; k++) {
+        unsigned long i = order[k];
+        pick[np++] = i;
+        sum += our_val[i];
+    }
+    if (sum < amount + fee) return -1;        /* insufficient funds */
+
+    unsigned char (*tid)[32] = malloc(np * 32);
+    unsigned long* tidx = malloc(np * sizeof(unsigned long));
+    unsigned long long* tval = malloc(np * sizeof(unsigned long long));
+    if (!tid || !tidx || !tval) { free(tid); free(tidx); free(tval); return -1; }
+    for (unsigned long k = 0; k < np; k++) {
+        memcpy(tid[k], our_txid[pick[k]], 32);
+        tidx[k] = our_idx[pick[k]];
+        tval[k] = our_val[pick[k]];
+    }
+    long sl = wallet_send_tx(out_tx, cap, tid, tidx, tval, np, to_h160, amount, fee, priv_be, 0);
+    free(tid); free(tidx); free(tval);
+    if (sl < 0) return -1;
+    if (out_change) *out_change = sum - amount - fee;
+    if (out_picked) *out_picked = np;
+    if (out_picked_val) *out_picked_val = sum;
+    return sl;
+}
+
+/* ============================================================================
  * signrawtransactionwithkey -- sign selected inputs of an arbitrary raw tx with
  * provided private keys (legacy SIGHASH_ALL, low-S). Mirrors Core's
  * signrawtransactionwithkey within our P2PKH scope.

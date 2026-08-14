@@ -47,6 +47,15 @@ extern long wallet_signrawtx_withkeys(unsigned char* out_tx, long cap,
     const unsigned char* tx, unsigned long txlen,
     const unsigned char keys[][32], unsigned long nkeys,
     const unsigned char prevout[][25], unsigned long n_in, unsigned char* signed_mask_out);
+extern long wallet_sendtoaddress(unsigned char* out_tx, long cap,
+    const unsigned char our_txid[][32], const unsigned long* our_idx,
+    const unsigned long long* our_val, unsigned long n_ours,
+    const unsigned char to_h160[20],
+    unsigned long long amount, unsigned long long fee,
+    const unsigned char priv_be[32],
+    unsigned long long* out_change, unsigned long* out_picked,
+    unsigned long long* out_picked_val);
+extern unsigned long long wallet_get_balance(const unsigned long long* tval, unsigned long n);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 /* wallet address-type enum mirrors (asm/wallet_core.c) */
 #define WAL_ADDR_INVALID 0
@@ -354,6 +363,54 @@ static int cmd_signraw(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_sendtoaddress(int argc, char** argv) {
+    /* usage: wallet_cli sendtoaddress <priv_hex> <dest_h160_hex40> <amount>
+     *        <fee> <our_txid:idx:value> ...   (wallet's own UTXOs for selection) */
+    if (argc < 8) {
+        fprintf(stderr, "usage: wallet_cli sendtoaddress <priv_hex> <dest_h160_hex40> "
+                        "<amount_sat> <fee_sat> <our_txid:idx:value> [...more of your UTXOs]\n");
+        return 2;
+    }
+    unsigned char priv[32];
+    if (!hex_to_bytes(priv, argv[2], 64)) { fprintf(stderr, "sendtoaddress: bad key hex\n"); return 1; }
+    unsigned char to_h[20];
+    if (!hex_to_bytes(to_h, argv[3], 40)) { fprintf(stderr, "sendtoaddress: bad dest h160\n"); return 1; }
+    long long amount = strtoll(argv[4], NULL, 10);
+    long long fee    = strtoll(argv[5], NULL, 10);
+    int n = argc - 6;
+    unsigned char (*txt)[32] = malloc(n * 32);
+    unsigned long* idx = malloc(n * sizeof(unsigned long));
+    unsigned long long* val = malloc(n * sizeof(unsigned long long));
+    if (!txt || !idx || !val) { free(txt); free(idx); free(val); return 1; }
+    for (int i = 0; i < n; i++) {
+        char* s = argv[6 + i];
+        char* c1 = strchr(s, ':'); if (!c1) { fprintf(stderr, "input %d must be txid:idx:value\n", i); return 1; } *c1 = 0;
+        char* c2 = strchr(c1 + 1, ':'); if (!c2) { fprintf(stderr, "input %d must be txid:idx:value\n", i); return 1; } *c2 = 0;
+        if (!hex_to_bytes(txt[i], s, 64)) { fprintf(stderr, "input %d bad txid\n", i); return 1; }
+        idx[i] = (unsigned long)strtoul(c1 + 1, NULL, 10);
+        val[i] = (unsigned long long)strtoull(c2 + 1, NULL, 10);
+    }
+    unsigned long long bal_before = wallet_get_balance(val, (unsigned long)n);
+    unsigned char signedtx[16384];
+    unsigned long long change = 0, picked_val = 0; unsigned long picked = 0;
+    long sl = wallet_sendtoaddress(signedtx, sizeof signedtx, txt, idx, val, (unsigned long)n,
+                                   to_h, (unsigned long long)amount, (unsigned long long)fee,
+                                   priv, &change, &picked, &picked_val);
+    free(txt); free(idx); free(val);
+    if (sl < 0) { fprintf(stderr, "sendtoaddress: insufficient funds (balance %llu, need %lld+fee)\n", bal_before, amount >= 0 ? amount : 0); return 1; }
+    printf("balance: %llu\n", bal_before);
+    printf("amount: %lld\n", amount);
+    printf("fee: %lld\n", fee);
+    printf("change: %llu\n", change);
+    printf("inputs-used: %lu\n", picked);
+    printf("inputs-value: %llu\n", picked_val);
+    printf("new-balance: %llu\n", bal_before - (unsigned long long)amount - (unsigned long long)fee);
+    printf("signed-tx (%ld bytes):\n", sl);
+    print_hex(signedtx, (int)sl);
+    printf("\n");
+    return 0;
+}
+
 static int cmd_balance(int argc, char** argv) {
     /* usage: wallet_cli balance <value_sat> ...  -> sum of the wallet's UTXOs */
     if (argc < 3) {
@@ -419,7 +476,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -443,6 +500,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "listunspent")) return cmd_listunspent(argc, argv);
     if (!strcmp(argv[1], "decoderawtransaction")) return cmd_decoderawtx(argc, argv);
     if (!strcmp(argv[1], "signrawtransactionwithkey")) return cmd_signraw(argc, argv);
+    if (!strcmp(argv[1], "sendtoaddress")) return cmd_sendtoaddress(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }
