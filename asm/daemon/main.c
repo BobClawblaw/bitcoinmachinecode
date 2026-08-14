@@ -89,6 +89,27 @@ static int build_hash_index(void){
     return 0;
 }
 
+/* Build the hash->height index from the IN-MEMORY store (used where the chain
+ * lives only in store_buf, e.g. the socketpair server-test, not on disk yet).
+ * Iterates heights 0..tip, serves each block via node_serve_block, hashes its
+ * header with block_hash, and idx_put -> same O(1) hash index disk mode builds. */
+static int build_inmem_hash_index(void){
+    ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);
+    if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
+    idx_init(ht_idx, HT_SLOTS);
+    int tip = *(int*)(store_buf+24);        /* same tip source the rest of main.c uses */
+    static unsigned char sb[8<<20];
+    int hashed = 0;
+    for(int h=0; h<=tip; h++){
+        long L = node_serve_block(store_buf, h, sb, sizeof sb);
+        if(L<80){ continue; }                /* hole: skip, don't abandon the range */
+        unsigned char bhash[32]; block_hash(bhash, sb);
+        if(idx_put(ht_idx, bhash, h)) hashed++;
+    }
+    fprintf(stderr,"[inmem idx] indexed %d stored heights (tip %d)\n", hashed, tip);
+    return 0;
+}
+
 static int lsock(int port){
     int l = socket(AF_INET,SOCK_STREAM,0);
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port); a.sin_addr.s_addr=htonl(INADDR_ANY);
@@ -426,6 +447,9 @@ int main(int argc, char** argv){
         int tip=*(int*)(store_buf+24);
         printf("[server-test] synced ok=%ld blocks=%ld tip=%d\n", ok, cnt, tip);
         if(ok!=1||tip<6){ printf("TESTS FAILED (no chain)\n"); return 1; }
+        /* the chain lives in-memory only (not yet on disk), so build the O(1)
+         * hash->height index directly from store_buf rather than from disk */
+        if(build_inmem_hash_index()!=0){ printf("TESTS FAILED (hash index)\n"); return 1; }
 
         /* 2) socketpair: parent = server(serve_loop), child = test client */
         int sv[2]; if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)!=0){ perror("socketpair"); return 1; }

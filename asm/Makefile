@@ -191,6 +191,16 @@ P2PINVOBS := bitcoin_p2p.o bitcoin_net.o bitcoin_hash.o sha256.o
 tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 	$(CC) -no-pie -O0 -o $@ tests/test_p2p_inv.c $(P2PINVOBS)
 
+# daemon/bitcoind -- the runnable core node driver (sync/ibd/follow/serve/
+# server-test). This is a REAL target so the daemon never goes stale or suffers
+# a missing-object link, unlike the old ad-hoc manual gcc command. -O0 required
+# (an -O2 rebuild regressed lsock's bind to EFAULT).
+DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
+              bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
+              bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o
+daemon/bitcoind: daemon/main.c $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ daemon/main.c $(DAEMONOBJS)
+
 # pverify -- parallel block-chain verifier, machine-adaptive worker count.
 # Built at -O1 (not -O2/-O3): the deep asm call chain (cons_verify -> tx_parse
 # / sha256d) misparses a block when the C driver is compiled at aggressive -O2+,

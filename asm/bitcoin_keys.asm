@@ -198,3 +198,5 @@ scalar_to_pubkey:
     pop  rbx
     pop  rbp
     ret
+
+section .note.GNU-stack noalloc noexec nowrite progbits

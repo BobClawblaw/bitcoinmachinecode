@@ -218,3 +218,5 @@ node_log_str:
     pop  rbx
     pop  rbp
     ret
+
+section .note.GNU-stack noalloc noexec nowrite progbits
