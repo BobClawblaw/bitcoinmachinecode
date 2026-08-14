@@ -85,3 +85,9 @@ asm/bitcoin_hmac.o
 asm/tests/test_bip32_master
 asm/bitcoin_bip32.o
 asm/daemon/pverify
+
+# test-helper binaries (sources are tracked)
+asm/tests/gh_client
+asm/tests/live_serve_check
+asm/tests/test_gh_real
+asm/tests/test_nsb_range
