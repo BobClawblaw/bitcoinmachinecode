@@ -168,6 +168,51 @@ peerclaims table, and reuses the existing `headers.dat` (no rewrite) so it can
 run CONCURRENTLY with the forward chainctl — the two fill the archive from both
 ends with zero duplicate blocks.
 
+**Wallet / validation bridge (complete)** — the node now validates and signs real
+transactions in machine code, on top of the verified asm crypto. All of this was
+built as part of the same AI-authored assembly / C-verified work as the node:
+
+- **secp256k1 pubkey parse** (`asm/bitcoin_pubkey.asm`) — `fe_pow` +
+  `pubkey_parse`: recover affine curve coords (Qx,Qy) from a compressed (02/03) or
+  uncompressed (04) secp256k1 public key. Verified on G, non-residue rejection,
+  bad length, off-curve.
+- **Legacy SIGHASH_ALL preimage builder** (`asm/bitcoin_sighash.asm`) — builds
+  the unsigned-tx preimage for a target input, verified byte-exact vs Python on
+  1-in/1-out and 2-in/1-out txs.
+- **DER ECDSA sig parsing** (`asm/bitcoin_script.asm`) — `der_parse_sig`
+  (canonical DER sig -> r,s LE limbs via `be_to_limbs` + trailing SIGHASH type
+  byte), verified against a real `cryptography`-generated DER sig.
+- **End-to-end P2PKH spend validation** (`bitcoin_script.asm` `verify_p2pkh`) —
+  validates one P2PKH input in assembly: build SIGHASH_ALL, walk the scriptSig,
+  DER-parse the sig, parse the pubkey, `ecdsa_verify`. Valid spend -> 1, tampered
+  sig -> 0 (the `validation CAPSTONE`).
+- **UTXO set** (`asm/bitcoin_utxo.asm`) — in-memory Unspent-Transaction-Output
+  store: txid(32)+index(u32) -> (value, scriptPubKey) open-addressing table +
+  value/script blob. `utxo_init/put/get/del/count`. Verified: put/get round-trip,
+  dedup, distinct outpoints, spend/delete -> miss and double-spend -> miss, and a
+  300-entry probing/collision-wrap bulk round-trip.
+- **Whole-transaction validator** (`tests/test_txval.c`) — validates a full
+  serialized tx against the UTXO set: every input outpoint present+unspent
+  (double-spend guard), every input's P2PKH signature verifies via asm
+  `verify_p2pkh`, and sum(in) >= sum(out) (valid fee). Signed vectors are genuine
+  ECDSA spends (gen_txval_vectors.py). 6 cases: 2 valid multi-input txs +
+  double-spend / fee / sig(empty) / sig(wrong-key) negatives. Suite 40/40.
+- **Policy + RBF / fee handling** (`asm/bitcoin_mempool_policy.c`) — policy layer
+  over the structural mempool + UTXO set: fee computation + min-relay-fee floor,
+  double-spend rejection, BIP125 RBF (replacement fee math + eviction), ancestor/
+  descendant limits, and an EMA fee estimator. Verified against an independent
+  pure-Python oracle (4 scenarios / 21 steps). Full offline suite 35/35 green.
+- **Wallet CLI** (`asm/wallet_core.c` + `asm/daemon/wallet_cli.c`) —
+  `wallet_cli gen` (random keypair + P2PKH mainnet address), `addr <keyhex>`
+  (compressed pubkey + address), and `sign <tx><key><i>` (legacy SIGHASH_ALL P2PKH
+  sign, deterministic nonce k=sha256d(z||priv), low-S DER). `test_wallet` 9/9,
+  plus an independent Python verification of the signature.
+- **bech32 / bech32m codec** (`asm/bech32.asm`) — BIP173/350 address codec
+  (`bech32_polymod` 30-bit CRC, create/verify checksum with the XOR-1 vs
+  0x2bc830a3 switch, 8<->5 bit regroup, encode/decode), verified against every
+  authoritative BIP173/BIP350 vector plus exact real mainnet segwit addresses
+  (P2WPKH bc1qw508..., P2WSH bc1qrp33..., P2TR bech32m bc1p...).
+
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
 (verified by `test_addrmgr`). `daemon/crawler.c` / `daemon/addrgather.c` harvest
@@ -216,11 +261,19 @@ bitcoinmachinecode/
 |   +-- bitcoin_addrmgr.asm    # persisted peer address book + addr v1 codecs
 |   +-- bitcoin_idx.asm        # O(1) block hash->height index for serving (idx_*)
 |   +-- bitcoin_serve.asm      # inbound server message loop (node_serve_loop)
+|   +-- bitcoin_pubkey.asm     # fe_pow + pubkey_parse: secp256k1 pubkey de/compress
+|   +-- bitcoin_sighash.asm    # legacy SIGHASH_ALL preimage builder
+|   +-- bitcoin_script.asm     # der_parse_sig + verify_p2pkh (end-to-end P2PKH validate)
+|   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script)
+|   +-- bech32.asm             # BIP173/350 bech32/bech32m address codec
+|   +-- wallet_core.c          # wallet primitives glue over asm crypto
+|   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer over mempool + UTXO
 |   +-- build.sh              # assemble + build + run every verification harness
 |   +-- Makefile              # make asm | test | clean
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
+|       +-- wallet_cli.c      # wallet CLI: gen/addr/sign (SIGHASH_ALL P2PKH)
 |       +-- unified_ibd.c     # full-chain download into a unified single store (forward + backfill)
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
 |       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
