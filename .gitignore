@@ -99,3 +99,8 @@ asm/tests/test_script
 asm/tests/test_p2pkh
 asm/tests/test_utxo
 asm/tests/test_txval
+
+# ---- Kanban board mirror files (local tracking only; never publish) ----
+KANBAN.md
+**/KANBAN.md
+.kitchen/kanban/**
