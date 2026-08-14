@@ -312,6 +312,28 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   `ecdsa` oracle (`asm/validation/p2sh_oracle.py`): known p2sh hashes, a
   self-consistent spend that verifies, and tampered-sig / wrong-pubkey
   negatives.
+- **Full script interpreter** (`asm/bitcoin_interp.asm` built on the verified
+  support layer `asm/bitcoin_scriptcodec.asm`) — a complete Bitcoin Script
+  EvalScript engine covering the full opcode set with Bitcoin Core semantics:
+  flow control (`OP_IF/ELSE/ENDIF/VERIFY/RETURN`, `vfExec` condition stack),
+  stack/splice (`DUP/DROP/SWAP/ROT/PICK/ROLL/2DUP/2OVER/2ROT/...`),
+  bitwise (`SIZE/EQUAL[VERIFY]`), arithmetic (monadic `1ADD/1SUB/NEGATE/ABS/
+  NOT/0NOTEQUAL` + binary `ADD/SUB/BOOLAND/BOOLOR/NUMEQUAL[VERIFY]/
+  NUMNOTEQUAL/LESSTHAN/GREATERTHAN/.../MIN/MAX/WITHIN` over clamped 32-bit and
+  64-bit ScriptNum), crypto (`OP_SHA256/OP_HASH160/OP_HASH256/OP_RIPEMD160`,
+  `OP_CODESEPARATOR`, and the `OP_CHECKSIG` family host via a callback),
+  disabled opcodes returning **false**, reserved->bad-opcode, `OP_CLTV/OP_CSV`
+  handling, and **tapscript/BIP342** semantics: `OP_SUCCESSx` pre-scan
+  (short-circuit success / `DISCOURAGE_OP_SUCCESS`), cleanstack +
+  empty-stack treatment (`CLEANSTACK`/`EVAL_FALSE`), tapscript-minimal-IF as an
+  unconditional consensus rule, `OP_CHECKSIGVERIFY` forbidden,
+  `OP_CHECKMULTISIG` -> `TAPSCRIPT_CHECKMULTISIG`, and `OP_CHECKSIGADD` gating
+  (valid only under tapscript). Verified differentially against Bitcoin Core's
+  `script_tests.json` (`tests/script_tests_diff.py`: 67/67 BASE opcode vectors
+  byte-for-byte, exit 0) plus a dedicated 24-check tapscript harness
+  (`tests/test_tapscript_interp.c`) and `tests/smoke_interp`/`test_interp`.
+  The taproot/schnorr signature callback layer is wired downstream
+  (t_93b2695f, taproot/segwit v1).
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
