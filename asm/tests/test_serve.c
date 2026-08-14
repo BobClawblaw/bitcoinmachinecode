@@ -116,6 +116,36 @@ int main(void){
     }
     cki("all served blocks byte-exact via asm server", allok, 1);
 
+    /* ---- STRESS: multi-inv getdata (one message requests several blocks) ---- */
+    /* build getdata with TEST_NB inv items: varint(TEST_NB) + TEST_NB*(u32 type, 32B hash) */
+    static unsigned char mget[1<<12];
+    int mp = 0; mget[mp++] = (unsigned char)TEST_NB;         /* single-byte varint (<=252) */
+    for(int i=0;i<TEST_NB;i++){ unsigned char iv[36]; memset(iv,0,4); iv[0]=2; /* MSG_BLOCK */
+                                iv[4]|=bhash[i][0]; memcpy(iv+4,bhash[i],32); memcpy(mget+mp,iv,36); mp+=36; }
+    p2p_write(fd,"getdata",7,mget,(unsigned)mp);
+    int mall=1;
+    for(int i=0;i<TEST_NB;i++){
+        char c4[12]; static unsigned char blkbuf2[1<<20]; unsigned bl2=0;
+        int rr2=p2p_read(fd,c4,blkbuf2,sizeof blkbuf2,&bl2);
+        /* compare to the matching block by length then bytes */
+        if(rr2<=0||strncmp(c4,"block",5)!=0){ mall=0; break; }
+        int matched=-1;
+        for(int j=0;j<TEST_NB;j++) if((long)bl2==blen[j]&&memcmp(blkbuf2,blk[j],(size_t)bl2)==0){matched=j;break;}
+        if(matched<0) mall=0;
+    }
+    cki("multi-inv getdata: all blocks byte-exact", mall, 1);
+
+    /* ---- STRESS: repeated ping/pong after serving (loop-continuation sanity) ---- */
+    int pingok=1;
+    for(int k=0;k<25;k++){
+        uint64_t n2=0x1234abcd00000001ull+k;
+        p2p_ping(pg,n2); long w2=p2p_write(fd,"ping",4,pg,8);
+        char c5[12]; static unsigned char rp2[1024]; unsigned rl2=0;
+        int rr3=p2p_read(fd,c5,rp2,sizeof rp2,&rl2);
+        if(w2<=0||rr3<=0||strncmp(c5,"pong",4)!=0||rl2<8||memcmp(rp2,pg,8)!=0) pingok=0;
+    }
+    cki("25x ping/pong after multi-getdata (loop stable)", pingok, 1);
+
     close(fd); waitpid(pid,0,0); close(ls);
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;

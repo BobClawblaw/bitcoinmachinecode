@@ -92,7 +92,11 @@ node_serve_loop:
     mov  [s_st], rdx         ; stable copy of st
     mov  qword [s_served], 0 ; served count
 
-    mov  rbx, 10000          ; outer loop bound
+    ; Outer-loop counter lives in r15. r15 is written ONLY here (entry); all
+    ; handlers avoid it and reuse rbx as scratch (getdata item pointer etc.).
+    ; r15 is callee-saved so the external calls (p2p_read, idx_get,
+    ; node_serve_block, p2p_write) preserve it across the whole loop.
+    mov  r15, 10000          ; outer loop bound
 .outer:
     ; ---- read a message ----
     mov  qword [s_plen], 0
@@ -362,7 +366,7 @@ node_serve_loop:
     jmp  .next
 
 .next:
-    dec  rbx
+    dec  r15
     jg   .outer
 .done:
     mov  rax, [s_served]
