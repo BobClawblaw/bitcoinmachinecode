@@ -41,6 +41,22 @@ extern int  ecdsa_verify(const uint64_t z[4], const uint64_t r[4],
                          const uint64_t s[4], const uint64_t Qx[4], const uint64_t Qy[4]);
 /* scalar_small_nonzero: BIP32 range check 0<k<n */
 extern int  scalar_small_nonzero(const unsigned char k[32]);
+/* BIP39 mnemonic <-> seed (bitcoin_bip39.asm) */
+extern int  bip39_generate(char* out, const unsigned char* entropy, long ent_bits);
+extern int  bip39_validate(const char* mnemonic);
+extern int  bip39_mnemonic_to_seed(unsigned char seed[64], const char* mnemonic,
+                                   const char* passphrase, long passlen);
+/* BIP32 seeds/longest path (bitcoin_bip32.asm) for pairing with BIP39 */
+extern int  bip32_master(unsigned char k[32], unsigned char c[32],
+                         const unsigned char* seed, long seedlen);
+extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
+                              const unsigned char* seed, long seedlen,
+                              const unsigned* indexes, long n);
+extern int  bip32_extkey_serialize(unsigned char ser[78], int is_priv,
+                                   unsigned char depth,
+                                   const unsigned char parent_fp[4],
+                                   unsigned child, const unsigned char c[32],
+                                   const unsigned char* key, long keylen);
 
 /* ---------------- constants ------------------------------------------------ */
 /* secp256k1 curve order n, 4 ascending LE limbs. */
@@ -314,4 +330,53 @@ long wallet_sign_tx(unsigned char* out_tx, long cap,
     memcpy(out_tx, tmp, (size_t)pos);
     free(tmp0);
     return pos;
+}
+
+/* ============================================================================
+ * BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets).
+ * ==========================================================================*/
+
+/* Generate a fresh 128-bit (12-word) BIP39 mnemonic from /dev/urandom.
+ * Returns 1 on success (out receives the mnemonic string), 0 on error. */
+int  wallet_mnemonic_generate(char out[256]) {
+    unsigned char ent[16];
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (!f || fread(ent, 1, 16, f) != 16) { if (f) fclose(f); return 0; }
+    fclose(f);
+    return bip39_generate(out, ent, 128);
+}
+
+/* Derive the 64-byte BIP39 seed from a mnemonic + optional passphrase. */
+int  wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
+                          const char* pass, long passlen) {
+    return bip39_mnemonic_to_seed(seed, mn, pass, passlen);
+}
+
+/* Validate a mnemonic (wordlist + checksum). Returns word count or -1. */
+int  wallet_mnemonic_validate(const char* mn) {
+    return bip39_validate(mn);
+}
+
+/* Derive the BIP32 master extended private key (xprv) from a seed. */
+int  wallet_seed_master_xprv(char xprv[128], const unsigned char seed[64]) {
+    unsigned char k[32], c[32], ser[78];
+    unsigned char zero4[4] = {0, 0, 0, 0};
+    if (bip32_master(k, c, seed, 64) != 1) return 0;
+    bip32_extkey_serialize(ser, 1, 0, zero4, 0, c, k, 32);
+    base58check_encode(xprv, ser, 78);
+    return 1;
+}
+
+/* Derive the BIP44 m/44'/0'/0'/0/0 receive ADDRESS from a seed. */
+int  wallet_seed_bip44_address(char addr[64], const unsigned char seed[64]) {
+    unsigned indexes[5] = {0x80000000u | 44u, 0x80000000u, 0x80000000u, 0, 0};
+    unsigned char k[32], c[32], pub[33], h[20], payload[21];
+    char b58[128];
+    if (bip32_derive_path(k, c, seed, 64, indexes, 5) != 1) return 0;
+    scalar_to_pubkey(pub, k);
+    hash160(h, pub, 33);
+    payload[0] = 0x00; memcpy(payload + 1, h, 20);
+    base58check_encode(b58, payload, 21);
+    memcpy(addr, b58, 64);
+    return 1;
 }

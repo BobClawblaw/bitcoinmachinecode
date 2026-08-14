@@ -24,6 +24,13 @@ extern int  wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
 extern long wallet_sign_tx(unsigned char* out_tx, long cap,
                            const unsigned char* tx, unsigned long txlen,
                            long input_index, const unsigned char priv_be[32]);
+/* BIP39 mnemonic <-> seed, paired with BIP32 (recoverable wallets). */
+extern int  wallet_mnemonic_generate(char out[256]);
+extern int  wallet_mnemonic_validate(const char* mn);
+extern int  wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
+                                 const char* pass, long passlen);
+extern int  wallet_seed_master_xprv(char xprv[128], const unsigned char seed[64]);
+extern int  wallet_seed_bip44_address(char addr[64], const unsigned char seed[64]);
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -113,12 +120,61 @@ static int cmd_sign(const char* txhex, const char* keyhex, const char* idxhex) {
     return 0;
 }
 
+static int cmd_mnemonic(void) {
+    /* produce a fresh recoverable seed: random mnemonic -> seed -> BIP32. */
+    char mn[256];
+    if (!wallet_mnemonic_generate(mn)) {
+        fprintf(stderr, "mnemonic: cannot read /dev/urandom\n");
+        return 1;
+    }
+    unsigned char seed[64];
+    wallet_mnemonic_seed(seed, mn, NULL, 0);
+    char xprv[128], addr[64];
+    wallet_seed_master_xprv(xprv, seed);
+    wallet_seed_bip44_address(addr, seed);
+    printf("mnemonic: %s\n", mn);
+    printf("seed:     "); print_hex(seed, 64); printf("\n");
+    printf("xprv:     %s\n", xprv);
+    printf("m/44'/0'/0'/0/0: %s\n", addr);
+    return 0;
+}
+
+static int cmd_seed(int argc, char** argv) {
+    /* restore a recoverable seed from a mnemonic (and optional passphrase):
+     *   wallet_cli seed "<w0 w1 ... wn>" [passphrase]   (sentence in quotes) */
+    if (argc < 3) {
+        fprintf(stderr, "usage: wallet_cli seed \"<mnemonic sentence>\" [passphrase]\n");
+        return 2;
+    }
+    const char* mn = argv[2];
+    int nw = wallet_mnemonic_validate(mn);
+    if (nw <= 0) {
+        fprintf(stderr, "seed: invalid mnemonic (bad wordlist entry or checksum)\n");
+        return 1;
+    }
+    const char* pass = (argc >= 4) ? argv[3] : NULL;
+    long passlen = pass ? (long)strlen(pass) : 0;
+    unsigned char seed[64];
+    wallet_mnemonic_seed(seed, mn, pass, passlen);
+    char xprv[128], addr[64];
+    wallet_seed_master_xprv(xprv, seed);
+    wallet_seed_bip44_address(addr, seed);
+    printf("words:    %d\n", nw);
+    if (pass) printf("passphrase: %s\n", pass);
+    printf("seed:     "); print_hex(seed, 64); printf("\n");
+    printf("xprv:     %s\n", xprv);
+    printf("m/44'/0'/0'/0/0: %s\n", addr);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|mnemonic|seed> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
+    if (!strcmp(argv[1], "mnemonic")) return cmd_mnemonic();
+    if (!strcmp(argv[1], "seed")) return cmd_seed(argc, argv);
     if (!strcmp(argv[1], "addr")) {
         if (argc < 3) { fprintf(stderr, "usage: wallet_cli addr <privkey_hex>\n"); return 2; }
         return cmd_addr(argv[2]);

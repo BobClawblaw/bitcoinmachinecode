@@ -14,7 +14,7 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_multisig.o
+OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_multisig.o bitcoin_bip39.o
 # bitcoin_hash.asm (sha256d/block-hash/merkle/pow) depends on sha256.o
 HASHOBJS := sha256.o bitcoin_hash.o
 # bitcoin_tx.asm parser harness also exercises sha256d/merkle_root.
@@ -189,6 +189,19 @@ tests/test_bip32_extkey: tests/test_bip32_extkey.c tests/bip32_extkey_vec.h $(EX
 tests/bip32_extkey_vec.h: validation/gen_bip32_vectors.py
 	cd tests && python3 ../validation/gen_bip32_vectors.py > bip32_extkey_vec.h
 
+# bitcoin_bip39.asm -- BIP39 mnemonic <-> seed. Deps: sha256 (checksum),
+# sha512 + bitcoin_hmac (PBKDF2-HMAC-SHA512). Vectors from the independent
+# Python oracle (validation/gen_bip39_vectors.py -> tests/bip39_vec.h), which
+# is itself cross-checked against the official bip-0039 vectors and the
+# third-party `mnemonic` pip package.
+BIP39OBJS := bitcoin_bip39.o sha256.o sha512.o bitcoin_hmac.o
+tests/test_bip39: tests/test_bip39.c tests/bip39_vec.h $(BIP39OBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_bip39.c $(BIP39OBJS)
+
+# regenerate the BIP39 vectors from the independent Python oracle
+tests/bip39_vec.h: validation/gen_bip39_vectors.py
+	python3 validation/gen_bip39_vectors.py > tests/bip39_vec.h
+
 # ripemd160.asm (HASH160 half; needed for P2PKH address generation).
 tests/test_ripemd160: tests/test_ripemd160.c ripemd160.o
 	$(CC) -no-pie -O0 -o $@ tests/test_ripemd160.c ripemd160.o
@@ -265,14 +278,16 @@ MULTISIGOBJS := bitcoin_multisig.o bitcoin_script.o bitcoin_sighash.o \
 tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_multisig.c $(MULTISIGOBJS)
 
-# Wallet CLI: generate key, show address, sign a P2PKH tx.
+# Wallet CLI: generate key, show address, sign a P2PKH tx, and -- via BIP39 +
+# BIP32 -- produce/restore recoverable seeds.
 # asm/wallet_core.c glues the VERIFIED asm primitives (scalar_to_pubkey,
-# hash160, base58check_encode, sighash_all, ecdsa_verify) plus the verified
-# scalar/point/field ops (sc_*, point_scalar_mul, fe_*) used to construct
-# ECDSA signatures.
+# hash160, base58check_encode, sighash_all, ecdsa_verify, BIP39 mnemonic<->seed,
+# BIP32 master/path/extkey) plus the verified scalar/point/field ops (sc_*,
+# point_scalar_mul, fe_*) used to construct ECDSA signatures.
 WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o \
                bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
-               bitcoin_hash.o sha256.o ripemd160.o
+               bitcoin_hash.o sha256.o ripemd160.o \
+               bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o
 daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c $(WALLETPRIMS)
 	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c $(WALLETPRIMS)
 
@@ -310,7 +325,7 @@ tests/test_shared: tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_txval tests/test_multisig tests/test_wallet \
+test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_txval tests/test_multisig tests/test_wallet \
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -325,6 +340,7 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_bip32_master
 	./tests/test_bip32_chain
 	./tests/test_bip32_extkey
+	./tests/test_bip39
 	./tests/test_ripemd160
 	./tests/test_addr
 	./tests/test_bech32
@@ -363,4 +379,4 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_p2p_inv
 
 clean:
-	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip32.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_txval tests/test_multisig tests/test_wallet daemon/wallet_cli
+	rm -f $(OBJS) bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_p2p_inv tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_txval tests/test_multisig tests/test_wallet daemon/wallet_cli

@@ -102,6 +102,9 @@ asm/tests/test_utxo
 asm/tests/test_txval
 asm/tests/test_multisig
 asm/tests/test_bip32_extkey
+asm/tests/test_bip39
+asm/tests/test_wallet
+asm/daemon/wallet_cli
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----
 KANBAN.md

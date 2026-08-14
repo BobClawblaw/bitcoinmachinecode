@@ -437,9 +437,17 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   `gen` | `addr <keyhex>` | `sign <tx><key><i>` (legacy SIGHASH_ALL, low-S).
   The receive/address and signing flow is now real; see the WALLET/VALIDATION
   BRIDGE section above for the full picture.
-- NEXT (natural wallet steps, not yet started): (b) BIP39 mnemonic<->seed.
-  (BIP32 full-path + extended-key xprv/xpub encoding is DONE; P2SH/multisig
-  (OP_CHECKMULTISIG) is also DONE -- see the compliance table above.)
+- **BIP39 mnemonic <-> seed DONE** (`asm/bitcoin_bip39.asm` + `asm/wordlist.inc`):
+  mnemonic generation/validation (entropy 128..256 bits, 12..24 words, SHA-256
+  checksum CS=ENT/32) and PBKDF2-HMAC-SHA512 seed derivation (salt =
+  "mnemonic"||passphrase, c=2048, dkLen=64), embedded 2048-word English
+  wordlist. Verified byte-exact against the official bip-0039 vectors (both
+  empty- and "TREZOR"-passphrase seeds) via the independent Python oracle
+  (`asm/validation/gen_bip39_vectors.py`, cross-checked with hashlib).
+  Pairs with BIP32: the wallet CLI now produces/restores a recoverable seed
+  (`wallet_cli mnemonic` / `wallet_cli seed "<words>" [pass]`) yielding the
+  mnemonic, 64-byte seed, master xprv, and m/44'/0'/0'/0/0 address.
+- NEXT (natural wallet steps, not yet started): none blocking — BIP39 is DONE.
 
 ### 11. COMPLIANCE TARGET — "fully compliant" is a DEFINED, MEASUREABLE SCOPE
 
@@ -465,7 +473,7 @@ result on shared blocks/txs must be bit-identical or the node must refuse
 | mempool policy / RBF / fee | DONE | bitcoin_mempool_policy.c |
 | P2SH / multisig (OP_CHECKMULTISIG) | DONE | bitcoin_multisig.asm |
 | BIP32 full-path + xprv/xpub | DONE | bitcoin_bip32.asm (derive_path/fingerprint/extkey_serialize) |
-| BIP39 mnemonic <-> seed | queued (card 3) | this batch |
+| BIP39 mnemonic <-> seed | DONE | bitcoin_bip39.asm (gen/validate/PBKDF2 seed) |
 | Persistent UTXO to disk | queued (card 4) | this batch |
 | sighash_all real-spend end-to-end | queued (card 5) | this batch |
 | Full script interpreter (all opcodes incl. tapscript/BIP342) | OPEN — largest asm item | post-batch |

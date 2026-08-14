@@ -218,6 +218,21 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   keys byte-exact against an independent `bip32` Python oracle. (The base58
   encoder's digit-work buffers were enlarged to hold 78-byte payloads; the
   25-byte address path is unchanged and still green.)
+- **BIP39 mnemonic <-> seed** (`asm/bitcoin_bip39.asm`) — full mnemonic
+  generation/validation + PBKDF2 seed derivation, pairing with BIP32 for
+  recoverable wallets. Embedded 2048-word English wordlist (`asm/wordlist.inc`,
+  9-byte fixed-width records, official order abandon..zoo); entropy (128..256
+  bits, 12..24 words) -> 11-bit groups with the trailing SHA-256 checksum
+  (CS = ENT/32); validation re-derives the checksum and rejects bad word
+  count, unknown words, and checksum mismatches; and seed derivation is
+  PBKDF2-HMAC-SHA512(P=mnemonic, S="mnemonic"||pass, c=2048, dkLen=64) built on
+  the verified asm `hmac_sha512`. `test_bip39` (24 vectors) verifies
+  generate/validate/mnemonic->entropy and both empty- and "TREZOR"-passphrase
+  seeds byte-exact against the official bip-0039 vectors via the independent
+  Python oracle (`asm/validation/gen_bip39_vectors.py`, cross-checked with
+  `hashlib.pbkdf2_hmac`). The wallet CLI now reports a recoverable seed end to
+  end: `wallet_cli mnemonic` `->` `wallet_cli seed "<words>" [pass]` yields the
+  mnemonic, 64-byte seed, master `xprv`, and `m/44'/0'/0'/0/0` address.
 - **bech32 / bech32m codec** (`asm/bech32.asm`) — BIP173/350 address codec
   (`bech32_polymod` 30-bit CRC, create/verify checksum with the XOR-1 vs
   0x2bc830a3 switch, 8<->5 bit regroup, encode/decode), verified against every
@@ -286,6 +301,9 @@ bitcoinmachinecode/
 |   +-- bitcoin_script.asm     # der_parse_sig + verify_p2pkh (end-to-end P2PKH validate)
 |   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script)
 |   +-- bech32.asm             # BIP173/350 bech32/bech32m address codec
+|   +-- bitcoin_bip32.asm      # BIP32 master/CKD/derive_path + xprv/xpub
+|   +-- bitcoin_bip39.asm      # BIP39 mnemonic<->seed (PBKDF2-HMAC-SHA512)
+|   +-- wordlist.inc           # 2048-word BIP39 English wordlist (9-byte records)
 |   +-- bitcoin_multisig.asm   # p2sh_hash + multisig_verify (OP_CHECKMULTISIG)
 |   +-- wallet_core.c          # wallet primitives glue over asm crypto
 |   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer over mempool + UTXO
@@ -294,7 +312,7 @@ bitcoinmachinecode/
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
-|       +-- wallet_cli.c      # wallet CLI: gen/addr/sign (SIGHASH_ALL P2PKH)
+|       +-- wallet_cli.c      # wallet CLI: gen/addr/sign + mnemonic/seed (recoverable)
 |       +-- unified_ibd.c     # full-chain download into a unified single store (forward + backfill)
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
 |       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
