@@ -267,10 +267,11 @@ node_serve_loop:
     jmp  .gd_loop
 
 .maybe_getheaders:
-    ; "getheaders" -> dword0 "geth", index4..7 "head", index8..11 "ers\0"
-    cmp  dword [s_cmd+4], 0x64616568 ; "head"
+    ; "getheaders" = g e t h e a d e r s
+    ;   "head" spans cmd[3..6], "ers\0" spans cmd[7..10].
+    cmp  dword [s_cmd+3], 0x64616568 ; "head"
     jne  .next
-    cmp  dword [s_cmd+8], 0x00737265 ; "ers\0"
+    cmp  dword [s_cmd+7], 0x00737265 ; "ers\0"
     jne  .next
     ; locator hash at pl+5 -> resolve via idx
     mov  rax, [s_plen]
@@ -302,43 +303,104 @@ node_serve_loop:
     mov  rax, [s_fh]
     cmp  rax, [s_cnt]
     ja   .gh_empty
-    ; hp[0]=count varint (assume <=252 single byte); p=1; n=0
-    mov  byte [hp_buf], 0
-    mov  qword [s_p], 1 ; p
-    xor  ecx, ecx            ; n
-    mov  rax, [s_fh]     ; h = from
+    ; Headers are written starting at hp_buf+3 (3 bytes reserved for the
+    ; count varint, which is emitted at the end once n is known). p=3; n=0.
+    mov  qword [s_p], 3 ; p
+    mov  qword [s_n], 0 ; n   (kept in a static: immune to callee clobbering)
+    mov  rax, [s_fh]
+    mov  [s_plen], rax ; save starting 'from' for the post-serve log (loop advances s_fh)
 .ghh_loop:
+    ; loop using statics [s_fh] (height) and [s_n] (count). Callees
+    ; (idx_get/node_serve_block/memcpy_len/p2p_write) clobber the volatile
+    ; registers rax..r11, so the running height/count MUST live in statics.
+    mov  rax, [s_fh]
     cmp  rax, [s_cnt]
     ja   .ghh_done
-    cmp  ecx, 2000
+    mov  rax, [s_n]
+    cmp  rax, 2000
     jae  .ghh_done
     ; node_serve_block(st, h, sb_buf, cap)
-    mov  [s_plen], rax     ; save h (below save area)
-    mov  [s_n], rcx     ; save n (below save area)
     mov  rdi, r14
-    mov  rsi, rax
+    mov  rsi, [s_fh]
     lea  rdx, [sb_buf]
     mov  rcx, (8<<20)
     call node_serve_block
-    mov  rcx, [s_n]
     test rax, rax
     jle  .ghh_done
     ; copy 80-byte header into hp_buf at p; then tx-count byte 0 at p+80
+    ; memcpy_len(dst, src, len) reads its LENGTH from RDX (not r8). Passing the
+    ; length in r8 here made it copy [s_p] bytes instead of 80 -> the write swept
+    ; through hp_buf and past the .bss into the stdout/stderr copies (0x143e6a0),
+    ; wiping libc's stdout/stderr globals and crashing main's printf once the
+    ; loop had run a few headers. Must load the 80-header length into RDX.
     mov  rdx, [s_p]
     lea  rdi, [hp_buf + rdx]
     lea  rsi, [sb_buf]
-    mov  r8, 80
+    mov  rdx, 80             ; memcpy_len length argument (RDX)
     call memcpy_len
     mov  rdx, [s_p]
     mov  byte [hp_buf + rdx + 80], 0
     add  qword [s_p], 81
-    inc  ecx                ; n++
-    mov  rax, [s_plen]
+    mov  rax, [s_n]
     inc  rax
+    mov  [s_n], rax
+    mov  rax, [s_fh]
+    inc  rax
+    mov  [s_fh], rax
     jmp  .ghh_loop
 .ghh_done:
-    mov  byte [hp_buf], cl   ; count varint (assume < 252)
-    mov  [s_n], rcx     ; save n (p2p_write clobbers rcx)
+    ; Count c = number of headers actually written = (s_p - 3) / 81.
+    ; Derive it from the byte pointer (not the loop counter, which callees
+    ; clobber) so the count field always matches the payload length.
+    mov  rax, [s_p]
+    sub  rax, 3
+    xor  edx, edx
+    mov  ecx, 81
+    div  rcx                 ; rax = c
+    mov  [s_n], rax          ; save n
+    cmp  rax, 253
+    jae  .gh_varint16
+    ; c < 253 : single-byte varint. Headers sit at hp_buf+3; compact them down
+    ; to hp_buf+1 (copy forward, dst<src so non-overlapping-safe) and set
+    ; hp_buf[0]=c.
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov  r12, rax            ; c*81 = bytes to move
+    imul r12, 81
+    mov  r13, 0              ; i
+.gh_compact:
+    cmp  r13, r12
+    jae  .gh_compact_done
+    mov  al, [hp_buf+3+r13]
+    mov  [hp_buf+1+r13], al
+    inc  r13
+    jmp  .gh_compact
+.gh_compact_done:
+    mov  rax, [s_n]
+    mov  byte [hp_buf], al
+    mov  rax, [s_n]
+    imul rax, 81
+    add  rax, 1              ; final payload len = 1 + c*81
+    mov  [s_p], rax
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    jmp  .gh_send
+.gh_varint16:
+    ; c in [253, 65535] : 0xFD + 2-byte little-endian. Headers already at +3.
+    mov  byte [hp_buf], 0xFD
+    mov  rax, [s_n]
+    mov  byte [hp_buf+1], al
+    shr  rax, 8
+    mov  byte [hp_buf+2], al
+    mov  rax, [s_n]
+    imul rax, 81
+    add  rax, 3              ; final payload len = 3 + c*81
+    mov  [s_p], rax
+.gh_send:
     ; p2p_write(fd,"headers",7,hp_buf,p)
     mov  r8d, [s_p]    ; headers payload length (p2p_write arg5 = r8)
     mov  rdi, r12
@@ -350,7 +412,7 @@ node_serve_loop:
     mov  rdi, r13
     mov  rsi, 6
     mov  rdx, [s_n]
-    mov  rcx, [s_fh]
+    mov  rcx, [s_plen]
     xor  r8, r8
     call node_log_event
     jmp  .next

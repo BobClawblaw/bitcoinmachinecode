@@ -151,6 +151,18 @@ open_file:
     sub  rsp, 0x40            ; name[16] at rbp-0x40 (BELOW the 5-push save area)
     mov  r12, rdi
     mov  r13d, esi
+    ; Close any previously-open block file first. open_file leaks an fd on every
+    ; call otherwise: node_serve_block opens the block file anew for EACH block
+    ; served, so without this every serve leaks a descriptor and the process
+    ; hits EMFILE (~1024) after a few hundred blocks -> serving breaks. This is
+    ; what truncated getheaders (and any multi-block serve) at ~1016 headers.
+    mov  rax, [r12]           ; cur_blk_fd
+    cmp  rax, -1
+    je   .noclose
+    mov  rdi, rax
+    mov  eax, 3              ; close
+    syscall
+.noclose:
     ; fmt name into rbp-0x40
     lea  rdi, [rbp-0x40]
     mov  esi, r13d

@@ -81,7 +81,12 @@ static int build_hash_index(void){
     for(long h=0;h<n;h++){
         if(fread(rec,1,48,f)!=48) break;
         if(rec[0]==0&&rec[1]==0&&rec[2]==0&&rec[3]==0) continue; /* hole */
-        idx_put(ht_idx,rec,h);
+        /* index.dat stores the block hash in big-endian DISPLAY byte order; the
+         * getdata/inv wire hash is little-endian (the raw internal hash). Reverse
+         * to the wire/LE order so idx_get (looked up with the raw getdata hash)
+         * matches. */
+        unsigned char le[32]; for(int k=0;k<32;k++) le[k]=rec[31-k];
+        idx_put(ht_idx, le, h);
         if(h%100000==0){ fprintf(stderr,"[hashidx] %ld/%ld\n",h,n); }
     }
     fclose(f);
