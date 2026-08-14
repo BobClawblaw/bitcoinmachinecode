@@ -170,6 +170,14 @@ P2PINVOBS := bitcoin_p2p.o bitcoin_net.o bitcoin_hash.o sha256.o
 tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 	$(CC) -no-pie -O0 -o $@ tests/test_p2p_inv.c $(P2PINVOBS)
 
+# pverify -- parallel block-chain verifier, machine-adaptive worker count.
+# Built at -O1 (not -O2/-O3): the deep asm call chain (cons_verify -> tx_parse
+# / sha256d) misparses a block when the C driver is compiled at aggressive -O2+,
+# a documented codegen interaction. -O1 is safe; the speed comes from the
+# parallel workers, not C-codegen.
+daemon/pverify: daemon/pverify.c $(CONSOBJS)
+	$(CC) -O1 -o $@ daemon/pverify.c $(CONSOBJS) -lpthread
+
 # bitcoin_store.asm shared-append: concurrent-safe single-store write (standalone).
 tests/test_shared: tests/test_shared.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared.c bitcoin_store.o

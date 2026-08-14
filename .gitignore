@@ -84,3 +84,4 @@ asm/tests/test_hmac
 asm/bitcoin_hmac.o
 asm/tests/test_bip32_master
 asm/bitcoin_bip32.o
+asm/daemon/pverify
