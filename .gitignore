@@ -38,6 +38,7 @@ asm/tests/test_scalarmul
 asm/tests/test_sha256
 asm/tests/test_store
 asm/tests/test_tx
+asm/tests/test_mempool_policy
 asm/daemon/bitcoind
 asm/daemon/cli
 asm/daemon/discover

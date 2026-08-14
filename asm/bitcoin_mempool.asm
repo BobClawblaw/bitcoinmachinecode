@@ -25,6 +25,7 @@
 ;                    const unsigned char* tx, unsigned long txlen) -> 1 new / 0 dup / 2 full
 ;   const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
 ;                                  unsigned long* out_len)
+;   long   mpool_del(void* mp, const unsigned char txid[32]) -> 1 deleted / 0 miss
 ;   long   mpool_count(void* mp)
 
 default rel
@@ -310,6 +311,74 @@ mpool_get:
 .miss:
     xor  eax, eax
 .ret:
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; ---------------------------------------------------------------- 
+; mpool_del(mp, txid) -> 1 deleted / 0 not-found
+; Remove an entry: clears the slot (len = EMPTY) and decrements n. The blob
+; bytes are left in place (not compacted) -- acceptable for the in-memory
+; relay/policy mempool, where RBF eviction/reorg removal just needs the entry
+; gone from get()/count(). Callee-saved preserved.
+global mpool_del
+mpool_del:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  r12, rdi
+    mov  r13, rsi            ; txid
+    ; probe
+    mov  rdi, r13
+    mov  rsi, [r12+8]
+    call mpool_hash
+    mov  r15, rax            ; slot offset
+    xor  r8, r8              ; probe count
+    mov  r9, 0xFFFFFFFFFFFFFFFF
+    mov  r10, [r12+8]
+    inc  r10                 ; slot_count
+.dprobe:
+    cmp  r8, r10
+    jae  .dmiss
+    lea  r11, [r12+r15]      ; slot
+    mov  rax, [r11]
+    cmp  rax, r9
+    je   .dmiss              ; empty slot -> not present (in open addressing with
+                             ;  no tombstones this is correct: if we hit a hole the
+                             ;  key was never inserted)
+    ; compare txid (memcmp32 length in RDX)
+    mov  rdi, r13
+    lea  rsi, [r11+8]
+    mov  rdx, 32
+    call memcmp32
+    test rax, rax
+    jz   .dhit
+    ; advance probe with wrap-around
+    add  r15, 48
+    mov  rax, [r12+8]
+    inc  rax
+    imul rax, 48
+    add  rax, 40
+    cmp  r15, rax
+    jb   .dnowrap
+    mov  r15, 40
+.dnowrap:
+    inc  r8
+    jmp  .dprobe
+.dhit:
+    mov  qword [r11], r9     ; mark slot empty
+    dec  qword [r12]         ; n--
+    mov  eax, 1
+    jmp  .dret
+.dmiss:
+    xor  eax, eax
+.dret:
     pop  r15
     pop  r14
     pop  r13

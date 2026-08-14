@@ -50,6 +50,28 @@ int main(void){
     p = mpool_get(mp, miss, &len);
     ck(p==0, "get unknown txid -> 0 (miss)");
 
+    /* --- mpool_del (eviction, used by RBF policy) --- */
+    {
+        extern long mpool_del(void* mp, const unsigned char txid[32]);
+        /* put a fourth tx, then delete it */
+        unsigned char tid4[32], t4[50];
+        for(i=0;i<32;i++) tid4[i]=(unsigned char)(i+3);
+        for(i=0;i<50;i++) t4[i]=(unsigned char)(i+1);
+        ck(mpool_put(mp, tid4, t4, 50)==1, "put tid4 -> new (1)");
+        ck(mpool_get(mp, tid4, &len)!=0 && len==50, "tid4 present after put");
+        ck(mpool_del(mp, tid4)==1, "del tid4 -> deleted (1)");
+        ck(mpool_get(mp, tid4, &len)==0, "tid4 gone after del");
+        ck(mpool_del(mp, tid4)==0, "del tid4 again -> not found (0)");
+        ck(mpool_del(mp, miss)==0, "del unknown txid -> not found (0)");
+        /* count decreased */
+        ck(mpool_count(mp)==3, "count back to 3 after delete");
+        /* the three original txs still intact */
+        len=0; p = mpool_get(mp, tid1, &len);
+        ck(p!=0 && len==64 && memcmp(p,t1,64)==0, "tid1 survives after delete of another");
+        p = mpool_get(mp, tid2, &len);
+        ck(p!=0 && len==90 && memcmp(p,t2,90)==0, "tid2 survives after delete of another");
+    }
+
     /* larger count to exercise probing (collisions); distinct txids */
     static unsigned char tids[512][32]; static unsigned char txb[512][64];
     for(i=0;i<300;i++){ for(int j=0;j<4;j++) tids[i][j]=(unsigned char)((i>>(8*j))&0xFF); for(int j=4;j<32;j++) tids[i][j]=0xAA; for(int j=0;j<64;j++) txb[i][j]=(unsigned char)(i*7+j); }
