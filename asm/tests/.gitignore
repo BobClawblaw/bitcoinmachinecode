@@ -3,3 +3,5 @@ test_keys
 bench_hash
 xcheck_nia
 test_sha512g
+test_ripemd160
+test_addr
