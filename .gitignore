@@ -80,6 +80,9 @@ asm/tests/test_serve
 asm/bitcoin_idx.o
 asm/bitcoin_serve.o
 asm/tests/test_p2p_inv
+asm/tests/test_bip152
+asm/tests/test_bip152_loop
+asm/bitcoin_cmpct.o
 asm/tests/test_sha512
 asm/sha512.o
 asm/tests/test_hmac

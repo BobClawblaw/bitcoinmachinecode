@@ -127,6 +127,14 @@ archive. Verified LIVE over loopback against real mainnet data:
   requested locator (verified for locators at h=1, h=200000, h=293300, 2000
   headers each). The server stays alive after serving.
 
+**BIP152 compact blocks** (`asm/bitcoin_cmpct.asm`, serve integration in
+`asm/bitcoin_serve.asm`): SipHash-2-4 short-tx-ids and the compact-block wire
+codecs (`sendcmpct` negotiation incl. high-bandwidth, `cmpctblock` build/serve,
+`getblocktxn`/`blocktxn`). Verified byte-exact against REAL Bitcoin Core v31.99:
+short-ids captured from Core's actual wire `cmpctblock` messages over loopback
+(`validation/bip152_vectors.h`, 12 vectors; `tests/test_bip152` 35 checks) and a
+loopback e2e over the asm server (`tests/test_bip152_loop`, 16 checks).
+
 The live work exposed and fixed five real bugs that fake-block unit tests could
 not catch: (1) the daemon had no Makefile target (ad-hoc stale command);
 (2) `server-test` never built the hash index, so getdata couldn't resolve a

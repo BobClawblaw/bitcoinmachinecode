@@ -36,6 +36,12 @@ default rel
     extern mpool_get
     extern mpool_count
     extern tx_txid
+    extern bip152_shortid
+    extern block_tx_at
+    extern block_txcount
+    extern p2p_blocktxn_build
+    extern cmpctblock_build
+    extern node_serve_block_by_hash
 section .data
 align 16
 pl_buf:    times (8<<20) db 0     ; receive buffer
@@ -48,6 +54,22 @@ cn_head:   db "headers",0
 cn_inv:    db "inv",0
 cn_tx:     db "tx",0
 cn_getdata: db "getdata",0
+cn_getbtxn: db "getblocktxn",0
+cn_btxn:   db "blocktxn",0
+cn_cmpct:  db "cmpctblock",0
+; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
+align 16
+bt_buf:    times (8<<20) db 0     ; compact-block output buffer
+s_cmpct_v2:  dq 0                 ; peer negotiated compact blocks (sendcmpct version 2)
+s_cmpct_hb:  dq 0                 ; peer requested high-bandwidth mode (announce=1)
+s_cmpct_nonce: dq 0               ; nonce used for the compact block we announced
+s_idxn:    dq 0                   ; # indexes parsed from getblocktxn
+s_idxbuf:  times (512*2) db 0      ; getblocktxn requested tx indexes (u16 LE each)
+s_diffshift: dq 0
+s_blen_spill: dq 0                 ; preserved block length for blocktxn assembly
+s_txptr:   dq 0                    ; block_tx_at output pointer
+s_txlen:   dq 0                    ; block_tx_at output length
+s_j:       dq 0                    ; loop counter j (blocktxn assembly)
 ; ---- mempool for tx relay (static; initialized once in node_serve_loop) ----
 ; struct+slots: 40 + slots*48 ; use 1024 slots
 MP_SLOTS equ 1024
@@ -148,12 +170,14 @@ node_serve_loop:
     je   .maybe_getdata
     cmp  dword [s_cmd], 0x68746567   ; "geth..." (getheaders)
     je   .maybe_getheaders
-    cmp  dword [s_cmd], 0x62746567   ; "getb..." (getblocks)
-    je   .maybe_getblocks
+    cmp  dword [s_cmd], 0x62746567   ; "getb..." (getblocks / getblocktxn)
+    je   .maybe_getb
     cmp  dword [s_cmd], 0x00766e69   ; "inv"
     je   .do_inv
-    cmp  dword [s_cmd], 0x00007874   ; "tx\0\0"
+    cmp  dword [s_cmd], 0x00007874   ; "tx"
     je   .do_tx
+    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct)
+    je   .maybe_sendcmpct
     jmp  .next
 
 .do_verack:
@@ -325,12 +349,70 @@ node_serve_loop:
     test rax, rax
     jle  .next
     mov  rbx, [s_ptr]     ; item ptr (rbx is free here -- outer counter saved in the loop bound)
-    ; type at rbx (u32 LE): 2=MSG_BLOCK -> serve block; 1=MSG_TX -> mempool tx
+    ; type at rbx (u32 LE): 2=MSG_BLOCK -> serve block; 1=MSG_TX -> mempool tx;
+    ; 4=MSG_CMPCT_BLOCK -> serve a compact block (BIP152, requester negotiated).
     mov  r9d, [rbx]
     cmp  r9d, 1
     je   .gd_tx
+    cmp  r9d, 4
+    je   .gd_cmpct
     cmp  r9d, 2
+    je   .gd_block
+    jmp  .gd_next
+.gd_cmpct:
+    ; ---- serve a compact block (type 4) ----
+    ; guard: peer must have negotiated sendcmpct v2
+    cmp  qword [s_cmpct_v2], 1
     jne  .gd_next
+    ; hash at rbx+4 -> resolve to height
+    mov  [s_ptr], rbx
+    mov  rdi, [s_htidx]
+    lea  rsi, [rbx+4]
+    lea  rdx, [s_fh]
+    call idx_get
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jz   .gd_next
+    ; load block into sb_buf
+    mov  [s_ptr], rbx
+    mov  rdi, [s_st]
+    mov  rsi, [s_fh]
+    lea  rdx, [sb_buf]
+    mov  rcx, (8<<20)
+    call node_serve_block
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jle  .gd_next
+    mov  [s_blen_spill], rax
+    ; choose/rotate the nonce (fixed seed is fine for deterministic tests)
+    mov  rcx, [s_cmpct_nonce]
+    test rcx, rcx
+    jnz  .gc_nonce_ok
+    mov  rcx, 0x0123456789abcdef
+    mov  [s_cmpct_nonce], rcx
+.gc_nonce_ok:
+    ; cmpctblock_build(bt_buf, sb_buf, blen, nonce)
+    mov  [s_ptr], rbx
+    lea  rdi, [bt_buf]
+    lea  rsi, [sb_buf]
+    mov  rdx, [s_blen_spill]
+    call cmpctblock_build
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jle  .gd_next
+    mov  r8d, eax           ; cmpctblock length
+    ; p2p_write(fd, "cmpctblock", 10, bt_buf, len)
+    mov  [s_ptr], rbx
+    mov  rdi, r12
+    lea  rsi, [cn_cmpct]
+    mov  rdx, 10
+    lea  rcx, [bt_buf]
+    call p2p_write
+    mov  rbx, [s_ptr]
+    add  qword [s_served], 1
+    jmp  .gd_next
+    ; ---- serve a full block (type 2) ----
+.gd_block:
     ; hash at rbx+4; idx_get(ht_idx, hash, &fh)
     mov  [s_ptr], rbx
     mov  rdi, [s_htidx]      ; use the stable copy (a callee clobbers r15)
@@ -556,10 +638,13 @@ node_serve_loop:
     call p2p_write
     jmp  .next
 
-.maybe_getblocks:
-    ; "getblocks" = g e t b l o c k s. dword0 dispatch already guarantees "getb";
-    ; confirm cmd[4..7]="lock" (getheaders has "ead\u...." there). Note we must
-    ; compare all FOUR bytes: 'k' sits at cmd[7], so the LE dword is 0x6b636f6c.
+.maybe_getb:
+    ; "getb..." splits into "getblocks" (cmd[4..7]=="lock" then cmd[8..11]==0)
+    ; and "getblocktxn" (cmd[4..7]=="lock", cmd[8..11]=="txn\0" -> 0x006e7874).
+    ; Check the "txn\0" suffix at cmd[8..11] first.
+    cmp  dword [s_cmd+8], 0x006e7874 ; "txn\0"
+    je   .do_getblocktxn
+    ; else must be the classic getblocks -> require "lock" at cmd[4..7]
     cmp  dword [s_cmd+4], 0x6b636f6c ; "lock"
     jne  .next
     ; payload: version(4) count(1) locator-hash(32) stop(32) ; locator at pl+5
@@ -692,6 +777,157 @@ node_serve_loop:
     call p2p_write
     jmp  .next
 
+.maybe_sendcmpct:
+    ; "sendcmpct": dword0 already "send"; confirm cmd[4]=='c' and cmd[5]=='m'
+    cmp  byte [s_cmd+4], 'c'
+    jne  .next
+    cmp  byte [s_cmd+5], 'm'
+    jne  .next
+    ; payload = announce(u8) || version(u64 LE), 9 bytes
+    mov  rax, [s_plen]
+    cmp  rax, 9
+    jb   .next
+    mov  al, [pl_buf]          ; announce (high-bandwidth flag)
+    mov  rdx, [pl_buf+1]       ; version
+    cmp  rdx, 2
+    jne  .next                 ; only support version 2 (BIP152 witness)
+    mov  qword [s_cmpct_v2], 1
+    movzx rax, byte [pl_buf]
+    test rax, rax
+    jz   .sc_low
+    mov  qword [s_cmpct_hb], 1
+    jmp  .next
+.sc_low:
+    mov  qword [s_cmpct_hb], 0
+    jmp  .next
+
+.do_getblocktxn:
+    ; payload: blockhash(32) || count(varint) || indexes (DifferenceFormatter
+    ; encoded: stored[i]=idx-shift; shift=idx+1). We serve a blocktxn reply with
+    ; exactly the requested txs (witness included) from the stored block.
+    mov  rax, [s_plen]
+    cmp  rax, 33
+    jb   .next
+    ; load the requested block by hash into sb_buf
+    ; node_serve_block_by_hash(st, hash, out, cap) -> len
+    mov  rdi, [s_st]
+    lea  rsi, [pl_buf]
+    lea  rdx, [sb_buf]
+    mov  rcx, (8<<20)
+    call node_serve_block_by_hash
+    mov  [s_blen_spill], rax   ; block length (preserved)
+    test rax, rax
+    jle  .next
+    ; parse indexes (DifferenceFormatter) from pl_buf+33...
+    mov  qword [s_idxn], 0
+    mov  qword [s_diffshift], 0
+    ; count varint at pl_buf+32
+    lea  rbx, [pl_buf+32]      ; cursor (rbx is free, outer counter in r15/rbp)
+    xor  ecx, ecx
+    mov  cl, byte [rbx]
+    cmp  cl, 0xfd
+    jae  .gbtx_bigcnt
+    inc  rbx
+    jmp  .gbtx_cnthave
+.gbtx_bigcnt:
+    cmp  cl, 0xfd
+    jne  .gbkt_done            ; unsupported varint form -> bail (send nothing)
+    movzx rcx, word [rbx+1]
+    add  rbx, 3
+.gbtx_cnthave:
+    ; rcx = number of indexes. Parse each diff varint.
+.gbtx_idxloop:
+    test rcx, rcx
+    jz   .gbkt_build
+    ; parse a varint diff value at rbx
+    xor  edx, edx
+    mov  dl, byte [rbx]
+    cmp  dl, 0xfd
+    jb   .gbtx_d1
+    cmp  dl, 0xfd
+    jne  .gbkt_done
+    movzx rdx, word [rbx+1]
+    add  rbx, 3
+    jmp  .gbtx_dhave
+.gbtx_d1:
+    inc  rbx
+.gbtx_dhave:
+    ; index = shift + diff
+    mov  rax, [s_diffshift]
+    add  rax, rdx
+    ; store index (u16) in s_idxbuf[ idxn*2 ]
+    mov  rdx, [s_idxn]
+    mov  word [s_idxbuf + rdx*2], ax
+    inc  qword [s_idxn]
+    ; shift = index + 1
+    inc  rax
+    mov  [s_diffshift], rax
+    dec  rcx
+    jmp  .gbtx_idxloop
+.gbkt_build:
+    ; Build blocktxn into bt_buf = blockhash(32) + count(varint) + concat txs.
+    ; blockhash = original request's pl_buf[0:32] (echoed back)
+    lea  rdi, [bt_buf]
+    lea  rsi, [pl_buf]
+    mov  rdx, 32
+    call memcpy_len
+    ; count varint from s_idxn
+    lea  rdi, [bt_buf+32]
+    mov  rsi, [s_idxn]
+    call varint_put
+    ; running write offset = 32 + countbytes
+    add  rax, 32
+    mov  [s_p], rax
+    ; for each requested index j, copy that tx from sb_buf into bt_buf
+    mov  qword [s_cnt], 0     ; j = 0
+.gbtx_txloop:
+    mov  rax, [s_cnt]
+    cmp  rax, [s_idxn]
+    jae  .gbkt_send
+    ; block_tx_at(sb_buf, blen, idx, out_ptr=rcx, out_len=r8)
+    ;   out_ptr -> s_fh (slot), out_len -> s_blen (slot); args in regs
+    movzx rdx, word [s_idxbuf + rax*2]   ; index
+    lea  rdi, [sb_buf]                    ; blockbuf
+    mov  rsi, [s_blen_spill]              ; blen  (preserved block length)
+    lea  rcx, [s_txptr]                   ; out_ptr
+    lea  r8,  [s_txlen]                   ; out_len
+    ; save loop vars (caller-saved across block_tx_at + memcpy_len)
+    mov  rax, [s_cnt]
+    mov  [s_j], rax
+    call block_tx_at
+    test rax, rax
+    jz   .gbkt_done
+    ; dst = bt_buf + s_p ; src = s_txptr ; n = s_txlen
+    mov  rax, [s_p]
+    lea  rdi, [bt_buf + rax]
+    mov  rsi, [s_txptr]
+    mov  rdx, [s_txlen]
+    push rbx
+    call memcpy_len
+    pop  rbx
+    ; advance offset
+    mov  rax, [s_p]
+    add  rax, [s_txlen]
+    mov  [s_p], rax
+    ; next j
+    mov  rax, [s_j]
+    inc  rax
+    mov  [s_cnt], rax
+    jmp  .gbtx_txloop
+.gbkt_send:
+    ; p2p_write(fd, "blocktxn", 8, bt_buf, len)
+    mov  rdi, r12
+    lea  rsi, [cn_btxn]
+    mov  rdx, 8
+    lea  rcx, [bt_buf]
+    mov  r8d, [s_p]
+    call p2p_write
+    ; served++
+    add  qword [s_served], 1
+    jmp  .next
+.gbkt_done:
+    jmp  .next
+
 .next:
     dec  r15
     jg   .outer
@@ -718,6 +954,33 @@ memcpy_len:
     inc  rcx
     jmp  .c
 .cd:
+    ret
+
+; helper: varint_put(dst=rdi, val=rsi) -> rax bytes written (1/3/5/9)
+varint_put:
+    cmp  rsi, 0xfd
+    jb   .v1
+    cmp  rsi, 0xffff
+    jbe  .v3
+    cmp  rsi, 0xffffffff
+    jbe  .v5
+    mov  byte [rdi], 0xff
+    mov  [rdi+1], rsi
+    mov  rax, 9
+    ret
+.v5:
+    mov  byte [rdi], 0xfe
+    mov  dword [rdi+1], esi
+    mov  rax, 5
+    ret
+.v3:
+    mov  byte [rdi], 0xfd
+    mov  word [rdi+1], si
+    mov  rax, 3
+    ret
+.v1:
+    mov  byte [rdi], sil
+    mov  rax, 1
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
