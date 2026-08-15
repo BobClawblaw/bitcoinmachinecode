@@ -28,6 +28,9 @@ default rel
     extern amr_get_i
     extern p2p_addr_v1
     extern idx_get
+    extern idx_put
+    extern store_append
+    extern cons_verify
     extern node_serve_block
     extern node_log_event
     extern block_hash
@@ -105,6 +108,8 @@ s_from:   dq 0
 s_htidx:  dq 0     ; stable copy of ht_idx (a callee clobbers r15; store it once)
 s_txid:   times 32 db 0 ; inbound tx's computed BIP141 txid
 s_st:     dq 0     ; stable copy of the store context (r14 also at risk)
+s_fd:     dq 0     ; stable copy of the peer fd (r12 at risk: cons_verify clobbers it)
+s_lfd:    dq 0     ; stable copy of the log fd (r13 at risk)
 
 section .text
 
@@ -135,6 +140,8 @@ node_serve_loop:
     mov  r13, rsi            ; lfd
     mov  r14, rdx            ; st
     mov  r15, rcx            ; ht_idx
+    mov  [s_fd], rdi         ; stable fd copy (cons_verify clobbers r12-r15)
+    mov  [s_lfd], rsi        ; stable lfd copy
     mov  [s_htidx], rcx      ; keep a stable copy (a downstream callee clobbers r15)
     mov  [s_st], rdx         ; stable copy of st
     mov  qword [s_served], 0 ; served count
@@ -170,11 +177,11 @@ node_serve_loop:
     call p2p_write
     mov  byte [s_feesent], 1
 
-    ; Outer-loop counter lives in r15. r15 is written ONLY here (entry); all
-    ; handlers avoid it and reuse rbx as scratch (getdata item pointer etc.).
-    ; r15 is callee-saved so the external calls (p2p_read, idx_get,
-    ; node_serve_block, p2p_write) preserve it across the whole loop.
-    mov  r15, 10000          ; outer loop bound
+    ; r15 was written at entry and is no longer used as an iteration counter
+    ; (see `.done` -- the loop is now unbounded, terminating only on connection
+    ; close). Handlers avoid r15 and reuse rbx as scratch (getdata item pointer
+    ; etc.); r15 is callee-saved so the external calls preserve it.
+    mov  r15, 10000          ; (retained: reserved, unused bound)
 .outer:
     ; ---- read a message ----
     mov  qword [s_plen], 0
@@ -205,6 +212,8 @@ node_serve_loop:
     je   .do_inv
     cmp  dword [s_cmd], 0x00007874   ; "tx"
     je   .do_tx
+    cmp  dword [s_cmd], 0x636f6c62   ; "bloc" ("block" command byte0..3, LE)
+    je   .do_block
     cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct / sendheaders)
     je   .maybe_sendcmpct
     cmp  dword [s_cmd], 0x66656566   ; "feef" (feefilter)
@@ -305,6 +314,69 @@ node_serve_loop:
     lea  rdx, [pl_buf]
     mov  rcx, [s_plen]
     call mpool_put
+    jmp  .next
+
+.do_block:
+    ; ---- inbound `block` message: the response to a getdata we sent from an
+    ; inv (or a peer pushing a block directly). This is the receive/validate/
+    ; store half of relay keep-up -- without it the serve loop relayed invs
+    ; but never advanced its own store. Drain ONE block here (pl_buf).
+    ; Guard 1: minimum block = 80-byte header + count byte.
+    mov  rax, [s_plen]
+    cmp  rax, 81
+    jb   .next
+    ; Guard 2: consensus validation. cons_verify(pl_buf, s_plen, scratch, cap)
+    ; uses a 1MB reconstruction scratch below rbp internally; pass hp_buf
+    ; (idle here) as the scratch source. Returns 1 = valid.
+    lea  rdi, [pl_buf]
+    mov  rsi, rax             ; s_plen
+    lea  rdx, [hp_buf]        ; scratch
+    mov  rcx, (2000*81+8)     ; cap
+    call cons_verify
+    ; cons_verify does NOT preserve r12-r15 (it pushes only rbp/rbx), so it
+    ; clobbered the serve loop's fd/ht/st live registers. Restore the ones the
+    ; rest of the loop relies on from their stable static copies.
+    mov  r12, [s_fd]
+    mov  r13, [s_lfd]
+    mov  r14, [s_st]
+    test rax, rax
+    jz   .next                ; invalid block -> ignore
+    ; Guard 3: re-derive the block hash from its 80-byte header and require it
+    ; to be unknown (not already in the hash index). If we already have it,
+    ; this is a duplicate relay -- skip, no re-store.
+    ; block_hash(out=sb_buf+0x200000, hdr=pl_buf). NOTE: pl_buf may be clobbered
+    ; by later calls, so compute the hash BEFORE store_append/idx_put.
+    lea  rdi, [sb_buf+0x200000]
+    lea  rsi, [pl_buf]
+    call block_hash
+    ; already have it? idx_get(ht_idx, hash, &s_fh)
+    mov  rdi, [s_htidx]
+    lea  rsi, [sb_buf+0x200000]
+    lea  rdx, [s_fh]
+    call idx_get
+    test rax, rax
+    jnz  .next                ; duplicate -> skip
+    ; store_append(st, hash, pl_buf, s_plen) -- sequential append at current
+    ; tip; valid for the single-authority serve store (st+40 is NOT a flock fd
+    ; in the serve daemon, so store_append_shared must not be used here).
+    mov  rdi, [s_st]
+    lea  rsi, [sb_buf+0x200000]
+    lea  rdx, [pl_buf]
+    mov  rcx, [s_plen]
+    call store_append
+    test rax, rax
+    jle  .next
+    ; index it (freshly-stored block becomes serveable by hash O(1)):
+    ; idx_put(ht_idx, hash, height=newtip). New tip = rax (store_append returns
+    ; the appended position). idx_put(idx, hash, height).
+    push rax                  ; save height across idx_put
+    mov  rdi, [s_htidx]
+    lea  rsi, [sb_buf+0x200000]
+    pop  rdx                  ; height
+    call idx_put
+    ; bump the served/blocks counter + tip-watch will announce the new tip next
+    ; iteration (s_lasttip is stale -> .next announces it exactly once).
+    inc  qword [s_served]
     jmp  .next
 
 .maybe_getaddr:
@@ -1006,8 +1078,11 @@ node_serve_loop:
     mov  rax, [s_cnt]
     mov  [s_lasttip], rax
 .tw_done:
-    dec  r15
-    jg   .outer
+    ; LONG-RUNNING: do not count down to an exit. Real termination is handled
+    ; only by connection close / error (p2p_read <= 0 jumps straight to `.done`).
+    ; This lets the node serve + keep current continuously instead of exiting
+    ; after a fixed iteration budget.
+    jmp  .outer
 .done:
     mov  rax, [s_served]
     add  rsp, 0x50

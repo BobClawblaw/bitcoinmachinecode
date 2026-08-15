@@ -19,6 +19,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -47,6 +49,8 @@ extern long p2p_addr_v1(void* out, const void* src, long n);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
 extern long node_ibd(int fd, void* st, void* hst, void* buf, long buflen); /* bitcoind.asm */
+extern long node_drain(int fd, void* st, void* buf, long buflen);          /* bitcoind.asm */
+extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count); /* bitcoind.asm */
 extern int  hst_init(void* hst);
 extern long hst_count(void* hst);
 extern int  hst_get_at(void* hst, unsigned long long height, void* out);
@@ -122,6 +126,66 @@ static int lsock(int port){
     if(bind(l,(struct sockaddr*)&a,sizeof a)<0){ perror("bind"); return -1; }
     if(listen(l,8)<0){ perror("listen"); return -1; }
     return l;
+}
+
+/* ---- BEST-EFFORT OUTBOUND CATCH-UP (stays-up-to-date on boot) ----
+ * The serve loop is inbound-only; without an outbound connection the node can
+ * never pull missed blocks. On serve startup we try real mainnet seeds (via the
+ * verified asm tcp_connect_ip + node_handshake) and run the verified asm
+ * node_drain per-peer download loop to catch up the store to the chain tip.
+ * It is deliberately best-effort and non-fatal: any seed/network failure falls
+ * straight through to serving (the node still serves whatever it has, and the
+ * new bitcoin_serve.asm `.do_block` keep-up path stores any block a peer later
+ * pushes). Returns the count of blocks added on success, 0/-1 on no-network.
+ * Sieve out peers that hang: a 10s recv timeout + per-seed cap. */
+static const char* catchup_seeds[] = {
+    "seed.bitcoin.sipa.be",
+    "dnsseed.bluematt.me",
+    "seed.bitcoinstats.com",
+    "seed.bitcoin.jonasschnelli.ch",
+    "seed.btc.petertodd.net",
+    "seed.bitcharcoal.com",
+    "seed.bitcoin.wiz.biz"
+};
+static long outbound_catchup(void){
+    static unsigned char cbuf[4<<20];
+    long total=0;
+    for(size_t s=0; s<sizeof(catchup_seeds)/sizeof(catchup_seeds[0]); s++){
+        const char* host=catchup_seeds[s];
+        struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+        if(getaddrinfo(host,NULL,&h,&res)!=0) continue;
+        unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+        freeaddrinfo(res);
+        int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
+        if(fd<0) continue;
+        struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
+        setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        if(node_handshake(fd)!=1){ close(fd); continue; }
+        /* ACTIVE headers-first catch-up (node_sync sends getheaders and pulls
+         * real blocks -- NOT the passive node_drain, which waits for an inv the
+         * seed never pushes to a fresh peer). Anchor the locator to our STORED
+         * TIP so we only pull the missing tail (true incremental "stay current"),
+         * falling back to a zero locator (full download) only when the store is
+         * empty. node_sync advances its locator to the last stored hash after
+         * each page and stops when the peer serves zero headers == we are at the
+         * chain tip. Each block is cons_verify-validated with a re-derived-hash
+         * guard before store_append -- the same verified asm path as `follow`. */
+        static unsigned char loc[32];
+        int t = *(int*)(store_buf+24);
+        if(t>=0){
+            static unsigned char hd[80];
+            long L = node_serve_block(store_buf, t, hd, sizeof hd);
+            if(L>=80) block_hash(loc, hd);
+            else memset(loc,0,32);
+        } else memset(loc,0,32);
+        long cnt=0;
+        long ok=node_sync(fd, store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
+        int tip=*(int*)(store_buf+24);
+        fprintf(stderr,"[catchup] %-28s sync ok=%ld new=%ld tip=%d\n", host, ok, cnt, tip);
+        close(fd);
+        if(ok==1 && cnt>0){ total=cnt; break; }
+    }
+    return total;
 }
 
 static unsigned char fake_blocks[8][4096]; static long fake_blen[8]; static unsigned char fake_bh[8][32]; static int fake_NB=0;
@@ -517,6 +581,12 @@ int main(int argc, char** argv){
     if(strcmp(mode,"serve")==0 && argc>=4){
         int port = atoi(argv[3]);
         store_reload(store_buf);            /* load the persisted chain from disk */
+        /* BEST-EFFORT OUTBOUND CATCH-UP (non-fatal): pull any missed blocks from
+         * a real seed before serving so the node is as current as the network
+         * allows on boot. Falls through cleanly with no network. */
+        long caught = outbound_catchup();
+        if(caught>0)
+            fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (serve mode)", 22);

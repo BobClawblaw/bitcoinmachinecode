@@ -1,0 +1,407 @@
+{
+ "generated": "2026-08-15T14:11:39Z",
+ "tip": 962580,
+ "accept": [
+  {
+   "h": 227931,
+   "hash": "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
+   "asm_ok": 1
+  },
+  {
+   "h": 227932,
+   "hash": "000000000000019c2f79d19c74d62319426b55e5e373393f75852e20b8e7cc61",
+   "asm_ok": 1
+  },
+  {
+   "h": 227933,
+   "hash": "00000000000001cfb5a8379a50343447f4d60fb91dddb620f2416d47940128a2",
+   "asm_ok": 1
+  },
+  {
+   "h": 227934,
+   "hash": "00000000000000907b91daf9f25aba0af5e5b0575c6f2be2a8a1f78294e06107",
+   "asm_ok": 1
+  },
+  {
+   "h": 227935,
+   "hash": "000000000000023501d11cde4871e153e0f46a89b0dc3221bc40244288265b87",
+   "asm_ok": 1
+  },
+  {
+   "h": 227936,
+   "hash": "000000000000016eb0a909f9f091a2fe9aaf746947dbd387cfc3776fae7376ca",
+   "asm_ok": 1
+  },
+  {
+   "h": 227937,
+   "hash": "00000000000001d863387787a259f780c1a33adba0825d7567d6a77cc895e771",
+   "asm_ok": 1
+  },
+  {
+   "h": 227938,
+   "hash": "00000000000001f205a713a6e23dd2f8c3eed42ffbd765bdfe54d353757ee18a",
+   "asm_ok": 1
+  },
+  {
+   "h": 227939,
+   "hash": "0000000000000245dfb6301a7d977bb5412335afbd4608cf73a332ed21263622",
+   "asm_ok": 1
+  },
+  {
+   "h": 227940,
+   "hash": "000000000000017760e964f1e54abad7b2aebefb9023f42324ea4548db9b3737",
+   "asm_ok": 1
+  },
+  {
+   "h": 227941,
+   "hash": "00000000000002143ab408abc2bc52f0f434251a2cf0cd410c3bf7d6f83d815e",
+   "asm_ok": 1
+  },
+  {
+   "h": 227942,
+   "hash": "000000000000011b2308956fd493393145fd983f4ae33c3b15685a2c4fe1a8fd",
+   "asm_ok": 1
+  },
+  {
+   "h": 227943,
+   "hash": "000000000000018893166f25b269aa5766dea148732ad103be35424094fa2882",
+   "asm_ok": 1
+  },
+  {
+   "h": 227944,
+   "hash": "000000000000009d3cab450bb97b37aff31fc1846718428d57b732d3e75d5e06",
+   "asm_ok": 1
+  },
+  {
+   "h": 227945,
+   "hash": "00000000000001f95a6a70039a4fb552e7039b6e9992005787e758fd53a077ec",
+   "asm_ok": 1
+  },
+  {
+   "h": 227946,
+   "hash": "0000000000000085591b53c9d4e9e74b84630d44539996ea465a33c168c5f30d",
+   "asm_ok": 1
+  },
+  {
+   "h": 227947,
+   "hash": "000000000000003964eee6ee03ff0830dd0b317bbbcf864f4f3bc95261863e00",
+   "asm_ok": 1
+  },
+  {
+   "h": 227948,
+   "hash": "000000000000000f9fd659da8226afc1a851f24a5b21d04be4f2226099e351e3",
+   "asm_ok": 1
+  },
+  {
+   "h": 227949,
+   "hash": "0000000000000011801510ace942617ed8688ff5a3cb98a4c712d9eb787158b6",
+   "asm_ok": 1
+  },
+  {
+   "h": 227950,
+   "hash": "000000000000016260d5631413100b02b822c1a25b86f39ac7b1b8ac745fea5f",
+   "asm_ok": 1
+  },
+  {
+   "h": 227951,
+   "hash": "00000000000001b29e89f70556c76bb8717059f515e42904f237cec9c8d028fb",
+   "asm_ok": 1
+  },
+  {
+   "h": 227952,
+   "hash": "0000000000000203a2f5fdad5d64b109ab64b9331fb3aa28e814f9390e411acf",
+   "asm_ok": 1
+  },
+  {
+   "h": 227953,
+   "hash": "00000000000001c1c60ccc181159f351691d12cafc6665ca328618b5d4e6a0e4",
+   "asm_ok": 1
+  },
+  {
+   "h": 227954,
+   "hash": "000000000000003a0e9b642d627fbfe8e07d8b946680c5dadc070dcacb754a29",
+   "asm_ok": 1
+  },
+  {
+   "h": 227955,
+   "hash": "000000000000008e11ab8264f82e26b4f185fd86ca9f7633bab446558fe16a96",
+   "asm_ok": 1
+  },
+  {
+   "h": 227956,
+   "hash": "0000000000000263c84d6ce50e0109c369b3ba009bdb03e3cb0f5853b5c7a4d5",
+   "asm_ok": 1
+  },
+  {
+   "h": 227957,
+   "hash": "0000000000000088d490bd1f8aae272acd8ad3e5a0f6dce5974419d3bdfc8b1f",
+   "asm_ok": 1
+  },
+  {
+   "h": 227958,
+   "hash": "00000000000001c8d3154ed6c43f91f7f45ea91c053b5b4a448d54a855b170da",
+   "asm_ok": 1
+  },
+  {
+   "h": 227959,
+   "hash": "00000000000000eae9f09bcae61aa107351f700e85b98e3f7fd78df4b2752840",
+   "asm_ok": 1
+  },
+  {
+   "h": 227960,
+   "hash": "00000000000000bb7761aa19a2faeb2a96690d7a9a059c1818cfdf562d3179fb",
+   "asm_ok": 1
+  },
+  {
+   "h": 227961,
+   "hash": "00000000000000d90c91745f99602cd0406445a7863079bdac4a005775af1340",
+   "asm_ok": 1
+  },
+  {
+   "h": 227962,
+   "hash": "00000000000001c58f5b97b235d5156424ef6488e1b9a9340225575882efc6bb",
+   "asm_ok": 1
+  },
+  {
+   "h": 227963,
+   "hash": "0000000000000098744ee62cb41b5007052f3ecae528f6fd691fa0e119e33f31",
+   "asm_ok": 1
+  },
+  {
+   "h": 227964,
+   "hash": "00000000000000620c6216e5caf50eaffb1af88874052c5fd86c551eaf7111ee",
+   "asm_ok": 1
+  },
+  {
+   "h": 227965,
+   "hash": "000000000000009efc05be08103de782ba1bfb86b839c0a9e8491605cf8059c0",
+   "asm_ok": 1
+  },
+  {
+   "h": 227966,
+   "hash": "0000000000000248a6338f4b5ef6fc52a0f3d77cbe547041349cea764fa59020",
+   "asm_ok": 1
+  },
+  {
+   "h": 227967,
+   "hash": "000000000000005995ee240709f9d9cbf98252c63433e46f9511fe722626b686",
+   "asm_ok": 1
+  },
+  {
+   "h": 227968,
+   "hash": "000000000000027d5714cf08dbee0a67e543681261dc8a93c9b8d15047bdd604",
+   "asm_ok": 1
+  },
+  {
+   "h": 227969,
+   "hash": "00000000000000dbc8947f931b8e7caabe07abb549142b55a5dce0bd8a428ac6",
+   "asm_ok": 1
+  },
+  {
+   "h": 227970,
+   "hash": "000000000000012a84c772fd97b3456e5aea18f9d1c11ba042c2a828616dfafc",
+   "asm_ok": 1
+  },
+  {
+   "h": 227971,
+   "hash": "00000000000000cd9c07f53f56a82d1fb4c67b56f14a2e7bb852d83a3c902d82",
+   "asm_ok": 1
+  },
+  {
+   "h": 227972,
+   "hash": "0000000000000267a5f91133fa0b746529614e35828d992223dbfeedd53df093",
+   "asm_ok": 1
+  },
+  {
+   "h": 227973,
+   "hash": "000000000000003c0b63dd0fa47df3b8a67e12fb7007454531ef28fbd45f6447",
+   "asm_ok": 1
+  },
+  {
+   "h": 227974,
+   "hash": "000000000000007334cbb85c4fe48d8b131a12d88a52ec9bc057a72db651ff60",
+   "asm_ok": 1
+  },
+  {
+   "h": 227975,
+   "hash": "000000000000013ee2671205bc9d0a212ed7dec00cb8ed2f8a4eb3102297ab5d",
+   "asm_ok": 1
+  },
+  {
+   "h": 227976,
+   "hash": "000000000000020abd78c7b0d40c19c051ba4fa4f16888956a92428cb56eac36",
+   "asm_ok": 1
+  },
+  {
+   "h": 227977,
+   "hash": "000000000000010cc3efed0dbd8138b4a559c0df51e6d5e5c414b9467abbeeb5",
+   "asm_ok": 1
+  },
+  {
+   "h": 227978,
+   "hash": "00000000000001b6ebe9c07606d5badb3abc53d901d214a13c9a858420409fd5",
+   "asm_ok": 1
+  },
+  {
+   "h": 227979,
+   "hash": "0000000000000273c7e49492ec66a0a477f605ad291aeb6b0235e6bc663b286a",
+   "asm_ok": 1
+  },
+  {
+   "h": 227980,
+   "hash": "0000000000000002b81e8db517531c72a4a7059d22d1a609f44065797962f4c7",
+   "asm_ok": 1
+  },
+  {
+   "h": 227981,
+   "hash": "00000000000000bace71d8d3d82df74f93c3e14b8b3011cab16167ca3fc8015f",
+   "asm_ok": 1
+  },
+  {
+   "h": 227982,
+   "hash": "00000000000001eb42002fa8a967a9ee0f0788a2433f1d067b04ad1e41ce7b9b",
+   "asm_ok": 1
+  },
+  {
+   "h": 227983,
+   "hash": "00000000000000c3620303e51241ac227ceb03bbe2a15b6452d80c44cd2b3404",
+   "asm_ok": 1
+  },
+  {
+   "h": 227984,
+   "hash": "0000000000000024eae4bbdcb36ed3b624b32bf2017fbee2b2d7ecc33cc6b127",
+   "asm_ok": 1
+  },
+  {
+   "h": 227985,
+   "hash": "000000000000010e5438f7dfa83d5476f2e08ab7299e025a392d215d1232afa1",
+   "asm_ok": 1
+  },
+  {
+   "h": 227986,
+   "hash": "00000000000001bb47949c589e72029d696437f3e3bb04b7daaf90dbbc8ec275",
+   "asm_ok": 1
+  },
+  {
+   "h": 227987,
+   "hash": "000000000000026188bd555cc63526a178b203bb25089c92cfec223d80cae879",
+   "asm_ok": 1
+  },
+  {
+   "h": 227988,
+   "hash": "0000000000000151e2b1184704de6a16d326d9d3bdb9118d2c8f7756c7aa124c",
+   "asm_ok": 1
+  },
+  {
+   "h": 227989,
+   "hash": "00000000000001563801836d51506812ac23bf07a0f4add6cf95637bedef4ea2",
+   "asm_ok": 1
+  },
+  {
+   "h": 227990,
+   "hash": "0000000000000091b276f41e586af5d6f841bc6f51173fa7a594fc6b93f36e76",
+   "asm_ok": 1
+  }
+ ],
+ "reject": [
+  {
+   "h": 227931,
+   "mut": "flip-merkle-byte@41",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "high-hash"
+  },
+  {
+   "h": 227931,
+   "mut": "flip-tx-byte@59142",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "bad-txnmrklroot"
+  },
+  {
+   "h": 227931,
+   "mut": "corrupt-txcount@80",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "core-rpc-error"
+  },
+  {
+   "h": 227931,
+   "mut": "corrupt-prevblock@4+",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "high-hash"
+  },
+  {
+   "h": 227931,
+   "mut": "truncate-32",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "core-rpc-error"
+  },
+  {
+   "h": 227931,
+   "mut": "flip-nonce@76",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "high-hash"
+  },
+  {
+   "h": 227932,
+   "mut": "flip-merkle-byte@42",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "high-hash"
+  },
+  {
+   "h": 227932,
+   "mut": "flip-tx-byte@12236",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "bad-txnmrklroot"
+  },
+  {
+   "h": 227932,
+   "mut": "corrupt-txcount@80",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "core-rpc-error"
+  },
+  {
+   "h": 227932,
+   "mut": "corrupt-prevblock@4+",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "high-hash"
+  },
+  {
+   "h": 227932,
+   "mut": "truncate-32",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "core-rpc-error"
+  },
+  {
+   "h": 227932,
+   "mut": "flip-nonce@76",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "high-hash"
+  },
+  {
+   "h": 227932,
+   "mut": "corrupt-tx0-version",
+   "asm_reject": true,
+   "core_reject": true,
+   "core_verdict": "bad-txnmrklroot"
+  }
+ ],
+ "divergences": [],
+ "stats": {
+  "accept_run": 60,
+  "accept_ok": 60,
+  "reject_run": 13,
+  "reject_agree": 13,
+  "txid_ok": 120
+ }
+}
