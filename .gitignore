@@ -119,6 +119,8 @@ asm/tests/test_tapscript_interp
 asm/tests/test_schnorr
 asm/tests/test_taproot
 asm/tests/test_taproot_sighash
+asm/tests/test_segwit_sighash
+asm/tests/test_mempool_accept_modern
 asm/daemon/wallet_cli
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----

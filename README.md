@@ -351,6 +351,22 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   cross-checked by the independent pure-Python oracle
   (`asm/validation/gen_taproot_vectors.py`). `test_taproot_sighash` 48 checks
   green; `make test` suite green.
+- **Witness-v0 + taproot full mempool acceptance parity vs Core** —
+  modern-output transactions (P2WPKH / P2WSH / P2TR) through the entire
+  mempool-acceptance pipeline. BIP143 segwit-v0 sighash
+  (`asm/bitcoin_segwit.c`, mirroring Core `SignatureHash WITNESS_V0`) verified
+  byte-exact against the official BIP-0143 test vector via the independent
+  Python oracle (`asm/validation/gen_modern_vectors.py`); a unified whole-tx
+  validator (`asm/bitcoin_txval_modern.c`) dispatches by prevout type and runs
+  each genuine spend through strip-witness + per-input ECDSA (P2WPKH, P2WSH
+  `OP_CHECKSIG` + 2-of-2 `OP_CHECKMULTISIG`) / Schnorr (P2TR key-path) verify on
+  top of the verified ASM secp256k1; driven end-to-end with the mempool policy
+  layer (`mpool_policy_add`: fee, double-spend, RBF, ancestor limits) in
+  `test_mempool_accept_modern`. Every genuine modern tx is accepted by BOTH
+  policy and whole-tx validation; every negative (corrupted sig, wrong pubkey,
+  absent prevout, double-spend, negative fee) rejected in agreement with Core.
+  `test_segwit_sighash` 17 + `test_mempool_accept_modern` 23 checks green;
+  `make test` suite green. Closes the modern-output validation gap.
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
