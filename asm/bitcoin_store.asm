@@ -25,7 +25,18 @@
 ;   +28   dword cur_file_no     (current block file number)
 ;   +32   dword cur_file_pos    (bytes written in the current block file so far)
 ;   +36   dword magic           (mainnet 0xd9b4bef9)
-;   +40   dword pad             (reserved / alignment)
+;   +40   dword pad             (reserved; store_append_shared uses as flock fd)
+;   +48   dword prune_height    (PRUNING: first height whose block data is
+;                                retained; heights below are deleted/unavailable.
+;                                Default 0 = no pruning. Persisted to prune.dat
+;                                and reloaded by store_init on restart.)
+;
+; PRUNING (mirrors Bitcoin Core's -prune): store_prune(st, prune_height) retains
+;   only the UTXO set + block data at height >= prune_height, unlinks the fully
+;   pruned blk%05d.dat files, compacts the one boundary file, and updates the
+;   index. Above the prune point blocks are still served; below returns
+;   unavailable (store_get_at returns -3). store_set_prune(st, h) configures +
+;   persists the gate without deleting. prune.dat holds the 4-byte LE gate.
 ;
 ; Exports:
 ;   int store_init(void* st)                    -> 1 ok / -errno
@@ -34,10 +45,13 @@
 ;                                               -> new height or -1
 ;   int store_get_at(void* st, u64 height, u64 out_meta[3])
 ;          out_meta[0]=data_pos, out_meta[1]=data_size, out_meta[2]=file_no
-;                                               -> 1 ok / -2 out-of-range / -1 err
+;                                               -> 1 ok / -2 out-of-range
+;                                                  / -3 pruned(unavailable) / -1 err
 ;   int store_get_tip(void* st, u64 out_meta[3]) -> 1 ok / -1 (empty)
 ;   int store_get_file_fd(void* st, u32 file_no) -> fd (open/reopen blk%05d.dat)
 ;                                               -> >=0 or -1
+;   int store_set_prune(void* st, int h)        -> 1 ok (config+persist gate)
+;   int store_prune(void* st, int h)            -> 1 ok (persist + delete files)
 ;
 ; Every function frame: callee-saved save area is [rbp-8 .. -(8*nsaved)], so
 ; ALL stack locals live strictly BELOW it and never overwrite the save slots.
@@ -110,6 +124,7 @@ global store_init
 store_init:
     push rbp
     mov  rbp, rsp
+    push rbx
     push r12
     mov  r12, rdi
     lea  rdi, [rel idxname]
@@ -126,14 +141,45 @@ store_init:
     mov  dword [r12+28], 0      ; cur_file_no = 0
     mov  dword [r12+32], 0      ; cur_file_pos = 0
     mov  dword [r12+36], 0xd9b4bef9
-    mov  dword [r12+40], 0
+    mov  dword [r12+40], 0      ; pad / flock fd (set by shared-append caller)
+    mov  dword [r12+48], 0      ; prune_height = 0 (no pruning by default)
+    ; ---- load persisted prune height from prune.dat (if present) ----
+    ; If a previous run pruned, the block store is missing blk files below the
+    ; persisted prune height; restoring it in-memory is what keeps store_get_at
+    ; returning "pruned/unavailable" (-3) instead of mis-serving from a deleted
+    ; file after restart.
+    lea  rdi, [rel prunename]
+    xor  esi, esi               ; O_RDONLY
+    mov  edx, 0o644
+    mov  eax, 2                 ; open
+    syscall
+    test rax, rax
+    jl   .noprune
+    mov  rbx, rax               ; fd (callee-saved)
+    ; read 4 bytes into rsp scratch
+    mov  rdi, rbx               ; fd
+    lea  rsi, [rsp-8]
+    mov  edx, 4
+    xor  eax, eax               ; read
+    syscall
+    cmp  rax, 4
+    jne  .prcls
+    mov  eax, [rsp-8]
+    mov  [r12+48], eax          ; prune_height
+.prcls:
+    mov  rdi, rbx
+    mov  eax, 3                 ; close
+    syscall
+.noprune:
     mov  rax, 1
     pop  r12
+    pop  rbx
     pop  rbp
     ret
 .fail:
     mov  rax, -1
     pop  r12
+    pop  rbx
     pop  rbp
     ret
 
@@ -319,6 +365,13 @@ store_get_at:
     je   .oor                ; empty
     cmp  r13, rax
     ja   .oor
+    ; ---- pruning gate: height below the configured prune height is
+    ; unavailable (its blk file has been deleted). Return -3 (pruned) so
+    ; node_serve_block/cli_load_block surface it as unavailable, distinct
+    ; from -2 out-of-range and -1 err. ----
+    mov  eax, [r12+48]       ; prune_height
+    cmp  r13d, eax
+    jl   .pruned
     ; seek index to height*48, read 48
     mov  rax, r13
     imul rax, 48
@@ -353,6 +406,16 @@ store_get_at:
     ret
 .oor:
     mov  rax, -2
+    add  rsp, 0x80
+    pop  rbx
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+.pruned:
+    mov  rax, -3
     add  rsp, 0x80
     pop  rbx
     pop  r15
@@ -406,6 +469,434 @@ store_get_tip:
 .ret:
     pop  rbx
     pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; PRUNING MODE  (mirrors Bitcoin Core's -prune)
+;   Retain the UTXO set + the last M blocks / last N MB of block data; delete
+;   pruned blk%05d.dat files. Blocks at height >= prune_height are still
+;   served; blocks below are unavailable (store_get_at returns -3 for them).
+;
+;   prune_height (st+48): the first height whose block data is RETAINED.
+;   Everything below it is deleted. Default 0 (no pruning). Persisted to
+;   prune.dat so a restart restores the same gate.
+;
+;   store_set_prune(st, prune_height)  -> configures + persists the gate only.
+;   store_prune(st, prune_height)      -> configures + persists + PHYSICALLY
+;       deletes the pruned blk files. Uses the "last M blocks" model: caller
+;       passes the absolute prune height, or tip+1 to retain UTXO-only.
+;   Returns 1 on success, -1 on error.
+;
+;   Deletion rule: a blk file is a contiguous run of heights (height is
+;   monotonic non-decreasing in file_no). Files numbered below the file of the
+;   first retained height contain ONLY pruned blocks -> unlink them wholesale.
+;   The one file that straddles prune_height (contains both pruned and retained
+;   blocks) is compacted IN-PLACE: retained blocks are re-packed from offset 0
+;   (safe: each write lands strictly below its read, since new_off == old_off -
+;   pruned_prefix_len) and their index records' data_pos is updated; the file is
+;   then ftruncate()d to the new length to reclaim the pruned prefix bytes.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; store_set_prune(st, prune_height) -> 1 / -1
+;   Persist the prune gate (no physical deletion). Useful as the config path.
+; ----------------------------------------------------------------------------
+global store_set_prune
+store_set_prune:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    sub  rsp, 0x10
+    mov  r12, rdi            ; st
+    mov  eax, esi
+    mov  [r12+48], eax       ; prune_height
+    ; persist to prune.dat (4-byte LE)
+    lea  rdi, [rel prunename]
+    mov  esi, 2 | 0x40 | 0x200   ; O_RDWR | O_CREAT | O_TRUNC
+    mov  edx, 0o644
+    mov  eax, 2              ; open
+    syscall
+    test rax, rax
+    jl   .setfail
+    mov  rbx, rax            ; fd
+    mov  eax, [r12+48]
+    mov  [rsp-8], eax
+    mov  rdi, rbx
+    lea  rsi, [rsp-8]
+    mov  edx, 4
+    mov  eax, 1              ; write
+    syscall
+    cmp  rax, 4
+    jne  .setwfail
+    mov  rdi, rbx
+    mov  eax, 3              ; close
+    syscall
+    mov  rax, 1
+    add  rsp, 0x10
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+.setwfail:
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+.setfail:
+    mov  rax, -1
+    add  rsp, 0x10
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; unlink_blk(st, file_no)  -- remove blk%05d.dat (ignores ENOENT).
+;   frame: rbx,r12,r13,push save area [rbp-8..-0x20]; name buf below.
+; ----------------------------------------------------------------------------
+unlink_blk:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub  rsp, 0x30           ; name[16] below save area
+    mov  r12, rdi
+    mov  r13d, esi
+    lea  rdi, [rbp-0x30]
+    mov  esi, r13d
+    call fmt_blkname
+    lea  rdi, [rbp-0x30]
+    mov  eax, 87             ; unlink
+    syscall
+    add  rsp, 0x30
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; store_prune(st, prune_height) -> 1 / -1
+;   Set + persist the prune gate and physically delete pruned blk files.
+; ----------------------------------------------------------------------------
+global store_prune
+store_prune:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    ; Frame / align: 6 pushes (rbp + 5 callee-saved) occupy rbp-0x08..-0x28.
+    ; ALL locals MUST live strictly BELOW that save area (>= -0x30) or a
+    ; 48-byte record buffer would clobber the saved callee-saved regs -- the
+    ; classic collision this file guards against. 64KB copy buffer sits at
+    ; rbp-0x20000..rbp-0x30000. sub 0x30008 keeps rsp under the buffer bottom
+    ; and 16-aligned (0x28 pushes + 0x30008 -> rsp ≡ 0 mod 16).
+    sub  rsp, 0x30008
+    mov  r12, rdi            ; st (callee-saved across calls)
+    ; Local map (all below rbp-0x30):
+    ;   -0x100 recA[48]  -0x140 recB[48]
+    ;   -0x168 tip  -0x16c eff  -0x170 first_retained_file
+    ;   -0x174 h  -0x178 old_off  -0x17c size  -0x180 remaining  -0x184 chunk
+    ; ---- clamp prune height into [0, tip+1] ----
+    mov  eax, [r12+24]       ; tip
+    cmp  eax, -1
+    je   .empty
+    mov  [rbp-0x168], eax    ; tip
+    mov  eax, esi            ; requested prune_height
+    test eax, eax
+    jns  .nonneg
+    xor  eax, eax            ; clamp negatives to 0
+.nonneg:
+    mov  ecx, [rbp-0x168]    ; tip
+    add  ecx, 1              ; tip+1
+    cmp  eax, ecx
+    jbe  .clamped
+    mov  eax, ecx            ; clamp to tip+1 (UTXO-only retention)
+.clamped:
+    mov  [r12+48], eax       ; prune_height
+    mov  [rbp-0x16c], eax    ; eff
+    test eax, eax
+    jz   .persist_only       ; eff 0 -> nothing deleted, just persist gate
+    ; ---- persist gate first (store_set_prune writes prune.dat) ----
+    mov  rdi, r12
+    mov  esi, [rbp-0x16c]
+    call store_set_prune
+    ; ---- delete fully-pruned blk files ----
+    ; If eff == tip+1 there is no retained block -> delete ALL files.
+    mov  eax, [rbp-0x16c]
+    mov  ecx, [rbp-0x168]
+    add  ecx, 1
+    cmp  eax, ecx
+    je   .prune_all
+    ; first_retained_file = file_no of the block at height=eff
+    mov  rdi, r12
+    mov  esi, eax            ; eff
+    lea  rdx, [rbp-0x100]    ; rec A
+    call read_idx_rec
+    test rax, rax
+    jl   .prfail
+    mov  [rbp-0x170], eax    ; first_retained_file
+    ; delete files 0 .. first_retained_file-1
+    xor  ebx, ebx
+.delfiles:
+    mov  eax, [rbp-0x170]
+    cmp  ebx, eax
+    jae  .deldone
+    mov  rdi, r12
+    mov  esi, ebx
+    call unlink_blk
+    inc  ebx
+    jmp  .delfiles
+.deldone:
+    ; ---- compact the boundary file (first_retained_file) in place ----
+    mov  rdi, r12
+    mov  esi, [rbp-0x170]
+    call open_file           ; open boundary; sets cur_blk_fd
+    test rax, rax
+    jl   .prfail
+    mov  rbx, rax            ; fd (callee-saved)
+    xor  r13d, r13d          ; new_off (callee-saved)
+    mov  eax, [rbp-0x16c]
+    mov  [rbp-0x174], eax    ; h = eff
+.cmploop:
+    ; stop when h passes the tip (boundary file is the last file)
+    mov  eax, [rbp-0x174]
+    cmp  eax, [rbp-0x168]    ; h > tip?
+    ja   .cmpdone
+    mov  rdi, r12
+    mov  esi, [rbp-0x174]
+    lea  rdx, [rbp-0x100]    ; rec A
+    call read_idx_rec
+    test rax, rax
+    jl   .prfail
+    cmp  eax, [rbp-0x170]    ; rec file_no == boundary?
+    jne  .cmpdone
+    mov  eax, [rbp-0x100+36]
+    mov  [rbp-0x178], eax    ; old_off = rec.pos
+    mov  eax, [rbp-0x100+44]
+    mov  [rbp-0x17c], eax    ; size
+    ; copy (8+size) bytes old_off -> new_off; in-place SAFE because each write
+    ; lands at new_off = old_off - pruned_prefix_len (< the read offset).
+    ; The whole [len][magic] frame + payload (8+size bytes) is copied from the
+    ; OLD frame start (old_off) to the NEW frame start (new_off); reading from
+    ; the frame start keeps the read range inside the file for the last block.
+    ; The inner chunk loop makes only syscalls (no calls), so r14/r15 safely
+    ; hold the byte offsets as clean 64-bit pointers across the syscalls.
+    movsxd r14, dword [rbp-0x178]  ; old_ptr = old frame start
+    mov  r15, r13                 ; new_ptr = new frame start
+    mov  eax, [rbp-0x17c]
+    add  eax, 8
+    mov  [rbp-0x180], eax    ; remaining (bytes, kept as dword local)
+.cpychunk:
+    mov  eax, [rbp-0x180]
+    test eax, eax
+    jbe  .cpydone
+    ; chunk = min(remaining, 0x10000)
+    mov  edx, eax
+    cmp  edx, 0x10000
+    jbe  .chunkok
+    mov  edx, 0x10000
+.chunkok:
+    mov  [rbp-0x184], edx    ; chunk (dword)
+    ; lseek(fd, old_ptr, SEEK_SET); read(fd, buf, chunk)
+    mov  rdi, rbx
+    mov  rsi, r14
+    xor  edx, edx
+    mov  eax, 8              ; lseek
+    syscall
+    test rax, rax
+    jl   .prfail
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x20000]  ; copy buf
+    mov  edx, [rbp-0x184]    ; chunk (zero-extends)
+    xor  eax, eax            ; read
+    syscall
+    cmp  eax, [rbp-0x184]
+    jne  .prfail
+    ; lseek(fd, new_ptr, SEEK_SET); write(fd, buf, chunk)
+    mov  rdi, rbx
+    mov  rsi, r15
+    xor  edx, edx
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .prfail
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x20000]
+    mov  edx, [rbp-0x184]
+    mov  eax, 1              ; write
+    syscall
+    cmp  eax, [rbp-0x184]
+    jne  .prfail
+    ; advance pointers / remaining
+    mov  edx, [rbp-0x184]
+    add  r14, rdx
+    add  r15, rdx
+    mov  eax, [rbp-0x180]
+    sub  eax, edx
+    mov  [rbp-0x180], eax
+    jmp  .cpychunk
+.cpydone:
+    ; copy rec A -> rec B, set data_pos := new_off (r13d), write to index
+    lea  rsi, [rbp-0x100]
+    lea  rdi, [rbp-0x140]
+    mov  rcx, 48
+    rep  movsb
+    mov  eax, r13d
+    mov  [rbp-0x140+36], eax ; new data_pos
+    mov  rdi, r12
+    mov  esi, [rbp-0x174]
+    lea  rdx, [rbp-0x140]
+    call write_idx_rec
+    test rax, rax
+    jl   .prfail
+    ; new_off += size+8 ; h++
+    mov  eax, [rbp-0x17c]
+    add  eax, 8
+    add  r13d, eax
+    inc  dword [rbp-0x174]
+    jmp  .cmploop
+.cmpdone:
+    ; ftruncate(fd, new_off) drops the pruned prefix bytes
+    mov  rdi, rbx
+    mov  rsi, r13
+    mov  eax, 77             ; ftruncate
+    syscall
+    test rax, rax
+    jl   .prfail
+    mov  rax, 1
+    jmp  .prdone
+.prune_all:
+    xor  ebx, ebx
+.pall_loop:
+    mov  eax, [r12+28]       ; cur_file_no
+    cmp  ebx, eax
+    ja   .prdone_ok
+    mov  rdi, r12
+    mov  esi, ebx
+    call unlink_blk
+    inc  ebx
+    jmp  .pall_loop
+.prdone_ok:
+    mov  rax, 1
+    jmp  .prdone
+.persist_only:
+    mov  rdi, r12
+    xor  esi, esi
+    call store_set_prune
+    mov  rax, 1
+    jmp  .prdone
+.empty:
+    mov  dword [r12+48], 0
+    mov  rdi, r12
+    xor  esi, esi
+    call store_set_prune
+    mov  rax, 1
+    jmp  .prdone
+.prfail:
+    mov  rax, -1
+.prdone:
+    add  rsp, 0x30008
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; read_idx_rec(st, height, buf)  -> file_no in rax (or -1 on error); fills buf.
+;   Reads the 48-byte index record at height*48 into buf.
+; ----------------------------------------------------------------------------
+read_idx_rec:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub  rsp, 0x10
+    mov  r12, rdi            ; st
+    mov  r13, rsi            ; height
+    mov  r14, rdx            ; buf (callee-saved across syscall)
+    ; lseek(idx_fd, height*48)
+    mov  rdi, [r12+8]
+    mov  rax, r13
+    imul rax, 48
+    mov  rsi, rax
+    xor  edx, edx
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .rerr
+    mov  rdi, [r12+8]
+    mov  rsi, r14            ; buf
+    mov  edx, 48
+    xor  eax, eax
+    syscall
+    cmp  rax, 48
+    jne  .rerr
+    mov  eax, [r14+32]       ; file_no
+    jmp  .rok
+.rerr:
+    mov  rax, -1
+.rok:
+    add  rsp, 0x10
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; write_idx_rec(st, height, buf) -> 1 ok / -1 err
+;   Writes the 48-byte record in buf at index offset height*48.
+; ----------------------------------------------------------------------------
+write_idx_rec:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub  rsp, 0x10
+    mov  r12, rdi            ; st
+    mov  r13, rsi            ; height
+    mov  r14, rdx            ; buf
+    ; lseek(idx_fd, height*48)
+    mov  rdi, [r12+8]
+    mov  rax, r13
+    imul rax, 48
+    mov  rsi, rax
+    xor  edx, edx
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .werr
+    mov  rdi, [r12+8]
+    mov  rsi, r14            ; buf
+    mov  edx, 48
+    mov  eax, 1              ; write
+    syscall
+    cmp  rax, 48
+    jne  .werr
+    mov  rax, 1
+    jmp  .wok
+.werr:
+    mov  rax, -1
+.wok:
+    add  rsp, 0x10
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
     pop  rbp
     ret
 
@@ -749,5 +1240,6 @@ open_idx_close:
 section .rodata
 blkname: db "blk00000.dat", 0   ; (fmt_blkname builds actual names at runtime)
 idxname: db "index.dat", 0
+prunename: db "prune.dat", 0
 
 section .note.GNU-stack noalloc noexec nowrite progbits
