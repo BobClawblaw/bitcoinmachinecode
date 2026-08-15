@@ -1,0 +1,11 @@
+  2of3-genuine-accept  flags=00020e15 core=(1,0) asm=(1,0) OK
+  2of3-prebip16        flags=00000614 core=(1,0) asm=(1,0) OK
+  2of3-wrong-sig       flags=00020e15 core=(0,2) asm=(0,2) OK
+  2of3-insufficient    flags=00020e15 core=(0,18) asm=(0,18) OK
+  2of3-bad-redeem      flags=00020e15 core=(0,2) asm=(0,2) OK
+  2of3-null-dummy      flags=00020e15 core=(0,28) asm=(0,28) OK
+  2of3-empty-ss        flags=00020e15 core=(0,18) asm=(0,18) OK
+  1of1-accept          flags=00020e15 core=(1,0) asm=(1,0) OK
+  1of1-wrong-sig       flags=00020e15 core=(0,2) asm=(0,2) OK
+
+==== P2SH differential ==== agree=9/9 divergences=0
