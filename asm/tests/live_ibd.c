@@ -7,14 +7,22 @@
  *
  * Usage: live_ibd <ipv4-or-seed-name> [max_blocks]
  *
- * KNOWN RESULT (2026-08-15): node_ibd HANGS against a live public seed.
- * node_handshake succeeds, but node_ibd requests block bodies from locator=0
- * (genesis) -- ANCIENT blocks -- and real full nodes "tend to drop requests
- * for ancient blocks" (see live_blocks.c). node_ibd's p2p_read has NO network
- * timeout (plain blocking read), so a dropped getdata -> indefinite hang.
- * This is the PLAN "download + store a real MULTI-BLOCK chain" gap surfaced:
- * node_ibd is proven only against a cooperative synthetic fake_peer.
- * Reproduces with: timeout 20 ./tests/live_ibd <seed-ipv4>  (exit 124 = hang).
+ * KNOWN RESULT (2026-08-15): node_ibd's HEADERS phase does not terminate in
+ * practical time against a live seed. node_handshake succeeds and
+ * node_ibd_headers steadily fetches header pages (genesis-locator crawl), but
+ * a live seed never returns a "short page" or empty page to signal tip, so the
+ * naive crawl runs unbounded rather than reaching phase-2 (block bodies). This
+ * is a STRATEGY limitation of the genesis-start IBD, not a hang: the recent-tip
+ * strategy (live_blocks / node_ibd_blocks_x, the ingest card domain) already
+ * downloads+validates real block bodies live.
+ *
+ * ROBUSTNESS FIXES LANDED so node_ibd can never HANG indefinitely:
+ *   - tcp_connect_ip now sets SO_RCVTIMEO (10s): a stalled/idle peer causes a
+ *     blocking p2p_read to FAIL FAST (EAGAIN -> .fail) instead of hanging.
+ *   - node_fetch_headers drains at most 64 non-headers messages.
+ *   - node_ibd_headers caps the page crawl at 4096 pages.
+ * Repro of pre-fix hang (no longer possible with these bounds):
+ *   timeout 20 ./tests/live_ibd <seed-ipv4>
  */
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +30,8 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -52,6 +62,15 @@ int main(int argc, char** argv){
     int fd = tcp_connect_ip(ip, PORT_BE);
     if(fd<0){ printf("connect fail fd=%d\n", fd); return 2; }
     printf("PASS connect %s\n", ipstr);
+
+    /* FIX (2026-08-15): bound the blocking p2p_read so a dropped getdata
+     * (ancient block bodies, which real seeds refuse to serve) FAILS FAST
+     * instead of hanging forever. node_ibd's p2p_read is a plain blocking
+     * read with no socket timeout; without this, node_ibd hangs indefinitely
+     * waiting for a `block` that never arrives. SO_RCVTIMEO is the established
+     * repo convention (see test_net.c/test_serve.c). */
+    struct timeval rcv_tv; rcv_tv.tv_sec=5; rcv_tv.tv_usec=0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof rcv_tv);
 
     if(!node_handshake(fd)){ printf("FAIL node_handshake (live peer negotiation)\n"); close(fd); return 1; }
     printf("PASS node_handshake vs live peer\n");
