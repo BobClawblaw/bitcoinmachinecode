@@ -13,7 +13,7 @@
 extern long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]);
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
-extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20]);
+extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str);
 extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
 extern int  wallet_address(char out[64], const unsigned char priv_be[32]);
@@ -38,7 +38,7 @@ int main(void) {
 
     /* ---- getaddressinfo / validateaddress on known real addresses ---- */
     /* P2PKH 1BgGZ9tc... h160 = 751e76e8199196d454941c45d1b3a323f1433bd6 */
-    ck("valid P2PKH 1BgGZ", wallet_validate_address("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", &type, &ver, h160), 1);
+    ck("valid P2PKH 1BgGZ", wallet_validate_address("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", &type, &ver, h160, NULL), 1);
     ck("  type P2PKH", type, WAL_ADDR_P2PKH);
     ck("  version 0x00", ver, 0x00);
     {
@@ -46,7 +46,7 @@ int main(void) {
         ck("  h160 matches", memcmp(h160, expect, 20) == 0, 1);
     }
     /* P2SH 3J98t1WpEZ... version 5, h160 b472a266d0bd89c13706a4132ccfb16f7c3b9fcb */
-    ck("valid P2SH 3J98", wallet_validate_address("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", &type, &ver, h160), 1);
+    ck("valid P2SH 3J98", wallet_validate_address("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", &type, &ver, h160, NULL), 1);
     ck("  type P2SH", type, WAL_ADDR_P2SH);
     ck("  version 0x05", ver, 0x05);
     {
@@ -54,24 +54,24 @@ int main(void) {
         ck("  h160 matches", memcmp(h160, expect, 20) == 0, 1);
     }
     /* P2WPKH bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4, h160 751e...3bd6 */
-    ck("valid P2WPKH bc1qw508", wallet_validate_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &type, &ver, h160), 1);
+    ck("valid P2WPKH bc1qw508", wallet_validate_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &type, &ver, h160, NULL), 1);
     ck("  type P2WPKH", type, WAL_ADDR_P2WPKH);
     {
         unsigned char expect[20]; hex_in(expect, "751e76e8199196d454941c45d1b3a323f1433bd6");
         ck("  h160 matches", memcmp(h160, expect, 20) == 0, 1);
     }
     /* P2WSH bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3 */
-    ck("valid P2WSH bc1qrp33", wallet_validate_address("bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3", &type, &ver, h160), 1);
+    ck("valid P2WSH bc1qrp33", wallet_validate_address("bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3", &type, &ver, h160, NULL), 1);
     ck("  type P2WSH", type, WAL_ADDR_P2WSH);
 
     /* ---- invalid handles ---- */
-    ck("garbage rejected", wallet_validate_address("notanaddress!!", &type, &ver, h160), 0);
+    ck("garbage rejected", wallet_validate_address("notanaddress!!", &type, &ver, h160, NULL), 0);
     ck("  type invalid", type, WAL_ADDR_INVALID);
     /* corrupt a checksum byte in a valid P2PKH string */
     {
         char bad[] = "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH";
         bad[5] = (bad[5] == 'Z') ? 'Y' : 'Z';
-        ck("corrupt checksum rejected", wallet_validate_address(bad, &type, &ver, h160), 0);
+        ck("corrupt checksum rejected", wallet_validate_address(bad, &type, &ver, h160, NULL), 0);
     }
 
     /* ---- base58check round-trip: encode P2PKH payload, decode back ---- */
@@ -101,11 +101,11 @@ int main(void) {
         ck("getnewaddress idx1 derived", r3 > 0, 1);
         /* each validates as P2WPKH with a 20-byte hash */
         ck("recv[idx0] validates as P2WPKH",
-           wallet_validate_address(recv, &type, &ver, h160) == 1 && type == WAL_ADDR_P2WPKH, 1);
+           wallet_validate_address(recv, &type, &ver, h160, NULL) == 1 && type == WAL_ADDR_P2WPKH, 1);
         ck("chg[idx0] validates as P2WPKH",
-           wallet_validate_address(chg, &type, &ver, h160) == 1 && type == WAL_ADDR_P2WPKH, 1);
+           wallet_validate_address(chg, &type, &ver, h160, NULL) == 1 && type == WAL_ADDR_P2WPKH, 1);
         ck("recv[idx1] validates as P2WPKH",
-           wallet_validate_address(recv2, &type, &ver, h160) == 1 && type == WAL_ADDR_P2WPKH, 1);
+           wallet_validate_address(recv2, &type, &ver, h160, NULL) == 1 && type == WAL_ADDR_P2WPKH, 1);
         /* receive(idx0) != change(idx0) != receive(idx1)  (distinct keys) */
         ck("receive idx0 != change idx0", strcmp(recv, chg) != 0, 1);
         ck("receive idx0 != receive idx1", strcmp(recv, recv2) != 0, 1);
