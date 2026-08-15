@@ -124,9 +124,16 @@ sighash_all:
     mov   rsi, [rbp-0x68]
     call  parse_varint    ; rax = raw scriptSig length; rdi advanced past the varint
     cmp   rax, 0        ; (a zero-length script is legal; we still handled len=0)
-    ; advance txcur past the scriptSig bytes
+    ; advance txcur past the scriptSig bytes, and RE-VALIDATE the resulting
+    ; cursor stays within [tx, txend). A hostile scriptSig length that overruns
+    ; the tx buffer must be rejected here -- otherwise the later raw reads
+    ; (prevout/index, sequence) via copy_bytes would read past the buffer.
+    ; (SECURITY: OOB source read; reproduced as a SIGSEGV on a tx whose
+    ;  scriptSig length field runs past the tx end.)
     mov   rcx, rax
     add   rdi, rcx
+    cmp   rdi, [rbp-0x68]
+    ja    .fail
     mov   [rbp-0x60], rdi
 
     ; script (emit for preimage)
