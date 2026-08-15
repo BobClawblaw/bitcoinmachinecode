@@ -152,7 +152,7 @@ def compute_sighash(script, tx, in_index, hash_type, amount, spent_scriptpubkeys
     is_none = (eff_ht & 0x03) == 2
 
     ext_flag = 1 if leaf_hash is not None else 0
-    annex_present = 0
+    annex_present = 1 if annex is not None else 0
 
     # ----- SigMsg (starts with hash_type) -----
     m = bytes([raw_ht]) + struct.pack('<i', tx['version']) + struct.pack('<I', tx['locktime'])
@@ -265,6 +265,24 @@ def build_contexts():
         'output_x': kp_output.hex(), 'sig': kpsig.hex(), 'key': kp_output.hex(),
     })
 
+    # ---- key-path spend WITH a witness annex (BIP341 annex rules) ----
+    # Same output key / tx; the annex flips spend_type bit0 and commits
+    # sha256(compactsize(len)||annex) into the SigMsg, so the sighash differs.
+    annex = bytes([0x50, 0x11, 0x22, 0x33])   # attestation-flag annex (0x50 0x4c00..)
+    ann_sighash, ann_pre = compute_sighash(kp_spk[0], kp_tx, 0, 0x01, 100000,
+                                           kp_spk, 2, 0, leaf_hash=None, annex=annex)
+    # Re-sign over the annex-inclusive sighash with the tweaked key.
+    ann_sig = schnorr_sign(ann_sighash, tweaked_sk) + bytes([0x01])
+    assert schnorr_verify(ann_sighash, kp_output, ann_sig[:64])
+    assert ann_sighash != kpdh   # annex must change the commitment
+    contexts.append({
+        'name': 'keypath_annex', 'tx': kp_tx, 'index': 0, 'hash_type': 0x01,
+        'amount': 100000, 'spks': kp_spk, 'spend_type': 0, 'leaf': None,
+        'sighash': ann_sighash.hex(), 'pre': ann_pre.hex(),
+        'output_x': kp_output.hex(), 'sig': ann_sig.hex(), 'key': kp_output.hex(),
+        'annex': annex.hex(),
+    })
+
     # script-path: single leaf script OP_CHECKSIG (0x20 <pk> 0xac) -> tapscript
     sk = 0x1a2b3c4d5e6f7081728394059607a8b9c0d1e2f3a4b5c6d7e8f900112233445566
     Pk = ser_xonly(point_mul(G, sk))
@@ -339,21 +357,27 @@ if __name__ == '__main__':
         f.write('#pragma once\n')
         f.write('#include <stdint.h>\n')
         for i, c in enumerate(ctxs):
-            f.write(f'\n/* {c["name"]} */\n')
-            f.write(f'static const uint8_t tv{i}_pre[] = {{ {",".join("0x%02x"%b for b in bytes.fromhex(c["pre"]))} }};\n')
-            f.write(f'static const uint8_t tv{i}_sighash[32] = {{ {",".join("0x%02x"%b for b in bytes.fromhex(c["sighash"]))} }};\n')
+            f.write('\n/* %s */\n' % c['name'])
+            f.write('static const uint8_t tv%d_pre[] = { %s };\n' % (i, ','.join('0x%02x' % b for b in bytes.fromhex(c['pre']))))
+            f.write('static const uint8_t tv%d_sighash[32] = { %s };\n' % (i, ','.join('0x%02x' % b for b in bytes.fromhex(c['sighash']))))
             if c['leaf'] is not None:
                 L = ','.join('0x%02x' % b for b in bytes.fromhex(c['leaf']))
                 f.write('static const uint8_t tv%d_leaf[32] = { %s };\n' % (i, L))
+            if 'annex' in c:
+                A = ','.join('0x%02x' % b for b in bytes.fromhex(c['annex']))
+                f.write('static const uint8_t tv%d_annex[] = { %s };\n' % (i, A))
         f.write('\n')
         # write a compact table
         f.write('typedef struct { const char* name; const uint8_t* pre; int prelen; ')
         f.write('const uint8_t* sighash; int index; int hash_type; uint64_t amount; int spend_type; ')
-        f.write('const uint8_t* leaf; } tvec_t;\n')
+        f.write('const uint8_t* leaf; const uint8_t* annex; int annexlen; } tvec_t;\n')
         f.write('static const tvec_t taproot_vecs[] = {\n')
         for i, c in enumerate(ctxs):
-            leaf_field = '(const uint8_t*)0' if c['leaf'] is None else f'tv{i}_leaf'
-            f.write(f'  {{ "{c["name"]}", tv{i}_pre, sizeof(tv{i}_pre), tv{i}_sighash, {c["index"]}, {c["hash_type"]}, {c["amount"]}ull, {c["spend_type"]}, {leaf_field} }},\n')
+            leaf_field = '(const uint8_t*)0' if c['leaf'] is None else ('tv%d_leaf' % i)
+            annex_field = ('tv%d_annex' % i) if 'annex' in c else '(const uint8_t*)0'
+            annex_len = len(bytes.fromhex(c['annex'])) if 'annex' in c else 0
+            f.write('  { "%s", tv%d_pre, sizeof(tv%d_pre), tv%d_sighash, %d, %d, %dull, %d, %s, %s, %d },\n' % (
+                c['name'], i, i, i, c['index'], c['hash_type'], c['amount'], c['spend_type'], leaf_field, annex_field, annex_len))
         f.write('};\n')
         f.write('static const int taproot_num_vecs = %d;\n' % len(ctxs))
     # Also dump a JSON with the spend materials for the C harness
@@ -412,6 +436,8 @@ if __name__ == '__main__':
             if 'sig' in c:
                 f.write(f'static const uint8_t ts{i}_sig[] = {carr(bytes.fromhex(c["sig"]))};\n')
                 f.write(f'static const uint8_t ts{i}_key[32] = {carr(bytes.fromhex(c["key"]))};\n')
+            if 'annex' in c:
+                f.write(f'static const uint8_t ts{i}_annex[] = {carr(bytes.fromhex(c["annex"]))};\n')
             if 'sig1' in c:
                 f.write(f'static const uint8_t ts{i}_sig1[] = {carr(bytes.fromhex(c["sig1"]))};\n')
                 f.write(f'static const uint8_t ts{i}_sig2[] = {carr(bytes.fromhex(c["sig2"]))};\n')

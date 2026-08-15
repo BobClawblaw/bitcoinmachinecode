@@ -167,6 +167,8 @@ typedef struct {
     int      ext_flag;         /* 0 keypath, 1 scriptpath(BIP342) */
     const uint8_t* tapleaf;    /* 32 bytes or NULL */
     uint32_t codesep_pos;
+    const uint8_t* annex;      /* optional annex bytes (witness annex), or NULL */
+    uint64_t annexlen;         /* length of annex (if annex != NULL) */
 } tapctx_t;
 
 /* Key-path budget for a reference P2TR: script is 34 bytes. */
@@ -259,8 +261,9 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
         uint8_t ho[32]; sha256_full(ho, obuf, on);
         if (p + 32 > pend) return 0; memcpy(p, ho, 32); p += 32;
     }
-    /* spend_type = ext_flag*2 (+annex=0) */
-    if (p + 1 > pend) return 0; *p++ = (uint8_t)(c->ext_flag * 2);
+    /* spend_type = ext_flag*2 | annex_present (BIP341 bit0 = annex present) */
+    int annex_present = (c->annex != NULL);
+    if (p + 1 > pend) return 0; *p++ = (uint8_t)(c->ext_flag * 2 + annex_present);
     if (acp){
         /* outpoint */
         const uint8_t* op = tx_outpoint(&t, c->n_in);
@@ -282,6 +285,14 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     } else {
         /* input_index */
         if (p + 4 > pend) return 0; w32le(p, (uint32_t)c->n_in); p += 4;
+    }
+    /* annex (BIP341): sha256(compactsize(len) || annex) */
+    if (annex_present){
+        uint8_t abuf[4096]; size_t an = 0;
+        put_cs(abuf, c->annexlen); an += cs_size(c->annexlen);
+        memcpy(abuf+an, c->annex, (size_t)c->annexlen); an += (size_t)c->annexlen;
+        uint8_t ha[32]; sha256_full(ha, abuf, an);
+        if (p + 32 > pend) return 0; memcpy(p, ha, 32); p += 32;
     }
     /* SINGLE: sha_single_output */
     if (is_single){
@@ -328,9 +339,38 @@ int taproot_keypath_verify(const uint8_t* spk, const uint8_t* sig, int siglen,
     c.tx = tx; c.txlen = txlen; c.n_in = n_in; c.hash_type = ht;
     c.prevouts = prevouts; c.amounts = amounts; c.spks = spks;
     c.num_inputs = num_inputs; c.ext_flag = 0; c.tapleaf = NULL; c.codesep_pos = 0xffffffff;
+    c.annex = NULL; c.annexlen = 0;
 
     uint8_t pre[256]; uint8_t hash[32];
     if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;
+    return schnorr_verify(sig, spk+2, hash, 32);
+}
+
+/* Key-path verify aware of a witness annex (BIP341 annex rules). Annex commits
+ * into the SigMsg (spend_type bit0 + sha256(compactsize(len)||annex)). Returns
+ * 1 valid/0 invalid; if out_hash non-NULL the computed sighash is written there.
+ */
+int taproot_keypath_verify_annex(const uint8_t* spk, const uint8_t* sig, int siglen,
+                                 const uint8_t* tx, int64_t txlen, int64_t n_in,
+                                 const uint8_t* prevouts, const uint8_t* amounts,
+                                 const uint8_t* spks, int64_t num_inputs,
+                                 const uint8_t* annex, uint64_t annexlen,
+                                 uint8_t* out_hash)
+{
+    if (siglen < 64 || siglen > 65) return 0;
+    if (spk[0] != 0x51 || spk[1] != 0x20) return 0;
+    uint8_t ht = (siglen == 65) ? sig[siglen-1] : 0x00;
+    if (siglen == 65 && ht == 0x00) return 0;
+
+    tapctx_t c;
+    c.tx = tx; c.txlen = txlen; c.n_in = n_in; c.hash_type = ht;
+    c.prevouts = prevouts; c.amounts = amounts; c.spks = spks;
+    c.num_inputs = num_inputs; c.ext_flag = 0; c.tapleaf = NULL; c.codesep_pos = 0xffffffff;
+    c.annex = annex; c.annexlen = annexlen;
+
+    uint8_t pre[256]; uint8_t hash[32];
+    if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;
+    if (out_hash) memcpy(out_hash, hash, 32);
     return schnorr_verify(sig, spk+2, hash, 32);
 }
 
@@ -361,6 +401,7 @@ int tapscript_checksig(const uint8_t* sig, int siglen, const uint8_t* pubkey,
     c.prevouts = prevouts; c.amounts = amounts; c.spks = spks;
     c.num_inputs = num_inputs; c.ext_flag = 1; c.tapleaf = tapleaf;
     c.codesep_pos = codesep_pos;
+    c.annex = NULL; c.annexlen = 0;
 
     uint8_t pre[256]; uint8_t hash[32];
     if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;

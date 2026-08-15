@@ -29,12 +29,20 @@ typedef struct {
     int      ext_flag;
     const uint8_t* tapleaf;
     uint32_t codesep_pos;
+    const uint8_t* annex;
+    uint64_t annexlen;
 } tapctx_t;
 extern long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap);
 extern int  taproot_keypath_verify(const uint8_t* spk, const uint8_t* sig, int siglen,
                                    const uint8_t* tx, int64_t txlen, int64_t n_in,
                                    const uint8_t* prevouts, const uint8_t* amounts,
                                    const uint8_t* spks, int64_t num_inputs);
+extern int  taproot_keypath_verify_annex(const uint8_t* spk, const uint8_t* sig, int siglen,
+                                         const uint8_t* tx, int64_t txlen, int64_t n_in,
+                                         const uint8_t* prevouts, const uint8_t* amounts,
+                                         const uint8_t* spks, int64_t num_inputs,
+                                         const uint8_t* annex, uint64_t annexlen,
+                                         uint8_t* out_hash);
 extern int  tapscript_checksig(const uint8_t* sig, int siglen, const uint8_t* pubkey,
                                const uint8_t* tx, int64_t txlen, int64_t n_in,
                                const uint8_t* prevouts, const uint8_t* amounts,
@@ -176,9 +184,9 @@ static int interp_tapspend(const tspend_t* s, const uint8_t* tapleaf,
 
 /* OP_CHECKSIG tapscript: script <pk> CHECKSIG, witness [sig] */
 static void run_interp_tapspend(void){
-    /* CHECKSIG: scriptpath_checksig = ts4_leaf_script; init stack [sig] */
+    /* CHECKSIG: scriptpath_checksig = ts5_leaf_script; init stack [sig] */
     {
-        const tspend_t* s = &taproot_spends[4];
+        const tspend_t* s = &taproot_spends[5];
         static char sighex[256]; static int siglen;
         /* copy sig bytes to local 8-bit array */
         uint8_t sigbuf[65]; memcpy(sigbuf, s->sig, s->siglen);
@@ -188,13 +196,13 @@ static void run_interp_tapspend(void){
         int linit[1] = { siglen };
         /* build script bytes <pk32> CHECKSIG = 0x20 key 0xac */
         static uint8_t sc[64]; sc[0]=0x20; memcpy(sc+1, s->key, 32); sc[33]=0xac;
-        int r = interp_tapspend(s, taproot_vecs[4].leaf, sc, 34, init, linit, 1);
+        int r = interp_tapspend(s, taproot_vecs[5].leaf, sc, 34, init, linit, 1);
         ckb("interp: <pk> CHECKSIG tapscript passes", r==1);
         /* corrupted sig must fail */
         uint8_t bad[65]; memcpy(bad, s->sig, 65); bad[0]^=1;
         char bhex[130]; char* q=bhex; for(int i=0;i<65;i++){ sprintf(q,"%02x",bad[i]); q+=2; }
         const char* ib[1]={bhex}; int lb[1]={65};
-        r = interp_tapspend(s, taproot_vecs[4].leaf, sc, 34, ib, lb, 1);
+        r = interp_tapspend(s, taproot_vecs[5].leaf, sc, 34, ib, lb, 1);
         ckb("interp: <pk> CHECKSIG with bad sig fails", r==0);
     }
     /* CHECKSIGADD 2-of-2 tapscript (BIP342): script
@@ -202,7 +210,7 @@ static void run_interp_tapspend(void){
      * witness (bottom->top) [sig2, sig1]: sig1 pairs with pk1 (CHECKSIG),
      * sig2 pairs with pk2 (CHECKSIGADD accumulator). */
     {
-        const tspend_t* s = &taproot_spends[5];
+        const tspend_t* s = &taproot_spends[6];
         char h1[130], h2[130];
         char* q=h1; for(int i=0;i<s->siglen;i++){ sprintf(q,"%02x",s->sig[i]); q+=2; }
         q=h2; for(int i=0;i<s->sig2len;i++){ sprintf(q,"%02x",s->sig2[i]); q+=2; }
@@ -212,11 +220,11 @@ static void run_interp_tapspend(void){
         sc[n++]=0x20; memcpy(sc+n, s->key, 32); n+=32; sc[n++]=0xac;   /* pk1 CHECKSIG */
         sc[n++]=0x20; memcpy(sc+n, s->key2, 32); n+=32; sc[n++]=0xba;  /* pk2 CHECKSIGADD */
         sc[n++]=0x52; sc[n++]=0x87;                       /* 2 EQUAL */
-        int r = interp_tapspend(s, taproot_vecs[5].leaf, sc, n, init, linit, 2);
+        int r = interp_tapspend(s, taproot_vecs[6].leaf, sc, n, init, linit, 2);
         ckb("interp: CHECKSIGADD 2-of-2 tapscript passes", r==1);
         /* only one valid sig -> accumulator 1 != 2 -> fails */
         const char* init1[1] = { h1 }; int linit1[1] = { s->siglen };
-        r = interp_tapspend(s, taproot_vecs[5].leaf, sc, n, init1, linit1, 1);
+        r = interp_tapspend(s, taproot_vecs[6].leaf, sc, n, init1, linit1, 1);
         ckb("interp: CHECKSIGADD 1-of-2 fails (needs 2)", r==0);
     }
 }
@@ -238,6 +246,8 @@ int main(void){
         c.num_inputs = s->numin; c.ext_flag = (s->output_key && s->leaf_len) ? 1 : 0;
         c.tapleaf = (c.ext_flag ? taproot_vecs[i].leaf : NULL);
         c.codesep_pos = 0xffffffff;
+        c.annex = taproot_vecs[i].annex;
+        c.annexlen = (uint64_t)taproot_vecs[i].annexlen;
 
         uint8_t hash[32], pre[256];
         long plen = taproot_sighash(hash, &c, pre, sizeof(pre));
@@ -322,36 +332,36 @@ int main(void){
 
     printf("\n== script-path spend: OP_CHECKSIG (BIP342) ==\n");
     {
-        const tspend_t* s = &taproot_spends[4];
+        const tspend_t* s = &taproot_spends[5];
         uint8_t hash[32];
         ckb("scriptpath CHECKSIG genuine sig", tapscript_checksig(
                 s->sig, s->siglen, s->key, s->tx, s->txlen, s->index,
                 s->prevouts, s->amounts, s->spks, s->numin,
-                taproot_vecs[4].leaf, 0xffffffff, hash));
+                taproot_vecs[5].leaf, 0xffffffff, hash));
         ckb("scriptpath CHECKSIG hash matches ref", memcmp(hash, s->expect_sighash, 32)==0);
         uint8_t bad[65]; memcpy(bad, s->sig, 65); bad[3] ^= 0x80;
         ckb("scriptpath CHECKSIG corrupted sig rejected", !tapscript_checksig(
                 bad, 65, s->key, s->tx, s->txlen, s->index,
                 s->prevouts, s->amounts, s->spks, s->numin,
-                taproot_vecs[4].leaf, 0xffffffff, NULL));
+                taproot_vecs[5].leaf, 0xffffffff, NULL));
         ckb("scriptpath wrong pubkey rejected", !tapscript_checksig(
                 s->sig, s->siglen, s->output_key, s->tx, s->txlen, s->index,
                 s->prevouts, s->amounts, s->spks, s->numin,
-                taproot_vecs[4].leaf, 0xffffffff, NULL));
+                taproot_vecs[5].leaf, 0xffffffff, NULL));
     }
 
     printf("\n== script-path spend: OP_CHECKSIGADD / tapscript multisig ==\n");
     {
-        const tspend_t* s = &taproot_spends[5];
+        const tspend_t* s = &taproot_spends[6];
         uint8_t hash[32];
         int k1 = tapscript_checksig(s->sig, s->siglen, s->key,
                                     s->tx, s->txlen, s->index, s->prevouts,
                                     s->amounts, s->spks, s->numin,
-                                    taproot_vecs[5].leaf, 0xffffffff, hash);
+                                    taproot_vecs[6].leaf, 0xffffffff, hash);
         int k2 = tapscript_checksig(s->sig2, s->sig2len, s->key2,
                                     s->tx, s->txlen, s->index, s->prevouts,
                                     s->amounts, s->spks, s->numin,
-                                    taproot_vecs[5].leaf, 0xffffffff, NULL);
+                                    taproot_vecs[6].leaf, 0xffffffff, NULL);
         ckb("CHECKSIGADD sig1 verified", k1==1);
         ckb("CHECKSIGADD sig2 verified", k2==1);
         ckb("CHECKSIGADD hash matches ref", memcmp(hash, s->expect_sighash,32)==0);
@@ -360,8 +370,30 @@ int main(void){
         uint8_t bad1[65]; memcpy(bad1, s->sig, 65); bad1[10]^=0x04;
         int k1b = tapscript_checksig(bad1, 65, s->key, s->tx, s->txlen, s->index,
                                      s->prevouts, s->amounts, s->spks, s->numin,
-                                     taproot_vecs[5].leaf, 0xffffffff, NULL);
+                                     taproot_vecs[6].leaf, 0xffffffff, NULL);
         ckb("CHECKSIGADD corrupted sig1 rejected", k1b==0);
+    }
+
+    printf("\n== key-path spend with annex (BIP341 annex rules) ==\n");
+    {
+        const tspend_t* s = &taproot_spends[4];       /* keypath_annex */
+        const tvec_t* v = &taproot_vecs[4];
+        uint8_t spk[34]; spk[0]=0x51; spk[1]=0x20; memcpy(spk+2, s->output_key, 32);
+        uint8_t hash[32];
+        int r = taproot_keypath_verify_annex(spk, s->sig, s->siglen, s->tx, s->txlen,
+                                             s->index, s->prevouts, s->amounts,
+                                             s->spks, s->numin, v->annex, v->annexlen,
+                                             hash);
+        ckb("keypath-annex genuine sig verified", r==1);
+        ckb("keypath-annex sighash matches ref", memcmp(hash, v->sighash, 32)==0);
+        ckb("keypath-annex spend_type committed (annex != no-annex)",
+            taproot_keypath_verify_annex(spk, s->sig, s->siglen, s->tx, s->txlen,
+                                         s->index, s->prevouts, s->amounts,
+                                         s->spks, s->numin, NULL, 0, NULL) == 0);
+        uint8_t bad[65]; memcpy(bad, s->sig, 65); bad[0]^=0x01;
+        ckb("keypath-annex corrupted sig rejected", !taproot_keypath_verify_annex(
+                spk, bad, 65, s->tx, s->txlen, s->index, s->prevouts, s->amounts,
+                s->spks, s->numin, v->annex, v->annexlen, NULL));
     }
 
     printf("\n== script-path spend through the ASM script interpreter ==\n");
