@@ -142,6 +142,9 @@ asm/rpc_server.o
 asm/tests/test_verify_p2sh
 asm/tests/verify_p2sh_shim
 asm/tests/stress_pointmul
+# ---- chain-context BIP30 gate test binaries ----
+asm/tests/bip30_shim
+asm/tests/test_bip30
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----
 KANBAN.md
