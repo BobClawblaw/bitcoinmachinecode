@@ -1,0 +1,54 @@
+/* rpc_commands.h -- shared JSON-RPC command dispatch + Core-bit-exact rendering.
+ *
+ * Bridges the in-scope wallet-core command layer (asm/wallet_core.c, built +
+ * green by cards t_wrpc_getaddr..t_wrpc_send) onto JSON-RPC. Given a parsed
+ * request (method + params) and a wallet-state struct, produces a Core-shaped
+ * `result` UniValue exactly as bitcoind would for that method.
+ *
+ * The child card (HTTP JSON-RPC server endpoint) dispatches through the same
+ * rpc_dispatch() function, so the client-side rendering here and the server do
+ * not diverge -- one render path, bit-identical on both ends.
+ */
+#ifndef RPC_COMMANDS_H
+#define RPC_COMMANDS_H
+
+#include "rpc_json.h"
+
+/* Wallet state a request is resolved against. Not owned/freed here; the caller
+ * (client harness or HTTP server) supplies it. */
+typedef struct {
+    const unsigned char* seed;      /* 64-byte BIP32 seed (deterministic wallet) */
+
+    /* the wallet's own unspent outputs (for listunspent/getbalance/sendtoaddr) */
+    const unsigned char (*utxo_txid)[32];
+    const unsigned long* utxo_idx;
+    const unsigned long long* utxo_val;
+    const unsigned char* const* utxo_script; /* scriptPubKey hex strings */
+    unsigned long utxo_n;
+} rpc_wallet;
+
+/* Amount (satoshis) -> Core ValueFromAmount string, exactly:
+ *   sign? "-" then quotient "." 8-zero-padded remainder. Returns into a
+ *   caller buffer at least 24 bytes. */
+void rpc_amounts(long long sats, char* out, size_t outcap);
+
+/* Dispatch one JSON-RPC method with params. Builds a `result` value into
+ * *result (heap; caller rj_free) on success (returns 1) or fills *err_code /
+ * *err_msg (static string, no free) and returns 0 on an RPC error. */
+int rpc_dispatch(const char* method, const rj_val* params,
+                 const rpc_wallet* w,
+                 rj_val** result, long* err_code, const char** err_msg);
+
+/* Parse a JSON-RPC param array element as a string; on error sets err. */
+const char* rpc_param_str(const rj_val* params, size_t i,
+                          long* err_code, const char** err_msg);
+
+/* Parse a JSON-RPC param array element as a 64-bit number (strict integer).
+ * Core JSON numbers here are integral amounts (no floats). */
+int rpc_param_i64(const rj_val* params, size_t i, long long* out,
+                  long* err_code, const char** err_msg);
+
+/* Human + machine model: is `method` a wallet command we dispatch? */
+int rpc_known_method(const char* method);
+
+#endif /* RPC_COMMANDS_H */

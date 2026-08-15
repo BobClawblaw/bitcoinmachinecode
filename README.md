@@ -248,6 +248,27 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   exact-balance). This is the in-scope wallet-core + bitcoin-cli/RPC surface
   (behavioral parity target); the full RPC transport and the remaining
   address/UTXO-resolver commands remain for a later RPC/bitcoin-cli layer.
+- **bitcoin-cli network layer / JSON-RPC transport** (`t_8e5be37f`) — wired the
+  command layer onto a REAL JSON-RPC 2.0 transport. New shared RPC layer:
+  `asm/rpc_json.c` — Core-bit-exact UniValue serializer (`write(pretty=2)`,
+  2-space indent, Core field order + escape set) and strict parser;
+  `asm/rpc_net.c` — JSON-RPC 2.0 request/reply framing + HTTP POST over a local
+  socket with HTTP Basic auth (rpcuser/rpcpassword), a minimal HTTP/1.1 request
+  parser, and the reply-envelope parser; `asm/rpc_commands.c` — the shared
+  dispatch/render path that maps a parsed request (method+params) to the
+  wallet-core command layer and emits Core-shaped result JSON
+  (`rpc_amounts` reproduces Core `ValueFromAmount` exactly). Client binary
+  `asm/daemon/bitcoin_cli` behaves like bitcoin-cli: string results print raw,
+  objects/arrays via `write(2)`, RPC errors print `error code:`/`error message:`
+  and exit non-zero. Verified end-to-end over a real loopback HTTP socket by
+  `asm/tests/test_rpc_transport` (execs the actual `daemon/bitcoin_cli` binary
+  against a thread-spawned HTTP JSON-RPC responder that dispatches through the
+  same `rpc_dispatch`) — 19 checks byte-exact (wire framing, getnewaddress /
+  getrawchangeaddress / getbalance / validateaddress / listunspent / gettxout /
+  decoderawtransaction rendering, method-not-found + transport-error paths);
+  `asm/tests/test_rpc_json` (28 checks) pins the renderer + `rpc_amounts`
+  byte-exact. The production HTTP server endpoint (child card `t_0ca5d72e`)
+  dispatches through the same `rpc_dispatch()`.
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine

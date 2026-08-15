@@ -122,6 +122,12 @@ asm/tests/test_taproot_sighash
 asm/tests/test_segwit_sighash
 asm/tests/test_mempool_accept_modern
 asm/daemon/wallet_cli
+asm/daemon/bitcoin_cli
+asm/tests/test_rpc_json
+asm/tests/test_rpc_transport
+asm/rpc_json.o
+asm/rpc_net.o
+asm/rpc_commands.o
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----
 KANBAN.md
