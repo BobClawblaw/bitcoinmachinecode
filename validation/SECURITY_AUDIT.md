@@ -87,6 +87,30 @@ rewrite of primitives that are already validated bit-exact, it is flagged for a
 **dedicated follow-up task** rather than patched blind in this audit pass (see
 "Remediation plan" below).
 
+### Status — scalar half LANDED (2026-08-15); point half tracked
+
+**Scalar half — FIXED.** Commit `6162ad8` made `sc_add`, `sc_sub`, `sc_mul`,
+`sc_sqr`, `sc_inv` fully constant-time (no data-dependent branches): the carry
+fold in `sc_add` and the borrow re-add in `sc_sub` use mask-selected arithmetic
+instead of `jnc`, and the per-bit conditional add in `sc_mul` is now an
+unconditional add + `bt`/`cmovnc` revert (fixed 256-iteration loop, branch-free).
+This covers the secret scalar multiplications on the signing path:
+`sc_mul(rd, r, d)` and `sc_mul(out_s, zrd, k)`.
+Verified: `test_scalar` KAT (13 vectors) + `tests/stress_scalar.py` differential
+vs a Python big-int oracle (20,000 iters, 0 failures) + signing suites
+(`test_ecdsa`, `test_wallet`, `test_keys`, `test_scalarmul`, `test_taproot`).
+
+**Point half — NOT YET FIXED (tracked).** `point_scalar_mul` (the `k*G` used by
+`wallet_ecdsa_sign` with the secret nonce `k`) still uses a `bsr`-derived loop
+bound and a per-bit `jnc` conditional add. A correct constant-time ladder
+requires an **infinity-safe, exception-free point addition** — verified that the
+current `point_add_mixed`/`point_add` do **not** handle an infinity operand
+(`inf+base` returns the zero point), so a naive infinity-seeded ladder is
+invalid. Tracked as kanban card `t_08b49753`; a differential harness
+(`tests/run_pointmul_diff.py`, `tests/stress_pointmul.c`, baseline 0 failures)
+is in place to validate the ladder bit-exactly. The README warning remains until
+this lands.
+
 > NOTE: for the **verification-derivable** claim "the README warning can be
 > cleared with fixes landed + green tests": this finding requires a real
 > constant-time implementation before signing should ever be used with real
@@ -138,7 +162,7 @@ green.
 
 ---
 
-## FINDING 2b — MEDIUM — Legacy sighash builder: preimage **write** cap on the signing-script copy is caller-dependent — **NOT FIXED (documented)**
+## FINDING 2b — MEDIUM — Legacy sighash builder: preimage **write** cap on the signing-script copy is caller-dependent — **FIXED**
 
 **File:** `asm/bitcoin_sighash.asm` (`.write_script` path)
 
@@ -151,6 +175,21 @@ prevout scriptPubKey (≤ consensus 10 kB) and the preimage buffer is 4 kB
 `script_len` near/above `cap`, which the current call graph does not obviously
 produce. Still an internal invariant violation; a defensive cap check should be
 added (cheap, recommended as a follow-up with #2).
+
+### Fix (landed)
+
+A defensive cap check was added immediately after the script `copy_bytes`, so a
+script copy that would push the preimage cursor past the supplied end
+(`[rbp-0x58]`) is rejected with `.fail` exactly like the hashtype write:
+
+```asm
+cmp   rdi, [rbp-0x58]   ; reject if the resulting cursor passes the preimage end
+ja    .fail
+```
+
+This closes the invariant without altering valid-input behavior (current
+preimage buffers are far larger than any reachable script). Verified:
+`sighash` / `sighash_oob` / `p2pkh` / `script` / `multisig` suites green.
 
 ---
 
@@ -208,24 +247,34 @@ correctly skipped for unwitnessed txid. No overflow found.
 
 ## Remediation plan (recommended follow-up cards)
 
-1. **Constant-time `point_scalar_mul` + `sc_mul`** (fix FINDING 1) — the
-   critical one. Fixed window / Montgomery ladder over the full 256-bit range,
-   `cmov`-based. Must keep bit-exact outputs (there is a differential harness
-   to lock behaviour). Do **not** sign with real keys until this lands.
-2. **Defensive cap check on the sighash script copy** (findings 2b).
+1. **Constant-time `point_scalar_mul`** (FINDING 1, point half) — the critical
+   remaining one. Infinity-safe exception-free point addition + fixed full-256
+   ladder over the full 256-bit range, `cmov`-based, bit-exact vs the new
+   differential harness (`tests/run_pointmul_diff.py`). The **`sc_mul` half is
+   already done** (commit `6162ad8`). Do **not** sign with real keys until the
+   point half lands. Tracked: kanban card `t_08b49753`.
+2. **Defensive cap check on the sighash script copy** (findings 2b) — **DONE**
+   (commit `83f2019`, documented in FINDING 2b above).
 3. Re-run the full differential-consensus harness + `make test` after any
    crypto rewrite.
 
 ## Changes landed in this pass
 
 - `asm/bitcoin_sighash.asm` — source-cursor bounds check after scriptSig skip
-  (FINDING 2).
+  (FINDING 2); preimage-write cap check (FINDING 2b).
+- `asm/secp256k1_scalar.asm` — constant-time `sc_add`/`sc_sub`/`sc_mul`/`sc_sqr`/
+  `sc_inv` (FINDING 1, scalar half; commit `6162ad8`).
 - `asm/tests/test_sighash_oob.c` — regression repro (new).
+- `asm/tests/stress_pointmul.py` + `.c`, `run_pointmul_diff.py` — differential
+  harness for `point_scalar_mul` (validates the pending point-half ladder).
 - `asm/Makefile` — wire `tests/test_sighash_oob` into build/test/clean.
 
-`make test` exit 0 / 62 suite binaries green + new regression PASS.
+`make test` green for the crypto/signing suites; the only outstanding build
+gap is the in-progress P2SH card's `tests/test_verify_p2sh.c` (worker WIP).
 
 **Bottom line:** the node's *verification & consensus* core is functionally
-sound and much better defended than the warning implies, but the **signing**
-crypto is provably side-channel-unsafe and must not be used with real private
-keys until FINDING 1 is fixed. The README warning should remain until then.
+sound and much better defended than the warning implies. The **signing** crypto
+is now constant-time on the scalar half (key/nonce low-level mults), but the
+`k*G` point multiply (`point_scalar_mul`) is still not — so it must not be used
+with real private keys until the point half of FINDING 1 lands. The README
+warning should remain until then.
