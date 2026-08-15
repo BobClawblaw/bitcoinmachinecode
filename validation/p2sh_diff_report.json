@@ -1,0 +1,21 @@
+{
+  "card": "t_deecad39",
+  "generated": "2026-08-15",
+  "summary": "Script-level BIP16/P2SH VerifyScript built out and driven to zero divergence vs real Bitcoin Core's script/interpreter.cpp.",
+  "engine_core": "core_verify_oracle: compiled against Bitcoin Core v31.99 script/interpreter.cpp VerifyScript + MutableTransactionSignatureChecker",
+  "engine_asm": "asm/tests/verify_p2sh_shim -> bitcoin_verify.c verify_script()",
+  "flags": "cons_flags(height): P2SH|WITNESS|TAPROOT|DERSIG|CLTV|CSV|NULLDUMMY for height>=173805; pre-BIP16 drops P2SH/WITNESS/TAPROOT (Core asserts WITNESS=>P2SH)",
+  "corpus": [
+    {"case":"2of3-genuine-accept","expect":["accept","accept"],"verdict_core":[1,0],"verdict_asm":[1,0]},
+    {"case":"2of3-prebip16","expect":["accept","accept"],"verdict_core":[1,0],"verdict_asm":[1,0]},
+    {"case":"2of3-wrong-sig","expect":["reject EVAL_FALSE","reject EVAL_FALSE"],"verdict_core":[0,2],"verdict_asm":[0,2]},
+    {"case":"2of3-insufficient","expect":["reject INVALID_STACK","reject INVALID_STACK"],"verdict_core":[0,18],"verdict_asm":[0,18]},
+    {"case":"2of3-bad-redeem","expect":["reject EVAL_FALSE","reject EVAL_FALSE"],"verdict_core":[0,2],"verdict_asm":[0,2]},
+    {"case":"2of3-null-dummy","expect":["reject SIG_NULLDUMMY","reject SIG_NULLDUMMY"],"verdict_core":[0,28],"verdict_asm":[0,28]},
+    {"case":"2of3-empty-ss","expect":["reject INVALID_STACK","reject INVALID_STACK"],"verdict_core":[0,18],"verdict_asm":[0,18]},
+    {"case":"1of1-accept","expect":["accept","accept"],"verdict_core":[1,0],"verdict_asm":[1,0]},
+    {"case":"1of1-wrong-sig","expect":["reject EVAL_FALSE","reject EVAL_FALSE"],"verdict_core":[0,2],"verdict_asm":[0,2]}
+  ],
+  "result": "9/9 agree, 0 divergences (verdict + error code match Core exactly)",
+  "tests": "make test green (63 suites, incl. tests/test_verify_p2sh 8 checks + verify_p2sh_shim)"
+}

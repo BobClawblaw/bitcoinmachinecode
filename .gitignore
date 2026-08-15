@@ -138,6 +138,11 @@ asm/rpc_net.o
 asm/rpc_commands.o
 asm/rpc_server.o
 
+# ---- script-level P2SH/BIP16 VerifyScript test binaries ----
+asm/tests/test_verify_p2sh
+asm/tests/verify_p2sh_shim
+asm/tests/stress_pointmul
+
 # ---- Kanban board mirror files (local tracking only; never publish) ----
 KANBAN.md
 **/KANBAN.md
