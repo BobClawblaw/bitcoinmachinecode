@@ -1,0 +1,30 @@
+{
+ "generated": "2026-08-15T21:00:49Z",
+ "mainnet_tip": "962625",
+ "part1": {
+  "seed_blocks": 91500,
+  "region_blocks": 389,
+  "region_start": 91500,
+  "region_end": 91888,
+  "grandfathered_zero_enforce": [
+   91842,
+   91880
+  ]
+ },
+ "part2": {
+  "case_A": {
+   "core_verdict": "bad-txns-BIP30",
+   "asm_bip30": 1
+  },
+  "case_B": {
+   "core_verdict": "bad-txns-inputs-missingorspent",
+   "asm_bip30": 0
+  },
+  "agree_A": true,
+  "agree_B": true,
+  "t_live_txid": "1529c3b14d92a29d3b69576b3c866218ebe6da3adfebee2e042ecea66084e340",
+  "t_live_height": 213,
+  "spend_height": 214
+ },
+ "divergences": []
+}
