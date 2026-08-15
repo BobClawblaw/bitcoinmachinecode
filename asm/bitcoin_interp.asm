@@ -2141,7 +2141,7 @@ interp_checksig:
     mov   rsi, [r12+0]
     call  stack_second_ptr
     mov   r13, rax            ; sig elem
-    mov   rbx, [r13]          ; siglen
+    mov   ebx, [r13]          ; siglen (32-bit elem length; was rbx[8])
     test  rbx, rbx
     jz    .false
     mov   rax, [r12+96]
@@ -2190,7 +2190,7 @@ interp_checksig_add:
     mov   rsi, [r12+0]
     call  stack_third_ptr
     mov   r13, rax
-    mov   rbx, [r13]
+    mov   ebx, [r13]          ; siglen (32-bit elem length; was rbx[8])
     test  rbx, rbx
     jz    .false
     mov   rax, [r12+96]

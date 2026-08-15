@@ -116,6 +116,9 @@ asm/tests/test_wrpc_send
 asm/tests/smoke_interp
 asm/tests/test_interp
 asm/tests/test_tapscript_interp
+asm/tests/test_schnorr
+asm/tests/test_taproot
+asm/tests/test_taproot_sighash
 asm/daemon/wallet_cli
 
 # ---- Kanban board mirror files (local tracking only; never publish) ----

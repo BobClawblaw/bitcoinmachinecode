@@ -334,6 +334,22 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   (`tests/test_tapscript_interp.c`) and `tests/smoke_interp`/`test_interp`.
   The taproot/schnorr signature callback layer is wired downstream
   (t_93b2695f, taproot/segwit v1).
+- **Taproot / segwit v1 validation (BIP341/340/342)** — BIP340 Schnorr
+  signature verify + signing (`asm/secp256k1_schnorr.asm`, verified against all
+  19 official `bip-0340` test vectors), BIP341 taproot helpers
+  (`asm/secp256k1_taproot.asm`: x-only tweak with parity, tagged-hash tapleaf/
+  branch/merkle-root, control-block parsing), bech32m P2TR
+  address<->scriptPubKey (BIP341/350), and end-to-end spend validation in
+  `asm/bitcoin_taproot_sighash.c`: BIP341 SigMsg serialization + TapSighash for
+  key-path and script-path (BIP342 ext) with every hash type, key-path schnorr
+  verify against the output key, script-path `OP_CHECKSIG`/`OP_CHECKSIGADD`
+  verify, and the `checksig_fn` callback that drives live tapscript
+  `OP_CHECKSIG`/`CHECKSIGADD` spends through the ASM script interpreter.
+  Verified byte-for-byte against the official Bitcoin Core
+  `wallet-test-vectors` (keyPathSpending) + Core-validated reference preimages,
+  cross-checked by the independent pure-Python oracle
+  (`asm/validation/gen_taproot_vectors.py`). `test_taproot_sighash` 42 checks
+  green; `make test` suite green.
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
