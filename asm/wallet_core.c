@@ -343,6 +343,22 @@ long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]) {
 
 /* Encode the bech32m (BIP350) P2PKH-style ... unused here; keep P2WPKH only. */
 
+/* Encode the bech32m (BIP350) witness-v1 P2TR address "bc1p" + 32-byte xonly key.
+ * BIP341/350: hrp "bc", bech32m (spec=1), witness version 1, 32-byte program.
+ * Returns string length or -1. */
+long wallet_p2tr_address(char* out, long cap, const unsigned char xonly[32]) {
+    unsigned char d5[64];
+    long long n5 = bech32_convert_bits(d5, xonly, 32, 8, 5, 1);
+    if (n5 < 0) return -1;
+    unsigned char data[64];
+    long long dl = 0;
+    data[dl++] = 1;                     /* witness version v1 (taproot) */
+    for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
+    bech32_init();
+    long long sl = bech32_encode(out, "bc", 2, data, dl, 1);  /* spec 1 = bech32m */
+    return (sl >= 0 && sl < cap) ? (long)sl : -1;
+}
+
 /* Build the 22-byte P2WPKH scriptPubKey: OP_0 PUSH20 <h160>. */
 int wallet_p2wpkh_script_pubkey(unsigned char out[22], const unsigned char h160[20]) {
     out[0] = 0x00; out[1] = 0x14;
@@ -375,16 +391,20 @@ long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[6
 
 /* Reported address type from wallet_validate_address. */
 enum wal_addr_type { WAL_ADDR_INVALID = 0, WAL_ADDR_P2PKH, WAL_ADDR_P2WPKH,
-                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_UNKNOWN };
+                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_P2TR, WAL_ADDR_UNKNOWN };
 
 /* Parse + validate an address string. Fills:
  *   *type_   - WAL_ADDR_P2PKH / WAL_ADDR_P2WPKH / WAL_ADDR_P2SH / WAL_ADDR_P2WSH
- *              / WAL_ADDR_UNKNOWN (valid but unclassified) / WAL_ADDR_INVALID (bad).
+ *              / WAL_ADDR_P2TR / WAL_ADDR_UNKNOWN (valid but unclassified)
+ *              / WAL_ADDR_INVALID (bad).
  *   version[1] - base58 version byte (P2PKH address->1) for base58 types.
  *   h160[20]   - the 20-byte hash (P2PKH h160 / P2WPKH h160 / P2SH redeem-hash).
+ *   prog32[32] - (may be NULL) the 32-byte program/commitment for P2TR (and
+ *                P2WSH script-hash) / key for P2TR. For P2TR this is the
+ *                x-only output key (BIP341).
  * Returns 1 if the string is a CHECKSUM-VALID address (any recognized type), 0 if not. */
 int wallet_validate_address(const char* str, int* type_, unsigned char* version,
-                            unsigned char h160[20]) {
+                            unsigned char h160[20], unsigned char prog32[32]) {
     long plen;
     unsigned char pay[128];
     /* try base58check first */
@@ -399,8 +419,8 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
         *type_ = WAL_ADDR_UNKNOWN;
         return 1;                               /* checksum ok, odd payload size */
     }
-    /* try bech32 (P2WPKH/P2WSH) -- bech32_decode gives data5 WITHOUT verifying
-     * the checksum; accept only checksum-valid (verifies as bech32, spec 0). */
+    /* try bech32 (P2WPKH/P2WSH bech32; P2TR bech32m) -- bech32_decode gives
+     * data5 WITHOUT verifying the checksum; accept only if it verifies. */
     bech32_init();
     unsigned char d5[256];
     char hrp[32];
@@ -409,22 +429,33 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
         /* normalize HRP to lowercase for the checksum + "bc" match */
         for (char* p = hrp; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p + 32);
         long long hrplen = (long long)strlen(hrp);
-        if (bech32_verify_checksum(hrp, hrplen, d5, n5, 0) == 1 &&
-            hrplen == 2 && hrp[0] == 'b' && hrp[1] == 'c' && n5 >= 8 && d5[0] == 0) {
-            /* witness v0: convert 5-bit to 8-bit (no pad). d5[0] is the witness
-             * version (0), the LAST SIX groups are the checksum, and the rest
-             * is the 5-bit program: 32 groups for P2WPKH (160 bit -> 20 byte),
-             * 52 for P2WSH (260 bit -> 32 byte). */
-            unsigned char bytes[64];
-            long long bl = bech32_convert_bits(bytes, d5 + 1, n5 - 7, 5, 8, 0);
-            if (bl == 20) {                         /* P2WPKH */
-                memcpy(h160, bytes, 20);
-                *type_ = WAL_ADDR_P2WPKH;
-                return 1;
+        /* witness v0 uses bech32 (spec 0); witness v1 (taproot) uses bech32m (spec 1). */
+        if (hrplen == 2 && hrp[0] == 'b' && hrp[1] == 'c' && n5 >= 8) {
+            if (bech32_verify_checksum(hrp, hrplen, d5, n5, 1) == 1 && d5[0] == 1) {
+                /* P2TR: witness version 1, 32-byte program, bech32m. */
+                unsigned char bytes[64];
+                long long bl = bech32_convert_bits(bytes, d5 + 1, n5 - 7, 5, 8, 0);
+                if (bl == 32) {
+                    if (prog32) memcpy(prog32, bytes, 32);
+                    *type_ = WAL_ADDR_P2TR;
+                    return 1;
+                }
             }
-            if (bl == 32) {                         /* P2WSH */
-                *type_ = WAL_ADDR_P2WSH;
-                return 1;
+            if (bech32_verify_checksum(hrp, hrplen, d5, n5, 0) == 1 && d5[0] == 0) {
+                /* witness v0: the LAST SIX groups are the checksum, and the rest
+                 * is the 5-bit program: 32 groups -> P2WPKH (20 byte), 52 -> P2WSH. */
+                unsigned char bytes[64];
+                long long bl = bech32_convert_bits(bytes, d5 + 1, n5 - 7, 5, 8, 0);
+                if (bl == 20) {                         /* P2WPKH */
+                    memcpy(h160, bytes, 20);
+                    *type_ = WAL_ADDR_P2WPKH;
+                    return 1;
+                }
+                if (bl == 32) {                         /* P2WSH */
+                    if (prog32) memcpy(prog32, bytes, 32);
+                    *type_ = WAL_ADDR_P2WSH;
+                    return 1;
+                }
             }
         }
     }
@@ -452,6 +483,11 @@ int wallet_script_to_address(char* out, long cap, const unsigned char* script, l
         /* P2WPKH */
         if (wallet_p2wpkh_address(out, cap, script + 2) < 0) return WAL_ADDR_INVALID;
         return WAL_ADDR_P2WPKH;
+    }
+    if (slen == 34 && script[0] == 0x51 && script[1] == 0x20) {
+        /* P2TR: OP_1 PUSH32 <xonly output key> (BIP341), bech32m */
+        if (wallet_p2tr_address(out, cap, script + 2) < 0) return WAL_ADDR_INVALID;
+        return WAL_ADDR_P2TR;
     }
     return WAL_ADDR_INVALID;
 }

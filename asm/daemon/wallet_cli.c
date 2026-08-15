@@ -34,7 +34,7 @@ extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]
 extern unsigned long long wallet_get_balance(const unsigned long long* tval, unsigned long n);
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
-extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20]);
+extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern int  wallet_gettxout(void* u, const unsigned char txid[32], unsigned long index,
                             unsigned long long* value, const unsigned char** script,
                             unsigned long* slen, char* addr, long addr_cap);
@@ -229,10 +229,11 @@ static int cmd_validateaddress(int argc, char** argv, int info) {
         fprintf(stderr, "usage: wallet_cli %s <address>\n", info ? "getaddressinfo" : "validateaddress");
         return 2;
     }
-    int type; unsigned char ver, h160[20];
-    int ok = wallet_validate_address(argv[2], &type, &ver, h160);
+    int type; unsigned char ver, h160[20], prog32[32];
+    int ok = wallet_validate_address(argv[2], &type, &ver, h160, prog32);
     const char* tn = (type == 1) ? "p2pkh" : (type == 2) ? "p2wpkh"
-                   : (type == 3) ? "p2sh" : (type == 4) ? "p2wsh" : "unknown";
+                   : (type == 3) ? "p2sh" : (type == 4) ? "p2wsh"
+                   : (type == 5) ? "p2tr" : "unknown";
     if (!info) { /* validateaddress: isvalid + type */
         printf("isvalid: %s\n", ok ? "true" : "false");
         if (ok) printf("scriptPubKey-type: %s\n", tn);
