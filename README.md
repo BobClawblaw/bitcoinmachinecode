@@ -342,13 +342,14 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   address<->scriptPubKey (BIP341/350), and end-to-end spend validation in
   `asm/bitcoin_taproot_sighash.c`: BIP341 SigMsg serialization + TapSighash for
   key-path and script-path (BIP342 ext) with every hash type, key-path schnorr
-  verify against the output key, script-path `OP_CHECKSIG`/`OP_CHECKSIGADD`
+  verify against the output key (including witness-annex commitment),
+  script-path `OP_CHECKSIG`/`OP_CHECKSIGADD`
   verify, and the `checksig_fn` callback that drives live tapscript
   `OP_CHECKSIG`/`CHECKSIGADD` spends through the ASM script interpreter.
   Verified byte-for-byte against the official Bitcoin Core
   `wallet-test-vectors` (keyPathSpending) + Core-validated reference preimages,
   cross-checked by the independent pure-Python oracle
-  (`asm/validation/gen_taproot_vectors.py`). `test_taproot_sighash` 42 checks
+  (`asm/validation/gen_taproot_vectors.py`). `test_taproot_sighash` 48 checks
   green; `make test` suite green.
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
