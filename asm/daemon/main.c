@@ -24,6 +24,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
+#include <stdbool.h>
+#include <fcntl.h>
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
@@ -32,6 +35,7 @@ extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, l
 extern long node_serve_block(void* st, long height, void* out, long cap);
 extern long node_serve_block_by_hash(void* st, const void* hash32, void* out, long cap);
 extern long node_serve_loop(int fd, int lfd, void* st, void* ht_idx, void* out, long cap);
+extern long node_announce_tip(int fd, void* st, void* ht_idx, long use_headers);
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern long store_init(void* st);
 extern long store_reload(void* st);
@@ -391,6 +395,157 @@ static int serve_loop(int fd, int lfd){
     return served;
 }
 
+/* ============================================================================
+ * OUTBOUND MULTIPLEXER (stays-current-while-serving).
+ *
+ * The serve loop above is inbound-only (fork-per-peer). This block adds the
+ * persistent OUTBOUND legs the node needs to stay current on its own: N
+ * long-lived connections to real seeds, multiplexed with the listening socket
+ * in ONE poll() loop. On each rotation pass we run the now-hardened asm
+ * node_sync (getheaders-from-stored-tip -> cons_verify -> store_append ->
+ * advance locator) to pull any newly mined blocks, then maintain the hash
+ * index and announce the new tip back to the peer (node_announce_tip, BIP130
+ * honored by the peer's own negotiation). Inbound connections are still forked
+ * off to node_serve_loop children so concurrent serving is unaffected.
+ *
+ * The outbound legs are NOT forked -- they are multiplexed inline in the one
+ * parent loop, so the node simultaneously serves AND downloads. Each outbound
+ * fd carries a short SO_RCVTIMEO so a node_sync pass returns promptly when the
+ * peer is already at the chain tip (empty headers page) instead of blocking
+ * the accept loop.
+ * ========================================================================== */
+#define MUX_MAX_OUT 8
+static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
+static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
+static char  mux_out_host[MUX_MAX_OUT][64];
+static int   mux_n_out = 0;
+
+/* Connect + handshake one outbound seed, returning a long-lived fd (or -1). */
+static int outbound_connect(const char* host, int rcv_ms, int out_port){
+    struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+    if(getaddrinfo(host,NULL,&h,&res)!=0) return -1;
+    unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+    freeaddrinfo(res);
+    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+    if(fd<0) return -1;
+    struct timeval tv; tv.tv_sec=rcv_ms/1000; tv.tv_usec=(rcv_ms%1000)*1000;
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    if(node_handshake(fd)!=1){ close(fd); return -1; }
+    return fd;
+}
+
+/* Anchor a peer's locator to our CURRENT stored tip hash (zero if empty). */
+static void anchor_locator(unsigned char loc[32]){
+    int t=*(int*)(store_buf+24);
+    if(t>=0){ static unsigned char hd[8<<20];
+        if(node_serve_block(store_buf, t, hd, sizeof hd)>=80){ block_hash(loc,hd); return; }
+    }
+    memset(loc,0,32);
+}
+
+/* Materialize the locator for outbound peer i into `loc` (32 bytes). */
+static void mux_locator(int i, unsigned char loc[32]){
+    memcpy(loc, mux_out_loc[i], 32);
+}
+
+static int mux_locator_zero(int i){
+    for(int k=0;k<32;k++) if(mux_out_loc[i][k]) return 0; return 1;
+}
+
+/* One bounded download+announce pass on outbound peer i.
+ *   - anchor locator at our stored tip (so we only pull the missing tail)
+ *   - run node_sync (getheaders -> validate -> store_append) with the fd's
+ *     short recv timeout so an idle peer returns fast
+ *   - index any newly-stored blocks (node_sync appends but does not idx_put)
+ *   - announce the new tip back to the peer via node_announce_tip
+ *   - update the per-peer locator to our new tip
+ * Returns # blocks stored this pass. */
+static long do_outbound_sync(int i){
+    unsigned char loc[32]; mux_locator(i, loc);
+    if(mux_locator_zero(i)){ anchor_locator(loc); }  /* first time: genesis */
+    static unsigned char cbuf[6<<20]; long cnt=0;
+    int st_tip_before=*(int*)(store_buf+24);
+    long ok=node_sync(mux_out_fd[i], store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
+    int st_tip=*(int*)(store_buf+24);
+    if(ok!=1 || cnt<=0){
+        /* keep the locator fresh even on a no-op so we don't re-request from
+         * genesis forever (node_sync advanced it internally only on success) */
+        anchor_locator(mux_out_loc[i]);
+        return 0;
+    }
+    /* index every newly stored height (st_tip_before+1 .. st_tip) into ht_idx */
+    static unsigned char sb[8<<20];
+    for(int h=st_tip_before+1; h<=st_tip; h++){
+        long L=node_serve_block(store_buf, h, sb, sizeof sb);
+        if(L<80) continue;
+        unsigned char bhash[32]; block_hash(bhash, sb);
+        idx_put(ht_idx, bhash, h);
+    }
+    /* announce the new tip to this peer (inv; BIP130 headers honored by the
+     * peer's sendheaders negotiation is handled downstream on its own leg) */
+    node_announce_tip(mux_out_fd[i], store_buf, ht_idx, 0);
+    /* advance this peer's persistent locator to our new stored tip */
+    anchor_locator(mux_out_loc[i]);
+    fprintf(stderr,"[mux:%d] %-22s sync ok=%ld new=%ld tip=%d\n", i, mux_out_host[i], ok, cnt, st_tip);
+    return cnt;
+}
+
+/* The outbound multiplexer: ONE poll() loop over the listen socket + all N
+ * outbound seed fds. Inbound accepts are forked to node_serve_loop children
+ * (preserved behavior); outbound legs run inline (node_sync + announce).
+ * `peers` = host names; `nwant` of them are connected on entry at `out_port`
+ * (best effort). */
+static int serve_mux(int port, const char* peers[], int nwant, int out_port){
+    /* connect up to nwant outbound peers up front */
+    for(int i=0;i<nwant && i<MUX_MAX_OUT;i++){
+        int fd=outbound_connect(peers[i], 300, out_port);
+        if(fd<0){ fprintf(stderr,"[mux] outbound %s failed\n", peers[i]); continue; }
+        strncpy(mux_out_host[mux_n_out], peers[i], 63);
+        mux_out_fd[mux_n_out]=fd;
+        anchor_locator(mux_out_loc[mux_n_out]);
+        fprintf(stderr,"[mux] outbound %d = %s (fd %d)\n", mux_n_out, peers[i], fd);
+        mux_n_out++;
+    }
+    int l=lsock(port);
+    if(l<0) return 1;
+    printf("serving on port %d (%d outbound peer(s))...\n", port, mux_n_out); fflush(stdout);
+    long long rot=0;
+    struct pollfd pfds[MUX_MAX_OUT+1];
+    for(;;){
+        int nfds=0;
+        pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        for(int i=0;i<mux_n_out;i++){ pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
+        int pr=poll(pfds, nfds, 300);
+        if(pr<0){ if(errno==EINTR) continue; break; }
+        /* inbound accept -> fork a serve child (unchanged semantics) */
+        if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
+            int c=accept(l,0,0);
+            if(c>=0){
+                pid_t w=fork();
+                if(w==0){
+                    close(l);
+                    if(node_accept_handshake(c)==1)
+                        node_serve_loop(c, node_log_open("bitcoind.log"), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+                    close(c); _exit(0);
+                }
+                close(c);
+            }
+        }
+        /* outbound: on rotation, pull from each peer (periodic getheaders-from-
+         * tip keeps us current); also pull immediately if a peer fd is readable
+         * (it sent data we should react to). Round-robin spreads the load so
+         * idle peers each get polled roughly once per mux_n_out iterations. */
+        rot++;
+        for(int i=0;i<mux_n_out;i++){
+            bool due=(rot % mux_n_out)==(long long)i;                       /* periodic */
+            if(pfds[i+1].revents&(POLLIN|POLLHUP|POLLERR)) due=true;        /* data */
+            if(due) do_outbound_sync(i);
+        }
+    }
+    return 0;
+}
+
+
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
     signal(SIGCHLD, SIG_IGN);   /* fork-per-peer workers: auto-reap, no zombies */
@@ -580,7 +735,14 @@ int main(int argc, char** argv){
 
     if(strcmp(mode,"serve")==0 && argc>=4){
         int port = atoi(argv[3]);
+        /* # outbound peers is optional 4th arg (default 3). */
+        int nwant = (argc>=5)? atoi(argv[4]) : 3;
+        if(nwant<0) nwant=0; if(nwant>MUX_MAX_OUT) nwant=MUX_MAX_OUT;
         store_reload(store_buf);            /* load the persisted chain from disk */
+        /* shared-append flock fd: open append.lock once so any concurrent-safe
+         * store_append_shared writes (and the boot catch-up) serialize. */
+        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+        if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         /* BEST-EFFORT OUTBOUND CATCH-UP (non-fatal): pull any missed blocks from
          * a real seed before serving so the node is as current as the network
          * allows on boot. Falls through cleanly with no network. */
@@ -589,33 +751,34 @@ int main(int argc, char** argv){
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
-        node_log_str(lfd, 0, "node start (serve mode)", 22);
-        int l = lsock(port);
-        if(l<0) return 1;
-        printf("serving on port %d...\n", port); fflush(stdout);
-        /* MULTI-PEER: fork a worker per accepted connection. Each child shares
-         * the inherited (copy-on-write) store + hash index + mempool statics and
-         * runs the single-connection asm node_serve_loop; the parent keeps
-         * accepting. This gives concurrent inbound serving without rewriting the
-         * single-fd serve loop into a select() multiplexer. */
-        for(;;){
-            int c = accept(l,0,0);
-            if(c<0){ perror("accept"); continue; }
-            pid_t w = fork();
-            if(w<0){ perror("fork"); close(c); continue; }
-            if(w>0){ close(c); continue; }   /* parent: drop peer fd, keep accepting */
-            /* child: serve this one peer, then exit */
-            close(l);
-            /* Inbound role: a real peer connecting to us sends ITS version first
-             * and expects us to answer with our own version + verack. */
-            if(node_accept_handshake(c)!=1){ _exit(0); }
-            /* Serve the peer entirely in assembly (bitcoin_serve.asm
-             * node_serve_loop): ping/getaddr/getdata/getheaders/getblocks/tx. */
-            long s = node_serve_loop(c, lfd, store_buf, ht_idx, out_buf, (long)sizeof out_buf);
-            node_log_event(lfd, L_BLOCK, (unsigned)(s>0?s:0), 0, 0);
-            close(c);
-            _exit(0);
-        }
+        node_log_str(lfd, 0, "node start (serve mode / outbound mux)", 38);
+        /* OUTBOUND MULTIPLEXER: ONE poll() loop over the listen socket + N
+         * outbound seed legs. Inbound connections are forked to node_serve_loop
+         * children (concurrent serving preserved); outbound legs run INLINE in
+         * this loop (periodic node_sync-from-tip + node_announce_tip), so the
+         * node simultaneously serves AND stays current by its own poll. */
+        return serve_mux(port, catchup_seeds, nwant, 8333);
+    }
+
+    if(strcmp(mode,"serve-test")==0 && argc>=6){
+        /* LOOPBACK variant of the outbound multiplexer used by test_outbound_mux:
+         * the outbound legs connect to a LOCAL peer (host@out_port) instead of
+         * real seeds, so the whole accept+outbound-pull loop is exercised in
+         * isolation (no network dependency). Same ONE poll() loop, same
+         * node_sync-from-tip + node_announce_tip outbound legs, same forked
+         * inbound serving. */
+        int port = atoi(argv[3]);
+        const char* peer[] = { argv[4] };
+        int out_port = atoi(argv[5]);
+        int nwant = (argc>=7)? atoi(argv[6]) : 1;
+        if(nwant<1) nwant=1; if(nwant>1) nwant=1;   /* one loopback peer */
+        store_reload(store_buf);
+        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+        if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
+        build_hash_index();
+        int lfd = node_log_open("bitcoind.log");
+        node_log_str(lfd, 0, "serve-test outbound mux", 22);
+        return serve_mux(port, peer, nwant, out_port);
     }
     return 2;
 }
