@@ -404,6 +404,23 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   absent prevout, double-spend, negative fee) rejected in agreement with Core.
   `test_segwit_sighash` 17 + `test_mempool_accept_modern` 23 checks green;
   `make test` suite green. Closes the modern-output validation gap.
+- **Differential consensus harness vs Bitcoin Core (compliance gate)** —
+  `validation/consensus_diff.py` + `asm/tests/consensus_shim` feed the SAME real
+  mainnet block/tx bytes to (a) the ASM consensus stack (`cons_verify` /
+  `block_hash` / `pow_check` / `diff_target` / `tx_txid` via the shim) and
+  (b) a real Bitcoin Core node's RPC, and compare every verdict byte-for-byte.
+  Two differential passes: an **ACCEPT path** (every real mainnet block the
+  active chain accepted must be `cons_verify`-valid AND its ASM block_hash must
+  equal Core's height->hash — a rejection/`hash mismatch is a false-negative
+  consensus bug), and a **REJECT path** (deterministic mutations of real blocks
+  — flipped merkle/tx/nonce/prev bytes, txcount corruption, truncation — are
+  fed as identical bytes to `cons_verify` and Core `submitblock`; both must
+  reject together). A per-tx **txid differential** verifies the ASM BIP141
+  txid against Core's canonical txid for up to 120 real txs per sampled block.
+  Verified clean (zero divergences) across the consensus-critical epochs:
+  genesis, BIP16 activation (173805), BIP34 (227931), SegWit (481824),
+  Taproot (709632), recent mainnet (918000). `tests/consensus_shim` builds via
+  `make`; drive with `python3 validation/consensus_diff.py --start H --count N`.
 
 **Peer discovery layer (self-contained, full-client):** `asm/bitcoin_addrmgr.asm`
 is a persisted peer address book (`peers.dat`) plus byte-exact `addr` v1 codecs
