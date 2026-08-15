@@ -267,8 +267,16 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   getrawchangeaddress / getbalance / validateaddress / listunspent / gettxout /
   decoderawtransaction rendering, method-not-found + transport-error paths);
   `asm/tests/test_rpc_json` (28 checks) pins the renderer + `rpc_amounts`
-  byte-exact. The production HTTP server endpoint (child card `t_0ca5d72e`)
-  dispatches through the same `rpc_dispatch()`.
+  byte-exact. **HTTP JSON-RPC server endpoint** (child card `t_0ca5d72e`)
+  added the production server side: `asm/rpc_server.c` (loopback listen socket +
+  accept thread, Core-bit-exact HTTP + JSON-RPC: 405 on non-POST, 401 +
+  `WWW-Authenticate` auth, `-32700` parse error, V2/V1 envelopes with id echo,
+  V2-notification 204) and `asm/daemon/bitcoin_rpcd` (loads rpcport/rpcuser/
+  rpcpassword from `config/bitcoin.conf`, serves until SIGINT/SIGTERM), both
+  dispatching through the same `rpc_dispatch()`. `asm/tests/test_rpc_server`
+  proves the production path end-to-end — forks+execs the REAL `bitcoin_rpcd`
+  and drives it with the REAL `bitcoin_cli` plus raw sockets — 23 checks
+  byte-exact. Together the client and server close the RPC-transport OPEN item.
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine
