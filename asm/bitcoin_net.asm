@@ -157,6 +157,26 @@ tcp_connect_ip:
     test rax, rax
     jl   .ret
     mov  rbx, rax           ; fd
+    ; ---- set SO_RCVTIMEO (10s) so blocking reads FAIL FAST on an idle peer
+    ; instead of hanging forever. The IBD/headers paths (node_fetch_headers,
+    ; node_ibd_blocks, node_sync) rely on p2p_read returning on idle; without a
+    ; socket timeout a live seed that stops replying blocks the whole node
+    ; indefinitely (2026-08-15 live-IBD finding). 10s is generous vs synthetic
+    ; loopback tests (which reply instantly and are unaffected) yet bounds any
+    ; real-peer stall. setsockopt(fd, SOL_SOCKET=1, SO_RCVTIMEO=20, &tv{10,0}, 16)
+    sub  rsp, 0x20          ; scratch below save area (rsp = rbp-0x40)
+    xor  eax, eax
+    mov  qword [rsp],   10  ; tv_sec  = 10
+    mov  qword [rsp+8], 0   ; tv_usec = 0
+    mov  rdi, rbx           ; fd
+    mov  esi, 1             ; SOL_SOCKET
+    mov  edx, 20            ; SO_RCVTIMEO
+    lea  rcx, [rsp]         ; &timeval
+    mov  r8, 16             ; optlen
+    mov  eax, 54            ; setsockopt
+    syscall
+    add  rsp, 0x20
+    ; (ignore setsockopt errors; the read-timeout is best-effort)
     ; sockaddr_in on stack (16 bytes) BELOW save area
     sub  rsp, 0x40            ; rsp = rbp-0x40 ; sockaddr at rbp-0x40..-0x31
     xor  eax, eax

@@ -899,7 +899,17 @@ node_fetch_headers:
     call p2p_write
     cmp  rax, 24
     jl   .fail
+    ; Bound the drain: a live seed streams sendheaders/addr/inv/sendcmpct/
+    ; feefilter etc. and may NOT send a `headers` reply for a locator it
+    ; considers already-known, so an unbounded wait hangs forever (the
+    ; 2026-08-15 live-IBD finding). Cap + return an error so a caller can
+    ; never block indefinitely. Synthetic loopback peers reply within a few
+    ; iterations, so this bound (64) is unreachable in tests.
+    mov  rax, 64
+    mov  [rbp-0x70], rax
 .do_read:
+    dec  qword [rbp-0x70]
+    js   .fail                ; drained too much chatter -> no headers reply
     mov  rdi, rbx            ; fd
     lea  rsi, [rbp-0x80]     ; cmd buffer (12 bytes, no overlap)
     mov  rdx, r12            ; payload -> out_buf
@@ -998,6 +1008,7 @@ node_ibd_headers:
     mov  r15, r8            ; buflen (cap)
     mov  qword [rbp-0x88], 0    ; total = 0
     mov  qword [rbp-0x78], 0    ; pgcount = 0
+    mov  qword [rbp-0x98], 0    ; pages_fetched = 0 (live-peer loop bound)
     ; zero the stop[32] local (pull toward tip = all-zero stop hash)
     xor  eax, eax
     mov  qword [rbp-0xb0], rax
@@ -1012,6 +1023,14 @@ node_ibd_headers:
     rep  movsb
 
 .page_loop:
+    ; Safety bound on page count so a live peer that never returns a short
+    ; page (or ignores our advancing locator) cannot busy-loop forever:
+    ; a max of 4096 pages (~8.2M headers, well past mainnet's 790k tip). A
+    ; cooperative peer reaches the tip long before this; the bound only ever
+    ; trips against a misbehaving/streaming live seed (2026-08-15 finding).
+    inc  qword [rbp-0x98]    ; pages_fetched++
+    cmp  qword [rbp-0x98], 4096
+    jg   .done
     ; ---- fetch one page at running locator ----
     mov  rdi, rbx            ; fd
     mov  rsi, r13            ; locator
