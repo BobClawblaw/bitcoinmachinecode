@@ -87,16 +87,38 @@ sc_add:
     adc rax, [rdx+24]
     mov r11, rax          ; CF = carry (257th bit)
 
-    jnc .folded
-    add r8, [DELTA+0]
-    adc r9, [DELTA+8]
-    adc r10, [DELTA+16]
-    adc r11, [DELTA+24]
-    jnc .folded
-    add r8, [DELTA+0]
-    adc r9, [DELTA+8]
-    adc r10, [DELTA+16]
-    adc r11, [DELTA+24]
+    ; --- constant-time DELTA fold (replaces the branchy jnc folds below) ---
+    ; a,b are reduced (< n), so s = a+b < 2n < 2^257 with at most one 257th
+    ; carry bit (CF). Fold 2^256 == DELTA (mod n) by adding DELTA iff CF is
+    ; set, using a mask instead of a branch so the instruction count -- and
+    ; therefore the execution time -- is independent of the operand values.
+    ;   w = s + (c ? DELTA : 0), computed add/mask over 4 limbs.
+    ; Proof that w fits 4 limbs (no carry-out) and w < 2n (single cond-sub):
+    ;   c=0: w = a+b < 2n, no 257-bit carry by definition.
+    ;   c=1: t = s - 2^256 < n (since a+b < 2n => t < n); w = t+DELTA; and
+    ;        n + DELTA = 2^256  =>  w <= n-1+DELTA = 2^256-1  (no carry-out).
+    ;        w < n + DELTA < 2n, so one conditional subtract of n suffices.
+    mov  rbx, 0
+    adc  rbx, 0           ; rbx = c (0 or 1); reads CF with no branch
+    neg  rbx              ; rbx = -c  =>  0, or -1 (all-ones mask)
+    ; Pre-mask the four DELTA limbs into scratch regs FIRST. This keeps the
+    ; and/mask ops out of the add/adc chain below -- an `and` between an `add`
+    ; and an `adc` would clobber the carry flag (CF) and corrupt propagation.
+    mov  rax, [DELTA+0]
+    and  rax, rbx
+    mov  rcx, [DELTA+8]
+    and  rcx, rbx
+    mov  r12, [DELTA+16]
+    and  r12, rbx
+    mov  r13, [DELTA+24]
+    and  r13, rbx
+    ; constant-time fold: w = s + (c ? DELTA : 0) over 4 limbs. No interleaved
+    ; flag-clobbering instructions, so the adc chain propagates carries
+    ; correctly and the instruction count is independent of c.
+    add  r8, rax
+    adc  r9, rcx
+    adc  r10, r12
+    adc  r11, r13
 
 .folded:
     mov rax, r8
@@ -148,14 +170,23 @@ sc_sub:
     mov rax, [rsi+24]
     sbb rax, [rdx+24]
     mov r11, rax
+    ; CF = borrow (0 iff a >= b). Add n back iff borrow, branch-free.
+    ; mask = -borrow  (all-ones if borrow, else 0), via sbb rax,rax.
+    sbb rax, rax          ; rax = -CF  = 0 or -1 (mask)
+    ; Pre-mask n limbs so the add/adc chain has no interleaved flag-clobber.
+    mov rbx, [N_LIMBS+0]
+    and rbx, rax
+    mov r12, [N_LIMBS+8]
+    and r12, rax
+    mov r13, [N_LIMBS+16]
+    and r13, rax
+    mov rcx, [N_LIMBS+24]
+    and rcx, rax
+    add r8, rbx
+    adc r9, r12
+    adc r10, r13
+    adc r11, rcx
 
-    jnc .store
-    add r8, [N_LIMBS+0]
-    adc r9, [N_LIMBS+8]
-    adc r10, [N_LIMBS+16]
-    adc r11, [N_LIMBS+24]
-
-.store:
     mov [rdi+0], r8
     mov [rdi+8], r9
     mov [rdi+16], r10
@@ -223,12 +254,48 @@ sc_mul:
     mov rdx, r15
     and rdx, 63
     mov rax, [rbp-0xa8+rcx]
-    bt rax, rdx
-    jnc .next
+    bt rax, rdx           ; CF = bit i of b (the secret multiplicand bit)
+    ; Constant-time conditional add. We ALWAYS perform R = R + a, then revert
+    ; to the pre-add R via cmov where the bit is clear. The bt/cmovnc pair
+    ; never branches on the bit, and the loop bound (dec r15; jns) is a fixed
+    ; 256 iterations independent of b. Instruction count is data-independent.
+    mov rax, [rbp-0x78]   ; save original R (pre-add) to scratch
+    mov [rbp-0xc8], rax
+    mov rax, [rbp-0x70]
+    mov [rbp-0xc0], rax
+    mov rax, [rbp-0x68]
+    mov [rbp-0xb8], rax
+    mov rax, [rbp-0x60]
+    mov [rbp-0xb0], rax
     lea rdi, [rbp-0x78]
     lea rsi, [rbp-0x78]
     mov rdx, r13
-    call sc_add
+    call sc_add           ; R = R + a  (unconditional)
+    ; restore the bit into CF (mov/call clobbered it); bt is branch-free
+    mov rcx, r15
+    shr rcx, 6
+    shl rcx, 3
+    mov rdx, r15
+    and rdx, 63
+    mov rax, [rbp-0xa8+rcx]
+    bt rax, rdx           ; CF = bit i of b again
+    ; cmovnc: CF=0 (bit clear) -> take original R; CF=1 (bit set) -> keep R+a
+    mov rax, [rbp-0x78]
+    mov rcx, [rbp-0xc8]
+    cmovnc rax, rcx
+    mov [rbp-0x78], rax
+    mov rax, [rbp-0x70]
+    mov rcx, [rbp-0xc0]
+    cmovnc rax, rcx
+    mov [rbp-0x70], rax
+    mov rax, [rbp-0x68]
+    mov rcx, [rbp-0xb8]
+    cmovnc rax, rcx
+    mov [rbp-0x68], rax
+    mov rax, [rbp-0x60]
+    mov rcx, [rbp-0xb0]
+    cmovnc rax, rcx
+    mov [rbp-0x60], rax
 .next:
     dec r15
     jns .dbl_loop
