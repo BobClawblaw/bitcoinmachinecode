@@ -82,6 +82,7 @@ asm/bitcoin_serve.o
 asm/tests/test_p2p_inv
 asm/tests/test_bip152
 asm/tests/test_bip152_loop
+asm/tests/test_sendheaders_fee
 asm/bitcoin_cmpct.o
 asm/tests/test_sha512
 asm/sha512.o

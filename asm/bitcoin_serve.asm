@@ -57,12 +57,21 @@ cn_getdata: db "getdata",0
 cn_getbtxn: db "getblocktxn",0
 cn_btxn:   db "blocktxn",0
 cn_cmpct:  db "cmpctblock",0
+cn_sendhd: db "sendheaders",0
+cn_feeflt: db "feefilter",0
 ; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
 align 16
 bt_buf:    times (8<<20) db 0     ; compact-block output buffer
 s_cmpct_v2:  dq 0                 ; peer negotiated compact blocks (sendcmpct version 2)
 s_cmpct_hb:  dq 0                 ; peer requested high-bandwidth mode (announce=1)
 s_cmpct_nonce: dq 0               ; nonce used for the compact block we announced
+s_shdr:    dq 0                   ; peer sent `sendheaders` -> announce new blocks with
+                                  ;   a `headers` message instead of an `inv`
+s_peerfee: dq 0                   ; peer's `feefilter` (min relay feerate, sat/kB); 0 = none.
+s_myfee:   dq 1000                ; OUR min-relay-feerate (sat/kB) advertised to peers via
+                                  ;   a `feefilter` message (1000 sat/kB = 1 sat/vB, Core default)
+s_feesent: db 0                   ; have we sent our `feefilter` to this peer yet
+s_lasttip: dq 0                   ; remembered stored tip (height) for tip-watch announce
 s_idxn:    dq 0                   ; # indexes parsed from getblocktxn
 s_idxbuf:  times (512*2) db 0      ; getblocktxn requested tx indexes (u16 LE each)
 s_diffshift: dq 0
@@ -141,6 +150,26 @@ node_serve_loop:
     mov  byte [mp_initdone], 1
 .mpready:
 
+    ; ---- per-connection init: reset negotiation state, remember tip, and
+    ; send the peer OUR `feefilter` (advertise min-relay-feerate so it skips
+    ; low-fee relay to us). This is the outbound feefilter leg.
+    mov  qword [s_shdr], 0
+    mov  qword [s_peerfee], 0
+    mov  byte [s_feesent], 0
+    mov  eax, [r14+24]           ; tip height (st[24])
+    mov  [s_lasttip], rax
+    ; feefilter_send(fd) -- 8-byte int64 LE min-relay-feerate (s_myfee)
+    lea  rax, [hp_buf]
+    mov  rdx, [s_myfee]
+    mov  [hp_buf], rdx
+    mov  rdi, r12
+    lea  rsi, [cn_feeflt]
+    mov  rdx, 9
+    lea  rcx, [hp_buf]
+    mov  r8d, 8
+    call p2p_write
+    mov  byte [s_feesent], 1
+
     ; Outer-loop counter lives in r15. r15 is written ONLY here (entry); all
     ; handlers avoid it and reuse rbx as scratch (getdata item pointer etc.).
     ; r15 is callee-saved so the external calls (p2p_read, idx_get,
@@ -176,8 +205,10 @@ node_serve_loop:
     je   .do_inv
     cmp  dword [s_cmd], 0x00007874   ; "tx"
     je   .do_tx
-    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct)
+    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct / sendheaders)
     je   .maybe_sendcmpct
+    cmp  dword [s_cmd], 0x66656566   ; "feef" (feefilter)
+    je   .maybe_feefilter
     jmp  .next
 
 .do_verack:
@@ -778,7 +809,12 @@ node_serve_loop:
     jmp  .next
 
 .maybe_sendcmpct:
-    ; "sendcmpct": dword0 already "send"; confirm cmd[4]=='c' and cmd[5]=='m'
+    ; "send..." split: sendheaders / sendcmpct share dword0 "send".
+    ;   cmd[4]=='h' -> sendheaders : peer wants new blocks announced as a
+    ;     headers message instead of an inv (payload: none).
+    ;   cmd[4]=='c' && cmd[5]=='m' -> sendcmpct : BIP152 negotiation.
+    cmp  byte [s_cmd+4], 'h'
+    je   .do_sendheaders
     cmp  byte [s_cmd+4], 'c'
     jne  .next
     cmp  byte [s_cmd+5], 'm'
@@ -799,6 +835,27 @@ node_serve_loop:
     jmp  .next
 .sc_low:
     mov  qword [s_cmpct_hb], 0
+    jmp  .next
+
+.do_sendheaders:
+    ; sendheaders: peer wants new blocks advertised with a `headers` message
+    ; rather than an `inv`, cutting relay traffic (one header instead of one
+    ; 36-byte inv entry). Empty payload; record the flag so the tip-watch
+    ; announcer honors it.
+    mov  qword [s_shdr], 1
+    jmp  .next
+
+.maybe_feefilter:
+    ; "feefilter": confirm cmd[4..7]=="ilt\0" (dword after "feef").
+    cmp  dword [s_cmd+4], 0x00746c69 ; "ilt\0"
+    jne  .next
+    ; payload = int64 LE min-relay-feerate (sat/kB), 8 bytes. We skip relaying
+    ; txs to this peer whose feerate is below it.
+    mov  rax, [s_plen]
+    cmp  rax, 8
+    jb   .next
+    mov  rax, [pl_buf]           ; int64 LE feerate
+    mov  [s_peerfee], rax
     jmp  .next
 
 .do_getblocktxn:
@@ -929,11 +986,145 @@ node_serve_loop:
     jmp  .next
 
 .next:
+    ; ---- tip-watch: if the stored tip advanced past what we last announced,
+    ; advertise the newly-tipped block to the connected peer. Honored form:
+    ; `inv`(MSG_BLOCK) by default, or a `headers` message when the peer
+    ; negotiated `sendheaders` (BIP130). Updates s_lasttip so each new tip is
+    ; announced exactly once.
+    mov  eax, [r14+24]        ; tip height (st[24])
+    mov  [s_cnt], rax
+    mov  rax, [s_lasttip]
+    cmp  rax, [s_cnt]
+    jge  .tw_done             ; no advance -> nothing to announce
+    ; announce the newly-tipped block (height = s_cnt)
+    ; node_announce_tip(fd, st, ht_idx, use_headers)
+    mov  rdi, r12             ; fd
+    mov  rsi, [s_st]          ; st
+    mov  rdx, [s_htidx]       ; ht_idx (stable copy)
+    mov  rcx, [s_shdr]        ; use_headers: 1 if sendheaders negotiated
+    call node_announce_tip
+    mov  rax, [s_cnt]
+    mov  [s_lasttip], rax
+.tw_done:
     dec  r15
     jg   .outer
 .done:
     mov  rax, [s_served]
     add  rsp, 0x50
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; node_announce_tip(int fd, void* st, void* ht_idx, long use_headers) -> long
+;   Advertise the node's current tip block to a connected peer, the proactive
+;   relay half of the serve loop. Honouases BIP130 sendheaders: when
+;   `use_headers` is nonzero the tip is announced as a `headers` message
+;   (one 80-byte header + tx-count 0) instead of an `inv`(MSG_BLOCK) entry.
+;   Modeled on the wire output a reference client expects byte-for-byte:
+;     inv:     [count=1][type u32 LE=2][hash32]           (37 bytes)
+;     headers: [count varint=1][hdr80][tx-count 0]        (82 bytes)
+;   Returns 1 on success (announcement written), 0 on failure (no tip / load
+;   error). Preserves all callee-saved registers.
+; ============================================================================
+global node_announce_tip
+node_announce_tip:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 8               ; keep 16-byte stack alignment for calls
+    mov  r12, rdi             ; fd
+    mov  r13, rsi             ; st
+    mov  r14, rdx             ; ht_idx (unused here; block_hash only needs header)
+    ; use_headers (rcx) -> local slot [rbp-0x30]. A deep callee below
+    ; (node_serve_block / hashing) clobbers r15 and caller-saved regs, so keep
+    ; the mode in a stack slot rather than a live register.
+    mov  [rbp-0x30], rcx      ; use_headers
+    ; tip height = *(int*)(st+24)
+    mov  eax, [r13+24]
+    test eax, eax
+    js   .at_fail             ; no tip
+    mov  ebx, eax             ; height (ebx, callee-saved)
+    ; node_serve_block(st, h, sb_buf, cap) -> rax = length
+    mov  rdi, r13
+    mov  esi, ebx
+    lea  rdx, [sb_buf]
+    mov  rcx, (8<<20)
+    call node_serve_block
+    test rax, rax
+    jle  .at_fail
+    cmp  rax, 80
+    jb   .at_fail
+    ; ---- headers form (sendheaders negotiated) ----
+    mov  rax, [rbp-0x30]      ; use_headers (restore after deep callee)
+    test rax, rax
+    jz   .at_inv
+    ; hp_buf = [count varint=0x01][hdr80][tx-count 0x00]
+    mov  byte [hp_buf], 1
+    ; memcpy_len(dst=hp_buf+1, src=sb_buf, n=80) -- length in RDX
+    lea  rdi, [hp_buf+1]
+    lea  rsi, [sb_buf]
+    mov  rdx, 80
+    call memcpy_len
+    mov  byte [hp_buf+81], 0        ; tx-count 0
+    mov  rdi, r12
+    lea  rsi, [cn_head]
+    mov  rdx, 7
+    lea  rcx, [hp_buf]
+    mov  r8d, 82
+    call p2p_write
+    test rax, rax
+    jle  .at_fail
+    mov  rax, 1
+    jmp  .at_done
+.at_inv:
+    ; ---- inv form ----
+    ; block_hash(out=hp_buf+6+? ...) use sb_buf+0x200000 scratch like getblocks
+    ; block_hash(hh, sb_buf) -- 80-byte header hash
+    lea  rdi, [sb_buf+0x200000]
+    lea  rsi, [sb_buf]
+    call block_hash
+    ; build inv: hp_buf[0]=count 1, hp_buf[1..4]=type u32 LE=2, hp_buf[5..36]=hashLE
+    mov  byte [hp_buf], 1
+    mov  dword [hp_buf+1], 2
+    ; reverse the 32-byte hash (internal order at sb_buf+0x200000..+31) into
+    ; hp_buf+5 in LE wire order. Use base+index (2 MB displacement not encodable
+    ; with a scaled register index directly).
+    lea  r10, [sb_buf+0x200000+31]  ; src base (last hash byte)
+    lea  r11, [hp_buf+5]            ; dst base
+    xor  ecx, ecx
+.at_rev:
+    cmp  rcx, 32
+    jae  .at_rev_done
+    mov  r9, rcx
+    neg  r9
+    mov  al, [r10+r9]
+    mov  [r11+rcx], al
+    inc  rcx
+    jmp  .at_rev
+.at_rev_done:
+    mov  rdi, r12
+    lea  rsi, [cn_inv]
+    mov  rdx, 3
+    lea  rcx, [hp_buf]
+    mov  r8d, 37
+    call p2p_write
+    test rax, rax
+    jle  .at_fail
+    mov  rax, 1
+    jmp  .at_done
+.at_fail:
+    xor  eax, eax
+.at_done:
+    add  rsp, 8
     pop  r15
     pop  r14
     pop  r13
