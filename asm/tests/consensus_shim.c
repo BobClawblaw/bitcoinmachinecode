@@ -31,6 +31,7 @@ extern void diff_target(unsigned char out[32], unsigned bits);
 extern int  tx_parse(unsigned long long info[8], const void* tx, unsigned long long txlen);
 extern int  tx_txid(unsigned char out[32], const void* tx, unsigned long long txlen,
                     void* scratch, unsigned long long cap);
+extern unsigned long long tx_legacy_sigops(const void* tx, unsigned long long txlen);
 
 static long hex2b(const char* h, unsigned char* o, long max){
     long n=0; if(!h) return 0;
@@ -82,6 +83,58 @@ int main(void){
             unsigned bits; memcpy(&bits,buf,4);
             unsigned char t[32]; diff_target(t,bits);
             printf("OK 1 "); put_hex(t,32); printf("\n");
+        } else if(!strcmp(cmd,"SIGOPS")){
+            /* Walk every tx in the block, sum ASM tx_legacy_sigops (matches
+             * Core's structurally-computable legacy sigop count). */
+            unsigned long long idx=80, total=0;
+            unsigned char c=buf[80];
+            if(c<0xfd) idx=81;
+            else if(c==0xfd) idx=83;
+            else if(c==0xfe) idx=85;
+            else idx=89;
+            int ntx=0; int cap_ok=1;
+            while(idx < (unsigned long)n){
+                unsigned long long info[8];
+                int pr=tx_parse(info,buf+idx,(unsigned long long)(n-idx));
+                if(!pr){ cap_ok=0; break; }
+                unsigned long long tlen=info[0];
+                if(tlen==0 || tlen>(unsigned long long)(n-idx)){ cap_ok=0; break; }
+                total += tx_legacy_sigops(buf+idx,tlen);
+                idx += tlen; ntx++;
+                if(ntx>20000){cap_ok=0;break;}
+            }
+            printf("OK %lld %d %d\n", total, ntx, cap_ok?1:0);
+        } else if(!strcmp(cmd,"DUPTX")){
+            /* In-block duplicate-txid detection using ASM tx_txid. Core's
+             * CheckBlock rejects a block that contains two txs with the same
+             * txid (BIP30 in-block rule). Print:  <dup> <ntx>. */
+            static unsigned char dupbuf[20000*32]; /* txids so far */
+            unsigned long long idx=80;
+            unsigned char c=buf[80];
+            if(c<0xfd) idx=81;
+            else if(c==0xfd) idx=83;
+            else if(c==0xfe) idx=85;
+            else idx=89;
+            int ntx=0; int dup=0;
+            for(int i=0;i<20000 && idx<(unsigned long)n && !dup;i++,ntx++){
+                unsigned long long info[8];
+                int pr=tx_parse(info,buf+idx,(unsigned long long)(n-idx));
+                if(!pr) break;
+                unsigned long long tlen=info[0];
+                if(tlen==0 || tlen>(unsigned long long)(n-idx)) break;
+                unsigned char id[32];
+                int tid=tx_txid(id,buf+idx,tlen,tscratch,(unsigned long long)(sizeof tscratch));
+                if(tid){
+                    for(int j=0;j<i;j++){
+                        if(!memcmp(id, dupbuf+j*32, 32)){ dup=1; break; }
+                    }
+                    if(!dup) memcpy(dupbuf+i*32, id, 32);
+                }
+                idx += tlen;
+            }
+            printf("OK %d %d\n", dup, ntx);
+        } else if(!strcmp(cmd,"QUIT")){
+            break;
         }
         fflush(stdout);
     }
