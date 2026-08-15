@@ -348,7 +348,14 @@ node_sync:
     call p2p_write
     cmp  rax, 24
     jl   .fail
-    ; ---- receive headers ----
+    ; ---- receive headers, draining ANY interleaved relay chatter a live seed
+    ; sends post-verack (addr/sendheaders/feefilter/inv/version/ping). The fake
+    ; loopback peer never interleaves these, so the original strict "first read
+    ; must be headers -> else .fail" only worked in test. Against real mainnet
+    ; the first post-getheaders read is often an `addr`/`inv`, which must be
+    ; drained -- echo ping->pong, ignore everything else, re-read. Only a real
+    ; read error/timeout (<=0) is a hard failure. ----
+.hdr_drain:
     mov  rdi, rbx
     lea  rsi, [rbp-0x160]   ; cmd
     mov  rdx, r14
@@ -361,7 +368,21 @@ node_sync:
     lea  rsi, [rel _headers]
     mov  ecx, 7
     repe cmpsb
-    jne  .fail
+    je   .have_headers
+    ; not headers: echo pong if ping, else just ignore & re-read
+    lea  rdi, [rbp-0x160]
+    lea  rsi, [rel _ping]
+    mov  ecx, 4
+    repe cmpsb
+    jne  .hdr_drain
+    mov  rdi, rbx
+    lea  rsi, [rel _pong]
+    mov  rdx, 4
+    mov  rcx, r14
+    mov  r8d, 8
+    call p2p_write
+    jmp  .hdr_drain
+.have_headers:
     ; ---- headers count ----
     mov  rdi, r14
     mov  esi, [rbp-0x54]
@@ -431,7 +452,12 @@ node_sync:
     call p2p_write
     cmp  rax, 24
     jl   .fail
-    ; ---- receive block ----
+    ; ---- receive block, draining interleaved relay chatter (live seeds send
+    ; addr/inv/ping/sendheaders between our getdata and the block reply; the
+    ; fake peer never did, so the original strict read broke live). Echo ping->
+    ; pong, ignore other non-`block` msgs, re-read; only a real read error
+    ; (<=0) is a hard failure. ----
+.blk_drain:
     mov  rdi, rbx
     lea  rsi, [rbp-0x160]
     mov  rdx, r14
@@ -444,7 +470,21 @@ node_sync:
     lea  rsi, [rel _block]
     mov  ecx, 5
     repe cmpsb
-    jne  .fail
+    je   .have_block
+    ; not block: echo pong if ping, else ignore & re-read
+    lea  rdi, [rbp-0x160]
+    lea  rsi, [rel _ping]
+    mov  ecx, 4
+    repe cmpsb
+    jne  .blk_drain
+    mov  rdi, rbx
+    lea  rsi, [rel _pong]
+    mov  rdx, 4
+    mov  rcx, r14
+    mov  r8d, 8
+    call p2p_write
+    jmp  .blk_drain
+.have_block:
     ; ---- validate ----
     mov  rdi, r14
     mov  esi, [rbp-0x54]
