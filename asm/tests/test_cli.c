@@ -66,7 +66,7 @@ int main(void){
     build_chain();
     /* build store in CWD (empty dir); use a scratch subdir */
     mkdir("/tmp/clitest",0777); chdir("/tmp/clitest");
-    unlink("blk00000.dat"); unlink("index.dat");
+    unlink("blk00000.dat"); unlink("index.dat"); unlink("prune.dat");
     static unsigned char st[4096];
     cki("store_init", store_init(st), 1);
     for(int i=0;i<NB;i++) cki("append", store_append(st,bhash[i],blk[i],blen[i]), i);
@@ -131,6 +131,32 @@ int main(void){
     /* stop -> block count (now with trailing newline like the other commands) */
     char* cmd8="stop"; void* ava[8]; ava[0]=cmd8;
     n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("stop",(char*)out,"8\n");
+
+    /* ---- prune (Core-style -prune): delete blk data below a height ----
+     * NB blocks have blen: b[0] has a compact tx. Retain only blocks >= 4. */
+    char* cmd9="prune"; char* p4="4"; void* avb[8]; avb[0]=cmd9; avb[1]=p4;
+    n=cli_main(st,2,avb,out,sizeof out); out[n]=0;
+    if(strncmp((char*)out,"pruned to height ",17)==0) printf("PASS prune cmd (got %.20s)\n",(char*)out);
+    else { printf("FAIL prune cmd got=%.30s\n",(char*)out); failures++; }
+    /* block count still reports the full stored chain (index retained) */
+    n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("count after prune",(char*)out,"8\n");
+    /* pruned height (<4) -> unavailable (error output) */
+    char* h1="1"; void* avc[8]; avc[0]=cmd3; avc[1]=h1;   /* getblock 1 */
+    n=cli_main(st,2,avc,out,sizeof out); out[n]=0;
+    if(strncmp((char*)out,"error:",6)==0) printf("PASS getblock pruned->error\n");
+    else { printf("FAIL getblock pruned got=%.20s\n",(char*)out); failures++; }
+    /* retained height (>=4) still served byte-exact */
+    char* h7="7"; void* avd[8]; avd[0]=cmd3; avd[1]=h7;
+    n=cli_main(st,2,avd,out,sizeof out); out[n]=0;
+    { char e[1600]; hexfmt(e,blk[7],(int)blen[7]); strcat(e,"\n"); cks("getblock 7 after prune",(char*)out,e); }
+    /* prune-all: prune to a height > tip deletes every blk file (UTXO-only) */
+    char* p99="99"; void* ave[8]; ave[0]=cmd9; ave[1]=p99;   /* prune > tip */
+    n=cli_main(st,2,ave,out,sizeof out); out[n]=0;
+    if(strncmp((char*)out,"pruned to height ",17)==0) printf("PASS prune-all ok\n");
+    else { printf("FAIL prune-all got=%.30s\n",(char*)out); failures++; }
+    n=cli_main(st,2,avd,out,sizeof out); out[n]=0;   /* getblock 7 now pruned too */
+    if(strncmp((char*)out,"error:",6)==0) printf("PASS getblock pruned-all->error\n");
+    else { printf("FAIL getblock pruned-all got=%.20s\n",(char*)out); failures++; }
 
     printf(failures?"FAILURES %d\n":"ALL TESTS PASSED (0 failures)\n",failures);
     return failures?1:0;

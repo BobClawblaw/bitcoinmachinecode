@@ -34,6 +34,7 @@ extern store_get_at
 extern store_get_file_fd
 extern store_get_tip
 extern store_reload
+extern store_prune
 extern block_hash
 extern sha256d
 extern tx_parse
@@ -49,6 +50,7 @@ help_text:
  db `  getblock <h|hash64>   raw block bytes as hex\n`
  db `  gettx <txid64>        find + print a transaction by id\n`
  db `  getbalance            total of stored coinbase outputs (sat)\n`
+ db `  prune <height>        delete blk data below height (Core -prune)\n`
  db `  stop                  report current tip\n`
 help_len equ $ - help_text
 
@@ -1161,6 +1163,11 @@ cli_main:
     call str_eq
     test al, al
     jnz  .count           ; stop reports the block count
+    mov  rdi, r8
+    lea  rsi, [rel c_prune]
+    call str_eq
+    test al, al
+    jnz  .prune
     jmp  .unknown
 .help:
     mov  rdi, r14
@@ -1227,6 +1234,34 @@ cli_main:
     cmp  rax, -1
     je   .erange
     jmp  .finish_out
+.prune:
+    ; prune <height>: retain block data at height >= <height>, delete pruned
+    ; blk files below it (mirrors Core's -prune). <0 -> prune nothing;
+    ; >tip -> UTXO-only retention (all blk files deleted).
+    cmp  rbx, 2
+    jb   .earg
+    mov  rdi, [r13+8]       ; argv[1] = height string
+    call cli_atoi
+    mov  rbx, rax           ; height (callee-saved)
+    mov  rdi, r12
+    mov  esi, ebx
+    call store_prune
+    test rax, rax
+    jl   .erange           ; store_prune failed
+    ; output: "pruned to height <h> (retained blocks serve; below unavailable)\n"
+    mov  rdi, r14
+    lea  rsi, [rel prune_msg]
+    mov  edx, prune_msg_len
+    call cli_out
+    mov  r13, rax           ; advanced out
+    mov  rdi, r13
+    mov  eax, [r12+48]      ; effective prune height (clamped) is at st+48
+    mov  rsi, rax
+    call cli_emit_dec
+    ; rax = advanced out
+    mov  byte [rax], 10
+    inc  rax
+    jmp  .finish_out
 .finish_out:
     ; rax = end pointer; return length = rax - out
     mov  rdi, r14
@@ -1290,5 +1325,8 @@ c_block:   db "getblock",0
 c_tx:      db "gettx",0
 c_balance: db "getbalance",0
 c_stop:    db "stop",0
+c_prune:   db "prune",0
+prune_msg: db "pruned to height "
+prune_msg_len equ $-prune_msg
 
 section .note.GNU-stack noalloc noexec nowrite progbits

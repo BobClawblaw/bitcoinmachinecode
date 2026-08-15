@@ -18,7 +18,7 @@ extern int  store_get_tip(void* st, unsigned long long* out_meta);
 static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
 
-/* state struct layout must mirror bitcoin_store.asm */
+/* state struct layout must mirror bitcoin_store.asm (incl. pruning at +48) */
 struct St {
     unsigned long long cur_blk_fd;   /* +0  */
     unsigned long long idx_fd;       /* +8  */
@@ -28,6 +28,8 @@ struct St {
     int cur_file_pos;                /* +32 */
     int magic;                       /* +36 */
     int pad;                         /* +40 */
+    int pad2;                        /* +44 */
+    int prune_height;                /* +48 */
 };
 
 int main(void){
