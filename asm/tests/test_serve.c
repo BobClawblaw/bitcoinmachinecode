@@ -93,6 +93,14 @@ int main(void){
     struct timeval tv; tv.tv_sec=8; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     cki("handshake", node_handshake(fd), 1);
 
+    /* the serve loop advertises its min-relay-feerate (a `feefilter`) as the
+       first post-handshake message (as Core does after verack); drain it so the
+       getdata/ping reads below sync to the reply stream. */
+    {
+        char dc[12]; static unsigned char db[64]; unsigned dbl=0;
+        cki("drain leading feefilter", p2p_read(fd,dc,db,sizeof db,&dbl)>0 && !strncmp(dc,"feefilter",9) && dbl==8, 1);
+    }
+
     /* ping -> pong */
     unsigned char pg[8]; uint64_t nonce=0xdeadbeefcafebabeull;
     p2p_ping(pg, nonce);

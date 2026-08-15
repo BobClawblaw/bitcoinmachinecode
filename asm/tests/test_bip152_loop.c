@@ -77,6 +77,15 @@ int main(void){
     struct timeval tv; tv.tv_sec=8; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     ck("handshake", node_handshake(fd)==1);
 
+    /* the asm serve loop advertises our min-relay-feerate (a `feefilter`) as
+       its first post-handshake message (like Core after verack); drain it so
+       subsequent reads sync to the reply stream. */
+    {
+        char dcmd[12]; unsigned char dbuf[64]; unsigned dbl=0;
+        int dr=p2p_read(fd,dcmd,dbuf,sizeof dbuf,&dbl);
+        ck("drain leading feefilter", dr>0 && !strncmp(dcmd,"feefilter",9) && dbl==8);
+    }
+
     /* ---- sendcmpct low-bandwidth negotiation ---- */
     {
         unsigned char sc[16]; sc[0]=0; put_u64(sc+1,2);
