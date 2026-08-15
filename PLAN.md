@@ -131,8 +131,12 @@ make daemon/wallet_cli   # builds asm/daemon/wallet_cli from wallet_core.c + wal
          FULL IBD pass node_ibd = headers-first persist + getdata block bodies +
          validate + store over one peer connection (test_ibd_full, 1200 blocks).
          Store / CLI / block-consensus are in-place; real block BODY download
-         from live seeds remains a peer-policy gap (seeds drop getdata to
-         minimal clients), not an asm gap.
+         from live seeds is proven end-to-end asm (tests/live_block_dl:
+         handshake -> 2000 real mainnet headers -> getdata -> block body ->
+         cons_verify VALID -> store_append), so a single live download is no
+         longer a gap. A minimal (unnegotiated) client is still dropped by
+         seeds (a peer-policy limit, not an asm limitation), and the residual
+         gap is MULTI-BLOCK persistent ingest by the long-running node.
 [ DONE ] Node-layer remaining part (d): the UTXO set and full tx signature/script
          validation — completed as the wallet/validation bridge (see the new
          section below): in-memory UTXO store (bitcoin_utxo.asm, utxo_init/put/
@@ -254,10 +258,11 @@ daemon path -- sockets/P2P codecs (S1-S2), persistent blk store + block index
 (S3), full-block consensus incl. SegWit txids (S4), the daemon driver + CLI
 (S5-S6), and the persistent headers-first IBD + block-body download (S5b/S5c) --
 is DONE & VERIFIED against synthetic chains, real mainnet headers, and real
-validated/hashed blocks. The one honest gap is downloading + storing a real
-MULTI-BLOCK chain over the wire: live seeds serve headers but drop block-body
-getdata to a minimal client (a peer-policy limit, not an asm limit). See
-COMPLETION ROADMAP below.
+validated/hashed blocks, and a single real block body downloaded live from a
+seed and validated with asm cons_verify (tests/live_block_dl). The residual
+honest gap is downloading + storing a real MULTI-BLOCK chain over the wire into
+the long-running node: a minimal (unnegotiated) client is dropped by seeds
+(a peer-policy limit, not an asm limit). See COMPLETION ROADMAP below.
 
 ### 10. COMPLETION ROADMAP (node that downloads/serves + full CLI)
 
