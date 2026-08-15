@@ -420,7 +420,11 @@ static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
 static int   mux_n_out = 0;
 
-/* Connect + handshake one outbound seed, returning a long-lived fd (or -1). */
+/* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
+ * The handshake reads the seed's version/verack plus its post-verack chatter
+ * (sendheaders/sendaddrv2/feefilter/addr), which can take longer than the
+ * tight per-pass recv bound -- so give the handshake a generous 6s timeout,
+ * then clamp the socket to the short per-pass timeout for node_sync. */
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(host,NULL,&h,&res)!=0) return -1;
@@ -428,9 +432,12 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     freeaddrinfo(res);
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
     if(fd<0) return -1;
-    struct timeval tv; tv.tv_sec=rcv_ms/1000; tv.tv_usec=(rcv_ms%1000)*1000;
-    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     if(node_handshake(fd)!=1){ close(fd); return -1; }
+    /* handshake done: tighten the recv bound so each node_sync pass returns
+     * promptly when the peer is already at the chain tip */
+    struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
     return fd;
 }
 
