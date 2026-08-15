@@ -161,6 +161,14 @@ sighash_all:
     mov   r8, [rbp-0x38]
     call  copy_bytes
     mov   [rbp-0x50], rdi
+    ; FINDING 2b: the script preimage write (varint + script_len bytes) was not
+    ; capped against the preimage end ([rbp-0x58] = preimg+cap). The current
+    ; callers cannot exceed it (script is a prevout scriptPubKey, <= consensus
+    ; 10 kB, vs a 4 kB preimage buffer), but this is an internal invariant
+    ; violation that must be defensively rejected, exactly like the hashtype
+    ; write below. Reject if the resulting cursor passes the preimage end.
+    cmp   rdi, [rbp-0x58]
+    ja    .fail
 .after_script:
     ; sequence(4) raw (txcur now points at the raw sequence)
     mov   rdi, [rbp-0x50]
