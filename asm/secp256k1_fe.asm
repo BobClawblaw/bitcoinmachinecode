@@ -121,16 +121,13 @@ fe_add:
     ; We implement step 2 with adc from a zero high limb.
 
     ; Step 2: fold the carry. 2^256 - p = 2^32 + 977. So add (carry)*(2^32+977)
-    ; to the low limb and propagate. Simpler: add the constant C into limb0
-    ; and let it carry up through the all-ones limbs (since p's top three
-    ; limbs are all 0xFFFFFFFFFFFFFFFF, adding C propagates exactly as adding
-    ; to (2^256 - p)).
-    jnc .no_carry_fold      ; if no top carry, skip the fold
-
-    ; sum += (2^256 - p)  == add C to low limb and propagate carry
-    mov rax, r8
-    add rax, [C_CONST]      ; + (2^32+977)
-    mov r8, rax
+    ; to the low limb and propagate. Now branch-free (FINDING 3): the 257th
+    ; carry bit becomes a mask, and (2^256 - p) is conditionally added without
+    ; a jump, keeping the instruction count independent of the operand values.
+    sbb rbx, rbx            ; rbx = -CF = 0 (no carry) or -1 (carry mask)
+    mov rax, [C_CONST]
+    and rax, rbx            ; masked (2^32+977)
+    add r8, rax
     adc r9, 0
     adc r10, 0
     adc r11, 0
@@ -194,18 +191,25 @@ fe_sub:
     sbb rax, [rdx + 24]
     mov r11, rax            ; r8..r11 = a - b, CF = borrow
 
-    ; if borrow (a < b), add p: d += p
-    ; We branch here for clarity; a caller operating on secret data would
-    ; make this branchless, but fe_sub in the point-arithmetic hot path is
-    ; fine to branch since all values are public in signature verification.
-    jnc .store
-
-    mov rax, r8
-    add rax, [P_LIMBS + 0]
-    mov r8, rax
-    adc r9, [P_LIMBS + 8]
-    adc r10, [P_LIMBS + 16]
-    adc r11, [P_LIMBS + 24]
+    ; if borrow (a < b), add p: d += p. Now branch-free (FINDING 3): the
+    ; borrow is turned into a mask and p is conditionally re-added, so the
+    ; instruction count is independent of the operand values (secret-clean for
+    ; the future constant-time ladder).
+    sbb rax, rax            ; rax = -CF  = 0 (no borrow) or -1 (borrow) = mask
+    ; Pre-mask p limbs into scratch so the add/adc chain has no interleaved
+    ; flag-clobbering `and` between an `add` and its `adc`.
+    mov rbx, [P_LIMBS + 0]
+    and rbx, rax
+    mov r12, [P_LIMBS + 8]
+    and r12, rax
+    mov r13, [P_LIMBS + 16]
+    and r13, rax
+    mov rcx, [P_LIMBS + 24]
+    and rcx, rax
+    add r8, rbx
+    adc r9, r12
+    adc r10, r13
+    adc r11, rcx
 
 .store:
     mov [rdi + 0],  r8
