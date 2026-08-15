@@ -205,6 +205,25 @@ concern if a future coding path runs secret scalars through them — which is
 already foreclosed by FINDING 1's remediation (constant-time ladder). No action
 beyond noting the hygiene (prefer `cmov` in any future secret path).
 
+### Status — field-op half FIXED (2026-08-15); point-add half folded into FINDING 1
+
+**Field arithmetic — FIXED.** Commit `6e19041` made `fe_add` and `fe_sub`
+branch-free (constant-time): the `fe_sub` borrow re-add of `p` and the `fe_add`
+257th-carry fold now use mask-selected arithmetic instead of `jnc`. `fe_mul`
+was already branch-free (its only `jnz` is a fixed 8-iteration zeroing loop,
+data-independent; the reduction uses `cmovnc`). No data-dependent branches
+remain in the field layer; `fe_inv` still branches only on the fixed Fermat
+exponent (constant-time w.r.t. the input). Verified: `test_fe` KAT (40) +
+`tests/run_fe_diff.py` differential vs a Python big-int oracle (8,000 samples,
+0 failures) + all dependent point/ecdsa/wallet/key/taproot/sighash suites green
++ `point_scalar_mul` differential (1,213 samples, 0 failures).
+
+**Point-addition branches — NOT fixed here (folded into FINDING 1).** The
+`point_add`/`point_add_mixed` equal/opposite/infinity branches remain, but they
+must be made exception-free and branch-free as part of the FINDING 1
+constant-time `point_scalar_mul` ladder (card `t_08b49753`), which now has the
+branch-free field primitives it needs. See FINDING 1 status.
+
 ---
 
 ## Areas reviewed and found sound
@@ -264,17 +283,22 @@ correctly skipped for unwitnessed txid. No overflow found.
   (FINDING 2); preimage-write cap check (FINDING 2b).
 - `asm/secp256k1_scalar.asm` — constant-time `sc_add`/`sc_sub`/`sc_mul`/`sc_sqr`/
   `sc_inv` (FINDING 1, scalar half; commit `6162ad8`).
+- `asm/secp256k1_fe.asm` — constant-time (branch-free) `fe_add`/`fe_sub`
+  (FINDING 3, field-op half; commit `6e19041`); `fe_mul` verified branch-free.
 - `asm/tests/test_sighash_oob.c` — regression repro (new).
 - `asm/tests/stress_pointmul.py` + `.c`, `run_pointmul_diff.py` — differential
   harness for `point_scalar_mul` (validates the pending point-half ladder).
+- `asm/tests/run_fe_diff.py` + `stress_fe.c` — differential harness for
+  `fe_add`/`fe_sub`/`fe_mul` (locks FINDING 3 bit-exactness).
 - `asm/Makefile` — wire `tests/test_sighash_oob` into build/test/clean.
 
 `make test` green for the crypto/signing suites; the only outstanding build
 gap is the in-progress P2SH card's `tests/test_verify_p2sh.c` (worker WIP).
 
 **Bottom line:** the node's *verification & consensus* core is functionally
-sound and much better defended than the warning implies. The **signing** crypto
-is now constant-time on the scalar half (key/nonce low-level mults), but the
-`k*G` point multiply (`point_scalar_mul`) is still not — so it must not be used
+sound and has been hardened substantially. The **signing** crypto is now
+constant-time on the scalar half (key/nonce low-level mults) and the field layer
+is branch-free, but the `k*G` point multiply (`point_scalar_mul`) and the
+point-addition disagree/infinity branches are still not — so it must not be used
 with real private keys until the point half of FINDING 1 lands. The README
 warning should remain until then.
