@@ -387,15 +387,31 @@ node_sync:
     mov  rdi, r14
     mov  esi, [rbp-0x54]
     call p2p_headers_count
-    mov  [rbp-0x50], eax    ; hcount
+    mov  [rbp-0x50], eax    ; hcount (processing cap)
+    mov  [rbp-0x4c], eax    ; hcount_real (raw; for varint offset calc below)
     test eax, eax
     jz   .done
-    ; varint bytes = plen - count*81
-    mov  eax, [rbp-0x50]
+    ; varint bytes = plen - hcount_real*81  (real count, NOT the 64-cap -- the
+    ; page may hold up to 2000 headers in the buffer even though we only
+    ; process/store the first 64 this pass; offset must point at header 0)
+    mov  eax, [rbp-0x4c]
     imul rax, 81
     mov  r8d, [rbp-0x54]    ; plen is a DWORD -- 32-bit load!
     sub  r8, rax
     mov  [rbp-0x58], r8d
+    ; CAP the PROCESSING count to the allocated prehash array (64 x 32B at
+    ; rbp-0xae8). A live mainnet seed returns up to 2000 headers per getheaders
+    ; page; the prehash loop writes hash[i] at rbp-0xae8 + i*32, so processing
+    ; >64 would overflow that array upward and stomp the locator ([rbp-0x78])
+    ; + save area -> SIGSEGV. The fake 8-block peer never sent >64, hiding this.
+    ; Clamping to 64 keeps the verified array bound; node_sync re-requests from
+    ; the advanced locator to fetch the remainder.
+    mov  eax, [rbp-0x50]
+    cmp  eax, 64
+    jbe  .hc_ok
+    mov  eax, 64
+    mov  [rbp-0x50], eax
+.hc_ok:
     mov  dword [rbp-0x68], 0
     ; PRECOMPUTE all block hashes from headers into rbp-0xae8 + i*32 while the
     ; headers are still in buf (the later block receive overwrites buf, so we
