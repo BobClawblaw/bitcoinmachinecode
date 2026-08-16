@@ -85,6 +85,13 @@ extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
                               const unsigned char seed[64], unsigned seedlen,
                               const unsigned indexes[], unsigned n);
 
+/* address book (asm/wallet_book.c) */
+extern int  book_set(const char* path, const char* label, const char* addr, int overwrite);
+extern int  book_rm (const char* path, const char* label);
+extern int  book_get(const char* path, const char* label, char* addr, int cap);
+extern int  book_list(const char* path, char* out, int cap);
+extern int  book_validate(const char* label);
+
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -495,6 +502,59 @@ static int seed_address(const char* mn, const char* pass, char* addr, int cap,
 }
 
 static const char* default_wallet_path(void) { return "config/wallet.dat"; }
+static const char* default_book_path(void) { return "config/addressbook.dat"; }
+
+/* address-book subcommands:
+ *   wallet_cli abook add  <label> <address> [book]
+ *   wallet_cli abook set  <label> <address> [book]   (overwrite)
+ *   wallet_cli abook get  <label> [book]
+ *   wallet_cli abook rm   <label> [book]
+ *   wallet_cli abook list [book]
+ * Default book: config/addressbook.dat (0600, own format). Labels are
+ * alnum/'-'/'_'/'.' (no spaces) and map name->address for sends/reference. */
+static int cmd_abook(int argc, char** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: wallet_cli abook <add|set|get|rm|list> <label> [address] [book]\n");
+        return 2;
+    }
+    const char* sub = argv[2];
+    if (!strcmp(sub, "list")) {
+        const char* path = (argc >= 4) ? argv[3] : default_book_path();
+        char buf[8192];
+        if (book_list(path, buf, (int)sizeof buf) != 0) { printf("(empty or no book at %s)\n", path); return 0; }
+        printf("%s", buf);
+        return 0;
+    }
+    if (argc < 4) { fprintf(stderr, "usage: wallet_cli abook %s <label> [address] [book]\n", sub); return 2; }
+    const char* label = argv[3];
+    if (book_validate(label)) { fprintf(stderr, "abook: invalid label '%s' (alnum/_/-/., no spaces, <=48ch)\n", label); return 1; }
+    if (!strcmp(sub, "get")) {
+        const char* path = (argc >= 5) ? argv[4] : default_book_path();
+        char addr[160];
+        if (book_get(path, label, addr, (int)sizeof addr)) { fprintf(stderr, "abook: no entry '%s'\n", label); return 1; }
+        printf("%s\n", addr);
+        return 0;
+    }
+    if (!strcmp(sub, "rm")) {
+        const char* path = (argc >= 5) ? argv[4] : default_book_path();
+        if (book_rm(path, label)) { fprintf(stderr, "abook: no entry '%s'\n", label); return 1; }
+        printf("removed %s\n", label);
+        return 0;
+    }
+    if (!strcmp(sub, "add") || !strcmp(sub, "set")) {
+        if (argc < 5) { fprintf(stderr, "usage: wallet_cli abook %s <label> <address> [book]\n", sub); return 2; }
+        const char* addr = argv[4];
+        const char* path = (argc >= 6) ? argv[5] : default_book_path();
+        int overwrite = !strcmp(sub, "set") ? 1 : 0;
+        int r = book_set(path, label, addr, overwrite);
+        if (r < 0) { fprintf(stderr, "abook: write failed for %s\n", path); return 1; }
+        if (r > 0) { fprintf(stderr, "abook: label '%s' already exists (use 'set' to overwrite)\n", label); return 1; }
+        printf("%s -> %s\n", label, addr);
+        return 0;
+    }
+    fprintf(stderr, "abook: unknown subcommand '%s'\n", sub);
+    return 2;
+}
 
 /* ---- dev secret file: <wallet>.pass -------------------------------------
  * For in-development use on a trusted/secure box we persist the secret that
@@ -675,7 +735,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|netaddr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|netaddr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey|abook> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -685,6 +745,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "load")) return cmd_load(argc, argv);
     if (!strcmp(argv[1], "getaddress")) return cmd_getaddress(argc, argv);
     if (!strcmp(argv[1], "getprivkey")) return cmd_getprivkey(argc, argv);
+    if (!strcmp(argv[1], "abook")) return cmd_abook(argc, argv);
     if (!strcmp(argv[1], "addr")) {
         if (argc < 3) { fprintf(stderr, "usage: wallet_cli addr <privkey_hex>\n"); return 2; }
         return cmd_addr(argv[2]);
