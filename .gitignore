@@ -47,6 +47,10 @@ asm/daemon/inbound_client
 asm/daemon/paribd
 asm/daemon/paribd_asm
 asm/daemon/unified_ibd
+asm/cuda/cuda_verify
+asm/cuda/cuda_bench
+asm/cuda/cuda_autodetect_test
+asm/cuda/libbmc_cuda.so
 asm/daemon/crawler
 asm/daemon/addrgather
 asm/daemon/merge_only
