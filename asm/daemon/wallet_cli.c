@@ -520,17 +520,18 @@ static int cmd_init(int argc, char** argv) {
 }
 
 static int cmd_load(int argc, char** argv) {
-    /* load a persistent wallet and show its seed + main address:
-     *   wallet_cli load [path] [passphrase]   (passphrase only if the wallet has one) */
+    /* load a persistent wallet:
+     *   wallet_cli load [path] [passphrase]   (passphrase required for v2-encrypted wallets) */
     const char* path = (argc >= 3) ? argv[2] : default_wallet_path();
-    const char* cli_pass = (argc >= 4) ? argv[3] : NULL;
+    const char* cli_pass = (argc >= 4) ? argv[3] : getenv("BMC_WALLET_PASS");
     char mn[768], pass[256];
+    /* pre-fill the secret as INPUT to load (v2 decrypt), if supplied */
+    if (cli_pass && cli_pass[0]) snprintf(pass, sizeof pass, "%s", cli_pass);
+    else pass[0] = 0;
     if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "load: cannot load wallet %s (does it exist? use init)\n", path);
+        fprintf(stderr, "load: cannot load wallet %s (v2-encrypted? supply the passphrase; or use init)\n", path);
         return 1;
     }
-    /* a CLI-provided passphrase overrides the stored one if present */
-    if (cli_pass && cli_pass[0]) snprintf(pass, sizeof pass, "%s", cli_pass);
     unsigned char seed[64];
     char addr[64];
     if (!seed_address(mn, pass, addr, (int)sizeof addr, seed)) {
@@ -539,7 +540,7 @@ static int cmd_load(int argc, char** argv) {
     }
     printf("wallet:  %s\n", path);
     printf("mnemonic: %s\n", mn);
-    if (pass[0]) printf("passphrase: %s\n", pass);
+    if (pass[0]) printf("passphrase: (secret, not in file)\n");
     printf("seed:   "); print_hex(seed, 64); printf("\n");
     printf("m/44'/0'/0'/0/0: %s\n", addr);
     return 0;
@@ -553,8 +554,12 @@ static int cmd_getaddress(int argc, char** argv) {
     if (argc >= 3) idx = (unsigned)strtoul(argv[2], NULL, 10);
     if (argc >= 4) path = argv[3];
     char mn[768], pass[256];
+    {
+        const char* sec = getenv("BMC_WALLET_PASS");
+        if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec); else pass[0] = 0;
+    }
     if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "getaddress: cannot load wallet %s\n", path);
+        fprintf(stderr, "getaddress: cannot load wallet %s (encrypted? set BMC_WALLET_PASS)\n", path);
         return 1;
     }
     unsigned char seed[64];
@@ -575,8 +580,12 @@ static int cmd_getprivkey(int argc, char** argv) {
     if (argc >= 3) idx = (unsigned)strtoul(argv[2], NULL, 10);
     if (argc >= 4) path = argv[3];
     char mn[768], pass[256];
+    {
+        const char* sec = getenv("BMC_WALLET_PASS");
+        if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec); else pass[0] = 0;
+    }
     if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "getprivkey: cannot load wallet %s\n", path);
+        fprintf(stderr, "getprivkey: cannot load wallet %s (encrypted? set BMC_WALLET_PASS)\n", path);
         return 1;
     }
     unsigned char seed[64];
