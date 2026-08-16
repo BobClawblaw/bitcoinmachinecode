@@ -87,7 +87,7 @@ rewrite of primitives that are already validated bit-exact, it is flagged for a
 **dedicated follow-up task** rather than patched blind in this audit pass (see
 "Remediation plan" below).
 
-### Status — scalar half LANDED (2026-08-15); point half tracked
+### Status — FIXED (scalar half 2026-08-15, point half 2026-08-16)
 
 **Scalar half — FIXED.** Commit `6162ad8` made `sc_add`, `sc_sub`, `sc_mul`,
 `sc_sqr`, `sc_inv` fully constant-time (no data-dependent branches): the carry
@@ -100,22 +100,66 @@ Verified: `test_scalar` KAT (13 vectors) + `tests/stress_scalar.py` differential
 vs a Python big-int oracle (20,000 iters, 0 failures) + signing suites
 (`test_ecdsa`, `test_wallet`, `test_keys`, `test_scalarmul`, `test_taproot`).
 
-**Point half — NOT YET FIXED (tracked).** `point_scalar_mul` (the `k*G` used by
-`wallet_ecdsa_sign` with the secret nonce `k`) still uses a `bsr`-derived loop
-bound and a per-bit `jnc` conditional add. A correct constant-time ladder
-requires an **infinity-safe, exception-free point addition** — verified that the
-current `point_add_mixed`/`point_add` do **not** handle an infinity operand
-(`inf+base` returns the zero point), so a naive infinity-seeded ladder is
-invalid. Tracked as kanban card `t_08b49753`; a differential harness
-(`tests/run_pointmul_diff.py`, `tests/stress_pointmul.c`, baseline 0 failures)
-is in place to validate the ladder bit-exactly. The README warning remains until
-this lands.
+**Point half — FIXED (2026-08-16).** Landed as a new companion module
+`asm/secp256k1_point_ct.asm` exporting `point_scalar_mul_ct` (same ABI and same
+12-limb Jacobian output as `point_scalar_mul`). The two **secret**-scalar call
+sites now use it:
 
-> NOTE: for the **verification-derivable** claim "the README warning can be
-> cleared with fixes landed + green tests": this finding requires a real
-> constant-time implementation before signing should ever be used with real
-> funds. It does **not** affect consensus-correctness of the node (verification
-> is functionally correct and differentially tested).
+| call site | secret scalar | now calls |
+|---|---|---|
+| `wallet_core.c` `wallet_ecdsa_sign` | nonce `k` | `point_scalar_mul_ct` |
+| `bitcoin_keys.asm` `scalar_to_pubkey` | private key | `point_scalar_mul_ct` |
+
+`point_scalar_mul` itself is **deliberately left unchanged**. Its remaining
+callers — `ecdsa_verify` (`u2*Q`), `schnorr_verify` (`s*G`, `e*P`) and the
+taproot tweak (`t*G`) — multiply only **public** values, where variable-time is
+both safe and roughly 4x faster. Since these sit on the consensus-hot block
+validation path, converting them would cost throughput to protect nothing.
+Leaving the function untouched also keeps its existing differential proof
+(`tests/run_pointmul_diff.py`) valid byte-for-byte as a regression guard.
+
+*Implementation.* Rather than retrofit cmov around the special cases of the
+Jacobian adds, the CT module uses the **Renes–Costello–Batina complete addition
+formulas for a=0** (eprint 2015/1060, Alg. 7 add / Alg. 9 double) in
+homogeneous projective coordinates. These are exception-free by construction —
+a single straight-line sequence is correct for the identity, for `P == Q` and
+for `P == -Q` — so there is no special case to enumerate and therefore nothing
+to branch on. This sidesteps the blocker recorded above (that
+`point_add_mixed`/`point_add` mishandle an infinity operand) instead of
+patching it. Conversion back to Jacobian happens once at the end via
+`(X*Z, Y*Z^2, Z)`; both conventions send `Z=0` to `Z=0`, so infinity
+round-trips and the canonical `(1,1,0)` is selected by cmov.
+
+*Constant-time properties.* Exactly 256 iterations regardless of `k` (no `bsr`,
+no bit-length dependence); one complete double plus one complete add every
+iteration (double-and-add-always), committed or discarded by 12 `cmov`s rather
+than a jump; and **no precomputed table**, hence no secret-indexed load and no
+cache-timing channel. The underlying `fe_*` primitives are already branch-free
+(see FINDING 3).
+
+*Validation.* KATs (1G/2G/3G/kbig, `nG` → canonical infinity, `0G`); differential
+vs the Python oracle via `tests/run_pointmul_ct_diff.py` (2,513 samples, 0
+failures); cross-check against `point_scalar_mul` in affine over 2,000 random
+scalars, 300 random non-`G` base points and `k = 1..512`, all exact; plus
+`test_ecdsa`, `test_keys`, `test_add`, `test_addm`, `test_scalarmul` green, and
+`point_scalar_mul`'s own differential re-run at 1,513 samples / 0 failures.
+Measured timing (`tests/test_scalarmul_ct`), minimal vs full-width dense scalar:
+
+```
+variable-time : tiny 0.01 ms   dense 0.12 ms   ratio 15.9x
+constant-time : tiny 0.23 ms   dense 0.23 ms   ratio  1.00x
+```
+
+> CORRECTION TO THE DESCRIPTION ABOVE: the "Description" section of this finding
+> describes an MSB→LSB `bt`/`jnc` double-and-add. That code was already
+> superseded by a w=4 windowed ladder before this fix. The finding was still
+> valid, but the actual leaks at the time of the fix were (a) the `bsr`-derived
+> loop bound, (b) `jz .wskip` skipping zero window digits, and (c) the
+> secret-indexed `TAB[digit]` address — a cache channel the original write-up
+> did not identify.
+
+> NOTE: this finding does **not** affect consensus-correctness of the node
+> (verification is functionally correct and differentially tested).
 
 ---
 
@@ -205,7 +249,7 @@ concern if a future coding path runs secret scalars through them — which is
 already foreclosed by FINDING 1's remediation (constant-time ladder). No action
 beyond noting the hygiene (prefer `cmov` in any future secret path).
 
-### Status — field-op half FIXED (2026-08-15); point-add half folded into FINDING 1
+### Status — FIXED (field ops 2026-08-15; point-add branches resolved by avoidance 2026-08-16)
 
 **Field arithmetic — FIXED.** Commit `6e19041` made `fe_add` and `fe_sub`
 branch-free (constant-time): the `fe_sub` borrow re-add of `p` and the `fe_add`
@@ -218,11 +262,21 @@ exponent (constant-time w.r.t. the input). Verified: `test_fe` KAT (40) +
 0 failures) + all dependent point/ecdsa/wallet/key/taproot/sighash suites green
 + `point_scalar_mul` differential (1,213 samples, 0 failures).
 
-**Point-addition branches — NOT fixed here (folded into FINDING 1).** The
-`point_add`/`point_add_mixed` equal/opposite/infinity branches remain, but they
-must be made exception-free and branch-free as part of the FINDING 1
-constant-time `point_scalar_mul` ladder (card `t_08b49753`), which now has the
-branch-free field primitives it needs. See FINDING 1 status.
+**Point-addition branches — RESOLVED BY AVOIDANCE (2026-08-16).** The
+equal/opposite/infinity branches in `point_add` / `point_add_mixed` still exist
+and are **not** being removed. They are now reachable only from
+`point_scalar_mul`, which after the FINDING 1 fix is called exclusively with
+**public** scalars (`ecdsa_verify`, `schnorr_verify`, taproot tweak), so the
+branches leak nothing secret and the variable-time speed is wanted on the
+consensus-hot path.
+
+Secret-scalar work no longer goes through them at all: `point_scalar_mul_ct`
+(`asm/secp256k1_point_ct.asm`) uses complete, exception-free RCB formulas that
+have no special cases to branch on. See FINDING 1 status.
+
+Residual risk accepted: if a **new** caller ever passes a secret scalar to
+`point_scalar_mul`, this becomes live again. Guard: any new secret-scalar call
+site must use `point_scalar_mul_ct`.
 
 ---
 
@@ -266,12 +320,16 @@ correctly skipped for unwitnessed txid. No overflow found.
 
 ## Remediation plan (recommended follow-up cards)
 
-1. **Constant-time `point_scalar_mul`** (FINDING 1, point half) — the critical
-   remaining one. Infinity-safe exception-free point addition + fixed full-256
-   ladder over the full 256-bit range, `cmov`-based, bit-exact vs the new
-   differential harness (`tests/run_pointmul_diff.py`). The **`sc_mul` half is
-   already done** (commit `6162ad8`). Do **not** sign with real keys until the
-   point half lands. Tracked: kanban card `t_08b49753`.
+1. **Constant-time `point_scalar_mul`** (FINDING 1, point half) — **DONE**
+   (`asm/secp256k1_point_ct.asm`, `point_scalar_mul_ct`; card `t_08b49753`).
+   Shipped as a separate CT routine on the two secret-scalar call sites rather
+   than a rewrite of `point_scalar_mul`, which stays variable-time for the
+   public-scalar verification path. NOTE for future cards: the acceptance gate
+   is **affine** equality against the Python oracle — `tests/stress_pointmul.c`
+   calls `toaff()` before printing, so Jacobian/projective `Z` is never
+   compared and any mathematically correct implementation passes. The earlier
+   framing of this card as requiring *bit-exact Jacobian* output was wrong and
+   describes an unsatisfiable constraint.
 2. **Defensive cap check on the sighash script copy** (findings 2b) — **DONE**
    (commit `83f2019`, documented in FINDING 2b above).
 3. Re-run the full differential-consensus harness + `make test` after any
@@ -283,6 +341,12 @@ correctly skipped for unwitnessed txid. No overflow found.
   (FINDING 2); preimage-write cap check (FINDING 2b).
 - `asm/secp256k1_scalar.asm` — constant-time `sc_add`/`sc_sub`/`sc_mul`/`sc_sqr`/
   `sc_inv` (FINDING 1, scalar half; commit `6162ad8`).
+- `asm/secp256k1_point_ct.asm` (NEW) — constant-time `point_scalar_mul_ct` via
+  Renes-Costello-Batina complete formulas + fixed 256-iteration
+  double-and-add-always ladder (FINDING 1, point half). Callers repointed:
+  `wallet_core.c` (`wallet_ecdsa_sign`), `bitcoin_keys.asm` (`scalar_to_pubkey`).
+  Harnesses: `tests/test_scalarmul_ct.c`, `tests/stress_pointmul_ct.c`,
+  `tests/run_pointmul_ct_diff.py`.
 - `asm/secp256k1_fe.asm` — constant-time (branch-free) `fe_add`/`fe_sub`
   (FINDING 3, field-op half; commit `6e19041`); `fe_mul` verified branch-free.
 - `asm/tests/test_sighash_oob.c` — regression repro (new).
