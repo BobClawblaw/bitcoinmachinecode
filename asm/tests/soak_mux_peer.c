@@ -41,6 +41,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>
+#include <signal.h>
+#include <pthread.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -90,8 +92,10 @@ static long build_cb_block(unsigned char* b, const unsigned char prev[32], unsig
 
 static int chain_reserve(long need){
     if(need <= chain_cap) return 1;
+    if(need > NB_MAX){ fprintf(stderr,"[soakpeer] chain cap reached\n"); return 0; }
     long nc = chain_cap ? chain_cap*2 : 1024;
     while(nc < need) nc *= 2;
+    if(nc > NB_MAX) nc = NB_MAX;
     unsigned char* nb = realloc(chain_blk, (size_t)nc*BLOCK_CAP);
     unsigned char* nh = realloc(chain_hash, (size_t)nc*32);
     if(!nb||!nh){ free(nb); free(nh); return 0; }
@@ -100,12 +104,12 @@ static int chain_reserve(long need){
 }
 
 static void mine_block(void){
-    if(!chain_reserve(chain_len+1)){ fprintf(stderr,"[soakpeer] chain alloc fail\n"); exit(9); }
+    if(chain_len >= NB_MAX){ fprintf(stderr,"[soakpeer] chain cap reached (len=%ld cap=%ld)\n", chain_len, (long)NB_MAX); exit(9); }
+    if(!chain_reserve(chain_len+1)){ fprintf(stderr,"[soakpeer] chain alloc fail (len=%ld need=%ld)\n", chain_len, (long)chain_len+1); exit(9); }
     unsigned char prev[32];
     if(chain_len==0) memset(prev,0,32);
     else memcpy(prev, chain_hash+(chain_len-1)*32, 32);
     long blen = build_cb_block(chain_blk + chain_len*BLOCK_CAP, prev, (unsigned)chain_len);
-    if(chain_len>=NB_MAX){ fprintf(stderr,"[soakpeer] chain cap reached\n"); exit(9); }
     chain_blklen[chain_len] = (unsigned long)blen;
     block_hash(chain_hash + chain_len*32, chain_blk + chain_len*BLOCK_CAP);
     (void)blen;
@@ -155,16 +159,19 @@ static int probe_serve(long tip_height){
 int main(int argc, char** argv){
     setbuf(stdout,NULL);
     signal(SIGPIPE,SIG_IGN);
-    if(argc<4){ fprintf(stderr,"usage: %s <port_pipe> <ctrl_pipe> <metrics.jsonl> "
-                    "[mine_every_s] [serve_port] [probe_every] [initial_blocks]\n",argv[0]); return 2; }
-    int port_pipe = atoi(argv[1]);
-    int ctrl_pipe = atoi(argv[2]);
-    mlog = fopen(argv[3], "w");
+    if(argc<7){ fprintf(stderr,"usage: %s <metrics.jsonl> [mine_every_s] [serve_port] "
+                    "[probe_every] [initial_blocks] <port_pipe> <ctrl_pipe>\n",argv[0]); return 2; }
+    /* The pipe fds go LAST: glibc's dynamic loader consumes the early argv
+     * slots during startup, so passing them first made atoi() see garbage. */
+    int port_pipe = atoi(argv[argc-2]);
+    int ctrl_pipe = atoi(argv[argc-1]);
+    if(port_pipe<3 || ctrl_pipe<3){ fprintf(stderr,"[soakpeer] bad pipe fds (port=%d ctrl=%d)\n", port_pipe, ctrl_pipe); return 2; }
+    mlog = fopen(argv[1], "w");
     if(!mlog){ fprintf(stderr,"[soakpeer] metrics open fail\n"); return 9; }
-    mine_every = argc>4 ? atoi(argv[4]) : 15;
-    serve_port = argc>5 ? atoi(argv[5]) : 0;
-    probe_every = argc>6 ? atoi(argv[6]) : 10;
-    long initial = argc>7 ? atol(argv[7]) : 5;
+    mine_every = argc>2 ? atoi(argv[2]) : 15;
+    serve_port = argc>3 ? atoi(argv[3]) : 0;
+    probe_every = argc>4 ? atoi(argv[4]) : 10;
+    long initial = argc>5 ? atol(argv[5]) : 5;
 
     for(long i=0;i<initial;i++) mine_block();
 
@@ -175,12 +182,27 @@ int main(int argc, char** argv){
     if(bind(ls,(struct sockaddr*)&a,sizeof a)<0){ fprintf(stderr,"[soakpeer] bind fail\n"); return 9; }
     socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
     unsigned short port=ntohs(a.sin_port);
+    if(mlog) { fprintf(mlog, "{\"ts\":%.3f,\"role\":\"peer\",\"event\":\"listening\",\"port\":%d,\"initial_chain\":%ld}\n", (double)time(0), (int)port, chain_len); fflush(mlog); }
     unsigned char pb[4]; pb[0]=port&0xff; pb[1]=(port>>8)&0xff;
-    if(write(port_pipe,pb,2)!=2){ fprintf(stderr,"[soakpeer] port publish fail\n"); return 9; }
-    listen(ls,4);
+    int wp=-1;
+    for(int t=0;t<50;t++){
+        wp=write(port_pipe,pb,2);
+        if(wp==2) break;
+        if(errno==EINTR){ continue; }
+        usleep(20000);
+    }
+    if(wp!=2){ fprintf(stderr,"[soakpeer] FATAL: port publish fail (write rc=%d errno=%d pipe=%d); parent must keep the pipe read-end OPEN while waiting\n", wp, errno, port_pipe); fflush(stderr); return 9; }
+    listen(ls,16);
     fprintf(stderr,"[soakpeer] listening on %d, initial chain %ld, mine every %ds, serve_port %d\n",
-            port, chain_len, mine_every, serve_port);
+            (int)port, chain_len, (int)mine_every, (int)serve_port);
 
+    /* poll(2) returns immediately with -1/EINTR when it is interrupted by a
+     * signal, so a blocked accept() would never block when SIGINT/SIGTERM are
+     * pending. Block them here so the listener genuinely blocks on accept and
+     * the poll loop stays deterministic (the harness sends the peer its port
+     * and control fds over pipes, never signals). */
+    { sigset_t ss; sigemptyset(&ss); sigaddset(&ss, SIGINT); sigaddset(&ss, SIGTERM);
+      pthread_sigmask(SIG_BLOCK, &ss, 0); }
     int cfd=accept(ls,0,0);
     if(cfd<0){ fprintf(stderr,"[soakpeer] accept fail\n"); return 9; }
     close(ls);
@@ -213,6 +235,14 @@ int main(int argc, char** argv){
         poll_us += (t1.tv_sec-t0.tv_sec)*1000000LL + (t1.tv_nsec-t0.tv_nsec)/1000;
         poll_iters++;
         if(pr<0 && errno!=EINTR) break;
+        if(pr<0) continue;  /* EINTR: a signal (e.g. SIGCHLD from the node's
+                              fork-per-serve child) interrupted the poll.
+                              Re-arm poll IMMEDIATELY instead of dropping into
+                              the 300ms-timeout path: a 300ms timeout with a
+                              pending signal returns -EINTR AGAIN, which would
+                              spin the loop at ~3x poll rate (poll_us/poll_iters
+                              would report ~300us "latency" and ctx_delta would
+                              balloon) for as long as any signal stays pending. */
 
         /* control pipe: 'M' = force-mine now, 'Q' = quit */
         if(pfds[1].revents & POLLIN){
@@ -233,18 +263,22 @@ int main(int argc, char** argv){
             if(r<=0){
                 /* leg closed: if it's EOF and we got data before, the node
                  * closed -- mux peer gone. */
-                fprintf(stderr,"[soakpeer] node leg closed (p2p_read<=0)\n");
+                fprintf(stderr,"[soakpeer] node leg closed (p2p_read rc=%d) poll_iters=%ld\n", r, poll_iters);
                 exit_code=3; goto done;
             }
             cmd[11]=0;
             if(!strncmp(cmd,"getheaders",10)){
-                int from=chain_len;
-                if(plen>=37){
-                    int zero=1; for(int z=0;z<32;z++) if(pl[5+z]){zero=0;break;}
-                    if(!zero){ from=0; int found=0;
-                        for(int i=0;i<chain_len;i++) if(memcmp(pl+5,chain_hash+i*32,32)==0){from=i+1;found=1;break;}
-                        if(!found) from=chain_len;
-                    }
+                /* Wire-correct locator handling (matches test_outbound_mux):
+                 * - zero locator (empty store) -> serve from block 0 (full sync)
+                 * - known locator hash -> serve strictly after it
+                 * - unknown locator -> serve nothing (we don't have the fork point) */
+                int zero=1; for(int z=0;z<32;z++) if(pl[5+z]){zero=0;break;}
+                int from;
+                if(zero) from=0;
+                else {
+                    int found=-1;
+                    for(int i=0;i<chain_len;i++) if(!memcmp(pl+5,chain_hash+i*32,32)){found=i;break;}
+                    from = (found>=0) ? found+1 : chain_len;
                 }
                 int cnt=chain_len-from; if(cnt<0) cnt=0; if(cnt>2000) cnt=2000;
                 if(cnt>0){
@@ -273,7 +307,7 @@ int main(int argc, char** argv){
             int res = probe_serve(tip);
             double now=0; { struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); now=ts.tv_sec+ts.tv_nsec/1e9; }
             fprintf(mlog, "{\"ts\":%.3f,\"role\":\"probe\",\"probe_tip\":%ld,"
-                          "\"probe_result\":%d,\"chain_len\":%ld}\n", now, tip, res, chain_len);
+                          "\"probe_result\":%d,\"chain_len\":%ld}\n", (double)now, tip, (int)res, chain_len);
             fflush(mlog);
         }
         if(poll_iters % 20 == 0) metrics_line(poll_iters, poll_us, chain_len);
