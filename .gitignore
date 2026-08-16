@@ -87,6 +87,7 @@ asm/tests/serve_test
 asm/tests/test_idx
 asm/tests/test_idx
 asm/tests/test_serve
+asm/tests/test_redial
 asm/bitcoin_idx.o
 asm/bitcoin_serve.o
 asm/tests/test_p2p_inv
