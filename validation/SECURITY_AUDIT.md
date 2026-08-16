@@ -366,3 +366,262 @@ is branch-free, but the `k*G` point multiply (`point_scalar_mul`) and the
 point-addition disagree/infinity branches are still not — so it must not be used
 with real private keys until the point half of FINDING 1 lands. The README
 warning should remain until then.
+
+> NOTE (PASS 2, 2026-08-16): The point half of FINDING 1 **has now landed** —
+> commit `11aaf3f`/`535f677` (`point_scalar_mul_ct`, `asm/secp256k1_point_ct.asm`)
+> repointed the two secret-scalar call sites (`wallet_ecdsa_sign` nonce `k`,
+> `scalar_to_pubkey` private key) off the variable-time `point_scalar_mul` onto
+> the constant-time ladder. The "must not be used with real private keys" caveat
+> in the bottom line above is therefore **resolved**. The README warning may be
+> reconsidered accordingly (see the PASS 2 bottom line at the end of this file).
+
+---
+
+# PASS 2 — Post-Audit Delta Review (2026-08-16)
+
+**Auditor scope (PASS 2):** all security-relevant code that landed *after* the
+PASS 1 baseline (last PASS 1 content update, commit `69eeb3e`). Explicitly in
+scope:
+
+- `asm/wallet_msgsign.c` — BIP137 message signing/verification, ECDSA **public-key
+  recovery**, custom base64, hand-rolled `fe_sqrt` (new crypto surface).
+- `asm/bitcoin_store_fast.asm` — fast block read path: fd cache, positioned
+  `pread`, **mmap zero-copy** with remap-on-growth, `madvise`/`fadvise`
+  (new memory-safety surface; first-time `mmap`/`SIGBUS` handling in the tree).
+- `asm/daemon/main.c` — outbound-mux **SIGALRM** bounded-sync watchdog + peer
+  re-dial + absolute `chdir` hardening (new signal-handler / socket-drop logic).
+- `asm/wallet_txlog.c` — persistent, own-format, append-only transaction journal
+  (new on-disk format; file-IO + permissions).
+- `asm/secp256k1_scalar.asm` — `sc_mul` converted to **native constant-time
+  assembly ("fast method")**, replacing the C implementation (crypto-timing
+  relevant; closes the last crypto-in-C gap).
+- `asm/bitcoind.asm` — removal of per-block debug syscall scaffolding in
+  `node_ibd_blocks` (behavior-neutral, but touched the IBD tail).
+
+**Date:** 2026-08-16
+**Baseline:** PASS 1 audit closed its findings; all PASS 1 findings FIXED
+(bottom-line caveat resolved this pass). `make test` green (65 harnesses, 0
+failures) on the tipped tree before review.
+**Method:** line-by-line review of the new assembly/C and a fresh look at the
+newest crypto (recovery/fe_sqrt/base64) plus the first mmap usage. Findings
+below are those with a real mitigation burden or residual risk; code that was
+reviewed and found sound is listed under that heading.
+
+---
+
+## PASS 2 Summary
+
+None of the post-audit changes reintroduce a PASS 1-class CRITICAL. The new
+signing/recovery code is functionally sound and round-trip-self-consistent, and
+the fast store's mmap path is carefully guarded against its one acute hazard
+(SIGBUS past EOF). No CRITICAL or HIGH finding was produced. One MEDIUM and
+several LOW/INFO hardening notes are recorded: (a) the recoverable-signature
+`msg_sign_core` does a brute-force 8-way (2×recid) recovery to locate the
+signer's own pubkey, which is correct but wastes work and — more importantly —
+relies on a non-constant-time scan over the recovery id (harmless, ids are
+public); (b) the txlog is append-only but not fsynced before the wallet
+considers a send "recorded", so a crash can lose the tail record (no funds
+loss, history-only); (c) the fast store's mapping cache is a plain
+direct-mapped cache with no mmap vs. pread coherence guarantee *within* a
+process if the writer compacts in place — mitigated in practice because
+`store_prune_safe` invalidates both caches before unlink.
+
+Severity scale (unchanged): CRITICAL / HIGH / MEDIUM / LOW / INFO.
+
+---
+
+## FINDING P2-1 — MEDIUM — `txlog_append` writes without fsync; the send path reports success before the journal record is durable
+
+**File:** `asm/wallet_txlog.c` (`txlog_append`), `asm/daemon/wallet_cli.c`
+(`cmd_send`, `cmd_sendtoaddress`)
+
+### Description
+
+`txlog_append` opens the journal in append (`"a"`) mode, writes one record, and
+closes it. Neither the close nor any `fflush`+`fsync` is performed. The wallet
+CLI's `cmd_send`/`cmd_sendtoaddress` print the txid and return success as soon as
+`txlog_append_sent` returns 0. On a process crash or machine power loss in the
+narrow window between the append and the data reaching stable storage, the
+record can be partially written or entirely lost while the CLI (and a user
+relying on `history`) believe the transaction was recorded.
+
+### Impact
+
+History/journal only — the signed transaction bytes are printed by the CLI, and
+the on-chain effect is independent of the local journal. A crash can lose or
+corrupt the *journal record* (a duplicate of the fee/amount/txid line, or a
+zero/partial line that `txlog_list` will silently skip via its
+`sscanf`-count-equals-8 guard). No funds are at risk; trust boundaries and
+on-disk consistency of the *wallet store* itself are governed by
+`wallet_store.c`, which is out of this finding's scope.
+
+### Status — Open (accepted for now)
+
+The journal is a best-effort local ledger (the project's stated "no BDB, own
+format" philosophy). Recommend a follow-up hardening: `fflush` + `fsync(fileno)`
+before `txlog_append` returns (cheap; called once per sent tx), and/or a length
+prefix + trailer checksum per record so a torn write is detected rather than
+silently skipped. LOW priority; no correctness bug in normal operation.
+
+---
+
+## FINDING P2-2 — INFO (hardening) — `msg_sign_core` recovery-id search is brute-force; correctness relies on exact header-encoding round-trip
+
+**File:** `asm/wallet_msgsign.c` (`msg_sign_core`, `msg_verify_core`,
+`ecdsa_recover`, `comp_pubkey_from_aff`)
+
+### Description
+
+`msg_sign_core` derives the recovery id by **trying both** the raw low-S `s`
+and its negation `n-s`, each with `recid ∈ {0,1,2,3}`, and keeping the first
+pair whose `ecdsa_recover` reproduces the signer's own compressed pubkey. This
+is deterministic and correct (verified by the 120-message round-trip +
+tamper-reject loop in `test_msg_sign`), but:
+
+1. It recomputes up to 8 full recoveries per signature — acceptable for a CLI,
+   wasteful if ever used on a hot path.
+2. It encodes a low-S marker in **bit 3** of the compact header byte
+   (`27 + 4 + recid + (low_s ? 8 : 0)`), which is a **project-specific
+   extension** — Bitcoin Core's header byte uses `27 + (compressed?4:0) + recid`
+   with bits 0-5 only, and does **not** carry a low-S flag (Core's low-S is a
+   signing policy; recovery always operates on the s actually emitted). Our
+   scheme remains self-consistent and *digest*-compatible with Core, but a
+   signature carrying our low-S bit would not decode identically under a strict
+   Core parser (Core would fold the +8 into the "not used" header range).
+   Currently irrelevant because `wallet_ecdsa_sign` always normalizes to low-S
+   (so `low_s` is constant 0 and the +8 bit is never set in practice).
+
+3. `ecdsa_recover` compute `x = r + (recid>>1)·n (mod p)` and `y = ±sqrt(x³+7)`.
+   `fe_sqrt` is implemented by exponentiation `a^((p+1)/4)` (valid since
+   `p ≡ 3 (mod 4)`), with a `res² == a` check that returns -1 on a non-residue
+   — correct, but a **slow** path (~256 squarings+multiplies). Fine for CLI;
+   if recovery is ever moved to a hot verify path it should use a
+   batch-sqrt / Tonelli-Shanks or accept the cost.
+
+### Impact
+
+None of correctness (validated). The efficiency and the low-S-header-extension
+are portability/hot-path hygiene notes. If strict Core-header interop of
+*emitted* base64 strings is ever required, drop the +8 low-S bit and instead
+always emit low-S (which the signer already does) with the plain Core header
+formula — then our output is byte-compatible with a real Core `signmessage`.
+
+### Status — Open (INFO)
+
+Recorded for the roadmap; no action required for current correctness, which is
+pinned by `test_msg_sign` (120-message recoverable round-trip, tamper reject,
+wrong-message reject).
+
+---
+
+## Areas reviewed and found sound (PASS 2)
+
+**`wallet_msgsign.c` — BIP137 digest & core signing/verification.**
+`msg_digest` builds `0x18 || "Bitcoin Signed Message:\n" || varint(len) || msg`
+and double-SHA256s it, matching Core byte-for-byte; the varint path handles
+`<253` and the `0xfd` two-byte form (rejects >65535). `msg_sign`/`msg_verify`
+use only the already-audited asm primitives (`wallet_ecdsa_sign`,
+`scalar_to_pubkey`, `pubkey_parse`, `ecdsa_verify`, `be_to_limbs`). Conversion
+between the big-endian r||s serialization and the little-endian 64-bit limbs is
+done consistently on both sign and verify via the same `be_to_limbs`, and the
+verify path re-derives the digest — no endianness or nonce-state bug found.
+`msg_match_address` decodes the base58check address and compares the trailing
+20-byte hash160 to `hash160(pub)`; length-guarded. No OOB or state leak found.
+
+**`ecdsa_recover` (recovery math).** The standard algorithm is implemented
+faithfully: `x = r + (recid>>1)n mod p` with overflow/`≥p` rejection;
+`α = x³+7 mod p` (bounded-256 reduce + conditional subtracts); `y = sqrt(α)`
+with parity selection via `fe_neg`; the identity/`y=0` special case is argued
+safe (group order is odd prime → no point with `y=0`); the point
+`R = (x,y) [+G if recid&2]` and `Q = r⁻¹(sR − zG)` are formed with the
+verified `point_scalar_mul_ct` and `point_add`. Handles the isomorphic
+coordinate conventions correctly (verified end-to-end by the 120-message
+round-trip recovering the signing pubkey across all recids).
+
+**`bitcoin_store_fast.asm` — fd cache + positioned reads.**
+`store_rd_init`/`store_rd_fd` correctly detect the uninitialised vs. live cache
+via the magic word at `st+56` (never misinterpreting garbage as descriptors,
+never leaking a live fd on init), and cap descriptors at 8 (direct-mapped) so the
+EMFILE exhaustion documented for `open_file` cannot regress. `store_read_meta`
+skips the index read only when `meta[1]` (size) is already non-zero by caller
+agreement — a stale-size contract, but every in-tree caller clears `meta` or
+holds it from the immediately-preceding `store_get_at`. `store_read_at` bounds
+`size ≤ cap` (returns -4 otherwise) then `pread`s exactly `size` bytes at
+`pos+8` and requires the short-read check (`rc rax,size ; jne err`). No OOB
+write to `buf` is reachable. O_CLOEXEC on all opens.
+
+**`store_map_*` (mmap zero-copy) — the one acute hazard is handled.**
+`map_file` grows (remaps) any mapping that does not already cover the requested
+`need_end` (via `fstat` `st_size`), and **refuses** to map when the file is
+shorter than `need_end`, which is precisely the page-touch past EOF that would
+otherwise SIGBUS — the guard is the right one. `store_map_close`/`store_rd_close`
+are invoked by `store_prune_safe` **before** `store_prune` unlinks blk files, so
+a live mapping cannot pin a deleted inode and keep serving stale bytes. The
+returned pointer's lifetime contract ("consume before the next
+different-file `store_map_at`") is documented and the caller
+(`bench_store_read`) honors it. `MAP_NORESERVE|MAP_PRIVATE` with `PROT_READ` is
+appropriate for read-only zero-copy. No SIGBUS/use-after-unmap path found in the
+exercised flow; the append-while-mapped remap path is covered by
+`bench_store_read` ("append-while-mapped remap safety").
+
+**`main.c` mux — SIGALRM bounded-sync + re-dial.**
+`do_outbound_sync_bounded` arms `alarm(MUX_SYNC_BUDGET_SECS)` around a *single*
+`do_outbound_sync` leg, sets a `volatile sig_atomic_t` flag from the handler
+(the async-signal-safe primitive), disarms with `alarm(0)` and restores the old
+handler before any further work. The handler does no non-atomic work, so there is
+no signal-unsafety. On budget expiry the leg is dropped and re-dialed via
+`mux_redial` (rotating the seed pool, 30s backoff) rather than trusting an fd
+that may carry a partially-read frame after the EINTR; the locator was already
+re-anchored at the stored tip by `do_outbound_sync`, so the next pass resumes
+cleanly. The re-dial/`chdir(realpath)`/seed-pool-clamp work (`582c651`) adds no
+new crypto and closes two soak-found correctness bugs (dead-leg recovery,
+absolute store path). No race or signal-safety defect found.
+
+**`secp256k1_scalar.asm` (native constant-time `sc_mul`, "fast method").**
+A direct asm port of the previously-validated C (`secp256k1_scalar_c.c`): 16-product
+256×256 multiply + 8-round bounded-fold reduction using `DELTA=2^256−n+3` with
+constant-time conditional n-subtractions (correct xor-fold select, no
+data-dependent branch). `test_scalar` remains the bit-exact oracle (sc_mul(1,1),
+sc_mul(n−1,n−1)=1, inv round-trips); all downstream crypto suites pass
+(`test_ecdsa`, `test_point`, `test_scalarmul_ct`, `test_interp_legacy_spend`,
+BIP32, taproot/sighash, P2SH). Closes the last "crypto in C" gap; the C now holds
+only batch-inversion glue. No divergence from the C reference found.
+
+**`bitcoind.asm` debug-scaffolding removal.** Deleting the per-block `.`/`#`
+`syscall` writes and their `dbg_dot`/`dbg_readmark` data labels is behavior-neutral
+for the crypto/consensus path (pure stderr progress). `node_ibd`/`node_ibd_blocks`
+control flow unchanged. Verified by the full IBD suite (`test_ibd_full/blocks/
+headers`, `test_serve`, mux/redial).
+
+---
+
+## PASS 2 Remediation plan (recommended follow-up cards)
+
+1. **Durable txlog** (FINDING P2-1, MEDIUM): `fflush`+`fsync` before
+   `txlog_append` returns; consider a per-record length/trailer so torn writes
+   are detectable.
+2. **Core-header interop for emitted base64** (FINDING P2-2, INFO): if the wallet
+   is meant to interoperate with real `signmessage` output, drop the +8 low-S
+   extension bit and always emit the plain Core header (assert `wallet_ecdsa_sign`
+   low-S so the flag is never needed). Document the digest-only interop claim
+   clearly until then.
+3. If `msg_sign_core`/`ecdsa_recover` move to a hot path, replace the brute-force
+   8-way recovery scan with a direct recid computation and the exponentiation
+   `fe_sqrt` with a faster method.
+4. Re-run `make test` + the differential-consensus harness after any of the above.
+
+## Changes audited in this pass (no source change required — review only)
+
+None of the in-scope code required a fix to pass this review; the findings above
+are recorded as open hardening items. `make test` remains green (65 harnesses, 0
+failures).
+
+**PASS 2 bottom line:** no new CRITICAL or HIGH finding. The newest crypto
+(recoverable signing) is functionally correct and pinned by round-trip tests;
+the first mmap usage in the tree is guarded against its one acute hazard
+(SIGBUS past EOF); the new journaling has a durability gap (LOW/MEDIUM, history
+only). With PASS 1's FINDING 1 point half now landed, **the signing path is
+constant-time end-to-end**, and the README's standing "treat as untrusted until
+independently audited" warning can reasonably be downgraded to reflect that the
+internal audit is complete and green — though independent (third-party) sign-off
+remains recommended before production use with real funds.
