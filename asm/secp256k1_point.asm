@@ -393,6 +393,27 @@ point_add_mixed:
 ;     point_double(R,R); if k bit i set: point_add_mixed(R,R,base).
 ;   k==0 -> return Jacobian infinity (Z=0).
 ; ----------------------------------------------------------------------------
+; point_scalar_mul(r[12], xy[8], k[4]) -- r = k*affine(xy), Jacobian, w=4
+; windowed, VARIABLE-TIME (verification-safe). Replaces the former MSB->LSB
+; double-and-add with a fixed 4-bit window:
+;   * Build a 15-entry Jacobian table TAB[1..15] = i*base (TAB[i]=TAB[i-1]+base
+;     via point_add_mixed). ~14 adds, done per-call (base is NOT precomputed
+;     here; see FINDING-1/option-1 notes for fixed-base G to drop this).
+;   * Process the scalar from the MSB nibble down: 4 point_double per window,
+;     plus one conditional point_add of TAB[digit] when the window digit != 0.
+;   * ~252 doublings (unchanged -- windowing cannot cut doublings) but only
+;     ~(nonzero lower nibbles) window-adds vs the naive ~128 addmixeds,
+;     i.e. adds roughly halved. Variable-time is fine: the OLD double-and-add
+;     (branchy `jnc` skip) was already variable-time, so this does NOT regress
+;     the (pending, FINDING-1) constant-time signing ladder which is a separate
+;     routine. Verified bit-exact (affine) vs the prior version and vs Core by
+;     tests/run_pointmul_diff.py and the full suite.
+;
+; Register discipline (all callee-saved, preserved by point_* callees):
+;   rbx = TAB base            r12 = R (working accumulator = output)
+;   r13 = base affine xy      r14 = k limb buffer (4 u64, limb0 first)
+;   r15 = window index / temp
+; ----------------------------------------------------------------------------
 global point_scalar_mul
 point_scalar_mul:
     push rbp
@@ -402,31 +423,33 @@ point_scalar_mul:
     push r13
     push r14
     push r15
-    sub  rsp, 0x188
+    sub  rsp, 0x808          ; 0x808 == 8 mod16 -> rsp 0 mod16 at nested calls.
+                             ; TAB[1..15] @ rbp-0x600 (15*96 = 1440 B), k buffer
+                             ; @ rbp-0x58, top-window idx @ rbp-0x48.
 
     mov r12, rdi           ; R (out)
-    mov r13, rsi           ; base affine
+    mov r13, rsi           ; base affine xy
 
-    ; copy k[0..3] (rdx) to a persistent 4-limb buffer. Store ASCENDING
-    ; addresses = ascending limbs so r14+0,+8,+16,+24 index limb0..limb3.
+    ; ---- copy k[0..3] (rdx) to persistent ascending-limb buffer ----
     mov rax, [rdx+0]
-    mov [rbp-0x68], rax
-    mov rax, [rdx+8]
-    mov [rbp-0x60], rax
-    mov rax, [rdx+16]
     mov [rbp-0x58], rax
-    mov rax, [rdx+24]
+    mov rax, [rdx+8]
     mov [rbp-0x50], rax
-    lea r14, [rbp-0x68]    ; r14 = k limb buffer (limb0 at +0, limb3 at +24)
+    mov rax, [rdx+16]
+    mov [rbp-0x48], rax
+    mov rax, [rdx+24]
+    mov [rbp-0x40], rax
+    lea r14, [rbp-0x58]    ; r14 = k buffer (limb0 at +0, limb3 at +24)
 
-    ; if k == 0 -> return Jacobian infinity
+    ; ---- k == 0 -> Jacobian infinity ----
     mov rax, [r14+0]
     or  rax, [r14+8]
     or  rax, [r14+16]
     or  rax, [r14+24]
     jz  .zero
 
-    ; find the highest set bit (msb index 0..255) -> r15
+    ; ---- find msb index (0..255) -> keep top-win idx at [r14? no] ----
+    ; Use r15 as working msb first.
     mov r15, -1
     mov rax, [r14+24]
     test rax, rax
@@ -434,7 +457,7 @@ point_scalar_mul:
     bsr rcx, rax
     mov r15, 192
     add r15, rcx
-    jmp .initR
+    jmp .gotmsb
 .l2:
     mov rax, [r14+16]
     test rax, rax
@@ -442,7 +465,7 @@ point_scalar_mul:
     bsr rcx, rax
     mov r15, 128
     add r15, rcx
-    jmp .initR
+    jmp .gotmsb
 .l1:
     mov rax, [r14+8]
     test rax, rax
@@ -450,59 +473,115 @@ point_scalar_mul:
     bsr rcx, rax
     mov r15, 64
     add r15, rcx
-    jmp .initR
+    jmp .gotmsb
 .l0:
     mov rax, [r14+0]
     bsr rcx, rax
     mov r15, rcx
+.gotmsb:
+    ; top_win = msb>>2 ; stash at [rbp-0x38]
+    mov rax, r15
+    shr rax, 2
+    mov [rbp-0x38], rax
 
-.initR:
-    ; R = base : copy xy[0..7] -> R[0..7]
+    ; ================= BUILD TABLE TAB[1..15] =================
+    lea rbx, [rbp-0x600]       ; TAB base
+    ; TAB[1] = base : copy xy[0..7] -> TAB[0..55], Z=1
     mov rax, [r13+0]
-    mov [r12+0], rax
+    mov [rbx+0], rax
     mov rax, [r13+8]
-    mov [r12+8], rax
+    mov [rbx+8], rax
     mov rax, [r13+16]
-    mov [r12+16], rax
+    mov [rbx+16], rax
     mov rax, [r13+24]
-    mov [r12+24], rax
+    mov [rbx+24], rax
     mov rax, [r13+32]
-    mov [r12+32], rax
+    mov [rbx+32], rax
     mov rax, [r13+40]
-    mov [r12+40], rax
+    mov [rbx+40], rax
     mov rax, [r13+48]
-    mov [r12+48], rax
+    mov [rbx+48], rax
     mov rax, [r13+56]
-    mov [r12+56], rax
-    ; Z = 1
-    mov qword [r12+64], 1
-    mov qword [r12+72], 0
-    mov qword [r12+80], 0
-    mov qword [r12+88], 0
+    mov [rbx+56], rax
+    mov qword [rbx+64], 1
+    mov qword [rbx+72], 0
+    mov qword [rbx+80], 0
+    mov qword [rbx+88], 0
+    ; for i=2..15 (ASCENDING: TAB[i] depends on TAB[i-1]): TAB[i]=TAB[i-1]+base
+    ; Entry m lives at offset (m-1)*96. out = TAB[i] @ (i-1)*96,
+    ; p = TAB[i-1] @ (i-2)*96 = out - 96. point_add_mixed clobbers rdi/rsi,
+    ; so recompute addresses from preserved rbx each iteration.
+    mov r15, 2                 ; i=2..15 ascending
+.mktab:
+    mov rax, r15
+    dec rax                    ; i-1
+    imul rax, rax, 96
+    lea rdi, [rbx + rax]       ; out = TAB[i]
+    lea rsi, [rdi - 96]        ; p   = TAB[i-1]
+    mov rdx, r13               ; base affine
+    call point_add_mixed       ; TAB[i] = TAB[i-1] + base
+    inc r15
+    cmp r15, 15
+    jle .mktab
 
-    ; loop i = msb-1 down to 0 : double, then add base if k bit set
-.loop:
+    ; ================= TOP WINDOW =================
+    ; R = TAB[digit_top] ; digit_top = (k >> (top_win*4)) & 0xF  (>=1 by def)
+    mov rcx, [rbp-0x38]        ; top_win
+    shl rcx, 2                 ; bit offset
+    mov rdx, rcx
+    shr rdx, 6
+    lea rdx, [r14 + rdx*8]     ; k limb
+    and rcx, 63
+    mov rax, [rdx]
+    shr rax, cl
+    and rax, 15
+    dec rax
+    imul rax, rax, 96
+    lea rsi, [rbx + rax]       ; -> TAB[digit]
+    mov rdi, r12
+    mov rcx, 12
+    rep movsq                  ; copy 96 B : R = TAB[digit] (clobbers rcx/rsi/rdi)
+
+    ; ================= REMAINING WINDOWS (top_win-1 .. 0) =================
+    mov r15, [rbp-0x38]
     dec r15
-    js  .done          ; r15 < 0 -> finished
-    ; R = 2*R
+    js  .done                  ; only one window total
+.wnext:
+    ; R = 16*R : four doublings
     mov rdi, r12
     mov rsi, r12
     call point_double
-    ; test bit r15 of k
-    mov rcx, r15
-    shr rcx, 6          ; limb index 0..3
-    shl rcx, 3          ; byte offset into k buffer
-    mov rdx, r15
-    and rdx, 63         ; bit within limb
-    mov rax, [r14+rcx]  ; k limb
-    bt  rax, rdx
-    jnc .loop           ; bit clear -> just continue
-    ; bit set: R = R + base (affine)
     mov rdi, r12
     mov rsi, r12
-    mov rdx, r13
-    call point_add_mixed
-    jmp .loop
+    call point_double
+    mov rdi, r12
+    mov rsi, r12
+    call point_double
+    mov rdi, r12
+    mov rsi, r12
+    call point_double
+    ; digit for window r15
+    mov rcx, r15
+    shl rcx, 2
+    mov rdx, rcx
+    shr rdx, 6
+    lea rdx, [r14 + rdx*8]
+    and rcx, 63
+    mov rax, [rdx]
+    shr rax, cl
+    and rax, 15
+    jz  .wskip
+    dec rax
+    imul rax, rax, 96
+    lea rcx, [rbx + rax]       ; TAB[digit]
+    mov rdi, r12
+    mov rsi, r12
+    mov rdx, rcx
+    call point_add             ; R = R + TAB[digit]
+.wskip:
+    dec r15
+    jns .wnext
+    jmp .done
 
 .zero:
     ; k == 0 : return Jacobian infinity (X=1,Y=1,Z=0)
@@ -520,7 +599,7 @@ point_scalar_mul:
     mov qword [r12+88], 0
 
 .done:
-    add rsp, 0x188
+    add rsp, 0x808
     pop r15
     pop r14
     pop r13
@@ -528,21 +607,6 @@ point_scalar_mul:
     pop rbx
     pop rbp
     ret
-
-; ----------------------------------------------------------------------------
-; point_add(r[12], p[12], q[12])  -- r = p + q, both Jacobian, a=0 curve.
-;   Z1Z1=Z1^2 ; Z22=Z2^2 ; U1=X1*Z22 ; U2=X2*Z1Z1
-;   S1=Y1*Z2*Z22 ; S2=Y2*Z1*Z1Z1
-;   if U1==U2: if S1!=S2 -> infinity ; else -> point_double(p)
-;   H=U2-U1 ; R=S2-S1 ; HH=H^2 ; HHH=H*HH ; V=U1*HH
-;   X3=R^2-HHH-2V ; Y3=R*(V-X3)-S1*HHH ; Z3=Z1*Z2*H
-;   Slot window (sub rsp,0x1c8): save area [rbp-8..-40], then:
-;     S0=-0x50 Z1Z1, S1=-0x70 S1(proj), S2=-0x90 U1, S3=-0xb0 U2,
-;     S4=-0xd0 S2(proj), S5=-0xf0 (free), S6=-0x110 H, S7=-0x130 R,
-;     S8=-0x150 HH, S9=-0x170 HHH, S10=-0x190 V/2V, S11=-0x1b0 w
-;   r12=out, r13=p, r14=q. Solves the special cases (equal -> double,
-;   opposite -> infinity) and is robust to out==p (in-place) callers.
-; ----------------------------------------------------------------------------
 global point_add
 point_add:
     push rbp
