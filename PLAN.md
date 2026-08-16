@@ -90,6 +90,34 @@ make daemon/wallet_cli   # builds asm/daemon/wallet_cli from wallet_core.c + wal
          tamper + edge rejections). Key lessons logged (ascending-buffer
          convention; affine-vs-Jacobian x; Z at base+64).
 
+[DONE] FINDING 1 (point half) -- CONSTANT-TIME SCALAR MULT, signing-path
+         timing side-channel CLOSED (commit 11aaf3f, 2026-08-16). The ECDSA
+         signing path multiplied by the SECRET nonce k with a branch-per-bit
+         MSB->LSB ladder (bsr loop-bound + per-bit jnc in secp256k1_point.asm),
+         letting a timing attacker recover k and derive the private key.
+         FIX: asm/secp256k1_point_ct.asm adds point_scalar_mul_ct -- a
+         FIXED-256-iteration double-and-add-always ladder over HOMOGENEOUS
+         coords using the Renes-Costello-Batina COMPLETE addition/doubling
+         formulas (eprint 2015/1060 Alg 7/9). Exception-free BY CONSTRUCTION
+         (identity / P=Q / P=-Q all handled, no data-dependent branch);
+         cmov-based bit selection; no bsr, no secret-indexed loads.
+         pointh_add/pointh_double exported for the harness. Now used on the
+         SECRET-scalar paths only: scalar_to_pubkey (bitcoin_keys.asm, private
+         key) + the wallet signing path (wallet_core.c, nonce k). The
+         variable-time windowed point_scalar_mul is LEFT for PUBLIC-scalar
+         verify/consensus paths (fast; its branches leak nothing secret there)
+         -- "resolved by avoidance", per SECURITY_AUDIT.
+         VERIFIED (built + run 2026-08-16): tests/test_scalarmul_ct.c -- KATs
+         (1G/2G/3G/kbig/nG/0G), cross-check vs variable-time routine (2000
+         random + 300 random non-G base + k=1..512) ALL PASS; TIMING
+         INVARIANCE: variable-time leaks 16.73x (tiny vs dense scalar), the CT
+         ladder ratio 0.997x (within 5%) -> timing side-channel eliminated.
+         tests/test_ecdsa, test_point pass (no regression). Differential vs
+         python oracle (asm/tests/run_pointmul_ct_diff.py) = 0 divergence.
+         NOTE: the one-infinity case intentionally differs from the BUGGY
+         differential oracle; the CT path emits canonical Jacobian infinity
+         (1,1,0) which is the correct result.
+
 [ DONE ] bitcoin_hash.asm : NODE-LAYER HASHING PRIMITIVES (built on sha256).
          HF: asm/bitcoin_hash.asm
          API: sha256d(out,msg,len), block_hash(out,hdr[80]),
@@ -472,6 +500,39 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   (`wallet_cli mnemonic` / `wallet_cli seed "<words>" [pass]`) yielding the
   mnemonic, 64-byte seed, master xprv, and m/44'/0'/0'/0/0 address.
 - NEXT (natural wallet steps, not yet started): none blocking — BIP39 is DONE.
+
+### 13. WALLET PERSISTENCE / ADDRESS BOOK / SECURITY (2026-08-16 session)
+- **Persistent wallet store** (`asm/wallet_store.c`, own-format BMCWAL, NOT BDB):
+  `wallet_cli init|load|getaddress|getprivkey` persist the recoverable secret
+  (a BIP39 mnemonic + optional passphrase) across sessions. getprivkey derives
+  the BIP44 m/44'/0'/0'/0/i private key so the persistent wallet can SIGN.
+- **At-rest seed encryption (BMCWAL v2)**: a non-empty secret passphrase now
+  ENCRYPTS the mnemonic at rest (PBKDF2-HMAC-SHA512 via the verified BIP39
+  primitive + CTR over SHA512). A stolen wallet file yields only ciphertext;
+  wrong/missing pass fails via an authenticity tag. Backward compatible (v1
+  plaintext + legacy pass= wallets still load). Local dev secret via a separate
+  0600 `<wallet>.pass` file for unattended dev unlock (env BMC_WALLET_PASS or
+  the .pass file). Wallet + .pass are gitignored (regenerable); the address
+  book is versioned.
+- **Address book** (`asm/wallet_book.c`): `wallet_cli abook add|set|get|rm|list`
+  name->address mapping in 0600 config/addressbook.dat (own textual BMCABK v1
+  format). Seeded with the session's real addresses:
+  `user-other-wallet` = bc1qyz34yshtf5m0ct0ffpxrxlhak4mzx2kdvx07qp; and our
+  dev wallet P2WPKH/P2PKH.
+- **Regtest network-parameterized addresses**: wallet_address_net /
+  wallet_p2wpkh_address_hrp + `wallet_cli netaddr` produce regtest-valid
+  addresses (0x6f P2PKH / bcrt bech32) that Core-regtest will mine to/accept
+  (mainnet-version addresses are rejected on regtest).
+- **Real end-to-end send PROVEN on live Core regtest**: mined 105+ blocks to a
+  wallet address, derived the user's bc1qyz34... dest script, built a raw tx,
+  signed input 0 with the ASM ECDSA, and Core ACCEPTED + mined it
+  (txid b18b53a19...8affb; 1.0 BTC to the dest P2WPKH script + 48.999 change).
+  Core accepting the ASM signature is definitive proof the ASM ECDSA is valid.
+- **Mainnet funding gap (OPEN)**: everything is mainnet-ready (synced node
+  962k, valid verified addresses, proven signer) but there is NO real mainnet
+  bitcoin on this box. A real mainnet send to bc1qyz34... awaits any provision
+  (micro-payment to our wallet, or another funding source). Free mainnet
+  faucets do not reliably pay (tested).
 
 ### 11. COMPLIANCE TARGET — "fully compliant" is a DEFINED, MEASUREABLE SCOPE
 
