@@ -151,6 +151,7 @@ static const char* catchup_seeds[] = {
     "seed.bitcharcoal.com",
     "seed.bitcoin.wiz.biz"
 };
+static void anchor_locator(unsigned char loc[32]);   /* fwd decl (defined below) */
 static long outbound_catchup(void){
     static unsigned char cbuf[4<<20];
     long total=0;
@@ -175,13 +176,10 @@ static long outbound_catchup(void){
          * chain tip. Each block is cons_verify-validated with a re-derived-hash
          * guard before store_append -- the same verified asm path as `follow`. */
         static unsigned char loc[32];
-        int t = *(int*)(store_buf+24);
-        if(t>=0){
-            static unsigned char hd[80];
-            long L = node_serve_block(store_buf, t, hd, sizeof hd);
-            if(L>=80) block_hash(loc, hd);
-            else memset(loc,0,32);
-        } else memset(loc,0,32);
+        /* Anchor from the STORED TIP index record (index-hash read, robust to a
+         * transiently-unreadable tip body -- avoiding the live-found genesis
+         * re-download duplicate-tail corruption) or a zero locator when empty. */
+        anchor_locator(loc);
         long cnt=0;
         long ok=node_sync(fd, store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
         int tip=*(int*)(store_buf+24);
@@ -443,9 +441,18 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
 
 /* Anchor a peer's locator to our CURRENT stored tip hash (zero if empty). */
 static void anchor_locator(unsigned char loc[32]){
-    int t=*(int*)(store_buf+24);
-    if(t>=0){ static unsigned char hd[8<<20];
-        if(node_serve_block(store_buf, t, hd, sizeof hd)>=80){ block_hash(loc,hd); return; }
+    /* Anchor the locator to the stored tip's HASH read straight from the index
+     * record (idx_len-48 .. idx_len-16), NOT via node_serve_block. A live
+     * sustained-ingest finding: node_serve_block on a just-appended tip can
+     * transiently return <80 (bd: block body not yet at a readable position),
+     * which used to make this helper collapse loc to all-zero (genesis) --
+     * the next node_sync then re-downloaded from genesis and store_append
+     * appended a duplicate, non-contiguous tail. Reading the tip hash directly
+     * from index.dat is always available and cannot misfire. */
+    int fd = *(int*)(store_buf+8);          /* idx_fd */
+    long len = *(long*)(store_buf+16);      /* idx_len */
+    if(fd>=0 && len>=48){
+        if(lseek(fd, len-48, SEEK_SET)>=0 && read(fd, loc, 32)==32) return;
     }
     memset(loc,0,32);
 }
