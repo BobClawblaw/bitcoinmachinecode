@@ -597,6 +597,11 @@ headers`, `test_serve`, mux/redial).
 
 ## PASS 2 Remediation plan (recommended follow-up cards)
 
+> **ACTIONABLE COPY:** the open items below live as a tracked, AI-executable
+> checklist in [`AUDIT_BATCH2_ACTIONS.md`](AUDIT_BATCH2_ACTIONS.md). Point any
+> follow-up agent at that file — it contains ONLY what is still open, no
+> already-fixed history.
+
 1. **Durable txlog** (FINDING P2-1, MEDIUM): `fflush`+`fsync` before
    `txlog_append` returns; consider a per-record length/trailer so torn writes
    are detectable.
