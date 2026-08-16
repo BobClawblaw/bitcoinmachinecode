@@ -71,8 +71,30 @@ int main(void){
     ck_contains("append-only adds second txid", out2, "8081828384858687", 1);
 
     /* list of a missing path is empty-but-ok, not an error */
-    char out3[4096]; 
+    char out3[4096];
     ck("list of missing file -> ok(0)", txlog_list("/tmp/definitely_missing.txlog", out3, sizeof out3), 0);
+
+    /* ---- torn-write guard (FINDING P2-1) ---- */
+    /* A record whose trailing checksum does not match its 8 data fields is a
+     * torn/partial write and must be REJECTED by txlog_list, not silently
+     * accepted. We simulate one by appending a record with a corrupted checksum
+     * directly to the on-disk journal, then confirm list skips it while still
+     * showing the good record above. */
+    {
+        char jp2[] = "/tmp/wtxlog_torn.dat.txlog";
+        remove(jp2);
+        unsigned char tx[32]; for (int i=0;i<32;i++) tx[i]=(unsigned char)i;
+        unsigned char de[20]; for (int i=0;i<20;i++) de[i]=(unsigned char)(0xa0+i);
+        ck("torn fixture: good append succeeds", txlog_append_sent("/tmp/wtxlog_torn.dat", tx, 5000, 100, de, 1, 226), 0);
+        /* hand-write a second "record" with a wrong (torn) checksum field */
+        FILE* f = fopen(jp2, "a");
+        fputs("1786923023 sent 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 900 20 a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3 1 100 00000000deadbeef\n", f);
+        fclose(f);
+        char o[4096]; o[0]=0;
+        txlog_list(jp2, o, sizeof o);
+        ck("torn-write: good record still listed", strstr(o, "000102030405060708090a0b0c0d0e0f") != NULL, 1);
+        ck_contains("torn-write: corrupt record rejected", o, "900", 0);
+    }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
