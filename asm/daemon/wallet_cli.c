@@ -71,6 +71,11 @@ extern int  wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
 extern int  wallet_seed_master_xprv(char xprv[128], const unsigned char seed[64]);
 extern int  wallet_seed_bip44_address(char addr[64], const unsigned char seed[64]);
 
+/* persistent wallet store (asm/wallet_store.c) */
+extern int  wallet_store_create(const char* path, const char* mnemonic, const char* pass);
+extern int  wallet_store_load(const char* path, char* mnemonic_out, int cap,
+                              char* pass_out, int pcap);
+
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -447,6 +452,96 @@ static int cmd_mnemonic(void) {
     return 0;
 }
 
+/* Persistent wallet management: store the recoverable mnemonic to disk and
+ * derive addresses deterministically. Everything derives from the mnemonic via
+ * the verified wallet_core API, so `init` once + `getaddress`/`load` after is a
+ * usable persistent wallet for real small-amount sends. */
+
+static int seed_address(const char* mn, const char* pass, char* addr, int cap,
+                        unsigned char* seed_out) {
+    int nw = wallet_mnemonic_validate(mn);
+    if (nw <= 0) return 0;
+    unsigned char seed[64];
+    long pl = pass ? (long)strlen(pass) : 0;
+    wallet_mnemonic_seed(seed, mn, pass, pl);
+    if (seed_out) memcpy(seed_out, seed, 64);
+    return wallet_seed_bip44_address(addr, seed) ? 1 : 0;
+}
+
+static const char* default_wallet_path(void) { return "config/wallet.dat"; }
+
+static int cmd_init(int argc, char** argv) {
+    /* create a persistent wallet:
+     *   wallet_cli init [passphrase] [path]   (path defaults to config/wallet.dat) */
+    const char* pass = (argc >= 3) ? argv[2] : NULL;
+    const char* path = (argc >= 4) ? argv[3] : default_wallet_path();
+    char mn[256];
+    if (!wallet_mnemonic_generate(mn)) {
+        fprintf(stderr, "init: cannot read /dev/urandom\n");
+        return 1;
+    }
+    if (wallet_store_create(path, mn, pass)) {
+        fprintf(stderr, "init: cannot write %s\n", path);
+        return 1;
+    }
+    char addr[64];
+    seed_address(mn, pass, addr, (int)sizeof addr, NULL);
+    printf("wallet:   %s\n", path);
+    printf("mnemonic: %s\n", mn);
+    if (pass) printf("passphrase: %s\n", pass);
+    printf("m/44'/0'/0'/0/0: %s\n", addr);
+    printf("(recoverable: wallet_cli load %s / getaddress <i> to re-derive)\n", path);
+    return 0;
+}
+
+static int cmd_load(int argc, char** argv) {
+    /* load a persistent wallet and show its seed + main address:
+     *   wallet_cli load [path] [passphrase]   (passphrase only if the wallet has one) */
+    const char* path = (argc >= 3) ? argv[2] : default_wallet_path();
+    const char* cli_pass = (argc >= 4) ? argv[3] : NULL;
+    char mn[768], pass[256];
+    if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
+        fprintf(stderr, "load: cannot load wallet %s (does it exist? use init)\n", path);
+        return 1;
+    }
+    /* a CLI-provided passphrase overrides the stored one if present */
+    if (cli_pass && cli_pass[0]) snprintf(pass, sizeof pass, "%s", cli_pass);
+    unsigned char seed[64];
+    char addr[64];
+    if (!seed_address(mn, pass, addr, (int)sizeof addr, seed)) {
+        fprintf(stderr, "load: stored mnemonic invalid\n");
+        return 1;
+    }
+    printf("wallet:  %s\n", path);
+    printf("mnemonic: %s\n", mn);
+    if (pass[0]) printf("passphrase: %s\n", pass);
+    printf("seed:   "); print_hex(seed, 64); printf("\n");
+    printf("m/44'/0'/0'/0/0: %s\n", addr);
+    return 0;
+}
+
+static int cmd_getaddress(int argc, char** argv) {
+    /* derive address index i from the persistent wallet:
+     *   wallet_cli getaddress [index] [path]   (index default 0) */
+    unsigned idx = 0;
+    const char* path = default_wallet_path();
+    if (argc >= 3) idx = (unsigned)strtoul(argv[2], NULL, 10);
+    if (argc >= 4) path = argv[3];
+    char mn[768], pass[256];
+    if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
+        fprintf(stderr, "getaddress: cannot load wallet %s\n", path);
+        return 1;
+    }
+    unsigned char seed[64];
+    long pl = pass[0] ? (long)strlen(pass) : 0;
+    wallet_mnemonic_seed(seed, mn, pass[0] ? pass : NULL, pl);
+    char addr[96];
+    long n = wallet_derive_p2wpkh_address(addr, 96, seed, idx);
+    if (n <= 0) n = wallet_seed_bip44_address(addr, seed), idx = 0;
+    printf("%s\n", addr);
+    return 0;
+}
+
 static int cmd_seed(int argc, char** argv) {
     /* restore a recoverable seed from a mnemonic (and optional passphrase):
      *   wallet_cli seed "<w0 w1 ... wn>" [passphrase]   (sentence in quotes) */
@@ -477,12 +572,15 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
     if (!strcmp(argv[1], "mnemonic")) return cmd_mnemonic();
     if (!strcmp(argv[1], "seed")) return cmd_seed(argc, argv);
+    if (!strcmp(argv[1], "init")) return cmd_init(argc, argv);
+    if (!strcmp(argv[1], "load")) return cmd_load(argc, argv);
+    if (!strcmp(argv[1], "getaddress")) return cmd_getaddress(argc, argv);
     if (!strcmp(argv[1], "addr")) {
         if (argc < 3) { fprintf(stderr, "usage: wallet_cli addr <privkey_hex>\n"); return 2; }
         return cmd_addr(argv[2]);
