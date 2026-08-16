@@ -212,6 +212,12 @@ tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVEOBJS) tests/bloc
 tests/test_outbound_mux: tests/test_outbound_mux.c daemon/bitcoind $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_outbound_mux.c $(SERVEOBJS)
 
+# OUTBOUND MUX RE-DIAL e2e: regression for soak-defect D2 -- proves the mux
+# re-dials a leg the peer rips down (POLLHUP) and recovers keep-up via a fresh
+# connection to a rotated peer, instead of syncing on a dead socket forever.
+tests/test_redial: tests/test_redial.c daemon/bitcoind $(SERVEOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_redial.c $(SERVEOBJS)
+
 # OUTBOUND MUX SOAK HARNESS controlled mining peer: real process that serves the
 # node_sync protocol from a GROWING chain (mines a block every N seconds) for
 # unattended 24h+ soak runs; also periodically re-connects inbound to prove the
@@ -497,11 +503,14 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_s
                bitcoin_hash.o sha256.o ripemd160.o \
                bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
                bitcoin_utxo.o
-daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c $(WALLETPRIMS)
-	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c $(WALLETPRIMS)
+daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
+	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 
 tests/test_wallet_txlog: tests/test_wallet_txlog.c wallet_txlog.c
 	$(CC) -no-pie -O0 -o $@ tests/test_wallet_txlog.c wallet_txlog.c
+
+tests/test_msg_sign: tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
+	$(CC) -no-pie -O0 -o $@ tests/test_msg_sign.c wallet_msgsign.c wallet_core.c $(WALLETPRIMS) bitcoin_script.o
 
 tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
 	$(CC) -no-pie -O0 -o $@ tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
@@ -580,7 +589,7 @@ tests/test_shared: tests/test_shared.c bitcoin_store.o
 tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
-test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 \
+test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 \
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -659,6 +668,7 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/test_bip152_loop
 	./tests/test_sendheaders_fee
 	./tests/test_outbound_mux ./daemon/bitcoind
+	./tests/test_redial ./daemon/bitcoind
 	./tests/verify_p2sh_shim < /dev/null
 	./tests/test_verify_p2sh
 	./tests/test_bip30
