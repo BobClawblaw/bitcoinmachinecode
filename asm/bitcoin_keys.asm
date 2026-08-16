@@ -37,7 +37,9 @@ section .text
 extern fe_mul
 extern fe_sqr
 extern fe_inv
-extern point_scalar_mul
+; FINDING 1: scalar_to_pubkey multiplies by the SECRET private key, so it
+; uses the constant-time ladder rather than the variable-time windowed one.
+extern point_scalar_mul_ct
 
 ; ============================================================================
 ; int scalar_small_nonzero(const u8 k[32])
@@ -113,7 +115,7 @@ scalar_to_pubkey:
     lea  rdi, [rbp-0xc8]
     lea  rsi, [G_AFF]
     lea  rdx, [rbp-0x58]
-    call point_scalar_mul
+    call point_scalar_mul_ct
 
     ; ---- affinize ----
     ; z2 = Z^2  (Z is element at point+2 => [rbp-0xc8+64])

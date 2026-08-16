@@ -30,8 +30,11 @@ extern void sc_add(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void sc_sub(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void sc_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void sc_inv(uint64_t r[4], const uint64_t a[4]);
-/* point ops: point_scalar_mul(r_jac[12], xy_aff[8], k[4]) */
-extern void point_scalar_mul(uint64_t r[12], const uint64_t xy[8], const uint64_t k[4]);
+/* point ops: point_scalar_mul(r_jac[12], xy_aff[8], k[4])
+ * FINDING 1: signing multiplies by the SECRET nonce k, so it must use the
+ * constant-time ladder (secp256k1_point_ct.asm), not the variable-time
+ * windowed point_scalar_mul used on public-scalar verification paths. */
+extern void point_scalar_mul_ct(uint64_t r[12], const uint64_t xy[8], const uint64_t k[4]);
 /* field ops over prime p: r,a,b = 4 ascending little-endian u64 */
 extern void fe_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void fe_sqr(uint64_t r[4], const uint64_t a[4]);
@@ -192,8 +195,8 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
     be32_to_limbs(d, priv_be);
     be32_to_limbs(z, z_be);
 
-    /* R = k*G (Jacobian 12 limbs) */
-    point_scalar_mul(R, G_AFF, k);
+    /* R = k*G (Jacobian 12 limbs) -- CONSTANT TIME in k (FINDING 1) */
+    point_scalar_mul_ct(R, G_AFF, k);
 
     /* affine x = X * (1/Z^2) mod p */
     fe_sqr(z2, R + 8);          /* Z^2 */
