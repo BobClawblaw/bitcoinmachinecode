@@ -203,6 +203,13 @@ tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVEOBJS) tests/bloc
 tests/test_outbound_mux: tests/test_outbound_mux.c daemon/bitcoind $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_outbound_mux.c $(SERVEOBJS)
 
+# OUTBOUND MUX SOAK HARNESS controlled mining peer: real process that serves the
+# node_sync protocol from a GROWING chain (mines a block every N seconds) for
+# unattended 24h+ soak runs; also periodically re-connects inbound to prove the
+# node serves while downloading. Link set = SERVEOBJS (same as test_outbound_mux).
+tests/soak_mux_peer: tests/soak_mux_peer.c $(SERVEOBJS)
+	$(CC) -no-pie -O2 -o $@ tests/soak_mux_peer.c $(SERVEOBJS)
+
 # SHA-512 (FIPS 180-4, wallet/BIP32+bech32 foundation).
 tests/test_sha512: tests/test_sha512.c sha512.o
 	$(CC) -no-pie -O0 -o $@ tests/test_sha512.c sha512.o
@@ -472,8 +479,8 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_sca
                bitcoin_hash.o sha256.o ripemd160.o \
                bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
                bitcoin_utxo.o
-daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c $(WALLETPRIMS)
-	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c $(WALLETPRIMS)
+daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c $(WALLETPRIMS)
+	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c $(WALLETPRIMS)
 
 tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
 	$(CC) -no-pie -O0 -o $@ tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
