@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 /* core API from asm/wallet_core.c */
 extern void wallet_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
@@ -495,6 +496,43 @@ static int seed_address(const char* mn, const char* pass, char* addr, int cap,
 
 static const char* default_wallet_path(void) { return "config/wallet.dat"; }
 
+/* ---- dev secret file: <wallet>.pass -------------------------------------
+ * For in-development use on a trusted/secure box we persist the secret that
+ * unlocks an encrypted wallet in a SEPARATE 0600 file next to the wallet
+ * (e.g. config/wallet.dat -> config/wallet.dat.pass). It is deliberately a
+ * different file from the ciphertext so a partial leak never pairs both
+ * halves, and it is root/owner-only (0600). This is a DEV convenience; later
+ * this single function is where prod would read from a secrets manager/env. */
+static const char* passfile_for(const char* wallet_path) {
+    static char pf[512];
+    snprintf(pf, sizeof pf, "%s.pass", wallet_path);
+    return pf;
+}
+/* Read the secret from <wallet>.pass if it exists and is non-empty. Returns 1
+ * and fills out[cap] (NUL-terminated) on success; 0 if absent/empty. */
+static int passfile_read(const char* wallet_path, char* out, int cap) {
+    if (!out || cap <= 1) return 0;
+    out[0] = 0;
+    const char* pf = passfile_for(wallet_path);
+    FILE* f = fopen(pf, "r");
+    if (!f) return 0;
+    if (!fgets(out, cap, f)) { fclose(f); out[0] = 0; return 0; }
+    fclose(f);
+    size_t l = strlen(out);
+    while (l && (out[l-1]=='\n' || out[l-1]=='\r')) out[--l]=0;
+    return out[0] ? 1 : 0;
+}
+/* Write the secret to <wallet>.pass with 0600 perms (only if non-empty). */
+static void passfile_write(const char* wallet_path, const char* sec) {
+    if (!sec || !sec[0]) return;
+    const char* pf = passfile_for(wallet_path);
+    FILE* f = fopen(pf, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", sec);
+    fclose(f);
+    chmod(pf, 0600);
+}
+
 static int cmd_init(int argc, char** argv) {
     /* create a persistent wallet:
      *   wallet_cli init [passphrase] [path]   (path defaults to config/wallet.dat) */
@@ -509,6 +547,8 @@ static int cmd_init(int argc, char** argv) {
         fprintf(stderr, "init: cannot write %s\n", path);
         return 1;
     }
+    /* persist the secret (dev convenience) in a separate 0600 .pass file */
+    if (pass && pass[0]) passfile_write(path, pass);
     char addr[64];
     seed_address(mn, pass, addr, (int)sizeof addr, NULL);
     printf("wallet:   %s\n", path);
@@ -525,9 +565,10 @@ static int cmd_load(int argc, char** argv) {
     const char* path = (argc >= 3) ? argv[2] : default_wallet_path();
     const char* cli_pass = (argc >= 4) ? argv[3] : getenv("BMC_WALLET_PASS");
     char mn[768], pass[256];
-    /* pre-fill the secret as INPUT to load (v2 decrypt), if supplied */
+    /* pre-fill the secret as INPUT to load (v2 decrypt), from CLI arg, env,
+     * or the local dev <wallet>.pass file. */
     if (cli_pass && cli_pass[0]) snprintf(pass, sizeof pass, "%s", cli_pass);
-    else pass[0] = 0;
+    else if (!passfile_read(path, pass, (int)sizeof pass)) pass[0] = 0;
     if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
         fprintf(stderr, "load: cannot load wallet %s (v2-encrypted? supply the passphrase; or use init)\n", path);
         return 1;
@@ -556,10 +597,11 @@ static int cmd_getaddress(int argc, char** argv) {
     char mn[768], pass[256];
     {
         const char* sec = getenv("BMC_WALLET_PASS");
-        if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec); else pass[0] = 0;
+        if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec);
+        else if (!passfile_read(path, pass, (int)sizeof pass)) pass[0] = 0;
     }
     if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "getaddress: cannot load wallet %s (encrypted? set BMC_WALLET_PASS)\n", path);
+        fprintf(stderr, "getaddress: cannot load wallet %s (encrypted? set BMC_WALLET_PASS or use <wallet>.pass)\n", path);
         return 1;
     }
     unsigned char seed[64];
@@ -582,10 +624,11 @@ static int cmd_getprivkey(int argc, char** argv) {
     char mn[768], pass[256];
     {
         const char* sec = getenv("BMC_WALLET_PASS");
-        if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec); else pass[0] = 0;
+        if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec);
+        else if (!passfile_read(path, pass, (int)sizeof pass)) pass[0] = 0;
     }
     if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "getprivkey: cannot load wallet %s (encrypted? set BMC_WALLET_PASS)\n", path);
+        fprintf(stderr, "getprivkey: cannot load wallet %s (encrypted? set BMC_WALLET_PASS or use <wallet>.pass)\n", path);
         return 1;
     }
     unsigned char seed[64];

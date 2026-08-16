@@ -168,3 +168,6 @@ soak/logs/
 soak/run-*/
 soak/soak-analysis/
 soak-store/
+# Dev wallet + its separate secret file (regenerable via wallet_cli init)
+asm/config/wallet.dat
+asm/config/wallet.dat.pass
