@@ -24,6 +24,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <time.h>
 #include <signal.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -438,6 +439,9 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
 static int   mux_n_out = 0;
+static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
+static long long mux_out_nextretry[MUX_MAX_OUT]; /* monotonic ms deadline before the next re-dial attempt */
+#define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
 
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
  * The handshake reads the seed's version/verack plus its post-verack chatter
@@ -525,11 +529,33 @@ static long do_outbound_sync(int i){
     return cnt;
 }
 
+/* Re-dial one dead outbound leg: close the socket (if any) and attempt a fresh
+ * connect+handshake to a DIFFERENT seed in the pool, rotating so keep-up is not
+ * single-seed-limited. This is the peer-pool rotation / retry the soak analysis
+ * flagged as missing (D2): the old mux connected N legs once up front and never
+ * recovered a leg that died or failed to handshake, leaving keep-up silently
+ * single-seed-limited. On success the slot is re-anchored at our stored tip and
+ * reused in the poll loop; on failure the slot stays dead (fd -1) and is retried
+ * on a later rotation. */ 
+static void mux_redial(int i, const char* peers[], int pool_len, int out_port){
+    if(mux_out_fd[i]>=0){ close(mux_out_fd[i]); mux_out_fd[i]=-1; }
+    /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
+    int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    mux_out_peer[i] = p;
+    int fd = outbound_connect(peers[p], 300, out_port);
+    if(fd<0){ fprintf(stderr,"[mux:%d] redial %s failed (kept dead)\n", i, peers[p]); return; }
+    mux_out_fd[i]=fd;
+    strncpy(mux_out_host[i], peers[p], 63);
+    anchor_locator(mux_out_loc[i]);
+    fprintf(stderr,"[mux:%d] redialed -> %s (fd %d)\n", i, peers[p], fd);
+}
+
 /* The outbound multiplexer: ONE poll() loop over the listen socket + all N
  * outbound seed fds. Inbound accepts are forked to node_serve_loop children
  * (preserved behavior); outbound legs run inline (node_sync + announce).
- * `peers` = host names; `nwant` of them are connected on entry at `out_port`
- * (best effort).
+ * `peers` = host names (pool of `pool_len`); `nwant` of them are connected on
+ * entry at `out_port` (best effort), and dead legs are re-dialed by rotating
+ * through the pool (D2 fix).
  *
  * IMPORTANT: the listener socket is created FIRST, before any outbound
  * connect. The outbound legs are best-effort; if they all fail the mux still
@@ -537,15 +563,17 @@ static long do_outbound_sync(int i){
  * means `serve` is live to inbound peers immediately (the listener exists
  * even while the outbound legs are still connecting), which the old order
  * (connect-all-outbound-then-listen) did not guarantee. */
-static int serve_mux(int port, const char* peers[], int nwant, int out_port, int l){
+static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l){
     /* connect up to nwant outbound peers up front (the listener `l` is already
      * live and passed in, so inbound serving is available even while the
-     * outbound legs are still connecting). */
-    for(int i=0;i<nwant && i<MUX_MAX_OUT;i++){
+     * outbound legs are still connecting). Clamped to pool_len so we never
+     * read past the seed list (the pool may be smaller than nwant). */
+    for(int i=0;i<nwant && i<pool_len && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed\n", peers[i]); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 63);
         mux_out_fd[mux_n_out]=fd;
+        mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
         fprintf(stderr,"[mux] outbound %d = %s (fd %d)\n", mux_n_out, peers[i], fd);
         mux_n_out++;
@@ -556,7 +584,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int out_port, int
     for(;;){
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
-        for(int i=0;i<mux_n_out;i++){ pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
+        for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
         int pr=poll(pfds, nfds, 300);
         if(pr<0){ if(errno==EINTR) continue; break; }
         /* inbound accept -> fork a serve child (unchanged semantics) */
@@ -578,10 +606,28 @@ static int serve_mux(int port, const char* peers[], int nwant, int out_port, int
          * (it sent data we should react to). Round-robin spreads the load so
          * idle peers each get polled roughly once per mux_n_out iterations. */
         rot++;
+        int poll_idx=1;                                  /* pfds[0] is the listener */
+        long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         for(int i=0;i<mux_n_out;i++){
-            bool due=(rot % mux_n_out)==(long long)i;                       /* periodic */
-            if(pfds[i+1].revents&(POLLIN|POLLHUP|POLLERR)) due=true;        /* data */
+            if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
+                if(now_ms >= mux_out_nextretry[i]){ mux_redial(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                continue;
+            }
+            short ev = pfds[poll_idx].revents;
+            /* A permanent peer-side error/hangup/INVAL means the leg is dead:
+             * close and re-dial a rotated seed (D2 fix) instead of syncing on a
+             * broken socket forever. */
+            if(ev & (POLLHUP|POLLERR|POLLNVAL)){
+                fprintf(stderr,"[mux:%d] %s dropped (revents 0x%x); re-dialing\n", i, mux_out_host[i], ev);
+                mux_redial(i, peers, pool_len, out_port);
+                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
+                poll_idx++;
+                continue;
+            }
+            bool due=(rot % mux_n_out)==(long long)i;     /* periodic */
+            if(ev & POLLIN) due=true;                     /* data */
             if(due) do_outbound_sync(i);
+            poll_idx++;
         }
     }
     return 0;
@@ -593,7 +639,15 @@ int main(int argc, char** argv){
     signal(SIGCHLD, SIG_IGN);   /* fork-per-peer workers: auto-reap, no zombies */
     if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }
     const char* mode = argv[1]; const char* dir = argv[2];
-    if(chdir(dir)!=0){ perror("chdir"); return 1; }
+    /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
+     * right directory regardless of the caller's cwd (soak analysis found a
+     * caller-relative chdir silently opened the wrong store when the node was
+     * launched from another directory). realpath fails only if <dir> does not
+     * exist, which chdir would reject anyway. */
+    char absp[4096];
+    if(!realpath(dir, absp)){ perror("realpath"); return 1; }
+    if(chdir(absp)!=0){ perror("chdir"); return 1; }
+    dir = absp;
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
 
     if(strcmp(mode,"sync")==0){
@@ -807,7 +861,7 @@ int main(int argc, char** argv){
          * children (concurrent serving preserved); outbound legs run INLINE in
          * this loop (periodic node_sync-from-tip + node_announce_tip), so the
          * node simultaneously serves AND stays current by its own poll. */
-        return serve_mux(port, catchup_seeds, nwant, 8333, l);
+        return serve_mux(port, catchup_seeds, nwant, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333, l);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -830,7 +884,7 @@ int main(int argc, char** argv){
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         if(l<0){ perror("lsock"); return 1; }
-        return serve_mux(port, peer, nwant, out_port, l);
+        return serve_mux(port, peer, nwant, 1, out_port, l);
     }
     return 2;
 }
