@@ -60,9 +60,7 @@ N_EXP_END:
 
 section .text
 
-; sc_mul is now provided by secp256k1_scalar_c.c (see note above sc_sqr).
-; Declare it external so sc_sqr's jmp and sc_inv's calls resolve at link time.
-extern sc_mul
+; sc_mul is now DEFINED natively in this file (see sc_mul below).
 
 ; ----------------------------------------------------------------------------
 ; sc_add(r,a,b) = (a+b) mod n
@@ -202,17 +200,234 @@ sc_sub:
     ret
 
 ; ----------------------------------------------------------------------------
-; sc_mul(r,a,b) = (a*b) mod n.
-;   NOTE: the direct CONSTANT-TIME modular multiply (schoolbook 256x256 product
-;   + bounded-fold reduction using DELTA=2^256-n) now lives in
-;   secp256k1_scalar_c.c (a documented C-module exception, linked via
-;   secp256k1_scalar_c.o in the Makefile).  The former asm implementation did a
-;   bit-by-bit double-and-add using only sc_add (~256*2 sc_add per mul) which
-;   made sc_inv (=a^(n-2), ~387 mults) the dominant cost of every ECDSA
-;   verification; the C fast multiply is ~5x faster per mul and validated
-;   bit-exact over 8k vectors vs the (a*b) mod n oracle.
-; sc_sqr/sc_inv call sc_mul by symbol; those references resolve to the C object
-; at link time.
+; sc_mul(r,a,b) = (a*b) mod n  : CONSTANT-TIME 256x256 schoolbook multiply +
+;   bounded-fold reduction (8 rounds, DELTA=2^256-n) + 3 constant-time
+;   n-subtractions.  ABI: rdi=out[4], rsi=a[4], rdx=b[4].
+;   Fast-method port of secp256k1_scalar_c.c sc_mul (NOT the abandoned slow
+;   double-and-add). Validated bit-exact against the C reference by
+;   tests/test_scalar (which is the oracle for this conversion).
+;   Frame (rbp-based, NON-overlapping):
+;     cur[0..9]  rbp-80  .. rbp-8
+;     tmp[0..9]  rbp-160 .. rbp-88
+;     a[0..3]    rbp-192 .. rbp-168
+;     b[0..3]    rbp-224 .. rbp-200
+;     out        rbp-232
+;   Uses r8,r9,r10,r11,rbx,r12-r15 as scratch (callee-saved restored).
+; ----------------------------------------------------------------------------
+global sc_mul
+sc_mul:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 232
+
+    ; save a, b, out
+    mov  rax, [rsi+0]
+    mov  [rbp-192], rax
+    mov  rax, [rsi+8]
+    mov  [rbp-184], rax
+    mov  rax, [rsi+16]
+    mov  [rbp-176], rax
+    mov  rax, [rsi+24]
+    mov  [rbp-168], rax
+    mov  rax, [rdx+0]
+    mov  [rbp-224], rax
+    mov  rax, [rdx+8]
+    mov  [rbp-216], rax
+    mov  rax, [rdx+16]
+    mov  [rbp-208], rax
+    mov  rax, [rdx+24]
+    mov  [rbp-200], rax
+    mov  [rbp-232], rdi        ; out
+
+    ; zero cur[0..9]
+    xor  eax, eax
+    lea  rdi, [rbp-80]
+    mov  rcx, 10
+.zero_cur:
+    mov  [rdi], rax
+    add  rdi, 8
+    dec  rcx
+    jnz  .zero_cur
+
+    ; ================= PHASE 1: schoolbook product cur = a*b ================
+    ; 16 products. For (i,j) with k=i+j: cur[k]+=lo(a[i]*b[j]),
+    ;   cur[k+1]+=hi (with the carry from cur[k]+lo), cur[k+2]+=carry.
+%macro MULACC 2
+    mov    rax, [rbp-192 + (8*%1)]
+    mul    qword [rbp-224 + (8*%2)]
+    mov    r8,  [rbp-80 + 8*(%1+%2)]
+    add    r8,  rax
+    mov    [rbp-80 + 8*(%1+%2)], r8
+    mov    r8,  [rbp-80 + 8*(%1+%2+1)]
+    adc    r8,  rdx
+    mov    [rbp-80 + 8*(%1+%2+1)], r8
+    mov    r8,  [rbp-80 + 8*(%1+%2+2)]
+    adc    r8,  0
+    mov    [rbp-80 + 8*(%1+%2+2)], r8
+%endmacro
+    MULACC 0,0
+    MULACC 0,1
+    MULACC 0,2
+    MULACC 0,3
+    MULACC 1,0
+    MULACC 1,1
+    MULACC 1,2
+    MULACC 1,3
+    MULACC 2,0
+    MULACC 2,1
+    MULACC 2,2
+    MULACC 2,3
+    MULACC 3,0
+    MULACC 3,1
+    MULACC 3,2
+    MULACC 3,3
+
+    ; PHASE 1 DONE. Raw 512-bit product is in cur[0..9].
+
+    ; ==== PHASE 2: bounded-fold reduction (8 rounds) ====
+    ; Round: hi=cur[4..8] (5 limbs); tmp = hi*DELTA (5x4 products into tmp[0..9]);
+    ;   cur = tmp + cur[0..3] with carry, all 10 limbs copied.
+%macro FOLD 0
+    ; zero tmp[0..9] (rbp-160..-88)
+    xor    eax, eax
+    lea    rdi, [rbp-160]
+    mov    rcx, 10
+%%zt:
+    mov    [rdi], rax
+    add    rdi, 8
+    dec    rcx
+    jnz    %%zt
+    ; tmp += hi * DELTA ; hi=cur[4+hh], DELTA[dj]
+%assign hh 0
+%rep 5
+%assign dj 0
+%rep 4
+    mov    rax, [rbp-80 + 8*(4+hh)]
+    mul    qword [DELTA + 8*dj]
+    mov    r8,  [rbp-160 + 8*(hh+dj)]
+    add    r8,  rax
+    mov    [rbp-160 + 8*(hh+dj)], r8
+    mov    r8,  [rbp-160 + 8*(hh+dj+1)]
+    adc    r8,  rdx
+    mov    [rbp-160 + 8*(hh+dj+1)], r8
+    mov    r8,  [rbp-160 + 8*(hh+dj+2)]
+    adc    r8,  0
+    mov    [rbp-160 + 8*(hh+dj+2)], r8
+%assign dj dj+1
+%endrep
+%assign hh hh+1
+%endrep
+    ; cur = tmp + cur[0..3] (carry into high), all 10 limbs
+    mov    r8,  [rbp-160+0]
+    add    r8,  [rbp-80+0]
+    mov    [rbp-80+0], r8
+    mov    r8,  [rbp-160+8]
+    adc    r8,  [rbp-80+8]
+    mov    [rbp-80+8], r8
+    mov    r8,  [rbp-160+16]
+    adc    r8,  [rbp-80+16]
+    mov    [rbp-80+16], r8
+    mov    r8,  [rbp-160+24]
+    adc    r8,  [rbp-80+24]
+    mov    [rbp-80+24], r8
+    mov    r8,  [rbp-160+32]
+    adc    r8,  0
+    mov    [rbp-80+32], r8
+    mov    r8,  [rbp-160+40]
+    adc    r8,  0
+    mov    [rbp-80+40], r8
+    mov    r8,  [rbp-160+48]
+    adc    r8,  0
+    mov    [rbp-80+48], r8
+    mov    r8,  [rbp-160+56]
+    adc    r8,  0
+    mov    [rbp-80+56], r8
+    mov    r8,  [rbp-160+64]
+    adc    r8,  0
+    mov    [rbp-80+64], r8
+    mov    r8,  [rbp-160+72]
+    adc    r8,  0
+    mov    [rbp-80+72], r8
+%endmacro
+    FOLD
+    FOLD
+    FOLD
+    FOLD
+    FOLD
+    FOLD
+    FOLD
+    FOLD
+
+    ; ==== PHASE 3: 3 constant-time conditional n-subtractions ====
+%macro CONDS 0
+    mov    r8,  [rbp-80+0]
+    sub    r8,  [N_LIMBS+0]
+    mov    r9,  [rbp-80+8]
+    sbb    r9,  [N_LIMBS+8]
+    mov    r10, [rbp-80+16]
+    sbb    r10, [N_LIMBS+16]
+    mov    r11, [rbp-80+24]
+    sbb    r11, [N_LIMBS+24]
+    sbb    rax, rax
+    not    rax                 ; mask = -1 iff no-borrow (>=n => subtract), else 0
+    ; constant-time select via XOR-fold: (r & mask) | (cur & ~mask)
+    ;   = cur ^ (cur&mask) ^ (r&mask)  [since mask is 0 or -1]
+    mov    rcx, [rbp-80+0]
+    mov    rdx, rcx
+    and    rdx, rax
+    xor    rcx, rdx
+    and    r8,  rax
+    xor    r8,  rcx
+    mov    [rbp-80+0], r8
+    mov    rcx, [rbp-80+8]
+    mov    rdx, rcx
+    and    rdx, rax
+    xor    rcx, rdx
+    and    r9,  rax
+    xor    r9,  rcx
+    mov    [rbp-80+8], r9
+    mov    rcx, [rbp-80+16]
+    mov    rdx, rcx
+    and    rdx, rax
+    xor    rcx, rdx
+    and    r10, rax
+    xor    r10, rcx
+    mov    [rbp-80+16], r10
+    mov    rcx, [rbp-80+24]
+    mov    rdx, rcx
+    and    rdx, rax
+    xor    rcx, rdx
+    and    r11, rax
+    xor    r11, rcx
+    mov    [rbp-80+24], r11
+%endmacro
+    CONDS
+    CONDS
+    CONDS
+
+    ; ---- store result ----
+    mov    rdi, [rbp-232]
+    mov    rax, [rbp-80+0]
+    mov    [rdi+0], rax
+    mov    rax, [rbp-80+8]
+    mov    [rdi+8], rax
+    mov    rax, [rbp-80+16]
+    mov    [rdi+16], rax
+    mov    rax, [rbp-80+24]
+    mov    [rdi+24], rax
+    add  rsp, 232
+    pop  rbp
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
 ; ----------------------------------------------------------------------------
 
 ; ----------------------------------------------------------------------------
