@@ -16,7 +16,7 @@ ARCH      := -arch=sm_120
 COMMON    := $(ARCH) -O3 -std=c++17 --expt-relaxed-constexpr
 ORACLE    := ../sha256.o ../bitcoin_hash.o
 
-.PHONY: all verify bench detect poc clean
+.PHONY: all verify bench detect poc audit clean
 
 all: verify bench detect
 
@@ -55,5 +55,14 @@ cuda_verify: cuda_verify.cu cuda_sha256.cu $(ORACLE)
 cuda_bench: cuda_bench.cu cuda_sha256.cu $(ORACLE)
 	$(NVCC) $(COMMON) -o $@ cuda_bench.cu cuda_sha256.cu $(ORACLE)
 
+# PLAN.md option A: bulk PoW / header-chain re-audit.  Re-computes block_hash
+# for every stored header in ONE CUDA sha256d batch (auto-fallback to asm) and
+# checks hash-match + PoW + chain-link across the whole stored chain.
+cuda_header_audit: cuda_header_audit.c cuda_autodetect.c $(ORACLE)
+	$(CC) -O2 -o $@ cuda_header_audit.c cuda_autodetect.c $(ORACLE) -ldl
+
+audit: libbmc_cuda.so cuda_header_audit
+	LD_LIBRARY_PATH=. ./cuda_header_audit ../headers.dat
+
 clean:
-	rm -f cuda_verify cuda_bench cuda_autodetect_test libbmc_cuda.so
+	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit libbmc_cuda.so
