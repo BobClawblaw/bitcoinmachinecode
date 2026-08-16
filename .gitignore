@@ -164,14 +164,13 @@ KANBAN.md
 **/KANBAN.md
 .kitchen/kanban/**
 
-# ---- outbound-mux soak scenario (t_5c05b606): run artifacts + the live store ----
-# The scenario sources (soak_profile.env, soak_start.sh, soak_monitor.py,
-# README.md, SOAK_EVIDENCE.md, soak_timeseries.csv) ARE tracked; only the
-# per-run output and the growing live archive are ignored.
-soak/logs/
-soak/run-*/
-soak/soak-analysis/
+# ---- outbound-mux soak scenario: fully removed from the repo/history ----
+# soak/, soak-store/, and the root files "4" and "6" were purged from all git
+# history. Ignore them outright so they can never be committed again.
+soak/
 soak-store/
+/4
+/6
 # Dev wallet + its separate secret file (regenerable via wallet_cli init)
 asm/config/wallet.dat
 asm/config/wallet.dat.pass
