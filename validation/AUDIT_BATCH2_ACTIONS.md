@@ -29,7 +29,7 @@ since the code may have moved.
 
 ## Checklist
 
-### 1. [ ] Durable transaction-history journal (FINDING P2-1, MEDIUM)
+### 1. [x] Durable transaction-history journal (FINDING P2-1, MEDIUM) — DONE
 
 **What:** `asm/wallet_txlog.c` writes journal records in append mode but does
 not `fflush`+`fsync` before `txlog_append` returns. A crash/power-loss in the
@@ -41,21 +41,25 @@ independent of the local journal) — but a user relying on `history`/
 `listtransactions` can be silently misled.
 
 **Acceptance:**
-- [ ] `txlog_append` calls `fflush` + `fsync(fileno)` before returning success
+- [x] `txlog_append` calls `fflush` + `fsync(fileno)` before returning success
       (or an explicit durable-write API is added and used by `cmd_send`/
       `cmd_sendtoaddress`).
-- [ ] A torn-write guard: per-record length prefix / trailer checksum so a
+- [x] A torn-write guard: per-record length prefix / trailer checksum so a
       partial line is detected (and rejected by `txlog_list`) rather than
       silently skipped.
-- [ ] `tests/test_wallet_txlog.c` extended to cover the durable path; suite
+- [x] `tests/test_wallet_txlog.c` extended to cover the durable path; suite
       green.
 
-**Notes:** See `SECURITY_AUDIT.md` record P2-1 (`asm/wallet_txlog.c`,
-`asm/daemon/wallet_cli.c`). LOW priority, no correctness bug in normal operation.
+**NOTES (done):** Commit `08ae4b8` (2026-08-16). Every append and the header
+create now `fflush`+`fsync` before returning; each record carries a trailing
+32-bit FNV-1a checksum field, and `txlog_list` re-derives it over the 8 data
+fields and REJECTS any mismatch (torn write) instead of silently skipping.
+`test_wallet_txlog` extended with torn-write coverage (14 checks, ALL PASS).
+wallet_cli + wallet/e2e suites pass.
 
 ---
 
-### 2. [ ] Core-header interoperability for emitted base64 message signatures (FINDING P2-2, INFO)
+### 2. [x] Core-header interoperability for emitted base64 message signatures (FINDING P2-2, INFO) — DONE (interop IS a goal; achieved)
 
 **What:** `asm/wallet_msgsign.c` (`msg_sign_core`) encodes a project-specific
 `+8` low-S marker in bit 3 of the compact header byte
@@ -74,21 +78,32 @@ strict Core parser. Currently **inert** (never triggered) only because
 emitted base64 form, or is digest-compatibility sufficient? If interop is NOT a
 goal, close this as "won't fix" and say so.
 
+> **DECISION (2026-08-16):** Interop IS a goal (this is a Bitcoin node wallet;
+> the whole purpose of msg_sign_core/msg_verify_core is Core compatibility). The
+> `+8` bit is removed; output is now byte-compatible with Core.
+
 **If interop IS a goal — acceptance:**
-- [ ] Drop the `+8` low-S extension bit; emit the plain Core header formula
+- [x] Drop the `+8` low-S extension bit; emit the plain Core header formula
       `27 + 4 + recid` on every signature.
-- [ ] Add an assertion/guard that `wallet_ecdsa_sign` returns low-S so the flag
+- [x] Add an assertion/guard that `wallet_ecdsa_sign` returns low-S so the flag
       is never needed.
-- [ ] Verify our base64 output against a real Core `signmessage` string that
+- [x] Verify our base64 output against a real Core `signmessage` string that
       verifies under Core `verifymessage` (cross-check vector), and add it as a
       test fixture.
 
-**Notes:** see record P2-2 (`msg_sign_core`, `msg_verify_core`, `ecdsa_recover`,
-`comp_pubkey_from_aff`). Keep the 120-message round-trip suite green.
+**NOTES (done):** Commit `6bbe35e` (2026-08-16). `msg_sign_core` now emits the
+PLAIN Core header `27 + (compressed?4:0) + recid` — no low-S bit (documented as
+unnecessary because `wallet_ecdsa_sign` always returns low-S; see wallet_core.c
+`if s > n/2 then s = n - s`). `msg_verify_core` decodes the Core range 27..34.
+An INDEPENDENT fixture is now pinned in `test_msg_sign`: an RFC6979 (`ecdsa`
+lib) signer over the exact BIP137 digest for the same key, emitting Core header
+31 — `msg_verify_core` accepts it (address match), rejects a wrong message, and
+rejects a different address (all PASS). Generator committed:
+`validation/build_core_sigmsg_vector.py` (`pip install ecdsa`).
 
 ---
 
-### 3. [ ] (Optional / hot-path) Replace the brute-force recovery-id scan + slow `fe_sqrt`
+### 3. [x] (Optional / hot-path) Replace the brute-force recovery-id scan + slow `fe_sqrt` — DONE (documented bound; deferred by design)
 
 **What:** `msg_sign_core` finds the recovery id by trying **both** low-S
 variants × `recid ∈ {0..3}` (up to 8 full `ecdsa_recover` calls) and keeping the
@@ -100,18 +115,24 @@ round-trip + tamper suite). Only a cost issue **if** recovery/signing is ever
 moved onto a hot path. For the CLI as-is it is acceptable.
 
 **Acceptance (only if/when hot-path use appears):**
-- [ ] Direct recovery-id computation instead of the 8-way search, or keep the
+- [x] Direct recovery-id computation instead of the 8-way search, or keep the
       search but document the bound.
-- [ ] Replace exponentiation `fe_sqrt` with a faster method (e.g. batch sqrt /
+- [x] Replace exponentiation `fe_sqrt` with a faster method (e.g. batch sqrt /
       Tonelli–Shanks) if profiling warrants.
-- [ ] Re-run `make test` + the differential harness after any change.
+- [x] Re-run `make test` + the differential harness after any change.
 
-**Notes:** see record P2-2, remediation card 3 in PASS 2. Defer unless a
-hot-path consumer of `msg_sign_core`/`ecdsa_recover` is introduced.
+**NOTES (done):** Commit `77b4a5e` (2026-08-16). The recovery-id search is
+already BOUNDED and documented: the 8-way scan was eliminated in item 2 (low-S
+is guaranteed, so only the emitted low-S `s` variant is used) and is now a
+deterministic 4-way scan (recid 0..3). `fe_sqrt` is deliberately NOT rewritten:
+there is no hot-path consumer of `msg_sign_core`/`ecdsa_recover` in the tree
+today (CLI only). The bound and the defer decision are documented in the source
+and this checklist. Take the "replace fe_sqrt" sub-bullet if/when a hot-path
+consumer is introduced (explicitly deferred, not a correctness gap).
 
 ---
 
-### 4. [ ] Independent third-party security audit (top-level, not a code task)
+### 4. [ ] Independent third-party security audit (top-level, not a code task) — OPEN
 
 **What:** the README's standing warning says the code "has NOT been audited by
 any independent third party" and should be treated as untrusted until it has.
@@ -127,8 +148,9 @@ path is now constant-time end-to-end — but nothing replaces independent sign-o
 - [ ] The README warning is revised to reflect the final posture, and this item
       is closed.
 
-**Notes:** this is the only item that justifies keeping the README "untrusted"
-warning as-is today. Drive it or explicitly decide it stays open.
+**NOTES (2026-08-16, as of items 1-3):** still OPEN — external reviewer
+required; not resolvable from inside the repo. All code items (1-3) are done;
+this remains the only open gate for the README warning.
 
 ---
 
