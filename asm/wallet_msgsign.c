@@ -459,7 +459,18 @@ int msg_sign_core(const unsigned char priv_be[32], const char* message,
      * header (low-S is a signing policy, and recovery operates on the exact s
      * emitted), so we do NOT carry one either: recovery against the emitted
      * low-S `s` is the only variant possible. recid is found by trying 0..3
-     * and keeping the one that recovers the signer's own pubkey. */
+     * and keeping the one that recovers the signer's own pubkey.
+     *
+     * COMPLEXITY NOTE (audit FINDING P2-2 / batch-2 item 3): the recovery-id
+     * search is a deterministic, BOUNDED 4-way scan (recid 0..3) only -- no
+     * 8-way n-s/variant search remains (low-S is guaranteed, so one variant
+     * suffices). This is acceptable for the CLI. ecdsa_recover's sqrt uses
+     * exponentiation a^((p+1)/4) (~256 field ops) -- correct (validated by
+     * test_msg_sign round-trips) but slow. It is deliberately NOT replaced
+     * with a faster method because there is NO hot-path consumer of
+     * msg_sign_core/ecdsa_recover in the tree today (CLI only). If a hot-path
+     * consumer is ever added, revisit (documented in
+     * validation/AUDIT_BATCH2_ACTIONS.md item 3). */
     uint64_t Qx[4], Qy[4];
     int rec = -1;
     for (int i = 0; i < 4 && rec < 0; i++) {
