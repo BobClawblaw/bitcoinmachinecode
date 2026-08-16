@@ -263,7 +263,8 @@ def main():
             # Core verdict on identical bytes.
             cw = core.submitblock(mb.hex())
             # Core reject classification:
-            #   bare string ("" -> 'null', else reject reason) = accepted/rejected
+            #   bare string ("" -> 'null', 'duplicate'/else reject reason)
+            #   'duplicate' = block already known by header hash = ACCEPT
             #   dict with error -22 'Block decode failed' = rejected at decode
             #   dict with other error = RPC-level failure (treat as rejected:
             #     the bytes were never accepted into a block)
@@ -271,8 +272,8 @@ def main():
                 core_reject = True
                 core_verdict = 'core-rpc-error'
             else:
-                core_verdict = '' if cw in (None, 'null', '') else cw
-                core_reject = bool(cw) and cw not in ('null', '')
+                core_verdict = '' if cw in (None, 'null', '', 'duplicate') else cw
+                core_reject = bool(cw) and cw not in ('null', '', 'duplicate')
             asm_reject = (aw['ok'] == 0)
             record = {'h': H, 'mut': name, 'asm_reject': asm_reject,
                       'core_reject': core_reject, 'core_verdict': core_verdict}
