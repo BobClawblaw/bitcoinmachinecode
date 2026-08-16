@@ -75,5 +75,21 @@ cuda_txid_reindex: cuda_txid_reindex.c cuda_autodetect.c ../sha256.o ../bitcoin_
 reindex: libbmc_cuda.so cuda_txid_reindex
 	LD_LIBRARY_PATH=. ./cuda_txid_reindex ../data/blk00000.dat
 
+# PLAN.md option D: secp256k1 ECDSA BATCH verify.  Full field/scalar/point math
+# in CUDA (cuda_ecdsa_math.h).  Per-thread ECDSA verify: computes s^-1 (mod n),
+# u1,u2, R=u1*G+u2*Q, accepts iff R.x mod n == r.  Validated bit-exact vs the
+# host oracle on the asm ecdsa_verify official vectors AND an independent
+# Python-verified signature (a 512-wide batch: GPU == host == expected).
+cuda_ecdsa_verify: cuda_ecdsa_verify.cu cuda_ecdsa_math.h
+	$(NVCC) $(COMMON) -o $@ cuda_ecdsa_verify.cu
+
+verify_ecdsa: cuda_ecdsa_verify
+	./cuda_ecdsa_verify
+
+# CPU-only cross-check: the same math compiled for the host, run against the
+# repo's official asm-oracle ECDSA test vectors.  Must report fails=0.
+ecdtest: ecdtest.c cuda_ecdsa_math.h
+	$(CC) -O2 -I. -o $@ ecdtest.c
+
 clean:
-	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit cuda_txid_reindex libbmc_cuda.so
+	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit cuda_txid_reindex cuda_ecdsa_verify ecdtest libbmc_cuda.so

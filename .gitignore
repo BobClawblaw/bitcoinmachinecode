@@ -51,6 +51,10 @@ asm/cuda/cuda_verify
 asm/cuda/cuda_bench
 asm/cuda/cuda_autodetect_test
 asm/cuda/libbmc_cuda.so
+asm/cuda/cuda_header_audit
+asm/cuda/cuda_txid_reindex
+asm/cuda/cuda_ecdsa_verify
+asm/cuda/ecdtest
 asm/daemon/crawler
 asm/daemon/addrgather
 asm/daemon/merge_only

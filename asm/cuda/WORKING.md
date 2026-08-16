@@ -274,3 +274,60 @@ Rebuild/run from this directory:
 
 Note: `make all` needs the assembly oracle objects; they are produced by
 `make asm` in `/storage/bitcoinmachinecode/asm`.
+
+---
+
+## 9. Option A / B / D auditors and re-index tools (delivered)
+
+Beyond the SHA batch PoC, this directory now holds the PLAN.md options A, B and
+the ECDSA half of D as standalone audit/re-index tools. **All four are
+validated on real data**; none change hot-path node code.
+
+- **Option A — bulk PoW/header re-audit** (`cuda_header_audit.c`): reads the
+  stored header store (`../headers.dat`, 112-byte `[80 header][32 hash]`
+  records), computes every block hash in ONE `bmc_sha256d_batch` call, and
+  validates hash-match, PoW, and chain-link. Ran on all 582,000 real mainnet
+  headers: **0 anomalies**; all 582k hashes computed in **0.083 s** (CUDA).
+- **Option B — cross-block txid re-index** (`cuda_txid_reindex.c`): parses real
+  `blk%05d.dat` framings, strips witness, densely packs every unwitnessed tx
+  into ONE sha256d batch, recomputes txids, and validates each block's merkle
+  root against its header plus an externally-anchored real-txid check. Ran on
+  six real block files: **1,511,751 txs / 1,189 blocks, 1189 merkle OK / 0
+  bad**, GPU bit-exact vs python-hashlib on a real coinbase. Landmines found &
+  fixed in PLAN.md (dense packing, `{offset,len}` idx pairs, no asm-abided CUDA
+  main -> portable C sha oracle).
+- **Option D (ECDSA half) — secp256k1 ECDSA BATCH verify**
+  (`cuda_ecdsa_verify.cu` + `cuda_ecdsa_math.h`): a per-thread GPU ECDSA
+  verifier for offline signature audit. Full secp256k1 field/scalar/point math
+  in CUDA (no asm dependency). The math was the hard part and is validated to
+  bit-exactness: 4000/4000 random `a*b mod p/mod n` vs python ints, inversion
+  identity `Z·Z^-1≡1`, known-point goldens (`kG` for 1,2,3,5,7,11 and `G+G=2G`
+  vs python), and the ECDSA verify itself matches the repo's asm `ecdsa_verify`
+  oracle on **all 8 official test vectors** plus an independently python-verified
+  random signature. GPU gate (`make verify_ecdsa`): 32/32 official vectors and
+  a 512-wide known-vector batch, **every GPU result == host == expected**.
+  Host-only cross-check: `make ecdtest` (must print fails=0).
+
+Key lessons from implementing D (all the subtle bugs, for the record):
+ 1. The correct Jacobian doubling (curve a=0) Y3 term is `E·(D-X3) - 8·C` —
+    NOT `4·E·(D-X3) - 8·C`. Adding the spurious ×4 made 2G's y land off-curve;
+    removing it gave the on-curve `1ae168fe…` matching every public reference.
+ 2. `(p-1)² mod p ≡ 1` and `(n-1)² mod n ≡ 1` were the canonical edge checks;
+    catching them exposed reduction defects no random differential hit.
+ 3. Quotient bound is 2^257, so the long-division reduction MUST iterate
+    `k = 256..0` (an `M<<256` term is reachable, e.g. `(2^256-1)² mod n`), and
+    all compare/subtract/shift must run on 9 limbs, not 8.
+ 4. Hand-rolled big-int subtract where `pre = b[i]+br` can overflow a limb to
+    zero and silently drop the borrow — compute underflow via `a[i]<br` and
+    `(a[i]-br)<b[i]` instead.
+ 5. Gx/Gy (and any curve point passed in) must be in little-endian limb order:
+    `{…, 0x79BE667E…, 0x59F2815B…}` with the least-significant limb FIRST. I
+    reversed them twice and got clean-but-wrong points.
+ 6. Jacobian mixed-add degenerates on self-add / negation; add infinity and
+    self-add (double) guards.
+
+Reviewer note: this is correctness-first, deliberately un-optimized (per-thread
+256-bit long-division reduction + Fermat inversions), matching the repo's audit
+stance. GPU speedup is secondary for an offline tool; the SHA batch (A/B) is the
+performance-relevant path. Schnorr batch verify remains future work.
+
