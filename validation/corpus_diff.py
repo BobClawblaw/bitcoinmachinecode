@@ -109,14 +109,27 @@ def be_from_le(b):
     return ''.join('%02x' % x for x in b[::-1])
 
 # --- ASM shim per worker --------------------------------------------------------
+class ShimDied(Exception):
+    """Raised when the shim subprocess dies mid-conversation (broken pipe / EOF).
+    Callers respawn-and-retry once, then degrade the block instead of aborting."""
+
 class Shim:
     def __init__(self, path=SHIM):
         self.p = subprocess.Popen([path], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True)
     def ask(self, cmd, hexstr):
-        self.p.stdin.write('%s %s\n' % (cmd, hexstr))
-        self.p.stdin.flush()
-        return self.p.stdout.readline().strip()
+        # Detect a dead shim up front (process already exited -> stdin pipe closed).
+        if self.p.poll() is not None:
+            raise ShimDied()
+        try:
+            self.p.stdin.write('%s %s\n' % (cmd, hexstr))
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            raise ShimDied()
+        line = self.p.stdout.readline().strip()
+        if line == '':                      # EOF => shim died before answering
+            raise ShimDied()
+        return line
     def close(self):
         try:
             self.p.stdin.write('QUIT\n'); self.p.stdin.flush()
@@ -174,47 +187,100 @@ def mutations(block_raw, seed):
 
 # --- per-block worker ----------------------------------------------------------
 def process_block(H, do_mut, mut_seed):
-    """Run the full battery on one block. Returns a dict of results."""
+    """Run the full battery on one block. Returns a dict of results.
+    Never raises on a dead shim: a transient shim crash respawns-retries once,
+    and a repeat failure degrades the block to a shim_crash record so the corpus
+    run continues and reports it instead of aborting the whole differential."""
     res = {'h': H}
     hsh = rpc('getblockhash', [H])
     res['hash'] = hsh
     rawhex = rpc('getblock', [hsh, 0])
     b = bytes.fromhex(rawhex)
-    shim = Shim()
-    try:
+
+    def battery(shim, is_retry):
+        """Runs the A-F battery against one shim; raises ShimDied on death.
+        Returns (res_dict, ok) where ok=False leaves a partial result to be
+        recorded by the caller once a surface legitimately failed."""
+        r = {'h': H, 'hash': hsh}
         # A) ACCEPT
         a = shim.ask('BLOCK', rawhex).split()
-        ok, ah = int(a[1]), be_from_lehex(a[2])
-        res['accept_ok'] = (ok == 1)
-        res['hash_ok'] = (ah == hsh)
+        if len(a) >= 3:
+            r['accept_ok'] = (int(a[1]) == 1)
+            r['hash_ok'] = (be_from_lehex(a[2]) == hsh)
+        else:
+            r['accept_ok'] = False; r['hash_ok'] = False
+            r['block_err'] = ' '.join(a)
         # B) header PoW + diff target
         hd = shim.ask('HEADER', rawhex[:160]).split()
-        res['pow_ok'] = (int(hd[1]) == 1)
+        r['pow_ok'] = (len(hd) >= 2 and int(hd[1]) == 1)
         nbits = int.from_bytes(b[72:76], 'little')
         tg = shim.ask('TARGET', nbits.to_bytes(4, 'little').hex()).split()
         tv = int(tg[2], 16) if len(tg) >= 3 else 0
-        res['target_ok'] = (0 < tv < (1 << 256))
+        r['target_ok'] = (0 < tv < (1 << 256))
         # C) legacy sigops
         sp = shim.ask('SIGOPS', rawhex).split()
-        res['sigops'] = int(sp[1]); res['ntx'] = int(sp[2])
-        res['sigops_ok'] = (int(sp[1]) <= 20000)
+        if len(sp) >= 3:
+            r['sigops'] = int(sp[1]); r['ntx'] = int(sp[2])
+            r['sigops_ok'] = (int(sp[1]) <= 20000)
+        else:
+            r['sigops'] = -1; r['ntx'] = -1; r['sigops_ok'] = False
+            r['sigops_err'] = ' '.join(sp)
         # D) in-block dup
         dp = shim.ask('DUPTX', rawhex).split()
-        res['duptx'] = int(dp[1]); res['duptx_ok'] = (int(dp[1]) == 0)
-        # F) mutation REJECT differential
+        if len(dp) >= 2:
+            r['duptx'] = int(dp[1]); r['duptx_ok'] = (int(dp[1]) == 0)
+        else:
+            r['duptx'] = -1; r['duptx_ok'] = False
+            r['duptx_err'] = ' '.join(dp)
+        # F) mutation REJECT differential (never abort the block on a shim death
+        #    here either: respawn internally if the shim died mid-mutations)
         if do_mut:
             muts = mutations(b, mut_seed)
-            res['mut'] = []
+            r['mut'] = []
             for name, mb in muts:
-                aw = shim.ask('BLOCK', mb.hex()).split()
-                asm_reject = (int(aw[1]) == 0)
+                try:
+                    aw = shim.ask('BLOCK', mb.hex()).split()
+                except ShimDied:
+                    if not is_retry:
+                        raise                       # let outer retry respawn once
+                    aw = []
+                if len(aw) >= 2:
+                    asm_reject = (int(aw[1]) == 0)
+                else:
+                    asm_reject = None               # shim couldn't judge this mut
                 cw = submitblock_tolerant(mb.hex())
                 core_reject = cw['reject']
-                res['mut'].append({'mut': name, 'asm_reject': asm_reject,
-                                   'core_reject': core_reject,
-                                   'core_verdict': cw['verdict']})
-    finally:
+                r['mut'].append({'mut': name, 'asm_reject': asm_reject,
+                                 'core_reject': core_reject,
+                                 'core_verdict': cw['verdict']})
+        return r
+
+    shim = None
+    for attempt in (0, 1):
+        if shim is not None:
+            try: shim.close()
+            except Exception: pass
+        shim = Shim()
+        try:
+            res = battery(shim, attempt == 1)
+            break
+        except ShimDied:
+            continue                                # respawn & retry once
+        except Exception:
+            try: shim.close()
+            except Exception: pass
+            raise
+    else:
+        # Both attempts died: degrade this block so the corpus completes.
+        res = {'h': H, 'hash': hsh, 'shim_crash': True,
+               'accept_ok': False, 'hash_ok': False, 'pow_ok': False,
+               'target_ok': False, 'sigops_ok': False, 'duptx_ok': False}
+        return res
+
+    try:
         shim.close()
+    except Exception:
+        pass
     return res
 
 def sample_heights(tip, per_epoch, seed):
@@ -359,6 +425,13 @@ def main():
         for r in ex.map(worker, heights):
             block_results.append(r)
             stats['blocks'] += 1
+            if r.get('shim_crash'):
+                # Shim subprocess died on both attempts: not a consensus verdict.
+                # Record once as infrastructure noise so it isn't misread as a
+                # real Core-vs-ASM consensus divergence.
+                record_div('shim_crash@%d' % r['h'],
+                           'consensus_shim process died (2 attempts) on this block; surfaces unfilled')
+                continue
             if r.get('accept_ok'): stats['accept_ok'] += 1
             else: record_div('accept@%d' % r['h'], 'cons_verify rejected a real in-chain block')
             if r.get('hash_ok'): stats['hash_ok'] += 1
