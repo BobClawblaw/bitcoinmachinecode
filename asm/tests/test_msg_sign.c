@@ -85,9 +85,8 @@ int main(void){
     ck("core verify wrong message -> 0", msg_verify_core(addr, "hello worm", sigb64), 0);
 
     /* ---- Core round-trip across many messages over a fixed key ---- */
-    /* Exercises every recovery-id and both low-s states that the header can
-     * carry, locking in the (non-colliding) low-s bit encoding. Mirrors the
-     * Core verifymessage flow: recover pubkey from sig+msg, match its hash160
+    /* Exercises every recovery-id the header can carry. Mirrors the Core
+     * verifymessage flow: recover pubkey from sig+msg, match its hash160
      * against the owning P2PKH. */
     {
         int bad = 0, n = 0;
@@ -104,6 +103,30 @@ int main(void){
         }
         ck("core 120-msg recoverable round-trip + tamper reject", bad == 0, 1);
         printf("  (%d messages signed+verified)\n", n);
+    }
+
+    /* ---- INDEPENDENT Core-format vector (byte-level interop, FINDING P2-2) ----
+     * Produced by an independent RFC6979 signer (ecdsa lib, sign_digest over
+     * the BIP137 digest; see validation/build_core_sigmsg_vector.py) for the
+     * SAME fixed key 0x01..0x20. It emits the Core compact header
+     * 27+4+recid = 31 (compressed, recid 0), so a Core parser would accept it.
+     * msg_verify_core must recover this signature's pubkey and match our
+     * address -> PROOFS we verify a genuine non-self-produced Core signature. */
+    {
+        const char* core_msg = "Core-interop hello from libsecp256k1";
+        const char* core_sig =
+            "H3whTeDv9zJycufNQMJcO8ElAAqW0UwWxl+k/QJKRFf8AgYtfjtEgPrHeeD+bFHU1nxH3ssB8hDE38K7u8ETTF8=";
+        const char* core_addr = "194sjtY7LtC3P886FTepA5Q42VGqrwTK86";
+        ck("interop: independent Core-format sig verifies (address match)",
+           msg_verify_core(core_addr, core_msg, core_sig), 1);
+        ck("interop: wrong message on Core sig -> 0",
+           msg_verify_core(core_addr, "Core-interop hello from libsecp256k1x", core_sig), 0);
+        /* the same Core sig must NOT verify against a different address */
+        char oth[64];
+        extern int wallet_address(char out[64], const unsigned char priv_be[32]);
+        unsigned char priv2[32]; for (int i=0;i<32;i++) priv2[i]=(unsigned char)(0x40+i);
+        wallet_address(oth, priv2);
+        ck("interop: Core sig rejects a different address", msg_verify_core(oth, core_msg, core_sig), 0);
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
