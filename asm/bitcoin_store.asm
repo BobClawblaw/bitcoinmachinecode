@@ -66,6 +66,9 @@ MAX_FILE equ 0x08000000      ; 128 MiB per blk file (Bitcoin MAX_BLOCKFILE_SIZE)
 ; helpers (file-name formatting + open by number)
 ;   fmt_blkname(buf12, file_no): writes "blk%05u.dat" (12 bytes incl NUL) to buf
 ; ============================================================================
+; fmt_blkname is exported so bitcoin_store_fast.asm's read-fd cache can build
+; the same filenames without duplicating the formatter.
+global fmt_blkname
 fmt_blkname:                 ; rdi=buf(>=13), esi=file_no
     push rbp
     mov  rbp, rsp
@@ -372,20 +375,19 @@ store_get_at:
     mov  eax, [r12+48]       ; prune_height
     cmp  r13d, eax
     jl   .pruned
-    ; seek index to height*48, read 48
+    ; ---- read the 48-byte index record at height*48 with ONE pread ----
+    ; Was lseek(idx_fd, h*48) + read(48). pread halves the syscall count and,
+    ; more importantly, does not touch idx_fd's shared file offset -- which is
+    ; what makes concurrent readers safe. Nothing else in the tree depends on
+    ; the index fd's offset being left anywhere in particular.
+    ; pread64(rdi=fd, rsi=buf, rdx=count, r10=offset)
     mov  rax, r13
     imul rax, 48
     mov  rdi, [r12+8]
-    mov  rsi, rax
-    xor  edx, edx
-    mov  eax, 8
-    syscall
-    test rax, rax
-    jl   .err
-    mov  rdi, [r12+8]
     lea  rsi, [rbp-0x78]
     mov  edx, 48
-    xor  eax, eax
+    mov  r10, rax
+    mov  eax, 17              ; pread64
     syscall
     cmp  rax, 48
     jne  .err
