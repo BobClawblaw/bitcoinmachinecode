@@ -464,6 +464,51 @@ forward pass and the early-height backfill converge, the archive reaches **block
 (the 2009 genesis block)** upward — `verify` on contiguous runs reports 100%
 hash-match / chain-link / PoW / consensus (`CHAIN VERIFIED`).
 
+- **Wallet message signing / verification** (`asm/wallet_msgsign.c`,
+  `asm/daemon/wallet_cli.c`) — `signmessage <priv_hex> <message>` and
+  `verifymessage <pub_hex|address> <message> <sig>` using only the verified asm
+  crypto. Two encodings, both over the byte-exact BIP137 digest
+  (double-SHA256 of `"\x18Bitcoin Signed Message:\n" || varint || msg`): a plain
+  `r||s` hex form (verify against a pubkey), and a **Core-compatible recoverable**
+  form (`msg_sign_core`/`msg_verify_core`) that emits the 65-byte base64 compact
+  signature `[27+4+recid(+low-s bit)]||r||s` via hand-rolled ECDSA **public-key
+  recovery** (recid search over the asm `fe`/`point`/`scalar` primitives) and
+  verifies from an **address alone** — the exact Core `verifymessage` flow.
+  Pinned by `tests/test_msg_sign.c`: 120-message recoverable round-trip +
+  tamper reject + wrong-message reject (all recovery-ids and both low-s states).
+- **Persistent transaction history journal** (`asm/wallet_txlog.c`) —
+  `wallet_cli history` / `listtransactions` render an append-only, versioned,
+  own-format journal (BMCTX v1, 0600 perms, one record per sent tx: ts, txid,
+  amount, fee, dest-h160, inputs, rawlen). `cmd_send`/`cmd_sendtoaddress` record
+  each sent tx; `test_wallet_txlog` (11 checks) covers path derivation, perms,
+  versioned header, list round-trip and append-only behavior.
+- **Fast block store read path** (`asm/bitcoin_store_fast.asm`,
+  `asm/bench_store_read.c`) — cuts the per-block serve cost from six syscalls to
+  two (positioned `pread` of index + body via a direct-mapped 8-slot read-only fd
+  cache), and to zero-copy via a guarded `mmap` path (`store_map_*`) with
+  remap-on-growth and SIGBUS-past-EOF protection. Verified byte-exact vs the old
+  path on 4000 blocks incl. random-access, mmap, append-while-mapped remap; ~1.1x
+  (pread) and ~2.1x (mmap) at page-cache speeds. Removes the shared-index-fd
+  race making concurrent reads safe; `store_prune_safe` invalidates both caches
+  before unlink.
+- **Security audit status** (`validation/SECURITY_AUDIT.md`) — two completed
+  audit passes, 2026-08-15 (PASS 1) and 2026-08-16 (PASS 2), of the assembly
+  crypto + consensus + wallet core, following an internal line-by-line review
+  method and backed by regression harnesses committed to the suite.
+  - PASS 1 findings all **FIXED**: the CRITICAL non-constant-time signing path
+    (FINDING 1 — fixed via a constant-time `point_scalar_mul_ct` repointed onto
+    the two secret-scalar call sites; field arithmetic made branch-free per
+    FINDING 3), and the legacy-sighash out-of-bounds read / write-cap defects
+    (FINDING 2 / 2b, both with `test_sighash_oob.c` regression).
+  - PASS 2 (2026-08-16, post-delta review) found **no new CRITICAL or HIGH**
+    issue across the newest crypto/networking surfaces; two hardening items are
+    recorded as open (INFO/LOW — journal durability, recovery-scan efficiency /
+    Core-header extension bit).
+  - With FINDING 1 fully landed the **signing path is constant-time
+    end-to-end**. The README warning above remains because the code has not
+    undergone an *independent third-party* audit; the internal audit is complete,
+    tracked in-repo, and green.
+
 ## Layout
 
 ```
