@@ -514,8 +514,17 @@ against Core — feed the same real mainnet blocks/txs and compare every verdict
 byte-for-byte for consensus, validation, mempool acceptance, and CLI/RPC
 responses. "100% compatible" is reached only when the ASM result equals Core's
 on the shared inputs and divergences are zero. The harness that does this for
-the consensus/validation surface is `validation/consensus_diff.py` (built in
-t_67a30097); mempool-acceptance and CLI/RPC surfaces are separately
+the consensus/validation surface is `validation/corpus_diff.py` (scaled up from
+`consensus_diff.py`, built in t_67a30097): a re-runnable, epoch-stratified
+~8,900-block real-mainnet differential across the WHOLE chain (genesis, pre-BIP16,
+BIP16, segwit, taproot + boundaries) covering ACCEPT / block-hash / header-PoW /
+diff-target / legacy-sigop-limit / in-block-dup / TXID / mutation-REJECT
+surfaces vs a live fully-synced Core. The large corpus exposed and fixed a real
+`consensus_shim` bug (its 4MB hex line buffer truncated any block > 2 MB, so
+cons_verify rejected 13 real taproot-era >2MB blocks — now fixed with 8MB
+buffers and re-verified green), plus a `submitblock` `duplicate`-verdict
+(accept, not reject) labeling fix. Final report: `validation/corpus_diff_report.json`.
+mempool-acceptance and CLI/RPC surfaces are separately
 differentially verified against real Core by their dedicated cards
 (t_84752b9b, t_0ca5d72e/t_8e5be37f).
 
@@ -524,5 +533,37 @@ drivers: the full script interpreter incl. tapscript, taproot/segsig validation,
 the full wallet-cli/RPC surface, and bit-exact consensus on mainnet edge cases.
 Rate is unproven (we are one card into a five-card batch); revisit the day
 estimate once 3-5 cards have measured durations.
+
+### 12. DEFERRED — CUDA batch-acceleration tier (DO NOT START UNTIL NODE CARDS ARE CLEAR)
+
+NOT on the live kanban board. Left deliberately un-started to avoid interrupting
+running kanban tasks (per KANBAN convention: half-done work must not be
+dispatched while cards tick). The CUDA accelerator itself is already committed
+and pushed to main (`24da54b`, `asm/cuda/`) — see `asm/cuda/WORKING.md` for the
+full analysis/roadmap. What is recorded here is only the REMAINING integration
+step, for later.
+
+What exists (done, verified, committed):
+- Batched SHA-256 / SHA-256d kernel + opaque host ABI (`cuda_sha256.cu/.h`).
+- Runtime auto-detect + CPU-fallback dispatcher `bmc_sha256d_batch`
+  (`cuda_autodetect.c`): uses CUDA only when device present AND batch >= 512 AND
+  not BMC_CUDA=0; otherwise bit-exact fallback to the proven asm `sha256d`.
+- Correctness gate vs the asm oracle (FIPS vectors + all padding edges + 10,000
+  randoms, 0 failures); routing/digest matrix `cuda_autodetect_test`; benchmark
+  ~17-18x GPU/CPU at N=1M on RTX 5090, CPU wins below ~100.
+
+What is DEFERRED (do later, NOT now):
+- Tier 1: wire `bmc_sha256d_batch` into the assembly node path (bitcoind.asm /
+  bitcoin_hash.asm) behind a runtime probe, mirroring the CPUID->SHA-NI seam.
+  Single-hash call sites (pow_check, per-tx mempool, getblockhash) stay on CPU.
+- Tier 2 (bigger): secp256k1 ECDSA/Schnorr VERIFY as a CUDA batch verifier —
+  the real IBD consensus hot path — validated against the secp256k1 oracle/corpus
+  (one warp/lane per input).
+- Tier 3: batch HMAC/BIP32/BIP39 key-derivation; hash160/utxo index building.
+- Gate before it may serve consensus data: full mainnet IBD differential
+  (hash-for-hash vs the CPU path) in CI, per this project's audit stance.
+
+Trigger to start: when the active node-completion kanban batch reaches a clean
+state and a worker is free. Until then, ignore asm/cuda entirely.
 
 ===== END PLAN =====
