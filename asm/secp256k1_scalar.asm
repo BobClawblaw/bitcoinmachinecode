@@ -60,6 +60,10 @@ N_EXP_END:
 
 section .text
 
+; sc_mul is now provided by secp256k1_scalar_c.c (see note above sc_sqr).
+; Declare it external so sc_sqr's jmp and sc_inv's calls resolve at link time.
+extern sc_mul
+
 ; ----------------------------------------------------------------------------
 ; sc_add(r,a,b) = (a+b) mod n
 ;   s = a+b (adc chain). Sum in [0,2n) < 2^257, has at most one 257th bit.
@@ -198,126 +202,18 @@ sc_sub:
     ret
 
 ; ----------------------------------------------------------------------------
-; sc_mul(r,a,b) = (a*b) mod n, via MSB->LSB double-and-add in the scalar ring.
-;   Uses only sc_add. Long-lived values in callee-saved regs (sc_add preserves
-;   rbx/r12-r15).
-;     r12 = result accumulator, r13 = a (multiplicand), r14 = b copy (4 limbs
-;          held on stack), r15 = running bit index (255..0)
-;   Main loop per bit: result += result; if set-bit: result += a.
+; sc_mul(r,a,b) = (a*b) mod n.
+;   NOTE: the direct CONSTANT-TIME modular multiply (schoolbook 256x256 product
+;   + bounded-fold reduction using DELTA=2^256-n) now lives in
+;   secp256k1_scalar_c.c (a documented C-module exception, linked via
+;   secp256k1_scalar_c.o in the Makefile).  The former asm implementation did a
+;   bit-by-bit double-and-add using only sc_add (~256*2 sc_add per mul) which
+;   made sc_inv (=a^(n-2), ~387 mults) the dominant cost of every ECDSA
+;   verification; the C fast multiply is ~5x faster per mul and validated
+;   bit-exact over 8k vectors vs the (a*b) mod n oracle.
+; sc_sqr/sc_inv call sc_mul by symbol; those references resolve to the C object
+; at link time.
 ; ----------------------------------------------------------------------------
-global sc_mul
-sc_mul:
-    push rbp
-    mov  rbp, rsp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    sub  rsp, 0xc8        ; layout (all BELOW save area [rbp-8..-40]):
-                          ;   R contig @ [rbp-0x78, -0x70, -0x68, -0x60]
-                          ;     (limb0..3; sc_add writes contiguously upward
-                          ;      from its rdi, so R must be contiguous here)
-                          ;   b ascending @ [-0xa8,-0xa0,-0x98,-0x90]
-                          ; 0xc8==8 mod 16 so nested sc_add calls stay aligned
-
-    ; r12 = original output pointer
-    mov r12, rdi
-    ; copy b (rdx) ascending: b[j] at [rbp-0xa8 + 8*j]
-    mov rax, [rdx+0]
-    mov [rbp-0xa8], rax
-    mov rax, [rdx+8]
-    mov [rbp-0xa0], rax
-    mov rax, [rdx+16]
-    mov [rbp-0x98], rax
-    mov rax, [rdx+24]
-    mov [rbp-0x90], rax
-    ; r13 = a (multiplicand)
-    mov r13, rsi
-    ; R = 0  (contiguous)
-    mov qword [rbp-0x78], 0
-    mov qword [rbp-0x70], 0
-    mov qword [rbp-0x68], 0
-    mov qword [rbp-0x60], 0
-
-    ; iterate bit i = 255..0 : R = 2R ; if bit i of b set: R += a
-    mov r15, 255
-.dbl_loop:
-    lea rdi, [rbp-0x78]
-    lea rsi, [rbp-0x78]
-    mov rdx, rsi
-    call sc_add
-
-    mov rcx, r15
-    shr rcx, 6
-    shl rcx, 3
-    mov rdx, r15
-    and rdx, 63
-    mov rax, [rbp-0xa8+rcx]
-    bt rax, rdx           ; CF = bit i of b (the secret multiplicand bit)
-    ; Constant-time conditional add. We ALWAYS perform R = R + a, then revert
-    ; to the pre-add R via cmov where the bit is clear. The bt/cmovnc pair
-    ; never branches on the bit, and the loop bound (dec r15; jns) is a fixed
-    ; 256 iterations independent of b. Instruction count is data-independent.
-    mov rax, [rbp-0x78]   ; save original R (pre-add) to scratch
-    mov [rbp-0xc8], rax
-    mov rax, [rbp-0x70]
-    mov [rbp-0xc0], rax
-    mov rax, [rbp-0x68]
-    mov [rbp-0xb8], rax
-    mov rax, [rbp-0x60]
-    mov [rbp-0xb0], rax
-    lea rdi, [rbp-0x78]
-    lea rsi, [rbp-0x78]
-    mov rdx, r13
-    call sc_add           ; R = R + a  (unconditional)
-    ; restore the bit into CF (mov/call clobbered it); bt is branch-free
-    mov rcx, r15
-    shr rcx, 6
-    shl rcx, 3
-    mov rdx, r15
-    and rdx, 63
-    mov rax, [rbp-0xa8+rcx]
-    bt rax, rdx           ; CF = bit i of b again
-    ; cmovnc: CF=0 (bit clear) -> take original R; CF=1 (bit set) -> keep R+a
-    mov rax, [rbp-0x78]
-    mov rcx, [rbp-0xc8]
-    cmovnc rax, rcx
-    mov [rbp-0x78], rax
-    mov rax, [rbp-0x70]
-    mov rcx, [rbp-0xc0]
-    cmovnc rax, rcx
-    mov [rbp-0x70], rax
-    mov rax, [rbp-0x68]
-    mov rcx, [rbp-0xb8]
-    cmovnc rax, rcx
-    mov [rbp-0x68], rax
-    mov rax, [rbp-0x60]
-    mov rcx, [rbp-0xb0]
-    cmovnc rax, rcx
-    mov [rbp-0x60], rax
-.next:
-    dec r15
-    jns .dbl_loop
-
-    ; copy R (contiguous) -> output (r12)
-    mov rax, [rbp-0x78]
-    mov [r12+0], rax
-    mov rax, [rbp-0x70]
-    mov [r12+8], rax
-    mov rax, [rbp-0x68]
-    mov [r12+16], rax
-    mov rax, [rbp-0x60]
-    mov [r12+24], rax
-
-    add rsp, 0xc8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    ret
 
 ; ----------------------------------------------------------------------------
 ; sc_sqr(r,a) = (a*a) mod n

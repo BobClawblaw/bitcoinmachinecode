@@ -14,7 +14,7 @@ NASMFLAGS  := -f elf64
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
 
-OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o
+OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o
 # BIP152 compact blocks (bitcoin_cmpct.asm) needs sha256_full (single SHA256)
 # and tx_parse (block tx enumeration for getblocktxn/blocktxn serving).
 CMPCTOBJS := bitcoin_cmpct.o sha256.o bitcoin_hash.o bitcoin_tx.o
@@ -42,6 +42,9 @@ asm: $(OBJS)
 %.o: %.asm
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 tests/test_sha256: tests/test_sha256.c sha256.o
 	$(CC) $(CFLAGS) -o $@ tests/test_sha256.c sha256.o
 
@@ -60,11 +63,11 @@ tests/test_scalarmul: tests/test_scalarmul.c secp256k1_point.o secp256k1_fe.o
 tests/test_add: tests/test_add.c secp256k1_point.o secp256k1_fe.o
 	$(CC) $(CFLAGS) -o $@ tests/test_add.c secp256k1_point.o secp256k1_fe.o
 
-tests/test_scalar: tests/test_scalar.c secp256k1_scalar.o
-	$(CC) $(CFLAGS) -o $@ tests/test_scalar.c secp256k1_scalar.o
+tests/test_scalar: tests/test_scalar.c secp256k1_scalar.o secp256k1_scalar_c.o
+	$(CC) $(CFLAGS) -o $@ tests/test_scalar.c secp256k1_scalar.o secp256k1_scalar_c.o
 
-tests/test_ecdsa: tests/test_ecdsa.c secp256k1_ecdsa.o secp256k1_scalar.o secp256k1_point.o secp256k1_fe.o
-	$(CC) $(CFLAGS) -o $@ tests/test_ecdsa.c secp256k1_ecdsa.o secp256k1_scalar.o secp256k1_point.o secp256k1_fe.o
+tests/test_ecdsa: tests/test_ecdsa.c secp256k1_ecdsa.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_point.o secp256k1_fe.o
+	$(CC) $(CFLAGS) -o $@ tests/test_ecdsa.c secp256k1_ecdsa.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_point.o secp256k1_fe.o
 
 tests/test_block: tests/test_block.c $(HASHOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_block.c $(HASHOBJS)
@@ -162,7 +165,7 @@ tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_addrmgr.c $(ADMRGOBJS)
 
 # bitcoin_keys.asm (secp256k1 pubkey derivation for wallet/BIP32).
-KEYSOBJS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o bitcoin_keys.o
+KEYSOBJS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_keys.o
 tests/test_keys: tests/test_keys.c $(KEYSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_keys.c $(KEYSOBJS)
 
@@ -212,7 +215,7 @@ tests/test_hmac: tests/test_hmac.c $(HMACOBJS)
 # bitcoin_bip32.asm (BIP32 master + CKDpriv + full-path + extkey/fingerprint;
 # secp256k1 + HMAC + SHA-512 + base58/hash160). bitcoin_bip32.o's fingerprint
 # references hash160/base58check from bitcoin_addr.o, so those deps are here.
-BIP32OBJS := bitcoin_bip32.o bitcoin_hmac.o sha512.o bitcoin_keys.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o bitcoin_addr.o sha256.o bitcoin_hash.o ripemd160.o
+BIP32OBJS := bitcoin_bip32.o bitcoin_hmac.o sha512.o bitcoin_keys.o secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_addr.o sha256.o bitcoin_hash.o ripemd160.o
 tests/test_bip32_master: tests/test_bip32_master.c $(BIP32OBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_bip32_master.c $(BIP32OBJS)
 tests/test_bip32_chain: tests/test_bip32_chain.c $(BIP32OBJS)
@@ -279,7 +282,7 @@ tests/test_txtxid: tests/test_txtxid.c $(TXIDOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_txtxid.c $(TXIDOBJS)
 
 # secp256k1 public-key parsing/decompression (affine-limb recovery for ecdsa_verify).
-PUBKEYOBJS := bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o
+PUBKEYOBJS := bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
 tests/test_pubkey: tests/test_pubkey.c $(PUBKEYOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_pubkey.c $(PUBKEYOBJS)
 
@@ -294,7 +297,7 @@ tests/test_sighash_oob: tests/test_sighash_oob.c $(SIGHASHOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_sighash_oob.c $(SIGHASHOBJS)
 
 # script layer: DER sig parsing + full P2PKH verification.
-SCRIPTOBJS := bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_ecdsa.o secp256k1_point.o bitcoin_hash.o sha256.o
+SCRIPTOBJS := bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o secp256k1_point.o bitcoin_hash.o sha256.o
 tests/test_script: tests/test_script.c $(SCRIPTOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_script.c $(SCRIPTOBJS)
 
@@ -317,7 +320,7 @@ tests/test_utxo_store: tests/test_utxo_store.c $(UTXOSTOREOBJS)
 # Whole-transaction validator (test_txval.c): tx_parse + UTXO store +
 # P2PKH spend verification (verify_p2pkh + its sighash/pubkey/ecdsa chain).
 TXVALOBJS := bitcoin_utxo.o bitcoin_tx.o bitcoin_script.o bitcoin_sighash.o \
-             bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o \
+             bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
              secp256k1_ecdsa.o secp256k1_point.o bitcoin_hash.o sha256.o
 tests/test_txval: tests/test_txval.c tests/txval_vec.h $(TXVALOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_txval.c $(TXVALOBJS)
@@ -371,7 +374,7 @@ tests/test_wrpc_send: tests/test_wrpc_send.c wallet_core.c $(WALLETPRIMS) bitcoi
 # P2SH / multisig: p2sh_hash (RIPEMD160 of SHA256 of redeem script) +
 # OP_CHECKMULTISIG verification over the existing sighash/pubkey/ecdsa chain.
 MULTISIGOBJS := bitcoin_multisig.o bitcoin_script.o bitcoin_sighash.o \
-                bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o \
+                bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
                 secp256k1_ecdsa.o secp256k1_point.o bitcoin_hash.o sha256.o ripemd160.o
 tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_multisig.c $(MULTISIGOBJS)
@@ -380,7 +383,7 @@ tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 # sighash/pubkey/ecdsa/ripemd160 object set as test_multisig, plus the full
 # C VerifyScript (two-pass + P2SH sub-script execution + CheckMultisig).
 VERIFYOBJS := bitcoin_verify.c bitcoin_sighash.o bitcoin_script.o \
-              bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o \
+              bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
               secp256k1_ecdsa.o secp256k1_point.o bitcoin_hash.o sha256.o ripemd160.o
 tests/verify_p2sh_shim: tests/verify_p2sh_shim.c $(VERIFYOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/verify_p2sh_shim.c $(VERIFYOBJS)
@@ -423,7 +426,7 @@ tests/test_sigops: tests/test_sigops.c bitcoin_sigops.o bitcoin_scriptcodec.o
 
 # BIP340 Schnorr verify + BIP341 Taproot helpers (secp256k1_schnorr.asm,
 # secp256k1_taproot.asm) over the verified point/field/scalar + sha256/pubkey.
-TAPRIMSOBJS := secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o sha256.o bitcoin_pubkey.o
+TAPRIMSOBJS := secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_pubkey.o
 tests/test_schnorr: tests/test_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
 tests/test_taproot: tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
@@ -443,7 +446,7 @@ tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h t
 # P2TR key-path spend through the same whole-tx materials.
 SEGWITOBJS := bitcoin_segwit.c bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproot.o \
               bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o \
-              secp256k1_fe.o secp256k1_scalar.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o
+              secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o
 tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/modern_spend.h $(SEGWITOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
 
@@ -454,7 +457,7 @@ MEMPACCOBJS := bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
                bitcoin_mempool_policy.c bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
                secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
                bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o \
-               secp256k1_scalar.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o
+               secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o
 tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/modern_vec.h tests/modern_spend.h $(MEMPACCOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_mempool_accept_modern.c $(filter %.c,$(MEMPACCOBJS)) $(filter %.o,$(MEMPACCOBJS))
 
@@ -464,7 +467,7 @@ tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/moder
 # hash160, base58check_encode, sighash_all, ecdsa_verify, BIP39 mnemonic<->seed,
 # BIP32 master/path/extkey) plus the verified scalar/point/field ops (sc_*,
 # point_scalar_mul, fe_*) used to construct ECDSA signatures.
-WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_ecdsa.o \
+WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
                bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
                bitcoin_hash.o sha256.o ripemd160.o \
                bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
