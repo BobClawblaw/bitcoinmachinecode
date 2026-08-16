@@ -16,6 +16,10 @@
 /* core API from asm/wallet_core.c */
 extern void wallet_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
 extern int  wallet_address(char out[64], const unsigned char priv_be[32]);
+extern int  wallet_address_net(char out[64], const unsigned char priv_be[32],
+                               unsigned pk_version);
+extern long wallet_p2wpkh_address_hrp(char* out, long cap, const unsigned char h160[20],
+                                      const char* hrp);
 extern int  wallet_sighash(unsigned char out32[32], const unsigned char* tx,
                            unsigned long txlen, unsigned long input_index,
                            const unsigned char* script, unsigned long script_len);
@@ -124,6 +128,23 @@ static int cmd_addr(const char* keyhex) {
     char addr[64]; wallet_address(addr, priv);
     printf("pub:  "); print_hex(pub, 33); printf("\n");
     printf("addr: %s\n", addr);
+    return 0;
+}
+
+/* netaddr <privkey_hex>: print regtest/testnet-valid addresses for a key so a
+ * regtest node will accept them (0x6f P2PKH, bcrt P2WPKH). Core regtest rejects
+ * mainnet-version addresses, so this is required for a real send test. */
+static int cmd_netaddr(const char* keyhex) {
+    unsigned char priv[32], pub[33], h[20];
+    extern void hash160(unsigned char o[20], const void* in, long long len);
+    if (!hex_to_bytes(priv, keyhex, 64)) { fprintf(stderr, "netaddr: bad private key hex\n"); return 1; }
+    wallet_pubkey(pub, priv);
+    hash160(h, pub, 33);   /* declared in wallet_core.h usage; call extern below */
+    char p2pkh[64], p2wpkh[96];
+    wallet_address_net(p2pkh, priv, 0x6f);          /* testnet/regtest version */
+    wallet_p2wpkh_address_hrp(p2wpkh, 96, h, "bcrt"); /* regtest HRP */
+    printf("reg_p2pkh : %s\n", p2pkh);
+    printf("reg_p2wpkh: %s\n", p2wpkh);
     return 0;
 }
 
@@ -602,7 +623,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|netaddr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -615,6 +636,10 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "addr")) {
         if (argc < 3) { fprintf(stderr, "usage: wallet_cli addr <privkey_hex>\n"); return 2; }
         return cmd_addr(argv[2]);
+    }
+    if (!strcmp(argv[1], "netaddr")) {
+        if (argc < 3) { fprintf(stderr, "usage: wallet_cli netaddr <privkey_hex>\n"); return 2; }
+        return cmd_netaddr(argv[2]);
     }
     if (!strcmp(argv[1], "sign")) {
         if (argc < 5) { fprintf(stderr, "usage: wallet_cli sign <tx_hex> <privkey_hex> <input_idx>\n"); return 2; }
