@@ -64,5 +64,16 @@ cuda_header_audit: cuda_header_audit.c cuda_autodetect.c $(ORACLE)
 audit: libbmc_cuda.so cuda_header_audit
 	LD_LIBRARY_PATH=. ./cuda_header_audit ../headers.dat
 
+# PLAN.md option B: cross-block txid re-index / audit.  Walks stored block
+# files, strips witness, gathers every unwitnessed tx into ONE sha256d batch,
+# recomputes txids (CUDA or asm fallback), and validates per-block merkle roots
+# against the headers + an externally-anchored real-txid check (portable C sha
+# oracle; asm merkle/sha are NOT called directly -- ABI sharp edge).
+cuda_txid_reindex: cuda_txid_reindex.c cuda_autodetect.c ../sha256.o ../bitcoin_hash.o ../bitcoin_tx.o
+	$(CC) -O2 -o $@ cuda_txid_reindex.c cuda_autodetect.c ../sha256.o ../bitcoin_hash.o ../bitcoin_tx.o -ldl
+
+reindex: libbmc_cuda.so cuda_txid_reindex
+	LD_LIBRARY_PATH=. ./cuda_txid_reindex ../data/blk00000.dat
+
 clean:
-	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit libbmc_cuda.so
+	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit cuda_txid_reindex libbmc_cuda.so

@@ -575,6 +575,19 @@ existing bmc_sha256d_batch auto-detect + fallback:
   unwitnessed txs from thousands of stored blocks into ONE CUDA sha256d batch
   (NOT per-block — the PoC proved per-block loses). For utxo/txid index rebuild /
   audit. Requires a batch gatherer + the existing sha256d batch.
+  **[DONE 2026-08-16]** cuda_txid_reindex: parses stored blk%05d.dat files,
+  strips witness (asm tx_parse boundaries), packs every unwitnessed tx DENSELY
+  into ONE bmc_sha256d_batch, recomputes txids (CUDA or asm fallback), and
+  validates per-block merkle roots against each header + an externally-anchored
+  real-txid check (portable C sha256d oracle; asm merkle/sha avoided -- ABI
+  sharp edge). Proven on real mainnet: 1,511,751 txs / 1,189 blocks in one call,
+  1189 merkle OK / 0 bad, GPU bit-exact vs python-hashlib real coinbase txid.
+  Build/run: `make -C asm/cuda reindex`.
+  NOTE (landmines found): (a) variable-length txs must be packed DENSELY, not at
+  a fixed 80-byte stride (overlap corrupted txids); (b) the batch idx convention
+  is uint64 {data_offset,len} PAIRS, not txid-indices; (c) calling asm merkle/sha
+  from a CUDA-linked C main hits a stack-alignment ABI edge -> portable C oracle
+  used instead. Real-txid anchor reproduced with python hashlib.
 - C: ADDRESS / key-derivation scale-out. Large hash160 sets (address index,
   sweep/derive many keys, BIP32/BIP39 tree) = thousands of independent
   SHA-256d+RIPEMD-160. Needs a new RIPEMD-160 batch kernel + the existing
