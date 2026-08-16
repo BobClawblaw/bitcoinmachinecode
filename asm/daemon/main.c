@@ -37,6 +37,17 @@
  * far-from-tip store. */
 #define CATCHUP_MAX 10000L
 #define CATCHUP_MAX_SECS 60.0
+/* Per-rotation wall-clock budget for ONE outbound do_outbound_sync leg inside
+ * the mux poll loop. A far-behind store (or a slow seed building a large
+ * getheaders catch-up) would otherwise let a single blocking node_sync soak the
+ * loop for tens of seconds to minutes, starving inbound accepts (the kernel
+ * accepts the TCP connection into the listen backlog but the loop never calls
+ * accept(), so the version handshake never starts and every inbound probe
+ * times out). Bounding each leg's sync time makes serve_mux return to poll() +
+ * accept() promptly, so "serve stays live to inbound while downloading" holds
+ * at any store scale. Kept well above the at-tip round-trip cost (~hundreds of
+ * ms) so a caught-up node is never interrupted. */
+#define MUX_SYNC_BUDGET_SECS 2.0
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
@@ -550,6 +561,50 @@ static void mux_redial(int i, const char* peers[], int pool_len, int out_port){
     fprintf(stderr,"[mux:%d] redialed -> %s (fd %d)\n", i, peers[p], fd);
 }
 
+/* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
+ * serve_mux runs ONE poll() loop that services inbound accepts AND the
+ * outbound legs INLINE. If a single outbound node_sync pass blocks for a long
+ * time (far-behind store / slow seed building a large getheaders catch-up),
+ * the loop never returns to poll(), so inbound connections sit in the kernel
+ * accept backlog un-accepted and the version handshake never starts -- every
+ * inbound probe times out. We bound each leg's sync wall-clock: arm a short
+ * SIGALRM around node_sync; if it fires we know the pass was interrupted (the
+ * socket may hold a partially-read frame), so we DROP and re-dial a rotated
+ * seed (re-using mux_redial) and let the next rotation continue the catch-up
+ * from the freshly-anchored stored tip. A caught-up node completes node_sync
+ * in well under the budget, so it is never interrupted and small-store
+ * behavior (test_outbound_mux) is unchanged. */
+static volatile sig_atomic_t mux_sync_budget_fired = 0;
+static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
+
+/* Execute ONE bounded outbound sync pass on leg i. Returns the # blocks stored
+ * this pass (as do_outbound_sync) -- but keeps the loop responsive by capping
+ * the wall-clock. On budget expiry the leg is dropped and re-dialed (its fd may
+ * be mid-frame after the EINTR). Caller still enforces its own re-dial
+ * back-off; here we always allow the interrupt-driven redial so catch-up is
+ * never blocked behind a stuck leg. */
+static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, int out_port){
+    struct sigaction sa, old;
+    memset(&sa,0,sizeof sa); sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM,&sa,&old);
+    mux_sync_budget_fired = 0;
+    alarm((unsigned)MUX_SYNC_BUDGET_SECS < 1 ? 1 : (unsigned)MUX_SYNC_BUDGET_SECS);
+    long n = do_outbound_sync(i);
+    alarm(0);                                   /* disarm; return 0 leftover already fired */
+    sigaction(SIGALRM,&old,NULL);
+    if(mux_sync_budget_fired){
+        /* The budget alarm interrupted node_sync. The leg's socket may hold a
+         * partially-read frame after the EINTR, so it is NOT safe to keep
+         * syncing on it -- drop and re-dial a rotated seed. do_outbound_sync
+         * already re-anchored the locator at the (possibly advanced) stored
+         * tip, so the next pass continues exactly where this one stopped. */
+        fprintf(stderr,"[mux:%d] %s sync exceeded %gs budget; re-dialing\n",
+                i, mux_out_fd[i]>=0?mux_out_host[i]:"?", MUX_SYNC_BUDGET_SECS);
+        mux_redial(i, peers, pool_len, out_port);
+    }
+    return n;
+}
+
 /* The outbound multiplexer: ONE poll() loop over the listen socket + all N
  * outbound seed fds. Inbound accepts are forked to node_serve_loop children
  * (preserved behavior); outbound legs run inline (node_sync + announce).
@@ -626,7 +681,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             }
             bool due=(rot % mux_n_out)==(long long)i;     /* periodic */
             if(ev & POLLIN) due=true;                     /* data */
-            if(due) do_outbound_sync(i);
+            /* Bounded: each leg's node_sync must not starve inbound accepts.
+             * do_outbound_sync_bounded caps the wall-clock and re-dials the
+             * leg if it exceeds the budget, so the loop always returns to
+             * poll()+accept() promptly even at large store scale. */
+            if(due) do_outbound_sync_bounded(i, peers, pool_len, out_port);
             poll_idx++;
         }
     }
