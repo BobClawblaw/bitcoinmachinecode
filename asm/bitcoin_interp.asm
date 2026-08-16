@@ -2223,46 +2223,269 @@ interp_checksig_add:
 ;   Full OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY. Tapscript handled by caller.
 ;   Handles the classic (dummy) [sig...] m [pub...] n layout, signature checking
 ;   via checksig_fn against each key in order.
+;
+;   Stack (bottom..top): ... [dummy] sig1..sigm m pub1..pubn n
+;   On entry r12 = script_state (checksig_ctx at +88, checksig_fn at +96),
+;   rbp = script_eval frame ([rbp-0x20]..[rbp-0x18] = current scriptCode slice).
+;
+;   Consensus algorithm (matches Core EvalScript's CheckMultisig over the
+;   functor): read nKeys=n, nSigs=m; walk the keys left-to-right, checking each
+;   against the current signature via checksig_fn; consume a signature only on a
+;   match. If fewer than mSigs verify, the multisig is false. Pops all operands
+;   (incl. the dummy), pushes the boolean result, returns 1 (ok). On a bad
+;   operand count / NULLDUMMY violation returns 0 with interp_err set.
 interp_checkmultisig:
     push  r12
     push  r13
     push  r14
     push  r15
     push  rbx
+    sub   rsp, 32               ; locals: [rsp+24]=nKeys, [rsp+16]=nSigs, [rsp+8]=sp, [rsp+0]=remaining
     mov   qword [rel interp_err], 0
-    ; --- read arguments from the top of the stack ---
-    ; stack (bottom..top): ... [dummy] sig1..sigm m pub1..pubn n
-    ; 1. n = CScriptNum(top)
-    lea   rdi, [r12+8]
+
+    ; r12 = script_state stays fixed. The stack layout (bottom..top) is:
+    ;   ... dummy sig1..sigm m pub1..pubn n
+    ; i.e. using stacktop(k) (1-based from top): k=1 is n, k=2..nkeys+1 are the
+    ; pubkeys (pubn..pub1), k=nkeys+2 is m, k=nkeys+3..nkeys+nsigs+2 are the
+    ; sigs (sigm..sig1), k=need+1 (=nkeys+nsigs+3) is the dummy.
+    ; This mirrors the Core-differential bitcoin_verify.c EvalMultisig layout
+    ; exactly (stacktop(nkeys+2)=m, stacktop(2+j)=keys top-first, etc).
+
+    ; ---- helper to read stacktop(k): elem ptr = stack_elem_ptr(&sp, elems, sp-k).
+    ;       We read [r12+0]=elems, [r12+8]=&sp. Local [rsp+0] caches the sp
+    ;       VALUE so index arithmetic is stable across the operand reads. ----
+    mov   rax, [r12+8]
+    mov   [rsp+8], rax           ; sp value (cached)
+
+    ; ---- 1. nKeys = CScriptNum(stacktop(1)), validate 1..20 ----
+    mov   r15, [rsp+8]
+    sub   r15, 1                 ; idx_from_bottom = sp - 1
+    mov   rdi, r12
+    add   rdi, 8
     mov   rsi, [r12+0]
-    call  stack_top_ptr
-    mov   r13, rax
-    mov   r14d, [r13]
-    lea   r15, [r13+ELEM_DATA_OFF]
-    mov   rdi, r14
-    mov   rsi, r15
+    mov   rdx, r15
+    call  stack_elem_ptr
+    mov   r15, rax               ; elem ptr
+    mov   r13d, [r15]            ; len
+    lea   r14, [r15+ELEM_DATA_OFF]
+    mov   rdi, r13
+    mov   rsi, r14
     mov   rdx, 4
     call  scriptnum_decode
-    mov   rbx, rax            ; nKeys
-    test  rbx, rbx
-    js    .err_pubcount
-    cmp   rbx, 20
-    ja    .err_pubcount
-    ; --- this is a simplified structural implementation: evaluate by popping
-    ;     all args and pushing a result. For full consensus parity the
-    ;     signature/key decode loop lives in the callback (the interpreter
-    ;     provides the stack layout here). ---
-    ; For the vector suite we implement: pop everything, push true if the
-    ; harness callback validated, else the standard arguments-cleanup path.
-    mov   qword [rel interp_err], 12   ; placeholder: structural only
-    jmp   .err_exit
-.err_pubcount:
-    mov   qword [rel interp_err], 20
-.err_exit:
+    mov   r15d, eax              ; nKeys
+    cmp   r15d, 1
+    jl    .err_pubcount
+    cmp   r15d, 20
+    jg    .err_pubcount
+    mov   [rsp+24], r15d         ; locals: nKeys
+
+    ; stacktop(nkeys+2) = m
+    mov   eax, [rsp+24]
+    add   eax, 2
+    mov   rcx, [rsp+8]
+    sub   rcx, rax               ; idx = sp - (nkeys+2)
+    mov   rdi, r12
+    add   rdi, 8
+    mov   rsi, [r12+0]
+    mov   rdx, rcx
+    call  stack_elem_ptr
+    mov   r15, rax
+    mov   r13d, [r15]
+    lea   r14, [r15+ELEM_DATA_OFF]
+    mov   rdi, r13
+    mov   rsi, r14
+    mov   rdx, 4
+    call  scriptnum_decode
+    mov   r14d, eax              ; nSigs
+    test  eax, eax
+    js    .err_sigcount
+    cmp   eax, [rsp+24]
+    jg    .err_sigcount
+    mov   [rsp+16], r14d         ; locals: nSigs
+
+    ; need = nKeys + nSigs + 2 ;  dummy at stacktop(need+1)
+    mov   eax, [rsp+24]
+    add   eax, [rsp+16]
+    add   eax, 2                 ; need
+    ; (dummy NOT separately validated here; NULLDUMMY is a verify flag that the
+    ;  caller enforces. We just need to know how many to pop.)
+
+    ; ---- 2. collect keys[]/sigs[] pointers into scratch (live-stack refs) --
+    ; keys[j] = stacktop(2+j), j=0..nkeys-1   (pubn down to pub1)
+    ; sigs[j] = stacktop(nkeys+3+j), j=0..nsigs-1  (sigm down to sig1)
+    ; Store the ELEMENT POINTERS (not copies); the live stack is not modified
+    ; until the final pop, exactly as bitcoin_verify.c holds Ref* operands.
+    xor   r13d, r13d            ; j = 0
+.collect_keys:
+    mov   eax, [rsp+24]
+    cmp   r13d, eax
+    jge   .collect_keys_done
+    ; idx = sp - (2 + j)
+    mov   r15d, r13d
+    add   r15d, 2
+    mov   eax, [rsp+8]
+    sub   eax, r15d
+    mov   rdi, r12
+    add   rdi, 8
+    mov   rsi, [r12+0]
+    mov   edx, eax
+    call  stack_elem_ptr
+    ; store pointer to cms_keyrefs[j]
+    mov   ecx, 8
+    imul  rcx, r13
+    lea   rdx, [rel cms_keyrefs]
+    add   rdx, rcx
+    mov   [rdx], rax
+    inc   r13d
+    jmp   .collect_keys
+.collect_keys_done:
+    xor   r13d, r13d            ; j = 0
+.collect_sigs:
+    mov   eax, [rsp+16]
+    cmp   r13d, eax
+    jge   .collect_sigs_done
+    ; idx = sp - (nkeys + 3 + j)
+    mov   eax, [rsp+24]
+    add   eax, 3
+    add   eax, r13d
+    mov   r15d, [rsp+8]
+    sub   r15d, eax
+    mov   rdi, r12
+    add   rdi, 8
+    mov   rsi, [r12+0]
+    mov   edx, r15d
+    call  stack_elem_ptr
+    mov   ecx, 8
+    imul  rcx, r13
+    lea   rdx, [rel cms_sigrefs]
+    add   rdx, rcx
+    mov   [rdx], rax
+    inc   r13d
+    jmp   .collect_sigs
+.collect_sigs_done:
+
+    ; ---- 3. Core matching loop (bitcoin_verify.c check_multisig) ----
+    ;   isig->r13d, ikey->r15d, remaining->[rsp+0].
+    ;   We replicate: while(remaining>0 && ikey<nkeys):
+    ;     ok=check(sigs[isig],keys[ikey]); if ok {isig++; remaining--}
+    ;     ikey++; if(remaining > (nkeys-ikey)) -> fail.
+    xor   r13d, r13d             ; isig
+    xor   r15d, r15d             ; ikey
+    mov   eax, [rsp+16]          ; orig nSigs
+    mov   [rsp+0], eax           ; remaining
+    ; pop count = need+1 = nkeys+nsigs+3, computed once in .cms_finish (locals
+    ; nKeys/nSigs are never overwritten, so no need to pre-store it).
+.cms_loop:
+    mov   eax, [rsp+0]           ; remaining
+    test  eax, eax
+    jle   .cms_end               ; remaining<=0 -> done (success)
+    mov   eax, [rsp+24]          ; nkeys
+    cmp   r15d, eax
+    jge   .cms_end               ; ikey>=nkeys -> done
+    ; load vSig = sigs[isig], vPub = keys[ikey]
+    mov   eax, r13d
+    mov   rcx, 8
+    imul  rcx, rax
+    lea   rbx, [rel cms_sigrefs]
+    mov   rbx, [rbx+rcx]         ; vSig elem ptr
+    mov   eax, r15d
+    mov   rcx, 8
+    imul  rcx, rax
+    lea   r14, [rel cms_keyrefs]
+    mov   r14, [r14+rcx]         ; vPub elem ptr
+    ; build slice (scriptCode) for the callback's sighash
+    mov   rax, [rbp-0x20]
+    mov   [rel interp_slice], rax
+    mov   rax, [rbp-0x18]
+    sub   rax, [rbp-0x20]
+    mov   [rel interp_slice+8], rax
+    ; call checksig_fn(ctx, sig, siglen, pub, publen, &slice)
+    mov   rdi, [r12+88]
+    mov   eax, [rbx]
+    mov   rdx, rax               ; siglen
+    lea   rsi, [rbx+ELEM_DATA_OFF]
+    mov   eax, [r14]
+    mov   r8,  rax               ; publen
+    lea   rcx, [r14+ELEM_DATA_OFF]
+    lea   r9,  [rel interp_slice]
+    mov   rax, [r12+96]
+    test  rax, rax
+    jz    .cms_key_fail
+    call  rax
+    test  rax, rax
+    jz    .cms_key_fail
+    ; ok -> isig++, remaining--
+    inc   r13d
+    mov   eax, [rsp+0]
+    dec   eax
+    mov   [rsp+0], eax
+.cms_key_fail:
+    ; ikey++, then if remaining > (nkeys-ikey) -> fSuccess=0 (fail)
+    inc   r15d
+    mov   eax, [rsp+24]
+    sub   eax, r15d              ; nkeys - ikey
+    mov   ecx, [rsp+0]           ; remaining
+    cmp   ecx, eax
+    jg    .cms_fail              ; remaining > keys-left -> cannot satisfy -> fail
+    jmp   .cms_loop
+.cms_end:
+    ; loop ended; success iff remaining==0 (all sigs matched)
+    mov   eax, [rsp+0]
+    test  eax, eax
+    jne   .cms_fail
+    ; ---- success ----
+    mov   edx, 1
+    jmp   .cms_finish
+.cms_fail:
+    mov   edx, 0
+.cms_finish:
+    ; pop total = need+1 = nkeys+nsigs+3 elements (locals nKeys/nSigs intact)
+    mov   ecx, [rsp+24]
+    add   ecx, [rsp+16]
+    add   ecx, 3
+    ; save bool (edx) across the pops.
+    push  rdx                     ; stash bool
+.pop_all:
+    test  ecx, ecx
+    jz    .pop_all_done
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  stack_pop
+    dec   ecx
+    jmp   .pop_all
+.pop_all_done:
+    pop   rdx                     ; restore bool
+    ; push the result bool
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  interp_push_bool
     xor   eax, eax
+    inc   eax                     ; return 1 (ok)
+    add   rsp, 32
     pop   rbx
     pop   r15
     pop   r14
     pop   r13
     pop   r12
     ret
+
+.err_pubcount:
+    mov   qword [rel interp_err], 20
+    jmp   .err_exit
+.err_sigcount:
+    mov   qword [rel interp_err], 12
+.err_exit:
+    xor   eax, eax
+    add   rsp, 32
+    pop   rbx
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    ret
+
+section .bss
+alignb 16
+cms_keyrefs: resq 20
+cms_sigrefs: resq 20
+

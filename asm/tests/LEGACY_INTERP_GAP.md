@@ -1,47 +1,50 @@
-# LEGACY INTERP CHECKMULTISIG GAP — corrected finding (2026-08-16)
+# LEGACY INTERP CHECKMULTISIG GAP — RESOLVED (2026-08-16)
 
-## REVISED CONCLUSION (after the probe was debugged)
+## STATUS: CLOSED
 
-The initial claim in the first version of this note — that the interpreter's
-**legacy OP_CHECKSIG** "is not wired to a real ECDSA callback" — was WRONG. That
-was a **test-harness artifact** (bad stack model + non-canonical hand-rolled DER
-in the probe), not a project gap. Corrected findings:
+The OP_CHECKMULTISIG stub in the ASM interpreter has been replaced with a real
+implementation, and the probe now verifies genuine ECDSA spends end-to-end
+through bitcoin_interp.asm. See history below for how this conclusion evolved.
 
-- **Legacy OP_CHECKSIG through bitcoin_interp.asm IS wired and correct.** The
-  probe (`tests/test_interp_legacy_spend.c`) wires a real ECDSA checksig_fn and
-  proves the interpreter passes the correct (sig, pub, scriptCode-slice) to it:
-  callbacks are entered with `siglen=72 publen=33 slice_len=35` and
-  `der_parse_sig` accepts the (low-S) signature. The taproot path
-  (`test_taproot_sighash.c`) is, as established, ALL PASS 48/48.
-- **`interp_checkmultisig` (bitcoin_interp.asm ~line 2129) REMAINS A STRUCTURAL
-  STUB**: it sets `interp_err = 12` (placeholder) and exits without actually
-  walking keys/sigs to verify an m-of-n OP_CHECKMULTISIG. So a genuine 2-of-3
-  P2SH redeem run through the INTERPRETER ITSELF is not yet signature-verified
-  there. This is the one genuine legacy-interpreter gap.
+## RESOLUTION
+`interp_checkmultisig` (bitcoin_interp.asm) is now a full consensus implementation
+that mirrors the Core-differential `bitcoin_verify.c` EvalMultisig layout and the
+`check_multisig` matching loop exactly:
 
-## What the probe proved (evidence)
-- Callback entered 2x (the two P2PKH runs) with correct inputs; `der_parse_sig`
-  returns 1 after low-S normalization (the initial failures were my DER).
-- P2PKH `<pub> CHECKSIG` genuine-vs-wrong-pubkey is now correctly distinguished.
-- A 2-of-3 OP_CHECKMULTISIG script cannot ACCEPT through the interpreter today
-  because `interp_checkmultisig` is a stub (it must verify in the caller, e.g.
-  bitcoin_verify.c, not the interpreter proper).
+- Reads nKeys (stacktop 1) and nSigs (stacktop nkeys+2), validating 1..20 / 0..nKeys.
+- Collects keys[]/sigs[] as live-stack references in the SAME order the C reference
+  builds them (`stacktop(2+j)` = keys top-first; `stacktop(nkeys+3+j)` = sigs top-first),
+  so the Top-sig-vs-Top-pub walk-down matching semantics are identical.
+- Runs the Core matching loop via the ECDSA checksig_fn with the current
+  scriptCode slice (interp_slice) for the sighash — identical to interp_checksig.
+- Pops all operands (incl. the dummy) and pushes the boolean result.
 
-## How to close it (future work)
-Reimplement `interp_checkmultisig` in bitcoin_interp.asm to actually implement
-the Core CHECKMULTISIG semantics using the checksig_fn callback (pop nKeys,
-iterate keys left-to-right matching sigs, NULLDUMMY handling, push bool), the
-way .op_checksig already delegates to interp_checksig. Mirror the proven
-bitcoin_verify.c CheckMultisig + the taproot checksig wiring. Then re-run
-tests/test_interp_legacy_spend.c (both 2-of-3 scenarios) green and the full
-make test for regression.
+## PROOF
+`tests/test_interp_legacy_spend.c` now ALL PASS (6 checks, 0 failures):
+  1. P2PKH genuine OP_CHECKSIG -> accept (real ECDSA)
+  2. P2PKH wrong pubkey          -> reject
+  3. 2-of-3 two valid sigs       -> accept (real ECDSA through the interpreter)
+  4. 2-of-3 one valid sig        -> reject
+  5. 2-of-3 wrong-message sig    -> reject
+  6. raw-limb sign->verify roundtrip (controls the primitives)
 
-## NOTE: legacy final-stack enforcement
-legacy script_eval() returns "no script error" without enforcing final-stack
-truth (that is TAPSCRIPT-only). Real consensus enforces it in the caller
-(VerifyScript inspects the resolved stack). Any harness must do the same; this
-is caller responsibility, not an interpreter bug.
+No regressions: test_verify_p2sh (C oracle), test_interp (40 vectors),
+test_taproot_sighash (48), test_ecdsa, test_point, test_scalarmul_ct,
+test_tapscript_interp, smoke_interp all still pass.
 
-## Status
-Probe committed as tests/test_interp_legacy_spend.c (+ Makefile target). The
-OP_CHECKMULTISIG stub fix is the open item; tracked here and in PLAN.
+## Debugging history (honest record)
+- Initial "legacy OP_CHECKSIG not wired" claim was WRONG: a test artifact.
+- The OP_RETURN (gerr=3) seen in the 2-of-3 runs was a BUFFER OVERFLOW in the
+  probe (sc2[80] held a 105-byte script) — masked the interpreter entirely.
+- The genuine sig "not verifying" was a DER byte-order bug in the probe's
+  limb->BE serializer (v[0] is the LEAST significant limb; its low byte goes at
+  the END of the BE value). Fixed to mirror wallet_core limbs_to_be32.
+- With these probe bugs fixed, both the wiring AND the implementation verify.
+
+## Remaining caveats
+- NULLDUMMY strict enforcement and the sig-public-key-encoding checks
+  (check_sig_encoding / check_pubkey_encoding) are not duplicated in the
+  interpreter path here; they are caller/flag responsibilities, as documented
+  in the code. The Core-differential bitcoin_verify.c path enforces them.
+- This validates the interpreter's CHECKMULTISIG matching logic. Differential
+  fuzzing across key/sig orderings is a reasonable follow-up card.
