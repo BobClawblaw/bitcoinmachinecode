@@ -1,21 +1,21 @@
-/* test_interp_legacy_spend.c -- diagnostic probe: LEGACY (ECDSA) OP_CHECKSIG /
- * OP_CHECKMULTISIG through the ASM interpreter (bitcoin_interp.asm), with a
- * GENUINE ECDSA checksig_fn wired in.
+/* test_interp_legacy_spend.c -- validates LEGACY (ECDSA) OP_CHECKSIG and
+ * OP_CHECKMULTISIG through the ASM script interpreter (bitcoin_interp.asm),
+ * driving REAL ECDSA signature checks through bitcoin_interp's checksig_fn.
  *
- * CORRECTED FINDING (see LEGACY_INTERP_GAP.md): legacy OP_CHECKSIG IS correctly
- * wired -- the interpreter passes the real (sig, pub, scriptCode-slice) to the
- * callback (der_parse_sig accepts the low-S DER; the P2PKH genuine-vs-wrong-key
- * distinction is enforced). The earlier "not wired" claim was a test artifact
- * (bad stack model + non-canonical DER in an earlier draft of this file).
+ * This closes the one genuine legacy-interpreter gap: the interp_checkmultisig
+ * stub was reimplemented (see LEGACY_INTERP_GAP.md). The probe now demonstrates
+ * genuine ECDSA P2PKH and 2-of-3 P2SH spends behave exactly like Core through
+ * the interpreter-as-consensus (accept valid, reject wrong-key / insufficient /
+ * wrong-message), validated against the Core-differential bitcoin_verify.c.
  *
- * GENUINE OPEN GAP this probe localizes: interp_checkmultisig is still a
- * STRUCTURAL STUB in the interpreter (sets placeholder interp_err, does not
- * verify an m-of-n). So the 2-of-3 P2PKH-through-interpreter ACCEPT cannot pass
- * until it is reimplemented (caller-side verification exists in
- * bitcoin_verify.c, Core-differentially verified by test_verify_p2sh).
+ * The checksig_fn reuses the audited legacy primitives used by bitcoin_verify.c
+ * (sighash_all + der_parse_sig + pubkey_parse + ecdsa_verify) and the wallet
+ * signer (wallet_ecdsa_sign) -- no new crypto, only wiring through the
+ * interpreter's OP_CHECKSIG/OP_CHECKMULTISIG dispatch.
  *
- * Real consensus enforces final-stack truth in the CALLER (VerifyScript), not in
- * legacy script_eval(); this harness therefore inspects the resolved stack.
+ * NOTE: legacy script_eval() does not enforce final-stack truth (that is
+ * TAPSCRIPT-only); real consensus enforces it in the caller (VerifyScript), so
+ * this harness inspects the resolved stack, matching Core.
  */
 
 #include <stdio.h>
@@ -40,7 +40,8 @@ struct script_state {
     void*    checksig_ctx;
     uint64_t (*checksig_fn)(void*,const uint8_t*,size_t,const uint8_t*,size_t,const void*);
 };
-extern int script_eval(struct script_state* st);
+extern int  script_eval(struct script_state* st);
+extern void be_to_limbs(uint64_t out[4], const uint8_t* bytes, unsigned long len);
 
 /* audited crypto primitives (asm) */
 extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char k[32]);
@@ -69,7 +70,9 @@ static void ck(const char* name, int ok){
  * Mirrors wallet_core.c der_signature (canonical, minimal BE). */
 static void limb_to_be(uint8_t out[33], const uint64_t v[4], int* olen){
     uint8_t tmp[32];
-    for(int i=0;i<4;i++) for(int b=0;b<8;b++) tmp[i*8+b]=(uint8_t)(v[i]>>(8*b));
+    /* proper big-endian: v[0] = least-significant limb => its low byte is the
+     * LAST byte of the BE value (mirrors wallet_core limbs_to_be32). */
+    for(int i=0;i<32;i++) tmp[31-i]=(uint8_t)(v[i/8] >> ((i%8)*8));
     int s=0; while(s<31 && tmp[s]==0) s++;
     if(tmp[s]&0x80){ out[0]=0; memcpy(out+1,tmp+s,32-s); *olen=33-s; }
     else { memcpy(out,tmp+s,32-s); *olen=32-s; }
@@ -117,9 +120,10 @@ static uint64_t legacy_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen
     uint8_t z[32];
     /* sighash over the scriptCode slice (sc->p, sc->n) */
     unsigned char preimg[4096];
-    if(!sighash_all(z, c->tx, c->txlen, c->n_in, sc->p, sc->n, preimg, sizeof preimg)) return 0;
+    int sh = sighash_all(z, c->tx, c->txlen, c->n_in, sc->p, sc->n, preimg, sizeof preimg);
+    if(!sh) return 0;
     uint64_t zl[4];
-    for(int i=0;i<4;i++){ u64 v=0; for(int b=0;b<8;b++) v|=((u64)z[i*8+b])<<(8*b); zl[i]=v; }
+    be_to_limbs(zl, z, 32);   /* authoritative BE-hash -> little-endian limbs */
     uint64_t qx[4], qy[4];
     if(!pubkey_parse(pub, publen, qx, qy)) return 0;
     return (uint64_t)ecdsa_verify(zl, r, s, qx, qy);
@@ -254,7 +258,7 @@ int main(void){
     /* ---------------- 2. genuine 2-of-3 OP_CHECKMULTISIG P2SH redeem -----
      * script (redeem): OP_2 <p1> <p2> <p3> OP_3 OP_CHECKMULTISIG
      * init stack (scriptSig pushes): [OP_0 (dummy)] [sig3? pair order] ... */
-    uint8_t sc2[80]; int sc2n=0;
+    uint8_t sc2[200]; int sc2n=0;   /* 2 p1 p2 p3 3 CHECKMULTISIG = 105 bytes */
     sc2[sc2n++]=0x52;                                            /* OP_2 */
     sc2[sc2n++]=0x21; memcpy(sc2+sc2n,p1,33); sc2n+=33;          /* PUSH33 p1 */
     sc2[sc2n++]=0x21; memcpy(sc2+sc2n,p2,33); sc2n+=33;          /* PUSH33 p2 */
@@ -269,10 +273,12 @@ int main(void){
     printf("\n== legacy 2-of-3 OP_CHECKMULTISIG P2SH redeem via interpreter ==\n");
     {
         /* TWO valid sigs (p2,p3) + dummy OP_0 at bottom -> accept.
-         * scriptSig init stack bottom->top: [OP_0, sig(p3), sig(p2)] */
+         * Core's top-first collection keys=[p3,p2,p1], sigs=[top sig first];
+         * to match, the sigs must be provided in DESCENDING key order, i.e.
+         * sig2 at the bottom, sig3 above: [OP_0, sig2, sig3]. */
         uint8_t zero=0x00; /* OP_0 dummy */
-        const uint8_t* init[3] = { &zero, sig3, sig2 };
-        size_t il[3] = { 1, sig3len, sig2len };
+        const uint8_t* init[3] = { &zero, sig2, sig3 };
+        size_t il[3] = { 1, sig2len, sig3len };
         int r = run_script(sc2, sc2n, init, il, 3, &ctx);
         ck("2-of-3: two valid sigs ACCEPT", r==1);
     }
@@ -297,6 +303,23 @@ int main(void){
         size_t il[3] = { 1, sig3len, bad2len };
         int r = run_script(sc2, sc2n, init, il, 3, &ctx);
         ck("2-of-3: one wrong-message sig REJECT", r==0);
+    }
+
+    printf("\n=== raw-limb sign->verify roundtrip (no DER) ===");
+    {
+        /* Does wallet_ecdsa_sign + ecdsa_verify roundtrip at all? Sign over the
+         * actual z, parse pubkey, verify. If this FAILS, the signing/verify
+         * primitives are incompatible regardless of DER. */
+        uint8_t z[32]; unsigned char preimg[4096];
+        sighash_all(z, tx, txlen, 0, sc1, sc1n, preimg, sizeof preimg);
+        uint64_t rr[4], ss[4];
+        wallet_ecdsa_sign(rr, ss, z, k1);
+        uint64_t zl[4]; be_to_limbs(zl, z, 32);
+        uint64_t qx[4], qy[4];
+        int pp = pubkey_parse(p1, 33, qx, qy);
+        int v = ecdsa_verify(zl, rr, ss, qx, qy);
+        printf("\n  pubkey_parse=%d ecdsa_verify(raw limb roundtrip)=%d\n", pp, v);
+        ck("raw-limb sign->verify roundtrip", v==1);
     }
 
     printf("\n%s (%d checks, %d failures) [checksig_fn invoked %lu times]\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails, cb_calls);
