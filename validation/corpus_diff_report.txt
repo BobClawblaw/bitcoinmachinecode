@@ -1,0 +1,8 @@
+Broad differential-consensus corpus run vs Core
+generated: 2026-08-16T01:55:31Z  tip: 962651  elapsed: 2406.4s
+
+corpus blocks: 8935 ; surfaces A-D/F on all, surface E on 8000 txs
+
+stats: {"blocks": 8935, "accept_ok": 8935, "hash_ok": 8935, "pow_ok": 8935, "target_ok": 8935, "sigops_ok": 8935, "duptx_ok": 8935, "mut_run": 37, "mut_agree": 37, "mut_both_accepted": 0, "txid_ok": 8000, "txid_run": 8000}
+
+ZERO DIVERGENCES across all sampled real-mainnet blocks/txs.

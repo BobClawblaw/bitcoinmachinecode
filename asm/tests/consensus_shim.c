@@ -46,8 +46,13 @@ static void put_hex(const unsigned char* b, long n){
 }
 
 int main(void){
-    char line[4<<20];
-    static unsigned char buf[4<<20];
+    /* Mainnet MAX_BLOCK_SERIALIZED_SIZE = 4,000,000 bytes => hex up to 8,000,000
+     * chars. The old 4<<20 line buffer truncated any real block > 2 MB (4MB hex
+     * chars), silently decoding a truncated block -> cons_verify/DUPTX/SIGOPS
+     * desynchronised on every >2MB mainnet block. Use 8MB line (static, so it
+     * lives in BSS not on the 8MB default stack) + 8MB binary buffer. */
+    static char line[8<<20];
+    static unsigned char buf[8<<20];
     static unsigned char scratch[64<<20];
     static unsigned char tscratch[1<<20];
     char cmd[16];
