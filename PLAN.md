@@ -552,16 +552,38 @@ What exists (done, verified, committed):
   randoms, 0 failures); routing/digest matrix `cuda_autodetect_test`; benchmark
   ~17-18x GPU/CPU at N=1M on RTX 5090, CPU wins below ~100.
 
-What is DEFERRED (do later, NOT now):
-- Tier 1: wire `bmc_sha256d_batch` into the assembly node path (bitcoind.asm /
-  bitcoin_hash.asm) behind a runtime probe, mirroring the CPUID->SHA-NI seam.
-  Single-hash call sites (pow_check, per-tx mempool, getblockhash) stay on CPU.
-- Tier 2 (bigger): secp256k1 ECDSA/Schnorr VERIFY as a CUDA batch verifier —
-  the real IBD consensus hot path — validated against the secp256k1 oracle/corpus
-  (one warp/lane per input).
-- Tier 3: batch HMAC/BIP32/BIP39 key-derivation; hash160/utxo index building.
-- Gate before it may serve consensus data: full mainnet IBD differential
-  (hash-for-hash vs the CPU path) in CI, per this project's audit stance.
+What is DEFERRED (do later, NOT now) — refined by the cuda_txid_poc (f8db03f):
+
+**Conviction (from the txid PoC + bench):** CUDA pays ONLY on LARGE BATCHES of
+INDEPENDENT hashing, and only on CPU-bound (not network/disk-bound) offline work.
+Live IBD is network/disk-bound and per-block offload is *slower* (PoC ~0.6-0.8x),
+so IBD is NOT a CUDA target. Direct effort at offline bulk-audit / re-index /
+derivation tools, not at per-block consensus paths.
+
+Ranked candidates (by ROI), all offline + CPU-bound + batchable, all behind the
+existing bmc_sha256d_batch auto-detect + fallback:
+- A (best, lowest effort): BULK PoW / header re-audit. Re-check stored headers'
+  PoW + block_hash across thousands of headers in one CUDA block_hash/sha256d
+  batch (kernel exists; ~18x measured). Target: pverify/chainctl/check_chain
+  style offline audit of a stored chain.
+- B (build-out of cuda_txid_poc): CROSS-BLOCK txid / re-index recompute. Gather
+  unwitnessed txs from thousands of stored blocks into ONE CUDA sha256d batch
+  (NOT per-block — the PoC proved per-block loses). For utxo/txid index rebuild /
+  audit. Requires a batch gatherer + the existing sha256d batch.
+- C: ADDRESS / key-derivation scale-out. Large hash160 sets (address index,
+  sweep/derive many keys, BIP32/BIP39 tree) = thousands of independent
+  SHA-256d+RIPEMD-160. Needs a new RIPEMD-160 batch kernel + the existing
+  sha256d batch.
+- D (big, most value): secp256k1 ECDSA/Schnorr BATCH verify for offline
+  signature audit (validate all historical inputs). EC-mult is GPU-accelerable
+  but is a large port (field/point math in CUDA) validated vs the secp256k1
+  oracle/corpus. One warp/lane per input.
+
+NOT CUDA targets (do not pursue): live IBD download (network-bound), per-block
+cons_verify, single hashes / one RPC / one tx accept, per-derivation HMAC chain.
+
+Gate (unchanged): before any of A-D may serve consensus/reindex data, run a full
+mainnet differential (hash-for-hash vs the CPU path) in CI, per audit stance.
 
 Trigger to start: when the active node-completion kanban batch reaches a clean
 state and a worker is free. Until then, ignore asm/cuda entirely.
