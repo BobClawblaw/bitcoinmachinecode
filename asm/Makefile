@@ -425,6 +425,13 @@ tests/run_batch: tests/run_batch.c $(INTERPOBJS)
 tests/consensus_shim: tests/consensus_shim.c $(CONSOBJS) bitcoin_sigops.o bitcoin_scriptcodec.o
 	$(CC) -no-pie -O0 -o $@ tests/consensus_shim.c $(CONSOBJS) bitcoin_sigops.o bitcoin_scriptcodec.o
 
+# Full-chain batch differential shim (fullchain_diff.py): same asm objects as
+# consensus_shim, non-interactive batch protocol (len-prefixed frames in, one
+# compact verdict line per block out) for chewing tens of thousands of blocks
+# per process without per-block launch overhead.
+tests/fullchain_shim: tests/fullchain_shim.c $(CONSOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/fullchain_shim.c $(CONSOBJS)
+
 # Chain-context BIP30 differential shim (bip30_diff.py): maintains a persistent
 # UTXO view (bitcoin_utxo.asm) across CONNECT calls and runs Core's ConnectBlock
 # BIP30 duplicate-txid gate (validation.cpp, fEnforceBIP30 / IsBIP30Repeat).
