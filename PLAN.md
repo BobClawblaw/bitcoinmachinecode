@@ -610,7 +610,19 @@ existing bmc_sha256d_batch auto-detect + fallback:
   `make -C asm/cuda ecdtest` (host-only asm-vector cross-check, fails=0).
   NOTE: correctness-first binary long-division reduction (k=256 range for the
   full 2^257 quotient bound) and Fermat inversion; this is an offline audit
-  tool, not constant-time hot-path.  Schnorr batch verify remains future work.
+  tool, not constant-time hot-path.
+  [ DONE ] Schnorr half delivered as `asm/cuda/cuda_schnorr_verify.cu` (per-thread
+  BIP340 Verify) reusing `cuda_ecdsa_math.h`.  Adds mod-p sqrt via a^((p+1)/4)
+  (p==3 mod 4), even-y lift_x, a per-thread SHA-256 for the tagged hash
+  `BIP0340/challenge`, and R = s*G - e*P (accept iff x(R)==r and y(R) even).
+  Gate: ALL 19 official BIP340 test vectors (9 TRUE + 10 FALSE, incl. messages
+  of length 0/1/17/100) pass on BOTH the host oracle and the GPU kernel (0
+  mismatches), plus a 532-signature concurrent batch (host==gpu==expected).
+  Build/run: `make -C asm/cuda verify_schnorr`.
+  Another landmine: the SHA-256 round constants SHARED by host+device must be a
+  function-local `static const` -- `__constant__` is unreadable from host code
+  (silently corrupts e on the CPU-oracle path) and a file-scope `static const`
+  is invisible to device code.  nvcc gives each host/device passes its own copy.
 
 NOT CUDA targets (do not pursue): live IBD download (network-bound), per-block
 cons_verify, single hashes / one RPC / one tx accept, per-derivation HMAC chain.

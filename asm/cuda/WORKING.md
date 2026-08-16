@@ -307,6 +307,17 @@ validated on real data**; none change hot-path node code.
   random signature. GPU gate (`make verify_ecdsa`): 32/32 official vectors and
   a 512-wide known-vector batch, **every GPU result == host == expected**.
   Host-only cross-check: `make ecdtest` (must print fails=0).
+- **Option D (Schnorr half) — BIP340 Schnorr BATCH verify**
+  (`cuda_schnorr_verify.cu`): per-thread BIP340 `Verify(pk,m,sig)`, reusing the
+  same validated `cuda_ecdsa_math.h`. Adds mod-p sqrt via `a^((p+1)/4)`
+  (p≡3 mod 4), even-y `lift_x`, a per-thread SHA-256 for the tagged hash
+  `BIP0340/challenge`, and `R = s*G - e*P` (accept iff x(R)==r and y(R) even).
+  GATE: all **19 official BIP340 test vectors** (9 TRUE + 10 FALSE, including
+  messages of length 0/1/17/100 bytes) pass on BOTH the host oracle and the GPU
+  kernel with **0 mismatches**, plus a **532-signature concurrent batch**
+  (host==expected, gpu==expected, gpu==host — all 532/532). Build/run:
+  `make -C asm/cuda verify_schnorr`. With this, **option D is delivered in
+  full** (ECDSA + Schnorr batch verify).
 
 Key lessons from implementing D (all the subtle bugs, for the record):
  1. The correct Jacobian doubling (curve a=0) Y3 term is `E·(D-X3) - 8·C` —
@@ -325,9 +336,17 @@ Key lessons from implementing D (all the subtle bugs, for the record):
     reversed them twice and got clean-but-wrong points.
  6. Jacobian mixed-add degenerates on self-add / negation; add infinity and
     self-add (double) guards.
+ 7. (Schnorr) Data shared by host and device code must be a function-LOCAL
+    `static const`, never a `__constant__` global (unreadable from host code —
+    silently corrupted the tagged hash on the CPU-oracle path, making only the
+    9 VALID vectors fail) nor a file-scope `static const` (invisible to device
+    code under nvcc). nvcc gives each host/device pass its own local copy.
+ 8. (Schnorr) mod-p sqrt is direct via `a^((p+1)/4)` because p≡3 mod 4; verify
+    the QR check (`y²≡x³+7`) before trusting the root, and take the even root.
 
 Reviewer note: this is correctness-first, deliberately un-optimized (per-thread
-256-bit long-division reduction + Fermat inversions), matching the repo's audit
-stance. GPU speedup is secondary for an offline tool; the SHA batch (A/B) is the
-performance-relevant path. Schnorr batch verify remains future work.
+256-bit long-division reduction + Fermat inversions + per-thread SHA-256),
+matching the repo's audit stance. GPU speedup is secondary for an offline tool;
+the SHA batch (A/B) is the performance-relevant path. Option D (ECDSA + Schnorr
+batch verify) is now delivered in full.
 
