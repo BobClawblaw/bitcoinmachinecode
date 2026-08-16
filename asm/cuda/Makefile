@@ -91,5 +91,16 @@ verify_ecdsa: cuda_ecdsa_verify
 ecdtest: ecdtest.c cuda_ecdsa_math.h
 	$(CC) -O2 -I. -o $@ ecdtest.c
 
+# PLAN.md option D, Schnorr half: BIP340 batch verify (complements
+# cuda_ecdsa_verify).  per-thread Verify(pk,m,sig): mod-p sqrt lift_x, tagged
+# hash, R=s*G-e*P.  Validated on all 19 official BIP340 vectors (9 TRUE + 10
+# FALSE, incl. msg lengths 0/1/17/100) on CPU oracle AND gpu kernel, plus a
+# 532-wide concurrent batch (host==gpu==expected).  Reuses cuda_ecdsa_math.h.
+cuda_schnorr_verify: cuda_schnorr_verify.cu cuda_ecdsa_math.h
+	$(NVCC) $(COMMON) -o $@ cuda_schnorr_verify.cu
+
+verify_schnorr: cuda_schnorr_verify
+	./cuda_schnorr_verify
+
 clean:
-	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit cuda_txid_reindex cuda_ecdsa_verify ecdtest libbmc_cuda.so
+	rm -f cuda_verify cuda_bench cuda_autodetect_test cuda_header_audit cuda_txid_reindex cuda_ecdsa_verify ecdtest cuda_schnorr_verify libbmc_cuda.so
