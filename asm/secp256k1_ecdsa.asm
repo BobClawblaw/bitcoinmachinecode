@@ -40,6 +40,7 @@ default rel
 extern sc_inv
 extern sc_mul
 extern point_scalar_mul
+extern point_scalar_mul_fixed
 extern point_add
 extern fe_mul
 extern fe_inv
@@ -167,11 +168,10 @@ ecdsa_verify:
     lea rdx, [rbp-0x90]     ; w
     call sc_mul
 
-    ; ---- P1 = u1*G : P1_base -0x1c0 (12) ----
+    ; ---- P1 = u1*G : P1_base -0x1c0 (12)  [fixed-base G comb] ----
     lea rdi, [rbp-0x1c0]
-    lea rsi, [G_AFF]
-    lea rdx, [rbp-0xc0]     ; u1
-    call point_scalar_mul
+    lea rsi, [rbp-0xc0]     ; u1
+    call point_scalar_mul_fixed
 
     ; ---- P2 = u2*Q : P2_base -0x220 (12) ----
     lea rdi, [rbp-0x220]

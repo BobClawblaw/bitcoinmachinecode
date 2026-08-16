@@ -34,6 +34,11 @@
 ; (Offsets used below as plain constants for clarity + auditability.)
 ; ----------------------------------------------------------------------------
 
+; Fixed-base G comb table (w=4): T[j][i] = i * 2^(4j) * G, affine, for the
+; fixed-base scalar multiply point_scalar_mul_fixed (see end of file). Entry
+; offset = ((j*15)+(i-1)) * 64 bytes. Auto-generated + validated offline.
+section .rodata
+%include "g_comb_table.inc"
 section .text
 
 extern fe_add
@@ -799,6 +804,158 @@ point_add:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; point_scalar_mul_fixed(out[12], k[4]) : out = k*G  (FIXED-BASE G comb, w=4)
+;   G is a compile-time constant, so the full w=4 comb table T[j][i]=i*2^(4j)*G
+;   (affine) is precomputed in .rodata (g_comb_table.inc, auto-generated and
+;   validated offline vs the oracle).  k*G = sum_j T[j][digit_j], so the multiply
+;   needs ZERO doublings -- only up to 64 point_add_mixed Jacobian+affine adds.
+;   Used by ecdsa_verify for the u1*G term (variable-base Q still uses
+;   point_scalar_mul).
+;   ABI: point_scalar_mul_fixed(rdi=out[12], rsi=k[4]); preserves rbx,r12-r15.
+;   k==0 -> Jacobian infinity.  Constant-time: fixed loop over 64 columns.
+;   Stack (rbp-relative): R @ -0x98 (12), Rcopy @ -0x140 (12), k @ -0x168 (4).
+;   sub rsp 0x178 (==8 mod16) -> rsp 0 mod16 at nested point_add_mixed calls.
+; ----------------------------------------------------------------------------
+global point_scalar_mul_fixed
+point_scalar_mul_fixed:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x178
+    mov  r12, rdi            ; out
+    ; copy k (rsi) ascending into rbp-0x168
+    mov  rax, [rsi+0]
+    mov  [rbp-0x168], rax
+    mov  rax, [rsi+8]
+    mov  [rbp-0x160], rax
+    mov  rax, [rsi+16]
+    mov  [rbp-0x158], rax
+    mov  rax, [rsi+24]
+    mov  [rbp-0x150], rax
+    ; k == 0 -> infinity
+    mov  rax, [rbp-0x168]
+    or   rax, [rbp-0x160]
+    or   rax, [rbp-0x158]
+    or   rax, [rbp-0x150]
+    jz   .zero
+    xor  r15, r15            ; j = 0..63
+.find:
+    mov  rcx, r15
+    shl  rcx, 2
+    mov  rdx, rcx
+    shr  rdx, 6
+    lea  rdx, [rbp-0x168 + rdx*8]
+    and  rcx, 63
+    mov  rax, [rdx]
+    shr  rax, cl
+    and  rax, 15
+    jnz  .init
+    inc  r15
+    cmp  r15, 64
+    jb   .find
+    jmp  .zero
+.init:
+    dec  rax                ; d-1
+    mov  r14, r15
+    imul r14, r14, 15
+    add  r14, rax           ; (j*15)+(d-1)
+    imul r14, r14, 64
+    lea  r14, [G_COMB_TABLE + r14]
+    lea  rdi, [rbp-0x98]    ; R
+    mov  rsi, r14
+    mov  rcx, 8
+    rep  movsq              ; R[0..7] = affine x,y
+    mov  qword [rbp-0x98+64], 1
+    mov  qword [rbp-0x98+72], 0
+    mov  qword [rbp-0x98+80], 0
+    mov  qword [rbp-0x98+88], 0
+    inc  r15
+    cmp  r15, 64
+    jae  .store
+.acc:
+    mov  rcx, r15
+    shl  rcx, 2
+    mov  rdx, rcx
+    shr  rdx, 6
+    lea  rdx, [rbp-0x168 + rdx*8]
+    and  rcx, 63
+    mov  rax, [rdx]
+    shr  rax, cl
+    and  rax, 15
+    jz   .accskip
+    dec  rax                ; d-1
+    mov  r14, r15
+    imul r14, r14, 15
+    add  r14, rax
+    imul r14, r14, 64
+    lea  r14, [G_COMB_TABLE + r14]
+    ; Rcopy = R
+    lea  rdi, [rbp-0x140]
+    lea  rsi, [rbp-0x98]
+    mov  rcx, 12
+    rep  movsq
+    ; R = Rcopy + affine(table)  (distinct p -> no aliasing)
+    lea  rdi, [rbp-0x98]
+    lea  rsi, [rbp-0x140]
+    mov  rdx, r14
+    call point_add_mixed
+.accskip:
+    inc  r15
+    cmp  r15, 64
+    jb   .acc
+    jmp  .store
+.zero:
+    mov  qword [rbp-0x98+0], 1
+    mov  qword [rbp-0x98+8], 0
+    mov  qword [rbp-0x98+16], 0
+    mov  qword [rbp-0x98+24], 0
+    mov  qword [rbp-0x98+32], 1
+    mov  qword [rbp-0x98+40], 0
+    mov  qword [rbp-0x98+48], 0
+    mov  qword [rbp-0x98+56], 0
+    mov  qword [rbp-0x98+64], 0
+    mov  qword [rbp-0x98+72], 0
+    mov  qword [rbp-0x98+80], 0
+    mov  qword [rbp-0x98+88], 0
+.store:
+    mov  rax, [rbp-0x98+0]
+    mov  [r12+0], rax
+    mov  rax, [rbp-0x98+8]
+    mov  [r12+8], rax
+    mov  rax, [rbp-0x98+16]
+    mov  [r12+16], rax
+    mov  rax, [rbp-0x98+24]
+    mov  [r12+24], rax
+    mov  rax, [rbp-0x98+32]
+    mov  [r12+32], rax
+    mov  rax, [rbp-0x98+40]
+    mov  [r12+40], rax
+    mov  rax, [rbp-0x98+48]
+    mov  [r12+48], rax
+    mov  rax, [rbp-0x98+56]
+    mov  [r12+56], rax
+    mov  rax, [rbp-0x98+64]
+    mov  [r12+64], rax
+    mov  rax, [rbp-0x98+72]
+    mov  [r12+72], rax
+    mov  rax, [rbp-0x98+80]
+    mov  [r12+80], rax
+    mov  rax, [rbp-0x98+88]
+    mov  [r12+88], rax
+    add  rsp, 0x178
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
