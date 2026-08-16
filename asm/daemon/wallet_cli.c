@@ -92,6 +92,16 @@ extern int  book_get(const char* path, const char* label, char* addr, int cap);
 extern int  book_list(const char* path, char* out, int cap);
 extern int  book_validate(const char* label);
 
+/* transaction journal (asm/wallet_txlog.c) -- persistent tx history */
+extern char* txlog_path_for(const char* wallet_path, char* buf, int cap);
+extern int   txlog_append_sent(const char* wallet_path, const unsigned char txid[32],
+                               long long amount, long long fee,
+                               const unsigned char dest_h160[20],
+                               unsigned long inputs_used, long rawlen);
+extern int   txlog_list(const char* path, char* out, int cap);
+/* double-SHA256 (asm hashing) -- used to compute a raw transaction's txid */
+extern void  sha256d(unsigned char out[32], const void* msg, long len);
+
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -239,6 +249,14 @@ static int cmd_send(int argc, char** argv) {
     printf("signed-tx (%ld bytes):\n", sl);
     print_hex(signedtx, (int)sl);
     printf("\n");
+    /* record this transaction in the persistent history journal */
+    unsigned char txid[32];
+    sha256d(txid, signedtx, sl);   /* txid = double-SHA256 of the raw tx */
+    printf("txid: ");
+    print_hex(txid, 32);
+    printf("\n");
+    if (txlog_append_sent(NULL, txid, amount, fee, to_h, (unsigned long)n, sl) != 0)
+        fprintf(stderr, "warning: could not write transaction history\n");
     return 0;
 }
 
@@ -447,6 +465,14 @@ static int cmd_sendtoaddress(int argc, char** argv) {
     printf("signed-tx (%ld bytes):\n", sl);
     print_hex(signedtx, (int)sl);
     printf("\n");
+    /* record this transaction in the persistent history journal */
+    unsigned char txid[32];
+    sha256d(txid, signedtx, sl);
+    printf("txid: ");
+    print_hex(txid, 32);
+    printf("\n");
+    if (txlog_append_sent(NULL, txid, amount, fee, to_h, picked, sl) != 0)
+        fprintf(stderr, "warning: could not write transaction history\n");
     return 0;
 }
 
@@ -733,9 +759,25 @@ static int cmd_seed(int argc, char** argv) {
     return 0;
 }
 
+/* history / listtransactions: print the persistent transaction journal. */
+static int cmd_history(int argc, char** argv) {
+    /* usage: wallet_cli history [path]      (path defaults to the journal next
+     *        to the default wallet store: config/wallet.dat.txlog) */
+    char path[1024];
+    const char* p = (argc >= 3) ? argv[2] : txlog_path_for(NULL, path, sizeof path);
+    char out[8192];
+    if (txlog_list(p, out, sizeof out) != 0) {
+        fprintf(stderr, "history: could not read %s\n", p);
+        return 1;
+    }
+    if (!out[0]) { printf("(empty)\n"); return 0; }
+    printf("%s", out);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|netaddr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey|abook> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|netaddr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey|abook|history|listtransactions> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -769,6 +811,8 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "decoderawtransaction")) return cmd_decoderawtx(argc, argv);
     if (!strcmp(argv[1], "signrawtransactionwithkey")) return cmd_signraw(argc, argv);
     if (!strcmp(argv[1], "sendtoaddress")) return cmd_sendtoaddress(argc, argv);
+    if (!strcmp(argv[1], "history")) return cmd_history(argc, argv);
+    if (!strcmp(argv[1], "listtransactions")) return cmd_history(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 2;
 }
