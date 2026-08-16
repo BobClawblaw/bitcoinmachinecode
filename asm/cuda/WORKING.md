@@ -127,10 +127,38 @@ enough, not disabled). Any failure to load or run CUDA degrades to the identical
 CPU behavior — never to wrong output. A production integration must keep the
 `cuda_autodetect_test` matrix in CI before the CUDA tier may ever serve consensus
 data.
-- **`Makefile`** — `make all` = verify + bench + autodetect. Building the CUDA
-  kernel/.so requires nvcc + CUDA GPU; but the auto-detect dispatcher (plain C +
-  assembly oracle) links and runs with zero CUDA installed and simply falls back
-  to CPU at runtime.
+- **`Makefile`** — `make all` = verify + bench + autodetect; `make poc` runs the
+  txid-offload PoC below. Building the CUDA kernel/.so requires nvcc + CUDA GPU;
+  but the auto-detect dispatcher (plain C + assembly oracle) links and runs with
+  zero CUDA installed and simply falls back to CPU at runtime.
+
+### cons_verify txid-offload PoC — CORRECT but NOT worth it per-block (findings)
+
+`cuda_txid_poc.py` (`make poc`) prototypes offloading cons_verify's dominant
+per-block crypto — computing tx_txid (= SHA-256d of the unwitnessed tx) for every
+tx — to the CUDA sha256d batch, verified against the trusted assembly `tx_txid`
+oracle via consensus_shim on a REAL mainnet block.
+
+**Correctness: PROVEN.** CUDA sha256d reproduced the asm tx_txid byte-for-byte on
+every tx of blk 200000 (0 / 388 mismatches) — including the SegWit-era unwitnessed
+form. The mechanism is sound.
+
+**Performance: NEGATIVE for per-block offload.** On a single block's ~388 txs:
+  - CUDA batch (incl. host upload + launch + device→host copy): 172.7 ms
+  - ASM oracle serial (per-tx via shim): 107.5 ms
+  - => CUDA is ~0.6x the speed (slower)
+
+Root cause: per-block launch + H2D/D2H transfer overhead (~170ms) dwarfs the
+actual crypto on a few-hundred-tx batch — far below the ~1k+ crossover we measured
+in `cuda_bench`, and the per-tx CPU path through the shim is already fast.
+
+**Conclusion for the roadmap (tier-defining):** Do NOT wire CUDA into per-block
+`cons_verify` — it would slow the node down. CUDA only pays off for txid hashing
+if we batch ACROSS many blocks (thousands of txids per GPU call), i.e. a harness/API
+that collects unwitnessed txs from a whole header-page / IBD page and hash them in
+one launch — then the ~18x raw batch win applies. This is exactly the deferred
+direction already noted in §12 of PLAN.md; this PoC confirms the "batch across
+blocks, not per-block" shape is required.
 
 ### Config note
 This host has `nvcc` (CUDA 13.3) and one RTX 5090 (SM 12.0). Builds use

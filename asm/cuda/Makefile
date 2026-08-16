@@ -16,9 +16,17 @@ ARCH      := -arch=sm_120
 COMMON    := $(ARCH) -O3 -std=c++17 --expt-relaxed-constexpr
 ORACLE    := ../sha256.o ../bitcoin_hash.o
 
-.PHONY: all verify bench detect clean
+.PHONY: all verify bench detect poc clean
 
 all: verify bench detect
+
+# txid-offload proof-of-concept (Python; needs libbmc_cuda.so + Core RPC for a
+# real block, uses the proven consensus_shim as the trusted txid oracle). This is
+# a NEGATIVE result for per-block offload: it proves correctness (CUDA sha256d ==
+# asm tx_txid byte-for-byte) but that a SINGLE block's txid batch is too small to
+# amortize GPU launch/transfer. See WORKING.md "cons_verify txid-offload PoC".
+poc: libbmc_cuda.so
+	python3 cuda_txid_poc.py
 
 # The runtime-loaded CUDA backend: kernels + host launchers as a shared object.
 # Exported C symbols (from cuda_sha256.h extern "C") so the dispatcher can
