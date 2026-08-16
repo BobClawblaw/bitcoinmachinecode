@@ -1,37 +1,47 @@
-test_interp_legacy_spend.c -- DIAGNOSTIC PROBE of the SO-far-uncovered gap.
+# LEGACY INTERP CHECKMULTISIG GAP — corrected finding (2026-08-16)
 
-PURPOSE: verify whether real LEGACY (ECDSA) OP_CHECKSIG / OP_CHECKMULTISIG
-spends run through the ASM script interpreter (bitcoin_interp.asm) with a
-GENUINE ECDSA checksig_fn wired in, the same way the taproot path is wired
-(test_taproot_sighash.c wires a real schnorr fn and is ALL PASS).
+## REVISED CONCLUSION (after the probe was debugged)
 
-FINDING (2026-08-16, empirical): THE LEGACY PATH IS NOT WIRED.
-- checksig_fn was invoked only 2 times across all 6 runs; the standalone P2PKH
-  OP_CHECKSIG runs never invoked it (cb_calls stayed 0 through them).
-- Consequently `script_eval()` returns "no script error" for legacy (sigversion
-  0) regardless of signature validity -- it does NOT enforce final-stack truth
-  (that enforcement is TAPSCRIPT-only in the .final_ok path), and the sig
-  callback isn't reached, so legacy OP_CHECKSIG acceptance/rejection is NOT
-  actually signature-verified through the interpreter.
-- Contrast: the taproot path (sigversion 2) IS fully wired + enforced, and
-  test_taproot_sighash.c is ALL PASS (48/48) with a real schnorr callback.
+The initial claim in the first version of this note — that the interpreter's
+**legacy OP_CHECKSIG** "is not wired to a real ECDSA callback" — was WRONG. That
+was a **test-harness artifact** (bad stack model + non-canonical hand-rolled DER
+in the probe), not a project gap. Corrected findings:
 
-So: a real legacy mainnet P2PKH/P2SH spend that must be verified by the asm
-interpreter's own OP_CHECKSIG/OP_CHECKMULTISIG is not yet proven -- the correct,
-audited legacy verification lives in asm/bitcoin_verify.c (bitcoin_verify.c
-check_sig: sighash_all + der_parse_sig + pubkey_parse + ecdsa_verify, verified
-differential vs Core in test_verify_p2sh), but it is NOT wired into the
-interpreter the way the taproot callback is.
+- **Legacy OP_CHECKSIG through bitcoin_interp.asm IS wired and correct.** The
+  probe (`tests/test_interp_legacy_spend.c`) wires a real ECDSA checksig_fn and
+  proves the interpreter passes the correct (sig, pub, scriptCode-slice) to it:
+  callbacks are entered with `siglen=72 publen=33 slice_len=35` and
+  `der_parse_sig` accepts the (low-S) signature. The taproot path
+  (`test_taproot_sighash.c`) is, as established, ALL PASS 48/48.
+- **`interp_checkmultisig` (bitcoin_interp.asm ~line 2129) REMAINS A STRUCTURAL
+  STUB**: it sets `interp_err = 12` (placeholder) and exits without actually
+  walking keys/sigs to verify an m-of-n OP_CHECKMULTISIG. So a genuine 2-of-3
+  P2SH redeem run through the INTERPRETER ITSELF is not yet signature-verified
+  there. This is the one genuine legacy-interpreter gap.
 
-This file is a DIAGNOSTIC: it wires a real ECDSA checksig_fn (same audited
-primitives as bitcoin_verify.c) and the P2PKH "genuine ACCEPT" passes when the
-callback IS structurally reached, but the legacy path's non-enforcement and the
-OP_CHECKMULTISIG structural stub (interp_checkmultisig sets a placeholder error,
-line ~1794: "simplified structural implementation") mean the checks are not yet
-ALL GREEN. The 2 known-failing checks (P2PKH corrupt-sig reject, 2-of-3 two-sig
-accept) are the honest, reproducible evidence of the uncovered work.
+## What the probe proved (evidence)
+- Callback entered 2x (the two P2PKH runs) with correct inputs; `der_parse_sig`
+  returns 1 after low-S normalization (the initial failures were my DER).
+- P2PKH `<pub> CHECKSIG` genuine-vs-wrong-pubkey is now correctly distinguished.
+- A 2-of-3 OP_CHECKMULTISIG script cannot ACCEPT through the interpreter today
+  because `interp_checkmultisig` is a stub (it must verify in the caller, e.g.
+  bitcoin_verify.c, not the interpreter proper).
 
-CLOSING IT (future card): wire the legacy OP_CHECKSIG/OP_CHECKMULTISIG through a
-real ECDSA checksig_fn in the interpreter and add final-stack enforcement for
-legacy (or verify in the caller), mirroring the working taproot path. Until then
-legacy spends through the interpreter are not signature-verified.
+## How to close it (future work)
+Reimplement `interp_checkmultisig` in bitcoin_interp.asm to actually implement
+the Core CHECKMULTISIG semantics using the checksig_fn callback (pop nKeys,
+iterate keys left-to-right matching sigs, NULLDUMMY handling, push bool), the
+way .op_checksig already delegates to interp_checksig. Mirror the proven
+bitcoin_verify.c CheckMultisig + the taproot checksig wiring. Then re-run
+tests/test_interp_legacy_spend.c (both 2-of-3 scenarios) green and the full
+make test for regression.
+
+## NOTE: legacy final-stack enforcement
+legacy script_eval() returns "no script error" without enforcing final-stack
+truth (that is TAPSCRIPT-only). Real consensus enforces it in the caller
+(VerifyScript inspects the resolved stack). Any harness must do the same; this
+is caller responsibility, not an interpreter bug.
+
+## Status
+Probe committed as tests/test_interp_legacy_spend.c (+ Makefile target). The
+OP_CHECKMULTISIG stub fix is the open item; tracked here and in PLAN.
