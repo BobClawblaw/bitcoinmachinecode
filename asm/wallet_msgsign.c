@@ -453,48 +453,34 @@ int msg_sign_core(const unsigned char priv_be[32], const char* message,
     unsigned char pub[33];
     scalar_to_pubkey(pub, priv_be);
 
-    /* wallet_ecdsa_sign applies LOW-S normalization (may return n - s). We do
-     * not know whether s was flipped, so we try BOTH s and (n - s), each with
-     * recovery ids 0..3, and keep the (s-variant, recid) pair that recovers the
-     * signer's own pubkey. low_s encodes which variant was used so the verifier
-     * reproduces the exact same internal s. */
-    uint64_t ns[4];
-    {
-        uint64_t c = 0;
-        for (int i = 0; i < 4; i++) {
-            uint64_t sub = N_SC[i] + c;
-            ns[i] = s[i] - sub;
-            c = (s[i] < sub) ? 1 : 0;
-        }
-    }
-    int low_s = 0;
+    /* wallet_ecdsa_sign ALWAYS applies low-S normalization (secp256k1_scalar.c
+     * `if s > n/2 then s = n - s`; see wallet_core.c), so `s` is guaranteed
+     * low-S on every path. Core never encodes a low-S flag in the compact
+     * header (low-S is a signing policy, and recovery operates on the exact s
+     * emitted), so we do NOT carry one either: recovery against the emitted
+     * low-S `s` is the only variant possible. recid is found by trying 0..3
+     * and keeping the one that recovers the signer's own pubkey. */
     uint64_t Qx[4], Qy[4];
     int rec = -1;
-    for (int variant = 0; variant < 2 && rec < 0; variant++) {
-        const uint64_t* sv = variant ? ns : s;
-        for (int i = 0; i < 4 && rec < 0; i++) {
-            int rcc = ecdsa_recover(r, sv, z, i, Qx, Qy);
-            if (rcc == 0) {
-                unsigned char rp[33];
-                comp_pubkey_from_aff(rp, Qx, Qy);
-                if (memcmp(rp, pub, 33) == 0) { rec = i; low_s = variant; break; }
-            }
+    for (int i = 0; i < 4 && rec < 0; i++) {
+        int rcc = ecdsa_recover(r, s, z, i, Qx, Qy);
+        if (rcc == 0) {
+            unsigned char rp[33];
+            comp_pubkey_from_aff(rp, Qx, Qy);
+            if (memcmp(rp, pub, 33) == 0) { rec = i; break; }
         }
     }
     if (rec < 0) return -1;
 
-    /* compact: header = 27 + recid (+4 compressed) ; Core low-s is NOT encoded
-     * in the header (low-s is a policy, recovery works on the exact s used).
-     * We carry our OWN low-s bit in bit 3 (value 8) so it does not COLLIDE with
-     * the +4 compressed marker in bit 2 (value 4). With both, the header stays
-     * in the Core-compatible 27..39 range: 27..30 = uncompressed, 31..38 =
-     * compressed, plus value 8 when the signer normalized s to low-s. */
+    /* compact header: 27 + (4 if compressed) + recid -- EXACTLY Bitcoin Core's
+     * signmessage/verifymessage header byte, with no project-specific bit, so
+     * the emitted base64 is byte-compatible with Core. (Low-S is not encoded;
+     * see above.) */
     unsigned char comp[65];
-    /* header = 27 + (4 if compressed) + recid + (8 if low_s) */
-    comp[0] = (unsigned char)(27 + 4 + rec + (low_s ? 8 : 0));
+    comp[0] = (unsigned char)(27 + 4 + rec);
     unsigned char rbe[32], sbe[32];
     limbs_to_be(rbe, r);
-    limbs_to_be(sbe, low_s ? ns : s);
+    limbs_to_be(sbe, s);
     memcpy(comp + 1, rbe, 32);
     memcpy(comp + 33, sbe, 32);
     b64_encode(comp, 65, sig_b64);
@@ -510,14 +496,13 @@ int msg_verify_core(const char* address, const char* message, const char* sig_b6
     int cl = b64_decode(sig_b64, comp, sizeof comp);
     if (cl != 65) return -1;
     int hdr = comp[0];
-    /* valid range for our encoding (always compressed, recid 0..3, low_s bit):
-     * min = 27+4+0+0 = 31 ; max = 27+4+3+8 = 42. */
-    if (hdr < 27 || hdr > 42) return -1;
-    /* compressed iff (hdr >= 31) ; we always emit compressed. Decode:
-     * low_s = bit 3 (value 8), recid = bits 1..0 (27 + 4 leaves base with the
-     * compression +4 in bit 2, recid in bits 0-1, low_s in bit 3). */
+    /* Bitcoin Core compact-signature header range. 27..30 = uncompressed,
+     * 31..34 = compressed; we always emit compressed (31..34). Core's header
+     * has no low-S bit. */
+    if (hdr < 27 || hdr > 34) return -1;
+    /* compressed iff (hdr >= 31) ; recid = (hdr - 27) & 3, with the +4
+     * compressed bit in bit 2. */
     int base = hdr - 27;
-    int low_s = (base >> 3) & 1;
     int rec = base & 3;
     unsigned char rbe[32], sbe[32];
     memcpy(rbe, comp + 1, 32);
@@ -528,16 +513,6 @@ int msg_verify_core(const char* address, const char* message, const char* sig_b6
     unsigned char zbe[32];
     if (msg_digest(zbe, message) != 0) return -1;
     be_to_limbs(z, zbe, 32);
-    /* undo low-s if the signer flagged it: the stored s is n-s when low_s set,
-     * so the internal s we recover with is (n - stored). */
-    if (low_s) {
-        uint64_t c = 0;
-        for (int i = 0; i < 4; i++) {
-            uint64_t sub = N_SC[i] + c;
-            ss[i] = ss[i] - sub;
-            c = 0; /* one subtraction suffices (s < n) */
-        }
-    }
     uint64_t Qx[4], Qy[4];
     if (ecdsa_recover(r, ss, z, rec, Qx, Qy) != 0) return -1;
     /* serialize recovered compressed pubkey and compare its hash160 to address */
