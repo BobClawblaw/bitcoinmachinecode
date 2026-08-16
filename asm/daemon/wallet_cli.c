@@ -75,6 +75,10 @@ extern int  wallet_seed_bip44_address(char addr[64], const unsigned char seed[64
 extern int  wallet_store_create(const char* path, const char* mnemonic, const char* pass);
 extern int  wallet_store_load(const char* path, char* mnemonic_out, int cap,
                               char* pass_out, int pcap);
+/* BIP32 path derivation (asm/wallet_core.c) -> private key for signing */
+extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
+                              const unsigned char seed[64], unsigned seedlen,
+                              const unsigned indexes[], unsigned n);
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -542,6 +546,32 @@ static int cmd_getaddress(int argc, char** argv) {
     return 0;
 }
 
+static int cmd_getprivkey(int argc, char** argv) {
+    /* derive the PRIVATE KEY (hex) for address index i of the persistent wallet,
+     * for use with send/sendtoaddress/sign:   wallet_cli getprivkey [index] [path] */
+    unsigned idx = 0;
+    const char* path = default_wallet_path();
+    if (argc >= 3) idx = (unsigned)strtoul(argv[2], NULL, 10);
+    if (argc >= 4) path = argv[3];
+    char mn[768], pass[256];
+    if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
+        fprintf(stderr, "getprivkey: cannot load wallet %s\n", path);
+        return 1;
+    }
+    unsigned char seed[64];
+    long pl = pass[0] ? (long)strlen(pass) : 0;
+    wallet_mnemonic_seed(seed, mn, pass[0] ? pass : NULL, pl);
+    /* BIP44 account 0, external, index idx: m/44'/0'/0'/0/idx */
+    unsigned char k[32], c[32];
+    unsigned indexes[5] = { 44 | 0x80000000u, 0x80000000u, 0x80000000u, 0, idx };
+    if (bip32_derive_path(k, c, seed, 64, indexes, 5) != 1) {
+        fprintf(stderr, "getprivkey: derivation failed\n");
+        return 1;
+    }
+    print_hex(k, 32); printf("\n");
+    return 0;
+}
+
 static int cmd_seed(int argc, char** argv) {
     /* restore a recoverable seed from a mnemonic (and optional passphrase):
      *   wallet_cli seed "<w0 w1 ... wn>" [passphrase]   (sentence in quotes) */
@@ -572,7 +602,7 @@ static int cmd_seed(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress> [args...]\n");
+        fprintf(stderr, "usage: wallet_cli <gen|addr|sign|send|sendtoaddress|balance|getnewaddress|getrawchangeaddress|validateaddress|getaddressinfo|gettxout|listunspent|decoderawtransaction|signrawtransactionwithkey|mnemonic|seed|init|load|getaddress|getprivkey> [args...]\n");
         return 2;
     }
     if (!strcmp(argv[1], "gen")) return cmd_gen();
@@ -581,6 +611,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "init")) return cmd_init(argc, argv);
     if (!strcmp(argv[1], "load")) return cmd_load(argc, argv);
     if (!strcmp(argv[1], "getaddress")) return cmd_getaddress(argc, argv);
+    if (!strcmp(argv[1], "getprivkey")) return cmd_getprivkey(argc, argv);
     if (!strcmp(argv[1], "addr")) {
         if (argc < 3) { fprintf(stderr, "usage: wallet_cli addr <privkey_hex>\n"); return 2; }
         return cmd_addr(argv[2]);
