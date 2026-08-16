@@ -1,0 +1,22 @@
+{
+ "generated": "2026-08-16T15:34:35Z",
+ "tip": 962748,
+ "total_blocks": 962752,
+ "blocks_checked": 962749,
+ "calibrate": null,
+ "elapsed_s": 1209.2,
+ "stats": {
+  "blocks": 962749,
+  "accept_ok": 962749,
+  "hash_ok": 962749,
+  "pow_ok": 962749,
+  "ntx_ok": 962749,
+  "chain_ok": 962748,
+  "missing": 0,
+  "mut_run": 0,
+  "mut_agree": 0,
+  "mut_both_accepted": 0,
+  "mut_asm_unknown": 0
+ },
+ "divergences": []
+}

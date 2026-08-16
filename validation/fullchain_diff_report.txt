@@ -1,0 +1,7 @@
+Full-chain differential vs Core (hash-for-hash, 962752 blocks)
+generated: 2026-08-16T15:34:35Z  tip: 962748  blocks: 962749/962752  elapsed: 1209.2s
+
+surfaces: A accept / B hash / D pow / E txcount / CHAIN prev-link / F mut
+stats: {"blocks": 962749, "accept_ok": 962749, "hash_ok": 962749, "pow_ok": 962749, "ntx_ok": 962749, "chain_ok": 962748, "missing": 0, "mut_run": 0, "mut_agree": 0, "mut_both_accepted": 0, "mut_asm_unknown": 0}
+
+ZERO DIVERGENCES across all 962749 real-mainnet blocks.
