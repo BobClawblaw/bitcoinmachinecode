@@ -137,6 +137,21 @@ int wallet_address(char out[64], const unsigned char priv_be[32]) {
     return 0;
 }
 
+/* P2PKH address with an explicit version byte (network-parameterized). Use 0x00
+ * for mainnet, 0x6F for testnet/regtest (the version byte Core's regtest accepts).
+ * Added so the wallet can produce addresses a regtest node will mine/validate to,
+ * enabling a real send test. */
+int wallet_address_net(char out[64], const unsigned char priv_be[32],
+                       unsigned pk_version) {
+    unsigned char pub[33], h[20], payload[21];
+    scalar_to_pubkey(pub, priv_be);
+    hash160(h, pub, 33);
+    payload[0] = (unsigned char)(pk_version & 0xff);
+    memcpy(payload + 1, h, 20);
+    base58check_encode(out, payload, 21);    /* verified primitive */
+    return 0;
+}
+
 /* Build the P2PKH prevout script (the signing script) for a compressed pubkey:
  *   OP_DUP 0xA9, OP_HASH160 0xA9, PUSH20 <h160>, OP_EQUALVERIFY 0x88, OP_CHECKSIG 0xAC
  * length = 25. */
@@ -338,6 +353,25 @@ long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]) {
     for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
     bech32_init();
     long long sl = bech32_encode(out, "bc", 2, data, dl, 0);  /* spec 0 = bech32 */
+    return (sl >= 0 && sl < cap) ? (long)sl : -1;
+}
+
+/* P2WPKH address with an explicit bech32 HRP (network-parameterized). Use "bc"
+ * for mainnet, "bcrt" for regtest (Core regtest rejects mainnet "bc" addresses;
+ * it requires the "bcrt" HRP). Needed so the wallet can produce a regtest-valid
+ * bech32 address for a real send test. */
+long wallet_p2wpkh_address_hrp(char* out, long cap, const unsigned char h160[20],
+                               const char* hrp) {
+    long long hrplen = (long long)strlen(hrp);
+    unsigned char d5[40];
+    long long n5 = bech32_convert_bits(d5, h160, 20, 8, 5, 1);
+    if (n5 < 0) return -1;
+    unsigned char data[40];
+    long long dl = 0;
+    data[dl++] = 0;                     /* witness version v0 */
+    for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
+    bech32_init();
+    long long sl = bech32_encode(out, hrp, hrplen, data, dl, 0);  /* spec 0 = bech32 */
     return (sl >= 0 && sl < cap) ? (long)sl : -1;
 }
 
