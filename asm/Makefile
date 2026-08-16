@@ -171,6 +171,13 @@ tests/test_ibd_blocks: tests/test_ibd_blocks.c $(IBDOBJS)
 tests/test_ibd_full: tests/test_ibd_full.c $(IBDOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_full.c $(IBDOBJS)
 
+# LARGE-SCALE full-IBD demo (default NB=20000; slow, heavy manual test, NOT in
+# the `test` target). Same IBDOBJS link set as test_ibd_full. Brought under the
+# Makefile so `make tests/test_ibd_scale` always relinks against CURRENT objects
+# (previously it was built by hand and rotted stale, failing spuriously).
+tests/test_ibd_scale: tests/test_ibd_scale.c $(IBDOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_ibd_scale.c $(IBDOBJS)
+
 # bitcoin_addrmgr.asm: peer address book + addr v1 codec (standalone deps).
 ADMRGOBJS := bitcoin_addrmgr.o
 tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)

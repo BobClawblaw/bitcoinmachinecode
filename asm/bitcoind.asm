@@ -1227,19 +1227,6 @@ node_ibd_blocks:
     call hst_get_at
     test eax, eax
     jle  .fail              ; out-of-range/err -> treat as hard error
-    ; (debug) one '.' per block to stderr
-    mov  byte [rel dbg_dot], '.'
-    push rbx
-    push r12
-    push r11
-    mov  eax, 1
-    mov  edi, 2
-    lea  rsi, [rel dbg_dot]
-    mov  edx, 1
-    syscall
-    pop  r11
-    pop  r12
-    pop  rbx
     ; build getdata(block_hash = rec+80) into getdata@rbp-0x110
     lea  rdi, [rbp-0x110]
     lea  rsi, [rbp-0xd0+80]
@@ -1260,25 +1247,6 @@ node_ibd_blocks:
     mov  ecx, r15d          ; buflen (cap)
     lea  r8, [rbp-0x60]     ; &plen
     call p2p_read
-    ; (debug) mark p2p_read returned
-    push rax
-    push rdi
-    push rsi
-    push rdx
-    push rcx
-    push r11
-    mov  byte [rel dbg_readmark], '#'
-    mov  eax, 1
-    mov  edi, 2
-    lea  rsi, [rel dbg_readmark]
-    mov  edx, 1
-    syscall
-    pop  r11
-    pop  rcx
-    pop  rdx
-    pop  rsi
-    pop  rdi
-    pop  rax
     test rax, rax
     jle  .fail              ; eof/err
     lea  rdi, [rbp-0xe0]
@@ -1772,13 +1740,6 @@ node_ibd:
 section .data
 align 16
 ua: db "Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x"   ; EXACTLY 42 chars (len byte = 42 above)
-
-; (debug, temporary) node_ibd_blocks per-block progress to stderr.
-global dbg_dot
-dbg_dot: db 0
-; (debug, temporary) p2p_read returned marker.
-global dbg_readmark
-dbg_readmark: db 0
 
 section .rodata
 _version: db "version",0
