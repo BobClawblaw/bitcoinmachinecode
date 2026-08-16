@@ -108,6 +108,10 @@ extern int msg_sign(const unsigned char priv_be[32], const char* message,
 extern int msg_verify(const unsigned char pub[33], const char* message,
                       const char* rs_hex);
 extern int msg_match_address(const unsigned char pub[33], const char* address);
+extern int msg_sign_core(const unsigned char priv_be[32], const char* message,
+                         char sig_b64[96]);
+extern int msg_verify_core(const char* address, const char* message,
+                           const char* sig_b64);
 extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
 extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char k[32]);
 
@@ -786,7 +790,8 @@ static int cmd_history(int argc, char** argv) {
 
 /* signmessage: sign an arbitrary message with a wallet private key.
  *   usage: wallet_cli signmessage <priv_hex> <message>
- *   prints the BIP137 message signature as r||s hex (128 chars). */
+ *   prints the BIP137 message signature as r||s hex (128 chars), plus the
+ *   Core-compatible recoverable base64 form (verifiable from an ADDRESS alone). */
 static int cmd_signmessage(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: wallet_cli signmessage <priv_hex> <message>\n"
@@ -801,45 +806,61 @@ static int cmd_signmessage(int argc, char** argv) {
     if (msg_sign(priv, argv[3], rs) != 0) {
         fprintf(stderr, "signmessage: signing failed\n"); return 1;
     }
+    char coreb64[96];
+    int core_ok = (msg_sign_core(priv, argv[3], coreb64) == 0);
     unsigned char pub[33];
     scalar_to_pubkey(pub, priv);
     unsigned char h[20];
     wallet_key_h160(h, priv);
-    printf("signature: %s\n", rs);
-    printf("pubkey:    "); print_hex(pub, 33); printf("\n");
+    char addr[64];
+    wallet_address(addr, priv);   /* always fills buffer (returns 0); mainnet P2PKH */
+    printf("signature:  %s\n", rs);
+    printf("pubkey:     "); print_hex(pub, 33); printf("\n");
+    printf("address:    %s\n", addr);
+    if (core_ok) {
+        printf("sig_core:   %s\n", coreb64);
+        printf("check:      wallet_cli verifymessage %s \"%s\" %s\n",
+               addr, argv[3], coreb64);
+    }
     return 0;
 }
 
 /* verifymessage: verify a message signature against a public key or address.
- *   usage: wallet_cli verifymessage <pub_hex|address> <message> <sig_hex>
- *   prints "true"/"false"; exit 0 if valid, 1 if invalid/malformed. */
+ *   usage: wallet_cli verifymessage <pub_hex66|address> <message> <sig>
+ *   <sig> is the 128-char r||s hex when verifying against a pubkey, OR the
+ *   Core base64 compact signature when verifying against an ADDRESS alone
+ *   (pubkey recovered from sig via msg_verify_core, hash160 compared to addr).
+ *   Prints "true"/"false"; exit 0 if valid, 1 if invalid/malformed. */
 static int cmd_verifymessage(int argc, char** argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: wallet_cli verifymessage <pub_hex66|address> <message> <sig_hex128>\n");
+        fprintf(stderr, "usage: wallet_cli verifymessage <pub_hex66|address> <message> <sig>\n"
+                        "       (address mode uses the Core base64 compact sig;\n"
+                        "        pubkey mode uses the 128-char r||s hex)\n");
         return 2;
     }
     const char* who = argv[2];
     const char* msg = argv[3];
-    const char* rs  = argv[4];
+    const char* sig = argv[4];
+    int ok = 0;
+    /* ---- pubkey given directly? (66 hex = 33 bytes) -> r||s hex sig ---- */
     unsigned char pub[33];
-    int have_pub = 0;
-    /* pubkey given directly? (66 hex = 33 bytes) */
-    if (strlen(who) == 66) {
-        if (hex_to_bytes(pub, who, 66)) have_pub = 1;
+    if (strlen(who) == 66 && hex_to_bytes(pub, who, 66)) {
+        if (strlen(sig) == 128) {
+            ok = (msg_verify(pub, msg, sig) == 1);
+        } else {
+            fprintf(stderr, "verifymessage: pubkey mode expects a 128-char r||s hex sig\n");
+            return 2;
+        }
+    } else {
+        /* ---- address mode: recover pubkey from the Core base64 compact sig --- */
+        int r = msg_verify_core(who, msg, sig);
+        if (r == 0) ok = 0;         /* valid structure but address mismatch */
+        else if (r == 1) ok = 1;
+        else {
+            fprintf(stderr, "verifymessage: malformed address or signature\n");
+            return 2;
+        }
     }
-    /* else treat as a base58check address: decode to (version||h160) */
-    if (!have_pub) {
-        unsigned char adec[25]; long al = 0;
-        /* try to decode as an address; we need the pubkey though, so the
-         * address-only path requires the caller to have passed the pubkey
-         * separately -- if not, error clearly. */
-        extern long wallet_base58check_decode_to_pub; (void)wallet_base58check_decode_to_pub;
-        (void)adec; (void)al;
-        fprintf(stderr, "verifymessage: pass the sender's 66-hex public key "
-                        "(or an address is not yet recoverable from the signature here)\n");
-        return 2;
-    }
-    int ok = have_pub && msg_verify(pub, msg, rs);
     printf("%s\n", ok ? "true" : "false");
     return ok ? 0 : 1;
 }
