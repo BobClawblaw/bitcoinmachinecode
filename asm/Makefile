@@ -497,8 +497,11 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_s
                bitcoin_hash.o sha256.o ripemd160.o \
                bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
                bitcoin_utxo.o
-daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c $(WALLETPRIMS)
-	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c $(WALLETPRIMS)
+daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c $(WALLETPRIMS)
+	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c $(WALLETPRIMS)
+
+tests/test_wallet_txlog: tests/test_wallet_txlog.c wallet_txlog.c
+	$(CC) -no-pie -O0 -o $@ tests/test_wallet_txlog.c wallet_txlog.c
 
 tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
 	$(CC) -no-pie -O0 -o $@ tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
