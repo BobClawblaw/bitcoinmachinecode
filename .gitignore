@@ -154,3 +154,6 @@ asm/tests/test_bip30
 KANBAN.md
 **/KANBAN.md
 .kitchen/kanban/**
+
+# ---- Full-chain differential resume/progress state (scratch, not a deliverable) ----
+validation/fullchain_state/
