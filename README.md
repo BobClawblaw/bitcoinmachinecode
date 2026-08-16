@@ -87,6 +87,21 @@ assembly.
   asm hashes). The assembly hashing/tx stack also reproduces the real genesis
   block hash + coinbase txid (test_block/test_tx) and a live-downloaded real
   mainnet block-1 hash (manual `test/live_blocks.c`).
+- **Optional CUDA batch-acceleration tier** (`asm/cuda/`) — an explicit,
+  runtime-gated accelerator for batched SHA-256 / SHA-256d (Bitcoin's double
+  hash), matching the CPUID/SHA-NI design philosophy but with a *device probe*.
+  A single dispatcher (`bmc_sha256d_batch`) auto-detects a usable GPU at runtime
+  and uses CUDA only when a device is present AND the batch is large enough to
+  amortize launch/copy (>=512) AND not disabled (`BMC_CUDA=0`); on any CUDA
+  error, no device, or a small batch it falls back bit-exact to the proven
+  assembly `sha256d`. Correctness is the priority: the CUDA digest must equal the
+  asm oracle byte-for-byte. Verified against the asm oracle over the FIPS
+  vectors, all Bitcoin padding edges, and 10,000 random messages (0 failures);
+  routing/digests verified in every mode (default->CUDA, disabled/small/no-GPU
+  ->CPU fallback). Measured ~17-18x GPU/CPU wall-clock at N=1,000,000 on an
+  RTX 5090 (CPU wins below ~100). Building the kernels needs nvcc + CUDA GPU; the
+  dispatcher itself links and runs with zero CUDA installed (falls back to CPU).
+  Not yet wired into bitcoind/bitcoin_cli — see WORKING.md for the roadmap.
 
 All assembly is authored by AI; C/Python harnesses exist only to prove the
 machine code is correct against trusted references. Real-mainnet validation
@@ -484,6 +499,15 @@ bitcoinmachinecode/
 |   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer over mempool + UTXO
 |   +-- build.sh              # assemble + build + run every verification harness
 |   +-- Makefile              # make asm | test | clean
+|   +-- cuda/                 # optional CUDA batch-acceleration tier (crypto)
+|   |   +-- cuda_sha256.cu    #   batch SHA-256 / SHA-256d kernel + host ABI
+|   |   +-- cuda_sha256.h     #   opaque batch ABI header
+|   |   +-- cuda_autodetect.c #   runtime auto-detect + CPU-fallback dispatcher
+|   |   +-- cuda_verify.cu    #   correctness gate vs the asm oracle (PASSES)
+|   |   +-- cuda_bench.cu     #   GPU/CPU throughput comparison
+|   |   +-- cuda_autodetect_test.c # routing/digest matrix (all modes)
+|   |   +-- Makefile          #   make verify | bench | detect | all
+|   |   +-- WORKING.md        #   feasibility analysis + roadmap
 |   +-- tests/                # C harnesses proving the machine code correct
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
