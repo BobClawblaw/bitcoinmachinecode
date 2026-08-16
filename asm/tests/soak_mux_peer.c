@@ -286,7 +286,7 @@ int main(int argc, char** argv){
                     hp[0]=(unsigned char)(cnt>255?255:cnt);
                     int p=1;
                     for(int i=from;i<from+cnt;i++){ memcpy(hp+p, chain_blk+i*BLOCK_CAP, 80); hp[p+80]=0; p+=81; }
-                    p2p_write(cfd,"headers",7,hp,(unsigned)(p-1));
+                    p2p_write(cfd,"headers",7,hp,(unsigned)p);
                     free(hp);
                 } else p2p_write(cfd,"headers",7, (unsigned char*)"\x00", 1);
             } else if(!strncmp(cmd,"getdata",7)){
