@@ -94,6 +94,7 @@ asm/tests/test_p2p_inv
 asm/tests/test_bip152
 asm/tests/test_bip152_loop
 asm/tests/test_sendheaders_fee
+asm/tests/bench_store_read
 asm/bitcoin_cmpct.o
 asm/tests/test_sha512
 asm/sha512.o
@@ -123,6 +124,8 @@ asm/tests/test_bip32_extkey
 asm/tests/test_bip39
 asm/tests/test_wallet
 asm/tests/test_e2e_sighash
+asm/tests/test_msg_sign
+asm/tests/test_wallet_txlog
 asm/tests/test_send
 asm/tests/test_wrpc_addr
 asm/tests/test_wrpc_utxo
