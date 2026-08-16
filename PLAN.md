@@ -596,6 +596,21 @@ existing bmc_sha256d_batch auto-detect + fallback:
   signature audit (validate all historical inputs). EC-mult is GPU-accelerable
   but is a large port (field/point math in CUDA) validated vs the secp256k1
   oracle/corpus. One warp/lane per input.
+  [ DONE ] ECDSA half delivered as `asm/cuda/cuda_ecdsa_verify.cu` (per-thread
+  full ECDSA verify) + `asm/cuda/cuda_ecdsa_math.h` (secp256k1 field/scalar/
+  point math, pure CUDA/C, no asm). Per-thread: s^-1 (mod n, Fermat), u1,u2,
+  R=u1*G+u2*Q (double-and-add scalar_mul + Jacobian mixed add with self-add/
+  infinity guards), accept iff R.x mod n == r.  Verified bit-exact vs the host
+  oracle; that oracle matches the repo's asm `ecdsa_verify` on ALL 8 official
+  test vectors (2 valid accept, 6 rejects) AND an independent python-verified
+  random signature.  GPU gate: 32/32 official vectors + 512/512 known-vector
+  batch, ALL GPU results == host == expected.  Math primitives cross-checked vs
+  python ints (4000/4000 mulmod) and known curve points (kG for k=1,2,3,5,7,11
+  + G+G=2G).  Build/run: `make -C asm/cuda verify_ecdsa` (GPU gate),
+  `make -C asm/cuda ecdtest` (host-only asm-vector cross-check, fails=0).
+  NOTE: correctness-first binary long-division reduction (k=256 range for the
+  full 2^257 quotient bound) and Fermat inversion; this is an offline audit
+  tool, not constant-time hot-path.  Schnorr batch verify remains future work.
 
 NOT CUDA targets (do not pursue): live IBD download (network-bound), per-block
 cons_verify, single hashes / one RPC / one tx accept, per-derivation HMAC chain.
