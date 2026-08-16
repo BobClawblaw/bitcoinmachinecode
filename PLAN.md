@@ -566,6 +566,11 @@ existing bmc_sha256d_batch auto-detect + fallback:
   PoW + block_hash across thousands of headers in one CUDA block_hash/sha256d
   batch (kernel exists; ~18x measured). Target: pverify/chainctl/check_chain
   style offline audit of a stored chain.
+  **[DONE 2026-08-16]** cuda_header_audit: recomputes block_hash for the whole
+  stored chain in ONE bmc_sha256d_batch and checks hash-match + PoW + chain-link.
+  Proven on the real 582,000-header headers.dat: all 582k hash-match, PoW, and
+  chain-link hold (0 anomalies); CUDA batch bit-exact vs asm oracle (0 mismatch).
+  Build/run: `make -C asm/cuda audit` (auto-detect + asm fallback if no GPU).
 - B (build-out of cuda_txid_poc): CROSS-BLOCK txid / re-index recompute. Gather
   unwitnessed txs from thousands of stored blocks into ONE CUDA sha256d batch
   (NOT per-block — the PoC proved per-block loses). For utxo/txid index rebuild /
