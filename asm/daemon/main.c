@@ -23,10 +23,19 @@
 #include <netinet/tcp.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <fcntl.h>
+
+/* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
+ * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
+ * CATCHUP_MAX_SECS caps the catch-up wall-clock. Both keep the mux loop (the
+ * long-running stays-current mechanism) from being delayed indefinitely by a
+ * far-from-tip store. */
+#define CATCHUP_MAX 10000L
+#define CATCHUP_MAX_SECS 60.0
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
@@ -41,6 +50,7 @@ extern long store_init(void* st);
 extern long store_reload(void* st);
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
+extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
 extern int  node_log_open(const char* path);
 extern void node_log_event(int fd, int kind, unsigned a, unsigned b, unsigned c);
 extern void node_log_str(int fd, int kind, const char* s, long len);
@@ -152,7 +162,19 @@ static const char* catchup_seeds[] = {
     "seed.bitcoin.wiz.biz"
 };
 static void anchor_locator(unsigned char loc[32]);   /* fwd decl (defined below) */
-static long outbound_catchup(void){
+/* Wall-clock alarm handler: raise SIGALRM after CATCHUP_MAX_SECS so the
+ * synchronous node_sync catch-up (blocking on a real seed) is interrupted and
+ * the mux loop can start. node_sync's blocking p2p_read is interrupted by the
+ * signal (EINTR), so it returns and the parent proceeds to the mux loop. */
+static void catchup_alarm(int sig){ (void)sig; }
+/* Bounded boot catch-up. Runs ONE node_sync pass (the verified asm download->
+ * validate->store path) against the first reachable seed, anchored at the
+ * stored tip, to close any small gap before the mux starts. A wall-clock alarm
+ * (CATCHUP_MAX_SECS) bounds the synchronous window: if the gap is large the
+ * alarm fires, node_sync returns, and the mux loop takes over closing the rest
+ * gradually WHILE SERVING (the mux is the long-running stays-current
+ * mechanism). Returns # blocks pulled. */
+static long outbound_catchup(long max_blocks){
     static unsigned char cbuf[4<<20];
     long total=0;
     for(size_t s=0; s<sizeof(catchup_seeds)/sizeof(catchup_seeds[0]); s++){
@@ -166,28 +188,27 @@ static long outbound_catchup(void){
         struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
         if(node_handshake(fd)!=1){ close(fd); continue; }
-        /* ACTIVE headers-first catch-up (node_sync sends getheaders and pulls
-         * real blocks -- NOT the passive node_drain, which waits for an inv the
-         * seed never pushes to a fresh peer). Anchor the locator to our STORED
-         * TIP so we only pull the missing tail (true incremental "stay current"),
-         * falling back to a zero locator (full download) only when the store is
-         * empty. node_sync advances its locator to the last stored hash after
-         * each page and stops when the peer serves zero headers == we are at the
-         * chain tip. Each block is cons_verify-validated with a re-derived-hash
-         * guard before store_append -- the same verified asm path as `follow`. */
         static unsigned char loc[32];
         /* Anchor from the STORED TIP index record (index-hash read, robust to a
          * transiently-unreadable tip body -- avoiding the live-found genesis
          * re-download duplicate-tail corruption) or a zero locator when empty. */
         anchor_locator(loc);
+        /* Wall-clock cap: alarm after CATCHUP_MAX_SECS so a large gap does not
+         * block the mux start. node_sync's blocking reads see the SIGALRM as
+         * EINTR and return; we then proceed to the mux loop. */
+        struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=catchup_alarm;
+        sigaction(SIGALRM,&sa,NULL);
+        alarm(CATCHUP_MAX_SECS);
         long cnt=0;
         long ok=node_sync(fd, store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
+        alarm(0);
         int tip=*(int*)(store_buf+24);
         fprintf(stderr,"[catchup] %-28s sync ok=%ld new=%ld tip=%d\n", host, ok, cnt, tip);
         close(fd);
-        if(ok==1 && cnt>0){ total=cnt; break; }
+        total=cnt;
+        break;   /* one bounded pass; the mux loop closes the rest */
     }
-    return total;
+    return total>max_blocks?max_blocks:total;
 }
 
 static unsigned char fake_blocks[8][4096]; static long fake_blen[8]; static unsigned char fake_bh[8][32]; static int fake_NB=0;
@@ -508,9 +529,18 @@ static long do_outbound_sync(int i){
  * outbound seed fds. Inbound accepts are forked to node_serve_loop children
  * (preserved behavior); outbound legs run inline (node_sync + announce).
  * `peers` = host names; `nwant` of them are connected on entry at `out_port`
- * (best effort). */
-static int serve_mux(int port, const char* peers[], int nwant, int out_port){
-    /* connect up to nwant outbound peers up front */
+ * (best effort).
+ *
+ * IMPORTANT: the listener socket is created FIRST, before any outbound
+ * connect. The outbound legs are best-effort; if they all fail the mux still
+ * serves inbound from the listener. Creating the listener up front also
+ * means `serve` is live to inbound peers immediately (the listener exists
+ * even while the outbound legs are still connecting), which the old order
+ * (connect-all-outbound-then-listen) did not guarantee. */
+static int serve_mux(int port, const char* peers[], int nwant, int out_port, int l){
+    /* connect up to nwant outbound peers up front (the listener `l` is already
+     * live and passed in, so inbound serving is available even while the
+     * outbound legs are still connecting). */
     for(int i=0;i<nwant && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed\n", peers[i]); continue; }
@@ -520,8 +550,6 @@ static int serve_mux(int port, const char* peers[], int nwant, int out_port){
         fprintf(stderr,"[mux] outbound %d = %s (fd %d)\n", mux_n_out, peers[i], fd);
         mux_n_out++;
     }
-    int l=lsock(port);
-    if(l<0) return 1;
     printf("serving on port %d (%d outbound peer(s))...\n", port, mux_n_out); fflush(stdout);
     long long rot=0;
     struct pollfd pfds[MUX_MAX_OUT+1];
@@ -757,10 +785,18 @@ int main(int argc, char** argv){
          * store_append_shared writes (and the boot catch-up) serialize. */
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
-        /* BEST-EFFORT OUTBOUND CATCH-UP (non-fatal): pull any missed blocks from
-         * a real seed before serving so the node is as current as the network
-         * allows on boot. Falls through cleanly with no network. */
-        long caught = outbound_catchup();
+        /* LISTENER FIRST: bind+listen the inbound socket before the (possibly
+         * long) catch-up so the node is live to inbound peers immediately.
+         * The mux loop will poll it once the catch-up returns. */
+        int l = lsock(port);
+        if(l<0){ perror("lsock"); return 1; }
+        /* BEST-EFFORT OUTBOUND CATCH-UP (non-fatal, BOUNDED): pull any missed
+         * blocks from a real seed before the mux starts, so the node is as
+         * current as the network allows on boot. Bounded to CATCHUP_MAX so a
+         * far-from-tip store never blocks the mux (listener + concurrent
+         * serving) indefinitely; the mux loop closes the rest gradually.
+         * Falls through cleanly with no network. */
+        long caught = outbound_catchup(CATCHUP_MAX);
         if(caught>0)
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
         build_hash_index();                 /* hash->height for O(1) getdata serving */
@@ -771,7 +807,7 @@ int main(int argc, char** argv){
          * children (concurrent serving preserved); outbound legs run INLINE in
          * this loop (periodic node_sync-from-tip + node_announce_tip), so the
          * node simultaneously serves AND stays current by its own poll. */
-        return serve_mux(port, catchup_seeds, nwant, 8333);
+        return serve_mux(port, catchup_seeds, nwant, 8333, l);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -792,7 +828,9 @@ int main(int argc, char** argv){
         build_hash_index();
         int lfd = node_log_open("bitcoind.log");
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
-        return serve_mux(port, peer, nwant, out_port);
+        int l = lsock(port);
+        if(l<0){ perror("lsock"); return 1; }
+        return serve_mux(port, peer, nwant, out_port, l);
     }
     return 2;
 }
