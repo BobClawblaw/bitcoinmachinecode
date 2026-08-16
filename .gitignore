@@ -165,12 +165,14 @@ KANBAN.md
 .kitchen/kanban/**
 
 # ---- outbound-mux soak scenario: fully removed from the repo/history ----
-# soak/, soak-store/, and the root files "4" and "6" were purged from all git
-# history. Ignore them outright so they can never be committed again.
+# soak/, soak-store/, the root files "4"/"6", and the git-worktree metadata
+# dir .worktrees/ were purged from all git history. Ignore them outright so
+# they can never be committed again.
 soak/
 soak-store/
 /4
 /6
+.worktrees/
 # Dev wallet + its separate secret file (regenerable via wallet_cli init)
 asm/config/wallet.dat
 asm/config/wallet.dat.pass
