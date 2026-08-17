@@ -1099,22 +1099,35 @@ static int dlc_probe_round(char pool[][64], int from, int ntry,
     return got;
 }
 
-/* total bytes a process has read (network + disk + everything -- for a
- * dlc_worker child this is dominated by socket reads), from the kernel's own
- * per-process I/O accounting. Real measured throughput, not an estimate:
- * block-level chunk counters miss a worker that's mid-transfer on a large
- * chunk, but this doesn't. Returns -1 if unavailable (process already gone,
- * or a non-Linux host without /proc). */
-static long dlc_proc_rchar(pid_t pid){
+/* read one named field out of /proc/<pid>/io ("rchar:", "write_bytes:", ...).
+ * Returns -1 if unavailable (process already gone, field not found, or a
+ * non-Linux host without /proc). */
+static long dlc_proc_iofield(pid_t pid, const char* field){
     char path[64]; snprintf(path,sizeof path,"/proc/%d/io",(int)pid);
     FILE* f=fopen(path,"r"); if(!f) return -1;
-    char line[128]; long v=-1;
+    char line[128]; long v=-1; size_t flen=strlen(field);
     while(fgets(line,sizeof line,f)){
-        if(!strncmp(line,"rchar:",6)){ v=atol(line+6); break; }
+        if(!strncmp(line,field,flen)){ v=atol(line+flen); break; }
     }
     fclose(f);
     return v;
 }
+/* total bytes a process has read (network + disk + everything -- for a
+ * dlc_worker child this is dominated by socket reads), from the kernel's own
+ * per-process I/O accounting. Real measured throughput, not an estimate:
+ * block-level chunk counters miss a worker that's mid-transfer on a large
+ * chunk, but this doesn't. NOTE: this is network-received bytes, NOT the
+ * same as disk bytes written -- index.dat's sparse-file block allocation,
+ * filesystem journaling, and local header/index re-reads all add disk I/O
+ * that never shows up here, which is why "aggregate" read-rate has run
+ * measurably behind actual `du` growth on this archive. See dlc_proc_wbytes
+ * for the disk-write-side counterpart. */
+static long dlc_proc_rchar(pid_t pid){ return dlc_proc_iofield(pid,"rchar:"); }
+/* actual bytes written to storage (kernel block-I/O accounting, not just
+ * buffered writes) -- the disk-side counterpart to dlc_proc_rchar, so the
+ * status log can show network-received and disk-written rates separately
+ * instead of one figure trying to represent both. */
+static long dlc_proc_wbytes(pid_t pid){ return dlc_proc_iofield(pid,"write_bytes:"); }
 
 /* human-scaled "N.NUNIT/s" into buf (>=16 bytes). */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
@@ -1255,8 +1268,9 @@ static long dl_catchup(const char* dir, int min_workers){
      * bytes read), not the block/chunk counters -- a worker mid-transfer on
      * one large chunk shows 0 chunks for minutes even while actively
      * downloading at full speed, which the byte counter catches. */
-    long prev_blocks[64]={0}; long prev_rchar[64]={0}; int dead_ticks[64]={0};
-    double cumulative_bytes=0.0; /* running total across the whole dl_catchup call, not just this tick */
+    long prev_blocks[64]={0}; long prev_rchar[64]={0}; long prev_wbytes[64]={0}; int dead_ticks[64]={0};
+    double cumulative_bytes=0.0;       /* running total network-received, across the whole call */
+    double cumulative_write_bytes=0.0; /* running total actually written to disk, across the whole call */
     int alive=nw;
     while(alive>0){
         struct timespec ts={10,0}; nanosleep(&ts,NULL);
@@ -1277,10 +1291,11 @@ static long dl_catchup(const char* dir, int min_workers){
                     elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct);
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
-        double tick_total_bytes=0.0;
+        double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(b-prev_blocks[w])/10;
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
+            long wc=kids[w]!=0 ? dlc_proc_wbytes(opid[w]) : -1;
             char bw[16]="--"; double byte_rate=-1.0;
             if(rc>=0){
                 if(prev_rchar[w]>0){
@@ -1291,6 +1306,10 @@ static long dl_catchup(const char* dir, int min_workers){
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
                 }
                 prev_rchar[w]=rc;
+            }
+            if(wc>=0){
+                if(prev_wbytes[w]>0) tick_total_write_bytes+=(double)(wc-prev_wbytes[w]);
+                prev_wbytes[w]=wc;
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
@@ -1318,11 +1337,32 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         {
             cumulative_bytes+=tick_total_bytes;
-            char totbuf[16], aggbuf[16], cumbuf[16];
+            cumulative_write_bytes+=tick_total_write_bytes;
+            char totbuf[16], aggbuf[16], cumbuf[16], wtotbuf[16], waggbuf[16], wcumbuf[16];
             dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
             dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/10.0);
             dlc_fmt_bytes(cumbuf,sizeof cumbuf,cumulative_bytes);
-            fprintf(stderr,"[dlc] -- transferred this tick: %s (%s aggregate) | total since start: %s --\n",totbuf,aggbuf,cumbuf);
+            dlc_fmt_bytes(wtotbuf,sizeof wtotbuf,tick_total_write_bytes);
+            dlc_fmt_rate(waggbuf,sizeof waggbuf,tick_total_write_bytes/10.0);
+            dlc_fmt_bytes(wcumbuf,sizeof wcumbuf,cumulative_write_bytes);
+            /* two genuinely different numbers, shown separately rather than
+             * conflated into one "aggregate": network-received (rchar) is
+             * NOT the same as disk-written (write_bytes) -- index.dat's
+             * sparse-block allocation, filesystem journaling, and local
+             * header/index re-reads all add disk I/O the network figure
+             * never sees, so disk growth normally runs ahead of it. */
+            fprintf(stderr,"[dlc] -- network recv this tick: %s (%s) | total recv: %s || disk write this tick: %s (%s) | total written: %s --\n",
+                    totbuf,aggbuf,cumbuf,wtotbuf,waggbuf,wcumbuf);
+            /* the per-tick numbers above are a noisy 10s snapshot -- this is
+             * the stable figure: total bytes / total elapsed time since
+             * dl_catchup started, so it settles down over the run instead
+             * of bouncing with whichever peers happen to be fast or slow
+             * in any given 10s window. */
+            long elapsed_secs=(long)(time(NULL)-catchup_start); if(elapsed_secs<1) elapsed_secs=1;
+            char avgrbuf[16], avgwbuf[16];
+            dlc_fmt_rate(avgrbuf,sizeof avgrbuf,cumulative_bytes/(double)elapsed_secs);
+            dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
+            fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
         }
     }
     long total=*done_count;
