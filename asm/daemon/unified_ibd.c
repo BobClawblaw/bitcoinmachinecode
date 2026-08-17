@@ -112,16 +112,18 @@ static void rmrf(const char* d){ DIR* dd=opendir(d); if(!dd) return;
 /* true iff every height in [lo,hi] already has a non-zero index.dat record.
  * Lets a worker skip a claimed chunk that's ALREADY archived (a real hole
  * span run alongside already-filled heights in one combined invocation)
- * without touching a peer at all -- just a single pread-sized index check. */
+ * without touching a peer at all -- just a single pread-sized index check.
+ * asm/bitcoin_idxscan.asm:idxscan_all_present -- buffered pread64, same
+ * function already used by dl_catchup (main.c) and proven 4-48x faster than
+ * this per-record fseek/fread shape. `dir` is unused: every caller runs
+ * after main()'s chdir(dir), so CWD already == dir; idxscan_all_present
+ * operates on "index.dat" relative to CWD, matching every other idxscan_*
+ * call site in the codebase. */
+extern long idxscan_all_present(long lo, long hi);
+extern long idxscan_tip(void);
 static int chunk_all_present(const char* dir, long lo, long hi){
-    char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
-    FILE* f=fopen(ip,"rb"); if(!f) return 0;
-    static unsigned char rec[48]; int all=1;
-    for(long k=lo;k<=hi;k++){
-        if(fseek(f,k*48,SEEK_SET)!=0 || fread(rec,1,48,f)!=48 || !(rec[0]||rec[1]||rec[2]||rec[3])){ all=0; break; }
-    }
-    fclose(f);
-    return all;
+    (void)dir;
+    return idxscan_all_present(lo, hi) != 0;
 }
 
 /* worker: pull CHUNK_BLOCKS-sized chunks from a SHARED atomic cursor
@@ -301,11 +303,15 @@ int main(int argc,char**argv){
      * do NOT jump forward to the tip, and do NOT shrink the index. ---- */
     long existing_tip=-1; long idx_records=0;
     {
+        /* idx_records still needs the file size (used later to pre-size the
+         * index), but the tip itself is now asm/bitcoin_idxscan.asm's
+         * idxscan_tip -- buffered pread64 instead of a per-record backward
+         * fseek/fread scan. CWD == dir here (chdir'd above), matching every
+         * other idxscan_* call site. */
         char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
-        FILE* ix=fopen(ip,"rb");
-        if(ix){ fseek(ix,0,SEEK_END); idx_records=ftell(ix)/48; fclose(ix);
-            long mh=-1; FILE* ix2=fopen(ip,"rb"); static unsigned char rec[48];
-            if(ix2){ long h=idx_records-1; while(h>=0){ if(fseek(ix2,h*48,SEEK_SET)==0 && fread(rec,1,48,ix2)==48 && (rec[0]||rec[1]||rec[2]||rec[3])){ mh=h; break; } h--; } fclose(ix2); }
+        struct stat sb;
+        if(stat(ip,&sb)==0){ idx_records=sb.st_size/48;
+            long mh = idxscan_tip();
             existing_tip=mh;
             if(mh>=0 && mh+1>start_h && !(end_h < mh)){ start_h=mh+1; printf("resume: existing tip %ld, continuing from %ld\n", mh, start_h); }
             else if(end_h < mh){ printf("backfill: range [%ld,%ld] is below existing tip %ld; preserving requested range\n", start_h,end_h,mh); }

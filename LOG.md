@@ -7,6 +7,54 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17 -- unified_ibd.c's LAST TWO RAW index.dat SCANS SWAPPED TO idxscan_*
+### Goal and outcome
+Fourth asm-adjacent pass today. A fresh survey (deliberately checking
+beyond the two items already flagged and deferred -- `verify.c`'s
+per-height `fopen`/`fclose`, low-value since real crypto work in the same
+loop dwarfs it and it's a rarely-run manual fallback; `paribd.c`'s
+per-record `fopen`, the worst constant-factor bug found but genuinely dead
+code with no Makefile target) confirmed `unified_ibd.c` still had the last
+two raw index.dat scans in the codebase duplicating already-proven asm
+functions: `chunk_all_present` (per-200-block-chunk presence check) and the
+tip-detection backward scan in `main()`.
+### Fix
+Both call sites run after `main()`'s own `chdir(dir)`, so CWD is already
+the archive directory -- no chdir-wrapper needed (unlike the `chainctl.c`
+fix earlier today), just direct calls to `idxscan_all_present`/
+`idxscan_tip`.
+### Honest framing
+This one is modest compared to the day's other three fixes, worth stating
+plainly rather than dressing up: these were plain I/O-bound loops with no
+compounding algorithmic issue (unlike `idx_hash`'s entropy collapse or
+`check_chain`'s O(n^2)) -- just the same buffered-pread64 constant-factor
+win the `idxscan` family already established elsewhere.
+### A benchmarking lesson mid-investigation
+First attempt constructed synthetic "pre-sized with trailing holes" test
+files via `truncate` extending a partial real copy -- this creates sparse-
+file holes the kernel serves as zero without touching disk at all,
+regardless of implementation, so it showed almost no difference either
+way. Recognized real production `index.dat` files are themselves sparse
+via the same pre-sizing mechanism, so re-ran against an actual snapshot of
+the live growing archive instead, which gave the honest numbers below.
+### Verified (hard evidence)
+- Tip-scan on a real snapshot (899,844 real tip, ~63,000 trailing zero
+  records to walk): 0.007s -> 0.001s (~7x).
+- `chunk_all_present` across the realistic hot-path pattern (a full
+  backfill's worth of 200-block chunk claims: 4,500 chunks over the present
+  range, 4,815 over the full range including trailing holes): 0.126s ->
+  0.0046s (~27x) and 0.151s -> 0.0048s (~32x) respectively. Correctness:
+  identical "all present" counts (4,496/4,496 matching) between old and new
+  at every tested range.
+- Full `make test`: 65/65 green, exit 0.
+### Safety note (deliberately avoided a repeat)
+Learned from an earlier incident today (running `chainctl` directly against
+the live production `data/` directory spawned real `unified_ibd` workers
+competing with the live daemon) -- this time, all testing used scratch
+copies exclusively, with `end_h` chosen so the resume logic's own "archive
+already complete; nothing to do" short-circuit fires before any network
+code path can run. Zero interaction with the live production archive.
+
 ## 2026-08-17 -- check_chain.c O(n^2) DUP DETECTOR FIXED + chainctl.c archive_tip SWAPPED TO idxscan_tip
 ### Goal and outcome
 Third asm-adjacent fix today (candidate found via a fresh survey of
