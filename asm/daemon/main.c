@@ -744,17 +744,26 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
  * data dir before mode dispatch, so paths below are bare relative
  * filenames, matching the rest of this file's convention (e.g. the
  * "append.lock" open just above the serve-mode block). */
-#define DLC_CHUNK_BLOCKS 200
+/* Optimizing for speed, not just "give every peer a fair shot": on a chunk
+ * cut, ALL progress on that chunk is thrown away (the retry path
+ * redownloads the whole thing from scratch, no partial resume) -- so the
+ * real lever is chunk size, not timeout length. A smaller chunk means a bad
+ * peer gets detected and replaced faster in wall-clock terms AND costs less
+ * to lose when it does happen; a good peer loses nothing either way since a
+ * successful connection is reused back-to-back across many chunks. 200
+ * blocks (~250-300MB near the tip) meant a bad-peer cut wasted a lot of
+ * work and took minutes to even trigger; 40 blocks (~50-60MB near the tip)
+ * with a proportionally shorter budget gives a ~4x faster detect-and-replace
+ * cycle at ~4x lower cost per miss. */
+#define DLC_CHUNK_BLOCKS 40
 #define DLC_MAXPOOL 512
 #define DLC_HDR_TRY_PEERS 8
-/* wall-clock budget for ONE chunk transfer. Near the real tip a 200-block
- * chunk is large (segwit blocks with witness data, ~250-300MB observed).
- * 180s required ~1.56MB/s sustained to survive, which was cutting plenty
- * of real (if unremarkable) peers doing 400-800KB/s -- not stalled, just
- * not fast. 480s only requires ~600KB/s, giving those peers room to
- * actually finish while still catching the genuinely dead ones (observed
- * as low as 0.0-10KB/s, which would otherwise take HOURS on one chunk). */
-#define DLC_CHUNK_BUDGET_SECS 480
+/* wall-clock budget for ONE chunk transfer. At DLC_CHUNK_BLOCKS=40
+ * (~50-60MB near the real tip), 120s requires ~467KB/s sustained to
+ * survive -- similar bar to the old 480s/200-block combo, but the
+ * detect-and-replace cycle for a dead peer is ~4x faster and a miss costs
+ * ~4x less redone work. */
+#define DLC_CHUNK_BUDGET_SECS 120
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record. */
 static int dlc_chunk_all_present(long lo, long hi){
