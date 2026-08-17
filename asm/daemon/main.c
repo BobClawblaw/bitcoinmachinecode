@@ -50,6 +50,13 @@
  * ms) so a caught-up node is never interrupted. */
 #define MUX_SYNC_BUDGET_SECS 2.0
 
+/* Per-leg sync wall-clock budget for the download WORKER (dedicated multi-peer
+ * downloader, never serves inbound). Because it does not serve, each leg may
+ * sync for a LONG window so far-from-tip stores close aggressively; a caught-up
+ * leg returns in milliseconds and does not hold the rotation. Kept well above a
+ * single leg's per-pass round-trip cost. */
+#define DL_BUDGET_SECS 60.0
+
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
 extern long node_accept_handshake(int fd);
@@ -73,6 +80,12 @@ extern int  amr_init(void* ab);
 extern long amr_count(void* ab);
 extern int  amr_get_i(void* ab, long i, void* out);
 extern long p2p_addr_v1(void* out, const void* src, long n);
+/* peer-discovery externs (bitcoin_addrmgr.asm): amr_* is the persisted address
+ * manager ("peers.dat" book), p2p_addr_count parses an `addr` payload. The DNS
+ * seeds are used ONLY as BOOTSTRAPS -- we getaddr from them, ingest discovered
+ * peers into the amr book, then download across DISCOVERED peers (not seeds). */
+extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
+extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
 extern long node_ibd(int fd, void* st, void* hst, void* buf, long buflen); /* bitcoind.asm */
@@ -172,7 +185,9 @@ static const char* catchup_seeds[] = {
     "seed.bitcoin.jonasschnelli.ch",
     "seed.btc.petertodd.net",
     "seed.bitcharcoal.com",
-    "seed.bitcoin.wiz.biz"
+    "seed.bitcoin.wiz.biz",
+    "dnsseed.bitcoin.dashjr.org",
+    "seed.bitnodes.io"
 };
 static void anchor_locator(unsigned char loc[32]);   /* fwd decl (defined below) */
 /* Wall-clock alarm handler: raise SIGALRM after CATCHUP_MAX_SECS so the
@@ -634,6 +649,79 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
  * worker appends becomes serve-able once index.dat holds the height; the
  * parent refreshes its in-memory idx_len (store_buf+16) from index.dat at each
  * accept so served tips advance. */
+
+/* ---- peer discovery at boot (seeds are BOOTSTRAPS only) ------------------
+ * Real Bitcoin nodes do NOT download from DNS seeds; they use them once to
+ * learn reachable peers, then connect to those -- never downloading from the
+ * seeds themselves. We resolve each seed-DNS hostname to its A-records (real,
+ * current Bitcoin node IPs), fold them into the persisted amr "peers.dat"
+ * book, then dial up to 8 of those DISCOVERED peers for download. Fast and
+ * reliable: DNS resolution returns dozens of live peer IPs in milliseconds, so
+ * we do NOT depend on the flaky getaddr/addrv2 round-trip. */
+
+/* bootstrap: resolve each seed-DNS hostname to its A-records (REAL reachable
+ * Bitcoin node IPs) and fold them into the amr book. This is fast (milliseconds)
+ * and reliable -- no flaky getaddr round-trip that can block for seconds per
+ * seed. We dial these discovered IPs (never the seed hostname itself as a
+ * long-lived download source); they are bootstrap peers only. */
+static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
+    long total=0;
+    for(int i=0;i<pool_len && i<12;i++){
+        struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+        long got=0;
+        if(getaddrinfo(peers[i],NULL,&h,&res)==0){
+            for(struct addrinfo* ai=res; ai && got<64; ai=ai->ai_next){
+                struct sockaddr_in* sa=(struct sockaddr_in*)ai->ai_addr;
+                unsigned ip=sa->sin_addr.s_addr;
+                if(ip && amr_add(ab,ip,(unsigned short)htons(8333),1,(unsigned)time(NULL))>0) got++;
+            }
+            freeaddrinfo(res);
+        }
+        if(got>0) fprintf(stderr,"[boot] %s -> +%ld peers (dns)\n", peers[i], got);
+        total+=got;
+    }
+    return total;
+}
+
+/* pick up to n distinct public IPv4 endpoints from the amr book into
+ * out[i] = "a.b.c.d" (IP only; the downloader dials each on the standard
+ * out_port, matching how outbound_connect/serve_mux treat all peers). */
+static int dl_pool_from_book(void* ab, char out[][64], int nitems){
+    long cnt=amr_count(ab); if(cnt<=0) return 0;
+    unsigned char rec[18]; int got=0;
+    /* iterate the WHOLE book (not just the first `nitems`) and keep plausible
+     * PUBLIC IPv4s, so stale/special-range garbage from prior runs never crowds
+     * the download pool. */
+    for(long i=0;i<cnt && got<nitems;i++){
+        if(amr_get_i(ab,i,rec)!=1) continue;
+        /* amr stores the ip as the 4 bytes passed to amr_add -- which we passed
+         * in NETWORK (big-endian) order (sin_addr.s_addr). The "u32 LE" in the
+         * asm comment is literal movement of those bytes, not an LE reorder.
+         * Reading with *(unsigned*) on an LE CPU would byte-swap and yield
+         * wrong/unreachable IPs (e.g. 97.158.36.82 for the real 82.36.158.97).
+         * Decode explicitly BIG-endian from the record bytes instead. */
+        unsigned ip = ((unsigned)rec[0]<<24)|((unsigned)rec[1]<<16)|((unsigned)rec[2]<<8)|(unsigned)rec[3];
+        unsigned a=(ip>>24)&0xff,b=(ip>>16)&0xff,c=(ip>>8)&0xff,d=ip&0xff;
+        /* skip special/reserved ranges that can't be a reachable peer:
+         * 0.0.0.0/8, 10/8 & 172.16/12 & 192.168/16 (RFC1918 -- could be peers
+         * but our resolver gives public ones; skip to be safe), 169.254/16
+         * link-local, 224-239 multicast, 240+ reserved, broadcast, and
+         * 255.127.0.0-style garbage seen in stale books. */
+        if(a==0) continue;
+        if(a==10) continue;
+        if(a==172 && b>=16 && b<=31) continue;
+        if(a==192 && b==168) continue;
+        if(a==169 && b==254) continue;
+        if(a==127) continue;
+        if(a>=224) continue;                     /* multicast + reserved + 255.x */
+        if(b==0&&c==0&&d==0) continue;
+        if(a==255&&b==255&&c==255&&d==255) continue;
+        snprintf(out[got],64,"%u.%u.%u.%u",a,b,c,d);
+        got++;
+    }
+    return got;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -645,37 +733,150 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * unified_ibd comments on re-initialising per process). */
     chdir(dir);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
-    unsigned char loc[32];
-    static unsigned char cbuf[8<<20];
-    long long npass = 0;
-    for(;;){
-        int p = (int)(npass % (pool_len>0?pool_len:1));
-        int fd = outbound_connect(peers[p], 400, out_port);
-        if(fd<0){ fprintf(stderr,"[dl] connect %s failed; retry\n", peers[p]); sleep(5); npass++; continue; }
-        anchor_locator(loc);                 /* resume from on-disk tip */
-        long cnt=0;
-        long ok = node_sync(fd, store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
-        int tip = *(int*)(store_buf+24);
-        fprintf(stderr,"[dl] %-22s sync ok=%ld new=%ld tip=%d\n", peers[p], ok, cnt, tip);
-        /* index any newly stored heights so by-hash serving works for them */
-        if(ok==1 && cnt>0){
-            static unsigned char sb[8<<20];
-            int tnow=*(int*)(store_buf+24);
-            int base = tnow-(int)cnt;
-            if(base<0) base=0;
-            for(int h=base; h<=tnow; h++){
-                long L=node_serve_block(store_buf, h, sb, sizeof sb);
-                if(L<80) continue;
-                unsigned char bhash[32]; block_hash(bhash, sb);
-                idx_put(ht_idx, bhash, h);
+    /* ---- BOOTSTRAP + DISCOVER (seeds are bootstrap-only) ----
+     * Real nodes use DNS seeds once to learn reachable peers, then connect to
+     * those -- never downloading from the seeds themselves. We resolve each
+     * seed-DNS hostname to its A-records (real, current node IPs), fold the
+     * distinct v4 endpoints into the persisted amr book (peers.dat), then dial
+     * up to 8 of those DISCOVERED peers for download. */
+    static unsigned char ab[64];
+    if(amr_init(ab)==1){
+        long disc = dl_bootstrap(ab, peers, pool_len);
+        fprintf(stderr,"[boot] discovered +%ld peers (peers.dat now %ld)\n", disc, (long)amr_count(ab));
+    } else {
+        fprintf(stderr,"[boot] amr_init failed; falling back to seed list\n");
+    }
+    static char dle[64][64];
+    int npool = dl_pool_from_book(ab, dle, 64);
+    fprintf(stderr,"[boot] %d public peer candidate(s) in pool\n", npool);
+    const char* srcpool[64]; int nsrc=0;
+    for(int i=0;i<npool && nsrc<64;i++){ srcpool[nsrc++]=dle[i]; }
+    if(nsrc==0){
+        /* Discovery found nothing: DEGRADED fallback so the node still syncs.
+         * Normally the seeds are bootstrap-only; this is only an emergency. */
+        fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
+        for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+    }
+    /* ---- MULTI-PEER DOWNLOAD: establish up to 8 live legs by dialing the
+     * discovered candidate pool IN PARALLEL. A DNS seed returns many
+     * plausible-but-dead IPs, so a per-candidate sequential dial with timeouts
+     * would stall for minutes. Instead we non-blocking-connect ALL candidates
+     * at once, poll once for readiness, and promote only the live ones -- dead
+     * peers are shed in the same single bounded wait as live ones connect.
+     * (We are the sole block writer in ONE process, so rotating bounded sync
+     * passes over the shared store_buf is race-free; each leg's node_sync
+     * appends via store_append while the others idle. A LONG per-pass budget,
+     * DL_BUDGET_SECS, applies because this process does not serve inbound.) */
+    mux_n_out = 0;                                   /* isolate from any parent state */
+    {
+        int ntry = nsrc; if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;   /* cap candidates */
+        static int cfd[64];
+        int nc=0;
+        for(int i=0;i<ntry && nc<64;i++){
+            unsigned ip;
+            if(inet_pton(AF_INET,srcpool[i],&ip)!=1){
+                struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+                if(getaddrinfo(srcpool[i],NULL,&h,&res)!=0){ cfd[nc++]=-1; continue; }
+                ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr; freeaddrinfo(res);
             }
-            /* Publish the new tip to the PARENT so it can serve the new blocks:
-             * store_buf's idx_len is in-memory per process; the parent reads
-             * index.dat's real size each loop via its own refresh (see
-             * serve_mux) -- but we keep our own idx_len honest here. */
+            int fd=socket(AF_INET,SOCK_STREAM,0);
+            if(fd<0){ cfd[nc++]=-1; continue; }
+            int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
+            struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
+            sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)out_port);
+            int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
+            if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
+            /* stash the original flags so we can clear O_NONBLOCK after promote */
+            cfd[nc++]=fd;
         }
-        close(fd);
-        npass++;
+        /* single bounded wait for any of them to become writable */
+        struct pollfd pol[64]; int nf=0;
+        for(int i=0;i<nc;i++){ if(cfd[i]<0) continue; pol[nf].fd=cfd[i]; pol[nf].events=POLLOUT; pol[nf].revents=0; nf++; }
+        if(nf>0) poll(pol,nf,2500);
+        for(int i=0;i<nc && mux_n_out<8 && mux_n_out<MUX_MAX_OUT;i++){
+            if(cfd[i]<0) continue;
+            int ready=0;
+            for(int j=0;j<nf;j++) if(pol[j].fd==cfd[i]){ ready=(pol[j].revents&POLLOUT)?1:0; break; }
+            if(!ready){ close(cfd[i]); continue; }
+            int soerr=0; socklen_t sl=sizeof soerr;
+            if(getsockopt(cfd[i],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[i]); continue; }
+            /* it connected: clear non-blocking, then handshake (bounded recv) */
+            int fl=fcntl(cfd[i],F_GETFL,0); fcntl(cfd[i],F_SETFL,fl&~O_NONBLOCK);
+            struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+            int hk=node_handshake(cfd[i]);
+            if(hk!=1){ close(cfd[i]); continue; }
+            struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
+            strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
+            mux_out_fd[mux_n_out]=cfd[i];
+            mux_out_peer[mux_n_out]=i;
+            anchor_locator(mux_out_loc[mux_n_out]);
+            mux_out_nextretry[mux_n_out]=0;
+            fprintf(stderr,"[dl] outbound %d = %s (fd %d)\n", mux_n_out, srcpool[i], cfd[i]);
+            mux_n_out++;
+        }
+        /* close every candidate fd that was NOT promoted into a live leg */
+        for(int i=0;i<nc;i++){
+            if(cfd[i]<0) continue;
+            int kept=0;
+            for(int k=0;k<mux_n_out;k++) if(mux_out_fd[k]==cfd[i]){ kept=1; break; }
+            if(!kept) close(cfd[i]);
+        }
+    }
+    fprintf(stderr,"[dl] connected %d/%d peer(s); downloading across them...\n", mux_n_out, 8);
+    long long rot=0;
+    for(;;){
+        long long now_ms = 0;
+        { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+        int did=0;
+        for(int i=0;i<mux_n_out;i++){
+            if(mux_out_fd[i]<0){
+                /* dead slot: re-dial (rate-limited), same logic as serve_mux */
+                if(now_ms>=mux_out_nextretry[i]){ mux_redial(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                continue;
+            }
+            /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
+            struct sigaction sa, old; memset(&sa,0,sizeof sa);
+            sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
+            sigaction(SIGALRM,&sa,&old);
+            mux_sync_budget_fired=0;
+            alarm((unsigned)DL_BUDGET_SECS);
+            long n = do_outbound_sync(i);
+            alarm(0); sigaction(SIGALRM,&old,NULL);
+            if(mux_sync_budget_fired){
+                fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
+                        i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
+                mux_redial(i, peers, pool_len, out_port);
+            }
+            did |= (n>0)?1:0;
+            /* brief yield so we don't spin a CPU core when all legs are idle */
+            if((i&1)==1){ usleep(20000); }
+        }
+        rot++;
+        if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
+        /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
+         * from the discovered candidate pool. Boot rarely lands all 8 at once
+         * on a variable network, so keep trying to add a leg occasionally
+         * (rate-limited) instead of giving up at the initial dial. Uses the
+         * proven outbound_connect path (works for reachable peers). */
+        if(mux_n_out < 8 && (rot % 8)==0){
+            for(int ci=0; ci<nsrc && mux_n_out<8 && mux_n_out<MUX_MAX_OUT; ci++){
+                if(mux_n_out>=8) break;
+                int already=0;
+                for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
+                if(already) continue;
+                int nfd=outbound_connect(srcpool[ci], 300, out_port);
+                if(nfd>=0){
+                    strncpy(mux_out_host[mux_n_out], srcpool[ci], 63);
+                    mux_out_fd[mux_n_out]=nfd;
+                    mux_out_peer[mux_n_out]=ci;
+                    anchor_locator(mux_out_loc[mux_n_out]);
+                    mux_out_nextretry[mux_n_out]=0;
+                    fprintf(stderr,"[dl] filled outbound %d = %s (fd %d)\n", mux_n_out, srcpool[ci], nfd);
+                    mux_n_out++;
+                }
+                /* if outbound_connect to this one hung/refused, move on to next */
+            }
+        }
     }
 }
 
