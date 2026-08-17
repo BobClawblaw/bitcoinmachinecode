@@ -915,7 +915,8 @@ static long dlc_headers(char live[][64], int nlive){
  * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
  * before the parent's first 10s tick. */
 typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; } dlc_stat_t;
-static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decl, defined below */
+static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
+static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 
 static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
@@ -1122,6 +1123,13 @@ static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
     else if(v>=1024.0){ v/=1024.0; unit="KB"; }
     snprintf(buf,cap,"%.1f%s/s",v,unit);
 }
+/* same unit scaling as dlc_fmt_rate but for a plain total, no "/s" suffix. */
+static void dlc_fmt_bytes(char* buf, size_t cap, double bytes){
+    const char* unit="B"; double v=bytes;
+    if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
+    else if(v>=1024.0){ v/=1024.0; unit="KB"; }
+    snprintf(buf,cap,"%.1f%s",v,unit);
+}
 
 /* full sequential scan of index.dat: highest non-zero height (tip, -1 if
  * none) and count of non-zero records in [0,tip]. Two genuinely different
@@ -1254,13 +1262,16 @@ static long dl_catchup(const char* dir, int min_workers){
                     present, end_h+1, overall_pct, holes, cur_tip, span_pct);
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
+        double tick_total_bytes=0.0;
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(b-prev_blocks[w])/10;
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
             char bw[16]="--"; double byte_rate=-1.0;
             if(rc>=0){
                 if(prev_rchar[w]>0){
-                    byte_rate=(double)(rc-prev_rchar[w])/10.0;
+                    double delta=(double)(rc-prev_rchar[w]);
+                    tick_total_bytes+=delta;
+                    byte_rate=delta/10.0;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
                 }
@@ -1289,6 +1300,12 @@ static long dl_catchup(const char* dir, int min_workers){
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
                     stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, dragbuf);
             prev_blocks[w]=b;
+        }
+        {
+            char totbuf[16], aggbuf[16];
+            dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
+            dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/10.0);
+            fprintf(stderr,"[dlc] -- transferred this tick: %sB (%s aggregate) --\n",totbuf,aggbuf);
         }
     }
     long total=*done_count;
