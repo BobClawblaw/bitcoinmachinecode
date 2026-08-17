@@ -191,6 +191,8 @@ soak-store/
 # via wallet_cli init.
 asm/config/bmcwallet.dat
 asm/config/bmcwallet.dat.pass
+# Address book (own format, see wallet_cli abook) — regenerable user data.
+asm/config/addressbook.dat
 # ---- Full-chain differential resume/progress state (scratch, not a deliverable) ----
 validation/fullchain_state/
 
