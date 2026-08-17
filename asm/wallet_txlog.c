@@ -17,9 +17,9 @@
  *
  * ABI (plain C, stdio-only, no new deps):
  *   char* txlog_path_for(const char* wallet_path, char* buf, int cap);
- *     -> "<wallet_path>.txlog" (e.g. config/bmcwallet.dat ->
- *        config/bmcwallet.dat.txlog), or a default
- *        "config/bmcwallet.dat.txlog" if wallet_path is NULL.
+ *     -> "<wallet_path>.txlog" (e.g. data/bmcwallet.dat ->
+ *        data/bmcwallet.dat.txlog), or a default
+ *        "data/bmcwallet.dat.txlog" if wallet_path is NULL.
  *   int   txlog_append(const char* path, unsigned long long ts,
  *                      const unsigned char txid[32], long long amount,
  *                      long long fee, const unsigned char dest_h160[20],
@@ -51,7 +51,7 @@
  * NOTE: this is OUR OWN wallet format (see wallet_store.c), so it deliberately
  * does NOT use Core's "wallet.dat" name -- it is bmcwallet.dat to avoid any
  * implication it is a Bitcoin Core (BerkeleyDB) wallet. */
-#define DEFAULT_WALLET_PATH "config/bmcwallet.dat"
+#define DEFAULT_WALLET_PATH "data/bmcwallet.dat"
 
 /* ---- helpers ---------------------------------------------------------- */
 
