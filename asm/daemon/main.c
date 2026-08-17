@@ -23,6 +23,7 @@
 #include <netinet/tcp.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <signal.h>
@@ -605,6 +606,79 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
     return n;
 }
 
+/* ---- continuous download worker (serve mode, option 2) -------------------
+ * The PRODUCTION `serve <dir> <port>` must BOTH service our client calls AND
+ * keep downloading the blockchain to tip -- CONCURRENTLY. Serving must never
+ * be delayed by a long sync, and a long sync must not be chopped into 2s
+ * slices (which crawls far-from-tip stores). We therefore split the two jobs
+ * across processes:
+ *
+ *   - PARENT: `serve_mux` -- pure serving + the pre-existing mux outbound
+ *     legs (best-effort). Inbound connections are forked to node_serve_loop
+ *     children, so serving our clients is never blocked by any download work
+ *     in the parent. We keep the SMALL per-leg budget here (never delay
+ *     accepts) because the heavy lifting is the worker's.
+ *
+ *   - CHILD (this worker): a dedicated forked process that continuously
+ *     downloads. It re-initialises ITS OWN store from disk (fork COW is NOT
+ *     safe for a growable store; the child must re-store_reload so its
+ *     in-memory idx_len/pos track the archive), then loops: connect to a
+ *     seed, anchor the locator at the on-disk tip, node_sync (which appends
+ *     blocks), and index any new heights. It repeats until the daemon is
+ *     killed.
+ *
+ * The worker is the ONLY aggressive block writer (the parent runs serve-only
+ * with no outbound appends, so plain store_append is safe -- no cross-process
+ * writer race). Serving reads block bytes fresh from disk via node_serve_block
+ * (store_get_at preads index.dat and seeks the blk file), so whatever the
+ * worker appends becomes serve-able once index.dat holds the height; the
+ * parent refreshes its in-memory idx_len (store_buf+16) from index.dat at each
+ * accept so served tips advance. */
+static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+    /* The PARENT is serve-only (no outbound appends) -- see the serve branch
+     * that calls us. This child is therefore the SOLE block writer, so plain
+     * store_append is safe (no cross-process writer). Still, reload a fresh
+     * store state rather than inherit the parent's possibly-stale in-memory
+     * idx_len/pos (fork COW is not safe for a growable store -- see the
+     * unified_ibd comments on re-initialising per process). */
+    chdir(dir);
+    if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
+    unsigned char loc[32];
+    static unsigned char cbuf[8<<20];
+    long long npass = 0;
+    for(;;){
+        int p = (int)(npass % (pool_len>0?pool_len:1));
+        int fd = outbound_connect(peers[p], 400, out_port);
+        if(fd<0){ fprintf(stderr,"[dl] connect %s failed; retry\n", peers[p]); sleep(5); npass++; continue; }
+        anchor_locator(loc);                 /* resume from on-disk tip */
+        long cnt=0;
+        long ok = node_sync(fd, store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
+        int tip = *(int*)(store_buf+24);
+        fprintf(stderr,"[dl] %-22s sync ok=%ld new=%ld tip=%d\n", peers[p], ok, cnt, tip);
+        /* index any newly stored heights so by-hash serving works for them */
+        if(ok==1 && cnt>0){
+            static unsigned char sb[8<<20];
+            int tnow=*(int*)(store_buf+24);
+            int base = tnow-(int)cnt;
+            if(base<0) base=0;
+            for(int h=base; h<=tnow; h++){
+                long L=node_serve_block(store_buf, h, sb, sizeof sb);
+                if(L<80) continue;
+                unsigned char bhash[32]; block_hash(bhash, sb);
+                idx_put(ht_idx, bhash, h);
+            }
+            /* Publish the new tip to the PARENT so it can serve the new blocks:
+             * store_buf's idx_len is in-memory per process; the parent reads
+             * index.dat's real size each loop via its own refresh (see
+             * serve_mux) -- but we keep our own idx_len honest here. */
+        }
+        close(fd);
+        npass++;
+    }
+}
+
 /* The outbound multiplexer: ONE poll() loop over the listen socket + all N
  * outbound seed fds. Inbound accepts are forked to node_serve_loop children
  * (preserved behavior); outbound legs run inline (node_sync + announce).
@@ -646,6 +720,17 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
             int c=accept(l,0,0);
             if(c>=0){
+                /* Refresh our in-memory store extent from the on-disk archive
+                 * so this (and each forked child) serves blocks the download
+                 * WORKER appended since boot -- serving reads block bytes fresh
+                 * from disk, but the tip bound comes from store_buf+16, which
+                 * only advances if we re-read index.dat's real size here. */
+                struct stat st;
+                if(stat("index.dat",&st)==0 && st.st_size>0 && st.st_size>=48){
+                    long real = st.st_size;
+                    long mine = *(long*)(store_buf+16);
+                    if(real>mine) *(long*)(store_buf+16)=real;
+                }
                 pid_t w=fork();
                 if(w==0){
                     close(l);
@@ -914,13 +999,24 @@ int main(int argc, char** argv){
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
-        node_log_str(lfd, 0, "node start (serve mode / outbound mux)", 38);
-        /* OUTBOUND MULTIPLEXER: ONE poll() loop over the listen socket + N
-         * outbound seed legs. Inbound connections are forked to node_serve_loop
-         * children (concurrent serving preserved); outbound legs run INLINE in
-         * this loop (periodic node_sync-from-tip + node_announce_tip), so the
-         * node simultaneously serves AND stays current by its own poll. */
-        return serve_mux(port, catchup_seeds, nwant, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333, l);
+        node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
+        /* Serve-as-full-node (option 2): SERVICE our client calls instantly
+         * (fork-based inbound serving in the parent) AND continuously download
+         * the chain to tip (a dedicated forked DOWNLOAD-WORKER child; see
+         * serve_download_worker). The parent runs serve_mux as a PURE inbound
+         * server (nwant=0 -> no outbound appends), so:
+         *   - serving our clients is NEVER blocked by (or chopped by) a long
+         *     sync -- there is no sync in the parent;
+         *   - the worker is the SOLE block writer (no multi-writer race) and
+         *     grinds continuously from the on-disk tip to mainnet.
+         * Each forked serve child re-syncs its index length from index.dat so
+         * blocks the worker appends become serve-able (fresh disk reads). */
+        pid_t dl = fork();
+        if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }
+        fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
+        /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
+         * it only accepts+forks serve children (never blocks on sync). */
+        return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333, l);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
