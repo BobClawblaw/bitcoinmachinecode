@@ -300,8 +300,23 @@ node_accept_handshake:
 ;     rbp-0x58 varint(dw), rbp-0x5c getdata_len(dw), rbp-0x60 out_count(qw),
 ;     rbp-0x68 loop_i(dw), rbp-0x70 blockhash[32], rbp-0x90 getdata[37],
 ;     rbp-0xc0 getheaders[69], rbp-0xf0 stop[32], rbp-0x110 cmd[12],
-;     rbp-0x2e8 txid_scratch[64*32]
-;   sub rsp, 0xb08 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
+;     rbp-0xae8 block-hash-precompute[64*32] (headers path),
+;     rbp-0x1308 txid_scratch[64*32] (cons_verify path)
+;
+;   BUG FIXED: txid_scratch used to sit at rbp-0x2e8, immediately after the
+;   block-hash-precompute array -- but 0x2e8 (744 bytes) of headroom before
+;   rbp is nowhere near enough for a 64*32=2048-byte buffer. Any real block
+;   with more than ~23 transactions (i.e. essentially every real mainnet
+;   block) overflowed straight through the saved rbx/r12-r15/rbp and the
+;   return address on THIS frame, corrupting them with txid bytes and
+;   crashing on the next `ret` out of node_sync -- reliably, deterministically,
+;   on the very first real block with a real transaction count. The local
+;   fake-peer tests that exercised this path only ever sent a handful of
+;   near-empty blocks (well under 23 tx), which is why it went uncaught.
+;   Moved txid_scratch to fresh space at the (enlarged) frame's own edge,
+;   fully clear of both rbp and the block-hash-precompute array, without
+;   touching any other local's offset.
+;   sub rsp, 0x1b08 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
 ; ============================================================================
 global node_sync
 node_sync:
@@ -312,9 +327,9 @@ node_sync:
     push r13
     push r14
     push r15
-    sub  rsp, 0x1308       ; frame: scratch@-0x2e8 (cons_verify), block hashes
+    sub  rsp, 0x1b08       ; frame: scratch@-0x1308 (cons_verify), block hashes
                            ; array@-0xae8 (64 x 32B) so headers stay usable even
-                           ; after the block receive overwrites buf. 0x1308==8
+                           ; after the block receive overwrites buf. 0x1b08==8
                            ; mod16, after 6 pushes -> RSP 0 mod16 at all calls.
     mov  rbx, rdi           ; fd
     mov  r12, rsi           ; st
@@ -353,8 +368,26 @@ node_sync:
     ; loopback peer never interleaves these, so the original strict "first read
     ; must be headers -> else .fail" only worked in test. Against real mainnet
     ; the first post-getheaders read is often an `addr`/`inv`, which must be
-    ; drained -- echo ping->pong, ignore everything else, re-read. Only a real
-    ; read error/timeout (<=0) is a hard failure. ----
+    ; drained -- echo ping->pong, ignore everything else, re-read.
+    ;
+    ; BUG FIXED: a single read TIMEOUT (p2p_read returning -1, from the 3s
+    ; SO_RCVTIMEO on this socket) used to be treated identically to a real
+    ; connection failure -- immediately abandoning the whole getheaders
+    ; attempt. Debug instrumentation against real mainnet peers showed
+    ; -1 returns landing ~3.0s apart consistently (i.e. genuine per-read
+    ; timeouts, not a dead socket): a busy peer sends inv/ping chatter in
+    ; sparse bursts with multi-second gaps, so ANY single quiet moment
+    ; during the drain was enough to make us give up and re-dial from
+    ; scratch on the next rotation -- we would never sit through a gap
+    ; long enough to actually receive the real headers response, no matter
+    ; how healthy the connection was. -1 (timeout/transient error) now
+    ; retries, bounded, instead of failing immediately; 0 (EOF/short-read)
+    ; and -2 (truncated) are unchanged -- those mean the connection itself
+    ; is genuinely done, retrying would be pointless.
+    mov  dword [rbp-0x1b04], 0    ; hdr-drain retry counter (fresh unused
+                                    ; space in the enlarged frame; reset once
+                                    ; per getheaders attempt, i.e. every
+                                    ; .sync_loop re-entry)
 .hdr_drain:
     mov  rdi, rbx
     lea  rsi, [rbp-0x160]   ; cmd
@@ -362,6 +395,13 @@ node_sync:
     mov  ecx, [rbp-0x48]    ; cap
     lea  r8, [rbp-0x54]     ; plen
     call p2p_read
+    cmp  rax, -1
+    jne  .hdr_not_timeout
+    inc  dword [rbp-0x1b04]
+    cmp  dword [rbp-0x1b04], 20    ; ~20 timeouts (~60s, matching the outer
+    jae  .fail                      ; per-leg alarm budget anyway) before
+    jmp  .hdr_drain                 ; truly giving up on this getheaders pass
+.hdr_not_timeout:
     cmp  rax, 0
     jle  .fail
     lea  rdi, [rbp-0x160]
@@ -471,8 +511,12 @@ node_sync:
     ; ---- receive block, draining interleaved relay chatter (live seeds send
     ; addr/inv/ping/sendheaders between our getdata and the block reply; the
     ; fake peer never did, so the original strict read broke live). Echo ping->
-    ; pong, ignore other non-`block` msgs, re-read; only a real read error
-    ; (<=0) is a hard failure. ----
+    ; pong, ignore other non-`block` msgs, re-read.
+    ; Same fix as .hdr_drain: a single read timeout (-1) retries (bounded)
+    ; rather than immediately abandoning the block fetch -- see the .hdr_drain
+    ; comment above for why (busy real peers pause between chatter bursts).
+    mov  dword [rbp-0x1b00], 0    ; blk-drain retry counter (separate 4 bytes
+                                    ; from the hdr-drain one at -0x1b04)
 .blk_drain:
     mov  rdi, rbx
     lea  rsi, [rbp-0x160]
@@ -480,6 +524,13 @@ node_sync:
     mov  ecx, [rbp-0x48]
     lea  r8, [rbp-0x54]
     call p2p_read
+    cmp  rax, -1
+    jne  .blk_not_timeout
+    inc  dword [rbp-0x1b00]
+    cmp  dword [rbp-0x1b00], 20
+    jae  .fail
+    jmp  .blk_drain
+.blk_not_timeout:
     cmp  rax, 0
     jle  .fail
     lea  rdi, [rbp-0x160]
@@ -504,7 +555,7 @@ node_sync:
     ; ---- validate ----
     mov  rdi, r14
     mov  esi, [rbp-0x54]
-    lea  rdx, [rbp-0x2e8]
+    lea  rdx, [rbp-0x1308]
     mov  ecx, 64
     call cons_verify
     test eax, eax
@@ -529,7 +580,7 @@ node_sync:
     jmp  .sync_loop
 .done:
     mov  eax, 1
-    add  rsp, 0x1308
+    add  rsp, 0x1b08
     pop  r15
     pop  r14
     pop  r13
@@ -539,7 +590,7 @@ node_sync:
     ret
 .fail:
     mov  eax, 0
-    add  rsp, 0x1308
+    add  rsp, 0x1b08
     pop  r15
     pop  r14
     pop  r13
