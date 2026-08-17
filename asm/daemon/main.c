@@ -1059,6 +1059,30 @@ static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
     snprintf(buf,cap,"%.1f%s/s",v,unit);
 }
 
+/* full sequential scan of index.dat: highest non-zero height (tip, -1 if
+ * none) and count of non-zero records in [0,tip]. Two genuinely different
+ * numbers matter here and are easy to conflate (this bit me in conversation
+ * earlier): "% of the range reached so far that's actually filled" (gap-
+ * completeness) vs "% of the WHOLE real chain that's done" (overall
+ * progress) -- the former can read 99%+ while the latter is still under
+ * 60%. A fresh scan every status tick (rather than tracking incrementally)
+ * is simplest and correct even though workers claim scattered, non-
+ * sequential chunks -- cheap on local NVMe even at 900k+ records. */
+static void dlc_scan_progress(long* out_tip, long* out_present){
+    FILE* f=fopen("index.dat","rb");
+    long tip=-1, present=0;
+    if(f){
+        fseek(f,0,SEEK_END); long n=ftell(f)/48; fseek(f,0,SEEK_SET);
+        unsigned char rec[48];
+        for(long h=0; h<n; h++){
+            if(fread(rec,1,48,f)!=48) break;
+            if(rec[0]||rec[1]||rec[2]||rec[3]){ present++; tip=h; }
+        }
+        fclose(f);
+    }
+    *out_tip=tip; *out_present=present;
+}
+
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     static unsigned char ab[64];
@@ -1155,6 +1179,15 @@ static long dl_catchup(const char* dir, int min_workers){
             if(kids[w]==0) continue;
             int stt; pid_t r=waitpid(kids[w],&stt,WNOHANG);
             if(r==0) alive++; else kids[w]=0;
+        }
+        {
+            long cur_tip, present;
+            dlc_scan_progress(&cur_tip, &present);
+            long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
+            double overall_pct = 100.0*(double)present/(double)(end_h+1);
+            double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
+            fprintf(stderr,"[dlc] == overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
+                    present, end_h+1, overall_pct, holes, cur_tip, span_pct);
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         for(int w=0;w<nw;w++){
