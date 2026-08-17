@@ -1083,7 +1083,12 @@ static long dl_catchup(const char* dir, int min_workers){
     {
         int want = min_workers*3; if(want>npool) want=npool;
         int from=0, rounds=0;
-        while(nlive<want && from<npool && rounds<8){
+        /* no arbitrary round cap: keep probing until either `want` is hit or
+         * the WHOLE discovered pool has been tried (from<npool already
+         * guarantees termination -- a fixed round cap here previously cut
+         * the probe off after covering only ~40% of a 481-peer pool,
+         * settling for 10 live peers when the target was 48). */
+        while(nlive<want && from<npool){
             int ntry=npool-from; if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
             dlc_probe_round(pool, from, ntry, live, &nlive, DLC_MAXPOOL, 8000);
             from+=ntry; rounds++;
@@ -1651,7 +1656,7 @@ int main(int argc, char** argv){
          * same time). Self-throttling: a caught-up node returns almost
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
-        long caught = dl_catchup(dir, 8);
+        long caught = dl_catchup(dir, 16);
         if(caught>0){
             store_reload(store_buf);        /* our copy predates dl_catchup's writes */
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
