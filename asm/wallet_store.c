@@ -6,9 +6,10 @@
  * persistence needed to actually manage a wallet across sessions. It does NOT
  * replicate Bitcoin Core's wallet.dat (BerkeleyDB). Instead we store the
  * RECOVERABLE SECRET (a BIP39 mnemonic + optional secret passphrase) in a small
- * versioned file of our own format. Everything else (the 64-byte seed and all
- * BIP44 addresses/keys) is deterministically derived from the mnemonic at load
- * time via the verified wallet_core API.
+ * versioned file of our own format -- `config/bmcwallet.dat` (NOT "wallet.dat",
+ * to avoid implying it is a Core/BerkeleyDB wallet). Everything else (the
+ * 64-byte seed and all BIP44 addresses/keys) is deterministically derived from
+ * the mnemonic at load time via the verified wallet_core API.
  *
  * SECURITY MODEL (v2, hardened):
  *   - The mnemonic is the WHOLE wallet (all keys derive from it). If an attacker
