@@ -1119,14 +1119,18 @@ static long dlc_proc_rchar(pid_t pid){
 /* human-scaled "N.NUNIT/s" into buf (>=16 bytes). */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
     const char* unit="B"; double v=bytes_per_sec;
-    if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
+    if(v>=1024.0*1024.0*1024.0){ v/=1024.0*1024.0*1024.0; unit="GB"; }
+    else if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
     else if(v>=1024.0){ v/=1024.0; unit="KB"; }
     snprintf(buf,cap,"%.1f%s/s",v,unit);
 }
-/* same unit scaling as dlc_fmt_rate but for a plain total, no "/s" suffix. */
+/* same unit scaling as dlc_fmt_rate but for a plain total, no "/s" suffix --
+ * GB tier matters here especially: a multi-hour catch-up at a few MB/s
+ * aggregate crosses 1GB cumulative within the first hour or two. */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes){
     const char* unit="B"; double v=bytes;
-    if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
+    if(v>=1024.0*1024.0*1024.0){ v/=1024.0*1024.0*1024.0; unit="GB"; }
+    else if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
     else if(v>=1024.0){ v/=1024.0; unit="KB"; }
     snprintf(buf,cap,"%.1f%s",v,unit);
 }
@@ -1243,6 +1247,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * one large chunk shows 0 chunks for minutes even while actively
      * downloading at full speed, which the byte counter catches. */
     long prev_blocks[64]={0}; long prev_rchar[64]={0}; int dead_ticks[64]={0};
+    double cumulative_bytes=0.0; /* running total across the whole dl_catchup call, not just this tick */
     int alive=nw;
     while(alive>0){
         struct timespec ts={10,0}; nanosleep(&ts,NULL);
@@ -1302,10 +1307,12 @@ static long dl_catchup(const char* dir, int min_workers){
             prev_blocks[w]=b;
         }
         {
-            char totbuf[16], aggbuf[16];
+            cumulative_bytes+=tick_total_bytes;
+            char totbuf[16], aggbuf[16], cumbuf[16];
             dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
             dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/10.0);
-            fprintf(stderr,"[dlc] -- transferred this tick: %s (%s aggregate) --\n",totbuf,aggbuf);
+            dlc_fmt_bytes(cumbuf,sizeof cumbuf,cumulative_bytes);
+            fprintf(stderr,"[dlc] -- transferred this tick: %s (%s aggregate) | total since start: %s --\n",totbuf,aggbuf,cumbuf);
         }
     }
     long total=*done_count;
