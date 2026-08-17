@@ -773,13 +773,13 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
 /* early-kill thresholds: the parent's status loop already samples each
  * worker's real /proc/<pid>/io bandwidth every 10s for the live display --
  * a connection sustaining under DLC_DEAD_WEIGHT_BPS for
- * DLC_DEAD_WEIGHT_TICKS consecutive ticks is obviously dead (observed
- * 1-4KB/s vs 200KB/s+ for legitimately-working peers -- a wide, easy gap),
- * so the parent signals that worker to abandon immediately instead of
- * making it sit out the full DLC_CHUNK_BUDGET_SECS on a peer that was
- * never going anywhere. */
+ * DLC_DEAD_WEIGHT_TICKS consecutive ticks (10 ticks = ~100s: deliberately
+ * long, to be confident this is a truly dead connection and not a peer
+ * that's just momentarily slow before recovering) is treated as dead, so
+ * the parent signals that worker to abandon rather than making it sit out
+ * the full DLC_CHUNK_BUDGET_SECS on a peer that was never going anywhere. */
 #define DLC_DEAD_WEIGHT_BPS 10240.0
-#define DLC_DEAD_WEIGHT_TICKS 2
+#define DLC_DEAD_WEIGHT_TICKS 10
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record. */
 static int dlc_chunk_all_present(long lo, long hi){
