@@ -7,6 +7,79 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17 -- build_hash_index PORTED TO ASM + CRITICAL idx_hash BUG FOUND & FIXED
+### Goal and outcome
+Follow-on to the idxscan conversion below: identified `build_hash_index`
+(daemon/main.c, the boot-time O(1) hash->height index builder used for
+`getdata`-by-hash serving) as the next asm-conversion candidate, since it
+took **185.9s on the real 962,831-record archive** -- every `serve`/`follow`
+boot pays this, unconditionally, right before the node can accept any
+connection. Converting it surfaced a much bigger, PRE-EXISTING bug: the
+in-memory index's own hash function was pathologically bad on real data,
+independent of anything C-vs-asm. Fixing that (not the C/asm conversion
+itself) is responsible for nearly the entire win.
+### 1. `idx_build_from_file` (asm/bitcoin_idx.asm) -- the scoped conversion
+Buffered-`pread64` bulk loader (same 192KB-window approach as
+`idxscan_progress`), replacing the per-record `fread`+byte-reverse+`idx_put`
+C loop. Straightforward, same pattern as the idxscan work below.
+### 2. The real discovery: idx_hash collapses on real block hashes
+Benchmarking the conversion in isolation gave a shock: `idx_put` on
+400,000 real block hashes took **15.8s**, vs **0.04s** for 400,000
+synthetic random hashes into the identical table (asm/tests -- since
+deleted, see asm/tests/bench_hashidx.c and asm/tests/test_idx.c for the
+surviving artifacts). Bisecting by record count showed clearly super-linear
+growth (300k: 1.55s, 350k: 6.5s, 400k: 14.4s, 450k: >30s) -- not a bug in
+the new conversion (the synthetic control ruled that out), but in
+`idx_hash` itself, called identically by both the old C path and the new
+asm path.
+ROOT CAUSE: `idx_hash` hashed only the first 8 bytes of the 32-byte key.
+Every REAL Bitcoin block hash's leading bytes (in the byte order this table
+is queried with) are constrained near-zero BY PROOF-OF-WORK -- that IS what
+a valid hash is -- so those 8 bytes carry almost no entropy across
+different real inputs. Dumping the actual bytes confirmed it directly:
+every sampled record's first 4 bytes were literally `0x00000000`. A first
+fix attempt (XOR-folding FNV-1a's output before masking, to counter FNV's
+separately-known weak low-bit avalanche) did NOT help -- the problem was
+insufficient entropy going INTO the hash, not how the output bits mix.
+FIX: hash all 32 bytes instead of just 8 (kept the XOR-fold too, as free
+insurance on top). Reconfirmed against the real archive: idx_put on the
+full 962,831 records (823,833 new, 19,192 genuine hash duplicates, 0 "full")
+dropped from the original ~186s to **0.104s** -- roughly an 1800x
+improvement, and this affects `idx_get` too (same hash function), which
+live `serve` mode uses for O(1) `getdata`-by-hash lookups -- so this had
+likely been silently degrading actual block-serving performance in
+production, not just boot time.
+### Regression guard added
+`asm/tests/test_idx.c` gained a case: 500,000 keys sharing an IDENTICAL
+first 8 bytes (varying only bytes 8-31), inserted into a production-scale
+table. With the buggy 8-byte-only hash this genuinely times out (every
+insert collides on one bucket, O(n) per insert); with the fix it completes
+in ~0.13s. Verified BOTH directions live (temporarily reverted idx_hash,
+confirmed the test fails/hangs, restored the fix, confirmed it passes) --
+the existing `test_idx.c` never caught this because its other cases
+deliberately randomize the first 8 bytes specifically to get genuine
+(non-hash-collision) duplicate detection, which is exactly the case that
+avoids this defect.
+### Verified (hard evidence)
+- `idx_build_from_file` cross-checked against the C original via sampled
+  `idx_get` lookups on the real live archive (both tables agree exactly,
+  including on genuine duplicate-hash heights) -- `asm/tests/bench_hashidx.c`.
+- Full `make test` (fresh, after cleaning up several stale ROOT-OWNED
+  `/tmp/*test*` scratch directories left over from an earlier root-run
+  suite, unrelated to this work but blocking verification) -- 65/65 harness
+  blocks green, 0 failures, `MAKE_EXIT=0`.
+- `build_hash_index()` called directly via gdb against the actual compiled
+  daemon binary and the real production archive: ran clean, indexed
+  826,746 heights, matching expectations.
+- Redeployed to the live production daemon (killed + relaunched); resumed
+  catch-up cleanly with no crashes. The idx_hash fix will take effect the
+  next time this boot reaches `build_hash_index` (after catch-up finishes).
+### Before/after (real ~962k-record archive)
+| | C (old, buggy hash) | asm (new, fixed hash) | improvement |
+|---|---|---|---|
+| `build_hash_index` (full boot-time build) | ~186s | ~0.1-0.14s | ~1500-1800x |
+| `idx_build_from_file` vs C loop, hash ALREADY fixed | 0.123-0.136s | 0.108-0.110s | ~1.1-1.24x (the honest, modest I/O-side win once the real bottleneck is gone) |
+
 ## 2026-08-17 -- BUILT-IN SELF-HEALING CATCH-UP (dl_catchup) + index.dat SCANS PORTED TO ASM
 ### Goal and outcome
 Two related pieces of work on the download/catch-up path, both against the
