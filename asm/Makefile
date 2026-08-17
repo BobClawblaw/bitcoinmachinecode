@@ -100,6 +100,9 @@ tests/test_bip152: tests/test_bip152.c $(CMPCTOBJS) tests/bip152_vectors.h
 tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 
+tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o
+	$(CC) $(CFLAGS) -o $@ tests/bench_idxscan.c bitcoin_idxscan.o
+
 tests/test_store: tests/test_store.c bitcoin_store.o
 	$(CC) $(CFLAGS) -o $@ tests/test_store.c bitcoin_store.o
 
@@ -581,7 +584,7 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
               bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
               bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o \
-              bitcoin_mempool.o bitcoin_cmpct.o
+              bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o
 daemon/bitcoind: daemon/main.c $(DAEMONOBJS)
 	$(CC) -no-pie -O0 -o $@ daemon/main.c $(DAEMONOBJS)
 
