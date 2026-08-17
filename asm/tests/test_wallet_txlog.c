@@ -34,8 +34,8 @@ static void ck_contains(const char* lbl, const char* hay, const char* needle, in
 }
 
 int main(void){
-    const char* wal = "/tmp/wtxlog_test_wallet.dat";
-    const char* jp  = "/tmp/wtxlog_test_wallet.dat.txlog";
+    const char* wal = "/tmp/wtxlog_test_bmcwallet";
+    const char* jp  = "/tmp/wtxlog_test_bmcwallet.txlog";
     remove(jp);
     unlink(jp);
 
@@ -81,11 +81,11 @@ int main(void){
      * directly to the on-disk journal, then confirm list skips it while still
      * showing the good record above. */
     {
-        char jp2[] = "/tmp/wtxlog_torn.dat.txlog";
+        char jp2[] = "/tmp/wtxlog_torn_bmcwallet.txlog";
         remove(jp2);
         unsigned char tx[32]; for (int i=0;i<32;i++) tx[i]=(unsigned char)i;
         unsigned char de[20]; for (int i=0;i<20;i++) de[i]=(unsigned char)(0xa0+i);
-        ck("torn fixture: good append succeeds", txlog_append_sent("/tmp/wtxlog_torn.dat", tx, 5000, 100, de, 1, 226), 0);
+        ck("torn fixture: good append succeeds", txlog_append_sent("/tmp/wtxlog_torn_bmcwallet", tx, 5000, 100, de, 1, 226), 0);
         /* hand-write a second "record" with a wrong (torn) checksum field */
         FILE* f = fopen(jp2, "a");
         fputs("1786923023 sent 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 900 20 a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3 1 100 00000000deadbeef\n", f);

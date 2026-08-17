@@ -173,9 +173,12 @@ soak-store/
 /4
 /6
 .worktrees/
-# Dev wallet + its separate secret file (regenerable via wallet_cli init)
-asm/config/wallet.dat
-asm/config/wallet.dat.pass
+# ---- own-format wallet (NOT Core's wallet.dat) + its separate secret file ----
+# config/bmcwallet.dat is our own BMC-formatted encrypted wallet (see
+# wallet_store.c); bmcwallet.dat.pass is the dev-side secret. Both regenerable
+# via wallet_cli init.
+asm/config/bmcwallet.dat
+asm/config/bmcwallet.dat.pass
 # ---- Full-chain differential resume/progress state (scratch, not a deliverable) ----
 validation/fullchain_state/
 
