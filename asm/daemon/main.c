@@ -747,6 +747,12 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
 #define DLC_CHUNK_BLOCKS 200
 #define DLC_MAXPOOL 512
 #define DLC_HDR_TRY_PEERS 8
+/* wall-clock budget for ONE chunk transfer. Near the real tip a 200-block
+ * chunk is large (segwit blocks with witness data, ~250-300MB observed) --
+ * a healthy peer clears that in 2-3 minutes at 1.5-2+ MB/s; this budget
+ * catches the "connected but crawling at a few KB/s" case (would otherwise
+ * take HOURS for the same chunk) without punishing a merely-average peer. */
+#define DLC_CHUNK_BUDGET_SECS 180
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record. */
 static int dlc_chunk_all_present(long lo, long hi){
@@ -871,8 +877,14 @@ static long dlc_headers(char live[][64], int nlive){
  * independently opens append.lock itself -- flock() locks belong to the
  * open file description, so an INHERITED fd would not actually exclude
  * sibling workers from each other. */
+/* per-worker live stats, in a MAP_SHARED region so the parent can read them
+ * while the workers run -- "what peer is worker N talking to and how much
+ * has it pulled" without waiting for the final one-line summary. */
+typedef struct { char peer[64]; long chunks; long blocks; long guard; } dlc_stat_t;
+
 static int dlc_worker(int w, long end_h, char live[][64], int nlive,
-                      int slot0, volatile long* next_claim, volatile long* done_count){
+                      int slot0, volatile long* next_claim, volatile long* done_count,
+                      volatile dlc_stat_t* mystat, volatile int* claimed){
     int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
@@ -885,15 +897,16 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
     char hp_[64]; snprintf(hp_,sizeof hp_,"/tmp/dlc_hdr_%d.dat",getpid());
     static unsigned char hst[64]; static unsigned char rec[112];
     int slot=slot0; long total=0; long stalled=0;
-    int fd=-1;
+    int fd=-1; int held=-1;   /* index into live[]/claimed[] currently held, or -1 */
+#define DLC_RELEASE() do{ if(held>=0){ claimed[held]=0; held=-1; } }while(0)
     for(;;){
         long lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
-        if(lo>end_h){ if(fd>=0) close(fd); break; }
+        if(lo>end_h){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
         long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
 
         int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
-        if(hfd<0){ if(fd>=0) close(fd); break; }
+        if(hfd<0){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
         *(int*)((char*)hst+0)=hfd; *(long*)((char*)hst+8)=0;
         long n=0; FILE* mf=fopen("headers.dat","rb");
         for(long k=lo;k<=hi;k++){
@@ -901,19 +914,26 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
             else break;
         }
         if(mf) fclose(mf);
-        if(n<=0){ close(hfd); if(fd>=0) close(fd); break; }
+        if(n<=0){ close(hfd); if(fd>=0) close(fd); DLC_RELEASE(); break; }
 
         int guard=0, chunk_ok=0;
         for(;;){
             if(fd<0){
                 int ok=0;
                 for(int a=0;a<nlive && !ok;a++){
-                    const char* cand=live[(slot+a)%nlive];
+                    int idx=(slot+a)%nlive;
+                    const char* cand=live[idx];
                     unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) continue;
+                    /* claim this peer for exclusive use FIRST -- a real peer
+                     * IP is only worth as much as its own bandwidth, so two
+                     * workers sharing one starves both instead of using a
+                     * second distinct peer that's sitting idle. */
+                    if(!__sync_bool_compare_and_swap(&claimed[idx],0,1)) continue;
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons(8333));
-                    if(fdc<0) continue;
+                    if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-                    if(node_handshake(fdc)==1){ fd=fdc; ok=1; slot=(slot+a+1)%nlive; } else close(fdc);
+                    if(node_handshake(fdc)==1){ fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive; strncpy((char*)mystat->peer,cand,63); }
+                    else { claimed[idx]=0; close(fdc); }
                 }
                 if(!ok){
                     stalled++;
@@ -922,22 +942,46 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                 }
                 stalled=0;
             }
+            /* budget the WHOLE transfer's wall-clock, not just the socket
+             * read timeout -- a peer trickling a few KB/s keeps resetting
+             * SO_RCVTIMEO on every partial read and would never trip that,
+             * but is still worth dropping in favor of a fresh peer from the
+             * pool. Same bounded-call pattern as do_outbound_sync_bounded
+             * above: on budget expiry the socket may hold a partial frame,
+             * so it is NOT safe to keep using it -- drop unconditionally. */
+            struct sigaction sa, old; memset(&sa,0,sizeof sa);
+            sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
+            sigaction(SIGALRM,&sa,&old);
+            mux_sync_budget_fired=0;
+            alarm(DLC_CHUNK_BUDGET_SECS);
             long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
+            alarm(0); sigaction(SIGALRM,&old,NULL);
             store_reload(st);
             guard++;
-            if(r>=0){ chunk_ok=1; break; }   /* clean completion; KEEP fd for the next chunk */
-            close(fd); fd=-1;
+            if(mux_sync_budget_fired){
+                fprintf(stderr,"[dlc w%d] %s exceeded %ds budget (dead weight); dropping for a fresh peer\n",
+                        w, mystat->peer, DLC_CHUNK_BUDGET_SECS);
+                close(fd); fd=-1; DLC_RELEASE();
+                slot=(slot+1)%(nlive>0?nlive:1);
+                if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
+                continue;   /* r is unreliable after an EINTR'd read; don't trust it */
+            }
+            if(r>=0){ chunk_ok=1; break; }   /* clean completion; KEEP fd (and claim) for the next chunk */
+            close(fd); fd=-1; DLC_RELEASE();
             slot=(slot+1)%(nlive>0?nlive:1);
             if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
         }
         close(hfd);
-        if(chunk_ok){ total+=n; __sync_fetch_and_add(done_count,n); }
-        else fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] ABANDONED\n",w,lo,hi);
+        if(chunk_ok){
+            total+=n; __sync_fetch_and_add(done_count,n);
+            mystat->chunks++; mystat->blocks+=n; mystat->guard+=guard;
+        } else fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] ABANDONED\n",w,lo,hi);
     }
     fprintf(stderr,"[dlc w%d] done: blocks=%ld\n", w, total);
     close(lfd);
     return 0;
 }
+#undef DLC_RELEASE
 
 /* orchestrator: bootstrap peers -> header phase -> compute the combined
  * hole+extend span -> a fast non-blocking-connect liveness probe (same
@@ -1047,18 +1091,50 @@ static long dl_catchup(const char* dir, int min_workers){
 
     volatile long* next_claim=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     volatile long* done_count=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-    if(next_claim==MAP_FAILED || done_count==MAP_FAILED){ perror("mmap"); return 0; }
+    volatile dlc_stat_t* stats=mmap(NULL,sizeof(dlc_stat_t)*(size_t)nw,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    /* one claim flag per live[] peer -- __sync_bool_compare_and_swap makes
+     * "pick an unclaimed peer" atomic across all forked workers, so no two
+     * workers ever share one peer's bandwidth while a distinct live peer
+     * sits unused. */
+    volatile int* claimed=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED){ perror("mmap"); return 0; }
     *next_claim=start_h; *done_count=0;
+    /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
+     * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
+     * init needed. */
 
     pid_t kids[64];
     for(int w=0;w<nw;w++){
         pid_t p=fork();
-        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count)); }
+        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed)); }
         kids[w]=p;
     }
-    for(int w=0;w<nw;w++){ int stt; waitpid(kids[w],&stt,0); }
+    /* live peer-stats table: poll every 10s instead of blocking silently on
+     * waitpid, so "what are our peers doing right now" is visible in the log
+     * for the whole catch-up, not just a one-line summary at the very end. */
+    long prev_blocks[64]={0};
+    int alive=nw;
+    while(alive>0){
+        struct timespec ts={10,0}; nanosleep(&ts,NULL);
+        alive=0;
+        for(int w=0;w<nw;w++){
+            if(kids[w]==0) continue;
+            int stt; pid_t r=waitpid(kids[w],&stt,WNOHANG);
+            if(r==0) alive++; else kids[w]=0;
+        }
+        fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
+        for(int w=0;w<nw;w++){
+            long b=stats[w].blocks; long rate=(b-prev_blocks[w])/10;
+            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld/s)%s\n",
+                    w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
+                    stats[w].chunks, b, rate, kids[w]==0?" [done]":"");
+            prev_blocks[w]=b;
+        }
+    }
     long total=*done_count;
     munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
+    munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
+    munmap((void*)claimed,sizeof(int)*(size_t)nlive);
     fprintf(stderr,"[dlc] catch-up done: %ld new blocks written\n", total);
     return total;
 }
