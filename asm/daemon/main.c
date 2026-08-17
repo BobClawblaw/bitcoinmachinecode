@@ -1134,6 +1134,14 @@ static void dlc_fmt_bytes(char* buf, size_t cap, double bytes){
     else if(v>=1024.0){ v/=1024.0; unit="KB"; }
     snprintf(buf,cap,"%.1f%s",v,unit);
 }
+/* HH:MM:SS (HH unbounded, not clamped to 24) since catchup_start -- so "how
+ * long has this dl_catchup run been going" is readable straight from the
+ * log instead of needing `ps -o etime` on the process from outside. */
+static void dlc_fmt_elapsed(char* buf, size_t cap, long secs){
+    if(secs<0) secs=0;
+    long h=secs/3600, m=(secs%3600)/60, s=secs%60;
+    snprintf(buf,cap,"%ld:%02ld:%02ld",h,m,s);
+}
 
 /* full sequential scan of index.dat: highest non-zero height (tip, -1 if
  * none) and count of non-zero records in [0,tip]. Two genuinely different
@@ -1233,6 +1241,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
      * init needed. */
 
+    time_t catchup_start=time(NULL); /* for the elapsed-time display in the status loop below */
     pid_t kids[64]; pid_t opid[64];
     for(int w=0;w<nw;w++){
         pid_t p=fork();
@@ -1263,8 +1272,9 @@ static long dl_catchup(const char* dir, int min_workers){
             long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
             double overall_pct = 100.0*(double)present/(double)(end_h+1);
             double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
-            fprintf(stderr,"[dlc] == overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
-                    present, end_h+1, overall_pct, holes, cur_tip, span_pct);
+            char elapsed[16]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
+            fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
+                    elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct);
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0;
