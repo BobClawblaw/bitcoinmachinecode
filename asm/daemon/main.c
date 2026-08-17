@@ -1034,6 +1034,31 @@ static int dlc_probe_round(char pool[][64], int from, int ntry,
     return got;
 }
 
+/* total bytes a process has read (network + disk + everything -- for a
+ * dlc_worker child this is dominated by socket reads), from the kernel's own
+ * per-process I/O accounting. Real measured throughput, not an estimate:
+ * block-level chunk counters miss a worker that's mid-transfer on a large
+ * chunk, but this doesn't. Returns -1 if unavailable (process already gone,
+ * or a non-Linux host without /proc). */
+static long dlc_proc_rchar(pid_t pid){
+    char path[64]; snprintf(path,sizeof path,"/proc/%d/io",(int)pid);
+    FILE* f=fopen(path,"r"); if(!f) return -1;
+    char line[128]; long v=-1;
+    while(fgets(line,sizeof line,f)){
+        if(!strncmp(line,"rchar:",6)){ v=atol(line+6); break; }
+    }
+    fclose(f);
+    return v;
+}
+
+/* human-scaled "N.NUNIT/s" into buf (>=16 bytes). */
+static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
+    const char* unit="B"; double v=bytes_per_sec;
+    if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
+    else if(v>=1024.0){ v/=1024.0; unit="KB"; }
+    snprintf(buf,cap,"%.1f%s/s",v,unit);
+}
+
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     static unsigned char ab[64];
@@ -1103,16 +1128,20 @@ static long dl_catchup(const char* dir, int min_workers){
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
      * init needed. */
 
-    pid_t kids[64];
+    pid_t kids[64]; pid_t opid[64];
     for(int w=0;w<nw;w++){
         pid_t p=fork();
         if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed)); }
-        kids[w]=p;
+        kids[w]=p; opid[w]=p;
     }
     /* live peer-stats table: poll every 10s instead of blocking silently on
      * waitpid, so "what are our peers doing right now" is visible in the log
-     * for the whole catch-up, not just a one-line summary at the very end. */
-    long prev_blocks[64]={0};
+     * for the whole catch-up, not just a one-line summary at the very end.
+     * Bandwidth comes from each worker's OWN /proc/<pid>/io (real measured
+     * bytes read), not the block/chunk counters -- a worker mid-transfer on
+     * one large chunk shows 0 chunks for minutes even while actively
+     * downloading at full speed, which the byte counter catches. */
+    long prev_blocks[64]={0}; long prev_rchar[64]={0};
     int alive=nw;
     while(alive>0){
         struct timespec ts={10,0}; nanosleep(&ts,NULL);
@@ -1124,10 +1153,13 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         for(int w=0;w<nw;w++){
-            long b=stats[w].blocks; long rate=(b-prev_blocks[w])/10;
-            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld/s)%s\n",
+            long b=stats[w].blocks; long blkrate=(b-prev_blocks[w])/10;
+            long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
+            char bw[16]="--";
+            if(rc>=0){ if(prev_rchar[w]>0) dlc_fmt_rate(bw,sizeof bw,(double)(rc-prev_rchar[w])/10.0); prev_rchar[w]=rc; }
+            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
-                    stats[w].chunks, b, rate, kids[w]==0?" [done]":"");
+                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"");
             prev_blocks[w]=b;
         }
     }
