@@ -1305,7 +1305,7 @@ static long dl_catchup(const char* dir, int min_workers){
             char totbuf[16], aggbuf[16];
             dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
             dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/10.0);
-            fprintf(stderr,"[dlc] -- transferred this tick: %sB (%s aggregate) --\n",totbuf,aggbuf);
+            fprintf(stderr,"[dlc] -- transferred this tick: %s (%s aggregate) --\n",totbuf,aggbuf);
         }
     }
     long total=*done_count;
