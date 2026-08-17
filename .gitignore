@@ -185,14 +185,16 @@ soak-store/
 /4
 /6
 .worktrees/
-# ---- own-format wallet (NOT Core's wallet.dat) + its separate secret file ----
-# config/bmcwallet.dat is our own BMC-formatted encrypted wallet (see
-# wallet_store.c); bmcwallet.dat.pass is the dev-side secret. Both regenerable
-# via wallet_cli init.
-asm/config/bmcwallet.dat
-asm/config/bmcwallet.dat.pass
-# Address book (own format, see wallet_cli abook) — regenerable user data.
-asm/config/addressbook.dat
+# ---- own-format wallet user data (NOT Core's wallet.dat) ----
+# Live under the durable runtime directory data/ (which is already ignored
+# wholesale below). bmcwallet.dat is our own BMC-formatted encrypted wallet
+# (see wallet_store.c); bmcwallet.dat.pass is the dev-side secret; txlog and
+# addressbook derive from the same base. Some paths are CWD-relative, so they
+# only land under data/ when run from the project root. Kept explicit here in
+# case the blanket data/ ignore is ever narrowed.
+data/bmcwallet.dat
+data/bmcwallet.dat.pass
+data/addressbook.dat
 # ---- Full-chain differential resume/progress state (scratch, not a deliverable) ----
 validation/fullchain_state/
 

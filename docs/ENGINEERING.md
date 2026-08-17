@@ -66,7 +66,7 @@ audit. Treat it as untrusted until it has. See the warning banner in
 |   |-- *.inc                 #   include tables (BIP39 wordlist, g_comb_table)
 |   |-- build.sh              #   assemble-all + make test + shared libs
 |   |-- Makefile              #   make asm | test | clean | <target>
-|   |-- config/               #   dev wallet secret (bmcwallet.dat.pass)
+|   |-- config/               #   (now empty; wallet user data moved to data/)
 |   |-- cuda/                 #   optional CUDA batch-acceleration tier (crypto)
 |   |-- daemon/               #   C orchestration + CLI drivers + tools
 |   |-- tests/                #   C harnesses proving each asm module correct
@@ -301,7 +301,7 @@ sendtoaddress <priv_hex> <dest_h160_hex> <amount> <fee> <txid:idx:value> [...]
 Persistent-wallet / address-book commands:
 
 ```
-init [password]                        # create persistent wallet (config/bmcwallet.dat)
+init [password]                        # create persistent wallet (data/bmcwallet.dat)
 load [password]                        # load it, report addresses
 getaddress                             # derive/print addresses from loaded wallet
 getprivkey                             # print secret (from loaded wallet)

@@ -540,8 +540,8 @@ static int seed_address(const char* mn, const char* pass, char* addr, int cap,
     return wallet_seed_bip44_address(addr, seed) ? 1 : 0;
 }
 
-static const char* default_wallet_path(void) { return "config/bmcwallet.dat"; }
-static const char* default_book_path(void) { return "config/addressbook.dat"; }
+static const char* default_wallet_path(void) { return "data/bmcwallet.dat"; }
+static const char* default_book_path(void) { return "data/addressbook.dat"; }
 
 /* address-book subcommands:
  *   wallet_cli abook add  <label> <address> [book]
@@ -549,7 +549,7 @@ static const char* default_book_path(void) { return "config/addressbook.dat"; }
  *   wallet_cli abook get  <label> [book]
  *   wallet_cli abook rm   <label> [book]
  *   wallet_cli abook list [book]
- * Default book: config/addressbook.dat (0600, own format). Labels are
+ * Default book: data/addressbook.dat (0600, own format). Labels are
  * alnum/'-'/'_'/'.' (no spaces) and map name->address for sends/reference. */
 static int cmd_abook(int argc, char** argv) {
     if (argc < 3) {
@@ -598,7 +598,7 @@ static int cmd_abook(int argc, char** argv) {
 /* ---- dev secret file: <wallet>.pass -------------------------------------
  * For in-development use on a trusted/secure box we persist the secret that
  * unlocks an encrypted wallet in a SEPARATE 0600 file next to the wallet
- * (e.g. config/bmcwallet.dat -> config/bmcwallet.dat.pass). It is
+ * (e.g. data/bmcwallet.dat -> data/bmcwallet.dat.pass). It is
  * deliberately a different file from the ciphertext so a partial leak never
  * pairs both halves, and it is root/owner-only (0600). This is a DEV
  * convenience; later this single function is where prod would read from a
@@ -635,7 +635,7 @@ static void passfile_write(const char* wallet_path, const char* sec) {
 
 static int cmd_init(int argc, char** argv) {
     /* create a persistent wallet:
-     *   wallet_cli init [passphrase] [path]   (path defaults to config/bmcwallet.dat) */
+     *   wallet_cli init [passphrase] [path]   (path defaults to data/bmcwallet.dat) */
     const char* pass = (argc >= 3) ? argv[2] : NULL;
     const char* path = (argc >= 4) ? argv[3] : default_wallet_path();
     char mn[256];
@@ -776,7 +776,7 @@ static int cmd_seed(int argc, char** argv) {
 /* history / listtransactions: print the persistent transaction journal. */
 static int cmd_history(int argc, char** argv) {
     /* usage: wallet_cli history [path]      (path defaults to the journal next
-     *        to the default wallet store: config/bmcwallet.dat.txlog) */
+     *        to the default wallet store: data/bmcwallet.dat.txlog) */
     char path[1024];
     const char* p = (argc >= 3) ? argv[2] : txlog_path_for(NULL, path, sizeof path);
     char out[8192];
