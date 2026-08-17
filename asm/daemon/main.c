@@ -770,6 +770,16 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
  * detect-and-replace cycle for a dead peer is ~4x faster and a miss costs
  * ~4x less redone work. */
 #define DLC_CHUNK_BUDGET_SECS 120
+/* early-kill thresholds: the parent's status loop already samples each
+ * worker's real /proc/<pid>/io bandwidth every 10s for the live display --
+ * a connection sustaining under DLC_DEAD_WEIGHT_BPS for
+ * DLC_DEAD_WEIGHT_TICKS consecutive ticks is obviously dead (observed
+ * 1-4KB/s vs 200KB/s+ for legitimately-working peers -- a wide, easy gap),
+ * so the parent signals that worker to abandon immediately instead of
+ * making it sit out the full DLC_CHUNK_BUDGET_SECS on a peer that was
+ * never going anywhere. */
+#define DLC_DEAD_WEIGHT_BPS 10240.0
+#define DLC_DEAD_WEIGHT_TICKS 2
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record. */
 static int dlc_chunk_all_present(long lo, long hi){
@@ -902,6 +912,16 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; } dlc_stat
 static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
                       volatile dlc_stat_t* mystat, volatile int* claimed){
+    /* SIGUSR1 registered for this worker's WHOLE lifetime, not just around
+     * the node_ibd_blocks_s call below -- the parent can send it any time
+     * it spots sustained near-zero bandwidth, which won't always land while
+     * the per-chunk alarm guard (further down) has it re-armed. Left
+     * unregistered here, a stray signal landing between chunks would hit
+     * the default SIGUSR1 disposition (terminate) and kill this whole
+     * worker instead of just its dead connection. The handler only sets a
+     * flag either way, so an early/idle delivery is harmless -- the next
+     * guarded call resets the flag before it matters. */
+    { struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=mux_budget_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL); }
     int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
@@ -975,10 +995,17 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
              * but is still worth dropping in favor of a fresh peer from the
              * pool. Same bounded-call pattern as do_outbound_sync_bounded
              * above: on budget expiry the socket may hold a partial frame,
-             * so it is NOT safe to keep using it -- drop unconditionally. */
+             * so it is NOT safe to keep using it -- drop unconditionally.
+             * SIGUSR1 gets the SAME handler as SIGALRM: the parent's status
+             * loop already samples this worker's real /proc/<pid>/io
+             * bandwidth every 10s for the live display, so it can spot an
+             * OBVIOUSLY dead connection (sustained near-zero, not just slow)
+             * well before the flat wall-clock budget would fire, and signal
+             * this worker to abandon early instead of sitting out the full
+             * DLC_CHUNK_BUDGET_SECS on a peer that was never going anywhere. */
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
-            sigaction(SIGALRM,&sa,&old);
+            sigaction(SIGALRM,&sa,&old);   /* SIGUSR1 already registered for this worker's whole life, above */
             mux_sync_budget_fired=0;
             alarm(DLC_CHUNK_BUDGET_SECS);
             long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
@@ -986,8 +1013,8 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
             store_reload(st);
             guard++;
             if(mux_sync_budget_fired){
-                fprintf(stderr,"[dlc w%d] %s exceeded %ds budget (dead weight); dropping for a fresh peer\n",
-                        w, mystat->peer, DLC_CHUNK_BUDGET_SECS);
+                fprintf(stderr,"[dlc w%d] %s dead weight (budget/early-kill); dropping for a fresh peer\n",
+                        w, mystat->peer);
                 close(fd); fd=-1; DLC_RELEASE();
                 slot=(slot+1)%(nlive>0?nlive:1);
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
@@ -1197,7 +1224,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * bytes read), not the block/chunk counters -- a worker mid-transfer on
      * one large chunk shows 0 chunks for minutes even while actively
      * downloading at full speed, which the byte counter catches. */
-    long prev_blocks[64]={0}; long prev_rchar[64]={0};
+    long prev_blocks[64]={0}; long prev_rchar[64]={0}; int dead_ticks[64]={0};
     int alive=nw;
     while(alive>0){
         struct timespec ts={10,0}; nanosleep(&ts,NULL);
@@ -1220,11 +1247,25 @@ static long dl_catchup(const char* dir, int min_workers){
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(b-prev_blocks[w])/10;
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
-            char bw[16]="--";
-            if(rc>=0){ if(prev_rchar[w]>0) dlc_fmt_rate(bw,sizeof bw,(double)(rc-prev_rchar[w])/10.0); prev_rchar[w]=rc; }
-            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s\n",
+            char bw[16]="--"; double byte_rate=-1.0;
+            if(rc>=0){
+                if(prev_rchar[w]>0){ byte_rate=(double)(rc-prev_rchar[w])/10.0; dlc_fmt_rate(bw,sizeof bw,byte_rate); }
+                prev_rchar[w]=rc;
+            }
+            const char* flag="";
+            if(kids[w]!=0 && byte_rate>=0.0){
+                if(byte_rate<DLC_DEAD_WEIGHT_BPS){
+                    dead_ticks[w]++;
+                    if(dead_ticks[w]>=DLC_DEAD_WEIGHT_TICKS){
+                        kill(opid[w],SIGUSR1);
+                        dead_ticks[w]=0;
+                        flag=" [early-kill sent]";
+                    }
+                } else dead_ticks[w]=0;
+            }
+            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
-                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"");
+                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag);
             prev_blocks[w]=b;
         }
     }
