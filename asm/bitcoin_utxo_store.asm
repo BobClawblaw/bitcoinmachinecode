@@ -145,16 +145,23 @@ mac_read_exact:
 ; mac_wr_log(st=r12, buf=r13, len=r14) -> rax 0 ok / -1
 ;   Appends 'len' bytes at st->log_len to the log fd, advancing st->log_len.
 ;   Internal: passes args in callee-saved regs (non-ABI). Preserves r12/r13/r14.
+;
+;   PERFORMANCE: no longer lseek()s before every write(). This fd is written
+;   ONLY here, append-only, single-writer -- a successful write() already
+;   advances the kernel's file offset by exactly the bytes just written,
+;   which is precisely where log_len (just incremented by the same amount)
+;   says the next write belongs. The seek was therefore redundant on every
+;   call after the first. The one place that matters is utxo_store_reload:
+;   it measures the log's size via lseek(log_fd, 0, SEEK_END) on this SAME
+;   fd, which as a side effect parks the fd exactly at log_len before any
+;   post-reload mac_wr_log call -- and reload's own replay of the WAL tail
+;   reads through a SEPARATE fd it opens for itself, so it never disturbs
+;   this one. Removing the lseek cuts the syscall count for the WAL append
+;   path roughly in half (this was a measured bottleneck: ~2 syscalls per
+;   utxo_store_put, up to 3.78B times across a full-archive replay).
 ; ============================================================================
 mac_wr_log:
     mov  rdi, [r12]        ; log_fd
-    mov  rsi, [r12+16]     ; log_len (seek offset)
-    xor  edx, edx
-    mov  eax, 8            ; lseek SEEK_SET
-    syscall
-    test rax, rax
-    js   .wf
-    mov  rdi, [r12]
     mov  rsi, r13
     mov  rdx, r14
     mov  eax, 1            ; write
