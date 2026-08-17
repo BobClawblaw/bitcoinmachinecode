@@ -23,9 +23,10 @@ extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsig
                           unsigned long long* value, const unsigned char** script, unsigned* slen);
 extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
+extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
 
-/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (144 bytes). */
+/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes). */
 struct LST {
     long log_fd;                      /* +0   */
     long idx_fd;                      /* +8   */
@@ -45,6 +46,7 @@ struct LST {
     unsigned long long manifest_n;    /* +120 */
     void*              scratch_buf;   /* +128 */
     unsigned long long scratch_cap;   /* +136 */
+    unsigned long long next_run_no;   /* +144 */
 };
 
 #define BLOOM_MAX_BYTES   (4*1024*1024)
@@ -96,7 +98,7 @@ int main(void) {
     chdir(dir);
 
     void* tomb = malloc(TOMB_CAP*36);
-    void* manifest = malloc(MANIFEST_CAP*8);
+    void* manifest = malloc(MANIFEST_CAP*16);
     void* scratch = malloc(SCRATCH_CAP);
     if (!tomb || !manifest || !scratch) { printf("FAIL alloc\n"); return 1; }
 
@@ -203,7 +205,7 @@ int main(void) {
     {
         struct LST lst2;
         void* tomb2 = malloc(TOMB_CAP*36);
-        void* manifest2 = malloc(MANIFEST_CAP*8);
+        void* manifest2 = malloc(MANIFEST_CAP*16);
         void* scratch2 = malloc(SCRATCH_CAP);
         setup_lst(&lst2, tomb2, manifest2, scratch2);
         static unsigned char ux2[ 40 + SLOTS*48 + 8 ];
@@ -231,7 +233,7 @@ int main(void) {
     {
         struct LST lst3;
         void* tomb3 = malloc(TOMB_CAP*36);
-        void* manifest3 = malloc(MANIFEST_CAP*8);
+        void* manifest3 = malloc(MANIFEST_CAP*16);
         void* scratch3 = malloc(SCRATCH_CAP);
         setup_lst(&lst3, tomb3, manifest3, scratch3);
         ckm("stress lsm_init", utxo_lsm_init(&lst3) == 1);
@@ -289,13 +291,44 @@ int main(void) {
                     }
                 }
             }
+            if ((round % 211) == 0) {
+                /* interleave compaction into the same live workload -- the
+                 * strongest test of compaction's correctness: it must not
+                 * disturb any in-flight get() result, whether the key ends
+                 * up in the merged run, an untouched newer run, or the
+                 * still-open memtable. */
+                long r = utxo_lsm_compact(&lst3);
+                if (r == -1) { stress_fails++; printf("FAIL: stress compact returned -1 at round %d\n", round); }
+            }
         }
-        /* final full sweep */
+        /* one more compaction right before the final full sweep, plus a
+         * fresh reload afterward -- exercises "did compaction's on-disk
+         * state survive being closed and reopened" on top of everything
+         * the interleaved compactions during the loop already covered. */
+        long manifest_before_final_compact = lst3.manifest_n;
+        long rc = utxo_lsm_compact(&lst3);
+        if (rc == -1) { stress_fails++; printf("FAIL: final compact returned -1\n"); }
+        printf("info: final compact manifest_n %ld -> %llu\n", manifest_before_final_compact, lst3.manifest_n);
+        utxo_lsm_close(&lst3);
+
+        struct LST lst3b;
+        void* tomb3b = malloc(TOMB_CAP*36);
+        void* manifest3b = malloc(MANIFEST_CAP*16);
+        void* scratch3b = malloc(SCRATCH_CAP);
+        setup_lst(&lst3b, tomb3b, manifest3b, scratch3b);
+        static unsigned char ux3b[ 40 + SLOTS*48 + 8 ];
+        static unsigned char blob3b[BLOB];
+        utxo_init(ux3b, SLOTS, blob3b, sizeof blob3b);
+        long replayed3b = utxo_lsm_reload(&lst3b, ux3b);
+        ckm("stress reload after compact ok (>=0)", replayed3b >= 0);
+        ck("stress reload manifest_n matches", lst3b.manifest_n, lst3.manifest_n);
+
+        /* final full sweep -- against the FRESH, reloaded state */
         for (int k = 0; k < NKEYS; k++) {
             unsigned char tk[32];
             make_txid(tk, 0x11, (unsigned)k);
             unsigned long long gv; const unsigned char* gs; unsigned gsl;
-            long r = utxo_lsm_get(&lst3, ux3, tk, 0, &gv, &gs, &gsl);
+            long r = utxo_lsm_get(&lst3b, ux3b, tk, 0, &gv, &gs, &gsl);
             if (live[k]) {
                 if (r != 1 || gv != refval[k]) {
                     stress_fails++;
@@ -310,10 +343,11 @@ int main(void) {
             }
         }
         ck("stress test (0 mismatches)", stress_fails, 0);
-        printf("info: stress final manifest_n=%llu (runs created)\n", lst3.manifest_n);
+        printf("info: stress final manifest_n=%llu (runs after compaction)\n", lst3b.manifest_n);
         fails += stress_fails;
-        utxo_lsm_close(&lst3);
+        utxo_lsm_close(&lst3b);
         free(tomb3); free(manifest3); free(scratch3);
+        free(tomb3b); free(manifest3b); free(scratch3b);
     }
 
     utxo_lsm_close(&lst);
