@@ -456,20 +456,31 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   NUL, so open() reads past the end into stack garbage and creates corrupted long
   filenames (bitcoin_store fmt_blkname bug, #13). Size every store to its full field.
 
-### CURRENT STATE (LAST UPDATED) -- single-directory downloader
-- Downloader: daemon/unified_ibd.c writes blocks DIRECTLY into ONE directory
-  (<dir>/blk*.dat + index.dat + headers.dat; NO w<w>/ worker dirs). 8 workers
-  each run asm node_ibd_blocks_s -> store_append_shared (flock append.lock;
-  block at true blk-file SEEK_END; 48B index record positionally at height*48;
-  index pre-sized to end_h+1). Each worker uses a PRIVATE /tmp hdr file so hst
-  never collides (fixes worker-boundary chain-breaks).
-- Verified: 8 workers x 8000 blocks = 0 dups, 8000/8000 hash-match, CHAIN
-  VERIFIED. check_chain audits; chainctl (8w, 16k chunks, audited) drives the
-  full forward download from the archive's current tip.
-- RESUME: unified_ibd reads highest non-zero index record and resumes from tip+1.
-- ARCHIVE IS NOW CONTIGUOUS FROM GENESIS: heights [0, ~219k] verified contiguous
-  (earlier 0..29999 backfill note is obsolete -- the forward download reached
-  the origin and the archive has no holes at the start).
+### CURRENT STATE (LAST UPDATED 2026-08-17) -- built-in self-healing catch-up
+- Primary mechanism is now BUILT INTO THE DAEMON: `bitcoind serve <dir> <port>`
+  runs `dl_catchup` (asm/daemon/main.c) synchronously at boot -- no external
+  scripts required for normal operation. It discovers peers via DNS-seed
+  bootstrap (`dl_bootstrap`/`dl_pool_from_book`), extends `headers.dat` to the
+  real tip, computes the archive gap directly from `index.dat` as ONE combined
+  span (holes below the stored tip + everything missing up to the real tip),
+  and forks `>=8` chunk-claiming work-stealing workers to fill it. Dead-peer
+  detection (bandwidth-based, configurable tick threshold) drops and replaces
+  underperforming peers automatically. Live status ticks report progress,
+  per-peer bandwidth, and cumulative/average transfer stats.
+- `daemon/unified_ibd.c` (same chunk-claiming engine, deeper peer pool) is kept
+  as a standalone ops tool for large one-off catch-ups or offline reindexing,
+  but is no longer load-bearing for the daemon's own boot path.
+- `index.dat` positional scans (tip/first-hole/all-present/full-progress),
+  needed every dl_catchup status tick and worker chunk-claim, are now a
+  canonical asm module (`asm/bitcoin_idxscan.asm`, `idxscan_*`) instead of
+  being reimplemented separately in C at each call site -- buffered pread64
+  (192KB window), verified byte-identical to the prior C/stdio versions on the
+  live archive, benchmarked 4-48x faster (`asm/tests/bench_idxscan.c`).
+- RESUME: dl_catchup (and unified_ibd) read the highest non-zero index record
+  and resume automatically; no manual bookkeeping needed between runs.
+- Archive state as of this update: 819,085/962,831 real mainnet blocks stored
+  (85.07% of real tip), contiguous from genesis, 188 holes remaining in the
+  reached range (99.98% gap-free) -- catch-up run is ongoing.
 
 ### WALLET (DONE) -- key derivation, addresses, signing, and a CLI in ASM
 - All wallet crypto primitives are pure x86-64 ASM and verified byte-exact.

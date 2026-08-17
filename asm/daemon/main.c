@@ -129,6 +129,14 @@ extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern int  idx_get(void* idx, const unsigned char hash[32], long* height);
 extern long idx_count(void* idx);
+
+/* bitcoin_idxscan.asm -- buffered index.dat positional scans, replacing the
+ * dlc_* stdio versions below (kept as reference/fallback docs in comments
+ * at each call site; see asm/bitcoin_idxscan.asm for the perf rationale). */
+extern long idxscan_tip(void);
+extern long idxscan_first_hole(long tip);
+extern long idxscan_all_present(long lo, long hi);
+extern void idxscan_progress(long* out_tip, long* out_present);
 static int build_hash_index(void){
     ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);   /* last slot may need a full --- actually over-allocate */
     if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
@@ -781,39 +789,24 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
 #define DLC_DEAD_WEIGHT_BPS 10240.0
 #define DLC_DEAD_WEIGHT_TICKS 10
 
-/* true iff every height in [lo,hi] already has a non-zero index.dat record. */
+/* true iff every height in [lo,hi] already has a non-zero index.dat record.
+ * asm/bitcoin_idxscan.asm:idxscan_all_present -- buffered pread64 port,
+ * ~44x faster than this stdio version on the real archive (see
+ * tests/bench_idxscan.c). */
 static int dlc_chunk_all_present(long lo, long hi){
-    FILE* f=fopen("index.dat","rb"); if(!f) return 0;
-    unsigned char rec[48]; int all=1;
-    for(long k=lo;k<=hi;k++){
-        if(fseek(f,k*48,SEEK_SET)!=0 || fread(rec,1,48,f)!=48 || !(rec[0]||rec[1]||rec[2]||rec[3])){ all=0; break; }
-    }
-    fclose(f);
-    return all;
+    return idxscan_all_present(lo, hi) != 0;
 }
 
-/* highest height h with index.dat[h] non-zero, or -1 if none/empty. */
+/* highest height h with index.dat[h] non-zero, or -1 if none/empty.
+ * asm/bitcoin_idxscan.asm:idxscan_tip -- ~48x faster (see tests/bench_idxscan.c). */
 static long dlc_index_tip(void){
-    FILE* f=fopen("index.dat","rb"); if(!f) return -1;
-    fseek(f,0,SEEK_END); long n=ftell(f)/48;
-    unsigned char rec[48]; long tip=-1;
-    for(long h=n-1; h>=0; h--){
-        if(fseek(f,h*48,SEEK_SET)!=0 || fread(rec,1,48,f)!=48) continue;
-        if(rec[0]||rec[1]||rec[2]||rec[3]){ tip=h; break; }
-    }
-    fclose(f); return tip;
+    return idxscan_tip();
 }
 
-/* first zero-record height in [0,tip], or -1 if none (contiguous). */
+/* first zero-record height in [0,tip], or -1 if none (contiguous).
+ * asm/bitcoin_idxscan.asm:idxscan_first_hole -- ~4.5x faster. */
 static long dlc_first_hole(long tip){
-    if(tip<0) return -1;
-    FILE* f=fopen("index.dat","rb"); if(!f) return -1;
-    unsigned char rec[48];
-    for(long h=0; h<=tip; h++){
-        if(fread(rec,1,48,f)!=48){ fclose(f); return h; }
-        if(!(rec[0]||rec[1]||rec[2]||rec[3])){ fclose(f); return h; }
-    }
-    fclose(f); return -1;
+    return idxscan_first_hole(tip);
 }
 
 /* combined hole+extend span: 1 with *start_h/*end_h set, or 0 if the
@@ -1165,19 +1158,10 @@ static void dlc_fmt_elapsed(char* buf, size_t cap, long secs){
  * 60%. A fresh scan every status tick (rather than tracking incrementally)
  * is simplest and correct even though workers claim scattered, non-
  * sequential chunks -- cheap on local NVMe even at 900k+ records. */
+/* asm/bitcoin_idxscan.asm:idxscan_progress -- ~4x faster (see
+ * tests/bench_idxscan.c). */
 static void dlc_scan_progress(long* out_tip, long* out_present){
-    FILE* f=fopen("index.dat","rb");
-    long tip=-1, present=0;
-    if(f){
-        fseek(f,0,SEEK_END); long n=ftell(f)/48; fseek(f,0,SEEK_SET);
-        unsigned char rec[48];
-        for(long h=0; h<n; h++){
-            if(fread(rec,1,48,f)!=48) break;
-            if(rec[0]||rec[1]||rec[2]||rec[3]){ present++; tip=h; }
-        }
-        fclose(f);
-    }
-    *out_tip=tip; *out_present=present;
+    idxscan_progress(out_tip, out_present);
 }
 
 static long dl_catchup(const char* dir, int min_workers){
