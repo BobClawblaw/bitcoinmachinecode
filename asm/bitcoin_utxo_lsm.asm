@@ -43,12 +43,18 @@
 ; specifically because callers only ever delete real spends (see
 ; daemon/build_utxo.c). utxo_lsm_del returns -1 only on a genuine I/O error.
 ;
-; PHASE 1 SCOPE: no compaction. Runs accumulate and are never merged or
-; garbage-collected. This is correct and sufficient for build_utxo.c's
-; one-shot, non-resumable archive replay (bounded run count: ~archive size
-; / memtable capacity). It is an explicit non-goal for any long-running
-; process (e.g. a live daemon's real-time mempool) -- compaction is Phase 2
-; and is a hard gate before this module is ever wired into daemon/main.c.
+; PHASE 2: utxo_lsm_compact(lst) merges ALL current runs into one via a
+; single-pass streaming k-way merge (bounded memory -- one small read-ahead
+; buffer per input run, in a scratch region this function mmaps itself,
+; not the caller's flush-oriented scratch_buf). Since it always compacts
+; every run down to the oldest one, every tombstone it encounters is safe
+; to drop outright (no older run could still need it). It's EXPLICIT /
+; caller-invoked, not auto-triggered by a garbage-ratio estimate -- that's
+; a documented future refinement, not implemented here. This is what makes
+; the run count bounded for a long-running process; Phase 1 alone (flush
+; with no compaction) is only safe for a one-shot, non-resumable replay
+; like build_utxo.c, where the run count is naturally bounded by archive
+; size / memtable capacity and the process never runs "forever."
 ;
 ; Run files are SORTED (ascending 36-byte key) so a lookup can early-exit
 ; and so a future compaction can do a straight streaming k-way merge
@@ -81,12 +87,22 @@
 ;                                  build_utxo.c already treats del_miss as
 ;                                  approximate, never correctness-critical)
 ;   +96  qword next_gen        -- next generation number to assign on flush
-;   +104 qword manifest_buf    -- CALLER SETS: array of qword generation
-;                                  numbers, one per run; run i's file is
-;                                  always "utxo_run_%06u.dat" for i itself
-;                                  (Phase 1 never removes/renumbers runs, so
-;                                  a run's number IS its manifest index)
-;   +112 qword manifest_cap    -- CALLER SETS: capacity of manifest_buf (runs)
+;                                  or compaction (compaction's merged run
+;                                  adopts a FRESH gen here, not the max of
+;                                  its inputs -- see utxo_lsm_compact)
+;   +104 qword manifest_buf    -- CALLER SETS: array of 16-byte entries,
+;                                  one per run: [gen:8][run_no:8]. A run's
+;                                  file is "utxo_run_%06u.dat" for its OWN
+;                                  run_no field -- NOT its manifest index.
+;                                  (Phase 1 alone could imply run_no from
+;                                  the index since runs were never removed;
+;                                  compaction replaces many runs with one,
+;                                  so the index no longer determines the
+;                                  file number and both fields are stored
+;                                  explicitly.)
+;   +112 qword manifest_cap    -- CALLER SETS: capacity of manifest_buf
+;                                  (runs, i.e. manifest_buf must be >=
+;                                  manifest_cap*16 bytes)
 ;   +120 qword manifest_n      -- current run count
 ;   +128 qword scratch_buf     -- CALLER SETS: big scratch arena, layout:
 ;                                  [0 .. desc_cap*64)         merge-sort ping
@@ -98,9 +114,15 @@
 ;                                  Required: desc_cap >= fill_threshold +
 ;                                  tomb_cap (worst case every live memtable
 ;                                  entry AND every tombstone need a
-;                                  descriptor in the same flush).
+;                                  descriptor in the same flush). Used only
+;                                  by flush/get, NOT by compaction (which
+;                                  mmaps its own small scratch -- see below).
 ;   +136 qword scratch_cap     -- CALLER SETS: byte size of scratch_buf
-;   (total struct size: 144 bytes)
+;   +144 qword next_run_no     -- next run file number to assign (decoupled
+;                                  from manifest_n/next_gen since compaction
+;                                  can shrink the manifest while file
+;                                  numbers must stay globally unique)
+;   (total struct size: 152 bytes)
 ;
 ; Exports (System V AMD64):
 ;   long utxo_lsm_init(void* lst)                              -> 1 / -1
@@ -117,6 +139,7 @@
 ;                      blob pointer; documented divergence from utxo_get.)
 ;   long utxo_lsm_count(void* lst)                              -> total_live
 ;   long utxo_lsm_reload(void* lst, void* u)          -> replayed count / -1
+;   long utxo_lsm_compact(void* lst)      -> 1 ok / 0 nothing-to-do / -1 err
 ;   void utxo_lsm_close(void* lst)
 ;
 ; FRAME RULE: same as bitcoin_utxo_store.asm -- locals live strictly below
@@ -129,6 +152,22 @@ MAGIC_RUN        equ 0x4E555255      ; "URUN" little-endian dword
 MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword
 BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
+
+; ---- compaction (Phase 2) constants ----
+; utxo_lsm_compact merges the OLDEST min(manifest_n, COMPACT_MAX_RUNS) runs
+; into one via a streaming k-way merge, using its OWN small mmap'd scratch
+; (not the caller's flush-oriented scratch_buf): one read-ahead "current
+; record" slot per input run, bounded regardless of how large those runs
+; are. Always a contiguous PREFIX starting at the oldest run, so every
+; tombstone encountered is provably safe to drop (no older run could still
+; need it) -- this holds for a partial (< manifest_n) batch too, not just a
+; full compaction, since "oldest" only ever grows from index 0 upward.
+COMPACT_MAX_RUNS   equ 64
+; per-run slot: fd(8) gen(8) run_no(8) remaining(8) active(8) key(36)
+; type(1)+pad(3) value(8) slen(2)+pad(6) script(up to SCRIPT_MAX_BYTES)
+COMPACT_SLOT_SIZE  equ 96 + SCRIPT_MAX_BYTES
+COMPACT_SLOTS_BYTES equ COMPACT_MAX_RUNS * COMPACT_SLOT_SIZE
+COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES
 
 manifest_name:     db "utxo_manifest.dat", 0
 manifest_tmp_name:  db "utxo_manifest.tmp", 0
@@ -649,6 +688,7 @@ utxo_lsm_init:
     mov  qword [r12+88], 0
     mov  qword [r12+96], 0
     mov  qword [r12+120], 0
+    mov  qword [r12+144], 0
     mov  rax, 1
     jmp  .li_done
 .li_fail:
@@ -1076,8 +1116,15 @@ utxo_lsm_get:
     jz   .lg_not_found
     dec  rax
     mov  [rbp-0x50], rax
+    ; run_no comes from the manifest ENTRY, not the array index -- once
+    ; compaction can replace many runs with one, the index no longer
+    ; determines the file number.
+    mov  rcx, rax
+    shl  rcx, 4                 ; *16 (entry size)
+    mov  rdx, [r12+104]          ; manifest_buf
+    add  rdx, rcx
+    mov  esi, [rdx+8]             ; run_no
     mov  rdi, r12
-    mov  esi, eax
     mov  rdx, rbx
     mov  ecx, [rbp-0x30]
     mov  r8, [rbp-0x38]
@@ -1318,7 +1365,7 @@ mac_flush:
 
     ; ---- write run file ----
     lea  rdi, [rbp-0x140]
-    mov  esi, [r12+120]              ; this run's number = manifest_n
+    mov  esi, [r12+144]              ; this run's file number = next_run_no
     call fmt_runname
     lea  rdi, [rbp-0x140]
     mov  esi, 1 | 0x40 | 0x200
@@ -1401,18 +1448,21 @@ mac_flush:
     mov  eax, 3
     syscall
 
-    ; ---- append to in-memory manifest, advance next_gen ----
+    ; ---- append to in-memory manifest, advance next_gen/next_run_no ----
     mov  rax, [r12+120]
     cmp  rax, [r12+112]
     jae  .fl_err
     mov  rdi, [r12+104]
     mov  rcx, rax
-    shl  rcx, 3
+    shl  rcx, 4                 ; *16 (entry size: gen8+run_no8)
     add  rdi, rcx
-    mov  rdx, [r12+96]
+    mov  rdx, [r12+96]           ; gen
     mov  [rdi], rdx
-    inc  qword [r12+120]
-    inc  qword [r12+96]
+    mov  rdx, [r12+144]           ; run_no
+    mov  [rdi+8], rdx
+    inc  qword [r12+120]          ; manifest_n++
+    inc  qword [r12+96]            ; next_gen++
+    inc  qword [r12+144]            ; next_run_no++
 
     ; ---- publish manifest: tmp file + fsync + rename + dir fsync ----
     lea  rdi, [rel manifest_tmp_name]
@@ -1435,7 +1485,7 @@ mac_flush:
     mov  rdi, rbx
     mov  rsi, [r12+104]
     mov  rdx, [r12+120]
-    shl  rdx, 3
+    shl  rdx, 4                 ; *16 (entry size)
     call mac_write_exact
     test rax, rax
     jnz  .fl_merr_close
@@ -1563,7 +1613,7 @@ utxo_lsm_reload:
     mov  rdi, r14
     mov  rsi, [r12+104]
     mov  rdx, rax
-    shl  rdx, 3
+    shl  rdx, 4                 ; *16 (entry size: gen8+run_no8)
     call mac_read_exact2
     test rax, rax
     jnz  .rl_manifest_bad
@@ -1571,8 +1621,37 @@ utxo_lsm_reload:
     mov  rdi, r14
     mov  eax, 3
     syscall
-    mov  rax, [r12+120]
+    ; next_gen/next_run_no = 1 + the max gen/run_no seen across all
+    ; entries -- can no longer assume manifest_n itself (compaction can
+    ; shrink the manifest while gens/run_nos keep climbing globally).
+    mov  qword [r12+96], 0        ; max_gen so far (next_gen slot doubles as accumulator)
+    mov  qword [r12+144], 0       ; max_run_no so far
+    mov  qword [rbp-0x90], 0      ; scan cursor
+.rl_mscan:
+    mov  rax, [rbp-0x90]
+    cmp  rax, [r12+120]
+    jae  .rl_mscan_done
+    mov  rcx, rax
+    shl  rcx, 4
+    mov  rdx, [r12+104]
+    add  rdx, rcx
+    mov  rax, [rdx]              ; this entry's gen
+    cmp  rax, [r12+96]
+    jbe  .rl_mscan_g
     mov  [r12+96], rax
+.rl_mscan_g:
+    mov  rax, [rdx+8]            ; this entry's run_no
+    cmp  rax, [r12+144]
+    jbe  .rl_mscan_r
+    mov  [r12+144], rax
+.rl_mscan_r:
+    inc  qword [rbp-0x90]
+    jmp  .rl_mscan
+.rl_mscan_done:
+    cmp  qword [r12+120], 0
+    je   .rl_manifest_done         ; empty manifest -> next_gen/next_run_no stay 0
+    inc  qword [r12+96]
+    inc  qword [r12+144]
     jmp  .rl_manifest_done
 .rl_manifest_bad:
     mov  rdi, r14
@@ -1580,10 +1659,12 @@ utxo_lsm_reload:
     syscall
     mov  qword [r12+120], 0
     mov  qword [r12+96], 0
+    mov  qword [r12+144], 0
     jmp  .rl_manifest_done
 .rl_no_manifest:
     mov  qword [r12+120], 0
     mov  qword [r12+96], 0
+    mov  qword [r12+144], 0
 .rl_manifest_done:
 
     mov  rdi, r12
@@ -1676,6 +1757,658 @@ utxo_lsm_reload:
     mov  rax, -1
 .rl_ret:
     add  rsp, 0x200
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; mac_compact_read_rec(slot=rdi) -> eax: 1 ok / -1 err
+;   Reads ONE record from slot.fd at the slot's current file position into
+;   the slot's record fields, sets slot.active=1, decrements slot.remaining.
+;   CALLER must have already verified slot.remaining > 0 before calling (a
+;   slot whose header-reported record count is exhausted is never read
+;   again -- this function trusts that count rather than inferring EOF from
+;   a short read, so a genuinely truncated/corrupt run file surfaces as a
+;   mac_read_exact2 failure here, -1, same as any other I/O error).
+;   Slot layout: +0 fd +8 gen +16 run_no +24 remaining +32 active +40 key(36)
+;   +76 type +80 value(8) +88 slen(2) +96 script(up to SCRIPT_MAX_BYTES).
+; ============================================================================
+mac_compact_read_rec:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub  rsp, 0x10
+    mov  r12, rdi                  ; slot base
+    mov  rbx, [r12]                 ; fd
+    mov  rdi, rbx
+    lea  rsi, [r12+40]
+    mov  rdx, 37                     ; key(36)+type(1)
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cr_err
+    movzx eax, byte [r12+76]           ; type
+    cmp  eax, 1
+    jne  .cr_dec
+    mov  rdi, rbx
+    lea  rsi, [r12+80]
+    mov  rdx, 10                          ; value(8)+slen(2)
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cr_err
+    movzx eax, word [r12+88]                ; slen
+    test eax, eax
+    jz   .cr_dec
+    mov  rdi, rbx
+    lea  rsi, [r12+96]
+    mov  rdx, rax
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cr_err
+.cr_dec:
+    mov  qword [r12+32], 1              ; active = 1
+    dec  qword [r12+24]                  ; remaining--
+    mov  eax, 1
+    jmp  .cr_ret
+.cr_err:
+    mov  eax, -1
+.cr_ret:
+    add  rsp, 0x10
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_compact(lst=rdi) -> 1 ok / 0 nothing-to-do / -1 err
+;   Merges the oldest min(manifest_n, COMPACT_MAX_RUNS) runs into one new
+;   run via a streaming k-way merge (see header comment + COMPACT_* consts
+;   above). Drops every tombstone it sees (always safe: this batch always
+;   starts at the globally oldest run). On a same-key tie across inputs,
+;   the copy with the HIGHEST generation wins; every input holding that key
+;   still advances past its own copy so it isn't reprocessed. Bloom sized
+;   from the sum of input nrecs (a safe upper bound, since merging can only
+;   drop records via dedup/tombstones, never add any) computed up front so
+;   the whole write is one pass; nrec and the bloom bytes are the only
+;   things patched via seek-back at the end. Publishes via the same
+;   tmp+fsync+rename+dirsync manifest pattern as flush, then unlinks the
+;   old run files -- a crash between publish and unlink just orphans those
+;   files (harmless, never referenced by the new manifest); a crash before
+;   publish leaves the old manifest+old runs fully intact and correct.
+; ============================================================================
+global utxo_lsm_compact
+utxo_lsm_compact:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x400
+    mov  r12, rdi                   ; lst
+
+    mov  rax, [r12+120]              ; manifest_n
+    cmp  rax, 2
+    jb   .cc_noop                     ; 0 or 1 runs -> nothing to compact
+
+    mov  rcx, COMPACT_MAX_RUNS
+    cmp  rax, rcx
+    jbe  .cc_bs_ok
+    mov  rax, rcx
+.cc_bs_ok:
+    mov  r14, rax                     ; batch_size (stable for the whole function)
+
+    ; ---- mmap our own scratch (NOT lst->scratch_buf) ----
+    xor  edi, edi
+    mov  esi, COMPACT_SCRATCH_BYTES
+    mov  edx, 3                        ; PROT_READ|PROT_WRITE
+    mov  r10d, 0x22                     ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov  r8, -1
+    xor  r9d, r9d
+    mov  eax, 9                          ; mmap
+    syscall
+    cmp  rax, -1
+    je   .cc_err_noscratch
+    mov  r13, rax                        ; scratch base (stable for the whole function)
+
+    mov  qword [rbp-0x38], 0             ; upper_bound accumulator
+
+    ; ---- open + prime each of the batch_size (oldest) runs ----
+    mov  qword [rbp-0x78], 0             ; i
+.cc_open_loop:
+    mov  rax, [rbp-0x78]
+    cmp  rax, r14
+    jae  .cc_open_done
+
+    ; manifest entry i -> gen, run_no
+    mov  rcx, rax
+    shl  rcx, 4
+    mov  rdx, [r12+104]
+    add  rdx, rcx
+    mov  rcx, [rdx]              ; gen
+    mov  rdx, [rdx+8]             ; run_no
+    mov  [rbp-0x90], rcx           ; stash gen
+    mov  [rbp-0x98], rdx            ; stash run_no
+
+    ; slot base for i
+    mov  rax, [rbp-0x78]
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r13
+    mov  rcx, [rbp-0x90]
+    mov  [rax+8], rcx              ; slot.gen
+    mov  rcx, [rbp-0x98]
+    mov  [rax+16], rcx              ; slot.run_no
+    mov  qword [rax+32], 0           ; slot.active = 0 (until primed below)
+
+    ; format filename from run_no, open read-only
+    lea  rdi, [rbp-0x140]
+    mov  esi, [rbp-0x98]
+    call fmt_runname
+    lea  rdi, [rbp-0x140]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .cc_err
+
+    mov  rdx, [rbp-0x78]
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13
+    mov  [rdx], rax                 ; slot.fd
+
+    ; read this run's own header (28 bytes)
+    mov  rdi, rax
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 28
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cc_err
+
+    mov  rax, [rbp-0x1C0+12]         ; this run's nrec
+    mov  rdx, [rbp-0x78]
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13
+    mov  [rdx+24], rax                ; slot.remaining = nrec
+    add  qword [rbp-0x38], rax          ; upper_bound += nrec
+
+    ; skip this run's own bloom bytes to reach its records section
+    mov  rax, [rbp-0x1C0+20]           ; this run's bloom_bits
+    shr  rax, 3                          ; bloom_bytes
+    mov  rdx, [rbp-0x78]
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13
+    mov  rdi, [rdx]                       ; fd
+    mov  rsi, rax
+    mov  edx, 1                             ; SEEK_CUR
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .cc_err
+
+    ; prime the first record, unless this run is (degenerately) empty
+    mov  rdx, [rbp-0x78]
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13
+    cmp  qword [rdx+24], 0
+    je   .cc_open_next
+    mov  rdi, rdx
+    call mac_compact_read_rec
+    cmp  eax, -1
+    je   .cc_err
+
+.cc_open_next:
+    inc  qword [rbp-0x78]
+    jmp  .cc_open_loop
+.cc_open_done:
+
+    ; ---- bloom sizing from the upper-bound record count ----
+    mov  rax, [rbp-0x38]
+    imul rax, rax, 10
+    cmp  rax, 64
+    jae  .cc_bb1
+    mov  rax, 64
+.cc_bb1:
+    mov  rcx, 1
+.cc_bb_loop:
+    cmp  rcx, rax
+    jae  .cc_bb2
+    shl  rcx, 1
+    jmp  .cc_bb_loop
+.cc_bb2:
+    mov  rdx, BLOOM_MAX_BYTES*8
+    cmp  rcx, rdx
+    jbe  .cc_bb3
+    mov  rcx, rdx
+.cc_bb3:
+    mov  [rbp-0x40], rcx           ; bloom_bits
+    mov  rax, rcx
+    shr  rax, 3
+    mov  [rbp-0x50], rax            ; bloom_bytes
+    dec  rcx
+    mov  [rbp-0x48], rcx             ; bits_mask
+
+    ; zero the bloom region in OUR scratch
+    mov  rdi, r13
+    add  rdi, COMPACT_SLOTS_BYTES
+    mov  rcx, [rbp-0x50]
+.cc_bz:
+    test rcx, rcx
+    jz   .cc_bz_done
+    mov  byte [rdi], 0
+    inc  rdi
+    dec  rcx
+    jmp  .cc_bz
+.cc_bz_done:
+
+    ; ---- open the output run, write a placeholder header+bloom ----
+    mov  rax, [r12+96]                  ; next_gen -- the merged run's FRESH gen
+    mov  [rbp-0x68], rax                  ; out_gen
+    mov  rax, [r12+144]                    ; next_run_no
+    mov  [rbp-0x60], rax                     ; out_run_no
+
+    lea  rdi, [rbp-0x140]
+    mov  esi, [rbp-0x60]
+    call fmt_runname
+    lea  rdi, [rbp-0x140]
+    mov  esi, 1 | 0x40 | 0x200
+    mov  edx, 0o644
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .cc_err
+    mov  [rbp-0x58], rax                    ; out_fd
+
+    mov  dword [rbp-0x1C0], MAGIC_RUN
+    mov  rax, [rbp-0x68]
+    mov  [rbp-0x1C0+4], rax
+    mov  qword [rbp-0x1C0+12], 0             ; nrec placeholder
+    mov  rax, [rbp-0x40]
+    mov  [rbp-0x1C0+20], rax
+    mov  rdi, [rbp-0x58]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 28
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+
+    mov  rdi, [rbp-0x58]
+    mov  rsi, r13
+    add  rsi, COMPACT_SLOTS_BYTES
+    mov  rdx, [rbp-0x50]
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+
+    mov  qword [rbp-0x70], 0                  ; true_nrec
+
+    ; ================= streaming k-way merge =================
+.cc_merge_loop:
+    ; find the active slot with the smallest key; ties broken by highest gen
+    mov  qword [rbp-0xA0], -1        ; best_idx
+    mov  qword [rbp-0x78], 0          ; i
+.cc_find_loop:
+    mov  rax, [rbp-0x78]
+    cmp  rax, r14
+    jae  .cc_find_done
+    mov  rdx, rax
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13                     ; this slot base
+    cmp  qword [rdx+32], 0             ; active?
+    je   .cc_find_next
+    cmp  qword [rbp-0xA0], -1
+    je   .cc_find_setbest
+    mov  rcx, [rbp-0xA0]
+    imul rcx, rcx, COMPACT_SLOT_SIZE
+    add  rcx, r13                       ; best slot base
+    lea  rdi, [rdx+40]
+    lea  rsi, [rcx+40]
+    push rdx
+    call mac_cmp_key                       ; 0=this<best 1=eq 2=this>best
+    pop  rdx
+    cmp  eax, 0
+    je   .cc_find_setbest
+    cmp  eax, 1
+    jne  .cc_find_next
+    ; equal keys -- this wins the tie only if its gen is strictly higher
+    mov  rax, [rdx+8]                         ; this.gen
+    mov  rcx, [rbp-0xA0]
+    imul rcx, rcx, COMPACT_SLOT_SIZE
+    add  rcx, r13
+    mov  rcx, [rcx+8]                           ; best.gen
+    cmp  rax, rcx
+    jbe  .cc_find_next
+.cc_find_setbest:
+    mov  rax, [rbp-0x78]
+    mov  [rbp-0xA0], rax
+.cc_find_next:
+    inc  qword [rbp-0x78]
+    jmp  .cc_find_loop
+.cc_find_done:
+    cmp  qword [rbp-0xA0], -1
+    je   .cc_merge_done                    ; no active slots left -> done
+
+    mov  rax, [rbp-0xA0]
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r13
+    mov  [rbp-0xB0], rax                    ; winning slot base
+    ; Snapshot the winning key into a STABLE buffer now. The advance loop
+    ; below re-reads the winning slot's OWN fields in place (it's one of
+    ; the slots that matches the winning key, so it gets advanced too) --
+    ; comparing later iterations against the winning slot's now-mutated
+    ; live fields instead of this snapshot was a real bug (rereads landed
+    ; past a run's true EOF because slots that should have matched the
+    ; ORIGINAL winning key no longer did once it changed mid-loop).
+    lea  rdi, [rbp-0x200]
+    lea  rsi, [rax+40]
+    push rax
+    mov  rdx, 36
+    call mac_memcpy
+    pop  rax
+
+    ; ---- emit the winner if it's a PUSH (DEL is always safe to drop) ----
+    movzx eax, byte [rax+76]                  ; type
+    cmp  eax, 1
+    jne  .cc_wr_skip
+    mov  rdx, [rbp-0xB0]
+    mov  rdi, [rbp-0x58]
+    lea  rsi, [rdx+40]                          ; key+type, 37 bytes
+    mov  rdx, 37
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+    mov  rdx, [rbp-0xB0]
+    mov  rdi, [rbp-0x58]
+    lea  rsi, [rdx+80]                            ; value+slen, 10 bytes
+    mov  rdx, 10
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+    mov  rdx, [rbp-0xB0]
+    movzx r15d, word [rdx+88]                       ; slen
+    test r15d, r15d
+    jz   .cc_wr_bloom
+    mov  rdi, [rbp-0x58]
+    lea  rsi, [rdx+96]
+    mov  rdx, r15
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+.cc_wr_bloom:
+    ; mac_bloom_setbit's real signature is (key=rdi, seed=esi,
+    ; bloom_base=rdx, bits_mask=ecx) -- bloom_base MUST go in rdx, not
+    ; rsi (rsi is the seed slot, overwritten by each call below anyway).
+    ; Putting it in rsi here left rdx holding whatever this block's first
+    ; line put there (the WINNING SLOT's own address), so the "set bit"
+    ; write landed inside that slot's own header fields (fd/gen/run_no/
+    ; remaining/active) instead of the bloom bitmap -- confirmed via a
+    ; hardware watchpoint on the corrupted fd field, which caught the
+    ; write happening right here.
+    mov  rdx, [rbp-0xB0]
+    lea  rdi, [rdx+40]                                ; key ptr
+    mov  rdx, r13
+    add  rdx, COMPACT_SLOTS_BYTES                        ; bloom base
+    mov  ecx, [rbp-0x48]                                    ; bits_mask
+    push rdi
+    push rdx
+    push rcx
+    mov  esi, 0x811c9dc5
+    call mac_bloom_setbit
+    pop  rcx
+    pop  rdx
+    pop  rdi
+    push rdi
+    push rdx
+    push rcx
+    mov  esi, 0xa1b2c3d4
+    call mac_bloom_setbit
+    pop  rcx
+    pop  rdx
+    pop  rdi
+    mov  esi, 0x5bd1e995
+    call mac_bloom_setbit
+    inc  qword [rbp-0x70]                                     ; true_nrec++
+.cc_wr_skip:
+
+    ; ---- advance every slot whose current key equals the winning key ----
+    mov  qword [rbp-0x78], 0
+.cc_adv_loop:
+    mov  rax, [rbp-0x78]
+    cmp  rax, r14
+    jae  .cc_adv_done
+    mov  rcx, rax
+    imul rcx, rcx, COMPACT_SLOT_SIZE
+    add  rcx, r13                          ; this slot base
+    cmp  qword [rcx+32], 0                   ; active?
+    je   .cc_adv_next
+    lea  rdi, [rcx+40]
+    lea  rsi, [rbp-0x200]                       ; stable snapshot of the winning key
+    push rcx
+    call mac_cmp_key
+    pop  rcx
+    cmp  eax, 1
+    jne  .cc_adv_next                             ; not the same key -> leave it
+    cmp  qword [rcx+24], 0                          ; remaining
+    jne  .cc_adv_reread
+    mov  qword [rcx+32], 0                            ; exhausted -> active=0
+    jmp  .cc_adv_next
+.cc_adv_reread:
+    mov  rdi, rcx
+    call mac_compact_read_rec
+    cmp  eax, -1
+    je   .cc_err_close
+.cc_adv_next:
+    inc  qword [rbp-0x78]
+    jmp  .cc_adv_loop
+.cc_adv_done:
+    jmp  .cc_merge_loop
+.cc_merge_done:
+    ; ================= end streaming k-way merge =================
+
+    ; ---- patch bloom bytes (file offset 28) and nrec (offset 12) ----
+    mov  rdi, [rbp-0x58]
+    mov  esi, 28
+    xor  edx, edx
+    mov  eax, 8                          ; lseek SEEK_SET
+    syscall
+    test rax, rax
+    jl   .cc_err_close
+    mov  rdi, [rbp-0x58]
+    mov  rsi, r13
+    add  rsi, COMPACT_SLOTS_BYTES
+    mov  rdx, [rbp-0x50]
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+
+    mov  rdi, [rbp-0x58]
+    mov  esi, 12
+    xor  edx, edx
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .cc_err_close
+    mov  rax, [rbp-0x70]
+    mov  [rbp-0x1C0], rax
+    mov  rdi, [rbp-0x58]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 8
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+
+    mov  rdi, [rbp-0x58]
+    call mac_fsync2
+    mov  rdi, [rbp-0x58]
+    mov  eax, 3
+    syscall
+
+    ; ---- shift surviving (newer) manifest entries down, append the merged
+    ;      entry after them so the array stays strictly gen-ascending ----
+    mov  rax, [r12+120]                   ; manifest_n
+    mov  [rbp-0x78], r14                    ; src index, starts at batch_size
+    mov  qword [rbp-0x90], 0                  ; dst index, starts at 0
+.cc_shift_loop:
+    mov  rdx, [rbp-0x78]
+    cmp  rdx, rax
+    jae  .cc_shift_done
+    mov  rsi, [r12+104]
+    mov  rcx, rdx
+    shl  rcx, 4
+    add  rsi, rcx                            ; src ptr
+    mov  rdi, [r12+104]
+    mov  rcx, [rbp-0x90]
+    shl  rcx, 4
+    add  rdi, rcx                             ; dst ptr
+    mov  rcx, [rsi]
+    mov  [rdi], rcx
+    mov  rcx, [rsi+8]
+    mov  [rdi+8], rcx
+    inc  qword [rbp-0x78]
+    inc  qword [rbp-0x90]
+    jmp  .cc_shift_loop
+.cc_shift_done:
+    mov  rdi, [r12+104]
+    mov  rcx, [rbp-0x90]
+    shl  rcx, 4
+    add  rdi, rcx
+    mov  rax, [rbp-0x68]                       ; out_gen
+    mov  [rdi], rax
+    mov  rax, [rbp-0x60]                        ; out_run_no
+    mov  [rdi+8], rax
+    inc  qword [rbp-0x90]
+    mov  rax, [rbp-0x90]
+    mov  [r12+120], rax                           ; manifest_n = new count
+    inc  qword [r12+96]                             ; next_gen++
+    inc  qword [r12+144]                              ; next_run_no++
+
+    ; ---- publish manifest: tmp file + fsync + rename + dir fsync ----
+    lea  rdi, [rel manifest_tmp_name]
+    mov  esi, 1 | 0x40 | 0x200
+    mov  edx, 0o644
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .cc_err_close
+    mov  rbx, rax
+    mov  dword [rbp-0x1C0], MAGIC_MANIFEST
+    mov  rax, [r12+120]
+    mov  [rbp-0x1C0+4], rax
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 12
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_merr_close
+    mov  rdi, rbx
+    mov  rsi, [r12+104]
+    mov  rdx, [r12+120]
+    shl  rdx, 4
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_merr_close
+    mov  rdi, rbx
+    call mac_fsync2
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+
+    lea  rdi, [rel manifest_tmp_name]
+    lea  rsi, [rel manifest_name]
+    mov  eax, 82                            ; rename
+    syscall
+    test rax, rax
+    jl   .cc_err_close
+
+    lea  rdi, [rel dot_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .cc_dirsync_skip
+    mov  rbx, rax
+    mov  rdi, rbx
+    call mac_fsync2
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+.cc_dirsync_skip:
+
+    ; ---- close output fd, close+unlink old input runs, free scratch ----
+    mov  rdi, [rbp-0x58]
+    mov  eax, 3
+    syscall
+
+    mov  qword [rbp-0x78], 0
+.cc_unlink_loop:
+    mov  rax, [rbp-0x78]
+    cmp  rax, r14
+    jae  .cc_unlink_done
+    mov  rdx, rax
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13
+    mov  rdi, [rdx]                          ; input fd
+    mov  eax, 3
+    syscall
+    lea  rdi, [rbp-0x140]
+    mov  rdx, [rbp-0x78]
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r13
+    mov  esi, [rdx+16]                          ; run_no
+    call fmt_runname
+    lea  rdi, [rbp-0x140]
+    mov  eax, 87                                  ; unlink
+    syscall
+    inc  qword [rbp-0x78]
+    jmp  .cc_unlink_loop
+.cc_unlink_done:
+
+    mov  rdi, r13
+    mov  esi, COMPACT_SCRATCH_BYTES
+    mov  eax, 11                             ; munmap
+    syscall
+
+    mov  rax, 1
+    jmp  .cc_ret
+
+.cc_noop:
+    xor  eax, eax
+    jmp  .cc_ret_noscratch
+.cc_merr_close:
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+    jmp  .cc_err_close
+.cc_err_close:
+    mov  rdi, [rbp-0x58]
+    mov  eax, 3
+    syscall
+.cc_err:
+    ; best-effort only: input fds / mmap'd scratch are left for the
+    ; process to reclaim on exit rather than unwound perfectly here -- -1
+    ; is meant to be treated as fatal by the caller, same as elsewhere in
+    ; this module (utxo_lsm_put/del's own -1 contract).
+    mov  rax, -1
+    jmp  .cc_ret
+.cc_err_noscratch:
+    mov  rax, -1
+.cc_ret_noscratch:
+    add  rsp, 0x400
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+.cc_ret:
+    add  rsp, 0x400
     pop  r15
     pop  r14
     pop  r13
