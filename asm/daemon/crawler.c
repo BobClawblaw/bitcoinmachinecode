@@ -20,6 +20,9 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/file.h>
+#include <fcntl.h>
 
 extern int  tcp_connect_ip(unsigned, unsigned short);
 extern long p2p_write(int,const char*,unsigned,const void*,unsigned);
@@ -31,11 +34,52 @@ static void u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>
 static void u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
 static void u16(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 
-/* dedup across the whole run */
+/* dedup across the whole run, shared across every forked worker.
+ * FORK-STATE BUG (fixed): this used to be a plain static array. Each
+ * fork()'d child got its own COPY-ON-WRITE private copy, so every
+ * mark_seen() a child did was invisible to the parent and to sibling
+ * children -- the parent's own seen_n stayed 0 for the whole run, so
+ * out_file was always written empty and "crawl complete: N distinct" was
+ * always N=0 (the wire-format harvest still worked, since each child's
+ * printf()s go through the inherited, genuinely shared stdout fd -- only
+ * the in-memory dedup table and the file/summary built from it were
+ * broken). Fixed by putting seen[]/seen_n in a MAP_SHARED|MAP_ANONYMOUS
+ * mapping, created in the parent BEFORE the fork loop so every child
+ * inherits the SAME physical pages. The check-and-insert itself still
+ * needs cross-process mutual exclusion (two children could otherwise both
+ * pass is_seen() for the same endpoint before either calls mark_seen(), or
+ * race on the shared seen_n slot index) -- guarded with flock() on a
+ * dedicated lock file. Per the flock lesson learned elsewhere in this
+ * codebase (store_append_shared etc.): flock() locks belong to the OPEN
+ * FILE DESCRIPTION, so a fork-INHERITED fd would not actually exclude
+ * sibling children from each other -- each child must open its OWN fd to
+ * the lock file, which is why the lock path (not an fd) is what gets
+ * passed down into crawl(). */
 #define MAXSEEN 200000
-static char seen[MAXSEEN][40]; static long seen_n=0;
-static int is_seen(const char* s){ for(long i=0;i<seen_n;i++) if(!strcmp(seen[i],s)) return 1; return 0; }
-static void mark_seen(const char* s){ if(seen_n<MAXSEEN && !is_seen(s)){ strncpy(seen[seen_n],s,39); seen[seen_n][39]=0; seen_n++; } }
+static char (*seen)[40];
+static long* seen_n;
+static char lockpath[664];
+
+static void seen_init(const char* out_file){
+    seen = mmap(NULL, sizeof(char[MAXSEEN][40]), PROT_READ|PROT_WRITE,
+                MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    seen_n = mmap(NULL, sizeof(long), PROT_READ|PROT_WRITE,
+                  MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if(seen==MAP_FAILED || seen_n==MAP_FAILED){ perror("mmap"); exit(1); }
+    *seen_n = 0;
+    snprintf(lockpath,sizeof lockpath,"%s.lock",out_file);
+}
+/* NOT lock-safe alone -- callers must hold the flock for the whole
+ * check-and-insert (see the .lock-wrapped call sites below). */
+static int is_seen(const char* s){ for(long i=0;i<*seen_n;i++) if(!strcmp(seen[i],s)) return 1; return 0; }
+static void mark_seen(const char* s){ if(*seen_n<MAXSEEN && !is_seen(s)){ long i=*seen_n; strncpy(seen[i],s,39); seen[i][39]=0; *seen_n=i+1; } }
+/* each child opens its OWN fd to the shared lock path (see comment above) */
+static int lock_acquire(void){
+    int lfd=open(lockpath,O_CREAT|O_RDWR,0644);
+    if(lfd>=0) flock(lfd,LOCK_EX);
+    return lfd;
+}
+static void lock_release(int lfd){ if(lfd>=0){ flock(lfd,LOCK_UN); close(lfd); } }
 
 /* handshake + ask getaddr. returns open fd on success */
 static int connect_getaddr(const char* host){
@@ -71,22 +115,27 @@ static int connect_getaddr(const char* host){
     return fd;
 }
 
-/* addrv2 -> distinct public v4 endpoints */
+/* addrv2 -> distinct public v4 endpoints. Holds the cross-process lock for
+ * the whole message (not per-record): cheaper than open+flock per address,
+ * and correctness only needs the check-and-insert serialized against
+ * sibling children, not against this function's own parsing. Every exit
+ * path (truncated/malformed varints included) releases the lock. */
 static void parse_addrv2(unsigned char* rb, unsigned plen){
     if(plen<2) return; unsigned cnt=rb[0]; unsigned long long pos=1;
+    int lfd=lock_acquire();
     for(unsigned k=0;k<cnt && pos<plen;k++){
         pos+=4;
         while(pos<plen&&(rb[pos]&0x80)) pos++; pos++;
         unsigned long long net=0;
         if(pos>=plen)break;
         { unsigned char c=rb[pos];
-          if(c<0xfd){net=c;pos+=1;} else if(c==0xfd){if(pos+3<=plen){net=rb[pos+1]|rb[pos+2]<<8;pos+=3;}else return;}
-          else if(c==0xfe){if(pos+5<=plen){pos+=5;}else return;} else {if(pos+9<=plen){pos+=9;}else return;} }
+          if(c<0xfd){net=c;pos+=1;} else if(c==0xfd){if(pos+3<=plen){net=rb[pos+1]|rb[pos+2]<<8;pos+=3;}else{lock_release(lfd);return;}}
+          else if(c==0xfe){if(pos+5<=plen){pos+=5;}else{lock_release(lfd);return;}} else {if(pos+9<=plen){pos+=9;}else{lock_release(lfd);return;}} }
         unsigned long long alen=0;
         if(pos>=plen)break;
         { unsigned char c=rb[pos];
-          if(c<0xfd){alen=c;pos+=1;} else if(c==0xfd){if(pos+3<=plen){alen=rb[pos+1]|rb[pos+2]<<8;pos+=3;}else return;}
-          else if(c==0xfe){if(pos+5<=plen){pos+=5;}else return;} else return; }
+          if(c<0xfd){alen=c;pos+=1;} else if(c==0xfd){if(pos+3<=plen){alen=rb[pos+1]|rb[pos+2]<<8;pos+=3;}else{lock_release(lfd);return;}}
+          else if(c==0xfe){if(pos+5<=plen){pos+=5;}else{lock_release(lfd);return;}} else {lock_release(lfd);return;} }
         unsigned char a[16]; memset(a,0,sizeof a);
         for(unsigned long long x=0;x<alen && x<16 && pos+x<plen;x++) a[x]=rb[pos+x];
         pos+=alen;
@@ -99,10 +148,13 @@ static void parse_addrv2(unsigned char* rb, unsigned plen){
             }
         }
     }
+    lock_release(lfd);
 }
-/* addr (v1) -> distinct public v4 endpoints */
+/* addr (v1) -> distinct public v4 endpoints. Same whole-message locking
+ * rationale as parse_addrv2 above. */
 static void parse_addr(unsigned char* rb, unsigned plen){
     if(plen<1) return; unsigned cnt=rb[0]; if(cnt>2000) cnt=2000;
+    int lfd=lock_acquire();
     for(unsigned k=0;k<cnt;k++){
         size_t o=1+k*30; if(o+30>plen) break;
         const unsigned char* ipb=rb+o+12;
@@ -114,6 +166,7 @@ static void parse_addr(unsigned char* rb, unsigned plen){
             if(!is_seen(endp)){ mark_seen(endp); printf("%s\n",endp); fflush(stdout); }
         }
     }
+    lock_release(lfd);
 }
 
 /* query one peer end-to-end; emits harvested endpoints */
@@ -128,7 +181,7 @@ static void crawl(const char* host, int wait){
         else if(!strncmp(cmd,"addrv2",6)) parse_addrv2(rb,plen);
     }
     fd_close(fd);
-    fprintf(stderr,"# %s done (%ld distinct total)\n", host, seen_n);
+    fprintf(stderr,"# %s done (%ld distinct total)\n", host, *seen_n);
 }
 
 int main(int argc,char**argv){
@@ -147,6 +200,7 @@ int main(int argc,char**argv){
         if(*p&&ns<4096){ strncpy(seeds[ns],p,127); seeds[ns][127]=0; ns++; }
     }
     fclose(f);
+    seen_init(out);
     printf("# crawling %d seeds (getaddr), %d-way parallel, %ds each\n", ns, par, wait);
     int done=0; pid_t kids[128]; int nk=0;
     while(done<ns){
@@ -159,7 +213,7 @@ int main(int argc,char**argv){
     }
     for(int i=0;i<nk;i++){int st;waitpid(kids[i],&st,0);}
     /* write out_file */
-    FILE* o=fopen(out,"w"); if(o){ for(long i=0;i<seen_n;i++) fprintf(o,"%s\n",seen[i]); fclose(o); }
-    fprintf(stderr,"# crawl complete: %ld distinct endpoints -> %s\n", seen_n, out);
+    FILE* o=fopen(out,"w"); if(o){ for(long i=0;i<*seen_n;i++) fprintf(o,"%s\n",seen[i]); fclose(o); }
+    fprintf(stderr,"# crawl complete: %ld distinct endpoints -> %s\n", *seen_n, out);
     return 0;
 }
