@@ -1022,8 +1022,8 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
             guard++;
             if(mux_sync_budget_fired){
                 char lastbw[16]; dlc_fmt_rate(lastbw,sizeof lastbw,mystat->last_bw_bps);
-                fprintf(stderr,"[dlc w%d] %s dead weight (last measured %s); dropping for a fresh peer\n",
-                        w, mystat->peer, lastbw);
+                fprintf(stderr,"[dlc w%d] %s dead weight (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
+                        w, mystat->peer, lastbw, mystat->chunks, mystat->blocks);
                 close(fd); fd=-1; DLC_RELEASE();
                 slot=(slot+1)%(nlive>0?nlive:1);
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
