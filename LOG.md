@@ -7,6 +7,93 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17 -- BUILT-IN SELF-HEALING CATCH-UP (dl_catchup) + index.dat SCANS PORTED TO ASM
+### Goal and outcome
+Two related pieces of work on the download/catch-up path, both against the
+real ~962k-block mainnet archive:
+1. Moved the standalone multi-peer catch-up tool's engine (chunk-claiming
+   work-stealing, dynamic peer replacement) DIRECTLY INTO THE DAEMON, so
+   `bitcoind serve <dir> <port>` self-heals archive holes and catches up to
+   the real chain tip on its own at boot -- no external scripts required for
+   normal operation.
+2. Converted the C `index.dat` positional-record scan logic (reimplemented
+   separately 5x in C plus twice more in Python) into a canonical asm module.
+### 1. `dl_catchup` (asm/daemon/main.c)
+New orchestrator: `dl_bootstrap`/`dl_pool_from_book` (existing DNS-seed
+discovery) for peers, extends `headers.dat` incrementally (resumes from the
+last stored header, not a genesis refetch), computes the combined
+hole-plus-extend span directly from `index.dat`, then forks `>=8`
+chunk-claiming workers (`dlc_worker`) that pull work from a shared `mmap`'d
+atomic counter, skip already-archived chunks, and reuse persistent
+connections. Peer liveness is a bounded non-blocking-connect probe (several
+rounds) -- the ONLY peer source for both the header phase and workers; no
+fallback to a raw unconfirmed pool entry, because `tcp_connect_ip` has no
+connect-phase timeout and a black-holed host can hang the whole synchronous
+boot for minutes (hit this directly: 3+ minute stall on one bad candidate
+before the fix). Dead-weight detection drops a peer whose measured bandwidth
+(from `/proc/<pid>/io`) stays below a floor for a configurable number of
+status ticks, and replaces it with a fresh candidate. Live status ticks
+report overall/gap-free progress, per-peer bandwidth and chunk/block counts,
+network-recv vs disk-write totals (both tick and cumulative), and a stable
+running average since start.
+Real bugs found live: a header-phase success check used `added>=0` instead
+of `added>0` (a peer returning exactly 0 new headers on an empty store was
+wrongly treated as done); an early liveness-probe design dialed the whole
+pool in one burst and only found 1/140 live -- fixed by running several
+bounded rounds instead of one shot, since real handshakes often take longer
+than a single short poll window.
+`daemon/unified_ibd.c` (the same chunk-claiming engine, standalone) is kept
+as an ops tool for large one-off catch-ups/offline reindexing but is no
+longer load-bearing for the daemon's own boot path.
+### 2. `asm/bitcoin_idxscan.asm` -- index.dat scans in asm
+`dl_catchup` reruns its archive-gap scan every status tick and every worker
+chunk-claim, so the "scan index.dat's 48-byte records for non-zero" logic was
+reimplemented 5 separate times in C (plus 2x in Python). Consolidated into
+one asm module: `idxscan_tip`, `idxscan_first_hole`, `idxscan_all_present`,
+`idxscan_progress` (raw open/pread64/close syscalls, matching the project's
+existing daemon-facing asm conventions from `bitcoin_store.asm`).
+FIRST CUT WAS A REGRESSION: one `pread64` syscall per 48-byte record
+benchmarked 2-15x SLOWER than the C baseline's buffered `fread`, because
+glibc's own stdio already amortizes its `read()` syscalls across a ~4KB
+window while the raw-syscall version paid a syscall per record. FIX: batch
+reads into a 192KB static `.bss` buffer (4096 records/read, scanned in
+memory with no syscalls in the hot loop) -- bigger than stdio's own window is
+what actually wins. Buffer is static (not stack) since these run inside
+forked, single-threaded `dl_catchup` workers, where a static buffer needs no
+locking.
+Also hit, mid-build, the project's own documented golden rule directly:
+placed two scratch locals at `[rbp-8]`/`[rbp-16]` in `idxscan_progress`
+without first `sub rsp`-ing past the 5-register callee-saved save area,
+silently corrupting the saved `rbx`/`r12` on return. Caught by a debug build
+(gdb backtrace pointed at `main` with no symbols, rebuilding at `-O0 -g`
+localized it) before it ever reached the live daemon; fixed by allocating the
+locals properly below the save area, per the codebase's own established rule.
+### Verified (hard evidence)
+- `dl_catchup`: two isolated smoke tests (empty store fresh bootstrap through
+  to `serve_mux`'s "serving on port" handoff; re-run against a partially
+  filled store confirming incremental header resume + narrowed span), then a
+  bounded-`timeout` sanity run against the real archive before full release.
+- `idxscan_*`: `asm/tests/bench_idxscan.c` snapshots `index.dat` first (so
+  it's safe to run against a concurrently-writing daemon), then cross-checks
+  every function's output against the original C `dlc_*` functions on the
+  live ~810k-record-and-growing archive -- all outputs byte-identical. Also
+  smoke-tested by running the swapped daemon binary against a scratch copy of
+  the real archive for 40s under `timeout`, confirming the full `dl_catchup`
+  status-tick loop runs cleanly end-to-end on the new asm path, not just in
+  the standalone benchmark harness.
+### Benchmark (real ~814k-record archive, snapshot-frozen for a fair before/after)
+| function | C (old) | asm (new) | speedup |
+|---|---|---|---|
+| `idxscan_tip` (backward scan) | 0.181s/20 reps | 0.004s/20 reps | 47.6x |
+| `idxscan_first_hole` (forward scan) | 0.103s/20 reps | 0.023s/20 reps | 4.5x |
+| `idxscan_progress` (forward scan) | 0.131s/20 reps | 0.033s/20 reps | 4.0x |
+| `chunk_all_present` (2000-rec chunk) | 0.017s/200 reps | 0.0004s/200 reps | 43.6x |
+### Result
+`main.c`'s four `dlc_*` functions now delegate to the asm exports. Rebuilt
+and redeployed to the live production daemon (killed + relaunched against the
+real archive); confirmed via log to resume cleanly at the same progress with
+no crashes. Full suite unaffected (no existing harness touches this path).
+
 ## 2026-08-14 -- WALLET CLI: GENERATE KEY / SHOW ADDRESS / SIGN A P2PKH TX (t_9f55dbe5)
 ### Goal and outcome
 Wire the VERIFIED wallet primitives (secp256k1, BIP32, hash160, base58check,

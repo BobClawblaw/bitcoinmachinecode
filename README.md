@@ -188,6 +188,21 @@ timeout and can hang for minutes on a black-holed peer). Self-throttling: a
 node that's already caught up returns from `dl_catchup` almost instantly (pure
 disk reads, no network), so it's safe to run unconditionally on every boot.
 
+**`index.dat` scans, in asm (`asm/bitcoin_idxscan.asm`):** `dl_catchup` reruns
+its archive-gap scan every status tick and every worker chunk-claim, so this
+logic used to be reimplemented separately in C at each of the 4 call sites
+(plus twice more in `hole_ranges.py`). Consolidated into one canonical asm
+module — `idxscan_tip`, `idxscan_first_hole`, `idxscan_all_present`,
+`idxscan_progress` — buffered `pread64` over a 192KB static window (4096
+records/read) instead of one syscall per 48-byte record. Verified
+byte-identical to the C originals on the live ~810k-record archive
+(`asm/tests/bench_idxscan.c`, which snapshots `index.dat` first so it's safe
+to run against a concurrently-writing daemon) and benchmarked 4-48x faster.
+A naive first cut (one `pread64` per record) was actually *slower* than the C
+`stdio` baseline — `fread`'s own ~4KB buffering already amortizes its
+syscalls, so beating it required a bigger window, not just moving the same
+per-record loop into asm.
+
 **Standalone bulk-download tool (`daemon/unified_ibd.c`):** the same
 chunk-claiming/work-stealing engine as a manual ops tool, useful for a very
 large initial catch-up or offline reindexing outside the daemon's own
@@ -546,6 +561,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_cli.asm        # S6 CLI: query the store (cli_main)
 |   +-- bitcoin_addrmgr.asm    # persisted peer address book + addr v1 codecs
 |   +-- bitcoin_idx.asm        # O(1) block hash->height index for serving (idx_*)
+|   +-- bitcoin_idxscan.asm    # buffered index.dat positional scans (idxscan_*, used by dl_catchup)
 |   +-- bitcoin_serve.asm      # inbound server message loop (node_serve_loop)
 |   +-- bitcoin_pubkey.asm     # fe_pow + pubkey_parse: secp256k1 pubkey de/compress
 |   +-- bitcoin_sighash.asm    # legacy SIGHASH_ALL preimage builder
@@ -578,6 +594,7 @@ bitcoinmachinecode/
 |       +-- hole_ranges.py    # find gaps in index.dat (unified_ibd's driver)
 |       +-- backfill_holes.sh # one combined-span unified_ibd call over current holes
 |       +-- sync_chain.sh     # chains hole-fill into extending to the real tip
+|       +-- peerstats.sh      # tail -f the live dl_catchup peer/bandwidth status log
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
 |       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
 |       +-- verify.c          # full chain validation (hash/chain/PoW/consensus)
