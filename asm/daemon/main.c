@@ -906,8 +906,16 @@ static long dlc_headers(char live[][64], int nlive){
  * sibling workers from each other. */
 /* per-worker live stats, in a MAP_SHARED region so the parent can read them
  * while the workers run -- "what peer is worker N talking to and how much
- * has it pulled" without waiting for the final one-line summary. */
-typedef struct { char peer[64]; long chunks; long blocks; long guard; } dlc_stat_t;
+ * has it pulled" without waiting for the final one-line summary. last_bw_bps
+ * is written by the PARENT (it's the one sampling /proc/<pid>/io for the
+ * live display) and read by the WORKER itself when it prints a drop message,
+ * so "why did we drop this peer" shows the actual measured rate instead of
+ * just "budget expired" with no numbers -- the worker has no way to sample
+ * its own throughput while blocked inside node_ibd_blocks_s. MAP_ANONYMOUS
+ * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
+ * before the parent's first 10s tick. */
+typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; } dlc_stat_t;
+static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decl, defined below */
 
 static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
@@ -1013,8 +1021,9 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
             store_reload(st);
             guard++;
             if(mux_sync_budget_fired){
-                fprintf(stderr,"[dlc w%d] %s dead weight (budget/early-kill); dropping for a fresh peer\n",
-                        w, mystat->peer);
+                char lastbw[16]; dlc_fmt_rate(lastbw,sizeof lastbw,mystat->last_bw_bps);
+                fprintf(stderr,"[dlc w%d] %s dead weight (last measured %s); dropping for a fresh peer\n",
+                        w, mystat->peer, lastbw);
                 close(fd); fd=-1; DLC_RELEASE();
                 slot=(slot+1)%(nlive>0?nlive:1);
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
@@ -1249,17 +1258,21 @@ static long dl_catchup(const char* dir, int min_workers){
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
             char bw[16]="--"; double byte_rate=-1.0;
             if(rc>=0){
-                if(prev_rchar[w]>0){ byte_rate=(double)(rc-prev_rchar[w])/10.0; dlc_fmt_rate(bw,sizeof bw,byte_rate); }
+                if(prev_rchar[w]>0){
+                    byte_rate=(double)(rc-prev_rchar[w])/10.0;
+                    dlc_fmt_rate(bw,sizeof bw,byte_rate);
+                    stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
+                }
                 prev_rchar[w]=rc;
             }
-            const char* flag="";
+            char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
                 if(byte_rate<DLC_DEAD_WEIGHT_BPS){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=DLC_DEAD_WEIGHT_TICKS){
                         kill(opid[w],SIGUSR1);
                         dead_ticks[w]=0;
-                        flag=" [early-kill sent]";
+                        snprintf(flag,sizeof flag," [early-kill sent, last %s]",bw);
                     }
                 } else dead_ticks[w]=0;
             }
