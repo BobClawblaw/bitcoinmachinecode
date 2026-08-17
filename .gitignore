@@ -12,6 +12,7 @@ asm/tests/live_handshake
 asm/tests/live_headers
 asm/tests/live_local_probe
 asm/tests/live_probe
+asm/tests/probe_own_serve
 asm/tests/parconn_test
 asm/tests/live_five
 asm/tests/test_add
