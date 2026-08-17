@@ -162,6 +162,10 @@ asm/tests/stress_pointmul
 asm/tests/bip30_shim
 asm/tests/test_bip30
 
+# ---- tx_txid/tx_parse callee-saved-register ABI probe (regression test for
+# the tx_txid r13-clobber bug) ----
+asm/tests/debug_regsave
+
 # ---- Kanban board mirror files (local tracking only; never publish) ----
 KANBAN.md
 **/KANBAN.md
