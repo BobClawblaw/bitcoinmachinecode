@@ -30,6 +30,7 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -94,6 +95,13 @@ extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, l
 extern int  hst_init(void* hst);
 extern long hst_count(void* hst);
 extern int  hst_get_at(void* hst, unsigned long long height, void* out);
+/* built-in catch-up engine externs (bitcoind.asm / bitcoin_headers.asm) --
+ * same primitives the standalone unified_ibd.c tool already uses. */
+extern long node_ibd_headers(int fd, void* hst, void* locator32, void* buf, unsigned long buflen);
+extern long node_ibd_blocks_s(int fd, void* st, void* hst, long lo_real, long nloc,
+                              void* buf, unsigned long buflen, void* scratch, unsigned cap);
+extern int  hst_reload(void* hst);
+extern int  hst_append(void* hst, const unsigned char hdr[80], const unsigned char hash[32]);
 
 #define L_HDRS   2
 #define L_BLOCK  3
@@ -722,6 +730,339 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
     return got;
 }
 
+/* ---- built-in multi-peer catch-up (replaces the external unified_ibd.c /
+ * hole_ranges.py / backfill_holes.sh / sync_chain.sh pipeline) ------------
+ * Runs SYNCHRONOUSLY before serve mode opens for business (see the caller
+ * below): detects any archive hole (a zero-record run below the current
+ * on-disk tip) plus whatever's missing up to the real chain tip (tracked in
+ * headers.dat), then fills the WHOLE span with a pool of chunk-claiming
+ * workers -- same design as the standalone unified_ibd.c tool: a shared
+ * mmap'd atomic cursor so an idle worker keeps pulling new 200-block chunks
+ * instead of sitting on a static pre-split shard, and a present-check so
+ * the SAME invocation can span real holes and already-filled heights
+ * without redundant re-download. main() already chdir()s into the resolved
+ * data dir before mode dispatch, so paths below are bare relative
+ * filenames, matching the rest of this file's convention (e.g. the
+ * "append.lock" open just above the serve-mode block). */
+#define DLC_CHUNK_BLOCKS 200
+#define DLC_MAXPOOL 512
+#define DLC_HDR_TRY_PEERS 8
+
+/* true iff every height in [lo,hi] already has a non-zero index.dat record. */
+static int dlc_chunk_all_present(long lo, long hi){
+    FILE* f=fopen("index.dat","rb"); if(!f) return 0;
+    unsigned char rec[48]; int all=1;
+    for(long k=lo;k<=hi;k++){
+        if(fseek(f,k*48,SEEK_SET)!=0 || fread(rec,1,48,f)!=48 || !(rec[0]||rec[1]||rec[2]||rec[3])){ all=0; break; }
+    }
+    fclose(f);
+    return all;
+}
+
+/* highest height h with index.dat[h] non-zero, or -1 if none/empty. */
+static long dlc_index_tip(void){
+    FILE* f=fopen("index.dat","rb"); if(!f) return -1;
+    fseek(f,0,SEEK_END); long n=ftell(f)/48;
+    unsigned char rec[48]; long tip=-1;
+    for(long h=n-1; h>=0; h--){
+        if(fseek(f,h*48,SEEK_SET)!=0 || fread(rec,1,48,f)!=48) continue;
+        if(rec[0]||rec[1]||rec[2]||rec[3]){ tip=h; break; }
+    }
+    fclose(f); return tip;
+}
+
+/* first zero-record height in [0,tip], or -1 if none (contiguous). */
+static long dlc_first_hole(long tip){
+    if(tip<0) return -1;
+    FILE* f=fopen("index.dat","rb"); if(!f) return -1;
+    unsigned char rec[48];
+    for(long h=0; h<=tip; h++){
+        if(fread(rec,1,48,f)!=48){ fclose(f); return h; }
+        if(!(rec[0]||rec[1]||rec[2]||rec[3])){ fclose(f); return h; }
+    }
+    fclose(f); return -1;
+}
+
+/* combined hole+extend span: 1 with *start_h/*end_h set, or 0 if the
+ * archive is already contiguous through hdr_len-1. chunk_all_present makes
+ * it safe for this ONE span to also re-cover already-filled heights between
+ * a hole and the current tip, so no separate hole-then-extend passes are
+ * needed the way the external CLI tool required (and no tip-1 sentinel
+ * juggling -- this is a single internal computation, not a value that gets
+ * reinterpreted by a second process's own resume logic). */
+static int dlc_span(long hdr_len, long* start_h, long* end_h){
+    long true_end = hdr_len-1; if(true_end<0) return 0;
+    long tip = dlc_index_tip();
+    if(tip<0){ *start_h=0; *end_h=true_end; return 1; }
+    long fh = dlc_first_hole(tip);
+    if(fh>=0){ *start_h=fh; *end_h=true_end; return 1; }
+    if(tip>=true_end) return 0;
+    *start_h=tip+1; *end_h=true_end; return 1;
+}
+
+/* extend headers.dat as far as a discovered peer will serve, resuming from
+ * whatever's already on disk (a real locator from the last stored hash) so
+ * repeat boots only pull the delta instead of refetching from genesis every
+ * time. Returns the new header count, or -1 if nothing served AND nothing
+ * was already on disk. */
+/* try ONE candidate for the header phase: connect+handshake+node_ibd_headers.
+ * Returns added-header-count (>=0) on a completed exchange, -1 if the
+ * candidate couldn't even be reached/handshaked. */
+static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
+                            unsigned char* hdrbuf, size_t hdrbuf_sz){
+    unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) return -1;
+    int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
+    if(fd<0) return -1;
+    struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    if(node_handshake(fd)!=1){ close(fd); return -1; }
+    long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
+    close(fd);
+    return added;
+}
+
+/* live[] must already be confirmed-reachable (via dlc_probe_round below) --
+ * dlc_headers_try's tcp_connect_ip() is a plain blocking connect with no
+ * connect-phase timeout, so trying an UNCONFIRMED candidate here would carry
+ * the same hang risk documented on dlc_worker; deliberately no fallback to
+ * raw pool entries. */
+static long dlc_headers(char live[][64], int nlive){
+    static unsigned char hst[4096]; hst_init(hst);
+    struct stat hs;
+    if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
+    long have = hst_count(hst);
+    unsigned char loc[32]; memset(loc,0,32);
+    if(have>0){
+        static unsigned char rec[112];
+        if(hst_get_at(hst,(unsigned long long)(have-1),rec)==1) memcpy(loc, rec+80, 32);
+    }
+    static unsigned char hdrbuf[2<<20];
+    int tried=0;
+    for(int i=0;i<nlive && tried<DLC_HDR_TRY_PEERS; i++){
+        long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf);
+        if(added<0) continue;
+        tried++;
+        /* a genuine peer failure/hiccup can return exactly 0 added headers
+         * with nothing wrong at the protocol level (unified_ibd.c's own
+         * fork-based header phase treats this the same way: h>0 is the only
+         * success signal, not h>=0) -- so 0 added on an EMPTY store means
+         * try the next candidate, not "done". 0 added when we already HAD
+         * headers is a real, different signal: the peer confirms we're
+         * already at its tip, which is legitimate success. */
+        if(added>0){ fprintf(stderr,"[dlc] headers +%ld from %s (total %ld)\n", added, live[i], hst_count(hst)); return hst_count(hst); }
+        if(added==0 && have>0){ fprintf(stderr,"[dlc] headers: already current per %s (total %ld)\n", live[i], hst_count(hst)); return hst_count(hst); }
+    }
+    return have>0 ? have : -1;
+}
+
+/* chunk-claiming worker: pulls DLC_CHUNK_BLOCKS-sized pieces from a SHARED
+ * atomic cursor (mmap'd MAP_SHARED across all forked workers) until the
+ * whole [.,end_h] span is claimed -- a worker that lands fast peers just
+ * keeps claiming more chunks instead of idling once some static "share" is
+ * done (same design as unified_ibd.c's worker()). Persistent connection
+ * reused across chunks. Peer search is scoped to `live[]` ONLY (candidates
+ * the caller already confirmed reachable via a bounded non-blocking probe --
+ * see dlc_probe_round below) -- deliberately NOT a fallback to raw
+ * unconfirmed pool entries: tcp_connect_ip() is a plain blocking connect()
+ * with no connect-phase timeout (SO_RCVTIMEO only bounds reads afterward),
+ * so dialing an unconfirmed, possibly-black-holed host can hang for a long
+ * time (observed firsthand: a header-phase version of this fallback stalled
+ * for 3+ minutes on one bad candidate). `live[]` needs to be reasonably
+ * populated by the caller for this to have enough depth. Each worker
+ * independently opens append.lock itself -- flock() locks belong to the
+ * open file description, so an INHERITED fd would not actually exclude
+ * sibling workers from each other. */
+static int dlc_worker(int w, long end_h, char live[][64], int nlive,
+                      int slot0, volatile long* next_claim, volatile long* done_count){
+    int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+    if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
+    static unsigned char st[4096]; store_init(st);
+    *(int*)((char*)st+40)=lfd;
+    *(int*)((char*)st+36)=0xd9b4bef9;   /* magic */
+    *(int*)((char*)st+28)=0;            /* cur_file_no=0 */
+    *(int*)((char*)st+0)=-1;            /* no blk fd yet */
+    static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
+    unsigned cap=(unsigned)(sizeof scratch/32);
+    char hp_[64]; snprintf(hp_,sizeof hp_,"/tmp/dlc_hdr_%d.dat",getpid());
+    static unsigned char hst[64]; static unsigned char rec[112];
+    int slot=slot0; long total=0; long stalled=0;
+    int fd=-1;
+    for(;;){
+        long lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
+        if(lo>end_h){ if(fd>=0) close(fd); break; }
+        long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
+        if(dlc_chunk_all_present(lo,hi)) continue;
+
+        int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
+        if(hfd<0){ if(fd>=0) close(fd); break; }
+        *(int*)((char*)hst+0)=hfd; *(long*)((char*)hst+8)=0;
+        long n=0; FILE* mf=fopen("headers.dat","rb");
+        for(long k=lo;k<=hi;k++){
+            if(mf && fseek(mf,k*112,SEEK_SET)==0 && fread(rec,1,112,mf)==112){ if(hst_append(hst,rec,rec+80)<0) break; n++; }
+            else break;
+        }
+        if(mf) fclose(mf);
+        if(n<=0){ close(hfd); if(fd>=0) close(fd); break; }
+
+        int guard=0, chunk_ok=0;
+        for(;;){
+            if(fd<0){
+                int ok=0;
+                for(int a=0;a<nlive && !ok;a++){
+                    const char* cand=live[(slot+a)%nlive];
+                    unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) continue;
+                    int fdc=tcp_connect_ip(ip,(unsigned short)htons(8333));
+                    if(fdc<0) continue;
+                    struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                    if(node_handshake(fdc)==1){ fd=fdc; ok=1; slot=(slot+a+1)%nlive; } else close(fdc);
+                }
+                if(!ok){
+                    stalled++;
+                    if(stalled>40){ fprintf(stderr,"[dlc w%d] peers exhausted\n",w); break; }
+                    sleep(3); slot=(slot+7)%(nlive>0?nlive:1); continue;
+                }
+                stalled=0;
+            }
+            long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
+            store_reload(st);
+            guard++;
+            if(r>=0){ chunk_ok=1; break; }   /* clean completion; KEEP fd for the next chunk */
+            close(fd); fd=-1;
+            slot=(slot+1)%(nlive>0?nlive:1);
+            if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
+        }
+        close(hfd);
+        if(chunk_ok){ total+=n; __sync_fetch_and_add(done_count,n); }
+        else fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] ABANDONED\n",w,lo,hi);
+    }
+    fprintf(stderr,"[dlc w%d] done: blocks=%ld\n", w, total);
+    close(lfd);
+    return 0;
+}
+
+/* orchestrator: bootstrap peers -> header phase -> compute the combined
+ * hole+extend span -> a fast non-blocking-connect liveness probe (same
+ * technique already used above in serve_download_worker) -> fork
+ * >=min_workers chunk-claiming children -> wait -> return blocks written.
+ * Self-throttling: if the archive is already caught up, the span/probe/
+ * fork overhead is cheap (all local disk reads, no network), so it's safe
+ * to call unconditionally on every boot -- this is what makes the node
+ * self-healing without any external tooling. */
+/* one non-blocking dial+poll round over pool[from..from+ntry), appending any
+ * live+handshaked candidates into live[]/*nlive (capped at cap). Never
+ * blocks longer than wait_ms regardless of how many candidates in this
+ * batch are dead or black-holed -- poll() naturally times out, unlike a
+ * blocking connect() to an unreachable host. Same technique as the parallel
+ * dial in serve_download_worker above; caps the batch at MUX_MAX_OUT*3 (24)
+ * per round to match its proven behavior (trying the WHOLE pool at once in
+ * one round measurably tanks the success rate -- observed 1/140 live).
+ * Returns how many were promoted this round. */
+static int dlc_probe_round(char pool[][64], int from, int ntry,
+                           char live[][64], int* nlive, int cap, int wait_ms){
+    if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
+    static int cfd[MUX_MAX_OUT*3];
+    int nc=0;
+    for(int k=0;k<ntry;k++){
+        int i=from+k;
+        unsigned ip; if(inet_pton(AF_INET,pool[i],&ip)!=1){ cfd[nc++]=-1; continue; }
+        int fd=socket(AF_INET,SOCK_STREAM,0);
+        if(fd<0){ cfd[nc++]=-1; continue; }
+        int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
+        struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
+        sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons(8333);
+        int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
+        if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
+        cfd[nc++]=fd;
+    }
+    struct pollfd pol[MUX_MAX_OUT*3]; int nf=0;
+    for(int k=0;k<nc;k++){ if(cfd[k]<0) continue; pol[nf].fd=cfd[k]; pol[nf].events=POLLOUT; pol[nf].revents=0; nf++; }
+    if(nf>0) poll(pol,nf,wait_ms);
+    int got=0;
+    for(int k=0;k<nc && *nlive<cap;k++){
+        if(cfd[k]<0) continue;
+        int ready=0;
+        for(int j=0;j<nf;j++) if(pol[j].fd==cfd[k]){ ready=(pol[j].revents&POLLOUT)?1:0; break; }
+        if(!ready){ close(cfd[k]); continue; }
+        int soerr=0; socklen_t sl=sizeof soerr;
+        if(getsockopt(cfd[k],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[k]); continue; }
+        strncpy(live[*nlive],pool[from+k],63); (*nlive)++; got++;
+        close(cfd[k]);
+    }
+    return got;
+}
+
+static long dl_catchup(const char* dir, int min_workers){
+    (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
+    static unsigned char ab[64];
+    if(amr_init(ab)!=1){ fprintf(stderr,"[dlc] amr_init failed\n"); return 0; }
+    long disc=dl_bootstrap(ab, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])));
+    fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
+
+    static char pool[DLC_MAXPOOL][64];
+    int npool=dl_pool_from_book(ab, pool, DLC_MAXPOOL);
+    fprintf(stderr,"[dlc] %d candidate peer(s) in pool\n", npool);
+    if(npool<=0){ fprintf(stderr,"[dlc] no peers discovered; skipping catch-up\n"); return 0; }
+
+    /* liveness probe: several bounded non-blocking-dial rounds (see
+     * dlc_probe_round) instead of one shot, targeting a decently deep
+     * confirmed-live pool (>= min_workers*3) before we ever rely on it --
+     * real Bitcoin peers often take longer than one short poll to complete
+     * a handshake (serve_download_worker's own gradual background leg-fill
+     * exists for the same reason), and everything downstream of this
+     * (dlc_headers, dlc_worker) deliberately only dials CONFIRMED entries,
+     * so under-populating `live[]` here directly costs catch-up depth. */
+    static char live[DLC_MAXPOOL][64]; int nlive=0;
+    {
+        int want = min_workers*3; if(want>npool) want=npool;
+        int from=0, rounds=0;
+        while(nlive<want && from<npool && rounds<8){
+            int ntry=npool-from; if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
+            dlc_probe_round(pool, from, ntry, live, &nlive, DLC_MAXPOOL, 8000);
+            from+=ntry; rounds++;
+        }
+        fprintf(stderr,"[dlc] %d confirmed-live peer(s) (%d probe round(s))\n", nlive, rounds);
+    }
+    if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
+    int nw = min_workers; if(nlive<nw) nw=nlive; if(nw<1) nw=1; if(nw>64) nw=64;
+
+    long hdr_len = dlc_headers(live, nlive);
+    if(hdr_len<=0){ fprintf(stderr,"[dlc] header phase failed; skipping catch-up\n"); return 0; }
+
+    long start_h, end_h;
+    if(!dlc_span(hdr_len, &start_h, &end_h)){
+        fprintf(stderr,"[dlc] archive already complete through %ld\n", hdr_len-1);
+        return 0;
+    }
+    fprintf(stderr,"[dlc] span [%ld,%ld] (%ld heights)\n", start_h, end_h, end_h-start_h+1);
+
+    /* pre-size index.dat GROW-ONLY, create append.lock */
+    {
+        int ix=open("index.dat", O_RDWR|O_CREAT, 0644);
+        if(ix<0){ perror("open index.dat"); return 0; }
+        struct stat sb; long cur=0; if(fstat(ix,&sb)==0) cur=sb.st_size;
+        long need=(end_h+1)*48; if(need<cur) need=cur;
+        if(ftruncate(ix,need)){ perror("ftruncate index.dat"); close(ix); return 0; }
+        close(ix);
+        int lf=open("append.lock", O_RDWR|O_CREAT, 0644); if(lf>=0) close(lf);
+    }
+
+    volatile long* next_claim=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    volatile long* done_count=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED || done_count==MAP_FAILED){ perror("mmap"); return 0; }
+    *next_claim=start_h; *done_count=0;
+
+    pid_t kids[64];
+    for(int w=0;w<nw;w++){
+        pid_t p=fork();
+        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count)); }
+        kids[w]=p;
+    }
+    for(int w=0;w<nw;w++){ int stt; waitpid(kids[w],&stt,0); }
+    long total=*done_count;
+    munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
+    fprintf(stderr,"[dlc] catch-up done: %ld new blocks written\n", total);
+    return total;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -1189,15 +1530,24 @@ int main(int argc, char** argv){
          * The mux loop will poll it once the catch-up returns. */
         int l = lsock(port);
         if(l<0){ perror("lsock"); return 1; }
-        /* BEST-EFFORT OUTBOUND CATCH-UP (non-fatal, BOUNDED): pull any missed
-         * blocks from a real seed before the mux starts, so the node is as
-         * current as the network allows on boot. Bounded to CATCHUP_MAX so a
-         * far-from-tip store never blocks the mux (listener + concurrent
-         * serving) indefinitely; the mux loop closes the rest gradually.
-         * Falls through cleanly with no network. */
-        long caught = outbound_catchup(CATCHUP_MAX);
-        if(caught>0)
+        /* BUILT-IN MULTI-PEER CATCH-UP (SYNCHRONOUS, self-healing): detect
+         * any archive holes plus whatever's missing up to the real chain
+         * tip, and fill the whole span with a pool of chunk-claiming
+         * workers before this node ever opens for service -- replaces the
+         * old single-peer, 60s-capped outbound_catchup() with the same
+         * multi-peer engine already proven in the standalone unified_ibd.c
+         * tool. On a large gap this can take a long time; the node will not
+         * respond to any peer until it returns (deliberate: simplest
+         * correct behavior, no writer-coordination needed with the
+         * steady-state download worker below since they never run at the
+         * same time). Self-throttling: a caught-up node returns almost
+         * instantly (pure disk reads, no network) so it's safe to run on
+         * every boot. */
+        long caught = dl_catchup(dir, 8);
+        if(caught>0){
+            store_reload(store_buf);        /* our copy predates dl_catchup's writes */
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
+        }
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);

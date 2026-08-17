@@ -7,13 +7,17 @@
  * Flow (download+write loops in ASM):
  *   1. Header phase: persist the whole chain into <dir>/headers.dat.
  *   2. Rank a verified trusted pool of >=nw DISTINCT up peers.
- *   3. Split [start_h,end_h] into nw disjoint ranges; each worker downloads its
- *      shard via node_ibd_blocks_s and writes EVERY block DIRECTLY into <dir>
- *      through store_append_shared (flock-serialized on append.lock; block at the
- *      true file end of rolling blkNNNNN.dat; 48-byte index record positionally at
- *      height*48; index.dat pre-sized to end_h+1). No worker block dirs.
- *   4. Each worker keeps a PRIVATE /tmp header file (hst state never collides).
- *      Peers are distinct (flock peerclaims).
+ *   3. [start_h,end_h] is claimed in CHUNK_BLOCKS-sized pieces from a SHARED
+ *      atomic cursor (mmap'd MAP_SHARED, __sync_fetch_and_add) -- NOT split
+ *      into nw static shards -- so a worker that lands fast peers keeps
+ *      pulling more chunks instead of idling once its "share" is done. Each
+ *      chunk is downloaded via node_ibd_blocks_s and written EVERY block
+ *      DIRECTLY into <dir> through store_append_shared (flock-serialized on
+ *      append.lock; block at the true file end of rolling blkNNNNN.dat;
+ *      48-byte index record positionally at height*48; index.dat pre-sized to
+ *      end_h+1). No worker block dirs.
+ *   4. Each worker keeps a PRIVATE /tmp header file, refilled per chunk (hst
+ *      state never collides). Peers are distinct (flock peerclaims).
  *
  * Resumable: a rerun reads the existing tip from index.dat, then worker shards
  * only cover the zero/missing heights after it; index pre-size grows to end_h.
@@ -35,6 +39,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <dirent.h>
 
 extern int  tcp_connect_ip(unsigned, unsigned short);
@@ -57,8 +62,9 @@ extern long store_append(void* st, const unsigned char hash[32], const void* raw
 extern long store_get_tip(void* st, void* out);
 extern void fd_close(int fd);
 
-#define MAXPEERS 24
+#define MAXPEERS 160
 #define PORT_BE ((unsigned short)htons(8333))
+#define CHUNK_BLOCKS 200
 
 static char claimpath[512];
 static FILE* cf=NULL;
@@ -103,91 +109,142 @@ static void rmrf(const char* d){ DIR* dd=opendir(d); if(!dd) return;
     struct dirent* e; char p[600]; while((e=readdir(dd))){ if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;
         snprintf(p,sizeof p,"%s/%s",d,e->d_name); remove(p); } closedir(dd); rmdir(d); }
 
-/* worker: download [lo,hi] real heights via asm node_ibd_blocks_x into a
- * transient scratch store dir. Re-indexes master [lo,hi] -> local hst.
- * Uses the TRUSTED pool (goodindex[] of length ngood, all confirmed-up distinct)
- * so on a peer drop it fails over to another confirmed-up distinct peer without
- * re-probing dead hosts. Claims are held for the whole session per worker. */
-/* worker: download [lo,hi] REAL heights via asm node_ibd_blocks_s, writing each
- * block DIRECTLY into the ONE shared store in <dir> (no worker dirs, no chdir).
- * Reads its shard headers from <dir>/headers.dat. Stores via the concurrent-safe
- * store_append_shared under append.lock. Fails over within the trusted pool and
- * resumes on drop; retries with backoff instead of giving up. */
-static int worker(int w, const char* dir, long lo, long hi,
-                  char peers[][128], int goodindex[], int ngood, int slot0){
-    /* PRIVATE header store in /tmp (a single FILE, not block data, not in
-     * dir/). Each worker MUST have its own header store: hst uses an on-disk
-     * file and all workers share dir/headers.dat, so appending one worker's
-     * shard would clobber another's (the boundary-chain-break bug). We set the
-     * hst struct's fd/count directly to a private file. */
-    static unsigned char hst[64];
-    char hp_[640]; snprintf(hp_,sizeof hp_,"/tmp/hdr_%d.dat",getpid());
-    int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
-    if(hfd<0){ fprintf(stderr,"[w%d] no hdr file\n",w); return 1; }
-    *(int*)((char*)hst+0)=hfd;
-    *(long*)((char*)hst+8)=0;              /* count = 0 */
-    long n=0;
-    char hp[640]; snprintf(hp,sizeof hp,"%s/headers.dat",dir);
-    FILE* mf=fopen(hp,"rb");
-    static unsigned char rec[112];
+/* true iff every height in [lo,hi] already has a non-zero index.dat record.
+ * Lets a worker skip a claimed chunk that's ALREADY archived (a real hole
+ * span run alongside already-filled heights in one combined invocation)
+ * without touching a peer at all -- just a single pread-sized index check. */
+static int chunk_all_present(const char* dir, long lo, long hi){
+    char ip[640]; snprintf(ip,sizeof ip,"%s/index.dat",dir);
+    FILE* f=fopen(ip,"rb"); if(!f) return 0;
+    static unsigned char rec[48]; int all=1;
     for(long k=lo;k<=hi;k++){
-        if(mf && fseek(mf,k*112,SEEK_SET)==0 && fread(rec,1,112,mf)==112){
-            if(hst_append(hst,rec,rec+80)<0) break; n++;
-        } else break;
+        if(fseek(f,k*48,SEEK_SET)!=0 || fread(rec,1,48,f)!=48 || !(rec[0]||rec[1]||rec[2]||rec[3])){ all=0; break; }
     }
-    if(mf) fclose(mf);
-    if(n<=0){ fprintf(stderr,"[w%d] no headers\n",w); return 1; }
+    fclose(f);
+    return all;
+}
+
+/* worker: pull CHUNK_BLOCKS-sized chunks from a SHARED atomic cursor
+ * (next_claim, mmap'd MAP_SHARED across all forked workers) until the whole
+ * [start_h,end_h] range is claimed, instead of owning one fixed shard for its
+ * whole life. A worker that lands fast peers just claims more chunks; a
+ * worker stuck behind a slow peer simply contributes fewer -- no idle workers
+ * sitting on unclaimed range while others still have a backlog.
+ * Uses the TRUSTED pool (goodindex[] of length ngood, all confirmed-up
+ * distinct) so on a peer drop it fails over without re-probing dead hosts.
+ * Each chunk is written DIRECTLY into the ONE shared store in <dir> via the
+ * concurrent-safe store_append_shared under append.lock. */
+static int worker(int w, const char* dir, long start_h, long end_h,
+                  char peers[][128], int goodindex[], int ngood, int np, int slot0,
+                  volatile long* next_claim){
+    char lp[640]; snprintf(lp,sizeof lp,"%s/append.lock",dir);
+    int lfd=open(lp,O_RDWR|O_CREAT,0644);
+    if(lfd<0){ fprintf(stderr,"[w%d] no lock\n",w); return 1; }
     /* own store context pointing at the SHARED store in dir (CWD = dir).
      * Do NOT store_reload: index.dat is PRE-SIZED (all-zero), so reload would
      * misread it as having real blocks at every height. store_init gives empty
      * state; we set cur_file_no/magic and let store_append_shared manage pos. */
     static unsigned char st[4096]; store_init(st);
-    /* open the shared append lock with OUR OWN open-file-description so flock
-     * contends across processes (a fork-shared fd bypasses flock). */
-    char lp[640]; snprintf(lp,sizeof lp,"%s/append.lock",dir);
-    int lfd=open(lp,O_RDWR|O_CREAT,0644);
-    if(lfd<0){ fprintf(stderr,"[w%d] no lock\n",w); return 1; }
     *(int*)((char*)st+40)=lfd;
     *(int*)((char*)st+36)=0xd9b4bef9;   /* magic */
     *(int*)((char*)st+28)=0;            /* cur_file_no=0 */
     *(int*)((char*)st+0)=-1;            /* no blk fd yet */
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
     unsigned cap=(unsigned)(sizeof scratch/32);
-    int guard=0; int slot=slot0; long resume=0; char cip[128]={0};
+    char hp[640]; snprintf(hp,sizeof hp,"%s/headers.dat",dir);
+    char hp_[640]; snprintf(hp_,sizeof hp_,"/tmp/hdr_%d.dat",getpid());
+    /* PRIVATE header store in /tmp, re-populated per chunk: hst uses an
+     * on-disk file and all workers share dir/headers.dat, so appending one
+     * worker's chunk would clobber another's (the boundary-chain-break bug). */
+    static unsigned char hst[64];
+    static unsigned char rec[112];
+    int slot=slot0; long total_local=0; int total_guard=0; int chunks=0;
     long stalled=0;
+    /* PERSISTENT peer connection: reused across chunks (fd stays open, peer
+     * claim stays held) instead of reconnecting+re-handshaking every chunk.
+     * Only dropped on a failed transfer or once there's no more work. */
+    int fd=-1; char cip[128]={0};
     for(;;){
-        int fd=-1; int ok=0;
-        for(int a=0;a<ngood && !ok;a++){
-            int idx=goodindex[(slot+a)%ngood];
-            const char* cand=peers[idx];
-            char i[128]; snprintf(i,sizeof i,"%s",cand); char*c=strchr(i,':'); if(c)*c=0;
-            if(!cl_take(i)) continue;
-            int fdc=connect_peer(cand);
-            if(fdc>=0){ strncpy(cip,i,sizeof cip); fd=fdc; ok=1; slot=(slot+a+1)%ngood; }
-            else { cl_rel(i); }
+        long lo=__sync_fetch_and_add(next_claim,(long)CHUNK_BLOCKS);
+        if(lo>end_h){ if(fd>=0){ fd_close(fd); cl_rel(cip); } break; }
+        long hi=lo+CHUNK_BLOCKS-1; if(hi>end_h)hi=end_h;
+
+        /* already fully archived (this claim landed on an already-filled
+         * span within a combined invocation) -- skip without touching a
+         * peer or the header file at all, straight to the next claim. */
+        if(chunk_all_present(dir,lo,hi)) continue;
+
+        int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
+        if(hfd<0){ fprintf(stderr,"[w%d] no hdr file\n",w); if(fd>=0){fd_close(fd);cl_rel(cip);} break; }
+        *(int*)((char*)hst+0)=hfd;
+        *(long*)((char*)hst+8)=0;              /* count = 0 */
+        long n=0;
+        FILE* mf=fopen(hp,"rb");
+        for(long k=lo;k<=hi;k++){
+            if(mf && fseek(mf,k*112,SEEK_SET)==0 && fread(rec,1,112,mf)==112){
+                if(hst_append(hst,rec,rec+80)<0) break; n++;
+            } else break;
         }
-        if(!ok){
-            stalled++;
-            if(stalled>40){ fprintf(stderr,"[w%d] no distinct peer: exhausted\n",w); break; }
-            sleep(3); slot=(slot+7)%ngood; continue;
+        if(mf) fclose(mf);
+        if(n<=0){ fprintf(stderr,"[w%d] no headers for chunk [%ld,%ld]\n",w,lo,hi); close(hfd); if(fd>=0){fd_close(fd);cl_rel(cip);} break; }
+
+        int guard=0; int chunk_ok=0;
+        for(;;){
+            if(fd<0){
+                int ok=0;
+                /* fast path: the pool confirmed-up at startup */
+                for(int a=0;a<ngood && !ok;a++){
+                    int idx=goodindex[(slot+a)%ngood];
+                    const char* cand=peers[idx];
+                    char i[128]; snprintf(i,sizeof i,"%s",cand); char*c=strchr(i,':'); if(c)*c=0;
+                    if(!cl_take(i)) continue;
+                    int fdc=connect_peer(cand);
+                    if(fdc>=0){ strncpy(cip,i,sizeof cip); fd=fdc; ok=1; slot=(slot+a+1)%ngood; }
+                    else { cl_rel(i); }
+                }
+                /* fallback: the pool may have shrunk (peers dropping over a
+                 * long run) or the file has more entries than were confirmed
+                 * at startup -- connect_peer() is a live check every time, so
+                 * a peer marked DOWN at boot (or never probed) is worth a real
+                 * retry here instead of being excluded for the whole run. */
+                for(int a=0;a<np && !ok;a++){
+                    const char* cand=peers[a];
+                    char i[128]; snprintf(i,sizeof i,"%s",cand); char*c=strchr(i,':'); if(c)*c=0;
+                    if(!cl_take(i)) continue;
+                    int fdc=connect_peer(cand);
+                    if(fdc>=0){ strncpy(cip,i,sizeof cip); fd=fdc; ok=1; }
+                    else { cl_rel(i); }
+                }
+                if(!ok){
+                    stalled++;
+                    if(stalled>40){ fprintf(stderr,"[w%d] no distinct peer: exhausted\n",w); break; }
+                    sleep(3); slot=(slot+7)%ngood; continue;
+                }
+                stalled=0;
+            }
+            /* node_ibd_blocks_s(fd, st, hst, lo, n, ...) writes real heights lo..lo+n-1 */
+            long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
+            store_reload(st);
+            guard++;
+            if(r>=0){ chunk_ok=1; break; } /* clean completion; KEEP fd for the next chunk */
+            /* transfer failed on this connection -- drop it and force a fresh
+             * connect (possibly a different peer) before retrying the chunk.
+             * We can't easily know the partial tip under shared append (r=-1
+             * may be mid-chunk), so retry the WHOLE chunk from lo (idempotent
+             * under store_append_shared's positional writes). */
+            fd_close(fd); cl_rel(cip); cip[0]=0; fd=-1;
+            slot=(slot+1)%ngood;
+            if(guard>400){ fprintf(stderr,"[w%d] reconnect budget on chunk [%ld,%ld]\n",w,lo,hi); break; }
         }
-        stalled=0;
-        /* node_ibd_blocks_s(fd, st, hst, lo, n, ...) writes real heights lo..lo+n-1 */
-        long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
-        fd_close(fd); cl_rel(cip); cip[0]=0;
-        slot=(slot+1)%ngood;
-        /* resume = lo + (number of local heights now stored) */
-        store_reload(st);
-        resume = lo + n;               /* on success the whole shard is done */
-        guard++;
-        if(r>=0){ resume=lo+n; break; } /* clean completion */
-        /* on failure, we can't easily know the partial tip under shared append
-         * (r=-1 may be mid-shard); retry the WHOLE shard from lo (idempotent
-         * under store_append_shared's positional writes). */
-        if(guard>400){ fprintf(stderr,"[w%d] reconnect budget\n",w); break; }
-        continue;
+        close(hfd);
+        /* only count/advance on an ACTUAL successful download -- a chunk that
+         * never completed (peer exhaustion or reconnect budget) must NOT be
+         * reported as done; it's left as a real hole for a later backfill
+         * pass (hole_ranges.py) to pick up, instead of silently skipped. */
+        if(chunk_ok){ total_local+=n; chunks++; } else { fprintf(stderr,"[w%d] chunk [%ld,%ld] ABANDONED\n",w,lo,hi); }
+        total_guard+=guard;
     }
-    fprintf(stderr,"[w%d] done: heads=%ld local=%ld guard=%d\n", w, resume, n, guard);
+    fprintf(stderr,"[w%d] done: chunks=%d blocks=%ld guard=%d\n", w, chunks, total_local, total_guard);
     close(lfd);
     return 0;
 }
@@ -323,13 +380,18 @@ int main(int argc,char**argv){
         if(lf>=0) close(lf);
         printf("pre-sized index.dat to %ld heights; created append.lock\n", end_h+1);
     }
+    /* shared atomic work cursor: MAP_SHARED survives fork(), so all workers
+     * claim disjoint CHUNK_BLOCKS-sized slices from the SAME counter via
+     * __sync_fetch_and_add instead of each owning one static 1/nw shard. */
+    volatile long* next_claim=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,
+                                    MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED){ perror("mmap next_claim"); return 1; }
+    *next_claim=start_h;
+
     pid_t kids[MAXPEERS];
     for(int w=0;w<nw;w++){
-        long lo=start_h + (long)((long long)span*w/nw);
-        long hi=start_h + (long)((long long)span*(w+1)/nw)-1;
-        if(hi<lo)hi=lo;
         pid_t p=fork();
-        if(p==0){ _exit(worker(w, dir, lo, hi, peers, goodindex, ngood, w)); }
+        if(p==0){ _exit(worker(w, dir, start_h, end_h, peers, goodindex, ngood, np, w, next_claim)); }
         kids[w]=p;
     }
     for(int w=0;w<nw;w++){ int stt; waitpid(kids[w],&stt,0); printf("worker %d exit %d\n",w,WEXITSTATUS(stt)); }
