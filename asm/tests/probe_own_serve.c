@@ -11,7 +11,13 @@ extern int  p2p_read(int fd, char cmd[12], void* pl, unsigned cap, unsigned* len
 extern int  node_handshake(int fd);
 static void put_u32le(unsigned char* p, unsigned v){ p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24; }
 int main(int argc, char** argv){
-    if(argc<4){ fprintf(stderr,"usage: %s <host> <port> <hash_be_hex64>\n", argv[0]); return 2; }
+    /* The hash argument is taken in the byte order the server's on-disk index
+     * uses: pass the 32 bytes exactly as they appear in a 48-byte index.dat
+     * record (bytes 0..31). This is a DIAGNOSTIC tool for proving the serve
+     * daemon answers getdata; it is NOT trying to be a canonical-BE-hash CLI.
+     * The getdata wire hash we send is reverse(arg), which matches the form
+     * build_hash_index() stored (le[k]=rec[31-k]) so the O(1) idx_get hits. */
+    if(argc<4){ fprintf(stderr,"usage: %s <host> <port> <hash_bytes_hex64_in_index-order>\n", argv[0]); return 2; }
     fprintf(stderr,"[p] getaddrinfo\n");
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(argv[1],NULL,&h,&res)!=0){ perror("gai"); return 1; }
