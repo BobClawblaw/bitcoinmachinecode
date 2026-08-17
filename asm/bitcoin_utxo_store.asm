@@ -663,7 +663,16 @@ utxo_store_reload:
     test rax, rax
     jnz  .ckpt_done         ; truncated snapshot -> stop gracefully
     movzx eax, word [rbp-0xD4]
-    mov  [rbp-0x48], eax    ; slen
+    ; store the FULL 64-bit rax (not eax) -- movzx already zero-extends the
+    ; u16 into all of rax, but a 32-bit `mov [.],eax` only overwrites the
+    ; low 4 bytes of this 8-byte slot, leaving stale stack garbage in the
+    ; high 4 bytes; utxo_put's slen arg is loaded back as a 64-bit qword
+    ; below (r9), so that garbage corrupted the value it saw -- confirmed
+    ; via a real replay where it made utxo_put's blob-capacity check see a
+    ; huge garbage size and spuriously report "table full" (2) after
+    ; already writing the slot's txid/index, leaving a phantom "occupied"
+    ; slot with no value/script -- a real UTXO-lookup correctness bug.
+    mov  [rbp-0x48], rax    ; slen
     mov  rdx, rax
     test rdx, rdx
     jz   .ckpt_put
@@ -743,7 +752,9 @@ utxo_store_reload:
     jnz  .rep_close
     add  qword [rbp-0x150], 46
     movzx eax, word [rbp-0xD4]
-    mov  [rbp-0x48], eax   ; slen
+    ; see the identical fix + explanation in .ckpt_loop above -- same bug,
+    ; same fix (store rax, not eax, so the slot's high 4 bytes are zeroed).
+    mov  [rbp-0x48], rax   ; slen
     mov  rdx, rax
     test rdx, rdx
     jz   .rep_push_apply
