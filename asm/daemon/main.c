@@ -3,13 +3,19 @@
  *   daemon sync  <dir>                : init store in <dir>, connect to the
  *                                       loopback test peer, handshake, run IBD
  *                                       (node_sync), report resulting height.
- *   daemon serve <dir> <port>         : init store in <dir>, listen on port,
+ *   daemon serve <dir> <port> [nwant] [catchup_workers]
+ *                                     : init store in <dir>, listen on port,
  *                                       accept a peer, handshake, then serve
  *                                       stored blocks to getdata / reply to
  *                                       ping. The node IE (connect/handshake/
  *                                       IBD/serve-block) is all assembly
  *                                       (bitcoind.asm); this is only the main
- *                                       loop over sockets.
+ *                                       loop over sockets. nwant (default 3)
+ *                                       is the steady-state outbound leg
+ *                                       count; catchup_workers (default 16)
+ *                                       is the dl_catchup chunk-claiming
+ *                                       worker count for the self-healing
+ *                                       boot-time catch-up pass.
  */
 #include <stdio.h>
 #include <string.h>
@@ -1687,6 +1693,15 @@ int main(int argc, char** argv){
         /* # outbound peers is optional 4th arg (default 3). */
         int nwant = (argc>=5)? atoi(argv[4]) : 3;
         if(nwant<0) nwant=0; if(nwant>MUX_MAX_OUT) nwant=MUX_MAX_OUT;
+        /* # dl_catchup chunk-claiming workers is optional 5th arg (default
+         * 16 -- tried both 8 and 16 against the real archive; 16 gave a
+         * modest throughput bump once the liveness probe was fixed to
+         * actually find enough live peers to support it). dl_catchup itself
+         * clamps this down to however many confirmed-live peers it finds
+         * (and up to 64 max), so an over-large request here just becomes a
+         * ceiling, not a guarantee. */
+        int catchup_workers = (argc>=6)? atoi(argv[5]) : 16;
+        if(catchup_workers<1) catchup_workers=1;
         store_reload(store_buf);            /* load the persisted chain from disk */
         /* shared-append flock fd: open append.lock once so any concurrent-safe
          * store_append_shared writes (and the boot catch-up) serialize. */
@@ -1710,7 +1725,7 @@ int main(int argc, char** argv){
          * same time). Self-throttling: a caught-up node returns almost
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
-        long caught = dl_catchup(dir, 16);
+        long caught = dl_catchup(dir, catchup_workers);
         if(caught>0){
             store_reload(store_buf);        /* our copy predates dl_catchup's writes */
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
