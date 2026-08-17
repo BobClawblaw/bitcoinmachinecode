@@ -1,0 +1,1687 @@
+; ============================================================================
+; bitcoin_utxo_lsm.asm -- LSM-tree-style persistent UTXO store, Phase 1.
+;
+; Replaces bitcoin_utxo_store.asm's giant-pre-sized-table approach (which
+; write-amplified ~13x during full-archive replay because the table had to
+; be sized for the FINAL live-UTXO count and scattered writes across the
+; whole 51.5GB structure from block 0 onward) with a bounded, FIXED-SIZE
+; in-memory "memtable" that periodically flushes to sorted, immutable
+; on-disk "runs" -- the same structural idea as Bitcoin Core's real
+; LevelDB-backed chainstate (a bounded -dbcache in front of an LSM tree).
+;
+; The memtable+WAL tier is NOT reimplemented here: bitcoin_utxo.asm's
+; open-addressing table and bitcoin_utxo_store.asm's utxo_store_init/put/
+; del/reload/close ALREADY implement exactly "WAL-logged put/del against a
+; hash table, replay-recoverable on crash" -- proven correct by this
+; project's own stress tests. This module's state struct starts with the
+; IDENTICAL 40-byte layout utxo_store_* expects (log_fd/idx_fd/log_len/
+; ckpt_log_off/ckpt_n) so `lst` can be passed directly as utxo_store_*'s
+; `st` argument with zero translation.
+;
+; What THIS module adds on top:
+;   - a flush trigger (memtable live-count OR op-count threshold) that,
+;     once crossed, sorts the memtable's live entries plus this
+;     generation's delete-tombstones into a new immutable run file and
+;     resets the memtable/WAL for the next generation;
+;   - a per-run Bloom filter (uniform SHA256d-derived keys make min/max
+;     range bounds useless for pruning, so a real Bloom filter is the
+;     actual fast-reject);
+;   - a crash-safe manifest (temp-file + fsync + rename) tracking which
+;     runs exist, instead of the O_TRUNC-rewrite-in-place utxo_store_sync
+;     uses for its checkpoint (that pattern has a real, separate crash
+;     hazard: a crash mid-rewrite loses the checkpoint with no WAL replay
+;     covering the gap -- not fixed here, just not repeated);
+;   - multi-run point lookup (utxo_lsm_get), newest generation first,
+;     Bloom-gated, stopping at the first tombstone or hit.
+;
+; CONTRACT CHANGE from utxo_del/utxo_store_del: utxo_lsm_del(key) returns 1
+; (recorded) for BOTH a memtable hit and a memtable MISS -- a miss is
+; assumed to reference a key flushed into an older run (this workload's
+; every DEL is a real consensus-valid spend) and is recorded as a
+; tombstone so it correctly shadows that older run's PUSH at merge time.
+; This assumption is NOT safe for a general-purpose store; it is safe here
+; specifically because callers only ever delete real spends (see
+; daemon/build_utxo.c). utxo_lsm_del returns -1 only on a genuine I/O error.
+;
+; PHASE 1 SCOPE: no compaction. Runs accumulate and are never merged or
+; garbage-collected. This is correct and sufficient for build_utxo.c's
+; one-shot, non-resumable archive replay (bounded run count: ~archive size
+; / memtable capacity). It is an explicit non-goal for any long-running
+; process (e.g. a live daemon's real-time mempool) -- compaction is Phase 2
+; and is a hard gate before this module is ever wired into daemon/main.c.
+;
+; Run files are SORTED (ascending 36-byte key) so a lookup can early-exit
+; and so a future compaction can do a straight streaming k-way merge
+; without re-sorting. A sparse index is NOT implemented in Phase 1 (a
+; known, deliberate simplification: utxo_lsm_get is never on build_utxo.c's
+; hot path, so a full linear scan per candidate run is an acceptable cost;
+; only the WAL-backed memtable path is hot, and that is untouched
+; utxo_store_* code already proven fast).
+;
+; ---- state struct `lst` (caller allocates, zeroes, then fills the
+;      caller-owned config fields below BEFORE calling utxo_lsm_init or
+;      utxo_lsm_reload) ----
+;   +0   qword log_fd         \
+;   +8   qword idx_fd          \  IDENTICAL layout to bitcoin_utxo_store.asm's
+;   +16  qword log_len          > state struct -- owned by utxo_store_*,
+;   +24  qword ckpt_log_off    /   never touched directly by this module.
+;   +32  qword ckpt_n         /
+;   +40  qword op_count        -- puts+dels since the last flush
+;   +48  qword op_threshold    -- CALLER SETS: flush when op_count reaches this
+;   +56  qword fill_threshold  -- CALLER SETS: flush when memtable live-count
+;                                  reaches this (utxo_count(u), i.e. u->n)
+;   +64  qword tomb_buf        -- CALLER SETS: buffer of 36-byte (txid+index)
+;                                  entries, capacity >= op_threshold
+;   +72  qword tomb_cap        -- CALLER SETS: capacity of tomb_buf (entries)
+;   +80  qword tomb_n          -- current tombstone-list count this generation
+;   +88  qword total_live      -- best-effort live-count estimate (put-hit
+;                                  increments, every del decrements; NOT
+;                                  reconciled against older-run contents --
+;                                  informational/telemetry only, mirrors how
+;                                  build_utxo.c already treats del_miss as
+;                                  approximate, never correctness-critical)
+;   +96  qword next_gen        -- next generation number to assign on flush
+;   +104 qword manifest_buf    -- CALLER SETS: array of qword generation
+;                                  numbers, one per run; run i's file is
+;                                  always "utxo_run_%06u.dat" for i itself
+;                                  (Phase 1 never removes/renumbers runs, so
+;                                  a run's number IS its manifest index)
+;   +112 qword manifest_cap    -- CALLER SETS: capacity of manifest_buf (runs)
+;   +120 qword manifest_n      -- current run count
+;   +128 qword scratch_buf     -- CALLER SETS: big scratch arena, layout:
+;                                  [0 .. desc_cap*64)         merge-sort ping
+;                                  [desc_cap*64 .. *128)      merge-sort pong
+;                                  [desc_cap*128 .. +BLOOM_MAX_BYTES) bloom
+;                                  [+BLOOM_MAX_BYTES .. +SCRIPT_MAX_BYTES) script
+;                                  where desc_cap = (scratch_cap -
+;                                  BLOOM_MAX_BYTES - SCRIPT_MAX_BYTES) / 128.
+;                                  Required: desc_cap >= fill_threshold +
+;                                  tomb_cap (worst case every live memtable
+;                                  entry AND every tombstone need a
+;                                  descriptor in the same flush).
+;   +136 qword scratch_cap     -- CALLER SETS: byte size of scratch_buf
+;   (total struct size: 144 bytes)
+;
+; Exports (System V AMD64):
+;   long utxo_lsm_init(void* lst)                              -> 1 / -1
+;   long utxo_lsm_put(void* lst, void* u, const u8 txid[32],
+;                      u32 index, u64 value, const u8* script, u32 slen)
+;                                                                -> 1/0/2/-1
+;   long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index)
+;                                                                -> 1 / -1
+;   long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
+;                      u64* value, u8** script, u32* slen)      -> 1/0/-1
+;                      (on a disk-run hit, *script points into lst's
+;                      internal scratch buffer -- valid only until the next
+;                      utxo_lsm_get call, unlike a memtable hit's stable
+;                      blob pointer; documented divergence from utxo_get.)
+;   long utxo_lsm_count(void* lst)                              -> total_live
+;   long utxo_lsm_reload(void* lst, void* u)          -> replayed count / -1
+;   void utxo_lsm_close(void* lst)
+;
+; FRAME RULE: same as bitcoin_utxo_store.asm -- locals live strictly below
+; the push-save area; `syscall` clobbers rcx/r11, never held live across one.
+; ============================================================================
+default rel
+section .text
+
+MAGIC_RUN        equ 0x4E555255      ; "URUN" little-endian dword
+MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword
+BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
+SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
+
+manifest_name:     db "utxo_manifest.dat", 0
+manifest_tmp_name:  db "utxo_manifest.tmp", 0
+dot_name:           db ".", 0
+wal_name:            db "utxo.dat", 0
+
+extern utxo_put
+extern utxo_get
+extern utxo_del
+extern utxo_store_init
+extern utxo_store_put
+extern utxo_store_del
+extern utxo_store_reload
+extern utxo_store_close
+
+; ============================================================================
+; small local helpers
+; ============================================================================
+
+; mac_memcpy(dst=rdi, src=rsi, n=rdx) -- preserves nothing special, trivial
+mac_memcpy:
+    push rcx
+    xor  ecx, ecx
+.ml:
+    cmp  rcx, rdx
+    jae  .md
+    mov  al, [rsi+rcx]
+    mov  [rdi+rcx], al
+    inc  rcx
+    jmp  .ml
+.md:
+    pop  rcx
+    ret
+
+; mac_read_exact2(fd=rdi, buf=rsi, len=rdx) -> rax 0 ok / -1
+mac_read_exact2:
+    push rbx
+    push r12
+    push r13
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  rbx, rdx
+.re:
+    test rbx, rbx
+    jz   .ok
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, rbx
+    xor  eax, eax
+    syscall
+    test rax, rax
+    jz   .bad
+    js   .bad
+    add  r13, rax
+    sub  rbx, rax
+    jmp  .re
+.bad:
+    mov  rax, -1
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+.ok:
+    xor  eax, eax
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+
+; mac_write_exact(fd=rdi, buf=rsi, len=rdx) -> rax 0 ok / -1
+mac_write_exact:
+    push rbx
+    push r12
+    push r13
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  rbx, rdx
+.we:
+    test rbx, rbx
+    jz   .ok
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, rbx
+    mov  eax, 1
+    syscall
+    test rax, rax
+    jle  .bad
+    add  r13, rax
+    sub  rbx, rax
+    jmp  .we
+.bad:
+    mov  rax, -1
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+.ok:
+    xor  eax, eax
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+
+; mac_fsync2(fd=rdi) -> rax
+mac_fsync2:
+    mov  eax, 74
+    syscall
+    ret
+
+; mac_cmp_key(p=rdi, q=rsi) -> eax: 0 = p<q, 1 = p==q, 2 = p>q (36-byte unsigned)
+; Preserves rdi,rsi,rcx,rdx.
+mac_cmp_key:
+    push rdi
+    push rsi
+    push rcx
+    push rdx
+    xor  ecx, ecx
+.kl:
+    cmp  ecx, 36
+    jae  .keq
+    movzx eax, byte [rdi+rcx]
+    movzx edx, byte [rsi+rcx]
+    cmp  eax, edx
+    jb   .klt
+    ja   .kgt
+    inc  ecx
+    jmp  .kl
+.keq:
+    mov  eax, 1
+    jmp  .kret
+.klt:
+    mov  eax, 0
+    jmp  .kret
+.kgt:
+    mov  eax, 2
+.kret:
+    pop  rdx
+    pop  rcx
+    pop  rsi
+    pop  rdi
+    ret
+
+; mac_copy_rec(dst=rdi, src=rsi) -- copies a fixed 64-byte descriptor.
+; Preserves rdi,rsi,rcx.
+mac_copy_rec:
+    push rdi
+    push rsi
+    push rcx
+    xor  ecx, ecx
+.cl:
+    cmp  ecx, 64
+    jae  .cd
+    mov  al, [rsi+rcx]
+    mov  [rdi+rcx], al
+    inc  ecx
+    jmp  .cl
+.cd:
+    pop  rcx
+    pop  rsi
+    pop  rdi
+    ret
+
+; mac_bloom_h(key=rdi(36B), seed=esi) -> eax = FNV-1a-style 32-bit hash.
+; Preserves rdi,rdx,rcx,rbx (esi untouched throughout).
+mac_bloom_h:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    mov  ebx, esi
+    xor  ecx, ecx
+.bh:
+    cmp  ecx, 36
+    jae  .bhd
+    movzx edx, byte [rdi+rcx]
+    xor  ebx, edx
+    imul ebx, ebx, 16777619
+    inc  ecx
+    jmp  .bh
+.bhd:
+    mov  eax, ebx
+    pop  rdi
+    pop  rdx
+    pop  rcx
+    pop  rbx
+    ret
+
+; mac_bloom_setbit(key=rdi, seed=esi, bloom_base=rdx, bits_mask=ecx) -- sets
+; the one bit this (key,seed) hashes to, mod bits_mask+1. Clobbers rax/rbx/
+; rdx/rcx (does NOT preserve rdx/rcx across return -- caller must re-load
+; bloom_base/bits_mask before the next call if it needs them again).
+mac_bloom_setbit:
+    push rbx
+    call mac_bloom_h
+    and  eax, ecx
+    mov  ebx, eax
+    shr  ebx, 3
+    and  eax, 7
+    mov  cl, al
+    mov  al, 1
+    shl  al, cl
+    add  rdx, rbx
+    or   [rdx], al
+    pop  rbx
+    ret
+
+; mac_bloom_testbit(key=rdi, seed=esi, bloom_base=rdx, bits_mask=ecx) -> eax
+; 1 if the bit is set, 0 if not. Same clobber contract as mac_bloom_setbit.
+mac_bloom_testbit:
+    push rbx
+    call mac_bloom_h
+    and  eax, ecx
+    mov  ebx, eax
+    shr  ebx, 3
+    and  eax, 7
+    mov  cl, al
+    mov  al, 1
+    shl  al, cl
+    add  rdx, rbx
+    test byte [rdx], al
+    jz   .bt0
+    mov  eax, 1
+    jmp  .btr
+.bt0:
+    xor  eax, eax
+.btr:
+    pop  rbx
+    ret
+
+; mac_clear_memtable(u=rdi) -- reset the in-memory table to empty, reusing
+; its mask/blob/blob_cap pointers (local re-implementation of
+; bitcoin_utxo_store.asm's utxo_store_clear, which isn't exported).
+mac_clear_memtable:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    mov  r12, rdi
+    mov  qword [r12], 0
+    mov  qword [r12+32], 0
+    mov  r13, [r12+8]
+    inc  r13
+    lea  rdi, [r12+40]
+.cm:
+    test r13, r13
+    jz   .cmd
+    mov  dword [rdi+40], 0xFFFFFFFF
+    add  rdi, 48
+    dec  r13
+    jmp  .cm
+.cmd:
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; mac_calc_desc_cap(lst=rdi) -> rax = (scratch_cap - BLOOM_MAX_BYTES -
+;   SCRIPT_MAX_BYTES) / 128. Leaf function, no frame needed.
+mac_calc_desc_cap:
+    mov  rax, [rdi+136]
+    sub  rax, BLOOM_MAX_BYTES
+    sub  rax, SCRIPT_MAX_BYTES
+    xor  edx, edx
+    mov  rcx, 128
+    div  rcx
+    ret
+
+; fmt_runname(buf20=rdi, run_no=esi) -- writes "utxo_run_%06u.dat\0" (20B)
+fmt_runname:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    sub  rsp, 0x10
+    mov  r12, rdi
+    mov  byte [r12+0], 'u'
+    mov  byte [r12+1], 't'
+    mov  byte [r12+2], 'x'
+    mov  byte [r12+3], 'o'
+    mov  byte [r12+4], '_'
+    mov  byte [r12+5], 'r'
+    mov  byte [r12+6], 'u'
+    mov  byte [r12+7], 'n'
+    mov  byte [r12+8], '_'
+    mov  eax, esi
+    xor  edx, edx
+    mov  ebx, 100000
+    div  ebx
+    add  al, '0'
+    mov  [r12+9], al
+    mov  eax, edx
+    xor  edx, edx
+    mov  ebx, 10000
+    div  ebx
+    add  al, '0'
+    mov  [r12+10], al
+    mov  eax, edx
+    xor  edx, edx
+    mov  ebx, 1000
+    div  ebx
+    add  al, '0'
+    mov  [r12+11], al
+    mov  eax, edx
+    xor  edx, edx
+    mov  ebx, 100
+    div  ebx
+    add  al, '0'
+    mov  [r12+12], al
+    mov  eax, edx
+    xor  edx, edx
+    mov  ebx, 10
+    div  ebx
+    add  al, '0'
+    mov  [r12+13], al
+    mov  eax, edx
+    add  al, '0'
+    mov  [r12+14], al
+    mov  dword [r12+15], 0x7461642E   ; ".dat"
+    mov  byte  [r12+19], 0
+    add  rsp, 0x10
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; mac_sort_desc(a=rdi, b=rsi, n=rdx) -- bottom-up iterative merge sort of n
+; fixed-64-byte records in a, comparing the first 36 bytes (mac_cmp_key), b
+; is scratch of equal size. Final sorted result always ends up in a.
+mac_sort_desc:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x80
+    mov  r12, rdi          ; a
+    mov  r13, rsi          ; b
+    mov  r14, rdx          ; n
+    cmp  r14, 1
+    jbe  .sd_done
+    mov  rbx, 1             ; width
+    mov  r15, 1             ; cur_src_is_a
+.sd_pass:
+    cmp  rbx, r14
+    jae  .sd_maybe_copy
+    cmp  r15, 1
+    je   .sd_src_a
+    mov  qword [rbp-0x30], r13
+    mov  qword [rbp-0x38], r12
+    jmp  .sd_bases_set
+.sd_src_a:
+    mov  qword [rbp-0x30], r12
+    mov  qword [rbp-0x38], r13
+.sd_bases_set:
+    mov  qword [rbp-0x40], 0
+.sd_outer:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .sd_pass_done
+    mov  [rbp-0x48], rax
+    mov  rcx, rax
+    add  rcx, rbx
+    cmp  rcx, r14
+    jbe  .sd_mid_ok
+    mov  rcx, r14
+.sd_mid_ok:
+    mov  [rbp-0x50], rcx
+    mov  rdx, rbx
+    shl  rdx, 1
+    add  rdx, rax
+    cmp  rdx, r14
+    jbe  .sd_hi_ok
+    mov  rdx, r14
+.sd_hi_ok:
+    mov  [rbp-0x58], rdx
+    mov  rax, [rbp-0x48]
+    mov  [rbp-0x60], rax
+    mov  rax, [rbp-0x50]
+    mov  [rbp-0x68], rax
+    mov  rax, [rbp-0x48]
+    mov  [rbp-0x70], rax
+.sd_inner:
+    mov  rax, [rbp-0x60]
+    mov  rcx, [rbp-0x50]
+    cmp  rax, rcx
+    jae  .sd_drain_q
+    mov  rax, [rbp-0x68]
+    mov  rcx, [rbp-0x58]
+    cmp  rax, rcx
+    jae  .sd_drain_p
+    mov  rax, [rbp-0x60]
+    shl  rax, 6
+    add  rax, [rbp-0x30]
+    mov  rdi, rax
+    mov  rax, [rbp-0x68]
+    shl  rax, 6
+    add  rax, [rbp-0x30]
+    mov  rsi, rax
+    call mac_cmp_key
+    cmp  eax, 2
+    je   .sd_take_q
+    mov  rax, [rbp-0x60]
+    shl  rax, 6
+    add  rax, [rbp-0x30]
+    mov  rsi, rax
+    mov  rax, [rbp-0x70]
+    shl  rax, 6
+    add  rax, [rbp-0x38]
+    mov  rdi, rax
+    call mac_copy_rec
+    inc  qword [rbp-0x60]
+    inc  qword [rbp-0x70]
+    jmp  .sd_inner
+.sd_take_q:
+    mov  rax, [rbp-0x68]
+    shl  rax, 6
+    add  rax, [rbp-0x30]
+    mov  rsi, rax
+    mov  rax, [rbp-0x70]
+    shl  rax, 6
+    add  rax, [rbp-0x38]
+    mov  rdi, rax
+    call mac_copy_rec
+    inc  qword [rbp-0x68]
+    inc  qword [rbp-0x70]
+    jmp  .sd_inner
+.sd_drain_p:
+    mov  rax, [rbp-0x60]
+    mov  rcx, [rbp-0x50]
+    cmp  rax, rcx
+    jae  .sd_drain_done
+    mov  rax, [rbp-0x60]
+    shl  rax, 6
+    add  rax, [rbp-0x30]
+    mov  rsi, rax
+    mov  rax, [rbp-0x70]
+    shl  rax, 6
+    add  rax, [rbp-0x38]
+    mov  rdi, rax
+    call mac_copy_rec
+    inc  qword [rbp-0x60]
+    inc  qword [rbp-0x70]
+    jmp  .sd_drain_p
+.sd_drain_q:
+    mov  rax, [rbp-0x68]
+    mov  rcx, [rbp-0x58]
+    cmp  rax, rcx
+    jae  .sd_drain_done
+    mov  rax, [rbp-0x68]
+    shl  rax, 6
+    add  rax, [rbp-0x30]
+    mov  rsi, rax
+    mov  rax, [rbp-0x70]
+    shl  rax, 6
+    add  rax, [rbp-0x38]
+    mov  rdi, rax
+    call mac_copy_rec
+    inc  qword [rbp-0x68]
+    inc  qword [rbp-0x70]
+    jmp  .sd_drain_q
+.sd_drain_done:
+    mov  rax, [rbp-0x40]
+    mov  rcx, rbx
+    shl  rcx, 1
+    add  rax, rcx
+    mov  [rbp-0x40], rax
+    jmp  .sd_outer
+.sd_pass_done:
+    shl  rbx, 1
+    xor  r15, 1
+    jmp  .sd_pass
+.sd_maybe_copy:
+    cmp  r15, 1
+    je   .sd_done
+    xor  ecx, ecx
+.sd_copyall:
+    cmp  rcx, r14
+    jae  .sd_done
+    push rcx
+    mov  rax, rcx
+    shl  rax, 6
+    lea  rdi, [r12+rax]
+    lea  rsi, [r13+rax]
+    call mac_copy_rec
+    pop  rcx
+    inc  rcx
+    jmp  .sd_copyall
+.sd_done:
+    add  rsp, 0x80
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_init(lst) -> 1 ok / -1 err
+;   Opens the WAL (utxo_store_init) and resets THIS module's own fields.
+;   Caller must already have set op_threshold/fill_threshold/tomb_buf/
+;   tomb_cap/manifest_buf/manifest_cap/scratch_buf/scratch_cap.
+; ============================================================================
+global utxo_lsm_init
+utxo_lsm_init:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    sub  rsp, 0x10
+    mov  r12, rdi
+    call utxo_store_init
+    cmp  rax, 1
+    jne  .li_fail
+    mov  qword [r12+40], 0
+    mov  qword [r12+80], 0
+    mov  qword [r12+88], 0
+    mov  qword [r12+96], 0
+    mov  qword [r12+120], 0
+    mov  rax, 1
+    jmp  .li_done
+.li_fail:
+    mov  rax, -1
+.li_done:
+    add  rsp, 0x10
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_put(lst, u, txid, index, value, script, slen) -> 1/0/2/-1
+; ============================================================================
+global utxo_lsm_put
+utxo_lsm_put:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x40
+    mov  r12, rdi          ; lst
+    mov  r13, rsi          ; u
+    mov  rax, [rbp+16]      ; slen (my 7th arg)
+    push rax                 ; forward as utxo_store_put's 7th arg
+    call utxo_store_put       ; rdi..r9 untouched since our own entry
+    add  rsp, 8
+    mov  r14d, eax
+    cmp  r14d, 1
+    jne  .lp_no_live_inc
+    inc  qword [r12+88]
+.lp_no_live_inc:
+    inc  qword [r12+40]
+    xor  r15d, r15d
+    mov  rax, [r12+40]
+    cmp  rax, [r12+48]
+    jae  .lp_do_flush
+    mov  rax, [r13]
+    cmp  rax, [r12+56]
+    jb   .lp_skip_flush
+.lp_do_flush:
+    mov  rdi, r12
+    mov  rsi, r13
+    call mac_flush
+    cmp  rax, -1
+    jne  .lp_skip_flush
+    mov  r15d, 1
+.lp_skip_flush:
+    cmp  r15d, 1
+    je   .lp_err
+    mov  eax, r14d
+    jmp  .lp_done
+.lp_err:
+    mov  eax, -1
+.lp_done:
+    add  rsp, 0x40
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_del(lst, u, txid, index) -> 1 recorded / -1 err
+;   See CONTRACT CHANGE note at top of file: memtable-miss still returns 1
+;   and still records a tombstone.
+; ============================================================================
+global utxo_lsm_del
+utxo_lsm_del:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x40
+    mov  r12, rdi           ; lst
+    mov  r13, rsi            ; u
+    mov  rbx, rdx             ; txid
+    mov  r14d, ecx              ; index
+    call utxo_store_del          ; rdi..rcx unchanged since our entry
+    cmp  rax, -1
+    je   .ld_err
+    ; append to tombstone list unconditionally (hit or miss)
+    mov  rax, [r12+80]
+    cmp  rax, [r12+72]
+    jae  .ld_err
+    mov  rdi, [r12+64]
+    mov  rcx, rax
+    imul rcx, rcx, 36
+    add  rdi, rcx
+    mov  rsi, rbx
+    push rdi
+    mov  rdx, 32
+    call mac_memcpy
+    pop  rdi
+    mov  eax, r14d
+    mov  [rdi+32], eax
+    inc  qword [r12+80]
+    inc  qword [r12+40]
+    dec  qword [r12+88]
+    xor  r15d, r15d
+    mov  rax, [r12+40]
+    cmp  rax, [r12+48]
+    jae  .ld_do_flush
+    mov  rax, [r13]
+    cmp  rax, [r12+56]
+    jb   .ld_skip_flush
+.ld_do_flush:
+    mov  rdi, r12
+    mov  rsi, r13
+    call mac_flush
+    cmp  rax, -1
+    jne  .ld_skip_flush
+    mov  r15d, 1
+.ld_skip_flush:
+    cmp  r15d, 1
+    je   .ld_err
+    mov  eax, 1
+    jmp  .ld_done
+.ld_err:
+    mov  eax, -1
+.ld_done:
+    add  rsp, 0x40
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_count(lst) -> total_live
+; ============================================================================
+global utxo_lsm_count
+utxo_lsm_count:
+    mov  rax, [rdi+88]
+    ret
+
+; ============================================================================
+; utxo_lsm_close(lst) -- tail call, same struct layout utxo_store_close needs
+; ============================================================================
+global utxo_lsm_close
+utxo_lsm_close:
+    jmp  utxo_store_close
+
+; ============================================================================
+; mac_run_lookup(lst, run_no, txid, index, &value, &script, &slen) ->
+;   1 found-push / 0 absent-in-this-run / 2 tombstone-hit(=miss) / -1 err
+; ============================================================================
+mac_run_lookup:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x200
+    mov  r12, rdi
+    mov  r13d, esi
+    mov  [rbp-0x30], rdx
+    mov  [rbp-0x38], ecx
+    mov  [rbp-0x40], r8
+    mov  [rbp-0x48], r9
+    mov  rax, [rbp+16]
+    mov  [rbp-0x50], rax
+
+    mov  rdi, r12
+    call mac_calc_desc_cap
+    shl  rax, 7
+    mov  [rbp-0x60], rax        ; off_bloom
+
+    lea  rdi, [rbp-0x180]
+    mov  esi, r13d
+    call fmt_runname
+    lea  rdi, [rbp-0x180]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .ml_err
+    mov  [rbp-0x68], rax
+
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x140]
+    mov  rdx, 28
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_err_close
+
+    mov  rax, [rbp-0x140+20]
+    mov  rcx, rax
+    dec  rcx
+    mov  [rbp-0x58], rcx        ; bits_mask
+    shr  rax, 3                  ; bloom_bytes
+
+    mov  rdi, [rbp-0x68]
+    mov  rsi, [r12+128]
+    add  rsi, [rbp-0x60]
+    mov  rdx, rax
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_err_close
+
+    lea  rdi, [rbp-0x100]
+    mov  rsi, [rbp-0x30]
+    mov  rdx, 32
+    call mac_memcpy
+    mov  eax, [rbp-0x38]
+    mov  [rbp-0x100+32], eax
+
+    mov  rdx, [r12+128]
+    add  rdx, [rbp-0x60]
+    mov  ecx, [rbp-0x58]
+    lea  rdi, [rbp-0x100]
+    mov  esi, 0x811c9dc5
+    push rdx
+    push rcx
+    call mac_bloom_testbit
+    pop  rcx
+    pop  rdx
+    test eax, eax
+    jz   .ml_absent_close
+    lea  rdi, [rbp-0x100]
+    mov  esi, 0xa1b2c3d4
+    push rdx
+    push rcx
+    call mac_bloom_testbit
+    pop  rcx
+    pop  rdx
+    test eax, eax
+    jz   .ml_absent_close
+    lea  rdi, [rbp-0x100]
+    mov  esi, 0x5bd1e995
+    call mac_bloom_testbit
+    test eax, eax
+    jz   .ml_absent_close
+
+.ml_scan_loop:
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 37
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_absent_close
+    lea  rdi, [rbp-0x1C0]
+    lea  rsi, [rbp-0x100]
+    call mac_cmp_key
+    cmp  eax, 1
+    je   .ml_key_match
+    cmp  eax, 2
+    je   .ml_absent_close
+    movzx eax, byte [rbp-0x1C0+36]
+    cmp  eax, 1
+    jne  .ml_scan_loop
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 10
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_absent_close
+    movzx eax, word [rbp-0x1C0+8]
+    test eax, eax
+    jz   .ml_scan_loop
+    mov  rdi, [rbp-0x68]
+    mov  rsi, rax
+    mov  edx, 1
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .ml_err_close
+    jmp  .ml_scan_loop
+.ml_key_match:
+    movzx eax, byte [rbp-0x1C0+36]
+    cmp  eax, 2
+    je   .ml_tombstone_close
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 10
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_err_close
+    movzx r14d, word [rbp-0x1C0+8]
+    test r14d, r14d
+    jz   .ml_push_noscript
+    mov  rdi, [rbp-0x68]
+    mov  rsi, [r12+128]
+    add  rsi, [rbp-0x60]
+    add  rsi, BLOOM_MAX_BYTES
+    mov  rdx, r14
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_err_close
+.ml_push_noscript:
+    mov  rdi, [rbp-0x68]
+    mov  eax, 3
+    syscall
+    mov  rax, [rbp-0x1C0]
+    mov  rcx, [rbp-0x40]
+    mov  [rcx], rax
+    mov  rcx, [rbp-0x48]
+    mov  rax, [r12+128]
+    add  rax, [rbp-0x60]
+    add  rax, BLOOM_MAX_BYTES
+    mov  [rcx], rax
+    mov  rcx, [rbp-0x50]
+    mov  [rcx], r14d
+    mov  eax, 1
+    jmp  .ml_ret
+.ml_tombstone_close:
+    mov  rdi, [rbp-0x68]
+    mov  eax, 3
+    syscall
+    mov  eax, 2
+    jmp  .ml_ret
+.ml_absent_close:
+    mov  rdi, [rbp-0x68]
+    mov  eax, 3
+    syscall
+    xor  eax, eax
+    jmp  .ml_ret
+.ml_err_close:
+    mov  rdi, [rbp-0x68]
+    mov  eax, 3
+    syscall
+.ml_err:
+    mov  eax, -1
+.ml_ret:
+    add  rsp, 0x200
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_get(lst, u, txid, index, &value, &script, &slen) -> 1/0/-1
+; ============================================================================
+global utxo_lsm_get
+utxo_lsm_get:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x120
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  rbx, rdx
+    mov  [rbp-0x30], ecx
+    mov  [rbp-0x38], r8
+    mov  [rbp-0x40], r9
+    mov  rax, [rbp+16]
+    mov  [rbp-0x48], rax
+
+    mov  rdi, r13
+    mov  rsi, rbx
+    mov  edx, [rbp-0x30]
+    mov  rcx, [rbp-0x38]
+    mov  r8, [rbp-0x40]
+    ; utxo_get's REAL contract writes a full 8-byte "unsigned long* slen"
+    ; (see bitcoin_utxo.asm) even though this module's own contract is
+    ; u32* slen throughout -- forwarding the caller's 4-byte u32* directly
+    ; here would be a genuine 4-byte stack overflow on every memtable hit.
+    ; Give it an 8-byte scratch slot instead and narrow-copy below.
+    lea  r9, [rbp-0x110]
+    call utxo_get
+    cmp  eax, 1
+    jne  .lg_no_memtable_hit
+    mov  eax, [rbp-0x110]
+    mov  rcx, [rbp-0x48]
+    mov  [rcx], eax
+    jmp  .lg_found
+.lg_no_memtable_hit:
+
+    ; Check THIS generation's unflushed tombstone list before falling
+    ; through to disk runs. Without this, a del that missed the memtable
+    ; (assumed to shadow an older run, per the documented contract change)
+    ; would stay invisible to get() until the NEXT flush actually writes
+    ; its tombstone record to a run file -- a real staleness window, since
+    ; tomb_buf is otherwise only consulted at flush time.
+    lea  rdi, [rbp-0x100]
+    mov  rsi, rbx
+    push rdi
+    mov  rdx, 32
+    call mac_memcpy
+    pop  rdi
+    mov  eax, [rbp-0x30]
+    mov  [rdi+32], eax
+    mov  rax, [r12+80]        ; tomb_n
+    mov  [rbp-0x58], rax
+    mov  qword [rbp-0x60], 0
+.lg_tomb_loop:
+    mov  rax, [rbp-0x60]
+    cmp  rax, [rbp-0x58]
+    jae  .lg_tomb_done
+    mov  rdi, [r12+64]
+    mov  rcx, rax
+    imul rcx, rcx, 36
+    add  rdi, rcx
+    lea  rsi, [rbp-0x100]
+    call mac_cmp_key
+    cmp  eax, 1
+    je   .lg_not_found
+    inc  qword [rbp-0x60]
+    jmp  .lg_tomb_loop
+.lg_tomb_done:
+
+    mov  rax, [r12+120]
+    mov  [rbp-0x50], rax
+.lg_run_loop:
+    mov  rax, [rbp-0x50]
+    test rax, rax
+    jz   .lg_not_found
+    dec  rax
+    mov  [rbp-0x50], rax
+    mov  rdi, r12
+    mov  esi, eax
+    mov  rdx, rbx
+    mov  ecx, [rbp-0x30]
+    mov  r8, [rbp-0x38]
+    mov  r9, [rbp-0x40]
+    mov  rax, [rbp-0x48]
+    push rax
+    call mac_run_lookup
+    add  rsp, 8
+    cmp  eax, 1
+    je   .lg_found
+    cmp  eax, 2
+    je   .lg_not_found
+    cmp  eax, -1
+    je   .lg_err
+    jmp  .lg_run_loop
+.lg_found:
+    mov  eax, 1
+    jmp  .lg_done
+.lg_not_found:
+    xor  eax, eax
+    jmp  .lg_done
+.lg_err:
+    mov  eax, -1
+.lg_done:
+    add  rsp, 0x120
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; mac_flush(lst=rdi, u=rsi) -> 1 ok / -1 err
+;   See header comment for full algorithm. Called by utxo_lsm_put/del once
+;   op_count or memtable fill crosses its threshold.
+; ============================================================================
+mac_flush:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x300
+    mov  r12, rdi           ; lst
+    mov  r13, rsi            ; u
+
+    mov  rdi, r12
+    call mac_calc_desc_cap
+    mov  [rbp-0x30], rax     ; desc_cap
+    shl  rax, 6
+    mov  [rbp-0x40], rax     ; off_desc_b
+    shl  rax, 1
+    mov  [rbp-0x48], rax     ; off_bloom
+    mov  qword [rbp-0x38], 0 ; n_desc
+
+    ; ---- walk memtable live slots -> PUSH descriptors ----
+    mov  rax, [r13+8]
+    mov  [rbp-0x58], rax      ; mask
+    mov  qword [rbp-0x50], 0  ; slot cursor i
+.fl_slot_loop:
+    mov  rax, [rbp-0x50]
+    cmp  rax, [rbp-0x58]
+    ja   .fl_slots_done
+    mov  rax, [rbp-0x50]
+    imul rax, rax, 48
+    lea  rax, [r13+rax+40]     ; slot base
+    mov  ecx, [rax+40]
+    cmp  ecx, 0xFFFFFFFF
+    je   .fl_slot_next
+    mov  rdx, [rbp-0x38]
+    cmp  rdx, [rbp-0x30]
+    jae  .fl_err
+    mov  rdi, [r12+128]
+    mov  rsi, rdx
+    shl  rsi, 6
+    add  rdi, rsi               ; dest descriptor
+    push rax                     ; slot base
+    push rdi                      ; dest
+    lea  rsi, [rax+8]
+    mov  rdx, 32
+    call mac_memcpy
+    pop  rdi
+    pop  rax
+    mov  ecx, [rax+40]
+    mov  [rdi+32], ecx
+    mov  byte [rdi+36], 1         ; type = PUSH
+    mov  rdx, [rax]                ; blob_off
+    mov  rcx, [r13+16]              ; blob base
+    add  rdx, rcx
+    mov  rcx, [rdx]                  ; value
+    mov  [rdi+40], rcx
+    mov  cx, [rdx+8]                  ; slen (low u16)
+    mov  [rdi+48], cx
+    lea  rcx, [rdx+16]                 ; script_ptr
+    mov  [rdi+56], rcx
+    inc  qword [rbp-0x38]
+.fl_slot_next:
+    inc  qword [rbp-0x50]
+    jmp  .fl_slot_loop
+.fl_slots_done:
+
+    ; ---- walk tombstone list -> DEL descriptors where not currently live ----
+    mov  qword [rbp-0x60], 0     ; tomb cursor
+.fl_tomb_loop:
+    mov  rax, [rbp-0x60]
+    cmp  rax, [r12+80]
+    jae  .fl_tomb_done
+    mov  rbx, [r12+64]
+    mov  rcx, rax
+    imul rcx, rcx, 36
+    add  rbx, rcx                  ; tomb entry ptr
+    mov  rdi, r13
+    mov  rsi, rbx
+    mov  edx, [rbx+32]
+    lea  rcx, [rbp-0x180]
+    lea  r8, [rbp-0x188]
+    lea  r9, [rbp-0x190]
+    call utxo_get
+    cmp  eax, 1
+    je   .fl_tomb_skip
+    mov  rdx, [rbp-0x38]
+    cmp  rdx, [rbp-0x30]
+    jae  .fl_err
+    mov  rdi, [r12+128]
+    mov  rsi, rdx
+    shl  rsi, 6
+    add  rdi, rsi
+    push rdi
+    mov  rsi, rbx
+    mov  rdx, 36
+    call mac_memcpy
+    pop  rdi
+    mov  byte [rdi+36], 2          ; type = DEL
+    inc  qword [rbp-0x38]
+.fl_tomb_skip:
+    inc  qword [rbp-0x60]
+    jmp  .fl_tomb_loop
+.fl_tomb_done:
+
+    mov  rax, [rbp-0x38]
+    test rax, rax
+    jz   .fl_finish_reset
+
+    ; Check manifest capacity BEFORE doing any sort/bloom/run-file work --
+    ; catching this after writing the run file (as the later manifest-
+    ; append check does, kept as a defensive backstop) would leave an
+    ; orphaned run file on disk that's never referenced by the manifest,
+    ; silently losing whatever it would have shadowed (fatal for a
+    ; tombstone: an older run's stale PUSH stays visible to get()).
+    mov  rax, [r12+120]
+    cmp  rax, [r12+112]
+    jae  .fl_err
+
+    ; ---- sort descriptors ----
+    mov  rdi, [r12+128]
+    mov  rsi, [r12+128]
+    add  rsi, [rbp-0x40]
+    mov  rdx, [rbp-0x38]
+    call mac_sort_desc
+
+    ; ---- compute bloom_bits/bits_mask ----
+    mov  rax, [rbp-0x38]
+    imul rax, rax, 10
+    cmp  rax, 64
+    jae  .fl_bb1
+    mov  rax, 64
+.fl_bb1:
+    mov  rcx, 1
+.fl_bb_loop:
+    cmp  rcx, rax
+    jae  .fl_bb2
+    shl  rcx, 1
+    jmp  .fl_bb_loop
+.fl_bb2:
+    mov  rdx, BLOOM_MAX_BYTES*8
+    cmp  rcx, rdx
+    jbe  .fl_bb3
+    mov  rcx, rdx
+.fl_bb3:
+    mov  [rbp-0x70], rcx           ; bloom_bits
+    mov  rax, rcx
+    shr  rax, 3
+    mov  [rbp-0x68], rax           ; bloom_bytes
+    dec  rcx
+    mov  [rbp-0x78], rcx           ; bits_mask
+
+    ; ---- zero bloom region ----
+    mov  rdi, [r12+128]
+    add  rdi, [rbp-0x48]
+    mov  rcx, [rbp-0x68]
+.fl_bz:
+    test rcx, rcx
+    jz   .fl_bz_done
+    mov  byte [rdi], 0
+    inc  rdi
+    dec  rcx
+    jmp  .fl_bz
+.fl_bz_done:
+
+    ; ---- set 3 bloom bits per descriptor ----
+    mov  qword [rbp-0x80], 0
+.fl_bloom_loop:
+    mov  rax, [rbp-0x80]
+    cmp  rax, [rbp-0x38]
+    jae  .fl_bloom_done
+    mov  rdi, [r12+128]
+    mov  rsi, rax
+    shl  rsi, 6
+    add  rdi, rsi                   ; key ptr
+    mov  rdx, [r12+128]
+    add  rdx, [rbp-0x48]              ; bloom base
+    mov  ecx, [rbp-0x78]                ; bits_mask
+    push rdi
+    push rdx
+    push rcx
+    mov  esi, 0x811c9dc5
+    call mac_bloom_setbit
+    pop  rcx
+    pop  rdx
+    pop  rdi
+    push rdi
+    push rdx
+    push rcx
+    mov  esi, 0xa1b2c3d4
+    call mac_bloom_setbit
+    pop  rcx
+    pop  rdx
+    pop  rdi
+    mov  esi, 0x5bd1e995
+    call mac_bloom_setbit
+    inc  qword [rbp-0x80]
+    jmp  .fl_bloom_loop
+.fl_bloom_done:
+
+    ; ---- write run file ----
+    lea  rdi, [rbp-0x140]
+    mov  esi, [r12+120]              ; this run's number = manifest_n
+    call fmt_runname
+    lea  rdi, [rbp-0x140]
+    mov  esi, 1 | 0x40 | 0x200
+    mov  edx, 0o644
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .fl_err
+    mov  [rbp-0x88], rax             ; fd
+
+    mov  dword [rbp-0x100], MAGIC_RUN
+    mov  rax, [r12+96]                ; next_gen
+    mov  [rbp-0x100+4], rax
+    mov  rax, [rbp-0x38]
+    mov  [rbp-0x100+12], rax
+    mov  rax, [rbp-0x70]
+    mov  [rbp-0x100+20], rax
+    mov  rdi, [rbp-0x88]
+    lea  rsi, [rbp-0x100]
+    mov  rdx, 28
+    call mac_write_exact
+    test rax, rax
+    jnz  .fl_err_close
+
+    mov  rdi, [rbp-0x88]
+    mov  rsi, [r12+128]
+    add  rsi, [rbp-0x48]
+    mov  rdx, [rbp-0x68]
+    call mac_write_exact
+    test rax, rax
+    jnz  .fl_err_close
+
+    mov  qword [rbp-0x80], 0
+.fl_wr_loop:
+    mov  rax, [rbp-0x80]
+    cmp  rax, [rbp-0x38]
+    jae  .fl_wr_done
+    mov  rsi, [r12+128]
+    mov  rcx, rax
+    shl  rcx, 6
+    add  rsi, rcx
+    mov  rdi, [rbp-0x88]
+    push rsi
+    mov  rdx, 37
+    call mac_write_exact
+    pop  rsi
+    test rax, rax
+    jnz  .fl_err_close
+    movzx eax, byte [rsi+36]
+    cmp  eax, 1
+    jne  .fl_wr_next
+    mov  rdi, [rbp-0x88]
+    lea  rax, [rsi+40]
+    push rsi
+    mov  rsi, rax
+    mov  rdx, 10
+    call mac_write_exact
+    pop  rsi
+    test rax, rax
+    jnz  .fl_err_close
+    movzx r14d, word [rsi+48]
+    test r14d, r14d
+    jz   .fl_wr_next
+    mov  rdi, [rbp-0x88]
+    mov  r9, [rsi+56]
+    push rsi
+    mov  rsi, r9
+    mov  rdx, r14
+    call mac_write_exact
+    pop  rsi
+    test rax, rax
+    jnz  .fl_err_close
+.fl_wr_next:
+    inc  qword [rbp-0x80]
+    jmp  .fl_wr_loop
+.fl_wr_done:
+    mov  rdi, [rbp-0x88]
+    call mac_fsync2
+    mov  rdi, [rbp-0x88]
+    mov  eax, 3
+    syscall
+
+    ; ---- append to in-memory manifest, advance next_gen ----
+    mov  rax, [r12+120]
+    cmp  rax, [r12+112]
+    jae  .fl_err
+    mov  rdi, [r12+104]
+    mov  rcx, rax
+    shl  rcx, 3
+    add  rdi, rcx
+    mov  rdx, [r12+96]
+    mov  [rdi], rdx
+    inc  qword [r12+120]
+    inc  qword [r12+96]
+
+    ; ---- publish manifest: tmp file + fsync + rename + dir fsync ----
+    lea  rdi, [rel manifest_tmp_name]
+    mov  esi, 1 | 0x40 | 0x200
+    mov  edx, 0o644
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .fl_err
+    mov  rbx, rax
+    mov  dword [rbp-0x100], MAGIC_MANIFEST
+    mov  rax, [r12+120]
+    mov  [rbp-0x100+4], rax
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x100]
+    mov  rdx, 12
+    call mac_write_exact
+    test rax, rax
+    jnz  .fl_merr_close
+    mov  rdi, rbx
+    mov  rsi, [r12+104]
+    mov  rdx, [r12+120]
+    shl  rdx, 3
+    call mac_write_exact
+    test rax, rax
+    jnz  .fl_merr_close
+    mov  rdi, rbx
+    call mac_fsync2
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+
+    lea  rdi, [rel manifest_tmp_name]
+    lea  rsi, [rel manifest_name]
+    mov  eax, 82                        ; rename
+    syscall
+    test rax, rax
+    jl   .fl_err
+
+    lea  rdi, [rel dot_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .fl_finish_reset
+    mov  rbx, rax
+    mov  rdi, rbx
+    call mac_fsync2
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+
+.fl_finish_reset:
+    mov  rdi, [r12+0]
+    xor  esi, esi
+    mov  eax, 77                         ; ftruncate
+    syscall
+    mov  rdi, [r12+0]
+    xor  esi, esi
+    xor  edx, edx
+    mov  eax, 8                           ; lseek SEEK_SET 0
+    syscall
+    mov  qword [r12+16], 0
+    mov  rdi, r13
+    call mac_clear_memtable
+    mov  qword [r12+40], 0
+    mov  qword [r12+80], 0
+    mov  rax, 1
+    jmp  .fl_ret
+
+.fl_merr_close:
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+    jmp  .fl_err
+.fl_err_close:
+    mov  rdi, [rbp-0x88]
+    mov  eax, 3
+    syscall
+.fl_err:
+    mov  rax, -1
+.fl_ret:
+    add  rsp, 0x300
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_reload(lst, u) -> replayed count / -1
+;   (1) reads utxo_manifest.dat if present -> manifest_buf/manifest_n/
+;       next_gen; (2) utxo_store_reload rebuilds the memtable from the WAL
+;       (no checkpoint file is ever written in this design, so it always
+;       replays the whole WAL from offset 0 -- exactly this generation's
+;       unflushed history); (3) a second read-only pass over the same WAL
+;       reconstructs the tombstone list and op_count (lost across a crash
+;       since they only ever lived in memory) by re-deriving them from the
+;       WAL's own DEL records.
+; ============================================================================
+global utxo_lsm_reload
+utxo_lsm_reload:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x200
+    mov  r12, rdi           ; lst
+    mov  r13, rsi            ; u
+
+    ; open (or reopen) the WAL fds -- utxo_store_reload below assumes
+    ; st->log_fd/idx_fd are already valid open fds (it never opens them
+    ; itself, mirroring bitcoin_utxo_store.asm's own store_init-then-
+    ; store_reload calling convention). Safe to call unconditionally: it
+    ; reopens the existing utxo.dat/utxo.idx (O_CREAT|O_RDWR, no truncate).
+    mov  rdi, r12
+    call utxo_store_init
+    cmp  rax, 1
+    jne  .rl_fail
+
+    lea  rdi, [rel manifest_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .rl_no_manifest
+    mov  r14, rax
+    lea  rsi, [rbp-0x80]
+    mov  rdi, r14
+    mov  rdx, 12
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rl_manifest_bad
+    mov  eax, [rbp-0x80]
+    cmp  eax, MAGIC_MANIFEST
+    jne  .rl_manifest_bad
+    mov  rax, [rbp-0x80+4]
+    cmp  rax, [r12+112]
+    ja   .rl_manifest_bad
+    mov  [r12+120], rax
+    test rax, rax
+    jz   .rl_manifest_close
+    mov  rdi, r14
+    mov  rsi, [r12+104]
+    mov  rdx, rax
+    shl  rdx, 3
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rl_manifest_bad
+.rl_manifest_close:
+    mov  rdi, r14
+    mov  eax, 3
+    syscall
+    mov  rax, [r12+120]
+    mov  [r12+96], rax
+    jmp  .rl_manifest_done
+.rl_manifest_bad:
+    mov  rdi, r14
+    mov  eax, 3
+    syscall
+    mov  qword [r12+120], 0
+    mov  qword [r12+96], 0
+    jmp  .rl_manifest_done
+.rl_no_manifest:
+    mov  qword [r12+120], 0
+    mov  qword [r12+96], 0
+.rl_manifest_done:
+
+    mov  rdi, r12
+    mov  rsi, r13
+    call utxo_store_reload
+    cmp  rax, -1
+    je   .rl_fail
+    mov  r15, rax
+
+    mov  qword [r12+80], 0
+    mov  qword [r12+40], 0
+    lea  rdi, [rel wal_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .rl_fail
+    mov  rbx, rax
+    mov  qword [rbp-0x90], 0
+.rl_wal_loop:
+    mov  rax, [rbp-0x90]
+    cmp  rax, [r12+16]
+    jae  .rl_wal_close
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x100]
+    mov  rdx, 8
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rl_wal_close
+    add  qword [rbp-0x90], 8
+    inc  qword [r12+40]
+    mov  al, [rbp-0x100+4]
+    cmp  al, 1
+    je   .rl_wal_push
+    cmp  al, 2
+    je   .rl_wal_del
+    jmp  .rl_wal_close
+.rl_wal_push:
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x100]
+    mov  rdx, 46
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rl_wal_close
+    add  qword [rbp-0x90], 46
+    movzx eax, word [rbp-0x100+44]
+    add  qword [rbp-0x90], rax
+    test eax, eax
+    jz   .rl_wal_loop
+    mov  rdi, rbx
+    mov  rsi, rax
+    mov  edx, 1                         ; SEEK_CUR
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .rl_wal_close
+    jmp  .rl_wal_loop
+.rl_wal_del:
+    mov  rdi, rbx
+    lea  rsi, [rbp-0x100]
+    mov  rdx, 36
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rl_wal_close
+    add  qword [rbp-0x90], 36
+    mov  rax, [r12+80]
+    cmp  rax, [r12+72]
+    jae  .rl_wal_close
+    mov  rdi, [r12+64]
+    mov  rcx, rax
+    imul rcx, rcx, 36
+    add  rdi, rcx
+    lea  rsi, [rbp-0x100]
+    push rdi
+    mov  rdx, 36
+    call mac_memcpy
+    pop  rdi
+    inc  qword [r12+80]
+    jmp  .rl_wal_loop
+.rl_wal_close:
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+
+    mov  rax, [r13]
+    mov  [r12+88], rax
+    mov  rax, r15
+    jmp  .rl_ret
+.rl_fail:
+    mov  rax, -1
+.rl_ret:
+    add  rsp, 0x200
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+section .note.GNU-stack noalloc noexec nowrite progbits
