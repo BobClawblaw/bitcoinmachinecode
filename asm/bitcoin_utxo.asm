@@ -132,6 +132,10 @@ utxo_put:
     mov  rdx, [r12+8]       ; mask
     call utxo_hash
     mov  rbx, rax           ; slot offset (relative to u)
+    xor  r10, r10            ; probe count (r10 unused elsewhere in this
+                               ; function; neither utxo_hash nor memcmp_asm
+                               ; touch it, so it safely survives both calls
+                               ; below without needing to be pushed/popped)
     ; linear probe from slot
 .probe:
     ; compute slot base = u + rbx
@@ -156,9 +160,18 @@ utxo_put:
     test eax, eax
     jz   .dup
 .next:
-    ; wrap: slot offset spans [40 .. 40 + (mask+1)*48)
+    ; Bounded probe count: with backward-shift deletion an empty slot is
+    ; guaranteed to exist whenever the table isn't genuinely full, and is
+    ; guaranteed to be found within one lap (slot_count probes) of linear
+    ; probing -- so exceeding that here means every slot is occupied and we
+    ; must report full rather than looping forever (mirrors mpool_put's
+    ; existing bounded probe, bitcoin_mempool.asm).
+    inc  r10
     mov  rcx, [r12+8]        ; mask
     inc  rcx                ; slot count
+    cmp  r10, rcx
+    jae  .full
+    ; wrap: slot offset spans [40 .. 40 + (mask+1)*48)
     imul rcx, rcx, 48
     add  rcx, 40            ; region_end_offset
     add  rbx, 48
@@ -327,9 +340,11 @@ utxo_del:
     mov  r12, rdi
     mov  r13, rsi
     mov  r14, rdx
+    mov  r15, [r12+8]      ; mask (persists; needed again in the backward-
+                             ; shift phase below after a hit)
     mov  rdi, r13
     mov  rsi, r14
-    mov  rdx, [r12+8]
+    mov  rdx, r15
     call utxo_hash
     mov  rbx, rax
 .probe:
@@ -363,9 +378,88 @@ utxo_del:
 .pc:
     jmp  .probe
 .hit:
+    ; ---- backward-shift deletion (NO tombstones) ----
+    ; Plain "mark empty" here would break the invariant utxo_get/utxo_put's
+    ; probes depend on: any key that collided with this one and got pushed
+    ; past it during insertion would become unreachable the moment this slot
+    ; goes empty, since their own probe stops at the first empty slot it
+    ; meets. Instead we open a "gap" at the deleted slot and walk forward,
+    ; pulling back any later entry whose ideal (hash) slot lies at-or-before
+    ; the gap in the forward probe order -- the standard backward-shift
+    ; algorithm for linear-probed open addressing (Knuth Vol 3 Algorithm R).
+    ; This keeps "empty slot terminates a probe" true at all times, so
+    ; utxo_get/utxo_put need no changes at all.
+    ;
+    ; rbx currently holds the found slot's BYTE offset; convert to a
+    ; 0-based slot index (r13) since the wraparound distance comparison
+    ; below needs modular arithmetic, and slot count (mask+1) is a power of
+    ; two while the byte stride (48) is not.
+    mov  rax, rbx
+    sub  rax, 40
+    xor  edx, edx
+    mov  ecx, 48
+    div  ecx
+    mov  r13, rax              ; r13 = i (0-based gap index)
+
     lea  rdx, [r12+rbx]
-    mov  dword [rdx+40], 0xFFFFFFFF   ; mark empty
-    dec  qword [r12]
+    mov  dword [rdx+40], 0xFFFFFFFF   ; open the gap
+    dec  qword [r12]                  ; n--
+
+    mov  r14, r13               ; j := i (advanced before first use below)
+.bs_loop:
+    inc  r14
+    and  r14, r15                ; j = (j+1) & mask  (r15 = mask, loaded above)
+    mov  rax, r14
+    imul rax, rax, 48
+    add  rax, 40
+    add  rax, r12                ; rax = &slot[j]
+    mov  ecx, [rax+40]           ; slot[j]'s index field
+    cmp  ecx, 0xFFFFFFFF
+    je   .bs_done                 ; genuine empty: hole fully propagated, stop
+    mov  rbx, rax                 ; rbx = &slot[j] (persists across the call)
+    push rbx
+    push r13
+    push r14
+    lea  rdi, [rbx+8]              ; txid ptr = slot[j]'s stored txid
+    mov  esi, ecx                   ; index = slot[j]'s stored index
+    mov  rdx, r15                    ; mask
+    call utxo_hash                    ; rax = byte offset of slot[j]'s home slot
+    pop  r14
+    pop  r13
+    pop  rbx
+    sub  rax, 40
+    xor  edx, edx
+    mov  ecx, 48
+    div  ecx                          ; rax = k (0-based home slot index)
+    ; is i within [k, j) walking forward from k, modulo capacity? i.e. is
+    ; the gap on slot[j]'s own probe path from its home to where it sits?
+    mov  rcx, r13
+    sub  rcx, rax
+    and  rcx, r15                     ; rcx = d_i = (i - k) & mask
+    mov  rdx, r14
+    sub  rdx, rax
+    and  rdx, r15                     ; rdx = d_j = (j - k) & mask
+    cmp  rcx, rdx
+    jae  .bs_loop                     ; not safe to move -- leave slot[j], keep scanning
+    ; safe: pull slot[j] back into the gap at i, then the gap moves to j.
+    mov  rax, r13
+    imul rax, rax, 48
+    add  rax, 40
+    add  rax, r12                     ; rax = &slot[i]
+    mov  rdi, rax
+    mov  rsi, rbx
+    mov  rcx, 48
+    push rbx
+    push r13
+    push r14
+    call memcpy_asm
+    pop  r14
+    pop  r13
+    pop  rbx
+    mov  dword [rbx+40], 0xFFFFFFFF   ; the old slot[j] position is now empty
+    mov  r13, r14                     ; i := j (gap follows the moved entry)
+    jmp  .bs_loop
+.bs_done:
     mov  eax, 1
     jmp  .done3
 .miss:
