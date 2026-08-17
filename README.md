@@ -606,7 +606,7 @@ bitcoinmachinecode/
 |       +-- sync_chain.sh     # chains hole-fill into extending to the real tip
 |       +-- peerstats.sh      # tail -f the live dl_catchup peer/bandwidth status log
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
-|       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
+|       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks); dup detector uses bitcoin_idx.asm's idx_put (was O(n^2), ~680x on the real archive)
 |       +-- verify.c          # full chain validation (hash/chain/PoW/consensus)
 |       +-- dumpblock.c       # inspect a stored block (raw bytes / header summary)
 |       +-- nodecheck.sh      # one-shot health: audit + progress + serve round-trip

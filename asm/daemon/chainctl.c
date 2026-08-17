@@ -21,15 +21,20 @@
 #include <sys/wait.h>
 #include <time.h>
 
+extern long idxscan_tip(void);
+
 static long archive_tip(const char* dir){
-    /* highest height with a non-zero 48-byte index record (positional format). */
-    char p[600]; snprintf(p,sizeof p,"%s/index.dat",dir);
-    struct stat sb; if(stat(p,&sb)||sb.st_size<48) return -1;
-    long n=sb.st_size/48;
-    FILE* f=fopen(p,"rb"); if(!f) return -1;
-    unsigned char rec[48]; long mh=-1;
-    for(long h=n-1;h>=0;h--){ if(fseek(f,h*48,SEEK_SET)==0 && fread(rec,1,48,f)==48 && (rec[0]||rec[1]||rec[2]||rec[3])){ mh=h; break; } }
-    fclose(f);
+    /* highest height with a non-zero 48-byte index record (positional format).
+     * Was a per-record fseek+fread backward scan; idxscan_tip (bitcoin_idx-
+     * scan.asm) does the same buffered-pread64 scan already used by the
+     * live daemon's dl_catchup. idxscan_tip operates on "index.dat" in CWD,
+     * so chdir into dir for the call and restore CWD afterward (nothing
+     * else in this file depends on staying in a particular directory --
+     * every other path is built explicitly from dir or absolute). */
+    char cwd[600]; if(!getcwd(cwd,sizeof cwd)) return -1;
+    if(chdir(dir)!=0) return -1;
+    long mh = idxscan_tip();
+    if(chdir(cwd)!=0) { perror("chdir back"); }
     return mh;
 }
 static long header_count(const char* dir){
