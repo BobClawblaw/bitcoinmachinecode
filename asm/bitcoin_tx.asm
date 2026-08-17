@@ -466,14 +466,22 @@ tx_txid:
     push r13
     push r14
     push r15
-    sub  rsp, 8
+    sub  rsp, 24              ; two 8-byte scratch locals + 8 padding for
+                               ; 16-byte call alignment (6 pushes leave
+                               ; rsp%16==8, so we need a %16==8 subtraction)
 
     mov  r12, rdi            ; out
     mov  r13, rsi            ; tx
     mov  r15, rdx            ; txlen
     mov  r14, rcx            ; buf
-    mov  [rbp-0x30], r8      ; buflen (stack local below the r15 save at -0x28;
-                             ; rbx is clobbered by the walk)
+    mov  [rbp-0x30], r8      ; buflen -- stack local; scratch region is
+                             ; [rbp-0x40..rbp-0x29], strictly below the r15
+                             ; save slot at rbp-0x28, so it cannot alias any
+                             ; pushed callee-saved register (rbx/rbp/r12-r15)
+                             ; the way [rbp-0x18] used to (that offset landed
+                             ; exactly on the pushed r13 slot and silently
+                             ; corrupted it -- confirmed via a register-probe
+                             ; test that showed r13 clobbered on every call).
 
     lea  r9,  [r13+r15]      ; end = tx + txlen
 
@@ -493,11 +501,11 @@ tx_txid:
 
     ; inputs_start pointer = tx+4 (legacy) or tx+6 (segwit); save it.
     lea  r8,  [r13+4]
-    mov  [rbp-0x18], r8
+    mov  [rbp-0x38], r8
     test r11d, r11d
     jz   .have_cur
     lea  r8,  [r13+6]
-    mov  [rbp-0x18], r8
+    mov  [rbp-0x38], r8
 .have_cur:
 
     ; ---- varint n_in (r10d = n_in) ----
@@ -657,7 +665,7 @@ tx_txid:
     ;   part2 = mid = tx[inputs_start .. outputs_end]
     ;   part3 = locktime = tx[end-4 .. end]
     ; mid_len = outputs_end - inputs_start_ptr
-    mov  rsi, [rbp-0x18]     ; inputs_start_ptr
+    mov  rsi, [rbp-0x38]     ; inputs_start_ptr
     sub  r8,  rsi            ; mid_len
     mov  rcx, r8             ; rcx = mid_len
 
@@ -672,7 +680,7 @@ tx_txid:
     mov  ecx, 4
     rep  movsb
     ; copy mid (rcx = mid_len)
-    mov  rsi, [rbp-0x18]
+    mov  rsi, [rbp-0x38]
     mov  rcx, r8             ; mid_len
     rep  movsb
     ; copy locktime (4 bytes)
@@ -693,7 +701,7 @@ tx_txid:
 .fail:
     xor  eax, eax
 .ret:
-    add  rsp, 8
+    add  rsp, 24
     pop  r15
     pop  r14
     pop  r13
