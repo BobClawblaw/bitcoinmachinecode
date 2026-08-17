@@ -4,13 +4,17 @@
 >
 > **This is actively developed, highly experimental software.** It implements
 > Bitcoin node functionality as hand-rolled x86-64 assembly produced by an AI. It
-> has NOT been audited by any independent third party. **You should treat this
-> code as untrusted and dangerous.** A bug in consensus, cryptographic, or
-> networking logic can cause loss of funds, chain divergence, resource
-> exhaustion, or exposure of your machine to the network. Do **not** run it with
-> real funds, on a production machine, or on an internet-exposed host, and do
-> not rely on it for any security-sensitive purpose — until it has undergone an
-> independent security audit. Use at your own risk.
+> has NOT been audited by any independent human reviewer. The project has gone
+> through multiple rounds of AI-driven security review (see
+> `validation/SECURITY_AUDIT.md`), and issues found that way get fixed as they
+> come up — but that internal process is not a substitute for independent human
+> sign-off, and no such review has happened yet. **You should treat this code as
+> untrusted and dangerous.** A bug in consensus, cryptographic, or networking
+> logic can cause loss of funds, chain divergence, resource exhaustion, or
+> exposure of your machine to the network. Do **not** run it with real funds, on
+> a production machine, or on an internet-exposed host, and do not rely on it
+> for any security-sensitive purpose — until it has undergone an independent
+> human security audit. Use at your own risk.
 
 A Bitcoin node for Linux built as **100% AI-generated machine code** — every line of
 assembly is authored by an AI assistant, none by a human. The security-critical
@@ -112,11 +116,9 @@ real Bitcoin difficulty algorithm and are proven against real mainnet nBits;
 and the node reproduces a live-downloaded real block-1 hash. **The block-body
 download + store tail is now exercised end to end against a REAL node: real
 mainnet block bodies are downloaded, cons_verify-validated as VALID, and
-stored.** (The initial live proof used the cooperative local node
-192.168.5.69:8333, but the production download no longer depends on it — block
-bodies come from a large pool of verified **internet** peers via distinct-peer
-selection, and while a local node is still tried first only as a *header* source,
-the bulk of the chain is pulled in parallel from internet peers.) The
+stored** — block bodies come from a large pool of verified **internet** peers
+via distinct-peer selection, discovered entirely through the node's own DNS-seed
+bootstrap (no cooperative/local test peer involved). The
 long-standing "seeds drop block-body getdata" wall was root-caused to our own
 malformed getdata: `p2p_getdata_block`
 emitted a 34-byte message (type as a 1-byte varint) that real nodes silently
@@ -166,30 +168,45 @@ printf. Found with a hardware write watchpoint on the stdout slot; fixed by
 loading the length into `RDX`. The test suite stays 33/33 green throughout.
 
 
-**Full-chain download into ONE directory (>= 8 DISTINCT peers, NO worker dirs):**
-`daemon/unified_ibd.c` downloads the whole chain in parallel — the asm
-`node_ibd_headers` persists the header chain, then each worker runs
-`node_ibd_blocks_s` (asm) to download / `cons_verify` / validate per block. Every
-block is written **directly into the single archive** in `data/` via the
-concurrent-safe asm `store_append_shared`: each append is flock-serialized on
-`append.lock`, the block lands at the true file end of the rolling
-`blkNNNNN.dat`, and the index record goes positionally at `height*48` (index.dat
-pre-sized). No per-worker block directories exist — the archive is one
-directory holding only `blk00000.dat`..`blkNNNNN.dat`, `index.dat`, `headers.dat`.
-Workers each keep a private `/tmp` header-store file (never touching
-`data/headers.dat`), which fixed a deterministic worker-boundary corruption bug.
-Peer distinctness is guaranteed across the whole run via a flock-locked
-`peerclaims` table (no two workers on the same peer). Real-mainnet
-header-continuity bug found and fixed (see LOG #12). `daemon/chainctl.c` drives
-the whole chain forward in audited chunks (16k, resumable from the archive tip,
-per-chunk `check_chain` audit + throughput/ETA). **Backfill:** because the
-forward pass resumes from the existing tip, the missing early heights can be
-fetched by a `unified_ibd <dir> N <lo> <hi>` run whose range lies BELOW the tip:
-the loader detects this as a backfill, preserves the requested range, keeps the
-index grow-only (never truncates the forward archive), uses a per-process
-peerclaims table, and reuses the existing `headers.dat` (no rewrite) so it can
-run CONCURRENTLY with the forward chainctl — the two fill the archive from both
-ends with zero duplicate blocks.
+**Built-in multi-peer catch-up (`bitcoind serve`, no external tooling needed):**
+the daemon now self-heals on its own — `main.c`'s `dl_catchup` runs
+synchronously at boot, before the node ever opens for service: it discovers
+peers via the existing DNS-seed bootstrap (`dl_bootstrap`/`dl_pool_from_book`,
+the same discovery `serve_download_worker` already used), extends
+`headers.dat` incrementally to the real chain tip, computes the current archive
+gap directly from `index.dat` (any hole below the stored tip, plus everything
+missing up to the real tip, as ONE combined span), and forks `>=8` chunk-claiming
+worker processes to fill it. Workers pull 200-block chunks from a shared
+`mmap`'d atomic counter (work-stealing — a worker that lands fast peers just
+keeps claiming more chunks instead of idling on a static pre-split share),
+skip any chunk that's already fully archived (so the same span safely covers
+both real gaps and already-filled heights in one pass), and reuse a persistent
+peer connection across chunks instead of reconnecting per chunk. Peer liveness
+is checked via a bounded non-blocking-connect probe (several rounds, never a
+blind blocking connect to an unconfirmed host — that has no connect-phase
+timeout and can hang for minutes on a black-holed peer). Self-throttling: a
+node that's already caught up returns from `dl_catchup` almost instantly (pure
+disk reads, no network), so it's safe to run unconditionally on every boot.
+
+**Standalone bulk-download tool (`daemon/unified_ibd.c`):** the same
+chunk-claiming/work-stealing engine as a manual ops tool, useful for a very
+large initial catch-up or offline reindexing outside the daemon's own
+boot path. Every block is written **directly into the single archive** in
+`data/` via the concurrent-safe asm `store_append_shared`: each append is
+flock-serialized on `append.lock` (each worker opens its own fd — `flock()`
+locks belong to the open file description, so a fork-inherited fd would not
+actually exclude sibling workers from each other), the block lands at the true
+file end of the rolling `blkNNNNN.dat`, and the index record goes positionally
+at `height*48` (index.dat pre-sized, grow-only). No per-worker block
+directories exist — the archive is one directory holding only
+`blk00000.dat`..`blkNNNNN.dat`, `index.dat`, `headers.dat`. Peer distinctness
+is guaranteed via a flock-locked `peerclaims` table, with a deep peer pool
+(all of `good_internet_peers.txt`, not just a small prefix) and a live-retry
+fallback for peers that looked down at the one-time startup probe. Driver
+scripts: `hole_ranges.py` (finds gaps in `index.dat`), `backfill_holes.sh`
+(one combined-span `unified_ibd` call over them), `sync_chain.sh` (chains
+hole-fill into extending to the real tip). Real-mainnet header-continuity bug
+found and fixed (see LOG #12).
 
 **Wallet / validation bridge (complete)** — the node now validates and signs real
 transactions in machine code, on top of the verified asm crypto. All of this was
@@ -557,7 +574,10 @@ bitcoinmachinecode/
 |   +-- validation/           # Python big-int oracles (trusted reference)
 |   +-- daemon/               # C orchestration + peer discovery/serving tools
 |       +-- wallet_cli.c      # wallet CLI: addr/sign/send/sendtoaddress/balance/getnewaddress/getrawchangeaddress/getaddressinfo/validateaddress/gettxout/listunspent/decoderawtransaction/signrawtransactionwithkey + mnemonic/seed
-|       +-- unified_ibd.c     # full-chain download into a unified single store (forward + backfill)
+|       +-- unified_ibd.c     # standalone bulk-download tool: chunk-claiming/work-stealing engine (same design bitcoind's own built-in dl_catchup uses)
+|       +-- hole_ranges.py    # find gaps in index.dat (unified_ibd's driver)
+|       +-- backfill_holes.sh # one combined-span unified_ibd call over current holes
+|       +-- sync_chain.sh     # chains hole-fill into extending to the real tip
 |       +-- chainctl.c        # chunked full-chain orchestrator (resume/audit/ETA)
 |       +-- check_chain.c     # integrity audit (dups/holes/corruption, chain-breaks)
 |       +-- verify.c          # full chain validation (hash/chain/PoW/consensus)
@@ -567,7 +587,7 @@ bitcoinmachinecode/
 |       +-- crawler.c         # parallel getaddr peer harvester
 |       +-- addrgather.c      # getaddr -> addr/addrv2 -> peers.dat address book
 |       +-- peertest.c        # verify which peers serve block bodies
-|       +-- main.c            # daemon: sync / ibd / follow / serve / server-test
+|       +-- main.c            # daemon: sync / ibd / follow / serve (self-healing built-in catch-up) / server-test
 |       +-- cli.c             # thin driver for the asm cli_main
 +-- data/                    # durable chain storage: ONE unified archive
 |                           # (blk00000.dat..blkNNNNN.dat + index.dat + headers.dat)
@@ -589,13 +609,18 @@ cd /storage/bitcoinmachinecode/asm/daemon
                                                      # (headers-first persist +
                                                      # getdata block bodies +
                                                      # validate + store)
-# full-chain download into a UNIFIED single store (parallel, >=8 DISTINCT peers,
-# no shard dirs, resumable from the store tip):
+# self-healing: discovers peers, fills any archive gap AND catches up to the
+# real chain tip on its own (dl_catchup, >=8 chunk-claiming workers), THEN
+# opens for inbound service -- no external tooling needed for normal operation:
+./bitcoind serve /storage/bitcoinmachinecode/data 8333
+
+# standalone bulk-download tool (same chunk-claiming engine as dl_catchup),
+# for a very large initial catch-up or offline reindexing:
 ./unified_ibd /storage/bitcoinmachinecode/data 8 <start_h> <end_h>
+./backfill_holes.sh /storage/bitcoinmachinecode/data 8   # fill every current gap
+./sync_chain.sh /storage/bitcoinmachinecode/data 8       # gaps, then extend to real tip
 # chunked full-chain orchestrator (forward to tip, resuming + auditing each chunk):
 ./chainctl /storage/bitcoinmachinecode/data 8 16000 20
-# backfill early heights below the existing tip (runs safely alongside chainctl):
-./unified_ibd /storage/bitcoinmachinecode/data 8 0 29999
 # health / progress / audit / serve round-trip:
 ./nodecheck.sh /storage/bitcoinmachinecode/data        # audit + progress + serve
 ./chainprogress.sh /storage/bitcoinmachinecode/data    # coverage toward 0..tip
