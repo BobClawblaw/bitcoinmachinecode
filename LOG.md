@@ -7,6 +7,64 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17 -- crawler.c FORK-STATE BUG FIXED; addrgather.c INVESTIGATED AND LEFT ALONE
+### Goal and outcome
+Fifth pass today. A fresh asm-candidate survey found no strong "next
+check_chain" (bitcoin_mempool_policy.c has the right O(n^2) shape --
+find_node/find_outreg/find_claim linear-scan the mempool per input -- but
+zero call sites from the daemon; tx-relay isn't wired into main.c yet, so
+there's nothing real to benchmark). Picked up a correctness bug the survey
+flagged in passing instead: `crawler.c`/`addrgather.c` both fork() per-seed
+discovery workers, and the initial read was that per-worker state never
+propagates back to the parent, leaving the final report/output empty.
+### Verification before fixing anything
+Checked both files independently rather than trusting the shared
+characterization, since they turned out to differ:
+- `crawler.c`: CONFIRMED broken. `seen[MAXSEEN][40]`/`seen_n` were a plain
+  static array; each fork()'d child got its own copy-on-write private
+  copy, so no child's `mark_seen()` was ever visible to the parent.
+  `out_file` was always written empty; the "crawl complete: N distinct"
+  summary always reported N=0. (Live discoveries themselves weren't lost --
+  each child's `printf()` goes through the inherited, genuinely-shared
+  stdout fd -- only the in-memory dedup table and anything built from it
+  in the parent afterward were broken.)
+- `addrgather.c`: NOT broken this way. Reading `bitcoin_addrmgr.asm`
+  showed `amr_add`/`amr_count` are entirely file-backed via a single fd
+  (`peers.dat`, opened once before fork) -- there is no in-memory table to
+  lose across fork. Verified empirically (throwaway probe: fork N
+  children, each calls `amr_add`, check the parent's `amr_count` after
+  `waitpid`): state correctly survived fork every time. Also stress-tested
+  the theoretical concern -- concurrent children sharing one fd's file
+  offset with an unprotected `lseek`+`write` pair -- two ways: 40
+  concurrent children adding DISTINCT IPs (expect all 40 land), and 40
+  concurrent children all adding the SAME IP (expect exactly 1, exercising
+  the dup-check race). 5/5 trials each, zero lost writes, zero duplicates
+  -- the shared-fd semantics correctly serialize at the kernel level in
+  practice. Left the file untouched: no evidence of a real problem to fix.
+### Fix (crawler.c only)
+Moved `seen[]`/`seen_n` into a `mmap(MAP_SHARED|MAP_ANONYMOUS)` region
+created in the parent before the fork loop, so every child inherits the
+same physical pages instead of a private copy. The check-and-insert
+(`is_seen`+`mark_seen`) still needed cross-process mutual exclusion --
+two children could otherwise both pass `is_seen()` for the same endpoint
+before either called `mark_seen()`, or race on the shared `seen_n` slot
+index -- guarded with `flock()` on a dedicated lock file derived from the
+output path (`<out_file>.lock`). Per the flock lesson already established
+elsewhere in this codebase (`store_append_shared` etc.): each child opens
+its OWN fd to the lock file rather than inheriting one from the parent,
+since flock locks belong to the open file description, not the path --
+a fork-inherited fd would not actually provide mutual exclusion between
+siblings.
+### Verified (hard evidence)
+Wrote a throwaway probe mirroring the exact mechanism: 30 concurrent
+children, each marking 3 endpoints distinct to itself plus 2 shared across
+every child (exercising the propagation fix and the dedup-race guard
+together). Parent's final `*seen_n` and the written `out_file`'s line
+count both correctly landed on 92 (= 30*3 + 2 deduped) across 3/3 runs --
+previously would have been 0 / an empty file. Full `make test`: 65/65
+green, exit 0 (`crawler.c` isn't a Makefile/test-suite target, built and
+verified manually).
+
 ## 2026-08-17 -- unified_ibd.c's LAST TWO RAW index.dat SCANS SWAPPED TO idxscan_*
 ### Goal and outcome
 Fourth asm-adjacent pass today. A fresh survey (deliberately checking
