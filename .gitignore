@@ -166,6 +166,11 @@ asm/tests/test_bip30
 # the tx_txid r13-clobber bug) ----
 asm/tests/debug_regsave
 
+# ---- utxo/mempool deletion regression tests (backward-shift fix) ----
+asm/tests/debug_utxo_tombstone
+asm/tests/test_utxo_delete_stress
+asm/tests/test_mpool_delete_stress
+
 # ---- Kanban board mirror files (local tracking only; never publish) ----
 KANBAN.md
 **/KANBAN.md

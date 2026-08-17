@@ -349,9 +349,7 @@ mpool_del:
     lea  r11, [r12+r15]      ; slot
     mov  rax, [r11]
     cmp  rax, r9
-    je   .dmiss              ; empty slot -> not present (in open addressing with
-                             ;  no tombstones this is correct: if we hit a hole the
-                             ;  key was never inserted)
+    je   .dmiss
     ; compare txid (memcmp32 length in RDX)
     mov  rdi, r13
     lea  rsi, [r11+8]
@@ -372,8 +370,83 @@ mpool_del:
     inc  r8
     jmp  .dprobe
 .dhit:
-    mov  qword [r11], r9     ; mark slot empty
-    dec  qword [r12]         ; n--
+    ; ---- backward-shift deletion (NO tombstones) ----
+    ; Plain "mark empty" would break the invariant mpool_get/mpool_put's
+    ; probes rely on: a later entry that collided with this one and got
+    ; pushed past it during insertion would become unreachable the moment
+    ; this slot goes empty, since a probe stops at the first empty slot it
+    ; meets. Instead we open a gap here and walk forward, pulling back any
+    ; later entry whose home (hash) slot lies at-or-before the gap in probe
+    ; order -- see bitcoin_utxo.asm's utxo_del, fixed identically (mempool
+    ; and utxo share this exact open-addressing/lazy-delete shape, and this
+    ; file's own pre-existing comment claiming "no tombstones is correct
+    ; here" was the same mistaken reasoning, empirically disproven by a
+    ; forced-collision reproduction against utxo_del before this fix).
+    ;
+    ; r15 currently holds the found slot's BYTE offset; convert to a
+    ; 0-based slot index (r13) for the modular distance comparison below
+    ; (slot count is a power of two; the 48-byte stride is not, so we
+    ; convert once here rather than mask byte offsets directly).
+    mov  rax, r15
+    sub  rax, 40
+    xor  edx, edx
+    mov  ecx, 48
+    div  ecx
+    mov  r13, rax              ; r13 = i (0-based gap index)
+
+    mov  qword [r11], r9        ; open the gap (r11 = &slot[i]; r9 = EMPTY)
+    dec  qword [r12]            ; n--
+
+    mov  r14, r13                ; j := i (advanced before first use below)
+.mbs_loop:
+    inc  r14
+    mov  r10, [r12+8]              ; mask
+    and  r14, r10                   ; j = (j+1) & mask
+    mov  rax, r14
+    imul rax, rax, 48
+    add  rax, 40
+    add  rax, r12                    ; rax = &slot[j]
+    mov  rcx, [rax]                   ; slot[j].len field
+    cmp  rcx, r9
+    je   .mbs_done                     ; genuine empty: hole fully propagated
+    mov  r15, rax                       ; r15 = &slot[j] (persists across call)
+    push r13
+    push r14
+    lea  rdi, [r15+8]                    ; txid ptr = slot[j]'s stored txid
+    mov  rsi, [r12+8]                      ; mask
+    call mpool_hash                         ; rax = byte offset of slot[j]'s home
+    pop  r14
+    pop  r13
+    sub  rax, 40
+    xor  edx, edx
+    mov  ecx, 48
+    div  ecx                                 ; rax = k (0-based home slot index)
+    mov  r10, [r12+8]                         ; mask
+    mov  r8, r13
+    sub  r8, rax
+    and  r8, r10                               ; r8 = d_i = (i - k) & mask
+    mov  r11, r14
+    sub  r11, rax
+    and  r11, r10                               ; r11 = d_j = (j - k) & mask
+    cmp  r8, r11
+    jae  .mbs_loop                               ; not safe to move -- keep scanning
+    ; safe: pull slot[j] back into the gap at i, then the gap moves to j.
+    mov  rax, r13
+    imul rax, rax, 48
+    add  rax, 40
+    add  rax, r12                                 ; rax = &slot[i]
+    mov  rdi, rax
+    mov  rsi, r15
+    mov  rdx, 48
+    push r13
+    push r14
+    call mcopy                                      ; mcopy(dst=rdi,src=rsi,n=rdx)
+    pop  r14
+    pop  r13
+    mov  qword [r15], r9                             ; old slot[j] position empty now
+    mov  r13, r14                                     ; i := j (gap follows the move)
+    jmp  .mbs_loop
+.mbs_done:
     mov  eax, 1
     jmp  .dret
 .dmiss:
