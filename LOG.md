@@ -7,6 +7,85 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17 -- secp256k1_fe.asm: fe_mul REWRITTEN WITH adcx/adox PARALLEL CHAINS (1.13x, FULLY VERIFIED)
+### Goal and outcome
+A different question this time: not more C-to-asm conversion, but whether
+EXISTING asm crypto primitives could be faster with better instruction
+selection. `fe_mul`/`fe_sqr` (secp256k1 field multiplication -- the single
+most-executed operation during ECDSA verify, since it's called dozens of
+times per point add/double) was still plain schoolbook `mul`/`adc`, no
+BMI2 (`mulx`) or ADX (`adcx`/`adox`), despite the host CPU (AMD Ryzen 9
+9950X3D) supporting both. Separately confirmed `sha256.asm` is already
+optimal (CPUID-gated SHA-NI hardware dispatch, correctly active on this
+host) -- nothing to do there.
+### Attempt 1 (conservative): mulx substitution only
+Given the stakes (this underlies every signature verification in the
+node), first tried the conservative option: swapped `mul` for `mulx` in
+Phase 1 (the 256x256->512-bit schoolbook multiply) only, leaving the
+accumulation structure and all of Phase 2 (reduction) byte-for-byte
+untouched. Verified rigorously (100M random trials vs the original + an
+independent `__uint128_t` reference, zero mismatches; full `make test`
+65/65 green) before even measuring it. Result: 82.5 -> 83.7 Mops/s,
+**~1.015x** -- the real bottleneck (the serial dependency between each
+term's carry-out, threaded through one register across all 4 terms of a
+row) wasn't touched by swapping just the multiply instruction.
+### Measuring the real ceiling before attempting more
+Rather than trust the general BMI2/ADX literature figures (~20-35%) at
+face value, measured where fe_mul's time actually goes: built a
+Phase-1-only variant and timed it against the full function. **Phase 1 is
+~81% of total cost, Phase 2 ~19%** -- translating the literature's
+Phase-1-only figure into a more realistic ~20-25% END-TO-END estimate for
+this codebase's specific reduction strategy. This is what justified
+attempting the fuller rewrite.
+### Attempt 2: adcx/adox parallel chains
+Four independent row computations (`a[i]*B`, each 1x4->5 limbs), rows 0/2
+via the `adcx` chain (CF), rows 1/3 via `adox` (OF) -- two rows using
+DIFFERENT flags share no dependency, so the CPU can overlap e.g. row 1's
+work with row 0's still-retiring chain (the actual mechanism these
+speedups come from; attempt 1 kept everything on one serial chain). Each
+row writes to its own scratch buffer; the 4 rows are combined into the
+final 8-limb product via a separate, deliberately low-risk `add`/`adc`
+merge (same ripple-carry style already proven elsewhere in this file).
+Every row opens with `xor ecx,ecx` (clears both CF and OF) so no row
+inherits a stale carry from an earlier row sharing its flag.
+### A real bug, caught immediately by the verification pipeline
+First build crashed on the very first call, zero output before segfault.
+gdb: `rip=0`, every register zeroed. Root cause: the prologue's stack
+allocation grew from 64 to 224 bytes (for the new row buffers) but the
+epilogue still deallocated only 64 -- a 160-byte mismatch that corrupted
+the return address on every call. The same class of bug this codebase's
+own "golden rule" warns about (scratch overlapping saved state), just via
+a mismatched prologue/epilogue pair rather than an overlapping slot. Fixed
+by matching the epilogue to the new allocation size; never got near
+`make test`, let alone production, before being caught.
+### Verified (same rigor as attempt 1, repeated against the TRUE original)
+- Built the true original (pre-any-change, straight from `git show
+  HEAD:...`) under renamed symbols for a clean side-by-side comparison,
+  plus the same independent third reference.
+- 150,000,000 random trials + edge cases (0, 1, p-1, p, all pairwise
+  combinations, forced out-of-canonical-range operands on a fraction):
+  zero mismatches vs the original, zero mismatches vs the independent
+  reference.
+- Full `make test`: 65/65 green.
+- Same live-daemon-independence facts as attempt 1 still hold: `cons_verify`
+  (used by `dl_catchup`'s block download) doesn't call into secp256k1/
+  fe_mul at all, and `secp256k1_fe.o` isn't linked into `DAEMONOBJS` --
+  only test binaries and `wallet_cli`. No live-daemon redeployment
+  applicable.
+### Benchmark, and an honest diagnosis of the remaining gap
+fe_mul throughput, 30M calls: 83.8 -> 94.7 Mops/s, **~1.13x**. Better than
+attempt 1 but short of the ~20-25% estimate -- isolating the row
+computation alone shows it really did get ~44% faster (0.3035s -> 0.1693s
+per 30M calls), but the separate merge pass this design needs (rows write
+to independent buffers rather than accumulating in place) costs ~0.078s,
+consuming roughly 58% of the raw row-computation savings. The clean row
+independence that made the parallel chains safe to reason about is also
+what gives most of the gain back. A design that accumulates in place while
+still using two chains could close that gap further, but reintroduces much
+of the complexity/risk the independent-rows approach was chosen to avoid,
+for a return that's already diminishing at this point -- not pursued.
+Shipped as the final version, replacing attempt 1.
+
 ## 2026-08-17 -- crawler.c FORK-STATE BUG FIXED; addrgather.c INVESTIGATED AND LEFT ALONE
 ### Goal and outcome
 Fifth pass today. A fresh asm-candidate survey found no strong "next
