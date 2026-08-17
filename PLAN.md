@@ -538,7 +538,7 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   the .pass file). Wallet + .pass are gitignored (regenerable); the address
   book is versioned.
 - **Address book** (`asm/wallet_book.c`): `wallet_cli abook add|set|get|rm|list`
-  name->address mapping in 0600 config/addressbook.dat (own textual BMCABK v1
+  name->address mapping in 0600 data/addressbook.dat (own textual BMCABK v1
   format). Seeded with the session's real addresses:
   `user-other-wallet` = bc1qyz34yshtf5m0ct0ffpxrxlhak4mzx2kdvx07qp; and our
   dev wallet P2WPKH/P2PKH.
