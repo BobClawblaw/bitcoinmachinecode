@@ -14,6 +14,12 @@
 #include <unistd.h>
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
+extern void idx_init(void* idx, unsigned long slots);
+extern int  idx_put(void* idx, const unsigned char hash[32], long height);
+
+static unsigned long next_pow2(unsigned long v){
+    unsigned long p=1; while(p<v) p<<=1; return p;
+}
 int main(int argc,char**argv){
     const char* dir = argc>1? argv[1] : ".";
     int deep = argc>2 && !strcmp(argv[2],"deep");
@@ -54,21 +60,27 @@ int main(int argc,char**argv){
             { if(first_problem<0)first_problem=h; consbad++; }
     }
     if(blk)fclose(blk);
-    /* duplicates: any hash appearing at 2+ stored heights */
+    /* duplicates: any hash appearing at 2+ stored heights.
+     * Was a naive linear scan against every previously-seen hash per record
+     * (genuinely O(n^2) despite the old comment claiming O(n)) -- at the
+     * real archive size (~962,831 blocks) that's ~4.6e11 comparisons, and
+     * chainctl.c reruns this after every ~8000-block chunk during a full
+     * IBD, so the cost compounds across a run. Fixed with the same O(1)-
+     * amortized hash-table insert (idx_init/idx_put, bitcoin_idx.asm) used
+     * to build the live daemon's O(1) serving index -- idx_put's own return
+     * (1 new / 0 dup) does the dedup check in one pass. */
     long dups=0;
     {
-        /* naive O(n) via a simple hash->count map (bounded: mainnet ~1.1M blocks) */
-        /* use a dict of first-30-bytes to detect repeats */
-        static unsigned char seen[1<<20][30]; static unsigned char* s1=(unsigned char*)seen;
-        long scnt=0;
+        unsigned long slots = next_pow2((unsigned long)n*4 + 1024); /* ~25% load factor, headroom for archive growth */
+        unsigned char* ht = malloc(24 + (size_t)slots*48 + 64);
+        if(!ht){ printf("dup-check alloc failed\n"); return 1; }
+        idx_init(ht, slots);
         for(long h=0;h<n;h++){
             unsigned char* rec=idx+h*48;
             if(rec[0]==0&&rec[1]==0&&rec[2]==0&&rec[3]==0) continue;
-            int found=0;
-            for(long k=0;k<scnt && !found;k++){ if(!memcmp(s1+k*30,rec+2,30)){ found=1; } }
-            if(!found && scnt < (1<<20)){ memcpy(s1+scnt*30,rec+2,30); scnt++; }
-            else if(found){ dups++; }
+            if(idx_put(ht, rec, h)==0) dups++;   /* 0 == exact 32-byte hash already present */
         }
+        free(ht);
     }
     printf("== check_chain %s (heights 0..%ld) ==\n", dir, n-1);
     printf("  index records : %ld\n", n);

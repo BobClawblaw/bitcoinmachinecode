@@ -7,6 +7,65 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17 -- check_chain.c O(n^2) DUP DETECTOR FIXED + chainctl.c archive_tip SWAPPED TO idxscan_tip
+### Goal and outcome
+Third asm-adjacent fix today (candidate found via a fresh survey of
+asm/daemon/*.c for hot loops still using the superseded per-record C
+patterns already replaced elsewhere): `check_chain.c` (standalone archive
+integrity-audit tool, not the live `dl_catchup` daemon) had a genuinely
+O(n^2) duplicate-block-hash detector -- a nested loop comparing every new
+record's hash against every previously-seen hash, despite its own comment
+claiming "naive O(n)". At the real archive size (~962,831 blocks) that's
+~4.6e11 comparisons; `chainctl.c` (the orchestrator that drives
+`check_chain` after every ~8000-block chunk during a full IBD) reruns this
+~120 times over a full run with growing n each time, so the cost compounds.
+### Fix
+Reused `idx_init`/`idx_put` (`bitcoin_idx.asm`, written and validated
+earlier today for `build_hash_index`) in place of the manual nested-loop
+scan -- `idx_put`'s own return (1 new / 0 dup) does duplicate detection in
+one O(1)-amortized-per-insert pass, turning the whole thing O(n). Table
+sized dynamically (`next_pow2(n*4+1024)`, ~25% target load factor) so it
+doesn't need retuning as the real archive grows past today's size.
+Also swapped `chainctl.c`'s `archive_tip()` -- a per-record `fseek`+`fread`
+backward scan for the highest non-zero index record, the same pattern
+`idxscan_tip` already replaced in `main.c` -- to call `idxscan_tip()`
+directly via a chdir-in/chdir-out wrapper (idxscan_tip operates on
+"index.dat" in CWD; nothing else in chainctl.c depends on staying in a
+particular directory).
+### Verified (hard evidence)
+- Timed the OLD dup detector on real truncated archive slices to confirm
+  the O(n^2) shape empirically before trusting an extrapolation: 50k->0.36s,
+  100k->1.46s, 150k->3.26s, 300k->13.09s, 400k->23.30s -- fits a quadratic
+  curve almost exactly (e.g. 100k->150k ratio 2.24 vs predicted (150/100)^2
+  = 2.25), confirming no unexpected cache-driven acceleration/deceleration
+  at larger n that would invalidate extrapolating to full scale.
+- NEW version at the same slice sizes: 50k->0.007s, 100k->0.027s,
+  150k->0.034s, 300k->0.079s, 400k->0.089s -- dup counts matched the OLD
+  version exactly at every size (0 at all tested slices).
+- Full real archive (879,800 stored records): OLD extrapolated ~135s vs NEW
+  measured 0.198s (~680x, growing further as the archive does). The full
+  run additionally reported `duplicate rec: 19192` -- an exact match to the
+  duplicate-hash count found completely independently during today's
+  earlier `idx_hash` investigation (own separate verification cross-check).
+- `archive_tip()` verified via gdb calling it directly against a scratch
+  copy of the real archive: returned 881,523, matching the live daemon's
+  own concurrently-reported progress; confirmed CWD correctly restored
+  afterward (chdir-back works, doesn't leave chainctl's other relative-path
+  logic broken).
+- Full `make test`: 65/65 harness blocks green, exit 0 (these are C-only
+  changes to standalone ops tools, not Makefile/test-suite targets, so this
+  confirms no regression to anything the suite does cover).
+### Incident (caught immediately, no damage)
+An early verification attempt ran the real `chainctl` binary directly
+against the LIVE production `data/` directory to sanity-check `archive_tip`
+-- it immediately spawned 8 `unified_ibd` workers against the same archive
+the live `dl_catchup` daemon was actively writing to. Killed within
+seconds (no corruption observed; the archive's flock-based append
+coordination would likely have protected it regardless, but the extra
+network/disk contention against the live sync was unintended and avoidable).
+Redid the check safely: gdb calling `archive_tip()` directly against an
+isolated scratch copy instead of running the full program against live data.
+
 ## 2026-08-17 -- build_hash_index PORTED TO ASM + CRITICAL idx_hash BUG FOUND & FIXED
 ### Goal and outcome
 Follow-on to the idxscan conversion below: identified `build_hash_index`
