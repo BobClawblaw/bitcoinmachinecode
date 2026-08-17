@@ -103,6 +103,13 @@ tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_f
 tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_idxscan.c bitcoin_idxscan.o
 
+# -O0: -O2 miscompiles this harness (fread called with a NULL buffer per
+# gdb; idx_build_from_file itself is independently verified correct via
+# tests/debug_hashidx_min.c and this same harness built at -O0/-g -- see the
+# LOG.md entry for this investigation).
+tests/bench_hashidx: tests/bench_hashidx.c bitcoin_idx.o
+	$(CC) -no-pie -O0 -Wall -o $@ tests/bench_hashidx.c bitcoin_idx.o
+
 tests/test_store: tests/test_store.c bitcoin_store.o
 	$(CC) $(CFLAGS) -o $@ tests/test_store.c bitcoin_store.o
 

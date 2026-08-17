@@ -481,7 +481,17 @@ selection this is the basis for self-directed discovery.
 and **served entirely in assembly**. Serving was rebuilt around an **O(1) in-memory
 hash→height index** built in assembly (`asm/bitcoin_idx.asm`: `idx_init/put/get`,
 open-addressing, full 32-byte keys) — a linear per-height scan never finished on a
-large archive and a single hole aborted it. `asm/bitcoin_serve.asm`
+large archive and a single hole aborted it. The boot-time bulk load
+(`idx_build_from_file`) is buffered `pread64` (same 192KB-window approach as
+`bitcoin_idxscan.asm`) instead of a per-record C loop — was ~186s on the real
+archive, now a fraction of a second, and fixing it surfaced a real bug in
+`idx_hash` itself (not the load loop): it only hashed a key's first 8 bytes,
+and every real block hash's leading bytes are near-zero by proof-of-work
+construction, so real data collided catastrophically (independent of C vs
+asm — the old C loop had the exact same slowdown, just harder to see under
+its own overhead) while synthetic random keys were fine. Fixed by hashing
+the full 32 bytes; also speeds up `idx_get`, used for every live
+`getdata`-by-hash lookup, not just the boot-time build. `asm/bitcoin_serve.asm`
 (`node_serve_loop`) is the per-connection server message loop in pure machine
 code: ping→pong, getaddr→addr (address book), getdata→block (O(1) lookup +
 `node_serve_block`), getheaders (2000x81B pages), inv. The serve daemon
@@ -560,7 +570,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_cons.asm       # full-block consensus check (cons_verify)
 |   +-- bitcoin_cli.asm        # S6 CLI: query the store (cli_main)
 |   +-- bitcoin_addrmgr.asm    # persisted peer address book + addr v1 codecs
-|   +-- bitcoin_idx.asm        # O(1) block hash->height index for serving (idx_*)
+|   +-- bitcoin_idx.asm        # O(1) block hash->height index for serving (idx_*, idx_build_from_file)
 |   +-- bitcoin_idxscan.asm    # buffered index.dat positional scans (idxscan_*, used by dl_catchup)
 |   +-- bitcoin_serve.asm      # inbound server message loop (node_serve_loop)
 |   +-- bitcoin_pubkey.asm     # fe_pow + pubkey_parse: secp256k1 pubkey de/compress

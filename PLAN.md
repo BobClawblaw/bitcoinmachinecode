@@ -478,6 +478,18 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   live archive, benchmarked 4-48x faster (`asm/tests/bench_idxscan.c`).
 - RESUME: dl_catchup (and unified_ibd) read the highest non-zero index record
   and resume automatically; no manual bookkeeping needed between runs.
+- The boot-time O(1) hash->height index build (`build_hash_index`, used for
+  serving `getdata`-by-hash) is also now asm (`bitcoin_idx.asm:
+  idx_build_from_file`). Converting it surfaced a critical PRE-EXISTING bug,
+  not something the conversion introduced: `idx_hash` only hashed the first
+  8 bytes of a 32-byte key, and every real block hash's leading bytes are
+  near-zero by proof-of-work construction, so real data collided
+  catastrophically (~186s to index the full archive) while synthetic random
+  data was instant. Fixed by hashing all 32 bytes -- full-archive index
+  build dropped to ~0.1s (~1800x), and since `idx_get` shares the same hash
+  function, this had likely also been silently slowing live `getdata`
+  lookups during normal serving, not just boot. See LOG.md 2026-08-17 entry
+  for the full investigation; regression-guarded in `asm/tests/test_idx.c`.
 - Archive state as of this update: 819,085/962,831 real mainnet blocks stored
   (85.07% of real tip), contiguous from genesis, 188 holes remaining in the
   reached range (99.98% gap-free) -- catch-up run is ongoing.

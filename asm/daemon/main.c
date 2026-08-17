@@ -129,6 +129,7 @@ extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern int  idx_get(void* idx, const unsigned char hash[32], long* height);
 extern long idx_count(void* idx);
+extern long idx_build_from_file(void* idx, const char* path);
 
 /* bitcoin_idxscan.asm -- buffered index.dat positional scans, replacing the
  * dlc_* stdio versions below (kept as reference/fallback docs in comments
@@ -137,25 +138,16 @@ extern long idxscan_tip(void);
 extern long idxscan_first_hole(long tip);
 extern long idxscan_all_present(long lo, long hi);
 extern void idxscan_progress(long* out_tip, long* out_present);
+/* asm/bitcoin_idx.asm:idx_build_from_file -- buffered pread64 bulk loader,
+ * replacing the per-record fread+reverse+idx_put loop that used to live
+ * here. Drops the periodic "[hashidx] N/M" progress print: the whole build
+ * is now a small fraction of a second on the real archive (was ~186s), so
+ * there's nothing left to show progress on. */
 static int build_hash_index(void){
     ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);   /* last slot may need a full --- actually over-allocate */
     if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
     idx_init(ht_idx, HT_SLOTS);
-    FILE* f=fopen("index.dat","rb"); if(!f){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
-    fseek(f,0,SEEK_END); long n=ftell(f)/48; fseek(f,0,SEEK_SET);
-    unsigned char rec[48];
-    for(long h=0;h<n;h++){
-        if(fread(rec,1,48,f)!=48) break;
-        if(rec[0]==0&&rec[1]==0&&rec[2]==0&&rec[3]==0) continue; /* hole */
-        /* index.dat stores the block hash in big-endian DISPLAY byte order; the
-         * getdata/inv wire hash is little-endian (the raw internal hash). Reverse
-         * to the wire/LE order so idx_get (looked up with the raw getdata hash)
-         * matches. */
-        unsigned char le[32]; for(int k=0;k<32;k++) le[k]=rec[31-k];
-        idx_put(ht_idx, le, h);
-        if(h%100000==0){ fprintf(stderr,"[hashidx] %ld/%ld\n",h,n); }
-    }
-    fclose(f);
+    if(idx_build_from_file(ht_idx, "index.dat")<0){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
     fprintf(stderr,"[hashidx] indexed %ld stored heights\n", (long)idx_count(ht_idx));
     return 0;
 }

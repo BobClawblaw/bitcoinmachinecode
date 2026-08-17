@@ -97,6 +97,7 @@ asm/tests/test_bip152_loop
 asm/tests/test_sendheaders_fee
 asm/tests/bench_store_read
 asm/tests/bench_idxscan
+asm/tests/bench_hashidx
 asm/bitcoin_cmpct.o
 asm/tests/test_sha512
 asm/sha512.o
