@@ -943,7 +943,17 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons(8333));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-                    if(node_handshake(fdc)==1){ fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive; strncpy((char*)mystat->peer,cand,63); }
+                    if(node_handshake(fdc)==1){
+                        fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        strncpy((char*)mystat->peer,cand,63);
+                        /* fresh peer -- the displayed chunks/blocks/guard
+                         * must reflect THIS connection, not accumulate
+                         * across every peer this worker slot has ever
+                         * cycled through (that read as "the new peer has
+                         * already done N chunks" when really the old, now-
+                         * dropped peer did them). */
+                        mystat->chunks=0; mystat->blocks=0; mystat->guard=0;
+                    }
                     else { claimed[idx]=0; close(fdc); }
                 }
                 if(!ok){
