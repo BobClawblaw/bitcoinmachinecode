@@ -1277,23 +1277,17 @@ static long dl_catchup(const char* dir, int min_workers){
                     }
                 } else dead_ticks[w]=0;
             }
-            /* one X per timeout this worker slot has ever hit (budget expiry
-             * or early-kill, same counter) -- capped in the DISPLAY only so
-             * a worker that's cycled through many dead peers over a long
-             * catch-up doesn't blow out the line width; the real count
-             * still shows via the "+N" suffix past the cap. */
-            char marks[40]=""; long to=stats[w].timeouts;
-            if(to>0){
-                int show=(int)(to>32?32:to);
-                for(int i=0;i<show;i++) marks[i]='X';
-                marks[show]=0;
-            }
-            char timeoutbuf[64]="";
-            if(to>32) snprintf(timeoutbuf,sizeof timeoutbuf," [%s+%ld]",marks,to-32);
-            else if(to>0) snprintf(timeoutbuf,sizeof timeoutbuf," [%s]",marks);
+            /* live progress toward THIS worker's next early-kill -- updates
+             * every 10s tick as dead_ticks climbs, so it's visible in real
+             * time as a connection starts trending dead, not just after a
+             * kill has already happened (a historical per-kill tally only
+             * changes once a drop actually fires, which can take a while to
+             * show up at all). Resets to nothing once healthy or just cut. */
+            char dragbuf[32]="";
+            if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],DLC_DEAD_WEIGHT_TICKS);
             fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
-                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, timeoutbuf);
+                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, dragbuf);
             prev_blocks[w]=b;
         }
     }
