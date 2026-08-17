@@ -914,7 +914,7 @@ static long dlc_headers(char live[][64], int nlive){
  * its own throughput while blocked inside node_ibd_blocks_s. MAP_ANONYMOUS
  * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
  * before the parent's first 10s tick. */
-typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; } dlc_stat_t;
+typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; } dlc_stat_t;
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decl, defined below */
 
 static int dlc_worker(int w, long end_h, char live[][64], int nlive,
@@ -1021,6 +1021,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
             store_reload(st);
             guard++;
             if(mux_sync_budget_fired){
+                mystat->timeouts++;   /* covers both the flat budget AND an early-kill signal -- same code path */
                 char lastbw[16]; dlc_fmt_rate(lastbw,sizeof lastbw,mystat->last_bw_bps);
                 fprintf(stderr,"[dlc w%d] %s dead weight (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
                         w, mystat->peer, lastbw, mystat->chunks, mystat->blocks);
@@ -1276,9 +1277,23 @@ static long dl_catchup(const char* dir, int min_workers){
                     }
                 } else dead_ticks[w]=0;
             }
-            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s\n",
+            /* one X per timeout this worker slot has ever hit (budget expiry
+             * or early-kill, same counter) -- capped in the DISPLAY only so
+             * a worker that's cycled through many dead peers over a long
+             * catch-up doesn't blow out the line width; the real count
+             * still shows via the "+N" suffix past the cap. */
+            char marks[40]=""; long to=stats[w].timeouts;
+            if(to>0){
+                int show=(int)(to>32?32:to);
+                for(int i=0;i<show;i++) marks[i]='X';
+                marks[show]=0;
+            }
+            char timeoutbuf[64]="";
+            if(to>32) snprintf(timeoutbuf,sizeof timeoutbuf," [%s+%ld]",marks,to-32);
+            else if(to>0) snprintf(timeoutbuf,sizeof timeoutbuf," [%s]",marks);
+            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
-                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag);
+                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, timeoutbuf);
             prev_blocks[w]=b;
         }
     }
