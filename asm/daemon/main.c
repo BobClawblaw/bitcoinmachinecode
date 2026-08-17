@@ -748,11 +748,13 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
 #define DLC_MAXPOOL 512
 #define DLC_HDR_TRY_PEERS 8
 /* wall-clock budget for ONE chunk transfer. Near the real tip a 200-block
- * chunk is large (segwit blocks with witness data, ~250-300MB observed) --
- * a healthy peer clears that in 2-3 minutes at 1.5-2+ MB/s; this budget
- * catches the "connected but crawling at a few KB/s" case (would otherwise
- * take HOURS for the same chunk) without punishing a merely-average peer. */
-#define DLC_CHUNK_BUDGET_SECS 180
+ * chunk is large (segwit blocks with witness data, ~250-300MB observed).
+ * 180s required ~1.56MB/s sustained to survive, which was cutting plenty
+ * of real (if unremarkable) peers doing 400-800KB/s -- not stalled, just
+ * not fast. 480s only requires ~600KB/s, giving those peers room to
+ * actually finish while still catching the genuinely dead ones (observed
+ * as low as 0.0-10KB/s, which would otherwise take HOURS on one chunk). */
+#define DLC_CHUNK_BUDGET_SECS 480
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record. */
 static int dlc_chunk_all_present(long lo, long hi){
