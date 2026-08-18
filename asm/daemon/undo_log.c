@@ -1,26 +1,25 @@
 /* daemon/undo_log.c -- Stage A reorg/fork-choice primitive #5 (per-block
  * undo-data structure). 100% AI-generated, plain C.
  *
- * STANDALONE / ADDITIVE, DELIBERATELY NOT WIRED IN: the Stage A brief asks
- * for a capture step to be added inside daemon/utxo_live.c's live_on_input,
- * BEFORE its real utxo_lsm_del call, on the theory that it's "just" an
- * additive capture step. It is not, in the sense that matters here:
- * live_on_input is called for every real input of every real block the
- * live daemon actually applies (via apply_block <- utxo_live_catchup,
- * which daemon/main.c calls repeatedly during real sync against a live
- * UTXO set) -- editing it means editing a real-time call site the
- * production daemon executes today, which the very same Stage A brief
- * separately and repeatedly says not to do ("do NOT modify ... any other
- * real-time call site that the production daemon actually executes today
- * -- every primitive you add should be new, dead code from the live
- * daemon's perspective"). Given that direct conflict, this file keeps
- * daemon/utxo_live.c completely untouched (zero diff) and instead
- * implements the exact capture shape live_on_input would use once this
- * primitive is wired in a later, separately reviewed stage --
- * undo_capture_and_del below -- as a new, standalone function exercised
- * only by tests/test_undo_log.c against the real LSM (utxo_lsm_get/_del).
- * This choice, and why, is called out again in the top-level report for
- * this stage.
+ * STAGE B UPDATE -- THIS IS NOW LIVE. Stage A deliberately left this module
+ * unwired (its original note explained that adding the capture step to
+ * daemon/utxo_live.c's live_on_input meant editing a real-time call site the
+ * production daemon executes, which that stage's brief forbade). Stage B is
+ * the stage that does it: undo_capture_and_del is now called from
+ * live_on_input for every non-coinbase input of every block the live daemon
+ * applies, which is what makes a later DISCONNECT of those blocks possible
+ * at all. Stage B also adds undo_replay (streaming reader -- the disconnect
+ * path cannot afford undo_load's 10KB-per-record array), undo_discard, and
+ * undo_prune_from (bounded/resumable retention sweep). undo_append_record,
+ * undo_load, undo_prune and undo_capture_and_del are unchanged.
+ *
+ * PERFORMANCE NOTE for the now-live capture path: every spent input costs one
+ * extra utxo_lsm_get (to read the value+script before deleting) plus one
+ * open/write/close on undo_<height>.dat. The LSM's own header comment notes
+ * that utxo_lsm_get does a linear scan per candidate disk run and was written
+ * on the assumption of never being on a hot path -- it now is. See this
+ * stage's report; this is called out as something to measure under real
+ * mainnet block sizes before it is trusted at scale.
  *
  * Record format (one per spent input), written in order to a per-height
  * file `undo_<height>.dat` (append-only; simplest possible layout given a
@@ -117,6 +116,92 @@ long undo_load(long height, undo_rec_t* out, long max_recs){
     }
     close(fd);
     return n;
+}
+
+/* ---- STAGE B additions ---------------------------------------------------
+ *
+ * undo_replay: a STREAMING reader, added because undo_load's caller-supplied
+ * undo_rec_t array cannot be used on the real disconnect path. One
+ * undo_rec_t is UNDO_MAX_SCRIPT+46 = 10046 bytes; a real mainnet block can
+ * spend >10000 inputs, so a "load it all then walk it" disconnect would need
+ * ~100MB of contiguous buffer PER BLOCK DISCONNECTED. undo_replay hands each
+ * record to a callback as it is read, with one fixed 10KB record buffer, so
+ * disconnect memory is O(1) in the block's input count. undo_load itself is
+ * left completely unchanged (tests/test_undo_log.c still covers it).
+ *
+ * Returns the number of records replayed (>=0), or -1 on a malformed file or
+ * a callback that reported failure (a callback returning 0 aborts the replay
+ * immediately -- a half-restored UTXO set must surface as an error, never as
+ * a silently short success).
+ */
+typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
+                               u64 value, const u8* script, u16 slen);
+
+long undo_replay(long height, undo_replay_cb cb, void* ctx){
+    char path[64]; undo_path(path, height);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;            /* same contract as undo_load: absent == empty */
+
+    static u8 script[UNDO_MAX_SCRIPT];
+    long n = 0;
+    for (;;) {
+        u8 hdr[UNDO_HEADER_BYTES];
+        long r = read(fd, hdr, UNDO_HEADER_BYTES);
+        if (r == 0) break;
+        if (r != UNDO_HEADER_BYTES) { close(fd); return -1; }
+        u32 index; u64 value; u16 slen;
+        memcpy(&index, hdr+32, 4);
+        memcpy(&value, hdr+36, 8);
+        memcpy(&slen,  hdr+44, 2);
+        if (slen > UNDO_MAX_SCRIPT) { close(fd); return -1; }
+        if (slen > 0) {
+            long sr = read(fd, script, slen);
+            if (sr != (long)slen) { close(fd); return -1; }
+        }
+        if (cb && !cb(ctx, hdr, index, value, script, slen)) { close(fd); return -1; }
+        n++;
+    }
+    close(fd);
+    return n;
+}
+
+/* undo_discard(height) -> 1 removed / 0 nothing there.
+ * Drops one height's undo file once it has been consumed by a disconnect --
+ * that data describes a block that is no longer on our chain, so keeping it
+ * around could only ever mislead a later disconnect at the same height (a
+ * reconnected block at height H writes its OWN undo_<H>.dat, and
+ * undo_append_record opens with O_APPEND, so a stale file left in place
+ * would be silently PREPENDED to the new block's records). */
+long undo_discard(long height){
+    char path[64]; undo_path(path, height);
+    return unlink(path) == 0 ? 1 : 0;
+}
+
+/* undo_prune_from(from_height, tip_height, window, max_scan)
+ *   -> the height the sweep reached (a resumable cursor), or -1 on bad args.
+ *
+ * Bounded, resumable variant of undo_prune below. undo_prune restarts its
+ * unlink sweep at h=0 on EVERY call: wired into a per-block flow on a store
+ * whose tip is ~974k, that is ~974,000 failing unlink() syscalls per block
+ * applied, forever. This variant starts at a caller-held cursor and examines
+ * at most `max_scan` heights per call, returning the new cursor -- so the
+ * steady-state per-block cost is O(1) and a cold start (cursor 0 on a deep
+ * store) is amortised over several calls instead of stalling one.
+ * undo_prune is left byte-for-byte unchanged (tests/test_undo_log.c covers
+ * its exact existing semantics).
+ */
+long undo_prune_from(long from_height, long tip_height, long window, long max_scan){
+    if (tip_height < 0 || window <= 0 || max_scan <= 0) return from_height;
+    if (from_height < 0) from_height = 0;
+    long keep_from = tip_height - window + 1;
+    if (keep_from < 0) keep_from = 0;
+    long end = from_height + max_scan;
+    if (end > keep_from) end = keep_from;
+    for (long h = from_height; h < end; h++){
+        char path[64]; undo_path(path, h);
+        unlink(path);
+    }
+    return end > from_height ? end : from_height;
 }
 
 /* undo_prune(tip_height, window) -> number of undo_<h>.dat files removed.

@@ -53,9 +53,8 @@
 ;   int store_set_prune(void* st, int h)        -> 1 ok (config+persist gate)
 ;   int store_prune(void* st, int h)            -> 1 ok (persist + delete files)
 ;
-;   -- Stage A reorg/fork-choice primitives (STANDALONE / ADDITIVE: nothing
-;      in the live daemon calls these yet -- see tests/test_prevhash.c and
-;      tests/test_truncate.c) --
+;   -- Stage A reorg/fork-choice primitives (WIRED IN AS OF STAGE B -- see
+;      daemon/reorg.c and the longer note further down this file) --
 ;   int store_get_tip_hash(void* st, u8 out_hash[32]) -> 1 ok / -1 (empty)
 ;          Reads the CURRENT tip's block hash straight from its index.dat
 ;          record (same technique daemon/main.c's anchor_locator already
@@ -63,8 +62,9 @@
 ;   int store_validates_prevhash(void* st, const u8 block_header[80])
 ;                                               -> 1 match / 0 mismatch / -1 (empty store)
 ;          Compares header bytes [4..35] (the wire-order prevhash field)
-;          against store_get_tip_hash's result. Pure validation -- NOT
-;          wired into any append path (that is Stage B).
+;          against store_get_tip_hash's result. Stage B gates every
+;          reorg-RECONNECTED block on this; the ordinary append path still
+;          does not check it.
 ;   int store_truncate_to(void* st, long target_height) -> 1 ok / -1 err
 ;          Rollback/undo primitive: drops every block ABOVE target_height
 ;          (index.dat + the relevant blk%05u.dat files ftruncate'd, later
@@ -1264,11 +1264,20 @@ open_idx_close:
 
 ; ============================================================================
 ; STAGE A: reorg/fork-choice primitives #3 (prevhash validation gate) and #4
-;   (store truncate/rollback). STANDALONE / ADDITIVE -- nothing in the live
-;   daemon calls any of these three functions yet; they are exercised only
-;   by tests/test_prevhash.c and tests/test_truncate.c. Wiring prevhash
-;   validation into the real append path, or truncate into real reorg
-;   handling, is later, separately reviewed work.
+;   (store truncate/rollback).
+;
+;   STAGE B UPDATE -- ALL THREE ARE NOW LIVE, via daemon/reorg.c:
+;     store_truncate_to        rolls the block store back to the fork point
+;                              during a reorg (reorg_execute).
+;     store_get_tip_hash       reports the post-reorg tip for logging.
+;     store_validates_prevhash gates every block RECONNECTED after a
+;                              rollback, so a replacement branch can never be
+;                              appended out of order.
+;   They are still NOT wired into the ordinary append path: an inbound serve
+;   child's .do_block continues to append without a prevhash check. See this
+;   stage's report -- that remains an open item.
+;   tests/test_prevhash.c and tests/test_truncate.c still cover them in
+;   isolation; tests/test_reorg.c covers them wired into a real reorg.
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
