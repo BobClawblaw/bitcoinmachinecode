@@ -378,6 +378,21 @@ long wallet_p2wpkh_address_hrp(char* out, long cap, const unsigned char h160[20]
     return (sl >= 0 && sl < cap) ? (long)sl : -1;
 }
 
+/* Encode the bech32 (BIP141) P2WSH address "bc1q" + 32-byte script hash.
+ * SegWit v0 like P2WPKH, just a 32-byte program instead of 20. */
+long wallet_p2wsh_address(char* out, long cap, const unsigned char h256[32]) {
+    unsigned char d5[64];
+    long long n5 = bech32_convert_bits(d5, h256, 32, 8, 5, 1);
+    if (n5 < 0) return -1;
+    unsigned char data[64];
+    long long dl = 0;
+    data[dl++] = 0;                     /* witness version v0 */
+    for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
+    bech32_init();
+    long long sl = bech32_encode(out, "bc", 2, data, dl, 0);  /* spec 0 = bech32 */
+    return (sl >= 0 && sl < cap) ? (long)sl : -1;
+}
+
 /* Encode the bech32m (BIP350) P2PKH-style ... unused here; keep P2WPKH only. */
 
 /* Encode the bech32m (BIP350) witness-v1 P2TR address "bc1p" + 32-byte xonly key.
@@ -520,6 +535,20 @@ int wallet_script_to_address(char* out, long cap, const unsigned char* script, l
         /* P2WPKH */
         if (wallet_p2wpkh_address(out, cap, script + 2) < 0) return WAL_ADDR_INVALID;
         return WAL_ADDR_P2WPKH;
+    }
+    if (slen == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87) {
+        /* P2SH: OP_HASH160 PUSH20 <h160> OP_EQUAL -- version 0x05 || h160 */
+        unsigned char payload[21];
+        payload[0] = 0x05;
+        memcpy(payload + 1, script + 2, 20);
+        base58check_encode(out, payload, 21);
+        return WAL_ADDR_P2SH;
+    }
+    if (slen == 34 && script[0] == 0x00 && script[1] == 0x20) {
+        /* P2WSH: OP_0 PUSH32 <script hash> -- distinguished from P2TR (OP_1
+         * PUSH32) by the leading opcode, not just the length. */
+        if (wallet_p2wsh_address(out, cap, script + 2) < 0) return WAL_ADDR_INVALID;
+        return WAL_ADDR_P2WSH;
     }
     if (slen == 34 && script[0] == 0x51 && script[1] == 0x20) {
         /* P2TR: OP_1 PUSH32 <xonly output key> (BIP341), bech32m */
