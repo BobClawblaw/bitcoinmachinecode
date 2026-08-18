@@ -574,7 +574,11 @@ tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
 # through the same rpc_dispatch().
 # ============================================================================
 RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
-RPCLIBS := wallet_core.c $(WALLETPRIMS)
+# bitcoin_utxo_lsm.o/bitcoin_utxo_store.o: rpc_commands.o's cmd_gettxout_w
+# calls utxo_lsm_get unconditionally, so every rpc_commands.o-linking target
+# needs them, not just daemon/bitcoin_rpcd (which additionally builds/reloads
+# the store itself).
+RPCLIBS := wallet_core.c $(WALLETPRIMS) bitcoin_utxo_lsm.o bitcoin_utxo_store.o
 
 rpc_json.o: rpc_json.c rpc_json.h
 	$(CC) -no-pie -O0 -c -o $@ rpc_json.c

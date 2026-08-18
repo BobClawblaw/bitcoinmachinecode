@@ -51,4 +51,18 @@ int rpc_param_i64(const rj_val* params, size_t i, long long* out,
 /* Human + machine model: is `method` a wallet command we dispatch? */
 int rpc_known_method(const char* method);
 
+/* Long-lived UTXO LSM store handle backing gettxout (real Bitcoin Core
+ * semantics: any confirmed outpoint, not wallet-scoped) and, once the
+ * address index lands, listunspent/getbalance. Deliberately a SEPARATE
+ * handle from rpc_wallet, which stays scoped to the wallet's own known
+ * outputs per its existing doc comment -- this isn't wallet data.
+ * `lst`/`u` are opaque here (bitcoin_utxo_lsm.asm's struct lsm_state and
+ * the in-memory UTXO table); only the caller that builds them (bitcoin_
+ * rpcd.c) needs the concrete layout. Pass NULL/NULL to say "not
+ * configured" (gettxout then reports every outpoint as not found, same
+ * as an RPC server with no chain data). Safe with no locking: rpc_
+ * server.c's server_thread is a single accept()->service_conn() loop,
+ * never fork/thread-per-connection. */
+void rpc_commands_set_utxo_store(void* lst, void* u);
+
 #endif /* RPC_COMMANDS_H */
