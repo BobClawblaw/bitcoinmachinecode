@@ -38,8 +38,15 @@ extern int  taproot_keypath_verify(const uint8_t* spk, const uint8_t* sig, int s
                                    const uint8_t* prevouts, const uint8_t* amounts,
                                    const uint8_t* spks, int64_t num_inputs);
 
-/* ---- UTXO set (asm) ---- */
-extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
+/* ---- UTXO set ---- */
+/* NOT bitcoin_utxo.asm's own `utxo_get` directly -- see bitcoin_mempool_
+ * policy.c's identical extern for why: that symbol is already bound to a
+ * different, unrelated purpose (bitcoin_utxo_lsm.asm's own memtable
+ * internals) in any binary that also links the LSM store, so this needs
+ * its own distinct name. Each binary that links this file provides its own
+ * definition (old-table test harnesses pass through to utxo_get; the live
+ * daemon provides an LSM-backed one, see daemon/tx_accept.c). */
+extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
                      unsigned long long* value, const unsigned char** script,
                      unsigned long* slen);
 
@@ -140,7 +147,7 @@ static int mv_resolve(mv_tx_t* T, void* utxo, const char** err){
         inrec_t* in = &T->in[i];
         unsigned long long val; const unsigned char* sp; unsigned long sl;
         /* txid (32 bytes) + vout (4 LE) from outpoint */
-        if (utxo_get(utxo, in->outpoint,
+        if (mempool_resolve_confirmed_utxo(utxo, in->outpoint,
                      (unsigned long)(in->outpoint[32] | (in->outpoint[33]<<8)
                                      | (in->outpoint[34]<<16) | ((uint32_t)in->outpoint[35]<<24)),
                      &val, &sp, &sl) != 1){

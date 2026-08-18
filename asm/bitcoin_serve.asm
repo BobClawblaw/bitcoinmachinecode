@@ -39,6 +39,9 @@ default rel
     extern mpool_put
     extern mpool_get
     extern mpool_count
+    extern tx_dispatch_init
+    extern tx_policy_init
+    extern tx_accept_validate
     extern tx_txid
     extern bip152_shortid
     extern block_tx_at
@@ -89,6 +92,10 @@ MP_SLOTS equ 1024
 mp_area:   times (40 + 1024*48 + 8) db 0
 mp_blob:   times (2<<20) db 0           ; 2 MiB tx storage
 mp_initdone: db 0
+; ---- per-connection tx validation (daemon/tx_accept.c); same lazy-init-
+; once-per-process shape as mp_initdone above ----
+tx_dv_initdone: db 0
+tx_dv_ok: db 0
 amr_ab:    times 64 db 0
 ah_buf:    times (1000*30+8) db 0
 src_buf:   times (1000*18) db 0
@@ -157,6 +164,20 @@ node_serve_loop:
     call mpool_init
     mov  byte [mp_initdone], 1
 .mpready:
+    ; init this connection's read-only UTXO snapshot + mempool policy state
+    ; once per process (same lazy-init-guard shape as mpool_init above).
+    ; Non-fatal on failure -- .do_tx checks tx_dv_ready and falls back to
+    ; dropping inbound tx (not accepting unvalidated ones) rather than
+    ; taking the whole connection down.
+    cmp  byte [tx_dv_initdone], 1
+    je   .txdvready
+    call tx_dispatch_init
+    mov  byte [tx_dv_ok], al
+    call tx_policy_init
+    and  al, byte [tx_dv_ok]
+    mov  byte [tx_dv_ok], al
+    mov  byte [tx_dv_initdone], 1
+.txdvready:
 
     ; ---- per-connection init: reset negotiation state, remember tip, and
     ; send the peer OUR `feefilter` (advertise min-relay-feerate so it skips
@@ -309,12 +330,18 @@ node_serve_loop:
     call tx_txid
     test rax, rax
     jz   .next
-    ; mpool_put(mp_area, s_txid, pl_buf, s_plen)
+    ; tx_accept_validate(mp_area, s_txid, pl_buf, s_plen) -- full mempool
+    ; policy (fee/RBF/ancestor-descendant limits) + whole-tx signature
+    ; validation before storing for relay, replacing the previous
+    ; unconditional mpool_put (which called it on every syntactically-
+    ; minimal tx with zero validation).
+    cmp  byte [tx_dv_ok], 1
+    jne  .next               ; validation unavailable this connection -- drop, don't relay unvalidated
     mov  rdi, mp_area
     lea  rsi, [s_txid]
     lea  rdx, [pl_buf]
     mov  rcx, [s_plen]
-    call mpool_put
+    call tx_accept_validate
     jmp  .next
 
 .do_block:

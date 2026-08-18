@@ -49,6 +49,19 @@ extern const char* mpool_policy_reason(void* pol);
 extern int  txval_modern(const unsigned char* tx, long txlen, void* utxo);
 extern const char* txval_modern_reason(void);
 
+/* bitcoin_mempool_policy.c / bitcoin_txval_modern.c now call
+ * mempool_resolve_confirmed_utxo instead of utxo_get directly (see their
+ * own externs' comments) -- this harness still wants the real, single-
+ * table bitcoin_utxo.asm behavior, so just pass through unchanged. */
+extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, const unsigned char** script,
+                     unsigned long* slen);
+long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, const unsigned char** script,
+                     unsigned long* slen){
+    return utxo_get(u, txid, index, value, script, slen);
+}
+
 static int g_fails = 0, g_checks = 0;
 static void ckb(const char* name, int cond){
     g_checks++;

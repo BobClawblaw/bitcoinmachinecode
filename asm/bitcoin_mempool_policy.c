@@ -30,8 +30,15 @@
 #include <stddef.h>
 
 /* ---------------- asm glue (declared; resolved at link) ------------------- */
-/* bitcoin_utxo.asm */
-extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
+/* Resolves a confirmed prevout's value/script. NOT literally bitcoin_utxo.
+ * asm's own `utxo_get` -- that symbol is already bound (as a hard, unrelated
+ * dependency of bitcoin_utxo_lsm.asm's own memtable internals) whenever this
+ * file is linked into a binary that also uses the LSM store, so a second,
+ * differently-behaved definition under the same name would collide. Each
+ * binary that links this file provides its own definition: the old-table
+ * test harnesses pass straight through to the real utxo_get, while the live
+ * daemon's build provides an LSM-backed one (see daemon/tx_accept.c). */
+extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
                      unsigned long long* value, const unsigned char** script,
                      unsigned long* slen);
 /* bitcoin_mempool.asm */
@@ -231,7 +238,7 @@ long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
         uint64_t v = 0;
         if (find_outreg(st, prev[i], idx[i], &v)) { sum_in += v; continue; }
         unsigned long long val; const unsigned char* sp; unsigned long sl;
-        if (!utxo || utxo_get(utxo, prev[i], idx[i], &val, &sp, &sl)!=1){
+        if (!utxo || mempool_resolve_confirmed_utxo(utxo, prev[i], idx[i], &val, &sp, &sl)!=1){
             _mpol_last_reason = "input not found in mempool or utxo"; return 0; }
         sum_in += val;
     }
