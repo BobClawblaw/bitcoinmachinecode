@@ -65,4 +65,15 @@ int rpc_known_method(const char* method);
  * never fork/thread-per-connection. */
 void rpc_commands_set_utxo_store(void* lst, void* u);
 
+/* Long-lived, read-only scriptPubKey(hash)->UTXO reverse index handle
+ * backing listunspent/getbalance (asm/daemon/build_addr_index.c). `base`
+ * should be an mmap()'d, read-only view of the whole index file (see that
+ * tool's own header comment for the on-disk format); `size` its byte
+ * length. Pass NULL/0 to say "not configured" (listunspent/getbalance
+ * then behave as if the resolved address owns nothing). This is a
+ * periodically-*rebuilt* index, not incrementally live-maintained, so it
+ * only reflects whatever the index file held as of when the caller mmap'd
+ * it -- restart/remap to pick up a freshly rebuilt file. */
+void rpc_commands_set_addr_index(const void* base, unsigned long long size);
+
 #endif /* RPC_COMMANDS_H */

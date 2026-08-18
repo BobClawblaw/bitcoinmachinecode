@@ -25,10 +25,6 @@ extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, uns
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, const unsigned char** script, unsigned* slen);
 
-static void* g_utxo_lst = NULL;
-static void* g_utxo_u = NULL;
-void rpc_commands_set_utxo_store(void* lst, void* u) { g_utxo_lst = lst; g_utxo_u = u; }
-
 /* wallet address type enum mirrors asm/wallet_core.c */
 #define WAL_ADDR_INVALID 0
 #define WAL_ADDR_P2PKH   1
@@ -36,6 +32,109 @@ void rpc_commands_set_utxo_store(void* lst, void* u) { g_utxo_lst = lst; g_utxo_
 #define WAL_ADDR_P2SH    3
 #define WAL_ADDR_P2WSH   4
 #define WAL_ADDR_P2TR    5
+
+static void* g_utxo_lst = NULL;
+static void* g_utxo_u = NULL;
+void rpc_commands_set_utxo_store(void* lst, void* u) { g_utxo_lst = lst; g_utxo_u = u; }
+
+/* ---- scriptPubKey(hash) -> UTXO reverse index (asm/daemon/build_addr_
+ * index.c) backing listunspent/getbalance. Same "opaque handle, separate
+ * from rpc_wallet" pattern as the UTXO store above. Mmap'd read-only by
+ * the caller (bitcoin_rpcd.c); the on-disk layout is documented in build_
+ * addr_index.c's own header comment -- mirrored exactly here (packed,
+ * type_tag(1)+hash(32) sort key, sparse index sampled every 256th
+ * record). */
+static const unsigned char* g_addr_idx_base = NULL;
+static unsigned long long g_addr_idx_size = 0;
+void rpc_commands_set_addr_index(const void* base, unsigned long long size) {
+    g_addr_idx_base = base; g_addr_idx_size = size;
+}
+
+#pragma pack(push,1)
+typedef struct { unsigned char type_tag; unsigned char hash[32]; unsigned char txid[32]; unsigned int vout; unsigned long long value; } addr_idx_rec;
+#pragma pack(pop)
+#define ADDR_IDX_REC_SIZE 77
+#define ADDR_IDX_SPARSE_ENT_SIZE 41
+#define ADDR_IDX_HDR_SIZE 28
+
+static int addr_idx_cmp(const unsigned char* p /* type_tag+hash, 33 bytes */,
+                        unsigned char type_tag, const unsigned char hash[32]) {
+    if (p[0] != type_tag) return p[0] < type_tag ? -1 : 1;
+    return memcmp(p + 1, hash, 32);
+}
+
+/* Binary search the sparse index for the largest sampled key <= target,
+ * then linear-scan forward from there collecting every record whose key
+ * exactly matches (an address can own more than one UTXO). Returns the
+ * number of matches written to out[] (capped at max_out). */
+static int addr_idx_lookup(unsigned char type_tag, const unsigned char hash[32],
+                           addr_idx_rec* out, int max_out) {
+    if (!g_addr_idx_base || g_addr_idx_size < ADDR_IDX_HDR_SIZE) return 0;
+    const unsigned char* base = g_addr_idx_base;
+    unsigned long long sparse_off, sparse_n;
+    memcpy(&sparse_off, base + 12, 8);
+    memcpy(&sparse_n, base + 20, 8);
+
+    unsigned long long best_off = ADDR_IDX_HDR_SIZE;
+    if (sparse_n > 0) {
+        long long lo = 0, hi = (long long)sparse_n - 1;
+        while (lo <= hi) {
+            long long mid = lo + (hi - lo) / 2;
+            const unsigned char* ent = base + sparse_off + (unsigned long long)mid * ADDR_IDX_SPARSE_ENT_SIZE;
+            int c = addr_idx_cmp(ent, type_tag, hash);
+            if (c <= 0) {
+                unsigned long long off; memcpy(&off, ent + 33, 8);
+                best_off = off;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+    }
+
+    int n = 0;
+    unsigned long long off = best_off;
+    while (off < sparse_off && n < max_out) {
+        const unsigned char* rec = base + off;
+        int c = addr_idx_cmp(rec, type_tag, hash);
+        if (c == 0) {
+            memcpy(&out[n], rec, ADDR_IDX_REC_SIZE);
+            n++;
+        } else if (c > 0) {
+            break;
+        }
+        off += ADDR_IDX_REC_SIZE;
+    }
+    return n;
+}
+
+/* Resolve an optional address-string RPC param into a (type_tag, hash)
+ * query key. NULL addr_param -> the wallet's own default receive address
+ * (m/84'/0'/0'/0/0, matching cmd_getnewaddr's bare-call convention). */
+static int addr_idx_resolve(const char* addr_param, const rpc_wallet* w,
+                            unsigned char* type_tag_out, unsigned char hash_out[32]) {
+    char addrbuf[96];
+    const char* addr = addr_param;
+    if (!addr) {
+        if (!w->seed || wallet_derive_p2wpkh_address(addrbuf, sizeof addrbuf, w->seed, 0) < 0) return 0;
+        addr = addrbuf;
+    }
+    int type; unsigned char ver, h160[20], prog32[32];
+    if (!wallet_validate_address(addr, &type, &ver, h160, prog32)) return 0;
+    memset(hash_out, 0, 32);
+    switch (type) {
+        case WAL_ADDR_P2PKH: case WAL_ADDR_P2WPKH: case WAL_ADDR_P2SH:
+            memcpy(hash_out, h160, 20);
+            break;
+        case WAL_ADDR_P2WSH: case WAL_ADDR_P2TR:
+            memcpy(hash_out, prog32, 32);
+            break;
+        default:
+            return 0;
+    }
+    *type_tag_out = (unsigned char)type;
+    return 1;
+}
 
 #define RPC_SATOSHI 100000000LL
 
@@ -175,38 +274,93 @@ static int cmd_validate(const char* method, const rj_val* params, long* ec, cons
     return 1;
 }
 
-/* ---- getbalance ---- */
-static int cmd_getbalance(const rpc_wallet* w, rj_val** result) {
+/* Rebuild a scriptPubKey from the address index's (type_tag, hash) key --
+ * the index stores only txid/vout/value, not the original script bytes,
+ * so listunspent's scriptPubKey/address fields are reconstructed rather
+ * than looked up. Writes out_len bytes into out (caller-sized >= 34) and
+ * returns out_len, or 0 for an unrecognized type_tag. */
+static int addr_idx_build_script(unsigned char type_tag, const unsigned char hash[32], unsigned char* out) {
+    switch (type_tag) {
+        case WAL_ADDR_P2PKH:
+            out[0]=0x76; out[1]=0xa9; out[2]=0x14; memcpy(out+3, hash, 20); out[23]=0x88; out[24]=0xac;
+            return 25;
+        case WAL_ADDR_P2WPKH:
+            out[0]=0x00; out[1]=0x14; memcpy(out+2, hash, 20);
+            return 22;
+        case WAL_ADDR_P2SH:
+            out[0]=0xa9; out[1]=0x14; memcpy(out+2, hash, 20); out[22]=0x87;
+            return 23;
+        case WAL_ADDR_P2WSH:
+            out[0]=0x00; out[1]=0x20; memcpy(out+2, hash, 32);
+            return 34;
+        case WAL_ADDR_P2TR:
+            out[0]=0x51; out[1]=0x20; memcpy(out+2, hash, 32);
+            return 34;
+        default:
+            return 0;
+    }
+}
+
+#define ADDR_IDX_MAX_MATCHES 200000
+
+/* ---- getbalance: sum of the address index's entries for the resolved
+ * address (param, or the wallet's own default address if omitted). ---- */
+static int cmd_getbalance(const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
+    const char* addr_param = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems > 0) {
+        addr_param = rpc_param_str(params, 0, ec, em);
+        if (!addr_param) return 0;
+    }
+    unsigned char type_tag, hash[32];
     unsigned long long total = 0;
-    for (unsigned long i = 0; i < w->utxo_n; i++) total += w->utxo_val[i];
+    if (addr_idx_resolve(addr_param, w, &type_tag, hash)) {
+        addr_idx_rec* recs = malloc(ADDR_IDX_MAX_MATCHES * sizeof(addr_idx_rec));
+        if (!recs) { *ec = -32603; *em = "out of memory"; return 0; }
+        int n = addr_idx_lookup(type_tag, hash, recs, ADDR_IDX_MAX_MATCHES);
+        for (int i = 0; i < n; i++) total += recs[i].value;
+        free(recs);
+    }
     char amt[24]; rpc_amounts((long long)total, amt, sizeof amt);
     *result = rj_str(amt);
     return 1;
 }
 
-/* ---- listunspent ---- */
-static int cmd_listunspent(const rpc_wallet* w, rj_val** result) {
+/* ---- listunspent: every address-index entry for the resolved address
+ * (param, or the wallet's own default address if omitted). ---- */
+static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
+    const char* addr_param = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems > 0) {
+        addr_param = rpc_param_str(params, 0, ec, em);
+        if (!addr_param) return 0;
+    }
     rj_val* arr = rj_arr();
-    for (unsigned long i = 0; i < w->utxo_n; i++) {
-        char txidhex[65]; bin_to_hex(txidhex, w->utxo_txid[i], 32);
-        char addr[96]; addr[0] = 0;
-        const unsigned char* script = w->utxo_script ? (const unsigned char*)w->utxo_script[i] : NULL;
-        long slen = script ? (long)strlen((const char*)script) / 2 : 0;
-        unsigned char sbytes[128]; if (slen && slen <= 128) hex_to_bytes(sbytes, (const char*)script, (size_t)(slen*2));
-        int t = (script && slen) ? wallet_script_to_address(addr, 96, sbytes, slen) : WAL_ADDR_INVALID;
-        char amt[24]; rpc_amounts((long long)w->utxo_val[i], amt, sizeof amt);
-        rj_val* o = rj_obj();
-        rj_obj_set(o, "txid", rj_str(txidhex));
-        rj_obj_set(o, "vout", rj_numf("%lu", w->utxo_idx[i]));
-        if (addr[0]) rj_obj_set(o, "address", rj_str(addr));
-        rj_obj_set(o, "label", rj_str(""));
-        rj_obj_set(o, "scriptPubKey", rj_str((const char*)script ? (const char*)script : ""));
-        rj_obj_set(o, "amount", rj_str(amt));
-        rj_obj_set(o, "confirmations", rj_numf("%d", 0));
-        rj_obj_set(o, "spendable", rj_bool(1));
-        rj_obj_set(o, "solvable", rj_bool(1));
-        rj_obj_set(o, "safe", rj_bool(1));
-        rj_arr_push(arr, o);
+    unsigned char type_tag, hash[32];
+    if (addr_idx_resolve(addr_param, w, &type_tag, hash)) {
+        addr_idx_rec* recs = malloc(ADDR_IDX_MAX_MATCHES * sizeof(addr_idx_rec));
+        if (!recs) { rj_free(arr); *ec = -32603; *em = "out of memory"; return 0; }
+        int n = addr_idx_lookup(type_tag, hash, recs, ADDR_IDX_MAX_MATCHES);
+        for (int i = 0; i < n; i++) {
+            char txidhex[65]; bin_to_hex(txidhex, recs[i].txid, 32);
+            unsigned char script[34];
+            int slen = addr_idx_build_script(type_tag, hash, script);
+            char scripthex[70]; bin_to_hex(scripthex, script, (size_t)slen);
+            char addr[96]; addr[0] = 0;
+            wallet_script_to_address(addr, sizeof addr, script, slen);
+            char amt[24]; rpc_amounts((long long)recs[i].value, amt, sizeof amt);
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "txid", rj_str(txidhex));
+            rj_obj_set(o, "vout", rj_numf("%u", recs[i].vout));
+            if (addr[0]) rj_obj_set(o, "address", rj_str(addr));
+            rj_obj_set(o, "label", rj_str(""));
+            rj_obj_set(o, "scriptPubKey", rj_str(scripthex));
+            rj_obj_set(o, "amount", rj_str(amt));
+            rj_obj_set(o, "confirmations", rj_numf("%d", 0));
+            rj_obj_set(o, "spendable", rj_bool(1));
+            rj_obj_set(o, "solvable", rj_bool(1));
+            rj_obj_set(o, "safe", rj_bool(1));
+            rj_arr_push(arr, o);
+        }
+        free(recs);
     }
     *result = arr;
     return 1;
@@ -428,9 +582,9 @@ int rpc_dispatch(const char* method, const rj_val* params,
     if (!strcmp(method, "gettxout"))
         return cmd_gettxout_w(params, w, err_code, err_msg, result);
     if (!strcmp(method, "listunspent"))
-        return cmd_listunspent(w, result);
+        return cmd_listunspent(params, w, err_code, err_msg, result);
     if (!strcmp(method, "getbalance"))
-        return cmd_getbalance(w, result);
+        return cmd_getbalance(params, w, err_code, err_msg, result);
     if (!strcmp(method, "decoderawtransaction"))
         return cmd_decoderaw(params, err_code, err_msg, result);
     *err_code = -32601; *err_msg = "Method not found";
