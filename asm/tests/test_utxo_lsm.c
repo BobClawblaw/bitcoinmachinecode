@@ -350,6 +350,158 @@ int main(void) {
         free(tomb3b); free(manifest3b); free(scratch3b);
     }
 
+    /* ---------- phase 6: sparse index acceleration on a large run ---------- */
+    /* A single flush this large forces many SPARSE_STRIDE(256)-record
+     * strides into one run, so utxo_lsm_get must actually exercise the
+     * on-disk binary search (not just land at records_start by luck). */
+    {
+        #define SP_SLOTS    4096
+        #define SP_FILL     3000
+        #define SP_OP       999999
+        #define SP_TOMB     64
+        #define SP_MANIFEST 64
+        #define SP_DESC     3200
+        #define SP_SCRATCH  ((unsigned long long)SP_DESC*128 + BLOOM_MAX_BYTES + SCRIPT_MAX_BYTES)
+        #define SP_N        3000
+
+        struct LST lst4;
+        void* tomb4 = malloc(SP_TOMB*36);
+        void* manifest4 = malloc(SP_MANIFEST*16);
+        void* scratch4 = malloc(SP_SCRATCH);
+        if (!tomb4 || !manifest4 || !scratch4) { printf("FAIL alloc (sparse)\n"); return 1; }
+        memset(&lst4, 0, sizeof lst4);
+        lst4.op_threshold = SP_OP;
+        lst4.fill_threshold = SP_FILL;
+        lst4.tomb_buf = tomb4; lst4.tomb_cap = SP_TOMB;
+        lst4.manifest_buf = manifest4; lst4.manifest_cap = SP_MANIFEST;
+        lst4.scratch_buf = scratch4; lst4.scratch_cap = SP_SCRATCH;
+        ckm("sparse: lsm_init", utxo_lsm_init(&lst4) == 1);
+
+        static unsigned char ux4[ 40 + SP_SLOTS*48 + 8 ];
+        static unsigned char blob4[BLOB];
+        utxo_init(ux4, SP_SLOTS, blob4, sizeof blob4);
+
+        static unsigned long long sp_val[SP_N];
+        int sp_setup_fails = 0;
+        for (int i = 0; i < SP_N; i++) {
+            unsigned char tk[32];
+            make_txid(tk, 0x22, (unsigned)i);
+            unsigned char scrk[6] = {1,2,3,4,5,(unsigned char)i};
+            sp_val[i] = 900000ULL + (unsigned long long)i;
+            long r = utxo_lsm_put(&lst4, ux4, tk, 0, sp_val[i], scrk, 6);
+            if (r != 1) { sp_setup_fails++; printf("FAIL: sparse setup put %d returned %ld\n", i, r); }
+        }
+        ck("sparse: setup puts all new (0 failures)", sp_setup_fails, 0);
+        fails += sp_setup_fails;
+        ckm("sparse: flush happened after N puts", lst4.manifest_n >= 1);
+        ck("sparse: memtable cleared", utxo_count(ux4), 0);
+        printf("info: sparse run manifest_n=%llu (nrec=%d, SPARSE_STRIDE=256 -> ~%d strides)\n",
+               lst4.manifest_n, SP_N, SP_N/256);
+
+        int sp_fails = 0;
+        for (int i = 0; i < SP_N; i += 7) {
+            unsigned char tk[32];
+            make_txid(tk, 0x22, (unsigned)i);
+            unsigned long long gv; const unsigned char* gs; unsigned gsl;
+            long r = utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl);
+            if (r != 1 || gv != sp_val[i] || gsl != 6 || gs[5] != (unsigned char)i) {
+                sp_fails++;
+                printf("FAIL: sparse get key %d r=%ld v=%llu exp=%llu\n", i, r, gv, sp_val[i]);
+            }
+        }
+        {
+            unsigned char tk[32]; unsigned long long gv; const unsigned char* gs; unsigned gsl;
+            make_txid(tk, 0x22, 0);
+            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse first key absent\n"); }
+            make_txid(tk, 0x22, SP_N-1);
+            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse last key absent\n"); }
+            make_txid(tk, 0x22, SP_N);
+            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl) != 0) { sp_fails++; printf("FAIL: sparse absent key found\n"); }
+        }
+        ck("sparse: spot-check across large run (0 mismatches)", sp_fails, 0);
+        fails += sp_fails;
+
+        utxo_lsm_close(&lst4);
+        free(tomb4); free(manifest4); free(scratch4);
+        #undef SP_SLOTS
+        #undef SP_FILL
+        #undef SP_OP
+        #undef SP_TOMB
+        #undef SP_MANIFEST
+        #undef SP_DESC
+        #undef SP_SCRATCH
+        #undef SP_N
+    }
+
+    /* ---------- phase 7: old-format (MAGIC_RUN) run readable via fallback ---------- */
+    /* Hand-write a run file in the ORIGINAL 28-byte-header format (no
+     * sparse index) exactly as an unmodified pre-Stage-1 writer would
+     * have produced, and inject it directly into a manifest -- proves
+     * mac_run_lookup's fallback (sparse_n==0 -> unchanged full linear
+     * scan) still works, not just the new sparse-accelerated path. */
+    {
+        struct LST lst5;
+        void* tomb5 = malloc(TOMB_CAP*36);
+        void* manifest5 = malloc(MANIFEST_CAP*16);
+        void* scratch5 = malloc(SCRATCH_CAP);
+        if (!tomb5 || !manifest5 || !scratch5) { printf("FAIL alloc (oldfmt)\n"); return 1; }
+        setup_lst(&lst5, tomb5, manifest5, scratch5);
+        ckm("oldfmt: lsm_init", utxo_lsm_init(&lst5) == 1);
+        static unsigned char ux5[ 40 + SLOTS*48 + 8 ];
+        static unsigned char blob5[BLOB];
+        utxo_init(ux5, SLOTS, blob5, sizeof blob5);
+
+        unsigned run_no = 777;
+        char fname[64];
+        snprintf(fname, sizeof fname, "utxo_run_%06u.dat", run_no);
+        FILE* f = fopen(fname, "wb");
+        ckm("oldfmt: fixture file opened", f != NULL);
+
+        unsigned char tX[32], tY[32];
+        make_txid(tX, 0x01, 1);   /* key sorts first (txid[0]=1) */
+        make_txid(tY, 0x01, 2);   /* key sorts second (txid[0]=2) */
+        unsigned char scrX[4] = {11,22,33,44};
+        unsigned char scrY[3] = {5,6,7};
+        unsigned long long valX = 111111ULL, valY = 222222ULL;
+
+        unsigned magic = 0x4E555255; /* MAGIC_RUN ("URUN") */
+        unsigned long long gen = 1, nrec = 2, bloom_bits = 64; /* 8 bloom bytes */
+        unsigned char bloom_all_ones[8]; memset(bloom_all_ones, 0xFF, 8);
+        fwrite(&magic, 4, 1, f);
+        fwrite(&gen, 8, 1, f);
+        fwrite(&nrec, 8, 1, f);
+        fwrite(&bloom_bits, 8, 1, f);
+        fwrite(bloom_all_ones, 1, 8, f);
+        {
+            unsigned zero32 = 0; unsigned char type_push = 1; unsigned short slen;
+            fwrite(tX, 32, 1, f); fwrite(&zero32, 4, 1, f); fwrite(&type_push, 1, 1, f);
+            fwrite(&valX, 8, 1, f); slen = 4; fwrite(&slen, 2, 1, f); fwrite(scrX, 1, 4, f);
+            fwrite(tY, 32, 1, f); fwrite(&zero32, 4, 1, f); fwrite(&type_push, 1, 1, f);
+            fwrite(&valY, 8, 1, f); slen = 3; fwrite(&slen, 2, 1, f); fwrite(scrY, 1, 3, f);
+        }
+        fclose(f);
+
+        /* inject a single manifest entry pointing at the hand-written run,
+         * bypassing utxo_lsm_put/flush entirely */
+        unsigned long long* mbuf = (unsigned long long*)manifest5;
+        mbuf[0] = gen; mbuf[1] = run_no;
+        lst5.manifest_n = 1;
+
+        unsigned long long v5; const unsigned char* s5; unsigned sl5;
+        ck("oldfmt: get X (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tX, 0, &v5, &s5, &sl5), 1);
+        ck("oldfmt: get X value", v5, valX);
+        ck("oldfmt: get X slen", sl5, 4);
+        ckm("oldfmt: get X script", memcmp(s5, scrX, 4) == 0);
+        ck("oldfmt: get Y (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tY, 0, &v5, &s5, &sl5), 1);
+        ck("oldfmt: get Y value", v5, valY);
+        ckm("oldfmt: get Y script", memcmp(s5, scrY, 3) == 0);
+        unsigned char tZ3[32]; make_txid(tZ3, 0x01, 3); /* sorts after both -> EOF miss */
+        ck("oldfmt: get absent key past end", utxo_lsm_get(&lst5, ux5, tZ3, 0, &v5, &s5, &sl5), 0);
+
+        utxo_lsm_close(&lst5);
+        free(tomb5); free(manifest5); free(scratch5);
+    }
+
     utxo_lsm_close(&lst);
     free(tomb); free(manifest); free(scratch);
 
