@@ -34,6 +34,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
@@ -84,6 +85,47 @@ long archive_scan(long* out_entries, long* out_unique, long* out_dups){
     if (out_unique)  *out_unique  = stored - dups;
     if (out_dups)    *out_dups    = dups;
     return first_dup;
+}
+
+/* archive_drop_utxo_state(): delete every persisted UTXO artefact so the set
+ * is rebuilt from a genuinely clean slate.
+ *
+ * Removing utxo_applied_height.dat alone is NOT enough, and getting this
+ * wrong silently reintroduces the corruption we just repaired: utxo_live_init
+ * decides "prior state exists" from utxo.dat / utxo_manifest.dat, so it would
+ * utxo_lsm_reload() the old (wrong) set and then replay from height 0 ON TOP
+ * of it. The run files must go too -- there were 366 of them left behind by
+ * the interrupted rebuild that exposed this.
+ *
+ * Returns the number of files removed. */
+long archive_drop_utxo_state(void){
+    static const char* fixed[] = {
+        "utxo_applied_height.dat", "utxo.dat", "utxo.idx", "utxo_manifest.dat",
+        "utxo_manifest.dat.new", "utxo_lsm_table.map", "utxo_lsm_blob.map", 0
+    };
+    long removed = 0;
+    for (int i = 0; fixed[i]; i++)
+        if (unlink(fixed[i]) == 0) removed++;
+
+    /* utxo_run_*.dat -- variable set, so enumerate rather than guess */
+    DIR* d = opendir(".");
+    if (d){
+        struct dirent* e;
+        while ((e = readdir(d))){
+            if (strncmp(e->d_name, "utxo_run_", 9) == 0 && unlink(e->d_name) == 0) removed++;
+        }
+        closedir(d);
+    }
+    /* per-block undo data describes heights that may no longer exist */
+    d = opendir(".");
+    if (d){
+        struct dirent* e;
+        while ((e = readdir(d))){
+            if (strncmp(e->d_name, "undo_", 5) == 0 && unlink(e->d_name) == 0) removed++;
+        }
+        closedir(d);
+    }
+    return removed;
 }
 
 /* archive_verify_and_repair(): scan, and if corrupt, truncate back to the last
