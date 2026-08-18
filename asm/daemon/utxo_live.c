@@ -103,6 +103,31 @@ struct lsm_state {
  * disk-run scan cost, not just disk-space hygiene (see file header). */
 #define UTXO_LIVE_COMPACT_THRESHOLD 12
 
+/* ---- BULK (far-behind) memtable sizing ---------------------------------
+ * The steady-state sizing above is deliberately small so a per-inbound-child
+ * utxo_lsm_reload() (a full current-generation WAL replay) stays cheap. That
+ * is the right trade when we are a few blocks behind -- and badly wrong for a
+ * from-scratch or long-gap replay, where it is quadratic: every flush is
+ * ~49k entries, every 12th flush triggers utxo_lsm_compact, and compact
+ * merges ALL runs into one, i.e. rewrites the ENTIRE UTXO set. Cost per
+ * compaction grows with the set while the trigger cadence stays fixed.
+ *
+ * Measured in production on 2026-08-18: with a fixed ~590k UTXO ops between
+ * compactions, wall time per compaction interval grew from ~2-4s at height
+ * 125k to ~13.5s by 305k, still climbing -- 140 full-set rewrites in 21
+ * minutes, and the set only ~2% of its eventual size.
+ *
+ * So: when we boot a long way behind, size the memtable like the batch tool
+ * (daemon/build_utxo.c, whose documented production default is exactly
+ * 2^22 / 1GB) and flush ~64x less often. Once caught up we downshift the
+ * flush thresholds back to steady-state values (see utxo_live_catchup), which
+ * restores the cheap-inbound-reload property the small sizing existed for.
+ * Buffers stay allocated at bulk size -- lowering a threshold below the
+ * capacity it was sized for is always safe; raising it would not be. */
+#define UTXO_LIVE_BULK_SLOTS_LOG2 22
+#define UTXO_LIVE_BULK_BLOB_BYTES (1024UL<<20)
+#define UTXO_LIVE_BULK_GAP_BLOCKS 50000L
+
 static void* g_utxo_table = 0;
 struct lsm_state g_utxo_lst;
 static long  g_applied_height = -1;
@@ -441,9 +466,36 @@ void utxo_live_set_undo_enabled(int on){ g_undo_enabled = on; }
  * current directory (callers have already chdir'd to the daemon's data
  * dir, matching every other store in this codebase -- `dir` is only used
  * for the log line). Returns 1 on success, 0 on failure. */
+/* Stored tip height straight off index.dat's size. Each index record is 48
+ * bytes (the same layout anchor_locator/locator_build read positionally), so
+ * the record count is the height count. Read this way rather than from a
+ * store_buf because utxo_live_init deliberately takes no store handle -- and
+ * we only need it to pick a memtable size. -1 when there is no usable index. */
+static long utxo_live_index_tip(void){
+    struct stat sb;
+    if (stat("index.dat", &sb) != 0) return -1;
+    if (sb.st_size < 48) return -1;
+    return (long)(sb.st_size / 48) - 1;
+}
+
+/* Set while the memtable is bulk-sized, until catch-up downshifts it. */
+static int g_bulk_mode = 0;
+
 int utxo_live_init(const char* dir){
-    unsigned long slots = 1UL << UTXO_LIVE_SLOTS_LOG2;
-    u64 blob_cap = UTXO_LIVE_BLOB_BYTES;
+    /* Pick the memtable size from how far behind we actually are. */
+    long boot_applied = read_applied_height();
+    long boot_tip     = utxo_live_index_tip();
+    long boot_gap     = (boot_tip >= 0) ? (boot_tip - boot_applied) : 0;
+    g_bulk_mode = (boot_gap >= UTXO_LIVE_BULK_GAP_BLOCKS);
+
+    unsigned long slots = g_bulk_mode ? (1UL << UTXO_LIVE_BULK_SLOTS_LOG2)
+                                      : (1UL << UTXO_LIVE_SLOTS_LOG2);
+    u64 blob_cap = g_bulk_mode ? UTXO_LIVE_BULK_BLOB_BYTES : UTXO_LIVE_BLOB_BYTES;
+    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB\n",
+            g_bulk_mode ? "BULK -- far behind, batch-sized memtable" : "steady-state",
+            boot_applied, boot_tip, boot_gap,
+            g_bulk_mode ? UTXO_LIVE_BULK_SLOTS_LOG2 : UTXO_LIVE_SLOTS_LOG2,
+            (unsigned long long)(blob_cap >> 20));
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
     u64 tomb_cap         = op_threshold;
@@ -576,6 +628,23 @@ long utxo_live_catchup(void* store_buf){
                 fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld mid-catchup\n", g_applied_height);
             }
         }
+    }
+    /* Caught up while bulk-sized: drop the flush thresholds back to
+     * steady-state so the current WAL generation stops growing to bulk size.
+     * That is what keeps a per-inbound-child utxo_lsm_reload() cheap -- the
+     * whole reason the steady-state memtable is small. We do NOT shrink the
+     * allocations: the next put/del simply sees live-count over the new, lower
+     * threshold and flushes naturally, which also resets the WAL. Lowering a
+     * threshold under buffers sized for a bigger one is safe; the reverse
+     * would not be. */
+    if (g_bulk_mode && g_applied_height >= tip) {
+        unsigned long ss = 1UL << UTXO_LIVE_SLOTS_LOG2;
+        g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;
+        g_utxo_lst.op_threshold   = (u64)ss * 2;
+        g_bulk_mode = 0;
+        fprintf(stderr, "[utxo_live] caught up at height %ld -- downshifting to steady-state flush thresholds (fill=%llu op=%llu)\n",
+                g_applied_height, (unsigned long long)g_utxo_lst.fill_threshold,
+                (unsigned long long)g_utxo_lst.op_threshold);
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable
