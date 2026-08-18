@@ -623,6 +623,9 @@ bitcoinmachinecode/
 |   +-- bitcoin_multisig.asm   # p2sh_hash + multisig_verify (OP_CHECKMULTISIG)
 |   +-- wallet_core.c          # wallet primitives glue over asm crypto
 |   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer over mempool + UTXO
+|   +-- version.inc            # SINGLE SOURCE OF TRUTH for node wire identity (app version, user-agent, protocol version)
+|   +-- gen_version_header.py  # build tool: derives C version_gen.h from version.inc
+|   +-- version_gen.h          # GENERATED from version.inc (git-ignored)
 |   +-- build.sh              # assemble + build + run every verification harness
 |   +-- Makefile              # make asm | test | clean
 |   +-- cuda/                 # optional CUDA batch-acceleration tier (crypto)
@@ -707,6 +710,38 @@ cd asm && make test
 ```
 
 Requires `nasm` and `gcc`. Exit code 0 means the assembly hash is correct.
+
+## Versioning & user-agent
+
+The node's advertised wire identity (application version, P2P user-agent, and
+Bitcoin protocol version) is defined in exactly one place:
+
+```
+asm/version.inc        # the ONLY file you edit: NODE_VERSION_{MAJOR,MINOR,PATCH},
+                       # NODE_PROTOCOL_VER, and the UA prefix/suffix
+```
+
+Everything else is **derived** from it:
+
+- `asm/bitcoind.asm` (`node_make_version`) builds the version payload the node
+  sends, computing the UA string and its length at assembly time (NASM
+  `%strcat`/`%strlen`) -- there are no hand-synced length/payload magic
+  numbers left.
+- `asm/bitcoin_p2p.asm` (getheaders) and `daemon/main.c` (level-logger HSHK
+  event) read the protocol version from the same source.
+- The Makefile regenerates `asm/version_gen.h` (git-ignored) from
+  `version.inc` for the C consumers; the affected objects, the daemon, and the
+  byte-exactness test rebuild automatically when `version.inc` changes.
+
+**To change the version or protocol number, edit ONLY `asm/version.inc`** and
+rebuild (`make daemon/bitcoind`). The current identity is
+`/BitcoinMachineCode:0.0.1/` speaking protocol 70016.
+
+> The standalone peer-masquerade tools in `asm/daemon/` (peertest, discover,
+> seedprobe, crawler, addrgather, etc.) still advertise their own `/Satoshi:*`
+> / `/btcasm:*` / `/peer:*` strings on purpose -- they impersonate *other*
+> Bitcoin clients during probing, so they are intentionally NOT tied to this
+> node's own identity.
 
 ## API (System V AMD64, ELF64)
 

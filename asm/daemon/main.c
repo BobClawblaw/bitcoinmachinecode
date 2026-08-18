@@ -40,6 +40,7 @@
 #include "log_ts.h"
 #include "log_phase.h"
 #include "utxo_walk.h"   /* utxo_walk_read_varint, for tx-count in [block] stored logs */
+#include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -1810,7 +1811,7 @@ int main(int argc, char** argv){
         int fd=tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port);
         if(fd<0){ fprintf(stderr,"connect failed\n"); return 1; }
         if(node_handshake(fd)!=1){ fprintf(stderr,"handshake failed\n"); return 1; }
-        node_log_event(lfd, 1, 70016, 1, 0);        /* HSHK protocol services */
+        node_log_event(lfd, 1, NODE_PROTOCOL_VER, 1, 0);        /* HSHK protocol services */
         static unsigned char gen[32]; memset(gen,0,32);
         static unsigned char buf[65536]; long cnt=0;
         long ok = node_sync(fd, store_buf, gen, buf, sizeof buf, &cnt);

@@ -10,9 +10,22 @@
 # ============================================================================
 
 NASM       := nasm
-NASMFLAGS  := -f elf64
+# -I. so .asm sources can %include "version.inc" (the single source of truth).
+NASMFLAGS  := -f elf64 -I.
 CC         := gcc
 CFLAGS     := -no-pie -O2 -Wall
+
+# Single source of truth for the node's wire identity (app version, user-agent,
+# protocol version). version.inc is the ONLY human-authored definition; the
+# derived values reach C via the generated version_gen.h below.
+VERSION_INC      := version.inc
+VERSION_GEN_H    := version_gen.h
+VERSION_GEN_PY   := gen_version_header.py
+
+# Regenerate the C header from the single source of truth every time the
+# canonical .inc changes. C code #includes version_gen.h; it never hardcodes.
+$(VERSION_GEN_H): $(VERSION_INC) $(VERSION_GEN_PY)
+	python3 $(VERSION_GEN_PY) --out $@ --version-inc $(VERSION_INC)
 
 OBJS := sha256.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_store_fast.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o
 # BIP152 compact blocks (bitcoin_cmpct.asm) needs sha256_full (single SHA256)
@@ -41,6 +54,11 @@ asm: $(OBJS)
 
 %.o: %.asm
 	$(NASM) $(NASMFLAGS) -o $@ $<
+
+# bitcoind.asm and bitcoin_p2p.asm %include version.inc (the single source of
+# truth), so they MUST rebuild when it changes -- otherwise a version bump
+# would silently leave the assembled node advertising stale identity.
+bitcoind.o bitcoin_p2p.o: $(VERSION_INC)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -159,7 +177,7 @@ tests/test_block_genesis: tests/test_block_genesis.c $(CONSOBJS)
 # node_ibd_headers references hst_append (bitcoin_headers.asm), so include it.
 DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_idxscan.o
 
-tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
+tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
 
 # Full IBD client (node_sync): handshake + headers + getdata + validate + store.
@@ -660,7 +678,7 @@ DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
               secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o
 DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/tx_accept.c \
               bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
-daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
+daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS)
 
 # pverify -- parallel block-chain verifier, machine-adaptive worker count.
