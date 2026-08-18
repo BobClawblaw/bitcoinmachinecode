@@ -119,6 +119,34 @@ tests/test_store: tests/test_store.c bitcoin_store.o
 tests/test_prune: tests/test_prune.c bitcoin_store.o
 	$(CC) $(CFLAGS) -o $@ tests/test_prune.c bitcoin_store.o
 
+# ---- Stage A reorg/fork-choice primitives (standalone, additive -- see each
+# new file's own header comment; nothing in the live daemon calls these yet) ----
+
+# Primitive #1: chainwork tracking (bitcoin_chainwork.asm). Standalone.
+tests/test_chainwork: tests/test_chainwork.c bitcoin_chainwork.o
+	$(CC) $(CFLAGS) -o $@ tests/test_chainwork.c bitcoin_chainwork.o
+
+# Primitive #2: real multi-hash block locator (p2p_getheaders count>1
+# extension in bitcoin_p2p.asm + daemon/locator_build.c).
+tests/test_locator: tests/test_locator.c $(P2POBJS) bitcoin_store.o daemon/locator_build.o
+	$(CC) $(CFLAGS) -o $@ tests/test_locator.c $(P2POBJS) bitcoin_store.o daemon/locator_build.o
+
+# Primitive #3: prevhash validation gate (store_get_tip_hash /
+# store_validates_prevhash in bitcoin_store.asm). Standalone.
+tests/test_prevhash: tests/test_prevhash.c bitcoin_store.o
+	$(CC) $(CFLAGS) -o $@ tests/test_prevhash.c bitcoin_store.o
+
+# Primitive #4: store truncate/rollback (store_truncate_to in
+# bitcoin_store.asm). Also exercises the EXISTING, unmodified
+# idx_build_from_file (bitcoin_idx.asm) against the truncated store.
+tests/test_truncate: tests/test_truncate.c bitcoin_store.o $(IDXOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_truncate.c bitcoin_store.o $(IDXOBJS)
+
+# Primitive #5: per-block undo-data structure (daemon/undo_log.c) against
+# the real LSM UTXO store.
+tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
+
 tests/test_cons: tests/test_cons.c $(CONSOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_cons.c $(CONSOBJS)
 
@@ -650,6 +678,7 @@ tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
 test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 \
+tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log \
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
@@ -734,6 +763,11 @@ test: tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/te
 	./tests/verify_p2sh_shim < /dev/null
 	./tests/test_verify_p2sh
 	./tests/test_bip30
- 
+	./tests/test_chainwork
+	./tests/test_locator
+	./tests/test_prevhash
+	./tests/test_truncate
+	./tests/test_undo_log
+
 clean:
-	rm -f $(OBJS) secp256k1_taproot.o secp256k1_schnorr.o bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server rpc_json.o rpc_net.o rpc_commands.o rpc_server.o daemon/bitcoin_cli daemon/bitcoin_rpcd daemon/wallet_cli tests/bip30_shim tests/test_bip30
+	rm -f $(OBJS) secp256k1_taproot.o secp256k1_schnorr.o bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server rpc_json.o rpc_net.o rpc_commands.o rpc_server.o daemon/bitcoin_cli daemon/bitcoin_rpcd daemon/wallet_cli tests/bip30_shim tests/test_bip30 bitcoin_chainwork.o daemon/locator_build.o daemon/undo_log.o tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log

@@ -291,6 +291,20 @@ idx_count:
 ;   r12=idx, r14=fd, r15=n, rbx=pos, r13=full (records in the current read).
 ;   The inner-loop counter i is NOT callee-saved-safe to keep in a scratch
 ;   reg across idx_put, so it lives in a stack local below the save area.
+;
+;   SAVE-AREA CLEARANCE BUG FIX (Stage A reorg-primitives work, found via
+;   tests/test_truncate.c crashing at -O2 only): with 5 pushes after rbp
+;   (rbx,r12,r13,r14,r15), the save area spans [rbp-0x28, rbp) (40 bytes).
+;   The le[32] buffer used to start at rbp-0x28, which reaches all the way
+;   up through rbp -- i.e. it fully overwrote r15/r14/r13/r12's saved
+;   values on every hash byte-reversed, and this function's own epilogue
+;   then `pop`ed that clobbered garbage back into the CALLER's r12-r15 the
+;   moment it returned. Only visible when a caller happens to keep a live
+;   value in one of those registers across the call (most callers didn't,
+;   which is how this stayed latent) -- see bitcoin_chainwork.asm's
+;   block_work for the same bug pattern, first found and fixed there.
+;   le[32] now at rbp-0x48 (spans [-72,-40), clear of the save area); the
+;   loop counter i moved to rbp-0x50 to stay clear of le too.
 ; ============================================================================
 global idx_build_from_file
 idx_build_from_file:
@@ -301,7 +315,7 @@ idx_build_from_file:
     push r13
     push r14
     push r15
-    sub  rsp, 0x30           ; le[32]@[rbp-0x28..-0x9], i@[rbp-0x30]
+    sub  rsp, 0x58           ; le[32]@[rbp-0x48..-0x29], i@[rbp-0x50]
     mov  r12, rdi             ; idx
     mov  rdi, rsi              ; path
     xor  esi, esi                ; O_RDONLY
@@ -348,9 +362,9 @@ idx_build_from_file:
     mov  ecx, 48
     div  ecx                                 ; eax = full records in this read
     mov  r13, rax                             ; full (persists across idx_put)
-    mov  qword [rbp-0x30], 0                   ; i = 0
+    mov  qword [rbp-0x50], 0                   ; i = 0
 .scanrec:
-    mov  rcx, [rbp-0x30]                        ; i
+    mov  rcx, [rbp-0x50]                        ; i
     cmp  rcx, r13
     jge  .afterscan
     mov  rax, rcx
@@ -367,19 +381,19 @@ idx_build_from_file:
     mov  r11, 31
     sub  r11, r10
     movzx r8d, byte [rax+r11]
-    mov  [rbp-0x28+r10], r8b
+    mov  [rbp-0x48+r10], r8b
     inc  r10
     jmp  .rev
 .revdone:
     mov  rdx, rbx
     add  rdx, rcx                                   ; height = pos + i
     mov  rdi, r12
-    lea  rsi, [rbp-0x28]
+    lea  rsi, [rbp-0x48]
     call idx_put
 .nextrec:
-    mov  rcx, [rbp-0x30]
+    mov  rcx, [rbp-0x50]
     inc  rcx
-    mov  [rbp-0x30], rcx
+    mov  [rbp-0x50], rcx
     jmp  .scanrec
 .afterscan:
     add  rbx, r13
@@ -399,7 +413,7 @@ idx_build_from_file:
 .fail:
     mov  rax, -1
 .ret:
-    add  rsp, 0x30
+    add  rsp, 0x58
     pop  r15
     pop  r14
     pop  r13
