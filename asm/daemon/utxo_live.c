@@ -575,7 +575,8 @@ int utxo_live_init(const char* dir){
 
     g_applied_height = read_applied_height();
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
-            dir, UTXO_LIVE_SLOTS_LOG2, have_prior_state ? "reload" : "fresh",
+            dir, g_bulk_mode ? UTXO_LIVE_BULK_SLOTS_LOG2 : UTXO_LIVE_SLOTS_LOG2,
+            have_prior_state ? "reload" : "fresh",
             g_applied_height, g_utxo_lst.manifest_n, utxo_lsm_count(&g_utxo_lst));
     return 1;
 }
@@ -662,6 +663,33 @@ long utxo_live_catchup(void* store_buf){
         }
     }
     return applied;
+}
+
+/* utxo_live_recover(): try to unstick a catch-up that just failed, in place.
+ *
+ * The dominant catch-up failure is a FULL MANIFEST: once manifest_n reaches
+ * manifest_cap, mac_flush refuses to add a run, so utxo_lsm_put/del start
+ * returning -1 and every subsequent block fails. A compaction collapses the
+ * runs and clears exactly that condition -- which means the failure is
+ * usually recoverable without operator involvement, and the node has no
+ * business giving up on UTXO tracking for its whole lifetime over it.
+ *
+ * Returns the number of compaction rounds that actually reduced manifest_n
+ * (0 = nothing moved, so a retry will probably fail the same way). Bounded
+ * by manifest_cap, and stops the moment a round stops making progress, so a
+ * compact() that can no longer merge cannot spin here. */
+long utxo_live_recover(void){
+    long rounds = 0;
+    for (unsigned long guard = 0; guard < UTXO_LIVE_MANIFEST_CAP; guard++){
+        u64 before = g_utxo_lst.manifest_n;
+        if (before < 2) break;
+        long cr = utxo_lsm_compact(&g_utxo_lst);
+        fprintf(stderr, "[utxo_live] recover: compact manifest_n=%lu -> %lu (result=%ld)\n",
+                (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
+        if (g_utxo_lst.manifest_n >= before) break;   /* no progress -- stop */
+        rounds++;
+    }
+    return rounds;
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }
