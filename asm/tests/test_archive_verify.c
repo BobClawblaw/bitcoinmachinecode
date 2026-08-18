@@ -4,11 +4,13 @@
  * real damage shape: an early-block duplicate spliced onto the tail. */
 #include <stdio.h>
 #include <unistd.h>
+#include <stdio.h>
 
 extern long store_init(void* st);
 extern long store_reload(void* st);
 extern long archive_scan(long* entries, long* unique, long* dups);
 extern int  archive_verify_and_repair(void* store_buf, int repair);
+extern long archive_drop_utxo_state(void);
 
 static unsigned char store_buf[4096];
 
@@ -51,6 +53,29 @@ int main(int argc, char** argv){
     int again = archive_verify_and_repair(store_buf, 1);
     if (again == 1) printf("PASS: re-verify on the repaired archive reports CLEAN (idempotent)\n");
     else { printf("FAIL: re-verify returned %d on a clean archive\n", again); failures++; }
+
+    /* A repair MUST also wipe persisted UTXO state. Leaving it behind is not
+     * cosmetic: utxo_live_init infers "prior state exists" from utxo.dat /
+     * utxo_manifest.dat and would reload the stale (wrong) set, then replay
+     * from 0 on top of it -- silently recreating the corruption. */
+    {
+        FILE* f;
+        f=fopen("utxo.dat","w");            if(f){fputs("x",f);fclose(f);}
+        f=fopen("utxo_manifest.dat","w");   if(f){fputs("x",f);fclose(f);}
+        f=fopen("utxo_applied_height.dat","w"); if(f){fputs("x",f);fclose(f);}
+        f=fopen("utxo_run_000001.dat","w"); if(f){fputs("x",f);fclose(f);}
+        f=fopen("utxo_run_000002.dat","w"); if(f){fputs("x",f);fclose(f);}
+        f=fopen("undo_479000.dat","w");     if(f){fputs("x",f);fclose(f);}
+
+        long dropped = archive_drop_utxo_state();
+        if (dropped >= 6) printf("PASS: wipe removed %ld UTXO state file(s) incl. run + undo files\n", dropped);
+        else { printf("FAIL: wipe removed only %ld files; stale state would be reloaded\n", dropped); failures++; }
+
+        if (access("utxo.dat",F_OK)!=0 && access("utxo_manifest.dat",F_OK)!=0
+            && access("utxo_run_000001.dat",F_OK)!=0 && access("undo_479000.dat",F_OK)!=0)
+            printf("PASS: no UTXO artefacts remain -- rebuild starts from a clean slate\n");
+        else { printf("FAIL: UTXO artefacts survived the wipe\n"); failures++; }
+    }
 
     if (failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");
