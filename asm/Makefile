@@ -183,6 +183,18 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
 tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(REORGSRCS) $(REORGOBJS)
 
+# daemon/build_utxo -- batch UTXO-set construction from the archive. This is
+# the RIGHT tool for a from-scratch (or long-gap) UTXO rebuild: its memtable is
+# CLI-sized (slots_log2/blob_gb) for batch work, so it flushes -- and therefore
+# full-compacts -- orders of magnitude less often than the live daemon's
+# steady-state-sized memtable. Previously built by hand, which is how it went
+# stale and briefly vanished; a real target keeps it buildable and honest.
+BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
+                 bitcoin_store_fast.o bitcoin_utxo_lsm.o bitcoin_utxo_store.o \
+                 bitcoin_utxo.o bitcoin_idxscan.o
+daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
+	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
+
 # test_dial_budget -- regression test for the outbound_connect dial-budget hang
 # (download worker wedged in a peer read() for 60+ min, 2026-08-18). It forks
 # its own trickling fake peer, so it needs no external helper or network.
