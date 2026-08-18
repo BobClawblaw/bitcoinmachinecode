@@ -119,6 +119,12 @@ tests/test_bip152: tests/test_bip152.c $(CMPCTOBJS) tests/bip152_vectors.h
 tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 
+# bench_ecdsa -- signature verifications/sec on one core. Scoping input for
+# block script verification: the chain needs ~1e9 of these, so this rate
+# decides whether assumevalid is a prerequisite or just an optimisation.
+tests/bench_ecdsa: tests/bench_ecdsa.c secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
+	$(CC) -no-pie -O2 -o $@ tests/bench_ecdsa.c secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
+
 tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
 
