@@ -1853,8 +1853,16 @@ int main(int argc, char** argv){
          * server (nwant=0 -> no outbound appends), so:
          *   - serving our clients is NEVER blocked by (or chopped by) a long
          *     sync -- there is no sync in the parent;
-         *   - the worker is the SOLE block writer (no multi-writer race) and
-         *     grinds continuously from the on-disk tip to mainnet.
+         *   - the worker grinds continuously from the on-disk tip to mainnet.
+         * NOTE: the worker is NOT the sole block writer -- an inbound serve
+         * child can also append a block pushed to it (bitcoin_serve.asm
+         * .do_block, reachable via an unsolicited inv or our own
+         * .do_inv-triggered getdata, regardless of nwant=0 here). Both the
+         * worker's node_sync and .do_block now go through
+         * idxscan_append_locked (flock-guarded, atomic-height-under-lock),
+         * so concurrent writers from either path can't collide on or
+         * clobber each other's height slot; see idxscan_append_locked's
+         * header comment in bitcoin_idxscan.asm for the full rationale.
          * Each forked serve child re-syncs its index length from index.dat so
          * blocks the worker appends become serve-able (fresh disk reads). */
         pid_t dl = fork();

@@ -44,6 +44,8 @@ default rel
 %define IDXSCAN_BUFRECS 4096
 %define IDXSCAN_BUFBYTES (IDXSCAN_BUFRECS*48)
 
+extern store_append_shared
+
 section .text
 
 ; ----------------------------------------------------------------------------
@@ -219,6 +221,83 @@ idxscan_tip:
 .none:
     mov  rax, -1
 .ret:
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; idxscan_append_locked(st, hash[32], raw, len)   (rdi,rsi,rdx,rcx)
+;   -> rax: height on success, -1 on error.
+;
+;   CONCURRENT-SAFE "append the next sequential block" for opportunistic
+;   multi-process writers that do NOT pre-partition disjoint heights among
+;   themselves (unlike dl_catchup's worker pool, which allocates disjoint
+;   chunks via a shared atomic cursor and can safely call store_append_shared
+;   with a caller-computed height). Two independent processes -- e.g. the
+;   serve daemon's download worker and an inbound peer's forked serve child --
+;   each occasionally appending "whatever the next block is" cannot safely
+;   pre-compute a height outside the lock: two callers that both read a stale
+;   view of the true tip could both decide on the SAME "next" height, and
+;   store_append_shared's lock only serializes the byte-level write, not that
+;   decision. This function closes that gap by making "read true tip, then
+;   write" one atomic critical section: acquire the SAME flock
+;   store_append_shared uses (st+40), determine the true current tip via
+;   idxscan_tip() (robust to any pre-sized/zero-padded trailing region a
+;   batch tool like dl_catchup may have left -- unlike a raw idx_len/48
+;   read), then delegate the actual write to store_append_shared with that
+;   height. flock(LOCK_EX) taken twice in a row by the same fd (once here,
+;   again inside store_append_shared) is a harmless idempotent re-assertion;
+;   store_append_shared's own LOCK_UN at the end is what actually releases
+;   it, so the whole read-then-write sequence stays locked throughout.
+;
+;   On success, refreshes st's cached idx_len/tip_height (st+16/st+24)
+;   directly from the height just written, rather than via store_reload
+;   (whose idx_len/48-1 tip computation is NOT hole-aware and would be wrong
+;   under the same pre-sized-region scenario this function exists to handle
+;   correctly at write time).
+; ----------------------------------------------------------------------------
+global idxscan_append_locked
+idxscan_append_locked:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  r12, rdi            ; st
+    mov  r13, rsi            ; hash
+    mov  r14, rdx            ; raw
+    mov  r15, rcx            ; len
+    ; ---- acquire shared append lock (mirrors store_append_shared's own) ----
+    mov  rdi, [r12+40]
+    test rdi, rdi
+    js   .noflock
+    mov  eax, 73              ; flock
+    mov  esi, 2               ; LOCK_EX
+    syscall
+.noflock:
+    ; ---- true current tip under lock, hole-aware ----
+    call idxscan_tip           ; -> rax = tip (-1 if empty)
+    lea  rbx, [rax+1]          ; height = tip + 1 (callee-saved across the call below)
+    ; ---- delegate the actual write: store_append_shared(st, height, hash, raw, len) ----
+    mov  rdi, r12
+    mov  rsi, rbx
+    mov  rdx, r13
+    mov  rcx, r14
+    mov  r8,  r15
+    call store_append_shared
+    cmp  rax, -1
+    je   .ret                  ; error: lock already released by store_append_shared
+    mov  dword [r12+24], eax   ; tip_height = height
+    lea  rcx, [rax+1]
+    imul rcx, 48
+    mov  [r12+16], rcx         ; idx_len = (height+1)*48
+.ret:
+    pop  r15
     pop  r14
     pop  r13
     pop  r12
