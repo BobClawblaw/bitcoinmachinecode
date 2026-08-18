@@ -128,6 +128,11 @@ extern long p2p_addr_v1(void* out, const void* src, long n);
  * peers into the amr book, then download across DISCOVERED peers (not seeds). */
 extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
 extern long addr_replenish(void* ab, char peers[][64], int npeers, int max_try, int wait_s, long target); /* daemon/addr_ingest.c */
+extern int  mempool_configure(void);                     /* daemon/mempool_cfg.c */
+extern long mempool_expire_now(void);                    /* daemon/mempool_cfg.c */
+extern long      upload_note_and_check(long bytes_added); /* daemon/upload_cap.c */
+extern long long upload_proc_wchar(int pid);              /* daemon/upload_cap.c */
+extern long long upload_bytes_this_window(void);          /* daemon/upload_cap.c */
 extern int  net_handshake_relay(const char* ip_str, int relay, int rcv_secs);  /* daemon/net_policy.c */
 extern int  net_feeler_probe(const char* ip_str);                             /* daemon/net_policy.c */
 extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
@@ -588,6 +593,30 @@ static volatile sig_atomic_t g_shutdown_requested = 0;
  * the best chain -- which matters now that Stage B acts on peer chainwork. */
 static int  bro_fd[MAX_BLOCK_RELAY_ONLY];
 static char bro_host[MAX_BLOCK_RELAY_ONLY][64];
+
+/* Serve children we are metering for -maxuploadtarget. The parent samples
+ * each child's /proc/<pid>/io rather than counting inside the asm serve loop
+ * -- same technique dl_catchup uses on download workers, and it measures what
+ * the kernel actually sent. */
+#define UPL_MAX_TRACK 256
+static int       upl_pid[UPL_MAX_TRACK];
+static long long upl_last[UPL_MAX_TRACK];
+static int       upl_n = 0;
+
+static void upl_track(int pid){
+    if(upl_n >= UPL_MAX_TRACK) return;
+    upl_pid[upl_n]=pid; upl_last[upl_n]=0; upl_n++;
+}
+/* Sample every tracked child, add the delta, and drop the dead ones. */
+static void upl_sample(void){
+    long added=0;
+    for(int i=0;i<upl_n;i++){
+        long long w = upload_proc_wchar(upl_pid[i]);
+        if(w < 0){ upl_pid[i]=upl_pid[upl_n-1]; upl_last[i]=upl_last[upl_n-1]; upl_n--; i--; continue; }
+        if(w > upl_last[i]){ added += (long)(w - upl_last[i]); upl_last[i]=w; }
+    }
+    if(added>0) upload_note_and_check(added);
+}
 
 static volatile sig_atomic_t g_inbound_n = 0;
 static void reap_children(int sig){
@@ -2144,6 +2173,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     *(int*)(store_buf+24), live_peers, mux_n_out,
                     utxo_live_ok?utxo_live_count():-1L, (now_ms-boot_ms)/1000,
                     utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
+            if(g_cfg.maxuploadtarget_mb > 0)
+                fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
+                        upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
@@ -2221,10 +2253,29 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         }
         int pr=poll(pfds, nfds, 300);
         if(pr<0){ if(errno==EINTR) continue; break; }
+        /* -mempoolexpiry sweep. Bounded scan of a fixed table, so running it
+         * once a minute costs nothing measurable and keeps the pool from
+         * accumulating transactions no one will ever mine. */
+        /* -maxuploadtarget: meter what we have actually served, and refuse new
+         * inbound once over budget. Existing connections are left alone --
+         * cutting a peer mid-block would just make it retry. */
+        { static long long next_upl_ms = 0;
+          long long ums; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                           ums = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+          if(ums >= next_upl_ms){ next_upl_ms = ums + 5000L; upl_sample(); } }
+
+        { static long long next_expiry_ms = 0;
+          long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                           nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+          if(nms >= next_expiry_ms){ next_expiry_ms = nms + 60000L; mempool_expire_now(); } }
         /* inbound accept -> fork a serve child (unchanged semantics) */
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c=accept(l,(struct sockaddr*)&ca,&cal);
+            if(c>=0 && upload_note_and_check(0)){
+                /* over -maxuploadtarget for this 24h window */
+                close(c); c = -1;
+            }
             if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
                 /* At capacity: accept and close immediately so the connection
                  * is refused cleanly rather than sitting in the backlog, and
@@ -2267,7 +2318,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     close(c); _exit(0);
                 }
                 close(c);
-                if(w > 0) g_inbound_n++;
+                if(w > 0){ g_inbound_n++; upl_track(w); }
                 fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d (%d/%d inbound)\n",
                         ipbuf, ntohs(ca.sin_port), w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
             }
@@ -2333,6 +2384,10 @@ int main(int argc, char** argv){
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
       node_config_log(); }
+    /* Size the relay mempool from -maxmempool BEFORE any serve loop runs, and
+     * before the fork, so every child inherits the same region rather than
+     * each falling back to the 2 MiB static. */
+    mempool_configure();
     dir = absp;
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
 

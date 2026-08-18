@@ -92,8 +92,23 @@ s_j:       dq 0                    ; loop counter j (blocktxn assembly)
 ; struct+slots: 40 + slots*48 ; use 1024 slots
 MP_SLOTS equ 1024
 mp_area:   times (40 + 1024*48 + 8) db 0
-mp_blob:   times (2<<20) db 0           ; 2 MiB tx storage
+mp_blob:   times (2<<20) db 0           ; 2 MiB tx storage -- FALLBACK only
 mp_initdone: db 0
+; ---- runtime-sized mempool (Core -maxmempool) ---------------------------
+; The static buffers above cap the relay mempool at 2 MiB / 1024 slots, so
+; -maxmempool (Core default 300 MB) could not be honoured at all. Rather than
+; grow the statics -- which would cost that memory in every process whether
+; used or not -- C may allocate a right-sized region and publish it here
+; BEFORE node_serve_loop runs (daemon/mempool_cfg.c). If mp_ext_area is null
+; the static fallback is used and behaviour is byte-identical to before, so
+; every existing caller and test is unaffected.
+extern mp_ext_area
+extern mp_ext_blob
+extern mp_ext_slots
+extern mp_ext_blobcap
+; resolved once at init to whichever region is in play; every later mempool
+; call goes through this, so there is exactly one place that decides.
+mp_cur:         dq 0
 ; ---- per-connection tx validation (daemon/tx_accept.c); same lazy-init-
 ; once-per-process shape as mp_initdone above ----
 tx_dv_initdone: db 0
@@ -162,11 +177,27 @@ node_serve_loop:
     ; init the tx-relay mempool once (static; shared across connections)
     cmp  byte [mp_initdone], 1
     je   .mpready
-    mov  rdi, mp_area
+    mov  rax, [mp_ext_area]
+    test rax, rax
+    jnz  .mp_external
+    ; --- static fallback: exactly the previous behaviour ---
+    mov  rax, mp_area
+    mov  [mp_cur], rax
+    mov  rdi, rax
     mov  rsi, MP_SLOTS
     lea  rdx, [mp_blob]
     mov  rcx, (2<<20)
     call mpool_init
+    jmp  .mp_inited
+.mp_external:
+    ; --- C-provided, -maxmempool sized ---
+    mov  [mp_cur], rax
+    mov  rdi, rax
+    mov  rsi, [mp_ext_slots]
+    mov  rdx, [mp_ext_blob]
+    mov  rcx, [mp_ext_blobcap]
+    call mpool_init
+.mp_inited:
     mov  byte [mp_initdone], 1
 .mpready:
     ; init this connection's read-only UTXO snapshot + mempool policy state
@@ -335,14 +366,14 @@ node_serve_loop:
     call tx_txid
     test rax, rax
     jz   .next
-    ; tx_accept_validate(mp_area, s_txid, pl_buf, s_plen) -- full mempool
+    ; tx_accept_validate(mp_cur, s_txid, pl_buf, s_plen) -- full mempool
     ; policy (fee/RBF/ancestor-descendant limits) + whole-tx signature
     ; validation before storing for relay, replacing the previous
     ; unconditional mpool_put (which called it on every syntactically-
     ; minimal tx with zero validation).
     cmp  byte [tx_dv_ok], 1
     jne  .next               ; validation unavailable this connection -- drop, don't relay unvalidated
-    mov  rdi, mp_area
+    mov  rdi, [mp_cur]
     lea  rsi, [s_txid]
     lea  rdx, [pl_buf]
     mov  rcx, [s_plen]
@@ -649,9 +680,9 @@ node_serve_loop:
     jmp  .gd_next
 
 .gd_tx:
-    ; txid at rbx+4; mpool_get(mp_area, txid, &s_n) -> ptr or 0
+    ; txid at rbx+4; mpool_get(mp_cur, txid, &s_n) -> ptr or 0
     mov  [s_ptr], rbx
-    mov  rdi, mp_area
+    mov  rdi, [mp_cur]
     lea  rsi, [rbx+4]
     lea  rdx, [s_n]          ; out_len slot
     call mpool_get

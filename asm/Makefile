@@ -35,7 +35,8 @@ CMPCTOBJS := bitcoin_cmpct.o sha256.o bitcoin_hash.o bitcoin_tx.o
 HASHOBJS := sha256.o bitcoin_hash.o
 # Full script interpreter (bitcoin_interp.asm over bitcoin_scriptcodec.asm) plus
 # its hashing deps (OP_SHA256/HASH160/HASH256/RIPEMD160).
-INTERPOBJS := bitcoin_interp.o bitcoin_scriptcodec.o sha256.o ripemd160.o bitcoin_hash.o
+INTERPOBJS := bitcoin_interp.o bitcoin_scriptcodec.o sha256.o ripemd160.o \
+    bitcoin_hash.o
 # bitcoin_tx.asm parser harness also exercises sha256d/merkle_root.
 TXOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o
 # bitcoin_net.asm framing needs sha256d (checksum).
@@ -174,12 +175,12 @@ tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
 # sha256d) is documented in this Makefile as misbehaving under aggressive C
 # optimisation, and this harness sits directly on top of it.
 REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/utxo_live.c daemon/undo_log.c \
-             daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c
+    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c
 REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o \
-             bitcoin_chainwork.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_cons.o \
-             bitcoin_p2p.o bitcoin_net.o bitcoin_mempool.o \
-             bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o \
-             bitcoind.o bitcoin_headers.o
+    bitcoin_chainwork.o bitcoin_hash.o sha256.o bitcoin_tx.o \
+    bitcoin_cons.o bitcoin_p2p.o bitcoin_net.o bitcoin_mempool.o \
+    bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o \
+    bitcoin_headers.o
 tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(REORGSRCS) $(REORGOBJS)
 
@@ -190,8 +191,8 @@ tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 # steady-state-sized memtable. Previously built by hand, which is how it went
 # stale and briefly vanished; a real target keeps it buildable and honest.
 BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
-                 bitcoin_store_fast.o bitcoin_utxo_lsm.o bitcoin_utxo_store.o \
-                 bitcoin_utxo.o bitcoin_idxscan.o
+    bitcoin_store_fast.o bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o \
+    bitcoin_idxscan.o
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
 
@@ -216,9 +217,10 @@ tests/test_net_policy: tests/test_net_policy.c daemon/net_policy.c bitcoin_net.o
 #   make tests/test_utxo_recover && ./tests/test_utxo_recover <datadir>
 # It still gets a rule so it is built/compiled-checked on demand rather than
 # rotting the way daemon/build_utxo did with no target at all.
-RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/undo_log.c \
-               daemon/tx_accept.c daemon/reorg.c daemon/locator_build.c daemon/archive_verify.c \
-               daemon/node_config.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/undo_log.c daemon/tx_accept.c \
+    daemon/mempool_cfg.c daemon/reorg.c daemon/locator_build.c daemon/archive_verify.c \
+    daemon/node_config.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    bitcoin_taproot_sighash.c
 tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 	$(CC) -no-pie -O0 -o $@ $(RECOVERSRCS) $(DAEMONOBJS)
 
@@ -228,9 +230,10 @@ tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 # outbound_connect is static in daemon/main.c, so the test #includes that TU
 # directly (renaming its main) and therefore links the same objects the daemon
 # does, minus daemon/main.c itself (it comes in via the #include).
-DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/tx_accept.c \
-            daemon/reorg.c daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
-            bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/tx_accept.c daemon/mempool_cfg.c \
+    daemon/upload_cap.c daemon/reorg.c daemon/undo_log.c daemon/locator_build.c \
+    daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
+    bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DIALSRCS) $(DAEMONOBJS)
 
@@ -252,15 +255,15 @@ tests/test_block_genesis: tests/test_block_genesis.c $(CONSOBJS)
 # tests/test_bitcoind linked fine only because stale .o files happened to
 # already exist on disk from earlier incremental builds; a clean rebuild
 # failed with "cannot find X.o" at the final link step.
-DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
-              bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
-              bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o \
-              bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
-              bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
-              secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-              bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
-              secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
-              bitcoin_chainwork.o
+DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
+    bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
+    node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o \
+    bitcoin_serve.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
+    bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
+    secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
+    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
+    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
+    bitcoin_addr.o bitcoin_chainwork.o
 
 tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
@@ -281,7 +284,8 @@ tests/test_log: tests/test_log.c $(LOGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_log.c $(LOGOBJS)
 
 # S6 CLI (bitcoin_cli.asm): queries the store + hashing/tx primitives.
-CLIOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o bitcoin_cli.o
+CLIOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
+    bitcoin_cli.o
 tests/test_cli: tests/test_cli.c $(CLIOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_cli.c $(CLIOBJS)
 
@@ -297,7 +301,9 @@ tests/test_headers: tests/test_headers.c $(HEADOBJS)
 # as the bitcoind sync harness; the asm is identical and correct at -O0.
 # bitcoind.o bundles node_sync/node_serve_block/node_drain which reference the
 # cons/store/tx symbols, so link the full DAEMONOBJS superset.
-IBDOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_idxscan.o
+IBDOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
+    bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
+    bitcoin_headers.o bitcoin_idxscan.o
 tests/test_ibd_headers: tests/test_ibd_headers.c $(IBDOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_headers.c $(IBDOBJS)
 
@@ -325,7 +331,8 @@ tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_addrmgr.c $(ADMRGOBJS)
 
 # bitcoin_keys.asm (secp256k1 pubkey derivation for wallet/BIP32).
-KEYSOBJS := secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_keys.o
+KEYSOBJS := secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_scalar.o \
+    secp256k1_scalar_c.o bitcoin_keys.o
 tests/test_keys: tests/test_keys.c $(KEYSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_keys.c $(KEYSOBJS)
 
@@ -340,8 +347,16 @@ tests/test_idx: tests/test_idx.c $(IDXOBJS)
 # tests/test_mempool_accept_modern's MEMPACCOBJS plus the LSM/memtable objects.
 # SERVETXVALSRCS are raw .c sources (not pre-built .o) needed by every target
 # that links bitcoin_serve.o, since .do_tx's new call sites live there.
-SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o sha256.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o
-SERVETXVALSRCS := daemon/tx_accept.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
+    bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o \
+    bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o \
+    sha256.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
+    bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o \
+    secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o \
+    secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o
+SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
+    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
@@ -394,7 +409,10 @@ tests/test_hmac: tests/test_hmac.c $(HMACOBJS)
 # bitcoin_bip32.asm (BIP32 master + CKDpriv + full-path + extkey/fingerprint;
 # secp256k1 + HMAC + SHA-512 + base58/hash160). bitcoin_bip32.o's fingerprint
 # references hash160/base58check from bitcoin_addr.o, so those deps are here.
-BIP32OBJS := bitcoin_bip32.o bitcoin_hmac.o sha512.o bitcoin_keys.o secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_addr.o sha256.o bitcoin_hash.o ripemd160.o
+BIP32OBJS := bitcoin_bip32.o bitcoin_hmac.o sha512.o bitcoin_keys.o \
+    secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_scalar.o \
+    secp256k1_scalar_c.o bitcoin_addr.o sha256.o bitcoin_hash.o \
+    ripemd160.o
 tests/test_bip32_master: tests/test_bip32_master.c $(BIP32OBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_bip32_master.c $(BIP32OBJS)
 tests/test_bip32_chain: tests/test_bip32_chain.c $(BIP32OBJS)
@@ -476,7 +494,9 @@ tests/test_sighash_oob: tests/test_sighash_oob.c $(SIGHASHOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_sighash_oob.c $(SIGHASHOBJS)
 
 # script layer: DER sig parsing + full P2PKH verification.
-SCRIPTOBJS := bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o sha256.o
+SCRIPTOBJS := bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_fe.o \
+    secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o secp256k1_point.o \
+    secp256k1_point_ct.o bitcoin_hash.o sha256.o
 tests/test_script: tests/test_script.c $(SCRIPTOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_script.c $(SCRIPTOBJS)
 
@@ -508,8 +528,9 @@ tests/test_utxo_lsm: tests/test_utxo_lsm.c $(UTXOLSMOBJS)
 # Whole-transaction validator (test_txval.c): tx_parse + UTXO store +
 # P2PKH spend verification (verify_p2pkh + its sighash/pubkey/ecdsa chain).
 TXVALOBJS := bitcoin_utxo.o bitcoin_tx.o bitcoin_script.o bitcoin_sighash.o \
-             bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
-             secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o sha256.o
+    bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o \
+    sha256.o
 tests/test_txval: tests/test_txval.c tests/txval_vec.h $(TXVALOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_txval.c $(TXVALOBJS)
 
@@ -561,18 +582,20 @@ tests/test_wrpc_send: tests/test_wrpc_send.c wallet_core.c $(WALLETPRIMS) bitcoi
 
 # P2SH / multisig: p2sh_hash (RIPEMD160 of SHA256 of redeem script) +
 # OP_CHECKMULTISIG verification over the existing sighash/pubkey/ecdsa chain.
-MULTISIGOBJS := bitcoin_multisig.o bitcoin_script.o bitcoin_sighash.o \
-                bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
-                secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o sha256.o ripemd160.o
+MULTISIGOBJS := bitcoin_multisig.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
+    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
+    secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
+    ripemd160.o
 tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_multisig.c $(MULTISIGOBJS)
 
 # Script-level P2SH / BIP16 VerifyScript (bitcoin_verify.c): reuses the same
 # sighash/pubkey/ecdsa/ripemd160 object set as test_multisig, plus the full
 # C VerifyScript (two-pass + P2SH sub-script execution + CheckMultisig).
-VERIFYOBJS := bitcoin_verify.c bitcoin_sighash.o bitcoin_script.o \
-              bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
-              secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o sha256.o ripemd160.o
+VERIFYOBJS := bitcoin_verify.c bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o \
+    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
+    secp256k1_point.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
+    ripemd160.o
 tests/verify_p2sh_shim: tests/verify_p2sh_shim.c $(VERIFYOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/verify_p2sh_shim.c $(VERIFYOBJS)
 tests/test_verify_p2sh: tests/test_verify_p2sh.c $(VERIFYOBJS)
@@ -623,7 +646,8 @@ tests/test_sigops: tests/test_sigops.c bitcoin_sigops.o bitcoin_scriptcodec.o
 
 # BIP340 Schnorr verify + BIP341 Taproot helpers (secp256k1_schnorr.asm,
 # secp256k1_taproot.asm) over the verified point/field/scalar + sha256/pubkey.
-TAPRIMSOBJS := secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_pubkey.o
+TAPRIMSOBJS := secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
+    secp256k1_scalar_c.o sha256.o bitcoin_pubkey.o
 tests/test_schnorr: tests/test_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
 tests/test_taproot: tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
@@ -632,7 +656,9 @@ tests/test_taproot: tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
 # BIP341/BIP342 taproot sighash + spend validation: C glue (bitcoin_taproot_sighash.c)
 # over the verified asm crypto core (sha256_full, tagged_hash256, schnorr_verify,
 # point/fe/scalar/pubkey). Vectors are Core-validated (bip-0341 wallet-test-vectors).
-TAPSIGHASHOBJS := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproot.o bech32.o bitcoin_interp.o bitcoin_scriptcodec.o ripemd160.o bitcoin_hash.o $(TAPRIMSOBJS)
+TAPSIGHASHOBJS := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproot.o bech32.o \
+    bitcoin_interp.o bitcoin_scriptcodec.o ripemd160.o bitcoin_hash.o \
+    $(TAPRIMSOBJS)
 tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h tests/taproot_vec.h $(TAPSIGHASHOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
 
@@ -642,19 +668,22 @@ tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h t
 # spends, oracle validated against the official BIP-0143 vector. Also covers the
 # P2TR key-path spend through the same whole-tx materials.
 SEGWITOBJS := bitcoin_segwit.c bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproot.o \
-              bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
-              secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o
+    bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o \
+    secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
+    secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o \
+    bitcoin_addr.o
 tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/modern_spend.h $(SEGWITOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
 
 # FULL mempool acceptance pipeline for modern outputs: mempool policy +
 # whole-tx validation + ECDSA/Schnorr verify (bitcoin_txval_modern.c +
 # bitcoin_segwit.c + bitcoin_taproot_sighash.c + asm utxo/mempool/tx/taproot).
-MEMPACCOBJS := bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
-               bitcoin_mempool_policy.c bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
-               secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-               bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o \
-               secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o
+MEMPACCOBJS := bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_mempool_policy.c \
+    bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o secp256k1_schnorr.o \
+    secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o \
+    secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o \
+    ripemd160.o bitcoin_addr.o
 tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/modern_vec.h tests/modern_spend.h $(MEMPACCOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_mempool_accept_modern.c $(filter %.c,$(MEMPACCOBJS)) $(filter %.o,$(MEMPACCOBJS))
 
@@ -663,13 +692,13 @@ tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/moder
 # txval_modern -> tx_accept_validate's accept/reject + mempool storage) --
 # NOT covered by test_mempool_accept_modern, which only exercises the old
 # bitcoin_utxo.asm-backed passthrough shim, never tx_accept.c itself.
-TXACCEPTOBJS := daemon/tx_accept.c bitcoin_mempool_policy.c bitcoin_txval_modern.c \
-                bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o \
-                bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
-                secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-                bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
-                secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o \
-                ripemd160.o bitcoin_addr.o
+TXACCEPTOBJS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
+    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o \
+    bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
+    secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
+    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
+    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o \
+    bitcoin_hash.o ripemd160.o bitcoin_addr.o
 tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXACCEPTOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_tx_accept_e2e.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS))
 
@@ -758,10 +787,10 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # (per-block undo data, now wired into the live apply path) and
 # daemon/locator_build.c (the real multi-hash block locator), plus
 # bitcoin_chainwork.o for the cumulative-work primitives they run on.
-DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/tx_accept.c \
-              daemon/reorg.c daemon/undo_log.c daemon/locator_build.c \
-              daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
-              bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/tx_accept.c daemon/reorg.c \
+    daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
+    daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c \
+    bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS)
 
