@@ -382,6 +382,28 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   it (restart-resume), recovering a crash between checkpoints exactly like the
   block store's resume. `test_utxo_store` verifies put/spend/dedup, full-WAL
   reload, checkpoint + crash-tail restart-resume, and on-disk framing.
+- **LSM-tree UTXO store** (`asm/bitcoin_utxo_lsm.asm`) — replaces
+  `bitcoin_utxo_store.asm`'s single pre-sized in-memory table as the
+  chain-scale UTXO set: that table has to be sized upfront for the FINAL
+  total live-UTXO count (~408M), so a full-archive replay write-amplified
+  ~13x (scattered writes across a 51GB structure regardless of how few
+  entries are actually live at that point in the replay). The LSM store
+  instead uses a small BOUNDED memtable (`bitcoin_utxo.asm`'s table,
+  reused unchanged) that flushes to sorted, Bloom-filtered, immutable run
+  files and periodically compacts via a streaming k-way merge — mirroring
+  Core's LevelDB-behind-bounded-`dbcache` design, built from scratch (no
+  external libraries). `bitcoin_utxo_store.asm` itself is untouched and
+  still does real work here: its WAL format is reused verbatim as the
+  LSM's own per-generation write-ahead log. `daemon/build_utxo.c` replays
+  the whole archive into it (full-archive rate now stays flat instead of
+  collapsing); `daemon/utxo_live.c` is the live daemon's own instance
+  (single writer = the download worker, persisted-applied-height catch-up
+  so it also picks up blocks an inbound peer connection wrote); each
+  inbound connection gets its own read-only snapshot
+  (`daemon/tx_accept.c`) for tx acceptance (below). `tests/test_utxo_lsm`
+  (100+-trial randomized stress incl. compaction, crash-recovery
+  simulation) and `tests/test_tx_accept_e2e` (real pipeline end-to-end)
+  both green.
 - **bech32 / bech32m codec** (`asm/bech32.asm`) — BIP173/350 address codec
   (`bech32_polymod` 30-bit CRC, create/verify checksum with the XOR-1 vs
   0x2bc830a3 switch, 8<->5 bit regroup, encode/decode), verified against every
@@ -451,6 +473,21 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   absent prevout, double-spend, negative fee) rejected in agreement with Core.
   `test_segwit_sighash` 17 + `test_mempool_accept_modern` 23 checks green;
   `make test` suite green. Closes the modern-output validation gap.
+- **Live-daemon mempool acceptance (2026-08-18)** — the above validation
+  pipeline is now actually wired into the running P2P daemon, not just
+  exercised standalone in tests. `bitcoin_serve.asm`'s inbound `.do_tx`
+  handler used to accept any syntactically-minimal tx with zero
+  validation; it now calls a new per-connection dispatcher
+  (`asm/daemon/tx_accept.c`) that runs every inbound tx through
+  `mpool_policy_add` + `txval_modern` against a read-only LSM UTXO
+  snapshot (one `utxo_lsm_reload()` per forked connection) before storing
+  anything for relay — rejecting on either check, and specifically
+  ordered so a signature failure never triggers the policy layer's own
+  mempool insert (it has no public rollback API). New permanent test
+  `tests/test_tx_accept_e2e.c` proves the real pipeline end-to-end
+  (valid spend accepted+stored; corrupted-signature spend rejected with
+  no phantom mempool entry). Full `make test` suite (~80 harnesses)
+  green. Remaining: soak test against live real peers.
 - **Differential consensus harness vs Bitcoin Core (compliance gate)** —
   `validation/consensus_diff.py` + `asm/tests/consensus_shim` feed the SAME real
   mainnet block/tx bytes to (a) the ASM consensus stack (`cons_verify` /
@@ -576,8 +613,9 @@ bitcoinmachinecode/
 |   +-- bitcoin_pubkey.asm     # fe_pow + pubkey_parse: secp256k1 pubkey de/compress
 |   +-- bitcoin_sighash.asm    # legacy SIGHASH_ALL preimage builder
 |   +-- bitcoin_script.asm     # der_parse_sig + verify_p2pkh (end-to-end P2PKH validate)
-|   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script)
-|   +-- bitcoin_utxo_store.asm # PERSISTENT UTXO: WAL utxo.dat + idx checkpoint
+|   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script); also the LSM store's memtable engine
+|   +-- bitcoin_utxo_store.asm # WAL utxo.dat + idx checkpoint; also the LSM store's per-generation WAL engine
+|   +-- bitcoin_utxo_lsm.asm   # CHAIN-SCALE persistent UTXO: bounded memtable + sorted Bloom-filtered runs + compaction
 |   +-- bech32.asm             # BIP173/350 bech32/bech32m address codec
 |   +-- bitcoin_bip32.asm      # BIP32 master/CKD/derive_path + xprv/xpub
 |   +-- bitcoin_bip39.asm      # BIP39 mnemonic<->seed (PBKDF2-HMAC-SHA512)
@@ -615,6 +653,10 @@ bitcoinmachinecode/
 |       +-- addrgather.c      # getaddr -> addr/addrv2 -> peers.dat address book
 |       +-- peertest.c        # verify which peers serve block bodies
 |       +-- main.c            # daemon: sync / ibd / follow / serve (self-healing built-in catch-up) / server-test
+|       +-- build_utxo.c      # one-shot: replay the whole archive into the LSM UTXO store
+|       +-- utxo_walk.h       # shared block input/output walker (build_utxo.c + utxo_live.c)
+|       +-- utxo_live.c       # live daemon's own LSM UTXO instance: single-writer catch-up in the download worker
+|       +-- tx_accept.c       # live daemon's inbound tx acceptance: per-connection read-only LSM snapshot + mempool policy/txval dispatch
 |       +-- cli.c             # thin driver for the asm cli_main
 +-- data/                    # durable chain storage: ONE unified archive
 |                           # (blk00000.dat..blkNNNNN.dat + index.dat + headers.dat)
