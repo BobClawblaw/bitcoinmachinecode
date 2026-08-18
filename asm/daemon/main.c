@@ -42,6 +42,7 @@
 #include "utxo_walk.h"   /* utxo_walk_read_varint, for tx-count in [block] stored logs */
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 #include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
+#include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -539,11 +540,15 @@ static int serve_loop(int fd, int lfd){
  * There was previously NO inbound limit at all: the accept loop forked a
  * child per connection with nothing bounding it, so an attacker could open
  * connections until the host ran out of processes or memory. */
-#define MAX_CONNECTIONS            125
-#define MAX_BLOCK_RELAY_ONLY       2
-#define MAX_FEELER                 1
-#define MAX_INBOUND   (MAX_CONNECTIONS - MUX_MAX_OUT - MAX_BLOCK_RELAY_ONLY - MAX_FEELER)
-#define FEELER_INTERVAL_MS         120000L   /* Core's ~2 minutes */
+/* These are HARD BOUNDS (array sizing). The live values come from g_cfg,
+ * loaded from bitcoin.conf at boot and clamped to these -- see
+ * daemon/node_config.c. An array cannot be sized from a runtime value, so the
+ * ceiling stays compiled while the operator tunes underneath it. */
+#define MAX_BLOCK_RELAY_ONLY       8         /* ceiling; g_cfg picks the live count */
+#define CFG_INBOUND_LIMIT() \
+    (g_cfg.max_connections - g_cfg.max_outbound - g_cfg.max_block_relay_only - g_cfg.max_feeler)
+#define CFG_BRO_N() \
+    (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
 #define MUX_MAX_OUT 8
 static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
@@ -1660,13 +1665,13 @@ static long dl_catchup(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(byte_rate<DLC_DEAD_WEIGHT_BPS){
+                if(byte_rate<g_cfg.dead_weight_bps){
                     dead_ticks[w]++;
-                    if(dead_ticks[w]>=DLC_DEAD_WEIGHT_TICKS){
+                    if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
                         if(bidx>=0 && bidx<nlive && !banned[bidx]){
                             int usable=0; for(int q=0;q<nlive;q++) if(!banned[q]) usable++;
-                            if(usable > DLC_MIN_USABLE_PEERS){ banned[bidx]=1; nbanned++; }
+                            if(usable > g_cfg.min_usable_peers){ banned[bidx]=1; nbanned++; }
                             /* else: at the floor -- still kill the worker so it
                              * rotates to a different peer, but keep this one
                              * selectable. A slow peer beats no peer. */
@@ -1684,7 +1689,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * changes once a drop actually fires, which can take a while to
              * show up at all). Resets to nothing once healthy or just cut. */
             char dragbuf[32]="";
-            if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],DLC_DEAD_WEIGHT_TICKS);
+            if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],g_cfg.dead_weight_ticks);
             fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
                     stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, dragbuf);
@@ -2049,7 +2054,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * DIFFERENT netgroup than any existing leg where possible: two peers
          * in the same /16 are far more likely to be the same operator, which
          * defeats the point of having them. */
-        for(int b=0; b<MAX_BLOCK_RELAY_ONLY; b++){
+        for(int b=0; b<CFG_BRO_N(); b++){
             if(bro_fd[b] >= 0) continue;
             if((rot % 16) != 0) break;             /* rate-limit re-dials */
             for(int ci=0; ci<nsrc; ci++){
@@ -2059,7 +2064,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     unsigned oip; if(inet_pton(AF_INET,mux_out_host[k],&oip)!=1) continue;
                     if(net_netgroup_v4(oip)==net_netgroup_v4(cip)){ clash=1; break; }
                 }
-                for(int k=0;k<MAX_BLOCK_RELAY_ONLY && !clash;k++){
+                for(int k=0;k<CFG_BRO_N() && !clash;k++){
                     if(bro_fd[k]<0) continue;
                     unsigned oip; if(inet_pton(AF_INET,bro_host[k],&oip)!=1) continue;
                     if(net_netgroup_v4(oip)==net_netgroup_v4(cip)) clash=1;
@@ -2078,8 +2083,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * Validates a book entry and drops it. This is what keeps the address
          * book from rotting -- without it we only discover the rot at boot,
          * as happened on 2026-08-18 (1,974 entries, ~4% still answering). */
-        if(now_ms >= next_feeler_ms && nsrc > 0){
-            next_feeler_ms = now_ms + FEELER_INTERVAL_MS;
+        if(g_cfg.max_feeler > 0 && now_ms >= next_feeler_ms && nsrc > 0){
+            next_feeler_ms = now_ms + g_cfg.feeler_interval_ms;
             int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
             int alive = net_feeler_probe(srcpool[pick]);
             fprintf(stderr,"[net] feeler %s -> %s\n", srcpool[pick], alive?"alive":"dead");
@@ -2210,7 +2215,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c=accept(l,(struct sockaddr*)&ca,&cal);
-            if(c>=0 && g_inbound_n >= MAX_INBOUND){
+            if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
                 /* At capacity: accept and close immediately so the connection
                  * is refused cleanly rather than sitting in the backlog, and
                  * do NOT fork. Rate-limited log -- under a flood this would
@@ -2220,7 +2225,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                                  nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
                 if(nms - last_full_log_ms > 10000){
                     fprintf(stderr,"[serve] inbound at capacity (%d/%d) -- refusing new connections\n",
-                            (int)g_inbound_n, MAX_INBOUND);
+                            (int)g_inbound_n, CFG_INBOUND_LIMIT());
                     last_full_log_ms = nms;
                 }
                 close(c);
@@ -2254,7 +2259,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 close(c);
                 if(w > 0) g_inbound_n++;
                 fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d (%d/%d inbound)\n",
-                        ipbuf, ntohs(ca.sin_port), w, (int)g_inbound_n, MAX_INBOUND);
+                        ipbuf, ntohs(ca.sin_port), w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
@@ -2313,6 +2318,11 @@ int main(int argc, char** argv){
     char absp[4096];
     if(!realpath(dir, absp)){ perror("realpath"); return 1; }
     if(chdir(absp)!=0){ perror("chdir"); return 1; }
+    /* Load durable tuning BEFORE anything reads it -- and before the fork, so
+     * the download worker inherits the same resolved values. */
+    { char cfgpath[512];
+      node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      node_config_log(); }
     dir = absp;
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
 

@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include "node_config.h"
 
 extern int  tcp_connect_ip(unsigned, unsigned short);
 extern long p2p_write(int,const char*,unsigned,const void*,unsigned);
@@ -47,11 +48,11 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken; } ai_quota_t;
 
 static int ai_quota_ok(ai_quota_t* q, unsigned ip){
-    if(q->taken >= AI_MAX_PER_RESPONSE) return 0;
+    if(q->taken >= g_cfg.addr_max_per_response) return 0;
     unsigned g = net_netgroup_v4(ip);
     for(int i=0;i<q->n;i++){
         if(q->ng[i]==g){
-            if(q->cnt[i] >= AI_MAX_PER_NETGROUP) return 0;
+            if(q->cnt[i] >= g_cfg.addr_max_per_netgroup) return 0;
             q->cnt[i]++; q->taken++; return 1;
         }
     }
