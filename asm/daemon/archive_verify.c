@@ -36,6 +36,8 @@
 #include <fcntl.h>
 #include <dirent.h>
 
+#include "archive_verify.h"
+
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern int  store_truncate_to(void* st, long target_height);
@@ -170,6 +172,265 @@ long archive_layout_monotonic(long upto){
     }
     close(fd);
     return bad;
+}
+
+/* ---------------------------------------------------------------------------
+ * BOOT VERIFICATION (Core -checkblocks / -checklevel)
+ *
+ * Core's levels are defined against its own storage model (undo data,
+ * disconnect/reconnect). Ours is an append-only archive plus an LSM UTXO set,
+ * so the levels are mapped to the strongest checks this layout supports, in
+ * the same order of increasing cost:
+ *
+ *   0  nothing
+ *   1  index records well-formed (present, non-zero size, sane geometry)
+ *   2  + block data laid out monotonically across the checked range
+ *   3  + on-disk frame is intact AND the body hashes to the index hash
+ *   4  + cons_verify on the body (PoW, tx parsing, coinbase, merkle root)
+ *
+ * Level 3 covers the frame plus the HEADER: block_hash digests 80 bytes, so a
+ * body whose transaction data has been corrupted still hashes correctly and
+ * passes. Only level 4 recomputes the merkle root and therefore notices. Both
+ * properties are pinned by tests/test_archive_check.c, because the difference
+ * decides which level is worth running.
+ *
+ * ON-DISK FRAMING. index.dat's data_pos is the offset of the 8-byte FRAME
+ * ([u32 len LE][u32 magic 0xd9b4bef9]), not of the block itself -- the block
+ * payload starts at data_pos + 8 and runs for data_size bytes. See the format
+ * block at the top of bitcoin_store.asm. The first version of this function
+ * read data_size bytes from data_pos, so it hashed 8 bytes of frame plus a
+ * truncated header and reported EVERY block in a healthy archive as corrupt.
+ * Its unit test passed only because the fixture was written with the same
+ * wrong assumption; the live run against a real archive is what caught it.
+ * The frame is now validated explicitly, which makes that class of mistake
+ * fail loudly at the first block instead of silently mis-reading every one.
+ *
+ * Level 3 is the first level that reads actual block DATA. Levels 1 and 2 only
+ * read index.dat, so they cannot detect a truncated or overwritten blk file --
+ * which is exactly the failure mode that destroyed this archive once. That is
+ * why the default is 3, matching Core's own default.
+ *
+ * NOTE ON LEVEL 4: cons_verify does NOT verify scripts or signatures (see its
+ * header in bitcoin_cons.asm). No level here can, because nothing in this
+ * codebase script-verifies a block. Level 4 is therefore PoW + merkle
+ * integrity, not full consensus validation, and must not be read as such.
+ *
+ * Returns the number of problems found (0 == clean), or -1 if the check could
+ * not run at all. Read-only: this NEVER modifies or deletes anything.
+ * ------------------------------------------------------------------------ */
+extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
+
+/* On-disk frame that precedes every block body: [u32 len LE][u32 magic].
+ * Mirrors the format block at the top of bitcoin_store.asm -- if that layout
+ * ever changes, this must change with it. */
+#define ARCHIVE_FRAME_LEN 8
+#define ARCHIVE_MAGIC     0xd9b4bef9u
+
+long archive_check(long nblocks, int level){
+    if (level <= 0) return 0;
+
+    int ifd = open("index.dat", O_RDONLY);
+    if (ifd < 0){ fprintf(stderr,"[check] no index.dat -- nothing to verify\n"); return -1; }
+    off_t isz = lseek(ifd, 0, SEEK_END);
+    long n = (long)(isz / 48);
+    if (n <= 0){ close(ifd); fprintf(stderr,"[check] index.dat empty -- nothing to verify\n"); return -1; }
+
+    long tip   = n - 1;
+    long first = (nblocks > 0 && nblocks < n) ? (n - nblocks) : 0;   /* 0 == all */
+
+    long problems = 0, examined = 0, holes = 0;
+    unsigned char rec[48];
+    unsigned char* body = NULL;
+    unsigned char  txids[64 * 32];
+    long body_cap = 0;
+    int  cur_file = -1, cur_fd = -1;
+
+    for (long h = first; h <= tip; h++){
+        if (pread(ifd, rec, 48, (off_t)h * 48) != 48){
+            fprintf(stderr,"[check] height %ld: index record unreadable\n", h);
+            problems++; continue;
+        }
+        if (!rec[0] && !rec[1] && !rec[2] && !rec[3]){ holes++; continue; }  /* not yet downloaded */
+
+        unsigned int fno, dsz; unsigned long long pos;
+        memcpy(&fno, rec + 32, 4);
+        memcpy(&pos, rec + 36, 8);
+        memcpy(&dsz, rec + 44, 4);
+        examined++;
+
+        /* level 1: geometry */
+        if (dsz < 80 || dsz > (32u << 20)){
+            fprintf(stderr,"[check] height %ld: implausible data_size %u\n", h, dsz);
+            problems++; continue;
+        }
+        if (level < 3) continue;
+
+        /* level 3+: read the body and confirm it is the block the index claims */
+        if ((long)dsz > body_cap){
+            unsigned char* nb = realloc(body, dsz);
+            if (!nb){ fprintf(stderr,"[check] height %ld: alloc failed -- stopping\n", h); problems++; break; }
+            body = nb; body_cap = dsz;
+        }
+        /* level 3+: the frame must be intact before the body means anything */
+        if ((int)fno != cur_file){
+            if (cur_fd >= 0) close(cur_fd);
+            char nm[32]; snprintf(nm, sizeof nm, "blk%05u.dat", fno);
+            cur_fd = open(nm, O_RDONLY);
+            cur_file = (int)fno;
+            if (cur_fd < 0){
+                fprintf(stderr,"[check] height %ld: %s missing (pruned or lost)\n", h, nm);
+                problems++; cur_file = -1; continue;
+            }
+        }
+        {
+            unsigned char fr[ARCHIVE_FRAME_LEN];
+            if (pread(cur_fd, fr, ARCHIVE_FRAME_LEN, (off_t)pos) != (ssize_t)ARCHIVE_FRAME_LEN){
+                fprintf(stderr,"[check] height %ld: cannot read frame at blk%05u.dat+%llu\n",
+                        h, fno, (unsigned long long)pos);
+                problems++; continue;
+            }
+            unsigned flen, fmagic;
+            memcpy(&flen,   fr,     4);
+            memcpy(&fmagic, fr + 4, 4);
+            if (fmagic != ARCHIVE_MAGIC){
+                fprintf(stderr,"[check] height %ld: bad frame magic 0x%08x at blk%05u.dat+%llu\n",
+                        h, fmagic, fno, (unsigned long long)pos);
+                problems++; continue;
+            }
+            if (flen != dsz){
+                fprintf(stderr,"[check] height %ld: frame length %u disagrees with index data_size %u\n",
+                        h, flen, dsz);
+                problems++; continue;
+            }
+        }
+        if (pread(cur_fd, body, dsz, (off_t)pos + ARCHIVE_FRAME_LEN) != (ssize_t)dsz){
+            fprintf(stderr,"[check] height %ld: short read at blk%05u.dat+%llu (%u bytes)\n",
+                    h, fno, (unsigned long long)(pos + ARCHIVE_FRAME_LEN), dsz);
+            problems++; continue;
+        }
+        unsigned char got[32];
+        block_hash(got, body);
+        if (memcmp(got, rec, 32) != 0){
+            fprintf(stderr,"[check] height %ld: body hash does not match the index record\n", h);
+            problems++; continue;
+        }
+        if (level < 4) continue;
+
+        /* level 4: PoW + merkle integrity of the body itself */
+        if (cons_verify(body, (long)dsz, txids, 64) != 1){
+            fprintf(stderr,"[check] height %ld: cons_verify failed (PoW/merkle)\n", h);
+            problems++;
+        }
+    }
+
+    if (cur_fd >= 0) close(cur_fd);
+    free(body);
+    close(ifd);
+
+    /* level 2+: layout ordering over the checked range. Cheap (index only) and
+     * it is the precondition store_truncate_to and store_prune both depend on,
+     * so a violation matters well beyond this check. */
+    if (level >= 2){
+        long badh = archive_layout_monotonic(tip);
+        if (badh >= 0){
+            fprintf(stderr,"[check] block data is NOT laid out monotonically (first break at height %ld) -- "
+                           "truncation and pruning will refuse to run\n", badh);
+            problems++;
+        }
+    }
+
+    fprintf(stderr,"[check] checklevel=%d over %ld block(s) [%ld..%ld]: %ld examined, %ld hole(s), %ld problem(s)\n",
+            level, tip - first + 1, first, tip, examined, holes, problems);
+    return problems;
+}
+
+/* archive_first_hole(): lowest height <= upto whose index record is empty, or
+ * -1 if the range is fully populated. A "hole" is a height we have never
+ * downloaded -- distinct from corruption, and the reason pruning must not run
+ * during an incomplete sync. */
+long archive_first_hole(long upto){
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return -1;
+    unsigned char rec[48];
+    long found = -1;
+    for (long h = 0; h <= upto; h++){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48){ found = h; break; }
+        if (!rec[0] && !rec[1] && !rec[2] && !rec[3]){ found = h; break; }
+    }
+    close(fd);
+    return found;
+}
+
+/* archive_prune_height_for_budget(): the lowest height that can be RETAINED
+ * while keeping total retained block data under `budget_bytes`.
+ *
+ * Core's -prune is a size budget, not a height, so the budget has to be turned
+ * into the height gate store_prune actually takes. Walk back from the tip
+ * accumulating real data_size values -- not an average block size, which would
+ * be badly wrong at both ends of this chain (early blocks are ~200 bytes,
+ * recent ones ~1.5 MB).
+ *
+ * Returns the prune height (>=0), or -1 if it could not be computed. A budget
+ * larger than the whole archive yields 0, i.e. retain everything. */
+long archive_prune_height_for_budget(long long budget_bytes){
+    if (budget_bytes <= 0) return -1;
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return -1;
+    off_t isz = lseek(fd, 0, SEEK_END);
+    long n = (long)(isz / 48);
+    if (n <= 0){ close(fd); return -1; }
+
+    unsigned char rec[48];
+    long long acc = 0;
+    long h = n - 1;
+    for (; h >= 0; h--){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48) continue;
+        if (!rec[0] && !rec[1] && !rec[2] && !rec[3]) continue;
+        unsigned int dsz; memcpy(&dsz, rec + 44, 4);
+        if (acc + (long long)dsz > budget_bytes) break;
+        acc += (long long)dsz;
+    }
+    close(fd);
+    return (h < 0) ? 0 : h + 1;    /* h is the first height that did NOT fit */
+}
+
+
+/* archive_prune_decide(): should we delete anything, and if so below what
+ * height? Pure decision, no side effects -- SEPARATE FROM THE DELETION on
+ * purpose.
+ *
+ * store_prune physically unlinks block files. The last time a destructive
+ * store primitive was driven straight from inline caller logic, that logic
+ * was wrong and the archive was lost. Splitting the decision out means the
+ * refusal cases can be tested exhaustively against small synthetic archives
+ * instead of requiring a multi-hundred-megabyte one, and main.c is reduced to
+ * acting on a verdict it cannot get subtly wrong.
+ *
+ * out_height receives the first height to RETAIN; out_detail receives the
+ * offending height for the refusal verdicts (-1 otherwise). */
+archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
+                                             long* out_height, long* out_detail){
+    if (out_height) *out_height = 0;
+    if (out_detail) *out_detail = -1;
+
+    long ph = archive_prune_height_for_budget(budget_bytes);
+    if (ph < 0)  return ARCHIVE_PRUNE_ERROR;
+    if (ph == 0) return ARCHIVE_PRUNE_NOTHING;   /* budget covers the archive */
+
+    if (out_height) *out_height = ph;
+
+    long badh = archive_layout_monotonic(ph);
+    if (badh >= 0){
+        if (out_detail) *out_detail = badh;
+        return ARCHIVE_PRUNE_REFUSE_LAYOUT;
+    }
+    long hole = archive_first_hole(ph);
+    if (hole >= 0){
+        if (out_detail) *out_detail = hole;
+        return ARCHIVE_PRUNE_REFUSE_HOLE;
+    }
+    return ARCHIVE_PRUNE_OK;
 }
 
 /* archive_verify_and_repair(): scan, and if corrupt, truncate back to the last
