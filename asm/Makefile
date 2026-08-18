@@ -195,6 +195,20 @@ BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
 
+# test_utxo_recover -- integration test for utxo_live_recover(), the in-place
+# recovery that makes a failed catch-up survivable instead of terminal.
+# DELIBERATELY NOT IN `make test`: it replays a real 250k-height archive
+# (~3 min) and therefore needs a populated datadir, which a clean checkout
+# does not have. Run it by hand against a real store:
+#   make tests/test_utxo_recover && ./tests/test_utxo_recover <datadir>
+# It still gets a rule so it is built/compiled-checked on demand rather than
+# rotting the way daemon/build_utxo did with no target at all.
+RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/undo_log.c \
+               daemon/tx_accept.c daemon/reorg.c daemon/locator_build.c \
+               bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ $(RECOVERSRCS) $(DAEMONOBJS)
+
 # test_dial_budget -- regression test for the outbound_connect dial-budget hang
 # (download worker wedged in a peer read() for 60+ min, 2026-08-18). It forks
 # its own trickling fake peer, so it needs no external helper or network.
