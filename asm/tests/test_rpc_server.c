@@ -196,8 +196,13 @@ int main(void) {
     ck_out("getnewaddress prints raw address (real server)", expect);
 
     /* ============ 2. getbalance via real bitcoin_cli ======================= */
+    /* getbalance answers from the real scriptPubKey->UTXO address index
+     * (asm/daemon/build_addr_index.c) now, not the wallet's own fake
+     * utxo_* arrays. This harness never launches bitcoin_rpcd with
+     * -datadir=, so the wallet's own default address correctly resolves
+     * to zero, same as real Core before it's synced. */
     run_cli(port, "bitcoin", "bitcoin", "getbalance", NULL);
-    ck_out("getbalance 0.25500000 (real server)", "0.25500000\n");
+    ck_out("getbalance (no addr index configured, real server)", "0.00000000\n");
 
     /* ============ 3. unknown method -> bitcoin_cli stderr ------------------ */
     run_cli(port, "bitcoin", "bitcoin", "nosuchmethod", NULL);
@@ -281,14 +286,14 @@ int main(void) {
               "{\"id\":1,\"method\":\"getbalance\",\"params\":[]}", NULL);
     raw_exchange(port, req, strlen(req));
     ck("V1 success envelope has error:null",
-       has_substr(raw_out, "\"result\":\"0.25500000\",\"error\":null,\"id\":1"));
+       has_substr(raw_out, "\"result\":\"0.00000000\",\"error\":null,\"id\":1"));
 
     /* ============ 13. wrong method on parametrized - GET handled above ====== */
-    /* spot-check listunspent object render via real bitcoin_cli */
+    /* listunspent, same real-index story as getbalance above: no addr
+     * index configured, so the wallet's own default address correctly
+     * owns nothing yet -- an empty array. */
     run_cli(port, "bitcoin", "bitcoin", "listunspent", NULL);
-    ck("listunspent array rendered (real server)",
-       has_substr(out_buf, "\"amount\": \"0.25000000\"") &&
-       has_substr(out_buf, "\"amount\": \"0.00500000\""));
+    ck_out("listunspent (no addr index configured, real server)", "[]\n");
 
     /* ---- teardown ---- */
     kill(srv, SIGTERM);

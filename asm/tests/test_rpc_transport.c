@@ -253,10 +253,17 @@ int main(int argc, char** argv) {
     }
 
     /* ---------- 3. getbalance: string result, Core amount ---------- */
+    /* getbalance now answers from the real scriptPubKey->UTXO address
+     * index (asm/daemon/build_addr_index.c), not the wallet's own fake
+     * utxo_* arrays -- see rpc_commands_set_addr_index's doc comment.
+     * This harness's in-process rpc_dispatch never calls that setter, so
+     * it's exactly a fresh/unconfigured server: the wallet's own default
+     * address (correctly) resolves to zero balance, same as real Core
+     * before it's synced. */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
         run_cli(portfixed, "getbalance", NULL);
-        ck_out("getbalance", "0.25500000\n"); /* 25000000 + 500000 = 25500000 sats */
+        ck_out("getbalance (no addr index configured)", "0.00000000\n");
     }
 
     /* ---------- 4. wire framing: request body captured on the socket ---------- */
@@ -285,41 +292,13 @@ int main(int argc, char** argv) {
     }
 
     /* ---------- 6. listunspent: array of objects ---------- */
+    /* Same real-index story as getbalance above: no addr index configured
+     * in this harness, so the wallet's own default address (correctly)
+     * owns nothing yet -- an empty array, same as real Core pre-sync. */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
-        char tx0[65], tx1[65];
-        { char* d="0123456789abcdef"; for(int i=0;i<32;i++){tx0[i*2]=d[utxo_txid[0][i]>>4];tx0[i*2+1]=d[utxo_txid[0][i]&15];} tx0[64]=0;
-          for(int i=0;i<32;i++){tx1[i*2]=d[utxo_txid[1][i]>>4];tx1[i*2+1]=d[utxo_txid[1][i]&15];} tx1[64]=0; }
         run_cli(portfixed, "listunspent", NULL);
-        char want[2048];
-        snprintf(want, sizeof want,
-            "[\n"
-            "  {\n"
-            "    \"txid\": \"%s\",\n"
-            "    \"vout\": 0,\n"
-            "    \"address\": \"1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH\",\n"
-            "    \"label\": \"\",\n"
-            "    \"scriptPubKey\": \"%s\",\n"
-            "    \"amount\": \"0.25000000\",\n"
-            "    \"confirmations\": 0,\n"
-            "    \"spendable\": true,\n"
-            "    \"solvable\": true,\n"
-            "    \"safe\": true\n"
-            "  },\n"
-            "  {\n"
-            "    \"txid\": \"%s\",\n"
-            "    \"vout\": 1,\n"
-            "    \"address\": \"1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH\",\n"
-            "    \"label\": \"\",\n"
-            "    \"scriptPubKey\": \"%s\",\n"
-            "    \"amount\": \"0.00500000\",\n"
-            "    \"confirmations\": 0,\n"
-            "    \"spendable\": true,\n"
-            "    \"solvable\": true,\n"
-            "    \"safe\": true\n"
-            "  }\n"
-            "]\n", tx0, utxo_script[0], tx1, utxo_script[1]);
-        ck_out("listunspent array write(2)", want);
+        ck_out("listunspent (no addr index configured)", "[]\n");
     }
 
     /* ---------- 7. gettxout: real Core semantics (any confirmed outpoint via
