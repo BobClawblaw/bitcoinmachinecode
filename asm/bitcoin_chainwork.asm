@@ -40,34 +40,49 @@
 ;         out = a+b, 128-bit unsigned add/adc (any overflow past bit 127 is
 ;         silently dropped -- unreachable for real chainwork totals).
 ;
-;   Persistence (store_buf integration -- see bitcoin_store.asm's own header
-;   comment for the base struct layout up to +48/prune_height):
-;     +128..+143 (16 bytes) cur_chainwork -- cumulative chainwork of the
-;                                            in-memory tip, 128-bit LE.
-;     +144..+151 (8 bytes)  chainwork_fd  -- open fd of chainwork.dat, or -1.
+;   Persistence. Chainwork's own per-process state -- the cached cumulative
+;   work of the tip and the open descriptor for chainwork.dat -- lives in
+;   THIS MODULE'S OWN storage (cw_cum / cw_fd, at the bottom of this file).
+;   It is deliberately NOT stored inside the caller's store struct.
 ;
-;   *** STAGE B RELOCATION -- READ THIS BEFORE MOVING THESE AGAIN. ***
-;   Stage A put these fields at +56 / +72. Those offsets are NOT free: they
-;   are the middle of bitcoin_store_fast.asm's read-fd cache, which claims
-;   +56 (an 8-byte "RDFC" magic word) and +64..+127 (eight 8-byte
-;   file_no/fd slots) of the SAME store struct. Stage A never noticed
-;   because nothing called both on one struct -- but the live daemon does:
-;   daemon/utxo_live.c calls store_read_at(store_buf, ...) on exactly the
-;   store_buf that Stage B now also runs chainwork on. Left at +56/+72 the
-;   two would have destroyed each other in both directions:
-;     - store_chainwork_append writes 16 bytes over the RDFC magic and fd
-;       slot 0, so the next store_read_at sees a bad magic and re-inits the
-;       cache -- silently LEAKING every descriptor cached in slots 1..7
-;       (the exact EMFILE exhaustion bitcoin_store.asm's open_file documents
-;       having already caused an outage once), and
-;     - store_rd_init clears +64..+127, which includes +72 -- so
-;       chainwork_fd would be replaced by a (file_no,fd) pair and every
-;       later chainwork pwrite would target a garbage descriptor.
-;   +128..+151 is clear of bitcoin_store.asm (+0..+52) and of
-;   bitcoin_store_fast.asm (+56..+127), and still inside the 256-byte
-;   minimum store-struct allocation used anywhere in the tree
-;   (tests/test_ibd_blocks.c's stb2/stb3[256], the documented floor).
-;   ANY future addition to this struct must be checked against BOTH files.
+;   *** WHY: THE STORE STRUCT IS NOT SAFE TO EXTEND. READ BEFORE CHANGING. ***
+;   Stage A put these fields at store_buf+56/+72. Stage B first moved them to
+;   +128/+144. BOTH were wrong, and each was found only after the fact:
+;     +0  ..+52   bitcoin_store.asm's own fields (core store state)
+;     +56         bitcoin_store_fast.asm read-fd cache magic ("RDFC")
+;     +64 ..+127  bitcoin_store_fast.asm read-fd cache, 8 x 8-byte slots
+;     +120        bitcoin_store_fast.asm MAPPING cache magic  (overlaps +64.. )
+;     +128..+255  bitcoin_store_fast.asm mapping cache, 4 x 32-byte slots
+;   i.e. essentially the WHOLE +56..+255 range of a 256-byte store struct is
+;   already claimed by two other caches, and the struct's documented minimum
+;   size is 256 bytes -- there is no free hole left to move into. The read-fd
+;   cache is live today (daemon/utxo_live.c calls store_read_at on the very
+;   same store_buf); the mapping cache is defined but not yet wired to any
+;   caller, so the second collision was a dormant landmine rather than an
+;   active corruption -- it would have fired silently the moment anyone
+;   enabled that optimisation.
+;
+;   Rather than hunt for a third number that merely happens to be free today,
+;   chainwork now owns its state outright, the same way daemon/utxo_live.c
+;   owns g_utxo_lst as a module global instead of embedding it in store_buf.
+;   That removes this bug class entirely: the store struct can grow however it
+;   likes and chainwork cannot be affected.
+;
+;   Every function below still TAKES `st` as its first argument, purely to
+;   keep one calling convention across the Stage A/B primitives (and so call
+;   sites read consistently) -- but `st` is now IGNORED by all of them and
+;   not one byte is read from or written to it. This is honest rather than
+;   lossy: chainwork.dat is opened by a FIXED name in the process's current
+;   directory, so these functions were never actually per-store-struct in the
+;   first place -- two structs in one process always shared one file.
+;
+;   Uninitialised state is a hard error, not a silent zero: cw_fd starts at -1
+;   and every persistence entry point below returns -1 if store_chainwork_init
+;   has not run. (store_chainwork_get_tip keeps its "always returns 1"
+;   contract and yields zero work, which is the documented empty-chain value;
+;   daemon/reorg.c additionally refuses to make any fork-choice decision until
+;   its own open flag is set, so a zero cache can never be mistaken for a
+;   real comparison.)
 ;
 ;   chainwork.dat holds one 16-byte little-endian cumulative-chainwork
 ;   record per stored height (positional, mirroring index.dat's own
@@ -430,156 +445,9 @@ chainwork_add:
     ret
 
 ; ============================================================================
-; store_chainwork_init(st) -> 1 ok / -1 err
-;   Opens/creates chainwork.dat and zeroes the st+128 cumulative-chainwork
-;   cache. Call once, analogous to (and typically right after) store_init.
-; ============================================================================
-global store_chainwork_init
-store_chainwork_init:
-    push rbp
-    mov  rbp, rsp
-    push rbx
-    mov  rbx, rdi
-    lea  rdi, [rel cwname]
-    mov  esi, 2 | 0x40        ; O_RDWR | O_CREAT
-    mov  edx, 0o644
-    mov  eax, 2                ; open
-    syscall
-    test rax, rax
-    jl   .fail
-    mov  [rbx+144], rax          ; chainwork_fd
-    xor  eax, eax
-    mov  [rbx+128], rax
-    mov  [rbx+136], rax
-    mov  rax, 1
-    jmp  .ret
-.fail:
-    mov  rax, -1
-.ret:
-    pop  rbx
-    pop  rbp
-    ret
-
-; ============================================================================
-; store_chainwork_append(st, height, work[16]) -> 1 ok / -1 err
-;   cumulative(height) = cumulative(height-1) [0 if height==0] + work;
-;   written to chainwork.dat at height*16 and cached at st+128. height MUST
-;   be appended in order (0,1,2,...) -- same positional-append discipline
-;   store_append itself relies on for index.dat.
-; ============================================================================
-; Frame: 4 pushes (rbp,r12,r13,r14) -> save area is [rbp-0x18, rbp) (24
-; bytes: r12,r13,r14); locals must start at rbp-0x18-size or deeper (see
-; block_work's save-area-clearance note -- the same class of bug was caught
-; and fixed here too on re-audit: prev_cum at a naive rbp-0x20 would reach
-; up into r14's saved slot). prev_cum@-0x40, new_cum@-0x60 (each 16 bytes,
-; 0x20 apart, both comfortably below -0x18). sub amount must be ~=8 mod16;
-; 0x68 (104 = 6*16+8) covers the deepest local (-0x60..-0x50) with margin.
-global store_chainwork_append
-store_chainwork_append:
-    push rbp
-    mov  rbp, rsp
-    push r12
-    push r13
-    push r14
-    sub  rsp, 0x68
-    mov  r12, rdi              ; st
-    mov  r13, rsi               ; height
-    mov  r14, rdx                ; work[16]
-    test r13, r13
-    jnz  .have_prev
-    xor  eax, eax
-    mov  [rbp-0x40], rax
-    mov  [rbp-0x38], rax
-    jmp  .prevdone
-.have_prev:
-    mov  rax, r13
-    dec  rax
-    imul rax, 16
-    mov  rdi, [r12+144]           ; chainwork_fd
-    lea  rsi, [rbp-0x40]           ; prev_cum[16]
-    mov  edx, 16
-    mov  r10, rax
-    mov  eax, 17                     ; pread64
-    syscall
-    cmp  rax, 16
-    jne  .err
-.prevdone:
-    lea  rdi, [rbp-0x60]             ; new_cum[16]
-    lea  rsi, [rbp-0x40]              ; prev_cum
-    mov  rdx, r14                      ; work
-    call chainwork_add
-    mov  rax, r13
-    imul rax, 16
-    mov  rdi, [r12+144]
-    lea  rsi, [rbp-0x60]
-    mov  edx, 16
-    mov  r10, rax
-    mov  eax, 18                        ; pwrite64
-    syscall
-    cmp  rax, 16
-    jne  .err
-    mov  rax, [rbp-0x60]
-    mov  [r12+128], rax
-    mov  rax, [rbp-0x58]
-    mov  [r12+136], rax
-    mov  rax, 1
-    jmp  .ret
-.err:
-    mov  rax, -1
-.ret:
-    add  rsp, 0x68
-    pop  r14
-    pop  r13
-    pop  r12
-    pop  rbp
-    ret
-
-; ============================================================================
-; store_chainwork_get_at(st, height, out[16]) -> 1 ok / -1 (no such record)
-; ============================================================================
-global store_chainwork_get_at
-store_chainwork_get_at:
-    push rbp
-    mov  rbp, rsp
-    push rbx
-    push r12
-    mov  rbx, rdi
-    mov  r12, rdx               ; out
-    mov  rax, rsi                ; height
-    imul rax, 16
-    mov  r10, rax
-    mov  rdi, [rbx+144]             ; chainwork_fd
-    mov  rsi, r12
-    mov  edx, 16
-    mov  eax, 17                     ; pread64
-    syscall
-    cmp  rax, 16
-    jne  .fail
-    mov  rax, 1
-    jmp  .ret
-.fail:
-    mov  rax, -1
-.ret:
-    pop  r12
-    pop  rbx
-    pop  rbp
-    ret
-
-; ============================================================================
-; store_chainwork_get_tip(st, out[16]) -> 1 (always; copies the st+128 cache)
-; ============================================================================
-global store_chainwork_get_tip
-store_chainwork_get_tip:
-    mov  rax, [rdi+128]
-    mov  [rsi+0], rax
-    mov  rax, [rdi+136]
-    mov  [rsi+8], rax
-    mov  eax, 1
-    ret
-
-; ============================================================================
 ; chainwork_cmp(a[16], b[16]) -> -1 (a<b) / 0 (a==b) / 1 (a>b)
 ;   Unsigned 128-bit compare, high limb first then low. Leaf, no frame.
+;   THE fork-choice predicate: "is the candidate chain heavier than ours".
 ;   NOTE the -1 return uses a full 64-bit `mov rax, -1`, NOT `mov eax, -1`
 ;   (which zero-extends to 0x00000000FFFFFFFF and would compare unequal to
 ;   -1 in a C caller holding the result in a `long`) -- the exact bug
@@ -605,9 +473,170 @@ chainwork_cmp:
     ret
 
 ; ============================================================================
+; store_chainwork_init(st) -> 1 ok / -1 err        (`st` ignored -- see header)
+;   Opens/creates chainwork.dat and zeroes the cached cumulative work. Closes
+;   any descriptor a previous init left open, so repeated calls in one process
+;   (the tests do exactly this) neither leak nor keep writing through a stale
+;   descriptor. NOTE: on an EXISTING chainwork.dat this leaves the cache at
+;   zero, which would make our own tip look weightless to fork choice --
+;   always follow it with store_chainwork_reload.
+; ============================================================================
+global store_chainwork_init
+store_chainwork_init:
+    push rbp
+    mov  rbp, rsp
+    mov  rax, [rel cw_fd]
+    cmp  rax, 0
+    jl   .noclose
+    mov  rdi, rax
+    mov  eax, 3                ; close
+    syscall
+    mov  qword [rel cw_fd], -1
+.noclose:
+    lea  rdi, [rel cwname]
+    mov  esi, 2 | 0x40         ; O_RDWR | O_CREAT
+    mov  edx, 0o644
+    mov  eax, 2                 ; open
+    syscall
+    test rax, rax
+    jl   .fail
+    mov  [rel cw_fd], rax
+    xor  eax, eax
+    mov  [rel cw_cum+0], rax
+    mov  [rel cw_cum+8], rax
+    mov  rax, 1
+    jmp  .ret
+.fail:
+    mov  rax, -1
+.ret:
+    pop  rbp
+    ret
+
+; ============================================================================
+; store_chainwork_append(st, height, work[16]) -> 1 ok / -1 err  (`st` ignored)
+;   cumulative(height) = cumulative(height-1) [0 if height==0] + work;
+;   written to chainwork.dat at height*16 and cached in cw_cum. height MUST
+;   be appended in order (0,1,2,...) -- same positional-append discipline
+;   store_append itself relies on for index.dat.
+; ============================================================================
+; Frame: 4 pushes (rbp,r12,r13,r14) -> save area is [rbp-0x18, rbp) (24
+; bytes: r12,r13,r14); locals must start at rbp-0x18-size or deeper (see
+; block_work's save-area-clearance note -- the same class of bug was caught
+; and fixed here too on re-audit: prev_cum at a naive rbp-0x20 would reach
+; up into r14's saved slot). prev_cum@-0x40, new_cum@-0x60 (each 16 bytes,
+; 0x20 apart, both comfortably below -0x18). sub amount must be ~=8 mod16;
+; 0x68 (104 = 6*16+8) covers the deepest local (-0x60..-0x50) with margin.
+global store_chainwork_append
+store_chainwork_append:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    push r14
+    sub  rsp, 0x68
+    mov  r13, rsi               ; height
+    mov  r14, rdx                ; work[16]
+    mov  r12, [rel cw_fd]
+    cmp  r12, 0
+    jl   .err                     ; never initialised -> hard error, not fd 0
+    test r13, r13
+    jnz  .have_prev
+    xor  eax, eax
+    mov  [rbp-0x40], rax
+    mov  [rbp-0x38], rax
+    jmp  .prevdone
+.have_prev:
+    mov  rax, r13
+    dec  rax
+    imul rax, 16
+    mov  rdi, r12
+    lea  rsi, [rbp-0x40]           ; prev_cum[16]
+    mov  edx, 16
+    mov  r10, rax
+    mov  eax, 17                     ; pread64
+    syscall
+    cmp  rax, 16
+    jne  .err
+.prevdone:
+    lea  rdi, [rbp-0x60]             ; new_cum[16]
+    lea  rsi, [rbp-0x40]              ; prev_cum
+    mov  rdx, r14                      ; work
+    call chainwork_add
+    mov  rax, r13
+    imul rax, 16
+    mov  rdi, r12
+    lea  rsi, [rbp-0x60]
+    mov  edx, 16
+    mov  r10, rax
+    mov  eax, 18                        ; pwrite64
+    syscall
+    cmp  rax, 16
+    jne  .err
+    mov  rax, [rbp-0x60]
+    mov  [rel cw_cum+0], rax
+    mov  rax, [rbp-0x58]
+    mov  [rel cw_cum+8], rax
+    mov  rax, 1
+    jmp  .ret
+.err:
+    mov  rax, -1
+.ret:
+    add  rsp, 0x68
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; store_chainwork_get_at(st, height, out[16]) -> 1 ok / -1  (`st` ignored)
+;   Leaf: no calls, so pread64's r10 argument and the scratch regs are free.
+;   `height` arrives in rsi, which pread64 needs for its buffer pointer, so it
+;   is moved to r8 (untouched by the syscall) before rsi is overwritten.
+; ============================================================================
+global store_chainwork_get_at
+store_chainwork_get_at:
+    push rbp
+    mov  rbp, rsp
+    mov  rax, [rel cw_fd]
+    cmp  rax, 0
+    jl   .fail
+    mov  r8, rsi                ; height (saved before rsi is reused)
+    imul r8, r8, 16
+    mov  r10, r8                 ; file offset
+    mov  rdi, rax                 ; fd
+    mov  rsi, rdx                  ; out[16]
+    mov  edx, 16
+    mov  eax, 17                    ; pread64
+    syscall
+    cmp  rax, 16
+    jne  .fail
+    mov  rax, 1
+    jmp  .ret
+.fail:
+    mov  rax, -1
+.ret:
+    pop  rbp
+    ret
+
+; ============================================================================
+; store_chainwork_get_tip(st, out[16]) -> 1 (always; copies the cw_cum cache)
+;   (`st` ignored.) Zero for a fresh/never-appended/never-initialised store,
+;   matching an empty chain's zero cumulative work.
+; ============================================================================
+global store_chainwork_get_tip
+store_chainwork_get_tip:
+    mov  rax, [rel cw_cum+0]
+    mov  [rsi+0], rax
+    mov  rax, [rel cw_cum+8]
+    mov  [rsi+8], rax
+    mov  eax, 1
+    ret
+
+; ============================================================================
 ; store_chainwork_reload(st) -> number of 16-byte records in chainwork.dat
-;   (>=0), or -1 on error. Refreshes the st+128 cumulative-work cache from the
-;   file's last record (zeroing it when the file is empty).
+;   (>=0), or -1 on error.  (`st` ignored.) Refreshes the cw_cum cache from
+;   the file's last record (zeroing it when the file is empty).
 ;
 ;   Frame: 3 pushes (rbp,rbx,r12) -> save area is [rbp-0x10, rbp) (rbx,r12).
 ;   The 16-byte `last` local therefore has to start at rbp-0x18-16 or deeper
@@ -623,9 +652,11 @@ store_chainwork_reload:
     push rbx
     push r12
     sub  rsp, 0x30
-    mov  r12, rdi
-    ; ---- size = lseek(chainwork_fd, 0, SEEK_END) ----
-    mov  rdi, [r12+144]
+    mov  r12, [rel cw_fd]
+    cmp  r12, 0
+    jl   .fail
+    ; ---- size = lseek(cw_fd, 0, SEEK_END) ----
+    mov  rdi, r12
     xor  esi, esi
     mov  edx, 2                 ; SEEK_END
     mov  eax, 8                 ; lseek
@@ -636,8 +667,8 @@ store_chainwork_reload:
     mov  rbx, rax                 ; ignored -- floor, never over-count)
     ; ---- cache := 0 (correct as-is for an empty file) ----
     xor  eax, eax
-    mov  [r12+128], rax
-    mov  [r12+136], rax
+    mov  [rel cw_cum+0], rax
+    mov  [rel cw_cum+8], rax
     test rbx, rbx
     jz   .done
     ; ---- cache := record (n-1) ----
@@ -645,7 +676,7 @@ store_chainwork_reload:
     dec  rax
     shl  rax, 4
     mov  r10, rax                  ; offset (n-1)*16
-    mov  rdi, [r12+144]
+    mov  rdi, r12
     lea  rsi, [rbp-0x30]
     mov  edx, 16
     mov  eax, 17                     ; pread64
@@ -653,9 +684,9 @@ store_chainwork_reload:
     cmp  rax, 16
     jne  .fail
     mov  rax, [rbp-0x30]
-    mov  [r12+128], rax
+    mov  [rel cw_cum+0], rax
     mov  rax, [rbp-0x28]
-    mov  [r12+136], rax
+    mov  [rel cw_cum+8], rax
 .done:
     mov  rax, rbx
     jmp  .ret
@@ -669,7 +700,7 @@ store_chainwork_reload:
     ret
 
 ; ============================================================================
-; store_chainwork_truncate(st, target_height) -> 1 ok / -1 err
+; store_chainwork_truncate(st, target_height) -> 1 ok / -1 err (`st` ignored)
 ;   See this file's header for the contract. Frame: 3 pushes (rbp,rbx,r12);
 ;   entry rsp%16==8 -> after the 3 pushes rsp%16==0, so the sub amount must
 ;   be 0 mod 16 to keep the nested store_chainwork_reload call aligned. No
@@ -682,12 +713,14 @@ store_chainwork_truncate:
     push rbx
     push r12
     sub  rsp, 0x10
-    mov  r12, rdi               ; st
     mov  rbx, rsi                ; target_height
     cmp  rbx, -1
     jl   .fail                     ; below -1 is not a meaningful target
+    mov  r12, [rel cw_fd]
+    cmp  r12, 0
+    jl   .fail
     ; ---- current record count (also refreshes the cache, harmlessly) ----
-    mov  rdi, r12
+    xor  edi, edi                   ; `st` is ignored; pass NULL explicitly
     call store_chainwork_reload
     cmp  rax, -1
     je   .fail
@@ -698,14 +731,14 @@ store_chainwork_truncate:
     cmp  rdx, rax
     jge  .noop
     shl  rdx, 4                    ; new length in bytes
-    mov  rdi, [r12+144]
+    mov  rdi, r12
     mov  rsi, rdx
     mov  eax, 77                     ; ftruncate
     syscall
     test rax, rax
     js   .fail
     ; ---- re-derive the cache from the NEW last record ----
-    mov  rdi, r12
+    xor  edi, edi
     call store_chainwork_reload
     cmp  rax, -1
     je   .fail
@@ -720,6 +753,19 @@ store_chainwork_truncate:
     pop  rbx
     pop  rbp
     ret
+
+; ============================================================================
+; MODULE-OWNED STATE (see this file's header for why it is not in store_buf).
+;   cw_fd  : open descriptor for chainwork.dat, or -1 when never initialised.
+;            Lives in .data, NOT .bss, precisely so the "never initialised"
+;            value is -1 rather than .bss's zero -- zero is a perfectly valid
+;            descriptor (stdin), and every entry point above tests `< 0` to
+;            refuse before it can lseek/pread/pwrite/ftruncate on it.
+;   cw_cum : cumulative chainwork of the tip, 128-bit little-endian.
+; ============================================================================
+section .data
+cw_fd:  dq -1
+cw_cum: dq 0, 0
 
 section .rodata
 cwname: db "chainwork.dat", 0
