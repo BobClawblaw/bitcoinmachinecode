@@ -125,6 +125,7 @@ extern void   mpool_policy_init(void* pol, unsigned long long relay_fee_rate,
 extern size_t mpool_policy_state_size(unsigned n);
 extern void   mpool_policy_state_init(void* st, unsigned n);
 extern long   mpool_count(void* mp);
+extern void   mempool_note_accept(const unsigned char txid[32]); /* daemon/mempool_cfg.c */
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const u8* tx, unsigned long txlen,
                                const u8 txid[32], void* utxo);
@@ -197,6 +198,10 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     char ts[17]; for(int k=0;k<8;k++){ u8 b=txid[31-k]; ts[k*2]=hexd[b>>4]; ts[k*2+1]=hexd[b&0xf]; } ts[16]=0;
     fprintf(stderr, "[tx_accept] accepted txid=%s.. vsize=%lu mempool_now=%ld\n",
             ts, txlen, mpool_count(mp_area));
+    /* Stamp arrival so -mempoolexpiry can evict it later. The mempool slot
+     * format has no timestamp field, so this parallel record is what makes
+     * expiry possible without changing the slot layout. */
+    mempool_note_accept(txid);
     return 1;
 }
 

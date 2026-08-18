@@ -48,6 +48,9 @@ node_config_t g_cfg = {
     .bind_addr             = "",     /* empty == INADDR_ANY */
     .par                   = 0,      /* Core -par default: auto              */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
+    .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
+    .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
+    .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
 };
 
 static void set_defaults(void){
@@ -75,6 +78,9 @@ static void set_defaults(void){
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
     g_cfg.maxrecvbuffer_kb      = 5000;
+    g_cfg.maxmempool_mb         = 300;
+    g_cfg.mempoolexpiry_h       = 336;
+    g_cfg.maxuploadtarget_mb    = 0;
 }
 
 /* Clamp to values that cannot wedge the node. A config file is operator input,
@@ -164,6 +170,12 @@ long node_config_load(const char* path){
             /* Core -maxreceivebuffer is in units of 1000 bytes. Bounds how
              * much a single peer can make us buffer for one message. */
             t=clamp_int(iv,64,262144,key,&bad); if(t>=0){ g_cfg.maxrecvbuffer_kb=t; applied++; } }
+        else if(!strcmp(key,"maxmempool")){    /* Core: MB */
+            t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; applied++; } }
+        else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
+            t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
+        else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
+            t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; applied++; }
         else if(!strcmp(key,"blocksonly")){
@@ -220,6 +232,8 @@ void node_config_log(void){
     fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",
             g_cfg.dbcache_mb, g_cfg.utxo_bulk_slots_log2, g_cfg.utxo_bulk_blob_mb,
             g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold);
+    fprintf(stderr,"[config] pool : maxmempool=%ldMB mempoolexpiry=%ldh maxuploadtarget=%ldMB\n",
+            g_cfg.maxmempool_mb, g_cfg.mempoolexpiry_h, g_cfg.maxuploadtarget_mb);
     fprintf(stderr,"[config] res  : par=%d (%s) maxreceivebuffer=%d*1000B\n",
             g_cfg.par, g_cfg.par==0?"auto":(g_cfg.par<0?"leave cores free":"fixed"),
             g_cfg.maxrecvbuffer_kb);

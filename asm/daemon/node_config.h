@@ -51,6 +51,9 @@ typedef struct {
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
+    long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
+    long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
+    long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
 } node_config_t;
 
 extern node_config_t g_cfg;
