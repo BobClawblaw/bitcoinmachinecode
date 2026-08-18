@@ -42,6 +42,19 @@ extern long   mpool_policy_add(void* pol, void* st, void* mp,
 extern unsigned long long mpool_policy_estimate_feerate(void* st);
 extern const char* mpool_policy_reason(void* pol);
 
+/* bitcoin_mempool_policy.c now calls mempool_resolve_confirmed_utxo instead
+ * of utxo_get directly (see its own extern's comment) -- this harness still
+ * wants the real, single-table bitcoin_utxo.asm behavior, so just pass
+ * through unchanged. */
+extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, const unsigned char** script,
+                     unsigned long* slen);
+long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, const unsigned char** script,
+                     unsigned long* slen){
+    return utxo_get(u, txid, index, value, script, slen);
+}
+
 static int hex_in(unsigned char* out, const char* h);
 
 static int failures = 0;
