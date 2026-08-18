@@ -124,6 +124,7 @@ extern void   mpool_policy_init(void* pol, unsigned long long relay_fee_rate,
                                 unsigned rbf_enabled);
 extern size_t mpool_policy_state_size(unsigned n);
 extern void   mpool_policy_state_init(void* st, unsigned n);
+extern long   mpool_count(void* mp);
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const u8* tx, unsigned long txlen,
                                const u8 txid[32], void* utxo);
@@ -192,6 +193,10 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
         fprintf(stderr, "[tx_accept] reject (policy): %s\n", mpool_policy_reason(g_pol));
         return 0;
     }
+    static const char hexd[]="0123456789abcdef";
+    char ts[17]; for(int k=0;k<8;k++){ u8 b=txid[31-k]; ts[k*2]=hexd[b>>4]; ts[k*2+1]=hexd[b&0xf]; } ts[16]=0;
+    fprintf(stderr, "[tx_accept] accepted txid=%s.. vsize=%lu mempool_now=%ld\n",
+            ts, txlen, mpool_count(mp_area));
     return 1;
 }
 
@@ -202,10 +207,23 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
  * worker's own writes are logged separately (main.c's do_outbound_sync).
  * hash32 is wire-order; block explorers/RPC display it byte-reversed, so
  * print that convention (short form: last 8 wire bytes = first 8 displayed). */
-void log_block_stored_inbound(const u8 hash32[32], long height, long bytes){
+void log_block_stored_inbound(const u8 hash32[32], long height, long bytes, const u8* block){
     static const char hexd[]="0123456789abcdef";
     char hs[17];
     for(int k=0;k<8;k++){ u8 b=hash32[31-k]; hs[k*2]=hexd[b>>4]; hs[k*2+1]=hexd[b&0xf]; }
     hs[16]=0;
-    fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%ld (inbound relay)\n", height, hs, bytes);
+    /* tx count: CompactSize varint right after the 80-byte header, matching
+     * tx_parse's own decode (mirrored here rather than pulled in from
+     * daemon/utxo_walk.h to avoid its u8/u64/u32 typedefs colliding with
+     * the ones already declared at the top of this file). */
+    u64 ntx = 0;
+    if (bytes > 81) {
+        u8 c = block[80];
+        if (c < 0xfd) ntx = c;
+        else if (c == 0xfd && bytes >= 83) ntx = (u64)block[81] | ((u64)block[82]<<8);
+        else if (c == 0xfe && bytes >= 85) { u32 v; memcpy(&v, block+81, 4); ntx = v; }
+        else if (c == 0xff && bytes >= 89) memcpy(&ntx, block+81, 8);
+    }
+    fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%ld tx=%llu (inbound relay)\n",
+            height, hs, bytes, (unsigned long long)ntx);
 }

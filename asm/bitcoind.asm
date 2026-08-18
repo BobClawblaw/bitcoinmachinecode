@@ -114,6 +114,24 @@ node_handshake:
     call p2p_read
     cmp  rax, 0
     jle  .fail
+    ; --- is it "version"? capture the peer's payload for logging only (we
+    ; already sent ours before the loop; no reply needed here) ---
+    lea  rdi, [rbp-0xe0]
+    lea  rsi, [rel _version]
+    mov  ecx, 7
+    repe cmpsb
+    jne  .nh_not_version
+    mov  rax, [rbp-0xd8]      ; plen
+    cmp  rax, 256
+    jbe  .nh_len_ok
+    mov  rax, 256
+.nh_len_ok:
+    mov  [rel g_peer_version_len], rax
+    mov  rcx, rax
+    lea  rdi, [rel g_peer_version_payload]
+    lea  rsi, [rbp-0x140]
+    rep  movsb
+.nh_not_version:
     ; --- is it "verack"? ---
     lea  rdi, [rbp-0xe0]
     lea  rsi, [rel _verack]
@@ -220,6 +238,18 @@ node_accept_handshake:
     call p2p_write
     jmp  .loop
 .got_version:
+    ; capture the peer's raw version payload (side-effect only; actual
+    ; field parsing happens in C -- see g_peer_version_payload's comment)
+    mov  rax, [rbp-0x54]      ; plen
+    cmp  rax, 256
+    jbe  .gv_len_ok
+    mov  rax, 256
+.gv_len_ok:
+    mov  [rel g_peer_version_len], rax
+    mov  rcx, rax
+    lea  rdi, [rel g_peer_version_payload]
+    lea  rsi, [rbp-0x300]
+    rep  movsb
     ; build our version reply
     lea  rdi, [rbp-0x180]
     call node_make_version
@@ -1800,6 +1830,21 @@ node_ibd:
 section .data
 align 16
 ua: db "Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x"   ; EXACTLY 42 chars (len byte = 42 above)
+
+; ---- last-seen peer `version` payload, captured (not parsed) by both
+; node_handshake and node_accept_handshake the moment they see a "version"
+; command from the other side -- raw bytes only, zero interpretation here.
+; Actual field extraction (services/protocol/UA/height, general Bitcoin
+; varint-length UA) happens in C (daemon/main.c) for safety/simplicity;
+; this is just a plain memcpy'd snapshot. Per-connection process only (each
+; inbound serve child and the single outbound download worker are separate
+; processes), so a single set of globals is safe -- no cross-connection
+; clobbering. Purely additive: existing handshake control flow/behavior is
+; unchanged either way, this is a side-effect capture only. */
+global g_peer_version_payload
+global g_peer_version_len
+g_peer_version_payload: times 256 db 0
+g_peer_version_len:     dq 0
 
 section .rodata
 _version: db "version",0
