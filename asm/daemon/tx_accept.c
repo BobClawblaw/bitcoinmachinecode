@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "log_ts.h"
 
 typedef unsigned char u8;
 typedef unsigned long u64;

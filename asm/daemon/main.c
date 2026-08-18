@@ -37,6 +37,7 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include "log_ts.h"
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
