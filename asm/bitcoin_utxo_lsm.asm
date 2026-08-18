@@ -148,10 +148,16 @@
 default rel
 section .text
 
-MAGIC_RUN        equ 0x4E555255      ; "URUN" little-endian dword
+MAGIC_RUN        equ 0x4E555255      ; "URUN" little-endian dword -- OLD format, no sparse index
+MAGIC_RUN2       equ 0x32555255      ; "URU2" little-endian dword -- adds sparse_off/sparse_n
 MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword
 BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
+
+; ---- sparse index (added after Phase 2 shipped without one -- see
+; mac_read_run_header's header comment for the full backward-compat story) ----
+SPARSE_STRIDE    equ 256             ; sample every Nth sorted record (index 0 always sampled)
+SPARSE_ENT_SIZE  equ 44              ; key(36) + file_offset(8) per sparse entry
 
 ; ---- compaction (Phase 2) constants ----
 ; utxo_lsm_compact merges the OLDEST min(manifest_n, COMPACT_MAX_RUNS) runs
@@ -308,6 +314,106 @@ mac_cmp_key:
     pop  rcx
     pop  rsi
     pop  rdi
+    ret
+
+; ============================================================================
+; mac_read_run_header(fd=rdi, out=rsi) -> rax: 0 ok / -1 err
+;   Reads a run file's header, transparently handling BOTH the original
+;   28-byte MAGIC_RUN format (no sparse index -- every run written before
+;   this fix) and the new 44-byte MAGIC_RUN2 format (adds sparse_off/
+;   sparse_n). No migration tool needed: an old-format run keeps working
+;   via the caller's own unchanged full-scan fallback (sparse_n=0 signals
+;   this), and gets rewritten in the new format automatically the next
+;   time it's touched by a flush or compaction (both write through the
+;   same updated writer). Leaves the fd positioned immediately after
+;   the header either way (ready for the caller to read the bloom bytes
+;   next, exactly as before this helper existed).
+;
+;   out (56-byte caller-allocated buffer):
+;     +0  gen(8)  +8 nrec(8)  +16 bloom_bytes(8)  +24 bits_mask(8)
+;     +32 header_size(8, 28 or 44)  +40 sparse_off(8)  +48 sparse_n(8)
+;     (sparse_off/sparse_n are 0 for an old-format run, or for a new-
+;     format run whose sparse index build could find nothing -- either
+;     way the caller's contract is "0 means fall back to the original
+;     start-of-records scan," so both cases are handled identically.)
+; ============================================================================
+mac_read_run_header:
+    push rbp
+    mov  rbp, rsp
+    push r12
+    push r13
+    sub  rsp, 0x30
+    mov  r12, rdi           ; fd
+    mov  r13, rsi            ; out
+
+    mov  rdi, r12
+    lea  rsi, [rbp-0x38]
+    mov  rdx, 4
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rh_err
+
+    mov  eax, [rbp-0x38]
+    cmp  eax, MAGIC_RUN2
+    je   .rh_new
+    cmp  eax, MAGIC_RUN
+    jne  .rh_err             ; unrecognized magic -- treat as corrupt
+
+    ; ---- old format: remaining 24 bytes are gen+nrec+bloom_bits ----
+    mov  rdi, r12
+    lea  rsi, [rbp-0x38]
+    mov  rdx, 24
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rh_err
+    mov  rax, [rbp-0x38]
+    mov  [r13+0], rax         ; gen
+    mov  rax, [rbp-0x38+8]
+    mov  [r13+8], rax          ; nrec
+    mov  rax, [rbp-0x38+16]
+    mov  rcx, rax
+    dec  rcx
+    mov  [r13+24], rcx           ; bits_mask
+    shr  rax, 3
+    mov  [r13+16], rax             ; bloom_bytes
+    mov  qword [r13+32], 28         ; header_size
+    mov  qword [r13+40], 0           ; sparse_off
+    mov  qword [r13+48], 0            ; sparse_n
+    xor  eax, eax
+    jmp  .rh_ret
+
+.rh_new:
+    ; ---- new format: remaining 40 bytes are gen+nrec+bloom_bits+sparse_off+sparse_n ----
+    mov  rdi, r12
+    lea  rsi, [rbp-0x38]
+    mov  rdx, 40
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rh_err
+    mov  rax, [rbp-0x38]
+    mov  [r13+0], rax          ; gen
+    mov  rax, [rbp-0x38+8]
+    mov  [r13+8], rax           ; nrec
+    mov  rax, [rbp-0x38+16]
+    mov  rcx, rax
+    dec  rcx
+    mov  [r13+24], rcx            ; bits_mask
+    shr  rax, 3
+    mov  [r13+16], rax              ; bloom_bytes
+    mov  rax, [rbp-0x38+24]
+    mov  [r13+40], rax                ; sparse_off
+    mov  rax, [rbp-0x38+32]
+    mov  [r13+48], rax                  ; sparse_n
+    mov  qword [r13+32], 44              ; header_size
+    xor  eax, eax
+    jmp  .rh_ret
+.rh_err:
+    mov  rax, -1
+.rh_ret:
+    add  rsp, 0x30
+    pop  r13
+    pop  r12
+    pop  rbp
     ret
 
 ; mac_copy_rec(dst=rdi, src=rsi) -- copies a fixed 64-byte descriptor.
@@ -853,7 +959,7 @@ mac_run_lookup:
     push r13
     push r14
     push r15
-    sub  rsp, 0x200
+    sub  rsp, 0x300
     mov  r12, rdi
     mov  r13d, esi
     mov  [rbp-0x30], rdx
@@ -879,18 +985,17 @@ mac_run_lookup:
     jl   .ml_err
     mov  [rbp-0x68], rax
 
+    ; format-aware header read (old MAGIC_RUN or new MAGIC_RUN2, see
+    ; mac_read_run_header's own header comment) -- out struct at [rbp-0x200]
     mov  rdi, [rbp-0x68]
-    lea  rsi, [rbp-0x140]
-    mov  rdx, 28
-    call mac_read_exact2
+    lea  rsi, [rbp-0x200]
+    call mac_read_run_header
     test rax, rax
     jnz  .ml_err_close
 
-    mov  rax, [rbp-0x140+20]
-    mov  rcx, rax
-    dec  rcx
+    mov  rcx, [rbp-0x200+24]
     mov  [rbp-0x58], rcx        ; bits_mask
-    shr  rax, 3                  ; bloom_bytes
+    mov  rax, [rbp-0x200+16]    ; bloom_bytes
 
     mov  rdi, [rbp-0x68]
     mov  rsi, [r12+128]
@@ -933,6 +1038,94 @@ mac_run_lookup:
     call mac_bloom_testbit
     test eax, eax
     jz   .ml_absent_close
+
+    ; ---- sparse index acceleration ----
+    ; records_start = header_size + bloom_bytes: the position the file is
+    ; ALREADY sitting at (untouched since the bloom-bytes read above) --
+    ; captured explicitly here because the binary search below performs its
+    ; own lseeks to read individual sparse entries, so "don't seek, rely on
+    ; the current position" stops being valid once any entries have been
+    ; read. Every path from here to .ml_scan_loop seeks explicitly instead.
+    mov  rax, [rbp-0x200+32]         ; header_size
+    add  rax, [rbp-0x200+16]          ; + bloom_bytes
+    mov  [rbp-0x220], rax               ; records_start
+
+    mov  rax, [rbp-0x200+48]         ; sparse_n
+    test rax, rax
+    jnz  .ml_sp_search
+    mov  r15, [rbp-0x220]             ; old format or empty run -- no sparse index
+    jmp  .ml_sp_seek
+
+.ml_sp_search:
+    xor  rbx, rbx                      ; lo = 0
+    mov  r14, rax
+    dec  r14                            ; hi = sparse_n - 1
+    mov  r15, [rbp-0x220]                ; best_offset defaults to records_start;
+                                           ; index 0 is always sampled (see the
+                                           ; write side), so a well-formed search
+                                           ; always improves on this default.
+.ml_sp_loop:
+    cmp  rbx, r14
+    jg   .ml_sp_seek
+    mov  rax, rbx
+    add  rax, r14
+    shr  rax, 1                           ; mid
+    mov  rcx, [rbp-0x200+40]               ; sparse_off
+    mov  rdx, rax
+    imul rdx, rdx, SPARSE_ENT_SIZE
+    add  rcx, rdx                           ; this entry's file offset
+    push rax
+    push rbx
+    push r14
+    push r15
+    mov  rdi, [rbp-0x68]
+    mov  rsi, rcx
+    xor  edx, edx
+    mov  eax, 8                              ; lseek SEEK_SET
+    syscall
+    test rax, rax
+    js   .ml_sp_err_pop
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x260]
+    mov  rdx, SPARSE_ENT_SIZE
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_sp_err_pop
+    pop  r15
+    pop  r14
+    pop  rbx
+    pop  r13                                  ; mid -- NOT popped into rax: mac_cmp_key
+                                                 ; returns its result in eax, which would
+                                                 ; clobber mid before lo/hi get updated
+                                                 ; from it below (this was a real infinite-
+                                                 ; loop bug: lo/hi kept "shrinking" toward
+                                                 ; the cmp result 0-2 instead of toward mid,
+                                                 ; so the range stopped converging).
+    lea  rdi, [rbp-0x260]                       ; sampled key
+    lea  rsi, [rbp-0x100]                        ; target key
+    call mac_cmp_key                              ; 0=sampled<target 1=eq 2=sampled>target
+    cmp  eax, 2
+    je   .ml_sp_hi
+    mov  rcx, [rbp-0x260+36]                        ; this entry's own file_offset
+    mov  r15, rcx
+    lea  rbx, [r13+1]                                 ; lo = mid + 1
+    jmp  .ml_sp_loop
+.ml_sp_hi:
+    test r13, r13
+    jz   .ml_sp_seek                                    ; mid==0: no smaller candidate exists
+    lea  r14, [r13-1]                                     ; hi = mid - 1
+    jmp  .ml_sp_loop
+.ml_sp_err_pop:
+    add  rsp, 32
+    jmp  .ml_err_close
+.ml_sp_seek:
+    mov  rdi, [rbp-0x68]
+    mov  rsi, r15
+    xor  edx, edx
+    mov  eax, 8                                           ; lseek SEEK_SET
+    syscall
+    test rax, rax
+    js   .ml_err_close
 
 .ml_scan_loop:
     mov  rdi, [rbp-0x68]
@@ -1024,7 +1217,7 @@ mac_run_lookup:
 .ml_err:
     mov  eax, -1
 .ml_ret:
-    add  rsp, 0x200
+    add  rsp, 0x300
     pop  r15
     pop  r14
     pop  r13
@@ -1376,16 +1569,18 @@ mac_flush:
     jl   .fl_err
     mov  [rbp-0x88], rax             ; fd
 
-    mov  dword [rbp-0x100], MAGIC_RUN
+    mov  dword [rbp-0x100], MAGIC_RUN2
     mov  rax, [r12+96]                ; next_gen
     mov  [rbp-0x100+4], rax
     mov  rax, [rbp-0x38]
     mov  [rbp-0x100+12], rax
     mov  rax, [rbp-0x70]
     mov  [rbp-0x100+20], rax
+    mov  qword [rbp-0x100+28], 0        ; sparse_off placeholder (patched below)
+    mov  qword [rbp-0x100+36], 0         ; sparse_n placeholder (patched below)
     mov  rdi, [rbp-0x88]
     lea  rsi, [rbp-0x100]
-    mov  rdx, 28
+    mov  rdx, 44
     call mac_write_exact
     test rax, rax
     jnz  .fl_err_close
@@ -1399,6 +1594,7 @@ mac_flush:
     jnz  .fl_err_close
 
     mov  qword [rbp-0x80], 0
+    mov  qword [rbp-0x1A0], 0    ; sparse_n (entries sampled so far)
 .fl_wr_loop:
     mov  rax, [rbp-0x80]
     cmp  rax, [rbp-0x38]
@@ -1408,6 +1604,38 @@ mac_flush:
     shl  rcx, 6
     add  rsi, rcx
     mov  rdi, [rbp-0x88]
+
+    ; ---- sparse index sampling: every SPARSE_STRIDEth record (by sorted
+    ; order -- index 0 always included), record (key, file_offset) BEFORE
+    ; writing this record, so the captured offset is exactly where its
+    ; bytes are about to start. mac_memcpy preserves rdi/rsi/rdx/rcx (only
+    ; clobbers rax), so no need to save them across that call; rdi=fd DOES
+    ; get repurposed as mac_memcpy's dest pointer, restored explicitly
+    ; before falling through to the caller's own upcoming write below. ----
+    test rax, (SPARSE_STRIDE-1)
+    jnz  .fl_wr_nosample
+    push rsi
+    xor  esi, esi
+    mov  edx, 1                  ; SEEK_CUR
+    mov  eax, 8
+    syscall
+    pop  rsi
+    test rax, rax
+    js   .fl_err_close
+    mov  rbx, rax                  ; this record's file offset
+    mov  rdx, [rbp-0x1A0]            ; sparse_n
+    mov  rdi, [r12+128]
+    add  rdi, [rbp-0x40]               ; sparse_buf base (off_desc_b slack region)
+    imul rax, rdx, SPARSE_ENT_SIZE
+    add  rdi, rax                        ; dest = sparse_buf + sparse_n*44
+    push rdi
+    mov  rdx, 36
+    call mac_memcpy                        ; copy the 36-byte key (rsi) -> dest (rdi)
+    pop  rdi
+    mov  [rdi+36], rbx                       ; append file_offset right after the key
+    inc  qword [rbp-0x1A0]                     ; sparse_n++
+    mov  rdi, [rbp-0x88]                         ; restore fd
+.fl_wr_nosample:
     push rsi
     mov  rdx, 37
     call mac_write_exact
@@ -1442,6 +1670,48 @@ mac_flush:
     inc  qword [rbp-0x80]
     jmp  .fl_wr_loop
 .fl_wr_done:
+    ; ---- write the sparse index right after the last record, then seek
+    ; back to patch sparse_off/sparse_n into the header -- the same seek-
+    ; back-and-patch shape this file's own compaction write path already
+    ; uses for its nrec/bloom fields. ----
+    mov  rdi, [rbp-0x88]
+    xor  esi, esi
+    mov  edx, 1                    ; SEEK_CUR -- this is where the sparse index starts
+    mov  eax, 8
+    syscall
+    test rax, rax
+    js   .fl_err_close
+    mov  [rbp-0x1A8], rax             ; sparse_off
+
+    mov  rax, [rbp-0x1A0]               ; sparse_n
+    test rax, rax
+    jz   .fl_sp_written
+    imul rdx, rax, SPARSE_ENT_SIZE
+    mov  rdi, [rbp-0x88]
+    mov  rsi, [r12+128]
+    add  rsi, [rbp-0x40]
+    call mac_write_exact
+    test rax, rax
+    jnz  .fl_err_close
+.fl_sp_written:
+    mov  rdi, [rbp-0x88]
+    mov  esi, 28
+    xor  edx, edx
+    mov  eax, 8                        ; lseek SEEK_SET to the sparse_off/sparse_n slot
+    syscall
+    test rax, rax
+    jl   .fl_err_close
+    mov  rax, [rbp-0x1A8]
+    mov  [rbp-0x100], rax
+    mov  rax, [rbp-0x1A0]
+    mov  [rbp-0x100+8], rax
+    mov  rdi, [rbp-0x88]
+    lea  rsi, [rbp-0x100]
+    mov  rdx, 16
+    call mac_write_exact
+    test rax, rax
+    jnz  .fl_err_close
+
     mov  rdi, [rbp-0x88]
     call mac_fsync2
     mov  rdi, [rbp-0x88]
@@ -1923,15 +2193,20 @@ utxo_lsm_compact:
     add  rdx, r13
     mov  [rdx], rax                 ; slot.fd
 
-    ; read this run's own header (28 bytes)
+    ; format-aware header read (old MAGIC_RUN or new MAGIC_RUN2 -- an input
+    ; run being compacted may be EITHER, since not every run has necessarily
+    ; been rewritten by the fixed writer yet; see mac_read_run_header's own
+    ; header comment). [rbp-0x1C0] holds its 56-byte output struct here;
+    ; this slot gets reused for unrelated staging later in this same
+    ; function (the OUTPUT run's own header, then manifest staging) -- safe,
+    ; since those uses happen in strictly later, non-overlapping phases.
     mov  rdi, rax
     lea  rsi, [rbp-0x1C0]
-    mov  rdx, 28
-    call mac_read_exact2
+    call mac_read_run_header
     test rax, rax
     jnz  .cc_err
 
-    mov  rax, [rbp-0x1C0+12]         ; this run's nrec
+    mov  rax, [rbp-0x1C0+8]          ; this run's nrec
     mov  rdx, [rbp-0x78]
     imul rdx, rdx, COMPACT_SLOT_SIZE
     add  rdx, r13
@@ -1939,8 +2214,7 @@ utxo_lsm_compact:
     add  qword [rbp-0x38], rax          ; upper_bound += nrec
 
     ; skip this run's own bloom bytes to reach its records section
-    mov  rax, [rbp-0x1C0+20]           ; this run's bloom_bits
-    shr  rax, 3                          ; bloom_bytes
+    mov  rax, [rbp-0x1C0+16]           ; this run's bloom_bytes (already shifted)
     mov  rdx, [rbp-0x78]
     imul rdx, rdx, COMPACT_SLOT_SIZE
     add  rdx, r13
@@ -2007,6 +2281,40 @@ utxo_lsm_compact:
     jmp  .cc_bz
 .cc_bz_done:
 
+    ; ---- second, separate mmap for the sparse-index build buffer ----
+    ; Sized from upper_bound (the sum of input runs' own nrec, already known
+    ; from .cc_open_loop -- a safe over-estimate of the merged run's true
+    ; record count, same upper-bound-not-exact-count reasoning the bloom
+    ; sizing above already relies on). Kept as ITS OWN mmap, separate from
+    ; the fixed-size COMPACT_SCRATCH_BYTES region above, since its size is
+    ; only known now, not at compile time.
+    mov  rax, [rbp-0x38]              ; upper_bound
+    xor  edx, edx
+    mov  rcx, SPARSE_STRIDE
+    div  rcx
+    add  rax, 2                         ; +2 margin
+    imul rax, rax, SPARSE_ENT_SIZE
+    mov  [rbp-0x178], rax                 ; sparse_scratch_bytes
+    xor  edi, edi
+    mov  esi, eax
+    mov  edx, 3                            ; PROT_READ|PROT_WRITE
+    mov  r10d, 0x22                          ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov  r8, -1
+    xor  r9d, r9d
+    mov  eax, 9                                ; mmap
+    syscall
+    cmp  rax, -1
+    je   .cc_err
+    ; NOTE: 0x188/0x180/0x178 -- deliberately NOT 0x200/0x208/0x210, which
+    ; collide with the pre-existing winning-key snapshot buffer at
+    ; [rbp-0x200] (36 bytes, written/read every .cc_merge_loop iteration --
+    ; see the "stable buffer" comment above .cc_wr_skip). This is the one
+    ; genuinely free gap in this frame: below the fmt_runname buffer at
+    ; [rbp-0x140] (max offset 0x140) and above the mac_read_run_header
+    ; output struct at [rbp-0x1C0] (occupies offsets 0x189-0x1C0).
+    mov  [rbp-0x188], rax                        ; sparse_scratch base
+    mov  qword [rbp-0x180], 0                      ; sparse_n
+
     ; ---- open the output run, write a placeholder header+bloom ----
     mov  rax, [r12+96]                  ; next_gen -- the merged run's FRESH gen
     mov  [rbp-0x68], rax                  ; out_gen
@@ -2025,15 +2333,17 @@ utxo_lsm_compact:
     jl   .cc_err
     mov  [rbp-0x58], rax                    ; out_fd
 
-    mov  dword [rbp-0x1C0], MAGIC_RUN
+    mov  dword [rbp-0x1C0], MAGIC_RUN2
     mov  rax, [rbp-0x68]
     mov  [rbp-0x1C0+4], rax
     mov  qword [rbp-0x1C0+12], 0             ; nrec placeholder
     mov  rax, [rbp-0x40]
     mov  [rbp-0x1C0+20], rax
+    mov  qword [rbp-0x1C0+28], 0               ; sparse_off placeholder (patched below)
+    mov  qword [rbp-0x1C0+36], 0                ; sparse_n placeholder (patched below)
     mov  rdi, [rbp-0x58]
     lea  rsi, [rbp-0x1C0]
-    mov  rdx, 28
+    mov  rdx, 44
     call mac_write_exact
     test rax, rax
     jnz  .cc_err_close
@@ -2116,6 +2426,36 @@ utxo_lsm_compact:
     movzx eax, byte [rax+76]                  ; type
     cmp  eax, 1
     jne  .cc_wr_skip
+
+    ; ---- sparse index sampling: sample every SPARSE_STRIDEth EMITTED
+    ; record's (key, file_offset), checked BEFORE true_nrec's increment
+    ; below (so [rbp-0x70] here is the 0-indexed ordinal of THIS emission
+    ; -- index 0 is always sampled) -- offset captured before writing any
+    ; of this record's bytes, so it points exactly at this record's start,
+    ; mirroring mac_flush's identical sampling technique. ----
+    mov  rax, [rbp-0x70]                ; true_nrec (pre-increment)
+    test rax, (SPARSE_STRIDE-1)
+    jnz  .cc_sp_nosample
+    mov  rdi, [rbp-0x58]                 ; out_fd
+    xor  esi, esi
+    mov  edx, 1                            ; SEEK_CUR
+    mov  eax, 8                              ; lseek
+    syscall
+    test rax, rax
+    js   .cc_err_close
+    mov  rbx, rax                              ; this record's file offset
+    mov  rax, [rbp-0x180]                        ; sparse_n
+    imul rax, rax, SPARSE_ENT_SIZE
+    add  rax, [rbp-0x188]                          ; dest = sparse base + n*44
+    mov  rdi, rax
+    mov  rdx, [rbp-0xB0]
+    lea  rsi, [rdx+40]                                ; winning slot's key ptr
+    mov  rdx, 36
+    call mac_memcpy
+    mov  [rdi+36], rbx                                  ; file_offset (rdi preserved by mac_memcpy)
+    inc  qword [rbp-0x180]                                ; sparse_n++
+.cc_sp_nosample:
+
     mov  rdx, [rbp-0xB0]
     mov  rdi, [rbp-0x58]
     lea  rsi, [rdx+40]                          ; key+type, 37 bytes
@@ -2211,9 +2551,12 @@ utxo_lsm_compact:
 .cc_merge_done:
     ; ================= end streaming k-way merge =================
 
-    ; ---- patch bloom bytes (file offset 28) and nrec (offset 12) ----
+    ; ---- patch bloom bytes (file offset 44 -- MAGIC_RUN2's header is 44
+    ; bytes, not the old format's 28, since sparse_off/sparse_n now sit
+    ; between bloom_bits and the bloom bytes themselves) and nrec (offset
+    ; 12, unchanged -- still inside the common MAGIC/gen/nrec prefix) ----
     mov  rdi, [rbp-0x58]
-    mov  esi, 28
+    mov  esi, 44
     xor  edx, edx
     mov  eax, 8                          ; lseek SEEK_SET
     syscall
@@ -2239,6 +2582,47 @@ utxo_lsm_compact:
     mov  rdi, [rbp-0x58]
     lea  rsi, [rbp-0x1C0]
     mov  rdx, 8
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+
+    ; ---- append the sparse index after all records (SEEK_END lands there
+    ; exactly: the two patches above overwrote existing bytes in place,
+    ; they never changed the file's length), then patch sparse_off/sparse_n
+    ; into the header at offset 28 -- same placeholder-then-patch pattern
+    ; as nrec/bloom above, mirroring mac_flush's identical technique. ----
+    mov  rdi, [rbp-0x58]
+    xor  esi, esi
+    mov  edx, 2                          ; SEEK_END
+    mov  eax, 8
+    syscall
+    test rax, rax
+    jl   .cc_err_close
+    mov  r15, rax                         ; sparse_off
+    mov  rax, [rbp-0x180]                   ; sparse_n
+    test rax, rax
+    jz   .cc_sp_wr_done
+    mov  rdi, [rbp-0x58]
+    mov  rsi, [rbp-0x188]                     ; sparse scratch base
+    mov  rdx, [rbp-0x180]
+    imul rdx, rdx, SPARSE_ENT_SIZE
+    call mac_write_exact
+    test rax, rax
+    jnz  .cc_err_close
+.cc_sp_wr_done:
+    mov  rdi, [rbp-0x58]
+    mov  esi, 28
+    xor  edx, edx
+    mov  eax, 8                          ; lseek SEEK_SET
+    syscall
+    test rax, rax
+    jl   .cc_err_close
+    mov  [rbp-0x1C0], r15                    ; sparse_off
+    mov  rax, [rbp-0x180]                      ; sparse_n
+    mov  [rbp-0x1C0+8], rax
+    mov  rdi, [rbp-0x58]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 16
     call mac_write_exact
     test rax, rax
     jnz  .cc_err_close
@@ -2372,6 +2756,11 @@ utxo_lsm_compact:
     mov  rdi, r13
     mov  esi, COMPACT_SCRATCH_BYTES
     mov  eax, 11                             ; munmap
+    syscall
+
+    mov  rdi, [rbp-0x188]                    ; sparse scratch base
+    mov  esi, [rbp-0x178]                      ; sparse_scratch_bytes
+    mov  eax, 11                                 ; munmap
     syscall
 
     mov  rax, 1
