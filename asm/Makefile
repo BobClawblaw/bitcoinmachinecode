@@ -131,16 +131,16 @@ tests/test_block_genesis: tests/test_block_genesis.c $(CONSOBJS)
 # node_ibd_headers references hst_append (bitcoin_headers.asm), so include it.
 DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_idxscan.o
 
-tests/test_bitcoind: tests/test_bitcoind.c $(DAEMONOBJS)
-	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(DAEMONOBJS)
+tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
 
 # Full IBD client (node_sync): handshake + headers + getdata + validate + store.
 # Built at -O0: the deep asm hash call chain (node_sync -> cons_verify ->
 # pow_check -> block_hash -> sha256d -> sha256_full) provably works at -O0, but
 # gcc -O2's main register/stack layout triggers a latent sha256_full deep-frame-
 # overlap crash in this specific networked harness. The asm is identical.
-tests/test_bitcoind_sync: tests/test_bitcoind_sync.c $(DAEMONOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_bitcoind_sync.c $(DAEMONOBJS)
+tests/test_bitcoind_sync: tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONOBJS)
 
 # all-asm leveled logger (uses fd_write_all from bitcoin_net.asm)
 # Built at -O0: same gcc -O2 vs deep-asm-call-chain interaction as the sync

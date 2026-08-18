@@ -39,6 +39,7 @@
 #include <sys/mman.h>
 #include "log_ts.h"
 #include "log_phase.h"
+#include "utxo_walk.h"   /* utxo_walk_read_varint, for tx-count in [block] stored logs */
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -70,6 +71,8 @@
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
+extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, see its header comment */
+extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
 extern long node_serve_block(void* st, long height, void* out, long cap);
@@ -492,6 +495,17 @@ static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-
 static long long mux_out_nextretry[MUX_MAX_OUT]; /* monotonic ms deadline before the next re-dial attempt */
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
 
+/* ---- graceful shutdown --------------------------------------------------
+ * Previously SIGTERM/SIGINT had no handler at all (only SIGPIPE/SIGCHLD,
+ * both ignored) -- every stop was a bare kill with zero shutdown log line,
+ * ever, regardless of how the process actually died. The handler itself
+ * only sets a flag (async-signal-safe, matches this file's own existing
+ * mux_budget_alarm/SIGALRM pattern) -- the actual logging/cleanup happens
+ * in each main loop's own next iteration, never inside the handler. */
+static volatile sig_atomic_t g_shutdown_requested = 0;
+static pid_t g_dl_worker_pid = -1;       /* set by main() right after fork(); parent forwards SIGTERM here */
+static void handle_shutdown_signal(int sig){ g_shutdown_requested = sig; }
+
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
  * The handshake reads the seed's version/verack plus its post-verack chatter
  * (sendheaders/sendaddrv2/feefilter/addr), which can take longer than the
@@ -553,6 +567,39 @@ static int mux_locator_zero(int i){
  * logged hash can be pasted straight into a lookup. Short form (first 8
  * display bytes = last 8 wire bytes) is enough to eyeball/grep-correlate
  * without bloating every block-stored line to a full 64 hex chars. */
+/* format_peer_version_info(out, cap) -> writes a compact human-readable
+ * summary of whatever bitcoind.asm's node_handshake/node_accept_handshake
+ * last captured into g_peer_version_payload (the OTHER side's `version`
+ * message, raw wire bytes -- see that global's header comment). Parses the
+ * Bitcoin version-message layout by hand (version u32, services u64,
+ * timestamp u64, addr_recv[26], addr_from[26], nonce u64, then a
+ * CompactSize-prefixed user-agent string, then start_height u32) since
+ * nothing in this codebase already exposes these fields. Empty string if
+ * no version was captured (payload too short to be a real version msg) --
+ * callers should treat that as "no data," not an error. */
+static void format_peer_version_info(char* out, size_t cap){
+    out[0] = 0;
+    long len = g_peer_version_len;
+    const unsigned char* p = g_peer_version_payload;
+    if (len < 80) return;               /* fixed prefix alone is 80 bytes */
+    unsigned proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
+    unsigned long long services;
+    memcpy(&services, p+4, 8);
+    long off = 80;
+    unsigned long long ualen;
+    if (p[off] < 0xfd) { ualen = p[off]; off += 1; }
+    else if (p[off] == 0xfd) { if (off+3 > len) return; ualen = (unsigned)p[off+1] | ((unsigned)p[off+2]<<8); off += 3; }
+    else if (p[off] == 0xfe) { if (off+5 > len) return; memcpy(&ualen, p+off+1, 4); off += 5; }
+    else { if (off+9 > len) return; memcpy(&ualen, p+off+1, 8); off += 9; }
+    if (off + (long)ualen + 4 > len || ualen > 200) return; /* malformed/hostile -- bail, don't overread */
+    char ua[201]; memcpy(ua, p+off, (size_t)ualen); ua[ualen] = 0;
+    for (unsigned long long k=0;k<ualen;k++) if (ua[k] < 0x20 || ua[k] > 0x7e) ua[k] = '.'; /* printable only */
+    off += (long)ualen;
+    unsigned height;
+    memcpy(&height, p+off, 4);
+    snprintf(out, cap, "proto=%u services=0x%llx ua=\"%s\" height=%u", proto, services, ua, height);
+}
+
 static void log_hash_short(char out[17], const unsigned char hash32[32]){
     static const char hexd[]="0123456789abcdef";
     for(int k=0;k<8;k++){
@@ -590,7 +637,9 @@ static long do_outbound_sync(int i){
         unsigned char bhash[32]; block_hash(bhash, sb);
         idx_put(ht_idx, bhash, h);
         char hs[17]; log_hash_short(hs, bhash);
-        fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld (via %s)\n", h, hs, L, mux_out_host[i]);
+        u64 consumed=0; u64 ntx = L>80 ? utxo_walk_read_varint(sb+80, sb+L, &consumed) : 0;
+        if(!consumed) ntx = 0;
+        fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
     }
     /* announce the new tip to this peer (inv; BIP130 headers honored by the
      * peer's sendheaders negotiation is handled downstream on its own leg) */
@@ -1384,6 +1433,8 @@ static long dl_catchup(const char* dir, int min_workers){
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
+    signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGINT, handle_shutdown_signal);
     /* Reload a fresh store state rather than inherit the parent's possibly-
      * stale in-memory idx_len/pos (fork COW is not safe for a growable
      * store -- see the unified_ibd comments on re-initialising per
@@ -1485,7 +1536,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
             mux_out_nextretry[mux_n_out]=0;
-            fprintf(stderr,"[dl] outbound %d = %s (fd %d)\n", mux_n_out, srcpool[i], cfd[i]);
+            { char pv[256]; format_peer_version_info(pv, sizeof pv);
+              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[i], cfd[i], pv); }
             mux_n_out++;
         }
         /* close every candidate fd that was NOT promoted into a live leg */
@@ -1502,10 +1554,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
     for(;;){
+        if(g_shutdown_requested){
+            int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
+            long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+            fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d live_utxo=%ld uptime=%llds\n",
+                    (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
+                    utxo_live_ok?utxo_live_count():-1L, (stop_ms-boot_ms)/1000);
+            _exit(0);
+        }
         long long now_ms = 0;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
         int did=0;
         for(int i=0;i<mux_n_out;i++){
+            if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
                 if(now_ms>=mux_out_nextretry[i]){ mux_redial(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
@@ -1590,7 +1651,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
                     mux_out_nextretry[mux_n_out]=0;
-                    fprintf(stderr,"[dl] filled outbound %d = %s (fd %d)\n", mux_n_out, srcpool[ci], nfd);
+                    { char pv[256]; format_peer_version_info(pv, sizeof pv);
+                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[ci], nfd, pv); }
                     mux_n_out++;
                 }
                 /* if outbound_connect to this one hung/refused, move on to next */
@@ -1634,6 +1696,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
+        if(g_shutdown_requested){
+            fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",
+                    (int)g_shutdown_requested, *(int*)(store_buf+24), mux_n_out);
+            if(g_dl_worker_pid>0){
+                kill(g_dl_worker_pid, SIGTERM);
+                fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
+            }
+            _exit(0);
+        }
         int pr=poll(pfds, nfds, 300);
         if(pr<0){ if(errno==EINTR) continue; break; }
         /* inbound accept -> fork a serve child (unchanged semantics) */
@@ -1658,8 +1729,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 if(w==0){
                     close(l);
                     int hok = node_accept_handshake(c);
-                    fprintf(stderr,"[serve] inbound %s:%d %s (pid %d)\n", ipbuf,
-                            ntohs(ca.sin_port), hok==1?"connected":"handshake failed", getpid());
+                    char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
+                    fprintf(stderr,"[serve] inbound %s:%d %s (pid %d) %s\n", ipbuf,
+                            ntohs(ca.sin_port), hok==1?"connected":"handshake failed", getpid(), pv);
                     if(hok==1)
                         node_serve_loop(c, node_log_open("bitcoind.log"), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
@@ -1708,6 +1780,8 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
     signal(SIGCHLD, SIG_IGN);   /* fork-per-peer workers: auto-reap, no zombies */
+    signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGINT, handle_shutdown_signal);
     if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }
     const char* mode = argv[1]; const char* dir = argv[2];
     /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
@@ -1914,6 +1988,8 @@ int main(int argc, char** argv){
          * ceiling, not a guarantee. */
         int catchup_workers = (argc>=6)? atoi(argv[5]) : 16;
         if(catchup_workers<1) catchup_workers=1;
+        fprintf(stderr,"[boot] config: datadir=%s port=%d nwant=%d catchup_workers=%d\n",
+                dir, port, nwant, catchup_workers);
         phase_timer_t boot_pt; phase_start(&boot_pt);
         fprintf(stderr,"[boot] loading chain archive from disk...\n");
         phase_timer_t load_pt; phase_start(&load_pt);
@@ -1978,6 +2054,7 @@ int main(int argc, char** argv){
          * blocks the worker appends become serve-able (fresh disk reads). */
         pid_t dl = fork();
         if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }
+        g_dl_worker_pid = dl;   /* so serve_mux's shutdown handling can forward SIGTERM to it */
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
         fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
