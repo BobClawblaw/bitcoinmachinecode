@@ -51,6 +51,11 @@ node_config_t g_cfg = {
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
     .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
+    .dnsseed               = 1,      /* Core -dnsseed default: on            */
+    .connect_only          = 0,
+    .n_seednode            = 0,
+    .n_addnode             = 0,
+    .n_connect             = 0,
 };
 
 static void set_defaults(void){
@@ -81,6 +86,56 @@ static void set_defaults(void){
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
     g_cfg.maxuploadtarget_mb    = 0;
+    g_cfg.dnsseed               = 1;
+    g_cfg.connect_only          = 0;
+    g_cfg.n_seednode = g_cfg.n_addnode = g_cfg.n_connect = 0;
+    g_cfg.seednode[0][0] = g_cfg.addnode[0][0] = g_cfg.connectn[0][0] = 0;
+}
+
+/* Append one host to a repeatable-key list.
+ *
+ * Accepts "host" or "host:port". A per-entry port cannot be honoured yet --
+ * every dial path downstream (dl_bootstrap, dlc_probe_round, the workers,
+ * addr_gather_from) takes a bare IP string and dials one fixed port -- so a
+ * NON-DEFAULT port is REJECTED rather than silently dialled on 8333. Being
+ * loudly unsupported beats connecting somewhere the operator did not ask for.
+ * Returns 1 if the entry was stored. */
+static int cfg_addlist(char list[][64], int* n, const char* val, const char* key, int* bad){
+    char host[64];
+    if(!*val){ fprintf(stderr,"[config] %s= empty -- ignoring\n", key); (*bad)++; return 0; }
+    if(strlen(val) >= sizeof host){
+        fprintf(stderr,"[config] %s=%s too long (max %d) -- ignoring\n", key, val, (int)sizeof host - 1);
+        (*bad)++; return 0;
+    }
+    snprintf(host, sizeof host, "%s", val);
+    if(strchr(host,' ')||strchr(host,'\t')){
+        fprintf(stderr,"[config] %s=%s contains whitespace -- ignoring\n", key, val);
+        (*bad)++; return 0;
+    }
+    { char* colon = strrchr(host,':');
+      if(colon){
+        int p = atoi(colon+1);
+        if(p != 8333){
+            fprintf(stderr,"[config] %s=%s -- only the default P2P port (8333) is supported for named peers; ignoring this entry\n", key, val);
+            (*bad)++; return 0;
+        }
+        *colon = 0;
+      } }
+    if(!host[0]){ fprintf(stderr,"[config] %s=%s has no host part -- ignoring\n", key, val); (*bad)++; return 0; }
+    for(int i=0;i<*n;i++) if(!strcmp(list[i],host)) return 0;   /* dedupe, silently */
+    if(*n >= CFG_MAX_NODES){
+        fprintf(stderr,"[config] %s=%s ignored -- at most %d entries per key\n", key, val, CFG_MAX_NODES);
+        (*bad)++; return 0;
+    }
+    snprintf(list[*n], 64, "%s", host); (*n)++;
+    return 1;
+}
+
+int node_config_is_manual(const char* ip){
+    if(!ip || !*ip) return 0;
+    for(int i=0;i<g_cfg.n_addnode;i++) if(!strcmp(g_cfg.addnode[i], ip)) return 1;
+    for(int i=0;i<g_cfg.n_connect;i++) if(!strcmp(g_cfg.connectn[i], ip)) return 1;
+    return 0;
 }
 
 /* Clamp to values that cannot wedge the node. A config file is operator input,
@@ -112,6 +167,11 @@ long node_config_load(const char* path){
         return 0;
     }
     long applied = 0; int bad = 0;
+    /* -connect implies -dnsseed=0 and -listen=0 in Core, but only when those
+     * were not set explicitly. The implication therefore has to run AFTER the
+     * whole file is read: `listen=1` may appear on a line BELOW `connect=`,
+     * and a file must not mean different things depending on key order. */
+    int saw_dnsseed = 0, saw_listen = 0;
     char line[1024];
     while(fgets(line, sizeof line, f)){
         char* p = line;
@@ -177,7 +237,21 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
-            g_cfg.listen = iv?1:0; applied++; }
+            g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
+        else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
+            g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }
+        else if(!strcmp(key,"seednode")){     /* Core: getaddr from, then drop */
+            if(cfg_addlist(g_cfg.seednode,&g_cfg.n_seednode,val,key,&bad)) applied++; }
+        else if(!strcmp(key,"addnode")){      /* Core: prefer + keep connected */
+            if(cfg_addlist(g_cfg.addnode,&g_cfg.n_addnode,val,key,&bad)) applied++; }
+        else if(!strcmp(key,"connect")){
+            /* Core: connect ONLY to these; `connect=0` means no automatic
+             * connections at all. Either form sets connect_only, which is
+             * what the rest of the daemon keys off. */
+            if(!strcmp(val,"0")){ g_cfg.n_connect = 0; g_cfg.connect_only = 1; applied++; }
+            else if(cfg_addlist(g_cfg.connectn,&g_cfg.n_connect,val,key,&bad)){
+                g_cfg.connect_only = 1; applied++;
+            } }
         else if(!strcmp(key,"blocksonly")){
             /* Core: do not participate in tx relay. We honour it by setting
              * relay=0 on ordinary outbound legs too, which is what the flag
@@ -204,12 +278,27 @@ long node_config_load(const char* path){
     }
     fclose(f);
 
+    /* -connect's implications, applied once the whole file has been seen. */
+    if(g_cfg.connect_only){
+        if(!saw_dnsseed && g_cfg.dnsseed){
+            g_cfg.dnsseed = 0;
+            fprintf(stderr,"[config] connect= set -- disabling dnsseed (Core does the same; set dnsseed=1 to override)\n");
+        }
+        if(!saw_listen && g_cfg.listen){
+            g_cfg.listen = 0;
+            fprintf(stderr,"[config] connect= set -- disabling listen (Core does the same; set listen=1 to override)\n");
+        }
+    }
+
     /* Cross-field sanity: outbound classes must leave room for inbound. */
     int outbound = g_cfg.max_outbound + g_cfg.max_block_relay_only + g_cfg.max_feeler;
     if(outbound >= g_cfg.max_connections){
         fprintf(stderr,"[config] outbound classes (%d) >= maxconnections (%d) -- would leave no inbound slots; reverting connection budget to defaults\n",
                 outbound, g_cfg.max_connections);
-        g_cfg.max_connections=125; g_cfg.max_outbound=8;
+        g_cfg.max_connections=200;   /* Core v31 default -- must track the
+                                      * value at the top of this file, not the
+                                      * 125 this line was written against */
+        g_cfg.max_outbound=8;
         g_cfg.max_block_relay_only=2; g_cfg.max_feeler=1;
         bad++;
     }
@@ -240,4 +329,10 @@ void node_config_log(void){
     fprintf(stderr,"[config] net  : port=%d bind=%s listen=%d blocksonly=%d timeout=%dms peertimeout=%ds\n",
             g_cfg.port, g_cfg.bind_addr[0]?g_cfg.bind_addr:"0.0.0.0", g_cfg.listen,
             g_cfg.blocksonly, g_cfg.connect_timeout_ms, g_cfg.peer_timeout_s);
+    fprintf(stderr,"[config] src  : dnsseed=%d seednode=%d addnode=%d connect=%d%s\n",
+            g_cfg.dnsseed, g_cfg.n_seednode, g_cfg.n_addnode, g_cfg.n_connect,
+            g_cfg.connect_only?" (connect-only: no automatic peer discovery)":"");
+    for(int i=0;i<g_cfg.n_addnode;i++)  fprintf(stderr,"[config] src  :   addnode  %s\n", g_cfg.addnode[i]);
+    for(int i=0;i<g_cfg.n_seednode;i++) fprintf(stderr,"[config] src  :   seednode %s\n", g_cfg.seednode[i]);
+    for(int i=0;i<g_cfg.n_connect;i++)  fprintf(stderr,"[config] src  :   connect  %s\n", g_cfg.connectn[i]);
 }

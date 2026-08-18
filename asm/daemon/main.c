@@ -128,6 +128,7 @@ extern long p2p_addr_v1(void* out, const void* src, long n);
  * peers into the amr book, then download across DISCOVERED peers (not seeds). */
 extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
 extern long addr_replenish(void* ab, char peers[][64], int npeers, int max_try, int wait_s, long target); /* daemon/addr_ingest.c */
+extern long addr_gather_from(void* ab, const char* ip_str, int wait_s);              /* daemon/addr_ingest.c */
 extern int  mempool_configure(void);                     /* daemon/mempool_cfg.c */
 extern long mempool_expire_now(void);                    /* daemon/mempool_cfg.c */
 extern long      upload_note_and_check(long bytes_added); /* daemon/upload_cap.c */
@@ -289,8 +290,23 @@ static void catchup_alarm(int sig){ (void)sig; }
 static long outbound_catchup(long max_blocks){
     static unsigned char cbuf[4<<20];
     long total=0;
-    for(size_t s=0; s<sizeof(catchup_seeds)/sizeof(catchup_seeds[0]); s++){
-        const char* host=catchup_seeds[s];
+    /* This path dials the DNS seed hostnames directly, so it IS dns seeding:
+     * -dnsseed=0 and -connect must suppress it or the node would quietly
+     * contact seeds the operator disabled. Under -connect the configured
+     * nodes are used instead. */
+    const char* clist[CFG_MAX_NODES];
+    const char** srcs = catchup_seeds;
+    size_t nsrcs = sizeof(catchup_seeds)/sizeof(catchup_seeds[0]);
+    if(g_cfg.connect_only){
+        for(int i=0;i<g_cfg.n_connect;i++) clist[i]=g_cfg.connectn[i];
+        srcs = clist; nsrcs = (size_t)g_cfg.n_connect;
+        if(nsrcs==0){ fprintf(stderr,"[catchup] connect=0 -- no outbound catch-up\n"); return 0; }
+    } else if(!g_cfg.dnsseed){
+        fprintf(stderr,"[catchup] dnsseed=0 -- skipping seed-based boot catch-up\n");
+        return 0;
+    }
+    for(size_t s=0; s<nsrcs; s++){
+        const char* host=srcs[s];
         struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
         if(getaddrinfo(host,NULL,&h,&res)!=0) continue;
         unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
@@ -964,8 +980,59 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
  * and reliable -- no flaky getaddr round-trip that can block for seconds per
  * seed. We dial these discovered IPs (never the seed hostname itself as a
  * long-lived download source); they are bootstrap peers only. */
+/* Resolve a hostname or dotted-quad to ONE dotted-quad IPv4 string. Every
+ * peer list downstream (the candidate pool, the workers, addr_gather_from)
+ * speaks dotted-quad, so config entries are resolved at the boundary rather
+ * than each consumer having to cope with hostnames. Returns 1 on success. */
+static int dl_resolve1(const char* host, char out[64]){
+    struct addrinfo h,*res=0; memset(&h,0,sizeof h);
+    h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+    if(getaddrinfo(host,NULL,&h,&res)!=0 || !res) return 0;
+    struct sockaddr_in* sa=(struct sockaddr_in*)res->ai_addr;
+    const char* p = inet_ntop(AF_INET,&sa->sin_addr,out,64);
+    freeaddrinfo(res);
+    return p?1:0;
+}
+
 static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
     long total=0;
+
+    /* Core -connect: these are the ONLY peers. No DNS, no seednode getaddr,
+     * no book growth -- discovery of any kind would defeat the point of the
+     * option (it exists to pin the node to a known set). */
+    if(g_cfg.connect_only){
+        fprintf(stderr,"[boot] connect= set -- skipping all peer discovery\n");
+        return 0;
+    }
+
+    /* Core -addnode: peers the operator named. Folded into the book so every
+     * existing consumer sees them, and put at the head of the candidate pool
+     * by dl_catchup so they are actually tried first. */
+    for(int i=0;i<g_cfg.n_addnode;i++){
+        char ipd[64]; unsigned ip;
+        if(!dl_resolve1(g_cfg.addnode[i], ipd)){
+            fprintf(stderr,"[boot] addnode=%s did not resolve\n", g_cfg.addnode[i]); continue; }
+        if(inet_pton(AF_INET,ipd,&ip)!=1) continue;
+        if(amr_add(ab,ip,(unsigned short)htons(8333),1,(unsigned)time(NULL))>0) total++;
+        fprintf(stderr,"[boot] addnode %s -> %s\n", g_cfg.addnode[i], ipd);
+    }
+
+    /* Core -seednode: ask for addresses, then drop the connection. Distinct
+     * from addnode -- a seednode is a source of peers, not a peer we keep. */
+    for(int i=0;i<g_cfg.n_seednode;i++){
+        char ipd[64];
+        if(!dl_resolve1(g_cfg.seednode[i], ipd)){
+            fprintf(stderr,"[boot] seednode=%s did not resolve\n", g_cfg.seednode[i]); continue; }
+        long got = addr_gather_from(ab, ipd, 20);
+        fprintf(stderr,"[boot] seednode %s (%s) -> +%ld peers (getaddr)\n",
+                g_cfg.seednode[i], ipd, got);
+        total += got;
+    }
+
+    if(!g_cfg.dnsseed){
+        fprintf(stderr,"[boot] dnsseed=0 -- not querying the DNS seeds\n");
+        return total;
+    }
     for(int i=0;i<pool_len && i<12;i++){
         struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
         long got=0;
@@ -1529,23 +1596,43 @@ static long dl_catchup(const char* dir, int min_workers){
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
 
     static char pool[DLC_MAXPOOL][64];
-    /* Known-good peers first: these actually delivered blocks on a previous
-     * run, so they are worth far more than an arbitrary book entry. The book
-     * fills the rest; duplicates are harmless (the probe just confirms one
-     * twice) and the claimed[] logic already prevents two workers sharing a
-     * peer. */
-    int ngood = dl_load_good_peers(pool, DLC_MAXPOOL);
-    int npool = ngood;
-    {
-        static char book[DLC_MAXPOOL][64];
-        int nbook = dl_pool_from_book(ab, book, DLC_MAXPOOL);
-        for(int i=0;i<nbook && npool<DLC_MAXPOOL;i++){
-            int dup=0;
-            for(int j=0;j<ngood;j++) if(!strcmp(book[i],pool[j])){ dup=1; break; }
-            if(dup) continue;
-            strncpy(pool[npool],book[i],63); pool[npool][63]=0; npool++;
+    int npool = 0, ngood = 0, nadd = 0;
+    if(g_cfg.connect_only){
+        /* Core -connect: the pool IS the configured list. Nothing from the
+         * book, nothing from peers.good -- an operator who pins the node to
+         * two nodes must not find it downloading from two hundred. */
+        for(int i=0;i<g_cfg.n_connect && npool<DLC_MAXPOOL;i++){
+            char ipd[64];
+            if(!dl_resolve1(g_cfg.connectn[i], ipd)){
+                fprintf(stderr,"[dlc] connect=%s did not resolve\n", g_cfg.connectn[i]); continue; }
+            strncpy(pool[npool],ipd,63); pool[npool][63]=0; npool++;
+        }
+        fprintf(stderr,"[dlc] connect= -- pool restricted to %d configured node(s)\n", npool);
+    } else {
+        /* Order is priority order. addnode entries are operator intent and
+         * outrank everything; then peers that actually delivered blocks on a
+         * previous run; then the book, which records only that an address was
+         * SEEN. Duplicates are harmless (the probe just confirms one twice)
+         * and claimed[] already stops two workers sharing a peer. */
+        for(int i=0;i<g_cfg.n_addnode && npool<DLC_MAXPOOL;i++){
+            char ipd[64];
+            if(!dl_resolve1(g_cfg.addnode[i], ipd)) continue;
+            strncpy(pool[npool],ipd,63); pool[npool][63]=0; npool++; nadd++;
+        }
+        ngood = dl_load_good_peers(pool+npool, DLC_MAXPOOL-npool);
+        npool += ngood;
+        {
+            static char book[DLC_MAXPOOL][64];
+            int nbook = dl_pool_from_book(ab, book, DLC_MAXPOOL);
+            for(int i=0;i<nbook && npool<DLC_MAXPOOL;i++){
+                int dup=0;
+                for(int j=0;j<npool;j++) if(!strcmp(book[i],pool[j])){ dup=1; break; }
+                if(dup) continue;
+                strncpy(pool[npool],book[i],63); pool[npool][63]=0; npool++;
+            }
         }
     }
+    if(nadd)  fprintf(stderr,"[dlc] %d addnode peer(s) tried first\n", nadd);
     if(ngood) fprintf(stderr,"[dlc] %d known-good peer(s) from a previous run tried first\n", ngood);
     fprintf(stderr,"[dlc] %d candidate peer(s) in pool\n", npool);
     if(npool<=0){ fprintf(stderr,"[dlc] no peers discovered; skipping catch-up\n"); return 0; }
@@ -1591,7 +1678,10 @@ static long dl_catchup(const char* dir, int min_workers){
          * timeout, so a useful window is ~20s per peer). A node that already
          * probed a healthy live set should pay none of that. Below half the
          * target, top up; otherwise skip entirely. */
-        if(nlive>0 && nlive < want/2){
+        if(g_cfg.connect_only && nlive>0 && nlive < want/2){
+            fprintf(stderr,"[addr] only %d live peer(s) but connect= is set -- not asking for more\n", nlive);
+        }
+        else if(nlive>0 && nlive < want/2){
             fprintf(stderr,"[addr] only %d live peer(s) (target %d) -- asking peers for more\n", nlive, want);
             addr_replenish(ab, live, nlive, 3 /* ask at most 3 */, 20 /* seconds each */, 400);
         }
@@ -1708,16 +1798,31 @@ static long dl_catchup(const char* dir, int min_workers){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
-                        if(bidx>=0 && bidx<nlive && !banned[bidx]){
+                        /* Three outcomes, and the log line has to say WHICH:
+                         * this message read "peer BANNED" unconditionally,
+                         * including on the min_usable floor path where no ban
+                         * happens, so the log claimed bans that were never
+                         * applied. */
+                        const char* why = "kept";
+                        if(bidx>=0 && bidx<nlive && node_config_is_manual(live[bidx])){
+                            /* addnode/connect peers are MANUAL connections:
+                             * Core never auto-evicts them, and banning one
+                             * would drop a peer the operator pinned -- or,
+                             * under connect=, empty the pool outright. Rotate
+                             * the worker off it, but leave it selectable. */
+                            why = "manual";
+                        }
+                        else if(bidx>=0 && bidx<nlive && !banned[bidx]){
                             int usable=0; for(int q=0;q<nlive;q++) if(!banned[q]) usable++;
-                            if(usable > g_cfg.min_usable_peers){ banned[bidx]=1; nbanned++; }
+                            if(usable > g_cfg.min_usable_peers){ banned[bidx]=1; nbanned++; why="BANNED"; }
                             /* else: at the floor -- still kill the worker so it
                              * rotates to a different peer, but keep this one
                              * selectable. A slow peer beats no peer. */
+                            else why = "floor";
                         }
                         kill(opid[w],SIGUSR1);
                         dead_ticks[w]=0;
-                        snprintf(flag,sizeof flag," [early-kill sent, last %s, peer BANNED]",bw);
+                        snprintf(flag,sizeof flag," [early-kill, last %s, peer %s]",bw,why);
                     }
                 } else dead_ticks[w]=0;
             }
@@ -2237,6 +2342,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     }
     printf("serving on port %d (%d outbound peer(s))...\n", port, mux_n_out); fflush(stdout);
     long long rot=0;
+    /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
+     * negative fd and returns revents==0 for it, so the accept branch below
+     * is naturally dead in outbound-only mode -- no separate code path. */
     struct pollfd pfds[MUX_MAX_OUT+1];
     for(;;){
         int nfds=0;
@@ -2626,7 +2734,14 @@ int main(int argc, char** argv){
          * actually means. */
         int l = g_cfg.listen ? lsock(port) : -1;
         if(!g_cfg.listen) fprintf(stderr,"[boot] listen=0 -- not accepting inbound connections\n");
-        if(l<0){ perror("lsock"); return 1; }
+        /* Only a listener we ASKED for and failed to get is fatal. Under
+         * listen=0 the -1 is the intended result, and this check used to
+         * abort on it ("lsock: Invalid argument") -- so listen=0 killed the
+         * node instead of running it outbound-only, and by implication so did
+         * connect=, which sets listen=0. serve_mux polls `l` and nothing
+         * else, and poll() ignores a negative fd (POSIX: revents is set to 0),
+         * so the accept branch simply never fires. */
+        if(g_cfg.listen && l<0){ perror("lsock"); return 1; }
         fprintf(stderr,"[boot] checking for archive gaps / missing blocks...\n");
         phase_timer_t catchup_pt; phase_start(&catchup_pt);
         /* BUILT-IN MULTI-PEER CATCH-UP (SYNCHRONOUS, self-healing): detect

@@ -6,6 +6,7 @@
  * that. */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "node_config.h"
 
 static void wr(const char* path, const char* body){
@@ -40,7 +41,7 @@ int main(void){
     /* 3. out-of-range values are rejected, not applied */
     wr("/storage/bitcoinmachinecode/asm/bmc_t1.conf", "maxconnections=2\nbmc.peerminusable=0\nbmc.peerpool=-5\n");
     node_config_load("/storage/bitcoinmachinecode/asm/bmc_t1.conf");
-    if (g_cfg.max_connections==125 && g_cfg.min_usable_peers==8 && g_cfg.maxpool==2048)
+    if (g_cfg.max_connections==200 && g_cfg.min_usable_peers==8 && g_cfg.maxpool==2048)
         printf("PASS: out-of-range values rejected, defaults kept\n");
     else { printf("FAIL: bad values applied (conns=%d usable=%d pool=%d)\n",
                   g_cfg.max_connections,g_cfg.min_usable_peers,g_cfg.maxpool); failures++; }
@@ -66,6 +67,93 @@ int main(void){
     if (g_cfg.max_connections==64)
         printf("PASS: foreign Core keys ignored without disturbing parsing\n");
     else { printf("FAIL: parsing disturbed by foreign keys (conns=%d)\n", g_cfg.max_connections); failures++; }
+
+    /* ---- peer sourcing: dnsseed / seednode / addnode / connect ---- */
+
+    /* 7. dnsseed=0 is honoured (it gates ALL DNS bootstrapping) */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t5.conf", "dnsseed=0\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t5.conf");
+    if (g_cfg.dnsseed==0 && g_cfg.connect_only==0)
+        printf("PASS: dnsseed=0 honoured without implying connect-only\n");
+    else { printf("FAIL: dnsseed=%d connect_only=%d\n", g_cfg.dnsseed, g_cfg.connect_only); failures++; }
+
+    /* 8. the repeatable keys accumulate, and duplicates collapse */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t6.conf",
+       "addnode=1.2.3.4\naddnode=5.6.7.8\naddnode=1.2.3.4\nseednode=9.9.9.9\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t6.conf");
+    if (g_cfg.n_addnode==2 && g_cfg.n_seednode==1
+        && !strcmp(g_cfg.addnode[0],"1.2.3.4") && !strcmp(g_cfg.addnode[1],"5.6.7.8")
+        && !strcmp(g_cfg.seednode[0],"9.9.9.9"))
+        printf("PASS: addnode/seednode repeat and de-duplicate (%d addnode, %d seednode)\n",
+               g_cfg.n_addnode, g_cfg.n_seednode);
+    else { printf("FAIL: list parse (addnode=%d seednode=%d)\n", g_cfg.n_addnode, g_cfg.n_seednode); failures++; }
+
+    /* 9. connect= implies dnsseed=0 and listen=0, as in Core */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t7.conf", "connect=10.0.0.1\nconnect=10.0.0.2\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t7.conf");
+    if (g_cfg.connect_only==1 && g_cfg.n_connect==2 && g_cfg.dnsseed==0 && g_cfg.listen==0)
+        printf("PASS: connect= implies dnsseed=0 listen=0 (2 nodes pinned)\n");
+    else { printf("FAIL: connect implications (only=%d n=%d dnsseed=%d listen=%d)\n",
+                  g_cfg.connect_only,g_cfg.n_connect,g_cfg.dnsseed,g_cfg.listen); failures++; }
+
+    /* 10. an EXPLICIT listen=1/dnsseed=1 beats the implication -- and does so
+     *     even when it appears BELOW connect=, because a config file must not
+     *     change meaning with key order. */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t8.conf", "connect=10.0.0.1\nlisten=1\ndnsseed=1\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t8.conf");
+    if (g_cfg.connect_only==1 && g_cfg.listen==1 && g_cfg.dnsseed==1)
+        printf("PASS: explicit listen/dnsseed below connect= still win (order-independent)\n");
+    else { printf("FAIL: order dependence (listen=%d dnsseed=%d)\n", g_cfg.listen, g_cfg.dnsseed); failures++; }
+
+    /* 11. connect=0 -- no automatic connections, and no manual ones either */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t9.conf", "connect=0\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t9.conf");
+    if (g_cfg.connect_only==1 && g_cfg.n_connect==0)
+        printf("PASS: connect=0 disables automatic connections with an empty node list\n");
+    else { printf("FAIL: connect=0 (only=%d n=%d)\n", g_cfg.connect_only, g_cfg.n_connect); failures++; }
+
+    /* 12. manual-peer lookup drives the never-evict rule in the downloader */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t10.conf", "addnode=1.1.1.1\nconnect=2.2.2.2\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t10.conf");
+    if (node_config_is_manual("1.1.1.1") && node_config_is_manual("2.2.2.2")
+        && !node_config_is_manual("3.3.3.3") && !node_config_is_manual(""))
+        printf("PASS: node_config_is_manual identifies addnode+connect peers only\n");
+    else { printf("FAIL: is_manual wrong\n"); failures++; }
+
+    /* 13. host:port -- the default port is stripped and kept; anything else is
+     *     REJECTED rather than silently dialled on 8333 */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t11.conf", "addnode=4.4.4.4:8333\naddnode=5.5.5.5:18333\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t11.conf");
+    if (g_cfg.n_addnode==1 && !strcmp(g_cfg.addnode[0],"4.4.4.4"))
+        printf("PASS: :8333 stripped, non-default port rejected (not silently redirected)\n");
+    else { printf("FAIL: port handling (n=%d first=%s)\n",
+                  g_cfg.n_addnode, g_cfg.n_addnode?g_cfg.addnode[0]:"-"); failures++; }
+
+    /* 14. more entries than the fixed array holds must not overflow it */
+    { char big[8192]; int o=0;
+      for(int i=0;i<CFG_MAX_NODES+8;i++) o+=snprintf(big+o,sizeof big-o,"addnode=10.1.%d.1\n",i);
+      wr("/storage/bitcoinmachinecode/asm/bmc_t12.conf", big);
+      node_config_load("/storage/bitcoinmachinecode/asm/bmc_t12.conf");
+      if (g_cfg.n_addnode==CFG_MAX_NODES)
+          printf("PASS: addnode list capped at CFG_MAX_NODES (%d) without overflow\n", CFG_MAX_NODES);
+      else { printf("FAIL: cap not enforced (n=%d)\n", g_cfg.n_addnode); failures++; } }
+
+    /* 15. a reload must not inherit the previous file's lists */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t13.conf", "maxconnections=64\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t13.conf");
+    if (g_cfg.n_addnode==0 && g_cfg.n_connect==0 && g_cfg.n_seednode==0
+        && g_cfg.connect_only==0 && g_cfg.dnsseed==1)
+        printf("PASS: reload clears peer lists from the previous config\n");
+    else { printf("FAIL: stale lists after reload (add=%d conn=%d seed=%d)\n",
+                  g_cfg.n_addnode,g_cfg.n_connect,g_cfg.n_seednode); failures++; }
+
+    /* the fixtures are written into the repo dir; do not leave 13 stray
+     * bmc_t*.conf files behind for the next `git status` to trip over. */
+    { char rmpath[256];
+      for(int i=1;i<=13;i++){
+          snprintf(rmpath,sizeof rmpath,"/storage/bitcoinmachinecode/asm/bmc_t%d.conf",i);
+          remove(rmpath);
+      } }
 
     printf("\n");
     node_config_log();
