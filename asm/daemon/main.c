@@ -64,6 +64,8 @@
  * leg returns in milliseconds and does not hold the rotation. Kept well above a
  * single leg's per-pass round-trip cost. */
 #define DL_BUDGET_SECS 60.0
+#define DL_HEARTBEAT_MS 60000L   /* periodic [dl] heartbeat so the log stays
+                                  * visibly alive between block/peer events */
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
@@ -78,6 +80,7 @@ extern long store_init(void* st);
 extern long store_reload(void* st);
 extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
+extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1462,6 +1465,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     }
     fprintf(stderr,"[dl] connected %d/%d peer(s); downloading across them...\n", mux_n_out, 8);
     long long rot=0;
+    long long boot_ms = 0;
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+    long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
     for(;;){
         long long now_ms = 0;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
@@ -1470,6 +1476,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
                 if(now_ms>=mux_out_nextretry[i]){ mux_redial(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                continue;
+            }
+            /* Cheap liveness check BEFORE syncing: a peer that cleanly closed
+             * or reset the connection shows up here as POLLHUP/POLLERR/POLLNVAL
+             * with a zero timeout (non-blocking -- never delays the rotation).
+             * Without this, do_outbound_sync's node_sync would just keep
+             * returning ok!=1 on the dead fd forever with no log and no
+             * re-dial (only a genuinely HUNG peer trips the SIGALRM budget
+             * below) -- this is the serve_mux parent's own POLLHUP/POLLERR/
+             * POLLNVAL pattern (see the accept loop above), mirrored here so
+             * the download worker's peer drops are equally visible/handled. */
+            struct pollfd pf = { mux_out_fd[i], POLLIN, 0 };
+            if(poll(&pf, 1, 0) > 0 && (pf.revents & (POLLHUP|POLLERR|POLLNVAL))){
+                fprintf(stderr,"[dl:%d] %s connection dropped (revents 0x%x); re-dialing\n",
+                        i, mux_out_host[i], pf.revents);
+                mux_redial(i, peers, pool_len, out_port);
+                mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
             }
             /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
@@ -1503,6 +1526,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 fprintf(stderr,"[dl] utxo_live_catchup fatal error -- disabling live UTXO tracking\n");
                 utxo_live_ok = 0;
             }
+        }
+        if(now_ms >= next_heartbeat_ms){
+            int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
+            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%llds\n",
+                    *(int*)(store_buf+24), live_peers, mux_n_out,
+                    utxo_live_ok?utxo_live_count():-1L, (now_ms-boot_ms)/1000);
+            next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
         /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
@@ -1571,8 +1601,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(pr<0){ if(errno==EINTR) continue; break; }
         /* inbound accept -> fork a serve child (unchanged semantics) */
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
-            int c=accept(l,0,0);
+            struct sockaddr_in ca; socklen_t cal=sizeof ca;
+            int c=accept(l,(struct sockaddr*)&ca,&cal);
             if(c>=0){
+                char ipbuf[INET_ADDRSTRLEN]; ipbuf[0]=0;
+                inet_ntop(AF_INET,&ca.sin_addr,ipbuf,sizeof ipbuf);
                 /* Refresh our in-memory store extent from the on-disk archive
                  * so this (and each forked child) serves blocks the download
                  * WORKER appended since boot -- serving reads block bytes fresh
@@ -1587,11 +1620,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
-                    if(node_accept_handshake(c)==1)
+                    int hok = node_accept_handshake(c);
+                    fprintf(stderr,"[serve] inbound %s:%d %s (pid %d)\n", ipbuf,
+                            ntohs(ca.sin_port), hok==1?"connected":"handshake failed", getpid());
+                    if(hok==1)
                         node_serve_loop(c, node_log_open("bitcoind.log"), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
                 }
                 close(c);
+                fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d\n", ipbuf, ntohs(ca.sin_port), w);
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
