@@ -564,6 +564,10 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
+        if (applied % 20000 == 0) {
+            fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
+                    h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
+        }
         if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
