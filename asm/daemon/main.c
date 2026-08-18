@@ -107,6 +107,7 @@ extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
+extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1579,9 +1580,33 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * ever calls utxo_lsm_put/del (inbound serve children only ever get a
      * read-only utxo_lsm_reload() snapshot). Non-fatal on failure -- block
      * sync/relay must keep working even if UTXO tracking can't start. */
+    /* Verify the archive BEFORE any UTXO work. An append-only store cannot
+     * notice that a mid-sync locator collapse made a peer re-serve from
+     * genesis onto our tail, so a corrupt archive used to flow straight into
+     * the UTXO set and be reported as success. Detect it (duplicate block
+     * hashes are never valid on a real chain) and self-repair by truncating
+     * to the last good height, letting normal sync re-download from there. */
+    int archive_ok;
+    {
+        /* ONE scan: it walks every index record through a ~1M-entry hash
+         * table, so this is not something to run twice per boot. */
+        int av = archive_verify_and_repair(store_buf, 1 /* repair */);
+        archive_ok = (av >= 0);
+        if(av == 0){
+            /* Truncated: any persisted UTXO applied-height now refers to
+             * heights that no longer exist, so the UTXO set must be rebuilt
+             * from scratch rather than resumed against a shorter chain. */
+            unlink("utxo_applied_height.dat");
+            fprintf(stderr,"[dl] archive was repaired -- dropped utxo_applied_height.dat so UTXO state rebuilds cleanly\n");
+        } else if(av < 0){
+            fprintf(stderr,"[dl] archive INTEGRITY CHECK FAILED and was not repaired -- continuing WITHOUT live UTXO tracking\n");
+        }
+    }
+
     fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
     phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
-    int utxo_live_ok = utxo_live_init(dir);
+    int utxo_live_ok = archive_ok ? utxo_live_init(dir) : 0;
+    if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
     else fprintf(stderr,"[dl] worker: live UTXO state loaded (%.2fs)\n", phase_elapsed(&utxo_init_pt));
 
