@@ -542,15 +542,65 @@ static void handle_shutdown_signal(int sig){ g_shutdown_requested = sig; }
  * (sendheaders/sendaddrv2/feefilter/addr), which can take longer than the
  * tight per-pass recv bound -- so give the handshake a generous 6s timeout,
  * then clamp the socket to the short per-pass timeout for node_sync. */
+/* Shared wall-clock-budget signal state. Defined here (rather than just above
+ * do_outbound_sync_bounded, where it used to live) because outbound_connect
+ * below now arms the same budget around its dial, and needs it in scope. */
+static volatile sig_atomic_t mux_sync_budget_fired = 0;
+static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
+
+/* Wall-clock budget for ONE dial (blocking connect + handshake). SO_RCVTIMEO
+ * alone is NOT sufficient here and this is a real production hang, not a
+ * hypothetical: it bounds each INDIVIDUAL read(), so a peer that trickles the
+ * version/verack bytes a few at a time resets the timer on every partial read
+ * and node_handshake never returns -- the download worker's whole rotation
+ * loop then sits in that one read() forever (no heartbeat, no other leg
+ * serviced, SIGTERM not even checked). Observed twice on 2026-08-18: the
+ * worker wedged in tcp_recvmsg for 60+ minutes right after a leg-fill round,
+ * and had to be SIGKILLed. tcp_connect_ip's connect() has no connect-phase
+ * timeout either, which this same budget also covers.
+ *
+ * The rest of this file already solves exactly this problem the same way --
+ * see do_outbound_sync_bounded and the dlc chunk worker, whose comment spells
+ * out the trickle-resets-SO_RCVTIMEO mechanism. outbound_connect was simply
+ * never given the same treatment, even though every one of its callers (the
+ * steady-state leg fill and mux_redial) runs OUTSIDE any enclosing alarm. */
+#define OUTBOUND_DIAL_BUDGET_SECS 20
+
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(host,NULL,&h,&res)!=0) return -1;
     unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);
+
+    /* Arm the dial budget around BOTH the blocking connect and the handshake.
+     * SA_RESTART is deliberately left clear (memset) so the signal makes the
+     * in-flight syscall fail with EINTR instead of silently resuming. */
+    struct sigaction sa, old; memset(&sa,0,sizeof sa);
+    sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM,&sa,&old);
+    sig_atomic_t saved_fired = mux_sync_budget_fired;   /* don't clobber an outer pass's flag */
+    mux_sync_budget_fired = 0;
+    alarm(OUTBOUND_DIAL_BUDGET_SECS);
+
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+    int hk = 0;
+    if(fd>=0){
+        struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        hk = node_handshake(fd);
+    }
+
+    alarm(0);
+    int fired = mux_sync_budget_fired;
+    mux_sync_budget_fired = saved_fired;
+    sigaction(SIGALRM,&old,NULL);
+
     if(fd<0) return -1;
-    struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-    if(node_handshake(fd)!=1){ close(fd); return -1; }
+    if(fired || hk!=1){
+        if(fired) fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
+                          host, OUTBOUND_DIAL_BUDGET_SECS);
+        close(fd);
+        return -1;
+    }
     /* handshake done: tighten the recv bound so each node_sync pass returns
      * promptly when the peer is already at the chain tip */
     struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
@@ -752,8 +802,6 @@ static void mux_redial(int i, const char* peers[], int pool_len, int out_port){
  * from the freshly-anchored stored tip. A caught-up node completes node_sync
  * in well under the budget, so it is never interrupted and small-store
  * behavior (test_outbound_mux) is unchanged. */
-static volatile sig_atomic_t mux_sync_budget_fired = 0;
-static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
 
 /* Execute ONE bounded outbound sync pass on leg i. Returns the # blocks stored
  * this pass (as do_outbound_sync) -- but keeps the loop responsive by capping
