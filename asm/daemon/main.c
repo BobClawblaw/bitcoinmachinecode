@@ -982,8 +982,16 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
  * that's just momentarily slow before recovering) is treated as dead, so
  * the parent signals that worker to abandon rather than making it sit out
  * the full DLC_CHUNK_BUDGET_SECS on a peer that was never going anywhere. */
-#define DLC_DEAD_WEIGHT_BPS 10240.0
-#define DLC_DEAD_WEIGHT_TICKS 10
+/* Retuned 2026-08-18 after watching a real re-sync crawl at ~119KB/s
+ * aggregate. The old floor (10KB/s sustained for 10 consecutive 10s ticks)
+ * meant a peer trickling 3-9KB/s -- bad, but not bad enough to trip a 10KB/s
+ * bar -- burned a FULL 100 SECONDS of a worker slot before being replaced,
+ * and most of the pool was doing exactly that. Patience is only a virtue when
+ * the peer might recover; when other peers are managing 15KB/s+ on the same
+ * link, a slot held by a 5KB/s peer is pure loss. React in ~30s instead, and
+ * judge against a floor that reflects what a useful peer actually delivers. */
+#define DLC_DEAD_WEIGHT_BPS 32768.0
+#define DLC_DEAD_WEIGHT_TICKS 3
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record.
  * asm/bitcoin_idxscan.asm:idxscan_all_present -- buffered pread64 port,
@@ -1103,13 +1111,14 @@ static long dlc_headers(char live[][64], int nlive){
  * its own throughput while blocked inside node_ibd_blocks_s. MAP_ANONYMOUS
  * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
  * before the parent's first 10s tick. */
-typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; } dlc_stat_t;
+typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; long held_idx; } dlc_stat_t;
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 
 static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
-                      volatile dlc_stat_t* mystat, volatile int* claimed){
+                      volatile dlc_stat_t* mystat, volatile int* claimed,
+                      volatile int* banned){
     /* SIGUSR1 registered for this worker's WHOLE lifetime, not just around
      * the node_ibd_blocks_s call below -- the parent can send it any time
      * it spots sustained near-zero bandwidth, which won't always land while
@@ -1157,6 +1166,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                 int ok=0;
                 for(int a=0;a<nlive && !ok;a++){
                     int idx=(slot+a)%nlive;
+                    if(banned[idx]) continue;   /* already proved itself useless this run */
                     const char* cand=live[idx];
                     unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) continue;
                     /* claim this peer for exclusive use FIRST -- a real peer
@@ -1169,6 +1179,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     if(node_handshake(fdc)==1){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
                         /* fresh peer -- the displayed chunks/blocks/guard
                          * must reflect THIS connection, not accumulate
@@ -1428,7 +1439,17 @@ static long dl_catchup(const char* dir, int min_workers){
      * workers ever share one peer's bandwidth while a distinct live peer
      * sits unused. */
     volatile int* claimed=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED){ perror("mmap"); return 0; }
+    /* Peers evicted for sustained uselessness are banned for the REST OF THE
+     * RUN. Without this the replacement draw is memoryless: a worker killed
+     * for trickling at 5KB/s could immediately be handed the same IP again,
+     * and with most of the pool being duds that is what kept happening. */
+    volatile int* banned=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED){ perror("mmap"); return 0; }
+    /* MAP_ANONYMOUS zero-fills, so held_idx would default to 0 -- and a
+     * worker that never managed to connect would then make the parent ban
+     * live[0], a peer that may be perfectly good. Mark "holding nothing"
+     * explicitly. */
+    for(int i=0;i<nw;i++) stats[i].held_idx = -1;
     *next_claim=start_h; *done_count=0;
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
@@ -1438,7 +1459,7 @@ static long dl_catchup(const char* dir, int min_workers){
     pid_t kids[64]; pid_t opid[64];
     for(int w=0;w<nw;w++){
         pid_t p=fork();
-        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed)); }
+        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed, banned)); }
         kids[w]=p; opid[w]=p;
     }
     /* live peer-stats table: poll every 10s instead of blocking silently on
@@ -1449,6 +1470,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * one large chunk shows 0 chunks for minutes even while actively
      * downloading at full speed, which the byte counter catches. */
     long prev_blocks[64]={0}; long prev_rchar[64]={0}; long prev_wbytes[64]={0}; int dead_ticks[64]={0};
+    long nbanned=0;
     double cumulative_bytes=0.0;       /* running total network-received, across the whole call */
     double cumulative_write_bytes=0.0; /* running total actually written to disk, across the whole call */
     int alive=nw;
@@ -1496,9 +1518,11 @@ static long dl_catchup(const char* dir, int min_workers){
                 if(byte_rate<DLC_DEAD_WEIGHT_BPS){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=DLC_DEAD_WEIGHT_TICKS){
+                        long bidx = stats[w].held_idx;
+                        if(bidx>=0 && bidx<nlive && !banned[bidx]){ banned[bidx]=1; nbanned++; }
                         kill(opid[w],SIGUSR1);
                         dead_ticks[w]=0;
-                        snprintf(flag,sizeof flag," [early-kill sent, last %s]",bw);
+                        snprintf(flag,sizeof flag," [early-kill sent, last %s, peer BANNED]",bw);
                     }
                 } else dead_ticks[w]=0;
             }
@@ -1542,7 +1566,8 @@ static long dl_catchup(const char* dir, int min_workers){
             char avgrbuf[16], avgwbuf[16];
             dlc_fmt_rate(avgrbuf,sizeof avgrbuf,cumulative_bytes/(double)elapsed_secs);
             dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
-            fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
+            fprintf(stderr,"[dlc] -- peers banned this run: %ld of %d --\n", nbanned, nlive);
+    fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
         }
     }
     long total=*done_count;
