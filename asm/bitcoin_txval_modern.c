@@ -44,12 +44,23 @@ extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
                      unsigned long* slen);
 
 /* ================= helpers ================= */
+/* prev_spk points into prev_spk_buf (owned, copied by value in mv_resolve),
+ * NOT directly into whatever utxo_get/utxo_lsm_get returned. Required for
+ * utxo_lsm_get specifically: on a disk-run hit its returned script pointer
+ * is only valid until the NEXT utxo_lsm_get call (see bitcoin_utxo_lsm.asm's
+ * header comment), and mv_resolve below resolves ALL inputs in one loop
+ * before any of them are consumed -- including P2TR's own aggregation of
+ * every input's prev_spk together for the combined sighash, further below
+ * in this file. Sized to comfortably cover the fixed-size scriptPubKey
+ * forms this validator actually supports (P2WPKH 22B, P2WSH/P2TR 34B). */
+#define PREV_SPK_BUF_MAX 42
 typedef struct {
     uint8_t outpoint[36];
     uint8_t scriptSig[32]; uint32_t scriptSiglen;
     uint32_t sequence;
     const uint8_t* wit[16]; uint32_t witlen[16]; uint32_t nwit;
     uint64_t amount;
+    uint8_t prev_spk_buf[PREV_SPK_BUF_MAX];
     const uint8_t* prev_spk; uint32_t prev_spklen;
 } inrec_t;
 
@@ -129,15 +140,20 @@ static int mv_resolve(mv_tx_t* T, void* utxo, const char** err){
         inrec_t* in = &T->in[i];
         unsigned long long val; const unsigned char* sp; unsigned long sl;
         /* txid (32 bytes) + vout (4 LE) from outpoint */
-        if (utxo_get(utxo, in->outpoint, 
+        if (utxo_get(utxo, in->outpoint,
                      (unsigned long)(in->outpoint[32] | (in->outpoint[33]<<8)
                                      | (in->outpoint[34]<<16) | ((uint32_t)in->outpoint[35]<<24)),
                      &val, &sp, &sl) != 1){
             if (err) *err = "input not found in utxo";
             return 0;
         }
+        if (sl > PREV_SPK_BUF_MAX){
+            if (err) *err = "prevout script too large";
+            return 0;
+        }
         in->amount = (uint64_t)val;
-        in->prev_spk = sp; in->prev_spklen = (uint32_t)sl;
+        memcpy(in->prev_spk_buf, sp, sl);
+        in->prev_spk = in->prev_spk_buf; in->prev_spklen = (uint32_t)sl;
     }
     return 1;
 }
