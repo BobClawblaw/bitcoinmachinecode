@@ -128,6 +128,50 @@ long archive_drop_utxo_state(void){
     return removed;
 }
 
+/* archive_layout_monotonic(): -1 if block data is laid out in increasing
+ * (file_no, data_pos) order across heights 0..upto, else the FIRST height
+ * that goes backwards.
+ *
+ * THIS GUARD EXISTS BECAUSE ITS ABSENCE DESTROYED A ~50GB ARCHIVE.
+ *
+ * store_truncate_to assumes the archive is well formed: that block data was
+ * appended in increasing height order, so "truncate to H" means cut H's file
+ * at H's offset and delete every higher-numbered blk file. On a CORRUPT
+ * archive that invariant does not hold -- and a corrupt archive is precisely
+ * when repair gets called. Here, height 479,658 held the block belonging at
+ * height 43, so its recorded location was blk00000.dat at offset ~9,597.
+ * Truncating "to" that location cut the first block file down to 9,597 bytes
+ * and unlinked all ~4,855 files above it. The entire chain archive was gone.
+ *
+ * So: never hand a destructive, well-formedness-assuming primitive an archive
+ * we have just proven malformed. Verify the layout first; if it goes
+ * backwards anywhere, truncation is NOT a safe repair and must be refused.
+ *
+ * Index record (48B): [0..31] hash, [32..35] file_no u32,
+ *                     [36..43] data_pos u64, [44..47] data_size u32. */
+long archive_layout_monotonic(long upto){
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return -1;
+    unsigned char rec[48];
+    unsigned long long prev_file = 0, prev_pos = 0;
+    int seen = 0;
+    long bad = -1;
+    for (long h = 0; h <= upto; h++){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48) break;
+        if (!rec[0] && !rec[1] && !rec[2] && !rec[3]) continue;   /* hole */
+        unsigned int fno; unsigned long long pos;
+        memcpy(&fno, rec + 32, 4);
+        memcpy(&pos, rec + 36, 8);
+        if (seen && (fno < prev_file || (fno == prev_file && pos < prev_pos))){
+            bad = h;
+            break;
+        }
+        prev_file = fno; prev_pos = pos; seen = 1;
+    }
+    close(fd);
+    return bad;
+}
+
 /* archive_verify_and_repair(): scan, and if corrupt, truncate back to the last
  * known-good height so normal sync re-downloads the rest.
  *   repair == 0 -> report only (log and return, change nothing)
@@ -156,6 +200,22 @@ int archive_verify_and_repair(void* store_buf, int repair){
 
     long keep = first_bad - 1;
     if (keep < 0) keep = 0;
+
+    /* SAFETY GATE -- see archive_layout_monotonic. Truncation is only sound
+     * when block data really is laid out in height order; on this archive it
+     * was not, and truncating cost ~4,855 block files. Refuse rather than
+     * destroy: a node that declines to repair is recoverable, one that has
+     * deleted its archive is not. */
+    long nonmono = archive_layout_monotonic(keep);
+    if (nonmono >= 0){
+        fprintf(stderr, "[archive] REFUSING TO TRUNCATE: block data is not in height order\n");
+        fprintf(stderr, "[archive]   height %ld points BACKWARDS in the blk files.\n", nonmono);
+        fprintf(stderr, "[archive]   store_truncate_to assumes append-in-height-order and would cut the\n");
+        fprintf(stderr, "[archive]   first block file at that low offset and unlink everything above it,\n");
+        fprintf(stderr, "[archive]   destroying the archive. Manual repair or a full re-sync is required.\n");
+        return -1;
+    }
+
     fprintf(stderr, "[archive] repairing: truncating to height %ld (discarding %ld entries above it).\n",
             keep, entries - 1 - keep);
     fprintf(stderr, "[archive] the store is append-only, so truncate-and-resync is the only sound repair;\n");
