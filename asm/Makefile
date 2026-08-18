@@ -634,8 +634,10 @@ tests/smoke_interp: tests/smoke_interp.c $(INTERPOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/smoke_interp.c $(INTERPOBJS)
 tests/test_interp: tests/test_interp.c $(INTERPOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_interp.c $(INTERPOBJS)
-tests/test_tapscript_interp: tests/test_tapscript_interp.c $(INTERPOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_tapscript_interp.c $(INTERPOBJS)
+# -I. so the test picks up the GENERATED script_error_codes.h instead of
+# carrying its own copy of the interpreter's error numbering.
+tests/test_tapscript_interp: tests/test_tapscript_interp.c script_error_codes.h $(INTERPOBJS)
+	$(CC) -no-pie -O0 -I. -o $@ tests/test_tapscript_interp.c $(INTERPOBJS)
 tests/test_interp_legacy_spend: tests/test_interp_legacy_spend.c wallet_core.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script.o $(WALLETPRIMS)
 	$(CC) -no-pie -O0 -o $@ tests/test_interp_legacy_spend.c wallet_core.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script.o $(WALLETPRIMS)
 tests/run_batch: tests/run_batch.c $(INTERPOBJS)
