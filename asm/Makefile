@@ -100,8 +100,8 @@ tests/test_bip152: tests/test_bip152.c $(CMPCTOBJS) tests/bip152_vectors.h
 tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 
-tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o
-	$(CC) $(CFLAGS) -o $@ tests/bench_idxscan.c bitcoin_idxscan.o
+tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
+	$(CC) $(CFLAGS) -o $@ tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
 
 # -O0: -O2 miscompiles this harness (fread called with a NULL buffer per
 # gdb; idx_build_from_file itself is independently verified correct via
@@ -129,7 +129,7 @@ tests/test_block_genesis: tests/test_block_genesis.c $(CONSOBJS)
 # bitcoind: handshake + version builder (networked). node_sync also calls
 # cons_verify + store_append, so DAEMONOBJS must include those objects.
 # node_ibd_headers references hst_append (bitcoin_headers.asm), so include it.
-DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o
+DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_idxscan.o
 
 tests/test_bitcoind: tests/test_bitcoind.c $(DAEMONOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(DAEMONOBJS)
@@ -166,7 +166,7 @@ tests/test_headers: tests/test_headers.c $(HEADOBJS)
 # as the bitcoind sync harness; the asm is identical and correct at -O0.
 # bitcoind.o bundles node_sync/node_serve_block/node_drain which reference the
 # cons/store/tx symbols, so link the full DAEMONOBJS superset.
-IBDOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o
+IBDOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_idxscan.o
 tests/test_ibd_headers: tests/test_ibd_headers.c $(IBDOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_headers.c $(IBDOBJS)
 
@@ -204,7 +204,7 @@ tests/test_idx: tests/test_idx.c $(IDXOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_idx.c $(IDXOBJS)
 
 # bitcoin_serve.asm: inbound (server) message loop over p2p + idx + serve_block.
-SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o sha256.o bitcoin_mempool.o bitcoin_cmpct.o
+SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o sha256.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o
 tests/test_serve: tests/test_serve.c $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVEOBJS)
 

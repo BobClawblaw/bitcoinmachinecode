@@ -30,6 +30,7 @@ default rel
     extern idx_get
     extern idx_put
     extern store_append
+    extern idxscan_append_locked
     extern cons_verify
     extern node_serve_block
     extern node_log_event
@@ -356,14 +357,21 @@ node_serve_loop:
     call idx_get
     test rax, rax
     jnz  .next                ; duplicate -> skip
-    ; store_append(st, hash, pl_buf, s_plen) -- sequential append at current
-    ; tip; valid for the single-authority serve store (st+40 is NOT a flock fd
-    ; in the serve daemon, so store_append_shared must not be used here).
+    ; idxscan_append_locked(st, hash, pl_buf, s_plen) -- an inbound peer can
+    ; push a block directly (or in response to our own .do_inv-triggered
+    ; getdata) in ANY forked serve child, concurrently with the download
+    ; worker's own node_sync-driven appends in a SEPARATE process -- st+40 IS
+    ; a valid flock fd here (main.c opens append.lock and sets it into
+    ; store_buf before forking either the download worker or serve_mux's
+    ; per-connection children, so every forked copy inherits it). Both
+    ; concurrent writers now go through the same flock-guarded,
+    ; atomic-height-under-lock primitive so neither can silently collide on
+    ; or clobber the other's height slot.
     mov  rdi, [s_st]
     lea  rsi, [sb_buf+0x200000]
     lea  rdx, [pl_buf]
     mov  rcx, [s_plen]
-    call store_append
+    call idxscan_append_locked
     test rax, rax
     jle  .next
     ; index it (freshly-stored block becomes serveable by hash O(1)):
