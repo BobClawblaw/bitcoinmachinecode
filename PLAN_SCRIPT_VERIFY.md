@@ -191,6 +191,49 @@ Each is a well-known consensus footgun with real chain data exercising it.
 This is implementation in asm, not wiring, and it makes B the dominant stage
 by a wide margin.
 
+## Stage A work item: error-code translation
+
+The two interpreters use DIFFERENT ScriptError numbering, and the difference
+is deliberate on the asm side.
+
+Authoritative values, read from
+`/storage/bitcoin-core-source/src/script/script_error.h` (Core v31.99.0):
+
+| name | Core | `bitcoin_verify.c` | `bitcoin_interp.asm` |
+|---|---|---|---|
+| SCRIPTNUM | 4 | 4 | 18 |
+| SCRIPT_SIZE | 5 | 5 | 4 |
+| PUSH_SIZE | 6 | 6 | 5 |
+| OP_COUNT | 7 | 7 | 6 |
+| STACK_SIZE | 8 | 8 | 7 |
+| BAD_OPCODE | 16 | 16 | 8 |
+| INVALID_STACK_OPERATION | 18 | 18 | 16 |
+| MINIMALDATA | 25 | 25 | 19 |
+| SIG_NULLDUMMY | 28 | 28 | n/a |
+| CLEANSTACK | 30 | 30 | 53 |
+
+So `bitcoin_verify.c` matches Core exactly, and the asm interpreter uses its
+own scheme -- including a private high range for tapscript-era codes
+(TAPSCRIPT_MINIMALIF 50, TAPSCRIPT_CHECKMULTISIG 51, DISCOURAGE_OP_SUCCESS 52,
+CLEANSTACK 53).
+
+(Recorded because it was initially claimed the other way round, from memory,
+before the header was read. The header is the authority; assertions about
+Core's constants in this project must come from
+`/storage/bitcoin-core-source/src`, never from recall.)
+
+Consequence for Stage A: making `script_eval` the consensus interpreter means
+the seam must TRANSLATE asm error codes into Core codes, because the
+differential harness compares error-for-error against the Core oracle.
+
+Two options:
+- **(preferred) translation table in the C seam.** Leaves the audited asm
+  interpreter untouched, keeps one place where the mapping lives, and is
+  directly testable: assert every asm code maps to the Core code of the same
+  name, with a test that fails if either enum gains a member.
+- renumber the asm to Core's values. Single source of truth, but edits a
+  verified interpreter across many sites for no behavioural gain.
+
 ## Original decision list (now resolved -- kept for the reasoning)
 
 1. **Which interpreter is consensus?** The project's stated ethos is
