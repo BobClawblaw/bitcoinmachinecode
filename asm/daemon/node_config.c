@@ -45,6 +45,7 @@ node_config_t g_cfg = {
     .port                  = 8333,
     .listen                = 1,
     .blocksonly            = 0,
+    .bind_addr             = "",     /* empty == INADDR_ANY */
 };
 
 static void set_defaults(void){
@@ -69,6 +70,7 @@ static void set_defaults(void){
     g_cfg.port                  = 8333;
     g_cfg.listen                = 1;
     g_cfg.blocksonly            = 0;
+    g_cfg.bind_addr[0]          = 0;
 }
 
 /* Clamp to values that cannot wedge the node. A config file is operator input,
@@ -142,6 +144,13 @@ long node_config_load(const char* path){
             t=clamp_int(iv,5,3600,key,&bad);  if(t>=0){g_cfg.peer_timeout_s=t;applied++;} }
         else if(!strcmp(key,"port")){         /* Core: P2P listen port      */
             t=clamp_int(iv,1,65535,key,&bad); if(t>=0){g_cfg.port=t;applied++;} }
+        else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
+            char tmp[64]; snprintf(tmp,sizeof tmp,"%s",val);
+            char* colon = strrchr(tmp,':');
+            if(colon){ *colon = 0; int bp = atoi(colon+1);
+                       if(bp>0 && bp<65536){ g_cfg.port = bp; } }
+            snprintf(g_cfg.bind_addr,sizeof g_cfg.bind_addr,"%s",tmp);
+            applied++; }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; applied++; }
         else if(!strcmp(key,"blocksonly")){
@@ -198,7 +207,7 @@ void node_config_log(void){
     fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",
             g_cfg.dbcache_mb, g_cfg.utxo_bulk_slots_log2, g_cfg.utxo_bulk_blob_mb,
             g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold);
-    fprintf(stderr,"[config] net  : port=%d listen=%d blocksonly=%d timeout=%dms peertimeout=%ds\n",
-            g_cfg.port, g_cfg.listen, g_cfg.blocksonly,
-            g_cfg.connect_timeout_ms, g_cfg.peer_timeout_s);
+    fprintf(stderr,"[config] net  : port=%d bind=%s listen=%d blocksonly=%d timeout=%dms peertimeout=%ds\n",
+            g_cfg.port, g_cfg.bind_addr[0]?g_cfg.bind_addr:"0.0.0.0", g_cfg.listen,
+            g_cfg.blocksonly, g_cfg.connect_timeout_ms, g_cfg.peer_timeout_s);
 }

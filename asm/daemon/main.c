@@ -230,7 +230,17 @@ static int build_inmem_hash_index(void){
 
 static int lsock(int port){
     int l = socket(AF_INET,SOCK_STREAM,0);
-    struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port); a.sin_addr.s_addr=htonl(INADDR_ANY);
+    struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port);
+    /* Core -bind: listen on one address instead of every interface. Empty (the
+     * default) keeps the previous INADDR_ANY behaviour. A malformed value is
+     * refused rather than silently widening the bind to every interface --
+     * failing closed is the safe direction for a listen address. */
+    if(g_cfg.bind_addr[0]){
+        if(inet_pton(AF_INET, g_cfg.bind_addr, &a.sin_addr) != 1){
+            fprintf(stderr,"[net] bind=%s is not a valid IPv4 address -- refusing to listen\n", g_cfg.bind_addr);
+            close(l); return -1;
+        }
+    } else a.sin_addr.s_addr=htonl(INADDR_ANY);
     int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     if(bind(l,(struct sockaddr*)&a,sizeof a)<0){ perror("bind"); return -1; }
     if(listen(l,8)<0){ perror("listen"); return -1; }
@@ -2505,8 +2515,16 @@ int main(int argc, char** argv){
         return failures?1:0;
     }
 
-    if(strcmp(mode,"serve")==0 && argc>=4){
-        int port = atoi(argv[3]);
+    if(strcmp(mode,"serve")==0 && argc>=3){
+        /* Port precedence: CLI arg > bitcoin.conf `port` > Core default 8333.
+         * The CLI arg is now OPTIONAL so the config file can genuinely own
+         * the node's network identity -- previously it was required, so the
+         * file's `port` was parsed and then always overridden. */
+        int port = (argc>=4) ? atoi(argv[3]) : g_cfg.port;
+        if(port<1 || port>65535){
+            fprintf(stderr,"[boot] invalid port %d -- refusing to start\n", port);
+            return 2;
+        }
         /* # outbound peers is optional 4th arg (default 3). */
         int nwant = (argc>=5)? atoi(argv[4]) : 3;
         if(nwant<0) nwant=0; if(nwant>MUX_MAX_OUT) nwant=MUX_MAX_OUT;
@@ -2519,8 +2537,8 @@ int main(int argc, char** argv){
          * ceiling, not a guarantee. */
         int catchup_workers = (argc>=6)? atoi(argv[5]) : 16;
         if(catchup_workers<1) catchup_workers=1;
-        fprintf(stderr,"[boot] config: datadir=%s port=%d nwant=%d catchup_workers=%d\n",
-                dir, port, nwant, catchup_workers);
+        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d\n",
+                dir, port, (argc>=4)?"cli":"bitcoin.conf", g_cfg.listen, nwant, catchup_workers);
         phase_timer_t boot_pt; phase_start(&boot_pt);
         fprintf(stderr,"[boot] loading chain archive from disk...\n");
         phase_timer_t load_pt; phase_start(&load_pt);
@@ -2534,7 +2552,11 @@ int main(int argc, char** argv){
         /* LISTENER FIRST: bind+listen the inbound socket before the (possibly
          * long) catch-up so the node is live to inbound peers immediately.
          * The mux loop will poll it once the catch-up returns. */
-        int l = lsock(port);
+        /* Core -listen=0: outbound-only. Skip binding entirely rather than
+         * binding and refusing every connection, which is what the flag
+         * actually means. */
+        int l = g_cfg.listen ? lsock(port) : -1;
+        if(!g_cfg.listen) fprintf(stderr,"[boot] listen=0 -- not accepting inbound connections\n");
         if(l<0){ perror("lsock"); return 1; }
         fprintf(stderr,"[boot] checking for archive gaps / missing blocks...\n");
         phase_timer_t catchup_pt; phase_start(&catchup_pt);
