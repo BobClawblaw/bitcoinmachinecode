@@ -53,6 +53,29 @@
 ;   int store_set_prune(void* st, int h)        -> 1 ok (config+persist gate)
 ;   int store_prune(void* st, int h)            -> 1 ok (persist + delete files)
 ;
+;   -- Stage A reorg/fork-choice primitives (STANDALONE / ADDITIVE: nothing
+;      in the live daemon calls these yet -- see tests/test_prevhash.c and
+;      tests/test_truncate.c) --
+;   int store_get_tip_hash(void* st, u8 out_hash[32]) -> 1 ok / -1 (empty)
+;          Reads the CURRENT tip's block hash straight from its index.dat
+;          record (same technique daemon/main.c's anchor_locator already
+;          uses, for the same reason: robust even right after an append).
+;   int store_validates_prevhash(void* st, const u8 block_header[80])
+;                                               -> 1 match / 0 mismatch / -1 (empty store)
+;          Compares header bytes [4..35] (the wire-order prevhash field)
+;          against store_get_tip_hash's result. Pure validation -- NOT
+;          wired into any append path (that is Stage B).
+;   int store_truncate_to(void* st, long target_height) -> 1 ok / -1 err
+;          Rollback/undo primitive: drops every block ABOVE target_height
+;          (index.dat + the relevant blk%05u.dat files ftruncate'd, later
+;          blk files removed outright) and updates st's in-memory
+;          idx_len/tip_height/cur_file_no/cur_file_pos so the store is
+;          immediately re-appendable. target_height==-1 truncates to a
+;          fully empty store; target_height >= the current tip is a no-op
+;          success. Caller must still call idx_build_from_file afterward to
+;          rebuild any in-memory hash->height index (bitcoin_idx.asm) --
+;          this primitive only touches on-disk/state-struct truncation.
+;
 ; Every function frame: callee-saved save area is [rbp-8 .. -(8*nsaved)], so
 ; ALL stack locals live strictly BELOW it and never overwrite the save slots.
 ; ============================================================================
@@ -1236,6 +1259,250 @@ open_idx_close:
 .oer:
     add  rsp, 0x20
     pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
+; STAGE A: reorg/fork-choice primitives #3 (prevhash validation gate) and #4
+;   (store truncate/rollback). STANDALONE / ADDITIVE -- nothing in the live
+;   daemon calls any of these three functions yet; they are exercised only
+;   by tests/test_prevhash.c and tests/test_truncate.c. Wiring prevhash
+;   validation into the real append path, or truncate into real reorg
+;   handling, is later, separately reviewed work.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; store_get_tip_hash(st, out_hash[32]) -> 1 ok / -1 (empty store)
+;   Reads the CURRENT tip's block hash directly from its 48-byte index.dat
+;   record (the hash occupies its first 32 bytes) -- the same "read straight
+;   from the index record, not via node_serve_block" approach
+;   daemon/main.c's anchor_locator already uses (see its own header comment:
+;   node_serve_block on a just-appended tip can transiently return a short
+;   read; a direct index.dat read cannot misfire that way).
+; ----------------------------------------------------------------------------
+global store_get_tip_hash
+store_get_tip_hash:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    mov  r12, rdi            ; st
+    mov  rbx, rsi             ; out_hash
+    mov  eax, [r12+24]         ; tip_height (signed dword; -1 = empty)
+    cmp  eax, -1
+    je   .fail
+    movsxd rax, eax
+    imul rax, 48
+    mov  rdi, [r12+8]           ; idx_fd
+    mov  rsi, rbx                ; out_hash
+    mov  edx, 32
+    mov  r10, rax
+    mov  eax, 17                  ; pread64
+    syscall
+    cmp  rax, 32
+    jne  .fail
+    mov  rax, 1
+    jmp  .ret
+.fail:
+    mov  rax, -1
+.ret:
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; store_validates_prevhash(st, block_header[80]) -> 1 match / 0 mismatch / -1
+;   (empty store -- nothing to validate against). Compares header bytes
+;   [4..35] (the raw wire-order prevhash field) against the current tip's
+;   hash from store_get_tip_hash -- both are already in the SAME byte order
+;   (this codebase's block_hash() raw digest / index.dat storage order; see
+;   daemon/main.c's anchor_locator, which forwards/compares hashes in this
+;   exact order with no reversal anywhere in that path either).
+;   Frame: 3 pushes (rbp,rbx,r12) -> sub amount must be ~=0 mod16; 0x30
+;   covers the 32-byte tip_hash local with margin.
+; ----------------------------------------------------------------------------
+global store_validates_prevhash
+store_validates_prevhash:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    sub  rsp, 0x30
+    mov  r12, rdi             ; st
+    mov  rbx, rsi              ; header
+    mov  rdi, r12
+    lea  rsi, [rbp-0x30]         ; tip_hash[32]
+    call store_get_tip_hash
+    cmp  rax, 1
+    jne  .err
+    lea  rdi, [rbx+4]             ; header+4 = prevhash field
+    lea  rsi, [rbp-0x30]
+    mov  rcx, 32
+    repe cmpsb
+    je   .match
+    xor  eax, eax
+    jmp  .ret
+.match:
+    mov  eax, 1
+    jmp  .ret
+.err:
+    mov  eax, -1
+.ret:
+    add  rsp, 0x30
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; store_truncate_to(st, target_height) -> 1 ok / -1 err
+;   See this file's header comment for the full contract. Frame: 6 pushes
+;   (rbp,rbx,r12,r13,r14,r15) -> save area is [rbp-0x28, rbp) (40 bytes:
+;   rbx,r12,r13,r14,r15). Locals must start at rbp-0x28-size or deeper --
+;   see bitcoin_chainwork.asm's block_work for the save-area-clearance bug
+;   this exact pattern caused there; re-auditing this function on that
+;   discovery found the SAME bug here (a naive rec[48] at rbp-0x30 would
+;   have spanned all the way up through rbp, fully overlapping the entire
+;   40-byte save area). rec[48] now at -0x58 (spans [-88,-40), clear of the
+;   save area), stash at -0x60 (clear of rec too). sub amount must be ~=8
+;   mod16; 0x68 covers the deepest local (-0x60) with margin.
+; ----------------------------------------------------------------------------
+global store_truncate_to
+store_truncate_to:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x68
+    mov  r12, rdi              ; st
+    mov  r13, rsi               ; target_height (signed 64-bit)
+    mov  eax, [r12+24]           ; current tip_height
+    cmp  eax, -1
+    je   .noop                    ; store already empty -> nothing to do
+    movsxd rax, eax
+    cmp  r13, rax
+    jge  .noop                     ; target >= tip -> nothing to drop
+    cmp  r13, -1
+    je   .full_empty                ; target_height==-1 -> wipe everything
+
+    ; ---- read index record at (target_height+1)*48 to learn the new
+    ;      end-of-data (file_no, data_pos) ----
+    mov  rax, r13
+    add  rax, 1
+    imul rax, 48
+    mov  rdi, [r12+8]              ; idx_fd
+    lea  rsi, [rbp-0x58]             ; rec[48]
+    mov  edx, 48
+    mov  r10, rax
+    mov  eax, 17                       ; pread64
+    syscall
+    cmp  rax, 48
+    jne  .err
+    mov  r14d, [rbp-0x58+32]             ; boundary_file_no
+    mov  r15, [rbp-0x58+36]                ; boundary_data_pos (u64)
+
+    ; ---- ftruncate index.dat to (target_height+1)*48 ----
+    mov  rax, r13
+    add  rax, 1
+    imul rax, 48
+    mov  rdi, [r12+8]
+    mov  rsi, rax
+    mov  eax, 77                          ; ftruncate
+    syscall
+    test rax, rax
+    js   .err
+
+    ; ---- ftruncate the boundary blk file to boundary_data_pos ----
+    ; open_file(st, boundary_file_no): local helper defined earlier in this
+    ; file; also sets st's cur_blk_fd, which is exactly the fd store_append
+    ; will keep using afterward.
+    mov  rdi, r12
+    mov  esi, r14d
+    call open_file
+    test rax, rax
+    js   .err
+    mov  rbx, rax                          ; boundary fd (callee-saved)
+    mov  rdi, rbx
+    mov  rsi, r15
+    mov  eax, 77                              ; ftruncate
+    syscall
+    test rax, rax
+    js   .err
+
+    ; ---- delete any LATER blk files (file_no > boundary_file_no) ----
+    mov  eax, [r12+28]                        ; orig cur_file_no
+    mov  [rbp-0x60], eax                        ; stash (survives calls below)
+    cmp  eax, r14d
+    jbe  .no_later_files
+    mov  ebx, r14d
+    inc  ebx                                      ; first file_no to delete
+.dellater:
+    cmp  ebx, [rbp-0x60]
+    ja   .no_later_files
+    mov  rdi, r12
+    mov  esi, ebx
+    call unlink_blk
+    inc  ebx
+    jmp  .dellater
+.no_later_files:
+
+    ; ---- update in-memory state to match ----
+    mov  [r12+28], r14d                            ; cur_file_no
+    mov  eax, r15d
+    mov  [r12+32], eax                               ; cur_file_pos
+    mov  rax, r13
+    add  rax, 1
+    imul rax, 48
+    mov  [r12+16], rax                                ; idx_len
+    mov  eax, r13d
+    mov  [r12+24], eax                                 ; tip_height
+    mov  rax, 1
+    jmp  .ret
+
+.noop:
+    mov  rax, 1
+    jmp  .ret
+
+.full_empty:
+    mov  rdi, [r12+8]
+    xor  esi, esi
+    mov  eax, 77                                        ; ftruncate index.dat to 0
+    syscall
+    test rax, rax
+    js   .err
+    mov  eax, [r12+28]
+    mov  [rbp-0x60], eax
+    xor  ebx, ebx
+.dellall:
+    cmp  ebx, [rbp-0x60]
+    ja   .empty_done
+    mov  rdi, r12
+    mov  esi, ebx
+    call unlink_blk
+    inc  ebx
+    jmp  .dellall
+.empty_done:
+    mov  qword [r12+16], 0
+    mov  dword [r12+24], -1
+    mov  dword [r12+28], 0
+    mov  dword [r12+32], 0
+    mov  qword [r12+0], -1                                ; cur_blk_fd = none
+    mov  rax, 1
+    jmp  .ret
+
+.err:
+    mov  rax, -1
+.ret:
+    add  rsp, 0x68
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
     pop  rbp
     ret
 
