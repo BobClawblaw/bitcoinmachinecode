@@ -74,6 +74,11 @@
  * resolved in minutes, not seconds) and long enough that it is noise against
  * the per-leg sync traffic. */
 #define REORG_PROBE_INTERVAL_MS 30000L
+/* Backoff for a catch-up that keeps failing even after in-place recovery.
+ * We retry forever (capped interval) instead of disabling UTXO tracking:
+ * running blind indefinitely is worse than retrying a failing operation. */
+#define UTXO_RETRY_BASE_MS 5000L
+#define UTXO_RETRY_MAX_MS  300000L
 #define DL_HEARTBEAT_MS 60000L   /* periodic [dl] heartbeat so the log stays
                                   * visibly alive between block/peer events */
 
@@ -101,6 +106,7 @@ extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
+extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1545,6 +1551,11 @@ static long dl_catchup(const char* dir, int min_workers){
     return total;
 }
 
+/* UTXO catch-up health: consecutive post-recovery failures, and the earliest
+ * time we may retry. Zero streak == healthy. See the catch-up block below. */
+static long      utxo_fail_streak  = 0;
+static long long utxo_retry_at_ms  = 0;
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -1812,22 +1823,49 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * child's .do_block writes land in the shared archive independently.
          * A no-op (one lseek) when already in step. */
         if(reorg_ok) reorg_chainwork_sync(store_buf, 0);
-        if(utxo_live_ok){
+        /* A catch-up failure is RECOVERABLE, not terminal. It used to set
+         * utxo_live_ok=0, which left the node serving blocks with no UTXO
+         * tracking at all -- silently, until a human noticed and restarted
+         * it. That happened twice on 2026-08-18. The usual cause (a full
+         * manifest) is cleared by a compaction, so: try recovery, retry
+         * once, and on repeated failure back off and RETRY LATER rather
+         * than giving up for the life of the process. */
+        if(utxo_live_ok && now_ms >= utxo_retry_at_ms){
             phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);
             if(ar < 0){
-                fprintf(stderr,"[dl] utxo_live_catchup fatal error -- disabling live UTXO tracking\n");
-                utxo_live_ok = 0;
-            } else if(ar > 0){
+                fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld -- attempting in-place recovery\n",
+                        utxo_live_applied_height());
+                long rounds = utxo_live_recover();
+                ar = utxo_live_catchup(store_buf);
+                if(ar >= 0){
+                    utxo_fail_streak = 0;
+                    fprintf(stderr,"[dl] utxo recovery SUCCEEDED (%ld compaction round(s)) -- tracking continues at height %ld\n",
+                            rounds, utxo_live_applied_height());
+                } else {
+                    if(utxo_fail_streak < 30) utxo_fail_streak++;
+                    long shift = utxo_fail_streak - 1; if(shift > 6) shift = 6;
+                    long backoff = UTXO_RETRY_BASE_MS << shift;
+                    if(backoff > UTXO_RETRY_MAX_MS) backoff = UTXO_RETRY_MAX_MS;
+                    utxo_retry_at_ms = now_ms + backoff;
+                    fprintf(stderr,"[dl] utxo STILL failing after recovery (streak=%ld) -- DEGRADED (no UTXO tracking), retrying in %lds\n",
+                            utxo_fail_streak, backoff/1000);
+                }
+            } else if(utxo_fail_streak){
+                fprintf(stderr,"[dl] utxo tracking healthy again after %ld failed attempt(s)\n", utxo_fail_streak);
+                utxo_fail_streak = 0;
+            }
+            if(ar > 0){
                 fprintf(stderr,"[dl] updating utxo: applied %ld block(s), now at height %ld, live=%ld (%.2fs)\n",
                         ar, utxo_live_applied_height(), utxo_live_count(), phase_elapsed(&utxo_ct_pt));
             }
         }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
-            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%llds\n",
+            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%llds%s\n",
                     *(int*)(store_buf+24), live_peers, mux_n_out,
-                    utxo_live_ok?utxo_live_count():-1L, (now_ms-boot_ms)/1000);
+                    utxo_live_ok?utxo_live_count():-1L, (now_ms-boot_ms)/1000,
+                    utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
