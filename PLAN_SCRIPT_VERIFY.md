@@ -142,7 +142,56 @@ explaining before this ships.
 Implement `-assumevalid` for real (skip script checks at or below the named
 block, keep every structural check), and only then redeploy.
 
-## Decisions needed before Stage A
+## Decisions taken (2026-08-18)
+
+1. **`script_eval` (asm) is the consensus interpreter.** `bitcoin_verify.c`'s
+   private C `eval_script` is demoted to a differential reference and
+   eventually retired. This is the larger job and the one consistent with the
+   project's central claim.
+2. **`assumevalid` defaults OFF.** Full verification is the out-of-the-box
+   behaviour. At ~1-2 h on this box that is affordable, and it is the
+   stronger claim.
+3. **Verification is inline in `apply_block_inner`.** The UTXO catch-up
+   already runs as a sequential in-order pass over the archive, so inline
+   verification IS the batch pass during IBD and becomes live verification
+   for new blocks -- one code path serves both.
+
+## CORRECTION to Stage B sizing (found while starting Stage A)
+
+Stage B was scoped as "mostly wiring". That was wrong.
+
+**Legacy signature hashing supports SIGHASH_ALL and nothing else.**
+`sighash_all` (`bitcoin_sighash.asm:4`) is the only legacy sighash entry
+point in the codebase and hardcodes `hashtype(4)=1` in the preimage. The
+Core-parity `verify_script` rejects every other type outright:
+
+```c
+if ((hb & 0x1f)!=1) return 0;   /* bitcoin_verify.c:274 */
+if (ht!=1) return 0;            /* bitcoin_verify.c:283 */
+```
+
+There is also **no FindAndDelete** implementation anywhere -- only
+OP_CODESEPARATOR position tracking (`bitcoin_verify.c:454`).
+
+BIP143 (segwit) sighash DOES handle the full set (`bitcoin_segwit.c:34`), so
+the gap is specific to the legacy path.
+
+Stage B therefore additionally requires, before any dispatch work:
+
+- **B0. Legacy SignatureHash, complete.** SIGHASH_ALL / NONE / SINGLE, the
+  ANYONECANPAY modifier, and the SIGHASH_SINGLE out-of-range quirk (when
+  `nIn >= n_out`, consensus returns the hash `uint256(1)` rather than
+  failing -- a real chain behaviour that must be reproduced exactly).
+- **B1. FindAndDelete.** Pre-segwit consensus removes the signature being
+  checked from the scriptCode. Rare on chain but real, and Stage D's
+  "every block validates" bar means rare is not optional.
+- **B2. OP_CODESEPARATOR scriptCode truncation.**
+
+Each is a well-known consensus footgun with real chain data exercising it.
+This is implementation in asm, not wiring, and it makes B the dominant stage
+by a wide margin.
+
+## Original decision list (now resolved -- kept for the reasoning)
 
 1. **Which interpreter is consensus?** The project's stated ethos is
    assembly-authored with thin C wrappers, which argues for `script_eval`
