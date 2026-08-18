@@ -31,6 +31,7 @@ default rel
     extern idx_put
     extern store_append
     extern idxscan_append_locked
+    extern store_validates_prevhash
     extern cons_verify
     extern node_serve_block
     extern node_log_event
@@ -388,6 +389,56 @@ node_serve_loop:
     call idx_get
     test rax, rax
     jnz  .next                ; duplicate -> skip
+    ; Guard 4 (STAGE B): the block must actually EXTEND OUR TIP.
+    ;
+    ; Until now this path appended whatever a peer pushed, at "whatever the
+    ; next height is", with no check that it chained to anything -- so a peer
+    ; sending a block from a different chain (or a block far ahead of us) had
+    ; it recorded at a height it does not belong to, silently producing a
+    ; non-contiguous archive. Stage A built store_validates_prevhash for
+    ; exactly this gate and nothing ever called it.
+    ;
+    ; This matters much more now that reorgs exist: an inbound child racing
+    ; with a legitimate reorg in the download worker could otherwise append
+    ; onto a chain that is mid-rewrite. (reorg_execute holding the append
+    ; flock across its whole operation is the other half of that fix; this is
+    ; the half that also protects the ordinary, non-reorg case.)
+    ;
+    ; store_validates_prevhash(st, header80) -> 1 match / 0 mismatch
+    ;                                          / -1 empty store.
+    ; 1  -> extends our tip, proceed.
+    ; -1 -> store is empty, there is no tip to chain to, proceed (first block).
+    ; 0  -> does not chain: DROP, matching this handler's existing
+    ;       "duplicate -> skip" style (log and ignore, never disconnect the
+    ;       peer -- a peer legitimately relaying a block we simply are not
+    ;       caught up to yet is not misbehaviour, and the download worker's
+    ;       own sync will fetch the gap in order).
+    mov  rdi, [s_st]
+    lea  rsi, [pl_buf]
+    call store_validates_prevhash
+    ; store_validates_prevhash -> store_get_tip_hash preserve only rbx/r12-r15
+    ; per this codebase's convention, but the serve loop's live fd/lfd/st
+    ; registers are restored from their stable statics here anyway, exactly as
+    ; the cons_verify call above already does -- cheaper than reasoning about
+    ; which callee happens to preserve what.
+    mov  r12, [s_fd]
+    mov  r13, [s_lfd]
+    mov  r14, [s_st]
+    test rax, rax
+    jnz  .blk_chains          ; 1 (match) or -1 (empty store) -> accept
+    ; node_log_event(lfd, 6=L_ERROR, 0, plen, 0) -- already-extern'd logger,
+    ; so this adds no new link-time dependency to any binary using this file.
+    mov  rdi, r13
+    mov  rsi, 6
+    xor  rdx, rdx
+    mov  rcx, [s_plen]
+    xor  r8, r8
+    call node_log_event
+    mov  r12, [s_fd]
+    mov  r13, [s_lfd]
+    mov  r14, [s_st]
+    jmp  .next                ; does not chain to our tip -> drop
+.blk_chains:
     ; idxscan_append_locked(st, hash, pl_buf, s_plen) -- an inbound peer can
     ; push a block directly (or in response to our own .do_inv-triggered
     ; getdata) in ANY forked serve child, concurrently with the download

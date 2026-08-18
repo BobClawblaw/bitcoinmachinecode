@@ -61,6 +61,12 @@ extern int  store_validates_prevhash(void* st, const unsigned char header[80]);
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);
 extern long idxscan_append_locked(void* st, const unsigned char hash[32],
                                   const void* raw, long len);
+/* Same append, minus the per-call flock/unflock pair -- for use only while
+ * this module is already holding that lock across the whole reorg. See
+ * bitcoin_idxscan.asm's header for why the plain variant cannot be used
+ * here (its internal LOCK_UN would drop our outer hold after block one). */
+extern long idxscan_append_nolocked(void* st, const unsigned char hash[32],
+                                    const void* raw, long len);
 
 extern void block_work(unsigned char work[16], unsigned bits);
 extern void chainwork_add(unsigned char out[16], const unsigned char a[16], const unsigned char b[16]);
@@ -537,6 +543,31 @@ long reorg_execute(void* st, long fork_height, long nblocks,
 
     static unsigned char blkbuf[REORG_BLOCK_BUF];
 
+    /* ---------------- TAKE THE APPEND LOCK FOR THE WHOLE OPERATION ------
+     * The other writer into this archive is an inbound serve child's
+     * .do_block, which appends through store_append_shared and takes this
+     * same flock (st+40, main.c's append.lock). A reorg must exclude it for
+     * the ENTIRE window -- pre-flight, disconnect, truncate AND the whole
+     * reconnect loop -- because a block appended by a sibling at any point
+     * in that window lands on a chain that is mid-rewrite.
+     *
+     * This originally only covered disconnect+truncate, and even that hold
+     * was illusory once reconnect started: idxscan_append_locked delegates to
+     * store_append_shared, whose unconditional LOCK_UN on the way out would
+     * have released OUR outer hold after the very first reconnected block.
+     * The reconnect loop below therefore uses idxscan_append_nolocked, which
+     * is the same append with the flock pair removed, so the hold taken here
+     * survives to the single release at the end.
+     *
+     * If no flock fd is configured (st+40 unset -- standalone tools and some
+     * tests), `locked` stays 0 and the reconnect loop falls back to the
+     * self-locking append: strictly no worse than before, and correct in a
+     * single-writer setting. */
+    int lfd = store_flock_fd(st);
+    int locked = 0;
+    if (lfd > 0 && flock(lfd, LOCK_EX) == 0) locked = 1;
+    else if (lfd > 0) fprintf(stderr, "[reorg] WARNING: could not take the append lock; proceeding with per-append locking only\n");
+
     /* ---------------- PRE-FLIGHT (non-destructive) ----------------------
      * Prove, for every height we intend to disconnect, that (a) the block is
      * readable and (b) its undo data is present and record-for-record
@@ -547,24 +578,16 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         if (len < 81){
             fprintf(stderr, "[reorg] refusing: cannot read block at height %ld (len=%ld)\n", h, len);
             hdr_fd_close();
+            if (locked) flock(lfd, LOCK_UN);
             return 0;
         }
         if (!utxo_live_can_unapply(blkbuf, (uint64_t)len, h)){
             fprintf(stderr, "[reorg] refusing: height %ld cannot be safely unapplied (see the pre-flight line above)\n", h);
             hdr_fd_close();
+            if (locked) flock(lfd, LOCK_UN);
             return 0;
         }
     }
-
-    /* Serialise the destructive window against the other appender in this
-     * store (an inbound serve child's .do_block goes through
-     * store_append_shared, which takes this same flock). NOTE: this only
-     * covers disconnect+truncate; the reconnect appends below take and drop
-     * the lock individually, exactly as every other append in this codebase
-     * does. See this stage's report for the residual concurrency caveat. */
-    int lfd = store_flock_fd(st);
-    int locked = 0;
-    if (lfd > 0 && flock(lfd, LOCK_EX) == 0) locked = 1;
 
     /* ------------------------ point of no return ------------------------ */
     for (long h = tip; h > fork_height; h--){
@@ -615,7 +638,8 @@ long reorg_execute(void* st, long fork_height, long nblocks,
     }
     if (g_index_rebuild) g_index_rebuild();
 
-    if (locked){ flock(lfd, LOCK_UN); locked = 0; }
+    /* NOTE: the append lock is deliberately NOT released here -- it is held
+     * through the reconnect loop below and dropped once at the very end. */
 
     /* ---------------- RECONNECT ---------------- */
     long connected = 0;
@@ -624,6 +648,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         if (len < 81){
             fprintf(stderr, "[reorg] FATAL: replacement block %ld unavailable (len=%ld) -- chain left at height %ld\n",
                     i, len, store_tip(st));
+            if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
         /* Re-verify at connect time even though the staging path already
@@ -634,27 +659,33 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         if (!cons_verify(blkbuf, len, scratch, sizeof scratch)){
             fprintf(stderr, "[reorg] FATAL: replacement block %ld failed cons_verify -- chain left at height %ld\n",
                     i, store_tip(st));
+            if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
         if (store_validates_prevhash(st, blkbuf) != 1){
             fprintf(stderr, "[reorg] FATAL: replacement block %ld does not chain to the current tip -- chain left at height %ld\n",
                     i, store_tip(st));
+            if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
         unsigned char bh[32]; block_hash(bh, blkbuf);
-        long h = idxscan_append_locked(st, bh, blkbuf, len);
+        long h = locked ? idxscan_append_nolocked(st, bh, blkbuf, len)
+                        : idxscan_append_locked(st, bh, blkbuf, len);
         if (h < 0){
             fprintf(stderr, "[reorg] FATAL: store append failed for replacement block %ld\n", i);
+            if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
         unsigned char w[16];
         block_work(w, hdr_bits(blkbuf));
         if (store_chainwork_append(st, h, w) != 1){
             fprintf(stderr, "[reorg] FATAL: chainwork append failed at height %ld\n", h);
+            if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
         if (!utxo_live_apply_block(blkbuf, (uint64_t)len, h)){
             fprintf(stderr, "[reorg] FATAL: UTXO apply failed at height %ld\n", h);
+            if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
         if (!utxo_live_rewind_to(h)){
@@ -684,6 +715,10 @@ long reorg_execute(void* st, long fork_height, long nblocks,
     if (store_get_tip_hash(st, tiph) == 1) hash_short(hs, tiph);
     fprintf(stderr, "[reorg] complete: new tip height=%ld hash=%s.. (%.2fs, -%ld +%ld blocks)\n",
             store_tip(st), hs, now_s()-t0, tip - fork_height, connected);
+    /* The single release for the whole operation. Everything above -- the
+     * pre-flight, the disconnect, the truncate and every reconnect append --
+     * ran under one continuous hold of this lock. */
+    if (locked) flock(lfd, LOCK_UN);
     return 1;
 }
 
