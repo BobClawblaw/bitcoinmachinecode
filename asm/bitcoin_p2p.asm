@@ -5,19 +5,36 @@
 ; All wire integers are LITTLE-endian (Bitcoin convention).
 ;
 ; Exports:
-;   long p2p_getheaders(u8* out, const u8 locator[32], long count, const u8 stop[32])
-;        -> 69 (count==1) serialized getheaders payload.
+;   long p2p_getheaders(u8* out, const u8* locator, long count, const u8 stop[32])
+;        -> serialized getheaders payload length, or -1 (count out of
+;        [1,252]). `locator` is COUNT*32 contiguous hash bytes (Stage A
+;        extension -- was fixed at exactly one 32-byte hash/count==1 before;
+;        count==1 callers are unaffected byte-for-byte, see below).
 ;   long p2p_getdata_block(u8* out, const u8 hash[32])   -> 37.
 ;   long p2p_ping(u8* out, u64 nonce)                   -> 8.
 ;   long p2p_headers_count(const u8* payload, long plen) -> #header entries
 ;        (parses the leading CompactSize), or -1 on malformed.
+;
+; STAGE A NOTE (real multi-hash locator, reorg/fork-choice primitive #2):
+;   p2p_getheaders used to `jne .err` on any count != 1. It now accepts
+;   count in [1,252] (a single-byte CompactSize varint covers that whole
+;   range; Bitcoin's own doubling-gap locator construction -- see
+;   daemon/locator_build.c -- never needs more than ~32 entries to reach
+;   genesis from any realistic chain height, so 252 is a generous, still
+;   provably-safe ceiling rather than an arbitrary smaller cap). Every
+;   existing call site (bitcoind.asm's node_sync / node_ibd_headers) still
+;   hardcodes count=1 and is byte-for-byte unaffected: for count=1 the new
+;   code path produces the exact same 69-byte payload the old count==1-only
+;   path did. This extension is standalone/additive -- nothing new calls
+;   count>1 yet; wiring a real multi-hash locator into the live sync loop is
+;   a later, separately reviewed stage.
 ; ============================================================================
 
 default rel
 section .text
 
 global p2p_getheaders
-; out[rdi], locator[rsi], count[rdx], stop[rcx]
+; out[rdi], locator[rsi] (count*32 contiguous hash bytes), count[edx], stop[rcx]
 p2p_getheaders:
     push rbp
     mov  rbp, rsp
@@ -26,39 +43,40 @@ p2p_getheaders:
     push r13
     push r14
     mov  r12, rdi          ; out
-    mov  r13, rsi          ; locator
+    mov  r13, rsi          ; locator array
     mov  r14, rcx          ; stop
+    mov  ebx, edx          ; count
+    cmp  ebx, 1
+    jl   .err
+    cmp  ebx, 252          ; single-byte CompactSize varint range (0..0xfc)
+    ja   .err
     ; version = 70016 (0x011180) little-endian -> 80 11 01 00
-    mov  r8, r12
-    mov  dword [r8], 0x00011180
-    ; locator count = count (assume small <= 252 -> 1-byte varint)
-    mov  r9, r12
-    add  r9, 4
-    mov  al, dl            ; count (low byte)
-    mov  [r9], al
-    add  r9, 1
-    ; locator hashes: we only build count==1 (one hash) in v1
-    mov  ecx, edx
-    cmp  ecx, 1
-    jne  .err
-    ; copy locator[32] -> r9
-    mov  rdi, r9
+    mov  dword [r12], 0x00011180
+    ; locator count varint (1 byte, count in [1,252])
+    mov  al, bl
+    mov  [r12+4], al
+    ; locator hashes at out+5, count*32 bytes
+    lea  rdi, [r12+5]
     mov  rsi, r13
-    mov  rcx, 32
+    mov  eax, ebx
+    imul eax, 32
+    mov  ecx, eax
     rep  movsb
-    add  r9, 32
-    ; stop hash[32]
-    mov  rdi, r9
+    ; stop hash at out+5+count*32 (eax still holds count*32 -- rep movsb
+    ; only clobbers rcx/rdi/rsi, not rax)
+    lea  rdi, [r12+5]
+    add  rdi, rax
     mov  rsi, r14
-    mov  rcx, 32
+    mov  ecx, 32
     rep  movsb
-    add  r9, 32
-    ; length = r9 - out
-    mov  rax, r9
-    sub  rax, r12
+    ; length = 5 + count*32 + 32
+    add  eax, 37
     jmp  .ret
 .err:
-    mov  rax, -1
+    mov  rax, -1              ; MUST be a 64-bit mov: `mov eax,-1` zero-extends
+                               ; to 0x00000000FFFFFFFF, not true -1, breaking
+                               ; any caller comparing the `long` return value
+                               ; against -1 (caught by tests/test_locator.c).
 .ret:
     pop  r14
     pop  r13
