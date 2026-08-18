@@ -150,7 +150,12 @@ int main(void) {
      * synthetic chain of headers, verified against independently
      * accumulated __int128 expected totals. ---------- */
     {
-        unsigned char st[128]; memset(st, 0, sizeof st);
+        /* 256 bytes, not 128: Stage B moved the chainwork fields to
+         * +128..+151 to get them out of bitcoin_store_fast.asm's read-fd
+         * cache (+56..+127) -- see bitcoin_chainwork.asm's header comment
+         * for the full collision write-up. 256 is the documented minimum
+         * store-struct allocation used anywhere in this tree. */
+        unsigned char st[256]; memset(st, 0, sizeof st);
         ck("store_chainwork_init", store_chainwork_init(st), 1);
 
         unsigned int bits_seq[] = { 0x1d00ffffu, 0x1d00ffffu, 0x1c00ffffu, 0x1b0404cbu, 0x1f00ffffu, 0x1d00ffffu };
