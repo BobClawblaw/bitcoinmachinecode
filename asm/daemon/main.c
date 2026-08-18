@@ -108,6 +108,7 @@ extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
+extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1596,8 +1597,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* Truncated: any persisted UTXO applied-height now refers to
              * heights that no longer exist, so the UTXO set must be rebuilt
              * from scratch rather than resumed against a shorter chain. */
-            unlink("utxo_applied_height.dat");
-            fprintf(stderr,"[dl] archive was repaired -- dropped utxo_applied_height.dat so UTXO state rebuilds cleanly\n");
+            long dropped = archive_drop_utxo_state();
+            fprintf(stderr,"[dl] archive was repaired -- dropped %ld UTXO state file(s) so the set rebuilds from a clean slate\n", dropped);
         } else if(av < 0){
             fprintf(stderr,"[dl] archive INTEGRITY CHECK FAILED and was not repaired -- continuing WITHOUT live UTXO tracking\n");
         }
