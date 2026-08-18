@@ -1424,6 +1424,97 @@ store_validates_prevhash:
 ;   save area), stash at -0x60 (clear of rec too). sub amount must be ~=8
 ;   mod16; 0x68 covers the deepest local (-0x60) with margin.
 ; ----------------------------------------------------------------------------
+; ============================================================================
+; store_layout_monotonic(st, upto_height) -> 1 monotonic / 0 NOT monotonic
+;
+; Read-only. Walks index.dat records 0..upto and reports whether block data is
+; laid out in non-decreasing (file_no, data_pos) order.
+;
+; WHY THIS EXISTS: store_truncate_to below ASSUMES this property. It reads the
+; boundary height's (file_no, data_pos), ftruncates that blk file to that
+; offset, and unlinks every higher-numbered blk file. If some height at or
+; below the target actually lives ABOVE the boundary in the files, that data is
+; destroyed.
+;
+; On 2026-08-18 that destroyed a ~600GB archive. A mid-sync locator collapse
+; had made a peer re-serve from genesis onto the tail, so height 479,658 held
+; the block belonging at height 43 -- its recorded location was blk00000.dat
+; offset ~9,597. Truncating "to" height 479,657 therefore cut the FIRST block
+; file down to 9,597 bytes and unlinked all ~4,855 files above it. The caller
+; had just finished proving the archive was out of order, then handed it to a
+; primitive that assumes it is in order.
+;
+; The guard lives HERE, in the primitive, rather than in one caller: any
+; caller can reach it (reorg_execute truncates to a fork point), and the
+; property being assumed belongs to this function, not to its callers.
+;
+; Frame: 5 pushes -> save area [rbp-0x28, rbp). rec[48] at rbp-0x58 ends
+; exactly at -0x28, clear of it; `seen` at -0x60. sub 0x68 -> rsp = rbp-0x90,
+; below both, and 0 mod 16.
+; ============================================================================
+global store_layout_monotonic
+store_layout_monotonic:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x68
+    mov  r12, rdi                  ; st
+    mov  r13, rsi                  ; upto_height
+    xor  rbx, rbx                  ; h = 0
+    xor  r14, r14                  ; prev_file_no
+    xor  r15, r15                  ; prev_data_pos
+    mov  qword [rbp-0x60], 0       ; seen = 0
+.slm_loop:
+    cmp  rbx, r13
+    jg   .slm_ok
+    mov  rax, rbx
+    imul rax, 48
+    mov  rdi, [r12+8]              ; idx_fd
+    lea  rsi, [rbp-0x58]           ; rec[48]
+    mov  edx, 48
+    mov  r10, rax
+    mov  eax, 17                   ; pread64
+    syscall
+    cmp  rax, 48
+    jne  .slm_ok                   ; short read == end of index; nothing more
+    mov  eax, [rbp-0x58]
+    test eax, eax
+    jz   .slm_next                 ; all-zero hash prefix == hole, not a block
+    mov  ecx, [rbp-0x58+32]        ; file_no  (u32, zero-extended)
+    mov  rdx, [rbp-0x58+36]        ; data_pos (u64)
+    cmp  qword [rbp-0x60], 0
+    je   .slm_store                ; first real record -- nothing to compare
+    cmp  rcx, r14
+    jb   .slm_bad                  ; file_no went backwards
+    ja   .slm_store                ; strictly later file -- fine
+    cmp  rdx, r15
+    jb   .slm_bad                  ; same file, offset went backwards
+.slm_store:
+    mov  r14, rcx
+    mov  r15, rdx
+    mov  qword [rbp-0x60], 1
+.slm_next:
+    inc  rbx
+    jmp  .slm_loop
+.slm_bad:
+    xor  eax, eax                  ; 0 -> NOT safe to truncate
+    jmp  .slm_ret
+.slm_ok:
+    mov  eax, 1
+.slm_ret:
+    add  rsp, 0x68
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
 global store_truncate_to
 store_truncate_to:
     push rbp
@@ -1444,6 +1535,18 @@ store_truncate_to:
     jge  .noop                     ; target >= tip -> nothing to drop
     cmp  r13, -1
     je   .full_empty                ; target_height==-1 -> wipe everything
+
+    ; ---- SAFETY GATE: refuse to truncate an out-of-order archive ----------
+    ; Checked up to target+1 (the boundary record whose file_no/data_pos this
+    ; function is about to treat as the new end-of-data). If anything at or
+    ; below that boundary lives further along in the files, truncating here
+    ; deletes live data -- see store_layout_monotonic's header for the
+    ; incident this prevents. Runs BEFORE any ftruncate/unlink.
+    lea  rsi, [r13+1]
+    mov  rdi, r12
+    call store_layout_monotonic
+    test rax, rax
+    jz   .err                       ; not monotonic -> refuse, change nothing
 
     ; ---- read index record at (target_height+1)*48 to learn the new
     ;      end-of-data (file_no, data_pos) ----

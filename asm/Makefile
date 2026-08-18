@@ -195,6 +195,13 @@ BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
 
+# test_truncate_guard_prim -- store_truncate_to must REFUSE an out-of-order
+# archive and leave the block data intact. Asserts on the BLOCK FILES, not
+# just index.dat: the test that missed the original ~600GB loss checked only
+# index counts and never opened a block, so it passed while data was deleted.
+tests/test_truncate_guard_prim: tests/test_truncate_guard_prim.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_idxscan.o
+	$(CC) -no-pie -O0 -o $@ tests/test_truncate_guard_prim.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_idxscan.o
+
 # test_utxo_recover -- integration test for utxo_live_recover(), the in-place
 # recovery that makes a failed catch-up survivable instead of terminal.
 # DELIBERATELY NOT IN `make test`: it replays a real 250k-height archive
