@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include "log_ts.h"
+#include "log_phase.h"
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -81,6 +82,7 @@ extern long store_reload(void* st);
 extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
+extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1367,13 +1369,20 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * under-lock) so they can't collide, see that function's header comment
      * in bitcoin_idxscan.asm. */
     chdir(dir);
+    fprintf(stderr,"[dl] worker: reloading chain archive...\n");
+    phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
+    fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
+            *(int*)(store_buf+24), phase_elapsed(&dl_load_pt));
     /* Single-writer live UTXO instance: this worker is the sole process that
      * ever calls utxo_lsm_put/del (inbound serve children only ever get a
      * read-only utxo_lsm_reload() snapshot). Non-fatal on failure -- block
      * sync/relay must keep working even if UTXO tracking can't start. */
+    fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
+    phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
     int utxo_live_ok = utxo_live_init(dir);
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
+    else fprintf(stderr,"[dl] worker: live UTXO state loaded (%.2fs)\n", phase_elapsed(&utxo_init_pt));
     /* ---- BOOTSTRAP + DISCOVER (seeds are bootstrap-only) ----
      * Real nodes use DNS seeds once to learn reachable peers, then connect to
      * those -- never downloading from the seeds themselves. We resolve each
@@ -1521,10 +1530,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * child's .do_block writes, which land in the shared archive
          * independently of any leg here. */
         if(utxo_live_ok){
+            phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);
             if(ar < 0){
                 fprintf(stderr,"[dl] utxo_live_catchup fatal error -- disabling live UTXO tracking\n");
                 utxo_live_ok = 0;
+            } else if(ar > 0){
+                fprintf(stderr,"[dl] updating utxo: applied %ld block(s), now at height %ld, live=%ld (%.2fs)\n",
+                        ar, utxo_live_applied_height(), utxo_live_count(), phase_elapsed(&utxo_ct_pt));
             }
         }
         if(now_ms >= next_heartbeat_ms){
@@ -1877,7 +1890,12 @@ int main(int argc, char** argv){
          * ceiling, not a guarantee. */
         int catchup_workers = (argc>=6)? atoi(argv[5]) : 16;
         if(catchup_workers<1) catchup_workers=1;
+        phase_timer_t boot_pt; phase_start(&boot_pt);
+        fprintf(stderr,"[boot] loading chain archive from disk...\n");
+        phase_timer_t load_pt; phase_start(&load_pt);
         store_reload(store_buf);            /* load the persisted chain from disk */
+        fprintf(stderr,"[boot] chain archive loaded: tip=%d (%.2fs)\n",
+                *(int*)(store_buf+24), phase_elapsed(&load_pt));
         /* shared-append flock fd: open append.lock once so any concurrent-safe
          * store_append_shared writes (and the boot catch-up) serialize. */
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
@@ -1887,6 +1905,8 @@ int main(int argc, char** argv){
          * The mux loop will poll it once the catch-up returns. */
         int l = lsock(port);
         if(l<0){ perror("lsock"); return 1; }
+        fprintf(stderr,"[boot] checking for archive gaps / missing blocks...\n");
+        phase_timer_t catchup_pt; phase_start(&catchup_pt);
         /* BUILT-IN MULTI-PEER CATCH-UP (SYNCHRONOUS, self-healing): detect
          * any archive holes plus whatever's missing up to the real chain
          * tip, and fill the whole span with a pool of chunk-claiming
@@ -1901,11 +1921,16 @@ int main(int argc, char** argv){
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
         long caught = dl_catchup(dir, catchup_workers);
+        fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
+                caught, phase_elapsed(&catchup_pt));
         if(caught>0){
             store_reload(store_buf);        /* our copy predates dl_catchup's writes */
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
         }
+        fprintf(stderr,"[boot] building hash index...\n");
+        phase_timer_t hidx_pt; phase_start(&hidx_pt);
         build_hash_index();                 /* hash->height for O(1) getdata serving */
+        fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
         int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly
@@ -1930,6 +1955,7 @@ int main(int argc, char** argv){
         pid_t dl = fork();
         if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
+        fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
         return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333, l);
