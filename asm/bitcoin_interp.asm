@@ -159,6 +159,7 @@
 %define SIGVERSION_WITNESS_V0 1
 %define SIGVERSION_TAPSCRIPT 2
 
+%define SCRIPT_VERIFY_NULLDUMMY (1<<4)
 %define SCRIPT_VERIFY_MINIMALDATA (1<<6)
 %define SCRIPT_VERIFY_MINIMALIF (1<<13)
 %define SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY (1<<9)
@@ -189,6 +190,9 @@
 %define SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG    50
 %define SCRIPT_ERR_DISCOURAGE_OP_SUCCESS      36
 %define SCRIPT_ERR_CLEANSTACK                 30
+%define SCRIPT_ERR_SIG_COUNT                  9
+%define SCRIPT_ERR_PUBKEY_COUNT               10
+%define SCRIPT_ERR_SIG_NULLDUMMY              28
 
 section .bss
 align 16
@@ -2307,8 +2311,42 @@ interp_checkmultisig:
     mov   eax, [rsp+24]
     add   eax, [rsp+16]
     add   eax, 2                 ; need
-    ; (dummy NOT separately validated here; NULLDUMMY is a verify flag that the
-    ;  caller enforces. We just need to know how many to pop.)
+    ; ---- stack depth: need+1 elements (operands + the dummy) must exist.
+    ; Without this, too few operands fell through to "multisig is false"
+    ; (EVAL_FALSE) where Core reports INVALID_STACK_OPERATION.
+    mov   ecx, eax               ; need
+    inc   ecx                    ; need+1
+    mov   edx, [rsp+8]           ; sp
+    cmp   edx, ecx
+    jl    .err_stackop
+
+    ; ---- BIP147 NULLDUMMY. This MUST live here, not in the caller.
+    ; The comment this replaces claimed the caller enforces it, but this
+    ; function pops the dummy as part of its operand cleanup, so by the time
+    ; script_eval returns there is nothing left to inspect. Core checks it
+    ; inside EvalScript for the same reason. Leaving it to the caller meant
+    ; the interpreter ACCEPTED a spend Core rejects.
+    mov   rax, [r12+56]          ; flags
+    test  rax, SCRIPT_VERIFY_NULLDUMMY
+    jz    .cms_dummy_ok
+    mov   ecx, [rsp+24]          ; nKeys
+    add   ecx, [rsp+16]          ; + nSigs
+    add   ecx, 3                 ; = need+1
+    mov   edx, [rsp+8]           ; sp
+    sub   edx, ecx               ; idx of the dummy, from the bottom
+    movsxd rdx, edx
+    mov   rdi, r12
+    add   rdi, 8
+    mov   rsi, [r12+0]
+    call  stack_elem_ptr
+    mov   ecx, [rax]             ; dummy length
+    test  ecx, ecx
+    jnz   .err_nulldummy
+.cms_dummy_ok:
+    ; recompute need: the checks above clobbered eax.
+    mov   eax, [rsp+24]
+    add   eax, [rsp+16]
+    add   eax, 2
 
     ; ---- 2. collect keys[]/sigs[] pointers into scratch (live-stack refs) --
     ; keys[j] = stacktop(2+j), j=0..nkeys-1   (pubn down to pub1)
@@ -2469,11 +2507,17 @@ interp_checkmultisig:
     pop   r12
     ret
 
+.err_stackop:
+    mov   qword [rel interp_err], SCRIPT_ERR_INVALID_STACK_OPERATION
+    jmp   .err_exit
+.err_nulldummy:
+    mov   qword [rel interp_err], SCRIPT_ERR_SIG_NULLDUMMY
+    jmp   .err_exit
 .err_pubcount:
-    mov   qword [rel interp_err], 20
+    mov   qword [rel interp_err], SCRIPT_ERR_PUBKEY_COUNT
     jmp   .err_exit
 .err_sigcount:
-    mov   qword [rel interp_err], 12
+    mov   qword [rel interp_err], SCRIPT_ERR_SIG_COUNT
 .err_exit:
     xor   eax, eax
     add   rsp, 32
