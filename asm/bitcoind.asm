@@ -318,7 +318,29 @@ node_accept_handshake:
     ret
 
 ; ============================================================================
-; node_sync(fd, st*, locator32, buf, buflen, out_count*)
+; STAGE B: node_sync now has TWO entry points.
+;
+;   node_sync(fd, st*, locator32, buf, buflen, out_count*)
+;       The ORIGINAL 6-argument signature, byte-for-byte behaviour preserved
+;       for every pre-existing caller (tests/test_bitcoind_sync.c,
+;       tests/test_keepup.c, daemon/main.c's follow/ibd/serve_mux paths, ...).
+;       Now implemented as a thin shim over node_sync_multi with count=1.
+;
+;   node_sync_multi(fd, st*, locator*, loc_count, buf, buflen, out_count*)
+;       The real body. `locator` is loc_count*32 contiguous hash bytes (the
+;       doubling-gap ancestor list daemon/locator_build.c produces), clamped
+;       to [1,32]. This is what makes FORK DISCOVERY possible at all: with a
+;       single-hash locator, a peer whose chain diverged below our tip
+;       recognises NONE of our locator and replies from ITS genesis (or with
+;       nothing usable); with the real multi-hash locator it finds the newest
+;       ancestor it shares with us and starts there.
+;
+;   After the first successfully stored block the internal loc_count is reset
+;   to 1, because from that point the locator local holds exactly one hash
+;   (the block just stored) -- the same locator-advance the original code did,
+;   just with the count kept consistent with it.
+;
+; node_sync_multi(fd, st*, locator, loc_count, buf, buflen, out_count*)
 ;   Headers-first Initial Block Download for a small chain. Loop:
 ;     request getheaders from the tip locator; parse headers; for each header
 ;     request the block (getdata), receive `block`, validate (cons_verify), store
@@ -351,9 +373,47 @@ node_accept_handshake:
 ;   fully clear of both rbp and the block-hash-precompute array, without
 ;   touching any other local's offset.
 ;   sub rsp, 0x1b08 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
+;
+;   STAGE B FRAME ADDITIONS. The getheaders payload used to be built at
+;   rbp-0x140, where it had only 0x45 (69) bytes of clearance before the
+;   stop-hash local at rbp-0xf0 -- exactly the size of a ONE-hash getheaders
+;   message and not one byte more. A 32-hash locator serialises to
+;   5 + 32*32 + 32 = 1061 (0x425) bytes, which from rbp-0x140 would have run
+;   0x2e5 bytes PAST rbp, straight through the entire save area and the
+;   return address. The payload buffer is therefore moved into the deep,
+;   otherwise-unused tail of this frame, and loc_count gets its own qword
+;   there too:
+;     rbp-0x1b04 hdr-drain retry counter (dword, pre-existing)
+;     rbp-0x1b00 blk-drain retry counter (dword, pre-existing)
+;     rbp-0x1af8 loc_count (qword, NEW)
+;     rbp-0x1af0 getheaders payload[1061] (NEW) -> spans [-0x1af0, -0x16cb)
+;   RSP is rbp-0x1b30 (5 pushes + 0x1b08), so -0x1b04 is the deepest local and
+;   is in bounds; the payload's top (-0x16cb) stays 0x3c3 bytes clear of
+;   txid_scratch's base at -0x1308. rbp-0x140 is now unused.
 ; ============================================================================
+; ---- node_sync: 6-arg compatibility shim (count = 1) ----------------------
+;   Shifts the register arguments and passes out_count as the 7th (stack)
+;   argument node_sync_multi expects at [rbp+16].
+;   Alignment: entry RSP%16==8; push rbp -> 0; sub 16 -> 0; so node_sync_multi
+;   is entered with RSP%16==8, the standard post-call state its own frame
+;   arithmetic assumes.
 global node_sync
 node_sync:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 16
+    mov  rax, r9            ; out_count* (arg6) -> 7th arg slot
+    mov  [rsp], rax
+    mov  r9, r8             ; buflen   (arg5) -> arg6
+    mov  r8, rcx            ; buf      (arg4) -> arg5
+    mov  ecx, 1             ; loc_count = 1   -> arg4
+    call node_sync_multi
+    add  rsp, 16
+    pop  rbp
+    ret
+
+global node_sync_multi
+node_sync_multi:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -369,9 +429,22 @@ node_sync:
     mov  r12, rsi           ; st
     mov  [rbp-0x78], rdx    ; locator kept in a STACK LOCAL (r13 is leaked by a
                             ; deep callee in this hash chain -- do not trust it)
-    mov  r14, rcx           ; buf
-    mov  [rbp-0x48], r8     ; buflen (QWORD; write BEFORE out_count to avoid overlap)
-    mov  [rbp-0x60], r9     ; out_count ptr (qword)
+    ; ---- loc_count, clamped to [1,32] (the locator payload buffer below is
+    ; sized for exactly 32 hashes; p2p_getheaders itself would accept up to
+    ; 252, so the clamp must happen HERE, not there) ----
+    cmp  rcx, 1
+    jge  .lc_lo_ok
+    mov  rcx, 1
+.lc_lo_ok:
+    cmp  rcx, 32
+    jle  .lc_hi_ok
+    mov  rcx, 32
+.lc_hi_ok:
+    mov  [rbp-0x1af8], rcx
+    mov  r14, r8            ; buf
+    mov  [rbp-0x48], r9     ; buflen (QWORD; write BEFORE out_count to avoid overlap)
+    mov  rax, [rbp+16]      ; out_count ptr (7th arg, on the stack)
+    mov  [rbp-0x60], rax
     mov  r15, [rbp-0x60]    ; r15 = out_count ptr (callee-saved)
     mov  qword [r15], 0
     mov  dword [rbp-0x68], 0    ; loop index i = 0
@@ -382,18 +455,18 @@ node_sync:
     rep  stosb
 .sync_loop:
     ; ---- request headers ----
-    lea  rdi, [rbp-0x140]
+    lea  rdi, [rbp-0x1af0]  ; payload buffer (1061B capacity; see frame note)
     mov  rsi, [rbp-0x78]    ; locator (from stack local)
-    mov  edx, 1
+    mov  edx, [rbp-0x1af8]  ; loc_count (clamped to [1,32] at entry)
     lea  rcx, [rbp-0xf0]
     call p2p_getheaders
     test rax, rax
     jle  .fail
-    mov  r8, rax            ; headers payload len (69) = plen for the send
+    mov  r8, rax            ; headers payload len (5+count*32+32) = plen to send
     mov  rdi, rbx
     lea  rsi, [rel _getheaders]
     mov  rdx, 10
-    lea  rcx, [rbp-0x140]
+    lea  rcx, [rbp-0x1af0]
     call p2p_write
     cmp  rax, 24
     jl   .fail
@@ -610,11 +683,14 @@ node_sync:
     call idxscan_append_locked
     cmp  rax, -1
     je   .fail
-    ; locator = stored block hash
+    ; locator = stored block hash (a SINGLE hash from here on -- so the count
+    ; must drop to 1 to match, or the next getheaders would re-send stale
+    ; ancestor hashes from the caller's original multi-hash buffer behind it)
     lea  rsi, [rbp-0xa0]
     mov  rdi, [rbp-0x78]    ; locator (from stack local)
     mov  rcx, 32
     rep  movsb
+    mov  qword [rbp-0x1af8], 1
     inc  qword [r15]
     inc  dword [rbp-0x68]
     jmp  .header_loop

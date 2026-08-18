@@ -1,13 +1,13 @@
 /* daemon/locator_build.c -- Stage A reorg/fork-choice primitive #2 (real
  * multi-hash block locator). 100% AI-generated, plain C, no libc surprises.
  *
- * STANDALONE / ADDITIVE: nothing in the live daemon calls this yet. It is
- * exercised only by tests/test_locator.c. daemon/main.c's own
- * anchor_locator/mux_locator (single-hash-only locator, the one the live
- * sync loop actually uses today) are left completely untouched -- wiring a
- * real multi-hash locator into that loop is a later, separately reviewed
- * stage. This file only borrows their read-the-hash-straight-from-
- * index.dat technique (see anchor_locator's own header comment for why:
+ * STAGE B UPDATE -- THIS IS NOW LIVE. daemon/main.c's do_outbound_sync builds
+ * its locator here on every sync pass (via build_locator_for_sync) and passes
+ * it to node_sync_multi; daemon/reorg.c uses it for fork discovery, and
+ * additionally re-derives the same height sequence so it can map "the peer
+ * answered from hash X" to a height in O(1). The old single-hash
+ * mux_locator/mux_locator_zero accessors are gone. This file borrows
+ * anchor_locator's read-the-hash-straight-from-index.dat technique (see anchor_locator's own header comment for why:
  * node_serve_block on a just-appended tip can transiently return a short
  * read, whereas index.dat's positional record is always consistently
  * readable once store_append's single 48-byte write has landed).

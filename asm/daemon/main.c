@@ -41,6 +41,7 @@
 #include "log_phase.h"
 #include "utxo_walk.h"   /* utxo_walk_read_varint, for tx-count in [block] stored logs */
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
+#include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -67,6 +68,12 @@
  * leg returns in milliseconds and does not hold the rotation. Kept well above a
  * single leg's per-pass round-trip cost. */
 #define DL_BUDGET_SECS 60.0
+/* STAGE B: minimum gap between fork probes across all outbound legs. A probe
+ * is one extra getheaders round trip on an already-idle leg, so this only has
+ * to be short enough to notice a competing chain promptly (a mainnet reorg is
+ * resolved in minutes, not seconds) and long enough that it is noise against
+ * the per-leg sync traffic. */
+#define REORG_PROBE_INTERVAL_MS 30000L
 #define DL_HEARTBEAT_MS 60000L   /* periodic [dl] heartbeat so the log stays
                                   * visibly alive between block/peer events */
 
@@ -76,6 +83,13 @@ extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, 
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
+/* STAGE B: the real multi-hash-locator entry point. node_sync is now a
+ * count==1 shim over this (see bitcoind.asm). A single-hash locator is what
+ * made fork DISCOVERY impossible: a peer whose chain diverged below our tip
+ * recognises none of it and answers from its own genesis. */
+extern long node_sync_multi(int fd, void* st, void* locator, long loc_count,
+                            void* buf, long buflen, long* out_count);
+extern long locator_build(void* store_buf, unsigned char* out_hashes); /* daemon/locator_build.c */
 extern long node_serve_block(void* st, long height, void* out, long cap);
 extern long node_serve_block_by_hash(void* st, const void* hash32, void* out, long cap);
 extern long node_serve_loop(int fd, int lfd, void* st, void* ht_idx, void* out, long cap);
@@ -162,6 +176,22 @@ static int build_hash_index(void){
     if(idx_build_from_file(ht_idx, "index.dat")<0){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
     fprintf(stderr,"[hashidx] indexed %ld stored heights\n", (long)idx_count(ht_idx));
     return 0;
+}
+
+/* STAGE B: rebuild the hash index in place after a reorg truncated the store.
+ * Deliberately reuses build_hash_index's EXACT construction (idx_init +
+ * idx_build_from_file) rather than re-deriving keys some other way, so a
+ * post-reorg index is byte-identical to a fresh boot's -- reorg.c does not
+ * guess at this, it calls back through reorg_set_index_rebuild. Reuses the
+ * already-allocated buffer instead of mallocing a new one each time (a reorg
+ * can happen repeatedly over a process's lifetime). */
+static void rebuild_hash_index_after_reorg(void){
+    if(!ht_idx) return;
+    idx_init(ht_idx, HT_SLOTS);
+    if(idx_build_from_file(ht_idx, "index.dat")<0)
+        fprintf(stderr,"[reorg] WARNING: hash index rebuild failed; block-by-hash serving is degraded until restart\n");
+    else
+        fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
 }
 
 /* Build the hash->height index from the IN-MEMORY store (used where the chain
@@ -546,13 +576,34 @@ static void anchor_locator(unsigned char loc[32]){
     memset(loc,0,32);
 }
 
-/* Materialize the locator for outbound peer i into `loc` (32 bytes). */
-static void mux_locator(int i, unsigned char loc[32]){
-    memcpy(loc, mux_out_loc[i], 32);
-}
+/* mux_locator/mux_locator_zero (the old per-peer single-hash locator
+ * accessors) are gone: do_outbound_sync now derives a real multi-hash
+ * locator from the store on every pass -- see build_locator_for_sync. */
 
-static int mux_locator_zero(int i){
-    for(int k=0;k<32;k++) if(mux_out_loc[i][k]) return 0; return 1;
+/* ---- STAGE B: the REAL block locator ------------------------------------
+ * Builds the doubling-gap ancestor list (tip, tip-1, tip-2, tip-4, ...) via
+ * daemon/locator_build.c, which reads each ancestor's hash straight out of
+ * index.dat by position -- the same "read the index record, not the block
+ * body" technique anchor_locator above already uses, and for the same
+ * reason (a just-appended tip's body can transiently read short).
+ *
+ * WHY THIS REPLACES anchor_locator ON THE SYNC PATH: a one-hash locator only
+ * ever says "I have exactly this block". A peer on a chain that diverged
+ * below our tip recognises nothing in it and answers from its own genesis,
+ * so a fork is literally undiscoverable -- which is why every sync pass
+ * until now silently assumed the peer was on our chain. With the full list
+ * the peer finds the newest block we actually share and answers from there,
+ * which is what makes the fork point visible. A peer that IS on our chain is
+ * unaffected: it matches the first entry (our tip) immediately, exactly as
+ * before.
+ *
+ * Falls back to the old single-hash anchor if locator_build cannot read the
+ * index (returns the hash count, always >= 1). */
+static long build_locator_for_sync(unsigned char loc[REORG_LOCATOR_MAX*32]){
+    long n = locator_build(store_buf, loc);
+    if(n >= 1) return n;
+    anchor_locator(loc);
+    return 1;
 }
 
 /* One bounded download+announce pass on outbound peer i.
@@ -611,12 +662,17 @@ static void log_hash_short(char out[17], const unsigned char hash32[32]){
 }
 
 static long do_outbound_sync(int i){
-    unsigned char loc[32]; mux_locator(i, loc);
-    if(mux_locator_zero(i)){ anchor_locator(loc); }  /* first time: genesis */
+    /* STAGE B: a REAL multi-hash locator built fresh from our stored chain on
+     * every pass, replacing the single-hash anchor. mux_out_loc[i] is still
+     * maintained below for the other call sites that read it, but the sync
+     * itself no longer depends on it -- the locator is derived from the store,
+     * which is the authoritative thing anyway. */
+    unsigned char loc[REORG_LOCATOR_MAX*32];
+    long nloc = build_locator_for_sync(loc);
     static unsigned char cbuf[6<<20]; long cnt=0;
     int st_tip_before=*(int*)(store_buf+24);
     phase_timer_t sync_pt; phase_start(&sync_pt);
-    long ok=node_sync(mux_out_fd[i], store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
+    long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     if(ok!=1 || cnt<=0){
@@ -642,6 +698,16 @@ static long do_outbound_sync(int i){
         if(!consumed) ntx = 0;
         fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
     }
+    /* STAGE B: keep chainwork.dat in lockstep with index.dat for every block
+     * that just landed. This is a CATCH-UP call, not a per-block hook: it
+     * appends one cumulative-work record for every height index.dat has and
+     * chainwork.dat does not, so it covers blocks this leg just stored AND
+     * blocks a sibling inbound serve child appended via .do_block, with one
+     * call site instead of two edited assembly write paths. Without this,
+     * fork choice has nothing to weigh our own chain with. */
+    if(reorg_chainwork_sync(store_buf, 0) < 0)
+        fprintf(stderr,"[chainwork] sync failed after storing heights %d..%d -- fork choice is DEGRADED until this recovers\n",
+                st_tip_before+1, st_tip);
     /* announce the new tip to this peer (inv; BIP130 headers honored by the
      * peer's sendheaders negotiation is handled downstream on its own leg) */
     node_announce_tip(mux_out_fd[i], store_buf, ht_idx, 0);
@@ -1459,6 +1525,41 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     int utxo_live_ok = utxo_live_init(dir);
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
     else fprintf(stderr,"[dl] worker: live UTXO state loaded (%.2fs)\n", phase_elapsed(&utxo_init_pt));
+
+    /* ---- STAGE B: fork choice ------------------------------------------
+     * Open chainwork.dat and bring it fully in step with index.dat. The
+     * first run on an existing archive is the one-time backfill of every
+     * already-stored height (each one costs an index read, an 80-byte header
+     * read and one 16-byte record write); every later boot finds the file
+     * already complete and this returns immediately. Doing the backfill here
+     * rather than as a separate tool means the backfill path and the
+     * steady-state path are literally the same tested function, and it is
+     * resumable -- an interrupted backfill just continues next boot.
+     *
+     * A failure here disables reorg handling for this process but must not
+     * stop the node: without chainwork we simply cannot compare chains, and
+     * refusing to reorg is always the safe direction. */
+    int reorg_ok = 0;
+    if(reorg_chainwork_open(store_buf) != 1){
+        fprintf(stderr,"[dl] chainwork open failed -- fork detection DISABLED for this process\n");
+    } else {
+        phase_timer_t cw_pt; phase_start(&cw_pt);
+        long added = reorg_chainwork_sync(store_buf, 0);
+        if(added < 0){
+            fprintf(stderr,"[dl] chainwork backfill failed -- fork detection DISABLED for this process\n");
+        } else {
+            reorg_ok = 1;
+            fprintf(stderr,"[dl] worker: chainwork in step with the archive (%ld record(s) backfilled, %.2fs)\n",
+                    added, phase_elapsed(&cw_pt));
+        }
+    }
+    /* Reorg handling additionally REQUIRES live UTXO tracking: disconnecting
+     * a block means replaying its undo data against the live LSM, and the
+     * undo data itself is only written by the live apply path. */
+    if(reorg_ok && !utxo_live_ok){
+        fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
+    }
+    reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
     /* ---- BOOTSTRAP + DISCOVER (seeds are bootstrap-only) ----
      * Real nodes use DNS seeds once to learn reachable peers, then connect to
      * those -- never downloading from the seeds themselves. We resolve each
@@ -1554,6 +1655,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
+    /* STAGE B: next allowed fork probe (see the probe block in the rotation
+     * below). Starts armed so a node booting onto a store that is already on
+     * a losing branch notices on its first idle rotation rather than after a
+     * full interval. */
+    long long next_reorg_probe_ms = 0;
     for(;;){
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
@@ -1604,6 +1710,43 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 mux_redial(i, peers, pool_len, out_port);
             }
             did |= (n>0)?1:0;
+            /* ---- STAGE B: periodic fork probe -----------------------------
+             * Runs only on a leg that just returned NOTHING, which is exactly
+             * the situation a fork hides in: if the peer is on a competing
+             * branch, node_sync stores nothing and looks indistinguishable
+             * from "we are caught up". The probe re-asks with the same real
+             * multi-hash locator and evaluates the answer with the full
+             * validate -> locate fork -> compare work -> download -> verify
+             * pipeline; every step before the destructive one can bail out
+             * with the node completely unchanged.
+             *
+             * Rate-limited to ONE leg per REORG_PROBE_INTERVAL_MS so the
+             * extra getheaders round trip is negligible against the per-leg
+             * sync traffic, and bounded by the same SIGALRM budget the sync
+             * pass uses so a stalled peer cannot hold the rotation.
+             * Gated on BOTH chainwork (needed to compare) and live UTXO
+             * tracking (needed for undo data). */
+            if(reorg_ok && utxo_live_ok && n<=0 && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms){
+                next_reorg_probe_ms = now_ms + REORG_PROBE_INTERVAL_MS;
+                struct sigaction psa, pold; memset(&psa,0,sizeof psa);
+                psa.sa_handler=mux_budget_alarm; sigemptyset(&psa.sa_mask);
+                sigaction(SIGALRM,&psa,&pold);
+                mux_sync_budget_fired=0;
+                alarm((unsigned)DL_BUDGET_SECS);
+                long pr = reorg_probe_peer(mux_out_fd[i], store_buf, mux_out_host[i]);
+                alarm(0); sigaction(SIGALRM,&pold,NULL);
+                if(mux_sync_budget_fired){
+                    fprintf(stderr,"[reorg] probe of %s exceeded %gs budget; re-dialing\n", mux_out_host[i], DL_BUDGET_SECS);
+                    mux_redial(i, peers, pool_len, out_port);
+                } else if(pr == 1){
+                    /* The chain moved under us: re-anchor this leg and force
+                     * a UTXO catch-up pass this rotation. */
+                    anchor_locator(mux_out_loc[i]);
+                    did = 1;
+                } else if(pr < 0){
+                    fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
+                }
+            }
             /* brief yield so we don't spin a CPU core when all legs are idle */
             if((i&1)==1){ usleep(20000); }
         }
@@ -1615,6 +1758,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * (utxo_live_catchup's own job) also picks up a sibling inbound
          * child's .do_block writes, which land in the shared archive
          * independently of any leg here. */
+        /* STAGE B: same argument as the UTXO catch-up directly below --
+         * chainwork must track the store's TRUE on-disk tip, not just what
+         * this worker's own legs happened to store, because an inbound serve
+         * child's .do_block writes land in the shared archive independently.
+         * A no-op (one lseek) when already in step. */
+        if(reorg_ok) reorg_chainwork_sync(store_buf, 0);
         if(utxo_live_ok){
             phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);

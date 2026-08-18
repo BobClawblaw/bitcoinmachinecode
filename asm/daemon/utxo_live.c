@@ -52,6 +52,34 @@ extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
 
+/* ---- STAGE B: per-block undo data (daemon/undo_log.c) --------------------
+ * Stage A built these but deliberately left live_on_input untouched. They
+ * are wired in below: every input the live daemon spends is now captured
+ * (value + scriptPubKey, read out of the LSM immediately before the delete)
+ * into undo_<height>.dat, which is what makes a later DISCONNECT of that
+ * block possible at all. */
+extern long undo_capture_and_del(void* lst, void* u, long height,
+                                 const u8 txid[32], u32 index);
+extern long undo_discard(long height);
+extern long undo_prune_from(long from_height, long tip_height, long window, long max_scan);
+/* utxo_walk.h supplies u8/u32/u64 but not u16 (undo records carry a u16
+ * script length -- see daemon/undo_log.c's record format). */
+typedef unsigned short u16;
+typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
+                              u64 value, const u8* script, u16 slen);
+extern long undo_replay(long height, undo_replay_cb cb, void* ctx);
+
+/* Rolling undo-data retention window. Stage A's own design note calls for
+ * ~100-200 blocks; 200 is the top of that range, chosen because it is also
+ * comfortably deeper than any reorg this node would apply automatically
+ * (see REORG_MAX_DEPTH in daemon/reorg.c, which refuses to go deeper than
+ * the undo data can actually support). */
+#define UTXO_UNDO_WINDOW    200
+/* Heights examined per prune sweep. Bounds the cold-start cost on a deep
+ * store (a fresh boot starts the cursor at 0) without ever stalling the
+ * download worker's loop; the cursor resumes on the next block. */
+#define UTXO_UNDO_PRUNE_SCAN 20000
+
 /* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes). */
 struct lsm_state {
     long log_fd, idx_fd;
@@ -78,6 +106,20 @@ struct lsm_state {
 static void* g_utxo_table = 0;
 struct lsm_state g_utxo_lst;
 static long  g_applied_height = -1;
+/* Height whose block is currently being applied -- the key undo records are
+ * filed under. Set by apply_block_at before any walk begins. */
+static long  g_apply_height = -1;
+/* Undo capture master switch. ON by default: the whole point of Stage B is
+ * that undo data accumulates during NORMAL operation so a reorg that shows
+ * up later has something to disconnect with. Turned off only while
+ * REconnecting is not a thing we do -- reconnect captures undo data too, so
+ * this stays on there as well; the switch exists for one-shot batch tools
+ * (daemon/build_utxo.c-style archive replays) that would otherwise write a
+ * million undo files they will never read. */
+static int   g_undo_enabled = 1;
+/* Resumable prune cursor -- see undo_prune_from's own header comment for why
+ * a plain undo_prune(tip,window) per block is not viable at mainnet depth. */
+static long  g_undo_prune_cursor = 0;
 
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -143,6 +185,20 @@ static const u8 ZERO32[32] = {0};
 static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
     apply_ctx_t* ctx = (apply_ctx_t*)ctxv;
     if (index == 0xFFFFFFFFu && memcmp(txid, ZERO32, 32)==0) return; /* coinbase */
+    if (g_undo_enabled) {
+        /* STAGE B: capture-then-delete. undo_capture_and_del is Stage A's own
+         * intended shape for exactly this call site: utxo_lsm_get the prevout,
+         * append (txid,index,value,script) to undo_<height>.dat, THEN
+         * utxo_lsm_del. Its return contract is deliberately identical to the
+         * bare utxo_lsm_del this replaces -- 1 deleted / 0 no-such-UTXO /
+         * -1 error -- so the fatal condition below is unchanged. A 0 is NOT
+         * fatal here for the same reason it was not before: an already-absent
+         * prevout is how a re-applied (crash-resumed) block legitimately
+         * reads back. */
+        long r = undo_capture_and_del(&g_utxo_lst, g_utxo_table, g_apply_height, txid, index);
+        if (r == -1) ctx->fatal = 1;
+        return;
+    }
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, txid, index);
     if (r == -1) ctx->fatal = 1;
 }
@@ -158,7 +214,7 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
  * corrupt-block handling; the Stage 0 archive-write-race fix plus the
  * corruption repair already run make this an unexpected path in practice,
  * not a normal one). */
-static int apply_block(const u8* blockbuf, u64 blocklen){
+static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (blocklen < 81) return 0;
     const u8* p = blockbuf + 80;
     const u8* blkend = blockbuf + blocklen;
@@ -188,6 +244,198 @@ static int apply_block(const u8* blockbuf, u64 blocklen){
     }
     return ctx.fatal ? 0 : 1;
 }
+
+/* apply_block_at(buf, len, height): apply_block_inner, but with this block's
+ * undo records filed under `height` and starting from a CLEAN undo file.
+ *
+ * The discard matters: a block that gets re-applied (crash-resumed catch-up
+ * -- applied_height is only persisted after a whole batch, so the last block
+ * of an interrupted batch is legitimately applied twice) would otherwise
+ * have its second attempt's records O_APPENDed onto the first attempt's. A
+ * later disconnect would then both restore duplicates AND see a record count
+ * that no longer matches the block's real input count -- which the unapply
+ * pre-flight gate below treats as corruption and refuses, turning a
+ * survivable crash into a permanently un-disconnectable height. */
+static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
+    g_apply_height = height;
+    if (g_undo_enabled && height >= 0) undo_discard(height);
+    return apply_block_inner(blockbuf, blocklen);
+}
+
+/* ===========================================================================
+ * STAGE B: DISCONNECT (the mirror image of apply_block).
+ *
+ * Unapplying block H must leave the UTXO set byte-identical to its state
+ * before H was applied. Two steps, and THE ORDER IS LOAD-BEARING:
+ *
+ *   1. RESTORE every prevout H spent, from undo_<H>.dat (utxo_lsm_put with
+ *      the exact value+scriptPubKey captured at spend time).
+ *   2. THEN DELETE every output H created (utxo_lsm_del on each (txid,vout)).
+ *
+ * Doing it the other way round is wrong for outputs that were BOTH created
+ * and spent inside H (tx B in block H spending tx A in block H -- extremely
+ * common). Such an outpoint is in the undo log (it really was in the live
+ * set at the moment B spent it, because apply walks tx-by-tx and A's outputs
+ * land before B's inputs are processed), and it is also in H's created-output
+ * set. Correct end state: ABSENT. "Delete created, then restore" leaves it
+ * PRESENT -- a phantom spendable UTXO that never existed. "Restore, then
+ * delete created" leaves it absent. Hence this order.
+ *
+ * (The one case this global ordering gets wrong is a pre-BIP30 duplicate
+ * coinbase txid -- heights 91722/91880 on mainnet, where a block creates an
+ * outpoint identical to one an EARLIER block created. Disconnecting the
+ * later of those two would delete the earlier one's still-live output. Those
+ * two heights are ~880k blocks below any tip this code will ever disconnect
+ * -- the undo window is 200 blocks -- so it is documented, not handled.)
+ * ======================================================================== */
+
+/* ---- pre-flight integrity gate ----------------------------------------
+ * Counts the block's non-coinbase inputs and the undo file's record count
+ * and requires them to be EQUAL before any mutation happens. This is the
+ * single most important safety check in the disconnect path: undo data that
+ * is missing, truncated, pruned away, or left over from a different block at
+ * the same height would otherwise produce a silently WRONG UTXO set -- the
+ * one failure mode of a reorg that no later check would catch and that
+ * corrupts real money state. Refusing to disconnect leaves the node on its
+ * current chain, which is always a safe outcome.
+ * Returns 1 = safe to unapply, 0 = refuse. */
+typedef struct { long n_inputs; } count_ctx_t;
+
+static void count_on_input(void* ctxv, const u8 txid[32], u32 index){
+    if (index == 0xFFFFFFFFu && memcmp(txid, ZERO32, 32)==0) return; /* coinbase */
+    ((count_ctx_t*)ctxv)->n_inputs++;
+}
+
+/* Walk a block's transactions, invoking the given input/output callbacks.
+ * Shared by the counting pre-flight and the created-output deletion below so
+ * the two can never drift on how a block is sliced. Returns 1 well-formed. */
+static int walk_block_txs(const u8* blockbuf, u64 blocklen, void* ctx,
+                          utxo_walk_input_cb icb, utxo_walk_output_cb ocb,
+                          const u8** cur_txid_slot){
+    if (blocklen < 81) return 0;
+    const u8* p = blockbuf + 80;
+    const u8* blkend = blockbuf + blocklen;
+    u64 consumed;
+    u64 ntx = utxo_walk_read_varint(p, blkend, &consumed);
+    if (!consumed) return 0;
+    p += consumed;
+
+    static u8 txid_scratch2[4<<20];
+    for (u64 t=0; t<ntx; t++){
+        u8 info[64];
+        if (!tx_parse(info, p, (unsigned long)(blkend - p))) return 0;
+        u64 txlen; memcpy(&txlen, info, 8);
+        u32 pn_in, pn_out; memcpy(&pn_in, info+12, 4); memcpy(&pn_out, info+16, 4);
+        u8 txid[32];
+        tx_txid(txid, p, txlen, txid_scratch2, sizeof txid_scratch2);
+        if (cur_txid_slot) *cur_txid_slot = txid;
+        u64 wnin=0, wnout=0;
+        if (!utxo_walk_tx_io(p, p+txlen, ctx, icb, ocb, &wnin, &wnout)) return 0;
+        if (wnin != pn_in || wnout != pn_out) return 0;
+        p += txlen;
+    }
+    return 1;
+}
+
+static int undo_count_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
+                         const u8* script, u16 slen){
+    (void)txid; (void)index; (void)value; (void)script; (void)slen;
+    (*(long*)ctx)++;
+    return 1;
+}
+
+int utxo_live_can_unapply(const void* blockbuf, u64 blocklen, long height){
+    count_ctx_t cc = { 0 };
+    if (!walk_block_txs((const u8*)blockbuf, blocklen, &cc, count_on_input, 0, 0)){
+        fprintf(stderr, "[utxo_live] unapply pre-flight: height %ld block does not parse\n", height);
+        return 0;
+    }
+    long nrec = 0;
+    long r = undo_replay(height, undo_count_cb, &nrec);
+    if (r < 0){
+        fprintf(stderr, "[utxo_live] unapply pre-flight: height %ld undo file malformed\n", height);
+        return 0;
+    }
+    if (nrec != cc.n_inputs){
+        fprintf(stderr, "[utxo_live] unapply pre-flight REFUSED at height %ld: undo records=%ld but block spends %ld inputs (undo data missing, pruned, or stale)\n",
+                height, nrec, cc.n_inputs);
+        return 0;
+    }
+    return 1;
+}
+
+/* ---- the actual unapply ---- */
+static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
+                           const u8* script, u16 slen){
+    int* fatal = (int*)ctx;
+    long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value, script, (u32)slen);
+    if (r == -1 || r == 2) { *fatal = 1; return 0; }
+    return 1;
+}
+
+typedef struct { const u8* txid; int fatal; } del_created_ctx_t;
+
+static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
+                                  const u8* script, u32 slen){
+    del_created_ctx_t* c = (del_created_ctx_t*)ctxv;
+    (void)value; (void)script; (void)slen;
+    long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index);
+    if (r == -1) c->fatal = 1;   /* 0 (already absent: spent inside this same
+                                  * block, or by a descendant we already
+                                  * unapplied) is expected, not an error */
+}
+
+/* utxo_live_unapply_block(buf, len, height) -> 1 clean / 0 failed.
+ * Caller MUST have run utxo_live_can_unapply over the whole range first --
+ * see the reorg driver, which pre-flights every height it intends to
+ * disconnect BEFORE it mutates anything. */
+int utxo_live_unapply_block(const void* blockbuf, u64 blocklen, long height){
+    /* Undo capture must be OFF for the duration: the puts/dels below are the
+     * reversal of a block's effects, not the application of one, and letting
+     * them write undo records would corrupt the file for the height being
+     * unapplied. */
+    int saved = g_undo_enabled;
+    g_undo_enabled = 0;
+
+    int fatal = 0;
+    long r = undo_replay(height, undo_restore_cb, &fatal);
+    if (r < 0 || fatal){
+        fprintf(stderr, "[utxo_live] unapply height %ld: undo replay failed (r=%ld fatal=%d)\n", height, r, fatal);
+        g_undo_enabled = saved;
+        return 0;
+    }
+
+    del_created_ctx_t dc = { 0, 0 };
+    int ok = walk_block_txs((const u8*)blockbuf, blocklen, &dc, 0,
+                            del_created_on_output, &dc.txid);
+    g_undo_enabled = saved;
+    if (!ok || dc.fatal){
+        fprintf(stderr, "[utxo_live] unapply height %ld: created-output removal failed (ok=%d fatal=%d)\n", height, ok, dc.fatal);
+        return 0;
+    }
+    /* This height is no longer on our chain -- drop its undo file so a block
+     * later reconnected at the same height starts clean (undo_append_record
+     * opens O_APPEND). */
+    undo_discard(height);
+    return 1;
+}
+
+/* Public apply entry for the reorg RECONNECT path: identical to what
+ * catch-up does per block, including undo capture, so a reconnected block is
+ * itself disconnectable afterwards. */
+int utxo_live_apply_block(const void* blockbuf, u64 blocklen, long height){
+    return apply_block_at((const u8*)blockbuf, blocklen, height);
+}
+
+/* Rewind the persisted applied-height counter after a disconnect, so a
+ * subsequent utxo_live_catchup re-applies from the new fork tip rather than
+ * believing heights that no longer exist are already applied. */
+int utxo_live_rewind_to(long height){
+    g_applied_height = height;
+    return persist_applied_height(height);
+}
+
+void utxo_live_set_undo_enabled(int on){ g_undo_enabled = on; }
 
 /* utxo_live_init(dir): open-or-init the live LSM UTXO instance in the
  * current directory (callers have already chdir'd to the daemon's data
@@ -300,7 +548,7 @@ long utxo_live_catchup(void* store_buf){
             fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
             break;
         }
-        if (!apply_block(blockbuf, (u64)len)) {
+        if (!apply_block_at(blockbuf, (u64)len, h)) {
             fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up\n", h);
             return -1;
         }
@@ -308,6 +556,12 @@ long utxo_live_catchup(void* store_buf){
         applied++;
     }
     if (applied > 0) {
+        /* STAGE B: steady-state undo-data retention. Bounded and resumable
+         * (see undo_prune_from) so this stays O(1) per catch-up call at
+         * mainnet depth instead of re-sweeping from height 0 every time. */
+        if (g_undo_enabled)
+            g_undo_prune_cursor = undo_prune_from(g_undo_prune_cursor, g_applied_height,
+                                                  UTXO_UNDO_WINDOW, UTXO_UNDO_PRUNE_SCAN);
         if (!persist_applied_height(g_applied_height)) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
@@ -321,6 +575,14 @@ long utxo_live_catchup(void* store_buf){
 
 long utxo_live_applied_height(void){ return g_applied_height; }
 long utxo_live_count(void){ return utxo_lsm_count(&g_utxo_lst); }
+
+/* Handles onto the ONE live writable LSM instance, so a caller that needs to
+ * read the confirmed set (tests/test_reorg.c's expected-vs-actual UTXO diff,
+ * and any in-process mempool prevout resolution) queries exactly the
+ * instance this module writes to, rather than a second reloaded snapshot
+ * that could lag it. */
+void* utxo_live_table(void){ return g_utxo_table; }
+void* utxo_live_lst(void){ return &g_utxo_lst; }
 
 void utxo_live_close(void){
     utxo_lsm_close(&g_utxo_lst);
