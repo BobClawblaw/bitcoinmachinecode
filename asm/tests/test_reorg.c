@@ -39,6 +39,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <signal.h>
+#include <sys/file.h>
 #include "../daemon/reorg.h"
 
 typedef unsigned char u8;
@@ -50,6 +51,8 @@ extern long store_init(void* st);
 extern long store_reload(void* st);
 extern int  store_get_at(void* st, u64 height, u64 out_meta[3]);
 extern long idxscan_append_locked(void* st, const u8 hash[32], const void* raw, long len);
+extern long idxscan_append_nolocked(void* st, const u8 hash[32], const void* raw, long len);
+extern int  store_validates_prevhash(void* st, const u8 header[80]);
 extern int  store_get_tip_hash(void* st, u8 out[32]);
 extern long store_truncate_to(void* st, long target);
 extern long store_append(void* st, const u8 hash[32], const void* raw, long len);
@@ -479,6 +482,45 @@ static void case_chainwork_primitives(void){
     ck("emptied file size 0", (long)sb.st_size, 0);
     store_chainwork_get_tip(st, tip);
     ckm("emptied tip work is zero", memcmp(tip,(u8[16]){0},16)==0);
+
+    /* ---- REGRESSION GUARD for the struct-collision bug class ----
+     * Chainwork's per-process state used to live INSIDE the caller's store
+     * struct: Stage A at +56/+72, Stage B first at +128/+144. Both collided
+     * with bitcoin_store_fast.asm, which claims +56 (read-fd magic),
+     * +64..+127 (read-fd slots), +120 (mapping magic) and +128..+255 (mapping
+     * slots) of the same 256-byte struct -- i.e. there is no free hole in it
+     * at all. The fix was to stop putting state there entirely, so the
+     * invariant worth pinning is not "chainwork lives at offset N" but
+     * "chainwork writes NOTHING into that struct". Hand it a fully poisoned
+     * buffer, run the whole lifecycle, and require it to come back
+     * byte-identical. This test keeps passing no matter how the store struct
+     * is later rearranged, which is exactly the point. */
+    {
+        unsigned char probe[256], before[256];
+        memset(probe, 0xAB, sizeof probe);
+        memcpy(before, probe, sizeof probe);
+        u8 w[16], o[16];
+        block_work(w, 0x207fffffu);
+        ck("poisoned-struct: init",     store_chainwork_init(probe), 1);
+        ck("poisoned-struct: reload",   store_chainwork_reload(probe), 0);
+        ck("poisoned-struct: append",   store_chainwork_append(probe, 0, w), 1);
+        ck("poisoned-struct: get_at",   store_chainwork_get_at(probe, 0, o), 1);
+        ck("poisoned-struct: get_tip",  store_chainwork_get_tip(probe, o), 1);
+        ckm("poisoned-struct: get_tip returned the appended work", memcmp(o, w, 16)==0);
+        ck("poisoned-struct: truncate", store_chainwork_truncate(probe, -1), 1);
+        ckm("chainwork writes ZERO bytes into the store struct it is handed",
+            memcmp(probe, before, sizeof probe) == 0);
+    }
+
+    /* Uninitialised state must be a hard error, never a syscall on fd 0
+     * (stdin). cw_fd starts at -1 in .data precisely so this holds -- but
+     * this process has already initialised, so the check that matters here is
+     * the documented empty-chain contract of get_tip. */
+    {
+        u8 t2[16];
+        ck("get_tip still returns 1 after a full truncate", store_chainwork_get_tip(st, t2), 1);
+        ckm("...and reports zero work", memcmp(t2,(u8[16]){0},16)==0);
+    }
 }
 
 /* ======================================================================== */
@@ -589,6 +631,18 @@ static void store_chain(long nbase, long nlose){
     for (long i=0;i<nlose;i++) ckm("store losing block", harness_store(&lose[i]) == nbase+i);
 }
 
+static int lock_is_free(void){
+    pid_t p = fork();
+    if (p == 0){
+        int fd = open("append.lock", O_RDWR);
+        if (fd < 0) _exit(2);
+        int got = (flock(fd, LOCK_EX | LOCK_NB) == 0);
+        _exit(got ? 0 : 1);
+    }
+    int st = 0; waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
 /* Run one full reorg and verify everything. */
 static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const char* label){
     build_base(nbase, 0x207fffffu);
@@ -621,6 +675,11 @@ static void do_reorg_case(long nbase, long nlose, long nwin, u32 winbits, const 
     memsrc_t src = { win, nwin };
     snprintf(lbuf,sizeof lbuf,"%s reorg_execute", label);
     ck(lbuf, reorg_execute(store_buf, c.fork_height, nwin, memsrc, &src), 1);
+    /* reorg_execute holds the append lock across pre-flight + disconnect +
+     * truncate + the whole reconnect loop, and must release it exactly once
+     * on the way out -- a leak here would wedge every future inbound append. */
+    snprintf(lbuf,sizeof lbuf,"%s released the append lock on completion", label);
+    ckm(lbuf, lock_is_free());
 
     /* ---- independent expected UTXO: replay ONLY the winning chain ---- */
     model_reset();
@@ -1054,6 +1113,103 @@ static void case_fakepeer_locator_and_reorg(void){
 }
 
 /* ======================================================================== */
+/* CASE: append-lock scope, and the inbound prevhash gate's predicate.       */
+/*                                                                           */
+/* A reorg has to exclude the OTHER writer into this archive (an inbound      */
+/* serve child's .do_block) for its ENTIRE window, not just the disconnect.   */
+/* The bug: idxscan_append_locked delegates to store_append_shared, which     */
+/* unconditionally LOCK_UNs on the way out -- so a reorg holding the lock     */
+/* externally had it silently dropped by its own FIRST reconnected block,     */
+/* leaving every later append (and the gaps between them) unprotected.        */
+/* idxscan_append_nolocked is the same append with that pair removed.         */
+/*                                                                           */
+/* flock is per-OPEN-FILE-DESCRIPTION, so "is the lock held?" is probed from  */
+/* a forked child that open()s append.lock FRESH -- an inherited descriptor   */
+/* would see our own lock as its own and always succeed.                      */
+/* ======================================================================== */
+static void case_append_lock_scope(void){
+    const long nbase = 4;
+    build_base(nbase, 0x207fffffu);
+    harness_open();
+    for (long h=0;h<nbase;h++) ckm("store base block", harness_store(&base[h]) == h);
+
+    int lfd = *(int*)((char*)store_buf+40);
+    ckm("append.lock fd is configured on the store", lfd > 0);
+    ckm("lock is free before we take it", lock_is_free());
+
+    /* Two further blocks that legitimately extend the chain. */
+    static blk_t nxt[2];
+    { u8 prev[32]; memcpy(prev, base[nbase-1].hash, 32);
+      for (int i=0;i<2;i++){
+        memset(&nxt[i],0,sizeof nxt[i]);
+        nxt[i].bits = 0x207fffffu; nxt[i].ntx = 1;
+        mk_coinbase(&nxt[i].tx[0], 0x90000000u + (u32)i, 50000000ULL);
+        mk_block(&nxt[i], prev, 1950000000u + (u32)i);
+        memcpy(prev, nxt[i].hash, 32);
+      } }
+
+    /* ---- the NOLOCK variant must leave our outer hold intact ---- */
+    ck("take the append lock ourselves", flock(lfd, LOCK_EX), 0);
+    ckm("lock reads as held once we take it", !lock_is_free());
+    long h4 = idxscan_append_nolocked(store_buf, nxt[0].hash, nxt[0].raw, nxt[0].len);
+    ck("idxscan_append_nolocked appended at the right height", h4, nbase);
+    ckm("OUR LOCK IS STILL HELD after idxscan_append_nolocked", !lock_is_free());
+    ck("nolocked append updated the cached tip", (long)*(int*)(store_buf+24), nbase);
+    ck("release", flock(lfd, LOCK_UN), 0);
+    ckm("lock is free once we release it", lock_is_free());
+
+    /* ---- and the ordinary variant stays self-contained (takes AND drops) --
+     * i.e. exactly the behaviour that made it unusable inside a reorg. */
+    long h5 = idxscan_append_locked(store_buf, nxt[1].hash, nxt[1].raw, nxt[1].len);
+    ck("idxscan_append_locked appended at the right height", h5, nbase+1);
+    ckm("idxscan_append_locked left the lock free (it releases its own)", lock_is_free());
+
+    /* both blocks must be genuinely on disk and readable */
+    store_reload(store_buf);
+    ck("tip after both appends", (long)*(int*)(store_buf+24), nbase+1);
+    int bad = 0, idx_fd = *(int*)(store_buf+8);
+    for (int i=0;i<2;i++){
+        u8 rec[32];
+        if (pread(idx_fd, rec, 32, (nbase+i)*48) != 32 || memcmp(rec, nxt[i].hash, 32) != 0) bad++;
+    }
+    ck("both appended blocks are indexed correctly", bad, 0);
+
+    /* ---- the predicate bitcoin_serve.asm's .do_block now gates on ----
+     * The branch itself lives in assembly and is covered end-to-end by
+     * tests/test_keepup.c (which pushes a real chaining block through
+     * .do_block and requires it to be stored and served back); what is pinned
+     * here is the accept/reject decision on the exact inputs that path feeds
+     * it -- a raw 80-byte header at the start of the block buffer. */
+    {
+        static blk_t good, bad_chain;
+        memset(&good,0,sizeof good);
+        good.bits = 0x207fffffu; good.ntx = 1;
+        mk_coinbase(&good.tx[0], 0x91000000u, 50000000ULL);
+        mk_block(&good, nxt[1].hash, 1960000000u);
+        ck("prevhash gate ACCEPTS a block that extends our tip",
+           store_validates_prevhash(store_buf, good.raw), 1);
+
+        memset(&bad_chain,0,sizeof bad_chain);
+        bad_chain.bits = 0x207fffffu; bad_chain.ntx = 1;
+        mk_coinbase(&bad_chain.tx[0], 0x92000000u, 50000000ULL);
+        mk_block(&bad_chain, base[0].hash, 1960000001u);   /* forks way back */
+        ck("prevhash gate REJECTS a block from a competing branch",
+           store_validates_prevhash(store_buf, bad_chain.raw), 0);
+
+        u8 bogus[32]; memset(bogus, 0x77, 32);
+        static blk_t orphan;
+        memset(&orphan,0,sizeof orphan);
+        orphan.bits = 0x207fffffu; orphan.ntx = 1;
+        mk_coinbase(&orphan.tx[0], 0x93000000u, 50000000ULL);
+        mk_block(&orphan, bogus, 1960000002u);
+        ck("prevhash gate REJECTS a block chaining to nothing we have",
+           store_validates_prevhash(store_buf, orphan.raw), 0);
+    }
+
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE: node_sync_multi -- the assembly sync loop driven with a REAL          */
 /*       multi-hash locator.                                                   */
 /*                                                                             */
@@ -1194,6 +1350,7 @@ int main(void){
     total += run_case("mempool reconciliation",         case_mempool);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
+    total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);
 
     printf("\n%s (%d failures)\n", total ? "TESTS FAILED" : "ALL TESTS PASSED", total);
     return total ? 1 : 0;

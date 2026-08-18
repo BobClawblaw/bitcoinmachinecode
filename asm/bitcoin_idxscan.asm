@@ -45,6 +45,7 @@ default rel
 %define IDXSCAN_BUFBYTES (IDXSCAN_BUFRECS*48)
 
 extern store_append_shared
+extern store_append_shared_nolock
 
 section .text
 
@@ -297,6 +298,72 @@ idxscan_append_locked:
     imul rcx, 48
     mov  [r12+16], rcx         ; idx_len = (height+1)*48
 .ret:
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; idxscan_append_nolocked(st, hash[32], raw, len)   (rdi,rsi,rdx,rcx)
+;   -> rax: height on success, -1 on error.   STAGE B.
+;
+;   idxscan_append_locked, MINUS all locking. For a caller that is ALREADY
+;   holding the st+40 append flock across a longer critical section and must
+;   not have it dropped underneath it.
+;
+;   The bug this exists to fix: idxscan_append_locked takes LOCK_EX itself and
+;   delegates to store_append_shared, which unconditionally does LOCK_UN on the
+;   way out of EVERY call. daemon/reorg.c needs the lock held across
+;   pre-flight + disconnect + truncate + the entire reconnect loop; with the
+;   plain function, the very first reconnected block's LOCK_UN would silently
+;   release the reorg's own outer hold, leaving every remaining reconnect
+;   append -- and the window between them -- unprotected against an inbound
+;   serve child appending onto a half-rebuilt chain. Re-acquiring is a no-op
+;   on Linux (flock is per-open-file-description, not counting), so only the
+;   release had to be removed.
+;
+;   The read-true-tip-then-write sequence is still atomic FOR THIS CALLER,
+;   because the caller holds the same lock the whole time -- which is a
+;   stronger guarantee than idxscan_append_locked's own per-call critical
+;   section, not a weaker one. Calling this WITHOUT already holding that lock
+;   is a bug; there is no way for it to check.
+;
+;   Register/stack layout, tip computation and st+16/st+24 refresh are
+;   otherwise identical to idxscan_append_locked -- see that function's header
+;   for the rationale behind each.
+; ----------------------------------------------------------------------------
+global idxscan_append_nolocked
+idxscan_append_nolocked:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  r12, rdi            ; st
+    mov  r13, rsi            ; hash
+    mov  r14, rdx            ; raw
+    mov  r15, rcx            ; len
+    ; ---- true current tip, hole-aware (caller's lock is already held) ----
+    call idxscan_tip           ; -> rax = tip (-1 if empty)
+    lea  rbx, [rax+1]          ; height = tip + 1 (callee-saved across the call below)
+    mov  rdi, r12
+    mov  rsi, rbx
+    mov  rdx, r13
+    mov  rcx, r14
+    mov  r8,  r15
+    call store_append_shared_nolock
+    cmp  rax, -1
+    je   .nlret
+    mov  dword [r12+24], eax   ; tip_height = height
+    lea  rcx, [rax+1]
+    imul rcx, 48
+    mov  [r12+16], rcx         ; idx_len = (height+1)*48
+.nlret:
     pop  r15
     pop  r14
     pop  r13

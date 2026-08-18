@@ -1081,8 +1081,43 @@ store_append:
 ;   Returns height on success, -1 on error.
 ;   Frame: 5 pushes (rbx,r12-r15) -> save area rbp-8..-0x28; locals below.
 ; ============================================================================
+; ---------------------------------------------------------------------------
+; STAGE B: two entry points over one body.
+;
+;   store_append_shared(st, height, hash, raw, len)
+;       Unchanged behaviour and unchanged signature: takes the append flock
+;       for the duration of this one call and drops it on the way out. Every
+;       pre-existing caller keeps exactly this.
+;
+;   store_append_shared_nolock(st, height, hash, raw, len)
+;       Identical, MINUS the flock acquire/release pair -- for a caller that
+;       is already holding that lock itself across a longer critical section.
+;       daemon/reorg.c is the only such caller: a reorg has to hold the append
+;       lock across pre-flight + disconnect + truncate + the whole reconnect
+;       loop, and the plain function's unconditional LOCK_UN at the end of
+;       EVERY call would silently drop that outer hold after the first
+;       reconnected block -- reopening the exact race the outer lock exists to
+;       close (an inbound serve child appending onto a half-rebuilt chain).
+;       Re-acquiring flock on an fd you already hold is a harmless no-op on
+;       Linux (flock is per-open-file-description, not counting), so it is the
+;       *release*, not the acquire, that had to become conditional.
+;
+;   Implemented as a shared body with a 6th `dolock` argument in r9 rather
+;   than a copy, so the ~150 lines of append logic can never drift between the
+;   two. Both entry points tail-jump in, preserving the return address and all
+;   five register arguments untouched.
+; ---------------------------------------------------------------------------
 global store_append_shared
 store_append_shared:
+    mov  r9d, 1
+    jmp  store_append_shared_x
+
+global store_append_shared_nolock
+store_append_shared_nolock:
+    xor  r9d, r9d
+    jmp  store_append_shared_x
+
+store_append_shared_x:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -1096,7 +1131,14 @@ store_append_shared:
     mov  r14, rdx            ; hash
     mov  r15, rcx            ; raw
     mov  [rbp-0x30], r8      ; len (below save area)
-    ; ---- acquire shared append lock ----
+    ; dolock at rbp-0xA0: this frame already uses -0x30/-0x38/-0x40/-0x48/
+    ; -0x5c/-0x60 and a 48-byte record buffer based at -0x90 (spanning
+    ; [-0x90,-0x60)), so -0xA0 is the first clear qword below all of them and
+    ; is well inside rsp (= rbp-0x148). MUST be stored before the acquire below.
+    mov  [rbp-0xA0], r9      ; dolock (1 = take/release the flock here)
+    ; ---- acquire shared append lock (skipped when the caller holds it) ----
+    cmp  qword [rbp-0xA0], 0
+    je   .hlock
     mov  rdi, [r12+40]
     test rdi, rdi
     js   .hlock
@@ -1212,7 +1254,10 @@ store_append_shared:
     syscall
     cmp  rax, 48
     jne  .herr
-    ; ---- release lock ----
+    ; ---- release lock (ONLY if we took it -- see the entry-point comment:
+    ; releasing a lock the caller owns is what silently broke reorg's hold) ----
+    cmp  qword [rbp-0xA0], 0
+    je   .hlkdone
     mov  rdi, [r12+40]
     test rdi, rdi
     js   .hlkdone
@@ -1223,6 +1268,8 @@ store_append_shared:
     mov  rax, r13
     jmp  .hret
 .herr:
+    cmp  qword [rbp-0xA0], 0
+    je   .hlkerr2
     mov  rdi, [r12+40]
     test rdi, rdi
     js   .hlkerr2
