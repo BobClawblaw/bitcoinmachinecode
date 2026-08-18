@@ -193,7 +193,23 @@ tests/test_block_genesis: tests/test_block_genesis.c $(CONSOBJS)
 # bitcoind: handshake + version builder (networked). node_sync also calls
 # cons_verify + store_append, so DAEMONOBJS must include those objects.
 # node_ibd_headers references hst_append (bitcoin_headers.asm), so include it.
-DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_idxscan.o
+# NOTE: this must be the FULL object list (matching the daemon/bitcoind link
+# below) -- prerequisite lists are expanded at parse time, not build time, so
+# an earlier/short DAEMONOBJS here would silently drop objects the later
+# reassignment adds, even though the recipe line (expanded at build time)
+# would look correct. A prior duplicate short definition caused exactly that:
+# tests/test_bitcoind linked fine only because stale .o files happened to
+# already exist on disk from earlier incremental builds; a clean rebuild
+# failed with "cannot find X.o" at the final link step.
+DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
+              bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
+              bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o \
+              bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
+              bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
+              secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
+              bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
+              secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
+              bitcoin_chainwork.o
 
 tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
@@ -685,16 +701,8 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # daemon/bitcoind -- the runnable core node driver (sync/ibd/follow/serve/
 # server-test). This is a REAL target so the daemon never goes stale or suffers
 # a missing-object link, unlike the old ad-hoc manual gcc command. -O0 required
-# (an -O2 rebuild regressed lsock's bind to EFAULT).
-DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
-              bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
-              bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o \
-              bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
-              bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
-              secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-              bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
-              secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
-              bitcoin_chainwork.o
+# (an -O2 rebuild regressed lsock's bind to EFAULT). DAEMONOBJS is defined
+# once, above, near its first use (tests/test_bitcoind) -- see the note there.
 # STAGE B adds daemon/reorg.c (fork choice / reorg engine), daemon/undo_log.c
 # (per-block undo data, now wired into the live apply path) and
 # daemon/locator_build.c (the real multi-hash block locator), plus
