@@ -420,6 +420,7 @@ node_serve_loop:
     lea  rdi, [sb_buf+0x200000]
     mov  rsi, [s_lastheight]
     mov  rdx, [s_plen]
+    lea  rcx, [pl_buf]
     call log_block_stored_inbound
     ; bump the served/blocks counter + tip-watch will announce the new tip next
     ; iteration (s_lasttip is stale -> .next announces it exactly once).
