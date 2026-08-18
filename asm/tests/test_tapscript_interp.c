@@ -90,13 +90,14 @@ static int run_script(const char* script_hex,
     return script_eval(&st);
 }
 
-/* Internal error codes (match bitcoin_interp.asm %defines). */
-enum {
-    ERR_OK=0, ERR_EVAL_FALSE=2, ERR_BAD_OPCODE=8, ERR_DISABLED=9,
-    ERR_INVALID_STACK_OPERATION=16, ERR_UNBALANCED=15,
-    ERR_TAPSCRIPT_MINIMALIF=50, ERR_TAPSCRIPT_CHECKMULTISIG=51,
-    ERR_DISCOURAGE_OP_SUCCESS=52, ERR_CLEANSTACK=53
-};
+/* Error codes come from the GENERATED header, never a local copy.
+ * This file used to carry its own enum of the interpreter's old private
+ * numbering. When bitcoin_interp.asm was corrected to emit Bitcoin Core's
+ * own ScriptError values, all twelve of this test's expectations were
+ * suddenly wrong -- the test was stale, not the interpreter. Sharing one
+ * generated source removes that failure mode entirely.
+ * Regenerate with validation/gen_script_error_defines.py. */
+#include "script_error_codes.h"
 #define FLAG_DISCOURAGE_OP_SUCCESS (1ull<<18)
 #define FLAG_MINIMALIF (1ull<<13)
 #define SIGV_BASE 0
@@ -132,36 +133,36 @@ int main(void)
         is_opsuccess_c(0xac) || is_opsuccess_c(0xb1)) { printf("  FAIL is_opsuccess negatives\n"); g_fails++; }
 
     printf("tapscript OP_SUCCESSx semantics (BIP342 ExecuteWitnessScript):\n");
-    check_run("bare OP_SUCCESSx (0xbb)",    "bb", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
-    check_run("OP_1 OP_SUCCESSx",           "51bb", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
-    check_run("OP_SUCCESSx w/ discourage",  "51bb", SIGV_TAPSCRIPT, FLAG_DISCOURAGE_OP_SUCCESS, 0, ERR_DISCOURAGE_OP_SUCCESS);
-    check_run("push then OP_SUCCESSx",      "02aabb", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
-    check_run("SUCCESS in dead branch",     "00 63 bb 68", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
+    check_run("bare OP_SUCCESSx (0xbb)",    "bb", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
+    check_run("OP_1 OP_SUCCESSx",           "51bb", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
+    check_run("OP_SUCCESSx w/ discourage",  "51bb", SIGV_TAPSCRIPT, FLAG_DISCOURAGE_OP_SUCCESS, 0, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
+    check_run("push then OP_SUCCESSx",      "02aabb", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
+    check_run("SUCCESS in dead branch",     "00 63 bb 68", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
 
     printf("tapscript cleanstack / empty-stack treatment:\n");
-    check_run("empty script + empty stack", "", SIGV_TAPSCRIPT, 0, 0, ERR_CLEANSTACK);
-    check_run("OP_0 single (false top)",    "00", SIGV_TAPSCRIPT, 0, 0, ERR_EVAL_FALSE);
-    check_run("OP_1 single (valid)",        "51", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
-    check_run("two items -> non-clean",     "5151", SIGV_TAPSCRIPT, 0, 0, ERR_CLEANSTACK);
-    check_run("push+2drop leaves empty",    "51516d", SIGV_TAPSCRIPT, 0, 0, ERR_CLEANSTACK);
-    check_run("empty via IF empty true",    "516368", SIGV_TAPSCRIPT, 0, 0, ERR_CLEANSTACK);
-    check_run("IF(true){1} -> [1] valid",   "51635168", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
+    check_run("empty script + empty stack", "", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_CLEANSTACK);
+    check_run("OP_0 single (false top)",    "00", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_EVAL_FALSE);
+    check_run("OP_1 single (valid)",        "51", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
+    check_run("two items -> non-clean",     "5151", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_CLEANSTACK);
+    check_run("push+2drop leaves empty",    "51516d", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_CLEANSTACK);
+    check_run("empty via IF empty true",    "516368", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_CLEANSTACK);
+    check_run("IF(true){1} -> [1] valid",   "51635168", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
 
     printf("tapscript gating (opcode set):\n");
-    check_run("CHECKSIGVERIFY forbidden",   "5151ad", SIGV_TAPSCRIPT, 0, 0, ERR_BAD_OPCODE);
-    check_run("CHECKMULTISIG forbidden",    "5151ae", SIGV_TAPSCRIPT, 0, 0, ERR_TAPSCRIPT_CHECKMULTISIG);
-    check_run("CHECKMULTISIGVERIFY forb.",  "5151af", SIGV_TAPSCRIPT, 0, 0, ERR_TAPSCRIPT_CHECKMULTISIG);
-    check_run("CHECKSIGADD valid (undeflow->stackerr)", "ba", SIGV_TAPSCRIPT, 0, 0, ERR_INVALID_STACK_OPERATION);
-    check_run("CHECKSIGADD BAD in BASE",    "ba", SIGV_BASE, 0, 0, ERR_BAD_OPCODE);
-    check_run("undefined 0xbb BAD in BASE", "bb", SIGV_BASE, 0, 0, ERR_BAD_OPCODE);
+    check_run("CHECKSIGVERIFY forbidden",   "5151ad", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_BAD_OPCODE);
+    check_run("CHECKMULTISIG forbidden",    "5151ae", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
+    check_run("CHECKMULTISIGVERIFY forb.",  "5151af", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
+    check_run("CHECKSIGADD valid (undeflow->stackerr)", "ba", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_INVALID_STACK_OPERATION);
+    check_run("CHECKSIGADD BAD in BASE",    "ba", SIGV_BASE, 0, 0, SCRIPT_ERR_BAD_OPCODE);
+    check_run("undefined 0xbb BAD in BASE", "bb", SIGV_BASE, 0, 0, SCRIPT_ERR_BAD_OPCODE);
 
     printf("tapscript MINIMALIF (consensus rule, unconditional per Core):\n");
     /* tapscript requires the IF/NOTIF condition to be empty or exactly [0x01];
        non-minimal conditions fail with TAPSCRIPT_MINIMALIF regardless of flags. */
-    check_run("MINIMALIF non-minimal cond",  "020100635168", SIGV_TAPSCRIPT, 0, 0, ERR_TAPSCRIPT_MINIMALIF);
-    check_run("MINIMALIF 1-byte non-1 cond", "0151635168", SIGV_TAPSCRIPT, 0, 0, ERR_TAPSCRIPT_MINIMALIF);
-    check_run("MINIMALIF OP_0 cond ok",      "00635168", SIGV_TAPSCRIPT, 0, 0, ERR_CLEANSTACK);
-    check_run("MINIMALIF OP_1 cond ok",      "51635168", SIGV_TAPSCRIPT, 0, 1, ERR_OK);
+    check_run("MINIMALIF non-minimal cond",  "020100635168", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_TAPSCRIPT_MINIMALIF);
+    check_run("MINIMALIF 1-byte non-1 cond", "0151635168", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_TAPSCRIPT_MINIMALIF);
+    check_run("MINIMALIF OP_0 cond ok",      "00635168", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_CLEANSTACK);
+    check_run("MINIMALIF OP_1 cond ok",      "51635168", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
 
     printf("\n%s\n", g_fails ? "TAPSCRIPT_INTERP FAILED" : "TAPSCRIPT_INTERP PASSED");
     return g_fails ? 1 : 0;
