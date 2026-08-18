@@ -904,6 +904,48 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
 /* pick up to n distinct public IPv4 endpoints from the amr book into
  * out[i] = "a.b.c.d" (IP only; the downloader dials each on the standard
  * out_port, matching how outbound_connect/serve_mux treat all peers). */
+/* ---- known-good peer memory (peers.good) ---------------------------------
+ * The address book records that an IP was SEEN, never that it was any use.
+ * So every boot re-probed ~2,000 aged entries, kept whichever ~4% happened to
+ * answer, and threw away the hard-won knowledge of which peers actually
+ * delivered blocks -- the ones that worked last run got no preference at all
+ * over long-dead entries. Persist the peers that really produced blocks and
+ * try them FIRST next time.
+ *
+ * Deliberately a plain newline-separated IP text file: it is tiny, trivially
+ * inspectable, and a corrupt/missing one degrades to exactly the old
+ * behaviour (probe the book) rather than breaking startup. */
+#define DL_GOODPEERS_FILE "peers.good"
+#define DL_GOODPEERS_MAX  256
+
+static int dl_load_good_peers(char out[][64], int cap){
+    FILE* f = fopen(DL_GOODPEERS_FILE, "r");
+    if(!f) return 0;
+    int n=0; char line[128];
+    while(n<cap && fgets(line,sizeof line,f)){
+        size_t L=strlen(line);
+        while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
+        if(!L) continue;
+        struct in_addr t;
+        if(inet_pton(AF_INET,line,&t)!=1) continue;   /* ignore junk lines */
+        strncpy(out[n],line,63); out[n][63]=0; n++;
+    }
+    fclose(f);
+    return n;
+}
+
+/* Written atomically (tmp+rename) so a crash mid-write cannot leave a
+ * truncated list that silently shrinks the next boot's head start. */
+static void dl_save_good_peers(char peers[][64], int n){
+    if(n<=0) return;
+    FILE* f = fopen(DL_GOODPEERS_FILE ".tmp","w");
+    if(!f) return;
+    for(int i=0;i<n && i<DL_GOODPEERS_MAX;i++) fprintf(f,"%s\n",peers[i]);
+    fflush(f); fsync(fileno(f)); fclose(f);
+    rename(DL_GOODPEERS_FILE ".tmp", DL_GOODPEERS_FILE);
+    fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
+}
+
 static int dl_pool_from_book(void* ab, char out[][64], int nitems){
     long cnt=amr_count(ab); if(cnt<=0) return 0;
     unsigned char rec[18]; int got=0;
@@ -966,7 +1008,14 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
  * with a proportionally shorter budget gives a ~4x faster detect-and-replace
  * cycle at ~4x lower cost per miss. */
 #define DLC_CHUNK_BLOCKS 40
-#define DLC_MAXPOOL 512
+/* Draw from the WHOLE address book, not a 512 slice of it. Measured
+ * 2026-08-18: the book held 1,974 peers, the pool was capped at 512, the
+ * probe tried all 512 and only 22 were reachable (~4% -- normal for an aged
+ * book full of long-dead nodes). That left ~1,460 candidates untried and the
+ * downloader running on 22 peers, which is also what made peer-banning
+ * exhaust the pool. Probing is nearly free -- dead peers refuse instantly,
+ * so all 512 were covered in 0.49s -- so there is no reason to sample. */
+#define DLC_MAXPOOL 2048
 #define DLC_HDR_TRY_PEERS 8
 /* wall-clock budget for ONE chunk transfer. At DLC_CHUNK_BLOCKS=40
  * (~50-60MB near the real tip), 120s requires ~467KB/s sustained to
@@ -992,6 +1041,14 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
  * judge against a floor that reflects what a useful peer actually delivers. */
 #define DLC_DEAD_WEIGHT_BPS 32768.0
 #define DLC_DEAD_WEIGHT_TICKS 3
+/* Never ban the pool down to nothing. Banning is only an optimisation -- a
+ * banned peer is worth less than an unbanned one, but ANY peer beats none.
+ * The first cut of this had no floor and, against a 22-peer live pool,
+ * banned 28 slots: every worker hit "peers exhausted" (logged 20,495 times),
+ * the chunked downloader gave up after 24,720 blocks, and the sync fell back
+ * to the slow sequential path. Keep a working set alive, and grant amnesty
+ * rather than deadlock if we somehow still run dry. */
+#define DLC_MIN_USABLE_PEERS 8
 
 /* true iff every height in [lo,hi] already has a non-zero index.dat record.
  * asm/bitcoin_idxscan.asm:idxscan_all_present -- buffered pread64 port,
@@ -1193,6 +1250,17 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                 }
                 if(!ok){
                     stalled++;
+                    /* Could not connect to ANY unbanned peer. Bans are an
+                     * optimisation, not a correctness property, so lift them
+                     * rather than stall the download: a slow peer beats no
+                     * peer, and a permanently-empty pool is how this used to
+                     * spin, printing "peers exhausted" 20,495 times while the
+                     * sync went nowhere. Amnesty is idempotent and cheap. */
+                    if(stalled==10 || stalled==25){
+                        int lifted=0;
+                        for(int q=0;q<nlive;q++) if(banned[q]){ banned[q]=0; lifted++; }
+                        if(lifted) fprintf(stderr,"[dlc w%d] no reachable peer -- amnesty, un-banned %d peer(s)\n", w, lifted);
+                    }
                     if(stalled>40){ fprintf(stderr,"[dlc w%d] peers exhausted\n",w); break; }
                     sleep(3); slot=(slot+7)%(nlive>0?nlive:1); continue;
                 }
@@ -1379,7 +1447,24 @@ static long dl_catchup(const char* dir, int min_workers){
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
 
     static char pool[DLC_MAXPOOL][64];
-    int npool=dl_pool_from_book(ab, pool, DLC_MAXPOOL);
+    /* Known-good peers first: these actually delivered blocks on a previous
+     * run, so they are worth far more than an arbitrary book entry. The book
+     * fills the rest; duplicates are harmless (the probe just confirms one
+     * twice) and the claimed[] logic already prevents two workers sharing a
+     * peer. */
+    int ngood = dl_load_good_peers(pool, DLC_MAXPOOL);
+    int npool = ngood;
+    {
+        static char book[DLC_MAXPOOL][64];
+        int nbook = dl_pool_from_book(ab, book, DLC_MAXPOOL);
+        for(int i=0;i<nbook && npool<DLC_MAXPOOL;i++){
+            int dup=0;
+            for(int j=0;j<ngood;j++) if(!strcmp(book[i],pool[j])){ dup=1; break; }
+            if(dup) continue;
+            strncpy(pool[npool],book[i],63); pool[npool][63]=0; npool++;
+        }
+    }
+    if(ngood) fprintf(stderr,"[dlc] %d known-good peer(s) from a previous run tried first\n", ngood);
     fprintf(stderr,"[dlc] %d candidate peer(s) in pool\n", npool);
     if(npool<=0){ fprintf(stderr,"[dlc] no peers discovered; skipping catch-up\n"); return 0; }
 
@@ -1393,7 +1478,10 @@ static long dl_catchup(const char* dir, int min_workers){
      * so under-populating `live[]` here directly costs catch-up depth. */
     static char live[DLC_MAXPOOL][64]; int nlive=0;
     {
-        int want = min_workers*3; if(want>npool) want=npool;
+        /* Target a deep live pool: workers*3 was sized before peers could be
+         * banned, and left no headroom -- evicting duds then starved the
+         * downloader outright. Aim for 6x so eviction has room to work. */
+        int want = min_workers*6; if(want>npool) want=npool;
         int from=0, rounds=0;
         /* no arbitrary round cap: keep probing until either `want` is hit or
          * the WHOLE discovered pool has been tried (from<npool already
@@ -1519,7 +1607,13 @@ static long dl_catchup(const char* dir, int min_workers){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=DLC_DEAD_WEIGHT_TICKS){
                         long bidx = stats[w].held_idx;
-                        if(bidx>=0 && bidx<nlive && !banned[bidx]){ banned[bidx]=1; nbanned++; }
+                        if(bidx>=0 && bidx<nlive && !banned[bidx]){
+                            int usable=0; for(int q=0;q<nlive;q++) if(!banned[q]) usable++;
+                            if(usable > DLC_MIN_USABLE_PEERS){ banned[bidx]=1; nbanned++; }
+                            /* else: at the floor -- still kill the worker so it
+                             * rotates to a different peer, but keep this one
+                             * selectable. A slow peer beats no peer. */
+                        }
                         kill(opid[w],SIGUSR1);
                         dead_ticks[w]=0;
                         snprintf(flag,sizeof flag," [early-kill sent, last %s, peer BANNED]",bw);
@@ -1574,6 +1668,24 @@ static long dl_catchup(const char* dir, int min_workers){
     munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
     munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
     munmap((void*)claimed,sizeof(int)*(size_t)nlive);
+    /* Remember who actually produced blocks. A peer that delivered is worth
+     * trying first next boot; the address book alone only records that an IP
+     * was once seen, which is why every restart re-probed ~2,000 aged entries
+     * and rediscovered the same handful from scratch. Recorded from the live
+     * stats, and only for peers with blocks>0 -- being reachable is not the
+     * same as being useful. */
+    {
+        static char good[64][64]; int ngood=0;
+        for(int w=0; w<nw && ngood<64; w++){
+            if(stats[w].blocks<=0) continue;
+            const char* ip=(const char*)stats[w].peer;
+            if(!ip[0]) continue;
+            int dup=0; for(int j=0;j<ngood;j++) if(!strcmp(good[j],ip)){ dup=1; break; }
+            if(dup) continue;
+            strncpy(good[ngood],ip,63); good[ngood][63]=0; ngood++;
+        }
+        dl_save_good_peers(good, ngood);
+    }
     fprintf(stderr,"[dlc] catch-up done: %ld new blocks written\n", total);
     return total;
 }
