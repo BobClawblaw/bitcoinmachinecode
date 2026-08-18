@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include "node_config.h"
 #include "utxo_walk.h"
 #include "log_ts.h"
 
@@ -486,15 +487,15 @@ int utxo_live_init(const char* dir){
     long boot_applied = read_applied_height();
     long boot_tip     = utxo_live_index_tip();
     long boot_gap     = (boot_tip >= 0) ? (boot_tip - boot_applied) : 0;
-    g_bulk_mode = (boot_gap >= UTXO_LIVE_BULK_GAP_BLOCKS);
+    g_bulk_mode = (boot_gap >= g_cfg.utxo_bulk_gap_blocks);
 
-    unsigned long slots = g_bulk_mode ? (1UL << UTXO_LIVE_BULK_SLOTS_LOG2)
+    unsigned long slots = g_bulk_mode ? (1UL << g_cfg.utxo_bulk_slots_log2)
                                       : (1UL << UTXO_LIVE_SLOTS_LOG2);
-    u64 blob_cap = g_bulk_mode ? UTXO_LIVE_BULK_BLOB_BYTES : UTXO_LIVE_BLOB_BYTES;
+    u64 blob_cap = g_bulk_mode ? ((u64)g_cfg.utxo_bulk_blob_mb << 20) : UTXO_LIVE_BLOB_BYTES;
     fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB\n",
             g_bulk_mode ? "BULK -- far behind, batch-sized memtable" : "steady-state",
             boot_applied, boot_tip, boot_gap,
-            g_bulk_mode ? UTXO_LIVE_BULK_SLOTS_LOG2 : UTXO_LIVE_SLOTS_LOG2,
+            g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
             (unsigned long long)(blob_cap >> 20));
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
@@ -575,7 +576,7 @@ int utxo_live_init(const char* dir){
 
     g_applied_height = read_applied_height();
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
-            dir, g_bulk_mode ? UTXO_LIVE_BULK_SLOTS_LOG2 : UTXO_LIVE_SLOTS_LOG2,
+            dir, g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
             have_prior_state ? "reload" : "fresh",
             g_applied_height, g_utxo_lst.manifest_n, utxo_lsm_count(&g_utxo_lst));
     return 1;
