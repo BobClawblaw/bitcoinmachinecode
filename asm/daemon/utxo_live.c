@@ -245,6 +245,34 @@ int utxo_live_init(const char* dir){
     int ok = have_prior_state ? (r != -1) : (r == 1);
     if (!ok) { fprintf(stderr, "[utxo_live] utxo_lsm_%s failed\n", have_prior_state ? "reload" : "init"); return 0; }
 
+    /* A reloaded manifest can already be at or near UTXO_LIVE_MANIFEST_CAP --
+     * e.g. a batch-scale seed (build_utxo.c, much larger manifest_cap) can
+     * leave exactly this many runs behind at its checkpoint, with zero
+     * headroom left for the live daemon's own first flush. mac_flush's own
+     * manifest-capacity guard (bitcoin_utxo_lsm.asm, right before any
+     * sort/bloom/run-file work) refuses to add a run once manifest_n >=
+     * manifest_cap, so utxo_lsm_put/del would return -1 (fatal, per
+     * live_on_output/live_on_input) on literally the first op that crosses
+     * op_threshold/fill_threshold -- and utxo_live_catchup only calls
+     * utxo_lsm_compact() AFTER a successful (applied>0) batch, so a
+     * catch-up call that fails on its very first block never gets a chance
+     * to shrink the manifest on its own: full manifest -> fatal flush ->
+     * catch-up aborts before any block succeeds -> compact() never runs ->
+     * manifest stays full forever. Break that deadlock here, once, before
+     * any block is applied: proactively compact down while there's still
+     * more than one run to merge and we're above the same threshold normal
+     * steady-state catch-up uses (UTXO_LIVE_COMPACT_THRESHOLD). Bounded by
+     * manifest_cap iterations so a compact() that stops making progress
+     * (e.g. every remaining run already merged) can't spin forever. */
+    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && guard < UTXO_LIVE_MANIFEST_CAP; guard++){
+        u64 before = g_utxo_lst.manifest_n;
+        if (before < 2) break;
+        long cr = utxo_lsm_compact(&g_utxo_lst);
+        fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
+                (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
+        if (g_utxo_lst.manifest_n >= before) break; /* no progress -- stop rather than loop */
+    }
+
     g_applied_height = read_applied_height();
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
             dir, UTXO_LIVE_SLOTS_LOG2, have_prior_state ? "reload" : "fresh",
