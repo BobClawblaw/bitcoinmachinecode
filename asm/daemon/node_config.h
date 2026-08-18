@@ -48,6 +48,7 @@ typedef struct {
     int  port;                   /* Core -port                               */
     int  listen;                 /* Core -listen                             */
     int  blocksonly;             /* Core -blocksonly: no tx relay            */
+    char bind_addr[64];          /* Core -bind: listen address (empty = any) */
 } node_config_t;
 
 extern node_config_t g_cfg;
