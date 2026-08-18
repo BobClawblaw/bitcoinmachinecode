@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -106,6 +107,30 @@ static int init_utxo_store(const char* datadir) {
     return 1;
 }
 
+/* mmap the address index (asm/daemon/build_addr_index.c's output,
+ * "addr_index.dat" in the data directory) read-only, for listunspent/
+ * getbalance. Optional: if the file doesn't exist yet (the index hasn't
+ * been built), those commands just report "owns nothing" rather than
+ * failing the whole daemon -- matches gettxout's "not configured" story.
+ * Must run AFTER init_utxo_store's chdir(datadir), since this opens a
+ * relative filename in the same directory. */
+static int init_addr_index(void) {
+    int fd = open("addr_index.dat", O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "bitcoin_rpcd: no addr_index.dat (listunspent/getbalance will report empty) -- %s\n", strerror(errno));
+        return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { fprintf(stderr, "bitcoin_rpcd: fstat(addr_index.dat): %s\n", strerror(errno)); close(fd); return 0; }
+    u64 size = (u64)st.st_size;
+    void* base = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) { fprintf(stderr, "bitcoin_rpcd: mmap(addr_index.dat): %s\n", strerror(errno)); return 0; }
+    rpc_commands_set_addr_index(base, size);
+    fprintf(stderr, "bitcoin_rpcd: address index loaded (%llu bytes)\n", size);
+    return 1;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -179,8 +204,10 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                 "Bitcoin Core RPC server\n\n"
                 "usage: bitcoin_rpcd [-conf=<path>] [-datadir=<path>] [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]\n"
-                "  -datadir=<path>  enables real gettxout against the LSM UTXO store in <path>\n"
-                "                   (omit to serve gettxout as \"not found\" for everything)\n");
+                "  -datadir=<path>  enables real gettxout against the LSM UTXO store in <path>,\n"
+                "                   and (if <path>/addr_index.dat exists, see daemon/build_\n"
+                "                   addr_index.c) real listunspent/getbalance\n"
+                "                   (omit to serve those as \"not found\"/empty for everything)\n");
             return 0;
         }
     }
@@ -193,9 +220,15 @@ int main(int argc, char** argv) {
 
     init_wallet();
 
-    if (datadir && !init_utxo_store(datadir)) {
-        fprintf(stderr, "bitcoin_rpcd: UTXO store init failed for -datadir=%s\n", datadir);
-        return 1;
+    if (datadir) {
+        if (!init_utxo_store(datadir)) {
+            fprintf(stderr, "bitcoin_rpcd: UTXO store init failed for -datadir=%s\n", datadir);
+            return 1;
+        }
+        if (!init_addr_index()) {
+            fprintf(stderr, "bitcoin_rpcd: address index init failed\n");
+            return 1;
+        }
     }
 
     rpc_server_cfg cfg;
