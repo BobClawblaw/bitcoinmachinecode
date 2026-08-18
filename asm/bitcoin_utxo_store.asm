@@ -590,12 +590,14 @@ utxo_store_sync:
 ;       from st->ckpt_log_off to end, applying PUSH/DEL in order (restart-resume).
 ;
 ;   5 pushes -> save area [rbp-8..-0x40]; locals at <= -0x48.
-;   Buffer layout (all safely in the 0x160 frame, non-overlapping):
-;     [rbp-0x100] 46-byte fixed record buffer: txid@-0x100 idx@-0xE0
-;                 value@-0xDC slen(u16)@-0xD4
-;     [rbp-0x140] script scratch
-;     [rbp-0x150] consumed-offset counter
-;     [rbp-0x48]  slen local (qword)
+;   Buffer layout (all safely in the 0x160+65536 frame, non-overlapping):
+;     [rbp-0x100]    46-byte fixed record buffer: txid@-0x100 idx@-0xE0
+;                    value@-0xDC slen(u16)@-0xD4
+;     [rbp-0x10158]  script scratch (65536+ bytes of room, growing UP toward
+;                    rbp -- must stay far from rbp so a max-size script can
+;                    never reach it; see the frame-size comment below)
+;     [rbp-0x150]    consumed-offset counter
+;     [rbp-0x48]     slen local (qword)
 ;   r12=st r13=u r14=read fd r15=replayed counter rbx=log end offset.
 ; ============================================================================
 global utxo_store_reload
@@ -607,15 +609,20 @@ utxo_store_reload:
     push r13
     push r14
     push r15
-    ; frame enlarged from the original 0x160 -- the script scratch buffer at
-    ; [rbp-0x140] (used by both .ckpt_loop and .rep_push below) only had
-    ; ~0x20 bytes of real margin before this fix, but a script's slen can be
-    ; up to 65535 (SCRIPT_MAX_BYTES-1): a real WAL/checkpoint script over
-    ; ~32 bytes -- routine for real Bitcoin scripts -- smashed the stack
-    ; (return addresses included) reading past it. This never showed up in
-    ; testing because every test fixture used tiny (<32-byte) scripts; a
-    ; real replay's WAL tail with real-sized scripts crashes reliably.
-    ; +65536 gives [rbp-0x140] a full SCRIPT_MAX_BYTES of safe room below it.
+    ; frame enlarged from the original 0x160. The script scratch buffer used
+    ; to live at [rbp-0x140], a mere 0x140 (320) bytes from rbp -- but a
+    ; script's slen can be up to 65535 (SCRIPT_MAX_BYTES-1), and the buffer
+    ; is filled by copying FORWARD (increasing addresses, i.e. TOWARD rbp).
+    ; Any script over ~320 bytes -- routine for real Bitcoin scripts -- wrote
+    ; straight through the saved rbp and the return address into the
+    ; CALLER's frame. Merely growing the frame downward (the first attempted
+    ; fix) did nothing, since that only adds room on the far side of the
+    ; buffer, away from the direction it actually overflows. The real fix:
+    ; the buffer was RELOCATED to [rbp-0x10158], near the bottom of this
+    ; enlarged frame, so a max-size copy (ending at [rbp-0x159]) still lands
+    ; nowhere near rbp. This never showed up in testing because every test
+    ; fixture used tiny (<320-byte) scripts; the real replay's WAL has at
+    ; least one script with slen=1690, which crashes it reliably.
     sub  rsp, 0x160+65536
     mov  r12, rdi
     mov  r13, rsi
@@ -685,9 +692,9 @@ utxo_store_reload:
     mov  rdx, rax
     test rdx, rdx
     jz   .ckpt_put
-    ; read script into [rbp-0x140] scratch
+    ; read script into [rbp-0x10158] scratch
     mov  rdi, r14
-    lea  rsi, [rbp-0x140]
+    lea  rsi, [rbp-0x10158]
     call mac_read_exact
     test rax, rax
     jnz  .ckpt_done
@@ -696,7 +703,7 @@ utxo_store_reload:
     lea  rsi, [rbp-0x100]   ; txid
     mov  edx, [rbp-0xE0]    ; index
     mov  rcx, [rbp-0xDC]    ; value
-    lea  r8,  [rbp-0x140]   ; script
+    lea  r8,  [rbp-0x10158]   ; script
     mov  r9,  [rbp-0x48]    ; slen
     call utxo_put
     inc  r15
@@ -767,9 +774,9 @@ utxo_store_reload:
     mov  rdx, rax
     test rdx, rdx
     jz   .rep_push_apply
-    ; read script into [rbp-0x140] scratch
+    ; read script into [rbp-0x10158] scratch
     mov  rdi, r14
-    lea  rsi, [rbp-0x140]
+    lea  rsi, [rbp-0x10158]
     call mac_read_exact
     test rax, rax
     jnz  .rep_close
@@ -778,7 +785,7 @@ utxo_store_reload:
     lea  rsi, [rbp-0x100]  ; txid
     mov  edx, [rbp-0xE0]   ; index
     mov  rcx, [rbp-0xDC]   ; value
-    lea  r8,  [rbp-0x140]  ; script
+    lea  r8,  [rbp-0x10158]  ; script
     mov  r9,  [rbp-0x48]   ; slen
     call utxo_put
     mov  rax, [rbp-0x48]
