@@ -216,7 +216,7 @@ tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 # directly (renaming its main) and therefore links the same objects the daemon
 # does, minus daemon/main.c itself (it comes in via the #include).
 DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/tx_accept.c \
-            daemon/reorg.c daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c \
+            daemon/reorg.c daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
             bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DIALSRCS) $(DAEMONOBJS)
@@ -747,7 +747,7 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # bitcoin_chainwork.o for the cumulative-work primitives they run on.
 DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/tx_accept.c \
               daemon/reorg.c daemon/undo_log.c daemon/locator_build.c \
-              daemon/archive_verify.c \
+              daemon/archive_verify.c daemon/addr_ingest.c \
               bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS)

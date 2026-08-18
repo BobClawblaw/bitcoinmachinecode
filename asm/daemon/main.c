@@ -126,6 +126,7 @@ extern long p2p_addr_v1(void* out, const void* src, long n);
  * seeds are used ONLY as BOOTSTRAPS -- we getaddr from them, ingest discovered
  * peers into the amr book, then download across DISCOVERED peers (not seeds). */
 extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
+extern long addr_replenish(void* ab, char peers[][64], int npeers, int max_try, int wait_s, long target); /* daemon/addr_ingest.c */
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
@@ -1494,6 +1495,25 @@ static long dl_catchup(const char* dir, int min_workers){
             from+=ntry; rounds++;
         }
         fprintf(stderr,"[dlc] %d confirmed-live peer(s) (%d probe round(s))\n", nlive, rounds);
+
+        /* Ask real peers for more peers. Until now the book only ever grew
+         * from DNS seeds at boot, so it decayed as peers died and there was
+         * no recovery from exhausting it -- three of the last four boots
+         * discovered "+0 peers" against a 1,974-entry book that was only ~4%
+         * reachable. A single peer can return up to 1,000 addresses, so we
+         * stop as soon as we have a useful haul rather than asking everyone.
+         * Best-effort: any failure just leaves the book as it was. */
+        /* ONLY when we are actually short. The book is not small -- it is
+         * stale: ~1,974 entries of which only ~4% still answer. Fresh
+         * addresses from a live peer have a far better hit rate, but asking
+         * costs real time (a peer delays its reply well past the socket
+         * timeout, so a useful window is ~20s per peer). A node that already
+         * probed a healthy live set should pay none of that. Below half the
+         * target, top up; otherwise skip entirely. */
+        if(nlive>0 && nlive < want/2){
+            fprintf(stderr,"[addr] only %d live peer(s) (target %d) -- asking peers for more\n", nlive, want);
+            addr_replenish(ab, live, nlive, 3 /* ask at most 3 */, 20 /* seconds each */, 400);
+        }
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
     int nw = min_workers; if(nlive<nw) nw=nlive; if(nw<1) nw=1; if(nw>64) nw=64;
