@@ -49,6 +49,8 @@ typedef struct {
     int  listen;                 /* Core -listen                             */
     int  blocksonly;             /* Core -blocksonly: no tx relay            */
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
+    int  par;                    /* Core -par: worker threads, 0 = auto      */
+    int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
 } node_config_t;
 
 extern node_config_t g_cfg;

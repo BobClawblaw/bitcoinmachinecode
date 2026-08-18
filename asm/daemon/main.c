@@ -2535,10 +2535,24 @@ int main(int argc, char** argv){
          * clamps this down to however many confirmed-live peers it finds
          * (and up to 64 max), so an over-large request here just becomes a
          * ceiling, not a guarantee. */
-        int catchup_workers = (argc>=6)? atoi(argv[5]) : 16;
+        /* Core -par semantics: 0 == auto (use the machine), negative == leave
+         * that many cores free. CLI arg still wins when given. `par` is the
+         * closest Core equivalent to this node's chunk-claiming worker count;
+         * dl_catchup already clamps the result down to however many
+         * confirmed-live peers it finds, so this is a ceiling, not a promise. */
+        int catchup_workers;
+        if(argc>=6) catchup_workers = atoi(argv[5]);
+        else {
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1) ncpu=4;
+            if(g_cfg.par > 0)      catchup_workers = g_cfg.par;
+            else if(g_cfg.par < 0) catchup_workers = (int)(ncpu + g_cfg.par);  /* leave |par| free */
+            else                   catchup_workers = 16;                       /* auto: prior default */
+        }
         if(catchup_workers<1) catchup_workers=1;
-        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d\n",
-                dir, port, (argc>=4)?"cli":"bitcoin.conf", g_cfg.listen, nwant, catchup_workers);
+        if(catchup_workers>64) catchup_workers=64;
+        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s)\n",
+                dir, port, (argc>=4)?"cli":"bitcoin.conf", g_cfg.listen, nwant,
+                catchup_workers, (argc>=6)?"cli":"par");
         phase_timer_t boot_pt; phase_start(&boot_pt);
         fprintf(stderr,"[boot] loading chain archive from disk...\n");
         phase_timer_t load_pt; phase_start(&load_pt);

@@ -46,6 +46,8 @@ node_config_t g_cfg = {
     .listen                = 1,
     .blocksonly            = 0,
     .bind_addr             = "",     /* empty == INADDR_ANY */
+    .par                   = 0,      /* Core -par default: auto              */
+    .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
 };
 
 static void set_defaults(void){
@@ -71,6 +73,8 @@ static void set_defaults(void){
     g_cfg.listen                = 1;
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
+    g_cfg.par                   = 0;
+    g_cfg.maxrecvbuffer_kb      = 5000;
 }
 
 /* Clamp to values that cannot wedge the node. A config file is operator input,
@@ -151,6 +155,15 @@ long node_config_load(const char* path){
                        if(bp>0 && bp<65536){ g_cfg.port = bp; } }
             snprintf(g_cfg.bind_addr,sizeof g_cfg.bind_addr,"%s",tmp);
             applied++; }
+        else if(!strcmp(key,"par")){
+            /* Core -par: worker threads. 0 = auto, and NEGATIVE means "leave
+             * that many cores free", which is why the lower bound is not 0.
+             * Drives the chunk-claiming catch-up worker count. */
+            t=clamp_int(iv,-64,64,key,&bad); if(t!=-1 || iv>=-64){ g_cfg.par=iv; applied++; } }
+        else if(!strcmp(key,"maxreceivebuffer")){
+            /* Core -maxreceivebuffer is in units of 1000 bytes. Bounds how
+             * much a single peer can make us buffer for one message. */
+            t=clamp_int(iv,64,262144,key,&bad); if(t>=0){ g_cfg.maxrecvbuffer_kb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; applied++; }
         else if(!strcmp(key,"blocksonly")){
@@ -207,6 +220,9 @@ void node_config_log(void){
     fprintf(stderr,"[config] utxo : dbcache=%dMB -> bulk_slots=2^%d bulk_blob=%dMB bulk_gap=%ld compact_at=%d\n",
             g_cfg.dbcache_mb, g_cfg.utxo_bulk_slots_log2, g_cfg.utxo_bulk_blob_mb,
             g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold);
+    fprintf(stderr,"[config] res  : par=%d (%s) maxreceivebuffer=%d*1000B\n",
+            g_cfg.par, g_cfg.par==0?"auto":(g_cfg.par<0?"leave cores free":"fixed"),
+            g_cfg.maxrecvbuffer_kb);
     fprintf(stderr,"[config] net  : port=%d bind=%s listen=%d blocksonly=%d timeout=%dms peertimeout=%ds\n",
             g_cfg.port, g_cfg.bind_addr[0]?g_cfg.bind_addr:"0.0.0.0", g_cfg.listen,
             g_cfg.blocksonly, g_cfg.connect_timeout_ms, g_cfg.peer_timeout_s);
