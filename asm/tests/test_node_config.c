@@ -147,10 +147,63 @@ int main(void){
     else { printf("FAIL: stale lists after reload (add=%d conn=%d seed=%d)\n",
                   g_cfg.n_addnode,g_cfg.n_connect,g_cfg.n_seednode); failures++; }
 
+    /* ---- chain / storage: prune, checkblocks, checklevel, stopatheight ---- */
+
+    /* 16. prune accepts 0 and 1 as MODES, and a real budget only at >=550 */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t14.conf", "prune=1\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t14.conf");
+    if (g_cfg.prune_mib==1) printf("PASS: prune=1 (manual-only mode) accepted\n");
+    else { printf("FAIL: prune=1 -> %ld\n", g_cfg.prune_mib); failures++; }
+
+    wr("/storage/bitcoinmachinecode/asm/bmc_t15.conf", "prune=100\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t15.conf");
+    if (g_cfg.prune_mib==0)
+        printf("PASS: prune=100 rejected -- a budget below 550 MiB cannot hold a usable node\n");
+    else { printf("FAIL: prune=100 accepted as %ld\n", g_cfg.prune_mib); failures++; }
+
+    wr("/storage/bitcoinmachinecode/asm/bmc_t16.conf", "prune=2000\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t16.conf");
+    if (g_cfg.prune_mib==2000) printf("PASS: prune=2000 accepted as a MiB budget\n");
+    else { printf("FAIL: prune=2000 -> %ld\n", g_cfg.prune_mib); failures++; }
+
+    /* 17. checkblocks/checklevel, including an out-of-range level */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t17.conf", "checkblocks=100\nchecklevel=4\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t17.conf");
+    if (g_cfg.checkblocks==100 && g_cfg.checklevel==4)
+        printf("PASS: checkblocks=100 checklevel=4 applied\n");
+    else { printf("FAIL: checkblocks=%ld checklevel=%d\n", g_cfg.checkblocks, g_cfg.checklevel); failures++; }
+
+    wr("/storage/bitcoinmachinecode/asm/bmc_t18.conf", "checklevel=9\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t18.conf");
+    if (g_cfg.checklevel==3)
+        printf("PASS: checklevel=9 rejected, Core default 3 kept\n");
+    else { printf("FAIL: checklevel=%d\n", g_cfg.checklevel); failures++; }
+
+    /* 18. checkblocks=0 means ALL blocks in Core, so it must be accepted as 0
+     *     rather than treated as unset */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t19.conf", "checkblocks=0\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t19.conf");
+    if (g_cfg.checkblocks==0) printf("PASS: checkblocks=0 accepted (means: check all)\n");
+    else { printf("FAIL: checkblocks=%ld\n", g_cfg.checkblocks); failures++; }
+
+    /* 19. stopatheight */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t20.conf", "stopatheight=500000\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t20.conf");
+    if (g_cfg.stopatheight==500000) printf("PASS: stopatheight=500000 applied\n");
+    else { printf("FAIL: stopatheight=%ld\n", g_cfg.stopatheight); failures++; }
+
+    /* 20. the two keys we accept ONLY to warn about must not change anything,
+     *     and must not disturb the rest of the parse */
+    wr("/storage/bitcoinmachinecode/asm/bmc_t21.conf", "txindex=1\nassumevalid=00000000000000000008a89e854d57e5667df88f1cdef6fea2db3d5eeb8ea9c1\nmaxconnections=77\n");
+    node_config_load("/storage/bitcoinmachinecode/asm/bmc_t21.conf");
+    if (g_cfg.max_connections==77)
+        printf("PASS: txindex/assumevalid warn without disturbing the parse\n");
+    else { printf("FAIL: parse disturbed (conns=%d)\n", g_cfg.max_connections); failures++; }
+
     /* the fixtures are written into the repo dir; do not leave 13 stray
      * bmc_t*.conf files behind for the next `git status` to trip over. */
     { char rmpath[256];
-      for(int i=1;i<=13;i++){
+      for(int i=1;i<=21;i++){
           snprintf(rmpath,sizeof rmpath,"/storage/bitcoinmachinecode/asm/bmc_t%d.conf",i);
           remove(rmpath);
       } }

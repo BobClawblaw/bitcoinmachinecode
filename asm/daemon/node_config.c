@@ -56,6 +56,10 @@ node_config_t g_cfg = {
     .n_seednode            = 0,
     .n_addnode             = 0,
     .n_connect             = 0,
+    .prune_mib             = 0,      /* Core -prune default: disabled        */
+    .checkblocks           = 6,      /* Core -checkblocks default            */
+    .checklevel            = 3,      /* Core -checklevel default             */
+    .stopatheight          = 0,      /* Core -stopatheight default: no stop  */
 };
 
 static void set_defaults(void){
@@ -90,6 +94,10 @@ static void set_defaults(void){
     g_cfg.connect_only          = 0;
     g_cfg.n_seednode = g_cfg.n_addnode = g_cfg.n_connect = 0;
     g_cfg.seednode[0][0] = g_cfg.addnode[0][0] = g_cfg.connectn[0][0] = 0;
+    g_cfg.prune_mib             = 0;
+    g_cfg.checkblocks           = 6;
+    g_cfg.checklevel            = 3;
+    g_cfg.stopatheight          = 0;
 }
 
 /* Append one host to a repeatable-key list.
@@ -238,6 +246,33 @@ long node_config_load(const char* path){
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
+        else if(!strcmp(key,"prune")){
+            /* Core -prune: 0 disabled, 1 manual-only (no automatic deletion),
+             * >=550 a target size in MiB for the block data. Values in 2..549
+             * are refused by Core too -- a budget that small cannot hold the
+             * blocks a node must keep to stay usable. */
+            if(iv==0 || iv==1){ g_cfg.prune_mib=iv; applied++; }
+            else { t=clamp_int(iv,550,1073741824,key,&bad); if(t>=0){ g_cfg.prune_mib=t; applied++; } } }
+        else if(!strcmp(key,"checkblocks")){  /* Core: 0 = all              */
+            t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){ g_cfg.checkblocks=t; applied++; } }
+        else if(!strcmp(key,"checklevel")){   /* Core: 0..4                 */
+            t=clamp_int(iv,0,4,key,&bad); if(t>=0){ g_cfg.checklevel=t; applied++; } }
+        else if(!strcmp(key,"stopatheight")){
+            t=clamp_int(iv,0,100000000,key,&bad); if(t>=0){ g_cfg.stopatheight=iv; applied++; } }
+
+        /* ---- Core keys we PARSE ONLY TO SAY WE DO NOT HONOUR THEM ----
+         * Silence would be worse than a warning: this repo's own bitcoin.conf
+         * carries txindex=1, which reads as "enabled" and is not. A key that
+         * changes nothing must say so on every boot, not be quietly ignored
+         * alongside genuinely foreign keys like rpcuser. */
+        else if(!strcmp(key,"txindex")){
+            if(iv) fprintf(stderr,"[config] txindex=1 IGNORED -- this node has no txid->block index; "
+                                  "getrawtransaction by txid alone will not work\n"); }
+        else if(!strcmp(key,"assumevalid")){
+            fprintf(stderr,"[config] assumevalid IGNORED -- block connection performs no script/signature "
+                           "verification (cons_verify checks PoW, parsing, coinbase and merkle root only), "
+                           "so there is nothing for it to skip\n"); }
+
         else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
             g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }
         else if(!strcmp(key,"seednode")){     /* Core: getaddr from, then drop */
@@ -335,4 +370,11 @@ void node_config_log(void){
     for(int i=0;i<g_cfg.n_addnode;i++)  fprintf(stderr,"[config] src  :   addnode  %s\n", g_cfg.addnode[i]);
     for(int i=0;i<g_cfg.n_seednode;i++) fprintf(stderr,"[config] src  :   seednode %s\n", g_cfg.seednode[i]);
     for(int i=0;i<g_cfg.n_connect;i++)  fprintf(stderr,"[config] src  :   connect  %s\n", g_cfg.connectn[i]);
+    fprintf(stderr,"[config] chain: prune=%s checkblocks=%s checklevel=%d stopatheight=%s\n",
+            g_cfg.prune_mib==0?"off":(g_cfg.prune_mib==1?"manual-only":"MiB-budget"),
+            g_cfg.checkblocks?"n":"all", g_cfg.checklevel,
+            g_cfg.stopatheight?"set":"none");
+    if(g_cfg.prune_mib>1)     fprintf(stderr,"[config] chain:   prune budget %ld MiB\n", g_cfg.prune_mib);
+    if(g_cfg.checkblocks)     fprintf(stderr,"[config] chain:   checking last %ld block(s)\n", g_cfg.checkblocks);
+    if(g_cfg.stopatheight)    fprintf(stderr,"[config] chain:   stopping at height %ld\n", g_cfg.stopatheight);
 }

@@ -110,6 +110,9 @@ extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c *
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
+#include "archive_verify.h"                               /* archive_* + prune verdict */
+extern int  store_set_prune(void* st, int h);             /* bitcoin_store.asm       */
+extern int  store_prune(void* st, int h);                 /* bitcoin_store.asm       */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1228,12 +1231,35 @@ static long dlc_first_hole(long tip){
  * reinterpreted by a second process's own resume logic). */
 static int dlc_span(long hdr_len, long* start_h, long* end_h){
     long true_end = hdr_len-1; if(true_end<0) return 0;
+    /* Core -stopatheight: every download path funnels through here, so this is
+     * the one place that has to honour it. Clamping the SPAN (rather than
+     * checking per block) also means the progress figures and the
+     * "already complete" test below speak in terms of the requested stopping
+     * point instead of the real chain tip. */
+    if(g_cfg.stopatheight > 0 && true_end > g_cfg.stopatheight){
+        true_end = g_cfg.stopatheight;
+    }
+    /* Pruned heights are DELIBERATELY absent, so they must not be treated as
+     * holes to refill. Without this floor, enabling prune produces a loop:
+     * store_prune deletes the blocks below the gate, the next span sees them
+     * missing, downloads them again, and the following boot prunes them
+     * again -- forever, at full bandwidth. Nothing exercised this before
+     * because nothing ever called store_prune. */
+    long prune_h = *(int*)((char*)store_buf + 48);
+    if(prune_h < 0) prune_h = 0;
+
     long tip = dlc_index_tip();
-    if(tip<0){ *start_h=0; *end_h=true_end; return 1; }
+    if(tip<0){ *start_h=prune_h; *end_h=true_end; return prune_h<=true_end; }
     long fh = dlc_first_hole(tip);
-    if(fh>=0){ *start_h=fh; *end_h=true_end; return 1; }
+    if(fh>=0){
+        if(fh < prune_h) fh = prune_h;          /* below the gate: not a hole */
+        if(fh <= true_end){ *start_h=fh; *end_h=true_end; return 1; }
+        /* every remaining hole is below the prune gate -- nothing to fetch */
+    }
     if(tip>=true_end) return 0;
-    *start_h=tip+1; *end_h=true_end; return 1;
+    *start_h = (tip+1 < prune_h) ? prune_h : tip+1;
+    *end_h   = true_end;
+    return *start_h <= true_end;
 }
 
 /* extend headers.dat as far as a discovered peer will serve, resuming from
@@ -2722,6 +2748,22 @@ int main(int argc, char** argv){
         store_reload(store_buf);            /* load the persisted chain from disk */
         fprintf(stderr,"[boot] chain archive loaded: tip=%d (%.2fs)\n",
                 *(int*)(store_buf+24), phase_elapsed(&load_pt));
+        /* Core -checkblocks/-checklevel. Read-only, and deliberately BEFORE
+         * anything opens the archive for writing. It reports problems and does
+         * not act on them: archive_verify_and_repair is the only thing allowed
+         * to change the archive, and it runs on its own much narrower and
+         * better-understood trigger. */
+        if(g_cfg.checklevel > 0){
+            phase_timer_t chk_pt; phase_start(&chk_pt);
+            long probs = archive_check(g_cfg.checkblocks, g_cfg.checklevel);
+            if(probs > 0)
+                fprintf(stderr,"[boot] archive check found %ld problem(s) in %.2fs -- see [check] lines above\n",
+                        probs, phase_elapsed(&chk_pt));
+            else if(probs == 0)
+                fprintf(stderr,"[boot] archive check clean (%.2fs)\n", phase_elapsed(&chk_pt));
+        } else {
+            fprintf(stderr,"[boot] checklevel=0 -- skipping archive verification\n");
+        }
         /* shared-append flock fd: open append.lock once so any concurrent-safe
          * store_append_shared writes (and the boot catch-up) serialize. */
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
@@ -2742,6 +2784,61 @@ int main(int argc, char** argv){
          * else, and poll() ignores a negative fd (POSIX: revents is set to 0),
          * so the accept branch simply never fires. */
         if(g_cfg.listen && l<0){ perror("lsock"); return 1; }
+        /* Core -prune. The primitive (store_prune) has existed and been
+         * tested since the store was written but nothing ever called it, so
+         * pruning was configurable in theory only.
+         *
+         * The decision of WHETHER and HOW FAR to prune lives in
+         * archive_prune_decide (daemon/archive_verify.c) so it can be tested
+         * against synthetic archives; this code only acts on the verdict.
+         * Every refusal still persists the GATE, which touches no block data,
+         * so a later run can complete the sync and prune then. A node that
+         * keeps too many blocks is merely over budget; one that deletes blocks
+         * it still needed is unrecoverable. */
+        if(g_cfg.prune_mib > 1){
+            long ph = 0, detail = -1;
+            archive_prune_verdict_t v =
+                archive_prune_decide((long long)g_cfg.prune_mib * 1048576LL, &ph, &detail);
+            switch(v){
+            case ARCHIVE_PRUNE_ERROR:
+                fprintf(stderr,"[prune] could not compute a prune height -- pruning skipped\n");
+                break;
+            case ARCHIVE_PRUNE_NOTHING:
+                fprintf(stderr,"[prune] budget %ld MiB covers the whole archive -- nothing to prune\n",
+                        g_cfg.prune_mib);
+                break;
+            case ARCHIVE_PRUNE_REFUSE_LAYOUT:
+                fprintf(stderr,"[prune] REFUSING to prune to height %ld: archive is not laid out "
+                               "monotonically (first break at %ld). Gate persisted, no data deleted.\n", ph, detail);
+                store_set_prune(store_buf, (int)ph);
+                break;
+            case ARCHIVE_PRUNE_REFUSE_HOLE:
+                fprintf(stderr,"[prune] REFUSING to prune to height %ld: archive has a hole at height %ld "
+                               "(sync incomplete). Gate persisted, no data deleted.\n", ph, detail);
+                store_set_prune(store_buf, (int)ph);
+                break;
+            case ARCHIVE_PRUNE_OK:
+                fprintf(stderr,"[prune] budget %ld MiB -> retaining from height %ld; deleting below it\n",
+                        g_cfg.prune_mib, ph);
+                if(store_prune(store_buf, (int)ph) == 1)
+                    fprintf(stderr,"[prune] done: block data below height %ld removed\n", ph);
+                else
+                    fprintf(stderr,"[prune] store_prune FAILED -- archive left as it was\n");
+                break;
+            }
+        } else if(g_cfg.prune_mib == 1){
+            fprintf(stderr,"[prune] prune=1 (manual-only) -- no automatic pruning\n");
+        }
+
+        /* PRUNE BEFORE THE CATCH-UP, not after.
+         *
+         * This block originally sat after the catch-up completed, which made
+         * it unreachable in practice: every boot re-syncs the header chain and
+         * then fills the archive, so a disk budget was only applied once that
+         * finished -- exactly backwards, since the point of a budget is to
+         * bound the space the download is about to consume. It also never
+         * printed anything in a bounded test run, which is how the placement
+         * was noticed at all. */
         fprintf(stderr,"[boot] checking for archive gaps / missing blocks...\n");
         phase_timer_t catchup_pt; phase_start(&catchup_pt);
         /* BUILT-IN MULTI-PEER CATCH-UP (SYNCHRONOUS, self-healing): detect
@@ -2768,6 +2865,7 @@ int main(int argc, char** argv){
         phase_timer_t hidx_pt; phase_start(&hidx_pt);
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
+
         int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly

@@ -76,6 +76,16 @@ typedef struct {
     char seednode[CFG_MAX_NODES][64];  /* getaddr from, then drop            */
     char addnode [CFG_MAX_NODES][64];  /* prefer, and never evict            */
     char connectn[CFG_MAX_NODES][64];  /* the ONLY peers, when non-empty     */
+
+    /* ---- chain / storage (Core -prune/-checkblocks/-checklevel/
+     *                       -stopatheight) ---- */
+    long prune_mib;              /* Core -prune: 0 off, 1 manual-only, else
+                                  * target block-data size in MiB (min 550)  */
+    long checkblocks;            /* Core -checkblocks: trailing blocks to
+                                  * verify at boot; 0 = all (def 6)          */
+    int  checklevel;             /* Core -checklevel: 0..4 (def 3)           */
+    long stopatheight;           /* Core -stopatheight: stop at this height,
+                                  * 0 = run forever (def 0)                  */
 } node_config_t;
 
 extern node_config_t g_cfg;
