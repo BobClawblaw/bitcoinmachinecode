@@ -75,6 +75,8 @@ extern long node_announce_tip(int fd, void* st, void* ht_idx, long use_headers);
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern long store_init(void* st);
 extern long store_reload(void* st);
+extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
+extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
@@ -1352,14 +1354,22 @@ static long dl_catchup(const char* dir, int min_workers){
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
-    /* The PARENT is serve-only (no outbound appends) -- see the serve branch
-     * that calls us. This child is therefore the SOLE block writer, so plain
-     * store_append is safe (no cross-process writer). Still, reload a fresh
-     * store state rather than inherit the parent's possibly-stale in-memory
-     * idx_len/pos (fork COW is not safe for a growable store -- see the
-     * unified_ibd comments on re-initialising per process). */
+    /* Reload a fresh store state rather than inherit the parent's possibly-
+     * stale in-memory idx_len/pos (fork COW is not safe for a growable
+     * store -- see the unified_ibd comments on re-initialising per
+     * process). NOTE: this process is NOT the sole block writer -- an
+     * inbound serve child can also append a pushed block via .do_block; both
+     * paths go through idxscan_append_locked (flock-guarded, atomic-height-
+     * under-lock) so they can't collide, see that function's header comment
+     * in bitcoin_idxscan.asm. */
     chdir(dir);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
+    /* Single-writer live UTXO instance: this worker is the sole process that
+     * ever calls utxo_lsm_put/del (inbound serve children only ever get a
+     * read-only utxo_lsm_reload() snapshot). Non-fatal on failure -- block
+     * sync/relay must keep working even if UTXO tracking can't start. */
+    int utxo_live_ok = utxo_live_init(dir);
+    if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
     /* ---- BOOTSTRAP + DISCOVER (seeds are bootstrap-only) ----
      * Real nodes use DNS seeds once to learn reachable peers, then connect to
      * those -- never downloading from the seeds themselves. We resolve each
@@ -1479,6 +1489,20 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if((i&1)==1){ usleep(20000); }
         }
         rot++;
+        /* Real-time UTXO catch-up: its OWN step, decoupled from any single
+         * leg's do_outbound_sync return value. A per-leg local diff would
+         * only ever see blocks THIS worker just synced; comparing the
+         * store's true on-disk tip against the persisted applied-height
+         * (utxo_live_catchup's own job) also picks up a sibling inbound
+         * child's .do_block writes, which land in the shared archive
+         * independently of any leg here. */
+        if(utxo_live_ok){
+            long ar = utxo_live_catchup(store_buf);
+            if(ar < 0){
+                fprintf(stderr,"[dl] utxo_live_catchup fatal error -- disabling live UTXO tracking\n");
+                utxo_live_ok = 0;
+            }
+        }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
         /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
          * from the discovered candidate pool. Boot rarely lands all 8 at once

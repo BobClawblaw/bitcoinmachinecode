@@ -600,9 +600,10 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o \
               bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o \
               bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o \
-              bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o
-daemon/bitcoind: daemon/main.c $(DAEMONOBJS)
-	$(CC) -no-pie -O0 -o $@ daemon/main.c $(DAEMONOBJS)
+              bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
+              bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o
+daemon/bitcoind: daemon/main.c daemon/utxo_live.c daemon/utxo_walk.h $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ daemon/main.c daemon/utxo_live.c $(DAEMONOBJS)
 
 # pverify -- parallel block-chain verifier, machine-adaptive worker count.
 # Built at -O1 (not -O2/-O3): the deep asm call chain (cons_verify -> tx_parse
