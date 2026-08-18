@@ -20,6 +20,15 @@ extern int  wallet_validate_address(const char* str, int* type_, unsigned char* 
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
 
+/* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
+ * rpc_commands_set_utxo_store's own doc comment in the header. */
+extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
+                          unsigned long long* value, const unsigned char** script, unsigned* slen);
+
+static void* g_utxo_lst = NULL;
+static void* g_utxo_u = NULL;
+void rpc_commands_set_utxo_store(void* lst, void* u) { g_utxo_lst = lst; g_utxo_u = u; }
+
 /* wallet address type enum mirrors asm/wallet_core.c */
 #define WAL_ADDR_INVALID 0
 #define WAL_ADDR_P2PKH   1
@@ -341,38 +350,54 @@ static int cmd_decoderaw(const rj_val* params, long* ec, const char** em, rj_val
 }
 
 /* ---- gettxout against wallet UTXOs (Core-shaped; null when absent) ---- */
+/* gettxout, real Core semantics: any confirmed outpoint via the LSM UTXO
+ * store (asm/bitcoin_utxo_lsm.asm), not scoped to the wallet's own outputs
+ * -- matches real Bitcoin Core, where gettxout answers for the whole UTXO
+ * set. `w` is unused here (kept in the signature only so rpc_dispatch's
+ * call site didn't need to change); the wallet-scoped commands (listunspent/
+ * getbalance) still use it. */
 static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
                           long* ec, const char** em, rj_val** result) {
+    (void)w;
     const char* txid = rpc_param_str(params, 0, ec, em);
     if (!txid) return 0;
     long long vout; if (!rpc_param_i64(params, 1, &vout, ec, em)) return 0;
     if (strlen(txid) != 64) { *ec = -8; *em = "Invalid parameter: txid must be 64 hex chars"; return 0; }
-    for (unsigned long i = 0; i < w->utxo_n; i++) {
-        char th[65]; bin_to_hex(th, w->utxo_txid[i], 32);
-        if (!strcmp(th, txid) && (long long)w->utxo_idx[i] == vout) {
-            char amt[24]; rpc_amounts((long long)w->utxo_val[i], amt, sizeof amt);
-            char addr[96]; addr[0] = 0;
-            const unsigned char* script = w->utxo_script ? (const unsigned char*)w->utxo_script[i] : NULL;
-            long slen = script ? (long)strlen((const char*)script)/2 : 0;
-            unsigned char sbytes[128]; if (slen && slen <= 128) hex_to_bytes(sbytes, (const char*)script, (size_t)(slen*2));
-            int t = (script && slen) ? wallet_script_to_address(addr, 96, sbytes, slen) : WAL_ADDR_INVALID;
-            rj_val* o = rj_obj();
-            rj_obj_set(o, "bestblock", rj_str("0000000000000000000000000000000000000000000000000000000000000000"));
-            rj_obj_set(o, "confirmations", rj_numf("%d", 0));
-            rj_obj_set(o, "value", rj_str(amt));
-            rj_val* sp = rj_obj();
-            rj_obj_set(sp, "asm", rj_str(""));
-            rj_obj_set(sp, "desc", rj_str(""));
-            rj_obj_set(sp, "hex", rj_str((const char*)script ? (const char*)script : ""));
-            if (addr[0]) rj_obj_set(sp, "address", rj_str(addr));
-            rj_obj_set(sp, "type", rj_str(spk_type(t)));
-            rj_obj_set(o, "scriptPubKey", sp);
-            rj_obj_set(o, "coinbase", rj_bool(0));
-            *result = o;
-            return 1;
-        }
-    }
-    *result = rj_null();
+    unsigned char txid_display[32];
+    if (!hex_to_bytes(txid_display, txid, 64)) { *ec = -8; *em = "Invalid parameter: txid must be hexadecimal"; return 0; }
+    if (vout < 0) { *result = rj_null(); return 1; }
+    /* RPC txid strings are byte-reversed relative to the internal/wire order
+     * the LSM store's key uses (matches tx_txid's own output -- see build_
+     * utxo.c's doc comment) -- reverse before the lookup. */
+    unsigned char txid_wire[32];
+    for (int i = 0; i < 32; i++) txid_wire[i] = txid_display[31 - i];
+
+    if (!g_utxo_lst) { *result = rj_null(); return 1; }
+    unsigned long long value; const unsigned char* script; unsigned slen;
+    long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &script, &slen);
+    if (r != 1) { *result = rj_null(); return 1; }
+
+    char amt[24]; rpc_amounts((long long)value, amt, sizeof amt);
+    char addr[96]; addr[0] = 0;
+    int t = slen ? wallet_script_to_address(addr, 96, script, (long)slen) : WAL_ADDR_INVALID;
+    char* scripthex = malloc((size_t)slen * 2 + 1);
+    if (!scripthex) { *ec = -32603; *em = "out of memory"; return 0; }
+    if (slen) bin_to_hex(scripthex, script, slen); else scripthex[0] = 0;
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "bestblock", rj_str("0000000000000000000000000000000000000000000000000000000000000000"));
+    rj_obj_set(o, "confirmations", rj_numf("%d", 0));
+    rj_obj_set(o, "value", rj_str(amt));
+    rj_val* sp = rj_obj();
+    rj_obj_set(sp, "asm", rj_str(""));
+    rj_obj_set(sp, "desc", rj_str(""));
+    rj_obj_set(sp, "hex", rj_str(scripthex));
+    if (addr[0]) rj_obj_set(sp, "address", rj_str(addr));
+    rj_obj_set(sp, "type", rj_str(spk_type(t)));
+    rj_obj_set(o, "scriptPubKey", sp);
+    rj_obj_set(o, "coinbase", rj_bool(0));
+    free(scripthex);
+    *result = o;
     return 1;
 }
 

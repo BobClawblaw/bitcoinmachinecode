@@ -322,17 +322,20 @@ int main(int argc, char** argv) {
         ck_out("listunspent array write(2)", want);
     }
 
-    /* ---------- 7. gettxout: known UTXO -> object; unknown -> null ---------- */
+    /* ---------- 7. gettxout: real Core semantics (any confirmed outpoint via
+     * the LSM UTXO store, not the wallet's own outputs -- see rpc_commands_
+     * set_utxo_store's doc comment). This harness's in-process rpc_dispatch
+     * never calls that setter, so it's exactly a fresh/unconfigured server
+     * with no chain data loaded: every outpoint (wallet's own included)
+     * correctly comes back null, same as real Core before it's synced. ---- */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
         char tx0[65]; { char* d="0123456789abcdef"; for(int i=0;i<32;i++){tx0[i*2]=d[utxo_txid[0][i]>>4];tx0[i*2+1]=d[utxo_txid[0][i]&15];} tx0[64]=0; }
-        char arg[80]; snprintf(arg, sizeof arg, "%s", tx0); (void)arg;
-        char wantargs[128]; snprintf(wantargs, sizeof wantargs, "%s", tx0);
-        /* our command layer sends both params as strings; server parses vout as number */
-        /* exec: gettxout <txid> 0 */
+        /* exec: gettxout <txid> 0 -- wallet's own outpoint, but no UTXO store
+         * configured in this harness, so still null (not an error) */
         run_cli(portfixed, "gettxout", tx0, "0", NULL);
-        ck("gettxout known exit 0", last_req_exit == 0);
-        ck("gettxout known not null", strstr(out_buf, "\"value\": \"0.25000000\"") != NULL);
+        ck("gettxout (no store configured) exit 0", last_req_exit == 0);
+        ck_out("gettxout (no store configured) prints nothing (null result)", "");
         /* unknown txid -> null -> bitcoin-cli prints nothing */
         run_cli(portfixed, "gettxout", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "0", NULL);
         ck("gettxout unknown exit 0", last_req_exit == 0);
