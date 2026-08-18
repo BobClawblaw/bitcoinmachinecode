@@ -22,6 +22,89 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <errno.h>
+
+/* ---- long-lived LSM UTXO store for gettxout (asm/bitcoin_utxo_lsm.asm) ----
+ * See rpc_commands_set_utxo_store's doc comment: a separate handle from the
+ * wallet, reloaded once at startup and never re-reloaded, so it goes stale
+ * exactly as far as the on-disk store drifts after boot -- an accepted
+ * tradeoff per the LSM store's own "periodically rebuilt, not incrementally
+ * live-maintained" design (avoids touching the live daemon's already-proven
+ * UTXO-application code at all). Restart bitcoin_rpcd to pick up new data. */
+typedef unsigned long long u64;
+extern long utxo_struct_size(unsigned long slots);
+extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
+extern long utxo_lsm_reload(void* lst, void* u);
+struct lsm_state {
+    long log_fd, idx_fd;
+    u64 log_len, ckpt_log_off, ckpt_n;
+    u64 op_count, op_threshold, fill_threshold;
+    void* tomb_buf; u64 tomb_cap, tomb_n, total_live, next_gen;
+    void* manifest_buf; u64 manifest_cap, manifest_n;
+    void* scratch_buf; u64 scratch_cap;
+    u64 next_run_no;
+};
+#define BLOOM_MAX_BYTES  (4*1024*1024)
+#define SCRIPT_MAX_BYTES 65536
+static struct lsm_state g_utxo_lst;
+
+static void* mmap_file(const char* path, u64 size){
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) { fprintf(stderr, "bitcoin_rpcd: open(%s): %s\n", path, strerror(errno)); return 0; }
+    if (ftruncate(fd, (off_t)size) != 0) { fprintf(stderr, "bitcoin_rpcd: ftruncate(%s): %s\n", path, strerror(errno)); close(fd); return 0; }
+    void* p = mmap(0, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) { fprintf(stderr, "bitcoin_rpcd: mmap(%s): %s\n", path, strerror(errno)); return 0; }
+    return p;
+}
+
+/* Same slots_log2 as build_utxo.c/build_migrate_compact.c, NOT a smaller
+ * "modest" size (an earlier version of this code tried slots_log2=16 and
+ * was reliably pathological: the memtable's linear-probe hash table has a
+ * bounded-but-O(slots) probe on a full/overfull table, and a WAL tail's
+ * live-entry count is whatever was unflushed when the writer stopped --
+ * for the real store that was ~953K entries, ~15x too many for 65536
+ * slots. Matching the production sizing costs more memory/startup time but
+ * is correct regardless of how large the tail turns out to be. */
+static int init_utxo_store(const char* datadir) {
+    if (chdir(datadir)) { fprintf(stderr, "bitcoin_rpcd: chdir(%s): %s\n", datadir, strerror(errno)); return 0; }
+    int slots_log2 = 22;
+    unsigned long slots = 1UL << slots_log2;
+    u64 blob_cap = 2UL*1024*1024*1024;
+    long ustruct = utxo_struct_size(slots);
+    u64 fill_threshold = (u64)slots * 3 / 4;
+    u64 op_threshold    = (u64)slots * 2;
+    u64 tomb_cap         = op_threshold;
+    u64 desc_cap         = (u64)slots * 3;
+    u64 scratch_cap       = desc_cap*128 + BLOOM_MAX_BYTES + SCRIPT_MAX_BYTES;
+    u64 manifest_cap       = 8192;
+
+    void* u = mmap_file("utxo_lsm_rpcd_table.map", (u64)ustruct);
+    void* blob = mmap_file("utxo_lsm_rpcd_blob.map", blob_cap);
+    if (!u || !blob) return 0;
+    utxo_init(u, slots, blob, blob_cap);
+
+    void* tomb_buf = malloc(tomb_cap*36);
+    void* manifest_buf = malloc(manifest_cap*16);
+    void* scratch_buf = malloc(scratch_cap);
+    if (!tomb_buf || !manifest_buf || !scratch_buf) { fprintf(stderr, "bitcoin_rpcd: malloc failed\n"); return 0; }
+
+    memset(&g_utxo_lst, 0, sizeof g_utxo_lst);
+    g_utxo_lst.op_threshold = op_threshold;
+    g_utxo_lst.fill_threshold = fill_threshold;
+    g_utxo_lst.tomb_buf = tomb_buf; g_utxo_lst.tomb_cap = tomb_cap;
+    g_utxo_lst.manifest_buf = manifest_buf; g_utxo_lst.manifest_cap = manifest_cap;
+    g_utxo_lst.scratch_buf = scratch_buf; g_utxo_lst.scratch_cap = scratch_cap;
+
+    long replayed = utxo_lsm_reload(&g_utxo_lst, u);
+    if (replayed < 0) { fprintf(stderr, "bitcoin_rpcd: utxo_lsm_reload failed\n"); return 0; }
+    fprintf(stderr, "bitcoin_rpcd: UTXO store loaded (manifest_n=%llu, %ld WAL-tail ops replayed)\n",
+            g_utxo_lst.manifest_n, replayed);
+    rpc_commands_set_utxo_store(&g_utxo_lst, u);
+    return 1;
+}
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -81,19 +164,23 @@ static void init_wallet(void) {
 
 int main(int argc, char** argv) {
     const char* conf = "config/bitcoin.conf";
+    const char* datadir = NULL;
     int port = 8332;
     char user[128] = "bitcoin";
     char pass[128] = "bitcoin";
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "-conf=", 6)) conf = argv[i] + 6;
+        else if (!strncmp(argv[i], "-datadir=", 9)) datadir = argv[i] + 9;
         else if (!strncmp(argv[i], "-rpcport=", 9)) port = atoi(argv[i] + 9);
         else if (!strncmp(argv[i], "-rpcuser=", 9)) snprintf(user, sizeof user, "%s", argv[i] + 9);
         else if (!strncmp(argv[i], "-rpcpassword=", 13)) snprintf(pass, sizeof pass, "%s", argv[i] + 13);
         else if (!strncmp(argv[i], "-h", 2)) {
             fprintf(stderr,
                 "Bitcoin Core RPC server\n\n"
-                "usage: bitcoin_rpcd [-conf=<path>] [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]\n");
+                "usage: bitcoin_rpcd [-conf=<path>] [-datadir=<path>] [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]\n"
+                "  -datadir=<path>  enables real gettxout against the LSM UTXO store in <path>\n"
+                "                   (omit to serve gettxout as \"not found\" for everything)\n");
             return 0;
         }
     }
@@ -105,6 +192,11 @@ int main(int argc, char** argv) {
     if (env && *env) port = atoi(env);
 
     init_wallet();
+
+    if (datadir && !init_utxo_store(datadir)) {
+        fprintf(stderr, "bitcoin_rpcd: UTXO store init failed for -datadir=%s\n", datadir);
+        return 1;
+    }
 
     rpc_server_cfg cfg;
     cfg.port = port;
