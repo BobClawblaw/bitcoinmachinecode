@@ -26,6 +26,7 @@ extern p2p_headers_count
 extern block_hash
 extern cons_verify
 extern store_append
+extern idxscan_append_locked
 extern store_get_at
 extern store_get_file_fd
 extern hst_append
@@ -561,11 +562,19 @@ node_sync:
     test eax, eax
     jz   .fail
     ; ---- store ----
+    ; idxscan_append_locked (not plain store_append): in `serve` mode this
+    ; process (the download worker) is not the only writer -- an inbound
+    ; peer's forked serve child can also append via .do_block. Both paths
+    ; now go through the flock-guarded, atomic-height-under-lock primitive
+    ; so neither can silently collide on or clobber the other's height slot.
+    ; Same (st,hash,raw,len) signature and return convention as store_append,
+    ; so no other change is needed at this call site. Harmless/no-op locking
+    ; overhead in `sync`/`ibd` modes, where st+40 is never set to a flock fd.
     mov  rdi, r12
     lea  rsi, [rbp-0xa0]
     mov  rdx, r14
     mov  ecx, [rbp-0x54]    ; blen is a DWORD -- 32-bit load!
-    call store_append
+    call idxscan_append_locked
     cmp  rax, -1
     je   .fail
     ; locator = stored block hash
