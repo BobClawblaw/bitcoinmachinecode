@@ -30,6 +30,8 @@
 ;   a later, separately reviewed stage.
 ; ============================================================================
 
+%include "version.inc"   ; single source of truth: NODE_PROTOCOL_VER for getheaders
+
 default rel
 section .text
 
@@ -50,8 +52,8 @@ p2p_getheaders:
     jl   .err
     cmp  ebx, 252          ; single-byte CompactSize varint range (0..0xfc)
     ja   .err
-    ; version = 70016 (0x011180) little-endian -> 80 11 01 00
-    mov  dword [r12], 0x00011180
+    ; protocol version (from version.inc single source of truth)
+    mov  dword [r12], NODE_PROTOCOL_VER
     ; locator count varint (1 byte, count in [1,252])
     mov  al, bl
     mov  [r12+4], al
