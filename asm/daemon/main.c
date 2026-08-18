@@ -127,6 +127,9 @@ extern long p2p_addr_v1(void* out, const void* src, long n);
  * peers into the amr book, then download across DISCOVERED peers (not seeds). */
 extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
 extern long addr_replenish(void* ab, char peers[][64], int npeers, int max_try, int wait_s, long target); /* daemon/addr_ingest.c */
+extern int  net_handshake_relay(const char* ip_str, int relay, int rcv_secs);  /* daemon/net_policy.c */
+extern int  net_feeler_probe(const char* ip_str);                             /* daemon/net_policy.c */
+extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
@@ -526,6 +529,21 @@ static int serve_loop(int fd, int lfd){
  * peer is already at the chain tip (empty headers page) instead of blocking
  * the accept loop.
  * ========================================================================== */
+/* ---- connection budget, matching Bitcoin Core's shape -------------------
+ *   full-relay        8   ordinary outbound: tx + block relay, addr gossip
+ *   block-relay-only  2   headers/blocks only (relay=0), never addr-gossiped
+ *   feeler            1   short-lived liveness probe, ~every 2 minutes
+ *   -------------------
+ *   outbound         11, leaving MAX_CONNECTIONS-11 inbound slots.
+ *
+ * There was previously NO inbound limit at all: the accept loop forked a
+ * child per connection with nothing bounding it, so an attacker could open
+ * connections until the host ran out of processes or memory. */
+#define MAX_CONNECTIONS            125
+#define MAX_BLOCK_RELAY_ONLY       2
+#define MAX_FEELER                 1
+#define MAX_INBOUND   (MAX_CONNECTIONS - MUX_MAX_OUT - MAX_BLOCK_RELAY_ONLY - MAX_FEELER)
+#define FEELER_INTERVAL_MS         120000L   /* Core's ~2 minutes */
 #define MUX_MAX_OUT 8
 static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
@@ -543,6 +561,25 @@ static long long mux_out_nextretry[MUX_MAX_OUT]; /* monotonic ms deadline before
  * mux_budget_alarm/SIGALRM pattern) -- the actual logging/cleanup happens
  * in each main loop's own next iteration, never inside the handler. */
 static volatile sig_atomic_t g_shutdown_requested = 0;
+/* Live inbound serve children. SIGCHLD was SIG_IGN (kernel auto-reap), which
+ * is tidy but gives no way to know when a child exits -- so we reap manually
+ * and keep the count. If this ever drifts it drifts LOW (the download worker
+ * exiting also fires SIGCHLD), which fails open by allowing an extra
+ * connection rather than locking inbound out entirely. */
+/* Block-relay-only legs (Core: MAX_BLOCK_RELAY_ONLY_CONNECTIONS). relay=0,
+ * and deliberately never fed into addr gossip, so an attacker enumerating the
+ * network cannot discover or crowd them out. These carry headers/blocks only
+ * and exist so an eclipse of the ordinary legs still leaves us a true view of
+ * the best chain -- which matters now that Stage B acts on peer chainwork. */
+static int  bro_fd[MAX_BLOCK_RELAY_ONLY];
+static char bro_host[MAX_BLOCK_RELAY_ONLY][64];
+
+static volatile sig_atomic_t g_inbound_n = 0;
+static void reap_children(int sig){
+    (void)sig; int st;
+    while(waitpid(-1,&st,WNOHANG) > 0){ if(g_inbound_n > 0) g_inbound_n--; }
+}
+
 static pid_t g_dl_worker_pid = -1;       /* set by main() right after fork(); parent forwards SIGTERM here */
 static void handle_shutdown_signal(int sig){ g_shutdown_requested = sig; }
 
@@ -1836,6 +1873,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * passes over the shared store_buf is race-free; each leg's node_sync
      * appends via store_append while the others idle. A LONG per-pass budget,
      * DL_BUDGET_SECS, applies because this process does not serve inbound.) */
+    long long next_feeler_ms = 0;
+    for(int b=0;b<MAX_BLOCK_RELAY_ONLY;b++){ bro_fd[b]=-1; bro_host[b][0]=0; }
     mux_n_out = 0;                                   /* isolate from any parent state */
     {
         int ntry = nsrc; if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;   /* cap candidates */
@@ -2005,6 +2044,47 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * this worker's own legs happened to store, because an inbound serve
          * child's .do_block writes land in the shared archive independently.
          * A no-op (one lseek) when already in step. */
+        /* ---- block-relay-only legs (relay=0, no addr gossip) -------------
+         * Kept topped up alongside the full-relay legs. Chosen from a
+         * DIFFERENT netgroup than any existing leg where possible: two peers
+         * in the same /16 are far more likely to be the same operator, which
+         * defeats the point of having them. */
+        for(int b=0; b<MAX_BLOCK_RELAY_ONLY; b++){
+            if(bro_fd[b] >= 0) continue;
+            if((rot % 16) != 0) break;             /* rate-limit re-dials */
+            for(int ci=0; ci<nsrc; ci++){
+                unsigned cip; if(inet_pton(AF_INET,srcpool[ci],&cip)!=1) continue;
+                int clash=0;
+                for(int k=0;k<mux_n_out;k++){
+                    unsigned oip; if(inet_pton(AF_INET,mux_out_host[k],&oip)!=1) continue;
+                    if(net_netgroup_v4(oip)==net_netgroup_v4(cip)){ clash=1; break; }
+                }
+                for(int k=0;k<MAX_BLOCK_RELAY_ONLY && !clash;k++){
+                    if(bro_fd[k]<0) continue;
+                    unsigned oip; if(inet_pton(AF_INET,bro_host[k],&oip)!=1) continue;
+                    if(net_netgroup_v4(oip)==net_netgroup_v4(cip)) clash=1;
+                }
+                if(clash) continue;
+                int f = net_handshake_relay(srcpool[ci], 0 /* relay=0 */, 6);
+                if(f>=0){
+                    bro_fd[b]=f; strncpy(bro_host[b],srcpool[ci],63); bro_host[b][63]=0;
+                    fprintf(stderr,"[net] block-relay-only %d = %s (fd %d, relay=0)\n", b, bro_host[b], f);
+                    break;
+                }
+            }
+        }
+
+        /* ---- feeler: one short-lived probe every ~2 minutes ---------------
+         * Validates a book entry and drops it. This is what keeps the address
+         * book from rotting -- without it we only discover the rot at boot,
+         * as happened on 2026-08-18 (1,974 entries, ~4% still answering). */
+        if(now_ms >= next_feeler_ms && nsrc > 0){
+            next_feeler_ms = now_ms + FEELER_INTERVAL_MS;
+            int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
+            int alive = net_feeler_probe(srcpool[pick]);
+            fprintf(stderr,"[net] feeler %s -> %s\n", srcpool[pick], alive?"alive":"dead");
+        }
+
         if(reorg_ok) reorg_chainwork_sync(store_buf, 0);
         /* A catch-up failure is RECOVERABLE, not terminal. It used to set
          * utxo_live_ok=0, which left the node serving blocks with no UTXO
@@ -2130,6 +2210,22 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c=accept(l,(struct sockaddr*)&ca,&cal);
+            if(c>=0 && g_inbound_n >= MAX_INBOUND){
+                /* At capacity: accept and close immediately so the connection
+                 * is refused cleanly rather than sitting in the backlog, and
+                 * do NOT fork. Rate-limited log -- under a flood this would
+                 * otherwise be the loudest line in the file. */
+                static long long last_full_log_ms = 0;
+                long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                                 nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+                if(nms - last_full_log_ms > 10000){
+                    fprintf(stderr,"[serve] inbound at capacity (%d/%d) -- refusing new connections\n",
+                            (int)g_inbound_n, MAX_INBOUND);
+                    last_full_log_ms = nms;
+                }
+                close(c);
+                c = -1;
+            }
             if(c>=0){
                 char ipbuf[INET_ADDRSTRLEN]; ipbuf[0]=0;
                 inet_ntop(AF_INET,&ca.sin_addr,ipbuf,sizeof ipbuf);
@@ -2156,7 +2252,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     close(c); _exit(0);
                 }
                 close(c);
-                fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d\n", ipbuf, ntohs(ca.sin_port), w);
+                if(w > 0) g_inbound_n++;
+                fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d (%d/%d inbound)\n",
+                        ipbuf, ntohs(ca.sin_port), w, (int)g_inbound_n, MAX_INBOUND);
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
@@ -2198,7 +2296,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
 
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
-    signal(SIGCHLD, SIG_IGN);   /* fork-per-peer workers: auto-reap, no zombies */
+    /* counting reaper instead of SIG_IGN: we must know how many inbound
+     * children are live to enforce MAX_INBOUND (see the budget above). */
+    { struct sigaction sc; memset(&sc,0,sizeof sc); sc.sa_handler=reap_children;
+      sigemptyset(&sc.sa_mask); sc.sa_flags=SA_RESTART|SA_NOCLDSTOP;
+      sigaction(SIGCHLD,&sc,NULL); }
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
     if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }

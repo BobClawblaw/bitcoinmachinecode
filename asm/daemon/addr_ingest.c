@@ -33,6 +33,32 @@ extern void fd_close(int);
 extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
 extern long amr_count(void* ab);
 extern long p2p_addr_count(const void* pl, long plen);
+extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c */
+
+/* SOURCE LIMITS. Core buckets addrman by source netgroup so no single source
+ * can flood the table. Our book is a flat list with no such protection, and
+ * the getaddr support in 563da15 accepted 838 addresses from ONE peer -- an
+ * eclipse vector that commit introduced. Bound both the total taken from one
+ * response and how much of it may share a /16, so a hostile peer cannot fill
+ * the book with addresses it controls. */
+#define AI_MAX_PER_RESPONSE 256
+#define AI_MAX_PER_NETGROUP 16
+
+typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken; } ai_quota_t;
+
+static int ai_quota_ok(ai_quota_t* q, unsigned ip){
+    if(q->taken >= AI_MAX_PER_RESPONSE) return 0;
+    unsigned g = net_netgroup_v4(ip);
+    for(int i=0;i<q->n;i++){
+        if(q->ng[i]==g){
+            if(q->cnt[i] >= AI_MAX_PER_NETGROUP) return 0;
+            q->cnt[i]++; q->taken++; return 1;
+        }
+    }
+    if(q->n < AI_MAX_PER_RESPONSE){ q->ng[q->n]=g; q->cnt[q->n]=1; q->n++; }
+    q->taken++;
+    return 1;
+}
 
 static void ai_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
 static void ai_u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
@@ -48,7 +74,7 @@ static int ai_public_v4(const unsigned char* a){
 }
 
 /* v1 addr payload -> book. 30-byte records after the CompactSize count. */
-static long ai_ingest_addr1(void* ab, const unsigned char* pl, long plen){
+static long ai_ingest_addr1(void* ab, const unsigned char* pl, long plen, ai_quota_t* q){
     long cnt = p2p_addr_count(pl, plen); if(cnt<=0) return 0;
     long base = (pl[0]<0xfd)?1:(pl[0]==0xfd?3:(pl[0]==0xfe?5:9));
     long added=0;
@@ -65,6 +91,7 @@ static long ai_ingest_addr1(void* ab, const unsigned char* pl, long plen){
             (unsigned long long)r[6]<<16 |(unsigned long long)r[7]<<24 | (unsigned long long)r[8]<<32 |
             (unsigned long long)r[9]<<40 |(unsigned long long)r[10]<<48 |(unsigned long long)r[11]<<56;
         unsigned ip = (unsigned)ipb[0]|(unsigned)ipb[1]<<8|(unsigned)ipb[2]<<16|(unsigned)ipb[3]<<24;
+        if(!ai_quota_ok(q, ip)) continue;
         if(amr_add(ab, ip, port, svc, (unsigned)time(NULL))>0) added++;
     }
     return added;
@@ -105,7 +132,7 @@ static int ai_compact(const unsigned char* pl, long plen, unsigned long long* po
  *
  * Record layout per BIP155: time u32le, services CompactSize, networkID u8,
  * addr (CompactSize len + bytes), port u16be. */
-static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen){
+static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_quota_t* q){
     if(plen < 1) return 0;
     unsigned long long pos = 0, cnt = 0;
     if(!ai_compact(pl, plen, &pos, &cnt)) return 0;
@@ -128,6 +155,7 @@ static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen){
         pos += 2;
         if(net == 1 && alen == 4 && ai_public_v4(ad)){   /* 1 == IPv4 */
             unsigned ip = (unsigned)ad[0] | (unsigned)ad[1]<<8 | (unsigned)ad[2]<<16 | (unsigned)ad[3]<<24;
+            if(!ai_quota_ok(q, ip)) continue;
             if(amr_add(ab, ip, port, svc, tm) > 0) added++;
         }
     }
@@ -179,14 +207,15 @@ long addr_gather_from(void* ab, const char* ip_str, int wait_s){
      * as fatal meant bailing out at that pause every time, which is why the
      * first live test harvested 0 peers from nodes that were in fact
      * answering correctly. Keep waiting; only the wall clock ends this. */
+    ai_quota_t quota; memset(&quota,0,sizeof quota);   /* per-peer source limit */
     long added=0; time_t endt=time(NULL)+(wait_s>0?wait_s:5);
     while(time(NULL)<endt){
         plen=0; int r=p2p_read(fd,cmd,rb,sizeof rb,&plen);
         if(r<=0) continue;            /* recv timeout -- keep waiting */
         cmd[11]=0;
         if(!strncmp(cmd,"ping",4)&&plen==8){ p2p_write(fd,"pong",4,rb,8); continue; }
-        if(!strncmp(cmd,"addrv2",6))     added += ai_ingest_addrv2(ab, rb, plen);
-        else if(!strncmp(cmd,"addr",4))  added += ai_ingest_addr1(ab, rb, plen);
+        if(!strncmp(cmd,"addrv2",6))     added += ai_ingest_addrv2(ab, rb, plen, &quota);
+        else if(!strncmp(cmd,"addr",4))  added += ai_ingest_addr1(ab, rb, plen, &quota);
     }
     fd_close(fd);
     return added;
