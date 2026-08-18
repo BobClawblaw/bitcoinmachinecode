@@ -11,6 +11,11 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+/* version_gen.h -- GENERATED from asm/version.inc (single source of truth).
+   The byte-exactness assertions below reference these derived constants so a
+   version/UA bump cannot silently desync this test from node_make_version. */
+#include "../version_gen.h"
+
 extern long node_make_version(unsigned char* out);
 extern int  node_handshake(int fd);
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
@@ -49,17 +54,17 @@ int main(void){
     /* --- node_make_version byte-exactness --- */
     unsigned char v[130]; unsigned char vb[160]; memset(v,0xEE,sizeof v); memset(vb,0xEE,sizeof vb);
     long n = node_make_version(vb);
-    cki("version len 128", n, 128);
+    cki("version len", n, 81 + NODE_UA_STRING_LEN + 5);
     cki("version field", vb[0]==0x80&&vb[1]==0x11&&vb[2]==0x01&&vb[3]==0x00, 1);
     cki("services=1", vb[4]==1, 1);
     unsigned long long ts; memcpy(&ts,vb+12,8); cki("timestamp", (long)ts, 1700000000);
     unsigned short pr; memcpy(&pr,vb+44,2); cki("addr_recv port 0x8d20", pr, 0x8d20);
     memcpy(&pr,vb+70,2); cki("addr_from port 0x8d20", pr, 0x8d20);
     unsigned long long nn; memcpy(&nn,vb+72,8); cki("nonce", nn, 0x1122334455667788ULL);
-    cki("UA len=42", vb[80], 42);
-    cki("UA bytes", memcmp(vb+81,"Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x",42)==0, 1);
-    unsigned sh; memcpy(&sh,vb+123,4); cki("start_height=0", sh, 0);
-    cki("relay=1", vb[127], 1);
+    cki("UA len", vb[80], NODE_UA_STRING_LEN);
+    cki("UA bytes", memcmp(vb+81, NODE_UA_STRING, NODE_UA_STRING_LEN)==0, 1);
+    unsigned sh; memcpy(&sh, vb+81+NODE_UA_STRING_LEN, 4); cki("start_height=0", sh, 0);
+    cki("relay=1", vb[81+NODE_UA_STRING_LEN+4], 1);
 
     /* --- node_handshake over loopback --- */
     int ls=socket(AF_INET,SOCK_STREAM,0);

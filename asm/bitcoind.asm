@@ -15,6 +15,7 @@
 ; Depends on (all verified asm): p2p_* builders (bitcoin_p2p.asm), net framing
 ;   (bitcoin_net.asm).
 ; ============================================================================
+%include "version.inc"   ; single source of truth: app version, UA, protocol version
 default rel
 section .text
 
@@ -40,8 +41,8 @@ node_make_version:
     push rbx
     push r12
     mov  r12, rdi           ; out (cursor base)
-    ; version = 70016 = LE 80 11 01 00
-    mov  dword [r12], 0x00011180
+    ; protocol version -- from the single source of truth (version.inc)
+    mov  dword [r12], NODE_PROTOCOL_VER
     ; services = NODE_NETWORK(1), timestamp
     mov  qword [r12+4], 1
     mov  qword [r12+12], 1700000000
@@ -59,18 +60,20 @@ node_make_version:
     ; nonce at +72  (build in rax: an imm64 mem-store truncates to 32 bits!)
     mov  rax, 0x1122334455667788
     mov  [r12+72], rax
-    ; user_agent varstr at +80: len byte + UA bytes
-    mov  byte [r12+80], 42
+    ; user_agent varstr at +80: len byte + UA bytes. Length is DERIVED at
+    ; assembly time from version.inc (%strlen), so it can never drift from the
+    ; string itself.
+    mov  byte [r12+80], NODE_UA_LEN
     lea  rsi, [rel ua]
     lea  rdi, [r12+81]
-    mov  rcx, 42
+    mov  rcx, NODE_UA_LEN
     rep  movsb
-    ; start_height u32 then relay byte (cursor-relative: after 81+42=123)
-    lea  rdi, [r12+123]
+    ; start_height u32 then relay byte (cursor-relative: after 81+UA_LEN)
+    lea  rdi, [r12+81+NODE_UA_LEN]
     mov  dword [rdi], 0
     mov  byte [rdi+4], 1
-    ; total length = 81 + 42 + 4 + 1 = 128
-    mov  rax, 128
+    ; total length = 81 + UA_LEN + 4 + 1 -- derived, no hardcoded total
+    mov  rax, 81 + NODE_UA_LEN + 5
     pop  r12
     pop  rbx
     pop  rbp
@@ -1829,7 +1832,7 @@ node_ibd:
 
 section .data
 align 16
-ua: db "Bitcoind-AssemlbyCode (BobClawblaw) vx.x.x"   ; EXACTLY 42 chars (len byte = 42 above)
+ua: db NODE_UA_STRING   ; user-agent from version.inc (length derived via %strlen)
 
 ; ---- last-seen peer `version` payload, captured (not parsed) by both
 ; node_handshake and node_accept_handshake the moment they see a "version"

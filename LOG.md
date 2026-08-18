@@ -7,6 +7,40 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-18 -- Single source of truth for node wire identity (user-agent + versioning)
+
+### Problem: node's advertised identity was hardcoded, duplicated, and placeholder
+The daemon's outgoing P2P `version` payload (`node_make_version` in
+`bitcoind.asm`) advertised a hardcoded user-agent `"Bitcoind-AssemlbyCode
+(BobClawblaw) vx.x.x"` whose version number was never actually resolved to a
+real value. Three magic numbers had to be kept in sync by hand and could
+silently drift: the UA string, its length byte (42), and the total payload
+size (128). The same protocol version (70016) was duplicated across the
+version handshake, the getheaders builder (`bitcoin_p2p.asm`), and a level
+logger call (`main.c`). The wire protocol version also had no shared source
+-- the user asked for both the application version AND the protocol version
+to come from one canonical definition.
+
+### Change: one canonical file, everything else derived
+- `asm/version.inc` is now the SINGLE SOURCE OF TRUTH: `NODE_VERSION_MAJOR/
+  MINOR/PATCH` (0.0.1), `NODE_PROTOCOL_VER` (70016), and the UA prefix/suffix.
+- `bitcoind.asm` `node_make_version` derives the UA string (NASM `%strcat`),
+  its length byte (NASM `%strlen`), and the payload size (`81+UA_LEN+5`) at
+  assembly time from `version.inc` -- no hand-synced literals remain.
+- `bitcoin_p2p.asm` getheaders and `main.c`'s HSHK level-logger call read the
+  protocol version from the same source.
+- The Makefile + `gen_version_header.py` regenerate `asm/version_gen.h` (C
+  header, git-ignored) from `version.inc` for the C consumers, and the ASM
+  objects / daemon / test rebuild automatically when `version.inc` changes.
+- `tests/test_bitcoind.c` byte-exactness assertions now reference the derived
+  constants instead of hardcoded 42/128/legacy string.
+
+The node now advertises `/BitcoinMachineCode:0.0.1/` (26-byte UA, version
+payload 112 bytes). Verified: bumping to 0.1.2 propagates the new identity to
+the ASM object, daemon binary, and test; reverted to the 0.0.1 baseline. Full
+`make test` passes (71/71). To bump the version or protocol, edit ONLY
+`asm/version.inc`.
+
 ## 2026-08-17/18 -- UTXO set replaced with an LSM-tree, then wired live into the P2P daemon (mempool/tx-relay validation, commits 4e393ef..3ff03f3)
 
 ### The problem: single-table UTXO store write-amplified ~13x during full replay

@@ -158,6 +158,9 @@ asm/rpc_server.o
 asm/tests/test_verify_p2sh
 asm/tests/verify_p2sh_shim
 asm/tests/stress_pointmul
+
+# ---- generated single-source-of-truth header (from version.inc) ----
+asm/version_gen.h
 # ---- chain-context BIP30 gate test binaries ----
 asm/tests/bip30_shim
 asm/tests/test_bip30
