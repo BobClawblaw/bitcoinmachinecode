@@ -207,46 +207,49 @@ tests/test_idx: tests/test_idx.c $(IDXOBJS)
 # .do_tx now calls into daemon/tx_accept.c (mempool policy + whole-tx
 # validation, LSM-backed UTXO snapshot), pulling in the same object set as
 # tests/test_mempool_accept_modern's MEMPACCOBJS plus the LSM/memtable objects.
+# SERVETXVALSRCS are raw .c sources (not pre-built .o) needed by every target
+# that links bitcoin_serve.o, since .do_tx's new call sites live there.
 SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o sha256.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o
-tests/test_serve: tests/test_serve.c daemon/tx_accept.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(SERVEOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_serve.c daemon/tx_accept.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(SERVEOBJS)
+SERVETXVALSRCS := daemon/tx_accept.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # test_keepup: proves the inbound `block` keep-up path (.do_block) -- a peer
 # pushes a block the server lacks; the server validates, stores, and indexes
 # it so it becomes serveable, and survives duplicate pushes. Uses SERVEOBJS
 # (needs cons_verify/store_append/idx_put from the listed objects).
-tests/test_keepup: tests/test_keepup.c $(SERVEOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_keepup.c $(SERVEOBJS)
+tests/test_keepup: tests/test_keepup.c $(SERVETXVALSRCS) $(SERVEOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_keepup.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # BIP152 compact-block serving loopback e2e (sendcmpct/getblocktxn/cmpctblock).
-tests/test_bip152_loop: tests/test_bip152_loop.c $(SERVEOBJS) tests/block_vec.h tests/cmpct_expected.h
-	$(CC) -no-pie -O0 -o $@ tests/test_bip152_loop.c $(SERVEOBJS)
+tests/test_bip152_loop: tests/test_bip152_loop.c $(SERVETXVALSRCS) $(SERVEOBJS) tests/block_vec.h tests/cmpct_expected.h
+	$(CC) -no-pie -O0 -o $@ tests/test_bip152_loop.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # sendheaders (BIP130) + feefilter: announce_tip inv-vs-headers wire bytes +
 # forked serve-loop outbound feefilter & negotiation parsing (loopback e2e).
-tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVEOBJS) tests/block_vec.h
-	$(CC) -no-pie -O0 -o $@ tests/test_sendheaders_fee.c $(SERVEOBJS)
+tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVETXVALSRCS) $(SERVEOBJS) tests/block_vec.h
+	$(CC) -no-pie -O0 -o $@ tests/test_sendheaders_fee.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # OUTBOUND P2P MULTIPLEXER loopback e2e: exec's the REAL daemon in serve-test
 # mode (poll-multiplexed outbound node_sync + inbound serving), a mining-peer
 # child that grows its chain, and an inbound client that fetches the freshly
 # mined block -- proving the running node pulls+stores+serves new blocks with
 # no restart. Links the server object set for the client/peer roles.
-tests/test_outbound_mux: tests/test_outbound_mux.c daemon/bitcoind $(SERVEOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_outbound_mux.c $(SERVEOBJS)
+tests/test_outbound_mux: tests/test_outbound_mux.c daemon/bitcoind $(SERVETXVALSRCS) $(SERVEOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_outbound_mux.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # OUTBOUND MUX RE-DIAL e2e: regression for soak-defect D2 -- proves the mux
 # re-dials a leg the peer rips down (POLLHUP) and recovers keep-up via a fresh
 # connection to a rotated peer, instead of syncing on a dead socket forever.
-tests/test_redial: tests/test_redial.c daemon/bitcoind $(SERVEOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_redial.c $(SERVEOBJS)
+tests/test_redial: tests/test_redial.c daemon/bitcoind $(SERVETXVALSRCS) $(SERVEOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_redial.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # OUTBOUND MUX SOAK HARNESS controlled mining peer: real process that serves the
 # node_sync protocol from a GROWING chain (mines a block every N seconds) for
 # unattended 24h+ soak runs; also periodically re-connects inbound to prove the
 # node serves while downloading. Link set = SERVEOBJS (same as test_outbound_mux).
-tests/soak_mux_peer: tests/soak_mux_peer.c $(SERVEOBJS)
-	$(CC) -no-pie -O2 -o $@ tests/soak_mux_peer.c $(SERVEOBJS)
+tests/soak_mux_peer: tests/soak_mux_peer.c $(SERVETXVALSRCS) $(SERVEOBJS)
+	$(CC) -no-pie -O2 -o $@ tests/soak_mux_peer.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # SHA-512 (FIPS 180-4, wallet/BIP32+bech32 foundation).
 tests/test_sha512: tests/test_sha512.c sha512.o
