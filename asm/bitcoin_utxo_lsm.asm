@@ -850,7 +850,7 @@ utxo_lsm_put:
     mov  eax, r14d
     jmp  .lp_done
 .lp_err:
-    mov  eax, -1
+    mov  rax, -1
 .lp_done:
     add  rsp, 0x40
     pop  r15
@@ -921,7 +921,7 @@ utxo_lsm_del:
     mov  eax, 1
     jmp  .ld_done
 .ld_err:
-    mov  eax, -1
+    mov  rax, -1
 .ld_done:
     add  rsp, 0x40
     pop  r15
@@ -1215,7 +1215,7 @@ mac_run_lookup:
     mov  eax, 3
     syscall
 .ml_err:
-    mov  eax, -1
+    mov  rax, -1
 .ml_ret:
     add  rsp, 0x300
     pop  r15
@@ -1340,7 +1340,7 @@ utxo_lsm_get:
     xor  eax, eax
     jmp  .lg_done
 .lg_err:
-    mov  eax, -1
+    mov  rax, -1
 .lg_done:
     add  rsp, 0x120
     pop  r15
@@ -2086,7 +2086,7 @@ mac_compact_read_rec:
     mov  eax, 1
     jmp  .cr_ret
 .cr_err:
-    mov  eax, -1
+    mov  rax, -1
 .cr_ret:
     add  rsp, 0x10
     pop  r13

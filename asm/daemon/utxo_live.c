@@ -33,6 +33,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "utxo_walk.h"
+#include "log_ts.h"
 
 extern long store_reload(void* st);
 extern long store_read_at(void* st, u64 height, void* buf, u64 cap);
