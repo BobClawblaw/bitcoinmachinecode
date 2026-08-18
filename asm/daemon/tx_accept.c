@@ -194,3 +194,18 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     }
     return 1;
 }
+
+/* log_block_stored_inbound(hash32, height, bytes): called from
+ * bitcoin_serve.asm's .do_block, the ONLY place a peer-pushed block
+ * (unsolicited, or in response to our own .do_inv-triggered getdata) is
+ * written to disk -- previously silent entirely. The outbound download
+ * worker's own writes are logged separately (main.c's do_outbound_sync).
+ * hash32 is wire-order; block explorers/RPC display it byte-reversed, so
+ * print that convention (short form: last 8 wire bytes = first 8 displayed). */
+void log_block_stored_inbound(const u8 hash32[32], long height, long bytes){
+    static const char hexd[]="0123456789abcdef";
+    char hs[17];
+    for(int k=0;k<8;k++){ u8 b=hash32[31-k]; hs[k*2]=hexd[b>>4]; hs[k*2+1]=hexd[b&0xf]; }
+    hs[16]=0;
+    fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%ld (inbound relay)\n", height, hs, bytes);
+}

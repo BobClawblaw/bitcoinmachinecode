@@ -548,12 +548,28 @@ static int mux_locator_zero(int i){
  *   - announce the new tip back to the peer via node_announce_tip
  *   - update the per-peer locator to our new tip
  * Returns # blocks stored this pass. */
+/* hash32[32] is wire-order (as stored/compared internally); block explorers
+ * and RPC display it byte-reversed -- print that convention here so a
+ * logged hash can be pasted straight into a lookup. Short form (first 8
+ * display bytes = last 8 wire bytes) is enough to eyeball/grep-correlate
+ * without bloating every block-stored line to a full 64 hex chars. */
+static void log_hash_short(char out[17], const unsigned char hash32[32]){
+    static const char hexd[]="0123456789abcdef";
+    for(int k=0;k<8;k++){
+        unsigned char b=hash32[31-k];
+        out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf];
+    }
+    out[16]=0;
+}
+
 static long do_outbound_sync(int i){
     unsigned char loc[32]; mux_locator(i, loc);
     if(mux_locator_zero(i)){ anchor_locator(loc); }  /* first time: genesis */
     static unsigned char cbuf[6<<20]; long cnt=0;
     int st_tip_before=*(int*)(store_buf+24);
+    phase_timer_t sync_pt; phase_start(&sync_pt);
     long ok=node_sync(mux_out_fd[i], store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
+    double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     if(ok!=1 || cnt<=0){
         /* keep the locator fresh even on a no-op so we don't re-request from
@@ -561,20 +577,28 @@ static long do_outbound_sync(int i){
         anchor_locator(mux_out_loc[i]);
         return 0;
     }
-    /* index every newly stored height (st_tip_before+1 .. st_tip) into ht_idx */
+    /* index every newly stored height (st_tip_before+1 .. st_tip) into ht_idx,
+     * logging each disk-written block individually -- node_sync itself does
+     * getheaders+download+validate+store as one opaque pass (no network-vs-
+     * disk breakdown available without touching that ASM), so this loop's
+     * own re-read of each freshly-stored block is the cheapest place to
+     * report per-block write events for troubleshooting. */
     static unsigned char sb[8<<20];
     for(int h=st_tip_before+1; h<=st_tip; h++){
         long L=node_serve_block(store_buf, h, sb, sizeof sb);
         if(L<80) continue;
         unsigned char bhash[32]; block_hash(bhash, sb);
         idx_put(ht_idx, bhash, h);
+        char hs[17]; log_hash_short(hs, bhash);
+        fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld (via %s)\n", h, hs, L, mux_out_host[i]);
     }
     /* announce the new tip to this peer (inv; BIP130 headers honored by the
      * peer's sendheaders negotiation is handled downstream on its own leg) */
     node_announce_tip(mux_out_fd[i], store_buf, ht_idx, 0);
+    fprintf(stderr,"[mux:%d] broadcast tip height=%d to %s\n", i, st_tip, mux_out_host[i]);
     /* advance this peer's persistent locator to our new stored tip */
     anchor_locator(mux_out_loc[i]);
-    fprintf(stderr,"[mux:%d] %-22s sync ok=%ld new=%ld tip=%d\n", i, mux_out_host[i], ok, cnt, st_tip);
+    fprintf(stderr,"[mux:%d] %-22s sync ok=%ld new=%ld tip=%d (%.2fs)\n", i, mux_out_host[i], ok, cnt, st_tip, sync_s);
     return cnt;
 }
 

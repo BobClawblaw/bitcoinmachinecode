@@ -42,6 +42,7 @@ default rel
     extern tx_dispatch_init
     extern tx_policy_init
     extern tx_accept_validate
+    extern log_block_stored_inbound
     extern tx_txid
     extern bip152_shortid
     extern block_tx_at
@@ -118,6 +119,9 @@ s_txid:   times 32 db 0 ; inbound tx's computed BIP141 txid
 s_st:     dq 0     ; stable copy of the store context (r14 also at risk)
 s_fd:     dq 0     ; stable copy of the peer fd (r12 at risk: cons_verify clobbers it)
 s_lfd:    dq 0     ; stable copy of the log fd (r13 at risk)
+s_lastheight: dq 0 ; height just returned by idxscan_append_locked in .do_block,
+                    ; held here (not a register) so it survives the idx_put call
+                    ; intact for the log_block_stored_inbound call right after
 
 section .text
 
@@ -401,14 +405,22 @@ node_serve_loop:
     call idxscan_append_locked
     test rax, rax
     jle  .next
+    mov  [s_lastheight], rax  ; survive the idx_put call in a static, not a register
     ; index it (freshly-stored block becomes serveable by hash O(1)):
     ; idx_put(ht_idx, hash, height=newtip). New tip = rax (store_append returns
     ; the appended position). idx_put(idx, hash, height).
-    push rax                  ; save height across idx_put
     mov  rdi, [s_htidx]
     lea  rsi, [sb_buf+0x200000]
-    pop  rdx                  ; height
+    mov  rdx, [s_lastheight]
     call idx_put
+    ; log this inbound-relay disk write (daemon/tx_accept.c) -- the ONLY
+    ; place a peer-pushed block (unsolicited or via our own .do_inv-triggered
+    ; getdata) becomes visible in the log; the outbound download worker's own
+    ; writes are logged separately in main.c's do_outbound_sync.
+    lea  rdi, [sb_buf+0x200000]
+    mov  rsi, [s_lastheight]
+    mov  rdx, [s_plen]
+    call log_block_stored_inbound
     ; bump the served/blocks counter + tip-watch will announce the new tip next
     ; iteration (s_lasttip is stale -> .next announces it exactly once).
     inc  qword [s_served]
