@@ -554,6 +554,24 @@ long utxo_live_catchup(void* store_buf){
         }
         g_applied_height = h;
         applied++;
+
+        /* Compact periodically DURING a long catch-up, not just once at the
+         * end. A from-scratch (or long-gap) replay flushes far more runs
+         * than a steady-state catch-up call ever would, and the manifest
+         * has a hard cap (UTXO_LIVE_MANIFEST_CAP) sized for steady-state
+         * gaps, not a full historical replay. Without this, a long
+         * catch-up deterministically walks into the cap and utxo_lsm_put/
+         * del starts returning -1 (fatal, per live_on_output/live_on_input)
+         * partway through -- observed in production: a from-scratch replay
+         * (applied_height reset to -1) hit this wall at height 202134. */
+        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
+            long cr = utxo_lsm_compact(&g_utxo_lst);
+            fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
+                    h, g_utxo_lst.manifest_n, cr);
+            if (!persist_applied_height(g_applied_height)) {
+                fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld mid-catchup\n", g_applied_height);
+            }
+        }
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable
