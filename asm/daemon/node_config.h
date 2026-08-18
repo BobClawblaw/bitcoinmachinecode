@@ -17,6 +17,12 @@
 #ifndef NODE_CONFIG_H
 #define NODE_CONFIG_H
 
+/* addnode/seednode/connect are the only REPEATABLE keys: a bitcoin.conf may
+ * name several and every occurrence counts. 32 is well past what an operator
+ * hand-lists and keeps g_cfg a fixed-size static (no allocation on a path
+ * that must never fail). */
+#define CFG_MAX_NODES 32
+
 typedef struct {
     /* connection budget (Core: -maxconnections and the outbound classes) */
     int  max_connections;        /* total; inbound = this - outbound classes */
@@ -54,6 +60,22 @@ typedef struct {
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
     long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
+
+    /* ---- peer sourcing (Core -dnsseed/-seednode/-addnode/-connect) ----
+     * Until now the DNS seed list was compiled in and there was no way to
+     * point the node at specific peers -- which made isolated/regtest-style
+     * bring-up and "just use these two nodes" debugging impossible without a
+     * rebuild. Entries are hostnames or dotted-quad IPv4; they are resolved
+     * at use, not at parse (a seed host that is down at boot must not be a
+     * permanent config error). */
+    int  dnsseed;                /* Core -dnsseed: query DNS seeds (def 1)   */
+    int  connect_only;           /* Core -connect was given: no auto conns   */
+    int  n_seednode;
+    int  n_addnode;
+    int  n_connect;
+    char seednode[CFG_MAX_NODES][64];  /* getaddr from, then drop            */
+    char addnode [CFG_MAX_NODES][64];  /* prefer, and never evict            */
+    char connectn[CFG_MAX_NODES][64];  /* the ONLY peers, when non-empty     */
 } node_config_t;
 
 extern node_config_t g_cfg;
@@ -70,5 +92,11 @@ void node_config_log(void);
 /* Resolve the config path: $BITCOIN_CONF, else <datadir>/bitcoin.conf, else
  * ../config/bitcoin.conf relative to the datadir (where this repo keeps it). */
 const char* node_config_path(const char* datadir, char* buf, unsigned long cap);
+
+/* True if <ip> was named by the operator via addnode= or connect=. Such peers
+ * are MANUAL connections: Core never auto-evicts them and neither do we --
+ * otherwise the dead-weight eviction pass would ban the very nodes the
+ * operator pinned, and a connect= node list would empty itself. */
+int node_config_is_manual(const char* ip);
 
 #endif
