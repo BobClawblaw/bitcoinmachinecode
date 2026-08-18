@@ -607,7 +607,16 @@ utxo_store_reload:
     push r13
     push r14
     push r15
-    sub  rsp, 0x160
+    ; frame enlarged from the original 0x160 -- the script scratch buffer at
+    ; [rbp-0x140] (used by both .ckpt_loop and .rep_push below) only had
+    ; ~0x20 bytes of real margin before this fix, but a script's slen can be
+    ; up to 65535 (SCRIPT_MAX_BYTES-1): a real WAL/checkpoint script over
+    ; ~32 bytes -- routine for real Bitcoin scripts -- smashed the stack
+    ; (return addresses included) reading past it. This never showed up in
+    ; testing because every test fixture used tiny (<32-byte) scripts; a
+    ; real replay's WAL tail with real-sized scripts crashes reliably.
+    ; +65536 gives [rbp-0x140] a full SCRIPT_MAX_BYTES of safe room below it.
+    sub  rsp, 0x160+65536
     mov  r12, rdi
     mov  r13, rsi
     ; ---- (1) reset table ----
@@ -796,7 +805,7 @@ utxo_store_reload:
     mov  eax, 3
     syscall
     mov  rax, r15
-    add  rsp, 0x160
+    add  rsp, 0x160+65536
     pop  r15
     pop  r14
     pop  r13
@@ -808,7 +817,7 @@ utxo_store_reload:
     jmp  .rep_close
 .fail:
     mov  rax, -1
-    add  rsp, 0x160
+    add  rsp, 0x160+65536
     pop  r15
     pop  r14
     pop  r13
