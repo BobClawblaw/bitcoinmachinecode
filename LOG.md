@@ -7,6 +7,267 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-17/18 -- UTXO set replaced with an LSM-tree, then wired live into the P2P daemon (mempool/tx-relay validation, commits 4e393ef..3ff03f3)
+
+### The problem: single-table UTXO store write-amplified ~13x during full replay
+A full-archive UTXO-set-from-archive replay (`daemon/build_utxo.c`, driving
+`bitcoin_utxo_store.asm`/`bitcoin_utxo.asm`) started at ~9,000 blocks/sec and
+collapsed to under 100 blocks/sec by 15% progress. Root cause, confirmed
+empirically (`iostat`, `/proc/PID/io`, `/proc/PID/smaps_rollup`): the
+in-memory hash table has to be pre-sized upfront for the FINAL total live
+UTXO count (~408M, at 2^30=1.07B slots for headroom), but during replay the
+hash function scatters writes essentially randomly across that entire
+51.5GB mmap'd, file-backed structure from block 0 onward, regardless of how
+few entries are actually live -- table pages measured being written back to
+disk ~13x on average (606GB actually written vs ~47GB of real touched
+data). Two low-risk mitigations (drop a redundant WAL `lseek()`, raise
+`vm.dirty_ratio`) helped but didn't fix the structural problem; shrinking
+the table to 2^29 slots gave 2-4x but risked silently producing an
+incomplete set if the live-count estimate ran even moderately over.
+
+Bitcoin Core avoids this with LevelDB (an LSM-tree) behind a bounded
+`-dbcache`, not one giant pre-sized structure. Built the equivalent from
+scratch (no external libraries, matching this project's ethos):
+`bitcoin_utxo_lsm.asm`, reusing `bitcoin_utxo.asm`'s open-addressing table
+UNCHANGED as the memtable engine (proven correct via prior backward-shift-
+deletion stress testing), instantiated small and fixed-size, never resized.
+
+### Phase 1 (4e393ef): bounded memtable + per-generation WAL + sorted-run flush
+On-disk layout: `utxo_manifest.dat` (run-generation list, published via
+temp-file+fsync+rename -- NOT the old `utxo.idx`'s O_TRUNC-rewrite-in-place,
+which has its own unfixed crash hazard), `utxo_run_%06d.dat` (immutable
+sorted runs: min/max key + Bloom filter + sparse index + sorted records),
+`utxo_wal.dat` (reuses `bitcoin_utxo_store.asm`'s existing PUSH/DEL record
+format, scoped to the current generation, truncated on flush). Per-run
+Bloom filter (txids are SHA256d, so byte-order is uniform -- a min/max
+bounds check alone gives near-zero pruning power). `utxo_lsm_del`
+deliberately changed behavior vs `utxo_del`: a memtable miss always emits a
+tombstone rather than silently no-op'ing, since every DEL here is a real
+consensus-valid spend. Verified via `tests/test_utxo_lsm.c` (basic
+put/get/del across memtable+runs, tombstone-shadowing, crash-recovery
+simulation at each of the 5 flush ordering steps), then a 100+-trial
+randomized stress test, before swapping `build_utxo.c` over and running a
+smoke differential (identical live count + sampled `utxo_get` results)
+against the real archive. Full-archive rate stayed flat instead of
+collapsing (e.g. 694 blk/s vs the old store's 79 blk/s at matching
+checkpoints) -- fix confirmed.
+
+Also found and fixed, while verifying Phase 1: a pre-existing (not new)
+`bitcoin_utxo_store.asm` bug in `utxo_store_reload`'s WAL-tail replay --
+`slen` was stored via a 32-bit `mov` into an 8-byte stack slot then reloaded
+via a 64-bit `mov`, leaving stack garbage in the high 4 bytes and corrupting
+the size `utxo_put` used for its blob-capacity check, spuriously reporting
+"table full" AFTER already writing the slot's txid/index (a phantom
+occupied-but-empty slot). Fixed by storing the full zero-extended `rax`
+instead of `eax` at both occurrences.
+
+### Phase 2 (c0a2f68): streaming k-way merge compaction
+Manifest refactored from 8-byte `[gen]` entries (run_no implied by array
+index) to explicit 16-byte `[gen:8][run_no:8]` pairs, since compaction
+replaces many runs with one, breaking the index-implies-run_no invariant.
+`utxo_lsm_compact`: opens up to 64 oldest runs, streams the globally-
+smallest key across all input buffers, always drops tombstones (safe since
+compaction is always a prefix down to the oldest live run), publishes via
+the same fsync+rename sequence as flush.
+
+Two real bugs, both found via a 6000-round stress test with compaction
+interleaved every 211 rounds, both root-caused with a minimal ~211-round
+deterministic repro (`/tmp/repro_compact.c`) once isolated, rather than
+continuing to iterate against the slow full test:
+- **Key-aliasing**: the "advance every slot matching the winning key" loop
+  compared against the winning slot's own LIVE key field, which gets
+  mutated in place when it's one of the slots being advanced (which it
+  always is, since it won). Fixed by snapshotting the winning key into a
+  stable buffer before any advancing starts.
+- **The real corruption**: `mac_bloom_setbit`'s signature is
+  `(key, seed, bloom_base, bits_mask)`, but the compaction code placed
+  `bloom_base` in `rsi` instead of `rdx`, while `rdx` still held the
+  winning slot's OWN address from an earlier instruction in the same
+  block -- `mac_bloom_setbit`'s internal `add rdx,rbx; or [rdx],al` wrote
+  into the winning slot's own header fields instead of the bloom bitmap,
+  corrupting its `fd` (observed as an impossible `fd=2097163`), which then
+  failed with a real I/O error the NEXT time that slot needed re-reading.
+  Found via a hardware watchpoint on the corrupted slot's `fd` field, which
+  caught the exact write instruction and its caller. The existing FLUSH
+  code already had this correct; a copy-adaptation slip specific to the
+  new compaction path. Fixed by moving `bloom_base` to `rdx` as documented.
+
+Verified: full 6000-round stress test green (0 mismatches), plus a
+dedicated "close, fresh-init a second instance, `utxo_lsm_reload`, confirm
+state survives" check.
+
+### Live-daemon wiring (8408ee4..3ff03f3): five stages, three fresh bugs found while wiring, one archive-integrity bug found and fixed along the way
+
+**Stage 0 (8408ee4) -- cross-process archive-write race.** Investigating how
+to wire the LSM store into `main.c`'s live P2P loop surfaced a real,
+independent bug: the download worker (`serve_download_worker`) is NOT
+actually the sole block writer in `serve` mode, despite its own comment
+claiming so -- a forked inbound serve child can also append a pushed block
+(`bitcoin_serve.asm` `.do_block`, reachable via an unsolicited `inv` or the
+child's own `.do_inv`-triggered `getdata`, regardless of `nwant=0`), using
+plain unlocked `store_append` while believing (per a stale comment) that
+`st+40` wasn't a valid flock fd in this context -- it is, `main.c` sets it
+before both forks. Simply flock-guarding both paths wasn't sufficient
+either: `store_append_shared` takes a caller-supplied height, so two
+writers each computing "next height" from their own stale cached state
+could still both decide on the same height and clobber each other's index
+slot, since the lock only serializes the byte-level write, not that
+decision made outside it. Fixed with a new primitive,
+`idxscan_append_locked` (`bitcoin_idxscan.asm`): holds the same flock,
+determines the true current tip via the existing hole-aware `idxscan_tip()`
+scan (robust to a batch tool's pre-sized/zero-padded trailing region, unlike
+a raw `idx_len/48` read) UNDER that lock, then delegates to
+`store_append_shared` with that height -- making "read tip, then write" one
+atomic critical section. Both `node_sync` and `.do_block` now go through it.
+Verified via the full daemon/IBD/serve test suite (0 regressions); redeployed
+the live production daemon onto this binary.
+
+**Archive corruption (found and fixed mid-Stage-1, not part of the original
+plan).** The very first full LSM-based UTXO replay against the real archive
+completed (962,831 blocks, ~9,600s) but flagged 13,513 heights where the
+stored block data's hash didn't match its own index record --
+`build_utxo.c` already had defensive per-block hash verification (added
+after an EARLIER instance of this exact issue was found during development)
+that skips and logs rather than aborting. The bad heights clustered in a
+very telling pattern: contiguous runs starting at round chunk-boundary
+numbers (30000, 40000, 42000, 44000, 46000, 48000, 52000, plus three
+smaller clusters near 388180/482331/482852) -- the signature of
+`unified_ibd.c`'s own documented (and already-fixed) "boundary-chain-break"
+header-reuse bug from an earlier backfill pass, leaving stale, NON-ZERO
+(so invisible to the existing zero-record hole-detection) index records
+that were never actually holes, just wrong. Root-caused via direct
+byte-level inspection (a small `pread`-based Python script) confirming the
+recorded `file_no`/`pos` for one such height pointed at bytes that don't
+even parse as a valid `[len][magic]` frame. Fix: zeroed the 13,513 bad
+records (making them real, detectable holes), re-ran `backfill_holes.sh`
+(0 holes afterward, 100% contiguous from genesis, independently re-verified
+byte-hash-exact on all 13,513 previously-bad heights), then discarded the
+first replay's ~219GB of now-known-incomplete LSM state and re-ran the full
+replay from scratch against the corrected archive (order-dependent: a coin
+created in a skipped height but spent in an already-processed later height
+would otherwise end up incorrectly "live" if just patched in after the
+fact). Second replay completed clean, 0 corruption warnings.
+
+**Stage 1 (b332d42) -- `daemon/utxo_live.c`: live UTXO catch-up.** The
+download worker becomes the sole live UTXO writer, tracked via a PERSISTED
+applied-height counter (published with the same tmp+fsync+rename+dirfsync
+pattern the LSM store's own manifest uses) compared against the store's
+TRUE on-disk tip every rotation -- not a per-call before/after diff the way
+`do_outbound_sync` tracks its own sync progress, since that would only ever
+see blocks this process's own `node_sync` calls produced, missing a
+sibling inbound child's (now Stage-0-safe) `.do_block` writes entirely.
+Sized far smaller than `build_utxo.c`'s batch-scale memtable so a future
+per-connection `utxo_lsm_reload()` stays cheap. Extracted
+`read_varint`/`walk_tx_io` out of `build_utxo.c` into a new shared
+`daemon/utxo_walk.h` rather than duplicating them.
+
+Two real bugs found via a standalone smoke test (init, apply <1
+flush-threshold worth of puts against a truncated 500-height archive slice,
+close, re-init, verify state survives) BEFORE this ever touched
+`main.c`:
+- `utxo_manifest.dat` is only created at the first flush -- checking its
+  existence alone to decide init-vs-reload misses any WAL-durable-but-
+  unflushed state and silently starts fresh, losing it (observed as count
+  dropping from 503 to 0 across a close/reopen). Fixed by also checking
+  `utxo.dat` (the actual WAL file) directly.
+- `utxo_lsm_init` and `utxo_lsm_reload` have different return contracts (1
+  ok / -1 err vs REPLAYED RECORD COUNT / -1 err) -- a single `r != 1` check
+  treated reload's own legitimate success (e.g. 523 replayed records) as a
+  failure. Root-caused via a `gdb` breakpoint directly at the presumed
+  `.rl_fail` label, which never fired, revealing the return-value
+  assumption itself was wrong rather than any actual failure path.
+
+Deployment of Stage 1+ to the live daemon deliberately deferred until the
+corrected full replay finished, to avoid two processes (the replay tool and
+`utxo_live_init`) touching the same on-disk LSM files concurrently with no
+coordination between them.
+
+**Stage 2 (897fc45) -- `mv_resolve` pointer-lifetime bug.**
+`bitcoin_txval_modern.c`'s `mv_resolve` resolved every input's prevout
+script in one loop, storing the raw `utxo_get`-returned pointer before any
+of them are consumed -- including P2TR keypath verification's own
+aggregation of ALL inputs' scripts together for the combined sighash, much
+later in the same function. Safe against `bitcoin_utxo.asm`'s stable
+in-memory pointers, but not against `utxo_lsm_get`'s documented contract:
+on a disk-run hit, the returned pointer is only valid until the NEXT
+`utxo_lsm_get` call -- exactly what the loop resolving the next input does.
+Any multi-input tx with 2+ disk-resident prevouts (the common case once the
+memtable has flushed past them) would validate against corrupted script
+bytes once wired to the LSM backend. Fixed with an owned per-input
+`prev_spk_buf[42]`, copied into immediately after each resolve call.
+Confirmed a behavior no-op against the current stable-pointer backend:
+`test_mempool_accept_modern` still passes all 23 checks byte-for-byte.
+
+**Stages 3-4 (d31d12b, 3ff03f3) -- compat shim + wiring `.do_tx`.**
+`.do_tx` accepted any syntactically-minimal tx with zero validation. New
+`daemon/tx_accept.c` gives each forked inbound connection a read-only UTXO
+snapshot via one `utxo_lsm_reload()` at connection start (private malloc'd
+memory, never file-backed/shared -- must never collide with the writer's
+own mmap'd state or with sibling connections), then runs the tx through the
+existing, already-tested `mpool_policy_add` (fee/RBF/ancestor-descendant
+limits) and `txval_modern` (full segwit/taproot signature verification)
+before storing anything for relay.
+
+A naming collision required a rename, not just new glue code:
+`mpool_policy_add`/`txval_modern` call `utxo_get` to resolve confirmed
+prevouts, but that exact symbol is ALREADY bound -- as an unrelated
+dependency of `bitcoin_utxo_lsm.asm`'s own memtable internals -- in any
+binary that also links the LSM store, so a second, differently-behaved
+definition under the same name would collide at link time. Renamed their
+call sites to `mempool_resolve_confirmed_utxo`; the two existing test
+harnesses get a 3-line passthrough to the real `utxo_get`, preserving their
+exact prior behavior (confirmed unchanged: both pass as before).
+
+Ordering matters and isn't what a first read of the task suggested:
+`mpool_policy_add`'s own accept path already calls `mpool_put` internally
+as its final step (confirmed directly in `bitcoin_mempool_policy.c`), and
+there is no public API to unregister a tx from its internal
+ancestor/descendant graph state afterward -- only the structural
+`mpool_del`, which wouldn't clean up that bookkeeping. So `txval_modern`
+(pure signature/structural validation, no policy/mempool dependency) runs
+FIRST: a signature failure then never triggers the policy accept+insert in
+the first place, rather than inserting and needing a rollback that isn't
+cleanly possible via the existing API.
+
+New permanent test, `tests/test_tx_accept_e2e.c` -- not covered by
+`test_mempool_accept_modern`, which only ever exercises the old
+`bitcoin_utxo.asm`-backed passthrough, never `tx_accept.c` itself: seeds a
+real confirmed prevout into a fresh on-disk LSM store, drives the actual
+`tx_dispatch_init`/`tx_policy_init`/`tx_accept_validate` sequence
+`bitcoin_serve.asm` now uses, and proves both that a valid spend is
+accepted and actually stored in the mempool, AND that a corrupted-signature
+spend is rejected and leaves no phantom mempool entry (the concrete proof
+the ordering fix above works). Landmine while building it: BIP141 txid
+excludes witness data, so corrupting a witness signature byte does NOT
+change the tx's own txid -- reusing the same fixture for both the
+valid-accept and corrupted-reject cases made the "not left in the mempool"
+check spuriously find the valid tx's own legitimate entry; fixed by using a
+distinct fixture for the corruption case.
+
+Stage 4 (Makefile `DAEMONOBJS`/`SERVEOBJS` wiring) landed incrementally
+across Stages 1 and 3 as each needed new objects to link, then got a
+dedicated cleanup pass (3ff03f3): running the FULL `make test` suite (not
+just the individually-touched targets) caught six more test binaries
+(`test_keepup`, `test_bip152_loop`, `test_sendheaders_fee`,
+`test_outbound_mux`, `test_redial`, `soak_mux_peer`) that also link
+`bitcoin_serve.o` and needed the same new sources -- refactored into a
+shared `SERVETXVALSRCS` Makefile variable instead of six separate copies.
+
+**Full verification**: entire `make test` suite (~80 harnesses) green, 0
+failures, after the Makefile fix. One transient failure during an earlier
+run (`test_scalarmul_ct`, a constant-time timing-ratio check, unrelated
+secp256k1 code never touched by any of this) reproduced as flaky under
+concurrent system load (the background UTXO replay competing for CPU) --
+confirmed by 3/3 clean passes in isolation, not a regression.
+
+**Status at end of session**: Stage 0 deployed live. Stages 1-4 committed,
+tested, NOT yet deployed to the live daemon -- pending confirmation the
+corrected UTXO replay is fully complete and the daemon restart is a good
+time (deployment replaces the running production process). Remaining:
+redeploy, then task-level real-peer soak testing of live tx-relay/mempool
+acceptance.
+
+----------------------------------------------------------------------------
 ## 2026-08-17 -- secp256k1_fe.asm: fe_mul REWRITTEN WITH adcx/adox PARALLEL CHAINS (1.13x, FULLY VERIFIED)
 ### Goal and outcome
 A different question this time: not more C-to-asm conversion, but whether
