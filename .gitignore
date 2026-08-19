@@ -117,6 +117,9 @@ asm/tests/test_txtxid
 asm/tests/test_pubkey
 asm/tests/test_sighash
 asm/tests/test_sighash_oob
+asm/tests/test_legacy_sighash
+asm/tests/test_find_and_delete
+asm/tests/test_hashtype_e2e
 asm/tests/test_script
 asm/tests/test_p2pkh
 asm/tests/test_utxo
