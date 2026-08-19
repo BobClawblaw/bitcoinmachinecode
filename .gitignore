@@ -205,3 +205,51 @@ data/addressbook.dat
 # ---- Full-chain differential resume/progress state (scratch, not a deliverable) ----
 validation/fullchain_state/
 
+# ---- Stage D / script-verify / archive-repair / bulk-catchup test binaries
+# and standalone diagnostic tools (sources are tracked where they exist) ----
+asm/tests/consensus_shim
+asm/tests/run_batch
+asm/tests/test_interp_legacy_spend
+asm/tests/test_keepup
+asm/tests/test_outbound_mux
+asm/daemon/build_addr_index
+asm/daemon/build_migrate_compact
+asm/daemon/build_utxo
+asm/daemon/flush_wal_tail
+asm/daemon/utxo_reload_check
+asm/tests/bench_ecdsa
+asm/tests/test_addr_ingest
+asm/tests/test_archive_check
+asm/tests/test_archive_repair
+asm/tests/test_archive_verify
+asm/tests/test_chainwork
+asm/tests/test_dial_budget
+asm/tests/test_locator
+asm/tests/test_net_policy
+asm/tests/test_node_config
+asm/tests/test_prevhash
+asm/tests/test_reorg
+asm/tests/test_scriptverify_parity
+asm/tests/test_truncate
+asm/tests/test_truncate_guard
+asm/tests/test_truncate_guard_prim
+asm/tests/test_tx_accept_e2e
+asm/tests/test_tx_verify_parallel
+asm/tests/test_undo_log
+asm/tests/test_utxo_checkpoint
+asm/tests/test_utxo_lsm
+asm/tests/test_utxo_recover
+
+# ---- macOS / Apple junk ----
+# AppleDouble resource-fork companions (created by macOS when files are copied
+# over SMB/FAT/network shares). The 1337 stray ._* files deleted 2026-08-19
+# came from this. ._* matches in every directory.
+._*
+.DS_Store
+.AppleDouble
+LSOverride
+.Spotlight-V100
+.Trashes
+# Apple's per-folder resource fork directory
+.fseventsd
+
