@@ -30,6 +30,18 @@ le_hex_to_dec(){
   echo $((16#$rev))
 }
 
+# whole seconds -> "DD:HH:MM:SS" (days can exceed 2 digits; the rest are
+# zero-padded). A bare "459s" reads as noise once it climbs past a minute or
+# two -- this is the one format that stays legible from seconds out to days.
+fmt_dhms(){
+  local s=$1
+  if [ -z "$s" ] || ! [ "$s" -ge 0 ] 2>/dev/null; then echo "n/a"; return; fi
+  local d=$((s/86400)); s=$((s%86400))
+  local h=$((s/3600));  s=$((s%3600))
+  local m=$((s/60));    s=$((s%60))
+  printf "%d:%02d:%02d:%02d" "$d" "$h" "$m" "$s"
+}
+
 read_live_height(){
   local pid=$1 addr=$2 hex
   hex=$(as_root dd if="/proc/$pid/mem" bs=1 skip="$((addr))" count=8 status=none 2>/dev/null | xxd -p 2>/dev/null)
@@ -76,7 +88,7 @@ while true; do
     cur_ts=$(awk '{print $1" "$2}' <<<"$cur")
     cur_epoch=$(date -d "$cur_ts" +%s 2>/dev/null)
     age=$(( $(date +%s) - cur_epoch ))
-    log_str="log: h=${h}/${end} (${pct}%) last line ${age}s ago"
+    log_str="log: h=${h}/${end} (${pct}%) last line $(fmt_dhms "$age") ago"
     [ -z "$tip" ] && tip=$end
   fi
 
@@ -88,8 +100,9 @@ while true; do
       rate=$(awk "BEGIN{printf \"%.2f\", $dh/$dt}")
       if [ -n "$tip" ]; then
         left=$((tip - live_h))
-        eta=$(awk "BEGIN{ r=$dh/$dt; printf \"%s\", (r>0)?sprintf(\"%.1fh\", $left/r/3600):\"n/a\" }")
-        live_str="LIVE h=${live_h} (${rate} blk/s now, ETA~${eta})"
+        eta_secs=$(awk "BEGIN{ r=$dh/$dt; printf \"%d\", (r>0)?($left/r):-1 }")
+        eta=$(fmt_dhms "$eta_secs")
+        live_str="LIVE h=${live_h} (${rate} blk/s now, ETA~${eta} [D:H:M:S])"
       else
         live_str="LIVE h=${live_h} (${rate} blk/s now)"
       fi
