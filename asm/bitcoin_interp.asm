@@ -145,8 +145,16 @@
 %define OP_CHECKSIGVERIFY 0xad
 %define OP_CHECKMULTISIG 0xae
 %define OP_CHECKMULTISIGVERIFY 0xaf
+%define OP_NOP1 0xb0
 %define OP_CHECKLOCKTIMEVERIFY 0xb1
 %define OP_CHECKSEQUENCEVERIFY 0xb2
+%define OP_NOP4 0xb3
+%define OP_NOP5 0xb4
+%define OP_NOP6 0xb5
+%define OP_NOP7 0xb6
+%define OP_NOP8 0xb7
+%define OP_NOP9 0xb8
+%define OP_NOP10 0xb9
 %define OP_CHECKSIGADD 0xba
 %define OP_PUSHDATA4 0x4e
 
@@ -536,6 +544,33 @@ script_eval:
     je    .op_cltv
     cmp   rax, OP_CHECKSEQUENCEVERIFY
     je    .op_csv
+    ; OP_NOP1 (0xb0) and OP_NOP4..OP_NOP10 (0xb3..0xb9): consensus no-ops.
+    ; Only OP_NOP2 (0xb1, -> CLTV/BIP65) and OP_NOP3 (0xb2, -> CSV/BIP112)
+    ; were ever repurposed; the rest of the original reserved-for-upgrade
+    ; NOP range must still do nothing, exactly like plain OP_NOP -- treating
+    ; them as bad opcodes rejects real, historically-mined mainnet
+    ; transactions that used OP_NOP1 as part of a non-standard (but
+    ; consensus-valid) script (e.g. a hash-reveal script ending in
+    ; OP_EQUALVERIFY OP_NOP1 instead of OP_EQUALVERIFY OP_CHECKSIG).
+    ; SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS is a mempool/relay POLICY
+    ; flag (like STRICTENC, removed above) that never appears in Core's
+    ; consensus GetBlockScriptFlags, so it does not gate this here.
+    cmp   rax, OP_NOP1
+    je    .next_op
+    cmp   rax, OP_NOP4
+    je    .next_op
+    cmp   rax, OP_NOP5
+    je    .next_op
+    cmp   rax, OP_NOP6
+    je    .next_op
+    cmp   rax, OP_NOP7
+    je    .next_op
+    cmp   rax, OP_NOP8
+    je    .next_op
+    cmp   rax, OP_NOP9
+    je    .next_op
+    cmp   rax, OP_NOP10
+    je    .next_op
     jmp   .bad_opcode
 
 ; --- pushnum ---
