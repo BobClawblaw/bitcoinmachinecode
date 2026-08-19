@@ -122,7 +122,20 @@
 ;                                  from manifest_n/next_gen since compaction
 ;                                  can shrink the manifest while file
 ;                                  numbers must stay globally unique)
-;   (total struct size: 152 bytes)
+;   +152 qword tomb_hash_buf   -- LSM-OWNED, do NOT set: lazily mmap'd by
+;                                  mac_tomb_hash_reset (called from
+;                                  utxo_lsm_init/reload/mac_flush's post-
+;                                  flush reset). Array of 8-byte slots, each
+;                                  either -1 (empty) or a 0-based index into
+;                                  tomb_buf. Open-addressed hash set that
+;                                  makes utxo_lsm_get's tombstone-membership
+;                                  check O(1) instead of an O(tomb_n) linear
+;                                  scan of tomb_buf via mac_cmp_key -- caller
+;                                  still just zero-inits this field like
+;                                  every other struct field.
+;   +160 qword tomb_hash_mask  -- LSM-OWNED: (capacity-1) of tomb_hash_buf,
+;                                  capacity = next_pow2(max(tomb_cap,1)*2).
+;   (total struct size: 168 bytes)
 ;
 ; Exports (System V AMD64):
 ;   long utxo_lsm_init(void* lst)                              -> 1 / -1
@@ -349,6 +362,136 @@ mac_cmp_key:
     ret
 .lt:
     xor  eax, eax
+    ret
+
+; mac_tomb_hash_reset(lst=rdi) -> rax: 1 ok / -1 err
+;   (Re)initializes the O(1) tombstone-membership hash set (tomb_hash_buf/
+;   tomb_hash_mask) for a fresh generation. mmaps ONCE per lst instance
+;   (capacity = next_pow2(max(tomb_cap,1)*2) 8-byte slots -- anonymous pages
+;   are lazily zero-cost until touched, so this is cheap even at BULK-mode
+;   scale) and just memsets the existing mapping back to the -1 empty
+;   sentinel on every later call for the SAME lst -- avoids leaking a
+;   mapping on every flush/compact generation reset in a long-running
+;   process. Called from utxo_lsm_init, utxo_lsm_reload, and mac_flush's
+;   post-flush reset, everywhere tomb_n gets zeroed for a new generation.
+mac_tomb_hash_reset:
+    push rbx
+    push r12
+    mov  r12, rdi
+    cmp  qword [r12+152], 0
+    jne  .thr_fill
+    mov  rax, [r12+72]           ; tomb_cap
+    cmp  rax, 1
+    jae  .thr_min_ok
+    mov  rax, 1
+.thr_min_ok:
+    shl  rax, 1                   ; *2 for a <=50% max load factor
+    dec  rax
+    mov  rcx, rax
+    shr  rcx, 1
+    or   rax, rcx
+    mov  rcx, rax
+    shr  rcx, 2
+    or   rax, rcx
+    mov  rcx, rax
+    shr  rcx, 4
+    or   rax, rcx
+    mov  rcx, rax
+    shr  rcx, 8
+    or   rax, rcx
+    mov  rcx, rax
+    shr  rcx, 16
+    or   rax, rcx
+    mov  rcx, rax
+    shr  rcx, 32
+    or   rax, rcx
+    inc  rax                       ; rax = cap_pow2 (>= tomb_cap*2)
+    mov  rbx, rax
+    shl  rax, 3                     ; *8 bytes/slot
+    xor  edi, edi
+    mov  rsi, rax
+    mov  edx, 3                      ; PROT_READ|PROT_WRITE
+    mov  r10d, 0x22                   ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov  r8, -1
+    xor  r9d, r9d
+    mov  eax, 9                        ; mmap
+    syscall
+    cmp  rax, -1
+    je   .thr_err
+    mov  [r12+152], rax               ; tomb_hash_buf
+    dec  rbx
+    mov  [r12+160], rbx                ; tomb_hash_mask = cap_pow2-1
+.thr_fill:
+    mov  rdi, [r12+152]
+    mov  rcx, [r12+160]
+    inc  rcx                            ; slot count = mask+1
+    mov  rax, -1
+    rep  stosq
+    mov  rax, 1
+    jmp  .thr_done
+.thr_err:
+    mov  rax, -1
+.thr_done:
+    pop  r12
+    pop  rbx
+    ret
+
+; mac_tomb_hash_probe(lst=rdi, key=rsi) -> rax = &slot (in tomb_hash_buf)
+;   Finds either the slot already holding this key's tomb_buf index, or the
+;   first empty (-1) slot -- a combined find-or-insert-point, standard
+;   open-addressing linear probe. Always terminates: tomb_buf's own
+;   capacity check (tomb_n < tomb_cap, enforced at every append site)
+;   guarantees this table can never exceed 50% load, so an empty slot is
+;   always reachable.
+;   Caller decides what the result means: utxo_lsm_get checks whether
+;   *slot == -1 (not found) or otherwise found (this only returns early on
+;   an empty slot or a genuine key match, never anything in between);
+;   an appender just overwrites *slot with the new tomb_buf index.
+; Clobbers rax,rcx,rdx,r8,r9,r10. Preserves rbx/r12/r13 (pushed/popped, even
+; though used internally) and rdi/rsi (values, not contents pointed-to,
+; since neither mac_cmp_key nor this function ever assigns to them).
+mac_tomb_hash_probe:
+    push rbx
+    push r12
+    push r13
+    mov  r8, 0x811c9dc5
+    xor  ecx, ecx
+.hp_hl:
+    cmp  ecx, 8
+    jae  .hp_hdone
+    movzx eax, byte [rsi+rcx]
+    xor  r8d, eax
+    imul r8d, r8d, 16777619
+    inc  ecx
+    jmp  .hp_hl
+.hp_hdone:
+    mov  eax, [rsi+32]              ; vout index
+    xor  r8, rax
+    and  r8, [rdi+160]               ; tomb_hash_mask -> starting probe index
+    mov  r9, [rdi+152]                ; tomb_hash_buf base
+    mov  r10, [rdi+64]                 ; tomb_buf base
+    mov  r12, [rdi+160]                 ; mask (kept for wraparound)
+    mov  r13, rdi                        ; save lst -- rdi gets repurposed below
+.hp_probe:
+    lea  rbx, [r9 + r8*8]                  ; &slot
+    mov  rcx, [rbx]                         ; slot value (tomb_buf index or -1)
+    cmp  rcx, -1
+    je   .hp_ret
+    imul rax, rcx, 36
+    add  rax, r10                            ; &tomb_buf[slot_value]
+    mov  rdi, rax
+    call mac_cmp_key                          ; rsi (key) untouched by it
+    cmp  eax, 1
+    je   .hp_ret
+    inc  r8
+    and  r8, r12
+    jmp  .hp_probe
+.hp_ret:
+    mov  rax, rbx
+    mov  rdi, r13
+    pop  r13
+    pop  r12
+    pop  rbx
     ret
 
 ; ============================================================================
@@ -849,7 +992,10 @@ utxo_lsm_init:
     mov  qword [r12+96], 0
     mov  qword [r12+120], 0
     mov  qword [r12+144], 0
-    mov  rax, 1
+    mov  rdi, r12
+    call mac_tomb_hash_reset
+    cmp  rax, 1
+    jne  .li_fail
     jmp  .li_done
 .li_fail:
     mov  rax, -1
@@ -969,6 +1115,11 @@ utxo_lsm_del:
     pop  rdi
     mov  eax, r14d
     mov  [rdi+32], eax
+    mov  rsi, rdi                 ; key = &tomb_buf[old_index] (just-written)
+    mov  rdi, r12                  ; lst
+    call mac_tomb_hash_probe
+    mov  rdx, [r12+80]              ; old_index (tomb_n, still pre-increment)
+    mov  [rax], rdx
     inc  qword [r12+80]
     inc  qword [r12+40]
     dec  qword [r12+88]
@@ -1440,23 +1591,12 @@ utxo_lsm_get:
     pop  rdi
     mov  eax, [rbp-0x30]
     mov  [rdi+32], eax
-    mov  rax, [r12+80]        ; tomb_n
-    mov  [rbp-0x58], rax
-    mov  qword [rbp-0x60], 0
-.lg_tomb_loop:
-    mov  rax, [rbp-0x60]
-    cmp  rax, [rbp-0x58]
-    jae  .lg_tomb_done
-    mov  rdi, [r12+64]
-    mov  rcx, rax
-    imul rcx, rcx, 36
-    add  rdi, rcx
     lea  rsi, [rbp-0x100]
-    call mac_cmp_key
-    cmp  eax, 1
-    je   .lg_not_found
-    inc  qword [rbp-0x60]
-    jmp  .lg_tomb_loop
+    mov  rdi, r12
+    call mac_tomb_hash_probe
+    cmp  qword [rax], -1
+    je   .lg_tomb_done
+    jmp  .lg_not_found
 .lg_tomb_done:
 
     mov  rax, [r12+120]
@@ -1989,6 +2129,10 @@ mac_flush:
     call mac_clear_memtable
     mov  qword [r12+40], 0
     mov  qword [r12+80], 0
+    mov  rdi, r12
+    call mac_tomb_hash_reset
+    cmp  rax, 1
+    jne  .fl_err
     mov  rax, 1
     jmp  .fl_ret
 
@@ -2135,6 +2279,10 @@ utxo_lsm_reload:
 
     mov  qword [r12+80], 0
     mov  qword [r12+40], 0
+    mov  rdi, r12
+    call mac_tomb_hash_reset
+    cmp  rax, 1
+    jne  .rl_fail
     lea  rdi, [rel wal_name]
     xor  esi, esi
     mov  eax, 2
@@ -2215,6 +2363,11 @@ utxo_lsm_reload:
     mov  rdx, 36
     call mac_memcpy
     pop  rdi
+    mov  rsi, rdi                 ; key = &tomb_buf[old_index] (just-written)
+    mov  rdi, r12                  ; lst
+    call mac_tomb_hash_probe
+    mov  rdx, [r12+80]              ; old_index (tomb_n, still pre-increment)
+    mov  [rax], rdx
     inc  qword [r12+80]
     jmp  .rl_wal_loop
 .rl_wal_close:

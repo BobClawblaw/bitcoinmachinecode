@@ -52,7 +52,7 @@ extern long undo_load(long height, undo_rec_t* out, long max_recs);
 extern long undo_prune(long tip_height, long window);
 extern long undo_capture_and_del(void* lst, void* u, long height, const u8 txid[32], u32 index);
 
-/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes) --
+/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (168 bytes) --
  * same layout tests/test_utxo_lsm.c / daemon/utxo_live.c / daemon/tx_accept.c mirror. */
 struct LST {
     long log_fd, idx_fd;
@@ -62,6 +62,7 @@ struct LST {
     void* manifest_buf; unsigned long long manifest_cap, manifest_n;
     void* scratch_buf; unsigned long long scratch_cap;
     unsigned long long next_run_no;
+    void* tomb_hash_buf; unsigned long long tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
 };
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536
