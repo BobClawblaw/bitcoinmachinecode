@@ -456,6 +456,53 @@ live-network check. Final deliverable: daemon + CLI, both pure AI assembly.
   NUL, so open() reads past the end into stack garbage and creates corrupted long
   filenames (bitcoin_store fmt_blkname bug, #13). Size every store to its full field.
 
+### CURRENT STATE (LAST UPDATED 2026-08-18) -- re-syncing; script verification started
+Full detail and a RESUME HERE section: `worklog/2026-08-18.md`.
+Working rules earned the hard way: `ENGINEERING_RULES.md`.
+
+- **THE BLOCK ARCHIVE WAS DESTROYED AND IS RE-DOWNLOADING.**
+  `store_truncate_to` assumes blocks were appended in increasing height order;
+  it was called to "repair" an archive whose defect WAS out-of-order blocks,
+  and unlinked ~4,855 `blk*.dat` (~600GB) from a 962,831-block chain. Headers
+  survived. Re-sync healthy at 53% / 11 MB/s as of end of day. The primitive
+  now calls `store_layout_monotonic` ITSELF and refuses (`a7e2d26`) -- a
+  caller-only guard was not enough, `reorg_execute` also truncates.
+- Sync throughput 218 KB/s -> 11 MB/s: peer eviction retuned with a
+  min-usable floor, `peers.good` persistence, a corrected BIP155 addrv2
+  parser, and Core-shaped connection classes. Live peers 22 -> 86.
+- **Durable config is done**, Core key names and units throughout, read from
+  `config/bitcoin.conf` at boot: `maxconnections`, `dbcache`, `timeout`,
+  `peertimeout`, `port`, `bind`, `listen`, `blocksonly`, `par`,
+  `maxreceivebuffer`, `maxmempool`, `mempoolexpiry`, `maxuploadtarget`,
+  `dnsseed`, `seednode`, `addnode`, `connect`, `prune`, `checkblocks`,
+  `checklevel`, `stopatheight`. `txindex` and `assumevalid` are parsed ONLY to
+  warn -- neither has anything behind it.
+- **THE NODE DOES NOT SCRIPT-VERIFY BLOCKS.** `cons_verify` checks PoW, tx
+  parsing, coinbase shape and merkle root; `txval_modern` (the real signature
+  validator) is reached only from the MEMPOOL path in `tx_accept.c`. A block
+  with valid PoW and a correct merkle root is accepted whatever its signatures
+  say. Scoped in `PLAN_SCRIPT_VERIFY.md` with a measured cost basis
+  (`tests/bench_ecdsa`: 8,731 verifies/s/core -> ~2 h for the whole chain on
+  16 cores, so `assumevalid` is an optimisation, not a prerequisite).
+- Script verification **Stage A is done**: the asm interpreter is authoritative
+  and now emits Core's own ScriptError values, GENERATED from Core's header by
+  `validation/gen_script_error_defines.py` (21 of 24 were wrong).
+  `bitcoin_scriptverify.c` is the seam block connection will call;
+  `tests/test_scriptverify_parity` compares it against the C reference on
+  Core-validated vectors and is in `make test`.
+  That test immediately found a real consensus bug: `interp_checkmultisig` did
+  not enforce BIP147 NULLDUMMY and **accepted a spend Core rejects**. Fixed at
+  the opcode -- the dummy is popped during operand cleanup, so no caller could
+  ever have enforced it.
+- **NEXT: Stage B** -- legacy `SignatureHash` is SIGHASH_ALL only and there is
+  no `FindAndDelete` anywhere. That must be built before legacy script-type
+  dispatch. See `PLAN_SCRIPT_VERIFY.md`.
+- Known limitation: the archive is NOT laid out monotonically (parallel chunked
+  download writes out of height order), which blocks reorg truncation and
+  pruning. Now detectable on demand with `checklevel>=2`.
+- `/storage/bitcoin-core-source/src` is a full Core source tree and is the
+  authority for every Core constant. Read it; do not recall values.
+
 ### CURRENT STATE (LAST UPDATED 2026-08-17) -- built-in self-healing catch-up
 - Primary mechanism is now BUILT INTO THE DAEMON: `bitcoind serve <dir> <port>`
   runs `dl_catchup` (asm/daemon/main.c) synchronously at boot -- no external
