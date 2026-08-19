@@ -256,11 +256,28 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
     if (r == -1 || r == 2) ctx->fatal = 1; /* -1 I/O error, 2 table full (undersized memtable) */
 }
 
+/* rollback_partial_apply(): undo whatever apply_block_inner already
+ * committed for transactions 0..upto_t_inclusive of the CURRENT block
+ * before failing partway through it, so a retry of this same height starts
+ * from the true pre-block state instead of one where the first N
+ * transactions' spends already landed. Without this, a retry re-walks from
+ * tx 0 and its OWN first spend of an already-consumed input fails with a
+ * confusing "missing/already-spent UTXO" that masks the real rejection
+ * reason -- exactly what happened live at height 212613 on 2026-08-19 (the
+ * OP_NOP1 bug's real error got buried under this artifact on every retry).
+ * Forward-declared here; defined below once del_created_on_output and
+ * undo_restore_cb exist (this file's existing STAGE B disconnect helpers,
+ * reused as-is -- not reimplemented). */
+static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_inclusive);
+
 /* Apply every tx's puts/dels in one block. Returns 1 on a clean apply, 0 on
  * a parse inconsistency (caller logs/skips -- matches build_utxo.c's own
  * corrupt-block handling; the Stage 0 archive-write-race fix plus the
  * corruption repair already run make this an unexpected path in practice,
- * not a normal one). */
+ * not a normal one). Any failure ONCE THE LOOP HAS STARTED rolls back
+ * whatever it already committed (see rollback_partial_apply) before
+ * returning -- the two returns before the loop starts (malformed block
+ * header) need no rollback since nothing has been applied yet. */
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (blocklen < 81) return 0;
     const u8* p = blockbuf + 80;
@@ -277,7 +294,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     for (u64 t=0; t<ntx && !ctx.fatal; t++){
         u8 info[64];
         int ok = tx_parse(info, p, (unsigned long)(blkend - p));
-        if (!ok) return 0;
+        if (!ok) { if (t>0) rollback_partial_apply(blockbuf, blocklen, t-1); return 0; }
         u64 txlen; memcpy(&txlen, info, 8);
         u32 pn_in, pn_out; memcpy(&pn_in, info+12, 4); memcpy(&pn_out, info+16, 4);
 
@@ -295,14 +312,15 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                                          &g_utxo_lst, g_utxo_table, &reason)) {
                 fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n",
                         g_apply_height, (unsigned long)t, reason);
+                if (t>0) rollback_partial_apply(blockbuf, blocklen, t-1);
                 return 0;
             }
         }
 
         u64 wnin=0, wnout=0;
         int wok = utxo_walk_tx_io(p, p+txlen, &ctx, live_on_input, live_on_output, &wnin, &wnout);
-        if (!wok || ctx.fatal) return 0;
-        if (wnin != pn_in || wnout != pn_out) return 0;
+        if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
+        if (wnin != pn_in || wnout != pn_out) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
         p += txlen;
     }
     return ctx.fatal ? 0 : 1;
@@ -370,11 +388,15 @@ static void count_on_input(void* ctxv, const u8 txid[32], u32 index){
 }
 
 /* Walk a block's transactions, invoking the given input/output callbacks.
- * Shared by the counting pre-flight and the created-output deletion below so
- * the two can never drift on how a block is sliced. Returns 1 well-formed. */
+ * Shared by the counting pre-flight, the created-output deletion below, and
+ * the partial-apply rollback further down, so all three can never drift on
+ * how a block is sliced. max_tx bounds how many leading transactions get
+ * walked -- pass (u64)-1 for "the whole block" (the two disconnect-path
+ * callers below want that; partial-apply rollback wants only the
+ * transactions it knows were actually touched). Returns 1 well-formed. */
 static int walk_block_txs(const u8* blockbuf, u64 blocklen, void* ctx,
                           utxo_walk_input_cb icb, utxo_walk_output_cb ocb,
-                          const u8** cur_txid_slot){
+                          const u8** cur_txid_slot, u64 max_tx){
     if (blocklen < 81) return 0;
     const u8* p = blockbuf + 80;
     const u8* blkend = blockbuf + blocklen;
@@ -384,7 +406,7 @@ static int walk_block_txs(const u8* blockbuf, u64 blocklen, void* ctx,
     p += consumed;
 
     static u8 txid_scratch2[4<<20];
-    for (u64 t=0; t<ntx; t++){
+    for (u64 t=0; t<ntx && t<max_tx; t++){
         u8 info[64];
         if (!tx_parse(info, p, (unsigned long)(blkend - p))) return 0;
         u64 txlen; memcpy(&txlen, info, 8);
@@ -409,7 +431,7 @@ static int undo_count_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
 
 int utxo_live_can_unapply(const void* blockbuf, u64 blocklen, long height){
     count_ctx_t cc = { 0 };
-    if (!walk_block_txs((const u8*)blockbuf, blocklen, &cc, count_on_input, 0, 0)){
+    if (!walk_block_txs((const u8*)blockbuf, blocklen, &cc, count_on_input, 0, 0, (u64)-1)){
         fprintf(stderr, "[utxo_live] unapply pre-flight: height %ld block does not parse\n", height);
         return 0;
     }
@@ -454,6 +476,49 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
                                   * unapplied) is expected, not an error */
 }
 
+/* rollback_partial_apply(blockbuf, blocklen, upto_t_inclusive): reverse
+ * whatever apply_block_inner already committed for transactions
+ * 0..upto_t_inclusive of the block CURRENTLY being applied at g_apply_height,
+ * after it failed partway through. Deliberately NOT utxo_live_unapply_block:
+ * that function's pre-flight gate (utxo_live_can_unapply) REQUIRES the undo
+ * file's record count to equal the WHOLE block's declared input count --
+ * exactly the mismatch a partial apply always produces, so it would refuse
+ * every single time. This is the same restore-then-delete two-step (see the
+ * STAGE B header comment above for why the order matters -- a same-block
+ * spend chain needs the earlier tx's output back before its own declared
+ * output gets deleted), just over a prefix of the block's transactions
+ * instead of the whole thing, and reusing the disconnect path's own
+ * undo_restore_cb / del_created_on_output callbacks unchanged.
+ *
+ * Both steps tolerate "never actually got that far": undo_replay only
+ * restores whatever records this partial attempt genuinely wrote (a
+ * verify-failure never reaches live_on_input, so no record exists for the
+ * failing tx), and deleting a never-created output returns "already
+ * absent" (0), not an error -- the same tolerance del_created_on_output
+ * already relies on for the real disconnect path. */
+static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_inclusive){
+    long height = g_apply_height;
+    int saved = g_undo_enabled;
+    g_undo_enabled = 0;
+
+    int fatal = 0;
+    long r = undo_replay(height, undo_restore_cb, &fatal);
+    if (r < 0 || fatal)
+        fprintf(stderr, "[utxo_live] rollback h=%ld: undo replay failed (r=%ld fatal=%d) -- state may be inconsistent\n",
+                height, r, fatal);
+
+    del_created_ctx_t dc = { 0, 0 };
+    int ok = walk_block_txs(blockbuf, blocklen, &dc, 0, del_created_on_output,
+                            &dc.txid, upto_t_inclusive + 1);
+    g_undo_enabled = saved;
+    if (!ok || dc.fatal)
+        fprintf(stderr, "[utxo_live] rollback h=%ld: created-output removal failed (ok=%d fatal=%d) -- state may be inconsistent\n",
+                height, ok, dc.fatal);
+
+    undo_discard(height);
+    fprintf(stderr, "[utxo_live] rolled back partial apply at h=%ld (tx 0..%lu)\n", height, (unsigned long)upto_t_inclusive);
+}
+
 /* utxo_live_unapply_block(buf, len, height) -> 1 clean / 0 failed.
  * Caller MUST have run utxo_live_can_unapply over the whole range first --
  * see the reorg driver, which pre-flights every height it intends to
@@ -476,7 +541,7 @@ int utxo_live_unapply_block(const void* blockbuf, u64 blocklen, long height){
 
     del_created_ctx_t dc = { 0, 0 };
     int ok = walk_block_txs((const u8*)blockbuf, blocklen, &dc, 0,
-                            del_created_on_output, &dc.txid);
+                            del_created_on_output, &dc.txid, (u64)-1);
     g_undo_enabled = saved;
     if (!ok || dc.fatal){
         fprintf(stderr, "[utxo_live] unapply height %ld: created-output removal failed (ok=%d fatal=%d)\n", height, ok, dc.fatal);

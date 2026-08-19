@@ -237,6 +237,7 @@ asm/tests/test_tx_accept_e2e
 asm/tests/test_tx_verify_parallel
 asm/tests/diff_add_ct_homog
 asm/tests/test_nop1_regression
+asm/tests/test_apply_block_rollback
 asm/tests/test_undo_log
 asm/tests/test_utxo_checkpoint
 asm/tests/test_utxo_lsm
