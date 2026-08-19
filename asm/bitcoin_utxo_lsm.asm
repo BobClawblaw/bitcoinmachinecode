@@ -150,6 +150,18 @@ section .text
 
 MAGIC_RUN        equ 0x4E555255      ; "URUN" little-endian dword -- OLD format, no sparse index
 MAGIC_RUN2       equ 0x32555255      ; "URU2" little-endian dword -- adds sparse_off/sparse_n
+; MAGIC_RUN3 (2026-08-19, Stage D): the PER-RECORD shape changes (a PUSH
+; record's value-portion grows from 10 to 15 bytes: value(8)+slen(2) ->
+; value(8)+slen(2)+height(4)+is_coinbase(1)), not just the header -- unlike
+; the RUN->RUN2 change, which only added header fields and left every
+; record byte-compatible. A header-only version bump would let new code
+; silently misparse an old-shape run file (wrong height/is_coinbase, and
+; slen read from the wrong offset entirely, corrupting the subsequent
+; script-length-gated read) with no error at all. mac_read_run_header
+; reports which record shape a file uses (out+56, see below); old files
+; (MAGIC_RUN/MAGIC_RUN2) are still fully readable, just report
+; height=0/is_coinbase=0 for every record (that data was never captured).
+MAGIC_RUN3       equ 0x33555255      ; "URU3" little-endian dword -- new PUSH record shape
 MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword
 BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
@@ -170,8 +182,10 @@ SPARSE_ENT_SIZE  equ 44              ; key(36) + file_offset(8) per sparse entry
 ; full compaction, since "oldest" only ever grows from index 0 upward.
 COMPACT_MAX_RUNS   equ 64
 ; per-run slot: fd(8) gen(8) run_no(8) remaining(8) active(8) key(36)
-; type(1)+pad(3) value(8) slen(2)+pad(6) script(up to SCRIPT_MAX_BYTES)
-COMPACT_SLOT_SIZE  equ 96 + SCRIPT_MAX_BYTES
+; type(1)+pad(3) value(8) slen(2) height(4) is_coinbase(1)+pad(1) rec_v2(8)
+; script(up to SCRIPT_MAX_BYTES) -- see mac_compact_read_rec's own header
+; comment for the exact byte offsets (grown 2026-08-19, Stage D: was 96).
+COMPACT_SLOT_SIZE  equ 104 + SCRIPT_MAX_BYTES
 COMPACT_SLOTS_BYTES equ COMPACT_MAX_RUNS * COMPACT_SLOT_SIZE
 COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES
 
@@ -329,9 +343,15 @@ mac_cmp_key:
 ;   the header either way (ready for the caller to read the bloom bytes
 ;   next, exactly as before this helper existed).
 ;
-;   out (56-byte caller-allocated buffer):
+;   out (64-byte caller-allocated buffer):
 ;     +0  gen(8)  +8 nrec(8)  +16 bloom_bytes(8)  +24 bits_mask(8)
 ;     +32 header_size(8, 28 or 44)  +40 sparse_off(8)  +48 sparse_n(8)
+;     +56 rec_v2(8, 0/1 -- see MAGIC_RUN3 above: 1 means PUSH records in
+;     this file carry height/is_coinbase (15-byte value-portion), 0 means
+;     they don't (10-byte value-portion, height/is_coinbase unavailable --
+;     callers must default them to 0/0, not read 5 bytes that were never
+;     written). Added alongside MAGIC_RUN3, independent of header_size:
+;     MAGIC_RUN2 and MAGIC_RUN3 share the same 44-byte header shape.)
 ;     (sparse_off/sparse_n are 0 for an old-format run, or for a new-
 ;     format run whose sparse index build could find nothing -- either
 ;     way the caller's contract is "0 means fall back to the original
@@ -354,12 +374,14 @@ mac_read_run_header:
     jnz  .rh_err
 
     mov  eax, [rbp-0x38]
+    cmp  eax, MAGIC_RUN3
+    je   .rh_new3
     cmp  eax, MAGIC_RUN2
-    je   .rh_new
+    je   .rh_new2
     cmp  eax, MAGIC_RUN
     jne  .rh_err             ; unrecognized magic -- treat as corrupt
 
-    ; ---- old format: remaining 24 bytes are gen+nrec+bloom_bits ----
+    ; ---- old format (MAGIC_RUN): remaining 24 bytes are gen+nrec+bloom_bits ----
     mov  rdi, r12
     lea  rsi, [rbp-0x38]
     mov  rdx, 24
@@ -379,11 +401,20 @@ mac_read_run_header:
     mov  qword [r13+32], 28         ; header_size
     mov  qword [r13+40], 0           ; sparse_off
     mov  qword [r13+48], 0            ; sparse_n
+    mov  qword [r13+56], 0             ; rec_v2 = 0 (old PUSH record shape)
     xor  eax, eax
     jmp  .rh_ret
 
-.rh_new:
-    ; ---- new format: remaining 40 bytes are gen+nrec+bloom_bits+sparse_off+sparse_n ----
+.rh_new2:
+    mov  qword [rbp-0x40], 0    ; rec_v2 = 0 -- MAGIC_RUN2 grew the HEADER
+                                  ; only; its PUSH records are still old-shape
+    jmp  .rh_new_common
+.rh_new3:
+    mov  qword [rbp-0x40], 1    ; rec_v2 = 1 -- MAGIC_RUN3's PUSH records
+                                  ; carry height/is_coinbase
+.rh_new_common:
+    ; ---- MAGIC_RUN2/RUN3 share this header shape: remaining 40 bytes are
+    ; gen+nrec+bloom_bits+sparse_off+sparse_n ----
     mov  rdi, r12
     lea  rsi, [rbp-0x38]
     mov  rdx, 40
@@ -405,6 +436,8 @@ mac_read_run_header:
     mov  rax, [rbp-0x38+32]
     mov  [r13+48], rax                  ; sparse_n
     mov  qword [r13+32], 44              ; header_size
+    mov  rax, [rbp-0x40]
+    mov  [r13+56], rax                    ; rec_v2
     xor  eax, eax
     jmp  .rh_ret
 .rh_err:
@@ -806,7 +839,8 @@ utxo_lsm_init:
     ret
 
 ; ============================================================================
-; utxo_lsm_put(lst, u, txid, index, value, script, slen) -> 1/0/2/-1
+; utxo_lsm_put(lst, u, txid, index, value, height, is_coinbase, script, slen)
+;                                                                -> 1/0/2/-1
 ; ============================================================================
 global utxo_lsm_put
 utxo_lsm_put:
@@ -820,10 +854,26 @@ utxo_lsm_put:
     sub  rsp, 0x40
     mov  r12, rdi          ; lst
     mov  r13, rsi          ; u
-    mov  rax, [rbp+16]      ; slen (my 7th arg)
-    push rax                 ; forward as utxo_store_put's 7th arg
-    call utxo_store_put       ; rdi..r9 untouched since our own entry
-    add  rsp, 8
+    mov  [rbp-0x30], rdx   ; txid
+    mov  [rbp-0x38], rcx   ; index
+    mov  [rbp-0x40], r8    ; value
+    mov  [rbp-0x48], r9    ; height
+    ; is_coinbase/script/slen are our OWN 7th/8th/9th args, at [rbp+16/24/32]
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, [rbp-0x30]
+    mov  rcx, [rbp-0x38]
+    mov  r8,  [rbp-0x40]
+    mov  r9,  [rbp-0x48]
+    mov  rax, [rbp+16]      ; is_coinbase
+    mov  r10, [rbp+24]      ; script (r10: scratch, not an arg register)
+    mov  r11, [rbp+32]      ; slen
+    sub  rsp, 0x18
+    mov  [rsp], rax
+    mov  [rsp+8], r10
+    mov  [rsp+16], r11
+    call utxo_store_put
+    add  rsp, 0x18
     mov  r14d, eax
     cmp  r14d, 1
     jne  .lp_no_live_inc
@@ -948,7 +998,8 @@ utxo_lsm_close:
     jmp  utxo_store_close
 
 ; ============================================================================
-; mac_run_lookup(lst, run_no, txid, index, &value, &script, &slen) ->
+; mac_run_lookup(lst, run_no, txid, index, &value, &height, &is_coinbase,
+;                &script, &slen) ->
 ;   1 found-push / 0 absent-in-this-run / 2 tombstone-hit(=miss) / -1 err
 ; ============================================================================
 mac_run_lookup:
@@ -964,10 +1015,14 @@ mac_run_lookup:
     mov  r13d, esi
     mov  [rbp-0x30], rdx
     mov  [rbp-0x38], ecx
-    mov  [rbp-0x40], r8
-    mov  [rbp-0x48], r9
+    mov  [rbp-0x40], r8     ; &value
+    mov  [rbp-0x48], r9     ; &height
     mov  rax, [rbp+16]
-    mov  [rbp-0x50], rax
+    mov  [rbp-0x50], rax    ; &is_coinbase
+    mov  rax, [rbp+24]
+    mov  [rbp-0x78], rax    ; &script
+    mov  rax, [rbp+32]
+    mov  [rbp-0x80], rax    ; &slen
 
     mov  rdi, r12
     call mac_calc_desc_cap
@@ -1144,13 +1199,34 @@ mac_run_lookup:
     movzx eax, byte [rbp-0x1C0+36]
     cmp  eax, 1
     jne  .ml_scan_loop
+    ; Skip past a NON-matching PUSH record to examine the next one. Format-
+    ; aware for the SAME reason .ml_key_match is: reading the wrong byte
+    ; count here desyncs the scan position for every record after this one
+    ; (a real bug this fixed: it stayed hardcoded at 10 bytes/old slen
+    ; offset even after .ml_key_match was updated, so any scan that had to
+    ; skip past even one new-shape record silently corrupted every lookup
+    ; after it -- caught by the sparse-index test's spot-checks, which
+    ; started reporting false misses partway through a large run).
+    mov  rax, [rbp-0x200+56]      ; rec_v2
+    test rax, rax
+    jz   .ml_skip_old
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 15                    ; value(8)+slen(2)+height(4)+is_coinbase(1)
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_absent_close
+    movzx eax, word [rbp-0x1C0+8]     ; slen (new-shape offset)
+    jmp  .ml_skip_have_slen
+.ml_skip_old:
     mov  rdi, [rbp-0x68]
     lea  rsi, [rbp-0x1C0]
     mov  rdx, 10
     call mac_read_exact2
     test rax, rax
     jnz  .ml_absent_close
-    movzx eax, word [rbp-0x1C0+8]
+    movzx eax, word [rbp-0x1C0+8]     ; slen (old-shape offset, same position)
+.ml_skip_have_slen:
     test eax, eax
     jz   .ml_scan_loop
     mov  rdi, [rbp-0x68]
@@ -1165,13 +1241,59 @@ mac_run_lookup:
     movzx eax, byte [rbp-0x1C0+36]
     cmp  eax, 2
     je   .ml_tombstone_close
+    ; format-aware value-portion read: an old-shape run (rec_v2==0, see
+    ; MAGIC_RUN3's header comment) never captured height/is_coinbase at
+    ; all, so those two paths write the caller's output pointers
+    ; DIRECTLY from their own respective buffer layouts (rather than
+    ; sharing one extraction after the fact) to avoid any aliasing
+    ; confusion between where slen sits in each shape.
+    mov  rax, [rbp-0x200+56]      ; rec_v2
+    test rax, rax
+    jz   .ml_read_old_rec
+
+    ; ---- new shape: value(8)+slen(2)+height(4)+is_coinbase(1) = 15, SAME
+    ; order mac_flush actually writes (see its descriptor-build comment:
+    ; height/is_coinbase reuse the pad gap right AFTER slen, not before
+    ; it) -- this function originally assumed value,height,is_coinbase,slen
+    ; instead, a real bug: every new-format height/is_coinbase/slen came
+    ; back wrong (slen's own bytes reinterpreted as height), caught by the
+    ; flush-then-read-back assertions in tests/test_utxo_lsm.c. ----
+    mov  rdi, [rbp-0x68]
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 15
+    call mac_read_exact2
+    test rax, rax
+    jnz  .ml_err_close
+    movzx r14d, word [rbp-0x1C0+8]    ; slen
+    mov  rax, [rbp-0x1C0]
+    mov  rcx, [rbp-0x40]
+    mov  [rcx], rax                    ; *value
+    mov  eax, [rbp-0x1C0+10]
+    mov  rcx, [rbp-0x48]
+    mov  [rcx], rax                     ; *height (zero-extended)
+    movzx eax, byte [rbp-0x1C0+14]
+    mov  rcx, [rbp-0x50]
+    mov  [rcx], rax                      ; *is_coinbase (zero-extended)
+    jmp  .ml_have_value_fields
+
+.ml_read_old_rec:
+    ; ---- old shape: value(8)+slen(2) = 10; height/is_coinbase were never
+    ; captured for this run -- caller gets 0/0, not garbage. ----
     mov  rdi, [rbp-0x68]
     lea  rsi, [rbp-0x1C0]
     mov  rdx, 10
     call mac_read_exact2
     test rax, rax
     jnz  .ml_err_close
-    movzx r14d, word [rbp-0x1C0+8]
+    movzx r14d, word [rbp-0x1C0+8]    ; slen (old offset)
+    mov  rax, [rbp-0x1C0]
+    mov  rcx, [rbp-0x40]
+    mov  [rcx], rax                    ; *value
+    mov  rcx, [rbp-0x48]
+    mov  qword [rcx], 0                 ; *height = 0
+    mov  rcx, [rbp-0x50]
+    mov  qword [rcx], 0                  ; *is_coinbase = 0
+.ml_have_value_fields:
     test r14d, r14d
     jz   .ml_push_noscript
     mov  rdi, [rbp-0x68]
@@ -1186,15 +1308,14 @@ mac_run_lookup:
     mov  rdi, [rbp-0x68]
     mov  eax, 3
     syscall
-    mov  rax, [rbp-0x1C0]
-    mov  rcx, [rbp-0x40]
-    mov  [rcx], rax
-    mov  rcx, [rbp-0x48]
+    ; script ptr
+    mov  rcx, [rbp-0x78]
     mov  rax, [r12+128]
     add  rax, [rbp-0x60]
     add  rax, BLOOM_MAX_BYTES
     mov  [rcx], rax
-    mov  rcx, [rbp-0x50]
+    ; slen
+    mov  rcx, [rbp-0x80]
     mov  [rcx], r14d
     mov  eax, 1
     jmp  .ml_ret
@@ -1227,7 +1348,13 @@ mac_run_lookup:
     ret
 
 ; ============================================================================
-; utxo_lsm_get(lst, u, txid, index, &value, &script, &slen) -> 1/0/-1
+; utxo_lsm_get(lst, u, txid, index, &value, &height, &is_coinbase, &script,
+;              &slen) -> 1/0/-1
+; height/is_coinbase are u64* (unnarrowed, matching &value's treatment) --
+; NOT the narrow u32* convention &slen uses at this layer, to avoid needing
+; the same scratch+narrow-copy dance twice more for no real benefit (a block
+; height is an unbounded-growing counter in spirit, like value, not a small
+; bounded count like a script length).
 ; ============================================================================
 global utxo_lsm_get
 utxo_lsm_get:
@@ -1243,27 +1370,37 @@ utxo_lsm_get:
     mov  r13, rsi
     mov  rbx, rdx
     mov  [rbp-0x30], ecx
-    mov  [rbp-0x38], r8
-    mov  [rbp-0x40], r9
+    mov  [rbp-0x38], r8     ; &value
+    mov  [rbp-0x40], r9     ; &height
     mov  rax, [rbp+16]
-    mov  [rbp-0x48], rax
+    mov  [rbp-0x68], rax    ; &is_coinbase
+    mov  rax, [rbp+24]
+    mov  [rbp-0x48], rax    ; &script
+    mov  rax, [rbp+32]
+    mov  [rbp-0x70], rax    ; &slen
 
     mov  rdi, r13
     mov  rsi, rbx
     mov  edx, [rbp-0x30]
-    mov  rcx, [rbp-0x38]
-    mov  r8, [rbp-0x40]
+    mov  rcx, [rbp-0x38]    ; &value
+    mov  r8, [rbp-0x40]     ; &height
+    mov  r9, [rbp-0x68]     ; &is_coinbase
     ; utxo_get's REAL contract writes a full 8-byte "unsigned long* slen"
     ; (see bitcoin_utxo.asm) even though this module's own contract is
     ; u32* slen throughout -- forwarding the caller's 4-byte u32* directly
     ; here would be a genuine 4-byte stack overflow on every memtable hit.
     ; Give it an 8-byte scratch slot instead and narrow-copy below.
-    lea  r9, [rbp-0x110]
+    sub  rsp, 0x10
+    mov  rax, [rbp-0x48]
+    mov  [rsp], rax          ; &script (utxo_get's 7th arg)
+    lea  rax, [rbp-0x110]
+    mov  [rsp+8], rax        ; scratch &slen (utxo_get's 8th arg)
     call utxo_get
+    add  rsp, 0x10
     cmp  eax, 1
     jne  .lg_no_memtable_hit
     mov  eax, [rbp-0x110]
-    mov  rcx, [rbp-0x48]
+    mov  rcx, [rbp-0x70]
     mov  [rcx], eax
     jmp  .lg_found
 .lg_no_memtable_hit:
@@ -1320,12 +1457,17 @@ utxo_lsm_get:
     mov  rdi, r12
     mov  rdx, rbx
     mov  ecx, [rbp-0x30]
-    mov  r8, [rbp-0x38]
-    mov  r9, [rbp-0x40]
-    mov  rax, [rbp-0x48]
-    push rax
+    mov  r8, [rbp-0x38]      ; &value
+    mov  r9, [rbp-0x40]      ; &height
+    mov  rax, [rbp-0x68]     ; &is_coinbase
+    mov  r10, [rbp-0x48]     ; &script (r10: scratch, not an arg register)
+    mov  r11, [rbp-0x70]     ; &slen
+    sub  rsp, 0x18
+    mov  [rsp], rax
+    mov  [rsp+8], r10
+    mov  [rsp+16], r11
     call mac_run_lookup
-    add  rsp, 8
+    add  rsp, 0x18
     cmp  eax, 1
     je   .lg_found
     cmp  eax, 2
@@ -1410,12 +1552,26 @@ mac_flush:
     mov  byte [rdi+36], 1         ; type = PUSH
     mov  rdx, [rax]                ; blob_off
     mov  rcx, [r13+16]              ; blob base
-    add  rdx, rcx
-    mov  rcx, [rdx]                  ; value
+    add  rdx, rcx                    ; record = blob+blob_off (bitcoin_utxo.asm
+                                       ; Stage D layout: value@0 height/cb@8
+                                       ; (packed) slen@16 script@24)
+    mov  rcx, [rdx]                   ; value
     mov  [rdi+40], rcx
-    mov  cx, [rdx+8]                  ; slen (low u16)
+    ; height/is_coinbase reuse the sort descriptor's existing pad gap
+    ; between slen(+48,2B) and script_ptr(+56) -- was 6 bytes of pure
+    ; padding, now height(4B)@+50 + is_coinbase(1B)@+54 + 1 pad byte@+55,
+    ; so the descriptor's overall 64-byte size and script_ptr's offset are
+    ; both unchanged (mac_sort_desc/mac_copy_rec copy the struct wholesale
+    ; via `shl rax,6`, oblivious to individual field positions).
+    mov  rcx, [rdx+8]                  ; height(low32)/is_coinbase(byte32) packed
+    mov  [rdi+50], ecx                  ; height
+    mov  rax, rcx
+    shr  rax, 32
+    and  eax, 0xFF
+    mov  [rdi+54], al                    ; is_coinbase
+    mov  cx, [rdx+16]                     ; slen (moved from +8 to +16)
     mov  [rdi+48], cx
-    lea  rcx, [rdx+16]                 ; script_ptr
+    lea  rcx, [rdx+24]                     ; script_ptr (moved from +16 to +24)
     mov  [rdi+56], rcx
     inc  qword [rbp-0x38]
 .fl_slot_next:
@@ -1436,10 +1592,18 @@ mac_flush:
     mov  rdi, r13
     mov  rsi, rbx
     mov  edx, [rbx+32]
-    lea  rcx, [rbp-0x180]
-    lea  r8, [rbp-0x188]
-    lea  r9, [rbp-0x190]
+    ; This call only cares whether the key is CURRENTLY live (eax==1); every
+    ; output is discarded, so all 5 just need valid scratch, no narrowing.
+    lea  rcx, [rbp-0x180]     ; &value (discarded)
+    lea  r8, [rbp-0x188]      ; &height (discarded)
+    lea  r9, [rbp-0x190]      ; &is_coinbase (discarded)
+    sub  rsp, 0x10
+    lea  rax, [rbp-0x198]
+    mov  [rsp], rax           ; &script (discarded)
+    lea  rax, [rbp-0x1A0]
+    mov  [rsp+8], rax         ; &slen (discarded)
     call utxo_get
+    add  rsp, 0x10
     cmp  eax, 1
     je   .fl_tomb_skip
     mov  rdx, [rbp-0x38]
@@ -1569,7 +1733,7 @@ mac_flush:
     jl   .fl_err
     mov  [rbp-0x88], rax             ; fd
 
-    mov  dword [rbp-0x100], MAGIC_RUN2
+    mov  dword [rbp-0x100], MAGIC_RUN3     ; new PUSH record shape (Stage D)
     mov  rax, [r12+96]                ; next_gen
     mov  [rbp-0x100+4], rax
     mov  rax, [rbp-0x38]
@@ -1645,11 +1809,15 @@ mac_flush:
     movzx eax, byte [rsi+36]
     cmp  eax, 1
     jne  .fl_wr_next
+    ; value(8)+slen(2)+height(4)+is_coinbase(1) = 15 contiguous bytes at
+    ; descriptor+40, in exactly this order -- see the descriptor-build
+    ; comment above (height/is_coinbase reuse the existing pad gap right
+    ; after slen, so this is still ONE write, just 15 bytes instead of 10).
     mov  rdi, [rbp-0x88]
     lea  rax, [rsi+40]
     push rsi
     mov  rsi, rax
-    mov  rdx, 10
+    mov  rdx, 15
     call mac_write_exact
     pop  rsi
     test rax, rax
@@ -1973,14 +2141,28 @@ utxo_lsm_reload:
     je   .rl_wal_del
     jmp  .rl_wal_close
 .rl_wal_push:
+    ; This is a SEPARATE rescan of the WAL from utxo_store_reload's own
+    ; replay above (which already rebuilt the memtable) -- it exists only
+    ; to rebuild the LSM layer's own per-generation tombstone list/op_count
+    ; from DEL records, so a PUSH record is just skipped over here, never
+    ; applied. Body size grew from 46 to 51 with height/is_coinbase
+    ; (2026-08-19, Stage D; matches bitcoin_utxo_store.asm's own CKPT_REC,
+    ; the same fixed shape, just not a shared symbol across files) -- a
+    ; THIRD independent copy of this
+    ; same "WAL PUSH body size" fact (alongside utxo_store_put's write and
+    ; utxo_store_reload's own replay, both already fixed) that was missed
+    ; on the first pass and stayed at 46/its old slen offset, corrupting
+    ; every WAL-tail rescan's byte position from the first PUSH record
+    ; onward -- caught by test_utxo_lsm.c's crash-recovery and stress
+    ; tests (a DEL right after an unflushed PUSH lost its tombstone).
     mov  rdi, rbx
     lea  rsi, [rbp-0x100]
-    mov  rdx, 46
+    mov  rdx, 51            ; txid(32)+index(4)+value(8)+height(4)+is_coinbase(1)+slen(2)
     call mac_read_exact2
     test rax, rax
     jnz  .rl_wal_close
-    add  qword [rbp-0x90], 46
-    movzx eax, word [rbp-0x100+44]
+    add  qword [rbp-0x90], 51
+    movzx eax, word [rbp-0x100+49]    ; slen (txid32+index4+value8+height4+is_coinbase1=49)
     add  qword [rbp-0x90], rax
     test eax, eax
     jz   .rl_wal_loop
@@ -2044,8 +2226,17 @@ utxo_lsm_reload:
 ;   again -- this function trusts that count rather than inferring EOF from
 ;   a short read, so a genuinely truncated/corrupt run file surfaces as a
 ;   mac_read_exact2 failure here, -1, same as any other I/O error).
-;   Slot layout: +0 fd +8 gen +16 run_no +24 remaining +32 active +40 key(36)
-;   +76 type +80 value(8) +88 slen(2) +96 script(up to SCRIPT_MAX_BYTES).
+;   Slot layout (grown 2026-08-19, Stage D): +0 fd +8 gen +16 run_no
+;   +24 remaining +32 active +40 key(36) +76 type +80 value(8) +88 slen(2)
+;   +90 height(4) +94 is_coinbase(1) +96 rec_v2(8, CALLER sets once when
+;   opening/priming this run, from mac_read_run_header's out+56 -- see
+;   MAGIC_RUN3's header comment; this function only READS it) +104 script
+;   (up to SCRIPT_MAX_BYTES). value/slen/height/is_coinbase are laid out in
+;   the SAME order the run-file's on-disk PUSH record uses (see mac_flush's
+;   descriptor-build comment), so both the new-shape and old-shape reads
+;   below land directly in their final slot position with no extra copy --
+;   and so the merge-write in utxo_lsm_compact can still emit them as one
+;   contiguous range, matching the file format exactly.
 ; ============================================================================
 mac_compact_read_rec:
     push rbp
@@ -2065,17 +2256,38 @@ mac_compact_read_rec:
     movzx eax, byte [r12+76]           ; type
     cmp  eax, 1
     jne  .cr_dec
+    mov  rax, [r12+96]                    ; rec_v2 (set by the caller at open time)
+    test rax, rax
+    jz   .cr_read_old
+
+    ; ---- new shape: value(8)+slen(2)+height(4)+is_coinbase(1) = 15 ----
     mov  rdi, rbx
     lea  rsi, [r12+80]
-    mov  rdx, 10                          ; value(8)+slen(2)
+    mov  rdx, 15
     call mac_read_exact2
     test rax, rax
     jnz  .cr_err
-    movzx eax, word [r12+88]                ; slen
+    movzx eax, word [r12+88]              ; slen
+    jmp  .cr_have_slen
+
+.cr_read_old:
+    ; ---- old shape: value(8)+slen(2) = 10; height/is_coinbase unavailable,
+    ; explicitly zeroed (they land at the SAME slot offsets the new shape
+    ; uses, just never populated by this read). ----
+    mov  rdi, rbx
+    lea  rsi, [r12+80]
+    mov  rdx, 10
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cr_err
+    movzx eax, word [r12+88]              ; slen
+    mov  dword [r12+90], 0                  ; height = 0
+    mov  byte [r12+94], 0                    ; is_coinbase = 0
+.cr_have_slen:
     test eax, eax
     jz   .cr_dec
     mov  rdi, rbx
-    lea  rsi, [r12+96]
+    lea  rsi, [r12+104]
     mov  rdx, rax
     call mac_read_exact2
     test rax, rax
@@ -2193,13 +2405,18 @@ utxo_lsm_compact:
     add  rdx, r13
     mov  [rdx], rax                 ; slot.fd
 
-    ; format-aware header read (old MAGIC_RUN or new MAGIC_RUN2 -- an input
-    ; run being compacted may be EITHER, since not every run has necessarily
+    ; format-aware header read (MAGIC_RUN/RUN2/RUN3 -- an input run being
+    ; compacted may be ANY of them, since not every run has necessarily
     ; been rewritten by the fixed writer yet; see mac_read_run_header's own
-    ; header comment). [rbp-0x1C0] holds its 56-byte output struct here;
-    ; this slot gets reused for unrelated staging later in this same
-    ; function (the OUTPUT run's own header, then manifest staging) -- safe,
-    ; since those uses happen in strictly later, non-overlapping phases.
+    ; header comment). [rbp-0x1C0] holds its 64-byte output struct here;
+    ; its TAIL ([rbp-0x188] onward) gets reused for unrelated staging
+    ; (sparse_scratch/sparse_n) just a few instructions below in this same
+    ; iteration -- safe only because rec_v2 (the struct's last field) is
+    ; extracted immediately after this call, before that reuse happens (see
+    ; the comment at that extraction). Further reuse of [rbp-0x1C0] itself
+    ; later in this function (the OUTPUT run's own header, then manifest
+    ; staging) is fine as before -- those happen in strictly later,
+    ; non-overlapping phases, well after every input run has been opened.
     mov  rdi, rax
     lea  rsi, [rbp-0x1C0]
     call mac_read_run_header
@@ -2212,6 +2429,13 @@ utxo_lsm_compact:
     add  rdx, r13
     mov  [rdx+24], rax                ; slot.remaining = nrec
     add  qword [rbp-0x38], rax          ; upper_bound += nrec
+    ; rec_v2 (out+56) MUST be extracted here, before this same scratch
+    ; region ([rbp-0x1C0]'s tail, at [rbp-0x188]) gets reused below for
+    ; sparse_scratch/sparse_n -- an input run being compacted may be ANY of
+    ; MAGIC_RUN/RUN2/RUN3, so each slot needs its OWN rec_v2, not a shared
+    ; assumption (see MAGIC_RUN3's header comment).
+    mov  rax, [rbp-0x1C0+56]
+    mov  [rdx+96], rax                  ; slot.rec_v2
 
     ; skip this run's own bloom bytes to reach its records section
     mov  rax, [rbp-0x1C0+16]           ; this run's bloom_bytes (already shifted)
@@ -2333,7 +2557,7 @@ utxo_lsm_compact:
     jl   .cc_err
     mov  [rbp-0x58], rax                    ; out_fd
 
-    mov  dword [rbp-0x1C0], MAGIC_RUN2
+    mov  dword [rbp-0x1C0], MAGIC_RUN3     ; new PUSH record shape (Stage D)
     mov  rax, [rbp-0x68]
     mov  [rbp-0x1C0+4], rax
     mov  qword [rbp-0x1C0+12], 0             ; nrec placeholder
@@ -2465,8 +2689,14 @@ utxo_lsm_compact:
     jnz  .cc_err_close
     mov  rdx, [rbp-0xB0]
     mov  rdi, [rbp-0x58]
-    lea  rsi, [rdx+80]                            ; value+slen, 10 bytes
-    mov  rdx, 10
+    ; value(8)+slen(2)+height(4)+is_coinbase(1) = 15 contiguous bytes, same
+    ; order as the on-disk PUSH record (see mac_compact_read_rec's header
+    ; comment) -- height/is_coinbase are 0 for a record that came from an
+    ; old-shape input run (mac_compact_read_rec zeroed them at read time),
+    ; so compacting a mix of old- and new-shape runs is safe: it just
+    ; can't manufacture height/coinbase data that was never captured.
+    lea  rsi, [rdx+80]                            ; value+slen+height+is_coinbase, 15 bytes
+    mov  rdx, 15
     call mac_write_exact
     test rax, rax
     jnz  .cc_err_close
@@ -2475,7 +2705,7 @@ utxo_lsm_compact:
     test r15d, r15d
     jz   .cc_wr_bloom
     mov  rdi, [rbp-0x58]
-    lea  rsi, [rdx+96]
+    lea  rsi, [rdx+104]                            ; script (moved from +96)
     mov  rdx, r15
     call mac_write_exact
     test rax, rax

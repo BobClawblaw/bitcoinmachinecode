@@ -40,9 +40,11 @@
 extern size_t utxo_struct_size(unsigned long slots);
 extern void   utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long   utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                       unsigned long long value, const unsigned char* script, unsigned long slen);
+                       unsigned long long value, unsigned long height,
+                       unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long   utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                       unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern long   utxo_del(void* u, const unsigned char txid[32], unsigned long index);
 
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
@@ -148,8 +150,8 @@ static void do_connect(const unsigned char* blk, unsigned long n, int height){
                     if (q+8 > end){ok=0;break;} q+=8;
                     unsigned long long sl=0; cc=rd_cs(q,end,&sl); if(cc<0){ok=0;break;} q+=cc;
                     /* BIP30: does (txid,k) already exist as an unspent coin? */
-                    unsigned long long v; const unsigned char* sp; unsigned long slen;
-                    if (utxo_get(g_utxo, txid, (unsigned long)k, &v, &sp, &slen)==1 && bip30==0){
+                    unsigned long long v; const unsigned char* sp; unsigned long slen, h_unused, cb_unused;
+                    if (utxo_get(g_utxo, txid, (unsigned long)k, &v, &h_unused, &cb_unused, &sp, &slen)==1 && bip30==0){
                         bip30 = 1;
                     }
                     if(q+sl > end){ok=0;break;} q+=sl;
@@ -190,7 +192,7 @@ static void do_connect(const unsigned char* blk, unsigned long n, int height){
                 unsigned long long val=0; for(int b=0;b<8;b++) val|=(unsigned long long)q[b]<<(8*b); q+=8;
                 unsigned long long sl=0; cc=rd_cs(q,end,&sl); if(cc<0) break; q+=cc;
                 if(q+sl>end) break;
-                if (got){ utxo_put(g_utxo, txid, (unsigned long)k, val, q, (unsigned long)sl); added++; }
+                if (got){ utxo_put(g_utxo, txid, (unsigned long)k, val, (unsigned long)height, (unsigned long)(i==0), q, (unsigned long)sl); added++; }
                 q+=sl;
             }
             t += tlen;
@@ -227,8 +229,8 @@ int main(void){
             } else if(!strcmp(cmd,"QUERY")){
                 char* ntok=strtok_r(NULL," \t\n",&save);
                 unsigned long idx = ntok ? (unsigned long)strtoul(ntok,NULL,10) : 0;
-                unsigned long long v; const unsigned char* sp; unsigned long slen;
-                long f=utxo_get(g_utxo, buf, idx, &v, &sp, &slen);
+                unsigned long long v; const unsigned char* sp; unsigned long slen, h_unused, cb_unused;
+                long f=utxo_get(g_utxo, buf, idx, &v, &h_unused, &cb_unused, &sp, &slen);
                 printf("OK %ld\n", f);
             }
         }

@@ -8,23 +8,33 @@
 ;   utxo.dat  -- append-only OPERATION LOG (the ".dat" payload). Every mutation
 ;                is a framed record appended at the current log length:
 ;                  PUSH : [u32 magic][u8 op=1][3 pad][txid 32][u32 index]
-;                         [u64 value][u16 slen][script slen]   (add an output)
+;                         [u64 value][u32 height][u8 is_coinbase][u16 slen]
+;                         [script slen]   (add an output)
 ;                  DEL  : [u32 magic][u8 op=2][3 pad][txid 32][u32 index]
 ;                         (spend/delete an output)
 ;                Replaying PUSH/DEL records in order reconstructs the exact
 ;                current UTXO set -- this is the durable source of truth.
+;                (height/is_coinbase added 2026-08-19, Stage D of
+;                PLAN_SCRIPT_VERIFY.md, so script verification can enforce
+;                the 100-block coinbase maturity rule -- the store previously
+;                had no data source for it at all. DEL is unaffected: a spend
+;                needs no value fields, only the key.)
 ;
 ;   utxo.idx  -- POSITIONAL INDEX / CHECKPOINT (the "index.dat" analog). A
 ;                serialized snapshot of every LIVE (unspent) record plus the
 ;                utxo.dat byte offset it covers and the live count:
 ;                  [u32 magic][u64 log_off][u64 n]
-;                  then n records: [txid 32][u32 index][u64 value][u16 slen]
+;                  then n records: [txid 32][u32 index][u64 value]
+;                                  [u32 height][u8 is_coinbase][u16 slen]
 ;                                  [script slen]
 ;                Written by utxo_store_sync() (a checkpoint). On reload the
 ;                snapshot is restored O(n) and only the log TAIL past log_off
 ;                is replayed -- so a crash between checkpoints is recovered by
 ;                replaying the remaining log records (restart-resume), exactly
 ;                like store_reload restoring tip/cur_file_pos from index.dat.
+;                (Same CKPT_REC fixed-portion shape as the WAL PUSH body --
+;                the checkpoint record IS that body, minus the log's own
+;                magic/op/pad framing.)
 ;
 ; The in-memory hash table is UNCHANGED (bitcoin_utxo.asm owns it); this module
 ; is a thin durable wrapper: every put/del writes the log first (WAL), then
@@ -42,13 +52,15 @@
 ;   long utxo_store_sync(void* st, void* u)                 -> 1 ok / -1 err
 ;   long utxo_store_reload(void* st, void* u)               -> records replayed, -1 err
 ;   long utxo_store_put(void* st, void* u, const u8 txid[32],
-;                       u32 index, u64 value, const u8* script, u32 slen)
+;                       u32 index, u64 value, u32 height, u32 is_coinbase,
+;                       const u8* script, u32 slen)
 ;                                                           -> utxo_put result (1/0/2) or -1
 ;   long utxo_store_del(void* st, void* u, const u8 txid[32], u32 index)
 ;                                                           -> utxo_del result (1/0) or -1
 ;   long utxo_store_count(void* st, void* u)                -> utxo_count(u)
 ;   long utxo_store_get(void* st, void* u, const u8 txid[32], u32 index,
-;                       u64* value, u8** script, u32* slen) -> utxo_get result (1/0)
+;                       u64* value, u32* height, u32* is_coinbase,
+;                       u8** script, u32* slen)             -> utxo_get result (1/0)
 ;   void utxo_store_close(void* st)                         -> fsync + close fds
 ;
 ; The in-memory table layout (bitcoin_utxo.asm) that this module reads/writes:
@@ -56,7 +68,8 @@
 ;   +32 qword fill ; +40 slots (48B): [+0 qword blob_off][+8 u8 txid[32]]
 ;                                    [+40 u32 index][+44 qword _pad]
 ;   empty slot: index field == 0xFFFFFFFF
-;   blob record at blob+off: [+0 u64 value][+8 u64 slen][+16 u8 script[slen]]
+;   blob record at blob+off: [+0 u64 value][+8 u32 height][+12 u8 is_coinbase]
+;                             [+13..15 pad][+16 u64 slen][+24 u8 script[slen]]
 ;
 ; FRAME RULE (as bitcoin_store.asm): for a function that pushes N callee-saved
 ; registers the save area occupies [rbp-8 .. -(8*N)]. ALL stack locals live
@@ -74,8 +87,16 @@ MAGIC_LOG equ 0x5554584F      ; "UTXO" little-endian in a dword
 OP_PUSH   equ 1
 OP_DEL    equ 2
 MAGIC_IDX equ 0x55545849      ; "UTXI"
-PUSH_HDR  equ 54              ; header bytes before script for a PUSH record
-DEL_SIZE  equ 44              ; DEL record fully fixed size
+; PUSH_HDR/CKPT_REC bumped 2026-08-19 (Stage D): added height(4)+is_coinbase(1)
+; so script verification can enforce the 100-block coinbase maturity rule --
+; the store previously had no data source for it at all. CKPT_REC is the
+; fixed portion shared by BOTH the WAL PUSH body (after its 8-byte magic/op/
+; pad prefix: 8+CKPT_REC=PUSH_HDR) and the utxo.idx checkpoint record --
+; same payload, same layout, deliberately kept identical.
+CKPT_REC  equ 51              ; txid(32)+index(4)+value(8)+height(4)+is_coinbase(1)+slen(2)
+PUSH_HDR  equ 8+CKPT_REC      ; magic(4)+op(1)+pad(3) + CKPT_REC = 59
+DEL_SIZE  equ 44              ; DEL record fully fixed size (unchanged -- DEL
+                               ; carries no value/height/coinbase fields)
 IDX_HDR   equ 20              ; utxo.idx header: magic(4)+log_off(8)+n(8)
 
 logname: db "utxo.dat",0
@@ -234,6 +255,9 @@ utxo_store_init:
 ;   r12=st r15=u (stable) rbx=txid; r13/r14 transient for mac_wr_log.
 ; ============================================================================
 global utxo_store_put
+; utxo_store_put(st, u, txid, index, value, height, is_coinbase, script, slen)
+;   rdi=st rsi=u rdx=txid rcx=index(dword) r8=value r9=height
+;   [rbp+16]=is_coinbase [rbp+24]=script [rbp+32]=slen
 utxo_store_put:
     push rbp
     mov  rbp, rsp
@@ -248,49 +272,67 @@ utxo_store_put:
     mov  rbx, rdx           ; txid
     mov  [rbp-0x48], ecx    ; index
     mov  [rbp-0x50], r8     ; value
-    mov  [rbp-0x58], r9     ; script
+    mov  eax, r9d
+    mov  [rbp-0x58], rax    ; height (zero-extended to 64 bits)
     mov  rax, [rbp+16]
-    mov  [rbp-0x60], rax    ; slen
-    ; ---- build PUSH header (54 bytes) at rbp-0xB0 ----
-    mov  dword [rbp-0xB0], MAGIC_LOG
-    mov  byte  [rbp-0xB0+4], OP_PUSH
-    mov  byte  [rbp-0xB0+5], 0
-    mov  byte  [rbp-0xB0+6], 0
-    mov  byte  [rbp-0xB0+7], 0
-    lea  rdi, [rbp-0xB0+8]
+    mov  [rbp-0x60], rax    ; is_coinbase
+    mov  rax, [rbp+24]
+    mov  [rbp-0x68], rax    ; script
+    mov  rax, [rbp+32]
+    mov  [rbp-0x70], rax    ; slen
+    ; ---- build PUSH header (59 bytes) at rbp-0x100 (kept well clear of the
+    ; locals above, which end at -0x70 -- see the memtable-layer commit's
+    ; ENGINEERING_RULES-flagged habit of leaving generous slack here). ----
+    mov  dword [rbp-0x100], MAGIC_LOG
+    mov  byte  [rbp-0x100+4], OP_PUSH
+    mov  byte  [rbp-0x100+5], 0
+    mov  byte  [rbp-0x100+6], 0
+    mov  byte  [rbp-0x100+7], 0
+    lea  rdi, [rbp-0x100+8]
     mov  rsi, rbx
     mov  rdx, 32
     call mac_memcpy
     mov  eax, [rbp-0x48]
-    mov  [rbp-0xB0+40], eax
+    mov  [rbp-0x100+40], eax        ; index
     mov  rax, [rbp-0x50]
-    mov  [rbp-0xB0+44], rax
-    mov  ax, [rbp-0x60]
-    mov  [rbp-0xB0+52], ax
+    mov  [rbp-0x100+44], rax        ; value
+    mov  eax, [rbp-0x58]
+    mov  [rbp-0x100+52], eax        ; height
+    mov  al, byte [rbp-0x60]
+    mov  [rbp-0x100+56], al         ; is_coinbase
+    mov  ax, [rbp-0x70]
+    mov  [rbp-0x100+57], ax         ; slen
     ; ---- append header to log ----
-    lea  r13, [rbp-0xB0]
+    lea  r13, [rbp-0x100]
     mov  r14, PUSH_HDR
     call mac_wr_log
     test rax, rax
     jnz  .fail
     ; ---- append script if any ----
-    mov  rax, [rbp-0x60]
+    mov  rax, [rbp-0x70]
     test rax, rax
     jz   .no_script
-    mov  r13, [rbp-0x58]
+    mov  r13, [rbp-0x68]
     mov  r14, rax
     call mac_wr_log
     test rax, rax
     jnz  .fail
 .no_script:
-    ; ---- apply in memory (utxo_put(u, txid, index, value, script, slen)) ----
+    ; ---- apply in memory:
+    ; utxo_put(u, txid, index, value, height, is_coinbase, script, slen) ----
     mov  rdi, r15           ; u
     mov  rsi, rbx           ; txid
     mov  edx, [rbp-0x48]
     mov  rcx, [rbp-0x50]
-    mov  r8,  [rbp-0x58]
-    mov  r9,  [rbp-0x60]
+    mov  r8,  [rbp-0x58]    ; height
+    mov  r9,  [rbp-0x60]    ; is_coinbase
+    sub  rsp, 0x10          ; outgoing stack args for utxo_put (7th/8th)
+    mov  rax, [rbp-0x68]
+    mov  [rsp], rax         ; script
+    mov  rax, [rbp-0x70]
+    mov  [rsp+8], rax       ; slen
     call utxo_put
+    add  rsp, 0x10
     jmp  .done
 .fail:
     mov  rax, -1
@@ -372,17 +414,34 @@ utxo_store_count:
 ;   rdi=st rsi=u rdx=txid rcx=index(dword) r8=&value r9=&script [rsp+8]=&slen
 ;   Clean tail-call into utxo_get (no frame locals at all). st is unused.
 ; ============================================================================
+; utxo_store_get(st, u, txid, index, &value, &height, &is_coinbase, &script, &slen)
+;   -> utxo_get result
+;   rdi=st(unused) rsi=u rdx=txid rcx=index(dword) r8=&value r9=&height
+;   [rbp+16]=&is_coinbase [rbp+24]=&script [rbp+32]=&slen
+;
+; No longer a naked tail-call: utxo_get gained a 6th register arg
+; (&is_coinbase), which shifts where ITS OWN stack args need to sit relative
+; to the caller's -- utxo_store_get's incoming stack args don't land there
+; for free anymore, so this builds a real (properly 16-aligned) frame and
+; does a normal call instead of hand-shuffling the tail-call stack slots.
 global utxo_store_get
 utxo_store_get:
-    mov  r10, [rsp+8]     ; &slen (7th arg; return addr is at [rsp])
-    mov  rdi, rsi         ; u
-    mov  rsi, rdx         ; txid
-    mov  rdx, rcx         ; index
-    mov  rcx, r8          ; &value
-    mov  r8,  r9          ; &script
-    mov  r9,  r10         ; &slen
-    jmp  utxo_get         ; tail call (utxo_get returns to our caller)
-    ; (no ret here -- utxo_get's ret returns to the original caller)
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20
+    mov  rax, [rbp+24]      ; &script
+    mov  [rsp], rax
+    mov  rax, [rbp+32]      ; &slen
+    mov  [rsp+8], rax
+    mov  rdi, rsi           ; u
+    mov  rsi, rdx           ; txid
+    mov  rdx, rcx           ; index
+    mov  rcx, r8            ; &value
+    mov  r8,  r9            ; &height
+    mov  r9,  [rbp+16]      ; &is_coinbase
+    call utxo_get
+    leave
+    ret
 
 ; ============================================================================
 ; utxo_store_clear(u=rdi) -- reset the in-memory table to empty, reusing its
@@ -494,7 +553,8 @@ utxo_store_sync:
     syscall
     cmp  rax, 4
     jne  .fclose
-    ; blob record = blob + slot->blob_off
+    ; blob record = blob + slot->blob_off. Layout (bitcoin_utxo.asm, Stage D):
+    ; [+0 value][+8 height/is_coinbase packed][+16 slen][+24 script]
     mov  eax, r15d
     imul eax, eax, 48
     lea  r10, [r13+40]
@@ -504,7 +564,9 @@ utxo_store_sync:
     add  rax, rdx           ; record
     mov  rbx, [rax]         ; value
     mov  [rbp-0x50], rbx
-    mov  rbx, [rax+8]       ; slen (u64; only low u16 persisted)
+    mov  rbx, [rax+8]       ; height(low32)/is_coinbase(byte32) packed
+    mov  [rbp-0x78], rbx
+    mov  rbx, [rax+16]      ; slen (u64; only low u16 persisted)
     mov  [rbp-0x58], rbx
     ; write value (8 bytes)
     mov  rdi, r14
@@ -514,6 +576,22 @@ utxo_store_sync:
     syscall
     cmp  rax, 8
     jne  .fclose
+    ; write height (4 bytes, low 32 of the packed qword)
+    mov  rdi, r14
+    lea  rsi, [rbp-0x78]
+    mov  rdx, 4
+    mov  eax, 1
+    syscall
+    cmp  rax, 4
+    jne  .fclose
+    ; write is_coinbase (1 byte, byte 32 of the packed qword)
+    mov  rdi, r14
+    lea  rsi, [rbp-0x78+4]
+    mov  rdx, 1
+    mov  eax, 1
+    syscall
+    cmp  rax, 1
+    jne  .fclose
     ; write slen (2 bytes, low u16)
     mov  rdi, r14
     lea  rsi, [rbp-0x58]
@@ -522,7 +600,7 @@ utxo_store_sync:
     syscall
     cmp  rax, 2
     jne  .fclose
-    ; write script slen bytes from record+16
+    ; write script slen bytes from record+24
     mov  rbx, [rbp-0x58]
     test rbx, rbx
     jz   .slot_next
@@ -533,7 +611,7 @@ utxo_store_sync:
     mov  rax, [r10]         ; blob_off
     mov  rdx, [r13+16]
     add  rax, rdx
-    add  rax, 16            ; script ptr
+    add  rax, 24            ; script ptr
     mov  rdi, r14
     mov  rsi, rax
     mov  rdx, rbx
@@ -591,8 +669,9 @@ utxo_store_sync:
 ;
 ;   5 pushes -> save area [rbp-8..-0x40]; locals at <= -0x48.
 ;   Buffer layout (all safely in the 0x160+65536 frame, non-overlapping):
-;     [rbp-0x100]    46-byte fixed record buffer: txid@-0x100 idx@-0xE0
-;                    value@-0xDC slen(u16)@-0xD4
+;     [rbp-0x100]    CKPT_REC (51)-byte fixed record buffer: txid@-0x100
+;                    idx@-0xE0 value@-0xDC height@-0xD4 is_coinbase@-0xD0
+;                    slen(u16)@-0xCF
 ;     [rbp-0x10158]  script scratch (65536+ bytes of room, growing UP toward
 ;                    rbp -- must stay far from rbp so a max-size script can
 ;                    never reach it; see the frame-size comment below)
@@ -665,25 +744,26 @@ utxo_store_reload:
     mov  [r12+32], rax      ; ckpt_n
     test rax, rax
     jz   .ckpt_done
-    ; load 'n' snapshot records: [txid32][idx4][value8][slen2][script]
+    ; load 'n' snapshot records: [txid32][idx4][value8][height4][cb1][slen2][script]
     mov  r15, 0
 .ckpt_loop:
     mov  rax, [r12+32]
     cmp  r15, rax
     jae  .ckpt_done
-    ; read 46 fixed bytes into [rbp-0x100..]
+    ; read CKPT_REC (51) fixed bytes into [rbp-0x100..]
     mov  rdi, r14
-    lea  rsi, [rbp-0x100]   ; txid@-0x100 idx@-0xE0 value@-0xDC slen@-0xD4
-    mov  rdx, 46
+    ; txid@-0x100 idx@-0xE0 value@-0xDC height@-0xD4 is_coinbase@-0xD0 slen@-0xCF
+    lea  rsi, [rbp-0x100]
+    mov  rdx, CKPT_REC
     call mac_read_exact
     test rax, rax
     jnz  .ckpt_done         ; truncated snapshot -> stop gracefully
-    movzx eax, word [rbp-0xD4]
+    movzx eax, word [rbp-0xCF]
     ; store the FULL 64-bit rax (not eax) -- movzx already zero-extends the
     ; u16 into all of rax, but a 32-bit `mov [.],eax` only overwrites the
     ; low 4 bytes of this 8-byte slot, leaving stale stack garbage in the
     ; high 4 bytes; utxo_put's slen arg is loaded back as a 64-bit qword
-    ; below (r9), so that garbage corrupted the value it saw -- confirmed
+    ; below, so that garbage corrupted the value it saw -- confirmed
     ; via a real replay where it made utxo_put's blob-capacity check see a
     ; huge garbage size and spuriously report "table full" (2) after
     ; already writing the slot's txid/index, leaving a phantom "occupied"
@@ -699,13 +779,20 @@ utxo_store_reload:
     test rax, rax
     jnz  .ckpt_done
 .ckpt_put:
+    ; utxo_put(u, txid, index, value, height, is_coinbase, script, slen)
     mov  rdi, r13
     lea  rsi, [rbp-0x100]   ; txid
     mov  edx, [rbp-0xE0]    ; index
     mov  rcx, [rbp-0xDC]    ; value
-    lea  r8,  [rbp-0x10158]   ; script
-    mov  r9,  [rbp-0x48]    ; slen
+    mov  r8d, [rbp-0xD4]    ; height (32-bit mov zero-extends into r8)
+    movzx r9, byte [rbp-0xD0] ; is_coinbase
+    sub  rsp, 0x10
+    lea  rax, [rbp-0x10158]
+    mov  [rsp], rax          ; script (7th arg, stack)
+    mov  rax, [rbp-0x48]
+    mov  [rsp+8], rax        ; slen (8th arg, stack)
     call utxo_put
+    add  rsp, 0x10
     inc  r15
     jmp  .ckpt_loop
 .ckpt_done:
@@ -759,15 +846,16 @@ utxo_store_reload:
     je   .rep_del
     jmp  .rep_close        ; unknown op -> stop replaying
 .rep_push:
-    ; read txid[32]+idx4+value8+slen2 = 46 bytes into [rbp-0x100..]
+    ; read CKPT_REC (51) fixed bytes: txid+idx+value+height+is_coinbase+slen
     mov  rdi, r14
-    lea  rsi, [rbp-0x100]  ; txid@-0x100 idx@-0xE0 value@-0xDC slen@-0xD4
-    mov  rdx, 46
+    ; txid@-0x100 idx@-0xE0 value@-0xDC height@-0xD4 is_coinbase@-0xD0 slen@-0xCF
+    lea  rsi, [rbp-0x100]
+    mov  rdx, CKPT_REC
     call mac_read_exact
     test rax, rax
     jnz  .rep_close
-    add  qword [rbp-0x150], 46
-    movzx eax, word [rbp-0xD4]
+    add  qword [rbp-0x150], CKPT_REC
+    movzx eax, word [rbp-0xCF]
     ; see the identical fix + explanation in .ckpt_loop above -- same bug,
     ; same fix (store rax, not eax, so the slot's high 4 bytes are zeroed).
     mov  [rbp-0x48], rax   ; slen
@@ -781,13 +869,20 @@ utxo_store_reload:
     test rax, rax
     jnz  .rep_close
 .rep_push_apply:
+    ; utxo_put(u, txid, index, value, height, is_coinbase, script, slen)
     mov  rdi, r13
-    lea  rsi, [rbp-0x100]  ; txid
-    mov  edx, [rbp-0xE0]   ; index
-    mov  rcx, [rbp-0xDC]   ; value
-    lea  r8,  [rbp-0x10158]  ; script
-    mov  r9,  [rbp-0x48]   ; slen
+    lea  rsi, [rbp-0x100]   ; txid
+    mov  edx, [rbp-0xE0]    ; index
+    mov  rcx, [rbp-0xDC]    ; value
+    mov  r8d, [rbp-0xD4]    ; height (32-bit mov zero-extends into r8)
+    movzx r9, byte [rbp-0xD0] ; is_coinbase
+    sub  rsp, 0x10
+    lea  rax, [rbp-0x10158]
+    mov  [rsp], rax          ; script (7th arg, stack)
+    mov  rax, [rbp-0x48]
+    mov  [rsp+8], rax        ; slen (8th arg, stack)
     call utxo_put
+    add  rsp, 0x10
     mov  rax, [rbp-0x48]
     add  qword [rbp-0x150], rax   ; consume script bytes
     inc  r15

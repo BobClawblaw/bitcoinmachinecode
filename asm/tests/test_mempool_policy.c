@@ -28,7 +28,8 @@ extern long   mpool_count(void* mp);
 extern size_t utxo_struct_size(unsigned long slots);
 extern void   utxo_init(void* u, unsigned long slots, void* blob, unsigned long blob_cap);
 extern long   utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                       unsigned long long value, const unsigned char* script, unsigned long slen);
+                       unsigned long long value, unsigned long height,
+                       unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 /* ---- policy module (bitcoin_mempool_policy.c) ---- */
 extern size_t mpool_policy_state_size(unsigned n);
 extern void   mpool_policy_state_init(void* st, unsigned n);
@@ -47,12 +48,14 @@ extern const char* mpool_policy_reason(void* pol);
  * wants the real, single-table bitcoin_utxo.asm behavior, so just pass
  * through unchanged. */
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script,
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script,
                      unsigned long* slen);
 long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
                      unsigned long long* value, const unsigned char** script,
                      unsigned long* slen){
-    return utxo_get(u, txid, index, value, script, slen);
+    unsigned long h_unused, cb_unused;
+    return utxo_get(u, txid, index, value, &h_unused, &cb_unused, script, slen);
 }
 
 static int hex_in(unsigned char* out, const char* h);
@@ -127,7 +130,7 @@ static int run_scenario(int si,
     for (unsigned i=0;i<nutxo;i++){
         unsigned char t[32];
         hex_in(t, utxo_txid[i]);
-        utxo_put(ux, t, utxo_idx[i], utxo_val[i], (const unsigned char*)"\x51", 1);
+        utxo_put(ux, t, utxo_idx[i], utxo_val[i], 0, 0, (const unsigned char*)"\x51", 1);
     }
 
     printf("== scenario %d: %u steps ==\n", si, nsteps);

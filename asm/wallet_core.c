@@ -561,9 +561,11 @@ int wallet_script_to_address(char* out, long cap, const unsigned char* script, l
 /* extern in-memory UTXO set primitives */
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long utxo_del(void* u, const unsigned char txid[32], unsigned long index);
 
 /* gettxout: query the outpoint (txid, index) in the UTXO store. On a hit fills
@@ -573,8 +575,8 @@ extern long utxo_del(void* u, const unsigned char txid[32], unsigned long index)
 int wallet_gettxout(void* u, const unsigned char txid[32], unsigned long index,
                     unsigned long long* value, const unsigned char** script, unsigned long* slen,
                     char* addr, long addr_cap) {
-    unsigned long long v; const unsigned char* s; unsigned long sl;
-    long r = utxo_get(u, txid, index, &v, &s, &sl);
+    unsigned long long v; const unsigned char* s; unsigned long sl, h_unused, cb_unused;
+    long r = utxo_get(u, txid, index, &v, &h_unused, &cb_unused, &s, &sl);
     if (r != 1) return 0;
     if (value) *value = v;
     if (script) *script = s;

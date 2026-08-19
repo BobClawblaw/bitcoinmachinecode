@@ -13,7 +13,8 @@
 
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 
 extern int  wallet_gettxout(void* u, const unsigned char txid[32], unsigned long index,
                             unsigned long long* value, const unsigned char** script,
@@ -43,8 +44,8 @@ int main(void) {
 
     unsigned char tA[32], tB[32];
     for(int i=0;i<32;i++){tA[i]=(unsigned char)(0x10+i);tB[i]=(unsigned char)(0x20+i);}
-    utxo_put(ux, tA, 0, 5000000ULL, p2pkh, 25);
-    utxo_put(ux, tB, 7, 1234567ULL, p2pkh, 25);
+    utxo_put(ux, tA, 0, 5000000ULL, 0, 0, p2pkh, 25);
+    utxo_put(ux, tB, 7, 1234567ULL, 0, 0, p2pkh, 25);
 
     /* ---- gettxout: found ---- */
     unsigned long long v; const unsigned char* s; unsigned long sl;

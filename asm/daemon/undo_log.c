@@ -25,11 +25,22 @@
  * file `undo_<height>.dat` (append-only; simplest possible layout given a
  * bounded ~100-200 block retention window -- no separate index file is
  * needed since consumers just read a whole small file sequentially):
- *   txid[32] | index(u32 LE) | value(u64 LE) | script_len(u16 LE) | script[script_len]
- * (46-byte fixed header + variable-length script, back to back, no framing
+ *   txid[32] | index(u32 LE) | value(u64 LE) | height(u32 LE) |
+ *   is_coinbase(u8) | script_len(u16 LE) | script[script_len]
+ * (51-byte fixed header + variable-length script, back to back, no framing
  * beyond that -- a reader just consumes records until EOF, mirroring how
  * bitcoin_store.asm's blk%05u.dat framing is "read until you know you're
  * done" rather than length-prefixed as a whole file).
+ *
+ * height/is_coinbase added 2026-08-19 (Stage D of PLAN_SCRIPT_VERIFY.md).
+ * CAREFUL: this record's `height` field is the spent UTXO's OWN original
+ * creation height (captured from utxo_lsm_get right before the spend) --
+ * NOT the height of the block doing the spending, which is a completely
+ * different value already used elsewhere (the undo FILE's own name,
+ * `undo_<consuming_block_height>.dat`). Losing this distinction would mean
+ * a reorg-restored coinbase output silently gets the WRONG creation height
+ * (or none at all), defeating the 100-block maturity check for exactly the
+ * blocks that most need reorg correctness.
  *
  * Retention: undo_prune(tip_height, window) removes undo_<h>.dat files for
  * every h below (tip_height-window+1), mirroring bitcoin_store.asm's own
@@ -50,14 +61,19 @@ typedef unsigned short u16;
 typedef unsigned long long u64;
 
 #define UNDO_MAX_SCRIPT 10000   /* generous vs. any real scriptPubKey */
-#define UNDO_HEADER_BYTES 46    /* 32 + 4 + 8 + 2 */
+#define UNDO_HEADER_BYTES 51    /* 32 + 4 + 8 + 4 + 1 + 2 (was 46 before Stage D) */
 
 static void undo_path(char out[64], long height){
     snprintf(out, 64, "undo_%ld.dat", height);
 }
 
-/* undo_append_record(height, txid, index, value, script, slen) -> 1 ok / -1 err */
+/* undo_append_record(height, txid, index, value, utxo_height, is_coinbase,
+ *                    script, slen) -> 1 ok / -1 err
+ * `height` here is the CONSUMING block's height (the undo file this record
+ * is appended to); `utxo_height` is the spent UTXO's OWN original creation
+ * height, captured separately -- see this file's header comment. */
 long undo_append_record(long height, const u8 txid[32], u32 index, u64 value,
+                         u32 utxo_height, u8 is_coinbase,
                          const u8* script, u16 slen){
     char path[64]; undo_path(path, height);
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -67,7 +83,9 @@ long undo_append_record(long height, const u8 txid[32], u32 index, u64 value,
     memcpy(hdr, txid, 32);
     memcpy(hdr+32, &index, 4);
     memcpy(hdr+36, &value, 8);
-    memcpy(hdr+44, &slen, 2);
+    memcpy(hdr+44, &utxo_height, 4);
+    hdr[48] = is_coinbase;
+    memcpy(hdr+49, &slen, 2);
 
     long ok = 1;
     if (write(fd, hdr, UNDO_HEADER_BYTES) != UNDO_HEADER_BYTES) ok = -1;
@@ -83,6 +101,8 @@ typedef struct {
     u8  txid[32];
     u32 index;
     u64 value;
+    u32 height;        /* the spent UTXO's own original creation height */
+    u8  is_coinbase;
     u16 slen;
     u8  script[UNDO_MAX_SCRIPT];
 } undo_rec_t;
@@ -106,7 +126,9 @@ long undo_load(long height, undo_rec_t* out, long max_recs){
         memcpy(out[n].txid, hdr, 32);
         memcpy(&out[n].index, hdr+32, 4);
         memcpy(&out[n].value, hdr+36, 8);
-        memcpy(&out[n].slen, hdr+44, 2);
+        memcpy(&out[n].height, hdr+44, 4);
+        out[n].is_coinbase = hdr[48];
+        memcpy(&out[n].slen, hdr+49, 2);
         if (out[n].slen > UNDO_MAX_SCRIPT) { close(fd); return -1; }
         if (out[n].slen > 0) {
             long sr = read(fd, out[n].script, out[n].slen);
@@ -135,7 +157,8 @@ long undo_load(long height, undo_rec_t* out, long max_recs){
  * a silently short success).
  */
 typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
-                               u64 value, const u8* script, u16 slen);
+                               u64 value, u32 height, u8 is_coinbase,
+                               const u8* script, u16 slen);
 
 long undo_replay(long height, undo_replay_cb cb, void* ctx){
     char path[64]; undo_path(path, height);
@@ -149,16 +172,18 @@ long undo_replay(long height, undo_replay_cb cb, void* ctx){
         long r = read(fd, hdr, UNDO_HEADER_BYTES);
         if (r == 0) break;
         if (r != UNDO_HEADER_BYTES) { close(fd); return -1; }
-        u32 index; u64 value; u16 slen;
+        u32 index; u64 value; u32 utxo_height; u8 is_coinbase; u16 slen;
         memcpy(&index, hdr+32, 4);
         memcpy(&value, hdr+36, 8);
-        memcpy(&slen,  hdr+44, 2);
+        memcpy(&utxo_height, hdr+44, 4);
+        is_coinbase = hdr[48];
+        memcpy(&slen,  hdr+49, 2);
         if (slen > UNDO_MAX_SCRIPT) { close(fd); return -1; }
         if (slen > 0) {
             long sr = read(fd, script, slen);
             if (sr != (long)slen) { close(fd); return -1; }
         }
-        if (cb && !cb(ctx, hdr, index, value, script, slen)) { close(fd); return -1; }
+        if (cb && !cb(ctx, hdr, index, value, utxo_height, is_coinbase, script, slen)) { close(fd); return -1; }
         n++;
     }
     close(fd);
@@ -228,22 +253,28 @@ long undo_prune(long tip_height, long window){
  * why it is NOT actually installed there in this stage). Exercised only by
  * tests/test_undo_log.c against the real LSM. ---- */
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
-                          u64* value, const u8** script, unsigned long* slen);
+                          u64* value, unsigned long* height, unsigned long* is_coinbase,
+                          const u8** script, unsigned long* slen);
 extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
 
 /* undo_capture_and_del(lst, u, height, txid, index)
  *   -> 1 ok (captured + deleted) / 0 no such UTXO (nothing to capture or
  *      delete -- e.g. a coinbase input, which live_on_input already skips
  *      before this point in its real shape) / -1 error (lookup, capture,
- *      or delete failure). */
+ *      or delete failure).
+ * `height` is the CONSUMING block's height (undo file name); the spent
+ * UTXO's OWN creation height/is_coinbase come from utxo_lsm_get and are
+ * captured into the record so a later reorg-restore gets them right --
+ * see this file's header comment. */
 long undo_capture_and_del(void* lst, void* u, long height,
                            const u8 txid[32], u32 index){
     u64 value = 0;
+    unsigned long utxo_height = 0, is_coinbase = 0;
     const u8* script = 0;
     unsigned long slen = 0;
-    long r = utxo_lsm_get(lst, u, txid, index, &value, &script, &slen);
+    long r = utxo_lsm_get(lst, u, txid, index, &value, &utxo_height, &is_coinbase, &script, &slen);
     if (r != 1) return r;   /* 0 not-found, -1 err: pass through unchanged */
-    if (undo_append_record(height, txid, index, value, script, (u16)slen) != 1)
+    if (undo_append_record(height, txid, index, value, (u32)utxo_height, (u8)is_coinbase, script, (u16)slen) != 1)
         return -1;
     return utxo_lsm_del(lst, u, txid, index);
 }

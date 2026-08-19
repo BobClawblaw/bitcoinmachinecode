@@ -23,7 +23,8 @@ extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, uns
 /* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
  * rpc_commands_set_utxo_store's own doc comment in the header. */
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
-                          unsigned long long* value, const unsigned char** script, unsigned* slen);
+                          unsigned long long* value, unsigned long* height, unsigned long* is_coinbase,
+                          const unsigned char** script, unsigned* slen);
 
 /* wallet address type enum mirrors asm/wallet_core.c */
 #define WAL_ADDR_INVALID 0
@@ -527,9 +528,12 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     for (int i = 0; i < 32; i++) txid_wire[i] = txid_display[31 - i];
 
     if (!g_utxo_lst) { *result = rj_null(); return 1; }
-    unsigned long long value; const unsigned char* script; unsigned slen;
-    long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &script, &slen);
+    unsigned long long value; unsigned long height, is_coinbase; const unsigned char* script; unsigned slen;
+    long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &height, &is_coinbase, &script, &slen);
     if (r != 1) { *result = rj_null(); return 1; }
+    (void)height; /* "confirmations" below is still a hardcoded placeholder,
+                   * like "bestblock" -- wiring those to the real chain tip
+                   * is RPC completeness, out of scope for Stage D. */
 
     char amt[24]; rpc_amounts((long long)value, amt, sizeof amt);
     char addr[96]; addr[0] = 0;
@@ -549,7 +553,7 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     if (addr[0]) rj_obj_set(sp, "address", rj_str(addr));
     rj_obj_set(sp, "type", rj_str(spk_type(t)));
     rj_obj_set(o, "scriptPubKey", sp);
-    rj_obj_set(o, "coinbase", rj_bool(0));
+    rj_obj_set(o, "coinbase", rj_bool(is_coinbase != 0));
     free(scripthex);
     *result = o;
     return 1;
