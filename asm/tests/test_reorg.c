@@ -77,6 +77,9 @@ extern long store_chainwork_truncate(void* st, long target);
 
 extern int  utxo_live_init(const char* dir);
 extern long utxo_live_catchup(void* store_buf);
+extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index,
+                         u64 value, u64 height, u64 is_coinbase,
+                         const u8* script, u32 slen);
 extern long utxo_live_count(void);
 extern long utxo_live_applied_height(void);
 extern void utxo_live_close(void);
@@ -312,6 +315,25 @@ static void rebuild_index(void){
     idx_build_from_file(g_ht, "index.dat");
 }
 
+/* Stage D (2026-08-19): build_base's very first spend has no earlier
+ * non-coinbase output in the synthetic chain to draw from, and a fresh
+ * coinbase is always immature (spending block height - creation height is
+ * always 1 for "spend the immediately preceding block's own coinbase",
+ * which build_base does -- always < COINBASE_MATURITY regardless of the
+ * chain's absolute height). Seed ONE already-live, non-coinbase, OP_TRUE-
+ * spendable UTXO directly into the live LSM (bypassing block application
+ * entirely, the same "seed state block application never produced" pattern
+ * tests/test_undo_log.c already uses) so build_base's block-1 spend has a
+ * real, maturity-EXEMPT (is_coinbase=0, so the 100-block rule never
+ * applies) prevout to reference. Every later block's spend chains off the
+ * PREVIOUS block's own spend output instead of a coinbase -- see build_base
+ * / build_branch's own updated comments. */
+static const u8 ROOT_SEED_TXID[32] = {
+    0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,
+    0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,
+};
+#define ROOT_SEED_VALUE 50000000ULL
+
 static void harness_open(void){
     memset(store_buf,0,sizeof store_buf);
     ck("store_init", store_init(store_buf), 1);
@@ -319,6 +341,12 @@ static void harness_open(void){
     if (apfd >= 0) *(int*)((char*)store_buf+40) = apfd;
     ck("reorg_chainwork_open", reorg_chainwork_open(store_buf), 1);
     ckm("utxo_live_init", utxo_live_init(".") == 1);
+    {
+        static const u8 op_true[1] = {0x51};
+        long r = utxo_lsm_put(utxo_live_lst(), utxo_live_table(), ROOT_SEED_TXID, 0,
+                              ROOT_SEED_VALUE, 0, 0, op_true, 1);
+        ckm("seed root spendable UTXO (non-coinbase, maturity-exempt)", r == 1);
+    }
     g_ht = malloc(24 + (size_t)HT_SLOTS*48 + 64);
     idx_init(g_ht, HT_SLOTS);
     reorg_set_index_rebuild(rebuild_index);
@@ -534,8 +562,15 @@ static void case_chainwork_primitives(void){
 static blk_t base[MAXBLK], lose[MAXBLK], win[MAXBLK];
 
 /* Build a common prefix of `nbase` blocks. Block 0 is coinbase-only; every
- * later block also spends block (h-1)'s coinbase, so there is real, moving
- * UTXO state (creations AND spends) throughout. */
+ * later block also spends a NON-coinbase output, so there is real, moving
+ * UTXO state (creations AND spends) throughout WITHOUT tripping the
+ * 100-block coinbase maturity rule (Stage D, 2026-08-19): block 1 spends
+ * the synthetic ROOT_SEED_TXID harness_open() seeds directly (is_coinbase=0,
+ * maturity-exempt); every later block spends the PRECEDING block's own
+ * spend-tx output (also is_coinbase=0). A fresh coinbase spent by the very
+ * next block is ALWAYS immature regardless of the chain's absolute height
+ * (spending height - creation height is always 1), so this chain must never
+ * spend block (h-1)'s coinbase directly. */
 static void build_base(long nbase, u32 bits){
     u8 prev[32]; memset(prev,0,32);
     for (long h=0;h<nbase;h++){
@@ -545,7 +580,8 @@ static void build_base(long nbase, u32 bits){
         b->ntx = 1;
         mk_coinbase(&b->tx[0], 0x10000000u + (u32)h, 50000000ULL);
         if (h >= 1){
-            mk_spend(&b->tx[1], base[h-1].tx[0].txid, 0, 49000000ULL);
+            if (h == 1) mk_spend(&b->tx[1], ROOT_SEED_TXID, 0, 49000000ULL);
+            else        mk_spend(&b->tx[1], base[h-1].tx[1].txid, 0, 49000000ULL);
             b->ntx = 2;
         }
         mk_block(b, prev, 1600000000u + (u32)h);
@@ -555,10 +591,12 @@ static void build_base(long nbase, u32 bits){
 
 /* Build a branch of `n` blocks on top of base[nbase-1]. `tagbase` keeps the
  * two branches' coinbase txids (and therefore every derived outpoint)
- * disjoint. Each block spends the PREVIOUS block-in-this-branch's coinbase,
- * except the first, which spends base[nbase-1]'s coinbase -- so both branches
+ * disjoint. Each block spends the PREVIOUS block-in-this-branch's own spend
+ * output (never a coinbase -- see build_base's comment on why), except the
+ * first, which spends base[nbase-1]'s own spend output -- so both branches
  * contest the same pre-fork output, which is what makes the mempool and UTXO
- * outcomes interesting. */
+ * outcomes interesting. Every caller passes nbase>=2, so base[nbase-1]
+ * always has a tx[1] to reference. */
 static void build_branch(blk_t* out, long n, long nbase, u32 tagbase, u32 bits){
     u8 prev[32]; memcpy(prev, base[nbase-1].hash, 32);
     for (long i=0;i<n;i++){
@@ -566,8 +604,8 @@ static void build_branch(blk_t* out, long n, long nbase, u32 tagbase, u32 bits){
         memset(b,0,sizeof *b);
         b->bits = bits;
         mk_coinbase(&b->tx[0], tagbase + (u32)i, 50000000ULL);
-        if (i == 0) mk_spend(&b->tx[1], base[nbase-1].tx[0].txid, 0, 48000000ULL);
-        else        mk_spend(&b->tx[1], out[i-1].tx[0].txid, 0, 48000000ULL);
+        if (i == 0) mk_spend(&b->tx[1], base[nbase-1].tx[1].txid, 0, 48000000ULL);
+        else        mk_spend(&b->tx[1], out[i-1].tx[1].txid, 0, 48000000ULL);
         b->ntx = 2;
         mk_block(b, prev, 1700000000u + tagbase + (u32)i);
         memcpy(prev, b->hash, 32);
@@ -889,12 +927,17 @@ static void case_mempool(void){
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);
 
-    /* SURVIVOR: spends the OUTPUT OF base[2]'s spend transaction. Coinbase
-     * outputs are all consumed by the next block in this builder, so the
-     * only genuinely unspent pre-fork outputs are the spend transactions'
-     * own outputs -- and neither branch touches those, so this stays valid
-     * across the reorg and must remain in the mempool. */
-    tx_t survivor; mk_spend(&survivor, base[2].tx[1].txid, 0, 40000000ULL);
+    /* SURVIVOR: spends base[nbase-2]'s COINBASE output. Every base spend-tx
+     * output is consumed by the next block in the chain (Stage D,
+     * 2026-08-19: blocks now chain off the PRECEDING block's own spend
+     * output rather than its coinbase -- see build_base's comment), and
+     * base[nbase-1]'s own spend output is the one BOTH branches deliberately
+     * contest (build_branch's comment) -- so a coinbase strictly before that
+     * is the only kind of output left that is genuinely untouched by base,
+     * lose, AND win alike. Never mined/applied through the real
+     * block-connect path here (mpool_policy_add is a separate code path
+     * from tx_verify_block_connect), so its own coinbase-maturity is moot. */
+    tx_t survivor; mk_spend(&survivor, base[nbase-2].tx[0].txid, 0, 40000000ULL);
     ck("survivor accepted into mempool",
        mpool_policy_add(pol, pol_state, mp, survivor.raw, survivor.len, survivor.txid, (void*)1), 1);
 
@@ -946,13 +989,19 @@ static void case_mempool(void){
 
     /* Now the positive re-entry case: a transaction that was confirmed only
      * on the losing branch and whose input SURVIVES on the winner must come
-     * back. base[3]'s spend output is untouched by both branches, so a
-     * disconnected block containing a spend of it should be reinjected. */
+     * back. base[nbase-1]'s COINBASE output is untouched by both branches
+     * (Stage D, 2026-08-19: branches now chain off base[nbase-1]'s spend
+     * output, not its coinbase -- see build_branch's comment; distinct from
+     * `survivor`'s own target above so the two don't both reference the
+     * same outpoint), so a disconnected block containing a spend of it
+     * should be reinjected. Never actually mined/applied through the real
+     * block-connect path here, so its own coinbase-maturity is moot -- this
+     * is purely exercising reorg_mempool_reconcile. */
     {
         static blk_t extra; memset(&extra,0,sizeof extra);
         extra.bits = 0x207fffffu; extra.ntx = 2;
         mk_coinbase(&extra.tx[0], 0x70000000u, 50000000ULL);
-        mk_spend(&extra.tx[1], base[3].tx[1].txid, 0, 30000000ULL);
+        mk_spend(&extra.tx[1], base[nbase-1].tx[0].txid, 0, 30000000ULL);
         mk_block(&extra, base[nbase-1].hash, 1900000000u);
 
         const u8* d2[1] = { extra.raw }; uint32_t l2[1] = { (uint32_t)extra.len };
