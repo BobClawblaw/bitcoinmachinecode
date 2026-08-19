@@ -122,11 +122,11 @@ static int mv_parse(mv_tx_t* T){
         uint64_t sl = rd_cs(&p);
         if (p + sl > end) return 0; p += sl;
     }
-    /* witness */
+    /* witness: no overall stack-count field on the wire -- exactly one
+     * stack per input, back-to-back (Core's SerializeTransaction writes
+     * tx.vin[i].scriptWitness.stack for i in [0, vin.size())). */
     if (segwit){
-        uint64_t witcnt = rd_cs(&p);
-        if (witcnt > nin) return 0;
-        for (uint64_t i=0;i<witcnt;i++){
+        for (uint64_t i=0;i<nin;i++){
             inrec_t* in = &T->in[i];
             uint64_t nitems = rd_cs(&p);
             if (nitems > 16) return 0;
