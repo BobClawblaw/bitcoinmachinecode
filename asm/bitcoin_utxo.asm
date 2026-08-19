@@ -19,17 +19,24 @@
 ;        [+44 qword _pad]
 ;   empty slot marker: index == 0xFFFFFFFFFFFFFFFF-free: use index field 0xFFFFFFFF.
 ;
-; Blob record at offset o:
-;   [+0  u64 value][+8 u64 script_len][+16 u8 script[script_len]]
+; Blob record at offset o (2026-08-19, Stage D: added height/is_coinbase so
+; script verification can enforce the 100-block coinbase maturity rule --
+; the store previously had no data source for it at all):
+;   [+0  u64 value][+8 u32 height][+12 u8 is_coinbase][+13..15 pad]
+;   [+16 u64 script_len][+24 u8 script[script_len]]
+; height/is_coinbase are packed into ONE qword at +8 (height in the low 32
+; bits, is_coinbase in byte 32) so the read/write is a single mov, not two.
 ;
 ; Exports (System V AMD64):
 ;   size_t utxo_struct_size(unsigned long slots)
 ;   void   utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap)
 ;   long   utxo_put(void* u, const u8 txid[32], unsigned long index,
-;                   unsigned long long value, const u8* script, unsigned long slen)
+;                   unsigned long long value, unsigned long height,
+;                   unsigned long is_coinbase, const u8* script, unsigned long slen)
 ;               -> 1 new / 0 dup / 2 table-full
 ;   long   utxo_get(void* u, const u8 txid[32], unsigned long index,
-;                   unsigned long long* value, const u8** script, unsigned long* slen)
+;                   unsigned long long* value, unsigned long* height,
+;                   unsigned long* is_coinbase, const u8** script, unsigned long* slen)
 ;               -> 1 found / 0 miss
 ;   long   utxo_del(void* u, const u8 txid[32], unsigned long index) -> 1 deleted / 0 miss
 ;   long   utxo_count(void* u)
@@ -105,7 +112,7 @@ utxo_hash:
     ret
 
 ; -----------------------------------------------------------------
-; utxo_put(u, txid, index, value, script, slen)
+; utxo_put(u, txid, index, value, height, is_coinbase, script, slen)
 global utxo_put
 utxo_put:
     push rbp
@@ -120,12 +127,17 @@ utxo_put:
     mov  r13, rsi       ; txid
     mov  r14, rdx       ; index
     mov  r15, rcx       ; value
-    ; value is 64-bit in rcx; script in r8, slen in r9
+    ; r8=height r9=is_coinbase; script/slen are now the 7th/8th args (stack).
     ; NOTE: save area is [rbp-8..-0x28] (5 pushes); locals live at
     ; [rbp-0x30] and below so the saved callee-saved regs are not clobbered.
+    mov  eax, r8d
+    mov  [rbp-0x40], rax    ; height (zero-extended to 64 bits)
+    mov  eax, r9d
+    mov  [rbp-0x48], rax    ; is_coinbase (zero-extended to 64 bits)
     mov  rax, [rbp+16]
-    mov  [rbp-0x30], r8     ; script
-    mov  [rbp-0x38], r9     ; slen
+    mov  [rbp-0x30], rax    ; script
+    mov  rax, [rbp+24]
+    mov  [rbp-0x38], rax    ; slen
     ; ---- find slot ----
     mov  rdi, r13
     mov  rsi, r14
@@ -195,7 +207,7 @@ utxo_put:
     ; ---- allocate blob record ----
     mov  rax, [r12+32]         ; fill = record offset
     mov  rcx, [rbp-0x38]       ; slen
-    lea  rcx, [rcx+16]         ; + value(8) + slen(8)
+    lea  rcx, [rcx+24]         ; + value(8) + height/coinbase(8) + slen(8)
     lea  rdx, [rax+rcx]
     cmp  rdx, [r12+24]         ; blob_cap
     ja   .full
@@ -205,21 +217,28 @@ utxo_put:
     ; store blob_off in the slot
     lea  rdx, [r12+rbx]
     mov  [rdx], rax
-    ; write value, slen
+    ; write value
     mov  r8, r15
     mov  [rcx], r8             ; value
+    ; write height (low 32 bits) + is_coinbase (byte 32) as one packed qword
+    mov  r8, [rbp-0x40]        ; height
+    mov  r9, [rbp-0x48]        ; is_coinbase
+    shl  r9, 32
+    or   r8, r9
+    mov  [rcx+8], r8           ; height/is_coinbase
+    ; slen
     mov  r8, [rbp-0x38]
-    mov  [rcx+8], r8           ; script_len
-    ; copy script into record+16
-    lea  rdi, [rcx+16]
+    mov  [rcx+16], r8          ; script_len
+    ; copy script into record+24
+    lea  rdi, [rcx+24]
     mov  rsi, [rbp-0x30]
     push rbx
     mov  rcx, [rbp-0x38]
     call memcpy_asm
     pop  rbx
-    ; fill += 16 + slen ; n++
+    ; fill += 24 + slen ; n++
     mov  r8, [rbp-0x38]
-    lea  r8, [r8+16]
+    lea  r8, [r8+24]
     add  qword [r12+32], r8
     inc  qword [r12]
     mov  eax, 1
@@ -240,7 +259,7 @@ utxo_put:
     ret
 
 ; -----------------------------------------------------------------
-; utxo_get(u, txid, index, &value, &script, &slen)
+; utxo_get(u, txid, index, &value, &height, &is_coinbase, &script, &slen)
 global utxo_get
 utxo_get:
     push rbp
@@ -250,15 +269,19 @@ utxo_get:
     push r13
     push r14
     push r15
-    sub  rsp, 0x30
+    sub  rsp, 0x40
     mov  r12, rdi
     mov  r13, rsi
     mov  r14, rdx
     ; NOTE: save area is [rbp-8..-0x28] (5 pushes); locals live BELOW it
     ; at [rbp-0x40..] so the saved callee-saved regs are not clobbered.
     mov  [rbp-0x40], rcx    ; &value
-    mov  [rbp-0x48], r8     ; &script
-    mov  [rbp-0x50], r9     ; &slen
+    mov  [rbp-0x48], r8     ; &height
+    mov  [rbp-0x50], r9     ; &is_coinbase
+    mov  rax, [rbp+16]
+    mov  [rbp-0x58], rax    ; &script
+    mov  rax, [rbp+24]
+    mov  [rbp-0x60], rax    ; &slen
     mov  rdi, r13
     mov  rsi, r14
     mov  rdx, [r12+8]
@@ -303,20 +326,35 @@ utxo_get:
     mov  rdx, [rbp-0x40]
     mov  r8, [rax]
     mov  [rdx], r8
-    ; script ptr
+    ; height (low 32) / is_coinbase (byte 32) -- one packed qword at [+8].
+    ; NOTE: `and r8, 0xFFFFFFFF` would sign-extend the immediate to all-1s
+    ; (no imm64 AND form), making the mask a no-op -- caught by nasm's own
+    ; "signed dword value exceeds bounds" warning before this ever ran.
+    ; `mov r8d, r9d` zero-extends the upper 32 bits instead (real x86-64
+    ; semantics of a 32-bit register write), which is what's actually wanted.
+    mov  r9, [rax+8]
     mov  rdx, [rbp-0x48]
-    lea  r8, [rax+16]
+    mov  r8d, r9d
+    mov  [rdx], r8              ; *height
+    mov  rdx, [rbp-0x50]
+    mov  r8, r9
+    shr  r8, 32
+    and  r8, 0xFF
+    mov  [rdx], r8              ; *is_coinbase
+    ; script ptr
+    mov  rdx, [rbp-0x58]
+    lea  r8, [rax+24]
     mov  [rdx], r8
     ; slen
-    mov  rdx, [rbp-0x50]
-    mov  r8, [rax+8]
+    mov  rdx, [rbp-0x60]
+    mov  r8, [rax+16]
     mov  [rdx], r8
     mov  eax, 1
     jmp  .done2
 .miss:
     xor  eax, eax
 .done2:
-    add  rsp, 0x30
+    add  rsp, 0x40
     pop  r15
     pop  r14
     pop  r13

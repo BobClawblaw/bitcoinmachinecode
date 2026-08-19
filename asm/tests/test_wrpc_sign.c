@@ -27,9 +27,11 @@ extern int  wallet_p2pkh_output_script(unsigned char out[25], const unsigned cha
 extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern int  verify_p2pkh(const unsigned char* tx, unsigned long txlen,
                          unsigned long input_index,
                          const unsigned char* prevout_script, unsigned long prevout_len,
@@ -58,8 +60,8 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen, void
         unsigned char txid[32]; memcpy(txid,p,32);
         unsigned long idx=(unsigned long)p[32]|((unsigned long)p[33]<<8)|((unsigned long)p[34]<<16)|((unsigned long)p[35]<<24);
         p+=36; unsigned long sl=rd_varint(p,&p); p+=sl+4;
-        unsigned long long val; const unsigned char* s; unsigned long ssl;
-        if(utxo_get(utxo,txid,idx,&val,&s,&ssl)!=1){printf("  [double-spend]\n");return 0;}
+        unsigned long long val; const unsigned char* s; unsigned long ssl, h_unused, cb_unused;
+        if(utxo_get(utxo,txid,idx,&val,&h_unused,&cb_unused,&s,&ssl)!=1){printf("  [double-spend]\n");return 0;}
         scripts[i]=s; vals[i]=val; total_in+=val;
     }
     for(unsigned int i=0;i<info.n_in&&i<64;i++)
@@ -115,8 +117,8 @@ int main(void){
         ck("  input1 signed", mask[1],1);
         unsigned char ux[40+512*48+8], ublob[1<<16], work[8192];
         utxo_init(ux,512,ublob,sizeof ublob);
-        utxo_put(ux,tA,0,tval[0],prevB[0],25);
-        utxo_put(ux,tB,1,tval[1],prevB[1],25);
+        utxo_put(ux,tA,0,tval[0],0,0,prevB[0],25);
+        utxo_put(ux,tB,1,tval[1],0,0,prevB[1],25);
         ck("signed tx VALID", sl>0 && validate_signed_tx(signed_k,(unsigned long)sl,ux,work,sizeof work),1);
     }
 
@@ -134,8 +136,8 @@ int main(void){
         ck("  unsigned unchanged", sl==rawlen && memcmp(signed_k,raw,(size_t)rawlen)==0,1);
         unsigned char ux[40+512*48+8], ublob[1<<16], work[8192];
         utxo_init(ux,512,ublob,sizeof ublob);
-        utxo_put(ux,tA,0,tval[0],prevB[0],25);
-        utxo_put(ux,tB,1,tval[1],prevB[1],25);
+        utxo_put(ux,tA,0,tval[0],0,0,prevB[0],25);
+        utxo_put(ux,tB,1,tval[1],0,0,prevB[1],25);
         ck("wrong-key tx REJECTED (sig fail)", validate_signed_tx(signed_k,(unsigned long)sl,ux,work,sizeof work)==0,1);
     }
 
@@ -151,8 +153,8 @@ int main(void){
         /* still invalid because input1 unsigned */
         unsigned char ux[40+512*48+8], ublob[1<<16], work[8192];
         utxo_init(ux,512,ublob,sizeof ublob);
-        utxo_put(ux,tA,0,tval[0],prevB[0],25);
-        utxo_put(ux,tB,1,tval[1],prevB[1],25);
+        utxo_put(ux,tA,0,tval[0],0,0,prevB[0],25);
+        utxo_put(ux,tB,1,tval[1],0,0,prevB[1],25);
         ck("partial (in0 only) REJECTED (in1 unsigned)", validate_signed_tx(signed_k,(unsigned long)sl,ux,work,sizeof work)==0,1);
     }
 

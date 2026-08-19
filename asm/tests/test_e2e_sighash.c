@@ -30,9 +30,11 @@
 extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern int  verify_p2pkh(const unsigned char* tx, unsigned long txlen,
                          unsigned long input_index,
                          const unsigned char* prevout_script, unsigned long prevout_len,
@@ -222,8 +224,8 @@ static int validate_tx(const unsigned char* tx, unsigned long txlen,
             unsigned long sl = rd_varint(p, &p);
             p += sl + 4;
         }
-        unsigned long long val; const unsigned char* sp; unsigned long sl;
-        if (utxo_get(utxo, txid, index, &val, &sp, &sl) != 1) {
+        unsigned long long val; const unsigned char* sp; unsigned long sl, h_unused, cb_unused;
+        if (utxo_get(utxo, txid, index, &val, &h_unused, &cb_unused, &sp, &sl) != 1) {
             printf("  [double-spend] input %u outpoint absent/unspent\n", i);
             return 0;
         }
@@ -381,7 +383,7 @@ int main(void) {
     static unsigned char ublob[1 << 16];
     static unsigned char work[8192];
     utxo_init(ux, 512, ublob, sizeof ublob);
-    utxo_put(ux, fund_txid, fund_idx, fund_amt, script1, 25);
+    utxo_put(ux, fund_txid, fund_idx, fund_amt, 0, 0, script1, 25);
 
     printf("\n[1] whole-tx validator on the CLI-signed tx:\n");
     int valid = validate_tx(signed_tx, (unsigned long)slen, ux, work, sizeof work);

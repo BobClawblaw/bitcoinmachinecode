@@ -1,6 +1,10 @@
 /* test_utxo_lsm.c -- verify the LSM-tree UTXO store (bitcoin_utxo_lsm.asm):
  * bounded memtable + per-generation WAL + sorted immutable run flush +
- * multi-run Bloom-filtered lookup + tombstone-shadowing + crash recovery.
+ * multi-run Bloom-filtered lookup + tombstone-shadowing + crash recovery,
+ * and (2026-08-19, Stage D) that height/is_coinbase survive every one of
+ * those paths -- memtable, flush-to-disk-run, the sparse-index-accelerated
+ * disk lookup, crash recovery, compaction, and reading an OLD-format run
+ * file that never captured them at all (must report 0/0, not garbage).
  *
  * Run in a throwaway temp dir (utxo_lsm_init/reload's fds are relative
  * filenames, matching the convention build_utxo.c's chdir already uses).
@@ -17,10 +21,13 @@ extern long utxo_count(void* u);
 extern long utxo_lsm_init(void* lst);
 extern long utxo_lsm_put(void* lst, void* u, const unsigned char txid[32],
                           unsigned index, unsigned long long value,
+                          unsigned long height, unsigned long is_coinbase,
                           const unsigned char* script, unsigned slen);
 extern long utxo_lsm_del(void* lst, void* u, const unsigned char txid[32], unsigned index);
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
-                          unsigned long long* value, const unsigned char** script, unsigned* slen);
+                          unsigned long long* value, unsigned long* height,
+                          unsigned long* is_coinbase,
+                          const unsigned char** script, unsigned* slen);
 extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
 extern long utxo_lsm_compact(void* lst);
@@ -118,21 +125,24 @@ int main(void) {
     for (int i=0;i<22;i++) scrB[i]=0x90+i;
     for (int i=0;i<5;i++)  scrC[i]=0x51;
 
-    ck("lsm_put A0 new", utxo_lsm_put(&lst, g_ux, tA, 0, 50000ULL, scrA, 25), 1);
-    ck("lsm_put B7 new", utxo_lsm_put(&lst, g_ux, tB, 7, 1234567ULL, scrB, 22), 1);
-    ck("lsm_put C0 new", utxo_lsm_put(&lst, g_ux, tC, 0, 999ULL, scrC, 5), 1);
+    /* A0 is a coinbase output at height 100; B7/C0 are normal spends. */
+    ck("lsm_put A0 new (coinbase h=100)", utxo_lsm_put(&lst, g_ux, tA, 0, 50000ULL, 100, 1, scrA, 25), 1);
+    ck("lsm_put B7 new (h=200)", utxo_lsm_put(&lst, g_ux, tB, 7, 1234567ULL, 200, 0, scrB, 22), 1);
+    ck("lsm_put C0 new (h=201)", utxo_lsm_put(&lst, g_ux, tC, 0, 999ULL, 201, 0, scrC, 5), 1);
     ck("lsm_count 3", utxo_lsm_count(&lst), 3);
     ck("manifest_n still 0 (no flush)", lst.manifest_n, 0);
 
-    unsigned long long v; const unsigned char* s; unsigned sl;
-    ck("get A0 (memtable)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &s, &sl), 1);
+    unsigned long long v; const unsigned char* s; unsigned sl; unsigned long h, cb;
+    ck("get A0 (memtable)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &h, &cb, &s, &sl), 1);
     ck("get A0 value", v, 50000ULL);
+    ck("get A0 height (memtable)", h, 100);
+    ck("get A0 is_coinbase (memtable)", cb, 1);
     ck("get A0 slen", sl, 25);
     ckm("get A0 script", memcmp(s, scrA, 25) == 0);
 
     ck("lsm_del B7", utxo_lsm_del(&lst, g_ux, tB, 7), 1);
     ck("lsm_count 2 after spend", utxo_lsm_count(&lst), 2);
-    ck("get B7 miss (spent)", utxo_lsm_get(&lst, g_ux, tB, 7, &v, &s, &sl), 0);
+    ck("get B7 miss (spent)", utxo_lsm_get(&lst, g_ux, tB, 7, &v, &h, &cb, &s, &sl), 0);
     ck("tomb_n 1 after spend", lst.tomb_n, 1);
 
     /* ---------- phase 2: force a flush by crossing op_threshold ---------- */
@@ -140,15 +150,16 @@ int main(void) {
     make_txid(tD, 0x40, 4); make_txid(tE, 0x50, 5);
     unsigned char scrD[8]; for (int i=0;i<8;i++) scrD[i]=0x77;
     unsigned char scrE[10]; for (int i=0;i<10;i++) scrE[i]=0x33;
-    ck("lsm_put D0", utxo_lsm_put(&lst, g_ux, tD, 0, 7777ULL, scrD, 8), 1);
-    ck("lsm_put E0", utxo_lsm_put(&lst, g_ux, tE, 0, 5555ULL, scrE, 10), 1);
+    /* D0 is a coinbase output at height 300; E0 is a normal spend at 301. */
+    ck("lsm_put D0 (coinbase h=300)", utxo_lsm_put(&lst, g_ux, tD, 0, 7777ULL, 300, 1, scrD, 8), 1);
+    ck("lsm_put E0 (h=301)", utxo_lsm_put(&lst, g_ux, tE, 0, 5555ULL, 301, 0, scrE, 10), 1);
     /* op_count so far: put A,put B,del B,put D,put E = 6; push exactly 10
      * more no-op dup puts (duplicates of C0, each still counts as an op but
      * never changes memtable live-count) so op_count hits OP_THRESHOLD=16
      * on precisely the LAST iteration -- flush fires there and nothing
      * else runs afterward, so the post-flush reset checks below are exact. */
     for (int i = 0; i < 10; i++) {
-        utxo_lsm_put(&lst, g_ux, tC, 0, 999ULL, scrC, 5); /* dup, still counts as an op */
+        utxo_lsm_put(&lst, g_ux, tC, 0, 999ULL, 201, 0, scrC, 5); /* dup */
     }
     ckm("flush happened (manifest_n>=1)", lst.manifest_n >= 1);
     ck("memtable cleared after flush", utxo_count(g_ux), 0);
@@ -156,19 +167,29 @@ int main(void) {
     ck("tomb_n reset after flush", lst.tomb_n, 0);
     ck("log_len reset after flush", (long)lst.log_len, 0);
 
-    /* live keys now only findable via the flushed run (memtable is empty) */
-    ck("get A0 (from run)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &s, &sl), 1);
+    /* live keys now only findable via the flushed run (memtable is empty).
+     * Checking height/is_coinbase here proves mac_flush's write and
+     * mac_run_lookup's read agree on the new 15-byte record shape. */
+    ck("get A0 (from run)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &h, &cb, &s, &sl), 1);
     ck("get A0 value (from run)", v, 50000ULL);
+    ck("get A0 height (from run)", h, 100);
+    ck("get A0 is_coinbase (from run)", cb, 1);
     ckm("get A0 script (from run)", memcmp(s, scrA, 25) == 0);
-    ck("get C0 (from run)", utxo_lsm_get(&lst, g_ux, tC, 0, &v, &s, &sl), 1);
+    ck("get C0 (from run)", utxo_lsm_get(&lst, g_ux, tC, 0, &v, &h, &cb, &s, &sl), 1);
     ck("get C0 value (from run)", v, 999ULL);
-    ck("get D0 (from run)", utxo_lsm_get(&lst, g_ux, tD, 0, &v, &s, &sl), 1);
+    ck("get C0 height (from run)", h, 201);
+    ck("get C0 is_coinbase (from run)", cb, 0);
+    ck("get D0 (from run)", utxo_lsm_get(&lst, g_ux, tD, 0, &v, &h, &cb, &s, &sl), 1);
     ck("get D0 value (from run)", v, 7777ULL);
+    ck("get D0 height (from run)", h, 300);
+    ck("get D0 is_coinbase (from run)", cb, 1);
     ckm("get D0 script (from run)", memcmp(s, scrD, 8) == 0);
-    ck("get E0 (from run)", utxo_lsm_get(&lst, g_ux, tE, 0, &v, &s, &sl), 1);
-    ck("get B7 absent (spent before flush)", utxo_lsm_get(&lst, g_ux, tB, 7, &v, &s, &sl), 0);
+    ck("get E0 (from run)", utxo_lsm_get(&lst, g_ux, tE, 0, &v, &h, &cb, &s, &sl), 1);
+    ck("get E0 height (from run)", h, 301);
+    ck("get E0 is_coinbase (from run)", cb, 0);
+    ck("get B7 absent (spent before flush)", utxo_lsm_get(&lst, g_ux, tB, 7, &v, &h, &cb, &s, &sl), 0);
     unsigned char tZ[32]; make_txid(tZ, 0x99, 9);
-    ck("get tZ absent (never existed)", utxo_lsm_get(&lst, g_ux, tZ, 0, &v, &s, &sl), 0);
+    ck("get tZ absent (never existed)", utxo_lsm_get(&lst, g_ux, tZ, 0, &v, &h, &cb, &s, &sl), 0);
 
     /* ---------- phase 3: tombstone-shadowing across generations ---------- */
     /* A0 currently lives in run 0. Spend it now (memtable miss -> tombstone
@@ -183,12 +204,12 @@ int main(void) {
     for (int i = 0; i < 16; i++) {
         unsigned char tF[32]; make_txid(tF, 0x60, 100+i);
         unsigned char scrF[4] = {1,2,3,4};
-        utxo_lsm_put(&lst, g_ux, tF, 0, (unsigned long long)i, scrF, 4);
+        utxo_lsm_put(&lst, g_ux, tF, 0, (unsigned long long)i, (unsigned long)i, 0, scrF, 4);
     }
     ckm("second flush happened", lst.manifest_n > manifest_before);
-    ck("get A0 absent after tombstone flush (shadowed)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &s, &sl), 0);
-    ck("get C0 still present (unaffected)", utxo_lsm_get(&lst, g_ux, tC, 0, &v, &s, &sl), 1);
-    ck("get D0 still present (unaffected)", utxo_lsm_get(&lst, g_ux, tD, 0, &v, &s, &sl), 1);
+    ck("get A0 absent after tombstone flush (shadowed)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &h, &cb, &s, &sl), 0);
+    ck("get C0 still present (unaffected)", utxo_lsm_get(&lst, g_ux, tC, 0, &v, &h, &cb, &s, &sl), 1);
+    ck("get D0 still present (unaffected)", utxo_lsm_get(&lst, g_ux, tD, 0, &v, &h, &cb, &s, &sl), 1);
 
     /* ---------- phase 4: crash recovery ---------- */
     /* Do a handful of puts/dels that stay BELOW both thresholds (so they
@@ -197,7 +218,7 @@ int main(void) {
     unsigned char tG[32], tH[32];
     make_txid(tG, 0x70, 200); make_txid(tH, 0x80, 201);
     unsigned char scrG[3] = {9,9,9};
-    ck("lsm_put G0 (unflushed, pre-crash)", utxo_lsm_put(&lst, g_ux, tG, 0, 42ULL, scrG, 3), 1);
+    ck("lsm_put G0 (unflushed, pre-crash)", utxo_lsm_put(&lst, g_ux, tG, 0, 42ULL, 400, 0, scrG, 3), 1);
     ck("lsm_del D0 (unflushed, pre-crash spend of a run0 key)", utxo_lsm_del(&lst, g_ux, tD, 0), 1);
     unsigned long long pre_total_live = lst.total_live;
     long pre_manifest_n = lst.manifest_n;
@@ -214,13 +235,13 @@ int main(void) {
         long replayed = utxo_lsm_reload(&lst2, ux2);
         ckm("reload ok (>=0)", replayed >= 0);
         ck("reload manifest_n matches pre-crash", lst2.manifest_n, pre_manifest_n);
-        ck("reload get G0 (from replayed WAL)", utxo_lsm_get(&lst2, ux2, tG, 0, &v, &s, &sl), 1);
+        ck("reload get G0 (from replayed WAL)", utxo_lsm_get(&lst2, ux2, tG, 0, &v, &h, &cb, &s, &sl), 1);
         ck("reload get G0 value", v, 42ULL);
         ck("reload get D0 absent (spent in lost tail, tombstone rebuilt)",
-           utxo_lsm_get(&lst2, ux2, tD, 0, &v, &s, &sl), 0);
-        ck("reload get C0 still present (older run)", utxo_lsm_get(&lst2, ux2, tC, 0, &v, &s, &sl), 1);
+           utxo_lsm_get(&lst2, ux2, tD, 0, &v, &h, &cb, &s, &sl), 0);
+        ck("reload get C0 still present (older run)", utxo_lsm_get(&lst2, ux2, tC, 0, &v, &h, &cb, &s, &sl), 1);
         ck("reload get A0 still absent (tombstone run survives)",
-           utxo_lsm_get(&lst2, ux2, tA, 0, &v, &s, &sl), 0);
+           utxo_lsm_get(&lst2, ux2, tA, 0, &v, &h, &cb, &s, &sl), 0);
         /* tomb_n after reload must reflect the one DEL (D0) replayed from
          * the WAL tail, so a THIRD flush would still correctly shadow it */
         ck("reload tomb_n rebuilt to 1", lst2.tomb_n, 1);
@@ -228,6 +249,7 @@ int main(void) {
         free(tomb2); free(manifest2); free(scratch2);
     }
     (void)pre_total_live;
+    (void)tH;
 
     /* ---------- phase 5: randomized stress vs a reference model ---------- */
     {
@@ -244,6 +266,8 @@ int main(void) {
         #define NKEYS 400
         static unsigned char live[NKEYS];
         static unsigned long long refval[NKEYS];
+        static unsigned long refheight[NKEYS];
+        static unsigned char refcb[NKEYS];
         memset(live, 0, sizeof live);
 
         srand(12345);
@@ -256,13 +280,16 @@ int main(void) {
             int do_put = (rand() % 2) == 0;
             if (do_put) {
                 unsigned long long val = (unsigned long long)round*1000ULL + k;
-                long r = utxo_lsm_put(&lst3, ux3, tk, 0, val, scrk, 4);
+                unsigned long height = (unsigned long)round;
+                unsigned long is_cb = (k % 3 == 0) ? 1 : 0;
                 /* utxo_put's real contract (matching real UTXO semantics --
                  * a given outpoint is created exactly once): a put against
                  * an ALREADY-LIVE key is a no-op dup (r==0) that does NOT
-                 * update the stored value, so the reference model must only
-                 * adopt the new value when r==1 (genuinely new insert). */
-                if (r == 1) { live[k] = 1; refval[k] = val; }
+                 * update the stored value/height/is_coinbase, so the
+                 * reference model must only adopt the new fields when
+                 * r==1 (genuinely new insert). */
+                long r = utxo_lsm_put(&lst3, ux3, tk, 0, val, height, is_cb, scrk, 4);
+                if (r == 1) { live[k] = 1; refval[k] = val; refheight[k] = height; refcb[k] = (unsigned char)is_cb; }
                 else if (r == -1) { stress_fails++; printf("FAIL: stress put returned -1 at round %d\n", round); }
             } else {
                 long r = utxo_lsm_del(&lst3, ux3, tk, 0);
@@ -270,18 +297,19 @@ int main(void) {
                 else live[k] = 0;
             }
             if ((round % 37) == 0) {
-                /* spot-check a handful of keys against the reference */
+                /* spot-check a handful of keys against the reference,
+                 * including height/is_coinbase */
                 for (int c = 0; c < 20; c++) {
                     int ck_i = (round + c*13) % NKEYS;
                     unsigned char tc[32];
                     make_txid(tc, 0x11, (unsigned)ck_i);
-                    unsigned long long gv; const unsigned char* gs; unsigned gsl;
-                    long r = utxo_lsm_get(&lst3, ux3, tc, 0, &gv, &gs, &gsl);
+                    unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+                    long r = utxo_lsm_get(&lst3, ux3, tc, 0, &gv, &gh, &gcb, &gs, &gsl);
                     if (live[ck_i]) {
-                        if (r != 1 || gv != refval[ck_i]) {
+                        if (r != 1 || gv != refval[ck_i] || gh != refheight[ck_i] || gcb != refcb[ck_i]) {
                             stress_fails++;
-                            printf("FAIL: stress key %d expected live=%llu got r=%ld v=%llu (round %d)\n",
-                                   ck_i, refval[ck_i], r, gv, round);
+                            printf("FAIL: stress key %d expected live=%llu h=%lu cb=%u got r=%ld v=%llu h=%lu cb=%lu (round %d)\n",
+                                   ck_i, refval[ck_i], refheight[ck_i], (unsigned)refcb[ck_i], r, gv, gh, gcb, round);
                         }
                     } else {
                         if (r != 0) {
@@ -327,13 +355,13 @@ int main(void) {
         for (int k = 0; k < NKEYS; k++) {
             unsigned char tk[32];
             make_txid(tk, 0x11, (unsigned)k);
-            unsigned long long gv; const unsigned char* gs; unsigned gsl;
-            long r = utxo_lsm_get(&lst3b, ux3b, tk, 0, &gv, &gs, &gsl);
+            unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+            long r = utxo_lsm_get(&lst3b, ux3b, tk, 0, &gv, &gh, &gcb, &gs, &gsl);
             if (live[k]) {
-                if (r != 1 || gv != refval[k]) {
+                if (r != 1 || gv != refval[k] || gh != refheight[k] || gcb != refcb[k]) {
                     stress_fails++;
-                    printf("FAIL: final sweep key %d expected live=%llu got r=%ld v=%llu\n",
-                           k, refval[k], r, gv);
+                    printf("FAIL: final sweep key %d expected live=%llu h=%lu cb=%u got r=%ld v=%llu h=%lu cb=%lu\n",
+                           k, refval[k], refheight[k], (unsigned)refcb[k], r, gv, gh, gcb);
                 }
             } else {
                 if (r != 0) {
@@ -382,13 +410,17 @@ int main(void) {
         utxo_init(ux4, SP_SLOTS, blob4, sizeof blob4);
 
         static unsigned long long sp_val[SP_N];
+        static unsigned long sp_height[SP_N];
+        static unsigned char sp_cb[SP_N];
         int sp_setup_fails = 0;
         for (int i = 0; i < SP_N; i++) {
             unsigned char tk[32];
             make_txid(tk, 0x22, (unsigned)i);
             unsigned char scrk[6] = {1,2,3,4,5,(unsigned char)i};
             sp_val[i] = 900000ULL + (unsigned long long)i;
-            long r = utxo_lsm_put(&lst4, ux4, tk, 0, sp_val[i], scrk, 6);
+            sp_height[i] = 900000UL + (unsigned long)i;
+            sp_cb[i] = (i % 5 == 0) ? 1 : 0;
+            long r = utxo_lsm_put(&lst4, ux4, tk, 0, sp_val[i], sp_height[i], sp_cb[i], scrk, 6);
             if (r != 1) { sp_setup_fails++; printf("FAIL: sparse setup put %d returned %ld\n", i, r); }
         }
         ck("sparse: setup puts all new (0 failures)", sp_setup_fails, 0);
@@ -402,23 +434,25 @@ int main(void) {
         for (int i = 0; i < SP_N; i += 7) {
             unsigned char tk[32];
             make_txid(tk, 0x22, (unsigned)i);
-            unsigned long long gv; const unsigned char* gs; unsigned gsl;
-            long r = utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl);
-            if (r != 1 || gv != sp_val[i] || gsl != 6 || gs[5] != (unsigned char)i) {
+            unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+            long r = utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gh, &gcb, &gs, &gsl);
+            if (r != 1 || gv != sp_val[i] || gsl != 6 || gs[5] != (unsigned char)i
+                || gh != sp_height[i] || gcb != sp_cb[i]) {
                 sp_fails++;
-                printf("FAIL: sparse get key %d r=%ld v=%llu exp=%llu\n", i, r, gv, sp_val[i]);
+                printf("FAIL: sparse get key %d r=%ld v=%llu exp=%llu h=%lu exph=%lu cb=%lu expcb=%u\n",
+                       i, r, gv, sp_val[i], gh, sp_height[i], gcb, sp_cb[i]);
             }
         }
         {
-            unsigned char tk[32]; unsigned long long gv; const unsigned char* gs; unsigned gsl;
+            unsigned char tk[32]; unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
             make_txid(tk, 0x22, 0);
-            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse first key absent\n"); }
+            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gh, &gcb, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse first key absent\n"); }
             make_txid(tk, 0x22, SP_N-1);
-            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse last key absent\n"); }
+            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gh, &gcb, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse last key absent\n"); }
             make_txid(tk, 0x22, SP_N);
-            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gs, &gsl) != 0) { sp_fails++; printf("FAIL: sparse absent key found\n"); }
+            if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gh, &gcb, &gs, &gsl) != 0) { sp_fails++; printf("FAIL: sparse absent key found\n"); }
         }
-        ck("sparse: spot-check across large run (0 mismatches)", sp_fails, 0);
+        ck("sparse: spot-check across large run (0 mismatches, incl height/is_coinbase)", sp_fails, 0);
         fails += sp_fails;
 
         utxo_lsm_close(&lst4);
@@ -433,12 +467,13 @@ int main(void) {
         #undef SP_N
     }
 
-    /* ---------- phase 7: old-format (MAGIC_RUN) run readable via fallback ---------- */
-    /* Hand-write a run file in the ORIGINAL 28-byte-header format (no
-     * sparse index) exactly as an unmodified pre-Stage-1 writer would
-     * have produced, and inject it directly into a manifest -- proves
-     * mac_run_lookup's fallback (sparse_n==0 -> unchanged full linear
-     * scan) still works, not just the new sparse-accelerated path. */
+    /* ---------- phase 7: old-format (MAGIC_RUN) run readable via fallback,
+     * reporting height=0/is_coinbase=0 (never garbage) since that data was
+     * never captured by the pre-Stage-D format; and phase 8: compacting
+     * TWO such old-format runs together, alongside a genuine new-format
+     * key, mid-migration -- exactly what a long-running node hits before
+     * every run has been rewritten in the new MAGIC_RUN3 shape. Kept in
+     * ONE scope (not two) so phase 8 can reuse phase 7's lst5/ux5/run. ---- */
     {
         struct LST lst5;
         void* tomb5 = malloc(TOMB_CAP*36);
@@ -487,16 +522,84 @@ int main(void) {
         mbuf[0] = gen; mbuf[1] = run_no;
         lst5.manifest_n = 1;
 
-        unsigned long long v5; const unsigned char* s5; unsigned sl5;
-        ck("oldfmt: get X (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tX, 0, &v5, &s5, &sl5), 1);
+        unsigned long long v5; unsigned long h5, cb5; const unsigned char* s5; unsigned sl5;
+        ck("oldfmt: get X (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tX, 0, &v5, &h5, &cb5, &s5, &sl5), 1);
         ck("oldfmt: get X value", v5, valX);
+        ck("oldfmt: get X height (unavailable -> 0, not garbage)", h5, 0);
+        ck("oldfmt: get X is_coinbase (unavailable -> 0, not garbage)", cb5, 0);
         ck("oldfmt: get X slen", sl5, 4);
         ckm("oldfmt: get X script", memcmp(s5, scrX, 4) == 0);
-        ck("oldfmt: get Y (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tY, 0, &v5, &s5, &sl5), 1);
+        ck("oldfmt: get Y (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tY, 0, &v5, &h5, &cb5, &s5, &sl5), 1);
         ck("oldfmt: get Y value", v5, valY);
+        ck("oldfmt: get Y height (unavailable -> 0, not garbage)", h5, 0);
+        ck("oldfmt: get Y is_coinbase (unavailable -> 0, not garbage)", cb5, 0);
         ckm("oldfmt: get Y script", memcmp(s5, scrY, 3) == 0);
         unsigned char tZ3[32]; make_txid(tZ3, 0x01, 3); /* sorts after both -> EOF miss */
-        ck("oldfmt: get absent key past end", utxo_lsm_get(&lst5, ux5, tZ3, 0, &v5, &s5, &sl5), 0);
+        ck("oldfmt: get absent key past end", utxo_lsm_get(&lst5, ux5, tZ3, 0, &v5, &h5, &cb5, &s5, &sl5), 0);
+
+        /* ---------- phase 8: compact TWO old-format runs together, with a
+         * genuine new-format key live in the memtable at the same time. ---- */
+        unsigned run_no2 = 778;
+        char fname2[64];
+        snprintf(fname2, sizeof fname2, "utxo_run_%06u.dat", run_no2);
+        FILE* f2 = fopen(fname2, "wb");
+        ckm("phase8: fixture2 file opened", f2 != NULL);
+
+        unsigned char tW[32];
+        make_txid(tW, 0x02, 1);
+        unsigned char scrW[2] = {77, 88};
+        unsigned long long valW = 333333ULL;
+
+        unsigned magic2 = 0x4E555255; /* MAGIC_RUN, same old format as run 777 */
+        unsigned long long gen2 = 1, nrec2 = 1, bloom_bits2 = 64;
+        unsigned char bloom_all_ones2[8]; memset(bloom_all_ones2, 0xFF, 8);
+        fwrite(&magic2, 4, 1, f2);
+        fwrite(&gen2, 8, 1, f2);
+        fwrite(&nrec2, 8, 1, f2);
+        fwrite(&bloom_bits2, 8, 1, f2);
+        fwrite(bloom_all_ones2, 1, 8, f2);
+        {
+            unsigned zero32 = 0; unsigned char type_push = 1; unsigned short slen2;
+            fwrite(tW, 32, 1, f2); fwrite(&zero32, 4, 1, f2); fwrite(&type_push, 1, 1, f2);
+            fwrite(&valW, 8, 1, f2); slen2 = 2; fwrite(&slen2, 2, 1, f2); fwrite(scrW, 1, 2, f2);
+        }
+        fclose(f2);
+
+        unsigned long long* mbuf5b = (unsigned long long*)manifest5;
+        mbuf5b[2] = gen2; mbuf5b[3] = run_no2;
+        lst5.manifest_n = 2;
+
+        /* a genuine new-format key, left live in the memtable (not
+         * flushed) -- proves compacting the two old-format runs doesn't
+         * disturb an unrelated live memtable entry. The compaction path
+         * for a REAL MAGIC_RUN3 run is already covered by phase 5's
+         * interleaved compactions (all its runs are new-format); phase 8's
+         * unique value is old-format-only compaction plus a coexisting
+         * live memtable, which phase 5 doesn't specifically isolate. */
+        unsigned char tI[32]; make_txid(tI, 0x03, 1);
+        unsigned char scrI[3] = {1, 2, 3};
+        ck("phase8: put I0 (new-format, memtable-resident)",
+           utxo_lsm_put(&lst5, ux5, tI, 0, 444444ULL, 500, 1, scrI, 3), 1);
+
+        long rc8 = utxo_lsm_compact(&lst5);
+        ck("phase8: compact of 2 old-format runs succeeds", rc8, 1);
+
+        unsigned long long v8; unsigned long h8, cb8; const unsigned char* s8; unsigned sl8;
+        ck("phase8: get X after compact", utxo_lsm_get(&lst5, ux5, tX, 0, &v8, &h8, &cb8, &s8, &sl8), 1);
+        ck("phase8: X value after compact", v8, valX);
+        ck("phase8: X height still 0 after compact (never captured)", h8, 0);
+        ck("phase8: X is_coinbase still 0 after compact (never captured)", cb8, 0);
+        ck("phase8: get Y after compact", utxo_lsm_get(&lst5, ux5, tY, 0, &v8, &h8, &cb8, &s8, &sl8), 1);
+        ck("phase8: Y value after compact", v8, valY);
+        ck("phase8: Y height still 0 after compact (never captured)", h8, 0);
+        ck("phase8: get W after compact", utxo_lsm_get(&lst5, ux5, tW, 0, &v8, &h8, &cb8, &s8, &sl8), 1);
+        ck("phase8: W value after compact", v8, valW);
+        ck("phase8: W height still 0 after compact (never captured)", h8, 0);
+        ck("phase8: W is_coinbase still 0 after compact (never captured)", cb8, 0);
+        ck("phase8: get I0 (memtable, unaffected by compact)", utxo_lsm_get(&lst5, ux5, tI, 0, &v8, &h8, &cb8, &s8, &sl8), 1);
+        ck("phase8: I0 value", v8, 444444ULL);
+        ck("phase8: I0 height (real, new-format, survives)", h8, 500);
+        ck("phase8: I0 is_coinbase (real, new-format, survives)", cb8, 1);
 
         utxo_lsm_close(&lst5);
         free(tomb5); free(manifest5); free(scratch5);
