@@ -8,6 +8,7 @@
  * Unknown keys are ignored, so the file stays shared with the RPC daemon.
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>

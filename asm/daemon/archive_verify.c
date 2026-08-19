@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <errno.h>
+#include "log_ts.h"
 
 #include "archive_verify.h"
 

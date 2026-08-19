@@ -18,6 +18,7 @@
  * makes that logic reusable and wires it into the node.
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
