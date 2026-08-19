@@ -72,16 +72,39 @@ typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
                               const u8* script, u16 slen);
 extern long undo_replay(long height, undo_replay_cb cb, void* ctx);
 
-/* ---- STAGE D: per-input script verification + coinbase maturity ---------
- * (daemon/tx_verify.c). Called once per non-coinbase tx, BEFORE that tx's
- * puts/dels are applied below -- exactly where Core's ConnectBlock runs
- * CheckInputs, ahead of UpdateCoins, for the same reason: the confirmed
- * UTXO set at this exact point already reflects every earlier tx in this
- * same block (apply_block_inner walks tx-by-tx in order), which is required
- * for verifying a spend of an output created earlier in the same block. */
-extern int tx_verify_block_connect(const u8* tx, u64 txlen, long height,
-                                   const u8 block_hash32[32], void* lst, void* u,
-                                   const char** reason);
+/* ---- STAGE D / CROSS-TX PARALLEL VERIFY (2026-08-19): per-input script
+ * verification + coinbase maturity (daemon/tx_verify.c). Called ONCE per
+ * block, for every non-coinbase tx at once (tx_verify_block_connect_all),
+ * BEFORE any of the block's puts/dels are applied below -- exactly where
+ * Core's ConnectBlock runs CheckInputs, ahead of UpdateCoins.
+ *
+ * A tx may spend an output created by an EARLIER tx in the SAME block;
+ * since verification now runs before any of this block has been applied,
+ * that can no longer resolve through the confirmed UTXO set the way the
+ * old strictly-sequential verify-then-apply loop let it. build_block_index
+ * below builds an in-block outpoint index BEFORE calling into tx_verify.c,
+ * which consults it (via the exported bidx_get) ahead of falling back to
+ * utxo_lsm_get. See tx_verify.c's own "CROSS-TRANSACTION PARALLEL
+ * VERIFICATION" header comment for the full design rationale.
+ *
+ * Also builds/checks a whole-block duplicate-outpoint set (check_dup_
+ * outpoints): the OLD interleaved loop caught an in-block double-spend only
+ * as an accidental side effect (the second spender's utxo_lsm_get failed
+ * once the first spender's output had already been deleted) -- that
+ * detection disappears once verification runs before any apply, so this is
+ * now an explicit check, run before verification, matching Core's own
+ * CheckBlock (a whole-block structural check, not part of per-tx script
+ * verification). */
+typedef struct {
+    const u8* ptr;
+    u64 len;
+    u8  txid[32];
+    u32 pn_in;    /* tx_parse's own input count -- tx_verify.c reuses this
+                    * to size its flat verify array without re-parsing */
+} block_tx_t;
+extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
+                                       const u8 block_hash32[32], void* lst, void* u, void* bx,
+                                       u64* fail_tx_index, const char** reason);
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
 /* Rolling undo-data retention window. Stage A's own design note calls for
@@ -271,6 +294,139 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
  * reused as-is -- not reimplemented). */
 static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_inclusive);
 
+/* ---- in-block index (2026-08-19, cross-tx parallel verify) --------------
+ * Two open-addressed hash sets over the same 36-byte (txid+index) outpoint
+ * key shape, same technique as bitcoin_utxo_lsm.asm's tomb_hash_buf
+ * (mac_tomb_hash_probe) -- kept as plain C here since this is single-
+ * threaded, block-scoped, heap-allocated state built fresh per block, not a
+ * persistent module-owned structure:
+ *   - bidx_t: outpoint -> the output that created it (value/script/height/
+ *     is_coinbase), for resolving same-block chained spends. Consulted by
+ *     tx_verify.c via bidx_get, exported below.
+ *   - bspent_t: outpoint -> "already claimed by an earlier input in this
+ *     block", for the explicit whole-block duplicate-outpoint check. */
+static u64 next_pow2_u64(u64 n){
+    if (n < 2) return 2;
+    u64 p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+static u64 outpoint_hash(const u8 key[36]){
+    u64 h = 0x811c9dc5ULL;
+    for (int i=0;i<8;i++){ h ^= key[i]; h = (h * 16777619ULL) & 0xffffffffULL; }
+    u32 idx; memcpy(&idx, key+32, 4);
+    h ^= idx;
+    return h;
+}
+
+typedef struct {
+    u64 value;
+    const u8* spk;       /* points directly into blockbuf -- valid for the
+                           * block's whole lifetime, no copy needed */
+    u32 spklen;
+    u32 creating_tx;     /* an input may only resolve against an output
+                           * whose creating_tx is STRICTLY LESS than its own
+                           * tx index -- a tx can never spend a later-in-
+                           * block tx's not-yet-existing output, matching
+                           * real consensus behavior (see bidx_get) */
+    u8  is_coinbase;
+} bidx_out_t;
+typedef struct { u8 key[36]; u64 out_idx; } bidx_slot_t; /* out_idx==(u64)-1: empty */
+typedef struct {
+    bidx_slot_t* table; u64 mask;
+    bidx_out_t*  outs;  u64 outs_n;
+} bidx_t;
+
+static bidx_t bidx_init(u64 nout_hint){
+    bidx_t bx;
+    u64 tcap = next_pow2_u64((nout_hint ? nout_hint : 1) * 2);
+    bx.table = malloc(tcap * sizeof(bidx_slot_t));
+    bx.mask = tcap - 1;
+    for (u64 i=0;i<tcap;i++) bx.table[i].out_idx = (u64)-1;
+    bx.outs = malloc((nout_hint ? nout_hint : 1) * sizeof(bidx_out_t));
+    bx.outs_n = 0;
+    return bx;
+}
+static void bidx_insert(bidx_t* bx, const u8 key[36], u64 value, const u8* spk, u32 spklen,
+                        u32 creating_tx, u8 is_coinbase){
+    u64 idx = bx->outs_n++;
+    bx->outs[idx].value = value; bx->outs[idx].spk = spk; bx->outs[idx].spklen = spklen;
+    bx->outs[idx].creating_tx = creating_tx; bx->outs[idx].is_coinbase = is_coinbase;
+    u64 h = outpoint_hash(key) & bx->mask;
+    while (bx->table[h].out_idx != (u64)-1) h = (h+1) & bx->mask;
+    memcpy(bx->table[h].key, key, 36);
+    bx->table[h].out_idx = idx;
+}
+static void bidx_free(bidx_t* bx){ free(bx->table); free(bx->outs); bx->table=0; bx->outs=0; }
+
+/* bidx_get: exported for tx_verify.c. Same argument/return shape as
+ * utxo_lsm_get, plus the resolving tx's own 0-based block position. Returns
+ * 1 hit / 0 miss (not resolvable in-block -- caller falls back to
+ * utxo_lsm_get against the confirmed set). height is always this block's
+ * own g_apply_height for an in-block-created output (relevant only for the
+ * coinbase-maturity check: a coinbase can never be matured enough to spend
+ * within the very block that created it, conf==0 < COINBASE_MATURITY,
+ * correctly rejected downstream). */
+long bidx_get(void* bxv, u32 caller_tx_index, const u8 txid[32], u32 index,
+             u64* value, u64* height, u64* is_coinbase, const u8** script, unsigned long* slen){
+    bidx_t* bx = (bidx_t*)bxv;
+    u8 key[36]; memcpy(key, txid, 32); memcpy(key+32, &index, 4);
+    u64 h = outpoint_hash(key) & bx->mask;
+    while (bx->table[h].out_idx != (u64)-1){
+        u64 oi = bx->table[h].out_idx;
+        if (memcmp(bx->table[h].key, key, 36) == 0){
+            if (bx->outs[oi].creating_tx >= caller_tx_index) return 0; /* forward/self reference: not resolvable in-block */
+            *value = bx->outs[oi].value; *height = (u64)g_apply_height;
+            *is_coinbase = bx->outs[oi].is_coinbase;
+            *script = bx->outs[oi].spk; *slen = bx->outs[oi].spklen;
+            return 1;
+        }
+        h = (h+1) & bx->mask;
+    }
+    return 0;
+}
+
+typedef struct { u8* used; u8* keys; u64 mask; } bspent_t;
+static bspent_t bspent_init(u64 nin_hint){
+    bspent_t bs;
+    u64 tcap = next_pow2_u64((nin_hint ? nin_hint : 1) * 2);
+    bs.used = calloc(tcap, 1);
+    bs.keys = malloc(tcap * 36);
+    bs.mask = tcap - 1;
+    return bs;
+}
+/* Returns 1 the first time this exact outpoint is claimed, 0 if it was
+ * already claimed earlier in this same block (an in-block double-spend). */
+static int bspent_claim(bspent_t* bs, const u8 key[36]){
+    u64 h = outpoint_hash(key) & bs->mask;
+    while (bs->used[h]){
+        if (memcmp(bs->keys + h*36, key, 36) == 0) return 0;
+        h = (h+1) & bs->mask;
+    }
+    bs->used[h] = 1;
+    memcpy(bs->keys + h*36, key, 36);
+    return 1;
+}
+static void bspent_free(bspent_t* bs){ free(bs->used); free(bs->keys); bs->used=0; bs->keys=0; }
+
+typedef struct {
+    bidx_t* bx; bspent_t* bs;
+    const u8* txid; u32 tx_index;
+    int dup_found;
+} idxbuild_ctx_t;
+
+static void idxbuild_on_input(void* ctxv, const u8 txid[32], u32 index){
+    idxbuild_ctx_t* c = (idxbuild_ctx_t*)ctxv;
+    if (index == 0xFFFFFFFFu && memcmp(txid, ZERO32, 32)==0) return; /* coinbase's null prevout */
+    u8 key[36]; memcpy(key, txid, 32); memcpy(key+32, &index, 4);
+    if (!bspent_claim(c->bs, key)) c->dup_found = 1;
+}
+static void idxbuild_on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u32 slen){
+    idxbuild_ctx_t* c = (idxbuild_ctx_t*)ctxv;
+    u8 key[36]; memcpy(key, c->txid, 32); memcpy(key+32, &out_index, 4);
+    bidx_insert(c->bx, key, value, script, slen, c->tx_index, (u8)(c->tx_index==0));
+}
+
 /* Apply every tx's puts/dels in one block. Returns 1 on a clean apply, 0 on
  * a parse inconsistency (caller logs/skips -- matches build_utxo.c's own
  * corrupt-block handling; the Stage 0 archive-write-race fix plus the
@@ -287,43 +443,88 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     u64 ntx = utxo_walk_read_varint(p, blkend, &consumed);
     if (!consumed) return 0;
     p += consumed;
+    if (ntx == 0) return 1;   /* matches the old loop's own (never actually
+                               * hit by real chain data) empty-block behavior */
 
     static u8 txid_scratch[4<<20];
     u8 blk_hash[32];
     block_hash(blk_hash, blockbuf);
-    apply_ctx_t ctx = { 0, 0 };
-    for (u64 t=0; t<ntx && !ctx.fatal; t++){
+
+    /* ---- Phase 0: parse every tx once (same tx_parse this loop always
+     * used), building the tx array tx_verify.c also consumes. A parse
+     * failure here means nothing has been applied yet -- no rollback
+     * needed, unlike the old code's mid-loop parse failure. ---- */
+    block_tx_t* txs = malloc(ntx * sizeof(block_tx_t));
+    u32* pn_outs = malloc(ntx * sizeof(u32));
+    if (!txs || !pn_outs) { free(txs); free(pn_outs); return 0; }
+    const u8* q = p;
+    u64 total_nin = 0, total_nout = 0;
+    for (u64 t=0; t<ntx; t++){
         u8 info[64];
-        int ok = tx_parse(info, p, (unsigned long)(blkend - p));
-        if (!ok) { if (t>0) rollback_partial_apply(blockbuf, blocklen, t-1); return 0; }
+        int ok = tx_parse(info, q, (unsigned long)(blkend - q));
+        if (!ok) { free(txs); free(pn_outs); return 0; }
         u64 txlen; memcpy(&txlen, info, 8);
         u32 pn_in, pn_out; memcpy(&pn_in, info+12, 4); memcpy(&pn_out, info+16, 4);
-
-        u8 txid[32];
-        tx_txid(txid, p, txlen, txid_scratch, sizeof txid_scratch);
-        ctx.txid = txid;
-        ctx.is_coinbase = (t == 0);
-
-        /* STAGE D: verify BEFORE applying this tx's puts/dels -- see the
-         * extern's own comment for why this ordering (and this exact
-         * point) is load-bearing. */
-        if (!ctx.is_coinbase) {
-            const char* reason = "?";
-            if (!tx_verify_block_connect(p, txlen, g_apply_height, blk_hash,
-                                         &g_utxo_lst, g_utxo_table, &reason)) {
-                fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n",
-                        g_apply_height, (unsigned long)t, reason);
-                if (t>0) rollback_partial_apply(blockbuf, blocklen, t-1);
-                return 0;
-            }
-        }
-
-        u64 wnin=0, wnout=0;
-        int wok = utxo_walk_tx_io(p, p+txlen, &ctx, live_on_input, live_on_output, &wnin, &wnout);
-        if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
-        if (wnin != pn_in || wnout != pn_out) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
-        p += txlen;
+        txs[t].ptr = q; txs[t].len = txlen; txs[t].pn_in = pn_in;
+        pn_outs[t] = pn_out;
+        tx_txid(txs[t].txid, q, txlen, txid_scratch, sizeof txid_scratch);
+        total_nin += pn_in; total_nout += pn_out;
+        q += txlen;
     }
+
+    /* ---- Phase 0 cont'd / Phase 0.5: in-block output index + whole-block
+     * duplicate-outpoint check, in one pass over the already-parsed array.
+     * See this file's own header comment above and tx_verify.c's for why. ---- */
+    bidx_t bx = bidx_init(total_nout);
+    bspent_t bs = bspent_init(total_nin);
+    int dup = 0;
+    for (u64 t=0; t<ntx && !dup; t++){
+        idxbuild_ctx_t ic = { &bx, &bs, txs[t].txid, (u32)t, 0 };
+        u64 wnin=0, wnout=0;
+        int wok = utxo_walk_tx_io(txs[t].ptr, txs[t].ptr+txs[t].len, &ic,
+                                  idxbuild_on_input, idxbuild_on_output, &wnin, &wnout);
+        if (!wok || wnin != txs[t].pn_in || wnout != pn_outs[t]) {
+            /* utxo_walk_tx_io and tx_parse disagree on this tx's own shape
+             * -- an internal consistency problem, same class of check the
+             * old apply loop already made, just moved earlier (before any
+             * verification/apply work happens, so still no rollback). */
+            bidx_free(&bx); bspent_free(&bs); free(txs); free(pn_outs);
+            return 0;
+        }
+        dup = ic.dup_found;
+    }
+    if (dup) {
+        fprintf(stderr, "[utxo_live] REJECT h=%ld: in-block double-spend (duplicate outpoint)\n", g_apply_height);
+        bidx_free(&bx); bspent_free(&bs); free(txs); free(pn_outs);
+        return 0;
+    }
+
+    /* ---- Phase 1-4 (tx_verify.c): verify every non-coinbase tx's
+     * signatures, block-wide. Nothing applied yet -- a reject here needs no
+     * rollback either. ---- */
+    u64 fail_tx = 0; const char* reason = "?";
+    if (!tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
+                                     &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason)) {
+        fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n", g_apply_height, (unsigned long)fail_tx, reason);
+        bidx_free(&bx); bspent_free(&bs); free(txs); free(pn_outs);
+        return 0;
+    }
+    bidx_free(&bx); bspent_free(&bs);
+
+    /* ---- Phase 5: sequential apply, exactly as before, reusing the
+     * already-parsed tx array instead of re-parsing. A failure HERE is the
+     * only case that still needs rollback_partial_apply -- everything above
+     * ran before any put/del happened. ---- */
+    apply_ctx_t ctx = { 0, 0 };
+    for (u64 t=0; t<ntx && !ctx.fatal; t++){
+        ctx.txid = txs[t].txid;
+        ctx.is_coinbase = (t == 0);
+        u64 wnin=0, wnout=0;
+        int wok = utxo_walk_tx_io(txs[t].ptr, txs[t].ptr+txs[t].len, &ctx, live_on_input, live_on_output, &wnin, &wnout);
+        if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); free(txs); free(pn_outs); return 0; }
+        if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); free(txs); free(pn_outs); return 0; }
+    }
+    free(txs); free(pn_outs);
     return ctx.fatal ? 0 : 1;
 }
 
