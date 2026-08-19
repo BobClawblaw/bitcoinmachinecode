@@ -95,7 +95,7 @@ extern void block_hash(u8 out[32], const u8 hdr[80]);
  * download worker's loop; the cursor resumes on the next block. */
 #define UTXO_UNDO_PRUNE_SCAN 20000
 
-/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes). */
+/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (168 bytes). */
 struct lsm_state {
     long log_fd, idx_fd;
     u64 log_len, ckpt_log_off, ckpt_n;
@@ -104,6 +104,7 @@ struct lsm_state {
     void* manifest_buf; u64 manifest_cap, manifest_n;
     void* scratch_buf; u64 scratch_cap;
     u64 next_run_no;
+    void* tomb_hash_buf; u64 tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
 };
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536
