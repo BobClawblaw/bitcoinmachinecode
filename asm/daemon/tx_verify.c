@@ -70,6 +70,7 @@
  */
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -476,4 +477,468 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
         }
     }
     return 1;
+}
+
+/* ============================================================================
+ * CROSS-TRANSACTION PARALLEL VERIFICATION (2026-08-19).
+ *
+ * Everything above this point is UNCHANGED and stays exactly as it was:
+ * tx_verify_block_connect() still verifies one transaction at a time using
+ * its own file-scope g_txv_in/g_txv_results, still used by
+ * tests/test_tx_verify_parallel.c. This section is purely additive.
+ *
+ * WHY: profiling the live daemon during bulk catch-up (2026-08-19) showed
+ * genuine secp256k1 verification arithmetic (fe_mul alone ~29.5% of sampled
+ * CPU) dominating, while the daemon used only ~1.2 of the box's ~32 cores --
+ * because the pool above only ever fans out across ONE transaction's own
+ * inputs (gated by TXV_PARALLEL_MIN), and most transactions in this era of
+ * chain history have too few inputs each to trigger it, even though a whole
+ * BLOCK has plenty of independent signature checks spread across many small
+ * transactions.
+ *
+ * WHY INPUT GRANULARITY, NOT TRANSACTION GRANULARITY: an earlier sketch of
+ * this design dispatched at transaction granularity (an outer pool where
+ * each worker ran a whole tx_verify_block_connect() call). That has two real
+ * bugs: (a) a worker thread verifying an >=TXV_PARALLEL_MIN-input tx would
+ * itself spawn the pool above, oversubscribing badly; (b) g_txv_in/
+ * g_txv_results are file-scope statics -- safe today only because exactly
+ * one tx is ever in flight at a time, but silently wrong under concurrent
+ * transaction-granularity dispatch (a second worker's writes would race the
+ * first's, or -- if instead made __thread -- a DIFFERENT worker thread
+ * spawned by an outer worker would see an empty TLS copy, never the outer
+ * thread's resolved data). Dispatching at INPUT granularity across one
+ * flat, heap-allocated, block-scoped array sidesteps both: Phase 1 below is
+ * the array's sole writer (single-threaded, matching the resolve pass
+ * above), each Phase 2 worker only ever writes the result slots it
+ * dequeued (disjoint by construction, no synchronization needed beyond the
+ * pthread_create/join happens-before edges that already exist), and there
+ * is only ONE pool, not a nested pair.
+ *
+ * IN-BLOCK CHAINED SPENDS: a transaction may spend an output created by an
+ * earlier transaction in the SAME block. bidx_get (exported by
+ * daemon/utxo_live.c) resolves against that in-block index first, falling
+ * back to the confirmed UTXO set via utxo_lsm_get -- see bidx_get's own
+ * comment for why it also takes the resolving tx's own block position (an
+ * input may only resolve against a STRICTLY EARLIER transaction's output,
+ * matching real consensus behavior; utxo_live.c enforces this).
+ *
+ * IN-BLOCK DOUBLE-SPENDS: today, an in-block double-spend is rejected only
+ * because the OLD code's strict verify-then-apply interleaving means the
+ * second spender's utxo_lsm_get fails once the first spender's output has
+ * already been deleted. Once verification for the WHOLE block runs before
+ * any of it applies (the entire point of this file), that accidental
+ * detection disappears -- both conflicting spends would resolve
+ * successfully against the not-yet-mutated confirmed set / in-block index.
+ * daemon/utxo_live.c's apply_block_inner is responsible for an EXPLICIT
+ * whole-block duplicate-outpoint check (an open-addressed hash set over
+ * every tx's inputs, same 36-byte-key technique as bitcoin_utxo_lsm.asm's
+ * tomb_hash_buf) BEFORE ever calling into this file -- this file assumes
+ * that check already ran and never sees a block containing such a
+ * double-spend. This is Core's own CheckBlock design: duplicate-outpoint
+ * detection is a whole-block structural check, separate from and before
+ * per-tx script verification, not something this file re-derives.
+ *
+ * TAPROOT stays exactly as sequential/single-tx-at-a-time as the pass 2
+ * above -- rare in practice, and it reuses Phase 1's already-resolved
+ * prevout data (value/spk/spklen) instead of re-querying, since Phase 1 has
+ * already done that work for every input, taproot included.
+ * ============================================================================ */
+
+/* bidx_get: exported by daemon/utxo_live.c -- same argument/return shape as
+ * utxo_lsm_get, plus the CALLING tx's own 0-based block position. Returns
+ * 1 hit / 0 miss (not resolvable in-block; caller falls back to
+ * utxo_lsm_get against the confirmed set). bx may be NULL (no in-block
+ * index at all, e.g. a block with no chained spends) -- callers must check
+ * before calling. */
+extern long bidx_get(void* bx, u32 caller_tx_index, const u8 txid[32], u32 index,
+                     u64* value, u64* height, u64* is_coinbase,
+                     const u8** script, unsigned long* slen);
+
+/* Mirrors daemon/utxo_live.c's own block_tx_t exactly (same convention this
+ * codebase already uses for struct lsm_state -- duplicated per file rather
+ * than shared via a header). pn_in is tx_parse's own input count, reused
+ * here to size the flat verify array without a second parsing pass. */
+typedef struct {
+    const u8* ptr;
+    u64 len;
+    u8  txid[32];
+    u32 pn_in;
+} block_tx_t;
+
+#define TXVB_MAX_WORKERS 64
+
+typedef struct {
+    u64 tx_index;
+    u32 local_idx;               /* 0-based position among THIS tx's own
+                                   * inputs -- the sighash primitives need
+                                   * this, not the flat array's global index */
+    const u8* tx_ptr; u64 tx_len; /* this input's own tx -- workers no
+                                   * longer receive tx/txlen as a call arg
+                                   * since different flat-array entries
+                                   * belong to different transactions */
+    const u8* outpoint;
+    const u8* scriptSig; u32 scriptSiglen;
+    const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
+    u64 value;
+    u8  spk[TXV_SPK_CAP]; u32 spklen;
+    u8  shape;
+} txvb_in_t;
+
+typedef struct { u8 ok; char reason[64]; } txvb_result_t;
+typedef struct { u64 lo, hi; } txvb_txrange_t;
+
+/* Parses ONE tx's inputs (+ witnesses) into flat[base..base+nin), mirroring
+ * txv_parse's own CompactSize decode exactly (reuses txv_rd_cs directly --
+ * that low-level reader is already shared, only this per-tx driving loop is
+ * duplicated), writing into a caller-supplied flat array/offset instead of
+ * g_txv_in[0..). Bounds-checks base+nin against cap defensively rather than
+ * trusting the caller's sizing sum. */
+static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
+                         txvb_in_t* flat, u64 base, u64 cap,
+                         u64* out_nin, const char** reason){
+    const u8* p = tx; const u8* end = tx+txlen;
+    int ok = 1;
+    if (txlen < 10) { *reason = "tx too short"; return 0; }
+    p += 4;
+    int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
+    if (segwit) p += 2;
+    u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
+    if (nin == 0) { *reason = "input count out of bounds"; return 0; }
+    if (base + nin > cap) { *reason = "block input count exceeds sizing pass"; return 0; }
+    for (u64 i=0;i<nin;i++){
+        txvb_in_t* e = &flat[base+i];
+        e->tx_index = tx_index; e->local_idx = (u32)i;
+        e->tx_ptr = tx; e->tx_len = txlen;
+        if (p+36 > end) { *reason = "truncated outpoint"; return 0; }
+        e->outpoint = p; p += 36;
+        u64 sl = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad scriptSig varint"; return 0; }
+        if ((u64)(end-p) < sl+4) { *reason = "truncated scriptSig/sequence"; return 0; }
+        e->scriptSig = p; e->scriptSiglen = (u32)sl;
+        p += sl + 4;
+        e->nwit = 0;
+    }
+    u64 nout = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_out varint"; return 0; }
+    for (u64 i=0;i<nout;i++){
+        if (p+8>end){ *reason = "truncated output"; return 0; }
+        p += 8;
+        u64 sl = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad output script varint"; return 0; }
+        if ((u64)(end-p) < sl){ *reason = "truncated output script"; return 0; }
+        p += sl;
+    }
+    if (segwit){
+        for (u64 i=0;i<nin;i++){
+            txvb_in_t* e = &flat[base+i];
+            u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
+            if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
+            e->nwit = (u32)nitems;
+            for (u64 j=0;j<nitems;j++){
+                u64 il = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness-item-len varint"; return 0; }
+                if ((u64)(end-p) < il){ *reason = "truncated witness item"; return 0; }
+                e->wit[j] = p; e->witlen[j] = (u32)il;
+                p += il;
+            }
+        }
+    }
+    *out_nin = nin;
+    return 1;
+}
+
+/* Mirrors txv_verify_one exactly, reading a caller-supplied entry pointer
+ * instead of g_txv_in[i], and in->local_idx (this input's position within
+ * ITS OWN tx) instead of a bare loop index for the sighash-position
+ * arguments the underlying primitives need. */
+static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long long flags,
+                           u8* sv_work, unsigned long sv_workcap, const char** reason){
+    switch (in->shape){
+    case TXV_SHAPE_P2WPKH:
+        if (!p2wpkh_verify(tx, (int64_t)txlen, (int64_t)in->local_idx, in->spk, (int64_t)in->spklen, in->value,
+                           in->wit[0], in->witlen[0], in->wit[1], in->witlen[1])) {
+            *reason = "p2wpkh signature invalid"; return 0;
+        }
+        return 1;
+    case TXV_SHAPE_P2WSH: {
+        const u8* ws = in->wit[in->nwit-1];
+        u32 wslen = in->witlen[in->nwit-1];
+        if (wslen >= 34 && ws[0]==0x21 && ws[wslen-1]==0xac){
+            if (!p2wsh_verify_checksig(tx, (int64_t)txlen, (int64_t)in->local_idx, in->value, ws, wslen,
+                                       in->wit[0], in->witlen[0], ws+1, 33)) {
+                *reason = "p2wsh checksig invalid"; return 0;
+            }
+            return 1;
+        }
+        if (wslen >= 3+33+33 && ws[0]==0x52 && ws[wslen-1]==0xae && in->nwit >= 4){
+            if (!p2wsh_verify_multisig(tx, (int64_t)txlen, (int64_t)in->local_idx, in->value, ws, wslen,
+                                       in->wit[2], in->witlen[2], in->wit[1], in->witlen[1],
+                                       ws+2, ws+36)) {
+                *reason = "p2wsh multisig invalid"; return 0;
+            }
+            return 1;
+        }
+        *reason = "unsupported p2wsh witnessScript shape"; return 0;
+    }
+    case TXV_SHAPE_LEGACY: {
+        int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
+                                   flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
+        if (err != 0) { *reason = "legacy script verification failed"; return 0; }
+        return 1;
+    }
+    default: /* taproot: handled by the sequential taproot pass, never here */
+        return 1;
+    }
+}
+
+typedef struct {
+    txvb_in_t* flat; txvb_result_t* res; unsigned long long flags; u64 lo, hi;
+} txvb_warg_t;
+
+static void* txvb_worker(void* argp){
+    txvb_warg_t* a = (txvb_warg_t*)argp;
+    static __thread u8 sv_work[1<<20];  /* per-THREAD -- see txv_worker_thread's
+                                         * own comment above, identical reasoning */
+    for (u64 i=a->lo;i<a->hi;i++){
+        if (a->flat[i].shape == TXV_SHAPE_P2TR) { a->res[i].ok = 1; continue; }
+        const char* r = 0;
+        int ok = txvb_verify_one(a->flat[i].tx_ptr, a->flat[i].tx_len, &a->flat[i], a->flags, sv_work, sizeof sv_work, &r);
+        a->res[i].ok = ok ? 1 : 0;
+        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(a->res[i].reason, r, n); a->res[i].reason[n]=0; }
+    }
+    return 0;
+}
+
+/* txvb_verify_all: verify every non-taproot input across the WHOLE block's
+ * flat array, in parallel once there's enough work to be worth it (same
+ * TXV_PARALLEL_MIN threshold and reasoning as above, just measured
+ * block-wide instead of per-tx). Always fills res[] completely for every
+ * non-taproot entry and returns -- no early exit on the first failure,
+ * unlike txv_verify_all -- the caller (tx_verify_block_connect_all's Phase 4)
+ * is the single place that scans res[] and decides accept/reject, so the
+ * "earliest failing tx in block order" logic exists in exactly one place. */
+static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsigned long long flags){
+    u64 nverify = 0;
+    for (u64 i=0;i<total;i++){
+        if (flat[i].shape != TXV_SHAPE_P2TR) { nverify++; res[i].ok=0; res[i].reason[0]=0; }
+        else res[i].ok = 1;
+    }
+    if (nverify == 0) return;
+
+    if (nverify < TXV_PARALLEL_MIN){
+        /* plain static, not __thread -- this branch only ever runs on the
+         * calling thread (sequential, no pthread_create here), same as
+         * txv_verify_all's own equivalent branch above. */
+        static u8 sv_work[1<<20];
+        for (u64 i=0;i<total;i++){
+            if (flat[i].shape == TXV_SHAPE_P2TR) continue;
+            const char* r = 0;
+            int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work, sizeof sv_work, &r);
+            res[i].ok = ok?1:0;
+            if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason,r,n); res[i].reason[n]=0; }
+        }
+        return;
+    }
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
+    int nworkers = (int)(nverify < (u64)ncpu ? nverify : (u64)ncpu);
+    if (nworkers > TXVB_MAX_WORKERS) nworkers = TXVB_MAX_WORKERS;
+    if (nworkers < 1) nworkers = 1;
+
+    u64 per = (total + (u64)nworkers - 1) / (u64)nworkers;
+    pthread_t tids[TXVB_MAX_WORKERS];
+    txvb_warg_t args[TXVB_MAX_WORKERS];
+    int spawned = 0;
+    for (int w=0; w<nworkers; w++){
+        u64 lo = (u64)w*per, hi = lo+per; if (hi>total) hi=total;
+        if (lo >= hi) break;
+        args[spawned].flat=flat; args[spawned].res=res; args[spawned].flags=flags;
+        args[spawned].lo=lo; args[spawned].hi=hi;
+        if (pthread_create(&tids[spawned], 0, txvb_worker, &args[spawned]) != 0){
+            /* same fallback story as txv_verify_all: whatever didn't get a
+             * thread stays at its zeroed res[] slot, picked up below. */
+            break;
+        }
+        spawned++;
+    }
+    for (int w=0; w<spawned; w++) pthread_join(tids[w], 0);
+
+    /* plain static, not __thread -- runs only after every worker has
+     * already joined above (sequential), same as txv_verify_all's own
+     * equivalent fallback sweep. */
+    static u8 sv_work_main[1<<20];
+    for (u64 i=0;i<total;i++){
+        if (flat[i].shape == TXV_SHAPE_P2TR) continue;
+        if (res[i].ok) continue;
+        if (res[i].reason[0] != 0) continue;   /* a real reported failure already */
+        const char* r = 0;
+        int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work_main, sizeof sv_work_main, &r);
+        res[i].ok = ok ? 1 : 0;
+        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason, r, n); res[i].reason[n]=0; }
+    }
+}
+
+/* tx_verify_block_connect_all(txs, ntx, height, block_hash32, lst, u, bx,
+ * &fail_tx_index, &reason) -> 1 accept / 0 reject. txs[0] MUST be the
+ * coinbase (skipped entirely -- matches Bitcoin's own "coinbase is always
+ * the first tx" rule already relied on elsewhere in this codebase); bx is
+ * the in-block index from daemon/utxo_live.c's Phase 0 (may be NULL if the
+ * block has no chained spends at all -- callers may pass NULL freely, this
+ * function checks before calling bidx_get). Caller (daemon/utxo_live.c) is
+ * responsible for the separate whole-block duplicate-outpoint check BEFORE
+ * calling this -- see this section's header comment. */
+int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
+                                const u8 block_hash32[32], void* lst, void* u, void* bx,
+                                u64* fail_tx_index, const char** reason){
+    static char g_rbuf[64];
+    unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
+
+    u64 total_nin = 0;
+    for (u64 t=1; t<ntx; t++) total_nin += txs[t].pn_in;
+    if (total_nin == 0) return 1;
+
+    txvb_in_t* flat = malloc(total_nin * sizeof(txvb_in_t));
+    txvb_result_t* res = malloc(total_nin * sizeof(txvb_result_t));
+    txvb_txrange_t* ranges = malloc(ntx * sizeof(txvb_txrange_t));
+    if (!flat || !res || !ranges) {
+        *reason = "out of memory"; *fail_tx_index = 0;
+        free(flat); free(res); free(ranges);
+        return 0;
+    }
+
+    /* ---- Phase 0/parse: expand every tx's inputs into the flat array. ---- */
+    u64 base = 0;
+    for (u64 t=1; t<ntx; t++){
+        u64 nin_this;
+        if (!txvb_parse_tx(txs[t].ptr, txs[t].len, t, flat, base, total_nin, &nin_this, reason)) {
+            *fail_tx_index = t; free(flat); free(res); free(ranges); return 0;
+        }
+        ranges[t].lo = base; ranges[t].hi = base + nin_this;
+        base += nin_this;
+    }
+    if (base != total_nin) {
+        /* tx_parse (utxo_live.c's sizing pass) and txvb_parse_tx (this
+         * file's own CompactSize decode) disagree on some tx's input count
+         * -- an internal consistency bug, not a malformed-block condition
+         * (a genuinely malformed tx would have failed txvb_parse_tx above
+         * already). */
+        *reason = "internal: input count parse mismatch"; *fail_tx_index = 0;
+        free(flat); free(res); free(ranges); return 0;
+    }
+
+    /* ---- Phase 1: resolve + classify every input, sequential, block-wide
+     * (in-block index first, confirmed set fallback). ---- */
+    int has_taproot = 0;
+    for (u64 gi=0; gi<total_nin; gi++){
+        txvb_in_t* in = &flat[gi];
+        u32 index; memcpy(&index, in->outpoint+32, 4);
+        u64 value=0, uheight=0, ucb=0; const u8* spk=0; unsigned long spklen=0;
+        long r = -1;
+        if (bx) r = bidx_get(bx, (u32)in->tx_index, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
+        if (r != 1) r = utxo_lsm_get(lst, u, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
+        if (r != 1) { *reason = "input references a missing/already-spent UTXO"; *fail_tx_index = in->tx_index; goto fail; }
+        if (ucb) {
+            long conf = height - (long)uheight;
+            if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; *fail_tx_index = in->tx_index; goto fail; }
+        }
+        in->value = value;
+        if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; *fail_tx_index = in->tx_index; goto fail; }
+        memcpy(in->spk, spk, spklen); in->spklen = (u32)spklen;
+
+        if (is_p2tr(spk, (u32)spklen)) {
+            has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
+            if (in->scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
+            if (in->nwit != 1) { *reason = "p2tr keypath needs exactly 1 witness item"; *fail_tx_index = in->tx_index; goto fail; }
+            continue;
+        }
+        if (is_p2wpkh(spk, (u32)spklen)) {
+            in->shape = TXV_SHAPE_P2WPKH;
+            if (in->scriptSiglen != 0) { *reason = "p2wpkh scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
+            if (in->nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; *fail_tx_index = in->tx_index; goto fail; }
+            continue;
+        }
+        if (is_p2wsh(spk, (u32)spklen)) {
+            in->shape = TXV_SHAPE_P2WSH;
+            if (in->scriptSiglen != 0) { *reason = "p2wsh scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
+            if (in->nwit < 2) { *reason = "p2wsh needs a witnessScript"; *fail_tx_index = in->tx_index; goto fail; }
+            continue;
+        }
+        in->shape = TXV_SHAPE_LEGACY;
+    }
+
+    /* ---- Phase 2: the actual (parallel) crypto verification for every
+     * non-taproot input in the whole block. ---- */
+    txvb_verify_all(flat, res, total_nin, flags);
+
+    /* ---- Phase 4 (before Phase 3/taproot -- see this section's header
+     * comment for the accepted, documented scoping of "earliest tx" when a
+     * block has BOTH a non-taproot and a taproot problem): first failing
+     * non-taproot input, in block order (flat array order already matches,
+     * since entries are appended tx-by-tx in order). ---- */
+    for (u64 gi=0; gi<total_nin; gi++){
+        if (flat[gi].shape == TXV_SHAPE_P2TR) continue;
+        if (!res[gi].ok) {
+            *fail_tx_index = flat[gi].tx_index;
+            size_t n = strlen(res[gi].reason); if (n > sizeof(g_rbuf)-1) n = sizeof(g_rbuf)-1;
+            memcpy(g_rbuf, res[gi].reason, n); g_rbuf[n] = 0;
+            *reason = g_rbuf;
+            goto fail;
+        }
+    }
+
+    /* ---- Phase 3: taproot key-path inputs, sequential, one tx at a time,
+     * exactly as tx_verify_block_connect's own pass 2 -- reuses Phase 1's
+     * already-resolved value/spk/spklen instead of re-querying (safe:
+     * nothing mutates UTXO state between Phase 1 and here). ---- */
+    if (has_taproot) {
+        static u8 ns[8<<20];
+        for (u64 t=1; t<ntx; t++){
+            u64 lo = ranges[t].lo, hi = ranges[t].hi, nin_t = hi-lo;
+            int tx_has_tap = 0;
+            for (u64 gi=lo; gi<hi; gi++) if (flat[gi].shape == TXV_SHAPE_P2TR) { tx_has_tap = 1; break; }
+            if (!tx_has_tap) continue;
+
+            u8* po = malloc(nin_t*36);
+            u8* am = malloc(nin_t*8);
+            u8* sp = malloc(nin_t*(1+TXV_SPK_CAP));
+            u8 (*spk34)[34] = malloc(nin_t*34);
+            u8* is_tap = malloc(nin_t);
+            if (!po || !am || !sp || !spk34 || !is_tap) {
+                *reason = "out of memory"; *fail_tx_index = t;
+                free(po); free(am); free(sp); free(spk34); free(is_tap);
+                goto fail;
+            }
+            u64 sp_off = 0;
+            int tap_fail = 0;
+            for (u64 k=0;k<nin_t;k++){
+                txvb_in_t* in = &flat[lo+k];
+                memcpy(po+k*36, in->outpoint, 36);
+                for (int b=0;b<8;b++) am[k*8+b] = (u8)(in->value>>(8*b));
+                if (in->spklen >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; *fail_tx_index = t; tap_fail = 1; break; }
+                sp[sp_off++] = (u8)in->spklen;
+                memcpy(sp+sp_off, in->spk, in->spklen); sp_off += in->spklen;
+                if (in->shape == TXV_SHAPE_P2TR) { is_tap[k] = 1; memcpy(spk34[k], in->spk, 34); }
+                else is_tap[k] = 0;
+            }
+            if (!tap_fail) {
+                long nslen = strip_witness(txs[t].ptr, (int64_t)txs[t].len, ns, sizeof ns);
+                if (nslen <= 0) { *reason = "malformed witness (strip failed)"; *fail_tx_index = t; tap_fail = 1; }
+                else {
+                    for (u64 k=0;k<nin_t;k++){
+                        if (!is_tap[k]) continue;
+                        txvb_in_t* in = &flat[lo+k];
+                        if (!taproot_keypath_verify(spk34[k], in->wit[0], (int)in->witlen[0],
+                                                    ns, nslen, (int64_t)k, po, am, sp, (int64_t)nin_t)) {
+                            *reason = "p2tr keypath signature invalid"; *fail_tx_index = t; tap_fail = 1; break;
+                        }
+                    }
+                }
+            }
+            free(po); free(am); free(sp); free(spk34); free(is_tap);
+            if (tap_fail) goto fail;
+        }
+    }
+
+    free(flat); free(res); free(ranges);
+    return 1;
+
+fail:
+    free(flat); free(res); free(ranges);
+    return 0;
 }
