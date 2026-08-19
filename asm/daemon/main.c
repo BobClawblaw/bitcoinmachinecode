@@ -2838,6 +2838,28 @@ int main(int argc, char** argv){
             fprintf(stderr,"[prune] prune=1 (manual-only) -- no automatic pruning\n");
         }
 
+        /* DUPLICATE-HASH REPAIR BEFORE THE CATCH-UP, and unconditional (runs
+         * every boot, not behind -checklevel): a duplicate-hash height is
+         * never a false positive (see archive_repair_duplicates' own header
+         * comment) and left alone it silently feeds a wrong block into
+         * script/UTXO validation forever, since nothing else in the boot
+         * path re-checks a height that's already "present". Zeroing it marks
+         * it as an ordinary hole, and the catch-up call right below -- which
+         * already, unconditionally, re-fills any hole plus whatever's
+         * missing up to the real tip -- does the actual re-fetch with zero
+         * new fetch logic. This is the "on boot, before serving other
+         * clients" health check + fix (2026-08-19): previously this
+         * corruption could only be found by hand (a one-off scan) and only
+         * repaired via archive_verify_and_repair's truncate-based path,
+         * which refuses outright on a non-monotonic archive -- exactly the
+         * state this archive was already in. */
+        {
+            long rep = archive_repair_duplicates();
+            if(rep > 0) store_reload(store_buf);   /* our copy predates the zeroed records */
+            else if(rep < 0)
+                fprintf(stderr,"[boot] duplicate-hash repair scan failed -- continuing without it\n");
+        }
+
         /* PRUNE BEFORE THE CATCH-UP, not after.
          *
          * This block originally sat after the catch-up completed, which made
