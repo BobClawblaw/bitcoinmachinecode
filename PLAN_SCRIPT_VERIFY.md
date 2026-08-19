@@ -1,6 +1,10 @@
 # PLAN — Block-level script verification
 
-Status: **scoped, not started.** Written 2026-08-18.
+Status: Written 2026-08-18. Stage A done. **Stage B0+B1+B2 done 2026-08-19**
+(legacy SignatureHash complete, FindAndDelete, OP_CODESEPARATOR strip) --
+see "Stage B0/B1/B2 done" below. Remainder of Stage B (broader
+differential verification across P2PKH/P2SH/bare-multisig) and Stages C-E
+not started.
 
 ## The gap
 
@@ -190,6 +194,74 @@ Stage B therefore additionally requires, before any dispatch work:
 Each is a well-known consensus footgun with real chain data exercising it.
 This is implementation in asm, not wiring, and it makes B the dominant stage
 by a wide margin.
+
+## Stage B0/B1/B2 done (2026-08-19)
+
+Implemented in `bitcoin_sighash.asm` (asm, not C -- consensus semantics stay
+in asm per the project's own rule): `legacy_sighash` generalizes
+`sighash_all` (kept unchanged, still used by its existing callers) to every
+legacy hashtype -- ALL/NONE/SINGLE x ANYONECANPAY, including the
+SIGHASH_SINGLE-out-of-range `uint256(1)` quirk. Two shared primitives
+(`script_op_len`, `script_find_and_delete`) implement Core's own
+`FindAndDelete` exactly -- and turn out to BE the OP_CODESEPARATOR strip
+too: Core's `SerializeScriptCode` is `FindAndDelete` with a needle of the
+single byte `0xab`, so `legacy_sighash` calls the same primitive twice (once
+by its caller, for the real signature; once internally, for codeseparators)
+rather than needing separate logic. `script_push_encode` builds the needle
+for real signature removal.
+
+**Verification, in order:**
+1. Hand-derived the exact algorithm from Core's C++ (`interpreter.cpp`'s
+   `SignatureHash`/`CTransactionSignatureSerializer`, `script.cpp`'s
+   `FindAndDelete`/`GetScriptOp`), then checked it in Python against Core's
+   own **official 500-vector fixture**
+   (`/storage/bitcoin-core-source/src/test/data/sighash.json`) *before
+   writing any assembly* -- caught the byte-order convention (the fixture's
+   expected hash is reversed relative to the raw sha256d bytes this codebase
+   uses directly; settled empirically, not assumed) and validated the whole
+   algorithm design cheaply.
+2. `script_find_and_delete`/`script_op_len`/`script_push_encode` unit-tested
+   against Core's own `BOOST_AUTO_TEST_CASE(script_FindAndDelete)` cases,
+   transcribed from `script_tests.cpp` (`tests/test_find_and_delete.c`, 23
+   checks).
+3. `legacy_sighash` run against all 500 `sighash.json` vectors via a
+   generated header (`validation/gen_sighash_vectors.py` ->
+   `tests/sighash_vec.h`, consumed by `tests/test_legacy_sighash.c`):
+   **500/500 pass.**
+4. Wired into `bitcoin_scriptverify.c`'s `sv_checksig` (removed the
+   SIGHASH_ALL-only gate; `der_parse_sig`'s own hashtype output turned out
+   to be hardcoded to recognize only byte==1 too -- a leftover of the same
+   era -- so the real hashtype now comes from the signature's own trailing
+   byte, not that field). Proved END TO END through the real interpreter
+   (`sv_verify_script`, not just the hash math) with genuine ECDSA-signed
+   P2PK spends per hashtype, each paired with a tamper of a field that
+   hashtype is supposed to ignore (must still ACCEPT -- proves the field is
+   really unbound) and a tamper of a field it binds (must REJECT -- proves
+   this isn't just accepting everything): `validation/gen_hashtype_vectors.py`
+   -> `tests/hashtype_vec.h`, `tests/test_hashtype_e2e.c`, 11/11 pass. Also
+   confirmed the SIGHASH_SINGLE out-of-range quirk reproduces (a genuinely
+   signed degenerate `uint256(1)` hash verifies, matching Core's known
+   behaviour).
+
+Full `make test` green throughout (no regressions; `sighash_all` itself is
+untouched, used unchanged by its existing ~15 call sites).
+
+No live Bitcoin Core process was used anywhere in this verification --
+deliberately: `/storage/bitcoin` (the production data/binary) was touched
+only by an accidental `ls`/failed RPC probe early on and is now off-limits
+for this work entirely; ground truth came from Core's own SOURCE and
+bundled TEST FIXTURES (`/storage/bitcoin-core-source`), which this project
+already treats as authoritative for Core facts.
+
+**What's NOT done:** Stage B's "dispatch P2PK/P2PKH/P2SH/bare-multisig"
+item. `sv_verify_script` already runs arbitrary script bytes generically
+(it doesn't switch on script "type" at all), so these are very likely
+already exercised correctly by the same path the P2PK e2e test just proved
+-- but that's an inference, not a vector-checked fact yet. Next: extend the
+hashtype e2e generator (or a differential run against `core_verify_oracle`,
+built from source as this project's existing convention does, if a
+lighter-weight ground truth doesn't cover it) to P2PKH/P2SH/bare-multisig
+with non-ALL hashtypes specifically, then Stage C (activation flags).
 
 ## Stage A work item: error-code translation
 
