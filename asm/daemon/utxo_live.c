@@ -672,25 +672,27 @@ long utxo_live_catchup(void* store_buf){
         if (applied % 20000 == 0) {
             fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
                     h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
-            /* Checkpoint the resume point at the same cadence, independent
-             * of compaction. Before this, persist_applied_height only ran
-             * on a compact (rare during bulk mode -- the whole point of the
-             * bulk-sized memtable is to flush/compact far less often, see
-             * the BULK sizing comment above) or at the very end of the
-             * whole catch-up call -- so a from-scratch replay had ZERO
-             * durable resume point for however long it took to reach the
-             * first compaction (hours, observed), and killing/restarting
-             * the daemon anywhere in that window discarded ALL of it back
-             * to height -1, even though every put/del up to the crash was
-             * already WAL-durable (persist_applied_height's own header
-             * comment: "utxo_lsm_put/del are themselves WAL-durable"). This
-             * makes that already-true durability actually usable on
-             * restart instead of re-walking + re-applying (safely
-             * idempotent, but wastefully slow) from scratch every time. */
-            if (!persist_applied_height(g_applied_height)) {
-                fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld at progress checkpoint\n", g_applied_height);
-            }
         }
+        /* REVERTED (2026-08-19): a periodic persist_applied_height() used to
+         * live here, independent of compaction, so a restart wouldn't have
+         * to re-walk the whole archive from -1. Reverted after it exposed a
+         * real, still-unresolved data-loss bug: reloading from a checkpoint
+         * taken between flush/compact events came back missing entries that
+         * had genuinely been applied (confirmed against production -- even
+         * the exact checkpointed height's own coinbase output was gone from
+         * the reloaded LSM state, while older, already-flushed-to-run
+         * entries were intact). The WAL write() itself is synchronous and
+         * durable-enough for a same-machine restart regardless of fsync/
+         * close, so the leading theory is a correctness bug in the flush/
+         * compact reconstruction path itself (silently dropping live
+         * entries under a large/heavily-loaded table before resetting the
+         * WAL, which is what makes it unrecoverable) -- likely pre-existing
+         * and simply never before exercised by a restart landing between
+         * two flush/compact events. Do not reintroduce periodic
+         * checkpointing here until that is root-caused and fixed; until
+         * then persist_applied_height only runs where it already ran
+         * (compaction, and once at the end of the whole catch-up call),
+         * which is the only cadence proven safe. */
         if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
