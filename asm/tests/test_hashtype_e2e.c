@@ -39,7 +39,7 @@ int main(void){
         int ssl   = hex2b(HT_SS[k], ss);
         int spl   = hex2b(HT_SPK[k], spk);
         int r = sv_verify_script(ss, (unsigned long)ssl, spk, (unsigned long)spl,
-                                 0, HT_NIN[k], tx, (unsigned long)txlen,
+                                 HT_FLAGS[k], HT_NIN[k], tx, (unsigned long)txlen,
                                  work, sizeof work);
         int accepted = (r == 0);
         int want = HT_EXPECT[k] ? 1 : 0;
