@@ -21,8 +21,17 @@
 %define MAX_STACK_SIZE 1000
 %define MAX_SCRIPT_ELEMENT_SIZE 520
 
-    section .bss
-align 16
+; ---- THREAD-LOCAL scratch (2026-08-19, parallel per-input verification) --
+; Was plain .bss (one shared instance for the whole process) -- unsafe once
+; these helpers (stack_swap_two, scriptnum_decode/serialize, the vfexec_*
+; condition-stack functions) can run concurrently from multiple worker
+; threads. Found the hard way: a dedicated multi-thread stress test
+; (tests/test_scriptverify_thread_stress.c) caught intermittent SIG_COUNT/
+; INVALID_STACK_OPERATION errors on genuinely-valid CHECKMULTISIG spends --
+; this file's globals, not bitcoin_interp.asm's/bitcoin_sighash.asm's (which
+; were converted first and are NOT the source of that race). See those two
+; files' matching header notes for the full TLS_ADDR/.tbss rationale.
+    section .tbss alloc noexec nowrite tls align=16
 global elem_tmp0, elem_tmp1, elem_tmp2, elem_tmp3
 elem_tmp0:  resb ELEM_SIZE
 elem_tmp1:  resb ELEM_SIZE
@@ -37,8 +46,50 @@ snum_overflow: resq 1
 align 16
 vfexec:     resb 1024
 vfexec_sp:  resq 1
+global vfexec, vfexec_sp
 
     section .text
+
+; TLS_ADDR dst, sym -- dst = this thread's address of `sym` (ELF x86-64
+; Initial-Exec model: a GOT-style offset loaded from a fixed, link-time
+; location, added to the thread pointer at %fs:0). Clobbers only `dst`.
+; Mirrors bitcoin_interp.asm's identical macro (kept per-file since NASM
+; macros aren't visible across separately-assembled files).
+%macro TLS_ADDR 2
+    mov   %1, [rel %2 wrt ..gottpoff]
+    add   %1, qword [fs:0]
+%endmacro
+
+; ---- cross-file TLS accessors --------------------------------------------
+; bitcoin_interp.asm needs elem_tmp0..3 and snum_overflow too, but NASM's
+; `extern sym` doesn't carry a TLS type across object files the way a local
+; `wrt ..gottpoff` reference does within ONE file -- the linker rejects it
+; ("TLS definition ... mismatches non-TLS reference") because the
+; REFERENCING file's undefined symbol comes out untyped (STT_NOTYPE) with
+; no NASM syntax found to mark it otherwise. Confirmed empirically with a
+; minimal 2-file probe before writing these. A plain function call sidesteps
+; the whole problem -- completely ordinary cross-file linkage, no special
+; relocation type involved at the call site at all.
+global elem_tmp0_addr
+elem_tmp0_addr:
+    TLS_ADDR rax, elem_tmp0
+    ret
+global elem_tmp1_addr
+elem_tmp1_addr:
+    TLS_ADDR rax, elem_tmp1
+    ret
+global elem_tmp2_addr
+elem_tmp2_addr:
+    TLS_ADDR rax, elem_tmp2
+    ret
+global elem_tmp3_addr
+elem_tmp3_addr:
+    TLS_ADDR rax, elem_tmp3
+    ret
+global snum_overflow_addr
+snum_overflow_addr:
+    TLS_ADDR rax, snum_overflow
+    ret
 
 ; ============================================================================
 ; stack_depth(&sp) -> rax = *sp
@@ -204,8 +255,15 @@ stack_swap_two:
     push  r13
     push  r14
     push  r15
+    sub   rsp, 16              ; [rsp+0]=elem_tmp0 addr [rsp+8]=elem_tmp1 addr
+                                ; (16 = alignment-neutral, preserves whatever
+                                ; call-site alignment already existed here)
     mov   r12, rdi
     mov   r13, rsi
+    TLS_ADDR rax, elem_tmp0
+    mov   [rsp+0], rax
+    TLS_ADDR rax, elem_tmp1
+    mov   [rsp+8], rax
     ; A = top (sp-1), B = second (sp-2)
     mov   rax, [r12]
     sub   rax, 1
@@ -218,18 +276,19 @@ stack_swap_two:
     add   rax, r13
     mov   r15, rax            ; B
     ; tmp0 = *A ; tmp1 = *B ; *A = tmp1 ; *B = tmp0
-    mov   rdi, elem_tmp0
+    mov   rdi, [rsp+0]
     mov   rsi, r14
     call  elem_move
-    mov   rdi, elem_tmp1
+    mov   rdi, [rsp+8]
     mov   rsi, r15
     call  elem_move
     mov   rdi, r14
-    mov   rsi, elem_tmp1
+    mov   rsi, [rsp+8]
     call  elem_move
     mov   rdi, r15
-    mov   rsi, elem_tmp0
+    mov   rsi, [rsp+0]
     call  elem_move
+    add   rsp, 16
     pop   r15
     pop   r14
     pop   r13
@@ -246,10 +305,12 @@ scriptnum_decode:
     push  r12
     push  r13
     push  r14
-    mov   qword [rel snum_overflow], 0
+    TLS_ADDR rax, snum_overflow   ; rax free here (rdi/rsi/rdx are the incoming
+                                   ; len/data/maxsize params, untouched by this)
+    mov   qword [rax], 0
     cmp   rdi, rdx
     jbe   .size_ok
-    mov   qword [rel snum_overflow], 1
+    mov   qword [rax], 1
 .size_ok:
     mov   r12, rdi            ; len
     mov   r13, rsi            ; data
@@ -307,7 +368,7 @@ scriptnum_serialize:
     push  r13
     push  r14
     push  r15
-    lea   r15, [rel scriptnum_buf]
+    TLS_ADDR r15, scriptnum_buf
     ; rdi = value (int64)
     mov   r12, rdi            ; value
     test  r12, r12
@@ -545,25 +606,30 @@ get_op:
 global vfexec_push
 vfexec_push:
     push  rdx
-    mov   rcx, [rel vfexec_sp]
-    lea   rdx, [rel vfexec]
+    push  r8
+    TLS_ADDR r8, vfexec_sp
+    mov   rcx, [r8]
+    TLS_ADDR rdx, vfexec
     mov   [rdx+rcx], dil
-    inc   qword [rel vfexec_sp]
+    inc   qword [r8]
+    pop   r8
     pop   rdx
     ret
 ; vfexec_pop()
 global vfexec_pop
 vfexec_pop:
-    mov   rax, [rel vfexec_sp]
+    TLS_ADDR rcx, vfexec_sp
+    mov   rax, [rcx]
     test  rax, rax
     jz    .empty
-    dec   qword [rel vfexec_sp]
+    dec   qword [rcx]
 .empty:
     ret
 ; vfexec_depth() -> rax
 global vfexec_depth
 vfexec_depth:
-    mov   rax, [rel vfexec_sp]
+    TLS_ADDR rax, vfexec_sp
+    mov   rax, [rax]
     ret
 ; vfexec_toggle_top()
 global vfexec_toggle_top
@@ -571,15 +637,20 @@ vfexec_toggle_top:
     push  rax
     push  rcx
     push  rdx
-    mov   rax, [rel vfexec_sp]
+    push  r8
+    push  r9
+    TLS_ADDR r8, vfexec_sp
+    mov   rax, [r8]
     test  rax, rax
     jz    .empty
-    mov   rcx, [rel vfexec_sp]
-    lea   rdx, [rel vfexec]
-    movzx eax, byte [rdx+rcx-1]
+    mov   rcx, [r8]
+    TLS_ADDR r9, vfexec
+    movzx eax, byte [r9+rcx-1]
     xor   eax, 1
-    mov   [rdx+rcx-1], al
+    mov   [r9+rcx-1], al
 .empty:
+    pop   r9
+    pop   r8
     pop   rdx
     pop   rcx
     pop   rax
@@ -589,8 +660,9 @@ global vfexec_all_true
 vfexec_all_true:
     push  rcx
     push  rdx
-    mov   rcx, [rel vfexec_sp]
-    lea   rdx, [rel vfexec]
+    TLS_ADDR rcx, vfexec_sp
+    mov   rcx, [rcx]
+    TLS_ADDR rdx, vfexec
     test  rcx, rcx
     jz    .yes
     xor   eax, eax
@@ -789,5 +861,6 @@ stack_insert_index:
 ; ============================================================================
 global vfexec_sp_reset
 vfexec_sp_reset:
-    mov   qword [rel vfexec_sp], 0
+    TLS_ADDR rax, vfexec_sp
+    mov   qword [rax], 0
     ret

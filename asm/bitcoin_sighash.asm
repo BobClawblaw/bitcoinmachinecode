@@ -30,6 +30,16 @@
 
 section .text
 
+; TLS_ADDR dst, sym -- dst = this thread's address of `sym` (ELF x86-64
+; Initial-Exec model: a GOT-style offset loaded from a fixed, link-time
+; location, added to the thread pointer at %fs:0). Clobbers only `dst`.
+; Mirrors bitcoin_interp.asm's identical macro (kept per-file since NASM
+; macros aren't visible across separately-assembled files).
+%macro TLS_ADDR 2
+    mov   %1, [rel %2 wrt ..gottpoff]
+    add   %1, qword [fs:0]
+%endmacro
+
 ; ----------------------------------------------------------------------------
 ; sighash_all
 ;   Frame locals:
@@ -789,8 +799,9 @@ legacy_sighash:
     jmp   .ls_done
 .ls_no_single_check:
 
-    ; ---- codeseparator-strip scriptCode into the static scratch buffer ----
-    lea   rdi, [rel legacy_sighash_scfbuf]
+    ; ---- codeseparator-strip scriptCode into the per-thread scratch buffer ----
+    TLS_ADDR rdi, legacy_sighash_scfbuf
+    mov   [rbp-0x100], rdi     ; also needed again below, past intervening calls
     mov   rsi, 20000
     mov   rdx, [rbp-0x50]
     mov   rcx, [rbp-0x58]
@@ -888,7 +899,8 @@ legacy_sighash:
     cmp   rax, [rbp-0xB0]
     ja    .ls_fail
     mov   rdi, [rbp-0xA8]
-    lea   rsi, [rel legacy_sighash_scfbuf]
+    mov   rsi, [rbp-0x100]     ; this thread's legacy_sighash_scfbuf address,
+                                ; computed once above
     mov   r8, [rbp-0xF8]
     call  copy_bytes
     mov   [rbp-0xA8], rdi
@@ -1107,8 +1119,12 @@ legacy_sighash:
 section .rodata
 cs_needle: db 0xab
 
-section .bss
-align 8
+; Thread-local (2026-08-19, parallel per-input verification): was a plain
+; .bss global (one shared instance for the whole process), unsafe once
+; legacy_sighash can be called concurrently from multiple worker threads --
+; see bitcoin_interp.asm's matching header note for the full rationale.
+section .tbss alloc noexec nowrite tls align=8
+global legacy_sighash_scfbuf
 legacy_sighash_scfbuf: resb 20000
 
 section .text
