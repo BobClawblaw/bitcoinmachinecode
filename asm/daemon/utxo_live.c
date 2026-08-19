@@ -72,6 +72,18 @@ typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
                               const u8* script, u16 slen);
 extern long undo_replay(long height, undo_replay_cb cb, void* ctx);
 
+/* ---- STAGE D: per-input script verification + coinbase maturity ---------
+ * (daemon/tx_verify.c). Called once per non-coinbase tx, BEFORE that tx's
+ * puts/dels are applied below -- exactly where Core's ConnectBlock runs
+ * CheckInputs, ahead of UpdateCoins, for the same reason: the confirmed
+ * UTXO set at this exact point already reflects every earlier tx in this
+ * same block (apply_block_inner walks tx-by-tx in order), which is required
+ * for verifying a spend of an output created earlier in the same block. */
+extern int tx_verify_block_connect(const u8* tx, u64 txlen, long height,
+                                   const u8 block_hash32[32], void* lst, void* u,
+                                   const char** reason);
+extern void block_hash(u8 out[32], const u8 hdr[80]);
+
 /* Rolling undo-data retention window. Stage A's own design note calls for
  * ~100-200 blocks; 200 is the top of that range, chosen because it is also
  * comfortably deeper than any reorg this node would apply automatically
@@ -259,6 +271,8 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     p += consumed;
 
     static u8 txid_scratch[4<<20];
+    u8 blk_hash[32];
+    block_hash(blk_hash, blockbuf);
     apply_ctx_t ctx = { 0, 0 };
     for (u64 t=0; t<ntx && !ctx.fatal; t++){
         u8 info[64];
@@ -271,6 +285,19 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         tx_txid(txid, p, txlen, txid_scratch, sizeof txid_scratch);
         ctx.txid = txid;
         ctx.is_coinbase = (t == 0);
+
+        /* STAGE D: verify BEFORE applying this tx's puts/dels -- see the
+         * extern's own comment for why this ordering (and this exact
+         * point) is load-bearing. */
+        if (!ctx.is_coinbase) {
+            const char* reason = "?";
+            if (!tx_verify_block_connect(p, txlen, g_apply_height, blk_hash,
+                                         &g_utxo_lst, g_utxo_table, &reason)) {
+                fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n",
+                        g_apply_height, (unsigned long)t, reason);
+                return 0;
+            }
+        }
 
         u64 wnin=0, wnout=0;
         int wok = utxo_walk_tx_io(p, p+txlen, &ctx, live_on_input, live_on_output, &wnin, &wnout);

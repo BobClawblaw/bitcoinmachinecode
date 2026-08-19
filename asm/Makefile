@@ -181,12 +181,18 @@ tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
 # sha256d) is documented in this Makefile as misbehaving under aggressive C
 # optimisation, and this harness sits directly on top of it.
 REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/utxo_live.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c
+    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    bitcoin_taproot_sighash.c
 REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o \
     bitcoin_chainwork.o bitcoin_hash.o sha256.o bitcoin_tx.o \
     bitcoin_cons.o bitcoin_p2p.o bitcoin_net.o bitcoin_mempool.o \
     bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o \
-    bitcoin_headers.o
+    bitcoin_headers.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o \
+    bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o \
+    secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
+    secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
+    bitcoin_addr.o
 tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(REORGSRCS) $(REORGOBJS)
 
@@ -248,7 +254,7 @@ tests/test_net_policy: tests/test_net_policy.c daemon/net_policy.c bitcoin_net.o
 RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/undo_log.c daemon/tx_accept.c \
     daemon/mempool_cfg.c daemon/reorg.c daemon/locator_build.c daemon/archive_verify.c \
     daemon/node_config.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c \
-    bitcoin_taproot_sighash.c
+    bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_scriptverify.c
 tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 	$(CC) -no-pie -O0 -o $@ $(RECOVERSRCS) $(DAEMONOBJS)
 
@@ -261,7 +267,8 @@ tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/tx_accept.c daemon/mempool_cfg.c \
     daemon/upload_cap.c daemon/reorg.c daemon/undo_log.c daemon/locator_build.c \
     daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
-    bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+    bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
+    daemon/tx_verify.c bitcoin_scriptverify.c
 tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DIALSRCS) $(DAEMONOBJS)
 
@@ -291,7 +298,8 @@ DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
-    bitcoin_addr.o bitcoin_chainwork.o
+    bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o \
+    bitcoin_script_flags.o
 
 tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
@@ -848,7 +856,8 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/tx_accept.c daemon/reorg.c \
     daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
     daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c \
-    bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+    bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
+    daemon/tx_verify.c bitcoin_scriptverify.c
 daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS)
 
