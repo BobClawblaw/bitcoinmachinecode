@@ -111,17 +111,19 @@ static int swtx_parse(swtx_t* t){
          * present the input vector started after 2 bytes. We still need to skip
          * the witness. Re-walk from the start that includes witness count. */
     }
-    /* q now points at the witness-count (if segwit) or locktime (if not).
+    /* q now points at the witness section (if segwit) or locktime (if not).
      * Rather than branch, we only need locktime for BIP143 and witness does
      * not affect the sighash --- but we must advance over witness to read
      * locktime. Detect segwit from tx[4:6]. */
     const uint8_t* w = t->tx + 4;
     int segwit = (w[0]==0x00 && w[1]==0x01);
-    /* q currently at: after outputs. If segwit, we need to skip witness. */
+    /* q currently at: after outputs. If segwit, we need to skip witness.
+     * Wire format has no overall witness-stack-count field: there is
+     * exactly one stack per input, back-to-back (Core's SerializeTransaction
+     * writes tx.vin[i].scriptWitness.stack for i in [0, vin.size())). */
     const uint8_t* r = q;
     if (segwit){
-        uint64_t witcnt = read_cs(&r);
-        for (uint64_t i=0;i<witcnt;i++){
+        for (int64_t i=0;i<t->nin;i++){
             uint64_t nitems = read_cs(&r);
             for (uint64_t j=0;j<nitems;j++){
                 uint64_t il = read_cs(&r);
@@ -192,11 +194,12 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     uint64_t nout = read_cs(&q);
     for (uint64_t i=0;i<nout;i++){ if (q+8 > tx+txlen) return 0; q += 8;
         uint64_t sl = read_cs(&q); if (q+(int64_t)sl > tx+txlen) return 0; q += sl; }
-    /* q = witness count (segwit) or locktime (legacy) */
+    /* q = witness section start (segwit) or locktime (legacy). Wire format
+     * has no overall witness-stack-count field: exactly one stack per
+     * input, back-to-back. */
     const uint8_t* lock = q;
     if (segwit){
-        uint64_t witcnt = read_cs(&q);
-        for (uint64_t i=0;i<witcnt;i++){
+        for (uint64_t i=0;i<nin;i++){
             uint64_t nitems = read_cs(&q);
             for (uint64_t j=0;j<nitems;j++){ uint64_t il=read_cs(&q);
                 if (q+(int64_t)il > tx+txlen) return 0; q += il; }
