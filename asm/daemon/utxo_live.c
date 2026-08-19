@@ -294,17 +294,33 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
  * reused as-is -- not reimplemented). */
 static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_inclusive);
 
-/* ---- in-block index (2026-08-19, cross-tx parallel verify) --------------
+/* ---- in-block index (2026-08-19, cross-tx parallel verify; made a
+ * persistent/reused arena 2026-08-19 -- see below) --------------------------
  * Two open-addressed hash sets over the same 36-byte (txid+index) outpoint
  * key shape, same technique as bitcoin_utxo_lsm.asm's tomb_hash_buf
- * (mac_tomb_hash_probe) -- kept as plain C here since this is single-
- * threaded, block-scoped, heap-allocated state built fresh per block, not a
- * persistent module-owned structure:
+ * (mac_tomb_hash_probe):
  *   - bidx_t: outpoint -> the output that created it (value/script/height/
  *     is_coinbase), for resolving same-block chained spends. Consulted by
  *     tx_verify.c via bidx_get, exported below.
  *   - bspent_t: outpoint -> "already claimed by an earlier input in this
- *     block", for the explicit whole-block duplicate-outpoint check. */
+ *     block", for the explicit whole-block duplicate-outpoint check.
+ *
+ * ORIGINALLY malloc'd fresh and freed at the end of every single block
+ * (bidx_init/bidx_free, bspent_init/bspent_free) -- profiling the live
+ * daemon after deploying that version showed ~4 MILLION minor page faults
+ * PER SECOND, with memset (called from calloc/realloc's own zero-fill, and
+ * from the manual empty-sentinel refill loop below) as the single largest
+ * userspace symbol, its entire call chain resolving into kernel page-fault
+ * handler addresses -- fresh malloc/calloc at bulk-mode block rates was
+ * handing out brand-new virtual pages that the kernel had to fault in and
+ * zero on every touch, EVERY block, more expensive than the crypto work
+ * this file exists to parallelize. Fixed the same way bitcoin_utxo_lsm.asm's
+ * own tomb_hash_buf already is: one process-lifetime arena per structure,
+ * grown (realloc) only when a block needs more than it currently has, never
+ * freed -- reused, already-resident pages cost nothing to re-touch, so
+ * re-filling the empty-sentinel/zero state on each block is now cheap
+ * (still O(active table size), but a pure memory write with no page fault,
+ * not a fresh OS allocation). */
 static u64 next_pow2_u64(u64 n){
     if (n < 2) return 2;
     u64 p = 1;
@@ -317,6 +333,18 @@ static u64 outpoint_hash(const u8 key[36]){
     u32 idx; memcpy(&idx, key+32, 4);
     h ^= idx;
     return h;
+}
+/* realloc()s *buf up to need_bytes if it isn't already that big, tracking
+ * the arena's real capacity in *cap_bytes separately from whatever a
+ * caller's CURRENT block only needs -- never shrinks, so a later smaller
+ * block reuses the larger existing allocation untouched. */
+static void* grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
+    if (need_bytes > *cap_bytes){
+        void* p = realloc(*buf, need_bytes);
+        if (!p) return 0;
+        *buf = p; *cap_bytes = need_bytes;
+    }
+    return *buf;
 }
 
 typedef struct {
@@ -333,19 +361,22 @@ typedef struct {
 } bidx_out_t;
 typedef struct { u8 key[36]; u64 out_idx; } bidx_slot_t; /* out_idx==(u64)-1: empty */
 typedef struct {
-    bidx_slot_t* table; u64 mask;
-    bidx_out_t*  outs;  u64 outs_n;
+    bidx_slot_t* table; u64 table_cap; u64 mask;
+    bidx_out_t*  outs;  u64 outs_cap;  u64 outs_n;
 } bidx_t;
 
-static bidx_t bidx_init(u64 nout_hint){
-    bidx_t bx;
+/* Resets bx for a new block, growing its two arenas only if this block's
+ * sizing needs more than they already have. Only the ACTIVE tcap-sized
+ * prefix of table gets refilled with the empty sentinel -- correct even
+ * when the arena is larger (from an earlier, bigger block) than tcap,
+ * since every lookup/insert masks its hash into exactly [0,tcap). */
+static void bidx_reset(bidx_t* bx, u64 nout_hint){
     u64 tcap = next_pow2_u64((nout_hint ? nout_hint : 1) * 2);
-    bx.table = malloc(tcap * sizeof(bidx_slot_t));
-    bx.mask = tcap - 1;
-    for (u64 i=0;i<tcap;i++) bx.table[i].out_idx = (u64)-1;
-    bx.outs = malloc((nout_hint ? nout_hint : 1) * sizeof(bidx_out_t));
-    bx.outs_n = 0;
-    return bx;
+    grow_arena((void**)&bx->table, &bx->table_cap, tcap * sizeof(bidx_slot_t));
+    bx->mask = tcap - 1;
+    for (u64 i=0;i<tcap;i++) bx->table[i].out_idx = (u64)-1;
+    grow_arena((void**)&bx->outs, &bx->outs_cap, (nout_hint ? nout_hint : 1) * sizeof(bidx_out_t));
+    bx->outs_n = 0;
 }
 static void bidx_insert(bidx_t* bx, const u8 key[36], u64 value, const u8* spk, u32 spklen,
                         u32 creating_tx, u8 is_coinbase){
@@ -357,7 +388,6 @@ static void bidx_insert(bidx_t* bx, const u8 key[36], u64 value, const u8* spk, 
     memcpy(bx->table[h].key, key, 36);
     bx->table[h].out_idx = idx;
 }
-static void bidx_free(bidx_t* bx){ free(bx->table); free(bx->outs); bx->table=0; bx->outs=0; }
 
 /* bidx_get: exported for tx_verify.c. Same argument/return shape as
  * utxo_lsm_get, plus the resolving tx's own 0-based block position. Returns
@@ -386,14 +416,13 @@ long bidx_get(void* bxv, u32 caller_tx_index, const u8 txid[32], u32 index,
     return 0;
 }
 
-typedef struct { u8* used; u8* keys; u64 mask; } bspent_t;
-static bspent_t bspent_init(u64 nin_hint){
-    bspent_t bs;
+typedef struct { u8* used; u64 used_cap; u8* keys; u64 keys_cap; u64 mask; } bspent_t;
+static void bspent_reset(bspent_t* bs, u64 nin_hint){
     u64 tcap = next_pow2_u64((nin_hint ? nin_hint : 1) * 2);
-    bs.used = calloc(tcap, 1);
-    bs.keys = malloc(tcap * 36);
-    bs.mask = tcap - 1;
-    return bs;
+    grow_arena((void**)&bs->used, &bs->used_cap, tcap);
+    memset(bs->used, 0, tcap);   /* active tcap-sized prefix only -- see bidx_reset */
+    grow_arena((void**)&bs->keys, &bs->keys_cap, tcap * 36);
+    bs->mask = tcap - 1;
 }
 /* Returns 1 the first time this exact outpoint is claimed, 0 if it was
  * already claimed earlier in this same block (an in-block double-spend). */
@@ -407,7 +436,6 @@ static int bspent_claim(bspent_t* bs, const u8 key[36]){
     memcpy(bs->keys + h*36, key, 36);
     return 1;
 }
-static void bspent_free(bspent_t* bs){ free(bs->used); free(bs->keys); bs->used=0; bs->keys=0; }
 
 typedef struct {
     bidx_t* bx; bspent_t* bs;
@@ -451,18 +479,22 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     block_hash(blk_hash, blockbuf);
 
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
-     * used), building the tx array tx_verify.c also consumes. A parse
-     * failure here means nothing has been applied yet -- no rollback
-     * needed, unlike the old code's mid-loop parse failure. ---- */
-    block_tx_t* txs = malloc(ntx * sizeof(block_tx_t));
-    u32* pn_outs = malloc(ntx * sizeof(u32));
-    if (!txs || !pn_outs) { free(txs); free(pn_outs); return 0; }
+     * used), building the tx array tx_verify.c also consumes. txs/pn_outs
+     * are persistent, process-lifetime arenas (grown, never freed -- see
+     * grow_arena's own comment above) instead of a fresh malloc/free every
+     * block. A parse failure here means nothing has been applied yet -- no
+     * rollback needed, unlike the old code's mid-loop parse failure. ---- */
+    static block_tx_t* g_txs = 0; static u64 g_txs_cap = 0;
+    static u32* g_pn_outs = 0;    static u64 g_pn_outs_cap = 0;
+    block_tx_t* txs = grow_arena((void**)&g_txs, &g_txs_cap, ntx * sizeof(block_tx_t));
+    u32* pn_outs = grow_arena((void**)&g_pn_outs, &g_pn_outs_cap, ntx * sizeof(u32));
+    if (!txs || !pn_outs) return 0;
     const u8* q = p;
     u64 total_nin = 0, total_nout = 0;
     for (u64 t=0; t<ntx; t++){
         u8 info[64];
         int ok = tx_parse(info, q, (unsigned long)(blkend - q));
-        if (!ok) { free(txs); free(pn_outs); return 0; }
+        if (!ok) return 0;
         u64 txlen; memcpy(&txlen, info, 8);
         u32 pn_in, pn_out; memcpy(&pn_in, info+12, 4); memcpy(&pn_out, info+16, 4);
         txs[t].ptr = q; txs[t].len = txlen; txs[t].pn_in = pn_in;
@@ -474,9 +506,13 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
 
     /* ---- Phase 0 cont'd / Phase 0.5: in-block output index + whole-block
      * duplicate-outpoint check, in one pass over the already-parsed array.
-     * See this file's own header comment above and tx_verify.c's for why. ---- */
-    bidx_t bx = bidx_init(total_nout);
-    bspent_t bs = bspent_init(total_nin);
+     * See this file's own header comment above and tx_verify.c's for why.
+     * bx/bs are also persistent, process-lifetime arenas -- reset (not
+     * freed+reallocated) every block. ---- */
+    static bidx_t bx = {0};
+    static bspent_t bs = {0};
+    bidx_reset(&bx, total_nout);
+    bspent_reset(&bs, total_nin);
     int dup = 0;
     for (u64 t=0; t<ntx && !dup; t++){
         idxbuild_ctx_t ic = { &bx, &bs, txs[t].txid, (u32)t, 0 };
@@ -488,14 +524,12 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
              * -- an internal consistency problem, same class of check the
              * old apply loop already made, just moved earlier (before any
              * verification/apply work happens, so still no rollback). */
-            bidx_free(&bx); bspent_free(&bs); free(txs); free(pn_outs);
             return 0;
         }
         dup = ic.dup_found;
     }
     if (dup) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld: in-block double-spend (duplicate outpoint)\n", g_apply_height);
-        bidx_free(&bx); bspent_free(&bs); free(txs); free(pn_outs);
         return 0;
     }
 
@@ -506,10 +540,8 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (!tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
                                      &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason)) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n", g_apply_height, (unsigned long)fail_tx, reason);
-        bidx_free(&bx); bspent_free(&bs); free(txs); free(pn_outs);
         return 0;
     }
-    bidx_free(&bx); bspent_free(&bs);
 
     /* ---- Phase 5: sequential apply, exactly as before, reusing the
      * already-parsed tx array instead of re-parsing. A failure HERE is the
@@ -521,10 +553,9 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         ctx.is_coinbase = (t == 0);
         u64 wnin=0, wnout=0;
         int wok = utxo_walk_tx_io(txs[t].ptr, txs[t].ptr+txs[t].len, &ctx, live_on_input, live_on_output, &wnin, &wnout);
-        if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); free(txs); free(pn_outs); return 0; }
-        if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); free(txs); free(pn_outs); return 0; }
+        if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
+        if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
     }
-    free(txs); free(pn_outs);
     return ctx.fatal ? 0 : 1;
 }
 
