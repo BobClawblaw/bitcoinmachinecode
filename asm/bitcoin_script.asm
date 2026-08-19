@@ -3,9 +3,14 @@
 ;
 ;   int der_parse_sig(const u8* sig, ulong slen, u64 r[4], u64 s[4],
 ;                     u32 *hashtype)
-;        Parse a canonical DER ECDSA signature
-;           0x30 len 0x02 rlen(<=32) r-bytes 0x02 slen(<=32) s-bytes [0x01 htype]
-;        into r,s as 4-LE-limb arrays (big-endian integer bytes converted by
+;        Parse a DER ECDSA signature, TOLERANT of non-minimal INTEGER
+;        encoding (real pre-BIP66/DERSIG mainnet history has these):
+;           0x30 len 0x02 rlen r-bytes 0x02 slen s-bytes [0x01 htype]
+;        r-bytes/s-bytes may carry any number of redundant leading 0x00
+;        padding bytes, stripped down to <=32 significant bytes before
+;        conversion; a value that still doesn't fit in 32 bytes after
+;        stripping is rejected (genuinely out of range for secp256k1).
+;        Into r,s as 4-LE-limb arrays (big-endian integer bytes converted by
 ;        be_to_limbs) and the trailing SIGHASH-type byte (0 if absent).
 ;        Returns 1 ok / 0 malformed.
 ;
@@ -51,8 +56,6 @@ der_parse_sig:
     movzx ecx, byte [r12+3]    ; rlen
     test  ecx, ecx
     jz    .fail
-    cmp   ecx, 33
-    ja    .fail
     lea   rdx, [r12+4]         ; r value base
     mov   r14, rdx             ; r base
     mov   r15, rcx             ; r len
@@ -61,14 +64,26 @@ der_parse_sig:
     lea   rbx, [r14+r15]
     cmp   rbx, rax
     ja    .fail
-    ; normalize a 33-byte r that starts with a 0x00 (positive-encoding padding)
-    ; down to the 32 meaningful bytes, so be_to_limbs gets 1..32 bytes.
-    cmp   r15, 33
-    jne   .r_norm
+    ; BUG FIX (2026-08-19): strip ANY number of redundant leading 0x00
+    ; padding bytes down to <=32 significant bytes, not just exactly one
+    ; (the old 33->32 special case). Non-minimal DER INTEGER encodings
+    ; (multiple redundant leading zero bytes) were routinely produced/
+    ; accepted by Bitcoin's original OpenSSL-based signature parser before
+    ; BIP66/DERSIG activates (height 363725) -- a real mainnet spend at
+    ; height 124275 has a 34-byte r AND s, each with a double leading zero,
+    ; that the old single-byte-strip logic rejected outright as malformed.
+    ; base+len stays invariant across the loop (inc/dec pair), so the later
+    ; `lea rbx,[r14+r15]` (locating the s-marker) is unaffected by how much
+    ; got stripped. A genuinely-nonzero byte short of 32 significant bytes
+    ; means the value doesn't fit in 32 bytes -- correctly invalid either way.
+.r_strip:
+    cmp   r15, 32
+    jbe   .r_norm
     cmp   byte [r14], 0x00
     jne   .fail
     inc   r14
-    mov   r15, 32
+    dec   r15
+    jmp   .r_strip
 .r_norm:
     ; convert r -> limbs
     mov   rdi, [rbp-0x30]
@@ -82,21 +97,25 @@ der_parse_sig:
     movzx ecx, byte [rbx+1]    ; slen
     test  ecx, ecx
     jz    .fail
-    cmp   ecx, 33
-    ja    .fail
     lea   rdx, [rbx+2]         ; s value base
-    lea   rax, [rdx+rcx]       ; end of s
+    lea   rax, [rdx+rcx]       ; end of s (ORIGINAL, unstripped -- the later
+                               ; hashtype lookup needs this exact position)
     ; ensure within slen
     lea   r8,  [r12+r13]
     cmp   rax, r8
     ja    .fail
-    ; normalize a 33-byte s with a leading 0x00 down to 32 meaningful bytes.
-    cmp   rcx, 33
-    jne   .s_norm
+    ; BUG FIX (2026-08-19): see the matching r-value fix above -- strip ANY
+    ; number of redundant leading 0x00 bytes down to <=32 significant bytes.
+    ; Only rdx/rcx (s base/len) are touched; rax (end-of-s) stays untouched
+    ; for the hashtype-byte lookup right after the be_to_limbs call below.
+.s_strip:
+    cmp   rcx, 32
+    jbe   .s_norm
     cmp   byte [rdx], 0x00
     jne   .fail
     inc   rdx
-    mov   rcx, 32
+    dec   rcx
+    jmp   .s_strip
 .s_norm:
     push  rcx
     push  rax
