@@ -2,31 +2,45 @@
 """gen_hashtype_vectors.py -- prove Stage B's non-ALL legacy hashtypes are
 wired correctly end-to-end, not just that the raw hash matches a fixture.
 
-Builds genuine P2PK spends signed with SIGHASH_NONE, SIGHASH_SINGLE, and
-ANYONECANPAY combinations, using this repo's own legacy_sighash Python
-reference (gen_sighash_vectors' algorithm, already proven 500/500 against
-Bitcoin Core's official sighash.json). For each hashtype, emits BOTH:
+Covers P2PK, P2PKH, P2SH(P2PK redeem), and P2SH(2-of-2 multisig redeem) --
+the four legacy script shapes PLAN_SCRIPT_VERIFY.md's Stage B named as
+needing dispatch verification. sv_verify_script itself doesn't switch on
+script "type" at all (it just runs whatever opcodes it's given), so these
+cases exist to prove that generic path is actually exercised correctly for
+each shape under non-ALL hashtypes -- not to add new dispatch code.
+
+Uses this repo's own legacy_sighash Python reference (proven 500/500
+against Bitcoin Core's official sighash.json -- see gen_sighash_vectors.py).
+For most groups, each hashtype gets:
   - the genuine spend (must ACCEPT), and
   - a tampered variant that changes exactly the field that hashtype is
     supposed to ignore (must ALSO ACCEPT -- proving the field really is
     unbound), and
   - a tampered variant that changes a field the hashtype DOES bind (must
     REJECT -- proving it isn't just accepting everything).
-Also one SIGHASH_SINGLE-out-of-range (nIn>=nOut) quirk case: the degenerate
-uint256(1) hash, genuinely signed, so verification must ACCEPT it -- Core's
-well-known consensus quirk, not a bug in this project's implementation.
+Also: the SIGHASH_SINGLE-out-of-range (nIn>=nOut) quirk (a genuinely-signed
+degenerate uint256(1) hash verifies -- Core's known behaviour), and for the
+P2SH-multisig group specifically, two co-signers using DIFFERENT hashtypes
+on the SAME input (CHECKMULTISIG builds its own scriptCode slice at a
+different site in bitcoin_interp.asm than single CHECKSIG, so this is
+genuinely separate coverage, not a restatement of the CHECKSIG cases).
 
 Output: asm/tests/hashtype_vec.h consumed by tests/test_hashtype_e2e.c via
 sv_verify_script directly (real ECDSA, real interpreter, no shortcuts).
 """
 import sys, os, struct, hashlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_p2sh_vectors import der_sign, pubkey, push, cs, Tx, sha256d
+from gen_p2sh_vectors import der_sign, pubkey, push, cs, Tx, sha256d, p2sh_spk
 
 SIGHASH_ALL = 1
 SIGHASH_NONE = 2
 SIGHASH_SINGLE = 3
 SIGHASH_ANYONECANPAY = 0x80
+
+SV_P2SH = 1 << 0
+
+def hash160(b):
+    return hashlib.new('ripemd160', hashlib.sha256(b).digest()).digest()
 
 def strip_codesep(s):
     out = b''; i = 0; n = len(s)
@@ -94,6 +108,8 @@ def legacy_sighash(tx_bytes, script_hex_or_bytes, nIn, hashtype):
     return sha256d(pre)
 
 def p2pk_spk(pub): return push(pub) + b'\xac'
+def p2pkh_spk(pub): return b'\x76\xa9\x14' + hash160(pub) + b'\x88\xac'
+def multisig_redeem(pubs, m, n): return bytes([0x50+m]) + b''.join(push(p) for p in pubs) + bytes([0x50+n, 0xae])
 
 def locate_fields(tx_bytes):
     """Parse a serialized tx and return (input_offsets, output_offsets) where
@@ -121,7 +137,13 @@ def locate_fields(tx_bytes):
         slen = rd_cs(); p += slen
     return in_offs, out_offs
 
-def build_and_sign(fund_outs, spend_outs, nIn, hashtype, key, spk):
+def build_spend(fund_outs, spend_outs, nIn, make_ss):
+    """Build a funding tx (single anyone-can-spend input) with the given
+    outputs, then a spend of those outputs with an empty scriptSig at nIn;
+    make_ss(spend_tx_bytes_with_empty_sig_at_nIn, nIn) -> final scriptSig
+    bytes, free to call legacy_sighash however many times it needs (single-
+    sig or multisig, mixed hashtypes). Returns (fund_bytes, spend_bytes, ss).
+    """
     fund = Tx(); fund.ins = [('00'*32, 0xffffffff, b'\x51', 0xffffffff)]
     fund.outs = fund_outs
     fund_bytes = fund.ser()
@@ -130,66 +152,134 @@ def build_and_sign(fund_outs, spend_outs, nIn, hashtype, key, spk):
     spend.ins = [(previd.hex(), i, b'', 0xffffffff) for i in range(len(fund_outs))]
     spend.outs = spend_outs
     raw = spend.ser()
-    d = legacy_sighash(raw, spk, nIn, hashtype)
-    sig = der_sign(key, d) + bytes([hashtype & 0xff])
-    ss = push(sig)   # P2PK scriptSig is JUST the signature -- the pubkey is
-                      # already in scriptPubKey, unlike P2PKH.
+    ss = make_ss(raw, nIn)
     spend.ins[nIn] = (spend.ins[nIn][0], spend.ins[nIn][1], ss, 0xffffffff)
     return fund_bytes, spend.ser(), ss
 
 CASES = []
-def add(name, tx, ss, spk, nIn, expect_accept):
-    CASES.append((name, tx, ss, spk, nIn, 1 if expect_accept else 0))
+def add(name, tx, ss, spk, nIn, flags, expect_accept):
+    CASES.append((name, tx, ss, spk, nIn, flags, 1 if expect_accept else 0))
+
+def group_checksig(label, spk, script_code, ss_of, key):
+    """Runs the standard genuine/tamper-unbound/tamper-bound/ACP/SINGLE/quirk
+    battery for any single-signature legacy shape (P2PK, P2PKH, P2SH-P2PK),
+    where ss_of(sig_with_hashtype_byte) builds the actual scriptSig bytes
+    (push(sig) for P2PK/P2SH-P2PK-redeem-signing convention differs -- caller
+    supplies it). flags: SV_P2SH for P2SH shapes, 0 otherwise."""
+    flags = SV_P2SH if label.startswith('p2sh') else 0
+
+    def sign_and_ss(raw, nIn, hashtype):
+        d = legacy_sighash(raw, script_code, nIn, hashtype)
+        sig = der_sign(key, d) + bytes([hashtype & 0xff])
+        return ss_of(sig)
+
+    # ---- SIGHASH_NONE: outputs unbound ----
+    fund, spend, ss = build_spend([(100000, spk)], [(90000, b'\x51')], 0,
+        lambda raw, nIn: sign_and_ss(raw, nIn, SIGHASH_NONE))
+    add(f'{label}-none-genuine', spend, ss, spk, 0, flags, True)
+    _, out_offs = locate_fields(spend)
+    t = bytearray(spend); t[out_offs[0]:out_offs[0]+8] = struct.pack('<Q', 12345)
+    add(f'{label}-none-tampered-output-still-accepts', bytes(t), ss, spk, 0, flags, True)
+
+    # control: SIGHASH_ALL -- tampering the output MUST now reject
+    fundA, spendA, ssA = build_spend([(100000, spk)], [(90000, b'\x51')], 0,
+        lambda raw, nIn: sign_and_ss(raw, nIn, SIGHASH_ALL))
+    add(f'{label}-all-genuine', spendA, ssA, spk, 0, flags, True)
+    _, out_offsA = locate_fields(spendA)
+    tA = bytearray(spendA); tA[out_offsA[0]:out_offsA[0]+8] = struct.pack('<Q', 12345)
+    add(f'{label}-all-tampered-output-rejects', bytes(tA), ssA, spk, 0, flags, False)
+
+    # ---- SIGHASH_SINGLE: only the same-index output is bound ----
+    fundS, spendS, ssS = build_spend([(100000, spk)], [(50000, b'\x51'), (40000, b'\x52')], 0,
+        lambda raw, nIn: sign_and_ss(raw, nIn, SIGHASH_SINGLE))
+    add(f'{label}-single-genuine', spendS, ssS, spk, 0, flags, True)
+    _, out_offsS = locate_fields(spendS)
+    tS1 = bytearray(spendS); tS1[out_offsS[1]:out_offsS[1]+8] = struct.pack('<Q', 999)
+    add(f'{label}-single-tampered-other-output-still-accepts', bytes(tS1), ssS, spk, 0, flags, True)
+    tS2 = bytearray(spendS); tS2[out_offsS[0]:out_offsS[0]+8] = struct.pack('<Q', 999)
+    add(f'{label}-single-tampered-same-output-rejects', bytes(tS2), ssS, spk, 0, flags, False)
+
+    # ---- ANYONECANPAY: other inputs' prevouts unbound ----
+    fundP, spendP, ssP = build_spend([(100000, spk), (50000, spk)], [(140000, b'\x51')], 0,
+        lambda raw, nIn: sign_and_ss(raw, nIn, SIGHASH_ALL | SIGHASH_ANYONECANPAY))
+    add(f'{label}-acp-genuine', spendP, ssP, spk, 0, flags, True)
+    in_offsP, _ = locate_fields(spendP)
+    tP1 = bytearray(spendP); tP1[in_offsP[1]:in_offsP[1]+4] = b'\xde\xad\xbe\xef'
+    add(f'{label}-acp-tampered-other-input-still-accepts', bytes(tP1), ssP, spk, 0, flags, True)
+    tP2 = bytearray(spendP); tP2[in_offsP[0]:in_offsP[0]+4] = b'\xde\xad\xbe\xef'
+    add(f'{label}-acp-tampered-signed-input-rejects', bytes(tP2), ssP, spk, 0, flags, False)
+
+    # ---- SIGHASH_SINGLE out-of-range quirk ----
+    fundQ, spendQ, ssQ = build_spend([(100000, spk)], [], 0,
+        lambda raw, nIn: sign_and_ss(raw, nIn, SIGHASH_SINGLE))
+    add(f'{label}-single-out-of-range-quirk-still-accepts', spendQ, ssQ, spk, 0, flags, True)
 
 def main():
     k1 = 0xA11CE
     pub1 = pubkey(k1)
-    spk = p2pk_spk(pub1)
 
-    # ---- SIGHASH_NONE: outputs are unbound after signing ----
-    fund, spend, ss = build_and_sign([(100000, spk)], [(90000, b'\x51')], 0, SIGHASH_NONE, k1, spk)
-    add('none-genuine', spend, ss, spk, 0, True)
-    _, out_offs = locate_fields(spend)
-    spend_t = bytearray(spend)
-    spend_t[out_offs[0]:out_offs[0]+8] = struct.pack('<Q', 12345)
-    add('none-tampered-output-still-accepts', bytes(spend_t), ss, spk, 0, True)
+    # ---- P2PK (baseline, already covered previously; kept for continuity) ----
+    spk_pk = p2pk_spk(pub1)
+    group_checksig('p2pk', spk_pk, spk_pk, lambda sig: push(sig), k1)
 
-    # control: same spend but SIGHASH_ALL -- tampering the output MUST now reject
-    fundA, spendA, ssA = build_and_sign([(100000, spk)], [(90000, b'\x51')], 0, SIGHASH_ALL, k1, spk)
-    add('all-genuine', spendA, ssA, spk, 0, True)
-    _, out_offsA = locate_fields(spendA)
-    spendA_t = bytearray(spendA)
-    spendA_t[out_offsA[0]:out_offsA[0]+8] = struct.pack('<Q', 12345)
-    add('all-tampered-output-rejects', bytes(spendA_t), ssA, spk, 0, False)
+    # ---- P2PKH: scriptSig = push(sig) + push(pubkey); scriptCode == spk ----
+    spk_pkh = p2pkh_spk(pub1)
+    group_checksig('p2pkh', spk_pkh, spk_pkh, lambda sig: push(sig) + push(pub1), k1)
 
-    # ---- SIGHASH_SINGLE: only the same-index output is bound ----
-    fundS, spendS, ssS = build_and_sign([(100000, spk)], [(50000, b'\x51'), (40000, b'\x52')], 0, SIGHASH_SINGLE, k1, spk)
-    add('single-genuine', spendS, ssS, spk, 0, True)
-    _, out_offsS = locate_fields(spendS)
-    spendS_other = bytearray(spendS)
-    spendS_other[out_offsS[1]:out_offsS[1]+8] = struct.pack('<Q', 999)  # output[1]: unbound by SINGLE at nIn=0
-    add('single-tampered-other-output-still-accepts', bytes(spendS_other), ssS, spk, 0, True)
-    spendS_same = bytearray(spendS)
-    spendS_same[out_offsS[0]:out_offsS[0]+8] = struct.pack('<Q', 999)  # output[0]: the bound one
-    add('single-tampered-same-output-rejects', bytes(spendS_same), ssS, spk, 0, False)
+    # ---- P2SH(P2PK redeem): scriptCode is the REDEEM script, not the outer
+    # HASH160..EQUAL scriptPubKey; scriptSig = push(sig) + push(redeem) ----
+    redeem_pk = p2pk_spk(pub1)
+    spk_p2sh_pk = p2sh_spk(redeem_pk)
+    group_checksig('p2sh-p2pk', spk_p2sh_pk, redeem_pk, lambda sig: push(sig) + push(redeem_pk), k1)
 
-    # ---- ANYONECANPAY: other inputs' prevouts are unbound ----
-    fundP, spendP, ssP = build_and_sign(
-        [(100000, spk), (50000, b'\x51')],
-        [(140000, b'\x51')], 0, SIGHASH_ALL | SIGHASH_ANYONECANPAY, k1, spk)
-    add('acp-genuine', spendP, ssP, spk, 0, True)
-    in_offsP, _ = locate_fields(spendP)
-    spendP_other = bytearray(spendP)
-    spendP_other[in_offsP[1]:in_offsP[1]+4] = b'\xde\xad\xbe\xef'  # input[1]: unbound by ANYONECANPAY
-    add('acp-tampered-other-input-still-accepts', bytes(spendP_other), ssP, spk, 0, True)
-    spendP_same = bytearray(spendP)
-    spendP_same[in_offsP[0]:in_offsP[0]+4] = b'\xde\xad\xbe\xef'  # input[0]: the signed one
-    add('acp-tampered-signed-input-rejects', bytes(spendP_same), ssP, spk, 0, False)
+    # ---- P2SH(2-of-2 multisig redeem): two co-signers, exercising
+    # CHECKMULTISIG's own (separate) scriptCode/FindAndDelete site, INCLUDING
+    # two signers using DIFFERENT hashtypes on the same input. ----
+    k2 = 0xB0B
+    pub2 = pubkey(k2)
+    redeem_ms = multisig_redeem([pub1, pub2], 2, 2)
+    spk_p2sh_ms = p2sh_spk(redeem_ms)
 
-    # ---- SIGHASH_SINGLE out-of-range quirk: nIn>=nOut -> degenerate hash,
-    # genuinely signed, still verifies (Core's own well-known behavior). ----
-    fundQ, spendQ, ssQ = build_and_sign([(100000, spk)], [], 0, SIGHASH_SINGLE, k1, spk)
-    add('single-out-of-range-quirk-still-accepts', spendQ, ssQ, spk, 0, True)
+    def ms_ss(sig1, sig2):
+        return b'\x00' + push(sig1) + push(sig2) + push(redeem_ms)
+
+    # genuine, both ALL
+    def make_ss_all(raw, nIn):
+        d = legacy_sighash(raw, redeem_ms, nIn, SIGHASH_ALL)
+        s1 = der_sign(k1, d) + bytes([SIGHASH_ALL])
+        s2 = der_sign(k2, d) + bytes([SIGHASH_ALL])
+        return ms_ss(s1, s2)
+    fundM, spendM, ssM = build_spend([(100000, spk_p2sh_ms)], [(50000, b'\x51'), (40000, b'\x52')], 0, make_ss_all)
+    add('p2sh-ms-all-genuine', spendM, ssM, spk_p2sh_ms, 0, SV_P2SH, True)
+
+    # mixed hashtypes: sig1=NONE (ignores all outputs), sig2=SINGLE (binds
+    # only output[0]) -- tamper output[1]: neither sig cares -> ACCEPT;
+    # tamper output[0]: sig2 (SINGLE) breaks -> REJECT (2-of-2 needs both).
+    def make_ss_mixed(raw, nIn):
+        d1 = legacy_sighash(raw, redeem_ms, nIn, SIGHASH_NONE)
+        d2 = legacy_sighash(raw, redeem_ms, nIn, SIGHASH_SINGLE)
+        s1 = der_sign(k1, d1) + bytes([SIGHASH_NONE])
+        s2 = der_sign(k2, d2) + bytes([SIGHASH_SINGLE])
+        return ms_ss(s1, s2)
+    fundMx, spendMx, ssMx = build_spend([(100000, spk_p2sh_ms)], [(50000, b'\x51'), (40000, b'\x52')], 0, make_ss_mixed)
+    add('p2sh-ms-mixed-none-single-genuine', spendMx, ssMx, spk_p2sh_ms, 0, SV_P2SH, True)
+    _, out_offsMx = locate_fields(spendMx)
+    tMx1 = bytearray(spendMx); tMx1[out_offsMx[1]:out_offsMx[1]+8] = struct.pack('<Q', 777)
+    add('p2sh-ms-mixed-tampered-unbound-output-still-accepts', bytes(tMx1), ssMx, spk_p2sh_ms, 0, SV_P2SH, True)
+    tMx2 = bytearray(spendMx); tMx2[out_offsMx[0]:out_offsMx[0]+8] = struct.pack('<Q', 777)
+    add('p2sh-ms-mixed-tampered-single-bound-output-rejects', bytes(tMx2), ssMx, spk_p2sh_ms, 0, SV_P2SH, False)
+
+    # negative control: one signature from a key NOT in the redeem -- must
+    # reject (proves 2-of-2 count enforcement survives non-ALL hashtypes,
+    # not just that mismatched fields reject).
+    kbad = 0xBAD
+    def make_ss_badkey(raw, nIn):
+        d = legacy_sighash(raw, redeem_ms, nIn, SIGHASH_ALL)
+        s1 = der_sign(kbad, d) + bytes([SIGHASH_ALL])
+        s2 = der_sign(k2, d) + bytes([SIGHASH_ALL])
+        return ms_ss(s1, s2)
+    fundB, spendB, ssB = build_spend([(100000, spk_p2sh_ms)], [(50000, b'\x51'), (40000, b'\x52')], 0, make_ss_badkey)
+    add('p2sh-ms-wrong-key-rejects', spendB, ssB, spk_p2sh_ms, 0, SV_P2SH, False)
 
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'asm', 'tests', 'hashtype_vec.h')
     with open(out_path, 'w') as f:
@@ -205,12 +295,14 @@ def main():
         for c in CASES: f.write('  "%s",\n' % c[3].hex())
         f.write('};\n\nstatic const unsigned HT_NIN[] = {\n  ')
         f.write(', '.join(str(c[4]) for c in CASES))
-        f.write('\n};\n\nstatic const unsigned HT_EXPECT[] = {\n  ')
+        f.write('\n};\n\nstatic const unsigned long long HT_FLAGS[] = {\n  ')
         f.write(', '.join(str(c[5]) for c in CASES))
+        f.write('\n};\n\nstatic const unsigned HT_EXPECT[] = {\n  ')
+        f.write(', '.join(str(c[6]) for c in CASES))
         f.write('\n};\n\nstatic const unsigned HT_COUNT = %d;\n\n#endif\n' % len(CASES))
     print('wrote %d cases to %s' % (len(CASES), out_path))
     for c in CASES:
-        print('  %-42s nIn=%d expect=%s' % (c[0], c[4], 'ACCEPT' if c[5] else 'REJECT'))
+        print('  %-52s nIn=%d flags=%d expect=%s' % (c[0], c[4], c[5], 'ACCEPT' if c[6] else 'REJECT'))
 
 if __name__ == '__main__':
     main()
