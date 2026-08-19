@@ -1,20 +1,29 @@
-/* tests/test_utxo_checkpoint.c -- Stage D fault tolerance: utxo_live_catchup
- * must persist a resumable checkpoint (utxo_applied_height.dat) PERIODICALLY
- * during a long catch-up, not just when a compaction happens to fire (rare
- * during bulk mode -- the whole point of the bulk-sized memtable is to flush/
- * compact far less often) or at the very end of the whole call. Before this
- * fix, a from-scratch (or long-gap) replay had ZERO durable resume point for
- * however long it took to reach the first compaction or full completion
- * (hours, observed in production) -- killing/restarting the daemon anywhere
- * in that window re-walked and re-applied EVERY block from height 0 again,
- * even though every put/del already applied was already WAL-durable
- * (persist_applied_height's own header comment).
+/* tests/test_utxo_checkpoint.c -- Stage D: a restart that lands BETWEEN two
+ * separate, individually-COMPLETE utxo_live_catchup() calls must resume from
+ * the persisted applied-height checkpoint instead of re-walking the whole
+ * archive from -1. persist_applied_height() already runs at the end of any
+ * call that applied at least one block (independent of compaction), so this
+ * is safe today and is what this test locks in as a regression guard.
  *
- * Drives a real, coinbase-only chain past the 20000-height checkpoint
- * cadence, then simulates a process restart (utxo_live_close + a fresh
- * utxo_live_init from the same directory) and proves the resume point comes
- * back from the checkpoint, not from -1, and that a subsequent catch-up call
- * applies ONLY the blocks appended after the restart.
+ * NOT covered here, and NOT currently safe: a restart that lands WHILE a
+ * single catch-up call is still in-flight, between two flush/compact events.
+ * A periodic mid-loop checkpoint for that case was tried on 2026-08-19 and
+ * reverted after it exposed a real data-loss bug in production -- reloading
+ * from a checkpoint taken between flush/compact events came back missing
+ * entries that had genuinely been applied (confirmed: even the exact
+ * checkpointed height's own coinbase output was gone from the reloaded LSM
+ * state, while older, already-flushed-to-run entries were intact). The
+ * leading theory is a correctness bug in the flush/compact reconstruction
+ * path itself, not a WAL-durability issue (WAL writes are synchronous and
+ * already durable-enough for a same-machine restart). Do not add a periodic
+ * mid-loop persist_applied_height() call back into utxo_live_catchup, or
+ * extend this test to cover an in-flight restart, until that is root-caused.
+ *
+ * Drives a real, coinbase-only chain past 20000 heights in a single
+ * complete catch-up call, simulates a process restart (utxo_live_close + a
+ * fresh utxo_live_init from the same directory), and proves the resume
+ * point comes back from the checkpoint, not from -1, with a follow-up
+ * catch-up call applying only the blocks appended after the restart.
  */
 #include <stdio.h>
 #include <stdlib.h>
