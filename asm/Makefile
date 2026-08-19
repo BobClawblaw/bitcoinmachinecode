@@ -197,7 +197,7 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
     secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
     bitcoin_addr.o
 tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
-	$(CC) -no-pie -O0 -Wall -o $@ $(REORGSRCS) $(REORGOBJS)
+	$(CC) -no-pie -O0 -Wall -o $@ $(REORGSRCS) $(REORGOBJS) -lpthread
 
 # test_tx_verify_parallel -- differential test for txv_verify_all's forked
 # parallel path (>= TXV_PARALLEL_MIN non-taproot inputs) against a genuinely
@@ -205,7 +205,7 @@ tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 TXVPARSRCS := tests/test_tx_verify_parallel.c daemon/tx_verify.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJS)
-	$(CC) -no-pie -O0 -Wall -o $@ $(TXVPARSRCS) $(REORGOBJS)
+	$(CC) -no-pie -O0 -Wall -o $@ $(TXVPARSRCS) $(REORGOBJS) -lpthread
 
 # test_utxo_checkpoint -- utxo_live_catchup must persist a resumable
 # checkpoint periodically during a long catch-up, not just on a (rare, during
@@ -215,7 +215,7 @@ CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/undo_log.c \
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS)
-	$(CC) -no-pie -O0 -Wall -o $@ $(CKPTSRCS) $(REORGOBJS)
+	$(CC) -no-pie -O0 -Wall -o $@ $(CKPTSRCS) $(REORGOBJS) -lpthread
 
 # test_apply_block_rollback -- a block that fails partway through must roll
 # back everything it already committed (coinbase + any earlier-in-block tx),
@@ -225,7 +225,7 @@ ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/undo
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS)
-	$(CC) -no-pie -O0 -Wall -o $@ $(ROLLBACKSRCS) $(REORGOBJS)
+	$(CC) -no-pie -O0 -Wall -o $@ $(ROLLBACKSRCS) $(REORGOBJS) -lpthread
 
 # daemon/build_utxo -- batch UTXO-set construction from the archive. This is
 # the RIGHT tool for a from-scratch (or long-gap) UTXO rebuild: its memtable is
@@ -294,7 +294,7 @@ RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/undo_log.c da
     daemon/node_config.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_scriptverify.c
 tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
-	$(CC) -no-pie -O0 -o $@ $(RECOVERSRCS) $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ $(RECOVERSRCS) $(DAEMONOBJS) -lpthread
 
 # test_dial_budget -- regression test for the outbound_connect dial-budget hang
 # (download worker wedged in a peer read() for 60+ min, 2026-08-18). It forks
@@ -308,7 +308,7 @@ DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/tx_accept.c daemo
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c
 tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
-	$(CC) -no-pie -O0 -o $@ $(DIALSRCS) $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ $(DIALSRCS) $(DAEMONOBJS) -lpthread
 
 tests/test_cons: tests/test_cons.c $(CONSOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_cons.c $(CONSOBJS)
@@ -909,7 +909,7 @@ DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/tx_accept.c daemon/reorg.c
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c
 daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(VERSION_GEN_H)
-	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS)
+	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS) -lpthread
 
 # pverify -- parallel block-chain verifier, machine-adaptive worker count.
 # Built at -O1 (not -O2/-O3): the deep asm call chain (cons_verify -> tx_parse
