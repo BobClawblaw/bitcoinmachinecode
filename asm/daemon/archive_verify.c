@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <errno.h>
 
 #include "archive_verify.h"
 
@@ -87,6 +88,103 @@ long archive_scan(long* out_entries, long* out_unique, long* out_dups){
     if (out_unique)  *out_unique  = stored - dups;
     if (out_dups)    *out_dups    = dups;
     return first_dup;
+}
+
+/* archive_scan_duplicates(): like archive_scan, but records EVERY duplicate
+ * height (not just the first) into out_heights, up to max_out entries, in
+ * ascending height order. Returns the TOTAL number of duplicate heights
+ * found -- this can exceed max_out; the caller must treat that as "not all
+ * of them fit" and size max_out generously (see ARCHIVE_REPAIR_MAX_DUPS).
+ * Returns 0 for a clean archive, -1 on error (missing index / alloc failure,
+ * same convention as archive_scan's own -1-on-error path via first_dup). */
+long archive_scan_duplicates(long* out_heights, long max_out){
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return -1;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    long n = (long)(sz / 48);
+    if (n <= 0) { close(fd); return -1; }
+
+    unsigned long slots = next_pow2((unsigned long)n * 4 + 1024);
+    unsigned char* ht = malloc(24 + (size_t)slots * 48 + 64);
+    if (!ht) { close(fd); fprintf(stderr, "[archive] dup-scan: alloc failed -- SKIPPING\n"); return -1; }
+    idx_init(ht, slots);
+
+    long dups = 0;
+    unsigned char rec[48];
+    for (long h = 0; h < n; h++){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48) break;
+        if (!rec[0] && !rec[1] && !rec[2] && !rec[3]) continue;
+        if (idx_put(ht, rec, h) == 0){
+            if (out_heights && dups < max_out) out_heights[dups] = h;
+            dups++;
+        }
+    }
+    free(ht);
+    close(fd);
+    return dups;
+}
+
+/* archive_repair_duplicates(): find every duplicate-hash height and mark it
+ * as a HOLE (zero its index.dat record -- the exact same representation an
+ * ordinary never-fetched height already has, see archive_first_hole/
+ * dlc_span in main.c) so the normal, already-proven catch-up/hole-fill path
+ * re-downloads the REAL block for that height from a live peer.
+ *
+ * Deliberately does NOT truncate anything, unlike archive_verify_and_repair.
+ * That matters because truncation additionally requires the archive to be
+ * laid out in monotonic (file_no, data_pos) order below the cut -- a
+ * precondition this archive can genuinely fail even in a range that has no
+ * duplicate-hash corruption at all (see archive_layout_monotonic's own
+ * header comment: enforcing it here has already prevented a truncate from
+ * destroying a well-formed-content-but-non-monotonic archive once). Zeroing
+ * specific existing records carries no such precondition -- it never
+ * deletes or reorders anything, so it is safe to run unconditionally,
+ * regardless of layout, and touches only the exact heights found bad.
+ *
+ * Returns the number of heights repaired (marked as holes) on success (0 for
+ * a clean archive), or -1 on error (nothing changed). */
+#define ARCHIVE_REPAIR_MAX_DUPS 65536
+long archive_repair_duplicates(void){
+    static long heights[ARCHIVE_REPAIR_MAX_DUPS];
+    long found = archive_scan_duplicates(heights, ARCHIVE_REPAIR_MAX_DUPS);
+    if (found <= 0) return found;   /* 0 clean, -1 error -- both pass through as-is */
+
+    long to_fix = found;
+    if (to_fix > ARCHIVE_REPAIR_MAX_DUPS){
+        fprintf(stderr, "[archive] dup-repair: %ld duplicate heights found, only the first %d were "
+                        "recorded this pass -- repairing those now; the next boot's scan will catch "
+                        "the rest once these are refilled\n", found, ARCHIVE_REPAIR_MAX_DUPS);
+        to_fix = ARCHIVE_REPAIR_MAX_DUPS;
+    }
+
+    int fd = open("index.dat", O_RDWR);
+    if (fd < 0){
+        fprintf(stderr, "[archive] dup-repair: could not open index.dat for writing: %s\n", strerror(errno));
+        return -1;
+    }
+
+    static const unsigned char zero48[48] = {0};
+    long fixed = 0;
+    for (long i = 0; i < to_fix; i++){
+        long h = heights[i];
+        if (pwrite(fd, zero48, 48, (off_t)h * 48) != 48){
+            fprintf(stderr, "[archive] dup-repair: pwrite failed at height %ld: %s\n", h, strerror(errno));
+            continue;
+        }
+        fixed++;
+    }
+    /* Durable before anything downstream (the boot catch-up's own hole scan,
+     * which runs right after this) trusts the file -- an unflushed zero that
+     * a crash right here lost would silently un-repair the height with
+     * nothing in the log to explain why it's still corrupt next boot. */
+    fsync(fd);
+    close(fd);
+
+    if (fixed > 0)
+        fprintf(stderr, "[archive] dup-repair: found %ld duplicate-hash height(s) (heights %ld..%ld), "
+                        "marked %ld as hole(s) for normal catch-up to re-fill\n",
+                found, heights[0], heights[to_fix-1], fixed);
+    return fixed;
 }
 
 /* archive_drop_utxo_state(): delete every persisted UTXO artefact so the set
