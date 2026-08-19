@@ -33,6 +33,20 @@ extern long utxo_lsm_init(void* lst);
 extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, u64 height, u64 is_coinbase, const u8* script, u32 slen);
 extern void utxo_lsm_close(void* lst);
 
+/* This test only exercises tx_verify.c's ORIGINAL single-tx
+ * tx_verify_block_connect path -- it never calls the newer, block-wide
+ * tx_verify_block_connect_all, which is what actually calls bidx_get (the
+ * real definition lives in daemon/utxo_live.c, not linked into this test
+ * binary). Still needed at link time since both live in the same
+ * translation unit (daemon/tx_verify.c). Always "not found in-block" is the
+ * correct, safe behavior for a test that never builds an in-block index. */
+long bidx_get(void* bx, u32 caller_tx_index, const u8 txid[32], u32 index,
+              u64* value, u64* height, u64* is_coinbase, const u8** script, unsigned long* slen){
+    (void)bx; (void)caller_tx_index; (void)txid; (void)index;
+    (void)value; (void)height; (void)is_coinbase; (void)script; (void)slen;
+    return 0;
+}
+
 struct lsm_state {
     long log_fd, idx_fd;
     u64 log_len, ckpt_log_off, ckpt_n;
