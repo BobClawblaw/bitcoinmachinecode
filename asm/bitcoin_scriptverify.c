@@ -20,10 +20,15 @@
  * generalizes the original SIGHASH_ALL-only sighash_all (Stage B of
  * PLAN_SCRIPT_VERIFY.md; verified against Bitcoin Core's own 500-vector
  * sighash.json fixture) and includes FindAndDelete + OP_CODESEPARATOR
- * scriptCode handling. Any hashtype whose low 5 bits aren't 1/2/3 returns
- * SCRIPT_ERR_SIG_HASHTYPE rather than being silently mis-hashed. Witness
- * dispatch is not here yet and callers must not assume it: sv_verify_script
- * takes no amount and no witness stack, exactly like the function it mirrors.
+ * scriptCode handling. Any raw hashtype byte is accepted and hashed as-is
+ * (sv_checksig used to reject anything whose low 5 bits weren't 1/2/3 --
+ * that was Core's IsDefinedHashtypeSignature, but that check lives behind
+ * SCRIPT_VERIFY_STRICTENC, a mempool/relay POLICY flag that never appears
+ * in Core's consensus GetBlockScriptFlags; removed 2026-08-19 after the
+ * Stage D archive replay hit a real mainnet block using hashtype 0x00).
+ * Witness dispatch is not here yet and callers must not assume it:
+ * sv_verify_script takes no amount and no witness stack, exactly like the
+ * function it mirrors.
  */
 #include <stdint.h>
 #include <string.h>
@@ -95,7 +100,6 @@ static int sv_true(sv_stack* s, size_t i){
 struct sv_ctx {
     const uint8_t* tx; unsigned long txlen; unsigned long nIn;
     uint8_t* work; unsigned long workcap;
-    int bad_hashtype;          /* sticky: an unsupported SIGHASH was seen */
 };
 
 static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
@@ -104,13 +108,31 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
     const struct { const uint8_t* p; size_t n; }* sc = slice;
     if (!siglen) return 0;                       /* empty sig: fail, not error */
 
-    /* Core's IsDefinedHashtypeSignature: low 5 bits must be ALL/NONE/SINGLE.
-     * Anything else -> SIG_HASHTYPE rather than silently mis-hashed -- a
-     * wrong-but-plausible hash would reject a VALID spend, and during a
-     * chain replay that looks like chain corruption, not a gap. */
+    /* BUG FIX (2026-08-19): this used to reject any hashtype whose low 5
+     * bits weren't ALL/NONE/SINGLE ("Core's IsDefinedHashtypeSignature").
+     * That check is real in Core, but it lives behind SCRIPT_VERIFY_STRICTENC
+     * (script/interpreter.cpp), and STRICTENC never appears in Core's own
+     * GetBlockScriptFlags (validation.cpp) -- confirmed by reading Core's
+     * source directly, not assumed. It is a MEMPOOL/RELAY POLICY flag
+     * (policy/policy.h's STANDARD_SCRIPT_VERIFY_FLAGS), never a consensus
+     * one. sv_verify_script's only real caller is block connection
+     * (daemon/tx_verify.c), which never sets it -- so this check was
+     * rejecting genuinely valid historical blocks outright. Found via the
+     * Stage D archive replay: a real mainnet P2PKH spend at height 110299
+     * uses hashtype byte 0x00 (undefined by the STRICT rule, perfectly
+     * valid by the actual consensus one) -- independently confirmed valid
+     * via a from-scratch Python SignatureHash + ECDSA verify, byte-for-byte
+     * matching this codebase's own (correct) hash once the raw hashtype is
+     * actually used instead of rejected.
+     *
+     * Core's CTransactionSignatureSerializer (interpreter.cpp) only ever
+     * special-cases `(nHashType & 0x1f) == SIGHASH_SINGLE` and `== SIGHASH_
+     * NONE`; every other low-5-bits value (0, 1, or 4-31) falls through to
+     * the same ALL-like path legacy_sighash already implements (its own
+     * fSingle/fNone flags mirror this exactly) -- so no consensus behavior
+     * needs to change here beyond simply not rejecting the signature before
+     * it ever reaches legacy_sighash. */
     uint8_t ht = sig[siglen-1];
-    uint8_t hb = ht & 0x1f;
-    if (hb < 1 || hb > 3){ c->bad_hashtype = 1; return 0; }
 
     /* der_parse_sig's own *hashtype output only ever recognizes byte==1
      * (a leftover from the SIGHASH_ALL-only era); r/s extraction itself is
@@ -202,7 +224,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
     static uint8_t copy_e[MAX_STACK*ELEM_SIZE];
     sv_stack st = { main_e, 0 };
     sv_stack cp = { copy_e, 0 };
-    struct sv_ctx ctx = { tx, txlen, nIn, work, workcap, 0 };
+    struct sv_ctx ctx = { tx, txlen, nIn, work, workcap };
     int err = SCRIPT_ERR_OK;
 
     memset(main_e, 0, sizeof main_e);
@@ -211,7 +233,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         return SCRIPT_ERR_SIG_PUSHONLY;
 
     if (!sv_run(scriptSig, ssl, &st, flags, &ctx, &err))
-        return ctx.bad_hashtype ? SCRIPT_ERR_SIG_HASHTYPE : err;
+        return err;
 
     if (flags & SV_P2SH){
         memcpy(copy_e, main_e, sizeof copy_e);
@@ -219,7 +241,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
     }
 
     if (!sv_run(scriptPubKey, spl, &st, flags, &ctx, &err))
-        return ctx.bad_hashtype ? SCRIPT_ERR_SIG_HASHTYPE : err;
+        return err;
 
     if (st.sp == 0) return SCRIPT_ERR_EVAL_FALSE;
     if (!sv_true(&st, st.sp-1)) return SCRIPT_ERR_EVAL_FALSE;
@@ -239,7 +261,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         st.sp = cp.sp;
 
         if (!sv_run(redeem, rl, &st, flags, &ctx, &err))
-            return ctx.bad_hashtype ? SCRIPT_ERR_SIG_HASHTYPE : err;
+            return err;
         if (st.sp == 0) return SCRIPT_ERR_EVAL_FALSE;
         if (!sv_true(&st, st.sp-1)) return SCRIPT_ERR_EVAL_FALSE;
     }
