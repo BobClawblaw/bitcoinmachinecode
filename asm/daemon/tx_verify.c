@@ -33,30 +33,45 @@
  * under this file will not reach chain tip until that coverage is extended;
  * see PLAN_SCRIPT_VERIFY.md's Stage D note.
  *
- * PARALLEL VERIFICATION (2026-08-19). Signature verification (ECDSA/Schnorr)
- * is the dominant cost of block connection and was, until now, entirely
- * single-threaded -- a from-scratch archive replay measured at ~1 core of
- * this box's 32 in active use. This file now resolves every input's
- * prevout SEQUENTIALLY first (exactly as before -- this is cheap, and is
- * what preserves correctness: same-tx input order and the surrounding
- * apply_block_inner's per-tx interleaving of verify-then-apply are what
- * make same-block spends resolve correctly, and none of that changes here),
- * then fans the expensive per-input crypto checks out across forked worker
- * processes -- the same fork()+shared-mmap-results pattern dl_catchup
- * already uses for parallel block downloading -- and collects pass/fail
- * before deciding whether to apply the transaction. Ordering between
- * transactions and between blocks is completely unchanged: only the
- * (already provably independent, once each input's prevout is resolved)
- * crypto work for ONE transaction's OWN inputs runs concurrently. Taproot
- * inputs, needing the BIP341 aggregate sighash built from every input's
- * prevout, stay on the existing sequential pass 2 -- rarer in practice, and
- * keeping it simple keeps the parallel path's correctness argument simple.
+ * PARALLEL VERIFICATION (2026-08-19, revised 2026-08-19). Signature
+ * verification (ECDSA/Schnorr) is the dominant cost of block connection and
+ * was, until now, entirely single-threaded -- a from-scratch archive replay
+ * measured at ~1 core of this box's 32 in active use. This file resolves
+ * every input's prevout SEQUENTIALLY first (exactly as before -- this is
+ * cheap, and is what preserves correctness: same-tx input order and the
+ * surrounding apply_block_inner's per-tx interleaving of verify-then-apply
+ * are what make same-block spends resolve correctly, and none of that
+ * changes here), then fans the expensive per-input crypto checks out across
+ * worker THREADS and collects pass/fail before deciding whether to apply
+ * the transaction. Ordering between transactions and between blocks is
+ * completely unchanged: only the (already provably independent, once each
+ * input's prevout is resolved) crypto work for ONE transaction's OWN inputs
+ * runs concurrently. Taproot inputs, needing the BIP341 aggregate sighash
+ * built from every input's prevout, stay on the existing sequential pass 2
+ * -- rarer in practice, and keeping it simple keeps the parallel path's
+ * correctness argument simple.
+ *
+ * Originally fork()-based (the same pattern dl_catchup uses for parallel
+ * block downloading), and disabled during bulk UTXO catch-up because
+ * fork()'s copy-on-write page-table setup cost scales with the PARENT's
+ * resident size -- during a from-scratch replay the parent IS the growing
+ * multi-GB UTXO memtable, so every fork() got progressively more expensive
+ * over the course of the run (confirmed via production stack sampling: every
+ * sample landed inside fork() itself, not inside any verify routine).
+ * Rewritten to use pthreads instead, which share the process's address
+ * space rather than copying its page tables, and so have no such cost --
+ * this is what makes it safe to run during bulk mode too now. That in turn
+ * required making sv_verify_script's legacy-path scratch state genuinely
+ * thread-safe (bitcoin_scriptverify.c/bitcoin_interp.asm/
+ * bitcoin_sighash.asm/bitcoin_scriptcodec.asm, real ELF TLS, see those
+ * files' own header notes and tests/test_scriptverify_thread_stress.c) --
+ * P2WPKH/P2WSH's dedicated fast paths already had no such state and needed
+ * no changes.
  */
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/wait.h>
+#include <pthread.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -240,38 +255,56 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
     }
 }
 
-/* Below this many non-taproot inputs, forking costs more than it saves --
- * fork() plus 2 mmap/munmap round-trips easily costs tens of microseconds,
- * comparable to a handful of ECDSA verifies (~115us each per the project's
- * own bench_ecdsa measurement). Chosen conservatively; a real profile could
- * tune it, but correctness does not depend on the exact value -- only
- * throughput does. */
+/* Below this many non-taproot inputs, spawning threads costs more than it
+ * saves -- pthread_create/join round-trips easily cost single-digit
+ * microseconds, comparable to a handful of ECDSA verifies (~115us each per
+ * the project's own bench_ecdsa measurement). Chosen conservatively; a real
+ * profile could tune it, but correctness does not depend on the exact
+ * value -- only throughput does. */
 #define TXV_PARALLEL_MIN 8
 #define TXV_MAX_WORKERS  16
 
-/* Set by utxo_live.c (via txv_set_bulk_mode) whenever its own memtable is
- * bulk-sized -- a from-scratch or long-gap catch-up that keeps growing a
- * multi-GB in-process UTXO structure. fork()'s copy-on-write page-table
- * setup cost scales with the PARENT's resident size, so forking workers out
- * of a process that is itself the thing getting bigger every block gets
- * progressively more expensive over the course of a catch-up -- observed in
- * production as a geometric slowdown (20k-height chunks going from ~5s to
- * 3.5min as RSS climbed past ~1.5GB) that tracked fork() cost, not
- * signature-verify cost (confirmed by repeated stack samples of the running
- * process landing inside fork() every time). Steady-state serving keeps the
- * memtable small and bounded by design (see utxo_live.c's own downshift
- * comment), where forking stays cheap -- so only skip parallel dispatch
- * while bulk mode is active, not permanently. */
-static int g_txv_bulk_mode = 0;
-void txv_set_bulk_mode(int on){ g_txv_bulk_mode = on; }
+/* Was: set by utxo_live.c (via txv_set_bulk_mode) to skip parallel dispatch
+ * during a bulk UTXO catch-up, because fork()'s cost scaled with the
+ * growing memtable (see this file's header note). Threads don't have that
+ * problem -- kept as a real, callable no-op (not deleted) so utxo_live.c's
+ * existing call site doesn't need touching, and so a future cost that DOES
+ * scale with bulk-mode state has an obvious place to hook back in. */
+void txv_set_bulk_mode(int on){ (void)on; }
 
 typedef struct { u8 ok; char reason[64]; } txv_result_t;
+static txv_result_t g_txv_results[TXV_MAX_INPUTS];
+
+typedef struct {
+    const u8* tx; u64 txlen; unsigned long long flags;
+    u64 lo, hi;
+} txv_worker_arg_t;
+
+static void* txv_worker_thread(void* argp){
+    txv_worker_arg_t* a = (txv_worker_arg_t*)argp;
+    static __thread u8 sv_work[1<<20];   /* per-THREAD, not per-process --
+                                          * threads share g_txv_results and
+                                          * the process's other statics, so
+                                          * this one specifically must stay
+                                          * __thread or concurrent workers
+                                          * would race on it (exactly the
+                                          * class of bug
+                                          * test_scriptverify_thread_stress.c
+                                          * was built to catch). */
+    for (u64 i=a->lo;i<a->hi;i++){
+        if (g_txv_in[i].shape == TXV_SHAPE_P2TR) { g_txv_results[i].ok = 1; continue; }
+        const char* r = 0;
+        int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, sizeof sv_work, &r);
+        g_txv_results[i].ok = ok ? 1 : 0;
+        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
+    }
+    return 0;
+}
 
 /* txv_verify_all(): verify every non-taproot input in g_txv_in[0..nin),
- * in parallel once there's enough work to be worth it AND we're not inside
- * a bulk UTXO catch-up (g_txv_bulk_mode -- see its own comment). Sequential
- * fallback below TXV_PARALLEL_MIN keeps small (the common case,
- * historically) txs exactly as fast as before with zero fork overhead.
+ * in parallel once there's enough work to be worth it. Sequential fallback
+ * below TXV_PARALLEL_MIN keeps small (the common case, historically) txs
+ * exactly as fast as before with zero thread overhead.
  * Returns 1 all valid / 0 at least one invalid (reason set). */
 static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long flags,
                           const char** reason){
@@ -281,7 +314,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
 
     static char rbuf[64];
 
-    if (nverify < TXV_PARALLEL_MIN || g_txv_bulk_mode){
+    if (nverify < TXV_PARALLEL_MIN){
         static u8 sv_work[1<<20];
         for (u64 i=0;i<nin;i++){
             if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
@@ -298,83 +331,47 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     if (nworkers > TXV_MAX_WORKERS) nworkers = TXV_MAX_WORKERS;
     if (nworkers < 1) nworkers = 1;
 
-    txv_result_t* results = mmap(0, sizeof(txv_result_t)*(size_t)nin, PROT_READ|PROT_WRITE,
-                                 MAP_SHARED|MAP_ANONYMOUS, -1, 0);
-    if (results == MAP_FAILED) {
-        /* fall back to sequential rather than fail the block over a
-         * resource hiccup -- correctness doesn't depend on parallelism */
-        static u8 sv_work[1<<20];
-        for (u64 i=0;i<nin;i++){
-            if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
-            const char* r = 0;
-            if (!txv_verify_one(tx, txlen, i, flags, sv_work, sizeof sv_work, &r)) {
-                *reason = r; return 0;
-            }
-        }
-        return 1;
-    }
-    memset(results, 0, sizeof(txv_result_t)*(size_t)nin);
+    memset(g_txv_results, 0, sizeof(txv_result_t)*(size_t)nin);
 
     u64 per = (nin + (u64)nworkers - 1) / (u64)nworkers;
-    pid_t pids[TXV_MAX_WORKERS];
+    pthread_t tids[TXV_MAX_WORKERS];
+    txv_worker_arg_t args[TXV_MAX_WORKERS];
     int spawned = 0;
     for (int w=0; w<nworkers; w++){
         u64 lo = (u64)w*per, hi = lo+per; if (hi>nin) hi=nin;
         if (lo >= hi) break;
-        pid_t p = fork();
-        if (p < 0){
-            /* fork failed partway: wait for whoever's already running, then
-             * finish the remaining range (including this one) inline,
-             * sequentially, in THIS process -- still correct, just slower. */
+        args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
+        args[spawned].lo = lo; args[spawned].hi = hi;
+        if (pthread_create(&tids[spawned], 0, txv_worker_thread, &args[spawned]) != 0){
+            /* thread creation failed partway: whatever didn't get a thread
+             * (including this one) stays at its zeroed g_txv_results slot
+             * and is picked up by the "finish inline" sweep below -- same
+             * fallback story fork() had, just for pthread_create instead. */
             break;
         }
-        if (p == 0){
-            static u8 sv_work[1<<20];
-            for (u64 i=lo;i<hi;i++){
-                if (g_txv_in[i].shape == TXV_SHAPE_P2TR) { results[i].ok = 1; continue; }
-                const char* r = 0;
-                int ok = txv_verify_one(tx, txlen, i, flags, sv_work, sizeof sv_work, &r);
-                results[i].ok = ok ? 1 : 0;
-                if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(results[i].reason, r, n); results[i].reason[n]=0; }
-            }
-            _exit(0);
-        }
-        pids[spawned++] = p;
+        spawned++;
     }
-    /* whatever didn't get spawned (fork() failure, or none attempted
-     * because nworkers==0 somehow) -- covered by the "finish inline" pass
-     * below, which re-checks every index's results[i] and fills in any
-     * still-untouched (ok==0, reason[0]==0 -- distinguishable from a real
-     * failure, which always sets reason) slot itself. */
-    for (int w=0; w<spawned; w++){
-        int status = 0;
-        waitpid(pids[w], &status, 0);
-        if (!(WIFEXITED(status) && WEXITSTATUS(status)==0)){
-            /* a worker crashed/was killed: treat every slot it owned as
-             * unverified rather than trust whatever partial writes landed --
-             * the inline sweep below re-verifies anything still blank. */
-        }
-    }
+    for (int w=0; w<spawned; w++) pthread_join(tids[w], 0);
+
     static u8 sv_work_main[1<<20];
     int all_ok = 1;
     for (u64 i=0;i<nin;i++){
         if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
-        if (results[i].ok) continue;
-        if (results[i].reason[0] != 0){
+        if (g_txv_results[i].ok) continue;
+        if (g_txv_results[i].reason[0] != 0){
             /* a real, reported failure */
-            memcpy(rbuf, results[i].reason, sizeof rbuf);
+            memcpy(rbuf, g_txv_results[i].reason, sizeof rbuf);
             all_ok = 0; break;
         }
-        /* blank: either genuinely not yet covered (fork() failure above) or
-         * a crashed worker's slot -- verify it inline now, in this process,
-         * so a transient resource failure never silently skips a check. */
+        /* blank: pthread_create failure above left this index untouched --
+         * verify it inline now, in this thread, so a transient resource
+         * failure never silently skips a check. */
         const char* r = 0;
         if (!txv_verify_one(tx, txlen, i, flags, sv_work_main, sizeof sv_work_main, &r)) {
             memcpy(rbuf, r, strlen(r)+1 > sizeof rbuf ? sizeof rbuf : strlen(r)+1);
             all_ok = 0; break;
         }
     }
-    munmap(results, sizeof(txv_result_t)*(size_t)nin);   /* only after every read above */
     if (!all_ok) *reason = rbuf;
     return all_ok;
 }
