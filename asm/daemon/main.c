@@ -1897,15 +1897,20 @@ static long dl_catchup(const char* dir, int min_workers){
         }
     }
     long total=*done_count;
-    munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
-    munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
-    munmap((void*)claimed,sizeof(int)*(size_t)nlive);
     /* Remember who actually produced blocks. A peer that delivered is worth
      * trying first next boot; the address book alone only records that an IP
      * was once seen, which is why every restart re-probed ~2,000 aged entries
      * and rediscovered the same handful from scratch. Recorded from the live
      * stats, and only for peers with blocks>0 -- being reachable is not the
-     * same as being useful. */
+     * same as being useful.
+     *
+     * BUG FIX (2026-08-19): this block used to run AFTER the munmap(stats)
+     * below, reading stats[w] through an already-unmapped pointer -- a real
+     * use-after-unmap. Confirmed against a real production SIGSEGV: dmesg's
+     * fault timestamp landed ~1.5s after the final "[dlc]" status tick, and
+     * the "[dlc] catch-up done" line below never printed -- exactly what a
+     * crash reading unmapped memory right after the loop exits looks like.
+     * Must run BEFORE stats (and friends) are unmapped. */
     {
         static char good[64][64]; int ngood=0;
         for(int w=0; w<nw && ngood<64; w++){
@@ -1918,6 +1923,9 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         dl_save_good_peers(good, ngood);
     }
+    munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
+    munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
+    munmap((void*)claimed,sizeof(int)*(size_t)nlive);
     fprintf(stderr,"[dlc] catch-up done: %ld new blocks written\n", total);
     return total;
 }
