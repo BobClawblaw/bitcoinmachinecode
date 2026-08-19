@@ -1,10 +1,9 @@
 # PLAN — Block-level script verification
 
-Status: Written 2026-08-18. Stage A done. **Stage B0+B1+B2 done 2026-08-19**
-(legacy SignatureHash complete, FindAndDelete, OP_CODESEPARATOR strip) --
-see "Stage B0/B1/B2 done" below. Remainder of Stage B (broader
-differential verification across P2PKH/P2SH/bare-multisig) and Stages C-E
-not started.
+Status: Written 2026-08-18. **Stage A and Stage B done, 2026-08-19** (legacy
+SignatureHash complete, FindAndDelete, OP_CODESEPARATOR strip, dispatch
+verified across P2PK/P2PKH/P2SH/bare-multisig) -- see "Stage B0/B1/B2 done"
+and its "CLOSED" follow-up below. Stages C-E not started.
 
 ## The gap
 
@@ -253,15 +252,21 @@ for this work entirely; ground truth came from Core's own SOURCE and
 bundled TEST FIXTURES (`/storage/bitcoin-core-source`), which this project
 already treats as authoritative for Core facts.
 
-**What's NOT done:** Stage B's "dispatch P2PK/P2PKH/P2SH/bare-multisig"
-item. `sv_verify_script` already runs arbitrary script bytes generically
-(it doesn't switch on script "type" at all), so these are very likely
-already exercised correctly by the same path the P2PK e2e test just proved
--- but that's an inference, not a vector-checked fact yet. Next: extend the
-hashtype e2e generator (or a differential run against `core_verify_oracle`,
-built from source as this project's existing convention does, if a
-lighter-weight ground truth doesn't cover it) to P2PKH/P2SH/bare-multisig
-with non-ALL hashtypes specifically, then Stage C (activation flags).
+**Stage B's "dispatch P2PK/P2PKH/P2SH/bare-multisig" item -- CLOSED
+(2026-08-19).** The inference above (that `sv_verify_script`'s generic,
+type-agnostic execution meant P2PKH/P2SH/bare-multisig were already covered
+by the P2PK proof) is now a vector-checked fact, not an inference:
+`validation/gen_hashtype_vectors.py` extended to P2PKH, P2SH(P2PK redeem),
+and P2SH(2-of-2 multisig redeem), same genuine/tamper-unbound/tamper-bound
+battery per shape, plus -- specific to multisig -- two co-signers using
+DIFFERENT hashtypes on the SAME input (NONE + SINGLE), which is genuinely
+separate coverage: `interp_checksig` and CHECKMULTISIG's `.cms_loop` build
+their `interp_slice` at two different sites in `bitcoin_interp.asm`.
+`tests/test_hashtype_e2e.c`: **38/38** (11 P2PK + 11 P2PKH + 11 P2SH-P2PK +
+5 P2SH-multisig, incl. a wrong-key negative control proving 2-of-2 count
+enforcement survives non-ALL hashtypes). Full `make test` green throughout.
+
+**Next:** Stage C (activation-height flag schedule).
 
 ## Stage A work item: error-code translation
 
