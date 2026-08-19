@@ -17,6 +17,7 @@
  * nobody can reason about.
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <string.h>
 #include <time.h>
 #include <stdlib.h>
