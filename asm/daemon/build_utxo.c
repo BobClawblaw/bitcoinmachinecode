@@ -74,7 +74,7 @@ extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long ca
 extern long utxo_count(void* u);
 
 extern long utxo_lsm_init(void* lst);
-extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, const u8* script, u32 slen);
+extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, u64 height, u64 is_coinbase, const u8* script, u32 slen);
 extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
 extern long utxo_lsm_count(void* lst);
 extern void utxo_lsm_close(void* lst);
@@ -126,12 +126,19 @@ static void on_input(void* ctx, const u8 txid[32], u32 index){
     }
 }
 
-typedef struct { const u8* txid; } out_ctx_t;
+/* height/is_coinbase (2026-08-19, Stage D): the UTXO record now carries
+ * both, so script verification can later enforce the 100-block coinbase
+ * maturity rule -- neither was available anywhere before this. Both are
+ * in scope in main()'s per-tx loop (block height h, tx index t) at
+ * exactly the point out_ctx_t gets built; is_coinbase is (t==0), Bitcoin's
+ * own rule (coinbase is always the first tx in a block). */
+typedef struct { const u8* txid; u64 height; u64 is_coinbase; } out_ctx_t;
 static void on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u32 slen){
     out_ctx_t* ctx = (out_ctx_t*)ctxv;
     g_puts++;
     if (g_dry_run) return;
-    long r = utxo_lsm_put(&g_lst, g_utxo, ctx->txid, out_index, value, script, slen);
+    long r = utxo_lsm_put(&g_lst, g_utxo, ctx->txid, out_index, value,
+                          ctx->height, ctx->is_coinbase, script, slen);
     if (r == 1) return;
     if (r == 0) { g_put_dup++; return; } /* rare, real (e.g. BIP30-class) dup */
     fprintf(stderr, "[build_utxo] FATAL: utxo_lsm_put returned %ld (2=table full -- memtable "
@@ -303,7 +310,7 @@ int main(int argc, char** argv){
             u8 txid[32];
             tx_txid(txid, p, txlen, txid_scratch, sizeof txid_scratch);
 
-            out_ctx_t oc = { txid };
+            out_ctx_t oc = { txid, (u64)h, (u64)(t == 0) };
             u64 wnin=0, wnout=0;
             int wok = walk_tx_io(p, p+txlen, &oc, on_input, on_output, &wnin, &wnout);
             if (!wok) {

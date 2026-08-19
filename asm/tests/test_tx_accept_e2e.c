@@ -33,7 +33,7 @@ typedef unsigned int u32;
 extern long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_lsm_init(void* lst);
-extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, const u8* script, u32 slen);
+extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, u64 height, u64 is_coinbase, const u8* script, u32 slen);
 extern void utxo_lsm_close(void* lst);
 extern const u8* mpool_get(void* mp, const u8 txid[32], unsigned long* out_len);
 
@@ -82,7 +82,7 @@ static void seed_utxos(const msend_t** specs, int n){
     if (utxo_lsm_init(&lst) != 1) { fprintf(stderr, "seed: utxo_lsm_init failed\n"); exit(1); }
     for (int i=0;i<n;i++){
         const msend_t* s = specs[i];
-        long r = utxo_lsm_put(&lst, table, s->txid, 0, s->prev_amount, s->prev_spk, (u32)s->prev_spklen);
+        long r = utxo_lsm_put(&lst, table, s->txid, 0, s->prev_amount, 0, 0, s->prev_spk, (u32)s->prev_spklen);
         if (r != 1) { fprintf(stderr, "seed: utxo_lsm_put(%s) returned %ld\n", s->name, r); exit(1); }
     }
     utxo_lsm_close(&lst);

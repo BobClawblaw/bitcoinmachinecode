@@ -35,7 +35,8 @@ extern long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_lsm_reload(void* lst, void* u);
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
-                         unsigned long long* value, const u8** script, unsigned long* slen);
+                         unsigned long long* value, unsigned long* height, unsigned long* is_coinbase,
+                         const u8** script, unsigned long* slen);
 
 /* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes) --
  * same layout daemon/utxo_live.c and daemon/build_utxo.c mirror. */
@@ -108,13 +109,20 @@ int tx_dispatch_init(void){
 
 /* mempool_resolve_confirmed_utxo: see bitcoin_mempool_policy.c's and
  * bitcoin_txval_modern.c's own externs for the full rationale. `u` is
- * unused -- this always reads the per-connection snapshot above. */
+ * unused -- this always reads the per-connection snapshot above.
+ *
+ * height/is_coinbase (2026-08-19, Stage D): discarded here on purpose --
+ * this function's own public contract (value/script/slen) is used by
+ * mempool policy and modern-tx validation elsewhere and is intentionally
+ * left unchanged; coinbase maturity enforcement is a BLOCK-validation
+ * concern (apply_block_inner), not mempool admission, in this pass. */
 long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long index,
                                     unsigned long long* value, const u8** script,
                                     unsigned long* slen){
     (void)u;
     if (!g_ready) return 0;
-    return utxo_lsm_get(&g_lst, g_table, txid, (u32)index, value, script, slen);
+    unsigned long height, is_coinbase;
+    return utxo_lsm_get(&g_lst, g_table, txid, (u32)index, value, &height, &is_coinbase, script, slen);
 }
 
 /* ---- mempool policy + whole-tx validation dispatcher ---- */

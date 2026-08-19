@@ -28,8 +28,8 @@ typedef unsigned int u32;
 extern long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_count(void* u);
-extern long utxo_put(void* u, const u8 txid[32], u64 index, u64 value, const u8* script, u64 slen);
-extern long utxo_get(void* u, const u8 txid[32], u64 index, u64* value, const u8** script, u64* slen);
+extern long utxo_put(void* u, const u8 txid[32], u64 index, u64 value, u64 height, u64 is_coinbase, const u8* script, u64 slen);
+extern long utxo_get(void* u, const u8 txid[32], u64 index, u64* value, u64* height, u64* is_coinbase, const u8** script, u64* slen);
 extern long utxo_del(void* u, const u8 txid[32], u64 index);
 
 #define MAX_KEYS 64
@@ -73,7 +73,7 @@ static int run_trial(unsigned seed, long slots){
 
         if (action == 0){
             u8 script[3] = {(u8)id, (u8)(id>>8), 0xAA};
-            long r = utxo_put(u, txid, index, 1000+id, script, 3);
+            long r = utxo_put(u, txid, index, 1000+id, 0, 0, script, 3);
             long ridx = ref_find(txid, index);
             if (ridx >= 0){
                 if (r != 0){
@@ -106,8 +106,8 @@ static int run_trial(unsigned seed, long slots){
             for (int i=0;i<max_keys;i++){
                 u8 kt[32]; u32 ki;
                 make_key(i, kt, &ki);
-                u64 val; const u8* sp; u64 sl;
-                long r = utxo_get(u, kt, ki, &val, &sp, &sl);
+                u64 val; const u8* sp; u64 sl, h_unused, cb_unused;
+                long r = utxo_get(u, kt, ki, &val, &h_unused, &cb_unused, &sp, &sl);
                 int expect = g_ref[i].live ? 1 : 0;
                 if (r != expect){
                     printf("FAIL seed=%u op=%d: get(id=%d) returned %ld, expected %d (live-check)\n", seed, op, i, r, expect);
@@ -126,8 +126,8 @@ static int run_trial(unsigned seed, long slots){
     for (int i=0;i<max_keys;i++){
         u8 kt[32]; u32 ki;
         make_key(i, kt, &ki);
-        u64 val; const u8* sp; u64 sl;
-        long r = utxo_get(u, kt, ki, &val, &sp, &sl);
+        u64 val; const u8* sp; u64 sl, h_unused, cb_unused;
+        long r = utxo_get(u, kt, ki, &val, &h_unused, &cb_unused, &sp, &sl);
         int expect = g_ref[i].live ? 1 : 0;
         if (r != expect){
             printf("FAIL seed=%u final: get(id=%d) returned %ld, expected %d\n", seed, i, r, expect);
