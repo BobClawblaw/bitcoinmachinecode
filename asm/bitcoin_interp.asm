@@ -46,7 +46,6 @@
     extern elem_move
     extern scriptnum_decode
     extern scriptnum_serialize
-    extern snum_overflow
     extern scriptnum_buf
     extern cast_to_bool
     extern check_minimal_push
@@ -57,10 +56,14 @@
     extern vfexec_toggle_top
     extern vfexec_all_true
     extern vfexec_sp_reset
-    extern elem_tmp0
-    extern elem_tmp1
-    extern elem_tmp2
-    extern elem_tmp3
+    ; cross-file TLS accessors (bitcoin_scriptcodec.asm) -- see that file's
+    ; header note by their definitions for why these are function calls
+    ; rather than direct wrt ..gottpoff references to an extern symbol.
+    extern elem_tmp0_addr
+    extern elem_tmp1_addr
+    extern elem_tmp2_addr
+    extern elem_tmp3_addr
+    extern snum_overflow_addr
 
     extern sha256_full
     extern ripemd160
@@ -202,8 +205,31 @@
 %define SCRIPT_ERR_PUBKEY_COUNT               10
 %define SCRIPT_ERR_SIG_NULLDUMMY              28
 
-section .bss
-align 16
+; ---- THREAD-LOCAL scratch (2026-08-19, parallel per-input verification) --
+; interp_tmp/bool_buf/interp_err/interp_slice/cms_keyrefs/cms_sigrefs used
+; to be plain .bss globals -- one shared instance for the whole process.
+; That was fine for the original fork()-per-worker parallelism (each forked
+; child gets its own COW copy of everything), but fork()'s page-table setup
+; cost scales with the parent's resident size, which made it progressively
+; more expensive as the UTXO memtable grew during a from-scratch replay
+; (confirmed via production stack sampling: every sample landed inside
+; fork() itself). Threads avoid that cost entirely -- but ONLY if nothing
+; they touch is process-global mutable state, which these six buffers were.
+; .tbss (NASM's thread-local BSS) + the ELF Initial-Exec TLS model gives
+; each thread its own private instance with no signature/struct-layout
+; changes needed anywhere that calls into this file.
+;
+; script_eval computes each buffer's per-thread ADDRESS once, at entry, into
+; six local slots below (interp_checkmultisig shares this same frame via
+; its documented "rbp = script_eval frame" convention, so it reads the same
+; slots rather than re-deriving them) -- every other reference in this file
+; was previously a compile-time-constant label; those become a load from
+; the matching slot instead, same instruction shape, same register usage.
+section .tbss alloc noexec nowrite tls align=16
+global interp_tmp
+global bool_buf
+global interp_err
+global interp_slice
 interp_tmp: resb ELEM_SIZE
 bool_buf: resb 1
 interp_err: resq 1
@@ -211,11 +237,26 @@ interp_slice: resq 2
 
 section .text
 
+; TLS_ADDR dst, sym -- dst = this thread's address of `sym` (ELF x86-64
+; Initial-Exec model: a GOT-style offset loaded from a fixed, link-time
+; location, added to the thread pointer at %fs:0). Clobbers only `dst`.
+%macro TLS_ADDR 2
+    mov   %1, [rel %2 wrt ..gottpoff]
+    add   %1, qword [fs:0]
+%endmacro
+
 ; ============================================================================
 ; script_eval(state*)   rdi = state
 ; Frame: r12=state throughout. Locals:
 ;   -0x08 fExec   -0x10 pc   -0x18 pend   -0x20 pbegincodehash
 ;   -0x28 nOpCount -0x30 opcode_pos -0x38 opcode -0x40 pushlen
+;   -0x60 &interp_tmp (this thread)   -0x68 &bool_buf   -0x70 &interp_err
+;   -0x78 &interp_slice   -0x80 &cms_keyrefs   -0x88 &cms_sigrefs
+;   -0x90 &elem_tmp0   -0x98 &elem_tmp1   -0xA0 &elem_tmp2   -0xA8 &elem_tmp3
+;   -0xB0 &snum_overflow (scriptnum_buf is only referenced from within
+;   bitcoin_scriptcodec.asm's own scriptnum_serialize, already TLS-converted
+;   there -- no slot needed here)
+;   (computed once here; unused-but-reserved scratch space, no frame resize)
 ; ============================================================================
 script_eval:
     push  rbp
@@ -227,6 +268,32 @@ script_eval:
     push  r15
     sub   rsp, 0x100
     mov   r12, rdi            ; state
+
+    ; per-thread scratch addresses, computed once (see file-header note
+    ; above script_eval and the TLS_ADDR macro) -- unused-but-reserved
+    ; frame space, no resize needed.
+    TLS_ADDR rax, interp_tmp
+    mov   [rbp-0x60], rax
+    TLS_ADDR rax, bool_buf
+    mov   [rbp-0x68], rax
+    TLS_ADDR rax, interp_err
+    mov   [rbp-0x70], rax
+    TLS_ADDR rax, interp_slice
+    mov   [rbp-0x78], rax
+    TLS_ADDR rax, cms_keyrefs
+    mov   [rbp-0x80], rax
+    TLS_ADDR rax, cms_sigrefs
+    mov   [rbp-0x88], rax
+    call  elem_tmp0_addr
+    mov   [rbp-0x90], rax
+    call  elem_tmp1_addr
+    mov   [rbp-0x98], rax
+    call  elem_tmp2_addr
+    mov   [rbp-0xA0], rax
+    call  elem_tmp3_addr
+    mov   [rbp-0xA8], rax
+    call  snum_overflow_addr
+    mov   [rbp-0xB0], rax
 
     ; script size limit for BASE/WITNESS_V0
     mov   eax, dword [r12+48]
@@ -728,7 +795,7 @@ script_eval:
     mov   rsi, [r12+0]
     call  stack_top_ptr
     mov   r13, rax
-    mov   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     mov   rsi, r13
     call  elem_move
     lea   rdi, [r12+8]
@@ -736,8 +803,8 @@ script_eval:
     call  stack_pop
     lea   rdi, [r12+24]
     mov   rsi, [r12+16]
-    mov   rdx, interp_tmp
-    mov   rcx, [interp_tmp]
+    mov   rdx, [rbp-0x60]
+    mov   rcx, [rdx]
     call  stack_push
     test  rax, rax
     jnz   .next_op
@@ -757,7 +824,7 @@ script_eval:
     mov   rsi, [r12+16]
     call  stack_top_ptr
     mov   r13, rax
-    mov   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     mov   rsi, r13
     call  elem_move
     lea   rdi, [r12+24]
@@ -765,8 +832,8 @@ script_eval:
     call  stack_pop
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, interp_tmp
-    mov   rcx, [interp_tmp]
+    mov   rdx, [rbp-0x60]
+    mov   rcx, [rdx]
     call  stack_push
     test  rax, rax
     jnz   .next_op
@@ -889,7 +956,7 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_elem_ptr
-    mov   rdi, elem_tmp0
+    mov   rdi, [rbp-0x90]
     mov   rsi, rax
     call  elem_move
     lea   rdi, [r12+8]
@@ -900,7 +967,7 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_elem_ptr
-    mov   rdi, elem_tmp1
+    mov   rdi, [rbp-0x98]
     mov   rsi, rax
     call  elem_move
     lea   rdi, [r12+8]
@@ -921,13 +988,15 @@ script_eval:
     call  stack_erase_index
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, elem_tmp0
-    mov   rcx, [elem_tmp0]
+    mov   rdx, [rbp-0x90]
+    mov   rax, [rbp-0x90]
+    mov   rcx, [rax]
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, elem_tmp1
-    mov   rcx, [elem_tmp1]
+    mov   rdx, [rbp-0x98]
+    mov   rax, [rbp-0x98]
+    mov   rcx, [rax]
     call  stack_push
     jmp   .next_op
 
@@ -1114,7 +1183,7 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, r14
     call  stack_elem_ptr
-    mov   rdi, elem_tmp0
+    mov   rdi, [rbp-0x90]
     mov   rsi, rax
     call  elem_move
     mov   rdi, [r12+8]
@@ -1123,8 +1192,9 @@ script_eval:
     call  stack_erase_index
     mov   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, elem_tmp0
-    mov   rcx, [elem_tmp0]
+    mov   rdx, [rbp-0x90]
+    mov   rax, [rbp-0x90]
+    mov   rcx, [rax]
     call  stack_push
     jmp   .next_op
 .pkdup:
@@ -1203,14 +1273,14 @@ script_eval:
     mov   rsi, [r12+0]
     call  stack_top_ptr
     mov   r13, rax
-    mov   rdi, elem_tmp2
+    mov   rdi, [rbp-0xA0]
     mov   rsi, r13
     call  elem_move              ; tmp2 = x2
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_second_ptr
     mov   r13, rax
-    mov   rdi, elem_tmp3
+    mov   rdi, [rbp-0xA8]
     mov   rsi, r13
     call  elem_move              ; tmp3 = x1
     lea   rdi, [r12+8]
@@ -1222,18 +1292,21 @@ script_eval:
     ; push x2, x1, x2
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, elem_tmp2
-    mov   rcx, [elem_tmp2]
+    mov   rdx, [rbp-0xA0]
+    mov   rax, [rbp-0xA0]
+    mov   rcx, [rax]
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, elem_tmp3
-    mov   rcx, [elem_tmp3]
+    mov   rdx, [rbp-0xA8]
+    mov   rax, [rbp-0xA8]
+    mov   rcx, [rax]
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, elem_tmp2
-    mov   rcx, [elem_tmp2]
+    mov   rdx, [rbp-0xA0]
+    mov   rax, [rbp-0xA0]
+    mov   rcx, [rax]
     call  stack_push
     jmp   .next_op
 
@@ -1351,7 +1424,8 @@ script_eval:
     mov   rsi, r15
     mov   rdx, 4
     call  scriptnum_decode
-    mov   rcx, [rel snum_overflow]
+    mov   rcx, [rbp-0xB0]
+    mov   rcx, [rcx]
     test  rcx, rcx
     jnz   .snum_fail
     mov   r14, rax          ; bn
@@ -1442,7 +1516,8 @@ script_eval:
     mov   rdx, 4
     call  scriptnum_decode
     mov   r14, rax          ; bn1
-    mov   rcx, [rel snum_overflow]
+    mov   rcx, [rbp-0xB0]
+    mov   rcx, [rcx]
     test  rcx, rcx
     jnz   .snum_fail
     lea   rdi, [r12+8]
@@ -1456,7 +1531,8 @@ script_eval:
     mov   rdx, 4
     call  scriptnum_decode
     mov   r15, rax          ; bn2
-    mov   rcx, [rel snum_overflow]
+    mov   rcx, [rbp-0xB0]
+    mov   rcx, [rcx]
     test  rcx, rcx
     jnz   .snum_fail
     ; rbx = op id
@@ -1653,14 +1729,14 @@ script_eval:
     ; SHA1 not available -> bad opcode
     jmp   .bad_opcode
 .cr_sha:
-    lea   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     mov   rsi, r15
     mov   rdx, r14
     call  sha256_full
     mov   r15d, 32
     jmp   .cr_out
 .cr_rip:
-    lea   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     mov   rsi, r15
     mov   rdx, r14
     call  ripemd160
@@ -1668,20 +1744,20 @@ script_eval:
     jmp   .cr_out
 .cr_h160:
     ; sha256 -> ripemd160
-    lea   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     mov   rsi, r15
     mov   rdx, r14
     call  sha256_full
-    lea   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     add   rdi, 32
-    lea   rsi, interp_tmp
+    mov   rsi, [rbp-0x60]
     mov   rdx, 32
     call  ripemd160
     ; result in interp_tmp+32 (20 bytes)
     mov   r15d, 20
     jmp   .cr_out2
 .cr_h256:
-    lea   rdi, interp_tmp
+    mov   rdi, [rbp-0x60]
     mov   rsi, r15
     mov   rdx, r14
     call  sha256d
@@ -1694,7 +1770,7 @@ script_eval:
     call  stack_pop
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, interp_tmp
+    mov   rdx, [rbp-0x60]
     mov   rcx, r15
     call  stack_push
     test  rax, rax
@@ -1707,7 +1783,7 @@ script_eval:
     call  stack_pop
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
-    mov   rdx, interp_tmp
+    mov   rdx, [rbp-0x60]
     add   rdx, 32
     mov   rcx, r15
     call  stack_push
@@ -1825,10 +1901,12 @@ script_eval:
     call  interp_checkmultisig
     test  rax, rax
     jnz   .next_op
-    mov   rax, [interp_err]
+    mov   rax, [rbp-0x70]
+    mov   rax, [rax]
     test  rax, rax
     jz    .bad_opcode
-    mov   rax, [interp_err]
+    mov   rax, [rbp-0x70]
+    mov   rax, [rax]
     jmp   .err_ret0
 
 .op_cltv:
@@ -2029,15 +2107,17 @@ is_opsuccess_c:
 ; ============================================================================
 interp_swap_recs:
     push  rbx
-    ; r13 = a, r14 = b
-    mov   rdi, elem_tmp0
+    ; r13 = a, r14 = b. rbp is script_eval's frame here (interp_swap_recs is
+    ; only ever reached via script_eval's own call graph, same convention as
+    ; interp_checkmultisig/interp_push_num/interp_push_bool).
+    mov   rdi, [rbp-0x90]
     mov   rsi, r13
     call  elem_move            ; tmp0 = *a
     mov   rdi, r13
     mov   rsi, r14
     call  elem_move            ; *a = *b
     mov   rdi, r14
-    mov   rsi, elem_tmp0
+    mov   rsi, [rbp-0x90]
     call  elem_move            ; *b = tmp0
     pop   rbx
     ret
@@ -2081,8 +2161,11 @@ interp_push_num:
     push  rdx
     mov   r14, rdx            ; len
     mov   rdi, rdx
-    ; copy rax[0..rdx) -> interp_tmp (interp_tmp is in .bss, 528 bytes)
-    mov   rdi, interp_tmp
+    ; copy rax[0..rdx) -> interp_tmp (interp_tmp is thread-local, 528 bytes;
+    ; interp_push_num is only ever reached via script_eval's own call graph,
+    ; so rbp is always script_eval's frame here -- same convention as
+    ; interp_checkmultisig)
+    mov   rdi, [rbp-0x60]
     mov   rsi, rax
     mov   rcx, r14
     rep movsb
@@ -2090,7 +2173,7 @@ interp_push_num:
     ; push (interp_tmp, r14)
     mov   rdi, r12
     mov   rsi, r13
-    mov   rdx, interp_tmp
+    mov   rdx, [rbp-0x60]
     mov   rcx, r14
     call  stack_push
     pop   r14
@@ -2109,12 +2192,20 @@ interp_push_bool:
     mov   r13, rsi
     mov   r14, rdx            ; bool
     ; build the single byte
+    mov   rax, [rbp-0x68]      ; this thread's bool_buf address (interp_push_bool
+                                ; is only reached via script_eval's call graph,
+                                ; incl. through interp_checkmultisig, which shares
+                                ; script_eval's frame -- same convention as -0x60).
+                                ; rax is caller-saved/volatile, safe to clobber
+                                ; here and hold across .put0/.have/.pushit below
+                                ; (nothing in this function relies on an incoming
+                                ; rax value -- r12/r13/r14 are its only locals).
     test  r14, r14
     jz    .put0
-    mov   byte [rel bool_buf], 1
+    mov   byte [rax], 1
     jmp   .have
 .put0:
-    mov   byte [rel bool_buf], 0
+    mov   byte [rax], 0
 .have:
     ; push either empty (len 0) or 1 byte. For bool true push 0x01; false push empty.
     xor   ecx, ecx
@@ -2124,7 +2215,7 @@ interp_push_bool:
 .pushit:
     mov   rdi, r12
     mov   rsi, r13
-    mov   rdx, bool_buf
+    mov   rdx, rax
     ; rcx = 0 or 1
     call  stack_push
     pop   r14
@@ -2188,17 +2279,19 @@ interp_checksig:
     jz    .false
     ; build slice
     mov   rax, [rbp-0x20]
-    mov   [rel interp_slice], rax
+    TLS_ADDR r10, interp_slice
+    mov   [r10], rax
     mov   rax, [rbp-0x18]
     sub   rax, [rbp-0x20]
-    mov   [rel interp_slice+8], rax
+    TLS_ADDR r10, interp_slice
+    mov   [r10+8], rax
     ; args
     mov   rdi, [r12+88]
     lea   rsi, [r13+ELEM_DATA_OFF]
     mov   rdx, rbx
     mov   rcx, r15
     mov   r8,  r14
-    lea   r9,  [rel interp_slice]
+    TLS_ADDR r9, interp_slice
     call  qword [r12+96]
     jmp   .end
 .false:
@@ -2236,16 +2329,18 @@ interp_checksig_add:
     test  rax, rax
     jz    .false
     mov   rax, [rbp-0x20]
-    mov   [rel interp_slice], rax
+    TLS_ADDR r10, interp_slice
+    mov   [r10], rax
     mov   rax, [rbp-0x18]
     sub   rax, [rbp-0x20]
-    mov   [rel interp_slice+8], rax
+    TLS_ADDR r10, interp_slice
+    mov   [r10+8], rax
     mov   rdi, [r12+88]
     lea   rsi, [r13+ELEM_DATA_OFF]
     mov   rdx, rbx
     mov   rcx, r15
     mov   r8,  r14
-    lea   r9,  [rel interp_slice]
+    TLS_ADDR r9, interp_slice
     call  qword [r12+96]
     jmp   .end
 .false:
@@ -2280,7 +2375,8 @@ interp_checkmultisig:
     push  r15
     push  rbx
     sub   rsp, 32               ; locals: [rsp+24]=nKeys, [rsp+16]=nSigs, [rsp+8]=sp, [rsp+0]=remaining
-    mov   qword [rel interp_err], 0
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], 0
 
     ; r12 = script_state stays fixed. The stack layout (bottom..top) is:
     ;   ... dummy sig1..sigm m pub1..pubn n
@@ -2406,7 +2502,7 @@ interp_checkmultisig:
     ; store pointer to cms_keyrefs[j]
     mov   ecx, 8
     imul  rcx, r13
-    lea   rdx, [rel cms_keyrefs]
+    TLS_ADDR rdx, cms_keyrefs
     add   rdx, rcx
     mov   [rdx], rax
     inc   r13d
@@ -2430,7 +2526,7 @@ interp_checkmultisig:
     call  stack_elem_ptr
     mov   ecx, 8
     imul  rcx, r13
-    lea   rdx, [rel cms_sigrefs]
+    TLS_ADDR rdx, cms_sigrefs
     add   rdx, rcx
     mov   [rdx], rax
     inc   r13d
@@ -2459,19 +2555,21 @@ interp_checkmultisig:
     mov   eax, r13d
     mov   rcx, 8
     imul  rcx, rax
-    lea   rbx, [rel cms_sigrefs]
+    TLS_ADDR rbx, cms_sigrefs
     mov   rbx, [rbx+rcx]         ; vSig elem ptr
     mov   eax, r15d
     mov   rcx, 8
     imul  rcx, rax
-    lea   r14, [rel cms_keyrefs]
+    TLS_ADDR r14, cms_keyrefs
     mov   r14, [r14+rcx]         ; vPub elem ptr
     ; build slice (scriptCode) for the callback's sighash
     mov   rax, [rbp-0x20]
-    mov   [rel interp_slice], rax
+    TLS_ADDR r10, interp_slice
+    mov   [r10], rax
     mov   rax, [rbp-0x18]
     sub   rax, [rbp-0x20]
-    mov   [rel interp_slice+8], rax
+    TLS_ADDR r10, interp_slice
+    mov   [r10+8], rax
     ; call checksig_fn(ctx, sig, siglen, pub, publen, &slice)
     mov   rdi, [r12+88]
     mov   eax, [rbx]
@@ -2480,7 +2578,7 @@ interp_checkmultisig:
     mov   eax, [r14]
     mov   r8,  rax               ; publen
     lea   rcx, [r14+ELEM_DATA_OFF]
-    lea   r9,  [rel interp_slice]
+    TLS_ADDR r9, interp_slice
     mov   rax, [r12+96]
     test  rax, rax
     jz    .cms_key_fail
@@ -2543,16 +2641,20 @@ interp_checkmultisig:
     ret
 
 .err_stackop:
-    mov   qword [rel interp_err], SCRIPT_ERR_INVALID_STACK_OPERATION
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_INVALID_STACK_OPERATION
     jmp   .err_exit
 .err_nulldummy:
-    mov   qword [rel interp_err], SCRIPT_ERR_SIG_NULLDUMMY
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_NULLDUMMY
     jmp   .err_exit
 .err_pubcount:
-    mov   qword [rel interp_err], SCRIPT_ERR_PUBKEY_COUNT
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_PUBKEY_COUNT
     jmp   .err_exit
 .err_sigcount:
-    mov   qword [rel interp_err], SCRIPT_ERR_SIG_COUNT
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_COUNT
 .err_exit:
     xor   eax, eax
     add   rsp, 32
@@ -2563,8 +2665,9 @@ interp_checkmultisig:
     pop   r12
     ret
 
-section .bss
-alignb 16
+section .tbss alloc noexec nowrite tls align=16
+global cms_keyrefs
+global cms_sigrefs
 cms_keyrefs: resq 20
 cms_sigrefs: resq 20
 
