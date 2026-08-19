@@ -1,9 +1,10 @@
 # PLAN — Block-level script verification
 
-Status: Written 2026-08-18. **Stage A and Stage B done, 2026-08-19** (legacy
+Status: Written 2026-08-18. **Stages A, B, and C done, 2026-08-19** (legacy
 SignatureHash complete, FindAndDelete, OP_CODESEPARATOR strip, dispatch
-verified across P2PK/P2PKH/P2SH/bare-multisig) -- see "Stage B0/B1/B2 done"
-and its "CLOSED" follow-up below. Stages C-E not started.
+verified across P2PK/P2PKH/P2SH/bare-multisig, activation-height flag
+schedule) -- see "Stage B0/B1/B2 done", its "CLOSED" follow-up, and "Stage C
+done" below. Stages D-E not started.
 
 ## The gap
 
@@ -125,12 +126,52 @@ Core's two-pass + P2SH semantics with Core error codes.
 *Verify:* differential against `core_verify_oracle` over generated vectors
 per type, error-for-error — the parity bar `bitcoin_verify.c` already set.
 
-### Stage C — activation-height flag schedule
-A pure `script_flags_for_height(h)` function. Heights **must be read out of
-Core's `chainparams.cpp`, not from memory** — Core defaults were misremembered
-twice already this session.
-*Verify:* unit tests at each activation boundary (h-1 vs h), plus a
-differential run against Core on real blocks straddling each fork.
+### Stage C — activation-height flag schedule -- DONE (2026-08-19)
+
+Turned out NOT to be a pure `script_flags_for_height(h)` function -- reading
+Core's actual `GetBlockScriptFlags` (`src/validation.cpp`) rather than
+assuming the textbook "P2SH activates at height 173805" shape found
+something the plan didn't anticipate: in current Core, P2SH/WITNESS/TAPROOT
+are active from height 0 UNCONDITIONALLY, with exactly TWO historical
+mainnet blocks -- identified by HASH, not height -- where Core overrides the
+flags down to something weaker (one pre-BIP16, one pre-Taproot violation).
+DERSIG/CLTV/CSV/NULLDUMMY (NULLDUMMY activates with segwit, BIP147) ARE each
+independently height-gated the textbook way. So the real signature is
+`script_flags_for_block(height, hash32) -> flags`.
+
+This also meant an EXISTING function, `verify_flags_for_height` in the
+demoted `bitcoin_verify.c`, was flagged and removed: it gated P2SH at a
+hardcoded 173805 and applied DERSIG/CLTV/CSV/NULLDUMMY at every height
+including 0 -- both wrong, and it was never called anywhere.
+
+Implemented in `bitcoin_script_flags.asm`, reading `script_flags_consts.inc`
+-- itself GENERATED, not transcribed, by `validation/gen_script_flags.py`
+straight from Core's `kernel/chainparams.cpp` (the 4 heights + both
+exception hashes) and `script/interpreter.h` (the `SCRIPT_VERIFY_*` bit
+positions), self-checking that it can re-parse its own output (the same
+discipline `gen_script_error_defines.py` already established, after a real
+incident recorded in `ENGINEERING_RULES.md`) -- and the self-check caught a
+real bug in this generator's own inconsistent column-padding before it ever
+reached a test.
+
+*Verified:* `validation/gen_script_flags_vectors.py` independently
+re-derives expected flag values from the SAME Core source via a SEPARATE
+extraction path (not from the .inc the implementation reads), covering the
+h-1/h boundary of all four buried deployments, both extremes (nothing
+active / everything active -- which lands on exactly `0x20e15`, matching
+the pre-existing `FLAGS_MODERN` constant already used in
+`test_scriptverify_parity.c`, an independent cross-check), and both
+exception hashes (including a near-miss hash that must NOT trigger the
+override, and an exception-hash block past all four height thresholds,
+proving the height-gated bits still get ORed in on top of the override --
+Core does this unconditionally, and a first draft of the vector generator
+got this wrong before the test ever ran). `tests/test_script_flags.c`:
+**13/13**. No live Core process used (ground truth from
+`/storage/bitcoin-core-source` only, per this session's standing
+constraint) -- the "differential run against Core on real blocks" the plan
+originally called for was deliberately not done for that reason; the
+source-derived + independently-cross-checked verification above is judged
+sufficient. Full `make test` green, no regressions.
 
 ### Stage D — connect it, and prove it against the real chain
 Call the verifier from `apply_block_inner`, interleaved with UTXO
