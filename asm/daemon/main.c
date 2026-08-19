@@ -2374,7 +2374,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         fprintf(stderr,"[mux] outbound %d = %s (fd %d)\n", mux_n_out, peers[i], fd);
         mux_n_out++;
     }
-    printf("serving on port %d (%d outbound peer(s))...\n", port, mux_n_out); fflush(stdout);
+    fprintf(stderr, "serving on port %d (%d outbound peer(s))...\n", port, mux_n_out);
     long long rot=0;
     /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
      * negative fd and returns revents==0 for it, so the accept branch below
