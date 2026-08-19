@@ -15,9 +15,12 @@
  * (tests/test_scriptverify_parity.c). Identical signature, identical return
  * codes, so the comparison is exact rather than approximate.
  *
- * SCOPE, STATED PLAINLY. Legacy signatures only, and only SIGHASH_ALL,
- * because sighash_all is the only legacy sighash this codebase has (see
- * PLAN_SCRIPT_VERIFY.md's Stage B correction). Any other hashtype returns
+ * SCOPE, STATED PLAINLY. Legacy signatures only: ALL/NONE/SINGLE, each with
+ * or without ANYONECANPAY, via legacy_sighash (bitcoin_sighash.asm), which
+ * generalizes the original SIGHASH_ALL-only sighash_all (Stage B of
+ * PLAN_SCRIPT_VERIFY.md; verified against Bitcoin Core's own 500-vector
+ * sighash.json fixture) and includes FindAndDelete + OP_CODESEPARATOR
+ * scriptCode handling. Any hashtype whose low 5 bits aren't 1/2/3 returns
  * SCRIPT_ERR_SIG_HASHTYPE rather than being silently mis-hashed. Witness
  * dispatch is not here yet and callers must not assume it: sv_verify_script
  * takes no amount and no witness stack, exactly like the function it mirrors.
@@ -46,9 +49,14 @@ struct script_state {
 extern int script_eval(struct script_state* st);
 
 /* ---- audited crypto layer, the same primitives bitcoin_verify.c uses ---- */
-extern int  sighash_all(uint8_t out[32], const uint8_t* tx, unsigned long txlen,
-                        unsigned long input_index, const uint8_t* script,
-                        unsigned long script_len, uint8_t* preimg, unsigned long cap);
+extern int  legacy_sighash(uint8_t out32[32], const uint8_t* tx, unsigned long txlen,
+                           unsigned long nIn, const uint8_t* scriptCode, unsigned long scLen,
+                           int32_t hashtype, uint8_t* preimg, unsigned long cap);
+extern long long script_find_and_delete(uint8_t* dst, unsigned long dstcap,
+                           const uint8_t* src, unsigned long srclen,
+                           const uint8_t* needle, unsigned long needlelen);
+extern long long script_push_encode(uint8_t* dst, unsigned long dstcap,
+                           const uint8_t* data, unsigned long datalen);
 extern int  der_parse_sig(const uint8_t* sig, unsigned long siglen,
                           uint64_t r[4], uint64_t s[4], uint32_t* hashtype);
 extern int  pubkey_parse(const uint8_t* pub, unsigned long publen,
@@ -96,20 +104,37 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
     const struct { const uint8_t* p; size_t n; }* sc = slice;
     if (!siglen) return 0;                       /* empty sig: fail, not error */
 
-    /* Only SIGHASH_ALL can be hashed correctly today. Flag anything else so
-     * the caller reports SIG_HASHTYPE instead of silently checking the wrong
-     * message -- a wrong-but-plausible hash would reject a VALID spend, and
-     * during a chain replay that looks like chain corruption, not a gap. */
+    /* Core's IsDefinedHashtypeSignature: low 5 bits must be ALL/NONE/SINGLE.
+     * Anything else -> SIG_HASHTYPE rather than silently mis-hashed -- a
+     * wrong-but-plausible hash would reject a VALID spend, and during a
+     * chain replay that looks like chain corruption, not a gap. */
     uint8_t ht = sig[siglen-1];
-    if ((ht & 0x1f) != 1 || (ht & 0x80)){ c->bad_hashtype = 1; return 0; }
+    uint8_t hb = ht & 0x1f;
+    if (hb < 1 || hb > 3){ c->bad_hashtype = 1; return 0; }
 
+    /* der_parse_sig's own *hashtype output only ever recognizes byte==1
+     * (a leftover from the SIGHASH_ALL-only era); r/s extraction itself is
+     * unaffected by the trailing hashtype byte's value (DER is
+     * self-delimiting), so `ht` above -- not der_parse_sig's dht -- is the
+     * real hashtype from here on. */
     uint64_t r[4], s[4]; uint32_t dht;
     if (!der_parse_sig(sig, (unsigned long)siglen, r, s, &dht)) return 0;
-    if (dht != 1){ c->bad_hashtype = 1; return 0; }
+
+    /* FindAndDelete: remove this exact signature (as a script push) from
+     * scriptCode before hashing. Core does this once per checksig call, on
+     * the interpreter-supplied slice, BEFORE legacy_sighash's own internal
+     * OP_CODESEPARATOR strip (interp.asm:CODESEPARATOR handling already
+     * bounds `sc` to [pbegincodehash, pend), matching Core's scriptCode). */
+    static uint8_t needle[600], scF[20000];
+    long long nlen = script_push_encode(needle, sizeof needle, sig, siglen);
+    if (nlen < 0) return 0;
+    long long scflen = script_find_and_delete(scF, sizeof scF, sc->p, sc->n,
+                                              needle, (unsigned long)nlen);
+    if (scflen < 0) return 0;
 
     uint8_t z[32];
-    if (!sighash_all(z, c->tx, c->txlen, c->nIn, sc->p, (unsigned long)sc->n,
-                     c->work, c->workcap)) return 0;
+    if (!legacy_sighash(z, c->tx, c->txlen, c->nIn, scF, (unsigned long)scflen,
+                        (int32_t)ht, c->work, c->workcap)) return 0;
     uint64_t zl[4]; be_to_limbs(zl, z, 32);
     uint64_t qx[4], qy[4];
     if (!pubkey_parse(pub, (unsigned long)publen, qx, qy)) return 0;
