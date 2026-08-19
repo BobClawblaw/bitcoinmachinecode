@@ -179,9 +179,12 @@ def ser_tx_full(txv, witnesses):
     for o in txv['outputs']:
         out += ser_ctxout(o['value'], o['spk'])
     if segwit:
-        out += cs(len(witnesses))
+        # No overall witness-stack-count field on the wire -- Core's
+        # SerializeTransaction writes exactly one stack per input,
+        # back-to-back (tx.vin[i].scriptWitness.stack for i in
+        # [0, vin.size())); an input without a witness still gets an
+        # empty stack (cs(0)), it is never omitted.
         for w in witnesses:                     # one stack per input
-            if not w: continue                  # input without witness
             out += cs(len(w))                   # number of stack items
             for item in w:
                 out += cs(len(item)) + item
