@@ -16,6 +16,8 @@ typedef enum {
 } archive_prune_verdict_t;
 
 long archive_scan(long* out_entries, long* out_unique, long* out_dups);
+long archive_scan_duplicates(long* out_heights, long max_out);
+long archive_repair_duplicates(void);
 long archive_layout_monotonic(long upto);
 long archive_check(long nblocks, int level);
 long archive_first_hole(long upto);
