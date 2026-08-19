@@ -179,6 +179,26 @@ MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword
 BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
 
+; mac_run_lookup (utxo_lsm_get's disk-run-hit path) used to stage its bloom
+; read + returned script bytes in lst->scratch_buf -- fine when get() only
+; ever ran from one thread, unsafe now that cross-transaction block
+; verification calls utxo_lsm_get concurrently from multiple worker threads
+; (mac_flush, the WRITER, keeps using lst->scratch_buf unchanged below --
+; it is exclusively single-writer by this module's own architecture, and
+; get()/flush() never run concurrently with each other by construction).
+; Fixed-size (not lst->scratch_cap-dependent, since get() never touches the
+; much larger merge-sort ping/pong region that makes scratch_cap so large)
+; and per-thread, same TLS pattern as bitcoin_sighash.asm's legacy_sighash_
+; scfbuf: Initial-Exec model via ..gottpoff (this NASM build has no ..tpoff).
+%macro TLS_ADDR 2
+    mov  %1, [rel %2 wrt ..gottpoff]
+    add  %1, qword [fs:0]
+%endmacro
+section .tbss alloc noexec nowrite tls align=16
+global lsm_get_scratch
+lsm_get_scratch: resb BLOOM_MAX_BYTES + SCRIPT_MAX_BYTES
+section .text
+
 ; ---- sparse index (added after Phase 2 shipped without one -- see
 ; mac_read_run_header's header comment for the full backward-compat story) ----
 SPARSE_STRIDE    equ 256             ; sample every Nth sorted record (index 0 always sampled)
@@ -1196,10 +1216,10 @@ mac_run_lookup:
     mov  rax, [rbp+32]
     mov  [rbp-0x80], rax    ; &slen
 
-    mov  rdi, r12
-    call mac_calc_desc_cap
-    shl  rax, 7
-    mov  [rbp-0x60], rax        ; off_bloom
+    ; off_bloom is always 0 now: bloom/script live in the dedicated
+    ; lsm_get_scratch TLS buffer (see its header comment above), not in
+    ; lst->scratch_buf's ping/pong-prefixed layout mac_flush still uses.
+    mov  qword [rbp-0x60], 0    ; off_bloom
 
     lea  rdi, [rbp-0x180]
     mov  esi, r13d
@@ -1225,7 +1245,7 @@ mac_run_lookup:
     mov  rax, [rbp-0x200+16]    ; bloom_bytes
 
     mov  rdi, [rbp-0x68]
-    mov  rsi, [r12+128]
+    TLS_ADDR rsi, lsm_get_scratch
     add  rsi, [rbp-0x60]
     mov  rdx, rax
     call mac_read_exact2
@@ -1239,7 +1259,7 @@ mac_run_lookup:
     mov  eax, [rbp-0x38]
     mov  [rbp-0x100+32], eax
 
-    mov  rdx, [r12+128]
+    TLS_ADDR rdx, lsm_get_scratch
     add  rdx, [rbp-0x60]
     mov  ecx, [rbp-0x58]
     lea  rdi, [rbp-0x100]
@@ -1469,7 +1489,7 @@ mac_run_lookup:
     test r14d, r14d
     jz   .ml_push_noscript
     mov  rdi, [rbp-0x68]
-    mov  rsi, [r12+128]
+    TLS_ADDR rsi, lsm_get_scratch
     add  rsi, [rbp-0x60]
     add  rsi, BLOOM_MAX_BYTES
     mov  rdx, r14
@@ -1482,7 +1502,7 @@ mac_run_lookup:
     syscall
     ; script ptr
     mov  rcx, [rbp-0x78]
-    mov  rax, [r12+128]
+    TLS_ADDR rax, lsm_get_scratch
     add  rax, [rbp-0x60]
     add  rax, BLOOM_MAX_BYTES
     mov  [rcx], rax
