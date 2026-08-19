@@ -251,8 +251,8 @@ static int lsock(int port){
         }
     } else a.sin_addr.s_addr=htonl(INADDR_ANY);
     int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
-    if(bind(l,(struct sockaddr*)&a,sizeof a)<0){ perror("bind"); return -1; }
-    if(listen(l,8)<0){ perror("listen"); return -1; }
+    if(bind(l,(struct sockaddr*)&a,sizeof a)<0){ fprintf(stderr,"[net] bind failed: %s\n", strerror(errno)); return -1; }
+    if(listen(l,8)<0){ fprintf(stderr,"[net] listen failed: %s\n", strerror(errno)); return -1; }
     return l;
 }
 
@@ -1728,10 +1728,10 @@ static long dl_catchup(const char* dir, int min_workers){
     /* pre-size index.dat GROW-ONLY, create append.lock */
     {
         int ix=open("index.dat", O_RDWR|O_CREAT, 0644);
-        if(ix<0){ perror("open index.dat"); return 0; }
+        if(ix<0){ fprintf(stderr,"[dlc] open index.dat failed: %s\n", strerror(errno)); return 0; }
         struct stat sb; long cur=0; if(fstat(ix,&sb)==0) cur=sb.st_size;
         long need=(end_h+1)*48; if(need<cur) need=cur;
-        if(ftruncate(ix,need)){ perror("ftruncate index.dat"); close(ix); return 0; }
+        if(ftruncate(ix,need)){ fprintf(stderr,"[dlc] ftruncate index.dat failed: %s\n", strerror(errno)); close(ix); return 0; }
         close(ix);
         int lf=open("append.lock", O_RDWR|O_CREAT, 0644); if(lf>=0) close(lf);
     }
@@ -1749,7 +1749,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * for trickling at 5KB/s could immediately be handed the same IP again,
      * and with most of the pool being duds that is what kept happening. */
     volatile int* banned=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED){ perror("mmap"); return 0; }
+    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED){ fprintf(stderr,"[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
     /* MAP_ANONYMOUS zero-fills, so held_idx would default to 0 -- and a
      * worker that never managed to connect would then make the parent ban
      * live[0], a peer that may be perfectly good. Mark "holding nothing"
@@ -2519,8 +2519,8 @@ int main(int argc, char** argv){
      * launched from another directory). realpath fails only if <dir> does not
      * exist, which chdir would reject anyway. */
     char absp[4096];
-    if(!realpath(dir, absp)){ perror("realpath"); return 1; }
-    if(chdir(absp)!=0){ perror("chdir"); return 1; }
+    if(!realpath(dir, absp)){ fprintf(stderr,"[boot] realpath(%s) failed: %s\n", dir, strerror(errno)); return 1; }
+    if(chdir(absp)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", absp, strerror(errno)); return 1; }
     /* Load durable tuning BEFORE anything reads it -- and before the fork, so
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
@@ -2670,7 +2670,7 @@ int main(int argc, char** argv){
         if(build_inmem_hash_index()!=0){ printf("TESTS FAILED (hash index)\n"); return 1; }
 
         /* 2) socketpair: parent = server(serve_loop), child = test client */
-        int sv[2]; if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)!=0){ perror("socketpair"); return 1; }
+        int sv[2]; if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)!=0){ fprintf(stderr,"socketpair failed: %s\n", strerror(errno)); return 1; }
         pid=fork();
         if(pid==0){
             close(sv[0]);
@@ -2791,7 +2791,7 @@ int main(int argc, char** argv){
          * connect=, which sets listen=0. serve_mux polls `l` and nothing
          * else, and poll() ignores a negative fd (POSIX: revents is set to 0),
          * so the accept branch simply never fires. */
-        if(g_cfg.listen && l<0){ perror("lsock"); return 1; }
+        if(g_cfg.listen && l<0){ fprintf(stderr,"[boot] lsock failed: %s\n", strerror(errno)); return 1; }
         /* Core -prune. The primitive (store_prune) has existed and been
          * tested since the store was written but nothing ever called it, so
          * pruning was configurable in theory only.
@@ -2946,7 +2946,7 @@ int main(int argc, char** argv){
         int lfd = node_log_open("bitcoind.log");
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
-        if(l<0){ perror("lsock"); return 1; }
+        if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
         return serve_mux(port, peer, nwant, 1, out_port, l);
     }
     return 2;
