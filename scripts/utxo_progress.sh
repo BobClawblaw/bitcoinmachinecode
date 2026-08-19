@@ -4,19 +4,40 @@
 # NOTE: this used to watch build_utxo_seed.log, the log of a separate,
 # one-off standalone seeding tool (daemon/build_utxo) -- not what actually
 # runs day to day. The live daemon logs its own catchup progress to
-# bitcoind.production.log instead, at a WIDE interval (every 20000 heights).
-# During a slow bulk-mode stretch that can be tens of minutes between log
-# lines with nothing new on screen even though the process is actively
-# working. This script re-polls every 2s and fills that gap with LIVE
-# process stats (seconds since the last log line, CPU%, RSS) read straight
-# from /proc via ps, not from the log, so the display keeps moving even
-# between log lines.
+# bitcoind.production.log instead, at a WIDE interval (every 20000 heights),
+# so during a slow bulk-mode stretch that's tens of minutes of nothing new
+# on screen even though the process is actively working.
 #
-# NOTE ON RATE/ETA: computed from the two most recent progress lines, not an
-# average-since-start -- both block size and the live UTXO set grow over the
-# run, so a recent-interval rate is the honest basis and an average-since-
-# start rate would be badly optimistic.
+# GRANULARITY: rather than wait on that log, this reads the daemon's own
+# in-memory g_applied_height counter (daemon/utxo_live.c) directly out of
+# the worker process's memory via /proc/$PID/mem -- a plain pread at the
+# symbol's address, NOT a ptrace attach/gdb session, so it never stops the
+# daemon even momentarily. The symbol address is resolved fresh from the
+# running binary (via /proc/$PID/exe) each time this script starts, so it
+# stays correct across rebuilds without needing an edit here. Needs root
+# (reading another process's memory) -- run this with sudo if not root
+# already; falls back to the coarse log-only view if the read ever fails
+# (stripped binary, permission denied, symbol renamed, etc).
 LOG=/storage/bitcoinmachinecode/logs/bitcoind.production.log
+SYM=g_applied_height
+
+as_root(){ if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+
+# little-endian hex (from `xxd -p`, e.g. "483e030000000000") -> decimal
+le_hex_to_dec(){
+  local hex=$1 rev="" i
+  for ((i=${#hex}-2; i>=0; i-=2)); do rev+="${hex:$i:2}"; done
+  echo $((16#$rev))
+}
+
+read_live_height(){
+  local pid=$1 addr=$2 hex
+  hex=$(as_root dd if="/proc/$pid/mem" bs=1 skip="$((addr))" count=8 status=none 2>/dev/null | xxd -p 2>/dev/null)
+  [ "${#hex}" -eq 16 ] && le_hex_to_dec "$hex"
+}
+
+prev_live_h="" prev_live_t="" addr="" tip=""
+
 while true; do
   mapfile -t lines < <(grep '\[utxo_live\] catchup progress' "$LOG" | tail -2)
   pids=$(pgrep -f 'daemon/bitcoind serve')
@@ -24,44 +45,64 @@ while true; do
   if [ -z "$pids" ]; then
     printf "\n[daemon not running]\n"; exit 1
   fi
-  if [ "${#lines[@]}" -eq 0 ]; then
-    printf "\rwaiting for first progress line...  (pid(s)=%s)   " "$(tr '\n' ',' <<<"$pids")"
-    sleep 2; continue
+
+  # of the (usually 2: parent + fork worker) matching pids, the worker
+  # actually running catchup is whichever one is burning CPU right now --
+  # the parent idles in serve_mux's poll(). In steady-state serving (no
+  # fork worker) there's only one pid and it IS the one to read.
+  worker=$(ps -o pid=,pcpu= -p "$(tr '\n' ',' <<<"$pids" | sed 's/,$//')" \
+             | sort -k2 -rn | head -1 | awk '{print $1}')
+
+  if [ -z "$addr" ]; then
+    # Read symbols through the /proc/$pid/exe magic symlink DIRECTLY -- do
+    # NOT readlink -f it first. If the on-disk binary has since been
+    # rebuilt (e.g. `make` ran while this daemon kept running), the old
+    # inode is unlinked and readlink -f resolves to a "(deleted)" path
+    # that doesn't exist on disk; nm on that string then fails silently.
+    # /proc/$pid/exe itself still points at the process's real, currently
+    # -running (possibly now-deleted-on-disk) binary either way.
+    addr=$(as_root nm "/proc/$worker/exe" 2>/dev/null | awk -v s="$SYM" '$3==s{print "0x"$1}')
   fi
 
-  cur="${lines[-1]}"
-  h=$(sed -E 's/.*height=([0-9]+)\/.*/\1/' <<<"$cur")
-  end=$(sed -E 's/.*height=[0-9]+\/([0-9]+).*/\1/' <<<"$cur")
-  pct=$(sed -E 's/.*\(([0-9.]+)%\).*/\1/' <<<"$cur")
-  cur_ts=$(awk '{print $1" "$2}' <<<"$cur")
-  cur_epoch=$(date -d "$cur_ts" +%s 2>/dev/null)
-  now_epoch=$(date +%s)
-  age=$(( now_epoch - cur_epoch ))
+  live_h=""
+  [ -n "$addr" ] && live_h=$(read_live_height "$worker" "$addr")
 
-  rate_str="rate n/a (first chunk since watcher started)"
-  if [ "${#lines[@]}" -eq 2 ]; then
-    prev="${lines[0]}"
-    ph=$(sed -E 's/.*height=([0-9]+)\/.*/\1/' <<<"$prev")
-    prev_ts=$(awk '{print $1" "$2}' <<<"$prev")
-    prev_epoch=$(date -d "$prev_ts" +%s 2>/dev/null)
-    dh=$(( h - ph ))
-    dt=$(( cur_epoch - prev_epoch ))
-    if [ "$dt" -gt 0 ]; then
+  log_str="no log line yet" end=""
+  if [ "${#lines[@]}" -gt 0 ]; then
+    cur="${lines[-1]}"
+    h=$(sed -E 's/.*height=([0-9]+)\/.*/\1/' <<<"$cur")
+    end=$(sed -E 's/.*height=[0-9]+\/([0-9]+).*/\1/' <<<"$cur")
+    pct=$(sed -E 's/.*\(([0-9.]+)%\).*/\1/' <<<"$cur")
+    cur_ts=$(awk '{print $1" "$2}' <<<"$cur")
+    cur_epoch=$(date -d "$cur_ts" +%s 2>/dev/null)
+    age=$(( $(date +%s) - cur_epoch ))
+    log_str="log: h=${h}/${end} (${pct}%) last line ${age}s ago"
+    [ -z "$tip" ] && tip=$end
+  fi
+
+  live_str="live height n/a (symbol read failed -- falling back to log-only)"
+  if [ -n "$live_h" ]; then
+    now=$(date +%s)
+    if [ -n "$prev_live_h" ] && [ "$now" != "$prev_live_t" ]; then
+      dh=$((live_h - prev_live_h)); dt=$((now - prev_live_t))
       rate=$(awk "BEGIN{printf \"%.2f\", $dh/$dt}")
-      left=$(( end - h ))
-      eta=$(awk "BEGIN{ r=$dh/$dt; printf \"%.0f\", (r>0)?($left/r/60):-1 }")
-      rate_str="${rate} blk/s (last chunk) ETA~${eta}m"
+      if [ -n "$tip" ]; then
+        left=$((tip - live_h))
+        eta=$(awk "BEGIN{ r=$dh/$dt; printf \"%s\", (r>0)?sprintf(\"%.1fh\", $left/r/3600):\"n/a\" }")
+        live_str="LIVE h=${live_h} (${rate} blk/s now, ETA~${eta})"
+      else
+        live_str="LIVE h=${live_h} (${rate} blk/s now)"
+      fi
+    else
+      live_str="LIVE h=${live_h} (measuring rate...)"
     fi
+    prev_live_h=$live_h; prev_live_t=$now
   fi
 
-  # sum CPU%/RSS across every matching pid (parent + fork workers) --
-  # whichever one is doing the real work varies by phase, so report both.
   read -r pcpu rss_kb <<<"$(ps -o %cpu=,rss= -p "$(tr '\n' ',' <<<"$pids" | sed 's/,$//')" \
                              | awk '{c+=$1; r+=$2} END{print c" "r}')"
   rss_mb=$(( rss_kb / 1024 ))
-  npid=$(wc -l <<<"$pids")
 
-  printf "\r h=%s/%s (%s%%) | %s | last log line %ds ago | %s proc(s) cpu=%s%% rss=%sMB   " \
-         "$h" "$end" "$pct" "$rate_str" "$age" "$npid" "$pcpu" "$rss_mb"
+  printf "\r %s | %s | cpu=%s%% rss=%sMB   " "$live_str" "$log_str" "$pcpu" "$rss_mb"
   sleep 2
 done
