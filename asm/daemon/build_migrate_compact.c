@@ -37,6 +37,7 @@ struct lsm_state {
     void* manifest_buf; u64 manifest_cap, manifest_n;
     void* scratch_buf; u64 scratch_cap;
     u64 next_run_no;
+    void* tomb_hash_buf; u64 tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
 };
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536

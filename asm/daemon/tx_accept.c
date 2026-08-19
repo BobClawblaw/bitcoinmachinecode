@@ -38,7 +38,7 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
                          unsigned long long* value, unsigned long* height, unsigned long* is_coinbase,
                          const u8** script, unsigned long* slen);
 
-/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes) --
+/* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (168 bytes) --
  * same layout daemon/utxo_live.c and daemon/build_utxo.c mirror. */
 struct lsm_state {
     long log_fd, idx_fd;
@@ -48,6 +48,7 @@ struct lsm_state {
     void* manifest_buf; u64 manifest_cap, manifest_n;
     void* scratch_buf; u64 scratch_cap;
     u64 next_run_no;
+    void* tomb_hash_buf; u64 tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
 };
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536

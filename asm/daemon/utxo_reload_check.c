@@ -26,7 +26,7 @@ extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
 extern void utxo_lsm_close(void* lst);
 
-/* Mirror bitcoin_utxo_lsm.asm's state struct exactly (152 bytes).
+/* Mirror bitcoin_utxo_lsm.asm's state struct exactly (168 bytes).
  * Must match the sizing build_utxo used (slots_log2=18). */
 struct LST {
     long log_fd;                     /* +0   */
@@ -48,6 +48,8 @@ struct LST {
     void*              scratch_buf;  /* +128 */
     unsigned long long scratch_cap;  /* +136 */
     unsigned long long next_run_no;  /* +144 */
+    void*              tomb_hash_buf;  /* +152, LSM-owned, see bitcoin_utxo_lsm.asm */
+    unsigned long long tomb_hash_mask; /* +160, LSM-owned */
 };
 
 #define BLOOM_MAX_BYTES  (4*1024*1024)
