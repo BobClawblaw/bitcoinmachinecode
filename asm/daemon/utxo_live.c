@@ -525,12 +525,20 @@ static long utxo_live_index_tip(void){
 /* Set while the memtable is bulk-sized, until catch-up downshifts it. */
 static int g_bulk_mode = 0;
 
+/* tx_verify.c's own parallel-verify dispatch: it must not fork() workers
+ * while THIS process's memtable (and therefore its RSS) is bulk-sized and
+ * still growing, since fork()'s copy-on-write cost scales with the parent's
+ * resident size -- see txv_set_bulk_mode's own comment for the production
+ * symptom that led to this. */
+extern void txv_set_bulk_mode(int on);
+
 int utxo_live_init(const char* dir){
     /* Pick the memtable size from how far behind we actually are. */
     long boot_applied = read_applied_height();
     long boot_tip     = utxo_live_index_tip();
     long boot_gap     = (boot_tip >= 0) ? (boot_tip - boot_applied) : 0;
     g_bulk_mode = (boot_gap >= g_cfg.utxo_bulk_gap_blocks);
+    txv_set_bulk_mode(g_bulk_mode);
 
     unsigned long slots = g_bulk_mode ? (1UL << g_cfg.utxo_bulk_slots_log2)
                                       : (1UL << UTXO_LIVE_SLOTS_LOG2);
@@ -687,6 +695,7 @@ long utxo_live_catchup(void* store_buf){
         g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;
         g_utxo_lst.op_threshold   = (u64)ss * 2;
         g_bulk_mode = 0;
+        txv_set_bulk_mode(0);
         fprintf(stderr, "[utxo_live] caught up at height %ld -- downshifting to steady-state flush thresholds (fill=%llu op=%llu)\n",
                 g_applied_height, (unsigned long long)g_utxo_lst.fill_threshold,
                 (unsigned long long)g_utxo_lst.op_threshold);

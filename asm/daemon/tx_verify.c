@@ -249,13 +249,30 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
 #define TXV_PARALLEL_MIN 8
 #define TXV_MAX_WORKERS  16
 
+/* Set by utxo_live.c (via txv_set_bulk_mode) whenever its own memtable is
+ * bulk-sized -- a from-scratch or long-gap catch-up that keeps growing a
+ * multi-GB in-process UTXO structure. fork()'s copy-on-write page-table
+ * setup cost scales with the PARENT's resident size, so forking workers out
+ * of a process that is itself the thing getting bigger every block gets
+ * progressively more expensive over the course of a catch-up -- observed in
+ * production as a geometric slowdown (20k-height chunks going from ~5s to
+ * 3.5min as RSS climbed past ~1.5GB) that tracked fork() cost, not
+ * signature-verify cost (confirmed by repeated stack samples of the running
+ * process landing inside fork() every time). Steady-state serving keeps the
+ * memtable small and bounded by design (see utxo_live.c's own downshift
+ * comment), where forking stays cheap -- so only skip parallel dispatch
+ * while bulk mode is active, not permanently. */
+static int g_txv_bulk_mode = 0;
+void txv_set_bulk_mode(int on){ g_txv_bulk_mode = on; }
+
 typedef struct { u8 ok; char reason[64]; } txv_result_t;
 
 /* txv_verify_all(): verify every non-taproot input in g_txv_in[0..nin),
- * in parallel once there's enough work to be worth it. Sequential fallback
- * below TXV_PARALLEL_MIN keeps small (the common case, historically) txs
- * exactly as fast as before with zero fork overhead. Returns 1 all valid /
- * 0 at least one invalid (reason set). */
+ * in parallel once there's enough work to be worth it AND we're not inside
+ * a bulk UTXO catch-up (g_txv_bulk_mode -- see its own comment). Sequential
+ * fallback below TXV_PARALLEL_MIN keeps small (the common case,
+ * historically) txs exactly as fast as before with zero fork overhead.
+ * Returns 1 all valid / 0 at least one invalid (reason set). */
 static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long flags,
                           const char** reason){
     u64 nverify = 0;
@@ -264,7 +281,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
 
     static char rbuf[64];
 
-    if (nverify < TXV_PARALLEL_MIN){
+    if (nverify < TXV_PARALLEL_MIN || g_txv_bulk_mode){
         static u8 sv_work[1<<20];
         for (u64 i=0;i<nin;i++){
             if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
