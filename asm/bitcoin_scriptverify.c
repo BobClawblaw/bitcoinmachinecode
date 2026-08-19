@@ -147,7 +147,7 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
      * the interpreter-supplied slice, BEFORE legacy_sighash's own internal
      * OP_CODESEPARATOR strip (interp.asm:CODESEPARATOR handling already
      * bounds `sc` to [pbegincodehash, pend), matching Core's scriptCode). */
-    static uint8_t needle[600], scF[20000];
+    static __thread uint8_t needle[600], scF[20000];
     long long nlen = script_push_encode(needle, sizeof needle, sig, siglen);
     if (nlen < 0) return 0;
     long long scflen = script_find_and_delete(scF, sizeof scF, sc->p, sc->n,
@@ -190,9 +190,9 @@ static int sv_push_only(const uint8_t* s, size_t n){
 /* ------------------------------------------------------------------ driver */
 static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
                   uint64_t flags, struct sv_ctx* ctx, int* err){
-    static uint8_t alt[MAX_STACK*ELEM_SIZE];
-    static uint8_t scratch[1<<16];
-    static uint8_t scopy[20000];
+    static __thread uint8_t alt[MAX_STACK*ELEM_SIZE];
+    static __thread uint8_t scratch[1<<16];
+    static __thread uint8_t scopy[20000];
     uint64_t e = SCRIPT_ERR_OK;
     if (slen > sizeof scopy){ *err = SCRIPT_ERR_SCRIPT_SIZE; return 0; }
     memcpy(scopy, script, slen);
@@ -220,8 +220,8 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                      uint64_t flags, unsigned long nIn,
                      const unsigned char* tx, unsigned long txlen,
                      unsigned char* work, unsigned long workcap){
-    static uint8_t main_e[MAX_STACK*ELEM_SIZE];
-    static uint8_t copy_e[MAX_STACK*ELEM_SIZE];
+    static __thread uint8_t main_e[MAX_STACK*ELEM_SIZE];
+    static __thread uint8_t copy_e[MAX_STACK*ELEM_SIZE];
     sv_stack st = { main_e, 0 };
     sv_stack cp = { copy_e, 0 };
     struct sv_ctx ctx = { tx, txlen, nIn, work, workcap };
@@ -251,7 +251,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         if (!sv_push_only(scriptSig, ssl)) return SCRIPT_ERR_SIG_PUSHONLY;
         if (cp.sp == 0) return SCRIPT_ERR_INVALID_STACK_OPERATION;
 
-        static uint8_t redeem[20000];
+        static __thread uint8_t redeem[20000];
         uint32_t rl = sv_len(&cp, cp.sp-1);
         if (rl > sizeof redeem) return SCRIPT_ERR_PUSH_SIZE;
         memcpy(redeem, sv_dat(&cp, cp.sp-1), rl);
