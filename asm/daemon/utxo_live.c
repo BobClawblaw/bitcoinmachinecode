@@ -47,7 +47,8 @@ extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long ca
 
 extern long utxo_lsm_init(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
-extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, const u8* script, u32 slen);
+extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value,
+                         u64 height, u64 is_coinbase, const u8* script, u32 slen);
 extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
 extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_compact(void* lst);
@@ -67,7 +68,8 @@ extern long undo_prune_from(long from_height, long tip_height, long window, long
  * script length -- see daemon/undo_log.c's record format). */
 typedef unsigned short u16;
 typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
-                              u64 value, const u8* script, u16 slen);
+                              u64 value, u32 height, u8 is_coinbase,
+                              const u8* script, u16 slen);
 extern long undo_replay(long height, undo_replay_cb cb, void* ctx);
 
 /* Rolling undo-data retention window. Stage A's own design note calls for
@@ -204,6 +206,8 @@ static int persist_applied_height(long h){
 typedef struct {
     const u8* txid;
     long fatal;
+    int  is_coinbase;   /* Stage D: true for tx index 0 of the current block --
+                          * Bitcoin's own rule (coinbase is always the first tx) */
 } apply_ctx_t;
 
 static const u8 ZERO32[32] = {0};
@@ -231,7 +235,12 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
 
 static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u32 slen){
     apply_ctx_t* ctx = (apply_ctx_t*)ctxv;
-    long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, ctx->txid, out_index, value, script, slen);
+    /* g_apply_height is already the right value here -- live_on_input uses
+     * the same global for undo_capture_and_del above -- and g_apply_height
+     * is always >= 0 by the time apply_block_inner runs (set by its sole
+     * caller, apply_block_at). */
+    long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, ctx->txid, out_index, value,
+                          (u64)g_apply_height, (u64)ctx->is_coinbase, script, slen);
     if (r == -1 || r == 2) ctx->fatal = 1; /* -1 I/O error, 2 table full (undersized memtable) */
 }
 
@@ -261,6 +270,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         u8 txid[32];
         tx_txid(txid, p, txlen, txid_scratch, sizeof txid_scratch);
         ctx.txid = txid;
+        ctx.is_coinbase = (t == 0);
 
         u64 wnin=0, wnout=0;
         int wok = utxo_walk_tx_io(p, p+txlen, &ctx, live_on_input, live_on_output, &wnin, &wnout);
@@ -364,8 +374,8 @@ static int walk_block_txs(const u8* blockbuf, u64 blocklen, void* ctx,
 }
 
 static int undo_count_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
-                         const u8* script, u16 slen){
-    (void)txid; (void)index; (void)value; (void)script; (void)slen;
+                         u32 height, u8 is_coinbase, const u8* script, u16 slen){
+    (void)txid; (void)index; (void)value; (void)height; (void)is_coinbase; (void)script; (void)slen;
     (*(long*)ctx)++;
     return 1;
 }
@@ -390,11 +400,17 @@ int utxo_live_can_unapply(const void* blockbuf, u64 blocklen, long height){
     return 1;
 }
 
-/* ---- the actual unapply ---- */
+/* ---- the actual unapply ----
+ * height/is_coinbase (2026-08-19, Stage D): restored straight from the undo
+ * record -- the spent UTXO's OWN original creation height/coinbase-ness,
+ * captured by undo_capture_and_del at spend time (see daemon/undo_log.c's
+ * header comment). Getting this wrong would mean a reorg-restored coinbase
+ * output silently loses correct maturity data. */
 static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
-                           const u8* script, u16 slen){
+                           u32 height, u8 is_coinbase, const u8* script, u16 slen){
     int* fatal = (int*)ctx;
-    long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value, script, (u32)slen);
+    long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value,
+                          (u64)height, (u64)is_coinbase, script, (u32)slen);
     if (r == -1 || r == 2) { *fatal = 1; return 0; }
     return 1;
 }

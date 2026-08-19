@@ -24,9 +24,11 @@ extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]
 extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern int  verify_p2pkh(const unsigned char* tx, unsigned long txlen,
                          unsigned long input_index,
                          const unsigned char* prevout_script, unsigned long prevout_len,
@@ -53,8 +55,8 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen, void
         unsigned char txid[32]; memcpy(txid,p,32);
         unsigned long idx=(unsigned long)p[32]|((unsigned long)p[33]<<8)|((unsigned long)p[34]<<16)|((unsigned long)p[35]<<24);
         p+=36; unsigned long sl=rd_varint(p,&p); p+=sl+4;
-        unsigned long long val; const unsigned char* s; unsigned long ssl;
-        if(utxo_get(utxo,txid,idx,&val,&s,&ssl)!=1){printf("  [double-spend]\n");return 0;}
+        unsigned long long val; const unsigned char* s; unsigned long ssl, h_unused, cb_unused;
+        if(utxo_get(utxo,txid,idx,&val,&h_unused,&cb_unused,&s,&ssl)!=1){printf("  [double-spend]\n");return 0;}
         scripts[i]=s; total_in+=val;
     }
     for(unsigned int i=0;i<info.n_in&&i<64;i++)
@@ -96,7 +98,7 @@ int main(void){
         /* validate against a UTXO store holding all 5 */
         unsigned char ux[40+512*48+8], ublob[1<<16], work[8192];
         utxo_init(ux,512,ublob,sizeof ublob);
-        for(int i=0;i<5;i++) utxo_put(ux,u_txid[i],u_idx[i],u_val[i],scr,25);
+        for(int i=0;i<5;i++) utxo_put(ux,u_txid[i],u_idx[i],u_val[i],0,0,scr,25);
         ck("signed send tx VALID (validator)", sl>0 && validate_signed_tx(signedtx,(unsigned long)sl,ux,work,sizeof work),1);
         (void)total;
     }

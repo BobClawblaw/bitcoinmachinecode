@@ -30,9 +30,11 @@
 extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern int  verify_p2pkh(const unsigned char* tx, unsigned long txlen,
                          unsigned long input_index,
                          const unsigned char* prevout_script, unsigned long prevout_len,
@@ -95,8 +97,8 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen,
     for (unsigned int i = 0; i < info.n_in && i < 64; i++) {
         unsigned char txid[32]; unsigned long index;
         input_outpoint(tx, i, txid, &index);
-        unsigned long long val; const unsigned char* sp; unsigned long sl;
-        if (utxo_get(utxo, txid, index, &val, &sp, &sl) != 1) {
+        unsigned long long val; const unsigned char* sp; unsigned long sl, h_unused, cb_unused;
+        if (utxo_get(utxo, txid, index, &val, &h_unused, &cb_unused, &sp, &sl) != 1) {
             printf("  [double-spend] input %u absent/unspent\n", i); return 0;
         }
         scripts[i] = sp; slens[i] = sl; vals[i] = val; total_in += val;
@@ -148,9 +150,9 @@ int main(void) {
 
     /* ---- load UTXO store with our 3 UTOXs ---- */
     utxo_init(ux, 512, ublob, sizeof ublob);
-    utxo_put(ux, tA, iA, vA, scr, 25);
-    utxo_put(ux, tB, iB, vB, scr, 25);
-    utxo_put(ux, tC, iC, vC, scr, 25);
+    utxo_put(ux, tA, iA, vA, 0, 0, scr, 25);
+    utxo_put(ux, tB, iB, vB, 0, 0, scr, 25);
+    utxo_put(ux, tC, iC, vC, 0, 0, scr, 25);
 
     /* ---- case 1: multi-input send (3 inputs), pay 6 BTC, fee 10000 ---- */
     {

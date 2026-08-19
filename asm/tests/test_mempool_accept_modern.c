@@ -34,7 +34,8 @@ extern int  tx_txid(unsigned char out[32], const unsigned char* tx, unsigned lon
                     unsigned char* buf, unsigned long buflen);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
 extern int  mpool_struct_size(unsigned long slots);
 extern size_t mpool_policy_state_size(unsigned n);
@@ -54,12 +55,14 @@ extern const char* txval_modern_reason(void);
  * own externs' comments) -- this harness still wants the real, single-
  * table bitcoin_utxo.asm behavior, so just pass through unchanged. */
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script,
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script,
                      unsigned long* slen);
 long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
                      unsigned long long* value, const unsigned char** script,
                      unsigned long* slen){
-    return utxo_get(u, txid, index, value, script, slen);
+    unsigned long h_unused, cb_unused;
+    return utxo_get(u, txid, index, value, &h_unused, &cb_unused, script, slen);
 }
 
 static int g_fails = 0, g_checks = 0;
@@ -96,7 +99,7 @@ int main(void){
     /* preload all 5 spend prevouts */
     for (int i = 0; i < modern_num_spends; i++){
         const msend_t* s = &modern_spends[i];
-        utxo_put(ux, s->txid, 0, s->prev_amount, s->prev_spk, s->prev_spklen);
+        utxo_put(ux, s->txid, 0, s->prev_amount, 0, 0, s->prev_spk, s->prev_spklen);
     }
 
     printf("== full mempool acceptance of every genuine modern spend ==\n");

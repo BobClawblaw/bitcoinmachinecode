@@ -25,9 +25,11 @@
 extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_put(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long value, const unsigned char* script, unsigned long slen);
+                     unsigned long long value, unsigned long height,
+                     unsigned long is_coinbase, const unsigned char* script, unsigned long slen);
 extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
-                     unsigned long long* value, const unsigned char** script, unsigned long* slen);
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script, unsigned long* slen);
 extern int  verify_p2pkh(const unsigned char* tx, unsigned long txlen,
                          unsigned long input_index,
                          const unsigned char* prevout_script, unsigned long prevout_len,
@@ -104,8 +106,8 @@ static int validate_tx(const unsigned char* tx, unsigned long txlen,
         const unsigned char* s = tx;
         (void)input_outpoint(s, i, txid, &index);
 
-        unsigned long long val; const unsigned char* sp; unsigned long sl;
-        if (utxo_get(utxo, txid, index, &val, &sp, &sl) != 1) {
+        unsigned long long val; const unsigned char* sp; unsigned long sl, h_unused, cb_unused;
+        if (utxo_get(utxo, txid, index, &val, &h_unused, &cb_unused, &sp, &sl) != 1) {
             printf("  [double-spend] input %u (txid %02x%02x..%02x idx %lu) "
                    "absent/unspent\n",
                    i, txid[0], txid[1], txid[31], index);
@@ -186,7 +188,7 @@ static void preload_utxo(void* utxo) {
         int sn = (int)(strlen(e[i].script)) / 2;
         hex_in(t, e[i].txid);
         hex_in(sc, e[i].script);
-        utxo_put(utxo, t, e[i].idx, e[i].val, sc, sn);
+        utxo_put(utxo, t, e[i].idx, e[i].val, 0, 0, sc, sn);
     }
 }
 

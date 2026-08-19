@@ -81,7 +81,8 @@ extern long utxo_live_count(void);
 extern long utxo_live_applied_height(void);
 extern void utxo_live_close(void);
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
-                         u64* value, const u8** script, unsigned long* slen);
+                         u64* value, u64* height, u64* is_coinbase,
+                         const u8** script, unsigned long* slen);
 /* daemon/utxo_live.c exports these two globals so this harness can query the
  * very same live LSM instance the code under test just wrote to. */
 extern void* utxo_live_table(void);
@@ -118,7 +119,8 @@ extern long   mpool_policy_add(void* pol, void* st, void* mp, const u8* tx,
 long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long index,
                                     u64* value, const u8** script, unsigned long* slen){
     (void)u;
-    return utxo_lsm_get(utxo_live_lst(), utxo_live_table(), txid, (u32)index, value, script, slen);
+    u64 h_unused, cb_unused;
+    return utxo_lsm_get(utxo_live_lst(), utxo_live_table(), txid, (u32)index, value, &h_unused, &cb_unused, script, slen);
 }
 
 /* ===================== tiny test scaffolding ============================= */
@@ -275,8 +277,8 @@ static void verify_utxo_against_model(const char* label, const blk_t* losing, lo
 
     int missing = 0, badval = 0, badscript = 0;
     for (int i=0;i<model_n;i++){
-        u64 v = 0; const u8* sc = 0; unsigned long sl = 0;
-        long r = utxo_lsm_get(utxo_live_lst(), utxo_live_table(), model[i].txid, model[i].idx, &v, &sc, &sl);
+        u64 v = 0, h = 0, cb = 0; const u8* sc = 0; unsigned long sl = 0;
+        long r = utxo_lsm_get(utxo_live_lst(), utxo_live_table(), model[i].txid, model[i].idx, &v, &h, &cb, &sc, &sl);
         if (r != 1) { missing++; continue; }
         if (v != model[i].val) badval++;
         if (sl != 1 || !sc || sc[0] != 0x51) badscript++;
@@ -291,8 +293,8 @@ static void verify_utxo_against_model(const char* label, const blk_t* losing, lo
         for (long i=0;i<losing[b].ntx;i++){
             const tx_t* t = &losing[b].tx[i];
             if (model_find(t->txid, 0) >= 0) continue;   /* also on the winner */
-            u64 v; const u8* sc; unsigned long sl;
-            if (utxo_lsm_get(utxo_live_lst(), utxo_live_table(), t->txid, 0, &v, &sc, &sl) == 1) ghosts++;
+            u64 v, h, cb; const u8* sc; unsigned long sl;
+            if (utxo_lsm_get(utxo_live_lst(), utxo_live_table(), t->txid, 0, &v, &h, &cb, &sc, &sl) == 1) ghosts++;
         }
     }
     snprintf(buf,sizeof buf,"%s: no losing-branch output survives in the UTXO set", label);
