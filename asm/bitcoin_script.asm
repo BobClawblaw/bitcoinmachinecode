@@ -195,6 +195,7 @@ be_to_limbs:
 ; ============================================================================
 parse_varint:
     push  r12
+    push  r13
     cmp   rdi, rsi
     jae   .pv_fail
     movzx eax, byte [rdi]
@@ -217,18 +218,27 @@ parse_varint:
     lea   rax, [rdi+r12]
     cmp   rax, rsi
     ja    .pv_fail
-    mov   eax, 0
+    xor   eax, eax
+    xor   r13d, r13d          ; shift amount (bits) -- little-endian accumulation.
+                              ; BUG FIX (2026-08-19): see bitcoin_sighash.asm's
+                              ; own parse_varint fix -- this was an independent
+                              ; duplicate of the same big-endian-read-of-a-
+                              ; little-endian-field bug (`shl rax,8` accumulation
+                              ; over low-address-first bytes).
 .pv_b:
-    shl   rax, 8
-    movzx ecx, byte [rdi]
-    or    rax, rcx
+    movzx edx, byte [rdi]
+    mov   cl, r13b
+    shl   rdx, cl
+    or    rax, rdx
     inc   rdi
+    add   r13d, 8
     dec   r12
     jnz   .pv_b
     jmp   .pv_ret
 .pv_fail:
     xor   eax, eax
 .pv_ret:
+    pop   r13
     pop   r12
     ret
 
