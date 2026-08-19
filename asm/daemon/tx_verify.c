@@ -565,6 +565,24 @@ typedef struct {
     u32 pn_in;
 } block_tx_t;
 
+/* realloc()s *buf up to need_bytes if it isn't already that big, tracking
+ * the arena's real capacity in *cap_bytes separately from whatever the
+ * CURRENT block only needs -- never shrinks. Same "allocate once, reuse"
+ * arena pattern as daemon/utxo_live.c's own grow_arena (own copy here,
+ * matching this codebase's convention of duplicating small file-local
+ * helpers rather than sharing via a header): the original per-block
+ * malloc/free of flat/res/ranges below measured ~4M minor page faults/sec
+ * on the live daemon -- fresh allocations at bulk-mode block rates cost
+ * more than the crypto work this file exists to parallelize. */
+static void* grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
+    if (need_bytes > *cap_bytes){
+        void* p = realloc(*buf, need_bytes);
+        if (!p) return 0;
+        *buf = p; *cap_bytes = need_bytes;
+    }
+    return *buf;
+}
+
 #define TXVB_MAX_WORKERS 64
 
 typedef struct {
@@ -793,12 +811,14 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     for (u64 t=1; t<ntx; t++) total_nin += txs[t].pn_in;
     if (total_nin == 0) return 1;
 
-    txvb_in_t* flat = malloc(total_nin * sizeof(txvb_in_t));
-    txvb_result_t* res = malloc(total_nin * sizeof(txvb_result_t));
-    txvb_txrange_t* ranges = malloc(ntx * sizeof(txvb_txrange_t));
+    static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
+    static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
+    static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
+    txvb_in_t* flat = grow_arena((void**)&g_flat, &g_flat_cap, total_nin * sizeof(txvb_in_t));
+    txvb_result_t* res = grow_arena((void**)&g_res, &g_res_cap, total_nin * sizeof(txvb_result_t));
+    txvb_txrange_t* ranges = grow_arena((void**)&g_ranges, &g_ranges_cap, ntx * sizeof(txvb_txrange_t));
     if (!flat || !res || !ranges) {
         *reason = "out of memory"; *fail_tx_index = 0;
-        free(flat); free(res); free(ranges);
         return 0;
     }
 
@@ -807,7 +827,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     for (u64 t=1; t<ntx; t++){
         u64 nin_this;
         if (!txvb_parse_tx(txs[t].ptr, txs[t].len, t, flat, base, total_nin, &nin_this, reason)) {
-            *fail_tx_index = t; free(flat); free(res); free(ranges); return 0;
+            *fail_tx_index = t; return 0;
         }
         ranges[t].lo = base; ranges[t].hi = base + nin_this;
         base += nin_this;
@@ -819,7 +839,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
          * (a genuinely malformed tx would have failed txvb_parse_tx above
          * already). */
         *reason = "internal: input count parse mismatch"; *fail_tx_index = 0;
-        free(flat); free(res); free(ranges); return 0;
+        return 0;
     }
 
     /* ---- Phase 1: resolve + classify every input, sequential, block-wide
@@ -888,20 +908,28 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
      * nothing mutates UTXO state between Phase 1 and here). ---- */
     if (has_taproot) {
         static u8 ns[8<<20];
+        static u8* g_po = 0;      static u64 g_po_cap = 0;
+        static u8* g_am = 0;      static u64 g_am_cap = 0;
+        static u8* g_sp = 0;      static u64 g_sp_cap = 0;
+        static u8 (*g_spk34)[34] = 0; static u64 g_spk34_cap = 0;
+        static u8* g_is_tap = 0;  static u64 g_is_tap_cap = 0;
         for (u64 t=1; t<ntx; t++){
             u64 lo = ranges[t].lo, hi = ranges[t].hi, nin_t = hi-lo;
             int tx_has_tap = 0;
             for (u64 gi=lo; gi<hi; gi++) if (flat[gi].shape == TXV_SHAPE_P2TR) { tx_has_tap = 1; break; }
             if (!tx_has_tap) continue;
 
-            u8* po = malloc(nin_t*36);
-            u8* am = malloc(nin_t*8);
-            u8* sp = malloc(nin_t*(1+TXV_SPK_CAP));
-            u8 (*spk34)[34] = malloc(nin_t*34);
-            u8* is_tap = malloc(nin_t);
+            /* Persistent, grown-on-demand arenas -- see grow_arena's own
+             * comment above for why (same fix as flat/res/ranges). Sized
+             * per single-tx input count, not block-wide, since taproot
+             * pass 3 stays sequential/single-tx-at-a-time. */
+            u8* po = grow_arena((void**)&g_po, &g_po_cap, nin_t*36);
+            u8* am = grow_arena((void**)&g_am, &g_am_cap, nin_t*8);
+            u8* sp = grow_arena((void**)&g_sp, &g_sp_cap, nin_t*(1+TXV_SPK_CAP));
+            u8 (*spk34)[34] = grow_arena((void**)&g_spk34, &g_spk34_cap, nin_t*34);
+            u8* is_tap = grow_arena((void**)&g_is_tap, &g_is_tap_cap, nin_t);
             if (!po || !am || !sp || !spk34 || !is_tap) {
                 *reason = "out of memory"; *fail_tx_index = t;
-                free(po); free(am); free(sp); free(spk34); free(is_tap);
                 goto fail;
             }
             u64 sp_off = 0;
@@ -930,15 +958,12 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                     }
                 }
             }
-            free(po); free(am); free(sp); free(spk34); free(is_tap);
             if (tap_fail) goto fail;
         }
     }
 
-    free(flat); free(res); free(ranges);
     return 1;
 
 fail:
-    free(flat); free(res); free(ranges);
     return 0;
 }
