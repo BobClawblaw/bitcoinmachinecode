@@ -604,13 +604,16 @@ int verify_script(const unsigned char* scriptSig, unsigned long ssl,
     return ERR_OK;
 }
 
-/* Compute consensus SCRIPT_VERIFY flags for a block height, identical to Core's
- * GetBlockScriptFlags() (P2SH gated at height >= 173805; pre-BIP16 also drops
- * WITNESS/TAPROOT since Core's VerifyScript asserts WITNESS => P2SH). */
-uint64_t verify_flags_for_height(uint64_t height){
-    if (height < 173805)
-        return SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_CLTV | SCRIPT_VERIFY_CSV | SCRIPT_VERIFY_NULLDUMMY;
-    return SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT
-         | SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_CLTV | SCRIPT_VERIFY_CSV
-         | SCRIPT_VERIFY_NULLDUMMY;
-}
+/* REMOVED (2026-08-19, Stage C): a `verify_flags_for_height` used to live
+ * here, gating P2SH (and therefore WITNESS/TAPROOT) at a hardcoded height
+ * 173805 and applying DERSIG/CLTV/CSV/NULLDUMMY at every height including 0.
+ * Both are wrong relative to Core's actual GetBlockScriptFlags
+ * (src/validation.cpp): P2SH/WITNESS/TAPROOT are active from height 0
+ * UNCONDITIONALLY except for two historical blocks identified by HASH (not
+ * height), and DERSIG/CLTV/CSV/NULLDUMMY are each independently height-gated
+ * at their own real threshold (363725 / 388381 / 419328 / 481824 on
+ * mainnet), not a shared one. It was never called anywhere in this
+ * codebase. The real, source-verified implementation is
+ * `script_flags_for_block` in bitcoin_script_flags.asm, generated from
+ * Core's own chainparams.cpp by validation/gen_script_flags.py -- see
+ * PLAN_SCRIPT_VERIFY.md's Stage C. */
