@@ -257,12 +257,34 @@ parse_varint:
     lea   rax, [rdi+r12]
     cmp   rax, rsi
     ja    .pv_fail
-    mov   eax, 0
+    xor   eax, eax
+    xor   ebx, ebx            ; shift amount (bits) -- little-endian accumulation.
+                              ; BUG FIX (2026-08-19): this loop used to do
+                              ; `shl rax,8; or rax,byte; inc rdi`, which walks
+                              ; bytes low-address-first (correct for reading
+                              ; the wire's little-endian byte order) but then
+                              ; accumulates them MSB-first via the left-shift
+                              ; -- a big-endian read of a little-endian field.
+                              ; A value like 320 (wire bytes 0x40,0x01) came
+                              ; back as (0x40<<8)|0x01=16385 instead of
+                              ; (0x01<<8)|0x40=320. Found via the Stage D
+                              ; archive replay: a real 320-input mainnet tx at
+                              ; height 29663 had its own n_in corrupted this
+                              ; way, desyncing legacy_sighash's whole input
+                              ; walk and producing a wrong SignatureHash for a
+                              ; genuinely valid signature. Only ever bites a
+                              ; CompactSize field >= 253 (the point the wire
+                              ; format needs more than one byte), which is why
+                              ; Core's own 500-vector sighash.json fixture
+                              ; never tripped it -- none of those vectors
+                              ; happen to have that many inputs/outputs.
 .pv_b:
-    shl   rax, 8
-    movzx ecx, byte [rdi]
-    or    rax, rcx
+    movzx edx, byte [rdi]
+    mov   cl, bl
+    shl   rdx, cl
+    or    rax, rdx
     inc   rdi
+    add   ebx, 8
     dec   r12
     jnz   .pv_b
     jmp   .pv_ret
