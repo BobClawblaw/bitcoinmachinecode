@@ -122,12 +122,24 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
 /* Bounds. Generous vs. any known real chain data (largest known mainnet tx
  * input counts are in the low tens of thousands) and produce a clean, loud
  * rejection rather than silent truncation if ever exceeded -- matching
- * bitcoin_txval_modern.c's own PREV_SPK_BUF_MAX philosophy. TXV_SPK_CAP must
- * stay under 0xfd: the taproot aggregate below mirrors txval_modern's own
- * single-length-byte prevout-script encoding exactly (not a full CompactSize
- * varint), since that is the encoding taproot_keypath_verify's asm expects. */
+ * bitcoin_txval_modern.c's own PREV_SPK_BUF_MAX philosophy.
+ *
+ * TXV_SPK_CAP (2026-08-20, corrected): matches bitcoin_interp.asm's own
+ * MAX_SCRIPT_SIZE=10000 -- the real Bitcoin consensus cap on any script,
+ * which that interpreter already enforces and is already sized to handle.
+ * Previously 252, on the mistaken belief that it needed to stay under 0xfd
+ * to fit the taproot aggregate sighash array's single-length-byte encoding
+ * (see the "prevout script too large for taproot aggregate sighash" check
+ * below) -- that check is actually a SEPARATE, independent `>= 0xfd` literal
+ * comparison, not derived from this constant at all, so the two were never
+ * actually coupled; the low cap just meant this file rejected any real
+ * legacy prevout script over 252 bytes (e.g. a large bare multisig) with a
+ * generic "prevout script too large", regardless of whether the tx had
+ * anything to do with taproot. First hit live in production at height
+ * 243015 during a full archive replay -- 243014 blocks of real chain data
+ * had simply never carried a legacy script that large before. */
 #define TXV_MAX_INPUTS    20000
-#define TXV_SPK_CAP         252
+#define TXV_SPK_CAP       10000
 #define TXV_MAX_WIT_ITEMS    8
 
 #define TXV_SHAPE_LEGACY  0
