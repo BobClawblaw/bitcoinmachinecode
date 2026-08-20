@@ -192,6 +192,7 @@
 %define SCRIPT_ERR_DISABLED_OPCODE            17
 %define SCRIPT_ERR_VERIFY                     11
 %define SCRIPT_ERR_EQUALVERIFY                12
+%define SCRIPT_ERR_CHECKMULTISIGVERIFY        13
 %define SCRIPT_ERR_CHECKSIGVERIFY             14
 %define SCRIPT_ERR_NUMEQUALVERIFY             15
 %define SCRIPT_ERR_UNBALANCED_CONDITIONAL     20
@@ -1987,13 +1988,47 @@ script_eval:
     ; full OP_CHECKMULTISIG handled by helper which returns 1 ok or sets interp_err
     call  interp_checkmultisig
     test  rax, rax
-    jnz   .next_op
+    jnz   .cms_ok
     mov   rax, [rbp-0x70]
     mov   rax, [rax]
     test  rax, rax
     jz    .bad_opcode
     mov   rax, [rbp-0x70]
     mov   rax, [rax]
+    jmp   .err_ret0
+.cms_ok:
+    ; interp_checkmultisig always pushes its bool result (mirrors real
+    ; CHECKMULTISIG, which is not itself a VERIFY op). CHECKMULTISIGVERIFY
+    ; must then pop-and-fail-on-false, exactly like every other VERIFY
+    ; opcode (op_checksigverify above is the same pattern) -- this used to
+    ; be missing entirely: .op_checkmultisigverify was a bare alias for
+    ; .op_checkmultisig with no additional behavior, so CHECKMULTISIGVERIFY
+    ; silently degraded to plain CHECKMULTISIG and left its bool on the
+    ; stack instead of consuming it, corrupting every opcode's stack
+    ; position after it. Found via a real mainnet block (height 324663)
+    ; whose redeem script chains CHECKMULTISIGVERIFY into a second
+    ; CHECKMULTISIG -- the stray leftover bool was consumed as that second
+    ; check's first "signature", which of course never verifies.
+    mov   rax, [rbp-0x38]
+    cmp   rax, OP_CHECKMULTISIGVERIFY
+    jne   .next_op
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  stack_top_ptr
+    mov   r13, rax
+    mov   r14d, [r13]
+    add   r13, ELEM_DATA_OFF
+    mov   rdi, r14
+    mov   rsi, r13
+    call  cast_to_bool
+    test  rax, rax
+    jz    .cmsv_fail
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  stack_pop
+    jmp   .next_op
+.cmsv_fail:
+    mov   rax, SCRIPT_ERR_CHECKMULTISIGVERIFY
     jmp   .err_ret0
 
 .op_cltv:
