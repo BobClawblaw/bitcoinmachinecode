@@ -606,18 +606,33 @@ static void* grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
  * byte handed out this call gets freshly memcpy'd, nothing is ever read
  * from an unwritten pool region. */
 typedef struct { u8* buf; u64 cap; u64 used; } bytepool_t;
-static const u8* bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
+static bytepool_t g_spk_pool = {0};
+
+/* Returns the byte OFFSET src was copied to, not a pointer (~0ull on
+ * allocation failure) -- 2026-08-20, replacing an earlier pointer-returning
+ * version that was a real dangling-pointer bug: a LATER call in the same
+ * block's resolve loop can realloc() and relocate pool->buf, silently
+ * invalidating every pointer already handed out to EARLIER entries in that
+ * same loop (confirmed in production: height 184390's tx=1 legacy input
+ * resolved a correct P2PKH scriptPubKey, then failed verification against
+ * garbage bytes -- a later input's pool growth had relocated the buffer out
+ * from under it). An offset stays valid regardless of relocation; callers
+ * must resolve it to an address (pool->buf + offset) only AFTER the pool is
+ * done growing for this block, i.e. after Phase 1's resolve loop returns --
+ * exactly when every current reader (txvb_verify_one, the taproot pass)
+ * already runs. */
+static u64 bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
     if (pool->used + n > pool->cap){
         u64 newcap = pool->cap ? pool->cap : 65536;
         while (newcap < pool->used + n) newcap *= 2;
         void* p = realloc(pool->buf, newcap);
-        if (!p) return 0;
+        if (!p) return ~0ull;
         pool->buf = p; pool->cap = newcap;
     }
-    u8* dst = pool->buf + pool->used;
-    memcpy(dst, src, n);
+    u64 off = pool->used;
+    memcpy(pool->buf + off, src, n);
     pool->used += n;
-    return dst;
+    return off;
 }
 
 #define TXVB_MAX_WORKERS 64
@@ -635,20 +650,24 @@ typedef struct {
     const u8* scriptSig; u32 scriptSiglen;
     const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
     u64 value;
-    const u8* spk; u32 spklen;   /* points into g_spk_pool (see below), NOT
-                                  * an inline TXV_SPK_CAP-sized buffer -- an
-                                  * inline array here would cost every one
-                                  * of possibly thousands of entries the
-                                  * full worst-case size (10000 bytes, since
+    u64 spk_off; u32 spklen;     /* spk_off is a byte OFFSET into g_spk_pool
+                                  * (see bytepool_alloc's own comment), NOT a
+                                  * pointer -- the pool can still realloc()
+                                  * and relocate for a LATER entry in this
+                                  * same block's resolve loop, which would
+                                  * dangle a pointer captured here but leaves
+                                  * an offset valid. Resolve to an address
+                                  * (g_spk_pool.buf + spk_off) only after
+                                  * Phase 1 is done growing the pool. Packed
+                                  * (not an inline TXV_SPK_CAP-sized buffer)
+                                  * for the same reason as before: an inline
+                                  * array here would cost every one of
+                                  * possibly thousands of entries the full
+                                  * worst-case size (10000 bytes, since
                                   * TXV_SPK_CAP was raised to the real
                                   * consensus max) regardless of that
                                   * entry's actual (almost always tiny)
-                                  * script, which is exactly what made this
-                                  * persistent arena's growth phase newly
-                                  * page-fault-heavy after that cap was
-                                  * raised. A packed byte pool costs only
-                                  * the real total script bytes for the
-                                  * block, not entries*TXV_SPK_CAP. */
+                                  * script. */
     u8  shape;
 } txvb_in_t;
 
@@ -717,9 +736,14 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
  * arguments the underlying primitives need. */
 static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long long flags,
                            u8* sv_work, unsigned long sv_workcap, const char** reason){
+    /* Safe here (unlike inside Phase 1's own resolve loop): every caller of
+     * this function runs strictly after that loop has finished growing
+     * g_spk_pool for this block, so pool->buf is stable for the whole
+     * verification pass. */
+    const u8* spk = g_spk_pool.buf + in->spk_off;
     switch (in->shape){
     case TXV_SHAPE_P2WPKH:
-        if (!p2wpkh_verify(tx, (int64_t)txlen, (int64_t)in->local_idx, in->spk, (int64_t)in->spklen, in->value,
+        if (!p2wpkh_verify(tx, (int64_t)txlen, (int64_t)in->local_idx, spk, (int64_t)in->spklen, in->value,
                            in->wit[0], in->witlen[0], in->wit[1], in->witlen[1])) {
             *reason = "p2wpkh signature invalid"; return 0;
         }
@@ -745,7 +769,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
         *reason = "unsupported p2wsh witnessScript shape"; return 0;
     }
     case TXV_SHAPE_LEGACY: {
-        int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
+        int err = sv_verify_script(in->scriptSig, in->scriptSiglen, spk, in->spklen,
                                    flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
@@ -921,7 +945,9 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
     static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
     static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
-    static bytepool_t g_spk_pool = {0};
+    /* g_spk_pool is file-scope (see its own comment, near bytepool_alloc) --
+     * txvb_verify_one and the taproot pass below both need to resolve
+     * spk_off against it too, not just this function. */
     txvb_in_t* flat = grow_arena((void**)&g_flat, &g_flat_cap, total_nin * sizeof(txvb_in_t));
     txvb_result_t* res = grow_arena((void**)&g_res, &g_res_cap, total_nin * sizeof(txvb_result_t));
     txvb_txrange_t* ranges = grow_arena((void**)&g_ranges, &g_ranges_cap, ntx * sizeof(txvb_txrange_t));
@@ -969,8 +995,8 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         }
         in->value = value;
         if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; *fail_tx_index = in->tx_index; goto fail; }
-        in->spk = bytepool_alloc(&g_spk_pool, spk, spklen);
-        if (!in->spk) { *reason = "out of memory"; *fail_tx_index = in->tx_index; goto fail; }
+        in->spk_off = bytepool_alloc(&g_spk_pool, spk, spklen);
+        if (in->spk_off == ~0ull) { *reason = "out of memory"; *fail_tx_index = in->tx_index; goto fail; }
         in->spklen = (u32)spklen;
 
         if (is_p2tr(spk, (u32)spklen)) {
@@ -1051,9 +1077,10 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                 memcpy(po+k*36, in->outpoint, 36);
                 for (int b=0;b<8;b++) am[k*8+b] = (u8)(in->value>>(8*b));
                 if (in->spklen >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; *fail_tx_index = t; tap_fail = 1; break; }
+                const u8* in_spk = g_spk_pool.buf + in->spk_off;   /* safe: Phase 1 is long done growing the pool */
                 sp[sp_off++] = (u8)in->spklen;
-                memcpy(sp+sp_off, in->spk, in->spklen); sp_off += in->spklen;
-                if (in->shape == TXV_SHAPE_P2TR) { is_tap[k] = 1; memcpy(spk34[k], in->spk, 34); }
+                memcpy(sp+sp_off, in_spk, in->spklen); sp_off += in->spklen;
+                if (in->shape == TXV_SHAPE_P2TR) { is_tap[k] = 1; memcpy(spk34[k], in_spk, 34); }
                 else is_tap[k] = 0;
             }
             if (!tap_fail) {
