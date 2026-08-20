@@ -3,6 +3,9 @@
 *.so
 *.a
 
+# ---- Runtime logs / crash dumps (bmc-bitcoind.service) ----
+logs/
+
 # ---- Compiled binaries (tests + daemon) ----
 asm/tests/fakepeer_headers
 asm/tests/live_block_dl
