@@ -56,6 +56,9 @@
     extern vfexec_toggle_top
     extern vfexec_all_true
     extern vfexec_sp_reset
+    ; CHECKMULTISIG's up-front scriptCode strip (bitcoin_sighash.asm).
+    extern script_push_encode
+    extern script_find_and_delete
     ; cross-file TLS accessors (bitcoin_scriptcodec.asm) -- see that file's
     ; header note by their definitions for why these are function calls
     ; rather than direct wrt ..gottpoff references to an extern symbol.
@@ -2458,7 +2461,9 @@ interp_checkmultisig:
     push  r14
     push  r15
     push  rbx
-    sub   rsp, 32               ; locals: [rsp+24]=nKeys, [rsp+16]=nSigs, [rsp+8]=sp, [rsp+0]=remaining
+    sub   rsp, 64               ; locals: [rsp+24]=nKeys, [rsp+16]=nSigs, [rsp+8]=sp, [rsp+0]=remaining
+                                 ; [rsp+32]=cur_src ptr, [rsp+40]=cur_src len, [rsp+48]=dst buf ptr
+                                 ; (used only by the up-front scriptCode-strip loop below)
     mov   rax, [rbp-0x70]
     mov   qword [rax], 0
 
@@ -2617,6 +2622,70 @@ interp_checkmultisig:
     jmp   .collect_sigs
 .collect_sigs_done:
 
+    ; ---- 2b. Core's real CHECKMULTISIG scriptCode (bitcoin_verify.c /
+    ; Core's interpreter.cpp): EVERY signature currently on the stack (all
+    ; nSigsCount of them) is stripped from scriptCode ONCE, up front, before
+    ; any signature check runs -- not just "the signature under test in the
+    ; current loop iteration", which is what a naive per-checksig-call
+    ; FindAndDelete (correct for plain OP_CHECKSIG, which only ever has one
+    ; signature) would do. A signature's bytes can appear inside scriptCode
+    ; for reasons unrelated to being the one currently checked -- e.g. a
+    ; multisig redeem script that reuses one signature's own bytes as a
+    ; deliberately-unparseable decoy pubkey slot (a legitimate, if unusual,
+    ; historical construction) -- so stripping only the current signature
+    ; produces the WRONG scriptCode, and thus the wrong sighash, for every
+    ; OTHER signature check that doesn't happen to match its own occurrence.
+    ; Confirmed via a real mainnet block (height ~290328) whose 2-of-3
+    ; CHECKMULTISIG spend embeds sig1's bytes as one "pubkey", and was
+    ; rejected (EVAL_FALSE on sig2) until this up-front stripping was added.
+    mov   rax, [rbp-0x20]
+    mov   [rsp+32], rax          ; cur_src ptr
+    mov   rax, [rbp-0x18]
+    sub   rax, [rbp-0x20]
+    mov   [rsp+40], rax          ; cur_src len
+    xor   r13d, r13d             ; j = 0
+.cms_strip_loop:
+    mov   eax, [rsp+16]          ; nSigs
+    cmp   r13d, eax
+    jge   .cms_strip_done
+    mov   eax, r13d
+    mov   rcx, 8
+    imul  rcx, rax
+    TLS_ADDR r14, cms_sigrefs
+    add   r14, rcx
+    mov   r14, [r14]             ; sigs[j] elem ptr
+    mov   ecx, [r14]             ; siglen
+    lea   rdx, [r14+ELEM_DATA_OFF]
+    TLS_ADDR rdi, cms_needle
+    mov   rsi, 600
+    call  script_push_encode     ; rdi=dst rsi=dstcap rdx=data rcx=datalen -> rax=outlen
+    mov   r15, rax               ; needlelen
+    test  r13d, 1
+    jnz   .cms_strip_dst1
+    TLS_ADDR rdi, cms_scstrip0
+    jmp   .cms_strip_call
+.cms_strip_dst1:
+    TLS_ADDR rdi, cms_scstrip1
+.cms_strip_call:
+    mov   [rsp+48], rdi          ; save dst ptr (becomes next src)
+    mov   rsi, 10008
+    mov   rdx, [rsp+32]          ; src
+    mov   rcx, [rsp+40]          ; srclen
+    TLS_ADDR r8, cms_needle
+    mov   r9, r15                ; needlelen
+    call  script_find_and_delete ; rdi dst rsi dstcap rdx src rcx srclen r8 needle r9 needlelen -> rax outlen
+    mov   rdi, [rsp+48]
+    mov   [rsp+32], rdi
+    mov   [rsp+40], rax
+    inc   r13d
+    jmp   .cms_strip_loop
+.cms_strip_done:
+    TLS_ADDR r10, interp_slice
+    mov   rax, [rsp+32]
+    mov   [r10], rax
+    mov   rax, [rsp+40]
+    mov   [r10+8], rax
+
     ; ---- 3. Core matching loop (bitcoin_verify.c check_multisig) ----
     ;   isig->r13d, ikey->r15d, remaining->[rsp+0].
     ;   We replicate: while(remaining>0 && ikey<nkeys):
@@ -2646,14 +2715,10 @@ interp_checkmultisig:
     imul  rcx, rax
     TLS_ADDR r14, cms_keyrefs
     mov   r14, [r14+rcx]         ; vPub elem ptr
-    ; build slice (scriptCode) for the callback's sighash
-    mov   rax, [rbp-0x20]
-    TLS_ADDR r10, interp_slice
-    mov   [r10], rax
-    mov   rax, [rbp-0x18]
-    sub   rax, [rbp-0x20]
-    TLS_ADDR r10, interp_slice
-    mov   [r10+8], rax
+    ; scriptCode (interp_slice) was already built once, with ALL on-stack
+    ; signatures stripped, in the .cms_strip_loop above -- do not rebuild it
+    ; per iteration (see the comment there for why per-call stripping of
+    ; only "the current signature" is wrong for CHECKMULTISIG).
     ; call checksig_fn(ctx, sig, siglen, pub, publen, &slice)
     mov   rdi, [r12+88]
     mov   eax, [rbx]
@@ -2716,7 +2781,7 @@ interp_checkmultisig:
     call  interp_push_bool
     xor   eax, eax
     inc   eax                     ; return 1 (ok)
-    add   rsp, 32
+    add   rsp, 64
     pop   rbx
     pop   r15
     pop   r14
@@ -2741,7 +2806,7 @@ interp_checkmultisig:
     mov   qword [rax], SCRIPT_ERR_SIG_COUNT
 .err_exit:
     xor   eax, eax
-    add   rsp, 32
+    add   rsp, 64
     pop   rbx
     pop   r15
     pop   r14
@@ -2752,6 +2817,15 @@ interp_checkmultisig:
 section .tbss alloc noexec nowrite tls align=16
 global cms_keyrefs
 global cms_sigrefs
+global cms_scstrip0
+global cms_scstrip1
+global cms_needle
 cms_keyrefs: resq 20
 cms_sigrefs: resq 20
+; MAX_SCRIPT_SIZE (consensus) is 10000; +8 slack. Ping-ponged by
+; .cms_strip_loop above so each script_find_and_delete call's dst never
+; aliases its own src.
+cms_scstrip0: resb 10008
+cms_scstrip1: resb 10008
+cms_needle: resb 600
 
