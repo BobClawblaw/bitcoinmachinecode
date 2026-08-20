@@ -68,6 +68,7 @@
     extern sha256_full
     extern ripemd160
     extern sha256d
+    extern sha1_full
 
 %define ELEM_SIZE 528
 %define ELEM_DATA_OFF 4
@@ -1319,7 +1320,16 @@ script_eval:
     mov   rsi, [r12+0]
     call  stack_top_ptr
     mov   r13, rax
-    mov   rdx, [r13]
+    mov   edx, [r13]          ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load here pulls in the element's own first
+                                ; 4 DATA bytes as garbage high bits of the
+                                ; pushed "size" number -- found via a real
+                                ; mainnet block (height 251683) using
+                                ; OP_SIZE on a 20-byte element whose first 4
+                                ; data bytes were nonzero, corrupting the
+                                ; result into a bogus multi-byte CScriptNum
+                                ; that a later numeric op then rejected as
+                                ; oversized.
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  interp_push_num
@@ -1726,7 +1736,8 @@ script_eval:
     je    .cr_h160
     cmp   rax, OP_HASH256
     je    .cr_h256
-    ; SHA1 not available -> bad opcode
+    cmp   rax, OP_SHA1
+    je    .cr_sha1
     jmp   .bad_opcode
 .cr_sha:
     mov   rdi, [rbp-0x60]
@@ -1734,6 +1745,13 @@ script_eval:
     mov   rdx, r14
     call  sha256_full
     mov   r15d, 32
+    jmp   .cr_out
+.cr_sha1:
+    mov   rdi, [rbp-0x60]
+    mov   rsi, r15
+    mov   rdx, r14
+    call  sha1_full
+    mov   r15d, 20
     jmp   .cr_out
 .cr_rip:
     mov   rdi, [rbp-0x60]
