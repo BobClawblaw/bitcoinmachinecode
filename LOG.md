@@ -7,6 +7,146 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-19/20 -- Stage D wired live; two real production incidents found and fixed during the first full-archive replay
+
+### Wiring: script verification connected to block connection
+`tx_verify_block_connect`/`tx_verify_block_connect_all` (`daemon/tx_verify.c`,
+new file) now runs from `apply_block_inner` (`daemon/utxo_live.c`), ahead of
+every block's puts/dels -- exactly where Core's `ConnectBlock` runs
+`CheckInputs`, before `UpdateCoins`. Per non-coinbase input: resolve the
+confirmed prevout (in-block outpoint index first for same-block chained
+spends, `utxo_lsm_get` fallback), enforce the 100-block coinbase-maturity
+rule, classify the prevout scriptPubKey's shape, and dispatch: legacy shapes
+(P2PK/P2PKH/P2SH/bare-multisig) to `sv_verify_script`
+(`bitcoin_scriptverify.c`), P2WPKH/P2WSH/P2TR-keypath to the witness
+primitives already proven at the mempool layer
+(`bitcoin_txval_modern.c`/`bitcoin_segwit.c`/`bitcoin_taproot_sighash.c`).
+Whole-block duplicate-outpoint detection is now an EXPLICIT pre-check (a
+hash-set walk over every input before verification starts), not the
+accidental side effect the old strictly-sequential verify-then-apply loop
+produced (the second spender's `utxo_lsm_get` used to fail only because the
+first spender had already deleted the UTXO) -- a real correctness gap a
+dedicated `Plan` design-review subagent caught before any of this landed;
+see `worklog/2026-08-19.md` and `tests/test_cross_tx_verify.c` scenario B for
+the regression coverage.
+
+### Made it fast enough to actually run at chain scale
+Signature verification (ECDSA/Schnorr) is the dominant cost of block
+connection and was single-threaded at first -- a from-scratch replay
+measured ~1 of this box's 32 cores in use. Path to a usable replay, each step
+profiling-driven:
+1. Per-tx fork()-based parallel verify (matching `dl_catchup`'s existing
+   pattern) replaced with a pthread pool: fork()'s copy-on-write page-table
+   setup cost scales with the PARENT's resident size, and during a
+   from-scratch replay the parent IS the growing multi-GB UTXO memtable, so
+   every fork() got progressively more expensive over the run (confirmed via
+   production stack sampling -- every sample landed inside `fork()` itself).
+   Required making the legacy-script interpreter's scratch state genuinely
+   thread-safe first (`bitcoin_scriptverify.c`/`bitcoin_interp.asm`/
+   `bitcoin_sighash.asm`/`bitcoin_scriptcodec.asm`, real ELF TLS via
+   `.tbss`/`TLS_ADDR`, not per-call heap scratch).
+2. Redesigned from per-transaction dispatch (`tx_verify_block_connect`, only
+   fanned out when a SINGLE tx had >=8 inputs -- most transactions in this
+   era of chain history don't) to whole-BLOCK dispatch across every
+   transaction's inputs at once (`tx_verify_block_connect_all`,
+   `daemon/tx_verify.c`'s "CROSS-TRANSACTION PARALLEL VERIFICATION" design).
+3. Re-profiled and found `memset` dominating the perf trace, resolving into
+   unresolved kernel addresses -- a page-fault storm from fresh
+   `malloc`/`calloc` at high per-block call rates forcing the kernel to fault
+   in and zero brand-new pages on every touch. Fixed with the "allocate
+   once, reuse forever" pattern applied to every hot per-block scratch array
+   (`grow_arena`: realloc-if-bigger, never shrink, `utxo_live.c` and
+   `tx_verify.c` each keep their own copy per this codebase's
+   no-shared-small-helpers convention).
+4. `strace -c -f -p <daemon pid>` then found a ~840 `clone3`/sec storm,
+   matched by `mmap`/`munmap`/`mprotect` -- per-block `pthread_create`/
+   `pthread_join` faulting in and tearing down a fresh thread stack every
+   round, dwarfing the crypto work being parallelized at bulk-mode block
+   rates (an earlier isolated microbenchmark of a single `pthread_create`
+   had NOT caught this, since it never measured sustained high-frequency
+   creation). Fixed with a persistent semaphore-parked worker pool
+   (`txvb_pool_ensure`/`txvb_worker_loop`) started lazily and never torn
+   down, matching this codebase's existing convention of never gracefully
+   joining background threads at shutdown.
+
+### Real production incident #1: LSM compaction inverted its own manifest scan order
+While the fixed-up daemon replayed the real archive live
+(`bmc-bitcoind.service`), it hit a genuine consensus rejection at real
+mainnet height 184390: `REJECT h=184390 tx=1: legacy script verification
+failed`, immediately followed by a blind auto-triggered "in-place recovery"
+compaction (`daemon/main.c` calls `utxo_live_recover()` unconditionally on
+ANY `utxo_live_catchup` failure -- it cannot distinguish "manifest full" from
+"genuine consensus rejection", a still-present design pattern worth treating
+any future FATAL+recovery pair with suspicion over).
+
+Root-caused by reading `bitcoin_utxo_lsm.asm` directly, not guessing:
+`utxo_lsm_get`'s disk-run scan (`.lg_run_loop`) walks the manifest array from
+its HIGHEST index down to 0, treating highest index as newest/highest-
+priority (and `mac_flush` always appends correctly at the true array end).
+`utxo_lsm_compact` inverted this for the merged/oldest run after a partial
+compaction: it shifted surviving (newer) manifest entries down to `[0,K)`
+FIRST, then appended the merged (oldest) entry AFTER them at the highest
+index -- exactly backwards from the scan order, so a stale, already-deleted
+key could resolve as live again post-compaction. Fixed by writing the merged
+entry first at index 0, then shifting survivors starting at `dst=1` instead
+of `dst=0` (`asm/bitcoin_utxo_lsm.asm`, commit `e12dcbb`).
+
+New regression test (`tests/test_compact_manifest_order.c`) forces a
+partial compaction with a deleted key's tombstone landing in the merged
+(oldest) batch and a genuinely-live key surviving alongside it; verified via
+`git stash` that it FAILS against the pre-fix code with the exact predicted
+symptom (the deleted key resolving live again) and PASSES with the fix. UTXO
+state was cleanly dropped and rebuilt (`archive_drop_utxo_state()`, the
+block archive itself untouched) before redeploying, since the bug could have
+left latent corruption in the on-disk manifest from earlier compactions.
+
+### Real production incident #2: dangling pointer into a growable byte pool
+Redeployed on fresh state -- and hit the SAME height-184390 rejection again,
+proving incident #1, while real, was not the (sole) cause of this specific
+symptom. Root-caused via an isolated, read-only reproduction (real archive
+block files symlinked into a throwaway directory, `utxo_live_init`/
+`utxo_live_catchup` run against a fresh UTXO state there -- never touching
+the live daemon's own data) plus targeted debug instrumentation proving the
+resolved prevout scriptPubKey was CORRECT at resolve time and CORRUPTED at
+verify time for the identical input.
+
+Cause: a byte-pool bump allocator (`bytepool_t`/`bytepool_alloc`,
+`daemon/tx_verify.c`) introduced earlier the same night to fix a *different*
+regression (raising `TXV_SPK_CAP` from 252 to the real consensus max 10000
+had made the OLD flat per-entry inline-buffer design ~25x bigger per entry,
+reintroducing the page-fault-storm symptom incident #1's arena-reuse fix had
+just eliminated) returned a RAW POINTER into its own `realloc()`-backed
+buffer. A later input's allocation in the SAME block's Phase 1 resolve loop
+could trigger a `realloc()` that relocated the buffer, silently invalidating
+every pointer already handed out to EARLIER inputs in that loop -- a classic
+dangling-pointer bug, and non-deterministic across process runs (whether
+`realloc` relocates depends on that process's heap layout), which is exactly
+why it reproduced inconsistently between attempts. Fixed by storing a stable
+byte OFFSET into the pool instead of a pointer (`txvb_in_t.spk_off`),
+resolved to an address only after Phase 1 has finished growing the pool for
+that block -- an offset survives relocation; a raw pointer captured
+mid-growth does not (`daemon/tx_verify.c`, commit `4ec089c`).
+
+New regression test (`tests/test_tx_verify_bytepool_realloc.c`) mines a
+block spending ten ~9000-byte-scriptPubKey prevouts (~90KB total,
+comfortably past the pool's 65536-byte initial capacity) to force
+`bytepool_alloc`'s `realloc()` to fire mid-loop after several earlier inputs
+are already resolved; verified via `git stash` that it reproduces the exact
+production failure signature against the pre-fix code and passes cleanly
+with the fix. Full `make -k test` green on both the fix worktree and `main`
+after merge (`--ff-only`) before redeploying. UTXO state dropped and rebuilt
+again before this redeploy for an unrelated reason: the on-disk
+`utxo_applied_height.dat` marker was missing after an earlier SIGKILL during
+debugging, while substantial LSM state (undo logs past height 203000)
+remained on disk -- an inconsistent combination unsafe to resume from
+directly.
+
+**Status at end of session:** both fixes merged to `main` and pushed
+(`e12dcbb`, `4ec089c`). `bmc-bitcoind.service` redeployed on a freshly
+rebuilt UTXO state and confirmed live past height 184390 (reached height
+~200000 cleanly, no rejections) during a full from-scratch archive replay
+that continues unattended overnight.
+
 ## 2026-08-18 -- Single source of truth for node wire identity (user-agent + versioning)
 
 ### Problem: node's advertised identity was hardcoded, duplicated, and placeholder

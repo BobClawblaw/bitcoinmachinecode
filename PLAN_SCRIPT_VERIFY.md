@@ -182,6 +182,53 @@ measurement above, so it is affordable to run repeatedly. Any single
 rejection is either a bug or a genuine chain-data problem, and both need
 explaining before this ships.
 
+**IN PROGRESS (2026-08-19/20).** Wired: `tx_verify_block_connect_all`
+(`daemon/tx_verify.c`, new file) runs from `apply_block_inner`, ahead of
+every block's puts/dels, with the 100-block coinbase-maturity check and an
+explicit whole-block duplicate-outpoint pre-check (see below). Made fast
+enough to actually run a full replay: single-threaded verification measured
+~1/32 cores in use, fixed via a sequence of profiling-driven changes (ELF-TLS
+thread safety for the legacy interpreter, fork()->pthread, per-tx->
+whole-block dispatch, persistent scratch arenas, a persistent worker pool)
+— full detail in `worklog/2026-08-19.md` Session 4 and
+`worklog/2026-08-20.md` Session 1.
+
+A dedicated design-review pass (a `Plan` subagent, independent read of
+`utxo_live.c`/`tx_verify.c`/the LSM store) caught a real correctness gap in
+the initial whole-block-dispatch sketch before it landed: in-block
+double-spend detection used to be an ACCIDENTAL side effect of the old
+strictly-sequential verify-then-apply loop (the second spender's
+`utxo_lsm_get` failed only because the first spender's output was already
+deleted) — that accidental detection disappears once verification runs
+before any apply. Fixed with an explicit whole-block duplicate-outpoint
+check, required before verification starts, not an afterthought. Covered by
+`tests/test_cross_tx_verify.c` (same-block chained spend accepts;
+in-block double-spend rejects the WHOLE block, not a half-apply; a
+many-tx block with a poisoned tx buried mid-list rejects at the correct
+tx/reason under real parallel dispatch).
+
+**Two real bugs found and fixed by the live replay itself** — exactly the
+"any single rejection ... needs explaining before this ships" bar this stage
+exists to enforce. Both full root-cause writeups live in
+`worklog/2026-08-20.md` (Sessions 2 and 3) and `LOG.md`'s 2026-08-19/20
+entry; one-line summaries:
+1. `utxo_lsm_compact` (`asm/bitcoin_utxo_lsm.asm`) inverted its own
+   manifest's oldest/newest scan order after a partial compaction, letting a
+   stale deleted key resolve as live again. Fixed, `e12dcbb`.
+2. `bytepool_alloc` (`daemon/tx_verify.c`, itself introduced this same
+   session to fix an unrelated memory-bloat regression) returned a raw
+   pointer into a `realloc()`-backed buffer; a later input's allocation in
+   the same block's resolve loop could relocate the buffer and dangle every
+   pointer already handed to earlier inputs. Fixed by storing a byte offset
+   instead of a pointer, `4ec089c`.
+
+Both fixes are on `main` and pushed, each with a regression test proven (via
+`git stash`) to fail against the pre-fix code with the real production
+failure signature and pass with the fix. `bmc-bitcoind.service` is running a
+fresh from-scratch replay as of this writing (confirmed clean past height
+184390, the site of both incidents above); **not yet DONE** — the replay
+has not reached chain tip (963183) yet.
+
 ### Stage E — assumevalid, then production
 Implement `-assumevalid` for real (skip script checks at or below the named
 block, keep every structural check), and only then redeploy.
