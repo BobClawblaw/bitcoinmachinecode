@@ -73,6 +73,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <semaphore.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -754,22 +755,82 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
     }
 }
 
+/* ---- persistent worker pool (2026-08-20) ---------------------------------
+ * Originally pthread_create/pthread_join'd a FRESH set of workers on every
+ * single call (every block whose block-wide nverify crossed
+ * TXV_PARALLEL_MIN). strace on the live daemon during bulk catch-up showed
+ * why that was expensive independent of pthread_create's own per-call cost
+ * (already benchmarked cheap in isolation, see tx_verify.c's own header):
+ * ~840 clone3 calls/sec, matched almost exactly by mmap+munmap+mprotect
+ * counts -- every fresh thread needs a freshly mmap'd stack, faulted in as
+ * the new thread touches it, then munmap'd on exit. At bulk-mode block
+ * rates that dwarfed the crypto work being parallelized.
+ *
+ * Fixed the same "allocate once, reuse forever" way as every other
+ * bottleneck fixed tonight, just applied to OS threads instead of memory:
+ * a fixed-size (TXVB_MAX_WORKERS) pool of worker threads started lazily
+ * (grown, never shrunk, via txvb_pool_ensure) and parked on their own
+ * semaphore between rounds instead of exiting. The main thread posts one
+ * work descriptor + wakes each worker's semaphore, then waits on a shared
+ * "done" semaphore once per worker to know the round finished -- same
+ * fan-out/barrier shape as before, just without tearing down and
+ * recreating the OS threads themselves every time.
+ *
+ * NOT applied to the OLD single-tx txv_worker_thread/txv_verify_all above:
+ * apply_block_inner no longer calls the single-tx tx_verify_block_connect
+ * at all (only tx_verify_block_connect_all), so that path is exercised by
+ * tests only, never by the live daemon -- not on the hot path this fixes. */
 typedef struct {
+    pthread_t tid;
+    sem_t work_sem;
     txvb_in_t* flat; txvb_result_t* res; unsigned long long flags; u64 lo, hi;
-} txvb_warg_t;
+} txvb_worker_slot_t;
 
-static void* txvb_worker(void* argp){
-    txvb_warg_t* a = (txvb_warg_t*)argp;
+static txvb_worker_slot_t g_txvb_pool[TXVB_MAX_WORKERS];
+static int g_txvb_pool_size = 0;
+static sem_t g_txvb_done_sem;
+static int g_txvb_done_sem_ready = 0;
+
+/* Loops forever -- these workers live for the process's whole lifetime,
+ * same as this codebase's convention elsewhere of never gracefully
+ * joining background threads at shutdown (the daemon's SIGTERM handler
+ * calls _exit(0), which tears down every thread regardless of state). */
+static void* txvb_worker_loop(void* argp){
+    txvb_worker_slot_t* w = (txvb_worker_slot_t*)argp;
     static __thread u8 sv_work[1<<20];  /* per-THREAD -- see txv_worker_thread's
-                                         * own comment above, identical reasoning */
-    for (u64 i=a->lo;i<a->hi;i++){
-        if (a->flat[i].shape == TXV_SHAPE_P2TR) { a->res[i].ok = 1; continue; }
-        const char* r = 0;
-        int ok = txvb_verify_one(a->flat[i].tx_ptr, a->flat[i].tx_len, &a->flat[i], a->flags, sv_work, sizeof sv_work, &r);
-        a->res[i].ok = ok ? 1 : 0;
-        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(a->res[i].reason, r, n); a->res[i].reason[n]=0; }
+                                         * own comment above, identical reasoning.
+                                         * Now allocated once for this worker's
+                                         * whole process-lifetime, not once per
+                                         * dispatch round either. */
+    for (;;){
+        sem_wait(&w->work_sem);
+        for (u64 i=w->lo;i<w->hi;i++){
+            if (w->flat[i].shape == TXV_SHAPE_P2TR) { w->res[i].ok = 1; continue; }
+            const char* r = 0;
+            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, sizeof sv_work, &r);
+            w->res[i].ok = ok ? 1 : 0;
+            if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
+        }
+        sem_post(&g_txvb_done_sem);
     }
-    return 0;
+    return 0;   /* unreachable -- for(;;) above never exits, see this
+                 * function's own header comment */
+}
+
+/* Starts new persistent workers if the pool doesn't already have `need` of
+ * them -- never shuts any down once started. Returns the number of workers
+ * actually available (may be less than `need` if pthread_create ever
+ * fails, matching txvb_verify_all's existing "finish inline" fallback
+ * story for whatever didn't get a thread). */
+static int txvb_pool_ensure(int need){
+    if (!g_txvb_done_sem_ready) { sem_init(&g_txvb_done_sem, 0, 0); g_txvb_done_sem_ready = 1; }
+    while (g_txvb_pool_size < need){
+        txvb_worker_slot_t* w = &g_txvb_pool[g_txvb_pool_size];
+        sem_init(&w->work_sem, 0, 0);
+        if (pthread_create(&w->tid, 0, txvb_worker_loop, w) != 0) break;
+        g_txvb_pool_size++;
+    }
+    return g_txvb_pool_size;
 }
 
 /* txvb_verify_all: verify every non-taproot input across the WHOLE block's
@@ -808,23 +869,20 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
     if (nworkers > TXVB_MAX_WORKERS) nworkers = TXVB_MAX_WORKERS;
     if (nworkers < 1) nworkers = 1;
 
+    int pool_avail = txvb_pool_ensure(nworkers);
+    int nspawn = nworkers < pool_avail ? nworkers : pool_avail;
     u64 per = (total + (u64)nworkers - 1) / (u64)nworkers;
-    pthread_t tids[TXVB_MAX_WORKERS];
-    txvb_warg_t args[TXVB_MAX_WORKERS];
     int spawned = 0;
-    for (int w=0; w<nworkers; w++){
+    for (int w=0; w<nspawn; w++){
         u64 lo = (u64)w*per, hi = lo+per; if (hi>total) hi=total;
         if (lo >= hi) break;
-        args[spawned].flat=flat; args[spawned].res=res; args[spawned].flags=flags;
-        args[spawned].lo=lo; args[spawned].hi=hi;
-        if (pthread_create(&tids[spawned], 0, txvb_worker, &args[spawned]) != 0){
-            /* same fallback story as txv_verify_all: whatever didn't get a
-             * thread stays at its zeroed res[] slot, picked up below. */
-            break;
-        }
+        txvb_worker_slot_t* slot = &g_txvb_pool[w];
+        slot->flat=flat; slot->res=res; slot->flags=flags;
+        slot->lo=lo; slot->hi=hi;
+        sem_post(&slot->work_sem);
         spawned++;
     }
-    for (int w=0; w<spawned; w++) pthread_join(tids[w], 0);
+    for (int w=0; w<spawned; w++) sem_wait(&g_txvb_done_sem);
 
     /* plain static, not __thread -- runs only after every worker has
      * already joined above (sequential), same as txv_verify_all's own
