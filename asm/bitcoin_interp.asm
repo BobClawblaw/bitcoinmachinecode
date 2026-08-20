@@ -809,6 +809,16 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; stack_push's data-pointer arg must point
+                                ; PAST the length field elem_move just wrote
+                                ; -- this was pointing at the record's BASE
+                                ; (the length field itself), so stack_push
+                                ; copied the length field's own bytes as if
+                                ; they were data. Real production incident
+                                ; 2026-08-20 (height 269613): OP_TUCK hit
+                                ; this same bug at all three of its pushes,
+                                ; corrupting a genuinely-valid spend's
+                                ; OP_WITHIN check into a false rejection.
     call  stack_push
     test  rax, rax
     jnz   .next_op
@@ -841,6 +851,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     test  rax, rax
     jnz   .next_op
@@ -1001,6 +1013,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
@@ -1010,6 +1024,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     jmp   .next_op
 
@@ -1219,6 +1235,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     jmp   .next_op
 .pkdup:
@@ -1322,6 +1340,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
@@ -1331,6 +1351,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
@@ -1340,6 +1362,8 @@ script_eval:
                                 ; load pulls in 4 garbage DATA bytes as high
                                 ; bits of the length passed to stack_push --
                                 ; same bug class as OP_SIZE's fix above
+    add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
+                                ; wrote, not at it -- see op_toalt's comment
     call  stack_push
     jmp   .next_op
 

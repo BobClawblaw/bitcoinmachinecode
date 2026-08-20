@@ -178,6 +178,41 @@ static const struct vec VECS[] = {
    "1 1 16 WITHIN VERIFY -- true case (1<=1<16), exact real-incident params"},
   {"60" "51" "60" "a5" "91" "69", 1,
    "16 1 16 WITHIN NOT VERIFY -- false case (1<=16<16 is false, half-open)"},
+  /* OP_TOALTSTACK/OP_FROMALTSTACK/OP_TUCK/OP_ROLL/OP_2ROT (2026-08-20, real
+   * mainnet height 269613): all five copy an element into a thread-local
+   * scratch buffer via elem_move (which writes a real {len,data} record --
+   * a 4-byte length field FOLLOWED by the data), then hand that same base
+   * address straight to stack_push as the DATA pointer -- never skipping
+   * the length field elem_move just wrote. stack_push then copies LENGTH
+   * bytes starting AT the length field itself: for a short element, the
+   * "data" it pushes is actually the low byte(s) of its own length; for a
+   * longer one, the first 4 bytes of "data" are the length field and the
+   * real data is truncated by 4 bytes at the end. Every earlier test for
+   * these five opcodes only checked "doesn't crash / doesn't error" (see
+   * tests/test_stack_push_len.c and the plain {"5176",...}-style vectors
+   * above) -- none of them decoded the round-tripped VALUE, so this exact
+   * bug survived two earlier fixes to these same opcodes tonight. These
+   * vectors push a recognizable multi-byte value through each opcode and
+   * verify the ACTUAL bytes via EQUALVERIFY (not plain EQUAL -- this
+   * harness's run loop only asserts on script_eval's error status, never
+   * the final stack's truthiness, so a bare EQUAL leaving a false-but-
+   * unconsumed boolean would silently pass either way; EQUALVERIFY turns
+   * a mismatch into a real execution error, which is what run_vec's
+   * r==1/r==0 check actually catches -- confirmed by first writing these
+   * with plain EQUAL and finding they did NOT catch the pre-fix bug for
+   * exactly this reason, only the already-EQUALVERIFY-based 2ROT vector
+   * did), each followed by a trailing OP_1 push so a correct script still
+   * ends on an unambiguous truthy top. */
+  {"04aabbccdd" "6b" "6c" "04aabbccdd" "88" "51", 1,
+   "push AABBCCDD TOALTSTACK FROMALTSTACK, verify round-tripped value"},
+  {"04aabbccdd" "0411223344" "7d" "75" "75" "0411223344" "88" "51", 1,
+   "TUCK: push A B, tuck, drop drop, verify the TUCKED COPY of B"},
+  {"04aabbccdd" "0411223344" "7d" "75" "04aabbccdd" "88" "51", 1,
+   "TUCK: push A B, tuck, drop, verify the MIDDLE (A) survived"},
+  {"04aabbccdd" "0411223344" "51" "7a" "04aabbccdd" "88" "51", 1,
+   "ROLL: push X Y, roll index 1 (X) to top, verify X survived intact"},
+  {"0111" "0122" "0133" "0144" "0155" "0166" "71" "0122" "88" "0111" "88" "51", 1,
+   "2ROT: push 6 bytes, 2ROT, verify both rotated-to-top values (x2,x1)"},
 };
 #define N_VECS (sizeof(VECS)/sizeof(VECS[0]))
 
