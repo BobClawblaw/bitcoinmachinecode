@@ -805,7 +805,10 @@ script_eval:
     lea   rdi, [r12+24]
     mov   rsi, [r12+16]
     mov   rdx, [rbp-0x60]
-    mov   rcx, [rdx]
+    mov   ecx, [rdx]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     test  rax, rax
     jnz   .next_op
@@ -834,7 +837,10 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0x60]
-    mov   rcx, [rdx]
+    mov   ecx, [rdx]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     test  rax, rax
     jnz   .next_op
@@ -991,13 +997,19 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0x90]
     mov   rax, [rbp-0x90]
-    mov   rcx, [rax]
+    mov   ecx, [rax]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0x98]
     mov   rax, [rbp-0x98]
-    mov   rcx, [rax]
+    mov   ecx, [rax]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     jmp   .next_op
 
@@ -1180,26 +1192,37 @@ script_eval:
     cmp   rax, OP_ROLL
     jne   .pkdup
     ; roll: copy idx, erase idx, push
-    mov   rdi, [r12+8]
+    lea   rdi, [r12+8]          ; &sp -- was `mov` (loading the sp VALUE, not
+                                 ; its address) at all 4 sites in this ROLL/
+                                 ; PICK handler; stack_erase_index/stack_push/
+                                 ; stack_dup_index below all write through
+                                 ; this as a real pointer, so a garbage small
+                                 ; integer here is an immediate SIGSEGV --
+                                 ; found via the stack_push length-register
+                                 ; regression test crashing even after that
+                                 ; fix, real production incident 2026-08-20
     mov   rsi, [r12+0]
     mov   rdx, r14
     call  stack_elem_ptr
     mov   rdi, [rbp-0x90]
     mov   rsi, rax
     call  elem_move
-    mov   rdi, [r12+8]
+    lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, r14
     call  stack_erase_index
-    mov   rdi, [r12+8]
+    lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0x90]
     mov   rax, [rbp-0x90]
-    mov   rcx, [rax]
+    mov   ecx, [rax]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     jmp   .next_op
 .pkdup:
-    mov   rdi, [r12+8]
+    lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, r14
     call  stack_dup_index
@@ -1295,19 +1318,28 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA0]
     mov   rax, [rbp-0xA0]
-    mov   rcx, [rax]
+    mov   ecx, [rax]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA8]
     mov   rax, [rbp-0xA8]
-    mov   rcx, [rax]
+    mov   ecx, [rax]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA0]
     mov   rax, [rbp-0xA0]
-    mov   rcx, [rax]
+    mov   ecx, [rax]           ; len is a uint32 (ELEM_LEN_OFF); a 64-bit
+                                ; load pulls in 4 garbage DATA bytes as high
+                                ; bits of the length passed to stack_push --
+                                ; same bug class as OP_SIZE's fix above
     call  stack_push
     jmp   .next_op
 
