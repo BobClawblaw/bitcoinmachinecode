@@ -595,6 +595,30 @@ static void* grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
     return *buf;
 }
 
+/* Packed byte-pool bump allocator, reused across blocks like grow_arena
+ * above but bump-reset instead of grown-per-entry -- backs txvb_in_t's
+ * spk pointer (see its own comment). Cost is proportional to the block's
+ * REAL total prevout-script bytes, not entries*TXV_SPK_CAP. Grows (never
+ * shrinks) only when a block's total need exceeds current capacity;
+ * *used resets to 0 at the start of every tx_verify_block_connect_all
+ * call, so a reused-but-dirty pool from an earlier block is safe -- every
+ * byte handed out this call gets freshly memcpy'd, nothing is ever read
+ * from an unwritten pool region. */
+typedef struct { u8* buf; u64 cap; u64 used; } bytepool_t;
+static const u8* bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
+    if (pool->used + n > pool->cap){
+        u64 newcap = pool->cap ? pool->cap : 65536;
+        while (newcap < pool->used + n) newcap *= 2;
+        void* p = realloc(pool->buf, newcap);
+        if (!p) return 0;
+        pool->buf = p; pool->cap = newcap;
+    }
+    u8* dst = pool->buf + pool->used;
+    memcpy(dst, src, n);
+    pool->used += n;
+    return dst;
+}
+
 #define TXVB_MAX_WORKERS 64
 
 typedef struct {
@@ -610,7 +634,20 @@ typedef struct {
     const u8* scriptSig; u32 scriptSiglen;
     const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
     u64 value;
-    u8  spk[TXV_SPK_CAP]; u32 spklen;
+    const u8* spk; u32 spklen;   /* points into g_spk_pool (see below), NOT
+                                  * an inline TXV_SPK_CAP-sized buffer -- an
+                                  * inline array here would cost every one
+                                  * of possibly thousands of entries the
+                                  * full worst-case size (10000 bytes, since
+                                  * TXV_SPK_CAP was raised to the real
+                                  * consensus max) regardless of that
+                                  * entry's actual (almost always tiny)
+                                  * script, which is exactly what made this
+                                  * persistent arena's growth phase newly
+                                  * page-fault-heavy after that cap was
+                                  * raised. A packed byte pool costs only
+                                  * the real total script bytes for the
+                                  * block, not entries*TXV_SPK_CAP. */
     u8  shape;
 } txvb_in_t;
 
@@ -826,6 +863,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
     static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
     static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
+    static bytepool_t g_spk_pool = {0};
     txvb_in_t* flat = grow_arena((void**)&g_flat, &g_flat_cap, total_nin * sizeof(txvb_in_t));
     txvb_result_t* res = grow_arena((void**)&g_res, &g_res_cap, total_nin * sizeof(txvb_result_t));
     txvb_txrange_t* ranges = grow_arena((void**)&g_ranges, &g_ranges_cap, ntx * sizeof(txvb_txrange_t));
@@ -833,6 +871,8 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         *reason = "out of memory"; *fail_tx_index = 0;
         return 0;
     }
+    g_spk_pool.used = 0;   /* bump-reset: safe, every byte handed out below
+                            * this call is freshly memcpy'd before any read */
 
     /* ---- Phase 0/parse: expand every tx's inputs into the flat array. ---- */
     u64 base = 0;
@@ -871,7 +911,9 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         }
         in->value = value;
         if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; *fail_tx_index = in->tx_index; goto fail; }
-        memcpy(in->spk, spk, spklen); in->spklen = (u32)spklen;
+        in->spk = bytepool_alloc(&g_spk_pool, spk, spklen);
+        if (!in->spk) { *reason = "out of memory"; *fail_tx_index = in->tx_index; goto fail; }
+        in->spklen = (u32)spklen;
 
         if (is_p2tr(spk, (u32)spklen)) {
             has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
