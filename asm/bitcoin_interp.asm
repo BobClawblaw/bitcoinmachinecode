@@ -2481,7 +2481,14 @@ interp_checkmultisig:
     mov   rax, [r12+8]
     mov   [rsp+8], rax           ; sp value (cached)
 
-    ; ---- 1. nKeys = CScriptNum(stacktop(1)), validate 1..20 ----
+    ; ---- 1. nKeys = CScriptNum(stacktop(1)), validate 0..20. Core's real
+    ; check is `nKeysCount < 0 || nKeysCount > MAX_PUBKEYS_PER_MULTISIG`
+    ; (interpreter.cpp) -- nKeys=0 (a degenerate 0-of-0 multisig, real
+    ; historical mainnet usage e.g. as a P2SH redeem script that's a bare
+    ; OP_CHECKMULTISIG run against three empty stack items) is explicitly
+    ; VALID, not rejected. This used to reject anything below 1, which is
+    ; wrong -- only a genuinely negative CScriptNum should fail here, same
+    ; as the nSigs check just below already does correctly. ----
     mov   r15, [rsp+8]
     sub   r15, 1                 ; idx_from_bottom = sp - 1
     mov   rdi, r12
@@ -2497,8 +2504,8 @@ interp_checkmultisig:
     mov   rdx, 4
     call  scriptnum_decode
     mov   r15d, eax              ; nKeys
-    cmp   r15d, 1
-    jl    .err_pubcount
+    test  eax, eax
+    js    .err_pubcount
     cmp   r15d, 20
     jg    .err_pubcount
     mov   [rsp+24], r15d         ; locals: nKeys
