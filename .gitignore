@@ -242,6 +242,7 @@ asm/tests/diff_add_ct_homog
 asm/tests/test_nop1_regression
 asm/tests/test_checkmultisig_findanddelete
 asm/tests/test_checkmultisig_zero_keys
+asm/tests/test_checkmultisigverify_pop
 asm/tests/test_apply_block_rollback
 asm/tests/test_scriptverify_thread_stress
 asm/tests/test_cross_tx_verify
