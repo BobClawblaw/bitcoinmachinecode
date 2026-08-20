@@ -1701,26 +1701,36 @@ script_eval:
     mov   rsi, r15
     mov   rdx, 4
     call  scriptnum_decode
-    mov   r15, rax          ; val
+    mov   r15, rax          ; val -- must survive the two scriptnum_decode
+                             ; calls below; they used to clobber it via a
+                             ; `lea r15, [r13+ELEM_DATA_OFF]` scratch step
+                             ; that was never restored, so the final
+                             ; min<=val<max check compared min/max against a
+                             ; leftover heap POINTER instead of val -- real
+                             ; production incident 2026-08-20 (height
+                             ; 256960): a genuinely-valid 1<=1<16 spend was
+                             ; wrongly rejected. Fixed by computing the
+                             ; pointer straight into rsi (its only use)
+                             ; instead of staging it through r15.
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_second_ptr
     mov   r13, rax
     mov   r14d, [r13]
-    lea   r15, [r13+ELEM_DATA_OFF]
+    lea   rsi, [r13+ELEM_DATA_OFF]
     mov   rdi, r14
-    mov   rsi, r15
     mov   rdx, 4
     call  scriptnum_decode
-    mov   r14, rax          ; min
+    mov   r14, rax          ; min -- must also survive the max lookup below;
+                             ; loading max's length straight into edi (not
+                             ; via r14) so this doesn't clobber it the same
+                             ; way val was clobbered above.
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_top_ptr
     mov   r13, rax
-    mov   r14d, [r13]
-    lea   r15, [r13+ELEM_DATA_OFF]
-    mov   rdi, r14
-    mov   rsi, r15
+    lea   rsi, [r13+ELEM_DATA_OFF]
+    mov   edi, [r13]
     mov   rdx, 4
     call  scriptnum_decode
     mov   rbx, rax          ; max

@@ -165,8 +165,19 @@ static const struct vec VECS[] = {
   {"6a", 0, "OP_RETURN -> fail"},
   /* depth */
   {"525174", 1, "1 2 DEPTH -> 1 2 2"},
-  /* within */
-  {"53515f51a5", 1, "x= ? ... "},   /* placeholder */
+  /* OP_WITHIN (2026-08-20, real mainnet height 256960): decoded "val" was
+   * staged in r15, but the min/max lookups right after it reused r15 as
+   * scratch for their own data pointers WITHOUT restoring it -- so the
+   * final min<=val<max check compared min/max against a leftover heap
+   * POINTER instead of val (a similar clobber hit "min" in r14 one step
+   * later too). The OLD placeholder vector below never caught this because
+   * it only asserted "doesn't error", never the actual boolean result --
+   * these do, via VERIFY/NOT+VERIFY, which fail loudly on a wrong result. */
+  {"53515f51a5", 1, "x= ? ... "},   /* placeholder, kept as-is (exec-only) */
+  {"51" "51" "60" "a5" "69", 1,
+   "1 1 16 WITHIN VERIFY -- true case (1<=1<16), exact real-incident params"},
+  {"60" "51" "60" "a5" "91" "69", 1,
+   "16 1 16 WITHIN NOT VERIFY -- false case (1<=16<16 is false, half-open)"},
 };
 #define N_VECS (sizeof(VECS)/sizeof(VECS[0]))
 
