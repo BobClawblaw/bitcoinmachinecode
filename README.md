@@ -115,12 +115,13 @@ assembly.
   check. Parallelized across every input in the block (a persistent worker
   pool, not per-block thread spawns) to make a full-archive replay
   affordable. **In progress**: `bmc-bitcoind.service` is running a
-  from-scratch replay of the real chain against this path; two real bugs
-  it surfaced along the way (an LSM compaction manifest-ordering bug, and a
-  dangling-pointer bug in a per-block script byte pool) were root-caused
-  and fixed, each with a regression test proven against the pre-fix code —
-  see `worklog/2026-08-20.md` and `PLAN_SCRIPT_VERIFY.md`'s Stage D section
-  for the full account. Not yet reached chain tip.
+  from-scratch replay of the real chain against this path; three real bugs
+  it surfaced along the way (an LSM compaction manifest-ordering bug, a
+  dangling-pointer bug in a per-block script byte pool, and an interpreter
+  `OP_SIZE` register-width bug alongside a wholly-missing `OP_SHA1`) were
+  root-caused and fixed, each with a regression test proven against the
+  pre-fix code — see `worklog/2026-08-20.md` and `PLAN_SCRIPT_VERIFY.md`'s
+  Stage D section for the full account. Not yet reached chain tip.
 
 All assembly is authored by AI; C/Python harnesses exist only to prove the
 machine code is correct against trusted references. Real-mainnet validation

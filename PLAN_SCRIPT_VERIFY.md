@@ -207,11 +207,10 @@ in-block double-spend rejects the WHOLE block, not a half-apply; a
 many-tx block with a poisoned tx buried mid-list rejects at the correct
 tx/reason under real parallel dispatch).
 
-**Two real bugs found and fixed by the live replay itself** — exactly the
+**Three real bugs found and fixed by the live replay itself** — exactly the
 "any single rejection ... needs explaining before this ships" bar this stage
-exists to enforce. Both full root-cause writeups live in
-`worklog/2026-08-20.md` (Sessions 2 and 3) and `LOG.md`'s 2026-08-19/20
-entry; one-line summaries:
+exists to enforce. Full root-cause writeups live in `worklog/2026-08-20.md`
+(Sessions 2-4) and `LOG.md`'s 2026-08-19/20 entry; one-line summaries:
 1. `utxo_lsm_compact` (`asm/bitcoin_utxo_lsm.asm`) inverted its own
    manifest's oldest/newest scan order after a partial compaction, letting a
    stale deleted key resolve as live again. Fixed, `e12dcbb`.
@@ -221,13 +220,20 @@ entry; one-line summaries:
    the same block's resolve loop could relocate the buffer and dangle every
    pointer already handed to earlier inputs. Fixed by storing a byte offset
    instead of a pointer, `4ec089c`.
+3. (Found autonomously overnight, per standing authorization to fix and
+   redeploy without asking.) `OP_SIZE` (`bitcoin_interp.asm`) used a 64-bit
+   load to read a `uint32` length field, pulling in 4 bytes of the
+   element's own data as garbage; and `OP_SHA1` was entirely unimplemented
+   — a real opcode this codebase had simply never built. Fixed by
+   correcting the load width and implementing SHA-1 from scratch
+   (`asm/sha1.asm`, FIPS-180-4-verified), `8caa5ac`.
 
-Both fixes are on `main` and pushed, each with a regression test proven (via
-`git stash`) to fail against the pre-fix code with the real production
+All three fixes are on `main` and pushed, each with a regression test proven
+(via `git stash`) to fail against the pre-fix code with the real production
 failure signature and pass with the fix. `bmc-bitcoind.service` is running a
-fresh from-scratch replay as of this writing (confirmed clean past height
-184390, the site of both incidents above); **not yet DONE** — the replay
-has not reached chain tip (963183) yet.
+fresh from-scratch replay as of this writing (confirmed clean past both
+height 184390 and height 251683, the sites of the incidents above); **not
+yet DONE** — the replay has not reached chain tip (963183) yet.
 
 ### Stage E — assumevalid, then production
 Implement `-assumevalid` for real (skip script checks at or below the named

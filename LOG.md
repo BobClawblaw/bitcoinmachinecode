@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-19/20 -- Stage D wired live; two real production incidents found and fixed during the first full-archive replay
+## 2026-08-19/20 -- Stage D wired live; three real production incidents found and fixed during the first full-archive replay
 
 ### Wiring: script verification connected to block connection
 `tx_verify_block_connect`/`tx_verify_block_connect_all` (`daemon/tx_verify.c`,
@@ -141,11 +141,63 @@ debugging, while substantial LSM state (undo logs past height 203000)
 remained on disk -- an inconsistent combination unsafe to resume from
 directly.
 
-**Status at end of session:** both fixes merged to `main` and pushed
-(`e12dcbb`, `4ec089c`). `bmc-bitcoind.service` redeployed on a freshly
-rebuilt UTXO state and confirmed live past height 184390 (reached height
-~200000 cleanly, no rejections) during a full from-scratch archive replay
-that continues unattended overnight.
+### Real production incident #3 (autonomous, overnight): OP_SIZE register-width bug + OP_SHA1 entirely unimplemented
+User went to bed with standing authorization to fix and redeploy autonomously
+overnight, reindexing from scratch if needed. The redeployed daemon hit a
+new, DETERMINISTIC rejection (unlike incident #2, this one repeated
+identically on every retry) at real mainnet height 251683:
+`REJECT h=251683 tx=9: legacy script verification failed`.
+
+Root-caused via the same isolated read-only reproduction technique as
+incident #2, but pivoted to a much faster iteration loop once the exact
+failing scriptSig/scriptPubKey bytes were known: a standalone
+`sv_verify_script` harness taking raw hex bytes directly (no archive replay
+needed at all -- sub-second per attempt instead of minutes), then a
+scriptPubKey-prefix binary search, then a stack-dump harness calling
+`script_eval` directly and inspecting the raw stack after each partial run.
+
+The failing script (`827651a0698faaa9a8a7a687`) decodes to `OP_SIZE OP_DUP
+OP_1 OP_GREATERTHAN OP_VERIFY OP_NEGATE OP_HASH256 OP_HASH160 OP_SHA256
+OP_SHA1 OP_RIPEMD160 OP_EQUAL` -- a real, well-known "hash puzzle" style
+scriptPubKey whose spending condition is fully computable from public
+information (not a signature check), legitimately spendable by anyone.
+
+Two independent bugs, both in `bitcoin_interp.asm`:
+1. `OP_SIZE` read the top stack element's length via `mov rdx, [r13]` -- a
+   64-bit load -- but that field is a `uint32` immediately followed by the
+   element's own data bytes, pulling in 4 bytes of DATA as garbage high
+   bits of the pushed "size" number. Confirmed via grep this was the ONE
+   exception among ~20 similar length-field reads elsewhere in the file
+   (all correctly use a 32-bit register). The existing OP_SIZE test vector
+   never caught it because it never decoded the pushed size back as a
+   number, and its specific data happened to have all-zero padding that
+   hid the corruption. Fixed: `mov edx, [r13]`.
+2. `OP_SHA1` was entirely unimplemented (`; SHA1 not available -> bad
+   opcode`) -- a real, always-defined Script opcode, never built. No SHA-1
+   existed anywhere in this codebase. Implemented from scratch
+   (`asm/sha1.asm`, scalar-only/correctness-first, mirroring `sha256.asm`'s
+   structure), verified against FIPS 180-4 vectors plus padding-boundary
+   cases against independent Python `hashlib` references (11/11), and
+   wired into `.op_crypto`'s dispatch.
+
+New `tests/test_interp.c` vectors (a targeted OP_SIZE case that actually
+decodes the pushed value, canonical SHA1("abc"), and the exact real
+height-251683 transaction bytes run end to end) verified via `git stash` to
+fail against the pre-fix code with the real production signature and pass
+with the fix. Full `make -k test` green (87/87) on both the fix worktree and
+`main` after merge (`--ff-only`); pushed (`8caa5ac`).
+
+Found the on-disk UTXO state in the same inconsistent shape as incident #2's
+redeploy (`utxo_applied_height.dat` missing, undo logs present up to exactly
+one height below the failure) -- dropped and rebuilt fresh, redeployed
+WITHOUT asking first this time, squarely covered by the standing autonomous
+authorization (incidents #1/#2 each got an explicit user confirmation while
+the user was awake; this one happened after they had gone to bed).
+
+**Status at end of session:** all three fixes merged to `main` and pushed
+(`e12dcbb`, `4ec089c`, `8caa5ac`). `bmc-bitcoind.service` redeployed on a
+freshly rebuilt UTXO state, confirmed past both height 184390 and height
+251683, replaying toward chain tip 963183 unattended. Monitoring continues.
 
 ## 2026-08-18 -- Single source of truth for node wire identity (user-agent + versioning)
 
