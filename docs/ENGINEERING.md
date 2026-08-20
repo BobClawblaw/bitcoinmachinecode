@@ -483,6 +483,20 @@ generators.
   (prevout presence + per-input ECDSA/Schnorr verify + fee) and signed via the
   verified asm crypto; modern outputs (P2WPKH/P2WSH/P2TR) run through the
   witness-v0 / taproot sighash + interpreter pipeline.
+- **Block-connection script verification (in progress, 2026-08-19/20):**
+  `apply_block_inner` (`daemon/utxo_live.c`) calls
+  `tx_verify_block_connect_all` (`daemon/tx_verify.c`) ahead of every block's
+  UTXO puts/dels — matching Core's `CheckInputs`-before-`UpdateCoins`
+  ordering. Per non-coinbase input: resolve the confirmed prevout (an
+  in-block outpoint index first, for same-block chained spends, then the
+  live UTXO LSM), enforce the 100-block coinbase-maturity rule, classify the
+  prevout scriptPubKey's shape, and dispatch to `sv_verify_script` (legacy)
+  or the witness primitives (P2WPKH/P2WSH/P2TR-keypath) — plus an explicit
+  whole-block duplicate-outpoint pre-check. Verification is parallelized
+  across every input in the block via a persistent worker pool. Being
+  proven by a full from-scratch replay of the real archive; see
+  `PLAN_SCRIPT_VERIFY.md` Stage D and `worklog/2026-08-20.md` for status and
+  the two real bugs the replay has found and fixed so far.
 
 ### 5.3 Durability & crash-safety design
 

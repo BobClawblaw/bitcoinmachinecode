@@ -134,7 +134,42 @@ had been committed a minute earlier.
 
 ---
 
-## 5. Working on this machine
+## 5. A pointer into a growable buffer dies at the next growth
+
+**Never hand out (or store) a raw pointer into a buffer that can still be
+`realloc()`'d later in the same pass. Hand out a stable offset/index and
+resolve it to an address only once the buffer is done growing.**
+
+A per-block byte-pool bump allocator (`bytepool_alloc`, `daemon/tx_verify.c`)
+returned a raw pointer into its own `realloc()`-backed buffer, and callers
+stored that pointer directly. A LATER input's allocation in the same block's
+resolve loop could trigger a `realloc()` that relocated the buffer, silently
+dangling every pointer already handed to EARLIER inputs in that same loop —
+this reached real production (a "legacy script verification failed"
+rejection on real mainnet block data) before being root-caused. It was
+non-deterministic across process runs, because whether `realloc()` relocates
+depends on that process's own heap layout — which is exactly why an
+isolated reproduction of the same code sometimes passed and sometimes
+didn't, and is a strong tell for this class of bug when you see it.
+
+**In practice**
+
+- Any allocator whose backing store can grow mid-pass (bump allocators,
+  arenas, dynamic arrays) must return something relocation-proof — an
+  offset or index — not a pointer, unless the caller can prove the buffer
+  is fully sized (no further growth possible) before the pointer is used.
+- If a pointer-returning version is kept for convenience, document — at the
+  allocator, not just at each call site — exactly when it's safe: only
+  after the LAST call into that allocator for the current pass has
+  returned.
+- A regression test for this shape must force the relocation to actually
+  happen (allocate enough total bytes to cross the initial capacity, not
+  just call the allocator a couple of times) and then check an
+  EARLY-allocated entry's data, not just the last one.
+
+---
+
+## 6. Working on this machine
 
 See the repo README for the full topology. The traps that recur:
 

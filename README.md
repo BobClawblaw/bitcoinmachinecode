@@ -106,6 +106,21 @@ assembly.
   RTX 5090 (CPU wins below ~100). Building the kernels needs nvcc + CUDA GPU; the
   dispatcher itself links and runs with zero CUDA installed (falls back to CPU).
   Not yet wired into bitcoind/bitcoin_cli — see WORKING.md for the roadmap.
+- **Per-input script verification, wired into block connection**
+  (`daemon/tx_verify.c`) — `tx_verify_block_connect_all` runs every
+  non-coinbase input's script check (legacy via `sv_verify_script`, P2WPKH/
+  P2WSH/P2TR-keypath via the existing witness primitives) from
+  `apply_block_inner`, ahead of that block's UTXO puts/dels, plus the
+  100-block coinbase-maturity rule and a whole-block duplicate-outpoint
+  check. Parallelized across every input in the block (a persistent worker
+  pool, not per-block thread spawns) to make a full-archive replay
+  affordable. **In progress**: `bmc-bitcoind.service` is running a
+  from-scratch replay of the real chain against this path; two real bugs
+  it surfaced along the way (an LSM compaction manifest-ordering bug, and a
+  dangling-pointer bug in a per-block script byte pool) were root-caused
+  and fixed, each with a regression test proven against the pre-fix code —
+  see `worklog/2026-08-20.md` and `PLAN_SCRIPT_VERIFY.md`'s Stage D section
+  for the full account. Not yet reached chain tip.
 
 All assembly is authored by AI; C/Python harnesses exist only to prove the
 machine code is correct against trusted references. Real-mainnet validation
