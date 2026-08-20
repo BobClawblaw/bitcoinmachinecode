@@ -724,17 +724,17 @@ tests/test_verify_p2sh: tests/test_verify_p2sh.c $(VERIFYOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_verify_p2sh.c $(VERIFYOBJS)
 
 # Full script interpreter harnesses (bitcoin_interp.asm + codec + hashing).
-tests/smoke_interp: tests/smoke_interp.c $(INTERPOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/smoke_interp.c $(INTERPOBJS)
-tests/test_interp: tests/test_interp.c $(INTERPOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_interp.c $(INTERPOBJS)
+tests/smoke_interp: tests/smoke_interp.c $(INTERPOBJS) bitcoin_sighash.o
+	$(CC) -no-pie -O0 -o $@ tests/smoke_interp.c $(INTERPOBJS) bitcoin_sighash.o
+tests/test_interp: tests/test_interp.c $(INTERPOBJS) bitcoin_sighash.o
+	$(CC) -no-pie -O0 -o $@ tests/test_interp.c $(INTERPOBJS) bitcoin_sighash.o
 # test_stack_push_len -- regression test for the stack_push length-register
 # crash (2026-08-20, real production incident): five opcodes (TOALTSTACK,
 # FROMALTSTACK, 2ROT, ROLL, TUCK) read a scratch element's length via a
 # 64-bit load, corrupting stack_push's byte count. Each case runs in a
 # forked child since the pre-fix bug SIGSEGVs, not just returns an error.
-tests/test_stack_push_len: tests/test_stack_push_len.c $(INTERPOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/test_stack_push_len.c $(INTERPOBJS)
+tests/test_stack_push_len: tests/test_stack_push_len.c $(INTERPOBJS) bitcoin_sighash.o
+	$(CC) -no-pie -O0 -o $@ tests/test_stack_push_len.c $(INTERPOBJS) bitcoin_sighash.o
 # test_scriptverify_parity -- the asm-driven VerifyScript must agree with the
 # C reference, verdict AND ScriptError code, on the genuine P2SH vectors.
 # Those vectors are already differentially validated against Core, so
@@ -754,6 +754,13 @@ tests/test_scriptverify_thread_stress: tests/test_scriptverify_thread_stress.c b
 tests/test_nop1_regression: tests/test_nop1_regression.c bitcoin_scriptverify.c script_error_codes.h $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_script_flags.o
 	$(CC) -no-pie -O0 -I. -I tests -o $@ tests/test_nop1_regression.c bitcoin_scriptverify.c $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_script_flags.o
 
+# real-mainnet CHECKMULTISIG scriptCode regression (height ~290328/290329):
+# a signature's own bytes reused as a decoy pubkey slot must be stripped
+# from scriptCode for EVERY signature check in the multisig, not just while
+# checking that one signature.
+tests/test_checkmultisig_findanddelete: tests/test_checkmultisig_findanddelete.c bitcoin_scriptverify.c script_error_codes.h $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_script_flags.o
+	$(CC) -no-pie -O0 -I. -I tests -o $@ tests/test_checkmultisig_findanddelete.c bitcoin_scriptverify.c $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o bitcoin_script_flags.o
+
 # Stage B end-to-end: genuine SIGHASH_NONE/SINGLE/ANYONECANPAY spends through
 # the real interpreter (sv_verify_script), each with a tamper of a field the
 # hashtype ignores (must still accept) and one it binds (must reject).
@@ -762,12 +769,12 @@ tests/test_hashtype_e2e: tests/test_hashtype_e2e.c tests/hashtype_vec.h bitcoin_
 
 # -I. so the test picks up the GENERATED script_error_codes.h instead of
 # carrying its own copy of the interpreter's error numbering.
-tests/test_tapscript_interp: tests/test_tapscript_interp.c script_error_codes.h $(INTERPOBJS)
-	$(CC) -no-pie -O0 -I. -o $@ tests/test_tapscript_interp.c $(INTERPOBJS)
+tests/test_tapscript_interp: tests/test_tapscript_interp.c script_error_codes.h $(INTERPOBJS) bitcoin_sighash.o
+	$(CC) -no-pie -O0 -I. -o $@ tests/test_tapscript_interp.c $(INTERPOBJS) bitcoin_sighash.o
 tests/test_interp_legacy_spend: tests/test_interp_legacy_spend.c wallet_core.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script.o sha1.o $(WALLETPRIMS)
 	$(CC) -no-pie -O0 -o $@ tests/test_interp_legacy_spend.c wallet_core.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script.o sha1.o $(WALLETPRIMS)
-tests/run_batch: tests/run_batch.c $(INTERPOBJS)
-	$(CC) -no-pie -O0 -o $@ tests/run_batch.c $(INTERPOBJS)
+tests/run_batch: tests/run_batch.c $(INTERPOBJS) bitcoin_sighash.o
+	$(CC) -no-pie -O0 -o $@ tests/run_batch.c $(INTERPOBJS) bitcoin_sighash.o
 
 # Consensus differential shim (consensus_diff.py): exposes cons_verify /
 # block_hash / pow_check / diff_target / tx_parse / tx_txid over stdin so a
@@ -814,6 +821,7 @@ tests/test_taproot: tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
 # point/fe/scalar/pubkey). Vectors are Core-validated (bip-0341 wallet-test-vectors).
 TAPSIGHASHOBJS := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproot.o bech32.o \
     bitcoin_interp.o bitcoin_scriptcodec.o ripemd160.o bitcoin_hash.o sha1.o \
+    bitcoin_sighash.o \
     $(TAPRIMSOBJS)
 tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h tests/taproot_vec.h $(TAPSIGHASHOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
@@ -966,13 +974,14 @@ tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
 test: tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 \
-tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len \
+tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len \
 	./tests/test_node_config
 	./tests/test_archive_check
 	./tests/test_archive_repair
 	./tests/test_scriptverify_parity
 	./tests/test_scriptverify_thread_stress
 	./tests/test_nop1_regression
+	./tests/test_checkmultisig_findanddelete
 	./tests/test_sha256
 	./tests/test_sha512
 	./tests/test_hmac
