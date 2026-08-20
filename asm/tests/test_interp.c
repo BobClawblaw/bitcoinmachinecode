@@ -115,12 +115,39 @@ static const struct vec VECS[] = {
   /* size */
   {"5182", 1, "1 SIZE -> 1 1"},
   {"010282", 1, "01 02 SIZE -> 01 02 01 (top=1)"},
+  /* SIZE regression (2026-08-20, real mainnet height 251683): op_size used
+   * to `mov rdx, [r13]` (a 64-bit load) to read the top element's length,
+   * which is only a uint32 field immediately followed by that element's own
+   * data bytes -- pulling in 4 bytes of DATA as garbage high bits of the
+   * pushed "size" number. {"5182",...} above never caught this because it
+   * never decodes the pushed size back as a number; this one does, via a
+   * numeric consumer (GREATERTHAN) right after SIZE, on a 4-byte element
+   * with deliberately nonzero data bytes (the old {"5182",...} vector's
+   * pushed value happened to have all-zero trailing padding, silently
+   * hiding the exact same bug). Under the bug this errors (SCRIPTNUM
+   * overflow decoding the corrupted, oversized garbage value); under the
+   * fix, SIZE correctly pushes 4, and 4 > 1 is true. */
+  {"04aabbccdd8251a0", 1, "push 4 nonzero-byte elem, SIZE 1 GREATERTHAN -> true"},
   /* hash */
   {"00a8", 1, "OP_0 SHA256 -> 32-byte hash (top nonzero)"},
   {"0151a8", 1, "1 SHA256 -> 32 bytes"},
   {"51a9", 1, "1 HASH160 -> 20 bytes"},
   {"51aa", 1, "1 HASH256 -> 32 bytes"},
   {"51a6", 1, "1 RIPEMD160 -> 20 bytes"},
+  /* OP_SHA1 (2026-08-20, real mainnet height 251683): was entirely
+   * unimplemented ("SHA1 not available -> bad opcode") -- a real, always-
+   * defined Script opcode, not a policy-gated one. First vector proves
+   * correctness against the canonical SHA1("abc") test vector (FIPS 180-4);
+   * second is the EXACT real historical scriptSig+scriptPubKey bytes from
+   * mainnet height 251683 tx=9 (the puzzle script whose replay found both
+   * this and the SIZE bug above), run as one combined script exactly as
+   * sv_verify_script would -- proves the whole interpreter path end to end
+   * against the real incident, not just the primitive in isolation. */
+  {"03616263a714a9993e364706816aba3e25717850c26c9cd0d89d87", 1,
+   "SHA1(\"abc\") EQUAL known digest -> true"},
+  {"1416cfb9bc7654ef1d7723e5c2722fc0c3d505045e"
+   "827651a0698faaa9a8a7a687", 1,
+   "real height-251683 tx=9 scriptSig+scriptPubKey -> accept"},
   /* disabled */
   {"517e", 0, "CAT disabled"},
   {"5183", 0, "INVERT disabled"},
