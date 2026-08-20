@@ -3057,11 +3057,38 @@ utxo_lsm_compact:
     mov  eax, 3
     syscall
 
-    ; ---- shift surviving (newer) manifest entries down, append the merged
-    ;      entry after them so the array stays strictly gen-ascending ----
+    ; ---- write the merged (OLDEST surviving generation) entry FIRST, at
+    ;      index 0, then shift the surviving (newer, un-merged) entries
+    ;      down to start right after it -- the array must stay strictly
+    ;      gen-ascending (lowest index = oldest) because utxo_lsm_get's own
+    ;      scan (.lg_run_loop) walks it from its HIGHEST index down to 0,
+    ;      treating the highest index as "newest, check first."
+    ;
+    ;      BUG (2026-08-20, found root-causing a real production incident:
+    ;      a genuinely-live, later-legitimately-spent UTXO resolved to its
+    ;      stale pre-spend value after a partial compaction, causing a
+    ;      real historical block's signature check to fail against wrong
+    ;      data): this used to shift survivors down to indices [0,K) FIRST
+    ;      and append the merged entry AFTER them at index K -- the
+    ;      HIGHEST index, which get()'s scan treats as newest. Any
+    ;      compaction that doesn't merge every existing run (batch_size <
+    ;      manifest_n, i.e. manifest_n was already > COMPACT_MAX_RUNS) put
+    ;      the OLDEST generation's data at the FRONT of get()'s scan order
+    ;      and the genuinely-newest surviving runs -- including whichever
+    ;      one held the correct, up-to-date tombstone or value for a given
+    ;      key -- BEHIND it. No existing test caught this because every
+    ;      test's manifest_n stays under COMPACT_MAX_RUNS(64), so every
+    ;      test compaction merges everything, leaving zero survivors and
+    ;      thus no ordering to get wrong. ----
+    mov  rdi, [r12+104]                    ; manifest_buf
+    mov  rax, [rbp-0x68]                    ; out_gen
+    mov  [rdi], rax
+    mov  rax, [rbp-0x60]                     ; out_run_no
+    mov  [rdi+8], rax
+
     mov  rax, [r12+120]                   ; manifest_n
     mov  [rbp-0x78], r14                    ; src index, starts at batch_size
-    mov  qword [rbp-0x90], 0                  ; dst index, starts at 0
+    mov  qword [rbp-0x90], 1                  ; dst index, starts at 1 (0 is the merged entry, just written above)
 .cc_shift_loop:
     mov  rdx, [rbp-0x78]
     cmp  rdx, rax
@@ -3082,15 +3109,6 @@ utxo_lsm_compact:
     inc  qword [rbp-0x90]
     jmp  .cc_shift_loop
 .cc_shift_done:
-    mov  rdi, [r12+104]
-    mov  rcx, [rbp-0x90]
-    shl  rcx, 4
-    add  rdi, rcx
-    mov  rax, [rbp-0x68]                       ; out_gen
-    mov  [rdi], rax
-    mov  rax, [rbp-0x60]                        ; out_run_no
-    mov  [rdi+8], rax
-    inc  qword [rbp-0x90]
     mov  rax, [rbp-0x90]
     mov  [r12+120], rax                           ; manifest_n = new count
     inc  qword [r12+96]                             ; next_gen++

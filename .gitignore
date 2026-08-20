@@ -240,6 +240,7 @@ asm/tests/test_nop1_regression
 asm/tests/test_apply_block_rollback
 asm/tests/test_scriptverify_thread_stress
 asm/tests/test_cross_tx_verify
+asm/tests/test_compact_manifest_order
 asm/tests/test_undo_log
 asm/tests/test_utxo_checkpoint
 asm/tests/test_utxo_lsm
