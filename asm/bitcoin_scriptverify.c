@@ -168,14 +168,24 @@ static int sv_is_p2sh(const uint8_t* spk, size_t spl){
     return spl==23 && spk[0]==0xa9 && spk[1]==0x14 && spk[22]==0x87;
 }
 
-/* OP_1NEGATE(0x4f) and OP_1..OP_16(0x51..0x60) count as pushes, per Core. */
+/* OP_1NEGATE(0x4f) and OP_1..OP_16(0x51..0x60) count as pushes, per Core.
+ * Direct-push opcodes are 0x01..0x4b INCLUSIVE (a single 0x4b byte pushes
+ * 75 data bytes, the maximum representable by a one-byte length) -- `op <
+ * 0x4b` excluded 0x4b itself, so a push of EXACTLY 75 bytes fell through to
+ * the OP_PUSHDATA4 branch and read four bytes of the push's own DATA as a
+ * length, desyncing the whole walk (typically landing on a byte that isn't
+ * a valid opcode at all, or a wildly wrong "length" past the end of the
+ * script) and wrongly rejecting an otherwise valid push-only scriptSig.
+ * Found via a real mainnet transaction (height 349617) whose scriptSig
+ * embeds ASCII text via a chain of pushes, one of which is exactly 75
+ * bytes long. */
 static int sv_push_only(const uint8_t* s, size_t n){
     size_t i=0;
     while (i<n){
         uint8_t op = s[i];
         if (op==0x4f || (op>=0x51 && op<=0x60)){ i++; continue; }
         if (op <= 0x4e){
-            if (op < 0x4b) i += 1u+op;
+            if (op <= 0x4b) i += 1u+op;
             else if (op==0x4b+1){ if (i+2>n) return 0; i += 2u + s[i+1]; }
             else if (op==0x4b+2){ if (i+3>n) return 0; i += 3u + (size_t)(s[i+1] | (s[i+2]<<8)); }
             else { if (i+5>n) return 0;
