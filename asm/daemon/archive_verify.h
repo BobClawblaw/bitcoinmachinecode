@@ -19,6 +19,7 @@ long archive_scan(long* out_entries, long* out_unique, long* out_dups);
 long archive_scan_duplicates(long* out_heights, long max_out);
 long archive_repair_duplicates(void);
 long archive_layout_monotonic(long upto);
+int  archive_truncate_safe(void* st, long target_height, int* out_used_index_only);
 long archive_check(long nblocks, int level);
 long archive_first_hole(long upto);
 long archive_prune_height_for_budget(long long budget_bytes);

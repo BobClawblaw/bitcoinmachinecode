@@ -57,6 +57,7 @@
 extern long store_reload(void* st);
 extern int  store_get_at(void* st, uint64_t height, uint64_t out_meta[3]);
 extern long store_truncate_to(void* st, long target_height);
+extern int  archive_truncate_safe(void* st, long target_height, int* out_used_index_only);
 extern void store_rd_close(void* st);   /* bitcoin_store_fast.asm read-fd cache */
 extern int  store_validates_prevhash(void* st, const unsigned char header[80]);
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);
@@ -609,15 +610,31 @@ long reorg_execute(void* st, long fork_height, long nblocks,
             return -1;
         }
     }
-    hdr_fd_close();   /* the blk files are about to be truncated/unlinked */
+    hdr_fd_close();   /* the blk files may be about to be truncated/unlinked */
 
     /* Rewind all three tips together -- block store, chainwork, applied UTXO
      * height. Any one of them left ahead of the others is the state that
-     * actually corrupts (see this file's header comment). */
-    if (store_truncate_to(st, fork_height) != 1){
-        fprintf(stderr, "[reorg] FATAL: store_truncate_to(%ld) failed\n", fork_height);
+     * actually corrupts (see this file's header comment).
+     *
+     * archive_truncate_safe, not a bare store_truncate_to: on an archive
+     * that isn't laid out in height order below fork_height (the parallel
+     * chunked downloader can produce this -- see PLAN_SCRIPT_VERIFY.md's
+     * "Related known issues"), a bare store_truncate_to safely refuses
+     * (see store_layout_monotonic's header comment for why it must refuse
+     * rather than guess) and this reorg would FATAL out here, leaving a
+     * won reorg it cannot actually complete. archive_truncate_safe instead
+     * falls back to the always-safe, index-only store_truncate_index_only
+     * in that case -- disconnected heights' block bytes go unreclaimed on
+     * disk rather than the reorg failing outright. */
+    int used_index_only = 0;
+    if (archive_truncate_safe(st, fork_height, &used_index_only) != 1){
+        fprintf(stderr, "[reorg] FATAL: archive_truncate_safe(%ld) failed\n", fork_height);
         if (locked) flock(lfd, LOCK_UN);
         return -1;
+    }
+    if (used_index_only){
+        fprintf(stderr, "[reorg] NOTE: archive below height %ld is not laid out in height order -- used the\n", fork_height);
+        fprintf(stderr, "[reorg]   index-only truncate fallback; disconnected block bytes remain on disk, unreclaimed.\n");
     }
     if (store_chainwork_truncate(st, fork_height) != 1){
         fprintf(stderr, "[reorg] FATAL: store_chainwork_truncate(%ld) failed\n", fork_height);
