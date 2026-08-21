@@ -168,21 +168,81 @@ collapsed them to 1.
   a scale-only bug before.
 - *Timing:* wait for tip.
 
-### 4.2 Batch modular inversion (Montgomery's trick)
+### 4.2 Inversions on the verify path — scoped 2026-08-21
 
-- *What:* `ecdsa_verify` computes `w = s⁻¹ mod n` via `sc_inv`, a Fermat
-  exponentiation costing ~255 `sc_mul` calls. Across a block's N verifies,
-  Montgomery's trick computes all N inverses with one inversion plus ~3N
-  multiplies. The verify pool already batches a whole block's inputs
-  (`tx_verify.c`, `txvb_verify_all`), so the batch boundary exists.
-- *Evidence:* `sc_mul`'s labels ≈ 38 % of bitcoind time while
-  `sc_inv.inv_loop` is only 0.2 % self — i.e. the cost is entirely in the
-  multiplies `sc_inv` *drives*, which is exactly what batching removes.
-- *Impact:* **potentially large**, not yet scoped in depth — flagged as a
-  real candidate, not a number.
-- *Risk / effort:* unknown; consensus-critical scalar-field code, needs its
-  own scoping pass.
-- *Timing:* wait for tip.
+Measured with callgrind on a single fixture verify (scratch harness linking
+the repo's `.o` files; verify ≈ 2.72 M instructions). There are exactly
+two inversions per `ecdsa_verify` (`grep 'call fe_inv\|call sc_inv'`:
+`secp256k1_ecdsa.asm:138` and `:204`, nothing else on the path):
+
+| callee | calls / verify | cost | share of verify |
+|---|---|---|---|
+| `sc_inv` (`:138`, Fermat `s^(n−2)`) | 1 → **450 `sc_mul`** (255 sq + 195 mul, `secp256k1_scalar.asm:450`) | 1.22 M Ir | **45 %** |
+| `fe_inv` (`:204`, Jacobian→affine x) | 1 → **503 `fe_mul`** (255 sq + 248 mul, `secp256k1_fe.asm:700`) | 0.15 M Ir | 5.4 % |
+| point arithmetic (`point_double` 253×, `point_add` 58×, `point_add_mixed` 73×) | ≈ 3,750 `fe_mul` + 4,700 `fe_add/sub` | 1.29 M Ir | ≈ 47 % |
+| everything else | 2 `sc_mul`, 2 `fe_mul`, parsing | — | ≈ 2 % |
+
+Two facts the live profile could not show: **`sc_mul` costs ≈ 9.4× a
+`fe_mul` per call** (2,719 vs 290 Ir — the fold-based mod-n reduction), so
+450 of them cost as much as all ~4,250 field multiplies; and the point
+formulas are already standard (dbl 2M+5S, add 11M+5S, madd 7M+4S) — the
+remaining point cost is op *count* (no GLV/wNAF), not formula choice. At
+120.9 µs/verify: `sc_inv` ≈ 54 µs, point arithmetic ≈ 57 µs, `fe_inv`
+≈ 6.5 µs.
+
+**What Core does** (`ecdsa_impl.h:195` `secp256k1_ecdsa_sig_verify`):
+`secp256k1_scalar_inverse_var` — a variable-time safegcd inverse, neither
+Fermat nor batched — then ecmult, then **no field inversion at all**:
+`secp256k1_gej_eq_x_var` (`:257`) checks `r·Z² == X`; if that fails and
+`r < p − n` (`secp256k1_ecdsa_const_p_minus_order`, `:261`) it retries with
+`r + n` (`:266`). Valid because `2n > p`. Core never batches ECDSA
+inversions.
+
+**Why batching is the wrong first move.** Legacy-script inputs — the whole
+current replay range and nearly all pre-2017 history — reach
+`ecdsa_verify` from *inside* the interpreter (`script_eval` →
+`checksig_fn` → `sv_checksig`, `bitcoin_scriptverify.c:217`),
+synchronously, because `OP_CHECKSIG`'s result can steer script control
+flow. Batching there needs a deferred-verify restructure; only the
+witness-v0 direct calls (`bitcoin_segwit.c:375/:388/:448`) and the worker
+slices in `txvb_verify_all` (`tx_verify.c:891-909`) offer a clean batch
+point. So the levers, in order:
+
+**A — inversion-free x-compare (drop `fe_inv`).** Replace
+`ecdsa.asm:196-244` with Core's projective test; Z² is already computed at
+`:200`. Pure algebra, identical verdict on every input. −5.4 % ≈ −6.5 µs.
+*Small* (~40–60 asm lines). The `r + n` branch fires with probability
+≈ 2⁻¹²⁷ for a real signature, so it must be tested at function level with
+a constructed `(X, Z)` where `X = (r+n)·Z²`, plus the `r ≥ p − n` negative.
+
+**B — variable-time scalar inverse (the real prize).** `sc_inv_var`:
+binary extended GCD over 256-bit limbs (~10–15 k Ir, ≈ 4–6 µs) or
+libsecp's safegcd (~1–2 µs, harder, ~600 lines). Dispatch it at
+`ecdsa.asm:138` only; keep Fermat `sc_inv` for secret-scalar paths. Within
+policy: `secp256k1_point_ct.asm`'s header and `ENGINEERING_RULES.md`
+confine constant-time to secret scalars, and `s` is public. `ecdsa_in_range`
+(`:126-135`) already rejects `s = 0` / `s ≥ n` before `:138` — keep that
+ordering. −45 % ≈ −50 µs → **~70 µs/verify (1.7×)**; with A, ~63 µs —
+**gap to libsecp256k1 5.5× → ~2.9×**. Also makes `sc_mul`'s per-call cost
+irrelevant to verify (2 calls left). *Medium* (~200–300 asm lines);
+exactness provable by differential test vs Fermat over ≥ 10⁶ random `a`
+plus `1, 2^k, n−1, n−2^k`, and `a·inv(a) ≡ 1`.
+
+**B′ — Montgomery batching, after B, witness-v0 only.** Per worker slice:
+range-check every `s` first (one zero poisons the prefix-product chain),
+one `sc_inv_var` + 3(k−1) `sc_mul`. After B this saves ≤ 5 %; not worth
+the `txvb_verify_one` restructure until a post-B profile says otherwise.
+
+**A′ — Schnorr.** `secp256k1_schnorr.asm:302/:313` do two `fe_inv` per
+verify; the same projective trick applies. Taproot-era only
+(> 709,632) — flagged, not scoped.
+
+*Effort* (calibrated: CLTV/CSV ≈ 310 lines/session, taproot script-path
+≈ 933 lines/long session): A ≈ ⅓ session, B ≈ 1 session incl. harness,
+B′ ≈ 1 session deferred. *Timing:* all change `ecdsa_verify`'s instruction
+stream — branch now, merge after the replay reaches tip, and require the
+second full-chain replay to match the first's accept/reject decisions
+before deploy.
 
 ### 4.3 GLV endomorphism split — **revised down**
 
@@ -232,7 +292,11 @@ between secp256k1 field/scalar arithmetic (≈ 53 %) and UTXO LSM read I/O
 The measured 5.5× crypto gap (§1) means the two fronts are closer in size
 than the cycle split alone suggests: if the crypto side reached
 libsecp256k1 speed, its 53 % would shrink to roughly 10 % of today's
-cycles, leaving LSM I/O as the dominant cost by a wide margin. Order of
-attack once the replay reaches tip is unchanged — **4.1 → scope 4.2 →
-4.3** — but 4.2 and 4.3 together now have a measured ceiling to aim at
-(21.8 µs/verify on this CPU), not a guessed one.
+cycles, leaving LSM I/O as the dominant cost by a wide margin.
+
+Order of attack once the replay reaches tip, revised after the §4.2
+inventory: **4.1 (LSM) → 4.2 A+B (projective compare + var-time scalar
+inverse, ~25 % of all cycles for two contained routines) → 4.3 (GLV+wNAF,
+which attacks the ~57 µs of point arithmetic that remains) → 4.2 B′**.
+4.2 and 4.3 together have a measured ceiling to aim at — 21.8 µs/verify on
+this CPU — not a guessed one.
