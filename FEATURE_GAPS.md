@@ -61,14 +61,26 @@ util), each individually small, but there's a lot of it.
   assumeutxo/utxo.snapshot/dumptxoutset/loadtxoutset. **Large** — needs a
   new snapshot format plus a background-validation state machine; nothing
   like it exists today.
-- **Taproot script-path spending (BIP342 tapscript)** — the crypto is
-  written (`bitcoin_taproot_sighash.c`'s `tapscript_checksig`, ~340 lines)
-  but has **zero callers** in the live verify path; `daemon/tx_verify.c`
-  only calls `taproot_keypath_verify` (2 call sites). Script-path taproot
-  spends would not validate correctly today even though the primitive
-  exists. **Medium** — the hard crypto is done, this is a dispatch/wiring
-  job, but consensus-critical, so needs the same rigor as everything else
-  in this project.
+- ~~**Taproot script-path spending (BIP342 tapscript)**~~ — **DONE
+  2026-08-21** (`e789df8`). `taproot_verify_input`
+  (`bitcoin_taproot_sighash.c`) now does BIP341 witness classification
+  (annex, key-path vs script-path), control-block Merkle commitment, and
+  tapscript execution through the shared `script_eval` interpreter
+  (OP_SUCCESSx, OP_CHECKSIGADD, validation-weight budget), wired at both
+  `tx_verify.c` call sites. Before this, every script-path spend was
+  false-rejected (fail-closed, never false-accept — verified before
+  touching it). Two dependency bugs found and fixed on the way: an
+  unbounded write in `tap_leaf_hash` for scripts over ~288 bytes, and a
+  wrong sighash for script-path spends carrying an annex. 9 independent
+  vectors in `tests/test_taproot_scriptpath.c`.
+  - **Remaining, narrow:** `OP_CODESEPARATOR` *inside a tapscript* is not
+    position-tracked for the sighash. Any tapscript containing a raw
+    `0xab` byte is detected and **refused loudly** (false-reject only —
+    `schnorr_verify` is still the final gate, so never false-accept).
+    Essentially unseen on real chain data, but if the replay ever hits
+    one past height 709,632 it will stop with that reason. **Small** to
+    finish: thread `codesep_pos` from the interpreter into
+    `tapscript_checksig`'s sighash context.
 - **Chain selection** — mainnet only. No testnet/signet/regtest handling in
   `node_config.c`; mainnet magic bytes are hardcoded directly in
   `bitcoin_net.asm`/`bitcoin_store.asm` (3 literal occurrences each), no
