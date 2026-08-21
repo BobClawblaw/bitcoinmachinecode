@@ -70,7 +70,28 @@ P_BE:
 section .data
 align 16
 tagh_buf:  times 32 db 0
-tap_preimg: times 352 db 0
+
+; tap_preimg: shared scratch for tagged_hash256/tap_branch_hash/tap_leaf_hash/
+; tap_merkle_root (single-threaded global, see this file's header comment).
+; Sized generously for tap_leaf_hash's variable-length script copy at +64:
+; BIP342 deliberately has NO fixed tapscript-size cap (bitcoin_interp.asm's
+; own MAX_SCRIPT_SIZE check is skipped entirely for SIGVERSION_TAPSCRIPT),
+; so this must hold any realistic real-world tapscript, not just the small
+; fixed-size hashes (32/64 bytes) the other three functions ever write here.
+; tap_leaf_hash checks its actual write length against (TAP_PREIMG_CAP-64)
+; and fails cleanly (returns 0, writes nothing) rather than overflow if that
+; capacity is ever exceeded -- found and fixed 2026-08-21 after a genuinely
+; large synthetic tapscript (~1.4KB, a validation-weight-budget test script)
+; silently overflowed the original 352-byte buffer and corrupted adjacent
+; global state (manifested as an unrelated-looking commitment mismatch in
+; LATER, otherwise-correct calls, and a crash under a different memory
+; layout) -- this is exactly the "produce a clean, loud rejection rather
+; than silent truncation" philosophy already established elsewhere in this
+; project (see e.g. TXV_SPK_CAP's own header comment in daemon/tx_verify.c).
+TAP_PREIMG_CAP equ 4*1024*1024
+section .bss
+align 16
+tap_preimg: resb TAP_PREIMG_CAP
 
 ; ============================================================================
 ; tagged_hash256(out[32]=rdi, tag=rsi, taglen=rdx, msg=rcx, msglen=r8)
@@ -187,6 +208,9 @@ tap_branch_hash:
 
 ; ============================================================================
 ; tap_leaf_hash(out[32]=rdi, leaf_version=rsi, script=rdx, slen=rcx)
+;   -> rax = 1 ok / 0 slen too large for TAP_PREIMG_CAP (out untouched on 0,
+;   nothing written past the buffer either way -- see TAP_PREIMG_CAP's own
+;   comment above tap_preimg for why this bound and check exist).
 ; ============================================================================
 global tap_leaf_hash
 tap_leaf_hash:
@@ -202,19 +226,37 @@ tap_leaf_hash:
     mov  r12, rdi
     mov  r13, rdx
     mov  r14, rcx
+    ; Bound slen against the buffer's real usable capacity BEFORE writing
+    ; anything: 64 (tag-hash-doubled prefix) + 1 (ver) + up to 5 (compact-
+    ; size) + slen must fit in TAP_PREIMG_CAP. Clean, loud failure instead
+    ; of ever overflowing -- see this function's own header comment.
+    mov  rax, TAP_PREIMG_CAP - 70
+    cmp  r14, rax
+    ja   .too_large
     ; msg at tap_preimg+64: ver || compact(slen) || script
     mov  byte [rel tap_preimg+64], sil
     lea  r15, [rel tap_preimg+65]
-    cmp  r14, 253
-    jae  .big
-    mov  byte [r15], r14b
+    cmp  r14, 0xfd
+    jb   .small
+    cmp  r14, 0x10000
+    jb   .mid
+    ; 5-byte compact-size (0xfe + 4-byte LE): slen already bounded well
+    ; under 4G by the TAP_PREIMG_CAP check above, so r14d truncation here
+    ; is exact, not lossy.
+    mov  byte [r15], 0xfe
     inc  r15
+    mov  dword [r15], r14d
+    add  r15, 4
     jmp  .copy
-.big:
+.mid:
     mov  byte [r15], 0xfd
     inc  r15
     mov  word [r15], r14w
     add  r15, 2
+    jmp  .copy
+.small:
+    mov  byte [r15], r14b
+    inc  r15
 .copy:
     mov  rdi, r15
     mov  rsi, r13
@@ -229,6 +271,11 @@ tap_leaf_hash:
     lea  rcx, [rel tap_preimg+64]
     mov  r8, r15
     call tagged_hash256
+    mov  eax, 1
+    jmp  .ret
+.too_large:
+    xor  eax, eax
+.ret:
     add  rsp, 0x18
     pop  r15
     pop  r14
