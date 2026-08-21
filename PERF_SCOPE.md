@@ -26,14 +26,37 @@ and by default they are not.
   time reflects that shortcut.
 - The only fair target is therefore Core with `-assumevalid=0` (full
   verification). That mode is far slower than Core's typical sync and is the
-  number this project should be measured against — and Core is still
-  expected to win it today, because libsecp256k1 carries GLV+wNAF scalar
-  multiplication and this project's secp256k1 does not (see §4).
-- **No live same-hardware benchmark against Core is possible.** Never
-  compiling or running real Bitcoin Core is an absolute rule for this
-  project (`/storage/bitcoin` and `bitcoind.service` are off-limits). Core
-  facts cited here are architectural, read from `/storage/bitcoin-core-source`
-  or well-known public material, and are labelled as such.
+  number this project should be measured against.
+- **Running Core for benchmarking and as an oracle is authorized as of
+  2026-08-21** — from the separate source build
+  (`/storage/bitcoin-core-source/build/bin/`), never the production install.
+  `/storage/bitcoin` and `bitcoind.service` remain off-limits.
+
+### Measured: libsecp256k1 vs this project, same CPU, same moment
+
+Built libsecp256k1 from Core's vendored source in isolation, with Core's own
+shipped configuration (x86-64 asm, `ECMULT_WINDOW_SIZE=15`, comb gen table),
+and ran its `bench ecdsa_verify` back-to-back with `tests/bench_ecdsa`, both
+under the same load (the live replay was consuming ~6 cores):
+
+    cmake -S /storage/bitcoin-core-source/src/secp256k1 -B <scratch> \
+      -DCMAKE_BUILD_TYPE=Release -DSECP256K1_BUILD_BENCHMARK=ON \
+      -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF \
+      -DSECP256K1_BUILD_CTIME_TESTS=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
+    cmake --build <scratch> --target bench
+    SECP256K1_BENCH_ITERS=20000 <scratch>/bin/bench ecdsa_verify
+
+| | µs / verify | verifies / s / core |
+|---|---|---|
+| libsecp256k1 (Core v31.99 config) | **21.8** (min 21.4, max 23.1) | **≈ 45,900** |
+| bitcoinmachinecode `ecdsa_verify` | 120.9 | 8,271 |
+
+**The crypto gap is 5.5×, not the ~1.5–2.5× assumed earlier from public
+figures.** That single measurement reframes §4: the secp256k1 side is a far
+bigger lever than the first GLV scoping estimated, and libsecp256k1's
+advantage is the *stack* of techniques (GLV split, wNAF with a 15-bit
+window, 5×52 field representation, lazy reduction, batch inversion), not
+GLV alone.
 
 Sub-conclusion: the gap is real but it is a **two-front problem** — crypto
 and storage I/O — not the single crypto optimisation the first GLV scoping
@@ -205,4 +228,11 @@ collapsed them to 1.
 At height ≈ 430 k with full verification on, ~85 % of all cycles are split
 between secp256k1 field/scalar arithmetic (≈ 53 %) and UTXO LSM read I/O
 (≈ 31 %). Reaching full-verification Core parity means attacking both.
-Order of attack once the replay reaches tip: **4.1 → scope 4.2 → 4.3.**
+
+The measured 5.5× crypto gap (§1) means the two fronts are closer in size
+than the cycle split alone suggests: if the crypto side reached
+libsecp256k1 speed, its 53 % would shrink to roughly 10 % of today's
+cycles, leaving LSM I/O as the dominant cost by a wide margin. Order of
+attack once the replay reaches tip is unchanged — **4.1 → scope 4.2 →
+4.3** — but 4.2 and 4.3 together now have a measured ceiling to aim at
+(21.8 µs/verify on this CPU), not a guessed one.
