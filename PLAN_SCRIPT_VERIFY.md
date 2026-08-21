@@ -544,17 +544,29 @@ materially changes B.
   behavior change for the common case) in
   `tests/test_archive_truncate_nonmonotonic.c`.
 
-  **Pruning is NOT fixed by this and remains genuinely blocked** on a
-  non-monotonic archive (`archive_prune_decide` still returns
-  `ARCHIVE_PRUNE_REFUSE_LAYOUT`). Pruning's whole point is reclaiming disk
-  space from OLD (low) heights, which the index-only trick cannot give it
-  -- "forgetting" old index records without touching the blk files frees
-  no space at all, defeating the purpose, and would also make a pruned
-  height look like an ordinary re-fetchable hole rather than intentionally
-  discarded. A real fix needs either (a) a maintenance pass that
-  physically rewrites the archive into height order once, or (b)
-  fine-grained, byte-range-aware reclamation instead of whole-file
-  unlink/ftruncate. Neither is implemented; this remains open.
+  **2026-08-21: PRUNING fixed too**, via a third option neither (a) nor
+  (b) above anticipated: whole-FILE-granular reclamation. `archive_prune_
+  file_granular` (`daemon/archive_verify.c`) does one sequential
+  `index.dat` scan to compute each `blk*.dat` file's min/max height, then
+  deletes an entire file only when every block it holds is safely below
+  the target -- real disk space reclaimed, no byte-range rewriting needed,
+  no requirement that the archive ever become physically monotonic. The
+  file holding the current tip is unconditionally protected. Wired as the
+  `ARCHIVE_PRUNE_REFUSE_LAYOUT` fallback in `main.c`, alongside (not
+  replacing) the existing scalar `prune_height` path for genuinely
+  monotonic archives. Pruned records are marked with a distinct sentinel
+  (`data_size = 0xFFFFFFFF`) from the all-zero "hole" marker used
+  elsewhere -- reusing the hole sentinel would have made the downloader
+  re-fetch every pruned block from peers on every boot, silently
+  defeating pruning entirely; `store_get_at` (`bitcoin_store.asm`) gained
+  the matching read-side check. Regression-tested in
+  `tests/test_prune_nonmonotonic.c` against a synthetic non-monotonic
+  multi-file archive (34 assertions: wholly-old files deleted, a
+  straddling file retained whole, tip-file protection, idempotent
+  re-pruning). Pruning remains strictly opt-in, matching prior default
+  behavior. Mirrors Bitcoin Core's own real approach to this identical
+  problem (Core also tolerates non-monotonic block files and prunes by
+  whole file using per-file height metadata, not physical reordering).
 
   Separately, and not addressed here: making the downloader itself write
   in height order in the first place (so future archives are monotonic
