@@ -576,3 +576,10 @@ materially changes B.
   actually matters (reorg/repair), while pruning would need the
   fine-grained fix above regardless of write order for any ALREADY
   non-monotonic archive (like the one currently in production).
+
+- **Replay throughput vs. Core** — scoped 2026-08-21 from a symbol-resolved
+  `perf` profile of the live replay at height ≈ 430 k: see `PERF_SCOPE.md`.
+  Headline: ~53 % of cycles in secp256k1 field/scalar arithmetic and ~31 %
+  in UTXO LSM read I/O (not archive reads — the non-monotonic layout above
+  is ruled out as the I/O cost). Every lever touches the live verify or
+  storage path, so nothing lands until this replay reaches tip.
