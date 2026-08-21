@@ -185,6 +185,20 @@ static int   g_undo_enabled = 1;
  * a plain undo_prune(tip,window) per block is not viable at mainnet depth. */
 static long  g_undo_prune_cursor = 0;
 
+/* TEST-ONLY crash injection (default disabled, -1). When armed (>=0),
+ * utxo_live_catchup's per-block loop calls _exit(1) the instant `applied`
+ * (this call's own count of newly-applied blocks) reaches the armed value --
+ * immediately after that block's checkpoint persist, before anything else in
+ * the loop or the function's own end-of-call bookkeeping. Simulates an
+ * unclean process kill partway through a batch, for
+ * tests/test_utxo_catchup_crash_resume.c to prove a restart never needs to
+ * re-verify an already-durably-applied block. Production code never calls
+ * the setter, so this is always a no-op (one integer compare) outside tests. */
+static long g_test_crash_after_applied = -1;
+void utxo_live_test_set_crash_after(long n){ g_test_crash_after_applied = n; }
+#define UTXO_LIVE_TEST_CRASH_HOOK(applied_count) \
+    do { if (g_test_crash_after_applied >= 0 && (applied_count) == g_test_crash_after_applied) _exit(1); } while (0)
+
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
     if (fd < 0) { fprintf(stderr, "[utxo_live] open(%s) failed: %s\n", path, strerror(errno)); return 0; }
@@ -958,6 +972,44 @@ long utxo_live_catchup(void* store_buf){
         g_applied_height = h;
         applied++;
 
+        /* Persist the checkpoint after EVERY block, not just at a compaction
+         * or at the very end of the (potentially hours-long, for a
+         * from-scratch replay) call. block h's puts/dels are ALREADY durable
+         * at this point -- utxo_lsm_put/del write their WAL entries
+         * synchronously, and any mac_flush they triggered along the way
+         * publishes its run + manifest via its own independent crash-safe
+         * rename, entirely decoupled from this height marker -- so an
+         * unclean process death anytime after this line can never leave the
+         * on-disk UTXO state further ahead than what utxo_applied_height.dat
+         * says. Before this, that gap was real and unbounded: this file's
+         * own header comment used to document a "REVERTED (2026-08-19)"
+         * attempt at exactly this that was pulled after production reload
+         * came back "missing" entries that were genuinely applied (even a
+         * checkpointed height's own coinbase gone). That was misdiagnosed as
+         * data loss in the flush/compact reconstruction path; it was in fact
+         * this same gap in the other direction -- the reloaded LSM state was
+         * correctly further ALONG than the stale checkpoint claimed, so
+         * anything the stale checkpoint's height had created that a later,
+         * already-durable-but-unpersisted block had since spent legitimately
+         * looked "gone". Confirmed live in production 2026-08-21: a restart
+         * landing after a mid-catchup compact's checkpoint (height 363896)
+         * came back rejecting height 363897's very first spend as
+         * "missing/already-spent" -- because that block (and however many
+         * after it) had already been durably applied before the crash, just
+         * never checkpointed. See tests/test_utxo_catchup_crash_resume.c.
+         * fsync-per-block is not the throughput risk it looks like: bulk
+         * catch-up is already far slower than one fsync per block (observed
+         * production rate tops out around a few thousand blocks/sec even in
+         * the cheap early-chain stretch, and drops to single digits/sec once
+         * blocks carry real transaction volume), so this adds a small,
+         * bounded fraction of total replay time in exchange for closing an
+         * unbounded-drift crash window. */
+        if (!persist_applied_height(g_applied_height)) {
+            fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld after block %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n",
+                    g_applied_height, h);
+        }
+        UTXO_LIVE_TEST_CRASH_HOOK(applied);
+
         /* Compact periodically DURING a long catch-up, not just once at the
          * end. A from-scratch (or long-gap) replay flushes far more runs
          * than a steady-state catch-up call ever would, and the manifest
@@ -971,33 +1023,10 @@ long utxo_live_catchup(void* store_buf){
             fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
                     h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
         }
-        /* REVERTED (2026-08-19): a periodic persist_applied_height() used to
-         * live here, independent of compaction, so a restart wouldn't have
-         * to re-walk the whole archive from -1. Reverted after it exposed a
-         * real, still-unresolved data-loss bug: reloading from a checkpoint
-         * taken between flush/compact events came back missing entries that
-         * had genuinely been applied (confirmed against production -- even
-         * the exact checkpointed height's own coinbase output was gone from
-         * the reloaded LSM state, while older, already-flushed-to-run
-         * entries were intact). The WAL write() itself is synchronous and
-         * durable-enough for a same-machine restart regardless of fsync/
-         * close, so the leading theory is a correctness bug in the flush/
-         * compact reconstruction path itself (silently dropping live
-         * entries under a large/heavily-loaded table before resetting the
-         * WAL, which is what makes it unrecoverable) -- likely pre-existing
-         * and simply never before exercised by a restart landing between
-         * two flush/compact events. Do not reintroduce periodic
-         * checkpointing here until that is root-caused and fixed; until
-         * then persist_applied_height only runs where it already ran
-         * (compaction, and once at the end of the whole catch-up call),
-         * which is the only cadence proven safe. */
         if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
                     h, g_utxo_lst.manifest_n, cr);
-            if (!persist_applied_height(g_applied_height)) {
-                fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld mid-catchup\n", g_applied_height);
-            }
         }
     }
     /* Caught up while bulk-sized: drop the flush thresholds back to
