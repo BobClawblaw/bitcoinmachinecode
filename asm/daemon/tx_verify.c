@@ -110,6 +110,18 @@ extern int  taproot_keypath_verify(const u8* spk, const u8* sig, int siglen,
                                    const u8* tx, int64_t txlen, int64_t n_in,
                                    const u8* prevouts, const u8* amounts,
                                    const u8* spks, int64_t num_inputs);
+/* taproot_verify_input (bitcoin_taproot_sighash.c): full BIP341/BIP342
+ * dispatch for one P2TR input -- key-path (with/without annex) or
+ * script-path (control-block Merkle commitment + tapscript execution via
+ * the shared script_eval interpreter), replacing the old "P2TR always
+ * means exactly-one-witness-item key-path" assumption below. Everything
+ * else (annex/control-block classification, weight budget) lives there. */
+extern int  taproot_verify_input(const u8* spk,
+                                 const u8* const* wit, const u32* witlen, u32 nwit,
+                                 const u8* tx, int64_t txlen, int64_t n_in,
+                                 const u8* prevouts, const u8* amounts,
+                                 const u8* spks, int64_t num_inputs,
+                                 const char** reason);
 
 /* ---- confirmed UTXO set (bitcoin_utxo_lsm.asm) ---- */
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
@@ -426,7 +438,7 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
             has_taproot = 1;
             g_txv_in[i].shape = TXV_SHAPE_P2TR;
             if (g_txv_in[i].scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; return 0; }
-            if (g_txv_in[i].nwit != 1) { *reason = "p2tr keypath needs exactly 1 witness item"; return 0; }
+            if (g_txv_in[i].nwit == 0) { *reason = "p2tr empty witness"; return 0; }
             continue;
         }
         if (is_p2wpkh(spk, (u32)spklen)) {
@@ -484,9 +496,10 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
 
     for (u64 i=0;i<nin;i++){
         if (!is_tap[i]) continue;
-        if (!taproot_keypath_verify(spk34[i], g_txv_in[i].wit[0], (int)g_txv_in[i].witlen[0],
-                                    ns, nslen, (int64_t)i, po, am, sp, (int64_t)nin)) {
-            *reason = "p2tr keypath signature invalid"; return 0;
+        const char* tap_reason = "p2tr verify failed";
+        if (!taproot_verify_input(spk34[i], g_txv_in[i].wit, g_txv_in[i].witlen, g_txv_in[i].nwit,
+                                  ns, nslen, (int64_t)i, po, am, sp, (int64_t)nin, &tap_reason)) {
+            *reason = tap_reason; return 0;
         }
     }
     return 1;
@@ -1002,7 +1015,12 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         if (is_p2tr(spk, (u32)spklen)) {
             has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
             if (in->scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
-            if (in->nwit != 1) { *reason = "p2tr keypath needs exactly 1 witness item"; *fail_tx_index = in->tx_index; goto fail; }
+            /* Exact shape (key-path vs script-path, annex or not) isn't
+             * decidable from nwit alone -- taproot_verify_input classifies
+             * it properly in Phase 3. Only the structural "some witness
+             * must be present" rule (BIP341: an empty witness is always
+             * invalid) is checked here. */
+            if (in->nwit == 0) { *reason = "p2tr empty witness"; *fail_tx_index = in->tx_index; goto fail; }
             continue;
         }
         if (is_p2wpkh(spk, (u32)spklen)) {
@@ -1090,9 +1108,11 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                     for (u64 k=0;k<nin_t;k++){
                         if (!is_tap[k]) continue;
                         txvb_in_t* in = &flat[lo+k];
-                        if (!taproot_keypath_verify(spk34[k], in->wit[0], (int)in->witlen[0],
-                                                    ns, nslen, (int64_t)k, po, am, sp, (int64_t)nin_t)) {
-                            *reason = "p2tr keypath signature invalid"; *fail_tx_index = t; tap_fail = 1; break;
+                        const char* tap_reason = "p2tr verify failed";
+                        if (!taproot_verify_input(spk34[k], in->wit, in->witlen, in->nwit,
+                                                  ns, nslen, (int64_t)k, po, am, sp, (int64_t)nin_t,
+                                                  &tap_reason)) {
+                            *reason = tap_reason; *fail_tx_index = t; tap_fail = 1; break;
                         }
                     }
                 }

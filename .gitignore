@@ -148,6 +148,7 @@ asm/tests/test_tapscript_interp
 asm/tests/test_schnorr
 asm/tests/test_taproot
 asm/tests/test_taproot_sighash
+asm/tests/test_taproot_scriptpath
 asm/tests/test_segwit_sighash
 asm/tests/test_mempool_accept_modern
 asm/daemon/wallet_cli

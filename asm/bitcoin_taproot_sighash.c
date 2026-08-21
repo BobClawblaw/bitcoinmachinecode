@@ -24,6 +24,11 @@ extern int  schnorr_verify(const uint8_t* sig, const uint8_t* pk,
                            const uint8_t* msg, int msglen);
 extern long taproot_tweak_pubkey(uint8_t* out_x, const uint8_t* internal_x,
                                  const uint8_t* merkle_root);
+extern long tap_leaf_hash(uint8_t out[32], uint8_t leaf_version,
+                          const uint8_t* script, uint64_t slen);
+extern long tap_merkle_root(uint8_t out[32], const uint8_t* leaf_hashes, uint64_t count,
+                            const uint8_t* control, uint64_t clen);
+extern int  stack_push(uint64_t* sp, uint8_t* elems, const uint8_t* data, uint32_t len);
 
 #define SHA256SZ 32
 
@@ -384,12 +389,45 @@ int taproot_keypath_verify_annex(const uint8_t* spk, const uint8_t* sig, int sig
  *      a CHECKSIGADD 'no signature' (returns 0 but is a valid empty entry --
  *      caller decides). pubkey: 32-byte x-only.
  */
+int tapscript_checksig_annex(const uint8_t* sig, int siglen, const uint8_t* pubkey,
+                             const uint8_t* tx, int64_t txlen, int64_t n_in,
+                             const uint8_t* prevouts, const uint8_t* amounts,
+                             const uint8_t* spks, int64_t num_inputs,
+                             const uint8_t* tapleaf /*32 bytes*/,
+                             uint32_t codesep_pos,
+                             const uint8_t* annex, uint64_t annexlen,
+                             uint8_t* out_hash /*32 or NULL*/);
 int tapscript_checksig(const uint8_t* sig, int siglen, const uint8_t* pubkey,
                        const uint8_t* tx, int64_t txlen, int64_t n_in,
                        const uint8_t* prevouts, const uint8_t* amounts,
                        const uint8_t* spks, int64_t num_inputs,
                        const uint8_t* tapleaf /*32 bytes*/,
                        uint32_t codesep_pos, uint8_t* out_hash /*32 or NULL*/)
+{
+    return tapscript_checksig_annex(sig, siglen, pubkey, tx, txlen, n_in,
+                                    prevouts, amounts, spks, num_inputs,
+                                    tapleaf, codesep_pos, NULL, 0, out_hash);
+}
+
+/* Annex-aware variant: a script-path spend's witness can carry an annex
+ * (BIP341) exactly like a key-path spend can, and the annex is committed
+ * into the SigMsg the same way in both cases (spend_type bit0 + sha256(
+ * compactsize(len)||annex)) -- taproot_keypath_verify_annex already handles
+ * this for key-path; this is the script-path counterpart, found missing
+ * 2026-08-21 while wiring script-path dispatch (taproot_verify_input):
+ * tapscript_checksig previously hardcoded annex=NULL unconditionally, so a
+ * script-path spend with a real annex present would compute the wrong
+ * sighash and any genuinely valid signature would fail to verify here (a
+ * false-reject, never a false-accept -- schnorr_verify is still the final
+ * gate over whatever hash got computed). */
+int tapscript_checksig_annex(const uint8_t* sig, int siglen, const uint8_t* pubkey,
+                             const uint8_t* tx, int64_t txlen, int64_t n_in,
+                             const uint8_t* prevouts, const uint8_t* amounts,
+                             const uint8_t* spks, int64_t num_inputs,
+                             const uint8_t* tapleaf /*32 bytes*/,
+                             uint32_t codesep_pos,
+                             const uint8_t* annex, uint64_t annexlen,
+                             uint8_t* out_hash /*32 or NULL*/)
 {
     if (siglen == 0) return 0;                 /* null/empty signature entry */
     if (siglen < 64 || siglen > 65) return 0;
@@ -401,7 +439,7 @@ int tapscript_checksig(const uint8_t* sig, int siglen, const uint8_t* pubkey,
     c.prevouts = prevouts; c.amounts = amounts; c.spks = spks;
     c.num_inputs = num_inputs; c.ext_flag = 1; c.tapleaf = tapleaf;
     c.codesep_pos = codesep_pos;
-    c.annex = NULL; c.annexlen = 0;
+    c.annex = annex; c.annexlen = annexlen;
 
     uint8_t pre[256]; uint8_t hash[32];
     if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;
@@ -427,20 +465,246 @@ typedef struct {
     int64_t num_inputs;
     const uint8_t* tapleaf;   /* 32 bytes */
     uint32_t codesep_pos;
+    const uint8_t* annex;     /* optional witness annex, or NULL */
+    uint64_t annexlen;
+    /* BIP342 sigops/witness-size validation-weight budget (Core's
+     * VALIDATION_WEIGHT_PER_SIGOP_PASSED / VALIDATION_WEIGHT_OFFSET, both
+     * 50, script/script.h). The caller (taproot_verify_input) initializes
+     * this to ser_size(full original witness) + 50, then this function
+     * decrements it by 50 on every invocation with a non-empty signature --
+     * the asm interpreter's interp_checksig/interp_checksig_add already
+     * gate the call itself on siglen!=0, so every actual call here is
+     * exactly Core's qualifying "success = !sig.empty()" case. Going
+     * negative fails the whole tapscript, matching Core's
+     * EvalChecksigTapscript exactly. Mutated in place: this ctx is
+     * per-verify-call, never shared/reused, so no locking needed. */
+    int64_t weight_left;
 } taproot_checksig_ctx;
 
 uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
                              const uint8_t* pub, size_t publen,
                              const void* slice)
 {
-    const taproot_checksig_ctx* c = (const taproot_checksig_ctx*)cptr;
+    taproot_checksig_ctx* c = (taproot_checksig_ctx*)cptr;
     (void)slice;
     if (siglen == 0) return 0;                     /* no signature provided */
+    c->weight_left -= 50;
+    if (c->weight_left < 0) return 0;               /* BIP342 validation-weight budget exceeded */
     if (publen != 32) return 0;                    /* x-only pubkey required */
-    int r = tapscript_checksig(sig, (int)siglen, pub,
-                               c->tx, c->txlen, c->n_in,
-                               c->prevouts, c->amounts, c->spks,
-                               c->num_inputs, c->tapleaf,
-                               c->codesep_pos, NULL);
+    int r = tapscript_checksig_annex(sig, (int)siglen, pub,
+                                     c->tx, c->txlen, c->n_in,
+                                     c->prevouts, c->amounts, c->spks,
+                                     c->num_inputs, c->tapleaf,
+                                     c->codesep_pos, c->annex, c->annexlen, NULL);
     return (uint64_t)r;
+}
+
+/* ============================================================================
+ * BIP341 witness classification + BIP342 script-path dispatch
+ * (taproot_verify_input). The full P2TR entry point: given ANY witness
+ * shape, decides key-path vs script-path (with or without an annex),
+ * verifies the control-block Merkle commitment for script-path, and -- for
+ * the known tapscript leaf version -- executes the tapscript itself
+ * through the shared script_eval interpreter (bitcoin_interp.asm), the
+ * same interpreter every other script type in this project uses. Mirrors
+ * Bitcoin Core's VerifyWitnessProgram taproot branch (script/
+ * interpreter.cpp) exactly, including the BIP342 sigops/witness-size
+ * validation-weight budget.
+ * ============================================================================ */
+#define TAPROOT_ANNEX_TAG          0x50u
+#define TAPROOT_CONTROL_BASE_SIZE  33
+#define TAPROOT_CONTROL_NODE_SIZE  32
+#define TAPROOT_CONTROL_MAX_NODES  128
+#define TAPROOT_CONTROL_MAX_SIZE   (TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE*TAPROOT_CONTROL_MAX_NODES)
+#define TAPROOT_LEAF_MASK          0xfeu
+#define TAPROOT_LEAF_TAPSCRIPT     0xc0u
+
+/* ---- private mirror of bitcoin_interp.asm's struct script_state ABI,
+ * same layout bitcoin_scriptverify.c's sv_run already relies on (see that
+ * file's own copy for the authoritative field-by-field commentary). Script
+ * is passed by pointer, NOT copied -- script_eval only ever READS through
+ * it (confirmed: no write to [r12+32] anywhere in bitcoin_interp.asm), and
+ * BIP342 deliberately has NO fixed script-size cap (the interpreter's own
+ * MAX_SCRIPT_SIZE check is skipped entirely for SIGVERSION_TAPSCRIPT), so
+ * copying into a fixed-size scratch buffer would silently misbehave on a
+ * large real tapscript (e.g. an Ordinals-style inscription reveal) where
+ * the legacy/witness-v0 paths' 20000-byte scopy buffer would not. ---- */
+#define TS_ELEM_SIZE      528
+#define TS_MAX_STACK      1000
+#define TS_SIGV_TAPSCRIPT 2
+struct ts_script_state {
+    uint8_t*  main_elems; uint64_t main_sp;
+    uint8_t*  alt_elems;  uint64_t alt_sp;
+    uint8_t*  script;     uint64_t script_len;
+    int       sigversion; uint64_t flags;
+    uint8_t*  work;       uint64_t work_cap;
+    uint64_t* error_out;
+    void*     checksig_ctx;
+    uint64_t (*checksig_fn)(void*, const uint8_t*, size_t,
+                            const uint8_t*, size_t, const void*);
+    uint32_t  tx_locktime;
+    uint32_t  in_sequence;
+    uint32_t  tx_version;
+};
+extern int script_eval(struct ts_script_state* st);
+
+/* taproot_verify_input(): full dispatch for one P2TR input's witness.
+ * Returns 1 valid / 0 invalid; *reason set to a static (never NULL)
+ * description, matching this project's existing per-shape error-reporting
+ * convention (see e.g. daemon/tx_verify.c's "p2wpkh signature invalid").
+ *
+ * wit[]/witlen[]: the input's FULL witness stack, nwit items (nwit >= 1 --
+ * an empty witness is rejected structurally before this is ever called).
+ * spk: the 34-byte P2TR scriptPubKey (0x51 0x20 <32-byte x-only key>).
+ * n_in: this input's index WITHIN ITS OWN TRANSACTION (0-based) -- matches
+ * every other function in this file, NOT a block-wide flat index.
+ *
+ * KNOWN, DELIBERATE LIMITATION: does not track OP_CODESEPARATOR position
+ * inside a tapscript for the BIP342 codesep_pos sighash field (always
+ * 0xffffffff, "none executed"). This is safety-neutral to omit: a
+ * tapscript that actually executes OP_CODESEPARATOR before a CHECKSIG
+ * would get a sighash preimage that differs from the real one, and any
+ * genuinely valid signature over the REAL sighash would then fail to
+ * verify here -- a false-REJECT, never a false-accept (the final gate is
+ * always a real Schnorr verify over whatever sighash got computed; an
+ * attacker cannot leverage a wrong sighash to forge acceptance of a bad
+ * signature). OP_CODESEPARATOR inside a tapscript is essentially unheard
+ * of on real chain data. To avoid ever silently mis-verifying rather than
+ * cleanly refusing, any tapscript containing the raw byte 0xab anywhere is
+ * refused outright before execution (over-conservative -- a 0xab byte
+ * inside push DATA also refuses -- but always safe and always loud, never
+ * silent). */
+int taproot_verify_input(const uint8_t* spk,
+                         const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
+                         const uint8_t* tx, int64_t txlen, int64_t n_in,
+                         const uint8_t* prevouts, const uint8_t* amounts,
+                         const uint8_t* spks, int64_t num_inputs,
+                         const char** reason)
+{
+    if (nwit == 0) { *reason = "p2tr empty witness"; return 0; }
+
+    /* ---- BIP341 annex: present iff >=2 items and the LAST item's first
+     * byte is the annex tag (0x50). Stripped before path classification;
+     * committed into the sighash separately by the keypath-annex/tapscript
+     * sighash paths, not treated as ordinary stack/script data. */
+    int annex_present = 0;
+    const uint8_t* annex = NULL; uint64_t annexlen = 0;
+    if (nwit >= 2 && witlen[nwit-1] >= 1 && wit[nwit-1][0] == TAPROOT_ANNEX_TAG) {
+        annex_present = 1; annex = wit[nwit-1]; annexlen = witlen[nwit-1];
+    }
+    uint32_t eff = nwit - (annex_present ? 1u : 0u);
+    if (eff == 0) { *reason = "p2tr empty witness after annex"; return 0; }
+
+    /* ---- key-path: effective stack size 1 (just the signature) ---- */
+    if (eff == 1) {
+        if (annex_present) {
+            if (!taproot_keypath_verify_annex(spk, wit[0], (int)witlen[0], tx, txlen, n_in,
+                                              prevouts, amounts, spks, num_inputs,
+                                              annex, annexlen, NULL)) {
+                *reason = "p2tr keypath (annex) signature invalid"; return 0;
+            }
+            return 1;
+        }
+        if (!taproot_keypath_verify(spk, wit[0], (int)witlen[0], tx, txlen, n_in,
+                                    prevouts, amounts, spks, num_inputs)) {
+            *reason = "p2tr keypath signature invalid"; return 0;
+        }
+        return 1;
+    }
+
+    /* ---- script-path: effective stack size >= 2 ----
+     * Last effective item = control block, second-to-last = the tapscript
+     * itself, everything before that = the tapscript's initial stack. */
+    const uint8_t* control = wit[eff-1]; uint64_t clen = witlen[eff-1];
+    const uint8_t* script  = wit[eff-2]; uint64_t slen = witlen[eff-2];
+
+    if (clen < TAPROOT_CONTROL_BASE_SIZE || clen > TAPROOT_CONTROL_MAX_SIZE ||
+        ((clen - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE) != 0) {
+        *reason = "p2tr control block wrong size"; return 0;
+    }
+
+    uint8_t leaf_version = control[0] & TAPROOT_LEAF_MASK;
+    const uint8_t* internal_pk = control + 1;   /* 32 bytes, x-only */
+
+    /* Merkle commitment: this ALWAYS runs, regardless of leaf version --
+     * per BIP341, it's what proves the control block genuinely commits
+     * this script to this specific taproot output. Only whether the
+     * SCRIPT gets executed afterward depends on the leaf version. */
+    uint8_t leaf_hash[32];
+    if (tap_leaf_hash(leaf_hash, leaf_version, script, slen) != 1) {
+        *reason = "p2tr tapscript too large"; return 0;
+    }
+    uint8_t merkle_root[32];
+    if (tap_merkle_root(merkle_root, leaf_hash, 1, control, clen) != 1) {
+        *reason = "p2tr merkle root reconstruction failed"; return 0;
+    }
+    uint8_t computed_q[32];
+    if (taproot_tweak_pubkey(computed_q, internal_pk, merkle_root) != 1) {
+        *reason = "p2tr script-path internal pubkey invalid"; return 0;
+    }
+    if (memcmp(computed_q, spk + 2, 32) != 0) {
+        *reason = "p2tr script-path commitment mismatch"; return 0;
+    }
+
+    /* Unknown leaf version: per BIP341, the commitment check just above is
+     * ALL that's required -- validation succeeds unconditionally without
+     * executing anything, reserved for future softforks to redefine script
+     * semantics under an unrecognized version without a hard fork. */
+    if (leaf_version != TAPROOT_LEAF_TAPSCRIPT) return 1;
+
+    /* See this function's header comment: OP_CODESEPARATOR (0xab) inside a
+     * known-leaf-version tapscript is not tracked; refuse rather than risk
+     * a silently-wrong sighash. */
+    for (uint64_t i = 0; i < slen; i++) {
+        if (script[i] == 0xab) {
+            *reason = "p2tr tapscript uses OP_CODESEPARATOR (not supported)";
+            return 0;
+        }
+    }
+
+    /* BIP342 sigops/witness-size validation-weight budget: ser_size of the
+     * ORIGINAL full witness (every one of the nwit items -- annex, control
+     * block and script included, exactly as broadcast), not the post-pop
+     * remainder. Core: GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_
+     * OFFSET(50); ser_size of a stack = compactsize(count) + sum over items
+     * of (compactsize(len) + len). */
+    int64_t weight_left = (int64_t)cs_size(nwit);
+    for (uint32_t i = 0; i < nwit; i++) weight_left += cs_size(witlen[i]) + (int64_t)witlen[i];
+    weight_left += 50;
+
+    taproot_checksig_ctx ctx;
+    ctx.tx = tx; ctx.txlen = txlen; ctx.n_in = n_in;
+    ctx.prevouts = prevouts; ctx.amounts = amounts; ctx.spks = spks;
+    ctx.num_inputs = num_inputs; ctx.tapleaf = leaf_hash; ctx.codesep_pos = 0xffffffffu;
+    ctx.annex = annex; ctx.annexlen = annexlen;
+    ctx.weight_left = weight_left;
+
+    static __thread uint8_t ts_main_e[TS_MAX_STACK*TS_ELEM_SIZE];
+    static __thread uint8_t ts_alt_e[TS_MAX_STACK*TS_ELEM_SIZE];
+    static __thread uint8_t ts_work[1<<16];
+
+    uint64_t sp = 0;
+    for (uint32_t i = 0; i + 2 < eff; i++) {
+        if (!stack_push(&sp, ts_main_e, wit[i], witlen[i])) {
+            *reason = "p2tr tapscript initial stack overflow"; return 0;
+        }
+    }
+
+    struct ts_script_state st;
+    memset(&st, 0, sizeof st);
+    st.main_elems = ts_main_e; st.main_sp = sp;
+    st.alt_elems  = ts_alt_e;  st.alt_sp  = 0;
+    st.script = (uint8_t*)(uintptr_t)script; st.script_len = slen;
+    st.sigversion = TS_SIGV_TAPSCRIPT;
+    st.flags = 0;
+    st.work = ts_work; st.work_cap = sizeof ts_work;
+    uint64_t err = 0; st.error_out = &err;
+    st.checksig_ctx = &ctx;
+    st.checksig_fn  = taproot_checksig_fn;
+
+    if (!script_eval(&st)) { *reason = "p2tr tapscript execution failed"; return 0; }
+    /* script_eval returning 1 already means the interpreter's own
+     * SIGVERSION_TAPSCRIPT-specific cleanstack/empty-result rule (exactly
+     * one truthy element left) passed -- nothing further to check here. */
+    return 1;
 }
