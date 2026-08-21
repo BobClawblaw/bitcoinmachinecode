@@ -4,7 +4,15 @@ Status: Written 2026-08-18. **Stages A, B, and C done, 2026-08-19** (legacy
 SignatureHash complete, FindAndDelete, OP_CODESEPARATOR strip, dispatch
 verified across P2PK/P2PKH/P2SH/bare-multisig, activation-height flag
 schedule) -- see "Stage B0/B1/B2 done", its "CLOSED" follow-up, and "Stage C
-done" below. Stages D-E not started.
+done" below.
+
+**Stage D: wired and mid-replay as of 2026-08-21, not yet DONE.**
+Verification is connected to block connection and running its own
+acceptance test -- a full from-scratch replay of the real mainnet archive,
+currently past height ~364,000 of 963,445 (see Stage D section below for
+the full incident list: the replay has found and fixed real consensus bugs
+directly, exactly as this stage's acceptance bar requires). Stage E
+(assumevalid, then production) not started.
 
 ## The gap
 
@@ -49,32 +57,40 @@ Considerably more than a fresh start. The expensive, hard parts are built.
 
 ## What is missing
 
-1. **`txval_modern` rejects every legacy script type.** Its dispatch chain
-   (`bitcoin_txval_modern.c:193`+) handles P2WPKH, P2WSH, P2TR key-path, and
-   falls through to `g_reason = "unsupported prevout script type"` → reject.
-   No P2PK, P2PKH, P2SH, bare multisig, no tapscript path. Wiring it into
-   block connection **as it stands would reject nearly the whole chain**:
-   P2PK dominates the earliest blocks, P2PKH most of the history.
+**As of 2026-08-21, items 1-5 below are DONE (verified against the current
+code, not assumed) -- kept here as history of the original gap. Only item 6
+(`assumevalid`) remains genuinely open, deferred to Stage E.**
 
-2. **Nothing joins legacy and witness into one per-input verifier.**
-   `verify_script` is legacy-only — its signature takes `scriptSig`,
-   `scriptPubKey`, `tx`, `nIn` with **no amount and no witness**, so it
-   cannot do BIP143. `txval_modern` is witness-only. Consensus needs one
-   entry point that dispatches both.
+1. ~~`txval_modern` rejects every legacy script type.~~ **DONE.** Stage D's
+   dispatch (`daemon/tx_verify.c`'s `txvb_verify_one`) classifies each
+   input's prevout shape and routes LEGACY (P2PK/P2PKH/P2SH/bare-multisig)
+   to `sv_verify_script` (`bitcoin_scriptverify.c`), P2WPKH/P2WSH to the
+   witness primitives, P2TR key-path to `taproot_keypath_verify` -- see
+   "Stage D" below.
 
-3. **Two interpreters.** `script_eval` (asm, all opcodes) and `eval_script`
-   (C, private to `bitcoin_verify.c`). Only one can be the consensus
-   interpreter. See Decisions below.
+2. ~~Nothing joins legacy and witness into one per-input verifier.~~
+   **DONE.** `txvb_verify_one` is that one entry point -- every shape
+   converges on parsing `(z, r, s, Qx, Qy)` and calling the shared
+   `ecdsa_verify`/Schnorr-verify primitives, dispatched per-input across the
+   whole block (`tx_verify_block_connect_all`).
 
-4. **No soft-fork activation schedule.** Script flags must be selected by
-   block height (BIP16, BIP66, BIP65, CSV, segwit, taproot). Applying
-   today's flags to a 2011 block would reject valid history; applying no
-   flags to a modern block would accept what consensus forbids.
+3. ~~Two interpreters.~~ **RESOLVED** in favor of the asm interpreter
+   (`bitcoin_interp.asm`'s `script_eval`, via `sv_verify_script`) as the
+   live consensus path, matching the project's asm-authored ethos.
+   `bitcoin_verify.c`'s `eval_script` is demoted to differential-reference
+   status only -- confirmed it is linked into `tests/test_scriptverify_parity`
+   and no daemon build target (`asm/Makefile`). See the error-code item
+   below for the numbering consequence of this choice.
 
-5. **No call from block connection**, and no coinbase skip / 100-block
-   coinbase maturity check.
+4. ~~No soft-fork activation schedule.~~ **DONE**, Stage C (2026-08-19) --
+   see "Stage C done" below.
 
-6. **No `assumevalid`.**
+5. ~~No call from block connection, and no coinbase skip / 100-block
+   coinbase maturity check.~~ **DONE**, Stage D -- `apply_block_inner`
+   (`daemon/utxo_live.c`) calls `tx_verify_block_connect_all` ahead of every
+   block's puts/dels, skips the coinbase, enforces 100-block maturity.
+
+6. **No `assumevalid`.** Still open -- Stage E.
 
 ## Cost — measured, not estimated
 
@@ -207,33 +223,60 @@ in-block double-spend rejects the WHOLE block, not a half-apply; a
 many-tx block with a poisoned tx buried mid-list rejects at the correct
 tx/reason under real parallel dispatch).
 
-**Three real bugs found and fixed by the live replay itself** — exactly the
-"any single rejection ... needs explaining before this ships" bar this stage
-exists to enforce. Full root-cause writeups live in `worklog/2026-08-20.md`
-(Sessions 2-4) and `LOG.md`'s 2026-08-19/20 entry; one-line summaries:
-1. `utxo_lsm_compact` (`asm/bitcoin_utxo_lsm.asm`) inverted its own
-   manifest's oldest/newest scan order after a partial compaction, letting a
-   stale deleted key resolve as live again. Fixed, `e12dcbb`.
-2. `bytepool_alloc` (`daemon/tx_verify.c`, itself introduced this same
-   session to fix an unrelated memory-bloat regression) returned a raw
-   pointer into a `realloc()`-backed buffer; a later input's allocation in
-   the same block's resolve loop could relocate the buffer and dangle every
-   pointer already handed to earlier inputs. Fixed by storing a byte offset
-   instead of a pointer, `4ec089c`.
-3. (Found autonomously overnight, per standing authorization to fix and
-   redeploy without asking.) `OP_SIZE` (`bitcoin_interp.asm`) used a 64-bit
-   load to read a `uint32` length field, pulling in 4 bytes of the
-   element's own data as garbage; and `OP_SHA1` was entirely unimplemented
-   — a real opcode this codebase had simply never built. Fixed by
-   correcting the load width and implementing SHA-1 from scratch
-   (`asm/sha1.asm`, FIPS-180-4-verified), `8caa5ac`.
+**A long tail of real bugs found and fixed by the live replay itself** —
+exactly the "any single rejection ... needs explaining before this ships"
+bar this stage exists to enforce. Full root-cause writeups for the first
+three live in `worklog/2026-08-20.md` (Sessions 2-4) and `LOG.md`'s
+2026-08-19/20 and 2026-08-21 entries. Every REJECT/FATAL height the replay
+has hit across its whole history, height-ordered, with its cause and fix
+(the last three columns reconstructed 2026-08-21 by correlating rejection
+timestamps against fix-commit timestamps and message content, not
+individually re-traced line-by-line -- flagged where confidence is lower):
 
-All three fixes are on `main` and pushed, each with a regression test proven
-(via `git stash`) to fail against the pre-fix code with the real production
-failure signature and pass with the fix. `bmc-bitcoind.service` is running a
-fresh from-scratch replay as of this writing (confirmed clean past both
-height 184390 and height 251683, the sites of the incidents above); **not
-yet DONE** — the replay has not reached chain tip (963183) yet.
+| Height | Symptom | Cause | Fixed in |
+|---|---|---|---|
+| 202471 | FATAL, no recovery attempt | Pre-Stage-D, during the LSM live-wiring rework (2026-08-18); superseded by later work, not independently re-traced | — |
+| 142998, 120000, 349021, 363897 | "input references a missing/already-spent UTXO" | **One root cause, four occurrences across three days**, not four bugs: `applied_height` was only persisted at rare compactions/end-of-call, so a crash could leave real durable state hours ahead of the checkpoint; resume then re-verified an already-applied block and its already-spent input looked fatal. See incident #5 below. | `2fd4a14` |
+| 184390 | "legacy script verification failed", then (post-recovery) the same missing-UTXO symptom | Two stacked bugs: LSM compaction manifest-order inversion, then a dangling pointer into a realloc'd byte pool | `e12dcbb`, `4ec089c` |
+| 212613 | "legacy script verification failed" | `OP_NOP1`/`OP_NOP4`..`OP_NOP10` treated as bad opcodes instead of no-ops | `757a377` |
+| 243015 | "prevout script too large" | `TXV_SPK_CAP` capped at 252 bytes, below the real consensus max (10000) | `e5c8c08` |
+| 251683 | "legacy script verification failed" | `OP_SIZE` 64-bit-load bug + `OP_SHA1` entirely unimplemented | `8caa5ac` |
+| 256960 | "legacy script verification failed" | `OP_WITHIN` compared against a leftover pointer, not the popped value | `a62f032` |
+| 269613 | "legacy script verification failed" | `stack_push`'s data pointer offset by `ELEM_DATA_OFF` too little | `b4cab22` |
+| 290328 | "legacy script verification failed" | `CHECKMULTISIG` didn't strip ALL on-stack sigs from scriptCode up front | `d0f0339` |
+| 299916 | "legacy script verification failed" | `CHECKMULTISIG` rejected `nKeys=0` instead of accepting it | `05015cb` |
+| 324663 | "legacy script verification failed" | `OP_CHECKMULTISIGVERIFY` never popped-and-checked its bool | `670b6a7` |
+| 349617 | "legacy script verification failed" | `sv_push_only`'s direct-push boundary excluded `0x4b` itself | `e1bdee2` |
+| 388431 | "legacy script verification failed" | `CHECKLOCKTIMEVERIFY`/`CHECKSEQUENCEVERIFY` were wired as no-op stubs, not real BIP65/BIP112 checks | `fbeff60` |
+
+### Incident #5 (2026-08-21): checkpoint could lag real durable state by an unbounded amount
+The four missing-UTXO occurrences in the table above share one root cause,
+finally isolated this session after being misattributed as one-off
+oddities for two days: `utxo_live_catchup` persisted `applied_height` only
+at compactions or once at the end of a (possibly hours-long) call, while
+every `utxo_lsm_put`/`del` is durable the instant it runs. An unclean
+process death (this occurrence: an unrelated HOST reboot, not a daemon
+crash) could leave true durable state hours ahead of the last checkpoint;
+resume then re-verified an already-applied block and treated its
+already-spent input as fatal instead of a safe no-op. Fixed by persisting
+`applied_height` after every block — correct by construction, no gap ever
+exists to reconcile. New regression test
+(`tests/test_utxo_catchup_crash_resume.c`) proven against the pre-fix code
+via disabling the fix line; `make -k test` 1582/1582 both pre- and
+post-merge. `2fd4a14`. Full writeup: `LOG.md`'s 2026-08-21 entry.
+
+Every fix above is on `main` and pushed, and every one that changed
+behavior (not the doc-only correlation work) has a regression test proven
+(via `git stash` or an equivalent disable-the-fix check) to fail against
+the pre-fix code with the real production failure signature and pass with
+the fix. `bmc-bitcoind.service` is running its third from-scratch replay
+attempt as of this writing (the first two were interrupted -- by the
+CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY bug, then by the host reboot that
+surfaced incident #5), currently past height ~364,000 of 963,445, confirmed
+clean past every rejection height in the table above except 388431 (not yet
+re-reached by this attempt, but independently confirmed clean once already
+during the CLTV/CSV fix's own post-fix redeploy); **not yet DONE** — the
+replay has not reached chain tip yet.
 
 ### Stage E — assumevalid, then production
 Implement `-assumevalid` for real (skip script checks at or below the named
@@ -362,10 +405,38 @@ enforcement survives non-ALL hashtypes). Full `make test` green throughout.
 
 **Next:** Stage C (activation-height flag schedule).
 
-## Stage A work item: error-code translation
+## Stage A work item: error-code translation -- RESOLVED (2026-08-20)
 
-The two interpreters use DIFFERENT ScriptError numbering, and the difference
-is deliberate on the asm side.
+**Neither of the two options below was taken as originally framed.** The
+project instead made `bitcoin_interp.asm` emit Core's own `SCRIPT_ERR_*`
+values directly (the "renumber the asm" option, previously marked
+NOT-preferred here) -- but mechanically, not by hand: `asm/script_error_codes.h`
+is generated by `validation/gen_script_error_defines.py` from Core's own
+`script_error.h`, and the asm interpreter includes/uses those generated
+defines rather than a hand-typed enum. This sidesteps the original tradeoff
+entirely -- "renumber by hand across many sites" was the risk that made a
+translation table look preferable, and generation removes that risk without
+paying for an extra seam.
+
+This was **not** bulletproof on the first pass: the generator originally only
+value-checked names the asm already had, so a name Core defines that the asm
+simply never typed (`SCRIPT_ERR_CHECKMULTISIGVERIFY`) was invisible to it --
+found the hard way when a real mainnet block needed exactly that code (see
+Stage D's incident list, height 324663). Fixed in `9218101` to also walk
+Core's enum and ADD missing names, not just verify existing ones. Now the
+asm interpreter and Core are numerically identical for every current
+`SCRIPT_ERR_*` name, checked by generation rather than by a comparison test
+that itself could be hand-typed wrong the same way.
+
+`bitcoin_verify.c`'s `eval_script`/Core-numbered scheme (the table below,
+still accurate as history) is no longer the live consensus path either way
+-- see "Decision 1" below, resolved in favor of the asm interpreter; `bitcoin_verify.c`
+is linked only into `tests/test_scriptverify_parity`, a differential
+reference, not the daemon binary (`asm/Makefile` confirms `bitcoin_verify.c`
+appears in no daemon build target).
+
+The two interpreters used DIFFERENT ScriptError numbering, and the
+difference was deliberate on the asm side, at the time this was written.
 
 Authoritative values, read from
 `/storage/bitcoin-core-source/src/script/script_error.h` (Core v31.99.0):
@@ -393,17 +464,20 @@ before the header was read. The header is the authority; assertions about
 Core's constants in this project must come from
 `/storage/bitcoin-core-source/src`, never from recall.)
 
-Consequence for Stage A: making `script_eval` the consensus interpreter means
-the seam must TRANSLATE asm error codes into Core codes, because the
-differential harness compares error-for-error against the Core oracle.
+Consequence for Stage A, as originally framed: making `script_eval` the
+consensus interpreter means the seam must TRANSLATE asm error codes into
+Core codes, because the differential harness compares error-for-error
+against the Core oracle.
 
-Two options:
-- **(preferred) translation table in the C seam.** Leaves the audited asm
-  interpreter untouched, keeps one place where the mapping lives, and is
-  directly testable: assert every asm code maps to the Core code of the same
-  name, with a test that fails if either enum gains a member.
+Two options considered at the time:
+- translation table in the C seam. Leaves the audited asm interpreter
+  untouched, keeps one place where the mapping lives, and is directly
+  testable: assert every asm code maps to the Core code of the same name,
+  with a test that fails if either enum gains a member.
 - renumber the asm to Core's values. Single source of truth, but edits a
-  verified interpreter across many sites for no behavioural gain.
+  verified interpreter across many sites for no behavioural gain --
+  **this is what actually happened, generated rather than hand-edited; see
+  above.**
 
 ## Original decision list (now resolved -- kept for the reasoning)
 
