@@ -2815,11 +2815,32 @@ int main(int argc, char** argv){
                 fprintf(stderr,"[prune] budget %ld MiB covers the whole archive -- nothing to prune\n",
                         g_cfg.prune_mib);
                 break;
-            case ARCHIVE_PRUNE_REFUSE_LAYOUT:
-                fprintf(stderr,"[prune] REFUSING to prune to height %ld: archive is not laid out "
-                               "monotonically (first break at %ld). Gate persisted, no data deleted.\n", ph, detail);
-                store_set_prune(store_buf, (int)ph);
+            case ARCHIVE_PRUNE_REFUSE_LAYOUT: {
+                /* store_prune's in-place compaction assumes a single
+                 * (file_no, data_pos) boundary, which a non-monotonic
+                 * archive breaks -- but whole-file-granularity pruning
+                 * (archive_prune_file_granular) doesn't need that
+                 * assumption, so try it before giving up. Deliberately does
+                 * NOT call store_set_prune: that gate is store_get_at's
+                 * single-threshold "everything below here is gone" check,
+                 * which would be WRONG here -- file-granular pruning can
+                 * leave still-live heights below `ph` (whichever file they
+                 * share with a not-yet-safe height stays whole), so those
+                 * heights must keep reading normally, not report -3. */
+                long nfiles = archive_prune_file_granular(ph);
+                if(nfiles > 0)
+                    fprintf(stderr,"[prune] archive not laid out monotonically (first break at %ld) -- "
+                                   "used whole-file-granular pruning instead: %ld file(s) below height %ld removed\n",
+                                   detail, nfiles, ph);
+                else if(nfiles == 0)
+                    fprintf(stderr,"[prune] archive not laid out monotonically (first break at %ld) -- "
+                                   "whole-file-granular pruning found nothing safely prunable yet below height %ld\n",
+                                   detail, ph);
+                else
+                    fprintf(stderr,"[prune] archive not laid out monotonically (first break at %ld) AND "
+                                   "whole-file-granular pruning failed -- no data deleted\n", detail);
                 break;
+            }
             case ARCHIVE_PRUNE_REFUSE_HOLE:
                 fprintf(stderr,"[prune] REFUSING to prune to height %ld: archive has a hole at height %ld "
                                "(sync incomplete). Gate persisted, no data deleted.\n", ph, detail);

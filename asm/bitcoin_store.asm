@@ -414,6 +414,35 @@ store_get_at:
     syscall
     cmp  rax, 48
     jne  .err
+    ; ---- sparse-prune marker check: archive_prune_file_granular (daemon/
+    ; archive_verify.c) marks an individual record as pruned by setting
+    ; data_size (bytes 44..47) to 0xFFFFFFFF -- an impossible real value (no
+    ; Bitcoin block is anywhere near 4GB) -- when its blk file gets deleted
+    ; below the configured prune_height threshold above. Whole-file pruning
+    ; on a non-monotonic archive can't guarantee a clean single boundary, so
+    ; individual records below the target can need marking even when not
+    ; caught by that scalar prune_height check.
+    ;
+    ; Deliberately NOT the hash/all-zero sentinel archive_first_hole and
+    ; idxscan_first_hole use for "never written" (dlc_span's hole-fill scan
+    ; reads that sentinel directly, off this struct's prune_height field
+    ; only -- see its own comment on the exact redownload-loop this guards
+    ; against for the scalar case): reusing it here would make the
+    ; downloader treat a deliberately-pruned, permanently-gone record as a
+    ; sync gap and re-fetch+re-store it from peers every single boot,
+    ; defeating pruning entirely. Leaving hash/file_no/data_pos untouched
+    ; and marking only data_size keeps every hash- or (file_no,pos)-order-
+    ; based scan (archive_first_hole, archive_layout_monotonic,
+    ; idxscan_first_hole) seeing an ordinary, present, correctly-ordered
+    ; record -- only this specific read path (and store_read_meta/
+    ; store_read_at, which call it) needs to recognise the marker, since
+    ; they are the ones that would otherwise try to open the now-deleted
+    ; blk file. Without this check, a pruned-but-not-below-prune_height
+    ; record would silently report its stale data_pos/data_size/file_no as
+    ; a SUCCESSFUL read against a file that no longer exists, instead of the
+    ; "unavailable" signal callers already handle. ----
+    cmp  dword [rbp-0x78+44], 0xFFFFFFFF
+    je   .pruned
     mov  rax, [rbp-0x78+36]   ; data_pos
     mov  [r14], rax
     mov  eax, [rbp-0x78+44]   ; data_size
