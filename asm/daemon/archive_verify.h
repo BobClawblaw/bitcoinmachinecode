@@ -25,6 +25,7 @@ long archive_first_hole(long upto);
 long archive_prune_height_for_budget(long long budget_bytes);
 archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
                                              long* out_height, long* out_detail);
+long archive_prune_file_granular(long target_height);
 int  archive_verify_and_repair(void* store_buf, int repair);
 long archive_drop_utxo_state(void);
 
