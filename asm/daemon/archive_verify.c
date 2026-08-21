@@ -563,6 +563,171 @@ archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
     return ARCHIVE_PRUNE_OK;
 }
 
+/* archive_prune_file_granular(): fallback executor for the
+ * ARCHIVE_PRUNE_REFUSE_LAYOUT verdict -- reclaims disk space below
+ * target_height even when the archive is NOT laid out monotonically, by
+ * operating at WHOLE-FILE granularity instead of assuming a single
+ * (file_no, data_pos) boundary the way store_prune's in-place compaction
+ * does (store_prune walks height h=target_height upward expecting every
+ * record naming the boundary file to appear as one contiguous run before
+ * the first record of a different file -- exactly the assumption a
+ * non-monotonic archive breaks, which is why archive_prune_decide refuses
+ * before ever calling it in that case).
+ *
+ * Mirrors Bitcoin Core's own real approach to this identical problem: Core's
+ * blk*.dat files are not perfectly height-ordered either (parallel peer
+ * download interleaves them there too), so Core prunes by tracking the
+ * min/max height held in each file and deleting whole files once every
+ * block they contain is safely below the target -- never a partial file,
+ * never a byte-range guess.
+ *
+ * Algorithm:
+ *   1. One sequential pass over index.dat (0..tip) computing, per file_no,
+ *      the min and max height that file holds. Holes (all-zero records,
+ *      the same sentinel archive_first_hole/archive_layout_monotonic
+ *      already treat as empty) are skipped. This also records each
+ *      height's file_no in an array so step 3 does not need a second read
+ *      pass over the file.
+ *   2. A file_no is prunable iff every height it holds is < target_height
+ *      AND it is not the file holding the current tip. The tip-file
+ *      exclusion is deliberate and unconditional, independent of what its
+ *      computed max height happens to be: the tip's file_no is always the
+ *      store's cur_file_no (store_append updates tip_height and
+ *      cur_file_no together, so they can only diverge via truncation, and
+ *      target_height <= tip always here) -- i.e. it is the file the live
+ *      process may still be appending to. Deleting an open file out from
+ *      under its own write fd would not crash the writer (the inode stays
+ *      alive via the fd) but would silently desync it from disk: on the
+ *      next boot, store_init/store_reload would find no file at that name
+ *      and either fail to reopen it or create a fresh empty one, corrupting
+ *      the append offset. Reading tip's file_no straight from index.dat's
+ *      own record (rather than the state struct) keeps this function fully
+ *      independent of bitcoin_store.asm's struct layout, matching this
+ *      file's existing convention of never reaching into st's fields
+ *      directly (see every other archive_* function in this file).
+ *   3. Unlink each prunable file's blk%05u.dat (ENOENT tolerated -- may
+ *      already be gone from a prior partial run).
+ *   4. Mark every index.dat record whose file_no was just deleted by
+ *      setting its data_size field to 0xFFFFFFFF (an impossible real
+ *      value -- no Bitcoin block is anywhere near 4GB), leaving hash/
+ *      file_no/data_pos untouched. Deliberately NOT the all-zero "hole"
+ *      sentinel used elsewhere (archive_first_hole, archive_layout_
+ *      monotonic, and critically idxscan_first_hole/dlc_span, whose
+ *      hole-fill scan reads the archive's SCALAR prune_height field, not
+ *      individual records -- see main.c's dlc_span comment on the exact
+ *      redownload loop that guards against for the scalar-gate case).
+ *      Reusing that sentinel here would make dlc_span's hole scan see a
+ *      deliberately-pruned, permanently-gone record as an ordinary sync
+ *      gap and have the downloader re-fetch it from peers every boot,
+ *      defeating pruning entirely. The data_size marker is invisible to
+ *      every hash- or (file_no,pos)-ordering-based scan and is checked
+ *      only by store_get_at (bitcoin_store.asm), which is the one place
+ *      that would otherwise try to open the now-deleted blk file.
+ *
+ * This does NOT guarantee heights [0, target_height) all become holes --
+ * a file whose min height is below target_height but whose max height is
+ * NOT is retained whole (files are the deletion unit; a still-needed height
+ * a few bytes away from a prunable one is not sacrificed to reclaim it).
+ * That is expected and correct, the same tradeoff Core makes.
+ *
+ * Returns the number of files deleted (>=0), or -1 on an I/O error (index.dat
+ * unreadable). A return of 0 is a normal, successful "nothing was prunable
+ * yet" outcome, not a failure. */
+long archive_prune_file_granular(long target_height){
+    if (target_height <= 0) return 0;
+
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return -1;
+    off_t isz = lseek(fd, 0, SEEK_END);
+    if (isz < 48){ close(fd); return 0; }       /* nothing stored yet */
+    long tip = (long)(isz / 48) - 1;
+    if (target_height > tip + 1) target_height = tip + 1;
+
+    unsigned int* rec_fileno = malloc((size_t)(tip + 1) * sizeof(unsigned int));
+    if (!rec_fileno){ close(fd); return -1; }
+
+    long fno_cap = 256;
+    unsigned int* fmin = malloc((size_t)fno_cap * sizeof(unsigned int));
+    unsigned int* fmax = malloc((size_t)fno_cap * sizeof(unsigned int));
+    if (!fmin || !fmax){ free(rec_fileno); free(fmin); free(fmax); close(fd); return -1; }
+    for (long i = 0; i < fno_cap; i++){ fmin[i] = 0xFFFFFFFFu; fmax[i] = 0; }
+
+    unsigned char rec[48];
+    unsigned int tip_fileno = 0xFFFFFFFFu;
+    for (long h = 0; h <= tip; h++){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48){
+            rec_fileno[h] = 0xFFFFFFFFu;   /* short read: treat as hole */
+            continue;
+        }
+        if (!rec[0] && !rec[1] && !rec[2] && !rec[3]){
+            rec_fileno[h] = 0xFFFFFFFFu;   /* hole */
+            continue;
+        }
+        unsigned int fno; memcpy(&fno, rec + 32, 4);
+        rec_fileno[h] = fno;
+        if (h == tip) tip_fileno = fno;
+
+        if ((long)fno >= fno_cap){
+            long newcap = fno_cap;
+            while ((long)fno >= newcap) newcap *= 2;
+            unsigned int* nmin = realloc(fmin, (size_t)newcap * sizeof(unsigned int));
+            unsigned int* nmax = realloc(fmax, (size_t)newcap * sizeof(unsigned int));
+            if (!nmin || !nmax){ free(rec_fileno); free(nmin?nmin:fmin); free(nmax?nmax:fmax); close(fd); return -1; }
+            for (long i = fno_cap; i < newcap; i++){ nmin[i] = 0xFFFFFFFFu; nmax[i] = 0; }
+            fmin = nmin; fmax = nmax; fno_cap = newcap;
+        }
+        if ((unsigned int)h < fmin[fno]) fmin[fno] = (unsigned int)h;
+        if ((unsigned int)h > fmax[fno]) fmax[fno] = (unsigned int)h;
+    }
+    close(fd);
+
+    if (tip_fileno == 0xFFFFFFFFu){   /* tip itself is a hole -- refuse to guess */
+        free(rec_fileno); free(fmin); free(fmax);
+        return 0;
+    }
+
+    /* ---- decide which files are wholly prunable ---- */
+    char* prunable = calloc((size_t)fno_cap, 1);
+    if (!prunable){ free(rec_fileno); free(fmin); free(fmax); return -1; }
+    long deleted = 0;
+    for (long f = 0; f < fno_cap; f++){
+        if (fmin[f] == 0xFFFFFFFFu) continue;         /* file never referenced */
+        if ((unsigned int)f == tip_fileno) continue;   /* never touch the open file */
+        if (fmax[f] >= (unsigned int)target_height) continue;  /* still holds a live height */
+        prunable[f] = 1;
+    }
+    free(fmin); free(fmax);
+
+    /* ---- unlink the whole-file victims ---- */
+    for (long f = 0; f < fno_cap; f++){
+        if (!prunable[f]) continue;
+        char name[24];
+        snprintf(name, sizeof name, "blk%05u.dat", (unsigned int)f);
+        if (unlink(name) == 0 || errno == ENOENT) deleted++;
+        else prunable[f] = 0;   /* unlink failed for a real reason -- do not touch its index records */
+    }
+
+    /* ---- mark the index records that pointed into a deleted file: patch
+     * only the 4-byte data_size field (offset 44) to the 0xFFFFFFFF pruned
+     * sentinel, leaving hash/file_no/data_pos exactly as they were. ---- */
+    if (deleted > 0){
+        int wfd = open("index.dat", O_WRONLY);
+        if (wfd >= 0){
+            static const unsigned char pruned_size[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+            for (long h = 0; h <= tip; h++){
+                unsigned int fno = rec_fileno[h];
+                if (fno == 0xFFFFFFFFu) continue;
+                if ((long)fno >= fno_cap || !prunable[fno]) continue;
+                pwrite(wfd, pruned_size, 4, (off_t)h * 48 + 44);
+            }
+            close(wfd);
+        }
+    }
+
+    free(rec_fileno); free(prunable);
+    return deleted;
+}
+
 /* archive_verify_and_repair(): scan, and if corrupt, truncate back to the last
  * known-good height so normal sync re-downloads the rest.
  *   repair == 0 -> report only (log and return, change nothing)
