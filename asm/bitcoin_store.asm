@@ -1665,6 +1665,106 @@ store_truncate_to:
     pop  rbp
     ret
 
+; ============================================================================
+; store_truncate_index_only(st, target_height) -> 1 ok / -1 err
+;
+; INDEX-ONLY logical truncation: drops index.dat records for every height
+; above target_height, WITHOUT touching any blk*.dat file and WITHOUT
+; requiring (or checking) store_layout_monotonic. This is deliberately safe
+; on a non-monotonically-laid-out archive, unlike store_truncate_to just
+; above, because it never reads or interprets a (file_no, data_pos) boundary
+; to decide what to ftruncate/unlink. index.dat is positional-by-height by
+; construction -- record h always lives at byte h*48, independent of where
+; that record's block DATA physically sits in the blk files -- so shrinking
+; index.dat down to height target_height is unconditionally sound, even on
+; the exact archive that made store_truncate_to destroy ~600GB (see
+; store_layout_monotonic's header comment for that incident).
+;
+; TRADEOFF, deliberate: cur_file_no/cur_file_pos (where the NEXT
+; store_append will write) are left untouched, so the block data belonging
+; to the now-forgotten heights (target_height+1 .. old tip) stays physically
+; present in the blk files as unreachable, unreclaimed bytes. This function
+; never deletes or reorders a single existing byte -- it only forgets
+; index.dat's pointers to a suffix of them. Blocks appended after this call
+; (e.g. the new canonical chain's blocks during a reorg) land after all
+; existing data via the unchanged cur_file_no/cur_file_pos, so they never
+; overwrite anything. Space for the forgotten heights is not reclaimed;
+; that is the price of safety on a non-monotonic archive and is fine for a
+; reorg's typically-shallow depth (a handful of blocks, not the whole
+; store) -- see daemon/archive_verify.c's archive_truncate_safe for the
+; caller-side choice between this and the space-reclaiming store_truncate_to.
+;
+; Frame: 5 pushes -> save area [rbp-0x28, rbp). No stack locals are needed
+; (everything lives in registers); sub 0x18 (24, 8 mod 16) keeps the final
+; rsp 16-aligned, matching this file's convention, though not load-bearing
+; here since this function makes no further `call`s, only raw syscalls.
+; ============================================================================
+global store_truncate_index_only
+store_truncate_index_only:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x18
+    mov  r12, rdi                  ; st
+    mov  r13, rsi                   ; target_height (signed 64-bit)
+    mov  eax, [r12+24]               ; current tip_height
+    cmp  eax, -1
+    je   .tio_noop                     ; store already empty -> nothing to do
+    movsxd rax, eax
+    cmp  r13, rax
+    jge  .tio_noop                      ; target >= tip -> nothing to drop
+    cmp  r13, -1
+    je   .tio_full                       ; target_height==-1 -> drop entire index
+
+    ; ---- ftruncate index.dat to (target_height+1)*48 ----
+    mov  rax, r13
+    add  rax, 1
+    imul rax, 48
+    mov  r14, rax                         ; stash new idx_len
+    mov  rdi, [r12+8]                      ; idx_fd
+    mov  rsi, rax
+    mov  eax, 77                              ; ftruncate
+    syscall
+    test rax, rax
+    js   .tio_err
+
+    mov  [r12+16], r14                         ; idx_len
+    mov  eax, r13d
+    mov  [r12+24], eax                           ; tip_height
+    mov  rax, 1
+    jmp  .tio_ret
+
+.tio_full:
+    mov  rdi, [r12+8]
+    xor  esi, esi
+    mov  eax, 77                                    ; ftruncate index.dat to 0
+    syscall
+    test rax, rax
+    js   .tio_err
+    mov  qword [r12+16], 0
+    mov  dword [r12+24], -1
+    mov  rax, 1
+    jmp  .tio_ret
+
+.tio_noop:
+    mov  rax, 1
+    jmp  .tio_ret
+.tio_err:
+    mov  rax, -1
+.tio_ret:
+    add  rsp, 0x18
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
 section .rodata
 blkname: db "blk00000.dat", 0   ; (fmt_blkname builds actual names at runtime)
 idxname: db "index.dat", 0
