@@ -16,13 +16,15 @@
 ;   sc_sqr(r[4], a[4])       : r = (a*a) mod n
 ;   sc_inv(r[4], a[4])       : r = a^(n-2) mod n  (Fermat)
 ;
-; DESIGN NOTE (correctness-first): sc_mul is implemented as MSB->LSB
-; double-and-add in the scalar ring, using only sc_add (which is a simple,
-; fully-tested 256-bit modular add).  This trades speed for clarity and
-; verifiability: no multi-limb mulq/carry logic to get wrong.  ECDSA
-; verification is not on the IBD hot path, so the constant factor cost is
-; acceptable.  sc_inv uses MSB->LSB square-and-multiply over the Fermat
-; exponent n-2.
+; DESIGN NOTE: sc_mul was originally a correctness-first MSB->LSB
+; double-and-add over sc_add. It was replaced (2026-08-16, see commits
+; 5e39cc5/71985ca) with a constant-time native schoolbook multiply +
+; bounded-fold reduction (see sc_mul's own header comment below for the
+; current design) once ECDSA verification became a real hot path -- this
+; note previously described the abandoned slow version and was stale.
+; sc_inv uses MSB->LSB square-and-multiply over the Fermat exponent n-2,
+; so its cost is dominated by ~255 sc_mul calls; see sc_mul's own comment
+; for that function's current cost profile.
 ;
 ;   System V AMD64 ABI: args rdi,rsi,rdx; preserve rbx/r12-r15. sc_mul/sc_inv
 ;   call sc_add/sc_sub, so they keep their own long-lived state in callee-saved
