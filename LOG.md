@@ -7,6 +7,95 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
+
+### Real production incident #4 (autonomous, overnight): CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY were stubs, not real checks
+The overnight replay (continuing from incident #3's redeploy) hit a new,
+deterministic rejection at real mainnet height 388431: `REJECT h=388431
+tx=564: legacy script verification failed`. Root-caused directly: `OP_CLTV`/
+`OP_CSV` in `bitcoin_interp.asm` were wired as pass-through no-ops rather
+than the real BIP65/BIP112 locktime/sequence comparisons against the
+spending transaction's own `nLockTime`/`nSequence` -- silently accepting
+scripts a real node must reject. Implemented the real checks; fixed in
+commit `fbeff60`. Compacting/recovering in place was not attempted this
+time -- given a rejection this late in a long replay could plausibly leave
+a subtly-wrong-but-not-obviously-broken UTXO set behind it (CLTV/CSV gate
+*script success*, not consensus state directly, but the safer call given
+the project's standing "verify against real data, don't assume" discipline
+was a full from-scratch redeploy rather than trusting the compaction-based
+in-place recovery path). `bmc-bitcoind.service` redeployed fresh
+(`applied_height=-1`) at 03:45:36 and confirmed clean past height 388431 on
+the very next attempt -- the fix holds under real replay.
+
+### Real production incident #5: UTXO checkpoint could lag real durable state by an unbounded amount, masquerading as corruption on crash-resume
+The fresh replay from incident #4 progressed cleanly to height 363896,
+took a routine mid-catchup compaction there (`manifest_n=1 -> result=1`,
+06:07:09), and kept running for several more hours. The HOST machine then
+rebooted multiple times, unprompted and unrelated to this project (external
+infra event, confirmed via `last reboot`), between 11:16 and 12:13 --
+killing the daemon uncleanly. It is not enabled on boot (per standing
+preference to run it manually), so it sat stopped until a manual restart at
+13:25:12, which reloaded the last persisted checkpoint (height 363896) and
+immediately hit a NEW, deterministic rejection on every retry: `REJECT
+h=363897 tx=1: input references a missing/already-spent UTXO`.
+
+This is the SAME failure shape flagged as unresolved in a 2026-08-19 code
+comment (`daemon/utxo_live.c`, near `utxo_live_catchup`) after an earlier,
+abandoned attempt at periodic mid-catchup checkpointing was reverted --
+that comment's leading theory (a flush/compact reconstruction bug silently
+dropping live entries) was WRONG, but the underlying symptom it observed
+was real and finally root-caused this session: `applied_height` was only
+persisted at rare compaction events or once at the very end of a (possibly
+hours-long) catch-up call, while every individual `utxo_lsm_put`/`del` is
+already durable the instant it runs. An unclean process death therefore
+routinely left the true on-disk UTXO state hours AHEAD of the last-written
+checkpoint. On restart, catch-up trusted the stale checkpoint and tried to
+re-verify a block whose inputs it had already durably spent before the
+crash -- correctly failing that re-verification (the input really is
+already spent), but incorrectly treating a "this block was already
+applied" situation as a fatal consensus rejection instead of a safe replay
+no-op. Two other worktrees from an earlier, independent investigation of
+this exact bug were found still on disk (`.worktrees/verify-snapshot-resume`,
+chasing the wrong flush/compact theory, and `.worktrees/fix-crash-resume-verify`,
+a real but incomplete fix that only re-checked the FIRST resumed height per
+boot rather than every block in a potentially multi-thousand-block gap) --
+both removed as superseded once the real fix landed.
+
+Fix: persist `applied_height` after every successfully applied block
+(`daemon/utxo_live.c`), not just at compactions/end-of-call, so no gap
+between real and checkpointed state can ever exist -- correct by
+construction rather than by detecting and tolerating the gap after the
+fact. Added a test-only crash-injection hook
+(`utxo_live_test_set_crash_after`, a guarded no-op unless a test arms it).
+New regression test (`tests/test_utxo_catchup_crash_resume.c`) builds a real
+chain with a real spend, forks a child that applies exactly one block and
+`_exit(1)`s right where its checkpoint should persist, then does a real
+`utxo_live_close()`+`utxo_live_init()` restart and asserts the checkpoint
+reflects the crashed block and resume is a clean no-op; verified via
+disabling the fix line that it reproduces the exact production symptom
+(`REJECT h=150 tx=1: input references a missing/already-spent UTXO`)
+pre-fix and passes with it restored. Full `make -k test`: 1582/1582, both
+in the fix worktree and after rebuild on `main`. Merged (`--ff-only`) and
+pushed as commit `2fd4a14`.
+
+Because the true durable height of the crashed run was unknown (and not
+worth the risk of guessing), UTXO state was dropped
+(`archive_drop_utxo_state()`'s exact file set: `utxo_applied_height.dat`,
+`utxo.dat`, `utxo.idx`, `utxo_manifest.dat*`, `utxo_lsm_table.map`,
+`utxo_lsm_blob.map`, every `utxo_run_*.dat` and `undo_*.dat`) and
+`bmc-bitcoind.service` redeployed fresh at 14:36:31, now durably protected
+against a repeat of this exact failure mode regardless of when a future
+crash lands.
+
+**Status at end of session:** both fixes (`fbeff60`, `2fd4a14`) merged to
+`main` and pushed. `bmc-bitcoind.service` redeployed from scratch,
+confirmed clean past height 363896 (the incident #5 stall point) via a
+routine compaction with no rejection, replaying toward chain tip 963445.
+Height 388431 (incident #4's stall point) not yet re-reached by this fresh
+replay as of session end, but already independently confirmed clean once
+during incident #4's own post-fix redeploy. Monitoring continues
+unattended.
+
 ## 2026-08-19/20 -- Stage D wired live; three real production incidents found and fixed during the first full-archive replay
 
 ### Wiring: script verification connected to block connection
