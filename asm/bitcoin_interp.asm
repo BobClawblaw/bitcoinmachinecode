@@ -2084,7 +2084,34 @@ script_eval:
     mov   rax, SCRIPT_ERR_NEGATIVE_LOCKTIME
     jmp   .err_ret0
 .cltv_nn:
-    ; no tx context in pure interpreter -> unsatisfied
+    ; BIP65 CheckLockTime (real Core algorithm, script/interpreter.cpp),
+    ; using the tx.nLockTime / this input's nSequence that sv_verify_script
+    ; now threads into script_state (added 2026-08-21 -- this used to be a
+    ; hardcoded "no tx context in pure interpreter -> unsatisfied", i.e.
+    ; every CHECKLOCKTIMEVERIFY spend was unconditionally rejected. Found
+    ; via a real mainnet block, height 388431, right at BIP65's real
+    ; activation -- the first CLTV-locked spend the replay ever reached).
+    ; rax = scriptTime (non-negative CScriptNum, already confirmed above).
+    mov   r15, rax                     ; r15 = scriptTime
+    mov   eax, [r12+104]               ; tx_locktime (u32, zero-extends into rax)
+    mov   r14, rax                     ; r14 = tx.nLockTime (u64)
+    mov   rax, 500000000               ; LOCKTIME_THRESHOLD
+    cmp   r15, rax
+    jl    .cltv_script_below
+    cmp   r14, rax
+    jl    .cltv_unsatisfied            ; type mismatch: script>=thresh, tx<thresh
+    jmp   .cltv_type_ok
+.cltv_script_below:
+    cmp   r14, rax
+    jge   .cltv_unsatisfied            ; type mismatch: script<thresh, tx>=thresh
+.cltv_type_ok:
+    cmp   r15, r14
+    jg    .cltv_unsatisfied            ; scriptTime > tx.nLockTime -> not yet satisfied
+    mov   eax, [r12+108]               ; in_sequence (u32)
+    cmp   eax, 0xffffffff              ; SEQUENCE_FINAL
+    je    .cltv_unsatisfied            ; finalized input bypasses nLockTime -> reject
+    jmp   .next_op
+.cltv_unsatisfied:
     mov   rax, SCRIPT_ERR_UNSATISFIED_LOCKTIME
     jmp   .err_ret0
 
@@ -2113,9 +2140,40 @@ script_eval:
     mov   rax, SCRIPT_ERR_NEGATIVE_LOCKTIME
     jmp   .err_ret0
 .csv_nn:
-    ; disable flag (bit 31) -> NOP
+    ; disable flag (bit 31) on the SCRIPT's own operand -> NOP (pre-existing,
+    ; correct -- unrelated to the input's real nSequence checked below).
     test  rax, 0x80000000
     jnz   .next_op
+    ; BIP68/BIP112 CheckSequence (real Core algorithm, script/interpreter.cpp),
+    ; using tx.nVersion / this input's nSequence now threaded into
+    ; script_state (added 2026-08-21, same fix as CHECKLOCKTIMEVERIFY above
+    ; -- this was also a hardcoded unconditional reject).
+    mov   r15, rax                     ; r15 = scriptSequence
+    mov   eax, [r12+112]               ; tx_version (u32)
+    cmp   eax, 2
+    jl    .csv_unsatisfied             ; BIP68 requires tx.nVersion >= 2
+    mov   eax, [r12+108]               ; in_sequence (u32)
+    test  eax, 0x80000000              ; this input's OWN disable flag
+    jnz   .csv_unsatisfied
+    mov   r14, rax                     ; r14 = txToSequence (u64, zero-extended)
+    mov   rcx, 0x0040ffff              ; SEQUENCE_LOCKTIME_TYPE_FLAG | SEQUENCE_LOCKTIME_MASK
+    and   r14, rcx                     ; txToSequenceMasked
+    mov   r13, r15
+    and   r13, rcx                     ; nSequenceMasked
+    mov   rax, 0x00400000              ; SEQUENCE_LOCKTIME_TYPE_FLAG
+    cmp   r13, rax
+    jl    .csv_script_below
+    cmp   r14, rax
+    jl    .csv_unsatisfied             ; type mismatch: script>=flag, tx<flag
+    jmp   .csv_type_ok
+.csv_script_below:
+    cmp   r14, rax
+    jge   .csv_unsatisfied             ; type mismatch: script<flag, tx>=flag
+.csv_type_ok:
+    cmp   r13, r14
+    jg    .csv_unsatisfied             ; nSequenceMasked > txToSequenceMasked -> not yet satisfied
+    jmp   .next_op
+.csv_unsatisfied:
     mov   rax, SCRIPT_ERR_UNSATISFIED_LOCKTIME
     jmp   .err_ret0
 

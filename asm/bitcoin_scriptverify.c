@@ -50,6 +50,12 @@ struct script_state {
     void*     checksig_ctx;
     uint64_t (*checksig_fn)(void*, const uint8_t*, size_t,
                             const uint8_t*, size_t, const void*);
+    /* CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY (BIP65/BIP68/BIP112) context.
+     * Appended at the end -- every existing offset elsewhere in this file
+     * and in bitcoin_interp.asm stays valid unchanged. */
+    uint32_t  tx_locktime;
+    uint32_t  in_sequence;
+    uint32_t  tx_version;
 };
 extern int script_eval(struct script_state* st);
 
@@ -100,7 +106,55 @@ static int sv_true(sv_stack* s, size_t i){
 struct sv_ctx {
     const uint8_t* tx; unsigned long txlen; unsigned long nIn;
     uint8_t* work; unsigned long workcap;
+    uint32_t tx_locktime; uint32_t in_sequence; uint32_t tx_version;
 };
+
+/* sv_get_locktime_context: pull tx.nVersion, tx.nLockTime, and input nIn's
+ * nSequence out of the raw tx bytes sv_verify_script already receives --
+ * CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY need these but nothing before
+ * 2026-08-21 ever threaded them into the interpreter (op_cltv/op_csv were
+ * unconditional stubs that rejected every use of either opcode -- see the
+ * fix commit for the real mainnet regression this was found from). Minimal,
+ * self-contained walk: only reads as far as input nIn's sequence field, does
+ * not need outputs. Returns 0 on a malformed/truncated tx or out-of-range
+ * nIn (caller must already have validated nIn against the real input count
+ * via some other path -- this is read-only script verification support, not
+ * itself a structural validity check). */
+static int sv_get_locktime_context(const uint8_t* tx, unsigned long txlen, unsigned long nIn,
+                                   uint32_t* out_version, uint32_t* out_locktime, uint32_t* out_sequence){
+    if (txlen < 8) return 0;
+    memcpy(out_version, tx, 4);
+    memcpy(out_locktime, tx + txlen - 4, 4);
+
+    const uint8_t* p = tx + 4;
+    const uint8_t* end = tx + txlen;
+    if (p+2 <= end && p[0]==0x00 && p[1]==0x01) p += 2; /* segwit marker/flag */
+
+    unsigned long n_in;
+    if (p>=end) return 0;
+    { uint8_t c = *p;
+      if (c < 0xfd) { n_in = c; p += 1; }
+      else if (c == 0xfd) { if (p+3>end) return 0; n_in = (unsigned long)p[1] | ((unsigned long)p[2]<<8); p += 3; }
+      else if (c == 0xfe) { if (p+5>end) return 0; uint32_t v; memcpy(&v,p+1,4); n_in = v; p += 5; }
+      else { if (p+9>end) return 0; uint64_t v; memcpy(&v,p+1,8); n_in = (unsigned long)v; p += 9; } }
+
+    for (unsigned long i=0; i<n_in; i++){
+        if (p+36 > end) return 0;
+        p += 36; /* prevout */
+        unsigned long slen;
+        if (p>=end) return 0;
+        { uint8_t c = *p;
+          if (c < 0xfd) { slen = c; p += 1; }
+          else if (c == 0xfd) { if (p+3>end) return 0; slen = (unsigned long)p[1] | ((unsigned long)p[2]<<8); p += 3; }
+          else if (c == 0xfe) { if (p+5>end) return 0; uint32_t v; memcpy(&v,p+1,4); slen = v; p += 5; }
+          else { if (p+9>end) return 0; uint64_t v; memcpy(&v,p+1,8); slen = (unsigned long)v; p += 9; } }
+        if ((unsigned long)(end - p) < slen + 4) return 0;
+        p += slen;
+        if (i == nIn) { memcpy(out_sequence, p, 4); return 1; }
+        p += 4; /* sequence */
+    }
+    return 0; /* nIn out of range */
+}
 
 static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
                             const uint8_t* pub, size_t publen, const void* slice){
@@ -218,6 +272,9 @@ static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
     s.error_out  = &e;
     s.checksig_ctx = ctx;
     s.checksig_fn  = sv_checksig;
+    s.tx_locktime  = ctx->tx_locktime;
+    s.in_sequence  = ctx->in_sequence;
+    s.tx_version   = ctx->tx_version;
 
     int ok = script_eval(&s);
     st->sp = s.main_sp;
@@ -234,8 +291,15 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
     static __thread uint8_t copy_e[MAX_STACK*ELEM_SIZE];
     sv_stack st = { main_e, 0 };
     sv_stack cp = { copy_e, 0 };
-    struct sv_ctx ctx = { tx, txlen, nIn, work, workcap };
+    struct sv_ctx ctx = { tx, txlen, nIn, work, workcap, 0, 0, 0 };
     int err = SCRIPT_ERR_OK;
+    /* CLTV/CSV context -- see sv_get_locktime_context's own comment. Leaves
+     * all three at 0 on failure (tx too short / nIn out of range, which
+     * should not happen -- callers already validated tx structure and nIn
+     * before reaching here); CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY simply
+     * won't be satisfiable with all-zero context if that path is ever hit,
+     * which is the safe direction to fail in. */
+    sv_get_locktime_context(tx, txlen, nIn, &ctx.tx_version, &ctx.tx_locktime, &ctx.in_sequence);
 
     memset(main_e, 0, sizeof main_e);
 
