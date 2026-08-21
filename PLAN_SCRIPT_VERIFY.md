@@ -509,8 +509,58 @@ materially changes B.
 ## Related known issues
 
 - The archive is **not laid out monotonically** (`[check]` reports the first
-  break at height 41 on a test archive) because the parallel chunked
-  downloader writes out of height order. This already blocks reorg
-  truncation and pruning. It does not block script verification, which
-  reads via the index, but it is the same underlying limitation and may be
-  worth fixing in the same push.
+  break at height 40/41 on the real archive) because the parallel chunked
+  downloader writes blocks to disk in whatever order their downloads finish,
+  not in height order. It does not block script verification, which reads
+  via the index, not by physical position.
+
+  **2026-08-21: TRUNCATION-FROM-THE-TIP fixed for this case; PRUNING is
+  not, and is a separate, harder problem -- see below.** Both used to
+  either refuse outright or (before `store_layout_monotonic`'s guard
+  existed) risk a repeat of the ~600GB archive loss documented in that
+  primitive's own header comment: physical `store_truncate_to` genuinely
+  cannot be trusted on a non-monotonic archive, since it assumes a
+  height's on-disk position tells you where all HIGHER heights' data
+  starts, which is exactly false here.
+
+  The fix is `store_truncate_index_only` (`bitcoin_store.asm`) +
+  `archive_truncate_safe` (`daemon/archive_verify.c`): index.dat is
+  positional-by-height by construction (record h always lives at byte
+  h*48, independent of where that record's block DATA physically sits in
+  the blk files), so shrinking it to drop heights above a target is
+  unconditionally sound regardless of layout. `archive_truncate_safe` uses
+  the physical, space-reclaiming `store_truncate_to` when the archive
+  genuinely is monotonic below the target, and this index-only fallback
+  otherwise -- at the cost of not reclaiming the disconnected heights'
+  disk space (their bytes stay physically present, just unreachable via
+  the index). That tradeoff is fine for what actually calls it: reorg's
+  disconnect path (`daemon/reorg.c`'s `reorg_execute`) and this project's
+  own duplicate/corruption self-repair (`archive_verify_and_repair`) --
+  both truncate from the TIP going backward, and both are typically
+  shallow (a handful of blocks), not the whole archive. Both now route
+  through `archive_truncate_safe` and can make real progress on a
+  non-monotonic archive instead of refusing. Regression-tested against a
+  synthetic non-monotonic archive plus a normal monotonic one (no
+  behavior change for the common case) in
+  `tests/test_archive_truncate_nonmonotonic.c`.
+
+  **Pruning is NOT fixed by this and remains genuinely blocked** on a
+  non-monotonic archive (`archive_prune_decide` still returns
+  `ARCHIVE_PRUNE_REFUSE_LAYOUT`). Pruning's whole point is reclaiming disk
+  space from OLD (low) heights, which the index-only trick cannot give it
+  -- "forgetting" old index records without touching the blk files frees
+  no space at all, defeating the purpose, and would also make a pruned
+  height look like an ordinary re-fetchable hole rather than intentionally
+  discarded. A real fix needs either (a) a maintenance pass that
+  physically rewrites the archive into height order once, or (b)
+  fine-grained, byte-range-aware reclamation instead of whole-file
+  unlink/ftruncate. Neither is implemented; this remains open.
+
+  Separately, and not addressed here: making the downloader itself write
+  in height order in the first place (so future archives are monotonic
+  from the start) was considered and deliberately not pursued -- it would
+  touch the performance-sensitive parallel download path for a benefit
+  the index-only truncation fix above already captures for the case that
+  actually matters (reorg/repair), while pruning would need the
+  fine-grained fix above regardless of write order for any ALREADY
+  non-monotonic archive (like the one currently in production).

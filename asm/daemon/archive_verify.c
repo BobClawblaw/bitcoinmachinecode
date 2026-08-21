@@ -43,6 +43,7 @@
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern int  store_truncate_to(void* st, long target_height);
+extern int  store_truncate_index_only(void* st, long target_height);
 extern long store_reload(void* st);
 
 static unsigned long next_pow2(unsigned long v){
@@ -271,6 +272,36 @@ long archive_layout_monotonic(long upto){
     }
     close(fd);
     return bad;
+}
+
+/* archive_truncate_safe(): truncate the archive to target_height using the
+ * best available method, instead of unconditionally requiring physical
+ * monotonic layout the way a bare store_truncate_to call does.
+ *
+ * When the archive genuinely IS laid out in height order up to (and
+ * including) the boundary record at target_height+1, uses the physical,
+ * space-reclaiming store_truncate_to (unlinks/ftruncates blk files). When
+ * it is NOT -- exactly the situation that used to make every truncating
+ * caller (reorg's disconnect path, this file's own corruption repair)
+ * either refuse outright or risk destroying the archive -- falls back to
+ * store_truncate_index_only, which is unconditionally safe (never reads or
+ * trusts a (file_no,data_pos) boundary) at the cost of not reclaiming the
+ * disconnected heights' disk space. See store_truncate_index_only's own
+ * header comment (bitcoin_store.asm) for why that tradeoff is sound.
+ *
+ * out_used_index_only, if non-NULL, is set to 1 when the fallback path ran
+ * and 0 when the physical path ran, so callers can log which happened.
+ * Returns whatever the primitive actually invoked returns (1 ok / -1 err) --
+ * a -1 here is a genuine failure of that primitive (bad fd, I/O error,
+ * corrupt index), never "layout was non-monotonic", since that case is
+ * routed to the always-safe primitive instead of failing. */
+int archive_truncate_safe(void* st, long target_height, int* out_used_index_only){
+    long badh = archive_layout_monotonic(target_height + 1);
+    int use_index_only = (badh >= 0);
+    if (out_used_index_only) *out_used_index_only = use_index_only;
+    if (use_index_only)
+        return store_truncate_index_only(st, target_height);
+    return store_truncate_to(st, target_height);
 }
 
 /* ---------------------------------------------------------------------------
@@ -561,29 +592,28 @@ int archive_verify_and_repair(void* store_buf, int repair){
     long keep = first_bad - 1;
     if (keep < 0) keep = 0;
 
-    /* SAFETY GATE -- see archive_layout_monotonic. Truncation is only sound
-     * when block data really is laid out in height order; on this archive it
-     * was not, and truncating cost ~4,855 block files. Refuse rather than
-     * destroy: a node that declines to repair is recoverable, one that has
-     * deleted its archive is not. */
-    long nonmono = archive_layout_monotonic(keep);
-    if (nonmono >= 0){
-        fprintf(stderr, "[archive] REFUSING TO TRUNCATE: block data is not in height order\n");
-        fprintf(stderr, "[archive]   height %ld points BACKWARDS in the blk files.\n", nonmono);
-        fprintf(stderr, "[archive]   store_truncate_to assumes append-in-height-order and would cut the\n");
-        fprintf(stderr, "[archive]   first block file at that low offset and unlink everything above it,\n");
-        fprintf(stderr, "[archive]   destroying the archive. Manual repair or a full re-sync is required.\n");
-        return -1;
-    }
-
+    /* SAFETY -- see archive_layout_monotonic / store_truncate_index_only.
+     * A non-monotonic archive below `keep` used to make this refuse outright
+     * (destroyed ~600GB once when it didn't -- see this file's own header
+     * comment). archive_truncate_safe now routes to the always-safe,
+     * index-only fallback in that case instead of refusing: it discards the
+     * disconnected heights' index records (so normal sync re-downloads them)
+     * without trusting the corrupt archive's (file_no,data_pos) ordering,
+     * at the cost of not reclaiming their disk space. */
     fprintf(stderr, "[archive] repairing: truncating to height %ld (discarding %ld entries above it).\n",
             keep, entries - 1 - keep);
     fprintf(stderr, "[archive] the store is append-only, so truncate-and-resync is the only sound repair;\n");
     fprintf(stderr, "[archive] normal sync will re-download from %ld.\n", keep + 1);
 
-    if (store_truncate_to(store_buf, keep) != 1){
+    int used_index_only = 0;
+    if (archive_truncate_safe(store_buf, keep, &used_index_only) != 1){
         fprintf(stderr, "[archive] TRUNCATE FAILED -- archive still corrupt, UTXO tracking should stay off\n");
         return -1;
+    }
+    if (used_index_only){
+        fprintf(stderr, "[archive] NOTE: block data below height %ld is not laid out in height order, so this\n", keep);
+        fprintf(stderr, "[archive]   repair used the index-only fallback -- disconnected block bytes remain on\n");
+        fprintf(stderr, "[archive]   disk, unreclaimed, rather than risk a destructive truncate on bad layout.\n");
     }
     store_reload(store_buf);
     fprintf(stderr, "[archive] repair complete: archive truncated to height %ld\n", keep);
