@@ -486,7 +486,8 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o \
-    secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o
+    secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
+    bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
     bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
@@ -887,6 +888,12 @@ TAPSIGHASHOBJS := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproo
 tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h tests/taproot_vec.h $(TAPSIGHASHOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
 
+# BIP341/BIP342 script-path spend dispatch (taproot_verify_input): witness
+# classification, control-block Merkle commitment, and full tapscript
+# execution via the shared script_eval interpreter.
+tests/test_taproot_scriptpath: tests/test_taproot_scriptpath.c tests/taproot_scriptpath_vec.h $(TAPSIGHASHOBJS)
+	$(CC) -no-pie -O0 -o $@ tests/test_taproot_scriptpath.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
+
 # BIP143 segwit-v0 sighash + P2WPKH/P2WSH spend verification (bitcoin_segwit.c)
 # over the verified asm primitives (sha256_full, ecdsa_verify, pubkey_parse,
 # der_parse_sig, hash160). Vectors are oracle-generated genuine P2WPKH/P2WSH
@@ -896,7 +903,7 @@ SEGWITOBJS := bitcoin_segwit.c bitcoin_taproot_sighash.c secp256k1_schnorr.o sec
     bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o \
     secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
     secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o \
-    bitcoin_addr.o
+    bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/modern_spend.h $(SEGWITOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
 
@@ -908,7 +915,7 @@ MEMPACCOBJS := bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o \
-    ripemd160.o bitcoin_addr.o
+    ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/modern_vec.h tests/modern_spend.h $(MEMPACCOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_mempool_accept_modern.c $(filter %.c,$(MEMPACCOBJS)) $(filter %.o,$(MEMPACCOBJS))
 
@@ -923,7 +930,7 @@ TXACCEPTOBJS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bit
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o \
-    bitcoin_hash.o ripemd160.o bitcoin_addr.o
+    bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXACCEPTOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_tx_accept_e2e.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS))
 
@@ -1035,7 +1042,7 @@ tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
 test: tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 \
-tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume \
+tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath \
 	./tests/test_node_config
 	./tests/test_archive_check
 	./tests/test_archive_repair
@@ -1096,6 +1103,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_schnorr tests/bip340_test_vectors.csv
 	./tests/test_taproot
 	./tests/test_taproot_sighash
+	./tests/test_taproot_scriptpath
 	./tests/test_segwit_sighash
 	./tests/test_mempool_accept_modern
 	./tests/test_tx_accept_e2e

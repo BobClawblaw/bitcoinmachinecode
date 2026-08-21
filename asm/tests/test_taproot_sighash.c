@@ -134,11 +134,19 @@ struct script_state {
 };
 extern int script_eval(struct script_state* st);
 
-/* checksig context for the interpreter (from bitcoin_taproot_sighash.c) */
+/* checksig context for the interpreter (from bitcoin_taproot_sighash.c) --
+ * must mirror that file's struct exactly, field-for-field, including the
+ * annex/weight_left fields added 2026-08-21 for script-path dispatch
+ * (taproot_verify_input): this is a plain C struct passed by pointer, so a
+ * stale/short local copy here would make taproot_checksig_fn read past the
+ * end of whatever a caller here allocates -- garbage stack memory, not a
+ * compile error. */
 typedef struct {
     const uint8_t* tx; int64_t txlen; int64_t n_in;
     const uint8_t* prevouts; const uint8_t* amounts; const uint8_t* spks;
     int64_t num_inputs; const uint8_t* tapleaf; uint32_t codesep_pos;
+    const uint8_t* annex; uint64_t annexlen;
+    int64_t weight_left;
 } taproot_checksig_ctx;
 extern uint64_t taproot_checksig_fn(void*, const uint8_t*, size_t,
                                     const uint8_t*, size_t, const void*);
@@ -168,6 +176,8 @@ static int interp_tapspend(const tspend_t* s, const uint8_t* tapleaf,
     cctx.tx = s->tx; cctx.txlen = s->txlen; cctx.n_in = s->index;
     cctx.prevouts = s->prevouts; cctx.amounts = s->amounts; cctx.spks = s->spks;
     cctx.num_inputs = s->numin; cctx.tapleaf = tapleaf; cctx.codesep_pos = 0xffffffff;
+    cctx.annex = NULL; cctx.annexlen = 0;
+    cctx.weight_left = 1000000; /* generous: this harness isn't testing the budget itself */
 
     struct script_state st;
     memset(&st, 0, sizeof(st));
