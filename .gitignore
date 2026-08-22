@@ -236,6 +236,8 @@ asm/tests/bench_ecdsa
 asm/tests/bench_segwit_sighash
 asm/tests/bench_taproot_sighash
 asm/tests/bench_fe
+asm/tests/bench_point
+asm/tests/test_fe_inline
 asm/tests/test_addr_ingest
 asm/tests/test_archive_check
 asm/tests/test_archive_repair
