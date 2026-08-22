@@ -280,3 +280,7 @@ LSOverride
 # Apple's per-folder resource fork directory
 .fseventsd
 
+asm/tests/test_lsm_sparse_diff
+asm/tests/soak_lsm_mm
+asm/tests/test_lsm_bloomsat
+asm/tests/diff_real_run
