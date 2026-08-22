@@ -14,6 +14,14 @@
 ;        be_to_limbs) and the trailing SIGHASH-type byte (0 if absent).
 ;        Returns 1 ok / 0 malformed.
 ;
+;        der_parse_sig deliberately stays TOLERANT: it is what pre-BIP66
+;        mainnet history needs. The BIP66 strict-DER rule is a separate
+;        predicate, der_sig_strict (bitcoin_scriptcodec.asm -- it lives there
+;        because every link line that has the interpreter also has that file,
+;        and this one drags in sighash_all/pubkey_parse/ecdsa_verify), which
+;        bitcoin_interp.asm calls FIRST when the block's flags say DERSIG is
+;        active. See LOG.md incident #25.
+;
 ; ABI: SysV AMD64. callee-saved rbx,r12-r15. Frame: 5 pushes(0x28)+0x60=0x88
 ; (==8 mod16) => rsp==8mod16 at nested calls. Locals in [rbp-0x30..-0x40].
 ; ============================================================================

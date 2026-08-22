@@ -110,7 +110,7 @@ the recipe. That is why this commit adds 2 to the invocation count. The count is
 now documented in `docs/ENGINEERING.md`, with the one-line command to check it:
 a test that stops running looks exactly like a test that passes, and this is the
 third instance today.
-## 2026-08-22 -- Incidents #6-#24; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#25; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -1535,6 +1535,137 @@ with no check that `off` stays inside `sp`. `nin` is capped at 16 and
 is enough, and bare multisig outputs exist on mainnet and are spendable. Same
 class as #13 and #21, third file. Not fixed here because it is a different file
 on a different path and this commit already carries three concerns.
+
+### Incident #25: BIP66/DERSIG -- the same shape as #22, in the dangerous direction
+
+`script_flags_for_block()` sets `SCRIPT_VERIFY_DERSIG` (bit 2) for every block
+at height >= 363,725, exactly as Core's `GetBlockScriptFlags` does. It was
+threaded into `sv_verify_script` -> `sv_run_v` -> `script_state.flags`, reached
+`bitcoin_interp.asm`, and **nothing read it**. Both checksig callbacks went
+straight to `der_parse_sig`, whose own header advertises that it is "TOLERANT
+of non-minimal INTEGER encoding" -- correct, and necessary, *below* the
+activation height. Above it this node accepted signatures Core rejects. Not a
+stall: a **chain split**, and unlike #22 (a false reject that stopped the
+replay loudly) this one is a false accept, which splits silently.
+
+There is no live symptom and there never will be one: Core-valid history after
+363,725 contains only strict-DER signatures, so no replay reaches it. It needed
+a constructed reproducer.
+
+**What was actually accepted** -- established by fuzzing 18,322 encodings
+against Core's own `CheckSignatureEncoding` through a new `SIGENC` command in
+`validation/core_verify_oracle.cpp`, not by reading `der_parse_sig`. 4,643 of
+them were accepted here and rejected by Core. Every clause of
+`IsValidSignatureEncoding` except three was simply absent:
+
+| Core's rule | before |
+|---|---|
+| `size() >= 9`, `<= 73` | only `>= 8`, no upper bound |
+| `sig[0] == 0x30` | enforced |
+| `sig[1] == size()-3` (the SEQUENCE length byte) | **never looked at** -- the header admitted it: "best-effort; we still rely on explicit 0x02 markers" |
+| `5 + lenR < size()` | enforced (as a raw pointer bound) |
+| `lenR + lenS + 7 == size()` | **never checked** -- trailing garbage, a missing hashtype byte, and two hashtype bytes all passed |
+| `sig[2] == 0x02`, `sig[lenR+4] == 0x02` | enforced |
+| `lenR != 0`, `lenS != 0` | enforced |
+| `!(sig[4] & 0x80)`, `!(sig[lenR+6] & 0x80)` (no negative INTEGERs) | **not checked** |
+| no excess `0x00` padding on R or S | **the opposite**: padding was deliberately stripped |
+
+The reported diagnosis held on every point. The padding case is the cleanest
+probe because it is value-preserving: prepending `0x00` to R changes neither
+R's value nor any sighash preimage (the legacy sighash substitutes the
+scriptCode for the spending input's scriptSig; BIP143 never hashes the witness
+at all), so the padded signature still verifies cryptographically. Core agrees:
+it accepts the padded transaction at a pre-BIP66 height and rejects it at a
+post-BIP66 one. The *only* thing wrong with it is its encoding.
+
+**The fix.** `der_sig_strict` (`bitcoin_scriptcodec.asm`, beside
+`check_minimal_push` -- the same kind of encoding-validity predicate, and the
+one file every link line carrying the interpreter already has) is Core's
+`IsValidSignatureEncoding` transcribed check-for-check in Core's own order --
+which is also what makes it memory-safe, since the `lenS != 0` test is what
+bounds the `sig[lenR+6]` load. `der_parse_sig` is untouched and stays tolerant;
+strictness is a gate in front of it, not a change to it. `interp_checksig` and
+the `interp_checkmultisig` loop call `interp_sig_encoding_ok` before any hashing
+or ECDSA work, exactly where Core calls `CheckSignatureEncoding` -- once per
+CHECKSIG, and once per signature-under-consideration in CHECKMULTISIG, so
+signatures the multisig loop never reaches are never checked, in Core and here
+alike.
+
+Three details that are easy to get wrong and were checked rather than assumed:
+
+- **A bad encoding is a hard script ERROR, not a false CHECKSIG.** Core's
+  `EvalChecksigPreTapscript` returns `SCRIPT_ERR_SIG_DER` and aborts the script.
+  Merely returning false would still reject a P2PKH -- but `<sig> <pk> CHECKSIG
+  OP_NOT` would then *accept* a signature Core rejects, leaving the split open.
+  `interp_checksig` returns -1 for this and `.op_checksig` converts it;
+  `interp_checkmultisig` uses its existing `interp_err` channel.
+- **Which flag gates it in which path.** Core's guard is
+  `flags & (DERSIG|LOW_S|STRICTENC)`, transcribed as-is; on this codebase's
+  consensus path DERSIG is the only one of the three that can ever be set,
+  because `GetBlockScriptFlags` never produces the other two and neither does
+  `script_flags_for_block`. The *witness v0* path is gated on the same flag,
+  not on something always-on: Core reaches `CheckSignatureEncoding` from
+  `EvalChecksigPreTapscript` for `SigVersion::BASE` **and** `WITNESS_V0`, with
+  no separate always-strict rule. That is not academic -- block 692,261, the
+  Taproot `script_flag_exception` from #22, has its flags overridden to
+  `P2SH|WITNESS` with **no DERSIG at all** despite being at height 692,261, so
+  a witness-v0 spend in that one block is not subject to strict DER.
+- **Tapscript is excluded.** `SIGVERSION_TAPSCRIPT` goes to Core's
+  `EvalChecksigTapscript`, whose signature rule is BIP342's 64/65-byte schnorr
+  one and has nothing to do with DER. Running the check there would reject
+  every tapscript spend.
+
+**The reproducer, `tests/test_dersig_encoding`.** Real mainnet transactions at
+all three block-connect dispatch shapes -- P2PKH, P2SH multisig, P2WPKH -- each
+unmodified and with one signature's R redundantly `0x00`-padded, driven through
+**both** `tx_verify_block_connect` and `tx_verify_block_connect_all` (#22 was
+present at both dispatch sites; a test covering one would have missed half of
+it). Against main it fails 12 assertions, every one of them a false accept, at
+every shape and both entry points. It also pins the gate in the other
+direction: the same padded bytes re-hosted at a real pre-BIP66 block must still
+be ACCEPTED, and the boundary is pinned at the two real blocks 363,724 and
+363,725. Without that half, "just always be strict" passes the reject
+assertions and breaks 363,000 blocks of history -- the exact failure mode #22
+shipped.
+
+**History really does contain these.** Scanning mainnet turned up plenty;
+two are baked in as fixtures, both P2PKH, both accepted by the real chain:
+
+    h149,850  b13abbc136a76dd5...  R = 0x00 0x0a 0x0f ...  redundant leading zero
+    h152,841  f17f32b98f834f2d...  R = 0xac 0xab 0x5e ...  negative DER INTEGER
+
+Each must verify at its own height and must be rejected if re-hosted above
+363,725 -- which is also what proves they are genuinely non-strict rather than
+merely unusual. Core's `SIGENC` confirms both directions for each.
+
+Fixtures come from `validation/fetch_dersig_vectors.py`, which asserts every
+baked verdict against Core's own `VerifyScript`/`CheckSignatureEncoding` before
+emitting it, and carries a 27-vector `der_sig_strict` table (one per clause of
+Core's function, plus the two historical signatures) so the unit level is
+pinned to Core without needing the oracle at test time.
+
+**Audit of the sibling rules, reported not fixed.** `LOW_S`, `NULLFAIL` and
+`STRICTENC` are *not* in the "computed but ignored" state: they are never
+computed, by us or by Core, because all three are mempool/relay policy
+(`policy.h` `STANDARD_SCRIPT_VERIFY_FLAGS`), never consensus. Removing an
+identical STRICTENC hashtype check from `sv_checksig` on 2026-08-19 is what
+unblocked the replay at height 110,299, and this change is careful not to
+reintroduce it. Of the seven flags `script_flags_for_block` *does* produce,
+DERSIG was the last unconsulted one: P2SH is read by `sv_verify_script`,
+NULLDUMMY inside `interp_checkmultisig`, CLTV/CSV by `op_cltv`/`op_csv`,
+WITNESS and TAPROOT by both `tx_verify.c` dispatch sites since #22.
+
+**Found while proving this, NOT fixed here.** The MEMPOOL path
+(`txval_modern` -> `p2wpkh_verify` / `p2wsh_verify_checksig` /
+`p2wsh_verify_multisig` in `bitcoin_segwit.c`, and `multisig_verify` in
+`bitcoin_multisig.asm`) parses signatures with `der_parse_sig` directly, never
+touching the interpreter, so it is unaffected by this fix and still accepts
+non-strict DER. That is a policy/relay divergence rather than a chain split --
+block connection never reaches those functions -- but it deserves its own
+incident. A correct `IsValidSignatureEncoding` also already existed in-tree at
+`rpc_chain.c:442` (`der_sig_ok`, used only to decide whether to pretty-print a
+`[ALL]` tag in `decodescript` output); it is now the third copy of this rule in
+the tree and could be collapsed onto `der_sig_strict`.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
