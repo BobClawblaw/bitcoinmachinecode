@@ -1960,10 +1960,15 @@ script_eval:
     mov   rax, [rbp-0x38]
     cmp   rax, OP_CHECKSIGVERIFY
     jne   .next_op
-    ; tapscript forbids CHECKSIGVERIFY
-    mov   eax, dword [r12+48]
-    cmp   rax, SIGVERSION_TAPSCRIPT
-    je    .bad_opcode
+    ; incident #16: OP_CHECKSIGVERIFY is VALID under SIGVERSION_TAPSCRIPT.
+    ; BIP342 keeps CHECKSIG/CHECKSIGVERIFY (re-specified for schnorr) and
+    ; disables only CHECKMULTISIG(VERIFY); Core runs the same switch arm and the
+    ; same trailing "if CHECKSIGVERIFY: pop-or-SCRIPT_ERR_CHECKSIGVERIFY" for
+    ; every sigversion. This used to "je .bad_opcode" under tapscript, rejecting
+    ; every real HTLC-style leaf (<pk> OP_CHECKSIGVERIFY ... OP_CSV) -- the true
+    ; cause of the mainnet tapscript-CSV reject wall (a spend Core accepted at
+    ; height 806500). Schnorr semantics are unchanged: interp_checksig already
+    ; pushed the bool, so the VERIFY pop/fail below is the same as CHECKSIG.
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_top_ptr

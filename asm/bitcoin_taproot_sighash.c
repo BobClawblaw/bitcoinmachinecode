@@ -573,6 +573,18 @@ struct ts_script_state {
 };
 extern int script_eval(struct ts_script_state* st);
 
+/* The interp (bitcoin_interp.asm) gates op_cltv on bit (1<<9) and op_csv on
+ * bit (1<<10) of st.flags. These are the ONLY st.flags bits the tapscript
+ * evaluation branch reads meaningfully: MINIMALIF is enforced unconditionally
+ * under SIGVERSION_TAPSCRIPT, CHECKMULTISIG(+NULLDUMMY) is forbidden in
+ * tapscript, and MINIMALDATA / DISCOURAGE_OP_SUCCESS are mempool-policy bits
+ * that are never part of Core's consensus GetBlockScriptFlags. At every height
+ * where taproot is active, BIP65(CLTV) and BIP112(CSV) are already active too,
+ * so this is exactly the consensus flag subset that reaches this branch --
+ * mirroring how sv_run_v receives the block flag set for the v0 path. */
+#define TS_SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY (1ULL<<9)
+#define TS_SCRIPT_VERIFY_CHECKSEQUENCEVERIFY (1ULL<<10)
+
 /* taproot_verify_input(): full dispatch for one P2TR input's witness.
  * Returns 1 valid / 0 invalid; *reason set to a static (never NULL)
  * description, matching this project's existing per-shape error-reporting
@@ -704,7 +716,22 @@ int taproot_verify_input(const uint8_t* spk,
     st.alt_elems  = ts_alt_e;  st.alt_sp  = 0;
     st.script = (uint8_t*)(uintptr_t)script; st.script_len = slen;
     st.sigversion = TS_SIGV_TAPSCRIPT;
-    st.flags = 0;
+    /* incident #16: CLTV/CSV inside a tapscript were under-enforced because
+     * st.flags was 0 (op_cltv/op_csv gated OFF -> silently NOP) and
+     * tx_locktime/in_sequence/tx_version were left zeroed by the memset above.
+     * Activate the two flags the tapscript branch reads and thread the real tx
+     * context, mirroring the witness-v0 path (sv_verify_witness_v0 -> sv_run_v).
+     * The tx handed to taproot_verify_input is the STRIPPED (no-witness)
+     * serialization -- the same one taproot_sighash parses -- so the file's own
+     * tx_parse/tx_seq read version/locktime/nSequence directly (keeping this
+     * translation unit self-contained; no cross-object link dependency). */
+    st.flags = TS_SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY | TS_SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
+    txview_t tvctx = { tx, txlen, 0, 0, NULL, NULL, 0, 0 };
+    if (tx_parse(&tvctx) && n_in >= 0 && n_in < tvctx.nin) {
+        st.tx_version  = (uint32_t)tvctx.version;
+        st.tx_locktime = tvctx.locktime;
+        st.in_sequence = tx_seq(&tvctx, n_in);
+    }
     st.work = ts_work; st.work_cap = 1<<16;
     uint64_t err = 0; st.error_out = &err;
     st.checksig_ctx = &ctx;

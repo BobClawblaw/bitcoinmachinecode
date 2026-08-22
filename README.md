@@ -480,8 +480,10 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   handling, and **tapscript/BIP342** semantics: `OP_SUCCESSx` pre-scan
   (short-circuit success / `DISCOURAGE_OP_SUCCESS`), cleanstack +
   empty-stack treatment (`CLEANSTACK`/`EVAL_FALSE`), tapscript-minimal-IF as an
-  unconditional consensus rule, `OP_CHECKSIGVERIFY` forbidden,
-  `OP_CHECKMULTISIG` -> `TAPSCRIPT_CHECKMULTISIG`, and `OP_CHECKSIGADD` gating
+  unconditional consensus rule, `OP_CHECKSIGVERIFY` valid (re-specified for
+  schnorr, like `OP_CHECKSIG`), `OP_CHECKMULTISIG(VERIFY)` ->
+  `TAPSCRIPT_CHECKMULTISIG` (the only checksig-family opcodes tapscript
+  disables), and `OP_CHECKSIGADD` gating
   (valid only under tapscript). Verified differentially against Bitcoin Core's
   `script_tests.json` (`tests/script_tests_diff.py`: 67/67 BASE opcode vectors
   byte-for-byte, exit 0) plus a dedicated 24-check tapscript harness
