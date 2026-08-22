@@ -427,6 +427,35 @@ unchanged — it is already the right gate.
 lesson: watch the first checkpoint resume. **Effort ≈ 1,100-1,400 lines
 incl. tests, 2-3 long sessions**, the risk concentrated in (d).
 
+**Status 2026-08-22 — BUILT on branch `glv`, (a)–(e) all landed, not
+merged.** Exactly the staging above: `3853c3f` Z=0 guards (the old code
+failed all 10 infinity cases of `tests/test_point_inf.c`); `efa0606`
+`sc_mul_512` + `sc_split_lambda` with the permanent identity check
+(1,000,016 product cases vs a C schoolbook, 2,018 exact vectors vs the
+Python oracle — which re-derives g1/g2/−b1/−b2 from Core's basis and
+asserts they match the asm — 10⁶ identity+bounds, and 1,002,018 exact
+out-of-tree); `82371b1` `glv_wnaf` (10⁶ reconstructed, both signs);
+`45d6c65` `point_add_mixed_zr` + `point_scalar_mul_glv` with globalz
+(102,056 projective cases vs `point_scalar_mul`, incl. `λG == (βGx, Gy)`,
+the k×Q grid, every sign combination of the halves); (e) wired behind
+`BMC_ECDSA_GLV` — the 113,315-case `test_ecdsa_inverse` campaign vs the
+frozen reference passes with GLV on **and** with the switch off, and
+`tests/test_ecdsa_glv_switch.c` pins glv/plain/reference to identical
+verdicts on 30,240 cases. The globalz variant shipped, not the Jacobian
+fallback.
+
+| same moment, replay + oracle loading the box, min of 3 | µs / verify | /s/core |
+|---|---|---|
+| `main` (4.2 A+B) | 54.7 | 18,271 |
+| `glv`, `BMC_ECDSA_GLV=0` | 54.8 | 18,238 |
+| **`glv`, GLV on** | **35.3** | **28,350** |
+| libsecp256k1 bench | 22.0 | ~45,500 |
+
+Standalone `u2·Q`: 46.2 → 25.7 µs (1.8×). **`ecdsa_verify` 1.55×; gap to
+libsecp256k1 2.5× → 1.6×** (the model above said 1.8×; the table build and
+the adds came in cheaper than the derivation assumed). What remains is
+field representation and the G side, as noted above.
+
 ### 4.4 Archive read-ahead tuning
 
 - *What:* `store_rd_advise` (`bitcoin_store_fast.asm`) already does
