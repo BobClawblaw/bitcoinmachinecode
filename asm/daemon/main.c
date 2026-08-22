@@ -2531,6 +2531,25 @@ int main(int argc, char** argv){
       sigaction(SIGCHLD,&sc,NULL); }
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
+    /* Launch banner -- an unmistakable marker so a restart is obvious when
+     * scrolling one continuously-appended production log (the unit uses
+     * StandardOutput=append:). Built with snprintf + fputs, not the
+     * timestamp-wrapped fprintf, so the ===== rules stay clean; the banner
+     * carries its own explicit UTC clock. First output of the process. */
+    {
+        time_t _bt = time(0); struct tm _g; gmtime_r(&_bt, &_g);
+        char _ts[32]; strftime(_ts, sizeof _ts, "%Y-%m-%d %H:%M:%S UTC", &_g);
+        char _b[512];
+        snprintf(_b, sizeof _b,
+            "\n"
+            "======================================================================\n"
+            "===== bmc-bitcoind  LOG START: %s\n"
+            "=====   pid %d  v%d.%d.%d  built %s %s  mode=%s\n"
+            "======================================================================\n",
+            _ts, (int)getpid(), NODE_VERSION_MAJOR, NODE_VERSION_MINOR, NODE_VERSION_PATCH,
+            __DATE__, __TIME__, argc>=2?argv[1]:"?");
+        fputs(_b, stderr); fflush(stderr);
+    }
     if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }
     const char* mode = argv[1]; const char* dir = argv[2];
     /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
