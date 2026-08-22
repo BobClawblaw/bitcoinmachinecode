@@ -155,6 +155,7 @@ asm/tests/test_fe_repr
 asm/tests/test_ecdsa_inverse
 asm/tests/test_segwit_sighash
 asm/tests/test_segwit_txout_bound
+asm/tests/test_segwit_bounds_fuzz
 asm/tests/test_p2wpkh_real
 asm/tests/test_mempool_accept_modern
 asm/daemon/wallet_cli
@@ -229,6 +230,7 @@ asm/daemon/build_utxo
 asm/daemon/flush_wal_tail
 asm/daemon/utxo_reload_check
 asm/tests/bench_ecdsa
+asm/tests/bench_segwit_sighash
 asm/tests/bench_fe
 asm/tests/test_addr_ingest
 asm/tests/test_archive_check
