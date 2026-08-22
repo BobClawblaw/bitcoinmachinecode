@@ -325,9 +325,12 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jnz  .inv_next           ; already have it -> don't re-request
-    ; build & send getdata: [count=1][type u32=2][hash32] = 37 bytes
+    ; build & send getdata: [count=1][type u32][hash32] = 37 bytes.
+    ; MSG_WITNESS_BLOCK (0x40000002), not MSG_BLOCK: this is the steady-state
+    ; path that fetches NEW tip blocks announced by inv, and with type 2 every
+    ; block after the archive repair would have arrived stripped again.
     mov  byte  [src_buf], 1
-    mov  dword [src_buf+1], 2
+    mov  dword [src_buf+1], 0x40000002
     ; copy hash (rbx+4) into src_buf+5 (memcpy_len length arg is RDX)
     mov  rdx, 32
     lea  rdi, [src_buf+5]
@@ -585,6 +588,14 @@ node_serve_loop:
     ; type at rbx (u32 LE): 2=MSG_BLOCK -> serve block; 1=MSG_TX -> mempool tx;
     ; 4=MSG_CMPCT_BLOCK -> serve a compact block (BIP152, requester negotiated).
     mov  r9d, [rbx]
+    ; BIP144: modern peers request MSG_WITNESS_BLOCK (0x40000002) / MSG_WITNESS_TX
+    ; (0x40000001). Mask the witness flag so they dispatch like the base types;
+    ; the archive/mempool hold the full (witness) serialization, which is what a
+    ; witness request wants. (A bare MSG_BLOCK from a pre-segwit peer would
+    ; strictly want the stripped form -- not done; such peers no longer exist.)
+    ; Before this, a MSG_WITNESS_BLOCK getdata matched nothing and was ignored --
+    ; this node could not serve blocks to any current peer (2026-08-22).
+    and  r9d, 0x3fffffff
     cmp  r9d, 1
     je   .gd_tx
     cmp  r9d, 4
