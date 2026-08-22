@@ -47,7 +47,13 @@ static void ckb(const char* name, int cond){
 /* index helper: prev_spk is the scriptCode for P2WPKH; witness_script for P2WSH */
 static const uint8_t* scriptcode_of(const msend_t* s, int* len){
     static const uint8_t* sc;
-    if (s->type == 1){ *len = s->prev_spklen; return s->prev_spk; }
+    static uint8_t p2wpkh_sc[25];
+    if (s->type == 1){
+        /* BIP143: P2WPKH scriptCode = 76a914 <hash160> 88ac, not the program */
+        p2wpkh_sc[0]=0x76; p2wpkh_sc[1]=0xa9; p2wpkh_sc[2]=0x14;
+        memcpy(p2wpkh_sc+3, s->prev_spk+2, 20); p2wpkh_sc[23]=0x88; p2wpkh_sc[24]=0xac;
+        *len = 25; return p2wpkh_sc;
+    }
     /* P2WSH: witness_script is the last witness item */
     sc = s->wit[s->nwit - 1];
     *len = s->witlen[s->nwit - 1];
