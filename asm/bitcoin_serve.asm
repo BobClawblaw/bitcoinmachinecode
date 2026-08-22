@@ -150,11 +150,26 @@ node_serve_loop:
     push r13
     push r14
     push r15
-    sub  rsp, 0x50          ; frame locals BELOW the 5-push save area [rbp-8..rbp-0x28].
-                            ;   0x50 == 0 mod16 -> after 5 pushes (rsp5==8 mod16)
-                            ;   RSP at nested calls == 8 mod16, the parity this
-                            ;   codebase's asm callees (p2p_write cksum4 / the
-                            ;   deep sha256d chain) require.
+    sub  rsp, 0x58          ; scratch reservation, sized to RESTORE SysV alignment.
+                            ;   Entry RSP == 8 mod16; the 6 pushes above leave it
+                            ;   at 8 mod16 again, so the reservation must be ODD
+                            ;   mod 16 (0x58, not 0x50) to put RSP == 0 mod16 at
+                            ;   every nested `call` -- exactly what node_announce_tip
+                            ;   below does with its `sub rsp, 8`.
+                            ;   This was 0x50, on the claim that the asm callees
+                            ;   (p2p_write cksum4 / the sha256d chain) "require"
+                            ;   8 mod16. They do not: every movdqa in sha256.asm /
+                            ;   secp256k1_point.asm is register-to-register, with no
+                            ;   16-byte-aligned stack operand anywhere. The C callees
+                            ;   DO require it -- glibc's vsnprintf (reached from every
+                            ;   daemon/log_ts.h fprintf) uses movaps on its stack
+                            ;   frame, and a 8-mod-16 RSP at the call site makes that
+                            ;   fault: #GP -> SIGSEGV with si_addr == NULL. That
+                            ;   killed the serve child on the FIRST peer-pushed block
+                            ;   (log_block_stored_inbound, .blk_chains). (2026-08-22)
+                            ; NOTE: the frame is scratch only -- every "local" listed
+                            ; below lives in .data, nothing here is rbp-relative, so
+                            ; the size change moves no operand.
     ; locals:
     ;   [s_plen] plen
     ;   [s_fh] scratch fh/item-index
@@ -336,7 +351,9 @@ node_serve_loop:
     lea  rdi, [src_buf+5]
     lea  rsi, [rbx+4]
     push rbx
+    push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned
     call memcpy_len
+    pop  rbx
     pop  rbx
     mov  [s_ptr], rbx
     mov  rdi, r12
@@ -345,7 +362,9 @@ node_serve_loop:
     lea  rcx, [src_buf]
     mov  r8d, 37
     push rbx
+    push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned
     call p2p_write
+    pop  rbx
     pop  rbx
 .inv_next:
     mov  rbx, [s_ptr]
@@ -708,7 +727,9 @@ node_serve_loop:
     mov  rcx, rax            ; tx bytes (mp_blob ptr)
     mov  r8, [s_n]           ; length
     push rbx
+    push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned
     call p2p_write
+    pop  rbx
     pop  rbx
     add  qword [s_served], 1
     mov  rbx, [s_ptr]
@@ -1173,7 +1194,9 @@ node_serve_loop:
     mov  rsi, [s_txptr]
     mov  rdx, [s_txlen]
     push rbx
+    push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned
     call memcpy_len
+    pop  rbx
     pop  rbx
     ; advance offset
     mov  rax, [s_p]
@@ -1226,7 +1249,7 @@ node_serve_loop:
     jmp  .outer
 .done:
     mov  rax, [s_served]
-    add  rsp, 0x50
+    add  rsp, 0x58
     pop  r15
     pop  r14
     pop  r13
