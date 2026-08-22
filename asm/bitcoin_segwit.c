@@ -356,10 +356,22 @@ int p2wpkh_verify(const uint8_t* tx, int64_t txlen, int64_t n_in,
     hash160(h, vchPub, (long long)publen);
     if (memcmp(h, prev_spk + 2, 20) != 0) return 0;
 
-    /* BIP143 digest with scriptCode = the P2WPKH scriptPubKey */
+    /* BIP143 scriptCode for P2WPKH is NOT the 22-byte witness program. It is
+     * the implied P2PKH script  OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+     * = 76 a9 14 <hash160> 88 ac (25 bytes; segwit_v0_sighash prepends the
+     * compactsize, giving BIP143's "1976a914...88ac"). Core: interpreter.cpp
+     * VerifyWitnessProgram, "scriptPubKey << OP_DUP << OP_HASH160 << program
+     * << OP_EQUALVERIFY << OP_CHECKSIG". This function passed prev_spk itself,
+     * and validation/gen_modern_vectors.py made the same assumption, so every
+     * synthetic vector was self-consistently wrong; the first real P2WPKH
+     * spend in history (block 481824 tx 562) was rejected (2026-08-22). */
+    uint8_t scriptCode[25];
+    scriptCode[0] = 0x76; scriptCode[1] = 0xa9; scriptCode[2] = 0x14;
+    memcpy(scriptCode + 3, prev_spk + 2, 20);
+    scriptCode[23] = 0x88; scriptCode[24] = 0xac;
     uint8_t pre[512]; uint8_t sighash[32];
     long n = segwit_v0_sighash(sighash, tx, txlen, n_in, SIGHASH_ALL,
-                               amount, prev_spk, (uint64_t)prev_spklen, pre, sizeof(pre));
+                               amount, scriptCode, 25, pre, sizeof(pre));
     if (n <= 0) return 0;
 
     /* parse DER signature + hashtype */
