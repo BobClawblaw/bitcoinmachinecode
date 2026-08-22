@@ -492,6 +492,25 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     u8 blk_hash[32];
     block_hash(blk_hash, blockbuf);
 
+    /* GENESIS: its coinbase output is NOT part of the UTXO set. Core never
+     * writes it to the chainstate, which is why those 50 BTC are famously
+     * unspendable -- the outpoint simply does not exist to be looked up.
+     * Applying it would leave this node one UTXO richer than Core forever,
+     * surfacing the first time our set is compared against `gettxoutsetinfo`
+     * (the intended Stage D acceptance test). Genesis has no inputs and one
+     * coinbase output, so there is nothing else here to do.
+     *
+     * Matched by HASH, not by height: the synthetic chains in
+     * tests/test_cross_tx_verify.c and tests/test_utxo_checkpoint.c use
+     * height 0 as an ordinary block whose outputs later get spent, and a
+     * bare `height == 0` test silently dropped those (caught by both suites
+     * failing, 2026-08-22). Only reachable at all because the archive now
+     * stores real genesis at index 0 as of the same day. */
+    static const u8 MAINNET_GENESIS[32] = {   /* wire (sha256d) order */
+        0x6f,0xe2,0x8c,0x0a,0xb6,0xf1,0xb3,0x72,0xc1,0xa6,0xa2,0x46,0xae,0x63,0xf7,0x4f,
+        0x93,0x1e,0x83,0x65,0xe1,0x5a,0x08,0x9c,0x68,0xd6,0x19,0x00,0x00,0x00,0x00,0x00 };
+    if (g_apply_height == 0 && memcmp(blk_hash, MAINNET_GENESIS, 32) == 0) return 1;
+
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
      * used), building the tx array tx_verify.c also consumes. txs/pn_outs
      * are persistent, process-lifetime arenas (grown, never freed -- see
