@@ -161,7 +161,18 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
  * had simply never carried a legacy script that large before. */
 #define TXV_MAX_INPUTS    20000
 #define TXV_SPK_CAP       10000
-#define TXV_MAX_WIT_ITEMS    8
+/* Per-input witness stack item count. Not 8 (that rejected the first real
+ * >8-item witness, incident #15: 498787 tx 2420, a 17-item P2SH-P2WSH
+ * stack). No consensus rule caps the item COUNT at parse time; the real
+ * bounds are per-item size <=520 and the 1000-element execution stack
+ * (MAX_STACK). A P2WSH witness's items become the initial stack (minus the
+ * popped witnessScript), so >1000 stack elements can never satisfy the
+ * cleanstack/MAX_STACK checks -- 1001 items is the most a valid P2WSH spend
+ * can carry; tapscript adds at most script+control+annex. 1004 rejects
+ * nothing Core would execute while bounding the pool reservation per input.
+ * Items are no longer stored inline (see the witpool below) -- this is only
+ * the reject threshold now, not an array dimension. */
+#define TXV_MAX_WIT_ITEMS    1004
 
 #define TXV_SHAPE_LEGACY  0
 #define TXV_SHAPE_P2WPKH  1
@@ -173,7 +184,9 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
 typedef struct {
     const u8* outpoint;             /* 36 bytes: txid(32)+index(4), in tx bytes */
     const u8* scriptSig; u32 scriptSiglen;
-    const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
+    const u8** wit; u32* witlen; u32 nwit; u32 wit_off; /* wit/witlen resolved from g_wit_pool at
+                                  * (wit_off) AFTER parse stops growing the pool -- offset, not pointer,
+                                  * survives the pool's realloc, same discipline as spk_off. */
     const u8* wprog; u32 wproglen; u8 wrapped;   /* TXV_SHAPE_WV0: the witness program (spk+2, or the P2SH redeemScript's program) */
     /* resolved during the sequential pass, before any forking -- self-
      * contained (a COPY, not a utxo_lsm_get pointer, which is only valid
@@ -193,6 +206,31 @@ static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
     if (b+9>end){*ok=0;return 0;} u64 v=0; for(int i=0;i<8;i++) v|=(u64)b[1+i]<<(8*i); *p=b+9; return v;
 }
 
+/* Witness-item pool: (ptr-into-tx, len) pairs for every input's stack, so an
+ * input's witness is not a fixed inline array (which at TXV_MAX_INPUTS x the
+ * item cap would be hundreds of MB of mostly-empty storage per block). Two
+ * parallel growable arrays; inputs reference a start OFFSET and resolve to
+ * ptr/len addresses only AFTER parse stops growing the pool, exactly like
+ * g_spk_pool/spk_off above (a realloc during parse would otherwise dangle a
+ * pointer handed to an earlier input). The item pointers themselves aim into
+ * the tx bytes, which are stable for the block. Bump-reset per block/tx. */
+typedef struct { const u8** ptr; u32* len; u64 cap, used; } witpool_t;
+static witpool_t g_wit_pool = {0};
+/* Reserve n contiguous slots; returns the start offset, or ~0ull on OOM. */
+static u64 witpool_reserve(witpool_t* wp, u64 n){
+    if (wp->used + n > wp->cap){
+        u64 nc = wp->cap ? wp->cap : 4096;
+        while (nc < wp->used + n) nc *= 2;
+        const u8** np = realloc(wp->ptr, nc*sizeof(const u8*));
+        u32*      nl = realloc(wp->len, nc*sizeof(u32));
+        if (np) wp->ptr = np;
+        if (nl) wp->len = nl;
+        if (!np || !nl) return ~0ull;
+        wp->cap = nc;
+    }
+    u64 off = wp->used; wp->used += n; return off;
+}
+
 /* Parses the tx's own input list (outpoint/scriptSig) and, if segwit-
  * marked, its per-input witness stacks, into g_txv_in[0..nin). Does not
  * touch outputs (irrelevant to script verification) or resolve any UTXO.
@@ -201,6 +239,7 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     const u8* p = tx; const u8* end = tx+txlen;
     int ok = 1;
     if (txlen < 10) { *reason = "tx too short"; return 0; }
+    g_wit_pool.used = 0;   /* bump-reset for this tx's witness items */
     p += 4; /* version */
     int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
     if (segwit) p += 2;
@@ -228,13 +267,21 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
             u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
             if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
             g_txv_in[i].nwit = (u32)nitems;
+            u64 woff = witpool_reserve(&g_wit_pool, nitems);
+            if (woff == ~0ull) { *reason = "out of memory"; return 0; }
+            g_txv_in[i].wit_off = (u32)woff;
             for (u64 j=0;j<nitems;j++){
                 u64 il = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness-item-len varint"; return 0; }
                 if ((u64)(end-p) < il){ *reason = "truncated witness item"; return 0; }
-                g_txv_in[i].wit[j] = p; g_txv_in[i].witlen[j] = (u32)il;
+                g_wit_pool.ptr[woff+j] = p; g_wit_pool.len[woff+j] = (u32)il;
                 p += il;
             }
         }
+    }
+    /* Resolve offsets to addresses now the pool is done growing for this tx. */
+    for (u64 i=0;i<nin;i++){
+        if (g_txv_in[i].nwit){ g_txv_in[i].wit = g_wit_pool.ptr + g_txv_in[i].wit_off; g_txv_in[i].witlen = g_wit_pool.len + g_txv_in[i].wit_off; }
+        else { g_txv_in[i].wit = 0; g_txv_in[i].witlen = 0; }
     }
     *out_nin = nin;
     return 1;
@@ -679,7 +726,8 @@ typedef struct {
                                    * belong to different transactions */
     const u8* outpoint;
     const u8* scriptSig; u32 scriptSiglen;
-    const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
+    const u8** wit; u32* witlen; u32 nwit; u32 wit_off; /* offset into g_wit_pool, resolved to
+                                  * wit/witlen after Phase 0 -- see g_txv_in's copy. */
     const u8* wprog; u32 wproglen; u8 wrapped;   /* TXV_SHAPE_WV0: the witness program. wrapped: a pointer into the
                                   * scriptSig's redeemScript (tx bytes, stable for the whole pass).
                                   * native (!wrapped): wprog is NULL and wprog_off below is the program's
@@ -758,10 +806,13 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
             u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
             if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
             e->nwit = (u32)nitems;
+            u64 woff = witpool_reserve(&g_wit_pool, nitems);
+            if (woff == ~0ull) { *reason = "out of memory"; return 0; }
+            e->wit_off = (u32)woff;
             for (u64 j=0;j<nitems;j++){
                 u64 il = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness-item-len varint"; return 0; }
                 if ((u64)(end-p) < il){ *reason = "truncated witness item"; return 0; }
-                e->wit[j] = p; e->witlen[j] = (u32)il;
+                g_wit_pool.ptr[woff+j] = p; g_wit_pool.len[woff+j] = (u32)il;
                 p += il;
             }
         }
@@ -979,6 +1030,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     }
     g_spk_pool.used = 0;   /* bump-reset: safe, every byte handed out below
                             * this call is freshly memcpy'd before any read */
+    g_wit_pool.used = 0;   /* bump-reset the witness-item pool for this block */
 
     /* ---- Phase 0/parse: expand every tx's inputs into the flat array. ---- */
     u64 base = 0;
@@ -998,6 +1050,15 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
          * already). */
         *reason = "internal: input count parse mismatch"; *fail_tx_index = 0;
         return 0;
+    }
+
+    /* Resolve each input's witness offset to ptr/len addresses now the pool
+     * is done growing (Phase 0 was its sole writer). Before Phase 1/2/3 read
+     * in->wit[]/in->witlen[]. */
+    for (u64 gi=0; gi<total_nin; gi++){
+        txvb_in_t* in = &flat[gi];
+        if (in->nwit){ in->wit = g_wit_pool.ptr + in->wit_off; in->witlen = g_wit_pool.len + in->wit_off; }
+        else { in->wit = 0; in->witlen = 0; }
     }
 
     /* ---- Phase 1: resolve + classify every input, sequential, block-wide
