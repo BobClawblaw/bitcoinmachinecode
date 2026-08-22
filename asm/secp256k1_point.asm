@@ -39,12 +39,26 @@
 ; offset = ((j*15)+(i-1)) * 64 bytes. Auto-generated + validated offline.
 section .rodata
 %include "g_comb_table.inc"
+
+; ---- GLV (PERF_SCOPE.md 4.3): beta, the cube root of unity mod p with
+; lambda*(x, y) == (beta*x, y) for the matching lambda in
+; secp256k1_scalar.asm. libsecp256k1 field.h:69-72; verified together with
+; lambda by validation/glv_split_oracle.py's derivation and by the
+; lambda*G == (beta*Gx, Gy) check in tests/test_glv_pointmul.c. ----
+align 16
+BETA_LIMBS:
+    dq 0xC1396C28719501EE, 0x9CF0497512F58995, 0x6E64479EAC3434E9, 0x7AE96A2B657C0710
+align 16
+FE_ZERO:
+    dq 0, 0, 0, 0
 section .text
 
 extern fe_add
 extern fe_sub
 extern fe_mul
 extern fe_sqr
+extern sc_split_lambda        ; secp256k1_scalar.asm
+extern glv_wnaf               ; secp256k1_glv_c.c
 
 ; ----------------------------------------------------------------------------
 ; point_double(r[12], p[12])  -- Jacobian doubling, a=0 curve.
@@ -219,6 +233,32 @@ point_double:
 ;     S0=-0x50 Z1Z1, S1=-0x70 U2, S2=-0x90 V(also t), S3=-0xb0 S2(y), S4=-0xd0 H,
 ;     S5=-0xf0 R, S6=-0x110 HH, S7=-0x130 HHH, S8=-0x150 work, S9=-0x170 work2
 ; ----------------------------------------------------------------------------
+; point_add_mixed_zr(r[12], p[12], xy[8], zr[4]) -- identical, plus
+;   zr = Z3/Z1 = H, the z-ratio libsecp256k1's secp256k1_gej_add_ge_var
+;   returns through rzr. The GLV odd-multiples table build needs it to
+;   bring all entries to one Z (secp256k1_ge_table_set_globalz). On the
+;   degenerate branches -- unreachable from that build, which adds distinct
+;   odd multiples of one point on a prime-order curve -- it stores what the
+;   ratio would be: 2*Y1 for the doubling case (our Z3 = 2*Y1*Z1), 0 for
+;   opposite points (result infinity), 1 for p == infinity.
+;   Shares point_add_mixed's body via r15 (= zr pointer, NULL for the plain
+;   entry); r15 is callee-saved and otherwise unused in that body.
+global point_add_mixed_zr
+point_add_mixed_zr:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x188
+    mov r12, rdi           ; OUT
+    mov r13, rsi           ; p
+    mov r14, rdx           ; affine xy
+    mov r15, rcx           ; zr out
+    jmp point_add_mixed.body
+
 global point_add_mixed
 point_add_mixed:
     push rbp
@@ -233,6 +273,8 @@ point_add_mixed:
     mov r12, rdi           ; OUT
     mov r13, rsi           ; p
     mov r14, rdx           ; affine xy
+    xor r15d, r15d         ; no z-ratio requested
+.body:
 
     ; ---- Z1 == 0 (p is infinity) -> r = (xy, Z=1).  (2026-08-22)
     ; Without this, Z1=0 gives U2=0, S2=0, H=-X1, Z3=Z1*H=0: the result is
@@ -253,6 +295,12 @@ point_add_mixed:
     mov qword [r12+72], 0
     mov qword [r12+80], 0
     mov qword [r12+88], 0
+    test r15, r15
+    jz  .done
+    mov qword [r15+0], 1   ; zr := 1 (Core asserts rzr == NULL here)
+    mov qword [r15+8], 0
+    mov qword [r15+16], 0
+    mov qword [r15+24], 0
     jmp .done
 .p_finite:
 
@@ -306,7 +354,15 @@ point_add_mixed:
     mov rax, [rbp-0xb0+24]
     cmp rax, [r13+32+24]
     jne .inf
-    ; same point -> double. r = 2*p
+    ; same point -> double. r = 2*p   (zr = 2*Y1, captured before Y1 can be
+    ; overwritten by an in-place double)
+    test r15, r15
+    jz  .dbl
+    mov rdi, r15
+    lea rsi, [r13+32]
+    mov rdx, rsi
+    call fe_add
+.dbl:
     mov rdi, r12
     mov rsi, r13
     call point_double
@@ -325,6 +381,12 @@ point_add_mixed:
     mov qword [r12+72], 0
     mov qword [r12+80], 0
     mov qword [r12+88], 0
+    test r15, r15
+    jz  .done
+    mov qword [r15+0], 0   ; zr := 0
+    mov qword [r15+8], 0
+    mov qword [r15+16], 0
+    mov qword [r15+24], 0
     jmp .done
 
 .distinct:
@@ -397,6 +459,17 @@ point_add_mixed:
     lea rsi, [r13+64]
     lea rdx, [rbp-0xd0]
     call fe_mul
+    ; zr = H (S4 is not touched after it is computed)
+    test r15, r15
+    jz  .done
+    mov rax, [rbp-0xd0+0]
+    mov [r15+0], rax
+    mov rax, [rbp-0xd0+8]
+    mov [r15+8], rax
+    mov rax, [rbp-0xd0+16]
+    mov [r15+16], rax
+    mov rax, [rbp-0xd0+24]
+    mov [r15+24], rax
 
 .done:
     add rsp, 0x188
@@ -999,6 +1072,325 @@ point_scalar_mul_fixed:
     mov  rax, [rbp-0x98+88]
     mov  [r12+88], rax
     add  rsp, 0x178
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; point_scalar_mul_glv(out[12], xy[8], k[4]) -- out = k * affine(xy), Jacobian,
+;   VARIABLE-TIME (verification only). PERF_SCOPE.md 4.3: the shape of
+;   libsecp256k1's secp256k1_ecmult_strauss_wnaf for a single point
+;   (ecmult_impl.h), GLV endomorphism + width-5 wNAF:
+;     1. k = r1 + lambda*r2 (mod n), both halves < 2^128 up to sign
+;        (sc_split_lambda, with its permanent identity check).
+;     2. wNAF of each half, 129 digit slots (glv_wnaf).
+;     3. Odd-multiples table TAB[i] = (2i+1)*Q, i = 0..7, built on the
+;        isomorphic curve with C := z(2Q) so every step is a mixed add
+;        (secp256k1_ecmult_odd_multiples_table), then brought to one common
+;        Z via the captured z-ratios (secp256k1_ge_table_set_globalz) -- no
+;        inversion anywhere. AUXX[i] = TAB[i].x * beta is the lambda-table:
+;        lambda*(x, y) == (beta*x, y), and a shared Z keeps that true.
+;     4. One ladder over both digit streams: ~128 doublings instead of 252,
+;        one mixed add per non-zero digit (TAB[idx] for stream 1, (AUXX[idx],
+;        TAB[idx].y) for stream 2, y negated for a negative digit).
+;     5. R.z *= Z to leave the isomorphic curve.
+;   Falls back to point_scalar_mul (kept intact) if the split's identity
+;   check or the wNAF encoder signals a problem -- slow-and-correct, never
+;   an abort. k == 0 -> Jacobian infinity.
+;   The accumulator starts at infinity, so the Z=0-operand guards in
+;   point_add / point_add_mixed (2026-08-22) are load-bearing here.
+;
+; Frame (rbp-relative; save area rbp-8..-0x28):
+;   K -0x50  R1 -0x70  R2 -0x90  W1 -0x120 (129 B)  W2 -0x1b0 (129 B)
+;   ZG -0x1d0  ZS -0x1f0  D -0x250 (96; its X,Y are the affine d_ge)
+;   AI -0x2b0 (96)  TAB -0x4b0 (8 x 64: x @+0, y @+32)  AUXX -0x5b0 (8 x 32)
+;   ZR -0x6b0 (8 x 32)  TMP -0x6f0 (64, affine scratch)  BITS -0x6f8
+;   sub rsp, 0x6f8 -> rsp = rbp-0x720, 16-byte aligned at every call.
+; Registers (callee-saved across every callee): r12 = out (= R), r13 = xy,
+;   r14 = loop index, r15 = stream, rbx = digit.
+; ----------------------------------------------------------------------------
+global point_scalar_mul_glv
+point_scalar_mul_glv:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x6f8
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  rax, [rdx+0]
+    mov  [rbp-0x50], rax
+    mov  rax, [rdx+8]
+    mov  [rbp-0x48], rax
+    mov  rax, [rdx+16]
+    mov  [rbp-0x40], rax
+    mov  rax, [rdx+24]
+    mov  [rbp-0x38], rax
+    mov  rax, [rbp-0x50]
+    or   rax, [rbp-0x48]
+    or   rax, [rbp-0x40]
+    or   rax, [rbp-0x38]
+    jz   .zero
+
+    ; ---- 1. split ----
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [rbp-0x90]
+    lea  rdx, [rbp-0x50]
+    call sc_split_lambda
+    test eax, eax
+    jz   .fallback
+
+    ; ---- 2. wNAF both halves; BITS = max ----
+    lea  rdi, [rbp-0x120]
+    lea  rsi, [rbp-0x70]
+    call glv_wnaf
+    test eax, eax
+    js   .fallback
+    movsxd rax, eax
+    mov  [rbp-0x6f8], rax
+    lea  rdi, [rbp-0x1b0]
+    lea  rsi, [rbp-0x90]
+    call glv_wnaf
+    test eax, eax
+    js   .fallback
+    movsxd rax, eax
+    cmp  rax, [rbp-0x6f8]
+    jle  .bits_ok
+    mov  [rbp-0x6f8], rax
+.bits_ok:
+    cmp  qword [rbp-0x6f8], 0
+    je   .zero                     ; both halves zero <=> k == 0 (already excluded)
+
+    ; ---- 3a. table on the isomorphic curve ----
+    ; AI := (Qx, Qy, 1) ; D := 2*AI ; C := D.z
+    lea  rdi, [rbp-0x2b0]
+    mov  rsi, r13
+    mov  rcx, 8
+    rep  movsq
+    mov  qword [rbp-0x2b0+64], 1
+    mov  qword [rbp-0x2b0+72], 0
+    mov  qword [rbp-0x2b0+80], 0
+    mov  qword [rbp-0x2b0+88], 0
+    lea  rdi, [rbp-0x250]
+    lea  rsi, [rbp-0x2b0]
+    call point_double
+    ; TAB[0] = (Qx*C^2, Qy*C^3)   (ZS scratch = C^2 then C^3)
+    lea  rdi, [rbp-0x1f0]
+    lea  rsi, [rbp-0x250+64]
+    mov  rdx, rsi
+    call fe_mul
+    lea  rdi, [rbp-0x4b0]
+    mov  rsi, r13
+    lea  rdx, [rbp-0x1f0]
+    call fe_mul
+    lea  rdi, [rbp-0x1f0]
+    lea  rsi, [rbp-0x1f0]
+    lea  rdx, [rbp-0x250+64]
+    call fe_mul
+    lea  rdi, [rbp-0x4b0+32]
+    lea  rsi, [r13+32]
+    lea  rdx, [rbp-0x1f0]
+    call fe_mul
+    ; AI := (TAB[0].x, TAB[0].y, 1)  -- phi(Q) with z = 1
+    lea  rdi, [rbp-0x2b0]
+    lea  rsi, [rbp-0x4b0]
+    mov  rcx, 8
+    rep  movsq
+    ; ZR[0] := C
+    lea  rdi, [rbp-0x6b0]
+    lea  rsi, [rbp-0x250+64]
+    mov  rcx, 4
+    rep  movsq
+    ; TAB[i] = AI += d_ge  (i = 1..7), ZR[i] = the z-ratio of that add
+    mov  r14, 1
+.tab_loop:
+    lea  rdi, [rbp-0x2b0]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x250]          ; d_ge = (D.x, D.y)
+    mov  rcx, r14
+    shl  rcx, 5
+    lea  rcx, [rbp-0x6b0 + rcx]    ; &ZR[i]
+    call point_add_mixed_zr
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0x4b0 + rax]    ; &TAB[i]
+    lea  rsi, [rbp-0x2b0]
+    mov  rcx, 8
+    rep  movsq
+    inc  r14
+    cmp  r14, 8
+    jb   .tab_loop
+    ; ZG := AI.z * C  (the table's common Z once globalz has run)
+    lea  rdi, [rbp-0x1d0]
+    lea  rsi, [rbp-0x2b0+64]
+    lea  rdx, [rbp-0x250+64]
+    call fe_mul
+
+    ; ---- 3b. globalz: scale TAB[j] (j = 6..0) by zs = ZR[j+1]*...*ZR[7] ----
+    lea  rdi, [rbp-0x1f0]          ; ZS := ZR[7]
+    lea  rsi, [rbp-0x6b0 + 7*32]
+    mov  rcx, 4
+    rep  movsq
+    mov  r14, 6
+.gz_loop:
+    cmp  r14, 6
+    je   .gz_scale
+    lea  rax, [r14+1]
+    shl  rax, 5
+    lea  rdi, [rbp-0x1f0]          ; ZS *= ZR[j+1]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x6b0 + rax]
+    call fe_mul
+.gz_scale:
+    lea  rdi, [rbp-0x6f0]          ; TMP := ZS^2
+    lea  rsi, [rbp-0x1f0]
+    mov  rdx, rsi
+    call fe_mul
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0x4b0 + rax]    ; TAB[j].x *= ZS^2
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x6f0]
+    call fe_mul
+    lea  rdi, [rbp-0x6f0]          ; TMP := ZS^3
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x1f0]
+    call fe_mul
+    mov  rax, r14
+    shl  rax, 6
+    lea  rdi, [rbp-0x4b0+32 + rax] ; TAB[j].y *= ZS^3
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x6f0]
+    call fe_mul
+    dec  r14
+    jns  .gz_loop
+
+    ; ---- 3c. lambda-table: AUXX[i] = TAB[i].x * beta ----
+    xor  r14d, r14d
+.aux_loop:
+    mov  rax, r14
+    shl  rax, 5
+    lea  rdi, [rbp-0x5b0 + rax]
+    mov  rax, r14
+    shl  rax, 6
+    lea  rsi, [rbp-0x4b0 + rax]
+    lea  rdx, [rel BETA_LIMBS]
+    call fe_mul
+    inc  r14
+    cmp  r14, 8
+    jb   .aux_loop
+
+    ; ---- 4. ladder: R = inf; for i = BITS-1..0: R = 2R (+ digit adds) ----
+    mov  qword [r12+0], 1
+    mov  qword [r12+8], 0
+    mov  qword [r12+16], 0
+    mov  qword [r12+24], 0
+    mov  qword [r12+32], 1
+    mov  qword [r12+40], 0
+    mov  qword [r12+48], 0
+    mov  qword [r12+56], 0
+    mov  qword [r12+64], 0
+    mov  qword [r12+72], 0
+    mov  qword [r12+80], 0
+    mov  qword [r12+88], 0
+    mov  r14, [rbp-0x6f8]
+.ladder:
+    dec  r14
+    js   .finish
+    mov  rdi, r12
+    mov  rsi, r12
+    call point_double
+    xor  r15d, r15d                ; stream 0 = W1/TAB.x, stream 1 = W2/AUXX
+.stream:
+    mov  rax, r15
+    imul rax, rax, 0x90            ; W2 sits 0x90 below W1
+    lea  rcx, [rbp-0x120]
+    sub  rcx, rax
+    movsx rbx, byte [rcx + r14]    ; digit
+    test rbx, rbx
+    jz   .next_stream
+    mov  rax, rbx
+    mov  rcx, rbx
+    sar  rcx, 63
+    xor  rax, rcx
+    sub  rax, rcx                  ; |d|
+    dec  rax
+    shr  rax, 1                    ; idx = (|d|-1)/2
+    mov  rdx, rax
+    shl  rdx, 6
+    lea  rsi, [rbp-0x4b0 + rdx]    ; &TAB[idx].x
+    test r15, r15
+    jz   .xsrc_ok
+    mov  rdx, rax
+    shl  rdx, 5
+    lea  rsi, [rbp-0x5b0 + rdx]    ; &AUXX[idx]
+.xsrc_ok:
+    lea  rdi, [rbp-0x6f0]          ; TMP.x
+    mov  rcx, 4
+    rep  movsq
+    mov  rdx, rax
+    shl  rdx, 6
+    lea  rsi, [rbp-0x4b0+32 + rdx] ; &TAB[idx].y
+    test rbx, rbx
+    js   .negy
+    lea  rdi, [rbp-0x6f0+32]       ; TMP.y = y
+    mov  rcx, 4
+    rep  movsq
+    jmp  .addit
+.negy:
+    lea  rdi, [rbp-0x6f0+32]       ; TMP.y = 0 - y
+    mov  rdx, rsi
+    lea  rsi, [rel FE_ZERO]
+    call fe_sub
+.addit:
+    mov  rdi, r12
+    mov  rsi, r12
+    lea  rdx, [rbp-0x6f0]
+    call point_add_mixed           ; R += TMP (R == inf handled by its guard)
+.next_stream:
+    inc  r15
+    cmp  r15, 2
+    jb   .stream
+    jmp  .ladder
+
+.finish:
+    ; ---- 5. leave the isomorphic curve: R.z *= ZG (Z == 0 stays 0) ----
+    lea  rdi, [r12+64]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x1d0]
+    call fe_mul
+    jmp  .done
+
+.fallback:
+    mov  rdi, r12
+    mov  rsi, r13
+    lea  rdx, [rbp-0x50]
+    call point_scalar_mul
+    jmp  .done
+
+.zero:
+    mov  qword [r12+0], 1
+    mov  qword [r12+8], 0
+    mov  qword [r12+16], 0
+    mov  qword [r12+24], 0
+    mov  qword [r12+32], 1
+    mov  qword [r12+40], 0
+    mov  qword [r12+48], 0
+    mov  qword [r12+56], 0
+    mov  qword [r12+64], 0
+    mov  qword [r12+72], 0
+    mov  qword [r12+80], 0
+    mov  qword [r12+88], 0
+
+.done:
+    add  rsp, 0x6f8
     pop  r15
     pop  r14
     pop  r13
