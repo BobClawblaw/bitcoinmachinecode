@@ -234,6 +234,28 @@ point_add_mixed:
     mov r13, rsi           ; p
     mov r14, rdx           ; affine xy
 
+    ; ---- Z1 == 0 (p is infinity) -> r = (xy, Z=1).  (2026-08-22)
+    ; Without this, Z1=0 gives U2=0, S2=0, H=-X1, Z3=Z1*H=0: the result is
+    ; "infinity" instead of xy. Unreachable from point_scalar_mul (it seeds
+    ; R from the top digit) but reachable from any ladder that starts at
+    ; infinity, e.g. the GLV dual-stream one. Mirrors Core's
+    ; secp256k1_gej_add_ge_var "if (a->infinity)" arm (group_impl.h). ----
+    mov rax, [r13+64]
+    or  rax, [r13+72]
+    or  rax, [r13+80]
+    or  rax, [r13+88]
+    jnz .p_finite
+    mov rdi, r12
+    mov rsi, r14
+    mov rcx, 8
+    rep movsq              ; X,Y = xy (clobbers rdi/rsi/rcx only)
+    mov qword [r12+64], 1
+    mov qword [r12+72], 0
+    mov qword [r12+80], 0
+    mov qword [r12+88], 0
+    jmp .done
+.p_finite:
+
     ; S0 = Z1*Z1        (Z1Z1)
     lea rdi, [rbp-0x50]
     lea rsi, [r13+64]
@@ -626,6 +648,33 @@ point_add:
     mov r12, rdi           ; out
     mov r13, rsi           ; p
     mov r14, rdx           ; q
+
+    ; ---- infinity operands (2026-08-22): p inf -> r = q ; q inf -> r = p.
+    ; Without this a Z=0 operand falls into the generic formulas and
+    ; Z3 = Z1*Z2*H = 0 -- "infinity" instead of the other point. rep movsq
+    ; with rdi == rsi (in-place caller) is a harmless self-copy. ----
+    mov rax, [r13+64]
+    or  rax, [r13+72]
+    or  rax, [r13+80]
+    or  rax, [r13+88]
+    jnz .p_finite
+    mov rdi, r12
+    mov rsi, r14
+    mov rcx, 12
+    rep movsq
+    jmp .done
+.p_finite:
+    mov rax, [r14+64]
+    or  rax, [r14+72]
+    or  rax, [r14+80]
+    or  rax, [r14+88]
+    jnz .q_finite
+    mov rdi, r12
+    mov rsi, r13
+    mov rcx, 12
+    rep movsq
+    jmp .done
+.q_finite:
 
     ; Z1Z1 = Z1*Z1 -> S0
     lea rdi, [rbp-0x50]
