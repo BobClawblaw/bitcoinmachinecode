@@ -57,6 +57,8 @@ default rel
 extern sc_inv_var
 extern sc_mul
 extern point_scalar_mul
+extern point_scalar_mul_glv       ; PERF_SCOPE.md 4.3 (GLV + wNAF), secp256k1_point.asm
+extern bmc_ecdsa_glv_enabled      ; BMC_ECDSA_GLV kill switch, secp256k1_glv_c.c
 extern point_scalar_mul_fixed
 extern point_add
 extern fe_mul
@@ -315,10 +317,26 @@ ecdsa_verify:
     call point_scalar_mul_fixed
 
     ; ---- P2 = u2*Q : P2_base -0x220 (12) ----
+    ; GLV endomorphism + wNAF ladder (PERF_SCOPE.md 4.3) unless the
+    ; BMC_ECDSA_GLV=0 kill switch is set; point_scalar_mul_glv itself falls
+    ; back to point_scalar_mul if the split's identity check fails. u2 is
+    ; public, so a variable-time multiply is within policy
+    ; (secp256k1_point_ct.asm header). The C call clobbers only
+    ; caller-saved registers; every operand below is re-derived from rbp.
+    call bmc_ecdsa_glv_enabled
+    test eax, eax
+    jz  .p2_plain
+    lea rdi, [rbp-0x220]
+    lea rsi, [rbp-0x150]    ; Q
+    lea rdx, [rbp-0xf0]     ; u2
+    call point_scalar_mul_glv
+    jmp .p2_done
+.p2_plain:
     lea rdi, [rbp-0x220]
     lea rsi, [rbp-0x150]    ; Q
     lea rdx, [rbp-0xf0]     ; u2
     call point_scalar_mul
+.p2_done:
 
     ; ---- P = P1 + P2 : P_base -0x280 (12) ----
     lea rdi, [rbp-0x280]
