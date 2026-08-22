@@ -9,8 +9,9 @@
 ;   [0..3] = X, [4..7] = Y, [8..11] = Z.
 ; An AFFINE point is 8 consecutive limbs: [0..3] = x, [4..7] = y.
 ;
-; All sub-functions call the verified field primitives (fe_add, fe_sub,
-; fe_mul, fe_sqr) which follow the SysV AMD64 ABI and preserve rbx/r12-r15.
+; Sub-functions CALL the verified multiplicative primitives (fe_mul, fe_sqr),
+; which follow the SysV AMD64 ABI and preserve rbx/r12-r15, and EXPAND the
+; additive ones in place from secp256k1_fe_inline.inc (see the block below).
 ; This file makes no other external calls.
 ;
 ; API exported:
@@ -34,6 +35,31 @@
 ; (Offsets used below as plain constants for clarity + auditability.)
 ; ----------------------------------------------------------------------------
 
+; ----------------------------------------------------------------------------
+; INLINED FIELD ADD / SUB (2026-08-22, PERF_SCOPE.md 12)
+;
+; The nine fe_add and five fe_sub calls in point_double, and the corresponding
+; calls in point_add / point_add_mixed, are expanded in place by the macros in
+; secp256k1_fe_inline.inc instead of being called. fe_add + fe_sub were 8.8 %
+; of ALL replay cycles at height 700,000 across ~2,553 calls per verification,
+; and most of that was argument setup, call/ret and the store/load round trip
+; through this frame -- not arithmetic.
+;
+; The macros keep the accumulator in r8..r11 and C = 2^32+977 in rbx, so a
+; CHAIN of consecutive additive operations (T-A-C then doubled; C doubled
+; three times; F-D-D) is one load, several register operations, one store.
+; Every intermediate stays CANONICAL: see the header of the .inc for why that
+; is not negotiable here (the doubling branches of point_add /
+; point_add_mixed compare field elements limb by limb).
+;
+; fe_mul and fe_sqr are still called. They are 21 multiplies each; the call
+; is noise against that, and duplicating a 100-instruction reduction at every
+; site would cost more in I-cache than it saves -- and PERF_SCOPE.md 10 has
+; already established that the reduction is the part of this codebase that
+; produces lost-carry bugs, so it keeps having exactly one copy.
+; ----------------------------------------------------------------------------
+%include "secp256k1_fe_inline.inc"
+
 ; Fixed-base G comb table (w=4): T[j][i] = i * 2^(4j) * G, affine, for the
 ; fixed-base scalar multiply point_scalar_mul_fixed (see end of file). Entry
 ; offset = ((j*15)+(i-1)) * 64 bytes. Auto-generated + validated offline.
@@ -53,8 +79,7 @@ FE_ZERO:
     dq 0, 0, 0, 0
 section .text
 
-extern fe_add
-extern fe_sub
+extern fe_sub          ; only point_scalar_mul_glv's y-negation still calls it
 extern fe_mul
 extern fe_sqr
 extern sc_split_lambda        ; secp256k1_scalar.asm
@@ -67,7 +92,9 @@ extern glv_wnaf               ; secp256k1_glv_c.c
 ;   X3 = F - 2*D
 ;   Y3 = E*(D - X3) - 8*C
 ;   Z3 = 2*Y1*Z1
-; Slot map: S0=A  S1=B  S2=C  S3=(X1+B)^2 then D  S4=E  S5=F  S6=work  S7=work2
+; Slot map: S0=A  S1=B  S2=C  S3=(X1+B)^2 then D  S4=E  S5=F  S6=work  S7=8C
+;   (S6 no longer holds 2*D: X3 is computed as F - D - D straight through the
+;    register accumulator, so S6 is only ever the Y1*Z1 stash and E*(D-X3).)
 ; ----------------------------------------------------------------------------
 global point_double
 point_double:
@@ -82,6 +109,9 @@ point_double:
 
     mov r12, rdi           ; r12 = output r
     mov r13, rsi           ; r13 = input  p
+    FE_C_INIT              ; rbx = C, for every inlined add/sub below.
+                           ; fe_sqr/fe_mul preserve rbx, so this is loaded
+                           ; once per call and never reloaded.
 
     ; A = X1*X1            -> S0
     lea rdi, [rbp-0x50]
@@ -99,56 +129,41 @@ point_double:
     call fe_sqr
 
     ; T = X1 + B           -> S3
-    lea rdi, [rbp-0xb0]
-    lea rsi, [r13+0]
-    lea rdx, [rbp-0x70]
-    call fe_add
+    FE_LD   r13+0
+    FE_ADDM rbp-0x70
+    FE_ST   rbp-0xb0
     ; T = T^2              -> S3
     lea rdi, [rbp-0xb0]
     lea rsi, [rbp-0xb0]
     call fe_sqr
-    ; T = T - A            -> S3
-    lea rdi, [rbp-0xb0]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [rbp-0x50]
-    call fe_sub
-    ; T = T - C            -> S3  (T = (X1+B)^2 - A - C)
-    lea rdi, [rbp-0xb0]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [rbp-0x90]
-    call fe_sub
+    ; D = 2*(T - A - C)    -> S3.  One load, three in-register operations, one
+    ; store: this chain is the reason the macros exist. Each step is
+    ; canonical, so it is the same value fe_sub/fe_sub/fe_add produced.
+    FE_LD   rbp-0xb0
+    FE_SUBM rbp-0x50       ; - A
+    FE_SUBM rbp-0x90       ; - C
+    FE_DBL                 ; D = 2*((X1+B)^2 - A - C)
+    FE_ST   rbp-0xb0
 
-    ; D = T + T            -> S3  (D = 2*((X1+B)^2-A-C))
-    lea rdi, [rbp-0xb0]
-    lea rsi, [rbp-0xb0]
-    mov rdx, rsi
-    call fe_add
-
-    ; E = A + A            -> S4
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0x50]
-    mov rdx, rsi
-    call fe_add
-    ; E = E + A            -> S4  (E = 3*A)
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0xd0]
-    lea rdx, [rbp-0x50]
-    call fe_add
+    ; E = 3*A              -> S4   (A + A, then + A -- in registers)
+    FE_LD   rbp-0x50
+    FE_DBL
+    FE_ADDM rbp-0x50
+    FE_ST   rbp-0xd0
 
     ; F = E*E              -> S5
     lea rdi, [rbp-0xf0]
     lea rsi, [rbp-0xd0]
     call fe_sqr
 
-    ; S6 = D + D  (= 2*D) ; X3 = F - S6 -> r12+0
-    lea rdi, [rbp-0x110]
-    lea rsi, [rbp-0xb0]
-    mov rdx, rsi
-    call fe_add
-    lea rdi, [r12+0]
-    lea rsi, [rbp-0xf0]
-    lea rdx, [rbp-0x110]
-    call fe_sub
+    ; X3 = F - 2*D -> r12+0, as F - D - D. Slot S6 no longer holds 2*D at all
+    ; (the reference materialised it there); subtracting D twice from a
+    ; canonical accumulator gives the same canonical residue and costs one
+    ; fewer reduction than add-then-subtract.
+    FE_LD   rbp-0xf0
+    FE_SUBM rbp-0xb0
+    FE_SUBM rbp-0xb0
+    FE_ST   r12+0
 
     ; NOTE (2026-08-22, PERF_SCOPE.md 10): E*(D-X3) used to be computed HERE,
     ; into S6, then unconditionally destroyed a few lines below by the Y1*Z1
@@ -162,19 +177,12 @@ point_double:
     ; it limb-for-limb against the frozen tests/point_ref.asm, in place and
     ; out of place.
 
-    ; S7 = 8*C : C+C ; + ; +
-    lea rdi, [rbp-0x130]
-    lea rsi, [rbp-0x90]
-    mov rdx, rsi
-    call fe_add
-    lea rdi, [rbp-0x130]
-    lea rsi, [rbp-0x130]
-    mov rdx, rsi
-    call fe_add
-    lea rdi, [rbp-0x130]
-    lea rsi, [rbp-0x130]
-    mov rdx, rsi
-    call fe_add
+    ; S7 = 8*C : three doublings, all three in registers
+    FE_LD   rbp-0x90
+    FE_DBL
+    FE_DBL
+    FE_DBL
+    FE_ST   rbp-0x130
 
     ; Y3 = S6 - S7        -> r12+32
     ; BUT first capture Z3's operands (Y1,Z1) while the input is still intact,
@@ -186,26 +194,23 @@ point_double:
     ;   Z3 = 2*Y1*Z1 -> r12+64, which frees S6 again for E*(D-X3).
     ;   Writing r12+64 here is safe even when r == p: Z1 (r13+64) was just
     ;   consumed and nothing below reads it.
-    lea rdi, [r12+64]
-    lea rsi, [rbp-0x110]
-    mov rdx, rsi
-    call fe_add          ; r12+64 = 2*Y1*Z1 = Z3
+    FE_LD   rbp-0x110
+    FE_DBL
+    FE_ST   r12+64         ; r12+64 = 2*Y1*Z1 = Z3
     ; now Y3, using slots (D, X3, E, C still in slots/out)
     ;   t = D - X3 -> S6
-    lea rdi, [rbp-0x110]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [r12+0]
-    call fe_sub
+    FE_LD   rbp-0xb0
+    FE_SUBM r12+0
+    FE_ST   rbp-0x110
     ;   t = E * t -> S6
     lea rdi, [rbp-0x110]
     lea rsi, [rbp-0xd0]
     lea rdx, [rbp-0x110]
     call fe_mul
     ;   8C in S7 still = 8*C ; Y3 = S6 - S7 -> r12+32
-    lea rdi, [r12+32]
-    lea rsi, [rbp-0x110]
-    lea rdx, [rbp-0x130]
-    call fe_sub
+    FE_LD   rbp-0x110
+    FE_SUBM rbp-0x130
+    FE_ST   r12+32
 
     add rsp, 0x148
     pop r15
@@ -225,7 +230,9 @@ point_double:
 ;   X3 = R^2 - HHH - 2V ; Y3 = R*(V-X3) - Y1*HHH ; Z3 = Z1*H
 ;   Slot window (add sub 0x188 : save area [rbp-8..-40], slots below):
 ;     S0=-0x50 Z1Z1, S1=-0x70 U2, S2=-0x90 V(also t), S3=-0xb0 S2(y), S4=-0xd0 H,
-;     S5=-0xf0 R, S6=-0x110 HH, S7=-0x130 HHH, S8=-0x150 work, S9=-0x170 work2
+;     S5=-0xf0 R, S6=-0x110 HH, S7=-0x130 HHH, S8=-0x150 work, S9=-0x170 Y1*HHH
+;   (S9 no longer holds 2V: X3 is R^2 - V - V - HHH through the register
+;    accumulator, so S9 is only ever Y1*HHH.)
 ; ----------------------------------------------------------------------------
 ; point_add_mixed_zr(r[12], p[12], xy[8], zr[4]) -- identical, plus
 ;   zr = Z3/Z1 = H, the z-ratio libsecp256k1's secp256k1_gej_add_ge_var
@@ -269,6 +276,8 @@ point_add_mixed:
     mov r14, rdx           ; affine xy
     xor r15d, r15d         ; no z-ratio requested
 .body:
+    FE_C_INIT              ; rbx = C for the inlined add/sub; rbx is otherwise
+                           ; unused here and every callee preserves it.
 
     ; ---- Z1 == 0 (p is infinity) -> r = (xy, Z=1).  (2026-08-22)
     ; Without this, Z1=0 gives U2=0, S2=0, H=-X1, Z3=Z1*H=0: the result is
@@ -351,10 +360,9 @@ point_add_mixed:
     ; overwritten by an in-place double)
     test r15, r15
     jz  .dbl
-    mov rdi, r15
-    lea rsi, [r13+32]
-    mov rdx, rsi
-    call fe_add
+    FE_LD r13+32
+    FE_DBL
+    FE_ST r15
 .dbl:
     mov rdi, r12
     mov rsi, r13
@@ -384,15 +392,13 @@ point_add_mixed:
 
 .distinct:
     ; H = U2 - X1      -> S4
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0x70]
-    lea rdx, [r13+0]
-    call fe_sub
+    FE_LD   rbp-0x70
+    FE_SUBM r13+0
+    FE_ST   rbp-0xd0
     ; R = S2 - Y1      -> S5
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [r13+32]
-    call fe_sub
+    FE_LD   rbp-0xb0
+    FE_SUBM r13+32
+    FE_ST   rbp-0xf0
     ; HH = H^2         -> S6
     lea rdi, [rbp-0x110]
     lea rsi, [rbp-0xd0]
@@ -408,28 +414,24 @@ point_add_mixed:
     lea rdx, [rbp-0x110]
     call fe_mul
     ; X3 = R^2 - HHH - 2V
-    ;   S8 = R^2 ; S9 = 2V
+    ;   S8 = R^2
     lea rdi, [rbp-0x150]
     lea rsi, [rbp-0xf0]
     call fe_sqr
-    lea rdi, [rbp-0x170]
-    lea rsi, [rbp-0x90]
-    mov rdx, rsi
-    call fe_add          ; 2V
-    lea rdi, [r12+0]
-    lea rsi, [rbp-0x150]
-    lea rdx, [rbp-0x170]
-    call fe_sub          ; X3 = R^2 - 2V
-    lea rdi, [r12+0]
-    lea rsi, [r12+0]
-    lea rdx, [rbp-0x130]
-    call fe_sub          ; X3 = X3 - HHH
+    ;   X3 = R^2 - V - V - HHH, one chain in registers. The reference
+    ;   materialised 2V into slot S9 first; subtracting V twice from a
+    ;   canonical accumulator is the same canonical residue with one fewer
+    ;   reduction and no slot traffic, so S9 is no longer used for it.
+    FE_LD   rbp-0x150
+    FE_SUBM rbp-0x90     ; - V
+    FE_SUBM rbp-0x90     ; - V
+    FE_SUBM rbp-0x130    ; - HHH
+    FE_ST   r12+0
     ; Y3 = R*(V-X3) - Y1*HHH
     ;   S8 = V - X3
-    lea rdi, [rbp-0x150]
-    lea rsi, [rbp-0x90]
-    lea rdx, [r12+0]
-    call fe_sub          ; V - X3
+    FE_LD   rbp-0x90
+    FE_SUBM r12+0
+    FE_ST   rbp-0x150
     ;   S8 = R * (V-X3)
     lea rdi, [rbp-0x150]
     lea rsi, [rbp-0xf0]
@@ -441,10 +443,9 @@ point_add_mixed:
     lea rdx, [rbp-0x130]
     call fe_mul
     ;   Y3 = S8 - S9  -> out+32
-    lea rdi, [r12+32]
-    lea rsi, [rbp-0x150]
-    lea rdx, [rbp-0x170]
-    call fe_sub
+    FE_LD   rbp-0x150
+    FE_SUBM rbp-0x170
+    FE_ST   r12+32
     ; Z3 = Z1 * H -> out+64
     lea rdi, [r12+64]
     lea rsi, [r13+64]
@@ -712,6 +713,7 @@ point_add:
     mov r12, rdi           ; out
     mov r13, rsi           ; p
     mov r14, rdx           ; q
+    FE_C_INIT              ; rbx = C for the inlined add/sub (see the header)
 
     ; ---- infinity operands (2026-08-22): p inf -> r = q ; q inf -> r = p.
     ; Without this a Z=0 operand falls into the generic formulas and
@@ -828,15 +830,13 @@ point_add:
 
 .distinct:
     ; H = U2 - U1 -> S6
-    lea rdi, [rbp-0x110]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [rbp-0x90]
-    call fe_sub
+    FE_LD   rbp-0xb0
+    FE_SUBM rbp-0x90
+    FE_ST   rbp-0x110
     ; R = S2proj - S1 -> S7
-    lea rdi, [rbp-0x130]
-    lea rsi, [rbp-0xd0]
-    lea rdx, [rbp-0x70]
-    call fe_sub
+    FE_LD   rbp-0xd0
+    FE_SUBM rbp-0x70
+    FE_ST   rbp-0x130
     ; HH = H*H -> S8
     lea rdi, [rbp-0x150]
     lea rsi, [rbp-0x110]
@@ -856,27 +856,19 @@ point_add:
     lea rdi, [rbp-0xf0]
     lea rsi, [rbp-0x130]
     call fe_sqr
-    ;   S11 = 2V
-    lea rdi, [rbp-0x1b0]
-    lea rsi, [rbp-0x190]
-    mov rdx, rsi
-    call fe_add
-    ;   out = S5 - S11 - S9
-    lea rdi, [r12+0]
-    lea rsi, [rbp-0xf0]
-    lea rdx, [rbp-0x1b0]
-    call fe_sub
-    lea rdi, [r12+0]
-    lea rsi, [r12+0]
-    lea rdx, [rbp-0x170]
-    call fe_sub
+    ;   out = R^2 - V - V - HHH, one chain in registers (the reference built
+    ;   2V into slot S11 first; S11 is no longer used for it)
+    FE_LD   rbp-0xf0
+    FE_SUBM rbp-0x190    ; - V
+    FE_SUBM rbp-0x190    ; - V
+    FE_SUBM rbp-0x170    ; - HHH
+    FE_ST   r12+0
 
     ; Y3 = R*(V-X3) - S1*HHH -> out+32
     ;   S5 = V - X3
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0x190]
-    lea rdx, [r12+0]
-    call fe_sub
+    FE_LD   rbp-0x190
+    FE_SUBM r12+0
+    FE_ST   rbp-0xf0
     ;   S5 = R * (V-X3)
     lea rdi, [rbp-0xf0]
     lea rsi, [rbp-0x130]
@@ -888,10 +880,9 @@ point_add:
     lea rdx, [rbp-0x170]
     call fe_mul
     ;   Y3 = S5 - S11 -> out+32
-    lea rdi, [r12+32]
-    lea rsi, [rbp-0xf0]
-    lea rdx, [rbp-0x1b0]
-    call fe_sub
+    FE_LD   rbp-0xf0
+    FE_SUBM rbp-0x1b0
+    FE_ST   r12+32
 
     ; Z3 = Z1*Z2*H -> out+64
     ;   S11 = Z1*Z2

@@ -1844,3 +1844,292 @@ There is no longer a "two-front problem" (§1): it is one front.
    unknown without a call-graph profile; worth one targeted run.
 4. Re-profile again afterwards. The shares have now moved three times in one
    day, and each time they inverted the ranking.
+
+## 12. Inlining the field add/sub into the EC formulas — BUILT, 2026-08-22
+
+§11.2's item 1, and the last lever with double-digit headroom. **1.10× on
+`ecdsa_verify`, 1.22× on `point_double`.** Branch `ec-inline`.
+
+### 12.1 What the lever actually is
+
+`fe_add` (5.48 %) + `fe_sub` (3.32 %) were **8.8 % of all replay cycles**
+across 2,553 calls per verification (§11). Both are tiny — 31 and 19
+instructions — so most of that is not arithmetic. It is three `lea`s of
+argument setup, a `call`/`ret`, and above all **four stores and four loads
+through the caller's stack frame** on every result, including results the
+very next operation consumes.
+
+§10.4 had already located this precisely: 5×52's one structural advantage
+over 4×64 is not the representation, it is that libsecp256k1's field ops are
+*inlined into the EC formulas*, so consecutive values stay in registers.
+This change gives 4×64 the same property, and it is independent of the
+representation — which is why §10 could reject 5×52 and this could still pay.
+
+`asm/secp256k1_fe_inline.inc` holds the macros; `secp256k1_point.asm` and
+`secp256k1_point_ct.asm` include it. The two files had **58** `call fe_add` /
+`call fe_sub` sites (30 + 28); **57** are gone, replaced by 57 inline field
+operations grouped into **40 register chains** (19 + 21). **One** call
+survives, in `point_scalar_mul_glv`'s wNAF y-negation, because `rbx` holds
+the digit there and `rbx` is the macros' home for C. It runs ~25× per verify,
+not 2,553×.
+
+The *operation* count is deliberately unchanged -- this banks no algebraic
+shortcut. What disappears is 57 `call`/`ret` pairs, ~150 argument `lea`s, and
+**17 whole field elements' worth of store-then-reload** (57 results now cost
+40 stores and 40 loads instead of 57 of each, because the value the next
+operation consumes never leaves the register file).
+
+### 12.2 Register pressure — why nothing spills
+
+A field element is four registers, so the design question is whether an
+accumulator fits without displacing anything.
+
+* Accumulator `V` = `r8:r9:r10:r11`; fold constant C = 2³²+977 pinned in
+  `rbx`, loaded once per function (`FE_C_INIT`); scratch `rax, rcx, rdx,
+  rsi, rdi`.
+* In `point_double`, `point_add`, `point_add_mixed`, `pointh_add` and
+  `pointh_double` those nine registers are **already dead between calls** —
+  `rax/rcx/rdx/rsi/rdi` exist only to pass arguments and `r8..r11` are
+  caller-saved and unused. Every live pointer (`r12` out, `r13` p, `r14` q,
+  `r15` zr, `rbp` frame) is callee-saved and untouched by the macros.
+* `rbx` was pushed by all five prologues and used by none of them, so C is
+  free real estate. `fe_mul`, `fe_sqr` and `point_double` all preserve it,
+  so it survives every nested call and is never reloaded.
+* **Zero spills, zero added stack slots, no frame-size change** — which is
+  also why `make abi-check` is unaffected (1,026 call sites, still all
+  16-byte aligned).
+
+A *full* inline — expanding `fe_mul`/`fe_sqr` too — was deliberately not
+attempted. Those need all 15 GPRs for the 512-bit product and would spill
+immediately, they are 21 multiplies each so the call is noise against them,
+and §10 established that the reduction is the one part of this codebase that
+has produced a lost-carry consensus bug, so it keeps having exactly one copy.
+
+### 12.3 The fusions the call boundary was hiding
+
+Chains that now cost one load, N register operations and one store:
+
+| site | was | now |
+|---|---|---|
+| `point_double` D | `T-A`, `T-C`, `T+T` — 3 calls, 3 slot round trips | one chain |
+| `point_double` E = 3A | `A+A`, `+A` | one chain |
+| `point_double` 8C | 3 chained `fe_add` | 3 `FE_DBL` |
+| `point_double` X3 | `S6 = D+D`; `F - S6` | `F - D - D`, slot S6 never written |
+| `point_add` / `point_add_mixed` X3 | `2V` into a slot; `R²-2V`; `-HHH` | `R² - V - V - HHH` |
+| `pointh_add` 7+8, 12+13, 17+18 | `t4 = ta+tb`; `t = t - t4` | `t - ta - tb`, temp never written |
+| `pointh_add` 19+20, `pointh_double` 11+12 | `X3 = 2t0`; `t0 = X3+t0` | `t0 = 3t0` in registers |
+| `pointh_double` 2-4 | 3 chained `fe_add` | 3 `FE_DBL` |
+
+Each dropped temp was verified dead by inspection *and* by the differential:
+in every case the slot is overwritten by a later step before anything reads
+it. Note that these fusions do not *remove* reductions -- `F - 2D` becomes
+`F - D - D`, still two -- they remove the slot the intermediate was parked
+in, and with it the store and the reload.
+
+### 12.4 The one algebraic change, and its proof
+
+`FE_ADD_TAIL` merges `fe_add`'s two reduction steps — fold the 257th bit,
+then conditionally subtract p — into **one** conditional select:
+
+    s = a + b = CF1·2²⁵⁶ + s0
+    t = s0 + C   (with carry CF2)          ; t == s - p  (mod 2²⁵⁶)
+    result = (CF1 | CF2) ? t : s0
+
+It is the same 256 bits `fe_add` returns, not merely congruent:
+
+* **CF1 = 0**: `t` and CF2 *are* `fe_add`'s own shadow sum and predicate, and
+  its fold added nothing. Identical by inspection.
+* **CF1 = 1**: with a, b < p, s ≤ 2p−2, so s0 ≤ 2²⁵⁶−2C−2 and
+  t = s0+C ≤ 2²⁵⁶−C−2 < p. `fe_add`'s second step therefore keeps `t`
+  unchanged — which is what this returns.
+
+The two forms can only differ when a+b ≥ 2²⁵⁷−2C, which is **impossible for
+a, b < p = 2²⁵⁶−C**. `tests/test_fe_inline` constructs that boundary
+explicitly and demonstrates the divergence on an out-of-contract pair
+(a = 2²⁵⁶−1), so the claim is shown rather than asserted.
+
+**No non-canonical intermediate is introduced anywhere.** Every macro takes
+canonical operands and leaves the accumulator canonical, so §10.5's hazard —
+`point_add`'s `U1 == U2` and `point_add_mixed`'s `U2 == X1` deciding the
+doubling branch by **limb** equality, returning infinity instead of 2P — is
+untouched. That hazard is the reason lazy reduction was rejected and it is
+the reason this change deliberately banks none of the same headroom.
+
+### 12.5 Measured
+
+Methodology throughout: CPU time (`CLOCK_THREAD_CPUTIME_ID`), min-of-N,
+spread printed, `taskset -c 20`, both builds run **alternately** in the same
+session (the before build is the shipped `secp256k1_point{,_ct}.asm` from
+`6df20c7`, assembled and linked identically). A full-chain replay was
+consuming ~5-10 of 32 threads throughout, which is why the absolute numbers
+drift between repeats and only the paired comparison is quoted.
+
+New permanent harnesses: `tests/bench_point` (`point_double`, `point_add`,
+`point_add_mixed` as serial chains over real curve points, plus the field
+additive ops both ways in the same binary — deliberately, because `bench_fe`
+is alignment-sensitive at ±0.5 ns and a cross-binary comparison of a 1 ns
+operation would not survive it).
+
+**`tests/bench_point`, 200,000 (50,000 for the adds) calls/round, min-of-15,
+4 alternating repeats.** Each cell is the min over the 4 repeat minima; the
+4 repeat minima are listed so the spread is visible.
+
+| ns/call | before | after | factor |
+|---|---|---|---|
+| `point_double` | **71.75** (72.11, 71.75, 71.83, 73.16) | **58.72** (58.86, 58.72, 60.11, 59.91) | **1.222×** |
+| `point_add_mixed` | **97.44** (97.44, 97.79, 100.67, 98.97) | **93.62** (93.62, 93.81, 95.53, 95.40) | 1.041× |
+| `point_add` | **134.68** (135.29, 134.68, 136.72, 137.72) | **131.52** (131.52, 132.12, 134.48, 134.02) | 1.024× |
+
+`point_double`'s distributions do not overlap. `point_add_mixed`'s do not
+overlap. `point_add`'s overlap by 2 ns across repeats, but the *paired*
+comparison is in the same direction in all four.
+
+The field ops, measured in one binary at one moment (`fe_*_inl` are the same
+macro bodies wrapped as SysV functions, so they still pay three push/pop
+pairs and a `ret` that the in-situ expansion does not — these are an **upper
+bound** on the inline cost):
+
+| ns/call, LAT | call | inline (wrapped) | factor |
+|---|---|---|---|
+| `fe_add` | 2.225 | **1.467** | 1.517× |
+| `fe_sub` | 1.302 | 1.301 | **1.00× — no change** |
+
+That `fe_sub` row is the honest part of the result: standalone, `fe_sub` is
+already latency-bound on its own four-limb `sbb` chain and the call/ret hides
+inside it. **All** of `fe_sub`'s gain comes from chaining — not paying the
+store and the reload when the next operation consumes the value — which is
+invisible to a single-operation benchmark and is exactly what `point_double`
+measures.
+
+**`tests/bench_ecdsa`, 20,000 verifications × min-of-9, 8 alternating
+repeats, `taskset -c 20`:**
+
+| µs / verify | before | after |
+|---|---|---|
+| repeat minima | 23.49, 23.41, 23.66, 23.50, 25.14, 25.44, 25.91, 26.13 | 21.38, 21.29, 21.28, 21.41, 23.77, 23.61, 23.60, 21.44 |
+| **best** | **23.41** | **21.28** |
+
+**1.100×.** Paired ratios: 1.099, 1.100, 1.112, 1.098, 1.058, 1.078, 1.098,
+1.219 — median 1.099. Unpinned, 3 alternating repeats: 22.75 → 20.76 µs,
+1.096×. `tests/bench_fe` (the field file is untouched — control) is
+unchanged within noise: `fe_mul` 8.39/5.36, `fe_sqr` 7.37/4.50, `fe_add`
+2.13, `fe_sub` 1.24.
+
+**The saving reconciles with the component numbers.** Instrumented entry
+counters on the benchmark fixture: **126 `point_double`, 109
+`point_add_mixed`, 1 `point_add` per `ecdsa_verify`**. Predicted saving
+126×13.03 + 109×3.82 + 1×3.16 = **2.06 µs**; measured 23.41 − 21.28 =
+**2.13 µs**. Agreement to 3.3 %, so the gain is where the microbenchmarks say
+it is and not somewhere else. (Counts are for one fixed fixture signature;
+real digit streams vary by a few counts either way.)
+
+### 12.6 Code size — measured, not assumed
+
+`.text` bytes in the NASM objects:
+
+| | before | after |
+|---|---|---|
+| `point_double` | 481 | 1,336 |
+| `point_add.distinct` | 344 | 762 |
+| `point_add_mixed.distinct` | 360 | 748 |
+| `pointh_add` | 850 | 2,186 |
+| `pointh_double` | 483 | 1,140 |
+| `secp256k1_point.o` `.text` | 4,764 | 6,530 (+37 %) |
+| `secp256k1_point_ct.o` `.text` | 2,153 | 4,146 (+93 %) |
+
+`point_double` nearly triples and runs 126× per verify, so this was the real
+risk. The verification hot loop is now `point_double` (1.3 K) +
+`point_add_mixed` (~1.2 K) + `point_scalar_mul_glv` (~1.2 K) + `fe_mul` /
+`fe_sqr` (~0.9 K) ≈ **4.6 KB against a 32 KB L1I**, and the measurement above
+is the answer: it got faster, so on this core the I-cache did not care. On a
+machine with a smaller L1I this trade could invert, and that is not tested.
+
+### 12.7 End-to-end projection, and the Amdahl bound stated
+
+**Not measured end to end. Projected.** §7 and §9 exist because projections
+off stale shares overstated results, so the arithmetic is spelled out.
+
+§11's live profile (height ~700,000, 117,989 samples) puts field + EC
+arithmetic at ~64 % of all replay cycles, essentially all of it under
+`ecdsa_verify`. A 1.100× on that component removes 9.1 % of its cycles:
+
+    end-to-end ≈ 1 / (1 − 0.091 × 0.64) ≈ 1.062×
+
+**The Amdahl bound for this lever specifically** is set by the two symbols it
+attacks: `fe_add` + `fe_sub` were 8.8 % of all cycles, so making field
+addition *entirely free* would give 1/(1−0.088) = **1.096× end-to-end**. This
+change realises about two thirds of that (5.8 of the 8.8 points). The
+remaining third is the arithmetic itself, which no amount of inlining removes.
+
+The wider bound is unchanged: even a free `ecdsa_verify` is 1/(1−0.64) =
+2.78×.
+
+This projection is only as good as §11's share, which is hours old and was
+taken at one height. **Re-profile before quoting an end-to-end number.**
+
+### 12.8 What this changes about the remaining plan
+
+**§11.2's item 2 — `fe_mul_int(r, a, k)` for the `3A` / `8C` patterns — has
+been mostly consumed by this change and should be re-sized before it is
+built.** §10.11 priced it at ~3 % of a verify against `fe_add` at 2.18 ns per
+call. Those five calls are now five inline operations costing ~0.87 ns each
+(derived: `point_double` lost 13.03 ns across 14 inlined operations), so the
+whole `3A` + `8C` chain is now ~4.4 ns, not ~11 ns. A shift-based small
+multiply might halve that: ~2 ns per `point_double`, 126× = 0.25 µs ≈ **1.2 %
+of a verify, ~0.8 % end-to-end** — for a *new* field primitive needing its own
+Python oracle and mutation campaign. That is now below the bar.
+
+What is left after this:
+
+1. **Re-profile.** The shares have moved four times in two days and the EC
+   layer's internal composition just changed again.
+2. Attribute the 6.9 % in `memmove`/`memset`/`copy_bytes` (§11.2 item 3) —
+   still unexplored, still needs one call-graph run.
+3. `fe_mul`/`fe_sqr` are now ~46 % of all cycles between them and there is no
+   known lever on them: §10 measured lazy reduction (1.07×, rejected on the
+   consensus hazard), 5×52 (worse), AVX-512 IFMA (§5.3, rejected), and three
+   contract-preserving `reduce` restructurings (all inside ±0.5 ns).
+
+### 12.9 Correctness evidence
+
+* `tests/test_point_repr` — **8,037,500 checks, 0 failures**: every point
+  routine against the frozen `tests/point_ref.asm` / `point_ct_ref.asm`, out
+  of place *and* in place, with the degenerate shapes forced (infinity,
+  q == p, mixed-add doubling, Y = 0, (0,0)).
+* `tests/test_fe_inline` — **NEW, 24,000,720 checks, 0 failures**: the macros
+  driven directly (`tests/fe_inline_probe.asm`) against `fe_add`/`fe_sub`
+  *and* an independent C big-integer oracle, over 3,000,000 structured and
+  random canonical pairs **plus 90 constructed carry-boundary pairs** around
+  p, 2²⁵⁶, 2²⁵⁶+C, 2p, 0 and C. Wired into `make test`.
+* `tests/test_ecdsa_inverse` (113,315 cases vs a frozen reference reaching
+  the verdict by a different route) and `tests/test_ecdsa_glv_switch`
+  (30,240, three-way): pass.
+* `tests/test_scalarmul_ct`: passes, including its timing check — CT ratio
+  **1.000×** against a variable-time control that leaks 14.6×. The macros are
+  straight-line `adc`/`sbb`/`cmov`; no branch and no data-dependent address
+  was introduced on the signing path.
+* `make abi-check`: OK, 1,026 call sites. No frame size changed.
+* `make -k test`: **MAKE_RC=0, zero failures**, 108 harnesses.
+
+**Mutation campaign: 18 mutants, 18 caught, 0 survivors.** Every mutant is a
+real instruction edit (never a comment), applied to the shipped source and
+rebuilt: broken `adc`→`add` carry chains in `FE_ADDM` and `FE_DBL`; inverted
+`cmovnz`→`cmovz`; **dropping CF1 from `FE_ADD_TAIL`'s predicate** (caught only
+by the constructed a+b ≥ 2²⁵⁶ boundary — the case §12.4's proof turns on);
+fold constant C → C−1; dropping `FE_SUBM`'s borrow correction; wrong limb
+offsets in `FE_LD` and `FE_ST`; and ten formula-level edits — `X3 = F−D`,
+`8C → 4C`, `E = 3A → 2A`, swapped `D−X3`, swapped `H = U2−X1`, a dropped `V`
+in `point_add`, `zr = Y1` instead of `2Y1`, a wrong slot in `pointh_add`'s
+fused 7+8, `Z3 = 4t0`, `t2 = 2t2`.
+
+### 12.10 Not verified
+
+* **No live profile of the new code.** The replay is running the previously
+  deployed binary; nothing here was deployed. §12.7 is arithmetic, not
+  measurement.
+* The 8.8 % / 64 % shares are §11's, from one 25-second window at one height.
+* Whether the code-size growth costs anything on a core with a smaller L1I.
+* `fe_mul` / `fe_sqr` inlining was reasoned about (§12.2) and **not measured**.
+* `tests/bench_point`'s operands are one fixed pair of curve points; the
+  routines are straight-line over the field so this is not a correctness
+  concern, but the digit-dependent call counts in §12.5 are fixture-specific.
