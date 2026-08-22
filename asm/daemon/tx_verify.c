@@ -108,6 +108,16 @@ extern int  sv_verify_witness_v0(const u8* prog, u32 proglen,
                                  u64 amount, unsigned long long flags, unsigned long nIn,
                                  const u8* tx, unsigned long txlen, u8* work, unsigned long workcap);
 #define TXV_FLAG_WITNESS (1ULL<<11)   /* SCRIPT_VERIFY_WITNESS, Core bit */
+/* SCRIPT_VERIFY_TAPROOT, Core bit 17 (script_flags_consts.inc SFC_BIT_TAPROOT).
+ * script_flags_for_block() already computes this correctly, INCLUDING Core's
+ * one mainnet exception block -- 692261,
+ * 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad, for which
+ * Core's chainparams override the flags down to P2SH|WITNESS. That block spends
+ * four real witness-v1 outputs with NO witness at all, which is invalid under
+ * taproot and valid without it. The two P2TR dispatch sites below used to
+ * ignore the computed flags entirely and apply taproot rules unconditionally,
+ * so the replay rejected that block: a FALSE REJECT. See LOG.md incident #22. */
+#define TXV_FLAG_TAPROOT (1ULL<<17)
 extern int  p2wsh_verify_multisig(const u8* tx, int64_t txlen, int64_t n_in,
                                   uint64_t amount, const u8* witness_script,
                                   uint64_t wslen,
@@ -486,7 +496,7 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
         memcpy(g_txv_in[i].spk, spk, spklen);
         g_txv_in[i].spklen = (u32)spklen;
 
-        if (is_p2tr(spk, (u32)spklen)) {
+        if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
             has_taproot = 1;
             g_txv_in[i].shape = TXV_SHAPE_P2TR;
             if (g_txv_in[i].scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; return 0; }
@@ -1082,7 +1092,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         if (in->spk_off == ~0ull) { *reason = "out of memory"; *fail_tx_index = in->tx_index; goto fail; }
         in->spklen = (u32)spklen;
 
-        if (is_p2tr(spk, (u32)spklen)) {
+        if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
             has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
             if (in->scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
             /* Exact shape (key-path vs script-path, annex or not) isn't
