@@ -14,7 +14,10 @@
 ;   sc_sub(r[4], a[4], b[4]) : r = (a-b) mod n
 ;   sc_mul(r[4], a[4], b[4]) : r = (a*b) mod n
 ;   sc_sqr(r[4], a[4])       : r = (a*a) mod n
-;   sc_inv(r[4], a[4])       : r = a^(n-2) mod n  (Fermat)
+;   sc_inv(r[4], a[4])       : r = a^(n-2) mod n  (Fermat, constant-time;
+;                              secret-scalar paths: signing k^{-1})
+;   sc_inv_var(r[4], a[4])   : r = a^{-1} mod n   (binary xgcd, VARIABLE-TIME;
+;                              public-scalar path only: ecdsa_verify s^{-1})
 ;
 ; DESIGN NOTE: sc_mul was originally a correctness-first MSB->LSB
 ; double-and-add over sc_add. It was replaced (2026-08-16, see commits
@@ -540,6 +543,249 @@ sc_inv:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; int sc_inv_var(r[4], a[4]) : r = a^-1 mod n  --  VARIABLE-TIME.
+;   Binary extended GCD (Stein), PERF_SCOPE.md 4.2 lever B. Replaces the
+;   Fermat sc_inv (450 sc_mul, ~45% of an ecdsa_verify) on the ONE call site
+;   whose operand is public: ecdsa_verify's w = s^{-1}. Everything that
+;   inverts a secret (signing k^{-1} in wallet_core.c / wallet_msgsign.c)
+;   keeps calling sc_inv; never route a secret through this function.
+;   Policy (secp256k1_point_ct.asm header): variable time "is FINE and FAST
+;   for verification, where the scalar is public ... It is FATAL for
+;   signing, where the scalar is the secret nonce k".
+;
+;   Invariants (mod n):  x1*a == u,  x2*a == v.   Start u=a, v=n, x1=1, x2=0.
+;     strip factors of 2 from u (halving x1 mod n alongside), then from v;
+;     both odd -> subtract the smaller from the larger (and the x's mod n);
+;     the difference is even, so the next round strips again. n is prime and
+;     0 < a < n, so the loop ends with u == 1 (answer x1) or v == 1 (x2).
+;   Halving x mod n: x even -> x/2; x odd -> (x+n)/2, which needs the
+;   257th carry bit of x+n (x < n  =>  (x+n)/2 < n, stays reduced).
+;
+;   Returns eax=1 and writes r on success. Returns eax=0 and leaves r
+;   untouched if a == 0 (no inverse; also the only input that would loop
+;   forever in the even-stripping). Caller (ecdsa_verify) already rejects
+;   s == 0 and s >= n before calling; a >= n is not supported.
+;   Cost: ~2*256 halvings + ~200 subtractions, ~15-25k instructions, vs
+;   ~1.2M for sc_inv.
+;   ABI: rdi=out, rsi=a. Preserves rbx, r12-r15, rbp. Calls sc_sub (leaf).
+;   Frame (ascending 4-limb blocks): u @ rbp-0x40, v @ rbp-0x60,
+;                                    x1 @ rbp-0x80, x2 @ rbp-0xa0.
+; ----------------------------------------------------------------------------
+global sc_inv_var
+sc_inv_var:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub  rsp, 0x80          ; rsp = rbp-0xa0, 16-aligned
+    mov  rbx, rdi           ; out
+
+    ; a == 0 -> fail
+    mov  rax, [rsi+0]
+    or   rax, [rsi+8]
+    or   rax, [rsi+16]
+    or   rax, [rsi+24]
+    jz   .fail
+
+    ; u = a ; v = n ; x1 = 1 ; x2 = 0
+    mov  rax, [rsi+0]
+    mov  [rbp-0x40+0], rax
+    mov  rax, [rsi+8]
+    mov  [rbp-0x40+8], rax
+    mov  rax, [rsi+16]
+    mov  [rbp-0x40+16], rax
+    mov  rax, [rsi+24]
+    mov  [rbp-0x40+24], rax
+    mov  rax, [N_LIMBS+0]
+    mov  [rbp-0x60+0], rax
+    mov  rax, [N_LIMBS+8]
+    mov  [rbp-0x60+8], rax
+    mov  rax, [N_LIMBS+16]
+    mov  [rbp-0x60+16], rax
+    mov  rax, [N_LIMBS+24]
+    mov  [rbp-0x60+24], rax
+    mov  qword [rbp-0x80+0], 1
+    mov  qword [rbp-0x80+8], 0
+    mov  qword [rbp-0x80+16], 0
+    mov  qword [rbp-0x80+24], 0
+    mov  qword [rbp-0xa0+0], 0
+    mov  qword [rbp-0xa0+8], 0
+    mov  qword [rbp-0xa0+16], 0
+    mov  qword [rbp-0xa0+24], 0
+
+.loop:
+    ; u == 1 ?
+    mov  rax, [rbp-0x40+0]
+    cmp  rax, 1
+    jne  .chk_v
+    mov  rax, [rbp-0x40+8]
+    or   rax, [rbp-0x40+16]
+    or   rax, [rbp-0x40+24]
+    jz   .ret_x1
+.chk_v:
+    ; v == 1 ?
+    mov  rax, [rbp-0x60+0]
+    cmp  rax, 1
+    jne  .strip_u
+    mov  rax, [rbp-0x60+8]
+    or   rax, [rbp-0x60+16]
+    or   rax, [rbp-0x60+24]
+    jz   .ret_x2
+
+.strip_u:
+    test byte [rbp-0x40], 1
+    jnz  .strip_v
+    lea  rdi, [rbp-0x40]
+    call .shr1
+    lea  rdi, [rbp-0x80]
+    call .halve_mod_n
+    jmp  .strip_u
+.strip_v:
+    test byte [rbp-0x60], 1
+    jnz  .cmp
+    lea  rdi, [rbp-0x60]
+    call .shr1
+    lea  rdi, [rbp-0xa0]
+    call .halve_mod_n
+    jmp  .strip_v
+
+.cmp:
+    ; u >= v ?  (compare from the top limb)
+    mov  rax, [rbp-0x40+24]
+    cmp  rax, [rbp-0x60+24]
+    jb   .v_big
+    ja   .u_big
+    mov  rax, [rbp-0x40+16]
+    cmp  rax, [rbp-0x60+16]
+    jb   .v_big
+    ja   .u_big
+    mov  rax, [rbp-0x40+8]
+    cmp  rax, [rbp-0x60+8]
+    jb   .v_big
+    ja   .u_big
+    mov  rax, [rbp-0x40+0]
+    cmp  rax, [rbp-0x60+0]
+    jb   .v_big
+.u_big:
+    ; u -= v (no borrow: u >= v) ; x1 = x1 - x2 mod n
+    mov  rax, [rbp-0x40+0]
+    sub  rax, [rbp-0x60+0]
+    mov  [rbp-0x40+0], rax
+    mov  rax, [rbp-0x40+8]
+    sbb  rax, [rbp-0x60+8]
+    mov  [rbp-0x40+8], rax
+    mov  rax, [rbp-0x40+16]
+    sbb  rax, [rbp-0x60+16]
+    mov  [rbp-0x40+16], rax
+    mov  rax, [rbp-0x40+24]
+    sbb  rax, [rbp-0x60+24]
+    mov  [rbp-0x40+24], rax
+    lea  rdi, [rbp-0x80]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0xa0]
+    call sc_sub
+    jmp  .loop
+.v_big:
+    ; v -= u ; x2 = x2 - x1 mod n
+    mov  rax, [rbp-0x60+0]
+    sub  rax, [rbp-0x40+0]
+    mov  [rbp-0x60+0], rax
+    mov  rax, [rbp-0x60+8]
+    sbb  rax, [rbp-0x40+8]
+    mov  [rbp-0x60+8], rax
+    mov  rax, [rbp-0x60+16]
+    sbb  rax, [rbp-0x40+16]
+    mov  [rbp-0x60+16], rax
+    mov  rax, [rbp-0x60+24]
+    sbb  rax, [rbp-0x40+24]
+    mov  [rbp-0x60+24], rax
+    lea  rdi, [rbp-0xa0]
+    mov  rsi, rdi
+    lea  rdx, [rbp-0x80]
+    call sc_sub
+    jmp  .loop
+
+.ret_x1:
+    lea  rsi, [rbp-0x80]
+    jmp  .store
+.ret_x2:
+    lea  rsi, [rbp-0xa0]
+.store:
+    mov  rax, [rsi+0]
+    mov  [rbx+0], rax
+    mov  rax, [rsi+8]
+    mov  [rbx+8], rax
+    mov  rax, [rsi+16]
+    mov  [rbx+16], rax
+    mov  rax, [rsi+24]
+    mov  [rbx+24], rax
+    mov  eax, 1
+    jmp  .out
+.fail:
+    xor  eax, eax
+.out:
+    add  rsp, 0x80
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; .shr1: [rdi] >>= 1 over 4 limbs (plain, no modulus). Clobbers r8-r11.
+.shr1:
+    mov  r8,  [rdi+0]
+    mov  r9,  [rdi+8]
+    mov  r10, [rdi+16]
+    mov  r11, [rdi+24]
+    shrd r8,  r9,  1
+    shrd r9,  r10, 1
+    shrd r10, r11, 1
+    shr  r11, 1
+    mov  [rdi+0],  r8
+    mov  [rdi+8],  r9
+    mov  [rdi+16], r10
+    mov  [rdi+24], r11
+    ret
+
+; .halve_mod_n: [rdi] = [rdi] / 2 mod n, for [rdi] in [0,n).
+;   odd: (x + n) >> 1 using the 257th bit (rax) as the incoming top bit.
+;   Clobbers rax, r8-r11.
+.halve_mod_n:
+    mov  r8,  [rdi+0]
+    mov  r9,  [rdi+8]
+    mov  r10, [rdi+16]
+    mov  r11, [rdi+24]
+    test r8, 1
+    jz   .hm_shift
+    xor  eax, eax           ; before the add chain (xor clobbers flags)
+    add  r8,  [N_LIMBS+0]
+    adc  r9,  [N_LIMBS+8]
+    adc  r10, [N_LIMBS+16]
+    adc  r11, [N_LIMBS+24]
+    adc  rax, 0             ; rax = carry-out (bit 256 of x+n)
+    shrd r8,  r9,  1
+    shrd r9,  r10, 1
+    shrd r10, r11, 1
+    shr  r11, 1
+    shl  rax, 63
+    or   r11, rax
+    jmp  .hm_store
+.hm_shift:
+    shrd r8,  r9,  1
+    shrd r9,  r10, 1
+    shrd r10, r11, 1
+    shr  r11, 1
+.hm_store:
+    mov  [rdi+0],  r8
+    mov  [rdi+8],  r9
+    mov  [rdi+16], r10
+    mov  [rdi+24], r11
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
