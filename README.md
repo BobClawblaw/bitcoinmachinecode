@@ -23,6 +23,26 @@ assembly.
 
 ## Status
 
+**Current state (2026-08-22).** Block-level script verification (Stage D of
+`PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
+acceptance test: a from-scratch, full-signature-verification replay of the
+real mainnet archive (no `assumevalid`), ~386k of 963k blocks so far with
+every fix deployed. Nine real production incidents have been found by that
+replay and fixed with regression tests (`LOG.md`); the latest include
+genesis missing from the archive (every buried soft fork one block late),
+two lost carries in the secp256k1 multiplies, and a shutdown path that had
+turned every `systemctl stop` into a SIGKILL. Performance this week
+(`PERF_SCOPE.md`): `ecdsa_verify` 121 → ~39 µs (variable-time inverse,
+projective compare, GLV+wNAF; libsecp256k1 measures 21.8 µs on the same
+CPU), UTXO lookups via an mmap run cache (kernel share 31 % → 5 %), and
+end-to-end replay throughput **4.4×** over identical heights. A scratch
+Bitcoin Core instance is now part of the development path as an oracle
+and benchmark; chain hashes agree with it at every height checked. Next:
+the 4×64 field multiply (56 % of cycles), and a UTXO-set hash so Stage D
+can be proven byte-identical to Core's chainstate rather than just
+"no block rejected". `FEATURE_GAPS.md` is the honest list of what this
+node still does not do.
+
 **Delivered and verified:**
 - **SHA-256 core** (`asm/sha256.asm`) — passes the canonical FIPS-180-4 vectors
   plus the multi-block and extra-length-block padding cases Bitcoin requires.
