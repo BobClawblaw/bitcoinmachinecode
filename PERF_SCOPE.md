@@ -1038,3 +1038,41 @@ transactions than the ~390 k blocks the original profile sampled).
 The general lesson, twice over in one session: a performance plan built on
 a profile is only as current as the profile. This one was ~227,000 blocks
 stale and it inverted the top of the list.
+
+**Amendment (incident #21): these three functions just got slower, on
+purpose, and the single-pass rewrite must not undo the reason.**
+
+`read_cs` was unbounded — a compactsize's width comes from its own first
+byte, so every walk in `bitcoin_segwit.c` could read up to 8 bytes past the
+end of the transaction — and `sw_ser_txout` wrote an output's scriptPubKey
+into a 600-byte stack buffer with no check at all, which real mainnet
+transactions from height ~927,500 onward overflow. Both are fixed;
+`read_cs` now takes the buffer end, and `sw_prevout`/`sw_seq` bound each
+step of their walk.
+
+That is not free, and it lands exactly on the 34% this section is about.
+Measured on `segwit_v0_sighash` alone (min of 12–15 runs, `-O2`, the
+census's 1,372-input shape, 100 outputs):
+
+| build | ms/call | vs main |
+|---|---|---|
+| before the fix | 2.44 | — |
+| bounded `read_cs` only | 2.54 | +4% |
+| as shipped (walk steps bounded too) | 2.84 | +16% |
+
+Most of the cost is *not* the bounded reader: it is the per-iteration bound
+in `sw_prevout`/`sw_seq`, which is redundant in the sense that `swtx_parse`
+has already validated the identical byte range before either is called. It
+was kept anyway, because "a distant function already checked this" is how
+incidents #13 and #21 both happened, and because the fix below deletes these
+loops entirely.
+
+**So lever 1 is now worth more, not less.** A single-pass precompute walks
+the transaction once with one bounded pass and indexes afterwards — it
+removes the O(n²) *and* the repeated bound checks, which together are the
+whole of this 34%. When it is written: the single walk must keep the
+`end`-bounded reader and must bound each `q += sl` against the remaining
+length rather than forming `q + sl` first (a wire-derived length near 2^64
+overflows the pointer into a comparison that passes). The `cap` on
+`sw_ser_txout` is a consensus-safety bound, not a policy one, and must
+survive in whatever replaces it.
