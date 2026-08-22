@@ -186,6 +186,41 @@ plus straightforward methods on top of it.
     a set hash, so the expensive half of `gettxoutsetinfo` is written.
     Note the count alone is NOT the acceptance test: `txouts` matching
     Core proves cardinality, not contents.
+  - **BLOCKER found 2026-08-22 the moment that count first became
+    trustworthy: our UTXO set stores provably-unspendable outputs and
+    Core's does not.** At height 575,833 we hold **77,191,281** entries;
+    the oracle's `gettxoutsetinfo none 575833` reports **54,953,225**
+    `txouts` — we carry **22,238,056** more. Root cause is in
+    `daemon/utxo_live.c:339`: `live_on_output` calls `utxo_lsm_put` for
+    every output with no script inspection whatsoever, while Core never
+    writes a provably-unspendable output to the chainstate (a script whose
+    first opcode is `OP_RETURN`, or one larger than `MAX_SCRIPT_SIZE`
+    = 10,000 B). Confirmed by magnitude, not just by mechanism: sampling
+    the oracle every 25,000 blocks to 575,833 gives ~37.7 nulldata outputs
+    per block, extrapolating to **~21.7M** — the observed delta to within
+    2.5 %.
+  - **This is NOT a consensus divergence.** An `OP_RETURN` output cannot be
+    spent either way: Core rejects the spend for a missing prevout, we find
+    the entry and then fail the script immediately. Same verdict, different
+    route. It costs storage (tens of millions of dead entries, and the
+    write/compaction amplification they cause) and it makes `txouts`/set-hash
+    parity with Core impossible until fixed — which is precisely the
+    acceptance test above.
+  - Note the codebase already made this exact argument, for exactly one
+    output: `utxo_live.c:548` excludes the genesis coinbase because
+    applying it "would leave this node one UTXO richer than Core forever,
+    surfacing the first time our set is compared against
+    `gettxoutsetinfo`". The reasoning was right and was never generalized
+    from one output to twenty-two million.
+  - **Deliberately NOT fixed mid-replay.** The filter itself is a few lines,
+    but it only takes effect for outputs applied *after* it lands — the
+    22M already-stored entries would persist until a full rebuild, so the
+    change is worth little without one, and a rebuild costs the whole
+    replay. It also carries a genuine false-reject risk if the
+    unspendable test is ever looser than Core's, which is the dangerous
+    direction. Sequence it with the set-hash work and a from-scratch
+    rebuild, and gate it on a differential test against Core's
+    `IsUnspendable` semantics.
 
 ## Wallet
 
