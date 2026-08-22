@@ -135,6 +135,30 @@ int main(){
             std::string o = HexStr(h);
             printf("OK %s\n", o.c_str());
             fflush(stdout);
+        } else if(cmd=="BIP143"){
+            /* BIP143 <inputidx> <nHashType_dec> <amount_sats> <tx_hex> <scriptCode_hex>
+             *   -> Core's SignatureHash(..., SigVersion::WITNESS_V0), i.e. the
+             *      real BIP143 sighash, hex-printed in the same byte order the
+             *      SIGHASH command above uses. Added 2026-08-22 so the
+             *      large-scriptPubKey CTxOut vectors (incident #20) get a
+             *      Core-authoritative answer rather than being checked against
+             *      our own implementation or a re-reading of the BIP.
+             *      scriptCode is the BARE script (no compactsize prefix) --
+             *      Core's serializer adds the prefix itself, exactly as
+             *      segwit_v0_sighash() does. */
+            unsigned idx=0; long long ht=0; long long amount=0;
+            std::string txs, sc;
+            iss>>idx>>ht>>amount>>txs>>sc;
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, txs)){ printf("ERR tx-decode-fail\n"); fflush(stdout); continue; }
+            if (idx >= mtx.vin.size()){ printf("ERR bad-input-index\n"); fflush(stdout); continue; }
+            if (sc=="-") sc="";
+            std::vector<unsigned char> scb = hex2bytes(sc.c_str());
+            CScript scriptCode(scb.begin(), scb.end());
+            uint256 h = SignatureHash(scriptCode, mtx, idx, (int32_t)ht, CAmount(amount),
+                                      SigVersion::WITNESS_V0);
+            printf("OK %s\n", HexStr(h).c_str());
+            fflush(stdout);
         }
     }
     return 0;
