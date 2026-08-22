@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#10; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#11; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -203,6 +203,40 @@ The lesson is the one from #6 again, sharper: a replay that runs clean is
 evidence only about the checks that exist. Every tool that "verified the
 archive against Core" compared headers and txids -- exactly the fields that
 do not change when witnesses are stripped.
+
+### Incident #11: the first real P2WPKH spend failed -- our BIP143 scriptCode was the witness program
+
+With the archive witness-complete, the replay resumed at 481823 and rejected
+481824 tx 562 again, now with `p2wpkh signature invalid`. The block bytes
+are identical to Core's and the new commitment check passed, so the data was
+right and the verifier was wrong. `p2wpkh_verify` (`bitcoin_segwit.c`) handed
+`segwit_v0_sighash` the 22-byte program `0014<hash160>` as the scriptCode.
+BIP143 -- and Core's `VerifyWitnessProgram` -- use the implied P2PKH script
+`76a914<hash160>88ac`, so the preimage carries `1976a914...88ac`. Every other
+field was correct.
+
+Why nothing caught it: the synthetic vectors were made by
+`validation/gen_modern_vectors.py`, which made the *same* assumption, and a
+second fixture (`tests/multi_p2wpkh_vec.h`, 10 genuine P2WPKH inputs) came
+from a `/tmp` script that copied it. A verifier and its vector generator
+agreeing byte-for-byte proves nothing if they share a premise. No real
+P2WPKH input had ever reached this code -- the archive was stripped.
+
+Root-caused differentially: `validation/bip143_ref.py` reproduces BIP143's
+own worked example first, then computes the real tx's sighash both ways;
+the real signature verifies only with the P2PKH scriptCode. Fixes `b3800f0`
+(verifier, generator, `test_segwit_sighash` helper; `modern_vec.h`
+regenerated -- P2WSH/P2TR unchanged, as they should be) and `b6c92fa`
+(`validation/gen_multi_p2wpkh.py` now lives in the repo and reuses the main
+generator's helpers; the regenerated fixture is rejected by the old verifier
+and the old fixture by the new one). `tests/test_p2wpkh_real.c` pins the
+real transaction: sighash `32f2913c...a9a6`, verify == 1. Blocks below
+481824 cannot contain P2WPKH inputs, so nothing already validated moves.
+
+Operationally: the Claude session itself died at ~07:25 (no OOM, no crash
+dump, no reboot -- client/API side), with the fix committed in its worktree
+and the daemon idle; resumed at 09:56. The session's background deploy chain
+had survived and was still waiting; killed.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
