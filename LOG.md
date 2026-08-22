@@ -579,6 +579,11 @@ form. That deviation is documented as intentional in `fe3addb`'s own
 comment and deserves its own decision, not a silent ride-along in an
 alignment fix.
 ### Incident #19: the tapscript initial stack had no 520-byte limit at all
+*(Committed as `1e80eb8`, whose subject line reads "incident #18". The number
+was reassigned at merge: the serve-path ABI fix `b18114b` had already taken
+#18 while this work was in flight. The commit message is left as-is rather
+than rewriting pushed history; #19 is the correct number and the one used
+everywhere else.)*
 Chasing `CHAIN_AHEAD_CENSUS.md`'s last two open rows -- "real inscription
 untested at scale" and "`tap_leaf_hash`'s 4 MB leaf cap" -- turned up
 something the census had not predicted and the replay would never have found.
