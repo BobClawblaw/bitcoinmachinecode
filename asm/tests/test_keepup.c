@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include "test_tmpdir.h"
 
 extern long node_handshake(int fd);
 extern int  node_accept_handshake(int fd);
@@ -73,6 +74,7 @@ static void build_chain(void){
 }
 
 int main(void){
+    tt_isolate();   /* private working dir: the store below writes index.dat/blk00000.dat by bare name */
     setbuf(stdout,NULL);
     signal(SIGPIPE, SIG_IGN);   /* as the daemon does (main.c): a broken peer
                                    socket must not kill the node mid-write */

@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "modern_spend.h"
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -90,11 +91,7 @@ static void seed_utxos(const msend_t** specs, int n){
 }
 
 int main(void){
-    char tmpl[] = "/tmp/txacceptXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { perror("mkdtemp"); return 1; }
-    if (chdir(dir)) { perror("chdir"); return 1; }
-
+    tt_isolate();
     const msend_t* s = &modern_spends[0];    /* p2wpkh_0 -- used for the valid-accept case */
     const msend_t* s2 = &modern_spends[1];   /* p2wpkh_1 -- a DISTINCT fixture for the corruption
                                                * case, since BIP141 txid excludes witness data, so

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "test_tmpdir.h"
 
 extern void sha256d(unsigned char out[32], const void* msg, long len);
 
@@ -74,14 +75,15 @@ static void do_connect(const unsigned char* blk, size_t n, int h, int* en, int* 
     static char hex[4000000]; size_t x=0; static const char* d="0123456789abcdef";
     for(size_t i=0;i<n && x+1<sizeof hex;i++){ hex[x++]=(char)d[blk[i]>>4]; hex[x++]=d[blk[i]&15]; }
     hex[x]=0;
-    const char* shim=getenv("BIP30_SHIM"); if(!shim) shim="./tests/bip30_shim";
+    const char* shim=getenv("BIP30_SHIM"); if(!shim) shim="tests/bip30_shim";
+    shim=tt_src(shim);   /* absolute passes through; relative rebases past the chdir */
     static char cmd[6000000];
     snprintf(cmd,sizeof cmd,
-        "{ printf 'RESET\\nCONNECT %s %d\\nQUIT\\n'; } | %s > /tmp/b30shim.out 2>/dev/null",
+        "{ printf 'RESET\\nCONNECT %s %d\\nQUIT\\n'; } | %s > b30shim.out 2>/dev/null",
         hex, h, shim);
     system(cmd);
     /* parse: line1=RESET OK, line2=CONNECT verdict */
-    FILE* f=fopen("/tmp/b30shim.out","r");
+    FILE* f=fopen("b30shim.out","r");
     char line[256]; int e=-1,a=-1,b=-1;
     int lc=0;
     while(f && fgets(line,sizeof line,f)){ lc++; if(lc==2){ sscanf(line,"OK %d %d %d %d",&e,&a,&b,&b); break; } }
@@ -91,6 +93,7 @@ static void do_connect(const unsigned char* blk, size_t n, int h, int* en, int* 
 
 
 int main(void){
+    tt_isolate();   /* the shim's stdout capture was a fixed /tmp path */
     int fails=0;
     unsigned char blk[1024];
     size_t bl = build_cb_block(blk, 0xABC1230000000000ULL, 0x207fffffUL, 200, 1600000000u);

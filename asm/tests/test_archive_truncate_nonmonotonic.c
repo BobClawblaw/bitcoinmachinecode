@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 /* state struct layout must mirror bitcoin_store.asm (see tests/test_truncate.c) */
 struct St {
@@ -102,10 +103,7 @@ static void make_nonmonotonic(long at_height){
  * an earlier Part's leftover bytes silently contaminate a later Part's
  * "fresh archive" assumptions (caught by this test's own first draft). */
 static void fresh_dir(void){
-    char tmpl[] = "/tmp/btcnonmonoXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); exit(1); }
-    chdir(dir);
+    tt_isolate();
 }
 
 int main(void){

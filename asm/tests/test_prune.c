@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 extern int  store_init(void* st);
 extern int  store_reload(void* st);
@@ -183,21 +184,17 @@ static void prune_all_case(void){
 }
 
 int main(void){
-    char tmpl[]="/tmp/btcpruneXXXXXX";
-    char* base = mkdtemp(tmpl);
-    if(!base){ printf("FAIL mkdtemp\n"); return 1; }
+    tt_isolate();
+    const char* base = tt_workdir();
 
     /* single-file case in its own subdir */
-    { char d[256]; snprintf(d,sizeof d,"%s/single",base); mkdir(d,0700); chdir(d);
-      single_file_case(); chdir(base); }
+    { mkdir("single",0700); chdir("single"); single_file_case(); chdir(base); }
 
     /* multi-file case */
-    { char d[256]; snprintf(d,sizeof d,"%s/multi",base); mkdir(d,0700); chdir(d);
-      multi_file_case(); chdir(base); }
+    { mkdir("multi",0700); chdir("multi"); multi_file_case(); chdir(base); }
 
     /* prune-all */
-    { char d[256]; snprintf(d,sizeof d,"%s/all",base); mkdir(d,0700); chdir(d);
-      prune_all_case(); chdir(base); }
+    { mkdir("all",0700); chdir("all"); prune_all_case(); chdir(base); }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;

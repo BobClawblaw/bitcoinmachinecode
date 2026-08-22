@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 static int failures = 0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
@@ -65,7 +66,8 @@ static void build_chain(void){
 int main(void){
     build_chain();
     /* build store in CWD (empty dir); use a scratch subdir */
-    mkdir("/tmp/clitest",0777); chdir("/tmp/clitest");
+    /* fixed /tmp/clitest was shared by every concurrent run */
+    tt_isolate();
     unlink("blk00000.dat"); unlink("index.dat"); unlink("prune.dat");
     static unsigned char st[4096];
     cki("store_init", store_init(st), 1);

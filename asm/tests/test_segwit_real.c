@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include <string.h>
 #include "segwit_real_vec.h"
+#include "test_tmpdir.h"
 typedef unsigned char u8; typedef unsigned long u64;
 struct lsm_state {
     long log_fd, idx_fd;
@@ -56,7 +57,7 @@ static void seed(void){
   if(utxo_lsm_init(&g_lst)!=1){fprintf(stderr,"lsm_init\n");exit(1);}
 }
 int main(void){
-  char tmpl[]="/tmp/segrealXXXXXX"; char* d=mkdtemp(tmpl); if(!d||chdir(d)){perror("dir");return 1;}
+  tt_isolate();
   seed();
   static u8 tx[1<<20], spk[128];
   /* seed every prevout of every fixture */

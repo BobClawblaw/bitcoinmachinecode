@@ -36,6 +36,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include "test_tmpdir.h"
 
 extern long p2p_write(int,const char*,unsigned,const void*,unsigned);
 extern int  p2p_read(int,char[12],void*,unsigned,unsigned*);
@@ -166,11 +167,15 @@ int main(int argc, char** argv){
     signal(SIGPIPE,SIG_IGN);
     build_chain();
     if(argc<2){ fprintf(stderr,"usage: %s <path-to-daemon/bitcoind>\n",argv[0]); return 2; }
-    const char* daemon=argv[1];
+    tt_isolate();
+    const char* daemon=tt_src(argv[1]);
 
     /* ---- node working dir ---- */
-    char ndir[128]; snprintf(ndir,sizeof ndir,"/tmp/outmux_%d",(int)getpid());
-    mkdir(ndir,0755);
+    /* The daemon takes its datadir as an argument, so hand it this test's
+     * private directory rather than a pid-named /tmp path that nothing
+     * ever removed. tt_isolate() also chdir()s, so the daemon path from
+     * argv (a repo-relative ./daemon/bitcoind) is rebased with tt_src(). */
+    const char* ndir = tt_workdir();
 
     /* ---- start MINING PEER, get its OUT_PORT via pipe ---- */
     int portpipe[2], growpipe[2];
@@ -195,7 +200,7 @@ int main(int argc, char** argv){
     snprintf(oport,sizeof oport,"%d",(int)out_port);
     pid_t node=fork();
     if(node==0){
-        char* av[] = { (char*)daemon, "serve-test", ndir, sport, "127.0.0.1", oport, "1", NULL };
+        char* av[] = { (char*)daemon, "serve-test", (char*)ndir, sport, "127.0.0.1", oport, "1", NULL };
         execv(daemon, av);
         perror("execv node"); _exit(9);
     }
@@ -230,7 +235,6 @@ int main(int argc, char** argv){
     write(growpipe[1],"Q",1);
     int st1,st2; kill(node,SIGTERM); waitpid(node,&st1,0); kill(peer,SIGTERM); waitpid(peer,&st2,0);
     close(growpipe[1]);
-    unlink(ndir); /* leave? keep for inspection */
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

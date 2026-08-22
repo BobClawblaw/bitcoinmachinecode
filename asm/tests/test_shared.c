@@ -10,13 +10,14 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/wait.h>
+#include "test_tmpdir.h"
 
 extern int  store_init(void* st);
 extern long store_append_shared(void* st, long height, const void* hash, const void* raw, unsigned long long len);
 
 int main(void){
-    const char* dir="/tmp/shared_test";
-    mkdir(dir,0777); chdir(dir);
+    /* fixed /tmp path: two concurrent runs shared one store */
+    tt_isolate();
     unlink("index.dat"); unlink("blk00000.dat"); unlink("append.lock");
 
     long total=200;               /* heights 0..199 */

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern long p2p_getheaders(void* out, const void* locator, long count, const void* stop);
 
@@ -43,11 +44,7 @@ static void fill_hash(unsigned char h[32], int height){
 }
 
 int main(void){
-    char tmpl[]="/tmp/btclocXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     /* ============================================================
      * Part 1: p2p_getheaders count>1 wire format
      * ============================================================ */
@@ -148,6 +145,5 @@ int main(void){
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
-    rmdir(dir);
     return failures?1:0;
 }

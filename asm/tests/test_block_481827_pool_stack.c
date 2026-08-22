@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include "test_tmpdir.h"
 typedef unsigned char u8;
 extern long store_init(void* st);
 extern int  utxo_live_init(const char* dir);
@@ -36,11 +37,12 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
 static u8 store_buf[4096];
 static int hx(const char* h, u8* out, int cap){ int n=0; for(; h[0]&&h[1]&&n<cap; h+=2,n++){ unsigned v; sscanf(h,"%2x",&v); out[n]=(u8)v; } return n; }
 int main(void){
-    const char* FX_BIN="tests/fixtures/blk_481827.bin"; const char* FX_PRE="tests/fixtures/blk_481827.prevouts";
+    tt_isolate();
+    const char* FX_BIN=tt_src("tests/fixtures/blk_481827.bin");
+    const char* FX_PRE=tt_src("tests/fixtures/blk_481827.prevouts");
     FILE* fb=fopen(FX_BIN,"rb"); FILE* fp=fopen(FX_PRE,"r");
     if(!fb||!fp){ printf("SKIP: fixtures absent (run validation/fetch_block_prevouts.py 481827)\n"); return 0; }
     static u8 blk[1<<21]; long blen=fread(blk,1,sizeof blk,fb); fclose(fb);
-    char tmpl[]="/tmp/blk481827XXXXXX"; char* dir=mkdtemp(tmpl); if(!dir||chdir(dir)){ printf("FAIL tmpdir\n"); return 1; }
     memset(store_buf,0,sizeof store_buf);
     if(store_init(store_buf)!=1){ printf("FAIL store_init\n"); return 1; }
     if(utxo_live_init(".")!=1){ printf("FAIL utxo_live_init\n"); return 1; }

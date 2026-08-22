@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 
 #include "block_vec.h"
+#include "test_tmpdir.h"
 
 extern long node_handshake(int fd);
 extern int  node_accept_handshake(int fd);
@@ -62,6 +63,7 @@ static void build_store(void* idx){
 }
 
 int main(void){
+    tt_isolate();   /* private working dir: the store below writes index.dat/blk00000.dat by bare name */
     setbuf(stdout,NULL);
     static unsigned char idx[24 + 64*48];
     build_store(idx);

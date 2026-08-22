@@ -37,6 +37,7 @@
 #include <dirent.h>
 #include <sys/wait.h>
 #include "../daemon/node_config.h"
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -218,9 +219,7 @@ static void run_scenario(const scen_t* s){
 
     /* ---------- crash path ---------- */
     {
-        char tmpl[] = "/tmp/crashrecXXXXXX";
-        char* dir = mkdtemp(tmpl);
-        if (!dir || chdir(dir)) { perror("mkdtemp/chdir"); exit(1); }
+        tt_subdir("crash");   /* a fresh, empty datadir for this leg */
         memset(store_buf,0,sizeof store_buf);
         apply_sizing(s->tiny);
         ck("store_init", store_init(store_buf), 1);
@@ -268,9 +267,7 @@ static void run_scenario(const scen_t* s){
     }
     /* ---------- reference path: same chain, never crashed ---------- */
     {
-        char tmpl[] = "/tmp/crashrefXXXXXX";
-        char* dir = mkdtemp(tmpl);
-        if (!dir || chdir(dir)) { perror("mkdtemp/chdir"); exit(1); }
+        tt_subdir("ref");   /* a fresh, empty datadir for this leg */
         memset(store_buf,0,sizeof store_buf);
         apply_sizing(s->tiny);
         ck("ref store_init", store_init(store_buf), 1);
@@ -317,6 +314,7 @@ static void run_scenario(const scen_t* s){
 }
 
 int main(void){
+    tt_isolate();
     scen_t scens[] = {
         { "(a) killed after ALL of block 150's ops hit the WAL, before its checkpoint",
           CRASH_BEFORE_PERSIST, 1, 3, 0 },

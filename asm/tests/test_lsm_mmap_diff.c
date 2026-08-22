@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "test_tmpdir.h"
 
 extern unsigned long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
@@ -125,11 +126,7 @@ static void* hammer(void* arg) {
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/lsmmmapXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    if (chdir(dir) != 0) { printf("FAIL chdir\n"); return 1; }
-
+    tt_isolate();
     void* tomb = malloc(TOMB_CAP*36);
     void* manifest = malloc(MANIFEST_CAP*16);
     void* scratch = malloc(SCRATCH_CAP);
