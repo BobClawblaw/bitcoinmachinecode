@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#17; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#18; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -500,6 +500,84 @@ compared against `gettxoutsetinfo`". The same sentence describes twenty-two
 million other outputs. Getting a rule right in one place is not the same as
 holding it as an invariant, and only an external oracle showed the
 difference -- a broken telemetry counter had been hiding it all along.
+
+### Incident #18: the serve path violated the SysV stack ABI, and a wrong comment defended it
+`test_keepup` had been failing 2/2 for most of the day, filed as "a tip
+keep-up serve-path regression, not on the replay's critical path, fix it
+later". Both halves of that description were wrong.
+
+The two assertions were not two failures. They were one crash: the serve
+child died of SIGSEGV the instant a peer pushed it a block, after which the
+getdata read returns -1 (indistinguishable from "wrong bytes" to the
+harness) and the later ping gets no pong. The evidence chain ran: child
+wait status `sig=11`; an `SA_SIGINFO` handler placing the fault inside
+glibc, reached from `log_block_stored_inbound` -> `log_fprintf` ->
+`snprintf`, with `si_addr = NULL`; and a disassembly of the faulting
+address showing `movaps %xmm0,-0xc0(%rbp)` -- a 16-byte-aligned SSE store
+against an `rbp` that was 8 mod 16. **That NULL fault address is the tell:
+a misalignment trap, not a null-pointer dereference.**
+
+Back-derived, `rbp` 8 mod 16 in the callee means RSP was 8 mod 16 at the
+`call`, and the ABI requires 0. `node_serve_loop`'s prologue pushes rbp
+plus five callee-saved registers, leaving RSP 8 mod 16, and then reserved
+`0x50` -- which is 0 mod 16 and therefore preserves the violation at every
+nested call in the function.
+
+The instructive part is the comment that had been sitting above that
+reservation, asserting `0x50` was correct because this codebase's asm
+callees "require" 8 mod 16. They do not: every `movdqa` in `sha256.asm`,
+`sha256_nia.asm` and `secp256k1_point.asm` is register-to-register, with no
+16-byte-aligned stack operand anywhere in the tree. The convention is
+visible two ways in the codebase itself -- `node_announce_tip`, the other
+global in the same file with an identical prologue, uses `sub rsp, 8`; and
+`mac_run_lookup` in `bitcoin_utxo_lsm.asm` brackets its C call with a
+`sub`/`add 0x28` pair for precisely this reason. So the file contained both
+the bug and, a few hundred lines away, the correct pattern.
+
+The violation dates to `dfa8690`, the file's original commit. What made it
+lethal was `5aea7c0`, which added the `log_block_stored_inbound` call --
+the first C callee on that path that reaches `vsnprintf`. For as long as
+the misaligned frame only ever called assembly, nothing noticed. **My own
+attribution to `fe3addb` (the MSG_WITNESS serve change) was wrong and was
+disproven directly: checking that file out at `fe3addb^` and rebuilding
+still fails 2/2.** That is three inline diagnoses overturned by
+differential test in one session (#13, #16, #18). The pattern is stable
+enough to be a rule: a root cause that has not been reproduced is a
+hypothesis.
+
+The fix reserves `0x58` and pairs the four `push rbx` / `call` / `pop rbx`
+sites with a padding push -- those four had been the only *correctly*
+aligned calls beforehand, and would have become the only misaligned ones
+after. It is safe against the frame resize because every "local" the old
+comment listed actually lives in `.data`; nothing in the function is
+rbp-relative, so no operand moves.
+
+**And the failure was hiding far more than itself.** A failing command
+aborts the remainder of a make recipe, so those two assertions had been
+truncating the suite: baseline `make -k test` on `main` executed 103 of 137
+tests and stopped. With the fix, 137/137 pass. The 34 that had never been
+running include `test_bip152`, `test_bip152_loop`, `test_p2p_inv`,
+`test_segwit_real`, `test_reorg`, `test_undo_log`, `test_chainwork` and
+four `test_utxo_*` crash/checkpoint tests. That is the second time in one
+day that a green-looking suite was not running what it claimed (cf. #15's
+missing prerequisites) -- and the second failure mode of the same kind: not
+a test that passes wrongly, but a test that never executes.
+
+Two things deliberately left alone, both recorded rather than folded in. A
+repo-wide alignment audit found the same violation in `utxo_lsm_init` and
+`utxo_lsm_reload`, which call `lsm_mm_invalidate_all` at RSP 8 mod 16; it
+is harmless *today* only because that C function compiles to five
+instructions with no stack frame and no SSE (verified by disassembly), and
+its sibling `mac_run_lookup` gets the alignment right, which is why the
+`movaps`-containing `lsm_run_lookup_mm` call does not fault. Latent, not
+live -- but this incident is the proof that "latent" here means "waiting
+for someone to add a `printf`". Separately, the serve path genuinely does
+ignore which type a getdata requested: after `fe3addb` masks the BIP144
+flag, both `MSG_BLOCK` and `MSG_WITNESS_BLOCK` return the full witness
+serialization, where Core answers a bare `MSG_BLOCK` with the stripped
+form. That deviation is documented as intentional in `fe3addb`'s own
+comment and deserves its own decision, not a silent ride-along in an
+alignment fix.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
