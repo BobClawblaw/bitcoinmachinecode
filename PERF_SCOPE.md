@@ -547,3 +547,89 @@ the download ceiling **pauses the replay entirely** for the duration of the
 download leg (they do not interleave), so wall-clock to tip includes those
 pauses — roughly 20 minutes per 58k blocks fetched from the local oracle at
 ~30 blk/s.
+
+## 6. Beyond parity — what would actually beat Bitcoin Core
+
+Scoped 2026-08-22 evening. Sections 1-5 aim at *parity* with libsecp256k1.
+This section is about exceeding it, and starts with the uncomfortable part.
+
+### 6.0 We have not measured Core, so "faster than Core" is currently unfalsifiable
+
+Every multiplier in this document is **this code against itself**, old vs
+new, at matched heights. That is the right way to measure a change and it
+says nothing about Core. The only like-for-like comparison is Core doing a
+full-verification IBD (`-assumevalid=0 -stopatheight`) in a scratch datadir
+on this machine, and it has never been run. Until it is, any claim to beat
+Core is unsupported.
+
+It is deliberately **not** run while the replay is live: it would contend
+for CPU and disk with the thing being measured, giving Core an artificially
+bad number and slowing our own replay. Queue it for a quiet window, pin
+cores, and state the pinning.
+
+Note also the asymmetry that makes the honest comparison harder: Core
+defaults to `assumevalid`, skipping historical signature verification
+entirely. Our replay always verifies in full. A fair contest must force
+`-assumevalid=0`; a *useful* framing also records what Core's default does,
+because that is what users actually run.
+
+### 6.1 The hardware we are on (measured, not assumed)
+
+`AMD Ryzen 9 9950X3D` (Zen 5), 16C/32T, **128 MiB L3**, plus:
+`avx512f avx512dq avx512vl avx512ifma adx bmi2 sha_ni gfni vaes avx512_vnni`.
+GPU: `RTX 5090`, 32 GB, compute 12.0 — already driving the CUDA `sha256d`
+path (~17-18× CPU at N=1,000,000).
+
+Two of these matter a great deal and were not being exploited:
+**`avx512ifma`** and the **128 MiB L3**.
+
+### 6.2 Parity lever: 5×52 lazy reduction (§4.6, in progress)
+
+`fe_mul` is 55.9 % of all replay cycles at ~290 Ir/call against
+libsecp256k1's 5×52. Closing this is worth ~39 µs → low 20s on
+`ecdsa_verify` and is the whole of the remaining primitive gap. It is
+parity work: it makes us as fast as Core's crypto, not faster.
+
+### 6.3 Exceed lever: AVX-512 IFMA lane-parallel field arithmetic
+
+`VPMADD52LUQ`/`VPMADD52HUQ` perform 8 lanes of 52-bit multiply-accumulate.
+**libsecp256k1 ships no IFMA field backend**, so unlike §6.2 this is not a
+gap to close but an instruction set Core does not use.
+
+The shape that fits: block validation verifies many **independent**
+signatures. Eight independent verifications in flight across lanes suits
+IFMA; vectorising *inside* one verification mostly does not, because the
+carry chain serialises. Caveats to measure rather than assume: Zen 5's IFMA
+throughput differs from Intel's, and AVX-512 downclocking can eat the win.
+A measured "not worth it" is a valid and useful outcome here.
+
+### 6.4 Exceed lever: BIP340 batch verification
+
+Core verifies Schnorr signatures **individually** in consensus. BIP340
+supports batch verification at roughly 2-3× individual, and a block is
+almost always valid, so the fallback-to-individual path on failure is rare
+and cheap. This gets more valuable exactly where the replay is heading:
+script-path taproot spends are heavy from ~775,000 (one sampled block held
+44,933 script-path inputs — see `CHAIN_AHEAD_CENSUS.md`).
+
+Not started yet, deliberately: it touches `bitcoin_taproot_sighash.c`,
+which had in-flight work at the time of writing. Sequence it after that
+lands to avoid a merge conflict in consensus code.
+
+### 6.5 Exceed lever, highest risk: GPU signature verification
+
+The 5090 already does `sha256d`. Batch ECDSA/Schnorr on GPU is the largest
+theoretical win and by far the largest correctness risk — consensus
+verification returning a wrong verdict is a chain split. It should come
+last, behind a byte-exact differential against the asm path over millions
+of real chain signatures, and behind a bit-exact CPU fallback on any CUDA
+error (the pattern `sha256d` already uses).
+
+### 6.6 What Amdahl allows
+
+Crypto is 74 % of replay cycles, `fe_mul` 55.9 %. Even an *infinitely* fast
+`fe_mul` leaves 44 % of the work, i.e. a ceiling of about 2.3× end-to-end
+from field arithmetic alone. Getting past that requires the UTXO/apply path
+and the archive read path to come down too — which is why §4.1's mmap work
+(kernel 31 % → 5 %) mattered so much and why the next profile after §6.2
+lands should be taken before choosing anything here.
