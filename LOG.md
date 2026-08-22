@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#13; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#17; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -327,6 +327,145 @@ the first plausible one (TLS) was a genuine bug that was not the cause;
 measuring the deepest frame found the real one. And the 500-input
 transaction is ordinary chain data -- this was the first witness-era block
 with one, 3 blocks after the verifier first ran on witness data at all.
+
+### Incident #14: the witness program was a dangling pointer into a reused buffer
+The replay verified 481824..482565 and then rejected 482566 tx 1499 -- an
+ordinary 1-in/2-out native P2WPKH spend -- with "p2wpkh signature invalid".
+Phase-1 classification stored `in->wprog = spk + 2`, a pointer INTO
+`g_txv_in[i].spk`, which is a per-input scratch buffer that Phase 1 keeps
+refilling for later inputs before Phase 2 ever runs a signature. By verify
+time those bytes were whatever a later input's scriptPubKey had written
+there, so the BIP143 program -- and with it the P2WPKH scriptCode and the
+P2WSH witnessScript hash -- was wrong.
+
+It had "worked" for 742 blocks only because the clobbering bytes did not
+happen to matter until 482566's particular input layout. That is the
+signature of this whole bug class: intermittent by construction, and
+data-dependent in a way no synthetic test would have found. It failed
+closed here (a wrong program cannot satisfy a real signature), which is the
+safe direction, but the same defect in a validator that compares rather
+than verifies would fail open.
+
+Fix: for the native case the program lives inside the spk, so store a
+stable `wprog_off` and recompute `spk + off` at verify time; the
+P2SH-wrapped case points at the redeemScript, which lives in the (stable)
+tx bytes, so that pointer stays. `sv_classify_segwit` was also being handed
+a stale local `spk` and now gets `g_txv_in[i].spk`.
+`tests/test_txvb_wprog_stable.c` reproduces it with a two-input tx whose
+second input overwrites the region the first input's wprog aimed at, and
+482566:1499 is pinned as a real fixture in `test_p2wpkh_real.c`. This is the
+third dangling-pointer-into-a-growable-buffer bug in this codebase (cf.
+incident #2); the offset-not-pointer discipline it established is what
+incident #15 then applied pre-emptively.
+
+### Incident #15: an 8-item witness cap rejected ordinary multisig spends
+Block 498787 tx 2420 -- a routine P2SH-P2WSH spend carrying a 17-item
+witness stack -- was rejected with "too many witness items".
+`TXV_MAX_WIT_ITEMS` was 8, chosen when nothing real had been parsed yet, and
+each input held its items in inline `wit[8]`/`witlen[8]` arrays.
+
+No consensus rule caps the witness item COUNT at parse time. The real
+bounds are the per-item size limit (520) and the 1000-element execution
+stack: a P2WSH witness's items BECOME the initial stack, so beyond ~1001
+items no spend can satisfy MAX_STACK/cleanstack anyway. The cap is now
+1004 (1001 + tapscript's script/control/annex), which rejects nothing Core
+would execute.
+
+Simply enlarging the inline arrays was not available: `g_txv_in` is
+`[TXV_MAX_INPUTS]` = 20000, so `wit[1004]` inline is ~240 MB of mostly-empty
+storage per block. Witness items now live in a growable pool (`g_wit_pool`,
+parallel ptr/len arrays) addressed by a per-input OFFSET that is resolved to
+a pointer only after parsing stops growing the pool -- deliberately the same
+discipline `g_spk_pool`/`spk_off` uses, because a realloc mid-parse would
+dangle a pointer already handed to an earlier input. That is incident #14's
+lesson applied before the bug could happen rather than after.
+
+Fixtures: 498787:2420 (17 items, the block that tripped it) and 750500 (21
+items -- the deepest real witness in a 499k-780k census of the oracle, so
+the bound is proven against the real maximum rather than against the first
+failure), plus a synthetic 1005-item stack that must reject cleanly instead
+of crashing. A pre-existing Makefile bug surfaced alongside:
+`test_segwit_real` and `test_block_481827_pool_stack` were in the `test:`
+RUN recipe but not its prerequisites, so `make -k test` never built them and
+exited 127 with zero reported failures -- a suite that was silently not
+running two of its tests.
+
+### Incident #16: BIP342 forbade an opcode it actually keeps -- and my diagnosis was wrong
+A census of the un-replayed chain (`CHAIN_AHEAD_CENSUS.md`, written to find
+walls BEFORE the replay hit them) predicted a tapscript reject wall around
+775k-826k. A fork fetched a real Core-accepted fixture -- the tapscript CSV
+spend at height 806500, txid `e5dd172b...47d7` -- and confirmed it: rejected
+with "p2tr tapscript execution failed".
+
+I diagnosed it inline as the zeroed script-eval context in
+`taproot_verify_input` (`st.flags = 0`, `tx_locktime`/`in_sequence`/
+`tx_version` never populated). **That diagnosis was wrong, and the fork's
+differential test overturned it.** That bug is real, but it is
+too-PERMISSIVE: with the CLTV/CSV flags off, both opcodes degrade to silent
+NOPs, which would wrongly ACCEPT rather than reject. The actual wall was in
+`bitcoin_interp.asm`: `OP_CHECKSIGVERIFY` (0xad) was routed to
+`.bad_opcode` under `SIGVERSION_TAPSCRIPT`. BIP342 keeps CHECKSIG *and*
+CHECKSIGVERIFY (re-specified for schnorr) and disables only
+CHECKMULTISIG(VERIFY). Real HTLC-style leaves (`<pk> OP_CHECKSIGVERIFY ...
+OP_1 OP_CSV`) died on the CHECKSIGVERIFY and never reached the timelock at
+all.
+
+Both are fixed: the opcode falls through to normal handling (the
+CHECKMULTISIG tapscript guards are untouched), and the C side now sets
+`CHECKLOCKTIMEVERIFY|CHECKSEQUENCEVERIFY` (0x600) and threads the real tx
+version/locktime/nSequence, mirroring the witness-v0 path. A stale test
+assertion that ENCODED bug #1 ("CHECKSIGVERIFY forbidden in tapscript") was
+corrected to Core-exact behavior -- a test that had been faithfully
+protecting a consensus bug.
+
+The lesson is the one worth keeping from this whole session: a confident
+inline root-cause is a hypothesis, not a finding. Two separate times today
+(here and in #13's TLS red herring) the first plausible explanation was a
+genuine bug that was not the cause. Handing the hypothesis to a differential
+check against a real fixture -- fails on old code, passes on new -- is what
+distinguished them. After being corrected here I re-verified the fix
+personally rather than accepting the fork's word: checked out main's two
+consensus files in the worktree, watched the 806500 fixture reject, restored
+the branch files, watched it accept.
+
+### Incident #17 (telemetry only, no consensus impact): the live-UTXO counter went negative
+Production logged `live_utxo=-2610837`. The count is informational -- it
+never gates validation -- but a negative UTXO count is nonsense, and the
+cause was worth finding.
+
+`total_live` was re-derived on every reload as `u->n`: the live entries of
+the current unflushed memtable generation ONLY. The tens of millions of
+UTXOs sitting in older flushed and compacted runs were never counted, so
+the counter came back ~51M too low after every resume. Deletes then made it
+worse in the obvious way: an LSM del just appends a tombstone and
+decrements unconditionally, so every spend of a pre-existing key pushed the
+number further down until it crossed zero. A from-scratch build kept it
+accurate (symmetric +1/-1 from empty) -- only reload was broken, which is
+why it had been meaningless since the very first resume and nobody noticed.
+
+The fix persists ground truth instead of re-deriving a guess. The manifest
+gains `MAGIC_MANIFEST2` ("UMN2", a 20-byte header carrying `total_live`)
+alongside the old 12-byte "UMAN", mirroring the run-file MAGIC_RUN->RUN2
+versioning already in the codebase. Flush persists the count at the exact
+moment it means "all runs, WAL empty" -- the memtable has just been folded
+into a run and the WAL is about to be truncated -- so reload restores that
+base and adds only the WAL tail's net (PUSHes - DELs), double-counting
+nothing. A full compaction persists the merged run's own live-entry count,
+which is authoritative and heals any accumulated drift. An old-format
+manifest (which is what production had) triggers `mac_lsm_recount`: a
+one-time, read-only k-way dedup merge over every run, newest generation
+winning, counting a key live iff its newest run record is a PUSH and it is
+not shadowed by the memtable or a tombstone. Bounded, one-time, and never
+on the per-op hot path -- which the diff confirms is byte-for-byte unchanged
+(still a single inc/dec).
+
+Two details worth recording. The displayed value is now clamped at 0 in
+`daemon/main.c` as a backstop, deliberately NOT as the fix -- clamping alone
+would have hidden the drift rather than corrected it. And the counter was
+positive again (`live_utxo=25053084`) by the time the fix was deployed,
+having drifted up as the replay added UTXOs: proof that the value was a
+free-drifting wrong seed rather than a fixed offset, and a good argument
+against ever "fixing" a symptom whose sign happens to look plausible today.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 

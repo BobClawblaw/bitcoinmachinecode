@@ -74,3 +74,28 @@ end-to-end.
 3. **Design-worthy, not urgent:** `tap_leaf_hash`'s 4 MB buffer caps a
    tapscript leaf at 4 MB; a > 4 MB leaf would fail — none seen, and block
    weight makes it near-impossible, but note it.
+
+## Outcome (appended 2026-08-22 evening, replay past 576,000)
+
+Recorded against the predictions above, including where the census was
+wrong. The original text is left unedited — its value is as a record of
+what the method did and did not catch.
+
+| prediction | outcome |
+|---|---|
+| witness stack > 8 items, "the one hard wall" | **CORRECT, and it was even earlier than predicted.** It rejected at **498,787** (a 17-item P2SH-P2WSH), not ~551,500 — the stride-1,500 sampling had simply missed the first occurrence, exactly the gap the Method section warned about. Fixed as incident #15 (`d1a2259`), cap → 1004. |
+| P2WSH CODESEP / HTLC / sighash 0x81/0x82/0x83 | Fixtures now exist and pass (`tests/test_segwit_coverage.c`) — the "turn should-work into verified" move from item 2 was done. |
+| tapscript CSV / CLTV / CHECKSIGADD, "handled, UNTESTED" | **The census's assessment was WRONG in the dangerous direction.** These were not handled: `OP_CHECKSIGVERIFY` was routed to `.bad_opcode` under SIGVERSION_TAPSCRIPT, so HTLC-style leaves could never execute, and the script-eval context was zeroed so tapscript CLTV/CSV were silently gated off. Incident #16 (`4dc5941`). Found by pulling the 806500 evidence txid and actually running it — i.e. by item 2, not by the classification. |
+| ">10 KB tapscript / real inscription" untested at scale | **Still open.** No inscription-scale fixture yet; needs fetch-on-demand rather than a checked-in vector. The single biggest remaining untested risk, unchanged. |
+| `tap_leaf_hash` 4 MB leaf cap | Still open, still design-worthy-not-urgent. |
+
+**The lesson.** Conclusion 2 above — "the remaining risk is coverage, not
+code" — was the wrong call, and it was wrong because the census classified
+shapes by whether a code path *existed*, not by whether it *worked*. A
+dispatch table entry that routes a valid opcode to `.bad_opcode` looks
+identical, from the outside, to a correct implementation. The census was
+still worth writing: it named the right region and the right evidence
+txids, and running one of those txids is what found the bug hours before
+the replay would have hit it. But "handled" in the table above should be
+read as "has a code path", never as "verified" — only a fixture that fails
+on the old code and passes on the new can say that.

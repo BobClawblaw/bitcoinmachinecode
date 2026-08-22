@@ -177,6 +177,15 @@ plus straightforward methods on top of it.
   block rejected" into "byte-identical UTXO set to Core at height H" —
   which is the only test that could have caught incident #6 (a rule
   applied too loosely is invisible to a replay). **Medium.**
+  - Prerequisite now in place (2026-08-22, incident #17): the LSM keeps an
+    accurate live-UTXO *count* across restarts, persisted runs-only in the
+    versioned manifest and restored as base + WAL-tail net, with a
+    one-time full dedup recount for old-format manifests
+    (`mac_lsm_recount`). That recount is a read-only k-way merge that
+    already visits exactly the live set — it is the natural place to hang
+    a set hash, so the expensive half of `gettxoutsetinfo` is written.
+    Note the count alone is NOT the acceptance test: `txouts` matching
+    Core proves cardinality, not contents.
 
 ## Wallet
 
