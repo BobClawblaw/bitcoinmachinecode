@@ -332,23 +332,100 @@ were wrong), and `fe_mul`'s fold 2 dropped the carry out of limb 3 (lost
 on structured chains. Those fixes are independent of A/B and
 cherry-pickable, and landed as the first of the two commits.
 
-### 4.3 GLV endomorphism split — **revised down**
+### 4.3 GLV endomorphism + wNAF for `u2·Q` — scoped 2026-08-22, implementation-ready
 
-- *What:* decompose the `u2·Q` scalar via the curve's efficient
-  endomorphism and run a dual-scalar Strauss/Shamir ladder — halves the
-  doubling chain for the variable-point multiply. Full scope (constants,
-  `sc_split_lambda`, `point_scalar_mul_dual`, signed-scalar handling,
-  required test campaign, 2–4 session estimate) was produced earlier the
-  same day and stands.
-- *Evidence for the revision:* this profile shows point arithmetic at only
-  ≈ 1.2 % of cycles. GLV cuts doubling *count*; it does not cut the
-  `fe_mul`/`sc_mul` volume that actually dominates. The earlier scoping
-  reasonably assumed point ops were the crypto cost; they are not.
-- *Impact:* **medium**, down from the earlier estimate. Still real; still
-  the standard reason libsecp256k1 is faster.
-- *Risk / effort:* large / high, unchanged. Most GLV bugs in the wild are
-  sign-handling errors in the split scalars.
-- *Timing:* wait for tip; do after 4.1 and a scoping of 4.2.
+*What:* replace the single `point_scalar_mul(P2, Q, u2)` at
+`secp256k1_ecdsa.asm:319-322` with a GLV-split, dual-stream wNAF
+Strauss/Shamir ladder: `u2 = r1 + λ·r2 (mod n)` with both halves ≤ 128 bits
+(`scalar_impl.h:142-178`), one odd-multiples table of Q at window w=5
+(`ecmult_impl.h:32,:73-123`) with the λ-table derived for free as `(β·x, y)`
+(`group_impl.h:917-923`, `ecmult_impl.h:315-317`), and one ladder over both
+digit streams (`ecmult_impl.h:252-365`): **~128 doublings instead of 252**.
+The G side (comb table, zero doublings) and the 4.2-A projective compare are
+untouched.
+
+*Constants* (4×64 LE limbs, limb0 first — transcribed from Core and
+**numerically verified**: λ³≡1 mod n, β³≡1 mod p, and `λ·G == (β·Gx, Gy)`
+on the real curve, so this is the matching pair, not the conjugate):
+
+| name | source | limbs |
+|---|---|---|
+| `LAMBDA` (mod n) | `scalar_impl.h:83` | `DF02967C1B23BD72 122E22EA20816678 A5261C028812645A 5363AD4CC05C30E0` |
+| `BETA` (mod p) | `field.h:69` | `C1396C28719501EE 9CF0497512F58995 6E64479EAC3434E9 7AE96A2B657C0710` |
+| `MINUS_B1` | `scalar_impl.h:144` | `6F547FA90ABFE4C3 E4437ED6010E8828 0 0` |
+| `MINUS_B2` | `:148` | `D765CDA83DB1562C 8A280AC50774346D FFFFFFFFFFFFFFFE FFFFFFFFFFFFFFFF` |
+| `G1` | `:152` | `E893209A45DBB031 3DAA8A1471E8CA7F E86C90E49284EB15 3086D221A7D46BCD` |
+| `G2` | `:156` | `1571B4AE8AC47F71 221208AC9DF506C6 6F547FA90ABFE4C4 E4437ED6010E8828` |
+
+*Algorithm:* split — `c1 = round((k·G1) >> 384)`, `c2 = round((k·G2) >> 384)`
+via a 512-bit product taking limbs [6,7] plus the rounding bit (bit 383,
+`scalar_4x64_impl.h:893-915`); `r2 = c1·MINUS_B1 + c2·MINUS_B2`;
+`r1 = k − r2·λ` (all mod n). Sign rule: a half is negative iff bit 255 is
+set (`ecmult_impl.h:176-179`, valid because n > 2²⁵⁵); negative → magnitude
+`n − r` and negate every wNAF digit. wNAF (`:162-222`): length **129** (bit
+128 can carry), w=5, odd digits |d| ≤ 15, index `pre[(|d|−1)/2]`, negate y
+for d < 0. Table (`:73-123`): `d = 2Q`, isomorphism `C = d.z`, 7 mixed adds
+recording z-ratios, then `ge_table_set_globalz` (`group_impl.h:289-310`) so
+every entry shares one Z — **no inversion anywhere**; λ-table `aux[i] =
+pre[i].x · β`. Ladder: per bit, double, then up to two mixed adds (one per
+stream); finish with `R.z *= Z` (`:359-361`) **before** `P = P1 + R` so the
+4.2-A compare sees a real-curve point.
+
+*New vs existing in this codebase:* `sc_mul_512` (~40 lines, extract
+`sc_mul`'s Phase-1 product at `secp256k1_scalar.asm:262-299` — `sc_mul` is a
+*reduced* product and cannot be reused); `sc_split_lambda` (~120 lines);
+`glv_wnaf` (~80 lines C, precedent `secp256k1_scalar_c.o`/`utxo_lsm_mm.c`);
+`fe_neg` is absent — use `fe_sub(r, ZERO, y)`; `point_add_mixed_zr` (+10
+lines, the z-ratio is `H` at `secp256k1_point.asm:205-212`);
+`point_scalar_mul_glv` (~350-450 lines, model on `point_scalar_mul`
+`:422-614`); kill switch `BMC_ECDSA_GLV=0` like `BMC_LSM_MMAP`.
+**Latent bug to close first:** `point_add`/`point_add_mixed` do not handle a
+Z=0 *operand* (return infinity instead of the other point; `:54-90` only
+handles equal-X). Unreachable via `point_scalar_mul` today (it seeds R from
+the top digit), reachable in a dual ladder — guard inside the primitives.
+
+*Expected gain, derived from §4.2's measured costs* (dbl 2,320 Ir, add 4,640,
+madd 3,162, fe_mul 290; verify ≈ 1.35 M Ir ≈ 56.3 µs):
+
+| component | today | GLV w=5 + globalz |
+|---|---|---|
+| split + wNAF | — | ≈ 15.5 k |
+| table | 14 madd = 44.3 k | 37.2 k |
+| doublings | 252 × 2,320 = 584.6 k | **128 × 2,320 = 297.0 k** |
+| window adds | 58 add = 269.1 k | ≈ 43 madd = 136.9 k |
+| **`u2·Q`** | **898 k ≈ 37.4 µs** | **≈ 487 k ≈ 20.3 µs** |
+| **`ecdsa_verify`** | **56.3 µs** | **≈ 39 µs** |
+| gap to libsecp256k1 (21.8 µs) | 2.58× | **1.8×** |
+
+A Jacobian-table variant without globalz gets ≈ 85 % of this (≈ 41.8 µs).
+What remains afterwards is field representation — libsecp's 5×52
+lazy-reduction `fe_mul` is ~4-5× cheaper per call than our 4×64 — and the
+G-side comb (≈ 7.9 µs; libsecp's `WINDOW_G`=15 tables would be a "4.5").
+
+*Risk:* sign handling in three places (half negativity, negative digit,
+λ-table shares y); lattice rounding off-by-one (halves still satisfy the
+identity but exceed 128 bits — caught only by **exact** comparison against
+Python's split, not by the identity); wNAF needs 129 digit slots; the
+globalz direction and the forgotten `R.z *= Z` are *silent* (only the
+point-level differential catches them); Z=0 mid-ladder (~2⁻¹²⁸/step, guard
+anyway). **Permanent runtime check:** after every split assert
+`r1 + λ·r2 == k` (≈ 0.1 µs; libsecp does it in VERIFY builds) and on failure
+**fall back to `point_scalar_mul`** — never abort a verify.
+
+*Tests:* `sc_mul_512` vs Python 10⁶; `sc_split_lambda` vs Python **exact**
+10⁶ + `{0,1,n−1,n−2,2¹²⁸,2¹²⁸−1,2²⁵⁵,n>>1,λ,n−λ}`; `glv_wnaf` 10⁶ reconstruct;
+`point_scalar_mul_glv` vs `point_scalar_mul` ≥ 10⁵ `(k,Q)` compared
+projectively incl. `Q ∈ {G, 2G, −G, λG}`; then the existing 113,315-case
+`tests/test_ecdsa_inverse.c` campaign vs the frozen `ecdsa_verify_ref.asm`
+unchanged — it is already the right gate.
+
+*Staging:* branch `glv`, each commit suite-green: (a) Z=0 guards in
+`point_add`/`point_add_mixed` (cherry-pickable bug fix); (b) `sc_mul_512` +
+`sc_split_lambda`; (c) `glv_wnaf`; (d) `point_add_mixed_zr` +
+`point_scalar_mul_glv` standalone + differential; (e) wire into
+`ecdsa_verify` behind `BMC_ECDSA_GLV`. Deploy gate as 4.2, plus tonight's
+lesson: watch the first checkpoint resume. **Effort ≈ 1,100-1,400 lines
+incl. tests, 2-3 long sessions**, the risk concentrated in (d).
 
 ### 4.4 Archive read-ahead tuning
 
