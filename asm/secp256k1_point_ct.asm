@@ -45,9 +45,9 @@
 ;     by cmov, never by a jump.
 ;   * No memory address anywhere depends on a bit of k -- there is no
 ;     precomputed table, so no secret-indexed load and no cache leak.
-;   * The underlying fe_add / fe_sub / fe_mul / fe_sqr are already branch-free
-;     (they reduce with sbb-mask + cmovnc; the only jump in fe_mul is a
-;     fixed-count 8-iteration memset).
+;   * The underlying fe_mul / fe_sqr, and the inlined add/sub macros, are all
+;     branch-free (they reduce with an sbb mask and cmov; there is no jump in
+;     any of them).
 ;   Cost: 256 doublings + 256 additions, ~4x the variable-time windowed
 ;   version. Signing is not a hot path; block validation, which is, keeps
 ;   using the fast variable-time routine.
@@ -71,8 +71,19 @@
 
 BITS 64
 
-extern fe_add
-extern fe_sub
+; ----------------------------------------------------------------------------
+; INLINED FIELD ADD / SUB (2026-08-22, PERF_SCOPE.md 12) -- the same macros
+; secp256k1_point.asm uses. The Renes-Costello-Batina formulas are
+; addition-heavy by design (19a in the add, 9a in the double), so the call
+; boundary costs proportionally MORE here than on the verification path.
+;
+; CONSTANT-TIME: every macro is straight-line -- adc/sbb/cmov only, no branch,
+; no data-dependent memory address, no variable shift. It is exactly the
+; instruction sequence fe_add/fe_sub already executed, minus the call. The
+; property this file exists to guarantee is unchanged.
+; ----------------------------------------------------------------------------
+%include "secp256k1_fe_inline.inc"
+
 extern fe_mul
 extern fe_sqr
 
@@ -112,6 +123,7 @@ pointh_add:
     mov r12, rdi           ; out
     mov r13, rsi           ; p
     mov r14, rdx           ; q
+    FE_C_INIT              ; rbx = C for the inlined add/sub
 
     ; 1. t0 = X1*X2
     lea rdi, [rbp-0x50]
@@ -129,105 +141,83 @@ pointh_add:
     lea rdx, [r14+64]
     call fe_mul
     ; 4. t3 = X1+Y1
-    lea rdi, [rbp-0xb0]
-    lea rsi, [r13+0]
-    lea rdx, [r13+32]
-    call fe_add
+    FE_LD   r13+0
+    FE_ADDM r13+32
+    FE_ST   rbp-0xb0
     ; 5. t4 = X2+Y2
-    lea rdi, [rbp-0xd0]
-    lea rsi, [r14+0]
-    lea rdx, [r14+32]
-    call fe_add
+    FE_LD   r14+0
+    FE_ADDM r14+32
+    FE_ST   rbp-0xd0
     ; 6. t3 = t3*t4
     lea rdi, [rbp-0xb0]
     lea rsi, [rbp-0xb0]
     lea rdx, [rbp-0xd0]
     call fe_mul
-    ; 7. t4 = t0+t1
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0x50]
-    lea rdx, [rbp-0x70]
-    call fe_add
-    ; 8. t3 = t3-t4
-    lea rdi, [rbp-0xb0]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [rbp-0xd0]
-    call fe_sub
+    ; 7+8. t3 = t3 - (t0+t1), as t3 - t0 - t1.  The reference materialised
+    ;      t4 = t0+t1 and immediately consumed it; step 9 overwrites t4, so
+    ;      nothing else ever reads it. Same reduction count, one slot round
+    ;      trip fewer, and t4 never has to be written here at all.
+    FE_LD   rbp-0xb0
+    FE_SUBM rbp-0x50
+    FE_SUBM rbp-0x70
+    FE_ST   rbp-0xb0
     ; 9. t4 = Y1+Z1
-    lea rdi, [rbp-0xd0]
-    lea rsi, [r13+32]
-    lea rdx, [r13+64]
-    call fe_add
+    FE_LD   r13+32
+    FE_ADDM r13+64
+    FE_ST   rbp-0xd0
     ; 10. X3 = Y2+Z2
-    lea rdi, [rbp-0xf0]
-    lea rsi, [r14+32]
-    lea rdx, [r14+64]
-    call fe_add
+    FE_LD   r14+32
+    FE_ADDM r14+64
+    FE_ST   rbp-0xf0
     ; 11. t4 = t4*X3
     lea rdi, [rbp-0xd0]
     lea rsi, [rbp-0xd0]
     lea rdx, [rbp-0xf0]
     call fe_mul
-    ; 12. X3 = t1+t2
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0x70]
-    lea rdx, [rbp-0x90]
-    call fe_add
-    ; 13. t4 = t4-X3
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0xd0]
-    lea rdx, [rbp-0xf0]
-    call fe_sub
+    ; 12+13. t4 = t4 - (t1+t2), as t4 - t1 - t2 (X3 is rewritten at step 14)
+    FE_LD   rbp-0xd0
+    FE_SUBM rbp-0x70
+    FE_SUBM rbp-0x90
+    FE_ST   rbp-0xd0
     ; 14. X3 = X1+Z1
-    lea rdi, [rbp-0xf0]
-    lea rsi, [r13+0]
-    lea rdx, [r13+64]
-    call fe_add
+    FE_LD   r13+0
+    FE_ADDM r13+64
+    FE_ST   rbp-0xf0
     ; 15. Y3 = X2+Z2
-    lea rdi, [rbp-0x110]
-    lea rsi, [r14+0]
-    lea rdx, [r14+64]
-    call fe_add
+    FE_LD   r14+0
+    FE_ADDM r14+64
+    FE_ST   rbp-0x110
     ; 16. X3 = X3*Y3
     lea rdi, [rbp-0xf0]
     lea rsi, [rbp-0xf0]
     lea rdx, [rbp-0x110]
     call fe_mul
-    ; 17. Y3 = t0+t2
-    lea rdi, [rbp-0x110]
-    lea rsi, [rbp-0x50]
-    lea rdx, [rbp-0x90]
-    call fe_add
-    ; 18. Y3 = X3-Y3
-    lea rdi, [rbp-0x110]
-    lea rsi, [rbp-0xf0]
-    lea rdx, [rbp-0x110]
-    call fe_sub
-    ; 19. X3 = t0+t0
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0x50]
-    lea rdx, [rbp-0x50]
-    call fe_add
-    ; 20. t0 = X3+t0
-    lea rdi, [rbp-0x50]
-    lea rsi, [rbp-0xf0]
-    lea rdx, [rbp-0x50]
-    call fe_add
+    ; 17+18. Y3 = X3 - (t0+t2), as X3 - t0 - t2
+    FE_LD   rbp-0xf0
+    FE_SUBM rbp-0x50
+    FE_SUBM rbp-0x90
+    FE_ST   rbp-0x110
+    ; 19+20. t0 = 3*t0.  The reference parked 2*t0 in X3; X3 is rewritten at
+    ;        step 25 and not read before it, so the intermediate stays in
+    ;        registers and the slot store disappears.
+    FE_LD   rbp-0x50
+    FE_DBL
+    FE_ADDM rbp-0x50
+    FE_ST   rbp-0x50
     ; 21. t2 = b3*t2
     lea rdi, [rbp-0x90]
     mov rsi, B3_LIMBS
     lea rdx, [rbp-0x90]
     call fe_mul
     ; 22. Z3 = t1+t2
-    lea rdi, [rbp-0x130]
-    lea rsi, [rbp-0x70]
-    lea rdx, [rbp-0x90]
-    call fe_add
-    ; 23. t1 = t1-t2
-    lea rdi, [rbp-0x70]
-    lea rsi, [rbp-0x70]
-    lea rdx, [rbp-0x90]
-    call fe_sub
+    FE_LD   rbp-0x70
+    FE_ADDM rbp-0x90
+    FE_ST   rbp-0x130
+    ; 23. t1 = t1-t2  (t1 must be reloaded: the accumulator is one field
+    ;     element wide and step 22 consumed it)
+    FE_LD   rbp-0x70
+    FE_SUBM rbp-0x90
+    FE_ST   rbp-0x70
     ; 24. Y3 = b3*Y3
     lea rdi, [rbp-0x110]
     mov rsi, B3_LIMBS
@@ -244,10 +234,9 @@ pointh_add:
     lea rdx, [rbp-0x70]
     call fe_mul
     ; 27. X3 = t2-X3
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0x90]
-    lea rdx, [rbp-0xf0]
-    call fe_sub
+    FE_LD   rbp-0x90
+    FE_SUBM rbp-0xf0
+    FE_ST   rbp-0xf0
     ; 28. Y3 = Y3*t0
     lea rdi, [rbp-0x110]
     lea rsi, [rbp-0x110]
@@ -259,10 +248,9 @@ pointh_add:
     lea rdx, [rbp-0x130]
     call fe_mul
     ; 30. Y3 = t1+Y3
-    lea rdi, [rbp-0x110]
-    lea rsi, [rbp-0x70]
-    lea rdx, [rbp-0x110]
-    call fe_add
+    FE_LD   rbp-0x70
+    FE_ADDM rbp-0x110
+    FE_ST   rbp-0x110
     ; 31. t0 = t0*t3
     lea rdi, [rbp-0x50]
     lea rsi, [rbp-0x50]
@@ -274,10 +262,9 @@ pointh_add:
     lea rdx, [rbp-0xd0]
     call fe_mul
     ; 33. Z3 = Z3+t0
-    lea rdi, [rbp-0x130]
-    lea rsi, [rbp-0x130]
-    lea rdx, [rbp-0x50]
-    call fe_add
+    FE_LD   rbp-0x130
+    FE_ADDM rbp-0x50
+    FE_ST   rbp-0x130
 
     ; copy-out: r = (X3, Y3, Z3)
     lea rsi, [rbp-0xf0]
@@ -325,26 +312,18 @@ pointh_double:
 
     mov r12, rdi           ; out
     mov r13, rsi           ; p
+    FE_C_INIT              ; rbx = C for the inlined add/sub
 
     ; 1. t0 = Y*Y
     lea rdi, [rbp-0x50]
     lea rsi, [r13+32]
     call fe_sqr
-    ; 2. Z3 = t0+t0
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0x50]
-    mov rdx, rsi
-    call fe_add
-    ; 3. Z3 = Z3+Z3
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0xf0]
-    mov rdx, rsi
-    call fe_add
-    ; 4. Z3 = Z3+Z3
-    lea rdi, [rbp-0xf0]
-    lea rsi, [rbp-0xf0]
-    mov rdx, rsi
-    call fe_add
+    ; 2-4. Z3 = 8*t0 : three doublings, all three in registers
+    FE_LD   rbp-0x50
+    FE_DBL
+    FE_DBL
+    FE_DBL
+    FE_ST   rbp-0xf0
     ; 5. t1 = Y*Z
     lea rdi, [rbp-0x70]
     lea rsi, [r13+32]
@@ -365,40 +344,33 @@ pointh_double:
     lea rdx, [rbp-0xf0]
     call fe_mul
     ; 9. Y3 = t0+t2
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0x50]
-    lea rdx, [rbp-0x90]
-    call fe_add
+    FE_LD   rbp-0x50
+    FE_ADDM rbp-0x90
+    FE_ST   rbp-0xd0
     ; 10. Z3 = t1*Z3
     lea rdi, [rbp-0xf0]
     lea rsi, [rbp-0x70]
     lea rdx, [rbp-0xf0]
     call fe_mul
-    ; 11. t1 = t2+t2
-    lea rdi, [rbp-0x70]
-    lea rsi, [rbp-0x90]
-    mov rdx, rsi
-    call fe_add
-    ; 12. t2 = t1+t2
-    lea rdi, [rbp-0x90]
-    lea rsi, [rbp-0x70]
-    lea rdx, [rbp-0x90]
-    call fe_add
+    ; 11+12. t2 = 3*t2.  The reference parked 2*t2 in t1; t1 is rewritten at
+    ;        step 16 and not read before it, so it stays in registers.
+    FE_LD   rbp-0x90
+    FE_DBL
+    FE_ADDM rbp-0x90
+    FE_ST   rbp-0x90
     ; 13. t0 = t0-t2
-    lea rdi, [rbp-0x50]
-    lea rsi, [rbp-0x50]
-    lea rdx, [rbp-0x90]
-    call fe_sub
+    FE_LD   rbp-0x50
+    FE_SUBM rbp-0x90
+    FE_ST   rbp-0x50
     ; 14. Y3 = t0*Y3
     lea rdi, [rbp-0xd0]
     lea rsi, [rbp-0x50]
     lea rdx, [rbp-0xd0]
     call fe_mul
     ; 15. Y3 = X3+Y3
-    lea rdi, [rbp-0xd0]
-    lea rsi, [rbp-0xb0]
-    lea rdx, [rbp-0xd0]
-    call fe_add
+    FE_LD   rbp-0xb0
+    FE_ADDM rbp-0xd0
+    FE_ST   rbp-0xd0
     ; 16. t1 = X*Y
     lea rdi, [rbp-0x70]
     lea rsi, [r13+0]
@@ -410,10 +382,9 @@ pointh_double:
     lea rdx, [rbp-0x70]
     call fe_mul
     ; 18. X3 = X3+X3
-    lea rdi, [rbp-0xb0]
-    lea rsi, [rbp-0xb0]
-    mov rdx, rsi
-    call fe_add
+    FE_LD   rbp-0xb0
+    FE_DBL
+    FE_ST   rbp-0xb0
 
     ; copy-out: r = (X3, Y3, Z3)
     lea rsi, [rbp-0xb0]
