@@ -210,6 +210,11 @@ not just present as unused/tested-in-isolation code:
   peers; serve the stripped form to a bare `MSG_BLOCK` request; and
   **`MSG_WITNESS_TX` for transaction relay** — the mempool path still fetches
   transactions without witnesses (same bug shape, not yet hit).
+- **Thread stacks / sighash buffers — FIXED 2026-08-22** (`9445268`): every
+  daemon thread now gets an explicit 64 MB stack (`bmc_thread.h`,
+  `BMC_THREAD_STACK_MB`); BIP143/BIP341 midstate hashes use bounded per-thread
+  heap buffers; static TLS 12.0 → 4.4 MB. **Remaining:** `lsm_get_scratch`
+  (4 MiB asm TLS, only the non-mmap fallback uses it) should move to heap.
 - **Nested segwit (P2SH-P2WPKH / P2SH-P2WSH) and general P2WSH — DONE
   2026-08-22** (`11f7aa9`): were absent / two hard-coded shapes; now
   witness-v0 scripts execute through `script_eval` (`bitcoin_witness_v0.c`),
