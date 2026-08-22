@@ -264,6 +264,7 @@ asm/tests/test_archive_truncate_nonmonotonic
 asm/tests/test_prune_nonmonotonic
 asm/tests/test_utxo_catchup_shutdown
 asm/tests/test_utxo_crash_recovery
+asm/tests/test_point_inf
 asm/tests/test_lsm_mmap_diff
 asm/tests/bench_lsm_get
 
