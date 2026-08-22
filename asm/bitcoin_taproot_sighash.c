@@ -261,12 +261,19 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     }
     /* sha_outputs (not NONE, not SINGLE) */
     if (!is_none && !is_single){
-        uint8_t obuf[1024]; size_t on = 0; /* one txout <=~230B in practice; bounded below */
+        /* All outputs concatenated. Was a fixed obuf[1024] that RETURNED 0
+         * when exceeded -- i.e. a false reject for any taproot tx with more
+         * than ~30 outputs -- and a per-txout tmp[600] with no bound (a
+         * >590-byte scriptPubKey overran the stack). Per-thread heap buffer
+         * sized to the block cap, each txout bounds-checked before it is
+         * serialized in place. */
+        static __thread uint8_t* obuf; BMC_TLS_BUF(obuf, TS_AGG_CAP); size_t on = 0;
         for (int64_t i=0;i<t.nout;i++){
             int len = ser_txout_len(&t, i);
-            uint8_t tmp[600]; int n = ser_txout(&t, i, tmp);
-            (void)len;
-            if(on+(size_t)n>sizeof obuf) return 0; memcpy(obuf+on, tmp, n); on += n;
+            if (len <= 0 || on + (size_t)len > TS_AGG_CAP) return 0;
+            int n = ser_txout(&t, i, obuf + on);
+            if (n != len) return 0;
+            on += (size_t)n;
         }
         uint8_t ho[32]; sha256_full(ho, obuf, on);
         if (p + 32 > pend) return 0; memcpy(p, ho, 32); p += 32;
@@ -308,7 +315,10 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     /* SINGLE: sha_single_output */
     if (is_single){
         if (c->n_in < t.nout){
-            uint8_t tmp[600]; int n = ser_txout(&t, c->n_in, tmp);
+            int n1 = ser_txout_len(&t, c->n_in);
+            if (n1 <= 0 || (size_t)n1 > TS_AGG_CAP) return 0;
+            static __thread uint8_t* tmp; BMC_TLS_BUF(tmp, TS_AGG_CAP);
+            int n = ser_txout(&t, c->n_in, tmp); if (n != n1) return 0;
             uint8_t hs[32]; sha256_full(hs, tmp, n);
             if (p + 32 > pend) return 0; memcpy(p, hs, 32); p += 32;
         } else {
