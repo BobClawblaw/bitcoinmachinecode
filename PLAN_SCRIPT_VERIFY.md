@@ -265,6 +265,7 @@ individually re-traced line-by-line -- flagged where confidence is lower):
 | 481824 | "p2wpkh needs exactly 2 witness items" at the first segwit block | The ARCHIVE, not the verifier: every block >= 481824 was stored witness-stripped because `getdata` asked for `MSG_BLOCK`; the merkle root cannot detect it and this node had no BIP141 witness-commitment check. Incident #10. | `31eac9a`, `fe3addb`, `191df6c` |
 | 481824 (again) | "p2wpkh signature invalid" once the block was witness-complete | Our BIP143 scriptCode for P2WPKH was the witness program, not the implied P2PKH script; the vector generator shared the mistake. Incident #11. First real P2WPKH spend ever verified by this node. | `b3800f0`, `b6c92fa` |
 | 481825 | "legacy script verification failed" (input 1 is P2SH-P2WPKH) | Nested segwit not implemented; P2WSH verifier had two hard-coded shapes. Now general witness-v0 via `script_eval`, native + wrapped. Three bugs underneath: CHECKMULTISIG FindAndDelete not gated on BASE; legacy-input sighash in a mixed tx must use the stripped serialization; NULLDUMMY/sig-order in the synthetic vectors. Incident #12. | `11f7aa9` |
+| 481827 | worker SEGFAULT (no reject line) | `segwit_v0_sighash` built the BIP143 midstate hashes into 4096-byte stack buffers; a 500-input tx needs 18,000. Same latent bug in the taproot aggregate hashes. Underneath: 12 MB static TLS on 2 MB default thread stacks (`LimitSTACK=infinity` makes glibc default to 2 MB). Incident #13. | `9445268` |
 | (none -- structurally undetectable by replay) | every buried soft fork active one block LATE; false-accept | genesis absent from the archive: record index == real height - 1. Incident #6. | `5f36dee` |
 | (none -- ~2^-64 per random operand) | wrong `s^-1` / affine x on structured operands; fail-closed | lost carries in `sc_mul` MULACC and `fe_mul` fold-2. Incident #7. | `54cc988` |
 
@@ -284,7 +285,7 @@ exists to reconcile. New regression test
 via disabling the fix line; `make -k test` 1582/1582 both pre- and
 post-merge. `2fd4a14`. Full writeup: `LOG.md`'s 2026-08-21 entry.
 
-### Incidents #6-#12 (2026-08-22)
+### Incidents #6-#13 (2026-08-22)
 Narratives in `LOG.md`'s 2026-08-22 entry; one line each here. **#6** genesis
 was never in the archive (record index == real height - 1), so
 `script_flags_for_block` ran a block behind and DERSIG/CLTV/CSV/NULLDUMMY
