@@ -175,7 +175,19 @@ MAGIC_RUN2       equ 0x32555255      ; "URU2" little-endian dword -- adds sparse
 ; (MAGIC_RUN/MAGIC_RUN2) are still fully readable, just report
 ; height=0/is_coinbase=0 for every record (that data was never captured).
 MAGIC_RUN3       equ 0x33555255      ; "URU3" little-endian dword -- new PUSH record shape
-MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword
+MAGIC_MANIFEST   equ 0x4E414D55      ; "UMAN" little-endian dword -- OLD format, no persisted live-count
+; MAGIC_MANIFEST2 (2026-08-22): the manifest header grows by ONE trailing
+; qword, total_live, written after manifest_n. This is the persisted,
+; ACCURATE live-UTXO count that utxo_lsm_reload restores instead of the old
+; WAL-tail-only seed (which counted only the current unflushed generation
+; and came back tens of millions too low, driving live_utxo negative). The
+; value persisted is the RUNS-ONLY count (WAL/memtable excluded), so reload
+; adds the current WAL tail's net (pushes - dels) on top without double-
+; counting -- see utxo_lsm_reload. An OLD-format (MAGIC_MANIFEST) manifest
+; carries no such field; reload detects the old magic and falls back to a
+; one-time full dedup recount (mac_lsm_recount) to establish the baseline,
+; mirroring the MAGIC_RUN -> MAGIC_RUN2 discipline for run files above.
+MAGIC_MANIFEST2  equ 0x324E4D55      ; "UMN2" little-endian dword -- adds trailing total_live qword
 BLOOM_MAX_BYTES  equ 4*1024*1024     ; 4MB bloom scratch (~3.35M entries @10 bits/entry)
 SCRIPT_MAX_BYTES equ 65536           ; get-time script-read scratch
 
@@ -2137,12 +2149,21 @@ mac_flush:
     test rax, rax
     jl   .fl_err
     mov  rbx, rax
-    mov  dword [rbp-0x100], MAGIC_MANIFEST
+    ; New-format (MAGIC_MANIFEST2) header: magic(4) manifest_n(8)
+    ; total_live(8) = 20 bytes. At THIS point total_live ([r12+88]) is the
+    ; RUNS-ONLY live count: the memtable's live entries were just folded into
+    ; the run written above, and the WAL is truncated a few lines below at
+    ; .fl_finish_reset -- so the running counter equals "all runs, WAL empty."
+    ; Persisting it here means reload restores an exact base and only has to
+    ; add the (then-empty, or since-appended) WAL tail's net on top.
+    mov  dword [rbp-0x100], MAGIC_MANIFEST2
     mov  rax, [r12+120]
     mov  [rbp-0x100+4], rax
+    mov  rax, [r12+88]                 ; total_live (runs-only at this point)
+    mov  [rbp-0x100+12], rax
     mov  rdi, rbx
     lea  rsi, [rbp-0x100]
-    mov  rdx, 12
+    mov  rdx, 20
     call mac_write_exact
     test rax, rax
     jnz  .fl_merr_close
@@ -2248,6 +2269,16 @@ utxo_lsm_reload:
     ; above occupy rbp-0x08..rbp-0x28), so neither survives a call.
     mov  r12, rdi           ; lst
     mov  r13, rsi            ; u
+    ; live-count restore locals (see the persist/restore design at
+    ; MAGIC_MANIFEST2): [rbp-0x108] has_count (1 if the manifest carried a
+    ; persisted total_live), [rbp-0x110] the persisted runs-only base,
+    ; [rbp-0x118]/[rbp-0x120] the WAL tail's PUSH/DEL counts (net applied on
+    ; top of the base). Default has_count=0 so any manifest-absent/-bad/old
+    ; path takes the recount branch below.
+    mov  qword [rbp-0x108], 0
+    mov  qword [rbp-0x110], 0
+    mov  qword [rbp-0x118], 0
+    mov  qword [rbp-0x120], 0
     call lsm_mm_invalidate_all   ; PERF_SCOPE 4.1: reload re-derives
                                   ; next_run_no/next_gen from the manifest,
                                   ; so cached mappings may no longer match
@@ -2277,8 +2308,22 @@ utxo_lsm_reload:
     test rax, rax
     jnz  .rl_manifest_bad
     mov  eax, [rbp-0x80]
+    cmp  eax, MAGIC_MANIFEST2
+    je   .rl_manifest_v2
     cmp  eax, MAGIC_MANIFEST
     jne  .rl_manifest_bad
+    jmp  .rl_manifest_haveN         ; old format: has_count stays 0 -> recount
+.rl_manifest_v2:
+    ; new format: read the trailing total_live qword that follows the
+    ; 12-byte magic+manifest_n prefix, BEFORE the entry array.
+    mov  rdi, r14
+    lea  rsi, [rbp-0x110]
+    mov  rdx, 8
+    call mac_read_exact2
+    test rax, rax
+    jnz  .rl_manifest_bad
+    mov  qword [rbp-0x108], 1        ; has_count = 1
+.rl_manifest_haveN:
     mov  rax, [rbp-0x80+4]
     cmp  rax, [r12+112]
     ja   .rl_manifest_bad
@@ -2382,6 +2427,7 @@ utxo_lsm_reload:
     je   .rl_wal_del
     jmp  .rl_wal_close
 .rl_wal_push:
+    inc  qword [rbp-0x118]           ; WAL tail PUSH count (live-count delta)
     ; This is a SEPARATE rescan of the WAL from utxo_store_reload's own
     ; replay above (which already rebuilt the memtable) -- it exists only
     ; to rebuild the LSM layer's own per-generation tombstone list/op_count
@@ -2416,6 +2462,7 @@ utxo_lsm_reload:
     jl   .rl_wal_close
     jmp  .rl_wal_loop
 .rl_wal_del:
+    inc  qword [rbp-0x120]           ; WAL tail DEL count (live-count delta)
     mov  rdi, rbx
     lea  rsi, [rbp-0x100]
     mov  rdx, 36
@@ -2447,7 +2494,33 @@ utxo_lsm_reload:
     mov  eax, 3
     syscall
 
-    mov  rax, [r13]
+    ; ---- restore an ACCURATE total_live (was: total_live = u->n, which
+    ; counted ONLY the current unflushed generation and ignored every
+    ; flushed/compacted run -- tens of millions too low, and every del of an
+    ; older-run key then drove it negative). ----
+    cmp  qword [rbp-0x108], 0
+    je   .rl_recount
+    ; new-format manifest: base = persisted RUNS-ONLY count, plus the WAL
+    ; tail's net (pushes - dels). The base was persisted with the WAL empty
+    ; (at the last flush), so the tail rescanned above is exactly the ops not
+    ; yet folded into it -- base + delta double-counts nothing.
+    mov  rax, [rbp-0x110]            ; persisted base (runs-only)
+    add  rax, [rbp-0x118]            ; + WAL tail PUSHes
+    sub  rax, [rbp-0x120]            ; - WAL tail DELs
+    mov  [r12+88], rax
+    mov  rax, r15
+    jmp  .rl_ret
+.rl_recount:
+    ; old-format / absent / bad manifest: no persisted count. Establish the
+    ; baseline with a one-time full dedup recount over all runs + the
+    ; (already WAL-replayed) memtable + this generation's rebuilt tombstones.
+    ; Its result is the exact current live count and ALREADY reflects the WAL
+    ; tail (the memtable is that tail replayed), so no delta is added.
+    mov  rdi, r12
+    mov  rsi, r13
+    call mac_lsm_recount
+    cmp  rax, -1
+    je   .rl_fail
     mov  [r12+88], rax
     mov  rax, r15
     jmp  .rl_ret
@@ -2554,6 +2627,315 @@ mac_compact_read_rec:
     ret
 
 ; ============================================================================
+; mac_lsm_recount(lst=rdi, u=rsi) -> rax = exact live UTXO count / -1 err
+;   ONE-TIME baseline recount used by utxo_lsm_reload when the manifest is
+;   OLD-format (or absent/corrupt) and so carries no persisted total_live.
+;   Read-only: opens every run, k-way merges them (newest generation wins on
+;   a key tie -- exactly like utxo_lsm_compact's merge) and counts a key live
+;   iff its newest RUN record is a PUSH (type==1) AND the key is not shadowed
+;   by the newer memtable generation -- i.e. it is not currently live in the
+;   memtable (utxo_get miss; if it IS live there it is already counted in
+;   u->n) and not tombstoned this generation (tomb_hash miss). The memtable's
+;   own live entries are added up front as u->n. Runs, memtable and
+;   tombstones here are the fully-reloaded state (utxo_store_reload + the WAL
+;   tombstone rescan both ran before this), so the result already reflects
+;   the WAL tail -- reload adds no separate delta on this branch. Bounded
+;   O(total run records) one-time cost, never on the hot per-op path.
+;   Reuses the compaction per-run SLOT layout (COMPACT_SLOT_SIZE) and its
+;   record reader / header reader / key comparator.
+;
+;   Frame locals (all below the push-save area): -0x30 live  -0x38 mmap_size
+;   -0x40 loop-i  -0x48 best_idx / slot-base stash  -0x50 winner_slot
+;   -0xA0..-0x60 run-header out(64)  -0xC0 fmtbuf(20)  -0xF0 winning-key
+;   snapshot(36)  -0x100 &value -0x108 &height -0x110 &is_coinbase
+;   -0x118 &script -0x120 &slen (utxo_get out-args, values discarded).
+; ============================================================================
+mac_lsm_recount:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x140
+    mov  r12, rdi                  ; lst
+    mov  r13, rsi                  ; u
+    mov  rax, [r13]                ; u->n = memtable live entries
+    mov  [rbp-0x30], rax           ; live = u->n
+    mov  r14, [r12+120]            ; manifest_n (run count)
+    mov  qword [rbp-0x38], 0       ; mmap_size (0 => nothing mapped yet)
+    xor  r15d, r15d                ; slots base = 0 until mmap'd
+    test r14, r14
+    jz   .rc_ret_live              ; no runs -> live is just u->n
+
+    ; ---- mmap n slots (n * COMPACT_SLOT_SIZE), one read-ahead record each --
+    mov  rax, r14
+    imul rax, rax, COMPACT_SLOT_SIZE
+    mov  [rbp-0x38], rax
+    xor  edi, edi
+    mov  rsi, rax
+    mov  edx, 3                    ; PROT_READ|PROT_WRITE
+    mov  r10d, 0x22                ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov  r8, -1
+    xor  r9d, r9d
+    mov  eax, 9
+    syscall
+    cmp  rax, -1
+    je   .rc_err_nomap
+    mov  r15, rax                  ; slots base
+
+    ; ---- init every slot fd=-1 / active=0 so cleanup is uniform ----
+    mov  qword [rbp-0x40], 0
+.rc_init_loop:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .rc_init_done
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r15
+    mov  qword [rax], -1           ; slot.fd = -1
+    mov  qword [rax+32], 0         ; slot.active = 0
+    inc  qword [rbp-0x40]
+    jmp  .rc_init_loop
+.rc_init_done:
+
+    ; ---- open + prime each run (mirrors utxo_lsm_compact's open loop) ----
+    mov  qword [rbp-0x40], 0
+.rc_open_loop:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .rc_open_done
+    mov  rcx, rax
+    shl  rcx, 4
+    mov  rdx, [r12+104]            ; manifest_buf
+    add  rdx, rcx
+    mov  rcx, [rdx]               ; gen
+    mov  rdx, [rdx+8]             ; run_no
+    mov  rax, [rbp-0x40]
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r15                  ; slot base
+    mov  [rax+8], rcx             ; slot.gen
+    mov  [rax+16], rdx            ; slot.run_no
+    mov  [rbp-0x48], rax           ; stash slot base (fmt_runname clobbers regs)
+    lea  rdi, [rbp-0xC0]
+    mov  esi, edx                  ; run_no (low 32)
+    call fmt_runname
+    lea  rdi, [rbp-0xC0]
+    xor  esi, esi                  ; O_RDONLY
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .rc_err_cleanup
+    mov  rdx, [rbp-0x48]           ; slot base
+    mov  [rdx], rax               ; slot.fd
+    mov  rdi, rax
+    lea  rsi, [rbp-0xA0]
+    call mac_read_run_header
+    test rax, rax
+    jnz  .rc_err_cleanup
+    mov  rdx, [rbp-0x48]
+    mov  rax, [rbp-0xA0+8]         ; nrec
+    mov  [rdx+24], rax            ; slot.remaining
+    mov  rax, [rbp-0xA0+56]        ; rec_v2
+    mov  [rdx+96], rax           ; slot.rec_v2
+    mov  rdi, [rdx]               ; fd
+    mov  rsi, [rbp-0xA0+16]        ; bloom_bytes -> skip to records
+    mov  edx, 1                    ; SEEK_CUR
+    mov  eax, 8
+    syscall
+    test rax, rax
+    js   .rc_err_cleanup
+    mov  rdx, [rbp-0x48]
+    cmp  qword [rdx+24], 0         ; remaining == 0 (empty run)?
+    je   .rc_open_next
+    mov  rdi, rdx
+    call mac_compact_read_rec
+    cmp  eax, -1
+    je   .rc_err_cleanup
+.rc_open_next:
+    inc  qword [rbp-0x40]
+    jmp  .rc_open_loop
+.rc_open_done:
+
+    ; ================= streaming k-way merge, count only =================
+.rc_merge:
+    mov  qword [rbp-0x48], -1      ; best_idx
+    mov  qword [rbp-0x40], 0       ; i
+.rc_find:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .rc_find_done
+    mov  rdx, rax
+    imul rdx, rdx, COMPACT_SLOT_SIZE
+    add  rdx, r15                  ; this slot
+    cmp  qword [rdx+32], 0         ; active?
+    je   .rc_find_next
+    cmp  qword [rbp-0x48], -1
+    je   .rc_find_setbest
+    mov  rcx, [rbp-0x48]
+    imul rcx, rcx, COMPACT_SLOT_SIZE
+    add  rcx, r15                  ; best slot
+    lea  rdi, [rdx+40]
+    lea  rsi, [rcx+40]
+    push rdx
+    call mac_cmp_key               ; 0 this<best / 1 eq / 2 this>best
+    pop  rdx
+    cmp  eax, 0
+    je   .rc_find_setbest
+    cmp  eax, 1
+    jne  .rc_find_next
+    ; equal keys: this wins the tie only on a strictly higher generation
+    mov  rax, [rdx+8]             ; this.gen
+    mov  rcx, [rbp-0x48]
+    imul rcx, rcx, COMPACT_SLOT_SIZE
+    add  rcx, r15
+    mov  rcx, [rcx+8]            ; best.gen
+    cmp  rax, rcx
+    jbe  .rc_find_next
+.rc_find_setbest:
+    mov  rax, [rbp-0x40]
+    mov  [rbp-0x48], rax
+.rc_find_next:
+    inc  qword [rbp-0x40]
+    jmp  .rc_find
+.rc_find_done:
+    cmp  qword [rbp-0x48], -1
+    je   .rc_merge_done           ; no active slots -> done
+
+    mov  rax, [rbp-0x48]
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r15
+    mov  [rbp-0x50], rax           ; winner slot
+    lea  rdi, [rbp-0xF0]           ; stable snapshot of the winning key
+    lea  rsi, [rax+40]
+    mov  rdx, 36
+    call mac_memcpy
+
+    mov  rax, [rbp-0x50]
+    movzx ecx, byte [rax+76]       ; winner type
+    cmp  ecx, 1
+    jne  .rc_advance              ; DEL/tombstone winner -> key is dead
+
+    ; PUSH winner: is this key shadowed by the newer memtable generation?
+    lea  rax, [rbp-0xF0]          ; key: txid(32)+index(4)
+    mov  rdi, r13                 ; u
+    mov  rsi, rax                 ; txid
+    mov  edx, [rax+32]           ; index
+    lea  rcx, [rbp-0x100]         ; &value
+    lea  r8,  [rbp-0x108]         ; &height
+    lea  r9,  [rbp-0x110]         ; &is_coinbase
+    sub  rsp, 0x10
+    lea  rax, [rbp-0x118]
+    mov  [rsp], rax              ; &script
+    lea  rax, [rbp-0x120]
+    mov  [rsp+8], rax            ; &slen
+    call utxo_get
+    add  rsp, 0x10
+    cmp  rax, 1
+    je   .rc_advance             ; live in memtable -> already in u->n
+
+    mov  rdi, r12                 ; lst
+    lea  rsi, [rbp-0xF0]          ; key
+    call mac_tomb_hash_probe
+    mov  rax, [rax]              ; tomb slot value (-1 == not present)
+    cmp  rax, -1
+    jne  .rc_advance             ; tombstoned this generation -> dead
+
+    inc  qword [rbp-0x30]         ; live++
+
+.rc_advance:
+    ; advance every active slot whose current key equals the winning key
+    mov  qword [rbp-0x40], 0
+.rc_adv_loop:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .rc_adv_done
+    mov  rcx, rax
+    imul rcx, rcx, COMPACT_SLOT_SIZE
+    add  rcx, r15                  ; this slot
+    cmp  qword [rcx+32], 0         ; active?
+    je   .rc_adv_next
+    lea  rdi, [rcx+40]
+    lea  rsi, [rbp-0xF0]          ; snapshot key
+    push rcx
+    call mac_cmp_key
+    pop  rcx
+    cmp  eax, 1
+    jne  .rc_adv_next             ; different key -> leave it
+    cmp  qword [rcx+24], 0         ; remaining
+    jne  .rc_adv_reread
+    mov  qword [rcx+32], 0         ; exhausted -> active=0
+    jmp  .rc_adv_next
+.rc_adv_reread:
+    mov  rdi, rcx
+    call mac_compact_read_rec
+    cmp  eax, -1
+    je   .rc_err_cleanup
+.rc_adv_next:
+    inc  qword [rbp-0x40]
+    jmp  .rc_adv_loop
+.rc_adv_done:
+    jmp  .rc_merge
+.rc_merge_done:
+
+    ; ---- close all run fds, munmap slots ----
+    mov  qword [rbp-0x40], 0
+.rc_close_loop:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .rc_close_done
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r15
+    mov  rdi, [rax]
+    cmp  rdi, -1
+    je   .rc_close_next
+    mov  eax, 3
+    syscall
+.rc_close_next:
+    inc  qword [rbp-0x40]
+    jmp  .rc_close_loop
+.rc_close_done:
+    mov  rdi, r15
+    mov  rsi, [rbp-0x38]
+    mov  eax, 11                   ; munmap
+    syscall
+.rc_ret_live:
+    mov  rax, [rbp-0x30]
+    jmp  .rc_ret
+.rc_err_cleanup:
+    mov  qword [rbp-0x40], 0
+.rc_errc_loop:
+    mov  rax, [rbp-0x40]
+    cmp  rax, r14
+    jae  .rc_errc_done
+    imul rax, rax, COMPACT_SLOT_SIZE
+    add  rax, r15
+    mov  rdi, [rax]
+    cmp  rdi, -1
+    je   .rc_errc_next
+    mov  eax, 3
+    syscall
+.rc_errc_next:
+    inc  qword [rbp-0x40]
+    jmp  .rc_errc_loop
+.rc_errc_done:
+    mov  rdi, r15
+    mov  rsi, [rbp-0x38]
+    mov  eax, 11                   ; munmap
+    syscall
+.rc_err_nomap:
+    mov  rax, -1
+.rc_ret:
+    add  rsp, 0x140
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ============================================================================
 ; utxo_lsm_compact(lst=rdi) -> 1 ok / 0 nothing-to-do / -1 err
 ;   Merges the oldest min(manifest_n, COMPACT_MAX_RUNS) runs into one new
 ;   run via a streaming k-way merge (see header comment + COMPACT_* consts
@@ -2585,6 +2967,7 @@ utxo_lsm_compact:
     mov  rax, [r12+120]              ; manifest_n
     cmp  rax, 2
     jb   .cc_noop                     ; 0 or 1 runs -> nothing to compact
+    mov  [rbp-0x210], rax             ; original manifest_n (for the full-merge test)
 
     mov  rcx, COMPACT_MAX_RUNS
     cmp  rax, rcx
@@ -3166,6 +3549,74 @@ utxo_lsm_compact:
     inc  qword [r12+96]                             ; next_gen++
     inc  qword [r12+144]                              ; next_run_no++
 
+    ; ---- decide the live-count field for the new manifest (see the
+    ; MAGIC_MANIFEST2 design note). The persisted value must be RUNS-ONLY
+    ; (WAL/memtable excluded) so reload can add the WAL tail on top without
+    ; double-counting. First recover the previously persisted base from the
+    ; CURRENT on-disk manifest (still intact -- the rename is below). ----
+    mov  qword [rbp-0x218], 0        ; has_count = 0
+    lea  rdi, [rel manifest_name]
+    xor  esi, esi
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .cc_pl_decide               ; unreadable -> has_count stays 0
+    mov  [rbp-0x228], rax            ; read fd
+    mov  rdi, rax
+    lea  rsi, [rbp-0x1C0]
+    mov  rdx, 12
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cc_pl_close
+    mov  eax, [rbp-0x1C0]
+    cmp  eax, MAGIC_MANIFEST2
+    jne  .cc_pl_close
+    mov  rdi, [rbp-0x228]
+    lea  rsi, [rbp-0x220]            ; P_old (previously persisted runs-only base)
+    mov  rdx, 8
+    call mac_read_exact2
+    test rax, rax
+    jnz  .cc_pl_close
+    mov  qword [rbp-0x218], 1        ; has_count = 1
+.cc_pl_close:
+    mov  rdi, [rbp-0x228]
+    mov  eax, 3
+    syscall
+.cc_pl_decide:
+    ; is_full == (batch_size == original manifest_n)?  A full merge collapses
+    ; ALL runs into one, so true_nrec ([rbp-0x70]) IS the exact runs-only
+    ; live count -- authoritative, independent of any prior drift.
+    mov  rax, r14
+    cmp  rax, [rbp-0x210]
+    jne  .cc_pl_partial
+    mov  rax, [rbp-0x70]             ; true_nrec
+    mov  [rbp-0x230], rax            ; persist_count
+    mov  qword [rbp-0x238], 1        ; write v2
+    ; heal the in-memory running counter to ground truth while preserving the
+    ; WAL tail's contribution: new = true_nrec + (running - old_base). Only
+    ; when we recovered old_base; otherwise the running value already came
+    ; from a fresh recount/init and is left untouched.
+    cmp  qword [rbp-0x218], 0
+    je   .cc_pl_have
+    mov  rax, [r12+88]
+    sub  rax, [rbp-0x220]
+    add  rax, [rbp-0x70]
+    mov  [r12+88], rax
+    jmp  .cc_pl_have
+.cc_pl_partial:
+    ; partial merge: count-neutral, and true_nrec covers only the merged
+    ; subset. Carry the previously persisted base through unchanged; if there
+    ; is none, write an OLD-format header so reload recomputes via recount.
+    cmp  qword [rbp-0x218], 0
+    je   .cc_pl_v1
+    mov  rax, [rbp-0x220]            ; P_old
+    mov  [rbp-0x230], rax
+    mov  qword [rbp-0x238], 1        ; write v2
+    jmp  .cc_pl_have
+.cc_pl_v1:
+    mov  qword [rbp-0x238], 0        ; write v1 (no count field)
+.cc_pl_have:
+
     ; ---- publish manifest: tmp file + fsync + rename + dir fsync ----
     lea  rdi, [rel manifest_tmp_name]
     mov  esi, 1 | 0x40 | 0x200
@@ -3175,12 +3626,21 @@ utxo_lsm_compact:
     test rax, rax
     jl   .cc_err_close
     mov  rbx, rax
-    mov  dword [rbp-0x1C0], MAGIC_MANIFEST
     mov  rax, [r12+120]
-    mov  [rbp-0x1C0+4], rax
+    mov  [rbp-0x1C0+4], rax          ; manifest_n
+    cmp  qword [rbp-0x238], 0
+    je   .cc_hdr_v1
+    mov  dword [rbp-0x1C0], MAGIC_MANIFEST2
+    mov  rax, [rbp-0x230]
+    mov  [rbp-0x1C0+12], rax         ; total_live
+    mov  edx, 20
+    jmp  .cc_hdr_wr
+.cc_hdr_v1:
+    mov  dword [rbp-0x1C0], MAGIC_MANIFEST
+    mov  edx, 12
+.cc_hdr_wr:
     mov  rdi, rbx
     lea  rsi, [rbp-0x1C0]
-    mov  rdx, 12
     call mac_write_exact
     test rax, rax
     jnz  .cc_merr_close
