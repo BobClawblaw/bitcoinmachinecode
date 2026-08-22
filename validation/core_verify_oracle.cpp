@@ -29,6 +29,7 @@
 
 #include <primitives/transaction.h>
 #include <core_io.h>
+#include <hash.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/script_error.h>
@@ -157,6 +158,106 @@ int main(){
             CScript scriptCode(scb.begin(), scb.end());
             uint256 h = SignatureHash(scriptCode, mtx, idx, (int32_t)ht, CAmount(amount),
                                       SigVersion::WITNESS_V0);
+            printf("OK %s\n", HexStr(h).c_str());
+            fflush(stdout);
+        } else if(cmd=="BIP341"){
+            /* BIP341 <inputidx> <hash_type_dec> <sigversion:0=taproot,1=tapscript>
+             *        <codesep_pos_dec> <annex_hex|-> <tapleaf_hex|->
+             *        <tx_hex_WITH_witness> <n_prev> <amount_0> <spk_0_hex> ...
+             *   -> Core's SignatureHashSchnorr(), i.e. the real BIP341/BIP342
+             *      taproot sighash, hex-printed in the same byte order the
+             *      SIGHASH and BIP143 commands above use.
+             *
+             *      Added 2026-08-22.  The BIP143 command can only answer for
+             *      witness-v0; taproot's sighash commits to EVERY spent output
+             *      (amounts and scriptPubKeys of all prevouts, not just the one
+             *      being spent) plus an execution-context blob -- the annex
+             *      hash, and for tapscript the tapleaf hash / key version /
+             *      last-executed OP_CODESEPARATOR position -- none of which
+             *      SignatureHash() takes.  So the taproot sighash in the ASM
+             *      implementation had no Core-authoritative check at all; it was
+             *      only ever compared against our own reading of BIP341.  This
+             *      command closes that gap the same way TAPVERIFY closed it for
+             *      whole-input validation: build a real PrecomputedTransactionData
+             *      from all spent outputs, fill a ScriptExecutionData by hand
+             *      (which the interpreter would normally fill during witness
+             *      execution), and ask Core for the digest.
+             *
+             *      Filling execdata by hand is deliberate: it lets the caller
+             *      probe sighash space that a real transaction cannot reach --
+             *      arbitrary codeseparator positions, an annex on a key-path
+             *      spend, tapleaf hashes not committed to by any control block --
+             *      without having to forge a spendable script for each case.
+             *      The annex is supplied here as its raw bytes and hashed
+             *      exactly as ExecuteWitnessScript does, (HashWriter{} << annex)
+             *      .GetSHA256(), i.e. SHA256 over compactsize(len)||annex, so
+             *      the caller passes what it would put on the witness stack and
+             *      not a pre-hashed value.  Note the transaction's own witness
+             *      is NOT consulted: BIP341 commits to the annex only through
+             *      execdata, so a witness-stripped tx serialization gives the
+             *      identical digest.
+             *
+             *      hash_type is a uint8_t (0 = SIGHASH_DEFAULT).  Core rejects
+             *      any value outside {0x00..0x03, 0x81..0x83} and SIGHASH_SINGLE
+             *      past the end of vout by returning false -> ERR
+             *      schnorr-sighash-failed. */
+            unsigned idx=0, nprev=0; long long ht=0; int sv=0;
+            long long csp=0; std::string annexs, leafs, txs;
+            if(!(iss>>idx>>ht>>sv>>csp>>annexs>>leafs>>txs>>nprev)){
+                printf("ERR bad-args\n"); fflush(stdout); continue;
+            }
+            if (ht < 0 || ht > 255){ printf("ERR bad-hash-type\n"); fflush(stdout); continue; }
+            if (sv != 0 && sv != 1){ printf("ERR bad-sigversion\n"); fflush(stdout); continue; }
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, txs)){ printf("ERR tx-decode-fail\n"); fflush(stdout); continue; }
+            std::vector<CTxOut> spent;
+            bool bad=false;
+            for (unsigned i=0;i<nprev;i++){
+                long long amt=0; std::string spkh;
+                if(!(iss>>amt>>spkh)){ bad=true; break; }
+                if (spkh=="-") spkh="";
+                std::vector<unsigned char> s = hex2bytes(spkh.c_str());
+                spent.emplace_back(CAmount(amt), CScript(s.begin(), s.end()));
+            }
+            if (bad || spent.size()!=nprev || spent.size()!=mtx.vin.size()){
+                printf("ERR bad-prevouts\n"); fflush(stdout); continue;
+            }
+            if (idx >= mtx.vin.size()){ printf("ERR bad-input-index\n"); fflush(stdout); continue; }
+
+            ScriptExecutionData execdata;
+            execdata.m_annex_init = true;
+            if (annexs=="-"){
+                execdata.m_annex_present = false;
+            } else {
+                std::vector<unsigned char> annex = hex2bytes(annexs.c_str());
+                // Exactly as EvalScript/VerifyWitnessProgram does it.
+                execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
+                execdata.m_annex_present = true;
+            }
+            SigVersion sigversion = (sv==0) ? SigVersion::TAPROOT : SigVersion::TAPSCRIPT;
+            if (sigversion == SigVersion::TAPSCRIPT){
+                if (leafs=="-"){ printf("ERR missing-tapleaf\n"); fflush(stdout); continue; }
+                std::vector<unsigned char> lh = hex2bytes(leafs.c_str());
+                if (lh.size()!=32){ printf("ERR bad-tapleaf\n"); fflush(stdout); continue; }
+                execdata.m_tapleaf_hash_init = true;
+                execdata.m_tapleaf_hash = uint256(lh);
+                execdata.m_codeseparator_pos_init = true;
+                execdata.m_codeseparator_pos = (uint32_t)(unsigned long long)csp;
+            }
+            CTransaction tx(mtx);
+            PrecomputedTransactionData txdata;
+            // force=true: Init() otherwise only precomputes the BIP341 midstates
+            // if it SEES a witness-bearing input with a v1 scriptPubKey, and this
+            // command deliberately accepts a witness-stripped serialization (the
+            // taproot sighash does not commit to the witness).  Without force,
+            // m_bip341_taproot_ready stays false and SignatureHashSchnorr()
+            // returns false via HandleMissingData().
+            txdata.Init(tx, std::vector<CTxOut>(spent), /*force=*/true);
+            uint256 h;
+            if (!SignatureHashSchnorr(h, execdata, tx, idx, (uint8_t)ht, sigversion,
+                                      txdata, MissingDataBehavior::FAIL)){
+                printf("ERR schnorr-sighash-failed\n"); fflush(stdout); continue;
+            }
             printf("OK %s\n", HexStr(h).c_str());
             fflush(stdout);
         }
