@@ -1250,3 +1250,38 @@ mode if the key ever aliased. After this change the sighash is 3.91 µs against
 `ecdsa_verify`'s 120.9 µs — 3.1% of a witness input's cost — so there is
 little left to win. Revisit only if a re-profile puts this path back near the
 top.
+
+## 9. Deployed end-to-end result — measured 2026-08-22 evening
+
+Both of the day's performance changes are live: the field-kernel rewrite
+(§5.2, deployed 19:40) and the single-pass BIP143 precompute (§8, deployed
+21:35).
+
+| | height band | rate |
+|---|---|---|
+| before both | 537,616 → 575,833 (38,217 blk / 3,816 s) | **10.01 blk/s** |
+| after both | 656,104 → 666,855 (10,751 blk / 790 s) | **13.61 blk/s** |
+
+**1.36×, and that is a floor rather than the figure.** The two bands are not
+the same work: the second sits ~120,000 blocks deeper, where transactions
+carry far more inputs and outputs. Measuring the true same-depth factor would
+mean reverting and re-replaying identical heights — hours of wall clock for a
+number that would only revise an already-known-conservative result upward. It
+was not done, and the figure is quoted as a floor accordingly.
+
+**A warning about every other rate number from this session: they are
+contaminated.** Full `make -k test` suites and up to four verification agents
+ran on this same 32-thread box throughout the evening, competing with the
+replay for CPU. One window containing a change that cost a measured +16 % on
+one function shows a 43 % end-to-end drop — that is contention, not code. The
+two rows above were both taken during comparatively quiet periods, and the
+component benchmarks in §5.2 and §8 (CPU-time, min-of-N, both builds back to
+back) are the numbers to trust. **If a future session wants a clean
+end-to-end figure, take it with nothing else running.**
+
+**Do not compose the component factors.** §8's sighash path got 27.4× on real
+blocks, and §5.2's `ecdsa_verify` 1.37×. The end-to-end result is neither,
+nor their product: §8 removed ~34 % of cycles, which caps it at 1.52× by
+Amdahl regardless of how fast that component became, and §5.2's share was
+smaller than the profile it was planned against. Component speedups multiply
+against their own share only.
