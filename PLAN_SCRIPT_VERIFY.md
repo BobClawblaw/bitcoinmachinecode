@@ -51,14 +51,14 @@ Considerably more than a fresh start. The expensive, hard parts are built.
 |---|---|---|
 | Full Script interpreter, **all opcodes** | `bitcoin_interp.asm` → `script_eval` | done; sigversion + Core flag word + pluggable `checksig_fn` callback |
 | Core-parity `VerifyScript` incl. BIP16/P2SH | `bitcoin_verify.c:565` → `verify_script` | done for **legacy**; two-pass eval, P2SH sub-script, cleanstack, SIGPUSHONLY, Core `ScriptError` codes |
-| Segwit/taproot tx validator | `bitcoin_txval_modern.c:174` → `txval_modern` | P2WPKH, P2WSH (CHECKSIG + one multisig form), P2TR **key-path only** |
+| Segwit/taproot tx validator | `bitcoin_txval_modern.c:174` → `txval_modern`; block path `daemon/tx_verify.c` → `taproot_verify_input` | P2WPKH, P2WSH, P2TR key-path **and script-path** (BIP342 incl. annex, `OP_CHECKSIGADD`, `OP_CODESEPARATOR` position — `e789df8`, `b2ccb2d`, 2026-08-21) |
 | Legacy sighash | `bitcoin_sighash.asm` | done |
 | BIP143 sighash | `bitcoin_segwit.c` | done |
 | BIP341 sighash | `bitcoin_taproot_sighash.c` | done |
 | ECDSA / Schnorr verify | `secp256k1_ecdsa.o`, `secp256k1_schnorr.o` | done, optimised (adcx/adox `fe_mul`) |
 | UTXO lookup by outpoint | `utxo_lsm_get` via `mempool_resolve_confirmed_utxo` | done, real set (the `placeholder_utxo` pointer in tx_accept is ignored by design) |
 | Differential harness vs Core | `validation/core_verify_oracle.cpp`, `consensus_diff.py`, `tests/consensus_shim`, `tests/verify_p2sh_shim` | exists and is used |
-| Core oracle binary | `/storage/bitcoin/bin/bitcoind` v31.99.0 | available |
+| Core oracle | scratch instance from the **source build** `/storage/bitcoin-core-source/build/bin/` at `/storage/core-oracle` (RPC 8335, `txindex`+`coinstatsindex`) | running since 2026-08-21; the production install `/storage/bitcoin` is off-limits |
 
 ## What is missing
 
@@ -98,6 +98,10 @@ code, not assumed) -- kept here as history of the original gap. Only item 6
 6. **No `assumevalid`.** Still open -- Stage E.
 
 ## Cost — measured, not estimated
+
+*(Historical: the 2026-08-18 measurement that sized the plan. As of
+2026-08-22 `ecdsa_verify` is ~39 µs and the replay runs 4.4–5.7× the 08-21
+baseline — see `PERF_SCOPE.md` §5 for current numbers.)*
 
 `tests/bench_ecdsa` (added while scoping, wired into the Makefile):
 
