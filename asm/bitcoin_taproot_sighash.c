@@ -33,17 +33,67 @@ extern int  stack_push(uint64_t* sp, uint8_t* elems, const uint8_t* data, uint32
 
 #define SHA256SZ 32
 
-/* ---------------- compact-size (varint) helpers ---------------- */
-static uint64_t read_cs(const uint8_t** p){
+/* ---------------- compact-size (varint) helpers ----------------
+ * read_cs is BOUNDED and MINIMALITY-CHECKING, and both properties are new
+ * (2026-08-22). It is the same reader bitcoin_segwit.c grew in fc4bd67, for
+ * the same two reasons, and the two files must agree because the daemon feeds
+ * both the SAME stripped transaction (daemon/tx_verify.c calls
+ * strip_witness() and hands the result to taproot_verify_input()).
+ *
+ * BOUNDED. A compactsize is 1, 3, 5 or 9 bytes and the width is chosen by the
+ * first byte, which is itself wire data. The previous reader here took no
+ * `end` at all, so ANY walk that landed on the last byte of the transaction
+ * read up to 8 bytes past it -- and every walk in this file could land there,
+ * because tx_parse() read the length BEFORE checking that the length fit.
+ * Concretely: a 10-byte buffer whose byte 4 is 0xff made tx_parse read
+ * tx[5..12], three bytes past the end, before any bound was consulted. That
+ * is incident #21's class exactly, one file over. tests/test_taproot_bounds_
+ * fuzz.c puts the transaction against a PROT_NONE page and SIGSEGVs on the
+ * pre-fix tree.
+ *
+ * MINIMAL. Core's ReadCompactSize() throws "non-canonical ReadCompactSize()"
+ * for an 0xfd form below 253, an 0xfe form below 0x10000, or an 0xff form
+ * below 0x100000000, ungated, so a transaction carrying a padded compactsize
+ * cannot be deserialized by Core at all and cannot appear in a block Core
+ * accepts. That rule became load-bearing the moment sha_outputs started
+ * hashing each CTxOut IN PLACE instead of re-serializing it: the old
+ * ser_txout() wrote put_cs(len), i.e. the canonical form, so a padded length
+ * was silently rewritten before hashing, and raw bytes are not rewritten.
+ * Neither answer is Core's -- Core refuses the transaction -- so this refuses
+ * it too, which is what makes in-place hashing PROVABLY identical to
+ * canonical re-serialization for every transaction not refused. It costs the
+ * hot path nothing: the single-byte encoding returns before any width is
+ * computed.
+ *
+ * (Same standing note as bitcoin_segwit.c: nothing else in the tree enforces
+ * minimality -- bitcoin_tx.asm's readers do not -- so a peer's non-canonical
+ * transaction is still mis-parsed elsewhere. Pre-existing, separate fix.) */
+static uint64_t read_cs(const uint8_t** p, const uint8_t* end, int* ok){
     const uint8_t* b = *p;
+    if (b >= end){ *ok = 0; *p = end; return 0; }
     uint8_t f = *b++;
-    uint64_t v;
-    if (f < 0xfd)      v = f;
-    else if (f == 0xfd){ v = b[0] | ((uint64_t)b[1]<<8); b += 2; }
-    else if (f == 0xfe){ v = 0; for(int i=0;i<4;i++) v |= (uint64_t)b[i]<<(8*i); b += 4; }
-    else              { v = 0; for(int i=0;i<8;i++) v |= (uint64_t)b[i]<<(8*i); b += 8; }
+    if (f < 0xfd){ *p = b; return f; }          /* hot path: one compare */
+    int extra = (f == 0xfd) ? 2 : (f == 0xfe ? 4 : 8);
+    if (end - b < extra){ *ok = 0; *p = end; return 0; }
+    uint64_t v, min;
+    if (f == 0xfd){ v = b[0] | ((uint64_t)b[1]<<8); b += 2; min = 0xfdULL; }
+    else if (f == 0xfe){ v = 0; for(int i=0;i<4;i++) v |= (uint64_t)b[i]<<(8*i); b += 4; min = 0x10000ULL; }
+    else              { v = 0; for(int i=0;i<8;i++) v |= (uint64_t)b[i]<<(8*i); b += 8; min = 0x100000000ULL; }
+    if (v < min){ *ok = 0; *p = end; return 0; }   /* non-canonical */
     *p = b;
     return v;
+}
+/* Bytes still available at q. Every bound test below is a "remaining >=
+ * wanted" comparison on this value, never `q + n > end`: the lengths come off
+ * the wire and can be up to 2^64-1, so forming q+n first overflows the
+ * pointer (undefined, and in practice wraps to a small address that PASSES
+ * the test). The old tx_parse used exactly that form -- `q + (int64_t)sl + 4 >
+ * t->tx + t->txlen` -- and worse, cast an unsigned wire length through
+ * int64_t first, so any sl >= 2^63 went NEGATIVE and the comparison passed
+ * unconditionally. Incident #21 removed the same idiom from
+ * bitcoin_segwit.c. */
+static uint64_t ts_avail(const uint8_t* q, const uint8_t* end){
+    return (uint64_t)(end - q);
 }
 static int cs_size(uint64_t n){
     if (n < 0xfdUL) return 1;
@@ -60,105 +110,173 @@ static void put_cs(uint8_t* d, uint64_t n){
 static void w32le(uint8_t* d, uint32_t v){ for(int i=0;i<4;i++) d[i]=(uint8_t)(v>>(8*i)); }
 static void w64le(uint8_t* d, uint64_t v){ for(int i=0;i<8;i++) d[i]=(uint8_t)(v>>(8*i)); }
 
-/* ---------------- transaction view ---------------- */
+/* ---------------- transaction view ----------------
+ * ONE bounded pass over the transaction records where every input and every
+ * output starts; every accessor afterwards is an array index.
+ *
+ * What this replaces was O(n^3) PER TRANSACTION, the identical shape
+ * PERF_SCOPE.md section 7 measured in bitcoin_segwit.c and fc4bd67 removed:
+ *
+ *   tx_seq(t,i) and tx_outpoint(t,i) each re-walked the input list FROM THE
+ *   START to reach input i, parsing a compactsize per step. BIP341's
+ *   sha_sequences calls tx_seq once per input, so building it was O(nin^2)
+ *   varint reads.
+ *
+ *   ser_txout(t,i) re-walked the first i outputs, and ser_txout_len(t,i) did
+ *   the same walk TWICE -- literally twice, the first result computed into a
+ *   local and then thrown away and the loop re-run. sha_outputs called both
+ *   once per output, so it was THREE O(nout^2) walks.
+ *
+ *   And taproot_sighash() is called once per input (once per executed
+ *   OP_CHECKSIG/OP_CHECKSIGADD, via taproot_checksig_fn), while BIP341's
+ *   aggregate hashes depend only on the transaction and not on which input
+ *   is being signed -- so all of that was redone from scratch nin times.
+ *
+ * Core has never paid any of it: PrecomputedTransactionData walks the
+ * transaction once.
+ *
+ * in_off[i] is the offset of input i's 36-byte outpoint, for i in [0, nin],
+ * where in_off[nin] is one past the last input (the nout compactsize).
+ * Inputs are contiguous, so input i's 4-byte nSequence ends exactly at
+ * in_off[i+1] -- that is where tx_seq reads it, with no parsing at all, and
+ * it is exact for the final input too.
+ *
+ * out_off[i] is the offset of output i's CTxOut, for i in [0, nout], with
+ * out_off[nout] the end of the outputs section.
+ *
+ * AND THE PART WORTH STATING PLAINLY, BECAUSE BIP341 IS NOT BIP143 HERE:
+ * BIP341's sha_outputs is SHA256 over "the serialization of all outputs in
+ * CTxOut format", i.e. 8-byte value || compactsize(len) || scriptPubKey per
+ * output -- byte for byte the transaction's OWN wire encoding, exactly as in
+ * BIP143. So sha_outputs is a single sha256 over the contiguous slice
+ * [out_off[0], out_off[nout]) IN PLACE, and SIGHASH_SINGLE's
+ * sha_single_output is one over [out_off[n_in], out_off[n_in+1]). ser_txout
+ * and ser_txout_len are deleted; no output is copied anywhere.
+ *
+ * BIP341 does ALSO hash amounts and scriptPubKeys separately -- sha_amounts
+ * and sha_scriptpubkeys, which BIP143 has no counterpart for -- and that is
+ * NOT a counterexample to the in-place property, because those two are over
+ * the SPENT outputs (the UTXOs this transaction consumes), which are not in
+ * this transaction at all. They arrive as the caller's own contiguous
+ * prevouts/amounts/spks arrays and are handled separately below, where they
+ * turn out to need no copying either. The outputs THIS transaction creates
+ * are hashed in exactly one place, sha_outputs, in exactly one format. */
 typedef struct {
     const uint8_t* tx;   int64_t txlen;
+    const uint8_t* end;      /* tx + txlen; every walk below bounds against it */
     int      version;
     uint32_t locktime;
-    const uint8_t* inputs;   /* start of the input vector (after varint) */
-    const uint8_t* outputs;  /* start of the output vector */
     int64_t  nin, nout;
+    const uint32_t* in_off;  /* nin+1 offsets; see above */
+    const uint32_t* out_off; /* nout+1 offsets; see above */
 } txview_t;
 
-/* Parse the tx header enough to locate inputs/outputs/locktime.
- * Returns 0 on malformed. */
-static int tx_parse(txview_t* t){
+/* Offset-table capacity, in uint32 entries, shared by in_off and out_off.
+ *
+ * The bound is arithmetic, not a guess, and it is the same one fc4bd67 used
+ * for SW_OFF_ENTRIES so the two sighash paths refuse at the same place. On
+ * the wire an input costs at least 36 (outpoint) + 1 (a zero-length
+ * scriptSig's compactsize) + 4 (nSequence) = 41 bytes and an output at least
+ * 8 (value) + 1 = 9, so for a transaction of txlen bytes
+ *
+ *      (nin + 1) + (nout + 1)  <=  txlen * (1/41 + 1/9) + 2
+ *                              =   0.13550 * txlen + 2,
+ *
+ * and MAX_BLOCK_SERIALIZED_SIZE is 4 MiB, so no transaction a valid block can
+ * carry needs more than 0.13550 * 4194304 + 2 = 568,335 entries. 600,000
+ * (2.29 MiB) therefore cannot false-reject anything, while still being a
+ * hard, checked ceiling on a wire-supplied count rather than an unbounded
+ * allocation. Note that the transaction reaching this file is the STRIPPED
+ * (no-witness) serialization, which is strictly smaller, so the bound is if
+ * anything looser than it needs to be.
+ *
+ * Per-thread HEAP (BMC_TLS_BUF), never a stack array: incident #13 is what a
+ * size-dependent fixed stack buffer does when it meets real chain data. */
+#define TS_OFF_ENTRIES 600000u
+/* sha_sequences gathers 4 bytes per input, so it needs 4*nin bytes. It can
+ * never be the binding constraint: the offset table above already refuses
+ * nin+1 > TS_OFF_ENTRIES, so nin <= 599,999 and 4*nin <= 2,399,996 -- which
+ * is why this is derived from TS_OFF_ENTRIES rather than stated separately.
+ * (The real bound is far smaller: a 4 MiB transaction holds at most
+ * 4194304/41 = 102,300 inputs, i.e. 409,200 bytes.) */
+#define TS_SEQ_CAP     (4u * TS_OFF_ENTRIES)
+
+/* Single bounded pass. `off` is TS_OFF_ENTRIES uint32 slots owned by the
+ * caller; on success t->in_off and t->out_off point into it and stay valid
+ * for as long as it does. Returns 0 on malformed. */
+static int tx_parse(txview_t* t, uint32_t* off){
     const uint8_t* p = t->tx;
-    if (t->txlen < 10) return 0;
+    /* Offsets are recorded as uint32. A transaction over 4 GiB cannot exist
+     * in a valid block (MAX_BLOCK_SERIALIZED_SIZE is 4 MiB), so refusing one
+     * outright is a bound no real transaction can reach -- and it is what
+     * makes the narrowing casts below exact. */
+    if (t->txlen < 10 || (uint64_t)t->txlen > 0xffffffffu) return 0;
+    const uint8_t* end = t->tx + t->txlen;
+    t->end = end;
+    int ok = 1;
     t->version = (int32_t)(p[0] | (p[1]<<8) | (p[2]<<16) | ((uint32_t)p[3]<<24));
     p += 4;
-    t->nin = (int64_t)read_cs(&p);
-    if (t->nin <= 0) return 0;
-    t->inputs = p;
-    /* walk inputs */
+    t->nin = (int64_t)read_cs(&p, end, &ok);
+    if (!ok || t->nin <= 0) return 0;
+    /* nin comes off the wire: bound the table before indexing it. (A count
+     * >= 2^63 lands negative in the int64 and is already refused above.) */
+    if ((uint64_t)t->nin + 1u > (uint64_t)TS_OFF_ENTRIES) return 0;
+    uint32_t* in_off = off;
     const uint8_t* q = p;
     for (int64_t i=0;i<t->nin;i++){
-        if (q + 36 > t->tx + t->txlen) return 0;
+        in_off[i] = (uint32_t)(q - t->tx);
+        if (ts_avail(q, end) < 36) return 0;
         q += 36;                         /* prevout */
-        uint64_t sl = read_cs(&q);
-        if (q + (int64_t)sl + 4 > t->tx + t->txlen) return 0;
+        uint64_t sl = read_cs(&q, end, &ok);
+        /* `avail < sl + 4` would wrap for sl within 4 of 2^64 -- read_cs can
+         * return any 64-bit value the wire supplies -- and let a bogus q
+         * through. Split it so neither side can overflow. */
+        if (!ok || ts_avail(q, end) < sl || ts_avail(q, end) - sl < 4) return 0;
         q += sl + 4;                     /* scriptSig + nSequence */
     }
-    uint64_t nout = read_cs(&q);
-    t->outputs = q;              /* point past the output-count varint */
-    t->nout = (int64_t)nout;
-    for (uint64_t i=0;i<nout;i++){
-        if (q + 8 > t->tx + t->txlen) return 0;
+    in_off[t->nin] = (uint32_t)(q - t->tx);
+    t->in_off = in_off;
+    t->nout = (int64_t)read_cs(&q, end, &ok);
+    if (!ok || t->nout < 0) return 0;
+    if ((uint64_t)t->nin + 1u + (uint64_t)t->nout + 1u > (uint64_t)TS_OFF_ENTRIES) return 0;
+    uint32_t* out_off = off + t->nin + 1;
+    for (int64_t i=0;i<t->nout;i++){
+        out_off[i] = (uint32_t)(q - t->tx);
+        if (ts_avail(q, end) < 8) return 0;
         q += 8;                          /* value */
-        uint64_t sl = read_cs(&q);
-        if (q + (int64_t)sl > t->tx + t->txlen) return 0;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || ts_avail(q, end) < sl) return 0;
         q += sl;                         /* scriptPubKey */
     }
-    if (q + 4 > t->tx + t->txlen) return 0;
+    out_off[t->nout] = (uint32_t)(q - t->tx);
+    t->out_off = out_off;
+    if (ts_avail(q, end) < 4) return 0;
     t->locktime = (uint32_t)(q[0]|(q[1]<<8)|(q[2]<<16)|((uint32_t)q[3]<<24));
     return 1;
 }
 
-/* nSequence of input i (start of its prevout = inputs + i*lenbytes walk). */
+/* nSequence of input i. Inputs are contiguous, so it is the last 4 bytes
+ * before input i+1 begins -- and in_off[nin] is one past the last input, so
+ * this is exact for the final input too. O(1), no compactsize read.
+ * i must be in [0, nin). */
 static uint32_t tx_seq(const txview_t* t, int64_t i){
-    const uint8_t* q = t->inputs;
-    for (int64_t k=0;k<i;k++){
-        q += 36;
-        uint64_t sl = read_cs(&q);
-        q += sl + 4;
-    }
-    q += 36;
-    uint64_t sl = read_cs(&q);
-    q += sl;
+    const uint8_t* q = t->tx + t->in_off[i+1] - 4;
     return (uint32_t)(q[0]|(q[1]<<8)|(q[2]<<16)|((uint32_t)q[3]<<24));
 }
 
-/* outpoint (36 bytes) of input i */
+/* outpoint (36 bytes) of input i. O(1): tx_parse recorded the offset in its
+ * one bounded pass and proved 36 bytes are there. i must be in [0, nin). */
 static const uint8_t* tx_outpoint(const txview_t* t, int64_t i){
-    const uint8_t* q = t->inputs;
-    for (int64_t k=0;k<i;k++){
-        q += 36;
-        uint64_t sl = read_cs(&q);
-        q += sl + 4;
-    }
-    return q;
+    return t->tx + t->in_off[i];
 }
 
-/* Serialize one CTxOut (value LE + compactsize spk + spk) into d, return len. */
-static int ser_txout(const txview_t* t, int64_t i, uint8_t* d){
-    const uint8_t* q = t->outputs;
-    uint64_t cnt = (uint64_t)t->nout;
-    /* skip i outputs */
-    for (int64_t k=0;k<i;k++){
-        q += 8;
-        uint64_t sl = read_cs(&q);
-        q += sl;
-    }
-    uint64_t val;
-    val = 0; for(int b=0;b<8;b++) val |= (uint64_t)q[b]<<(8*b); q += 8;
-    uint64_t sl = read_cs(&q);
-    w64le(d, val);
-    int n = 8;
-    put_cs(d+n, sl); n += cs_size(sl);
-    memcpy(d+n, q, sl); n += (int)sl;
-    return n;
-}
-static int ser_txout_len(const txview_t* t, int64_t i){
-    const uint8_t* q = t->outputs;
-    for (int64_t k=0;k<i;k++){ q += 8; uint64_t sl=read_cs(&q); q += sl; }
-    int n = 8 + cs_size(0);
-    /* value(8) + cs + spk */
-    /* recompute */
-    q = t->outputs;
-    for (int64_t k=0;k<i;k++){ q += 8; uint64_t sl=read_cs(&q); q += sl; }
-    q += 8;
-    uint64_t sl = read_cs(&q);
-    return 8 + cs_size(sl) + (int)sl;
+/* Outputs [lo, hi) as a contiguous in-place slice. See the header comment:
+ * a CTxOut's BIP341 serialization IS its wire encoding, so there is nothing
+ * to build and nothing to copy. */
+static const uint8_t* tx_txout_range(const txview_t* t, int64_t lo, int64_t hi,
+                                     uint64_t* len){
+    *len = (uint64_t)(t->out_off[hi] - t->out_off[lo]);
+    return t->tx + t->out_off[lo];
 }
 
 /* -------- context for sighash -------- */
@@ -179,46 +297,116 @@ typedef struct {
 
 /* Key-path budget for a reference P2TR: script is 34 bytes. */
 
-/* Compute sha256 of prevouts/amounts/spks/sequences into aggregates. */
-static void agg_hashes(const tapctx_t* c, const txview_t* t,
-                       uint8_t h_prev[32], uint8_t h_amt[32],
-                       uint8_t h_spk[32], uint8_t h_seq[32])
+/* SigMsg preimage buffer used by the four verifiers below (taproot_sighash
+ * itself still takes the buffer from its caller, because tests drive it
+ * directly). Bound, from the BIP341 layout:
+ *
+ *   epoch 1 + hash_type 1 + nVersion 4 + nLockTime 4
+ *   + 4*32 aggregates (non-ACP only)               = 128
+ *   + sha_outputs 32  OR  sha_single_output 32     =  32  (mutually exclusive)
+ *   + spend_type 1
+ *   + input_index 4  OR  ACP's outpoint 36 + amount 8 + cs+spk + nSequence 4
+ *   + sha_annex 32
+ *   + ext: tapleaf 32 + key_version 1 + codesep 4  =  37
+ *
+ * which is 244 bytes plus, on the ANYONECANPAY branch only, the spent
+ * scriptPubKey and its compactsize. That was a `uint8_t pre[256]` stack
+ * array, and 256 is enough ONLY because the spent output of a taproot input
+ * is a 34-byte P2TR program -- for anything larger taproot_sighash's own cap
+ * check fired and returned 0, i.e. a silent FALSE REJECT on a consensus path,
+ * with the accept/reject line sitting at an undocumented ~200 bytes. Core has
+ * no such limit. 64 KiB removes the latent false-reject entirely (no caller in
+ * this tree can reach even 253 bytes -- daemon/tx_verify.c and
+ * bitcoin_txval_modern.c both refuse a spent scriptPubKey >= 0xfd before
+ * calling here) while keeping the bound hard and checked. Per-thread heap;
+ * none of the four verifiers nest, so one buffer serves them all. */
+#define TS_PRE_CAP (64u<<10)
+
+/* BIP341's four aggregate hashes, plus the offset of the input being signed
+ * inside the caller's spks run (the ANYONECANPAY branch needs it, and finding
+ * it here costs nothing because the run has to be walked anyway).
+ * Returns 0 on malformed input; the caller MUST fail closed on 0.
+ *
+ * WHAT USED TO BE HERE, AND WHY IT WAS BOTH SLOW AND UNSAFE.
+ *
+ * Every one of the four staged its input into a 4 MiB per-thread buffer and
+ * hashed that. Three of the four did not need to: c->prevouts, c->amounts and
+ * c->spks are ALREADY the contiguous concatenations BIP341 asks for -- the
+ * old loops were copying a buffer onto itself, 36/8/n bytes at a time, and
+ * then hashing the copy. They are now hashed where they lie, which removes
+ * both the copies and the 4 MiB buffer.
+ *
+ * The bound checks on those copies were also wrong in two ways:
+ *   - the scriptpubkeys loop tested `n + 600 > TS_AGG_CAP` and then copied
+ *     `cs + sl` bytes, so any spent scriptPubKey longer than 600 bytes
+ *     overran the destination. Consensus places no limit on a scriptPubKey's
+ *     size (only relay standardness does) -- this is incident #21's shape
+ *     exactly, on the heap instead of the stack;
+ *   - the sequences loop had NO bound at all, and it iterated to
+ *     c->num_inputs while tx_seq() indexed the TRANSACTION, which has t->nin
+ *     inputs. Nothing checked that those two agree. They do agree for every
+ *     caller in this tree, but "a distant function already checked this" is
+ *     how #13 and #21 both happened, so it is checked here now.
+ *
+ * And on failure the function simply `return`ed -- leaving the remaining
+ * h_* outputs UNINITIALIZED, which taproot_sighash then copied into the
+ * preimage. A truncated aggregate was not refused; it was hashed. Returning
+ * a status and failing closed is the entire fix for that. */
+static int ts_agg_hashes(const tapctx_t* c, const txview_t* t,
+                         uint8_t h_prev[32], uint8_t h_amt[32],
+                         uint8_t h_spk[32], uint8_t h_seq[32],
+                         const uint8_t** spk_at_nin, uint64_t* spk_at_nin_len)
 {
-    /* BIP341 aggregate hashes over all inputs -- unbounded; fixed 4096-byte
-     * stack buffers were a latent overflow (same class as incident #13's
-     * BIP143 bug). Per-thread heap, block-cap sized. */
-    #define TS_AGG_CAP (4u<<20)
-    static __thread uint8_t* buf; BMC_TLS_BUF(buf, TS_AGG_CAP);
-    /* prevouts */
+    const int64_t n = c->num_inputs;
+    /* BIP341's aggregates are over ALL of this transaction's inputs, so the
+     * caller's per-input arrays must describe exactly this transaction. */
+    if (n <= 0 || n != t->nin) return 0;
+
+    /* sha_prevouts, sha_amounts: contiguous already. No copy, no buffer. */
+    sha256_full(h_prev, c->prevouts, n * 36);
+    sha256_full(h_amt,  c->amounts,  n * 8);
+
+    /* sha_scriptpubkeys: also contiguous -- the run IS
+     * compactsize(len)||spk repeated once per input, which is precisely what
+     * BIP341 hashes. Walk it once to measure it (and to locate entry n_in),
+     * then hash it in place.
+     *
+     * This run is NOT wire data: it is built by this codebase from resolved
+     * UTXOs (daemon/tx_verify.c and bitcoin_txval_modern.c both write one
+     * single-byte compactsize per entry and refuse a scriptPubKey >= 253
+     * bytes outright). It therefore has no `end` to bound against, and the
+     * API gives none. Rather than trust that, the walk carries its own hard
+     * ceiling: TS_SPK_RUN_CAP bytes total, checked before every advance, so a
+     * corrupted length cannot run away even though it cannot be proven
+     * in-bounds. The real fix is an spks_len parameter; that is an ABI change
+     * across ~10 call sites in two .c files and five tests, deliberately not
+     * bundled into a sighash restructure. Recorded in the commit message. */
+    #define TS_SPK_RUN_CAP (4u<<20)
     {
-        size_t n = 0;
-        for (int64_t i=0;i<c->num_inputs;i++){ if(n+36>TS_AGG_CAP) return; memcpy(buf+n, c->prevouts+i*36, 36); n+=36; }
-        sha256_full(h_prev, buf, n);
-    }
-    /* amounts */
-    {
-        size_t n = 0;
-        for (int64_t i=0;i<c->num_inputs;i++){ if(n+8>TS_AGG_CAP) return; memcpy(buf+n, c->amounts+i*8, 8); n+=8; }
-        sha256_full(h_amt, buf, n);
-    }
-    /* scriptpubkeys (compactsize + data) */
-    {
-        size_t n = 0;
         const uint8_t* p = c->spks;
-        for (int64_t i=0;i<c->num_inputs;i++){
-            uint64_t sl = read_cs(&p);
-            int cs = cs_size(sl);
-            if(n+600>TS_AGG_CAP) return; memcpy(buf+n, p-cs, (size_t)cs + sl); n += (size_t)cs + sl;
+        const uint8_t* run_end = c->spks + TS_SPK_RUN_CAP;
+        int ok = 1;
+        for (int64_t i=0;i<n;i++){
+            uint64_t sl = read_cs(&p, run_end, &ok);
+            if (!ok || ts_avail(p, run_end) < sl) return 0;
+            if (i == c->n_in){ *spk_at_nin = p; *spk_at_nin_len = sl; }
             p += sl;
         }
-        sha256_full(h_spk, buf, n);
+        sha256_full(h_spk, c->spks, (int64_t)(p - c->spks));
     }
-    /* sequences */
+
+    /* sha_sequences: the only one that genuinely has to be gathered, because
+     * nSequences are 41+ bytes apart in the transaction rather than
+     * contiguous. With in_off[] that is one indexed load per input and no
+     * compactsize read at all -- it was an O(nin^2) re-walk. */
     {
-        size_t n = 0;
-        for (int64_t i=0;i<c->num_inputs;i++){ w32le(buf+n, tx_seq(t,i)); n+=4; }
-        sha256_full(h_seq, buf, n);
+        static __thread uint8_t* seqbuf; BMC_TLS_BUF(seqbuf, TS_SEQ_CAP);
+        if ((uint64_t)n * 4u > (uint64_t)TS_SEQ_CAP) return 0;   /* unreachable: see TS_SEQ_CAP */
+        size_t k = 0;
+        for (int64_t i=0;i<n;i++){ w32le(seqbuf+k, tx_seq(t,i)); k += 4; }
+        sha256_full(h_seq, seqbuf, (int64_t)k);
     }
+    return 1;
 }
 
 /* Build the full TapSighash preimage "0x00 || SigMsg || ext" into pre (cap),
@@ -226,15 +414,46 @@ static void agg_hashes(const tapctx_t* c, const txview_t* t,
  * into out32. */
 long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
 {
+    /* The single-pass offset table. Per-thread heap, not a stack array
+     * (incident #13), and single-owner: tx_parse fills it and every accessor
+     * below indexes it before this function returns. Nothing re-enters -- the
+     * only caller chain that could is script_eval -> taproot_checksig_fn ->
+     * here, which is one level deep and completes each call before the next. */
+    static __thread uint32_t* ts_off;
+    BMC_TLS_BUF(ts_off, TS_OFF_ENTRIES * sizeof(uint32_t));
+
     txview_t t; t.tx = c->tx; t.txlen = c->txlen;
-    if (!tx_parse(&t)) return 0;
+    if (!tx_parse(&t, ts_off)) return 0;
     if (c->n_in < 0 || c->n_in >= t.nin) return 0;
     if (c->n_in >= c->num_inputs) return 0;
 
     uint8_t h_prev[32], h_amt[32], h_spk[32], h_seq[32];
-    agg_hashes(c, &t, h_prev, h_amt, h_spk, h_seq);
+    const uint8_t* spk_nin = NULL; uint64_t spk_nin_len = 0;
+    if (!ts_agg_hashes(c, &t, h_prev, h_amt, h_spk, h_seq, &spk_nin, &spk_nin_len))
+        return 0;
+    if (!spk_nin) return 0;
 
     uint8_t ht = c->hash_type;
+    /* BIP341: "If the hash_type is not valid, fail." Core, interpreter.cpp
+     * (SignatureHashSchnorr):
+     *   if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)))
+     *       return false;
+     * which CheckSchnorrSignature turns into SCRIPT_ERR_SCHNORR_SIG_HASHTYPE,
+     * i.e. the input is INVALID.
+     *
+     * FOUND 2026-08-22 while building this commit's corpus proof, and
+     * PRE-EXISTING -- not something the restructure introduced. Nothing here
+     * validated hash_type at all, and hash_type is the last byte of a 65-byte
+     * Schnorr signature, so it is entirely attacker-chosen. A spend signed
+     * with hash_type 0x04 is rejected by Core and was ACCEPTED here (0x04 & 3
+     * == 0, so it took the plain sha_outputs path and produced a perfectly
+     * good hash for the spender to have signed). That is a FALSE ACCEPT on a
+     * consensus path -- a chain split, not a false reject.
+     *
+     * The 64-byte/SIGHASH_DEFAULT rule and the 65-byte-with-0x00 rule are
+     * already enforced by the four callers below, which is also where Core
+     * puts them (CheckSchnorrSignature, before it hashes anything). */
+    if (!(ht <= 0x03 || (ht >= 0x81 && ht <= 0x83))) return 0;
     uint8_t eff = (ht == 0) ? 1 : ht;
     int acp  = (eff & 0x80) != 0;
     int is_single = (eff & 0x03) == 3;
@@ -259,23 +478,21 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
         memcpy(p, h_spk,  32); p+=32;
         memcpy(p, h_seq,  32); p+=32;
     }
-    /* sha_outputs (not NONE, not SINGLE) */
+    /* sha_outputs (not NONE, not SINGLE) -- IN PLACE over the transaction's
+     * own bytes. See the txview_t header comment: a CTxOut's BIP341
+     * serialization is byte for byte its wire encoding, so all outputs
+     * concatenated are exactly the contiguous slice [out_off[0],
+     * out_off[nout]).
+     *
+     * What is gone: a staging buffer fed by ser_txout_len() + ser_txout()
+     * once per output -- three O(nout) walks per output, i.e. three O(nout^2)
+     * walks per call, and this whole block ran once per input. Also gone with
+     * it: ser_txout_len()'s `int` return, which for a scriptPubKey of
+     * 0x100000000 bytes truncated to 13 and let ser_txout() memcpy 4 GiB.
+     * Nothing is copied now, so nothing can overrun. */
     if (!is_none && !is_single){
-        /* All outputs concatenated. Was a fixed obuf[1024] that RETURNED 0
-         * when exceeded -- i.e. a false reject for any taproot tx with more
-         * than ~30 outputs -- and a per-txout tmp[600] with no bound (a
-         * >590-byte scriptPubKey overran the stack). Per-thread heap buffer
-         * sized to the block cap, each txout bounds-checked before it is
-         * serialized in place. */
-        static __thread uint8_t* obuf; BMC_TLS_BUF(obuf, TS_AGG_CAP); size_t on = 0;
-        for (int64_t i=0;i<t.nout;i++){
-            int len = ser_txout_len(&t, i);
-            if (len <= 0 || on + (size_t)len > TS_AGG_CAP) return 0;
-            int n = ser_txout(&t, i, obuf + on);
-            if (n != len) return 0;
-            on += (size_t)n;
-        }
-        uint8_t ho[32]; sha256_full(ho, obuf, on);
+        uint64_t olen; const uint8_t* obytes = tx_txout_range(&t, 0, t.nout, &olen);
+        uint8_t ho[32]; sha256_full(ho, obytes, (int64_t)olen);
         if (p + 32 > pend) return 0; memcpy(p, ho, 32); p += 32;
     }
     /* spend_type = ext_flag*2 | annex_present (BIP341 bit0 = annex present) */
@@ -289,13 +506,14 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
         uint64_t amt; const uint8_t* a = c->amounts + c->n_in*8;
         amt = 0; for(int b=0;b<8;b++) amt |= (uint64_t)a[b]<<(8*b);
         if (p + 8 > pend) return 0; w64le(p, amt); p += 8;
-        /* scriptPubKey: find index n_in spk in c->spks */
-        const uint8_t* sp = c->spks;
-        for (int64_t i=0;i<c->n_in;i++){ uint64_t sl = read_cs(&sp); sp += sl; }
-        uint64_t sl = read_cs(&sp);
-        if ((uint64_t)(p - pre) + cs_size(sl) + (uint64_t)sl > (uint64_t)cap) return 0;
+        /* scriptPubKey of the spent output being signed. ts_agg_hashes
+         * located it during the walk it had to do anyway; this used to be a
+         * SECOND unbounded walk of the spks run, from the start, with an
+         * unbounded read_cs. */
+        uint64_t sl = spk_nin_len;
+        if (cap < 0 || (uint64_t)(cap - (p - pre)) < (uint64_t)cs_size(sl) + sl) return 0;
         put_cs(p, sl); p += cs_size(sl);
-        memcpy(p, sp, sl); p += sl;
+        memcpy(p, spk_nin, sl); p += sl;
         /* nSequence */
         uint32_t seq = tx_seq(&t, c->n_in);
         if (p + 4 > pend) return 0; w32le(p, seq); p += 4;
@@ -305,24 +523,46 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     }
     /* annex (BIP341): sha256(compactsize(len) || annex) */
     if (annex_present){
-        static __thread uint8_t* abuf; BMC_TLS_BUF(abuf, TS_AGG_CAP); size_t an = 0;
-        if (cs_size(c->annexlen)+(size_t)c->annexlen > TS_AGG_CAP) return 0;
+        /* sha256(compactsize(len) || annex) -- Core: (HashWriter{} << annex)
+         * .GetSHA256(), interpreter.cpp:1964. The annex is a witness stack
+         * item, so its length is bounded by the block size; the prefix is at
+         * most 9 bytes. The `> CAP - 9` form avoids the overflow that
+         * `cs_size + annexlen > CAP` has for an annexlen near 2^64. */
+        #define TS_ANNEX_CAP ((4u<<20) + 9u)
+        static __thread uint8_t* abuf; BMC_TLS_BUF(abuf, TS_ANNEX_CAP); size_t an = 0;
+        if (c->annexlen > (uint64_t)TS_ANNEX_CAP - 9u) return 0;
         put_cs(abuf, c->annexlen); an += cs_size(c->annexlen);
         memcpy(abuf+an, c->annex, (size_t)c->annexlen); an += (size_t)c->annexlen;
-        uint8_t ha[32]; sha256_full(ha, abuf, an);
+        uint8_t ha[32]; sha256_full(ha, abuf, (int64_t)an);
         if (p + 32 > pend) return 0; memcpy(p, ha, 32); p += 32;
     }
-    /* SINGLE: sha_single_output */
+    /* SINGLE: sha_single_output -- in place, same property as sha_outputs,
+     * over the one-output slice [out_off[n_in], out_off[n_in+1]). */
     if (is_single){
         if (c->n_in < t.nout){
-            int n1 = ser_txout_len(&t, c->n_in);
-            if (n1 <= 0 || (size_t)n1 > TS_AGG_CAP) return 0;
-            static __thread uint8_t* tmp; BMC_TLS_BUF(tmp, TS_AGG_CAP);
-            int n = ser_txout(&t, c->n_in, tmp); if (n != n1) return 0;
-            uint8_t hs[32]; sha256_full(hs, tmp, n);
+            uint64_t slen1; const uint8_t* sbytes =
+                tx_txout_range(&t, c->n_in, c->n_in + 1, &slen1);
+            uint8_t hs[32]; sha256_full(hs, sbytes, (int64_t)slen1);
             if (p + 32 > pend) return 0; memcpy(p, hs, 32); p += 32;
         } else {
-            if (p + 32 > pend) return 0; memset(p, 0, 32); p += 32;
+            /* Core, interpreter.cpp, in the SIGHASH_SINGLE branch:
+             *     if (in_pos >= tx_to.vout.size()) return false;
+             * -- there is no such thing as a taproot SIGHASH_SINGLE over a
+             * non-existent output. BIP143 does substitute a zero hash in this
+             * position and BIP341 deliberately does NOT, and this file had
+             * carried the BIP143 behaviour over: it wrote 32 zero bytes and
+             * returned a usable sighash for an input index past the end of
+             * the output list.
+             *
+             * FOUND 2026-08-22, PRE-EXISTING, same class as the hash_type
+             * check above: Core rejects the input, we accepted it, so any
+             * spender willing to sign that hash could have split us off the
+             * chain. 130 of the 945 vectors in the first smoke run of
+             * validation/diff_bip341_corpus.py are exactly this case on real
+             * mainnet transactions -- it is not a corner that needs
+             * constructing. Fail closed, which is now byte-for-byte Core's
+             * accept/reject boundary. */
+            return 0;
         }
     }
     /* BIP342 ext (tapscript) */
@@ -362,8 +602,9 @@ int taproot_keypath_verify(const uint8_t* spk, const uint8_t* sig, int siglen,
     c.num_inputs = num_inputs; c.ext_flag = 0; c.tapleaf = NULL; c.codesep_pos = 0xffffffff;
     c.annex = NULL; c.annexlen = 0;
 
-    uint8_t pre[256]; uint8_t hash[32];
-    if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;
+    static __thread uint8_t* pre; BMC_TLS_BUF(pre, TS_PRE_CAP);
+    uint8_t hash[32];
+    if (taproot_sighash(hash, &c, pre, (long)TS_PRE_CAP) <= 0) return 0;
     return schnorr_verify(sig, spk+2, hash, 32);
 }
 
@@ -389,8 +630,9 @@ int taproot_keypath_verify_annex(const uint8_t* spk, const uint8_t* sig, int sig
     c.num_inputs = num_inputs; c.ext_flag = 0; c.tapleaf = NULL; c.codesep_pos = 0xffffffff;
     c.annex = annex; c.annexlen = annexlen;
 
-    uint8_t pre[256]; uint8_t hash[32];
-    if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;
+    static __thread uint8_t* pre; BMC_TLS_BUF(pre, TS_PRE_CAP);
+    uint8_t hash[32];
+    if (taproot_sighash(hash, &c, pre, (long)TS_PRE_CAP) <= 0) return 0;
     if (out_hash) memcpy(out_hash, hash, 32);
     return schnorr_verify(sig, spk+2, hash, 32);
 }
@@ -457,8 +699,9 @@ int tapscript_checksig_annex(const uint8_t* sig, int siglen, const uint8_t* pubk
     c.codesep_pos = codesep_pos;
     c.annex = annex; c.annexlen = annexlen;
 
-    uint8_t pre[256]; uint8_t hash[32];
-    if (taproot_sighash(hash, &c, pre, sizeof(pre)) <= 0) return 0;
+    static __thread uint8_t* pre; BMC_TLS_BUF(pre, TS_PRE_CAP);
+    uint8_t hash[32];
+    if (taproot_sighash(hash, &c, pre, (long)TS_PRE_CAP) <= 0) return 0;
     if (out_hash) memcpy(out_hash, hash, 32);
     return schnorr_verify(sig, pubkey, hash, 32);
 }
@@ -810,11 +1053,20 @@ int taproot_verify_input(const uint8_t* spk,
      * tx_parse/tx_seq read version/locktime/nSequence directly (keeping this
      * translation unit self-contained; no cross-object link dependency). */
     st.flags = TS_SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY | TS_SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
-    txview_t tvctx = { tx, txlen, 0, 0, NULL, NULL, 0, 0 };
-    if (tx_parse(&tvctx) && n_in >= 0 && n_in < tvctx.nin) {
-        st.tx_version  = (uint32_t)tvctx.version;
-        st.tx_locktime = tvctx.locktime;
-        st.in_sequence = tx_seq(&tvctx, n_in);
+    {
+        /* Read version/locktime/nSequence out IMMEDIATELY and let the view
+         * die here. taproot_sighash() owns the same per-thread offset table,
+         * and script_eval() below re-enters it once per CHECKSIG -- so this
+         * view must not outlive this block. It does not: all three values are
+         * plain scalars copied into st before script_eval is called. */
+        static __thread uint32_t* tv_off;
+        BMC_TLS_BUF(tv_off, TS_OFF_ENTRIES * sizeof(uint32_t));
+        txview_t tvctx; tvctx.tx = tx; tvctx.txlen = txlen;
+        if (tx_parse(&tvctx, tv_off) && n_in >= 0 && n_in < tvctx.nin) {
+            st.tx_version  = (uint32_t)tvctx.version;
+            st.tx_locktime = tvctx.locktime;
+            st.in_sequence = tx_seq(&tvctx, n_in);
+        }
     }
     st.work = ts_work; st.work_cap = 1<<16;
     uint64_t err = 0; st.error_out = &err;

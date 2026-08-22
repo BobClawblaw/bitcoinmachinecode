@@ -1681,3 +1681,100 @@ Not the representation. The remaining structure is in the call *pattern*:
   verification at ~2.2 and ~1.3 ns, ≈ 4.4 µs or 18 % of a verify, most of it
   loads, stores and call overhead rather than arithmetic. This — not 5×52 —
   is where libsecp256k1's remaining advantage lives.
+
+## 10. Lever 1, taproot half — single-pass BIP341 precompute, 2026-08-22
+
+§8.5 named `bitcoin_taproot_sighash.c` as the next lever and as the same bug:
+`tx_seq`, `tx_outpoint`, `ser_txout` and `ser_txout_len` each walked from the
+start on every call, `ser_txout_len` walked the outputs *twice*, and BIP341's
+aggregates call them once per input/output while `taproot_sighash()` is itself
+called once per input — O(nin³) per transaction. All of that is confirmed and
+fixed (branch `taproot-precompute`); the design is in the file's comments and
+in `LOG.md`, and the two consensus divergences found while proving it are in
+`LOG.md` too, not here, because they are not performance.
+
+One design point that had to be checked rather than assumed, since BIP341 is
+not BIP143: **a CTxOut's BIP341 serialization is also byte for byte its wire
+encoding**, so `sha_outputs` is one sha256 over a contiguous slice of the
+transaction, in place. BIP341's separate `sha_amounts` and `sha_scriptpubkeys`
+are over the *spent* outputs, which are not in this transaction at all, so
+they are not a counterexample — and they turn out to need no copying either,
+because the caller already supplies them contiguously.
+
+### 10.1 Microbenchmark — `tests/bench_taproot_sighash`
+
+New and permanent (`make tests/bench_taproot_sighash`), `-O2`, CPU time
+(`CLOCK_PROCESS_CPUTIME_ID`), min of 15, both builds back to back. Same five
+shapes as §8.1 so the two tables are directly comparable. Key-path;
+script-path is +0.03–0.04 µs on both builds and otherwise identical.
+
+| shape | before | after | factor |
+|---|---|---|---|
+| 1 in / 2 out | 0.4001 µs | **0.3875 µs** | 1.03× |
+| 2 in / 2 out | 0.4699 µs | **0.4487 µs** | 1.05× |
+| 100 in / 5 out | 9.7203 µs | **4.3148 µs** | 2.25× |
+| 1,372 in / 100 out | 1.1254 ms | **54.360 µs** | 20.70× |
+| 2 in / 3,000 out | 18.177 ms | **43.318 µs** | 419× |
+
+**The common case is not pessimised**, checked the same way §8.1 checked it
+and then three more times: across four interleaved min-of-15 repeats the new
+build is at or below the old in *every* repeat of the 1- and 2-input shapes,
+key-path and script-path, by 2–5%, with non-overlapping distributions on the
+2-input rows. Per-thread resident scratch also falls, 4 MiB → 2.29 MiB.
+
+### 10.2 Real blocks
+
+19,870 taproot inputs across 12,014 transactions from heights 825,000 /
+830,000 / 842,000 / 865,000 / 910,000 — the five largest taproot input counts
+out of 38 blocks scanned in 709,700–963,000, capturing both the
+inscription-era script-path regime and the large-consolidation regime. Real
+witness-stripped serializations (real input/output counts and script sizes);
+spent outputs synthetic 34-byte P2TR, which is the correct size and does not
+affect cost. CPU time, min of 15:
+
+| | total | µs / taproot input |
+|---|---|---|
+| before | 4,577.85 ms | 230.39 |
+| after | **243.35 ms** | **12.25** |
+| | **18.81×** | |
+
+| height | taproot inputs | before | after | factor |
+|---|---|---|---|---|
+| 825,000 | 3,379 | 2.25 ms | 1.68 ms | 1.33× |
+| 830,000 | 3,661 | 3,833.15 ms | 195.65 ms | **19.59×** |
+| 842,000 | 4,274 | 68.00 ms | 5.39 ms | 12.61× |
+| 865,000 | 4,295 | 2.87 ms | 2.15 ms | 1.33× |
+| 910,000 | 4,261 | 766.24 ms | 65.72 ms | 11.66× |
+
+Ordinary 1–3 input taproot blocks gain a flat ~1.33×; the block carrying a
+1,500-input consolidation goes from 3.83 s of sighashing to 196 ms.
+
+### 10.3 No end-to-end projection, deliberately
+
+§7 exists because a projection off a stale share said 1.40× and delivered
+1.15×. This path is worse than stale: it has **never been profiled live**,
+because the replay has not reached 709,632. Its share of taproot-era cycles is
+unknown, so no Amdahl bound can honestly be stated here. The figure that does
+not depend on a share is the 18.81× on the component. Re-profile after the
+replay passes activation — that is the measurement that would let this be
+turned into an end-to-end number.
+
+### 10.4 What is left on this path — and it is bigger here than it was for BIP143
+
+`taproot_sighash()` still runs the single pass and re-hashes the O(nin)
+prevouts/amounts/spks arrays on **every** call, once per input. Only the inner
+re-walk was removed. That is why the 1,372-input shape is still 54 µs/call and
+why block 830,000 still costs 53 µs per taproot input afterwards.
+
+Core hoists exactly this to once per transaction. §8.6 priced the equivalent
+for BIP143 and rejected it — no transaction-scoped context to hang a cache on,
+and a thread-local keyed on the transaction's address and length is not sound.
+The same objection applies, but the *prize* is larger here: BIP341 has four
+aggregate hashes rather than three, and one of them (`sha_scriptpubkeys`) is
+over variable-length data. §8.6's arithmetic said the BIP143 cache would buy
+~2× on the rarest shape and ~0 on the common one; here the 1,372-input shape
+would go from 74.6 ms per transaction to roughly one call plus 1,372 cheap
+tail assemblies. If this path is ever re-profiled hot, this is the lever —
+and the sound way to do it is to thread a real per-transaction context down
+from `taproot_verify_input()`, which already exists per input and would only
+need to be created one level up, rather than to key a cache on an address.
