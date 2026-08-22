@@ -111,6 +111,29 @@ int main(void){
       q[8]^=0x01; }
   }
 
+  /* ---- synthetic: an over-limit witness (>TXV_MAX_WIT_ITEMS=1004) is REJECTED
+   * at parse with the right reason, not a crash. Parse runs before UTXO
+   * resolution, so no valid prevout is needed. ---- */
+  {
+    static u8 t[8192]; int n=0;
+    const u8 hdr[]={0x02,0,0,0, 0x00,0x01, 0x01};           /* version, marker/flag, nin=1 */
+    memcpy(t+n,hdr,sizeof hdr); n+=sizeof hdr;
+    memset(t+n,0,36); n+=36;                                 /* outpoint (32+4) */
+    t[n++]=0x00;                                             /* scriptSig len 0 */
+    memset(t+n,0xff,4); n+=4;                                /* sequence */
+    t[n++]=0x01;                                             /* nout=1 */
+    memset(t+n,0,8); n+=8;                                   /* value */
+    t[n++]=0x01; t[n++]=0x51;                                /* spk len 1, OP_1 */
+    /* witness for input 0: nitems=1005 as compactsize fd ed 03, then 1005 empty items */
+    t[n++]=0xfd; t[n++]=0xed; t[n++]=0x03;                   /* 1005 LE */
+    for(int i=0;i<1005;i++) t[n++]=0x00;                     /* each item length 0 */
+    memset(t+n,0,4); n+=4;                                   /* locktime */
+    u8 bh0[32]={0}; const char* rs="?";
+    int r=tx_verify_block_connect(t,(u64)n,500000,bh0,&g_lst,g_tab,&rs);
+    ck("1005-item witness is REJECTED (over TXV_MAX_WIT_ITEMS)", r==0 && rs && strstr(rs,"too many witness items")!=NULL);
+    if(r!=0||!rs||!strstr(rs,"too many witness items")) printf("       got r=%d reason=%s\n", r, rs?rs:"(null)");
+  }
+
   printf("\n%s (%d/%d)\n", fails?"TESTS FAILED":"ALL PASS", checks-fails, checks);
   return fails?1:0;
 }
