@@ -250,7 +250,8 @@ def build_p2wpkh(seckey, idx_tag):
     }
     # prevout to spend: index 0 of txid_in, value 100000, script = spk (P2WPKH)
     amount = 100000
-    scriptCode = spk  # P2WPKH scriptCode == the scriptPubKey
+    # BIP143: P2WPKH scriptCode is the implied P2PKH script, not the program
+    scriptCode = b'\x76\xa9\x14' + spk[2:22] + b'\x88\xac'
     sighash, pre = bip143_sighash(scriptCode, txv, 0, SIGHASH_ALL, amount)
     sig = der_with_hashtype(sighash, seckey, SIGHASH_ALL)
     assert ecdsa_verify_digest(pub33, sighash, sig)
