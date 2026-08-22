@@ -80,17 +80,20 @@ extern void be_to_limbs(uint64_t out[4], const uint8_t* be, unsigned long n);
 #define SV_P2SH        (1ULL<<0)
 #define SV_SIGPUSHONLY (1ULL<<5)
 #define SV_CLEANSTACK  (1ULL<<8)
+#define SV_WITNESS     (1ULL<<11)
+#define SIGV_WITNESS_V0 1
+#define MAX_SCRIPT_ELEMENT_SIZE 520
 
 /* ------------------------------------------------------------------ stack */
 typedef struct { uint8_t* e; size_t sp; } sv_stack;
 
-static uint8_t* sv_rec(sv_stack* s, size_t i){ return s->e + i*ELEM_SIZE; }
-static uint32_t sv_len(sv_stack* s, size_t i){ return *(uint32_t*)sv_rec(s,i); }
-static const uint8_t* sv_dat(sv_stack* s, size_t i){ return sv_rec(s,i)+ELEM_DATA_OFF; }
+uint8_t* sv_rec(sv_stack* s, size_t i){ return s->e + i*ELEM_SIZE; }
+uint32_t sv_len(sv_stack* s, size_t i){ return *(uint32_t*)sv_rec(s,i); }
+const uint8_t* sv_dat(sv_stack* s, size_t i){ return sv_rec(s,i)+ELEM_DATA_OFF; }
 
 /* CastToBool: false only for empty, or a value that is entirely zero bytes
  * with an optional negative-zero sign bit on the last one. */
-static int sv_true(sv_stack* s, size_t i){
+int sv_true(sv_stack* s, size_t i){
     uint32_t n = sv_len(s,i);
     const uint8_t* d = sv_dat(s,i);
     for (uint32_t k=0;k<n;k++){
@@ -107,7 +110,14 @@ struct sv_ctx {
     const uint8_t* tx; unsigned long txlen; unsigned long nIn;
     uint8_t* work; unsigned long workcap;
     uint32_t tx_locktime; uint32_t in_sequence; uint32_t tx_version;
+    uint64_t amount;               /* prevout value -- BIP143 sighash input (witness v0 only) */
 };
+extern long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
+                              int64_t n_in, uint32_t nHashType, uint64_t amount,
+                              const uint8_t* scriptCode, uint64_t scriptcode_len,
+                              uint8_t* pre, long cap);
+extern void sha256_full(uint8_t* out, const void* msg, int64_t len);
+extern void hash160(uint8_t o[20], const void* in, long long len);
 
 /* sv_get_locktime_context: pull tx.nVersion, tx.nLockTime, and input nIn's
  * nSequence out of the raw tx bytes sv_verify_script already receives --
@@ -120,7 +130,7 @@ struct sv_ctx {
  * nIn (caller must already have validated nIn against the real input count
  * via some other path -- this is read-only script verification support, not
  * itself a structural validity check). */
-static int sv_get_locktime_context(const uint8_t* tx, unsigned long txlen, unsigned long nIn,
+int sv_get_locktime_context(const uint8_t* tx, unsigned long txlen, unsigned long nIn,
                                    uint32_t* out_version, uint32_t* out_locktime, uint32_t* out_sequence){
     if (txlen < 8) return 0;
     memcpy(out_version, tx, 4);
@@ -218,7 +228,7 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
 }
 
 /* ------------------------------------------------------------ script shape */
-static int sv_is_p2sh(const uint8_t* spk, size_t spl){
+int sv_is_p2sh(const uint8_t* spk, size_t spl){
     return spl==23 && spk[0]==0xa9 && spk[1]==0x14 && spk[22]==0x87;
 }
 
@@ -252,8 +262,9 @@ static int sv_push_only(const uint8_t* s, size_t n){
 }
 
 /* ------------------------------------------------------------------ driver */
-static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
-                  uint64_t flags, struct sv_ctx* ctx, int* err){
+int sv_run_v(const uint8_t* script, size_t slen, sv_stack* st,
+                    uint64_t flags, struct sv_ctx* ctx, int* err, int sigversion,
+                    uint64_t (*cs)(void*, const uint8_t*, size_t, const uint8_t*, size_t, const void*)){
     static __thread uint8_t alt[MAX_STACK*ELEM_SIZE];
     static __thread uint8_t scratch[1<<16];
     static __thread uint8_t scopy[20000];
@@ -266,12 +277,12 @@ static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
     s.main_elems = st->e;  s.main_sp = st->sp;
     s.alt_elems  = alt;    s.alt_sp  = 0;
     s.script     = scopy;  s.script_len = slen;
-    s.sigversion = SIGV_BASE;
+    s.sigversion = sigversion;
     s.flags      = flags;
     s.work       = scratch; s.work_cap = sizeof scratch;
     s.error_out  = &e;
     s.checksig_ctx = ctx;
-    s.checksig_fn  = sv_checksig;
+    s.checksig_fn  = cs;
     s.tx_locktime  = ctx->tx_locktime;
     s.in_sequence  = ctx->in_sequence;
     s.tx_version   = ctx->tx_version;
@@ -280,6 +291,10 @@ static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
     st->sp = s.main_sp;
     if (!ok){ *err = (int)e; return 0; }
     return 1;
+}
+static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
+                  uint64_t flags, struct sv_ctx* ctx, int* err){
+    return sv_run_v(script, slen, st, flags, ctx, err, SIGV_BASE, sv_checksig);
 }
 
 int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,

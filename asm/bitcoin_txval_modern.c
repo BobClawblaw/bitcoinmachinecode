@@ -23,6 +23,16 @@ extern int  p2wpkh_verify(const uint8_t* tx, int64_t txlen, int64_t n_in,
                           const uint8_t* prev_spk, int64_t prev_spklen, uint64_t amount,
                           const uint8_t* vchSig, uint64_t siglen,
                           const uint8_t* vchPub, uint64_t publen);
+extern int  sv_classify_segwit(const uint8_t* spk, uint32_t spl, const uint8_t* ss, uint32_t ssl,
+                               uint32_t* version, const uint8_t** prog, uint32_t* proglen, int* wrapped);
+extern int  sv_verify_witness_v0(const uint8_t* prog, uint32_t proglen,
+                                 const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
+                                 uint64_t amount, unsigned long long flags, unsigned long nIn,
+                                 const uint8_t* tx, unsigned long txlen, uint8_t* work, unsigned long workcap);
+/* Mempool script flags for witness-v0 execution: the consensus set this
+ * validator already implies (P2SH, DERSIG, NULLDUMMY, CLTV, CSV, WITNESS)
+ * plus CLEANSTACK, which witness execution requires anyway. Core bit values. */
+#define MV_WITNESS_FLAGS ((1ULL<<0)|(1ULL<<2)|(1ULL<<4)|(1ULL<<8)|(1ULL<<9)|(1ULL<<10)|(1ULL<<11))
 extern int  p2wsh_verify_checksig(const uint8_t* tx, int64_t txlen, int64_t n_in,
                                   uint64_t amount, const uint8_t* witness_script,
                                   uint64_t wslen, const uint8_t* vchSig, uint64_t siglen,
@@ -63,7 +73,7 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
 #define PREV_SPK_BUF_MAX 42
 typedef struct {
     uint8_t outpoint[36];
-    uint8_t scriptSig[32]; uint32_t scriptSiglen;
+    uint8_t scriptSig[64]; uint32_t scriptSiglen;   /* 35 for P2SH-P2WSH (0x22 + 34); was 32, which silently truncated it */
     uint32_t sequence;
     const uint8_t* wit[16]; uint32_t witlen[16]; uint32_t nwit;
     uint64_t amount;
@@ -171,6 +181,7 @@ static const char* g_reason = "accepted";
  * Whole-tx modern validation. `utxo` is the confirmed-UTXO set providing the
  * prevout scripts/amounts. Returns 1 = accept, 0 = reject (reason in g_reason).
  * ========================================================================== */
+const char* txval_last_reason(void){ return g_reason; }
 int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
     g_reason = "accepted";
     mv_tx_t T; memset(&T, 0, sizeof T); T.tx = tx; T.txlen = txlen;
@@ -190,43 +201,27 @@ int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
         const uint8_t* spk = in->prev_spk;
         uint32_t sl = in->prev_spklen;
 
-        /* ---- P2WPKH: 00 14 <20> ; witness [sig, pub] ---- */
-        if (sl == 22 && spk[0]==0x00 && spk[1]==0x14){
-            if (in->scriptSiglen != 0){ g_reason="p2wpkh scriptSig must be empty"; return 0; }
-            if (in->nwit != 2){ g_reason="p2wpkh needs 2 witness items"; return 0; }
-            if (!p2wpkh_verify(tx, txlen, (int64_t)i, spk, sl, in->amount,
-                               in->wit[0], in->witlen[0], in->wit[1], in->witlen[1])){
-                g_reason = "p2wpkh signature invalid"; return 0; }
-            continue;
-        }
-        /* ---- P2WSH: 00 20 <32> ; witness [... , witnessScript] ---- */
-        if (sl == 34 && spk[0]==0x00 && spk[1]==0x20){
-            if (in->scriptSiglen != 0){ g_reason="p2wsh scriptSig must be empty"; return 0; }
-            if (in->nwit < 2){ g_reason="p2wsh needs witnessScript"; return 0; }
-            const uint8_t* ws = in->wit[in->nwit-1];
-            uint32_t wslen = in->witlen[in->nwit-1];
-            /* OP_CHECKSIG form: <0x21 pub> 0xac ; witness [sig, script] */
-            if (wslen >= 34 && ws[0]==0x21 && ws[wslen-1]==0xac){
-                if (!p2wsh_verify_checksig(tx, txlen, (int64_t)i, in->amount,
-                                           ws, wslen, in->wit[0], in->witlen[0],
-                                           ws+1, 33)){
-                    g_reason = "p2wsh checksig invalid"; return 0; }
+        /* ---- witness v0, native (00 14 <20> / 00 20 <32>) or P2SH-wrapped
+         * (BIP141 P2SH-P2WPKH / P2SH-P2WSH): one general path through the
+         * shared interpreter (sv_verify_witness_v0), replacing the former
+         * two-shape fast paths (single CHECKSIG, 2-of-2 CHECKMULTISIG) that
+         * could not verify the real chain (2026-08-22). ---- */
+        {
+            uint32_t wver=0, wplen=0; const uint8_t* wprog=0; int wrapped=0;
+            int cls = sv_classify_segwit(spk, sl, in->scriptSig, in->scriptSiglen, &wver, &wprog, &wplen, &wrapped);
+            if (cls < 0){ g_reason = "p2sh-wrapped witness program: malformed scriptSig"; return 0; }
+            if (cls > 0 && !(wver == 1 && wplen == 32 && !wrapped)){   /* native v1/32 = taproot, handled below */
+                if (!wrapped && in->scriptSiglen != 0){ g_reason = "witness program scriptSig must be empty"; return 0; }
+                if (wver != 0){ g_reason = "unknown witness version (policy: discouraged)"; return 0; }
+                if (wplen == 20 && in->nwit != 2){ g_reason = "p2wpkh needs 2 witness items"; return 0; }
+                if (wplen == 32 && in->nwit < 1){ g_reason = "p2wsh needs witnessScript"; return 0; }
+                static __thread uint8_t sv_work[1<<20];
+                int err = sv_verify_witness_v0(wprog, wplen, in->wit, in->witlen, in->nwit, in->amount,
+                                               MV_WITNESS_FLAGS, (unsigned long)i, tx, (unsigned long)txlen,
+                                               sv_work, sizeof sv_work);
+                if (err != 0){ g_reason = wplen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
                 continue;
             }
-            /* 2-of-2 CHECKMULTISIG: 52 <21 p1> <21 p2> 52 ae ; witness
-             * [dummy, sig2, sig1, script] where stack order puts sig1 on top
-             * (CHECKMULTISIG tries pub1 against sig1, pub2 against sig2) */
-            if (wslen >= 3+33+33 && ws[0]==0x52 && ws[wslen-1]==0xae){
-                if (in->nwit < 4){ g_reason="p2wsh multisig needs 4 witness items"; return 0; }
-                if (!p2wsh_verify_multisig(tx, txlen, (int64_t)i, in->amount, ws, wslen,
-                                           in->wit[2], in->witlen[2],
-                                           in->wit[1], in->witlen[1],
-                                           ws+2, ws+36)){
-                    g_reason = "p2wsh multisig invalid"; return 0; }
-                continue;
-            }
-            g_reason = "unsupported p2wsh witnessScript";
-            return 0;
         }
         /* ---- P2TR: 51 20 <32> ; witness [sig] (key-path) ---- */
         if (sl == 34 && spk[0]==0x51 && spk[1]==0x20){
