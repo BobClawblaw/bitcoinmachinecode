@@ -477,20 +477,48 @@ field representation and the G side, as noted above.
   CPU path 1.46× *faster* than GPU on 2026-08-21). Shelved until the node
   is stable at tip and GPU capacity is actually available.
 
+## 4.6 Post-deploy profile — 2026-08-22 04:45 UTC, height ≈ 390 k
+
+All of 4.1, 4.2 A+B and 4.3 deployed. Clean self-time `perf` (no call
+graph), symbol-resolved against `/proc/<pid>/exe`, 204 k samples:
+
+| share of all cycles | what |
+|---|---|
+| **74.0 %** | secp256k1 / hashing (`fe_*`, `sc_*`, `point_*`, `sha256`) |
+| 14.2 % | libc (`memcpy`/`memmove` in block parsing and the verify pool) |
+| 5.1 % | kernel — **was 31–38 %**; the LSM I/O wall is gone |
+| 1.1 % | script interpreter |
+| 0.9 % | UTXO apply / LSM |
+| 0.1 % | verify-pool dispatch |
+
+Top symbols: **`fe_mul` 55.9 %**, `fe_add` 4.1 %, `sc_inv_var` 3.6 %,
+`fe_sub` 3.3 %, `sha256_block_shani` 1.4 %, `point_scalar_mul_glv` 1.2 %,
+`point_double` 1.1 %. `point_scalar_mul` (the non-GLV path) is 0.00 % —
+GLV is executing, no fallback; `sc_inv`/`fe_inv` are 0.00 %;
+`mac_read_exact2` is 0.00 % — the mmap path serves every lookup.
+
+**Reading:** the replay is now almost purely bound by the field multiply.
+GLV cut the *number* of point operations (≈ 252 → 128 doublings) but each
+still costs our ~290-instruction 4×64-limb `fe_mul` with full reduction.
+libsecp256k1's 5×52-limb lazy-reduction `fe_mul` is ~4–5× cheaper per call;
+that representation change is the next lever and the last large one on the
+crypto side (then the G-side `WINDOW_G`=15 tables, ≈ 5–6 µs).
+
 ## 5. Summary
 
-At height ≈ 430 k with full verification on, ~85 % of all cycles are split
-between secp256k1 field/scalar arithmetic (≈ 53 %) and UTXO LSM read I/O
-(≈ 31 %). Reaching full-verification Core parity means attacking both.
+Session result, all deployed and running on the live rebuild:
 
-The measured 5.5× crypto gap (§1) means the two fronts are closer in size
-than the cycle split alone suggests: if the crypto side reached
-libsecp256k1 speed, its 53 % would shrink to roughly 10 % of today's
-cycles, leaving LSM I/O as the dominant cost by a wide margin.
+| | before (08-21 AM) | after (08-22 04:45) |
+|---|---|---|
+| `ecdsa_verify` | 115–121 µs | **~39 µs** (loaded: 44) |
+| vs libsecp256k1 on this CPU (21.8 µs) | 5.2× slower | **1.65× slower** |
+| kernel (I/O) share of cycles | 31–38 % | **5 %** |
+| replay, identical heights 343087→363086 | 7.8 blk/s | **34.1 blk/s (4.39×)** |
 
-Order of attack once the replay reaches tip, revised after the §4.2
-inventory: **4.1 (LSM) → 4.2 A+B (projective compare + var-time scalar
-inverse, ~25 % of all cycles for two contained routines) → 4.3 (GLV+wNAF,
-which attacks the ~57 µs of point arithmetic that remains) → 4.2 B′**.
-4.2 and 4.3 together have a measured ceiling to aim at — 21.8 µs/verify on
-this CPU — not a guessed one.
+The two walls the first profile found — inversions and bloom copies — are
+both gone. What remains is `fe_mul` at 56 % of cycles: **field
+representation (5×52 lazy reduction) is the next scope**, projected to take
+`fe_mul` from ~290 to ~70 Ir and the verify from ~39 µs to the low 20s —
+i.e. parity with libsecp256k1 is now one representation change away, not a
+stack of them. Order after that: G-side tables (4.5), then whatever the next
+clean profile shows.
