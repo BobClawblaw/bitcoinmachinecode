@@ -523,3 +523,27 @@ representation (5×52 lazy reduction) is the next scope**, projected to take
 i.e. parity with libsecp256k1 is now one representation change away, not a
 stack of them. Order after that: G-side tables (4.5), then whatever the next
 clean profile shows.
+
+### 5.1 Sustained throughput at depth — 2026-08-22 evening
+
+The multipliers above are **baseline-matched**: same heights, old code vs
+new. They are the honest way to measure a code change, but they are not the
+number you want for "how long to tip", because block density keeps rising.
+One clean uninterrupted run, measured end to end on the deployed binary:
+
+| span | wall clock | rate |
+|---|---|---|
+| 537,616 → 575,833 (38,217 blocks) | 16:35:23 → 17:38:59 (3,816 s) | **10.0 blk/s** |
+
+Full signature verification, no `assumevalid`, 16 verify threads, mmap run
+cache on. That is ~3.4× slower than the 34.1 blk/s measured at 343k–363k —
+almost entirely block density (inputs per block), not a regression: the
+343k-era blocks predate segwit and carry a fraction of the signature work.
+Treat 10 blk/s as the current realistic planning figure for the 500k–600k
+band and expect it to keep falling through the taproot/inscription era.
+
+A caveat for anyone projecting from this: raising `stopatheight` to extend
+the download ceiling **pauses the replay entirely** for the duration of the
+download leg (they do not interleave), so wall-clock to tip includes those
+pauses — roughly 20 minutes per 58k blocks fetched from the local oracle at
+~30 blk/s.
