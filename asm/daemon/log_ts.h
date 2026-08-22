@@ -18,23 +18,33 @@
 #include <stdarg.h>
 #include <time.h>
 
-static void log_ts_prefix(void) {
+/* One line = one write. The old version wrote the timestamp prefix and the
+ * message as TWO separate stdio operations; with the verify-pool threads and
+ * the parent + forked download worker all logging into the one append file
+ * (systemd StandardOutput=append:), those interleaved -- producing lines with
+ * a DOUBLED timestamp (another logger's prefix landed between ours) or with
+ * NONE (our prefix attached to the previous line). Format prefix+message into
+ * a single buffer and emit it with one fwrite; stderr is unbuffered and the
+ * fd is O_APPEND, so a single write is atomic across threads and processes. */
+static int log_fprintf(FILE* stream, const char* fmt, ...) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tmv;
     gmtime_r(&ts.tv_sec, &tmv);
-    fprintf(stderr, "%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
+    char buf[8192];
+    int p = snprintf(buf, sizeof buf,
+            "%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000);
-}
-
-static int log_fprintf(FILE* stream, const char* fmt, ...) {
-    log_ts_prefix();
+    if (p < 0) p = 0; if (p > (int)sizeof buf) p = (int)sizeof buf;
     va_list ap;
     va_start(ap, fmt);
-    int r = vfprintf(stream, fmt, ap);
+    int m = vsnprintf(buf + p, sizeof buf - p, fmt, ap);
     va_end(ap);
-    return r;
+    int total = p + (m > 0 ? m : 0);
+    if (total > (int)sizeof buf) total = (int)sizeof buf;   /* rare over-long line: truncate, still atomic+timestamped */
+    fwrite(buf, 1, (size_t)total, stream);
+    return m;
 }
 
 #define fprintf log_fprintf
