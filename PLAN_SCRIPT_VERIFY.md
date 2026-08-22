@@ -12,8 +12,12 @@ from-scratch replay of the real mainnet archive. The replay was restarted
 from block 0 at 02:40 UTC on 2026-08-22 after incident #6 (genesis absent
 from the archive, every buried soft fork one block late) invalidated the
 previous attempt; it is now past ~386,000 of 963,446 with every fix below
-deployed, at ~4.4x the throughput of the 08-21 baseline over identical
-heights (`PERF_SCOPE.md`). See the Stage D section for incidents #1-#9.
+deployed, at 4.4-5.7x the throughput of the 08-21 baseline over identical
+heights (`PERF_SCOPE.md`). At 481824 it found incident #10: the archive was
+witness-stripped for the whole segwit era; the UTXO checkpoint at 481823 is
+valid, the ~482k affected blocks are being re-fetched from the local Core
+oracle, and the replay resumes from there. See the Stage D section for
+incidents #1-#10.
 **Caveat learned from #6:** a clean replay cannot detect a rule applied too
 *loosely* -- real chain data is valid under the strict rules too -- so
 "every block validated" is necessary, not sufficient. Stage E
@@ -258,6 +262,7 @@ individually re-traced line-by-line -- flagged where confidence is lower):
 | 349617 | "legacy script verification failed" | `sv_push_only`'s direct-push boundary excluded `0x4b` itself | `e1bdee2` |
 | 388431 | "legacy script verification failed" | `CHECKLOCKTIMEVERIFY`/`CHECKSEQUENCEVERIFY` were wired as no-op stubs, not real BIP65/BIP112 checks | `fbeff60` |
 | 318148 | "input references a missing/already-spent UTXO" on the first resume after deploying the LSM mmap read path | NOT the read path (exonerated on 80,000 keys from four real production runs). `systemctl stop` SIGKILLed the worker at 90 s because the catch-up loop ignored SIGTERM; the kill landed between block N's WAL writes and its checkpoint, and Stage D verifies before applying. Incident #8. | `f2faf3b`, `96b555e` |
+| 481824 | "p2wpkh needs exactly 2 witness items" at the first segwit block | The ARCHIVE, not the verifier: every block >= 481824 was stored witness-stripped because `getdata` asked for `MSG_BLOCK`; the merkle root cannot detect it and this node had no BIP141 witness-commitment check. Incident #10. | `31eac9a`, `fe3addb`, `191df6c` |
 | (none -- structurally undetectable by replay) | every buried soft fork active one block LATE; false-accept | genesis absent from the archive: record index == real height - 1. Incident #6. | `5f36dee` |
 | (none -- ~2^-64 per random operand) | wrong `s^-1` / affine x on structured operands; fail-closed | lost carries in `sc_mul` MULACC and `fe_mul` fold-2. Incident #7. | `54cc988` |
 
@@ -277,7 +282,7 @@ exists to reconcile. New regression test
 via disabling the fix line; `make -k test` 1582/1582 both pre- and
 post-merge. `2fd4a14`. Full writeup: `LOG.md`'s 2026-08-21 entry.
 
-### Incidents #6-#9 (2026-08-22)
+### Incidents #6-#10 (2026-08-22)
 Narratives in `LOG.md`'s 2026-08-22 entry; one line each here. **#6** genesis
 was never in the archive (record index == real height - 1), so
 `script_flags_for_block` ran a block behind and DERSIG/CLTV/CSV/NULLDUMMY

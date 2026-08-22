@@ -201,6 +201,19 @@ not just present as unused/tested-in-isolation code:
   `p2p_blocktxn_build`, full message handling).
 - **wtxid relay, addrv2 (BIP155), feefilter, sendheaders** — all genuinely
   implemented and exchanged during real handshakes.
+- **Witness transport (BIP144) — FIXED 2026-08-22** (`31eac9a`, `fe3addb`):
+  block requests were `MSG_BLOCK`, so every post-segwit block was fetched
+  *stripped* and the archive held 482k witness-less bodies (incident #10,
+  `LOG.md`); the server side also ignored `MSG_WITNESS_*` requests, so this
+  node could not serve blocks to a modern peer. Now requests and serves
+  `MSG_WITNESS_BLOCK`. **Remaining:** prefer/require `NODE_WITNESS` (0x8)
+  peers; serve the stripped form to a bare `MSG_BLOCK` request; and
+  **`MSG_WITNESS_TX` for transaction relay** — the mempool path still fetches
+  transactions without witnesses (same bug shape, not yet hit).
+- **BIP141 witness-commitment validation — DONE 2026-08-22** (`191df6c`,
+  `daemon/block_witness.c`): the consensus check that makes a stripped block
+  unacceptable. Core had it; we did not, which is why the archive could be
+  stripped silently.
 
 Confirmed absent:
 - **Tor / I2P / onion support** — zero hits for tor/.onion/torcontrol.
