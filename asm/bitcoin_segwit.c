@@ -192,6 +192,7 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     const uint8_t* q = p;
     for (uint64_t i=0;i<nin;i++){ if (q+36 > tx+txlen) return 0; q += 36;
         uint64_t sl = read_cs(&q); if (q+(int64_t)sl+4 > tx+txlen) return 0; q += sl+4; }
+    const uint8_t* outs_start = q;      /* nout varint + every CTxOut, verbatim */
     uint64_t nout = read_cs(&q);
     for (uint64_t i=0;i<nout;i++){ if (q+8 > tx+txlen) return 0; q += 8;
         uint64_t sl = read_cs(&q); if (q+(int64_t)sl > tx+txlen) return 0; q += sl; }
@@ -232,15 +233,15 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
             memcpy(d, it, 4); d += 4; dsz += 4; it += 4;
         }
     }
-    /* outputs (nout varint + each CTxOut) */
+    /* outputs (nout varint + each CTxOut): witness stripping never touches
+     * this section, so copy it verbatim from the source. The old code
+     * re-serialized every output into a fixed uint8_t obuf[4096] with no
+     * bound -- the same overrun class as incident #13 (a 120-output tx
+     * already exceeds it; exchange batch payouts carry thousands). */
     {
-        swtx_t t0; t0.tx=tx; t0.txlen=txlen;
-        if(!swtx_parse(&t0)) return 0;
-        uint8_t nb[9]; put_cs(nb, nout); long csn = cs_size(nout);
-        if (dsz + csn > cap) return 0; memcpy(d, nb, csn); d += csn; dsz += csn;
-        uint8_t obuf[4096]; int on=0;
-        for (int64_t i=0;i<t0.nout;i++){ int k=sw_ser_txout(&t0,i,obuf+on); on+=k; }
-        if (dsz + on > cap) return 0; memcpy(d, obuf, on); d += on; dsz += on;
+        long olen = (long)(lock - outs_start);
+        if (olen < 1 || dsz + olen > cap) return 0;
+        memcpy(d, outs_start, (size_t)olen); d += olen; dsz += olen;
     }
     /* locktime */
     if (dsz + 4 > cap) return 0; memcpy(d, lock, 4); d += 4; dsz += 4;
