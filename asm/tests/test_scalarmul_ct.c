@@ -43,9 +43,37 @@ static const u64 Gaff[8] = {
 static u64 st = 0x9E3779B97F4A7C15ULL;
 static u64 rnd(void){ st ^= st>>12; st ^= st<<25; st ^= st>>27; return st*0x2545F4914F6CDD1DULL; }
 
-static double now_s(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+/* Timing source for the constant-time check.
+ *
+ * CLOCK_THREAD_CPUTIME_ID, not CLOCK_MONOTONIC: wall-clock includes every
+ * moment the scheduler parked this thread, and on a loaded box (the live
+ * replay, a Core sync and builds all ran alongside this test on 2026-08-22)
+ * those pauses were the same order of magnitude as the ~0.1 ms intervals
+ * being compared -- unchanged code produced ratios of 0.74, 1.00, 1.00 and
+ * 1.18 in four consecutive runs, i.e. a coin-flip pass rate. Thread CPU time
+ * stops the clock while the thread is descheduled, which removes the bulk
+ * of that noise at the source. What remains (cache state, frequency
+ * changes, SMT sibling load) only ever ADDS time, which is why the caller
+ * takes the minimum over many repetitions rather than a single sample. */
+static double cpu_s(void){
+    struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return ts.tv_sec + ts.tv_nsec*1e-9;
+}
+
+typedef void (*mulfn)(u64*, const u64*, const u64*);
+
+/* Min-of-N CPU-time cost of `reps` calls of fn(r, Gaff, k), in seconds per
+ * call. Interference can only inflate a sample, so the minimum over
+ * `rounds` is the best estimate of the routine's intrinsic cost. */
+static double min_cost(mulfn fn, u64* r, const u64* k, int reps, int rounds){
+    double best = 1e30;
+    for (int j = 0; j < rounds; j++){
+        double s = cpu_s();
+        for (int i = 0; i < reps; i++) fn(r, Gaff, k);
+        double t = cpu_s() - s;
+        if (t < best) best = t;
+    }
+    return best / reps;
 }
 
 int main(void){
@@ -137,28 +165,63 @@ int main(void){
     /* ---------- 3. timing invariance ---------- */
     /* Two scalar classes chosen to be maximally different for the
      * variable-time routine: tiny (short bsr bound, few nonzero digits)
-     * vs full-width dense. */
+     * vs full-width dense. The variable-time routine is the CONTROL: it is
+     * expected to leak (dense costs many times tiny), which proves the
+     * measurement is sensitive enough to see a leak when one exists. The
+     * constant-time routine must then show ~1.0.
+     *
+     * Measurement: per-thread CPU time (see cpu_s), min over ROUNDS
+     * repetitions of REPS calls each, with tiny and dense interleaved
+     * round-by-round (A B A B ...) so slow drift -- turbo/thermal state,
+     * another process warming or cooling a shared core -- lands on both
+     * classes equally instead of biasing one. Each measured interval is
+     * several ms, far above timer resolution. */
     u64 tiny[4] = {0xFF, 0, 0, 0};
     u64 dense[4]= {0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0x7FFFFFFFFFFFFFFFULL};
-    const int reps = 300;
-    double t_v_tiny, t_v_dense, t_c_tiny, t_c_dense, s;
+    const int REPS = 200, ROUNDS = 40;
+    double t_v_tiny = 1e30, t_v_dense = 1e30, t_c_tiny = 1e30, t_c_dense = 1e30;
 
-    s = now_s(); for(int i=0;i<reps;i++) point_scalar_mul(r, Gaff, tiny);  t_v_tiny  = now_s()-s;
-    s = now_s(); for(int i=0;i<reps;i++) point_scalar_mul(r, Gaff, dense); t_v_dense = now_s()-s;
-    s = now_s(); for(int i=0;i<reps;i++) point_scalar_mul_ct(r, Gaff, tiny);  t_c_tiny  = now_s()-s;
-    s = now_s(); for(int i=0;i<reps;i++) point_scalar_mul_ct(r, Gaff, dense); t_c_dense = now_s()-s;
+    /* warm-up: fault in code/data, let the core settle */
+    for (int i = 0; i < 50; i++){ point_scalar_mul_ct(r, Gaff, dense); point_scalar_mul(r, Gaff, dense); }
+
+    for (int j = 0; j < ROUNDS; j++){
+        double t;
+        t = min_cost(point_scalar_mul,    r, tiny,  REPS, 1); if (t < t_v_tiny)  t_v_tiny  = t;
+        t = min_cost(point_scalar_mul,    r, dense, REPS, 1); if (t < t_v_dense) t_v_dense = t;
+        t = min_cost(point_scalar_mul_ct, r, tiny,  REPS, 1); if (t < t_c_tiny)  t_c_tiny  = t;
+        t = min_cost(point_scalar_mul_ct, r, dense, REPS, 1); if (t < t_c_dense) t_c_dense = t;
+    }
 
     double v_ratio = t_v_dense / t_v_tiny;
     double c_ratio = t_c_dense / t_c_tiny;
-    printf("\n  variable-time : tiny %.2f ms  dense %.2f ms  ratio %.2fx\n",
-           t_v_tiny*1e3/reps, t_v_dense*1e3/reps, v_ratio);
-    printf("  constant-time : tiny %.2f ms  dense %.2f ms  ratio %.3fx\n",
-           t_c_tiny*1e3/reps, t_c_dense*1e3/reps, c_ratio);
-    if (c_ratio > 1.05 || c_ratio < 0.95) {
-        printf("FAIL CT timing ratio %.3f outside [0.95,1.05]\n", c_ratio);
+    printf("\n  variable-time : tiny %.3f ms  dense %.3f ms  ratio %.2fx   (control, must leak)\n",
+           t_v_tiny*1e3, t_v_dense*1e3, v_ratio);
+    printf("  constant-time : tiny %.3f ms  dense %.3f ms  ratio %.3fx\n",
+           t_c_tiny*1e3, t_c_dense*1e3, c_ratio);
+    /* Control: if the variable-time routine does NOT show a clear leak, the
+     * measurement itself is broken and a CT pass would be meaningless. */
+    if (v_ratio < 2.0) {
+        printf("FAIL control: variable-time ratio %.2f < 2.0 -- timing measurement is not sensitive\n", v_ratio);
+        failures++;
+    }
+    /* Window: +-3%%. Calibrated 2026-08-22 on a loaded box (load 4-7, a
+     * full-chain replay and a Core sync running alongside): 70 consecutive
+     * runs of the min-of-40 CPU-time measurement above gave ratios in
+     * 0.986..1.009, so 3%% is ~2x the worst observed deviation -- a real
+     * margin, not a number tuned to pass. (With min-of-15 the same window
+     * still saw 0.966 and 1.025 in 30 runs; 40 rounds is what it took to
+     * make a clean sample near-certain for both classes. The original
+     * wall-clock single-sample version needed +-5%% and still failed half
+     * the time.) Sensitivity, same day: an injected data-dependent cost of
+     * ~4%% -- extra work only when the top limb is zero -- is caught at 3%%
+     * (ratio ~0.955) and was MISSED at 5%%; the variable-time control leaks
+     * ~17x. Anything subtler than ~3%% is below what a timing test can
+     * responsibly claim to see. */
+    if (c_ratio > 1.03 || c_ratio < 0.97) {
+        printf("FAIL CT timing ratio %.3f outside [0.97,1.03]\n", c_ratio);
         failures++;
     } else {
-        printf("PASS CT timing ratio %.3f within 5%% (variable-time leaks %.1fx)\n",
+        printf("PASS CT timing ratio %.3f within 3%% (variable-time leaks %.1fx)\n",
                c_ratio, v_ratio);
     }
 
