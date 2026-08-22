@@ -82,16 +82,25 @@ plus straightforward methods on top of it.
   `index.dat` is keyed on reversed hashes. Whether the serve path's
   `idx_get` compensates was not checked. `rpc_chain.c` sidesteps it by
   building its own table from raw record bytes.
-- **Production archive record 0 is block 1, not genesis.** Same `pread`:
-  record 0 = `00000000839a8e…` (block 1, 215 bytes), record 1 = block 2,
-  record 2 = block 3. Genesis is not stored, so **stored height h = real
-  height h+1** everywhere the daemon logs a "height". The RPC layer reports
-  the store's own height (consistent with the node's logs and
-  `applied_height`), which means `getblockhash 0` on the production archive
-  returns block 1's hash and `getblockcount` is one less than Core would
-  report. Fixing the mapping is a storage/consensus decision (it also
-  shifts every height-gated activation by one block) and belongs with the
-  Stage D owners, not an RPC patch.
+- ~~**Production archive record 0 is block 1, not genesis.**~~ — **FIXED
+  2026-08-22.** Confirmed against Core that record index was consistently
+  real height − 1 across the whole archive, so `apply_block_at` handed
+  `script_flags_for_block` a height one too low and every buried soft fork
+  activated one block LATE: DERSIG (363,725), CLTV (388,381), CSV (419,328)
+  and NULLDUMMY (481,824) each missed their own activation block. Direction
+  was false-ACCEPT (we applied looser rules than Core for one block at each
+  boundary), i.e. a chain-split risk — and structurally invisible to the
+  replay, because looser rules accept a superset and real chain data is
+  valid under the stricter ones. Re-downloading could never have fixed it:
+  the P2P locator for "from the beginning" is the all-zero hash and peers
+  answer from block 1, so genesis is never transmitted (see
+  `bitcoind.asm:1247`). Genesis was injected from its known constant instead
+  — 285 bytes appended to the last `blk` file, `index.dat`/`headers.dat`
+  shifted by one record, `chainwork.dat` dropped to be rebuilt (its
+  cumulative values all change). Re-verified against Core: index hash, block
+  body, header record and `getblockhash` agree at 12 heights including 0.
+  `apply_block_inner` now skips genesis's coinbase, matched by hash, so the
+  UTXO set matches Core's.
 
 ## Consensus / validation
 
