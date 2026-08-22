@@ -7,503 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- taproot: the BIP341 sighash had the same O(n^3), the same unbounded reader -- and two CONSENSUS DIVERGENCES that Core rejects and we accepted
-
-`fc4bd67` ended with a note that `bitcoin_taproot_sighash.c` carried the
-identical defects one file over, and that a performance restructure and a
-consensus-path bounds fix should not land together. Taproot activates at
-709,632 and the live replay is a few hours away from it, so this is that work.
-All three diagnoses in that note are **confirmed**. Two further problems were
-found while proving the result, and they are worse than either.
-
-### 1. CONFIRMED: the O(n^3), same shape as BIP143's
-
-- `tx_seq(t,i)` and `tx_outpoint(t,i)` each re-walked the input list from the
-  start to reach input `i`, parsing a compactsize per step. BIP341's
-  `sha_sequences` calls `tx_seq` once per input: **O(nin^2)** varint reads.
-- `ser_txout(t,i)` re-walked the first `i` outputs, and `ser_txout_len(t,i)`
-  did the same walk **twice** -- literally twice, the first result computed
-  into a local and then discarded and the loop re-run. `sha_outputs` called
-  both once per output: **three O(nout^2) walks**.
-- And `taproot_sighash()` is called once per input (once per executed
-  OP_CHECKSIG/OP_CHECKSIGADD via `taproot_checksig_fn`), while BIP341's
-  aggregates depend only on the transaction and not on which input is being
-  signed -- so the whole thing was redone from scratch `nin` times.
-  **O(nin^3) per transaction.**
-
-Three of the four aggregates did not need any of it. `c->prevouts`,
-`c->amounts` and `c->spks` are ALREADY the contiguous concatenations BIP341
-asks for; the old loops copied a buffer onto itself 36/8/n bytes at a time into
-a 4 MiB staging buffer and hashed the copy. They are now hashed where they lie.
-Only `sha_sequences` genuinely has to be gathered, because nSequences are 41+
-bytes apart in the transaction, and with `in_off[]` that is one indexed load
-per input.
-
-### 2. CONFIRMED: the OOB read is real, and a plain truncation is enough
-
-`read_cs` took no `end`. A compactsize's width is chosen by its own first
-byte, which is wire data, so any walk landing on the last byte read up to 8
-bytes past it -- and `tx_parse` read each length BEFORE checking that it fit.
-Every bound was the pointer-overflow form `q + (int64_t)sl + 4 > t->tx +
-t->txlen`, which additionally casts an unsigned wire length through `int64_t`,
-so any `sl >= 2^63` went negative and the comparison passed unconditionally.
-
-`tests/test_taproot_bounds_fuzz.c` is new: the transaction is copied so its
-LAST byte abuts a `PROT_NONE` page, so a read one byte past the end is a
-deterministic SIGSEGV. No sanitizer, because this path links hand-written asm
-that ASAN cannot instrument.
-
-    on this tree   ALL PASS (8,601,700 calls, 0 faults)      3.9 s
-    on main        FAILURES (8,601,700 calls, 36,712 faults)
-
-Minimal reproducer, and it is exactly the predicted one -- `01000000ffb21282f7a2`,
-10 bytes: `txlen < 10` passes, the version is read, then the unbounded
-`read_cs` at `tx+4` sees `0xff`, selects the 9-byte form and reads `tx[5..12]`.
-Standalone with no handler installed: **SIGSEGV, exit 139, core dumped.**
-
-The part worth keeping: **14,579 of the 36,712 faults needed no byte poisoning
-at all.** They are plain truncations of real mainnet transactions. The smallest
-is the first 41 bytes of `4cc72b13218183d4a6b13e79ef3e0a73c7987688dd0334866a8398b03e514057`
-(block 775,000), where `q + 36 > tx + txlen` is `tx+41 > tx+41`, i.e. false, so
-the walk advances to `q == end` and `read_cs(&q)` dereferences `*end`. A peer
-truncating a real transaction on a byte boundary was sufficient. Nothing had to
-be crafted.
-
-### 3. NEW, and the reason this is urgent: two consensus divergences, both FALSE ACCEPT
-
-Neither was in fc4bd67's note. Both are pre-existing, both are in the class
-that splits the chain rather than merely stalling it, and both were found by
-asking Core about the corpus rather than by reading the code.
-
-**(a) `hash_type` was never validated.** Core, `SignatureHashSchnorr`:
-
-    if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83))) return false;
-
-which `CheckSchnorrSignature` turns into `SCRIPT_ERR_SCHNORR_SIG_HASHTYPE` --
-the input is invalid. Nothing here checked it at all, and `hash_type` is the
-LAST BYTE OF A 65-BYTE SCHNORR SIGNATURE, entirely attacker-chosen. A spend
-signed with hash_type `0x04` is rejected by Core and was accepted here (`0x04 &
-3 == 0`, so it took the plain `sha_outputs` path and produced a perfectly good
-hash for the spender to have signed).
-
-**(b) SIGHASH_SINGLE past the end of the output list.** Core:
-
-    if (output_type == SIGHASH_SINGLE) {
-        if (in_pos >= tx_to.vout.size()) return false;
-
-BIP143 substitutes a zero hash in this position; BIP341 deliberately does not,
-and this file had carried the BIP143 behaviour over -- it wrote 32 zero bytes
-and returned a usable sighash. This is not a corner that needs constructing:
-**1,710 of the 945-vector first smoke run were exactly this case on real
-mainnet transactions**, before any invalid hash types were added.
-
-Both are now Core's rule exactly, and the accept/reject boundary is checked as
-strictly as the hashes are (see the corpus result below).
-
-### The fix: one bounded pass, then index
-
-`in_off[0..nin]` and `out_off[0..nout]`, recorded in a single bounded walk;
-every accessor afterwards is an array index. Inputs are contiguous, so input
-`i`'s 4-byte nSequence ends exactly at `in_off[i+1]`, and `in_off[nin]` is one
-past the last input, so that is exact for the final input too. `tx_seq` and
-`tx_outpoint` become one load each with no compactsize read at all.
-
-**And the question fc4bd67 asked to be answered explicitly, because BIP341 is
-not BIP143 here.** BIP341's `sha_outputs` is SHA256 over "the serialization of
-all outputs in CTxOut format" -- 8-byte value || compactsize(len) ||
-scriptPubKey per output, which is byte for byte the transaction's own wire
-encoding, exactly as in BIP143. So **yes, the in-place property holds**:
-`sha_outputs` is a single sha256 over `[out_off[0], out_off[nout])` in place and
-SIGHASH_SINGLE's is one over `[out_off[n_in], out_off[n_in+1])`. `ser_txout`
-and `ser_txout_len` are deleted and no output is copied anywhere.
-
-BIP341 does also hash amounts and scriptPubKeys separately -- `sha_amounts` and
-`sha_scriptpubkeys`, which BIP143 has no counterpart for -- and that is **not**
-a counterexample, because those two are over the SPENT outputs, the UTXOs this
-transaction consumes, which are not in this transaction at all. They arrive as
-the caller's own contiguous arrays. The outputs this transaction *creates* are
-hashed in exactly one place and in exactly one format.
-
-Capacity is arithmetic, not a guess, and deliberately the same bound
-`SW_OFF_ENTRIES` uses so the two sighash paths refuse at the same place: an
-input costs >= 41 wire bytes and an output >= 9, so
-`(nin+1)+(nout+1) <= 0.13550*txlen + 2`, and MAX_BLOCK_SERIALIZED_SIZE (4 MiB)
-gives <= 568,335 entries. 600,000 (2.29 MiB) cannot false-reject anything.
-`TS_SEQ_CAP` is derived from it (`4 * TS_OFF_ENTRIES`) so the sequence buffer
-can never be the binding constraint. Per-thread heap (`BMC_TLS_BUF`), never a
-stack array -- incident #13.
-
-Also removed, all latent, all in the buffers the aggregates used to stage into:
-the scriptpubkeys loop tested `n + 600 > TS_AGG_CAP` and then copied `cs + sl`
-bytes (consensus places no limit on a scriptPubKey's size -- incident #21's
-shape, on the heap); the sequences loop had no bound at all AND iterated to
-`c->num_inputs` while `tx_seq` indexed `t->nin`, with nothing checking that
-those agree (now checked); `ser_txout_len` returned `int`, so a scriptPubKey of
-`0x100000000` bytes truncated to 13 and let `ser_txout` memcpy 4 GiB; and
-`agg_hashes` returned `void` and simply `return`ed on overflow, leaving the
-remaining `h_*` outputs UNINITIALIZED for `taproot_sighash` to copy into the
-preimage -- a truncated aggregate was not refused, it was hashed.
-
-`uint8_t pre[256]` also went to a bounded per-thread heap buffer. 256 was
-enough only because a taproot input's spent output is a 34-byte P2TR program;
-for anything larger the cap check fired and returned 0, i.e. a silent FALSE
-REJECT with the boundary at an undocumented ~200 bytes. Core has no such limit.
-
-### Byte-identical against Core, on 196 real mainnet taproot transactions
-
-Ground truth is Bitcoin Core, never our own previous answer.
-`validation/core_verify_oracle.cpp` gains a `BIP341` command running Core's own
-`SignatureHashSchnorr`, and it is self-checked against all seven published
-BIP-341 wallet-test-vectors before any answer is used -- if that fails, nothing
-else runs. (One trap worth recording: `PrecomputedTransactionData::Init()` only
-computes the BIP341 midstates when it *sees* a witness-bearing input whose
-spent scriptPubKey is a 34-byte OP_1 program, so with a witness-stripped
-transaction it silently produces nothing but errors. `Init(tx, spent,
-/*force=*/true)` is required.)
-
-`validation/diff_bip341_corpus.py` + `validation/bip341_corpus_dump.c` are new
-and reproduce the corpus on demand -- pull real taproot transactions, ask Core,
-build both sides, diff -- so the next change here does not reinvent it:
-
-    python3 validation/diff_bip341_corpus.py --baseline main
-
-19,721 vectors over 196 real mainnet taproot transactions from 69 blocks,
-heights 709,632..963,637: three input indices x seven hash types x six invalid
-hash types x key-path/script-path/codesep/annex variants.
-
-    worktree      vs Bitcoin Core :  15,125 / 15,125 hashes match
-    worktree      refusals        :   4,596 /  4,596 also refused
-    baseline(main) vs Bitcoin Core:  15,125 / 15,125 hashes match
-    baseline(main) refusals       :       0 /  4,596 also refused   <-- 4,596 FALSE ACCEPTS
-    worktree vs main              :  15,125 / 19,721 byte-identical,
-                                      4,596 intended refusals, 0 unexplained
-
-That is the whole result in one table. **No hash moved** -- zero unexplained
-differences against the previous implementation. **Every hash matches Core.**
-And the accept/reject boundary, which main got wrong 4,596 times out of 4,596,
-is now exact. Core refusing a vector is itself an answer, so the differ gates
-on it rather than excluding it; that gate is the only reason (a) and (b) were
-found at all.
-
-The same corpus under `-fsanitize=address,undefined` gives byte-identical
-output with zero diagnostics.
-
-### Measured
-
-`tests/bench_taproot_sighash` is new and permanent, so the next change to this
-path has something to be compared against. `-O2`, `CLOCK_PROCESS_CPUTIME_ID`,
-min of 15, both builds back to back, same five shapes as
-`bench_segwit_sighash` so the two tables are directly comparable. Iterations
-per shape are calibrated at runtime to >= 20 ms per run, because one fixed
-count cannot serve two builds 420x apart.
-
-Key-path (`ext_flag=0`); script-path is a flat +0.03 to +0.04 us on both
-builds (the 37 extra preimage bytes) and otherwise indistinguishable:
-
-    shape                  before        after      factor
-    1 in /     2 out     0.4001 us    0.3875 us      1.03x
-    2 in /     2 out     0.4699 us    0.4487 us      1.05x
-    100 in /   5 out     9.7203 us    4.3148 us      2.25x
-    1,372 in / 100 out   1.1254 ms   54.3603 us     20.70x
-    2 in / 3,000 out    18.1766 ms   43.3184 us      419x
-
-**The common case is not pessimised**, and that was the thing to check.
-Four independent min-of-15 repeats, binaries interleaved: the new build is at
-or below the old in every repeat of the 1- and 2-input shapes, key-path and
-script-path, by a consistent 2-5%, with the distributions not overlapping on
-the 2-input rows. The reason is direct -- at nin = 1-2 the offset table costs
-a couple of stores, while the prevouts/amounts/spks *copies* (36+8+35 bytes
-each, staged into a buffer before hashing) and the `ser_txout` output staging
-are gone outright. Per-thread resident scratch also falls, from a 4 MiB
-`TS_AGG_CAP` buffer to a 2.29 MiB offset table.
-
-### On the real thing: 19,870 taproot inputs from five mainnet blocks
-
-Heights 825,000 / 830,000 / 842,000 / 865,000 / 910,000 -- the five with the
-largest taproot input counts out of 38 blocks scanned between 709,700 and
-963,000, and the sample happens to capture both regimes (825,000 is
-inscription-era script-path-heavy; 830,000 and 910,000 carry 1,500- and
-1,000-input consolidations). 19,870 taproot inputs across 12,014 transactions,
-16,387 key-path and 3,483 script-path, each driven once through
-`taproot_sighash()` in block order on the REAL witness-stripped serialization
--- real input counts, real output counts, real script sizes. CPU time, min of
-15:
-
-    before   4,577.85 ms  (med 4,857.80, max 4,980.31)   230.39 us / input
-    after      243.35 ms  (med   252.68, max   264.94)    12.25 us / input
-
-    18.81x.
-
-The distribution matters more than the aggregate:
-
-    height    taproot in    before        after       factor
-    825,000    3,379        2.25 ms       1.68 ms      1.33x
-    830,000    3,661    3,833.15 ms     195.65 ms     19.59x
-    842,000    4,274       68.00 ms       5.39 ms     12.61x
-    865,000    4,295        2.87 ms       2.15 ms      1.33x
-    910,000    4,261      766.24 ms      65.72 ms     11.66x
-
-Blocks made of ordinary 1-3 input taproot spends gain a flat ~1.33x; the one
-block containing a 1,500-input consolidation goes from **3.83 seconds of
-sighashing to 196 ms**. Nothing gets slower.
-
-Two honest qualifications on that workload. The spent outputs are SYNTHETIC --
-a 34-byte P2TR scriptPubKey and an arbitrary amount per input, which is
-exactly the right size for a real taproot input's prevout, and the cost
-depends only on the count and sizes of those arrays, not their contents; the
-transaction STRUCTURE, which is what the O(n^2) was in, is real. And
-`hash_type` is forced to SIGHASH_DEFAULT, the dominant real choice and the
-most expensive branch, identically for both builds. This is a component
-benchmark, not a consensus check -- the consensus check is the corpus above.
-
-No end-to-end projection is offered. PERF_SCOPE.md section 7 exists because a
-projection off a stale profile share said 1.40x and delivered 1.15x, and this
-path has never been profiled live at all: the replay has not reached 709,632,
-so its share of taproot-era cycles is unmeasured. The figure that does not
-depend on a share is the 18.81x on the component.
-
-### The outer O(nin) is still there, and that is not a regression
-
-`taproot_sighash()` still runs the single pass and re-hashes the O(nin)
-prevouts/amounts/spks arrays on EVERY call, and it is still called once per
-input. What was removed is the inner re-walk. That is why the 1,372-input
-shape is still 54 us per call rather than ~1 us, and why block 830,000 still
-costs 53 us per taproot input afterwards. Core hoists exactly this to once per
-transaction (`PrecomputedTransactionData`); we cannot, for the reason
-PERF_SCOPE.md 8.6 already records for BIP143 -- there is no transaction-scoped
-context to hang it on, and a thread-local keyed on the transaction's address
-and length is not sound. It is the next available win on this path and it is
-larger here than it was there, because BIP341 has four aggregates rather than
-three. Recorded in PERF_SCOPE.md section 10.
-
-### Deliberately NOT done
-
-- **An `spks_len` parameter.** `c->spks` has no length in the API, so its walk
-  cannot be *proven* in bounds; it carries a hard 4 MiB ceiling checked before
-  every advance instead. It is built by this codebase from resolved UTXOs
-  (`daemon/tx_verify.c`, `bitcoin_txval_modern.c` both write one single-byte
-  compactsize per entry), not taken from the wire, so this is a real but
-  second-order gap. Fixing it is an ABI change across ~10 call sites in two .c
-  files and five tests, which does not belong in a sighash restructure.
-- **A per-transaction cache of the aggregates across one transaction's
-  inputs** -- Core's `PrecomputedTransactionData` proper. Declined for exactly
-  the reason PERF_SCOPE.md 8.6 records for the BIP143 path: there is no
-  transaction-scoped context to hang it on, and a thread-local keyed on the
-  transaction's address and length is not sound.
-
-### FOUND WHILE PROVING THIS, NOT FIXED HERE
-
-`bitcoin_txval_modern.c:240` (the mempool-accept path, not block validation)
-builds the taproot aggregate arrays into `uint8_t sp[16*70]` and fills it with
-
-    if (T.in[k].prev_spklen < 0xfd) sp[off++] = (uint8_t)T.in[k].prev_spklen;
-    else return 0;
-    memcpy(sp+off, T.in[k].prev_spk, T.in[k].prev_spklen);
-
-with no check that `off` stays inside `sp`. `nin` is capped at 16 and
-`prev_spklen` at 252, so the worst case is 16*253 = 4,048 bytes into a
-1,120-byte stack array. Eleven bare 2-of-3 multisig prevouts (105 bytes each)
-is enough, and bare multisig outputs exist on mainnet and are spendable. Same
-class as #13 and #21, third file. Not fixed here because it is a different file
-on a different path and this commit already carries three concerns.
-
-## 2026-08-22 -- perf: the BIP143 sighash was O(n^2) per call and O(n^3) per transaction; one bounded pass makes it linear (27.4x on real blocks at the profiled height)
-
-`PERF_SCOPE.md` section 7's re-profile of the live replay at height ~617,000
-(132,785 samples, no call graph) found `read_cs` at **22.44%** of all cycles,
-with `sw_seq` (5.92%) and `sw_prevout` (5.71%) behind it -- **34% together,
-larger than the field multiply**, and all three inside `bitcoin_segwit.c`.
-That is not a constant factor. `sw_prevout(t,i)` and `sw_seq(t,i)` each walked
-the input list from the start to reach input `i`, parsing a compactsize per
-step, and BIP143's hashPrevouts/hashSequence call them once per input:
-O(nin^2) per call. `sw_ser_txout(t,i)` was worse -- it re-walked every input
-*and* the first `i` outputs, so hashOutputs was O(nin*nout + nout^2). And
-because `segwit_v0_sighash` is called once per executed OP_CHECKSIG, i.e. once
-per input, the whole thing was **O(nin^3) per transaction**. Core has never
-paid any of this: `PrecomputedTransactionData` walks the transaction once.
-
-### The fix
-One bounded pass records the offset of every input and every output; every
-accessor afterwards is an array index.
-
-- `in_off[0..nin]` -- input `i`'s outpoint is at `in_off[i]`, and because
-  inputs are contiguous its 4-byte nSequence is the last 4 bytes before
-  `in_off[i+1]` (exact for the final input too, since `in_off[nin]` is one
-  past the last one). `sw_prevout` and `sw_seq` become one load each, with no
-  compactsize read at all.
-- `out_off[0..nout]` -- and here the part worth stating plainly: **a CTxOut's
-  BIP143 serialization is byte for byte its wire encoding**, so there is
-  nothing to build. hashOutputs is a `sha256d` over the contiguous slice
-  `[out_off[0], out_off[nout])` **in place**, and SIGHASH_SINGLE's is one over
-  `[out_off[n_in], out_off[n_in+1])`. `sw_ser_txout` is deleted; no output is
-  copied anywhere and the hashOutputs staging loop goes with it.
-
-The table is a per-thread heap buffer (`BMC_TLS_BUF`, 600,000 `uint32`
-entries = 2.29 MiB), not a stack array -- incident #13 is what a size-dependent
-stack buffer does in this file. Its capacity is an arithmetic bound, not a
-guess: an input costs >= 41 wire bytes and an output >= 9, so
-`(nin+1)+(nout+1) <= 0.13550*txlen + 2`, and MAX_BLOCK_SERIALIZED_SIZE (4 MiB)
-gives <= 568,335 entries -- nothing a valid block can carry is refused.
-
-### The bounds from incident #21 are intact, and the walk they guarded is gone
-Section 7's amendment measured #21's bound fix at +16% on this path and said
-most of it was the per-iteration bound in `sw_prevout`/`sw_seq` -- redundant
-given `swtx_parse` had already validated the same bytes, kept anyway because
-"a distant function already checked this" is how #13 and #21 both happened,
-and to be removed by deleting the loops rather than the checks. That is what
-happened: those loops no longer exist, so there is nothing left to re-check.
-What survives unchanged:
-
-- `read_cs` still takes `end`, and still returns on the single-byte encoding
-  before computing any width;
-- every step of the single pass is a "remaining >= wanted" comparison on
-  `sw_avail()`, never `q + n > end`;
-- the `sw_ser_txout` `cap` -- a consensus-safety bound, not a policy one -- is
-  now the caller's `olen > SW_MIDSTATE_CAP` test, and the accept/reject
-  boundary is **identical**, not merely similar: the old running
-  `cap = SW_MIDSTATE_CAP - written` refused exactly when the sum of the CTxOut
-  record lengths passed 4 MiB, and that sum is precisely this range's length.
-  `tests/test_segwit_txout_bound` still passes 125/125, including the
-  3,900,000-byte scale vector and the 5 MB over-cap refusal.
-
-One bound is *strengthened*: `avail(q) < sl + 4` wraps for `sl` within 4 of
-2^64 (`read_cs` can return any 64-bit value the wire supplies), so it is split
-into `avail < sl || avail - sl < 4`.
-
-### One real behaviour change, and it is toward Core
-Hashing a CTxOut in place is only equivalent to re-serializing it if the
-transaction's compactsizes are **minimally encoded**. The old `sw_ser_txout`
-wrote `put_cs(len)`, i.e. the canonical form, so a padded length (`fd 00 00`
-for zero, say) was silently rewritten before hashing; raw bytes are not
-rewritten, and the two answers differ. This was found by a differential fuzz,
-not by reasoning -- 12 cases out of 3.8 M, all of them a poisoned compactsize.
-
-Neither answer is Core's. Core's `ReadCompactSize()` throws "non-canonical
-ReadCompactSize()" and refuses to deserialize such a transaction at all, so it
-cannot appear in any block Core accepts. So `read_cs` now enforces minimality
--- Core's exact rule -- and refuses. That makes in-place hashing *provably*
-identical to canonical re-serialization for every transaction not refused,
-rather than merely identical on the transactions that happen to exist, and it
-costs the hot path nothing (the single-byte encoding returns first).
-
-Found while proving this and NOT fixed here: nothing else in the tree enforces
-minimality -- `bitcoin_tx.asm`'s compactsize readers do not -- so a peer's
-non-canonical transaction is still mis-parsed everywhere else. That is a
-pre-existing divergence from Core at block-acceptance level, not something
-this path introduced.
-
-### New test, and it has teeth
-`tests/test_segwit_bounds_fuzz.c`: the transaction is copied so its last byte
-abuts a **PROT_NONE guard page**, so a read one byte past the end is a SIGSEGV
-rather than a silent success -- no sanitizer needed, which matters because
-this path links hand-written asm that ASAN cannot instrument. Every real
-mainnet transaction in `segwit_txout_vec.h`, at every truncation from 0 to
-full length, under all five hashtypes and three input indices, plus every
-single-byte position poisoned to 00/fd/fe/ff: **3,184,330 calls**. It passes
-on this tree and on `main`, and **SEGVs on `bf673d0~1`** -- the pre-#21 tree --
-which is the whole point of writing it. Three bounds incidents (#13, #19, #21)
-came out of this file and every one was found by reading rather than by a
-test; now there is a test.
-
-### Byte-identical, against Core, on 461 real mainnet transactions
-This is a performance change and it must not move a single hash.
-
-Corpus: **4,974 vectors** -- 461 real mainnet transactions pulled from the
-Core oracle across heights **481,824 to 962,625** (the first segwit block
-through the incident-#21 census window), each driven at three input indices
-under **six hashtypes** (ALL, NONE, SINGLE, and each with ANYONECANPAY).
-
-- old build vs new build: **4,974/4,974 byte-identical**, 0 refusals;
-- and, more to the point, **both** match Bitcoin Core's own
-  `SignatureHash(..., SigVersion::WITNESS_V0)` on **4,974/4,974**, via
-  `validation/core_verify_oracle.cpp`'s `BIP143` command, which self-checks
-  against BIP-0143's published worked example first. Ground truth is Core,
-  never our own previous answer.
-- The same corpus under `-fsanitize=address,undefined` gives byte-identical
-  output with zero diagnostics.
-- Differential fuzz, old and new linked into one binary over every truncation
-  and single-byte poisoning of the fixture transactions: **3,821,196 cases,
-  3,820,122 identical (hash AND preimage AND return), 1,074 where the new
-  build refuses a non-canonical compactsize, 0 unexplained.** The
-  canonicality verdict comes from an independent walker, not from the
-  implementation under test.
-
-`validation/diff_bip143_corpus.py` + `validation/bip143_corpus_dump.c` are new
-and reproduce the corpus half on demand (`--baseline main`).
-
-### Measured
-`tests/bench_segwit_sighash` is new and permanent so the next change to this
-path has something to be compared against; both earlier figures for it were
-taken with throwaway harnesses. `-O2`, CPU time, min of 15, both builds back
-to back:
-
-| shape | before | after | factor |
-|---|---|---|---|
-| 1 in / 2 out (189 B) | 0.3960 us | 0.3718 us | 1.07x |
-| 2 in / 2 out (304 B) | 0.4364 us | 0.4052 us | 1.08x |
-| 100 in / 5 out | 16.830 us | 2.510 us | 6.7x |
-| 1,372 in / 100 out | 2.633 ms | 30.57 us | **86x** |
-| 2 in / 3,000 out | 5.115 ms | 42.14 us | **121x** |
-
-The common case is not pessimised -- that was the thing to check.
-
-On the real thing: 20 mainnet blocks at heights 616,980-617,018, the exact
-window section 7 profiled, all **53,400 witness inputs** driven through
-`segwit_v0_sighash` -- **5,735.90 ms -> 209.00 ms**, i.e. 107.41 us -> 3.91 us
-per witness input, **27.4x**. `read_cs` calls over the same blocks:
-4,340,010,792 -> 32,889,389, **131.9x**. Of the old total, `strip_witness` --
-untouched by this change -- is 0.010%, so essentially all of section 7's
-`read_cs` share is this and essentially all of it goes.
-
-Projection, with the bound stated: the three symbols are 34.07% of profiled
-cycles, so **the Amdahl ceiling is 1/(1-0.3407) = 1.517x** and nothing here
-can beat it. Residual 1.24% (whole-function, 27.4x) or ~0.2% (`read_cs`
-counts, 131.9x) gives **1.49-1.51x end-to-end**. Do not believe that without
-re-profiling: section 7 exists because a projection off a 227,000-block-stale
-profile said 1.40x and delivered 1.15x, and this share was measured at
-~617,000 while the replay has moved on. The figure that does not depend on the
-share is the 27.4x on the component.
-
-Corroboration that the benchmark drives the profiled work: the old path costs
-107.41 us per witness input against section 1's measured 120.9 us for
-`ecdsa_verify`, and 96.4% of the sighash cost is removed here, predicting the
-three symbols at 45.3% of that pair's cycles. The profile has them at 34.07%
-against 42.07% for the field/EC symbols -- 44.75%. Two routes, 0.6 points
-apart.
-
-No post-change profile of the daemon was taken: the change is not deployed
-(the replay has not reached tip), and `perf_event_paranoid` is 4 on this host,
-which blocks `perf` for a non-root user.
-
-### Deliberately not done
-A per-transaction cache of the three hashes across one transaction's inputs
-(Core's `PrecomputedTransactionData` proper). `segwit_v0_sighash` is called
-from inside the interpreter with no transaction-scoped context, so the cache
-would be a thread-local keyed on (address, length) -- not sound, since a
-different transaction can reuse an address at the same length, and making it
-sound needs a full byte-compare against a retained copy per call. Priced: on
-the 1,372-input shape that compare costs about half of what the rebuild now
-costs, so it buys ~2x on the rarest shape and ~0 on the common one, against a
-wrong-sighash failure mode if the key ever aliased. At 3.91 us against
-`ecdsa_verify`'s 120.9 us the path is now 3.1% of a witness input. Recorded in
-`PERF_SCOPE.md` section 8.6 so it is not re-litigated from scratch.
-
-### Found while measuring, NOT fixed here
-`bitcoin_taproot_sighash.c` has the identical O(n^2) -- `tx_seq`,
-`tx_outpoint`, `ser_txout` and `ser_txout_len` all walk from the start on
-every call, and `ser_txout_len` walks the output list twice -- **and its own
-`read_cs` is unbounded** (it takes no `end`), with bound tests written in the
-`q + sl > end` pointer form that incident #21 had to remove from
-`bitcoin_segwit.c` because a wire-derived length near 2^64 overflows it. That
-path goes hot at height **709,632** and is script-path-heavy from ~775,000
-(`CHAIN_AHEAD_CENSUS.md` sampled one block with 44,933 script-path inputs).
-Same fix, same bounds class, deliberately not in this commit: a performance
-restructure and a consensus-path bounds fix should not land together.
-
-### Full suite
-`make -k test` MAKE_RC=0, 0 failures. `make abi-check` OK.
-
-## 2026-08-22 -- Incidents #6-#21; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#24; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -1379,6 +883,555 @@ interval, not about the chain: 105 bytes was the honest answer to "every
 #19's, repeated: this was found by reading the buffer against the consensus
 rule that governs it -- there is no limit on an output script -- and only
 afterwards did the chain turn out to agree.
+
+### Incident #22: taproot rules applied at the one block Core exempts by hash
+The replay stopped dead at height 692,261 -- `REJECT h=692261 tx=193: p2tr
+empty witness` -- and then sat in a retry loop, failing the same block six
+times as the backoff grew. The transaction is
+`b10c007c60e14f9d087e0291d4d0c7869697c6681d979c6639dbd960792b4d41`, and its
+four inputs spend real witness-v1 taproot outputs carrying **no witness at
+all**: invalid under taproot rules, valid without them.
+
+Block 692,261's hash is
+`0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad`, and that
+is not a coincidence -- it is Core's Taproot `script_flag_exception`
+(`kernel/chainparams.cpp`), the single mainnet block that violates the
+taproot rules. It was mined well before activation at 709,632. Core's
+`GetBlockScriptFlags` keeps `P2SH|WITNESS|TAPROOT` on for *every* block --
+its comment says "for simplicity, always leave P2SH+WITNESS+TAPROOT on
+except for the two violating blocks" -- and then overrides the flags down to
+`P2SH|WITNESS` for this one hash.
+
+**This project already had that right.** `script_flags_for_block` implements
+the exception, and `tests/test_script_flags` covers it 13/13, including a
+near-miss hash that must NOT trigger the override. The defect was that the
+two P2TR dispatch sites in `daemon/tx_verify.c` never consulted the flags
+they had already computed -- `if (is_p2tr(spk, spklen))`, unconditionally,
+with `flags` sitting in scope and the very next branch correctly gating on
+`flags & TXV_FLAG_WITNESS`. The right answer was worked out and thrown away.
+
+The fix gates both sites on `TXV_FLAG_TAPROOT`. With the flag clear, a
+witness-v1 program falls through to the existing classifier and lands on
+`TXV_SHAPE_WPASS` ("unknown version: valid under consensus flags"), which is
+exactly what Core's `VerifyWitnessProgram` does -- it returns success for
+witness v1 without ever inspecting the stack when `SCRIPT_VERIFY_TAPROOT` is
+clear. Blast radius is one block in the entire chain.
+
+Two things worth keeping. First, the diagnosis went wrong before it went
+right: the obvious reading is "taproot is height-gated at 709,632 and we
+missed the gate", and that is false -- Core does not height-gate taproot at
+all. Reading Core's actual source rather than trusting the recollection is
+what turned an activation-height theory into an exception-block finding.
+Second, this is a FALSE REJECT, the safe direction. It stopped the replay
+loudly instead of quietly accepting something Core would not. The
+false-accept version of the same mistake -- enforcing *too little* -- is the
+one that splits a chain silently, and three of those were found and fixed
+earlier the same day (#19, and the two in #21's sibling path).
+
+
+### Performance: the BIP143 sighash was O(n^3) per transaction; one bounded pass makes it linear
+
+`PERF_SCOPE.md` section 7's re-profile of the live replay at height ~617,000
+(132,785 samples, no call graph) found `read_cs` at **22.44%** of all cycles,
+with `sw_seq` (5.92%) and `sw_prevout` (5.71%) behind it -- **34% together,
+larger than the field multiply**, and all three inside `bitcoin_segwit.c`.
+That is not a constant factor. `sw_prevout(t,i)` and `sw_seq(t,i)` each walked
+the input list from the start to reach input `i`, parsing a compactsize per
+step, and BIP143's hashPrevouts/hashSequence call them once per input:
+O(nin^2) per call. `sw_ser_txout(t,i)` was worse -- it re-walked every input
+*and* the first `i` outputs, so hashOutputs was O(nin*nout + nout^2). And
+because `segwit_v0_sighash` is called once per executed OP_CHECKSIG, i.e. once
+per input, the whole thing was **O(nin^3) per transaction**. Core has never
+paid any of this: `PrecomputedTransactionData` walks the transaction once.
+
+### The fix
+One bounded pass records the offset of every input and every output; every
+accessor afterwards is an array index.
+
+- `in_off[0..nin]` -- input `i`'s outpoint is at `in_off[i]`, and because
+  inputs are contiguous its 4-byte nSequence is the last 4 bytes before
+  `in_off[i+1]` (exact for the final input too, since `in_off[nin]` is one
+  past the last one). `sw_prevout` and `sw_seq` become one load each, with no
+  compactsize read at all.
+- `out_off[0..nout]` -- and here the part worth stating plainly: **a CTxOut's
+  BIP143 serialization is byte for byte its wire encoding**, so there is
+  nothing to build. hashOutputs is a `sha256d` over the contiguous slice
+  `[out_off[0], out_off[nout])` **in place**, and SIGHASH_SINGLE's is one over
+  `[out_off[n_in], out_off[n_in+1])`. `sw_ser_txout` is deleted; no output is
+  copied anywhere and the hashOutputs staging loop goes with it.
+
+The table is a per-thread heap buffer (`BMC_TLS_BUF`, 600,000 `uint32`
+entries = 2.29 MiB), not a stack array -- incident #13 is what a size-dependent
+stack buffer does in this file. Its capacity is an arithmetic bound, not a
+guess: an input costs >= 41 wire bytes and an output >= 9, so
+`(nin+1)+(nout+1) <= 0.13550*txlen + 2`, and MAX_BLOCK_SERIALIZED_SIZE (4 MiB)
+gives <= 568,335 entries -- nothing a valid block can carry is refused.
+
+### The bounds from incident #21 are intact, and the walk they guarded is gone
+Section 7's amendment measured #21's bound fix at +16% on this path and said
+most of it was the per-iteration bound in `sw_prevout`/`sw_seq` -- redundant
+given `swtx_parse` had already validated the same bytes, kept anyway because
+"a distant function already checked this" is how #13 and #21 both happened,
+and to be removed by deleting the loops rather than the checks. That is what
+happened: those loops no longer exist, so there is nothing left to re-check.
+What survives unchanged:
+
+- `read_cs` still takes `end`, and still returns on the single-byte encoding
+  before computing any width;
+- every step of the single pass is a "remaining >= wanted" comparison on
+  `sw_avail()`, never `q + n > end`;
+- the `sw_ser_txout` `cap` -- a consensus-safety bound, not a policy one -- is
+  now the caller's `olen > SW_MIDSTATE_CAP` test, and the accept/reject
+  boundary is **identical**, not merely similar: the old running
+  `cap = SW_MIDSTATE_CAP - written` refused exactly when the sum of the CTxOut
+  record lengths passed 4 MiB, and that sum is precisely this range's length.
+  `tests/test_segwit_txout_bound` still passes 125/125, including the
+  3,900,000-byte scale vector and the 5 MB over-cap refusal.
+
+One bound is *strengthened*: `avail(q) < sl + 4` wraps for `sl` within 4 of
+2^64 (`read_cs` can return any 64-bit value the wire supplies), so it is split
+into `avail < sl || avail - sl < 4`.
+
+### One real behaviour change, and it is toward Core
+Hashing a CTxOut in place is only equivalent to re-serializing it if the
+transaction's compactsizes are **minimally encoded**. The old `sw_ser_txout`
+wrote `put_cs(len)`, i.e. the canonical form, so a padded length (`fd 00 00`
+for zero, say) was silently rewritten before hashing; raw bytes are not
+rewritten, and the two answers differ. This was found by a differential fuzz,
+not by reasoning -- 12 cases out of 3.8 M, all of them a poisoned compactsize.
+
+Neither answer is Core's. Core's `ReadCompactSize()` throws "non-canonical
+ReadCompactSize()" and refuses to deserialize such a transaction at all, so it
+cannot appear in any block Core accepts. So `read_cs` now enforces minimality
+-- Core's exact rule -- and refuses. That makes in-place hashing *provably*
+identical to canonical re-serialization for every transaction not refused,
+rather than merely identical on the transactions that happen to exist, and it
+costs the hot path nothing (the single-byte encoding returns first).
+
+Found while proving this and NOT fixed here: nothing else in the tree enforces
+minimality -- `bitcoin_tx.asm`'s compactsize readers do not -- so a peer's
+non-canonical transaction is still mis-parsed everywhere else. That is a
+pre-existing divergence from Core at block-acceptance level, not something
+this path introduced.
+
+### New test, and it has teeth
+`tests/test_segwit_bounds_fuzz.c`: the transaction is copied so its last byte
+abuts a **PROT_NONE guard page**, so a read one byte past the end is a SIGSEGV
+rather than a silent success -- no sanitizer needed, which matters because
+this path links hand-written asm that ASAN cannot instrument. Every real
+mainnet transaction in `segwit_txout_vec.h`, at every truncation from 0 to
+full length, under all five hashtypes and three input indices, plus every
+single-byte position poisoned to 00/fd/fe/ff: **3,184,330 calls**. It passes
+on this tree and on `main`, and **SEGVs on `bf673d0~1`** -- the pre-#21 tree --
+which is the whole point of writing it. Three bounds incidents (#13, #19, #21)
+came out of this file and every one was found by reading rather than by a
+test; now there is a test.
+
+### Byte-identical, against Core, on 461 real mainnet transactions
+This is a performance change and it must not move a single hash.
+
+Corpus: **4,974 vectors** -- 461 real mainnet transactions pulled from the
+Core oracle across heights **481,824 to 962,625** (the first segwit block
+through the incident-#21 census window), each driven at three input indices
+under **six hashtypes** (ALL, NONE, SINGLE, and each with ANYONECANPAY).
+
+- old build vs new build: **4,974/4,974 byte-identical**, 0 refusals;
+- and, more to the point, **both** match Bitcoin Core's own
+  `SignatureHash(..., SigVersion::WITNESS_V0)` on **4,974/4,974**, via
+  `validation/core_verify_oracle.cpp`'s `BIP143` command, which self-checks
+  against BIP-0143's published worked example first. Ground truth is Core,
+  never our own previous answer.
+- The same corpus under `-fsanitize=address,undefined` gives byte-identical
+  output with zero diagnostics.
+- Differential fuzz, old and new linked into one binary over every truncation
+  and single-byte poisoning of the fixture transactions: **3,821,196 cases,
+  3,820,122 identical (hash AND preimage AND return), 1,074 where the new
+  build refuses a non-canonical compactsize, 0 unexplained.** The
+  canonicality verdict comes from an independent walker, not from the
+  implementation under test.
+
+`validation/diff_bip143_corpus.py` + `validation/bip143_corpus_dump.c` are new
+and reproduce the corpus half on demand (`--baseline main`).
+
+### Measured
+`tests/bench_segwit_sighash` is new and permanent so the next change to this
+path has something to be compared against; both earlier figures for it were
+taken with throwaway harnesses. `-O2`, CPU time, min of 15, both builds back
+to back:
+
+| shape | before | after | factor |
+|---|---|---|---|
+| 1 in / 2 out (189 B) | 0.3960 us | 0.3718 us | 1.07x |
+| 2 in / 2 out (304 B) | 0.4364 us | 0.4052 us | 1.08x |
+| 100 in / 5 out | 16.830 us | 2.510 us | 6.7x |
+| 1,372 in / 100 out | 2.633 ms | 30.57 us | **86x** |
+| 2 in / 3,000 out | 5.115 ms | 42.14 us | **121x** |
+
+The common case is not pessimised -- that was the thing to check.
+
+On the real thing: 20 mainnet blocks at heights 616,980-617,018, the exact
+window section 7 profiled, all **53,400 witness inputs** driven through
+`segwit_v0_sighash` -- **5,735.90 ms -> 209.00 ms**, i.e. 107.41 us -> 3.91 us
+per witness input, **27.4x**. `read_cs` calls over the same blocks:
+4,340,010,792 -> 32,889,389, **131.9x**. Of the old total, `strip_witness` --
+untouched by this change -- is 0.010%, so essentially all of section 7's
+`read_cs` share is this and essentially all of it goes.
+
+Projection, with the bound stated: the three symbols are 34.07% of profiled
+cycles, so **the Amdahl ceiling is 1/(1-0.3407) = 1.517x** and nothing here
+can beat it. Residual 1.24% (whole-function, 27.4x) or ~0.2% (`read_cs`
+counts, 131.9x) gives **1.49-1.51x end-to-end**. Do not believe that without
+re-profiling: section 7 exists because a projection off a 227,000-block-stale
+profile said 1.40x and delivered 1.15x, and this share was measured at
+~617,000 while the replay has moved on. The figure that does not depend on the
+share is the 27.4x on the component.
+
+Corroboration that the benchmark drives the profiled work: the old path costs
+107.41 us per witness input against section 1's measured 120.9 us for
+`ecdsa_verify`, and 96.4% of the sighash cost is removed here, predicting the
+three symbols at 45.3% of that pair's cycles. The profile has them at 34.07%
+against 42.07% for the field/EC symbols -- 44.75%. Two routes, 0.6 points
+apart.
+
+No post-change profile of the daemon was taken: the change is not deployed
+(the replay has not reached tip), and `perf_event_paranoid` is 4 on this host,
+which blocks `perf` for a non-root user.
+
+### Deliberately not done
+A per-transaction cache of the three hashes across one transaction's inputs
+(Core's `PrecomputedTransactionData` proper). `segwit_v0_sighash` is called
+from inside the interpreter with no transaction-scoped context, so the cache
+would be a thread-local keyed on (address, length) -- not sound, since a
+different transaction can reuse an address at the same length, and making it
+sound needs a full byte-compare against a retained copy per call. Priced: on
+the 1,372-input shape that compare costs about half of what the rebuild now
+costs, so it buys ~2x on the rarest shape and ~0 on the common one, against a
+wrong-sighash failure mode if the key ever aliased. At 3.91 us against
+`ecdsa_verify`'s 120.9 us the path is now 3.1% of a witness input. Recorded in
+`PERF_SCOPE.md` section 8.6 so it is not re-litigated from scratch.
+
+### Found while measuring, NOT fixed here
+`bitcoin_taproot_sighash.c` has the identical O(n^2) -- `tx_seq`,
+`tx_outpoint`, `ser_txout` and `ser_txout_len` all walk from the start on
+every call, and `ser_txout_len` walks the output list twice -- **and its own
+`read_cs` is unbounded** (it takes no `end`), with bound tests written in the
+`q + sl > end` pointer form that incident #21 had to remove from
+`bitcoin_segwit.c` because a wire-derived length near 2^64 overflows it. That
+path goes hot at height **709,632** and is script-path-heavy from ~775,000
+(`CHAIN_AHEAD_CENSUS.md` sampled one block with 44,933 script-path inputs).
+Same fix, same bounds class, deliberately not in this commit: a performance
+restructure and a consensus-path bounds fix should not land together.
+
+### Full suite
+`make -k test` MAKE_RC=0, 0 failures. `make abi-check` OK.
+
+### Incident #23 and #24 (found by corpus differential, not by the replay): the BIP341 sighash accepted two shapes Core rejects
+*(Numbered after #22 although found before it: #22 was committed and pushed
+while this section was still being written. Both are FALSE ACCEPTS -- Core
+rejects these spends and we returned a usable sighash -- and neither was
+reachable by replaying the real chain, because no such transaction is IN the
+chain: Core-running miners would not include one. They were found by asking
+Core for the answer to 19,721 vectors and comparing, which is the only method
+that finds a false accept at all. #23 is the unvalidated `hash_type`; #24 is
+SIGHASH_SINGLE past the end of the output list. Fixed in `0a3127d`.)*
+
+`fc4bd67` ended with a note that `bitcoin_taproot_sighash.c` carried the
+identical defects one file over, and that a performance restructure and a
+consensus-path bounds fix should not land together. Taproot activates at
+709,632 and the live replay is a few hours away from it, so this is that work.
+All three diagnoses in that note are **confirmed**. Two further problems were
+found while proving the result, and they are worse than either.
+
+### 1. CONFIRMED: the O(n^3), same shape as BIP143's
+
+- `tx_seq(t,i)` and `tx_outpoint(t,i)` each re-walked the input list from the
+  start to reach input `i`, parsing a compactsize per step. BIP341's
+  `sha_sequences` calls `tx_seq` once per input: **O(nin^2)** varint reads.
+- `ser_txout(t,i)` re-walked the first `i` outputs, and `ser_txout_len(t,i)`
+  did the same walk **twice** -- literally twice, the first result computed
+  into a local and then discarded and the loop re-run. `sha_outputs` called
+  both once per output: **three O(nout^2) walks**.
+- And `taproot_sighash()` is called once per input (once per executed
+  OP_CHECKSIG/OP_CHECKSIGADD via `taproot_checksig_fn`), while BIP341's
+  aggregates depend only on the transaction and not on which input is being
+  signed -- so the whole thing was redone from scratch `nin` times.
+  **O(nin^3) per transaction.**
+
+Three of the four aggregates did not need any of it. `c->prevouts`,
+`c->amounts` and `c->spks` are ALREADY the contiguous concatenations BIP341
+asks for; the old loops copied a buffer onto itself 36/8/n bytes at a time into
+a 4 MiB staging buffer and hashed the copy. They are now hashed where they lie.
+Only `sha_sequences` genuinely has to be gathered, because nSequences are 41+
+bytes apart in the transaction, and with `in_off[]` that is one indexed load
+per input.
+
+### 2. CONFIRMED: the OOB read is real, and a plain truncation is enough
+
+`read_cs` took no `end`. A compactsize's width is chosen by its own first
+byte, which is wire data, so any walk landing on the last byte read up to 8
+bytes past it -- and `tx_parse` read each length BEFORE checking that it fit.
+Every bound was the pointer-overflow form `q + (int64_t)sl + 4 > t->tx +
+t->txlen`, which additionally casts an unsigned wire length through `int64_t`,
+so any `sl >= 2^63` went negative and the comparison passed unconditionally.
+
+`tests/test_taproot_bounds_fuzz.c` is new: the transaction is copied so its
+LAST byte abuts a `PROT_NONE` page, so a read one byte past the end is a
+deterministic SIGSEGV. No sanitizer, because this path links hand-written asm
+that ASAN cannot instrument.
+
+    on this tree   ALL PASS (8,601,700 calls, 0 faults)      3.9 s
+    on main        FAILURES (8,601,700 calls, 36,712 faults)
+
+Minimal reproducer, and it is exactly the predicted one -- `01000000ffb21282f7a2`,
+10 bytes: `txlen < 10` passes, the version is read, then the unbounded
+`read_cs` at `tx+4` sees `0xff`, selects the 9-byte form and reads `tx[5..12]`.
+Standalone with no handler installed: **SIGSEGV, exit 139, core dumped.**
+
+The part worth keeping: **14,579 of the 36,712 faults needed no byte poisoning
+at all.** They are plain truncations of real mainnet transactions. The smallest
+is the first 41 bytes of `4cc72b13218183d4a6b13e79ef3e0a73c7987688dd0334866a8398b03e514057`
+(block 775,000), where `q + 36 > tx + txlen` is `tx+41 > tx+41`, i.e. false, so
+the walk advances to `q == end` and `read_cs(&q)` dereferences `*end`. A peer
+truncating a real transaction on a byte boundary was sufficient. Nothing had to
+be crafted.
+
+### 3. NEW, and the reason this is urgent: two consensus divergences, both FALSE ACCEPT
+
+Neither was in fc4bd67's note. Both are pre-existing, both are in the class
+that splits the chain rather than merely stalling it, and both were found by
+asking Core about the corpus rather than by reading the code.
+
+**(a) `hash_type` was never validated.** Core, `SignatureHashSchnorr`:
+
+    if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83))) return false;
+
+which `CheckSchnorrSignature` turns into `SCRIPT_ERR_SCHNORR_SIG_HASHTYPE` --
+the input is invalid. Nothing here checked it at all, and `hash_type` is the
+LAST BYTE OF A 65-BYTE SCHNORR SIGNATURE, entirely attacker-chosen. A spend
+signed with hash_type `0x04` is rejected by Core and was accepted here (`0x04 &
+3 == 0`, so it took the plain `sha_outputs` path and produced a perfectly good
+hash for the spender to have signed).
+
+**(b) SIGHASH_SINGLE past the end of the output list.** Core:
+
+    if (output_type == SIGHASH_SINGLE) {
+        if (in_pos >= tx_to.vout.size()) return false;
+
+BIP143 substitutes a zero hash in this position; BIP341 deliberately does not,
+and this file had carried the BIP143 behaviour over -- it wrote 32 zero bytes
+and returned a usable sighash. This is not a corner that needs constructing:
+**1,710 of the 945-vector first smoke run were exactly this case on real
+mainnet transactions**, before any invalid hash types were added.
+
+Both are now Core's rule exactly, and the accept/reject boundary is checked as
+strictly as the hashes are (see the corpus result below).
+
+### The fix: one bounded pass, then index
+
+`in_off[0..nin]` and `out_off[0..nout]`, recorded in a single bounded walk;
+every accessor afterwards is an array index. Inputs are contiguous, so input
+`i`'s 4-byte nSequence ends exactly at `in_off[i+1]`, and `in_off[nin]` is one
+past the last input, so that is exact for the final input too. `tx_seq` and
+`tx_outpoint` become one load each with no compactsize read at all.
+
+**And the question fc4bd67 asked to be answered explicitly, because BIP341 is
+not BIP143 here.** BIP341's `sha_outputs` is SHA256 over "the serialization of
+all outputs in CTxOut format" -- 8-byte value || compactsize(len) ||
+scriptPubKey per output, which is byte for byte the transaction's own wire
+encoding, exactly as in BIP143. So **yes, the in-place property holds**:
+`sha_outputs` is a single sha256 over `[out_off[0], out_off[nout])` in place and
+SIGHASH_SINGLE's is one over `[out_off[n_in], out_off[n_in+1])`. `ser_txout`
+and `ser_txout_len` are deleted and no output is copied anywhere.
+
+BIP341 does also hash amounts and scriptPubKeys separately -- `sha_amounts` and
+`sha_scriptpubkeys`, which BIP143 has no counterpart for -- and that is **not**
+a counterexample, because those two are over the SPENT outputs, the UTXOs this
+transaction consumes, which are not in this transaction at all. They arrive as
+the caller's own contiguous arrays. The outputs this transaction *creates* are
+hashed in exactly one place and in exactly one format.
+
+Capacity is arithmetic, not a guess, and deliberately the same bound
+`SW_OFF_ENTRIES` uses so the two sighash paths refuse at the same place: an
+input costs >= 41 wire bytes and an output >= 9, so
+`(nin+1)+(nout+1) <= 0.13550*txlen + 2`, and MAX_BLOCK_SERIALIZED_SIZE (4 MiB)
+gives <= 568,335 entries. 600,000 (2.29 MiB) cannot false-reject anything.
+`TS_SEQ_CAP` is derived from it (`4 * TS_OFF_ENTRIES`) so the sequence buffer
+can never be the binding constraint. Per-thread heap (`BMC_TLS_BUF`), never a
+stack array -- incident #13.
+
+Also removed, all latent, all in the buffers the aggregates used to stage into:
+the scriptpubkeys loop tested `n + 600 > TS_AGG_CAP` and then copied `cs + sl`
+bytes (consensus places no limit on a scriptPubKey's size -- incident #21's
+shape, on the heap); the sequences loop had no bound at all AND iterated to
+`c->num_inputs` while `tx_seq` indexed `t->nin`, with nothing checking that
+those agree (now checked); `ser_txout_len` returned `int`, so a scriptPubKey of
+`0x100000000` bytes truncated to 13 and let `ser_txout` memcpy 4 GiB; and
+`agg_hashes` returned `void` and simply `return`ed on overflow, leaving the
+remaining `h_*` outputs UNINITIALIZED for `taproot_sighash` to copy into the
+preimage -- a truncated aggregate was not refused, it was hashed.
+
+`uint8_t pre[256]` also went to a bounded per-thread heap buffer. 256 was
+enough only because a taproot input's spent output is a 34-byte P2TR program;
+for anything larger the cap check fired and returned 0, i.e. a silent FALSE
+REJECT with the boundary at an undocumented ~200 bytes. Core has no such limit.
+
+### Byte-identical against Core, on 196 real mainnet taproot transactions
+
+Ground truth is Bitcoin Core, never our own previous answer.
+`validation/core_verify_oracle.cpp` gains a `BIP341` command running Core's own
+`SignatureHashSchnorr`, and it is self-checked against all seven published
+BIP-341 wallet-test-vectors before any answer is used -- if that fails, nothing
+else runs. (One trap worth recording: `PrecomputedTransactionData::Init()` only
+computes the BIP341 midstates when it *sees* a witness-bearing input whose
+spent scriptPubKey is a 34-byte OP_1 program, so with a witness-stripped
+transaction it silently produces nothing but errors. `Init(tx, spent,
+/*force=*/true)` is required.)
+
+`validation/diff_bip341_corpus.py` + `validation/bip341_corpus_dump.c` are new
+and reproduce the corpus on demand -- pull real taproot transactions, ask Core,
+build both sides, diff -- so the next change here does not reinvent it:
+
+    python3 validation/diff_bip341_corpus.py --baseline main
+
+19,721 vectors over 196 real mainnet taproot transactions from 69 blocks,
+heights 709,632..963,637: three input indices x seven hash types x six invalid
+hash types x key-path/script-path/codesep/annex variants.
+
+    worktree      vs Bitcoin Core :  15,125 / 15,125 hashes match
+    worktree      refusals        :   4,596 /  4,596 also refused
+    baseline(main) vs Bitcoin Core:  15,125 / 15,125 hashes match
+    baseline(main) refusals       :       0 /  4,596 also refused   <-- 4,596 FALSE ACCEPTS
+    worktree vs main              :  15,125 / 19,721 byte-identical,
+                                      4,596 intended refusals, 0 unexplained
+
+That is the whole result in one table. **No hash moved** -- zero unexplained
+differences against the previous implementation. **Every hash matches Core.**
+And the accept/reject boundary, which main got wrong 4,596 times out of 4,596,
+is now exact. Core refusing a vector is itself an answer, so the differ gates
+on it rather than excluding it; that gate is the only reason (a) and (b) were
+found at all.
+
+The same corpus under `-fsanitize=address,undefined` gives byte-identical
+output with zero diagnostics.
+
+### Measured
+
+`tests/bench_taproot_sighash` is new and permanent, so the next change to this
+path has something to be compared against. `-O2`, `CLOCK_PROCESS_CPUTIME_ID`,
+min of 15, both builds back to back, same five shapes as
+`bench_segwit_sighash` so the two tables are directly comparable. Iterations
+per shape are calibrated at runtime to >= 20 ms per run, because one fixed
+count cannot serve two builds 420x apart.
+
+Key-path (`ext_flag=0`); script-path is a flat +0.03 to +0.04 us on both
+builds (the 37 extra preimage bytes) and otherwise indistinguishable:
+
+    shape                  before        after      factor
+    1 in /     2 out     0.4001 us    0.3875 us      1.03x
+    2 in /     2 out     0.4699 us    0.4487 us      1.05x
+    100 in /   5 out     9.7203 us    4.3148 us      2.25x
+    1,372 in / 100 out   1.1254 ms   54.3603 us     20.70x
+    2 in / 3,000 out    18.1766 ms   43.3184 us      419x
+
+**The common case is not pessimised**, and that was the thing to check.
+Four independent min-of-15 repeats, binaries interleaved: the new build is at
+or below the old in every repeat of the 1- and 2-input shapes, key-path and
+script-path, by a consistent 2-5%, with the distributions not overlapping on
+the 2-input rows. The reason is direct -- at nin = 1-2 the offset table costs
+a couple of stores, while the prevouts/amounts/spks *copies* (36+8+35 bytes
+each, staged into a buffer before hashing) and the `ser_txout` output staging
+are gone outright. Per-thread resident scratch also falls, from a 4 MiB
+`TS_AGG_CAP` buffer to a 2.29 MiB offset table.
+
+### On the real thing: 19,870 taproot inputs from five mainnet blocks
+
+Heights 825,000 / 830,000 / 842,000 / 865,000 / 910,000 -- the five with the
+largest taproot input counts out of 38 blocks scanned between 709,700 and
+963,000, and the sample happens to capture both regimes (825,000 is
+inscription-era script-path-heavy; 830,000 and 910,000 carry 1,500- and
+1,000-input consolidations). 19,870 taproot inputs across 12,014 transactions,
+16,387 key-path and 3,483 script-path, each driven once through
+`taproot_sighash()` in block order on the REAL witness-stripped serialization
+-- real input counts, real output counts, real script sizes. CPU time, min of
+15:
+
+    before   4,577.85 ms  (med 4,857.80, max 4,980.31)   230.39 us / input
+    after      243.35 ms  (med   252.68, max   264.94)    12.25 us / input
+
+    18.81x.
+
+The distribution matters more than the aggregate:
+
+    height    taproot in    before        after       factor
+    825,000    3,379        2.25 ms       1.68 ms      1.33x
+    830,000    3,661    3,833.15 ms     195.65 ms     19.59x
+    842,000    4,274       68.00 ms       5.39 ms     12.61x
+    865,000    4,295        2.87 ms       2.15 ms      1.33x
+    910,000    4,261      766.24 ms      65.72 ms     11.66x
+
+Blocks made of ordinary 1-3 input taproot spends gain a flat ~1.33x; the one
+block containing a 1,500-input consolidation goes from **3.83 seconds of
+sighashing to 196 ms**. Nothing gets slower.
+
+Two honest qualifications on that workload. The spent outputs are SYNTHETIC --
+a 34-byte P2TR scriptPubKey and an arbitrary amount per input, which is
+exactly the right size for a real taproot input's prevout, and the cost
+depends only on the count and sizes of those arrays, not their contents; the
+transaction STRUCTURE, which is what the O(n^2) was in, is real. And
+`hash_type` is forced to SIGHASH_DEFAULT, the dominant real choice and the
+most expensive branch, identically for both builds. This is a component
+benchmark, not a consensus check -- the consensus check is the corpus above.
+
+No end-to-end projection is offered. PERF_SCOPE.md section 7 exists because a
+projection off a stale profile share said 1.40x and delivered 1.15x, and this
+path has never been profiled live at all: the replay has not reached 709,632,
+so its share of taproot-era cycles is unmeasured. The figure that does not
+depend on a share is the 18.81x on the component.
+
+### The outer O(nin) is still there, and that is not a regression
+
+`taproot_sighash()` still runs the single pass and re-hashes the O(nin)
+prevouts/amounts/spks arrays on EVERY call, and it is still called once per
+input. What was removed is the inner re-walk. That is why the 1,372-input
+shape is still 54 us per call rather than ~1 us, and why block 830,000 still
+costs 53 us per taproot input afterwards. Core hoists exactly this to once per
+transaction (`PrecomputedTransactionData`); we cannot, for the reason
+PERF_SCOPE.md 8.6 already records for BIP143 -- there is no transaction-scoped
+context to hang it on, and a thread-local keyed on the transaction's address
+and length is not sound. It is the next available win on this path and it is
+larger here than it was there, because BIP341 has four aggregates rather than
+three. Recorded in PERF_SCOPE.md section 10.
+
+### Deliberately NOT done
+
+- **An `spks_len` parameter.** `c->spks` has no length in the API, so its walk
+  cannot be *proven* in bounds; it carries a hard 4 MiB ceiling checked before
+  every advance instead. It is built by this codebase from resolved UTXOs
+  (`daemon/tx_verify.c`, `bitcoin_txval_modern.c` both write one single-byte
+  compactsize per entry), not taken from the wire, so this is a real but
+  second-order gap. Fixing it is an ABI change across ~10 call sites in two .c
+  files and five tests, which does not belong in a sighash restructure.
+- **A per-transaction cache of the aggregates across one transaction's
+  inputs** -- Core's `PrecomputedTransactionData` proper. Declined for exactly
+  the reason PERF_SCOPE.md 8.6 records for the BIP143 path: there is no
+  transaction-scoped context to hang it on, and a thread-local keyed on the
+  transaction's address and length is not sound.
+
+### FOUND WHILE PROVING THIS, NOT FIXED HERE
+
+`bitcoin_txval_modern.c:240` (the mempool-accept path, not block validation)
+builds the taproot aggregate arrays into `uint8_t sp[16*70]` and fills it with
+
+    if (T.in[k].prev_spklen < 0xfd) sp[off++] = (uint8_t)T.in[k].prev_spklen;
+    else return 0;
+    memcpy(sp+off, T.in[k].prev_spk, T.in[k].prev_spklen);
+
+with no check that `off` stays inside `sp`. `nin` is capped at 16 and
+`prev_spklen` at 252, so the worst case is 16*253 = 4,048 bytes into a
+1,120-byte stack array. Eleven bare 2-of-3 multisig prevouts (105 bytes each)
+is enough, and bare multisig outputs exist on mainnet and are spendable. Same
+class as #13 and #21, third file. Not fixed here because it is a different file
+on a different path and this commit already carries three concerns.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
