@@ -2797,6 +2797,19 @@ interp_checkmultisig:
     mov   rax, [rbp-0x18]
     sub   rax, [rbp-0x20]
     mov   [rsp+40], rax          ; cur_src len
+    ; FindAndDelete of the signatures from scriptCode is a BASE-sigversion
+    ; rule ONLY. Core applies it inside OP_CHECKMULTISIG solely under
+    ; SigVersion::BASE (interpreter.cpp: `if (sigversion == SigVersion::BASE)
+    ; { ... FindAndDelete ... }`); for SigVersion::WITNESS_V0 (BIP143) and
+    ; TAPSCRIPT the scriptCode is the witnessScript verbatim. Stripping under
+    ; witness produces the wrong sighash and rejects every valid witness
+    ; multisig (found 2026-08-22 on real chain: P2SH-P2WSH 2-of-3 at height
+    ; 481945, and every native/wrapped m-of-n after). Skip the strip loop for
+    ; any non-BASE sigversion; the checksig callback for witness (see
+    ; bitcoin_scriptverify.c's sv_checksig_witness_v0) also omits FindAndDelete.
+    mov   eax, dword [r12+48]     ; sigversion
+    test  eax, eax
+    jnz   .cms_strip_done         ; != BASE -> no FindAndDelete
     xor   r13d, r13d             ; j = 0
 .cms_strip_loop:
     mov   eax, [rsp+16]          ; nSigs

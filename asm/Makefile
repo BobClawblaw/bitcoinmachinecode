@@ -229,7 +229,7 @@ tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
 # optimisation, and this harness sits directly on top of it.
 REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/archive_verify.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o \
     bitcoin_chainwork.o bitcoin_hash.o sha256.o bitcoin_tx.o \
@@ -247,7 +247,9 @@ tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 # parallel path (>= TXV_PARALLEL_MIN non-taproot inputs) against a genuinely
 # multi-signed P2WPKH tx (see tests/multi_p2wpkh_vec.h / gen_multi_p2wpkh.py).
 TXVPARSRCS := tests/test_tx_verify_parallel.c daemon/tx_verify.c bitcoin_scriptverify.c \
-    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+    bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+tests/test_segwit_real: tests/test_segwit_real.c tests/segwit_real_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS)
+	$(CC) -no-pie -O0 -Wall -o $@ tests/test_segwit_real.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread
 tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(TXVPARSRCS) $(REORGOBJS) -lpthread
 
@@ -256,7 +258,7 @@ tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJ
 # bulk mode) compaction or at the very end of the call.
 CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CKPTSRCS) $(REORGOBJS) -lpthread
@@ -266,7 +268,7 @@ tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS)
 # not just the failing tx -- see rollback_partial_apply in daemon/utxo_live.c daemon/block_witness.c. bitcoin_cmpct.o
 ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(ROLLBACKSRCS) $(REORGOBJS) -lpthread
@@ -279,7 +281,7 @@ tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS)
 # per-block persist_applied_height() call in daemon/utxo_live.c daemon/block_witness.c. bitcoin_cmpct.o
 CRASHRESUMESRCS := tests/test_utxo_catchup_crash_resume.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CRASHRESUMESRCS) $(REORGOBJS) -lpthread
@@ -290,7 +292,7 @@ tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(RE
 # the worker mid-block (every stop/restart did exactly that until 2026-08-22).
 SHUTDOWNSRCS := tests/test_utxo_catchup_shutdown.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(SHUTDOWNSRCS) $(REORGOBJS) -lpthread
@@ -302,7 +304,7 @@ tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS
 # forced mac_flush inside the block; key-by-key diff vs a never-crashed run.
 CRASHRECSRCS := tests/test_utxo_crash_recovery.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CRASHRECSRCS) $(REORGOBJS) -lpthread
@@ -316,7 +318,7 @@ tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS)
 # the correct failing tx.
 CROSSTXSRCS := tests/test_cross_tx_verify.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CROSSTXSRCS) $(REORGOBJS) -lpthread
@@ -329,7 +331,7 @@ tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS)
 # test file's own header comment for full root-cause detail.
 BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REORGOBJS)
 	$(CC) -no-pie -O0 -Wall -o $@ $(BYTEPOOLSRCS) $(REORGOBJS) -lpthread
@@ -417,7 +419,7 @@ tests/test_net_policy: tests/test_net_policy.c daemon/net_policy.c bitcoin_net.o
 RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c daemon/tx_accept.c \
     daemon/mempool_cfg.c daemon/reorg.c daemon/locator_build.c daemon/archive_verify.c \
     daemon/node_config.c bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c \
-    bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_scriptverify.c
+    bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c
 tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 	$(CC) -no-pie -O0 -o $@ $(RECOVERSRCS) $(DAEMONOBJS) -lpthread
 
@@ -431,7 +433,7 @@ DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/block_witness.c d
     daemon/upload_cap.c daemon/reorg.c daemon/undo_log.c daemon/locator_build.c \
     daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c
 tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DIALSRCS) $(DAEMONOBJS) -lpthread
 
@@ -555,8 +557,8 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
     bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
-SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
-    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c bitcoin_scriptverify.c \
+    bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
 tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
@@ -855,8 +857,8 @@ tests/test_stack_push_len: tests/test_stack_push_len.c $(INTERPOBJS) bitcoin_sig
 # C reference, verdict AND ScriptError code, on the genuine P2SH vectors.
 # Those vectors are already differentially validated against Core, so
 # agreement here is agreement with Core transitively.
-tests/test_scriptverify_parity: tests/test_scriptverify_parity.c bitcoin_scriptverify.c bitcoin_verify.c script_error_codes.h $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
-	$(CC) -no-pie -O0 -I. -I tests -o $@ tests/test_scriptverify_parity.c bitcoin_scriptverify.c bitcoin_verify.c $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
+tests/test_scriptverify_parity: tests/test_scriptverify_parity.c bitcoin_scriptverify.c bitcoin_verify.c bitcoin_segwit.c bitcoin_addr.o script_error_codes.h $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
+	$(CC) -no-pie -O0 -I. -I tests -o $@ tests/test_scriptverify_parity.c bitcoin_scriptverify.c bitcoin_verify.c bitcoin_segwit.c bitcoin_addr.o $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
 
 # test_scriptverify_thread_stress -- many pthreads hammering sv_verify_script
 # concurrently, proving the 2026-08-19 TLS conversion (bitcoin_scriptverify.c
@@ -997,7 +999,7 @@ tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/
 # FULL mempool acceptance pipeline for modern outputs: mempool policy +
 # whole-tx validation + ECDSA/Schnorr verify (bitcoin_txval_modern.c +
 # bitcoin_segwit.c + bitcoin_taproot_sighash.c + asm utxo/mempool/tx/taproot).
-MEMPACCOBJS := bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_mempool_policy.c \
+MEMPACCOBJS := bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_mempool_policy.c \
     bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o secp256k1_schnorr.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
@@ -1011,8 +1013,8 @@ tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/moder
 # txval_modern -> tx_accept_validate's accept/reject + mempool storage) --
 # NOT covered by test_mempool_accept_modern, which only exercises the old
 # bitcoin_utxo.asm-backed passthrough shim, never tx_accept.c itself.
-TXACCEPTOBJS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
-    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o utxo_lsm_mm.o \
+TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
+    bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o utxo_lsm_mm.o \
     bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
@@ -1124,7 +1126,7 @@ DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/block_witness.c daemon/tx_
     daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
     daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c \
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
-    daemon/tx_verify.c bitcoin_scriptverify.c
+    daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c
 daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O0 -o $@ $(DAEMONSRCS) $(DAEMONOBJS) -lpthread
 
@@ -1273,6 +1275,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_hashtype_e2e
 	./tests/test_script_flags
 	./tests/test_tx_verify_parallel
+	./tests/test_segwit_real
 	./tests/test_utxo_checkpoint
 	./tests/test_apply_block_rollback
 	./tests/test_utxo_catchup_crash_resume
