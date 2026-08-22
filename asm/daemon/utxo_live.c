@@ -103,6 +103,11 @@ typedef struct {
     u32 pn_in;    /* tx_parse's own input count -- tx_verify.c reuses this
                     * to size its flat verify array without re-parsing */
 } block_tx_t;
+#include <stddef.h>
+#include "block_witness.h"
+/* block_witness.c reads only the (ptr, len) prefix of block_tx_t, by stride. */
+_Static_assert(offsetof(block_tx_t, ptr) == 0 && offsetof(block_tx_t, len) == 8, "block_tx_t prefix must match bw_txref_t");
+extern unsigned long long script_flags_for_block(unsigned long long height, const u8 hash32[32]);
 extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                                        const u8 block_hash32[32], void* lst, void* u, void* bx,
                                        u64* fail_tx_index, const char** reason);
@@ -582,6 +587,29 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         tx_txid(txs[t].txid, q, txlen, txid_scratch, sizeof txid_scratch);
         total_nin += pn_in; total_nout += pn_out;
         q += txlen;
+    }
+
+    /* ---- Phase 0.25: BIP141 witness commitment (Core CheckWitnessMalleation).
+     * A whole-block structural check, like the merkle root: with segwit
+     * active and a commitment in the coinbase, sha256d(witness-merkle-root ||
+     * nonce) must match it; otherwise no tx may carry witness data. This is
+     * the check that rejects a witness-STRIPPED block -- which is exactly
+     * what the archive held for every block >= 481824 until 2026-08-22, and
+     * what the tx merkle root can never notice. Segwit-active is read from
+     * the flag schedule (NULLDUMMY bit == height >= SegwitHeight), the same
+     * gate Core uses (DeploymentActiveAfter(prev, SEGWIT)), not the WITNESS
+     * script flag, which is on from genesis. Nothing applied yet -- no
+     * rollback. ---- */
+    {
+        unsigned long long bflags = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
+        int segwit_active = (int)((bflags >> BW_SFC_BIT_NULLDUMMY) & 1ULL);
+        const char* wreason = "?";
+        long wr = block_check_witness_commitment(txs, ntx, sizeof(block_tx_t), segwit_active,
+                                                 txid_scratch, sizeof txid_scratch, &wreason);
+        if (wr != 1) {
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
+            return 0;
+        }
     }
 
     /* ---- Phase 0 cont'd / Phase 0.5: in-block output index + whole-block
