@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#9; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#10; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -137,6 +137,72 @@ itself, not trust its caller.
 - 9 blockchain-query RPCs (`090a109`). Scratch Bitcoin Core at
   `/storage/core-oracle` is now an authorized development oracle (the
   production install stays off-limits).
+
+### Incident #10: the archive was witness-stripped for the entire segwit era (~482,000 blocks)
+
+At 06:13 the from-scratch replay -- every fix of the night deployed --
+rejected the first segwit block, 481824, tx 562: `p2wpkh needs exactly 2
+witness items`. The Core oracle shows that input has exactly 2. So the bytes
+we verify differed from the bytes Core has, and block 481824 is the first
+block in history where a witness-bearing transaction could possibly be
+parsed. Comparing `index.dat`'s `data_size` against Core `getblock`: ours
+equals Core's `strippedsize` -- never `size` -- at 481824, 481900, 500000,
+550000. **Every block from segwit activation to tip was stored without its
+witness data.**
+
+Cause: `p2p_getdata_block` (`bitcoin_p2p.asm:103`) requested inventory type
+`MSG_BLOCK` (2). Per BIP144 a peer answers that with the non-witness
+serialization. The merkle root commits to txids, which are computed over
+that same stripped form, so `cons_verify` accepted every stripped block,
+"integrity OK" was true of headers and hashes and hollow for bodies, and
+`cuda_txid_reindex`'s "merkle OK" never could have caught it. Core *would*
+have rejected each of those blocks on arrival -- `bad-witness-nonce-size`
+-- because Core validates the BIP141 coinbase witness commitment. This node
+did not. Two bugs, then: the request type, and a missing consensus check.
+
+Three more turned up while fixing the first. `test_serve` failed the moment
+the client asked with `MSG_WITNESS_BLOCK`: the **server** dispatch compared
+the raw type against 1/2/4, so a witness request matched nothing and was
+silently ignored -- this node could not serve a block to any current peer.
+And the inbound-inv keep-up path built its own getdata inline with type 2,
+so even after an archive repair every *new* tip block would have arrived
+stripped again. All in `bitcoin_serve.asm`.
+
+Fixes: `31eac9a` (`MSG_WITNESS_BLOCK` in `p2p_getdata_block` + the
+byte-exact test), `fe3addb` (server masks the witness flag before dispatch;
+keep-up requests `MSG_WITNESS_BLOCK`), `191df6c` (BIP141 witness-commitment
+validation in `daemon/block_witness.c`, called before any signature work --
+mirrors `validation.cpp` `CheckWitnessMalleation`, gated on the segwit
+deployment height as Core does). Its decisive test feeds it the **exact
+stripped bytes of 481824 that our archive held** and gets
+`bad-witness-nonce-size`; one flipped witness byte gets
+`bad-witness-merkle-match`; a commitment removed with witnesses kept gets
+`unexpected-witness`.
+
+Recovery, without a from-scratch replay: the UTXO checkpoint at 481823 is
+valid (no witness data exists below segwit). `index.dat` and `chainwork.dat`
+were truncated to 481824 records (backups `*.pre-witness-truncate` in
+`/storage/bmc-archive-backup-20260822`); 359.8 GB of stripped bodies became
+dead space in the blk files (reclaimable later by the file-granular prune).
+Re-downloading 482k blocks over the internet would take days, so the local
+Core oracle was moved to loopback 8333 (`listen=1`, bound to 127.0.0.1 only
+-- the downloader hardcodes 8333, `paribd.c:58`) and the node configured
+`connect=127.0.0.1`. First re-fetched block: 481824 at 989,323 bytes ==
+Core's `size`. One peer meant one download worker (~14 MB/s); the oracle now
+binds sixteen loopback aliases and the node connects to each, one worker
+per peer. `stopatheight` tracks the oracle's own IBD height and must be
+raised as it advances, then removed with `connect=` once the archive is
+complete.
+
+Not fixed yet, in `FEATURE_GAPS.md`: prefer `NODE_WITNESS` peers; serve the
+stripped form to a bare `MSG_BLOCK` request (no such peers exist any more);
+`MSG_WITNESS_TX` for transaction relay -- the mempool path has the same
+shape of bug.
+
+The lesson is the one from #6 again, sharper: a replay that runs clean is
+evidence only about the checks that exist. Every tool that "verified the
+archive against Core" compared headers and txids -- exactly the fields that
+do not change when witnesses are stripped.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
