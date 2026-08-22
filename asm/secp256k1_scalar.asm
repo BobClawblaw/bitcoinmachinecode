@@ -54,6 +54,29 @@ DELTA:
     dq 0x0000000000000001
     dq 0x0000000000000000
 
+; ---- GLV endomorphism constants (PERF_SCOPE.md 4.3), 4 LE limbs each.
+; Transcribed from libsecp256k1 (scalar_impl.h:83 lambda, :144-159 the
+; lattice constants) and re-verified in validation/glv_split_oracle.py:
+; lambda^3 == 1 (mod n), lambda^2 + lambda + 1 == 0, g1/g2 are
+; round(2^384 * b2 / n) and round(2^384 * -b1 / n) for Core's basis
+; (a1,b1),(a2,b2) with a1*b2 - b1*a2 == n, minus_b1/minus_b2 are -b1/-b2
+; mod n. Public curve parameters, not derived secrets. ----
+align 16
+LAMBDA_LIMBS:
+    dq 0xDF02967C1B23BD72, 0x122E22EA20816678, 0xA5261C028812645A, 0x5363AD4CC05C30E0
+align 16
+MINUS_B1_LIMBS:
+    dq 0x6F547FA90ABFE4C3, 0xE4437ED6010E8828, 0x0000000000000000, 0x0000000000000000
+align 16
+MINUS_B2_LIMBS:
+    dq 0xD765CDA83DB1562C, 0x8A280AC50774346D, 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF
+align 16
+G1_LIMBS:
+    dq 0xE893209A45DBB031, 0x3DAA8A1471E8CA7F, 0xE86C90E49284EB15, 0x3086D221A7D46BCD
+align 16
+G2_LIMBS:
+    dq 0x1571B4AE8AC47F71, 0x221208AC9DF506C6, 0x6F547FA90ABFE4C4, 0xE4437ED6010E8828
+
 ; n - 2, the Fermat inverse exponent, as 32 little-endian bytes (sc_inv).
 align 16
 N_EXP:
@@ -786,6 +809,217 @@ sc_inv_var:
     mov  [rdi+8],  r9
     mov  [rdi+16], r10
     mov  [rdi+24], r11
+    ret
+
+; ----------------------------------------------------------------------------
+; void sc_mul_512(r[8], a[4], b[4]) : r = a*b, the full 512-bit product, NO
+;   reduction. This is sc_mul's Phase 1 (16 schoolbook products with full
+;   carry chains) exposed as a callable: the GLV split (PERF_SCOPE.md 4.3)
+;   needs the raw product's limbs 5..7, which the reduced sc_mul discards.
+;   Same frame layout as sc_mul so the MULACC macro is reused verbatim:
+;   a @ rbp-192, b @ rbp-224, out @ rbp-232, cur[0..9] @ rbp-80.
+;   ABI: rdi=out, rsi=a, rdx=b. Preserves rbx, r12-r15, rbp.
+; ----------------------------------------------------------------------------
+global sc_mul_512
+sc_mul_512:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 232
+
+    mov  rax, [rsi+0]
+    mov  [rbp-192], rax
+    mov  rax, [rsi+8]
+    mov  [rbp-184], rax
+    mov  rax, [rsi+16]
+    mov  [rbp-176], rax
+    mov  rax, [rsi+24]
+    mov  [rbp-168], rax
+    mov  rax, [rdx+0]
+    mov  [rbp-224], rax
+    mov  rax, [rdx+8]
+    mov  [rbp-216], rax
+    mov  rax, [rdx+16]
+    mov  [rbp-208], rax
+    mov  rax, [rdx+24]
+    mov  [rbp-200], rax
+    mov  [rbp-232], rdi
+
+    xor  eax, eax
+    lea  rdi, [rbp-80]
+    mov  rcx, 10
+.zero_cur:
+    mov  [rdi], rax
+    add  rdi, 8
+    dec  rcx
+    jnz  .zero_cur
+
+    MULACC 0,0
+    MULACC 0,1
+    MULACC 0,2
+    MULACC 0,3
+    MULACC 1,0
+    MULACC 1,1
+    MULACC 1,2
+    MULACC 1,3
+    MULACC 2,0
+    MULACC 2,1
+    MULACC 2,2
+    MULACC 2,3
+    MULACC 3,0
+    MULACC 3,1
+    MULACC 3,2
+    MULACC 3,3
+
+    mov    rdi, [rbp-232]
+%assign li 0
+%rep 8
+    mov    rax, [rbp-80 + 8*li]
+    mov    [rdi + 8*li], rax
+%assign li li+1
+%endrep
+    add  rsp, 232
+    pop  rbp
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; int sc_split_lambda(r1[4], r2[4], k[4]) -- GLV decomposition, PERF_SCOPE 4.3
+;   k == r1 + LAMBDA*r2 (mod n), with each of r1, r2 either < 2^128 or its
+;   negation mod n < 2^128 (so a 129-slot wNAF covers it; the sign rule is
+;   "bit 255 set => negative", valid because n > 2^255). Exactly
+;   libsecp256k1's secp256k1_scalar_split_lambda (scalar_impl.h:142-178):
+;     c1 = round((k*G1) >> 384)       ; round = + bit 383 of the product
+;     c2 = round((k*G2) >> 384)
+;     c1 = c1*MINUS_B1 ; c2 = c2*MINUS_B2 ; r2 = c1 + c2   (all mod n)
+;     r1 = k - r2*LAMBDA
+;   Then the identity check libsecp runs only in VERIFY builds is run
+;   ALWAYS (1 sc_mul + 1 sc_add, ~0.1 us): LAMBDA*r2 + r1 must equal k.
+;   Returns eax=1 on success, eax=0 if that check fails -- the caller
+;   (point_scalar_mul_glv) then falls back to the plain multiply; a verify
+;   path degrades to slow-and-correct, it never aborts.
+;   Requires k < n (every caller passes a reduced scalar; sc_sub needs it).
+;   ABI: rdi=r1, rsi=r2, rdx=k (r1, r2 must not alias k). Preserves
+;   rbx, r12-r15, rbp. Calls sc_mul_512, sc_mul, sc_add, sc_sub.
+;   Frame: t @ rbp-0x50, c1 @ rbp-0x70, c2 @ rbp-0x90, prod[8] @ rbp-0xd0.
+;   5 pushes (0x28) + 0xa8 = 0xd0 -> rsp = rbp-0xd0, 16-byte aligned.
+; ----------------------------------------------------------------------------
+global sc_split_lambda
+sc_split_lambda:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0xa8
+    mov  r12, rdi            ; r1
+    mov  r13, rsi            ; r2
+    mov  r14, rdx            ; k
+
+    ; ---- c1 = round((k * G1) >> 384) ----
+    lea  rdi, [rbp-0xd0]
+    mov  rsi, r14
+    lea  rdx, [G1_LIMBS]
+    call sc_mul_512
+    mov  rax, [rbp-0xd0+40]  ; prod[5]
+    shr  rax, 63             ; rounding bit 383
+    add  rax, [rbp-0xd0+48]  ; + prod[6]
+    mov  [rbp-0x70], rax
+    mov  rax, [rbp-0xd0+56]  ; prod[7]
+    adc  rax, 0
+    mov  [rbp-0x70+8], rax
+    mov  eax, 0              ; mov keeps CF
+    adc  rax, 0              ; 2^128 itself is reachable
+    mov  [rbp-0x70+16], rax
+    mov  qword [rbp-0x70+24], 0
+
+    ; ---- c2 = round((k * G2) >> 384) ----
+    lea  rdi, [rbp-0xd0]
+    mov  rsi, r14
+    lea  rdx, [G2_LIMBS]
+    call sc_mul_512
+    mov  rax, [rbp-0xd0+40]
+    shr  rax, 63
+    add  rax, [rbp-0xd0+48]
+    mov  [rbp-0x90], rax
+    mov  rax, [rbp-0xd0+56]
+    adc  rax, 0
+    mov  [rbp-0x90+8], rax
+    mov  eax, 0
+    adc  rax, 0
+    mov  [rbp-0x90+16], rax
+    mov  qword [rbp-0x90+24], 0
+
+    ; ---- c1 *= MINUS_B1 ; c2 *= MINUS_B2  (mod n; sc_mul copies inputs
+    ;      to its own frame first, so in-place is fine) ----
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [rbp-0x70]
+    lea  rdx, [MINUS_B1_LIMBS]
+    call sc_mul
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [rbp-0x90]
+    lea  rdx, [MINUS_B2_LIMBS]
+    call sc_mul
+
+    ; ---- r2 = c1 + c2 ----
+    mov  rdi, r13
+    lea  rsi, [rbp-0x70]
+    lea  rdx, [rbp-0x90]
+    call sc_add
+
+    ; ---- t = r2 * LAMBDA ; r1 = k - t ----
+    lea  rdi, [rbp-0x50]
+    mov  rsi, r13
+    lea  rdx, [LAMBDA_LIMBS]
+    call sc_mul
+    mov  rdi, r12
+    mov  rsi, r14
+    lea  rdx, [rbp-0x50]
+    call sc_sub
+
+    ; ---- permanent identity check: LAMBDA*r2 + r1 == k ----
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [LAMBDA_LIMBS]
+    mov  rdx, r13
+    call sc_mul
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [rbp-0x50]
+    mov  rdx, r12
+    call sc_add
+    mov  rax, [rbp-0x50+0]
+    cmp  rax, [r14+0]
+    jne  .bad
+    mov  rax, [rbp-0x50+8]
+    cmp  rax, [r14+8]
+    jne  .bad
+    mov  rax, [rbp-0x50+16]
+    cmp  rax, [r14+16]
+    jne  .bad
+    mov  rax, [rbp-0x50+24]
+    cmp  rax, [r14+24]
+    jne  .bad
+    mov  eax, 1
+    jmp  .out
+.bad:
+    xor  eax, eax
+.out:
+    add  rsp, 0xa8
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
