@@ -136,6 +136,11 @@ EIVOBJS := secp256k1_ecdsa.o tests/ecdsa_verify_ref.o secp256k1_scalar.o secp256
 tests/test_ecdsa_inverse: tests/test_ecdsa_inverse.c tests/ecdsa_inverse_vec.h $(EIVOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_ecdsa_inverse.c $(EIVOBJS)
 
+# PERF_SCOPE.md 4.3 (e): ecdsa_verify with GLV on vs off vs the frozen
+# reference, all three verdicts compared per case.
+tests/test_ecdsa_glv_switch: tests/test_ecdsa_glv_switch.c tests/ecdsa_inverse_vec.h $(EIVOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_ecdsa_glv_switch.c $(EIVOBJS)
+
 tests/test_ecdsa: tests/test_ecdsa.c secp256k1_ecdsa.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o
 	$(CC) $(CFLAGS) -o $@ tests/test_ecdsa.c secp256k1_ecdsa.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o
 
@@ -454,7 +459,7 @@ DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_serve.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
     bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o \
+    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
     bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o \
     bitcoin_script_flags.o sha1.o
@@ -547,7 +552,7 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     sha256.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
     bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
-    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o secp256k1_fe.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
     bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
@@ -762,7 +767,7 @@ tests/test_compact_manifest_order: tests/test_compact_manifest_order.c $(UTXOLSM
 # P2PKH spend verification (verify_p2pkh + its sighash/pubkey/ecdsa chain).
 TXVALOBJS := bitcoin_utxo.o bitcoin_tx.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
-    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o bitcoin_hash.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o bitcoin_hash.o \
     sha256.o
 tests/test_txval: tests/test_txval.c tests/txval_vec.h $(TXVALOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_txval.c $(TXVALOBJS)
@@ -817,7 +822,7 @@ tests/test_wrpc_send: tests/test_wrpc_send.c wallet_core.c $(WALLETPRIMS) bitcoi
 # OP_CHECKMULTISIG verification over the existing sighash/pubkey/ecdsa chain.
 MULTISIGOBJS := bitcoin_multisig.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
-    secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
+    secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
     ripemd160.o
 tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_multisig.c $(MULTISIGOBJS)
@@ -827,7 +832,7 @@ tests/test_multisig: tests/test_multisig.c $(MULTISIGOBJS)
 # C VerifyScript (two-pass + P2SH sub-script execution + CheckMultisig).
 VERIFYOBJS := bitcoin_verify.c bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
-    secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
+    secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
     ripemd160.o
 tests/verify_p2sh_shim: tests/verify_p2sh_shim.c $(VERIFYOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/verify_p2sh_shim.c $(VERIFYOBJS)
@@ -992,7 +997,7 @@ tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/
 MEMPACCOBJS := bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_mempool_policy.c \
     bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o secp256k1_schnorr.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
-    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o secp256k1_fe.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o \
     ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/modern_vec.h tests/modern_spend.h $(MEMPACCOBJS)
@@ -1007,7 +1012,7 @@ TXACCEPTOBJS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bit
     bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o utxo_lsm_mm.o \
     bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o secp256k1_point_ct.o \
+    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o \
     bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXACCEPTOBJS)
@@ -1205,6 +1210,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_taproot_scriptpath
 	./tests/test_mul_carry_regression
 	./tests/test_ecdsa_inverse
+	./tests/test_ecdsa_glv_switch
 	./tests/test_lsm_mmap_diff
 	./tests/test_lsm_sparse_diff
 	./tests/soak_lsm_mm
