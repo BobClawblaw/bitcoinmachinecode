@@ -467,6 +467,40 @@ having drifted up as the replay added UTXOs: proof that the value was a
 free-drifting wrong seed rather than a fixed offset, and a good argument
 against ever "fixing" a symptom whose sign happens to look plausible today.
 
+**And then the fixed counter immediately earned its keep.** The first boot
+on the new code ran the one-time recount over the production set (10 runs,
+13 GB, 133 s of reload) and reported `live=77191281` at height 575,833. The
+oracle, asked the same question, disagrees: `gettxoutsetinfo none 575833`
+gives **54,953,225** `txouts`. We hold **22,238,056** more entries than
+Core.
+
+The cause is `daemon/utxo_live.c:339` -- `live_on_output` puts every output
+into the set with no script inspection at all, while Core never writes a
+provably-unspendable output to the chainstate (leading `OP_RETURN`, or a
+script over `MAX_SCRIPT_SIZE`). Verified by magnitude rather than assumed:
+sampling the oracle every 25,000 blocks to 575,833 gives ~37.7 nulldata
+outputs per block, extrapolating to ~21.7M -- the observed delta to within
+2.5 %.
+
+This is not a consensus divergence. An `OP_RETURN` output is unspendable on
+both sides; Core rejects a spend of one for a missing prevout, we find the
+entry and fail the script. Same verdict by a different route. What it does
+cost is storage, compaction amplification, and the Stage D acceptance test
+itself -- set-hash parity with Core is unreachable while the two sets differ
+by 22M entries. It is left unfixed for now on purpose: the filter is a few
+lines, but it only affects outputs applied after it lands, so it is worth
+little without a from-scratch rebuild, and a rebuild costs the entire
+replay. See `FEATURE_GAPS.md`.
+
+The sharpest detail is that the codebase had already made this argument --
+once, correctly, and only for a single output. `utxo_live.c:548` excludes
+the genesis coinbase precisely because applying it "would leave this node
+one UTXO richer than Core forever, surfacing the first time our set is
+compared against `gettxoutsetinfo`". The same sentence describes twenty-two
+million other outputs. Getting a rule right in one place is not the same as
+holding it as an invariant, and only an external oracle showed the
+difference -- a broken telemetry counter had been hiding it all along.
+
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
 ### Real production incident #4 (autonomous, overnight): CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY were stubs, not real checks
