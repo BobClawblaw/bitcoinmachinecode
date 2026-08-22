@@ -513,7 +513,8 @@ Session result, all deployed and running on the live rebuild:
 | `ecdsa_verify` | 115–121 µs | **~39 µs** (loaded: 44) |
 | vs libsecp256k1 on this CPU (21.8 µs) | 5.2× slower | **1.65× slower** |
 | kernel (I/O) share of cycles | 31–38 % | **5 %** |
-| replay, identical heights 343087→363086 | 7.8 blk/s | **34.1 blk/s (4.39×)** |
+| replay, identical heights 343087→363086 (before GLV) | 7.8 blk/s | **34.1 blk/s (4.39×)** |
+| replay, identical heights 378845→398844 (with GLV) | 3.9 blk/s | **22.2 blk/s (5.68×)** |
 
 The two walls the first profile found — inversions and bloom copies — are
 both gone. What remains is `fe_mul` at 56 % of cycles: **field
