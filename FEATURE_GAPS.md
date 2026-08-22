@@ -210,6 +210,10 @@ not just present as unused/tested-in-isolation code:
   peers; serve the stripped form to a bare `MSG_BLOCK` request; and
   **`MSG_WITNESS_TX` for transaction relay** — the mempool path still fetches
   transactions without witnesses (same bug shape, not yet hit).
+- **P2WPKH BIP143 scriptCode — FIXED 2026-08-22** (`b3800f0`): was the witness
+  program; now `76a914<h160>88ac`. Lesson recorded: vector generators must be
+  derived from Core or the BIP's worked example, never from the verifier's
+  own assumptions (`validation/bip143_ref.py` now anchors on BIP143's example).
 - **BIP141 witness-commitment validation — DONE 2026-08-22** (`191df6c`,
   `daemon/block_witness.c`): the consensus check that makes a stripped block
   unacceptable. Core had it; we did not, which is why the archive could be

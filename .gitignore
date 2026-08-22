@@ -302,3 +302,6 @@ asm/tests/test_witness_commitment
 asm/tests/fixtures/blk_4*.bin
 asm/tests/fixtures/blk_5*.bin
 asm/tests/fixtures/blk_6*.bin
+
+# live-config backups taken before operational edits
+config/bitcoin.conf.bak-*

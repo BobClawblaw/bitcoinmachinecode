@@ -27,7 +27,7 @@ assembly.
 `PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
 acceptance test: a from-scratch, full-signature-verification replay of the
 real mainnet archive (no `assumevalid`), ~386k of 963k blocks so far with
-every fix deployed. Ten real production incidents have been found by that
+every fix deployed. Eleven real production incidents have been found by that
 replay and fixed with regression tests (`LOG.md`); the latest include
 genesis missing from the archive (every buried soft fork one block late),
 two lost carries in the secp256k1 multiplies, and a shutdown path that had
@@ -35,7 +35,10 @@ turned every `systemctl stop` into a SIGKILL -- and, at the first
 segwit block, that the archive had been witness-stripped for the whole
 segwit era (`getdata` asked for `MSG_BLOCK`; the merkle root cannot tell)
 while this node had no BIP141 witness-commitment check. Both fixed; the
-~482k affected blocks are being re-fetched from the local Core oracle. Performance this week
+~482k affected blocks are being re-fetched from the local Core oracle
+-- which immediately exposed #11: the first real P2WPKH spend in history
+failed because the BIP143 scriptCode was the witness program rather than
+the implied P2PKH script, a mistake the synthetic-vector generator shared. Performance this week
 (`PERF_SCOPE.md`): `ecdsa_verify` 121 → ~39 µs (variable-time inverse,
 projective compare, GLV+wNAF; libsecp256k1 measures 21.8 µs on the same
 CPU), UTXO lookups via an mmap run cache (kernel share 31 % → 5 %), and
