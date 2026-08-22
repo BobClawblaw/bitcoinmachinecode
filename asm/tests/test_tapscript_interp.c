@@ -3,7 +3,8 @@
  *   - OP_SUCCESSx pre-scan short-circuits success (and DISCOURAGE_OP_SUCCESS rejects)
  *   - empty-stack / non-cleanstack treatment: tapscript must end with exactly one
  *     truthy element, else CLEANSTACK / EVAL_FALSE
- *   - OP_CHECKSIGVERIFY is a BAD_OPCODE under tapscript
+ *   - OP_CHECKSIGVERIFY is VALID under tapscript (BIP342 re-specifies it for
+ *     schnorr; only CHECKMULTISIG(VERIFY) are disabled) -- fixed for incident #16
  *   - OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY -> TAPSCRIPT_CHECKMULTISIG
  *   - OP_CHECKSIGADD is valid ONLY under tapscript (BAD_OPCODE in BASE)
  * Each check compares the interpreter verdict + error code against Core's
@@ -149,7 +150,11 @@ int main(void)
     check_run("IF(true){1} -> [1] valid",   "51635168", SIGV_TAPSCRIPT, 0, 1, SCRIPT_ERR_OK);
 
     printf("tapscript gating (opcode set):\n");
-    check_run("CHECKSIGVERIFY forbidden",   "5151ad", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_BAD_OPCODE);
+    /* incident #16: CHECKSIGVERIFY is VALID under tapscript, not BAD_OPCODE.
+     * OP_0 (empty sig) <32-byte pubkey> OP_CHECKSIGVERIFY: empty sig makes
+     * success=false, Core skips the schnorr check, so this is a clean
+     * SCRIPT_ERR_CHECKSIGVERIFY failure -- identical to Core's EvalScript. */
+    check_run("CHECKSIGVERIFY valid; empty-sig fails", "00200000000000000000000000000000000000000000000000000000000000000000ad", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_CHECKSIGVERIFY);
     check_run("CHECKMULTISIG forbidden",    "5151ae", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
     check_run("CHECKMULTISIGVERIFY forb.",  "5151af", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
     check_run("CHECKSIGADD valid (undeflow->stackerr)", "ba", SIGV_TAPSCRIPT, 0, 0, SCRIPT_ERR_INVALID_STACK_OPERATION);
