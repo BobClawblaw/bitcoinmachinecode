@@ -260,6 +260,7 @@ asm/tests/test_utxo_recover
 asm/tests/test_utxo_catchup_crash_resume
 asm/tests/test_archive_truncate_nonmonotonic
 asm/tests/test_prune_nonmonotonic
+asm/tests/test_mul_carry_regression
 
 # ---- macOS / Apple junk ----
 # AppleDouble resource-fork companions (created by macOS when files are copied
