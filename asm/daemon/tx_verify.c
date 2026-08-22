@@ -100,6 +100,13 @@ extern int  p2wsh_verify_checksig(const u8* tx, int64_t txlen, int64_t n_in,
                                   uint64_t amount, const u8* witness_script,
                                   uint64_t wslen, const u8* vchSig, uint64_t siglen,
                                   const u8* vchPub, uint64_t publen);
+extern int  sv_classify_segwit(const u8* spk, u32 spl, const u8* ss, u32 ssl,
+                               u32* version, const u8** prog, u32* proglen, int* wrapped);
+extern int  sv_verify_witness_v0(const u8* prog, u32 proglen,
+                                 const u8* const* wit, const u32* witlen, u32 nwit,
+                                 u64 amount, unsigned long long flags, unsigned long nIn,
+                                 const u8* tx, unsigned long txlen, u8* work, unsigned long workcap);
+#define TXV_FLAG_WITNESS (1ULL<<11)   /* SCRIPT_VERIFY_WITNESS, Core bit */
 extern int  p2wsh_verify_multisig(const u8* tx, int64_t txlen, int64_t n_in,
                                   uint64_t amount, const u8* witness_script,
                                   uint64_t wslen,
@@ -159,11 +166,14 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
 #define TXV_SHAPE_P2WPKH  1
 #define TXV_SHAPE_P2WSH   2
 #define TXV_SHAPE_P2TR    3
+#define TXV_SHAPE_WV0     4   /* witness v0 program (native or P2SH-wrapped): general interpreter path */
+#define TXV_SHAPE_WPASS   5   /* unknown witness version (1..16, not taproot): anyone-can-spend under consensus flags */
 
 typedef struct {
     const u8* outpoint;             /* 36 bytes: txid(32)+index(4), in tx bytes */
     const u8* scriptSig; u32 scriptSiglen;
     const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
+    const u8* wprog; u32 wproglen; u8 wrapped;   /* TXV_SHAPE_WV0: the witness program (spk+2, or the P2SH redeemScript's program) */
     /* resolved during the sequential pass, before any forking -- self-
      * contained (a COPY, not a utxo_lsm_get pointer, which is only valid
      * until the next call) so a forked child can safely read it. */
@@ -229,8 +239,6 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     return 1;
 }
 
-static int is_p2wpkh(const u8* spk, u32 sl){ return sl==22 && spk[0]==0x00 && spk[1]==0x14; }
-static int is_p2wsh (const u8* spk, u32 sl){ return sl==34 && spk[0]==0x00 && spk[1]==0x20; }
 static int is_p2tr  (const u8* spk, u32 sl){ return sl==34 && spk[0]==0x51 && spk[1]==0x20; }
 
 /* txv_verify_one(): the actual per-input crypto check, dispatched by shape.
@@ -240,39 +248,35 @@ static int is_p2tr  (const u8* spk, u32 sl){ return sl==34 && spk[0]==0x51 && sp
  * invalid (reason set to a static string literal; NOT malloc'd, so it is
  * safe to read across a fork -- the string constants live in .rodata,
  * mapped identically in every child). */
+/* Legacy (pre-segwit sigversion) signature hashing must serialize the tx
+ * WITHOUT witness data (Core: SERIALIZE_TRANSACTION_NO_WITNESS). Before block
+ * 481824 every legacy input lived in a non-segwit tx, so tx bytes == stripped
+ * bytes and this never mattered; a tx that mixes a legacy input with a segwit
+ * input (first seen at 481825) is segwit-serialized, so the legacy input's
+ * sighash would be computed over marker/flag/witness bytes and fail. Strip
+ * once into a thread-local buffer; input order/count is unchanged, so nIn is
+ * preserved. Returns the tx unchanged when it carries no witness. */
+static const u8* legacy_tx_view(const u8* tx, u64 txlen, u64* out_len){
+    if (txlen < 6 || !(tx[4]==0x00 && tx[5]==0x01)) { *out_len = txlen; return tx; }
+    static __thread u8 stripped[1<<20];
+    long n = strip_witness(tx, (int64_t)txlen, stripped, (long)sizeof stripped);
+    if (n <= 0) { *out_len = txlen; return tx; }   /* fall back; sv will reject on a bad hash */
+    *out_len = (u64)n; return stripped;
+}
 static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long flags,
                           u8* sv_work, unsigned long sv_workcap, const char** reason){
     txv_rawin_t* in = &g_txv_in[i];
     switch (in->shape){
-    case TXV_SHAPE_P2WPKH:
-        if (!p2wpkh_verify(tx, (int64_t)txlen, (int64_t)i, in->spk, (int64_t)in->spklen, in->value,
-                           in->wit[0], in->witlen[0], in->wit[1], in->witlen[1])) {
-            *reason = "p2wpkh signature invalid"; return 0;
-        }
+    case TXV_SHAPE_WV0: {
+        int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
+                                       in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
+        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
-    case TXV_SHAPE_P2WSH: {
-        const u8* ws = in->wit[in->nwit-1];
-        u32 wslen = in->witlen[in->nwit-1];
-        if (wslen >= 34 && ws[0]==0x21 && ws[wslen-1]==0xac){
-            if (!p2wsh_verify_checksig(tx, (int64_t)txlen, (int64_t)i, in->value, ws, wslen,
-                                       in->wit[0], in->witlen[0], ws+1, 33)) {
-                *reason = "p2wsh checksig invalid"; return 0;
-            }
-            return 1;
-        }
-        if (wslen >= 3+33+33 && ws[0]==0x52 && ws[wslen-1]==0xae && in->nwit >= 4){
-            if (!p2wsh_verify_multisig(tx, (int64_t)txlen, (int64_t)i, in->value, ws, wslen,
-                                       in->wit[2], in->witlen[2], in->wit[1], in->witlen[1],
-                                       ws+2, ws+36)) {
-                *reason = "p2wsh multisig invalid"; return 0;
-            }
-            return 1;
-        }
-        *reason = "unsupported p2wsh witnessScript shape"; return 0;
     }
     case TXV_SHAPE_LEGACY: {
+        u64 ltxlen; const u8* ltx = legacy_tx_view(tx, txlen, &ltxlen);
         int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
-                                   flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
+                                   flags, (unsigned long)i, ltx, ltxlen, sv_work, sv_workcap);
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
@@ -441,17 +445,25 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
             if (g_txv_in[i].nwit == 0) { *reason = "p2tr empty witness"; return 0; }
             continue;
         }
-        if (is_p2wpkh(spk, (u32)spklen)) {
-            g_txv_in[i].shape = TXV_SHAPE_P2WPKH;
-            if (g_txv_in[i].scriptSiglen != 0) { *reason = "p2wpkh scriptSig must be empty"; return 0; }
-            if (g_txv_in[i].nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; return 0; }
-            continue;
-        }
-        if (is_p2wsh(spk, (u32)spklen)) {
-            g_txv_in[i].shape = TXV_SHAPE_P2WSH;
-            if (g_txv_in[i].scriptSiglen != 0) { *reason = "p2wsh scriptSig must be empty"; return 0; }
-            if (g_txv_in[i].nwit < 2) { *reason = "p2wsh needs a witnessScript"; return 0; }
-            continue;
+        if (flags & TXV_FLAG_WITNESS) {
+            u32 wver=0, wplen=0; const u8* wprog=0; int wrapped=0;
+            int cls = sv_classify_segwit(spk, (u32)spklen, g_txv_in[i].scriptSig, g_txv_in[i].scriptSiglen,
+                                         &wver, &wprog, &wplen, &wrapped);
+            if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; return 0; }
+            if (cls > 0) {
+                if (!wrapped && g_txv_in[i].scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; return 0; }
+                if (wver == 0) {
+                    g_txv_in[i].shape = TXV_SHAPE_WV0; g_txv_in[i].wprog = wprog; g_txv_in[i].wproglen = wplen; g_txv_in[i].wrapped = (u8)wrapped;
+                    if (wplen == 20 && g_txv_in[i].nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; return 0; }
+                    if (wplen == 32 && g_txv_in[i].nwit < 1) { *reason = "p2wsh needs a witnessScript"; return 0; }
+                } else {
+                    g_txv_in[i].shape = TXV_SHAPE_WPASS;   /* unknown version: valid under consensus flags (no DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) */
+                }
+                continue;
+            }
+            /* Core VerifyScript: a witness on an input whose script is not a
+             * witness program is SCRIPT_ERR_WITNESS_UNEXPECTED. */
+            if (g_txv_in[i].nwit != 0) { *reason = "unexpected witness on a non-witness script"; return 0; }
         }
         g_txv_in[i].shape = TXV_SHAPE_LEGACY;
     }
@@ -662,6 +674,7 @@ typedef struct {
     const u8* outpoint;
     const u8* scriptSig; u32 scriptSiglen;
     const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
+    const u8* wprog; u32 wproglen; u8 wrapped;   /* TXV_SHAPE_WV0: the witness program (spk+2, or the P2SH redeemScript's program) */
     u64 value;
     u64 spk_off; u32 spklen;     /* spk_off is a byte OFFSET into g_spk_pool
                                   * (see bytepool_alloc's own comment), NOT a
@@ -755,35 +768,16 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
      * verification pass. */
     const u8* spk = g_spk_pool.buf + in->spk_off;
     switch (in->shape){
-    case TXV_SHAPE_P2WPKH:
-        if (!p2wpkh_verify(tx, (int64_t)txlen, (int64_t)in->local_idx, spk, (int64_t)in->spklen, in->value,
-                           in->wit[0], in->witlen[0], in->wit[1], in->witlen[1])) {
-            *reason = "p2wpkh signature invalid"; return 0;
-        }
+    case TXV_SHAPE_WV0: {
+        int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
+                                       in->value, flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
+        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
-    case TXV_SHAPE_P2WSH: {
-        const u8* ws = in->wit[in->nwit-1];
-        u32 wslen = in->witlen[in->nwit-1];
-        if (wslen >= 34 && ws[0]==0x21 && ws[wslen-1]==0xac){
-            if (!p2wsh_verify_checksig(tx, (int64_t)txlen, (int64_t)in->local_idx, in->value, ws, wslen,
-                                       in->wit[0], in->witlen[0], ws+1, 33)) {
-                *reason = "p2wsh checksig invalid"; return 0;
-            }
-            return 1;
-        }
-        if (wslen >= 3+33+33 && ws[0]==0x52 && ws[wslen-1]==0xae && in->nwit >= 4){
-            if (!p2wsh_verify_multisig(tx, (int64_t)txlen, (int64_t)in->local_idx, in->value, ws, wslen,
-                                       in->wit[2], in->witlen[2], in->wit[1], in->witlen[1],
-                                       ws+2, ws+36)) {
-                *reason = "p2wsh multisig invalid"; return 0;
-            }
-            return 1;
-        }
-        *reason = "unsupported p2wsh witnessScript shape"; return 0;
     }
     case TXV_SHAPE_LEGACY: {
+        u64 ltxlen; const u8* ltx = legacy_tx_view(tx, txlen, &ltxlen);
         int err = sv_verify_script(in->scriptSig, in->scriptSiglen, spk, in->spklen,
-                                   flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
+                                   flags, (unsigned long)in->local_idx, ltx, ltxlen, sv_work, sv_workcap);
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
@@ -1023,17 +1017,23 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
             if (in->nwit == 0) { *reason = "p2tr empty witness"; *fail_tx_index = in->tx_index; goto fail; }
             continue;
         }
-        if (is_p2wpkh(spk, (u32)spklen)) {
-            in->shape = TXV_SHAPE_P2WPKH;
-            if (in->scriptSiglen != 0) { *reason = "p2wpkh scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
-            if (in->nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; *fail_tx_index = in->tx_index; goto fail; }
-            continue;
-        }
-        if (is_p2wsh(spk, (u32)spklen)) {
-            in->shape = TXV_SHAPE_P2WSH;
-            if (in->scriptSiglen != 0) { *reason = "p2wsh scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
-            if (in->nwit < 2) { *reason = "p2wsh needs a witnessScript"; *fail_tx_index = in->tx_index; goto fail; }
-            continue;
+        if (flags & TXV_FLAG_WITNESS) {
+            u32 wver=0, wplen=0; const u8* wprog=0; int wrapped=0;
+            int cls = sv_classify_segwit(spk, (u32)spklen, in->scriptSig, in->scriptSiglen,
+                                         &wver, &wprog, &wplen, &wrapped);
+            if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; *fail_tx_index = in->tx_index; goto fail; }
+            if (cls > 0) {
+                if (!wrapped && in->scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
+                if (wver == 0) {
+                    in->shape = TXV_SHAPE_WV0; in->wprog = wprog; in->wproglen = wplen; in->wrapped = (u8)wrapped;
+                    if (wplen == 20 && in->nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; *fail_tx_index = in->tx_index; goto fail; }
+                    if (wplen == 32 && in->nwit < 1) { *reason = "p2wsh needs a witnessScript"; *fail_tx_index = in->tx_index; goto fail; }
+                } else {
+                    in->shape = TXV_SHAPE_WPASS;
+                }
+                continue;
+            }
+            if (in->nwit != 0) { *reason = "unexpected witness on a non-witness script"; *fail_tx_index = in->tx_index; goto fail; }
         }
         in->shape = TXV_SHAPE_LEGACY;
     }

@@ -323,7 +323,7 @@ def build_p2wsh_multisig(sk1, sk2, idx_tag):
     assert ecdsa_verify_digest(pub1, sighash, sig1)
     assert ecdsa_verify_digest(pub2, sighash, sig2)
     # OP_CHECKMULTISIG witness: [dummy, sig1, sig2, witnessScript]
-    witness = [[b'\x00', sig2, sig1, witness_script]]
+    witness = [[b'', sig1, sig2, witness_script]]  # NULLDUMMY (BIP147, consensus from segwit): dummy must be EMPTY, not 0x00
     txfull = ser_tx_full(txv, witness)
     return {
         'name': f'p2wsh_multisig_{idx_tag}', 'type': 'P2WSH',
