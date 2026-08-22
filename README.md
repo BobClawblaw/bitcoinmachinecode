@@ -27,7 +27,7 @@ assembly.
 `PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
 acceptance test: a from-scratch, full-signature-verification replay of the
 real mainnet archive (no `assumevalid`), ~386k of 963k blocks so far with
-every fix deployed. Twelve real production incidents have been found by that
+every fix deployed. Thirteen real production incidents have been found by that
 replay and fixed with regression tests (`LOG.md`); the latest include
 genesis missing from the archive (every buried soft fork one block late),
 two lost carries in the secp256k1 multiplies, and a shutdown path that had
@@ -41,7 +41,9 @@ failed because the BIP143 scriptCode was the witness program rather than
 the implied P2PKH script, a mistake the synthetic-vector generator shared -- and #12: nested
 (P2SH-wrapped) segwit was not implemented at all and P2WSH handled two
 hard-coded shapes; witness-v0 scripts now run through the interpreter,
-with nine real mainnet spends (multisig, HTLC) pinned as fixtures. Performance this week
+with nine real mainnet spends (multisig, HTLC) pinned as fixtures; and
+#13, a 4096-byte BIP143 buffer overrun by a 500-input transaction, on
+threads that glibc had given 2 MB of stack minus 12 MB of TLS. Performance this week
 (`PERF_SCOPE.md`): `ecdsa_verify` 121 → ~39 µs (variable-time inverse,
 projective compare, GLV+wNAF; libsecp256k1 measures 21.8 µs on the same
 CPU), UTXO lookups via an mmap run cache (kernel share 31 % → 5 %), and

@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#12; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#13; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -283,6 +283,50 @@ which means CLTV, OP_IF branches and HASH160-of-preimage executed inside a
 witness script under the BIP143 sighash for the first time, against real
 chain data. Plus three negatives. The mempool path
 (`bitcoin_txval_modern.c`) had the same gap and shares the fix.
+
+### Incident #13: the worker segfaulted on block 481827 -- a 4096-byte BIP143 buffer, and threads with almost no stack
+
+Thirty-five seconds after the replay resumed past 481826, the download
+worker died on 481827 with `segfault at <addr> ... sp <same addr> ... in
+ld-linux` -- fault address equal to the stack pointer, inside the dynamic
+loader. That signature says "stack overflow", and the first diagnosis went
+there: `readelf` showed **12.0 MB of static thread-local storage**, and
+glibc carves static TLS out of every pthread's stack mapping. Worse, under
+`LimitSTACK=infinity` (the unit's setting) glibc's default thread stack is
+**2 MB**, measured -- it only becomes 8 MB when the rlimit is finite. So
+every verify-pool thread had been running on a few kilobytes of real stack
+for the entire session. That was real, and it is fixed: `bmc_thread.h`
+gives every daemon thread an explicit 64 MB stack, and the 1 MiB per-thread
+buffers (three `sv_work` plus the `stripped` copy added by #12) and the C
+script stacks moved from static TLS to lazily heap-allocated per-thread
+pointers -- TLS 12.0 MB -> 4.4 MB (the remaining 4 MiB is
+`lsm_get_scratch` in assembly, unused by the mmap path, left as a
+follow-up).
+
+But the **proximate** cause was simpler and worse: `segwit_v0_sighash`
+(`bitcoin_segwit.c`) assembled `hashPrevouts`/`hashSequence`/`hashOutputs`
+into fixed `uint8_t buf[4096]` / `obuf[4096]` stack arrays, 36 bytes per
+input. Block 481827 carries two **500-input** transactions: 18,000 bytes
+into 4,096 -- a 4x overrun that smashed the thread's stack into its guard
+page, which is exactly what the loader then tripped on. Reachable by any
+transaction with more than ~113 inputs or outputs from segwit activation
+on, and trivially by a crafted block. The BIP341 taproot aggregate hashes
+had the identical latent bug. Both now use a bounded per-thread heap
+buffer sized to the block cap. Proven load-bearing: with the old 4096 cap
+restored, the regression test crashes; with the fix it passes.
+
+The regression test runs the real block 481827 -- 1,377 transactions,
+4,855 prevouts seeded from the archive and the oracle
+(`validation/fetch_block_prevouts.py`) -- through the full apply path on
+the real pool threads. A third defect fixed alongside: the serve parent had
+sat "active" for thirteen minutes with no worker; it now records the
+worker's exit status and exits itself so systemd restarts the unit.
+
+Two lessons. The dmesg signature was consistent with both diagnoses, and
+the first plausible one (TLS) was a genuine bug that was not the cause;
+measuring the deepest frame found the real one. And the 500-input
+transaction is ordinary chain data -- this was the first witness-era block
+with one, 3 blocks after the verifier first ran on witness data at all.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
