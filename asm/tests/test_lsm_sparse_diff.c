@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern unsigned long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
@@ -98,11 +99,7 @@ static int res_eq(const res_t* a, const res_t* b) {
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/lsmsparseXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    if (chdir(dir) != 0) { printf("FAIL chdir\n"); return 1; }
-
+    tt_isolate();
     void* tomb     = malloc((size_t)TOMB_CAP*36);
     void* manifest = malloc((size_t)MANIFEST_CAP*16);
     void* scratch  = malloc(SCRATCH_CAP);

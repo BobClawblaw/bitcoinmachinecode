@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include "test_tmpdir.h"
 
 extern int  store_init(void* st);
 extern int  store_reload(void* st);
@@ -33,11 +34,7 @@ struct St {
 };
 
 int main(void){
-    char tmpl[]="/tmp/btcstoreXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     struct St st; memset(&st,0,sizeof st);
     cki("store_init", store_init(&st), 1);
 
@@ -104,7 +101,6 @@ int main(void){
     /* cleanup */
     unlink("blk00000.dat"); unlink("index.dat");
     { char p[256]; for(int i=0;i<4;i++){ snprintf(p,sizeof p,"blk0000%d.dat",i); unlink(p);} }
-    rmdir(dir);
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

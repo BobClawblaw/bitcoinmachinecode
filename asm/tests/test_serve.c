@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include "test_tmpdir.h"
 
 extern long node_handshake(int fd);
 extern int  node_accept_handshake(int fd);
@@ -62,6 +63,7 @@ static void build_chain(void){
 }
 
 int main(void){
+    tt_isolate();   /* private working dir: the store below writes index.dat/blk00000.dat by bare name */
     setbuf(stdout,NULL);
     build_chain();
     static unsigned char stbuf[4096];

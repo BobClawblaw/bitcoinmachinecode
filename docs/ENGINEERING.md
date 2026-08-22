@@ -155,13 +155,47 @@ make asm            # assemble all .asm sources only
 make clean          # remove generated objects + binaries
 ```
 
-`make test` builds and runs ~65 harness blocks. **Exit code 0 means the
-assembly hashes/verdicts match the trusted references.** A few harnesses are
+`make test` builds and runs **146 harness invocations**. Check that count --
+`grep -cE '^\t\./' asm/Makefile` -- whenever the suite is green but you did not
+expect it to be: a test that stops running looks identical to a test that
+passes, and this repository has been bitten by exactly that. **Exit code 0
+means the assembly hashes/verdicts match the trusted references.** A few
+harnesses are
 deliberately large/network-dependent and are **not** part of the default
 `test` target (e.g. `tests/test_ibd_scale`, the outbound-mux soak harness,
 live-network probes). Several networked/binary-glue harnesses are built at
 `-O0` because gcc `-O2` interacts badly with the deep asm call chain — the
 assembly is identical; do not "fix" these to `-O2` without re-verifying.
+
+#### Test working directories
+
+The storage layer opens its files by bare relative name (`index.dat`,
+`blk%05u.dat`, `utxo.dat`, `headers.dat`, `chainwork.dat`, `peers.dat`, …), so
+a harness that links it writes an archive into whatever its CWD happens to be.
+Every such harness now calls `tt_isolate()` from `tests/test_tmpdir.h` as the
+first statement of `main()`: it `mkdtemp()`s a private directory, `chdir()`s
+into it, and removes it on **every** exit path including `SIGSEGV`/`SIGABRT`.
+
+Consequences you can rely on:
+
+- the suite is **order-independent** — no harness can see state another left;
+- it is **concurrency-safe** — several harnesses, or several whole suites, can
+  run at once, and other work in `asm/` while the suite runs is harmless;
+- `make test` in a used tree behaves identically to `make test` in a fresh
+  clone, because nothing persists between runs.
+
+Two knobs:
+
+| variable | effect |
+|---|---|
+| `BMC_TEST_TMPDIR` | root the private directories are created under (default `$TMPDIR`, else `/tmp`). These harnesses write real block data — point this at a filesystem with room if `/tmp` is a small tmpfs. |
+| `BMC_TEST_KEEP` | if set and non-empty, keep the directory and print its path, for post-mortem inspection. |
+
+Paths that must still resolve against the source tree after the `chdir` —
+fixtures, `daemon/bitcoind`, the shim executables — go through `tt_src("…")`.
+A harness that hands a datadir to a forked child or a spawned daemon passes
+`tt_workdir()`. When adding a harness that touches storage, add `tt_isolate()`
+and list `$(TEST_TMPDIR_H)` in its Makefile prerequisites.
 
 ### 2.3 Manually rebuild the daemon binary
 

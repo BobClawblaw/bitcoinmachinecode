@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -94,11 +95,7 @@ static int file_exists(const char* path){
 }
 
 int main(void){
-    char tmpl[]="/tmp/btcundoXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     void* tomb = malloc(TOMB_CAP*36);
     void* manifest = malloc(MANIFEST_CAP*16);
     void* scratch = malloc(SCRATCH_CAP);
@@ -232,6 +229,5 @@ int main(void){
         unlink(p);
     }
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
-    rmdir(dir);
     return failures?1:0;
 }

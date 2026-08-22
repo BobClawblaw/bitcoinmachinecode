@@ -76,6 +76,7 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
 }
 
 #include "multi_p2wpkh_vec.h"
+#include "test_tmpdir.h"
 
 static int g_fails = 0, g_checks = 0;
 static void ck(const char* name, int cond){
@@ -123,11 +124,7 @@ static void seed_utxos(void){
 }
 
 int main(void){
-    char tmpl[] = "/tmp/txvparXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { perror("mkdtemp"); return 1; }
-    if (chdir(dir)) { perror("chdir"); return 1; }
-
+    tt_isolate();
     seed_utxos();
 
     static u8 tx[8192];

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include "test_tmpdir.h"
 
 extern int  hst_init(void* hst);
 extern int  hst_reload(void* hst);
@@ -36,11 +37,7 @@ static void mk_hdr(unsigned char* h, const unsigned char* prev){
 }
 
 int main(void){
-    char tmpl[]="/tmp/btchdrXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     struct Hst hs; memset(&hs,0,sizeof hs);
     cki("hst_init", hst_init(&hs), 1);
     cki("hst empty count", hst_count(&hs), 0);
@@ -106,7 +103,6 @@ int main(void){
     cki("append after reload -> count 6", hst_append(&hs2, hdr5, bh5), 6);
     cki("count 6", hst_count(&hs2), 6);
 
-    unlink("headers.dat"); rmdir(dir);
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include "test_tmpdir.h"
 
 static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
@@ -129,11 +130,9 @@ int main(void){
      * to the old missing-count layout that cons_verify/tx_parse would reject. */
     for(int i=0;i<NB;i++) if(blocks[i][80]!=1){ printf("FAIL block %d missing tx-count byte\n",i); return 1; }
 
-    /* store in a fresh temp dir (store_init uses CWD-relative filenames) */
-    char path[80]; snprintf(path,sizeof path,"/tmp/tsync_%d", getpid());
-    mkdir(path,0755);
-    char prev_cwd[1024]; getcwd(prev_cwd,sizeof prev_cwd);
-    if(chdir(path)!=0){ printf("FAIL chdir\n"); return 1; }
+    /* store in a fresh private temp dir (store_init uses CWD-relative
+     * filenames), removed on every exit path including a crash. */
+    tt_isolate();
     static unsigned char stbuf[4096];
     if(store_init(stbuf)!=1){ printf("FAIL store_init\n"); return 1; }
 

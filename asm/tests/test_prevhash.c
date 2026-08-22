@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern int store_init(void* st);
 extern int store_append(void* st, const void* hash, const void* raw, unsigned long long len);
@@ -32,11 +33,7 @@ static void make_header(unsigned char hdr[80], const unsigned char prevhash[32])
 }
 
 int main(void){
-    char tmpl[]="/tmp/btcprevXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     /* ---- edge case: empty store ---- */
     {
         struct St st; memset(&st, 0, sizeof st);
@@ -100,6 +97,5 @@ int main(void){
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
-    rmdir(dir);
     return failures?1:0;
 }

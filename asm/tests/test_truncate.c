@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 extern int  store_init(void* st);
 extern int  store_append(void* st, const void* hash, const void* raw, unsigned long long len);
@@ -52,11 +53,7 @@ static void reverse32(unsigned char out[32], const unsigned char in[32]){
 static unsigned char g_idx[24 + IDX_SLOTS*48];
 
 int main(void){
-    char tmpl[]="/tmp/btctruncXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     unsigned char hashes[5][32];
     for (int h=0; h<5; h++) for (int j=0;j<32;j++) hashes[h][j] = (unsigned char)((h+1)*10 + j);
     static unsigned char raws[5][90];
@@ -179,6 +176,5 @@ int main(void){
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
-    rmdir(dir);
     return failures?1:0;
 }

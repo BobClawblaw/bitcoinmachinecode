@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern unsigned long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
@@ -71,11 +72,7 @@ static void make_txid(unsigned char* t, int seed, unsigned int i) {
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/btcutxoXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     /* ---------- phase 1: fresh store, add several, spend one ---------- */
     struct US st; memset(&st, 0, sizeof st);
     ck("store_init", utxo_store_init(&st), 1);
@@ -227,8 +224,6 @@ int main(void) {
     }
 
     utxo_store_close(&st);
-    unlink("utxo.dat"); unlink("utxo.idx");
-    rmdir(dir);
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

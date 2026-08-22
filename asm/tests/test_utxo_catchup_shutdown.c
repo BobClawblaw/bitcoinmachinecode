@@ -31,6 +31,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -130,11 +131,10 @@ static double since_ms(const struct timespec* a){
 }
 
 int main(void){
+    tt_isolate();
     /* ---------------- Phase A: deterministic ---------------- */
     {
-        char tmpl[] = "/tmp/ctshutAXXXXXX";
-        char* dir = mkdtemp(tmpl);
-        if (!dir || chdir(dir)) { perror("mkdtemp/chdir"); return 1; }
+        tt_subdir("phaseA");   /* each phase needs an empty datadir of its own */
         memset(store_buf,0,sizeof store_buf);
         ck("A store_init", store_init(store_buf), 1);
         ck("A utxo_live_init", utxo_live_init("."), 1);
@@ -163,9 +163,7 @@ int main(void){
 
     /* ---------------- Phase B: flag set mid-call by a timer ---------------- */
     {
-        char tmpl[] = "/tmp/ctshutBXXXXXX";
-        char* dir = mkdtemp(tmpl);
-        if (!dir || chdir(dir)) { perror("mkdtemp/chdir"); return 1; }
+        tt_subdir("phaseB");   /* each phase needs an empty datadir of its own */
         memset(store_buf,0,sizeof store_buf);
         ck("B store_init", store_init(store_buf), 1);
         ck("B utxo_live_init", utxo_live_init("."), 1);

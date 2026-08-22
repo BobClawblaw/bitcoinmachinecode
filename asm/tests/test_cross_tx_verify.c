@@ -43,6 +43,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -185,11 +186,7 @@ static long assemble_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tstam
 static u8 store_buf[4096];
 
 int main(void){
-    char tmpl[] = "/tmp/crosstxXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { perror("mkdtemp"); return 1; }
-    if (chdir(dir)) { perror("chdir"); return 1; }
-
+    tt_isolate();
     memset(store_buf,0,sizeof store_buf);
     ck("store_init", store_init(store_buf), 1);
     ck("utxo_live_init", utxo_live_init("."), 1);

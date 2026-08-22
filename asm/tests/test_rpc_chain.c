@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern int  store_init(void* st);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
@@ -198,8 +199,7 @@ int main(void){
     SIG[36]=0x02; SIG[37]=0x20; for (int i = 0; i < 32; i++) SIG[38+i] = (unsigned char)(0x51 + i); SIG[70]=0x01;
     PUB[0]=0x02; for (int i = 1; i < 33; i++) PUB[i] = (unsigned char)(0x80 + i);
 
-    char dir[] = "/tmp/test_rpc_chain_XXXXXX";
-    if (!mkdtemp(dir) || chdir(dir) != 0){ printf("FAIL mkdtemp\n"); return 1; }
+    tt_isolate();
     memset(&g_w, 0, sizeof g_w);
     build_archive();
     rpc_chain_set_stop_handler(on_stop);

@@ -41,6 +41,7 @@
 #include <signal.h>
 #include <sys/file.h>
 #include "../daemon/reorg.h"
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -438,11 +439,15 @@ typedef void (*case_fn)(void);
 static int run_case(const char* name, case_fn fn){
     printf("\n---- %s ----\n", name);
     fflush(stdout);
+    /* Each case gets its own subdirectory of this process's private working
+     * directory. The child _exit()s, so it must not own the teardown -- the
+     * parent's tt_isolate() cleanup removes the whole tree. */
+    static int case_no = 0;
+    char sub[64]; snprintf(sub, sizeof sub, "case%02d", case_no++);
+    if (mkdir(sub, 0700) != 0){ printf("FAIL %s: mkdir %s\n", name, sub); return 1; }
     pid_t p = fork();
     if (p == 0){
-        char tmpl[] = "/tmp/btcreorgXXXXXX";
-        char* d = mkdtemp(tmpl);
-        if (!d || chdir(d) != 0){ printf("FAIL %s: tmpdir\n", name); _exit(1); }
+        if (chdir(sub) != 0){ printf("FAIL %s: tmpdir\n", name); _exit(1); }
         failures = 0;
         fn();
         fflush(stdout);
@@ -1388,6 +1393,7 @@ static void case_node_sync_multi(void){
 
 /* ======================================================================== */
 int main(void){
+    tt_isolate();
     int total = 0;
     total += run_case("chainwork primitives",           case_chainwork_primitives);
     total += run_case("chainwork over a pruned range",  case_chainwork_pruned_range);

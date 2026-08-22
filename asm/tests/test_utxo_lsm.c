@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern unsigned long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
@@ -101,11 +102,7 @@ static void setup_lst(struct LST* lst, void* tomb, void* manifest, void* scratch
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/btclsmXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     void* tomb = malloc(TOMB_CAP*36);
     void* manifest = malloc(MANIFEST_CAP*16);
     void* scratch = malloc(SCRATCH_CAP);

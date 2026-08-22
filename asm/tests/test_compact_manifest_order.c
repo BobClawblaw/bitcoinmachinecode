@@ -30,6 +30,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern unsigned long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
@@ -92,11 +93,7 @@ static void make_txid(unsigned char* t, int seed, unsigned int i) {
 #define N_DUMMY        63   /* runs 2..64 */
 
 int main(void) {
-    char tmpl[] = "/tmp/compactorderXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     void* tomb = malloc(TOMB_CAP*36);
     void* manifest = malloc(MANIFEST_CAP*16);
     void* scratch = malloc(SCRATCH_CAP);
