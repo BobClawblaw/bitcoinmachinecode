@@ -263,6 +263,7 @@ individually re-traced line-by-line -- flagged where confidence is lower):
 | 388431 | "legacy script verification failed" | `CHECKLOCKTIMEVERIFY`/`CHECKSEQUENCEVERIFY` were wired as no-op stubs, not real BIP65/BIP112 checks | `fbeff60` |
 | 318148 | "input references a missing/already-spent UTXO" on the first resume after deploying the LSM mmap read path | NOT the read path (exonerated on 80,000 keys from four real production runs). `systemctl stop` SIGKILLed the worker at 90 s because the catch-up loop ignored SIGTERM; the kill landed between block N's WAL writes and its checkpoint, and Stage D verifies before applying. Incident #8. | `f2faf3b`, `96b555e` |
 | 481824 | "p2wpkh needs exactly 2 witness items" at the first segwit block | The ARCHIVE, not the verifier: every block >= 481824 was stored witness-stripped because `getdata` asked for `MSG_BLOCK`; the merkle root cannot detect it and this node had no BIP141 witness-commitment check. Incident #10. | `31eac9a`, `fe3addb`, `191df6c` |
+| 481824 (again) | "p2wpkh signature invalid" once the block was witness-complete | Our BIP143 scriptCode for P2WPKH was the witness program, not the implied P2PKH script; the vector generator shared the mistake. Incident #11. First real P2WPKH spend ever verified by this node. | `b3800f0`, `b6c92fa` |
 | (none -- structurally undetectable by replay) | every buried soft fork active one block LATE; false-accept | genesis absent from the archive: record index == real height - 1. Incident #6. | `5f36dee` |
 | (none -- ~2^-64 per random operand) | wrong `s^-1` / affine x on structured operands; fail-closed | lost carries in `sc_mul` MULACC and `fe_mul` fold-2. Incident #7. | `54cc988` |
 
@@ -282,7 +283,7 @@ exists to reconcile. New regression test
 via disabling the fix line; `make -k test` 1582/1582 both pre- and
 post-merge. `2fd4a14`. Full writeup: `LOG.md`'s 2026-08-21 entry.
 
-### Incidents #6-#10 (2026-08-22)
+### Incidents #6-#11 (2026-08-22)
 Narratives in `LOG.md`'s 2026-08-22 entry; one line each here. **#6** genesis
 was never in the archive (record index == real height - 1), so
 `script_flags_for_block` ran a block behind and DERSIG/CLTV/CSV/NULLDUMMY
