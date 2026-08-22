@@ -151,6 +151,7 @@ asm/tests/test_taproot
 asm/tests/test_taproot_sighash
 asm/tests/test_taproot_scriptpath
 asm/tests/test_mul_carry_regression
+asm/tests/test_fe_repr
 asm/tests/test_ecdsa_inverse
 asm/tests/test_segwit_sighash
 asm/tests/test_p2wpkh_real
@@ -227,6 +228,7 @@ asm/daemon/build_utxo
 asm/daemon/flush_wal_tail
 asm/daemon/utxo_reload_check
 asm/tests/bench_ecdsa
+asm/tests/bench_fe
 asm/tests/test_addr_ingest
 asm/tests/test_archive_check
 asm/tests/test_archive_repair
