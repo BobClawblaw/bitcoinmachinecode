@@ -100,7 +100,12 @@ p2p_getdata_block:
     push r12
     mov  r12, rdi
     mov  byte [r12], 1          ; inventory count varint = 1
-    mov  dword [r12+1], 2       ; MSG_BLOCK type = 2 (int32 LE at +1)
+    mov  dword [r12+1], 0x40000002 ; MSG_WITNESS_BLOCK (BIP144) = MSG_BLOCK | 0x40000000, int32 LE at +1.
+                                  ; Plain MSG_BLOCK (2) makes peers strip every witness: the merkle
+                                  ; root commits to txids only, so cons_verify accepted 482k stripped
+                                  ; blocks (2026-08-22, found at the first segwit block 481824).
+                                  ; MSG_WITNESS_BLOCK returns the full block, identical bytes for
+                                  ; pre-segwit blocks -- which is why every test passed.
     lea  rdi, [r12+5]           ; hash at +5
     mov  rsi, rsi               ; hash
     mov  rcx, 32
