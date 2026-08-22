@@ -7,6 +7,137 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-22 -- Incidents #6-#9; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+
+A continuous ~16 h session (08-21 evening into 08-22 morning), the second
+half under a standing "deploy, restart, drop and rebuild as needed, update
+the docs at the end" authorization with the user asleep. Terse action log
+with hashes: `worklog/2026-08-21.md`, `worklog/2026-08-22.md`. Profiles and
+benchmark tables: `PERF_SCOPE.md`. This entry is the narrative, including
+the mistakes.
+
+### Real production incident #6: genesis was not in the archive, so every buried soft fork activated one block late (false-accept)
+Found while wiring blockchain-query RPCs (`090a109`): `index.dat` record 0
+was `00000000839a8e...` -- block 1. Confirmed against the scratch Core
+oracle across the whole archive: record index == real height - 1,
+everywhere. `utxo_live_catchup` hands that index to `apply_block_at` ->
+`script_flags_for_block`, so linking the real `bitcoin_script_flags.o` and
+asking it directly showed DERSIG (363725), CLTV (388381), CSV (419328) and
+NULLDUMMY (481824) each MISSING their flag bit at their own activation
+block. For exactly one block per boundary we applied looser rules than
+Core: a chain-split in the accept direction. It is also structurally
+invisible to Stage D's replay -- looser rules accept a superset, and real
+chain data is valid under the strict rules anyway -- which is a genuine
+limit on what a clean replay proves. The user's proposed fix (re-download
+the chain) could never have worked: the P2P "from the beginning" locator is
+the all-zero hash and peers answer from block 1; genesis is never
+transmitted (`bitcoind.asm:1247` already documents the symptom). Fixed by
+injecting genesis from its constant: 285 bytes appended to the last blk
+file, `index.dat`/`headers.dat` shifted one record, `chainwork.dat`
+dropped and rebuilt (963,447 records). The 1.5 TB of block bodies never
+moved. Re-verified: index hash, body, header record and `getblockhash`
+agree at 12 heights including 0. `apply_block_inner` now skips genesis's
+coinbase (Core never adds it to the chainstate) -- matched by HASH, because
+a `height == 0` guard broke two synthetic-chain tests whose height 0 has
+spendable outputs. `5f36dee`. The in-flight replay was invalidated and
+restarted from block 0.
+
+### Incident #7 (latent, found by a differential): two lost carries in `sc_mul` and `fe_mul`
+Building the 4.2 variable-time inverse's differential fed `sc_inv`
+structured inputs for the first time. `sc_mul`'s MULACC propagated a carry
+two limbs and dropped it when limb k+2 was 0xFFFF...; `fe_mul`'s fold-2
+dropped the carry out of limb 3. On the OLD code `sc_inv(6)` is wrong
+outright (checked against `pow(6,-1,n)`), `sc_inv(n-k)` wrong for
+4095/4096 small k, `fe_inv(p-k)` for 1607/4096 -- and 200,000 random
+`a*inv(a)==1` trials pass on that same old code, because random operands
+hit the condition at ~2^-64 and ~2^-190. That is the whole story of why
+the random differentials that have guarded this code since 08-11 never
+saw it. Direction: fail-closed (a wrong `s^-1` rejects a valid signature;
+it cannot forge one). `54cc988`, with the exact operand pairs pinned in
+`tests/test_mul_carry_regression.c`.
+
+### Incident #8: the mmap "bug" that was a SIGKILL, and a destroyed reproducer
+`e199952` (PERF_SCOPE 4.1) replaced `mac_run_lookup`'s per-lookup,
+per-run "open, read the ENTIRE 4 MiB bloom to test 3 bits, lseek/read,
+close" with a per-thread cache of read-only mmaps: 88 % fewer syscalls.
+Deployed 02:29. On its very first checkpoint resume (02:32, from 318147)
+the daemon rejected 318148 with "input references a missing/already-spent
+UTXO". The coordinator attributed it to the new read path, set the
+`BMC_LSM_MMAP=0` kill switch -- and, 45 seconds later, dropped the UTXO
+state to start the from-scratch run the user had asked for. That
+destroyed the only reproducer. Mistake, recorded as a gate: snapshot
+utxo_*/undo_* before any drop.
+
+The investigation then could not reproduce anything: the C path was read
+line-by-line against the assembly (u64 offsets, record advance,
+`mac_cmp_key`'s bswap == `memcmp`, identical FNV bloom/seeds/bit index);
+a real coverage gap was found (the differential used `fill_threshold=1`,
+so no run had ever had a sparse index and the C binary search had never
+run) and closed with sparse/compaction/reload/bloom-saturated
+differentials and a 180k-lookup soak -- all 0 mismatches; and a new
+read-only `tests/diff_real_run` was pointed at the four real production
+runs the rebuild had produced by then (18M records each, bloom at the
+4 MiB cap, sparse_n ~70k): 80,000 keys, 0 mismatches. `b41f711`.
+
+The actual cause came from `journalctl -u bmc-bitcoind.service`: EVERY
+stop during a replay -- 21:24:39, 01:16:00, 02:30:44, 02:37:18, 02:40:12
+-- ended in `State 'final-sigterm' timed out. Killing ... SIGKILL` at
+systemd's 90 s default. The replay is one `utxo_live_catchup()` call that
+runs for hours, and its per-block loop never read `g_shutdown_requested`.
+The 02:30:44 kill hit the OLD (pre-mmap) worker between "block 318148's
+spends are in the WAL" and "checkpoint 318148 persisted"; the new process
+reloaded state one block ahead of its checkpoint and correctly reported
+318148's inputs as spent. `2fd4a14`'s comment that re-applying is safe
+("duplicate put / redundant tombstone are non-error") was true of the
+storage layer and false once Stage D verifies BEFORE applying. mmap was
+innocent; the resume path was the bug, and it had been since Stage D.
+
+Two fixes: `f2faf3b` -- the loop polls the flag per block, finishes the
+block, persists, starts no compaction, returns (`systemctl stop` went from
+90.23 s + SIGKILL to 10.05 s, measured, no "Killing" in the journal);
+`96b555e` -- on boot, `undo_<applied+1>.dat` existing means that block
+began and never checkpointed, so restore its captured prevouts, delete
+its created outputs, let catch-up re-apply it. Three crash-injection
+scenarios incl. flush-mid-block give a set byte-identical to a
+never-crashed reference; the negative control reproduces the production
+line verbatim. The fix then proved itself unplanned: the deploy's own stop
+was the last 90 s SIGKILL, it landed mid-block 343087, and boot logged
+`RECOVERY: rolled back partially-applied block 343087 ... 147 prevout(s)
+restored` and resumed with zero rejects.
+
+### Incident #9 (caught by the suite before deploy): GLV segfault from stack misalignment on the CHECKMULTISIG path
+GLV + wNAF (`5023fdf`..`127ae2b`) passed 102,056 projective point cases,
+the 113,315-case verify campaign and 30,240 switch cases, then
+`test_scriptverify_parity` segfaulted: `glv_wnaf` (gcc-compiled C) entered
+with `rsp == 8 mod 16` from the all-asm `interp_checkmultisig ->
+sv_checksig -> ecdsa_verify` chain, and a `movaps` spill faulted. The
+direct-call harnesses had been aligned by luck. `and rsp, -16` after the
+frame (`3b00f63`), robust to either caller parity. Lesson, same as the
+earlier `utxo_lsm_mm.c` hook: any asm frame that calls C must align
+itself, not trust its caller.
+
+### Also this session
+- 4.2 A+B (`9e11146`): `ecdsa_verify` 115 -> 56 us; 4.3 GLV (`da3e683`):
+  56 -> ~39 us (44 vs 69 on the loaded box). libsecp256k1 on this CPU,
+  measured: 21.8 us. Gap 5.2x -> 2.6x -> ~1.65x.
+- End-to-end, identical heights 343087->363086 vs the 08-21 14:37 baseline:
+  7.8 -> 34.1 blk/s, **4.39x**. Almost all of that is the mmap fix: with
+  mmap off, 300-340k had collapsed to 1.04-1.08x as bloom copies grew.
+  GLV moved verify 1.56x and the replay 0x -- post-GLV profile: kernel 5 %
+  (was 31-38 %), crypto 74 %, `fe_mul` 56 %. The field multiply is the
+  last wall.
+- `test_scalarmul_ct` was a wall-clock coin flip (1.001/1.177/0.996/0.743
+  on unchanged main) AND could not detect an injected 4 % timing leak;
+  now CPU-time min-of-40 at +-3 %, 70/70 under load, catches the leak
+  3/3 (`879554b`). Seven test binaries were tracked in git and ran stale
+  after `git checkout --` (`860630c`).
+- Taproot: `OP_CODESEPARATOR` position in the tapscript sighash
+  (`b2ccb2d`); the old byte-level `0xab` scan also rejected pubkeys
+  containing that byte.
+- 9 blockchain-query RPCs (`090a109`). Scratch Bitcoin Core at
+  `/storage/core-oracle` is now an authorized development oracle (the
+  production install stays off-limits).
+
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
 ### Real production incident #4 (autonomous, overnight): CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY were stubs, not real checks
