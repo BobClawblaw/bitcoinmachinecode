@@ -6,12 +6,17 @@ verified across P2PK/P2PKH/P2SH/bare-multisig, activation-height flag
 schedule) -- see "Stage B0/B1/B2 done", its "CLOSED" follow-up, and "Stage C
 done" below.
 
-**Stage D: wired and mid-replay as of 2026-08-21, not yet DONE.**
-Verification is connected to block connection and running its own
-acceptance test -- a full from-scratch replay of the real mainnet archive,
-currently past height ~364,000 of 963,445 (see Stage D section below for
-the full incident list: the replay has found and fixed real consensus bugs
-directly, exactly as this stage's acceptance bar requires). Stage E
+**Stage D: wired, replaying, not yet DONE (2026-08-22).** Verification is
+connected to block connection and running its acceptance test -- a full
+from-scratch replay of the real mainnet archive. The replay was restarted
+from block 0 at 02:40 UTC on 2026-08-22 after incident #6 (genesis absent
+from the archive, every buried soft fork one block late) invalidated the
+previous attempt; it is now past ~386,000 of 963,446 with every fix below
+deployed, at ~4.4x the throughput of the 08-21 baseline over identical
+heights (`PERF_SCOPE.md`). See the Stage D section for incidents #1-#9.
+**Caveat learned from #6:** a clean replay cannot detect a rule applied too
+*loosely* -- real chain data is valid under the strict rules too -- so
+"every block validated" is necessary, not sufficient. Stage E
 (assumevalid, then production) not started.
 
 ## The gap
@@ -248,6 +253,9 @@ individually re-traced line-by-line -- flagged where confidence is lower):
 | 324663 | "legacy script verification failed" | `OP_CHECKMULTISIGVERIFY` never popped-and-checked its bool | `670b6a7` |
 | 349617 | "legacy script verification failed" | `sv_push_only`'s direct-push boundary excluded `0x4b` itself | `e1bdee2` |
 | 388431 | "legacy script verification failed" | `CHECKLOCKTIMEVERIFY`/`CHECKSEQUENCEVERIFY` were wired as no-op stubs, not real BIP65/BIP112 checks | `fbeff60` |
+| 318148 | "input references a missing/already-spent UTXO" on the first resume after deploying the LSM mmap read path | NOT the read path (exonerated on 80,000 keys from four real production runs). `systemctl stop` SIGKILLed the worker at 90 s because the catch-up loop ignored SIGTERM; the kill landed between block N's WAL writes and its checkpoint, and Stage D verifies before applying. Incident #8. | `f2faf3b`, `96b555e` |
+| (none -- structurally undetectable by replay) | every buried soft fork active one block LATE; false-accept | genesis absent from the archive: record index == real height - 1. Incident #6. | `5f36dee` |
+| (none -- ~2^-64 per random operand) | wrong `s^-1` / affine x on structured operands; fail-closed | lost carries in `sc_mul` MULACC and `fe_mul` fold-2. Incident #7. | `54cc988` |
 
 ### Incident #5 (2026-08-21): checkpoint could lag real durable state by an unbounded amount
 The four missing-UTXO occurrences in the table above share one root cause,
@@ -265,18 +273,37 @@ exists to reconcile. New regression test
 via disabling the fix line; `make -k test` 1582/1582 both pre- and
 post-merge. `2fd4a14`. Full writeup: `LOG.md`'s 2026-08-21 entry.
 
+### Incidents #6-#9 (2026-08-22)
+Narratives in `LOG.md`'s 2026-08-22 entry; one line each here. **#6** genesis
+was never in the archive (record index == real height - 1), so
+`script_flags_for_block` ran a block behind and DERSIG/CLTV/CSV/NULLDUMMY
+each missed their own activation block -- false-accept, invisible to the
+replay, fixed by injecting genesis from its constant (`5f36dee`; a
+re-download could not have done it, peers serve from block 1). **#7** lost
+carries in `sc_mul`/`fe_mul`, deterministic on structured operands, ~2^-64
+on random ones (`54cc988`). **#8** every stop during a replay had been a
+90 s SIGKILL (catch-up never read the shutdown flag); a kill in the
+WAL-write->checkpoint window made the next resume re-verify an already-
+applied block -- misattributed to the new mmap read path for an hour and
+the first reproducer was destroyed by dropping state; fixed by honouring
+SIGTERM per block (`f2faf3b`, stop now 10 s) and rolling back a partially-
+applied block on boot from the undo log (`96b555e`, proved on real data at
+343087 on first deploy). **#9** GLV's C helper segfaulted on the
+CHECKMULTISIG path from an rsp misaligned by 8 -- caught by the suite
+before deploy (`3b00f63`).
+
 Every fix above is on `main` and pushed, and every one that changed
 behavior (not the doc-only correlation work) has a regression test proven
 (via `git stash` or an equivalent disable-the-fix check) to fail against
 the pre-fix code with the real production failure signature and pass with
-the fix. `bmc-bitcoind.service` is running its third from-scratch replay
-attempt as of this writing (the first two were interrupted -- by the
-CHECKLOCKTIMEVERIFY/CHECKSEQUENCEVERIFY bug, then by the host reboot that
-surfaced incident #5), currently past height ~364,000 of 963,445, confirmed
-clean past every rejection height in the table above except 388431 (not yet
-re-reached by this attempt, but independently confirmed clean once already
-during the CLTV/CSV fix's own post-fix redeploy); **not yet DONE** — the
-replay has not reached chain tip yet.
+the fix. `bmc-bitcoind.service` is running its fourth from-scratch replay
+(started 2026-08-22 02:40 after #6 invalidated the third), past ~386,000 of
+963,446 with all of the above deployed, clean past every rejection height
+in the table including 388431 and past the DERSIG boundary at its correct
+height; **not yet DONE** -- the replay has not reached chain tip yet.
+The real acceptance test beyond "no rejects" is UTXO-set-hash parity with
+the scratch Core oracle (`gettxoutsetinfo`, `coinstatsindex` enabled there)
+-- not yet possible, this node computes no such hash (`FEATURE_GAPS.md`).
 
 ### Stage E — assumevalid, then production
 Implement `-assumevalid` for real (skip script checks at or below the named
@@ -577,9 +604,12 @@ materially changes B.
   fine-grained fix above regardless of write order for any ALREADY
   non-monotonic archive (like the one currently in production).
 
-- **Replay throughput vs. Core** — scoped 2026-08-21 from a symbol-resolved
-  `perf` profile of the live replay at height ≈ 430 k: see `PERF_SCOPE.md`.
-  Headline: ~53 % of cycles in secp256k1 field/scalar arithmetic and ~31 %
-  in UTXO LSM read I/O (not archive reads — the non-monotonic layout above
-  is ruled out as the I/O cost). Every lever touches the live verify or
-  storage path, so nothing lands until this replay reaches tip.
+- **Replay throughput vs. Core** — `PERF_SCOPE.md`. Scoped 2026-08-21
+  (~53 % secp256k1 arithmetic, ~31 % kernel file-read path from the UTXO
+  LSM's per-lookup bloom copies, NOT the non-monotonic archive); all three
+  levers built, verified and deployed 2026-08-22: 4.2 A+B (`ecdsa_verify`
+  115 -> 56 us), 4.1 mmap run cache (kernel share 31 % -> 5 %), 4.3
+  GLV+wNAF (56 -> ~39 us). End-to-end over identical heights vs the 08-21
+  baseline: 4.39x. libsecp256k1 measured at 21.8 us on this CPU; we are at
+  ~1.65x of it. What remains is the 4x64 field multiply (`fe_mul` = 56 % of
+  all cycles post-GLV); libsecp's 5x52 lazy reduction is the next lever.
