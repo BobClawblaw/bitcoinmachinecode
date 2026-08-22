@@ -26,28 +26,43 @@ assembly.
 **Current state (2026-08-22).** Block-level script verification (Stage D of
 `PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
 acceptance test: a from-scratch, full-signature-verification replay of the
-real mainnet archive (no `assumevalid`), ~386k of 963k blocks so far with
-every fix deployed. Thirteen real production incidents have been found by that
-replay and fixed with regression tests (`LOG.md`); the latest include
-genesis missing from the archive (every buried soft fork one block late),
-two lost carries in the secp256k1 multiplies, and a shutdown path that had
-turned every `systemctl stop` into a SIGKILL -- and, at the first
-segwit block, that the archive had been witness-stripped for the whole
-segwit era (`getdata` asked for `MSG_BLOCK`; the merkle root cannot tell)
-while this node had no BIP141 witness-commitment check. Both fixed; the
-~482k affected blocks are being re-fetched from the local Core oracle
--- which immediately exposed #11: the first real P2WPKH spend in history
-failed because the BIP143 scriptCode was the witness program rather than
-the implied P2PKH script, a mistake the synthetic-vector generator shared -- and #12: nested
-(P2SH-wrapped) segwit was not implemented at all and P2WSH handled two
-hard-coded shapes; witness-v0 scripts now run through the interpreter,
-with nine real mainnet spends (multisig, HTLC) pinned as fixtures; and
-#13, a 4096-byte BIP143 buffer overrun by a 500-input transaction, on
-threads that glibc had given 2 MB of stack minus 12 MB of TLS. Performance this week
-(`PERF_SCOPE.md`): `ecdsa_verify` 121 → ~39 µs (variable-time inverse,
-projective compare, GLV+wNAF; libsecp256k1 measures 21.8 µs on the same
-CPU), UTXO lookups via an mmap run cache (kernel share 31 % → 5 %), and
-end-to-end replay throughput **4.4×** over identical heights. A scratch
+real mainnet archive (no `assumevalid`), **~576k of 963k blocks** so far with
+every fix deployed. **Seventeen real production incidents** have been found by
+that replay and fixed with regression tests pinned to real chain data
+(`LOG.md` has the narrative for each, including the mistakes).
+
+The ones worth knowing: genesis was missing from the archive, so every
+buried soft fork activated one block late (a false-ACCEPT, and structurally
+invisible to a replay that only watches for rejects); two lost carries in
+the secp256k1 multiplies that ~2^-64 random testing could never have found;
+a shutdown path that had silently turned every `systemctl stop` into a
+SIGKILL; and, at the first segwit block, the discovery that the archive had
+been witness-stripped for the entire segwit era (`getdata` asked for
+`MSG_BLOCK`, and the merkle root cannot detect the difference) while this
+node had no BIP141 witness-commitment check to catch it. Re-fetching those
+~482k blocks from the local Core oracle then exposed the segwit era proper,
+one real spend at a time: the first P2WPKH spend in history (BIP143
+scriptCode was the witness program, a mistake the synthetic-vector generator
+shared), nested P2SH-wrapped segwit not being implemented at all, a
+4096-byte sighash buffer overrun by a 500-input transaction on threads glibc
+had given 2 MB of stack, a witness program left dangling into a reused
+buffer, an 8-item witness cap with no basis in consensus, and BIP342
+tapscript forbidding `OP_CHECKSIGVERIFY` -- an opcode it actually keeps.
+
+The method that now finds these earliest is a census of the un-replayed
+chain against known verifier limits (`CHAIN_AHEAD_CENSUS.md`): it predicted
+the tapscript wall hours before the replay would have reached it, and a real
+Core-accepted fixture from the oracle confirmed it. The discipline that
+keeps the fixes honest is differential: every consensus change must fail on
+the old code and pass on the new against real chain data. That has twice
+overturned a confident inline diagnosis this week -- in both cases the first
+plausible explanation was a genuine bug that was not the cause.
+
+Performance this week (`PERF_SCOPE.md`): `ecdsa_verify` 121 → ~39 µs
+(variable-time inverse, projective compare, GLV+wNAF; libsecp256k1 measures
+21.8 µs on the same CPU), UTXO lookups via an mmap run cache (kernel share
+31 % → 5 %), and end-to-end replay throughput **5.68×** over identical
+heights. A scratch
 Bitcoin Core instance is now part of the development path as an oracle
 and benchmark; chain hashes agree with it at every height checked. Next:
 the 4×64 field multiply (56 % of cycles), and a UTXO-set hash so Stage D
@@ -147,13 +162,16 @@ node still does not do.
   check. Parallelized across every input in the block (a persistent worker
   pool, not per-block thread spawns) to make a full-archive replay
   affordable. **In progress**: `bmc-bitcoind.service` is running a
-  from-scratch replay of the real chain against this path; three real bugs
-  it surfaced along the way (an LSM compaction manifest-ordering bug, a
-  dangling-pointer bug in a per-block script byte pool, and an interpreter
-  `OP_SIZE` register-width bug alongside a wholly-missing `OP_SHA1`) were
-  root-caused and fixed, each with a regression test proven against the
-  pre-fix code — see `worklog/2026-08-20.md` and `PLAN_SCRIPT_VERIFY.md`'s
-  Stage D section for the full account. Not yet reached chain tip.
+  from-scratch replay of the real chain against this path, currently past
+  height 576,000. **Seventeen** real bugs it has surfaced so far — from an
+  LSM compaction manifest-ordering bug and an interpreter `OP_SIZE`
+  register-width bug alongside a wholly-missing `OP_SHA1`, through the
+  witness-stripped archive and the segwit-era spend bugs underneath it, to
+  BIP342 tapscript rejecting `OP_CHECKSIGVERIFY` — were root-caused and
+  fixed, each with a regression test proven to fail against the pre-fix
+  code on real chain data. See `LOG.md` for the narratives,
+  `PLAN_SCRIPT_VERIFY.md`'s Stage D table for the one-line-per-wall index,
+  and the dated files in `worklog/`. Not yet reached chain tip.
 
 All assembly is authored by AI; C/Python harnesses exist only to prove the
 machine code is correct against trusted references. Real-mainnet validation
