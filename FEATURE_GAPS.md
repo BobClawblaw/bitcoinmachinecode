@@ -210,6 +210,11 @@ not just present as unused/tested-in-isolation code:
   peers; serve the stripped form to a bare `MSG_BLOCK` request; and
   **`MSG_WITNESS_TX` for transaction relay** — the mempool path still fetches
   transactions without witnesses (same bug shape, not yet hit).
+- **Nested segwit (P2SH-P2WPKH / P2SH-P2WSH) and general P2WSH — DONE
+  2026-08-22** (`11f7aa9`): were absent / two hard-coded shapes; now
+  witness-v0 scripts execute through `script_eval` (`bitcoin_witness_v0.c`),
+  native and wrapped, with CHECKMULTISIG's FindAndDelete gated on BASE and
+  mixed legacy+segwit sighash serialization fixed. Incident #12.
 - **P2WPKH BIP143 scriptCode — FIXED 2026-08-22** (`b3800f0`): was the witness
   program; now `76a914<h160>88ac`. Lesson recorded: vector generators must be
   derived from Core or the BIP's worked example, never from the verifier's
