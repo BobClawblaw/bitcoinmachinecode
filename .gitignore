@@ -289,3 +289,10 @@ asm/tests/test_lsm_sparse_diff
 asm/tests/soak_lsm_mm
 asm/tests/test_lsm_bloomsat
 asm/tests/diff_real_run
+asm/tests/live_ibd
+asm/tests/soak_mux_peer
+asm/tests/stress_fe
+asm/tests/stress_pointmul_ct
+asm/tests/test_bech32
+asm/tests/test_scalarmul_ct
+asm/tests/test_sigops
