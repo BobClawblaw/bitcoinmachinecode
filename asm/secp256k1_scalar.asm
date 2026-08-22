@@ -259,6 +259,17 @@ sc_mul:
     ; ================= PHASE 1: schoolbook product cur = a*b ================
     ; 16 products. For (i,j) with k=i+j: cur[k]+=lo(a[i]*b[j]),
     ;   cur[k+1]+=hi (with the carry from cur[k]+lo), cur[k+2]+=carry.
+; CARRY PROPAGATION (bug fixed 2026-08-21): the original macro stopped the
+; carry chain at limb k+2 (`adc r8, 0` once). When cur[k+2] was exactly
+; 0xFFFFFFFFFFFFFFFF at that moment the carry out of it was DROPPED -- a lost
+; 2^(64*(k+3)), i.e. for k+3 == 4 a lost 2^256 == DELTA (mod n), giving a
+; result off by exactly DELTA. Random operands hit it with probability ~2^-64
+; per product, but structured values hit it deterministically: sc_inv(6),
+; sc_inv(n-2) and every sc_inv(n-k) for small k were wrong (found by the
+; PERF_SCOPE 4.2 sc_inv_var differential, reproduced by emulating this
+; exact carry truncation in Python). The chain now carries to the END of the
+; 10-limb accumulator: same instruction count on every input (still
+; constant-time), never a lost carry.
 %macro MULACC 2
     mov    rax, [rbp-192 + (8*%1)]
     mul    qword [rbp-224 + (8*%2)]
@@ -268,9 +279,13 @@ sc_mul:
     mov    r8,  [rbp-80 + 8*(%1+%2+1)]
     adc    r8,  rdx
     mov    [rbp-80 + 8*(%1+%2+1)], r8
-    mov    r8,  [rbp-80 + 8*(%1+%2+2)]
+%assign cl (%1+%2+2)
+%rep (10 - (%1+%2+2))
+    mov    r8,  [rbp-80 + 8*cl]
     adc    r8,  0
-    mov    [rbp-80 + 8*(%1+%2+2)], r8
+    mov    [rbp-80 + 8*cl], r8
+%assign cl cl+1
+%endrep
 %endmacro
     MULACC 0,0
     MULACC 0,1
@@ -317,9 +332,14 @@ sc_mul:
     mov    r8,  [rbp-160 + 8*(hh+dj+1)]
     adc    r8,  rdx
     mov    [rbp-160 + 8*(hh+dj+1)], r8
-    mov    r8,  [rbp-160 + 8*(hh+dj+2)]
+    ; full carry propagation to the end of tmp (same fix as MULACC above)
+%assign cl (hh+dj+2)
+%rep (10 - (hh+dj+2))
+    mov    r8,  [rbp-160 + 8*cl]
     adc    r8,  0
-    mov    [rbp-160 + 8*(hh+dj+2)], r8
+    mov    [rbp-160 + 8*cl], r8
+%assign cl cl+1
+%endrep
 %assign dj dj+1
 %endrep
 %assign hh hh+1
