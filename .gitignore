@@ -296,3 +296,8 @@ asm/tests/stress_pointmul_ct
 asm/tests/test_bech32
 asm/tests/test_scalarmul_ct
 asm/tests/test_sigops
+asm/tests/test_witness_commitment
+# large real-block fixtures fetched on demand (validation/fetch_witness_blocks.py)
+asm/tests/fixtures/blk_4*.bin
+asm/tests/fixtures/blk_5*.bin
+asm/tests/fixtures/blk_6*.bin
