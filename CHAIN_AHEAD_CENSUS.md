@@ -1,0 +1,76 @@
+# Census: the un-replayed chain vs the verifier's limits
+
+Written 2026-08-22, while the Stage D replay sat at height 498,786. Purpose:
+after a run of "first occurrence in history" consensus bugs (incidents
+#10–#15 in `LOG.md`), stop discovering walls one at a time. This samples the
+chain **ahead** of the replay (499,000 → ~869,000, the Core oracle's tip) via
+`getblock … 2`, classifies every input's script/witness shape, and
+cross-references the maxima against the verifier's actual caps — so the walls
+are known before the replay reaches them.
+
+This is deliberately **not** a set of hand-written synthetic vectors. Tonight
+proved those share the author's blind spots (the P2WPKH-scriptCode and
+NULLDUMMY bugs passed synthetic tests because the generator made the same
+mistake as the verifier). The real chain is the independent adversary; this
+just consults it early.
+
+## Method / honesty
+
+257 blocks sampled: stride 1,500 across 499k–869k, plus every 250th block
+through the taproot-activation window 709k–712k. First-occurrence heights and
+running maxima recorded. **Gaps:** a rare shape between stride points can be
+missed (especially a one-off exotic tapscript); input/output **maxima are
+lower bounds** (a larger consolidation tx may sit between samples). Shapes
+were classified from scriptSig + witness only (exact for all witness spends).
+
+## Measured maxima vs our caps
+
+| measured | value | our cap | status |
+|---|---|---|---|
+| witness items / input | **21** | `TXV_MAX_WIT_ITEMS` = 8 | **EXCEEDS — the one hard wall** |
+| tapscript leaf size | 371,967 B (inscription) | `script_eval` walks in place; `MAX_SCRIPT_SIZE` exempt for tapscript | OK |
+| tapscript op count | 10,000 | `MAX_OPS`=201 **exempt** for tapscript | OK |
+| control-block depth | 21 (705 B) | `TAPROOT_CONTROL_MAX_NODES` = 128 | OK |
+| P2WSH multisig n | 11 (6-of-11) | CHECKMULTISIG ≤ 20 | OK |
+| witnessScript size | 887 B | `TXV_SPK_CAP` = 10000 | OK |
+| tx inputs | 1,372 | `TXV_MAX_INPUTS` = 20000 | OK (sampled) |
+| block inputs | 10,200 | 20000 | OK (sampled) |
+
+## Predicted walls, by height
+
+| first-height | shape / limit | our gap | verdict | evidence txid |
+|---|---|---|---|---|
+| **~551,500** | witness stack > 8 items (max 21) | `TXV_MAX_WIT_ITEMS=8` | **WILL REJECT** — fix in flight on `wit-items`; cap → MAX_STACK, not 21 | cf33e9d272219d23ff0b… |
+| ~532,000 | P2WSH with OP_CODESEPARATOR | general-P2WSH (#12) present | handled, UNTESTED | 23b098958df5086d8f49… |
+| 517,000+ | P2WSH HTLC: CLTV+CSV+IF+HASH160/SHA256 | present via `script_eval` | handled, UNTESTED (first real CLTV/CSV/hashlock *inside a witness script*) | 4022cbaecf465bde2176… |
+| 730k / 788.5k / 815.5k | sighash 0x81 / 0x83 / 0x82 (ACP, SINGLE\|ACP, NONE\|ACP) | BIP143 htype masking present | handled, UNTESTED (SINGLE\|ACP is the ancient corner) | 229614… / 11ace7… / 9ea2fe… |
+| **~775,000** | P2TR **script-path** (tapscript), incl. 363 KB inscriptions | dispatched; ops/size exempt; walked in place | handled, UNTESTED at scale — no fixture > 10 KB tapscript or a real inscription | 4cc72b13218183d4a6b1… |
+| 806.5k / 824.5k / 826k | tapscript CSV / CLTV / **CHECKSIGADD** | interp has OP_CHECKSIGADD + tapscript rules | handled, UNTESTED (first real CHECKSIGADD, tapscript CLTV/CSV) | e5dd… / 38806… / 7152875897af592bdd36… |
+
+## Taproot era (709,632+)
+
+Key-path common from ~713,500 (incl. ~11k non-default-sighash spends by
+713.5k). Script-path from ~775,000 and immediately heavy (one sampled block
+had 44,933 script-path inputs — inscriptions). Only leaf version 0xc0 seen
+(no future leaf versions yet). Control-block depth maxes at 21 (≪ 128). The
+tapscript opcodes that appear — OP_IF (ubiquitous), CHECKSIGADD, CLTV, CSV,
+HASH160 — all have code paths and **none has a real-chain fixture**. The
+single biggest untested risk is a real inscription-scale tapscript spend
+end-to-end.
+
+## What this means (the strategic answer)
+
+1. **One hard wall remains** before ~869k: the witness-item cap, already
+   being fixed. Nothing else in the sampled range rejects outright — the
+   #11–#14 fixes plus the tapscript size/op exemptions cover the shape
+   diversity. After `wit-items` lands, the replay should run *much* further.
+2. **The remaining risk is coverage, not code:** ~15 distinct "handled but
+   never run on real data" shapes. The high-value move is one differential
+   test that pulls the evidence txids above from the oracle and runs each
+   through `tx_verify_block_connect_all` — turning "should work" into
+   "verified," so a latent bug surfaces in a test, not at block 826,000.
+   Groups: (a) P2WSH HTLC / CODESEP / CLTV / CSV; (b) sighash
+   0x81/0x82/0x83; (c) tapscript incl. one inscription and one CHECKSIGADD.
+3. **Design-worthy, not urgent:** `tap_leaf_hash`'s 4 MB buffer caps a
+   tapscript leaf at 4 MB; a > 4 MB leaf would fail — none seen, and block
+   weight makes it near-impossible, but note it.
