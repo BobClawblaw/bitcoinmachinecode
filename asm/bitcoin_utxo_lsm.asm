@@ -227,6 +227,12 @@ manifest_tmp_name:  db "utxo_manifest.tmp", 0
 dot_name:           db ".", 0
 wal_name:            db "utxo.dat", 0
 
+; PERF_SCOPE.md 4.1: mmap-cached fast path for the disk-run lookup below.
+; Returns 1/0/2/-1 exactly as mac_run_lookup does, or -2 ("fall back") when
+; it declines -- open/mmap failure, a malformed run, any out-of-bounds
+; offset. See asm/utxo_lsm_mm.c for the cache and its staleness rules.
+extern lsm_run_lookup_mm
+extern lsm_mm_invalidate_all
 extern utxo_put
 extern utxo_get
 extern utxo_del
@@ -1003,6 +1009,10 @@ utxo_lsm_init:
     push r12
     sub  rsp, 0x10
     mov  r12, rdi
+    call lsm_mm_invalidate_all   ; PERF_SCOPE 4.1: a fresh instance restarts
+                                  ; run_no/gen at 0, so every cached mapping
+                                  ; from a previous instance is now stale
+    mov  rdi, r12
     call utxo_store_init
     cmp  rax, 1
     jne  .li_fail
@@ -1220,6 +1230,37 @@ mac_run_lookup:
     ; lsm_get_scratch TLS buffer (see its header comment above), not in
     ; lst->scratch_buf's ping/pong-prefixed layout mac_flush still uses.
     mov  qword [rbp-0x60], 0    ; off_bloom
+
+    ; ---- PERF_SCOPE.md 4.1 fast path ----------------------------------
+    ; Try the mmap-cached lookup first. It answers from a mapping already
+    ; held by this thread -- no open, no 4 MiB bloom copy, no lseek/read
+    ; per record. -2 means it declined (see the extern's comment); every
+    ; other value is a final answer and returns straight out, so the code
+    ; below is reached ONLY as the fallback and is otherwise untouched.
+    ; gen comes from the manifest entry the caller is iterating and is what
+    ; makes a reused run_no impossible to serve from a stale mapping.
+    ; rsp is 8 (mod 16) here (6 pushes + 0x300); 0x28 brings the call site
+    ; to 0 (mod 16) as the SysV ABI requires, leaving the four stack args
+    ; at [rsp .. rsp+24] and 8 bytes of pad above them.
+    mov  rdi, r12               ; lst
+    mov  esi, r13d              ; run_no
+    mov  rdx, [rbp+40]          ; gen
+    mov  rcx, [rbp-0x30]        ; txid
+    mov  r8d, [rbp-0x38]        ; index
+    mov  r9, [rbp-0x40]         ; &value
+    sub  rsp, 0x28
+    mov  rax, [rbp-0x48]
+    mov  [rsp], rax             ; &height
+    mov  rax, [rbp-0x50]
+    mov  [rsp+8], rax           ; &is_coinbase
+    mov  rax, [rbp-0x78]
+    mov  [rsp+16], rax          ; &script
+    mov  rax, [rbp-0x80]
+    mov  [rsp+24], rax          ; &slen
+    call lsm_run_lookup_mm
+    add  rsp, 0x28
+    cmp  eax, -2
+    jne  .ml_ret
 
     lea  rdi, [rbp-0x180]
     mov  esi, r13d
@@ -1634,6 +1675,8 @@ utxo_lsm_get:
     shl  rcx, 4                 ; *16 (entry size)
     mov  rdx, [r12+104]          ; manifest_buf
     add  rdx, rcx
+    mov  r14, [rdx]               ; gen (PERF_SCOPE 4.1: validates the
+                                   ; mmap cache -- see mac_run_lookup)
     mov  esi, [rdx+8]             ; run_no
     mov  rdi, r12
     mov  rdx, rbx
@@ -1643,12 +1686,14 @@ utxo_lsm_get:
     mov  rax, [rbp-0x68]     ; &is_coinbase
     mov  r10, [rbp-0x48]     ; &script (r10: scratch, not an arg register)
     mov  r11, [rbp-0x70]     ; &slen
-    sub  rsp, 0x18
+    sub  rsp, 0x28           ; 0x28 == 0x18 (mod 16): same call-site
+                              ; alignment as before, one more arg slot
     mov  [rsp], rax
     mov  [rsp+8], r10
     mov  [rsp+16], r11
+    mov  [rsp+24], r14       ; gen -> mac_run_lookup's [rbp+40]
     call mac_run_lookup
-    add  rsp, 0x18
+    add  rsp, 0x28
     cmp  eax, 1
     je   .lg_found
     cmp  eax, 2
@@ -2198,8 +2243,15 @@ utxo_lsm_reload:
     push r14
     push r15
     sub  rsp, 0x200
+    ; Stash both args in CALLEE-saved regs before the C call below: rdi/rsi
+    ; are caller-saved, and [rbp-0x08] is the saved rbx (the five pushes
+    ; above occupy rbp-0x08..rbp-0x28), so neither survives a call.
     mov  r12, rdi           ; lst
     mov  r13, rsi            ; u
+    call lsm_mm_invalidate_all   ; PERF_SCOPE 4.1: reload re-derives
+                                  ; next_run_no/next_gen from the manifest,
+                                  ; so cached mappings may no longer match
+    mov  rdi, r12
 
     ; open (or reopen) the WAL fds -- utxo_store_reload below assumes
     ; st->log_fd/idx_fd are already valid open fds (it never opens them

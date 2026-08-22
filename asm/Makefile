@@ -27,6 +27,9 @@ VERSION_GEN_PY   := gen_version_header.py
 $(VERSION_GEN_H): $(VERSION_INC) $(VERSION_GEN_PY)
 	python3 $(VERSION_GEN_PY) --out $@ --version-inc $(VERSION_INC)
 
+utxo_lsm_mm.o: utxo_lsm_mm.c
+	$(CC) $(CFLAGS) -c -o $@ utxo_lsm_mm.c
+
 OBJS := sha256.o sha1.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_store_fast.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o
 # BIP152 compact blocks (bitcoin_cmpct.asm) needs sha256_full (single SHA256)
 # and tx_parse (block tx enumeration for getblocktxn/blocktxn serving).
@@ -204,7 +207,7 @@ REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/archive_verify.c daemon/ut
 REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o \
     bitcoin_chainwork.o bitcoin_hash.o sha256.o bitcoin_tx.o \
     bitcoin_cons.o bitcoin_p2p.o bitcoin_net.o bitcoin_mempool.o \
-    bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o \
+    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o \
     bitcoin_headers.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o \
     bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o \
     secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
@@ -288,7 +291,7 @@ tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REOR
 # steady-state-sized memtable. Previously built by hand, which is how it went
 # stale and briefly vanished; a real target keeps it buildable and honest.
 BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
-    bitcoin_store_fast.o bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o \
+    bitcoin_store_fast.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o \
     bitcoin_idxscan.o
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
@@ -404,7 +407,7 @@ DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
     node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o \
     bitcoin_serve.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
-    bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
+    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
@@ -497,7 +500,7 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_store.o bitcoind.o bitcoin_headers.o bitcoin_hash.o \
     bitcoin_addrmgr.o node_log.o bitcoin_tx.o bitcoin_cons.o \
     sha256.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
-    bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o \
+    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o secp256k1_schnorr.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
@@ -683,7 +686,16 @@ tests/test_utxo_store: tests/test_utxo_store.c $(UTXOSTOREOBJS)
 # approach above for full-archive replay to fix write amplification.
 # NOT wired into DAEMONOBJS -- Phase 2 (compaction) is a hard gate before
 # any live-daemon use; today's only real caller is daemon/build_utxo.c.
-UTXOLSMOBJS := bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o
+UTXOLSMOBJS := bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o
+
+# PERF_SCOPE.md 4.1: the mmap fast path must be indistinguishable from the
+# asm path it short-circuits -- differential + concurrency, incl. the
+# stale-value shape that caught e12dcbb.
+tests/bench_lsm_get: tests/bench_lsm_get.c $(UTXOLSMOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/bench_lsm_get.c $(UTXOLSMOBJS)
+
+tests/test_lsm_mmap_diff: tests/test_lsm_mmap_diff.c $(UTXOLSMOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_lsm_mmap_diff.c $(UTXOLSMOBJS) -lpthread
 tests/test_utxo_lsm: tests/test_utxo_lsm.c $(UTXOLSMOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_utxo_lsm.c $(UTXOLSMOBJS)
 
@@ -939,7 +951,7 @@ tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/moder
 # NOT covered by test_mempool_accept_modern, which only exercises the old
 # bitcoin_utxo.asm-backed passthrough shim, never tx_accept.c itself.
 TXACCEPTOBJS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c \
-    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o \
+    bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o utxo_lsm_mm.o \
     bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_point_ct.o \
@@ -980,7 +992,7 @@ tests/test_wallet: tests/test_wallet.c wallet_core.c $(WALLETPRIMS)
 # through the same rpc_dispatch().
 # ============================================================================
 RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
-# bitcoin_utxo_lsm.o/bitcoin_utxo_store.o: rpc_commands.o's cmd_gettxout_w
+# bitcoin_utxo_lsm.o utxo_lsm_mm.o/bitcoin_utxo_store.o: rpc_commands.o's cmd_gettxout_w
 # calls utxo_lsm_get unconditionally, so every rpc_commands.o-linking target
 # needs them, not just daemon/bitcoin_rpcd (which additionally builds/reloads
 # the store itself).
@@ -989,7 +1001,7 @@ RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
 # path), bitcoin_idx.o (hash->height), bitcoin_tx.o (tx_txid), bitcoin_chainwork.o
 # (block_work/chainwork_add fallback when chainwork.dat is absent).
 RPCCHAIN := rpc_chain.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
-RPCLIBS := wallet_core.c $(WALLETPRIMS) bitcoin_utxo_lsm.o bitcoin_utxo_store.o $(RPCCHAIN)
+RPCLIBS := wallet_core.c $(WALLETPRIMS) bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o $(RPCCHAIN)
 
 rpc_json.o: rpc_json.c rpc_json.h
 	$(CC) -no-pie -O0 -c -o $@ rpc_json.c
@@ -1070,7 +1082,7 @@ tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
 test: tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 \
-tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_ecdsa_inverse \
+tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_ecdsa_inverse tests/test_lsm_mmap_diff \
 	./tests/test_node_config
 	./tests/test_archive_check
 	./tests/test_archive_repair
@@ -1134,6 +1146,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_taproot_scriptpath
 	./tests/test_mul_carry_regression
 	./tests/test_ecdsa_inverse
+	./tests/test_lsm_mmap_diff
 	./tests/test_segwit_sighash
 	./tests/test_mempool_accept_modern
 	./tests/test_tx_accept_e2e
