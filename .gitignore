@@ -150,6 +150,7 @@ asm/tests/test_schnorr
 asm/tests/test_taproot
 asm/tests/test_taproot_sighash
 asm/tests/test_taproot_scriptpath
+asm/tests/test_taproot_exception_block
 asm/tests/test_mul_carry_regression
 asm/tests/test_fe_repr
 asm/tests/test_point_repr
