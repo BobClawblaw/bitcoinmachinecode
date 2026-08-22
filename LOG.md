@@ -7,6 +7,133 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-22 -- Incident #20: the SysV stack ABI was violated tree-wide, not just on the serve path; the script interpreter was crashing the same way
+
+Incident #18 (`b18114b`) fixed one function. The obvious next question --
+"is `node_serve_loop` the only one?" -- turned out to have an uncomfortable
+answer, so this entry records a full audit rather than a patch.
+
+### The tool, because a hand audit of this size would be wrong
+`scripts/abi_stack_audit.py` abstract-interprets RSP mod 16 (and RBP mod 16,
+so `leave` / `mov rsp,rbp` / `lea rsp,[rbp-N]` / `and rsp,-16` are modelled)
+over the control-flow graph of every function in every `.asm` source, from
+every entry point, and reports the parity at each `call` and each tail `jmp`.
+
+The load-bearing design decision is that it analyses each function **twice**:
+once with the ABI-correct entry parity (8 mod 16, what a correct `call`
+delivers) and once with the abnormal one (0 mod 16, what a *violating* caller
+delivers). That distinction is the whole point. A function whose calls are
+aligned only under the abnormal entry has been tuned against a broken caller,
+and "fixing" that caller breaks it. Without that check a global fix converts
+a set of latent bugs into a set of live ones. It then runs a whole-program
+fixed point over the asm call graph, so every function's *actual* entry
+parities are known rather than assumed.
+
+C callees are classified empirically, not from source: `objdump -d` the `.o`
+and look for `movaps`/`movdqa`/`movntdq` against an `rbp`/`rsp` operand. That
+is what actually faults; nothing else about the C matters.
+
+### The result: the violation is the majority convention, not an outlier
+Across 339 assembly functions reachable from the exported entry points, at
+`cb20051`:
+
+| verdict (analysed in isolation)      | count |
+|--------------------------------------|-------|
+| ABI-CORRECT (aligned under entry 8)  |    97 |
+| NEEDS-ENTRY-0 (aligned only under 0) |    43 |
+| MIXED (no entry parity works)        |    15 |
+| SELF-ALIGNING (`and rsp,-16`)        |     8 |
+| NO-CALLS                             |   176 |
+
+1141 reachable call sites: 625 correct, **516 misaligned**.
+
+The dominant idiom in this tree is `push rbp` / `mov rbp,rsp` / five
+callee-saved pushes / `sub rsp, <multiple of 16>`. That leaves RSP at 8 mod 16
+at every nested `call`. `ripemd160`, `idx_get`, `idx_put`, `node_log_event`,
+`node_handshake`, `node_accept_handshake`, `utxo_store_put`, `multisig_verify`,
+`verify_p2pkh`, `script_eval` and ~30 more all have it. Where a function *is*
+correct it is usually because the push count happened to come out even, not
+because anyone chose it. **#18 was not an outlier; it was the first instance
+that mattered.**
+
+### The live one: the script interpreter, crashing exactly like #18
+`script_eval` reserved `0x100` after the six-push prologue, so all **215** of
+its call sites ran at 8 mod 16 -- including `call qword [r12+96]` inside
+`interp_checksig` / `interp_checksig_add` / `interp_checkmultisig`. That slot
+is `checksig_fn`, the C callback: `sv_checksig` (bitcoin_scriptverify.c) on the
+legacy path, `taproot_checksig_fn` (bitcoin_taproot_sighash.c) on tapscript.
+Assembly calling C, on a misaligned frame, on the consensus script path.
+
+Measured rather than argued. A probe returning the caller's RSP, installed as
+`checksig_fn`, reported `rsp%16 == 8`. Swapping in a callback that does one
+`snprintf` reproduced #18 byte for byte:
+
+```
+Program received signal SIGSEGV
+=> 0x7ffff7c8fd6c <__vsnprintf_internal+60>: movaps %xmm0,-0xc0(%rbp)
+   si_addr = 0x0
+   #4 log_cs   #5 interp_checksig
+```
+
+Same instruction, same NULL fault address, different subsystem. It had not
+been noticed because every C file on that path is compiled `-O0` (the daemon
+itself is `-O0`), and at `-O0` GCC does not emit the 16-byte-aligned spills
+that `-O2` does. The bug was one optimisation flag, or one log line, away.
+
+### What was fixed, and what deliberately was not
+Fixed, smallest blast radius first, each proven by re-running the analyser and
+diffing the violation set:
+
+* `script_eval` `0x100` -> `0x108`. All locals are rbp-relative, so the frame
+  grows and no operand moves.
+* `interp_checkmultisig`'s unpaired `push rdx` around the `.pop_all` loop gets
+  a padding push -- the same correction `b18114b` made to `node_serve_loop`'s
+  four `push rbx`/`call`/`pop rbx` sites.
+* `bitcoin_scriptcodec.asm`: `stack_swap_two` `sub rsp,16` -> `24`, and padding
+  pushes in `stack_erase_index` / `stack_insert_index`. These three are called
+  only from `script_eval`, so the subtree closes. Their comment claimed 16 was
+  "alignment-neutral, preserves whatever call-site alignment already existed" --
+  which is the #18 mistake stated as a principle. Preserving an 8-mod-16 RSP is
+  not neutral.
+* `utxo_lsm_init` and `utxo_lsm_reload` bracket their `lsm_mm_invalidate_all`
+  call with `sub rsp,8` / `add rsp,8`. Deliberately *not* a frame resize: that
+  would flip the entry parity delivered to `utxo_store_init`,
+  `mac_tomb_hash_reset` and everything under them, on the UTXO path. The
+  bracket fixes the one call that leaves assembly and changes nothing else.
+
+Result: 254 misaligned call sites removed, **zero call sites that leave
+assembly are misaligned**, and a line-shift-immune diff of the before/after
+site sets confirms no call site anywhere got worse.
+
+Not fixed, on purpose: 262 asm->asm misaligned sites remain. They are latent --
+every `movdqa` in this tree is register-to-register, with no 16-byte-aligned
+stack operand anywhere -- and clearing them is a coordinated tree-wide change,
+not a set of independent one-liners. The audit found exactly one true
+**compensated** site, and it is the proof that the coordination matters:
+`siphash24_uint256.sipround2` (bitcoin_cmpct.asm) has no prologue and is only
+ever entered at 0 mod 16, so its two `call .sipround`s are currently correct
+*because* its caller is broken. Fixing `siphash24_uint256` alone would break it.
+
+### The guard
+Two halves, both wired into `make test`:
+
+* `make abi-check` runs the analyser over the sources and fails if any call
+  site that leaves assembly is misaligned. Run against `b18114b^` it flags
+  `node_serve_loop`'s `log_block_stored_inbound` call directly -- **it would
+  have failed on `5aea7c0`, the commit that made #18 lethal, the day it
+  landed.**
+* `tests/test_abi_stack_align` drives the one place assembly calls back out to
+  C through a function pointer, asserts the measured parity, and then does a
+  printf from that callback. Linked against the pre-fix objects it SIGSEGVs;
+  against the fixed ones it passes.
+
+The lesson generalises past alignment: a bug that is invisible because nothing
+currently exercises it is not a bug that is fixed, and "the tests pass" is not
+evidence that an ABI is being honoured. The tests passed for the whole time the
+interpreter was one log line from dying.
+
+
+----------------------------------------------------------------------------
 ## 2026-08-22 -- Incidents #6-#19; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second

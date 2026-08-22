@@ -255,9 +255,18 @@ stack_swap_two:
     push  r13
     push  r14
     push  r15
-    sub   rsp, 16              ; [rsp+0]=elem_tmp0 addr [rsp+8]=elem_tmp1 addr
-                                ; (16 = alignment-neutral, preserves whatever
-                                ; call-site alignment already existed here)
+    sub   rsp, 24              ; [rsp+0]=elem_tmp0 addr [rsp+8]=elem_tmp1 addr
+                                ; 24, not 16: entry RSP == 8 mod16 and the four
+                                ; pushes above leave it at 8 mod16, so the
+                                ; reservation must be 8 mod16 to put RSP at
+                                ; 0 mod16 for the `call elem_move`s below.
+                                ; (The old comment called 16 "alignment-neutral,
+                                ; preserves whatever call-site alignment already
+                                ; existed" -- that is precisely the incident-#18
+                                ; mistake: preserving an 8-mod-16 RSP is not
+                                ; neutral, it is a SysV ABI violation. The two
+                                ; locals sit at the LOW end of the frame, so
+                                ; growing it moves neither operand.)
     mov   r12, rdi
     mov   r13, rsi
     TLS_ADDR rax, elem_tmp0
@@ -288,7 +297,7 @@ stack_swap_two:
     mov   rdi, r15
     mov   rsi, [rsp+0]
     call  elem_move
-    add   rsp, 16
+    add   rsp, 24              ; must match the prologue reservation
     pop   r15
     pop   r14
     pop   r13
@@ -757,9 +766,13 @@ stack_erase_index:
     add   rcx, r13            ; dst
     push  rdx
     push  rcx
+    push  rcx                 ; padding: 4 pushes above + 2 here left RSP at
+                              ; 8 mod16 for the call; a 3rd push restores
+                              ; 0 mod16, as SysV requires at a `call`.
     mov   rdi, rcx
     mov   rsi, rdx
     call  elem_move
+    pop   rcx                 ; discard padding
     pop   rcx
     pop   rdx
     inc   r15
@@ -813,9 +826,13 @@ stack_insert_index:
     push  rdx
     push  rcx
     push  r10
+    push  r10                 ; padding: 5 pushes above + 3 here left RSP at
+                              ; 8 mod16 for the call; a 4th push restores
+                              ; 0 mod16, as SysV requires at a `call`.
     mov   rdi, rcx
     mov   rsi, rdx
     call  elem_move
+    pop   r10                 ; discard padding
     pop   r10
     pop   rcx
     pop   rdx

@@ -306,7 +306,24 @@ script_eval:
     push  r13
     push  r14
     push  r15
-    sub   rsp, 0x100
+    sub   rsp, 0x108          ; ODD multiple of 8, on purpose -- SysV alignment.
+                              ;   Entry RSP == 8 mod16; `push rbp` -> 0 mod16;
+                              ;   the 5 callee-saved pushes -> 8 mod16 again.
+                              ;   The reservation must therefore be 8 mod16 to
+                              ;   put RSP == 0 mod16 at every nested `call`.
+                              ;   This was 0x100 (0 mod16), which left RSP at
+                              ;   8 mod16 at all 215 call sites in this
+                              ;   function -- including `call qword [r12+96]`
+                              ;   in interp_checksig / interp_checksig_add /
+                              ;   interp_checkmultisig, the C checksig callback
+                              ;   (sv_checksig, taproot_checksig_fn). Any C on
+                              ;   that path that reaches a printf-family call
+                              ;   died: glibc's vsnprintf does
+                              ;   `movaps %xmm0,-0xc0(%rbp)` -> #GP ->
+                              ;   SIGSEGV with si_addr == NULL. Same failure
+                              ;   mode as incident #18 (b18114b). (2026-08-22)
+                              ; All locals here are rbp-relative, so growing the
+                              ;   reservation by 8 moves no operand.
     mov   r12, rdi            ; state
 
     ; per-thread scratch addresses, computed once (see file-header note
@@ -2268,7 +2285,7 @@ script_eval:
 .ret0:
     xor   eax, eax
 .done:
-    add   rsp, 0x100
+    add   rsp, 0x108          ; must match the prologue reservation above
     pop   r15
     pop   r14
     pop   r13
@@ -2937,6 +2954,11 @@ interp_checkmultisig:
     add   ecx, 3
     ; save bool (edx) across the pops.
     push  rdx                     ; stash bool
+    push  rdx                     ; 2nd push = padding: an odd number of pushes
+                                  ; here would flip RSP off 16-byte alignment
+                                  ; for the `call stack_pop` below (same
+                                  ; correction b18114b made to node_serve_loop's
+                                  ; four push/call/pop sites).
 .pop_all:
     test  ecx, ecx
     jz    .pop_all_done
@@ -2946,6 +2968,7 @@ interp_checkmultisig:
     dec   ecx
     jmp   .pop_all
 .pop_all_done:
+    pop   rdx                     ; discard the padding push
     pop   rdx                     ; restore bool
     ; push the result bool
     lea   rdi, [r12+8]
