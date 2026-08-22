@@ -626,10 +626,26 @@ fe_mul:
     mov r12, rax            ; res2 -> r12
     mov rbx, rdx
 
-    ; res3 = new3 + carry_in  (result < 2^256, top carry is dropped)
+    ; res3 = new3 + carry_in. The carry OUT of this add is NOT always zero
+    ; (bug fixed 2026-08-21): the old code dropped it, assuming the fold-2
+    ; result was < 2^256. It is not when new0..new3 is within ~2^66 of
+    ; 2^256 -- e.g. squaring p - 2^31 -- and every drop lost exactly
+    ; 2^256 == C (mod p), so fe_inv(p - k) was wrong for small k (found by
+    ; the PERF_SCOPE 4.2 structured-input probe; random inputs hit it with
+    ; probability ~2^-190). Fold it: when the carry is 1 the surviving low
+    ; value is < 2^66, so adding C (< 2^34) once cannot carry again, and the
+    ; conditional subtract below still canonicalizes. Mask-based: same
+    ; instruction count either way (constant-time preserved).
     mov rax, [rsp + 24]
     add rax, rbx
-    mov r13, rax            ; res3 -> r13
+    mov r13, rax            ; res3 -> r13 ; CF = carry out of limb 3
+    sbb rbx, rbx            ; rbx = -CF (all-ones iff the carry was 1)
+    mov rax, [C_CONST]
+    and rax, rbx            ; rax = CF ? C : 0
+    add r10, rax
+    adc r11, 0
+    adc r12, 0
+    adc r13, 0
 
     ; ---- canonicalize: if value >= p, subtract p once ----
     mov rax, r10
