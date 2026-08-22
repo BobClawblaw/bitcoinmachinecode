@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "test_tmpdir.h"
 
 extern long archive_scan_duplicates(long* out_heights, long max_out);
 extern long archive_repair_duplicates(void);
@@ -46,11 +47,7 @@ static void write_rec(int fd, long h, unsigned char hashbyte, int is_hole){
 }
 
 int main(void){
-    char tmpl[] = "/tmp/btcarchreptestXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     /* Build a synthetic 20-height archive mirroring the REAL corruption
      * shape: heights 0..9 unique; heights 10..14 duplicate heights 1..5
      * (a "locator collapse" pattern); heights 15..19 unique again. */
@@ -117,6 +114,5 @@ int main(void){
     /* cleanup */
     unlink("index.dat");
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
-    rmdir(dir);
     return failures?1:0;
 }

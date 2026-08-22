@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "test_tmpdir.h"
 
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long utxo_count(void* u);
@@ -158,11 +159,7 @@ static int downgrade_manifest_to_oldformat(void) {
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/btclivecntXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     g_tomb = malloc(TOMB_CAP*36);
     g_manifest = malloc(MANIFEST_CAP*16);
     g_scratch = malloc(SCRATCH_CAP);

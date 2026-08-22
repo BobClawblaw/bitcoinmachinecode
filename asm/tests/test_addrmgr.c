@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 extern int  amr_init(void* ab);
 extern long amr_count(void* ab);
@@ -22,7 +23,8 @@ static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else {printf("FAIL %s got=%ld exp=%ld\n",l,g,e); failures++;} }
 
 int main(void){
-    mkdir("/tmp/amrtest",0777); chdir("/tmp/amrtest");
+    /* fixed /tmp/amrtest was shared by every concurrent run */
+    tt_isolate();
     unlink("peers.dat"); unlink("index.dat"); unlink("blk00000.dat");
     static unsigned char ab[64];
     cki("amr_init", amr_init(ab), 1);

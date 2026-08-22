@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "segwit_coverage_vec.h"
+#include "test_tmpdir.h"
 typedef unsigned char u8; typedef unsigned long u64;
 struct lsm_state {
     long log_fd, idx_fd;
@@ -60,7 +61,7 @@ static void seed_lsm(void){
 }
 static u8 txbuf[1<<20], spk[256];
 int main(void){
-  char tmpl[]="/tmp/segcovXXXXXX"; char* d=mkdtemp(tmpl); if(!d||chdir(d)){perror("dir");return 1;}
+  tt_isolate();
   seed_lsm();
   /* seed every prevout of every fixture (RPC display order -> wire order) */
   for(unsigned f=0; f<COV_N; f++){ const cov_fixture_t* F=&COV_FIXTURES[f];

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "test_tmpdir.h"
 
 extern int  node_log_open(const char* path);
 extern void node_log_event(int fd, int kind, unsigned a, unsigned b, unsigned c);
@@ -11,7 +12,8 @@ static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e) printf("PASS %s (got %ld)\n",l,g); else { printf("FAIL %s got=%ld exp=%ld\n",l,g,e); failures++; } }
 
 int main(void){
-    const char* path="/tmp/test_log.txt";
+    tt_isolate();   /* fixed /tmp/test_log.txt was shared by every concurrent run */
+    const char* path="test_log.txt";
     remove(path);
     int fd = node_log_open(path);
     cki("log open fd>=0", fd>0, 1);

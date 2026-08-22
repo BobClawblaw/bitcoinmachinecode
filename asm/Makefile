@@ -52,6 +52,11 @@ CONSOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_cons.o
 
 .PHONY: all asm test clean abi-check
 
+# Per-test private working directory helper. Every test that includes it must
+# list it as a prerequisite, or a change to the isolation mechanism silently
+# fails to reach the binaries that depend on it.
+TEST_TMPDIR_H = tests/test_tmpdir.h
+
 all: test
 
 asm: $(OBJS)
@@ -217,41 +222,41 @@ tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
 tests/bench_hashidx: tests/bench_hashidx.c bitcoin_idx.o
 	$(CC) -no-pie -O0 -Wall -o $@ tests/bench_hashidx.c bitcoin_idx.o
 
-tests/test_store: tests/test_store.c bitcoin_store.o
+tests/test_store: tests/test_store.c bitcoin_store.o $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_store.c bitcoin_store.o
 
 # PRUNING (store_prune/store_set_prune in bitcoin_store.asm): configurable prune
 # height, whole-file deletion, boundary compaction, -3-unavailable gate,
 # prune.dat persistence. Standalone (links bitcoin_store.o only).
-tests/test_prune: tests/test_prune.c bitcoin_store.o
+tests/test_prune: tests/test_prune.c bitcoin_store.o $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_prune.c bitcoin_store.o
 
 # ---- Stage A reorg/fork-choice primitives (standalone, additive -- see each
 # new file's own header comment; nothing in the live daemon calls these yet) ----
 
 # Primitive #1: chainwork tracking (bitcoin_chainwork.asm). Standalone.
-tests/test_chainwork: tests/test_chainwork.c bitcoin_chainwork.o
+tests/test_chainwork: tests/test_chainwork.c bitcoin_chainwork.o $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_chainwork.c bitcoin_chainwork.o
 
 # Primitive #2: real multi-hash block locator (p2p_getheaders count>1
 # extension in bitcoin_p2p.asm + daemon/locator_build.c).
-tests/test_locator: tests/test_locator.c $(P2POBJS) bitcoin_store.o daemon/locator_build.o
+tests/test_locator: tests/test_locator.c $(P2POBJS) bitcoin_store.o daemon/locator_build.o $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_locator.c $(P2POBJS) bitcoin_store.o daemon/locator_build.o
 
 # Primitive #3: prevhash validation gate (store_get_tip_hash /
 # store_validates_prevhash in bitcoin_store.asm). Standalone.
-tests/test_prevhash: tests/test_prevhash.c bitcoin_store.o
+tests/test_prevhash: tests/test_prevhash.c bitcoin_store.o $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_prevhash.c bitcoin_store.o
 
 # Primitive #4: store truncate/rollback (store_truncate_to in
 # bitcoin_store.asm). Also exercises the EXISTING, unmodified
 # idx_build_from_file (bitcoin_idx.asm) against the truncated store.
-tests/test_truncate: tests/test_truncate.c bitcoin_store.o $(IDXOBJS)
+tests/test_truncate: tests/test_truncate.c bitcoin_store.o $(IDXOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_truncate.c bitcoin_store.o $(IDXOBJS)
 
 # Primitive #5: per-block undo-data structure (daemon/undo_log.c) against
 # the real LSM UTXO store.
-tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
+tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
 
 # ---- Stage B: the wired-together reorg engine ----------------------------
@@ -275,7 +280,7 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
     secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
     secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
     bitcoin_addr.o sha1.o
-tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
+tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(REORGSRCS) $(REORGOBJS) -lpthread
 
 # test_tx_verify_parallel -- differential test for txv_verify_all's forked
@@ -283,7 +288,7 @@ tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS)
 # multi-signed P2WPKH tx (see tests/multi_p2wpkh_vec.h / gen_multi_p2wpkh.py).
 TXVPARSRCS := tests/test_tx_verify_parallel.c daemon/tx_verify.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
-tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c daemon/undo_log.c daemon/node_config.c $(REORGOBJS)
+tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c daemon/undo_log.c daemon/node_config.c $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c daemon/undo_log.c daemon/node_config.c $(REORGOBJS) -lpthread
 # NB: filter out the real LSM objects -- this test supplies its own adversarial
 # utxo_lsm_get (single reused return buffer) to pin the transient-spk contract.
@@ -300,9 +305,9 @@ tests/test_txvb_wprog_stable: tests/test_txvb_wprog_stable.c daemon/tx_verify.c 
 # never stands up an LSM, so it touches no files at all.
 tests/test_taproot_exception_block: tests/test_taproot_exception_block.c tests/taproot_exception_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS)
 	$(CC) -no-pie -O0 -Wall -I tests -o $@ tests/test_taproot_exception_block.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS) -lpthread
-tests/test_segwit_real: tests/test_segwit_real.c tests/segwit_real_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS)
+tests/test_segwit_real: tests/test_segwit_real.c tests/segwit_real_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ tests/test_segwit_real.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread
-tests/test_segwit_coverage: tests/test_segwit_coverage.c tests/segwit_coverage_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS)
+tests/test_segwit_coverage: tests/test_segwit_coverage.c tests/segwit_coverage_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ tests/test_segwit_coverage.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread
 # test_tapscript_scale -- inscription-SCALE tapscript coverage: the last two
 # open rows of CHAIN_AHEAD_CENSUS.md. The inline fixtures (42,594 B leaf,
@@ -311,9 +316,9 @@ tests/test_segwit_coverage: tests/test_segwit_coverage.c tests/segwit_coverage_v
 # tests/fixtures/tapscript_big.txt (regenerate with
 # `python3 validation/fetch_tapscript_scale.py --big tests/fixtures`) and SKIP
 # loudly when absent, so this never fails merely because the oracle is offline.
-tests/test_tapscript_scale: tests/test_tapscript_scale.c tests/tapscript_scale_vec.h tests/tapscript_stack_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS)
+tests/test_tapscript_scale: tests/test_tapscript_scale.c tests/tapscript_scale_vec.h tests/tapscript_stack_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ tests/test_tapscript_scale.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread
-tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJS)
+tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(TXVPARSRCS) $(REORGOBJS) -lpthread
 
 # test_utxo_checkpoint -- utxo_live_catchup must persist a resumable
@@ -323,7 +328,7 @@ CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/block_witness
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CKPTSRCS) $(REORGOBJS) -lpthread
 
 # test_apply_block_rollback -- a block that fails partway through must roll
@@ -333,7 +338,7 @@ ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/bloc
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(ROLLBACKSRCS) $(REORGOBJS) -lpthread
 
 # test_utxo_catchup_crash_resume -- a process death mid-catch-up must not
@@ -346,7 +351,7 @@ CRASHRESUMESRCS := tests/test_utxo_catchup_crash_resume.c daemon/utxo_live.c dae
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CRASHRESUMESRCS) $(REORGOBJS) -lpthread
 
 # test_utxo_catchup_shutdown -- SIGTERM during a (multi-hour) bulk catch-up
@@ -357,7 +362,7 @@ SHUTDOWNSRCS := tests/test_utxo_catchup_shutdown.c daemon/utxo_live.c daemon/blo
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(SHUTDOWNSRCS) $(REORGOBJS) -lpthread
 
 # test_utxo_crash_recovery -- a kill between "block N's ops hit the WAL" and
@@ -369,7 +374,7 @@ CRASHRECSRCS := tests/test_utxo_crash_recovery.c daemon/utxo_live.c daemon/block
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CRASHRECSRCS) $(REORGOBJS) -lpthread
 
 # test_cross_tx_verify -- correctness properties specific to the cross-
@@ -383,7 +388,7 @@ CROSSTXSRCS := tests/test_cross_tx_verify.c daemon/utxo_live.c daemon/block_witn
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(CROSSTXSRCS) $(REORGOBJS) -lpthread
 
 # test_tx_verify_bytepool_realloc -- regression test for the g_spk_pool
@@ -396,7 +401,7 @@ BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemo
     daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
-tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REORGOBJS)
+tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -Wall -o $@ $(BYTEPOOLSRCS) $(REORGOBJS) -lpthread
 
 # daemon/build_utxo -- batch UTXO-set construction from the archive. This is
@@ -422,14 +427,14 @@ tests/test_truncate_guard_prim: tests/test_truncate_guard_prim.c bitcoin_store.o
 # detection, and the prune budget->height conversion. Builds its own archive
 # in its own scratch dir and deletes it afterwards; it must never be pointed
 # at a real datadir.
-tests/test_archive_check: tests/test_archive_check.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
+tests/test_archive_check: tests/test_archive_check.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -I daemon -o $@ tests/test_archive_check.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
 
 # test_archive_repair -- boot-time duplicate-hash self-repair
 # (archive_scan_duplicates / archive_repair_duplicates): marks corrupted
 # heights as holes (never truncates) so the existing catch-up hole-filler
 # re-downloads them. Synthetic index.dat only; never touches a real datadir.
-tests/test_archive_repair: tests/test_archive_repair.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
+tests/test_archive_repair: tests/test_archive_repair.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -I daemon -o $@ tests/test_archive_repair.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
 
 # test_archive_truncate_nonmonotonic -- store_truncate_index_only
@@ -438,7 +443,7 @@ tests/test_archive_repair: tests/test_archive_repair.c daemon/archive_verify.c b
 # be able to make progress on a non-monotonically-laid-out archive, instead
 # of refusing outright the way a bare store_truncate_to safely does.
 # Synthetic archive only; never touches a real datadir.
-tests/test_archive_truncate_nonmonotonic: tests/test_archive_truncate_nonmonotonic.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
+tests/test_archive_truncate_nonmonotonic: tests/test_archive_truncate_nonmonotonic.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -I daemon -o $@ tests/test_archive_truncate_nonmonotonic.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
 
 # test_prune_nonmonotonic -- archive_prune_file_granular (daemon/archive_verify.c)
@@ -447,7 +452,7 @@ tests/test_archive_truncate_nonmonotonic: tests/test_archive_truncate_nonmonoton
 # progress, at whole-file granularity, on a non-monotonically-laid-out
 # archive, instead of refusing outright the way store_prune's in-place
 # compaction safely does. Synthetic archive only; never touches a real datadir.
-tests/test_prune_nonmonotonic: tests/test_prune_nonmonotonic.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
+tests/test_prune_nonmonotonic: tests/test_prune_nonmonotonic.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -I daemon -o $@ tests/test_prune_nonmonotonic.c daemon/archive_verify.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o bitcoin_cons.o bitcoin_hash.o bitcoin_tx.o sha256.o
 
 # test_node_config -- bitcoin.conf parsing, Core-key compatibility, clamping,
@@ -537,27 +542,27 @@ tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(VER
 # pow_check -> block_hash -> sha256d -> sha256_full) provably works at -O0, but
 # gcc -O2's main register/stack layout triggers a latent sha256_full deep-frame-
 # overlap crash in this specific networked harness. The asm is identical.
-tests/test_bitcoind_sync: tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONOBJS)
+tests/test_bitcoind_sync: tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONOBJS)
 
 # all-asm leveled logger (uses fd_write_all from bitcoin_net.asm)
 # Built at -O0: same gcc -O2 vs deep-asm-call-chain interaction as the sync
 # harness; the asm logger is identical and correct at -O0.
 LOGOBJS := node_log.o bitcoin_net.o bitcoin_hash.o sha256.o
-tests/test_log: tests/test_log.c $(LOGOBJS)
+tests/test_log: tests/test_log.c $(LOGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_log.c $(LOGOBJS)
 
 # S6 CLI (bitcoin_cli.asm): queries the store + hashing/tx primitives.
 CLIOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
     bitcoin_cli.o
-tests/test_cli: tests/test_cli.c $(CLIOBJS)
+tests/test_cli: tests/test_cli.c $(CLIOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_cli.c $(CLIOBJS)
 
 # Persistent header-chain store (bitcoin_headers.asm): appends a (header, block_hash)
 # pair per entry; the harness checks continuity by computing block_hash of chain
 # predecessors via the proven block_hash asm.
 HEADOBJS := sha256.o bitcoin_hash.o bitcoin_headers.o
-tests/test_headers: tests/test_headers.c $(HEADOBJS)
+tests/test_headers: tests/test_headers.c $(HEADOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_headers.c $(HEADOBJS)
 
 # Paged persistent headers-first IBD (bitcoind.asm node_ibd_headers) over the
@@ -568,18 +573,18 @@ tests/test_headers: tests/test_headers.c $(HEADOBJS)
 IBDOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
     bitcoin_headers.o bitcoin_idxscan.o
-tests/test_ibd_headers: tests/test_ibd_headers.c $(IBDOBJS)
+tests/test_ibd_headers: tests/test_ibd_headers.c $(IBDOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_headers.c $(IBDOBJS)
 
 # Block-body download off the persisted header chain (bitcoind.asm node_ibd_blocks).
 # node_ibd_blocks calls cons_verify/block_hash/store_append/hst_*; bitcoind.o pulls
 # the transitive cons/tx symbols too. Built at -O0 (deep-asm-call-chain convention).
-tests/test_ibd_blocks: tests/test_ibd_blocks.c $(IBDOBJS)
+tests/test_ibd_blocks: tests/test_ibd_blocks.c $(IBDOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_blocks.c $(IBDOBJS)
 
 # FULL initial-block-download as one asm pass (bitcoind.asm node_ibd =
 # node_ibd_headers + node_ibd_blocks) over a whole NB-block loopback chain.
-tests/test_ibd_full: tests/test_ibd_full.c $(IBDOBJS)
+tests/test_ibd_full: tests/test_ibd_full.c $(IBDOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_ibd_full.c $(IBDOBJS)
 
 # LARGE-SCALE full-IBD demo (default NB=20000; slow, heavy manual test, NOT in
@@ -591,7 +596,7 @@ tests/test_ibd_scale: tests/test_ibd_scale.c $(IBDOBJS)
 
 # bitcoin_addrmgr.asm: peer address book + addr v1 codec (standalone deps).
 ADMRGOBJS := bitcoin_addrmgr.o
-tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS)
+tests/test_addrmgr: tests/test_addrmgr.c $(ADMRGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_addrmgr.c $(ADMRGOBJS)
 
 # bitcoin_keys.asm (secp256k1 pubkey derivation for wallet/BIP32).
@@ -622,23 +627,23 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
-tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
+tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # test_keepup: proves the inbound `block` keep-up path (.do_block) -- a peer
 # pushes a block the server lacks; the server validates, stores, and indexes
 # it so it becomes serveable, and survives duplicate pushes. Uses SERVEOBJS
 # (needs cons_verify/store_append/idx_put from the listed objects).
-tests/test_keepup: tests/test_keepup.c $(SERVETXVALSRCS) $(SERVEOBJS)
+tests/test_keepup: tests/test_keepup.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_keepup.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # BIP152 compact-block serving loopback e2e (sendcmpct/getblocktxn/cmpctblock).
-tests/test_bip152_loop: tests/test_bip152_loop.c $(SERVETXVALSRCS) $(SERVEOBJS) tests/block_vec.h tests/cmpct_expected.h
+tests/test_bip152_loop: tests/test_bip152_loop.c $(SERVETXVALSRCS) $(SERVEOBJS) tests/block_vec.h tests/cmpct_expected.h $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_bip152_loop.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # sendheaders (BIP130) + feefilter: announce_tip inv-vs-headers wire bytes +
 # forked serve-loop outbound feefilter & negotiation parsing (loopback e2e).
-tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVETXVALSRCS) $(SERVEOBJS) tests/block_vec.h
+tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVETXVALSRCS) $(SERVEOBJS) tests/block_vec.h $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_sendheaders_fee.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # OUTBOUND P2P MULTIPLEXER loopback e2e: exec's the REAL daemon in serve-test
@@ -646,13 +651,13 @@ tests/test_sendheaders_fee: tests/test_sendheaders_fee.c $(SERVETXVALSRCS) $(SER
 # child that grows its chain, and an inbound client that fetches the freshly
 # mined block -- proving the running node pulls+stores+serves new blocks with
 # no restart. Links the server object set for the client/peer roles.
-tests/test_outbound_mux: tests/test_outbound_mux.c daemon/bitcoind $(SERVETXVALSRCS) $(SERVEOBJS)
+tests/test_outbound_mux: tests/test_outbound_mux.c daemon/bitcoind $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_outbound_mux.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # OUTBOUND MUX RE-DIAL e2e: regression for soak-defect D2 -- proves the mux
 # re-dials a leg the peer rips down (POLLHUP) and recovers keep-up via a fresh
 # connection to a rotated peer, instead of syncing on a dead socket forever.
-tests/test_redial: tests/test_redial.c daemon/bitcoind $(SERVETXVALSRCS) $(SERVEOBJS)
+tests/test_redial: tests/test_redial.c daemon/bitcoind $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_redial.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
 # OUTBOUND MUX SOAK HARNESS controlled mining peer: real process that serves the
@@ -793,7 +798,7 @@ tests/test_utxo: tests/test_utxo.c $(UTXOOBJS)
 # restart-resume reload), mirroring bitcoin_store.asm's store/index pattern.
 # bitcoin_utxo_store.asm wraps bitcoin_utxo.asm's in-memory table.
 UTXOSTOREOBJS := bitcoin_utxo_store.o bitcoin_utxo.o
-tests/test_utxo_store: tests/test_utxo_store.c $(UTXOSTOREOBJS)
+tests/test_utxo_store: tests/test_utxo_store.c $(UTXOSTOREOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_utxo_store.c $(UTXOSTOREOBJS)
 
 # LSM-tree UTXO store (bounded memtable + per-generation WAL + sorted
@@ -809,29 +814,29 @@ UTXOLSMOBJS := bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utx
 tests/bench_lsm_get: tests/bench_lsm_get.c $(UTXOLSMOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/bench_lsm_get.c $(UTXOLSMOBJS)
 
-tests/test_lsm_mmap_diff: tests/test_lsm_mmap_diff.c $(UTXOLSMOBJS)
+tests/test_lsm_mmap_diff: tests/test_lsm_mmap_diff.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_lsm_mmap_diff.c $(UTXOLSMOBJS) -lpthread
 tests/test_lsm_bloomsat: tests/test_lsm_bloomsat.c $(UTXOLSMOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_lsm_bloomsat.c $(UTXOLSMOBJS) -lpthread
 tests/diff_real_run: tests/diff_real_run.c $(UTXOLSMOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/diff_real_run.c $(UTXOLSMOBJS) -lpthread
-tests/test_lsm_sparse_diff: tests/test_lsm_sparse_diff.c $(UTXOLSMOBJS)
+tests/test_lsm_sparse_diff: tests/test_lsm_sparse_diff.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_lsm_sparse_diff.c $(UTXOLSMOBJS) -lpthread
-tests/soak_lsm_mm: tests/soak_lsm_mm.c $(UTXOLSMOBJS)
+tests/soak_lsm_mm: tests/soak_lsm_mm.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/soak_lsm_mm.c $(UTXOLSMOBJS) -lpthread
-tests/test_utxo_lsm: tests/test_utxo_lsm.c $(UTXOLSMOBJS)
+tests/test_utxo_lsm: tests/test_utxo_lsm.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_utxo_lsm.c $(UTXOLSMOBJS)
 
 # test_utxo_live_count -- utxo_lsm_count() must be EXACT and survive restarts
 # (the negative live_utxo telemetry bug): persist/restore total_live in the
 # manifest, plus the one-time old-format recount. See the test's own header.
-tests/test_utxo_live_count: tests/test_utxo_live_count.c $(UTXOLSMOBJS)
+tests/test_utxo_live_count: tests/test_utxo_live_count.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_utxo_live_count.c $(UTXOLSMOBJS)
 
 # Regression test for the 2026-08-20 compaction manifest-ordering bug (see
 # tests/test_compact_manifest_order.c's own header) -- needs manifest_n to
 # exceed COMPACT_MAX_RUNS(64) before compacting, which no other test does.
-tests/test_compact_manifest_order: tests/test_compact_manifest_order.c $(UTXOLSMOBJS)
+tests/test_compact_manifest_order: tests/test_compact_manifest_order.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_compact_manifest_order.c $(UTXOLSMOBJS)
 
 # Whole-transaction validator (test_txval.c): tx_parse + UTXO store +
@@ -1015,7 +1020,7 @@ tests/bip30_shim: tests/bip30_shim.c $(CONSOBJS) bitcoin_utxo.o
 
 # Smoke test for the chain-context BIP30 gate (drives tests/bip30_shim over
 # stdin; full differential vs real Core is validation/bip30_diff.py).
-tests/test_bip30: tests/test_bip30.c bitcoin_hash.o sha256.o
+tests/test_bip30: tests/test_bip30.c bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_bip30.c bitcoin_hash.o sha256.o
 
 bitcoin_sigops.o: bitcoin_sigops.asm bitcoin_scriptcodec.asm
@@ -1145,7 +1150,7 @@ TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/mempool_cfg.c d
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o \
     bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
-tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXACCEPTOBJS)
+tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXACCEPTOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_tx_accept_e2e.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS))
 
 # Wallet CLI: generate key, show address, sign a P2PKH tx, and -- via BIP39 +
@@ -1229,7 +1234,7 @@ tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json
 # throwaway temp dir: real mainnet genesis + 3 constructed blocks (one with a
 # segwit coinbase, a legacy spend and a P2WPKH spend). Exercises every method
 # in-process through rpc_dispatch, plus the error paths.
-tests/test_rpc_chain: tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS)
+tests/test_rpc_chain: tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 
@@ -1264,9 +1269,9 @@ daemon/pverify: daemon/pverify.c $(CONSOBJS)
 	$(CC) -O1 -o $@ daemon/pverify.c $(CONSOBJS) -lpthread
 
 # bitcoin_store.asm shared-append: concurrent-safe single-store write (standalone).
-tests/test_shared: tests/test_shared.c bitcoin_store.o
+tests/test_shared: tests/test_shared.c bitcoin_store.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_shared.c bitcoin_store.o
-tests/test_shared2: tests/test_shared2.c bitcoin_store.o
+tests/test_shared2: tests/test_shared2.c bitcoin_store.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_shared2.c bitcoin_store.o
 
 # BIP141 witness-commitment check (daemon/block_witness.c): real regtest segwit
@@ -1310,6 +1315,7 @@ tests/test_abi_stack_align: tests/test_abi_stack_align.c $(ABIALIGNOBJS)
 test: abi-check tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz
 	./tests/test_abi_stack_align
+	./tests/test_node_config
 	./tests/test_archive_check
 	./tests/test_archive_repair
 	./tests/test_archive_truncate_nonmonotonic
@@ -1371,6 +1377,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/smoke_interp
 	./tests/test_interp
 	./tests/test_tapscript_interp
+	./tests/test_sigops
 	./tests/test_schnorr tests/bip340_test_vectors.csv
 	./tests/test_taproot
 	./tests/test_taproot_sighash

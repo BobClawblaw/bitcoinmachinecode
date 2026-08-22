@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
@@ -118,11 +119,9 @@ int main(void){
         if(blocks[i][80]!=1){ printf("FAIL block %d missing tx-count\n",i); return 1; }
     }
 
-    /* temp dirs; daemon created two dirs: block store + header store share CWD */
-    char path[80]; snprintf(path,sizeof path,"/tmp/tiblk_%d", getpid());
-    mkdir(path,0755);
-    char prev_cwd[1024]; getcwd(prev_cwd,sizeof prev_cwd);
-    if(chdir(path)!=0){ printf("FAIL chdir\n"); return 1; }
+    /* one private temp dir; block store + header store share the CWD, as the
+     * daemon's datadir layout does */
+    tt_isolate();
 
     /* header store `hdr.dat` + block store `blk00000.dat` both in this dir */
     static unsigned char hstb[256], stb[256];
@@ -221,8 +220,8 @@ int main(void){
         cki("reorg: forked block NOT stored (store tip stays 1)", ((struct St*)stb3)->tip, 1);
     }
 
-    chdir(prev_cwd);
-    char rm[300]; snprintf(rm,sizeof rm,"rm -rf %s", path); system(rm);
+    /* teardown is tt_isolate()'s; the old rm -rf ran only on this success
+     * path, so every early `return 1` above used to leak the directory. */
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

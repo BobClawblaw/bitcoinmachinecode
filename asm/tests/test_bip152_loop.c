@@ -19,6 +19,7 @@
 
 #include "block_vec.h"
 #include "cmpct_expected.h"
+#include "test_tmpdir.h"
 
 extern long node_handshake(int fd);
 extern int  node_accept_handshake(int fd);
@@ -49,6 +50,7 @@ static unsigned char stbuf[1<<16];
 static unsigned char blkhash[32];
 
 int main(void){
+    tt_isolate();   /* private working dir: the store below writes index.dat/blk00000.dat by bare name */
     setbuf(stdout,NULL);
     /* store the real Core block */
     block_hash(blkhash, BLOCK_RAW);

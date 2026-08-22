@@ -7,6 +7,109 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-22 -- test infrastructure: the suite shared one working directory; now every harness owns its own
+
+The storage layer opens its files by BARE RELATIVE NAME -- `index.dat`,
+`blk%05u.dat`, `prune.dat`, `utxo.dat`, `utxo.idx`, `utxo_manifest.dat`,
+`utxo_run_%06u.dat`, `headers.dat`, `chainwork.dat`, `peers.dat` (see
+`bitcoin_store.asm:1798`, `bitcoin_utxo_store.asm:102`,
+`bitcoin_utxo_lsm.asm:237`, `bitcoin_headers.asm:223`,
+`bitcoin_chainwork.asm:771`, `bitcoin_addrmgr.asm:343`). That is a deliberate
+property of a daemon that is pointed at a datadir and runs there. It is a trap
+for a test harness, which `make` runs with CWD = `asm/`.
+
+### What was actually shared
+
+Measured, not guessed: every one of the 142 `make test` invocations was run
+individually with a before/after snapshot of `asm/`.
+
+- **Writes into the source tree.** `test_serve` left `index.dat`,
+  `blk00000.dat`, `utxo.dat`, `utxo.idx`; `test_keepup`, `test_bip152_loop` and
+  `test_sendheaders_fee` left `index.dat` + `blk00000.dat`. Those files persist
+  between runs, so `make test` in a used tree is not `make test` in a fresh
+  clone.
+- **Absolute paths into the MAIN checkout.** `test_archive_check` built its
+  fixture in `/storage/bitcoinmachinecode/asm/t_archchk` and `chdir`ed back to
+  `/storage/bitcoinmachinecode/asm` at the end -- so a run from a git worktree
+  reached across into the main tree, and two concurrent runs `rm -rf`'d each
+  other's fixture. `test_node_config` wrote 21 `bmc_t*.conf` fixtures the same
+  way, and read the main checkout's `config/bitcoin.conf` -- a file with 21
+  uncommitted lines in it at the time -- to decide a PASS.
+- **Fixed names outside the tree.** `/tmp/clitest`, `/tmp/amrtest`,
+  `/tmp/shared_test`, `/tmp/shared_test2`, `/tmp/test_log.txt`,
+  `/tmp/b30shim.out` -- one copy for all runs on the box.
+- **Leaks.** 34 harnesses `mkdtemp`'d and never removed the directory;
+  `test_reorg` leaked 13 per run (one per forked case). `/tmp` had accumulated
+  thousands.
+
+### The order dependence was real, and it was invisible
+
+`test_keepup` builds 7 blocks, has a peer push an 8th, and checks the node
+stores it. Before this change it logged `stored height=8`; after, `height=7`.
+The 8 was `test_serve`'s leftover archive: `store_init` found the stale
+`index.dat`, and keepup appended past it. **The test passed either way** -- 9
+PASS lines in both -- because no assertion pinned the height. That is the shape
+of the hazard: not a flaky red, an invisible green.
+
+### The fix
+
+`asm/tests/test_tmpdir.h`: `tt_isolate()` as the first statement of `main()`
+`mkdtemp`s a private directory, `chdir`s into it, and removes it on **every**
+exit path -- `atexit` plus `SIGSEGV`/`SIGABRT`/`SIGBUS`/`SIGILL`/`SIGFPE`/
+`SIGTERM`/`SIGINT`/`SIGHUP`/`SIGQUIT`/`SIGPIPE`, re-raising with the default
+disposition so the wait status a parent sees is unchanged. Two details that
+matter:
+
+- **The cleanup is PID-guarded.** A forked child inherits the `atexit` list and
+  the handlers; without the guard a child that `exit()`s or crashes would
+  delete the *parent's* working directory out from under it. Several harnesses
+  (`test_serve`, `test_keepup`, `test_utxo_crash_recovery`, `test_reorg`) fork
+  children that die on purpose.
+- **The removal walk is `getdents64`/`unlinkat` on a descriptor**, not `nftw()`
+  and not `system("rm -rf")`: no allocation, no fork, safe from a `SIGSEGV`
+  handler, and structurally incapable of escaping the directory it was handed.
+
+`tt_src("...")` rebases fixture/daemon/shim paths onto the launch directory so
+they still resolve past the `chdir`; `tt_workdir()` hands the absolute path to a
+spawned daemon that takes a datadir argument (`test_outbound_mux`,
+`test_redial`); `tt_subdir()` gives a multi-phase harness a fresh empty datadir
+per phase. `BMC_TEST_TMPDIR` moves the root off `/tmp` (these write real block
+data); `BMC_TEST_KEEP` preserves a directory for post-mortem. 51 harnesses
+converted, 34 hand-rolled `mkdtemp` blocks deleted.
+
+### Proofs, not assertions
+
+Every whole-suite figure below is over the 144 invocations this branch's own
+work covers; the rebase onto `0832d54` brought in two more (`test_point_repr`,
+`test_taproot_bounds_fuzz`, neither of which touches a file), so the count in
+the tree is **146**, re-verified after the rebase.
+
+- **Order.** Two full shuffled runs (seeds 1701 and 90210): 144/144, zero
+  failures.
+- **Fresh clone.** The tracked files copied to a tree that has never held a
+  `.dat`, built from scratch, full suite: 144/144, and the tree is bit-identical
+  to its checkout afterwards.
+- **Concurrency.** `test_serve` + `test_keepup` + `test_bip152_loop` started
+  simultaneously in `asm/`: on `main` `test_serve` fails with 2 assertion
+  failures, three trials out of three. On this branch all three pass, three out
+  of three. And the whole suite now runs in parallel: `-P 8` gives 144/144 in
+  **2m21 against 6m12 serial, 2.7x** -- a property that did not exist before.
+- **The failure mode that started this.** Deleting `index.dat`/`blk00000.dat`
+  every 20 ms while `test_serve` runs: `main` -> `rc=1`, `FAIL all served blocks
+  byte-exact`, `FAIL multi-inv getdata`. This branch -> `rc=0`, 0 failures.
+- **Suite.** `make -k test` MAKE_RC=0, zero failures; `make abi-check` OK;
+  `asm/` contains no generated data file afterwards and `/tmp` holds no
+  leftover directory.
+
+### Two tests were built and never run
+
+`tests/test_node_config` and `tests/test_sigops` were listed as prerequisites of
+the `test` target -- so they compiled, and a break in them would have been
+caught -- but no line of the recipe invoked them. Both pass, and both are now in
+the recipe. That is why this commit adds 2 to the invocation count. The count is
+now documented in `docs/ENGINEERING.md`, with the one-line command to check it:
+a test that stops running looks exactly like a test that passes, and this is the
+third instance today.
 ## 2026-08-22 -- Incidents #6-#24; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second

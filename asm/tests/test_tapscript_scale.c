@@ -49,6 +49,7 @@
 #include <malloc.h>
 #include "tapscript_scale_vec.h"
 #include "tapscript_stack_vec.h"
+#include "test_tmpdir.h"
 
 typedef unsigned char u8; typedef unsigned long u64;
 
@@ -344,17 +345,17 @@ int main(void){
    * verdict comparison below is what actually fails deterministically; the
    * signal check just names the failure correctly when it does happen. */
   mallopt(M_MMAP_THRESHOLD, 128*1024);
-  /* Resolve the blob path BEFORE chdir'ing into the LSM's scratch directory. */
+  tt_isolate();
+  /* The blob lives in the source tree; tt_src() rebases it past the chdir. */
   static char blobpath[1024];
   {
     const char* env = getenv("TAPSCRIPT_BIG_BLOB");
-    if (env) snprintf(blobpath,sizeof blobpath,"%s",env);
+    if (env) snprintf(blobpath,sizeof blobpath,"%s",tt_src(env));
     else {
-      char cwd[768]; if(!getcwd(cwd,sizeof cwd)) snprintf(cwd,sizeof cwd,".");
-      snprintf(blobpath,sizeof blobpath,"%s/tests/fixtures/%s",cwd,TS_BIG_BLOB);
+      char rel[256]; snprintf(rel,sizeof rel,"tests/fixtures/%s",TS_BIG_BLOB);
+      snprintf(blobpath,sizeof blobpath,"%s",tt_src(rel));
     }
   }
-  char tmpl[]="/tmp/tapscaleXXXXXX"; char* d=mkdtemp(tmpl); if(!d||chdir(d)){perror("dir");return 1;}
   seed_lsm();
 
   printf("== tap_leaf_hash capacity sweep (independent BIP341 reference hashes)\n");

@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 
 extern long archive_check(long nblocks, int level);
 extern long archive_first_hole(long upto);
@@ -100,11 +101,13 @@ static void put_rec(unsigned char rec[48], const unsigned char h[32],
 }
 
 int main(void){
+    /* A PRIVATE scratch directory, not a fixed path inside the checkout. The
+     * previous fixed "<repo>/asm/t_archchk" was an absolute path into the main
+     * checkout, so a run from a git worktree reached across into the main tree,
+     * two concurrent runs rm -rf'd each other's fixture, and the chdir-back at
+     * the end left the process pointed at the wrong tree. */
+    tt_isolate();
     printf("---- archive_check ----\n");
-    const char* dir = "/storage/bitcoinmachinecode/asm/t_archchk";
-    char cmd[512]; snprintf(cmd,sizeof cmd,"rm -rf %s && mkdir -p %s", dir, dir);
-    if (system(cmd)!=0){ printf("FAIL: could not create scratch dir\n"); return 1; }
-    if (chdir(dir)!=0){ printf("FAIL: chdir scratch\n"); return 1; }
 
     /* --- fixture: blk00000.dat = [real genesis][synthetic block] --- */
     unsigned char gen[285];
@@ -315,11 +318,8 @@ int main(void){
           archive_prune_decide(285, &ph, &det), ARCHIVE_PRUNE_OK);
     }
 
-    /* clean up the fixture; leaving it behind would let a later run pass or
-     * fail against stale data. */
-    if (chdir("/storage/bitcoinmachinecode/asm")!=0) printf("FAIL: chdir back\n");
-    snprintf(cmd,sizeof cmd,"rm -rf %s", dir);
-    if (system(cmd)!=0) printf("FAIL: cleanup\n");
+    /* The fixture is removed by tt_isolate()'s exit/signal cleanup; leaving it
+     * behind would let a later run pass or fail against stale data. */
 
     if (failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");

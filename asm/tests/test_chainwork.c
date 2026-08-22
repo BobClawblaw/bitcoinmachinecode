@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdint.h>
+#include "test_tmpdir.h"
 
 typedef unsigned char u8;
 
@@ -54,11 +55,7 @@ static uint64_t le32_get_u64(const u8 buf[32], int limb) {
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/btccworkXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); return 1; }
-    chdir(dir);
-
+    tt_isolate();
     /* ---------- 1. block_work hand-checked vectors ---------- */
     struct { unsigned int bits; unsigned __int128 expect; const char* name; } vec[] = {
         { 0x1d00ffffu, (unsigned __int128)4295032833ULL,               "genesis 0x1d00ffff" },
@@ -206,7 +203,5 @@ int main(void) {
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     /* best-effort cleanup */
-    unlink("chainwork.dat");
-    rmdir(dir);
     return failures ? 1 : 0;
 }

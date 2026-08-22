@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include "test_tmpdir.h"
 
 struct St {
     unsigned long long cur_blk_fd, idx_fd, idx_len;
@@ -61,10 +62,7 @@ static void ckcond(const char* l, int cond){ ck(l, cond ? 1 : 0, 1); }
 static int file_exists(const char* p){ struct stat s; return stat(p, &s) == 0; }
 
 static void fresh_dir(void){
-    char tmpl[] = "/tmp/btcprunenonmonoXXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) { printf("FAIL mkdtemp\n"); exit(1); }
-    if (chdir(dir) != 0) { printf("FAIL chdir\n"); exit(1); }
+    tt_isolate();
 }
 
 #define NB 40   /* payload bytes per test block */

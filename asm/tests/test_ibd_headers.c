@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <time.h>
+#include "test_tmpdir.h"
 
 /* ---- asm under test ---- */
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
@@ -153,9 +154,7 @@ int run_case(int evil){
     pid_t pid=fork();
     if(pid==0){ int cfd=accept(ls,0,0); serve_peer(cfd,evil); _exit(0); }
 
-    char tmpl[]="/tmp/btcibdXXXXXX"; char* dir=mkdtemp(tmpl);
-    if(!dir){ printf("FAIL mkdtemp\n"); return -1; }
-    chdir(dir);
+    tt_isolate();
 
     struct Hst hs; memset(&hs,0,sizeof hs);
     hst_init(&hs);
@@ -226,7 +225,6 @@ int run_case(int evil){
         /* evil peer should have stopped after the 1 valid header */
         cki("evil: only 1 header stored", hst_count(&hs), 1);
     }
-    unlink("headers.dat"); rmdir(dir);
     return 0;
 }
 

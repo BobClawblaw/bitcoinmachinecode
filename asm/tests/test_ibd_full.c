@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include "test_tmpdir.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -112,8 +113,7 @@ int main(void){
     }
     printf("chain built NB=%d\n", NB);
 
-    char path[80]; snprintf(path,sizeof path,"/tmp/tibdfull_%d", getpid()); mkdir(path,0755);
-    char cwd[1024]; getcwd(cwd,sizeof cwd); chdir(path);
+    tt_isolate();
     static unsigned char hstb[256], stb[256];
     if(hst_init(hstb)!=1){ printf("FAIL hst_init\n"); return 1; }
     if(store_init(stb)!=1){ printf("FAIL store_init\n"); return 1; }
@@ -157,7 +157,7 @@ int main(void){
     }
     cki("all NB blocks stored byte-exact", exact, 1);
 
-    chdir(cwd); char rm[300]; snprintf(rm,sizeof rm,"rm -rf %s", path); system(rm);
+    /* teardown is tt_isolate()'s, so the early `return 1`s leak nothing. */
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }
