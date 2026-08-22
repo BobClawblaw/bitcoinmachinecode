@@ -37,6 +37,7 @@ extern point_scalar_mul
 extern point_add
 extern fe_inv
 extern fe_mul
+extern fe_sqr
 
 section .rodata
 align 16
@@ -428,8 +429,7 @@ taproot_tweak_pubkey:
     ; ---- affine ----
     lea  rdi, [rbp+TW_Z2]
     lea  rsi, [rbp+TW_Q+64]
-    lea  rdx, [rbp+TW_Q+64]
-    call fe_mul
+    call fe_sqr
     lea  rdi, [rbp+TW_ZI]
     lea  rsi, [rbp+TW_Z2]
     call fe_inv

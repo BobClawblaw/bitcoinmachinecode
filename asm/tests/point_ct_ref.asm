@@ -1,20 +1,36 @@
 ; ============================================================================
+; tests/point_ct_ref.asm -- FROZEN copy of asm/secp256k1_point_ct.asm as of main
+; @ 91b7c9d, every exported symbol suffixed _ref.
+;
+; DO NOT EDIT. It exists so tests/test_point_repr can prove, limb for limb,
+; that the current EC layer computes exactly what the implementation that
+; replayed the chain computed. It is the point-layer analogue of
+; tests/fe_ref.asm and tests/ecdsa_verify_ref.asm, and was added with the
+; 2026-08-22 change that (a) routed the 20 fe_mul(a,a) call sites through
+; fe_sqr and (b) deleted a dead fe_mul+fe_sub from point_double.
+;
+; It links against the LIVE fe_add/fe_sub/fe_mul/fe_sqr on purpose: the field
+; layer is unchanged by that commit and already has its own frozen reference,
+; so any difference this file reports is a difference in the POINT layer.
+; Not linked into any daemon or tool.
+; ============================================================================
+; ============================================================================
 ; secp256k1_point_ct.asm -- CONSTANT-TIME scalar multiplication (FINDING 1).
 ;
 ; WHY THIS FILE EXISTS
-;   secp256k1_point.asm's point_scalar_mul is a w=4 windowed ladder that is
+;   secp256k1_point.asm's point_scalar_mul_ref is a w=4 windowed ladder that is
 ;   deliberately VARIABLE-TIME: its loop bound comes from bsr on the scalar
 ;   (leaking bit-length), it skips zero window digits with `jz .wskip`
 ;   (leaking per-window digit zero-ness), it indexes TAB[digit] with a
-;   secret-derived address (leaking digit via cache), and the point_add /
-;   point_add_mixed it calls branch on equal / opposite / infinity.
+;   secret-derived address (leaking digit via cache), and the point_add_ref /
+;   point_add_mixed_ref it calls branch on equal / opposite / infinity.
 ;
 ;   That is FINE and FAST for verification, where the scalar is public
 ;   (ecdsa_verify u2*Q, schnorr_verify s*G and e*P, taproot tweak t*G).
 ;   It is FATAL for signing, where the scalar is the secret nonce k: a timing
 ;   attacker recovers k, and from k the private key d. This file provides the
 ;   constant-time counterpart used ONLY on secret-scalar paths.
-;   point_scalar_mul is left untouched so its existing differential proof
+;   point_scalar_mul_ref is left untouched so its existing differential proof
 ;   (tests/run_pointmul_diff.py) still guards it byte-for-byte.
 ;
 ; APPROACH -- COMPLETE FORMULAS, NOT PATCHED JACOBIAN
@@ -31,7 +47,7 @@
 ;   These formulas use HOMOGENEOUS projective coordinates (X:Y:Z) meaning
 ;   affine (X/Z, Y/Z), identity = (0:1:0) -- NOT the Jacobian (X/Z^2, Y/Z^3)
 ;   convention of secp256k1_point.asm. The conversion back to Jacobian
-;   happens once, at the end of point_scalar_mul_ct, so the exported ABI and
+;   happens once, at the end of point_scalar_mul_ct_ref, so the exported ABI and
 ;   the 12-limb Jacobian output format are unchanged:
 ;       Jacobian (X*Z, Y*Z^2, Z)  <->  homogeneous (X:Y:Z)
 ;   Both send Z=0 to Z=0, so infinity round-trips.
@@ -53,12 +69,12 @@
 ;   using the fast variable-time routine.
 ;
 ; ABI (System V AMD64), matching secp256k1_point.asm:
-;   void point_scalar_mul_ct(u64 r[12], const u64 xy[8], const u64 k[4])
+;   void point_scalar_mul_ct_ref(u64 r[12], const u64 xy[8], const u64 k[4])
 ;       r  = k * affine(xy), returned in JACOBIAN form (X,Y,Z), 12 limbs.
 ;       k == 0 (mod n) yields canonical Jacobian infinity (1,1,0).
 ;   Helpers (exported for the test harness; homogeneous coordinates):
-;   void pointh_add(u64 r[12], const u64 p[12], const u64 q[12])
-;   void pointh_double(u64 r[12], const u64 p[12])
+;   void pointh_add_ref(u64 r[12], const u64 p[12], const u64 q[12])
+;   void pointh_double_ref(u64 r[12], const u64 p[12])
 ;
 ;   Callee-saved rbx/r12-r15 are preserved, as the fe_* primitives require.
 ;
@@ -74,12 +90,11 @@ BITS 64
 extern fe_add
 extern fe_sub
 extern fe_mul
-extern fe_sqr
 
 section .rodata
 align 16
 ; b3 = 3*b = 21 as a field element (4 little-endian limbs).
-B3_LIMBS:
+B3_LIMBS_ref:
     dq 21
     dq 0
     dq 0
@@ -88,7 +103,7 @@ B3_LIMBS:
 section .text
 
 ; ----------------------------------------------------------------------------
-; pointh_add(r[12], p[12], q[12]) -- complete addition, homogeneous, a=0.
+; pointh_add_ref(r[12], p[12], q[12]) -- complete addition, homogeneous, a=0.
 ; Renes-Costello-Batina Algorithm 7. 12M + 2*m_b3 + 19a.
 ; Correct for ALL inputs: p or q the identity, p == q, p == -q. No branches.
 ;
@@ -98,8 +113,8 @@ section .text
 ; Slots: t0=-0x50 t1=-0x70 t2=-0x90 t3=-0xb0 t4=-0xd0
 ;        X3=-0xf0 Y3=-0x110 Z3=-0x130
 ; ----------------------------------------------------------------------------
-global pointh_add
-pointh_add:
+global pointh_add_ref
+pointh_add_ref:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -215,7 +230,7 @@ pointh_add:
     call fe_add
     ; 21. t2 = b3*t2
     lea rdi, [rbp-0x90]
-    mov rsi, B3_LIMBS
+    mov rsi, B3_LIMBS_ref
     lea rdx, [rbp-0x90]
     call fe_mul
     ; 22. Z3 = t1+t2
@@ -230,7 +245,7 @@ pointh_add:
     call fe_sub
     ; 24. Y3 = b3*Y3
     lea rdi, [rbp-0x110]
-    mov rsi, B3_LIMBS
+    mov rsi, B3_LIMBS_ref
     lea rdx, [rbp-0x110]
     call fe_mul
     ; 25. X3 = t4*Y3
@@ -303,7 +318,7 @@ pointh_add:
     ret
 
 ; ----------------------------------------------------------------------------
-; pointh_double(r[12], p[12]) -- complete doubling, homogeneous, a=0.
+; pointh_double_ref(r[12], p[12]) -- complete doubling, homogeneous, a=0.
 ; Renes-Costello-Batina Algorithm 9. 6M + 2S + 1*m_b3 + 9a.
 ; Correct including p == identity. No branches.
 ;
@@ -312,8 +327,8 @@ pointh_add:
 ;
 ; Slots: t0=-0x50 t1=-0x70 t2=-0x90 X3=-0xb0 Y3=-0xd0 Z3=-0xf0
 ; ----------------------------------------------------------------------------
-global pointh_double
-pointh_double:
+global pointh_double_ref
+pointh_double_ref:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -329,7 +344,8 @@ pointh_double:
     ; 1. t0 = Y*Y
     lea rdi, [rbp-0x50]
     lea rsi, [r13+32]
-    call fe_sqr
+    mov rdx, rsi
+    call fe_mul
     ; 2. Z3 = t0+t0
     lea rdi, [rbp-0xf0]
     lea rsi, [rbp-0x50]
@@ -353,10 +369,11 @@ pointh_double:
     ; 6. t2 = Z*Z
     lea rdi, [rbp-0x90]
     lea rsi, [r13+64]
-    call fe_sqr
+    mov rdx, rsi
+    call fe_mul
     ; 7. t2 = b3*t2
     lea rdi, [rbp-0x90]
-    mov rsi, B3_LIMBS
+    mov rsi, B3_LIMBS_ref
     lea rdx, [rbp-0x90]
     call fe_mul
     ; 8. X3 = t2*Z3
@@ -439,7 +456,7 @@ pointh_double:
     ret
 
 ; ----------------------------------------------------------------------------
-; point_scalar_mul_ct(r[12], xy[8], k[4]) : r = k*affine(xy), CONSTANT TIME.
+; point_scalar_mul_ct_ref(r[12], xy[8], k[4]) : r = k*affine(xy), CONSTANT TIME.
 ;
 ;   Pb = (x : y : 1)            homogeneous base
 ;   R  = (0 : 1 : 0)            identity
@@ -457,8 +474,8 @@ pointh_double:
 ;        kbuf @ rbp-0x1e0 (32 B).
 ; sub rsp, 0x1e8 (== 8 mod 16) keeps RSP aligned at nested calls.
 ; ----------------------------------------------------------------------------
-global point_scalar_mul_ct
-point_scalar_mul_ct:
+global point_scalar_mul_ct_ref
+point_scalar_mul_ct_ref:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -513,12 +530,12 @@ point_scalar_mul_ct:
     ; R = 2*R
     lea rdi, [rbp-0x100]
     lea rsi, [rbp-0x100]
-    call pointh_double
+    call pointh_double_ref
     ; T = R + Pb   (always)
     lea rdi, [rbp-0x160]
     lea rsi, [rbp-0x100]
     lea rdx, [rbp-0x1c0]
-    call pointh_add
+    call pointh_add_ref
 
     ; bit = (k >> i) & 1 ; ZF = (bit == 0)
     mov rcx, r15
@@ -550,7 +567,8 @@ point_scalar_mul_ct:
     ; T is free again; use T slot as scratch for Z^2.
     lea rdi, [rbp-0x160]
     lea rsi, [rbp-0x100+64]
-    call fe_sqr                    ; T[0..3] = Z^2
+    mov rdx, rsi
+    call fe_mul                    ; T[0..3] = Z^2
     lea rdi, [rbp-0x160+32]
     lea rsi, [rbp-0x100+32]
     lea rdx, [rbp-0x160]

@@ -38,6 +38,7 @@ extern pubkey_parse
 extern point_scalar_mul
 extern point_add
 extern fe_mul
+extern fe_sqr
 extern fe_inv
 extern sha256_full
 
@@ -295,8 +296,7 @@ schnorr_verify:
     ; ---- affine xr = X*(1/Z^2) ; yr = Y*(1/Z^3) ----
     lea rdi, [rbp+Z2]
     lea rsi, [rbp+RPT+64]
-    lea rdx, [rbp+RPT+64]
-    call fe_mul                 ; z2
+    call fe_sqr                 ; z2
     lea rdi, [rbp+ZI]
     lea rsi, [rbp+Z2]
     call fe_inv                 ; zi = z2^{-1}
