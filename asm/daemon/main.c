@@ -107,6 +107,12 @@ extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
+/* Clamp the DISPLAYED live-UTXO count at 0. Backstop only: the count itself
+ * is now kept accurate across restarts by the manifest persist/restore in
+ * bitcoin_utxo_lsm.asm (this replaced the WAL-tail-only reload seed that let
+ * live_utxo go negative, e.g. -2610837). This just guarantees a future
+ * accounting drift can never surface a nonsensical negative in the logs. */
+static long live_utxo_disp(void){ long c = utxo_live_count(); return c < 0 ? 0 : c; }
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
@@ -2144,7 +2150,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
             fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d live_utxo=%ld uptime=%llds\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
-                    utxo_live_ok?utxo_live_count():-1L, (stop_ms-boot_ms)/1000);
+                    utxo_live_ok?live_utxo_disp():-1L, (stop_ms-boot_ms)/1000);
             _exit(0);
         }
         long long now_ms = 0;
@@ -2317,14 +2323,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
             if(ar > 0){
                 fprintf(stderr,"[dl] updating utxo: applied %ld block(s), now at height %ld, live=%ld (%.2fs)\n",
-                        ar, utxo_live_applied_height(), utxo_live_count(), phase_elapsed(&utxo_ct_pt));
+                        ar, utxo_live_applied_height(), live_utxo_disp(), phase_elapsed(&utxo_ct_pt));
             }
         }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%llds%s\n",
                     *(int*)(store_buf+24), live_peers, mux_n_out,
-                    utxo_live_ok?utxo_live_count():-1L, (now_ms-boot_ms)/1000,
+                    utxo_live_ok?live_utxo_disp():-1L, (now_ms-boot_ms)/1000,
                     utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
