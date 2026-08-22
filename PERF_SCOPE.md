@@ -1778,3 +1778,69 @@ tail assemblies. If this path is ever re-profiled hot, this is the lever —
 and the sound way to do it is to thread a real per-transaction context down
 from `taproot_verify_input()`, which already exists per input and would only
 need to be created one level up, rather than to key a cache on an address.
+
+## 11. Re-profile after the sighash work — 2026-08-22 22:45, height ~700,000
+
+Taken with everything from §5.2, §8, §10 and the taproot sighash rewrite
+deployed. Method as §7: `perf record -F 999`, **no call graph**, 25 s,
+117,989 samples, live worker. DSO: bitcoind 91.1 % · libc 6.1 % · kernel 2.8 %.
+
+| self time | symbol | note |
+|---|---|---|
+| **22.50 %** | `fe_mul.reduce` | modular reduction |
+| 14.31 % | `fe_mul` | |
+| 9.03 % | `fe_sqr` | **was 1.37 %** — §10 made it actually get called |
+| 5.48 % | `fe_add` | |
+| 5.14 % | `sha256_block_shani` | already SHA-NI accelerated |
+| 3.82 % | `__memmove_avx512` | libc |
+| 3.32 % | `fe_sub` | |
+| 2.25 % | `point_double` | |
+| 1.78 % | `__memset_avx512` | libc |
+| 1.53 % | `swtx_parse` | §8's single pass — cheap, as designed |
+| 1.45 % | `lsm_run_lookup_mm` | **the entire UTXO store** |
+| 1.31 % | `copy_bytes.cb_loop` | |
+| **1.27 %** | **`read_cs`** | **was 22.44 % in §7** |
+
+**§8 is confirmed in production.** `read_cs` was the single largest symbol in
+the whole profile at 22.44 %; it is now 1.27 % and thirteenth. The benchmark
+predicted 27.4× on the component and the live profile agrees.
+
+**The shape of the problem has changed completely.** Serialization and
+storage are effectively finished: sighash parsing is ~3 % (`swtx_parse` +
+`read_cs` + `w32le`), the UTXO store is **1.45 %**, the kernel 2.8 %. Field
+and EC arithmetic is now ~64 % of all cycles, and hashing another ~5.8 %.
+There is no longer a "two-front problem" (§1): it is one front.
+
+### 11.1 What is ruled out, by measurement, and should not be retried
+
+- **Lazy reduction / 5×52** (§10a): the *correct* implementation measures
+  **1.07×**, because `fe_add`/`fe_sub` each need an extra correction round
+  once `fe_mul` may return [0, 2²⁵⁶), and there are more of them (1,243 +
+  1,436) than multiplies (2,262). §10 also found four sites where
+  `point_add`/`point_add_mixed` select the doubling branch by **limb**
+  equality — a non-canonical operand there returns infinity instead of 2P,
+  silently.
+- **Micro-optimising `reduce`**: three contract-preserving restructurings
+  (ADCX/ADOX-fused carry refold, `CMOVO` canonicalisation, AND-tree
+  predicate) were built and proved bit-identical over 6,686,918 results.
+  All measured inside the ±0.5 ns alignment noise. `bench_fe` is
+  alignment-sensitive enough that a change touching only `fe_add` moved
+  `fe_mul` LAT by 0.68 ns — do not trust sub-ns deltas from it.
+- **G-side comb table** (§4.5, and ranked next by §6): `point_scalar_mul_fixed`
+  is **0.73 %**. This lever is now worth almost nothing and should be dropped
+  from the plan.
+
+### 11.2 What is left
+
+1. **Inline `fe_add`/`fe_sub` into the EC formulas** — §10.11's conclusion,
+   now corroborated by this profile: the two are **8.8 %** of all cycles
+   across ~2,553 calls per verify that are mostly loads, stores and call
+   overhead, and inlining additionally lets a multiply feeding an add skip an
+   intermediate canonicalisation. The only remaining lever with double-digit
+   headroom, and it is contained to the EC layer.
+2. **`fe_mul_int(r, a, k)` for small k** replacing the `3A`/`8C` patterns
+   (~3 % of a verify).
+3. **Attribute the 6.9 % in `memmove`/`memset`/`copy_bytes`** — source
+   unknown without a call-graph profile; worth one targeted run.
+4. Re-profile again afterwards. The shares have now moved three times in one
+   day, and each time they inverted the ranking.
