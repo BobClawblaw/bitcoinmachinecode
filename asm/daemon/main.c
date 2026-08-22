@@ -105,6 +105,7 @@ extern long store_init(void* st);
 extern long store_reload(void* st);
 extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
+extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
@@ -1940,6 +1941,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     signal(SIGCHLD, SIG_IGN);
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
+    /* Let the (multi-hour, during bulk replay) utxo_live_catchup loop see the
+     * flag too, so SIGTERM stops it at the next block boundary instead of
+     * systemd's 90s TimeoutStopSec SIGKILLing this worker mid-block --
+     * which happened on every stop/restart until 2026-08-22 and once landed
+     * between a block's WAL writes and its checkpoint (height 318148). */
+    utxo_live_set_shutdown_flag(&g_shutdown_requested);
     /* Reload a fresh store state rather than inherit the parent's possibly-
      * stale in-memory idx_len/pos (fork COW is not safe for a growable
      * store -- see the unified_ibd comments on re-initialising per

@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "node_config.h"
@@ -198,6 +199,21 @@ static long g_test_crash_after_applied = -1;
 void utxo_live_test_set_crash_after(long n){ g_test_crash_after_applied = n; }
 #define UTXO_LIVE_TEST_CRASH_HOOK(applied_count) \
     do { if (g_test_crash_after_applied >= 0 && (applied_count) == g_test_crash_after_applied) _exit(1); } while (0)
+
+/* Shutdown flag, registered by the process that owns the signal handler
+ * (daemon/main.c's download worker: utxo_live_set_shutdown_flag(&g_shutdown_
+ * requested)). utxo_live_catchup polls it after every block. Until
+ * 2026-08-22 nothing in this file ever looked at the flag: a from-scratch
+ * replay is one multi-hour utxo_live_catchup call, so SIGTERM just set a
+ * bit nobody read, systemd's TimeoutStopSec (90s) expired on every single
+ * stop/restart during bulk catch-up, and the worker was SIGKILLed mid-block
+ * -- which is what created the checkpoint-lag window that the recovery path
+ * below now also closes from the other side. A pointer rather than an
+ * extern keeps this file free of main.c internals (tests register their own
+ * flag). */
+static const volatile sig_atomic_t* g_shutdown_flag = 0;
+void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag){ g_shutdown_flag = flag; }
+static inline int shutdown_requested(void){ return g_shutdown_flag && *g_shutdown_flag; }
 
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -1029,6 +1045,18 @@ long utxo_live_catchup(void* store_buf){
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
 
+        /* SIGTERM/SIGINT arrived: block h is applied AND checkpointed, so
+         * this is a clean boundary. Stop here -- do not start the next block
+         * and do not begin a compaction -- and return the count applied so
+         * far like any other bounded call; the worker's own loop sees the
+         * flag and exits. The end-of-call bookkeeping below still runs
+         * (prune is bounded, the compacts are guarded). */
+        if (shutdown_requested()) {
+            fprintf(stderr, "[utxo_live] shutdown requested -- stopping catch-up cleanly after height %ld (%ld block(s) applied this call, checkpoint persisted)\n",
+                    h, applied);
+            break;
+        }
+
         /* Compact periodically DURING a long catch-up, not just once at the
          * end. A from-scratch (or long-gap) replay flushes far more runs
          * than a steady-state catch-up call ever would, and the manifest
@@ -1076,7 +1104,7 @@ long utxo_live_catchup(void* store_buf){
         if (!persist_applied_height(g_applied_height)) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
-        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
+        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && !shutdown_requested()) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] compact manifest_n=%lu -> result=%ld\n", g_utxo_lst.manifest_n, cr);
         }
