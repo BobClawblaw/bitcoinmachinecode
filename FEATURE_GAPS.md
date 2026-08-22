@@ -73,14 +73,19 @@ util), each individually small, but there's a lot of it.
   unbounded write in `tap_leaf_hash` for scripts over ~288 bytes, and a
   wrong sighash for script-path spends carrying an annex. 9 independent
   vectors in `tests/test_taproot_scriptpath.c`.
-  - **Remaining, narrow:** `OP_CODESEPARATOR` *inside a tapscript* is not
-    position-tracked for the sighash. Any tapscript containing a raw
-    `0xab` byte is detected and **refused loudly** (false-reject only —
-    `schnorr_verify` is still the final gate, so never false-accept).
-    Essentially unseen on real chain data, but if the replay ever hits
-    one past height 709,632 it will stop with that reason. **Small** to
-    finish: thread `codesep_pos` from the interpreter into
-    `tapscript_checksig`'s sighash context.
+  - ~~**Remaining, narrow:** `OP_CODESEPARATOR` *inside a tapscript*~~ —
+    **DONE 2026-08-21.** `script_eval` now tracks the BIP342 `codesep_pos`
+    (opcode position of the last *executed* `OP_CODESEPARATOR`, `0xffffffff`
+    if none, unexecuted branches excluded — Core `interpreter.cpp`
+    `opcode_pos`/`execdata.m_codeseparator_pos`) and passes it to the
+    tapscript checksig callback via `interp_slice`'s third field. The
+    byte-level `0xab` refuse scan is gone (it also rejected any tapscript
+    whose *push data* happened to contain `0xab`, e.g. a pubkey). 12 new
+    generated vectors (positions before CHECKSIG/CHECKSIGADD, not-taken
+    branch, last-executed-wins, wrong-position and none-committed
+    rejections, `0xab` inside a pubkey push) — all negatives pin the exact
+    rejection reason. No remaining known taproot consensus gap other than
+    the deferred items below.
 - **Chain selection** — mainnet only. No testnet/signet/regtest handling in
   `node_config.c`; mainnet magic bytes are hardcoded directly in
   `bitcoin_net.asm`/`bitcoin_store.asm` (3 literal occurrences each), no

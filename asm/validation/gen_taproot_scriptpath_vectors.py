@@ -100,7 +100,11 @@ def ser_compact_len(n):
 def write_varint(n): return ser_compact_len(n)
 
 # ---------- SigMsg / sighash (script-path, ext_flag=1) ----------
-def compute_sighash(tx, in_index, hash_type, amount, spent_scriptpubkeys, leaf_hash, annex=None):
+def compute_sighash(tx, in_index, hash_type, amount, spent_scriptpubkeys, leaf_hash, annex=None,
+                    codesep_pos=0xffffffff):
+    """codesep_pos: BIP342 opcode position of the last EXECUTED OP_CODESEPARATOR
+    before the signature opcode, 0xffffffff if none (Core:
+    execdata.m_codeseparator_pos, serialized LE32 after key_version)."""
     epoch = bytes([0])
     ht = bytes([hash_type])
     ver = struct.pack('<i', tx['version'])
@@ -123,7 +127,7 @@ def compute_sighash(tx, in_index, hash_type, amount, spent_scriptpubkeys, leaf_h
     pre = epoch + ht + ver + lt + sha_prevouts + sha_amounts + sha_spks + sha_sequences + sha_outputs + spend_type + input_index
     if annex_present:
         pre += sha256(ser_compact_len(len(annex)) + annex)
-    pre += leaf_hash + bytes([0x00]) + struct.pack('<I', 0xffffffff)  # key_version=0, codesep_pos=none
+    pre += leaf_hash + bytes([0x00]) + struct.pack('<I', codesep_pos)  # key_version=0, codesep_pos
     return tagged_hash("TapSighash", pre)
 
 def ser_tx(tx):
@@ -149,11 +153,14 @@ def mk_tx(numin=1, outval=90000, outspk=None):
 
 vectors = []
 
-def add(name, tx, index, amount, spks, control, witness_items, spk, expect):
+def add(name, tx, index, amount, spks, control, witness_items, spk, expect, reason=None):
     """witness_items: list of bytes, in order (script/control appended by caller
-    already at the end -- this is the FULL witness stack as broadcast)."""
+    already at the end -- this is the FULL witness stack as broadcast).
+    reason: for expect=0 vectors, the exact *reason string taproot_verify_input
+    must report (None = verdict only)."""
     vectors.append({'name': name, 'tx': tx, 'index': index, 'amount': amount, 'spks': spks,
-                    'witness': witness_items, 'spk': spk, 'expect': expect, 'control': control})
+                    'witness': witness_items, 'spk': spk, 'expect': expect, 'control': control,
+                    'reason': reason})
     # self-check: for script-path vectors (>=2 non-annex witness items), recompute
     # the commitment independently from the control block + script actually placed
     # in witness_items, and confirm it matches spk -- catches a generator bug before
@@ -199,15 +206,16 @@ add('scriptpath_2leaf', tx1, 0, 100000, [spk1], control1, [sig1, leaf_a, control
 
 # tampered variants of the 2-leaf case (all must FAIL)
 sig1_bad = bytearray(sig1); sig1_bad[10] ^= 0xff
-add('scriptpath_2leaf_badsig', tx1, 0, 100000, [spk1], control1, [bytes(sig1_bad), leaf_a, control1], spk1, 0)
+add('scriptpath_2leaf_badsig', tx1, 0, 100000, [spk1], control1, [bytes(sig1_bad), leaf_a, control1], spk1, 0,
+    "p2tr tapscript execution failed")
 
 leaf_a_bad = bytes([0x20]) + Pk + bytes([0xad])  # CHECKSIGVERIFY instead of CHECKSIG -> different leaf hash -> commitment mismatch
 add('scriptpath_2leaf_badscript', tx1, 0, 100000, [spk1], control1,
-    [sig1, leaf_a_bad, control1], spk1, 0)
+    [sig1, leaf_a_bad, control1], spk1, 0, "p2tr script-path commitment mismatch")
 
 control1_bad = bytes([0xc0]) + bytes([internal_x[0] ^ 0xff]) + internal_x[1:] + lh_b
 add('scriptpath_2leaf_badcontrol', tx1, 0, 100000, [spk1], control1_bad,
-    [sig1, leaf_a, control1_bad], spk1, 0)
+    [sig1, leaf_a, control1_bad], spk1, 0, "p2tr script-path commitment mismatch")
 
 # ---- vector 2: unknown leaf version (0xc2) -- must verify TRUE without execution ----
 # script is deliberately garbage/invalid (would fail if ever executed) to prove it's
@@ -240,7 +248,7 @@ dh3 = compute_sighash(tx3, 0, 0x01, 100000, [spk3], lh3)
 sig3 = schnorr_sign(dh3, sk3) + bytes([0x01])
 control3 = bytes([0xc0]) + internal_x
 add('scriptpath_weight_exceeded', tx3, 0, 100000, [spk3], control3,
-    [sig3, script3, control3], spk3, 0)
+    [sig3, script3, control3], spk3, 0, "p2tr tapscript execution failed")
 
 # ---- vector 4: annex present on a script-path spend (must still verify TRUE) ----
 annex = bytes([0x50, 0xaa, 0xbb, 0xcc])  # 0x50 tag + arbitrary payload
@@ -286,13 +294,11 @@ add('keypath_with_annex', tx5, 0, 100000, [spk5], b'', [sig5, annex5], spk5, 1)
 # scriptpath_checksigadd shape but with the internal pubkey/control block
 # this test actually needs, which that header doesn't export) ----
 def sk_with_clean_pubkey(seed):
-    """Pick a seckey whose x-only pubkey contains no 0xab byte -- taproot_
-    verify_input deliberately (and documentedly) refuses ANY tapscript
-    containing a raw 0xab byte as a conservative stand-in for not tracking
-    OP_CODESEPARATOR position (see its header comment); a coincidental 0xab
-    inside a pubkey embedded as script PUSH DATA would trip that same guard
-    and isn't what this vector is testing. ~12.5% chance per random key, so
-    just probe forward from the seed."""
+    """Pick a seckey whose x-only pubkey contains no 0xab byte. Historical:
+    taproot_verify_input used to refuse ANY tapscript containing a raw 0xab
+    byte (a stand-in for not tracking OP_CODESEPARATOR); that guard is gone
+    and vector 'scriptpath_pushdata_contains_0xab' below now pins the
+    opposite. Kept so this vector's bytes stay stable."""
     sk = seed
     while 0xab in ser_xonly(point_mul(G, sk)):
         sk = (sk + 1) % N
@@ -316,6 +322,73 @@ sig6b = schnorr_sign(dh6, sk6b) + bytes([0x01])
 control6 = bytes([0xc0]) + internal_x
 add('scriptpath_checksigadd_2of2', tx6, 0, 100000, [spk6], control6,
     [sig6b, sig6a, leaf6, control6], spk6, 1)
+
+# ============================================================================
+# BIP342 OP_CODESEPARATOR position tracking (codesep_pos in the SigMsg).
+# Core (script/interpreter.cpp): opcode_pos is incremented once per loop
+# iteration -- every opcode, pushes included, executed or not -- and
+# execdata.m_codeseparator_pos is set to opcode_pos only when the
+# OP_CODESEPARATOR is actually EXECUTED (taken branch). 0xffffffff if none.
+# ============================================================================
+OP_CODESEP = bytes([0xab]); OP_CHECKSIG = bytes([0xac]); OP_CHECKSIGADD = bytes([0xba])
+OP_0 = bytes([0x00]); OP_1 = bytes([0x51]); OP_IF = bytes([0x63]); OP_ENDIF = bytes([0x68]); OP_EQUAL = bytes([0x87])
+EXEC_FAIL = "p2tr tapscript execution failed"
+
+def scriptpath_vec(name, script, sk, codesep_pos, expect, reason=None, seckey_for_sig=None):
+    """Single-leaf tapscript spend of `script`, signed over the sighash computed
+    with `codesep_pos`. The C side recomputes codesep_pos from execution, so
+    expect=1 iff that matches what the interpreter tracks."""
+    lh = tap_leaf_hash(0xc0, script)
+    ox = taproot_tweak_pubkey(internal_x, lh)
+    tx = mk_tx()
+    spk = bytes([0x51, 0x20]) + ox
+    dh = compute_sighash(tx, 0, 0x01, 100000, [spk], lh, codesep_pos=codesep_pos)
+    sig = schnorr_sign(dh, seckey_for_sig if seckey_for_sig is not None else sk) + bytes([0x01])
+    control = bytes([0xc0]) + internal_x
+    add(name, tx, 0, 100000, [spk], control, [sig, script, control], spk, expect, reason)
+
+sk7 = 0x7788990011223344556677889900aabbccddeeff00112233445566778899aa
+Pk7 = ser_xonly(point_mul(G, sk7))
+PUSH_PK7 = bytes([0x20]) + Pk7
+
+# (a) <pk> OP_CODESEPARATOR OP_CHECKSIG : positions push=0, codesep=1, checksig=2 -> codesep_pos=1
+scr_a = PUSH_PK7 + OP_CODESEP + OP_CHECKSIG
+scriptpath_vec('codesep_before_checksig', scr_a, sk7, 1, 1)
+# (b) same script, signature committed to codesep_pos=0xffffffff -> MUST fail
+#     (proves the position is genuinely committed, not ignored)
+scriptpath_vec('codesep_sig_over_none_rejected', scr_a, sk7, 0xffffffff, 0, EXEC_FAIL)
+# (b') same script, signature committed to the wrong position (2) -> MUST fail
+scriptpath_vec('codesep_sig_over_wrong_pos_rejected', scr_a, sk7, 2, 0, EXEC_FAIL)
+# (c) OP_0 OP_IF OP_CODESEPARATOR OP_ENDIF <pk> OP_CHECKSIG : codesep in a NOT-taken
+#     branch -> not executed -> 0xffffffff (positions: 0,1,2,3,4,5)
+scr_c = OP_0 + OP_IF + OP_CODESEP + OP_ENDIF + PUSH_PK7 + OP_CHECKSIG
+scriptpath_vec('codesep_unexecuted_branch_none', scr_c, sk7, 0xffffffff, 1)
+scriptpath_vec('codesep_unexecuted_branch_pos2_rejected', scr_c, sk7, 2, 0, EXEC_FAIL)
+# (d) OP_CODESEPARATOR <pk> OP_CODESEPARATOR OP_CHECKSIG : both executed, LAST wins
+#     (positions: 0,1,2,3) -> codesep_pos=2
+scr_d = OP_CODESEP + PUSH_PK7 + OP_CODESEP + OP_CHECKSIG
+scriptpath_vec('codesep_last_executed_wins', scr_d, sk7, 2, 1)
+scriptpath_vec('codesep_first_of_two_rejected', scr_d, sk7, 0, 0, EXEC_FAIL)
+# (d2) OP_CODESEPARATOR OP_0 OP_IF OP_CODESEPARATOR OP_ENDIF <pk> OP_CHECKSIG :
+#      first executed (pos 0), second in a not-taken branch -> codesep_pos=0
+scr_d2 = OP_CODESEP + OP_0 + OP_IF + OP_CODESEP + OP_ENDIF + PUSH_PK7 + OP_CHECKSIG
+scriptpath_vec('codesep_exec_then_unexec_keeps_first', scr_d2, sk7, 0, 1)
+# (d3) OP_1 OP_IF OP_CODESEPARATOR OP_ENDIF <pk> OP_CHECKSIG : TAKEN branch -> pos 2
+scr_d3 = OP_1 + OP_IF + OP_CODESEP + OP_ENDIF + PUSH_PK7 + OP_CHECKSIG
+scriptpath_vec('codesep_taken_branch_pos2', scr_d3, sk7, 2, 1)
+# (e) a pubkey whose PUSH DATA contains 0xab and no real OP_CODESEPARATOR ->
+#     codesep_pos stays 0xffffffff. Regression for the old byte-level refuse scan.
+sk8 = 0x8899aabbccddeeff00112233445566778899aabbccddeeff0011223344556677
+while 0xab not in ser_xonly(point_mul(G, sk8)):
+    sk8 = (sk8 + 1) % N
+Pk8 = ser_xonly(point_mul(G, sk8)); assert 0xab in Pk8
+scr_e = bytes([0x20]) + Pk8 + OP_CHECKSIG
+scriptpath_vec('scriptpath_pushdata_contains_0xab', scr_e, sk8, 0xffffffff, 1)
+# (f) OP_0 <pk> OP_CODESEPARATOR OP_CHECKSIGADD OP_1 OP_EQUAL : CHECKSIGADD path
+#     (positions: 0,1,2,3,4,5) -> codesep_pos=2
+scr_f = OP_0 + PUSH_PK7 + OP_CODESEP + OP_CHECKSIGADD + OP_1 + OP_EQUAL
+scriptpath_vec('codesep_before_checksigadd', scr_f, sk7, 2, 1)
+scriptpath_vec('codesep_before_checksigadd_none_rejected', scr_f, sk7, 0xffffffff, 0, EXEC_FAIL)
 
 # ---- emit C header ----
 with open('tests/taproot_scriptpath_vec.h', 'w') as f:
@@ -341,11 +414,12 @@ with open('tests/taproot_scriptpath_vec.h', 'w') as f:
     f.write('\ntypedef struct {\n  const char* name;\n  const uint8_t* tx; int txlen;\n')
     f.write('  const uint8_t* prevouts; const uint8_t* amounts; const uint8_t* spks; int numin;\n')
     f.write('  const uint8_t* spk;\n  const uint8_t* const* wit; const uint32_t* witlen; uint32_t nwit;\n')
-    f.write('  int expect;\n} sp_vec_t;\n')
+    f.write('  int expect;\n  const char* reason; /* expect=0 only: exact reason required, or NULL */\n} sp_vec_t;\n')
     f.write('static const sp_vec_t sp_vectors[] = {\n')
     for i, v in enumerate(vectors):
+        rs = f'"{v["reason"]}"' if v['reason'] else 'NULL'
         f.write(f'  {{ "{v["name"]}", sp{i}_tx, sp{i}_txlen, sp{i}_prevouts, sp{i}_amounts, sp{i}_spks, sp{i}_numin, '
-                f'sp{i}_spk, sp{i}_wit, sp{i}_witlen, {len(v["witness"])}, {v["expect"]} }},\n')
+                f'sp{i}_spk, sp{i}_wit, sp{i}_witlen, {len(v["witness"])}, {v["expect"]}, {rs} }},\n')
     f.write('};\n')
     f.write(f'static const int sp_num_vectors = {len(vectors)};\n')
 
