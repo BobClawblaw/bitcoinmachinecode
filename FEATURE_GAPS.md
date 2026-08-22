@@ -25,6 +25,16 @@ tracks with the project's actual focus to date — proving consensus
 correctness via full historical replay — rather than general node
 operability.
 
+**Update 2026-08-22.** Closed since this survey was written: taproot
+script-path + `OP_CODESEPARATOR` (`e789df8`, `b2ccb2d`); 9 blockchain-query
+RPCs (`090a109`); reorg truncation and whole-file pruning on the
+non-monotonic archive (`9269a86`, `a051f21`); genesis injected so store
+index == height (`5f36dee`); clean shutdown + crash recovery of a
+partially-applied block (`f2faf3b`, `96b555e`). A scratch Bitcoin Core
+(`/storage/core-oracle`, `txindex`+`coinstatsindex`) is now an authorized
+development oracle: block hashes cross-validated at 14 heights, and after
+the genesis fix index/body/header/Core agree at 12 heights including 0.
+
 ## RPC surface — still the biggest gap, first tranche landed 2026-08-21
 
 **Implemented** (`asm/rpc_chain.c`, dispatched from `rpc_dispatch` in
@@ -160,7 +170,13 @@ plus straightforward methods on top of it.
   boot path. Not a live, queryable index.
 - **`blockfilterindex`** (BIP157/158, "neutrino" light-client support) —
   absent. No hits for blockfilter/bip157/bip158/cfilter/golomb-rice.
-- **`coinstatsindex` / `gettxoutsetinfo`** — absent.
+- **`coinstatsindex` / `gettxoutsetinfo`** — absent. **Now the most
+  valuable gap to close:** the scratch Core oracle has `coinstatsindex`
+  on, so a UTXO-set hash on our side (`hash_serialized_3` or MuHash3072
+  over the live LSM set) would turn Stage D's acceptance test from "no
+  block rejected" into "byte-identical UTXO set to Core at height H" —
+  which is the only test that could have caught incident #6 (a rule
+  applied too loosely is invisible to a replay). **Medium.**
 
 ## Wallet
 
@@ -201,6 +217,17 @@ This node can validate and relay blocks but cannot help build them.
 
 ## Ops / misc
 
+- ~~Clean shutdown during catch-up~~ — **FIXED 2026-08-22** (`f2faf3b`):
+  every `systemctl stop` during a replay had been a 90 s SIGKILL because
+  the catch-up loop ignored SIGTERM; now 10 s, checkpoint persisted.
+  `TimeoutStopSec=900` drop-in as compaction headroom.
+- ~~Crash consistency of the UTXO checkpoint~~ — **FIXED** (`96b555e`): a
+  kill between a block's WAL writes and its checkpoint no longer makes the
+  next resume reject that block; boot rolls it back from the undo log
+  (proved on real data at height 343087).
+- Full-verification IBD benchmark against Core (`-assumevalid=0
+  -stopatheight`, second scratch datadir) — not run yet; the only
+  like-for-like end-to-end comparison. Planned once our replay reaches tip.
 - `-checkblocks`/`-checklevel` startup verification — genuinely implemented,
   matching Core's own defaults exactly (`node_config.c:61-62`:
   `checkblocks=6`, `checklevel=3`). Positive, real parity.
