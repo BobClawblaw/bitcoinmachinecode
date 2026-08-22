@@ -149,6 +149,8 @@ asm/tests/test_schnorr
 asm/tests/test_taproot
 asm/tests/test_taproot_sighash
 asm/tests/test_taproot_scriptpath
+asm/tests/test_mul_carry_regression
+asm/tests/test_ecdsa_inverse
 asm/tests/test_segwit_sighash
 asm/tests/test_mempool_accept_modern
 asm/daemon/wallet_cli
@@ -259,7 +261,6 @@ asm/tests/test_utxo_recover
 asm/tests/test_utxo_catchup_crash_resume
 asm/tests/test_archive_truncate_nonmonotonic
 asm/tests/test_prune_nonmonotonic
-asm/tests/test_mul_carry_regression
 
 # ---- macOS / Apple junk ----
 # AppleDouble resource-fork companions (created by macOS when files are copied

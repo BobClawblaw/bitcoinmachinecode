@@ -244,6 +244,38 @@ stream — branch now, merge after the replay reaches tip, and require the
 second full-chain replay to match the first's accept/reject decisions
 before deploy.
 
+**Status 2026-08-21 — A and B BUILT on branch `perf-inverse`, not merged.**
+`ecdsa_x_eq_mod_n` (projective compare, exported for the `r+n` branch test)
+and `sc_inv_var` (binary xgcd, dispatched only at `ecdsa.asm`'s
+`w = s^{-1}`; Fermat `sc_inv` untouched for signing) are in, with
+`tests/test_ecdsa_inverse.c`: 1,001,023 `sc_inv_var` vs `sc_inv` cases
+(10⁶ random + every edge listed above), 6,008 `ecdsa_x_eq_mod_n` cases
+including the constructed `r+n` branch and the `r == p−n` boundary, and
+113,315 `ecdsa_verify` new-vs-frozen-reference cases (1,024
+libsecp256k1-signed fixtures × 13 variants + 10⁵ random tuples) — 0
+mismatches. Out-of-tree: 5,000 `sc_inv_var` outputs vs Python
+`pow(a,−1,n)` and 10⁵ further libsecp256k1-signed signatures through new
+and reference — 0 mismatches.
+
+| same moment, replay + Core sync loading the box | µs / verify | /s/core |
+|---|---|---|
+| before (`main`, min of 3) | 115.4 | 8,662 |
+| after (branch, min of 3) | **56.8** | **17,599** |
+| libsecp256k1 bench | 22.0 | ~45,500 |
+
+**2.03× on ecdsa_verify; gap to libsecp256k1 5.2× → 2.6×.**
+
+Building this found two pre-existing lost-carry bugs in the multiplies
+themselves, both fixed as the branch's first commit with exact-vector
+regression tests (`tests/test_mul_carry_regression.c`):
+`sc_mul`'s MULACC propagated carries only two limbs (lost `2^256 ≡ DELTA`
+when the third limb was `0xFFFF…`; `sc_inv(6)`, `sc_inv(n−2)`, `sc_inv(n−k)`
+were wrong), and `fe_mul`'s fold 2 dropped the carry out of limb 3 (lost
+`2^256 ≡ C`; `fe_inv(p−k)` wrong). Random-operand probability ~2⁻⁶⁴ and
+~2⁻¹⁹⁰ per product — invisible to every random differential, deterministic
+on structured chains. Those fixes are independent of A/B and
+cherry-pickable to `main` ahead of the post-tip gate.
+
 ### 4.3 GLV endomorphism split — **revised down**
 
 - *What:* decompose the `u2·Q` scalar via the curve's efficient
