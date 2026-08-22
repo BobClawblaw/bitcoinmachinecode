@@ -62,6 +62,7 @@ extern bmc_ecdsa_glv_enabled      ; BMC_ECDSA_GLV kill switch, secp256k1_glv_c.c
 extern point_scalar_mul_fixed
 extern point_add
 extern fe_mul
+extern fe_sqr
 
 section .rodata
 
@@ -147,8 +148,7 @@ ecdsa_x_eq_mod_n:
     ; z2 = Z*Z
     lea  rdi, [rbp-0x40]
     mov  rsi, r14
-    mov  rdx, r14
-    call fe_mul
+    call fe_sqr
     ; t = r * z2
     lea  rdi, [rbp-0x60]
     mov  rsi, r12
