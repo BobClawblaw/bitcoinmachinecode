@@ -639,12 +639,19 @@ static void upl_sample(void){
 }
 
 static volatile sig_atomic_t g_inbound_n = 0;
-static void reap_children(int sig){
-    (void)sig; int st;
-    while(waitpid(-1,&st,WNOHANG) > 0){ if(g_inbound_n > 0) g_inbound_n--; }
-}
-
 static pid_t g_dl_worker_pid = -1;       /* set by main() right after fork(); parent forwards SIGTERM here */
+static volatile sig_atomic_t g_dl_worker_exited = 0, g_dl_worker_status = 0;
+static void reap_children(int sig){
+    (void)sig; int st; pid_t p;
+    while((p = waitpid(-1,&st,WNOHANG)) > 0){
+        /* The download worker is a child too. Before 2026-08-22 its death was
+         * silently reaped here and the serve parent lived on with no worker
+         * (block 481827: worker segfaulted, unit stayed "active" for 13 min).
+         * Remember it; serve_mux exits non-zero so systemd restarts the unit. */
+        if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
+        else if(g_inbound_n > 0) g_inbound_n--;
+    }
+}
 static void handle_shutdown_signal(int sig){ g_shutdown_requested = sig; }
 
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
@@ -2391,6 +2398,12 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
+        if(g_dl_worker_exited && !g_shutdown_requested){
+            int st = (int)g_dl_worker_status;
+            if (WIFSIGNALED(st)) fprintf(stderr,"[serve] FATAL: download worker pid %d died on signal %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WTERMSIG(st));
+            else fprintf(stderr,"[serve] FATAL: download worker pid %d exited with status %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WEXITSTATUS(st));
+            _exit(1);
+        }
         if(g_shutdown_requested){
             fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), mux_n_out);
