@@ -259,6 +259,7 @@ asm/tests/test_stack_push_len
 asm/tests/test_undo_log
 asm/tests/test_utxo_checkpoint
 asm/tests/test_utxo_lsm
+asm/tests/test_utxo_live_count
 asm/tests/test_utxo_recover
 asm/tests/test_utxo_catchup_crash_resume
 asm/tests/test_archive_truncate_nonmonotonic
