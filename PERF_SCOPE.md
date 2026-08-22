@@ -151,6 +151,52 @@ collapsed them to 1.
 
 ### 4.1 Reduce LSM read amplification — **top priority**
 
+**Status 2026-08-22 — BUILT on branch `lsm-mmap`, not merged.** The root
+cause turned out to be sharper than "too many runs are scanned": for every
+lookup, for every run, `mac_run_lookup` (`bitcoin_utxo_lsm.asm:1197`)
+`open`ed the run file and read the **entire bloom filter**
+(`BLOOM_MAX_BYTES` = 4 MiB at bulk scale) into TLS scratch in order to test
+exactly **3 bits**, then `lseek`/`read` its way through the sparse index and
+records, then `close`d. That copy is the `_copy_to_iter` the profile put at
+24 % of all cycles.
+
+`asm/utxo_lsm_mm.c` adds a per-thread cache of read-only `mmap`s: a run is
+opened and mapped once, and every later lookup against it is pure memory
+access. `mac_run_lookup` calls it first and falls back to its original,
+untouched code on `-2` (open/mmap failure, malformed run, any out-of-bounds
+offset), so the audited asm remains the correctness anchor. Cache is
+`__thread` (no locks; `MAP_SHARED PROT_READ` pages ARE the page cache, so
+per-thread mappings cost page-table entries, not memory), direct-mapped over
+64 slots keyed by `run_no % 64`, entries tagged with the run's generation.
+
+Measured on identical work (`tests/test_utxo_lsm` under `strace -c -f`):
+
+| syscall | before | after | |
+|---|---|---|---|
+| `read` | 480,714 | 28,723 | −94 % |
+| `lseek` | 193,039 | 2,304 | −99 % |
+| `open` | 24,982 | 1,820 | −93 % |
+| `close` | 25,016 | 2,270 | −91 % |
+| `mmap`/`munmap` | 141 | 975 | (the cache) |
+| **total syscalls** | **781,882** | **94,918** | **−88 %** |
+| **time in syscalls** | **0.778 s** | **0.125 s** | **−84 %** |
+
+`tests/bench_lsm_get` (10 runs, lookups skewed to misses — the bloom-reject
+path): **44,664 → 2,111,432 lookups/s, 47×**, with `fallbacks=0` confirming
+the fast path serves every lookup rather than quietly degrading. That
+microbench has small blooms and a warm page cache, so it is an upper bound;
+the syscall table above is the honest structural number.
+
+**`UTXO_LIVE_COMPACT_THRESHOLD` (12): leave it alone.** Lowering it was the
+other half of the original proposal, and it is now the wrong lever. Its
+purpose was to bound how many runs a lookup scans, because each run cost an
+open + a multi-MiB read. Post-fix a scanned run costs three memory loads
+against an already-resident mapping, so scan width barely registers, while
+lowering the threshold would buy that irrelevance with strictly more
+compaction I/O — the expensive direction. Revisit only if a profile taken
+*after* this lands still shows run-scan cost.
+
+
 - *What:* compact more often (lower the run threshold from 12), and/or
   replace the newest→oldest linear run scan in `utxo_lsm_get` with a
   per-key index (e.g. a generation map or a single merged bloom over all
