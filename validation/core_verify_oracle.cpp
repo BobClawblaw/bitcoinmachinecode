@@ -54,7 +54,26 @@ int main(){
         std::istringstream iss(line);
         std::string cmd; iss>>cmd;
         if(cmd=="QUIT") break;
-        if(cmd=="VERIFY"){
+        if(cmd=="SIGENC"){
+            /* SIGENC <flags_hex> <sig_hex>
+             *   -> Core's CheckSignatureEncoding (script/interpreter.cpp) verdict
+             *      for one raw signature-with-hashtype push, under the given
+             *      script_verify_flags. With flags == SCRIPT_VERIFY_DERSIG alone
+             *      this is exactly IsValidSignatureEncoding, which is `static` in
+             *      interpreter.cpp and so cannot be called directly; with flags 0
+             *      it is the pre-BIP66 "anything goes" answer. Added 2026-08-22
+             *      for the DERSIG incident: the reference list of which malformed
+             *      DER encodings Core accepts/rejects has to come from Core
+             *      itself, never from a reading of Core. */
+            unsigned flags=0; std::string sh;
+            iss>>std::hex>>flags>>std::dec>>sh;
+            if (sh=="-") sh="";
+            std::vector<unsigned char> sig = hex2bytes(sh.c_str());
+            ScriptError serror = SCRIPT_ERR_OK;
+            bool ok = CheckSignatureEncoding(sig, script_verify_flags::from_int(flags), &serror);
+            printf("OK %d %d %s\n", ok?1:0, (int)serror, ScriptErrorString(serror).c_str());
+            fflush(stdout);
+        } else if(cmd=="VERIFY"){
             unsigned flags=0, idx=0;
             std::string txs, scs, scp;
             iss>>std::hex>>flags>>std::dec>>idx>>txs>>scs>>scp;

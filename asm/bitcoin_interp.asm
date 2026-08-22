@@ -59,6 +59,9 @@
     ; CHECKMULTISIG's up-front scriptCode strip (bitcoin_sighash.asm).
     extern script_push_encode
     extern script_find_and_delete
+    ; BIP66 strict-DER signature encoding (bitcoin_scriptcodec.asm) -- Core's
+    ; IsValidSignatureEncoding. See the CheckSignatureEncoding note below.
+    extern der_sig_strict
     ; cross-file TLS accessors (bitcoin_scriptcodec.asm) -- see that file's
     ; header note by their definitions for why these are function calls
     ; rather than direct wrt ..gottpoff references to an extern symbol.
@@ -174,6 +177,9 @@
 %define SIGVERSION_WITNESS_V0 1
 %define SIGVERSION_TAPSCRIPT 2
 
+%define SCRIPT_VERIFY_STRICTENC (1<<1)
+%define SCRIPT_VERIFY_DERSIG (1<<2)
+%define SCRIPT_VERIFY_LOW_S (1<<3)
 %define SCRIPT_VERIFY_NULLDUMMY (1<<4)
 %define SCRIPT_VERIFY_MINIMALDATA (1<<6)
 %define SCRIPT_VERIFY_MINIMALIF (1<<13)
@@ -1962,6 +1968,8 @@ script_eval:
     test  rax, rax
     jnz   .err_ret0
     call  interp_checksig
+    cmp   rax, -1           ; strict-DER encoding failure -> hard script error
+    je    .err_sigder
     mov   r13, rax          ; success
     ; pop sig, pub, push bool
     lea   rdi, [r12+8]
@@ -2003,6 +2011,9 @@ script_eval:
     jmp   .next_op
 .csigv_fail:
     mov   rax, SCRIPT_ERR_CHECKSIGVERIFY
+    jmp   .err_ret0
+.err_sigder:
+    mov   rax, SCRIPT_ERR_SIG_DER
     jmp   .err_ret0
 
 .op_checksigadd:
@@ -2506,7 +2517,57 @@ interp_require_depth:
 ; Preserve callee-saved rbx,r12-r15. rbp = script_eval frame (for slice).
 ; ============================================================================
 
-; interp_checksig() -> rax = 0/1 ; sig = sp-2, pub = sp-1
+; ----------------------------------------------------------------------------
+; interp_sig_encoding_ok(rdi = signature STACK ELEMENT ptr) -> rax = 1 ok / 0 =
+; the script must fail with SCRIPT_ERR_SIG_DER. r12 = script_state.
+;
+; Core's CheckSignatureEncoding (script/interpreter.cpp), reduced to the part
+; that is ever CONSENSUS here:
+;
+;   if (vchSig.size() == 0) return true;                       // -> .sigenc_ok
+;   if ((flags & (DERSIG|LOW_S|STRICTENC)) != 0
+;       && !IsValidSignatureEncoding(vchSig)) return SIG_DER;   // -> der_sig_strict
+;   else if (flags & LOW_S) ... else if (flags & STRICTENC) ...
+;
+; The trailing LOW_S / STRICTENC arms are deliberately NOT implemented: neither
+; flag is ever produced by GetBlockScriptFlags (validation.cpp) and neither is
+; ever set by script_flags_for_block (bitcoin_script_flags.asm) -- both are
+; mempool/relay POLICY only (policy.h STANDARD_SCRIPT_VERIFY_FLAGS). They are
+; named in the mask above solely to keep this a faithful transcription of the
+; guard Core actually writes; on this codebase's consensus path DERSIG is the
+; only one of the three that can be set. (Removing an identical STRICTENC
+; hashtype check from sv_checksig on 2026-08-19 was what unblocked the archive
+; replay at height 110299 -- see bitcoin_scriptverify.c's note. This must not
+; reintroduce it.)
+;
+; SIGVERSION gate: Core reaches CheckSignatureEncoding only from
+; EvalChecksigPreTapscript, i.e. SigVersion BASE and WITNESS_V0.
+; SIGVERSION_TAPSCRIPT goes to EvalChecksigTapscript, whose signature rule is
+; BIP342's schnorr 64/65-byte one and has nothing to do with DER -- running
+; this check there would reject every tapscript spend.
+;
+; Clobbers rax,rcx,rsi,rdi,r8,r9 (der_sig_strict is a leaf that touches no
+; callee-saved register), so both call sites keep their live rbx/r13-r15.
+; ----------------------------------------------------------------------------
+interp_sig_encoding_ok:
+    mov   eax, dword [r12+48]        ; sigversion
+    cmp   rax, SIGVERSION_TAPSCRIPT
+    je    .sigenc_ok
+    mov   rax, [r12+56]              ; flags
+    test  rax, SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC
+    jz    .sigenc_ok
+    mov   esi, dword [rdi]           ; siglen (elem length field)
+    test  esi, esi
+    jz    .sigenc_ok                 ; empty signature: Core returns true
+    add   rdi, ELEM_DATA_OFF
+    jmp   der_sig_strict             ; tail call; its 0/1 is our 0/1
+.sigenc_ok:
+    mov   eax, 1
+    ret
+
+; interp_checksig() -> rax = 0/1, or -1 = SCRIPT_ERR_SIG_DER (bad encoding is a
+;                      hard script ERROR in Core, not a false CHECKSIG result)
+;                      ; sig = sp-2, pub = sp-1
 interp_checksig:
     push  r12
     push  r13
@@ -2529,6 +2590,19 @@ interp_checksig:
     mov   rax, [r12+96]
     test  rax, rax
     jz    .false
+    ; ---- BIP66/DERSIG. Core runs CheckSignatureEncoding at the TOP of
+    ; EvalChecksigPreTapscript, before any hashing or ECDSA work, and its
+    ; failure aborts the whole script (SCRIPT_ERR_SIG_DER) rather than making
+    ; CHECKSIG push false. The distinction is consensus-visible: with a mere
+    ; false, `<sig> <pk> CHECKSIG OP_NOT` would still ACCEPT a signature Core
+    ; rejects. -1 carries the error out to .op_checksig.
+    mov   rdi, r13
+    call  interp_sig_encoding_ok
+    test  rax, rax
+    jnz   .encoding_ok
+    mov   rax, -1
+    jmp   .end
+.encoding_ok:
     ; build slice
     mov   rax, [rbp-0x20]
     TLS_ADDR r10, interp_slice
@@ -2904,6 +2978,18 @@ interp_checkmultisig:
     imul  rcx, rax
     TLS_ADDR r14, cms_keyrefs
     mov   r14, [r14+rcx]         ; vPub elem ptr
+    ; ---- BIP66/DERSIG. Core checks the encoding of the signature CURRENTLY
+    ; under consideration inside this same loop (interpreter.cpp's
+    ; CHECKMULTISIG arm: `if (!CheckSignatureEncoding(vchSig, flags, serror)
+    ; || !CheckPubKeyEncoding(...)) return false;`), immediately before the
+    ; ECDSA check and as a hard script error. Signatures the loop never
+    ; reaches -- because it ran out of keys first -- are never checked, in
+    ; Core and here alike, which is why this belongs here and not in the
+    ; up-front collect loop.
+    mov   rdi, rbx               ; vSig elem ptr
+    call  interp_sig_encoding_ok
+    test  rax, rax
+    jz    .err_sigder
     ; scriptCode (interp_slice) was already built once, with ALL on-stack
     ; signatures stripped, in the .cms_strip_loop above -- do not rebuild it
     ; per iteration (see the comment there for why per-call stripping of
@@ -2999,6 +3085,10 @@ interp_checkmultisig:
 .err_sigcount:
     mov   rax, [rbp-0x70]
     mov   qword [rax], SCRIPT_ERR_SIG_COUNT
+    jmp   .err_exit
+.err_sigder:
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_DER
 .err_exit:
     xor   eax, eax
     add   rsp, 64
