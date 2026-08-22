@@ -86,8 +86,9 @@ what the method did and did not catch.
 | witness stack > 8 items, "the one hard wall" | **CORRECT, and it was even earlier than predicted.** It rejected at **498,787** (a 17-item P2SH-P2WSH), not ~551,500 — the stride-1,500 sampling had simply missed the first occurrence, exactly the gap the Method section warned about. Fixed as incident #15 (`d1a2259`), cap → 1004. |
 | P2WSH CODESEP / HTLC / sighash 0x81/0x82/0x83 | Fixtures now exist and pass (`tests/test_segwit_coverage.c`) — the "turn should-work into verified" move from item 2 was done. |
 | tapscript CSV / CLTV / CHECKSIGADD, "handled, UNTESTED" | **The census's assessment was WRONG in the dangerous direction.** These were not handled: `OP_CHECKSIGVERIFY` was routed to `.bad_opcode` under SIGVERSION_TAPSCRIPT, so HTLC-style leaves could never execute, and the script-eval context was zeroed so tapscript CLTV/CSV were silently gated off. Incident #16 (`4dc5941`). Found by pulling the 806500 evidence txid and actually running it — i.e. by item 2, not by the classification. |
-| ">10 KB tapscript / real inscription" untested at scale | **Still open.** No inscription-scale fixture yet; needs fetch-on-demand rather than a checked-in vector. The single biggest remaining untested risk, unchanged. |
-| `tap_leaf_hash` 4 MB leaf cap | Still open, still design-worthy-not-urgent. |
+| ">10 KB tapscript / real inscription" untested at scale | **CLOSED, and the census's own maximum was 10x too small.** Fixtures now exist and pass (`tests/test_tapscript_scale.c`): a **3,938,182-byte** leaf at height **774628** — below the 775,000 this table calls the first script-path height, and within 1.5% of the ~3,999,000 MAX_BLOCK_WEIGHT allows at all, so nothing on the chain can be materially larger — plus the 371,967 B leaf at 779500, the 42,594 B leaf at 775000 (this row's evidence txid, full txid `4cc72b13218183d4a6b13e79ef3e0a73c7987688dd0334866a8398b03e514057`), a 21-node control block at 850000 and a 12-item script-path witness at 860500. Nothing on the size path broke. Chasing *why* it did not break is what found incident #18. |
+| `tap_leaf_hash` 4 MB leaf cap | **CLOSED, and it is provably unreachable, not merely unseen.** The asm bounds `slen` at `TAP_PREIMG_CAP-70` = **4,194,234**; MAX_BLOCK_WEIGHT = 4,000,000 caps any leaf a valid block can carry near **3,999,000**, so ~195 KB of headroom can never be consumed. Measured too: `tests/test_tapscript_scale.c` sweeps `tap_leaf_hash` at 0 / 1 / 252 / 253 / 65,535 / 65,536 / 371,967 / 3,938,182 / 3,999,000 / 4,194,234 bytes against independently-computed BIP341 hashes, and confirms 4,194,235 fails cleanly (returns 0, writes nothing). |
+| *(not predicted)* BIP342 initial-stack element-size limit | **A bug the census could not have found, because the shape does not exist on the chain.** `taproot_verify_input` applied no `MAX_SCRIPT_ELEMENT_SIZE` check to the tapscript initial stack, and `stack_push` bounds only the stack depth — so a >524-byte initial-stack item overran a 528,000-byte heap buffer by up to ~3.4 MB, and a 521-byte one was a silent consensus false-accept. 47,578 sampled real script-path inputs (68 blocks, 775k–869k) max out at a **79-byte** initial-stack item and contain **no OP_SUCCESSx leaf**, so no amount of chain sampling would have surfaced it. Incident #18. |
 
 **The lesson.** Conclusion 2 above — "the remaining risk is coverage, not
 code" — was the wrong call, and it was wrong because the census classified
@@ -99,3 +100,15 @@ txids, and running one of those txids is what found the bug hours before
 the replay would have hit it. But "handled" in the table above should be
 read as "has a code path", never as "verified" — only a fixture that fails
 on the old code and passes on the new can say that.
+
+**A second lesson (added with the last two rows).** The census's method — ask
+the chain what shapes exist, compare against our caps — is sound for finding
+walls the replay will hit, and it found them. But it is structurally blind to
+a whole class of bug: a shape that is *consensus-valid and therefore mineable*
+yet has simply never been mined. Incident #18's oversized tapscript stack item
+is exactly that. No sampling density would have produced it; only reading the
+path against Core's `ExecuteWitnessScript` line by line did, and only Core
+itself (a new `TAPVERIFY` command in `validation/core_verify_oracle.cpp`)
+could then say which way the vector was supposed to go. "What has the chain
+done" and "what may the chain do" are different questions, and this document
+only ever asked the first.
