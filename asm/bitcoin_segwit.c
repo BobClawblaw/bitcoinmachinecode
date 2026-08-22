@@ -199,6 +199,7 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     /* q = witness section start (segwit) or locktime (legacy). Wire format
      * has no overall witness-stack-count field: exactly one stack per
      * input, back-to-back. */
+    const uint8_t* outs_end = q;        /* end of outputs == witness start */
     const uint8_t* lock = q;
     if (segwit){
         for (uint64_t i=0;i<nin;i++){
@@ -239,7 +240,7 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
      * bound -- the same overrun class as incident #13 (a 120-output tx
      * already exceeds it; exchange batch payouts carry thousands). */
     {
-        long olen = (long)(lock - outs_start);
+        long olen = (long)(outs_end - outs_start);
         if (olen < 1 || dsz + olen > cap) return 0;
         memcpy(d, outs_start, (size_t)olen); d += olen; dsz += olen;
     }

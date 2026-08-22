@@ -38,6 +38,14 @@ def parse(tx):
     lock=tx[p:p+4]
     return ver,ins,outs,wit,lock
 def bip143(tx, n_in, script_code, amount, hashtype=1):
+    # Guard against the classic misuse (2026-08-22): callers passing the BARE
+    # script (e.g. 25-byte 76a914...88ac) without the compactsize prefix.
+    # BIP143's scriptCode is serialized WITH its length prefix; require that
+    # the leading compactsize covers exactly the rest of the bytes.
+    l, q = rd_cs(script_code, 0)
+    assert q + l == len(script_code), (
+        "script_code must include its compactsize prefix (e.g. 1976a914...88ac); "
+        "got a leading compactsize of %d over %d remaining bytes" % (l, len(script_code)-q))
     ver,ins,outs,wit,lock=parse(tx)
     hp=sha256d(b''.join(i[0] for i in ins)); hs=sha256d(b''.join(i[2] for i in ins)); ho=sha256d(b''.join(outs))
     pre = ver+hp+hs+ins[n_in][0]+script_code+amount.to_bytes(8,'little')+ins[n_in][2]+ho+lock+hashtype.to_bytes(4,'little')
