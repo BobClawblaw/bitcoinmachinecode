@@ -21,54 +21,87 @@ assembly is authored by an AI assistant, none by a human. The security-critical
 crypto (SHA-256, secp256k1 field/point/scalar/ECDSA) is written directly in x86-64
 assembly.
 
+## Where to look
+
+| document | what it is |
+|---|---|
+| **`ASSESSMENT.md`** | **An honest assessment of capability and speed vs Bitcoin Core.** Read this before believing any performance claim, including the ones in this README. |
+| `FEATURE_GAPS.md` | What this node does **not** implement, kept deliberately unflattering. |
+| `LOG.md` | Narrative of every defect found, including the wrong diagnoses and how they were overturned. |
+| `PERF_SCOPE.md` | Profiles, benchmarks, and the methodology behind each number — including which numbers are contaminated and why. |
+| `PLAN_SCRIPT_VERIFY.md` | The consensus-verification plan, and a one-line-per-wall table of every block that stopped the replay. |
+| `CHAIN_AHEAD_CENSUS.md` | Survey of the un-replayed chain against verifier limits, with an appended record of what it got right and wrong. |
+| `ENGINEERING_RULES.md` | The rules this project imposes on itself, each one earned by a specific failure. |
+| `worklog/` | Dated terse action logs. |
+
 ## Status
 
 **Current state (2026-08-22).** Block-level script verification (Stage D of
 `PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
 acceptance test: a from-scratch, full-signature-verification replay of the
-real mainnet archive (no `assumevalid`), **~576k of 963k blocks** so far with
-every fix deployed. **Seventeen real production incidents** have been found by
-that replay and fixed with regression tests pinned to real chain data
-(`LOG.md` has the narrative for each, including the mistakes).
+real mainnet archive (no `assumevalid`), **past height 727,000 of 963,000**
+with every fix deployed, currently sustaining ~15 blocks/s through the
+taproot era. **Twenty-four real defects** have been found and fixed with
+regression tests pinned to real chain data (`LOG.md` has the narrative for
+each, including the mistakes and the wrong diagnoses).
 
-The ones worth knowing: genesis was missing from the archive, so every
-buried soft fork activated one block late (a false-ACCEPT, and structurally
-invisible to a replay that only watches for rejects); two lost carries in
-the secp256k1 multiplies that ~2^-64 random testing could never have found;
-a shutdown path that had silently turned every `systemctl stop` into a
-SIGKILL; and, at the first segwit block, the discovery that the archive had
-been witness-stripped for the entire segwit era (`getdata` asked for
-`MSG_BLOCK`, and the merkle root cannot detect the difference) while this
-node had no BIP141 witness-commitment check to catch it. Re-fetching those
-~482k blocks from the local Core oracle then exposed the segwit era proper,
-one real spend at a time: the first P2WPKH spend in history (BIP143
-scriptCode was the witness program, a mistake the synthetic-vector generator
-shared), nested P2SH-wrapped segwit not being implemented at all, a
-4096-byte sighash buffer overrun by a 500-input transaction on threads glibc
-had given 2 MB of stack, a witness program left dangling into a reused
-buffer, an 8-item witness cap with no basis in consensus, and BIP342
-tapscript forbidding `OP_CHECKSIGVERIFY` -- an opcode it actually keeps.
+**Read `ASSESSMENT.md` before drawing conclusions from any of this.** The
+short version: this is a consensus *verification engine*, not a node — no
+mining, no PSBT, no wallets, no testnet, no light-client indexes, and a thin
+RPC surface. On the one primitive comparable like-for-like it is within ~1.2×
+of libsecp256k1, down from 5.5× two days ago; its end-to-end speed against
+Core has never been measured; and its consensus correctness is being actively
+established rather than established.
 
-The method that now finds these earliest is a census of the un-replayed
-chain against known verifier limits (`CHAIN_AHEAD_CENSUS.md`): it predicted
-the tapscript wall hours before the replay would have reached it, and a real
-Core-accepted fixture from the oracle confirmed it. The discipline that
-keeps the fixes honest is differential: every consensus change must fail on
-the old code and pass on the new against real chain data. That has twice
-overturned a confident inline diagnosis this week -- in both cases the first
-plausible explanation was a genuine bug that was not the cause.
+The defects worth knowing: genesis was missing from the archive, so every
+buried soft fork activated one block late (a false-ACCEPT, structurally
+invisible to a replay that only watches for rejects); two lost carries in the
+secp256k1 multiplies that ~2⁻⁶⁴ random testing could never have found; and,
+at the first segwit block, the discovery that the archive had been
+witness-stripped for the entire segwit era (`getdata` asked for `MSG_BLOCK`,
+and the merkle root cannot detect the difference) while this node had no
+BIP141 witness-commitment check to catch it. Re-fetching those ~482k blocks
+from a local Core oracle then exposed the segwit era one real spend at a
+time: the first P2WPKH spend in history, nested P2SH-wrapped segwit not
+implemented at all, a 4096-byte sighash buffer overrun by a 500-input
+transaction, an 8-item witness cap with no basis in consensus, BIP342
+tapscript forbidding `OP_CHECKSIGVERIFY` — an opcode it actually keeps — a
+600-byte stack buffer for an output the consensus rules do not bound, and the
+SysV stack ABI violated tree-wide, which had the script interpreter one log
+line away from crashing.
 
-Performance this week (`PERF_SCOPE.md`): `ecdsa_verify` 121 → ~39 µs
-(variable-time inverse, projective compare, GLV+wNAF; libsecp256k1 measures
-21.8 µs on the same CPU), UTXO lookups via an mmap run cache (kernel share
-31 % → 5 %), and end-to-end replay throughput **5.68×** over identical
-heights. A scratch
-Bitcoin Core instance is now part of the development path as an oracle
-and benchmark; chain hashes agree with it at every height checked. Next:
-the 4×64 field multiply (56 % of cycles), and a UTXO-set hash so Stage D
-can be proven byte-identical to Core's chainstate rather than just
-"no block rejected". `FEATURE_GAPS.md` is the honest list of what this
-node still does not do.
+**The most important thing the replay taught is what it cannot prove.**
+Several of those defects were reachable *only* by asking Core for the answer
+to constructed vectors, never by replaying the chain — because no such
+transaction exists in the chain, since Core-running miners never mined one. A
+clean full-chain replay would have run to tip with them still present. It
+proves the node accepts what the chain contains; it says nothing about what
+the node would accept that Core rejects. Five known defects were in that
+chain-splitting direction.
+
+Two methods do the finding. A **census** of the un-replayed chain against
+known verifier limits (`CHAIN_AHEAD_CENSUS.md`) predicted the tapscript wall
+hours before the replay reached it — though it also classified as "handled"
+a path that turned out to be broken, because it read for code presence rather
+than behaviour. A **differential corpus** against Core (`validation/`) asks
+Core for thousands of real and constructed vectors and compares; that is the
+method that has ever found a false accept.
+
+Performance (`PERF_SCOPE.md`, methodology and caveats included): `ecdsa_verify`
+121 → ~26 µs against libsecp256k1's 21.8 µs on the same CPU; the BIP143 sighash
+path **27.4×** and BIP341 **18.8×** on real blocks after removing an O(n³);
+UTXO lookups via an mmap run cache (kernel share 31 % → 3 %); end-to-end replay
+throughput **1.36× and rising** — quoted as a floor, because the two bands
+compared are 120,000 blocks apart in chain weight. Note that the component
+multipliers do **not** compose into the end-to-end figure: Amdahl caps each by
+its own share.
+
+Tooling that now guards the work: `make abi-check` (a whole-program SysV
+stack-alignment audit that would have caught the interpreter bug the day it
+landed), a test suite that is order-independent, concurrency-safe and
+identical in a fresh clone (and 2.7× faster in parallel), and guard-page
+bounds fuzzers on both sighash paths. `FEATURE_GAPS.md` is the honest list of
+what this node still does not do.
 
 **Delivered and verified:**
 - **SHA-256 core** (`asm/sha256.asm`) — passes the canonical FIPS-180-4 vectors
@@ -163,11 +196,12 @@ node still does not do.
   pool, not per-block thread spawns) to make a full-archive replay
   affordable. **In progress**: `bmc-bitcoind.service` is running a
   from-scratch replay of the real chain against this path, currently past
-  height 576,000. **Seventeen** real bugs it has surfaced so far — from an
+  height 727,000. **Twenty-four** real defects it has surfaced so far — from an
   LSM compaction manifest-ordering bug and an interpreter `OP_SIZE`
   register-width bug alongside a wholly-missing `OP_SHA1`, through the
   witness-stripped archive and the segwit-era spend bugs underneath it, to
-  BIP342 tapscript rejecting `OP_CHECKSIGVERIFY` — were root-caused and
+  BIP342 tapscript rejecting `OP_CHECKSIGVERIFY`, to the SysV stack ABI
+  being violated tree-wide — were root-caused and
   fixed, each with a regression test proven to fail against the pre-fix
   code on real chain data. See `LOG.md` for the narratives,
   `PLAN_SCRIPT_VERIFY.md`'s Stage D table for the one-line-per-wall index,
