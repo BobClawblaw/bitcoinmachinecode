@@ -548,6 +548,339 @@ download leg (they do not interleave), so wall-clock to tip includes those
 pauses — roughly 20 minutes per 58k blocks fetched from the local oracle at
 ~30 blk/s.
 
+### 5.2 The field rewrite — BUILT on branch `fe-repr`, not merged
+
+Scoped in §5 as "5×52 lazy reduction", targeting `fe_mul` from ~290 to ~70 Ir
+and the verify from ~39 µs to the low 20s. **What shipped is not 5×52.** The
+first measurement of the session invalidated the premise, so the plan changed;
+the numbers that forced that are below, and they are the main deliverable of
+this section along with the code.
+
+#### The premise that was wrong
+
+§4.6 recorded, from public knowledge rather than measurement, that
+"libsecp256k1's 5×52-limb lazy-reduction `fe_mul` is ~4–5× cheaper per call".
+Built libsecp256k1's own `bench_internal` and, separately, a single process
+linking libsecp's field code **and** this repo's `secp256k1_fe.o` so both run
+in one harness under one load (`scratch hh.c`, CPU-time, min-of-25):
+
+| ns per call, min-of-25 | this repo (main `cb20051`) | libsecp256k1 5×52 | ratio |
+|---|---|---|---|
+| `fe_mul`, serial dependency chain | 12.87 | 9.36 | 1.38× |
+| `fe_mul`, 4 independent chains | 10.46 | 4.33 | **2.42×** |
+| `fe_sqr`, serial chain | 13.12 | 8.20 | 1.60× |
+
+So the representation gap was **2.4×, not 4–5×**, and only in the
+throughput-bound regime. Two further facts settled the direction:
+
+- libsecp256k1 ships **no x86-64 field assembly at all** (`src/asm/` contains
+  only `field_10x26_arm.s`); its 5×52 `fe_mul` is `__int128` C. It was beating
+  hand-written assembly.
+- Probing this CPU directly (scratch `uarch.asm`, serial-`add` clock
+  reference): `mulx` 0.664 cyc/op throughput, `adcx`+`adox` on two interleaved
+  chains 0.501 cyc/op, achieved clock 5.48 GHz. A 4×64 `fe_mul` needs 21
+  multiplies; libsecp's 4.33 ns is 23.7 cycles, i.e. libsecp's 25-multiply
+  5×52 kernel was already sitting near the multiplier port limit. **A 4×64
+  kernel that also sat near that limit would be at parity or better** — with
+  no representation change, no lazy-reduction magnitude bookkeeping, and no
+  edit to `secp256k1_point.asm` (84 `fe_*` sites), `secp256k1_point_ct.asm`
+  (59), `bitcoin_pubkey.asm`, `bitcoin_keys.asm`, `secp256k1_ecdsa.asm`,
+  `secp256k1_schnorr.asm`, `secp256k1_taproot.asm` or `wallet_msgsign.c`.
+
+Diagnosis of the real problem: `main`'s `fe_mul` was 290 instructions for
+work that needs ~110. It materialised each row `a_i*B` into its own 40-byte
+stack buffer, merged the four buffers with memory-to-memory `add`/`adc`, then
+reduced through memory using `mul` (which forces rax/rdx) with three-
+instruction `xor edx,edx / add / adc rdx,0` carry captures. **The
+representation was never the cost; the constant factor was.**
+
+**Choice made: keep 4×64 canonical, rewrite the kernels.** Stated plainly
+because it is a deviation from the scope: this trades ~20 % of the remaining
+theoretical field gain for a change that touches ONE file, keeps every
+existing test applicable unchanged, and is provable limb-for-limb against the
+implementation that has been validating the chain. On consensus code that
+trade is not close.
+
+#### What changed (`asm/secp256k1_fe.asm`, one file, no API change)
+
+- **`fe_mul`** — same algorithm, same two-fold reduction, zero memory traffic.
+  The 512-bit product and both folds live in registers (15 of the 15 usable
+  GPRs); every carry is captured by ADCX/ADOX on two interleaved chains
+  instead of by an `add`/`adc` pair. 21 multiplies, ~36 ADX ops.
+- **`fe_sqr`** — was `jmp fe_mul`. Now a dedicated square: 10 multiplies
+  instead of 16 (six off-diagonal products accumulated once, doubled with one
+  shift-left chain, then the four diagonal squares on a single ripple carry).
+  Squaring is ~40 % of the field multiplies on the verify path.
+- **`fe_add` / `fe_sub`** — rewritten around the identity `p = 2^256 - C`, so
+  "subtract p" is "add C" and the carry out of `v + C` *is* the predicate
+  `v >= p`. No `P_LIMBS` load, no four-limb comparison, and no callee-saved
+  spills at all. **Bit-identical to the previous code on every 512-bit input
+  pair, in range or not** — "add p" and "subtract C" are the same operation on
+  wrapping 4-limb arithmetic — which is why this was safe to do without first
+  proving no caller ever passes a non-canonical value.
+- The reduction has exactly **one** implementation: `fe_sqr` jumps to
+  `fe_mul.reduce` (documented entry contract) rather than carrying a copy.
+  That code has already produced one consensus bug; two copies could drift.
+
+| instructions in the function | before | after |
+|---|---|---|
+| `fe_mul` | 290 | 113 |
+| `fe_sqr` | 291 (`jmp fe_mul`) | 105 (56 + the 49-instruction shared reduce) |
+| `fe_add` | 48 | 31 |
+| `fe_sub` | 36 | 19 |
+
+Callgrind on a 100,000-call `fe_mul` chain: **296 → 112 Ir/call.**
+
+#### Measured
+
+`tests/bench_fe` — new in-tree microbenchmark. CPU time
+(`CLOCK_THREAD_CPUTIME_ID`), min-of-25 rounds of 200,000 calls, spread
+printed; the same discipline commit `879554b` applied to
+`test_scalarmul_ct`, and mandatory here because the live replay was consuming
+~10 of 32 threads throughout. Two regimes are reported because they bracket
+the real cost: a serial dependency chain (latency) and four independent chains
+(throughput — closer to what point arithmetic achieves).
+
+| ns per call | before | after | speedup | libsecp256k1 |
+|---|---|---|---|---|
+| `fe_mul` latency chain | 12.87 | **8.53** | 1.51× | 9.36 |
+| `fe_mul` 4 indep. chains | 10.46 | **5.52** | **1.90×** | 4.33 |
+| `fe_sqr` latency chain | 13.12 | **7.67** | 1.71× | 8.20 |
+| `fe_sqr` 4 indep. chains | 10.73 | **4.68** | **2.29×** | — |
+| `fe_add` latency chain | 2.20 | 2.20 | 1.00× (48→31 instructions) | ~0 (inlined) |
+| `fe_sub` latency chain | 1.68 | **1.28** | 1.31× | — |
+
+Head-to-head again afterwards, both implementations in ONE process under one
+load (the same `hh.c` harness that produced the "premise was wrong" table):
+
+| ns per call, min-of-25 | this branch | libsecp256k1 5×52 | |
+|---|---|---|---|
+| `fe_mul`, serial chain | **8.92** | 9.65 | **1.08× faster** |
+| `fe_sqr`, serial chain | **7.79** | 8.21 | **1.05× faster** |
+| `fe_mul`, 4 indep. chains | 5.76 | 4.48 | 1.28× slower |
+
+So the 4×64 kernel now **beats** libsecp's 5×52 on latency and remains 1.28×
+behind on throughput. That residual is precisely what lazy reduction buys and
+this change deliberately did not take: libsecp's `fe_mul` returns a
+non-canonical result of bounded magnitude, skipping the conditional subtract,
+and its `fe_add` is five adds with no reduction at all (measured at 0.000 ns
+because it inlines to nothing) against our 2.31 ns canonical add. Closing
+that last 1.28× is what a real 5×52 lazy-reduction conversion would be for —
+and it is now worth ~11 % of a verify, not the 2× the original scope assumed.
+
+Spreads were tight: `fe_mul` after, 25 rounds, min 5.515 / median 5.646 /
+max 7.700 ns. `fe_add`'s *latency* is unchanged — it is a serial
+load→add→cmov→store chain and always was — but it costs 35 % fewer
+instructions, which is what its share of a throughput-bound verify responds to.
+
+`tests/bench_ecdsa`, upgraded to CPU-time min-of-N in the same commit,
+alternating old and new binaries in one session so drift lands on both:
+
+| µs / verify, min-of-7 rounds x 20,000 | | /s/core |
+|---|---|---|
+| `main` `cb20051` field, best of 3 runs | 35.28 | 28,342 |
+| **this branch, best of 3 runs** | **25.66** | **38,964** |
+| libsecp256k1 `bench ecdsa_verify`, best of 3 | 20.6 | ~48,500 |
+
+**`ecdsa_verify` 1.37×; gap to libsecp256k1 1.71× → 1.25×.** The §5 target was
+"low 20s"; 25.7 µs is close but short of it, and the honest reading is that
+the remaining gap is no longer mostly field representation — after this
+change, a callgrind attribution of one verify puts `fe_mul`(+`fe_sqr`) at
+61.7 % of retired instructions, `fe_add` at 9.3 %, `sc_mul` 6.7 %, `fe_sub`
+6.6 %, and the whole verify at 415 k Ir / 140 k cycles (IPC 2.95). The next
+lever is the G-side comb table (§4.5), not another field pass.
+
+#### Correctness — what was actually proved
+
+`tests/test_fe_repr.c` (new, in the `test` target) plus
+`validation/fe_oracle.py` (new) and `tests/fe_ref.asm` (new: a FROZEN copy of
+`main`'s field, symbols suffixed `_ref` — the implementation that replayed the
+chain to height ~575,000, including the incident #7 fixes). **39,266,927
+checks, 0 failures, 1.3 s.**
+
+1. **Python ground truth, explicit.** 1,600 `(a, b, a+b, a-b, a*b, a², a⁻¹)`
+   tuples from Python big integers. Shares nothing with the assembly.
+2. **Python ground truth, exhaustive over the structured space.** A 1,547-value
+   structured family — every `2^i`, `2^i±1`, `p-2^i`, `p-2^i±1` for all 256
+   bit positions, `0..7`, `p-1..p-8`, `C-1/C/C+1/2C/p-C/p-2C`, and per-limb
+   saturation patterns — crossed with itself: **2,393,209 ordered pairs**,
+   `a*b`, `a+b` and `a-b` for each, folded into one digest that the harness
+   recomputes from the assembly and compares to Python's. Every limb boundary
+   against every other limb boundary.
+3. **Differential vs the frozen `fe_ref`**, limb-exact: the same 2,393,209
+   structured pairs, plus 4,000,000 random in-range pairs
+   (mul/add/sub/sqr) — 0 differences.
+4. **Non-canonical input.** 4,000,000 full-range `[0, 2^256)` pairs plus a
+   structured sweep with `p` deliberately added to one operand, proving the
+   `fe_add`/`fe_sub` bit-identity claim on inputs neither implementation
+   defines a result for. 0 differences.
+5. **Algebraic identities** independent of both implementations: 800,000 of
+   `(a+b)-b == a`, `a*(b+c) == a*b+a*c`, `a*a⁻¹ == 1`, `fe_sqr(a) ==
+   fe_mul(a,a)`, and canonicality of every result.
+6. **Incident #7's exact operand** is pinned in this file as well as in
+   `test_mul_carry_regression`: `(p-2^31)² == 2^62`.
+
+**Sensitivity proven by mutation, both ways.** Eight deliberate carry bugs
+were injected and every one is caught: dropping the pending CF at the end of
+phase-1 row 3; deleting the fold-2 carry correction (literally re-introducing
+incident #7); dropping the fold-1 carry absorb; deleting the bit that
+`fe_sqr`'s doubling chain carries into T7; removing `fe_add`'s carry fold;
+flipping `fe_sub`'s correction sign; removing `fe_mul`'s canonicalisation;
+and moving one `fe_sqr` diagonal term a limb too low. The pre-existing
+`tests/test_fe` **misses** the fold-2 mutation, and
+`test_mul_carry_regression` misses both `fe_sqr` mutations — which is the
+argument for the new file existing.
+
+Whole-stack equivalence, out of tree: a digest harness ran the 1,024
+libsecp256k1-signed fixtures × 13 mutated variants, 200,000 random verify
+tuples, and a 200,000-step `fe_inv`/`fe_mul`/`fe_sqr` chain **digesting every
+intermediate**, built twice — once against the new field, once against
+`main`'s. All three digests identical (`717fb4cf77f2d725`,
+`a04995f0966e4025`, `48249430d5520df1`). In tree, the existing
+`tests/test_ecdsa_inverse` campaign (1,001,023 `sc_inv_var` cases, 6,008
+`ecdsa_x_eq_mod_n`, 113,315 verify-vs-frozen-reference) and
+`test_ecdsa_glv_switch` (30,240 three-way) pass unchanged, as does
+`test_scalarmul_ct` — **the constant-time guard, which matters because
+`fe_mul`'s canonicalisation stayed branch-free `cmov` rather than becoming a
+conditional jump.** Nothing on the signing path became variable-time; no
+variable-time optimisation was introduced at all in this change.
+
+**One hazard this change created, and how it was closed.** The new `fe_mul`
+reuses `rsi` as the fold's fifth limb and the new `fe_add` reuses `rsi`/`rdx`
+as canonicalisation scratch. Both are caller-saved under SysV so this is
+legal, but the OLD `fe_add`/`fe_sub`/`fe_mul` happened to leave `rsi` intact,
+and 163 hand-written call sites across `secp256k1_point.asm` (78),
+`secp256k1_point_ct.asm` (54), `bitcoin_pubkey.asm` (10), `bitcoin_keys.asm`
+(6), `secp256k1_schnorr.asm` (6), `secp256k1_taproot.asm` (6) and
+`secp256k1_ecdsa.asm` (3) could have been relying on that accident. A static
+scan found no site reading `rsi`/`rdx` after an `fe_*` call before writing it,
+and then the point was settled dynamically: a build with EVERY caller-saved
+register (`rsi, rdx, rcx, rdi, r8-r11`) deliberately poisoned with `0xDEAD…`
+at every `ret` in `secp256k1_fe.asm` passes `test_fe`, `test_point`,
+`test_point_inf`, `test_addm`, `test_add`, `test_scalarmul`,
+`test_glv_pointmul`, `test_ecdsa`, `diff_add_ct_homog`, `test_scalarmul_ct`,
+`test_mul_carry_regression`, `test_schnorr`, `test_pubkey` and `test_keys`
+unchanged. Nothing depends on the old register-preservation accident.
+
+Not verified: no replay of real chain data was run against this branch (the
+live daemon is mid-replay and is not to be touched), so the deploy gate of
+§4's preamble still applies.
+
+### 5.3 AVX-512 IFMA — evaluated, measured, and NOT built
+
+libsecp256k1 ships no IFMA field backend, so this is where this project could
+exceed it rather than approach it. Per the scoping rule, the CPU was measured
+before anything large was built.
+
+**Instruction-level probes** (scratch `uarch.asm`/`uarch.c`, min-of-15,
+CPU-time, clock established by a serial `add rax,1` chain = exactly 1 cyc/op):
+
+| | cyc/op | note |
+|---|---|---|
+| achieved clock | — | **5.478 GHz** under the live replay |
+| `mulx`, independent | 0.664 | ~1.5/cycle |
+| `adcx`+`adox`, two interleaved chains | 0.501 | 2/cycle — the fe_mul design target |
+| `vpmadd52luq` zmm, 8 independent accumulators | **0.550** | ~1.8/cycle × 8 lanes |
+| `vpmadd52luq` zmm, serial chain | 4.008 | latency 4 cycles |
+| `vpmadd52luq` ymm | 0.557 | identical to zmm — no 512-bit penalty |
+
+**Downclocking: there is none worth modelling on this part.** Immediately
+after a sustained AVX-512 burst the scalar clock read 5.469 GHz against a
+5.478 GHz baseline. Under **eight** concurrently running sustained IFMA hogs
+(on top of the replay) the scalar clock moved 5.429 → 5.305 GHz (−2.3 %,
+explicable by the added load alone) and scalar `fe_mul` was unchanged:
+8.686 → 8.677 ns latency, 5.675 → 5.791 ns throughput. This is the Zen 5
+answer, and it is not Intel's.
+
+**A real 8-way kernel was then built and validated**, not extrapolated:
+5×52 limbs, one field element per lane, 25 lane-parallel products as 50
+`VPMADD52{LU,HU}Q`, a ten-limb carry normalisation, and the `2^260 ≡ C·2^4`
+fold — 63 IFMA and ~91 other vector instructions. Checked against this repo's
+scalar `fe_mul` over 20,000 chained rounds × 8 lanes = 160,000 products, with
+the structured shapes (`0`, `1`, `p-1`, `p-2^31`, `2^255`, `2^64-1`, a
+limb-2-all-ones value, `p-2`) pinned into specific lanes: identical.
+
+| ns per field multiply | |
+|---|---|
+| scalar `fe_mul` after §5.2, 4 indep. chains | 5.52 |
+| **IFMA 8-way, 4 indep. chains** | **1.343** (min-of-15; med 1.446, max 1.722) |
+| IFMA 8-way, single chain | 2.619 |
+
+**4.11× on the field multiply, and the hardware objection does not apply.**
+One trap worth recording: with `acc[10]` written as a loop over an array, gcc
+kept the accumulators on the stack and the kernel measured **4.28 ns** — 3.2×
+worse than the unrolled version, and a number that would have produced the
+wrong verdict. The measurement is only valid because the disassembly was
+checked (27 `vmovdqa64` and 6 `vpmadd52` in a loop, versus 63 `vpmadd52` and
+no spills after unrolling).
+
+**Verdict: a genuine win at the kernel, correctly deferred as a project.**
+Not because of the silicon — the silicon is willing — but because of what
+lane-parallelism costs *above* the kernel:
+
+- Every consumer must be rewritten 8-wide. `fe_add`/`fe_sub` become nearly
+  free, but the point formulas, the GLV ladder, the wNAF digit handling and
+  the scalar side are a **second complete implementation of the EC stack**,
+  in vector form, on the consensus path — beside the scalar one, which cannot
+  be retired because odd-sized batches still need it.
+- The per-lane table read is solvable but not free: each lane has its own
+  `Q`, so the eight w=5 table entries for a lane cannot be packed into one
+  zmm and selected with a single `vpermq`. A table read becomes ~8 blends per
+  limb (or a `vpgatherqq`, which is slow on Zen) — with the globalz table's
+  two coordinates × 5 limbs that is ~80 vector ops per windowed add, on top
+  of the add itself. Estimated, not measured.
+- **The batching point does not exist yet for most of the remaining work.**
+  §4.2 already recorded this: legacy-script inputs — nearly all pre-2017
+  history — reach `ecdsa_verify` synchronously from inside the interpreter
+  because `OP_CHECKSIG`'s result steers script control flow. Only the
+  witness-v0 direct calls and the `txvb_verify_all` worker slices offer a
+  clean place to collect eight independent verifications.
+
+So the honest ordering is: **the deferred-verify restructure is the
+prerequisite, and it is worth doing on its own merits** (it also unlocks
+§4.2 B′ Montgomery batching). IFMA is what you build *after* that exists, and
+only if a profile at that point still says the field multiply is the wall.
+Recorded here with the numbers so the next scoping does not have to
+re-measure the CPU.
+
+Ceiling, for whoever picks this up: if the whole 74 % crypto share went 4×,
+Amdahl gives 1/(1 − 0.74·0.75) = **2.3×** on replay — real, but a second EC
+implementation's worth of consensus risk for it.
+
+### 5.4 Projected effect on replay throughput — and the Amdahl bound
+
+From §4.6's post-deploy profile: `fe_mul` (which then included every
+`fe_sqr`, since `fe_sqr` was `jmp fe_mul`) was **55.9 %** of *all* replay
+cycles, `fe_add` 4.1 %, `fe_sub` 3.3 %; crypto+hashing together 74.0 %.
+
+**State the bound first: even an infinitely fast `fe_mul` only removes its own
+55.9 %**, capping the whole lever at 1/(1 − 0.559) = **2.27×** on replay. Every
+number below is a fraction of that ceiling, not of the runtime.
+
+Applying the measured throughput-regime speedups to their measured shares:
+
+| component | share of all cycles | speedup | cycles removed |
+|---|---|---|---|
+| `fe_mul` + `fe_sqr` | 55.9 % | 1.90× (sqr better, 2.29×) | 26.5 % |
+| `fe_add` + `fe_sub` | 7.4 % | ~1.4× (instruction count 84→50) | 2.1 % |
+| everything else | 36.7 % | 1.00× | 0 |
+
+→ 1/(1 − 0.286) = **≈ 1.40× on replay block throughput**, i.e. ~47 % of the
+theoretical `fe_mul` headroom captured. That projection is corroborated
+rather than assumed: the independently measured end-to-end `ecdsa_verify`
+improvement is **1.37×**, and `ecdsa_verify` is the dominant consumer of
+those same cycles.
+
+Against §5.1's measured 10.0 blk/s in the 537,616 → 575,833 band, that
+projects **≈ 14 blk/s** in the same band. Caveats, stated because this number
+will be quoted: the 55.9 % share was measured at height ~390 k and block
+composition keeps shifting toward more signature work per block (which, if
+anything, makes the crypto share *larger* and the projection conservative);
+the projection assumes the replay is CPU-bound, which §4.6 supports (kernel
+5.1 %); and no replay was actually run on this branch, so this is a
+projection from two measurements, not an observation.
+
+
 ## 6. Beyond parity — what would actually beat Bitcoin Core
 
 Scoped 2026-08-22 evening. Sections 1-5 aim at *parity* with libsecp256k1.
