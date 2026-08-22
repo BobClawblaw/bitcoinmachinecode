@@ -448,7 +448,12 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
         }
         if (flags & TXV_FLAG_WITNESS) {
             u32 wver=0, wplen=0; const u8* wprog=0; int wrapped=0;
-            int cls = sv_classify_segwit(spk, (u32)spklen, g_txv_in[i].scriptSig, g_txv_in[i].scriptSiglen,
+            /* Classify against the STABLE per-input copy, not `spk` --
+             * utxo_lsm_get's pointer is only valid until the next call, and
+             * the returned wprog (stored below, read in pass 1b) would
+             * otherwise aim into that transient buffer. Same bug class as
+             * the block path's wprog_off (incident 482566 tx 1499). */
+            int cls = sv_classify_segwit(g_txv_in[i].spk, (u32)spklen, g_txv_in[i].scriptSig, g_txv_in[i].scriptSiglen,
                                          &wver, &wprog, &wplen, &wrapped);
             if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; return 0; }
             if (cls > 0) {
@@ -675,7 +680,15 @@ typedef struct {
     const u8* outpoint;
     const u8* scriptSig; u32 scriptSiglen;
     const u8* wit[TXV_MAX_WIT_ITEMS]; u32 witlen[TXV_MAX_WIT_ITEMS]; u32 nwit;
-    const u8* wprog; u32 wproglen; u8 wrapped;   /* TXV_SHAPE_WV0: the witness program (spk+2, or the P2SH redeemScript's program) */
+    const u8* wprog; u32 wproglen; u8 wrapped;   /* TXV_SHAPE_WV0: the witness program. wrapped: a pointer into the
+                                  * scriptSig's redeemScript (tx bytes, stable for the whole pass).
+                                  * native (!wrapped): wprog is NULL and wprog_off below is the program's
+                                  * byte offset WITHIN the spk -- the raw sv_classify_segwit pointer
+                                  * aimed into utxo_lsm_get's transient buffer ("only valid until the
+                                  * next call"), which a later Phase-1 resolve overwrites; incident
+                                  * 482566 tx 1499 read another entry's hash160 through it. Resolve as
+                                  * (g_spk_pool.buf + spk_off + wprog_off), same discipline as spk_off. */
+    u32 wprog_off;
     u64 value;
     u64 spk_off; u32 spklen;     /* spk_off is a byte OFFSET into g_spk_pool
                                   * (see bytepool_alloc's own comment), NOT a
@@ -770,7 +783,8 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
     const u8* spk = g_spk_pool.buf + in->spk_off;
     switch (in->shape){
     case TXV_SHAPE_WV0: {
-        int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
+        const u8* wprog = in->wprog ? in->wprog : spk + in->wprog_off;
+        int err = sv_verify_witness_v0(wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
         if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
@@ -1026,7 +1040,11 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
             if (cls > 0) {
                 if (!wrapped && in->scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
                 if (wver == 0) {
-                    in->shape = TXV_SHAPE_WV0; in->wprog = wprog; in->wproglen = wplen; in->wrapped = (u8)wrapped;
+                    in->shape = TXV_SHAPE_WV0; in->wproglen = wplen; in->wrapped = (u8)wrapped;
+                    if (wrapped) { in->wprog = wprog; in->wprog_off = 0; }          /* redeemScript: tx bytes, stable */
+                    else         { in->wprog = 0; in->wprog_off = (u32)(wprog - spk); } /* program lies inside the spk:
+                                  * store an offset and re-derive from the POOL copy at verify time --
+                                  * `spk` here is utxo_lsm_get's transient buffer (see spk_off's comment) */
                     if (wplen == 20 && in->nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; *fail_tx_index = in->tx_index; goto fail; }
                     if (wplen == 32 && in->nwit < 1) { *reason = "p2wsh needs a witnessScript"; *fail_tx_index = in->tx_index; goto fail; }
                 } else {
