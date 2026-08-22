@@ -323,3 +323,4 @@ asm/tests/test_segwit_real
 asm/tests/test_segwit_coverage
 asm/tests/test_txvb_wprog_stable
 asm/tests/test_tapscript_scale
+asm/tests/test_dersig_encoding

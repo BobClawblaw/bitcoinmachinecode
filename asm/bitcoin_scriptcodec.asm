@@ -472,6 +472,100 @@ cast_to_bool:
     ret
 
 ; ============================================================================
+; der_sig_strict(rdi=sig, rsi=siglen) -> rax = 1 valid / 0 invalid
+;
+; Bitcoin Core's IsValidSignatureEncoding (src/script/interpreter.cpp), the
+; BIP66 strict-DER rule, transcribed check-for-check IN CORE'S OWN ORDER:
+;
+;     if (sig.size() < 9) return false;
+;     if (sig.size() > 73) return false;
+;     if (sig[0] != 0x30) return false;
+;     if (sig[1] != sig.size() - 3) return false;
+;     unsigned int lenR = sig[3];
+;     if (5 + lenR >= sig.size()) return false;
+;     unsigned int lenS = sig[5 + lenR];
+;     if ((size_t)(lenR + lenS + 7) != sig.size()) return false;
+;     if (sig[2] != 0x02) return false;
+;     if (lenR == 0) return false;
+;     if (sig[4] & 0x80) return false;
+;     if (lenR > 1 && (sig[4] == 0x00) && !(sig[5] & 0x80)) return false;
+;     if (sig[lenR + 4] != 0x02) return false;
+;     if (lenS == 0) return false;
+;     if (sig[lenR + 6] & 0x80) return false;
+;     if (lenS > 1 && (sig[lenR + 6] == 0x00) && !(sig[lenR + 7] & 0x80)) return false;
+;     return true;
+;
+; The argument is the FULL scriptSig/witness push, i.e. DER + the trailing
+; one-byte SIGHASH type -- that byte is why the length descriptor is
+; size-3 and not size-2, and why the minimum is 9 rather than 8.
+;
+; IN-BOUNDS ARGUMENT for every load, in the order the checks run:
+;   sig[0..8]        siglen >= 9 by the first check.
+;   sig[5+lenR]      guarded immediately above by 5+lenR < siglen.
+;   sig[lenR+4]      lenR+4 < 5+lenR < siglen.
+;   sig[lenR+6]      reached only after lenS != 0 and lenR+lenS+7 == siglen,
+;                    so lenR+6 = siglen-lenS-1 <= siglen-2.
+;   sig[lenR+7]      reached only when lenS > 1, so lenR+7 <= siglen-2.
+; Note that Core's own ordering is what makes this safe: the lenS==0 test
+; must precede the sig[lenR+6] load, and it does, in both.
+;
+; Leaf, no stack frame, no callee-saved registers touched (clobbers only
+; rax/rcx/r8/r9), so bitcoin_interp.asm can call it from inside its checksig
+; helpers without disturbing their live r12-r15/rbx.
+; ============================================================================
+global der_sig_strict
+der_sig_strict:
+    cmp   rsi, 9
+    jb    .ds_bad
+    cmp   rsi, 73
+    ja    .ds_bad
+    cmp   byte [rdi], 0x30
+    jne   .ds_bad
+    movzx eax, byte [rdi+1]
+    lea   rcx, [rsi-3]              ; siglen >= 9, so no wrap
+    cmp   rax, rcx
+    jne   .ds_bad
+    movzx r8d, byte [rdi+3]         ; lenR
+    lea   rax, [r8+5]               ; 5 + lenR
+    cmp   rax, rsi
+    jae   .ds_bad
+    movzx r9d, byte [rdi+rax]       ; lenS = sig[5+lenR]
+    lea   rax, [r8+r9+7]
+    cmp   rax, rsi
+    jne   .ds_bad
+    cmp   byte [rdi+2], 0x02
+    jne   .ds_bad
+    test  r8, r8                    ; lenR == 0
+    jz    .ds_bad
+    test  byte [rdi+4], 0x80        ; R negative
+    jnz   .ds_bad
+    cmp   r8, 1                     ; excess padding on R
+    jbe   .ds_r_ok
+    cmp   byte [rdi+4], 0x00
+    jne   .ds_r_ok
+    test  byte [rdi+5], 0x80
+    jz    .ds_bad
+.ds_r_ok:
+    cmp   byte [rdi+r8+4], 0x02
+    jne   .ds_bad
+    test  r9, r9                    ; lenS == 0
+    jz    .ds_bad
+    test  byte [rdi+r8+6], 0x80     ; S negative
+    jnz   .ds_bad
+    cmp   r9, 1                     ; excess padding on S
+    jbe   .ds_ok
+    cmp   byte [rdi+r8+6], 0x00
+    jne   .ds_ok
+    test  byte [rdi+r8+7], 0x80
+    jz    .ds_bad
+.ds_ok:
+    mov   eax, 1
+    ret
+.ds_bad:
+    xor   eax, eax
+    ret
+
+; ============================================================================
 ; check_minimal_push(opcode, pushlen, data_ptr) -> rax = 0/1  (port of Core)
 ;   1 = the push is minimal for the given data/opcode.
 ; ============================================================================
