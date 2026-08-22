@@ -1076,3 +1076,177 @@ length rather than forming `q + sl` first (a wire-derived length near 2^64
 overflows the pointer into a comparison that passes). The `cap` on
 `sw_ser_txout` is a consensus-safety bound, not a policy one, and must
 survive in whatever replaces it.
+
+## 8. Lever 1 built and measured — single-pass BIP143 precompute, 2026-08-22
+
+§7's lever 1 is implemented (`asm/bitcoin_segwit.c`, branch
+`bip143-precompute`). This section is the measurement; the design is in the
+file's own comments and in `LOG.md`.
+
+**What it does.** One bounded pass over the transaction records the offset of
+every input and every output; `sw_prevout`/`sw_seq` become array indexes, and
+the CTxOut serialization disappears entirely because a CTxOut's BIP143
+encoding *is* its wire encoding — so `hashOutputs` is a `sha256d` over a
+contiguous slice of the transaction, in place, with no copy. The walks
+`read_cs` was called from are gone, and so are the per-iteration bounds §7's
+amendment measured at +16%: the loop they guarded no longer exists.
+
+### 8.1 Microbenchmark — `tests/bench_segwit_sighash`
+
+New and permanent (`make tests/bench_segwit_sighash`), `-O2`, CPU time
+(`CLOCK_PROCESS_CPUTIME_ID`), min of 15 runs, both builds back to back.
+
+| shape | tx size | before | after | factor |
+|---|---|---|---|---|
+| 1 in / 2 out | 189 B | 0.3960 µs | **0.3718 µs** | 1.07× |
+| 2 in / 2 out | 304 B | 0.4364 µs | **0.4052 µs** | 1.08× |
+| 100 in / 5 out | 11,667 B | 16.830 µs | **2.510 µs** | 6.7× |
+| 1,372 in / 100 out | 160,894 B | 2.633 ms | **30.57 µs** | 86× |
+| 2 in / 3,000 out | 93,244 B | 5.115 ms | **42.14 µs** | 121× |
+
+Spread (min / median / max) on the two extremes: before, 2.633 / 2.640 /
+2.652 ms and 5.115 / 5.134 / 5.297 ms; after, 30.57 / 30.72 / 30.87 µs and
+42.14 / 42.19 / 42.40 µs. The 1,372-input row is §7's shape; its "before" min
+of 2.63 ms is consistent with incident #21's 2.84 ms on a busier machine.
+
+**The common case is not pessimised** — that was the thing to check, because
+an asymptotic win that cost the 1- and 2-input shapes would be a bad trade on
+this chain. Both are slightly *faster*: even at two inputs the old code walked
+the input list twice per aggregate hash.
+
+### 8.2 The measurement that matters — real blocks at the profiled height
+
+The microbenchmark says the asymptote moved; it does not say what the replay
+will feel. So: 20 real mainnet blocks, heights 616,980–617,018 — the exact
+window §7 profiled — pulled from the Core oracle, with every one of their
+**53,400 witness inputs** driven through `segwit_v0_sighash` (taproot
+activates at 709,632, so at these heights every witness input is segwit v0).
+CPU time, min of 9:
+
+| | total | per witness input |
+|---|---|---|
+| before | 5,735.90 ms (med 5,765.87, max 6,913.13) | 107.41 µs |
+| after | **209.00 ms** (med 212.54, max 218.50) | **3.91 µs** |
+
+**27.4× on the real workload.**
+
+`read_cs` call counts over the same 20 blocks, from an instrumented build —
+this is what apportions §7's 22.44%:
+
+| | BIP143 sighash path | `strip_witness` (1× per tx) | total |
+|---|---|---|---|
+| before | 4,339,573,177 | 437,615 | 4,340,010,792 |
+| after | 32,451,774 | 437,615 | 32,889,389 |
+
+**131.9× fewer `read_cs` calls.** The middle column is why it is here:
+`strip_witness` also calls `read_cs`, runs once per transaction, and is *not*
+changed by this work — and it is 0.010% of the old total. So essentially all
+of §7's `read_cs` share is the BIP143 aggregate hashes, and essentially all of
+it goes.
+
+### 8.3 End-to-end projection, and the Amdahl bound stated
+
+§7's shares at height ≈617,000: `read_cs` 22.44% + `sw_seq` 5.92% +
+`sw_prevout` 5.71% = **34.07%** of all replay cycles.
+
+**Amdahl ceiling: 1 / (1 − 0.3407) = 1.517×.** Nothing in this change can beat
+that, because 65.93% of the profiled cycles are untouched by it.
+
+Residual, two ways:
+- from the whole-function measurement (27.4×): 34.07 / 27.4 = 1.24% →
+  **1.489×**;
+- from the `read_cs` counts (131.9×, with `sw_seq`/`sw_prevout` deleted
+  outright rather than reduced): ≈0.2% → **1.512×**.
+
+So the projection is **1.49–1.51×** — within a couple of points of the
+ceiling, and the gap between the two methods is smaller than the uncertainty
+in the share itself.
+
+**Independent corroboration that the benchmark drives the profiled work.**
+The old path costs 107.41 µs per witness input and §1 measured `ecdsa_verify`
+at 120.9 µs, so sighashing cost about as much as the signature check. 96.4% of
+that sighash cost is removed here, which predicts the three symbols at
+**45.3%** of that pair's cycles. §7's profile puts them at 34.07% against
+42.07% for the field/EC symbols (`fe_mul.reduce`, `fe_mul`, `fe_add`,
+`fe_sub`, `point_double`, `fe_sqr`), i.e. **44.75%**. Two independent routes,
+0.6 points apart.
+
+**What this projection is not.** §7 exists because a projection built on a
+227,000-block-stale profile said 1.40× and delivered 1.15×. The share above is
+measured at height ≈617,000 and the replay has moved on; blocks further up the
+chain carry different transaction shapes, and past 709,632 they carry taproot
+inputs that do not use this code at all. **Re-profile at the height the replay
+is actually at before believing 1.49×.** The number that does not depend on
+the share, and will hold at any height, is the 27.4× on the component.
+
+Also excluded: this is a userspace-cycles projection. §7's DSO split was
+bitcoind 92.3% / libc 6.0% / kernel 1.8%, so there is little else in the
+sample, but storage I/O behaves differently under different cache states.
+
+No post-change profile of the daemon was taken. The change is not deployed —
+the deployment rule at the top of this file says nothing lands until the
+replay reaches tip clean — and `perf_event_paranoid` is 4 on this host, which
+blocks `perf` for a non-root user; changing a system setting to take a profile
+was out of scope.
+
+### 8.4 One real behaviour change, and it is toward Core
+
+Hashing each CTxOut in place instead of re-serializing it is only equivalent
+if the transaction's compactsizes are **minimally encoded**. The old
+`sw_ser_txout` wrote `put_cs(len)`, i.e. the canonical form, so a padded
+length (`fd 00 00` for 0, say) was silently rewritten before hashing; the raw
+bytes are not rewritten, and the two answers differ. Neither answer is Core's:
+Core's `ReadCompactSize()` throws "non-canonical ReadCompactSize()" and
+refuses to deserialize such a transaction at all, so it cannot appear in any
+block Core accepts.
+
+So `read_cs` now enforces minimality — Core's exact rule — and refuses instead
+of hashing. That makes in-place hashing *provably* identical to canonical
+re-serialization for every transaction not refused, rather than merely
+identical on the transactions that happen to exist. It costs the hot path
+nothing (the single-byte encoding returns before the test).
+
+Found while proving this, and **not** fixed here: nothing else in the tree
+enforces minimality — `bitcoin_tx.asm`'s compactsize readers do not — so a
+peer's non-canonical transaction is still mis-parsed everywhere else, which is
+a pre-existing divergence from Core at the block-acceptance level, not
+something this path introduced.
+
+### 8.5 What this says about the next lever
+
+Two things, in order of confidence.
+
+1. **`bitcoin_taproot_sighash.c` is the same bug, unfixed, and it goes hot at
+   height 709,632.** `tx_seq`, `tx_outpoint`, `ser_txout` and `ser_txout_len`
+   each walk the input (and output) list from the start on every call, and
+   BIP341's aggregate hashes call them once per input — the identical O(n²).
+   `ser_txout_len` walks the output list *twice* per call. Worse, that file's
+   `read_cs` is **unbounded** (it takes no `end`) and its bound tests are
+   written in the `q + sl > end` pointer form that incident #21 had to remove
+   from `bitcoin_segwit.c` because a wire-derived length near 2^64 overflows
+   it. The taproot path is script-path-heavy from ~775,000 (one sampled block
+   in `CHAIN_AHEAD_CENSUS.md` had 44,933 script-path inputs). Same fix, same
+   bounds class; not done here because a performance restructure and a
+   consensus-path bounds fix should not land in one commit.
+2. **Re-profile.** With 34% removed, everything else's share rises by ~1.5×
+   and the ranking will move again — the standing lesson of §7. The field
+   kernels (`fe_mul` + `reduce`, 33%) become ~49% of what is left, which puts
+   §4.5's G-side comb table back at the top on share alone.
+
+### 8.6 What was deliberately not done
+
+A per-transaction *cache* of the three hashes across the inputs of one
+transaction — Core's `PrecomputedTransactionData` proper — was scoped and
+rejected on measurement. `segwit_v0_sighash` is called once per executed
+`OP_CHECKSIG` from deep inside the interpreter (`sv_checksig_witness_v0`),
+which has no transaction-scoped context to hang a cache on, so it would have
+to be a thread-local keyed on the transaction's address and length. That key
+is not sound on its own — a different transaction can land at the same address
+with the same length — and making it sound needs a full byte-compare against a
+retained copy on every call. Priced out: on the 1,372-input shape the compare
+costs about half of what the rebuild now costs, so the cache would buy ~2× on
+the rarest shape and ~0 on the common one, against a wrong-sighash failure
+mode if the key ever aliased. After this change the sighash is 3.91 µs against
+`ecdsa_verify`'s 120.9 µs — 3.1% of a witness input's cost — so there is
+little left to win. Revisit only if a re-profile puts this path back near the
+top.

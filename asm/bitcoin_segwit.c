@@ -46,7 +46,29 @@ extern void hash160(uint8_t o[20], const void* in, long long len);
  * read-only and at most 8 bytes, but it is still wire-driven, so the reader
  * takes the buffer end and reports failure instead. On a transaction that is
  * actually in bounds -- which is every valid one -- this reads and returns
- * exactly what the unbounded version did. */
+ * exactly what the unbounded version did.
+ *
+ * read_cs also requires the MINIMAL encoding, which is Core's rule:
+ * ReadCompactSize() throws "non-canonical ReadCompactSize()" for an 0xfd
+ * form below 253, an 0xfe form below 0x10000, or an 0xff form below
+ * 0x100000000, and that check is not gated on anything -- a transaction with
+ * a padded compactsize cannot be deserialized by Core at all, so it cannot
+ * appear in any block Core accepts.
+ *
+ * That rule became load-bearing when hashOutputs started hashing each CTxOut
+ * IN PLACE instead of re-serializing it. The old sw_ser_txout() wrote
+ * put_cs(len), i.e. the canonical encoding, so a padded length in the
+ * transaction was silently rewritten before hashing; hashing the raw bytes
+ * does not rewrite it, and the two answers differ. Neither answer is Core's,
+ * because Core refuses the transaction -- so this refuses it too, which is
+ * both the safe direction and the only one that makes in-place hashing
+ * provably identical to canonical re-serialization for every transaction not
+ * refused. No real transaction is affected: 4,974 vectors over 461 mainnet
+ * transactions are byte-identical across the change and all match Core.
+ * (Note for whoever audits the rest of the tree: nothing else in this
+ * codebase enforces minimality -- bitcoin_tx.asm's readers do not -- so a
+ * peer's non-canonical transaction is still mis-parsed elsewhere. That is a
+ * pre-existing divergence and a separate fix.) */
 static uint64_t read_cs(const uint8_t** p, const uint8_t* end, int* ok){
     const uint8_t* b = *p;
     if (b >= end){ *ok = 0; *p = end; return 0; }
@@ -54,14 +76,17 @@ static uint64_t read_cs(const uint8_t** p, const uint8_t* end, int* ok){
     /* Single-byte encoding first and returning immediately: this is the
      * branch essentially every real compactsize takes, and PERF_SCOPE.md's
      * re-profile puts read_cs at 22.4% of verify cycles, so the bound must
-     * cost one compare on the hot path and not a width computation. */
+     * cost one compare on the hot path and not a width computation. It is
+     * also always minimal, so the canonicality test below costs the hot path
+     * nothing. */
     if (f < 0xfd){ *p = b; return f; }
     int extra = (f == 0xfd) ? 2 : (f == 0xfe ? 4 : 8);
     if (end - b < extra){ *ok = 0; *p = end; return 0; }
-    uint64_t v;
-    if (f == 0xfd){ v = b[0] | ((uint64_t)b[1]<<8); b += 2; }
-    else if (f == 0xfe){ v = 0; for(int i=0;i<4;i++) v |= (uint64_t)b[i]<<(8*i); b += 4; }
-    else              { v = 0; for(int i=0;i<8;i++) v |= (uint64_t)b[i]<<(8*i); b += 8; }
+    uint64_t v, min;
+    if (f == 0xfd){ v = b[0] | ((uint64_t)b[1]<<8); b += 2; min = 0xfdULL; }
+    else if (f == 0xfe){ v = 0; for(int i=0;i<4;i++) v |= (uint64_t)b[i]<<(8*i); b += 4; min = 0x10000ULL; }
+    else              { v = 0; for(int i=0;i<8;i++) v |= (uint64_t)b[i]<<(8*i); b += 8; min = 0x100000000ULL; }
+    if (v < min){ *ok = 0; *p = end; return 0; }   /* non-canonical */
     *p = b;
     return v;
 }
@@ -88,8 +113,41 @@ static void sha256d(uint8_t out[32], const uint8_t* msg, int64_t len){
 }
 
 /* ---- transaction view (segwit-aware; witness part ignored for sighash) ----
- * Fills prevouts (36*n), sequences (4*n), outputs (serialized). Only the
- * fields BIP143 needs are extracted. */
+ * ONE bounded pass over the transaction records where every input and every
+ * output starts; everything BIP143 needs afterwards is an array index.
+ *
+ * This replaces a set of walk-from-the-start accessors (sw_prevout(t,i),
+ * sw_seq(t,i), sw_ser_txout(t,i)) that each re-parsed the input list -- and,
+ * for outputs, the input list AND the preceding outputs -- on every call.
+ * BIP143 calls them once per input, so hashPrevouts and hashSequence were
+ * O(nin^2) compactsize reads and hashOutputs was O(nin*nout + nout^2); the
+ * 1,372-input transaction in CHAIN_AHEAD_CENSUS.md spent ~1.9 M redundant
+ * varint reads on hashPrevouts alone. PERF_SCOPE.md section 7's live profile
+ * at height ~617,000 put read_cs at 22.4% of all replay cycles with sw_seq
+ * and sw_prevout behind it -- 34% together, larger than the field multiply.
+ * Core has never paid this: PrecomputedTransactionData walks the transaction
+ * once. This is that.
+ *
+ * It also removes the per-iteration bound checks incident #21 added to those
+ * walks (+16% on segwit_v0_sighash). They are not deleted -- the walk they
+ * guarded is deleted. The single pass below still bounds every step against
+ * `end`, still uses the bounded read_cs, and still writes each `q +=` as a
+ * remaining-vs-wanted comparison so a wire-derived length near 2^64 cannot
+ * overflow a pointer into a passing test. Nothing downstream re-derives a
+ * position from the wire, so nothing downstream needs to re-check one.
+ *
+ * in_off[i] is the offset of input i's 36-byte outpoint, for i in [0, nin],
+ * where in_off[nin] is one past the last input (the nout compactsize). Inputs
+ * are contiguous, so input i's 4-byte nSequence ends exactly at in_off[i+1]
+ * -- that is where sw_seq reads it, with no parsing at all.
+ *
+ * out_off[i] is the offset of output i's CTxOut, for i in [0, nout], with
+ * out_off[nout] the end of the outputs section. A CTxOut's BIP143
+ * serialization (8-byte value || compactsize(len) || scriptPubKey) is byte
+ * for byte what is already in the transaction, so hashOutputs is a sha256d
+ * over [out_off[0], out_off[nout]) IN PLACE and SIGHASH_SINGLE's is one over
+ * [out_off[n_in], out_off[n_in+1]). No CTxOut is re-serialized anywhere and
+ * no output is ever copied. */
 typedef struct {
     const uint8_t* tx; int64_t txlen;
     const uint8_t* end;      /* tx + txlen; every walk below bounds against it */
@@ -97,6 +155,8 @@ typedef struct {
     uint32_t locktime;
     int64_t nin, nout;
     const uint8_t* inputs;   /* first input's prevout */
+    const uint32_t* in_off;  /* nin+1 offsets; see above */
+    const uint32_t* out_off; /* nout+1 offsets; see above */
 } swtx_t;
 
 /* Bytes still available at q. Every bound test below is written as a
@@ -108,9 +168,31 @@ static uint64_t sw_avail(const uint8_t* q, const uint8_t* end){
     return (uint64_t)(end - q);
 }
 
-static int swtx_parse(swtx_t* t){
+/* Offset table capacity, in uint32 entries, shared by in_off and out_off.
+ *
+ * The bound is arithmetic, not a guess. On the wire an input costs at least
+ * 36 (outpoint) + 1 (a zero-length scriptSig's compactsize) + 4 (nSequence)
+ * = 41 bytes and an output at least 8 (value) + 1 = 9, so for a transaction
+ * of txlen bytes
+ *      (nin + 1) + (nout + 1)  <=  txlen * (1/41 + 1/9) + 2
+ *                              =   0.13550 * txlen + 2,
+ * and MAX_BLOCK_SERIALIZED_SIZE is 4 MiB, so no transaction a valid block
+ * can carry needs more than 568,335 entries. 600,000 (2.29 MiB) therefore
+ * cannot false-reject anything -- the same shape of argument that sizes
+ * SW_MIDSTATE_CAP below -- while still being a hard, checked ceiling on a
+ * wire-supplied count rather than an unbounded allocation. */
+#define SW_OFF_ENTRIES 600000u
+
+/* Single bounded pass. `off` is SW_OFF_ENTRIES uint32 slots owned by the
+ * caller; on success t->in_off and t->out_off point into it and stay valid
+ * for as long as it does. */
+static int swtx_parse(swtx_t* t, uint32_t* off){
     const uint8_t* p = t->tx;
-    if (t->txlen < 10) return 0;
+    /* Offsets are recorded as uint32. A transaction over 4 GiB cannot exist
+     * in a valid block (MAX_BLOCK_SERIALIZED_SIZE is 4 MiB), so refusing one
+     * outright is a bound that no real transaction can reach -- and it is
+     * what makes the narrowing casts below exact. */
+    if (t->txlen < 10 || (uint64_t)t->txlen > 0xffffffffu) return 0;
     const uint8_t* end = t->tx + t->txlen;
     t->end = end;
     int ok = 1;
@@ -119,24 +201,39 @@ static int swtx_parse(swtx_t* t){
     if (p[0] == 0x00 && p[1] == 0x01) p += 2;     /* segwit marker+flag */
     t->nin = (int64_t)read_cs(&p, end, &ok);
     if (!ok || t->nin <= 0) return 0;
+    /* nin comes off the wire: bound the table before indexing it. (A count
+     * >= 2^63 lands negative in the int64 and is already refused above.) */
+    if ((uint64_t)t->nin + 1u > (uint64_t)SW_OFF_ENTRIES) return 0;
     t->inputs = p;                                 /* first prevout */
+    uint32_t* in_off = off;
     const uint8_t* q = p;
     for (int64_t i=0;i<t->nin;i++){
+        in_off[i] = (uint32_t)(q - t->tx);
         if (sw_avail(q, end) < 36) return 0;
         q += 36;
         uint64_t sl = read_cs(&q, end, &ok);
-        if (!ok || sw_avail(q, end) < sl + 4) return 0;
+        /* `avail < sl + 4` would wrap for sl within 4 of 2^64 -- read_cs can
+         * return any 64-bit value the wire supplies -- and let a bogus q
+         * through. Split it so neither side can overflow. */
+        if (!ok || sw_avail(q, end) < sl || sw_avail(q, end) - sl < 4) return 0;
         q += sl + 4;
     }
+    in_off[t->nin] = (uint32_t)(q - t->tx);
+    t->in_off = in_off;
     t->nout = (int64_t)read_cs(&q, end, &ok);
     if (!ok || t->nout < 0) return 0;
+    if ((uint64_t)t->nin + 1u + (uint64_t)t->nout + 1u > (uint64_t)SW_OFF_ENTRIES) return 0;
+    uint32_t* out_off = off + t->nin + 1;
     for (int64_t i=0;i<t->nout;i++){
+        out_off[i] = (uint32_t)(q - t->tx);
         if (sw_avail(q, end) < 8) return 0;
         q += 8;
         uint64_t sl = read_cs(&q, end, &ok);
         if (!ok || sw_avail(q, end) < sl) return 0;
         q += sl;
     }
+    out_off[t->nout] = (uint32_t)(q - t->tx);
+    t->out_off = out_off;
     /* q now points at the witness section (if segwit) or locktime (if not).
      * We only need locktime for BIP143 and the witness does not affect the
      * sighash --- but we must advance over the witness to reach locktime.
@@ -163,86 +260,38 @@ static int swtx_parse(swtx_t* t){
     return 1;
 }
 
-/* prevout (36 bytes) of input i, or NULL if the walk runs out of buffer.
- * swtx_parse has already proven every input in range, so NULL here means the
- * caller asked for an input that does not exist. */
+/* prevout (36 bytes) of input i. O(1): swtx_parse recorded the offset in its
+ * one bounded pass and proved 36 bytes are there. i must be in [0, nin). */
 static const uint8_t* sw_prevout(const swtx_t* t, int64_t i){
-    const uint8_t* q = t->inputs;
-    int ok = 1;
-    for (int64_t k=0;k<i;k++){
-        if (sw_avail(q, t->end) < 36) return 0;
-        q += 36;
-        uint64_t sl = read_cs(&q, t->end, &ok);
-        if (!ok || sw_avail(q, t->end) < sl + 4) return 0;
-        q += sl + 4;
-    }
-    if (sw_avail(q, t->end) < 36) return 0;
-    return q;
+    return t->tx + t->in_off[i];
 }
-/* nSequence of input i into *out; 0 if the walk runs out of buffer. */
-static int sw_seq(const swtx_t* t, int64_t i, uint32_t* out){
-    const uint8_t* q = t->inputs;
-    int ok = 1;
-    for (int64_t k=0;k<=i;k++){
-        if (sw_avail(q, t->end) < 36) return 0;
-        q += 36;
-        uint64_t sl = read_cs(&q, t->end, &ok);
-        if (!ok || sw_avail(q, t->end) < sl + 4) return 0;
-        q += sl;
-        if (k == i) break;
-        q += 4;
-    }
-    *out = (uint32_t)(q[0]|(q[1]<<8)|(q[2]<<16)|((uint32_t)q[3]<<24));
-    return 1;
+/* nSequence of input i. Inputs are contiguous, so it is the last 4 bytes
+ * before input i+1 begins -- and in_off[nin] is one past the last input, so
+ * this is exact for the final input too. O(1), no compactsize read. */
+static uint32_t sw_seq(const swtx_t* t, int64_t i){
+    const uint8_t* q = t->tx + t->in_off[i+1] - 4;
+    return (uint32_t)(q[0]|(q[1]<<8)|(q[2]<<16)|((uint32_t)q[3]<<24));
 }
-/* Serialize output i as a CTxOut (8-byte value || compactsize(len) || script)
- * into d, which holds cap bytes. Returns the length written, or -1 if it does
- * not fit / the transaction is malformed -- BEFORE writing anything.
+/* The serialized CTxOut of output i, in place. BIP143 serializes an output as
+ * 8-byte value || compactsize(scriptPubKey length) || scriptPubKey, which is
+ * byte for byte the transaction's own encoding, so there is nothing to build:
+ * outputs [lo, hi) are the contiguous bytes [out_off[lo], out_off[hi]).
  *
- * The cap is the point. Consensus places NO limit on an output's
- * scriptPubKey size; only relay standardness does, so a miner can include an
- * output of any length and every node must hash it. This wrote into a
- * 600-byte STACK buffer at both call sites with no check at all, so a
- * scriptPubKey of 590 bytes or more smashed the verifying thread's stack
- * (incident #21 -- the same class as #13's 4096-byte midstate buffers, and
- * the same class the outputs section of strip_witness below was already
- * fixed for). */
-static long sw_ser_txout(const swtx_t* t, int64_t i, uint8_t* d, long cap){
-    const uint8_t* end = t->end;
-    int ok = 1;
-    /* walk to output i */
-    const uint8_t* q = t->tx + 4;
-    if (q[0]==0 && q[1]==1) q += 2;
-    read_cs(&q, end, &ok);                      /* nin */
-    if (!ok) return -1;
-    for (int64_t k=0;k<t->nin;k++){
-        if (sw_avail(q, end) < 36) return -1;
-        q += 36;
-        uint64_t sl = read_cs(&q, end, &ok);
-        if (!ok || sw_avail(q, end) < sl + 4) return -1;
-        q += sl+4;
-    }
-    read_cs(&q, end, &ok);                      /* nout */
-    if (!ok) return -1;
-    for (int64_t k=0;k<i;k++){
-        if (sw_avail(q, end) < 8) return -1;
-        q += 8;
-        uint64_t sl = read_cs(&q, end, &ok);
-        if (!ok || sw_avail(q, end) < sl) return -1;
-        q += sl;
-    }
-    if (sw_avail(q, end) < 8) return -1;
-    uint64_t v; v=0; for(int b=0;b<8;b++) v |= (uint64_t)q[b]<<(8*b); q += 8;
-    uint64_t sl = read_cs(&q, end, &ok);
-    if (!ok || sw_avail(q, end) < sl) return -1;
-    /* Bound the WRITE before any byte of it happens. cap is a long and sl is
-     * wire-derived, so compare in 64-bit unsigned and only then narrow. */
-    uint64_t need = 8u + (uint64_t)cs_size(sl) + sl;
-    if (cap < 0 || need > (uint64_t)cap) return -1;
-    w64le(d, v); long n = 8;
-    put_cs(d+n, sl); n += cs_size(sl);
-    memcpy(d+n, q, sl); n += (long)sl;
-    return n;
+ * This replaces sw_ser_txout(), whose `cap` was incident #21's fix -- it
+ * serialized an output of unbounded length into a 600-byte STACK buffer, and
+ * consensus places NO limit on an output's scriptPubKey size (only relay
+ * standardness does), so a real mainnet transaction from height 927,500
+ * onward smashed the verifying thread's stack. That cap is a consensus-safety
+ * bound, not a policy one, and it survives here unchanged in effect: the
+ * caller still refuses any output range longer than SW_MIDSTATE_CAP. The
+ * accept/reject boundary is identical because sw_ser_txout's running
+ * `cap = SW_MIDSTATE_CAP - written` refused exactly when the sum of the
+ * record lengths passed SW_MIDSTATE_CAP, and that sum IS hi-lo here. What is
+ * gone is the write: nothing is copied, so nothing can overrun. */
+static const uint8_t* sw_txout_range(const swtx_t* t, int64_t lo, int64_t hi,
+                                     uint64_t* len){
+    *len = (uint64_t)(t->out_off[hi] - t->out_off[lo]);
+    return t->tx + t->out_off[lo];
 }
 
 /* Strips the witness from a segwit tx, producing the canonical non-witness
@@ -346,8 +395,22 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
                        const uint8_t* scriptCode, uint64_t scriptcode_len,
                        uint8_t* pre, long cap)
 {
+    /* BIP143 midstates are sha256d of a concatenation whose length is
+     * unbounded (500-input txs exist at 481827; a max block admits ~100k
+     * inputs). The old code used fixed 4096-byte stack buffers -- a real
+     * consensus-path stack overflow (incident #13). Use one per-thread heap
+     * buffer sized to the largest a valid block allows: <=4 MB of prevouts
+     * (36 B each) or outputs (>=9 B each), so 4 MB covers both. */
+    #define SW_MIDSTATE_CAP (4u<<20)
+    static __thread uint8_t* mbuf; BMC_TLS_BUF(mbuf, SW_MIDSTATE_CAP);
+    /* The input/output offset table the single pass fills. Per-thread heap
+     * for the same reason mbuf is: its size follows a wire-supplied count,
+     * and incident #13 exists because a size-dependent buffer sat on a
+     * thread stack that turned out to be a few KB deep. */
+    static __thread uint32_t* soff; BMC_TLS_BUF(soff, SW_OFF_ENTRIES * sizeof(uint32_t));
+
     swtx_t t; t.tx = tx; t.txlen = txlen;
-    if (!swtx_parse(&t)) return 0;
+    if (!swtx_parse(&t, soff)) return 0;
     if (n_in < 0 || n_in >= t.nin) return 0;
 
     uint32_t htype = nHashType & 0x1f;
@@ -358,57 +421,47 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     uint8_t* p = pre;
     uint8_t* pend = pre + cap;
 
-    /* BIP143 midstates are sha256d of a concatenation whose length is
-     * unbounded (500-input txs exist at 481827; a max block admits ~100k
-     * inputs). The old code used fixed 4096-byte stack buffers -- a real
-     * consensus-path stack overflow (incident #13). Use one per-thread heap
-     * buffer sized to the largest a valid block allows: <=4 MB of prevouts
-     * (36 B each) or outputs (>=9 B each), so 4 MB covers both. */
-    #define SW_MIDSTATE_CAP (4u<<20)
-    static __thread uint8_t* mbuf; BMC_TLS_BUF(mbuf, SW_MIDSTATE_CAP);
     if (!acp){
-        /* hashPrevouts */
+        /* hashPrevouts -- one indexed pass, 36 bytes per input, no parsing.
+         * The cap check is the same one it always was (36*nin <= 4 MiB), just
+         * hoisted out of the loop now that the count is known up front. */
+        if ((uint64_t)t.nin * 36u > SW_MIDSTATE_CAP) return 0;
         size_t n = 0;
         for (int64_t i=0;i<t.nin;i++){
-            const uint8_t* po = sw_prevout(&t,i);
-            if (!po || n+36 > SW_MIDSTATE_CAP) return 0;
-            memcpy(mbuf+n, po, 36); n += 36;
+            memcpy(mbuf+n, sw_prevout(&t,i), 36); n += 36;
         }
         sha256d(hashPrevouts, mbuf, n);
-        /* hashSequence */
+        /* hashSequence -- likewise, 4 bytes per input straight out of the
+         * transaction. Little-endian on the wire and little-endian in the
+         * preimage, so w32le(...sw_seq()) is a copy; keep it written as the
+         * decode/encode pair it is rather than assuming host byte order. */
         if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
+            if ((uint64_t)t.nin * 4u > SW_MIDSTATE_CAP) return 0;
             n = 0;
             for (int64_t i=0;i<t.nin;i++){
-                uint32_t sq;
-                if (!sw_seq(&t,i,&sq) || n+4 > SW_MIDSTATE_CAP) return 0;
-                w32le(mbuf+n, sq); n += 4;
+                w32le(mbuf+n, sw_seq(&t,i)); n += 4;
             }
             sha256d(hashSequence, mbuf, n);
         }
     }
-    /* hashOutputs. Serialize each CTxOut STRAIGHT into mbuf at the running
-     * offset, bounded by what is left of it: an output's scriptPubKey has no
-     * consensus size limit, so the old 600-byte stack staging buffer was a
-     * remotely-triggerable stack overflow (incident #21). mbuf is 4 MiB --
-     * above MAX_BLOCK_SERIALIZED_SIZE -- so no transaction a valid block can
-     * carry is refused here, and dropping the staging buffer also drops one
-     * memcpy per output. */
+    /* hashOutputs, hashed IN PLACE out of the transaction. An output's BIP143
+     * serialization is exactly its wire encoding, so the whole outputs section
+     * is already the byte string BIP143 asks for -- no CTxOut is rebuilt, no
+     * output is copied, and mbuf is not touched.
+     *
+     * The SW_MIDSTATE_CAP test is incident #21's bound, preserved exactly: the
+     * old code refused as soon as the running total of CTxOut record lengths
+     * passed SW_MIDSTATE_CAP, and that total is precisely this range's length.
+     * 4 MiB is above MAX_BLOCK_SERIALIZED_SIZE, so no transaction a valid
+     * block can carry is refused. */
     if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
-        size_t on = 0;
-        for (int64_t i=0;i<t.nout;i++){
-            long k = sw_ser_txout(&t, i, mbuf+on, (long)(SW_MIDSTATE_CAP - on));
-            if (k < 0) return 0;
-            on += (size_t)k;
-        }
-        sha256d(hashOutputs, mbuf, on);
+        uint64_t olen; const uint8_t* obytes = sw_txout_range(&t, 0, t.nout, &olen);
+        if (olen > SW_MIDSTATE_CAP) return 0;
+        sha256d(hashOutputs, obytes, (int64_t)olen);
     } else if (htype == SIGHASH_SINGLE && n_in < t.nout){
-        /* mbuf is free to reuse here: hashPrevouts/hashSequence (the only
-         * other users) have already been folded into their own 32-byte
-         * arrays by the sha256d calls above, and under SIGHASH_SINGLE
-         * hashSequence is not computed at all. */
-        long k = sw_ser_txout(&t, n_in, mbuf, (long)SW_MIDSTATE_CAP);
-        if (k < 0) return 0;
-        sha256d(hashOutputs, mbuf, k);
+        uint64_t olen; const uint8_t* obytes = sw_txout_range(&t, n_in, n_in+1, &olen);
+        if (olen > SW_MIDSTATE_CAP) return 0;
+        sha256d(hashOutputs, obytes, (int64_t)olen);
     }
 
     /* version */
@@ -418,9 +471,8 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     memcpy(p, hashSequence, 32); p += 32;
     /* outpoint[nIn] */
     {
-        const uint8_t* po = sw_prevout(&t, n_in);
-        if (!po || p + 36 > pend) return 0;
-        memcpy(p, po, 36); p += 36;
+        if (p + 36 > pend) return 0;
+        memcpy(p, sw_prevout(&t, n_in), 36); p += 36;
     }
     /* scriptCode (compactsize + bytes) */
     if ((uint64_t)(p - pre) + cs_size(scriptcode_len) + scriptcode_len > (uint64_t)cap) return 0;
@@ -430,9 +482,8 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     if (p + 8 > pend) return 0; w64le(p, amount); p += 8;
     /* nSequence[nIn] */
     {
-        uint32_t sq;
-        if (!sw_seq(&t, n_in, &sq) || p + 4 > pend) return 0;
-        w32le(p, sq); p += 4;
+        if (p + 4 > pend) return 0;
+        w32le(p, sw_seq(&t, n_in)); p += 4;
     }
     /* hashOutputs */
     if (p + 32 > pend) return 0; memcpy(p, hashOutputs, 32); p += 32;

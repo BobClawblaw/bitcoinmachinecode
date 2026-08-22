@@ -7,6 +7,202 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-22 -- perf: the BIP143 sighash was O(n^2) per call and O(n^3) per transaction; one bounded pass makes it linear (27.4x on real blocks at the profiled height)
+
+`PERF_SCOPE.md` section 7's re-profile of the live replay at height ~617,000
+(132,785 samples, no call graph) found `read_cs` at **22.44%** of all cycles,
+with `sw_seq` (5.92%) and `sw_prevout` (5.71%) behind it -- **34% together,
+larger than the field multiply**, and all three inside `bitcoin_segwit.c`.
+That is not a constant factor. `sw_prevout(t,i)` and `sw_seq(t,i)` each walked
+the input list from the start to reach input `i`, parsing a compactsize per
+step, and BIP143's hashPrevouts/hashSequence call them once per input:
+O(nin^2) per call. `sw_ser_txout(t,i)` was worse -- it re-walked every input
+*and* the first `i` outputs, so hashOutputs was O(nin*nout + nout^2). And
+because `segwit_v0_sighash` is called once per executed OP_CHECKSIG, i.e. once
+per input, the whole thing was **O(nin^3) per transaction**. Core has never
+paid any of this: `PrecomputedTransactionData` walks the transaction once.
+
+### The fix
+One bounded pass records the offset of every input and every output; every
+accessor afterwards is an array index.
+
+- `in_off[0..nin]` -- input `i`'s outpoint is at `in_off[i]`, and because
+  inputs are contiguous its 4-byte nSequence is the last 4 bytes before
+  `in_off[i+1]` (exact for the final input too, since `in_off[nin]` is one
+  past the last one). `sw_prevout` and `sw_seq` become one load each, with no
+  compactsize read at all.
+- `out_off[0..nout]` -- and here the part worth stating plainly: **a CTxOut's
+  BIP143 serialization is byte for byte its wire encoding**, so there is
+  nothing to build. hashOutputs is a `sha256d` over the contiguous slice
+  `[out_off[0], out_off[nout])` **in place**, and SIGHASH_SINGLE's is one over
+  `[out_off[n_in], out_off[n_in+1])`. `sw_ser_txout` is deleted; no output is
+  copied anywhere and the hashOutputs staging loop goes with it.
+
+The table is a per-thread heap buffer (`BMC_TLS_BUF`, 600,000 `uint32`
+entries = 2.29 MiB), not a stack array -- incident #13 is what a size-dependent
+stack buffer does in this file. Its capacity is an arithmetic bound, not a
+guess: an input costs >= 41 wire bytes and an output >= 9, so
+`(nin+1)+(nout+1) <= 0.13550*txlen + 2`, and MAX_BLOCK_SERIALIZED_SIZE (4 MiB)
+gives <= 568,335 entries -- nothing a valid block can carry is refused.
+
+### The bounds from incident #21 are intact, and the walk they guarded is gone
+Section 7's amendment measured #21's bound fix at +16% on this path and said
+most of it was the per-iteration bound in `sw_prevout`/`sw_seq` -- redundant
+given `swtx_parse` had already validated the same bytes, kept anyway because
+"a distant function already checked this" is how #13 and #21 both happened,
+and to be removed by deleting the loops rather than the checks. That is what
+happened: those loops no longer exist, so there is nothing left to re-check.
+What survives unchanged:
+
+- `read_cs` still takes `end`, and still returns on the single-byte encoding
+  before computing any width;
+- every step of the single pass is a "remaining >= wanted" comparison on
+  `sw_avail()`, never `q + n > end`;
+- the `sw_ser_txout` `cap` -- a consensus-safety bound, not a policy one -- is
+  now the caller's `olen > SW_MIDSTATE_CAP` test, and the accept/reject
+  boundary is **identical**, not merely similar: the old running
+  `cap = SW_MIDSTATE_CAP - written` refused exactly when the sum of the CTxOut
+  record lengths passed 4 MiB, and that sum is precisely this range's length.
+  `tests/test_segwit_txout_bound` still passes 125/125, including the
+  3,900,000-byte scale vector and the 5 MB over-cap refusal.
+
+One bound is *strengthened*: `avail(q) < sl + 4` wraps for `sl` within 4 of
+2^64 (`read_cs` can return any 64-bit value the wire supplies), so it is split
+into `avail < sl || avail - sl < 4`.
+
+### One real behaviour change, and it is toward Core
+Hashing a CTxOut in place is only equivalent to re-serializing it if the
+transaction's compactsizes are **minimally encoded**. The old `sw_ser_txout`
+wrote `put_cs(len)`, i.e. the canonical form, so a padded length (`fd 00 00`
+for zero, say) was silently rewritten before hashing; raw bytes are not
+rewritten, and the two answers differ. This was found by a differential fuzz,
+not by reasoning -- 12 cases out of 3.8 M, all of them a poisoned compactsize.
+
+Neither answer is Core's. Core's `ReadCompactSize()` throws "non-canonical
+ReadCompactSize()" and refuses to deserialize such a transaction at all, so it
+cannot appear in any block Core accepts. So `read_cs` now enforces minimality
+-- Core's exact rule -- and refuses. That makes in-place hashing *provably*
+identical to canonical re-serialization for every transaction not refused,
+rather than merely identical on the transactions that happen to exist, and it
+costs the hot path nothing (the single-byte encoding returns first).
+
+Found while proving this and NOT fixed here: nothing else in the tree enforces
+minimality -- `bitcoin_tx.asm`'s compactsize readers do not -- so a peer's
+non-canonical transaction is still mis-parsed everywhere else. That is a
+pre-existing divergence from Core at block-acceptance level, not something
+this path introduced.
+
+### New test, and it has teeth
+`tests/test_segwit_bounds_fuzz.c`: the transaction is copied so its last byte
+abuts a **PROT_NONE guard page**, so a read one byte past the end is a SIGSEGV
+rather than a silent success -- no sanitizer needed, which matters because
+this path links hand-written asm that ASAN cannot instrument. Every real
+mainnet transaction in `segwit_txout_vec.h`, at every truncation from 0 to
+full length, under all five hashtypes and three input indices, plus every
+single-byte position poisoned to 00/fd/fe/ff: **3,184,330 calls**. It passes
+on this tree and on `main`, and **SEGVs on `bf673d0~1`** -- the pre-#21 tree --
+which is the whole point of writing it. Three bounds incidents (#13, #19, #21)
+came out of this file and every one was found by reading rather than by a
+test; now there is a test.
+
+### Byte-identical, against Core, on 461 real mainnet transactions
+This is a performance change and it must not move a single hash.
+
+Corpus: **4,974 vectors** -- 461 real mainnet transactions pulled from the
+Core oracle across heights **481,824 to 962,625** (the first segwit block
+through the incident-#21 census window), each driven at three input indices
+under **six hashtypes** (ALL, NONE, SINGLE, and each with ANYONECANPAY).
+
+- old build vs new build: **4,974/4,974 byte-identical**, 0 refusals;
+- and, more to the point, **both** match Bitcoin Core's own
+  `SignatureHash(..., SigVersion::WITNESS_V0)` on **4,974/4,974**, via
+  `validation/core_verify_oracle.cpp`'s `BIP143` command, which self-checks
+  against BIP-0143's published worked example first. Ground truth is Core,
+  never our own previous answer.
+- The same corpus under `-fsanitize=address,undefined` gives byte-identical
+  output with zero diagnostics.
+- Differential fuzz, old and new linked into one binary over every truncation
+  and single-byte poisoning of the fixture transactions: **3,821,196 cases,
+  3,820,122 identical (hash AND preimage AND return), 1,074 where the new
+  build refuses a non-canonical compactsize, 0 unexplained.** The
+  canonicality verdict comes from an independent walker, not from the
+  implementation under test.
+
+`validation/diff_bip143_corpus.py` + `validation/bip143_corpus_dump.c` are new
+and reproduce the corpus half on demand (`--baseline main`).
+
+### Measured
+`tests/bench_segwit_sighash` is new and permanent so the next change to this
+path has something to be compared against; both earlier figures for it were
+taken with throwaway harnesses. `-O2`, CPU time, min of 15, both builds back
+to back:
+
+| shape | before | after | factor |
+|---|---|---|---|
+| 1 in / 2 out (189 B) | 0.3960 us | 0.3718 us | 1.07x |
+| 2 in / 2 out (304 B) | 0.4364 us | 0.4052 us | 1.08x |
+| 100 in / 5 out | 16.830 us | 2.510 us | 6.7x |
+| 1,372 in / 100 out | 2.633 ms | 30.57 us | **86x** |
+| 2 in / 3,000 out | 5.115 ms | 42.14 us | **121x** |
+
+The common case is not pessimised -- that was the thing to check.
+
+On the real thing: 20 mainnet blocks at heights 616,980-617,018, the exact
+window section 7 profiled, all **53,400 witness inputs** driven through
+`segwit_v0_sighash` -- **5,735.90 ms -> 209.00 ms**, i.e. 107.41 us -> 3.91 us
+per witness input, **27.4x**. `read_cs` calls over the same blocks:
+4,340,010,792 -> 32,889,389, **131.9x**. Of the old total, `strip_witness` --
+untouched by this change -- is 0.010%, so essentially all of section 7's
+`read_cs` share is this and essentially all of it goes.
+
+Projection, with the bound stated: the three symbols are 34.07% of profiled
+cycles, so **the Amdahl ceiling is 1/(1-0.3407) = 1.517x** and nothing here
+can beat it. Residual 1.24% (whole-function, 27.4x) or ~0.2% (`read_cs`
+counts, 131.9x) gives **1.49-1.51x end-to-end**. Do not believe that without
+re-profiling: section 7 exists because a projection off a 227,000-block-stale
+profile said 1.40x and delivered 1.15x, and this share was measured at
+~617,000 while the replay has moved on. The figure that does not depend on the
+share is the 27.4x on the component.
+
+Corroboration that the benchmark drives the profiled work: the old path costs
+107.41 us per witness input against section 1's measured 120.9 us for
+`ecdsa_verify`, and 96.4% of the sighash cost is removed here, predicting the
+three symbols at 45.3% of that pair's cycles. The profile has them at 34.07%
+against 42.07% for the field/EC symbols -- 44.75%. Two routes, 0.6 points
+apart.
+
+No post-change profile of the daemon was taken: the change is not deployed
+(the replay has not reached tip), and `perf_event_paranoid` is 4 on this host,
+which blocks `perf` for a non-root user.
+
+### Deliberately not done
+A per-transaction cache of the three hashes across one transaction's inputs
+(Core's `PrecomputedTransactionData` proper). `segwit_v0_sighash` is called
+from inside the interpreter with no transaction-scoped context, so the cache
+would be a thread-local keyed on (address, length) -- not sound, since a
+different transaction can reuse an address at the same length, and making it
+sound needs a full byte-compare against a retained copy per call. Priced: on
+the 1,372-input shape that compare costs about half of what the rebuild now
+costs, so it buys ~2x on the rarest shape and ~0 on the common one, against a
+wrong-sighash failure mode if the key ever aliased. At 3.91 us against
+`ecdsa_verify`'s 120.9 us the path is now 3.1% of a witness input. Recorded in
+`PERF_SCOPE.md` section 8.6 so it is not re-litigated from scratch.
+
+### Found while measuring, NOT fixed here
+`bitcoin_taproot_sighash.c` has the identical O(n^2) -- `tx_seq`,
+`tx_outpoint`, `ser_txout` and `ser_txout_len` all walk from the start on
+every call, and `ser_txout_len` walks the output list twice -- **and its own
+`read_cs` is unbounded** (it takes no `end`), with bound tests written in the
+`q + sl > end` pointer form that incident #21 had to remove from
+`bitcoin_segwit.c` because a wire-derived length near 2^64 overflows it. That
+path goes hot at height **709,632** and is script-path-heavy from ~775,000
+(`CHAIN_AHEAD_CENSUS.md` sampled one block with 44,933 script-path inputs).
+Same fix, same bounds class, deliberately not in this commit: a performance
+restructure and a consensus-path bounds fix should not land together.
+
+### Full suite
+`make -k test` MAKE_RC=0, 0 failures. `make abi-check` OK.
+
 ## 2026-08-22 -- Incidents #6-#21; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
