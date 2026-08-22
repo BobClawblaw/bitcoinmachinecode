@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#18; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#19; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -578,6 +578,81 @@ serialization, where Core answers a bare `MSG_BLOCK` with the stripped
 form. That deviation is documented as intentional in `fe3addb`'s own
 comment and deserves its own decision, not a silent ride-along in an
 alignment fix.
+### Incident #19: the tapscript initial stack had no 520-byte limit at all
+Chasing `CHAIN_AHEAD_CENSUS.md`'s last two open rows -- "real inscription
+untested at scale" and "`tap_leaf_hash`'s 4 MB leaf cap" -- turned up
+something the census had not predicted and the replay would never have found.
+
+The scale question itself came out clean. Real fixtures pulled from the
+oracle and driven through `tx_verify_block_connect` all pass: the
+**3,938,182-byte** leaf at height 774628 (`0301e048...c0ae`, a 3,938,383 B
+transaction inside a 3.94 MB block -- the largest leaf located, and within
+1.5% of the ~3,999,000 that MAX_BLOCK_WEIGHT allows at all, so nothing on
+the chain can be materially bigger), the 371,967-byte leaf at 779500 that
+the census recorded as
+its maximum, the census's own ~775000 evidence txid (`4cc72b13...4057`, a
+42,594-byte leaf) with its full txid finally resolved from block data, a
+21-node/705-byte control block at 850000, and a 12-item script-path witness
+at 860500. The 4 MB cap is not a wall either, and now provably so:
+`tap_leaf_hash` bounds `slen` at `TAP_PREIMG_CAP-70` = 4,194,234, while
+MAX_BLOCK_WEIGHT = 4,000,000 caps any real leaf near 3,999,000 -- ~195 KB of
+headroom no valid block can consume. Measured, not assumed: the test sweeps
+`tap_leaf_hash` from 0 to 4,194,235 bytes against BIP341 hashes computed
+independently in Python, and every fixture also has its leaf's LAST byte
+flipped and must then reject -- a silent truncation anywhere would sail
+through the unmodified fixture untouched.
+
+The bug was next door. `taproot_verify_input` built the tapscript's initial
+stack by handing each witness item straight to `stack_push`, which bounds the
+stack DEPTH (`MAX_STACK_SIZE`) and **not the element LENGTH** -- it copies
+`len` bytes into a 528-byte element record with no check
+(`bitcoin_scriptcodec.asm:162`). `bitcoin_witness_v0.c:192` has the
+`MAX_SCRIPT_ELEMENT_SIZE` guard for witness v0; the tapscript path never got
+one. A witness item can be nearly a whole block, so a script-path spend
+carrying a >524-byte initial-stack item overran `ts_main_e`, a 528,000-byte
+heap buffer, by up to ~3.4 MB. Whether that SIGSEGVs or silently scribbles
+over neighbouring buffers is pure heap-layout luck -- both were observed on
+the same binary, the fault only when glibc's mmap threshold was pinned low.
+
+And the shape is not merely hostile input. Core's `ExecuteWitnessScript` runs
+its OP_SUCCESSx pre-scan BEFORE both the stack-size and element-size limits,
+with the comment "OP_SUCCESSx processing overrides everything, including
+stack element size limits" -- so a spend with a 3.9 MB witness item under an
+OP_SUCCESSx leaf is consensus-VALID and mineable today. We ran that scan too,
+but inside `script_eval`, i.e. AFTER the stack was already built and the
+damage done. The fix hoists the scan out (`ts_has_op_success`) and applies
+the count and size limits after it, in Core's exact order.
+
+None of this is reachable from the chain: 47,578 real script-path inputs
+sampled across 68 blocks in 775,000-869,000 have a maximum initial-stack item
+of **79 bytes** and not one OP_SUCCESSx leaf. So the fixture had to be
+synthetic -- and the honest way to stop a synthetic vector inheriting the
+author's blind spot is to let Core decide the answer.
+`validation/core_verify_oracle.cpp` gained a `TAPVERIFY` command (real
+`VerifyScript`, real `PrecomputedTransactionData`, the real
+`GetBlockScriptFlags` set) and all four vectors agree with Core: 520-byte
+item ACCEPT, 521-byte REJECT (`Push value size limit exceeded`), 3.9 MB item
+REJECT, 3.9 MB item under an OP_SUCCESS leaf **ACCEPT**. That last one is why
+the obvious one-line fix would have been wrong, and it is in the suite
+precisely to fail against it. Fail-then-pass on the real thing: against
+unmodified `main`, `init_item_521` and `init_item_3900000` are both falsely
+ACCEPTED; with the fix, 33/33.
+
+One divergence is knowingly LEFT in place, and named here so it is not
+mistaken for an oversight. Because Core's OP_SUCCESSx scan also precedes the
+`stack.size() > MAX_STACK_SIZE` check, a script-path spend with more than
+1000 initial stack items under an OP_SUCCESSx leaf is valid to Core, while
+`TXV_MAX_WIT_ITEMS = 1004` rejects it at parse time, before
+`taproot_verify_input` is ever reached. That cap is a deliberate per-input
+pool bound (incident #15), and removing it means unbounded witness-pool
+growth driven by wire data; the shape has never occurred, and the trade is
+worth making consciously rather than silently.
+
+The lesson is the mirror image of #16's. There the census said "handled" and
+meant "a code path exists". Here it said "untested at scale", the scale
+turned out fine -- and reading the path against Core to find out *why* it was
+fine is what surfaced a memory-corruption bug three feet to the left, in a
+shape the chain has never produced and therefore would never have taught us.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
