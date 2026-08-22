@@ -1,3 +1,4 @@
+#include "bmc_thread.h"
 /* bitcoin_witness_v0.c -- BIP141 witness program classification and version-0
  * execution (P2WPKH, P2WSH, and their P2SH-wrapped "nested segwit" forms).
  *
@@ -71,10 +72,10 @@ static uint64_t sv_checksig_witness_v0(void* cptr, const uint8_t* sig, size_t si
     uint8_t ht = sig[siglen-1];
     uint64_t r[4], s[4]; uint32_t dht;
     if (!der_parse_sig(sig, (unsigned long)siglen, r, s, &dht)) return 0;
-    static __thread uint8_t pre[1<<16];
+    static __thread uint8_t* pre; BMC_TLS_BUF(pre, 1<<16);
     uint8_t z[32];
     if (segwit_v0_sighash(z, c->tx, (int64_t)c->txlen, (int64_t)c->nIn, (uint32_t)ht,
-                          c->amount, sc->p, (uint64_t)sc->n, pre, (long)sizeof pre) <= 0) return 0;
+                          c->amount, sc->p, (uint64_t)sc->n, pre, (long)(1<<16)) <= 0) return 0;
     uint64_t zl[4]; be_to_limbs(zl, z, 32);
     uint64_t qx[4], qy[4];
     if (!pubkey_parse(pub, (unsigned long)publen, qx, qy)) return 0;
@@ -168,7 +169,7 @@ int sv_verify_witness_v0(const uint8_t* prog, uint32_t proglen,
                          uint64_t amount, uint64_t flags, unsigned long nIn,
                          const uint8_t* tx, unsigned long txlen,
                          uint8_t* work, unsigned long workcap){
-    static __thread uint8_t main_e[MAX_STACK*ELEM_SIZE];
+    static __thread uint8_t* main_e; BMC_TLS_BUF(main_e, MAX_STACK*ELEM_SIZE);
     static __thread uint8_t p2wpkh_script[25];
     const uint8_t* script; uint32_t slen; uint32_t nstack;
     if (proglen == 32){

@@ -1010,6 +1010,23 @@ int utxo_live_rewind_to(long height){
 
 void utxo_live_set_undo_enabled(int on){ g_undo_enabled = on; }
 
+/* TEST-ONLY: drive one raw block through the full production apply path
+ * (parse -> witness commitment -> tx_verify_block_connect_all on the real
+ * verify-pool threads -> UTXO mutation) against whatever the LSM currently
+ * holds. Used by tests/test_block_481827_pool_stack.c to reproduce the
+ * 481827 verify-pool stack overflow (incident #13) and prove the fix. Not
+ * called from any production path. */
+int utxo_live_test_apply_block(const unsigned char* blk, unsigned long len, long height){
+    return apply_block_at(blk, (u64)len, height);
+}
+/* TEST-ONLY: seed one prevout into the live LSM so a real historical block
+ * can be applied against a synthetic UTXO view. */
+int utxo_live_test_seed(const unsigned char txid[32], unsigned int index, unsigned long long value,
+                        const unsigned char* spk, unsigned int spklen){
+    return (int)utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value, 0, 0, spk, spklen);
+}
+
+
 /* utxo_live_init(dir): open-or-init the live LSM UTXO instance in the
  * current directory (callers have already chdir'd to the daemon's data
  * dir, matching every other store in this codebase -- `dir` is only used

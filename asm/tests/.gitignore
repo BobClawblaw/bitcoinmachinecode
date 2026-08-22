@@ -7,3 +7,4 @@ test_ripemd160
 test_addr
 fullchain_shim
 
+fixtures/

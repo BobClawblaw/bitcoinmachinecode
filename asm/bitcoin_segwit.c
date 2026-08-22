@@ -1,3 +1,4 @@
+#include "bmc_thread.h"
 /* bitcoin_segwit.c -- BIP143 (segwit v0) signature hashing + P2WPKH/P2WSH
  * spend verification, mirroring the verified Core algorithm.
  *
@@ -274,26 +275,34 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     uint8_t* p = pre;
     uint8_t* pend = pre + cap;
 
+    /* BIP143 midstates are sha256d of a concatenation whose length is
+     * unbounded (500-input txs exist at 481827; a max block admits ~100k
+     * inputs). The old code used fixed 4096-byte stack buffers -- a real
+     * consensus-path stack overflow (incident #13). Use one per-thread heap
+     * buffer sized to the largest a valid block allows: <=4 MB of prevouts
+     * (36 B each) or outputs (>=9 B each), so 4 MB covers both. */
+    #define SW_MIDSTATE_CAP (4u<<20)
+    static __thread uint8_t* mbuf; BMC_TLS_BUF(mbuf, SW_MIDSTATE_CAP);
     if (!acp){
         /* hashPrevouts */
-        uint8_t buf[4096]; size_t n = 0;
-        for (int64_t i=0;i<t.nin;i++){ memcpy(buf+n, sw_prevout(&t,i), 36); n += 36; }
-        sha256d(hashPrevouts, buf, n);
+        size_t n = 0;
+        for (int64_t i=0;i<t.nin;i++){ if (n+36 > SW_MIDSTATE_CAP) return 0; memcpy(mbuf+n, sw_prevout(&t,i), 36); n += 36; }
+        sha256d(hashPrevouts, mbuf, n);
         /* hashSequence */
         if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
             n = 0;
-            for (int64_t i=0;i<t.nin;i++){ w32le(buf+n, sw_seq(&t,i)); n += 4; }
-            sha256d(hashSequence, buf, n);
+            for (int64_t i=0;i<t.nin;i++){ if (n+4 > SW_MIDSTATE_CAP) return 0; w32le(mbuf+n, sw_seq(&t,i)); n += 4; }
+            sha256d(hashSequence, mbuf, n);
         }
     }
     /* hashOutputs */
     if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
-        uint8_t obuf[4096]; size_t on = 0;
+        size_t on = 0;
         for (int64_t i=0;i<t.nout;i++){
             uint8_t tmp[600]; int k = sw_ser_txout(&t, i, tmp);
-            memcpy(obuf+on, tmp, k); on += k;
+            if (on+(size_t)k > SW_MIDSTATE_CAP) return 0; memcpy(mbuf+on, tmp, k); on += k;
         }
-        sha256d(hashOutputs, obuf, on);
+        sha256d(hashOutputs, mbuf, on);
     } else if (htype == SIGHASH_SINGLE && n_in < t.nout){
         uint8_t tmp[600]; int k = sw_ser_txout(&t, n_in, tmp);
         sha256d(hashOutputs, tmp, k);

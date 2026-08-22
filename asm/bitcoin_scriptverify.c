@@ -1,3 +1,4 @@
+#include "bmc_thread.h"
 /* bitcoin_scriptverify.c -- VerifyScript driven by the ASM interpreter.
  *
  * Stage A of PLAN_SCRIPT_VERIFY.md: the single entry point block connection
@@ -265,11 +266,10 @@ static int sv_push_only(const uint8_t* s, size_t n){
 int sv_run_v(const uint8_t* script, size_t slen, sv_stack* st,
                     uint64_t flags, struct sv_ctx* ctx, int* err, int sigversion,
                     uint64_t (*cs)(void*, const uint8_t*, size_t, const uint8_t*, size_t, const void*)){
-    static __thread uint8_t alt[MAX_STACK*ELEM_SIZE];
-    static __thread uint8_t scratch[1<<16];
-    static __thread uint8_t scopy[20000];
+    static __thread uint8_t *alt, *scratch, *scopy;
+    BMC_TLS_BUF(alt, MAX_STACK*ELEM_SIZE); BMC_TLS_BUF(scratch, 1<<16); BMC_TLS_BUF(scopy, 20000);
     uint64_t e = SCRIPT_ERR_OK;
-    if (slen > sizeof scopy){ *err = SCRIPT_ERR_SCRIPT_SIZE; return 0; }
+    if (slen > 20000){ *err = SCRIPT_ERR_SCRIPT_SIZE; return 0; }
     memcpy(scopy, script, slen);
 
     struct script_state s;
@@ -279,7 +279,7 @@ int sv_run_v(const uint8_t* script, size_t slen, sv_stack* st,
     s.script     = scopy;  s.script_len = slen;
     s.sigversion = sigversion;
     s.flags      = flags;
-    s.work       = scratch; s.work_cap = sizeof scratch;
+    s.work       = scratch; s.work_cap = 1<<16;
     s.error_out  = &e;
     s.checksig_ctx = ctx;
     s.checksig_fn  = cs;
@@ -302,8 +302,8 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                      uint64_t flags, unsigned long nIn,
                      const unsigned char* tx, unsigned long txlen,
                      unsigned char* work, unsigned long workcap){
-    static __thread uint8_t main_e[MAX_STACK*ELEM_SIZE];
-    static __thread uint8_t copy_e[MAX_STACK*ELEM_SIZE];
+    static __thread uint8_t *main_e, *copy_e;
+    BMC_TLS_BUF(main_e, MAX_STACK*ELEM_SIZE); BMC_TLS_BUF(copy_e, MAX_STACK*ELEM_SIZE);
     sv_stack st = { main_e, 0 };
     sv_stack cp = { copy_e, 0 };
     struct sv_ctx ctx = { tx, txlen, nIn, work, workcap, 0, 0, 0 };
@@ -316,7 +316,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
      * which is the safe direction to fail in. */
     sv_get_locktime_context(tx, txlen, nIn, &ctx.tx_version, &ctx.tx_locktime, &ctx.in_sequence);
 
-    memset(main_e, 0, sizeof main_e);
+    memset(main_e, 0, MAX_STACK*ELEM_SIZE);
 
     if ((flags & SV_SIGPUSHONLY) && !sv_push_only(scriptSig, ssl))
         return SCRIPT_ERR_SIG_PUSHONLY;
@@ -325,7 +325,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         return err;
 
     if (flags & SV_P2SH){
-        memcpy(copy_e, main_e, sizeof copy_e);
+        memcpy(copy_e, main_e, MAX_STACK*ELEM_SIZE);
         cp.sp = st.sp;
     }
 
@@ -340,13 +340,13 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         if (!sv_push_only(scriptSig, ssl)) return SCRIPT_ERR_SIG_PUSHONLY;
         if (cp.sp == 0) return SCRIPT_ERR_INVALID_STACK_OPERATION;
 
-        static __thread uint8_t redeem[20000];
+        static __thread uint8_t* redeem; BMC_TLS_BUF(redeem, 20000);
         uint32_t rl = sv_len(&cp, cp.sp-1);
-        if (rl > sizeof redeem) return SCRIPT_ERR_PUSH_SIZE;
+        if (rl > 20000) return SCRIPT_ERR_PUSH_SIZE;
         memcpy(redeem, sv_dat(&cp, cp.sp-1), rl);
 
         cp.sp--;                          /* pop the serialised script */
-        memcpy(main_e, copy_e, sizeof main_e);
+        memcpy(main_e, copy_e, MAX_STACK*ELEM_SIZE);
         st.sp = cp.sp;
 
         if (!sv_run(redeem, rl, &st, flags, &ctx, &err))
