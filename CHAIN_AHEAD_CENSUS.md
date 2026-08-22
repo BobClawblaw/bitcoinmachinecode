@@ -89,6 +89,7 @@ what the method did and did not catch.
 | ">10 KB tapscript / real inscription" untested at scale | **CLOSED, and the census's own maximum was 10x too small.** Fixtures now exist and pass (`tests/test_tapscript_scale.c`): a **3,938,182-byte** leaf at height **774628** — below the 775,000 this table calls the first script-path height, and within 1.5% of the ~3,999,000 MAX_BLOCK_WEIGHT allows at all, so nothing on the chain can be materially larger — plus the 371,967 B leaf at 779500, the 42,594 B leaf at 775000 (this row's evidence txid, full txid `4cc72b13218183d4a6b13e79ef3e0a73c7987688dd0334866a8398b03e514057`), a 21-node control block at 850000 and a 12-item script-path witness at 860500. Nothing on the size path broke. Chasing *why* it did not break is what found incident #18. |
 | `tap_leaf_hash` 4 MB leaf cap | **CLOSED, and it is provably unreachable, not merely unseen.** The asm bounds `slen` at `TAP_PREIMG_CAP-70` = **4,194,234**; MAX_BLOCK_WEIGHT = 4,000,000 caps any leaf a valid block can carry near **3,999,000**, so ~195 KB of headroom can never be consumed. Measured too: `tests/test_tapscript_scale.c` sweeps `tap_leaf_hash` at 0 / 1 / 252 / 253 / 65,535 / 65,536 / 371,967 / 3,938,182 / 3,999,000 / 4,194,234 bytes against independently-computed BIP341 hashes, and confirms 4,194,235 fails cleanly (returns 0, writes nothing). |
 | *(not predicted)* BIP342 initial-stack element-size limit | **A bug the census could not have found, because the shape does not exist on the chain.** `taproot_verify_input` applied no `MAX_SCRIPT_ELEMENT_SIZE` check to the tapscript initial stack, and `stack_push` bounds only the stack depth — so a >524-byte initial-stack item overran a 528,000-byte heap buffer by up to ~3.4 MB, and a 521-byte one was a silent consensus false-accept. 47,578 sampled real script-path inputs (68 blocks, 775k–869k) max out at a **79-byte** initial-stack item and contain **no OP_SUCCESSx leaf**, so no amount of chain sampling would have surfaced it. Incident #18. |
+| *(not predicted)* **output** scriptPubKey size vs the BIP143 CTxOut buffer | **A wall this document had every means to predict and did not, because it only ever classified INPUTS.** `sw_ser_txout` serialized a CTxOut into `uint8_t tmp[600]` on the stack with no bound; consensus limits an output's scriptPubKey not at all. A sparse sweep (481,824..950,000, step 5,000) says the chain's maximum output scriptPubKey is **105 bytes**, which is exactly the kind of reassurance this table has been wrong about twice already. Dense sampling of the reachable shape — a segwit-v0 input in a transaction with a >589-byte output — finds it in **1 of 464** blocks over 900,000..946,400 and **7 of 920** over 940,000..963,000, first located at height **927,500** (a P2WPKH spend with a 2,019-byte `OP_RETURN`). The replay will hit it. Incident #20. |
 
 **The lesson.** Conclusion 2 above — "the remaining risk is coverage, not
 code" — was the wrong call, and it was wrong because the census classified
@@ -112,3 +113,17 @@ itself (a new `TAPVERIFY` command in `validation/core_verify_oracle.cpp`)
 could then say which way the vector was supposed to go. "What has the chain
 done" and "what may the chain do" are different questions, and this document
 only ever asked the first.
+
+**A third lesson (incident #20).** Two blind spots, and the second is the
+uncomfortable one. First, this census classified **inputs** — script shape,
+witness depth, leaf size — and never once measured an **output**'s
+scriptPubKey, even though a BIP143 sighash serializes every output of the
+spending transaction. Whole fields go unexamined when the classifier is
+written around the code you happen to be worried about. Second, and worse: the
+sparse answer to "how big do output scripts get" was **105 bytes**, and it was
+wrong by a factor of nineteen. It was not wrong the way #18 was wrong (a shape
+that has never been mined); the shape is *on the chain*, in ~1% of recent
+blocks, and a stride-5,000 sweep walked straight past it. A census result is a
+statement about its sampling interval. When the number it produces is the
+reason not to fix something, re-sample at the density the conclusion needs
+before believing it.

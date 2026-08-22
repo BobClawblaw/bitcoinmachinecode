@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#19; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#20; verify path 5.7x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -658,6 +658,91 @@ meant "a code path exists". Here it said "untested at scale", the scale
 turned out fine -- and reading the path against Core to find out *why* it was
 fine is what surfaced a memory-corruption bug three feet to the left, in a
 shape the chain has never produced and therefore would never have taught us.
+
+### Incident #20: a 600-byte stack buffer for an output with no size limit -- and the chain is already past it
+`sw_ser_txout` (`bitcoin_segwit.c`) serialized one CTxOut -- 8 bytes of value,
+a compactsize, then the scriptPubKey verbatim -- into a caller-supplied buffer
+with **no bound check of any kind**, and both call sites in
+`segwit_v0_sighash` handed it `uint8_t tmp[600]` on the stack. The arithmetic
+gives the exact cliff: 8 + 3 + 589 = 600, so a 589-byte output scriptPubKey is
+the last one that fits and **590 is the first that overruns**. One call site is
+the `hashOutputs` loop, which runs over *every* output of the spending
+transaction; the other is the `SIGHASH_SINGLE` branch. Both were affected.
+
+Bitcoin consensus places **no limit on an output's scriptPubKey size**. Only
+relay standardness does, and nothing in this codebase's block path bounds it
+either -- `TXV_SPK_CAP` and the taproot 0xfd limit apply to *prevout* scripts
+coming out of the UTXO set, never to the spending transaction's own outputs.
+So the overflow is reachable straight from `sv_verify_witness_v0`, which
+`daemon/tx_verify.c` hands the full spending transaction, and it happens
+*before* anything has decided the transaction is invalid.
+
+The part that was supposed to make this theoretical is where it went wrong.
+A sparse census -- 481,824..950,000 sampled every 5,000 blocks -- reports a
+maximum output scriptPubKey of **105 bytes**, and that reading is what framed
+this as a synthetic-only, defence-in-depth fix. It is a sampling artifact.
+Sampling the same shape densely (a segwit-v0 input, not taproot, in a
+transaction with a >589-byte output):
+
+| range | step | blocks | blocks with the shape |
+|---|---|---|---|
+| 481,824..900,000 | 1,000 | 419 | 0 |
+| 900,000..946,400 | 100 | 464 | 1 (927,500) |
+| 940,000..963,000 | 25 | 920 | 7 |
+
+Multi-hundred-byte `OP_RETURN` outputs start appearing around **927,500** and
+are routine past ~946,000. The earliest located is height 927,500, a 1-in/1-out
+**P2WPKH** spend whose single output is a **2,019-byte** `OP_RETURN`
+(`98850f2b...b4b1`); 952,224 carries a 1,198-byte one, 952,325 a 1,694-byte
+one. Every one of these is a mined, consensus-valid mainnet transaction that
+writes past the end of a 600-byte stack array on unmodified `main`. This is not
+a hardening exercise: the replay would have died on it, roughly the same way
+incident #13 died on block 481,827.
+
+Fix: `sw_ser_txout` takes a `cap`, computes `8 + cs_size(sl) + sl` in 64-bit
+unsigned, and returns -1 **before writing anything** if it does not fit. The
+staging buffer is gone -- both call sites serialize directly into `mbuf`, the
+4 MiB per-thread heap buffer incident #13 already introduced for the aggregate
+hashes, which is above `MAX_BLOCK_SERIALIZED_SIZE` and so cannot false-reject
+anything a valid block can carry (proven: a 3,900,000-byte output scriptPubKey
+hashes to Core's answer). The `hashOutputs` loop also loses one `memcpy` per
+output. `read_cs` was unbounded too and is now bounded: a compactsize's width
+is chosen by its own first byte, so every walk in the file could read up to
+8 bytes past the transaction whenever it landed on the last one -- read-only
+and small, but wire-driven. The `q + sl > end` bound tests became
+`avail(q) < sl` for the same reason: a 2^63 length made the pointer form
+overflow into a passing test.
+
+Proof, in the order it was built. Ground truth is Bitcoin Core:
+`validation/core_verify_oracle.cpp` gained a `BIP143` command running Core's
+own `SignatureHash(..., SigVersion::WITNESS_V0)`, which reproduces BIP-0143's
+published worked example (`c37af311...8cb670`) before any of its answers are
+used. `tests/test_segwit_txout_bound.c` carries 120 sighash vectors plus a
+3-entry scale set and an over-cap refusal, 124 in all: 75 ordinary mainnet
+transactions across all five hashtypes, 14 from the seven real over-the-bound
+mainnet spends, and the rest synthetic -- a boundary sweep, both call sites,
+ANYONECANPAY/NONE/SINGLE, and a scale set reaching 3.9 MB.
+
+Fail-then-pass, on the real thing. Against unmodified `main`, 27 of the 124
+vectors abort the process -- `-fsanitize=address` reports
+`stack-buffer-overflow, WRITE of size 2019 ... in sw_ser_txout` for the
+927,500 fixture and `WRITE of size 590` for the boundary vector, at
+`bitcoin_segwit.c:304` (hashOutputs) and `:309` (SIGHASH_SINGLE) respectively;
+without ASAN, gcc's default `-fstack-protector-strong` turns it into a
+deterministic `*** stack smashing detected ***` at exactly 590 bytes and not
+at 589. With the fix, 124/124 match Core.
+
+And the equivalence half, which is what says this changed bounds and not
+behaviour: the 97 vectors the old code could compute at all produce
+**byte-identical** sighashes before and after -- all 75 ordinary mainnet
+transactions among them. Full `make -k test` green.
+
+Two lessons. The first is that a census is a claim about its sampling
+interval, not about the chain: 105 bytes was the honest answer to "every
+5,000th block" and the wrong answer to "does this happen". The second is
+#19's, repeated: this was found by reading the buffer against the consensus
+rule that governs it -- there is no limit on an output script -- and only
+afterwards did the chain turn out to agree.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 

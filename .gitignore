@@ -152,6 +152,7 @@ asm/tests/test_taproot_scriptpath
 asm/tests/test_mul_carry_regression
 asm/tests/test_ecdsa_inverse
 asm/tests/test_segwit_sighash
+asm/tests/test_segwit_txout_bound
 asm/tests/test_p2wpkh_real
 asm/tests/test_mempool_accept_modern
 asm/daemon/wallet_cli

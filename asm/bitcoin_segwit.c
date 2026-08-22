@@ -36,10 +36,23 @@ extern void hash160(uint8_t o[20], const void* in, long long len);
 #define SIGHASH_SINGLE 3
 #define SIGHASH_ANYONECANPAY 0x80
 
-/* ---- compact-size helpers ---- */
-static uint64_t read_cs(const uint8_t** p){
+/* ---- compact-size helpers ----
+ * read_cs is BOUNDED: a compact size is 1, 3, 5 or 9 bytes and the width is
+ * chosen by the first byte, which is itself wire data, so an unchecked reader
+ * runs up to 9 bytes past the end of the transaction buffer whenever a walk
+ * lands on the last byte. Every walk in this file previously did that (the
+ * `nin` and `nout` reads take no bound at all, and the per-input/per-output
+ * reads were only checked AFTER the length had been consumed). The overrun is
+ * read-only and at most 8 bytes, but it is still wire-driven, so the reader
+ * takes the buffer end and reports failure instead. On a transaction that is
+ * actually in bounds -- which is every valid one -- this reads and returns
+ * exactly what the unbounded version did. */
+static uint64_t read_cs(const uint8_t** p, const uint8_t* end, int* ok){
     const uint8_t* b = *p;
+    if (b >= end){ *ok = 0; *p = end; return 0; }
     uint8_t f = *b++;
+    int extra = (f < 0xfd) ? 0 : (f == 0xfd ? 2 : (f == 0xfe ? 4 : 8));
+    if (end - b < extra){ *ok = 0; *p = end; return 0; }
     uint64_t v;
     if (f < 0xfd)      v = f;
     else if (f == 0xfd){ v = b[0] | ((uint64_t)b[1]<<8); b += 2; }
@@ -75,103 +88,156 @@ static void sha256d(uint8_t out[32], const uint8_t* msg, int64_t len){
  * fields BIP143 needs are extracted. */
 typedef struct {
     const uint8_t* tx; int64_t txlen;
+    const uint8_t* end;      /* tx + txlen; every walk below bounds against it */
     int64_t version;
     uint32_t locktime;
     int64_t nin, nout;
     const uint8_t* inputs;   /* first input's prevout */
 } swtx_t;
 
+/* Bytes still available at q. Every bound test below is written as a
+ * "remaining >= wanted" comparison on this value rather than as `q + n > end`:
+ * the lengths come off the wire and can be up to 2^64-1, so forming q+n first
+ * overflows the pointer (undefined, and in practice wraps to a small address
+ * that passes the test). */
+static uint64_t sw_avail(const uint8_t* q, const uint8_t* end){
+    return (uint64_t)(end - q);
+}
+
 static int swtx_parse(swtx_t* t){
     const uint8_t* p = t->tx;
     if (t->txlen < 10) return 0;
+    const uint8_t* end = t->tx + t->txlen;
+    t->end = end;
+    int ok = 1;
     t->version = (int32_t)(p[0]|(p[1]<<8)|(p[2]<<16)|((uint32_t)p[3]<<24));
     p += 4;
     if (p[0] == 0x00 && p[1] == 0x01) p += 2;     /* segwit marker+flag */
-    t->nin = (int64_t)read_cs(&p);
-    if (t->nin <= 0) return 0;
+    t->nin = (int64_t)read_cs(&p, end, &ok);
+    if (!ok || t->nin <= 0) return 0;
     t->inputs = p;                                 /* first prevout */
     const uint8_t* q = p;
     for (int64_t i=0;i<t->nin;i++){
-        if (q + 36 > t->tx + t->txlen) return 0;
+        if (sw_avail(q, end) < 36) return 0;
         q += 36;
-        uint64_t sl = read_cs(&q);
-        if (q + (int64_t)sl + 4 > t->tx + t->txlen) return 0;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || sw_avail(q, end) < sl + 4) return 0;
         q += sl + 4;
     }
-    t->nout = (int64_t)read_cs(&q);
-    for (uint64_t i=0;i<(uint64_t)t->nout;i++){
-        if (q + 8 > t->tx + t->txlen) return 0;
+    t->nout = (int64_t)read_cs(&q, end, &ok);
+    if (!ok || t->nout < 0) return 0;
+    for (int64_t i=0;i<t->nout;i++){
+        if (sw_avail(q, end) < 8) return 0;
         q += 8;
-        uint64_t sl = read_cs(&q);
-        if (q + (int64_t)sl > t->tx + t->txlen) return 0;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || sw_avail(q, end) < sl) return 0;
         q += sl;
     }
-    /* skip witness stack */
-    if (p != t->inputs || 1){ /* we already tracked q from inputs; witness comes after outputs */
-        /* re-detect segwit: version(4), nin(varint) were consumed; if marker/flag
-         * present the input vector started after 2 bytes. We still need to skip
-         * the witness. Re-walk from the start that includes witness count. */
-    }
     /* q now points at the witness section (if segwit) or locktime (if not).
-     * Rather than branch, we only need locktime for BIP143 and witness does
-     * not affect the sighash --- but we must advance over witness to read
-     * locktime. Detect segwit from tx[4:6]. */
+     * We only need locktime for BIP143 and the witness does not affect the
+     * sighash --- but we must advance over the witness to reach locktime.
+     * Detect segwit from tx[4:6]. */
     const uint8_t* w = t->tx + 4;
     int segwit = (w[0]==0x00 && w[1]==0x01);
-    /* q currently at: after outputs. If segwit, we need to skip witness.
-     * Wire format has no overall witness-stack-count field: there is
+    /* Wire format has no overall witness-stack-count field: there is
      * exactly one stack per input, back-to-back (Core's SerializeTransaction
      * writes tx.vin[i].scriptWitness.stack for i in [0, vin.size())). */
     const uint8_t* r = q;
     if (segwit){
         for (int64_t i=0;i<t->nin;i++){
-            uint64_t nitems = read_cs(&r);
+            uint64_t nitems = read_cs(&r, end, &ok);
+            if (!ok) return 0;
             for (uint64_t j=0;j<nitems;j++){
-                uint64_t il = read_cs(&r);
-                if (r + (int64_t)il > t->tx + t->txlen) return 0;
+                uint64_t il = read_cs(&r, end, &ok);
+                if (!ok || sw_avail(r, end) < il) return 0;
                 r += il;
             }
         }
     }
-    if (r + 4 > t->tx + t->txlen) return 0;
+    if (sw_avail(r, end) < 4) return 0;
     t->locktime = (uint32_t)(r[0]|(r[1]<<8)|(r[2]<<16)|((uint32_t)r[3]<<24));
     return 1;
 }
 
-/* prevout (36 bytes) of input i (start of the input vector) */
+/* prevout (36 bytes) of input i, or NULL if the walk runs out of buffer.
+ * swtx_parse has already proven every input in range, so NULL here means the
+ * caller asked for an input that does not exist. */
 static const uint8_t* sw_prevout(const swtx_t* t, int64_t i){
     const uint8_t* q = t->inputs;
+    int ok = 1;
     for (int64_t k=0;k<i;k++){
+        if (sw_avail(q, t->end) < 36) return 0;
         q += 36;
-        uint64_t sl = read_cs(&q); q += sl + 4;
+        uint64_t sl = read_cs(&q, t->end, &ok);
+        if (!ok || sw_avail(q, t->end) < sl + 4) return 0;
+        q += sl + 4;
     }
+    if (sw_avail(q, t->end) < 36) return 0;
     return q;
 }
-/* nSequence of input i */
-static uint32_t sw_seq(const swtx_t* t, int64_t i){
+/* nSequence of input i into *out; 0 if the walk runs out of buffer. */
+static int sw_seq(const swtx_t* t, int64_t i, uint32_t* out){
     const uint8_t* q = t->inputs;
-    for (int64_t k=0;k<i;k++){
+    int ok = 1;
+    for (int64_t k=0;k<=i;k++){
+        if (sw_avail(q, t->end) < 36) return 0;
         q += 36;
-        uint64_t sl = read_cs(&q); q += sl + 4;
+        uint64_t sl = read_cs(&q, t->end, &ok);
+        if (!ok || sw_avail(q, t->end) < sl + 4) return 0;
+        q += sl;
+        if (k == i) break;
+        q += 4;
     }
-    q += 36;
-    uint64_t sl = read_cs(&q); q += sl;
-    return (uint32_t)(q[0]|(q[1]<<8)|(q[2]<<16)|((uint32_t)q[3]<<24));
+    *out = (uint32_t)(q[0]|(q[1]<<8)|(q[2]<<16)|((uint32_t)q[3]<<24));
+    return 1;
 }
-/* serialize n-th output to d */
-static int sw_ser_txout(const swtx_t* t, int64_t i, uint8_t* d){
+/* Serialize output i as a CTxOut (8-byte value || compactsize(len) || script)
+ * into d, which holds cap bytes. Returns the length written, or -1 if it does
+ * not fit / the transaction is malformed -- BEFORE writing anything.
+ *
+ * The cap is the point. Consensus places NO limit on an output's
+ * scriptPubKey size; only relay standardness does, so a miner can include an
+ * output of any length and every node must hash it. This wrote into a
+ * 600-byte STACK buffer at both call sites with no check at all, so a
+ * scriptPubKey of 590 bytes or more smashed the verifying thread's stack
+ * (incident #20 -- the same class as #13's 4096-byte midstate buffers, and
+ * the same class the outputs section of strip_witness below was already
+ * fixed for). */
+static long sw_ser_txout(const swtx_t* t, int64_t i, uint8_t* d, long cap){
+    const uint8_t* end = t->end;
+    int ok = 1;
     /* walk to output i */
     const uint8_t* q = t->tx + 4;
     if (q[0]==0 && q[1]==1) q += 2;
-    read_cs(&q);                      /* nin */
-    for (int64_t k=0;k<t->nin;k++){ q += 36; uint64_t sl=read_cs(&q); q += sl+4; }
-    read_cs(&q);                      /* nout */
-    for (int64_t k=0;k<i;k++){ q += 8; uint64_t sl=read_cs(&q); q += sl; }
+    read_cs(&q, end, &ok);                      /* nin */
+    if (!ok) return -1;
+    for (int64_t k=0;k<t->nin;k++){
+        if (sw_avail(q, end) < 36) return -1;
+        q += 36;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || sw_avail(q, end) < sl + 4) return -1;
+        q += sl+4;
+    }
+    read_cs(&q, end, &ok);                      /* nout */
+    if (!ok) return -1;
+    for (int64_t k=0;k<i;k++){
+        if (sw_avail(q, end) < 8) return -1;
+        q += 8;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || sw_avail(q, end) < sl) return -1;
+        q += sl;
+    }
+    if (sw_avail(q, end) < 8) return -1;
     uint64_t v; v=0; for(int b=0;b<8;b++) v |= (uint64_t)q[b]<<(8*b); q += 8;
-    uint64_t sl = read_cs(&q);
-    w64le(d, v); int n = 8;
+    uint64_t sl = read_cs(&q, end, &ok);
+    if (!ok || sw_avail(q, end) < sl) return -1;
+    /* Bound the WRITE before any byte of it happens. cap is a long and sl is
+     * wire-derived, so compare in 64-bit unsigned and only then narrow. */
+    uint64_t need = 8u + (uint64_t)cs_size(sl) + sl;
+    if (cap < 0 || need > (uint64_t)cap) return -1;
+    w64le(d, v); long n = 8;
     put_cs(d+n, sl); n += cs_size(sl);
-    memcpy(d+n, q, sl); n += (int)sl;
+    memcpy(d+n, q, sl); n += (long)sl;
     return n;
 }
 
@@ -183,19 +249,24 @@ static int sw_ser_txout(const swtx_t* t, int64_t i, uint8_t* d){
 long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     const uint8_t* p = tx;
     if (txlen < 10) return 0;
+    const uint8_t* end = tx + txlen;
+    int ok = 1;
     p += 4;                             /* version */
     int segwit = (p[0] == 0x00 && p[1] == 0x01);
     if (segwit) p += 2;
-    uint64_t nin = read_cs(&p);
-    if (nin <= 0) return 0;
+    uint64_t nin = read_cs(&p, end, &ok);
+    if (!ok || nin == 0) return 0;
     /* walk to witness section start */
     const uint8_t* q = p;
-    for (uint64_t i=0;i<nin;i++){ if (q+36 > tx+txlen) return 0; q += 36;
-        uint64_t sl = read_cs(&q); if (q+(int64_t)sl+4 > tx+txlen) return 0; q += sl+4; }
+    for (uint64_t i=0;i<nin;i++){ if (sw_avail(q, end) < 36) return 0; q += 36;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || sw_avail(q, end) < sl + 4) return 0; q += sl+4; }
     const uint8_t* outs_start = q;      /* nout varint + every CTxOut, verbatim */
-    uint64_t nout = read_cs(&q);
-    for (uint64_t i=0;i<nout;i++){ if (q+8 > tx+txlen) return 0; q += 8;
-        uint64_t sl = read_cs(&q); if (q+(int64_t)sl > tx+txlen) return 0; q += sl; }
+    uint64_t nout = read_cs(&q, end, &ok);
+    if (!ok) return 0;
+    for (uint64_t i=0;i<nout;i++){ if (sw_avail(q, end) < 8) return 0; q += 8;
+        uint64_t sl = read_cs(&q, end, &ok);
+        if (!ok || sw_avail(q, end) < sl) return 0; q += sl; }
     /* q = witness section start (segwit) or locktime (legacy). Wire format
      * has no overall witness-stack-count field: exactly one stack per
      * input, back-to-back. */
@@ -203,13 +274,14 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     const uint8_t* lock = q;
     if (segwit){
         for (uint64_t i=0;i<nin;i++){
-            uint64_t nitems = read_cs(&q);
-            for (uint64_t j=0;j<nitems;j++){ uint64_t il=read_cs(&q);
-                if (q+(int64_t)il > tx+txlen) return 0; q += il; }
+            uint64_t nitems = read_cs(&q, end, &ok);
+            if (!ok) return 0;
+            for (uint64_t j=0;j<nitems;j++){ uint64_t il=read_cs(&q, end, &ok);
+                if (!ok || sw_avail(q, end) < il) return 0; q += il; }
         }
         lock = q;
     }
-    if (lock+4 > tx+txlen) return 0;
+    if (sw_avail(lock, end) < 4) return 0;
     /* rebuild: version + nin + inputs + compactsize(nout) + outputs + locktime */
     uint8_t* d = out;
     long dsz = 0;
@@ -223,12 +295,17 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     /* inputs (scriptSigs preserved; our segwit spends carry empty ones) */
     {
         const uint8_t* in0 = tx + 4; if (segwit) in0 += 2;
-        read_cs(&in0);                       /* skip nin varint */
+        read_cs(&in0, end, &ok);             /* skip nin varint */
+        if (!ok) return 0;
         const uint8_t* it = in0;
         for (uint64_t i=0;i<nin;i++){
             if (dsz + 36 > cap) return 0; memcpy(d, it, 36); d += 36; dsz += 36; it += 36;
-            uint64_t sl = read_cs(&it);
-            if (dsz + cs_size(sl) + (long)sl + 4 > cap) return 0;
+            uint64_t sl = read_cs(&it, end, &ok);
+            if (!ok) return 0;
+            /* cap is a long and sl is wire-derived: compare unsigned before
+             * narrowing, or a >2^63 length turns the test negative and lets
+             * the memcpy through (the same shape as the CTxOut bound above). */
+            if (cap < 0 || (uint64_t)(cap - dsz) < (uint64_t)cs_size(sl) + sl + 4) return 0;
             put_cs(d, sl); d += cs_size(sl); memcpy(d, it, sl); d += sl; dsz += (cs_size(sl)+sl);
             it += sl;
             memcpy(d, it, 4); d += 4; dsz += 4; it += 4;
@@ -288,26 +365,46 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     if (!acp){
         /* hashPrevouts */
         size_t n = 0;
-        for (int64_t i=0;i<t.nin;i++){ if (n+36 > SW_MIDSTATE_CAP) return 0; memcpy(mbuf+n, sw_prevout(&t,i), 36); n += 36; }
+        for (int64_t i=0;i<t.nin;i++){
+            const uint8_t* po = sw_prevout(&t,i);
+            if (!po || n+36 > SW_MIDSTATE_CAP) return 0;
+            memcpy(mbuf+n, po, 36); n += 36;
+        }
         sha256d(hashPrevouts, mbuf, n);
         /* hashSequence */
         if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
             n = 0;
-            for (int64_t i=0;i<t.nin;i++){ if (n+4 > SW_MIDSTATE_CAP) return 0; w32le(mbuf+n, sw_seq(&t,i)); n += 4; }
+            for (int64_t i=0;i<t.nin;i++){
+                uint32_t sq;
+                if (!sw_seq(&t,i,&sq) || n+4 > SW_MIDSTATE_CAP) return 0;
+                w32le(mbuf+n, sq); n += 4;
+            }
             sha256d(hashSequence, mbuf, n);
         }
     }
-    /* hashOutputs */
+    /* hashOutputs. Serialize each CTxOut STRAIGHT into mbuf at the running
+     * offset, bounded by what is left of it: an output's scriptPubKey has no
+     * consensus size limit, so the old 600-byte stack staging buffer was a
+     * remotely-triggerable stack overflow (incident #20). mbuf is 4 MiB --
+     * above MAX_BLOCK_SERIALIZED_SIZE -- so no transaction a valid block can
+     * carry is refused here, and dropping the staging buffer also drops one
+     * memcpy per output. */
     if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
         size_t on = 0;
         for (int64_t i=0;i<t.nout;i++){
-            uint8_t tmp[600]; int k = sw_ser_txout(&t, i, tmp);
-            if (on+(size_t)k > SW_MIDSTATE_CAP) return 0; memcpy(mbuf+on, tmp, k); on += k;
+            long k = sw_ser_txout(&t, i, mbuf+on, (long)(SW_MIDSTATE_CAP - on));
+            if (k < 0) return 0;
+            on += (size_t)k;
         }
         sha256d(hashOutputs, mbuf, on);
     } else if (htype == SIGHASH_SINGLE && n_in < t.nout){
-        uint8_t tmp[600]; int k = sw_ser_txout(&t, n_in, tmp);
-        sha256d(hashOutputs, tmp, k);
+        /* mbuf is free to reuse here: hashPrevouts/hashSequence (the only
+         * other users) have already been folded into their own 32-byte
+         * arrays by the sha256d calls above, and under SIGHASH_SINGLE
+         * hashSequence is not computed at all. */
+        long k = sw_ser_txout(&t, n_in, mbuf, (long)SW_MIDSTATE_CAP);
+        if (k < 0) return 0;
+        sha256d(hashOutputs, mbuf, k);
     }
 
     /* version */
@@ -316,7 +413,11 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     if (p + 64 > pend) return 0; memcpy(p, hashPrevouts, 32); p += 32;
     memcpy(p, hashSequence, 32); p += 32;
     /* outpoint[nIn] */
-    if (p + 36 > pend) return 0; memcpy(p, sw_prevout(&t, n_in), 36); p += 36;
+    {
+        const uint8_t* po = sw_prevout(&t, n_in);
+        if (!po || p + 36 > pend) return 0;
+        memcpy(p, po, 36); p += 36;
+    }
     /* scriptCode (compactsize + bytes) */
     if ((uint64_t)(p - pre) + cs_size(scriptcode_len) + scriptcode_len > (uint64_t)cap) return 0;
     put_cs(p, scriptcode_len); p += cs_size(scriptcode_len);
@@ -324,7 +425,11 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     /* amount */
     if (p + 8 > pend) return 0; w64le(p, amount); p += 8;
     /* nSequence[nIn] */
-    if (p + 4 > pend) return 0; w32le(p, sw_seq(&t, n_in)); p += 4;
+    {
+        uint32_t sq;
+        if (!sw_seq(&t, n_in, &sq) || p + 4 > pend) return 0;
+        w32le(p, sq); p += 4;
+    }
     /* hashOutputs */
     if (p + 32 > pend) return 0; memcpy(p, hashOutputs, 32); p += 32;
     /* locktime */
