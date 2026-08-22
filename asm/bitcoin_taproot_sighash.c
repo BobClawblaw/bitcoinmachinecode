@@ -1,3 +1,4 @@
+#include "bmc_thread.h"
 /* bitcoin_taproot_sighash.c -- BIP341 (Taproot) + BIP342 (Tapscript) signature
  * hashing and taproot spend validation.
  *
@@ -183,17 +184,21 @@ static void agg_hashes(const tapctx_t* c, const txview_t* t,
                        uint8_t h_prev[32], uint8_t h_amt[32],
                        uint8_t h_spk[32], uint8_t h_seq[32])
 {
-    uint8_t buf[4096];
+    /* BIP341 aggregate hashes over all inputs -- unbounded; fixed 4096-byte
+     * stack buffers were a latent overflow (same class as incident #13's
+     * BIP143 bug). Per-thread heap, block-cap sized. */
+    #define TS_AGG_CAP (4u<<20)
+    static __thread uint8_t* buf; BMC_TLS_BUF(buf, TS_AGG_CAP);
     /* prevouts */
     {
         size_t n = 0;
-        for (int64_t i=0;i<c->num_inputs;i++){ memcpy(buf+n, c->prevouts+i*36, 36); n+=36; }
+        for (int64_t i=0;i<c->num_inputs;i++){ if(n+36>TS_AGG_CAP) return; memcpy(buf+n, c->prevouts+i*36, 36); n+=36; }
         sha256_full(h_prev, buf, n);
     }
     /* amounts */
     {
         size_t n = 0;
-        for (int64_t i=0;i<c->num_inputs;i++){ memcpy(buf+n, c->amounts+i*8, 8); n+=8; }
+        for (int64_t i=0;i<c->num_inputs;i++){ if(n+8>TS_AGG_CAP) return; memcpy(buf+n, c->amounts+i*8, 8); n+=8; }
         sha256_full(h_amt, buf, n);
     }
     /* scriptpubkeys (compactsize + data) */
@@ -203,7 +208,7 @@ static void agg_hashes(const tapctx_t* c, const txview_t* t,
         for (int64_t i=0;i<c->num_inputs;i++){
             uint64_t sl = read_cs(&p);
             int cs = cs_size(sl);
-            memcpy(buf+n, p-cs, (size_t)cs + sl); n += (size_t)cs + sl;
+            if(n+600>TS_AGG_CAP) return; memcpy(buf+n, p-cs, (size_t)cs + sl); n += (size_t)cs + sl;
             p += sl;
         }
         sha256_full(h_spk, buf, n);
@@ -256,12 +261,12 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     }
     /* sha_outputs (not NONE, not SINGLE) */
     if (!is_none && !is_single){
-        uint8_t obuf[1024]; size_t on = 0;
+        uint8_t obuf[1024]; size_t on = 0; /* one txout <=~230B in practice; bounded below */
         for (int64_t i=0;i<t.nout;i++){
             int len = ser_txout_len(&t, i);
             uint8_t tmp[600]; int n = ser_txout(&t, i, tmp);
             (void)len;
-            memcpy(obuf+on, tmp, n); on += n;
+            if(on+(size_t)n>sizeof obuf) return 0; memcpy(obuf+on, tmp, n); on += n;
         }
         uint8_t ho[32]; sha256_full(ho, obuf, on);
         if (p + 32 > pend) return 0; memcpy(p, ho, 32); p += 32;
@@ -293,7 +298,8 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     }
     /* annex (BIP341): sha256(compactsize(len) || annex) */
     if (annex_present){
-        uint8_t abuf[4096]; size_t an = 0;
+        static __thread uint8_t* abuf; BMC_TLS_BUF(abuf, TS_AGG_CAP); size_t an = 0;
+        if (cs_size(c->annexlen)+(size_t)c->annexlen > TS_AGG_CAP) return 0;
         put_cs(abuf, c->annexlen); an += cs_size(c->annexlen);
         memcpy(abuf+an, c->annex, (size_t)c->annexlen); an += (size_t)c->annexlen;
         uint8_t ha[32]; sha256_full(ha, abuf, an);
@@ -672,9 +678,8 @@ int taproot_verify_input(const uint8_t* spk,
     ctx.annex = annex; ctx.annexlen = annexlen;
     ctx.weight_left = weight_left;
 
-    static __thread uint8_t ts_main_e[TS_MAX_STACK*TS_ELEM_SIZE];
-    static __thread uint8_t ts_alt_e[TS_MAX_STACK*TS_ELEM_SIZE];
-    static __thread uint8_t ts_work[1<<16];
+    static __thread uint8_t *ts_main_e, *ts_alt_e, *ts_work;
+    BMC_TLS_BUF(ts_main_e, TS_MAX_STACK*TS_ELEM_SIZE); BMC_TLS_BUF(ts_alt_e, TS_MAX_STACK*TS_ELEM_SIZE); BMC_TLS_BUF(ts_work, 1<<16);
 
     uint64_t sp = 0;
     for (uint32_t i = 0; i + 2 < eff; i++) {
@@ -690,7 +695,7 @@ int taproot_verify_input(const uint8_t* spk,
     st.script = (uint8_t*)(uintptr_t)script; st.script_len = slen;
     st.sigversion = TS_SIGV_TAPSCRIPT;
     st.flags = 0;
-    st.work = ts_work; st.work_cap = sizeof ts_work;
+    st.work = ts_work; st.work_cap = 1<<16;
     uint64_t err = 0; st.error_out = &err;
     st.checksig_ctx = &ctx;
     st.checksig_fn  = taproot_checksig_fn;
