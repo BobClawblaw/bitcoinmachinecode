@@ -43,9 +43,15 @@ int main(void){
                                       v->prevouts, v->amounts, v->spks, v->numin,
                                       &reason);
         int pass = (ok == v->expect);
-        printf("%-32s expect=%d got=%d%s%s  %s\n", v->name, v->expect, ok,
-               ok ? "" : "  reason=", ok ? "" : reason, pass ? "PASS" : "FAIL");
-        if (!pass) g_fails++;
+        /* Negative vectors may pin the exact rejection reason too, so a
+         * vector can't "pass" by failing for the wrong cause. */
+        int reason_ok = 1;
+        if (!ok && v->reason && strcmp(reason, v->reason) != 0) reason_ok = 0;
+        printf("%-36s expect=%d got=%d%s%s  %s%s\n", v->name, v->expect, ok,
+               ok ? "" : "  reason=", ok ? "" : reason,
+               (pass && reason_ok) ? "PASS" : "FAIL",
+               (pass && !reason_ok) ? " (wrong reason)" : "");
+        if (!pass || !reason_ok) g_fails++;
     }
     printf("\n%s (%d failure%s)\n", g_fails ? "FAILED" : "ALL PASSED",
            g_fails, g_fails == 1 ? "" : "s");
