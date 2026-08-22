@@ -77,6 +77,51 @@ int main(){
             printf("OK %d %d %s\n", ok?1:0, (int)serror,
                    ScriptErrorString(serror).c_str());
             fflush(stdout);
+        } else if(cmd=="TAPVERIFY"){
+            /* TAPVERIFY <inputidx> <tx_hex_WITH_witness> <n_prev> <amount_i> <spk_i_hex> ...
+             *   -> Core's verdict for a segwit/taproot input, using the real
+             *      consensus flag set at a taproot-active height
+             *      (GetBlockScriptFlags: P2SH|WITNESS|TAPROOT plus the
+             *      always-on DERSIG/NULLDUMMY/CLTV/CSV) and a
+             *      PrecomputedTransactionData built from every spent output --
+             *      which BIP341's aggregate sighash requires and the plain
+             *      VERIFY command above cannot supply. Added 2026-08-22 to
+             *      differentially check the BIP342 initial-stack limit vectors
+             *      (validation/gen_tapscript_stack_vectors.py) against Core
+             *      instead of against a reading of Core. */
+            unsigned idx=0, nprev=0; std::string txs;
+            iss>>idx>>txs>>nprev;
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, txs)) {
+                printf("OK 0 %d %s\n", (int)SCRIPT_ERR_UNKNOWN_ERROR, "tx-decode-fail");
+                fflush(stdout); continue;
+            }
+            std::vector<CTxOut> spent;
+            bool bad=false;
+            for (unsigned i=0;i<nprev;i++){
+                long long amt=0; std::string spkh;
+                if(!(iss>>amt>>spkh)){ bad=true; break; }
+                std::vector<unsigned char> s = hex2bytes(spkh.c_str());
+                spent.emplace_back(CAmount(amt), CScript(s.begin(), s.end()));
+            }
+            if (bad || spent.size()!=nprev || idx>=spent.size() || idx>=mtx.vin.size()){
+                printf("OK 0 %d %s\n", (int)SCRIPT_ERR_UNKNOWN_ERROR, "bad-prevouts");
+                fflush(stdout); continue;
+            }
+            const script_verify_flags tapflags =
+                SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT |
+                SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_NULLDUMMY |
+                SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY | SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
+            CTransaction tx(mtx);
+            PrecomputedTransactionData txdata;
+            txdata.Init(tx, std::vector<CTxOut>(spent));
+            TransactionSignatureChecker checker(&tx, idx, spent[idx].nValue, txdata,
+                                                MissingDataBehavior::FAIL);
+            ScriptError serror = SCRIPT_ERR_UNKNOWN_ERROR;
+            bool ok = VerifyScript(CScript(mtx.vin[idx].scriptSig), spent[idx].scriptPubKey,
+                                   &mtx.vin[idx].scriptWitness, tapflags, checker, &serror);
+            printf("OK %d %d %s\n", ok?1:0, (int)serror, ScriptErrorString(serror).c_str());
+            fflush(stdout);
         } else if(cmd=="SIGHASH"){
             /* SIGHASH <inputidx> <tx_hex> <scriptCode_hex>  -> Core's legacy
                SignatureHash(SIGHASH_ALL). */
