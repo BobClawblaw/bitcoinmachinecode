@@ -1021,9 +1021,22 @@ utxo_lsm_init:
     push r12
     sub  rsp, 0x10
     mov  r12, rdi
+    ; SysV alignment bracket around the ONE C callee on this path.
+    ;   Entry RSP == 8 mod16; `push rbp` -> 0, `push r12` -> 8, `sub 0x10`
+    ;   (0 mod16) -> still 8. Every `call` in this function therefore runs at
+    ;   8 mod16, which violates the ABI. Rather than resize the frame -- which
+    ;   would flip the entry parity delivered to utxo_store_init and
+    ;   mac_tomb_hash_reset and every asm function below them -- correct it for
+    ;   exactly the call that leaves assembly, the way mac_run_lookup already
+    ;   brackets its own C call. lsm_mm_invalidate_all is currently a 5-insn
+    ;   leaf (two rip-relative movs, an add, ret: no frame, no SSE) so this is
+    ;   latent today, but it is one `fprintf` away from incident #18's
+    ;   `movaps %xmm0,-0xc0(%rbp)` -> SIGSEGV(si_addr==NULL). (2026-08-22)
+    sub  rsp, 8
     call lsm_mm_invalidate_all   ; PERF_SCOPE 4.1: a fresh instance restarts
                                   ; run_no/gen at 0, so every cached mapping
                                   ; from a previous instance is now stale
+    add  rsp, 8
     mov  rdi, r12
     call utxo_store_init
     cmp  rax, 1
@@ -2279,9 +2292,15 @@ utxo_lsm_reload:
     mov  qword [rbp-0x110], 0
     mov  qword [rbp-0x118], 0
     mov  qword [rbp-0x120], 0
+    ; SysV alignment bracket -- see the identical note in utxo_lsm_init above.
+    ; This function's 6 pushes + `sub rsp,0x200` leave RSP at 8 mod16 at every
+    ; call; correct it for the one call that leaves assembly, so no asm callee's
+    ; entry parity changes.
+    sub  rsp, 8
     call lsm_mm_invalidate_all   ; PERF_SCOPE 4.1: reload re-derives
                                   ; next_run_no/next_gen from the manifest,
                                   ; so cached mappings may no longer match
+    add  rsp, 8
     mov  rdi, r12
 
     ; open (or reopen) the WAL fds -- utxo_store_reload below assumes

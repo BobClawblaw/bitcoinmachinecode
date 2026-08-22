@@ -169,7 +169,53 @@ didn't, and is a strong tell for this class of bug when you see it.
 
 ---
 
-## 6. Working on this machine
+## 6. Assembly must honour the SysV stack ABI at every `call`
+
+**At the `call` instruction RSP must be 0 mod 16.** The callee then sees
+8 mod 16 on entry (the return address), and its `push rbp` puts the frame back
+at 0. Compiler-generated C assumes this and places 16-byte-aligned SSE spills
+accordingly.
+
+This repo got the same bug twice. Incident #18 (`b18114b`): `node_serve_loop`
+reserved `0x50` after a six-push prologue, leaving RSP at 8 mod 16 at every
+nested call. Incident #20 (audit): `script_eval` reserved `0x100` and did the
+same thing at all 215 of its call sites, including the C `checksig_fn`
+callback on the consensus script path — 43 more functions had the same defect.
+
+Both slept for months, because misalignment is invisible while only assembly
+is called: **every `movdqa` in this tree is register-to-register, with no
+16-byte-aligned stack operand anywhere.** #18 became lethal when a C log call
+landed on the path; #20 would have become lethal at the first `-O2` build or
+the first log line. In both cases the faulting instruction was glibc's
+`movaps %xmm0,-0xc0(%rbp)` inside `vsnprintf`, and the fault address was
+**NULL** — that NULL is the signature of an alignment trap (#GP delivered as
+SIGSEGV), not of a null-pointer dereference.
+
+**In practice**
+
+- Compute the parity, do not eyeball it. Entry is 8 mod 16; each `push` and
+  each `pop` flips it; the frame reservation must be an ODD multiple of 8
+  whenever the push count leaves RSP at 8. A `sub rsp, <multiple of 16>` on
+  top of an odd push count is the bug, every time.
+- A comment claiming a size is "alignment-neutral" or that the asm callees
+  "require" 8 mod 16 is the bug defending itself. Both incidents shipped with
+  one. Preserving a misaligned RSP is not neutral.
+- A `push`/`call`/`pop` bracket inside a function flips the parity for that
+  call only. Pair the push, exactly as `b18114b` did.
+- When only ONE call in a function leaves assembly, bracket that call with
+  `sub rsp,8` / `add rsp,8` instead of resizing the frame. Resizing changes
+  the entry parity delivered to every asm callee below it, and some of them
+  may be silently relying on the broken one.
+- Before changing a caller's parity, check whether any callee is
+  *compensated* — correct only because its caller is wrong.
+  `siphash24_uint256.sipround2` is the live example in this tree.
+- `make abi-check` (`scripts/abi_stack_audit.py`) proves the property over
+  every call site in every `.asm` source. Run it before claiming an assembly
+  change is alignment-safe. Run against `b18114b^` it flags #18 directly.
+
+---
+
+## 7. Working on this machine
 
 See the repo README for the full topology. The traps that recur:
 
