@@ -7,7 +7,7 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-22 -- Incidents #6-#11; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
+## 2026-08-22 -- Incidents #6-#12; verify path 4.4x faster end-to-end; genesis was never in the archive; every stop had been a SIGKILL
 
 A continuous ~16 h session (08-21 evening into 08-22 morning), the second
 half under a standing "deploy, restart, drop and rebuild as needed, update
@@ -237,6 +237,52 @@ Operationally: the Claude session itself died at ~07:25 (no OOM, no crash
 dump, no reboot -- client/API side), with the fix committed in its worktree
 and the daemon idle; resumed at 09:56. The session's background deploy chain
 had survived and was still waiting; killed.
+
+### Incident #12: nested segwit was not implemented, and three bugs underneath it
+
+Block 481824 -- the first real native P2WPKH spend -- passed. Block 481825,
+tx 1668, failed `legacy script verification failed`. Its input 1 is a P2SH
+prevout whose scriptSig is one push of `0014<hash160>` with a two-item
+witness: **P2SH-P2WPKH**, the form nearly every wallet used from 2017 to
+2019. The dispatch (`daemon/tx_verify.c`) classified any P2SH prevout as
+legacy and ran the redeemScript as an ordinary script; it never executed the
+wrapped witness program. `FEATURE_GAPS.md`'s survey had checked native
+P2WPKH/P2WSH/P2TR and never asked about the nested forms.
+
+Before fixing one block at a time, a census of the segwit era from the
+oracle (every 3000th block, 484000 to 762875): P2SH-P2WPKH 129k inputs,
+native P2WPKH 67k, P2WSH multisig for some fifteen distinct m-of-n pairs
+native and wrapped (2-of-3 dominant; first 2-of-3 at 481945, 120 blocks
+after the wall), and ~1,100 "other" P2WSH scripts combining CSV, CLTV,
+OP_IF and hash locks -- HTLC and Lightning shapes -- from ~508000 on. Our
+P2WSH verifier handled exactly two hard-coded shapes. So the scope became
+**general witness-v0 execution through `script_eval`**, native and wrapped,
+rather than nested-segwit alone (`bitcoin_witness_v0.c`, `11f7aa9`;
+Core's `VerifyScript` P2SH-witness branch incl. `WITNESS_MALLEATED_P2SH`,
+`VerifyWitnessProgram` v0, `ExecuteWitnessScript`).
+
+Three genuine bugs surfaced under it, none reachable before:
+1. `bitcoin_interp.asm` `OP_CHECKMULTISIG` ran FindAndDelete of the
+   signatures from the scriptCode **unconditionally**. Core does it only
+   under `SigVersion::BASE`; under WITNESS_V0 it corrupted the scriptCode
+   and would have rejected every valid witness multisig. Gated on BASE; the
+   real h=290328 decoy-pubkey regression still passes.
+2. A transaction mixing a legacy input and a segwit input is
+   witness-serialized, so the **legacy** input's sighash must be computed
+   over the witness-stripped form. First possible at 481825; it would have
+   rejected most early-segwit-era transactions.
+3. The synthetic 2-of-2 vectors used a one-byte `0x00` CHECKMULTISIG dummy
+   (NULLDUMMY requires empty) and had the two signatures reversed relative
+   to pubkey order -- the old index-matching verifier did not care, the
+   interpreter does. Same lesson as #11.
+
+Nine real mainnet spends are pinned through the actual block dispatch
+(`tests/test_segwit_real.c`): P2SH-P2WPKH, P2SH-P2WSH 2-of-3/2-of-2/1-of-1/
+3-of-4, native P2WSH 1-of-2/5-of-7, and native and wrapped HTLC scripts --
+which means CLTV, OP_IF branches and HASH160-of-preimage executed inside a
+witness script under the BIP143 sighash for the first time, against real
+chain data. Plus three negatives. The mempool path
+(`bitcoin_txval_modern.c`) had the same gap and shares the fix.
 
 ## 2026-08-21 -- Two more real production incidents (#4, #5) during Stage D's full-archive replay; checkpoint durability fixed
 
