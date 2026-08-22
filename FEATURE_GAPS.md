@@ -25,30 +25,73 @@ tracks with the project's actual focus to date — proving consensus
 correctness via full historical replay — rather than general node
 operability.
 
-## RPC surface — the single biggest gap
+## RPC surface — still the biggest gap, first tranche landed 2026-08-21
 
-`rpc_dispatch` (`asm/rpc_commands.c:576`) implements exactly **8 methods**:
-`getnewaddress`, `getrawchangeaddress`, `validateaddress`, `getaddressinfo`,
-`gettxout`, `listunspent`, `getbalance`, `decoderawtransaction`. Everything
-else falls through to `-32601 "Method not found"` — confirmed by reading the
-function directly.
+**Implemented** (`asm/rpc_chain.c`, dispatched from `rpc_dispatch` in
+`asm/rpc_commands.c`; shapes follow Core v31's `blockchain.cpp` /
+`rawtransaction.cpp` / `core_io.cpp` field-for-field so a scratch-Core diff
+harness can compare JSON directly):
 
-Checked for these as literal method-name strings across `asm/daemon/*.c` and
-`asm/*.c` — **zero matches, every one**:
-`getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`,
-`getblockheader`, `getrawtransaction`, `sendrawtransaction`,
-`createrawtransaction`, `getpeerinfo`, `getconnectioncount`,
-`getnetworkinfo`, `getblockchaininfo`, `getmempoolinfo`, `stop`, `uptime`,
-`getmininginfo`, `estimatesmartfee`.
+- Blockchain query: `getblockcount`, `getbestblockhash`, `getblockhash`,
+  `getblockheader` (verbose + raw hex), `getblock` (verbosity 0/1/2; 3 acts
+  like 2 — no undo data, same as Core without it), `getblockchaininfo`.
+- Raw tx: `getrawtransaction <txid> [verbosity] <blockhash>` — the exact
+  behaviour Core has with **no txindex and an empty mempool**: succeeds only
+  with a block hash, otherwise Core's own `-5 "No such mempool transaction.
+  Use -txindex or provide a block hash…"`.
+- Node: `uptime`, `stop` (these apply to the `bitcoin_rpcd` process).
 
-There is currently no JSON-RPC way to query chain state, broadcast a raw
-transaction, or inspect node/network/peer status. (`sendtoaddress`/`send`/
-`sign` exist, but only in the separate local CLI tool `wallet_cli.c`, not
-over RPC transport.)
+How it reaches chain state: `bitcoin_rpcd` is a **standalone process**, not
+hosted in `bitcoind serve`. `rpc_chain.c` opens `-datadir` read-only —
+`index.dat`/`blk*.dat` through `bitcoin_store.asm`'s read path, its own
+hash→height table, `chainwork.dat` (recomputed from headers when absent),
+`headers.dat` for the headers count — and `store_reload`s on every request,
+so it tracks the live daemon's appends without a restart. Tested by
+`tests/test_rpc_chain.c` (124 checks: real mainnet genesis as oracle, a
+segwit coinbase, a legacy spend with Core's `[ALL]` sighash decode in
+`scriptSig.asm`, a P2WPKH spend with witness, every error path).
 
-**Effort: large.** This is breadth, not depth — dozens of straightforward
-methods across many categories (blockchain query, network status, raw tx,
-util), each individually small, but there's a lot of it.
+Deliberate, documented divergences (things we refuse to fabricate):
+scriptPubKey `desc` is omitted (no descriptor engine); `address` omitted for
+`witness_unknown`/`anchor`; `verificationprogress` is blocks/headers;
+`initialblockdownload` is "tip older than 24 h".
+
+**Still missing — needs live-node state the RPC process does not have:**
+`getpeerinfo`, `getconnectioncount`, `getnetworkinfo`, `getmempoolinfo`,
+`sendrawtransaction`, `getrawtransaction` without a block hash (mempool
+lookup), `getchaintips` (reorg candidates are not persisted). The honest
+plumbing for these is either hosting the RPC server inside `bitcoind serve`
+(where the peer table and mempool live) or a small IPC/shared-memory
+snapshot the serve process publishes; neither exists yet. Until then these
+return `-32601 Method not found` rather than stubbed answers.
+`createrawtransaction` was skipped as out of scope (the tx builder lives in
+the wallet CLI). Still absent as categories: wallet RPCs beyond the original
+8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, util.
+
+**Effort for the remainder: medium** — the blockchain-query breadth is now
+done; what's left is the one architectural step (RPC ↔ live node state)
+plus straightforward methods on top of it.
+
+## Observed while wiring RPC — not fixed here, flagged for the consensus/storage owners
+
+- **`index.dat` hash byte order vs `bitcoin_idx.asm`.** Verified on the
+  production archive (`pread` of record 0, read-only): records store the
+  hash in **wire (raw sha256d) order**. `bitcoin_idx.asm`'s
+  `idx_build_from_file` header comment says DISPLAY order and byte-reverses
+  every record before `idx_put`, so the table `main.c`'s boot builds from
+  `index.dat` is keyed on reversed hashes. Whether the serve path's
+  `idx_get` compensates was not checked. `rpc_chain.c` sidesteps it by
+  building its own table from raw record bytes.
+- **Production archive record 0 is block 1, not genesis.** Same `pread`:
+  record 0 = `00000000839a8e…` (block 1, 215 bytes), record 1 = block 2,
+  record 2 = block 3. Genesis is not stored, so **stored height h = real
+  height h+1** everywhere the daemon logs a "height". The RPC layer reports
+  the store's own height (consistent with the node's logs and
+  `applied_height`), which means `getblockhash 0` on the production archive
+  returns block 1's hash and `getblockcount` is one less than Core would
+  report. Fixing the mapping is a storage/consensus decision (it also
+  shifts every height-gated activation by one block) and belongs with the
+  Stage D owners, not an RPC patch.
 
 ## Consensus / validation
 

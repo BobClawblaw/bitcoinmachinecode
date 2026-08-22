@@ -8,6 +8,7 @@
  * the actual command-layer data, never fabricated).
  */
 #include "rpc_commands.h"
+#include "rpc_chain.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -570,7 +571,7 @@ int rpc_known_method(const char* method) {
         NULL
     };
     for (int i = 0; known[i]; i++) if (!strcmp(method, known[i])) return 1;
-    return 0;
+    return rpc_chain_known_method(method);
 }
 
 int rpc_dispatch(const char* method, const rj_val* params,
@@ -591,6 +592,12 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_getbalance(params, w, err_code, err_msg, result);
     if (!strcmp(method, "decoderawtransaction"))
         return cmd_decoderaw(params, err_code, err_msg, result);
+    /* blockchain-query / node-status methods (rpc_chain.c) -- read-only over
+     * the on-disk archive; -1 means "not one of its methods". */
+    {
+        int r = rpc_chain_dispatch(method, params, result, err_code, err_msg);
+        if (r >= 0) return r;
+    }
     *err_code = -32601; *err_msg = "Method not found";
     return 0;
 }
