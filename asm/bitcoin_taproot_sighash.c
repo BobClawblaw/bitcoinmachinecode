@@ -556,6 +556,7 @@ uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
  * the legacy/witness-v0 paths' 20000-byte scopy buffer would not. ---- */
 #define TS_ELEM_SIZE      528
 #define TS_MAX_STACK      1000
+#define TS_MAX_ELEM       520     /* Core MAX_SCRIPT_ELEMENT_SIZE */
 #define TS_SIGV_TAPSCRIPT 2
 struct ts_script_state {
     uint8_t*  main_elems; uint64_t main_sp;
@@ -584,6 +585,47 @@ extern int script_eval(struct ts_script_state* st);
  * mirroring how sv_run_v receives the block flag set for the v0 path. */
 #define TS_SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY (1ULL<<9)
 #define TS_SCRIPT_VERIFY_CHECKSEQUENCEVERIFY (1ULL<<10)
+
+/* ---- BIP342 IsOpSuccess (Core script/script.cpp:365) ---- */
+static int ts_is_op_success(unsigned op){
+    return op == 80 || op == 98 || (op >= 126 && op <= 129) ||
+           (op >= 131 && op <= 134) || (op >= 137 && op <= 138) ||
+           (op >= 141 && op <= 142) || (op >= 149 && op <= 153) ||
+           (op >= 187 && op <= 254);
+}
+
+/* Core's tapscript OP_SUCCESSx pre-scan, hoisted OUT of the interpreter.
+ *
+ * script_eval (bitcoin_interp.asm) runs this same scan itself, but it runs it
+ * AFTER taproot_verify_input has already built the initial stack -- and Core's
+ * ExecuteWitnessScript (script/interpreter.cpp:1846-1871) is emphatic that the
+ * scan comes FIRST: "OP_SUCCESSx processing overrides everything, including
+ * stack element size limits". Both the >1000-element and the >520-byte checks
+ * are skipped when an OP_SUCCESSx is present, so a script-path spend with a
+ * 3 MB witness item and an OP_SUCCESSx leaf is consensus-VALID and mineable
+ * today. Getting the order right is therefore not a stylistic point: it decides
+ * whether such an input is accepted (Core) or rejected (us).
+ *
+ * Returns 1 if an OP_SUCCESSx is reachable by a GetOp walk. A truncated push
+ * makes Core's GetOp fail -> SCRIPT_ERR_BAD_OPCODE; we return 0 and let the
+ * interpreter's own walk produce that same rejection a moment later, rather
+ * than duplicating the error path. */
+static int ts_has_op_success(const uint8_t* s, uint64_t n){
+    uint64_t i = 0;
+    while (i < n){
+        unsigned op = s[i++];
+        if (ts_is_op_success(op)) return 1;
+        if (op <= 0x4b)          { i += op; }
+        else if (op == 0x4c)     { if (i + 1 > n) return 0; i += 1 + (uint64_t)s[i]; }
+        else if (op == 0x4d)     { if (i + 2 > n) return 0;
+                                   i += 2 + ((uint64_t)s[i] | ((uint64_t)s[i+1]<<8)); }
+        else if (op == 0x4e)     { if (i + 4 > n) return 0;
+                                   i += 4 + ((uint64_t)s[i] | ((uint64_t)s[i+1]<<8)
+                                           | ((uint64_t)s[i+2]<<16) | ((uint64_t)s[i+3]<<24)); }
+        if (i > n) return 0;     /* push runs off the end: Core's GetOp fails */
+    }
+    return 0;
+}
 
 /* taproot_verify_input(): full dispatch for one P2TR input's witness.
  * Returns 1 valid / 0 invalid; *reason set to a static (never NULL)
@@ -682,6 +724,48 @@ int taproot_verify_input(const uint8_t* spk,
      * executing anything, reserved for future softforks to redefine script
      * semantics under an unrecognized version without a hard fork. */
     if (leaf_version != TAPROOT_LEAF_TAPSCRIPT) return 1;
+
+    /* ---- Core ExecuteWitnessScript's tapscript prologue, IN ITS ORDER
+     * (script/interpreter.cpp:1846-1871): OP_SUCCESSx scan, then the initial
+     * stack's element-COUNT limit, then its element-SIZE limit. All three used
+     * to be missing or mis-ordered here:
+     *
+     *   1. The OP_SUCCESSx scan happened only inside script_eval, i.e. AFTER
+     *      the stack had been built -- see ts_has_op_success's own comment.
+     *   2. The 520-byte per-element limit was NEVER APPLIED on this path at
+     *      all. bitcoin_witness_v0.c:192 has it for witness-v0; the tapscript
+     *      path went straight from the wire into stack_push, which bounds the
+     *      stack DEPTH (MAX_STACK_SIZE) but NOT the element LENGTH
+     *      (bitcoin_scriptcodec.asm:162 -- it copies `len` bytes into a
+     *      528-byte record, no check). A witness item may be nearly a whole
+     *      block (the largest on mainnet today is 3,938,182 B, block 774628),
+     *      so a script-path spend carrying a >524-byte INITIAL-STACK item
+     *      overran ts_main_e -- a 528,000-byte heap buffer -- by up to ~3.4 MB.
+     *      Reachable by any peer, since a block is parsed and verified before
+     *      it is known to be invalid; and legitimately mineable, since case 1
+     *      means an OP_SUCCESSx leaf makes exactly this shape CONSENSUS-VALID.
+     *      Sampling 47,578 real script-path inputs across 68 blocks in
+     *      775,000-869,000 found a maximum initial-stack item of 79 bytes and
+     *      no OP_SUCCESSx leaf at all -- so the archive replay would not have
+     *      tripped this, which is precisely why it needed finding by reading
+     *      the code against Core rather than by waiting for the chain.
+     *   3. The element-COUNT limit was only implicit in stack_push's own
+     *      MAX_STACK_SIZE failure; stated here so the reason string is honest.
+     *
+     * Anything that fails these checks is rejected BEFORE a single byte is
+     * copied onto the stack. ---- */
+    if (ts_has_op_success(script, slen)) return 1;   /* overrides everything below */
+    {
+        uint32_t ninit = eff - 2;                     /* eff >= 2 checked above */
+        if (ninit > TS_MAX_STACK) {
+            *reason = "p2tr tapscript initial stack too large"; return 0;
+        }
+        for (uint32_t i = 0; i < ninit; i++) {
+            if (witlen[i] > TS_MAX_ELEM) {
+                *reason = "p2tr tapscript witness item exceeds 520 bytes"; return 0;
+            }
+        }
+    }
 
     /* BIP342 sigops/witness-size validation-weight budget: ser_size of the
      * ORIGINAL full witness (every one of the nwit items -- annex, control
