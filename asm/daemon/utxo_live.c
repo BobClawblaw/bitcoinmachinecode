@@ -200,6 +200,31 @@ void utxo_live_test_set_crash_after(long n){ g_test_crash_after_applied = n; }
 #define UTXO_LIVE_TEST_CRASH_HOOK(applied_count) \
     do { if (g_test_crash_after_applied >= 0 && (applied_count) == g_test_crash_after_applied) _exit(1); } while (0)
 
+/* TEST-ONLY crash injection, second generation (2026-08-22): the hook above
+ * fires AFTER a block's checkpoint persist, i.e. at the one point in the
+ * per-block cycle where a kill is harmless. The production failure that
+ * motivated this file's crash-recovery path (see utxo_live_recover_partial_
+ * block below) was a SIGKILL landing BEFORE the persist -- after the block's
+ * spends were already durable in the WAL -- so the tests need to be able to
+ * die there too, and mid-block. Two more arming points:
+ *   UTXO_LIVE_CRASH_BEFORE_PERSIST n : _exit(1) right after the n-th block of
+ *                                      this catch-up call has fully applied
+ *                                      (all puts/dels in the WAL), before its
+ *                                      checkpoint is written.
+ *   UTXO_LIVE_CRASH_AFTER_INPUTS   n : _exit(1) right after the n-th
+ *                                      non-coinbase input seen since init
+ *                                      has been captured-and-deleted --
+ *                                      i.e. partway through a block.
+ * Always a no-op in production (one integer compare each). */
+#define UTXO_LIVE_CRASH_BEFORE_PERSIST 1
+#define UTXO_LIVE_CRASH_AFTER_INPUTS   2
+static int  g_test_crash_mode = 0;
+static long g_test_crash_n = -1;
+static long g_test_input_count = 0;
+void utxo_live_test_set_crash(int mode, long n){ g_test_crash_mode = mode; g_test_crash_n = n; }
+#define UTXO_LIVE_TEST_CRASH_AT(mode_, count_) \
+    do { if (g_test_crash_mode == (mode_) && (count_) == g_test_crash_n) _exit(1); } while (0)
+
 /* Shutdown flag, registered by the process that owns the signal handler
  * (daemon/main.c's download worker: utxo_live_set_shutdown_flag(&g_shutdown_
  * requested)). utxo_live_catchup polls it after every block. Until
@@ -214,6 +239,10 @@ void utxo_live_test_set_crash_after(long n){ g_test_crash_after_applied = n; }
 static const volatile sig_atomic_t* g_shutdown_flag = 0;
 void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag){ g_shutdown_flag = flag; }
 static inline int shutdown_requested(void){ return g_shutdown_flag && *g_shutdown_flag; }
+
+/* One-shot per process lifetime (reset by init/close): has the
+ * partially-applied-block check run yet? */
+static int g_recovery_checked = 0;
 
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -293,6 +322,8 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * reads back. */
         long r = undo_capture_and_del(&g_utxo_lst, g_utxo_table, g_apply_height, txid, index);
         if (r == -1) ctx->fatal = 1;
+        g_test_input_count++;
+        UTXO_LIVE_TEST_CRASH_AT(UTXO_LIVE_CRASH_AFTER_INPUTS, g_test_input_count);
         return;
     }
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, txid, index);
@@ -748,14 +779,30 @@ static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
 
 typedef struct { const u8* txid; int fatal; } del_created_ctx_t;
 
+extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
+                         unsigned long* height, unsigned long* is_coinbase,
+                         const u8** script, unsigned long* slen);
+
 static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
                                   const u8* script, u32 slen){
     del_created_ctx_t* c = (del_created_ctx_t*)ctxv;
     (void)value; (void)script; (void)slen;
+    /* Only delete what is actually there. utxo_lsm_del records a tombstone
+     * and decrements the LSM's live counter UNCONDITIONALLY (it cannot know
+     * whether the key exists in an older run without a lookup -- see the
+     * CONTRACT CHANGE note in bitcoin_utxo_lsm.asm), so deleting an output
+     * that was never created (a partial apply that died before that tx's
+     * outputs landed) or already spent (same-block chain, or a descendant
+     * already unapplied) left the count one too low each time. The set
+     * itself was never wrong -- a tombstone over an absent key is a no-op
+     * for lookups -- only the tally, which the heartbeat/logs report. Found
+     * by tests/test_utxo_crash_recovery.c's count check (149 vs 151, 0 vs
+     * 151) after its key-by-key comparison had already passed. One get per
+     * created output, on rollback/unapply paths only. */
+    u64 v=0; unsigned long hh=0, cb=0, sl=0; const u8* sc=0;
+    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1) return;
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index);
-    if (r == -1) c->fatal = 1;   /* 0 (already absent: spent inside this same
-                                  * block, or by a descendant we already
-                                  * unapplied) is expected, not an error */
+    if (r == -1) c->fatal = 1;
 }
 
 /* rollback_partial_apply(blockbuf, blocklen, upto_t_inclusive): reverse
@@ -799,6 +846,88 @@ static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_
 
     undo_discard(height);
     fprintf(stderr, "[utxo_live] rolled back partial apply at h=%ld (tx 0..%lu)\n", height, (unsigned long)upto_t_inclusive);
+}
+
+/* utxo_live_recover_partial_block(store_buf) -> 1 rolled back a partial
+ * block / 0 nothing to do / -1 could not (block unreadable; undo file left in
+ * place so the next call tries again).
+ *
+ * Boot-time repair for a process that died between "block N's puts/dels hit
+ * the WAL" and "checkpoint N persisted". Per-block WAL durability plus a
+ * per-block checkpoint (2fd4a14) closed the OLD unbounded window, but the
+ * two writes are still sequential, and a SIGKILL/OOM/power-loss between them
+ * leaves the reloaded set one block ahead of utxo_applied_height.dat. The
+ * 2fd4a14 comment's "re-applying is safe, duplicate puts/dels are non-error"
+ * was true of the storage layer and is false now that Stage D verifies a
+ * block BEFORE applying it: tx_verify resolves every prevout first, finds
+ * N's already spent, and rejects N as "missing/already-spent UTXO". That is
+ * exactly what production did at height 318148 on 2026-08-22 after systemd
+ * SIGKILLed a worker that was ignoring SIGTERM (now also fixed -- see
+ * shutdown_requested -- but kill -9 and power loss remain).
+ *
+ * Detection: live_on_input appends to undo_<N>.dat BEFORE each delete
+ * (undo_capture_and_del), and that file is only ever discarded by a
+ * completed rollback/unapply. So "undo_<applied+1>.dat exists" means block
+ * applied+1 started applying and its checkpoint never landed -- regardless
+ * of whether it got all the way through. Repair is the same restore-then-
+ * delete two-step rollback_partial_apply uses in-process, over the WHOLE
+ * block (a never-created output deletes as "already absent", which is fine),
+ * then catch-up re-applies N from a clean pre-block state.
+ *
+ * Flush in the middle of N: mac_flush can fire inside any utxo_lsm_put, so
+ * some of N's ops may already be in an immutable run while the rest are in
+ * the WAL. The rollback still works because the LSM is newest-wins: the
+ * restoring put (memtable) shadows the run's tombstone, and the deleting
+ * tombstone (memtable) shadows the run's put. tests/test_utxo_crash_recovery.c
+ * forces exactly that layout and checks the result key-by-key against a
+ * never-crashed reference.
+ *
+ * Torn tail: a kill between undo_append_record's two write()s (or a power
+ * loss mid-write) can leave a header with a short/missing script. That
+ * record's delete never happened (append precedes delete), so treating the
+ * torn tail as end-of-file is exactly right -- undo_replay_tolerant does
+ * that; the strict undo_replay used by the reorg pre-flight is untouched.
+ *
+ * Same-machine SIGKILL needs no fsync here: write() data that returned is
+ * visible to the next process via the page cache. */
+extern long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn);
+
+long utxo_live_recover_partial_block(void* store_buf){
+    long h = g_applied_height + 1;
+    char upath[64]; snprintf(upath, sizeof upath, "undo_%ld.dat", h);
+    struct stat sb;
+    if (stat(upath, &sb) != 0) return 0;
+
+    static u8 blockbuf[8<<20];
+    long len = store_read_at(store_buf, (u64)h, blockbuf, sizeof blockbuf);
+    if (len < 81) {
+        fprintf(stderr, "[utxo_live] RECOVERY: undo_%ld.dat exists (block %ld began applying before the last checkpoint) but block %ld is unreadable (len=%ld) -- cannot roll back, leaving it for retry\n",
+                h, h, h, len);
+        return -1;
+    }
+
+    long saved_apply = g_apply_height;
+    g_apply_height = h;
+    int saved = g_undo_enabled;
+    g_undo_enabled = 0;
+
+    int fatal = 0, torn = 0;
+    long r = undo_replay_tolerant(h, undo_restore_cb, &fatal, &torn);
+    del_created_ctx_t dc = { 0, 0 };
+    int ok = walk_block_txs(blockbuf, (u64)len, &dc, 0, del_created_on_output, &dc.txid, (u64)-1);
+
+    g_undo_enabled = saved;
+    g_apply_height = saved_apply;
+
+    if (r < 0 || fatal || !ok || dc.fatal) {
+        fprintf(stderr, "[utxo_live] RECOVERY FAILED at height %ld: restore r=%ld fatal=%d walk ok=%d del_fatal=%d -- state may be inconsistent\n",
+                h, r, fatal, ok, dc.fatal);
+        return -1;
+    }
+    undo_discard(h);
+    fprintf(stderr, "[utxo_live] RECOVERY: rolled back partially-applied block %ld (previous process died after its spends were durable but before its checkpoint): %ld prevout(s) restored%s, created outputs removed; catch-up will re-apply it\n",
+            h, r, torn ? " (torn trailing undo record ignored -- its delete never ran)" : "");
+    return 1;
 }
 
 /* utxo_live_unapply_block(buf, len, height) -> 1 clean / 0 failed.
@@ -880,6 +1009,8 @@ static int g_bulk_mode = 0;
 extern void txv_set_bulk_mode(int on);
 
 int utxo_live_init(const char* dir){
+    g_recovery_checked = 0;
+    g_test_input_count = 0;
     /* Pick the memtable size from how far behind we actually are. */
     long boot_applied = read_applied_height();
     long boot_tip     = utxo_live_index_tip();
@@ -990,6 +1121,17 @@ int utxo_live_init(const char* dir){
 long utxo_live_catchup(void* store_buf){
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
+
+    /* First call after init: if the previous process died between "block
+     * N's puts/dels hit the WAL" and "checkpoint N persisted", the reloaded
+     * set is one block AHEAD of g_applied_height and re-verifying N would
+     * fail on its own already-spent inputs. Roll N back before touching
+     * anything else (see utxo_live_recover_partial_block). Runs before the
+     * tip check so a caught-up node still repairs itself. */
+    if (!g_recovery_checked) {
+        g_recovery_checked = 1;
+        if (utxo_live_recover_partial_block(store_buf) < 0) return -1;
+    }
     if (tip < 0 || tip <= g_applied_height) return 0;
 
     static u8 blockbuf[8<<20];
@@ -1004,6 +1146,10 @@ long utxo_live_catchup(void* store_buf){
             fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up\n", h);
             return -1;
         }
+        /* Block h is now fully durable in the WAL but NOT yet checkpointed:
+         * this is the window a SIGKILL landed in at height 318148 on
+         * 2026-08-22. The test hook lets a test die exactly here. */
+        UTXO_LIVE_TEST_CRASH_AT(UTXO_LIVE_CRASH_BEFORE_PERSIST, applied + 1);
         g_applied_height = h;
         applied++;
 
@@ -1152,4 +1298,5 @@ void* utxo_live_lst(void){ return &g_utxo_lst; }
 
 void utxo_live_close(void){
     utxo_lsm_close(&g_utxo_lst);
+    g_recovery_checked = 0;
 }
