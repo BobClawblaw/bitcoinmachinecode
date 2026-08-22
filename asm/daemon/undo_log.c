@@ -160,7 +160,7 @@ typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
                                u64 value, u32 height, u8 is_coinbase,
                                const u8* script, u16 slen);
 
-long undo_replay(long height, undo_replay_cb cb, void* ctx){
+static long undo_replay_impl(long height, undo_replay_cb cb, void* ctx, int tolerant, int* torn){
     char path[64]; undo_path(path, height);
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;            /* same contract as undo_load: absent == empty */
@@ -171,7 +171,14 @@ long undo_replay(long height, undo_replay_cb cb, void* ctx){
         u8 hdr[UNDO_HEADER_BYTES];
         long r = read(fd, hdr, UNDO_HEADER_BYTES);
         if (r == 0) break;
-        if (r != UNDO_HEADER_BYTES) { close(fd); return -1; }
+        if (r != UNDO_HEADER_BYTES) {
+            /* Short header at the tail: undo_append_record died between
+             * open and its first write completing (or a power loss tore
+             * it). The matching delete never ran, so in tolerant mode this
+             * is end-of-file, not corruption. */
+            if (tolerant && r > 0) { if (torn) *torn = 1; break; }
+            close(fd); return -1;
+        }
         u32 index; u64 value; u32 utxo_height; u8 is_coinbase; u16 slen;
         memcpy(&index, hdr+32, 4);
         memcpy(&value, hdr+36, 8);
@@ -181,13 +188,35 @@ long undo_replay(long height, undo_replay_cb cb, void* ctx){
         if (slen > UNDO_MAX_SCRIPT) { close(fd); return -1; }
         if (slen > 0) {
             long sr = read(fd, script, slen);
-            if (sr != (long)slen) { close(fd); return -1; }
+            if (sr != (long)slen) {
+                /* Header landed, script didn't: the kill hit between
+                 * undo_append_record's two write()s. Same reasoning --
+                 * the delete that follows the append never happened. */
+                if (tolerant && sr >= 0) { if (torn) *torn = 1; break; }
+                close(fd); return -1;
+            }
         }
         if (cb && !cb(ctx, hdr, index, value, utxo_height, is_coinbase, script, slen)) { close(fd); return -1; }
         n++;
     }
     close(fd);
     return n;
+}
+
+long undo_replay(long height, undo_replay_cb cb, void* ctx){
+    return undo_replay_impl(height, cb, ctx, 0, 0);
+}
+
+/* undo_replay_tolerant: identical, except a torn TRAILING record (short
+ * header or short script at end-of-file) ends the replay instead of failing
+ * it, and reports that via *torn. For boot-time crash recovery ONLY
+ * (daemon/utxo_live.c, utxo_live_recover_partial_block): an append that
+ * never completed is an append whose delete never ran, so stopping there is
+ * exactly correct. The reorg pre-flight keeps the strict variant -- a torn
+ * file is NOT acceptable evidence for disconnecting a block. */
+long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn){
+    if (torn) *torn = 0;
+    return undo_replay_impl(height, cb, ctx, 1, torn);
 }
 
 /* undo_discard(height) -> 1 removed / 0 nothing there.
