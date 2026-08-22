@@ -50,7 +50,7 @@ P2POBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o
 # cons_verify (block consensus) uses pow_check/merkle_root/sha256d + tx_parse.
 CONSOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_cons.o
 
-.PHONY: all asm test clean
+.PHONY: all asm test clean abi-check
 
 all: test
 
@@ -1174,8 +1174,41 @@ tests/test_shared2: tests/test_shared2.c bitcoin_store.o
 tests/test_witness_commitment: tests/test_witness_commitment.c daemon/block_witness.c daemon/block_witness.h tests/block_vec.h bitcoin_tx.o sha256.o bitcoin_hash.o bitcoin_script_flags.o
 	$(CC) $(CFLAGS) -I. -I tests -o $@ tests/test_witness_commitment.c daemon/block_witness.c bitcoin_tx.o sha256.o bitcoin_hash.o bitcoin_script_flags.o
 
-test: tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
+# ---------------------------------------------------------------------------
+# ABI guard -- SysV AMD64 16-byte stack alignment.
+#
+# Incidents #18 (b18114b) and #20 are the same bug: an .asm function reserves a
+# frame whose size leaves RSP at 8 mod 16, so every nested `call` breaks the
+# ABI. Assembly callees never notice; the first C callee added to that path
+# dies inside glibc's vsnprintf on `movaps %xmm0,-0xc0(%rbp)` (#GP -> SIGSEGV,
+# si_addr == NULL).
+#
+# `make abi-check` abstract-interprets RSP mod 16 over every call site in every
+# .asm source and fails if any call that LEAVES assembly is misaligned. Run
+# against b18114b^ it flags node_serve_loop's log_block_stored_inbound call --
+# i.e. it would have caught 5aea7c0 the day it landed.
+#
+# Drop --external-only to see the asm->asm sites too; those are latent (nothing
+# in this tree uses a 16-byte-aligned stack operand) and are tracked in LOG.md.
+# ---------------------------------------------------------------------------
+abi-check:
+	python3 ../scripts/abi_stack_audit.py --asmdir . --objdir . \
+	    --format summary --check --external-only > /dev/null
+
+# Runtime half of the same guard: drives the one place assembly calls back out
+# to C through a function pointer (script_eval -> checksig_fn) and checks the
+# parity directly, then does a printf from that callback -- the exact mechanism
+# that killed the serve child in #18.
+ABIALIGNOBJS := $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o \
+    secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
+    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o
+tests/test_abi_stack_align: tests/test_abi_stack_align.c $(ABIALIGNOBJS)
+	$(CC) $(CFLAGS) -I. -I tests -o $@ tests/test_abi_stack_align.c $(ABIALIGNOBJS)
+
+
+test: abi-check tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack
+	./tests/test_abi_stack_align
 	./tests/test_archive_check
 	./tests/test_archive_repair
 	./tests/test_archive_truncate_nonmonotonic
