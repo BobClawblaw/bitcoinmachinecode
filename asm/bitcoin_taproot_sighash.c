@@ -486,7 +486,16 @@ uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
                              const void* slice)
 {
     taproot_checksig_ctx* c = (taproot_checksig_ctx*)cptr;
-    (void)slice;
+    /* The interpreter's slice is { p, n, codesep_pos } (bitcoin_interp.asm,
+     * interp_slice): p/n are the legacy scriptCode and are irrelevant here;
+     * codesep_pos is BIP342's "opcode position of the last EXECUTED
+     * OP_CODESEPARATOR, or 0xffffffff" that the interpreter tracks for
+     * SIGVERSION_TAPSCRIPT and that SignatureHashSchnorr commits into the
+     * SigMsg after key_version (Core: execdata.m_codeseparator_pos). Falls
+     * back to the ctx's own value when no slice is supplied (direct callers
+     * outside the interpreter). */
+    const struct { const uint8_t* p; size_t n; uint64_t codesep_pos; }* sl = slice;
+    uint32_t codesep_pos = sl ? (uint32_t)sl->codesep_pos : c->codesep_pos;
     if (siglen == 0) return 0;                     /* no signature provided */
     c->weight_left -= 50;
     if (c->weight_left < 0) return 0;               /* BIP342 validation-weight budget exceeded */
@@ -495,7 +504,7 @@ uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
                                      c->tx, c->txlen, c->n_in,
                                      c->prevouts, c->amounts, c->spks,
                                      c->num_inputs, c->tapleaf,
-                                     c->codesep_pos, c->annex, c->annexlen, NULL);
+                                     codesep_pos, c->annex, c->annexlen, NULL);
     return (uint64_t)r;
 }
 
@@ -559,21 +568,15 @@ extern int script_eval(struct ts_script_state* st);
  * n_in: this input's index WITHIN ITS OWN TRANSACTION (0-based) -- matches
  * every other function in this file, NOT a block-wide flat index.
  *
- * KNOWN, DELIBERATE LIMITATION: does not track OP_CODESEPARATOR position
- * inside a tapscript for the BIP342 codesep_pos sighash field (always
- * 0xffffffff, "none executed"). This is safety-neutral to omit: a
- * tapscript that actually executes OP_CODESEPARATOR before a CHECKSIG
- * would get a sighash preimage that differs from the real one, and any
- * genuinely valid signature over the REAL sighash would then fail to
- * verify here -- a false-REJECT, never a false-accept (the final gate is
- * always a real Schnorr verify over whatever sighash got computed; an
- * attacker cannot leverage a wrong sighash to forge acceptance of a bad
- * signature). OP_CODESEPARATOR inside a tapscript is essentially unheard
- * of on real chain data. To avoid ever silently mis-verifying rather than
- * cleanly refusing, any tapscript containing the raw byte 0xab anywhere is
- * refused outright before execution (over-conservative -- a 0xab byte
- * inside push DATA also refuses -- but always safe and always loud, never
- * silent). */
+ * OP_CODESEPARATOR inside a tapscript (BIP342 codesep_pos): tracked by the
+ * interpreter itself -- script_eval records the opcode position of the last
+ * EXECUTED OP_CODESEPARATOR (0xffffffff if none, unexecuted branches don't
+ * count) and hands it to taproot_checksig_fn through interp_slice's third
+ * field at every CHECKSIG/CHECKSIGADD, where it lands in the SigMsg after
+ * key_version exactly as Core's SignatureHashSchnorr serializes
+ * execdata.m_codeseparator_pos. (Until 2026-08-21 this was not tracked and
+ * any tapscript containing a raw 0xab byte -- even inside push data, e.g.
+ * a pubkey -- was refused outright; that scan is gone.) */
 int taproot_verify_input(const uint8_t* spk,
                          const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
                          const uint8_t* tx, int64_t txlen, int64_t n_in,
@@ -651,16 +654,6 @@ int taproot_verify_input(const uint8_t* spk,
      * executing anything, reserved for future softforks to redefine script
      * semantics under an unrecognized version without a hard fork. */
     if (leaf_version != TAPROOT_LEAF_TAPSCRIPT) return 1;
-
-    /* See this function's header comment: OP_CODESEPARATOR (0xab) inside a
-     * known-leaf-version tapscript is not tracked; refuse rather than risk
-     * a silently-wrong sighash. */
-    for (uint64_t i = 0; i < slen; i++) {
-        if (script[i] == 0xab) {
-            *reason = "p2tr tapscript uses OP_CODESEPARATOR (not supported)";
-            return 0;
-        }
-    }
 
     /* BIP342 sigops/witness-size validation-weight budget: ser_size of the
      * ORIGINAL full witness (every one of the nwit items -- annex, control

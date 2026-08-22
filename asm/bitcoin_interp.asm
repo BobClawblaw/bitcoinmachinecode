@@ -266,7 +266,12 @@ global interp_slice
 interp_tmp: resb ELEM_SIZE
 bool_buf: resb 1
 interp_err: resq 1
-interp_slice: resq 2
+; interp_slice: { p, n, codesep_pos }. p/n = the scriptCode slice starting at
+; the last executed OP_CODESEPARATOR (legacy/witness-v0 sighash).
+; codesep_pos = BIP342 opcode position of the last EXECUTED OP_CODESEPARATOR,
+; 0xffffffff if none (tapscript sighash field); only set meaningfully under
+; SIGVERSION_TAPSCRIPT -- legacy checksig_fn readers look at p/n only.
+interp_slice: resq 3
 
 section .text
 
@@ -283,6 +288,8 @@ section .text
 ; Frame: r12=state throughout. Locals:
 ;   -0x08 fExec   -0x10 pc   -0x18 pend   -0x20 pbegincodehash
 ;   -0x28 nOpCount -0x30 opcode_pos -0x38 opcode -0x40 pushlen
+;   -0x48 codesep_pos (BIP342: opcode_pos of the last EXECUTED
+;         OP_CODESEPARATOR, 0xffffffff if none; tapscript only)
 ;   -0x60 &interp_tmp (this thread)   -0x68 &bool_buf   -0x70 &interp_err
 ;   -0x78 &interp_slice   -0x80 &cms_keyrefs   -0x88 &cms_sigrefs
 ;   -0x90 &elem_tmp0   -0x98 &elem_tmp1   -0xA0 &elem_tmp2   -0xA8 &elem_tmp3
@@ -348,6 +355,8 @@ script_eval:
     mov   [rbp-0x20], rax
     mov   qword [rbp-0x28], 0
     mov   qword [rbp-0x30], 0
+    mov   rax, 0xffffffff          ; codesep_pos = "none executed" (Core:
+    mov   [rbp-0x48], rax          ; execdata.m_codeseparator_pos = 0xFFFFFFFF)
     call  vfexec_sp_reset
 
     ; ---- tapscript OP_SUCCESSx pre-scan (BIP342 / ExecuteWitnessScript) ----
@@ -1909,8 +1918,21 @@ script_eval:
     jmp   .err_ret0
 
 .op_cs:
+    ; Reached only when EXECUTED (fExec), like Core's switch arm
+    ; (interpreter.cpp, case OP_CODESEPARATOR): pbegincodehash = pc for the
+    ; legacy/witness-v0 scriptCode, and -- tapscript only -- record
+    ; execdata.m_codeseparator_pos = opcode_pos. [rbp-0x30] counts every
+    ; opcode iterated so far (pushes and unexecuted branches included) and
+    ; is bumped at .next_op AFTER this op, so right now it holds this
+    ; OP_CODESEPARATOR's own 0-based position -- the same value Core's
+    ; for-loop post-increment (++opcode_pos) leaves it at.
     mov   rax, [rbp-0x10]
     mov   [rbp-0x20], rax
+    mov   eax, dword [r12+48]
+    cmp   rax, SIGVERSION_TAPSCRIPT
+    jne   .next_op
+    mov   rax, [rbp-0x30]
+    mov   [rbp-0x48], rax
     jmp   .next_op
 
 ; ============================================================================
@@ -2493,6 +2515,8 @@ interp_checksig:
     sub   rax, [rbp-0x20]
     TLS_ADDR r10, interp_slice
     mov   [r10+8], rax
+    mov   rax, [rbp-0x48]     ; BIP342 codesep_pos -> slice[2] (tapscript)
+    mov   [r10+16], rax
     ; args
     mov   rdi, [r12+88]
     lea   rsi, [r13+ELEM_DATA_OFF]
@@ -2543,6 +2567,8 @@ interp_checksig_add:
     sub   rax, [rbp-0x20]
     TLS_ADDR r10, interp_slice
     mov   [r10+8], rax
+    mov   rax, [rbp-0x48]     ; BIP342 codesep_pos -> slice[2] (tapscript)
+    mov   [r10+16], rax
     mov   rdi, [r12+88]
     lea   rsi, [r13+ELEM_DATA_OFF]
     mov   rdx, rbx
