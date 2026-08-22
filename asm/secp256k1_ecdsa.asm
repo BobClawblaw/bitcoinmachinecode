@@ -243,6 +243,11 @@ ecdsa_verify:
     push r15
     sub  rsp, 0x2c8         ; below save area [rbp-8..-0x28]; 0x2c8==8 mod16
                             ; -> rsp 0 mod16 at nested calls. Covers -0x280.
+    and  rsp, -16           ; ...only if the caller was aligned, which the
+                            ; interpreter -> sv_checksig chain does not
+                            ; guarantee. This function now calls C
+                            ; (bmc_ecdsa_glv_enabled), so align here; every
+                            ; local is rbp-relative and .done restores from rbp.
 
     ; arg pointers in callee-saved regs (helpers preserve them):
     ;   r12=Qx  r13=Qy  r14=r  r15=z
@@ -363,7 +368,7 @@ ecdsa_verify:
 .invalid:
     xor eax, eax
 .done:
-    add rsp, 0x2c8
+    lea rsp, [rbp-0x28]     ; == rsp after the 5 pushes (rsp was and-ed)
     pop r15
     pop r14
     pop r13

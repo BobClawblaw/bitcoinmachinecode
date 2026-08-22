@@ -1123,6 +1123,15 @@ point_scalar_mul_glv:
     push r14
     push r15
     sub  rsp, 0x6f8
+    ; Force 16-byte alignment regardless of the CALLER's alignment: the
+    ; all-asm interpreter -> sv_checksig -> ecdsa_verify chain can arrive
+    ; here with rsp == 8 (mod 16) on the CHECKMULTISIG path, and glv_wnaf is
+    ; gcc-compiled C whose SSE spills (movaps to the stack) fault on a
+    ; misaligned frame -- found by tests/test_scriptverify_parity with
+    ; BMC_ECDSA_GLV=1 (the direct-call harnesses were aligned by luck).
+    ; Every local is rbp-relative, so rounding rsp down is safe; the
+    ; epilogue restores rsp from rbp instead of adding the constant back.
+    and  rsp, -16
     mov  r12, rdi
     mov  r13, rsi
     mov  rax, [rdx+0]
@@ -1390,7 +1399,7 @@ point_scalar_mul_glv:
     mov  qword [r12+88], 0
 
 .done:
-    add  rsp, 0x6f8
+    lea  rsp, [rbp-0x28]           ; == rsp after the 5 pushes (rsp was and-ed)
     pop  r15
     pop  r14
     pop  r13
