@@ -305,3 +305,6 @@ asm/tests/fixtures/blk_6*.bin
 
 # live-config backups taken before operational edits
 config/bitcoin.conf.bak-*
+asm/tests/fixtures/
+asm/tests/fixtures/
+asm/tests/test_block_481827_pool_stack

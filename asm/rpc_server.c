@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "bmc_thread.h"
 #include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -374,7 +375,7 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     if (actual_port) *actual_port = ntohs(a.sin_port);
 
     g_run = 1;
-    if (pthread_create(&g_thread, NULL, server_thread, NULL) != 0) {
+    if (bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {
         if (errmsg && errcap) snprintf(errmsg, errcap, "pthread_create failed");
         close(g_listen_fd); g_listen_fd = -1;
         return -1;

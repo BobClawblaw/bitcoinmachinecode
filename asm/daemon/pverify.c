@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "../bmc_thread.h"
 #include <signal.h>
 
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
@@ -145,7 +146,7 @@ int main(int argc,char**argv){
         next+=cnt;
     }
     for(long w=0; w<workers; w++){
-        if(pthread_create(&th[w],NULL,range_thread,&args[w])!=0){ fprintf(stderr,"pthread_create fail\n"); return 1; }
+        if(bmc_pthread_create(&th[w],range_thread,&args[w])!=0){ fprintf(stderr,"pthread_create fail\n"); return 1; }
         spawned++;
     }
     for(long w=0; w<spawned; w++) pthread_join(th[w],NULL);

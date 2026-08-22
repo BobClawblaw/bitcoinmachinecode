@@ -1,3 +1,4 @@
+#include "bmc_thread.h"
 /* bitcoin_txval_modern.c -- whole-transaction mempool-acceptance validator for
  * modern output types (P2WPKH / P2WSH / P2TR), the acceptance gate that sits
  * on top of the mempool POLICY layer (bitcoin_mempool_policy.c) and runs a full
@@ -215,10 +216,10 @@ int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
                 if (wver != 0){ g_reason = "unknown witness version (policy: discouraged)"; return 0; }
                 if (wplen == 20 && in->nwit != 2){ g_reason = "p2wpkh needs 2 witness items"; return 0; }
                 if (wplen == 32 && in->nwit < 1){ g_reason = "p2wsh needs witnessScript"; return 0; }
-                static __thread uint8_t sv_work[1<<20];
+                static __thread uint8_t* sv_work; BMC_TLS_BUF(sv_work, 1<<20);
                 int err = sv_verify_witness_v0(wprog, wplen, in->wit, in->witlen, in->nwit, in->amount,
                                                MV_WITNESS_FLAGS, (unsigned long)i, tx, (unsigned long)txlen,
-                                               sv_work, sizeof sv_work);
+                                               sv_work, (unsigned long)(1<<20));
                 if (err != 0){ g_reason = wplen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
                 continue;
             }

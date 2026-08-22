@@ -73,6 +73,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "../bmc_thread.h"
 #include <semaphore.h>
 
 typedef unsigned char u8;
@@ -258,8 +259,8 @@ static int is_p2tr  (const u8* spk, u32 sl){ return sl==34 && spk[0]==0x51 && sp
  * preserved. Returns the tx unchanged when it carries no witness. */
 static const u8* legacy_tx_view(const u8* tx, u64 txlen, u64* out_len){
     if (txlen < 6 || !(tx[4]==0x00 && tx[5]==0x01)) { *out_len = txlen; return tx; }
-    static __thread u8 stripped[1<<20];
-    long n = strip_witness(tx, (int64_t)txlen, stripped, (long)sizeof stripped);
+    static __thread u8* stripped; BMC_TLS_BUF(stripped, 1<<20);
+    long n = strip_witness(tx, (int64_t)txlen, stripped, (long)(1<<20));
     if (n <= 0) { *out_len = txlen; return tx; }   /* fall back; sv will reject on a bad hash */
     *out_len = (u64)n; return stripped;
 }
@@ -312,7 +313,7 @@ typedef struct {
 
 static void* txv_worker_thread(void* argp){
     txv_worker_arg_t* a = (txv_worker_arg_t*)argp;
-    static __thread u8 sv_work[1<<20];   /* per-THREAD, not per-process --
+    static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);   /* per-THREAD, not per-process --
                                           * threads share g_txv_results and
                                           * the process's other statics, so
                                           * this one specifically must stay
@@ -324,7 +325,7 @@ static void* txv_worker_thread(void* argp){
     for (u64 i=a->lo;i<a->hi;i++){
         if (g_txv_in[i].shape == TXV_SHAPE_P2TR) { g_txv_results[i].ok = 1; continue; }
         const char* r = 0;
-        int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, sizeof sv_work, &r);
+        int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
@@ -349,7 +350,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         for (u64 i=0;i<nin;i++){
             if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
             const char* r = 0;
-            if (!txv_verify_one(tx, txlen, i, flags, sv_work, sizeof sv_work, &r)) {
+            if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
                 *reason = r; return 0;
             }
         }
@@ -372,7 +373,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         if (lo >= hi) break;
         args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
         args[spawned].lo = lo; args[spawned].hi = hi;
-        if (pthread_create(&tids[spawned], 0, txv_worker_thread, &args[spawned]) != 0){
+        if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){
             /* thread creation failed partway: whatever didn't get a thread
              * (including this one) stays at its zeroed g_txv_results slot
              * and is picked up by the "finish inline" sweep below -- same
@@ -828,7 +829,7 @@ static int g_txvb_done_sem_ready = 0;
  * calls _exit(0), which tears down every thread regardless of state). */
 static void* txvb_worker_loop(void* argp){
     txvb_worker_slot_t* w = (txvb_worker_slot_t*)argp;
-    static __thread u8 sv_work[1<<20];  /* per-THREAD -- see txv_worker_thread's
+    static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);  /* per-THREAD -- see txv_worker_thread's
                                          * own comment above, identical reasoning.
                                          * Now allocated once for this worker's
                                          * whole process-lifetime, not once per
@@ -838,7 +839,7 @@ static void* txvb_worker_loop(void* argp){
         for (u64 i=w->lo;i<w->hi;i++){
             if (w->flat[i].shape == TXV_SHAPE_P2TR) { w->res[i].ok = 1; continue; }
             const char* r = 0;
-            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, sizeof sv_work, &r);
+            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, &r);
             w->res[i].ok = ok ? 1 : 0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
@@ -858,7 +859,7 @@ static int txvb_pool_ensure(int need){
     while (g_txvb_pool_size < need){
         txvb_worker_slot_t* w = &g_txvb_pool[g_txvb_pool_size];
         sem_init(&w->work_sem, 0, 0);
-        if (pthread_create(&w->tid, 0, txvb_worker_loop, w) != 0) break;
+        if (bmc_pthread_create(&w->tid, txvb_worker_loop, w) != 0) break;
         g_txvb_pool_size++;
     }
     return g_txvb_pool_size;
@@ -888,7 +889,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         for (u64 i=0;i<total;i++){
             if (flat[i].shape == TXV_SHAPE_P2TR) continue;
             const char* r = 0;
-            int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work, sizeof sv_work, &r);
+            int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work, 1<<20, &r);
             res[i].ok = ok?1:0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason,r,n); res[i].reason[n]=0; }
         }
