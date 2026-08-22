@@ -157,6 +157,7 @@ asm/daemon/bitcoin_rpcd
 asm/tests/test_rpc_json
 asm/tests/test_rpc_transport
 asm/tests/test_rpc_server
+asm/tests/test_rpc_chain
 asm/rpc_json.o
 asm/rpc_net.o
 asm/rpc_commands.o

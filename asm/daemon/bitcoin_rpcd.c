@@ -16,6 +16,7 @@
 #include "../rpc_server.h"
 #include "../rpc_json.h"
 #include "../rpc_commands.h"
+#include "../rpc_chain.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,7 @@ static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 /* ---- minimal bitcoin.conf reader (key=value, '#' comments, empty lines) ---- */
+static long g_prune_mib = 0;
 static void load_config(const char* path, int* port,
                         char* user, size_t usercap,
                         char* pass, size_t passcap) {
@@ -160,6 +162,7 @@ static void load_config(const char* path, int* port,
         if (strcmp(key, "rpcport") == 0) *port = atoi(val);
         else if (strcmp(key, "rpcuser") == 0) snprintf(user, usercap, "%s", val);
         else if (strcmp(key, "rpcpassword") == 0) snprintf(pass, passcap, "%s", val);
+        else if (strcmp(key, "prune") == 0) g_prune_mib = atol(val);
     }
     fclose(f);
 }
@@ -208,7 +211,9 @@ int main(int argc, char** argv) {
                 "  -datadir=<path>  enables real gettxout against the LSM UTXO store in <path>,\n"
                 "                   and (if <path>/addr_index.dat exists, see daemon/build_\n"
                 "                   addr_index.c) real listunspent/getbalance\n"
-                "                   (omit to serve those as \"not found\"/empty for everything)\n");
+                "                   (omit to serve those as \"not found\"/empty for everything),\n"
+                "                   and the blockchain-query RPCs (getblock*, getblockchaininfo,\n"
+                "                   getrawtransaction <txid> <verbosity> <blockhash>) against its archive\n");
             return 0;
         }
     }
@@ -230,6 +235,14 @@ int main(int argc, char** argv) {
             fprintf(stderr, "bitcoin_rpcd: address index init failed\n");
             return 1;
         }
+        /* Blockchain-query RPCs (getblock*, getblockchaininfo, getrawtransaction
+         * with a block hash) read the archive in this same directory. Optional:
+         * without index.dat those methods answer -28 "Loading block index...". */
+        rpc_chain_set_prune_mib(g_prune_mib);
+        if (rpc_chain_open(NULL))
+            fprintf(stderr, "bitcoin_rpcd: block archive opened (blockchain-query RPCs live)\n");
+        else
+            fprintf(stderr, "bitcoin_rpcd: no block archive in datadir (blockchain-query RPCs will report -28)\n");
     }
 
     rpc_server_cfg cfg;
