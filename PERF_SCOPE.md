@@ -966,3 +966,75 @@ from field arithmetic alone. Getting past that requires the UTXO/apply path
 and the archive read path to come down too — which is why §4.1's mmap work
 (kernel 31 % → 5 %) mattered so much and why the next profile after §6.2
 lands should be taken before choosing anything here.
+
+## 7. The re-profile that changed the answer — 2026-08-22, height ≈ 617,000
+
+§6.6 said to re-profile before choosing the next lever. Doing so immediately
+after deploying the field rewrite (§5.2) invalidated the ranking in §6.
+
+Method: `perf record -p <worker> -F 999` for 20 s, **no call-graph** (self
+time only — an inclusive `-g` profile misled a diagnosis earlier the same
+day), 132,785 samples, live replay at height ~617,000.
+DSO split: bitcoind 92.3 % · libc 6.0 % · kernel 1.8 %.
+
+| self time | symbol | where |
+|---|---|---|
+| **22.44 %** | **`read_cs`** | `bitcoin_segwit.c` compactsize reader |
+| 17.10 % | `fe_mul.reduce` | field |
+| 15.89 % | `fe_mul` | field |
+| 5.92 % | `sw_seq` | `bitcoin_segwit.c` |
+| 5.71 % | `sw_prevout` | `bitcoin_segwit.c` |
+| 3.85 % | `__memmove_avx512` | libc |
+| 3.69 % | `fe_add` | field |
+| 2.36 % | `fe_sub` | field |
+| 1.66 % | `point_double` | EC |
+| 1.45 % | `sha256_block_shani` | hashing |
+| 1.37 % | `fe_sqr` | field |
+
+**Two shifts, both decisive.**
+
+**1. Crypto is no longer dominant.** It was 74 % of cycles at height ~390 k
+(§2/§4.6); it is now roughly 45 %, and `fe_mul`+`reduce` is 33 % where
+`fe_mul` alone was 55.9 %. Part of that is §5.2's own doing; the rest is
+that the UTXO set has grown to ~106 M entries, so the storage and
+serialisation sides have grown around the crypto. This is why the deployed
+field rewrite delivered **~1.15 × end-to-end** (10.31 vs 8.95 blk/s at
+comparable depth) against a ~1.40 × projection computed from the *old*
+shares. The projection arithmetic was right; its input was stale. Amdahl
+inputs age — re-measure them, never carry them forward.
+
+**2. `read_cs` + `sw_seq` + `sw_prevout` = 34 %, and it is an O(n²) bug,
+not a constant factor.**
+
+`sw_prevout(t,i)` and `sw_seq(t,i)` each walk the input list **from the
+start** to reach input `i`, parsing a compactsize per step — and BIP143's
+hashPrevouts/hashSequence call them once per input. That is O(nin²)
+varint reads. `sw_ser_txout(t,i)` is worse: it re-walks every input *and*
+the first `i` outputs on each call, so hashOutputs is O(nin·nout + nout²).
+For the 1,372-input transaction in `CHAIN_AHEAD_CENSUS.md` that is ~1.9 M
+redundant reads for hashPrevouts alone.
+
+Core does not have this cost at all: `PrecomputedTransactionData` walks the
+transaction **once** and hashes the three vectors in a single pass.
+
+**The fix is a single-pass precompute** — walk the tx once recording each
+input's and output's offset, then index. It removes a super-linear term
+whose weight grows with transaction size, which is exactly the direction
+the remaining chain is heading (segwit-era blocks carry far larger
+transactions than the ~390 k blocks the original profile sampled).
+
+**Revised lever order**, replacing §6's:
+
+1. **Single-pass BIP143 precompute** — ~34 % of cycles, removes an O(n²)
+   term, contained to one file, no new instruction set, no consensus-format
+   change. Biggest and safest win available.
+2. Re-profile again. The shares will have moved again.
+3. G-side comb table (§4.5) — `fe_mul` is still ~33 %, so the field path
+   still matters, just less than it did.
+4. §6.3 IFMA / §6.4 BIP340 batch — both still real, both still gated on the
+   deferred-verify restructure that §5.2(b) identified as the actual
+   prerequisite.
+
+The general lesson, twice over in one session: a performance plan built on
+a profile is only as current as the profile. This one was ~227,000 blocks
+stale and it inverted the top of the list.
