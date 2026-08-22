@@ -72,11 +72,19 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
  * in this file. Sized to comfortably cover the fixed-size scriptPubKey
  * forms this validator actually supports (P2WPKH 22B, P2WSH/P2TR 34B). */
 #define PREV_SPK_BUF_MAX 42
+/* Mempool-admission witness-item cap. This is a simplified standardness
+ * parser (inputs/outputs also bounded at 16 below); mempool policy may be
+ * stricter than consensus, so a modest inline bound is fine here. It was 16,
+ * which rejected an ordinary >16-item P2WSH witness (e.g. a 15-of-15 or an
+ * HTLC-style script). 100 covers realistic standard witnesses cheaply on the
+ * stack. CONSENSUS block validation is daemon/tx_verify.c, which pools the
+ * items and admits the full ~1004-item range -- see TXV_MAX_WIT_ITEMS. */
+#define MV_MAX_WIT 100
 typedef struct {
     uint8_t outpoint[36];
     uint8_t scriptSig[64]; uint32_t scriptSiglen;   /* 35 for P2SH-P2WSH (0x22 + 34); was 32, which silently truncated it */
     uint32_t sequence;
-    const uint8_t* wit[16]; uint32_t witlen[16]; uint32_t nwit;
+    const uint8_t* wit[MV_MAX_WIT]; uint32_t witlen[MV_MAX_WIT]; uint32_t nwit;
     uint64_t amount;
     uint8_t prev_spk_buf[PREV_SPK_BUF_MAX];
     const uint8_t* prev_spk; uint32_t prev_spklen;
@@ -140,7 +148,7 @@ static int mv_parse(mv_tx_t* T){
         for (uint64_t i=0;i<nin;i++){
             inrec_t* in = &T->in[i];
             uint64_t nitems = rd_cs(&p);
-            if (nitems > 16) return 0;
+            if (nitems > MV_MAX_WIT) return 0;
             in->nwit = (uint32_t)nitems;
             for (uint64_t j=0;j<nitems;j++){
                 uint64_t il = rd_cs(&p);
