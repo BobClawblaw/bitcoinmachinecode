@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -1181,6 +1182,7 @@ long utxo_live_catchup(void* store_buf){
 
     static u8 blockbuf[8<<20];
     long applied = 0;
+    time_t last_progress_log = 0;   /* 0 => the first block prints immediately (restart-visible) */
     for (long h = g_applied_height + 1; h <= tip; h++){
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         if (len < 81) {
@@ -1248,6 +1250,25 @@ long utxo_live_catchup(void* store_buf){
             break;
         }
 
+        /* Progress heartbeat -- log-only, independent of the per-block
+         * checkpoint above and the compaction below. Emit at most one line
+         * per ~30 s of wall-clock, AND always on a round absolute-height
+         * milestone. Absolute (h), not the session-relative `applied`, so the
+         * same heights print across runs and the first line lands the moment
+         * a resume starts applying -- not 20000 blocks later. The old
+         * `applied % 20000` was both throughput-blind (interval swung with
+         * block density) and restart-delayed (a resume went silent until it
+         * had applied 20000 blocks, which masked whether it was progressing).
+         * time(NULL) once per applied block is negligible against a block's
+         * verify+apply cost. */
+        {
+            time_t now = time(NULL);
+            if (now - last_progress_log >= 30 || h % 20000 == 0) {
+                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
+                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
+                last_progress_log = now;
+            }
+        }
         /* Compact periodically DURING a long catch-up, not just once at the
          * end. A from-scratch (or long-gap) replay flushes far more runs
          * than a steady-state catch-up call ever would, and the manifest
@@ -1257,10 +1278,6 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
-        if (applied % 20000 == 0) {
-            fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
-                    h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
-        }
         if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
