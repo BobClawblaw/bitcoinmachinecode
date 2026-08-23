@@ -68,9 +68,15 @@ was built to make the rule testable against Core, which was the right
 instinct; what never happened is the step where the rule moves into the path
 the daemon actually runs, with the shim reduced to a driver for it.
 
-Worth auditing for the same shape: every `asm/tests/*_shim.c` that contains
-consensus logic rather than just transport. `verify_p2sh_shim` and
-`consensus_shim` are the other two.
+Audited the other two shims for the same shape, and they are clean --
+`verify_p2sh_shim` declares exactly one extern (`verify_script`) and
+`consensus_shim` seven (`cons_verify`, `block_hash`, `pow_check`,
+`diff_target`, ...), all of them shipped functions. Both are thin drivers over
+the real code, which is what a shim should be. `bip30_shim` is the outlier: it
+declares only the utxo table primitives (`utxo_init`/`put`/`get`/`del`) and
+implements the rule on top of them. So this is one shim, not a systemic
+pattern -- which is worth stating plainly, because "our test harnesses might
+all be fake" would be the wrong lesson to draw from it.
 
 ### Not fixed
 
