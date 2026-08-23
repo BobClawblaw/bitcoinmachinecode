@@ -2913,8 +2913,10 @@ projected.** That is the whole reason 14.7 exists.
    in `make test`, from real block 825,000 transactions spanning **14 distinct
    input counts** (1,2,3,4,5,6,7,8,11,12,14,19,28,36): 488 pairwise
    two-transaction blocks, one 483-transaction interleaved block of 4,284
-   inputs x25 runs, 46 in-place corruption rejects with exact blame, and the
-   single-transaction path over all 23 fixture transactions in both directions.
+   inputs x25 runs, 46 in-place corruption rejects with exact blame, the
+   single-transaction path over all 23 fixture transactions in both directions,
+   and the aggregate array's one-byte length limit checked from both sides —
+   refused at a 253-byte prevout script, accepted at 252.
 
 **Soaked, because the bug class is scheduling-dependent.** With 32 spinners
 saturating the box: the arena fixture 40 times, 0 failures; and 600 whole-block
@@ -2948,10 +2950,36 @@ Ten deliberate bugs injected into the arena logic, each caught:
 | `sp` strided instead of packed | A |
 | `TXV_SHAPE_P2TR` silently ok (the old skip), block path | D / reject-in-place |
 | `TXV_SHAPE_P2TR` silently ok, single-transaction path | single-tx reject |
+| `>= 0xfd` guard relaxed to `> 0xfd`, or removed | arena pass 5 |
+| `>= 0xfd` guard tightened to `>= 200` (false reject) | arena pass 5 |
 
 The two false-ACCEPT mutations are the ones that matter: a corrupted sighash
 never produces a false accept (a wrong sighash fails), but an input that is
 never checked does.
+
+#### Three invariants made enforced rather than documented
+
+A review of the diff found no consensus bug but three places where correctness
+rested on a fact that is no longer checkable at the point of use. All three are
+now closed, and the first two are the difference between a loud refusal and a
+silent heap overrun:
+
+* `tapagg_build` sizes with one traversal of `get()` and writes with a second.
+  `get` is a **function pointer**, so "both passes see the same `spklen`" stopped
+  being a local fact. If they ever disagreed, the `memcpy` would overrun `sp`
+  *into the arena regions other transactions' descriptors point at* — a
+  corrupted sighash for an unrelated transaction. The write pass now re-checks
+  `sl < 0xfd` and `w + 1 + sl <= splen`. Two compares per input against a
+  Schnorr verify. Removing the `>= 0xfd` guard entirely, or loosening it by
+  one, now trips this check rather than corrupting memory — which is exactly
+  what mutations M-a and M-b above demonstrate.
+* Same indirection weakened the realloc argument: a future adapter that
+  allocated would dangle `po`/`am`/`sp`/`ns`. The loop now compares `pool->buf`
+  against the base captured after the single reserve, before the first write of
+  each iteration.
+* `g_t1_tap_built` was only cleared inside `if (has_taproot)`. Safe today via a
+  non-local coupling (`has_taproot` and `TXV_SHAPE_P2TR` are set by the same
+  branch); now cleared unconditionally, so it is locally true.
 
 #### Not verified
 
