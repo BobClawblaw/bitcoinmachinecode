@@ -93,9 +93,54 @@ global base58check_encode
 ;   base58check string in `out` (NULL-terminated). Computes the double-SHA256
 ;   checksum appended by base58check.
 ;
-;   data(25) = payload || checksum[0..4]
+;   data(paylen+4) = payload || checksum[0..4]
 ;   Then standard base58 encoding of that big-endian number with leading-zero
 ;   '1' preservation.
+;
+;   paylen must be 0..78. Anything larger writes out[0] = 0 and returns rather
+;   than overrunning `data` -- see the frame note below for why that matters.
+;
+; FRAME LAYOUT -- read this before moving any offset.
+;
+;   push rbp / mov rbp,rsp puts the five callee-saved saves at fixed negative
+;   offsets from rbp:
+;
+;       [rbp-0x08] rbx   [rbp-0x10] r12   [rbp-0x18] r13
+;       [rbp-0x20] r14   [rbp-0x28] r15
+;
+;   Every local buffer therefore has to live BELOW [rbp-0x28], and -- because
+;   these buffers are filled with an ascending index -- its TOP end, not just
+;   its base, has to stay below it.
+;
+;   That is exactly what went wrong. `data` used to sit at [rbp-0x58] and is
+;   filled forwards for paylen+4 bytes, so it had only 0x58-0x28 = 48 bytes of
+;   headroom. A 21-byte P2PKH payload gives data = 25 bytes and fits. The
+;   78-byte BIP32 extended key gives data = 82 bytes, running from [rbp-0x58]
+;   up to [rbp-0x06] -- straight over saved r15, r14, r13, r12 and the low two
+;   bytes of saved rbx. The epilogue then popped payload bytes into all five.
+;   The frame was already 0x200 bytes and its comment already said "sized for
+;   the 78-byte extended key"; the SIZE was right, the PLACEMENT was not.
+;   (`work` at [rbp-0x140] also ran two bytes into `checksum` at [rbp-0xf0];
+;   harmless only because the checksum is consumed before work is filled.)
+;
+;   Nothing crashed in production, because gcc -O0 -- which is what
+;   daemon/bitcoind is pinned to -- reloads every value from memory around a
+;   call and so never trusts a callee-saved register. At -O2 it does trust
+;   them, and tests/test_bip32_extkey segfaulted in strcmp on a `char*` gcc
+;   had parked in r15 across the call. Caught by tests/test_abi_coverage,
+;   which probes BOTH 21 and 78 bytes for this reason: a 21-byte-only probe
+;   reports this function clean.
+;
+;   Current layout, all four buffers disjoint and all strictly below -0x28:
+;
+;       digitRev [rbp-0x1b0 .. rbp-0x110)   160 B, >= 112 digits for data=82
+;       work     [rbp-0x110 .. rbp-0x0b0)    96 B, holds data being divided
+;       checksum [rbp-0x0b0 .. rbp-0x090)    32 B, sha256d output
+;       data     [rbp-0x090 .. rbp-0x030)    96 B, top is 8 B clear of -0x28
+;
+;   Frame is 0x200, deepest use is 0x1b0. Do not raise the paylen bound above
+;   78 without re-checking `out` too: 82 data bytes is already ~112 base58
+;   digits plus a NUL, and every caller declares out as char[128].
 ; ----------------------------------------------------------------------------
 base58check_encode:
     push rbp
@@ -105,14 +150,22 @@ base58check_encode:
     push r13
     push r14
     push r15
-    sub  rsp, 0x200           ; locals [rbp-0x30..-0x228], buffers below -0x28
-                             ; data[0x58..0x07] checksum[0xf0..0xd1] work[0x140..0xef]
-                             ; digitRev[0x1c0..0x14d]
-                             ; Sized for the LARGEST payload we encode: the 78-byte
-                             ; BIP32 extended key (xprv/xpub) -> data is 82 bytes,
-                             ; up to ~112 base58 digits (40 was only enough for
-                             ; 25-byte P2PKH addresses and overflowed on xprv/xpub).
-                             ; All buffers non-overlapping.
+    sub  rsp, 0x200
+
+    ; ---- refuse a payload that would not fit `data` (see frame note) ----
+    ; Unsigned compare, so a negative paylen is caught here too.
+    cmp  rdx, 78
+    jbe  .len_ok
+    mov  byte [rdi], 0
+    add  rsp, 0x200
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+.len_ok:
 
     mov  r13, rdi            ; out
     ; persistent regs: out(rbx), payload(r14), paylen(r15) -- all callee-saved
@@ -120,8 +173,8 @@ base58check_encode:
     mov  r14, rsi            ; payload
     mov  r15, rdx            ; paylen
 
-    ; ---- build data[] at [rbp-0x58]: payload then checksum ----
-    lea  rdi, [rbp-0x58]     ; data dst
+    ; ---- build data[] at [rbp-0x90]: payload then checksum ----
+    lea  rdi, [rbp-0x90]     ; data dst
     mov  rsi, r14
     xor  r11, r11
 .cp1:
@@ -132,14 +185,14 @@ base58check_encode:
     inc  r11
     jmp  .cp1
 .cp1_done:
-    ; checksum = sha256d(out=[rbp-0xf0], in=payload(r14), len(r15))
-    lea  rdi, [rbp-0xf0]
+    ; checksum = sha256d(out=[rbp-0xb0], in=payload(r14), len(r15))
+    lea  rdi, [rbp-0xb0]
     mov  rsi, r14
     mov  rdx, r15
     call sha256d
     ; append first 4 checksum bytes at data+paylen
-    lea  rsi, [rbp-0xf0]
-    lea  rdi, [rbp-0x58]
+    lea  rsi, [rbp-0xb0]
+    lea  rdi, [rbp-0x90]
     add  rdi, r15
     mov  rax, [rsi]
     mov  [rdi], eax
@@ -148,7 +201,7 @@ base58check_encode:
 
     ; ---- count leading zero bytes of data ----
     xor  r10, r10
-    lea  rsi, [rbp-0x58]
+    lea  rsi, [rbp-0x90]
 .czl:
     cmp  r10, r15
     jae  .czl_done
@@ -169,9 +222,9 @@ base58check_encode:
     inc  r11
     jmp  .ez
 .ez_done:
-    ; ---- copy data to work [rbp-0x140], then repeatedly divide by 58 ----
-    lea  rdi, [rbp-0x140]
-    lea  rsi, [rbp-0x58]
+    ; ---- copy data to work [rbp-0x110], then repeatedly divide by 58 ----
+    lea  rdi, [rbp-0x110]
+    lea  rsi, [rbp-0x90]
     mov  rcx, r15
     xor  r8, r8
 .bcopy:
@@ -185,8 +238,8 @@ base58check_encode:
     mov  r9, r15              ; length of work number
     xor  r14, r14             ; ndigits (in r14; r14's payload value no longer needed)
 .divloop:
-    ; is work [[rbp-0x140]..+r9) all zero?
-    lea  rsi, [rbp-0x140]
+    ; is work [[rbp-0x110]..+r9) all zero?
+    lea  rsi, [rbp-0x110]
     xor  r11, r11
     xor  rcx, rcx
 .iszero:
@@ -205,7 +258,7 @@ base58check_encode:
     ; final remainder is the base58 digit for this pass.
     xor  eax, eax             ; rem
     xor  r11, r11             ; index
-    lea  rsi, [rbp-0x140]
+    lea  rsi, [rbp-0x110]
 .dv:
     cmp  r11, r9
     jae  .dv_done
@@ -223,15 +276,15 @@ base58check_encode:
     ; eax = remainder = least-significant base58 digit now
     lea  r8, [ALPHABET]
     movzx ecx, byte [r8 + rax]      ; base58 char
-    lea  r8, [rbp-0x1c0]             ; digitRev buffer (accumulate LSB-first)
+    lea  r8, [rbp-0x1b0]             ; digitRev buffer (accumulate LSB-first)
     mov  [r8 + r14], cl
     inc  r14                        ; ndigits++
     jmp  .divloop
 .divide_done:
-    ; reverse-copy ndigits(r14) chars from [rbp-0x1c0] into out after the '1's
+    ; reverse-copy ndigits(r14) chars from [rbp-0x1b0] into out after the '1's
     mov  rdi, rbx
     add  rdi, r12                   ; past the leading '1's
-    lea  rsi, [rbp-0x1c0]
+    lea  rsi, [rbp-0x1b0]
     mov  r8, r14                    ; count
 .rv:
     test r8, r8
