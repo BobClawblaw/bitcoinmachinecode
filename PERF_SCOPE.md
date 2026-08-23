@@ -2851,6 +2851,22 @@ the atomic counter are noise — while wall time goes 192.9 ms → 38.5 ms (5.01
 At full width the extra CPU is 26 threads sharing 16 cores, which is a real
 cost paid for a much larger wall-time win, not a regression.
 
+#### A secondary, measured effect: 218 MB less `.bss`
+
+The old single-transaction taproot pass declared its arena as file statics
+sized for the worst case — `sp[TXV_MAX_INPUTS*(1+TXV_SPK_CAP)]` alone is
+20,000 x 10,001 = **200 MB**, plus `po`, `am`, `spk34`, `is_tap` and an
+8 MiB `ns`; the block path carried a second 8 MiB `ns`. All of it is gone,
+replaced by a bump-reset pool that is a few MB per block. Measured on
+`tests/test_txvb_wprog_stable`, which links the same translation unit:
+
+    .bss   428,437,288 -> 210,060,200 bytes   (-218 MB)
+
+`.bss` is demand-paged, so most of that was address space rather than resident
+memory — but it was also 200 MB of arena whose entries were spaced 10,001
+bytes apart to hold scripts that are almost always 22 to 34 bytes long, which
+is why the packed layout is both smaller and better for cache.
+
 #### The Amdahl bound, stated honestly
 
 **The 7.49x is the script-verification phase in isolation, and nothing else.**
