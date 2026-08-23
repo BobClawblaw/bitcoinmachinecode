@@ -7,6 +7,103 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- the taproot helpers' scratch was process-global, and that one fact serialized every taproot input in the chain
+
+Not a bug that fired. A bug that could not fire, because the code had been
+arranged around it -- and the arrangement cost more than the bug would have.
+
+### What was there
+
+`secp256k1_taproot.asm` staged every hash it computed in two process-global
+buffers: `tagh_buf` (32 B, `.data`) and `tap_preimg` (4 MiB, `.bss`). All four
+helpers use them -- `tagged_hash256`, `tap_leaf_hash`, `tap_branch_hash`,
+`tap_merkle_root` -- and `tagged_hash256` is on the path of EVERY taproot
+sighash, key-path included (`bitcoin_taproot_sighash.c:576`).
+
+The file's own header stated the assumption that made this safe:
+
+    Global scratch (tagh_buf, tap_preimg) used by the small helpers is
+    single-threaded.
+
+It was true. `daemon/tx_verify.c` skips `TXV_SHAPE_P2TR` in both parallel
+worker loops and verifies every taproot input in a sequential pass afterwards.
+
+### What it cost
+
+PERF_SCOPE.md section 14, measured on the live replay at height ~797,000 on an
+idle box: **32 worker threads asleep, one thread running**, and that one thread
+**67% field arithmetic** -- it was doing every taproot signature in the block by
+itself while 31 cores sat idle. Per-signature tuning (section 13 took Schnorr
+from 3.35x to ~1.2x vs Core) had been optimising a path that runs on one core.
+
+So this is the third time in two days that a written-down assumption turned out
+to be a scheduled outage -- incidents #22 and #26 were both preceded by an
+explicit "known divergence, deliberately left" note. The pattern is now
+established well enough to state as a rule: **a documented assumption needs a
+test that fails when it stops being true, or it needs fixing. A comment is
+neither.**
+
+### The audit that had to come first
+
+Before touching anything, every file on the taproot verification path was
+checked for shared mutable state, because converting one buffer and missing
+another would produce exactly the silent corruption this was meant to prevent:
+
+  * `bitcoin_taproot_sighash.c` -- no file-scope mutable state.
+  * `secp256k1_schnorr.asm`, `secp256k1_point.asm`, `secp256k1_fe.asm`,
+    `secp256k1_scalar.asm`, `bitcoin_pubkey.asm` -- zero mutable globals.
+    (schnorr's was removed earlier the same day; see its own entry.)
+  * `bitcoin_interp.asm`, `bitcoin_scriptcodec.asm`, `bitcoin_sighash.asm` --
+    already `.tbss`, from the 2026-08-19 conversion.
+  * `sha256.asm` -- one byte, `shani_ready`, a CPUID-result cache. Every
+    thread computes and writes the SAME value, so the race is benign and
+    idempotent. Left alone deliberately.
+
+`tagh_buf` and `tap_preimg` were the only two. That is what makes this a
+bounded change rather than a hopeful one.
+
+### The change
+
+Both moved to `.tbss` via the `TLS_ADDR` macro already used in
+`bitcoin_interp.asm` and `bitcoin_sighash.asm` (ELF x86-64 Initial-Exec).
+28 call sites. `TLS_ADDR` clobbers only its destination register -- exactly
+like the `lea dst, [rel sym]` it replaces -- so every substitution is
+register-equivalent; the two sites that wrote through the symbol directly were
+rewritten to materialise the address first.
+
+`.tbss` is demand-paged, so `TAP_PREIMG_CAP` costs 4 MiB of *address space* per
+thread and only the touched pages are ever resident. The 256 MiB figure that
+initially looked like a blocker was virtual, not real.
+
+### FAIL-THEN-PASS
+
+`tests/test_taproot_thread_stress` -- 8 threads x 4,000 iterations over a
+rotation of 12 DISTINCT cases (different tags, different message lengths,
+script lengths 1..100,000 spanning both compact-size boundaries so
+`tap_leaf_hash` writes a different amount into the buffer each time), every
+digest compared against the value the same call produced single-threaded
+before any thread existed. Identical inputs across threads would have made the
+race invisible, which is why the rotation is staggered per thread.
+
+    against main's process-global buffers : 29,236 WRONG DIGESTS of 96,000
+    with the thread-local buffers         : 0
+
+The harness also refuses to pass vacuously: it fails if any ground-truth digest
+is all-zero, and fails if two cases in the rotation hash identically.
+
+Full suite: 155 ran, 0 failed. `make abi-check` OK (1,078 sites).
+`make callee-saved-check` OK (374 functions).
+
+### What this does NOT do
+
+**Taproot verification is still sequential.** This change makes the helpers
+safe to call concurrently; it does not call them concurrently. Removing the
+`TXV_SHAPE_P2TR` skip needs the per-transaction sighash arrays (`po`, `am`,
+`sp`, `nin`) to stay live across parallel verification instead of being reused
+one transaction at a time, and getting that wrong yields a corrupted sighash
+rather than a loud failure. It is scoped, not attempted. This is the
+prerequisite, and the new test is the gate it has to pass through.
+
 ## 2026-08-23 -- the UTXO set hash: the LIVE replay's set is Bitcoin Core's, at height 792,979
 
 Stage D's acceptance test was "no block was rejected". It is now "the UTXO set
