@@ -7,6 +7,107 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #30 FIXED: the daemon now enforces BIP30, and the test drives the daemon instead of a shim
+
+Recorded as found earlier today; this is the fix. The gap: `validation/bip30_diff.py`
+replayed real mainnet blocks 0..91,900 against Core and `tests/test_bip30`
+smoke-tested the same path, both green -- and both drove `tests/bip30_shim.c`,
+which implements the rule itself and is not linked into `bitcoind`. The daemon
+had no BIP30 check anywhere.
+
+### The gate, which is the part that could go wrong quietly
+
+Core does NOT enforce BIP30 at every height, so a naive "always check" would
+be a false REJECT, which is just as much a chain split as a false accept.
+`bip30_enforced()` in `daemon/utxo_live.c` mirrors `ConnectBlock`:
+
+  * the two grandfathered duplicate-coinbase blocks skip -- identified by
+    **hash**, not height alone;
+  * `height <= BIP34Height` (227,931) enforces. This is the `pprev->GetAncestor(H)
+    == nullptr` arm: that ancestor is null exactly when `H > pprev->nHeight`,
+    i.e. when this block's own height is <= H, which is why the boundary is
+    `<=` and not `<`;
+  * `height >= BIP34_IMPLIES_BIP30_LIMIT` (1,983,702) enforces;
+  * in between -- 227,932..1,983,701, where the live replay is -- it enforces
+    only if it cannot PROVE the ancestor at 227,931 is `BIP34Hash`.
+
+That last test is real, not an assumption that we are on mainnet: if the block
+at BIP34Height is not BIP34Hash we are on a different chain and Core keeps
+enforcing, so we must too. Resolved once from the block store and cached.
+**If it cannot be resolved (no store handle, unreadable block) the verdict is
+ENFORCE** -- over-enforcing can only reject a block no real chain contains,
+whereas under-enforcing is a false accept.
+
+### Constants: generated, then verified against the chain anyway
+
+`validation/gen_bip30_consts.py` extracts the two repeat blocks, BIP34Height,
+BIP34Hash and the resume limit from `src/validation.cpp` and
+`src/kernel/chainparams.cpp`, emitting `daemon/bip30_consts.h` with the hashes
+reversed into this codebase's internal byte order. Same discipline as
+`asm/script_flags_consts.inc`, and for the same reason: a slip in a 64-hex-digit
+constant is easy to make and invisible to every test that does not replay
+height 91,842.
+
+(A generator bug worth noting: the obvious `IsBIP30Repeat\s*\{(.*?)\}` body
+regex does not work -- the `uint256{"..."}` initialisers contain braces and the
+non-greedy match stops inside the first one. It takes a fixed window from the
+function start instead.)
+
+Verified against the live chain regardless -- `getblockhash` for 91,842,
+91,880 and 227,931 all match the generated values.
+
+### Where the check runs
+
+`daemon/utxo_live.c`, Phase 0.3 -- after the witness-commitment check, BEFORE
+signature verification, which is Core's order and means a violation costs one
+UTXO lookup per created output rather than a block's worth of ECDSA.
+
+It walks **every transaction including the coinbase**. The only two blocks this
+has ever fired on ARE duplicate coinbases, so a loop starting at `t=1` would
+check exactly the wrong thing -- which is also why this lives here and not in
+`tx_verify_block_connect_all`, whose loop starts at `t=1` because a coinbase
+has no signatures to verify.
+
+### FAIL-THEN-PASS
+
+`tests/test_bip30_daemon` -- 13 assertions, three parts:
+
+  1. the gate's height/hash arithmetic, asserted directly via a test hook
+     rather than inferred from whether a block was rejected (including "the
+     right hash at the wrong height still enforces");
+  2. detection end-to-end through the real apply path. The duplicate is
+     genuine: the transaction is built first, its real txid computed with
+     `tx_txid`, and THAT txid seeded as an unspent coin, so the collision is a
+     true (txid, vout) match rather than a fixture;
+  3. a control -- the same block shape with no collision must still be
+     accepted, so "reject everything" cannot pass part 2.
+
+    against main : "block re-creating that outpoint at h=1000 -> REJECTED
+                    got=1 exp=0"   -- main ACCEPTS it. The false accept.
+    with the fix : 13/13, and the reject reason is Core's own string,
+                    "bad-txns-BIP30 (tried to overwrite transaction)".
+
+Full suite 158 ran / 0 failed. `abi-check` OK (1,078 sites).
+`callee-saved-check` OK (374 functions).
+
+### Severity, restated
+
+Still bounded, as the correction to the original entry said: on mainnet Core
+also skips this check from 227,932 to 1,983,701, so through the range the
+replay is in we and Core agreed by both not checking. The divergence was real
+only at heights <= 227,931 and >= 1,983,702. Fixed for completeness, for any
+non-mainnet chain, and for the heights above 1,983,702 that this node will
+eventually reach.
+
+### Still open
+
+`validation/bip30_diff.py` still drives the shim. Repointing it at the daemon
+is the change that stops this class from recurring, and it is NOT done here --
+`tests/test_bip30_daemon` proves the daemon enforces the rule, but only the
+differential proves it enforces it the same way Core does across 91,900 real
+blocks. Incident #29 (a coinbase output's put must overwrite) is also still
+open and is independent of this.
+
 ## 2026-08-23 -- incident #31: tap_merkle_root wrote its loop counter onto its own saved r12, and both static auditors called it clean
 
 Found by widening an instrument that already existed, not by cleverness.
