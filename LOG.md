@@ -30,8 +30,22 @@ unspendable** and are filtered out while iterating. The remaining 102,532,574
 match Core's `txouts` to the unit. A filter that was wrong in either direction
 by a single entry would have broken that.
 
-The same comparison on a purpose-built set at height 91,721 -- before the first
-BIP30 duplicate, so no adjustment at all is needed -- is clean on all four:
+Three independent heights, three separate UTXO sets (one of them the live
+replay's own datadir), all four fields each:
+
+    height   txouts        total_amount (BTC)      bogosize       muhash   unspendable filtered
+    91,721       63,394       4,586,050.00000000     6,916,533     match          0
+    200,000   2,318,056       9,999,889.98361183   175,620,421     match          0
+    400,000  34,820,275      15,249,861.13306633 2,645,813,199     match    777,587
+    792,979 102,532,574      19,393,405.70154310 7,739,642,957     match 52,468,573
+
+91,721 needs NO adjustment of any kind -- it is before the first BIP30
+duplicate. The other three need exactly the two-entry height correction below,
+and nothing else. Height 400,000 is the first one where the unspendable filter
+does real work (777,587 nulldata entries removed) and the count still lands on
+Core's to the unit; 792,979 does it 52 million times.
+
+The height-91,721 set, in full:
 
     height 91,721   ours                        Core (`gettxoutsetinfo muhash 91721`)
     txouts          63,394                      63,394
