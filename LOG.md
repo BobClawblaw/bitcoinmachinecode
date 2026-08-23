@@ -7,6 +7,113 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #28: SETcc writes eight bits, and eleven numeric opcodes pushed the OPERAND back
+
+The live replay stopped dead at height 792,980:
+
+    REJECT h=792980 tx=2941: p2wsh script verification failed
+
+Transaction `c85311c12c70351948bf15c76963c9e5ae54831733bfa267692888b780a70876`
+is a P2WSH 1-of-7 built out of CHECKSIG + OP_ADD instead of OP_CHECKMULTISIG:
+seven `OP_CHECKSIG`s -- six of them deliberately fed an EMPTY signature so they
+push false -- summed with `OP_ADD`, then
+
+    OP_IF <400000> OP_CHECKLOCKTIMEVERIFY OP_0NOTEQUAL OP_ELSE OP_0 OP_ENDIF
+    OP_ADD OP_2 OP_EQUAL
+
+Everything about that description invites the wrong hypothesis. The empty
+signatures look like incident #25's strict-DER work; the seven separate CHECKSIG
+call sites look like a place a `-1` hard error could leak from one of them; the
+CLTV-inside-OP_IF looks like incident #16's zeroed tapscript context. All three
+were wrong. The interpreter's own error code was **SCRIPT_ERR_EVAL_FALSE** --
+nothing aborted, the script ran to the end with exactly one element on the stack
+and that element was false. The arithmetic was simply wrong.
+
+### The mistake
+
+`bitcoin_interp.asm`, `.mono_common` / `.bin_common`. r14 (and r15) hold the
+**decoded 64-bit operand**. The result was computed straight on top of it:
+
+    .mo6:  test  r14, r14
+           setnz r14b            ; <- writes EIGHT BITS
+
+`SETcc` has an 8-bit destination. The other 56 bits of the operand survive into
+what gets pushed. 400000 is `0x061A80`; `setnz` made it `0x061A01` = **400129**,
+not 1. `OP_ADD` then gave 400130 and the `OP_2 OP_EQUAL` was false.
+
+For operands 0..255 the answer comes out right by accident, which is why this
+survived 792,979 blocks, `tests/test_interp`, `tests/test_script` and every
+synthetic vector in the tree: nobody had written a test whose numeric operand
+reached 256. The real chain did it at 792,980.
+
+Eleven handlers had the same shape -- `OP_NOT`, `OP_0NOTEQUAL`, `OP_BOOLAND`,
+`OP_BOOLOR`, `OP_NUMEQUAL`, `OP_NUMEQUALVERIFY`, `OP_NUMNOTEQUAL`,
+`OP_LESSTHAN`, `OP_GREATERTHAN`, `OP_LESSTHANOREQUAL`, `OP_GREATERTHANOREQUAL`.
+Wrong for **every operand of magnitude >= 256 and every negative operand**.
+
+### It was a FALSE ACCEPT too, and that is the worse half
+
+A false reject stops the replay and announces itself. This bug also went the
+other way, silently:
+
+    <256> OP_NOT                  we pushed 256 (TRUE)   Core pushes 0 (false)
+    <256> <512> OP_NUMEQUAL       we pushed 256 (TRUE)   Core pushes 0
+    <256> <512> OP_NUMEQUALVERIFY we left 256, OP_VERIFY cast it to true and the
+                                  script PASSED; Core fails it
+    <-1>  OP_NOT                  we pushed 0xFF..FF00 (TRUE)   Core pushes 0
+
+Measured, not argued: 63,036 scripts driven through Core's own `VerifyScript`
+and this interpreter side by side gave **11,780 divergences on main -- 5,050
+FALSE ACCEPTS and 6,730 false rejects** -- and 0 after the fix. A fix that only
+made block 792,980 pass would have left the false-accept half of a chain split
+wide open.
+
+### The fix
+
+`movzx r14, r14b` after every `SETcc`, in all eleven arms. Core's every one of
+these opcodes is a bool: exactly 0 or 1.
+
+`OP_WITHIN` writes `SETcc` the same way and is **correct** -- it ANDs against a
+register it zeroed first, which masks the answer back down to 0/1. Correct by
+construction rather than by intent, so it is left alone and swept by the new
+test instead, where a future edit that removes the mask will be caught.
+
+### The reproducer
+
+`tests/test_scriptnum_bool` (8 assertions), fixtures from
+`validation/fetch_scriptnum_bool.py`:
+
+  * the real mainnet transaction at its real height and block hash -> ACCEPT;
+  * the same transaction with one byte of its ONE real signature flipped ->
+    REJECT with the exact reason string the replay printed, so "accept
+    everything" cannot pass this file;
+  * a sweep of **4,683 pure-arithmetic P2WSH scripts** across the 255/256 and
+    0/-1 boundaries -- 2,149 that Core ACCEPTS and 2,534 that Core REJECTS,
+    every verdict taken from Core's own `VerifyScript` before being baked --
+    asserted in **both directions**.
+
+All of it at **both** block-connection entry points, `tx_verify_block_connect`
+and `tx_verify_block_connect_all`, per incident #22's lesson.
+
+FAIL-THEN-PASS against main's `asm/bitcoin_interp.asm`: 6 of 8 assertions fail
+-- the real block rejected at both entry points, and at each entry point **497
+false rejects + 402 false accepts** out of the sweep. 8/8 with the fix.
+
+    make -k test : MAKE_RC=0, zero failures, 151 binaries
+    make abi-check : OK, 1029 external call sites, RSP == 0 mod 16
+    make callee-saved-check : OK, 353 functions
+
+### What to take from it
+
+The bug is one instruction wide and it is a **register-width** bug, not a
+consensus-rule bug. `make abi-check` and `make callee-saved-check` audit frames;
+nothing audits "did this 8-bit write want to be a 64-bit one". Every other
+`SETcc` in the tree was checked by hand while this was written --
+`bitcoin_scriptcodec.asm`, `bitcoin_sighash.asm`, `bech32.asm`,
+`bitcoin_bip32/39.asm`, `bitcoin_chainwork.asm`, `sha256.asm` -- and all of them
+either write to an already-zeroed register, to a byte-typed memory location, or
+feed a mask; the interpreter's numeric arms were the only instances.
+
 ## 2026-08-23 -- incident #27: twenty-one functions returned the caller's callee-saved registers full of their own locals
 
 `make abi-check` passed. `make test` passed. The consensus interpreter had been
