@@ -7,6 +7,87 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #30: BIP30 has a differential test against Core, a shim, and a smoke test. The daemon does not implement it.
+
+Found while investigating incident #29 (a BIP30 duplicate coinbase keeping the
+pre-overwrite height). The height was the symptom. This is the cause.
+
+### What is enforced, and where
+
+`validation/bip30_diff.py` replays real mainnet blocks 0..91,900 and compares
+the BIP30 verdict against Core block by block. `tests/test_bip30` smoke-tests
+the same path. Both drive `asm/tests/bip30_shim`.
+
+**The shim implements the rule itself.** `is_bip30_repeat()`, the `enforce`
+flag, and the `utxo_get` lookup that sets `bip30 = 1` when a created outpoint
+already exists unspent are all inside `bip30_shim.c`. The shim links
+`$(CONSOBJS) bitcoin_utxo.o`; it is not linked into `daemon/bitcoind`, and
+there is no shared module holding the rule.
+
+The production path has no equivalent, verified three ways:
+
+  * `daemon/tx_verify.c` calls `utxo_lsm_get` only for inputs being SPENT
+    (prevout lookup, lines ~505 and ~577). Nothing checks a CREATED output
+    against the UTXO set.
+  * `daemon/utxo_live.c`'s duplicate check is the in-block whole-block
+    duplicate-OUTPOINT check -- an in-block double-spend guard. BIP30 is a
+    different rule: a created outpoint colliding with an already-unspent coin
+    from an EARLIER block.
+  * `utxo_lsm_put` returns 1/0/2/-1 and the apply path discards the duplicate
+    case entirely: `if (r == -1 || r == 2) ctx->fatal = 1;`.
+
+### Consequence
+
+A block that creates an outpoint duplicating an existing unspent one is
+**accepted by us and rejected by Core** with `bad-txns-BIP30`. A false accept,
+i.e. a chain-split vector, in the same class as the five already listed in
+ASSESSMENT.md. Reaching it on mainnet is hard after BIP34 (the coinbase commits
+to the height), which is presumably why nothing has ever surfaced it -- but
+Core enforces the rule unconditionally, and "hard to reach" is not the standard
+this project holds itself to for the false-accept direction.
+
+It also fully explains incident #29. Our BIP30 duplicate keeps height 91,722 /
+91,812 where Core's `AddCoin(..., possible_overwrite=true)` holds 91,880 /
+91,842 -- not because a BIP30 handler mishandles the exception, but because
+there is no BIP30 handler. `utxo_lsm_put` silently declined to overwrite, the
+return value was never inspected, and the only instrument in the project that
+could see the difference was the MuHash set hash (count, amount and bogosize
+are all blind to a height field).
+
+### What to take from it
+
+This log has twice recorded "a guard proves only what it measures" -- `make
+abi-check` audits stack frames and passed cleanly on 21 register-clobbering
+functions (#27); `make callee-saved-check` audits preservation and cannot see
+an 8-bit write that wanted 64 bits (#28).
+
+This is a worse variant, and worth naming separately: **the guard passes, the
+differential against Core passes, and neither one touches the shipping code.**
+A test that drives a reimplementation validates the reimplementation. The shim
+was built to make the rule testable against Core, which was the right
+instinct; what never happened is the step where the rule moves into the path
+the daemon actually runs, with the shim reduced to a driver for it.
+
+Worth auditing for the same shape: every `asm/tests/*_shim.c` that contains
+consensus logic rather than just transport. `verify_p2sh_shim` and
+`consensus_shim` are the other two.
+
+### Not fixed
+
+Deliberately not fixed in the same session it was found. The fix is a
+chain-context check on the apply path (created outpoint vs the live UTXO set,
+skipped for the two grandfathered heights), it touches the live UTXO write
+path, and the replay is mid-flight at height ~826,000. It needs its own
+change with `validation/bip30_diff.py` repointed at the DAEMON rather than the
+shim -- which is the real deliverable here, because that repointing is what
+stops this from recurring.
+
+Incident #29's wrong heights are also still present in the live set: fixing the
+code does not repair the two existing entries, which would need either a
+rebuild from below height 91,722 or a targeted patch. Consensus-irrelevant now
+(the 100-block maturity window closed at height 91,980), but it is why our
+MuHash differs from Core's by exactly those two fields.
+
 ## 2026-08-23 -- the taproot helpers' scratch was process-global, and that one fact serialized every taproot input in the chain
 
 Not a bug that fired. A bug that could not fire, because the code had been
