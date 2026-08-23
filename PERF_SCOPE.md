@@ -2690,3 +2690,36 @@ removes the latent race, and lets the P2TR skip in both worker loops be deleted.
 * The taproot share of total verification at height ~797,000 was not counted
   directly (no per-shape input census); it is inferred from the main thread
   being 67% field arithmetic and the workers being the only other consumer.
+
+### 14.6 The constant-time assertion, resolved — 2026-08-23 02:55, quiet box
+
+§13.7 left "is close-core-gap constant-time clean" unverified, because
+`tests/test_scalarmul_ct` was failing and the box was at load 60. Resolved by
+alternating both binaries on one pinned core at load 3.3:
+
+| run | baseline (pre-§13) | with §13 |
+|---|---|---|
+| 1..7 | 1.000, 1.001, 1.001, 1.000, 1.001, 1.001, 1.001 | 1.001, 0.999, 1.000, 1.001, 1.003, 1.002, 1.000 |
+
+Both trees sit inside the +-3% window on every run. **§13 is constant-time
+clean**, and the test is sound — at load 3.3 it reproduces its own calibration
+band (0.986..1.009 at load 4-7) almost exactly.
+
+What it did under load is worth recording, because it nearly caused a wrong
+call. At load 60 the *same* binaries produced 0.906..1.129 in **both** arms.
+Two of those readings were 0.952 and 0.956 — and the test's own comment
+documents that an injected 4% data-dependent leak "is caught at 3% (ratio
+~0.955)". The noise landed exactly on the signature the tolerance exists to
+detect. An 8-run sample then showed the branch with ~3x the baseline's variance,
+which looked like a real asymmetry; four more runs destroyed it, with the
+*baseline* producing the two worst readings of the night.
+
+Two lessons, both already paid for elsewhere in this log:
+
+* **A calibrated instrument is calibrated for an environment.** This test is
+  rigorous at load 4-7 and worthless at load 60, in both directions. Its window
+  is not a safety margin against load; it is a claim about a measurement made
+  under stated conditions. Run it outside them and it manufactures both false
+  alarms and false confidence.
+* **Do not conclude from the sample you have when the next sample is cheap.**
+  The 3x-variance finding was real in its 8 points and wrong about the world.
