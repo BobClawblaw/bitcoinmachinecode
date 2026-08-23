@@ -2723,3 +2723,74 @@ Two lessons, both already paid for elsewhere in this log:
   alarms and false confidence.
 * **Do not conclude from the sample you have when the next sample is cheap.**
   The 3x-variance finding was real in its 8 points and wrong about the world.
+
+### 14.7 Parallelising the taproot pass — the design, and the measurement that picked it
+
+The prerequisite is done: `secp256k1_taproot.asm`'s two staging buffers are
+thread-local as of 2026-08-23, gated by `tests/test_taproot_thread_stress`
+(29,236 wrong digests of 96,000 against the pre-fix globals; 0 after). What
+remains is to actually use the worker pool.
+
+**Do not parallelise within a transaction.** Measured against Core at heights
+825,000 and 825,001:
+
+| | h825,000 | h825,001 |
+|---|---|---|
+| transactions (excl. coinbase) | 4,272 | 3,825 |
+| taproot-bearing transactions | 2,988 (70%) | 2,051 (54%) |
+| taproot inputs | 3,379 | 2,283 |
+| mean taproot inputs per taproot tx | **1.13** | **1.11** |
+| **txs with exactly one taproot input** | **96%** | **95%** |
+
+Fanning a transaction's own taproot inputs across threads — which would need no
+new memory management, since `po`/`am`/`sp`/`ns` are already built and
+read-only by then — finds nothing to fan out 96% of the time. It is the
+cheap design and it is worth approximately nothing.
+
+**The axis is across transactions**, and the cost of that is that the
+per-transaction aggregate sighash data has to be live for many transactions at
+once instead of being rebuilt into one reused arena per transaction.
+
+Shape that fits the existing code:
+
+* **Phase A, sequential and cheap.** For each transaction that has at least one
+  taproot input, build `po` (36B/input), `am` (8B/input), `sp`
+  (1+spklen per input, *packed* — the existing arena is sized
+  `nin*(1+TXV_SPK_CAP)` worst-case but only ever fills `1+spklen`) and the
+  witness-stripped `ns`, into a per-BLOCK arena. Record one small descriptor
+  per transaction: offsets plus `nin`. This is memcpy and `strip_witness`, not
+  signature work — it is not what the profile is complaining about.
+* **Phase B, parallel.** Fan every taproot input across `g_txvb_pool`. Each
+  worker reads its transaction's descriptor and calls `taproot_verify_input`
+  with pointers into the shared arena. The arena is **read-only** for the whole
+  of phase B, so no per-worker duplication is needed — which is the entire
+  reason phase A is worth doing separately rather than having each worker
+  rebuild its own transaction's arrays.
+
+Arena size is bounded by roughly `sum(stripped tx bytes) + 44 * inputs` over
+the taproot-bearing transactions — a few MB per block, not the 8 MiB-per-worker
+that duplicating `ns` would cost (`static u8 ns[8<<20]` x 32 workers).
+
+**Then, and only then, delete the two `TXV_SHAPE_P2TR` skips** at
+`tx_verify.c` (the single-tx worker loop and `txvb_worker_loop`) and the two
+sequential passes that follow them.
+
+**Expected effect, stated as a bound rather than a promise.** Section 14
+measured the main thread at 67% field arithmetic with 31 cores idle. If that
+whole 67% moves to the pool, Amdahl gives at most ~3x on the connect path;
+the replay's other serial work (the UTXO apply, the LSM writes, the archive
+read) does not move and will become the next ceiling. It has to be re-profiled
+after, not projected — this section exists because section 13's projections
+were made against a profile that predated taproot density and were wrong for
+exactly that reason.
+
+**Validation this must pass before deployment**, given the failure mode is a
+corrupted sighash rather than a loud error:
+
+1. `tests/test_taproot_thread_stress` (already in `make test`).
+2. Whole-block differential against the Core oracle over a run of real
+   taproot-dense blocks at height >= 800,000 — every transaction, both entry
+   points, accept AND reject direction.
+3. The block that a wrong shared arena would break first is one where two
+   transactions with different input counts verify concurrently; a fixture
+   with that shape specifically, not just "a busy block".
