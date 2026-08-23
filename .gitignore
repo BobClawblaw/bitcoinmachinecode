@@ -326,3 +326,14 @@ asm/tests/test_segwit_coverage
 asm/tests/test_txvb_wprog_stable
 asm/tests/test_tapscript_scale
 asm/tests/test_dersig_encoding
+
+# ---- BENCHMARKS.md suite: harness binaries and raw run output ----
+# scripts/bench_vs_core.sh writes every run under bench-results/<timestamp>/ and
+# builds libsecp256k1's own bench into bench-results/secp-bench/. None of it is
+# source; BENCHMARKS.md carries the numbers.
+asm/tests/bench_schnorr
+asm/tests/bench_hash_core
+asm/tests/bench_merkle
+asm/tests/bench_checkblock
+asm/tests/bench_abi_audit
+bench-results/
