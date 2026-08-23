@@ -7,6 +7,123 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #27: twenty-one functions returned the caller's callee-saved registers full of their own locals
+
+`make abi-check` passed. `make test` passed. The consensus interpreter had been
+handing every caller five wrong registers for as long as it had existed, and the
+only thing standing between that and corrupted script evaluation was a `-O0` in
+the Makefile that nobody had recorded as load-bearing.
+
+### The mistake, once, in twenty-one places
+
+    push rbp
+    mov  rbp, rsp
+    push rbx / r12 / r13 / r14 / r15    <- save area at rbp-0x08 .. rbp-0x28
+    sub  rsp, N
+    ...
+    lea  rdi, [rbp-0x30]                <- a 32-byte buffer that grows UP
+    call sha256_full                    <- ... straight through the save area
+
+Putting the callee-saved pushes AFTER `mov rbp,rsp` places the save area
+*between* `rbp` and the locals. Every local at `[rbp-N]` for small N is then
+sitting on a saved register, and every buffer addressed from the low end grows
+into one. The epilogue's `pop`s hand the caller digest bytes, interpreter state
+or log text.
+
+`script_eval` (`bitcoin_interp.asm`) was the worst: it pushes all five and then
+documents locals at exactly those five offsets -- `-0x08 fExec, -0x10 pc,
+-0x18 pend, -0x20 pbegincodehash, -0x28 nOpCount`. It is entered for every input
+of every transaction in every block.
+
+`node_log_str` (`node_log.asm`) was the only one firing in the LIVE daemon.
+Its 48-byte line buffer at `[rbp-48]` had 16 usable bytes before the save area;
+`daemon/main.c` logs lines of up to 42 characters. Every log line the node wrote
+destroyed the caller's rbx, r12, r13 and r14 and corrupted the low bytes of
+saved rbp. Measured, not inferred: a 22-byte message returns CLOBBERS r13 r14, a
+42-byte one CLOBBERS rbx r12 r13 r14.
+
+### The fix
+
+Move the pushes above `push rbp` in all twenty-one. The save area moves to
+`[rbp+8 ...]`, every `[rbp-N]` local is inside the function's own reservation,
+and the aliasing becomes structurally impossible rather than currently-harmless.
+
+Nineteen of the twenty-one were demonstrably defective -- nine measured
+directly with `tests/bench_abi_guard.S`, ten proved by arithmetic (a write of
+known size onto a save slot at a known offset). The other two,
+`node_log_event` and `cmd_getbalance`, share the frame shape and the same
+epilogue but had enough slack not to be firing; they are converted with their
+neighbours rather than left as the one remaining instance of the pattern in
+their file.
+
+**No frame was resized** except `node_log_str`, whose buffer went 48 -> 128 (a
+multiple of 16, so the parity is unchanged) because at 48 the longest current
+log line fitted exactly with zero slack.
+
+**Alignment is untouched.** Reordering pushes is parity-neutral: the same six
+pushes and the same reservation, so RSP has the same value mod 16 at every
+instruction after the prologue. Proof obligation discharged mechanically -- the
+full 253-line per-function table from `scripts/abi_stack_audit.py --format
+functions` is BYTE-IDENTICAL before and after, including all 215 call sites in
+`script_eval` and the compensated `siphash24_uint256.sipround2`. Incidents #18
+and #20 are undisturbed.
+
+### Why `make abi-check` never saw it
+
+Because it audits a different property. RSP *alignment* at call sites (#20) and
+callee-saved register *preservation* are independent; the tree was clean on one
+and broken on the other. Two guards now, both in `make test`:
+
+- `make callee-saved-check` -- `scripts/abi_callee_saved_audit.py`, static,
+  whole tree, 353 functions. Abstract-interprets each frame and fails on any
+  register left unrestored at a `ret` or any provable write into a live save
+  slot. It also prints a ranked "headroom" risk list (frame buffers that grow
+  toward a save area, ordered by how little slack they have). Twelve of the
+  twenty-one came out of that list; `node_log_str` was the smallest headroom in
+  the tree.
+- `asm/tests/bench_abi_audit` -- runtime, six sentinels, real arguments. Now
+  reports **14 clean, 0 violating**, and exits non-zero otherwise.
+
+Mutation-tested both, on instructions rather than comments. Reverting
+`script_eval`'s prologue to the aliasing order: `bench_abi_audit` -> `CLOBBERS
+rbx r12 r13 r14 r15`, exit 1; the static check -> `SAVE-AREA-ALIAS`, exit 1;
+`make abi-check` -> still OK, which is the point. Reverting `node_log_str`, a
+function `bench_abi_audit` does not probe: only the static check catches it.
+The static check also caught a mistake made DURING this fix -- an over-broad
+epilogue substitution that rewrote `cmd_getbalance`'s pops without its pushes.
+
+### The Makefile's optimisation folklore was this bug
+
+`daemon/pverify` is pinned to `-O1` with the comment that the `cons_verify ->
+tx_parse / sha256d` chain "misparses a block when the C driver is compiled at
+aggressive -O2+, a documented codegen interaction". There is no codegen
+interaction. A harness replaying that chain over `block413567.raw`:
+
+| build | pre-fix | post-fix |
+|---|---|---|
+| `-O0` | 400 blocks, 0 bad, acc 121800 | 400 blocks, 0 bad, acc 121800 |
+| `-O1` | 400 blocks, 0 bad, **acc 504** | 400 blocks, 0 bad, acc 121800 |
+| `-O2` | **400 blocks, 400 bad** | 400 blocks, 0 bad, acc 121800 |
+| `-O3` | **400 blocks, 400 bad** | 400 blocks, 0 bad, acc 121800 |
+
+`-O2` put a live value in `r13`; `pow_check` destroyed it; the verifier called
+every block invalid. `-O1` was not safe either -- right verdict, corrupted
+accumulator, which is the worse failure mode. Post-fix all four levels agree.
+
+**The build flags are deliberately NOT changed here.** Changing the optimisation
+level of consensus code deserves its own change, its own differential and its
+own deploy. What is established is only that the stated reason for the pins no
+longer holds.
+
+### Still open
+
+`scripts/abi_callee_saved_audit.py --format exposed` lists ~600 sites where a
+frame buffer still grows toward a save area with the pushes below `rbp`. None
+of them is a proven defect -- whether a buffer reaches depends on its length,
+which is not statically knowable -- and the smallest remaining headroom is 20
+bytes against an 8-byte write. They are the risk list, not the failure list, and
+they are cheap to eliminate one file at a time with the same edit.
+
 ## 2026-08-22 -- test infrastructure: the suite shared one working directory; now every harness owns its own
 
 The storage layer opens its files by BARE RELATIVE NAME -- `index.dat`,

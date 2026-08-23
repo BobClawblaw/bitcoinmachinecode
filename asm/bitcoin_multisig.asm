@@ -34,13 +34,26 @@ section .text
 
 ; ============================================================================
 ; p2sh_hash(script, script_len, out20[20])
+;
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP. This function keeps script/script_len/
+; out20 in r12/r13/r14 across two calls, but previously pushed only rbx and r12
+; -- r13 and r14 were used as scratch and never saved at all, so the caller lost
+; them outright (and lost r15 to the nested ripemd160). r13/r14 are now saved.
+; They must go ABOVE rbp: pushed below it they would land at rbp-0x18/-0x20,
+; directly underneath the 32-byte sha_buf at [rbp-0x30..rbp-0x11], which is the
+; same aliasing bug this commit removes elsewhere.
+; ALIGNMENT IS UNCHANGED at the two nested calls: two extra pushes is +0x10,
+; a multiple of 16. Entry 8 -> 4 pushes -> 8 -> push rbp -> 0 -> sub 0x50 -> 0;
+; previously 8 -> push rbp -> 0 -> 2 pushes -> 0 -> sub 0x50 -> 0.
 ; ============================================================================
 p2sh_hash:
-    push  rbp
-    mov   rbp, rsp
     push  rbx
     push  r12
-    sub   rsp, 0x50          ; 2 pushes(0x10)+0x50 = 0x60 == 0 mod16
+    push  r13
+    push  r14
+    push  rbp
+    mov   rbp, rsp
+    sub   rsp, 0x50          ; sha_buf at [rbp-0x30], inside this reservation
     mov   r12, rdi           ; script
     mov   r13, rsi           ; script_len
     mov   r14, rdx           ; out20
@@ -58,9 +71,11 @@ p2sh_hash:
     mov   eax, 1
 .done:
     add   rsp, 0x50
+    pop   rbp
+    pop   r14
+    pop   r13
     pop   r12
     pop   rbx
-    pop   rbp
     ret
 .fail:
     xor   eax, eax

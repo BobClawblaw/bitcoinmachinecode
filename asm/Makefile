@@ -50,7 +50,7 @@ P2POBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o
 # cons_verify (block consensus) uses pow_check/merkle_root/sha256d + tx_parse.
 CONSOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_cons.o
 
-.PHONY: all asm test clean abi-check
+.PHONY: all asm test clean abi-check callee-saved-check
 
 # Per-test private working directory helper. Every test that includes it must
 # list it as a prerequisite, or a change to the isolation mechanism silently
@@ -1393,10 +1393,48 @@ ABIALIGNOBJS := $(INTERPOBJS) bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.
 tests/test_abi_stack_align: tests/test_abi_stack_align.c $(ABIALIGNOBJS)
 	$(CC) $(CFLAGS) -I. -I tests -o $@ tests/test_abi_stack_align.c $(ABIALIGNOBJS)
 
+# ---------------------------------------------------------------------------
+# ABI guard #2 -- SysV AMD64 callee-saved register PRESERVATION.
+#
+# A DIFFERENT property from the alignment guard above, and invisible to it:
+# `make abi-check` passed on a build in which script_eval -- entered for every
+# input of every transaction on the consensus path -- returned with the
+# caller's rbx, r12, r13, r14 and r15 all holding interpreter state. Thirteen
+# functions had it, always the same mistake: the callee-saved pushes came AFTER
+# `mov rbp,rsp`, so the save area sat at [rbp-0x08 ...] with the locals
+# underneath it, and a buffer addressed from the low end wrote up through it.
+# Nothing had failed in production only because every C file on that path is
+# pinned to -O0 below, and -O0 keeps nothing live in a callee-saved register
+# across a call. That is accidental protection; these two targets replace it.
+#
+#   callee-saved-check  -- static, whole tree. abstract-interprets each
+#                          function's frame and fails on any register left
+#                          unrestored at a `ret` or any provable write into a
+#                          live save slot. Also prints a ranked "headroom" risk
+#                          list (frame buffers that grow toward a save area);
+#                          that list is reported, never gated, because whether
+#                          a buffer reaches depends on its length.
+#   tests/bench_abi_audit -- runtime. Loads six sentinels into the callee-saved
+#                          registers, calls each primitive with real arguments,
+#                          and reports which came back changed. MUST print
+#                          "0 violating"; it exits non-zero otherwise, so a
+#                          regression fails `make test` rather than printing a
+#                          plausible number next to it.
+#
+# The block argument enables the block_hash / pow_check / tx_parse / cons_verify
+# rows. It is optional so the target still runs where Core's source is absent.
+# ---------------------------------------------------------------------------
+ABI_AUDIT_BLOCK := $(wildcard /storage/bitcoin-core-source/src/bench/data/block413567.raw)
 
-test: abi-check tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
+callee-saved-check:
+	python3 ../scripts/abi_callee_saved_audit.py --asmdir . \
+	    --format summary --check > /dev/null
+
+
+test: abi-check callee-saved-check tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz
 	./tests/test_abi_stack_align
+	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
 	./tests/test_node_config
 	./tests/test_archive_check
 	./tests/test_archive_repair

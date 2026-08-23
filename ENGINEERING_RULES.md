@@ -215,6 +215,51 @@ SIGSEGV), not of a null-pointer dereference.
 
 ---
 
+## 6b. ...and it must give the caller its callee-saved registers back
+
+**`rbx`, `rbp`, `r12`, `r13`, `r14` and `r15` belong to the caller.** This is a
+SEPARATE obligation from rule 6, and passing `make abi-check` says nothing about
+it. Incident #27: twenty-one functions returned with the caller's registers
+holding their own locals while the whole alignment table was green.
+
+The mistake was the same one every time:
+
+```
+    push rbp
+    mov  rbp, rsp
+    push rbx / r12 / r13 / r14 / r15   <- save area now at rbp-0x08 .. rbp-0x28
+    sub  rsp, N
+    lea  rdi, [rbp-0x30]               <- a buffer that grows UP through it
+```
+
+**In practice**
+
+- **Push the callee-saved registers BEFORE `push rbp`, not after.** The save
+  area then lives at `[rbp+8 …]`, above the frame pointer, and no `[rbp-N]`
+  local can alias it no matter how the frame is later edited. This is the
+  shape every function in this tree now uses, and it costs nothing: the same
+  pushes in a different order is parity-neutral, so rule 6 is undisturbed.
+- **Reordering pushes never changes alignment. Resizing a frame does.** If a
+  fix needs more room, grow the reservation by a MULTIPLE OF 16 and say why in
+  the comment. Then prove it: `scripts/abi_stack_audit.py --format functions`
+  before and after must be byte-identical.
+- **A comment saying a local is "below the save area" is not evidence.**
+  `sha512_block` carried exactly that comment on three locals that were on top
+  of it. Compute the offsets.
+- **A buffer's SIZE is part of the frame layout.** `bip32_fingerprint` placed a
+  20-byte HASH160 output 16 bytes below the save area; four bytes of digest
+  landed on saved `r12`. `node_log_str` gave a 48-byte line buffer 16 usable
+  bytes and logged 42-character lines through it.
+- `make callee-saved-check` (`scripts/abi_callee_saved_audit.py`) proves the
+  sound half over the whole tree; `--format exposed` ranks the remaining risk
+  by headroom. `asm/tests/bench_abi_audit` is the runtime half and must print
+  `0 violating`. Both run in `make test`.
+- When a `-O0` or `-O1` pin is "needed because the compiler miscompiles this",
+  suspect this bug first. Every such pin in `asm/Makefile` traced back to it;
+  see incident #27's `-O0`/`-O1`/`-O2`/`-O3` differential.
+
+---
+
 ## 7. Working on this machine
 
 See the repo README for the full topology. The traps that recur:

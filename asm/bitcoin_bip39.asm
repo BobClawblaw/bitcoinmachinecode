@@ -203,14 +203,21 @@ bip39_strlen:
 ;   Builds the mnemonic string for the given entropy.
 ; ============================================================================
 global bip39_generate
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx r12 r13 r14 r15 are saved at [rbp+0x08 ...] and every [rbp-N] local is inside this
+;   function's own 0x38 reservation. Previously the pushes followed
+;   `mov rbp,rsp`, which put the save area at [rbp-0x08 ...] -- underneath the
+;   locals listed below -- so the epilogue's pops handed the CALLER out/entropy/ent_bits/cs_bits instead of r12/r13/r14/r15.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered, so
+;   RSP has the same value mod 16 at every instruction after the prologue.
 bip39_generate:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x38
     mov  [rbp-0x10], rdi             ; out
     mov  [rbp-0x18], rsi             ; entropy
@@ -356,12 +363,12 @@ bip39_generate:
     mov  eax, 1
 .ret1:
     add  rsp, 0x38
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
@@ -373,14 +380,22 @@ bip39_generate:
 ;   INTERNAL state (bss): m39_bits (bit stream), m39_idx (indices),
 ;   m39_salt (scratch digest), m39_nw (word count).
 ; ============================================================================
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx/r12/r13/r14/r15 are saved at [rbp+0x08 ...] and the locals (mnemonic
+;   @-0x10, ent_bits @-0x20, cs_bits @-0x28; deepest reference -0x28) are inside
+;   this function's own 0x30 reservation. Previously the pushes followed
+;   `mov rbp,rsp` and those three locals sat exactly on saved r12, r14 and r15.
+;   bip39_parse is internal, but it is called from bip39_mnemonic_to_entropy and
+;   bip39_validate, so the damage escaped into them.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered.
 bip39_parse:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x30
     mov  [rbp-0x10], rdi             ; mnemonic
     ; ---- split into word tokens, counting words ----
@@ -578,12 +593,12 @@ bip39_parse:
     mov  eax, -1
 .pret:
     add  rsp, 0x30
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 
@@ -604,14 +619,21 @@ bip39_validate:
 ;   -1 if the mnemonic is invalid.
 ; ============================================================================
 global bip39_mnemonic_to_entropy
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx r12 r13 r14 r15 are saved at [rbp+0x08 ...] and every [rbp-N] local is inside this
+;   function's own 0x20 reservation. Previously the pushes followed
+;   `mov rbp,rsp`, which put the save area at [rbp-0x08 ...] -- underneath the
+;   locals listed below -- so the epilogue's pops handed the CALLER out/mnemonic/ent_bits instead of r12/r13/r14.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered, so
+;   RSP has the same value mod 16 at every instruction after the prologue.
 bip39_mnemonic_to_entropy:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x20
     mov  [rbp-0x10], rdi             ; out
     mov  [rbp-0x18], rsi             ; mnemonic
@@ -670,12 +692,12 @@ bip39_mnemonic_to_entropy:
     mov  rax, -1
 .ret:
     add  rsp, 0x20
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
@@ -686,14 +708,21 @@ bip39_mnemonic_to_entropy:
 ;   Returns 1 on success.
 ; ============================================================================
 global bip39_mnemonic_to_seed
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx r12 r13 r14 r15 are saved at [rbp+0x08 ...] and every [rbp-N] local is inside this
+;   function's own 0x40 reservation. Previously the pushes followed
+;   `mov rbp,rsp`, which put the save area at [rbp-0x08 ...] -- underneath the
+;   locals listed below -- so the epilogue's pops handed the CALLER seed/mnemonic/passphrase/passlen instead of r12/r13/r14/r15.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered, so
+;   RSP has the same value mod 16 at every instruction after the prologue.
 bip39_mnemonic_to_seed:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x40
     mov  [rbp-0x10], rdi             ; seed
     mov  [rbp-0x18], rsi             ; mnemonic
@@ -837,12 +866,12 @@ bip39_mnemonic_to_seed:
 
     mov  eax, 1
     add  rsp, 0x40
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
