@@ -106,6 +106,7 @@ typedef struct {
 } block_tx_t;
 #include <stddef.h>
 #include "block_witness.h"
+#include "bip30_consts.h"
 /* block_witness.c reads only the (ptr, len) prefix of block_tx_t, by stride. */
 _Static_assert(offsetof(block_tx_t, ptr) == 0 && offsetof(block_tx_t, len) == 8, "block_tx_t prefix must match bw_txref_t");
 extern unsigned long long script_flags_for_block(unsigned long long height, const u8 hash32[32]);
@@ -530,6 +531,93 @@ static void idxbuild_on_output(void* ctxv, u32 out_index, u64 value, const u8* s
  * whatever it already committed (see rollback_partial_apply) before
  * returning -- the two returns before the loop starts (malformed block
  * header) need no rollback since nothing has been applied yet. */
+/* ========================================================================
+ * BIP30 -- Core's "bad-txns-BIP30" gate (src/validation.cpp, ConnectBlock)
+ *
+ * A block may not create an outpoint (txid, vout) that already exists as an
+ * UNSPENT coin. Until 2026-08-23 this daemon did not check it at all: the
+ * rule had a shim (tests/bip30_shim.c) and a full differential against Core
+ * (validation/bip30_diff.py), but the shim IMPLEMENTS the rule itself and is
+ * not linked into bitcoind, so what passed was a reimplementation, not this
+ * code path. See LOG.md incident #30.
+ *
+ * Core does NOT enforce it unconditionally, and getting that wrong in the
+ * strict direction would false-REJECT real blocks. The gate is:
+ *
+ *     fEnforceBIP30 = !IsBIP30Repeat(pindex);
+ *     pindexBIP34height = pindex->pprev->GetAncestor(BIP34Height);
+ *     fEnforceBIP30 = fEnforceBIP30 &&
+ *         (!pindexBIP34height ||
+ *          !(pindexBIP34height->GetBlockHash() == params.BIP34Hash));
+ *     if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT) { ... }
+ *
+ * which on mainnet means: enforce at heights <= 227,931; SKIP from 227,932
+ * to 1,983,701 (BIP34 puts the height in the coinbase, so a duplicate
+ * coinbase txid cannot recur); enforce again from 1,983,702. The two
+ * grandfathered duplicate-coinbase blocks (91,842 and 91,880) are identified
+ * by HASH, not height alone, and are skipped.
+ *
+ * `pprev->GetAncestor(H)` is NULL exactly when H > pprev->nHeight, i.e. when
+ * this block's own height <= H -- that is the `height <= BIP34_HEIGHT` arm
+ * below, and it is why the boundary is <= and not <.
+ *
+ * The BIP34-ancestor test is a real check, not an assumption that we are on
+ * mainnet: if the block at BIP34Height is NOT BIP34Hash we are on some other
+ * chain and Core keeps enforcing, so we must too. It is resolved once and
+ * cached. If it cannot be resolved (no store handle, unreadable block) the
+ * verdict is ENFORCE -- the safe direction, because over-enforcing can only
+ * reject a block that does not exist on any real chain, whereas
+ * under-enforcing is a false ACCEPT and a chain split.
+ *
+ * All constants come from validation/gen_bip30_consts.py, generated from
+ * Core's own source. Never hand-transcribe a 64-hex-digit block hash --
+ * same rule as asm/script_flags_consts.inc.
+ * ====================================================================== */
+extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
+                         unsigned long* height, unsigned long* is_coinbase,
+                         const u8** script, unsigned long* slen);
+
+/* Set by utxo_live_catchup / utxo_live_recover_partial_block, which are the
+ * only entry points that own a store handle (utxo_live_init deliberately
+ * takes none -- see its comment). NULL is handled: the gate enforces. */
+static void* g_bip30_store = 0;
+
+static int bip30_enforced(long height, const u8 hash32[32])
+{
+    static const u8 REP0[32] = BIP30_REPEAT0_HASH;
+    static const u8 REP1[32] = BIP30_REPEAT1_HASH;
+    static const u8 B34 [32] = BIP30_BIP34_HASH;
+
+    if (height == BIP30_REPEAT0_HEIGHT && memcmp(hash32, REP0, 32) == 0) return 0;
+    if (height == BIP30_REPEAT1_HEIGHT && memcmp(hash32, REP1, 32) == 0) return 0;
+
+    if (height >= BIP30_IMPLIES_LIMIT) return 1;
+    if (height <= BIP30_BIP34_HEIGHT)  return 1;   /* no ancestor at BIP34Height */
+
+    /* 0 = not yet resolved, 1 = ancestor is BIP34Hash (skip), -1 = it is not,
+     * or could not be read (enforce). */
+    static int anc = 0;
+    if (anc == 0) {
+        static u8 buf[1u<<20];      /* block 227,931 is ~215 KB */
+        u8 h[32];
+        long len = g_bip30_store
+                 ? store_read_at(g_bip30_store, (u64)BIP30_BIP34_HEIGHT, buf, sizeof buf)
+                 : -1;
+        if (len >= 80) {
+            block_hash(h, buf);
+            anc = (memcmp(h, B34, 32) == 0) ? 1 : -1;
+        } else {
+            anc = -1;
+        }
+        fprintf(stderr, "[utxo_live] BIP30: ancestor at height %d %s -- %s the duplicate-outpoint check above that height\n",
+                BIP30_BIP34_HEIGHT,
+                anc == 1 ? "is BIP34Hash" :
+                    (len >= 80 ? "is NOT BIP34Hash" : "could not be read"),
+                anc == 1 ? "skipping" : "ENFORCING");
+    }
+    return anc == 1 ? 0 : 1;
+}
+
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (blocklen < 81) return 0;
     const u8* p = blockbuf + 80;
@@ -610,6 +698,34 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (wr != 1) {
             fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
             return 0;
+        }
+    }
+
+    /* ---- Phase 0.3: BIP30. Core runs this in ConnectBlock BEFORE any
+     * script verification, and so do we -- it is one UTXO lookup per created
+     * output against a set we have already loaded, so failing here is far
+     * cheaper than failing after a block's worth of signatures.
+     *
+     * EVERY transaction, coinbase included: the only two blocks this has
+     * ever fired on are duplicate COINBASES, so a loop starting at t=1 would
+     * check exactly the wrong thing. (tx_verify_block_connect_all starts at
+     * t=1 because it verifies signatures, which a coinbase has none of --
+     * which is why this check lives here and not there.)
+     *
+     * On mainnet the gate is off from height 227,932 to 1,983,701, so for a
+     * node replaying the current chain this loop does not run at all. ---- */
+    if (bip30_enforced(g_apply_height, blk_hash)) {
+        for (u64 t=0; t<ntx; t++){
+            for (u32 o=0; o<pn_outs[t]; o++){
+                u64 v; unsigned long hh, cb, sl; const u8* sp;
+                if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, txs[t].txid, o,
+                                 &v, &hh, &cb, &sp, &sl) == 1) {
+                    fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: bad-txns-BIP30 "
+                            "(tried to overwrite transaction: output %u already unspent)\n",
+                            g_apply_height, (unsigned long)t, (unsigned)o);
+                    return 0;
+                }
+            }
         }
     }
 
@@ -922,6 +1038,7 @@ static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_
 extern long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn);
 
 long utxo_live_recover_partial_block(void* store_buf){
+    g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     long h = g_applied_height + 1;
     char upath[64]; snprintf(upath, sizeof upath, "undo_%ld.dat", h);
     struct stat sb;
@@ -1025,6 +1142,14 @@ int utxo_live_test_apply_block(const unsigned char* blk, unsigned long len, long
 int utxo_live_test_seed(const unsigned char txid[32], unsigned int index, unsigned long long value,
                         const unsigned char* spk, unsigned int spklen){
     return (int)utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value, 0, 0, spk, spklen);
+}
+/* TEST-ONLY: the BIP30 enforcement gate, so its height/hash arithmetic can be
+ * asserted directly instead of inferred from whether a block was rejected.
+ * Returns 1 = enforce, 0 = skip. NOTE: with no store handle cached (which is
+ * the case unless utxo_live_catchup ran) the BIP34-ancestor arm cannot be
+ * resolved and the gate deliberately answers ENFORCE -- see bip30_enforced. */
+int utxo_live_test_bip30_enforced(long height, const unsigned char hash32[32]){
+    return bip30_enforced(height, hash32);
 }
 
 
@@ -1165,6 +1290,7 @@ int utxo_live_init(const char* dir){
  * Returns the number of newly-applied heights (>=0), or -1 on a fatal
  * error (I/O or memtable-capacity failure -- see live_on_output). */
 long utxo_live_catchup(void* store_buf){
+    g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
 
