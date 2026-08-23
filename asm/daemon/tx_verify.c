@@ -171,18 +171,36 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
  * had simply never carried a legacy script that large before. */
 #define TXV_MAX_INPUTS    20000
 #define TXV_SPK_CAP       10000
-/* Per-input witness stack item count. Not 8 (that rejected the first real
- * >8-item witness, incident #15: 498787 tx 2420, a 17-item P2SH-P2WSH
- * stack). No consensus rule caps the item COUNT at parse time; the real
- * bounds are per-item size <=520 and the 1000-element execution stack
- * (MAX_STACK). A P2WSH witness's items become the initial stack (minus the
- * popped witnessScript), so >1000 stack elements can never satisfy the
- * cleanstack/MAX_STACK checks -- 1001 items is the most a valid P2WSH spend
- * can carry; tapscript adds at most script+control+annex. 1004 rejects
- * nothing Core would execute while bounding the pool reservation per input.
- * Items are no longer stored inline (see the witpool below) -- this is only
- * the reject threshold now, not an array dimension. */
-#define TXV_MAX_WIT_ITEMS    1004
+/* Per-input witness stack item count. The history here is two incidents, and
+ * the second one invalidated the first one's reasoning:
+ *
+ *   #15 (498787 tx 2420) raised this from 8, which had rejected an ordinary
+ *   17-item P2SH-P2WSH stack. It settled on 1004, arguing that a P2WSH
+ *   witness's items BECOME the initial stack, so >1001 could never satisfy
+ *   MAX_STACK(1000)/cleanstack, plus tapscript's script+control+annex.
+ *
+ *   #26 (761249 tx 121, txid 73be398c...2a7e) proved that argument wrong on
+ *   real mainnet data: ONE input with 500,003 witness items, accepted by
+ *   Core, rejected here. The hole is the same one #19 found for the element
+ *   SIZE limit -- Core runs the BIP342 OP_SUCCESSx scan BEFORE the stack
+ *   limits ("OP_SUCCESSx processing overrides everything"), so a tapscript
+ *   spend under an OP_SUCCESSx leaf is consensus-VALID with any number of
+ *   stack items. #19's author flagged exactly this as a known divergence and
+ *   left it; the replay then walked into it.
+ *
+ * There is no consensus item-count rule at all, so the only sound bound is
+ * what the wire can physically express. Every item costs at least one byte
+ * (its own compactsize length prefix, 0x00 for an empty item), so a
+ * transaction of length L carries at most L items, and L is bounded by
+ * MAX_BLOCK_SERIALIZED_SIZE = 4,000,000, which is validated before this
+ * point. The pool stores ptr+len (12 B/item), so the worst case a valid
+ * block can force is ~48 MB of pool -- bounded, and bounded by data the
+ * block-level checks already accepted.
+ *
+ * This is a reject THRESHOLD, not an array dimension (items live in the
+ * growable witpool below), so raising it costs nothing until the data
+ * actually arrives. */
+#define TXV_MAX_WIT_ITEMS    4000000
 
 #define TXV_SHAPE_LEGACY  0
 #define TXV_SHAPE_P2WPKH  1

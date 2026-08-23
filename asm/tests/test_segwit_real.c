@@ -131,8 +131,24 @@ int main(void){
     memset(t+n,0,4); n+=4;                                   /* locktime */
     u8 bh0[32]={0}; const char* rs="?";
     int r=tx_verify_block_connect(t,(u64)n,500000,bh0,&g_lst,g_tab,&rs);
-    ck("1005-item witness is REJECTED (over TXV_MAX_WIT_ITEMS)", r==0 && rs && strstr(rs,"too many witness items")!=NULL);
-    if(r!=0||!rs||!strstr(rs,"too many witness items")) printf("       got r=%d reason=%s\n", r, rs?rs:"(null)");
+    /* CHANGED by incident #26. This used to assert the opposite -- that 1005
+     * items is rejected "over TXV_MAX_WIT_ITEMS" -- which pinned incident
+     * #15's cap of 1004. That cap was WRONG: #15 argued no valid spend can
+     * exceed MAX_STACK(1000), but Core runs BIP342's OP_SUCCESSx scan BEFORE
+     * the stack limits, so a tapscript spend under an OP_SUCCESSx leaf is
+     * consensus-valid with any number of items. Real mainnet block 761,249
+     * tx 121 (73be398c...2a7e) carries 500,003 items on ONE input and Core
+     * accepts it; this node rejected it and the replay stopped there.
+     *
+     * There is no consensus item-count rule, so the assertion is now the
+     * negative one: a large witness must NOT be rejected FOR ITS COUNT. This
+     * synthetic transaction is still rejected -- its all-zero outpoint is not
+     * in the stub UTXO set -- so only the reason is asserted, not the
+     * verdict. The positive case is real chain data, and belongs in a fixture
+     * pulled from 761,249 rather than in a hand-built vector. */
+    ck("1005-item witness is NOT rejected for item count (incident #26)",
+       !(rs && strstr(rs,"too many witness items")));
+    if(rs && strstr(rs,"too many witness items")) printf("       got r=%d reason=%s\n", r, rs);
   }
 
   printf("\n%s (%d/%d)\n", fails?"TESTS FAILED":"ALL PASS", checks-fails, checks);
