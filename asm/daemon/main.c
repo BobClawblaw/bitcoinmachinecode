@@ -590,7 +590,18 @@ static int serve_loop(int fd, int lfd){
     (g_cfg.max_connections - g_cfg.max_outbound - g_cfg.max_block_relay_only - g_cfg.max_feeler)
 #define CFG_BRO_N() \
     (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
-#define MUX_MAX_OUT 8
+/* Array capacity for outbound legs. The TARGET is g_cfg.max_outbound
+ * (bitcoin.conf `bmc.maxoutbound`, Core's 8 full-relay by default); this is
+ * only the ceiling those arrays can hold, and must be >= the knob's clamp.
+ *
+ * Until 2026-08-23 this was 8 AND the dial loops carried a literal 8 beside
+ * it, so g_cfg.max_outbound -- which has existed and been parseable all along
+ * -- reached nothing except the inbound budget calculation. Setting it did
+ * nothing. Two numbers for one concept, in four places. */
+#define MUX_MAX_OUT 64
+/* The live target, clamped to what the arrays can hold. */
+#define MUX_WANT_OUT() ((int)(g_cfg.max_outbound > MUX_MAX_OUT ? MUX_MAX_OUT : \
+                              (g_cfg.max_outbound < 1 ? 1 : g_cfg.max_outbound)))
 static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
@@ -2120,14 +2131,54 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* stash the original flags so we can clear O_NONBLOCK after promote */
             cfd[nc++]=fd;
         }
-        /* single bounded wait for any of them to become writable */
+        /* Bounded wait for them to become writable -- in ROUNDS, not once.
+         *
+         * This used to be a single poll(pol,nf,2500) and then "whoever has
+         * POLLOUT set right now wins". But poll() returns as soon as the FIRST
+         * socket is ready, not after the full timeout: one nearby peer
+         * answering in 20ms made every slower peer look un-ready, and they
+         * were all closed on the spot. Measured 2026-08-23 on the first live
+         * boot: 85 candidates confirmed alive by the probe round, exactly ONE
+         * promoted here, and the (rot % 8) top-up loop then spent ~95 seconds
+         * redoing the work the dial should have done.
+         *
+         * So: keep polling until the target is met or the budget expires,
+         * carrying readiness forward across rounds. A satisfied entry has its
+         * fd negated, which makes poll() skip it, so each round waits only on
+         * the sockets still pending. Same total budget, just not surrendered
+         * to the first responder. */
         struct pollfd pol[64]; int nf=0;
-        for(int i=0;i<nc;i++){ if(cfd[i]<0) continue; pol[nf].fd=cfd[i]; pol[nf].events=POLLOUT; pol[nf].revents=0; nf++; }
-        if(nf>0) poll(pol,nf,2500);
-        for(int i=0;i<nc && mux_n_out<8 && mux_n_out<MUX_MAX_OUT;i++){
+        int   pidx[64];                    /* pol[j] -> cfd[] index */
+        char  rdy[64];                     /* accumulated readiness */
+        for(int i=0;i<nc;i++){ if(cfd[i]<0) continue; pol[nf].fd=cfd[i]; pol[nf].events=POLLOUT; pol[nf].revents=0; pidx[nf]=i; rdy[nf]=0; nf++; }
+        if(nf>0){
+            long long dl_end;
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+              dl_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + 2500; }
+            int nready = 0, want = MUX_WANT_OUT();
+            for(;;){
+                long long now_ms2;
+                { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                  now_ms2 = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
+                int left = (int)(dl_end - now_ms2);
+                if(left <= 0 || nready >= want) break;
+                int r = poll(pol,nf,left);
+                if(r <= 0) break;                    /* timeout, or error */
+                for(int j=0;j<nf;j++){
+                    if(pol[j].fd < 0) continue;      /* already counted */
+                    if(pol[j].revents & (POLLOUT|POLLERR|POLLHUP)){
+                        if(pol[j].revents & POLLOUT) { rdy[j]=1; nready++; }
+                        pol[j].fd = -pol[j].fd;      /* poll() ignores negative fds */
+                    }
+                    pol[j].revents = 0;
+                }
+            }
+            fprintf(stderr,"[dl] dial: %d of %d candidate(s) answered within the budget\n", nready, nf);
+        }
+        for(int i=0;i<nc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT;i++){
             if(cfd[i]<0) continue;
             int ready=0;
-            for(int j=0;j<nf;j++) if(pol[j].fd==cfd[i]){ ready=(pol[j].revents&POLLOUT)?1:0; break; }
+            for(int j=0;j<nf;j++) if(pidx[j]==i){ ready=rdy[j]; break; }
             if(!ready){ close(cfd[i]); continue; }
             int soerr=0; socklen_t sl=sizeof soerr;
             if(getsockopt(cfd[i],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[i]); continue; }
@@ -2154,7 +2205,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(!kept) close(cfd[i]);
         }
     }
-    fprintf(stderr,"[dl] connected %d/%d peer(s); downloading across them...\n", mux_n_out, 8);
+    fprintf(stderr,"[dl] connected %d/%d peer(s); downloading across them...\n", mux_n_out, MUX_WANT_OUT());
     long long rot=0;
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
@@ -2367,9 +2418,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * on a variable network, so keep trying to add a leg occasionally
          * (rate-limited) instead of giving up at the initial dial. Uses the
          * proven outbound_connect path (works for reachable peers). */
-        if(mux_n_out < 8 && (rot % 8)==0){
-            for(int ci=0; ci<nsrc && mux_n_out<8 && mux_n_out<MUX_MAX_OUT; ci++){
-                if(mux_n_out>=8) break;
+        if(mux_n_out < MUX_WANT_OUT() && (rot % 8)==0){
+            for(int ci=0; ci<nsrc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
+                if(mux_n_out>=MUX_WANT_OUT()) break;
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
