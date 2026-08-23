@@ -66,6 +66,7 @@ extern void utxo_lsm_close(void* lst);
  * into undo_<height>.dat, which is what makes a later DISCONNECT of that
  * block possible at all. */
 extern long utxo_script_unspendable(const u8* script, unsigned long slen); /* bitcoin_utxo_stats.asm: Core's IsUnspendable() */
+extern void utxo_prefetch(void* u, const u8 txid[32], unsigned long index); /* bitcoin_utxo.asm: warm the home slot, pure hint */
 extern long undo_capture_and_del(void* lst, void* u, long height,
                                  const u8 txid[32], u32 index);
 extern long undo_discard(long height);
@@ -586,6 +587,13 @@ static void idxbuild_on_input(void* ctxv, const u8 txid[32], u32 index){
     if (index == 0xFFFFFFFFu && memcmp(txid, ZERO32, 32)==0) return; /* coinbase's null prevout */
     u8 key[36]; memcpy(key, txid, 32); memcpy(key+32, &index, 4);
     if (!bspent_claim(c->bs, key)) c->dup_found = 1;
+    /* Warm the memtable's home slot for this prevout NOW, a whole phase
+     * before STAGE B's undo_capture_and_del and the verify workers'
+     * prevout resolution probe it for real. utxo_get's probe is a chain of
+     * dependent cache misses; issuing the address here overlaps that
+     * latency with the rest of the index build. Pure hint -- no result can
+     * change (see utxo_prefetch in bitcoin_utxo.asm). */
+    utxo_prefetch(g_utxo_table, txid, index);
 }
 static void idxbuild_on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u32 slen){
     idxbuild_ctx_t* c = (idxbuild_ctx_t*)ctxv;
