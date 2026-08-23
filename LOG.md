@@ -7,6 +7,70 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- the replay finished at 963,000, and the resulting UTXO set IS Bitcoin Core's
+
+The from-scratch, full-signature-verification replay of the real mainnet
+archive -- no `assumevalid` -- completed at 11:25:
+
+    [utxo_live] caught up at height 963000
+    [dl] updating utxo: applied 62707 block(s), now at height 963000, live=417948516
+
+Height 963,000 is within ~700 blocks of the live chain tip. **Zero rejects and
+zero fatals** across the 170,021 blocks applied since the run resumed at
+792,979 at 02:07.
+
+### The check that actually matters
+
+A clean replay proves no block was REFUSED. It says nothing about whether the
+state those blocks built is correct -- and count, total amount and bogosize are
+all blind to a field-level error. So the finished set was hashed with
+MuHash3072 and diffed against Core's own `gettxoutsetinfo muhash 963000`.
+
+    txouts        165,847,393          == Core
+    total_amount  20,071,648.00979492  == Core, to the satoshi
+    bogosize      12,989,895,997       == Core
+    muhash        4a527806...9b76      != Core's 218228b1...ffc9
+
+Every aggregate with an independent value matched. 252,101,123 unspendables
+filtered out of 417,948,516 raw entries landing exactly on Core's count means
+the `IsUnspendable` transcription is off by ZERO entries in either direction
+across 418 million. The hash disagreeing on top of that is a **field-level**
+difference: right key, right value, wrong metadata somewhere.
+
+Incident #29 predicts exactly two such entries. Re-hashing with only those two
+height fields corrected:
+
+    muhash        218228b1...ffc9      == Core, byte for byte
+    (both overrides reported "matched 1 live entry")
+
+So at height 963,000 both BIP30 duplicate coinbases are still unspent, and
+**two height fields on two outpoints from 2010 are the entire difference
+between this node's chainstate and Bitcoin Core's.** 165,847,393 entries,
+two wrong fields, both already known and both attributable to one open defect.
+
+### What this does and does not establish
+
+It establishes the ACCEPT direction about as strongly as it can be
+established: the node accepts everything the real chain contains, and the state
+it derives from doing so is bit-identical to Core's modulo a single known bug.
+
+It establishes nothing about the REJECT direction, and this project keeps
+finding that the two differ. On this day alone: incident #28's `SETcc` diverged
+from Core on 11,780 of 63,036 generated scripts, **5,050 of them false
+ACCEPTS**; and BIP30 turned out not to be implemented in the daemon at all
+(#30). Neither was reachable by replaying -- no block in the chain exercises
+them, because Core-running miners never mined one. A clean replay would have
+run to tip with both present, and this MuHash would still have matched, because
+both bugs are about blocks that do not exist.
+
+### Method note
+
+No downtime was needed. The daemon sits at its `stopatheight` ceiling, so the
+UTXO files are static -- verified with two stats five seconds apart before
+starting, rather than assumed -- and `utxo_setinfo`'s own quiescence gate
+confirmed it (`quiesced: true`). The read is genuinely read-only
+(`utxo_lsm_reload_ro`).
+
 ## 2026-08-23 -- bip30_diff.py now drives the daemon, and measuring what that proves corrected my own claim about it
 
 Incident #30 left one thing open and named it as the change that stops the
