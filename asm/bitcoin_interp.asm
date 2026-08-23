@@ -1595,6 +1595,10 @@ script_eval:
     je    .mo5
 .mo6:  test  r14, r14
     setnz r14b
+    movzx r14, r14b         ; SETcc writes ONLY the low byte -- without this the
+                            ; operand's upper 56 bits survive into the result
+                            ; (LOG.md incident #28). Core's OP_0NOTEQUAL is
+                            ; `bn = (bn != 0)`: exactly 0 or 1, nothing else.
     jmp   .mo_out
 .mo1:  add   r14, 1
     jmp   .mo_out
@@ -1608,6 +1612,7 @@ script_eval:
     jmp   .mo_out
 .mo5:  test  r14, r14
     setz  r14b
+    movzx r14, r14b         ; ditto: Core's OP_NOT is `bn = (bn == 0)`.
     jmp   .mo_out
 .mo_out:
     lea   rdi, [r12+8]
@@ -1726,38 +1731,52 @@ script_eval:
     jmp   .b_out
 .b_sub: sub   r14, r15
     jmp   .b_out
+; Every arm below ends in SETcc, which writes ONLY the low 8 bits of its
+; destination. r14 and r15 still hold the DECODED OPERANDS at that point, so
+; without a zero-extension the operand's upper 56 bits survive into what gets
+; pushed -- `256 512 NUMEQUAL` pushed 256 (true) where Core pushes 0 (false).
+; See LOG.md incident #28. Core's every one of these is a bool: 0 or 1.
 .b_band:
-    mov   r13d, 0
     test  r14, r14
     setnz r14b
+    movzx r14, r14b
     test  r15, r15
     setnz r15b
+    movzx r15, r15b
     and   r14d, r15d
     jmp   .b_out
 .b_bor:
     test  r14, r14
     setnz r14b
+    movzx r14, r14b
     test  r15, r15
     setnz r15b
+    movzx r15, r15b
     or    r14d, r15d
     jmp   .b_out
 .b_eq: cmp   r14, r15
     sete  r14b
+    movzx r14, r14b
     jmp   .b_out
 .b_ne: cmp   r14, r15
     setne r14b
+    movzx r14, r14b
     jmp   .b_out
 .b_lt: cmp   r14, r15
     setl  r14b
+    movzx r14, r14b
     jmp   .b_out
 .b_gt: cmp   r14, r15
     setg  r14b
+    movzx r14, r14b
     jmp   .b_out
 .b_le: cmp   r14, r15
     setle r14b
+    movzx r14, r14b
     jmp   .b_out
 .b_ge: cmp   r14, r15
     setge r14b
+    movzx r14, r14b
     jmp   .b_out
 .b_out:
     lea   rdi, [r12+8]
@@ -1846,6 +1865,12 @@ script_eval:
     mov   rdx, 4
     call  scriptnum_decode
     mov   rbx, rax          ; max
+    ; `setl r14b` below has incident #28's shape -- r14 still holds min -- but
+    ; the answer is CORRECT here, and only because r13d is zeroed first: r13d
+    ; is then 0 or 1, so `and r13d, r14d` masks r14's surviving upper bits away
+    ; and leaves exactly the SETcc bit. Keep the xor. (Swept by
+    ; tests/test_scriptnum_bool, so deleting it fails there rather than
+    ; silently.)
     xor   r13d, r13d
     cmp   r14, r15
     setle r13b
