@@ -337,3 +337,8 @@ asm/tests/bench_merkle
 asm/tests/bench_checkblock
 asm/tests/bench_abi_audit
 bench-results/
+
+# UTXO set hash / gettxoutsetinfo (2026-08-23)
+asm/tests/test_muhash
+asm/tests/test_utxo_setinfo
+asm/daemon/utxo_setinfo

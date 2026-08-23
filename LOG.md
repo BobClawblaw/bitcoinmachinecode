@@ -7,6 +7,153 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- the UTXO set hash: the LIVE replay's set is Bitcoin Core's, at height 792,979
+
+Stage D's acceptance test was "no block was rejected". It is now "the UTXO set
+is provably identical to Bitcoin Core's", and the answer -- measured on the
+production datadir, not a fixture -- is **yes**:
+
+    height 792,979   ours                    Core (`gettxoutsetinfo muhash 792979`)
+    txouts           102,532,574             102,532,574                    MATCH
+    total_amount     19,393,405.70154310     19,393,405.70154310 BTC        MATCH
+    bogosize         7,739,642,957           7,739,642,957                  MATCH
+    muhash           e7e65c06...649e776a     e7e65c06...649e776a            MATCH
+
+with **two entries' `height` field** re-hashed to the values Core's BIP30
+overwrite gives them (incident #28 below). Everything else -- 102.5 million
+coins, their outpoints, values, scripts, heights and coinbase flags -- agrees
+exactly.
+
+Read that count again against the one from incident #17: our raw live set at
+this height is 155,001,147 entries, of which **52,468,573 are provably
+unspendable** and are filtered out while iterating. The remaining 102,532,574
+match Core's `txouts` to the unit. A filter that was wrong in either direction
+by a single entry would have broken that.
+
+The same comparison on a purpose-built set at height 91,721 -- before the first
+BIP30 duplicate, so no adjustment at all is needed -- is clean on all four:
+
+    height 91,721   ours                        Core (`gettxoutsetinfo muhash 91721`)
+    txouts          63,394                      63,394
+    total_amount    4,586,050.00000000 BTC      4,586,050.00000000 BTC
+    bogosize        6,916,533                   6,916,533
+    muhash          0ec1016a3232...d9b5c65b     0ec1016a3232...d9b5c65b     IDENTICAL
+
+(with `--exclude-genesis-coinbase`, needed only because `build_utxo` built that
+one; the production set does not contain the genesis coinbase, and reports
+`genesis_excluded=0`.)
+
+At height 200,000, three of those four still match exactly -- txouts
+2,318,056, total_amount 9,999,889.98361183 BTC, bogosize 175,620,421 -- and the
+set hash does not. The whole of that difference is **two entries**, and finding
+which two is the point of the exercise. It is the same two entries at height
+792,979.
+
+### Which hash, and why the obvious one was wrong twice over
+
+`hash_serialized_3` was the obvious target and is unusable here, for two
+independent reasons:
+
+1. **Core will not answer for it.** `gettxoutsetinfo hash_serialized_3 <height>`
+   returns "hash type cannot be queried for a specific block". Only `muhash` is
+   answerable at an arbitrary height, because `muhash` is what `coinstatsindex`
+   stores. Our replay is never at the oracle's tip, so hash_serialized_3 had no
+   ground truth at all.
+2. **Our iteration order is not Core's, and not even numeric.** `mac_cmp_key`
+   compares the output index with `bswap` over a NATIVE-ENDIAN u32 -- i.e. by
+   its little-endian bytes. Index 256 (`00 01 00 00`) therefore sorts BEFORE
+   index 1 (`01 00 00 00`). Core hashes a txid's outputs in NUMERIC index order
+   (`ComputeUTXOStats` buffers them in a `std::map<uint32_t, Coin>`, which
+   re-sorts regardless of the VARINT-encoded leveldb key order). Every
+   transaction with 256 or more simultaneously-live outputs -- routine for pool
+   payouts -- would have hashed in the wrong order, and the result would have
+   looked exactly like a data corruption bug.
+
+MuHash3072 is a multiset hash: order-independent, so reason 2 evaporates. It
+is implemented in `asm/bitcoin_muhash.asm` (ChaCha20 keystream + 48-limb
+modular arithmetic mod 2^3072-1103717), and it matched Core's own
+`muhash.cpp` on every layer -- keystream, ToNum3072, Multiply, and whole-set
+hash -- on the first run, against vectors generated from Core's code by
+`validation/gen_muhash_vectors.py`. No modular inverse was needed: a snapshot
+only ever inserts, so Core's denominator is permanently 1 and its `Divide(1)`
+reduces to `Multiply(1)`.
+
+One cheap trap on the way: Core renders the muhash with `uint256::GetHex()`,
+which prints the digest **byte-reversed**. Our first comparison at height
+91,721 looked like a total mismatch and was in fact an exact match printed
+backwards.
+
+### The 22M-entry blocker, solved without a rebuild
+
+Our set stores provably-unspendable outputs and Core's does not (77,191,281
+against 54,953,225 at height 575,833; incident #17). Filtering at write time
+would only affect outputs applied afterwards, so it needs a from-scratch
+rebuild to mean anything. `bitcoin_utxo_stats.asm` applies Core's
+`CScript::IsUnspendable` -- leading `OP_RETURN`, or size > 10,000 -- while
+ITERATING instead. Storage is untouched, the running replay pays nothing, and
+the figure is directly comparable today.
+
+### Incident #28: a BIP30 duplicate coinbase keeps the WRONG height
+
+At height 200,000 our set hash differed from Core's while every other figure
+agreed. Bisecting on height (`validation/utxo_setdiff.py`, which needs nothing
+but read-only `gettxoutsetinfo`) put the first divergence at **block 91,722** --
+the first BIP30 duplicate-coinbase block on mainnet.
+
+Core's BIP30 exception path calls `AddCoin(..., possible_overwrite=true)`:
+the later block's coinbase OVERWRITES the earlier identical one, so Core's
+chainstate ends up holding the coin at height **91,880** (txid `e3bf3d07...`)
+and **91,842** (txid `d5d27987...`). `utxo_lsm_put` returns 0 ("duplicate")
+and keeps the EARLIER copy -- heights 91,722 and 91,812. `build_utxo` had been
+printing `put_dup=2` for this all along.
+
+Same txid, same index, same value, same script. Cardinality, value and
+bogosize are all blind to it. **Only the set hash can see it** -- which is the
+entire argument for having one. Proven rather than argued: re-hashing exactly
+those two outpoints with Core's heights (`utxo_setinfo --override-coin`)
+reproduces Core's muhash byte for byte at BOTH heights measured --
+`169c05b5...fa3c8ced` at 200,000 and `e7e65c06...649e776a` at 792,979. Two
+outpoints, one field each, and that is the entire difference between our
+102.5-million-entry chainstate and Core's.
+
+**This is a false-accept shape, not just an accounting one.** The coin's
+height feeds the 100-block coinbase maturity rule. Our copy looks 158 blocks
+older than Core's, so between heights 91,880 and 91,980 we would have accepted
+a spend of `e3bf3d07...:0` that Core rejects as immature. It is long past, no
+such transaction exists, and the coins are still unspent -- but the mechanism
+(a duplicate put silently declining to overwrite) is live code, and the class
+is exactly the one ASSESSMENT.md warns cannot be found by replaying the chain.
+
+### And a second, smaller one: the two writers disagree about genesis
+
+`daemon/utxo_live.c` excludes the genesis coinbase, with a comment saying
+precisely why: Core never writes it to the chainstate, and keeping it "would
+leave this node one UTXO richer than Core forever, surfacing the first time our
+set is compared against `gettxoutsetinfo`". `daemon/build_utxo.c` does not.
+The two writers for the same set disagree. It surfaced exactly as predicted --
++1 txout, +50.00000000 BTC, +117 bogosize -- the first time the comparison was
+run. `utxo_setinfo --exclude-genesis-coinbase` compensates at read time; the
+source disagreement is still there.
+
+### Reading a datadir that is being written
+
+`data/` is the live replay's and changes continuously: WAL appends per block,
+a rewritten height file, and flushes/compactions that publish a new manifest
+and unlink run files. A read that straddles any of those mixes states and
+produces a plausible wrong number. `daemon/utxo_setinfo` therefore fingerprints
+every UTXO file's inode/size/nanosecond-mtime plus the directory itself, twice
+before the read and once after, and REFUSES on any change instead of guessing.
+`utxo_lsm_reload_ro` / `utxo_store_init_ro` make the read genuinely read-only:
+the ordinary reload path's `O_RDWR|O_CREAT` on utxo.dat/utxo.idx was the only
+write in the entire chain, and it is now the one thing substituted.
+
+`mac_lsm_recount`'s k-way merge was reused rather than re-implemented -- it
+already visits exactly the live set, newest generation wins, memtable- and
+tombstone-aware -- with an optional visitor invoked at the exact instruction
+that increments the counter, so the visited set and the counted set cannot
+drift apart.
+
+----------------------------------------------------------------------------
 ## 2026-08-23 -- incident #27: twenty-one functions returned the caller's callee-saved registers full of their own locals
 
 `make abi-check` passed. `make test` passed. The consensus interpreter had been

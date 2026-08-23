@@ -562,3 +562,112 @@ memcpy_asm:
     pop  rsi
     pop  rcx
     ret
+
+; ============================================================================
+; utxo_walk_live(u=rdi, cb=rsi, ctx=rdx) -> rax = live entries visited
+;   Linear scan of the slot array, emitting every occupied slot exactly once
+;   through the SAME visitor signature the LSM's run merge uses
+;   (bitcoin_utxo_lsm.asm's mac_lsm_recount):
+;
+;       void cb(void* ctx, const u8 key36[36], u64 value,
+;               u64 code, const u8* script, u64 slen)
+;
+;   `code` is (height << 1) | is_coinbase, the exact uint32 Core serializes
+;   for a coin. One shared six-register signature is what lets one
+;   implementation of the visitor consume both halves of the set with no shim.
+;
+;   The visitor is handed a 36-byte key assembled on THIS frame rather than a
+;   pointer into the slot, because the slot's txid(32) and index(4) are not
+;   adjacent in the required layout (the slot puts blob_off first), and
+;   because a visitor must never be handed a pointer whose lifetime it cannot
+;   reason about. `script` DOES point into the blob and is stable: the blob is
+;   a bump allocator that is not being written during a walk.
+;
+;   The return value is the number of entries emitted, which the caller is
+;   expected to check against u->n -- utxo_lsm_walk does, and refuses on a
+;   mismatch rather than reporting a plausible number.
+;
+;   Frame (ENGINEERING_RULES.md 6b: callee-saved pushed BEFORE rbp, so the
+;   save area at [rbp+8..] cannot be aliased by any local): entry RSP is
+;   8 mod 16, six pushes leave it at 8 mod 16, sub rsp, 0x38 (8 mod 16) brings
+;   it to 0 mod 16 at the indirect call. Locals:
+;     [rbp-0x28 .. -0x05]  key36 scratch (36 bytes)
+;     [rbp-0x30]           cb
+;     [rbp-0x38]           ctx
+; ============================================================================
+global utxo_walk_live
+utxo_walk_live:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x38
+    mov  r12, rdi                  ; u
+    mov  [rbp-0x30], rsi           ; cb
+    mov  [rbp-0x38], rdx           ; ctx
+    mov  r13, [r12+8]              ; mask
+    inc  r13                        ; slot count
+    mov  r14, [r12+16]             ; blob base
+    xor  r15d, r15d                ; slot index
+    xor  ebx, ebx                   ; emitted count
+
+.wl_loop:
+    cmp  r15, r13
+    jae  .wl_done
+    mov  rax, r15
+    imul rax, rax, 48
+    lea  rax, [r12+rax+40]         ; slot base
+    mov  ecx, [rax+40]              ; index field
+    cmp  ecx, 0xFFFFFFFF
+    je   .wl_next                   ; empty slot
+    inc  rbx
+    cmp  qword [rbp-0x30], 0
+    je   .wl_next                   ; counting only
+
+    ; ---- key36 = txid(32) || index(4), in the LSM's own key layout --------
+    lea  rdi, [rbp-0x28]
+    mov  rdx, [rax+8]
+    mov  [rdi], rdx
+    mov  rdx, [rax+16]
+    mov  [rdi+8], rdx
+    mov  rdx, [rax+24]
+    mov  [rdi+16], rdx
+    mov  rdx, [rax+32]
+    mov  [rdi+24], rdx
+    mov  [rdi+32], ecx
+
+    ; ---- blob record: value@0, height(low32)/is_coinbase(byte32)@8,
+    ;      slen@16, script@24 (see this file's header comment) -------------
+    mov  rsi, [rax]                 ; blob_off
+    add  rsi, r14                    ; record base
+    mov  rdx, [rsi]                 ; value
+    mov  rcx, [rsi+8]                ; packed height/is_coinbase
+    mov  r8, rcx
+    shr  r8, 32
+    and  r8d, 0xFF                    ; is_coinbase (byte 32 of the packed qword)
+    mov  ecx, ecx                      ; height (low 32)
+    shl  rcx, 1
+    or   rcx, r8                        ; code = (height<<1) | is_coinbase
+    mov  r9, [rsi+16]                    ; slen
+    lea  r8, [rsi+24]                     ; script
+    mov  rdi, [rbp-0x38]                   ; ctx
+    lea  rsi, [rbp-0x28]                    ; key36
+    call qword [rbp-0x30]
+    ; the callee may clobber every caller-saved register; r12..r15 and rbx are
+    ; ours and survive by the ABI, and the loop reads nothing else.
+.wl_next:
+    inc  r15
+    jmp  .wl_loop
+.wl_done:
+    mov  rax, rbx
+    add  rsp, 0x38
+    pop  rbp
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
