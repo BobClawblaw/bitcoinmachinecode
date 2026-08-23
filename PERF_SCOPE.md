@@ -2794,3 +2794,236 @@ corrupted sighash rather than a loud error:
 3. The block that a wrong shared arena would break first is one where two
    transactions with different input counts verify concurrently; a fixture
    with that shape specifically, not just "a busy block".
+
+### 14.8 BUILT and measured — 2026-08-23, branch `taproot-parallel`
+
+14.7's shape, implemented at both entry points in `daemon/tx_verify.c`. Two
+`TXV_SHAPE_P2TR` skips and two sequential passes deleted; taproot inputs are
+now ordinary entries in the flat verify array.
+
+* **Phase A — `tapagg_build()`.** Sequential, cheap (memcpy + `strip_witness`,
+  no signature work). For every transaction with at least one taproot input,
+  appends `po` (36 B/input), `am` (8 B/input), `sp` (**packed** 1+spklen, not
+  `nin*(1+TXV_SPK_CAP)`) and the witness-stripped `ns` to ONE per-block arena,
+  and records a descriptor of byte offsets plus `nin`. One `bytepool_reserve`
+  per transaction, so nothing can relocate the arena between reserving a
+  region and filling it.
+* **Phase B — `tapagg_verify()`.** A pure reader of that arena, called from
+  `txv_verify_one`/`txvb_verify_one` like any other shape. The arena is
+  read-only from the moment Phase 2 dispatches.
+* Phase A exists exactly once (a `tapin_fn` adapter per entry point), so the
+  single-transaction and whole-block paths cannot drift apart.
+
+**One change 14.7 did not call for, and why.** Work claiming in the block pool
+went from a fixed contiguous `[lo,hi)` slice per worker to one shared atomic
+counter. Fixed slices were defensible while every entry cost roughly one
+ECDSA verify; with taproot in the same round the per-entry cost now spans a
+key-path Schnorr verify, a tapscript execution and a zero-work
+`TXV_SHAPE_WPASS` entry, and those are not spread evenly through a block. The
+measurement below separates the two changes.
+
+#### Measured — `tests/bench_taproot_block`, 36 taproot-dense blocks
+
+Heights 825,000–825,015, 840,000–840,007, 870,000–870,007, 850,000–850,001,
+860,000–860,001. 143,952 non-coinbase transactions, 247,725 inputs, 98,814 of
+them taproot. Blocks and prevouts from the scratch Core oracle. Box: AMD Ryzen
+9 9950X3D, 16 physical cores / 32 threads, load 8–13. Three timed runs per
+block after one untimed warm-up, A/B alternated; the two rounds of each arm
+agreed to better than 1.5%. Built at **-O2** (the pin came off the same day);
+an earlier -O0 measurement of the same three arms gave 4,035 / 777 / 563 ms,
+i.e. the same picture — verification is hand-written asm and the C glue is not
+where the time goes.
+
+| tree | wall (36 blocks) | CPU | effective cores | inputs/s | vs baseline |
+|---|---|---|---|---|---|
+| `main` (taproot sequential) | 3,999 ms | 10,848 ms | **2.72** | 61,950 | 1.00x |
+| + taproot in the pool, static slices | 715 ms | 13,444 ms | 18.80 | 346,300 | **5.59x** |
+| + dynamic work claiming (shipped) | 534 ms | 14,225 ms | **26.62** | 463,600 | **7.49x** |
+| + the sizing/realloc checks below | 537 ms | 14,275 ms | 26.57 | 461,000 | 7.44x |
+
+The last row is the hardening in "Three invariants made enforced rather than
+documented": two compares per input, 0.6% of wall — inside the run-to-run
+spread, and a fair price for turning a silent arena overrun into a refusal.
+
+Dynamic claiming is worth 1.34x of that on its own — with static slices a
+worker that draws a run of tapscript-heavy transactions holds the barrier
+while the rest idle.
+
+**CPU time rises 31% and that is SMT, not extra work.** Pinned to 8 logical
+CPUs, where no two worker threads share a physical core, the same block costs
+294.9 ms of CPU on `main` and 298.2 ms here — +1.1%, i.e. the arena build and
+the atomic counter are noise — while wall time goes 192.9 ms → 38.5 ms (5.01x).
+At full width the extra CPU is 26 threads sharing 16 cores, which is a real
+cost paid for a much larger wall-time win, not a regression.
+
+#### A secondary, measured effect: 218 MB less `.bss`
+
+The old single-transaction taproot pass declared its arena as file statics
+sized for the worst case — `sp[TXV_MAX_INPUTS*(1+TXV_SPK_CAP)]` alone is
+20,000 x 10,001 = **200 MB**, plus `po`, `am`, `spk34`, `is_tap` and an
+8 MiB `ns`; the block path carried a second 8 MiB `ns`. All of it is gone,
+replaced by a bump-reset pool that is a few MB per block. Measured on
+`tests/test_txvb_wprog_stable`, which links the same translation unit:
+
+    .bss   428,437,288 -> 210,060,200 bytes   (-218 MB)
+
+`.bss` is demand-paged, so most of that was address space rather than resident
+memory — but it was also 200 MB of arena whose entries were spaced 10,001
+bytes apart to hold scripts that are almost always 22 to 34 bytes long, which
+is why the packed layout is both smaller and better for cache.
+
+#### The Amdahl bound, stated honestly
+
+**The 7.49x is the script-verification phase in isolation, and nothing else.**
+It is not a connect-path number and it is emphatically not a replay-throughput
+number:
+
+* The bench feeds a fully-resolved in-memory prevout table. The live daemon
+  resolves each prevout through the LSM, sequentially, which is why §14
+  measured ~1.0 effective cores live where this bench measures 2.72 on the
+  same code. The bench isolates verification; it therefore **overstates** the
+  end-to-end effect.
+* Everything else the connect path does — block parse, BIP141 commitment,
+  BIP30, the in-block index and duplicate-outpoint check, the sequential UTXO
+  apply, the LSM writes, the undo log, the archive read — is untouched.
+* Applying §14's live figure (67% of the main thread was field arithmetic) to
+  a 7.49x on that portion gives at most **1/(0.33 + 0.67/7.49) ≈ 2.4x** on the
+  connect path, consistent with 14.7's "at most ~3x". The UTXO apply does not
+  move and becomes the next ceiling.
+
+**This has to be re-profiled on the live daemon after deployment, not
+projected.** That is the whole reason 14.7 exists.
+
+#### Validation — 14.7's three items, all executed
+
+1. **`tests/test_taproot_thread_stress`** — 8 threads x 4,000 iterations =
+   96,000 concurrent hashes, **0 wrong digests** (29,236 of 96,000 against the
+   pre-fix globals).
+2. **Whole-block differential against the Core oracle** —
+   `tests/test_taproot_block_diff`, new, over the 36 blocks above. Every
+   transaction, both entry points, both directions:
+
+   | | count | result |
+   |---|---|---|
+   | whole-block ACCEPT runs (block path) | 288 (36 blocks x8) | 0 rejects |
+   | per-transaction ACCEPT (single-tx path) | 143,952 | 0 rejects |
+   | corrupted-witness REJECT (single-tx path) | 81,124 | all rejected, `p2tr*` reason |
+   | corrupted-witness REJECT (block path) | 1,775 | all rejected, `fail_tx_index` exact |
+   | prevout perturbations, per path | 3,454 | all rejected, blame exact |
+
+   The prevout probes are the ones aimed at the arena specifically: bumping a
+   **sibling** input's amount by one satoshi can only reject through
+   `sha_amounts`, i.e. through the shared array.
+3. **The different-input-counts fixture** — `tests/test_taproot_parallel_arena`,
+   in `make test`, from real block 825,000 transactions spanning **14 distinct
+   input counts** (1,2,3,4,5,6,7,8,11,12,14,19,28,36): 488 pairwise
+   two-transaction blocks, one 483-transaction interleaved block of 4,284
+   inputs x25 runs, 46 in-place corruption rejects with exact blame, the
+   single-transaction path over all 23 fixture transactions in both directions,
+   and the aggregate array's one-byte length limit checked from both sides —
+   refused at a 253-byte prevout script, accepted at 252.
+
+**Soaked, because the bug class is scheduling-dependent.** With 32 spinners
+saturating the box: the arena fixture 40 times, 0 failures; and 600 whole-block
+accepts (100 runs each over blocks 825,000 / 825,010 / 840,003 / 870,004 /
+850,000 / 860,000), 0 rejects. A scheduling-dependent corruption that survives
+that is not one a single run would have found.
+
+**Two corpus facts that broke the first version of the probes**, recorded
+because both are easy to get wrong again:
+
+* 5 transactions spend taproot with **SIGHASH_ANYONECANPAY**, which drops
+  `sha_amounts`/`sha_scriptpubkeys` entirely — perturbing a sibling input's
+  amount is legitimately a no-op for them.
+* 17 transactions are **script-path spends that never compute a sighash at
+  all** (unknown leaf version, an `OP_SUCCESSx` leaf, or a tapscript with no
+  CHECKSIG). Their own amount is not committed either. They are covered by
+  breaking the control block's Merkle commitment instead, which every
+  script-path spend must satisfy.
+
+#### Mutation-tested, because a passing test proves nothing on its own
+
+Ten deliberate bugs injected into the arena logic, each caught:
+
+| mutation | caught by |
+|---|---|
+| descriptor index off by one | A (block accept) |
+| global flat index passed instead of `local_idx` | A |
+| `nin` off by one in the descriptor | A / pairwise |
+| `ns` taken from the neighbouring transaction | pairwise |
+| amounts written big-endian | A |
+| `sp` strided instead of packed | A |
+| `TXV_SHAPE_P2TR` silently ok (the old skip), block path | D / reject-in-place |
+| `TXV_SHAPE_P2TR` silently ok, single-transaction path | single-tx reject |
+| `>= 0xfd` guard relaxed to `> 0xfd`, or removed | arena pass 5 |
+| `>= 0xfd` guard tightened to `>= 200` (false reject) | arena pass 5 |
+
+The two false-ACCEPT mutations are the ones that matter: a corrupted sighash
+never produces a false accept (a wrong sighash fails), but an input that is
+never checked does.
+
+#### Three invariants made enforced rather than documented
+
+A review of the diff found no consensus bug but three places where correctness
+rested on a fact that is no longer checkable at the point of use. All three are
+now closed, and the first two are the difference between a loud refusal and a
+silent heap overrun:
+
+* `tapagg_build` sizes with one traversal of `get()` and writes with a second.
+  `get` is a **function pointer**, so "both passes see the same `spklen`" stopped
+  being a local fact. If they ever disagreed, the `memcpy` would overrun `sp`
+  *into the arena regions other transactions' descriptors point at* — a
+  corrupted sighash for an unrelated transaction. The write pass now re-checks
+  `sl < 0xfd` and `w + 1 + sl <= splen`. Two compares per input against a
+  Schnorr verify. Removing the `>= 0xfd` guard entirely, or loosening it by
+  one, now trips this check rather than corrupting memory — which is exactly
+  what mutations M-a and M-b above demonstrate.
+* Same indirection weakened the realloc argument: a future adapter that
+  allocated would dangle `po`/`am`/`sp`/`ns`. The loop now compares `pool->buf`
+  against the base captured after the single reserve, before the first write of
+  each iteration.
+* `g_t1_tap_built` was only cleared inside `if (has_taproot)`. Safe today via a
+  non-local coupling (`has_taproot` and `TXV_SHAPE_P2TR` are set by the same
+  branch); now cleared unconditionally, so it is locally true.
+
+#### Not verified
+
+* **End-to-end replay throughput.** Not measured at all. It needs the live
+  daemon restarted, which this work deliberately did not do. The 2.4x
+  connect-path figure above is arithmetic on §14's live profile, not a
+  measurement.
+* **The re-profile §14.3 asks for** — whether `fe_mul` is still the right next
+  target now that it multiplies against a parallel baseline — is not done.
+* **Blocks below 800,000 and above 870,007**, and any block whose taproot
+  usage is unlike this corpus's. The differential covers 36 blocks in four
+  clusters, not a chain.
+* **Constant-time behaviour.** `tests/test_scalarmul_ct` was not re-run for
+  this change; nothing here touches the scalar-multiply path.
+* **Taproot spending a SAME-BLOCK output.** The differential passes
+  `bx = NULL`, so every prevout resolves through `utxo_lsm_get`; the live
+  daemon resolves in-block chained spends through `bidx_get` first. Both write
+  the same `value`/`spk_off` fields that Phase A then reads, so the exposure is
+  small, but it is reasoned rather than measured. `tests/test_cross_tx_verify`
+  covers `bidx_get` with non-taproot scripts only.
+* **The `>= 0xfd` prevout-script guard on the taproot path.** Carried over
+  verbatim, and no real block in the corpus has a prevout script that large on
+  a taproot-bearing transaction, so the reject is untested here as it was
+  before.
+* **`tests/test_block_481827_pool_stack`** still SKIPs: its fixture has never
+  existed in this tree. Generating one exposed a PRE-EXISTING defect, verified
+  on unmodified `main` — the `.prevouts` format lists prevouts created by an
+  earlier transaction in the SAME block, which is right for a verifier and
+  wrong as a seed for the full apply path, where BIP30 then sees the block's
+  own transaction overwriting an unspent output and rejects
+  ("REJECT h=481827 tx=12: bad-txns-BIP30, output 32 already unspent"). A
+  seeder must drop any prevout whose funding txid appears in the block. Not
+  fixed here — unrelated to taproot, and the fixture is not committed.
+* **Memory under adversarial blocks** was reasoned and then checked against
+  the corpus, but not fuzzed. Measured maximum over the 38 fixture blocks:
+  **2.29 MB** (height 840,000). The adversarial ceiling is small for a reason
+  worth stating: `tapagg_build` rejects any prevout script `>= 0xfd` on a
+  taproot-bearing transaction (BIP341's aggregate array has a one-byte length
+  field), so `sp` costs at most 253 B/input, not `TXV_SPK_CAP`. An input costs
+  at least 41 wire bytes, so a 4,000,000-byte block carries at most ~97,600 of
+  them, giving `(36+8+253) * 97,600 + 4 MB ≈ 33 MB` — bounded, bump-reset per
+  block, and bounded by data the block-level checks already accepted.
