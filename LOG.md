@@ -53,8 +53,23 @@ regex does not work -- the `uint256{"..."}` initialisers contain braces and the
 non-greedy match stops inside the first one. It takes a fixed window from the
 function start instead.)
 
-Verified against the live chain regardless -- `getblockhash` for 91,842,
-91,880 and 227,931 all match the generated values.
+Verified twice regardless, because a generated constant is only as good as
+the convention it was generated INTO:
+
+  * against Core's `getblockhash` for 91,842 / 91,880 / 227,931 -- checks the
+    VALUES;
+  * against this codebase's own `block_hash()` run on those three blocks as
+    they sit in the production archive -- checks the BYTE ORDER, which is the
+    half a display-hex comparison cannot see. All three match byte for byte.
+
+The second check matters more than it looks: had the reversal been wrong, the
+gate would not have recognised 91,842 and 91,880 as grandfathered and would
+have FALSE-REJECTED two real mainnet blocks -- turning a bounded false-accept
+gap into an outage. The live daemon then confirmed the same thing
+independently on restart:
+
+    [utxo_live] BIP30: ancestor at height 227931 is BIP34Hash -- skipping the
+    duplicate-outpoint check above that height
 
 ### Where the check runs
 
