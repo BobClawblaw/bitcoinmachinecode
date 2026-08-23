@@ -227,16 +227,24 @@ what this node still does not do.
   100-block coinbase-maturity rule and a whole-block duplicate-outpoint
   check. Parallelized across every input in the block (a persistent worker
   pool, not per-block thread spawns) to make a full-archive replay
-  affordable. **In progress**: `bmc-bitcoind.service` is running a
-  from-scratch replay of the real chain against this path, currently past
-  height 727,000. **Twenty-four** real defects it has surfaced so far — from an
+  affordable — **except taproot inputs, which both entry points still verify
+  in a sequential pass** (`PERF_SCOPE.md` section 14). **In progress**:
+  `bmc-bitcoind.service` is running a from-scratch replay of the real chain
+  against this path, currently past height 806,000. **Twenty-nine** real
+  defects it has surfaced so far — from an
   LSM compaction manifest-ordering bug and an interpreter `OP_SIZE`
   register-width bug alongside a wholly-missing `OP_SHA1`, through the
   witness-stripped archive and the segwit-era spend bugs underneath it, to
   BIP342 tapscript rejecting `OP_CHECKSIGVERIFY`, to the SysV stack ABI
-  being violated tree-wide — were root-caused and
+  being violated tree-wide, to a `SETcc` writing eight bits where eleven
+  numeric opcodes needed sixty-four (which diverged from Core in *both*
+  directions on 11,780 of 63,036 generated scripts) — were root-caused and
   fixed, each with a regression test proven to fail against the pre-fix
-  code on real chain data. See `LOG.md` for the narratives,
+  code on real chain data. Two are **found but not yet fixed**: incident \#29
+  (a BIP30 duplicate coinbase keeps the pre-overwrite height, where Core's
+  `AddCoin(possible_overwrite=true)` replaces it) and a thread-unsafe global
+  in `secp256k1_taproot.asm` that is harmless only for as long as the taproot
+  pass stays sequential. See `LOG.md` for the narratives,
   `PLAN_SCRIPT_VERIFY.md`'s Stage D table for the one-line-per-wall index,
   and the dated files in `worklog/`. Not yet reached chain tip.
 
