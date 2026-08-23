@@ -7,6 +7,239 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- the -O0 pin comes off: the last two -O2 failures were a base58 stack overflow in product asm and a one-byte harness overflow, and the daemon's own stated reason no longer reproduces
+
+Previous entry: rewriting `-no-pie -O0` -> `-no-pie -O2` gave 156 ran / 7 FAILED.
+Incident #31 (`tap_merkle_root`) fixed four, the `test_taproot_sighash` hex
+buffer fixed a fifth. This entry is the remaining two, and the answer to the
+question they were gating.
+
+**Result: `make -k test` is 159 harnesses / 0 failures at `-O2` AND at `-O0`,
+`daemon/bitcoind` links and serves at `-O2`, and the Makefile's own stated
+reason for the pin does not reproduce.**
+
+### 1. `test_bip32_extkey` -- PRODUCT. `base58check_encode` overruns its own save area at 78-byte payloads
+
+The symptom looked like the other two harness bugs -- SIGSEGV in
+`__strcmp_evex` from `main`. It is not. In gdb, at the fault:
+
+    rbx 0x00000000000071a8   r12 0x571ec8e7e6c3a672
+    r13 0x83e5500866d6ca51   r14 0x5045c512e0576881
+    r15 0x6dded628e589e376   <- rdi; gcc had parked `b58` here
+
+Five callee-saved registers destroyed. **Extending the runtime sentinel probe
+found it in one run**, and found it only because the probe was given TWO input
+lengths:
+
+    ok   base58check_encode(21)      <- P2PKH: version||hash160
+    FAIL base58check_encode(78)      CLOBBERS rbx r12 r13 r14 r15
+
+`bitcoin_addr.asm`, `base58check_encode`. `push rbp / mov rbp,rsp` fixes the
+saves at `[rbp-0x08]`(rbx) through `[rbp-0x28]`(r15). `data` -- built forwards
+for `paylen+4` bytes -- sat at `[rbp-0x58]`, i.e. **48 bytes of headroom**:
+
+    paylen 21 -> data 25 bytes -> [rbp-0x58 .. rbp-0x3f]   fits
+    paylen 78 -> data 82 bytes -> [rbp-0x58 .. rbp-0x06]   over ALL FIVE saves
+
+The frame was already `sub rsp,0x200` and its comment already said "sized for
+the 78-byte BIP32 extended key". **The size was right; the placement was not.**
+(`work` at `[rbp-0x140]` also ran two bytes into `checksum` at `[rbp-0xf0]` --
+latent, since the checksum is consumed before `work` is filled.)
+
+Fix: all four buffers relaid below `-0x28`, disjoint, documented in the
+function header as a table --
+
+    digitRev [rbp-0x1b0 .. rbp-0x110)  160 B
+    work     [rbp-0x110 .. rbp-0x0b0)   96 B
+    checksum [rbp-0x0b0 .. rbp-0x090)   32 B
+    data     [rbp-0x090 .. rbp-0x030)   96 B   (8 B clear of -0x28)
+
+plus a `cmp rdx,78 / jbe` gate that writes `out[0]=0` and returns rather than
+overrunning, so an over-long payload fails closed instead of smashing the frame.
+
+**This is product code, on a path production runs**: `wallet_core.c`'s
+`wallet_seed_master_xprv` is the 78-byte caller. Nothing was corrupted in the
+live daemon for the same reason as #31 -- `-O0` reloads from memory around
+every call, so no caller ever trusted the register. The pin was hiding a real
+stack overflow in shipped assembly.
+
+Ground truth is Core, not our own vectors. The scratch oracle decodes the xprv
+this function now produces, checksum and all, and re-encodes the matching xpub
+**byte-identically to ours**:
+
+    $ bitcoin-cli getdescriptorinfo "pkh(xprv9s21ZrQH143K3QTDL...xrMPHi/0/*)"
+      descriptor: pkh(xpub661MyMwAqRbcFtXgS5sYJ...EGMcet8/0/*)#xgqkr0nt
+    $ bitcoin-cli validateaddress 15mKKb2eos1hWa6tisdPwwDC1a5J1y9nma
+      isvalid: true
+
+i.e. both payload lengths (21 and 78) validated against Bitcoin Core's own
+base58 decoder.
+
+### 2. `test_utxo_crash_recovery` -- HARNESS. `u8 tx[64]` for a 65-byte coinbase
+
+31 assertion failures, no crash, and **not** the crash hook: the first real
+symptom is `REJECT h=150 tx=1: input references a missing/already-spent UTXO`,
+in the *reference* leg that never crashes at all.
+
+Product-vs-harness settled by measurement, not by reading: four builds, test
+TU and product TUs at independent optimisation levels.
+
+| test TU | product TUs | result |
+|---|---|---|
+| -O0 | -O0 | 0 failures |
+| -O0 | **-O2** | **0 failures** |
+| **-O2** | -O0 | **31 failures** |
+| -O2 | -O2 | 31 failures |
+
+Harness. `daemon/utxo_live.c` is exonerated.
+
+Then the decisive byte. The two builds' `blk00000.dat` differ in exactly 150
+bytes -- one per block, always the block's last byte -- while `index.dat` (the
+block hashes) is **identical**:
+
+    154   0   1        <- byte 153 = last byte of block 0's raw
+    308   0   1
+    462   0   1        ... 150 of these
+
+`mk_coinbase_tx` serialises 65 bytes (4+1+32+4 +1+4+4 +1+8+1+1+4). `mk_and_mine`
+declared `u8 tx[64]`. `memcpy(o, tx, txlen)` therefore copied 65 bytes out of a
+64-byte array, so the coinbase WRITTEN to the store ended in whatever gcc had
+placed after `tx`, while the merkle root and `cb_txids[]` recorded the txid of
+the bytes as they were BEFORE that. At `-O0` the trailing byte read back as 0 --
+the value the overflow itself had just stored -- and the two agreed by luck. At
+`-O2` gcc laid the frame out differently, the stored coinbase no longer hashed
+to the recorded txid, so the daemon's own txid for all 150 coinbases differed
+from the test's and the height-150 spends resolved to nothing.
+
+Fix: `#define CB_TX_LEN 65`, `u8 tx[CB_TX_LEN]`, and a runtime check inside
+`mk_coinbase_tx` that the constant still matches what it emits (plus the same
+check on the spend txs against `txbuf[8][128]`).
+
+**Third one-byte overflow this week that `-O0` hid** (after
+`test_taproot_sighash`'s `bhex[130]`). `-O0` disables glibc `_FORTIFY_SOURCE`;
+it also removes the frame-layout variety that turns a one-byte overrun from
+harmless into fatal. The pin was not only hiding register bugs -- it was
+suppressing the buffer-overflow class in both directions.
+
+### 3. So: can the pin come off?
+
+`asm/Makefile`, every `-no-pie -O0` -> `-no-pie -O2` (133 sites):
+
+| | `-O0` (main + these two fixes) | `-O2` |
+|---|---|---|
+| harnesses invoked by `test:` | 159 | 159 |
+| harnesses that ran | 159 | 159 |
+| `TESTS FAILED` | 0 | 0 |
+| `make -k test` exit | 0 | 0 |
+| `make abi-check` | OK | OK |
+| `make callee-saved-check` | OK | OK |
+| `tests/test_abi_coverage` | 37 clean, 0 violating | 37 clean, 0 violating |
+
+The count matters as much as the failures: `make -k` continues across targets,
+but a failing command still aborts the enclosing recipe, so "0 failures" with a
+short count is a false green. 159 == the 159 `./tests/...` lines in the recipe.
+
+**The stated reason on the rule is stale.** `asm/Makefile` says of
+`daemon/bitcoind`: *"-O0 required (an -O2 rebuild regressed lsock's bind to
+EFAULT)"*. Built at `-O2` and run in a scratch datadir on port 39333:
+
+    LISTEN 0 8 0.0.0.0:39333 users:(("bitcoind",pid=3769991,fd=5),...)
+
+`lsock` binds. `tests/test_outbound_mux` and `tests/test_redial` -- which fork
+the real binary in serve mode -- both pass at `-O2`. `tests/bench_hashidx`
+carried its own separate `-O0` note ("-O2 miscompiles this harness, fread called
+with a NULL buffer"); it too runs correctly at `-O2` now, against a real
+130,001-record `index.dat`.
+
+### 4. What it is worth -- measured, and it is less than the framing suggested
+
+Two measurements, because they disagree and the disagreement is the finding.
+
+**(a) The pinned C files in isolation -- a real win.** `bench_segwit_sighash`
+and `bench_taproot_sighash` time `bitcoin_segwit.c` and
+`bitcoin_taproot_sighash.c`, both in `DAEMONSRCS`, min-of-25, one pinned core:
+
+(best min across two independent runs on each side, so every ratio below is the
+conservative one)
+
+| workload | BIP143 `-O0` | `-O2` | | BIP341 key-path `-O0` | `-O2` | |
+|---|---|---|---|---|---|---|
+| 1 in / 2 out      | 0.4155 us | 0.3691 us | **1.13x** | 0.4137 us | 0.3755 us | **1.10x** |
+| 2 in / 2 out      | 0.4801 us | 0.4018 us | **1.19x** | 0.4774 us | 0.4367 us | **1.09x** |
+| 100 in / 5 out    | 3.700 us  | 2.478 us  | **1.49x** | 5.003 us  | 4.463 us  | **1.12x** |
+| 1372 in / 100 out | 43.97 us  | 30.18 us  | **1.46x** | 63.75 us  | 57.89 us  | **1.10x** |
+| 2 in / 3000 out   | 48.07 us  | 41.93 us  | **1.15x** | 52.77 us  | 46.22 us  | **1.14x** |
+
+BIP341 script-path tracks the key-path row for row (1.11x). BIP143 gains more
+because more of its work is C loop; BIP341 spends more of its time inside
+`tagged_hash256`/SHA-256, which is assembly either way.
+
+**(b) A real 130,001-block mainnet replay -- no measurable difference at all.**
+A driver that runs `store_init` -> `utxo_live_init` -> `utxo_live_catchup` over
+heights 0..130,000 copied out of the archive, i.e. the actual
+`daemon/utxo_live.c` -> `daemon/tx_verify.c` -> script/sighash path, linked
+entirely `-O0` or entirely `-O2`. Both reach `live=269293`, identical work:
+
+| | user CPU | sys | wall |
+|---|---|---|---|
+| `-O0` round 1 | 50.80 s | 3.06 s | 8.74 s |
+| `-O2` round 1 | 50.96 s | 3.06 s | 8.54 s |
+| `-O0` round 2 | 50.94 s | 2.85 s | 8.48 s |
+| `-O2` round 2 | 50.90 s | 2.76 s | 8.32 s |
+
+Indistinguishable -- 0.1% apart, inside the round-to-round spread.
+
+The first attempt at this ran on NVMe and gave 188 s wall / 78-94 s CPU for
+both, at 80% device utilisation: **the replay was 95% I/O**, and the "CPU"
+difference it showed (77.6 vs 87.9) was writeback, not code. Re-run on tmpfs it
+collapses to 8.5 s. Recording that because it is the sort of number that would
+otherwise have been reported as a 13% regression.
+
+**Why (a) and (b) disagree.** PERF_SCOPE.md 14 measured the main thread as
+67.3% field/EC arithmetic -- `fe_mul`, `fe_sqr`, `point_double`, all hand-
+written assembly, which `-O0` does not touch. The C layer is thin glue over it.
+Optimising the glue moves the sighash preimage builders by 1.1-1.5x and moves
+the total by nothing measurable, on this workload.
+
+**And this workload is not the one 14 is about.** Heights 0..130,000 are
+pre-segwit P2PKH; there is no taproot in them, so the serial taproot pass that
+14 identifies as the bottleneck never runs. The honest statement is: **the pin
+costs ~nothing on the workload I could measure, and the workload where it would
+cost the most is exactly the one I could not.** Removing it is justified by the
+two real bugs it was hiding, not by a demonstrated speedup.
+
+### 5. Not verified
+
+* **No end-to-end daemon replay at a taproot-dense height.** Section 4(b) is
+  heights 0..130,000 -- pre-segwit, no taproot, so the serial taproot pass that
+  PERF_SCOPE.md 14 identifies as the bottleneck never executes in it. A `-O2`
+  measurement at ~797,000 needs the live archive and a daemon restart, and was
+  deliberately not done. **The claim "removing the pin is plausibly the largest
+  performance win available" is therefore still untested where it matters, and
+  the one place it could be tested says the win is zero.**
+* **Nothing was deployed and the live daemon was not restarted.** `bmc-bitcoind`
+  ran untouched throughout; the only daemon this session started was a scratch
+  `serve` on port 39333 in a temp datadir, killed after the bind check.
+* **`-fsanitize=address` was not run over the suite.** UBSan over the crash-
+  recovery harness was clean and did not find the overflow -- it is not an
+  overflow UBSan sees. The remaining `-O2` risk is exactly the class the runtime
+  probe covers (register clobbers) plus the class ASan would cover (overflows),
+  and only the first has an instrument here.
+* **The runtime probe now covers 37 functions**, up from 34. `callee-saved-check`
+  nominally covers 374. The gap is still the story: `base58check_encode` was in
+  neither the 34 nor any static auditor's blind spot list, and both static
+  auditors were green while it was destroying five registers.
+* Whether the four other previously-failing tests (`test_taproot`,
+  `test_segwit_coverage`, `test_taproot_scriptpath`, `test_tapscript_scale`)
+  pass **because** #31 was the cause was not re-derived here; they simply pass.
+
+### 6. Status
+
+Branch `o2-final`, not merged. `main` still pins `-O0`. The two fixes that are
+independent of the pin -- `bitcoin_addr.asm` and the two test harnesses -- are
+the part that should land regardless of what is decided about `-O2`, because
+the base58 overflow is a live latent bug in shipped assembly.
+
 ## 2026-08-23 -- the replay finished at 963,000, and the resulting UTXO set IS Bitcoin Core's
 
 The from-scratch, full-signature-verification replay of the real mainnet
