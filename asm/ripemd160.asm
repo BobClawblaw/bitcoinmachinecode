@@ -90,73 +90,1720 @@ rmd160_compress:
     mov  r14d, r10d            ; D2
     mov  ebx,  r11d            ; E2
 
-    xor  r15d, r15d            ; round counter 0..79 (r15 = callee-saved, pushed)
-.round:
-    ; ---------- left line ----------
-    lea  rax, [RL]
-    movzx edx, byte [rax+r15]
-    mov  [rbp-0x3c], edx       ; idx_l
-    lea  rax, [SL]
-    movzx edx, byte [rax+r15]
-    mov  [rbp-0x38], edx       ; rotl_l
-    mov  edx, r15d
-    shr  edx, 4
-    mov  eax, [KCON + rdx*4]
-    mov  [rbp-0x44], eax       ; Kl
-    call rmd_f_left             ; eax = f(B,C,D), preserves r15
-    add  eax, esi               ; + A
-    add  eax, [rbp-0x44]        ; + Kl
-    mov  edx, [rbp-0x3c]
-    add  eax, [rbp-0x90 + rdx*4]; + X[idx_l]
-    mov  ecx, [rbp-0x38]
-    rol  eax, cl                ; ROL by s[j]
-    add  eax, r11d              ; + E
-    ; shift left line
-    mov  esi,  r11d             ; A  = E
-    mov  r11d, r10d             ; E  = D
-    mov  edx, r9d
-    rol  edx, 10                ; D  = ROL(C,10)
-    mov  r10d, edx
-    mov  r9d,  r8d              ; C  = B
-    mov  r8d,  eax              ; B  = T
-
-    ; ---------- right line ----------
-    lea  rax, [RP]
-    movzx edx, byte [rax+r15]
-    mov  [rbp-0x3c], edx       ; idx_r
-    lea  rax, [SPROT]
-    movzx edx, byte [rax+r15]
-    mov  [rbp-0x38], edx       ; rotl_r
-    mov  edx, r15d
-    shr  edx, 4
-    mov  eax, [KCON + (5+rdx)*4]
-    mov  [rbp-0x44], eax       ; Kr
-    ; right line function selector: group' = 5 - group (1..5)
-    mov  eax, 5
-    mov  edx, r15d
-    shr  edx, 4
-    sub  eax, edx
-    mov  [rbp-0x48], eax
-    call rmd_f_right            ; eax = g(B2,C2,D2)
-    add  eax, edi               ; + A2
-    add  eax, [rbp-0x44]        ; + Kr
-    mov  edx, [rbp-0x3c]
-    add  eax, [rbp-0x90 + rdx*4]; + X[idx_r]
-    mov  ecx, [rbp-0x38]
-    rol  eax, cl                ; ROL by sp[j]
-    add  eax, ebx               ; + E2
-    ; shift right line
-    mov  edi,  ebx              ; A2 = E2
-    mov  ebx,  r14d             ; E2 = D2
-    mov  edx, r13d
-    rol  edx, 10                ; D2 = ROL(C2,10)
-    mov  r14d, edx
-    mov  r13d, r12d             ; C2 = B2
-    mov  r12d, eax              ; B2 = T
-
-    inc  r15d
-    cmp  r15d, 80
-    jb   .round
+    ; ---------- 80 rounds x 2 lines, FULLY UNROLLED (2026-08-23) ----------
+    ; The loop version was a per-round interpreter: table loads for idx/shift/K
+    ; spilled through the stack plus a CALL into a branch-tree f-selector, for
+    ; BOTH lines, every round -- measured 3.16x slower than Core (3.59 vs
+    ; 1.14 ns/B, BENCHMARKS.md tier 1). Everything below is generated from the
+    ; SAME schedule tables kept in .rodata above (RL/RP/SL/SPROT/KCON, now
+    ; reference-only): constants are immediates, round functions are inlined,
+    ; state never leaves registers. Register renaming replaces the 5-register
+    ; shuffle: each round writes only A and rotates C, and the NEXT round's
+    ; macro-expansion uses the rotated name list -- (E,A,B,C,D) -- so the
+    ; per-round "mov" chain of the loop version disappears entirely. Left and
+    ; right rounds are interleaved L0,R0,L1,R1,... so the two independent
+    ; dependency chains sit adjacent in program order and overlap in the OoO
+    ; window. eax/edx stay the only scratch, exactly as the header promises.
+    ; L0  f1 X[0] s=11
+    mov  eax, r8d
+    xor  eax, r9d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+0*4]
+    add  esi, eax
+    rol  esi, 11
+    add  esi, r11d
+    rol  r9d, 10
+    ; R0  f5 X[5] s=8 K=0x50a28be6
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, r12d
+    add  edi, [rbp-0x90+5*4]
+    add  edi, 0x50a28be6
+    add  edi, eax
+    rol  edi, 8
+    add  edi, ebx
+    rol  r13d, 10
+    ; L1  f1 X[1] s=14
+    mov  eax, esi
+    xor  eax, r8d
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+1*4]
+    add  r11d, eax
+    rol  r11d, 14
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R1  f5 X[14] s=9 K=0x50a28be6
+    mov  eax, r13d
+    not  eax
+    or   eax, r12d
+    xor  eax, edi
+    add  ebx, [rbp-0x90+14*4]
+    add  ebx, 0x50a28be6
+    add  ebx, eax
+    rol  ebx, 9
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L2  f1 X[2] s=15
+    mov  eax, r11d
+    xor  eax, esi
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+2*4]
+    add  r10d, eax
+    rol  r10d, 15
+    add  r10d, r9d
+    rol  esi, 10
+    ; R2  f5 X[7] s=9 K=0x50a28be6
+    mov  eax, r12d
+    not  eax
+    or   eax, edi
+    xor  eax, ebx
+    add  r14d, [rbp-0x90+7*4]
+    add  r14d, 0x50a28be6
+    add  r14d, eax
+    rol  r14d, 9
+    add  r14d, r13d
+    rol  edi, 10
+    ; L3  f1 X[3] s=12
+    mov  eax, r10d
+    xor  eax, r11d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+3*4]
+    add  r9d, eax
+    rol  r9d, 12
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R3  f5 X[0] s=11 K=0x50a28be6
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r14d
+    add  r13d, [rbp-0x90+0*4]
+    add  r13d, 0x50a28be6
+    add  r13d, eax
+    rol  r13d, 11
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L4  f1 X[4] s=5
+    mov  eax, r9d
+    xor  eax, r10d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+4*4]
+    add  r8d, eax
+    rol  r8d, 5
+    add  r8d, esi
+    rol  r10d, 10
+    ; R4  f5 X[9] s=13 K=0x50a28be6
+    mov  eax, ebx
+    not  eax
+    or   eax, r14d
+    xor  eax, r13d
+    add  r12d, [rbp-0x90+9*4]
+    add  r12d, 0x50a28be6
+    add  r12d, eax
+    rol  r12d, 13
+    add  r12d, edi
+    rol  r14d, 10
+    ; L5  f1 X[5] s=8
+    mov  eax, r8d
+    xor  eax, r9d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+5*4]
+    add  esi, eax
+    rol  esi, 8
+    add  esi, r11d
+    rol  r9d, 10
+    ; R5  f5 X[2] s=15 K=0x50a28be6
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, r12d
+    add  edi, [rbp-0x90+2*4]
+    add  edi, 0x50a28be6
+    add  edi, eax
+    rol  edi, 15
+    add  edi, ebx
+    rol  r13d, 10
+    ; L6  f1 X[6] s=7
+    mov  eax, esi
+    xor  eax, r8d
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+6*4]
+    add  r11d, eax
+    rol  r11d, 7
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R6  f5 X[11] s=15 K=0x50a28be6
+    mov  eax, r13d
+    not  eax
+    or   eax, r12d
+    xor  eax, edi
+    add  ebx, [rbp-0x90+11*4]
+    add  ebx, 0x50a28be6
+    add  ebx, eax
+    rol  ebx, 15
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L7  f1 X[7] s=9
+    mov  eax, r11d
+    xor  eax, esi
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+7*4]
+    add  r10d, eax
+    rol  r10d, 9
+    add  r10d, r9d
+    rol  esi, 10
+    ; R7  f5 X[4] s=5 K=0x50a28be6
+    mov  eax, r12d
+    not  eax
+    or   eax, edi
+    xor  eax, ebx
+    add  r14d, [rbp-0x90+4*4]
+    add  r14d, 0x50a28be6
+    add  r14d, eax
+    rol  r14d, 5
+    add  r14d, r13d
+    rol  edi, 10
+    ; L8  f1 X[8] s=11
+    mov  eax, r10d
+    xor  eax, r11d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+8*4]
+    add  r9d, eax
+    rol  r9d, 11
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R8  f5 X[13] s=7 K=0x50a28be6
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r14d
+    add  r13d, [rbp-0x90+13*4]
+    add  r13d, 0x50a28be6
+    add  r13d, eax
+    rol  r13d, 7
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L9  f1 X[9] s=13
+    mov  eax, r9d
+    xor  eax, r10d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+9*4]
+    add  r8d, eax
+    rol  r8d, 13
+    add  r8d, esi
+    rol  r10d, 10
+    ; R9  f5 X[6] s=7 K=0x50a28be6
+    mov  eax, ebx
+    not  eax
+    or   eax, r14d
+    xor  eax, r13d
+    add  r12d, [rbp-0x90+6*4]
+    add  r12d, 0x50a28be6
+    add  r12d, eax
+    rol  r12d, 7
+    add  r12d, edi
+    rol  r14d, 10
+    ; L10  f1 X[10] s=14
+    mov  eax, r8d
+    xor  eax, r9d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+10*4]
+    add  esi, eax
+    rol  esi, 14
+    add  esi, r11d
+    rol  r9d, 10
+    ; R10  f5 X[15] s=8 K=0x50a28be6
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, r12d
+    add  edi, [rbp-0x90+15*4]
+    add  edi, 0x50a28be6
+    add  edi, eax
+    rol  edi, 8
+    add  edi, ebx
+    rol  r13d, 10
+    ; L11  f1 X[11] s=15
+    mov  eax, esi
+    xor  eax, r8d
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+11*4]
+    add  r11d, eax
+    rol  r11d, 15
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R11  f5 X[8] s=11 K=0x50a28be6
+    mov  eax, r13d
+    not  eax
+    or   eax, r12d
+    xor  eax, edi
+    add  ebx, [rbp-0x90+8*4]
+    add  ebx, 0x50a28be6
+    add  ebx, eax
+    rol  ebx, 11
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L12  f1 X[12] s=6
+    mov  eax, r11d
+    xor  eax, esi
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+12*4]
+    add  r10d, eax
+    rol  r10d, 6
+    add  r10d, r9d
+    rol  esi, 10
+    ; R12  f5 X[1] s=14 K=0x50a28be6
+    mov  eax, r12d
+    not  eax
+    or   eax, edi
+    xor  eax, ebx
+    add  r14d, [rbp-0x90+1*4]
+    add  r14d, 0x50a28be6
+    add  r14d, eax
+    rol  r14d, 14
+    add  r14d, r13d
+    rol  edi, 10
+    ; L13  f1 X[13] s=7
+    mov  eax, r10d
+    xor  eax, r11d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+13*4]
+    add  r9d, eax
+    rol  r9d, 7
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R13  f5 X[10] s=14 K=0x50a28be6
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r14d
+    add  r13d, [rbp-0x90+10*4]
+    add  r13d, 0x50a28be6
+    add  r13d, eax
+    rol  r13d, 14
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L14  f1 X[14] s=9
+    mov  eax, r9d
+    xor  eax, r10d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+14*4]
+    add  r8d, eax
+    rol  r8d, 9
+    add  r8d, esi
+    rol  r10d, 10
+    ; R14  f5 X[3] s=12 K=0x50a28be6
+    mov  eax, ebx
+    not  eax
+    or   eax, r14d
+    xor  eax, r13d
+    add  r12d, [rbp-0x90+3*4]
+    add  r12d, 0x50a28be6
+    add  r12d, eax
+    rol  r12d, 12
+    add  r12d, edi
+    rol  r14d, 10
+    ; L15  f1 X[15] s=8
+    mov  eax, r8d
+    xor  eax, r9d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+15*4]
+    add  esi, eax
+    rol  esi, 8
+    add  esi, r11d
+    rol  r9d, 10
+    ; R15  f5 X[12] s=6 K=0x50a28be6
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, r12d
+    add  edi, [rbp-0x90+12*4]
+    add  edi, 0x50a28be6
+    add  edi, eax
+    rol  edi, 6
+    add  edi, ebx
+    rol  r13d, 10
+    ; L16  f2 X[7] s=7 K=0x5a827999
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+7*4]
+    add  r11d, 0x5a827999
+    add  r11d, eax
+    rol  r11d, 7
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R16  f4 X[6] s=9 K=0x5c4dd124
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, r13d
+    xor  eax, r12d
+    add  ebx, [rbp-0x90+6*4]
+    add  ebx, 0x5c4dd124
+    add  ebx, eax
+    rol  ebx, 9
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L17  f2 X[4] s=6 K=0x5a827999
+    mov  eax, esi
+    xor  eax, r8d
+    and  eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+4*4]
+    add  r10d, 0x5a827999
+    add  r10d, eax
+    rol  r10d, 6
+    add  r10d, r9d
+    rol  esi, 10
+    ; R17  f4 X[11] s=13 K=0x5c4dd124
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r12d
+    xor  eax, edi
+    add  r14d, [rbp-0x90+11*4]
+    add  r14d, 0x5c4dd124
+    add  r14d, eax
+    rol  r14d, 13
+    add  r14d, r13d
+    rol  edi, 10
+    ; L18  f2 X[13] s=8 K=0x5a827999
+    mov  eax, r11d
+    xor  eax, esi
+    and  eax, r10d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+13*4]
+    add  r9d, 0x5a827999
+    add  r9d, eax
+    rol  r9d, 8
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R18  f4 X[3] s=15 K=0x5c4dd124
+    mov  eax, r14d
+    xor  eax, ebx
+    and  eax, edi
+    xor  eax, ebx
+    add  r13d, [rbp-0x90+3*4]
+    add  r13d, 0x5c4dd124
+    add  r13d, eax
+    rol  r13d, 15
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L19  f2 X[1] s=13 K=0x5a827999
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, r9d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+1*4]
+    add  r8d, 0x5a827999
+    add  r8d, eax
+    rol  r8d, 13
+    add  r8d, esi
+    rol  r10d, 10
+    ; R19  f4 X[7] s=7 K=0x5c4dd124
+    mov  eax, r13d
+    xor  eax, r14d
+    and  eax, ebx
+    xor  eax, r14d
+    add  r12d, [rbp-0x90+7*4]
+    add  r12d, 0x5c4dd124
+    add  r12d, eax
+    rol  r12d, 7
+    add  r12d, edi
+    rol  r14d, 10
+    ; L20  f2 X[10] s=11 K=0x5a827999
+    mov  eax, r9d
+    xor  eax, r10d
+    and  eax, r8d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+10*4]
+    add  esi, 0x5a827999
+    add  esi, eax
+    rol  esi, 11
+    add  esi, r11d
+    rol  r9d, 10
+    ; R20  f4 X[0] s=12 K=0x5c4dd124
+    mov  eax, r12d
+    xor  eax, r13d
+    and  eax, r14d
+    xor  eax, r13d
+    add  edi, [rbp-0x90+0*4]
+    add  edi, 0x5c4dd124
+    add  edi, eax
+    rol  edi, 12
+    add  edi, ebx
+    rol  r13d, 10
+    ; L21  f2 X[6] s=9 K=0x5a827999
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+6*4]
+    add  r11d, 0x5a827999
+    add  r11d, eax
+    rol  r11d, 9
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R21  f4 X[13] s=8 K=0x5c4dd124
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, r13d
+    xor  eax, r12d
+    add  ebx, [rbp-0x90+13*4]
+    add  ebx, 0x5c4dd124
+    add  ebx, eax
+    rol  ebx, 8
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L22  f2 X[15] s=7 K=0x5a827999
+    mov  eax, esi
+    xor  eax, r8d
+    and  eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+15*4]
+    add  r10d, 0x5a827999
+    add  r10d, eax
+    rol  r10d, 7
+    add  r10d, r9d
+    rol  esi, 10
+    ; R22  f4 X[5] s=9 K=0x5c4dd124
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r12d
+    xor  eax, edi
+    add  r14d, [rbp-0x90+5*4]
+    add  r14d, 0x5c4dd124
+    add  r14d, eax
+    rol  r14d, 9
+    add  r14d, r13d
+    rol  edi, 10
+    ; L23  f2 X[3] s=15 K=0x5a827999
+    mov  eax, r11d
+    xor  eax, esi
+    and  eax, r10d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+3*4]
+    add  r9d, 0x5a827999
+    add  r9d, eax
+    rol  r9d, 15
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R23  f4 X[10] s=11 K=0x5c4dd124
+    mov  eax, r14d
+    xor  eax, ebx
+    and  eax, edi
+    xor  eax, ebx
+    add  r13d, [rbp-0x90+10*4]
+    add  r13d, 0x5c4dd124
+    add  r13d, eax
+    rol  r13d, 11
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L24  f2 X[12] s=7 K=0x5a827999
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, r9d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+12*4]
+    add  r8d, 0x5a827999
+    add  r8d, eax
+    rol  r8d, 7
+    add  r8d, esi
+    rol  r10d, 10
+    ; R24  f4 X[14] s=7 K=0x5c4dd124
+    mov  eax, r13d
+    xor  eax, r14d
+    and  eax, ebx
+    xor  eax, r14d
+    add  r12d, [rbp-0x90+14*4]
+    add  r12d, 0x5c4dd124
+    add  r12d, eax
+    rol  r12d, 7
+    add  r12d, edi
+    rol  r14d, 10
+    ; L25  f2 X[0] s=12 K=0x5a827999
+    mov  eax, r9d
+    xor  eax, r10d
+    and  eax, r8d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+0*4]
+    add  esi, 0x5a827999
+    add  esi, eax
+    rol  esi, 12
+    add  esi, r11d
+    rol  r9d, 10
+    ; R25  f4 X[15] s=7 K=0x5c4dd124
+    mov  eax, r12d
+    xor  eax, r13d
+    and  eax, r14d
+    xor  eax, r13d
+    add  edi, [rbp-0x90+15*4]
+    add  edi, 0x5c4dd124
+    add  edi, eax
+    rol  edi, 7
+    add  edi, ebx
+    rol  r13d, 10
+    ; L26  f2 X[9] s=15 K=0x5a827999
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+9*4]
+    add  r11d, 0x5a827999
+    add  r11d, eax
+    rol  r11d, 15
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R26  f4 X[8] s=12 K=0x5c4dd124
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, r13d
+    xor  eax, r12d
+    add  ebx, [rbp-0x90+8*4]
+    add  ebx, 0x5c4dd124
+    add  ebx, eax
+    rol  ebx, 12
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L27  f2 X[5] s=9 K=0x5a827999
+    mov  eax, esi
+    xor  eax, r8d
+    and  eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+5*4]
+    add  r10d, 0x5a827999
+    add  r10d, eax
+    rol  r10d, 9
+    add  r10d, r9d
+    rol  esi, 10
+    ; R27  f4 X[12] s=7 K=0x5c4dd124
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r12d
+    xor  eax, edi
+    add  r14d, [rbp-0x90+12*4]
+    add  r14d, 0x5c4dd124
+    add  r14d, eax
+    rol  r14d, 7
+    add  r14d, r13d
+    rol  edi, 10
+    ; L28  f2 X[2] s=11 K=0x5a827999
+    mov  eax, r11d
+    xor  eax, esi
+    and  eax, r10d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+2*4]
+    add  r9d, 0x5a827999
+    add  r9d, eax
+    rol  r9d, 11
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R28  f4 X[4] s=6 K=0x5c4dd124
+    mov  eax, r14d
+    xor  eax, ebx
+    and  eax, edi
+    xor  eax, ebx
+    add  r13d, [rbp-0x90+4*4]
+    add  r13d, 0x5c4dd124
+    add  r13d, eax
+    rol  r13d, 6
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L29  f2 X[14] s=7 K=0x5a827999
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, r9d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+14*4]
+    add  r8d, 0x5a827999
+    add  r8d, eax
+    rol  r8d, 7
+    add  r8d, esi
+    rol  r10d, 10
+    ; R29  f4 X[9] s=15 K=0x5c4dd124
+    mov  eax, r13d
+    xor  eax, r14d
+    and  eax, ebx
+    xor  eax, r14d
+    add  r12d, [rbp-0x90+9*4]
+    add  r12d, 0x5c4dd124
+    add  r12d, eax
+    rol  r12d, 15
+    add  r12d, edi
+    rol  r14d, 10
+    ; L30  f2 X[11] s=13 K=0x5a827999
+    mov  eax, r9d
+    xor  eax, r10d
+    and  eax, r8d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+11*4]
+    add  esi, 0x5a827999
+    add  esi, eax
+    rol  esi, 13
+    add  esi, r11d
+    rol  r9d, 10
+    ; R30  f4 X[1] s=13 K=0x5c4dd124
+    mov  eax, r12d
+    xor  eax, r13d
+    and  eax, r14d
+    xor  eax, r13d
+    add  edi, [rbp-0x90+1*4]
+    add  edi, 0x5c4dd124
+    add  edi, eax
+    rol  edi, 13
+    add  edi, ebx
+    rol  r13d, 10
+    ; L31  f2 X[8] s=12 K=0x5a827999
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+8*4]
+    add  r11d, 0x5a827999
+    add  r11d, eax
+    rol  r11d, 12
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R31  f4 X[2] s=11 K=0x5c4dd124
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, r13d
+    xor  eax, r12d
+    add  ebx, [rbp-0x90+2*4]
+    add  ebx, 0x5c4dd124
+    add  ebx, eax
+    rol  ebx, 11
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L32  f3 X[3] s=11 K=0x6ed9eba1
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+3*4]
+    add  r10d, 0x6ed9eba1
+    add  r10d, eax
+    rol  r10d, 11
+    add  r10d, r9d
+    rol  esi, 10
+    ; R32  f3 X[15] s=9 K=0x6d703ef3
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+15*4]
+    add  r14d, 0x6d703ef3
+    add  r14d, eax
+    rol  r14d, 9
+    add  r14d, r13d
+    rol  edi, 10
+    ; L33  f3 X[10] s=13 K=0x6ed9eba1
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+10*4]
+    add  r9d, 0x6ed9eba1
+    add  r9d, eax
+    rol  r9d, 13
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R33  f3 X[5] s=7 K=0x6d703ef3
+    mov  eax, ebx
+    not  eax
+    or   eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+5*4]
+    add  r13d, 0x6d703ef3
+    add  r13d, eax
+    rol  r13d, 7
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L34  f3 X[14] s=6 K=0x6ed9eba1
+    mov  eax, r10d
+    not  eax
+    or   eax, r9d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+14*4]
+    add  r8d, 0x6ed9eba1
+    add  r8d, eax
+    rol  r8d, 6
+    add  r8d, esi
+    rol  r10d, 10
+    ; R34  f3 X[1] s=15 K=0x6d703ef3
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+1*4]
+    add  r12d, 0x6d703ef3
+    add  r12d, eax
+    rol  r12d, 15
+    add  r12d, edi
+    rol  r14d, 10
+    ; L35  f3 X[4] s=7 K=0x6ed9eba1
+    mov  eax, r9d
+    not  eax
+    or   eax, r8d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+4*4]
+    add  esi, 0x6ed9eba1
+    add  esi, eax
+    rol  esi, 7
+    add  esi, r11d
+    rol  r9d, 10
+    ; R35  f3 X[3] s=11 K=0x6d703ef3
+    mov  eax, r13d
+    not  eax
+    or   eax, r12d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+3*4]
+    add  edi, 0x6d703ef3
+    add  edi, eax
+    rol  edi, 11
+    add  edi, ebx
+    rol  r13d, 10
+    ; L36  f3 X[9] s=14 K=0x6ed9eba1
+    mov  eax, r8d
+    not  eax
+    or   eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+9*4]
+    add  r11d, 0x6ed9eba1
+    add  r11d, eax
+    rol  r11d, 14
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R36  f3 X[7] s=8 K=0x6d703ef3
+    mov  eax, r12d
+    not  eax
+    or   eax, edi
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+7*4]
+    add  ebx, 0x6d703ef3
+    add  ebx, eax
+    rol  ebx, 8
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L37  f3 X[15] s=9 K=0x6ed9eba1
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+15*4]
+    add  r10d, 0x6ed9eba1
+    add  r10d, eax
+    rol  r10d, 9
+    add  r10d, r9d
+    rol  esi, 10
+    ; R37  f3 X[14] s=6 K=0x6d703ef3
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+14*4]
+    add  r14d, 0x6d703ef3
+    add  r14d, eax
+    rol  r14d, 6
+    add  r14d, r13d
+    rol  edi, 10
+    ; L38  f3 X[8] s=13 K=0x6ed9eba1
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+8*4]
+    add  r9d, 0x6ed9eba1
+    add  r9d, eax
+    rol  r9d, 13
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R38  f3 X[6] s=6 K=0x6d703ef3
+    mov  eax, ebx
+    not  eax
+    or   eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+6*4]
+    add  r13d, 0x6d703ef3
+    add  r13d, eax
+    rol  r13d, 6
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L39  f3 X[1] s=15 K=0x6ed9eba1
+    mov  eax, r10d
+    not  eax
+    or   eax, r9d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+1*4]
+    add  r8d, 0x6ed9eba1
+    add  r8d, eax
+    rol  r8d, 15
+    add  r8d, esi
+    rol  r10d, 10
+    ; R39  f3 X[9] s=14 K=0x6d703ef3
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+9*4]
+    add  r12d, 0x6d703ef3
+    add  r12d, eax
+    rol  r12d, 14
+    add  r12d, edi
+    rol  r14d, 10
+    ; L40  f3 X[2] s=14 K=0x6ed9eba1
+    mov  eax, r9d
+    not  eax
+    or   eax, r8d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+2*4]
+    add  esi, 0x6ed9eba1
+    add  esi, eax
+    rol  esi, 14
+    add  esi, r11d
+    rol  r9d, 10
+    ; R40  f3 X[11] s=12 K=0x6d703ef3
+    mov  eax, r13d
+    not  eax
+    or   eax, r12d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+11*4]
+    add  edi, 0x6d703ef3
+    add  edi, eax
+    rol  edi, 12
+    add  edi, ebx
+    rol  r13d, 10
+    ; L41  f3 X[7] s=8 K=0x6ed9eba1
+    mov  eax, r8d
+    not  eax
+    or   eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+7*4]
+    add  r11d, 0x6ed9eba1
+    add  r11d, eax
+    rol  r11d, 8
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R41  f3 X[8] s=13 K=0x6d703ef3
+    mov  eax, r12d
+    not  eax
+    or   eax, edi
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+8*4]
+    add  ebx, 0x6d703ef3
+    add  ebx, eax
+    rol  ebx, 13
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L42  f3 X[0] s=13 K=0x6ed9eba1
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+0*4]
+    add  r10d, 0x6ed9eba1
+    add  r10d, eax
+    rol  r10d, 13
+    add  r10d, r9d
+    rol  esi, 10
+    ; R42  f3 X[12] s=5 K=0x6d703ef3
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+12*4]
+    add  r14d, 0x6d703ef3
+    add  r14d, eax
+    rol  r14d, 5
+    add  r14d, r13d
+    rol  edi, 10
+    ; L43  f3 X[6] s=6 K=0x6ed9eba1
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, esi
+    add  r9d, [rbp-0x90+6*4]
+    add  r9d, 0x6ed9eba1
+    add  r9d, eax
+    rol  r9d, 6
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R43  f3 X[2] s=14 K=0x6d703ef3
+    mov  eax, ebx
+    not  eax
+    or   eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+2*4]
+    add  r13d, 0x6d703ef3
+    add  r13d, eax
+    rol  r13d, 14
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L44  f3 X[13] s=5 K=0x6ed9eba1
+    mov  eax, r10d
+    not  eax
+    or   eax, r9d
+    xor  eax, r11d
+    add  r8d, [rbp-0x90+13*4]
+    add  r8d, 0x6ed9eba1
+    add  r8d, eax
+    rol  r8d, 5
+    add  r8d, esi
+    rol  r10d, 10
+    ; R44  f3 X[10] s=13 K=0x6d703ef3
+    mov  eax, r14d
+    not  eax
+    or   eax, r13d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+10*4]
+    add  r12d, 0x6d703ef3
+    add  r12d, eax
+    rol  r12d, 13
+    add  r12d, edi
+    rol  r14d, 10
+    ; L45  f3 X[11] s=12 K=0x6ed9eba1
+    mov  eax, r9d
+    not  eax
+    or   eax, r8d
+    xor  eax, r10d
+    add  esi, [rbp-0x90+11*4]
+    add  esi, 0x6ed9eba1
+    add  esi, eax
+    rol  esi, 12
+    add  esi, r11d
+    rol  r9d, 10
+    ; R45  f3 X[0] s=13 K=0x6d703ef3
+    mov  eax, r13d
+    not  eax
+    or   eax, r12d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+0*4]
+    add  edi, 0x6d703ef3
+    add  edi, eax
+    rol  edi, 13
+    add  edi, ebx
+    rol  r13d, 10
+    ; L46  f3 X[5] s=7 K=0x6ed9eba1
+    mov  eax, r8d
+    not  eax
+    or   eax, esi
+    xor  eax, r9d
+    add  r11d, [rbp-0x90+5*4]
+    add  r11d, 0x6ed9eba1
+    add  r11d, eax
+    rol  r11d, 7
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R46  f3 X[4] s=7 K=0x6d703ef3
+    mov  eax, r12d
+    not  eax
+    or   eax, edi
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+4*4]
+    add  ebx, 0x6d703ef3
+    add  ebx, eax
+    rol  ebx, 7
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L47  f3 X[12] s=5 K=0x6ed9eba1
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r8d
+    add  r10d, [rbp-0x90+12*4]
+    add  r10d, 0x6ed9eba1
+    add  r10d, eax
+    rol  r10d, 5
+    add  r10d, r9d
+    rol  esi, 10
+    ; R47  f3 X[13] s=5 K=0x6d703ef3
+    mov  eax, edi
+    not  eax
+    or   eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+13*4]
+    add  r14d, 0x6d703ef3
+    add  r14d, eax
+    rol  r14d, 5
+    add  r14d, r13d
+    rol  edi, 10
+    ; L48  f4 X[1] s=11 K=0x8f1bbcdc
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, esi
+    xor  eax, r11d
+    add  r9d, [rbp-0x90+1*4]
+    add  r9d, 0x8f1bbcdc
+    add  r9d, eax
+    rol  r9d, 11
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R48  f2 X[8] s=15 K=0x7a6d76e9
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+8*4]
+    add  r13d, 0x7a6d76e9
+    add  r13d, eax
+    rol  r13d, 15
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L49  f4 X[9] s=12 K=0x8f1bbcdc
+    mov  eax, r9d
+    xor  eax, r10d
+    and  eax, r11d
+    xor  eax, r10d
+    add  r8d, [rbp-0x90+9*4]
+    add  r8d, 0x8f1bbcdc
+    add  r8d, eax
+    rol  r8d, 12
+    add  r8d, esi
+    rol  r10d, 10
+    ; R49  f2 X[6] s=5 K=0x7a6d76e9
+    mov  eax, r14d
+    xor  eax, ebx
+    and  eax, r13d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+6*4]
+    add  r12d, 0x7a6d76e9
+    add  r12d, eax
+    rol  r12d, 5
+    add  r12d, edi
+    rol  r14d, 10
+    ; L50  f4 X[11] s=14 K=0x8f1bbcdc
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, r10d
+    xor  eax, r9d
+    add  esi, [rbp-0x90+11*4]
+    add  esi, 0x8f1bbcdc
+    add  esi, eax
+    rol  esi, 14
+    add  esi, r11d
+    rol  r9d, 10
+    ; R50  f2 X[4] s=8 K=0x7a6d76e9
+    mov  eax, r13d
+    xor  eax, r14d
+    and  eax, r12d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+4*4]
+    add  edi, 0x7a6d76e9
+    add  edi, eax
+    rol  edi, 8
+    add  edi, ebx
+    rol  r13d, 10
+    ; L51  f4 X[10] s=15 K=0x8f1bbcdc
+    mov  eax, esi
+    xor  eax, r8d
+    and  eax, r9d
+    xor  eax, r8d
+    add  r11d, [rbp-0x90+10*4]
+    add  r11d, 0x8f1bbcdc
+    add  r11d, eax
+    rol  r11d, 15
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R51  f2 X[1] s=11 K=0x7a6d76e9
+    mov  eax, r12d
+    xor  eax, r13d
+    and  eax, edi
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+1*4]
+    add  ebx, 0x7a6d76e9
+    add  ebx, eax
+    rol  ebx, 11
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L52  f4 X[0] s=14 K=0x8f1bbcdc
+    mov  eax, r11d
+    xor  eax, esi
+    and  eax, r8d
+    xor  eax, esi
+    add  r10d, [rbp-0x90+0*4]
+    add  r10d, 0x8f1bbcdc
+    add  r10d, eax
+    rol  r10d, 14
+    add  r10d, r9d
+    rol  esi, 10
+    ; R52  f2 X[3] s=14 K=0x7a6d76e9
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+3*4]
+    add  r14d, 0x7a6d76e9
+    add  r14d, eax
+    rol  r14d, 14
+    add  r14d, r13d
+    rol  edi, 10
+    ; L53  f4 X[8] s=15 K=0x8f1bbcdc
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, esi
+    xor  eax, r11d
+    add  r9d, [rbp-0x90+8*4]
+    add  r9d, 0x8f1bbcdc
+    add  r9d, eax
+    rol  r9d, 15
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R53  f2 X[11] s=14 K=0x7a6d76e9
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+11*4]
+    add  r13d, 0x7a6d76e9
+    add  r13d, eax
+    rol  r13d, 14
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L54  f4 X[12] s=9 K=0x8f1bbcdc
+    mov  eax, r9d
+    xor  eax, r10d
+    and  eax, r11d
+    xor  eax, r10d
+    add  r8d, [rbp-0x90+12*4]
+    add  r8d, 0x8f1bbcdc
+    add  r8d, eax
+    rol  r8d, 9
+    add  r8d, esi
+    rol  r10d, 10
+    ; R54  f2 X[15] s=6 K=0x7a6d76e9
+    mov  eax, r14d
+    xor  eax, ebx
+    and  eax, r13d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+15*4]
+    add  r12d, 0x7a6d76e9
+    add  r12d, eax
+    rol  r12d, 6
+    add  r12d, edi
+    rol  r14d, 10
+    ; L55  f4 X[4] s=8 K=0x8f1bbcdc
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, r10d
+    xor  eax, r9d
+    add  esi, [rbp-0x90+4*4]
+    add  esi, 0x8f1bbcdc
+    add  esi, eax
+    rol  esi, 8
+    add  esi, r11d
+    rol  r9d, 10
+    ; R55  f2 X[0] s=14 K=0x7a6d76e9
+    mov  eax, r13d
+    xor  eax, r14d
+    and  eax, r12d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+0*4]
+    add  edi, 0x7a6d76e9
+    add  edi, eax
+    rol  edi, 14
+    add  edi, ebx
+    rol  r13d, 10
+    ; L56  f4 X[13] s=9 K=0x8f1bbcdc
+    mov  eax, esi
+    xor  eax, r8d
+    and  eax, r9d
+    xor  eax, r8d
+    add  r11d, [rbp-0x90+13*4]
+    add  r11d, 0x8f1bbcdc
+    add  r11d, eax
+    rol  r11d, 9
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R56  f2 X[5] s=6 K=0x7a6d76e9
+    mov  eax, r12d
+    xor  eax, r13d
+    and  eax, edi
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+5*4]
+    add  ebx, 0x7a6d76e9
+    add  ebx, eax
+    rol  ebx, 6
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L57  f4 X[3] s=14 K=0x8f1bbcdc
+    mov  eax, r11d
+    xor  eax, esi
+    and  eax, r8d
+    xor  eax, esi
+    add  r10d, [rbp-0x90+3*4]
+    add  r10d, 0x8f1bbcdc
+    add  r10d, eax
+    rol  r10d, 14
+    add  r10d, r9d
+    rol  esi, 10
+    ; R57  f2 X[12] s=9 K=0x7a6d76e9
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+12*4]
+    add  r14d, 0x7a6d76e9
+    add  r14d, eax
+    rol  r14d, 9
+    add  r14d, r13d
+    rol  edi, 10
+    ; L58  f4 X[7] s=5 K=0x8f1bbcdc
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, esi
+    xor  eax, r11d
+    add  r9d, [rbp-0x90+7*4]
+    add  r9d, 0x8f1bbcdc
+    add  r9d, eax
+    rol  r9d, 5
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R58  f2 X[2] s=12 K=0x7a6d76e9
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+2*4]
+    add  r13d, 0x7a6d76e9
+    add  r13d, eax
+    rol  r13d, 12
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L59  f4 X[15] s=6 K=0x8f1bbcdc
+    mov  eax, r9d
+    xor  eax, r10d
+    and  eax, r11d
+    xor  eax, r10d
+    add  r8d, [rbp-0x90+15*4]
+    add  r8d, 0x8f1bbcdc
+    add  r8d, eax
+    rol  r8d, 6
+    add  r8d, esi
+    rol  r10d, 10
+    ; R59  f2 X[13] s=9 K=0x7a6d76e9
+    mov  eax, r14d
+    xor  eax, ebx
+    and  eax, r13d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+13*4]
+    add  r12d, 0x7a6d76e9
+    add  r12d, eax
+    rol  r12d, 9
+    add  r12d, edi
+    rol  r14d, 10
+    ; L60  f4 X[14] s=8 K=0x8f1bbcdc
+    mov  eax, r8d
+    xor  eax, r9d
+    and  eax, r10d
+    xor  eax, r9d
+    add  esi, [rbp-0x90+14*4]
+    add  esi, 0x8f1bbcdc
+    add  esi, eax
+    rol  esi, 8
+    add  esi, r11d
+    rol  r9d, 10
+    ; R60  f2 X[9] s=12 K=0x7a6d76e9
+    mov  eax, r13d
+    xor  eax, r14d
+    and  eax, r12d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+9*4]
+    add  edi, 0x7a6d76e9
+    add  edi, eax
+    rol  edi, 12
+    add  edi, ebx
+    rol  r13d, 10
+    ; L61  f4 X[5] s=6 K=0x8f1bbcdc
+    mov  eax, esi
+    xor  eax, r8d
+    and  eax, r9d
+    xor  eax, r8d
+    add  r11d, [rbp-0x90+5*4]
+    add  r11d, 0x8f1bbcdc
+    add  r11d, eax
+    rol  r11d, 6
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R61  f2 X[7] s=5 K=0x7a6d76e9
+    mov  eax, r12d
+    xor  eax, r13d
+    and  eax, edi
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+7*4]
+    add  ebx, 0x7a6d76e9
+    add  ebx, eax
+    rol  ebx, 5
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L62  f4 X[6] s=5 K=0x8f1bbcdc
+    mov  eax, r11d
+    xor  eax, esi
+    and  eax, r8d
+    xor  eax, esi
+    add  r10d, [rbp-0x90+6*4]
+    add  r10d, 0x8f1bbcdc
+    add  r10d, eax
+    rol  r10d, 5
+    add  r10d, r9d
+    rol  esi, 10
+    ; R62  f2 X[10] s=15 K=0x7a6d76e9
+    mov  eax, edi
+    xor  eax, r12d
+    and  eax, ebx
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+10*4]
+    add  r14d, 0x7a6d76e9
+    add  r14d, eax
+    rol  r14d, 15
+    add  r14d, r13d
+    rol  edi, 10
+    ; L63  f4 X[2] s=12 K=0x8f1bbcdc
+    mov  eax, r10d
+    xor  eax, r11d
+    and  eax, esi
+    xor  eax, r11d
+    add  r9d, [rbp-0x90+2*4]
+    add  r9d, 0x8f1bbcdc
+    add  r9d, eax
+    rol  r9d, 12
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R63  f2 X[14] s=8 K=0x7a6d76e9
+    mov  eax, ebx
+    xor  eax, edi
+    and  eax, r14d
+    xor  eax, edi
+    add  r13d, [rbp-0x90+14*4]
+    add  r13d, 0x7a6d76e9
+    add  r13d, eax
+    rol  r13d, 8
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L64  f5 X[4] s=9 K=0xa953fd4e
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, r9d
+    add  r8d, [rbp-0x90+4*4]
+    add  r8d, 0xa953fd4e
+    add  r8d, eax
+    rol  r8d, 9
+    add  r8d, esi
+    rol  r10d, 10
+    ; R64  f1 X[12] s=8
+    mov  eax, r13d
+    xor  eax, r14d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+12*4]
+    add  r12d, eax
+    rol  r12d, 8
+    add  r12d, edi
+    rol  r14d, 10
+    ; L65  f5 X[0] s=15 K=0xa953fd4e
+    mov  eax, r10d
+    not  eax
+    or   eax, r9d
+    xor  eax, r8d
+    add  esi, [rbp-0x90+0*4]
+    add  esi, 0xa953fd4e
+    add  esi, eax
+    rol  esi, 15
+    add  esi, r11d
+    rol  r9d, 10
+    ; R65  f1 X[15] s=5
+    mov  eax, r12d
+    xor  eax, r13d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+15*4]
+    add  edi, eax
+    rol  edi, 5
+    add  edi, ebx
+    rol  r13d, 10
+    ; L66  f5 X[5] s=5 K=0xa953fd4e
+    mov  eax, r9d
+    not  eax
+    or   eax, r8d
+    xor  eax, esi
+    add  r11d, [rbp-0x90+5*4]
+    add  r11d, 0xa953fd4e
+    add  r11d, eax
+    rol  r11d, 5
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R66  f1 X[10] s=12
+    mov  eax, edi
+    xor  eax, r12d
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+10*4]
+    add  ebx, eax
+    rol  ebx, 12
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L67  f5 X[9] s=11 K=0xa953fd4e
+    mov  eax, r8d
+    not  eax
+    or   eax, esi
+    xor  eax, r11d
+    add  r10d, [rbp-0x90+9*4]
+    add  r10d, 0xa953fd4e
+    add  r10d, eax
+    rol  r10d, 11
+    add  r10d, r9d
+    rol  esi, 10
+    ; R67  f1 X[4] s=9
+    mov  eax, ebx
+    xor  eax, edi
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+4*4]
+    add  r14d, eax
+    rol  r14d, 9
+    add  r14d, r13d
+    rol  edi, 10
+    ; L68  f5 X[7] s=6 K=0xa953fd4e
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r10d
+    add  r9d, [rbp-0x90+7*4]
+    add  r9d, 0xa953fd4e
+    add  r9d, eax
+    rol  r9d, 6
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R68  f1 X[1] s=12
+    mov  eax, r14d
+    xor  eax, ebx
+    xor  eax, edi
+    add  r13d, [rbp-0x90+1*4]
+    add  r13d, eax
+    rol  r13d, 12
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L69  f5 X[12] s=8 K=0xa953fd4e
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, r9d
+    add  r8d, [rbp-0x90+12*4]
+    add  r8d, 0xa953fd4e
+    add  r8d, eax
+    rol  r8d, 8
+    add  r8d, esi
+    rol  r10d, 10
+    ; R69  f1 X[5] s=5
+    mov  eax, r13d
+    xor  eax, r14d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+5*4]
+    add  r12d, eax
+    rol  r12d, 5
+    add  r12d, edi
+    rol  r14d, 10
+    ; L70  f5 X[2] s=13 K=0xa953fd4e
+    mov  eax, r10d
+    not  eax
+    or   eax, r9d
+    xor  eax, r8d
+    add  esi, [rbp-0x90+2*4]
+    add  esi, 0xa953fd4e
+    add  esi, eax
+    rol  esi, 13
+    add  esi, r11d
+    rol  r9d, 10
+    ; R70  f1 X[8] s=14
+    mov  eax, r12d
+    xor  eax, r13d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+8*4]
+    add  edi, eax
+    rol  edi, 14
+    add  edi, ebx
+    rol  r13d, 10
+    ; L71  f5 X[10] s=12 K=0xa953fd4e
+    mov  eax, r9d
+    not  eax
+    or   eax, r8d
+    xor  eax, esi
+    add  r11d, [rbp-0x90+10*4]
+    add  r11d, 0xa953fd4e
+    add  r11d, eax
+    rol  r11d, 12
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R71  f1 X[7] s=6
+    mov  eax, edi
+    xor  eax, r12d
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+7*4]
+    add  ebx, eax
+    rol  ebx, 6
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L72  f5 X[14] s=5 K=0xa953fd4e
+    mov  eax, r8d
+    not  eax
+    or   eax, esi
+    xor  eax, r11d
+    add  r10d, [rbp-0x90+14*4]
+    add  r10d, 0xa953fd4e
+    add  r10d, eax
+    rol  r10d, 5
+    add  r10d, r9d
+    rol  esi, 10
+    ; R72  f1 X[6] s=8
+    mov  eax, ebx
+    xor  eax, edi
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+6*4]
+    add  r14d, eax
+    rol  r14d, 8
+    add  r14d, r13d
+    rol  edi, 10
+    ; L73  f5 X[1] s=12 K=0xa953fd4e
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r10d
+    add  r9d, [rbp-0x90+1*4]
+    add  r9d, 0xa953fd4e
+    add  r9d, eax
+    rol  r9d, 12
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R73  f1 X[2] s=13
+    mov  eax, r14d
+    xor  eax, ebx
+    xor  eax, edi
+    add  r13d, [rbp-0x90+2*4]
+    add  r13d, eax
+    rol  r13d, 13
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L74  f5 X[3] s=13 K=0xa953fd4e
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, r9d
+    add  r8d, [rbp-0x90+3*4]
+    add  r8d, 0xa953fd4e
+    add  r8d, eax
+    rol  r8d, 13
+    add  r8d, esi
+    rol  r10d, 10
+    ; R74  f1 X[13] s=6
+    mov  eax, r13d
+    xor  eax, r14d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+13*4]
+    add  r12d, eax
+    rol  r12d, 6
+    add  r12d, edi
+    rol  r14d, 10
+    ; L75  f5 X[8] s=14 K=0xa953fd4e
+    mov  eax, r10d
+    not  eax
+    or   eax, r9d
+    xor  eax, r8d
+    add  esi, [rbp-0x90+8*4]
+    add  esi, 0xa953fd4e
+    add  esi, eax
+    rol  esi, 14
+    add  esi, r11d
+    rol  r9d, 10
+    ; R75  f1 X[14] s=5
+    mov  eax, r12d
+    xor  eax, r13d
+    xor  eax, r14d
+    add  edi, [rbp-0x90+14*4]
+    add  edi, eax
+    rol  edi, 5
+    add  edi, ebx
+    rol  r13d, 10
+    ; L76  f5 X[11] s=11 K=0xa953fd4e
+    mov  eax, r9d
+    not  eax
+    or   eax, r8d
+    xor  eax, esi
+    add  r11d, [rbp-0x90+11*4]
+    add  r11d, 0xa953fd4e
+    add  r11d, eax
+    rol  r11d, 11
+    add  r11d, r10d
+    rol  r8d, 10
+    ; R76  f1 X[0] s=15
+    mov  eax, edi
+    xor  eax, r12d
+    xor  eax, r13d
+    add  ebx, [rbp-0x90+0*4]
+    add  ebx, eax
+    rol  ebx, 15
+    add  ebx, r14d
+    rol  r12d, 10
+    ; L77  f5 X[6] s=8 K=0xa953fd4e
+    mov  eax, r8d
+    not  eax
+    or   eax, esi
+    xor  eax, r11d
+    add  r10d, [rbp-0x90+6*4]
+    add  r10d, 0xa953fd4e
+    add  r10d, eax
+    rol  r10d, 8
+    add  r10d, r9d
+    rol  esi, 10
+    ; R77  f1 X[3] s=13
+    mov  eax, ebx
+    xor  eax, edi
+    xor  eax, r12d
+    add  r14d, [rbp-0x90+3*4]
+    add  r14d, eax
+    rol  r14d, 13
+    add  r14d, r13d
+    rol  edi, 10
+    ; L78  f5 X[15] s=5 K=0xa953fd4e
+    mov  eax, esi
+    not  eax
+    or   eax, r11d
+    xor  eax, r10d
+    add  r9d, [rbp-0x90+15*4]
+    add  r9d, 0xa953fd4e
+    add  r9d, eax
+    rol  r9d, 5
+    add  r9d, r8d
+    rol  r11d, 10
+    ; R78  f1 X[9] s=11
+    mov  eax, r14d
+    xor  eax, ebx
+    xor  eax, edi
+    add  r13d, [rbp-0x90+9*4]
+    add  r13d, eax
+    rol  r13d, 11
+    add  r13d, r12d
+    rol  ebx, 10
+    ; L79  f5 X[13] s=6 K=0xa953fd4e
+    mov  eax, r11d
+    not  eax
+    or   eax, r10d
+    xor  eax, r9d
+    add  r8d, [rbp-0x90+13*4]
+    add  r8d, 0xa953fd4e
+    add  r8d, eax
+    rol  r8d, 6
+    add  r8d, esi
+    rol  r10d, 10
+    ; R79  f1 X[11] s=11
+    mov  eax, r13d
+    xor  eax, r14d
+    xor  eax, ebx
+    add  r12d, [rbp-0x90+11*4]
+    add  r12d, eax
+    rol  r12d, 11
+    add  r12d, edi
+    rol  r14d, 10
+    ; after 80 rounds the renaming cycle (80 mod 5 == 0) restores the
+    ; original register assignment: left A..E = esi,r8d,r9d,r10d,r11d,
+    ; right A2..E2 = edi,r12d,r13d,r14d,ebx -- the cross-mix below is
+    ; unchanged from the loop version.
 
     ; ---------- cross-mix into state and add ----------
     ; Reference (pycryptodome src/RIPEMD160.c final mixing), where the left
@@ -194,115 +1841,8 @@ rmd160_compress:
     ret
 
 ; ----------------------------------------------------------------------------
-; rmd_f_left: eax = f(B,C,D) for the LEFT line: round group (ecx>>4) selects
-;   f1..f5. Registers unchanged except eax. B=r8d C=r9d D=r10d.
-; ----------------------------------------------------------------------------
-rmd_f_left:
-    ; group = round>>4 ; round counter lives in r15d (not ecx, which is the
-    ; rotate scratch). B=r8d C=r9d D=r10d.
-    mov  eax, r15d
-    shr  eax, 4
-    and  eax, 7                 ; group 0..4
-    cmp  eax, 0
-    je   .fl1
-    cmp  eax, 1
-    je   .fl2
-    cmp  eax, 2
-    je   .fl3
-    cmp  eax, 3
-    je   .fl4
-.fl5:
-    ; f5 = B ^ (C | ~D)
-    mov  eax, r10d
-    not  eax
-    or   eax, r9d
-    xor  eax, r8d
-    ret
-.fl1:
-    ; f1 = B ^ C ^ D
-    mov  eax, r8d
-    xor  eax, r9d
-    xor  eax, r10d
-    ret
-.fl2:
-    ; f2 = (B & C) | (~B & D)
-    mov  eax, r8d
-    and  eax, r9d
-    mov  edx, r8d
-    not  edx
-    and  edx, r10d
-    or   eax, edx
-    ret
-.fl3:
-    ; f3 = (B | ~C) ^ D
-    mov  eax, r9d
-    not  eax
-    or   eax, r8d
-    xor  eax, r10d
-    ret
-.fl4:
-    ; f4 = (B & D) | (C & ~D)
-    mov  eax, r8d
-    and  eax, r10d
-    mov  edx, r10d
-    not  edx
-    and  edx, r9d
-    or   eax, edx
-    ret
-
-; ----------------------------------------------------------------------------
-; rmd_f_right: eax = g(B2,C2,D2) for the RIGHT line. On entry the function
-;   selector is a scalar group' (0..4) passed via a convention -- see caller,
-;   which sets [rbp-0x48] to the desired f-number. B2=r12d C2=r13d D2=r14d.
-; ----------------------------------------------------------------------------
-rmd_f_right:
-    mov  eax, [rbp-0x48]        ; which f (1..5)
-    cmp  eax, 1
-    je   .fr1
-    cmp  eax, 2
-    je   .fr2
-    cmp  eax, 3
-    je   .fr3
-    cmp  eax, 4
-    je   .fr4
-.fr5:
-    ; f5 = B2 ^ (C2 | ~D2)
-    mov  eax, r14d
-    not  eax
-    or   eax, r13d
-    xor  eax, r12d
-    ret
-.fr1:
-    mov  eax, r12d
-    xor  eax, r13d
-    xor  eax, r14d
-    ret
-.fr2:
-    mov  eax, r12d
-    and  eax, r13d
-    mov  edx, r12d
-    not  edx
-    and  edx, r14d
-    or   eax, edx
-    ret
-.fr3:
-    mov  eax, r13d
-    not  eax
-    or   eax, r12d
-    xor  eax, r14d
-    ret
-.fr4:
-    mov  eax, r12d
-    and  eax, r14d
-    mov  edx, r14d
-    not  edx
-    and  edx, r13d
-    or   eax, edx
-    ret
-
-; ----------------------------------------------------------------------------
-; rmd_rol helper removed -- rotations now done inline with `rol eax, cl` where
-; rcx is loaded with the per-round rotation amount (round counter lives in r15).
+; rmd_f_left / rmd_f_right removed 2026-08-23: the unrolled rounds inline all
+; five round functions with immediate constants (see the compress body above).
 ; ----------------------------------------------------------------------------
 
 ; ============================================================================

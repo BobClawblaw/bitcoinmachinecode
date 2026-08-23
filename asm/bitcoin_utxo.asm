@@ -111,6 +111,30 @@ utxo_hash:
     lea  rax, [r8+40]
     ret
 
+; utxo_prefetch(u=rdi, txid=rsi, index=rdx) -> void
+; Warm the home slot's cache line(s) for a LATER utxo_get/utxo_del of the
+; same key. Added 2026-08-23: apply_block_inner's STAGE A walk sees every
+; prevout a full phase before STAGE B looks it up, so by issuing the home
+; slot's address here the dependent-miss latency of the real probe is paid
+; while the CPU is busy building the in-block index instead of stalling in
+; the probe loop. Purely a hint: no architectural effect, no result change.
+; Two lines: a 48-byte slot can straddle a 64-byte line, and the next line
+; also covers the first linear-probe step.
+; Clobbers only caller-saved regs (r10 kept across the utxo_hash call --
+; utxo_hash touches rax/rcx/r8/r9 only).
+global utxo_prefetch
+utxo_prefetch:
+    sub  rsp, 8            ; entry rsp is 8 mod 16; realign so the call site is 0 mod 16
+    mov  r10, rdi          ; u
+    mov  rdi, rsi          ; txid
+    mov  rsi, rdx          ; index
+    mov  rdx, [r10+8]      ; mask
+    call utxo_hash         ; rax = byte offset of home slot (from u)
+    prefetcht0 [r10+rax]
+    prefetcht0 [r10+rax+64]
+    add  rsp, 8
+    ret
+
 ; -----------------------------------------------------------------
 ; utxo_put(u, txid, index, value, height, is_coinbase, script, slen)
 global utxo_put
