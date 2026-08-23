@@ -150,6 +150,7 @@ extern unsigned net_netgroup_v4(unsigned ip);                                 /*
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
+extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
 extern long node_ibd(int fd, void* st, void* hst, void* buf, long buflen); /* bitcoind.asm */
 extern long node_drain(int fd, void* st, void* buf, long buflen);          /* bitcoind.asm */
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count); /* bitcoind.asm */
@@ -715,7 +716,7 @@ static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
  * see do_outbound_sync_bounded and the dlc chunk worker, whose comment spells
  * out the trickle-resets-SO_RCVTIMEO mechanism. outbound_connect was simply
  * never given the same treatment, even though every one of its callers (the
- * steady-state leg fill and mux_redial) runs OUTSIDE any enclosing alarm. */
+ * steady-state leg fill and mux_next_peer) runs OUTSIDE any enclosing alarm. */
 #define OUTBOUND_DIAL_BUDGET_SECS 20
 
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
@@ -928,17 +929,17 @@ static long do_outbound_sync(int i){
  * single-seed-limited. On success the slot is re-anchored at our stored tip and
  * reused in the poll loop; on failure the slot stays dead (fd -1) and is retried
  * on a later rotation. */ 
-static void mux_redial(int i, const char* peers[], int pool_len, int out_port){
+static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     if(mux_out_fd[i]>=0){ close(mux_out_fd[i]); mux_out_fd[i]=-1; }
     /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
     int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
     mux_out_peer[i] = p;
     int fd = outbound_connect(peers[p], 300, out_port);
-    if(fd<0){ fprintf(stderr,"[mux:%d] redial %s failed (kept dead)\n", i, peers[p]); return; }
+    if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable (leg stays down)\n", i, peers[p]); return; }
     mux_out_fd[i]=fd;
     strncpy(mux_out_host[i], peers[p], 63);
     anchor_locator(mux_out_loc[i]);
-    fprintf(stderr,"[mux:%d] redialed -> %s (fd %d)\n", i, peers[p], fd);
+    fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d)\n", i, peers[p], fd);
 }
 
 /* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
@@ -950,7 +951,7 @@ static void mux_redial(int i, const char* peers[], int pool_len, int out_port){
  * inbound probe times out. We bound each leg's sync wall-clock: arm a short
  * SIGALRM around node_sync; if it fires we know the pass was interrupted (the
  * socket may hold a partially-read frame), so we DROP and re-dial a rotated
- * seed (re-using mux_redial) and let the next rotation continue the catch-up
+ * seed (re-using mux_next_peer) and let the next rotation continue the catch-up
  * from the freshly-anchored stored tip. A caught-up node completes node_sync
  * in well under the budget, so it is never interrupted and small-store
  * behavior (test_outbound_mux) is unchanged. */
@@ -978,7 +979,7 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
          * tip, so the next pass continues exactly where this one stopped. */
         fprintf(stderr,"[mux:%d] %s sync exceeded %gs budget; re-dialing\n",
                 i, mux_out_fd[i]>=0?mux_out_host[i]:"?", MUX_SYNC_BUDGET_SECS);
-        mux_redial(i, peers, pool_len, out_port);
+        mux_next_peer(i, peers, pool_len, out_port);
     }
     return n;
 }
@@ -2132,7 +2133,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     /* srcpool is the ADDRESS BOOK pool, and it is what every dial in this
      * worker must use -- the initial dial, the top-up, AND the re-dials.
      *
-     * Until 2026-08-23 only the first two did. Every mux_redial() was handed
+     * Until 2026-08-23 only the first two did. Every mux_next_peer() (then named mux_redial) was handed
      * `peers`/`pool_len`, which serve_download_worker receives from its sole
      * caller as `catchup_seeds` -- the six DNS seed HOSTNAMES. Legs die
      * routinely (peer timeouts, dropped sockets, the per-leg sync budget), and
@@ -2271,6 +2272,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
+    int last_seen_tip = *(int*)(store_buf+24);   /* new-block announcement baseline (boot tip, so the catch-up burst is announced too) */
     /* STAGE B: next allowed fork probe (see the probe block in the rotation
      * below). Starts armed so a node booting onto a store that is already on
      * a losing branch notices on its first idle rotation rather than after a
@@ -2281,7 +2283,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
             char upbuf[UPTIME_BUF];
-            fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d live_utxo=%ld uptime=%s\n",
+            fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d txouts=%ld uptime=%s\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
@@ -2294,7 +2296,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
-                if(now_ms>=mux_out_nextretry[i]){ mux_redial(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
                 continue;
             }
             /* Cheap liveness check BEFORE syncing: a peer that cleanly closed
@@ -2310,7 +2312,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(poll(&pf, 1, 0) > 0 && (pf.revents & (POLLHUP|POLLERR|POLLNVAL))){
                 fprintf(stderr,"[dl:%d] %s connection dropped (revents 0x%x); re-dialing\n",
                         i, mux_out_host[i], pf.revents);
-                mux_redial(i, srcpool, nsrc, out_port);
+                mux_next_peer(i, srcpool, nsrc, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
             }
@@ -2325,7 +2327,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_sync_budget_fired){
                 fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
                         i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
-                mux_redial(i, srcpool, nsrc, out_port);
+                mux_next_peer(i, srcpool, nsrc, out_port);
             }
             did |= (n>0)?1:0;
             /* ---- STAGE B: periodic fork probe -----------------------------
@@ -2355,7 +2357,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 alarm(0); sigaction(SIGALRM,&pold,NULL);
                 if(mux_sync_budget_fired){
                     fprintf(stderr,"[reorg] probe of %s exceeded %gs budget; re-dialing\n", mux_out_host[i], DL_BUDGET_SECS);
-                    mux_redial(i, srcpool, nsrc, out_port);
+                    mux_next_peer(i, srcpool, nsrc, out_port);
                 } else if(pr == 1){
                     /* The chain moved under us: re-anchor this leg and force
                      * a UTXO catch-up pass this rotation. */
@@ -2460,10 +2462,30 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         ar, utxo_live_applied_height(), live_utxo_disp(), phase_elapsed(&utxo_ct_pt));
             }
         }
+        /* new-block announcement: one choke point watching the store's tip,
+         * so it fires no matter which path appended (mux keep-up leg,
+         * realtime getdata loop, catch-up). Hash read straight from the
+         * index record (store_get_tip_hash), printed big-endian like Core
+         * logs it, so a line here greps against a Core debug.log. */
+        {
+            int now_tip = *(int*)(store_buf+24);
+            if(last_seen_tip >= 0 && now_tip > last_seen_tip){
+                unsigned char th[32]; char hex[65];
+                if(store_get_tip_hash(store_buf, th) == 1){
+                    for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
+                    fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)\n",
+                            now_tip, hex, now_tip-last_seen_tip);
+                } else {
+                    fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
+                            now_tip, now_tip-last_seen_tip);
+                }
+            }
+            last_seen_tip = now_tip;
+        }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
-            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%s%s\n",
+            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d txouts=%ld uptime=%s%s\n",
                     *(int*)(store_buf+24), live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (now_ms-boot_ms)/1000),
@@ -2658,7 +2680,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
-                if(now_ms >= mux_out_nextretry[i]){ mux_redial(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
                 continue;
             }
             short ev = pfds[poll_idx].revents;
@@ -2667,7 +2689,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * broken socket forever. */
             if(ev & (POLLHUP|POLLERR|POLLNVAL)){
                 fprintf(stderr,"[mux:%d] %s dropped (revents 0x%x); re-dialing\n", i, mux_out_host[i], ev);
-                mux_redial(i, peers, pool_len, out_port);
+                mux_next_peer(i, peers, pool_len, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 poll_idx++;
                 continue;
