@@ -1073,6 +1073,13 @@ tests/bip30_shim: tests/bip30_shim.c $(CONSOBJS) bitcoin_utxo.o
 tests/test_bip30: tests/test_bip30.c bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_bip30.c bitcoin_hash.o sha256.o
 
+# BIP30 in the DAEMON's apply path. tests/test_bip30 tests/test_bip30_daemon above drives
+# tests/bip30_shim, which implements the rule itself and is NOT linked into
+# bitcoind -- so it validated a reimplementation. This drives utxo_live.c.
+# See LOG.md incident #30.
+tests/test_bip30_daemon: tests/test_bip30_daemon.c $(REORGSRCS_NOMAIN) $(REORGOBJS) $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O0 -Wall -I tests -o $@ tests/test_bip30_daemon.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread
+
 bitcoin_sigops.o: bitcoin_sigops.asm bitcoin_scriptcodec.asm
 	$(NASM) -f elf64 -o $@ bitcoin_sigops.asm
 
@@ -1635,6 +1642,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/verify_p2sh_shim < /dev/null
 	./tests/test_verify_p2sh
 	./tests/test_bip30
+	./tests/test_bip30_daemon
 	./tests/test_chainwork
 	./tests/test_locator
 	./tests/test_prevhash
