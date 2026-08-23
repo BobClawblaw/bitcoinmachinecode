@@ -582,6 +582,13 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* 
  * takes none -- see its comment). NULL is handled: the gate enforces. */
 static void* g_bip30_store = 0;
 
+/* Set ONLY by the BIP30 arm below. A differential harness needs to tell a
+ * BIP30 rejection apart from every other reason apply_block_inner returns 0
+ * -- otherwise a block refused for, say, a bad signature would be scored as a
+ * BIP30 hit and the comparison against Core would be meaningless. Read and
+ * cleared by utxo_live_test_took_bip30_reject. */
+static int g_bip30_rejected = 0;
+
 static int bip30_enforced(long height, const u8 hash32[32])
 {
     static const u8 REP0[32] = BIP30_REPEAT0_HASH;
@@ -723,6 +730,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                     fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: bad-txns-BIP30 "
                             "(tried to overwrite transaction: output %u already unspent)\n",
                             g_apply_height, (unsigned long)t, (unsigned)o);
+                    g_bip30_rejected = 1;
                     return 0;
                 }
             }
@@ -1150,6 +1158,11 @@ int utxo_live_test_seed(const unsigned char txid[32], unsigned int index, unsign
  * resolved and the gate deliberately answers ENFORCE -- see bip30_enforced. */
 int utxo_live_test_bip30_enforced(long height, const unsigned char hash32[32]){
     return bip30_enforced(height, hash32);
+}
+/* TEST-ONLY: 1 if the LAST apply_block failed the BIP30 check specifically.
+ * Reading clears it. */
+int utxo_live_test_took_bip30_reject(void){
+    int v = g_bip30_rejected; g_bip30_rejected = 0; return v;
 }
 
 
