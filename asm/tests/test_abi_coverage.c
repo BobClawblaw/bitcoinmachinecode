@@ -79,6 +79,7 @@ extern void tap_leaf_hash(void); extern void tap_merkle_root(void);
 extern void taproot_tweak_pubkey(void);
 extern void block_work(void); extern void chainwork_add(void);
 extern void chainwork_cmp(void); extern void u256_div(void);
+extern void hash160(void); extern void base58check_encode(void);
 
 static const char* RN[6] = { "rbx", "rbp", "r12", "r13", "r14", "r15" };
 static int g_clean = 0, g_bad = 0;
@@ -178,6 +179,26 @@ int main(void)
     P4("chainwork_add", chainwork_add, work2, work, work, 0);
     P4("chainwork_cmp", chainwork_cmp, work, work2, 0, 0);
     P4("u256_div",      u256_div,      work2, work, work, 0);
+
+    /* ---- base58check ----
+     * PROBE BOTH LENGTHS ON PURPOSE. base58check_encode is length-sensitive:
+     * it builds `data = payload || checksum[0..4]` in a stack buffer, and the
+     * bug this catches is that the buffer grew UPWARD into the function's own
+     * callee-saved save area once `data` passed 48 bytes. The 21-byte P2PKH
+     * payload every other test uses stays inside the safe window and reports
+     * clean; the 78-byte BIP32 extended key (xprv/xpub, wallet_core.c's
+     * wallet_seed_master_xprv) overruns it and destroys rbx and r12-r15.
+     * A probe that only ever tried 21 bytes would have been green forever. */
+    {
+        static u8 pay21[21], pay78[78];
+        static char b58[256];
+        for (int i = 0; i < 21; i++) pay21[i] = (u8)(i * 9 + 2);
+        for (int i = 0; i < 78; i++) pay78[i] = (u8)(i * 9 + 2);
+        pay21[0] = 0x00;                       /* mainnet P2PKH version */
+        P4("base58check_enc/21", base58check_encode, b58, pay21, 21, 0);
+        P4("base58check_enc/78", base58check_encode, b58, pay78, 78, 0);
+    }
+    P4("hash160", hash160, b32a, script, 33, 0);
 
     printf("\n%d clean, %d violating\n", g_clean, g_bad);
     if (g_bad){
