@@ -2148,9 +2148,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
-            fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d live_utxo=%ld uptime=%llds\n",
+            char upbuf[UPTIME_BUF];
+            fprintf(stderr,"[dl] shutting down (signal %d): tip=%d peers=%d live_utxo=%ld uptime=%s\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
-                    utxo_live_ok?live_utxo_disp():-1L, (stop_ms-boot_ms)/1000);
+                    utxo_live_ok?live_utxo_disp():-1L,
+                    fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
             _exit(0);
         }
         long long now_ms = 0;
@@ -2328,9 +2330,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
-            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%llds%s\n",
+            char upbuf[UPTIME_BUF];
+            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d live_utxo=%ld uptime=%s%s\n",
                     *(int*)(store_buf+24), live_peers, mux_n_out,
-                    utxo_live_ok?live_utxo_disp():-1L, (now_ms-boot_ms)/1000,
+                    utxo_live_ok?live_utxo_disp():-1L,
+                    fmt_uptime(upbuf, (now_ms-boot_ms)/1000),
                     utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
