@@ -26,8 +26,13 @@
 ;
 ;   LEAF_VERSION_TAPSCRIPT == 0xc0.
 ;
-;   System V ABI; preserves rbx,r12-r15. Global scratch (tagh_buf,
-;   tap_preimg) used by the small helpers is single-threaded.
+;   System V ABI; preserves rbx,r12-r15. The scratch the small helpers use
+;   (tagh_buf, tap_preimg) is THREAD-LOCAL as of 2026-08-23; it was
+;   process-global, and that one fact is why daemon/tx_verify.c verified every
+;   taproot input in a sequential pass while every other shape fanned out
+;   across the worker pool. These functions are safe to call concurrently.
+;   If you add scratch here, put it in .tbss too -- a plain .data/.bss buffer
+;   silently re-serializes the whole taproot path.
 ; ============================================================================
 default rel
 
@@ -68,9 +73,6 @@ P_BE:
     db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
     db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,0xFF,0xFF,0xFC,0x2F
 
-section .data
-align 16
-tagh_buf:  times 32 db 0
 
 ; tap_preimg: shared scratch for tagged_hash256/tap_branch_hash/tap_leaf_hash/
 ; tap_merkle_root (single-threaded global, see this file's header comment).
@@ -90,14 +92,31 @@ tagh_buf:  times 32 db 0
 ; than silent truncation" philosophy already established elsewhere in this
 ; project (see e.g. TXV_SPK_CAP's own header comment in daemon/tx_verify.c).
 TAP_PREIMG_CAP equ 4*1024*1024
-section .bss
-align 16
+; Thread-local (2026-08-23). Both were process-global scratch, which is
+; why daemon/tx_verify.c had to verify every taproot input in a SEQUENTIAL
+; pass while every other input shape fanned out across the worker pool --
+; see PERF_SCOPE.md section 14 for the profile that measured the cost.
+; .tbss is demand-paged, so TAP_PREIMG_CAP is 4 MiB of address space per
+; thread but only the touched pages are ever resident.
+section .tbss alloc noexec nowrite tls align=16
+global tagh_buf
+tagh_buf:   resb 32
+global tap_preimg
 tap_preimg: resb TAP_PREIMG_CAP
 
 ; ============================================================================
 ; tagged_hash256(out[32]=rdi, tag=rsi, taglen=rdx, msg=rcx, msglen=r8)
 ;   r12=out, r13=tag, r14=taglen, rbx=msg, r15=msglen
 ; ============================================================================
+; TLS_ADDR dst, sym -- dst = this thread's address of `sym` (ELF x86-64
+; Initial-Exec model). Clobbers only `dst`, so it is a drop-in for the
+; `lea dst, [rel sym]` it replaced. Mirrors the identical macro in
+; bitcoin_interp.asm / bitcoin_sighash.asm (NASM macros are per-file).
+%macro TLS_ADDR 2
+    mov   %1, [rel %2 wrt ..gottpoff]
+    add   %1, qword [fs:0]
+%endmacro
+
 section .text
 global tagged_hash256
 tagged_hash256:
@@ -115,24 +134,26 @@ tagged_hash256:
     mov  r14, rdx
     mov  rbx, rcx
     mov  r15, r8
-    lea  rdi, [rel tagh_buf]
+    TLS_ADDR rdi, tagh_buf
     mov  rsi, r13
     mov  rdx, r14
     call sha256_full
-    lea  rdi, [rel tap_preimg]
-    lea  rsi, [rel tagh_buf]
+    TLS_ADDR rdi, tap_preimg
+    TLS_ADDR rsi, tagh_buf
     mov  rcx, 32
     rep movsb
-    lea  rdi, [rel tap_preimg+32]
-    lea  rsi, [rel tagh_buf]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 32
+    TLS_ADDR rsi, tagh_buf
     mov  rcx, 32
     rep movsb
-    lea  rdi, [rel tap_preimg+64]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 64
     mov  rsi, rbx
     mov  rcx, r15
     rep movsb
     mov  rdi, r12
-    lea  rsi, [rel tap_preimg]
+    TLS_ADDR rsi, tap_preimg
     mov  rdx, r15
     add  rdx, 64
     call sha256_full
@@ -171,22 +192,26 @@ tap_branch_hash:
     repe cmpsb
     jb   .bfirst
     ; a first: msg = a||b at tap_preimg+64
-    lea  rdi, [rel tap_preimg+64]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 64
     mov  rsi, r13
     mov  rcx, 32
     rep movsb
-    lea  rdi, [rel tap_preimg+96]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 96
     mov  rsi, r14
     mov  rcx, 32
     rep movsb
     jmp  .bdo
 .bfirst:
     ; b first: msg = b||a
-    lea  rdi, [rel tap_preimg+64]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 64
     mov  rsi, r14
     mov  rcx, 32
     rep movsb
-    lea  rdi, [rel tap_preimg+96]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 96
     mov  rsi, r13
     mov  rcx, 32
     rep movsb
@@ -194,7 +219,8 @@ tap_branch_hash:
     mov  rdi, r12
     lea  rsi, [rel TAPBRANCH_TAG]
     mov  rdx, TAPBRANCH_TAG_LEN
-    lea  rcx, [rel tap_preimg+64]
+    TLS_ADDR rcx, tap_preimg
+    add  rcx, 64
     mov  r8, 64
     call tagged_hash256
     add  rsp, 0x18
@@ -235,8 +261,10 @@ tap_leaf_hash:
     cmp  r14, rax
     ja   .too_large
     ; msg at tap_preimg+64: ver || compact(slen) || script
-    mov  byte [rel tap_preimg+64], sil
-    lea  r15, [rel tap_preimg+65]
+    TLS_ADDR r15, tap_preimg
+    add  r15, 64
+    mov  byte [r15], sil
+    inc  r15                       ; r15 = tap_preimg+65, as before
     cmp  r14, 0xfd
     jb   .small
     cmp  r14, 0x10000
@@ -263,13 +291,15 @@ tap_leaf_hash:
     mov  rsi, r13
     mov  rcx, r14
     rep movsb
-    lea  rax, [rel tap_preimg+64]
+    TLS_ADDR rax, tap_preimg
+    add  rax, 64
     sub  r15, rax
     add  r15, r14
     mov  rdi, r12
     lea  rsi, [rel TAPLEAF_TAG]
     mov  rdx, TAPLEAF_TAG_LEN
-    lea  rcx, [rel tap_preimg+64]
+    TLS_ADDR rcx, tap_preimg
+    add  rcx, 64
     mov  r8, r15
     call tagged_hash256
     mov  eax, 1
@@ -529,7 +559,8 @@ tap_merkle_root:
     mov  r15, rax
 .justleaf:
     ; node = leaf_hashes[0] at tap_preimg+192
-    lea  rdi, [rel tap_preimg+192]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 192
     mov  rsi, r13
     mov  rcx, 32
     rep movsb
@@ -546,42 +577,53 @@ tap_merkle_root:
     lea  r11, [rbx+rax]
     ; compare node (+192) vs sibling: cmpsb flags = [rsi=sibling] - [rdi=node],
     ; so CF set here means sibling < node -> sibling goes FIRST.
-    lea  rdi, [rel tap_preimg+192]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 192
     mov  rsi, r11
     mov  rcx, 32
     repe cmpsb
     jb   .sib_first
     ; node first: msg = node||sibling  (node <= sibling)
-    lea  rdi, [rel tap_preimg+128]
-    lea  rsi, [rel tap_preimg+192]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 128
+    TLS_ADDR rsi, tap_preimg
+    add  rsi, 192
     mov  rcx, 32
     rep movsb
-    lea  rdi, [rel tap_preimg+160]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 160
     mov  rsi, r11
     mov  rcx, 32
     rep movsb
     jmp  .do_hash
 .sib_first:
     ; sibling first: msg = sibling||node  (sibling < node)
-    lea  rdi, [rel tap_preimg+128]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 128
     mov  rsi, r11
     mov  rcx, 32
     rep movsb
-    lea  rdi, [rel tap_preimg+160]
-    lea  rsi, [rel tap_preimg+192]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 160
+    TLS_ADDR rsi, tap_preimg
+    add  rsi, 192
     mov  rcx, 32
     rep movsb
     jmp  .do_hash
 .do_hash:
     ; node = TapBranch(msg at +128) -> write into +224 then copy to +192
-    lea  rdi, [rel tap_preimg+224]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 224
     lea  rsi, [rel TAPBRANCH_TAG]
     mov  rdx, TAPBRANCH_TAG_LEN
-    lea  rcx, [rel tap_preimg+128]
+    TLS_ADDR rcx, tap_preimg
+    add  rcx, 128
     mov  r8, 64
     call tagged_hash256
-    lea  rdi, [rel tap_preimg+192]
-    lea  rsi, [rel tap_preimg+224]
+    TLS_ADDR rdi, tap_preimg
+    add  rdi, 192
+    TLS_ADDR rsi, tap_preimg
+    add  rsi, 224
     mov  rcx, 32
     rep movsb
     mov  rax, [rbp-0x10]
@@ -590,7 +632,8 @@ tap_merkle_root:
     jmp  .mloop
 .mdone:
     mov  rdi, r12
-    lea  rsi, [rel tap_preimg+192]
+    TLS_ADDR rsi, tap_preimg
+    add  rsi, 192
     mov  rcx, 32
     rep movsb
     mov  eax, 1
