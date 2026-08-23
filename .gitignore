@@ -155,6 +155,10 @@ asm/tests/test_taproot
 asm/tests/test_taproot_sighash
 asm/tests/test_taproot_scriptpath
 asm/tests/test_taproot_exception_block
+asm/tests/bench_taproot_block
+asm/tests/test_abi_coverage
+asm/tests/test_bip30_daemon
+asm/tests/test_taproot_thread_stress
 asm/tests/test_taproot_parallel_arena
 asm/tests/test_taproot_block_diff
 asm/tests/test_mul_carry_regression
