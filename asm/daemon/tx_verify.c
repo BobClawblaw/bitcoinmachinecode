@@ -46,10 +46,20 @@
  * the transaction. Ordering between transactions and between blocks is
  * completely unchanged: only the (already provably independent, once each
  * input's prevout is resolved) crypto work for ONE transaction's OWN inputs
- * runs concurrently. Taproot inputs, needing the BIP341 aggregate sighash
- * built from every input's prevout, stay on the existing sequential pass 2
- * -- rarer in practice, and keeping it simple keeps the parallel path's
- * correctness argument simple.
+ * runs concurrently.
+ *
+ * TAPROOT USED TO BE EXCLUDED FROM THAT and verified in a sequential pass
+ * afterwards, at both entry points, for two reasons: BIP341's sighash needs
+ * WHOLE-TRANSACTION data (every input's outpoint/amount/scriptPubKey plus
+ * the witness-stripped serialization), and secp256k1_taproot.asm's staging
+ * buffers were process-global. Both are gone as of 2026-08-23. The buffers
+ * are thread-local (gated by tests/test_taproot_thread_stress), and a
+ * separate cheap pass now builds the aggregate data for every
+ * taproot-bearing transaction in the block into one arena that is read-only
+ * for the whole of verification. See the TAPROOT AGGREGATE-SIGHASH ARENA
+ * comment below and PERF_SCOPE.md section 14.7 -- the profile that forced
+ * this measured 32 worker threads asleep and one thread running at 67% field
+ * arithmetic on an 85%-idle box.
  *
  * Originally fork()-based (the same pattern dl_catchup uses for parallel
  * block downloading), and disabled during bulk UTXO catch-up because
@@ -259,6 +269,188 @@ static u64 witpool_reserve(witpool_t* wp, u64 n){
     u64 off = wp->used; wp->used += n; return off;
 }
 
+/* ---- packed byte-pool bump allocator ------------------------------------
+ * Reused across blocks like grow_arena below, but bump-reset instead of
+ * grown-per-entry. Backs (a) txvb_in_t's prevout scriptPubKey copies and
+ * (b) the taproot aggregate-sighash arena. Cost is proportional to the
+ * block's REAL byte total, not entries x worst-case. Grows (never shrinks)
+ * only when a block's total need exceeds current capacity; `used` resets to
+ * 0 at the start of every call, so a reused-but-dirty pool from an earlier
+ * block is safe -- every byte handed out gets freshly written, nothing is
+ * ever read from an unwritten pool region.
+ *
+ * Both entry points return byte OFFSETS, not pointers (2026-08-20, replacing
+ * an earlier pointer-returning version that was a real dangling-pointer bug:
+ * a LATER call in the same block's resolve loop can realloc() and relocate
+ * pool->buf, silently invalidating every pointer already handed out to
+ * EARLIER entries in that same loop -- confirmed in production: height
+ * 184390's tx=1 legacy input resolved a correct P2PKH scriptPubKey, then
+ * failed verification against garbage bytes). An offset stays valid
+ * regardless of relocation; callers must resolve it to an address
+ * (pool->buf + offset) only AFTER the pool is done growing, i.e. after the
+ * resolve/build phase returns -- exactly when every current reader runs. */
+typedef struct { u8* buf; u64 cap; u64 used; } bytepool_t;
+static bytepool_t g_spk_pool = {0};
+
+/* Reserve n uninitialised bytes; the caller writes them itself. Returns the
+ * offset, or ~0ull on OOM. Callers must finish writing the region BEFORE the
+ * next reserve/alloc on the same pool (which may relocate pool->buf). */
+static u64 bytepool_reserve(bytepool_t* pool, u64 n){
+    if (pool->used + n > pool->cap){
+        u64 newcap = pool->cap ? pool->cap : 65536;
+        while (newcap < pool->used + n) newcap *= 2;
+        void* p = realloc(pool->buf, newcap);
+        if (!p) return ~0ull;
+        pool->buf = p; pool->cap = newcap;
+    }
+    u64 off = pool->used;
+    pool->used += n;
+    return off;
+}
+static u64 bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
+    u64 off = bytepool_reserve(pool, n);
+    if (off == ~0ull) return off;
+    memcpy(pool->buf + off, src, n);
+    return off;
+}
+
+/* ============================================================================
+ * TAPROOT AGGREGATE-SIGHASH ARENA (PERF_SCOPE.md section 14.7, 2026-08-23)
+ *
+ * BIP341's sighash commits to EVERY input's outpoint, amount and
+ * scriptPubKey, plus the witness-stripped transaction -- so verifying one
+ * taproot input needs whole-transaction data, not just that input's own.
+ * Until now that was rebuilt into one reused scratch arena per transaction,
+ * which forced every taproot input in the block through a single sequential
+ * pass while every other shape fanned out across the worker pool. Measured
+ * on the live daemon at height ~797,000: 32 worker threads asleep, one
+ * thread running at 67% field arithmetic, on an 85%-idle box.
+ *
+ * The parallel axis is ACROSS TRANSACTIONS, not within one. Measured against
+ * Bitcoin Core at heights 825,000 and 825,001: 96% / 95% of taproot-bearing
+ * transactions have exactly ONE taproot input (mean 1.13 / 1.11), so fanning
+ * a transaction's own taproot inputs across threads finds nothing to fan out.
+ *
+ * Hence the two-phase shape:
+ *
+ *   Phase A (tapagg_build, sequential, cheap -- memcpy + strip_witness, no
+ *   signature work): for every transaction with at least one taproot input,
+ *   append its four aggregate arrays to ONE per-BLOCK arena and record a
+ *   descriptor of byte offsets.
+ *
+ *   Phase B (tapagg_verify, parallel): every taproot input in the block is
+ *   an ordinary entry in the flat verify array and is dispatched to the
+ *   worker pool like any other shape. The arena is READ-ONLY for the whole
+ *   of phase B -- which is precisely why phase A exists as a separate pass
+ *   rather than having each worker rebuild its own transaction's arrays.
+ *
+ * Sizing: sum over taproot-bearing transactions of
+ * (44*nin + sum(1+spklen) + txlen) -- a few MB per block. The `sp` array is
+ * PACKED (1+spklen per input), not the nin*(1+TXV_SPK_CAP) worst case the
+ * old per-transaction arena used.
+ *
+ * The prerequisite for any of this was secp256k1_taproot.asm's `tagh_buf`
+ * and `tap_preimg` becoming thread-local (2026-08-23, gated by
+ * tests/test_taproot_thread_stress: 29,236 wrong digests of 96,000 against
+ * the pre-fix globals, 0 after). Those were the only shared mutable state on
+ * the taproot path; everything else it touches (bitcoin_taproot_sighash.c's
+ * BMC_TLS_BUF scratch, bitcoin_interp.asm's and bitcoin_scriptcodec.asm's
+ * .tbss) was already per-thread.
+ * ========================================================================= */
+
+/* One transaction's BIP341 aggregate-sighash inputs, as byte OFFSETS into a
+ * bytepool -- never pointers, since the pool reallocs as later transactions
+ * are appended (same discipline as spk_off). */
+typedef struct {
+    u64 po_off;   /* nin*36 -- outpoints, wire order                       */
+    u64 am_off;   /* nin*8  -- amounts, LE64                               */
+    u64 sp_off;   /* packed: per input, one length byte then the spk bytes */
+    u64 ns_off;   /* the witness-stripped tx serialization                 */
+    u64 nslen;
+    u64 nin;
+} tapagg_t;
+
+/* Yields input k's already-resolved outpoint / amount / scriptPubKey. Two
+ * tiny adapters below (one per entry point) so phase A itself exists exactly
+ * once and the two entry points cannot drift apart. */
+typedef void (*tapin_fn)(void* ctx, u64 k, const u8** outpoint, u64* value,
+                         const u8** spk, u32* spklen);
+
+/* Phase A for ONE transaction. Appends to *pool and fills *d. 1 ok / 0 fail. */
+static int tapagg_build(bytepool_t* pool, tapagg_t* d,
+                        tapin_fn get, void* ctx, u64 nin,
+                        const u8* tx, u64 txlen, const char** reason){
+    const u8* op; u64 v; const u8* spk; u32 sl;
+    u64 splen = 0;
+    for (u64 k=0;k<nin;k++){
+        get(ctx, k, &op, &v, &spk, &sl);
+        /* BIP341's aggregate scriptPubKey array encodes each entry's length
+         * in ONE byte, so a >=0xfd prevout script cannot be expressed in it.
+         * An independent literal, deliberately NOT derived from TXV_SPK_CAP
+         * (which is the consensus MAX_SCRIPT_SIZE and much larger). */
+        if (sl >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; return 0; }
+        splen += 1u + sl;
+    }
+    /* strip_witness never grows a transaction (it only drops the marker/flag
+     * and the witness section, and re-serializes everything else verbatim),
+     * so txlen is a sound cap for the stripped copy. */
+    u64 need = nin*36 + nin*8 + splen + txlen;
+    u64 off = bytepool_reserve(pool, need);
+    if (off == ~0ull) { *reason = "out of memory"; return 0; }
+    d->po_off = off;
+    d->am_off = d->po_off + nin*36;
+    d->sp_off = d->am_off + nin*8;
+    d->ns_off = d->sp_off + splen;
+    d->nin    = nin;
+    /* Safe to take addresses now and not before: the single reserve above is
+     * the last thing that can relocate pool->buf until the next transaction. */
+    u8* base = pool->buf;
+    u8* po = base + d->po_off;
+    u8* am = base + d->am_off;
+    u8* sp = base + d->sp_off;
+    u8* ns = base + d->ns_off;
+    u64 w = 0;
+    for (u64 k=0;k<nin;k++){
+        get(ctx, k, &op, &v, &spk, &sl);
+        /* The sizing pass above and this write pass call `get` SEPARATELY, and
+         * `get` is a function pointer -- so "both passes see the same spklen"
+         * is no longer a locally checkable fact. Both adapters read fields that
+         * nothing writes in between, but if that ever stopped being true the
+         * memcpy below would overrun `sp` INTO THE ARENA REGIONS OTHER
+         * TRANSACTIONS' DESCRIPTORS POINT AT -- i.e. a corrupted sighash for an
+         * unrelated transaction, silently. These three checks make the
+         * invariant enforced rather than documented; they cost two compares per
+         * input against a Schnorr verify. Same reasoning for `base`: a future
+         * adapter that allocated would dangle po/am/sp/ns, and this catches it
+         * before the first write of the iteration rather than after. */
+        if (pool->buf != base) { *reason = "internal: taproot arena moved during build"; return 0; }
+        if (sl >= 0xfd || w + 1u + sl > splen) { *reason = "internal: taproot arena sizing pass disagreed"; return 0; }
+        memcpy(po + k*36, op, 36);
+        for (int b=0;b<8;b++) am[k*8+b] = (u8)(v>>(8*b));
+        sp[w++] = (u8)sl;
+        memcpy(sp + w, spk, sl); w += sl;
+    }
+    long nslen = strip_witness(tx, (int64_t)txlen, ns, (long)txlen);
+    if (nslen <= 0) { *reason = "malformed witness (strip failed)"; return 0; }
+    d->nslen = (u64)nslen;
+    return 1;
+}
+
+/* Phase B for ONE taproot input. Pure reader of *pool and *d -- callable
+ * concurrently from any number of worker threads. local_idx is the input's
+ * index WITHIN ITS OWN TRANSACTION, which is what BIP341 commits to. */
+static int tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
+                         const u8* const* wit, const u32* witlen, u32 nwit,
+                         u64 local_idx, const char** reason){
+    const u8* A = pool->buf;
+    const char* r = "p2tr verify failed";
+    if (!taproot_verify_input(spk, wit, witlen, nwit,
+                              A + d->ns_off, (int64_t)d->nslen, (int64_t)local_idx,
+                              A + d->po_off, A + d->am_off, A + d->sp_off,
+                              (int64_t)d->nin, &r)) { *reason = r; return 0; }
+    return 1;
+}
+
 /* Parses the tx's own input list (outpoint/scriptSig) and, if segwit-
  * marked, its per-input witness stacks, into g_txv_in[0..nin). Does not
  * touch outputs (irrelevant to script verification) or resolve any UTXO.
@@ -339,10 +531,36 @@ static const u8* legacy_tx_view(const u8* tx, u64 txlen, u64* out_len){
     if (n <= 0) { *out_len = txlen; return tx; }   /* fall back; sv will reject on a bad hash */
     *out_len = (u64)n; return stripped;
 }
+/* Single-transaction entry point's taproot phase-A state: one descriptor and
+ * one pool, since exactly one transaction is ever in flight here (that is the
+ * whole premise of g_txv_in being a file-scope static). Separate from the
+ * block path's pool so the two can never alias. */
+static bytepool_t g_t1_tap_pool = {0};
+static tapagg_t   g_t1_tap = {0};
+static int        g_t1_tap_built = 0;
+
+/* Adapter: input k of the single-transaction path, resolved by pass 1. */
+static void t1_tapin(void* ctx, u64 k, const u8** outpoint, u64* value,
+                     const u8** spk, u32* spklen){
+    (void)ctx;
+    *outpoint = g_txv_in[k].outpoint;
+    *value    = g_txv_in[k].value;
+    *spk      = g_txv_in[k].spk;
+    *spklen   = g_txv_in[k].spklen;
+}
+
 static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long flags,
                           u8* sv_work, unsigned long sv_workcap, const char** reason){
     txv_rawin_t* in = &g_txv_in[i];
     switch (in->shape){
+    case TXV_SHAPE_P2TR: {
+        /* Phase B. g_t1_tap/g_t1_tap_pool were filled by pass 1c below,
+         * strictly before any worker thread was created, and are read-only
+         * from here on -- so this case is safe to run concurrently. */
+        if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
+        return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
+                             in->wit, in->witlen, in->nwit, i, reason);
+    }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
@@ -356,12 +574,12 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
-    default: /* taproot: handled by pass 2, never dispatched here */
+    default: /* TXV_SHAPE_WPASS: unknown witness version, anyone-can-spend */
         return 1;
     }
 }
 
-/* Below this many non-taproot inputs, spawning threads costs more than it
+/* Below this many inputs, spawning threads costs more than it
  * saves -- pthread_create/join round-trips easily cost single-digit
  * microseconds, comparable to a handful of ECDSA verifies (~115us each per
  * the project's own bench_ecdsa measurement). Chosen conservatively; a real
@@ -398,7 +616,6 @@ static void* txv_worker_thread(void* argp){
                                           * test_scriptverify_thread_stress.c
                                           * was built to catch). */
     for (u64 i=a->lo;i<a->hi;i++){
-        if (g_txv_in[i].shape == TXV_SHAPE_P2TR) { g_txv_results[i].ok = 1; continue; }
         const char* r = 0;
         int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
@@ -407,15 +624,15 @@ static void* txv_worker_thread(void* argp){
     return 0;
 }
 
-/* txv_verify_all(): verify every non-taproot input in g_txv_in[0..nin),
- * in parallel once there's enough work to be worth it. Sequential fallback
- * below TXV_PARALLEL_MIN keeps small (the common case, historically) txs
- * exactly as fast as before with zero thread overhead.
+/* txv_verify_all(): verify EVERY input in g_txv_in[0..nin) -- taproot
+ * included as of 2026-08-23 (PERF_SCOPE.md section 14.7) -- in parallel once
+ * there's enough work to be worth it. Sequential fallback below
+ * TXV_PARALLEL_MIN keeps small (the common case, historically) txs exactly
+ * as fast as before with zero thread overhead.
  * Returns 1 all valid / 0 at least one invalid (reason set). */
 static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long flags,
                           const char** reason){
-    u64 nverify = 0;
-    for (u64 i=0;i<nin;i++) if (g_txv_in[i].shape != TXV_SHAPE_P2TR) nverify++;
+    u64 nverify = nin;
     if (nverify == 0) return 1;
 
     static char rbuf[64];
@@ -423,7 +640,6 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     if (nverify < TXV_PARALLEL_MIN){
         static u8 sv_work[1<<20];
         for (u64 i=0;i<nin;i++){
-            if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
             const char* r = 0;
             if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
                 *reason = r; return 0;
@@ -462,7 +678,6 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     static u8 sv_work_main[1<<20];
     int all_ok = 1;
     for (u64 i=0;i<nin;i++){
-        if (g_txv_in[i].shape == TXV_SHAPE_P2TR) continue;
         if (g_txv_results[i].ok) continue;
         if (g_txv_results[i].reason[0] != 0){
             /* a real, reported failure */
@@ -549,52 +764,42 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
         g_txv_in[i].shape = TXV_SHAPE_LEGACY;
     }
 
-    /* ---- pass 1b: the actual (possibly parallel) crypto verification for
-     * every non-taproot input just classified above. ---- */
+    /* ---- pass 1c (taproot phase A, sequential and cheap): build the BIP341
+     * aggregate-sighash arrays for this transaction BEFORE any verification
+     * thread exists, so pass 1b's workers can read them concurrently.
+     *
+     * Reuses pass 1's already-cached value/spk/spklen instead of re-querying
+     * the UTXO set, which is what the old sequential pass 2 did. The
+     * re-query was documented as "purely out of caution ... to minimize the
+     * diff against the already-proven pre-parallel version"; it returned the
+     * same bytes pass 1 had already copied out, and its extra failure mode
+     * ("missing/already-spent UTXO (pass 2)") was unreachable, since pass 1
+     * had just resolved every one of these outpoints and nothing mutates
+     * UTXO state in between.
+     *
+     * is_tap is likewise gone: pass 1 already set shape == TXV_SHAPE_P2TR
+     * for exactly the inputs the old `is_p2tr(spk, spklen)` retest would
+     * have flagged. The two can only differ when the TAPROOT flag is off for
+     * this block, and in that case has_taproot is 0 and neither this nor the
+     * old pass 2 runs at all (that flag is per-BLOCK, so it cannot differ
+     * between inputs of one transaction -- see TXV_FLAG_TAPROOT's own note
+     * about Core's mainnet exception block 692261). ---- */
+    /* Cleared unconditionally, not inside the `if`. It is true today that
+     * has_taproot == 0 implies no TXV_SHAPE_P2TR input exists (both are set by
+     * the same branch in pass 1), so a stale 1 from the previous transaction
+     * could never be read -- but that is a non-local invariant guarding a
+     * silent failure, and clearing it here costs nothing. */
+    g_t1_tap_built = 0;
+    if (has_taproot){
+        g_t1_tap_pool.used = 0;
+        if (!tapagg_build(&g_t1_tap_pool, &g_t1_tap, t1_tapin, 0, nin, tx, txlen, reason))
+            return 0;
+        g_t1_tap_built = 1;
+    }
+
+    /* ---- pass 1b (taproot phase B): the actual (possibly parallel) crypto
+     * verification for EVERY input classified above, taproot included. ---- */
     if (!txv_verify_all(tx, txlen, nin, flags, reason)) return 0;
-
-    if (!has_taproot) return 1;
-
-    /* ---- pass 2 (sequential, unchanged): taproot key-path inputs, which
-     * need EVERY input's resolved prevout (amount+scriptPubKey) for BIP341's
-     * aggregate sighash. Re-resolves rather than reusing pass 1's cached
-     * copies purely out of caution (pass 1 already has them in g_txv_in, so
-     * this could reuse that directly -- kept as a fresh utxo_lsm_get pass
-     * for now to minimize the diff against the already-proven pre-parallel
-     * version; taproot inputs are the rare case, so the extra lookups cost
-     * little). ---- */
-    static u8 po[TXV_MAX_INPUTS*36];
-    static u8 am[TXV_MAX_INPUTS*8];
-    static u8 sp[TXV_MAX_INPUTS*(1+TXV_SPK_CAP)];
-    static u8 spk34[TXV_MAX_INPUTS][34];
-    static u8 is_tap[TXV_MAX_INPUTS];
-    static u8 ns[8<<20];
-    u64 sp_off = 0;
-    for (u64 k=0;k<nin;k++){
-        memcpy(po + k*36, g_txv_in[k].outpoint, 36);
-        u32 index; memcpy(&index, g_txv_in[k].outpoint+32, 4);
-        u64 value=0, h=0, cb=0; const u8* spk=0; unsigned long spklen=0;
-        long r = utxo_lsm_get(lst, u, g_txv_in[k].outpoint, index, &value, &h, &cb, &spk, &spklen);
-        if (r != 1) { *reason = "input references a missing/already-spent UTXO (pass 2)"; return 0; }
-        for (int b=0;b<8;b++) am[k*8+b] = (u8)(value>>(8*b));
-        if (spklen >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; return 0; }
-        sp[sp_off++] = (u8)spklen;
-        memcpy(sp+sp_off, spk, spklen);
-        sp_off += spklen;
-        if (is_p2tr(spk, (u32)spklen)) { is_tap[k] = 1; memcpy(spk34[k], spk, 34); }
-        else is_tap[k] = 0;
-    }
-    long nslen = strip_witness(tx, (int64_t)txlen, ns, sizeof ns);
-    if (nslen <= 0) { *reason = "malformed witness (strip failed)"; return 0; }
-
-    for (u64 i=0;i<nin;i++){
-        if (!is_tap[i]) continue;
-        const char* tap_reason = "p2tr verify failed";
-        if (!taproot_verify_input(spk34[i], g_txv_in[i].wit, g_txv_in[i].witlen, g_txv_in[i].nwit,
-                                  ns, nslen, (int64_t)i, po, am, sp, (int64_t)nin, &tap_reason)) {
-            *reason = tap_reason; return 0;
-        }
-    }
     return 1;
 }
 
@@ -657,10 +862,19 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
  * detection is a whole-block structural check, separate from and before
  * per-tx script verification, not something this file re-derives.
  *
- * TAPROOT stays exactly as sequential/single-tx-at-a-time as the pass 2
- * above -- rare in practice, and it reuses Phase 1's already-resolved
- * prevout data (value/spk/spklen) instead of re-querying, since Phase 1 has
- * already done that work for every input, taproot included.
+ * TAPROOT (2026-08-23, PERF_SCOPE.md section 14.7) is now dispatched through
+ * the same pool as every other shape, at the same input granularity. What
+ * used to force it sequential was that BIP341's sighash needs WHOLE-
+ * TRANSACTION data (every input's outpoint/amount/scriptPubKey plus the
+ * witness-stripped serialization), which was rebuilt into one reused scratch
+ * arena per transaction. Phase 1.5 below builds that data for every
+ * taproot-bearing transaction in the block ONCE, up front, into a single
+ * per-block arena that is read-only for the whole of Phase 2 -- so no worker
+ * has to rebuild anything and no two workers share a writable byte. See the
+ * TAPROOT AGGREGATE-SIGHASH ARENA comment near the top of this file for the
+ * measurement that picked this axis (96% of taproot-bearing transactions
+ * have exactly ONE taproot input, so the within-transaction axis is worth
+ * approximately nothing).
  * ============================================================================ */
 
 /* bidx_get: exported by daemon/utxo_live.c -- same argument/return shape as
@@ -702,44 +916,9 @@ static void* grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
     return *buf;
 }
 
-/* Packed byte-pool bump allocator, reused across blocks like grow_arena
- * above but bump-reset instead of grown-per-entry -- backs txvb_in_t's
- * spk pointer (see its own comment). Cost is proportional to the block's
- * REAL total prevout-script bytes, not entries*TXV_SPK_CAP. Grows (never
- * shrinks) only when a block's total need exceeds current capacity;
- * *used resets to 0 at the start of every tx_verify_block_connect_all
- * call, so a reused-but-dirty pool from an earlier block is safe -- every
- * byte handed out this call gets freshly memcpy'd, nothing is ever read
- * from an unwritten pool region. */
-typedef struct { u8* buf; u64 cap; u64 used; } bytepool_t;
-static bytepool_t g_spk_pool = {0};
-
-/* Returns the byte OFFSET src was copied to, not a pointer (~0ull on
- * allocation failure) -- 2026-08-20, replacing an earlier pointer-returning
- * version that was a real dangling-pointer bug: a LATER call in the same
- * block's resolve loop can realloc() and relocate pool->buf, silently
- * invalidating every pointer already handed out to EARLIER entries in that
- * same loop (confirmed in production: height 184390's tx=1 legacy input
- * resolved a correct P2PKH scriptPubKey, then failed verification against
- * garbage bytes -- a later input's pool growth had relocated the buffer out
- * from under it). An offset stays valid regardless of relocation; callers
- * must resolve it to an address (pool->buf + offset) only AFTER the pool is
- * done growing for this block, i.e. after Phase 1's resolve loop returns --
- * exactly when every current reader (txvb_verify_one, the taproot pass)
- * already runs. */
-static u64 bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
-    if (pool->used + n > pool->cap){
-        u64 newcap = pool->cap ? pool->cap : 65536;
-        while (newcap < pool->used + n) newcap *= 2;
-        void* p = realloc(pool->buf, newcap);
-        if (!p) return ~0ull;
-        pool->buf = p; pool->cap = newcap;
-    }
-    u64 off = pool->used;
-    memcpy(pool->buf + off, src, n);
-    pool->used += n;
-    return off;
-}
+/* g_spk_pool / bytepool_alloc / bytepool_reserve now live near the top of
+ * this file (just after witpool_reserve), because the single-transaction
+ * entry point's taproot phase A needs a pool too. */
 
 #define TXVB_MAX_WORKERS 64
 
@@ -784,11 +963,26 @@ typedef struct {
                                   * consensus max) regardless of that
                                   * entry's actual (almost always tiny)
                                   * script. */
+    u64 tap_desc;                /* TXV_SHAPE_P2TR only: index into g_tapdesc
+                                  * (== this input's own tx_index) of the
+                                  * BIP341 aggregate-sighash descriptor built
+                                  * for its transaction by Phase 1.5. ~0ull
+                                  * when not built -- checked, not assumed,
+                                  * because reading a stale descriptor would
+                                  * produce a WRONG SIGHASH, which is silent. */
     u8  shape;
 } txvb_in_t;
 
 typedef struct { u8 ok; char reason[64]; } txvb_result_t;
 typedef struct { u64 lo, hi; } txvb_txrange_t;
+
+/* Per-block taproot aggregate-sighash arena + one descriptor per transaction
+ * (indexed by block position, so ntx entries; only taproot-bearing
+ * transactions are ever filled in or read). Written by Phase 1.5 only;
+ * strictly read-only from the moment Phase 2 dispatches. */
+static bytepool_t       g_tap_pool = {0};
+static tapagg_t*        g_tapdesc = 0;
+static u64              g_tapdesc_cap = 0;
 
 /* Parses ONE tx's inputs (+ witnesses) into flat[base..base+nin), mirroring
  * txv_parse's own CompactSize decode exactly (reuses txv_rd_cs directly --
@@ -819,6 +1013,11 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
         e->scriptSig = p; e->scriptSiglen = (u32)sl;
         p += sl + 4;
         e->nwit = 0;
+        e->tap_desc = ~0ull;   /* filled by Phase 1.5 iff this turns out to
+                                * be a taproot input; a stale value from the
+                                * PREVIOUS block's flat array would otherwise
+                                * hand a worker the wrong transaction's
+                                * aggregate sighash data -- silently */
     }
     u64 nout = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_out varint"; return 0; }
     for (u64 i=0;i<nout;i++){
@@ -849,6 +1048,19 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
     return 1;
 }
 
+/* Adapter: input k of ONE transaction on the block path. ctx is &flat[lo],
+ * i.e. that transaction's first entry in the block-wide flat array. Reads
+ * only Phase 1's already-resolved fields; the scriptPubKey comes out of
+ * g_spk_pool, which Phase 1 is done growing by the time this runs. */
+static void txvb_tapin(void* ctx, u64 k, const u8** outpoint, u64* value,
+                       const u8** spk, u32* spklen){
+    const txvb_in_t* in = &((const txvb_in_t*)ctx)[k];
+    *outpoint = in->outpoint;
+    *value    = in->value;
+    *spk      = g_spk_pool.buf + in->spk_off;
+    *spklen   = in->spklen;
+}
+
 /* Mirrors txv_verify_one exactly, reading a caller-supplied entry pointer
  * instead of g_txv_in[i], and in->local_idx (this input's position within
  * ITS OWN tx) instead of a bare loop index for the sighash-position
@@ -861,6 +1073,16 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
      * verification pass. */
     const u8* spk = g_spk_pool.buf + in->spk_off;
     switch (in->shape){
+    case TXV_SHAPE_P2TR: {
+        /* Phase B. g_tapdesc/g_tap_pool were filled by Phase 1.5, strictly
+         * before any worker was dispatched, and are read-only from then on
+         * -- which is what makes this case safe to run concurrently across
+         * transactions. `spk` is exactly the 34-byte P2TR scriptPubKey
+         * (is_p2tr required spklen == 34). */
+        if (in->tap_desc == ~0ull) { *reason = "internal: taproot aggregate not built"; return 0; }
+        return tapagg_verify(&g_tap_pool, &g_tapdesc[in->tap_desc], spk,
+                             in->wit, in->witlen, in->nwit, in->local_idx, reason);
+    }
     case TXV_SHAPE_WV0: {
         const u8* wprog = in->wprog ? in->wprog : spk + in->wprog_off;
         int err = sv_verify_witness_v0(wprog, in->wproglen, in->wit, in->witlen, in->nwit,
@@ -875,7 +1097,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
-    default: /* taproot: handled by the sequential taproot pass, never here */
+    default: /* TXV_SHAPE_WPASS: unknown witness version, anyone-can-spend */
         return 1;
     }
 }
@@ -905,10 +1127,23 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * apply_block_inner no longer calls the single-tx tx_verify_block_connect
  * at all (only tx_verify_block_connect_all), so that path is exercised by
  * tests only, never by the live daemon -- not on the hot path this fixes. */
+/* WORK CLAIMING (2026-08-23): a round used to hand each worker a fixed,
+ * contiguous [lo,hi) slice of the flat array. That was defensible while
+ * every entry was a single ECDSA-ish check of roughly equal cost; it stopped
+ * being so once taproot joined the same round, because per-entry cost now
+ * spans a key-path Schnorr verify, a tapscript execution, and a
+ * zero-work TXV_SHAPE_WPASS entry, and those are not spread evenly through a
+ * block. Workers now pull the next index off one shared counter instead, so
+ * a slice full of expensive inputs cannot leave 31 threads idle. The counter
+ * is the ONLY thing workers share besides the read-only inputs; each still
+ * writes only the res[] slots it claimed, so the disjointness argument in
+ * this section's header is unchanged. */
 typedef struct {
     pthread_t tid;
     sem_t work_sem;
-    txvb_in_t* flat; txvb_result_t* res; unsigned long long flags; u64 lo, hi;
+    txvb_in_t* flat; txvb_result_t* res; unsigned long long flags;
+    u64* next;                 /* shared claim counter for this round */
+    u64  total;                /* one past the last claimable index */
 } txvb_worker_slot_t;
 
 static txvb_worker_slot_t g_txvb_pool[TXVB_MAX_WORKERS];
@@ -928,9 +1163,14 @@ static void* txvb_worker_loop(void* argp){
                                          * whole process-lifetime, not once per
                                          * dispatch round either. */
     for (;;){
+        /* sem_wait/sem_post are the round's memory barriers: everything the
+         * main thread wrote into flat[]/g_spk_pool/g_tap_pool before posting
+         * work_sem is visible here, and everything written into res[] here
+         * is visible to the main thread after it drains g_txvb_done_sem. */
         sem_wait(&w->work_sem);
-        for (u64 i=w->lo;i<w->hi;i++){
-            if (w->flat[i].shape == TXV_SHAPE_P2TR) { w->res[i].ok = 1; continue; }
+        for (;;){
+            u64 i = __atomic_fetch_add(w->next, 1, __ATOMIC_RELAXED);
+            if (i >= w->total) break;
             const char* r = 0;
             int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, &r);
             w->res[i].ok = ok ? 1 : 0;
@@ -958,20 +1198,18 @@ static int txvb_pool_ensure(int need){
     return g_txvb_pool_size;
 }
 
-/* txvb_verify_all: verify every non-taproot input across the WHOLE block's
- * flat array, in parallel once there's enough work to be worth it (same
- * TXV_PARALLEL_MIN threshold and reasoning as above, just measured
- * block-wide instead of per-tx). Always fills res[] completely for every
- * non-taproot entry and returns -- no early exit on the first failure,
- * unlike txv_verify_all -- the caller (tx_verify_block_connect_all's Phase 4)
- * is the single place that scans res[] and decides accept/reject, so the
- * "earliest failing tx in block order" logic exists in exactly one place. */
+/* txvb_verify_all: verify EVERY input across the WHOLE block's flat array --
+ * taproot included as of 2026-08-23 (PERF_SCOPE.md section 14.7) -- in
+ * parallel once there's enough work to be worth it (same TXV_PARALLEL_MIN
+ * threshold and reasoning as above, just measured block-wide instead of
+ * per-tx). Always fills res[] completely and returns -- no early exit on the
+ * first failure, unlike txv_verify_all -- the caller
+ * (tx_verify_block_connect_all's Phase 4) is the single place that scans
+ * res[] and decides accept/reject, so the "earliest failing tx in block
+ * order" logic exists in exactly one place. */
 static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsigned long long flags){
-    u64 nverify = 0;
-    for (u64 i=0;i<total;i++){
-        if (flat[i].shape != TXV_SHAPE_P2TR) { nverify++; res[i].ok=0; res[i].reason[0]=0; }
-        else res[i].ok = 1;
-    }
+    for (u64 i=0;i<total;i++){ res[i].ok=0; res[i].reason[0]=0; }
+    u64 nverify = total;
     if (nverify == 0) return;
 
     if (nverify < TXV_PARALLEL_MIN){
@@ -980,7 +1218,6 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
          * txv_verify_all's own equivalent branch above. */
         static u8 sv_work[1<<20];
         for (u64 i=0;i<total;i++){
-            if (flat[i].shape == TXV_SHAPE_P2TR) continue;
             const char* r = 0;
             int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work, 1<<20, &r);
             res[i].ok = ok?1:0;
@@ -996,14 +1233,14 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
 
     int pool_avail = txvb_pool_ensure(nworkers);
     int nspawn = nworkers < pool_avail ? nworkers : pool_avail;
-    u64 per = (total + (u64)nworkers - 1) / (u64)nworkers;
+    static u64 claim;            /* one round at a time; the pool is not
+                                  * re-entrant and never has been */
+    claim = 0;
     int spawned = 0;
     for (int w=0; w<nspawn; w++){
-        u64 lo = (u64)w*per, hi = lo+per; if (hi>total) hi=total;
-        if (lo >= hi) break;
         txvb_worker_slot_t* slot = &g_txvb_pool[w];
         slot->flat=flat; slot->res=res; slot->flags=flags;
-        slot->lo=lo; slot->hi=hi;
+        slot->next=&claim; slot->total=total;
         sem_post(&slot->work_sem);
         spawned++;
     }
@@ -1014,7 +1251,6 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
      * equivalent fallback sweep. */
     static u8 sv_work_main[1<<20];
     for (u64 i=0;i<total;i++){
-        if (flat[i].shape == TXV_SHAPE_P2TR) continue;
         if (res[i].ok) continue;
         if (res[i].reason[0] != 0) continue;   /* a real reported failure already */
         const char* r = 0;
@@ -1146,86 +1382,51 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         in->shape = TXV_SHAPE_LEGACY;
     }
 
-    /* ---- Phase 2: the actual (parallel) crypto verification for every
-     * non-taproot input in the whole block. ---- */
+    /* ---- Phase 1.5 (taproot phase A): sequential, cheap, and the whole
+     * reason Phase 2 can now take taproot. For every transaction with at
+     * least one taproot input, append its BIP341 aggregate-sighash arrays
+     * (outpoints, amounts, packed scriptPubKeys, witness-stripped tx) to one
+     * per-BLOCK arena and point every taproot input at the descriptor. This
+     * is memcpy plus strip_witness -- not signature work. The arena is
+     * READ-ONLY from the moment Phase 2 dispatches, which is what lets many
+     * transactions' taproot inputs verify concurrently against it. ---- */
+    if (has_taproot) {
+        g_tap_pool.used = 0;
+        tapagg_t* td = grow_arena((void**)&g_tapdesc, &g_tapdesc_cap, ntx*sizeof(tapagg_t));
+        if (!td) { *reason = "out of memory"; *fail_tx_index = 0; goto fail; }
+        for (u64 t=1; t<ntx; t++){
+            u64 lo = ranges[t].lo, hi = ranges[t].hi, nin_t = hi-lo;
+            int tx_has_tap = 0;
+            for (u64 gi=lo; gi<hi; gi++) if (flat[gi].shape == TXV_SHAPE_P2TR) { tx_has_tap = 1; break; }
+            if (!tx_has_tap) continue;
+            if (!tapagg_build(&g_tap_pool, &td[t], txvb_tapin, &flat[lo], nin_t,
+                              txs[t].ptr, txs[t].len, reason)) {
+                *fail_tx_index = t; goto fail;
+            }
+            for (u64 gi=lo; gi<hi; gi++)
+                if (flat[gi].shape == TXV_SHAPE_P2TR) flat[gi].tap_desc = t;
+        }
+    }
+
+    /* ---- Phase 2: the actual (parallel) crypto verification for EVERY
+     * input in the whole block, taproot included. ---- */
     txvb_verify_all(flat, res, total_nin, flags);
 
-    /* ---- Phase 4 (before Phase 3/taproot -- see this section's header
-     * comment for the accepted, documented scoping of "earliest tx" when a
-     * block has BOTH a non-taproot and a taproot problem): first failing
-     * non-taproot input, in block order (flat array order already matches,
-     * since entries are appended tx-by-tx in order). ---- */
+    /* ---- Phase 4: first failing input, in block order (flat array order
+     * already matches, since entries are appended tx-by-tx in order). Now
+     * that taproot rides the same pass, this is genuinely the earliest
+     * failure in the block; the previous code deliberately reported the
+     * earliest NON-taproot failure ahead of any taproot one, because taproot
+     * ran in a separate later pass. Both reject the same blocks -- only the
+     * reported reason/tx index could differ, and only for a block with two
+     * independent failures. ---- */
     for (u64 gi=0; gi<total_nin; gi++){
-        if (flat[gi].shape == TXV_SHAPE_P2TR) continue;
         if (!res[gi].ok) {
             *fail_tx_index = flat[gi].tx_index;
             size_t n = strlen(res[gi].reason); if (n > sizeof(g_rbuf)-1) n = sizeof(g_rbuf)-1;
             memcpy(g_rbuf, res[gi].reason, n); g_rbuf[n] = 0;
             *reason = g_rbuf;
             goto fail;
-        }
-    }
-
-    /* ---- Phase 3: taproot key-path inputs, sequential, one tx at a time,
-     * exactly as tx_verify_block_connect's own pass 2 -- reuses Phase 1's
-     * already-resolved value/spk/spklen instead of re-querying (safe:
-     * nothing mutates UTXO state between Phase 1 and here). ---- */
-    if (has_taproot) {
-        static u8 ns[8<<20];
-        static u8* g_po = 0;      static u64 g_po_cap = 0;
-        static u8* g_am = 0;      static u64 g_am_cap = 0;
-        static u8* g_sp = 0;      static u64 g_sp_cap = 0;
-        static u8 (*g_spk34)[34] = 0; static u64 g_spk34_cap = 0;
-        static u8* g_is_tap = 0;  static u64 g_is_tap_cap = 0;
-        for (u64 t=1; t<ntx; t++){
-            u64 lo = ranges[t].lo, hi = ranges[t].hi, nin_t = hi-lo;
-            int tx_has_tap = 0;
-            for (u64 gi=lo; gi<hi; gi++) if (flat[gi].shape == TXV_SHAPE_P2TR) { tx_has_tap = 1; break; }
-            if (!tx_has_tap) continue;
-
-            /* Persistent, grown-on-demand arenas -- see grow_arena's own
-             * comment above for why (same fix as flat/res/ranges). Sized
-             * per single-tx input count, not block-wide, since taproot
-             * pass 3 stays sequential/single-tx-at-a-time. */
-            u8* po = grow_arena((void**)&g_po, &g_po_cap, nin_t*36);
-            u8* am = grow_arena((void**)&g_am, &g_am_cap, nin_t*8);
-            u8* sp = grow_arena((void**)&g_sp, &g_sp_cap, nin_t*(1+TXV_SPK_CAP));
-            u8 (*spk34)[34] = grow_arena((void**)&g_spk34, &g_spk34_cap, nin_t*34);
-            u8* is_tap = grow_arena((void**)&g_is_tap, &g_is_tap_cap, nin_t);
-            if (!po || !am || !sp || !spk34 || !is_tap) {
-                *reason = "out of memory"; *fail_tx_index = t;
-                goto fail;
-            }
-            u64 sp_off = 0;
-            int tap_fail = 0;
-            for (u64 k=0;k<nin_t;k++){
-                txvb_in_t* in = &flat[lo+k];
-                memcpy(po+k*36, in->outpoint, 36);
-                for (int b=0;b<8;b++) am[k*8+b] = (u8)(in->value>>(8*b));
-                if (in->spklen >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; *fail_tx_index = t; tap_fail = 1; break; }
-                const u8* in_spk = g_spk_pool.buf + in->spk_off;   /* safe: Phase 1 is long done growing the pool */
-                sp[sp_off++] = (u8)in->spklen;
-                memcpy(sp+sp_off, in_spk, in->spklen); sp_off += in->spklen;
-                if (in->shape == TXV_SHAPE_P2TR) { is_tap[k] = 1; memcpy(spk34[k], in_spk, 34); }
-                else is_tap[k] = 0;
-            }
-            if (!tap_fail) {
-                long nslen = strip_witness(txs[t].ptr, (int64_t)txs[t].len, ns, sizeof ns);
-                if (nslen <= 0) { *reason = "malformed witness (strip failed)"; *fail_tx_index = t; tap_fail = 1; }
-                else {
-                    for (u64 k=0;k<nin_t;k++){
-                        if (!is_tap[k]) continue;
-                        txvb_in_t* in = &flat[lo+k];
-                        const char* tap_reason = "p2tr verify failed";
-                        if (!taproot_verify_input(spk34[k], in->wit, in->witlen, in->nwit,
-                                                  ns, nslen, (int64_t)k, po, am, sp, (int64_t)nin_t,
-                                                  &tap_reason)) {
-                            *reason = tap_reason; *fail_tx_index = t; tap_fail = 1; break;
-                        }
-                    }
-                }
-            }
-            if (tap_fail) goto fail;
         }
     }
 

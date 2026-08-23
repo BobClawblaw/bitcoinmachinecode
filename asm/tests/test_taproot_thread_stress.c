@@ -10,18 +10,21 @@
  *   each hashed a blend of both.
  *
  *   That was survivable only because daemon/tx_verify.c refused to use the
- *   worker pool for taproot: both block-connection entry points skip
- *   TXV_SHAPE_P2TR in the parallel pass (tx_verify.c) and verify every taproot
- *   input sequentially afterwards. The file's own header said as much --
+ *   worker pool for taproot: both block-connection entry points skipped
+ *   TXV_SHAPE_P2TR in the parallel pass and verified every taproot input
+ *   sequentially afterwards. The file's own header said as much --
  *   "Global scratch (tagh_buf, tap_preimg) ... is single-threaded" -- which is
  *   an assumption written down rather than enforced, and PERF_SCOPE.md
  *   section 14 measured what it cost: 32 worker threads asleep and one thread
  *   running, on an 85%-idle box, with the main thread 67% field arithmetic
  *   because it was doing every taproot signature by itself.
  *
- *   The buffers are thread-local as of 2026-08-23. This test is what stops
- *   them quietly becoming global again -- and what has to pass before the
- *   P2TR skip may be removed.
+ *   The buffers are thread-local as of 2026-08-23, and both P2TR skips are
+ *   gone with them -- taproot inputs now fan out across the worker pool like
+ *   every other shape (PERF_SCOPE.md section 14.7, tests/
+ *   test_taproot_parallel_arena, tests/test_taproot_block_diff). This test is
+ *   what stops the buffers quietly becoming global again, which would now be
+ *   a live corrupted-sighash bug rather than a latent one.
  *
  * WHAT IT ASSERTS
  *
