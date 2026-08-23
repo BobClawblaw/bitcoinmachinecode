@@ -1198,7 +1198,7 @@ tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSO
 #     /storage/bitcoin-core-source/src/bench/data/block413567.raw
 tests/bench_abi_audit: tests/bench_abi_audit.c tests/bench_abi_guard.S $(CONSOBJS) \
     $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o secp256k1_ecdsa.o \
-    $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o
+    bitcoin_script.o $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_abi_audit.c tests/bench_abi_guard.S \
 	    $(sort $(CONSOBJS) $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o \
 	    secp256k1_ecdsa.o bitcoin_script.o $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o)
