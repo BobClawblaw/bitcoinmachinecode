@@ -2839,6 +2839,11 @@ where the time goes.
 | `main` (taproot sequential) | 3,999 ms | 10,848 ms | **2.72** | 61,950 | 1.00x |
 | + taproot in the pool, static slices | 715 ms | 13,444 ms | 18.80 | 346,300 | **5.59x** |
 | + dynamic work claiming (shipped) | 534 ms | 14,225 ms | **26.62** | 463,600 | **7.49x** |
+| + the sizing/realloc checks below | 537 ms | 14,275 ms | 26.57 | 461,000 | 7.44x |
+
+The last row is the hardening in "Three invariants made enforced rather than
+documented": two compares per input, 0.6% of wall — inside the run-to-run
+spread, and a fair price for turning a silent arena overrun into a refusal.
 
 Dynamic claiming is worth 1.34x of that on its own — with static slices a
 worker that draws a run of tapscript-heavy transactions holds the barrier
