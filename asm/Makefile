@@ -362,6 +362,16 @@ tests/test_txvb_wprog_stable: tests/test_txvb_wprog_stable.c daemon/tx_verify.c 
 # never stands up an LSM, so it touches no files at all.
 tests/test_taproot_exception_block: tests/test_taproot_exception_block.c tests/taproot_exception_vec.h daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS)
 	$(CC) -no-pie -O2 -Wall -I tests -o $@ tests/test_taproot_exception_block.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS) -lpthread
+# bench_taproot_block -- wall time, CPU time and EFFECTIVE PARALLELISM for one
+# whole block's script verification at the entry point the daemon uses. This is
+# the offline, re-runnable form of the measurement PERF_SCOPE.md section 14 took
+# from a live profile (32 workers asleep, ~1 core of 32 in use). Needs the same
+# gitignored fixtures as test_taproot_block_diff; not in `test:` -- it is a
+# benchmark, and a benchmark that runs on a loaded box reports noise.
+# Run: python3 validation/fetch_taproot_blocks.py 825000 &&
+#      make tests/bench_taproot_block && tests/bench_taproot_block 825000 --runs 5
+tests/bench_taproot_block: tests/bench_taproot_block.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS)
+	$(CC) -no-pie -O2 -Wall -o $@ tests/bench_taproot_block.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS) -lpthread
 # test_taproot_block_diff -- whole-block differential against the scratch Core
 # oracle for the PARALLEL taproot path (PERF_SCOPE.md section 14.7). Both entry
 # points, accept AND reject direction, over real taproot-dense blocks at height
