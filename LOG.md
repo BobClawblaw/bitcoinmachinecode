@@ -7,6 +7,76 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- Core parity: unspendable outputs never enter the chainstate; ours held ~252M of them
+
+The heartbeat's `live_utxo=419,779,752` was ~2.5x Core's `txouts=165,847,393`
+at the same height. Not drift, not a bug in the count -- a set-definition gap:
+Core's AddCoin returns early for provably-unspendable scripts (leading
+OP_RETURN, or > MAX_SCRIPT_SIZE=10000 bytes), so they NEVER enter its
+chainstate. Our apply path stored every output and only the differential
+tooling (bitcoin_utxo_stats.asm) filtered them, at read time. The numbers
+already on record from the MuHash run say exactly this:
+
+    raw_txouts          417,948,516   <- what we stored
+    unspendable_txouts  252,101,123   <- what Core refuses to store
+    txouts              165,847,393   <- Core's number
+
+The filter now runs at WRITE time, in both writers -- utxo_live.c's
+live_on_output and build_utxo.c's on_output -- calling the SAME
+utxo_script_unspendable the stats tool uses, so the write path and the
+verification path cannot disagree about the definition. Safety argument:
+spends can never miss a filtered output (referencing one is consensus-invalid,
+so no valid block does), and disconnect/rollback already tolerate an absent
+key (del_created_on_output is get-first). The walker's wnout parity check
+counts parsed outputs, not puts, so it is unaffected.
+
+test_utxo_unspendable pins the boundary cases (empty script SPENDABLE, 10000
+bytes spendable, 10001 not; bare 0x6a and OP_RETURN+payload not) and pushes a
+mixed coinbase through the real apply path: 2 of its 4 outputs land, and the
+live count grows by exactly the 2 Core would count. Heartbeat label renamed
+live_utxo= -> txouts= to mean what it says.
+
+The existing store still carries its ~252M pre-filter entries -- the filter
+only governs new writes. Rebuild from the archive (state moved aside, not
+deleted; undo files kept -- undo records capture spent prevouts, and
+unspendable outputs are never spent, so a rebuild regenerates them
+byte-identical). The rebuilt set is the real deliverable: txouts should equal
+Core's at the same height with NO read-time filtering, and the MuHash should
+match with NO overrides now that incident #29's coinbase overwrite records
+the later duplicate heights naturally.
+
+## 2026-08-23 -- the liveness probe has never measured liveness; it measured how many times it was called
+
+`[addr] only 11 live peer(s) (target 96) -- asking peers for more`, with 4,295
+book entries and 2,048 candidates. The probe DID reach the whole pool (raising
+MUX_MAX_OUT widened its rounds 24 -> 192, 11 rounds x 192 covers 2,048). The
+number that was wrong was `live`: dlc_probe_round had the IDENTICAL
+poll()-first-responder bug fixed in the dial path THE SAME DAY -- one poll()
+call per batch, judged the whole batch on the first return. The tell was the
+arithmetic across two runs: 86 rounds -> 84 "live", 11 rounds -> 11 "live".
+One confirmed peer per call, invariant of batch width, is the signature of an
+instrument counting its own invocations.
+
+Same fix, same shape: poll in rounds until the budget expires, carry readiness
+forward, negate satisfied fds. Measured after restart: **1 round -> 154
+confirmed-live of 2,048** (baseline: 11). The conclusions built on the broken
+number died with it: "the book is stale, ~4% answer" was false, and the
+addr_replenish gossip driven by the phantom shortage is gone from the log.
+
+Lesson, same as bench_abi_audit and bip30_diff before it: a guard (or here, a
+gauge) proves only what it measures. Both poll() sites were written from the
+same wrong model of poll()'s return semantics, and the second survived the
+first one's fix by hours because the fix was applied to the SITE, not to the
+PATTERN. Grepped this time: no further single-poll batch judgments remain.
+
+Also from the same session's review: `mux_redial` neither redialed the same
+host nor made that clear -- it advances to the NEXT pool entry. Renamed
+mux_next_peer, log line now says `leg replaced: connected next pool peer X`.
+And the dl loop now announces `new block: height=N hash=... (+K)` from one
+choke point watching the store tip (hash printed big-endian, so it greps
+against a Core debug.log), instead of leaving new tips implicit in heartbeat
+deltas.
+
 ## 2026-08-23 -- the outbound mux kept one peer of eighty-five, and the knob that should have fixed it was never wired up
 
 First live-network boot. `[dlc] 85 confirmed-live peer(s)` from the seed probe,

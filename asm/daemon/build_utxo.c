@@ -75,6 +75,7 @@ extern long utxo_count(void* u);
 
 extern long utxo_lsm_init(void* lst);
 extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value, u64 height, u64 is_coinbase, const u8* script, u32 slen);
+extern long utxo_script_unspendable(const u8* script, unsigned long slen); /* bitcoin_utxo_stats.asm: Core's IsUnspendable() */
 extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
 extern long utxo_lsm_count(void* lst);
 extern void utxo_lsm_close(void* lst);
@@ -136,6 +137,10 @@ static void on_input(void* ctx, const u8 txid[32], u32 index){
 typedef struct { const u8* txid; u64 height; u64 is_coinbase; } out_ctx_t;
 static void on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u32 slen){
     out_ctx_t* ctx = (out_ctx_t*)ctxv;
+    /* Core parity: same unspendable filter as daemon/utxo_live.c's
+     * live_on_output (see the comment there) -- without it a batch-built
+     * set differs from a live-built one by every OP_RETURN ever mined. */
+    if (utxo_script_unspendable(script, slen)) return;
     g_puts++;
     if (g_dry_run) return;
     long r = utxo_lsm_put(&g_lst, g_utxo, ctx->txid, out_index, value,
