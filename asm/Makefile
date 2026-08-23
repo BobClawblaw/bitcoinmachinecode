@@ -1122,7 +1122,7 @@ tests/test_taproot: tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
 ABICOVOBJS := secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o \
     secp256k1_point.o secp256k1_point_ct.o secp256k1_glv_c.o secp256k1_ecdsa.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_pubkey.o bitcoin_chainwork.o \
-    sha256.o bitcoin_hash.o
+    sha256.o bitcoin_hash.o bitcoin_addr.o ripemd160.o
 tests/test_abi_coverage: tests/test_abi_coverage.c tests/bench_abi_guard.S $(ABICOVOBJS)
 	$(CC) -no-pie -O2 -Wall -o $@ tests/test_abi_coverage.c tests/bench_abi_guard.S $(ABICOVOBJS)
 
