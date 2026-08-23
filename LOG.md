@@ -7,6 +7,74 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- schnorr_verify was not thread-safe: a live FALSE-REJECT on every concurrently-verified taproot key-path input
+
+Found while optimising `secp256k1_schnorr.asm` (PERF_SCOPE.md section 13), by
+reading the file rather than by a failing test -- nothing in the suite called
+`schnorr_verify` from more than one thread. Then reproduced, because "I read
+the code" is not a measurement.
+
+### The bug
+
+`schnorr_verify` built the BIP340 challenge preimage --
+`tagged_hash("BIP0340/challenge", r || pk || m)` -- in a **process-global
+`.data` buffer**, `schnorr_preimg`. `asm/daemon/tx_verify.c` verifies a block's
+inputs on worker threads (`bmc_pthread_create` at `tx_verify.c:451` and
+`:955`). Two taproot key-path inputs verified at the same moment therefore
+wrote over each other's preimage, and each computed the OTHER's challenge `e`.
+
+A wrong `e` gives a wrong `R = s*G - e*P`, so `x(R) != r` and **a perfectly
+valid signature is rejected**. A rejected valid signature inside a block is a
+rejected valid block.
+
+### Reproduced, not inferred
+
+8 threads x 20,000 verifications of the official BIP340 vectors -- signatures
+the same binary accepts single-threaded:
+
+    all 4 fixtures verify single-threaded
+    8 threads x 20000 verifications of KNOWN-GOOD signatures: 1982 FALSE REJECTS
+
+After moving the preimage into `schnorr_verify`'s own stack frame: **0**.
+
+### Direction of the failure, and why that matters
+
+False REJECT, not false accept. For a corrupted preimage to make a signature
+verify, the corrupted challenge would have to be the one that particular
+signature commits to -- a ~2^-256 accident. So this is a liveness / chain-split
+bug rather than a "coins can be stolen" bug. It is also exactly the shape that
+surfaces in a replay as an unexplained "block rejected" and gets blamed on
+something else, which is why it is written down here in full.
+
+### Why the existing tests missed it
+
+The 2026-08-19 thread-local-storage conversion (`bitcoin_scriptverify.c`'s 8
+`__thread` buffers, `bitcoin_interp.asm`'s 6 TLS labels,
+`bitcoin_sighash.asm`'s `legacy_sighash_scfbuf`) went through the interpreter's
+scratch state and had `tests/test_scriptverify_thread_stress.c` written for it.
+It did not reach the secp256k1 layer.
+
+### Fix, and what is NOT fixed
+
+Fixed: the preimage now lives in `schnorr_verify`'s frame (320 bytes), and the
+message length is bounds-checked against that capacity and REJECTED cleanly if
+it does not fit -- previously an over-long message silently overflowed the
+`.data` buffer, the same failure mode `tap_leaf_hash` was hardened against on
+2026-08-21. Consensus only ever passes 32 bytes; BIP340 allows any length and
+the official vectors go to 100.
+
+Regression test: `tests/test_schnorr_thread_stress.c`, in `make test`, and
+`scripts/mutate_check.py`'s `schnorr-preimg-back-to-a-global` mutation, which
+puts the global buffer back and confirms the test fails.
+
+**NOT fixed, same bug class, still live:** `secp256k1_taproot.asm` keeps
+`tagh_buf` (32 B) and `tap_preimg` as process-global scratch -- its own header
+calls them "single-threaded global" -- and they are on the taproot verify path
+(`tagged_hash256`, `tap_branch_hash`, `tap_leaf_hash`, `tap_merkle_root`),
+which the same worker threads reach for every script-path spend. That is a
+separate change with its own tests and is not folded into a performance
+branch.
+
 ## 2026-08-23 -- incident #28: SETcc writes eight bits, and eleven numeric opcodes pushed the OPERAND back
 
 The live replay stopped dead at height 792,980:

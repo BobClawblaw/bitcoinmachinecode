@@ -12,7 +12,7 @@
  *   sha256_1MB     <- SHA256_SHANI            : one CSHA256 over 1,000,000 B
  *                                               (BUFFER_SIZE in crypto_hash.cpp)
  *   sha256_32b     <- SHA256_32b_SHANI        : one CSHA256 over 32 B
- *   sha256d_64Bx1024 <- SHA256D64_1024_SHANI  : 1024 double-SHA256 of 64 B each
+ *   sha256d64_64Bx1024 <- SHA256D64_1024_SHANI : 1024 double-SHA256 of 64 B each
  *                                               (Core's SHA256D64, the merkle
  *                                               pair kernel; batch = 65,536 B)
  *   sha1_1MB       <- SHA1                    : one CSHA1 over 1,000,000 B
@@ -48,6 +48,7 @@
 
 extern void sha256_full(unsigned char out[32], const void* m, long len);
 extern void sha256d(unsigned char out[32], const void* m, long len);
+extern void sha256d64(unsigned char* out, const unsigned char* in, unsigned long pairs);
 extern void sha1_full(unsigned char out[20], const void* m, long len);
 extern void sha512_full(unsigned char out[64], const void* m, long len);
 extern void ripemd160(unsigned char out[20], const void* in, long long len);
@@ -103,12 +104,17 @@ static void run_shape(const char* name, const char* core_name, shape_fn fn,
 
 static void s_sha256_1mb (unsigned char* b){ unsigned char o[32]; sha256_full(o, b, CORE_BUFFER_SIZE); }
 static void s_sha256_32b (unsigned char* b){ unsigned char o[32]; sha256_full(o, b, 32); }
+static unsigned char d64_out[D64_PAIRS * 32];
 static void s_sha256d_64 (unsigned char* b){
+    /* Core's SHA256D64(out, in, 1024): 1024 32-byte digests from 1024 64-byte
+     * inputs, all in one call. `sha256d64` (bitcoin_hash.asm, 2026-08-23) is
+     * the same signature and the same work, so this row is now like for like.
+     * The row below keeps the OLD one-at-a-time shape so the improvement is
+     * visible in the same table rather than only in a commit message. */
+    sha256d64(d64_out, b, D64_PAIRS);
+}
+static void s_sha256d_64_seq (unsigned char* b){
     unsigned char o[32];
-    /* Core's SHA256D64(out, in, 1024) writes 1024 32-byte digests from 1024
-     * 64-byte inputs. The pair kernel is the same work either way; this repo
-     * has no batched 2-way form, so it is 1024 sequential sha256d calls. That
-     * asymmetry is real and is stated in BENCHMARKS.md, not hidden here. */
     for (int i = 0; i < D64_PAIRS; i++) sha256d(o, b + (long)i*64, 64);
 }
 static void s_sha1_1mb   (unsigned char* b){ unsigned char o[20]; sha1_full(o, b, CORE_BUFFER_SIZE); }
@@ -144,7 +150,8 @@ int main(int argc, char** argv){
 
     run_shape("sha256_1MB",       "SHA256_SHANI",           s_sha256_1mb,  buf,   30, CORE_BUFFER_SIZE,     rounds);
     run_shape("sha256_32b",       "SHA256_32b_SHANI",       s_sha256_32b,  buf, 300000, 32,                 rounds);
-    run_shape("sha256d_64Bx1024", "SHA256D64_1024_SHANI",   s_sha256d_64,  buf,  300, 64L*D64_PAIRS,        rounds);
+    run_shape("sha256d64_64Bx1024","SHA256D64_1024_SHANI",  s_sha256d_64,  buf,  300, 64L*D64_PAIRS,        rounds);
+    run_shape("sha256d_seq_x1024","(no Core opposite)",     s_sha256d_64_seq, buf, 300, 64L*D64_PAIRS,      rounds);
     run_shape("sha1_1MB",         "SHA1",                   s_sha1_1mb,    buf,   30, CORE_BUFFER_SIZE,     rounds);
     run_shape("sha512_1MB",       "SHA512",                 s_sha512_1mb,  buf,   30, CORE_BUFFER_SIZE,     rounds);
     run_shape("ripemd160_1MB*",   "BenchRIPEMD160",         s_rmd160_1mb,  buf,   20, CORE_BUFFER_SIZE,     rounds);

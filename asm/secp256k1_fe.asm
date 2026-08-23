@@ -52,7 +52,10 @@ C_CONST:
     dq 0x00000001000003D1   ; C = 2^32 + 977  (fits comfortably in 64 bits)
 
 ; EXP = p - 2 = 2^256 - 2^32 - 979, as 32 little-endian bytes.
-; The exponent used by fe_inv (Fermat a^(p-2)). Kept in this FIRST .rodata
+; NO LONGER READ: fe_inv walked these bits until 2026-08-23 and now uses a
+; fixed addition chain (see its header). Kept because it documents the
+; exponent the chain must equal, and because of the .rodata note below.
+; Kept in this FIRST .rodata
 ; block: splitting .rodata across two blocks in the source caused a link/rip-
 ; relative resolution bug that made fe_inv read the wrong exponent. P_LIMBS and
 ; C_CONST already live here and relocate correctly.
@@ -554,24 +557,94 @@ fe_sqr:
 
 ; ============================================================================
 ; void fe_inv(u64 r[4], const u64 a[4])
-;   r = a^-1 mod p, computed by Fermat's little theorem: a^(p-2) == a^-1 (mod p).
-;   Uses MSB->LSB square-and-multiply over the fixed exponent EXP = p-2,
-;   driven only by the known constant EXP (no secret-dependent branching).
+;   r = a^-1 mod p, by Fermat's little theorem: a^(p-2) == a^-1 (mod p).
 ;
-;   result := a
-;   for each exponent bit from bit 254 down to 0:
-;       result := fe_sqr(result)
-;       if that exponent bit is set:  result := fe_mul(result, a)
-;   r := result
+; WHY THIS WAS REWRITTEN (2026-08-23, PERF_SCOPE.md 13)
+;   The previous body was a naive MSB->LSB square-and-multiply over the 256
+;   bits of EXP = p-2, using fe_mul(R,R,R) for the squarings. p-2 has 247 set
+;   bits, so that is 255 squarings + 248 multiplies = 503 fe_mul calls, and it
+;   measured 4,712 ns on this box (Zen 5) -- 17 % of a whole BIP340 verify,
+;   which is the only remaining inversion on that path.
 ;
-; REGISTER plan (values that must survive the many fe_mul calls live in
-; callee-saved registers, which fe_mul preserves: rbx, r12-r15; rbp too):
-;   r15 = &A_i  (stack local copy of the input a, preserved across calls)
-;   r14 = &R    (stack local accumulator, preserved across calls)
-;   r13 = &EXP  (byte array of EXP = p-2, preserved across calls)
-;   r12 = bit index (254..0), preserved across calls
-;   rbx = scratch for the current exponent byte / mask, preserved across calls
+;   Fermat is kept; only the exponent's ADDITION CHAIN changes. Squarings
+;   cannot be avoided (the exponent is ~2^256), but the 248 multiplies can:
+;   p - 2 = 2^256 - 2^32 - 979 is a long run of 1-bits, so the classical
+;   "build a^(2^k - 1) by doubling k" ladder reaches it in 15 multiplies.
+;   Squarings additionally now go through fe_sqr (10 muls) instead of
+;   fe_mul (16).
+;
+; THE CHAIN, and its proof obligation
+;   Write x_k for a^(2^k - 1). Then x_(j+k) = (x_j)^(2^k) * x_k, which is k
+;   squarings and one multiply. The chain is
+;     x2  = a^2 * a                      (1 sq, 1 mul)
+;     x3  = x2^2 * a                     (1 sq, 1 mul)
+;     x6  = x3^(2^3) * x3                (3 sq, 1 mul)
+;     x9  = x6^(2^3) * x3                (3 sq, 1 mul)
+;     x11 = x9^(2^2) * x2                (2 sq, 1 mul)
+;     x22 = x11^(2^11) * x11             (11 sq, 1 mul)
+;     x44 = x22^(2^22) * x22             (22 sq, 1 mul)
+;     x88 = x44^(2^44) * x44             (44 sq, 1 mul)
+;     x176= x88^(2^88) * x88             (88 sq, 1 mul)
+;     x220= x176^(2^44) * x44            (44 sq, 1 mul)
+;     x223= x220^(2^3) * x3              (3 sq, 1 mul)
+;   and then the low 33 bits of p-2 (…FFFE FFFFFC2D) are spelled out:
+;     t = x223^(2^23) * x22              (23 sq, 1 mul)
+;     t = t^(2^5)   * a                  (5 sq, 1 mul)
+;     t = t^(2^3)   * x2                 (3 sq, 1 mul)
+;     r = t^(2^2)   * a                  (2 sq, 1 mul)
+;   Total 255 squarings + 15 multiplies.
+;
+;   The exponent identity is NOT asserted from memory: the chain is evaluated
+;   symbolically over the integers and checked to equal p-2 exactly, and the
+;   result is checked against the frozen naive-binary fe_inv_ref over 10^6+
+;   random and structured inputs, in tests/test_fe_inv_chain.c.
+;
+; TIMING: the operation sequence is fixed and depends only on the compile-time
+;   constant p, exactly as the old bit-driven loop did (it branched on EXP's
+;   bits, never on a's). So this remains free of input-dependent branching and
+;   is still usable on the secret-scalar paths (bitcoin_keys.asm).
+;
+; a == 0: every step multiplies zeros, so r = 0, the same value the old loop
+;   produced. Callers still must not treat 0 as invertible.
+;
+; FRAME (rbp-relative 32-byte boxes, all below the 5-register save area at
+; rbp-0x08..-0x28, all at or above rsp = rbp-0x120):
+;   A rbp-0x50   X2 rbp-0x70   X3 rbp-0x90   X22 rbp-0xb0   X44 rbp-0xd0
+;   T rbp-0xf0 (the accumulator)             U   rbp-0x110 (x11 / x88 stash)
+;   sub rsp,0xf8 leaves rsp 16-byte aligned at every nested call.
+; REGISTERS: rbx = caller's r[] (fe_mul/fe_sqr preserve it), r12 = squaring
+;   counter. A is copied in FIRST, so r[] may alias a[].
 ; ============================================================================
+
+; --- local expansion helpers; used only by fe_inv, below ---------------------
+%macro FEINV_CPY 2              ; [%1] := [%2]   (32 bytes)
+    mov  rax, [%2 + 0]
+    mov  [%1 + 0], rax
+    mov  rax, [%2 + 8]
+    mov  [%1 + 8], rax
+    mov  rax, [%2 + 16]
+    mov  [%1 + 16], rax
+    mov  rax, [%2 + 24]
+    mov  [%1 + 24], rax
+%endmacro
+
+%macro FEINV_SQN 1              ; T := T^(2^%1),  %1 >= 1
+    mov  r12, %1
+%%sq:
+    lea  rdi, [rbp-0xf0]
+    lea  rsi, [rbp-0xf0]
+    call fe_sqr
+    dec  r12
+    jnz  %%sq
+%endmacro
+
+%macro FEINV_MUL 1              ; T := T * [%1]
+    lea  rdi, [rbp-0xf0]
+    lea  rsi, [rbp-0xf0]
+    lea  rdx, [%1]
+    call fe_mul
+%endmacro
+
 global fe_inv
 fe_inv:
     push rbp
@@ -581,83 +654,67 @@ fe_inv:
     push r13
     push r14
     push r15
-    sub  rsp, 64            ; [rsp+0..31] = A local, [rsp+32..63] = R local
+    sub  rsp, 0xf8              ; rsp = rbp-0x120, 0 mod 16 at nested calls
 
-    ; copy the caller's a[0..3] into the local A[] at [rsp+0]
-    mov rax, [rsi + 0]
-    mov [rsp + 0], rax
-    mov rax, [rsi + 8]
-    mov [rsp + 8], rax
-    mov rax, [rsi + 16]
-    mov [rsp + 16], rax
-    mov rax, [rsi + 24]
-    mov [rsp + 24], rax
+    mov  rbx, rdi               ; caller's r[]; rdi is clobbered by every call
+    FEINV_CPY rbp-0x50, rsi     ; A := a  -- FIRST, so r[] may alias a[]
 
-    ; result := a   (start the accumulator at a^1)
-    lea r15, [rsp + 0]
-    lea r14, [rsp + 32]
-    mov rax, [r15 + 0]
-    mov [r14 + 0], rax
-    mov rax, [r15 + 8]
-    mov [r14 + 8], rax
-    mov rax, [r15 + 16]
-    mov [r14 + 16], rax
-    mov rax, [r15 + 24]
-    mov [r14 + 24], rax
+    ; ---- x2 = a^(2^2-1) = a^3 ----
+    lea  rdi, [rbp-0xf0]
+    lea  rsi, [rbp-0x50]
+    call fe_sqr                 ; T = a^2
+    FEINV_MUL rbp-0x50          ; T = a^3
+    FEINV_CPY rbp-0x70, rbp-0xf0        ; X2 := T
 
-    ; Preserve the caller's output pointer in rbx (callee-saved, so it
-    ; survives every fe_mul call). rdi is caller-saved and is clobbered by the
-    ; call argument setup inside the loop, so it CANNOT hold the output ptr.
-    mov rbx, rdi            ; rbx = caller's r[] output pointer
+    ; ---- x3 = a^(2^3-1) ----
+    FEINV_SQN 1
+    FEINV_MUL rbp-0x50
+    FEINV_CPY rbp-0x90, rbp-0xf0        ; X3 := T
 
-    ; exp byte pointer
-    lea r13, [EXP_BYTES]
+    ; ---- x6, x9, x11 ----
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x90                  ; T = x6
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x90                  ; T = x9
+    FEINV_SQN 2
+    FEINV_MUL rbp-0x70                  ; T = x11
 
-    ; bit index (process 254 down to 0; bit 255 is the implicit leading 1)
-    mov r12, 254
+    ; ---- x22 ----
+    FEINV_CPY rbp-0x110, rbp-0xf0       ; U := x11
+    FEINV_SQN 11
+    FEINV_MUL rbp-0x110                 ; T = x22
+    FEINV_CPY rbp-0xb0, rbp-0xf0        ; X22 := T
 
-.inv_loop:
-    ; --- square the accumulator: R := R^2 mod p ---
-    mov rdi, r14
-    mov rsi, r14
-    mov rdx, r14
+    ; ---- x44 ----
+    FEINV_SQN 22
+    FEINV_MUL rbp-0xb0                  ; T = x44
+    FEINV_CPY rbp-0xd0, rbp-0xf0        ; X44 := T
+
+    ; ---- x88, x176, x220, x223 ----
+    FEINV_SQN 44
+    FEINV_MUL rbp-0xd0                  ; T = x88
+    FEINV_CPY rbp-0x110, rbp-0xf0       ; U := x88
+    FEINV_SQN 88
+    FEINV_MUL rbp-0x110                 ; T = x176
+    FEINV_SQN 44
+    FEINV_MUL rbp-0xd0                  ; T = x220
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x90                  ; T = x223
+
+    ; ---- the low 33 bits of p-2 ----
+    FEINV_SQN 23
+    FEINV_MUL rbp-0xb0
+    FEINV_SQN 5
+    FEINV_MUL rbp-0x50
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x70
+    FEINV_SQN 2
+    mov  rdi, rbx               ; last multiply lands straight in r[]
+    lea  rsi, [rbp-0xf0]
+    lea  rdx, [rbp-0x50]
     call fe_mul
 
-    ; --- determine the current exponent byte and bit ---
-    ;   byte index b = r12 >> 3 ; bit = r12 & 7 ; mask = 1 << bit
-    mov r9, r12
-    shr r9, 3               ; byte index
-    mov rcx, r12
-    and rcx, 7              ; bit position 0..7
-    mov r8, 1
-    shl r8, cl              ; mask = 1 << bit
-
-    ; --- test EXP_BYTES[b] & mask ---
-    mov al, [r13 + r9]
-    test al, r8b             ; test byte & mask (low 8 bits of r8 is the mask)
-    jz .no_mul              ; exponent bit == 0 -> skip the multiply
-
-    ; --- multiply: R := R * A mod p ---
-    mov rdi, r14
-    mov rsi, r14
-    mov rdx, r15
-    call fe_mul
-
-.no_mul:
-    dec r12
-    jns .inv_loop           ; loop while bit index >= 0
-
-    ; --- copy R[] out to the caller's r[] (pointer saved in rbx) ---
-    mov rax, [r14 + 0]
-    mov [rbx + 0], rax
-    mov rax, [r14 + 8]
-    mov [rbx + 8], rax
-    mov rax, [r14 + 16]
-    mov [rbx + 16], rax
-    mov rax, [r14 + 24]
-    mov [rbx + 24], rax
-
-    add rsp, 64
+    add rsp, 0xf8
     pop r15
     pop r14
     pop r13
@@ -665,7 +722,6 @@ fe_inv:
     pop rbx
     pop rbp
     ret
-
 
 ; ----------------------------------------------------------------------------
 ; Non-executable stack marker (consistent with sha256.asm hygiene).
