@@ -851,6 +851,28 @@ tests/test_utxo_lsm: tests/test_utxo_lsm.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 tests/test_utxo_live_count: tests/test_utxo_live_count.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_utxo_live_count.c $(UTXOLSMOBJS)
 
+# ---- UTXO set hash / gettxoutsetinfo (ASSESSMENT.md 4, FEATURE_GAPS.md) ----
+# MuHash3072, byte-compatible with Core's, plus the per-coin filter and
+# serialization that turn our LSM set into a figure comparable with
+# `gettxoutsetinfo`. bitcoin_muhash.o needs sha256.o (SHA256 both as the
+# ChaCha20 key derivation and as the final digest).
+UTXOSTATSOBJS := bitcoin_utxo_stats.o bitcoin_muhash.o sha256.o
+
+# The vectors are GENERATED from Core's own muhash.cpp/chacha20.cpp and
+# committed, so `make test` needs no Core build tree; regenerate with
+# `python3 validation/gen_muhash_vectors.py --out tests/muhash_vectors.h`
+# after a Core upgrade. Not a Makefile rule on purpose: a rule would silently
+# regenerate (or fail) on a machine with no Core checkout, and these are
+# ground truth, not build output.
+tests/test_muhash: tests/test_muhash.c tests/muhash_vectors.h $(UTXOSTATSOBJS)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/test_muhash.c $(UTXOSTATSOBJS)
+
+tests/test_utxo_setinfo: tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS) $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O0 -Itests -o $@ tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
+
+daemon/utxo_setinfo: daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
+	$(CC) $(CFLAGS) -o $@ daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
+
 # Regression test for the 2026-08-20 compaction manifest-ordering bug (see
 # tests/test_compact_manifest_order.c's own header) -- needs manifest_n to
 # exceed COMPACT_MAX_RUNS(64) before compacting, which no other test does.
@@ -1171,9 +1193,14 @@ tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSO
 # preservation, so this class of bug is invisible to it.
 #   make tests/bench_abi_audit && tests/bench_abi_audit \
 #     /storage/bitcoin-core-source/src/bench/data/block413567.raw
+# bitcoin_script.o is in the LINK line below but was missing from these
+# prerequisites, so a fresh tree (no stale .o lying around) failed here with
+# "cannot find bitcoin_script.o" -- it only ever built because some LATER
+# target happened to produce it first. Listed explicitly now; the recipe and
+# the prerequisites must name the same objects.
 tests/bench_abi_audit: tests/bench_abi_audit.c tests/bench_abi_guard.S $(CONSOBJS) \
     $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o secp256k1_ecdsa.o \
-    $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o
+    bitcoin_script.o $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_abi_audit.c tests/bench_abi_guard.S \
 	    $(sort $(CONSOBJS) $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o \
 	    secp256k1_ecdsa.o bitcoin_script.o $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o)
@@ -1431,7 +1458,7 @@ callee-saved-check:
 	    --format summary --check > /dev/null
 
 
-test: abi-check callee-saved-check tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
+test: abi-check callee-saved-check tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_muhash tests/test_utxo_setinfo daemon/utxo_setinfo tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz
 	./tests/test_abi_stack_align
 	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
@@ -1484,6 +1511,8 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_utxo_store
 	./tests/test_utxo_lsm
 	./tests/test_utxo_live_count
+	./tests/test_muhash
+	./tests/test_utxo_setinfo
 	./tests/test_wallet
 	./tests/test_e2e_sighash
 	./tests/test_send

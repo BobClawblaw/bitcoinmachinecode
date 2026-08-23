@@ -152,6 +152,15 @@
 ;                      blob pointer; documented divergence from utxo_get.)
 ;   long utxo_lsm_count(void* lst)                              -> total_live
 ;   long utxo_lsm_reload(void* lst, void* u)          -> replayed count / -1
+;   long utxo_lsm_reload_ro(void* lst, void* u)       -> replayed count / -1
+;                      (identical, except the WAL is opened READ-ONLY and
+;                      utxo.idx is never created -- for tools that inspect a
+;                      datadir they must not modify; see its own comment)
+;   long utxo_lsm_walk(void* lst, void* u, cb, ctx)   -> live count / -1
+;                      (visits the whole live set exactly once each through
+;                      cb(ctx, key36, value, (height<<1)|coinbase, script,
+;                      slen) -- the read side of `gettxoutsetinfo`, built on
+;                      the SAME k-way merge mac_lsm_recount already uses)
 ;   long utxo_lsm_compact(void* lst)      -> 1 ok / 0 nothing-to-do / -1 err
 ;   void utxo_lsm_close(void* lst)
 ;
@@ -248,7 +257,9 @@ extern lsm_mm_invalidate_all
 extern utxo_put
 extern utxo_get
 extern utxo_del
+extern utxo_walk_live
 extern utxo_store_init
+extern utxo_store_init_ro
 extern utxo_store_put
 extern utxo_store_del
 extern utxo_store_reload
@@ -2267,8 +2278,25 @@ mac_flush:
 ;       since they only ever lived in memory) by re-deriving them from the
 ;       WAL's own DEL records.
 ; ============================================================================
+; utxo_lsm_reload_ro(lst=rdi, u=rsi) -- identical to utxo_lsm_reload except
+; that the WAL is opened READ-ONLY (utxo_store_init_ro) and utxo.idx is never
+; created. Everything else in the reload chain -- the manifest read, the run
+; opens, utxo_store_reload's replay, the WAL tombstone rescan, mac_lsm_recount
+; -- is already read-only, so this one substitution is the entire difference.
+; It exists so a set-hash/`gettxoutsetinfo` tool can inspect a datadir it is
+; forbidden to modify (the live replay's `data/`) and still be certain it has
+; changed nothing. A store opened this way is NOT usable for puts or dels:
+; idx_fd is -1 and log_fd is not writable, so any mutation fails loudly rather
+; than silently corrupting a datadir someone else owns.
+global utxo_lsm_reload_ro
+utxo_lsm_reload_ro:
+    mov  edx, 1
+    jmp  mac_lsm_reload_impl
+
 global utxo_lsm_reload
 utxo_lsm_reload:
+    xor  edx, edx
+mac_lsm_reload_impl:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -2282,6 +2310,9 @@ utxo_lsm_reload:
     ; above occupy rbp-0x08..rbp-0x28), so neither survives a call.
     mov  r12, rdi           ; lst
     mov  r13, rsi            ; u
+    mov  [rbp-0x128], rdx    ; read-only flag (see utxo_lsm_reload_ro above).
+                              ; Stashed FIRST: lsm_mm_invalidate_all below is a
+                              ; call, and rdx is caller-saved.
     ; live-count restore locals (see the persist/restore design at
     ; MAGIC_MANIFEST2): [rbp-0x108] has_count (1 if the manifest carried a
     ; persisted total_live), [rbp-0x110] the persisted runs-only base,
@@ -2309,7 +2340,13 @@ utxo_lsm_reload:
     ; store_reload calling convention). Safe to call unconditionally: it
     ; reopens the existing utxo.dat/utxo.idx (O_CREAT|O_RDWR, no truncate).
     mov  rdi, r12
+    cmp  qword [rbp-0x128], 0
+    jne  .rl_init_ro
     call utxo_store_init
+    jmp  .rl_init_done
+.rl_init_ro:
+    call utxo_store_init_ro
+.rl_init_done:
     cmp  rax, 1
     jne  .rl_fail
 
@@ -2537,6 +2574,8 @@ utxo_lsm_reload:
     ; tail (the memtable is that tail replayed), so no delta is added.
     mov  rdi, r12
     mov  rsi, r13
+    xor  edx, edx                 ; cb = NULL -- count only, unchanged behaviour
+    xor  ecx, ecx                  ; ctx
     call mac_lsm_recount
     cmp  rax, -1
     je   .rl_fail
@@ -2646,7 +2685,8 @@ mac_compact_read_rec:
     ret
 
 ; ============================================================================
-; mac_lsm_recount(lst=rdi, u=rsi) -> rax = exact live UTXO count / -1 err
+; mac_lsm_recount(lst=rdi, u=rsi, cb=rdx, ctx=rcx) -> rax = exact live UTXO
+;                                                     count / -1 err
 ;   ONE-TIME baseline recount used by utxo_lsm_reload when the manifest is
 ;   OLD-format (or absent/corrupt) and so carries no persisted total_live.
 ;   Read-only: opens every run, k-way merges them (newest generation wins on
@@ -2663,11 +2703,38 @@ mac_compact_read_rec:
 ;   Reuses the compaction per-run SLOT layout (COMPACT_SLOT_SIZE) and its
 ;   record reader / header reader / key comparator.
 ;
+;   OPTIONAL VISITOR (added 2026-08-23 for the UTXO set hash). `cb` may be
+;   NULL, in which case this behaves exactly as it always has and the count is
+;   the only output. When non-NULL it is invoked ONCE PER LIVE RUN-RESIDENT
+;   ENTRY, at precisely the point the counter increments -- so the visited set
+;   and the counted set cannot drift apart:
+;
+;       void cb(void* ctx, const u8 key36[36], u64 value,
+;               u64 code, const u8* script, u64 slen)
+;
+;   with `code` = (height << 1) | is_coinbase, which is the exact uint32 Core
+;   serializes for a coin (kernel/coinstats.cpp TxOutSer). Packing the two
+;   fields into one argument is what keeps the callback inside six registers,
+;   so no stack argument is needed here or in any implementation of it.
+;
+;   This does NOT visit the memtable's own live entries: those are added to
+;   the count up front as u->n and never enter the merge (that is the whole
+;   shadowing rule below). A caller that needs every live entry must walk the
+;   memtable too -- utxo_lsm_walk does exactly that, and is the only intended
+;   caller of this function with a non-NULL cb.
+;
+;   The callback is invoked through a `sub rsp,8` / `add rsp,8` bracket
+;   because this function's own prologue leaves RSP at 8 mod 16 and the
+;   callee may be C (ENGINEERING_RULES.md 6: bracket the one call that leaves
+;   assembly rather than resizing the frame, which would change the entry
+;   parity every asm callee below already relies on).
+;
 ;   Frame locals (all below the push-save area): -0x30 live  -0x38 mmap_size
 ;   -0x40 loop-i  -0x48 best_idx / slot-base stash  -0x50 winner_slot
 ;   -0xA0..-0x60 run-header out(64)  -0xC0 fmtbuf(20)  -0xF0 winning-key
 ;   snapshot(36)  -0x100 &value -0x108 &height -0x110 &is_coinbase
-;   -0x118 &script -0x120 &slen (utxo_get out-args, values discarded).
+;   -0x118 &script -0x120 &slen (utxo_get out-args, values discarded)
+;   -0x128 cb  -0x130 ctx.
 ; ============================================================================
 mac_lsm_recount:
     push rbp
@@ -2680,6 +2747,8 @@ mac_lsm_recount:
     sub  rsp, 0x140
     mov  r12, rdi                  ; lst
     mov  r13, rsi                  ; u
+    mov  [rbp-0x128], rdx          ; cb (may be 0)
+    mov  [rbp-0x130], rcx          ; ctx
     mov  rax, [r13]                ; u->n = memtable live entries
     mov  [rbp-0x30], rax           ; live = u->n
     mov  r14, [r12+120]            ; manifest_n (run count)
@@ -2862,6 +2931,25 @@ mac_lsm_recount:
 
     inc  qword [rbp-0x30]         ; live++
 
+    ; ---- optional visitor, at exactly the point the counter moves ----
+    cmp  qword [rbp-0x128], 0
+    je   .rc_advance
+    mov  rax, [rbp-0x50]           ; winner slot
+    mov  rdi, [rbp-0x130]          ; ctx
+    lea  rsi, [rbp-0xF0]           ; key36 snapshot (stable across the call)
+    mov  rdx, [rax+80]             ; value
+    mov  ecx, [rax+90]             ; height
+    shl  rcx, 1
+    movzx r10d, byte [rax+94]      ; is_coinbase
+    or   rcx, r10                   ; code = (height<<1) | is_coinbase
+    lea  r8, [rax+104]              ; script
+    movzx r9d, word [rax+88]         ; slen
+    ; RSP is 8 mod 16 here (see the header comment); correct it for this one
+    ; call, which may leave assembly.
+    sub  rsp, 8
+    call qword [rbp-0x128]
+    add  rsp, 8
+
 .rc_advance:
     ; advance every active slot whose current key equals the winning key
     mov  qword [rbp-0x40], 0
@@ -2952,6 +3040,85 @@ mac_lsm_recount:
     pop  r12
     pop  rbx
     pop  rbp
+    ret
+
+; ============================================================================
+; utxo_lsm_walk(lst=rdi, u=rsi, cb=rdx, ctx=rcx) -> rax = live entries
+;                                                    visited / -1 err
+;   The whole live set, exactly once each, through one visitor -- the read
+;   side of `gettxoutsetinfo`.
+;
+;   There is deliberately no second iteration written for this. The k-way
+;   merge in mac_lsm_recount already visits precisely the live run-resident
+;   set (newest generation wins; a key is live iff its newest run record is a
+;   PUSH, it is not currently live in the newer memtable, and it is not
+;   tombstoned this generation), and it has been running in production since
+;   2026-08-22. This function is that merge with its visitor hooked up, plus
+;   utxo_walk_live over the memtable for the entries the merge deliberately
+;   skips -- the ones recount folds in as the up-front u->n. Together those
+;   two are the live set with no overlap:
+;     - a key live in the memtable is emitted by utxo_walk_live, and the merge
+;       skips it (its utxo_get probe hits);
+;     - a key live only in a run is emitted by the merge, and the memtable
+;       does not hold it;
+;     - a key deleted this generation is in tomb_hash, so the merge skips it,
+;       and utxo_del already removed it from the memtable.
+;
+;   The return value is mac_lsm_recount's exact live count, which INCLUDES the
+;   memtable's u->n. As a self-check the memtable walk's own count is compared
+;   against u->n and a disagreement returns -1 rather than a plausible number:
+;   the caller of this function is an acceptance test, and an acceptance test
+;   that can be quietly wrong is worse than one that refuses.
+;
+;   Frame (ENGINEERING_RULES.md 6b prologue: callee-saved pushed BEFORE rbp,
+;   so the save area is at [rbp+8..] and no local can alias it): entry RSP is
+;   8 mod 16, six pushes leave it at 8 mod 16, sub rsp, 0x18 (8 mod 16) brings
+;   it to 0 mod 16 at every call. Locals: [rbp-0x08] cb, [rbp-0x10] ctx.
+; ============================================================================
+global utxo_lsm_walk
+utxo_lsm_walk:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x18
+    mov  r12, rdi                  ; lst
+    mov  r13, rsi                  ; u
+    mov  [rbp-0x08], rdx           ; cb
+    mov  [rbp-0x10], rcx           ; ctx
+
+    ; ---- runs: the existing merge, with the visitor hooked up -------------
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, [rbp-0x08]
+    mov  rcx, [rbp-0x10]
+    call mac_lsm_recount
+    cmp  rax, -1
+    je   .w_err
+    mov  rbx, rax                  ; total live (runs + memtable)
+
+    ; ---- memtable: the entries the merge deliberately does not emit -------
+    mov  rdi, r13
+    mov  rsi, [rbp-0x08]
+    mov  rdx, [rbp-0x10]
+    call utxo_walk_live
+    cmp  rax, [r13]                ; must equal u->n, the count recount used
+    jne  .w_err
+    mov  rax, rbx
+    jmp  .w_ret
+.w_err:
+    mov  rax, -1
+.w_ret:
+    add  rsp, 0x18
+    pop  rbp
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
     ret
 
 ; ============================================================================
