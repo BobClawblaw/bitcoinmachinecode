@@ -65,6 +65,9 @@ extern void sha512_full(void);
 extern void sha512_block(void);
 extern void sha512_init(void);
 extern void ripemd160(void);
+extern unsigned long utxo_struct_size(unsigned long slots);
+extern void utxo_init(void);      /* probed */
+extern void utxo_prefetch(void);  /* probed -- new 2026-08-23 */
 extern void hash160(void);
 extern void merkle_root(void);
 extern void block_hash(void);
@@ -153,6 +156,23 @@ int main(int argc, char** argv){
           "was: state words h2..h4 overlapped its own saved r15/r14 (ripemd160.asm)");
     probe("hash160",     (void*)hash160,     (unsigned long)out, (unsigned long)in, 1000000, 0,
           "was: SHA-256 buffer at rbp-0x30 overlapped saved r13/r14 (bitcoin_addr.asm)");
+
+    printf("\nutxo primitives:\n");
+    {
+        /* utxo_prefetch is new (2026-08-23) and calls utxo_hash internally, so
+         * it gets a poison probe on day one rather than after an incident.
+         * Needs a real initialised table (it dereferences u+8 for the mask). */
+        static unsigned char txid[32];
+        unsigned long slots = 1024;
+        void* u    = calloc(1, utxo_struct_size(slots));
+        void* blob = calloc(1, 4096);
+        if (u && blob){
+            memset(txid, 0x5a, sizeof txid);
+            probe("utxo_init",     (void*)utxo_init,     (unsigned long)u, slots, (unsigned long)blob, 4096, NULL);
+            probe("utxo_prefetch", (void*)utxo_prefetch, (unsigned long)u, (unsigned long)txid, 7, 0,
+                  "new 2026-08-23: home-slot warm ahead of get/del (bitcoin_utxo.asm)");
+        }
+    }
 
     printf("\nblock/merkle primitives:\n");
     {
