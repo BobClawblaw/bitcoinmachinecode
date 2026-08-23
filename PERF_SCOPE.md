@@ -2593,3 +2593,100 @@ triples** — matching ones plus every single-limb perturbation of `X` and of
 * `MK_STAGE` was swept at 1, 2, 4, 8 and 16 only; 32 and 64 need the frame
   offsets recomputed and were not tried. The curve is flat from 8, so this is
   unlikely to matter.
+
+## 14. The bottleneck is not arithmetic, it is serialization — MEASURED, 2026-08-23 02:30, height ~797,000
+
+Every projection in §11–§13 assumed the verifier's cost is spread across the
+worker pool. It is not. Measured on the live daemon, on a quiet box (load 6.9,
+system 85% idle, iowait 2–3%):
+
+    thread states, verification worker (pid 3459575):   32 sleeping,  1 running
+    effective parallelism:                              ~1 core of 32
+
+Thirty-three threads exist. The main thread runs; the thirty-two workers sleep.
+
+### 14.1 Where the main thread's time goes
+
+`perf record -F 999 -g -t <main tid>`, 24,893 samples, 30s:
+
+| symbol | share of main thread |
+|---|---|
+| `fe_mul.reduce` | 33.52% |
+| `fe_mul` | 14.02% |
+| `fe_sqr` | 11.54% |
+| `point_double` | 8.24% |
+| `sha256_block_shani` | 3.38% |
+| `lsm_run_lookup_mm` | 2.13% |
+
+**67.3% of the main thread is field/EC arithmetic** — i.e. signature
+verification. The whole-process profile (48,365 samples) agrees: 53.8% field
+arithmetic, ~63% including the EC layer, and SHA-256 only 5.53%.
+
+### 14.2 Why: the workers refuse taproot on purpose
+
+Both worker loops in `daemon/tx_verify.c` skip P2TR outright —
+
+    if (g_txv_in[i].shape == TXV_SHAPE_P2TR) { g_txv_results[i].ok = 1; continue; }   /* single-tx */
+    if (w->flat[i].shape  == TXV_SHAPE_P2TR) { w->res[i].ok  = 1; continue; }         /* batch    */
+
+— and every taproot input is then verified in a sequential loop after the
+threads join, at both entry points (`tx_verify.c:593` and `:1220`). The code
+says so: *"taproot pass 3 stays sequential/single-tx-at-a-time"*.
+
+That is not a scheduling choice. It is a workaround for shared mutable state:
+`secp256k1_taproot.asm` keeps `tagh_buf` in `.data` and `tap_preimg` in `.bss`
+as process-global scratch, and its own header still asserts the assumption that
+made that safe — *"Global scratch (tagh_buf, tap_preimg) used by the small
+helpers is single-threaded."* Every taproot sighash, key-path included, is
+built in that one shared buffer (`bitcoin_taproot_sighash.c:576` calls
+`tagged_hash256(out32, "TapSighash", 10, pre, prelen)`).
+
+This is the third time tonight a written-down assumption turned out to be a
+scheduled outage; incidents #22 and #26 were both preceded by an explicit
+"known divergence, deliberately left" note. **A documented assumption needs a
+test that fails when it stops being true, or it needs fixing.**
+
+### 14.3 What this means for §11–§13
+
+§13 took Schnorr from 3.35x to ~1.2x vs Core and SHA-256d/merkle to ~1.17x.
+That work is real and correctly measured. But it reduced **per-signature cost
+on a path that runs on one core**, while Core verifies taproot across its
+script-check thread pool. The remaining gap to Core is now mostly that we do
+not.
+
+It also explains the projection §13.4 could not make land: Schnorr's end-to-end
+effect was computed as "~1.00x and meaningless" against a profile that predates
+taproot density. The projection assumed a parallel execution that is not
+happening.
+
+**Ordering consequence: parallelising the taproot pass comes before any further
+`fe_mul` work.** A 1.15x on 54% of one core is worth far less than moving that
+work onto 32. `fe_mul` stays the right target afterwards, when it multiplies
+against a parallel baseline instead of a serial one.
+
+### 14.4 The blocker, and the shape of the fix
+
+`tap_leaf_hash` is the only one of the four helpers that needs a large buffer:
+BIP342 puts no cap on tapscript size, so `TAP_PREIMG_CAP` is 4 MiB and the true
+bound is the block size itself. Shrinking it would trade a latent bug for a
+false reject. `tagged_hash256` (64 + msglen) and `tap_branch_hash` (+64..+128)
+are small.
+
+Naive TLS therefore costs 4 MiB x up to `TXVB_MAX_WORKERS` (64) = 256 MiB of
+`.tbss`. The codebase already has the better idiom: worker threads receive
+`sv_work, 1<<20` as a **parameter** rather than reaching for a global. Threading
+a caller-provided scratch pointer through the four helpers removes the global,
+removes the latent race, and lets the P2TR skip in both worker loops be deleted.
+
+### 14.5 Not verified
+
+* The end-to-end win is **not** measured — only the headroom (31 idle cores and
+  a main thread that is 67% signature crypto). Whether the catch-up loop can
+  actually feed 32 workers is a separate question from whether the verifier can
+  use them, and the UTXO apply is sequential regardless.
+* An earlier parallelism sample read 1.90 cores rather than ~1.0; that window
+  was contaminated by concurrent agent load. The 32-sleeping/1-running thread
+  census is the reliable measurement, and it was taken on the quiet box.
+* The taproot share of total verification at height ~797,000 was not counted
+  directly (no per-shape input census); it is inferred from the main thread
+  being 67% field arithmetic and the workers being the only other consumer.
