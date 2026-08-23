@@ -10,7 +10,28 @@ LOG
 ## 2026-08-23 -- incident #30: BIP30 has a differential test against Core, a shim, and a smoke test. The daemon does not implement it.
 
 Found while investigating incident #29 (a BIP30 duplicate coinbase keeping the
-pre-overwrite height). The height was the symptom. This is the cause.
+pre-overwrite height).
+
+> **Correction, 2026-08-23 05:05, before this was acted on.** This entry was
+> first written claiming the daemon accepts, for ANY height, a block Core
+> rejects as `bad-txns-BIP30`, and that #30 was the *cause* of #29. Both
+> overstated. Reading `src/validation.cpp` instead of recalling it:
+>
+> * Core's gate is `fEnforceBIP30 = fEnforceBIP30 && (!pindexBIP34height ||
+>   !(pindexBIP34height->GetBlockHash() == params.GetConsensus().BIP34Hash))`,
+>   then `if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT)`.
+>   Mainnet `BIP34Height = 227931` and `BIP34_IMPLIES_BIP30_LIMIT = 1983702`,
+>   so **Core does not run the BIP30 check for mainnet heights 227,932 ..
+>   1,983,701** either. Through that whole range -- which is where the replay
+>   is -- we and Core agree by both not checking. The divergence window is
+>   heights <= 227,931 and >= 1,983,702, not "any block".
+> * #30 is NOT the cause of #29. They are independent. #29 is governed by
+>   `AddCoins`, quoted below, which never consults BIP30 at all.
+>
+> The gap is still real and still in the false-accept direction; it is just
+> bounded to a range the chain has long since passed and cannot re-enter
+> without a ~600,000-block reorg. Severity: low. Worth fixing for
+> completeness and for any non-mainnet chain, not urgently.
 
 ### What is enforced, and where
 
@@ -46,13 +67,25 @@ to the height), which is presumably why nothing has ever surfaced it -- but
 Core enforces the rule unconditionally, and "hard to reach" is not the standard
 this project holds itself to for the false-accept direction.
 
-It also fully explains incident #29. Our BIP30 duplicate keeps height 91,722 /
-91,812 where Core's `AddCoin(..., possible_overwrite=true)` holds 91,880 /
-91,842 -- not because a BIP30 handler mishandles the exception, but because
-there is no BIP30 handler. `utxo_lsm_put` silently declined to overwrite, the
-return value was never inspected, and the only instrument in the project that
-could see the difference was the MuHash set hash (count, amount and bogosize
-are all blind to a height field).
+### Incident #29 is a separate, much narrower thing (corrected)
+
+`src/coins.cpp`, `AddCoins` -- the connect path, reached from `ConnectBlock`
+via `AddCoins(inputs, tx, nHeight)` with `check_for_overwrite` defaulted false:
+
+    bool overwrite = check_for_overwrite ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
+    // Coinbase transactions can always be overwritten, in order to correctly
+    // deal with the pre-BIP30 occurrences of duplicate coinbase transactions.
+    cache.AddCoin(COutPoint(txid, i), Coin(tx.vout[i], nHeight, fCoinbase), overwrite);
+
+So **Core overwrites unconditionally for every coinbase output**, at every
+height, with no reference to BIP30 whatsoever. That is the entire mechanism by
+which its chainstate ends up holding 91,880 / 91,842.
+
+Our `utxo_lsm_put` declines on an existing key and the apply path discards the
+return (`if (r == -1 || r == 2) ctx->fatal = 1;`), so the earlier height
+survives. The fix is correspondingly narrow -- **a coinbase output's put must
+overwrite** -- and it is not a BIP30 change. It was only ever visible to the
+MuHash set hash; count, amount and bogosize are all blind to a height field.
 
 ### What to take from it
 
