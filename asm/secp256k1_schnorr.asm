@@ -30,7 +30,7 @@
 ;     R         -0x240 (96)   z3         -0x280 (32)
 ;     zi        -0x2a0 (32)   yr         -0x2e0 (32)
 ;     taghash   -0x340 (32)   digest     -0x320 (32)
-;     keyscratch -0x362 (34)
+;     keyscratch -0x362 (34)  preimg     -0x372 .. -0x4b2 (320, ASCENDING)
 ;   (the z2, xr and xBE boxes retired with the projective x compare, which now
 ;    lives in schnorr_x_eq_r and keeps its own two scratch slots)
 ;   Frame = sub rsp, 0x368 (==8 mod16 -> rsp 0 mod16 at calls after 6 pushes).
@@ -39,6 +39,24 @@
 ;   lift_x via pubkey_parse on 33-byte [0x02||pk] (even-Y root).
 ;
 ;   System V ABI. Preserve rbx,r12-r15.
+;
+;   THREAD SAFETY (fixed 2026-08-23, and it was a live false-reject bug)
+;   The tagged-hash preimage used to be a process-global `.data` buffer
+;   (`schnorr_preimg`). daemon/tx_verify.c verifies a block's inputs on
+;   several worker threads, so two taproot key-path inputs verified at the
+;   same time interleaved their writes into it and computed each other's
+;   challenge e. The result is a WRONG e, hence a wrong R, hence a REJECTED
+;   valid signature -- and a rejected valid signature in a block is a rejected
+;   valid block. Reproduced at 1,982 false rejects in 160,000 verifications of
+;   KNOWN-GOOD signatures across 8 threads; tests/test_schnorr_thread_stress.c
+;   is that reproducer. The buffer now lives in this function's own frame, so
+;   every call has its own.
+;
+;   The 2026-08-19 TLS conversion (bitcoin_scriptverify.c, bitcoin_interp.asm,
+;   bitcoin_sighash.asm) covered the interpreter's scratch and missed this one.
+;   It also missed secp256k1_taproot.asm's `tagh_buf` and `tap_preimg`, which
+;   are still process-global and still on the taproot verify path -- SAME BUG,
+;   not fixed here, see that file.
 ; ============================================================================
 default rel
 
@@ -66,7 +84,10 @@ extern sha256_full
 %define DIGEST     -0x330
 %define TAGHASH    -0x350
 %define KEYSCR     -0x372
-%define FRAME      0x388
+%define PREIMG     -0x4b2          ; 320 bytes: tagh||tagh||r||pk||msg
+%define PREIMG_CAP 320
+%define MSG_CAP    (PREIMG_CAP - 128)
+%define FRAME      0x4c8
 
 section .rodata
 align 16
@@ -79,10 +100,6 @@ align 16
 CHALLENGE_TAG:
     db "BIP0340/challenge"
 CHALLENGE_TAG_LEN equ $ - CHALLENGE_TAG
-
-section .data
-align 16
-schnorr_preimg: times 320 db 0
 
 section .text
 
@@ -174,7 +191,22 @@ schnorr_verify:
     mov r12, rdi
     mov r13, rsi
     mov r14, rdx
-    mov r15, rcx
+    movsxd r15, ecx           ; msglen is an int; sign-extend before using it
+                              ; as a rep-movsb count
+
+    ; ---- msglen bound (2026-08-23) --------------------------------------
+    ; The challenge preimage is 128 fixed bytes plus the message, and it now
+    ; lives in this frame rather than in a process-global buffer (see below),
+    ; so an unchecked length would smash the stack instead of quietly
+    ; corrupting .data. Consensus only ever passes 32 (the taproot sighash);
+    ; BIP340 itself allows any length and the official vectors go up to 100.
+    ; Anything that does not fit is REJECTED, loudly and without hashing --
+    ; the same "clean rejection rather than silent truncation" rule
+    ; secp256k1_taproot.asm's tap_leaf_hash already follows.
+    cmp r15, 0
+    jl  .invalid
+    cmp r15, MSG_CAP
+    ja  .invalid
 
     ; ---- P = lift_x(pk) via pubkey_parse([0x02||pk],33,P_aff) ----
     mov byte [rbp+KEYSCR], 0x02
@@ -257,30 +289,30 @@ schnorr_verify:
     lea rsi, [rel CHALLENGE_TAG]
     mov rdx, CHALLENGE_TAG_LEN
     call sha256_full
-    ; preimg = tagh||tagh||r_BE||pk||m  at schnorr_preimg (192 bytes)
-    lea rdi, [rel schnorr_preimg]
+    ; preimg = tagh||tagh||r_BE||pk||m  in the STACK frame (see PREIMG)
+    lea rdi, [rbp+PREIMG]
     lea rsi, [rbp+TAGHASH]
     mov rcx, 32
     rep movsb
-    lea rdi, [rel schnorr_preimg+32]
+    lea rdi, [rbp+PREIMG+32]
     lea rsi, [rbp+TAGHASH]
     mov rcx, 32
     rep movsb
-    lea rdi, [rel schnorr_preimg+64]
+    lea rdi, [rbp+PREIMG+64]
     mov rsi, r12              ; r big-endian bytes = sig[0:32]
     mov rcx, 32
     rep movsb
-    lea rdi, [rel schnorr_preimg+96]
+    lea rdi, [rbp+PREIMG+96]
     mov rsi, r13              ; pk
     mov rcx, 32
     rep movsb
-    lea rdi, [rel schnorr_preimg+128]
+    lea rdi, [rbp+PREIMG+128]
     mov rsi, r14              ; msg
     mov rcx, r15              ; msglen
     rep movsb
     ; digest = SHA256(preimg[0 .. 128+msglen]) -> DIGEST ; e limbs at E_SLIMS
     lea rdi, [rbp+DIGEST]
-    lea rsi, [rel schnorr_preimg]
+    lea rsi, [rbp+PREIMG]
     mov rdx, r15
     add rdx, 128
     call sha256_full
