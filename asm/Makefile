@@ -1063,6 +1063,16 @@ TAPRIMSOBJS := secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k
     secp256k1_scalar_c.o sha256.o bitcoin_pubkey.o
 tests/test_schnorr: tests/test_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
+# BIP340 differential vs Bitcoin Core (PERF_SCOPE.md 13). The corpus's expected
+# verdicts come from libsecp256k1 through validation/core_verify_oracle.cpp's
+# SCHNORR command; regenerate with the command in schnorr_diff_vec.h's header.
+tests/test_schnorr_diff: tests/test_schnorr_diff.c tests/schnorr_diff_vec.h secp256k1_schnorr.o $(TAPRIMSOBJS)
+	$(CC) -no-pie -O2 -o $@ tests/test_schnorr_diff.c secp256k1_schnorr.o $(TAPRIMSOBJS)
+# schnorr_verify from many threads at once. This is the harness that caught the
+# process-global challenge-preimage buffer (a live FALSE-REJECT bug on taproot
+# key-path inputs, which tx_verify.c verifies on worker threads).
+tests/test_schnorr_thread_stress: tests/test_schnorr_thread_stress.c secp256k1_schnorr.o $(TAPRIMSOBJS)
+	$(CC) -no-pie -O2 -pthread -o $@ tests/test_schnorr_thread_stress.c secp256k1_schnorr.o $(TAPRIMSOBJS) -lpthread
 tests/test_taproot: tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_taproot.c secp256k1_taproot.o $(TAPRIMSOBJS)
 
@@ -1160,6 +1170,11 @@ tests/bench_hash_core: tests/bench_hash_core.c tests/bench_abi_guard.S sha256.o 
 	$(CC) $(CFLAGS) -o $@ tests/bench_hash_core.c tests/bench_abi_guard.S sha256.o sha1.o sha512.o ripemd160.o bitcoin_hash.o
 
 # bench_merkle -- merkle root over 9,001 leaves, Core's MerkleRoot leaf count.
+# The batched merkle inner-node hash (PERF_SCOPE.md 13.2) against the
+# one-node-at-a-time algorithm it replaced, over every leaf count 1..2050.
+tests/test_merkle_batch: tests/test_merkle_batch.c bitcoin_hash.o sha256.o
+	$(CC) $(CFLAGS) -o $@ tests/test_merkle_batch.c bitcoin_hash.o sha256.o
+
 tests/bench_merkle: tests/bench_merkle.c bitcoin_hash.o sha256.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_merkle.c bitcoin_hash.o sha256.o
 
@@ -1441,7 +1456,7 @@ callee-saved-check:
 	    --format summary --check > /dev/null
 
 
-test: abi-check callee-saved-check tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul \
+test: abi-check callee-saved-check tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz
 	./tests/test_abi_stack_align
 	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
@@ -1509,10 +1524,13 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_tapscript_interp
 	./tests/test_sigops
 	./tests/test_schnorr tests/bip340_test_vectors.csv
+	./tests/test_schnorr_diff
+	./tests/test_schnorr_thread_stress tests/bip340_test_vectors.csv
 	./tests/test_taproot
 	./tests/test_taproot_sighash
 	./tests/test_taproot_scriptpath
 	./tests/test_witness_commitment
+	./tests/test_merkle_batch
 	./tests/test_mul_carry_regression
 	./tests/test_fe_repr
 	./tests/test_fe_inline
