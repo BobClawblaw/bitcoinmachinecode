@@ -65,6 +65,7 @@ extern void utxo_lsm_close(void* lst);
  * (value + scriptPubKey, read out of the LSM immediately before the delete)
  * into undo_<height>.dat, which is what makes a later DISCONNECT of that
  * block possible at all. */
+extern long utxo_script_unspendable(const u8* script, unsigned long slen); /* bitcoin_utxo_stats.asm: Core's IsUnspendable() */
 extern long undo_capture_and_del(void* lst, void* u, long height,
                                  const u8 txid[32], u32 index);
 extern long undo_discard(long height);
@@ -347,6 +348,18 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
 
 static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u32 slen){
     apply_ctx_t* ctx = (apply_ctx_t*)ctxv;
+    /* Core parity: AddCoin returns early for provably-unspendable scripts
+     * (leading OP_RETURN, or script > MAX_SCRIPT_SIZE=10000) -- they NEVER
+     * enter Core's chainstate, at any height. Until 2026-08-23 we stored
+     * them (~252M of ~419M entries at tip 963,762), so live_utxo read
+     * ~2.5x Core's txouts and the set was only comparable through the
+     * stats-time filter. Filter shared with the differential tooling:
+     * bitcoin_utxo_stats.asm's utxo_script_unspendable, which mirrors
+     * Core's IsUnspendable() exactly. Spends can never miss (referencing
+     * an unspendable output is consensus-invalid, so no valid block does),
+     * and disconnect/rollback already tolerate the absent key
+     * (del_created_on_output is get-first, "only delete what is there"). */
+    if (utxo_script_unspendable(script, slen)) return;
     /* g_apply_height is already the right value here -- live_on_input uses
      * the same global for undo_capture_and_del above -- and g_apply_height
      * is always >= 0 by the time apply_block_inner runs (set by its sole
