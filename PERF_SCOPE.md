@@ -2900,6 +2900,12 @@ projected.** That is the whole reason 14.7 exists.
    inputs x25 runs, 46 in-place corruption rejects with exact blame, and the
    single-transaction path over all 23 fixture transactions in both directions.
 
+**Soaked, because the bug class is scheduling-dependent.** With 32 spinners
+saturating the box: the arena fixture 40 times, 0 failures; and 600 whole-block
+accepts (100 runs each over blocks 825,000 / 825,010 / 840,003 / 870,004 /
+850,000 / 860,000), 0 rejects. A scheduling-dependent corruption that survives
+that is not one a single run would have found.
+
 **Two corpus facts that broke the first version of the probes**, recorded
 because both are easy to get wrong again:
 
@@ -2944,6 +2950,16 @@ never checked does.
   clusters, not a chain.
 * **Constant-time behaviour.** `tests/test_scalarmul_ct` was not re-run for
   this change; nothing here touches the scalar-multiply path.
+* **Taproot spending a SAME-BLOCK output.** The differential passes
+  `bx = NULL`, so every prevout resolves through `utxo_lsm_get`; the live
+  daemon resolves in-block chained spends through `bidx_get` first. Both write
+  the same `value`/`spk_off` fields that Phase A then reads, so the exposure is
+  small, but it is reasoned rather than measured. `tests/test_cross_tx_verify`
+  covers `bidx_get` with non-taproot scripts only.
+* **The `>= 0xfd` prevout-script guard on the taproot path.** Carried over
+  verbatim, and no real block in the corpus has a prevout script that large on
+  a taproot-bearing transaction, so the reject is untested here as it was
+  before.
 * **Memory under adversarial blocks.** The arena is bounded by roughly
   `sum(stripped tx bytes) + 44*inputs` over taproot-bearing transactions, a
   few MB per block, and it is bump-reset per block — but that bound was

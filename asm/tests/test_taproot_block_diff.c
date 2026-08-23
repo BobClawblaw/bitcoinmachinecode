@@ -477,8 +477,15 @@ static int run_height(int H, int repeats, int block_reject_samples){
 int main(int argc, char** argv){
     int repeats = 8, samples = 48;
     const char* e;
+    /* TBD_REPEATS/TBD_SAMPLES exist so this harness can also be run as a
+     * soak (many accept runs, few reject samples). Clamped, not trusted:
+     * samples reaches a divisor in pass D, and TBD_SAMPLES=0 used to be a
+     * SIGFPE. A test harness that dies on its own knob is a test harness
+     * whose "no output" gets read as "passed". */
     if ((e = getenv("TBD_REPEATS"))) repeats = atoi(e);
     if ((e = getenv("TBD_SAMPLES"))) samples = atoi(e);
+    if (repeats < 1) repeats = 1;
+    if (samples < 1) samples = 1;
     int nrun = 0, nskip = 0;
     if (argc < 2){
         printf("SKIP: no heights given (usage: %s <height>...)\n", argv[0]);
