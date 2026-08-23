@@ -564,10 +564,22 @@ tap_merkle_root:
     mov  rsi, r13
     mov  rcx, 32
     rep movsb
-    ; i lives on the stack at rbp-0x10 (survives nested calls)
-    mov  qword [rbp-0x10], 0
+    ; i lives on the stack, in the frame's own reserved area at rsp+0x18
+    ; (survives nested calls; rsp is not touched between the prologue's
+    ; `sub rsp,0x28` and the epilogue's `add rsp,0x28`).
+    ;
+    ; It was at rbp-0x10 until 2026-08-23, which ALIASED SAVED r12. The
+    ; prologue is `push rbp / mov rbp,rsp / and rsp,-16 / push rbx /
+    ; push r12 / ...`: because the callee-saved pushes happen AFTER
+    ; `and rsp,-16`, the distance from rbp down to them depends on the
+    ; CALLER's alignment. With no padding, saved rbx landed at rbp-0x08
+    ; and saved r12 at exactly rbp-0x10 -- so writing the loop counter
+    ; here overwrote it and `pop r12` returned the counter. Measured: a
+    ; caller got r12 = 0/1/2/3 for control blocks with 0/1/2/3 siblings.
+    ; Pinned by tests/test_abi_coverage.
+    mov  qword [rsp+0x18], 0
 .mloop:
-    mov  r9, [rbp-0x10]
+    mov  r9, [rsp+0x18]
     cmp  r9, r15
     jae  .mdone
     ; sibling = control + 33 + i*32
@@ -626,9 +638,9 @@ tap_merkle_root:
     add  rsi, 224
     mov  rcx, 32
     rep movsb
-    mov  rax, [rbp-0x10]
+    mov  rax, [rsp+0x18]
     inc  rax
-    mov  [rbp-0x10], rax
+    mov  [rsp+0x18], rax
     jmp  .mloop
 .mdone:
     mov  rdi, r12
