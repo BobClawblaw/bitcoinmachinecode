@@ -2985,7 +2985,12 @@ never checked does.
   ("REJECT h=481827 tx=12: bad-txns-BIP30, output 32 already unspent"). A
   seeder must drop any prevout whose funding txid appears in the block. Not
   fixed here — unrelated to taproot, and the fixture is not committed.
-* **Memory under adversarial blocks.** The arena is bounded by roughly
-  `sum(stripped tx bytes) + 44*inputs` over taproot-bearing transactions, a
-  few MB per block, and it is bump-reset per block — but that bound was
-  reasoned, not fuzzed.
+* **Memory under adversarial blocks** was reasoned and then checked against
+  the corpus, but not fuzzed. Measured maximum over the 38 fixture blocks:
+  **2.29 MB** (height 840,000). The adversarial ceiling is small for a reason
+  worth stating: `tapagg_build` rejects any prevout script `>= 0xfd` on a
+  taproot-bearing transaction (BIP341's aggregate array has a one-byte length
+  field), so `sp` costs at most 253 B/input, not `TXV_SPK_CAP`. An input costs
+  at least 41 wire bytes, so a 4,000,000-byte block carries at most ~97,600 of
+  them, giving `(36+8+253) * 97,600 + 4 MB ≈ 33 MB` — bounded, bump-reset per
+  block, and bounded by data the block-level checks already accepted.
