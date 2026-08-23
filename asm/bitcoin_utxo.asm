@@ -287,6 +287,7 @@ utxo_get:
     mov  rdx, [r12+8]
     call utxo_hash
     mov  rbx, rax
+    mov  r15, rax          ; home slot, for the probe bound at .pc
 .probe:
     lea  rax, [r12+rbx]
     mov  ecx, [rax+40]
@@ -316,6 +317,11 @@ utxo_get:
     jb   .pc
     mov  rbx, 40
 .pc:
+    ; Probe bound -- see the identical guard in utxo_del below for the full
+    ; story. Same defect, same fix: without this, a full table plus an
+    ; absent key is an infinite loop, not a miss.
+    cmp  rbx, r15
+    je   .miss
     jmp  .probe
 .hit:
     lea  rcx, [r12+rbx]
@@ -385,6 +391,10 @@ utxo_del:
     mov  rdx, r15
     call utxo_hash
     mov  rbx, rax
+    ; Remember the home slot for the probe bound at .pc. [rbp-0x30] is the
+    ; first local BELOW the 5-push save area at [rbp-0x08..-0x28]; this
+    ; frame's `sub rsp,0x20` covers it and nothing else uses it.
+    mov  [rbp-0x30], rax
 .probe:
     lea  rax, [r12+rbx]
     mov  ecx, [rax+40]
@@ -414,6 +424,32 @@ utxo_del:
     jb   .pc
     mov  rbx, 40
 .pc:
+    ; Probe bound. Before 2026-08-23 this was an unconditional `jmp .probe`,
+    ; and the ONLY loop exits were an empty slot (.miss) or a key match
+    ; (.hit). On a FULL table -- no empty slot anywhere -- a key that is not
+    ; present therefore wrapped forever. Not slow: non-terminating.
+    ;
+    ; The hazard was already known HERE, in this file: utxo_put's .next
+    ; carries an explicit probe counter whose comment says "we must report
+    ; full rather than looping forever (mirrors mpool_put's existing bounded
+    ; probe, bitcoin_mempool.asm)". So the same bound was written twice --
+    ; mpool_put, then utxo_put -- and never applied to get or del, which
+    ; leaned on put's "the table is never completely full" guarantee.
+    ;
+    ; That guarantee is not the invariant it looks like. utxo_lsm_reload's
+    ; WAL-tail replay applies records through these raw primitives and
+    ; bypasses put's bookkeeping entirely (daemon/flush_wal_tail.c says so in
+    ; as many words), so a tail larger than the memtable fills it completely
+    ; and nothing ever returned "full". Hit for real on 2026-08-23: replaying
+    ; a 1.83 GB tail spun here at 100% CPU with no progress -- in the live
+    ; daemon at 2^16 slots AND in flush_wal_tail at 2^22, which is what ruled
+    ; out "undersized" and pointed at "unbounded".
+    ;
+    ; Returning "not found" on a full-table miss is the honest answer and
+    ; is what an empty slot would have given. The caller then fails loudly
+    ; and recoverably instead of hanging.
+    cmp  rbx, [rbp-0x30]
+    je   .miss
     jmp  .probe
 .hit:
     ; ---- backward-shift deletion (NO tombstones) ----

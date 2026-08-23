@@ -658,7 +658,25 @@ static void reap_children(int sig){
         else if(g_inbound_n > 0) g_inbound_n--;
     }
 }
-static void handle_shutdown_signal(int sig){ g_shutdown_requested = sig; }
+/* Set only while the worker is inside utxo_live_init()'s UTXO reload. That
+ * reload is a tight assembly loop (utxo_lsm_reload -> the WAL-tail replay)
+ * which never consults a shutdown flag, and on a large tail it runs for
+ * minutes -- long enough that systemd sits in final-sigterm until
+ * TimeoutStopSec (15 min here) and then SIGKILLs. Observed 2026-08-23.
+ *
+ * Exiting straight from the handler is safe in this window specifically:
+ * the reload replays the WAL into MEMORY and commits nothing. The only file
+ * it opens for write is utxo.idx, which is a rebuildable index. Every
+ * durable object -- the WAL itself, the manifest, the runs,
+ * utxo_applied_height.dat -- is untouched until the first block is applied,
+ * which cannot happen until the reload returns. So an immediate _exit here
+ * leaves exactly the on-disk state the previous clean shutdown left, and is
+ * strictly better than being SIGKILLed at the same point 15 minutes later. */
+static volatile sig_atomic_t g_in_utxo_reload = 0;
+static void handle_shutdown_signal(int sig){
+    g_shutdown_requested = sig;
+    if (g_in_utxo_reload) _exit(0);
+}
 
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
  * The handshake reads the seed's version/verack plus its post-verack chatter
@@ -2003,7 +2021,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
 
     fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
     phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
+    g_in_utxo_reload = 1;                       /* see handle_shutdown_signal */
     int utxo_live_ok = archive_ok ? utxo_live_init(dir) : 0;
+    g_in_utxo_reload = 0;
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
     else fprintf(stderr,"[dl] worker: live UTXO state loaded (%.2fs)\n", phase_elapsed(&utxo_init_pt));

@@ -7,6 +7,112 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #32: utxo_get and utxo_del had no probe bound, so a full table was an infinite loop
+
+Restarting the node after the 963,000-block replay COMPLETED hung it. Not
+slowly -- permanently. The same restart that had worked every time during the
+replay.
+
+### Symptom, and the measurement that found the real cause
+
+`[dl] worker: loading live UTXO state...` and then nothing: 100% CPU, RSS flat,
+zero I/O, no progress after five minutes. `gdb -p` put it in
+`utxo_del[probe]`. SIGTERM was ignored, so systemd sat in `final-sigterm`.
+
+The obvious reading was "the memtable is undersized". Boot sizing is chosen
+from the block gap alone --
+
+    g_bulk_mode = (boot_gap >= 50000);   /* 963750 - 963000 = 750 -> steady state */
+
+-- which gives 2^16 slots, while the WAL tail left by the replay is 1.83 GB.
+So: undersized, obviously.
+
+That reading was wrong, and the thing that proved it was running
+`daemon/flush_wal_tail` (the documented remedy for exactly this shape) and
+watching it hang **in the same probe loop at 2^22 slots** -- sixty-four times
+larger. Two very different sizes, identical failure. Not undersized: unbounded.
+
+### The defect
+
+`bitcoin_utxo.asm`, both probe loops:
+
+    .pn:  advance rbx, wrap at the end of the table
+    .pc:  jmp .probe          ; unconditional
+
+The only exits are an EMPTY slot (`.miss`) or a key match (`.hit`). On a table
+with no empty slot, a key that is not present wraps forever.
+
+**The bound already existed in this same file.** `utxo_put`'s `.next` carries
+an explicit probe counter, and its comment says: "exceeding that here means
+every slot is occupied and we must report full rather than looping forever
+(mirrors mpool_put's existing bounded probe, bitcoin_mempool.asm)". So this
+bound was written twice -- once in the mempool, once in put -- and applied to
+neither of the two functions sitting beside it, because both leaned on put's
+promise that the table never fills completely.
+
+That promise is not an invariant. `utxo_lsm_reload`'s WAL-tail replay writes
+through these raw primitives and bypasses put's bookkeeping entirely --
+`daemon/flush_wal_tail.c` says so in as many words -- so a tail larger than the
+memtable fills it and nothing ever returns "full".
+
+### Fixes
+
+1. **The bound** (`bitcoin_utxo.asm`): `utxo_get` keeps the home slot in r15
+   (free there); `utxo_del` keeps it at `[rbp-0x30]` (its `sub rsp,0x20` region
+   is otherwise unused, and that slot is strictly below the 5-push save area at
+   `[rbp-0x08..-0x28]` -- the placement that incidents #31 and
+   `base58check_encode` both got wrong). Wrapping to the home slot returns the
+   same answer an empty slot would have.
+
+2. **Trigger prevention** (`daemon/utxo_live.c` + a new exported
+   `utxo_lsm_flush`): flush at catch-up completion. The downshift comment said
+   "the next put/del simply sees live-count over the new, lower threshold and
+   flushes naturally" -- true only if another block arrives. Caught up on a
+   quiet chain there is no next put/del, so the WAL stays bulk-sized for as
+   long as the node idles. `mac_flush` is now exported under its own name
+   rather than triggered by `flush_wal_tail`'s dummy-delete-of-a-nonexistent-key
+   trick, which writes a junk tombstone -- acceptable once in a one-shot tool,
+   not on every catch-up.
+
+3. **Damage limitation** (`daemon/main.c`): SIGTERM during the UTXO reload
+   `_exit(0)`s immediately. Safe in that window specifically -- the reload
+   replays the WAL into memory and commits nothing; the WAL, manifest, runs and
+   applied_height are untouched until the first block applies, which cannot
+   happen until the reload returns. Strictly better than being SIGKILLed at the
+   same point 15 minutes later.
+
+Only (1) makes the failure RECOVERABLE. (2) and (3) make it rarer and cheaper.
+
+### FAIL-THEN-PASS
+
+`tests/test_utxo_probe_bound` fills a 1024-slot table to capacity (`utxo_put`
+returns 2 = full, confirming every slot is occupied), then probes for an absent
+key.
+
+    against main : utxo_get and utxo_del both hit the alarm -- did not terminate
+    with the fix : both return, the absent key reads as missing, and a key that
+                   IS present is still found with its value intact
+
+Those last two matter: a bound that simply bailed early would pass "terminates"
+while silently losing entries.
+
+The test FORKS each probe under `alarm()`, because against unbounded code it
+would otherwise HANG rather than fail, and a hanging test in `make test` is
+worse than a missing one. My first draft got this wrong -- it called
+`utxo_get` in the parent for the correctness checks, which hung the whole test
+against old code -- so those are now guarded by the termination results.
+
+Full suite 162 ran / 0 failed. abi-check, callee-saved-check and prereq-check
+all OK.
+
+### Not fixed
+
+The 1.83 GB tail on the production datadir is still there; `flush_wal_tail`
+could not collect it (it hung on the same defect, and its fixed 2^22 sizing is
+too small for this tail regardless). With the bound in place an undersized
+attempt now FAILS in seconds instead of hanging, so sizing it is a fast
+experiment rather than a gamble -- but it has not been done yet.
+
 ## 2026-08-23 -- taproot verification moved onto the worker pool: 2.72 -> 26.6 effective cores
 
 PERF_SCOPE.md section 14 measured the live daemon on a quiet, 85%-idle box and

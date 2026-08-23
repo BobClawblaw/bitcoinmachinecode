@@ -52,6 +52,9 @@ extern long utxo_lsm_reload(void* lst, void* u);
 extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], u32 index, u64 value,
                          u64 height, u64 is_coinbase, const u8* script, u32 slen);
 extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
+/* A flush with no accompanying put/del -- see the asm's own header for why
+ * this exists and who needs it (daemon catch-up completion). */
+extern long utxo_lsm_flush(void* lst, void* u);
 extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
@@ -1440,6 +1443,39 @@ long utxo_live_catchup(void* store_buf){
         fprintf(stderr, "[utxo_live] caught up at height %ld -- downshifting to steady-state flush thresholds (fill=%llu op=%llu)\n",
                 g_applied_height, (unsigned long long)g_utxo_lst.fill_threshold,
                 (unsigned long long)g_utxo_lst.op_threshold);
+        /* ...and FLUSH, rather than wait for the next put/del to notice the
+         * lower threshold.
+         *
+         * The comment above used to end "the next put/del simply sees
+         * live-count over the new, lower threshold and flushes naturally,
+         * which also resets the WAL". True only if another block arrives.
+         * Caught up on a quiet chain there IS no next put/del, so the current
+         * WAL generation stays BULK-sized for as long as the node idles --
+         * while the steady-state memtable this downshift just selected is
+         * 2^16 slots, far too small to replay such a tail.
+         *
+         * A restart in that window reloads a batch-scale WAL into a
+         * 65,536-slot open-addressed table and degenerates to a full-table
+         * probe per record. Measured 2026-08-23 after the 963,000-block
+         * replay completed: 100% CPU inside utxo_del's probe loop, no
+         * progress after five minutes, and SIGTERM ignored because the reload
+         * never reaches a shutdown check. daemon/flush_wal_tail.c exists
+         * because build_utxo.c left exactly this kind of tail -- the live
+         * path can leave one too, and nothing collected it.
+         *
+         * One flush per catch-up completion: a bounded cost, paid at the one
+         * moment we know the WAL is at its largest and the node is idle. */
+        if (g_utxo_lst.log_len > 0) {
+            unsigned long long before_n   = (unsigned long long)g_utxo_lst.manifest_n;
+            unsigned long long before_len = (unsigned long long)g_utxo_lst.log_len;
+            long fr = utxo_lsm_flush(&g_utxo_lst, g_utxo_table);
+            if (fr == 1 && g_utxo_lst.log_len == 0)
+                fprintf(stderr, "[utxo_live] caught up: flushed the WAL tail (%llu bytes, manifest_n %llu -> %llu) so the next reload has nothing to replay\n",
+                        before_len, before_n, (unsigned long long)g_utxo_lst.manifest_n);
+            else
+                fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
+                        fr, (unsigned long long)g_utxo_lst.log_len, before_len);
+        }
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable
