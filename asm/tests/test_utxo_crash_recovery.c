@@ -85,17 +85,41 @@ static void put32(u8* p, u32 v){ p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16); 
 static void put64(u8* p, u64 v){ for(int i=0;i<8;i++) p[i]=(u8)(v>>(8*i)); }
 static u8 g_txid_scratch[1<<12];
 
+/* Serialises to exactly CB_TX_LEN bytes:
+ *    4 version + 1 nin + 32 null prevout hash + 4 prevout index
+ *  + 1 scriptSig len + 4 tag + 4 sequence
+ *  + 1 nout + 8 value + 1 scriptPubKey len + 1 OP_1 + 4 locktime  ==  65.
+ * Every buffer handed to this function must be at least CB_TX_LEN. `u8 tx[64]`
+ * -- one short -- is what LOG.md's -O2 investigation found: mk_and_mine's
+ * memcpy then copied 65 bytes out of a 64-byte array, so the block WRITTEN to
+ * the store ended in whatever gcc had put after `tx` while the merkle root and
+ * cb_txids[] recorded the txid of the bytes as they were BEFORE that. At -O0
+ * the trailing byte read back as 0 (what the overflow itself had stored) and
+ * the two agreed by luck; at -O2 gcc laid the frame out differently, the
+ * stored coinbase differed from the hashed one in its last byte, and the
+ * daemon's own txid for every one of the 150 coinbases came out different from
+ * the test's -- so the height-150 spends resolved to nothing:
+ *   REJECT h=150 tx=1: input references a missing/already-spent UTXO
+ * i.e. 31 assertion failures in a test about crash recovery, none of them
+ * about crash recovery. */
+#define CB_TX_LEN 65
+
 static long mk_coinbase_tx(u8* tx, u32 tag){
     u8* q = tx;
     put32(q,1); q+=4; *q++ = 1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
     *q++ = 4; put32(q, tag); q+=4; put32(q,0xffffffffu); q+=4;
     *q++ = 1; put64(q, 50000000ULL); q+=8; *q++ = 1; *q++ = 0x51; put32(q,0); q+=4;
+    if (q - tx != CB_TX_LEN){    /* keep the constant honest if the tx changes */
+        printf("FAIL mk_coinbase_tx emitted %ld bytes, CB_TX_LEN says %d\n",
+               (long)(q - tx), CB_TX_LEN);
+        failures++;
+    }
     return q - tx;
 }
 
 /* Coinbase-only block. */
 static long mk_and_mine(u8* raw, u8 hash[32], u8 cb_txid_out[32], const u8 prev[32], u32 tag, u32 tstamp){
-    u8 tx[64], txid[32];
+    u8 tx[CB_TX_LEN], txid[32];
     long txlen = mk_coinbase_tx(tx, tag);
     tx_txid(txid, tx, (unsigned long)txlen, g_txid_scratch, sizeof g_txid_scratch);
     memcpy(cb_txid_out, txid, 32);
@@ -115,6 +139,7 @@ static long mk_and_mine(u8* raw, u8 hash[32], u8 cb_txid_out[32], const u8 prev[
 static long mk_and_mine_multispend(u8* raw, u8 hash[32], const u8 prev[32],
                                    const u8 (*spend_txids)[32], int nspend,
                                    u32 tag, u32 tstamp, u8 (*out_txids)[32]){
+    /* 128 >= CB_TX_LEN (65) and >= a spend tx (61); asserted below. */
     u8 txbuf[8][128]; long txlen[8];
     u8 leaves[8*32];
     txlen[0] = mk_coinbase_tx(txbuf[0], tag);
@@ -131,6 +156,7 @@ static long mk_and_mine_multispend(u8* raw, u8 hash[32], const u8 prev[32],
         *q++ = 1; *q++ = 0x51;
         put32(q,0); q+=4;
         txlen[j+1] = q - txbuf[j+1];
+        if (txlen[j+1] > (long)sizeof txbuf[0]){ printf("FAIL spend tx overflowed txbuf\n"); failures++; }
         tx_txid(leaves + 32*(j+1), txbuf[j+1], (unsigned long)txlen[j+1], g_txid_scratch, sizeof g_txid_scratch);
         memcpy(out_txids[j], leaves + 32*(j+1), 32);
     }
