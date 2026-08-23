@@ -25,6 +25,30 @@
 default rel
 
 extern sha256_full
+extern sha256_block
+
+section .rodata
+
+; ---- constants for sha256d64 (below). All three are fixed by the shape of a
+; 64-byte double-SHA256 and could not be otherwise; see that function's header.
+align 16
+D64_IV:                     ; FIPS 180-4 H0..H7, host word order
+    dd 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a
+    dd 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+align 16
+D64_PAD_512:                ; block 2 of SHA-256 over a 64-byte message:
+    db 0x80                 ;   0x80, then zeros, then the bit length 512 BE
+    times 55 db 0
+    db 0x00,0x00,0x00,0x00,0x00,0x00,0x02,0x00
+align 16
+D64_PAD_256:                ; bytes 32..63 of SHA-256 over a 32-byte message:
+    db 0x80                 ;   0x80, then zeros, then the bit length 256 BE
+    times 23 db 0
+    db 0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00
+align 16
+D64_BSWAP32:                ; reverse the bytes WITHIN each 32-bit lane
+    db 0x03,0x02,0x01,0x00, 0x07,0x06,0x05,0x04
+    db 0x0b,0x0a,0x09,0x08, 0x0f,0x0e,0x0d,0x0c
 
 section .text
 
@@ -221,6 +245,178 @@ pow_check:
     pop rbp
     ret
 
+
+; ----------------------------------------------------------------------------
+; void sha256d64(u8 *out, const u8 *in, u64 pairs)
+;   out[32i .. 32i+31] = SHA256(SHA256(in[64i .. 64i+63])), for i < pairs.
+;   The opposite number of Core's SHA256D64 (src/crypto/sha256.h:51), and the
+;   merkle tree's inner-node operation.
+;
+; WHY IT EXISTS (PERF_SCOPE.md 13.2)
+;   `merkle_root` used to call sha256d(concat, 64) once per node. That is
+;   correct and it is slow for two measured reasons, in this order:
+;
+;   1. THE CHAIN IS SERIAL. A 64-byte double-SHA256 is three compressions in
+;      strict sequence, and sha256rnds2 is latency-bound: measured on this box
+;      (Zen 5), one chained sha256_block_shani costs 26.88 ns, but TWO
+;      INDEPENDENT ones alternated cost 16.91 ns each -- 1.59x, purely from
+;      letting the out-of-order engine overlap two chains. Widths 3..6 were
+;      measured too and buy nothing further (16.72 / 16.75 / 16.78 / 16.67),
+;      so TWO is the right width on this CPU and that is a measurement, not
+;      an assumption. Core's SHA256D64 is 2-way for the same reason.
+;
+;   2. PER-CALL OVERHEAD. sha256d -> sha256_full x2 re-runs sha256_init, does
+;      a `rep movsb` of the 64 input bytes into a second buffer, and BUILDS
+;      the padding block byte by byte -- every time, for a message whose
+;      length is a compile-time constant. Measured at 20.07 ns of the 100.84
+;      ns each pair cost, i.e. 19.9 %.
+;
+;   This function fixes both WITHOUT a new cryptographic kernel: it calls the
+;   existing, already-validated `sha256_block` (which dispatches to SHA-NI or
+;   the scalar fallback), twice per step with two independent states, and the
+;   two padding blocks are .rodata constants because the two message lengths
+;   are always 512 and 256 bits. Nothing here computes a hash round.
+;
+; LAYOUT PER PAIR OF INPUTS (lanes A and B, interleaved)
+;   SA = SB = IV
+;   compress(SA, inA)            compress(SB, inB)          ; the data
+;   compress(SA, PAD_512)        compress(SB, PAD_512)      ; the padding
+;   BA = BE(SA) || PAD_256       BB = BE(SB) || PAD_256     ; 2nd-hash block
+;   SA = SB = IV
+;   compress(SA, BA)             compress(SB, BB)
+;   out = BE(SA) || BE(SB)
+;
+; ABI: rdi=out, rsi=in, rdx=pairs. Preserves rbx, r12-r15 (sha256_block does).
+;   pairs == 0 returns immediately. An odd `pairs` finishes with one 1-way step.
+; Frame (rbp-relative, all below the save area, all at or above rsp):
+;   SA -0x50 (32)  SB -0x70 (32)  BA -0xb0 (64)  BB -0xf0 (64)
+;   The save area is at rbp-0x08..-0x28 when the caller was already 16-aligned
+;   and rbp-0x10..-0x30 when `and rsp,-16` had to move rsp, so NO box may sit
+;   above rbp-0x30. (SA at rbp-0x40 spans up to rbp-0x21 and clobbered saved
+;   rbx -- i.e. the caller's `out` pointer -- which is how this was found.)
+; ----------------------------------------------------------------------------
+
+; V := IV, at the rbp-relative base %1
+%macro D64_SETIV 1
+    movdqa xmm0, [rel D64_IV]
+    movdqa xmm1, [rel D64_IV+16]
+    movdqu [%1 + 0],  xmm0
+    movdqu [%1 + 16], xmm1
+%endmacro
+
+; [%1 .. %1+31] := big-endian bytes of the 8 host words at %2.
+;   pshufb with a per-dword reverse mask does all eight words in two shuffles;
+;   the mask is the same permutation sha256.asm's SHA-NI body already uses to
+;   byte-swap a message block, restated here so this file owns its constants.
+%macro D64_STORE_BE 2
+    movdqa xmm2, [rel D64_BSWAP32]
+    movdqu xmm0, [%2 + 0]
+    movdqu xmm1, [%2 + 16]
+    pshufb xmm0, xmm2
+    pshufb xmm1, xmm2
+    movdqu [%1 + 0],  xmm0
+    movdqu [%1 + 16], xmm1
+%endmacro
+
+; [%1 + 32 .. %1 + 63] := the 32-byte tail of a 32-byte message's padded block.
+;   Hoisted OUT of the loop: the second-hash blocks are our own buffers and
+;   only their first 32 bytes ever change, so this is written once per call.
+%macro D64_PADTAIL 1
+    movdqa xmm0, [rel D64_PAD_256]
+    movdqa xmm1, [rel D64_PAD_256+16]
+    movdqu [%1 + 32], xmm0
+    movdqu [%1 + 48], xmm1
+%endmacro
+
+global sha256d64
+sha256d64:
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16           ; the interpreter chain does not guarantee alignment
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0xf8          ; -> rsp 0 mod 16 at every nested call
+
+    mov  rbx, rdi           ; out
+    mov  r12, rsi           ; in
+    mov  r13, rdx           ; pairs remaining
+    test r13, r13
+    jz   .out
+    D64_PADTAIL rbp-0xb0    ; both second-hash blocks keep a constant tail
+    D64_PADTAIL rbp-0xf0
+
+.two:
+    cmp  r13, 2
+    jb   .one
+
+    D64_SETIV rbp-0x50
+    D64_SETIV rbp-0x70
+    ; ---- first hash, data block, both lanes ----
+    lea  rdi, [rbp-0x50]
+    mov  rsi, r12
+    call sha256_block
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [r12+64]
+    call sha256_block
+    ; ---- first hash, padding block (constant), both lanes ----
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [rel D64_PAD_512]
+    call sha256_block
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [rel D64_PAD_512]
+    call sha256_block
+    ; ---- build both second-hash blocks ----
+    D64_STORE_BE rbp-0xb0, rbp-0x50
+    D64_STORE_BE rbp-0xf0, rbp-0x70
+    ; ---- second hash, both lanes ----
+    D64_SETIV rbp-0x50
+    D64_SETIV rbp-0x70
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [rbp-0xb0]
+    call sha256_block
+    lea  rdi, [rbp-0x70]
+    lea  rsi, [rbp-0xf0]
+    call sha256_block
+    ; ---- emit ----
+    D64_STORE_BE rbx,    rbp-0x50
+    D64_STORE_BE rbx+32, rbp-0x70
+
+    add  rbx, 64
+    add  r12, 128
+    sub  r13, 2
+    jmp  .two
+
+.one:
+    test r13, r13
+    jz   .out
+    D64_SETIV rbp-0x50
+    lea  rdi, [rbp-0x50]
+    mov  rsi, r12
+    call sha256_block
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [rel D64_PAD_512]
+    call sha256_block
+    D64_STORE_BE rbp-0xb0, rbp-0x50
+    D64_SETIV rbp-0x50
+    lea  rdi, [rbp-0x50]
+    lea  rsi, [rbp-0xb0]
+    call sha256_block
+    D64_STORE_BE rbx, rbp-0x50
+
+.out:
+    add rsp, 0xf8           ; back to the 5 pushes (rsp-relative: `and rsp,-16`
+    pop r15                 ; means their address is NOT a fixed rbp offset)
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov rsp, rbp
+    pop rbp
+    ret
+
 ; ------------------------------------------------------------------------------
 ; merkle_root(out[32], hashes, n): Bitcoin merkle root of n leaf hashes (each
 ;   32 bytes) held contiguously in `hashes`.  Operates IN PLACE on `hashes`
@@ -229,43 +425,25 @@ pow_check:
 ;   last hash. Matches Bitcoin's tx-merkle construction (raw digest bytes).
 ;
 ;   ABI: rdi=out, rsi=hashes, rdx=n.
-;   Registers (callee-saved, safe across sha256d): rbx=hashes, r12=n, r13=out,
-;   r14=n (running).  Frame: concat[64] local; callers must keep rsp 0 mod16.
+;   Registers (callee-saved, safe across sha256d64): rbx=hashes, r12=n,
+;   r13=out, r14=nodes at this level, r15=read byte offset; the write byte
+;   offset lives at [rbp-0xc8].
+;
+;   2026-08-23 (PERF_SCOPE.md 13.2): the inner node hash goes through
+;   `sha256d64` a BATCH of nodes at a time instead of `sha256d` one at a
+;   time. The double-SHA256 chains of distinct nodes are independent, and on
+;   this CPU running two of them interleaved costs 16.91 ns per compression
+;   against 26.88 ns for one on its own -- so the pairing is worth 1.59x on
+;   the hashing itself, before the per-call padding and copying sha256d64
+;   also removes.
 ; ------------------------------------------------------------------------------
-global merkle_root
-merkle_root:
-    push rbp
-    mov  rbp, rsp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    sub  rsp, 0x98         ; concat[64] at [rbp-0x80..-0x21] BELOW save area
-                          ; [rbp-0x20..-0x08]; write-offset saved at -0x88.
-                          ; 0x98==8 mod16 -> rsp 0 mod16 -> sha256d calls aligned.
 
-    mov r13, rdi           ; out
-    mov rbx, rsi           ; hashes
-    mov r12, rdx           ; n
-
-    ; CALLEE-SAVED CURSORS that must survive sha256d (which clobbers rcx,r8-r11):
-    ;   r15 = read byte offset ; write byte offset kept in [rbp-0x88]
-
-.next_level:
-    cmp r12, 1
-    jbe .finish
-
-    ; produce the next level, in place, into hashes[0 .. new_n)
-    ; (new_n = (n+1)/2).  Each output index < its input indices, so in-place
-    ; overwrite is safe once the concat buffer holds both inputs.
-    mov r14, r12           ; original node count THIS level (r12 stays fixed)
-    xor r15, r15           ; read offset = 0
-    xor eax, eax
-    mov [rbp-0x88], rax    ; write offset = 0
-.pair:
-    lea r9,  [rbp-0x80]    ; concat base (caller-saved, rebuilt each iter)
-    ; copy left = hashes[r15 ..]  (32 bytes)
+; Stage hashes[r15] and its sibling into the 64-byte slot R9 POINTS AT.
+;   Sibling = the next node, or a duplicate of this one when this is the last
+;   node of an odd-sized level (Bitcoin's rule). r14 = nodes at this level.
+;   Advances r15 by 64. Clobbers rax, r10, r11 (all caller-saved, all rebuilt
+;   at every use); r9 is the caller's destination pointer and is left alone.
+%macro MK_CONCAT 0
     mov r10, rbx
     add r10, r15
     mov rax, [r10+0]
@@ -276,15 +454,13 @@ merkle_root:
     mov [r9+16], rax
     mov rax, [r10+24]
     mov [r9+24], rax
-    ; right sibling?  left node index = r15/32 ; present if index+1 < r14
     mov r11, r15
     shr r11, 5
     inc r11
     cmp r11, r14
-    jae .dup_last
-    mov r10, rbx
-    add r10, r15
+    jae %%dup                  ; no sibling -> duplicate the left node
     add r10, 32
+%%dup:
     mov rax, [r10+0]
     mov [r9+32], rax
     mov rax, [r10+8]
@@ -293,36 +469,78 @@ merkle_root:
     mov [r9+48], rax
     mov rax, [r10+24]
     mov [r9+56], rax
-    jmp .hash_pair
-.dup_last:
-    mov r10, rbx
-    add r10, r15
-    mov rax, [r10+0]
-    mov [r9+32], rax
-    mov rax, [r10+8]
-    mov [r9+40], rax
-    mov rax, [r10+16]
-    mov [r9+48], rax
-    mov rax, [r10+24]
-    mov [r9+56], rax
-.hash_pair:
-    ; sha256d(concat,64) -> hashes[write_off ..]  ; write_off in [rbp-0x88]
-    mov rdi, rbx
-    mov rax, [rbp-0x88]
-    add rdi, rax
-    mov rsi, r9
-    mov rdx, 64
-    call sha256d
-    ; advance one pair (both cursors are callee-saved / stack, safe)
     add r15, 64
-    mov rax, [rbp-0x88]
-    add rax, 32
-    mov [rbp-0x88], rax
-    ; continue while read_nodes (r15/32) < r14
+%endmacro
+
+; How many node pairs are staged before one sha256d64 call. Measured: 1 pair
+; per call leaves the two chains unable to overlap ACROSS calls and costs
+; 76.8 ns/leaf; batching amortises the call and lets consecutive pairs
+; pipeline, at 16 it is 1024 bytes of stack for the staging buffer.
+%define MK_STAGE 16
+
+global merkle_root
+merkle_root:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x448        ; concat[MK_STAGE*64] at [rbp-0x460..-0x61], write
+                           ; offset at -0x468, staged count at -0x470; all
+                           ; BELOW the save area [rbp-0x08..-0x28].
+                           ; 0x448==8 mod16 -> rsp 0 mod16 at nested calls.
+
+    mov r13, rdi           ; out
+    mov rbx, rsi           ; hashes
+    mov r12, rdx           ; n
+
+.next_level:
+    cmp r12, 1
+    jbe .finish
+
+    ; Produce the next level, in place, into hashes[0 .. new_n) where
+    ; new_n = (n+1)/2. Safe because every batch copies ALL of its inputs out
+    ; of `hashes` before sha256d64 writes any of its outputs back, and the
+    ; write offset is never more than half the read offset.
+    mov r14, r12           ; node count THIS level (r12 stays fixed)
+    xor r15, r15           ; read byte offset
+    xor eax, eax
+    mov [rbp-0x468], rax   ; write byte offset
+
+.batch:
+    xor eax, eax
+    mov [rbp-0x470], rax   ; staged pairs = 0
+.fill:
+    mov rax, [rbp-0x470]
+    shl rax, 6
+    lea r9, [rbp-0x460]
+    add r9, rax            ; r9 = &concat[staged]
+    MK_CONCAT
+    mov rax, [rbp-0x470]
+    inc rax
+    mov [rbp-0x470], rax
+    mov r11, r15
+    shr r11, 5
+    cmp r11, r14           ; level exhausted?
+    jae .flush
+    cmp rax, MK_STAGE
+    jb  .fill
+.flush:
+    mov rdi, rbx
+    add rdi, [rbp-0x468]
+    lea rsi, [rbp-0x460]
+    mov rdx, [rbp-0x470]
+    call sha256d64
+    mov rax, [rbp-0x470]
+    shl rax, 5             ; 32 output bytes per staged pair
+    add rax, [rbp-0x468]
+    mov [rbp-0x468], rax
     mov r11, r15
     shr r11, 5
     cmp r11, r14
-    jb  .pair
+    jb  .batch
 
     ; new_n = (r12 + 1) >> 1
     mov rax, r12
@@ -341,7 +559,7 @@ merkle_root:
     mov rax, [rbx+24]
     mov [r13+24], rax
 
-    add rsp, 0x98
+    add rsp, 0x448
     pop r15
     pop r14
     pop r13
