@@ -249,6 +249,51 @@ utxo_store_init:
     ret
 
 ; ============================================================================
+; utxo_store_init_ro(st) -> 1 ok / -1
+;   READ-ONLY sibling of utxo_store_init, for tools that inspect a datadir
+;   they must not touch. Differences, and both matter:
+;     - utxo.dat is opened O_RDONLY with NO O_CREAT, so a missing WAL is an
+;       error rather than a newly created empty file;
+;     - utxo.idx is not opened at all and idx_fd is set to -1. That is safe
+;       precisely because utxo_store_reload opens utxo.idx ITSELF (O_RDONLY)
+;       and never reads st->idx_fd -- checked, not assumed. Any function that
+;       WRITES (utxo_store_put/_del/_sync) does use it, and will fail loudly
+;       on fd -1, which is the intended outcome: a store opened read-only must
+;       not be mutable by accident.
+;   The point of this existing at all: `data/` is the live replay's datadir
+;   and is read-only to the set-hash tool, but the ordinary reload path opens
+;   both files O_RDWR|O_CREAT. That single open is the only write side effect
+;   in the entire reload chain, so this is the whole fix.
+; ============================================================================
+global utxo_store_init_ro
+utxo_store_init_ro:
+    push rbp
+    mov  rbp, rsp
+    push r12                ; 1 push -> save area [rbp-8..-0x10] (r12@-8)
+    mov  r12, rdi
+    lea  rdi, [rel logname]
+    xor  esi, esi            ; O_RDONLY, no O_CREAT
+    xor  edx, edx
+    mov  eax, 2
+    syscall
+    test rax, rax
+    jl   .rofail
+    mov  [r12+0], rax        ; log_fd
+    mov  qword [r12+8], -1   ; idx_fd = -1 (never opened; see above)
+    mov  qword [r12+16], 0   ; log_len = 0
+    mov  qword [r12+24], 0   ; ckpt_log_off = 0
+    mov  qword [r12+32], 0   ; ckpt_n = 0
+    mov  rax, 1
+    pop  r12
+    pop  rbp
+    ret
+.rofail:
+    mov  rax, -1
+    pop  r12
+    pop  rbp
+    ret
+
+; ============================================================================
 ; utxo_store_put(st, u, txid, index, value, script, slen)
 ;   rdi=st rsi=u rdx=txid rcx=index(dword) r8=value r9=script [rbp+16]=slen(dword)
 ;   5 pushes -> save area [rbp-8 .. -0x40]; locals at <= -0x48.

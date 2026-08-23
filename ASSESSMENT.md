@@ -77,9 +77,11 @@ differences enumerated. `BENCHMARKS.md` states them per measurement.
 There is also a handicap running the other way that is worth stating plainly:
 **our UTXO set is not the same object as Core's.** We store ~22.2 million
 provably-unspendable outputs that Core never writes to its chainstate — 77.2M
-entries against Core's 55.0M at the same height. We are doing measurably more
-storage work for the same chain, and we are not yet able to prove our set
-matches Core's contents at all.
+entries against Core's 55.0M at the same height. (As of 2026-08-23 this no
+longer blocks the comparison — the entries are filtered out while iterating —
+but they are still on disk, and still cost storage and compaction.) We are
+doing measurably more
+storage work for the same chain.
 
 ## 4. The correctness picture, which matters more than the speed
 
@@ -104,13 +106,37 @@ would accept that Core rejects. The differential corpus work — asking Core for
 the answer to thousands of constructed vectors — is what found the false
 accepts, and that method has only been applied to a few paths so far.
 
-**The acceptance test is currently weaker than it should be.** Stage D's
-criterion is "no block rejected". The criterion it *should* be is "UTXO set
-byte-identical to Core's at height H", which is exactly what a
-`gettxoutsetinfo`/set-hash comparison would give — and which the 22.2M
-unspendable-output divergence currently makes impossible. Closing that is
-tracked in `FEATURE_GAPS.md` and is, in my judgement, the single highest-value
-correctness work remaining.
+**The acceptance test was weaker than it should be, and now is not.** Stage D's
+criterion was "no block rejected". The criterion it *should* be is "UTXO set
+byte-identical to Core's at height H", and as of 2026-08-23 that comparison
+exists and has been run: `daemon/utxo_setinfo` plus
+`validation/diff_utxo_setinfo.py` produce `txouts`, `total_amount`, `bogosize`
+and a **MuHash3072** set hash over a filtered view of our LSM set, and diff them
+against a live Core node at any height. **On the production datadir at height
+792,979, all four match Core: 102,532,574 txouts, 19,393,405.70154310 BTC,
+bogosize 7,739,642,957, and MuHash `e7e65c06...649e776a` — with two entries'
+height field corrected for the BIP30 issue below. At height 91,721, before any
+BIP30 duplicate exists, all four match with no correction at all.** The 22.2M unspendable-output divergence turned out not to
+require the rebuild it appeared to: Core's `IsUnspendable` is applied while
+iterating, so those entries stay on disk and stop counting.
+
+The comparison immediately earned its keep, twice, in the way §4 predicts:
+both findings are invisible to the count, the value and the size metric, and
+visible only to the hash.
+
+- **Incident #28 — BIP30 duplicate coinbases keep the wrong height.** Core's
+  exception path calls `AddCoin(..., possible_overwrite=true)`, so its
+  chainstate holds those two coins at heights 91,880 / 91,842. `utxo_lsm_put`
+  returns "duplicate" and keeps the earlier copies, 91,722 / 91,812. Height
+  feeds the 100-block coinbase maturity rule, so this is a **false-accept
+  shape**: between heights 91,880 and 91,980 we would have accepted a spend
+  Core rejects as immature. Proven exactly — overriding just those two heights
+  reproduces Core's height-200,000 muhash byte for byte.
+- **The genesis coinbase.** `utxo_live.c` excludes it and says why;
+  `build_utxo.c` does not. Two writers for the same set, disagreeing.
+
+Neither could have been found by replaying the chain, and neither was. That is
+the fifth and sixth entry in the "reachable only by asking Core" column.
 
 **The discovery rate is not decelerating.** Six of the twenty-four were found
 today, in the last several hours, in code that had already been reviewed and
@@ -121,8 +147,11 @@ that had just been rewritten. The reasonable inference is that more remain.
 
 In rough order of how much each would move it:
 
-1. **A UTXO set hash matching Core at a given height.** Converts the acceptance
-   test from "nothing rejected" to "provably the same state".
+1. ~~**A UTXO set hash matching Core at a given height.**~~ **Done
+   (2026-08-23), and it matches on the production set at height 792,979.**
+   What remains of this item is fixing the two divergences it found above, and
+   re-running it as the replay advances (each run needs a quiesced datadir, and
+   the tool refuses on a busy one rather than guessing).
 2. **The differential corpus method applied to every consensus path**, not the
    three or four it has reached. It is the only method that has ever found a
    false accept here.
