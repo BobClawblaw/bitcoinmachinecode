@@ -1756,6 +1756,27 @@ utxo_lsm_get:
     ret
 
 ; ============================================================================
+; utxo_lsm_flush(lst=rdi, u=rsi) -> 1 ok / -1 err
+;   mac_flush by its public name, for the ONE caller that needs a flush
+;   without an accompanying put/del: daemon/utxo_live.c, at the moment
+;   catch-up completes and the flush thresholds downshift to steady state.
+;
+;   Until 2026-08-23 that caller had no way to ask. The downshift comment
+;   said "the next put/del simply sees live-count over the new, lower
+;   threshold and flushes naturally" -- true only if another block arrives.
+;   Caught up on a quiet chain there is no next put/del, so the current WAL
+;   generation stays BULK-sized indefinitely, and any restart in that window
+;   reloads it into a steady-state 2^16-slot memtable. daemon/flush_wal_tail.c
+;   documents where that ends up; it was hit for real after the 963,000-block
+;   replay finished, spinning in utxo_del's probe loop at 100% CPU.
+;
+;   A tail jump, so the ABI and return contract are mac_flush's exactly.
+; ============================================================================
+global utxo_lsm_flush
+utxo_lsm_flush:
+    jmp  mac_flush
+
+; ============================================================================
 ; mac_flush(lst=rdi, u=rsi) -> 1 ok / -1 err
 ;   See header comment for full algorithm. Called by utxo_lsm_put/del once
 ;   op_count or memtable fill crosses its threshold.
