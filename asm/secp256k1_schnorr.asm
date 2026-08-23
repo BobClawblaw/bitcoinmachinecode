@@ -54,9 +54,11 @@
 ;
 ;   The 2026-08-19 TLS conversion (bitcoin_scriptverify.c, bitcoin_interp.asm,
 ;   bitcoin_sighash.asm) covered the interpreter's scratch and missed this one.
-;   It also missed secp256k1_taproot.asm's `tagh_buf` and `tap_preimg`, which
-;   are still process-global and still on the taproot verify path -- SAME BUG,
-;   not fixed here, see that file.
+;   It also missed secp256k1_taproot.asm's `tagh_buf` and `tap_preimg` -- SAME
+;   BUG, on the same path. Those moved to .tbss later the same day; see that
+;   file's header. With both fixed, daemon/tx_verify.c stopped verifying
+;   taproot inputs in a sequential pass and now fans them across the worker
+;   pool like every other shape (PERF_SCOPE.md section 14.7).
 ; ============================================================================
 default rel
 
