@@ -176,7 +176,20 @@ processes) against `asm/tests/bench_ecdsa` and `asm/tests/bench_schnorr`
 | operation | libsecp256k1 | bitcoinmachinecode | ratio |
 |---|---|---|---|
 | **ECDSA verify** | **21.10 µs** (47,400/s/core) | **23.70 µs** (42,199/s/core) | **1.12× slower** |
-| **Schnorr verify (BIP340)** | **21.40 µs** (46,700/s/core) | **71.66 µs** (13,954/s/core) | **3.35× slower** |
+| **Schnorr verify (BIP340)** | **21.40 µs** (46,700/s/core) | ~~71.66 µs~~ → **see below** | ~~3.35×~~ |
+
+> **UPDATED 2026-08-23 — the Schnorr row is now stale and the update is
+> recorded here rather than overwritten.** `PERF_SCOPE.md` §13 rewrote
+> `secp256k1_schnorr.asm` onto the same fixed-base comb and GLV+wNAF ladder
+> ECDSA already used, made the `x(R) == r` test projective, and replaced
+> `fe_inv`'s naive binary exponentiation with an addition chain. Measured by
+> **alternating the baseline commit's binary and the branch's binary on the
+> same core in the same window** (three passes, min-of-15 CPU time each):
+> **60.65 µs → 25.45 µs, 2.38×**, with `ecdsa_verify` as an untouched control
+> moving 21.20 → 21.23 µs. Against the 21.40 µs libsecp256k1 figure above
+> that is **3.35× → ~1.19×**, but the two columns come from different
+> sittings on a much busier box, so treat 1.19× as an estimate and re-run
+> `scripts/bench_vs_core.sh` on a quiet machine for a same-sitting ratio.
 
 Two things to say about this table.
 
@@ -186,11 +199,15 @@ shows it.** `PERF_SCOPE.md` §1 measured the same pair on this same box on
 (§5.2) and the work in §10 have taken it to **1.12×**. The number in §1 should
 now be read as historical.
 
-**The Schnorr gap had never been measured and is the largest remaining crypto
-gap.** It is not the ECDSA ratio: BIP340 verification has no modular inversion
-(so it does not benefit from the inversion work) but does carry a tagged-hash
-challenge, and our implementation appears not to share whatever the ECDSA path
-gained. This matters more than it looks, because taproot key-path spends pay it
+**The Schnorr gap had never been measured and was the largest remaining crypto
+gap.** It is not the ECDSA ratio: BIP340 verification does carry a tagged-hash
+challenge, and our implementation did not share what the ECDSA path had
+gained — it called plain `point_scalar_mul` twice where ECDSA used the
+fixed-base comb and the GLV ladder, and it did **two** field inversions where
+one was needed and neither was needed for the x compare. All three are fixed
+as of 2026-08-23 (`PERF_SCOPE.md` §13). The sentence below about "the verify
+that dominates the part of the chain the replay has not reached yet" is why
+that mattered, and it still stands. This matters more than it looks, because taproot key-path spends pay it
 on every input from height 709,632 onward, and `FEATURE_GAPS.md` notes taproot
 usage goes script-path-heavy from roughly 775,000 — i.e. **this is the verify
 that dominates the part of the chain the replay has not reached yet.**
@@ -214,21 +231,38 @@ OpenSSL instead and is left alone.
 |---|---|---|---|---|
 | SHA-256, 1,000,000 B | `SHA256_SHANI` | 0.3654 ns/B (2.74 GB/s) | 0.4206 ns/B (2.38 GB/s) | 1.15× slower |
 | **SHA-256, 32 B** | `SHA256_32b_SHANI` | 37.63 ns | **35.55 ns** | **0.94× — we are 1.06× faster** |
-| SHA-256d, 64 B × 1024 | `SHA256D64_1024_SHANI` | 0.7104 ns/B (45.47 ns/pair) | 1.5901 ns/B (101.77 ns/pair) | 2.24× slower |
+| SHA-256d, 64 B × 1024 | `SHA256D64_1024_SHANI` | 0.7104 ns/B (45.47 ns/pair) | ~~1.5901~~ → **0.8084 ns/B** (51.7 ns/pair) | ~~2.24×~~ → **1.14×** |
 | SHA-1, 1,000,000 B | `SHA1` | 0.6472 ns/B | 1.7318 ns/B | 2.68× slower |
 | SHA-512, 1,000,000 B | `SHA512` | 0.9783 ns/B | 1.7513 ns/B | 1.79× slower |
 | RIPEMD-160, 1,000,000 B | `BenchRIPEMD160` | 1.1371 ns/B | 3.5877 ns/B | 3.16× slower |
-| Merkle root, 9,001 leaves | `MerkleRoot` | 45.97 ns/leaf | 103.14 ns/leaf | 2.24× slower |
+| Merkle root, 9,001 leaves | `MerkleRoot` | 45.97 ns/leaf | ~~103.14~~ → **53.89 ns/leaf** | ~~2.24×~~ → **1.17×** |
 
 Notes, in order of how much they change the reading:
 
-- **The SHA-256d and merkle rows are the same finding.** Core's
-  `ComputeMerkleRoot` and its `SHA256D64` share a **2-way interleaved SHA-NI
-  kernel** that hashes two 64-byte pairs at once; this repo calls `sha256d`
-  sequentially. The two rows agree to within 0.3 % on the ratio (2.238 and
-  2.243), which is what you would expect if a 2-way batch were the whole
-  difference. This is a real, identified, fixable gap on a path the replay uses
-  once per transaction (merkle) and once per merkle level.
+- **The SHA-256d and merkle rows were the same finding, and the diagnosis was
+  right.** Core's `ComputeMerkleRoot` and its `SHA256D64` share a **2-way
+  interleaved SHA-NI kernel**; this repo called `sha256d` sequentially. The two
+  rows agreed to within 0.3 % on the ratio (2.238 and 2.243), which is what you
+  would expect if a 2-way batch were the whole difference.
+
+  **2026-08-23: confirmed by direct measurement and fixed.** Alternating N
+  independent `sha256_block_shani` chains on this CPU costs 26.88 ns per
+  compression at N=1 and **16.91 ns at N=2** — and 16.72/16.75/16.78/16.67 at
+  N=3/4/5/6, so **two is the right width here and more buys nothing**. A new
+  `sha256d64(out, in, pairs)` (`bitcoin_hash.asm`) runs two chains interleaved
+  through the *existing* `sha256_block` — no new cryptographic kernel — and
+  hoists the constant padding blocks into `.rodata`; `merkle_root` stages 16
+  pairs per call. Both rows above are the branch's re-measured numbers, taken
+  by alternating baseline and branch binaries on one core.
+
+  **Read the end-to-end value before quoting the ratio.** `merkle_root` has
+  exactly one caller in the node (`cons_verify`), and counted over three real
+  mainnet blocks (heights 772,000 / 850,000 / 963,000) it is 6.7 % / 11.6 % /
+  10.2 % of that block's SHA-256 compressions. Against `PERF_SCOPE.md` §11's
+  5.14 % for *all* of `sha256_block_shani`, merkle is 0.34–0.60 % of replay
+  cycles: the 1.86× is worth about **1.002× end to end**, and an infinitely
+  fast `merkle_root` would be worth 1.006×. It was built because it needed no
+  new kernel, not because the ratio was large.
 - **Single-block SHA-256 is at parity, and slightly ahead on the small shape.**
   Both sides are SHA-NI. The 32-byte win is the interesting one: it is the shape
   Bitcoin actually hashes most often, and it says our one-shot path has less
@@ -323,8 +357,16 @@ interpreter, the flags dispatch, and the witness classification:
 | input type | our sighash | our sig verify | **our lower bound** | Core | ≥ ratio |
 |---|---|---|---|---|---|
 | P2WPKH | 0.3799 µs (BIP143, 1-in/2-out) | 23.70 µs | **24.08 µs** | 20.44 µs | **≥ 1.18× slower** |
-| P2TR key path | 0.3815 µs (BIP341, ext_flag=0) | 71.66 µs | **72.04 µs** | 20.66 µs | **≥ 3.49× slower** |
-| P2TR script path | 0.4112 µs (BIP341, ext_flag=1) | 71.66 µs | **72.07 µs** | 36.39 µs | **≥ 1.98× slower** |
+| P2TR key path | 0.3815 µs (BIP341, ext_flag=0) | ~~71.66~~ → 25.45 µs | ~~72.04~~ → **25.83 µs** | 20.66 µs | ~~≥ 3.49×~~ → **≥ 1.25×** |
+| P2TR script path | 0.4112 µs (BIP341, ext_flag=1) | ~~71.66~~ → 25.45 µs | ~~72.07~~ → **25.86 µs** | 36.39 µs | ~~≥ 1.98×~~ → **≥ 0.71×** |
+
+The two taproot rows are updated for the 2026-08-23 Schnorr work
+(`PERF_SCOPE.md` §13). The script-path row now reads **below 1.0**, which does
+**not** mean we are faster than Core there: it means the *lower bound* has
+stopped being informative, because tapscript execution — which the bound omits
+entirely and Core's 36.39 µs includes — is now a larger share of that number
+than the signature is. The right response is the harness this document already
+lists as its highest-value missing piece, not a speed claim.
 
 `PERF_SCOPE.md` §9 warns "do not compose the component factors", and that warning
 is about composing *speedup ratios* — which is invalid, because each component
@@ -342,14 +384,15 @@ and run `Chainstate::ConnectBlock` over it.
 | | Core (single core, as pinned) | our lower bound, from the table above |
 |---|---|---|
 | `ConnectBlockAllEcdsa` | **113.29 ms** (22.66 µs/input) | ≥ 120.4 ms (**≥ 1.06×**) |
-| `ConnectBlockMixedEcdsaSchnorr` (1:4 schnorr:ecdsa) | **114.01 ms** | ≥ 168.4 ms (**≥ 1.48×**) |
-| `ConnectBlockAllSchnorr` | **113.82 ms** | ≥ 360.2 ms (**≥ 3.16×**) |
+| `ConnectBlockMixedEcdsaSchnorr` (1:4 schnorr:ecdsa) | **114.01 ms** | ~~≥ 168.4 ms (≥ 1.48×)~~ → **≥ 124.2 ms (≥ 1.09×)** |
+| `ConnectBlockAllSchnorr` | **113.82 ms** | ~~≥ 360.2 ms (≥ 3.16×)~~ → **≥ 129.2 ms (≥ 1.13×)** |
 
 The mixed case is the one to watch: Core's own comment says blocks between
 848,000 and 868,000 run roughly 20 % Schnorr to 80 % ECDSA, so that row is the
-closest thing in this document to a projection of the modern chain — and it says
-we would be **at least ~1.5× slower per block there**, driven almost entirely by
-the Schnorr gap. Again, no harness on our side; these are floors composed from
+closest thing in this document to a projection of the modern chain. It said we
+would be **at least ~1.5× slower per block there, driven almost entirely by the
+Schnorr gap**; after 2026-08-23 the same composition says **≥ 1.09×**, and the
+all-Schnorr row moves from ≥ 3.16× to ≥ 1.13×. Again, no harness on our side; these are floors composed from
 tier-1 and tier-2 measurements, and they exclude UTXO lookups, undo-log writes,
 block-level checks and coinbase handling that `ConnectBlock` also performs.
 
@@ -570,28 +613,38 @@ suite. All single-core, ours ÷ theirs.
 
 | | factor | where |
 |---|---|---|
-| **Schnorr / BIP340 verify** | **3.35×** | tier 1 — the largest measured gap, and it lands on the taproot-heavy part of the chain the replay has not reached |
-| **RIPEMD-160 throughput** | **3.16×** | tier 1 |
+| **RIPEMD-160 throughput** | **3.16×** | tier 1 — **now the largest gap**, and see the note below |
 | **SHA-1 throughput** | **2.68×** | tier 1 |
-| **Merkle root** | **2.24×** | tier 1 — Core's 2-way SHA-NI batch |
-| **SHA-256d over 64-byte pairs** | **2.24×** | tier 1 — same cause as merkle |
-| **Block-level consensus check** | **1.99×** | tier 2 — *and Core is doing strictly more work* |
+| **Block-level consensus check** | **1.99×** | tier 2 — *and Core is doing strictly more work*; the merkle half of it improved 2026-08-23, not re-measured |
 | **SHA-512 throughput** | **1.79×** | tier 1 |
 | **SHA-256 over 1 MB** | **1.15×** | tier 1 |
+| **Merkle root** | ~~2.24×~~ → **1.17×** | tier 1 — 2026-08-23, 2-way batch |
+| **SHA-256d over 64-byte pairs** | ~~2.24×~~ → **1.14×** | tier 1 — same change |
+| **Schnorr / BIP340 verify** | ~~3.35×~~ → **~1.19×** | tier 1 — 2026-08-23, `PERF_SCOPE.md` §13 |
 | **ECDSA verify** | **1.12×** | tier 1 — down from 5.5× on 2026-08-21 |
-| P2TR key-path input verify | **≥ 3.49×** | tier 2, composed lower bound |
-| P2TR script-path input verify | **≥ 1.98×** | tier 2, composed lower bound |
+| P2TR key-path input verify | ~~≥ 3.49×~~ → **≥ 1.25×** | tier 2, composed lower bound |
 | P2WPKH input verify | **≥ 1.18×** | tier 2, composed lower bound |
-| Whole block, Schnorr-heavy | **≥ 3.16×** | tier 2, composed lower bound |
-| Whole block, realistic 1:4 mix | **≥ 1.48×** | tier 2, composed lower bound |
+| Whole block, Schnorr-heavy | ~~≥ 3.16×~~ → **≥ 1.13×** | tier 2, composed lower bound |
+| Whole block, realistic 1:4 mix | ~~≥ 1.48×~~ → **≥ 1.09×** | tier 2, composed lower bound |
+| P2TR script-path input verify | ~~≥ 1.98×~~ → **≥ 0.71×** | tier 2 — the bound has stopped being informative, see tier 2 |
+
+**On RIPEMD-160 and SHA-1, now the two worst rows: neither is worth fixing,
+and that is a measurement, not an opinion.** Neither appears in
+`PERF_SCOPE.md` §11's live-profile top 22, so each is under ~0.5 % of replay
+cycles. SHA-1 is reachable only through `OP_SHA1`. RIPEMD-160 is reached once
+per P2PKH/P2SH/P2WPKH input through `hash160` — real, but the profile says it
+is not where the time goes. A 3× on 0.5 % is 0.3 %.
 
 **Where we are faster:** exactly one measured row — SHA-256 over a 32-byte input,
 **1.06×**. Plus the transaction-walk row, which is an architectural difference
 rather than a speed win and is not counted.
 
 That is the honest summary: **on every operation this suite could compare
-directly, this project is at or behind Bitcoin Core**, with the ECDSA gap now
-nearly closed and Schnorr the clear next target.
+directly, this project is at or behind Bitcoin Core.** As of 2026-08-23 the
+signature and hash rows are all inside ~1.2×, and the two worst remaining rows
+(RIPEMD-160 and SHA-1) are the two the live profile says do not matter. What
+is left that *does* matter is not in this table at all: the tier-2 and tier-3
+harnesses this document lists as missing.
 
 ---
 
@@ -795,3 +848,9 @@ New harnesses added by this branch:
 | `asm/tests/bench_checkblock.c` | `cons_verify` + tx walk on block 413,567 | `CheckBlockTest`, `DeserializeBlockTest` |
 | `asm/tests/bench_abi_audit.c` | callee-saved register preservation | none — this is ours to worry about |
 | `asm/tests/bench_abi_guard.S` | the trampoline and probe the above two use | — |
+
+Changed by the 2026-08-23 work (`PERF_SCOPE.md` §13):
+
+| file | what changed |
+|---|---|
+| `asm/tests/bench_hash_core.c` | the `SHA256D64` row now drives `sha256d64`, which is Core's actual opposite number; the old one-at-a-time `sha256d` shape is kept as a second row so the change is visible in the same table |

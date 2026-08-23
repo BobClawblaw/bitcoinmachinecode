@@ -2133,3 +2133,391 @@ fused 7+8, `Z3 = 4t0`, `t2 = 2t2`.
 * `tests/bench_point`'s operands are one fixed pair of curve points; the
   routines are straight-line over the field so this is not a correctness
   concern, but the digit-dependent call counts in §12.5 are fixture-specific.
+
+## 13. Closing the two largest gaps to Core — BUILT, 2026-08-23
+
+`BENCHMARKS.md` (2026-08-22) measured this project against Bitcoin Core
+operation by operation and named the two biggest gaps: **BIP340 Schnorr verify
+at 3.35×** and **the SHA-256d/merkle pair at 2.24×**. Both diagnoses in that
+document were correct. This section records what they cost, what was done, and
+— for the second one — the measurement that says it was worth far less than
+the ratio suggests.
+
+Every number below is CPU time (`CLOCK_THREAD_CPUTIME_ID`), min-of-15 rounds,
+`taskset -c 25`, taken on 2026-08-23 with the live replay (~470 % CPU), the
+Core oracle (~46 %) and another agent on the box. Before and after were
+measured in the same sitting on the same core, which is why the "before"
+column does not always match `BENCHMARKS.md`'s absolute numbers — that run was
+a different night with different contention. **Compare the columns, not the
+documents.**
+
+### 13.1 Schnorr — the diagnosis confirmed, and three separate causes
+
+`BENCHMARKS.md` guessed one cause. There were three, and they are worth
+separating because two of them are not about Schnorr at all.
+
+**Cause 1 — Schnorr never received the ECDSA multiply work.**
+`secp256k1_ecdsa.asm` has used `point_scalar_mul_fixed` for the G-side and
+`point_scalar_mul_glv` for the point-side since §4.3. `secp256k1_schnorr.asm`
+called plain `point_scalar_mul` **twice**. BIP340's `R = s·G − e·P` is
+structurally the same shape — one fixed base, one variable — so both
+substitutions apply directly.
+
+*The sign.* `s·G − e·P` is not `u1·G + u2·Q`, and the two obvious ways to
+handle that are not equivalent. Negating the **scalar** (`e' = n − e`) costs a
+subtraction and then makes `e' = 0` mean "infinity" for what was `e = n`, which
+never happens but has to be reasoned about. Negating the **Jacobian Y**
+(`(X, Y, Z) → (X, p−Y, Z)`) is four `sub`/`sbb`, is exact for every input, and
+leaves `Z` alone so the infinity case stays infinity. The code already did the
+second and it was kept unchanged; only the multiply above it moved.
+
+*The x-only lift.* `lift_x` goes through `pubkey_parse` on `0x02 || pk`, which
+is the even-Y root by construction, and is untouched. The even-Y check on `R`
+is untouched. What changed underneath them is only how `s·G` and `e·P` are
+computed.
+
+**Cause 2 — two field inversions where one was needed, and neither was
+needed for x.** `PERF_SCOPE.md` §4.2's item A′ flagged this a day early and
+nobody had done it: the tail did `fe_inv(Z²)` **and** `fe_inv(Z³)`. The
+`x(R) == r` test needs no inversion at all — `r` is a field element and the
+caller has already rejected `r ≥ p`, so
+
+    x(R) == r   ⟺   r · Z² == X   (mod p)
+
+exactly as `ecdsa_x_eq_mod_n` does for ECDSA, minus the `r + n` retry that
+only exists because ECDSA's `r` is a scalar mod `n`. The even-Y test genuinely
+does need the affine `y` — parity is not a projective invariant, and no
+Legendre-symbol trick recovers it (that trick works for the *square*-y variant
+BIP340 abandoned) — but it needs `Z⁻¹` once, not `Z⁻²` and `Z⁻³` separately.
+The x compare is now done **first**, so a rejected signature never reaches the
+inversion at all.
+
+**Cause 3 — `fe_inv` itself was doing 248 multiplies it did not need.**
+Once the count was down to one inversion, that one inversion measured
+**4,712 ns — 17 % of a whole verify.** The reason is that `fe_inv` walked the
+256 bits of `EXP = p−2` with `fe_mul(R,R,R)` for the squarings: `p−2` has 247
+set bits, so 255 squarings **plus 248 multiplies**, 503 `fe_mul` calls in all
+(the count §4.2 already recorded, without noticing it was the fixable half).
+`p − 2 = 2²⁵⁶ − 2³² − 979` is a long run of 1-bits, and the classical
+`x_k = a^(2^k − 1)` ladder reaches it in **255 squarings and 15 multiplies**.
+Fermat is unchanged; only the addition chain and the use of `fe_sqr` for the
+squares are new.
+
+Deliberately **not** done: a variable-time inversion. The obvious candidate is
+a binary xgcd like `sc_inv_var`, which is right there and measures **3,590 ns**
+for the scalar field — *slower than the 2,091 ns the addition chain now costs*.
+libsecp256k1's safegcd would land near 1,000 ns, saving a further ~1.1 µs
+(4 % of a verify) for ~600 lines of new consensus-critical primitive. That
+trade is not worth taking today and is written down here so the next session
+does not rediscover it.
+
+### 13.2 SHA-256d / merkle — the diagnosis confirmed, the VALUE measured, and
+it is small
+
+`BENCHMARKS.md` attributed the 2.24× entirely to Core's 2-way SHA-NI batch.
+**That is exactly right, and it is now measured on our own kernel rather than
+inferred.** A scratch harness alternating N independent `sha256_block_shani`
+chains on this CPU (Zen 5):
+
+| independent chains in flight | ns per compression | vs 1 |
+|---|---|---|
+| 1 | 26.88 | 1.000× |
+| **2** | **16.91** | **1.590×** |
+| 3 | 16.72 | 1.608× |
+| 4 | 16.75 | 1.605× |
+| 5 | 16.78 | 1.602× |
+| 6 | 16.67 | 1.612× |
+
+**Two is the right width on this CPU and three is not better** — measured, not
+assumed. The whole 2.24× is that 1.59× plus per-call overhead: `sha256d(x, 64)`
+cost 100.84 ns per pair, of which 3 × 26.88 = 80.6 ns is the three serial
+compressions and **20.1 ns (19.9 %) is `sha256_init`, a `rep movsb` of the 64
+input bytes, and building a padding block whose contents are a compile-time
+constant.**
+
+**But the end-to-end value of fixing it is ~0.2 %, and that is the finding
+that matters.** `merkle_root` has exactly **one** caller in the node
+(`cons_verify`, `bitcoin_cons.asm:175`) — there is no other 64-byte
+double-hash on any path. Counting SHA-256 compressions over three real mainnet
+blocks pulled from the Core oracle:
+
+| height | txs | inputs | merkle compressions | share of the block's SHA-256 |
+|---|---|---|---|---|
+| 772,000 | 515 | 1,055 | 1,566 | **6.7 %** |
+| 850,000 | 3,163 | 6,087 | 9,504 | **11.6 %** |
+| 963,000 | 4,321 | 8,541 | 12,987 | **10.2 %** |
+
+§11's live profile puts **all** of `sha256_block_shani` at 5.14 % of replay
+cycles, so merkle is **0.34 – 0.60 % of all cycles**. The Amdahl bound is
+therefore blunt: making `merkle_root` *infinitely fast* is worth at most
+**1.006×** end to end, and the 1.90× actually achieved is worth **≈1.002×**.
+Put the other way: at height 963,000 `merkle_root` costs 0.43 ms against
+191.8 ms of signature verification for the same block — **0.22 %**.
+
+It was built anyway, and the reason is the risk side rather than the reward
+side: it needed **no new cryptographic kernel**. `sha256d64` calls the
+existing, already-validated `sha256_block` twice per step with two independent
+states, and both padding blocks are `.rodata` constants because the two
+message lengths are always 512 and 256 bits. Nothing in it computes a hash
+round. A translation of Core's `Transform_2way` — 16 live `__m128i` and ~430
+lines of intrinsics — would have been the wrong trade for 0.2 %; this was not.
+
+`merkle_root` stages a **batch** of nodes before calling `sha256d64`, because
+one pair per call leaves consecutive pairs unable to overlap across the call
+boundary. Measured, at 9,001 leaves: 1 pair/call **76.8 ns/leaf**, 2 → 60.0,
+4 → 54.9, 8 → 53.2, 16 → 53.2. The curve is flat from 8; **16** is what
+shipped (1 KB of stack).
+
+### 13.3 Measured
+
+**Methodology, and why it is not the one at the top of this section.** The box
+got much busier partway through this session (load average went from ~5 to
+~40 — another agent started a 30-way parallel job). `PERF_SCOPE.md` §9 and
+`BENCHMARKS.md` both warn that a "before" from one window and an "after" from
+another is worthless, and this run proved it: the same untouched
+`ecdsa_verify` measured 22.46 µs at load 5 and 31.63 µs at load 42.
+
+So the before/after table below was taken by **building the baseline commit
+(`cffe48b`) into a second worktree and ALTERNATING the two binaries on the
+same core, base/new, base/new, three passes** — whatever the box is doing hits
+both sides inside the same few seconds. Each figure is the minimum over the
+three passes of a min-of-15 CPU-time (`CLOCK_THREAD_CPUTIME_ID`) measurement,
+2,000 operations per round, `taskset -c 25`. Load average was 39.9 at the
+start and 32.1 at the end, which is why the absolute numbers are worse than
+§13.1's — **the ratios are what this table is for.**
+
+| | baseline `cffe48b` | this branch | factor |
+|---|---|---|---|
+| `schnorr_verify` | **60.65 µs** | **25.45 µs** | **2.38×** |
+| `merkle_root`, 9,001 leaves | 100.50 ns/leaf | 53.89 ns/leaf | 1.86× |
+| SHA256D64 shape (1024 × 64 B) | 1.5733 ns/B | 0.8084 ns/B | 1.95× |
+| **`ecdsa_verify` — untouched control** | **21.20 µs** | **21.23 µs** | **1.00×** |
+
+The control is the point of the table: `ecdsa_verify` shares `fe_mul`,
+`fe_sqr`, `point_add`, `point_double`, the comb and the GLV ladder with
+everything that changed, and it did not move — 21.20 vs 21.23 µs, a 0.1 %
+difference against a 3-pass spread of 21.20–24.94. Whatever made Schnorr 2.38×
+faster did not come from a measurement artefact that would have moved ECDSA
+too. (`ecdsa_verify` does not call `fe_inv` at all since §4.2's item A, which
+is why the addition chain does not show up here.)
+
+Per-pass, so the spread is visible rather than described:
+
+| pass | base schnorr | new schnorr | base merkle | new merkle | base ecdsa | new ecdsa |
+|---|---|---|---|---|---|---|
+| 1 | 64.82 µs | 27.95 µs | 111.36 ns | 58.81 ns | 23.24 µs | 23.25 µs |
+| 2 | 60.65 | 25.45 | 100.50 | 53.89 | 21.20 | 21.23 |
+| 3 | 63.72 | 31.24 | 119.26 | 62.42 | 24.88 | 24.94 |
+
+Two component measurements were taken earlier in the session, on the quiet
+box (load ~5), and are quoted with that caveat:
+
+| | before | after | factor |
+|---|---|---|---|
+| `fe_inv` (scratch harness, 20,000 calls/round, min-of-15) | 4,712.4 ns | 2,091.2 ns | **2.25×** |
+| `sha256d64` vs `sha256d`, per 64-byte pair | 100.74 ns | 51.99 ns | 1.94× |
+
+**The Schnorr decomposition.** Each step was measured on its own as it was
+built, in one sitting on the quiet box (so this column's baseline is 58.99 µs
+rather than the 60.65 µs above — same code, quieter machine):
+
+| step | µs/verify | share of the total gain |
+|---|---|---|
+| baseline (`point_scalar_mul` twice, two `fe_inv`) | 58.99 | — |
+| + fixed-base comb for `s·G`, GLV+wNAF for `e·P` | 31.99 | **82 %** |
+| + projective `x(R) == r`, one inversion instead of two | 27.69 | 13 % |
+| + `fe_inv` addition chain | **25.92** | 5 % |
+
+**Schnorr is now within ~20 % of this project's own ECDSA verify** (25.45 vs
+21.23 µs in the same window), which is the right internal sanity check: the
+two do the same two multiplies, and what is left between them is Schnorr's one
+`fe_inv` (2.09 µs) and two tagged `sha256_full` calls against ECDSA's
+`sc_inv_var` (3.59 µs) and two `sc_mul`.
+
+### 13.3a A live consensus bug found on the way, and fixed
+
+Reading `secp256k1_schnorr.asm` closely enough to rewrite it turned up
+something that has nothing to do with performance: **the function was not
+thread-safe, and the node verifies blocks on worker threads.**
+
+The BIP340 challenge preimage was built in a process-global `.data` buffer
+(`schnorr_preimg`). `asm/daemon/tx_verify.c` spawns verify workers
+(`bmc_pthread_create`, `tx_verify.c:451` and `:955`), so two taproot key-path
+inputs verified at the same moment overwrote each other's preimage and each
+computed the *other's* challenge `e`. A wrong `e` gives a wrong `R`, so
+`x(R) != r` and **a valid signature is rejected** — which, inside a block,
+rejects a valid block.
+
+Reproduced rather than inferred: 8 threads × 20,000 verifications of the
+official BIP340 vectors — signatures the same binary accepts single-threaded —
+gave **1,982 false rejects**. With the preimage moved into `schnorr_verify`'s
+own stack frame: **0**. `tests/test_schnorr_thread_stress.c` is that harness,
+now in `make test`, and `scripts/mutate_check.py` puts the global buffer back
+to confirm the test fails when it should.
+
+The direction matters: false *reject*, not false accept — a corrupted preimage
+would have to hash to the exact challenge that particular signature commits to,
+a ~2⁻²⁵⁶ accident. So this is a chain-split/liveness bug, not a theft bug. It
+is also the shape that shows up in a replay as an unexplained "block rejected"
+and gets attributed to something else.
+
+The same commit adds the message-length bound the buffer never had: an
+over-long message used to run off the end of a 320-byte `.data` buffer, and
+now rejects cleanly, exactly as `secp256k1_taproot.asm`'s `tap_leaf_hash` was
+hardened to do on 2026-08-21.
+
+**The same bug class is still live one file over and is NOT fixed here.**
+`secp256k1_taproot.asm`'s `tagh_buf` and `tap_preimg` are process-global — its
+own header calls them "single-threaded global" — and they are on the taproot
+verify path that the same worker threads reach for every script-path spend.
+The 2026-08-19 TLS conversion covered the interpreter's scratch and never
+reached the secp256k1 layer. That is a separate change with its own tests; it
+does not belong in a performance branch. See `LOG.md`, 2026-08-23.
+
+### 13.4 End-to-end projection, and the Amdahl bound stated plainly
+
+**These are projections from §11's shares, not measurements.** Nothing here has
+been deployed; the replay is running the previous binary.
+
+§11's profile was taken at height ~700,000, where the verify mix is
+overwhelmingly ECDSA, so it contains **almost no Schnorr at all**. That makes
+it the wrong instrument for this change and the right one for the merkle
+change:
+
+- **Merkle.** `sha256_block_shani` is 5.14 % of cycles; §13.2 measures merkle
+  at 6.7–11.6 % of a block's SHA-256 work, i.e. **0.34–0.60 % of cycles**.
+  At 1.90× that recovers 0.16–0.28 % → **1.002–1.003× end to end**. The
+  ceiling, at infinite speed, is **1.006×**.
+- **Schnorr.** At §11's height the share is near zero, so the projection there
+  is **~1.00× and meaningless**. The number that matters is per-input:
+  `BENCHMARKS.md`'s tier-2 lower bound for a P2TR key-path input falls from
+  **≥ 72.04 µs to ≥ 26.30 µs**, and Core's `VerifyScriptP2TR_KeyPath` is
+  20.66 µs, so the floor on that input type goes from **≥ 3.49× to ≥ 1.27×**.
+  For Core's own `ConnectBlockMixedEcdsaSchnorr` shape (1 Schnorr : 4 ECDSA,
+  which Core's comment calls representative of blocks 848,000–868,000) the
+  composed lower bound falls from **≥ 1.48× to ≥ 1.09×**.
+
+**The Schnorr share is going to grow, and §11 cannot see it.** Taproot
+key-path spends are common from ~713,500; the replay is at ~772,000 and
+climbing. A profile taken today would put a materially larger share on
+`schnorr_verify` than the one this projection is built from, and every month
+of chain makes that worse. Re-profiling after deploy is the only honest way to
+close this — §11's shares have already inverted the ranking three times.
+
+### 13.5 Correctness
+
+**BIP340's official vectors.** `tests/test_schnorr` — 19 checks, 0 failures,
+including every published failure case.
+
+**Differential against Bitcoin Core, per signature.** A new `SCHNORR` command
+in `validation/core_verify_oracle.cpp` calls `XOnlyPubKey::VerifySchnorr`
+(libsecp256k1's `secp256k1_schnorrsig_verify`) directly, with no script, no
+transaction and no flags — so a malformed signature can be handed to Core and
+its verdict taken. `validation/gen_schnorr_diff_vectors.py` builds the corpus
+from a small independent pure-Python BIP340 implementation (not a port of
+anything in this repo, so a shared misunderstanding cannot cancel out).
+
+| class | what it is | committed | bulk run |
+|---|---|---|---|
+| `valid` | correct signatures | 1,200 | 100,000 |
+| `oddy` | **x(R) == r but y(R) ODD** — signed without BIP340's k-negation | 450 | 37,500 |
+| `infinity` | **s·G − e·P is the point at infinity** — r chosen freely, s = e·d | 150 | 12,500 |
+| `nolift` | pk is not any curve point's x (x³+7 not a QR) | 240 | 20,000 |
+| `bitflip` | one bit flipped, spread over r / s / msg / pk | 960 | 80,000 |
+| `s_ge_n`, `r_ge_p`, `pk_ge_p`, `pk_zero`, `s_zero`, `r_zero` | every range edge, incl. s == n, r == p, pk == p | 20 | 500 |
+
+**3,020 committed cases and 250,500 bulk cases, each run twice (GLV on and
+`BMC_ECDSA_GLV=0`), agree with Core exactly — 501,000 comparisons, 0
+mismatches, 0 false accepts.** The committed set is `tests/test_schnorr_diff`,
+wired into `make test`; the bulk set is out of tree.
+
+On "small-order-adjacent": secp256k1 has **prime** order, so there is no
+non-trivial small subgroup — the point at infinity is the entire story and it
+is the `infinity` class above.
+
+**`fe_inv`'s chain.** `asm/validation/fe_inv_chain.py` **parses the assembly**,
+evaluates the exponent each `FEINV_SQN` / `FEINV_MUL` produces over Python's
+integers, and asserts it equals `p − 2` exactly (255 squarings, 15 multiplies);
+change a rung in the `.asm` and it fails. `tests/test_fe_repr` adds **252,555
+addition-chain cases against the frozen naive-binary `fe_inv_ref`** — 250,000
+random plus structured `k`, `p−k`, `2^k`, `2^k−1`, `p−2^k` for k = 1..256 and
+zero — 0 differences, on top of the 1,600 Python ground-truth vectors and the
+1,547-value structured digest it already carried.
+
+**Merkle.** `tests/test_merkle_batch` (new, in `make test`): `sha256d64` ==
+`sha256d` for every batch count 0..128 over 200 random fills including the
+odd tail and a no-overrun check, and `merkle_root` == the one-node-at-a-time
+algorithm it replaced for **every leaf count 1..2050** — which covers every
+odd level, every batch boundary, and the in-place overwrite. Real chain data:
+`cons_verify` recomputes every txid and the merkle root and compares it to the
+header, and it accepts **989 real mainnet blocks** pulled from the Core
+oracle: 389 spread across heights 0–963,000 (dense around the segwit
+activation at 481,824 and across the taproot era) **plus a contiguous run of
+600, heights 850,000–850,599**. All 989 accepted, i.e. all 989 merkle roots
+byte-identical to the header.
+
+**ABI.** `sha256d64`, `merkle_root`, `fe_inv`, `schnorr_verify` and
+`schnorr_x_eq_r` all probed with `tests/bench_abi_guard.S`'s sentinel probe:
+**clean**, no callee-saved register destroyed.
+
+**Mutation campaign — `scripts/mutate_check.py`, 11 mutants, 10 caught, 1
+documented-unobservable.** Every mutant is a real instruction or numeric
+constant in the shipped assembly; the script **refuses** a mutation whose
+anchor text appears only inside a comment, because an earlier attempt in this
+project was vacuous for exactly that reason. Mutants: drop the even-Y test;
+compute `s·G + e·P`; `e·G` instead of `s·G`; drop the top limb from the x
+compare; one squaring short in the `fe_inv` chain; the wrong operand in a
+chain rung; a 256-bit length in `sha256d64`'s 512-bit padding block; no state
+reset before the second SHA-256; `jae`→`ja` on the odd-level duplication; a
+64-byte write stride where 32 is right.
+
+The eleventh is worth reading, because finding it changed the code. Dropping
+`schnorr_verify`'s **infinity check** survives the entire 250,500-case Core
+corpus — `point_add` writes the canonical infinity `(1, 1, 0)`, so an infinite
+`R` reaches the compare as `X == 1, Z == 0` and `r·0 == 1` is false, and the
+signature is rejected by the x compare instead. No input can distinguish the
+two versions. The check stays because the compare **alone** would accept a
+`(0, ·, 0)` infinity against `r == 0`, and `tests/test_schnorr_diff` now
+asserts exactly that hazard (`schnorr_x_eq_r(0,0,0) == 1`). The mutation is
+marked `expect_survive` with that reasoning in the script rather than deleted.
+
+Finding the *other* survivor changed the code too: "check only 3 of the 4
+limbs of x(R)" is invisible to any corpus of real signatures, because it needs
+an `(r, X, Z)` where `r·Z²` agrees with `X` in three limbs and differs in the
+fourth — a ~2⁻¹⁹² accident that no signature can be steered into. The compare
+was therefore lifted into an exported `schnorr_x_eq_r`, following the exact
+precedent of `ecdsa_x_eq_mod_n` (exported "ONLY so tests can drive the r+n
+branch"), and `tests/test_schnorr_diff` drives it with **179,377 constructed
+triples** — matching ones plus every single-limb perturbation of `X` and of
+`r`. The mutation is now caught.
+
+### 13.6 Full test results
+
+* `make -k test`: **MAKE_RC=0, zero failures.**
+* `make abi-check`: OK.
+* Out of tree: 250,500 BIP340 cases × 2 GLV settings vs Core — 0 mismatches.
+* Out of tree: `cons_verify` over **989 real mainnet blocks** from the Core
+  oracle (389 spread over heights 0–963,000 plus a contiguous 850,000–850,599)
+  — all accepted, i.e. every merkle root byte-identical to its header.
+
+### 13.7 Not verified
+
+* **Nothing here has been deployed and no live profile of it exists.** §13.4
+  is arithmetic over §11's shares, and §11 predates the taproot-dense part of
+  the chain the replay is now in.
+* **No tier-3 end-to-end run.** `BENCHMARKS.md`'s reasons still hold: the box
+  carries a ~470 % replay plus another agent, and `bench_tier3.sh check` does
+  not pass.
+* The Schnorr differential uses **32-byte messages only** for the Core half,
+  because `XOnlyPubKey::VerifySchnorr` takes a `uint256` — which is also the
+  only shape consensus ever uses. Variable-length BIP340 messages are covered
+  only by the official vectors (which include 0, 1, 17 and 100-byte messages).
+* `e ≥ n` as an input edge is **unreachable**: `e` is a SHA-256 digest reduced
+  mod n by the verifier itself, and a digest ≥ n happens with probability
+  ~2⁻¹²⁸. The reduction is exercised by every case; the ≥ n branch of it is
+  not.
+* The merkle share in §13.2 is counted from three blocks, and the compression
+  model for the sighash side is analytic (preimage sizes), not instrumented.
+* `MK_STAGE` was swept at 1, 2, 4, 8 and 16 only; 32 and 64 need the frame
+  offsets recomputed and were not tried. The curve is flat from 8, so this is
+  unlikely to matter.
