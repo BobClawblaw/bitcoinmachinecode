@@ -36,22 +36,55 @@ assembly.
 
 ## Status
 
-**Current state (2026-08-22).** Block-level script verification (Stage D of
+**Current state (2026-08-23).** Block-level script verification (Stage D of
 `PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
 acceptance test: a from-scratch, full-signature-verification replay of the
-real mainnet archive (no `assumevalid`), **past height 727,000 of 963,000**
-with every fix deployed, currently sustaining ~15 blocks/s through the
-taproot era. **Twenty-four real defects** have been found and fixed with
-regression tests pinned to real chain data (`LOG.md` has the narrative for
-each, including the mistakes and the wrong diagnoses).
+real mainnet archive (no `assumevalid`), **past height 806,000 of 963,000**
+with every fix deployed. **Twenty-nine real defects** have been found and
+fixed with regression tests pinned to real chain data (`LOG.md` has the
+narrative for each, including the mistakes and the wrong diagnoses).
+
+Throughput, measured on an otherwise-quiet box: **5.67 blocks/s** over a clean
+300-second window at heights 805,295–806,996. An earlier figure of ~15
+blocks/s was taken at height ~727,000 and the two are **not comparable** — a
+block in the taproot era carries several times the signature work of one from
+2021, so a replay rate is only meaningful with its height band attached. Every
+end-to-end number in this project is quoted that way, or not quoted.
+
+**The UTXO set has been proved equal to Bitcoin Core's, not merely accepted.**
+A replay that rejects nothing proves only that no block was refused; it says
+nothing about whether the *state* those blocks built is right. So the live
+set is now hashed with **MuHash3072** over a filtered view and diffed against
+Core's own `gettxoutsetinfo muhash` at the same height. At height 792,979 —
+102,532,574 entries — the txout count, the total amount
+(19,393,405.70154310 BTC), the bogosize and the hash all match Core exactly.
+Independently re-verified at height 200,000, where correcting the genesis
+coinbase and **exactly one height field** reproduces Core's hash byte for byte
+across 2,318,056 entries. That one field is a real defect (`LOG.md` incident
+\#29): on a BIP30 duplicate coinbase, Core's `AddCoin(possible_overwrite=true)`
+overwrites and we decline to. Count, amount and bogosize are all blind to it —
+only the hash could see it, which is the entire argument for having one.
 
 **Read `ASSESSMENT.md` before drawing conclusions from any of this.** The
 short version: this is a consensus *verification engine*, not a node — no
 mining, no PSBT, no wallets, no testnet, no light-client indexes, and a thin
-RPC surface. On the one primitive comparable like-for-like it is within ~1.2×
-of libsecp256k1, down from 5.5× two days ago; its end-to-end speed against
-Core has never been measured; and its consensus correctness is being actively
-established rather than established.
+RPC surface. On the primitives comparable like-for-like it is within ~1.0–1.2×
+of Core (ECDSA verify ~1.0×, Schnorr ~1.2× down from 3.35×, SHA-256d and
+merkle ~1.17× down from 2.24×); its end-to-end speed against Core has never
+been measured; and its consensus correctness is being actively established
+rather than established.
+
+Those per-primitive ratios are also, on their own, misleading about where the
+remaining distance to Core actually is. Profiling the live replay at height
+~797,000 on an idle box found **32 worker threads asleep and one thread
+running** — taproot inputs are verified in a sequential pass at both block-
+connection entry points, while every other input shape fans out across the
+worker pool. The main thread is 67% field arithmetic because it is doing all
+of the taproot signature work by itself. The cause is process-global scratch
+in `secp256k1_taproot.asm`, and the effect is that per-signature tuning has
+been optimising a path that runs on one core. `PERF_SCOPE.md` section 14 has
+the measurement; parallelising that pass now precedes any further arithmetic
+work.
 
 The defects worth knowing: genesis was missing from the archive, so every
 buried soft fork activated one block late (a false-ACCEPT, structurally
