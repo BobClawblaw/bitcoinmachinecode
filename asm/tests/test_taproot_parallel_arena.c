@@ -58,7 +58,7 @@ extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long heig
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
 /* ---- prevout table ------------------------------------------------------ */
-typedef struct { u8 key[36]; u64 value; u32 spklen; u8 spk[128]; } prev_t;
+typedef struct { u8 key[36]; u64 value; u32 spklen; u8 spk[512]; } prev_t;
 static prev_t g_prev[TAV_NPREV];
 static long g_nprev;
 static int prev_cmp(const void* a, const void* b){ return memcmp(a, b, 36); }
@@ -67,7 +67,7 @@ long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
                   u64* value, u64* height, u64* coinbase,
                   const u8** spk, unsigned long* spklen){
     (void)lst; (void)u;
-    static u8 scratch[128];
+    static u8 scratch[512];
     u8 key[36]; memcpy(key, txid, 32); memcpy(key+32, &index, 4);
     prev_t* e = bsearch(key, g_prev, g_nprev, sizeof(prev_t), prev_cmp);
     if (!e) return 0;
@@ -314,6 +314,75 @@ int main(void){
         }
         printf("  4  single-tx path     %d tx, accept and corrupted-reject   %s\n",
                (int)TAV_NTX, bad?"FAIL":"ok");
+        fails += bad;
+    }
+
+    /* ---- 5: the >= 0xfd guard on the aggregate scriptPubKey array ----
+     * BIP341's `sp` array carries ONE length byte per entry, so a prevout
+     * script of 253 bytes or more cannot be expressed in it and the whole
+     * transaction must be refused. No real block has one, so without this the
+     * refusal has no coverage at all -- and it is the sizing pass of the very
+     * arena whose failure mode is a silent overrun rather than a loud error.
+     *
+     * It is ANY input's prevout script, not just the taproot one's: BIP341
+     * commits to all of them. So this grows a sibling's script -- specifically
+     * the WITNESSLESS one (TAV_MIXED_IN), because growing a witnessed input's
+     * script makes it stop looking like a witness program and Phase 1 rejects
+     * it as "unexpected witness on a non-witness script" long before the arena
+     * is reached. Block 825,000 has exactly one transaction of that shape and
+     * the generator keeps it on purpose. ---- */
+    {
+        long bad = 0;
+        unsigned i = TAV_MIXED_TX;
+        const u8* p = g_txbytes[i] + 4;
+        if (p[0]==0x00 && p[1]==0x01) p += 2;
+        u64 nin = *p++;                       /* every fixture tx has nin < 0xfd */
+        for (u64 k=0;k<TAV_MIXED_IN;k++){ p += 36; u64 sl = *p; p += 1 + sl + 4; }
+        u8 key[36]; memcpy(key, p, 36);
+        prev_t* victim = bsearch(key, g_prev, g_nprev, sizeof(prev_t), prev_cmp);
+        if (!victim || nin < 2){
+            printf("  FAIL 5: fixture's mixed transaction is not the expected shape\n");
+            bad++;
+        } else {
+            u32 save_len = victim->spklen; u8 save[512];
+            memcpy(save, victim->spk, save_len);
+            victim->spklen = 253;             /* exactly the first refused size */
+            memset(victim->spk, 0x51, 253);
+            unsigned list[1] = { i };
+            build(list, 1, 1);
+            u64 ft = ~0ull; const char* w2 = "?"; const char* w1 = "?";
+            int r2 = tx_verify_block_connect_all(g_txs, g_ntx, TAV_HEIGHT, g_bh,
+                                                 NULL, NULL, NULL, &ft, &w2);
+            int r1 = tx_verify_block_connect(g_txbytes[i], (u64)g_txlen[i], TAV_HEIGHT,
+                                             g_bh, NULL, NULL, &w1);
+            /* 252 must still be accepted -- the limit is >= 0xfd, not > 0xfd,
+             * and an off-by-one here is a FALSE REJECT of a real transaction. */
+            victim->spklen = 252; memset(victim->spk, 0x51, 252);
+            build(list, 1, 1);
+            u64 ft3 = ~0ull; const char* w3 = "?";
+            int r3 = tx_verify_block_connect_all(g_txs, g_ntx, TAV_HEIGHT, g_bh,
+                                                 NULL, NULL, NULL, &ft3, &w3);
+            victim->spklen = save_len; memcpy(victim->spk, save, save_len);
+
+            if (r1 != 0 || r2 != 0 || ft != 1){
+                printf("  FAIL 5: 253-byte prevout script: single=%d block=%d blamed=%llu\n",
+                       r1, r2, (unsigned long long)ft);
+                bad++;
+            } else if (!strstr(w1, "too large") || !strstr(w2, "too large")){
+                printf("  FAIL 5: wrong reason: single=%s block=%s\n", w1, w2);
+                bad++;
+            }
+            /* At 252 the aggregate array is representable, so the transaction
+             * must get past the arena. It still fails afterwards -- the legacy
+             * input's signature is over the real script, not 252 OP_1 bytes --
+             * so what is asserted is that the reason is NOT the size refusal. */
+            if (r3 == 0 && strstr(w3, "too large")){
+                printf("  FAIL 5: 252-byte prevout script refused as too large: %s\n", w3);
+                bad++;
+            }
+            if (!bad)
+                printf("  5  >=0xfd prevout spk  refused at 253, not at 252, both entry points   ok\n");
+        }
         fails += bad;
     }
 
