@@ -50,7 +50,46 @@ P2POBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o
 # cons_verify (block consensus) uses pow_check/merkle_root/sha256d + tx_parse.
 CONSOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_cons.o
 
-.PHONY: all asm test clean abi-check callee-saved-check
+# ---------------------------------------------------------------------------
+# Object/source groups used by rules FURTHER DOWN THIS FILE.
+#
+# A prerequisite list is expanded WHEN MAKE READS THE LINE; a recipe is
+# expanded when the recipe RUNS.  So a group named in a prerequisite list
+# before its own assignment expands to NOTHING there, while the recipe on the
+# next line still gets the full list.  The rule then links objects make was
+# never told about: fine on a warm tree, "cannot find X.o" on a fresh clone or
+# under -j.  Every one of these five was in exactly that state (found by
+# `make prereq-check`, 2026-08-23) -- so they all live up here now, above
+# every rule that names them.
+# ---------------------------------------------------------------------------
+# bitcoin_idx.asm: O(1) hash->height index for serving (standalone deps).
+IDXOBJS := bitcoin_idx.o
+# LSM-tree UTXO store: bounded memtable + per-generation WAL + sorted runs.
+UTXOLSMOBJS := bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o
+# The FULL daemon object list, matching the daemon/bitcoind link below.
+DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
+    bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
+    node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o \
+    bitcoin_serve.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
+    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
+    secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
+    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
+    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
+    bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o \
+    bitcoin_script_flags.o sha1.o
+# C sources of the tx-accept / script-verify path linked into the serve and
+# daemon harnesses.
+SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c bitcoin_scriptverify.c \
+    bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+# asm/wallet_core.c's verified asm primitives (keys, addresses, sighash, ECDSA,
+# BIP39/BIP32, field/scalar/point ops).
+WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
+               bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
+               bitcoin_hash.o sha256.o ripemd160.o \
+               bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
+               bitcoin_utxo.o
+
+.PHONY: all asm test clean abi-check callee-saved-check prereq-check
 
 # Per-test private working directory helper. Every test that includes it must
 # list it as a prerequisite, or a change to the isolation mechanism silently
@@ -551,16 +590,7 @@ tests/test_block_genesis: tests/test_block_genesis.c $(CONSOBJS)
 # tests/test_bitcoind linked fine only because stale .o files happened to
 # already exist on disk from earlier incremental builds; a clean rebuild
 # failed with "cannot find X.o" at the final link step.
-DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
-    bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
-    node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o \
-    bitcoin_serve.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
-    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
-    secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
-    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
-    secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
-    bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o \
-    bitcoin_script_flags.o sha1.o
+# DAEMONOBJS is defined at the top of this file -- see the "expanded when read" note there.
 
 tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) $(VERSION_GEN_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS)
@@ -634,7 +664,7 @@ tests/test_keys: tests/test_keys.c $(KEYSOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_keys.c $(KEYSOBJS)
 
 # bitcoin_idx.asm: O(1) hash->height index for serving (standalone deps).
-IDXOBJS := bitcoin_idx.o
+# IDXOBJS is defined at the top of this file -- see the "expanded when read" note there.
 tests/test_idx: tests/test_idx.c $(IDXOBJS)
 	$(CC) -no-pie -O0 -o $@ tests/test_idx.c $(IDXOBJS)
 
@@ -653,8 +683,7 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
     bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
-SERVETXVALSRCS := daemon/tx_accept.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c bitcoin_scriptverify.c \
-    bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+# SERVETXVALSRCS is defined at the top of this file -- see the "expanded when read" note there.
 tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O0 -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
 
@@ -834,7 +863,7 @@ tests/test_utxo_store: tests/test_utxo_store.c $(UTXOSTOREOBJS) $(TEST_TMPDIR_H)
 # approach above for full-archive replay to fix write amplification.
 # NOT wired into DAEMONOBJS -- Phase 2 (compaction) is a hard gate before
 # any live-daemon use; today's only real caller is daemon/build_utxo.c.
-UTXOLSMOBJS := bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o
+# UTXOLSMOBJS is defined at the top of this file -- see the "expanded when read" note there.
 
 # PERF_SCOPE.md 4.1: the mmap fast path must be indistinguishable from the
 # asm path it short-circuits -- differential + concurrency, incl. the
@@ -1084,8 +1113,16 @@ tests/test_bip30: tests/test_bip30.c bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 # tests/bip30_shim, which implements the rule itself and is NOT linked into
 # bitcoind -- so it validated a reimplementation. This drives utxo_live.c.
 # See LOG.md incident #30.
+# REORGSRCS_NOMAIN was referenced by the prerequisite list below and never
+# defined anywhere in this file, so the rule declared NO sources at all and
+# editing any of them left the binary stale.  Defined here, and used by the
+# recipe too, so the two lists cannot drift apart again.
+REORGSRCS_NOMAIN := daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
+    daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c \
+    bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c \
+    bitcoin_taproot_sighash.c
 tests/test_bip30_daemon: tests/test_bip30_daemon.c $(REORGSRCS_NOMAIN) $(REORGOBJS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O0 -Wall -I tests -o $@ tests/test_bip30_daemon.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread
+	$(CC) -no-pie -O0 -Wall -I tests -o $@ tests/test_bip30_daemon.c $(REORGSRCS_NOMAIN) $(REORGOBJS) -lpthread
 
 bitcoin_sigops.o: bitcoin_sigops.asm bitcoin_scriptcodec.asm
 	$(NASM) -f elf64 -o $@ bitcoin_sigops.asm
@@ -1328,11 +1365,7 @@ tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXAC
 # hash160, base58check_encode, sighash_all, ecdsa_verify, BIP39 mnemonic<->seed,
 # BIP32 master/path/extkey) plus the verified scalar/point/field ops (sc_*,
 # point_scalar_mul, fe_*) used to construct ECDSA signatures.
-WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
-               bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
-               bitcoin_hash.o sha256.o ripemd160.o \
-               bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
-               bitcoin_utxo.o
+# WALLETPRIMS is defined at the top of this file -- see the "expanded when read" note there.
 daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 	$(CC) -no-pie -O0 -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 
@@ -1517,8 +1550,33 @@ callee-saved-check:
 	python3 ../scripts/abi_callee_saved_audit.py --asmdir . \
 	    --format summary --check > /dev/null
 
+# ---------------------------------------------------------------------------
+# BUILD guard -- "the recipe uses what the rule never asked for".
+#
+# Twice on 2026-08-23 a recipe consumed a file its own rule never declared:
+# tests/bench_abi_audit linked bitcoin_script.o without listing it (dead under
+# -j with "/usr/bin/ld: cannot find bitcoin_script.o"), and the test: rule ran
+# ./tests/test_bip30_daemon while a scripted edit had added the binary to a
+# COMMENT instead of the prerequisite list. Both passed on this machine and
+# only on this machine, because the file was already lying around.
+#
+# `make prereq-check` compares every rule's recipe against its own prerequisite
+# closure and fails on any file the recipe uses that make was never told about.
+# It asks make for both halves -- `make -qp` for the expanded prerequisites,
+# `make -n -B --trace` for the expanded recipes -- so $(CONSOBJS), $(REORGOBJS)
+# and $(sort $(A) $(B)) are resolved by make itself, not by a regex.
+#
+# Run against 8a977cb it reports 225 unlisted objects across 11 rules, every
+# one of them a group variable used in a prerequisite list ABOVE its own
+# assignment: prerequisites expand when make READS the line, recipes when they
+# RUN, so the rule linked objects it had declared as nothing at all.
+# ---------------------------------------------------------------------------
+prereq-check:
+	python3 ../scripts/makefile_prereq_audit.py --asmdir . \
+	    --format summary --check > /dev/null
 
-test: abi-check callee-saved-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch \
+
+test: abi-check callee-saved-check prereq-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial daemon/bitcoind tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz
 	./tests/test_abi_stack_align
 	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
