@@ -407,11 +407,21 @@ bip32_derive_path:
 ;   void bip32_fingerprint(u8 fp[4], const u8 pub[33])
 ; ============================================================================
 global bip32_fingerprint
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx/r12 are saved at [rbp+0x08]/[rbp+0x10] and the 20-byte HASH160 output
+;   at [rbp-0x20 .. rbp-0x0d] is inside this function's own 0x30 reservation.
+;   Previously the pushes followed `mov rbp,rsp`, putting saved r12 at rbp-0x18
+;   -- only 16 bytes above the buffer, which hash160 fills with 20. The top
+;   4 bytes of the digest landed on saved r12's low half, so the CALLER got a
+;   corrupted r12. Confirmed with tests/bench_abi_guard.S: pre-fix,
+;   bip32_fingerprint returns CLOBBERS r12.
+;   ALIGNMENT IS UNCHANGED: same three pushes, same 0x30 reservation, only
+;   reordered; the nested hash160 call still sees RSP == 0 mod 16.
 bip32_fingerprint:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x30           ; h160 at [rbp-0x20]
     mov  rbx, rdi            ; fp
     mov  r12, rsi            ; pub
@@ -423,9 +433,9 @@ bip32_fingerprint:
     mov  eax, [rbp-0x20]
     mov  [rbx], eax
     add  rsp, 0x30
+    pop  rbp
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================

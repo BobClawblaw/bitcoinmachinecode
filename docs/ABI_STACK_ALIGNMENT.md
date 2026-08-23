@@ -7,6 +7,15 @@ cd asm && make asm
 python3 ../scripts/abi_stack_audit.py --asmdir . --objdir . --format functions
 ```
 
+> **This document is about ALIGNMENT ONLY.** There is a second, independent SysV
+> obligation -- that `rbx`, `rbp`, `r12`, `r13`, `r14`, `r15` survive a call --
+> and this tree was broken on it in twenty-one functions while every table below
+> was green. See LOG.md incident #27, `scripts/abi_callee_saved_audit.py`
+> (`make callee-saved-check`) and `asm/tests/bench_abi_audit`. A function passing
+> `make abi-check` says nothing about whether it preserves registers, and vice
+> versa. The fixes for #27 were deliberately parity-neutral -- reordering pushes,
+> not resizing frames -- so every number in this document is unchanged by them.
+
 ## The rule
 
 **At the `call` instruction RSP must be 0 mod 16.** The callee therefore sees

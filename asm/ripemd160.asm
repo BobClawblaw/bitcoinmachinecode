@@ -311,22 +311,35 @@ rmd_f_right:
 ;   out : 20-byte digest
 ;   in  : message (len bytes)
 ;
-; LOCAL FRAME (all at [rbp-...], below saved regs [rbp-8..-0x28]):
+; LOCAL FRAME (all at [rbp-...], inside this function's own reservation):
 ;   state h0..h4   [rbp-0x30,-0x2c,-0x28,-0x24,-0x20]  (5 dwords, updated)
 ;   working        [rbp-0x40] (T), [rbp-0x44] (K), [rbp-0x48] (f-select)
 ;   idx/rot        [rbp-0x3c] (idx), [rbp-0x38] (rot)
 ;   X[16] LE dwords [rbp-0x90..-0x50]
 ;   pad scratch    [rbp-0x118..-0x99] (128 bytes)
+;
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP, NOT BELOW IT.
+;   The pushes come before `push rbp`, so rbx/r12/r13/r14/r15 are preserved at
+;   [rbp+0x08 .. rbp+0x28] and every [rbp-N] local above is inside the 0x120
+;   reservation and cannot alias them.
+;   The previous order (`push rbp` / `mov rbp,rsp` / five pushes) put saved r15
+;   at rbp-0x28 and saved r14 at rbp-0x20, exactly where state words h2/h3/h4
+;   live -- so the epilogue popped digest bytes into the CALLER's r14 and r15.
+;   Confirmed by tests/bench_abi_audit before this change.
+;   ALIGNMENT IS UNCHANGED: still six pushes then `sub rsp,0x120`, merely
+;   reordered, so RSP has the same parity at every instruction after the
+;   prologue as it did before (entry 8 -> 5 pushes -> 0 -> push rbp -> 8 ->
+;   sub 0x120 -> 8; previously 8 -> push rbp -> 0 -> 5 pushes -> 8 -> 8).
 ; ============================================================================
 ripemd160:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub  rsp, 0x120           ; locals down to rbp-0x148; X at -0x90, pad at -0x118
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x120           ; locals down to rbp-0x120; X at -0x90, pad at -0x118
 
     mov  r12, rdi             ; out
     mov  r13, rsi             ; in
@@ -440,12 +453,12 @@ ripemd160:
 
     mov  [r12+16], eax
     add  rsp, 0x120
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ----------------------------------------------------------------------------

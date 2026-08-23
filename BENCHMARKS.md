@@ -629,13 +629,20 @@ nearly closed and Schnorr the clear next target.
 
 ## Bugs found while building this suite
 
-None of these are fixed here — this branch is measurement infrastructure, and
-repairing a consensus-path primitive belongs in its own change with its own
-tests. `asm/tests/bench_abi_audit` is the standing, reproducible check;
+`asm/tests/bench_abi_audit` is the standing, reproducible check;
 `scripts/bench_vs_core.sh` runs it before any timing and prints the result next
 to the numbers.
 
-### 1. Six functions return with callee-saved registers destroyed
+### 1. Six functions return with callee-saved registers destroyed — FIXED
+
+> **Status: fixed on branch `abi-callee-saved`.** Twenty-one functions in total,
+> not six: the six below (five of them; `cons_verify` needed no edit of its own) plus fifteen more found by
+> `scripts/abi_callee_saved_audit.py`, the static whole-tree auditor written for
+> the fix. `asm/tests/bench_abi_audit` now reports **14 clean, 0 violating** and
+> is wired into `make test`, alongside a new `make callee-saved-check`. The rest
+> of this section is the original diagnosis, kept because it is the record of
+> what each frame looked like. See the end of the section for what the fix
+> measured.
 
 The System V AMD64 ABI requires `rbx`, `rbp`, `r12`, `r13`, `r14` and `r15` to
 survive a call. `asm/tests/bench_abi_audit` loads six distinct sentinels into
@@ -705,14 +712,66 @@ unaffected.
 **`make abi-check` passes on all of this.** `scripts/abi_stack_audit.py` and
 `asm/tests/test_abi_stack_align.c` audit RSP 16-alignment at call sites, which is
 a different (and also useful) property. This class of bug is invisible to them.
-`asm/tests/bench_abi_audit` is deliberately **not** wired into `make test` yet,
-because it currently fails by design; wiring it in is the natural second half of
-fixing these.
 
 A static scan for the same pattern also flagged, unverified dynamically:
 `sha512_block`, `bitcoind.asm` `node_drain` and `node_serve_block`,
 `bitcoin_mempool.asm` `mpool_put`, `bip32_fingerprint`, and all four
 `bitcoin_bip39.asm` entry points.
+
+#### What the fix found and measured
+
+Every one of those static candidates was real, and six more turned up with them.
+Twenty-one functions were repaired, all by the same edit — move the callee-saved
+pushes **above** `push rbp`, so the save area lands at `[rbp+8 …]` and every
+`[rbp-N]` local is inside the function's own reservation. Nineteen were
+demonstrably defective (nine measured with `tests/bench_abi_guard.S`, ten proved
+by arithmetic); `node_log_event` and `cmd_getbalance` share the shape with
+enough slack not to be firing and are converted with their neighbours:
+
+| file | function | what aliased what |
+|---|---|---|
+| `ripemd160.asm` | `ripemd160` | state h2..h4 on saved r15/r14 |
+| `bitcoin_addr.asm` | `hash160` | SHA-256 buffer on saved r13/r14 |
+| `bitcoin_hash.asm` | `pow_check` | block_hash output on saved r13 |
+| `bitcoin_interp.asm` | `script_eval` | fExec/pc/pend/pbegincodehash/nOpCount on all five |
+| `bitcoin_multisig.asm` | `p2sh_hash` | r13/r14 used as scratch, never saved |
+| `sha512.asm` | `sha512_block` | T1/tmp/Maj on saved rbx/r12/r13 |
+| `node_log.asm` | `node_log_str` | line buffer on saved rbx/r12/r13/r14 — **live in the daemon** |
+| `node_log.asm` | `node_log_event` | same shape, 56 bytes of slack, not yet firing |
+| `bitcoin_bip32.asm` | `bip32_fingerprint` | HASH160 output 4 bytes into saved r12 |
+| `bitcoin_bip39.asm` | `bip39_generate`, `bip39_mnemonic_to_entropy`, `bip39_mnemonic_to_seed`, `bip39_parse` | argument spills on saved r12..r15 |
+| `bitcoin_mempool.asm` | `mpool_put` | blob offset on saved r12 |
+| `bitcoin_cli.asm` | `cmd_getbestblockhash`, `cmd_getblockhash`, `cmd_getblock` | 32-byte block hash 8 bytes into saved r15 |
+| `bitcoin_cli.asm` | `cmd_getbalance` | same frame shape and epilogue, 20 bytes of slack, not yet firing |
+| `bitcoind.asm` | `node_drain`, `node_serve_block`, `node_serve_block_by_hash` | buflen/plen/idx and 32-byte hashes on saved r14/r15 |
+
+`node_log_str` was the only one firing in the live daemon rather than merely
+latent: `daemon/main.c` logs lines of up to 42 characters into a buffer with 16
+bytes of headroom, so **every log line the node wrote destroyed four of its
+caller's registers** and corrupted the low bytes of saved `rbp`.
+
+**The Makefile's optimisation folklore was this bug.** `daemon/pverify` is pinned
+to `-O1` with the comment that the `cons_verify -> tx_parse / sha256d` chain
+"misparses a block when the C driver is compiled at aggressive -O2+, a documented
+codegen interaction". A harness that replays that exact chain over
+`block413567.raw`, linked against pre-fix and post-fix objects:
+
+| build | pre-fix | post-fix |
+|---|---|---|
+| `-O0` | 400 blocks, 0 bad, acc 121800 | 400 blocks, 0 bad, acc 121800 |
+| `-O1` | 400 blocks, 0 bad, **acc 504** | 400 blocks, 0 bad, acc 121800 |
+| `-O2` | **400 blocks, 400 bad** | 400 blocks, 0 bad, acc 121800 |
+| `-O3` | **400 blocks, 400 bad** | 400 blocks, 0 bad, acc 121800 |
+
+There is no compiler quirk. `-O2` put a live value in `r13`, `pow_check`
+destroyed it, and the verifier called every block invalid. `-O1` is not safe
+either — it returns the right verdict with a corrupted accumulator, which is the
+worse failure mode. Post-fix all four levels agree exactly.
+
+**The `-O0`/`-O1` pins are NOT changed in the fix commit.** Changing the
+optimisation level of consensus code deserves its own change, its own
+differential and its own deploy. What the table above establishes is that the
+stated reason for the pins no longer holds.
 
 ### 2. `connect=` does not stop the download worker from dialling DNS seeds
 

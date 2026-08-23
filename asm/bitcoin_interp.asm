@@ -303,15 +303,39 @@ section .text
 ;   bitcoin_scriptcodec.asm's own scriptnum_serialize, already TLS-converted
 ;   there -- no slot needed here)
 ;   (computed once here; unused-but-reserved scratch space, no frame resize)
+;
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP, NOT BELOW IT.
+;   The five pushes come before `push rbp`, so rbx/r12/r13/r14/r15 are saved at
+;   [rbp+0x08 .. rbp+0x28] and every local listed above -- which starts at
+;   rbp-0x08 and runs to rbp-0xB0 -- lies inside this function's own 0x108
+;   reservation. Nothing aliases.
+;   Before this change the order was `push rbp` / `mov rbp,rsp` / five pushes,
+;   which put saved rbx at rbp-0x08, r12 at rbp-0x10, r13 at rbp-0x18, r14 at
+;   rbp-0x20 and r15 at rbp-0x28 -- i.e. exactly on fExec, pc, pend,
+;   pbegincodehash and nOpCount. The epilogue's five pops therefore handed the
+;   CALLER interpreter state instead of its own registers, on the consensus
+;   path, for every input of every transaction. Nothing had broken yet only
+;   because every C caller on that path is pinned to -O0 (see asm/Makefile),
+;   and -O0 keeps nothing live in callee-saved registers across a call.
+;   tests/bench_abi_audit reproduces the pre-fix behaviour: CLOBBERS rbx r12
+;   r13 r14 r15.
+;
+;   ALIGNMENT IS UNCHANGED (incidents #18/#20, docs/ABI_STACK_ALIGNMENT.md):
+;   this is the same six pushes and the same 0x108 reservation, only reordered,
+;   so RSP has an identical value modulo 16 at every instruction after the
+;   prologue. Before: entry 8 -> push rbp -> 0 -> 5 pushes -> 8 -> sub 0x108
+;   -> 0. After: entry 8 -> 5 pushes -> 0 -> push rbp -> 8 -> sub 0x108 -> 0.
+;   All 215 nested call sites, including `call qword [r12+96]` into the C
+;   checksig callback, still see RSP == 0 mod 16. NO FRAME WAS RESIZED.
 ; ============================================================================
 script_eval:
-    push  rbp
-    mov   rbp, rsp
     push  rbx
     push  r12
     push  r13
     push  r14
     push  r15
+    push  rbp
+    mov   rbp, rsp
     sub   rsp, 0x108          ; ODD multiple of 8, on purpose -- SysV alignment.
                               ;   Entry RSP == 8 mod16; `push rbp` -> 0 mod16;
                               ;   the 5 callee-saved pushes -> 8 mod16 again.
@@ -2297,12 +2321,12 @@ script_eval:
     xor   eax, eax
 .done:
     add   rsp, 0x108          ; must match the prologue reservation above
+    pop   rbp                 ; save area is ABOVE rbp -- rbp pops first
     pop   r15
     pop   r14
     pop   r13
     pop   r12
     pop   rbx
-    pop   rbp
     ret
 
 ; ============================================================================
