@@ -44,8 +44,10 @@ with every fix deployed. **Twenty-nine real defects** have been found and
 fixed with regression tests pinned to real chain data (`LOG.md` has the
 narrative for each, including the mistakes and the wrong diagnoses).
 
-Throughput, measured on an otherwise-quiet box: **5.67 blocks/s** over a clean
-300-second window at heights 805,295–806,996. An earlier figure of ~15
+Throughput, measured on an otherwise-quiet box: **~5 blocks/s** in the
+806,000 range — two clean 300-second windows gave 4.84 and 5.67 blk/s, and
+that ~15% spread between adjacent windows is itself the point: per-block work
+varies enough that a single window is not a figure. An earlier figure of ~15
 blocks/s was taken at height ~727,000 and the two are **not comparable** — a
 block in the taproot era carries several times the signature work of one from
 2021, so a replay rate is only meaningful with its height band attached. Every
