@@ -170,57 +170,68 @@ plus straightforward methods on top of it.
   boot path. Not a live, queryable index.
 - **`blockfilterindex`** (BIP157/158, "neutrino" light-client support) —
   absent. No hits for blockfilter/bip157/bip158/cfilter/golomb-rice.
-- **`coinstatsindex` / `gettxoutsetinfo`** — absent. **Now the most
-  valuable gap to close:** the scratch Core oracle has `coinstatsindex`
-  on, so a UTXO-set hash on our side (`hash_serialized_3` or MuHash3072
-  over the live LSM set) would turn Stage D's acceptance test from "no
-  block rejected" into "byte-identical UTXO set to Core at height H" —
-  which is the only test that could have caught incident #6 (a rule
-  applied too loosely is invisible to a replay). **Medium.**
-  - Prerequisite now in place (2026-08-22, incident #17): the LSM keeps an
-    accurate live-UTXO *count* across restarts, persisted runs-only in the
-    versioned manifest and restored as base + WAL-tail net, with a
-    one-time full dedup recount for old-format manifests
-    (`mac_lsm_recount`). That recount is a read-only k-way merge that
-    already visits exactly the live set — it is the natural place to hang
-    a set hash, so the expensive half of `gettxoutsetinfo` is written.
-    Note the count alone is NOT the acceptance test: `txouts` matching
-    Core proves cardinality, not contents.
-  - **BLOCKER found 2026-08-22 the moment that count first became
-    trustworthy: our UTXO set stores provably-unspendable outputs and
-    Core's does not.** At height 575,833 we hold **77,191,281** entries;
-    the oracle's `gettxoutsetinfo none 575833` reports **54,953,225**
-    `txouts` — we carry **22,238,056** more. Root cause is in
-    `daemon/utxo_live.c:339`: `live_on_output` calls `utxo_lsm_put` for
-    every output with no script inspection whatsoever, while Core never
-    writes a provably-unspendable output to the chainstate (a script whose
-    first opcode is `OP_RETURN`, or one larger than `MAX_SCRIPT_SIZE`
-    = 10,000 B). Confirmed by magnitude, not just by mechanism: sampling
-    the oracle every 25,000 blocks to 575,833 gives ~37.7 nulldata outputs
-    per block, extrapolating to **~21.7M** — the observed delta to within
-    2.5 %.
-  - **This is NOT a consensus divergence.** An `OP_RETURN` output cannot be
-    spent either way: Core rejects the spend for a missing prevout, we find
-    the entry and then fail the script immediately. Same verdict, different
-    route. It costs storage (tens of millions of dead entries, and the
-    write/compaction amplification they cause) and it makes `txouts`/set-hash
-    parity with Core impossible until fixed — which is precisely the
-    acceptance test above.
-  - Note the codebase already made this exact argument, for exactly one
-    output: `utxo_live.c:548` excludes the genesis coinbase because
-    applying it "would leave this node one UTXO richer than Core forever,
-    surfacing the first time our set is compared against
-    `gettxoutsetinfo`". The reasoning was right and was never generalized
-    from one output to twenty-two million.
-  - **Deliberately NOT fixed mid-replay.** The filter itself is a few lines,
-    but it only takes effect for outputs applied *after* it lands — the
-    22M already-stored entries would persist until a full rebuild, so the
-    change is worth little without one, and a rebuild costs the whole
-    replay. It also carries a genuine false-reject risk if the
-    unspendable test is ever looser than Core's, which is the dangerous
-    direction. Sequence it with the set-hash work and a from-scratch
-    rebuild, and gate it on a differential test against Core's
-    `IsUnspendable` semantics.
+- **`coinstatsindex` / `gettxoutsetinfo`** — **the read side now exists**
+  (2026-08-23, branch `utxo-set-hash`). `daemon/utxo_setinfo` computes
+  `txouts`, `total_amount`, `bogosize` and a **MuHash3072** set hash over a
+  filtered view of the LSM set, and `validation/diff_utxo_setinfo.py` diffs
+  those against a live Core node's `gettxoutsetinfo` at the same height.
+  There is still no RPC and no live index — this is a tool, and it needs a
+  QUIESCED datadir (it detects a busy one and refuses; see below).
+  - **The result, on the PRODUCTION datadir at height 792,979:** `txouts`
+    102,532,574, `total_amount` 19,393,405.70154310 BTC, `bogosize`
+    7,739,642,957 and MuHash `e7e65c06...649e776a` — **all four identical to
+    Core**, with two entries' height field corrected for the BIP30 issue
+    below. Our raw live set there is 155,001,147 entries, of which 52,468,573
+    are filtered out as provably unspendable; the surviving 102,532,574 match
+    Core's count to the unit. At height 91,721, before any BIP30 duplicate
+    exists, all four match with no correction at all. That is the acceptance
+    test ASSESSMENT.md §4 asked for, actually run.
+  - **Which hash, and why not the other one.** `gettxoutsetinfo
+    hash_serialized_3 <height>` is REFUSED by Core ("hash type cannot be
+    queried for a specific block"): only `muhash` is answerable at an
+    arbitrary height, because only `muhash` is what `coinstatsindex` stores,
+    and our replay is never at the oracle's tip. Separately, MuHash is
+    order-independent, which matters because our key comparator (`mac_cmp_key`)
+    orders the output index by its LITTLE-ENDIAN BYTES — index 256 sorts
+    before index 1 — while Core hashes a txid's outputs in NUMERIC index
+    order. hash_serialized_3 over our iteration order would have been wrong
+    for every transaction with ≥256 simultaneously-live outputs.
+  - **The unspendable blocker is solved as a VIEW, not a rebuild.**
+    `bitcoin_utxo_stats.asm` applies Core's `CScript::IsUnspendable` (leading
+    `OP_RETURN`, or size > `MAX_SCRIPT_SIZE` = 10,000) while ITERATING, so the
+    ~22.2M dead entries stay on disk and stop counting. No rebuild, no cost to
+    the running replay. Filtering at write time remains the (optional) storage
+    change, and is still not done.
+  - **Two real divergences from Core's chainstate were found by it**, both
+    invisible to the count/amount/bogosize stages and visible only to the
+    hash — which is precisely the argument for having a set hash at all:
+    1. **The genesis coinbase.** `daemon/utxo_live.c` excludes it (Core never
+       writes it to the chainstate); `daemon/build_utxo.c` does NOT. A
+       batch-seeded set is one entry, 50 BTC and 117 bogosize richer than
+       Core forever. `utxo_setinfo --exclude-genesis-coinbase` compensates at
+       read time; the two writers still disagree with each other, and that
+       should be fixed at the source.
+    2. **BIP30 duplicate coinbases.** Core's exception path calls
+       `AddCoin(..., possible_overwrite=true)`, so the LATER block's coin wins
+       and Core's chainstate holds height 91,880 / 91,842. `utxo_lsm_put`
+       returns "duplicate" and keeps the EARLIER coin, height 91,722 / 91,812.
+       Same txid, index, value and script — so cardinality and value are blind
+       to it. Proven exactly: with those two heights overridden, our MuHash at
+       height 200,000 is byte-identical to Core's. **This is a false-accept
+       shape**: our copy of a coinbase looks 158 blocks older than Core's, so
+       between heights 91,880 and 91,980 we would have accepted a spend Core
+       rejects as immature. Long past, and no such transaction exists — but
+       the mechanism (duplicate put does not overwrite) is live code.
+  - **Reading a live LSM.** `data/` is written continuously; a read that
+    straddles a flush or compaction mixes states. The tool fingerprints every
+    UTXO file's inode/size/nanosecond-mtime plus the directory itself, twice
+    before the read and once after, and REFUSES on any change rather than
+    guessing. `utxo_lsm_reload_ro` / `utxo_store_init_ro` make the whole read
+    path genuinely read-only (the ordinary reload's `O_RDWR|O_CREAT` on
+    utxo.dat/utxo.idx was the only write in the chain).
+  - Still missing, and deliberately: a live `gettxoutsetinfo` RPC, an
+    incrementally-maintained index (Core's `coinstatsindex` updates per block;
+    ours is a full O(set) walk), and `hash_serialized_3`.
 
 ## Wallet
 
