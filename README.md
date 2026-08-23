@@ -37,15 +37,27 @@ assembly.
 ## Status
 
 **Current state (2026-08-23).** Block-level script verification (Stage D of
-`PLAN_SCRIPT_VERIFY.md`) is wired into block connection and running its
-acceptance test: a from-scratch, full-signature-verification replay of the
-real mainnet archive (no `assumevalid`), **past height 806,000 of 963,000**
-with every fix deployed. **Twenty-nine real defects** have been found and
-fixed with regression tests pinned to real chain data (`LOG.md` has the
-narrative for each, including the mistakes and the wrong diagnoses).
+`PLAN_SCRIPT_VERIFY.md`) has **completed its acceptance test**: a from-scratch,
+full-signature-verification replay of the real mainnet archive, no
+`assumevalid`, genesis through **height 963,000** -- within ~700 blocks of the
+live chain tip -- finishing 2026-08-23 11:25 with **zero rejects and zero
+fatals**. **Thirty-one real defects** were found and fixed along the way, each
+with a regression test pinned to real chain data (`LOG.md` has the narrative
+for every one, including the mistakes and the wrong diagnoses).
+
+**What that does and does not prove, stated first because it is the most
+important thing on this page.** It proves the node accepts everything the real
+chain contains. It says nothing about what the node would accept that Core
+*rejects*, and this project has repeatedly found that the two are different:
+on the last day alone, a `SETcc` writing eight bits where eleven numeric
+opcodes needed sixty-four diverged from Core on 11,780 of 63,036 generated
+scripts -- **5,050 of them in the false-ACCEPT direction** -- and BIP30 turned
+out not to be implemented in the daemon at all. Neither was reachable by
+replaying: no block in the chain exercises them, because Core-running miners
+never mined one. A clean replay would have run to tip with both present.
 
 Throughput, measured on an otherwise-quiet box: **~5 blocks/s** in the
-806,000 range — two clean 300-second windows gave 4.84 and 5.67 blk/s, and
+806,000-960,000 range — two clean 300-second windows gave 4.84 and 5.67 blk/s, and
 that ~15% spread between adjacent windows is itself the point: per-block work
 varies enough that a single window is not a figure. An earlier figure of ~15
 blocks/s was taken at height ~727,000 and the two are **not comparable** — a
@@ -230,10 +242,12 @@ what this node still does not do.
   check. Parallelized across every input in the block (a persistent worker
   pool, not per-block thread spawns) to make a full-archive replay
   affordable — **except taproot inputs, which both entry points still verify
-  in a sequential pass** (`PERF_SCOPE.md` section 14). **In progress**:
-  `bmc-bitcoind.service` is running a from-scratch replay of the real chain
-  against this path, currently past height 806,000. **Twenty-nine** real
-  defects it has surfaced so far — from an
+  in a sequential pass** (`PERF_SCOPE.md` section 14; the thread-local
+  conversion that unblocks parallelising it has landed, the parallelisation
+  itself has not). **Complete**: `bmc-bitcoind.service` ran a from-scratch
+  replay of the real chain against this path from genesis to height
+  **963,000**, finishing 2026-08-23 with zero rejects. **Thirty-one** real
+  defects it surfaced — from an
   LSM compaction manifest-ordering bug and an interpreter `OP_SIZE`
   register-width bug alongside a wholly-missing `OP_SHA1`, through the
   witness-stripped archive and the segwit-era spend bugs underneath it, to
@@ -242,11 +256,13 @@ what this node still does not do.
   numeric opcodes needed sixty-four (which diverged from Core in *both*
   directions on 11,780 of 63,036 generated scripts) — were root-caused and
   fixed, each with a regression test proven to fail against the pre-fix
-  code on real chain data. Two are **found but not yet fixed**: incident \#29
-  (a BIP30 duplicate coinbase keeps the pre-overwrite height, where Core's
-  `AddCoin(possible_overwrite=true)` replaces it) and a thread-unsafe global
-  in `secp256k1_taproot.asm` that is harmless only for as long as the taproot
-  pass stays sequential. See `LOG.md` for the narratives,
+  code on real chain data — including BIP30, which had a differential against
+  Core and a smoke test, both green, both driving a shim that implemented the
+  rule itself while the daemon implemented it nowhere (incident \#30).
+  One is **found but not yet fixed**: incident \#29, a BIP30 duplicate
+  coinbase keeping the pre-overwrite height where Core's
+  `AddCoin(possible_overwrite=true)` replaces it. See `LOG.md` for the
+  narratives,
   `PLAN_SCRIPT_VERIFY.md`'s Stage D table for the one-line-per-wall index,
   and the dated files in `worklog/`. Not yet reached chain tip.
 
