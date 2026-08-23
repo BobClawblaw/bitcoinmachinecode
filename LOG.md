@@ -7,6 +7,112 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #31: tap_merkle_root wrote its loop counter onto its own saved r12, and both static auditors called it clean
+
+Found by widening an instrument that already existed, not by cleverness.
+
+### The instrument gap
+
+The project has three ABI guards and they measure three different things:
+
+  * `make abi-check` -- static, 1,078 call sites. Audits **stack alignment**
+    (RSP == 0 mod 16 at every call leaving assembly). Says nothing about
+    register preservation; it passed cleanly on all 21 functions of #27.
+  * `make callee-saved-check` -- static, 374 functions. Audits whether what was
+    pushed is popped at every `ret`.
+  * `tests/bench_abi_audit` -- the **runtime sentinel probe**: fill
+    rbx/rbp/r12-r15 with known values, call the function, check them after.
+    This is the guard with teeth. It probed **fourteen** functions.
+
+Fourteen because it was written for BENCHMARKS.md tier 1 and covers what that
+benchmark calls. Everything a block's signatures actually run through --
+every secp256k1 primitive, every taproot helper, the constant-time ladder,
+chainwork -- was outside it. `tests/test_abi_coverage` (new) probes 34.
+
+It found a violation on its first run.
+
+### The bug
+
+`tap_merkle_root`, `secp256k1_taproot.asm`. Prologue:
+
+    push rbp
+    mov  rbp, rsp          ; rbp == rsp
+    and  rsp, -16          ; drops rsp by 0 OR 8 -- depends on the CALLER
+    push rbx               ; padding 0 -> lands at [rbp-0x08]
+    push r12               ; padding 0 -> lands at [rbp-0x10]
+    ...
+    sub  rsp, 0x28
+
+and the body:
+
+    ; i lives on the stack at rbp-0x10 (survives nested calls)
+    mov  qword [rbp-0x10], 0
+
+Because the callee-saved pushes happen **after** `and rsp,-16`, the distance
+from rbp down to them is not fixed -- it depends on the caller's alignment.
+When no padding was needed, saved r12 sat at exactly [rbp-0x10], and the loop
+counter was written straight onto it. `pop r12` then returned the counter.
+
+Measured, not argued -- a caller's r12 after the call:
+
+    control len  33 (0 siblings) -> r12 = 0
+    control len  65 (1 sibling)  -> r12 = 1
+    control len  97 (2 siblings) -> r12 = 2
+    control len 129 (3 siblings) -> r12 = 3
+
+i.e. exactly the final value of `i`.
+
+### Why the guards were green
+
+`callee-saved-check` verifies that pushes match pops. **They do.** The
+corruption is a local write landing on the save area, which a push/pop balance
+check cannot structurally see. `abi-check` audits alignment, a different
+property. Both were correct about what they measure; neither measures this.
+
+This is the same shape `tests/bench_abi_guard.S` documented on 2026-08-22 for
+`ripemd160`, `hash160` and `pow_check` -- "a digest buffer placed at rbp-0x30
+or similar, on a frame whose callee-saved pushes happen AFTER `mov rbp,rsp`".
+That header also says the other functions "were probed identically and are
+clean", which was true and misleading: `tap_merkle_root` was never in the
+probed set.
+
+### The fix
+
+The frame already reserves 40 bytes (`sub rsp,0x28`) and **used none of them**
+(zero `[rsp` references in the body), and rsp is untouched between the
+prologue's `sub` and the epilogue's `add`. So `i` moved to `[rsp+0x18]` -- four
+instructions, no frame-layout change.
+
+    probe before : 33 clean, 1 violating
+    probe after  : 34 clean, 0 violating
+
+Full suite 157 ran / 0 failed; `abi-check` OK (1,078 sites);
+`callee-saved-check` OK (374 functions).
+
+### Severity, stated honestly
+
+`daemon/bitcoind` is built `-O0`, where gcc reloads from memory around every
+call, so a caller never relied on the register and **nothing in production was
+corrupted**. It is a latent bug, not an outage. But it is also exactly the
+class that made the `-O0` pin necessary in the first place, and it is on the
+taproot script-path -- `taproot_verify_input` -> `tap_merkle_root`.
+
+Whether this is the cause of the `-O2` product failure recorded in the previous
+entry is **not established**. That crash corrupts a base register in
+`tx_verify_block_connect`'s frame, and the chain from a clobbered r12 to that
+symptom has not been traced. It is a candidate, not a conclusion. The `-O2`
+experiment should be re-run now that this is fixed, which is the obvious next
+step and was not done here.
+
+### What to take from it
+
+Three guards, all green, and a deterministic violation sitting in consensus
+code between them. The lesson is not "write more guards" -- it is that a guard
+has a **domain**, and the domain is usually much smaller than the confidence it
+inspires. `bench_abi_audit` said "14 clean, 0 violating" and every word was
+true. **Extending an existing instrument's coverage found more than adding a
+new kind of check would have.**
+
 ## 2026-08-23 -- the -O0 pin on daemon/bitcoind is still load-bearing, and the runtime ABI probe covers 14 functions out of ~374
 
 `asm/Makefile` builds `daemon/bitcoind` with `-no-pie -O0` -- the whole daemon C
