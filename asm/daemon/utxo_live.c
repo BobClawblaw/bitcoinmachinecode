@@ -177,6 +177,11 @@ struct lsm_state {
 #define UTXO_LIVE_BULK_SLOTS_LOG2 22
 #define UTXO_LIVE_BULK_BLOB_BYTES (1024UL<<20)
 #define UTXO_LIVE_BULK_GAP_BLOCKS 50000L
+/* ...and independently: a current-generation WAL at least this large means the
+ * RELOAD is batch-scale even when the remaining block gap is not. See
+ * utxo_live_init. 256 MB is ~5x the biggest tail steady-state operation can
+ * produce and ~1/7th of the one that wedged a restart on 2026-08-23. */
+#define UTXO_LIVE_BULK_WAL_BYTES (256ULL<<20)
 
 static void* g_utxo_table = 0;
 struct lsm_state g_utxo_lst;
@@ -348,6 +353,55 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
      * caller, apply_block_at). */
     long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, ctx->txid, out_index, value,
                           (u64)g_apply_height, (u64)ctx->is_coinbase, script, slen);
+
+    /* r == 0 means "this outpoint already exists"; utxo_put's .dup path
+     * declines the write and keeps the OLD record. For a coinbase output that
+     * is wrong -- Core overwrites. src/coins.cpp, AddCoins:
+     *
+     *     bool overwrite = check_for_overwrite ? cache.HaveCoin(...) : fCoinbase;
+     *     // Coinbase transactions can always be overwritten, in order to
+     *     // correctly deal with the pre-BIP30 occurrences of duplicate
+     *     // coinbase transactions.
+     *
+     * ConnectBlock calls AddCoins with check_for_overwrite defaulted false, so
+     * on the connect path `overwrite` is exactly `fCoinbase`, at every height,
+     * with no reference to BIP30 at all.
+     *
+     * Mainnet has two such duplicates: e3bf3d07...b468:0 (91,722 then 91,880)
+     * and d5d27987...8599:0 (91,812 then 91,842). Core's chainstate ends up
+     * holding the LATER height; ours held the earlier one. Nothing else in the
+     * set differed: at height 963,000 the MuHash over 165,847,393 entries
+     * matched Core byte for byte once exactly those two height fields were
+     * corrected (LOG.md incident #29). Count, amount and bogosize are all
+     * blind to a height field, so only the set hash could ever have seen it.
+     *
+     * It is not cosmetic: height feeds the 100-block coinbase-maturity rule,
+     * so between heights 91,880 and 91,980 we would have accepted a spend Core
+     * rejects as immature.
+     *
+     * del-then-put is the overwrite: the tombstone retires the old record and
+     * the second put writes the new one, which is what the WAL replays in
+     * order on reload. Live-count is unchanged (one del, one put) because the
+     * outpoint exists both before and after. */
+    if (r == 0 && ctx->is_coinbase) {
+        if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, ctx->txid, out_index) < 0) {
+            ctx->fatal = 1; return;
+        }
+        r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, ctx->txid, out_index, value,
+                         (u64)g_apply_height, (u64)ctx->is_coinbase, script, slen);
+        fprintf(stderr, "[utxo_live] h=%ld: duplicate coinbase outpoint overwritten (Core: AddCoins overwrite=fCoinbase)\n",
+                g_apply_height);
+    } else if (r == 0) {
+        /* A NON-coinbase duplicate. Core does not tolerate this at all: its
+         * AddCoin throws "Attempted to overwrite an unspent coin" when
+         * possible_overwrite is false. BIP30 is what makes it unreachable, and
+         * we now enforce BIP30 (incident #30) -- so reaching here means either
+         * a height where Core also skips the check, or a bug. Loud, not fatal:
+         * turning it fatal would be a new way to reject a block, and this has
+         * never been observed. */
+        fprintf(stderr, "[utxo_live] WARNING h=%ld: non-coinbase duplicate outpoint declined (Core's AddCoin would throw here)\n",
+                g_apply_height);
+    }
     if (r == -1 || r == 2) ctx->fatal = 1; /* -1 I/O error, 2 table full (undersized memtable) */
 }
 
@@ -592,8 +646,15 @@ static void* g_bip30_store = 0;
  * cleared by utxo_live_test_took_bip30_reject. */
 static int g_bip30_rejected = 0;
 
+/* TEST-ONLY: force the gate to "skip", so a harness can exercise the
+ * grandfathered path (heights 91,842 / 91,880) without forging a block whose
+ * hash matches IsBIP30Repeat. Zero effect unless a test sets it. */
+static int g_test_bip30_skip = 0;
+void utxo_live_test_force_bip30_skip(int on){ g_test_bip30_skip = on; }
+
 static int bip30_enforced(long height, const u8 hash32[32])
 {
+    if (g_test_bip30_skip) return 0;
     static const u8 REP0[32] = BIP30_REPEAT0_HASH;
     static const u8 REP1[32] = BIP30_REPEAT1_HASH;
     static const u8 B34 [32] = BIP30_BIP34_HASH;
@@ -1203,6 +1264,35 @@ int utxo_live_init(const char* dir){
     long boot_tip     = utxo_live_index_tip();
     long boot_gap     = (boot_tip >= 0) ? (boot_tip - boot_applied) : 0;
     g_bulk_mode = (boot_gap >= g_cfg.utxo_bulk_gap_blocks);
+
+    /* ...and ALSO go bulk when the WAL tail we are about to replay is large,
+     * regardless of how few blocks remain.
+     *
+     * The block gap alone answers "how much work is LEFT", not "how much work
+     * is about to be REPLAYED", and reload replays the whole current WAL
+     * generation before applying anything. Those diverge exactly once: right
+     * after a long catch-up finishes, when the gap collapses to ~0 while the
+     * WAL is at its largest. That is the one moment the old heuristic picked
+     * the SMALL memtable for the BIGGEST replay.
+     *
+     * Measured 2026-08-23: the 963,000-block replay left a 1.83 GB tail; the
+     * next restart had gap=750, chose 2^16 slots, filled the table, and
+     * ground to a halt (LOG.md incident #32). Sizing from the tail turns that
+     * restart into a normal one.
+     *
+     * The threshold is deliberately generous -- a WAL big enough to matter is
+     * orders of magnitude past this -- and bulk sizing costs address space,
+     * not resident memory, so over-selecting it is cheap and under-selecting
+     * it is what wedges a restart. */
+    {
+        struct stat wb;
+        if (!g_bulk_mode && stat("utxo.dat", &wb) == 0 &&
+            (unsigned long long)wb.st_size >= UTXO_LIVE_BULK_WAL_BYTES) {
+            fprintf(stderr, "[utxo_live] WAL tail is %lluMB -- bulk-sizing the memtable despite gap=%ld (see incident #32)\n",
+                    (unsigned long long)(wb.st_size >> 20), boot_gap);
+            g_bulk_mode = 1;
+        }
+    }
     txv_set_bulk_mode(g_bulk_mode);
 
     unsigned long slots = g_bulk_mode ? (1UL << g_cfg.utxo_bulk_slots_log2)
@@ -1523,6 +1613,10 @@ long utxo_live_recover(void){
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }
+/* TEST-ONLY: the live LSM handles, so a test can read a specific outpoint back
+ * out of the real store rather than infer it from counts. */
+void* utxo_live_test_lst(void){ return &g_utxo_lst; }
+void* utxo_live_test_tbl(void){ return g_utxo_table; }
 long utxo_live_count(void){ return utxo_lsm_count(&g_utxo_lst); }
 
 /* Handles onto the ONE live writable LSM instance, so a caller that needs to
