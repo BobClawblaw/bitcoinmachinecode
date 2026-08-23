@@ -264,6 +264,93 @@ int main(void){
     if (diffs){ printf("FAIL  %ld random in-range differences vs frozen reference\n", diffs); failures++; }
     else printf("PASS  %ld random in-range pairs vs frozen fe_ref (mul/add/sub/sqr), 0 differences\n", NR);
 
+    /* ---------- 3c. fe_inv ADDITION CHAIN differential (2026-08-23) ----------
+     * fe_inv stopped walking the bits of p-2 and now runs a fixed 255-squaring
+     * / 15-multiply addition chain (PERF_SCOPE.md section 13). That the chain's
+     * exponent equals p-2 is checked symbolically over the integers by
+     * validation/fe_inv_chain.py; THIS is the check that the assembly
+     * implements the chain it claims to.
+     *
+     * fe_inv_ref is the frozen naive-binary implementation, so every agreement
+     * below is between two structurally different computations of a^(p-2).
+     * The structured half matters more than the random half, for the same
+     * reason it does everywhere else in this file: a mis-sized rung is
+     * deterministic, not probabilistic. A run of 1-bits is exactly what the
+     * chain compresses, so operands with long limb runs (p-k, 2^k, 2^k-1) are
+     * the ones that would expose one.
+     */
+    {
+        const long NI = 250000;
+        long idiffs = 0, ichecks = 0;
+        for (long k = 0; k < NI; k++){
+            rnd_fe(a);
+            fe_inv(r, a); fe_inv_ref(r2, a);
+            if (!eq(r,r2)){
+                if (!idiffs){ printf("FAIL fe_inv != ref\n"); show("a",a); show("chain",r); show("ref",r2); }
+                idiffs++;
+            }
+            ichecks++;
+        }
+        for (int k = 1; k <= 256; k++){
+            for (int form = 0; form < 5; form++){
+                u64 v[4] = {0,0,0,0};
+                if (form == 0){ v[0] = (u64)k; }
+                else if (form == 1){                       /* p - k */
+                    memcpy(v, PL, 32);
+                    unsigned __int128 br = (u64)k;
+                    for (int q = 0; q < 4 && br; q++){
+                        unsigned __int128 t = (unsigned __int128)v[q] - (u64)br;
+                        v[q] = (u64)t; br = (t >> 64) & 1;
+                    }
+                }
+                else if (form == 2){ if (k >= 256) continue; v[k>>6] = 1ULL << (k & 63); }
+                else if (form == 3){                       /* 2^k - 1 */
+                    if (k >= 256) continue;
+                    for (int q = 0; q < 4; q++){
+                        int lo = q*64, hi = lo+64;
+                        if (k >= hi) v[q] = ~0ULL;
+                        else if (k > lo) v[q] = (1ULL << (k - lo)) - 1;
+                    }
+                }
+                else {                                     /* p - 2^k */
+                    if (k >= 256) continue;
+                    u64 t[4] = {0,0,0,0}; t[k>>6] = 1ULL << (k & 63);
+                    memcpy(v, PL, 32);
+                    unsigned __int128 br = 0;
+                    for (int q = 0; q < 4; q++){
+                        unsigned __int128 d = (unsigned __int128)v[q] - t[q] - br;
+                        v[q] = (u64)d; br = (d >> 64) & 1;
+                    }
+                }
+                if (!lt_p(v)) continue;
+                fe_inv(r, v); fe_inv_ref(r2, v);
+                if (!eq(r,r2)){
+                    if (!idiffs){ printf("FAIL fe_inv != ref (form %d k=%d)\n", form, k); show("a",v); show("chain",r); show("ref",r2); }
+                    idiffs++;
+                }
+                /* and the identity, which depends on neither implementation */
+                if (v[0]|v[1]|v[2]|v[3]){
+                    u64 one_chk[4];
+                    fe_mul(one_chk, v, r);
+                    if (!(one_chk[0]==1 && !one_chk[1] && !one_chk[2] && !one_chk[3])){
+                        if (!idiffs){ printf("FAIL fe_inv identity a*inv(a)!=1 (form %d k=%d)\n", form, k); show("a",v); }
+                        idiffs++;
+                    }
+                }
+                ichecks += 2;
+            }
+        }
+        memset(a, 0, 32);       /* both define fe_inv(0) == 0 */
+        fe_inv(r, a); fe_inv_ref(r2, a);
+        if (!eq(r,r2) || (r[0]|r[1]|r[2]|r[3])){ printf("FAIL fe_inv(0)\n"); idiffs++; }
+        ichecks++;
+        checks += ichecks;
+        if (idiffs){ printf("FAIL  %ld fe_inv addition-chain differences vs frozen fe_ref\n", idiffs); failures++; }
+        else printf("PASS  %ld fe_inv addition-chain cases vs frozen naive-binary fe_ref "
+                    "(%ld random + structured k / p-k / 2^k / 2^k-1 / p-2^k + zero), 0 differences\n",
+                    ichecks, NI);
+    }
+
     /* ---------- 4. bit-identity on NON-CANONICAL input ----------
      * fe_add/fe_sub are claimed bit-identical to the reference on the WHOLE
      * [0, 2^256) range, because "add p" and "subtract C" are the same
