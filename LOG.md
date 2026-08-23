@@ -7,6 +7,69 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- taproot verification moved onto the worker pool: 2.72 -> 26.6 effective cores
+
+PERF_SCOPE.md section 14 measured the live daemon on a quiet, 85%-idle box and
+found 32 verification worker threads asleep and one thread running at 67% field
+arithmetic. The cause was not scheduling: both block-connection entry points in
+`daemon/tx_verify.c` skipped `TXV_SHAPE_P2TR` in their worker loops and verified
+every taproot input in a sequential pass afterwards. That was a workaround for
+`secp256k1_taproot.asm`'s process-global staging buffers, which became
+thread-local earlier the same day.
+
+Section 14.7's design is now built (see 14.8 for the full write-up). A cheap
+sequential pass builds each taproot-bearing transaction's BIP341 aggregate data
+into one per-BLOCK arena; the arena is read-only for the whole of verification;
+taproot inputs then go to the pool like every other shape. Both skips and both
+sequential passes are gone.
+
+Measured over 36 taproot-dense blocks (825,000-825,015, 840,000-840,007,
+870,000-870,007, 850,000-850,001, 860,000-860,001; 247,725 inputs, 98,814 of
+them taproot), `tests/bench_taproot_block`:
+
+    main                          3,999 ms   2.72 effective cores    1.00x
+    + taproot in the pool           715 ms  18.80                    5.59x
+    + dynamic work claiming         534 ms  26.62                    7.49x
+
+**The 7.49x is the verification phase in isolation and nothing else.** The
+bench feeds a resolved in-memory prevout table; the live daemon resolves each
+prevout through the LSM sequentially, which is exactly why section 14 saw ~1.0
+cores live where this bench sees 2.72 on the same code. Applying section 14's
+live 67% figure gives at most ~2.4x on the connect path, and the UTXO apply
+does not move at all. That needs re-profiling on the daemon, not projecting --
+which is the entire lesson of section 14.3.
+
+### Three things worth keeping
+
+**The failure mode is silent, so the tests had to be mutation-tested.** A
+corrupted sighash produces no error, no assert and no bounds violation; it
+produces a verdict. Ten deliberate bugs were injected into the arena logic
+(wrong descriptor index, global index instead of local, wrong `nin`, wrong
+stripped transaction, big-endian amounts, strided instead of packed
+scriptPubKeys, and the old "P2TR is silently ok" skip at both entry points) and
+every one is caught by the two new tests. The two that matter most are the
+false-ACCEPT pair: a wrong arena can only ever cause a false REJECT, because a
+wrong sighash fails; an input that is never checked at all is the real danger.
+
+**Two corpus facts broke the first version of the reject probes, and both are
+about assuming a signature is always checked.** 5 transactions in the corpus
+spend taproot with SIGHASH_ANYONECANPAY, which drops `sha_amounts` and
+`sha_scriptpubkeys` from the sighash entirely -- so perturbing another input's
+amount is legitimately a no-op for them. 17 are script-path spends that never
+compute a sighash at all: an unknown leaf version, an `OP_SUCCESSx` leaf, or a
+tapscript with no CHECKSIG in it are each consensus-valid without one. The
+first version of the probe called all 22 of them failures. They are covered
+instead by breaking the control block's Merkle commitment, which is the one
+check every script-path spend must pass regardless of what its script says.
+
+**The CPU-time rise is SMT, and that had to be measured rather than argued.**
+Wall time fell 7.49x but process CPU time ROSE 31% (10,848 -> 14,225 ms), which
+looks like the change doing more total work. Pinned to 8 logical CPUs, so no
+two workers share a physical core, the same block costs 294.9 ms of CPU on
+`main` and 298.2 ms here -- +1.1%. The 31% is 26 threads sharing 16 physical
+cores, not extra work. Reporting only wall time would have hidden the question;
+reporting only the full-width CPU number would have answered it wrongly.
+
 ## 2026-08-23 -- the -O0 pin comes off: the last two -O2 failures were a base58 stack overflow in product asm and a one-byte harness overflow, and the daemon's own stated reason no longer reproduces
 
 Previous entry: rewriting `-no-pie -O0` -> `-no-pie -O2` gave 156 ran / 7 FAILED.
