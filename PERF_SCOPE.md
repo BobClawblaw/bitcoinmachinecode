@@ -2374,6 +2374,57 @@ The 2026-08-19 TLS conversion covered the interpreter's scratch and never
 reached the secp256k1 layer. That is a separate change with its own tests; it
 does not belong in a performance branch. See `LOG.md`, 2026-08-23.
 
+### 13.3b The refreshed comparison against Core, taken in one window
+
+`scripts/bench_vs_core.sh` was re-run, and its output at load 42 was
+discarded — Core's nanobench and libsecp256k1's `bench` both time with a WALL
+clock, so on a box at load 40 their numbers are inflated by descheduling that
+our `CLOCK_THREAD_CPUTIME_ID` harnesses do not see, which biases the ratio in
+our favour. The table below was taken instead by the same alternating method
+as §13.3: **Core's binary and ours, back to back on `taskset -c 25`, three
+passes, minimum of each.** Load average 40.2 at the start and 38.2 at the end.
+
+Ratios are ours ÷ theirs, so > 1 means we are slower.
+
+| operation | Core, this window | ours, this window | ratio | published 2026-08-22 |
+|---|---|---|---|---|
+| SHA-256, 1,000,000 B | 0.4051 ns/B | 0.4689 ns/B | **1.16×** | 1.15× |
+| SHA-256, 32 B | 41.0 ns | 39.83 ns | **0.97× (we are faster)** | 0.94× |
+| **SHA-256d, 64 B × 1024** | 0.7842 ns/B | **0.9140 ns/B** | **1.17×** | **2.24×** |
+| *— the same window, through the OLD `sha256d` path* | 0.7842 | *1.7400 ns/B* | *2.22×* | *2.24×* |
+| **Merkle root, 9,001 leaves** | 51.34 ns/leaf | **61.15 ns/leaf** | **1.19×** | **2.24×** |
+| ECDSA verify | 24.9 µs | 23.69 µs | 0.95× | 1.12× |
+| **Schnorr verify (BIP340)** | 25.6 µs | **29.96 µs** | **1.17×** | **3.35×** |
+
+**The italic row is the control that makes the rest of the table
+believable.** `bench_hash_core` still carries the old one-node-at-a-time
+`sha256d` shape alongside the new `sha256d64` one. In this window, under this
+load, on this core, the OLD path measures **2.22× Core** — reproducing the
+2.24× published on a quiet box on 2026-08-22 to within 1 %. So the
+alternating method survives a load-40 box for these shapes, and the 1.17×
+next to it is a real change rather than a measurement artefact.
+
+Two rows carry caveats and neither is a claim:
+
+- **ECDSA at 0.95× is not "we beat libsecp256k1".** libsecp256k1's `bench`
+  reports wall clock with no CPU/wall check; ours reports CPU time. Under
+  this load that difference alone is worth more than the 5 %. The honest
+  reading is "at parity, within the noise this box allows", and the quiet-box
+  1.12× from 2026-08-22 remains the number to quote. It is here as the
+  untouched control, and its job is to not have moved.
+- Core's own `bench_bitcoin` process measured **CPU/wall = 0.976** over the
+  three passes — i.e. it lost ~2.4 % of its measured wall time to
+  descheduling. `BENCHMARKS.md`'s rule is to discard the Core column if that
+  ratio drops materially below 1.0. 2.4 % is not material next to a 2.24× →
+  1.17× move, and it errs *against* us in the hash rows, but it is why this
+  table is labelled and not folded silently into `BENCHMARKS.md`'s tier-1
+  numbers.
+
+**The two gaps this session set out to close are closed to within ~20 %.**
+Schnorr 3.35× → 1.17×, SHA-256d 2.24× → 1.17×, merkle 2.24× → 1.19×. What
+that is worth end to end is §13.4, and for merkle the answer is "almost
+nothing".
+
 ### 13.4 End-to-end projection, and the Amdahl bound stated plainly
 
 **These are projections from §11's shares, not measurements.** Nothing here has
@@ -2493,8 +2544,17 @@ triples** — matching ones plus every single-limb perturbation of `X` and of
 
 ### 13.6 Full test results
 
-* `make -k test`: **MAKE_RC=0, zero failures.**
-* `make abi-check`: OK.
+* `make -k test`: **MAKE_RC=0, zero failures, 152 harnesses run** (149 on
+  `main` plus this branch's three: `test_schnorr_diff`,
+  `test_schnorr_thread_stress`, `test_merkle_batch`). Every "N failures" line
+  in the log reads 0; no `make` error lines. The count is stated because
+  silent test loss has bitten this project four times.
+* `make abi-check`: **OK**, 1,050 reachable call sites scanned, every call
+  site leaving assembly at RSP == 0 mod 16. (The 234 latent asm→asm
+  misalignments it also reports are pre-existing and tracked as LOG.md
+  incident #20; this branch adds none — `sha256d64` and `schnorr_x_eq_r` are
+  both 16-aligned at every nested call and `merkle_root`'s enlarged frame
+  keeps the property it had.)
 * Out of tree: 250,500 BIP340 cases × 2 GLV settings vs Core — 0 mismatches.
 * Out of tree: `cons_verify` over **989 real mainnet blocks** from the Core
   oracle (389 spread over heights 0–963,000 plus a contiguous 850,000–850,599)

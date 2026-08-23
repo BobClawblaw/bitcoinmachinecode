@@ -811,6 +811,18 @@ with the data and refuses to reuse a non-empty destination.
 
 ## Reproducing
 
+**2026-08-23 note on re-running this on a busy box.** `scripts/bench_vs_core.sh`
+was re-run after the §13 work and its output was discarded, because the
+machine was at load 42: Core's nanobench and libsecp256k1's `bench` both time
+with a WALL clock, while our harnesses use `CLOCK_THREAD_CPUTIME_ID`, so
+contention inflates their side more than ours and the ratio flatters us. The
+refreshed figures in this document were taken instead by **alternating Core's
+binary and ours back to back on one core, three passes, minimum of each** —
+and validated by a control: `bench_hash_core` still carries the OLD
+one-at-a-time `sha256d` shape, which in that same window measured 2.22× Core,
+reproducing the 2.24× on this page to within 1 %. `PERF_SCOPE.md` §13.3b has
+the full table and the CPU/wall ratio.
+
 ```bash
 # everything, default settings (pins to cpu 25, 3 process reps, min-of-15 rounds)
 scripts/bench_vs_core.sh
