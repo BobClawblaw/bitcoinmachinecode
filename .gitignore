@@ -37,6 +37,9 @@ asm/tests/test_ibd_scale
 asm/tests/test_log
 asm/tests/test_net
 asm/tests/test_p2p
+asm/tests/test_merkle_batch
+asm/tests/test_schnorr_diff
+asm/tests/test_schnorr_thread_stress
 asm/tests/test_point
 asm/tests/test_scalar
 asm/tests/test_scalarmul

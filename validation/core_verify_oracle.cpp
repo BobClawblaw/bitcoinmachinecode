@@ -36,6 +36,8 @@
 #include <script/verify_flags.h>
 #include <uint256.h>
 #include <util/strencodings.h>
+#include <pubkey.h>
+#include <span.h>
 
 static std::vector<unsigned char> hex2bytes(const char* h){
     std::vector<unsigned char> v;
@@ -54,7 +56,46 @@ int main(){
         std::istringstream iss(line);
         std::string cmd; iss>>cmd;
         if(cmd=="QUIT") break;
-        if(cmd=="SIGENC"){
+        if(cmd=="SCHNORR"){
+            /* SCHNORR <pk32_hex> <msg32_hex> <sig64_hex>
+             *   -> Core's XOnlyPubKey::VerifySchnorr (pubkey.cpp), i.e.
+             *      libsecp256k1's secp256k1_schnorrsig_verify, called directly
+             *      with no script, no transaction and no flags.
+             *
+             *      Added 2026-08-23 so the BIP340 verify in
+             *      asm/secp256k1_schnorr.asm can be differentially compared
+             *      against Core PER SIGNATURE rather than only through
+             *      TAPVERIFY's whole-input verdict, which folds the answer
+             *      together with the interpreter, the witness classification
+             *      and the sighash. The rewrite of that file (fixed-base comb
+             *      for s*G, GLV+wNAF for e*P, projective x(R)==r) needs an
+             *      oracle that can be handed a MALFORMED signature -- an
+             *      x-only key that does not lift, s >= n, r >= p, R with odd
+             *      Y -- and asked what Core says. TAPVERIFY cannot express
+             *      those directly; this can.
+             *
+             *      Core only ever verifies 32-byte BIP340 messages (the
+             *      taproot sighash), and XOnlyPubKey::VerifySchnorr's
+             *      signature says so, so this command takes exactly 32.
+             *      Variable-length BIP340 messages are covered by the
+             *      official test vectors instead.
+             *   Output: OK <0|1> 0 schnorr
+             */
+            std::string pks, msgs, sigs;
+            iss>>pks>>msgs>>sigs;
+            std::vector<unsigned char> pk  = hex2bytes(pks.c_str());
+            std::vector<unsigned char> msg = hex2bytes(msgs.c_str());
+            std::vector<unsigned char> sig = hex2bytes(sigs.c_str());
+            if (pk.size()!=32 || msg.size()!=32 || sig.size()!=64){
+                printf("OK 0 %d %s\n", (int)SCRIPT_ERR_UNKNOWN_ERROR, "bad-schnorr-operand");
+                fflush(stdout); continue;
+            }
+            XOnlyPubKey xpk{std::span<const unsigned char, 32>(pk.data(), 32)};
+            uint256 m(msg);
+            bool ok = xpk.VerifySchnorr(m, std::span<const unsigned char, 64>(sig.data(), 64));
+            printf("OK %d 0 schnorr\n", ok?1:0);
+            fflush(stdout);
+        } else if(cmd=="SIGENC"){
             /* SIGENC <flags_hex> <sig_hex>
              *   -> Core's CheckSignatureEncoding (script/interpreter.cpp) verdict
              *      for one raw signature-with-hashtype push, under the given
