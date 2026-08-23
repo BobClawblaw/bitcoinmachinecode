@@ -1569,13 +1569,53 @@ static int dlc_probe_round(char pool[][64], int from, int ntry,
         cfd[nc++]=fd;
     }
     struct pollfd pol[MUX_MAX_OUT*3]; int nf=0;
-    for(int k=0;k<nc;k++){ if(cfd[k]<0) continue; pol[nf].fd=cfd[k]; pol[nf].events=POLLOUT; pol[nf].revents=0; nf++; }
-    if(nf>0) poll(pol,nf,wait_ms);
+    static char prdy[MUX_MAX_OUT*3]; static int pmap[MUX_MAX_OUT*3];
+    for(int k=0;k<nc;k++){ if(cfd[k]<0) continue; pol[nf].fd=cfd[k]; pol[nf].events=POLLOUT; pol[nf].revents=0; prdy[nf]=0; pmap[nf]=k; nf++; }
+    /* Poll in ROUNDS, not once. poll() returns as soon as the FIRST socket is
+     * ready, so a single fast peer made every other candidate in the batch
+     * look un-ready and it was closed as dead.
+     *
+     * The tell is in the historical logs: "84 confirmed-live (86 probe
+     * rounds)" and "11 confirmed-live (11 probe rounds)" -- almost exactly ONE
+     * peer per round, both times, regardless of batch width. This probe has
+     * never measured liveness; it has measured how many times it was called.
+     *
+     * That matters beyond the peer count: the "book is stale, only ~4% still
+     * answer" belief recorded in the addr_replenish comment below, and the
+     * gossip that compensates for it, are both conclusions drawn from THIS
+     * number. Widening the batch (MUX_MAX_OUT 8 -> 64, so ntry 24 -> 192) did
+     * not cause the bug, it made it obvious: losing 23 per round is quiet,
+     * losing 191 is not. */
+    if(nf>0){
+        long long pr_end;
+        { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+          pr_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + wait_ms; }
+        for(;;){
+            long long pr_now;
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+              pr_now = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
+            int left = (int)(pr_end - pr_now);
+            if(left <= 0) break;
+            int r = poll(pol,nf,left);
+            if(r <= 0) break;
+            int pending = 0;
+            for(int j=0;j<nf;j++){
+                if(pol[j].fd < 0) continue;
+                if(pol[j].revents & (POLLOUT|POLLERR|POLLHUP)){
+                    if(pol[j].revents & POLLOUT) prdy[j] = 1;
+                    pol[j].fd = -pol[j].fd;      /* poll() skips negative fds */
+                } else pending++;
+                pol[j].revents = 0;
+            }
+            if(!pending) break;
+        }
+        for(int j=0;j<nf;j++) if(pol[j].fd < 0) pol[j].fd = -pol[j].fd;   /* restore */
+    }
     int got=0;
     for(int k=0;k<nc && *nlive<cap;k++){
         if(cfd[k]<0) continue;
         int ready=0;
-        for(int j=0;j<nf;j++) if(pol[j].fd==cfd[k]){ ready=(pol[j].revents&POLLOUT)?1:0; break; }
+        for(int j=0;j<nf;j++) if(pmap[j]==k){ ready=prdy[j]; break; }
         if(!ready){ close(cfd[k]); continue; }
         int soerr=0; socklen_t sl=sizeof soerr;
         if(getsockopt(cfd[k],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[k]); continue; }
@@ -2089,6 +2129,27 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     static char dle[64][64];
     int npool = dl_pool_from_book(ab, dle, 64);
     fprintf(stderr,"[boot] %d public peer candidate(s) in pool\n", npool);
+    /* srcpool is the ADDRESS BOOK pool, and it is what every dial in this
+     * worker must use -- the initial dial, the top-up, AND the re-dials.
+     *
+     * Until 2026-08-23 only the first two did. Every mux_redial() was handed
+     * `peers`/`pool_len`, which serve_download_worker receives from its sole
+     * caller as `catchup_seeds` -- the six DNS seed HOSTNAMES. Legs die
+     * routinely (peer timeouts, dropped sockets, the per-leg sync budget), and
+     * each death replaced a real peer with a seed, so the node CONVERGED onto
+     * the seeds the longer it ran. Observed on the first live boot: 217 seed
+     * contacts, and log lines like
+     *     [dl:3] seed.bitcoin.sipa.be connection dropped; re-dialing
+     *     [mux:3] redialed -> dnsseed.bluematt.me
+     * while 3,798 known-good peers sat unused in peers.dat.
+     *
+     * Wrong three ways: DNS seeds are a shared public resource that Core
+     * queries only when its address manager is short; a seed hostname is a
+     * name server and often not a full node at all, which is why those
+     * sockets kept dropping; and a node that drifts onto six fixed hosts is
+     * fragile and leaks its identity to them. This file's own header already
+     * said "seeds are bootstrap-only ... never downloading from the seeds
+     * themselves" -- the redial path just never honoured it. */
     const char* srcpool[64]; int nsrc=0;
     for(int i=0;i<npool && nsrc<64;i++){ srcpool[nsrc++]=dle[i]; }
     if(nsrc==0){
@@ -2233,7 +2294,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
-                if(now_ms>=mux_out_nextretry[i]){ mux_redial(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
+                if(now_ms>=mux_out_nextretry[i]){ mux_redial(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
                 continue;
             }
             /* Cheap liveness check BEFORE syncing: a peer that cleanly closed
@@ -2249,7 +2310,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(poll(&pf, 1, 0) > 0 && (pf.revents & (POLLHUP|POLLERR|POLLNVAL))){
                 fprintf(stderr,"[dl:%d] %s connection dropped (revents 0x%x); re-dialing\n",
                         i, mux_out_host[i], pf.revents);
-                mux_redial(i, peers, pool_len, out_port);
+                mux_redial(i, srcpool, nsrc, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
             }
@@ -2264,7 +2325,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_sync_budget_fired){
                 fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
                         i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
-                mux_redial(i, peers, pool_len, out_port);
+                mux_redial(i, srcpool, nsrc, out_port);
             }
             did |= (n>0)?1:0;
             /* ---- STAGE B: periodic fork probe -----------------------------
@@ -2294,7 +2355,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 alarm(0); sigaction(SIGALRM,&pold,NULL);
                 if(mux_sync_budget_fired){
                     fprintf(stderr,"[reorg] probe of %s exceeded %gs budget; re-dialing\n", mux_out_host[i], DL_BUDGET_SECS);
-                    mux_redial(i, peers, pool_len, out_port);
+                    mux_redial(i, srcpool, nsrc, out_port);
                 } else if(pr == 1){
                     /* The chain moved under us: re-anchor this leg and force
                      * a UTXO catch-up pass this rotation. */
@@ -2455,10 +2516,32 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
  * even while the outbound legs are still connecting), which the old order
  * (connect-all-outbound-then-listen) did not guarantee. */
 static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l){
+    /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
+     *
+     * The sole non-`-connect` caller passes `catchup_seeds` -- the six DNS
+     * seed HOSTNAMES -- so before 2026-08-23 every dial and every re-dial in
+     * this loop went to a seed, forever, while peers.dat held thousands of
+     * real peers. See the long note in serve_download_worker for what that
+     * looked like in production and why it is wrong. Seeds stay as the
+     * emergency fallback they are documented to be: used only when the book
+     * yields nothing, which is a genuinely fresh node. */
+    static unsigned char mux_ab[64];
+    static char mux_dle[64][64];
+    const char* bookpool[64]; int nbook = 0;
+    if(!g_cfg.connect_only && amr_init(mux_ab)==1){
+        int np = dl_pool_from_book(mux_ab, mux_dle, 64);
+        for(int i=0;i<np && nbook<64;i++) bookpool[nbook++] = mux_dle[i];
+    }
+    if(nbook > 0){
+        fprintf(stderr,"[mux] using %d peer(s) from the address book (seeds are bootstrap-only)\n", nbook);
+        peers = bookpool; pool_len = nbook;
+    } else if(!g_cfg.connect_only){
+        fprintf(stderr,"[mux] address book empty -- falling back to the seed list\n");
+    }
     /* connect up to nwant outbound peers up front (the listener `l` is already
      * live and passed in, so inbound serving is available even while the
      * outbound legs are still connecting). Clamped to pool_len so we never
-     * read past the seed list (the pool may be smaller than nwant). */
+     * read past the pool (it may be smaller than nwant). */
     for(int i=0;i<nwant && i<pool_len && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed\n", peers[i]); continue; }
