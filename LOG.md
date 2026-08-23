@@ -7,6 +7,90 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- bip30_diff.py now drives the daemon, and measuring what that proves corrected my own claim about it
+
+Incident #30 left one thing open and named it as the change that stops the
+class recurring: `validation/bip30_diff.py` replayed 91,900 real mainnet blocks
+against Core and reported zero divergences, while the daemon had no BIP30 check
+at all -- because the harness drove `tests/bip30_shim.c`, which implements the
+rule itself.
+
+### The change
+
+`asm/tests/bip30_daemon_shim.c`: the same CONNECT/RESET/QUIT protocol, so the
+harness needed only a `--shim` swap, but with **no BIP30 logic of its own**.
+`enforce` comes from `utxo_live_test_bip30_enforced()`; `bip30` comes from a
+flag set in exactly one place -- the real BIP30 arm of the real apply path --
+and cleared on read.
+
+That flag is not cosmetic. `utxo_live_test_apply_block` returns a bare 0/1, so
+without it a block refused for a bad signature or a missing prevout would score
+as a BIP30 hit and the comparison against Core would be meaningless.
+
+Also repointed the oracle: the file named `/storage/bitcoin/bin/bitcoin-cli`
+and `-datadir=/storage/bitcoin/data` -- the PRODUCTION Core install -- in three
+places, and PART 2 *launches a regtest node* from that binary. All three now
+use the scratch oracle at `/storage/core-oracle`.
+
+### Result
+
+    SEED   0..91499  : 91,500 blocks, false-bip30 = 0
+    REGION 91500..91888:  389 blocks, false-bip30 + enforce-mismatch = 0
+    divergences: 0
+
+### The claim I got wrong
+
+The docstring I wrote said "delete the daemon's check and PART 1 fails" --
+offered as the property that makes the repointing worthwhile. **It is false**,
+and I only found that because I tested it instead of shipping it. Measured by
+sabotage:
+
+| sabotage | PART 1 |
+|---|---|
+| disable the duplicate scan, leave the gate | **0 divergences -- NOT caught** |
+| drop the 91842 grandfather from the gate | 2 divergences at h91842 -- caught |
+
+PART 1 replays only real mainnet blocks, and no real block violates BIP30, so
+`false-bip30=0` passes whether or not the check exists. What PART 1 proves is
+that the **enforcement gate** is Core-exact across the affected region and that
+the daemon false-rejects none of 91,889 real blocks. Detection of an actual
+violation is proved by `tests/test_bip30_daemon`'s constructed txid collision,
+not here. Both facts, and the sabotage results behind them, are now in the
+file's own docstring.
+
+This is ASSESSMENT.md's central point arriving again from a new direction: a
+replay proves the node accepts what the chain contains, and says nothing about
+what it would accept that Core rejects. I wrote a harness to fix an overclaim
+and put a fresh overclaim in its header.
+
+One genuine byproduct: the gate-sabotage run is the only evidence anywhere that
+the daemon's check fires on the REAL historical duplicate -- with 91,842 no
+longer grandfathered, the daemon rejected it.
+
+### A prerequisite bug of mine, from this morning
+
+`make test` invoked `./tests/test_bip30_daemon` without declaring it a
+prerequisite: my `replace(..., 1)` in the incident #30 commit matched inside a
+COMMENT rather than the `test:` line, which also mangled the comment. The test
+passed only when the binary happened to already exist -- exactly the
+`bench_abi_audit`/`bitcoin_script.o` defect found and fixed earlier the same
+day, reintroduced within hours by the same mechanism.
+
+Fixed, and re-verified by deleting both binaries before the suite run rather
+than trusting a warm tree: 158 ran, 0 failed.
+
+The transferable point is not "be careful with sed". It is that **"a recipe
+line invokes a target that is not a prerequisite" is mechanically checkable**,
+and nothing checks it. Two instances in one day says the guard is missing, not
+that the author was unlucky.
+
+### Still on the shim
+
+PART 2 (constructive duplicates on regtest) still drives `bip30_shim`, so it
+proves only that the SHIM matches Core. Repointing it needs synthetic regtest
+blocks to survive full block connection, which is more than a shim swap. The
+docstring now says that plainly instead of implying otherwise.
+
 ## 2026-08-23 -- incident #30 FIXED: the daemon now enforces BIP30, and the test drives the daemon instead of a shim
 
 Recorded as found earlier today; this is the fix. The gap: `validation/bip30_diff.py`
