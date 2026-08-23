@@ -9,11 +9,55 @@ would collide with an already-unspent coin, EXCEPT for the two historical
 mainnet duplicate-coinbase blocks (heights 91842 / 91880) that Core
 grandfathers via IsBIP30Repeat.
 
-This harness proves the ASM node implements that exact rule to zero divergence:
+WHAT THIS HARNESS ACTUALLY DRIVES -- read this before trusting a green run.
+
+Until 2026-08-23 this file drove asm/tests/bip30_shim for both parts, and
+claimed to prove "the ASM node implements that exact rule to zero divergence".
+It did not. bip30_shim.c IMPLEMENTS BIP30 itself -- is_bip30_repeat(), the
+`enforce` flag and the utxo_get collision test are all inside the shim -- and
+the shim is not linked into daemon/bitcoind. The daemon had no BIP30 check at
+all (LOG.md incident #30). A green differential sat beside a missing rule for
+as long as both existed, because the differential was validating the shim.
+
+  PART 1 now drives asm/tests/bip30_daemon_shim, which contains NO BIP30 logic:
+      `enforce` comes from the daemon's real gate
+      (utxo_live_test_bip30_enforced) and `bip30` is set only by the real
+      BIP30 arm of the real apply path (utxo_live_test_took_bip30_reject).
+
+      WHAT PART 1 CAN AND CANNOT CATCH -- measured by sabotage, 2026-08-23,
+      because an unverified claim about a test's power is how this file came
+      to overclaim in the first place:
+
+        sabotage the GATE (drop the 91842 grandfather) -> 2 divergences at
+          exactly h91842, one of them "ASM rejected a real in-chain block".
+          Caught.
+        sabotage the CHECK (disable the duplicate scan, leave the gate) ->
+          0 divergences. NOT caught.
+
+      Part 1 replays only real mainnet blocks and no real block violates
+      BIP30, so "false-bip30=0" passes whether or not the check exists. What
+      Part 1 proves is that the ENFORCEMENT GATE is Core-exact across the
+      affected region and that the daemon false-rejects none of 91,889 real
+      blocks. Detection of an actual violation is proved by
+      tests/test_bip30_daemon, which constructs a genuine txid collision.
+
+      (The gate-sabotage run is also the one piece of evidence that the
+      daemon's check fires on the REAL historical duplicate: with 91842 no
+      longer grandfathered, the daemon rejected it.)
+
+      It is slower than the old shim because it does full block connection --
+      that is the price of testing what ships.
+
+  PART 2 still drives the legacy bip30_shim and therefore still proves only
+      that the SHIM matches Core on constructed duplicates. Repointing it needs
+      synthetic regtest blocks to survive full block connection, which is more
+      than a shim swap. Until then, treat PART 2 as a Core-semantics reference,
+      not as evidence about bitcoind. tests/test_bip30_daemon covers the same
+      constructed-duplicate case against the real apply path.
 
   PART 1 - Real-mainnet chain-context region sweep (the BIP30 affected region):
-      replay real mainnet blocks 0..91900 through the asm bip30_shim's
-      persistent UTXO view (chain context), and assert:
+      replay real mainnet blocks 0..91900 through the DAEMON's apply path
+      (chain context), and assert:
         * every real block is ACCEPTED (bip30=0)  -- matching Core, which has
           them all in-chain (zero false rejections);
         * the BIP30 enforcement switch is Core-exact: fEnforceBIP30==0 only at
@@ -30,25 +74,36 @@ This harness proves the ASM node implements that exact rule to zero divergence:
           91880 historical relationship, where the prior coin's spending makes
           the re-spend of a prior non-ancestor coinbase valid).
 
-Requires: a synced mainnet Core node (RPC at the default path used here) and
-the asm/tests/bip30_shim binary (built by `make tests/bip30_shim`).
+Requires: the SCRATCH Core oracle at /storage/core-oracle (never the
+production install at /storage/bitcoin), and both shim binaries --
+`make tests/bip30_daemon_shim tests/bip30_shim`.
 
 Usage:
   bip30_diff.py [--seed-end 91500] [--region-start 91500] [--region-end 91888]
                 [--shim PATH]
 Exit 0 if zero divergences. Writes validation/bip30_diff_report.json.
 """
-import os, sys, subprocess, hashlib, struct, time, json, shutil, argparse
+import os, sys, subprocess, hashlib, struct, time, json, shutil, argparse, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..'))
-SHIM = os.path.join(ROOT, 'asm', 'tests', 'bip30_shim')
+# PART 1 drives the DAEMON's own apply path (asm/tests/bip30_daemon_shim,
+# which contains no BIP30 logic of its own). PART 2 still drives the old
+# tests/bip30_shim -- see the module docstring for exactly what that means.
+SHIM = os.path.join(ROOT, 'asm', 'tests', 'bip30_daemon_shim')
+SHIM_LEGACY = os.path.join(ROOT, 'asm', 'tests', 'bip30_shim')
 REPORT = os.path.join(HERE, 'bip30_diff_report.json')
 
-# Synced mainnet Core node (the compliance oracle).
-MAIN_CLI = ["/storage/bitcoin/bin/bitcoin-cli", "-datadir=/storage/bitcoin/data"]
-RPC_BIN = "/storage/bitcoin/bin/bitcoind"
+# The compliance oracle is the SCRATCH Core at /storage/core-oracle, never the
+# production install at /storage/bitcoin -- that one is off limits, including
+# for reads, and PART 2 additionally *launches* a regtest node from the binary
+# it names here.
+CORE_BIN_DIR = "/storage/bitcoin-core-source/build/bin"
+MAIN_CLI = [CORE_BIN_DIR + "/bitcoin-cli",
+            "-conf=/storage/core-oracle/bitcoin.conf",
+            "-datadir=/storage/core-oracle"]
+RPC_BIN = CORE_BIN_DIR + "/bitcoind"
 
 # The two historical mainnet duplicate-coinbase blocks (validation.cpp IsBIP30Repeat).
 BIP30_GRANDFATHER = {91842, 91880}
@@ -61,8 +116,17 @@ def sha256d(b): return hashlib.sha256(hashlib.sha256(b).digest()).digest()
 # ASM chain-context shim driver
 # ---------------------------------------------------------------------------
 class Shim:
-    def __init__(self, path=SHIM):
-        self.p = subprocess.Popen([path], stdin=subprocess.PIPE,
+    """Drives either CONNECT shim. bip30_daemon_shim takes a scratch directory
+    (it re-inits a real utxo_live view per RESET); bip30_shim takes none."""
+    def __init__(self, path=SHIM, scratch=None):
+        argv = [path]
+        self._tmp = None
+        if os.path.basename(path) == 'bip30_daemon_shim':
+            if scratch is None:
+                self._tmp = tempfile.mkdtemp(prefix='bip30_daemon_shim.')
+                scratch = self._tmp
+            argv.append(scratch)
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True, bufsize=1)
     def send(self, s):
         self.p.stdin.write(s + "\n"); self.p.stdin.flush()
@@ -72,7 +136,10 @@ class Shim:
         return {'enforce': int(r[1]), 'bip30': int(r[2]), 'ntx': int(r[3]), 'added': int(r[4])}
     def reset(self):
         self.send("RESET")
-    def close(self): self.send("QUIT")
+    def close(self):
+        self.send("QUIT")
+        if self._tmp:
+            shutil.rmtree(self._tmp, ignore_errors=True); self._tmp = None
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +169,7 @@ def part1(args, core_tip):
     print("fetching region %d..%d ..." % (region_start, region_end), flush=True)
     region = fetch(region_start, region_end + 1)
 
-    shim = Shim()
+    shim = Shim(args.shim)
     shim.reset()
     t0 = time.time()
     for h, hexb in enumerate(seed):
@@ -145,7 +212,7 @@ def part1(args, core_tip):
 # PART 2: constructive semantics vs real Core (self-hosted regtest)
 # ---------------------------------------------------------------------------
 DATADIR = "/tmp/bip30regtest"
-REG_CLI = ["/storage/bitcoin/bin/bitcoin-cli", "-datadir=%s" % DATADIR, "-regtest",
+REG_CLI = [CORE_BIN_DIR + "/bitcoin-cli", "-datadir=%s" % DATADIR, "-regtest",
            "-rpcport=18455", "-rpcuser=regtest", "-rpcpassword=regtestpass"]
 
 
@@ -353,7 +420,7 @@ def main():
         d, r1 = part1(args, tip)
         divs += d; part1_res = r1
     if args.part in ('2', 'all'):
-        d, r2 = part2(args, args.shim)
+        d, r2 = part2(args, SHIM_LEGACY)
         divs += d; part2_res = r2
 
     report['part1'] = part1_res
