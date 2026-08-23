@@ -838,6 +838,8 @@ utxo_store_reload:
     mov  [rsp+8], rax        ; slen (8th arg, stack)
     call utxo_put
     add  rsp, 0x10
+    cmp  rax, 2                  ; utxo_put: 2 = memtable full
+    je   .full                   ; see .full -- do NOT keep replaying
     inc  r15
     jmp  .ckpt_loop
 .ckpt_done:
@@ -928,6 +930,8 @@ utxo_store_reload:
     mov  [rsp+8], rax        ; slen (8th arg, stack)
     call utxo_put
     add  rsp, 0x10
+    cmp  rax, 2                  ; utxo_put: 2 = memtable full
+    je   .full                   ; see .full -- do NOT keep replaying
     mov  rax, [rbp-0x48]
     add  qword [rbp-0x150], rax   ; consume script bytes
     inc  r15
@@ -962,6 +966,27 @@ utxo_store_reload:
     ret
 .rep_done:
     jmp  .rep_close
+.full:
+    ; The memtable filled while replaying. Before 2026-08-23 both reload-path
+    ; utxo_put calls discarded the return, so a tail bigger than the table was
+    ; replayed to the end regardless -- silently DROPPING every record past the
+    ; fill point, and doing it slowly, because each further put scans all
+    ; slot_count entries before reporting full again. Two failure modes for the
+    ; price of one: a wrong UTXO set, arrived at very slowly.
+    ;
+    ; Returning a distinct -2 lets the caller say WHY (daemon/utxo_live.c turns
+    ; it into "memtable too small for the WAL tail") instead of a generic
+    ; failure, which matters because the remedy -- bulk sizing, or
+    ; daemon/flush_wal_tail -- is specific. See LOG.md incident #32.
+    mov  rax, -2
+    add  rsp, 0x160+65536
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
 .fail:
     mov  rax, -1
     add  rsp, 0x160+65536

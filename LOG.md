@@ -7,6 +7,71 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- incident #29 FIXED: a coinbase output must overwrite, and the sizing/replay gaps behind incident #32
+
+Three changes, all from the same restart that hung.
+
+### #29 -- the last known consensus-state divergence from Core
+
+`src/coins.cpp`, `AddCoins`, on the connect path:
+
+    bool overwrite = check_for_overwrite ? cache.HaveCoin(...) : fCoinbase;
+    // Coinbase transactions can always be overwritten ...
+
+`ConnectBlock` passes `check_for_overwrite` defaulted false, so `overwrite` is
+exactly `fCoinbase`, at every height, with no reference to BIP30 at all.
+
+`utxo_put`'s `.dup` path returns 0 and keeps the OLD record, and `live_on_output`
+treated only -1 and 2 as errors -- so the duplicate was silently declined. Fixed
+by del-then-put when a COINBASE output reports duplicate, which is the overwrite:
+the tombstone retires the old record, the second put writes the new one, and the
+live count is unchanged because the outpoint exists before and after.
+
+A non-coinbase duplicate is still declined and now logged. Core's `AddCoin`
+throws there ("Attempted to overwrite an unspent coin"); BIP30 is what makes it
+unreachable, and we enforce BIP30 as of incident #30. Not made fatal: that would
+be a new way to reject a block, and it has never been observed.
+
+**Verification.** `tests/test_bip30_overwrite` pins BOTH halves, which turned out
+to matter -- the first draft failed because incident #30's gate correctly
+REJECTED the duplicate before the overwrite could run. That is right: the
+overwrite only ever applies where BIP30 is skipped, i.e. the two grandfathered
+blocks. So the test forces the skip (modelling 91,880 without forging a block
+hash) and separately asserts that with BIP30 enforced the same duplicate is
+rejected.
+
+    without the fix : height stays 1000 where Core would hold 2000
+    with the fix    : 10/10
+
+The acceptance test for this was exact before a line was written: at height
+963,000 our MuHash over 165,847,393 entries matched Core's byte for byte once
+these two height fields were overridden. The daemon now produces that value
+natively.
+
+### The two gaps behind #32
+
+**WAL-aware sizing** (`utxo_live_init`). Boot sizing came from the block gap
+alone -- "how much work is LEFT" -- while reload replays the whole current WAL
+generation, which is "how much work is about to be REPLAYED". Those diverge
+exactly once: right after a long catch-up, when the gap collapses to ~0 while the
+WAL is at its largest. That is the one moment the old heuristic picked the
+SMALLEST memtable for the BIGGEST replay. Now a WAL >= 256 MB forces bulk sizing
+regardless of gap.
+
+**Replay fail-fast** (`bitcoin_utxo_store.asm`). Both reload-path `utxo_put`
+calls discarded the return value, so "table full" was ignored and the replay ran
+to the end -- silently DROPPING every record past the fill point, and slowly,
+since each further put scans all slots before reporting full again. A wrong UTXO
+set, arrived at very slowly. Now returns a distinct -2 so the caller can say why.
+
+That second one also corrects something I claimed when fixing #32: I said the
+probe bound would make an undersized reload "fail loudly in seconds". It did not.
+The bound stops non-termination; it does not stop an O(records x slots) crawl,
+because nothing was checking the "full" return. Both were needed.
+
+Full suite 163 ran / 0 failed. abi-check (1,093 sites), callee-saved-check (375
+functions) and prereq-check (224 rules) all OK.
+
 ## 2026-08-23 -- incident #32: utxo_get and utxo_del had no probe bound, so a full table was an infinite loop
 
 Restarting the node after the 963,000-block replay COMPLETED hung it. Not
