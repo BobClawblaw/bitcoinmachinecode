@@ -7,6 +7,120 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- the -O0 pin on daemon/bitcoind is still load-bearing, and the runtime ABI probe covers 14 functions out of ~374
+
+`asm/Makefile` builds `daemon/bitcoind` with `-no-pie -O0` -- the whole daemon C
+layer (`daemon/tx_verify.c`, `daemon/utxo_live.c`, `bitcoin_taproot_sighash.c`,
+the script and sighash glue) runs unoptimised in production. The stated reason
+is that "the deep asm call chain (cons_verify -> tx_parse / sha256d) is
+documented in this Makefile as misbehaving under aggressive C optimisation".
+
+That description matches incident #27 exactly: 21 functions were returning the
+caller's callee-saved registers full of their own locals, invisible at `-O0`
+(GCC reloads from memory around every call) and catastrophic at `-O2` (GCC
+parks live values in rbx/r12-r15 across calls). #27 is fixed and
+`make callee-saved-check` now passes on 374 functions, so the question "is the
+pin still needed" became answerable for the first time. It was worth asking:
+at `-O0` there is no register allocation, no inlining and no cross-call
+optimisation anywhere in the verification driver.
+
+### The answer is no, the pin cannot be removed yet
+
+Rewrote every `-no-pie -O0` to `-no-pie -O2` (131 occurrences) and ran the
+suite: **156 ran, 7 failed** -- and all 7 fail identically on the pre-TLS
+parent commit, so none of them come from the taproot thread-local change
+landed earlier the same day. They are pre-existing.
+
+Triaged by backtrace:
+
+| test | crash | verdict |
+|---|---|---|
+| `test_taproot_sighash` | `__sprintf_chk` from `main` | **harness bug** |
+| `test_taproot` | `sscanf(s=0x1)` from `ck()` | **harness bug** |
+| `test_bip32_extkey` | `strcmp` from `main` | **harness bug** |
+| `test_utxo_crash_recovery` | injected crash hook did not fire; 5 cascading asserts | **instrumentation** |
+| `test_segwit_coverage` | `taproot_verify_input` <- `tx_verify_block_connect` | **PRODUCT** |
+| `test_taproot_scriptpath`, `test_tapscript_scale` | same area, not individually triaged | likely product |
+
+The harness bug in `test_taproot_sighash` is real and worth fixing on its own:
+`tests/test_taproot_sighash.c:213` declares `char bhex[130]` and then runs
+`for(i=0;i<65;i++){ sprintf(q,"%02x",bad[i]); q+=2; }` -- 65 x 2 = 130 chars
+plus the terminating NUL that `sprintf` writes at index 130, one past the end.
+`-O0` never noticed because glibc's `_FORTIFY_SOURCE` checks only activate with
+optimisation. **So the pin does not merely hide register bugs; it disables the
+buffer-overflow detection that would have caught this years ago.**
+
+### The product failure, and what is NOT yet known about it
+
+Reproducible, with `-g`:
+
+    taproot_verify_input(..., wit=0x0, witlen=0x19f692c0, ...)  bitcoin_taproot_sighash.c:1035
+      <- tx_verify_block_connect (...)                          daemon/tx_verify.c:593
+
+`wit` arrives NULL. But the memory it should have come from is **correct**:
+
+    g_txv_in[0].wit   (memory) = 0x19f612b0     == g_wit_pool.ptr
+    g_txv_in[0].witlen(memory) = 0x19f692c0     == g_wit_pool.len
+    g_txv_in[0].nwit = 4,  wit_off = 0
+    wit    (passed)            = 0x0            <-- wrong
+    witlen (passed)            = 0x19f692c0     <-- right
+
+Disassembly shows `mov 0x0(%r13),%rsi` immediately before the call, so `wit` is
+loaded from memory at the last moment through a base register, and that base
+register is what is wrong.
+
+**The mechanism is not identified, and I am not going to assert one.** Two
+candidates remain open:
+
+1. A callee-saved clobber that `callee-saved-check` misses. Ruled out for
+   `utxo_lsm_get` and `strip_witness` specifically -- both preserve r13 and r12
+   across the call, checked in gdb.
+2. Undefined behaviour in the C that `-O2` is entitled to exploit.
+   `sizeof(g_txv_in[0])` is 10,080 bytes and `g_txv_in` is a large file-scope
+   array indexed alongside several parallel arrays; a strict-aliasing or
+   out-of-bounds assumption would produce exactly this shape.
+
+Distinguishing them needs `-fno-strict-aliasing` and `-fsanitize=address,undefined`
+runs, which is the next step and was not done here.
+
+### The coverage gap, which is the transferable finding
+
+`tests/bench_abi_audit` is the **runtime sentinel probe** -- the instrument that
+actually catches a clobber, by filling rbx/rbp/r12-r15 with sentinels, calling
+the function and checking them afterwards. It reports "14 clean, 0 violating"
+against a real 1,557-transaction block, and that is true. It probes fourteen
+functions:
+
+    block_hash  cons_verify  hash160     merkle_root  p2sh_hash
+    pow_check   ripemd160    script_eval sha1_full    sha256d
+    sha256_full sha512_block sha512_full tx_parse
+
+**Not probed: the entire LSM/UTXO layer (`utxo_lsm_get`/`put`/`del`), all of
+secp256k1, all of the taproot helpers, bech32, chainwork, the segwit and
+sighash entry points.** The static `callee-saved-check` nominally covers 374
+functions and passes -- and a real `-O2` failure exists anyway, in code both
+instruments consider clean.
+
+This is the third time this log has recorded "a guard proves only what it
+measures", after #27 (`abi-check` audits frames, not preservation) and #28
+(`callee-saved-check` cannot see an 8-bit write that wanted 64). It is the
+sharpest instance because both guards are green and the failure is
+reproducible in consensus code. **The runtime probe should be extended to
+every asm function the daemon links, not the fourteen it grew up with** -- that
+is a bounded, mechanical job and it is worth more than any single bug it finds.
+
+### Status
+
+Nothing changed on `main`. `daemon/bitcoind` stays at `-O0`, correctly. The
+experiment lives in worktrees `o2-test` (main + `-O2`) and `o2-pre` (pre-TLS +
+`-O2`), both reproducing on demand.
+
+The prize is still there: the daemon's entire C layer is compiled with no
+optimisation, on the serial path that PERF_SCOPE.md section 14 identifies as
+the bottleneck. That is plausibly a larger end-to-end win than anything in
+sections 12-13, and it would come from deleting a workaround rather than
+writing new assembly. It is gated on the product failure above.
+
 ## 2026-08-23 -- incident #30: BIP30 has a differential test against Core, a shim, and a smoke test. The daemon does not implement it.
 
 Found while investigating incident #29 (a BIP30 duplicate coinbase keeping the
