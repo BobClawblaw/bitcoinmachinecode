@@ -97,16 +97,35 @@ sha512_init:
 ; ============================================================================
 ; sha512_block(state[8], block[128])
 ; ============================================================================
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP.
+;   The five pushes come before `push rbp`, so rbx/r12/r13/r14/r15 are saved at
+;   [rbp+0x08 .. rbp+0x28] and the three round temporaries at [rbp-8],
+;   [rbp-16], [rbp-24] are inside this function's own 0x20 reservation.
+;   Before this change the pushes followed `mov rbp,rsp` and the comment here
+;   claimed the temporaries were "below save area" -- they were not. Saved rbx
+;   sat at rbp-8, r12 at rbp-16 and r13 at rbp-24, i.e. exactly on T1, tmp and
+;   Maj, so the epilogue popped SHA-512 round state into the CALLER's rbx, r12
+;   and r13. Verified with tests/bench_abi_guard.S: pre-fix, a direct
+;   sha512_block call returns CLOBBERS rbx r12 r13.
+;   This was invisible to tests/bench_abi_audit because that harness probes
+;   sha512_full, whose own frame re-saves the same three registers, so the
+;   damage never escaped sha512.asm. sha512_block is `global`, though, so any
+;   future caller -- notably any C caller -- would have been hit. Found by
+;   scripts/abi_callee_saved_audit.py, the static half of this guard.
+;   ALIGNMENT IS UNCHANGED: same six pushes and the same 0x20 reservation,
+;   only reordered. Entry 8 -> 5 pushes -> 0 -> push rbp -> 8 -> sub 0x20 -> 8;
+;   previously 8 -> push rbp -> 0 -> 5 pushes -> 8 -> sub 0x20 -> 8. This
+;   function makes no calls, so nothing downstream sees a difference either.
 global sha512_block
 sha512_block:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub  rsp, 0x20                 ; [rbp-8]=T1, [rbp-16]=tmp, [rbp-24]=Maj (below save area)
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20                 ; [rbp-8]=T1, [rbp-16]=tmp, [rbp-24]=Maj
     mov  r12, rdi                ; state
     mov  r13, rsi                ; block
     lea  rbx, [Wbuf]             ; W base
@@ -241,12 +260,12 @@ sha512_block:
     add  [r12+48], rdi
     add  [r12+56], r8
     add  rsp, 0x20
+    pop  rbp                       ; save area is ABOVE rbp -- rbp pops first
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================

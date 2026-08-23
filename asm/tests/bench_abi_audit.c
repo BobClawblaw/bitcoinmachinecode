@@ -23,10 +23,26 @@
  *
  * `make abi-check` (scripts/abi_stack_audit.py) does NOT cover this. It audits
  * RSP 16-alignment at call sites -- a different and also useful property -- and
- * passes on a build containing all three violations found here.
+ * passed on a build containing every violation found here.
  *
- * Exit status: 0 if every probed function is clean, 1 otherwise. This one IS
- * an assertion, unlike the rest of the bench_* family.
+ * This harness can only check functions it can call with plausible arguments.
+ * scripts/abi_callee_saved_audit.py is the static counterpart that covers the
+ * whole tree, and it found seven more this file could not reach -- including
+ * sha512_block (probed below now that we know), whose damage never escaped
+ * sha512.asm because sha512_full re-saves the same registers, and node_log_str,
+ * which was corrupting four registers on every log line the daemon wrote.
+ *
+ * STATUS: all thirteen violations this file and scripts/abi_callee_saved_audit.py
+ * between them found are FIXED (branch abi-callee-saved). Every note below is
+ * kept in the past tense as the record of what each one was, because the note
+ * is the only place the pre-fix frame layout is written down. A line that says
+ * `clean` next to such a note is the regression check passing, not a
+ * contradiction.
+ *
+ * This target is wired into `make test` (asm/Makefile, target
+ * `callee-saved-check` runs the static half alongside it). Exit status: 0 if
+ * every probed function is clean, 1 otherwise. This one IS an assertion,
+ * unlike the rest of the bench_* family.
  *
  *   argv[1] = optional path to a raw block (Core ships
  *             src/bench/data/block413567.raw); enables the cons_verify and
@@ -46,6 +62,8 @@ extern void sha256_full(void);
 extern void sha256d(void);
 extern void sha1_full(void);
 extern void sha512_full(void);
+extern void sha512_block(void);
+extern void sha512_init(void);
 extern void ripemd160(void);
 extern void hash160(void);
 extern void merkle_root(void);
@@ -115,10 +133,26 @@ int main(int argc, char** argv){
     probe("sha256d",     (void*)sha256d,     (unsigned long)out, (unsigned long)in, 1000000, 0, NULL);
     probe("sha1_full",   (void*)sha1_full,   (unsigned long)out, (unsigned long)in, 1000000, 0, NULL);
     probe("sha512_full", (void*)sha512_full, (unsigned long)out, (unsigned long)in, 1000000, 0, NULL);
+    {
+        /* sha512_block, the compression function under sha512_full. Probing the
+         * wrapper alone said "clean" while this said CLOBBERS rbx r12 r13 --
+         * sha512_full's own frame re-saved the same three registers, so the
+         * damage never left sha512.asm. It is `global`, so a C caller would
+         * have been hit; found statically, kept here as the regression test.
+         * Needs an initialised state, hence the sha512_init first. */
+        static unsigned long st512[8];
+        static unsigned char blk512[128];
+        unsigned long ia[6] = { (unsigned long)st512, 0, 0, 0, 0, 0 }, g[6];
+        memset(blk512, 0xa5, sizeof blk512);
+        bench_abi_probe((void*)sha512_init, ia, g);
+        probe("sha512_block", (void*)sha512_block, (unsigned long)st512,
+              (unsigned long)blk512, 0, 0,
+              "was: T1/tmp/Maj at rbp-8/-16/-24 sat on saved rbx/r12/r13 (sha512.asm)");
+    }
     probe("ripemd160",   (void*)ripemd160,   (unsigned long)out, (unsigned long)in, 1000000, 0,
-          "state words h2..h4 overlap this function's own saved r15/r14 (ripemd160.asm)");
+          "was: state words h2..h4 overlapped its own saved r15/r14 (ripemd160.asm)");
     probe("hash160",     (void*)hash160,     (unsigned long)out, (unsigned long)in, 1000000, 0,
-          "SHA-256 buffer at rbp-0x30 overlaps saved r13/r14; r15 never saved (bitcoin_addr.asm)");
+          "was: SHA-256 buffer at rbp-0x30 overlapped saved r13/r14 (bitcoin_addr.asm)");
 
     printf("\nblock/merkle primitives:\n");
     {
@@ -144,7 +178,7 @@ int main(int argc, char** argv){
 
         probe("block_hash", (void*)block_hash, (unsigned long)out, (unsigned long)blk, 0, 0, NULL);
         probe("pow_check",  (void*)pow_check,  (unsigned long)blk, 0, 0, 0,
-              "block_hash output buffer at rbp-0x30 overlaps saved r13 at rbp-0x18 (bitcoin_hash.asm)");
+              "was: block_hash output at rbp-0x30 overlapped saved r13 at rbp-0x18 (bitcoin_hash.asm)");
 
         const unsigned char* q = blk + 80;
         unsigned long ntx = read_varint(&q, blk + len);
@@ -156,7 +190,7 @@ int main(int argc, char** argv){
         if (!scratch) return 1;
         probe("cons_verify", (void*)cons_verify, (unsigned long)blk, (unsigned long)len,
               (unsigned long)scratch, 65536,
-              "inherited: its own frame is correct (saves only rbx at rbp-8); pow_check does the damage");
+              "was: inherited -- its own frame is correct; pow_check did the damage");
         printf("  (block: %s, %ld bytes, %lu transactions)\n", argv[1], len, ntx);
         free(scratch); free(blk);
     } else {
@@ -184,7 +218,7 @@ int main(int argc, char** argv){
         st.script = script; st.script_len = sizeof script;
         st.sigversion = 0; st.flags = 0; st.error_out = &err;
         probe("script_eval", (void*)script_eval, (unsigned long)&st, 0, 0, 0,
-              "fExec/pc/pend/pbegincodehash/nOpCount sit on saved rbx/r12/r13/r14/r15 (bitcoin_interp.asm:288-301)");
+              "was: fExec/pc/pend/pbegincodehash/nOpCount sat on saved rbx/r12/r13/r14/r15 (bitcoin_interp.asm)");
         /* Prove the probe actually ran the interpreter rather than bouncing off
          * a rejected argument: OP_1 OP_1 OP_ADD must succeed and leave depth 1. */
         if (st.main_sp != 1)
@@ -198,7 +232,7 @@ int main(int argc, char** argv){
         unsigned char redeem[] = { 0x51, 0x51, 0x52, 0xae };    /* 1 <k> <n> CHECKMULTISIG shape */
         probe("p2sh_hash", (void*)p2sh_hash, (unsigned long)redeem, sizeof redeem,
               (unsigned long)out, 0,
-              "uses r13/r14 as scratch and never saves them (bitcoin_multisig.asm:38-63); test-only caller");
+              "was: used r13/r14 as scratch and never saved them (bitcoin_multisig.asm)");
     }
 
     printf("\n%d clean, %d violating\n", g_clean, g_bad);

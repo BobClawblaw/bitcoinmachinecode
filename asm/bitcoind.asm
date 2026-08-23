@@ -724,14 +724,21 @@ node_sync_multi:
 ;   data_pos+8 (skip the frame header), read data_size bytes into out_buf.
 ; ============================================================================
 global node_serve_block
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx r12 r13 r14 r15 are saved at [rbp+0x08 ...] and every [rbp-N] local is inside this
+;   function's own 0x48 reservation. Previously the pushes followed
+;   `mov rbp,rsp`, which put the save area at [rbp-0x08 ...] -- underneath the
+;   locals listed below -- so the epilogue's pops handed the CALLER the saved data_size instead of r15.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered, so
+;   RSP has the same value mod 16 at every instruction after the prologue.
 node_serve_block:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x48          ; meta[24]@-0x48, saved pos/size qwords @-0x30/-0x28
     mov  r12, rdi           ; st (callee-saved, preserved by store_* calls)
     mov  r13, rdx           ; out_buf
@@ -777,22 +784,22 @@ node_serve_block:
     jne  .fail
     mov  rax, [rbp-0x28]    ; return block length
     add  rsp, 0x48
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 .fail:
     mov  rax, -1
     add  rsp, 0x48
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
@@ -804,14 +811,23 @@ node_serve_block:
 ;   if height is out of range, cap too small, or no block matched.
 ; ============================================================================
 global node_serve_block_by_hash
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx/r12/r13/r14/r15 are saved at [rbp+0x08 .. rbp+0x28] and every [rbp-N]
+;   local is inside this function's own reservation. Previously the pushes
+;   followed `mov rbp,rsp`, putting saved r15 at rbp-0x28 -- only 24 bytes above
+;   the 32-byte hash buffer at [rbp-0x40], which block_hash fills completely. The top
+;   8 bytes of that hash landed on saved r15. Flagged by
+;   scripts/abi_callee_saved_audit.py as 24 bytes of headroom for a 32-byte
+;   write.
+;   ALIGNMENT IS UNCHANGED: same six pushes, same reservation, only reordered.
 node_serve_block_by_hash:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x208       ; 8 mod16 -> nested calls land at RSP ≡ 8 (mod 16), the
                           ; parity that provably works for the deep
                           ; block_hash->sha256d->sha256_full chain (node_sync and
@@ -858,22 +874,22 @@ node_serve_block_by_hash:
     test rax, rax
     jle  .nomatch
     add  rsp, 0x208
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 .nomatch:
     mov  rax, -1
     add  rsp, 0x208
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
@@ -891,14 +907,21 @@ node_serve_block_by_hash:
 ;   clobbers: caller-saved. Preserves rbx/r12-r15.
 ; ============================================================================
 global node_drain
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx r12 r13 r14 r15 are saved at [rbp+0x08 ...] and every [rbp-N] local is inside this
+;   function's own 0x108 reservation. Previously the pushes followed
+;   `mov rbp,rsp`, which put the save area at [rbp-0x08 ...] -- underneath the
+;   locals listed below -- so the epilogue's pops handed the CALLER buflen/plen/idx instead of r14/r15.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered, so
+;   RSP has the same value mod 16 at every instruction after the prologue.
 node_drain:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x108           ; 6 pushes (0x30) + 0x108 = 0x138 == 8 mod16 -> calls
                               ; aligned. Locals below rbp-0x28 down to -0x130:
                               ; buflen@-0x20, plen@-0x24, idx@-0x28, cmd@-0x40,
@@ -1013,12 +1036,12 @@ node_drain:
 .done:
     mov  eax, r14d
     add  rsp, 0x108
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================

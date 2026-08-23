@@ -156,14 +156,25 @@ diff_target:
 ;   and ensures it is <= the target derived from the header's nBits field.
 ;   Returns eax = 1 (valid PoW) or 0.
 ;   Stack locals: hash[32]@-0x30, hash_be[32]@-0x60, target_be[32]@-0x90.
+;
+;   CALLEE-SAVED SAVE AREA IS *ABOVE* RBP. The pushes precede `push rbp`, so
+;   rbx/r12/r13 live at [rbp+0x08..rbp+0x18] and hash[32] at
+;   [rbp-0x30..rbp-0x11] is inside this function's own 0xb8 reservation.
+;   Previously the pushes followed `mov rbp,rsp`, putting saved r13 at rbp-0x18
+;   underneath hash[32], so block_hash's output was popped into the CALLER's
+;   r13. cons_verify inherited that: its own frame is correct, but it calls
+;   pow_check. Both were flagged by tests/bench_abi_audit before this change.
+;   ALIGNMENT IS UNCHANGED: same four pushes and same 0xb8 reservation, merely
+;   reordered. Entry 8 -> 3 pushes -> 0 -> push rbp -> 8 -> sub 0xb8 -> 0, the
+;   same 0 mod 16 the nested calls saw before.
 ; ------------------------------------------------------------------------------
 global pow_check
 pow_check:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0xb8         ; locals -0x30, -0x60, -0x90; 0xb8==8 mod16 -> aligned
 
     mov r12, rdi           ; hdr (caller-saved clobbered by block_hash->sha256d)
@@ -215,10 +226,10 @@ pow_check:
     xor eax, eax
 .out:
     add rsp, 0xb8
+    pop rbp
     pop r13
     pop r12
     pop rbx
-    pop rbp
     ret
 
 ; ------------------------------------------------------------------------------

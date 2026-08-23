@@ -439,14 +439,23 @@ cli_load_block:
 ; cmd_getbestblockhash(rdi=st, rsi=out, rdx=cap) -> rax = advanced out / -1
 ;   Outputs <best block hash display-hex>\n (64 hex chars).
 ; ============================================================================
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx/r12/r13/r14/r15 are saved at [rbp+0x08 .. rbp+0x28] and every [rbp-N]
+;   local is inside this function's own reservation. Previously the pushes
+;   followed `mov rbp,rsp`, putting saved r15 at rbp-0x28 -- only 24 bytes above
+;   the 32-byte hash buffer at [rbp-0x40], which block_hash fills completely. The top
+;   8 bytes of that hash landed on saved r15. Flagged by
+;   scripts/abi_callee_saved_audit.py as 24 bytes of headroom for a 32-byte
+;   write.
+;   ALIGNMENT IS UNCHANGED: same six pushes, same reservation, only reordered.
 cmd_getbestblockhash:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x8008        ; blockbuf[0x4000=16KB] base rbp-0x4000 (ends rbp-0x8000)
                             ;   hbuf[32] rbp-0x40, rev[32] rbp-0x60
     mov  r12, rdi           ; st
@@ -481,26 +490,35 @@ cmd_getbestblockhash:
     mov  rax, -1
 .done:
     add  rsp, 0x8008
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
 ; cmd_getblockhash(rdi=st, rsi=hstr, rdx=out, rcx=cap) -> rax = advanced out / -1
 ;   getblockhash <h>: hash of the block at height h (display hex).
 ; ============================================================================
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx/r12/r13/r14/r15 are saved at [rbp+0x08 .. rbp+0x28] and every [rbp-N]
+;   local is inside this function's own reservation. Previously the pushes
+;   followed `mov rbp,rsp`, putting saved r15 at rbp-0x28 -- only 24 bytes above
+;   the 32-byte hash buffer at [rbp-0x40], which block_hash fills completely. The top
+;   8 bytes of that hash landed on saved r15. Flagged by
+;   scripts/abi_callee_saved_audit.py as 24 bytes of headroom for a 32-byte
+;   write.
+;   ALIGNMENT IS UNCHANGED: same six pushes, same reservation, only reordered.
 cmd_getblockhash:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x1008        ; blockbuf[0x800=2048] base rbp-0x800 (ends rbp-0x1000),
                             ;   hbuf[32] rbp-0x40, rev[32] rbp-0x60
     mov  r12, rdi           ; st
@@ -541,12 +559,12 @@ cmd_getblockhash:
     mov  rax, -1
 .done:
     add  rsp, 0x1008
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
@@ -641,14 +659,23 @@ str_eq:
 ;   reverse to raw, and scan stored heights for a block whose header hash
 ;   matches; serve the exact block.
 ; ============================================================================
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   rbx/r12/r13/r14/r15 are saved at [rbp+0x08 .. rbp+0x28] and every [rbp-N]
+;   local is inside this function's own reservation. Previously the pushes
+;   followed `mov rbp,rsp`, putting saved r15 at rbp-0x28 -- only 24 bytes above
+;   the 32-byte hash buffer at [rbp-0x40], which cli_hex_to_bin/cli_rev32 fills completely. The top
+;   8 bytes of that hash landed on saved r15. Flagged by
+;   scripts/abi_callee_saved_audit.py as 24 bytes of headroom for a 32-byte
+;   write.
+;   ALIGNMENT IS UNCHANGED: same six pushes, same reservation, only reordered.
 cmd_getblock:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x2c8        ; blockbuf[384] base rbp-0x2b0 (ends rbp-0x130),
                            ;   bin[32] rbp-0x40, rev[32] rbp-0x60, hbuf[32] rbp-0x80
     mov  r12, rdi           ; st
@@ -745,12 +772,12 @@ cmd_getblock:
     mov  rax, -1
 .done:
     add  rsp, 0x2c8
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================
@@ -983,14 +1010,19 @@ fnd1_len equ $ - fnd1
 ;   each block in our chain carries exactly one coinbase; the sum of its output
 ;   values is the total value the node controls. Accepts a 64-bit sum.
 ; ============================================================================
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP, like the other cmd_* handlers in this
+;   file. This one was not overrunning (its only escaping frame address takes an
+;   8-byte write with 20 bytes of headroom), but it shares the frame shape and
+;   the same epilogue, so it is converted with them for consistency.
+;   ALIGNMENT IS UNCHANGED: same six pushes, same 0x2c8 reservation, reordered.
 cmd_getbalance:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 0x2c8        ; locals skip save area (rbp-8..-30):
                            ;   blen rbp-0x38, ntx rbp-0x3c, vsize rbp-0x40,
                            ;   txbase rbp-0x48, remain rbp-0x4c, nout rbp-0x50,
@@ -1090,12 +1122,12 @@ cmd_getbalance:
     mov  rax, -1
 .done:
     add  rsp, 0x2c8
+    pop  rbp
     pop  r15
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ============================================================================

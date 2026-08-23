@@ -28,19 +28,29 @@ global hash160
 ; hash160(u8 out[20], const void *in, i64 len) -> rdi, rsi, rdx
 ;   Step 1: h = SHA-256(in)        (32 bytes)
 ;   Step 2: out = RIPEMD-160(h)    (20 bytes)
-;   Locals live at [rbp-0x30..-0x60]; note ripemd160/sha256_full are leaf
-;   wrappers that preserve callee-saved regs, so we keep out/in/len in
-;   rbx/r12/r13 across the two calls.
+;   Locals live at [rbp-0x30..-0x50]; note ripemd160/sha256_full preserve
+;   callee-saved regs, so we keep out/in/len in rbx/r12/r13 across the two
+;   calls.
+;
+;   CALLEE-SAVED SAVE AREA IS *ABOVE* RBP. The pushes precede `push rbp`, so
+;   rbx/r12/r13/r14 live at [rbp+0x08..rbp+0x20] and the 32-byte SHA-256 buffer
+;   at [rbp-0x30..rbp-0x11] is inside this function's own 0x50 reservation.
+;   Previously the pushes followed `mov rbp,rsp`, putting saved r13 at rbp-0x18
+;   and saved r14 at rbp-0x20 -- both underneath that buffer -- so the epilogue
+;   popped SHA-256 digest bytes into the CALLER's r13 and r14. (The caller also
+;   lost r15, but that came from ripemd160, fixed separately.)
+;   ALIGNMENT IS UNCHANGED: same five pushes and same 0x50 reservation, merely
+;   reordered. Entry 8 -> 4 pushes -> 8 -> push rbp -> 0 -> sub 0x50 -> 0, the
+;   same 0 mod 16 the two nested calls saw before.
 ; ----------------------------------------------------------------------------
 hash160:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
-    sub  rsp, 0x50           ; locals [rbp-0x30..-0x78] (below save area)
-    ; rsp after: 5 pushes (0x28) + sub 0x50 => rsp ≡ (8 - ... ) at calls.
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x50           ; locals [rbp-0x30..-0x50], all inside the frame
 
     mov  rbx, rdi            ; out
     mov  r12, rsi            ; in
@@ -59,11 +69,11 @@ hash160:
     call ripemd160
 
     add  rsp, 0x50
+    pop  rbp
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 ; ----------------------------------------------------------------------------

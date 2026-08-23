@@ -153,14 +153,21 @@ mcopy:
 ; ---------------------------------------------------------------- 
 ; mpool_put(mp, txid, tx, txlen) -> 1 new / 0 dup / 2 full
 global mpool_put
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP: the pushes precede `push rbp`, so
+;   r12 r13 r14 r15 rbx are saved at [rbp+0x08 ...] and every [rbp-N] local is inside this
+;   function's own 24-byte reservation. Previously the pushes followed
+;   `mov rbp,rsp`, which put the save area at [rbp-0x08 ...] -- underneath the
+;   locals listed below -- so the epilogue's pops handed the CALLER the blob offset instead of r12.
+;   ALIGNMENT IS UNCHANGED: same pushes, same reservation, only reordered, so
+;   RSP has the same value mod 16 at every instruction after the prologue.
 mpool_put:
-    push rbp
-    mov  rbp, rsp
     push r12
     push r13
     push r14
     push r15
     push rbx
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 24             ; locals: -24 blen, -8 blob_off, -16 spare
     mov  r12, rdi
     mov  r13, rsi            ; txid
@@ -244,12 +251,12 @@ mpool_put:
     mov  rax, 2
 .ret:
     add  rsp, 24
+    pop  rbp
     pop  rbx
     pop  r15
     pop  r14
     pop  r13
     pop  r12
-    pop  rbp
     ret
 
 ; ---------------------------------------------------------------- 

@@ -130,14 +130,23 @@ put_kind:
 ; ---------------------------------------------------------------------------
 ; node_log_event(fd, kind, a, b, c)
 global node_log_event
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP. Same shape as node_log_str above,
+;   but with more slack: the 96-byte buffer at [rbp-96] had 56 bytes before the
+;   save area, and the longest line this emits (tag + three u32s + newline) is
+;   about 40, so it was not overrunning -- tests/bench_abi_guard.S reports it
+;   clean. Fixed anyway, because "currently short enough" is not an invariant.
+;   ALIGNMENT IS UNCHANGED: same six pushes, same 96-byte reservation, only
+;   reordered. This function is NEEDS-ENTRY-0 in
+;   docs/ABI_STACK_ALIGNMENT.md and stays exactly that -- the coordinated
+;   alignment change tracked in LOG.md #20 is a separate piece of work.
 node_log_event:
-    push rbp
-    mov  rbp, rsp
     push r12
     push r13
     push r14
     push r15
     push rbx
+    push rbp
+    mov  rbp, rsp
     sub  rsp, 96
     mov  rbx, rdi          ; fd
     mov  r12, rsi          ; kind
@@ -165,30 +174,52 @@ node_log_event:
     mov  rdi, rbx          ; fd
     call fd_write_all      ; PROVEN socket/file writer from bitcoin_net.asm
     add  rsp, 96
+    pop  rbp
     pop  rbx
     pop  r15
     pop  r14
     pop  r13
     pop  r12
-    pop  rbp
     ret
 
 ; ---------------------------------------------------------------------------
 ; node_log_str(fd, kind, s, len)
 global node_log_str
+; CALLEE-SAVED SAVE AREA IS *ABOVE* RBP, AND THE LINE BUFFER IS 128 BYTES.
+;   Two coupled defects, both fixed here and both found by
+;   scripts/abi_callee_saved_audit.py's headroom ranking (this function had the
+;   smallest headroom in the tree, 16 bytes):
+;     1. The pushes followed `mov rbp,rsp`, so saved rbx/r12/r13/r14 occupied
+;        [rbp-0x08 .. rbp-0x28] -- directly ABOVE the line buffer at [rbp-48].
+;     2. The buffer therefore had only 16 usable bytes before it ran into that
+;        save area, not the 48 the reservation suggests.
+;   daemon/main.c logs lines of up to 42 characters ("node start (serve mode /
+;   download worker)"), plus a 4-6 byte kind tag, a space and a newline. Every
+;   one of those overran the save area. Measured with tests/bench_abi_guard.S:
+;   a 22-byte message returned CLOBBERS r13 r14; a 42-byte message returned
+;   CLOBBERS rbx r12 r13 r14 and also corrupted the low bytes of saved rbp.
+;   This is the only defect in this commit that was firing in the LIVE daemon
+;   rather than merely latent -- every log line the node wrote did it.
+;   The pushes now sit above `push rbp`, so [rbp-128 .. rbp-1] is all frame,
+;   and the reservation grew 48 -> 128 so the longest current line has room to
+;   spare rather than fitting exactly.
+;   ALIGNMENT IS UNCHANGED: the pushes are reordered (same count) and 128-48 =
+;   80 is a multiple of 16, so RSP keeps the same value mod 16 at both nested
+;   calls -- this function is ABI-CORRECT in docs/ABI_STACK_ALIGNMENT.md and
+;   stays so.
 node_log_str:
-    push rbp
-    mov  rbp, rsp
     push rbx
     push r12
     push r13
     push r14
-    sub  rsp, 48
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 128
     mov  rbx, rdi          ; fd
     mov  r12, rsi          ; kind
     mov  r13, rdx          ; s
     mov  r14, rcx          ; len
-    lea  rdi, [rbp-48]
+    lea  rdi, [rbp-128]
     mov  esi, r12d
     call put_kind
     mov  rcx, rax
@@ -206,17 +237,17 @@ node_log_str:
 .nl:
     mov  byte [rcx], 10
     inc  rcx
-    lea  rsi, [rbp-48]
+    lea  rsi, [rbp-128]
     mov  rdx, rcx
     sub  rdx, rsi
     mov  rdi, rbx          ; fd
     call fd_write_all
-    add  rsp, 48
+    add  rsp, 128
+    pop  rbp
     pop  r14
     pop  r13
     pop  r12
     pop  rbx
-    pop  rbp
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
