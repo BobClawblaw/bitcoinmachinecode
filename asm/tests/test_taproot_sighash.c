@@ -210,7 +210,10 @@ static void run_interp_tapspend(void){
         ckb("interp: <pk> CHECKSIG tapscript passes", r==1);
         /* corrupted sig must fail */
         uint8_t bad[65]; memcpy(bad, s->sig, 65); bad[0]^=1;
-        char bhex[130]; char* q=bhex; for(int i=0;i<65;i++){ sprintf(q,"%02x",bad[i]); q+=2; }
+        /* 65 bytes -> 130 hex chars + sprintf's NUL at index 130, so 131 is the
+         * minimum. Was [130]: a one-byte overflow that -O0 never saw, because
+         * glibc's _FORTIFY_SOURCE checks only activate with optimisation. */
+        char bhex[136]; char* q=bhex; for(int i=0;i<65;i++){ sprintf(q,"%02x",bad[i]); q+=2; }
         const char* ib[1]={bhex}; int lb[1]={65};
         r = interp_tapspend(s, taproot_vecs[5].leaf, sc, 34, ib, lb, 1);
         ckb("interp: <pk> CHECKSIG with bad sig fails", r==0);
@@ -221,7 +224,7 @@ static void run_interp_tapspend(void){
      * sig2 pairs with pk2 (CHECKSIGADD accumulator). */
     {
         const tspend_t* s = &taproot_spends[6];
-        char h1[130], h2[130];
+        char h1[136], h2[136];   /* same +NUL headroom as bhex above */
         char* q=h1; for(int i=0;i<s->siglen;i++){ sprintf(q,"%02x",s->sig[i]); q+=2; }
         q=h2; for(int i=0;i<s->sig2len;i++){ sprintf(q,"%02x",s->sig2[i]); q+=2; }
         const char* init[2] = { h2, h1 };   /* bottom=sig2, top=sig1 */
