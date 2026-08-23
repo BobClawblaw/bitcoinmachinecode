@@ -7,7 +7,22 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
-## 2026-08-23 -- schnorr_verify was not thread-safe: a live FALSE-REJECT on every concurrently-verified taproot key-path input
+## 2026-08-23 -- schnorr_verify was not thread-safe: a LATENT false-reject, armed for the moment taproot verification is parallelised
+
+> **Correction, 2026-08-23 02:40.** This entry was first written -- and first
+> reported to the user -- as a *live* bug corrupting concurrent taproot
+> verification in production. That was wrong. `schnorr_verify` is reachable
+> only via `bitcoin_taproot_sighash.c` -> `taproot_verify_input`, and **both**
+> call sites in `daemon/tx_verify.c` (`:593`, `:1220`) run in a sequential pass
+> *after* the worker threads join -- the workers skip `TXV_SHAPE_P2TR`
+> outright. Nothing in production calls `schnorr_verify` concurrently today,
+> so nothing was being corrupted. The bug, the reproducer and the fix below
+> are all real, and the fix was worth deploying: it disarms a trap that fires
+> the instant the P2TR skip is removed -- which PERF_SCOPE.md section 14 now
+> argues is the single largest performance win available. What follows
+> describes a hazard, not an outage. The lesson is the one this log keeps
+> re-learning: a call-graph claim needs the call graph checked, not inferred
+> from the callee.
 
 Found while optimising `secp256k1_schnorr.asm` (PERF_SCOPE.md section 13), by
 reading the file rather than by a failing test -- nothing in the suite called
