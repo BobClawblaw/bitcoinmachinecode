@@ -7,6 +7,53 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-23 -- the outbound mux kept one peer of eighty-five, and the knob that should have fixed it was never wired up
+
+First live-network boot. `[dlc] 85 confirmed-live peer(s)` from the seed probe,
+and then `heartbeat: peers=1/1`. It reached 8/8 about five minutes later, via
+the `(rot % 8)` top-up loop, which is the slow path redoing work the dial
+should have done.
+
+### Why one
+
+The initial dial non-blocking-connects every candidate at once and then does
+
+    if(nf>0) poll(pol,nf,2500);       /* "single bounded wait" */
+
+`poll()` returns as soon as the FIRST descriptor is ready -- not after the
+timeout. So one nearby peer answering in ~20 ms made the call return
+immediately, and every other candidate was judged un-ready in the loop below
+and closed on the spot. The 2500 ms budget was never actually spent. The
+comment above it -- "poll once for readiness, and promote only the live ones --
+dead peers are shed in the same single bounded wait as live ones connect" --
+describes the intent exactly, and the intent is what does not survive poll()'s
+return semantics.
+
+Now polled in ROUNDS against the same budget, carrying readiness forward and
+negating satisfied fds so each round waits only on those still pending. It also
+logs `dial: N of M candidate(s) answered within the budget`, so the ratio is
+visible instead of inferred from a heartbeat five minutes later.
+
+### And why raising the target would not have helped
+
+`g_cfg.max_outbound` has existed all along, is parsed from bitcoin.conf as
+`bmc.maxoutbound`, defaults to 8 and clamps 1..64. `main.c` used it in exactly
+one place: computing the INBOUND budget. The mux carried a literal `8` in four
+separate places, next to `#define MUX_MAX_OUT 8`. Setting the knob did nothing
+at all, and nothing said so.
+
+Two numbers for one concept, in five places, one of them user-facing and inert.
+`MUX_MAX_OUT` is now 64 -- matching both the config clamp and the 64-entry
+candidate pool -- and every site derives from `MUX_WANT_OUT()`.
+
+Full suite 163 ran / 0 failed; abi-check and prereq-check OK.
+
+### Not measured yet
+
+The dial improvement is reasoned from poll() semantics, not yet observed: the
+node was up on the old binary while this was written. The number to beat is
+1 of 85 promoted at the initial dial, and ~5 minutes to reach 8/8.
+
 ## 2026-08-23 -- incident #29 FIXED: a coinbase output must overwrite, and the sizing/replay gaps behind incident #32
 
 Three changes, all from the same restart that hung.
