@@ -1120,6 +1120,70 @@ tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/
 tests/bench_segwit_sighash: tests/bench_segwit_sighash.c $(SEGWITOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/bench_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
 
+# ---------------------------------------------------------------------------
+# BENCHMARKS.md tier 1 / tier 2 -- harnesses whose SHAPE mirrors a specific
+# Bitcoin Core (or libsecp256k1) benchmark, so the two tables compare directly
+# rather than merely sounding similar. Every file's header names the Core
+# benchmark it is the opposite number to AND states what differs between them.
+# None of these are in the `test` target: they measure, they do not assert.
+# `make bench-vs-core` builds all of them; scripts/bench_vs_core.sh runs both
+# sides and emits the table.
+#
+# These rules live down here, not next to tests/bench_ecdsa, because they use
+# $(TAPRIMSOBJS)/$(CONSOBJS) -- prerequisites are expanded when the rule is
+# READ, so a rule placed above the variable's definition would silently link
+# against nothing.
+# ---------------------------------------------------------------------------
+
+# bench_schnorr -- BIP340 verifications/sec, opposite number to libsecp256k1's
+# own `bench schnorrsig_verify`. Reads the same official BIP340 vector CSV
+# tests/test_schnorr validates against, so the fixture is not hardcoded here.
+# Run: make tests/bench_schnorr && tests/bench_schnorr [n] [rounds] [csv]
+tests/bench_schnorr: tests/bench_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
+	$(CC) -no-pie -O2 -o $@ tests/bench_schnorr.c secp256k1_schnorr.o $(TAPRIMSOBJS)
+
+# bench_hash_core -- SHA-256 / SHA-1 / SHA-512 / RIPEMD-160 in the exact buffer
+# shapes Core's src/bench/crypto_hash.cpp uses (1,000,000 B; 32 B; 1024 x 64 B
+# double-hash). tests/bench_hash.c compares against OpenSSL instead and stays
+# as it is; this one exists purely to be comparable to Core's table.
+tests/bench_hash_core: tests/bench_hash_core.c tests/bench_abi_guard.S sha256.o sha1.o sha512.o ripemd160.o bitcoin_hash.o
+	$(CC) $(CFLAGS) -o $@ tests/bench_hash_core.c tests/bench_abi_guard.S sha256.o sha1.o sha512.o ripemd160.o bitcoin_hash.o
+
+# bench_merkle -- merkle root over 9,001 leaves, Core's MerkleRoot leaf count.
+tests/bench_merkle: tests/bench_merkle.c bitcoin_hash.o sha256.o
+	$(CC) $(CFLAGS) -o $@ tests/bench_merkle.c bitcoin_hash.o sha256.o
+
+# bench_checkblock -- cons_verify + transaction walk over mainnet block
+# 413,567, read from CORE'S OWN data file so both sides see byte-identical
+# input. cons_verify does strictly LESS than Core's CheckBlock; the file
+# header enumerates exactly what is missing, and BENCHMARKS.md repeats it.
+#   make tests/bench_checkblock && tests/bench_checkblock \
+#     /storage/bitcoin-core-source/src/bench/data/block413567.raw [rounds]
+tests/bench_checkblock: tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/bench_checkblock.c tests/bench_abi_guard.S $(CONSOBJS)
+
+# bench_abi_audit -- NOT a benchmark: the standing check that the primitives the
+# suite times actually give the caller its callee-saved registers back. It is an
+# assertion (exit 1 on any violation) and it currently FAILS, by design: it
+# reports the three ABI violations found on 2026-08-22 (ripemd160, hash160,
+# cons_verify) rather than pretending they are not there. `make abi-check`
+# passes on the same build -- it audits RSP alignment, not register
+# preservation, so this class of bug is invisible to it.
+#   make tests/bench_abi_audit && tests/bench_abi_audit \
+#     /storage/bitcoin-core-source/src/bench/data/block413567.raw
+tests/bench_abi_audit: tests/bench_abi_audit.c tests/bench_abi_guard.S $(CONSOBJS) \
+    $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o secp256k1_ecdsa.o \
+    $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o
+	$(CC) $(CFLAGS) -o $@ tests/bench_abi_audit.c tests/bench_abi_guard.S \
+	    $(sort $(CONSOBJS) $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o \
+	    secp256k1_ecdsa.o bitcoin_script.o $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o)
+
+.PHONY: bench-vs-core
+bench-vs-core: tests/bench_ecdsa tests/bench_schnorr tests/bench_hash_core \
+    tests/bench_merkle tests/bench_checkblock tests/bench_abi_audit tests/bench_fe \
+    tests/bench_segwit_sighash tests/bench_taproot_sighash tests/bench_lsm_get
+	@echo "built. run ../scripts/bench_vs_core.sh from the repo root"
+
 # test_segwit_txout_bound -- incident #21: sw_ser_txout() serialized a CTxOut
 # of unbounded length into a 600-byte STACK buffer, so any output whose
 # scriptPubKey reached 590 bytes smashed the verifying thread's stack during
