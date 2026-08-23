@@ -79,6 +79,16 @@ across 2,318,056 entries. That one field is a real defect (`LOG.md` incident
 overwrites and we decline to. Count, amount and bogosize are all blind to it —
 only the hash could see it, which is the entire argument for having one.
 
+**Re-verified at the finish line (height 963,000).** The completed replay's set
+was hashed and diffed against Core's `gettxoutsetinfo muhash 963000`:
+**165,847,393 txouts, 20,071,648.00979492 BTC and bogosize 12,989,895,997 all
+match Core exactly** -- 252,101,123 unspendables filtered out of 417,948,516
+raw entries landing on Core's count with zero error in either direction. The
+MuHash matches byte for byte once **two height fields** are corrected, on two
+outpoints from 2010, both attributable to incident \#29 above and both still
+unspent at the tip. Two wrong fields in 165.8 million entries is the entire
+difference between this node's chainstate and Bitcoin Core's.
+
 **Read `ASSESSMENT.md` before drawing conclusions from any of this.** The
 short version: this is a consensus *verification engine*, not a node — no
 mining, no PSBT, no wallets, no testnet, no light-client indexes, and a thin
