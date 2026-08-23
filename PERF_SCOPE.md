@@ -2976,6 +2976,15 @@ never checked does.
   verbatim, and no real block in the corpus has a prevout script that large on
   a taproot-bearing transaction, so the reject is untested here as it was
   before.
+* **`tests/test_block_481827_pool_stack`** still SKIPs: its fixture has never
+  existed in this tree. Generating one exposed a PRE-EXISTING defect, verified
+  on unmodified `main` — the `.prevouts` format lists prevouts created by an
+  earlier transaction in the SAME block, which is right for a verifier and
+  wrong as a seed for the full apply path, where BIP30 then sees the block's
+  own transaction overwriting an unspent output and rejects
+  ("REJECT h=481827 tx=12: bad-txns-BIP30, output 32 already unspent"). A
+  seeder must drop any prevout whose funding txid appears in the block. Not
+  fixed here — unrelated to taproot, and the fixture is not committed.
 * **Memory under adversarial blocks.** The arena is bounded by roughly
   `sum(stripped tx bytes) + 44*inputs` over taproot-bearing transactions, a
   few MB per block, and it is bump-reset per block — but that bound was

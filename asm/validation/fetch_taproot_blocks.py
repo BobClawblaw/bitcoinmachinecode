@@ -22,6 +22,18 @@ archive:
 one RPC per block replaces one getrawtransaction per distinct funding tx.
 Verbosity 3 needs Core's txindex, which the oracle has.
 
+CAUTION for anyone reusing this format. The .prevouts file lists EVERY input's
+prevout, including ones created by an EARLIER TRANSACTION IN THE SAME BLOCK.
+That is correct for a verifier -- it is what bidx_get would resolve them to --
+and tests/test_taproot_block_diff wants exactly that. It is WRONG as a seed for
+the full apply path: seeding a same-block-created output into the UTXO set
+before applying the block makes BIP30 see the block's own transaction
+"overwriting" an unspent output and reject it. validation/fetch_block_prevouts.py
+has the same property, and tests/test_block_481827_pool_stack (which does seed
+and then apply) fails on such a fixture -- verified on unmodified main, so it is
+pre-existing and not a defect of this file. A seeder must drop any prevout whose
+funding txid appears in the block.
+
 The fixtures are large and gitignored; the test SKIPs when they are absent.
 
 Usage:
