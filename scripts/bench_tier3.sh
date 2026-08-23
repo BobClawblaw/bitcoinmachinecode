@@ -268,13 +268,32 @@ prepare_core(){
     local newest count=0 total=0
     newest=$(ls -1 "$src"/blk*.dat 2>/dev/null | sort | tail -1)
     say "preparing Core side into $dest/blocks (skipping the oracle's newest file, $newest)"
+    # Bytes-needed estimate. The old formula, HEIGHT*400 + 2GB, dropped a
+    # factor of 1000: it multiplies by 400 BYTES per block where its own
+    # calibration comment ("mainnet reaches ~500,000 in about 180 GB")
+    # implies ~400 KB per block. 500,000*400 is 200 MB, so the cap was always
+    # ~2 GB and any prepare-core past the earliest heights would have copied
+    # far too little -- run-core then dies hours later at whatever height the
+    # copied files happen to end. It never bit because the only run to date
+    # was the H=1000 harness validation, where 2 GB is plenty.
+    # MEASURED anchors (2026-08-23): 180 GB @ 500k (the original comment's
+    # own anchor) and the oracle's blocks dir at 811 GB @ 963,764 -- so
+    # blocks 500k..963k average ~1.36 MB each. Piecewise-linear between the
+    # anchors, plus 5 GB margin; still capped by "never take the oracle's
+    # active file".
+    local need_bytes
+    if [ "$HEIGHT" -le 500000 ]; then
+        need_bytes=$(( (HEIGHT * 400000) + 5000000000 ))
+    else
+        need_bytes=$(( 180000000000 + (HEIGHT - 500000) * 1360000 + 5000000000 ))
+    fi
+    say "  copy budget: $(( need_bytes / 1000000000 )) GB for height $HEIGHT"
     for f in $(ls -1 "$src"/blk*.dat 2>/dev/null | sort); do
         [ "$f" = "$newest" ] && { say "  stop: reached the oracle's active file"; break; }
         cp "$f" "$dest/blocks/" || die "copy failed for $f"
         count=$((count+1))
         total=$((total + $(stat -c %s "$f")))
-        # Very rough: mainnet reaches height ~500,000 in about 180 GB.
-        if [ "$total" -gt $(( (HEIGHT * 400) + 2000000000 )) ]; then
+        if [ "$total" -gt "$need_bytes" ]; then
             say "  copied $count file(s), $(( total / 1000000000 )) GB -- enough for height $HEIGHT"
             break
         fi
