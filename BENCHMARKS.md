@@ -186,10 +186,21 @@ processes) against `asm/tests/bench_ecdsa` and `asm/tests/bench_schnorr`
 > **alternating the baseline commit's binary and the branch's binary on the
 > same core in the same window** (three passes, min-of-15 CPU time each):
 > **60.65 µs → 25.45 µs, 2.38×**, with `ecdsa_verify` as an untouched control
-> moving 21.20 → 21.23 µs. Against the 21.40 µs libsecp256k1 figure above
-> that is **3.35× → ~1.19×**, but the two columns come from different
-> sittings on a much busier box, so treat 1.19× as an estimate and re-run
-> `scripts/bench_vs_core.sh` on a quiet machine for a same-sitting ratio.
+> moving 21.20 → 21.23 µs.
+>
+> Against Core: **3.35× → ~1.2×**, and that is stated as a range on purpose.
+> libsecp256k1's `bench` reports a WALL clock with no CPU/wall check of its
+> own, and in both of the windows available on 2026-08-23 it read 25–31 µs for
+> operations it publishes at 21.1–21.4 on a quiet box — inflated by up to
+> 47 %, which would flatter us by half. So the Core crypto column was
+> discarded and our column was calibrated against the untouched ECDSA control
+> instead: `ecdsa_verify` read 21.98 µs (best of night 21.20) against the
+> 23.70 µs published for the *identical binary* above, i.e. our side is at or
+> better than quiet-box quality. Composed that way, Schnorr is
+> **1.19–1.29×** and the ECDSA control is **1.00–1.04×** where this page
+> published 1.12× — erring slightly against us, not for us. `PERF_SCOPE.md`
+> §13.3b has the full working; re-run `scripts/bench_vs_core.sh` end to end on
+> a genuinely idle machine for a single-sitting number.
 
 Two things to say about this table.
 
@@ -231,11 +242,11 @@ OpenSSL instead and is left alone.
 |---|---|---|---|---|
 | SHA-256, 1,000,000 B | `SHA256_SHANI` | 0.3654 ns/B (2.74 GB/s) | 0.4206 ns/B (2.38 GB/s) | 1.15× slower |
 | **SHA-256, 32 B** | `SHA256_32b_SHANI` | 37.63 ns | **35.55 ns** | **0.94× — we are 1.06× faster** |
-| SHA-256d, 64 B × 1024 | `SHA256D64_1024_SHANI` | 0.7104 ns/B (45.47 ns/pair) | ~~1.5901~~ → **0.8084 ns/B** (51.7 ns/pair) | ~~2.24×~~ → **1.14×** |
+| SHA-256d, 64 B × 1024 | `SHA256D64_1024_SHANI` | 0.7104 ns/B (45.47 ns/pair) | ~~1.5901~~ → **0.8499 ns/B** (54.4 ns/pair) | ~~2.24×~~ → **1.17×** |
 | SHA-1, 1,000,000 B | `SHA1` | 0.6472 ns/B | 1.7318 ns/B | 2.68× slower |
 | SHA-512, 1,000,000 B | `SHA512` | 0.9783 ns/B | 1.7513 ns/B | 1.79× slower |
 | RIPEMD-160, 1,000,000 B | `BenchRIPEMD160` | 1.1371 ns/B | 3.5877 ns/B | 3.16× slower |
-| Merkle root, 9,001 leaves | `MerkleRoot` | 45.97 ns/leaf | ~~103.14~~ → **53.89 ns/leaf** | ~~2.24×~~ → **1.17×** |
+| Merkle root, 9,001 leaves | `MerkleRoot` | 45.97 ns/leaf | ~~103.14~~ → **55.94 ns/leaf** | ~~2.24×~~ → **1.17×** |
 
 Notes, in order of how much they change the reading:
 
@@ -619,8 +630,8 @@ suite. All single-core, ours ÷ theirs.
 | **SHA-512 throughput** | **1.79×** | tier 1 |
 | **SHA-256 over 1 MB** | **1.15×** | tier 1 |
 | **Merkle root** | ~~2.24×~~ → **1.17×** | tier 1 — 2026-08-23, 2-way batch |
-| **SHA-256d over 64-byte pairs** | ~~2.24×~~ → **1.14×** | tier 1 — same change |
-| **Schnorr / BIP340 verify** | ~~3.35×~~ → **~1.19×** | tier 1 — 2026-08-23, `PERF_SCOPE.md` §13 |
+| **SHA-256d over 64-byte pairs** | ~~2.24×~~ → **1.17×** | tier 1 — same change |
+| **Schnorr / BIP340 verify** | ~~3.35×~~ → **~1.2×** | tier 1 — 2026-08-23, `PERF_SCOPE.md` §13 |
 | **ECDSA verify** | **1.12×** | tier 1 — down from 5.5× on 2026-08-21 |
 | P2TR key-path input verify | ~~≥ 3.49×~~ → **≥ 1.25×** | tier 2, composed lower bound |
 | P2WPKH input verify | **≥ 1.18×** | tier 2, composed lower bound |
@@ -817,11 +828,14 @@ machine was at load 42: Core's nanobench and libsecp256k1's `bench` both time
 with a WALL clock, while our harnesses use `CLOCK_THREAD_CPUTIME_ID`, so
 contention inflates their side more than ours and the ratio flatters us. The
 refreshed figures in this document were taken instead by **alternating Core's
-binary and ours back to back on one core, three passes, minimum of each** —
-and validated by a control: `bench_hash_core` still carries the OLD
-one-at-a-time `sha256d` shape, which in that same window measured 2.22× Core,
-reproducing the 2.24× on this page to within 1 %. `PERF_SCOPE.md` §13.3b has
-the full table and the CPU/wall ratio.
+binary and ours back to back on one core, three passes, minimum of each**, in
+two separate windows (load ~40 and load ~15) that agreed to within 3 %. Three
+controls validate it: the two untouched SHA-256 rows land on their published
+1.15× and 0.94× to within 1 %, and `bench_hash_core` deliberately still
+carries the OLD one-at-a-time `sha256d` shape, which in the same window
+measured **2.18× Core** against the 2.24× on this page. Core's `bench_bitcoin`
+measured CPU/wall = 0.992. `PERF_SCOPE.md` §13.3b has the full table, and the
+reason the two *crypto* rows could not be measured this way at all.
 
 ```bash
 # everything, default settings (pins to cpu 25, 3 process reps, min-of-15 rounds)
