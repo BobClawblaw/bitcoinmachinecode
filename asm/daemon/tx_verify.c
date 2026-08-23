@@ -404,13 +404,27 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
     d->nin    = nin;
     /* Safe to take addresses now and not before: the single reserve above is
      * the last thing that can relocate pool->buf until the next transaction. */
-    u8* po = pool->buf + d->po_off;
-    u8* am = pool->buf + d->am_off;
-    u8* sp = pool->buf + d->sp_off;
-    u8* ns = pool->buf + d->ns_off;
+    u8* base = pool->buf;
+    u8* po = base + d->po_off;
+    u8* am = base + d->am_off;
+    u8* sp = base + d->sp_off;
+    u8* ns = base + d->ns_off;
     u64 w = 0;
     for (u64 k=0;k<nin;k++){
         get(ctx, k, &op, &v, &spk, &sl);
+        /* The sizing pass above and this write pass call `get` SEPARATELY, and
+         * `get` is a function pointer -- so "both passes see the same spklen"
+         * is no longer a locally checkable fact. Both adapters read fields that
+         * nothing writes in between, but if that ever stopped being true the
+         * memcpy below would overrun `sp` INTO THE ARENA REGIONS OTHER
+         * TRANSACTIONS' DESCRIPTORS POINT AT -- i.e. a corrupted sighash for an
+         * unrelated transaction, silently. These three checks make the
+         * invariant enforced rather than documented; they cost two compares per
+         * input against a Schnorr verify. Same reasoning for `base`: a future
+         * adapter that allocated would dangle po/am/sp/ns, and this catches it
+         * before the first write of the iteration rather than after. */
+        if (pool->buf != base) { *reason = "internal: taproot arena moved during build"; return 0; }
+        if (sl >= 0xfd || w + 1u + sl > splen) { *reason = "internal: taproot arena sizing pass disagreed"; return 0; }
         memcpy(po + k*36, op, 36);
         for (int b=0;b<8;b++) am[k*8+b] = (u8)(v>>(8*b));
         sp[w++] = (u8)sl;
@@ -770,8 +784,13 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
      * old pass 2 runs at all (that flag is per-BLOCK, so it cannot differ
      * between inputs of one transaction -- see TXV_FLAG_TAPROOT's own note
      * about Core's mainnet exception block 692261). ---- */
+    /* Cleared unconditionally, not inside the `if`. It is true today that
+     * has_taproot == 0 implies no TXV_SHAPE_P2TR input exists (both are set by
+     * the same branch in pass 1), so a stale 1 from the previous transaction
+     * could never be read -- but that is a non-local invariant guarding a
+     * silent failure, and clearing it here costs nothing. */
+    g_t1_tap_built = 0;
     if (has_taproot){
-        g_t1_tap_built = 0;
         g_t1_tap_pool.used = 0;
         if (!tapagg_build(&g_t1_tap_pool, &g_t1_tap, t1_tapin, 0, nin, tx, txlen, reason))
             return 0;
