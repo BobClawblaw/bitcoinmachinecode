@@ -403,6 +403,94 @@ int main(void){
       expect_err("getrawtransaction bad txid length", "getrawtransaction", "[\"ab\"]", -8, "parameter 1 must be of length 64 (not 2, for 'ab')");
     }
 
+    /* ---- decodescript (pure; no archive needed) ---- */
+    {
+        char p[512];
+        char H20[41], H32[65]; memset(H20,'1',40); H20[40]=0; memset(H32,'1',64); H32[64]=0;
+        char PKC[67], PKU[131];                                  /* 33B / 65B, exact lengths */
+        PKC[0]='0'; PKC[1]='2'; memset(PKC+2,'a',64); PKC[66]=0; /* 02 || 32 bytes */
+        PKU[0]='0'; PKU[1]='4'; memset(PKU+2,'b',128); PKU[130]=0; /* 04 || 64 bytes */
+        /* P2PKH spk: pubkeyhash, wraps to p2sh and p2wpkh-in-p2sh */
+        snprintf(p, sizeof p, "[\"76a914%s88ac\"]", H20);
+        rj_val* r = call("decodescript", p, &ec, &em);
+        ck_str("ds P2PKH type", S(r,"type"), "pubkeyhash");
+        ck("ds P2PKH has p2sh", S(r,"p2sh") != NULL);
+        ck("ds P2PKH has segwit", G(r,"segwit") != NULL);
+        ck_str("ds P2PKH segwit type", S(G(r,"segwit"),"type"), "witness_v0_keyhash");
+        ck("ds P2PKH segwit p2sh-segwit", S(G(r,"segwit"),"p2sh-segwit") != NULL);
+        rj_free(r);
+        /* P2SH spk: scripthash cannot be re-wrapped */
+        snprintf(p, sizeof p, "[\"a914%s87\"]", H20);
+        r = call("decodescript", p, &ec, &em);
+        ck_str("ds P2SH type", S(r,"type"), "scripthash");
+        ck("ds P2SH no p2sh", S(r,"p2sh") == NULL);
+        ck("ds P2SH no segwit", G(r,"segwit") == NULL);
+        rj_free(r);
+        /* 1-of-2 multisig, all compressed: wraps to p2sh + p2wsh */
+        snprintf(p, sizeof p, "[\"5121%s21%s52ae\"]", PKC, PKC);
+        r = call("decodescript", p, &ec, &em);
+        ck_str("ds multisig(C) type", S(r,"type"), "multisig");
+        ck("ds multisig(C) has p2sh", S(r,"p2sh") != NULL);
+        ck("ds multisig(C) has segwit", G(r,"segwit") != NULL);
+        ck_str("ds multisig(C) segwit type", S(G(r,"segwit"),"type"), "witness_v0_scripthash");
+        rj_free(r);
+        /* 1-of-2 multisig with an uncompressed key: p2sh yes, segwit NO */
+        snprintf(p, sizeof p, "[\"5121%s41%s52ae\"]", PKC, PKU);
+        r = call("decodescript", p, &ec, &em);
+        ck_str("ds multisig(U) type", S(r,"type"), "multisig");
+        ck("ds multisig(U) has p2sh", S(r,"p2sh") != NULL);
+        ck("ds multisig(U) NO segwit (uncompressed key)", G(r,"segwit") == NULL);
+        rj_free(r);
+        /* <32-byte push> OP_CHECKSIGADD -> not wrappable at all */
+        snprintf(p, sizeof p, "[\"20%sba\"]", H32);
+        r = call("decodescript", p, &ec, &em);
+        ck_str("ds OP_CHECKSIGADD type", S(r,"type"), "nonstandard");
+        ck("ds OP_CHECKSIGADD no p2sh", S(r,"p2sh") == NULL);
+        rj_free(r);
+        /* empty script */
+        r = call("decodescript", "[\"\"]", &ec, &em);
+        ck_str("ds empty type", S(r,"type"), "nonstandard");
+        ck_str("ds empty asm", S(r,"asm"), "");
+        rj_free(r);
+    }
+
+    /* ---- validateaddress (pure; exercises the rpc_commands.c JSON builder) ---- */
+    {
+        rj_val* r = call("validateaddress", "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]", &ec, &em);
+        ck("va P2WPKH valid", S(r,"isvalid") && !strcmp(S(r,"isvalid"),"1"));
+        ck_str("va P2WPKH scriptPubKey", S(r,"scriptPubKey"), "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+        ck_str("va P2WPKH isscript", S(r,"isscript"), "0");
+        ck_str("va P2WPKH iswitness", S(r,"iswitness"), "1");
+        ck_str("va P2WPKH witness_version", S(r,"witness_version"), "0");
+        ck_str("va P2WPKH witness_program", S(r,"witness_program"), "751e76e8199196d454941c45d1b3a323f1433bd6");
+        ck("va has NO ischange (Core validateaddress omits it)", G(r,"ischange") == NULL);
+        rj_free(r);
+        /* P2WSH: witness_program must be the 32-byte program, not a truncated h160 (regression) */
+        r = call("validateaddress", "[\"bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3\"]", &ec, &em);
+        ck_str("va P2WSH isscript", S(r,"isscript"), "1");
+        ck_str("va P2WSH witness_program", S(r,"witness_program"), "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262");
+        rj_free(r);
+        /* P2TR: isscript true, witness_version 1 */
+        r = call("validateaddress", "[\"bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr\"]", &ec, &em);
+        ck_str("va P2TR isscript", S(r,"isscript"), "1");
+        ck_str("va P2TR witness_version", S(r,"witness_version"), "1");
+        rj_free(r);
+        /* P2SH: script, not witness */
+        r = call("validateaddress", "[\"3P14159f73E4gFr7JterCCQh9QjiTjiZrG\"]", &ec, &em);
+        ck_str("va P2SH isscript", S(r,"isscript"), "1");
+        ck_str("va P2SH iswitness", S(r,"iswitness"), "0");
+        rj_free(r);
+        /* uppercase bech32 is normalised to lowercase (canonical) */
+        r = call("validateaddress", "[\"BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4\"]", &ec, &em);
+        ck_str("va normalises to lowercase", S(r,"address"), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        rj_free(r);
+        /* invalid -> isvalid:false, no address */
+        r = call("validateaddress", "[\"notanaddress\"]", &ec, &em);
+        ck_str("va invalid isvalid", S(r,"isvalid"), "0");
+        ck("va invalid has no address", G(r,"address") == NULL);
+        rj_free(r);
+    }
+
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
