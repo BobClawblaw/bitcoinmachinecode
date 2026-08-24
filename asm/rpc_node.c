@@ -128,17 +128,60 @@ static int cmd_getpeerinfo(rj_val** res){
     return 1;
 }
 
+/* getmempoolinfo / getrawmempool.
+ *
+ * Fork-model caveat (docs/RPC_LIVE_NODE.md): the mempool is MAP_PRIVATE, so
+ * each inbound serve child accepts into its own copy-on-write mempool -- there
+ * is no single coherent mempool to report. These serve the SERVE PROCESS's own
+ * mempool, which for the common `listen=0` config (no inbound children, worker
+ * doesn't accept loose txs) is empty. A shared mempool that makes inbound
+ * children's txs visible needs a MAP_SHARED region + cross-process locking on
+ * the tx-accept path -- deferred as its own slice. The config fields
+ * (maxmempool, fees) are always accurate. */
+#define MEMPOOL_MAXBYTES   300000000LL     /* 300 MB default (config default) */
+#define MEMPOOL_MINFEE_BTC 0.00001000      /* min relay fee, BTC/kvB */
+
+static int cmd_getmempoolinfo(rj_val** res){
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "loaded", rj_bool(1));
+    rj_obj_set(o, "size", rj_numf("%d", 0));
+    rj_obj_set(o, "bytes", rj_numf("%d", 0));
+    rj_obj_set(o, "usage", rj_numf("%d", 0));
+    rj_obj_set(o, "total_fee", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "maxmempool", rj_numf("%lld", (long long)MEMPOOL_MAXBYTES));
+    rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    rj_obj_set(o, "minrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
+    *res = o;
+    return 1;
+}
+static int cmd_getrawmempool(const rj_val* params, rj_val** res){
+    /* verbose (params[0]==true) -> object keyed by txid; else -> array of txids.
+     * Empty either way for this process's mempool. */
+    int verbose = 0;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1){
+        const rj_val* v = params->items[0];
+        if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
+    }
+    *res = verbose ? rj_obj() : rj_arr();
+    return 1;
+}
+
 static const char* const NODE_METHODS[] = {
-    "getconnectioncount", "getnetworkinfo", "getpeerinfo", NULL
+    "getconnectioncount", "getnetworkinfo", "getpeerinfo",
+    "getmempoolinfo", "getrawmempool", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
 }
 int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
-    (void)params; (void)ec; (void)em;
+    (void)ec; (void)em;
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
+    if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
+    if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
     return -1;
 }
