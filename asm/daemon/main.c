@@ -2202,9 +2202,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     for(int i=0;i<npool && nsrc<64;i++){ srcpool[nsrc++]=dle[i]; }
     if(nsrc==0){
         /* Discovery found nothing: DEGRADED fallback so the node still syncs.
-         * Normally the seeds are bootstrap-only; this is only an emergency. */
-        fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
-        for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+         * Normally the seeds are bootstrap-only; this is only an emergency.
+         *
+         * 2026-08-24: this fallback used to fire even under `connect=`, which
+         * is Core's "these are the ONLY peers" switch -- so a node configured
+         * connect-only still dialled the hard-coded DNS seeds. That is a
+         * privacy leak (it contacts hosts the operator excluded), and it made
+         * an OFFLINE benchmark impossible: scripts/bench_tier3.sh sets
+         * connect=192.0.2.1 precisely to take the node off the network, and
+         * the first real tier-3 run still reached the seeds and appended 567
+         * blocks past the truncated tip, invalidating the measurement by the
+         * harness's own post-condition. The harness documented the behaviour
+         * and worked around it; honouring the flag is the actual fix.
+         * With connect= set the correct degraded state is NO outbound peers,
+         * which is exactly what the operator asked for. */
+        if(g_cfg.connect_only){
+            fprintf(stderr,"[dl] no reachable connect= peers; staying offline (connect= means these are the ONLY peers)\n");
+        } else {
+            fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
+            for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+        }
     }
     /* ---- MULTI-PEER DOWNLOAD: establish up to 8 live legs by dialing the
      * discovered candidate pool IN PARALLEL. A DNS seed returns many
