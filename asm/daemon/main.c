@@ -882,6 +882,46 @@ static long do_outbound_sync(int i){
         /* keep the locator fresh even on a no-op so we don't re-request from
          * genesis forever (node_sync advanced it internally only on success) */
         anchor_locator(mux_out_loc[i]);
+        /* 2026-08-24: this path used to return SILENTLY, and that silence hid
+         * a total keep-up failure for 14.5 hours. The node sat at 8/8 peers
+         * with a frozen tip 80 blocks behind the network while calling
+         * node_sync_multi on every leg every rotation and getting ok!=1 back
+         * every time -- indistinguishable, in the log, from "caught up and
+         * nothing to do". The two cases are NOT the same and must not look
+         * the same:
+         *   ok != 1  -> the exchange itself failed (this is a fault)
+         *   ok == 1, cnt == 0 -> the peer had nothing for us (normal at tip)
+         * Rate-limited per leg so a persistent failure is one line a minute,
+         * not a flood, and the normal at-tip case stays quiet unless the
+         * failure kind changes. */
+        static long long next_sync_gripe_ms[MUX_MAX_OUT];
+        static long last_kind[MUX_MAX_OUT];
+        /* kind: 0 = clean no-op (ok==1), 1 = the exchange failed. The first
+         * draft of this line wrote `kind = (ok != 1) ? ok : 0`, which
+         * collapses the ok==0 FAILURE onto the same 0 the clean no-op uses
+         * -- so five failing legs printed "peer offered nothing" within
+         * minutes of the instrument being added. Same class as the bug this
+         * logging exists to expose: two different conditions rendered
+         * identical. */
+        long kind = (ok == 1) ? 0 : 1;
+        long long nm;
+        { struct timespec ts_; clock_gettime(CLOCK_MONOTONIC,&ts_);
+          nm = ts_.tv_sec*1000LL + ts_.tv_nsec/1000000LL; }
+        /* Report BOTH kinds, not just the failure. The clean no-op
+         * (ok==1,cnt==0) is normal at the tip and a FAULT when the network
+         * has moved on -- and from inside this function the two are
+         * indistinguishable, so the log has to carry enough for the reader
+         * to tell: ok, cnt, our tip, and the locator depth we asked with.
+         * A no-op is reported at a much lower rate than a failure. */
+        long long every = (kind != 0) ? 60000 : 300000;
+        if(nm >= next_sync_gripe_ms[i] || kind != last_kind[i]){
+            fprintf(stderr,"[dl:%d] %-22s sync %s (ok=%ld cnt=%ld tip=%d nloc=%ld)\n",
+                    i, mux_out_host[i],
+                    (kind != 0) ? "FAILED -- not advancing" : "no-op (peer offered nothing)",
+                    ok, cnt, st_tip, nloc);
+            next_sync_gripe_ms[i] = nm + every;
+            last_kind[i] = kind;
+        }
         return 0;
     }
     /* index every newly stored height (st_tip_before+1 .. st_tip) into ht_idx,
