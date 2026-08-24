@@ -7,6 +7,48 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #35: `connect=` did not take the node offline, and it cost the first real tier-3 run
+
+`scripts/bench_tier3.sh` sets `connect=192.0.2.1` (RFC 5737 TEST-NET-1,
+guaranteed unroutable) for exactly one reason: a benchmark that reads blocks
+from the network is not a benchmark. The harness's own header documented,
+from 2026-08-22, that this does not work -- the node still dialled the
+hard-coded DNS seeds -- and worked around it by asserting a post-condition
+(did index.dat grow?) instead of fixing the cause.
+
+The first tier-3 run today paid for that. The node printed
+
+    [boot] connect= set -- skipping all peer discovery
+    [dl] no discovered peers; temporary seed fallback
+    [dl] outbound 0 = seed.bitcoin.sipa.be ...
+
+appended **567 blocks past the truncated tip** (800,001 -> 800,568 index
+records), which invalidates the run by the harness's own rule -- and, worse,
+the failing seed legs starved the rotation so the replay applied **zero
+blocks in eight minutes**. The measurement did not just get contaminated;
+it never started.
+
+Cause: `serve_download_worker`'s degraded fallback fires whenever discovery
+yields no peers, without consulting `g_cfg.connect_only`. Core's `-connect`
+means "these are the ONLY peers"; the correct degraded state under it is NO
+outbound peers, not "substitute the seeds". Fixed there.
+
+This is also a privacy bug independent of benchmarking: a node configured
+connect-only contacted hosts its operator had explicitly excluded, and the
+file's own header already said seeds are bootstrap-only. Same shape as the
+`max_outbound` knob that was parsed and ignored (2026-08-23): a setting that
+is honoured on the main path and quietly bypassed on the fallback path is
+worse than one that does not exist, because the log says it was applied.
+
+After the fix the re-run prints
+
+    [dl] no reachable connect= peers; staying offline (connect= means these are the ONLY peers)
+    [dl] connected 0/8 peer(s)
+
+with index.dat holding exactly 800,001 records throughout, and the replay
+running at full speed from the local archive -- which is what the tier-3
+number requires to mean anything.
+
 ## 2026-08-24 -- incident #34: the same units confusion as #33, three more times, and two of them corrupt the stack
 
 Incident #33 was `cons_verify`'s 4th parameter -- a txid COUNT -- given the
