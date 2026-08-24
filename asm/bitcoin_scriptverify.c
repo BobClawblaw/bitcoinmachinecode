@@ -159,7 +159,7 @@ int sv_get_locktime_context(const uint8_t* tx, unsigned long txlen, unsigned lon
           else if (c == 0xfd) { if (p+3>end) return 0; slen = (unsigned long)p[1] | ((unsigned long)p[2]<<8); p += 3; }
           else if (c == 0xfe) { if (p+5>end) return 0; uint32_t v; memcpy(&v,p+1,4); slen = v; p += 5; }
           else { if (p+9>end) return 0; uint64_t v; memcpy(&v,p+1,8); slen = (unsigned long)v; p += 9; } }
-        if ((unsigned long)(end - p) < slen + 4) return 0;
+        { unsigned long avail=(unsigned long)(end - p); if (avail < slen || avail - slen < 4) return 0; }  /* split bound (incident #38) */
         p += slen;
         if (i == nIn) { memcpy(out_sequence, p, 4); return 1; }
         p += 4; /* sequence */
