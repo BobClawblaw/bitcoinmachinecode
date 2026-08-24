@@ -1069,22 +1069,28 @@ static void txvb_tapin(void* ctx, u64 k, const u8** outpoint, u64* value,
  * instead of g_txv_in[i], and in->local_idx (this input's position within
  * ITS OWN tx) instead of a bare loop index for the sighash-position
  * arguments the underlying primitives need. */
+/* Explicit-state signature (2026-08-24, phase 2 slice 8): the pools and the
+ * descriptor array arrive as parameters instead of file-scope statics, so
+ * bitcoin_txv_dispatch.asm's twin can be driven side by side. Every caller
+ * passes the globals; behavior is byte-identical to the static version. */
 static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long long flags,
-                           u8* sv_work, unsigned long sv_workcap, const char** reason){
+                           u8* sv_work, unsigned long sv_workcap,
+                           const bytepool_t* spk_pool, const bytepool_t* tap_pool,
+                           const tapagg_t* tapdesc, const char** reason){
     /* Safe here (unlike inside Phase 1's own resolve loop): every caller of
      * this function runs strictly after that loop has finished growing
-     * g_spk_pool for this block, so pool->buf is stable for the whole
+     * the spk pool for this block, so pool->buf is stable for the whole
      * verification pass. */
-    const u8* spk = g_spk_pool.buf + in->spk_off;
+    const u8* spk = spk_pool->buf + in->spk_off;
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
-        /* Phase B. g_tapdesc/g_tap_pool were filled by Phase 1.5, strictly
+        /* Phase B. tapdesc/tap_pool were filled by Phase 1.5, strictly
          * before any worker was dispatched, and are read-only from then on
          * -- which is what makes this case safe to run concurrently across
          * transactions. `spk` is exactly the 34-byte P2TR scriptPubKey
          * (is_p2tr required spklen == 34). */
         if (in->tap_desc == ~0ull) { *reason = "internal: taproot aggregate not built"; return 0; }
-        return tapagg_verify(&g_tap_pool, &g_tapdesc[in->tap_desc], spk,
+        return tapagg_verify(tap_pool, &tapdesc[in->tap_desc], spk,
                              in->wit, in->witlen, in->nwit, in->local_idx, reason);
     }
     case TXV_SHAPE_WV0: {
@@ -1176,7 +1182,7 @@ static void* txvb_worker_loop(void* argp){
             u64 i = __atomic_fetch_add(w->next, 1, __ATOMIC_RELAXED);
             if (i >= w->total) break;
             const char* r = 0;
-            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, &r);
+            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, &g_spk_pool, &g_tap_pool, g_tapdesc, &r);
             w->res[i].ok = ok ? 1 : 0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
@@ -1223,7 +1229,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         static u8 sv_work[1<<20];
         for (u64 i=0;i<total;i++){
             const char* r = 0;
-            int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work, 1<<20, &r);
+            int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work, 1<<20, &g_spk_pool, &g_tap_pool, g_tapdesc, &r);
             res[i].ok = ok?1:0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason,r,n); res[i].reason[n]=0; }
         }
@@ -1258,7 +1264,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         if (res[i].ok) continue;
         if (res[i].reason[0] != 0) continue;   /* a real reported failure already */
         const char* r = 0;
-        int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work_main, sizeof sv_work_main, &r);
+        int ok = txvb_verify_one(flat[i].tx_ptr, flat[i].tx_len, &flat[i], flags, sv_work_main, sizeof sv_work_main, &g_spk_pool, &g_tap_pool, g_tapdesc, &r);
         res[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason, r, n); res[i].reason[n]=0; }
     }
@@ -1291,6 +1297,25 @@ u64 txv_bytepool_reserve(bytepool_t* pool, u64 n){
 }
 void* txv_grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
     return grow_arena(buf, cap_bytes, need_bytes);
+}
+/* slice 7 seams: the static taproot aggregate build/verify, exported for
+ * tests/test_tapagg_diff.c. */
+int txv_test_tapagg_build(bytepool_t* pool, tapagg_t* d, tapin_fn get, void* ctx,
+                          u64 nin, const u8* tx, u64 txlen, const char** reason){
+    return tapagg_build(pool, d, get, ctx, nin, tx, txlen, reason);
+}
+int txv_test_tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
+                           const u8* const* wit, const u32* witlen, u32 nwit,
+                           u64 local_idx, const char** reason){
+    return tapagg_verify(pool, d, spk, wit, witlen, nwit, local_idx, reason);
+}
+/* slice 8 seam: the dispatch, explicit-state. */
+int txv_test_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long long flags,
+                        u8* sv_work, unsigned long sv_workcap,
+                        const bytepool_t* spk_pool, const bytepool_t* tap_pool,
+                        const tapagg_t* tapdesc, const char** reason){
+    return txvb_verify_one(tx, txlen, in, flags, sv_work, sv_workcap,
+                           spk_pool, tap_pool, tapdesc, reason);
 }
 int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
                   u64 value, u64 uheight, u64 ucb,
