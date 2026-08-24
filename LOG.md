@@ -7,6 +7,84 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #33: the node does not follow the chain. It only advances when restarted, and the code said nothing for 14.5 hours
+
+### What was observed
+
+After the parity rebuild finished (08:57, tip 963,775) the node sat at that
+height until 12:24 -- **14 hours 26 minutes** -- with `peers=8/8` in every
+heartbeat while the network moved 80 blocks ahead. A restart at 12:24 pulled
+all 80 in 22 seconds. A second restart pulled 1. A block mined at 13:19 was
+still not present at 13:24.
+
+### Why nobody noticed, including me
+
+Every tip advance during the previous night came from the BOOT CATCH-UP path
+at a restart, and I restarted the daemon repeatedly to deploy fixes. "8/8
+peers plus an advancing tip" reads exactly like keep-up. It was the restarts.
+
+And the code was silent by construction:
+
+    long ok = node_sync_multi(fd, store, loc, nloc, buf, cap, &cnt);
+    if(ok != 1 || cnt <= 0){ anchor_locator(...); return 0; }   /* no log */
+
+`ok != 1` (the exchange FAILED) and `ok == 1, cnt == 0` (the peer had nothing,
+normal at tip) exit through the same silent return. In a log that prints a
+line for every dial, drop, replacement and heartbeat, the one condition that
+mattered printed nothing at all.
+
+### The two paths, which is the useful part of this entry
+
+    boot catch-up (dlc)      getdata chunks     WORKS
+    steady state (mux)       getheaders->dl     FAILS, ok=0, ~30s after dial
+
+Same handshake, different message flow. Measured, not inferred:
+
+  - the dlc path pulled 81 blocks in 22 s from public peers, and in a
+    throwaway instance pointed at the scratch Core oracle it downloaded
+    6,105 blocks at ~24 blk/s continuously for 4+ minutes with no disconnect;
+  - the mux path returns ok=0 on every leg. Peers connect (all 8 handshake
+    fine), then ~30 s later `p2p_read` returns <= 0 -- not the 20-timeout
+    path, which would take ~60 s, and all five failures land within 20 ms of
+    each other.
+
+So this is NOT a protocol violation Core punishes: a known-good Core accepts
+us and serves us blocks for minutes. Whatever kills the mux legs is specific
+to that path or to public-peer policy toward it.
+
+### Two mistakes of mine inside this investigation, both caught
+
+1. The first version of the new logging computed
+   `kind = (ok != 1) ? ok : 0`, which collapses the ok==0 FAILURE onto the
+   same 0 the clean no-op uses. Five failing legs printed "peer offered
+   nothing" within minutes of the instrument being added -- the same
+   two-conditions-rendered-identical bug the instrument existed to expose.
+2. I nearly concluded "Core sees our version as 70015" from an oracle log
+   line. `New block-relay-only peer connected` is what Core logs for
+   connections IT initiates; the oracle is on the public network making its
+   own, and the line had nothing to do with our probe. Checked before
+   believing it. We advertise 70016.
+
+Also: `timeout 90` on the probe killed only the parent; the forked children
+kept downloading for four minutes. Cleaned up.
+
+### Next experiment, stated so it is not re-derived
+
+Drive `node_sync_multi` specifically against the scratch oracle, where Core
+logs what it receives and how it answers. That isolates three possibilities
+the current evidence cannot separate: a malformed `getheaders` we send, a
+reply shape we mishandle, or the socket dying for a reason unrelated to the
+message flow. The dlc-path probe does NOT exonerate the mux path -- it only
+proves the handshake and block download are fine.
+
+### Status
+
+Severity: the node cannot follow the chain unattended. It is not a consensus
+defect -- everything it *does* accept is still byte-identical to Core's
+chainstate (the 963,775 parity proof stands) -- but "runs live on the
+network" was not a claim the evidence supported, and I made it repeatedly
+last night.
+
 ## 2026-08-24 -- slice 11's differential caught a real overlapping-frame-slot bug, in the one place a weaker test would have missed it
 
 bitcoin_checksig.asm (twins of the BASE and WITNESS_V0 checksig hooks)
