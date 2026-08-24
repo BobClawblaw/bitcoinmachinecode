@@ -250,6 +250,10 @@ static int der_int(unsigned char* out, const uint64_t v[4]) {
 }
 
 /* DER-encode (r,s) into out (max 72 bytes). Returns length. */
+/* Phase 2 slice 11 seam (2026-08-24): tests/test_checksig_diff.c needs to
+ * MAKE real signatures so its accept cases are real accepts. Exported
+ * wrapper; the static implementation is unchanged. */
+int der_signature_export(unsigned char* out, const uint64_t r[4], const uint64_t s[4]);
 static int der_signature(unsigned char* out, const uint64_t r[4], const uint64_t s[4]) {
     unsigned char rb[33], sb[33];
     int rl = der_int(rb, r), sl = der_int(sb, s);
@@ -1214,4 +1218,8 @@ int  wallet_seed_bip44_address(char addr[64], const unsigned char seed[64]) {
     base58check_encode(b58, payload, 21);
     memcpy(addr, b58, 64);
     return 1;
+}
+
+int der_signature_export(unsigned char* out, const uint64_t r[4], const uint64_t s[4]){
+    return der_signature(out, r, s);
 }
