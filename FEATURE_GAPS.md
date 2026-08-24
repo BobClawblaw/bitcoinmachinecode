@@ -106,14 +106,19 @@ output. Remaining deliberate divergences: `address` omitted for
 `witness_unknown`/`anchor`; `verificationprogress` is blocks/headers;
 `initialblockdownload` is "tip older than 24 h".
 
-**Still missing — needs live-node state the RPC process does not have:**
-`getpeerinfo`, `getconnectioncount`, `getnetworkinfo`, `getmempoolinfo`,
-`sendrawtransaction`, `getrawtransaction` without a block hash (mempool
-lookup), `getchaintips` (reorg candidates are not persisted). The honest
-plumbing for these is either hosting the RPC server inside `bitcoind serve`
-(where the peer table and mempool live) or a small IPC/shared-memory
-snapshot the serve process publishes; neither exists yet. Until then these
-return `-32601 Method not found` rather than stubbed answers.
+**Live-node RPCs — in progress (`rpc_node.c`, see docs/RPC_LIVE_NODE.md).**
+The plumbing chosen is exactly the shared-memory route: the serve parent
+publishes a `MAP_SHARED` `node_status_t` (peer counts, tip, start time) that
+the forked children populate, and the RPC server is embedded in the serve
+daemon to read it. `getnetworkinfo` (mostly static: our wire identity from
+`version_gen.h`) and `getconnectioncount` are implemented and dispatch-wired;
+the module + its unit test are landed. Still to do: the serve-daemon
+integration (shared region + worker publishing + embedding `rpc_server_start`),
+then `getpeerinfo` (per-peer table), `getmempoolinfo`/`getrawmempool`
+(`MAP_SHARED` mempool + slot-walk), `sendrawtransaction` (accept+relay
+channel), `getchaintips`, and `getrawtransaction` without a block hash.
+Until the serve integration lands these report a node with 0 live connections
+from the standalone `bitcoin_rpcd` (correct for a read-only process).
 `createrawtransaction` was skipped as out of scope (the tx builder lives in
 the wallet CLI). Still absent as categories: wallet RPCs beyond the original
 8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest
