@@ -692,6 +692,24 @@ static int cmd_getbestblockhash(rj_val** res, long* ec, const char** em){
     if (tip < 0 || !read_idx_rec(tip, rec)){ *ec = -1; *em = "Block not available"; return 0; }
     char hx[65]; hex_rev(hx, rec, 32); *res = rj_str(hx); return 1;
 }
+/* getchaintips: Core lists the active tip plus any known side-branch tips.
+ * This node does not persist non-active tips (reorg candidates are dropped
+ * once the best chain is chosen), so we report exactly the active tip -- which
+ * is Core's output for a node with no stored forks (the common case). */
+static int cmd_getchaintips(rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    u8 rec[48];
+    if (tip < 0 || !read_idx_rec(tip, rec)){ *ec = -1; *em = "Block not available"; return 0; }
+    rj_val* arr = rj_arr();
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "height", rj_numf("%ld", tip));
+    char hx[65]; hex_rev(hx, rec, 32); rj_obj_set(o, "hash", rj_str(hx));
+    rj_obj_set(o, "branchlen", rj_numf("%d", 0));
+    rj_obj_set(o, "status", rj_str("active"));
+    rj_arr_push(arr, o);
+    *res = arr;
+    return 1;
+}
 static int cmd_getblockhash(const rj_val* params, rj_val** res, long* ec, const char** em){
     long long h; if (!rpc_param_i64(params, 0, &h, ec, em)) return 0;
     long tip = refresh();
@@ -1408,7 +1426,7 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
-    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig","uptime","stop", NULL
+    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig","getchaintips","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1421,6 +1439,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
+    if (!strcmp(m, "getchaintips")) return cmd_getchaintips(res, ec, em);
     if (!strcmp(m, "getblockhash")) return cmd_getblockhash(params, res, ec, em);
     if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
     if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
