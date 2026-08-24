@@ -116,10 +116,16 @@ daemon to read it. `getnetworkinfo` (mostly static: our wire identity from
 download worker publishes peer counts / tip into a `MAP_SHARED` `node_status_t`
 before the fork, and the parent serves them on the RPC thread — verified on an
 isolated scratch serve (server starts in-process, answers live-node + chain
-RPCs, serve loop coexists). Still to do: `getpeerinfo` (per-peer table),
-`getmempoolinfo`/`getrawmempool` (`MAP_SHARED` mempool + slot-walk),
-`sendrawtransaction` (accept+relay channel), `getchaintips`, and
-`getrawtransaction` without a block hash.
+RPCs, serve loop coexists). Landed: `getconnectioncount`, `getnetworkinfo`,
+`getpeerinfo` (outbound peer table over shared memory), `getmempoolinfo` /
+`getrawmempool` (the serve process's own mempool + accurate config), and
+`getchaintips` (active tip — side branches aren't persisted, which matches
+Core for a node with no forks). **Remaining:** `sendrawtransaction` — the one
+piece needing a parent→worker relay channel (the parent holds no peer sockets),
+deferred as its own careful slice; `getrawtransaction` without a block hash
+(mempool lookup); and a mempool coherent across the fork tree (`MAP_SHARED` +
+tx-accept-path locking) so a listening node's inbound-child txs appear in
+`getmempoolinfo`/`getrawmempool`.
 `createrawtransaction` was skipped as out of scope (the tx builder lives in
 the wallet CLI). Still absent as categories: wallet RPCs beyond the original
 8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest
