@@ -138,7 +138,7 @@ int main(void){
      * NB blocks have blen: b[0] has a compact tx. Retain only blocks >= 4. */
     char* cmd9="prune"; char* p4="4"; void* avb[8]; avb[0]=cmd9; avb[1]=p4;
     n=cli_main(st,2,avb,out,sizeof out); out[n]=0;
-    if(strncmp((char*)out,"pruned to height ",17)==0) printf("PASS prune cmd (got %.20s)\n",(char*)out);
+    if(strncmp((char*)out,"pruned to height ",17)==0){ if(n>0&&out[n-1]=='\n')out[n-1]=0; printf("PASS prune cmd (got %.20s)\n",(char*)out); }
     else { printf("FAIL prune cmd got=%.30s\n",(char*)out); failures++; }
     /* block count still reports the full stored chain (index retained) */
     n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("count after prune",(char*)out,"8\n");
