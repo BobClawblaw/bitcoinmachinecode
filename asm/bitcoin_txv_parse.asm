@@ -350,3 +350,252 @@ txv_parse_asm:
     pop  rbx
     pop  rbp
     ret
+
+; ----------------------------------------------------------------------------
+; txvb_parse_tx_asm -- the BLOCK path's per-tx parser (phase 2 slice 4,
+; 2026-08-24): twin of tx_verify.c's txvb_parse_tx, which is what the live
+; daemon actually runs (txv_parse above serves the single-tx path, test-only
+; since the connect-all rewrite). Same wire walk as txv_parse_asm; differs
+; exactly as the C does:
+;   - fills caller-supplied 144-byte txvb_in_t entries at flat[base..):
+;       tx_index@0 local_idx@8 tx_ptr@16 tx_len@24 outpoint@32 scriptSig@40
+;       scriptSiglen@48 nwit@72 wit_off@76 tap_desc@128 (poisoned ~0 --
+;       a stale descriptor index from the previous block's flat array would
+;       hand a worker the wrong tx's aggregate sighash, silently);
+;   - nin bound is the caller's sizing cap (base+nin > cap), not
+;     TXV_MAX_INPUTS;
+;   - does NOT reset wp->used and does NOT resolve wit/witlen -- the block
+;     driver owns both, before/after all txs.
+;
+;   long txvb_parse_tx_asm(tx, txlen, tx_index, flat, base, cap,
+;                          /*stack*/ u64* out_nin, const char** reason,
+;                          witpool_t* wp) -> 1 / 0
+;
+; Frame: push rbp + 5 pushes, sub rsp,0x58 -> rsp = rbp-0x80, 0 mod 16 at
+; the txv_witpool_reserve call. Locals below the save area:
+;   [rbp-0x30] tx    [rbp-0x38] txlen  [rbp-0x40] tx_index
+;   [rbp-0x48] nin   [rbp-0x50] flat+base*144 (entry 0)
+;   [rbp-0x58] i     [rbp-0x60] segwit [rbp-0x68] nitems
+;   [rbp-0x70] woff  [rbp-0x78] j
+; Registers: rbx = p (RDCS contract), r12 = end, r13 = entry cursor,
+; r14 = wp, r15 = scratch.
+; ----------------------------------------------------------------------------
+%define BIN_TXIDX     0
+%define BIN_LOCAL     8
+%define BIN_TXPTR     16
+%define BIN_TXLEN     24
+%define BIN_OUTPOINT  32
+%define BIN_SCRIPTSIG 40
+%define BIN_SSLEN     48
+%define BIN_NWIT      72
+%define BIN_WITOFF    76
+%define BIN_TAPDESC   128
+%define BIN_STRIDE    144
+
+section .rodata
+r_sizing:   db "block input count exceeds sizing pass",0
+
+section .text
+
+global txvb_parse_tx_asm
+txvb_parse_tx_asm:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x58
+    mov  [rbp-0x30], rdi                 ; tx
+    mov  [rbp-0x38], rsi                 ; txlen
+    mov  [rbp-0x40], rdx                 ; tx_index
+    mov  r14, [rbp+32]                   ; wp
+    ; entry 0 = flat + base*144  (144 = 16*9)
+    mov  rax, r8
+    imul rax, rax, BIN_STRIDE
+    add  rax, rcx
+    mov  [rbp-0x50], rax
+    mov  r13, rax
+    lea  r12, [rdi+rsi]                  ; end
+    mov  rbx, rdi                        ; p
+    mov  r15, r9                         ; cap (r8 = base survives to the check)
+
+    cmp  rsi, 10
+    jb   .b_short
+    add  rbx, 4                          ; version
+    xor  eax, eax
+    lea  rcx, [rbx+2]
+    cmp  rcx, r12
+    ja   .b_segdone
+    cmp  byte [rbx], 0x00
+    jne  .b_segdone
+    cmp  byte [rbx+1], 0x01
+    jne  .b_segdone
+    mov  eax, 1
+    add  rbx, 2
+.b_segdone:
+    mov  [rbp-0x60], rax                 ; segwit
+
+    RDCS .b_nin                          ; nin
+    test rax, rax
+    jz   .b_bounds                       ; nin == 0
+    mov  [rbp-0x48], rax                 ; nin (saved BEFORE the sum below)
+    add  rax, r8                         ; base + nin
+    cmp  rax, r15                        ; > cap ?
+    ja   .b_sizing
+
+    ; ---- input loop ----
+    xor  ecx, ecx
+    mov  [rbp-0x58], rcx                 ; i = 0
+.b_in_loop:
+    mov  rax, [rbp-0x58]
+    cmp  rax, [rbp-0x48]
+    jae  .b_in_done
+    ; entry header
+    mov  rdx, [rbp-0x40]
+    mov  [r13+BIN_TXIDX], rdx            ; tx_index
+    mov  [r13+BIN_LOCAL], eax            ; local_idx = (u32)i
+    mov  rdx, [rbp-0x30]
+    mov  [r13+BIN_TXPTR], rdx
+    mov  rdx, [rbp-0x38]
+    mov  [r13+BIN_TXLEN], rdx
+    mov  rax, -1
+    mov  [r13+BIN_TAPDESC], rax          ; poison tap_desc (see header)
+    lea  rcx, [rbx+36]
+    cmp  rcx, r12
+    ja   .b_outpt
+    mov  [r13+BIN_OUTPOINT], rbx
+    add  rbx, 36
+    RDCS .b_ssv                          ; sl
+    mov  r15, rax
+    mov  rax, r12
+    sub  rax, rbx
+    lea  rcx, [r15+4]                    ; sl+4 (same wrap fidelity as the C)
+    cmp  rax, rcx
+    jb   .b_sstrunc
+    mov  [r13+BIN_SCRIPTSIG], rbx
+    mov  [r13+BIN_SSLEN], r15d
+    lea  rbx, [rbx+r15+4]
+    mov  dword [r13+BIN_NWIT], 0
+    add  r13, BIN_STRIDE
+    inc  qword [rbp-0x58]
+    jmp  .b_in_loop
+.b_in_done:
+
+    RDCS .b_nout                         ; nout
+    mov  r15, rax
+.b_out_loop:
+    test r15, r15
+    jz   .b_out_done
+    lea  rcx, [rbx+8]
+    cmp  rcx, r12
+    ja   .b_outtr
+    add  rbx, 8
+    RDCS .b_osv                          ; output script len
+    mov  rcx, r12
+    sub  rcx, rbx
+    cmp  rcx, rax
+    jb   .b_ostrunc
+    add  rbx, rax
+    dec  r15
+    jmp  .b_out_loop
+.b_out_done:
+
+    cmp  qword [rbp-0x60], 0             ; segwit?
+    je   .b_ok
+    mov  r13, [rbp-0x50]                 ; entry cursor back to entry 0
+    xor  ecx, ecx
+    mov  [rbp-0x58], rcx                 ; i = 0
+.b_wit_loop:
+    mov  rax, [rbp-0x58]
+    cmp  rax, [rbp-0x48]
+    jae  .b_ok
+    RDCS .b_wcv                          ; nitems
+    cmp  rax, TXV_MAX_WIT_ITEMS
+    ja   .b_witmany
+    mov  [rbp-0x68], rax
+    mov  [r13+BIN_NWIT], eax
+    mov  rdi, r14
+    mov  rsi, rax
+    call txv_witpool_reserve
+    cmp  rax, -1
+    je   .b_oom
+    mov  [rbp-0x70], rax                 ; woff
+    mov  [r13+BIN_WITOFF], eax
+    xor  ecx, ecx
+    mov  [rbp-0x78], rcx                 ; j = 0
+.b_item_loop:
+    mov  rax, [rbp-0x78]
+    cmp  rax, [rbp-0x68]
+    jae  .b_items_done
+    RDCS .b_wlv                          ; il
+    mov  rcx, r12
+    sub  rcx, rbx
+    cmp  rcx, rax
+    jb   .b_wtrunc
+    mov  rcx, [rbp-0x70]
+    add  rcx, [rbp-0x78]
+    mov  rdx, [r14+WP_PTR]               ; re-read: reserve may have moved it
+    mov  [rdx+rcx*8], rbx
+    mov  rdx, [r14+WP_LEN]
+    mov  [rdx+rcx*4], eax
+    add  rbx, rax
+    inc  qword [rbp-0x78]
+    jmp  .b_item_loop
+.b_items_done:
+    add  r13, BIN_STRIDE
+    inc  qword [rbp-0x58]
+    jmp  .b_wit_loop
+
+.b_ok:
+    mov  rax, [rbp-0x48]
+    mov  rcx, [rbp+16]
+    mov  [rcx], rax                      ; *out_nin = nin
+    mov  eax, 1
+    jmp  .b_out
+
+.b_short:   lea rsi, [r_short]
+            jmp .b_reject
+.b_nin:     lea rsi, [r_nin]
+            jmp .b_reject
+.b_bounds:  lea rsi, [r_bounds]
+            jmp .b_reject
+.b_sizing:  lea rsi, [r_sizing]
+            jmp .b_reject
+.b_outpt:   lea rsi, [r_outpt]
+            jmp .b_reject
+.b_ssv:     lea rsi, [r_ssv]
+            jmp .b_reject
+.b_sstrunc: lea rsi, [r_sstrunc]
+            jmp .b_reject
+.b_nout:    lea rsi, [r_nout]
+            jmp .b_reject
+.b_outtr:   lea rsi, [r_outtr]
+            jmp .b_reject
+.b_osv:     lea rsi, [r_osv]
+            jmp .b_reject
+.b_ostrunc: lea rsi, [r_ostrunc]
+            jmp .b_reject
+.b_wcv:     lea rsi, [r_wcv]
+            jmp .b_reject
+.b_witmany: lea rsi, [r_witmany]
+            jmp .b_reject
+.b_oom:     lea rsi, [r_oom]
+            jmp .b_reject
+.b_wlv:     lea rsi, [r_wlv]
+            jmp .b_reject
+.b_wtrunc:  lea rsi, [r_wtrunc]
+.b_reject:
+    mov  rcx, [rbp+24]
+    mov  [rcx], rsi                      ; *reason = string
+    xor  eax, eax
+.b_out:
+    add  rsp, 0x58
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
