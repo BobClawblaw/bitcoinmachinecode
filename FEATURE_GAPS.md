@@ -73,6 +73,14 @@ harness can compare JSON directly):
   builder — a garbage P2WSH `witness_program` (copied 32 bytes from a 20-byte
   buffer), P2TR `isscript=false`, and a stray `ischange` — now fixed.
   (`getaddressinfo` shares the decoder; wallet-context fields are still stubs.)
+- Util: `createmultisig <n> <keys> [address_type]` — validate the pubkeys
+  (on-curve, via `pubkey_parse` = Core's `IsFullyValid`), assemble the m-of-n
+  redeemScript, and derive the address for `legacy` (P2SH), `p2sh-segwit`
+  (P2SH-P2WSH) or `bech32` (P2WSH); uncompressed keys force legacy and add
+  Core's warning; `bech32m` is refused as Core refuses it. Differs only by the
+  omitted `descriptor`. `validation/createmultisig_diff.py` diffs 17 cases vs
+  the oracle — every type, 15/16/17-key count encoding, the uncompressed path,
+  and every error code — all identical modulo `descriptor`.
 - Node: `uptime`, `stop` (these apply to the `bitcoin_rpcd` process).
 
 How it reaches chain state: `bitcoin_rpcd` is a **standalone process**, not
@@ -103,9 +111,9 @@ return `-32601 Method not found` rather than stubbed answers.
 `createrawtransaction` was skipped as out of scope (the tx builder lives in
 the wallet CLI). Still absent as categories: wallet RPCs beyond the original
 8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest
-of util (`decodescript` and `validateaddress` are done; `createmultisig` /
-`deriveaddresses` are the next pure-function candidates — the latter needs a
-descriptor engine).
+of util (`decodescript`, `validateaddress` and `createmultisig` are done;
+`deriveaddresses` / `getdescriptorinfo` are next but need a descriptor engine,
+and a `deriveaddresses`-free win is `getindexinfo`).
 
 **Effort for the remainder: medium** — the blockchain-query breadth is now
 done; what's left is the one architectural step (RPC ↔ live node state)

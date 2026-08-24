@@ -491,6 +491,42 @@ int main(void){
         rj_free(r);
     }
 
+    /* ---- createmultisig (pure; known answers from Bitcoin Core) ---- */
+    {
+        /* Core's own help-example keys */
+        const char* K1 = "03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd";
+        const char* K2 = "03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626";
+        const char* REDEEM =
+            "522103789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd"
+            "2103dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a6162652ae";
+        char p[400];
+        /* legacy 2-of-2 -> P2SH */
+        snprintf(p, sizeof p, "[2, [\"%s\",\"%s\"]]", K1, K2);
+        rj_val* r = call("createmultisig", p, &ec, &em);
+        ck_str("cms legacy address", S(r,"address"), "3QsFXpFJf2ZY6GLWVoNFFd2xSDwdS713qX");
+        ck_str("cms legacy redeemScript", S(r,"redeemScript"), REDEEM);
+        ck("cms no descriptor (omitted)", G(r,"descriptor") == NULL);
+        rj_free(r);
+        /* bech32 2-of-2 -> P2WSH */
+        snprintf(p, sizeof p, "[2, [\"%s\",\"%s\"], \"bech32\"]", K1, K2);
+        r = call("createmultisig", p, &ec, &em);
+        ck_str("cms bech32 address", S(r,"address"), "bc1q0jnggjwnn22a4ywxc2pcw86c0d6tghqkgk3hlryrxl7nmxkylmnq6smlx3");
+        rj_free(r);
+        /* p2sh-segwit 1-of-2 -> P2SH-P2WSH */
+        snprintf(p, sizeof p, "[1, [\"%s\",\"%s\"], \"p2sh-segwit\"]", K1, K2);
+        r = call("createmultisig", p, &ec, &em);
+        ck_str("cms p2sh-segwit address", S(r,"address"), "3EAkC7eViWC6z2KGXNLVHy6AXio96jkQJv");
+        rj_free(r);
+        /* error paths (Core's codes) */
+        snprintf(p, sizeof p, "[0, [\"%s\"]]", K1);
+        expect_err("cms required<1", "createmultisig", p, -8, "a multisignature address must require at least one key to redeem");
+        snprintf(p, sizeof p, "[3, [\"%s\",\"%s\"]]", K1, K2);
+        expect_err("cms not enough keys", "createmultisig", p, -8, "not enough keys supplied (got 2 keys, but need at least 3 to redeem)");
+        snprintf(p, sizeof p, "[1, [\"%s\"], \"bech32m\"]", K1);
+        expect_err("cms bech32m rejected", "createmultisig", p, -5, "createmultisig cannot create bech32m multisig addresses");
+        expect_err("cms invalid key", "createmultisig", "[1, [\"deadbeef\"]]", -5, "Invalid public key: deadbeef");
+    }
+
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
