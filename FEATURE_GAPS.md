@@ -111,14 +111,15 @@ The plumbing chosen is exactly the shared-memory route: the serve parent
 publishes a `MAP_SHARED` `node_status_t` (peer counts, tip, start time) that
 the forked children populate, and the RPC server is embedded in the serve
 daemon to read it. `getnetworkinfo` (mostly static: our wire identity from
-`version_gen.h`) and `getconnectioncount` are implemented and dispatch-wired;
-the module + its unit test are landed. Still to do: the serve-daemon
-integration (shared region + worker publishing + embedding `rpc_server_start`),
-then `getpeerinfo` (per-peer table), `getmempoolinfo`/`getrawmempool`
-(`MAP_SHARED` mempool + slot-walk), `sendrawtransaction` (accept+relay
-channel), `getchaintips`, and `getrawtransaction` without a block hash.
-Until the serve integration lands these report a node with 0 live connections
-from the standalone `bitcoin_rpcd` (correct for a read-only process).
+`version_gen.h`) and `getconnectioncount` are implemented, dispatch-wired, and
+**the RPC server is now embedded in the serve daemon** (`daemon/main.c`): the
+download worker publishes peer counts / tip into a `MAP_SHARED` `node_status_t`
+before the fork, and the parent serves them on the RPC thread — verified on an
+isolated scratch serve (server starts in-process, answers live-node + chain
+RPCs, serve loop coexists). Still to do: `getpeerinfo` (per-peer table),
+`getmempoolinfo`/`getrawmempool` (`MAP_SHARED` mempool + slot-walk),
+`sendrawtransaction` (accept+relay channel), `getchaintips`, and
+`getrawtransaction` without a block hash.
 `createrawtransaction` was skipped as out of scope (the tx builder lives in
 the wallet CLI). Still absent as categories: wallet RPCs beyond the original
 8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest

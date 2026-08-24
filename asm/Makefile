@@ -1606,8 +1606,13 @@ DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/block_witness.c daemon/tx_
     daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c \
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c
-daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(VERSION_GEN_H)
-	$(CC) -no-pie -O2 -o $@ $(DAEMONSRCS) $(DAEMONOBJS) -lpthread
+# Embedded RPC server (docs/RPC_LIVE_NODE.md): the serve daemon hosts the same
+# JSON-RPC layer as bitcoin_rpcd so it can answer live-node RPCs. These objects
+# are the net-new ones not already in DAEMONOBJS; wallet_core.c is a source.
+DAEMON_RPCOBJS := rpc_server.o rpc_commands.o rpc_chain.o rpc_json.o rpc_net.o rpc_node.o \
+    bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
+daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H)
+	$(CC) -no-pie -O2 -o $@ $(DAEMONSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c -lpthread
 
 # pverify -- parallel block-chain verifier, machine-adaptive worker count.
 # Built at -O1 (not -O2/-O3): the deep asm call chain (cons_verify -> tx_parse

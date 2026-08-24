@@ -43,6 +43,11 @@
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 #include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
+#include "../rpc_chain.h"
+#include "../rpc_node.h"     /* node_status_t + live-node RPC dispatch */
+static rpc_wallet     g_rpc_wallet;   /* zeroed: wallet RPCs report "not configured" */
+static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap failed */
 
 /* Pre-mux outbound catch-up bounds (used by outbound_catchup below and the
  * serve handler). CATCHUP_MAX caps the number of blocks pulled synchronously;
@@ -2340,6 +2345,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * full interval. */
     long long next_reorg_probe_ms = 0;
     for(;;){
+        /* publish outbound peer count + tip for the parent's RPC thread */
+        if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
+            g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24); }
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
@@ -2601,6 +2609,62 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
  * means `serve` is live to inbound peers immediately (the listener exists
  * even while the outbound legs are still connecting), which the old order
  * (connect-all-outbound-then-listen) did not guarantee. */
+/* ---- embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) --------------------
+ * The serve daemon hosts the same rpc_server as bitcoin_rpcd so it can answer
+ * LIVE-node RPCs (getconnectioncount/getnetworkinfo, later peers/mempool) that
+ * a read-only process cannot. The live counts cross the fork boundary via a
+ * MAP_SHARED node_status_t (g_node_status) allocated before the worker fork:
+ * the download worker publishes n_out/tip_height, the parent publishes
+ * n_inbound, and the parent's RPC thread reads it. (Includes + g_node_status /
+ * g_rpc_wallet are declared near the top of the file so serve_download_worker,
+ * defined earlier, can publish into the shared status.) */
+
+/* Parse rpcport/rpcuser/rpcpassword out of the daemon's config file (node_config
+ * treats them as foreign keys, so we read them here). */
+static void serve_rpc_read_creds(const char* cfgpath, int* port,
+                                 char* user, size_t ucap, char* pass, size_t pcap){
+    *port = 8332; user[0] = 0; pass[0] = 0;
+    if (!cfgpath) return;
+    FILE* f = fopen(cfgpath, "r"); if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)){
+        char* p = line; while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || !*p) continue;
+        char* eq = strchr(p, '='); if (!eq) continue; *eq = 0;
+        char* k = p; char* v = eq + 1;
+        size_t vl = strlen(v); while (vl && (v[vl-1]=='\n'||v[vl-1]=='\r'||v[vl-1]==' '||v[vl-1]=='\t')) v[--vl] = 0;
+        size_t kl = strlen(k); while (kl && (k[kl-1]==' '||k[kl-1]=='\t')) k[--kl] = 0;
+        if      (!strcmp(k, "rpcport"))     *port = atoi(v);
+        else if (!strcmp(k, "rpcuser"))     { strncpy(user, v, ucap-1); user[ucap-1] = 0; }
+        else if (!strcmp(k, "rpcpassword")) { strncpy(pass, v, pcap-1); pass[pcap-1] = 0; }
+    }
+    fclose(f);
+}
+
+/* Start the embedded RPC server in the serve parent (non-blocking: rpc_server
+ * runs its own accept thread). No-op with a log line if creds are absent. */
+static void serve_start_rpc(const char* dir, const char* cfgpath){
+    static char user[128], pass[256]; int port;
+    serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
+    if (!user[0] || !pass[0]){
+        fprintf(stderr, "[rpc] no rpcuser/rpcpassword in config -- embedded RPC server disabled\n");
+        return;
+    }
+    (void)dir;   /* the daemon has already chdir'd into the datadir */
+    if (rpc_chain_open(NULL))
+        fprintf(stderr, "[rpc] block archive opened (chain RPCs live)\n");
+    else
+        fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
+    rpc_node_set_status(g_node_status);
+    rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
+    int actual = 0; char err[256];
+    if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
+        fprintf(stderr, "[rpc] server start failed: %s\n", err);
+        return;
+    }
+    fprintf(stderr, "[rpc] JSON-RPC server on 127.0.0.1:%d (live-node + chain, user=%s)\n", actual, user);
+}
+
 static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
@@ -2645,6 +2709,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * is naturally dead in outbound-only mode -- no separate code path. */
     struct pollfd pfds[MUX_MAX_OUT+1];
     for(;;){
+        if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
@@ -3227,11 +3292,24 @@ int main(int argc, char** argv){
          * header comment in bitcoin_idxscan.asm for the full rationale.
          * Each forked serve child re-syncs its index length from index.dat so
          * blocks the worker appends become serve-able (fresh disk reads). */
+        /* Shared live-node status: MAP_SHARED so the download worker (peer
+         * counts, tip) and the parent (inbound count) can both publish and the
+         * parent's RPC thread can read across the fork. Allocated BEFORE the
+         * fork so the child inherits the same mapping. */
+        g_node_status = mmap(NULL, sizeof(node_status_t), PROT_READ|PROT_WRITE,
+                             MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
+        else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
+               g_node_status->tip_height = *(int*)(store_buf+24);
+               g_node_status->start_time = (long long)time(NULL); }
+
         pid_t dl = fork();
         if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }
         g_dl_worker_pid = dl;   /* so serve_mux's shutdown handling can forward SIGTERM to it */
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
         fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
+        /* Embedded JSON-RPC server (parent), non-blocking own accept thread. */
+        { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
         return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333, l);
