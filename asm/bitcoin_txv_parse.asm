@@ -76,57 +76,48 @@ r_wtrunc:   db "truncated witness item",0
 section .text
 
 ; ----------------------------------------------------------------------------
-; rd_cs(rdi = &cursor, rsi = end) -> rax value; CF set on failure (out of
-; bytes), clear on success. Advances *cursor through rdi. Clobbers only
-; caller-saved rax/rcx/rdx -- fully SysV, deliberately: the first draft kept
-; the cursor in rbx and mutated it as its output, which is exactly the
-; custom-convention shape callee-saved-check exists to flag, and widening
-; KNOWN_SHARED_FRAME for a brand-new helper would dilute "anything else here
-; is a real finding". Three extra instructions per call site buy a helper
-; the gate can verify like any other function. Mirrors txv_rd_cs exactly,
-; including the unaligned little-endian loads its byte loops amount to.
+; RDCS <fail_label>: inline compact-size read at rbx (end = r12) -> rax,
+; rbx advanced; truncation jumps straight to the fail label. Was a SysV
+; helper taking &cursor (2026-08-24 first rev): fully gate-clean but ~16%
+; slower than gcc's inlined txv_rd_cs on witness-heavy transactions -- the
+; per-varint spill/call/reload dominated exactly where varints are densest.
+; A macro expands INLINE, so the cursor lives in rbx with no call and no
+; custom convention for callee-saved-check to flag: the containing function
+; saves rbx once in its own prologue. Clobbers rax, rcx.
 ; ----------------------------------------------------------------------------
-rd_cs:
-    mov  rdx, [rdi]                      ; p
-    cmp  rdx, rsi
-    jae  .f
-    movzx eax, byte [rdx]
+%macro RDCS 1
+    cmp  rbx, r12
+    jae  %1
+    movzx eax, byte [rbx]
     cmp  al, 0xfd
-    jb   .one
-    je   .two
+    jb   %%one
+    je   %%two
     cmp  al, 0xfe
-    je   .four
-    lea  rcx, [rdx+9]                    ; 0xff: 8-byte value
-    cmp  rcx, rsi
-    ja   .f
-    mov  rax, [rdx+1]
-    mov  [rdi], rcx
-    clc
-    ret
-.four:
-    lea  rcx, [rdx+5]
-    cmp  rcx, rsi
-    ja   .f
-    mov  eax, [rdx+1]
-    mov  [rdi], rcx
-    clc
-    ret
-.two:
-    lea  rcx, [rdx+3]
-    cmp  rcx, rsi
-    ja   .f
-    movzx eax, word [rdx+1]
-    mov  [rdi], rcx
-    clc
-    ret
-.one:
-    inc  rdx
-    mov  [rdi], rdx
-    clc
-    ret
-.f:
-    stc
-    ret
+    je   %%four
+    lea  rcx, [rbx+9]                    ; 0xff: 8-byte value
+    cmp  rcx, r12
+    ja   %1
+    mov  rax, [rbx+1]
+    mov  rbx, rcx
+    jmp  %%done
+%%four:
+    lea  rcx, [rbx+5]
+    cmp  rcx, r12
+    ja   %1
+    mov  eax, [rbx+1]
+    mov  rbx, rcx
+    jmp  %%done
+%%two:
+    lea  rcx, [rbx+3]
+    cmp  rcx, r12
+    ja   %1
+    movzx eax, word [rbx+1]
+    mov  rbx, rcx
+    jmp  %%done
+%%one:
+    inc  rbx
+%%done:
+%endmacro
 
 ; ----------------------------------------------------------------------------
 ; txv_parse_asm(tx, txlen, in, wp, out_nin, reason) -> 1 / 0
@@ -138,8 +129,8 @@ rd_cs:
 ;   [rbp-0x30] out_nin   [rbp-0x38] reason    [rbp-0x40] tx base
 ;   [rbp-0x48] nin       [rbp-0x50] in base   [rbp-0x58] i (input loop)
 ;   [rbp-0x60] segwit    [rbp-0x68] nitems    [rbp-0x70] woff
-;   [rbp-0x78] j (item loop)  [rbp-0x80] rd_cs cursor slot (p spilled
-;   around each rd_cs call -- the helper is SysV, see its header)
+;   [rbp-0x78] j (item loop)   ([rbp-0x80] spare; the former rd_cs cursor
+;   slot -- varint reads are the inline RDCS macro now, cursor stays in rbx)
 ; Register roles: rbx = p (parse cursor, rd_cs contract), r12 = end,
 ; r13 = current input record, r14 = wp, r15 = loop bounds scratch.
 ; ----------------------------------------------------------------------------
@@ -181,12 +172,7 @@ txv_parse_asm:
 .seg_done:
     mov  [rbp-0x60], rax                 ; segwit flag
 
-    mov  [rbp-0x80], rbx
-    lea  rdi, [rbp-0x80]
-    mov  rsi, r12
-    call rd_cs                           ; nin
-    mov  rbx, [rbp-0x80]
-    jc   .r_nin
+    RDCS .r_nin                           ; nin
     test rax, rax                        ; nin == 0 -> bounds
     jz   .r_bounds
     cmp  rax, TXV_MAX_INPUTS
@@ -205,12 +191,7 @@ txv_parse_asm:
     ja   .r_outpt
     mov  [r13+IN_OUTPOINT], rbx
     add  rbx, 36
-    mov  [rbp-0x80], rbx
-    lea  rdi, [rbp-0x80]
-    mov  rsi, r12
-    call rd_cs                           ; sl
-    mov  rbx, [rbp-0x80]
-    jc   .r_ssv
+    RDCS .r_ssv                           ; sl
     mov  r15, rax                        ; sl
     mov  rax, r12
     sub  rax, rbx                        ; end - p
@@ -226,12 +207,7 @@ txv_parse_asm:
     jmp  .in_loop
 .in_done:
 
-    mov  [rbp-0x80], rbx
-    lea  rdi, [rbp-0x80]
-    mov  rsi, r12
-    call rd_cs                           ; nout
-    mov  rbx, [rbp-0x80]
-    jc   .r_nout
+    RDCS .r_nout                           ; nout
     mov  r15, rax
 .out_loop:
     test r15, r15
@@ -240,12 +216,7 @@ txv_parse_asm:
     cmp  rcx, r12
     ja   .r_outtr
     add  rbx, 8
-    mov  [rbp-0x80], rbx
-    lea  rdi, [rbp-0x80]
-    mov  rsi, r12
-    call rd_cs                           ; output script len
-    mov  rbx, [rbp-0x80]
-    jc   .r_osv
+    RDCS .r_osv                           ; output script len
     mov  rcx, r12
     sub  rcx, rbx
     cmp  rcx, rax                        ; (end-p) < sl ?
@@ -264,12 +235,7 @@ txv_parse_asm:
     mov  rax, [rbp-0x58]
     cmp  rax, [rbp-0x48]
     jae  .resolve
-    mov  [rbp-0x80], rbx
-    lea  rdi, [rbp-0x80]
-    mov  rsi, r12
-    call rd_cs                           ; nitems
-    mov  rbx, [rbp-0x80]
-    jc   .r_wcv
+    RDCS .r_wcv                           ; nitems
     cmp  rax, TXV_MAX_WIT_ITEMS
     ja   .r_witmany
     mov  [rbp-0x68], rax                 ; nitems
@@ -287,12 +253,7 @@ txv_parse_asm:
     mov  rax, [rbp-0x78]
     cmp  rax, [rbp-0x68]
     jae  .items_done
-    mov  [rbp-0x80], rbx
-    lea  rdi, [rbp-0x80]
-    mov  rsi, r12
-    call rd_cs                           ; il
-    mov  rbx, [rbp-0x80]
-    jc   .r_wlv
+    RDCS .r_wlv                           ; il
     mov  rcx, r12
     sub  rcx, rbx
     cmp  rcx, rax                        ; (end-p) < il ?
