@@ -513,10 +513,22 @@ node_sync_multi:
     cmp  rax, -1
     jne  .hdr_not_timeout
     inc  dword [rbp-0x1b04]
-    cmp  dword [rbp-0x1b04], 20    ; ~20 timeouts (~60s, matching the outer
+    ; 2026-08-24 (incident #33 root-cause-2 investigation): was 20 (~60s).
+    ; An independent Python getheaders probe against the same public peers
+    ; this node fails on showed every peer that WILL serve headers answers in
+    ; 150-1065 ms; the ones that fail send tx-relay chatter or go silent and
+    ; never send headers at all -- i.e. `where=3` is a non-serving peer, not a
+    ; slow one. 60 s of patience for a peer that answers in ~1 s just makes the
+    ; node slow to rotate off a dead leg after boot (each failing pass costs
+    ; the full budget, and a leg is dropped only after 3 passes). 8 timeouts
+    ; (~24s) is still far beyond any real headers latency while cutting the
+    ; dead-leg cost ~2.5x. Chatter (rax>0) does not increment this counter, so
+    ; this only bounds GENUINE silence; the block-drain counter is left at 20
+    ; because a large block transfer legitimately involves longer quiet gaps.
+    cmp  dword [rbp-0x1b04], 8
     jb .fchk3
     mov  dword [rel sync_fail_code], 3
-    jmp  .fail                      ; per-leg alarm budget anyway) before
+    jmp  .fail                      ; before truly giving up on this pass
     .fchk3:
     jmp  .hdr_drain                 ; truly giving up on this getheaders pass
 .hdr_not_timeout:
