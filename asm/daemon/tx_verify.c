@@ -1474,5 +1474,9 @@ fail:
 int txv_test_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason){
     return txv_parse(tx, txlen, out_nin, reason);
 }
+int txv_test_parse_block(const u8* tx, u64 txlen, u64 tx_index, void* flat,
+                         u64 base, u64 cap, u64* out_nin, const char** reason){
+    return txvb_parse_tx(tx, txlen, tx_index, (txvb_in_t*)flat, base, cap, out_nin, reason);
+}
 void* txv_test_in(void){ return g_txv_in; }
 void* txv_test_witpool(void){ return &g_wit_pool; }
