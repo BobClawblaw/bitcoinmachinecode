@@ -1292,6 +1292,17 @@ u64 txv_bytepool_reserve(bytepool_t* pool, u64 n){
 void* txv_grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
     return grow_arena(buf, cap_bytes, need_bytes);
 }
+/* slice 7 seams: the static taproot aggregate build/verify, exported for
+ * tests/test_tapagg_diff.c. */
+int txv_test_tapagg_build(bytepool_t* pool, tapagg_t* d, tapin_fn get, void* ctx,
+                          u64 nin, const u8* tx, u64 txlen, const char** reason){
+    return tapagg_build(pool, d, get, ctx, nin, tx, txlen, reason);
+}
+int txv_test_tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
+                           const u8* const* wit, const u32* witlen, u32 nwit,
+                           u64 local_idx, const char** reason){
+    return tapagg_verify(pool, d, spk, wit, witlen, nwit, local_idx, reason);
+}
 int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
                   u64 value, u64 uheight, u64 ucb,
                   const u8* spk, unsigned long spklen,
