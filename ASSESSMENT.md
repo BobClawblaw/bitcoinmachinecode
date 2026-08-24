@@ -10,7 +10,7 @@ The short version, stated before the detail so it cannot be skipped:
 > Bitcoin Core for any real user today. On the one primitive that can be
 > compared like-for-like it is within ~1.2× of libsecp256k1. Its end-to-end
 > speed against Core has **never been measured**. Its consensus correctness is
-> being actively established and is not yet established: **thirty-two** defects
+> being actively established and is not yet established: **thirty-five** defects
 > have been found (as of 2026-08-24), at least **eight** of them in the
 > chain-splitting direction, and the discovery rate is not yet decelerating.
 > The most recent five were found *after* a clean genesis-to-963,000 replay,
@@ -88,7 +88,7 @@ storage work for the same chain.
 
 ## 4. The correctness picture, which matters more than the speed
 
-**Thirty-two numbered defects** (`LOG.md`, incidents #1–#32; this section's
+**Thirty-five numbered defects** (`LOG.md`, incidents #1–#35; this section's
 distribution analysis was written at #24 and the shape has held since). The
 five most recent are worth separating out, because none of them was reachable
 by replaying the chain: a `SETcc` that wrote eight bits where eleven numeric
@@ -186,7 +186,11 @@ But **"can it replace Bitcoin Core" is not a close question today**: no mining,
 no PSBT, no wallets, no testnet, no light-client indexes, a thin RPC surface,
 and a node that until today crashed the first time a peer pushed it a block.
 And **"is it consensus-correct" is an open question**, not a settled one, with
-at least eight known chain-split-direction defects found so far and a discovery
+at least eight known chain-split-direction defects found so far (incidents
+#33–#35, added 2026-08-24, are liveness and memory-safety rather than
+chain-split: a keep-up failure, four cons_verify buffer-cap errors two of
+which smash the stack on peer data, and a `connect=` flag the fallback path
+ignored) and a discovery
 rate that has not levelled off — the most recent found by differential testing
 *after* a clean full-chain replay, which is the strongest available evidence
 that a clean replay is not the finish line it looks like.
