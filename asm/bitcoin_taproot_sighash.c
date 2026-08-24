@@ -409,6 +409,16 @@ static int ts_agg_hashes(const tapctx_t* c, const txview_t* t,
     return 1;
 }
 
+/* Phase 2 slice 13b seams (2026-08-24): tx_parse and tx_seq are static;
+ * exported so bitcoin_bip341.asm's twins use the SAME parse and the same
+ * sequence accessor, isolating the serialization under test. */
+int ts_tx_parse_export(void* t, uint32_t* off){ return tx_parse((txview_t*)t, off); }
+uint32_t ts_tx_seq_export(const void* t, int64_t i){ return tx_seq((const txview_t*)t, i); }
+int ts_agg_hashes_export(const void* c, const void* t, uint8_t hp[32], uint8_t ha[32],
+                         uint8_t hs[32], uint8_t hq[32], const uint8_t** sp, uint64_t* sl){
+    return ts_agg_hashes((const tapctx_t*)c, (const txview_t*)t, hp, ha, hs, hq, sp, sl);
+}
+
 /* Build the full TapSighash preimage "0x00 || SigMsg || ext" into pre (cap),
  * return its length, or 0 on error. Then compute TaggedHash("TapSighash", pre)
  * into out32. */
