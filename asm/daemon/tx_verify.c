@@ -1284,6 +1284,14 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
 u64 txv_bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
     return bytepool_alloc(pool, src, n);
 }
+/* slice 5 seams: the remaining static arena functions, exported so
+ * bitcoin_txv_pools.asm's twins can be differentially driven. */
+u64 txv_bytepool_reserve(bytepool_t* pool, u64 n){
+    return bytepool_reserve(pool, n);
+}
+void* txv_grow_arena(void** buf, u64* cap_bytes, u64 need_bytes){
+    return grow_arena(buf, cap_bytes, need_bytes);
+}
 int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
                   u64 value, u64 uheight, u64 ucb,
                   const u8* spk, unsigned long spklen,
