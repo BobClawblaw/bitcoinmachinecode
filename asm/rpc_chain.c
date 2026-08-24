@@ -5,7 +5,9 @@
  * Implemented (Core v31 shapes, src/rpc/blockchain.cpp + rawtransaction.cpp
  * + core_io.cpp):
  *   getblockcount, getbestblockhash, getblockhash, getblockheader, getblock,
- *   getblockchaininfo, getrawtransaction (block-hash form), uptime, stop.
+ *   getblockchaininfo, getdifficulty, getrawtransaction (block-hash form),
+ *   gettxoutproof / verifytxoutproof (BIP37 partial merkle tree; proofs are
+ *   byte-identical to Core's), uptime, stop.
  *
  * How chain state reaches this process: bitcoin_store.asm's store_init +
  * store_reload on -datadir's index.dat (positional 48-byte records:
@@ -877,10 +879,207 @@ static int cmd_stop(rj_val** res){
     return 1;
 }
 
+
+/* ==== gettxoutproof / verifytxoutproof: BIP37 partial merkle tree ==========
+ * Core: CMerkleBlock (blockencodings/merkleblock). A proof is the 80-byte
+ * header || CPartialMerkleTree{ uint32 nTx, compactsize(nHashes), hashes,
+ * compactsize(nBytes), flag bytes (LSB-first bits) }. Pure block data; no
+ * txindex/mempool needed, so like getrawtransaction we REQUIRE the blockhash
+ * param (Core's own behaviour with no txindex). */
+static u32 pmt_width(u32 ntx, int height){ return (ntx + (1u<<height) - 1) >> height; }
+static int pmt_height(u32 ntx){ int h=0; while (pmt_width(ntx,h) > 1) h++; return h; }
+
+static void pmt_calc_hash(const u8 (*leaves)[32], u32 ntx, int height, u32 pos, u8 out[32]){
+    if (height == 0){ memcpy(out, leaves[pos], 32); return; }
+    u8 left[32], right[32];
+    pmt_calc_hash(leaves, ntx, height-1, pos*2, left);
+    if (pos*2u+1u < pmt_width(ntx, height-1)) pmt_calc_hash(leaves, ntx, height-1, pos*2+1, right);
+    else memcpy(right, left, 32);
+    u8 cat[64]; memcpy(cat, left, 32); memcpy(cat+32, right, 32);
+    sha256d(out, cat, 64);
+}
+
+typedef struct { const u8 (*leaves)[32]; const u8* match; u32 ntx;
+                 u8 (*hashes)[32]; u32 nhash; u8* bits; u32 nbits; } pmt_build_t;
+static int pmt_match_sub(const u8* match, u32 ntx, int height, u32 pos){
+    u64 lo = (u64)pos << height, hi = lo + ((u64)1<<height); if (hi>ntx) hi=ntx;
+    for (u64 i=lo;i<hi;i++) if (match[i]) return 1; return 0;
+}
+static void pmt_build(pmt_build_t* b, int height, u32 pos){
+    int parent = pmt_match_sub(b->match, b->ntx, height, pos);
+    b->bits[b->nbits++] = (u8)parent;
+    if (height==0 || !parent){
+        pmt_calc_hash(b->leaves, b->ntx, height, pos, b->hashes[b->nhash++]);
+    } else {
+        pmt_build(b, height-1, pos*2);
+        if (pos*2u+1u < pmt_width(b->ntx, height-1)) pmt_build(b, height-1, pos*2+1);
+    }
+}
+
+typedef struct { const u8 (*hashes)[32]; u32 nhash, hpos; const u8* bits; u32 nbits, bpos;
+                 u8 (*matched)[32]; u32 nmatched; int bad; } pmt_extract_t;
+static void pmt_extract(pmt_extract_t* e, u32 ntx, int height, u32 pos, u8 out[32]){
+    if (e->bpos >= e->nbits){ e->bad=1; memset(out,0,32); return; }
+    int parent = e->bits[e->bpos++];
+    if (height==0 || !parent){
+        if (e->hpos >= e->nhash){ e->bad=1; memset(out,0,32); return; }
+        memcpy(out, e->hashes[e->hpos++], 32);
+        if (height==0 && parent) memcpy(e->matched[e->nmatched++], out, 32);
+    } else {
+        u8 left[32], right[32];
+        pmt_extract(e, ntx, height-1, pos*2, left);
+        if (pos*2u+1u < pmt_width(ntx, height-1)){
+            pmt_extract(e, ntx, height-1, pos*2+1, right);
+            if (!memcmp(left,right,32)) e->bad=1;   /* BIP37: no duplicate right */
+        } else memcpy(right, left, 32);
+        u8 cat[64]; memcpy(cat,left,32); memcpy(cat+32,right,32); sha256d(out,cat,64);
+    }
+}
+
+/* small compactsize writer (values here are small) */
+static int pmt_put_cs(u8* d, u64 v){
+    if (v < 0xfd){ d[0]=(u8)v; return 1; }
+    if (v <= 0xffff){ d[0]=0xfd; d[1]=(u8)v; d[2]=(u8)(v>>8); return 3; }
+    d[0]=0xfe; d[1]=(u8)v; d[2]=(u8)(v>>8); d[3]=(u8)(v>>16); d[4]=(u8)(v>>24); return 5;
+}
+static int hex1(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
+
+/* --- test hooks (exercised by tests/test_txoutproof.c) --- */
+int pmt_test_root(const u8 (*leaves)[32], u32 ntx, u8 out[32]){
+    if (ntx == 0) return 0;
+    pmt_calc_hash(leaves, ntx, pmt_height(ntx), 0, out);
+    return 1;
+}
+/* build a proof for the single leaf `idx`, extract it back, and return the
+ * extracted root + recovered txid: a full serialise-free build/extract cycle. */
+int pmt_test_roundtrip(const u8 (*leaves)[32], u32 ntx, u32 idx, u8 out_root[32], u8 out_leaf[32]){
+    if (idx >= ntx) return 0;
+    u8* match = calloc(ntx, 1); if (!match) return 0; match[idx] = 1;
+    u8 (*hashes)[32] = malloc(sizeof(*hashes)*(ntx+64));
+    u8* bits = malloc((size_t)ntx*2 + 64);
+    if (!hashes || !bits){ free(match); free(hashes); free(bits); return 0; }
+    pmt_build_t b = { leaves, match, ntx, hashes, 0, bits, 0 };
+    pmt_build(&b, pmt_height(ntx), 0);
+    free(match);
+    u8 (*matched)[32] = malloc(sizeof(*matched)*ntx);
+    pmt_extract_t e = { (const u8(*)[32])hashes, b.nhash, 0, bits, b.nbits, 0, matched, 0, 0 };
+    pmt_extract(&e, ntx, pmt_height(ntx), 0, out_root);
+    int ok = !e.bad && e.hpos == b.nhash && e.nmatched == 1;
+    if (ok) memcpy(out_leaf, matched[0], 32);
+    free(hashes); free(bits); free(matched);
+    return ok;
+}
+
+/* collect ordered wire-order txids of block h into leaves (caller-sized);
+ * returns ntx, or -1 on decode error. */
+static long pmt_block_txids(long h, u8 (*leaves)[32], u32 cap){
+    long len = read_block(h);
+    if (len < 80) return -1;
+    const u8* blk = g_blockbuf; const u8* end = blk + len;
+    u64 c; u64 ntx = read_varint(blk + 80, end, &c);
+    if (!c || ntx == 0 || ntx > cap) return -1;
+    const u8* p = blk + 80 + c;
+    for (u64 i=0;i<ntx;i++){
+        txw_t w;
+        if (!tx_walk(p, end, &w)) return -1;
+        u8* scratch = malloc(w.len); if (!scratch) return -1;
+        tx_txid(leaves[i], p, w.len, scratch, w.len); free(scratch);
+        p += w.len;
+    }
+    return (long)ntx;
+}
+
+#define PMT_MAX_TX 100000
+static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_ARR){
+        *ec = -8; *em = "Invalid parameter, expected array of txids"; return 0; }
+    const rj_val* txarr = params->items[0];
+    /* blockhash is required (no txindex) */
+    if (!param_present(params, 1)){
+        *ec = -5; *em = "Transaction not found in specified block (a blockhash is required with no txindex)"; return 0; }
+    refresh(); long h;
+    if (!lookup_block_param(params, 1, 1, &h, ec, em)) return 0;
+
+    static u8 (*leaves)[32]; if (!leaves){ leaves = malloc(sizeof(*leaves)*PMT_MAX_TX); if(!leaves){*ec=-7;*em="oom";return 0;} }
+    long ntx = pmt_block_txids(h, leaves, PMT_MAX_TX);
+    if (ntx < 0){ *ec = -1; *em = "Block decode failed"; return 0; }
+
+    u8* match = calloc((size_t)ntx, 1); if (!match){ *ec=-7; *em="oom"; return 0; }
+    for (size_t t=0; t<txarr->nitems; t++){
+        const rj_val* e = txarr->items[t];
+        if (e->typ != RJ_STR || strlen(e->str) != 64){ free(match); *ec=-8; *em="Invalid txid"; return 0; }
+        u8 want[32];  /* display hex -> wire order */
+        for (int k=0;k<32;k++){ int hi=hex1(e->str[k*2]), lo=hex1(e->str[k*2+1]); if(hi<0||lo<0){free(match);*ec=-8;*em="Invalid txid";return 0;} want[31-k]=(u8)(hi<<4|lo); }
+        int found=0; for (long i=0;i<ntx;i++) if (!memcmp(leaves[i], want, 32)){ match[i]=1; found=1; break; }
+        if (!found){ free(match); *ec=-5; *em="Transaction not found in specified block"; return 0; }
+    }
+    /* build the partial merkle tree */
+    static u8 (*hashes)[32]; if(!hashes){ hashes=malloc(sizeof(*hashes)*(PMT_MAX_TX+64)); if(!hashes){free(match);*ec=-7;*em="oom";return 0;} }
+    static u8* bits; if(!bits){ bits=malloc(PMT_MAX_TX*2+64); if(!bits){free(match);*ec=-7;*em="oom";return 0;} }
+    pmt_build_t b = { (const u8(*)[32])leaves, match, (u32)ntx, hashes, 0, bits, 0 };
+    pmt_build(&b, pmt_height((u32)ntx), 0);
+    free(match);
+    /* serialize: header(80) || u32 ntx LE || cs(nhash) || hashes || cs(nbytes) || flags */
+    u8 hdr[80]; if (read_block_prefix(h, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+    u32 nflagbytes = (b.nbits + 7) / 8;
+    size_t cap = 80 + 4 + 9 + (size_t)b.nhash*32 + 9 + nflagbytes;
+    u8* buf = malloc(cap); if (!buf){ *ec=-7; *em="oom"; return 0; }
+    size_t o = 0;
+    memcpy(buf+o, hdr, 80); o += 80;
+    buf[o++]=(u8)ntx; buf[o++]=(u8)(ntx>>8); buf[o++]=(u8)((u32)ntx>>16); buf[o++]=(u8)((u32)ntx>>24);
+    o += pmt_put_cs(buf+o, b.nhash);
+    for (u32 i=0;i<b.nhash;i++){ memcpy(buf+o, hashes[i], 32); o += 32; }
+    o += pmt_put_cs(buf+o, nflagbytes);
+    memset(buf+o, 0, nflagbytes);
+    for (u32 i=0;i<b.nbits;i++) if (bits[i]) buf[o + i/8] |= (u8)(1u << (i%8));
+    o += nflagbytes;
+    char* hx = malloc(o*2 + 1); if (!hx){ free(buf); *ec=-7; *em="oom"; return 0; }
+    hex_of(hx, buf, o); free(buf);
+    *res = rj_str(hx); free(hx);
+    return 1;
+}
+
+static int cmd_verifytxoutproof(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* proof = rpc_param_str(params, 0, ec, em); if (!proof) return 0;
+    size_t hn = strlen(proof); if (hn < (80+5)*2 || (hn & 1)){ *ec=-8; *em="Invalid proof"; return 0; }
+    size_t bn = hn/2; u8* buf = malloc(bn); if (!buf){ *ec=-7; *em="oom"; return 0; }
+    for (size_t i=0;i<bn;i++){ int hi=hex1(proof[i*2]),lo=hex1(proof[i*2+1]); if(hi<0||lo<0){free(buf);*ec=-8;*em="Invalid proof hex";return 0;} buf[i]=(u8)(hi<<4|lo); }
+    const u8* p = buf; const u8* end = buf + bn;
+    if (p + 84 > end){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
+    const u8* hdr = p; p += 80;
+    u32 ntx = rd32(p); p += 4;
+    u64 c; u64 nhash = read_varint(p, end, &c); if (!c || nhash > ntx + 64){ free(buf); *ec=-8; *em="Invalid proof"; return 0; } p += c;
+    if (p + nhash*32 > end){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
+    static u8 (*hashes)[32]; if(!hashes){ hashes=malloc(sizeof(*hashes)*(PMT_MAX_TX+64)); }
+    for (u64 i=0;i<nhash;i++){ memcpy(hashes[i], p, 32); p += 32; }
+    u64 nfb = read_varint(p, end, &c); if (!c){ free(buf); *ec=-8; *em="Invalid proof"; return 0; } p += c;
+    if (p + nfb > end || nfb*8 > PMT_MAX_TX*2+64){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
+    static u8* bits; if(!bits){ bits=malloc(PMT_MAX_TX*2+64); }
+    u32 nbits = (u32)(nfb*8);
+    for (u32 i=0;i<nbits;i++) bits[i] = (p[i/8] >> (i%8)) & 1;
+    if (ntx == 0 || ntx > PMT_MAX_TX){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
+    static u8 (*matched)[32]; if(!matched){ matched=malloc(sizeof(*matched)*(PMT_MAX_TX)); }
+    pmt_extract_t e = { (const u8(*)[32])hashes, (u32)nhash, 0, bits, nbits, 0, matched, 0, 0 };
+    u8 root[32]; pmt_extract(&e, ntx, pmt_height(ntx), 0, root);
+    /* BIP37 validity: every hash and every bit consumed, no error */
+    int ok = !e.bad && e.hpos == nhash && ((e.bpos + 7)/8) == nfb;
+    if (ok && memcmp(root, hdr + 36, 32) != 0) ok = 0;   /* root must match header */
+    /* block must be in our chain */
+    long h_out = -1;
+    if (ok){ u8 bh[32], disp[32]; sha256d(bh, hdr, 80);   /* wire order */
+        for (int i=0;i<32;i++) disp[i]=bh[31-i];           /* height_by_hash wants display order */
+        if (!height_by_hash(disp, &h_out)) ok = 0; }
+    rj_val* arr = rj_arr();
+    if (ok){ for (u32 i=0;i<e.nmatched;i++){ char hx[65]; hex_rev(hx, matched[i], 32); rj_arr_push(arr, rj_str(hx)); } }
+    free(buf);
+    *res = arr;   /* empty array if the proof is invalid or not in chain, like Core */
+    return 1;
+}
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
-    "getblockchaininfo","getdifficulty","getrawtransaction","uptime","stop", NULL
+    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -899,5 +1098,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
+    if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
+    if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
     return -1;
 }
