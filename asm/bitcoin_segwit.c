@@ -390,6 +390,10 @@ static void z_limbs_from_be(uint64_t z[4], const uint8_t* be32){
  *   swtx: parsed tx (must have nin inputs; n_in < nin).
  *   Returns preimage length (>0) into pre, writes sighash (SHA256d) to out32.
  * ========================================================================== */
+/* Phase 2 slice 12 seam (2026-08-24): swtx_parse is static; exported for
+ * tests/test_bip143_diff.c to drive it beside the asm twin. */
+int swtx_parse_export(void* t, uint32_t* off){ return swtx_parse((swtx_t*)t, off); }
+
 long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
                        int64_t n_in, uint32_t nHashType, uint64_t amount,
                        const uint8_t* scriptCode, uint64_t scriptcode_len,
