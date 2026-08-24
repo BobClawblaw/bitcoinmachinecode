@@ -90,6 +90,15 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_poin
                bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o \
                bitcoin_utxo.o
 
+# Embedded RPC server objects (docs/RPC_LIVE_NODE.md): net-new objects not
+# already in DAEMONOBJS, linked into daemon/bitcoind (+ any test that pulls in
+# daemon/main.c). Defined HERE, before the first rule that references it in its
+# prerequisites (tests/test_dial_budget), so make expands it in the prereq list
+# at parse time -- otherwise the prereq-check audit flags the objects as
+# linked-but-not-a-prerequisite.
+DAEMON_RPCOBJS := rpc_server.o rpc_commands.o rpc_chain.o rpc_json.o rpc_net.o rpc_node.o \
+    bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
+
 .PHONY: all asm test clean abi-check callee-saved-check prereq-check
 
 # Per-test private working directory helper. Every test that includes it must
@@ -618,8 +627,8 @@ DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/block_witness.c d
     daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c
-tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(VERSION_GEN_H)
-	$(CC) -no-pie -O2 -o $@ $(DIALSRCS) $(DAEMONOBJS) -lpthread
+tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H)
+	$(CC) -no-pie -O2 -o $@ $(DIALSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c -lpthread
 
 tests/test_cons: tests/test_cons.c $(CONSOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_cons.c $(CONSOBJS)
@@ -1606,11 +1615,8 @@ DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/block_witness.c daemon/tx_
     daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c \
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c
-# Embedded RPC server (docs/RPC_LIVE_NODE.md): the serve daemon hosts the same
-# JSON-RPC layer as bitcoin_rpcd so it can answer live-node RPCs. These objects
-# are the net-new ones not already in DAEMONOBJS; wallet_core.c is a source.
-DAEMON_RPCOBJS := rpc_server.o rpc_commands.o rpc_chain.o rpc_json.o rpc_net.o rpc_node.o \
-    bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
+# Embedded RPC server (docs/RPC_LIVE_NODE.md): DAEMON_RPCOBJS is defined near
+# the top (with WALLETPRIMS) so its prereqs expand for every rule that uses it.
 daemon/bitcoind: $(DAEMONSRCS) daemon/utxo_walk.h daemon/reorg.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O2 -o $@ $(DAEMONSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c -lpthread
 
