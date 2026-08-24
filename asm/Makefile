@@ -317,6 +317,21 @@ tests/test_truncate: tests/test_truncate.c bitcoin_store.o $(IDXOBJS) $(TEST_TMP
 tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) $(CFLAGS) -o $@ tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS)
 
+# The asm twin vs the C oracle, on identical op streams. The C is compiled
+# with objcopy-prefixed symbols (ref_*) so both link into one binary.
+tests/test_undo_asm_diff: tests/test_undo_asm_diff.c daemon/undo_log.c bitcoin_undo.o $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
+	$(CC) $(CFLAGS) -c daemon/undo_log.c -o tests/undo_log_ref.o
+	objcopy --redefine-sym undo_append_record=ref_undo_append_record \
+	        --redefine-sym undo_capture_and_del=ref_undo_capture_and_del \
+	        --redefine-sym undo_load=ref_undo_load \
+	        --redefine-sym undo_replay=ref_undo_replay \
+	        --redefine-sym undo_replay_tolerant=ref_undo_replay_tolerant \
+	        --redefine-sym undo_discard=ref_undo_discard \
+	        --redefine-sym undo_prune_from=ref_undo_prune_from \
+	        --redefine-sym undo_prune=ref_undo_prune \
+	        tests/undo_log_ref.o
+	$(CC) -no-pie -O2 -Wall -I tests -o $@ tests/test_undo_asm_diff.c tests/undo_log_ref.o bitcoin_undo.o $(UTXOLSMOBJS)
+
 # ---- Stage B: the wired-together reorg engine ----------------------------
 # tests/test_reorg.c drives the REAL production modules (daemon/reorg.c,
 # daemon/utxo_live.c daemon/block_witness.c, daemon/undo_log.c, daemon/locator_build.c and the real bitcoin_cmpct.o
