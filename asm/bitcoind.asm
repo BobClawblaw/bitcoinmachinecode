@@ -463,7 +463,10 @@ node_sync_multi:
     lea  rcx, [rbp-0xf0]
     call p2p_getheaders
     test rax, rax
-    jle  .fail
+    jg .fchk1
+    mov  dword [rel sync_fail_code], 1
+    jmp  .fail
+    .fchk1:
     mov  r8, rax            ; headers payload len (5+count*32+32) = plen to send
     mov  rdi, rbx
     lea  rsi, [rel _getheaders]
@@ -471,7 +474,10 @@ node_sync_multi:
     lea  rcx, [rbp-0x1af0]
     call p2p_write
     cmp  rax, 24
-    jl   .fail
+    jge .fchk2
+    mov  dword [rel sync_fail_code], 2
+    jmp  .fail
+    .fchk2:
     ; ---- receive headers, draining ANY interleaved relay chatter a live seed
     ; sends post-verack (addr/sendheaders/feefilter/inv/version/ping). The fake
     ; loopback peer never interleaves these, so the original strict "first read
@@ -508,11 +514,17 @@ node_sync_multi:
     jne  .hdr_not_timeout
     inc  dword [rbp-0x1b04]
     cmp  dword [rbp-0x1b04], 20    ; ~20 timeouts (~60s, matching the outer
-    jae  .fail                      ; per-leg alarm budget anyway) before
+    jb .fchk3
+    mov  dword [rel sync_fail_code], 3
+    jmp  .fail                      ; per-leg alarm budget anyway) before
+    .fchk3:
     jmp  .hdr_drain                 ; truly giving up on this getheaders pass
 .hdr_not_timeout:
     cmp  rax, 0
-    jle  .fail
+    jg .fchk4
+    mov  dword [rel sync_fail_code], 4
+    jmp  .fail
+    .fchk4:
     lea  rdi, [rbp-0x160]
     lea  rsi, [rel _headers]
     mov  ecx, 7
@@ -616,7 +628,10 @@ node_sync_multi:
     mov  r8d, [rbp-0x5c]
     call p2p_write
     cmp  rax, 24
-    jl   .fail
+    jge .fchk5
+    mov  dword [rel sync_fail_code], 5
+    jmp  .fail
+    .fchk5:
     ; ---- receive block, draining interleaved relay chatter (live seeds send
     ; addr/inv/ping/sendheaders between our getdata and the block reply; the
     ; fake peer never did, so the original strict read broke live). Echo ping->
@@ -637,11 +652,17 @@ node_sync_multi:
     jne  .blk_not_timeout
     inc  dword [rbp-0x1b00]
     cmp  dword [rbp-0x1b00], 20
-    jae  .fail
+    jb .fchk6
+    mov  dword [rel sync_fail_code], 6
+    jmp  .fail
+    .fchk6:
     jmp  .blk_drain
 .blk_not_timeout:
     cmp  rax, 0
-    jle  .fail
+    jg .fchk7
+    mov  dword [rel sync_fail_code], 7
+    jmp  .fail
+    .fchk7:
     lea  rdi, [rbp-0x160]
     lea  rsi, [rel _block]
     mov  ecx, 5
@@ -684,7 +705,10 @@ node_sync_multi:
     mov  ecx, SYNC_TXID_CAP
     call cons_verify
     test eax, eax
-    jz   .fail
+    jnz .fchk8
+    mov  dword [rel sync_fail_code], 8
+    jmp  .fail
+    .fchk8:
     ; ---- store ----
     ; idxscan_append_locked (not plain store_append): in `serve` mode this
     ; process (the download worker) is not the only writer -- an inbound
@@ -700,7 +724,10 @@ node_sync_multi:
     mov  ecx, [rbp-0x54]    ; blen is a DWORD -- 32-bit load!
     call idxscan_append_locked
     cmp  rax, -1
-    je   .fail
+    jne .fchk9
+    mov  dword [rel sync_fail_code], 9
+    jmp  .fail
+    .fchk9:
     ; locator = stored block hash (a SINGLE hash from here on -- so the count
     ; must drop to 1 to match, or the next getheaders would re-send stale
     ; ancestor hashes from the caller's original multi-hash buffer behind it)
@@ -1950,6 +1977,8 @@ node_ibd:
 section .bss
 align 32
 sync_txid_scratch: resb SYNC_TXID_CAP*32   ; node_sync_multi's cons_verify scratch
+global sync_fail_code
+sync_fail_code: resd 1                     ; which .fail exit node_sync_multi took   ; node_sync_multi's cons_verify scratch
 
 section .data
 align 16

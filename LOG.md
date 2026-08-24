@@ -110,14 +110,41 @@ bitcoin_serve.asm:420 passes `2000*81+8`, which is a headers-message BYTE
 size in a parameter that means a txid COUNT -- if its buffer is smaller than
 162,008 txids that is an overflow waiting, and it needs its own look.
 
-### ROOT CAUSE #2, STILL OPEN: legs still fail at the tip
+### RESOLVED 2026-08-24 14:16 -- the cap WAS the fix; keep-up works
 
-With the cap fixed and deployed, production still logs `sync FAILED (ok=0)`
-within ~25 s of each dial, at a tip level with the peer's. That is NOT the
-cap bug (no block to validate) and NOT the empty-headers case (`p2p_headers_
-count == 0` correctly jumps to .done -> ok=1). The fast, simultaneous
-failures point at `p2p_read` returning <= 0, i.e. the socket closed -- and
-public peers close on us where the scratch oracle does not.
+With the cap fix deployed, the node followed two consecutive blocks with no
+restart, on an 11-minute uptime:
+
+    [block] stored height=963863 ... tx=3923 (via 18.141.249.178)
+    [mux:3] 18.141.249.178  sync ok=1 new=1 tip=963863 (2.71s)
+    [dl] new block: height=963863 hash=00000000...ca52 (+1)
+    [block] stored height=963864 ... tx=2561 (via 107.202.37.185)
+    [mux:6] 107.202.37.185  sync ok=1 new=1 tip=963864 (0.69s)
+
+`sync ok=1 new=1` is do_outbound_sync's success path, which only prints when
+node_sync_multi returns 1 with blocks stored. **tx=3923** is the point: under
+cap=64 that block failed cons_verify every time it was offered, which is
+precisely why the tip never moved between restarts.
+
+The reason it looked unfixed for half an hour after deploying is that no
+block was mined in that window -- at a level tip the correct behaviour is
+exactly the "no-op" the log was printing. Waiting for a real block, rather
+than concluding from a quiet interval, is what settled it.
+
+### ROOT CAUSE #2, downgraded to a robustness issue, NOT a blocker
+
+Per-exit instrumentation (sync_fail_code, 1..9) names it: **where=4**, the
+headers read returning <= 0 -- EOF on a socket the peer already closed. It
+is per-peer and not universal: legs 4/6/7 return a clean where=0 no-op
+against the same tip in the same rotation. Public peers close idle
+connections; a leg that sat unused between rotations is dead when it is
+next used, and the pre-sync poll() liveness check cannot close the race.
+
+This costs a wasted rotation on the affected leg and nothing else -- enough
+legs stay healthy that new blocks land within a minute (measured above).
+Worth fixing for tidiness (keep legs warm, or react to peers' own inv/
+headers announcements instead of polling), but it does not block keep-up
+and is no longer part of incident #33.
 
 ### Next experiment, stated so it is not re-derived
 
