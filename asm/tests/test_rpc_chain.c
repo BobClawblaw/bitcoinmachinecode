@@ -505,7 +505,9 @@ int main(void){
         rj_val* r = call("createmultisig", p, &ec, &em);
         ck_str("cms legacy address", S(r,"address"), "3QsFXpFJf2ZY6GLWVoNFFd2xSDwdS713qX");
         ck_str("cms legacy redeemScript", S(r,"redeemScript"), REDEEM);
-        ck("cms no descriptor (omitted)", G(r,"descriptor") == NULL);
+        ck_str("cms legacy descriptor", S(r,"descriptor"),
+               "sh(multi(2,03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd,"
+               "03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626))#4djp057k");
         rj_free(r);
         /* bech32 2-of-2 -> P2WSH */
         snprintf(p, sizeof p, "[2, [\"%s\",\"%s\"], \"bech32\"]", K1, K2);
