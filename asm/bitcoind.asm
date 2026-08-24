@@ -17,6 +17,8 @@
 ; ============================================================================
 %include "version.inc"   ; single source of truth: app version, UA, protocol version
 default rel
+%define SYNC_TXID_CAP 80000          ; > 4,000,000 / 60, the wire maximum
+                                     ; number of txs a valid block can carry
 section .text
 
 extern p2p_write
@@ -662,8 +664,24 @@ node_sync_multi:
     ; ---- validate ----
     mov  rdi, r14
     mov  esi, [rbp-0x54]
-    lea  rdx, [rbp-0x1308]
-    mov  ecx, 64
+    ; INCIDENT #33 (2026-08-24): this passed the frame-local txid_scratch with
+    ; cap=64, and cons_verify's 4th argument is the scratch capacity IN TXIDS
+    ; -- so steady-state sync could not validate any block with more than 64
+    ; transactions. Every block at the chain tip has thousands, so
+    ; node_sync_multi returned 0 on every modern block, AFTER downloading and
+    ; storing it; do_outbound_sync then took its ok!=1 early-return and threw
+    ; the work away. The node advanced its tip only at boot (the dlc catch-up
+    ; path passes a correctly-sized scratch), and the failure was silent at
+    ; both ends. Found by driving node_sync_multi against the scratch Core
+    ; oracle: ok=0 with cnt=51,727 -- the first block over 64 txs, at height
+    ; ~51,726, is exactly where it stopped.
+    ;
+    ; A frame-local scratch cannot be made big enough: the bound is
+    ; MAX_BLOCK_SERIALIZED_SIZE / smallest-tx ~= 4,000,000/60 ~= 66,666
+    ; txids, i.e. >2 MB. It moves to .bss, which is per-process and therefore
+    ; still safe for the forked serve children (COW).
+    lea  rdx, [rel sync_txid_scratch]
+    mov  ecx, SYNC_TXID_CAP
     call cons_verify
     test eax, eax
     jz   .fail
@@ -1928,6 +1946,10 @@ node_ibd:
     pop  rbx
     pop  rbp
     ret
+
+section .bss
+align 32
+sync_txid_scratch: resb SYNC_TXID_CAP*32   ; node_sync_multi's cons_verify scratch
 
 section .data
 align 16
