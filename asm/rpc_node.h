@@ -11,15 +11,31 @@
 
 #include "rpc_json.h"
 
+/* One outbound peer, published by the download worker at connect/handshake.
+ * Byte/last-send counters Core tracks per-socket are not tracked here (the
+ * worker has no per-fd meters); getpeerinfo reports them as 0/-1. */
+#define RPC_MAX_PEERS 64
+typedef struct {
+    volatile int              used;         /* 1 = slot live */
+    volatile int              inbound;      /* 0 outbound (all we itemize today) */
+    char                      addr[80];     /* "ip:port" */
+    volatile unsigned         proto;        /* negotiated protocol version */
+    volatile unsigned long long services;   /* peer's advertised services */
+    char                      subver[96];   /* peer user-agent */
+    volatile int              start_height; /* peer's startingheight */
+    volatile long long        conn_time;    /* unix secs at connect */
+} rpc_peer_t;
+
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
  * the forked download worker / inbound children can publish into it and the
- * parent's RPC thread can read it. All fields are single-word so aligned
- * reads/writes are atomic enough for a status snapshot (no torn counters). */
+ * parent's RPC thread can read it. Single-word status fields are atomic enough
+ * for a snapshot; the peer table is written slot-at-a-time by the one worker. */
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
     volatile int       n_inbound;    /* live inbound peers   (serve parent)    */
     volatile long long tip_height;   /* current chain tip    (download worker) */
     volatile long long start_time;   /* node start, unix secs (parent, once)   */
+    rpc_peer_t         peers[RPC_MAX_PEERS];  /* outbound peer table (worker)   */
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).

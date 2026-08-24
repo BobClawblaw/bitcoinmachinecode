@@ -79,8 +79,57 @@ static int cmd_getnetworkinfo(rj_val** res){
     return 1;
 }
 
+/* service-bit names (Core protocol.h ServiceFlags) */
+static void services_names(unsigned long long s, rj_val* arr){
+    if (s & (1ULL<<0))  rj_arr_push(arr, rj_str("NETWORK"));
+    if (s & (1ULL<<2))  rj_arr_push(arr, rj_str("BLOOM"));
+    if (s & (1ULL<<3))  rj_arr_push(arr, rj_str("WITNESS"));
+    if (s & (1ULL<<6))  rj_arr_push(arr, rj_str("COMPACT_FILTERS"));
+    if (s & (1ULL<<10)) rj_arr_push(arr, rj_str("NETWORK_LIMITED"));
+    if (s & (1ULL<<11)) rj_arr_push(arr, rj_str("P2P_V2"));
+}
+
+/* getpeerinfo: one entry per live outbound peer from the shared table. Fields
+ * Core tracks per-socket but we do not (byte counters, last-send/recv, ping,
+ * synced_headers/blocks) are reported as 0/-1 -- a documented gap, not a
+ * fabricated value. Inbound peers are counted (getconnectioncount) but not
+ * itemized here yet (they are separate forked children). */
+static int cmd_getpeerinfo(rj_val** res){
+    rj_val* arr = rj_arr();
+    if (g_status){
+        int id = 0;
+        for (int i = 0; i < RPC_MAX_PEERS; i++){
+            const rpc_peer_t* p = &g_status->peers[i];
+            if (!p->used) continue;
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "id", rj_numf("%d", id++));
+            rj_obj_set(o, "addr", rj_str(p->addr));
+            { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)p->services);
+              rj_obj_set(o, "services", rj_str(h)); }
+            { rj_val* sn = rj_arr(); services_names(p->services, sn); rj_obj_set(o, "servicesnames", sn); }
+            rj_obj_set(o, "relaytxes", rj_bool(1));
+            rj_obj_set(o, "lastsend", rj_numf("%d", 0));
+            rj_obj_set(o, "lastrecv", rj_numf("%d", 0));
+            rj_obj_set(o, "bytessent", rj_numf("%d", 0));
+            rj_obj_set(o, "bytesrecv", rj_numf("%d", 0));
+            rj_obj_set(o, "conntime", rj_numf("%lld", (long long)p->conn_time));
+            rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
+            rj_obj_set(o, "version", rj_numf("%u", p->proto));
+            rj_obj_set(o, "subver", rj_str(p->subver));
+            rj_obj_set(o, "inbound", rj_bool(p->inbound));
+            rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
+            rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
+            rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));
+            rj_obj_set(o, "network", rj_str("ipv4"));
+            rj_arr_push(arr, o);
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
 static const char* const NODE_METHODS[] = {
-    "getconnectioncount", "getnetworkinfo", NULL
+    "getconnectioncount", "getnetworkinfo", "getpeerinfo", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -90,5 +139,6 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     (void)params; (void)ec; (void)em;
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);
+    if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
     return -1;
 }
