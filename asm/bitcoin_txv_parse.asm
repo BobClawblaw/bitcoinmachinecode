@@ -76,45 +76,52 @@ r_wtrunc:   db "truncated witness item",0
 section .text
 
 ; ----------------------------------------------------------------------------
-; rd_cs: compact-size at rbx (end = r12). Returns value in rax, advances rbx.
-; CF set on failure (out of bytes), clear on success. Clobbers rax, rcx.
-; Mirrors txv_rd_cs exactly, including the unaligned little-endian loads
-; that its byte-assembly loops amount to.
+; rd_cs(rdi = &cursor, rsi = end) -> rax value; CF set on failure (out of
+; bytes), clear on success. Advances *cursor through rdi. Clobbers only
+; caller-saved rax/rcx/rdx -- fully SysV, deliberately: the first draft kept
+; the cursor in rbx and mutated it as its output, which is exactly the
+; custom-convention shape callee-saved-check exists to flag, and widening
+; KNOWN_SHARED_FRAME for a brand-new helper would dilute "anything else here
+; is a real finding". Three extra instructions per call site buy a helper
+; the gate can verify like any other function. Mirrors txv_rd_cs exactly,
+; including the unaligned little-endian loads its byte loops amount to.
 ; ----------------------------------------------------------------------------
 rd_cs:
-    cmp  rbx, r12
+    mov  rdx, [rdi]                      ; p
+    cmp  rdx, rsi
     jae  .f
-    movzx eax, byte [rbx]
+    movzx eax, byte [rdx]
     cmp  al, 0xfd
     jb   .one
     je   .two
     cmp  al, 0xfe
     je   .four
-    lea  rcx, [rbx+9]                    ; 0xff: 8-byte value
-    cmp  rcx, r12
+    lea  rcx, [rdx+9]                    ; 0xff: 8-byte value
+    cmp  rcx, rsi
     ja   .f
-    mov  rax, [rbx+1]
-    add  rbx, 9
+    mov  rax, [rdx+1]
+    mov  [rdi], rcx
     clc
     ret
 .four:
-    lea  rcx, [rbx+5]
-    cmp  rcx, r12
+    lea  rcx, [rdx+5]
+    cmp  rcx, rsi
     ja   .f
-    mov  eax, [rbx+1]
-    add  rbx, 5
+    mov  eax, [rdx+1]
+    mov  [rdi], rcx
     clc
     ret
 .two:
-    lea  rcx, [rbx+3]
-    cmp  rcx, r12
+    lea  rcx, [rdx+3]
+    cmp  rcx, rsi
     ja   .f
-    movzx eax, word [rbx+1]
-    add  rbx, 3
+    movzx eax, word [rdx+1]
+    mov  [rdi], rcx
     clc
     ret
 .one:
-    inc  rbx
+    inc  rdx
+    mov  [rdi], rdx
     clc
     ret
 .f:
@@ -131,7 +138,8 @@ rd_cs:
 ;   [rbp-0x30] out_nin   [rbp-0x38] reason    [rbp-0x40] tx base
 ;   [rbp-0x48] nin       [rbp-0x50] in base   [rbp-0x58] i (input loop)
 ;   [rbp-0x60] segwit    [rbp-0x68] nitems    [rbp-0x70] woff
-;   [rbp-0x78] j (item loop)
+;   [rbp-0x78] j (item loop)  [rbp-0x80] rd_cs cursor slot (p spilled
+;   around each rd_cs call -- the helper is SysV, see its header)
 ; Register roles: rbx = p (parse cursor, rd_cs contract), r12 = end,
 ; r13 = current input record, r14 = wp, r15 = loop bounds scratch.
 ; ----------------------------------------------------------------------------
@@ -173,7 +181,11 @@ txv_parse_asm:
 .seg_done:
     mov  [rbp-0x60], rax                 ; segwit flag
 
+    mov  [rbp-0x80], rbx
+    lea  rdi, [rbp-0x80]
+    mov  rsi, r12
     call rd_cs                           ; nin
+    mov  rbx, [rbp-0x80]
     jc   .r_nin
     test rax, rax                        ; nin == 0 -> bounds
     jz   .r_bounds
@@ -193,7 +205,11 @@ txv_parse_asm:
     ja   .r_outpt
     mov  [r13+IN_OUTPOINT], rbx
     add  rbx, 36
+    mov  [rbp-0x80], rbx
+    lea  rdi, [rbp-0x80]
+    mov  rsi, r12
     call rd_cs                           ; sl
+    mov  rbx, [rbp-0x80]
     jc   .r_ssv
     mov  r15, rax                        ; sl
     mov  rax, r12
@@ -210,7 +226,11 @@ txv_parse_asm:
     jmp  .in_loop
 .in_done:
 
+    mov  [rbp-0x80], rbx
+    lea  rdi, [rbp-0x80]
+    mov  rsi, r12
     call rd_cs                           ; nout
+    mov  rbx, [rbp-0x80]
     jc   .r_nout
     mov  r15, rax
 .out_loop:
@@ -220,7 +240,11 @@ txv_parse_asm:
     cmp  rcx, r12
     ja   .r_outtr
     add  rbx, 8
+    mov  [rbp-0x80], rbx
+    lea  rdi, [rbp-0x80]
+    mov  rsi, r12
     call rd_cs                           ; output script len
+    mov  rbx, [rbp-0x80]
     jc   .r_osv
     mov  rcx, r12
     sub  rcx, rbx
@@ -240,7 +264,11 @@ txv_parse_asm:
     mov  rax, [rbp-0x58]
     cmp  rax, [rbp-0x48]
     jae  .resolve
+    mov  [rbp-0x80], rbx
+    lea  rdi, [rbp-0x80]
+    mov  rsi, r12
     call rd_cs                           ; nitems
+    mov  rbx, [rbp-0x80]
     jc   .r_wcv
     cmp  rax, TXV_MAX_WIT_ITEMS
     ja   .r_witmany
@@ -259,7 +287,11 @@ txv_parse_asm:
     mov  rax, [rbp-0x78]
     cmp  rax, [rbp-0x68]
     jae  .items_done
+    mov  [rbp-0x80], rbx
+    lea  rdi, [rbp-0x80]
+    mov  rsi, r12
     call rd_cs                           ; il
+    mov  rbx, [rbp-0x80]
     jc   .r_wlv
     mov  rcx, r12
     sub  rcx, rbx
