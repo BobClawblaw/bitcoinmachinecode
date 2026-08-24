@@ -665,6 +665,14 @@ static int lookup_block_param(const rj_val* params, size_t i, int pnum, long* h,
 
 /* ---- commands ---- */
 static int cmd_getblockcount(rj_val** res){ *res = rj_numf("%ld", refresh()); return 1; }
+static int cmd_getdifficulty(rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
+    u32 bits = rd32(hdr + 72);
+    *res = rj_double(difficulty_of(bits));   /* Core: difficulty of the current tip */
+    return 1;
+}
 static int cmd_getbestblockhash(rj_val** res, long* ec, const char** em){
     long tip = refresh();
     u8 rec[48];
@@ -872,7 +880,7 @@ static int cmd_stop(rj_val** res){
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
-    "getblockchaininfo","getrawtransaction","uptime","stop", NULL
+    "getblockchaininfo","getdifficulty","getrawtransaction","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -889,6 +897,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
     if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
+    if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     return -1;
 }
