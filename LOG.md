@@ -7,6 +7,52 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #36: the scriptSig-length bound wrapped, accepting a tx Core rejects (filed during slice 1, now fixed)
+
+Filed 2026-08-24 during the slice-1 port and deliberately left bug-for-bug in
+the asm twin so the differential stayed meaningful. Chased today with the box
+otherwise busy on the tier-3 replay (this is analysis + one small test, no
+timed-run contention).
+
+THE BUG. `txv_parse` and `txvb_parse_tx` bounded the scriptSig with
+`(u64)(end-p) < sl+4`. For `sl` within 4 of 2^64 -- which an 0xff compactsize
+can encode, since `txv_rd_cs` reads the 8-byte form with no MAX_SIZE cap --
+`sl+4` overflows to 0..3, the `<` check is false, and the parser ACCEPTS:
+`scriptSiglen` truncates to `(u32)sl = 0xFFFFFFFF` and the cursor advances
+only ~3 bytes. Core rejects any compactsize > MAX_SIZE (0x02000000) at
+deserialization (serialize.h:359), so this is a real divergence -- we accept
+a transaction Core throws out.
+
+WHAT THE TEST CORRECTED. I first reasoned the whole >MAX_SIZE range (33.5M ..
+4 GB) diverged. Building the demonstration (tests/test_txv_cs_maxsize.c)
+showed otherwise: values in [MAX_SIZE+1, ~4 GB] are REJECTED here too, because
+`sl+4` does not wrap for them and `(end-p) < sl+4` is true -> reject (reason
+"truncated" rather than "too large", but the same accept/reject verdict as
+Core). Only the four wrap values 2^64-4 .. 2^64-1 slip through. Proving beat
+theorising again: the divergence is exactly 4 values, not a 4 GB range.
+
+INCONSISTENCY IN THE TREE. bitcoin_segwit.c's swtx_parse already uses the
+split form `avail < sl || avail - sl < 4`, which cannot overflow and rejects
+the wrap values correctly. The same codebase had the safe form in one parser
+and the wrapping form in another. The fix makes txv_parse match its sibling.
+
+REACHABILITY (why this is filed, not alarmed). To turn this into a chain
+split or crash a peer must get us to VERIFY a malformed block, but the verify
+path runs only after cons_verify (PoW + merkle), and an attacker cannot
+commit a malformed tx to a valid-PoW header without mining it. The mempool
+accept path is worth a separate look (no PoW gate there), but it does not go
+through txv_parse. So: a genuine Core divergence and a malformed-parse
+accept, low practical exploitability, fixed regardless because the safe form
+was already sitting in the tree.
+
+THE FIX. Both C sites and both asm-twin sites (bitcoin_txv_parse.asm) now use
+the split bound. Verified: the regression test's four cases all reject the
+wrap/oversize values (was 1 false-accept), the control tx still parses, and
+both parse differentials (single-tx 9,555 cases, block-path) still pass --
+so the twin still matches the C and no legitimate transaction changed
+verdict. Committed to branch `csfix`; the merge to main waits on the full
+160-harness suite, which is not run during the tier-3 measurement.
+
 ## 2026-08-24 -- incident #35: `connect=` did not take the node offline, and it cost the first real tier-3 run
 
 `scripts/bench_tier3.sh` sets `connect=192.0.2.1` (RFC 5737 TEST-NET-1,
