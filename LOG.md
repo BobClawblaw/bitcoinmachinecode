@@ -7,6 +7,147 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #38: the overflow audit -- every hand-written length bound, classified and fixed
+
+After #33/#34/#36/#37 all turned out to be the same units/overflow error, a
+systematic sweep of every length bound in the consensus, network, mempool,
+RPC and wallet code. The complete catalog (grep for `p + len > end` and
+`avail < len + K` across all .c and the length-bounding .asm):
+
+  UNSAFE, consensus/peer-reachable:
+    daemon/tx_verify.c:476,1016   txv_parse           block path   FIXED #36
+    bitcoin_txval_modern.c:142,155 mv_parse           mempool      FIXED #37
+    bitcoin_mempool_policy.c:194  parse_inputs        mempool      FIXED here
+    bitcoin_scriptverify.c:162    sv_get_locktime_ctx every verify FIXED here
+    bitcoin_segwit.c:316 (+twin)  strip_witness       sighash      FIXED here
+
+  UNSAFE, RPC/wallet (user input, not peer consensus):
+    rpc_chain.c:354               tx_walk                          FIXED here
+    wallet_core.c:647,666         wallet_decoderawtx               FIXED here
+
+  ALREADY SAFE (the audit clears these, not everything grep flags is a bug):
+    bitcoin_bip143.asm:235        swtx twin      already split form (slice 12)
+    bitcoin_segwit.c swtx_parse   already split form
+    rpc_commands.c:425,482        varint reader caps at the 4-byte form (no
+                                  0xff), sl <= 4 GB so pos+sl cannot wrap, and
+                                  the read is gated by sl <= 128/256. Safe.
+
+Every fix is the same transform to the split form that cannot overflow
+(`avail < len || avail - len < 4`, or `len > avail`), the form swtx_parse
+and bitcoin_bip143.asm already used correctly. It is strictly MORE
+conservative: it rejects exactly the old set PLUS the near-2^64 wrap values,
+and no legitimate length is within 4 of 2^64, so no valid input changes
+verdict. The strip_witness asm twin's walk-phase bound was fixed to match
+its now-fixed C (the differential confirms twin == C: 10,243 cases pass).
+
+Verified: the daemon builds clean with all edits; the strip_witness
+differential and the 23-check test_mempool_accept_modern both still pass. Two
+of these (mempool_policy parse_inputs, mv_parse) are on the no-PoW inbound-tx
+path; the other three are re-parsers on the verify path, gated by the primary
+parsers but hardened anyway since a re-parser must not trust its input.
+
+The root pattern, now the closing note on this cluster: a length bound
+written as `pointer + attacker_length` or `avail < attacker_length + K`
+overflows, and this codebase wrote it that way in EIGHT places while the safe
+split form sat in the same tree. The lesson is not "fix these eight" but
+"the safe form must be the only form" -- a candidate lint (flag any
+`+ <non-constant> > end` or `< <non-constant> + <constant>` in a bounds
+context) is filed alongside the overlapping-locals checker.
+
+Committed to branch csfix with #36/#37; full suite + merge held for after the
+tier-3 run.
+
+## 2026-08-24 -- incident #37: the mempool-path parser had an unbounded compactsize reader and the #36 wrap, on the NO-PoW path
+
+Chasing #36 into the mempool path (user's call). The inbound-`tx` handler
+(bitcoin_serve.asm .do_tx) validates a peer-supplied transaction with only a
+`plen >= 10` guard, then calls tx_accept_validate -> txval_modern ->
+mv_parse. Unlike the block path, there is NO PoW/merkle gate here: any peer
+that sends a `tx` message reaches this parser directly.
+
+mv_parse (bitcoin_txval_modern.c) had two defects on that path:
+
+  1. `rd_cs` took no `end` and read 1/3/5/9 bytes UNCONDITIONALLY, so a
+     compactsize near the buffer end read up to 8 bytes PAST it -- a real,
+     if small, OOB read on attacker data, happening every time a peer sent a
+     tx with a truncated trailing varint.
+  2. The length bounds `p + sl + 4 > end`, `p + sl > end`, `p + il > end`
+     are pointer-overflow UB for attacker-supplied lengths near 2^64 -- the
+     same wrap as #36, here unguarded on the no-PoW path.
+
+SEVERITY, stated honestly. I probed txval_modern with crafted witness/output
+lengths near 2^64 in forked children to catch a crash. None crashed: the
+pointer wraps BACKWARD by a small amount (stays mapped), the loops
+terminate, and mv_parse returns with a truncated `witlen = (u32)il =
+0xFFFFFFFF` internally. A resolve failure (or downstream re-parse) then
+masks it. So this is UB + a bounded OOB read on a peer-reachable path -- a
+genuine memory-safety defect -- but NOT a demonstrated crash or RCE, and I
+will not label it one without a repro.
+
+THE FIX. rd_cs now takes `end` and sets *ok=0 on truncation; every bound is
+the split form that cannot overflow (matching swtx_parse and the #36 fix).
+Added an mv_test_parse hook because the external verdict is masked by
+resolve: tests/test_mv_parse_bounds.c shows the wrap/oversize/truncated
+inputs now reject at PARSE (parse=0) where before mv_parse reached `return
+1` with witlen=0xFFFFFFFF, while a well-formed tx still parses (parse=1,
+witlen=1). The existing 23-check test_mempool_accept_modern still passes, so
+legitimate P2WPKH/P2WSH acceptance is unchanged.
+
+Pattern (now four instances: #33/#34 cons_verify caps, #36 block parser, #37
+mempool parser): every hand-written compactsize/length bound in this codebase
+needs auditing against overflow, and the SAFE forms already exist in the tree
+(swtx_parse's split bound, the C `sizeof/32` caps). The unsafe ones are all
+literals or ad-hoc arithmetic written where the safe form wasn't reused.
+
+Committed to branch `csfix` alongside #36; the merge and full 160-harness
+suite wait until the tier-3 run finishes.
+
+## 2026-08-24 -- incident #36: the scriptSig-length bound wrapped, accepting a tx Core rejects (filed during slice 1, now fixed)
+
+Filed 2026-08-24 during the slice-1 port and deliberately left bug-for-bug in
+the asm twin so the differential stayed meaningful. Chased today with the box
+otherwise busy on the tier-3 replay (this is analysis + one small test, no
+timed-run contention).
+
+THE BUG. `txv_parse` and `txvb_parse_tx` bounded the scriptSig with
+`(u64)(end-p) < sl+4`. For `sl` within 4 of 2^64 -- which an 0xff compactsize
+can encode, since `txv_rd_cs` reads the 8-byte form with no MAX_SIZE cap --
+`sl+4` overflows to 0..3, the `<` check is false, and the parser ACCEPTS:
+`scriptSiglen` truncates to `(u32)sl = 0xFFFFFFFF` and the cursor advances
+only ~3 bytes. Core rejects any compactsize > MAX_SIZE (0x02000000) at
+deserialization (serialize.h:359), so this is a real divergence -- we accept
+a transaction Core throws out.
+
+WHAT THE TEST CORRECTED. I first reasoned the whole >MAX_SIZE range (33.5M ..
+4 GB) diverged. Building the demonstration (tests/test_txv_cs_maxsize.c)
+showed otherwise: values in [MAX_SIZE+1, ~4 GB] are REJECTED here too, because
+`sl+4` does not wrap for them and `(end-p) < sl+4` is true -> reject (reason
+"truncated" rather than "too large", but the same accept/reject verdict as
+Core). Only the four wrap values 2^64-4 .. 2^64-1 slip through. Proving beat
+theorising again: the divergence is exactly 4 values, not a 4 GB range.
+
+INCONSISTENCY IN THE TREE. bitcoin_segwit.c's swtx_parse already uses the
+split form `avail < sl || avail - sl < 4`, which cannot overflow and rejects
+the wrap values correctly. The same codebase had the safe form in one parser
+and the wrapping form in another. The fix makes txv_parse match its sibling.
+
+REACHABILITY (why this is filed, not alarmed). To turn this into a chain
+split or crash a peer must get us to VERIFY a malformed block, but the verify
+path runs only after cons_verify (PoW + merkle), and an attacker cannot
+commit a malformed tx to a valid-PoW header without mining it. The mempool
+accept path is worth a separate look (no PoW gate there), but it does not go
+through txv_parse. So: a genuine Core divergence and a malformed-parse
+accept, low practical exploitability, fixed regardless because the safe form
+was already sitting in the tree.
+
+THE FIX. Both C sites and both asm-twin sites (bitcoin_txv_parse.asm) now use
+the split bound. Verified: the regression test's four cases all reject the
+wrap/oversize values (was 1 false-accept), the control tx still parses, and
+both parse differentials (single-tx 9,555 cases, block-path) still pass --
+so the twin still matches the C and no legitimate transaction changed
+verdict. Committed to branch `csfix`; the merge to main waits on the full
+160-harness suite, which is not run during the tier-3 measurement.
+
 ## 2026-08-24 -- incident #35: `connect=` did not take the node offline, and it cost the first real tier-3 run
 
 `scripts/bench_tier3.sh` sets `connect=192.0.2.1` (RFC 5737 TEST-NET-1,
