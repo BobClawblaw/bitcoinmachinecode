@@ -7,7 +7,8 @@
  *   getblockcount, getbestblockhash, getblockhash, getblockheader, getblock,
  *   getblockchaininfo, getdifficulty, getrawtransaction (block-hash form),
  *   gettxoutproof / verifytxoutproof (BIP37 partial merkle tree; proofs are
- *   byte-identical to Core's), uptime, stop.
+ *   byte-identical to Core's), decodescript (util; identical to Core modulo
+ *   the omitted descriptor), uptime, stop.
  *
  * How chain state reaches this process: bitcoin_store.asm's store_init +
  * store_reload on -datadir's index.dat (positional 48-byte records:
@@ -80,6 +81,8 @@ extern void sha256d(u8 out[32], const void* data, unsigned long len);
 extern void block_work(u8 work[16], unsigned bits);
 extern void chainwork_add(u8 out[16], const u8 a[16], const u8 b[16]);
 extern int  wallet_script_to_address(char* out, long cap, const u8* script, long slen);
+extern void hash160(u8 out[20], const void* in, long long len);
+extern void sha256_full(u8 out[32], const void* msg, long long len);
 
 /* ---- module state ---- */
 #define ST_SIZE 4096
@@ -1076,10 +1079,93 @@ static int cmd_verifytxoutproof(const rj_val* params, rj_val** res, long* ec, co
     return 1;
 }
 
+/* ---- decodescript (util): classify a redeem/script hex like Core ----------
+ * Faithful port of src/rpc/rawtransaction.cpp decodescript: ScriptToUniv
+ * (no hex at top level) + the p2sh / segwit wrappers, gated exactly as Core
+ * gates them (can_wrap / can_wrap_P2WSH). "desc" is the one documented
+ * omission (no descriptor engine) -- everything else diffs against Core. */
+static int ds_op_success(u8 op){            /* IsOpSuccess (tapscript) */
+    return op==80 || op==98 || (op>=126&&op<=129) || (op>=131&&op<=134) ||
+           (op>=137&&op<=138) || (op>=141&&op<=142) || (op>=149&&op<=153) ||
+           (op>=187&&op<=254);
+}
+static int ds_valid_ops(const u8* s, size_t n){   /* CScript::HasValidOps */
+    const u8* pc=s; const u8* end=s+n; u8 op; const u8* d; size_t dl;
+    while (pc < end){
+        if (!script_getop(&pc, end, &op, &d, &dl)) return 0;
+        if (op > 0xb9 /*MAX_OPCODE=OP_NOP10*/) return 0;
+        if (dl > 520 /*MAX_SCRIPT_ELEMENT_SIZE*/) return 0;
+    }
+    return 1;
+}
+static int ds_compressed_pk(const u8* d, size_t dl){ return dl==33 && (d[0]==0x02||d[0]==0x03); }
+/* P2SH address of an arbitrary script; 1 on success. */
+static int ds_p2sh_addr(const u8* s, size_t n, char* out, long cap){
+    u8 h[20]; hash160(h, s, (long long)n);
+    u8 spk[23]; spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2,h,20); spk[22]=0x87;
+    return wallet_script_to_address(out, cap, spk, 23) > 0 && out[0];
+}
+
+static int cmd_decodescript(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* hex = rpc_param_str(params, 0, ec, em); if (!hex) return 0;
+    size_t hn = strlen(hex);
+    if (hn & 1){ *ec = -8; *em = "argument must be hexadecimal string (not '...')"; return 0; }
+    size_t n = hn/2;
+    u8* s = n ? malloc(n) : (u8*)"";
+    if (n && !s){ *ec=-7; *em="oom"; return 0; }
+    for (size_t i=0;i<n;i++){ int hi=hex1(hex[i*2]),lo=hex1(hex[i*2+1]); if(hi<0||lo<0){ if(n)free(s); *ec=-8; *em="argument must be hexadecimal string"; return 0; } s[i]=(u8)(hi<<4|lo); }
+
+    /* --- ScriptToUniv, include_hex=false, include_address=true, minus desc --- */
+    rj_val* o = rj_obj();
+    char* a = script_asm(s, n, 0); rj_obj_set(o,"asm", rj_str(a?a:"")); free(a);
+    const char* type = script_type(s, n);
+    { char addr[128]; addr[0]=0;
+      if (wallet_script_to_address(addr, sizeof addr, s, (long)n) > 0 && addr[0]) rj_obj_set(o,"address", rj_str(addr)); }
+    rj_obj_set(o,"type", rj_str(type));
+
+    /* --- can_wrap --- */
+    int cand = !strcmp(type,"multisig")||!strcmp(type,"nonstandard")||!strcmp(type,"pubkey")||
+               !strcmp(type,"pubkeyhash")||!strcmp(type,"witness_v0_keyhash")||!strcmp(type,"witness_v0_scripthash");
+    int can_wrap = 0;
+    if (cand){
+        can_wrap = ds_valid_ops(s,n) && !script_unspendable(s,n);
+        if (can_wrap){                                   /* no OP_CHECKSIGADD / OP_SUCCESSx */
+            const u8* pc=s; const u8* end=s+n; u8 op; const u8* d; size_t dl;
+            while (pc<end){ if(!script_getop(&pc,end,&op,&d,&dl)){ can_wrap=0; break; }
+                            if (op==0xba || ds_op_success(op)){ can_wrap=0; break; } }
+        }
+    }
+    if (can_wrap){
+        char p2sh[128]; if (ds_p2sh_addr(s,n,p2sh,sizeof p2sh)) rj_obj_set(o,"p2sh", rj_str(p2sh));
+
+        /* --- can_wrap_P2WSH --- */
+        int wsh = 0;
+        if (!strcmp(type,"nonstandard")||!strcmp(type,"pubkeyhash")) wsh = 1;
+        else if (!strcmp(type,"pubkey")){ wsh = ds_compressed_pk(s+1, s[0]); }
+        else if (!strcmp(type,"multisig")){
+            wsh = 1; const u8* pc=s+1; const u8* end=s+n-2; u8 op; const u8* d; size_t dl;
+            while (pc<end){ if(!script_getop(&pc,end,&op,&d,&dl)){ wsh=0; break; }
+                            if (dl!=1 && !ds_compressed_pk(d,dl)){ wsh=0; break; } }
+        }
+        if (wsh){
+            u8 wspk[34]; size_t wl;
+            if (!strcmp(type,"pubkey")){ u8 h[20]; hash160(h, s+1, (long long)s[0]); wspk[0]=0x00; wspk[1]=0x14; memcpy(wspk+2,h,20); wl=22; }
+            else if (!strcmp(type,"pubkeyhash")){ wspk[0]=0x00; wspk[1]=0x14; memcpy(wspk+2, s+3, 20); wl=22; }
+            else { u8 h[32]; sha256_full(h, s, (long long)n); wspk[0]=0x00; wspk[1]=0x20; memcpy(wspk+2,h,32); wl=34; }
+            rj_val* sr = script_pubkey_json(wspk, wl);   /* asm/hex/address/type */
+            char pss[128]; if (ds_p2sh_addr(wspk, wl, pss, sizeof pss)) rj_obj_set(sr,"p2sh-segwit", rj_str(pss));
+            rj_obj_set(o,"segwit", sr);
+        }
+    }
+    if (n) free(s);
+    *res = o;
+    return 1;
+}
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
-    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","uptime","stop", NULL
+    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1100,5 +1186,6 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
+    if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
     return -1;
 }
