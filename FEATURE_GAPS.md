@@ -57,13 +57,15 @@ harness can compare JSON directly):
   Like `getrawtransaction`, `gettxoutproof` **requires** the block hash (no
   txindex to locate the tx otherwise) — Core's own no-txindex behaviour.
 - Util: `decodescript <hex>` — classify a redeem/scriptPubKey exactly as Core's
-  `rawtransaction.cpp` does: `asm`/`type`/`address`, the `p2sh` wrapper, and the
-  `segwit` sub-object with `p2sh-segwit`, gated by Core's own `can_wrap` /
-  `can_wrap_P2WSH` rules (uncompressed-key and `OP_CHECKSIGADD`/`OP_SUCCESSx`
-  exclusions included). Differs from Core only by the omitted `desc`
-  descriptor. `validation/decodescript_diff.py` diffs it against the oracle
-  over every wrapper branch plus real on-chain scripts — 37/37 identical
-  modulo `desc`.
+  `rawtransaction.cpp` does: `asm`/`desc`/`type`/`address`, the `p2sh` wrapper,
+  and the `segwit` sub-object with `p2sh-segwit`, gated by Core's own `can_wrap`
+  / `can_wrap_P2WSH` rules (uncompressed-key and `OP_CHECKSIGADD`/`OP_SUCCESSx`
+  exclusions included). The inferred `desc` field is now emitted too — Core's
+  `InferDescriptor` no-keystore behaviour (`pk`/`multi`/`rawtr`/`addr`/`raw`,
+  and `wsh(inner)` for the segwit-of-a-known-script case) with the descriptor
+  checksum. **Fully identical to Core** — `validation/decodescript_diff.py`
+  compares the whole object (desc included) over every wrapper branch plus real
+  on-chain scripts: 37/37.
 - Util: `validateaddress <address>` — decode + classify (base58check and
   bech32/bech32m) into Core's `DescribeAddress` shape: `isvalid`, canonical
   `address`, `scriptPubKey`, `isscript`, `iswitness`, `witness_version`,

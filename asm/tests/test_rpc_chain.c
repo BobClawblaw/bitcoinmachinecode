@@ -414,6 +414,7 @@ int main(void){
         snprintf(p, sizeof p, "[\"76a914%s88ac\"]", H20);
         rj_val* r = call("decodescript", p, &ec, &em);
         ck_str("ds P2PKH type", S(r,"type"), "pubkeyhash");
+        ck_str("ds P2PKH desc (addr + checksum)", S(r,"desc"), "addr(12ZEw5Hcv1hTb6YUQJ69y1V7uhcoDz92PH)#krj9j7v6");
         ck("ds P2PKH has p2sh", S(r,"p2sh") != NULL);
         ck("ds P2PKH has segwit", G(r,"segwit") != NULL);
         ck_str("ds P2PKH segwit type", S(G(r,"segwit"),"type"), "witness_v0_keyhash");

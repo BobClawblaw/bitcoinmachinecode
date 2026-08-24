@@ -13,11 +13,13 @@ WHAT IT DRIVES
   theirs : bitcoin-cli against the scratch Core oracle (CORE_CLI env, default
            the 8335 core-oracle). NEVER the production node.
 
-THE ONE DOCUMENTED DIVERGENCE
-  Core adds an inferred output descriptor ("desc") to the top-level object and
-  to the "segwit" sub-object. We have no descriptor engine (see FEATURE_GAPS.md)
-  and omit it. This harness strips "desc" from BOTH sides before comparing;
-  a green run therefore asserts "identical modulo desc", nothing stronger.
+FULL COMPARE (no divergence)
+  The whole object is compared exactly, including the inferred "desc" on the
+  top-level and "segwit" sub-object: pk()/multi() when the key material is in
+  the script, rawtr() for a taproot output key, addr() for a hash-only type,
+  wsh(inner) for the segwit-of-a-known-script case, else raw() -- each with
+  Core's descriptor #checksum. This is InferDescriptor's no-keystore behaviour,
+  not a full descriptor engine.
 
 WHAT THE MATRIX COVERS
   Every branch of Core's decodescript wrapper logic (rawtransaction.cpp):
@@ -28,7 +30,7 @@ WHAT THE MATRIX COVERS
   redeemscripts and scriptPubKeys pulled live from the oracle's own blocks so
   the vectors are not all synthetic.
 
-  Exit 0 = all match (modulo desc). Exit 1 = at least one divergence, printed.
+  Exit 0 = all match (desc included). Exit 1 = at least one divergence, printed.
 """
 import os, sys, json, subprocess, urllib.request
 
@@ -67,11 +69,7 @@ def core(*args):
 
 
 def strip_desc(o):
-    if isinstance(o, dict):
-        return {k: strip_desc(v) for k, v in o.items() if k != "desc"}
-    if isinstance(o, list):
-        return [strip_desc(x) for x in o]
-    return o
+    return o          # identity: desc is now compared, kept for call-site names
 
 
 def synthetic_cases():
@@ -133,7 +131,7 @@ def main():
         else:
             fails += 1
             print(f"  DIFFER {name}\n    ours={json.dumps(o)}\n    core={json.dumps(c)}")
-    print(f"\n{fails} DIFF(S)" if fails else f"\nALL {len(cases)} MATCH (modulo desc)")
+    print(f"\n{fails} DIFF(S)" if fails else f"\nALL {len(cases)} MATCH (desc included)")
     sys.exit(1 if fails else 0)
 
 

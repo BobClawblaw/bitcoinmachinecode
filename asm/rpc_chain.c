@@ -1107,6 +1107,51 @@ static int ds_p2sh_addr(const u8* s, size_t n, char* out, long cap){
     return wallet_script_to_address(out, cap, spk, 23) > 0 && out[0];
 }
 
+static int desc_checksum(const char* span, char out[9]);   /* defined below */
+
+/* InferDescriptor for a bare scriptPubKey with no keystore (Core
+ * descriptor.cpp InferScript fallbacks): pk()/multi() when the key material is
+ * in the script, rawtr() for a taproot output key, addr() for a hash-only
+ * standard type, else raw(). Returns the inner descriptor string (no
+ * checksum), malloc'd; caller frees. */
+static char* desc_inner_of(const u8* s, size_t n){
+    const char* type = script_type(s, n);
+    char* d = NULL;
+    if (!strcmp(type,"pubkey")){
+        size_t pl = s[0]; d = malloc(4 + pl*2 + 2);
+        if (d){ memcpy(d,"pk(",3); hex_of(d+3, s+1, pl); strcpy(d+3+pl*2, ")"); }
+    } else if (!strcmp(type,"multisig")){
+        int m = 0; small_int(s[0], &m);
+        d = malloc(n*2 + 32);
+        if (d){ int off = sprintf(d, "multi(%d", m);
+            const u8* pc=s+1; const u8* end=s+n-2; u8 op; const u8* dp; size_t dl;
+            while (pc<end){ if(!script_getop(&pc,end,&op,&dp,&dl)) break; d[off++]=','; hex_of(d+off,dp,dl); off += (int)dl*2; }
+            d[off++]=')'; d[off]=0; }
+    } else if (!strcmp(type,"witness_v1_taproot")){
+        d = malloc(6 + 64 + 2);
+        if (d){ memcpy(d,"rawtr(",6); hex_of(d+6, s+2, 32); strcpy(d+6+64, ")"); }
+    } else if (!strcmp(type,"pubkeyhash")||!strcmp(type,"scripthash")||
+               !strcmp(type,"witness_v0_keyhash")||!strcmp(type,"witness_v0_scripthash")){
+        char addr[128]; addr[0]=0;
+        if (wallet_script_to_address(addr, sizeof addr, s, (long)n) > 0 && addr[0]){
+            d = malloc(strlen(addr)+8); if (d) sprintf(d, "addr(%s)", addr);
+        }
+    }
+    if (!d){                                              /* raw() fallback */
+        d = malloc(n*2 + 8);
+        if (d){ memcpy(d,"raw(",4); hex_of(d+4, s, n); strcpy(d+4+n*2, ")"); }
+    }
+    return d;
+}
+/* wrap an inner descriptor string with Core's #checksum; malloc'd, caller frees. */
+static char* desc_with_checksum(const char* inner){
+    if (!inner) return NULL;
+    char cks[9]; if (!desc_checksum(inner, cks)) return NULL;
+    char* out = malloc(strlen(inner) + 10);
+    if (out) sprintf(out, "%s#%s", inner, cks);
+    return out;
+}
+
 static int cmd_decodescript(const rj_val* params, rj_val** res, long* ec, const char** em){
     const char* hex = rpc_param_str(params, 0, ec, em); if (!hex) return 0;
     size_t hn = strlen(hex);
@@ -1116,9 +1161,11 @@ static int cmd_decodescript(const rj_val* params, rj_val** res, long* ec, const 
     if (n && !s){ *ec=-7; *em="oom"; return 0; }
     for (size_t i=0;i<n;i++){ int hi=hex1(hex[i*2]),lo=hex1(hex[i*2+1]); if(hi<0||lo<0){ if(n)free(s); *ec=-8; *em="argument must be hexadecimal string"; return 0; } s[i]=(u8)(hi<<4|lo); }
 
-    /* --- ScriptToUniv, include_hex=false, include_address=true, minus desc --- */
+    /* --- ScriptToUniv, include_hex=false, include_address=true --- */
     rj_val* o = rj_obj();
     char* a = script_asm(s, n, 0); rj_obj_set(o,"asm", rj_str(a?a:"")); free(a);
+    { char* di = desc_inner_of(s, n); char* dc = desc_with_checksum(di);
+      if (dc){ rj_obj_set(o,"desc", rj_str(dc)); free(dc); } free(di); }
     const char* type = script_type(s, n);
     { char addr[128]; addr[0]=0;
       if (wallet_script_to_address(addr, sizeof addr, s, (long)n) > 0 && addr[0]) rj_obj_set(o,"address", rj_str(addr)); }
@@ -1154,6 +1201,19 @@ static int cmd_decodescript(const rj_val* params, rj_val** res, long* ec, const 
             else if (!strcmp(type,"pubkeyhash")){ wspk[0]=0x00; wspk[1]=0x14; memcpy(wspk+2, s+3, 20); wl=22; }
             else { u8 h[32]; sha256_full(h, s, (long long)n); wspk[0]=0x00; wspk[1]=0x20; memcpy(wspk+2,h,32); wl=34; }
             rj_val* sr = script_pubkey_json(wspk, wl);   /* asm/hex/address/type */
+            /* segwit desc: P2WPKH -> addr() (no inner known); P2WSH -> wsh(inner
+             * descriptor of the original script), matching Core's provider. */
+            char* sdc;
+            if (wl == 22){ char* di = desc_inner_of(wspk, wl); sdc = desc_with_checksum(di); free(di); }
+            else { char* di = desc_inner_of(s, n);
+                   if (di && !strncmp(di, "raw(", 4)){    /* inner not a proper descriptor -> addr() */
+                       free(di); di = desc_inner_of(wspk, wl); sdc = desc_with_checksum(di); free(di);
+                   } else {
+                       char* w = di ? malloc(strlen(di)+6) : NULL;
+                       if (w) sprintf(w, "wsh(%s)", di);
+                       sdc = desc_with_checksum(w); free(w); free(di);
+                   } }
+            if (sdc){ rj_obj_set(sr,"desc", rj_str(sdc)); free(sdc); }
             char pss[128]; if (ds_p2sh_addr(wspk, wl, pss, sizeof pss)) rj_obj_set(sr,"p2sh-segwit", rj_str(pss));
             rj_obj_set(o,"segwit", sr);
         }
