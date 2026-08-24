@@ -915,10 +915,17 @@ static long do_outbound_sync(int i){
          * A no-op is reported at a much lower rate than a failure. */
         long long every = (kind != 0) ? 60000 : 300000;
         if(nm >= next_sync_gripe_ms[i] || kind != last_kind[i]){
-            fprintf(stderr,"[dl:%d] %-22s sync %s (ok=%ld cnt=%ld tip=%d nloc=%ld)\n",
+            /* sync_fail_code names WHICH .fail exit node_sync_multi took --
+             * 1 getheaders build, 2 getheaders write, 3 headers-drain
+             * timeout, 4 headers read <=0, 5 getdata write, 6 block-drain
+             * timeout, 7 block read <=0, 8 cons_verify rejected the block,
+             * 9 store failed. Without it "ok=0" is a single undifferentiated
+             * symptom, which is how incident #33 hid for 14.5 hours. */
+            extern int sync_fail_code;
+            fprintf(stderr,"[dl:%d] %-22s sync %s (ok=%ld cnt=%ld tip=%d nloc=%ld where=%d)\n",
                     i, mux_out_host[i],
                     (kind != 0) ? "FAILED -- not advancing" : "no-op (peer offered nothing)",
-                    ok, cnt, st_tip, nloc);
+                    ok, cnt, st_tip, nloc, (kind != 0) ? sync_fail_code : 0);
             next_sync_gripe_ms[i] = nm + every;
             last_kind[i] = kind;
         }
