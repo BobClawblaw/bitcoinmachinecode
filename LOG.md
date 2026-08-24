@@ -7,6 +7,51 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #34: the same units confusion as #33, three more times, and two of them corrupt the stack
+
+Incident #33 was `cons_verify`'s 4th parameter -- a txid COUNT -- given the
+value 64 where thousands were needed, so valid blocks were rejected. Auditing
+every other call site of the same function, since one wrong cap means the
+units are easy to get wrong, found three more. Two are strictly worse than
+#33: there the wrong cap REJECTED, here it lets cons_verify WRITE PAST THE
+BUFFER, on block data supplied by a peer.
+
+    site                          scratch                    cap    room
+    node_drain (bitcoind.asm)     sub rsp,0x400 -> 1024 B    256    32 txids
+    node_ibd_blocks               [rbp-0x540], frame 0x648   256    42 txids
+    node_serve_loop (serve.asm)   hp_buf, 162,008 B          162008 5,062 txids
+
+  - node_drain reserved 1024 bytes of stack scratch -- room for 32 txids --
+    and declared 256, i.e. 8192 bytes. A block with more than 32 transactions
+    writes up to 7 KB past it, over the function's own locals, saved
+    registers and return address. Every block at the tip has thousands.
+  - node_ibd_blocks' scratch sits 0x540 below rbp in a 0x648 frame; a
+    256-txid cap runs past rbp into the caller's frame.
+  - node_serve_loop passed `(2000*81+8)` -- the headers-page BYTE size --
+    into the COUNT parameter, licensing 5.18 MB of writes into a 162 KB
+    buffer (overflow past ~5,062 txs; real blocks reach ~12,000). That
+    buffer was hp_buf, the live headers page, so the scratch was aliasing
+    real data regardless of the cap.
+
+All three now use dedicated .bss scratches with a cap that matches
+(SYNC_TXID_CAP / SERVE_TXID_CAP = 80,000 > 4,000,000/60, the wire maximum).
+.bss is per-process, and the daemon forks per inbound peer rather than
+threading these paths, so the buffers cannot be shared across concurrent
+callers; that assumption is stated at each declaration rather than left
+implicit.
+
+Why none of these had been seen: node_drain and node_ibd_blocks are legacy
+paths the dlc downloader superseded, and node_serve_loop only reaches its
+cons_verify when an inbound peer pushes a block. They are reachable, not
+dead -- and the trigger is "a block with more than 32 transactions", which
+is every block for the last decade.
+
+The generalisation worth keeping: a function whose parameter is a COUNT and
+whose caller owns the BUFFER is a units trap, and this codebase now has four
+instances of it in one family. The C callers all get it right for a
+structural reason -- they write `sizeof scratch / 32`, which cannot
+disagree with the buffer. The asm callers each wrote a literal.
+
 ## 2026-08-24 -- incident #33: the node does not follow the chain. It only advances when restarted, and the code said nothing for 14.5 hours
 
 ### What was observed
