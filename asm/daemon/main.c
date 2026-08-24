@@ -608,7 +608,11 @@ static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
 static int   mux_n_out = 0;
 static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
-static long long mux_out_nextretry[MUX_MAX_OUT]; /* monotonic ms deadline before the next re-dial attempt */
+static long long mux_out_nextretry[MUX_MAX_OUT];
+/* consecutive failed sync passes per leg; surfaced in the heartbeat as
+ * sync_failing=N and used to drop a leg that will not answer (see
+ * do_outbound_sync). */
+static int g_sync_fail_streak[MUX_MAX_OUT]; /* monotonic ms deadline before the next re-dial attempt */
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
 
 /* ---- graceful shutdown --------------------------------------------------
@@ -882,52 +886,45 @@ static long do_outbound_sync(int i){
         /* keep the locator fresh even on a no-op so we don't re-request from
          * genesis forever (node_sync advanced it internally only on success) */
         anchor_locator(mux_out_loc[i]);
-        /* 2026-08-24: this path used to return SILENTLY, and that silence hid
-         * a total keep-up failure for 14.5 hours. The node sat at 8/8 peers
-         * with a frozen tip 80 blocks behind the network while calling
-         * node_sync_multi on every leg every rotation and getting ok!=1 back
-         * every time -- indistinguishable, in the log, from "caught up and
-         * nothing to do". The two cases are NOT the same and must not look
-         * the same:
-         *   ok != 1  -> the exchange itself failed (this is a fault)
-         *   ok == 1, cnt == 0 -> the peer had nothing for us (normal at tip)
-         * Rate-limited per leg so a persistent failure is one line a minute,
-         * not a flood, and the normal at-tip case stays quiet unless the
-         * failure kind changes. */
-        static long long next_sync_gripe_ms[MUX_MAX_OUT];
-        static long last_kind[MUX_MAX_OUT];
-        /* kind: 0 = clean no-op (ok==1), 1 = the exchange failed. The first
-         * draft of this line wrote `kind = (ok != 1) ? ok : 0`, which
-         * collapses the ok==0 FAILURE onto the same 0 the clean no-op uses
-         * -- so five failing legs printed "peer offered nothing" within
-         * minutes of the instrument being added. Same class as the bug this
-         * logging exists to expose: two different conditions rendered
-         * identical. */
-        long kind = (ok == 1) ? 0 : 1;
-        long long nm;
-        { struct timespec ts_; clock_gettime(CLOCK_MONOTONIC,&ts_);
-          nm = ts_.tv_sec*1000LL + ts_.tv_nsec/1000000LL; }
-        /* Report BOTH kinds, not just the failure. The clean no-op
-         * (ok==1,cnt==0) is normal at the tip and a FAULT when the network
-         * has moved on -- and from inside this function the two are
-         * indistinguishable, so the log has to carry enough for the reader
-         * to tell: ok, cnt, our tip, and the locator depth we asked with.
-         * A no-op is reported at a much lower rate than a failure. */
-        long long every = (kind != 0) ? 60000 : 300000;
-        if(nm >= next_sync_gripe_ms[i] || kind != last_kind[i]){
-            /* sync_fail_code names WHICH .fail exit node_sync_multi took --
-             * 1 getheaders build, 2 getheaders write, 3 headers-drain
-             * timeout, 4 headers read <=0, 5 getdata write, 6 block-drain
-             * timeout, 7 block read <=0, 8 cons_verify rejected the block,
-             * 9 store failed. Without it "ok=0" is a single undifferentiated
-             * symptom, which is how incident #33 hid for 14.5 hours. */
-            extern int sync_fail_code;
-            fprintf(stderr,"[dl:%d] %-22s sync %s (ok=%ld cnt=%ld tip=%d nloc=%ld where=%d)\n",
-                    i, mux_out_host[i],
-                    (kind != 0) ? "FAILED -- not advancing" : "no-op (peer offered nothing)",
-                    ok, cnt, st_tip, nloc, (kind != 0) ? sync_fail_code : 0);
-            next_sync_gripe_ms[i] = nm + every;
-            last_kind[i] = kind;
+        if(ok == 1){ g_sync_fail_streak[i] = 0; return 0; }   /* peer had nothing: normal at tip */
+        /* Incident #33 made this path log, because its silence hid a total
+         * keep-up failure for 14.5 hours. #33 is fixed; what is left here is
+         * an OPERATIONAL log, and the first version of it was far too loud --
+         * a line per leg per rotation, including the perfectly normal "peer
+         * had nothing for us at the tip". Rules now:
+         *
+         *   ok == 1, cnt == 0   the peer had nothing. This is the NORMAL
+         *                       state between blocks. Never logged.
+         *   ok != 1             the exchange failed. Logged once when a leg
+         *                       STARTS failing and once when it recovers --
+         *                       not once per rotation.
+         *
+         * And a failing leg is now REPLACED rather than retried forever. The
+         * common failure here is where=3, the headers-drain timeout, which
+         * costs a full ~60 s of the rotation before it gives up; two of those
+         * back to back on the same peer means the peer is not going to answer,
+         * and every further rotation spends a minute proving it again. */
+        /* Incident #33 made this path log, because its silence hid a total
+         * keep-up failure for 14.5 hours. #33 is fixed, so what belongs here
+         * now is a HEALTH SIGNAL, not a running commentary. Two earlier
+         * versions were too loud: one printed a line per leg per rotation
+         * (including the entirely normal "peer had nothing at the tip"), and
+         * the next printed every leg replacement, which on a pool where many
+         * peers do not answer getheaders is its own flood.
+         *
+         * So: nothing is logged from here at all. The per-leg failure count
+         * is exported to the heartbeat, which prints one compact number for
+         * the whole node -- an operator sees "sync_failing=2" and can turn on
+         * detail if they care, instead of reading the same four lines every
+         * rotation. A leg that fails repeatedly is still dropped so the
+         * rotation stops burning ~60 s on a peer that will not answer (that
+         * is where=3, the headers-drain timeout); the caller's existing
+         * dead-slot path re-dials it, rate-limited. */
+        g_sync_fail_streak[i]++;
+        if(g_sync_fail_streak[i] >= 3){
+            close(mux_out_fd[i]);
+            mux_out_fd[i] = -1;
+            g_sync_fail_streak[i] = 0;
         }
         return 0;
     }
@@ -2549,10 +2546,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
-            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d txouts=%ld uptime=%s%s\n",
+            int failing=0; for(int k=0;k<mux_n_out;k++) if(g_sync_fail_streak[k]) failing++;
+            char failbuf[32]; failbuf[0]=0;
+            if(failing) snprintf(failbuf, sizeof failbuf, " sync_failing=%d", failing);
+            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d txouts=%ld uptime=%s%s%s\n",
                     *(int*)(store_buf+24), live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
-                    fmt_uptime(upbuf, (now_ms-boot_ms)/1000),
+                    fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf,
                     utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
