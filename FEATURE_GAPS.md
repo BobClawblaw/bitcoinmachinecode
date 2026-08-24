@@ -100,8 +100,9 @@ segwit coinbase, a legacy spend with Core's `[ALL]` sighash decode in
 `tests/test_txoutproof.c` (BIP37 partial-merkle known-answer vector on block
 100000 + proof round-trips, incl. the odd-width duplicate-node path).
 
-Deliberate, documented divergences (things we refuse to fabricate):
-scriptPubKey `desc` is omitted (no descriptor engine); `address` omitted for
+scriptPubKey now includes the inferred `desc` (InferDescriptor no-keystore
+rules + checksum), matching Core on `getblock`/`getrawtransaction`/`decodescript`
+output. Remaining deliberate divergences: `address` omitted for
 `witness_unknown`/`anchor`; `verificationprogress` is blocks/headers;
 `initialblockdownload` is "tip older than 24 h".
 
