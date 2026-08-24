@@ -68,14 +68,66 @@ to that path or to public-peer policy toward it.
 Also: `timeout 90` on the probe killed only the parent; the forked children
 kept downloading for four minutes. Cleaned up.
 
+### ROOT CAUSE #1 FOUND AND FIXED: cons_verify's scratch cap was 64 txids
+
+Driving node_sync_multi against the scratch oracle (plain-C socket, since
+the asm tcp_connect_ip hangs against a listening local Core -- separate
+finding) reproduced it in isolation, and the return value said everything:
+
+    node_handshake -> 1
+    pass 1: node_sync_multi ok=0 cnt=51727 tip=51726
+
+**ok=0 with cnt=51,727.** It downloaded, validated and STORED 51,727 blocks
+and then reported failure. So the earlier characterisation -- "peers close on
+us and the sync fails" -- was wrong: the sync works and then returns 0, and
+do_outbound_sync's `ok != 1` early-return throws the work away before the
+indexing / chainwork / announce steps that follow it.
+
+Core's own net log named the boundary: a run of 215-416 byte blocks, then one
+of 97,994 bytes, then nothing. The failure tracks block SIZE, and
+cons_verify's 4th argument is the txid-scratch capacity IN TXIDS:
+
+    lea  rdx, [rbp-0x1308]
+    mov  ecx, 64              ; <-- capacity, in txids
+    call cons_verify
+
+**node_sync_multi could not validate any block with more than 64
+transactions.** Height ~51,726 is where mainnet blocks first cross that, and
+every block at the chain tip has thousands -- so at the tip this path fails
+100% of the time. The dlc catch-up path passes a correctly-sized scratch,
+which is exactly why the tip advanced at boot and never between boots.
+
+Fixed: the scratch moves to .bss (a frame-local cannot hold the real bound of
+MAX_BLOCK_SERIALIZED_SIZE/60 ~= 66,666 txids) with cap 80,000. Verified with
+the same probe against the same peer: it blew past the old wall and reached
+height 317,802 and climbing at ~800 blocks/s.
+
+Audit of the other call sites, since one wrong cap implies the units are easy
+to get wrong: bitcoind.asm:1015 and :1467 also pass 256 -- too small for any
+modern block, and still unfixed. :1632 and :1794 pass a variable, and the C
+callers all use `sizeof scratch / 32`, which is the right shape.
+bitcoin_serve.asm:420 passes `2000*81+8`, which is a headers-message BYTE
+size in a parameter that means a txid COUNT -- if its buffer is smaller than
+162,008 txids that is an overflow waiting, and it needs its own look.
+
+### ROOT CAUSE #2, STILL OPEN: legs still fail at the tip
+
+With the cap fixed and deployed, production still logs `sync FAILED (ok=0)`
+within ~25 s of each dial, at a tip level with the peer's. That is NOT the
+cap bug (no block to validate) and NOT the empty-headers case (`p2p_headers_
+count == 0` correctly jumps to .done -> ok=1). The fast, simultaneous
+failures point at `p2p_read` returning <= 0, i.e. the socket closed -- and
+public peers close on us where the scratch oracle does not.
+
 ### Next experiment, stated so it is not re-derived
 
-Drive `node_sync_multi` specifically against the scratch oracle, where Core
-logs what it receives and how it answers. That isolates three possibilities
-the current evidence cannot separate: a malformed `getheaders` we send, a
-reply shape we mishandle, or the socket dying for a reason unrelated to the
-message flow. The dlc-path probe does NOT exonerate the mux path -- it only
-proves the handshake and block download are fine.
+Put the scratch oracle in the production peer pool and watch whether a mux
+leg pointed at it stays up and advances while public-peer legs die. That
+separates "our code kills the connection" from "public peers drop us",
+which is the only question root cause #2 still has open. Everything else
+about the mux path is now known good: handshake, getheaders, headers,
+getdata, block download, validation, and store all work against a real Core
+for hundreds of thousands of blocks.
 
 ### Status
 
