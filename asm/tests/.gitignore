@@ -8,3 +8,24 @@ test_addr
 fullchain_shim
 
 fixtures/
+test_bip143_diff
+test_bip30_overwrite
+test_checksig_diff
+test_ripemd160_thread_stress
+test_segwit_classify_diff
+test_strip_witness_diff
+test_svs_drv_diff
+test_tapagg_diff
+test_taproot_verify_diff
+test_txv_classify_diff
+test_txv_dispatch_diff
+test_txv_parse_diff
+test_txv_pools_diff
+test_txvb_parse_diff
+test_undo_asm_diff
+test_utxo_prefetch_race
+test_utxo_probe_bound
+test_utxo_unspendable
+test_wv0_drv_diff
+test_bip341_diff
+undo_log_ref.o

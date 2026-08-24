@@ -392,6 +392,48 @@ chainstate (the 963,775 parity proof stands) -- but "runs live on the
 network" was not a claim the evidence supported, and I made it repeatedly
 last night.
 
+## 2026-08-24 -- slice 13b: three assumed layouts, three failures, three fixes -- and none of them reached main
+
+The BIP341 TapSighash twin (bitcoin_bip341.asm) took three iterations, and
+every failure was the same root cause in a different costume: a layout or
+calling detail TYPED FROM MEMORY instead of measured.
+
+  1. tapctx_t field ORDER. The first offsetof probe I wrote put hash_type
+     after num_inputs; the real struct has it immediately after n_in.
+     Caught by re-reading the header before writing any asm -- cost: two
+     minutes.
+  2. txview_t layout. I assumed it matched bitcoin_segwit.c's swtx_t. It
+     does not: `version` is a plain int, so locktime sits at 28 not 32, and
+     there is no `inputs` field at all. The twin segfaulted on its first
+     sha_outputs (out_off read back as 1, nout as a pointer). Then the SAME
+     wrong struct in the test drove the C ORACLE through garbage -- the
+     second crash was in the oracle, not the twin.
+  3. The SysV register/stack boundary. ts_agg_hashes takes eight arguments;
+     the sixth (h_seq) goes in r9, and I read it from [rbp+16], which is
+     the SEVENTH. Every aggregate hash came out wrong, and the stray
+     pointer was also what turned the mismatch into a segfault in the
+     non-ASAN build.
+
+What made #3 findable in minutes rather than hours: ASAN reported NO memory
+error while the differential reported 17 identical "aggregate hashes"
+failures. A segfault plus clean sanitizer plus a systematic wrong-value
+pattern is a marshaling bug, not a memory bug -- and the argument list is
+the first place to count.
+
+Final: 1,684 cases, 0 mismatches. Compares the four aggregates and the
+located spk-at-n_in, then the sighash's length, the ENTIRE pre-poisoned
+preimage buffer, and the digest -- across 13 hash_types (including the six
+INVALID ones the 2026-08-22 consensus fix must keep rejecting), key vs
+script path, annex present/absent, SIGHASH_SINGLE inside and PAST the
+output count (BIP341 fails; BIP143 would substitute a zero hash), every
+input index, out-of-range n_in, and two cap sweeps landing mid-field.
+
+Standing rule after tonight, now applied without exception: no struct
+offset, no field order, and no argument position goes into assembly until
+it has been printed by an offsetof probe or counted against the SysV
+tables. Three for three tonight, and all three were caught before the
+daemon ever linked the twin.
+
 ## 2026-08-24 -- slice 11's differential caught a real overlapping-frame-slot bug, in the one place a weaker test would have missed it
 
 bitcoin_checksig.asm (twins of the BASE and WITNESS_V0 checksig hooks)
