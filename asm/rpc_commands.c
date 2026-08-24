@@ -221,45 +221,50 @@ static int cmd_validate(const char* method, const rj_val* params, long* ec, cons
     int type; unsigned char ver, h160[20], prog32[32];
     memset(prog32, 0, 32);
     int ok = wallet_validate_address(addr, &type, &ver, h160, prog32);
+    /* Only P2PKH/P2SH/P2WPKH/P2WSH/P2TR are decodable destinations; an
+     * unknown base58 version passes the checksum but is not a valid address
+     * (Core: isvalid=false), matching DecodeDestination. */
+    int valid = ok && type >= WAL_ADDR_P2PKH && type <= WAL_ADDR_P2TR;
     rj_val* o = rj_obj();
-    rj_obj_set(o, "isvalid", rj_bool(ok));
-    rj_obj_set(o, "address", rj_str(addr));
+    rj_obj_set(o, "isvalid", rj_bool(valid));
     if (!strcmp(method, "validateaddress")) {
-        if (ok) {
-            /* scriptPubKey hex for the address (P2PKH/P2SH/P2WPKH/P2WSH/P2TR) */
-            char spkhex[128]; spkhex[0] = 0;
-            if (type == WAL_ADDR_P2PKH) {
-                unsigned char s[25]; s[0]=0x76; s[1]=0xa9; s[2]=0x14; memcpy(s+3,h160,20); s[23]=0x88; s[24]=0xac;
-                bin_to_hex(spkhex, s, 25);
-            } else if (type == WAL_ADDR_P2SH) {
-                unsigned char s[23]; s[0]=0xa9; s[1]=0x14; memcpy(s+2,h160,20); s[22]=0x87;
-                bin_to_hex(spkhex, s, 23);
-            } else if (type == WAL_ADDR_P2WPKH) {
-                unsigned char s[22]; s[0]=0x00; s[1]=0x14; memcpy(s+2,h160,20);
-                bin_to_hex(spkhex, s, 22);
-            } else if (type == WAL_ADDR_P2WSH) {
-                unsigned char s[34]; s[0]=0x00; s[1]=0x20; memcpy(s+2,prog32,32);
-                bin_to_hex(spkhex, s, 34);
-            } else if (type == WAL_ADDR_P2TR) {
-                unsigned char s[34]; s[0]=0x51; s[1]=0x20; memcpy(s+2,prog32,32);
-                bin_to_hex(spkhex, s, 34);
+        if (valid) {
+            /* scriptPubKey for the destination (P2PKH/P2SH/P2WPKH/P2WSH/P2TR) */
+            unsigned char s[34]; size_t sl = 0;
+            switch (type) {
+                case WAL_ADDR_P2PKH:  s[0]=0x76;s[1]=0xa9;s[2]=0x14;memcpy(s+3,h160,20);s[23]=0x88;s[24]=0xac; sl=25; break;
+                case WAL_ADDR_P2SH:   s[0]=0xa9;s[1]=0x14;memcpy(s+2,h160,20);s[22]=0x87;                     sl=23; break;
+                case WAL_ADDR_P2WPKH: s[0]=0x00;s[1]=0x14;memcpy(s+2,h160,20);                                sl=22; break;
+                case WAL_ADDR_P2WSH:  s[0]=0x00;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
+                case WAL_ADDR_P2TR:   s[0]=0x51;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
             }
-            if (spkhex[0]) rj_obj_set(o, "scriptPubKey", rj_str(spkhex));
-            rj_obj_set(o, "isscript", rj_bool(type == WAL_ADDR_P2SH || type == WAL_ADDR_P2WSH));
-            int isw = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
+            /* Core echoes the CANONICAL encoding (bech32 lower-cased) */
+            char canon[128]; canon[0] = 0; wallet_script_to_address(canon, sizeof canon, s, (long)sl);
+            rj_obj_set(o, "address", rj_str(canon[0] ? canon : addr));
+            char spkhex[128]; bin_to_hex(spkhex, s, sl);
+            rj_obj_set(o, "scriptPubKey", rj_str(spkhex));
+            /* DescribeAddress: P2SH/P2WSH/P2TR are scripts; witness types carry
+             * the program (P2WSH/P2TR use the 32-byte prog, not h160). */
+            int isscript = (type == WAL_ADDR_P2SH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
+            int isw      = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
+            rj_obj_set(o, "isscript", rj_bool(isscript));
             rj_obj_set(o, "iswitness", rj_bool(isw));
             if (isw) {
-                unsigned char* prog = (type == WAL_ADDR_P2TR) ? prog32 : h160;
-                size_t plen = (type == WAL_ADDR_P2TR || type == WAL_ADDR_P2WSH) ? 32 : 20;
-                unsigned wv = (type == WAL_ADDR_P2TR) ? 1 : 0;
-                rj_obj_set(o, "witness_version", rj_numf("%u", wv));
+                const unsigned char* prog = (type == WAL_ADDR_P2WPKH) ? h160 : prog32;
+                size_t plen = (type == WAL_ADDR_P2WPKH) ? 20 : 32;
+                rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1u : 0u));
                 char proghex[66]; bin_to_hex(proghex, prog, plen);
                 rj_obj_set(o, "witness_program", rj_str(proghex));
             }
-            rj_obj_set(o, "ischange", rj_bool(0));
+        } else {
+            /* Core's invalid shape (error text / bech32 error_locations are not
+             * reproduced -- we report the classification, not the diagnostics). */
+            rj_obj_set(o, "error_locations", rj_arr());
+            rj_obj_set(o, "error", rj_str("Invalid address"));
         }
     } else { /* getaddressinfo */
-        if (ok) {
+        rj_obj_set(o, "address", rj_str(addr));
+        if (valid) {
             if (type == WAL_ADDR_P2PKH) {
                 char pubhex[68]; pubhex[0] = 0;
                 rj_obj_set(o, "pubkey", rj_str(pubhex));

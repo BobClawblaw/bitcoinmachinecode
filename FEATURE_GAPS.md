@@ -56,6 +56,23 @@ harness can compare JSON directly):
   the scratch oracle over blocks 100000 and 800000; see `worklog/2026-08-24`).
   Like `getrawtransaction`, `gettxoutproof` **requires** the block hash (no
   txindex to locate the tx otherwise) — Core's own no-txindex behaviour.
+- Util: `decodescript <hex>` — classify a redeem/scriptPubKey exactly as Core's
+  `rawtransaction.cpp` does: `asm`/`type`/`address`, the `p2sh` wrapper, and the
+  `segwit` sub-object with `p2sh-segwit`, gated by Core's own `can_wrap` /
+  `can_wrap_P2WSH` rules (uncompressed-key and `OP_CHECKSIGADD`/`OP_SUCCESSx`
+  exclusions included). Differs from Core only by the omitted `desc`
+  descriptor. `validation/decodescript_diff.py` diffs it against the oracle
+  over every wrapper branch plus real on-chain scripts — 37/37 identical
+  modulo `desc`.
+- Util: `validateaddress <address>` — decode + classify (base58check and
+  bech32/bech32m) into Core's `DescribeAddress` shape: `isvalid`, canonical
+  `address`, `scriptPubKey`, `isscript`, `iswitness`, `witness_version`,
+  `witness_program`. `validation/validateaddress_diff.py` diffs it against the
+  oracle for every type (valid cases byte-for-byte; invalid on `isvalid` only).
+  Writing that differential caught three field bugs in the pre-existing
+  builder — a garbage P2WSH `witness_program` (copied 32 bytes from a 20-byte
+  buffer), P2TR `isscript=false`, and a stray `ischange` — now fixed.
+  (`getaddressinfo` shares the decoder; wallet-context fields are still stubs.)
 - Node: `uptime`, `stop` (these apply to the `bitcoin_rpcd` process).
 
 How it reaches chain state: `bitcoin_rpcd` is a **standalone process**, not
@@ -85,7 +102,10 @@ snapshot the serve process publishes; neither exists yet. Until then these
 return `-32601 Method not found` rather than stubbed answers.
 `createrawtransaction` was skipped as out of scope (the tx builder lives in
 the wallet CLI). Still absent as categories: wallet RPCs beyond the original
-8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, util.
+8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest
+of util (`decodescript` and `validateaddress` are done; `createmultisig` /
+`deriveaddresses` are the next pure-function candidates — the latter needs a
+descriptor engine).
 
 **Effort for the remainder: medium** — the blockchain-query breadth is now
 done; what's left is the one architectural step (RPC ↔ live node state)
