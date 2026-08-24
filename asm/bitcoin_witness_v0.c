@@ -164,6 +164,14 @@ int sv_classify_segwit(const uint8_t* spk, uint32_t spl,
  * (PUSH_SIZE); EvalScript; then exactly one element left (CLEANSTACK --
  * "scripts inside witness implicitly require cleanstack behaviour") and it
  * must CastToBool true (EVAL_FALSE). Returns a SCRIPT_ERR_* code. */
+/* Phase 2 slice 9 seam (2026-08-24): the checksig hook is static (it is
+ * only ever passed BY POINTER into sv_run_v), so the asm twin gets an
+ * exported alias with identical behavior to hand to the same sv_run_v. */
+uint64_t sv_checksig_witness_v0_export(void* c, const uint8_t* sig, size_t siglen,
+                                       const uint8_t* pub, size_t publen, const void* sc){
+    return sv_checksig_witness_v0(c, sig, siglen, pub, publen, sc);
+}
+
 int sv_verify_witness_v0(const uint8_t* prog, uint32_t proglen,
                          const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
                          uint64_t amount, uint64_t flags, unsigned long nIn,
