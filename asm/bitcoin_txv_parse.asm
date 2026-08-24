@@ -22,7 +22,9 @@
 ;   witpool_t:   ptr@0 len@8 cap@16 used@24
 ;
 ; FIDELITY NOTE: this is a bug-for-bug twin. In particular the C's
-; scriptSig bound `(u64)(end-p) < sl+4` wraps for sl within 4 of 2^64 (an
+; scriptSig bound: FIXED 2026-08-24 (incident #36) to the split form
+; `avail < sl || avail - sl < 4`, matching the C and bitcoin_segwit.c's
+; swtx_parse. The old `(u64)(end-p) < sl+4` wrapped for sl within 4 of 2^64 (an
 ; 0xff varint can encode that), which the twin reproduces EXACTLY -- the
 ; differential must not diverge. Whether Core's MAX_SIZE-capped compactsize
 ; reader makes that a real consensus difference is filed for its own
@@ -194,9 +196,11 @@ txv_parse_asm:
     RDCS .r_ssv                           ; sl
     mov  r15, rax                        ; sl
     mov  rax, r12
-    sub  rax, rbx                        ; end - p
-    lea  rcx, [r15+4]                    ; sl + 4 (wraps for sl near 2^64,
-    cmp  rax, rcx                        ;   EXACTLY like the C -- see header)
+    sub  rax, rbx                        ; avail = end - p
+    cmp  rax, r15                        ; avail < sl ? (catches sl near 2^64
+    jb   .r_sstrunc                      ;   without the sl+4 wrap -- incident #36)
+    sub  rax, r15                        ; avail - sl (>= 0 here)
+    cmp  rax, 4
     jb   .r_sstrunc
     mov  [r13+IN_SCRIPTSIG], rbx
     mov  [r13+IN_SSLEN], r15d            ; (u32)sl, the C's truncation
@@ -470,9 +474,11 @@ txvb_parse_tx_asm:
     RDCS .b_ssv                          ; sl
     mov  r15, rax
     mov  rax, r12
-    sub  rax, rbx
-    lea  rcx, [r15+4]                    ; sl+4 (same wrap fidelity as the C)
-    cmp  rax, rcx
+    sub  rax, rbx                        ; avail = end - p
+    cmp  rax, r15                        ; avail < sl ? (catches sl near 2^64
+    jb   .b_sstrunc                   ;   without the sl+4 wrap -- incident #36)
+    sub  rax, r15                        ; avail - sl (>= 0 here)
+    cmp  rax, 4
     jb   .b_sstrunc
     mov  [r13+BIN_SCRIPTSIG], rbx
     mov  [r13+BIN_SSLEN], r15d
