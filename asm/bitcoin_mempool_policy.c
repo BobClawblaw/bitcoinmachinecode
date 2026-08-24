@@ -191,7 +191,7 @@ static int parse_inputs(const unsigned char* tx, unsigned long txlen,
         else if (e == 0xfd){ if(p+2>end) return -1; sl = p[0]|(p[1]<<8); p+=2; }
         else if (e == 0xfe){ if(p+4>end) return -1; sl=0; for(int k=0;k<4;k++) sl|=((unsigned long)p[k])<<(8*k); p+=4; }
         else { if(p+8>end) return -1; sl=0; for(int k=0;k<8;k++) sl|=((unsigned long)p[k])<<(8*k); p+=8; }
-        if (p + sl > end) return -1;
+        if (sl > (unsigned long)(end - p)) return -1;   /* split bound: no overflow (incident #38) */
         p += sl;
     }
     return (int)n_in;
