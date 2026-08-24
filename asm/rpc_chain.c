@@ -357,7 +357,7 @@ static int tx_walk(const u8* p, const u8* end, txw_t* w){
     for (u64 i = 0; i < w->n_in; i++){
         if (p + 36 > end) return 0; p += 36;
         u64 sl = read_varint(p, end, &c); if (!c) return 0; p += c;
-        if ((u64)(end - p) < sl + 4) return 0; p += sl + 4;
+        { u64 avail=(u64)(end - p); if (avail < sl || avail - sl < 4) return 0; } p += sl + 4;  /* split bound (incident #38) */
     }
     w->vout = p;
     w->n_out = read_varint(p, end, &c); if (!c) return 0; p += c;

@@ -313,7 +313,8 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     const uint8_t* q = p;
     for (uint64_t i=0;i<nin;i++){ if (sw_avail(q, end) < 36) return 0; q += 36;
         uint64_t sl = read_cs(&q, end, &ok);
-        if (!ok || sw_avail(q, end) < sl + 4) return 0; q += sl+4; }
+        if (!ok) return 0;
+        { uint64_t avail=sw_avail(q,end); if (avail < sl || avail - sl < 4) return 0; } q += sl+4; }  /* split bound (incident #38) */
     const uint8_t* outs_start = q;      /* nout varint + every CTxOut, verbatim */
     uint64_t nout = read_cs(&q, end, &ok);
     if (!ok) return 0;
