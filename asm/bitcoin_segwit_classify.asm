@@ -183,6 +183,61 @@ last_push:
 ; ----------------------------------------------------------------------------
 global sv_classify_segwit_asm
 sv_classify_segwit_asm:
+    ; ---- FRAMELESS FAST PATH (2026-08-24, second rev) ----
+    ; The two overwhelmingly common outcomes -- native program, and
+    ; plain-legacy spk -- need no calls, so they pay no prologue. The C wins
+    ; these paths because gcc inlines sv_witness_program and keeps the leaf
+    ; lean; this recovers that. Stack args while frameless:
+    ;   [rsp+8] = proglen out, [rsp+16] = wrapped out.
+    mov  rax, [rsp+16]
+    mov  dword [rax], 0                  ; *wrapped = 0 (always, like the C)
+    ; inline witness-program test on the spk
+    cmp  rsi, 4
+    jb   .not_native
+    cmp  rsi, 42
+    ja   .not_native
+    movzx eax, byte [rdi]
+    test eax, eax                        ; OP_0
+    jz   .nv_ok
+    cmp  eax, 0x51
+    jb   .not_native
+    cmp  eax, 0x60
+    ja   .not_native
+.nv_ok:
+    lea  r10, [rsi-2]
+    movzx r11d, byte [rdi+1]
+    cmp  r11, r10                        ; s[1] == n - 2 ?
+    jne  .not_native
+    test eax, eax                        ; *version = s[0] ? s[0]-0x50 : 0
+    jz   .nv_v0
+    sub  eax, 0x50
+.nv_v0:
+    mov  [r8], eax
+    lea  rax, [rdi+2]
+    mov  [r9], rax                       ; *prog = spk + 2
+    mov  rax, [rsp+8]
+    mov  [rax], r10d                     ; *proglen = n - 2
+    mov  eax, 1
+    ret
+.not_native:
+    ; not-P2SH -> legacy, still frameless
+    cmp  rsi, 23
+    jne  .fast_legacy
+    cmp  byte [rdi], 0xa9
+    jne  .fast_legacy
+    cmp  byte [rdi+1], 0x14
+    jne  .fast_legacy
+    cmp  byte [rdi+22], 0x87
+    je   .p2sh_slow                      ; real P2SH: take the framed path
+.fast_legacy:
+    xor  eax, eax
+    ret
+
+    ; ---- FRAMED SLOW PATH: P2SH-wrapped analysis (calls last_push,
+    ; sv_witness_program_asm, hash160) -- args still intact in registers
+    ; and at their original stack slots, which the frame re-addresses as
+    ; [rbp+16]/[rbp+24] exactly as before. ----
+.p2sh_slow:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -197,30 +252,6 @@ sv_classify_segwit_asm:
     mov  [rbp-0x48], rcx                 ; ssl
     mov  [rbp-0x30], r8                  ; version out
     mov  [rbp-0x38], r9                  ; prog out
-
-    mov  rax, [rbp+24]
-    mov  dword [rax], 0                  ; *wrapped = 0
-
-    ; native? sv_witness_program(spk, spl, version, prog, proglen)
-    mov  rdx, r8
-    mov  rcx, r9
-    mov  r8,  [rbp+16]                   ; proglen out
-    ; rdi=spk rsi=spl already
-    call sv_witness_program_asm
-    test rax, rax
-    jz   .try_p2sh
-    mov  eax, 1
-    jmp  .out
-.try_p2sh:
-    ; sv_is_p2sh: 23 bytes, 0xa9 0x14 ... 0x87
-    cmp  r15, 23
-    jne  .legacy
-    cmp  byte [rbx], 0xa9
-    jne  .legacy
-    cmp  byte [rbx+1], 0x14
-    jne  .legacy
-    cmp  byte [rbx+22], 0x87
-    jne  .legacy
     ; last push of the scriptSig
     mov  rdi, [rbp-0x40]
     mov  rsi, [rbp-0x48]
