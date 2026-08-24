@@ -297,6 +297,14 @@ static int sv_run(const uint8_t* script, size_t slen, sv_stack* st,
     return sv_run_v(script, slen, st, flags, ctx, err, SIGV_BASE, sv_checksig);
 }
 
+/* Phase 2 slice 10 seam (2026-08-24): the legacy checksig hook is static
+ * (only ever passed by pointer into sv_run_v); exported alias so the asm
+ * twin of sv_verify_script can hand the SAME hook to the SAME sv_run_v. */
+uint64_t sv_checksig_export(void* c, const uint8_t* sig, size_t siglen,
+                            const uint8_t* pub, size_t publen, const void* sc){
+    return sv_checksig(c, sig, siglen, pub, publen, sc);
+}
+
 int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                      const unsigned char* scriptPubKey, unsigned long spl,
                      uint64_t flags, unsigned long nIn,
