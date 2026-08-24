@@ -44,11 +44,18 @@ harness can compare JSON directly):
 
 - Blockchain query: `getblockcount`, `getbestblockhash`, `getblockhash`,
   `getblockheader` (verbose + raw hex), `getblock` (verbosity 0/1/2; 3 acts
-  like 2 — no undo data, same as Core without it), `getblockchaininfo`.
+  like 2 — no undo data, same as Core without it), `getblockchaininfo`,
+  `getdifficulty`.
 - Raw tx: `getrawtransaction <txid> [verbosity] <blockhash>` — the exact
   behaviour Core has with **no txindex and an empty mempool**: succeeds only
   with a block hash, otherwise Core's own `-5 "No such mempool transaction.
   Use -txindex or provide a block hash…"`.
+- SPV proofs: `gettxoutproof [txids] <blockhash>` / `verifytxoutproof <hex>` —
+  BIP37 `CMerkleBlock` (partial merkle tree). Proofs are **byte-identical** to
+  Core's and each node verifies the other's (bidirectional differential against
+  the scratch oracle over blocks 100000 and 800000; see `worklog/2026-08-24`).
+  Like `getrawtransaction`, `gettxoutproof` **requires** the block hash (no
+  txindex to locate the tx otherwise) — Core's own no-txindex behaviour.
 - Node: `uptime`, `stop` (these apply to the `bitcoin_rpcd` process).
 
 How it reaches chain state: `bitcoin_rpcd` is a **standalone process**, not
@@ -59,7 +66,9 @@ hash→height table, `chainwork.dat` (recomputed from headers when absent),
 so it tracks the live daemon's appends without a restart. Tested by
 `tests/test_rpc_chain.c` (124 checks: real mainnet genesis as oracle, a
 segwit coinbase, a legacy spend with Core's `[ALL]` sighash decode in
-`scriptSig.asm`, a P2WPKH spend with witness, every error path).
+`scriptSig.asm`, a P2WPKH spend with witness, every error path) and
+`tests/test_txoutproof.c` (BIP37 partial-merkle known-answer vector on block
+100000 + proof round-trips, incl. the odd-width duplicate-node path).
 
 Deliberate, documented divergences (things we refuse to fabricate):
 scriptPubKey `desc` is omitted (no descriptor engine); `address` omitted for
