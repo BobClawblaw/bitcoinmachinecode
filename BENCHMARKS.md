@@ -245,7 +245,7 @@ OpenSSL instead and is left alone.
 | SHA-256d, 64 B × 1024 | `SHA256D64_1024_SHANI` | 0.7104 ns/B (45.47 ns/pair) | ~~1.5901~~ → **0.8499 ns/B** (54.4 ns/pair) | ~~2.24×~~ → **1.17×** |
 | SHA-1, 1,000,000 B | `SHA1` | 0.6472 ns/B | 1.7318 ns/B | 2.68× slower |
 | SHA-512, 1,000,000 B | `SHA512` | 0.9783 ns/B | 1.7513 ns/B | 1.79× slower |
-| RIPEMD-160, 1,000,000 B | `BenchRIPEMD160` | 1.1371 ns/B | 3.5877 ns/B | 3.16× slower |
+| RIPEMD-160, 1,000,000 B | `BenchRIPEMD160` | 1.1371 ns/B | ~~3.5877~~ → **1.1502 ns/B** (2026-08-24 unroll) | ~~3.16×~~ → **1.01× — parity** |
 | Merkle root, 9,001 leaves | `MerkleRoot` | 45.97 ns/leaf | ~~103.14~~ → **55.94 ns/leaf** | ~~2.24×~~ → **1.17×** |
 
 Notes, in order of how much they change the reading:
@@ -616,6 +616,35 @@ proportion is exactly why H must be large.
    ratio, or the ratio means nothing.
 
 ---
+
+## Addendum 2026-08-24 — the C→asm module twins
+
+Measured during the overnight C→asm conversion (phases 1–2), on the same
+box while the parity rebuild ran (~6 cores busy): `taskset -c 25`,
+best-of-N, both sides equally contended, so the RATIOS are trustworthy and
+the absolute numbers are not quiet-box numbers. Each module's asm twin is
+differential-proven against the C it replaces (31,572 + 4,901 cases across
+the four modules, zero mismatches) BEFORE being benchmarked. Ratios are
+asm/C; ≤ 1.0 means the asm is at parity or faster.
+
+| module | case | C | asm | ratio |
+|---|---|---|---|---|
+| bitcoin_txv_parse | 400-input legacy tx | 712 ns | 602 ns | 0.845 |
+| bitcoin_txv_parse | 50-input segwit tx | 291 ns | 230 ns | 0.793 |
+| bitcoin_txv_classify | p2pkh / p2wpkh / p2tr | 5.6 / 5.8 / 3.9 ns | 5.4 / 5.8 / 3.9 ns | 0.96–1.00 |
+| bitcoin_segwit_classify | native program | 1.9 ns | 0.9 ns | 0.490 |
+| bitcoin_segwit_classify | P2SH-wrapped (incl. hash160) | 135.1 ns | 134.8 ns | 0.998 |
+| bitcoin_segwit_classify | legacy spk | 1.7 ns | 0.9 ns | 0.516 |
+| bitcoin_undo | append, 34B script | 0.78 µs | 0.73 µs | 0.939 |
+| bitcoin_undo | replay, 5k records | 968 µs | 963 µs | 0.995 |
+
+The undo rows are syscall-bound (the time is the kernel's, in either
+language). Two twins initially measured SLOWER than gcc -O2 (segwit-heavy
+parse 1.165, segwit-cls common paths ~1.08); both were call/frame overhead
+around leaf logic the compiler inlines, fixed by a NASM inline macro and a
+frameless fast path — LOG.md 2026-08-24 has the discipline notes. This
+layer is ~0.003% of block-connect time; these ports are purity work, and
+this table exists so that claim is measured rather than assumed.
 
 ## Where we are slower
 
