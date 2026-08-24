@@ -8,7 +8,8 @@
  *   getblockchaininfo, getdifficulty, getrawtransaction (block-hash form),
  *   gettxoutproof / verifytxoutproof (BIP37 partial merkle tree; proofs are
  *   byte-identical to Core's), decodescript (util; identical to Core modulo
- *   the omitted descriptor), uptime, stop.
+ *   the omitted descriptor), createmultisig (util; identical modulo the
+ *   omitted descriptor), uptime, stop.
  *
  * How chain state reaches this process: bitcoin_store.asm's store_init +
  * store_reload on -datadir's index.dat (positional 48-byte records:
@@ -1162,10 +1163,128 @@ static int cmd_decodescript(const rj_val* params, rj_val** res, long* ec, const 
     return 1;
 }
 
+/* ---- createmultisig (util): build an m-of-n multisig address ---------------
+ * Core's rpc/output_script.cpp createmultisig + rpc/util.cpp
+ * AddAndGetMultisigDestination. Pure: validate the pubkeys (on-curve, via
+ * pubkey_parse = CPubKey::IsFullyValid), assemble the redeemScript, and derive
+ * the address for the requested output type. Uncompressed keys force legacy
+ * (and, if a segwit type was asked for, add Core's warning). The "descriptor"
+ * field is the one omission -- no descriptor engine (same as decodescript's
+ * "desc"). */
+extern int pubkey_parse(const u8* pub, unsigned long publen, u64 qx[4], u64 qy[4]);
+
+/* CScript << int for a 0..20 count: OP_0 / OP_1..OP_16, else a 1-byte push. */
+static size_t cms_push_count(u8* d, int v){
+    if (v == 0){ d[0] = 0x00; return 1; }
+    if (v >= 1 && v <= 16){ d[0] = (u8)(0x50 + v); return 1; }
+    d[0] = 0x01; d[1] = (u8)v; return 2;             /* CScriptNum, v <= 20 */
+}
+static int cms_p2sh_addr(const u8* s, size_t n, char* out, long cap){
+    u8 h[20]; hash160(h, s, (long long)n);
+    u8 spk[23]; spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2,h,20); spk[22]=0x87;
+    return wallet_script_to_address(out, cap, spk, 23) > 0 && out[0];
+}
+
+static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long long req;
+    if (!rpc_param_i64(params, 0, &req, ec, em)) return 0;
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "Invalid parameter, \"keys\" must be an array"; return 0; }
+    const rj_val* keys = params->items[1];
+    int n = (int)keys->nitems;
+
+    /* 1. validate + collect every pubkey (Core: HexToPubKey before the count
+     * checks, so a bad key is reported even when the count is also wrong). */
+    static char keyerr[160];
+    u8 (*pk)[65] = malloc((size_t)(n > 0 ? n : 1) * 65);
+    int* pklen = malloc((size_t)(n > 0 ? n : 1) * sizeof(int));
+    if (!pk || !pklen){ free(pk); free(pklen); *ec=-7; *em="oom"; return 0; }
+    int uncompressed = 0;
+    for (int i = 0; i < n; i++){
+        const rj_val* e = keys->items[i];
+        int bad = (e->typ != RJ_STR);
+        size_t hl = bad ? 0 : strlen(e->str);
+        int bytes = (int)(hl/2);
+        if (bad || (hl & 1) || (bytes != 33 && bytes != 65)){
+            snprintf(keyerr, sizeof keyerr, "Invalid public key: %s", bad ? "" : e->str);
+            free(pk); free(pklen); *ec=-5; *em=keyerr; return 0; }
+        for (int k = 0; k < bytes; k++){ int hi=hex1(e->str[k*2]),lo=hex1(e->str[k*2+1]);
+            if (hi<0||lo<0){ snprintf(keyerr,sizeof keyerr,"Invalid public key: %s", e->str); free(pk);free(pklen);*ec=-5;*em=keyerr;return 0; }
+            pk[i][k]=(u8)(hi<<4|lo); }
+        u64 qx[4], qy[4];
+        if (!pubkey_parse(pk[i], (unsigned long)bytes, qx, qy)){   /* on-curve / valid header */
+            snprintf(keyerr, sizeof keyerr, "Invalid public key: %s", e->str);
+            free(pk); free(pklen); *ec=-5; *em=keyerr; return 0; }
+        pklen[i] = bytes;
+        if (bytes == 65) uncompressed = 1;
+    }
+
+    /* 2. output type (default legacy) */
+    const char* atype = "legacy";
+    if (param_present(params, 2)){
+        if (params->items[2]->typ != RJ_STR){ free(pk);free(pklen); *ec=-8; *em="Invalid address_type"; return 0; }
+        atype = params->items[2]->str;
+    }
+    int otype;   /* 0 legacy, 1 p2sh-segwit, 2 bech32 */
+    static char typeerr[96];
+    if (!strcmp(atype,"legacy")) otype=0;
+    else if (!strcmp(atype,"p2sh-segwit")) otype=1;
+    else if (!strcmp(atype,"bech32")) otype=2;
+    else if (!strcmp(atype,"bech32m")){ free(pk);free(pklen); *ec=-5; *em="createmultisig cannot create bech32m multisig addresses"; return 0; }
+    else { snprintf(typeerr,sizeof typeerr,"Unknown address type '%s'", atype); free(pk);free(pklen); *ec=-5; *em=typeerr; return 0; }
+
+    /* 3. count checks (AddAndGetMultisigDestination) */
+    static char cnterr[160];
+    if (req < 1){ free(pk);free(pklen); *ec=-8; *em="a multisignature address must require at least one key to redeem"; return 0; }
+    if (n < req){ snprintf(cnterr,sizeof cnterr,"not enough keys supplied (got %d keys, but need at least %lld to redeem)", n, req); free(pk);free(pklen); *ec=-8; *em=cnterr; return 0; }
+    if (n > 20){ snprintf(cnterr,sizeof cnterr,"Number of keys involved in the multisignature address creation > 20\nReduce the number"); free(pk);free(pklen); *ec=-8; *em=cnterr; return 0; }
+
+    /* 4. redeemScript = OP_m <key>.. OP_n OP_CHECKMULTISIG */
+    int requested_segwit = (otype != 0);
+    if (uncompressed) otype = 0;                          /* force legacy */
+    u8* redeem = malloc((size_t)n * 66 + 8); if (!redeem){ free(pk);free(pklen); *ec=-7;*em="oom"; return 0; }
+    size_t rl = 0;
+    rl += cms_push_count(redeem+rl, (int)req);
+    for (int i=0;i<n;i++){ redeem[rl++]=(u8)pklen[i]; memcpy(redeem+rl,pk[i],pklen[i]); rl+=pklen[i]; }
+    rl += cms_push_count(redeem+rl, n);
+    redeem[rl++] = 0xae;
+    free(pk); free(pklen);
+
+    if (otype == 0 && rl > 520){
+        static char szerr[96]; snprintf(szerr,sizeof szerr,"redeemScript exceeds size limit: %zu > 520", rl);
+        free(redeem); *ec=-8; *em=szerr; return 0; }
+
+    /* 5. address */
+    char addr[128]; addr[0]=0;
+    if (otype == 0){                                      /* legacy: P2SH(redeem) */
+        cms_p2sh_addr(redeem, rl, addr, sizeof addr);
+    } else if (otype == 2){                               /* bech32: P2WSH(redeem) */
+        u8 h[32]; sha256_full(h, redeem, (long long)rl);
+        u8 spk[34]; spk[0]=0x00; spk[1]=0x20; memcpy(spk+2,h,32);
+        wallet_script_to_address(addr, sizeof addr, spk, 34);
+    } else {                                              /* p2sh-segwit: P2SH(P2WSH(redeem)) */
+        u8 h[32]; sha256_full(h, redeem, (long long)rl);
+        u8 wspk[34]; wspk[0]=0x00; wspk[1]=0x20; memcpy(wspk+2,h,32);
+        cms_p2sh_addr(wspk, 34, addr, sizeof addr);
+    }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "address", rj_str(addr));
+    { char* hx = malloc(rl*2+1); if (hx){ hex_of(hx, redeem, rl); rj_obj_set(o,"redeemScript", rj_str(hx)); free(hx); } }
+    if (requested_segwit && uncompressed){
+        rj_val* w = rj_arr();
+        rj_arr_push(w, rj_str("Unable to make chosen address type, please ensure no uncompressed public keys are present."));
+        rj_obj_set(o, "warnings", w);
+    }
+    free(redeem);
+    *res = o;
+    return 1;
+}
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
-    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","uptime","stop", NULL
+    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1187,5 +1306,6 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
     if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
+    if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     return -1;
 }
