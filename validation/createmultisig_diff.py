@@ -13,12 +13,12 @@ Valid on-curve pubkeys are generated here in pure Python (privkeys 1..N times
 G) so the many-key, compressed-vs-uncompressed, and error branches can all be
 exercised with keys Core's HexToPubKey/IsFullyValid accepts.
 
-THE ONE DOCUMENTED DIVERGENCE
-  Core returns an inferred output "descriptor" (sh(multi(...))#cksum etc.). We
-  have no descriptor engine (see FEATURE_GAPS.md) and omit it; this harness
-  strips "descriptor" from both sides before comparing. Everything else -- the
-  address, the redeemScript, and the uncompressed-key "warnings" -- is
-  compared exactly, and RPC error codes are compared for the error cases.
+FULL COMPARE (no divergence)
+  The whole object is compared exactly -- address, redeemScript, the
+  "descriptor" (multi() wrapped in sh/wsh, with Core's 8-char checksum) and
+  the uncompressed-key "warnings" -- and RPC error codes for the error cases.
+  createmultisig's descriptors are mechanical (all keys are known), so unlike
+  decodescript's inferred "desc" they need no descriptor engine.
 
   Note: RPC errors come back over HTTP as 500 + a JSON error body (Bitcoin's
   own JSON-RPC convention); the client reads the body rather than treating 500
@@ -96,10 +96,6 @@ def core(*p):
     return json.loads(r.stdout)
 
 
-def strip(o):
-    return {k: v for k, v in o.items() if k != "descriptor"} if isinstance(o, dict) else o
-
-
 CASES = [
     ("legacy 2of2",       (2, [KC[0], KC[1]])),
     ("legacy 1of1",       (1, [KC[0]])),
@@ -124,13 +120,13 @@ CASES = [
 def main():
     fails = 0
     for name, args in CASES:
-        o, c = strip(ours(*args)), strip(core(*args))
+        o, c = ours(*args), core(*args)
         if o == c:
             print(f"  MATCH  {name}")
         else:
             fails += 1
             print(f"  DIFFER {name}\n    ours={json.dumps(o)}\n    core={json.dumps(c)}")
-    print(f"\n{fails} DIFF(S)" if fails else f"\nALL {len(CASES)} MATCH (modulo descriptor)")
+    print(f"\n{fails} DIFF(S)" if fails else f"\nALL {len(CASES)} MATCH (incl. descriptor)")
     sys.exit(1 if fails else 0)
 
 

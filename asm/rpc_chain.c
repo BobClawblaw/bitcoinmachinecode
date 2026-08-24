@@ -1185,6 +1185,39 @@ static int cms_p2sh_addr(const u8* s, size_t n, char* out, long cap){
     return wallet_script_to_address(out, cap, spk, 23) > 0 && out[0];
 }
 
+/* Core's descriptor checksum (descriptor.cpp DescriptorChecksum): appends the
+ * 8-char "#..." suffix to a descriptor string. Fills out[9]; 0 if `span` holds
+ * a char outside the descriptor input charset. */
+static u64 desc_polymod(u64 c, int val){
+    u8 c0 = (u8)(c >> 35);
+    c = ((c & 0x7ffffffffULL) << 5) ^ (u64)val;
+    if (c0 & 1)  c ^= 0xf5dee51989ULL;
+    if (c0 & 2)  c ^= 0xa9fdca3312ULL;
+    if (c0 & 4)  c ^= 0x1bab10e32dULL;
+    if (c0 & 8)  c ^= 0x3706b1677aULL;
+    if (c0 & 16) c ^= 0x644d626ffdULL;
+    return c;
+}
+static int desc_checksum(const char* span, char out[9]){
+    static const char* IN =
+        "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+    static const char* CK = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    u64 c = 1; int cls = 0, clscount = 0;
+    for (const char* p = span; *p; p++){
+        const char* q = strchr(IN, *p); if (!q) return 0;
+        int pos = (int)(q - IN);
+        c = desc_polymod(c, pos & 31);
+        cls = cls * 3 + (pos >> 5);
+        if (++clscount == 3){ c = desc_polymod(c, cls); cls = 0; clscount = 0; }
+    }
+    if (clscount > 0) c = desc_polymod(c, cls);
+    for (int j = 0; j < 8; ++j) c = desc_polymod(c, 0);
+    c ^= 1;
+    for (int j = 0; j < 8; ++j) out[j] = CK[(c >> (5 * (7 - j))) & 31];
+    out[8] = 0;
+    return 1;
+}
+
 static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
     long long req;
     if (!rpc_param_i64(params, 0, &req, ec, em)) return 0;
@@ -1248,11 +1281,19 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
     for (int i=0;i<n;i++){ redeem[rl++]=(u8)pklen[i]; memcpy(redeem+rl,pk[i],pklen[i]); rl+=pklen[i]; }
     rl += cms_push_count(redeem+rl, n);
     redeem[rl++] = 0xae;
+    /* descriptor inner (canonical lowercase keys): multi(m,k1,k2,...) */
+    char* dinner = malloc((size_t)n * 132 + 32);
+    size_t di = 0;
+    if (dinner){
+        di += (size_t)snprintf(dinner+di, 32, "multi(%d", (int)req);
+        for (int i=0;i<n;i++){ dinner[di++]=','; hex_of(dinner+di, pk[i], (size_t)pklen[i]); di += (size_t)pklen[i]*2; }
+        dinner[di++] = ')'; dinner[di] = 0;
+    }
     free(pk); free(pklen);
 
     if (otype == 0 && rl > 520){
         static char szerr[96]; snprintf(szerr,sizeof szerr,"redeemScript exceeds size limit: %zu > 520", rl);
-        free(redeem); *ec=-8; *em=szerr; return 0; }
+        free(redeem); free(dinner); *ec=-8; *em=szerr; return 0; }
 
     /* 5. address */
     char addr[128]; addr[0]=0;
@@ -1271,11 +1312,27 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
     rj_val* o = rj_obj();
     rj_obj_set(o, "address", rj_str(addr));
     { char* hx = malloc(rl*2+1); if (hx){ hex_of(hx, redeem, rl); rj_obj_set(o,"redeemScript", rj_str(hx)); free(hx); } }
+    /* descriptor: sh(multi..) / wsh(multi..) / sh(wsh(multi..)) + checksum */
+    if (dinner){
+        char* dwrap = malloc(strlen(dinner) + 16);
+        if (dwrap){
+            if (otype == 0)      sprintf(dwrap, "sh(%s)", dinner);
+            else if (otype == 2) sprintf(dwrap, "wsh(%s)", dinner);
+            else                 sprintf(dwrap, "sh(wsh(%s))", dinner);
+            char cks[9];
+            if (desc_checksum(dwrap, cks)){
+                char* desc = malloc(strlen(dwrap) + 10);
+                if (desc){ sprintf(desc, "%s#%s", dwrap, cks); rj_obj_set(o,"descriptor", rj_str(desc)); free(desc); }
+            }
+            free(dwrap);
+        }
+    }
     if (requested_segwit && uncompressed){
         rj_val* w = rj_arr();
         rj_arr_push(w, rj_str("Unable to make chosen address type, please ensure no uncompressed public keys are present."));
         rj_obj_set(o, "warnings", w);
     }
+    free(dinner);
     free(redeem);
     *res = o;
     return 1;
