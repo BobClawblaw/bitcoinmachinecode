@@ -7,6 +7,40 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- slice 11's differential caught a real overlapping-frame-slot bug, in the one place a weaker test would have missed it
+
+bitcoin_checksig.asm (twins of the BASE and WITNESS_V0 checksig hooks)
+passed assembly, passed callee-saved-check (406 functions clean), and
+matched the C on EVERY rejection case. It failed only the ACCEPT cases,
+and only in the final stack BYTES -- sv_run_v's ok/err and the stack DEPTH
+matched exactly, because OP_CHECKSIG pushes false rather than failing the
+script. A differential that compared only return codes would have called
+this twin correct.
+
+Root cause: qy[4] at [rbp-0xf8] and zl[4] at [rbp-0xf0] overlap by 24 of
+their 32 bytes, so pubkey_parse's qy write clobbered the message-hash
+limbs and ecdsa_verify then rejected every VALID signature. Same class as
+incident #31 (a local landing on storage it must not touch) -- and again
+invisible to both static auditors, which check save-area aliasing and
+push/pop balance, not whether two of a function's OWN locals overlap.
+
+Fixed by laying the six 32-byte slots out explicitly and writing the map
+into the file header (r/s/z/zl/qx/qy at -0x90/-0xb0/-0xd0/-0xf0/-0x110/
+-0x130, frame 0x138). 15/15 differential runs now match, including real
+P2PKH and P2WPKH accepts signed by the wallet's own signer.
+
+Two lessons recorded rather than assumed:
+  - an accept case is not optional in a crypto differential. Every
+    reject-only comparison in this campaign's earlier slices is weaker
+    than it looks; the ones with real accepts (slices 8, 9, 10, 11) are
+    the ones that could have caught this shape.
+  - "the gates are green" means the gates' own questions were answered,
+    not that the code is right. Overlapping locals is a third question
+    nothing in the tree asks statically. Filed as a candidate check:
+    every [rbp-N] slot in a function, with its width, tested pairwise for
+    overlap -- mechanically decidable from the frame-map comments this
+    codebase already writes.
+
 ## 2026-08-24 -- phase 2 slices 2-4: classify, BIP141, and the block-path parser twinned; every twin at C parity or better
 
 Continuing the C->asm conversion overnight while the parity rebuild runs.
