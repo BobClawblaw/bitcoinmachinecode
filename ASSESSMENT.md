@@ -10,9 +10,12 @@ The short version, stated before the detail so it cannot be skipped:
 > Bitcoin Core for any real user today. On the one primitive that can be
 > compared like-for-like it is within ~1.2× of libsecp256k1. Its end-to-end
 > speed against Core has **never been measured**. Its consensus correctness is
-> being actively established and is not yet established: twenty-four defects
-> have been found in roughly four days of replay, five of them in the
+> being actively established and is not yet established: **thirty-two** defects
+> have been found (as of 2026-08-24), at least **eight** of them in the
 > chain-splitting direction, and the discovery rate is not yet decelerating.
+> The most recent five were found *after* a clean genesis-to-963,000 replay,
+> by differential testing against Core rather than by replaying — which is the
+> point: a clean replay proves only that no real block was refused.
 
 ---
 
@@ -85,8 +88,18 @@ storage work for the same chain.
 
 ## 4. The correctness picture, which matters more than the speed
 
-**Twenty-four numbered defects in roughly four days of replay** (`LOG.md`,
-incidents #1–#24). The distribution is the interesting part:
+**Thirty-two numbered defects** (`LOG.md`, incidents #1–#32; this section's
+distribution analysis was written at #24 and the shape has held since). The
+five most recent are worth separating out, because none of them was reachable
+by replaying the chain: a `SETcc` that wrote eight bits where eleven numeric
+opcodes needed sixty-four (**5,050 false-ACCEPT divergences** from Core across
+generated scripts, #28); coinbase outputs that must overwrite and did not
+(#29); **BIP30 tested by a shim that implemented it while the daemon did not**
+(#30); a taproot primitive writing its loop counter onto its own saved
+register (#31); and unbounded UTXO probe loops (#32). Core-running miners
+never mined a block that exercises the first three.
+
+The distribution is the interesting part:
 
 - Most were **false rejects** — the safe direction. They stop the replay
   loudly and cost time, not correctness.
@@ -173,8 +186,10 @@ But **"can it replace Bitcoin Core" is not a close question today**: no mining,
 no PSBT, no wallets, no testnet, no light-client indexes, a thin RPC surface,
 and a node that until today crashed the first time a peer pushed it a block.
 And **"is it consensus-correct" is an open question**, not a settled one, with
-five known chain-split-direction defects found so far and a discovery rate that
-has not levelled off.
+at least eight known chain-split-direction defects found so far and a discovery
+rate that has not levelled off — the most recent found by differential testing
+*after* a clean full-chain replay, which is the strongest available evidence
+that a clean replay is not the finish line it looks like.
 
 The right characterisation is: a fast and increasingly capable **consensus
 verification engine**, in the middle of the work that would establish whether

@@ -36,14 +36,18 @@ assembly.
 
 ## Status
 
-**Current state (2026-08-23).** Block-level script verification (Stage D of
+**Current state (2026-08-24).** Block-level script verification (Stage D of
 `PLAN_SCRIPT_VERIFY.md`) has **completed its acceptance test**: a from-scratch,
 full-signature-verification replay of the real mainnet archive, no
 `assumevalid`, genesis through **height 963,000** -- within ~700 blocks of the
 live chain tip -- finishing 2026-08-23 11:25 with **zero rejects and zero
-fatals**. **Thirty-one real defects** were found and fixed along the way, each
+fatals**. **Thirty-two real defects** were found and fixed along the way, each
 with a regression test pinned to real chain data (`LOG.md` has the narrative
 for every one, including the mistakes and the wrong diagnoses).
+
+The node has since been **running live on the real Bitcoin network**, and its
+UTXO set is being **rebuilt from genesis** so that a Core-parity change to what
+the set even contains (below) governs every entry.
 
 **What that does and does not prove, stated first because it is the most
 important thing on this page.** It proves the node accepts everything the real
@@ -79,6 +83,20 @@ across 2,318,056 entries. That one field is a real defect (`LOG.md` incident
 overwrites and we decline to. Count, amount and bogosize are all blind to it —
 only the hash could see it, which is the entire argument for having one.
 
+**The set now holds what Core's chainstate holds, not a superset (2026-08-24).**
+Core's `AddCoin` returns early for provably-unspendable scriptPubKeys (leading
+`OP_RETURN`, or longer than `MAX_SCRIPT_SIZE`), so they **never** enter its
+chainstate. This node stored them: **252,101,123 of 417,948,516 entries** at
+the tip. Nothing was *wrong* -- the differential tooling filtered them at read
+time, which is how the comparisons below were already exact -- but the stored
+set was a superset of Core's, the heartbeat's live count read ~2.5x Core's
+`txouts`, and the equality held only *through a filter*. The filter now runs at
+**write** time in both writers, sharing one implementation with the
+verification tooling so the writer and the checker cannot disagree about the
+definition. The set is being rebuilt from the archive on that basis; the
+completed rebuild is what a no-filter, no-override MuHash comparison will be
+run against.
+
 **Re-verified at the finish line (height 963,000).** The completed replay's set
 was hashed and diffed against Core's `gettxoutsetinfo muhash 963000`:
 **165,847,393 txouts, 20,071,648.00979492 BTC and bogosize 12,989,895,997 all
@@ -88,6 +106,26 @@ MuHash matches byte for byte once **two height fields** are corrected, on two
 outpoints from 2010, both attributable to incident \#29 above and both still
 unspent at the tip. Two wrong fields in 165.8 million entries is the entire
 difference between this node's chainstate and Bitcoin Core's.
+
+**The C is being converted to assembly, with the C kept as the oracle
+(2026-08-24, in progress).** The project's claim is 100% AI-generated machine
+code, and `daemon/` plus the script-verification layer were ~16,100 lines of C
+-- so the honest description was "all consensus *primitives* in assembly,
+orchestration in C". Fourteen modules now have differential-proven assembly
+twins (transaction parsing on both paths, per-input consensus classification,
+BIP141 witness-program classification, the arenas, canonical witness
+stripping, the BIP341 aggregate arena, per-input dispatch, the witness-v0 and
+legacy/P2SH drivers, both checksig hooks, and the BIP143 and BIP341 sighash
+builders). Each twin is compared against the C it replaces over every field it
+writes -- entire preimage buffers, not just digests -- across roughly 80,000
+cases with zero mismatches, and every benchmarked module is at or better than
+the C's speed. **The daemon still runs the C**: the twins are not deployed
+until a replay soak, and that swap is its own change. The campaign's value so
+far is not speed (the glue layer is ~0.003% of block-connect time) but the
+defects the differentials found -- most sharply a frame-slot overlap that made
+assembly reject **every valid signature** while passing every rejection test,
+every static gate, and assembling cleanly. `worklog/2026-08-24.md` has the
+method and the failures.
 
 **Read `ASSESSMENT.md` before drawing conclusions from any of this.** The
 short version: this is a consensus *verification engine*, not a node — no
