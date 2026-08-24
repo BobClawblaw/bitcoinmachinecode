@@ -1051,15 +1051,20 @@ node_drain:
     mov  ecx, 5
     repe cmpsb
     jne  .inv_next
-    ; validate: cons_verify(buf @r13, plen, scratch=[rbp-0x260], cap)
-    ; reserve a fresh scratch under the fixed locals with a sub/add around the call
-    sub  rsp, 0x400
+    ; validate: cons_verify(buf @r13, plen, scratch, cap)
+    ; 2026-08-24 (incident #33's audit): this reserved 0x400 = 1024 bytes of
+    ; stack scratch -- room for 32 txids -- and then told cons_verify the cap
+    ; was 256, i.e. 8192 bytes. Any block with more than 32 transactions
+    ; wrote up to 7 KB past the scratch, over this function's own locals,
+    ; saved registers and return address, on data supplied by a peer. Same
+    ; units confusion as node_sync_multi's cap=64, one step further along:
+    ; there the wrong cap REJECTED valid blocks, here it CORRUPTS THE STACK.
+    ; Uses the shared .bss scratch and its matching cap, like node_sync_multi.
     mov  rdi, r13
     mov  esi, [rbp-0x24]
-    mov  rdx, rsp
-    mov  ecx, 256
+    lea  rdx, [rel drain_txid_scratch]
+    mov  ecx, SYNC_TXID_CAP
     call cons_verify
-    add  rsp, 0x400
     test eax, eax
     jz   .inv_next
     ; block_hash(out@rbp-0x100, buf)
@@ -1508,8 +1513,11 @@ node_ibd_blocks:
     ; got `block`: validate with cons_verify(buf, plen, scratch@rbp-0x540, cap)
     mov  rdi, r14
     mov  esi, [rbp-0x60]
-    lea  rdx, [rbp-0x540]
-    mov  ecx, 256
+    ; 2026-08-24: was scratch=[rbp-0x540] with cap=256. The frame is 0x648
+    ; total, so at most 0x540/32 = 42 txids fit below rbp and a 256-txid cap
+    ; (8192 bytes) runs past rbp into the caller's frame. Same fix.
+    lea  rdx, [rel ibd_txid_scratch]
+    mov  ecx, SYNC_TXID_CAP
     call cons_verify
     test eax, eax
     jz   .fail              ; invalid block body
@@ -1978,6 +1986,8 @@ section .bss
 align 32
 sync_txid_scratch: resb SYNC_TXID_CAP*32   ; node_sync_multi's cons_verify scratch
 global sync_fail_code
+drain_txid_scratch: resb SYNC_TXID_CAP*32  ; node_drain's cons_verify scratch
+ibd_txid_scratch:   resb SYNC_TXID_CAP*32  ; node_ibd_blocks' cons_verify scratch
 sync_fail_code: resd 1                     ; which .fail exit node_sync_multi took   ; node_sync_multi's cons_verify scratch
 
 section .data
