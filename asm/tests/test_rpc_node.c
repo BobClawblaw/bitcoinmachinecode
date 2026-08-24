@@ -65,6 +65,22 @@ int main(void){
     rj_free(r);
     memset(st.peers, 0, sizeof st.peers);   /* reset for the remaining checks */
 
+    /* getmempoolinfo: accurate config, empty for this process's mempool */
+    r = NULL; rc = rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+    ck("getmempoolinfo dispatched", rc == 1 && r != NULL);
+    ck("mempool loaded true", r && S(r,"loaded") && !strcmp(S(r,"loaded"), "1"));
+    ck("mempool size 0", r && S(r,"size") && !strcmp(S(r,"size"), "0"));
+    ck("mempool maxmempool 300MB", r && S(r,"maxmempool") && !strcmp(S(r,"maxmempool"), "300000000"));
+    ck("mempool minrelayfee", r && S(r,"minrelayfee") && !strcmp(S(r,"minrelayfee"), "0.00001000"));
+    rj_free(r);
+    /* getrawmempool: [] non-verbose, {} verbose */
+    r = NULL; rpc_node_dispatch("getrawmempool", NULL, &r, &ec, &em);
+    ck("getrawmempool -> empty array", r && r->typ == RJ_ARR && r->nitems == 0); rj_free(r);
+    { rj_val* pv = rj_parse("[true]", 6);
+      r = NULL; rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      ck("getrawmempool true -> empty object", r && r->typ == RJ_OBJ && r->nmembers == 0);
+      rj_free(r); rj_free(pv); }
+
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);
     ck("unknown method -> -1", rc == -1);
