@@ -7,6 +7,33 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- phase 2 slice 1: the tx parse layer has an asm twin, and porting it surfaced a latent bound-check wrap
+
+bitcoin_txv_parse.asm ports txv_rd_cs + txv_parse with an explicit-state ABI
+(caller passes the input array and witness pool; pool GROWTH stays in C via
+the exported txv_witpool_reserve -- allocation is phase 3's boundary).
+Differential: 9,555 cases, 0 mismatches -- every tx of bench block 413567,
+per-byte truncation fuzz, synthetic segwit shapes (multi-item stacks,
+0xfd/0xfe varints), degenerate shapes (nin=0, 2^64-1 varints, item-count
+over threshold). Reasons compared by strcmp; on accept, every field down to
+individual witness item ptr/len pairs.
+
+Found while porting, NOT fixed (bug-for-bug fidelity so the differential
+stays meaningful): txv_parse's scriptSig bound `(u64)(end-p) < sl+4` WRAPS
+when an 0xff varint encodes sl within 4 of 2^64 -- sl = 2^64-1 passes the
+check whenever 3 bytes remain, stores scriptSiglen = (u32)sl = 0xffffffff,
+and advances p by 3. Core's compactsize reader rejects anything over
+MAX_SIZE = 0x02000000 at read time, so Core never even reaches a bound
+check with such a value. Whether any downstream check saves us (the u32
+truncation feeds sv_verify_script with a length no real buffer backs) needs
+its own differential against Core on a crafted block -- filed as the next
+incident to chase, deliberately BEFORE the twin is wired into the daemon.
+
+The undo_log port earlier tonight went the same way: differential caught
+nothing in the twin but DID catch two wrong absolute expectations in my own
+test (a truncate() that extended, parsing zeros as valid records). The
+oracle pattern keeps proving cheaper than trust, in both directions.
+
 ## 2026-08-23 -- Core parity: unspendable outputs never enter the chainstate; ours held ~252M of them
 
 The heartbeat's `live_utxo=419,779,752` was ~2.5x Core's `txouts=165,847,393`

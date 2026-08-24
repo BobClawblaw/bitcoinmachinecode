@@ -254,8 +254,12 @@ static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
  * the tx bytes, which are stable for the block. Bump-reset per block/tx. */
 typedef struct { const u8** ptr; u32* len; u64 cap, used; } witpool_t;
 static witpool_t g_wit_pool = {0};
+/* Phase 2 slice 1 seam (2026-08-24): bitcoin_txv_parse.asm's twin of
+ * txv_parse keeps pool GROWTH in C -- allocation is phase 3's boundary --
+ * so the reserve gets a non-static name it can call. Same function. */
+u64 txv_witpool_reserve(witpool_t* wp, u64 n);
 /* Reserve n contiguous slots; returns the start offset, or ~0ull on OOM. */
-static u64 witpool_reserve(witpool_t* wp, u64 n){
+u64 txv_witpool_reserve(witpool_t* wp, u64 n){
     if (wp->used + n > wp->cap){
         u64 nc = wp->cap ? wp->cap : 4096;
         while (nc < wp->used + n) nc *= 2;
@@ -487,7 +491,7 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
             u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
             if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
             g_txv_in[i].nwit = (u32)nitems;
-            u64 woff = witpool_reserve(&g_wit_pool, nitems);
+            u64 woff = txv_witpool_reserve(&g_wit_pool, nitems);
             if (woff == ~0ull) { *reason = "out of memory"; return 0; }
             g_txv_in[i].wit_off = (u32)woff;
             for (u64 j=0;j<nitems;j++){
@@ -1033,7 +1037,7 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
             u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
             if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
             e->nwit = (u32)nitems;
-            u64 woff = witpool_reserve(&g_wit_pool, nitems);
+            u64 woff = txv_witpool_reserve(&g_wit_pool, nitems);
             if (woff == ~0ull) { *reason = "out of memory"; return 0; }
             e->wit_off = (u32)woff;
             for (u64 j=0;j<nitems;j++){
@@ -1269,6 +1273,68 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
  * function checks before calling bidx_get). Caller (daemon/utxo_live.c) is
  * responsible for the separate whole-block duplicate-outpoint check BEFORE
  * calling this -- see this section's header comment. */
+/* txvb_classify: the per-input consensus classification, extracted verbatim
+ * from Phase 1's loop body (2026-08-24, phase 2 slice 2 of the C->asm
+ * conversion) so bitcoin_txv_classify.asm can be differentially driven
+ * against it. Maturity, spk copy-out (offset discipline), the taproot gate,
+ * segwit classification including the wrapped/native wprog split, the
+ * unexpected-witness rule, and the legacy fallthrough. Returns 1 ok /
+ * 0 reject with *reason set; caller owns fail_tx_index. Pool passed
+ * explicitly so twin and oracle can use separate pools. */
+u64 txv_bytepool_alloc(bytepool_t* pool, const u8* src, u64 n){
+    return bytepool_alloc(pool, src, n);
+}
+int txvb_classify(txvb_in_t* in, long height, unsigned long long flags,
+                  u64 value, u64 uheight, u64 ucb,
+                  const u8* spk, unsigned long spklen,
+                  bytepool_t* spk_pool, int* has_taproot, const char** reason){
+    if (ucb) {
+        long conf = height - (long)uheight;
+        if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; return 0; }
+    }
+    in->value = value;
+    if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; return 0; }
+    in->spk_off = bytepool_alloc(spk_pool, spk, spklen);
+    if (in->spk_off == ~0ull) { *reason = "out of memory"; return 0; }
+    in->spklen = (u32)spklen;
+
+    if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
+        *has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
+        if (in->scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; return 0; }
+        /* Exact shape (key-path vs script-path, annex or not) isn't
+         * decidable from nwit alone -- taproot_verify_input classifies
+         * it properly in Phase 3. Only the structural "some witness
+         * must be present" rule (BIP341: an empty witness is always
+         * invalid) is checked here. */
+        if (in->nwit == 0) { *reason = "p2tr empty witness"; return 0; }
+        return 1;
+    }
+    if (flags & TXV_FLAG_WITNESS) {
+        u32 wver=0, wplen=0; const u8* wprog=0; int wrapped=0;
+        int cls = sv_classify_segwit(spk, (u32)spklen, in->scriptSig, in->scriptSiglen,
+                                     &wver, &wprog, &wplen, &wrapped);
+        if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; return 0; }
+        if (cls > 0) {
+            if (!wrapped && in->scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; return 0; }
+            if (wver == 0) {
+                in->shape = TXV_SHAPE_WV0; in->wproglen = wplen; in->wrapped = (u8)wrapped;
+                if (wrapped) { in->wprog = wprog; in->wprog_off = 0; }          /* redeemScript: tx bytes, stable */
+                else         { in->wprog = 0; in->wprog_off = (u32)(wprog - spk); } /* program lies inside the spk:
+                              * store an offset and re-derive from the POOL copy at verify time --
+                              * `spk` here is utxo_lsm_get's transient buffer (see spk_off's comment) */
+                if (wplen == 20 && in->nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; return 0; }
+                if (wplen == 32 && in->nwit < 1) { *reason = "p2wsh needs a witnessScript"; return 0; }
+            } else {
+                in->shape = TXV_SHAPE_WPASS;
+            }
+            return 1;
+        }
+        if (in->nwit != 0) { *reason = "unexpected witness on a non-witness script"; return 0; }
+    }
+    in->shape = TXV_SHAPE_LEGACY;
+    return 1;
+}
+
 int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                                 const u8 block_hash32[32], void* lst, void* u, void* bx,
                                 u64* fail_tx_index, const char** reason){
@@ -1326,7 +1392,11 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     }
 
     /* ---- Phase 1: resolve + classify every input, sequential, block-wide
-     * (in-block index first, confirmed set fallback). ---- */
+     * (in-block index first, confirmed set fallback). Classification body
+     * extracted into txvb_classify (2026-08-24, phase 2 slice 2) so the C
+     * and its asm twin can be driven side by side; the resolve (bidx/LSM
+     * lookup) stays here -- it is the caller's coupling to storage, not
+     * classification. Behavior byte-identical to the inline version. ---- */
     int has_taproot = 0;
     for (u64 gi=0; gi<total_nin; gi++){
         txvb_in_t* in = &flat[gi];
@@ -1336,50 +1406,10 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         if (bx) r = bidx_get(bx, (u32)in->tx_index, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
         if (r != 1) r = utxo_lsm_get(lst, u, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
         if (r != 1) { *reason = "input references a missing/already-spent UTXO"; *fail_tx_index = in->tx_index; goto fail; }
-        if (ucb) {
-            long conf = height - (long)uheight;
-            if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; *fail_tx_index = in->tx_index; goto fail; }
+        if (!txvb_classify(in, height, flags, value, uheight, ucb, spk, spklen,
+                           &g_spk_pool, &has_taproot, reason)) {
+            *fail_tx_index = in->tx_index; goto fail;
         }
-        in->value = value;
-        if (spklen > TXV_SPK_CAP) { *reason = "prevout script too large"; *fail_tx_index = in->tx_index; goto fail; }
-        in->spk_off = bytepool_alloc(&g_spk_pool, spk, spklen);
-        if (in->spk_off == ~0ull) { *reason = "out of memory"; *fail_tx_index = in->tx_index; goto fail; }
-        in->spklen = (u32)spklen;
-
-        if (is_p2tr(spk, (u32)spklen) && (flags & TXV_FLAG_TAPROOT)) {
-            has_taproot = 1; in->shape = TXV_SHAPE_P2TR;
-            if (in->scriptSiglen != 0) { *reason = "p2tr scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
-            /* Exact shape (key-path vs script-path, annex or not) isn't
-             * decidable from nwit alone -- taproot_verify_input classifies
-             * it properly in Phase 3. Only the structural "some witness
-             * must be present" rule (BIP341: an empty witness is always
-             * invalid) is checked here. */
-            if (in->nwit == 0) { *reason = "p2tr empty witness"; *fail_tx_index = in->tx_index; goto fail; }
-            continue;
-        }
-        if (flags & TXV_FLAG_WITNESS) {
-            u32 wver=0, wplen=0; const u8* wprog=0; int wrapped=0;
-            int cls = sv_classify_segwit(spk, (u32)spklen, in->scriptSig, in->scriptSiglen,
-                                         &wver, &wprog, &wplen, &wrapped);
-            if (cls < 0) { *reason = "p2sh-wrapped witness program: scriptSig must be exactly one push of the redeemScript"; *fail_tx_index = in->tx_index; goto fail; }
-            if (cls > 0) {
-                if (!wrapped && in->scriptSiglen != 0) { *reason = "witness program scriptSig must be empty"; *fail_tx_index = in->tx_index; goto fail; }
-                if (wver == 0) {
-                    in->shape = TXV_SHAPE_WV0; in->wproglen = wplen; in->wrapped = (u8)wrapped;
-                    if (wrapped) { in->wprog = wprog; in->wprog_off = 0; }          /* redeemScript: tx bytes, stable */
-                    else         { in->wprog = 0; in->wprog_off = (u32)(wprog - spk); } /* program lies inside the spk:
-                                  * store an offset and re-derive from the POOL copy at verify time --
-                                  * `spk` here is utxo_lsm_get's transient buffer (see spk_off's comment) */
-                    if (wplen == 20 && in->nwit != 2) { *reason = "p2wpkh needs exactly 2 witness items"; *fail_tx_index = in->tx_index; goto fail; }
-                    if (wplen == 32 && in->nwit < 1) { *reason = "p2wsh needs a witnessScript"; *fail_tx_index = in->tx_index; goto fail; }
-                } else {
-                    in->shape = TXV_SHAPE_WPASS;
-                }
-                continue;
-            }
-            if (in->nwit != 0) { *reason = "unexpected witness on a non-witness script"; *fail_tx_index = in->tx_index; goto fail; }
-        }
-        in->shape = TXV_SHAPE_LEGACY;
     }
 
     /* ---- Phase 1.5 (taproot phase A): sequential, cheap, and the whole
@@ -1435,3 +1465,14 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
 fail:
     return 0;
 }
+
+/* ---- phase 2 slice 1 test hooks (2026-08-24) ----------------------------
+ * tests/test_txv_parse_diff.c drives the C txv_parse and the asm
+ * txv_parse_asm side by side. The C one is static and writes file-scope
+ * state; these expose exactly enough to compare, same pattern as
+ * utxo_live's test hooks. Not used by the daemon. */
+int txv_test_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason){
+    return txv_parse(tx, txlen, out_nin, reason);
+}
+void* txv_test_in(void){ return g_txv_in; }
+void* txv_test_witpool(void){ return &g_wit_pool; }
