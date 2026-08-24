@@ -77,10 +77,13 @@ harness can compare JSON directly):
   (on-curve, via `pubkey_parse` = Core's `IsFullyValid`), assemble the m-of-n
   redeemScript, and derive the address for `legacy` (P2SH), `p2sh-segwit`
   (P2SH-P2WSH) or `bech32` (P2WSH); uncompressed keys force legacy and add
-  Core's warning; `bech32m` is refused as Core refuses it. Differs only by the
-  omitted `descriptor`. `validation/createmultisig_diff.py` diffs 17 cases vs
-  the oracle — every type, 15/16/17-key count encoding, the uncompressed path,
-  and every error code — all identical modulo `descriptor`.
+  Core's warning; `bech32m` is refused as Core refuses it. **Fully identical to
+  Core, `descriptor` included** — the `multi()`/`sh`/`wsh` string plus Core's
+  8-char descriptor checksum (`descriptor.cpp DescriptorChecksum`), which is
+  mechanical here because every key is known (no descriptor *engine* needed).
+  `validation/createmultisig_diff.py` diffs 17 cases vs the oracle — every
+  type, 15/16/17-key count encoding, the uncompressed path, every error code —
+  all byte-identical.
 - Node: `uptime`, `stop` (these apply to the `bitcoin_rpcd` process).
 
 How it reaches chain state: `bitcoin_rpcd` is a **standalone process**, not
