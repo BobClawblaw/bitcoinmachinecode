@@ -864,6 +864,37 @@ static void format_peer_version_info(char* out, size_t cap){
     snprintf(out, cap, "proto=%u services=0x%llx ua=\"%s\" height=%u", proto, services, ua, height);
 }
 
+/* Fill one shared outbound-peer slot from the last-captured version payload
+ * (g_peer_version_payload, set by the just-completed handshake) + the host
+ * string. Mirrors format_peer_version_info's parse but into structured fields.
+ * Safe to call with g_node_status==NULL (no-op). */
+static void rpc_fill_peer_slot(int slot, const char* host){
+    if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS) return;
+    rpc_peer_t* pr = &g_node_status->peers[slot];
+    memset(pr, 0, sizeof *pr);
+    strncpy(pr->addr, host ? host : "", sizeof pr->addr - 1);
+    pr->inbound = 0;
+    pr->conn_time = (long long)time(NULL);
+    long len = g_peer_version_len;
+    const unsigned char* p = g_peer_version_payload;
+    if (len >= 80){
+        pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
+        unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
+        long off = 80; unsigned long long ualen = 0; int ok = 1;
+        if (p[off] < 0xfd) { ualen = p[off]; off += 1; }
+        else if (p[off]==0xfd){ if(off+3<=len){ ualen=(unsigned)p[off+1]|((unsigned)p[off+2]<<8); off+=3; } else ok=0; }
+        else if (p[off]==0xfe){ if(off+5<=len){ memcpy(&ualen,p+off+1,4); off+=5; } else ok=0; }
+        else { if(off+9<=len){ memcpy(&ualen,p+off+1,8); off+=9; } else ok=0; }
+        if (ok && ualen <= 90 && off+(long)ualen+4 <= len){
+            memcpy(pr->subver, p+off, (size_t)ualen); pr->subver[ualen] = 0;
+            for (unsigned long long k=0;k<ualen;k++) if(pr->subver[k]<0x20||pr->subver[k]>0x7e) pr->subver[k]='.';
+            off += (long)ualen;
+            unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
+        }
+    }
+    pr->used = 1;   /* publish last: readers see a fully-formed slot */
+}
+
 static void log_hash_short(char out[17], const unsigned char hash32[32]){
     static const char hexd[]="0123456789abcdef";
     for(int k=0;k<8;k++){
@@ -2323,6 +2354,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             mux_out_nextretry[mux_n_out]=0;
             { char pv[256]; format_peer_version_info(pv, sizeof pv);
               fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[i], cfd[i], pv); }
+            rpc_fill_peer_slot(mux_n_out, srcpool[i]);   /* publish peer to getpeerinfo */
             mux_n_out++;
         }
         /* close every candidate fd that was NOT promoted into a live leg */
@@ -2345,9 +2377,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * full interval. */
     long long next_reorg_probe_ms = 0;
     for(;;){
-        /* publish outbound peer count + tip for the parent's RPC thread */
+        /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
-            g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24); }
+            g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
+            for(int i=0;i<RPC_MAX_PEERS;i++)                        /* retire dead slots */
+                if(!(i < mux_n_out && mux_out_fd[i] >= 0)) g_node_status->peers[i].used = 0; }
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
@@ -2588,6 +2622,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     mux_out_nextretry[mux_n_out]=0;
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
                       fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[ci], nfd, pv); }
+                    rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
                     mux_n_out++;
                 }
                 /* if outbound_connect to this one hung/refused, move on to next */
