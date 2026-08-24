@@ -20,6 +20,8 @@
 ;
 ; Uses static scratch buffers so the stack frame stays tiny.
 
+%define SERVE_TXID_CAP 80000   ; > 4,000,000/60, the wire max txs per block
+
 default rel
     extern p2p_read
     extern p2p_write
@@ -56,6 +58,7 @@ align 16
 pl_buf:    times (8<<20) db 0     ; receive buffer
 sb_buf:    times (8<<20) db 0     ; single block buffer
 hp_buf:    times (2000*81+8) db 0 ; headers page buffer
+serve_txid_scratch: times SERVE_TXID_CAP*32 db 0  ; cons_verify scratch (own buffer)
 cn_pong:   db "pong",0
 cn_addr:   db "addr",0
 cn_block:  db "block",0
@@ -416,8 +419,15 @@ node_serve_loop:
     ; (idle here) as the scratch source. Returns 1 = valid.
     lea  rdi, [pl_buf]
     mov  rsi, rax             ; s_plen
-    lea  rdx, [hp_buf]        ; scratch
-    mov  rcx, (2000*81+8)     ; cap
+    lea  rdx, [serve_txid_scratch]        ; scratch
+    ; 2026-08-24 (incident #33's audit): this passed (2000*81+8) = 162,008 --
+    ; the headers-page BYTE size -- into cons_verify's 4th parameter, which
+    ; is a txid COUNT. It licensed 162,008*32 = 5.18 MB of writes into
+    ; hp_buf, a 162 KB buffer, i.e. an overflow for any block past ~5,062
+    ; transactions (real mainnet blocks reach ~12,000). hp_buf is also the
+    ; headers page buffer, so the scratch was aliasing live data either way;
+    ; it now has its own.
+    mov  rcx, SERVE_TXID_CAP  ; cap, IN TXIDS
     call cons_verify
     ; cons_verify does NOT preserve r12-r15 (it pushes only rbp/rbx), so it
     ; clobbered the serve loop's fd/ht/st live registers. Restore the ones the
