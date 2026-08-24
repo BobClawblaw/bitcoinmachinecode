@@ -644,7 +644,7 @@ long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned l
                          | ((unsigned long)tx[p+34] << 16) | ((unsigned long)tx[p+35] << 24);
         n += snprintf(out + n, (size_t)(cap - n), " prev_vout %lu\n", pv);
         p += 36;
-        unsigned long sl = get_varint(tx + p, &cc); p += cc; if (p + sl > txlen) return -1;
+        unsigned long sl = get_varint(tx + p, &cc); p += cc; if (p > txlen || sl > txlen - p) return -1;  /* split bound (incident #38) */
         n += snprintf(out + n, (size_t)(cap - n), "       scriptSig[%lu]: ", sl);
         for (unsigned long j = 0; j < sl; j++) n += snprintf(out + n, (size_t)(cap - n), "%02x", tx[p + j]);
         n += snprintf(out + n, (size_t)(cap - n), "\n");
@@ -663,7 +663,7 @@ long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned l
         unsigned long long val = 0;
         for (int j = 0; j < 8; j++) val |= (unsigned long long)tx[p + j] << (8 * j);
         p += 8;
-        unsigned long sl = get_varint(tx + p, &cc); p += cc; if (p + sl > txlen) return -1;
+        unsigned long sl = get_varint(tx + p, &cc); p += cc; if (p > txlen || sl > txlen - p) return -1;  /* split bound (incident #38) */
         char addr[96]; addr[0] = 0;
         wallet_script_to_address(addr, 96, tx + p, (long)sl);
         n += snprintf(out + n, (size_t)(cap - n), "  out[%lu]: value %llu\n", i, val);

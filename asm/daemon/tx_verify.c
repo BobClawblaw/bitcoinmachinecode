@@ -473,7 +473,12 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
         if (p+36 > end) { *reason = "truncated outpoint"; return 0; }
         g_txv_in[i].outpoint = p; p += 36;
         u64 sl = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad scriptSig varint"; return 0; }
-        if ((u64)(end-p) < sl+4) { *reason = "truncated scriptSig/sequence"; return 0; }
+        /* split bound: `(end-p) < sl+4` WRAPS for sl within 4 of 2^64 (an 0xff
+         * compactsize can encode that), accepting a tx Core rejects and
+         * truncating scriptSiglen to 0xFFFFFFFF -- incident #36. This is the
+         * form bitcoin_segwit.c's swtx_parse already uses; neither side can
+         * overflow. Proven by tests/test_txv_cs_maxsize.c. */
+        { u64 avail=(u64)(end-p); if (avail < sl || avail - sl < 4) { *reason = "truncated scriptSig/sequence"; return 0; } }
         g_txv_in[i].scriptSig = p; g_txv_in[i].scriptSiglen = (u32)sl;
         p += sl + 4;
         g_txv_in[i].nwit = 0;
@@ -1013,7 +1018,12 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
         if (p+36 > end) { *reason = "truncated outpoint"; return 0; }
         e->outpoint = p; p += 36;
         u64 sl = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad scriptSig varint"; return 0; }
-        if ((u64)(end-p) < sl+4) { *reason = "truncated scriptSig/sequence"; return 0; }
+        /* split bound: `(end-p) < sl+4` WRAPS for sl within 4 of 2^64 (an 0xff
+         * compactsize can encode that), accepting a tx Core rejects and
+         * truncating scriptSiglen to 0xFFFFFFFF -- incident #36. This is the
+         * form bitcoin_segwit.c's swtx_parse already uses; neither side can
+         * overflow. Proven by tests/test_txv_cs_maxsize.c. */
+        { u64 avail=(u64)(end-p); if (avail < sl || avail - sl < 4) { *reason = "truncated scriptSig/sequence"; return 0; } }
         e->scriptSig = p; e->scriptSiglen = (u32)sl;
         p += sl + 4;
         e->nwit = 0;
