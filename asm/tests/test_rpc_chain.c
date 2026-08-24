@@ -208,7 +208,7 @@ int main(void){
     expect_err("getblockcount before open -> -28", "getblockcount", "[]", -28, "Loading block index...");
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
-    expect_err("unknown method still -32601", "getchaintips", "[]", -32601, "Method not found");
+    expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
 
     long ec; const char* em; rj_val* r;
 
@@ -401,6 +401,17 @@ int main(void){
       snprintf(p, sizeof p, "[\"%s\", 1, \"%s\"]", GENESIS_MERKLE, GENESIS_HASH);
       expect_err("getrawtransaction genesis coinbase", "getrawtransaction", p, -5, "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved");
       expect_err("getrawtransaction bad txid length", "getrawtransaction", "[\"ab\"]", -8, "parameter 1 must be of length 64 (not 2, for 'ab')");
+    }
+
+    /* ---- getchaintips (active tip only; no forks persisted) ---- */
+    {
+        rj_val* r = call("getchaintips", "[]", &ec, &em);
+        ck("getchaintips is a 1-entry array", r && r->typ == RJ_ARR && r->nitems == 1);
+        rj_val* t0 = (r && r->nitems) ? r->items[0] : 0;
+        ck_str("chaintip status active", S(t0,"status"), "active");
+        ck_str("chaintip branchlen 0", S(t0,"branchlen"), "0");
+        ck("chaintip has height + hash", S(t0,"height") && S(t0,"hash"));
+        rj_free(r);
     }
 
     /* ---- decodescript (pure; no archive needed) ---- */
