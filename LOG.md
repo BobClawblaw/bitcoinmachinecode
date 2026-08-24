@@ -7,6 +7,61 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- phase 2 slices 2-4: classify, BIP141, and the block-path parser twinned; every twin at C parity or better
+
+Continuing the C->asm conversion overnight while the parity rebuild runs.
+Every slice follows the same sequence: extract a testable seam in the C if
+needed -> asm twin -> differential over deliberate matrix + real data +
+fuzz -> benchmark -> optimize to parity -> merge. The daemon keeps running
+the C until each twin has soaked; nothing here is deployed yet.
+
+  slice 2  bitcoin_txv_classify.asm   txvb_classify (extracted first)
+           288-case matrix (16 spk shapes x flags x witness counts +
+           maturity boundaries), 0 mismatches.
+  slice 3  bitcoin_segwit_classify.asm  sv_classify_segwit + helpers
+           21,729 cases (versions x lengths exhaustive, every wrapped-spend
+           push form Core's malleation rule distinguishes, 20k fuzz),
+           0 mismatches. Fidelity find: the C's op<=0x4b branch captures
+           OP_0 as a zero-byte DIRECT push -- its small-int arm is dead for
+           0x00; the twin matches the dead-code shape.
+  slice 4  txvb_parse_tx_asm (in bitcoin_txv_parse.asm)  the parser the
+           LIVE daemon runs (slice 1's txv_parse is the test-only single-tx
+           path). 4,901 cases incl. per-byte truncation fuzz and the
+           sizing-cap bound, 0 mismatches.
+
+### The parity pass, and what it taught
+
+First benchmarks showed two twins SLOWER than gcc -O2: parse on
+witness-heavy txs (1.165x) and the segwit classifier's common paths
+(1.08x). One cause both times: call/frame overhead around leaf logic the C
+compiler inlines. Two fixes, both keeping the gates clean by construction:
+
+  - rd_cs helper -> RDCS macro. The SysV-pure helper (chosen over widening
+    callee-saved-check's allowlist) spilled the cursor around every varint
+    read; a macro expands inline, cursor stays in rbx, and the gate sees
+    only the containing function's normal save/restore.
+  - sv_classify_segwit_asm: frameless fast path. Native-program and
+    not-P2SH verdicts need no calls, so they now pay no prologue; only the
+    P2SH-wrapped path (which calls hash160 anyway) builds a frame.
+
+Measured after (taskset -c 25, busy box, both sides equally contended,
+best-of-N; ratios are asm/C):
+
+  parse 400-in legacy      712 ->  602 ns   0.845
+  parse 50-in segwit       291 ->  230 ns   0.793   (was 1.165)
+  classify p2pkh/p2wpkh/p2tr   ~5.8/5.8/3.9 ns      0.96-1.00
+  segwit-cls native        1.9 ->  0.9 ns   0.490   (was 1.078)
+  segwit-cls wrapped     135.1 -> 134.8 ns  0.998   (was 1.088)
+  segwit-cls legacy        1.7 ->  0.9 ns   0.516
+  undo append             0.78 -> 0.73 us   0.939   (syscall-bound)
+  undo replay 5k recs      968 ->  963 us   0.995   (syscall-bound)
+
+Every row at or below 1.0. The honest reading stands: this layer is
+~0.003% of connect time (a 50-input segwit tx parses in 230ns and verifies
+in ~1,200,000ns); phases 1-2 are purity work. The one real perf item of
+the evening remains the RIPEMD-160 unroll (3.33 -> 1.15 ns/B, 2.9x, Core
+parity) -- BENCHMARKS.md tier 1 updated with the measured row.
+
 ## 2026-08-24 -- phase 2 slice 1: the tx parse layer has an asm twin, and porting it surfaced a latent bound-check wrap
 
 bitcoin_txv_parse.asm ports txv_rd_cs + txv_parse with an explicit-state ABI
