@@ -98,13 +98,22 @@ typedef struct {
     uint64_t out_total;
 } mv_tx_t;
 
-static uint64_t rd_cs(const uint8_t** p){
-    const uint8_t* b = *p; uint8_t f = *b++;
+/* Bounded compactsize (incident #37, 2026-08-24): the previous rd_cs took no
+ * `end` and read 1/3/5/9 bytes unconditionally, so on the no-PoW inbound-tx
+ * path a varint near the buffer's end read up to 8 bytes past it. It also let
+ * the CALLERS use `p + len > end` bounds that overflow for attacker-supplied
+ * lengths near 2^64 (the same wrap as incident #36, here on a peer-reachable
+ * path with no PoW gate). Now it bounds the encoding read and sets *ok=0 on
+ * truncation; callers use split bounds that cannot overflow. */
+static uint64_t rd_cs(const uint8_t** p, const uint8_t* end, int* ok){
+    const uint8_t* b = *p;
+    if (b >= end){ *ok = 0; return 0; }
+    uint8_t f = *b++;
     uint64_t v;
     if (f < 0xfd) v = f;
-    else if (f == 0xfd){ v = b[0]|((uint64_t)b[1]<<8); b += 2; }
-    else if (f == 0xfe){ v = 0; for(int i=0;i<4;i++) v |= (uint64_t)b[i]<<(8*i); b += 4; }
-    else { v = 0; for(int i=0;i<8;i++) v |= (uint64_t)b[i]<<(8*i); b += 8; }
+    else if (f == 0xfd){ if (end - b < 2){*ok=0;return 0;} v = b[0]|((uint64_t)b[1]<<8); b += 2; }
+    else if (f == 0xfe){ if (end - b < 4){*ok=0;return 0;} v = 0; for(int i=0;i<4;i++) v |= (uint64_t)b[i]<<(8*i); b += 4; }
+    else { if (end - b < 8){*ok=0;return 0;} v = 0; for(int i=0;i<8;i++) v |= (uint64_t)b[i]<<(8*i); b += 8; }
     *p = b; return v;
 }
 
@@ -112,34 +121,38 @@ static uint64_t rd_cs(const uint8_t** p){
 static int mv_parse(mv_tx_t* T){
     const uint8_t* tx = T->tx; const uint8_t* end = tx + T->txlen;
     if (T->txlen < 10) return 0;
-    const uint8_t* p = tx;
+    const uint8_t* p = tx; int ok = 1;
     T->version = 0; for(int i=0;i<4;i++) T->version |= (uint64_t)p[i]<<(8*i);
     p += 4;
     int segwit = (p[0]==0x00 && p[1]==0x01);
     if (segwit) p += 2;
-    uint64_t nin = rd_cs(&p);
-    if (nin == 0 || nin > 16) return 0;
+    uint64_t nin = rd_cs(&p, end, &ok);
+    if (!ok || nin == 0 || nin > 16) return 0;
     T->nin = nin;
     for (uint64_t i=0;i<nin;i++){
         inrec_t* in = &T->in[i];
         if (p + 36 > end) return 0;
         memcpy(in->outpoint, p, 36); p += 36;
-        uint64_t sl = rd_cs(&p);
-        if (p + sl + 4 > end) return 0;
+        uint64_t sl = rd_cs(&p, end, &ok);
+        if (!ok) return 0;
+        /* split bound: (end-p) must hold sl + 4, computed so neither side
+         * overflows for sl near 2^64 (incident #37, the #36 wrap on the
+         * mempool path). */
+        { uint64_t avail = (uint64_t)(end - p); if (avail < sl || avail - sl < 4) return 0; }
         if (sl > sizeof in->scriptSig) return 0;
         memcpy(in->scriptSig, p, sl); in->scriptSiglen = (uint32_t)sl; p += sl;
         in->sequence = (uint32_t)(p[0]|(p[1]<<8)|(p[2]<<16)|((uint32_t)p[3]<<24)); p += 4;
     }
-    uint64_t nout = rd_cs(&p);
-    if (nout > 16) return 0;
+    uint64_t nout = rd_cs(&p, end, &ok);
+    if (!ok || nout > 16) return 0;
     T->nout = nout;
     T->out_total = 0;
     for (uint64_t i=0;i<nout;i++){
         if (p + 8 > end) return 0;
         uint64_t v = 0; for(int k=0;k<8;k++) v |= (uint64_t)p[k]<<(8*k); p += 8;
         T->out_total += v;
-        uint64_t sl = rd_cs(&p);
-        if (p + sl > end) return 0; p += sl;
+        uint64_t sl = rd_cs(&p, end, &ok);
+        if (!ok || sl > (uint64_t)(end - p)) return 0; p += sl;
     }
     /* witness: no overall stack-count field on the wire -- exactly one
      * stack per input, back-to-back (Core's SerializeTransaction writes
@@ -147,17 +160,26 @@ static int mv_parse(mv_tx_t* T){
     if (segwit){
         for (uint64_t i=0;i<nin;i++){
             inrec_t* in = &T->in[i];
-            uint64_t nitems = rd_cs(&p);
-            if (nitems > MV_MAX_WIT) return 0;
+            uint64_t nitems = rd_cs(&p, end, &ok);
+            if (!ok || nitems > MV_MAX_WIT) return 0;
             in->nwit = (uint32_t)nitems;
             for (uint64_t j=0;j<nitems;j++){
-                uint64_t il = rd_cs(&p);
-                if (p + il > end) return 0;
+                uint64_t il = rd_cs(&p, end, &ok);
+                if (!ok || il > (uint64_t)(end - p)) return 0;
                 in->wit[j] = p; in->witlen[j] = (uint32_t)il; p += il;
             }
         }
     }
     return 1;
+}
+/* incident #37 test hook: expose mv_parse's verdict and the parsed witness
+ * length of input 0 so a test can prove the fix rejects at PARSE rather than
+ * accepting with a truncated length that a resolve-failure happens to hide. */
+int mv_test_parse(const uint8_t* tx, long txlen, uint32_t* wl0_out){
+    mv_tx_t T; memset(&T,0,sizeof T); T.tx=tx; T.txlen=txlen;
+    int r = mv_parse(&T);
+    if (wl0_out) *wl0_out = (r && T.nin>0 && T.in[0].nwit>0) ? T.in[0].witlen[0] : 0;
+    return r;
 }
 
 /* Resolve the prevout script+amount for every input from the UTXO set. */

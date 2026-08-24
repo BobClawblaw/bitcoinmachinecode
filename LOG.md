@@ -7,6 +7,51 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #37: the mempool-path parser had an unbounded compactsize reader and the #36 wrap, on the NO-PoW path
+
+Chasing #36 into the mempool path (user's call). The inbound-`tx` handler
+(bitcoin_serve.asm .do_tx) validates a peer-supplied transaction with only a
+`plen >= 10` guard, then calls tx_accept_validate -> txval_modern ->
+mv_parse. Unlike the block path, there is NO PoW/merkle gate here: any peer
+that sends a `tx` message reaches this parser directly.
+
+mv_parse (bitcoin_txval_modern.c) had two defects on that path:
+
+  1. `rd_cs` took no `end` and read 1/3/5/9 bytes UNCONDITIONALLY, so a
+     compactsize near the buffer end read up to 8 bytes PAST it -- a real,
+     if small, OOB read on attacker data, happening every time a peer sent a
+     tx with a truncated trailing varint.
+  2. The length bounds `p + sl + 4 > end`, `p + sl > end`, `p + il > end`
+     are pointer-overflow UB for attacker-supplied lengths near 2^64 -- the
+     same wrap as #36, here unguarded on the no-PoW path.
+
+SEVERITY, stated honestly. I probed txval_modern with crafted witness/output
+lengths near 2^64 in forked children to catch a crash. None crashed: the
+pointer wraps BACKWARD by a small amount (stays mapped), the loops
+terminate, and mv_parse returns with a truncated `witlen = (u32)il =
+0xFFFFFFFF` internally. A resolve failure (or downstream re-parse) then
+masks it. So this is UB + a bounded OOB read on a peer-reachable path -- a
+genuine memory-safety defect -- but NOT a demonstrated crash or RCE, and I
+will not label it one without a repro.
+
+THE FIX. rd_cs now takes `end` and sets *ok=0 on truncation; every bound is
+the split form that cannot overflow (matching swtx_parse and the #36 fix).
+Added an mv_test_parse hook because the external verdict is masked by
+resolve: tests/test_mv_parse_bounds.c shows the wrap/oversize/truncated
+inputs now reject at PARSE (parse=0) where before mv_parse reached `return
+1` with witlen=0xFFFFFFFF, while a well-formed tx still parses (parse=1,
+witlen=1). The existing 23-check test_mempool_accept_modern still passes, so
+legitimate P2WPKH/P2WSH acceptance is unchanged.
+
+Pattern (now four instances: #33/#34 cons_verify caps, #36 block parser, #37
+mempool parser): every hand-written compactsize/length bound in this codebase
+needs auditing against overflow, and the SAFE forms already exist in the tree
+(swtx_parse's split bound, the C `sizeof/32` caps). The unsafe ones are all
+literals or ad-hoc arithmetic written where the safe form wasn't reused.
+
+Committed to branch `csfix` alongside #36; the merge and full 160-harness
+suite wait until the tier-3 run finishes.
+
 ## 2026-08-24 -- incident #36: the scriptSig-length bound wrapped, accepting a tx Core rejects (filed during slice 1, now fixed)
 
 Filed 2026-08-24 during the slice-1 port and deliberately left bug-for-bug in
