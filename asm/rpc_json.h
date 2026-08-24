@@ -60,8 +60,15 @@ rj_val* rj_obj_get(const rj_val* o, const char* key);
 /* Serialize v into out using Core's write() semantics.
  * pretty>0: Core pretty format (indent = pretty spaces/depth).
  * pretty==0: compact (no whitespace), still Core-exact.
- * Appends NUL. Returns bytes written (excl. NUL). out must hold cap bytes. */
+ * Appends NUL, truncating to cap-1 bytes if the value is larger. Returns the
+ * value's FULL length excl. NUL (may exceed cap -- never use it as a length
+ * into `out`; a return >= cap means the output was truncated). */
 long rj_write(char* out, long cap, const rj_val* v, int pretty);
+
+/* Serialize into a malloc'd, NUL-terminated buffer sized to the value (no
+ * truncation). Returns the buffer (caller frees); *len_out gets its length
+ * excl. NUL. For responses of unbounded size. NULL only on OOM. */
+char* rj_write_alloc(const rj_val* v, int pretty, long* len_out);
 
 /* Deep-free a value tree. */
 void rj_free(rj_val* v);

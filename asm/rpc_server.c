@@ -244,10 +244,14 @@ static void handle_request(int cfd, const char* body, size_t blen) {
 
     if (is_v2_notification && reply) { rj_free(reply); reply = NULL; status = HTTP_NO_CONTENT; }
 
-    char bodybuf[262144];
+    /* Body is sized to the value: getblock/getrawtransaction on a real block
+     * is many MB. A fixed buffer + rj_write's returned length used as the
+     * write() size was an out-of-bounds read that leaked process memory to the
+     * client (and produced invalid JSON past the buffer). */
+    char* respbody = NULL;
     long bodylen = 0;
     if (reply) {
-        bodylen = rj_write(bodybuf, sizeof bodybuf, reply, 0);
+        respbody = rj_write_alloc(reply, 0, &bodylen);
         rj_free(reply);
         if (bodylen < 0) bodylen = 0;
     }
@@ -260,7 +264,12 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "\r\n",
         status, status_text(status), bodylen);
     write(cfd, hdr, (size_t)hl);
-    if (bodylen > 0) write(cfd, bodybuf, (size_t)bodylen);
+    for (long off = 0; respbody && off < bodylen; ) {   /* full write, handles short writes */
+        ssize_t wr = write(cfd, respbody + off, (size_t)(bodylen - off));
+        if (wr <= 0) break;
+        off += wr;
+    }
+    free(respbody);
     close(cfd);
 }
 

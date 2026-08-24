@@ -194,11 +194,29 @@ long rj_write(char* out, long cap, const rj_val* v, int pretty) {
     sbuf s = {0, 0, 0};
     unsigned indent = 0;
     rj_w(&s, v, pretty, indent);
-    long n = (long)s.len;
-    if (n > cap) n = cap;
-    if (cap > 0) { memcpy(out, s.buf, (size_t)n); out[n] = 0; }
+    if (cap > 0) {
+        long n = (long)s.len;
+        if (n > cap - 1) n = cap - 1;          /* leave room for NUL (was: out[cap] OOB) */
+        if (n > 0) memcpy(out, s.buf, (size_t)n);
+        out[n] = 0;
+    }
+    long len = (long)s.len;
     free(s.buf);
-    return s.len;
+    return len;
+}
+
+/* Serialize into a freshly malloc'd, NUL-terminated buffer sized exactly to the
+ * value (no truncation). Returns the buffer (caller frees) and, via *len_out,
+ * its length excluding the NUL. Use this for responses of unbounded size --
+ * a fixed stack buffer + rj_write's returned length is an out-of-bounds read
+ * waiting to happen. Returns NULL only on allocation failure. */
+char* rj_write_alloc(const rj_val* v, int pretty, long* len_out) {
+    sbuf s = {0, 0, 0};
+    rj_w(&s, v, pretty, 0);
+    if (!s.buf) { s.buf = malloc(1); if (s.buf) s.buf[0] = 0; }
+    else s.buf[s.len] = 0;                      /* sb_push keeps cap >= len+1 */
+    if (len_out) *len_out = (long)s.len;
+    return s.buf;
 }
 
 void rj_free(rj_val* v) {
