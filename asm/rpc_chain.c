@@ -529,11 +529,18 @@ static const char* script_type(const u8* s, size_t n){
     }
     return "nonstandard";
 }
-/* ScriptToUniv(include_hex=true, include_address=true) minus "desc" */
-static rj_val* script_pubkey_json(const u8* s, size_t n){
+static char* desc_inner_of(const u8* s, size_t n);        /* InferDescriptor, defined below */
+static char* desc_with_checksum(const char* inner);
+
+/* ScriptToUniv(include_hex=true, include_address=true). want_desc adds the
+ * inferred "desc" (after asm) as Core does for tx outputs; decodescript's
+ * segwit passes 0 because it supplies its own provider-aware desc. */
+static rj_val* script_pubkey_json_x(const u8* s, size_t n, int want_desc){
     rj_val* o = rj_obj();
     char* a = script_asm(s, n, 0);
     rj_obj_set(o, "asm", rj_str(a ? a : "")); free(a);
+    if (want_desc){ char* di = desc_inner_of(s, n); char* dc = desc_with_checksum(di);
+                    if (dc){ rj_obj_set(o, "desc", rj_str(dc)); free(dc); } free(di); }
     char* h = malloc(n*2 + 1); if (h){ hex_of(h, s, n); rj_obj_set(o, "hex", rj_str(h)); free(h); }
     const char* type = script_type(s, n);
     if (strcmp(type, "pubkey") != 0){
@@ -609,7 +616,7 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w){
         rj_val* out = rj_obj();
         rj_obj_set(out, "value", amount_json(val));
         rj_obj_set(out, "n", rj_numf("%llu", i));
-        rj_obj_set(out, "scriptPubKey", script_pubkey_json(p, sl));
+        rj_obj_set(out, "scriptPubKey", script_pubkey_json_x(p, sl, 1));
         p += sl;
         rj_arr_push(vout, out);
     }
@@ -1200,7 +1207,7 @@ static int cmd_decodescript(const rj_val* params, rj_val** res, long* ec, const 
             if (!strcmp(type,"pubkey")){ u8 h[20]; hash160(h, s+1, (long long)s[0]); wspk[0]=0x00; wspk[1]=0x14; memcpy(wspk+2,h,20); wl=22; }
             else if (!strcmp(type,"pubkeyhash")){ wspk[0]=0x00; wspk[1]=0x14; memcpy(wspk+2, s+3, 20); wl=22; }
             else { u8 h[32]; sha256_full(h, s, (long long)n); wspk[0]=0x00; wspk[1]=0x20; memcpy(wspk+2,h,32); wl=34; }
-            rj_val* sr = script_pubkey_json(wspk, wl);   /* asm/hex/address/type */
+            rj_val* sr = script_pubkey_json_x(wspk, wl, 0);   /* segwit supplies its own desc below */
             /* segwit desc: P2WPKH -> addr() (no inner known); P2WSH -> wsh(inner
              * descriptor of the original script), matching Core's provider. */
             char* sdc;
