@@ -41,13 +41,22 @@ assembly.
 full-signature-verification replay of the real mainnet archive, no
 `assumevalid`, genesis through **height 963,000** -- within ~700 blocks of the
 live chain tip -- finishing 2026-08-23 11:25 with **zero rejects and zero
-fatals**. **Thirty-two real defects** were found and fixed along the way, each
-with a regression test pinned to real chain data (`LOG.md` has the narrative
+fatals**. **Thirty-five real defects** were found and fixed along the way, each
+with a regression test or a live-node reproduction (`LOG.md` has the narrative
 for every one, including the mistakes and the wrong diagnoses).
 
-The node has since been **running live on the real Bitcoin network**, and its
-UTXO set is being **rebuilt from genesis** so that a Core-parity change to what
-the set even contains (below) governs every entry.
+The UTXO set was then **rebuilt from genesis** so a Core-parity change to what
+the set even contains (below) governs every entry, and the node now **follows
+the live Bitcoin network unattended**. That last clause is deliberately
+understated, because for most of 2026-08-24 it was not true and this file
+said it was: the node advanced its tip only when restarted, sat 80 blocks
+behind the network for 14.5 hours while reporting `peers=8/8`, and the failing
+sync path logged nothing (incident #33). The cause was a consensus-check
+scratch buffer told it had room for 64 transactions when tip blocks carry
+thousands; auditing that one function found the same units error at three
+more call sites, two of them corrupting the stack on peer-supplied block data
+(#34). With those fixed the node keeps pace with Core block-for-block, which
+is verified continuously against a local Core node rather than asserted.
 
 **What that does and does not prove, stated first because it is the most
 important thing on this page.** It proves the node accepts everything the real
