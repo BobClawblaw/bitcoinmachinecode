@@ -254,8 +254,12 @@ static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
  * the tx bytes, which are stable for the block. Bump-reset per block/tx. */
 typedef struct { const u8** ptr; u32* len; u64 cap, used; } witpool_t;
 static witpool_t g_wit_pool = {0};
+/* Phase 2 slice 1 seam (2026-08-24): bitcoin_txv_parse.asm's twin of
+ * txv_parse keeps pool GROWTH in C -- allocation is phase 3's boundary --
+ * so the reserve gets a non-static name it can call. Same function. */
+u64 txv_witpool_reserve(witpool_t* wp, u64 n);
 /* Reserve n contiguous slots; returns the start offset, or ~0ull on OOM. */
-static u64 witpool_reserve(witpool_t* wp, u64 n){
+u64 txv_witpool_reserve(witpool_t* wp, u64 n){
     if (wp->used + n > wp->cap){
         u64 nc = wp->cap ? wp->cap : 4096;
         while (nc < wp->used + n) nc *= 2;
@@ -487,7 +491,7 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
             u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
             if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
             g_txv_in[i].nwit = (u32)nitems;
-            u64 woff = witpool_reserve(&g_wit_pool, nitems);
+            u64 woff = txv_witpool_reserve(&g_wit_pool, nitems);
             if (woff == ~0ull) { *reason = "out of memory"; return 0; }
             g_txv_in[i].wit_off = (u32)woff;
             for (u64 j=0;j<nitems;j++){
@@ -1033,7 +1037,7 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
             u64 nitems = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad witness item-count varint"; return 0; }
             if (nitems > TXV_MAX_WIT_ITEMS) { *reason = "too many witness items"; return 0; }
             e->nwit = (u32)nitems;
-            u64 woff = witpool_reserve(&g_wit_pool, nitems);
+            u64 woff = txv_witpool_reserve(&g_wit_pool, nitems);
             if (woff == ~0ull) { *reason = "out of memory"; return 0; }
             e->wit_off = (u32)woff;
             for (u64 j=0;j<nitems;j++){
@@ -1435,3 +1439,14 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
 fail:
     return 0;
 }
+
+/* ---- phase 2 slice 1 test hooks (2026-08-24) ----------------------------
+ * tests/test_txv_parse_diff.c drives the C txv_parse and the asm
+ * txv_parse_asm side by side. The C one is static and writes file-scope
+ * state; these expose exactly enough to compare, same pattern as
+ * utxo_live's test hooks. Not used by the daemon. */
+int txv_test_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason){
+    return txv_parse(tx, txlen, out_nin, reason);
+}
+void* txv_test_in(void){ return g_txv_in; }
+void* txv_test_witpool(void){ return &g_wit_pool; }
