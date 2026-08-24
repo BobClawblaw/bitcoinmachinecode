@@ -890,6 +890,23 @@ static int ts_has_op_success(const uint8_t* s, uint64_t n){
  * execdata.m_codeseparator_pos. (Until 2026-08-21 this was not tracked and
  * any tapscript containing a raw 0xab byte -- even inside push data, e.g.
  * a pubkey -- was refused outright; that scan is gone.) */
+/* Phase 2 slice 13a seams (2026-08-24): two statics the asm twin needs.
+ * tap_txctx_export mirrors the C's guarded block exactly -- it writes the
+ * three fields ONLY when tx_parse succeeds and n_in is in range, leaving
+ * the caller's zeros otherwise. */
+int ts_has_op_success_export(const uint8_t* s, uint64_t n){ return ts_has_op_success(s, n); }
+void tap_txctx_export(const uint8_t* tx, int64_t txlen, int64_t n_in,
+                      uint32_t* ver, uint32_t* lt, uint32_t* seq){
+    static __thread uint32_t* tv_off_x;
+    BMC_TLS_BUF(tv_off_x, TS_OFF_ENTRIES * sizeof(uint32_t));
+    txview_t v; v.tx = tx; v.txlen = txlen;
+    if (tx_parse(&v, tv_off_x) && n_in >= 0 && n_in < v.nin) {
+        *ver = (uint32_t)v.version;
+        *lt  = v.locktime;
+        *seq = tx_seq(&v, n_in);
+    }
+}
+
 int taproot_verify_input(const uint8_t* spk,
                          const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
                          const uint8_t* tx, int64_t txlen, int64_t n_in,
