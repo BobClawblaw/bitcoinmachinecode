@@ -16,7 +16,8 @@
 ;   - the compactsize reader here is bitcoin_segwit.c's read_cs, which
 ;     REJECTS non-canonical encodings (v < min for its width) -- stricter
 ;     than tx_verify's txv_rd_cs. RDCSC below implements that contract.
-;   - the walk-phase scriptSig bound is `avail < sl + 4` with the same
+;   - the walk-phase scriptSig bound was `avail < sl + 4` (wrap); FIXED to the
+;     split form (incident #38) matching the C. The header note below
 ;     64-bit wrap for sl within 4 of 2^64 as the C (and as txv_parse; see
 ;     LOG.md 2026-08-24 -- the Core-differential for that class is filed).
 ;   - the emit-phase per-input bound is the C's own documented
@@ -189,8 +190,10 @@ strip_witness_asm:
     RDCSC .fail                          ; sl
     mov  rdx, r12
     sub  rdx, rbx                        ; avail
-    lea  rcx, [rax+4]                    ; sl + 4 (wrap fidelity, see header)
-    cmp  rdx, rcx
+    cmp  rdx, rax                        ; avail < sl ? (split bound, incident #38 --
+    jb   .fail                           ;   the C strip_witness fixed the same wrap)
+    sub  rdx, rax                        ; avail - sl
+    cmp  rdx, 4
     jb   .fail
     lea  rbx, [rbx+rax+4]
     inc  qword [rbp-0x60]

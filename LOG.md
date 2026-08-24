@@ -7,6 +7,56 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-24 -- incident #38: the overflow audit -- every hand-written length bound, classified and fixed
+
+After #33/#34/#36/#37 all turned out to be the same units/overflow error, a
+systematic sweep of every length bound in the consensus, network, mempool,
+RPC and wallet code. The complete catalog (grep for `p + len > end` and
+`avail < len + K` across all .c and the length-bounding .asm):
+
+  UNSAFE, consensus/peer-reachable:
+    daemon/tx_verify.c:476,1016   txv_parse           block path   FIXED #36
+    bitcoin_txval_modern.c:142,155 mv_parse           mempool      FIXED #37
+    bitcoin_mempool_policy.c:194  parse_inputs        mempool      FIXED here
+    bitcoin_scriptverify.c:162    sv_get_locktime_ctx every verify FIXED here
+    bitcoin_segwit.c:316 (+twin)  strip_witness       sighash      FIXED here
+
+  UNSAFE, RPC/wallet (user input, not peer consensus):
+    rpc_chain.c:354               tx_walk                          FIXED here
+    wallet_core.c:647,666         wallet_decoderawtx               FIXED here
+
+  ALREADY SAFE (the audit clears these, not everything grep flags is a bug):
+    bitcoin_bip143.asm:235        swtx twin      already split form (slice 12)
+    bitcoin_segwit.c swtx_parse   already split form
+    rpc_commands.c:425,482        varint reader caps at the 4-byte form (no
+                                  0xff), sl <= 4 GB so pos+sl cannot wrap, and
+                                  the read is gated by sl <= 128/256. Safe.
+
+Every fix is the same transform to the split form that cannot overflow
+(`avail < len || avail - len < 4`, or `len > avail`), the form swtx_parse
+and bitcoin_bip143.asm already used correctly. It is strictly MORE
+conservative: it rejects exactly the old set PLUS the near-2^64 wrap values,
+and no legitimate length is within 4 of 2^64, so no valid input changes
+verdict. The strip_witness asm twin's walk-phase bound was fixed to match
+its now-fixed C (the differential confirms twin == C: 10,243 cases pass).
+
+Verified: the daemon builds clean with all edits; the strip_witness
+differential and the 23-check test_mempool_accept_modern both still pass. Two
+of these (mempool_policy parse_inputs, mv_parse) are on the no-PoW inbound-tx
+path; the other three are re-parsers on the verify path, gated by the primary
+parsers but hardened anyway since a re-parser must not trust its input.
+
+The root pattern, now the closing note on this cluster: a length bound
+written as `pointer + attacker_length` or `avail < attacker_length + K`
+overflows, and this codebase wrote it that way in EIGHT places while the safe
+split form sat in the same tree. The lesson is not "fix these eight" but
+"the safe form must be the only form" -- a candidate lint (flag any
+`+ <non-constant> > end` or `< <non-constant> + <constant>` in a bounds
+context) is filed alongside the overlapping-locals checker.
+
+Committed to branch csfix with #36/#37; full suite + merge held for after the
+tier-3 run.
+
 ## 2026-08-24 -- incident #37: the mempool-path parser had an unbounded compactsize reader and the #36 wrap, on the NO-PoW path
 
 Chasing #36 into the mempool path (user's call). The inbound-`tx` handler
