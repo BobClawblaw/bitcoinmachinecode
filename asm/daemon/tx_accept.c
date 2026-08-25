@@ -159,11 +159,28 @@ static u8   g_pol[128];
 static void* g_pol_state = 0;
 static int   g_pol_ready = 0;
 
+/* Shared-mempool coherence (daemon/mempool_cfg.c): when the mempool region is
+ * the MAP_SHARED pre-fork one, the POLICY state (fee/ancestor registry) is a
+ * shared pre-fork region too, and every mutation must hold the cross-process
+ * lock. Both are no-ops / null in the static per-process fallback. */
+extern void* mp_ext_polstate;
+extern unsigned long mp_ext_polstate_n;
+extern void mp_lock(void);
+extern void mp_unlock(void);
+
 /* tx_policy_init(void) -> 1 ok / 0 failed. Called once per connection
  * alongside tx_dispatch_init. */
 int tx_policy_init(void){
     mpool_policy_init(g_pol, TXACC_RELAY_FEE_RATE, TXACC_MAX_ANC, TXACC_MAX_ANC_BYTES,
                       TXACC_MAX_DESC, TXACC_MAX_DESC_BYTES, TXACC_RBF_ENABLED);
+    if (mp_ext_polstate){
+        /* shared, already mpool_policy_state_init'd once pre-fork -- adopting
+         * it (NOT re-initing) is what keeps fee bookkeeping coherent across
+         * the worker, inbound children, and the parent's RPC thread. */
+        g_pol_state = mp_ext_polstate;
+        g_pol_ready = 1;
+        return 1;
+    }
     size_t sz = mpool_policy_state_size(TXACC_POLICY_STATE_N);
     g_pol_state = malloc(sz);
     if (!g_pol_state){ fprintf(stderr, "[tx_accept] policy state malloc failed\n"); return 0; }
@@ -199,7 +216,10 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
         fprintf(stderr, "[tx_accept] reject (txval): %s\n", txval_modern_reason());
         return 0;
     }
-    if (mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo) != 1){
+    mp_lock();
+    long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    mp_unlock();
+    if (padd != 1){
         fprintf(stderr, "[tx_accept] reject (policy): %s\n", mpool_policy_reason(g_pol));
         return 0;
     }
@@ -232,7 +252,10 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
         if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
         return -26;
     }
-    if (mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo) != 1){
+    mp_lock();
+    long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    mp_unlock();
+    if (padd != 1){
         const char* r = mpool_policy_reason(g_pol);
         if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
         fprintf(stderr, "[tx_accept] reject (policy): %s\n", r ? r : "");

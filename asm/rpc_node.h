@@ -67,6 +67,21 @@ typedef struct {
 void rpc_node_set_status(const node_status_t* st);
 void rpc_node_set_status_rw(node_status_t* st);
 
+/* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED
+ * pre-fork region) so getrawmempool/getmempoolinfo report the real pool
+ * instead of this process's empty copy. Everything is optional: all-NULL (the
+ * standalone rpcd, or the static per-process fallback) keeps the previous
+ * empty-pool reporting. lk/ulk are the cross-process lock; time_of/fee lookups
+ * may be NULL independently (fields degrade to absent/zero bookkeeping).
+ * Passed as pointers rather than read via extern so rpc_node.o does not drag
+ * daemon/mempool_cfg.c into every test binary that links it. */
+void rpc_node_set_mempool(void* mp, void* polstate, long long maxbytes,
+                          long (*count)(void*),
+                          void (*lk)(void), void (*ulk)(void),
+                          long (*time_of)(const unsigned char*),
+                          long (*pol_entry)(void*, const unsigned char*,
+                                            unsigned long long*, unsigned long long*));
+
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
 

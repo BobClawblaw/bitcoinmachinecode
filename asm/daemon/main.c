@@ -2769,6 +2769,19 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     else
         fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
+     * mempool_configure, written by the worker + inbound children) so
+     * getrawmempool/getmempoolinfo report the real pool. All-null when the
+     * static per-process fallback is in play (maxmempool=0). */
+    { extern void* mp_ext_area; extern void* mp_ext_polstate;
+      extern unsigned long mp_ext_blobcap;
+      extern void mp_lock(void); extern void mp_unlock(void);
+      extern long mempool_time_of(const unsigned char*);
+      extern long mpool_policy_entry(void*, const unsigned char*,
+                                     unsigned long long*, unsigned long long*);
+      extern long mpool_count(void*);
+      rpc_node_set_mempool(mp_ext_area, mp_ext_polstate, (long long)mp_ext_blobcap,
+                           mpool_count, mp_lock, mp_unlock, mempool_time_of, mpool_policy_entry); }
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){

@@ -89,6 +89,72 @@ int main(void){
       ck("getrawmempool true -> empty object", r && r->typ == RJ_OBJ && r->nmembers == 0);
       rj_free(r); rj_free(pv); }
 
+    /* ---- injected SHARED mempool (2026-08-25 coherence slice): the daemon
+     * hands the pre-fork MAP_SHARED pool to this layer via
+     * rpc_node_set_mempool; here a local pool stands in for it. Two entries:
+     * a legacy tx (vsize == size) and a segwit tx with a known witness split
+     * (weight = base*3 + total), so both arms of the vsize parser are pinned.
+     * The txids are what the pool was keyed with; getrawmempool must render
+     * them REVERSED (display order). ---- */
+    { extern void mpool_init(void*, unsigned long, void*, unsigned long);
+      extern long mpool_put(void*, const unsigned char*, const unsigned char*, unsigned long);
+      extern unsigned long mpool_struct_size(unsigned long);
+      extern long mpool_count(void*);
+      static unsigned char pool[40 + 1024*48 + 8];
+      static unsigned char blob[1<<16];
+      mpool_init(pool, 1024, blob, sizeof blob);
+      /* legacy: the createrawtransaction P2PKH KAT tx (85 bytes, no witness) */
+      static const char* LHEX = "020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000";
+      static unsigned char ltx[200]; unsigned long lln = strlen(LHEX)/2;
+      for (unsigned long i=0;i<lln;i++){ unsigned hv; sscanf(LHEX+2*i,"%2x",&hv); ltx[i]=(unsigned char)hv; }
+      unsigned char lid[32]; memset(lid, 0x5A, 32);
+      /* segwit: same body with marker+flag and one 2-item witness stack
+       * (71B sig + 33B pubkey): total = 85 + 2 + 107 = 194, base = 85,
+       * weight = 85*3 + 194 = 449, vsize = ceil(449/4) = 113. */
+      static unsigned char wtx[400]; unsigned long wln = 0;
+      memcpy(wtx, ltx, 4); wln = 4;                     /* version */
+      wtx[wln++]=0x00; wtx[wln++]=0x01;                 /* marker+flag */
+      memcpy(wtx+wln, ltx+4, lln-8); wln += lln-8;      /* ins/outs (no locktime) */
+      wtx[wln++]=0x02;                                  /* 2 witness items */
+      wtx[wln++]=71; for (int i=0;i<71;i++) wtx[wln++]=0x11;
+      wtx[wln++]=33; for (int i=0;i<33;i++) wtx[wln++]=0x22;
+      memcpy(wtx+wln, ltx+lln-4, 4); wln += 4;          /* locktime */
+      unsigned char wid[32]; memset(wid, 0xA5, 32);
+      ck("test pool: put legacy", mpool_put(pool, lid, ltx, lln) == 1);
+      ck("test pool: put segwit", mpool_put(pool, wid, wtx, wln) == 1);
+      rpc_node_set_mempool(pool, NULL, 8388608, mpool_count, NULL, NULL, NULL, NULL);
+
+      r = NULL; rpc_node_dispatch("getrawmempool", NULL, &r, &ec, &em);
+      ck("shared pool: getrawmempool has 2 txids", r && r->typ == RJ_ARR && r->nitems == 2);
+      int saw_l=0, saw_w=0;
+      /* display order = reversed bytes: lid -> 64 x '5a', wid -> 64 x 'a5' */
+      for (unsigned long i=0; r && i<r->nitems; i++){
+          if (r->items[i]->str && !strncmp(r->items[i]->str,"5a5a",4) && strlen(r->items[i]->str)==64) saw_l=1;
+          if (r->items[i]->str && !strncmp(r->items[i]->str,"a5a5",4) && strlen(r->items[i]->str)==64) saw_w=1;
+      }
+      ck("shared pool: both txids present (display order)", saw_l && saw_w);
+      rj_free(r);
+
+      { rj_val* pv = rj_parse("[true]", 6);
+        r = NULL; rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+        ck("shared pool: verbose -> object of 2", r && r->typ == RJ_OBJ && r->nmembers == 2);
+        rj_val* went = r ? rj_obj_get(r, "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5") : NULL;
+        ck("verbose segwit vsize 113 (weight 449)", went && S(went,"vsize") && !strcmp(S(went,"vsize"),"113")
+           && S(went,"weight") && !strcmp(S(went,"weight"),"449"));
+        rj_val* lent = r ? rj_obj_get(r, "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a") : NULL;
+        ck("verbose legacy vsize == size (85)", lent && S(lent,"vsize") && !strcmp(S(lent,"vsize"),"85")
+           && S(lent,"weight") && !strcmp(S(lent,"weight"),"340"));
+        rj_free(r); rj_free(pv); }
+
+      r = NULL; rpc_node_dispatch("getmempoolinfo", NULL, &r, &ec, &em);
+      ck("shared pool: getmempoolinfo size 2", r && S(r,"size") && !strcmp(S(r,"size"),"2"));
+      ck("shared pool: bytes = 85 + 113 = 198 (vsize sum)", r && S(r,"bytes") && !strcmp(S(r,"bytes"),"198"));
+      ck("shared pool: maxmempool = injected 8388608", r && S(r,"maxmempool") && !strcmp(S(r,"maxmempool"),"8388608"));
+      rj_free(r);
+
+      /* detach again so the empty-pool checks stay valid for later runs */
+      rpc_node_set_mempool(NULL, NULL, 300000000LL, NULL, NULL, NULL, NULL, NULL); }
+
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);
     ck("unknown method -> -1", rc == -1);
