@@ -17,6 +17,19 @@ strategy per class:
 - **Wallet-state RPCs** (send*, balance, history, multiwallet) → round-trip and
   own-node consistency; oracle-diff not available. Stated as such, not claimed.
 
+### gettxoutsetinfo — RPC WIRED 2026-08-25 (capstone-gated for live proof)
+daemon/utxo_setinfo_rpc.c #includes the standalone parity TOOL's translation
+unit (main renamed -- the test_dial_budget pattern), inheriting its
+fingerprint/quiescence discipline, applied-height reading, and memtable
+sizing VERBATIM: the tool -- the capstone's measuring instrument -- is
+untouched, and the two readers cross-check each other. The RPC REFUSES
+(busy) while the datadir is being written; there is no --force. DOCUMENTED
+DIVERGENCES: our default hash_type is muhash (Core's hash_serialized_3 is
+refused by name with a clear message); no coinstatsindex extras
+(total_unspendable_amount/block_info); height = the UTXO APPLIED height.
+Cross-check on the parked pre-rebuild state: RPC reader and tool agree
+field-for-field. Live end-to-end proof lands with the capstone.
+
 ## Current surface (verified present)
 Chain/util: getblock*, getrawtransaction, gettxoutproof/verify, decodescript,
 createmultisig, getdescriptorinfo, deriveaddresses, getchaintips, uptime, stop.
