@@ -16,6 +16,8 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern long p2p_write(int fd, const char *cmd, unsigned cmdlen, const void *payload, unsigned plen);
@@ -32,6 +34,14 @@ static void p32le(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v
 static void p64le(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
 
 int main(int argc, char**argv){
+    /* data directory: default ./data (per repo layout), override with
+       BITCOIN_DATA_DIR or argv[2]. Created + chdir'd so headers.dat (and
+       later the full block store) land there. */
+    const char *dd = getenv("BITCOIN_DATA_DIR");
+    if (!dd) dd = (argc>2) ? argv[2] : "data";
+    mkdir(dd, 0755);
+    chdir(dd);
+
     /* genesis: header used for the first locator. */
     unsigned char genesis[80]; int go=0;
     unsigned char gh_ser[80];  /* full 80-byte genesis header */
