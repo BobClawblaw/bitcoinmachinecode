@@ -83,7 +83,8 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 ### T8 — PSBT (BIP174)
 - [~] createpsbt (v0, Core-validated) + decodepsbt (byte-identical to Core) DONE.
       This also fixed incident #44: decoderawtransaction was minimal; now routes
-      through rpc_chain's full tx_to_json (Core shape). converttopsbt + combinepsbt + joinpsbts DONE.
+      through rpc_chain's full tx_to_json (Core shape). converttopsbt + combinepsbt + joinpsbts +
+      analyzepsbt DONE.
       joinpsbts: Core SHUFFLES inputs/outputs (privacy) so there is no byte-stable target; ours is
       deterministic (P1-first concat) and verified SEMANTICALLY vs Core (Core's decodepsbt reads our
       output as v0 / version 2 / locktime 0 with the identical input+output multiset). Remaining:
@@ -118,19 +119,25 @@ getindexinfo. Every remaining item is blocked on one of:
   store per-block nTx only); getblockfilter needs blockfilterindex; scanblocks.
 - **policy divergence we don't chase**: getdeploymentinfo (script_flags).
 
-### analyzepsbt — ground truth captured (node/psbt.cpp), deferred
-Implementation needs three pieces we don't yet have wired into the PSBT path:
-(1) is_final requires ACTUAL script+signature VERIFICATION of the final
-witness/scriptSig against the spk (not just field presence); (2) the "missing"
-object needs a Solver/dummy-signer; (3) estimated_vsize/feerate needs a
-dummy-signed size estimate. Live-verified Core outputs to match when it lands:
-- bare v0 (no UTXO): input {has_utxo:false,is_final:false,next:"updater"},
-  top next:"updater", NO fee.
-- P2WPKH witness_utxo only (hash known, pubkey NOT): has_utxo:true,
-  is_final:false, next:"updater", missing:{pubkeys:[<hash160 from spk>]},
-  and fee IS computed (sum(utxo)-sum(out)) because all inputs have a UTXO.
-- next:"signer" only when the pubkey is known but a sig is missing (e.g. a
-  P2WSH/multisig whose witness_script lists the pubkeys).
+### analyzepsbt — LANDED 2026-08-25 (14-vector live diff vs oracle, all match)
+Full role machine (updater<signer<finalizer<extractor, psbt next = min over
+inputs), missing pubkeys/signatures/redeemscript/witnessscript, fee, and
+estimated_vsize/feerate. Non-obvious Core behaviors replicated (each found by
+live-diffing, then confirmed in Core source):
+- witness_utxo-only + non-witness-resolving script: Core's require_witness_sig
+  early-return in SignPSBTInput fires BEFORE out_sigdata is filled, so ALL
+  "missing" info is dropped (next=updater, no missing) -- same script via
+  non_witness_utxo DOES report missing.
+- dummy sig for vsize estimation is 71 bytes (DummySignatureCreator(32,32):
+  32+32+7), not 72 -- 2-input P2WPKH vsize is 180 (72 would give 181).
+- P2SH-wrapped witness adds the redeem push to scriptSig (P2SH-P2WPKH: 136).
+- estimated_feerate uses CFeeRate = floor-toward-neg-inf division (negative
+  fee -50000/136vB -> -0.00367648, not truncation's -367647).
+DOCUMENTED DIVERGENCE: is_final is presence-of-final-field based; Core re-runs
+full script verification on final data (a deliberately corrupt final witness
+reads final here, not in Core). Conformant PSBTs match. Taproot inputs and
+inner-multisig missing-sets fall to next=updater with no missing (no schnorr
+signer / CHECKMULTISIG solver in the RPC path yet).
 
 ## Process
 One tranche at a time: worktree → implement → hermetic + oracle tests → full
