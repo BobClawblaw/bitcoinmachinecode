@@ -2577,13 +2577,26 @@ mac_lsm_reload_impl:
     ; older-run key then drove it negative). ----
     cmp  qword [rbp-0x108], 0
     je   .rl_recount
-    ; new-format manifest: base = persisted RUNS-ONLY count, plus the WAL
-    ; tail's net (pushes - dels). The base was persisted with the WAL empty
-    ; (at the last flush), so the tail rescanned above is exactly the ops not
-    ; yet folded into it -- base + delta double-counts nothing.
-    mov  rax, [rbp-0x110]            ; persisted base (runs-only)
-    add  rax, [rbp-0x118]            ; + WAL tail PUSHes
-    sub  rax, [rbp-0x120]            ; - WAL tail DELs
+    ; new-format manifest with an EMPTY WAL tail (the clean-shutdown case):
+    ; the persisted RUNS-ONLY base is exact as-is.
+    ;
+    ; INCIDENT #45 (2026-08-25): the old arithmetic here -- base + tail
+    ; PUSHes - tail DELs -- assumed "the base was persisted with the WAL
+    ; empty, so the tail is exactly the ops not yet folded". A kill landing
+    ; BETWEEN the flush's manifest write and its WAL truncate breaks that
+    ; assumption undetectably: the manifest's base already CONTAINS the
+    ; tail's ops, and base+tail then double-counts the tail's net. That is
+    ; exactly how the ghost-heal rebuild's counter drifted +7,890,418 while
+    ; the walk (and the set itself -- muhash-proven) stayed correct
+    ; (tests/test_lsm_count_drift.c reproduces the window byte-for-byte).
+    ; The v2 manifest cannot distinguish a folded tail from an unfolded one,
+    ; so a NON-EMPTY tail now always takes the exact recount below --
+    ; O(total run records), paid only on unclean-shutdown boots (a clean
+    ; close flushes, leaving the tail empty and this fast path intact).
+    mov  rax, [rbp-0x118]            ; WAL tail PUSHes
+    or   rax, [rbp-0x120]            ; | WAL tail DELs
+    jnz  .rl_recount                  ; any tail at all -> exact recount
+    mov  rax, [rbp-0x110]            ; persisted base (runs-only, tail empty)
     mov  [r12+88], rax
     mov  rax, r15
     jmp  .rl_ret
