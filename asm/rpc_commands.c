@@ -770,6 +770,74 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
     return 1;
 }
 
+/* combinepsbt (Core rpc/rawtransaction.cpp): merge PSBTs for the SAME unsigned
+ * tx by unioning each map's key-value pairs (dedup by key; first occurrence
+ * wins). Returns the merged base64 PSBT. */
+typedef struct { const unsigned char* k; unsigned long kl; const unsigned char* v; unsigned long vl; } psbt_kv;
+static int psbt_parse_map(const unsigned char* buf, long blen, long* pp, psbt_kv* kvs, int cap){
+    int n=0; long p=*pp;
+    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if(kl==0){ *pp=p; return n; }
+        const unsigned char* k=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* v=buf+p; p+=vl;
+        if(n<cap){ kvs[n].k=k;kvs[n].kl=kl;kvs[n].v=v;kvs[n].vl=vl;n++; }
+    }
+    *pp=p; return n;
+}
+static int psbt_union(psbt_kv* dst, int dn, int dcap, const psbt_kv* src, int sn){
+    for(int i=0;i<sn && dn<dcap;i++){
+        int dup=0; for(int j=0;j<dn;j++) if(dst[j].kl==src[i].kl && !memcmp(dst[j].k,src[i].k,src[i].kl)){ dup=1; break; }
+        if(!dup) dst[dn++]=src[i];
+    }
+    return dn;
+}
+static long psbt_ser_map(unsigned char* out, const psbt_kv* kvs, int n){
+    long o=0;
+    for(int i=0;i<n;i++){ o+=crt_varint(out+o,(unsigned long long)kvs[i].kl); memcpy(out+o,kvs[i].k,kvs[i].kl); o+=kvs[i].kl;
+        o+=crt_varint(out+o,(unsigned long long)kvs[i].vl); memcpy(out+o,kvs[i].v,kvs[i].vl); o+=kvs[i].vl; }
+    out[o++]=0x00; return o;
+}
+#define PSBT_MAXP 16
+#define PSBT_MAXKV 128
+#define PSBT_MAXIO 1000
+static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_ARR||params->items[0]->nitems<1){
+        *ec=-8; *em="Invalid parameter, expected an array of base64 PSBTs"; return 0; }
+    const rj_val* arr=params->items[0]; int np=(int)arr->nitems; if (np>PSBT_MAXP) np=PSBT_MAXP;
+    static unsigned char bufs[PSBT_MAXP][200000]; long blens[PSBT_MAXP];
+    const unsigned char* utx0=NULL; unsigned long utx0len=0;
+    static psbt_kv gkv[PSBT_MAXKV]; int gn=0;
+    static psbt_kv ikv[PSBT_MAXIO][PSBT_MAXKV]; static int in_n[PSBT_MAXIO];
+    static psbt_kv okv[PSBT_MAXIO][PSBT_MAXKV]; static int out_n[PSBT_MAXIO];
+    long n_in=-1, n_out=-1;
+    for (int pi=0; pi<np; pi++){
+        if (arr->items[pi]->typ!=RJ_STR){ *ec=-22; *em="TX decode failed"; return 0; }
+        if (!crt_b64dec(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi]) || blens[pi]<5 || memcmp(bufs[pi],"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+        long p=5;
+        psbt_kv g[PSBT_MAXKV]; int g_n=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
+        const unsigned char* utx=NULL; unsigned long utxl=0;
+        for (int j=0;j<g_n;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
+        if (!utx){ *ec=-22; *em="Only PSBTv0 (with an unsigned tx) can be combined"; return 0; }
+        if (!utx0){ utx0=utx; utx0len=utxl;
+            unsigned long cc; long q=4; n_in=(long)srw_varint(utx+q,&cc); q+=cc;
+            for (long k=0;k<n_in;k++){ q+=36; unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl+4; }
+            n_out=(long)srw_varint(utx+q,&cc);
+            if (n_in>PSBT_MAXIO||n_out>PSBT_MAXIO){ *ec=-22; *em="PSBT too large to combine"; return 0; }
+            for (long k=0;k<n_in;k++) in_n[k]=0;
+            for (long k=0;k<n_out;k++) out_n[k]=0;
+        } else if (utxl!=utx0len || memcmp(utx,utx0,utxl)){ *ec=-8; *em="PSBTs do not refer to the same transactions."; return 0; }
+        gn=psbt_union(gkv,gn,PSBT_MAXKV,g,g_n);
+        for (long k=0;k<n_in;k++){ psbt_kv m[PSBT_MAXKV]; int mn=psbt_parse_map(bufs[pi],blens[pi],&p,m,PSBT_MAXKV); in_n[k]=psbt_union(ikv[k],in_n[k],PSBT_MAXKV,m,mn); }
+        for (long k=0;k<n_out;k++){ psbt_kv m[PSBT_MAXKV]; int mn=psbt_parse_map(bufs[pi],blens[pi],&p,m,PSBT_MAXKV); out_n[k]=psbt_union(okv[k],out_n[k],PSBT_MAXKV,m,mn); }
+    }
+    static unsigned char out[220000]; long n=0;
+    out[n++]=0x70;out[n++]=0x73;out[n++]=0x62;out[n++]=0x74;out[n++]=0xff;
+    n+=psbt_ser_map(out+n,gkv,gn);
+    for (long k=0;k<n_in;k++)  n+=psbt_ser_map(out+n,ikv[k],in_n[k]);
+    for (long k=0;k<n_out;k++) n+=psbt_ser_map(out+n,okv[k],out_n[k]);
+    char* b64=malloc((size_t)((n+2)/3)*4+1); if(!b64){ *ec=-7; *em="oom"; return 0; }
+    crt_b64(b64,out,n); *result=rj_str(b64); free(b64);
+    return 1;
+}
+
 /* ---- signrawtransactionwithkey (pure, no wallet state) ---------------------
  * Core rpc/rawtransaction.cpp signrawtransactionwithkey. Signs an unsigned tx
  * with explicitly provided keys against provided prevtxs, returning
@@ -994,7 +1062,7 @@ int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
-        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt",
+        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -1035,6 +1103,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_decodepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "converttopsbt"))
         return cmd_converttopsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "combinepsbt"))
+        return cmd_combinepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
