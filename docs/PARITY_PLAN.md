@@ -64,9 +64,18 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 - [ ] submitblock, prioritisetransaction
 
 ### T4 — Mempool coherence
-- [ ] Flip mp_ext_area to MAP_SHARED + add bitcoin_mempool slot iterator
-- [ ] Real getrawmempool (verbose object) from the shared mempool
-- [ ] getmempoolinfo real size/bytes/usage
+- [x] mp_ext_area/blob/policy-state MAP_SHARED, init-once pre-fork
+      (mp_ext_inited; serve.asm adopts, never re-inits), PROCESS_SHARED
+      mp_lock over every C mutation site (accept, expiry, reorg reconcile).
+      Proven hermetically: tests/test_mempool_shared (cross-fork visibility).
+- [x] Real getrawmempool from the shared pool (txid array; verbose entries
+      carry vsize/weight/time/fees.base -- full ancestor/descendant
+      aggregates land with getmempoolentry) + getmempoolinfo real
+      size/bytes/usage/total_fee/maxmempool. BUILD-SIDE ONLY so far: the live
+      daemon still runs the MAP_PRIVATE build; deploy batched post-rebuild,
+      then live-verify (inbound tx -> parent getrawmempool).
+- [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (needs a
+      parent-index walk over the shared policy graph -- state is shared now)
 
 ### T5 — Fee estimation
 - [ ] estimatesmartfee / estimaterawfee from mempool feerate buckets + recent blocks
