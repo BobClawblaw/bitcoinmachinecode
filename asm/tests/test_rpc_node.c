@@ -45,6 +45,8 @@ int main(void){
     st.peers[0].services = 0x0000000000000409ULL;   /* NETWORK|WITNESS|NETWORK_LIMITED */
     strcpy(st.peers[0].subver, "/Satoshi:27.0.0/"); st.peers[0].start_height = 800000;
     st.peers[0].conn_time = 1700000000LL;
+    st.peers[0].bytes_sent = 4096; st.peers[0].bytes_recv = 1048576;
+    st.peers[0].last_send = 1700000100LL; st.peers[0].last_recv = 1700000200LL;
     st.peers[3].used = 1; strcpy(st.peers[3].addr, "5.6.7.8:8333"); st.peers[3].proto = 70016;
     rpc_node_set_status(&st);
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
@@ -57,6 +59,9 @@ int main(void){
       ck("peer0 services hex", p0 && S(p0,"services") && !strcmp(S(p0,"services"), "0000000000000409"));
       ck("peer0 inbound false", p0 && S(p0,"inbound") && !strcmp(S(p0,"inbound"), "0"));
       ck("peer0 id 0", p0 && S(p0,"id") && !strcmp(S(p0,"id"), "0"));
+      ck("peer0 bytessent", p0 && S(p0,"bytessent") && !strcmp(S(p0,"bytessent"), "4096"));
+      ck("peer0 bytesrecv", p0 && S(p0,"bytesrecv") && !strcmp(S(p0,"bytesrecv"), "1048576"));
+      ck("peer0 lastrecv", p0 && S(p0,"lastrecv") && !strcmp(S(p0,"lastrecv"), "1700000200"));
       rj_val* sn = p0 ? rj_obj_get(p0,"servicesnames") : 0;
       ck("peer0 servicesnames NETWORK+WITNESS+NETWORK_LIMITED", sn && sn->typ==RJ_ARR && sn->nitems==3); }
     /* second peer should get id 1 (contiguous ids, not the slot index) */

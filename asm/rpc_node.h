@@ -24,6 +24,10 @@ typedef struct {
     char                      subver[96];   /* peer user-agent */
     volatile int              start_height; /* peer's startingheight */
     volatile long long        conn_time;    /* unix secs at connect */
+    volatile long long        bytes_sent;   /* kernel TCP_INFO, per-socket */
+    volatile long long        bytes_recv;
+    volatile long long        last_send;    /* unix secs of last data sent */
+    volatile long long        last_recv;    /* unix secs of last data recv */
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
