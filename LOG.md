@@ -7,6 +7,24 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- RPC full-field audit (post-#44): two more parity gaps closed
+
+Applying the incident-#44 lesson (spot-checked "done" RPCs hide gaps), did a
+systematic full-field diff of the existing RPC surface against the oracle. Most
+(getblock/getblockheader/getrawtransaction/getchaintips/decodescript/
+createmultisig/getblockchaininfo) were already complete. Two real gaps found and
+fixed:
+  1. getmempoolinfo emitted "minrelayfee" -- Core's field is "minrelaytxfee".
+     Renamed; also added the released policy fields permitbaremultisig +
+     maxdatacarriersize. (Master-only cluster fields limitclustercount/size/
+     optimal are deliberately omitted -- bleeding-edge, no release has them.)
+  2. getdescriptorinfo/deriveaddresses rejected addr()/raw() descriptors with
+     "Invalid descriptor function". Added both: addr(<address>) builds the spk
+     from the address, raw(<hex>) takes the script directly; both issolvable=
+     false (no key). Verified byte-for-byte vs oracle (P2PKH/bech32 addr, raw).
+getnetworkinfo's only "missing" fields (tx_send_rate, inv_buckets) are master-
+only telemetry, correctly omitted.
+
 ## 2026-08-25 -- incident #44: decoderawtransaction returned a minimal, non-Core shape
 
 Found while building decodepsbt (its "tx" field reuses the tx decoder).
