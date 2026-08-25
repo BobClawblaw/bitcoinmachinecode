@@ -741,6 +741,67 @@ static int cmd_getdifficulty(rj_val** res, long* ec, const char** em){
     *res = rj_double(difficulty_of(bits));   /* Core: difficulty of the current tip */
     return 1;
 }
+
+/* getnetworkhashps (Core rpc/mining.cpp GetNetworkHashPS): estimated network
+ * hashes/sec from the cumulative-work delta over a window of `nblocks` blocks
+ * ending at `height` (defaults 120, tip). Computed from chainwork.dat + header
+ * timestamps -- no UTXO dependency, so verifiable now. arith_uint256.getdouble()
+ * replicated word-by-word (high 32-bit word first). */
+static double gnh_getdouble(const u8 w[16]){
+    double r=0; for (int i=3;i>=0;i--) r = r*4294967296.0 + (double)rd32(w+i*4); return r;
+}
+static int cmd_getnetworkhashps(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec=-28; *em="Loading block index..."; return 0; }
+    long nblocks=120, height=-1;
+    if (param_present(params,0)){ long long v; if(!rpc_param_i64(params,0,&v,ec,em)) return 0; nblocks=(long)v; }
+    if (param_present(params,1)){ long long v; if(!rpc_param_i64(params,1,&v,ec,em)) return 0; height=(long)v; }
+    if (nblocks < -1 || nblocks == 0){ *ec=-8; *em="Invalid nblocks. Must be a positive number or -1."; return 0; }
+    if (height < -1 || height > tip){ *ec=-8; *em="Block does not exist at specified height"; return 0; }
+    long pbh = (height>=0) ? height : tip;
+    if (pbh == 0){ *res=rj_numf("%d",0); return 1; }
+    if (nblocks == -1) nblocks = pbh % 2016 + 1;
+    if (nblocks > pbh) nblocks = pbh;
+    u8 hdr[80];
+    if (read_block_prefix(pbh, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+    long mn=(long)rd32(hdr+68), mx=mn, pb0=pbh;
+    for (long i=0;i<nblocks;i++){ pb0--;
+        if (read_block_prefix(pb0, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+        long t=(long)rd32(hdr+68); if(t<mn)mn=t; if(t>mx)mx=t; }
+    if (mn==mx){ *res=rj_numf("%d",0); return 1; }
+    u8 cw1[16], cw0[16];
+    if (!chainwork_at(pbh,cw1) || !chainwork_at(pb0,cw0)){ *ec=-1; *em="Chainwork not available"; return 0; }
+    u8 wd[16]; int borrow=0;
+    for (int i=0;i<16;i++){ int d=(int)cw1[i]-(int)cw0[i]-borrow; if(d<0){d+=256;borrow=1;}else borrow=0; wd[i]=(u8)d; }
+    *res = rj_double(gnh_getdouble(wd) / (double)(mx-mn));
+    return 1;
+}
+
+/* getmininginfo (Core rpc/mining.cpp): the documented v31 field set -- blocks,
+ * bits, difficulty, networkhashps, pooledtx, chain, warnings. The master oracle
+ * adds bleeding-edge fields (target, next, blockmintxfee) the project policy
+ * does not chase; the shared fields are oracle-verifiable. pooledtx reflects
+ * THIS process's mempool (0 for the read-only rpcd / listen=0 node, as
+ * getmempoolinfo). */
+static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec=-28; *em="Loading block index..."; return 0; }
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+    u32 bits = rd32(hdr+72);
+    rj_val* o = rj_obj();
+    rj_obj_set(o,"blocks", rj_numf("%ld", tip));
+    { char b[9]; snprintf(b,sizeof b,"%08x",(unsigned)bits); rj_obj_set(o,"bits", rj_str(b)); }
+    rj_obj_set(o,"difficulty", rj_double(difficulty_of(bits)));
+    { rj_val* nh=NULL; long e2; const char* m2;
+      if (cmd_getnetworkhashps(NULL,&nh,&e2,&m2)) rj_obj_set(o,"networkhashps", nh);
+      else rj_obj_set(o,"networkhashps", rj_numf("%d",0)); }
+    rj_obj_set(o,"pooledtx", rj_numf("%d", 0));
+    rj_obj_set(o,"chain", rj_str("main"));
+    rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
+    *res = o;
+    return 1;
+}
+
 static int cmd_getbestblockhash(rj_val** res, long* ec, const char** em){
     long tip = refresh();
     u8 rec[48];
@@ -1828,7 +1889,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getchaintips","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getchaintips","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1849,6 +1910,8 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
     if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
     if (!strcmp(m, "getblockstats")) return cmd_getblockstats(params, res, ec, em);
+    if (!strcmp(m, "getnetworkhashps")) return cmd_getnetworkhashps(params, res, ec, em);
+    if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
