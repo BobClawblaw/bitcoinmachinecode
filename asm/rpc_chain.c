@@ -49,7 +49,8 @@
  */
 #include "rpc_chain.h"
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
-#include "script_flags_consts.h"  /* buried-deployment heights, generated from
+#include "script_flags_consts.h"
+#include "block_filter.h"   /* BIP158 basic filters, Core-byte-validated */  /* buried-deployment heights, generated from
                                    * Core's chainparams -- the SAME parse the
                                    * script-flag path assembles against */
 #include "mempool_entry.h"
@@ -2577,13 +2578,341 @@ static int cmd_waitforblock(const rj_val* params, rj_val** res, long* ec, const 
     return 1;
 }
 
+/* ==== BIP158 filters: getblockfilter / scanblocks / getdescriptoractivity =
+ * The construction lives in block_filter.c and is validated byte-for-byte
+ * against Core's own filters (tests/test_block_filter.c). What this layer
+ * adds is the DATA: the block from the archive, and the spent-prevout
+ * scripts from undo_<h>.dat via an injected undo_replay -- injected, like
+ * every other cross-module dependency here, so rpc_chain does not pull the
+ * daemon's undo module into every target that links it.
+ *
+ * THE HONEST BOUNDS, stated once here and enforced below:
+ *   - undo files exist only inside the daemon's retention window (~200
+ *     blocks below the tip). A filter for an older block cannot include the
+ *     spent-prevout elements, and a filter missing elements is WRONG -- a
+ *     light client would conclude "nothing relevant here" about a block that
+ *     spends its coins. So getblockfilter refuses outside the window rather
+ *     than serving a filter that lies by omission.
+ *   - the filter HEADER chains from genesis, so computing it needs every
+ *     filter before this one -- unknowable without a full index. The header
+ *     field is OMITTED, never fabricated.
+ *   - scanblocks/getdescriptoractivity walk the BLOCKS directly instead of
+ *     a filter index. Exact (no false positives), and spends are detected
+ *     for outpoints received within the scanned range (the same forward
+ *     walk wallet_scan.c uses); a block that only spends a coin received
+ *     BEFORE the range is not flagged. Each result says what was scanned. */
+typedef int (*ch_undo_cb)(void* ctx, const unsigned char* txid, unsigned int index,
+                          unsigned long long value, unsigned int height, unsigned char is_coinbase,
+                          const unsigned char* script, unsigned short slen);
+static long (*g_undo_replay)(long height, ch_undo_cb cb, void* ctx);
+void rpc_chain_set_undo(long (*replay)(long, ch_undo_cb, void*)){ g_undo_replay = replay; }
+
+#define GBF_MAX_PREV 40000
+typedef struct {
+    bf_script* v;
+    unsigned char (*buf)[128];
+    unsigned long n;
+    int overflow;
+} gbf_ctx;
+
+static int gbf_cb(void* ctxp, const u8* txid, u32 index, u64 value, u32 height,
+                  u8 is_coinbase, const u8* script, unsigned short slen){
+    (void)txid; (void)index; (void)value; (void)height; (void)is_coinbase;
+    gbf_ctx* c = (gbf_ctx*)ctxp;
+    if (c->n >= GBF_MAX_PREV || slen > 128){ c->overflow = 1; return 1; }
+    memcpy(c->buf[c->n], script, slen);
+    c->v[c->n].script = c->buf[c->n];
+    c->v[c->n].len = slen;
+    c->n++;
+    return 1;
+}
+
+static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long h;
+    if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&
+        strcmp(params->items[1]->str, "basic")){
+        *ec = -5; *em = "Unknown filtertype"; return 0; }
+    long blen = read_block(h);
+    if (blen < 81){ *ec = -1; *em = "Block not available"; return 0; }
+    /* the spent-prevout scripts, from undo data */
+    gbf_ctx c;
+    c.v = malloc(GBF_MAX_PREV * sizeof *c.v);
+    c.buf = malloc((size_t)GBF_MAX_PREV * 128);
+    if (!c.v || !c.buf){ free(c.v); free(c.buf); *ec = -7; *em = "oom"; return 0; }
+    c.n = 0; c.overflow = 0;
+    long ur = g_undo_replay ? g_undo_replay(h, gbf_cb, &c) : -1;
+    /* h == 0 is the one height with legitimately no undo data (the genesis
+     * coinbase spends nothing), so an absent file there is not a gap */
+    if ((ur < 0 && h != 0) || c.overflow){
+        free(c.v); free(c.buf);
+        *ec = -1;
+        *em = ur < 0
+            ? "no undo data for this block: it is outside the daemon's undo "
+              "retention window (~200 blocks below the tip). A filter built "
+              "without the spent-prevout scripts would be missing elements, and "
+              "a light client would wrongly conclude the block does not touch "
+              "its coins -- so no filter is served rather than a wrong one"
+            : "this block's undo data exceeds the filter builder's bounds";
+        return 0;
+    }
+    unsigned char hash[32]; sha256d(hash, g_blockbuf, 80);
+    static unsigned char flt[1 << 20];
+    long fl = bf_basic_build(g_blockbuf, (unsigned long)blen, hash,
+                             c.v, c.n, flt, sizeof flt);
+    free(c.v); free(c.buf);
+    if (fl < 0){ *ec = -1; *em = "filter construction failed"; return 0; }
+    char* hx = malloc((size_t)fl * 2 + 1);
+    if (!hx){ *ec = -7; *em = "oom"; return 0; }
+    for (long i = 0; i < fl; i++){
+        static const char* H = "0123456789abcdef";
+        hx[i*2] = H[flt[i]>>4]; hx[i*2+1] = H[flt[i]&15];
+    }
+    hx[fl*2] = 0;
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "filter", rj_str(hx));
+    free(hx);
+    /* header: chains from genesis; unknowable without every prior filter.
+     * OMITTED -- a fabricated chain head would poison every later link. */
+    *res = o;
+    return 1;
+}
+
+/* ---- scanblocks / getdescriptoractivity ---------------------------------
+ * Direct block walk. The scan objects are expanded to concrete scriptPubKeys
+ * through the SAME expansion cmd_scantxoutset uses (scan_expand_objects), so
+ * addr()/raw()/wpkh()/ranged descriptors behave identically across the two. */
+#define SB_MAX_OWN  65536
+
+typedef struct { unsigned char txid[32]; unsigned int vout; } sb_op;
+
+/* Scan ONE block, sharing the caller's matched-outpoint set so a spend of a
+ * coin received in an earlier scanned block is recognised. */
+static int sb_scan_block(long h,
+                         unsigned char (*spks)[128], unsigned int* spklens, int nspk,
+                         sb_op* own, unsigned long* nown_io,
+                         rj_val* hits_arr, rj_val* activity_arr,
+                         long* ec, const char** em){
+    unsigned long nown = *nown_io;
+    static const char* HEXC = "0123456789abcdef";
+    static char sberr[128];
+    {
+        long blen = read_block(h);
+        if (blen < 81){
+            snprintf(sberr, sizeof sberr, "block %ld could not be read; the scan would be incomplete", h);
+            *ec = -1; *em = sberr; return 0;
+        }
+        unsigned char bh[32]; sha256d(bh, g_blockbuf, 80);
+        int block_hit = 0;
+        const u8* p = g_blockbuf + 80;
+        const u8* end = g_blockbuf + blen;
+        u64 cc;
+        u64 ntx = read_varint(p, end, &cc);
+        if (cc == 0){ *ec = -1; *em = "malformed block"; return 0; }
+        p += cc;
+        for (u64 t = 0; t < ntx; t++){
+            txw_t w;
+            if (!tx_walk(p, end, &w)){ *ec = -1; *em = "malformed tx"; return 0; }
+            u8 txid[32];
+            { u8* scratch = malloc(w.len ? w.len : 1);
+              if (scratch){ tx_txid(txid, p, w.len, scratch, w.len); free(scratch); }
+              else memset(txid, 0, 32); }
+            /* inputs: a spend of an outpoint matched earlier in this range */
+            { const u8* q = w.vin;
+              u64 n_in = read_varint(q, end, &cc); q += cc;
+              for (u64 i = 0; i < n_in; i++){
+                  unsigned int vo = (unsigned int)q[32] | ((unsigned int)q[33]<<8) |
+                                    ((unsigned int)q[34]<<16) | ((unsigned int)q[35]<<24);
+                  for (unsigned long k = 0; k < nown; k++)
+                      if (own[k].vout == vo && !memcmp(own[k].txid, q, 32)){
+                          block_hit = 1;
+                          if (activity_arr){
+                              rj_val* e = rj_obj();
+                              rj_obj_set(e, "type", rj_str("spend"));
+                              rj_obj_set(e, "height", rj_numf("%ld", h));
+                              char hx[65];
+                              for (int b2 = 0; b2 < 32; b2++){ unsigned char v2 = txid[31-b2];
+                                  hx[b2*2]=HEXC[v2>>4]; hx[b2*2+1]=HEXC[v2&15]; }
+                              hx[64]=0;
+                              rj_obj_set(e, "txid", rj_str(hx));
+                              rj_arr_push(activity_arr, e);
+                          }
+                          break;
+                      }
+                  u64 sl = read_varint(q + 36, end, &cc);
+                  q += 36 + cc + sl + 4;
+              } }
+            /* outputs paying a watched script */
+            { const u8* q = w.vout;
+              u64 n_out = read_varint(q, end, &cc); q += cc;
+              for (u64 i = 0; i < n_out; i++){
+                  u64 val = 0;
+                  for (int b2 = 0; b2 < 8; b2++) val |= (u64)q[b2] << (8*b2);
+                  q += 8;
+                  u64 sl = read_varint(q, end, &cc); q += cc;
+                  const u8* spk = q; q += sl;
+                  for (int k = 0; k < nspk; k++){
+                      if ((u64)spklens[k] != sl || memcmp(spks[k], spk, sl)) continue;
+                      block_hit = 1;
+                      if (nown < SB_MAX_OWN){
+                          memcpy(own[nown].txid, txid, 32);
+                          own[nown].vout = (unsigned int)i;
+                          nown++;
+                      }
+                      if (activity_arr){
+                          rj_val* e = rj_obj();
+                          rj_obj_set(e, "type", rj_str("receive"));
+                          rj_obj_set(e, "height", rj_numf("%ld", h));
+                          char hx[65];
+                          for (int b2 = 0; b2 < 32; b2++){ unsigned char v2 = txid[31-b2];
+                              hx[b2*2]=HEXC[v2>>4]; hx[b2*2+1]=HEXC[v2&15]; }
+                          hx[64]=0;
+                          rj_obj_set(e, "txid", rj_str(hx));
+                          rj_obj_set(e, "vout", rj_numf("%llu", (unsigned long long)i));
+                          { char am[32]; rpc_amounts((long long)val, am, sizeof am);
+                            rj_obj_set(e, "amount", rj_numf("%s", am)); }
+                          rj_arr_push(activity_arr, e);
+                      }
+                      break;
+                  }
+              } }
+            p += w.len;
+        }
+        if (block_hit && hits_arr){
+            char hx[65];
+            for (int b2 = 0; b2 < 32; b2++){ unsigned char v2 = bh[31-b2];
+                hx[b2*2]=HEXC[v2>>4]; hx[b2*2+1]=HEXC[v2&15]; }
+            hx[64]=0;
+            rj_arr_push(hits_arr, rj_str(hx));
+        }
+    }
+    *nown_io = nown;
+    return 1;
+}
+
+static int sb_scan_range(long from, long to,
+                         unsigned char (*spks)[128], unsigned int* spklens, int nspk,
+                         rj_val* hits_arr, rj_val* activity_arr,
+                         long* ec, const char** em){
+    sb_op* own = malloc((size_t)SB_MAX_OWN * sizeof *own);
+    if (!own){ *ec = -7; *em = "oom"; return 0; }
+    unsigned long nown = 0;
+    for (long h = from; h <= to; h++)
+        if (!sb_scan_block(h, spks, spklens, nspk, own, &nown, hits_arr, activity_arr, ec, em)){
+            free(own); return 0; }
+    free(own);
+    return 1;
+}
+
+/* Defined with cmd_scantxoutset below; identical redefinition there is
+ * permitted by C and keeps the two textually adjacent uses in sync. */
+#define SCAN_MAX_TARGETS 4096
+static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlens,
+                               int cap, int* ntgt_io, long* ec, const char** em);
+
+/* scanblocks "start" [scanobjects] ( start_height stop_height ) --
+ * a direct, EXACT walk over the blocks in range rather than a probabilistic
+ * filter-index match (no false positives to re-check). DOCUMENTED
+ * DIVERGENCES from Core's filter-backed form, also stated in the result:
+ * spends are recognised for outpoints received WITHIN the scanned range (the
+ * same forward walk wallet_scan.c uses); a block that only spends a coin
+ * received before the range is not flagged. The walk reads every block, so
+ * the range is capped where Core's index lookup is not. */
+#define SB_MAX_RANGE 250000
+
+static int cmd_scanblocks(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
+    if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
+    if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
+    if (strcmp(action, "start")){ *ec = -8; *em = "Invalid action"; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long from = 0, to = tip;
+    if (params->nitems >= 3 && params->items[2]->typ == RJ_NUM) from = atol(params->items[2]->str);
+    if (params->nitems >= 4 && params->items[3]->typ == RJ_NUM) to = atol(params->items[3]->str);
+    if (from < 0 || to < from){ *ec = -8; *em = "Invalid height range"; return 0; }
+    if (to > tip) to = tip;
+    if (to - from + 1 > SB_MAX_RANGE){
+        *ec = -8;
+        *em = "range too large: this node scans the blocks themselves (exact, no "
+              "filter index), and this range would read too much. Narrow "
+              "start_height/stop_height";
+        return 0;
+    }
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    if (!scan_expand_objects(params->items[1], targets, tlens, SCAN_MAX_TARGETS, &ntgt, ec, em))
+        return 0;
+    if (!ntgt){ *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    rj_val* hits = rj_arr();
+    if (!sb_scan_range(from, to, targets, tlens, ntgt, hits, NULL, ec, em)){
+        rj_free(hits); return 0; }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "from_height", rj_numf("%ld", from));
+    rj_obj_set(o, "to_height", rj_numf("%ld", to));
+    rj_obj_set(o, "relevant_blocks", hits);
+    rj_obj_set(o, "completed", rj_bool(1));
+    /* the divergence, in the result itself, so a caller who never read the
+     * docs still sees it */
+    rj_obj_set(o, "note",
+        rj_str("exact block scan (not a filter index): spends are detected only "
+               "for outputs received within the scanned range"));
+    *res = o;
+    return 1;
+}
+
+/* getdescriptoractivity [blockhashes] [scanobjects] -- the same walk,
+ * reporting the individual receives and spends instead of block hashes.
+ * The given blocks are scanned in HEIGHT order sharing one matched-outpoint
+ * set, so a spend in a later given block of a coin received in an earlier
+ * given block is recognised. */
+static int cmd_getdescriptoractivity(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 ||
+        params->items[0]->typ != RJ_ARR || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "getdescriptoractivity requires a blockhashes array and a scanobjects array";
+        return 0; }
+    if (refresh() < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    const rj_val* bhs = params->items[0];
+    if (bhs->nitems > 1024){ *ec = -8; *em = "too many blocks"; return 0; }
+    long heights[1024]; int nh = 0;
+    for (size_t i = 0; i < bhs->nitems; i++){
+        if (bhs->items[i]->typ != RJ_STR){ *ec = -8; *em = "blockhash must be a string"; return 0; }
+        u8 disp[32];
+        if (!parse_hash_param(bhs->items[i]->str, 1, disp, ec, em)) return 0;
+        long h;
+        if (!height_by_hash(disp, &h)){ *ec = -5; *em = "Block not found"; return 0; }
+        heights[nh++] = h;
+    }
+    /* height order, so the shared outpoint set sees receives before spends */
+    for (int i = 1; i < nh; i++){
+        long k = heights[i]; int j = i - 1;
+        while (j >= 0 && heights[j] > k){ heights[j+1] = heights[j]; j--; }
+        heights[j+1] = k;
+    }
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    if (!scan_expand_objects(params->items[1], targets, tlens, SCAN_MAX_TARGETS, &ntgt, ec, em))
+        return 0;
+    rj_val* act = rj_arr();
+    sb_op* own = malloc((size_t)SB_MAX_OWN * sizeof *own);
+    if (!own){ rj_free(act); *ec = -7; *em = "oom"; return 0; }
+    unsigned long nown = 0;
+    for (int i = 0; i < nh; i++)
+        if (!sb_scan_block(heights[i], targets, tlens, ntgt, own, &nown, NULL, act, ec, em)){
+            free(own); rj_free(act); return 0; }
+    free(own);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "activity", act);
+    *res = o;
+    return 1;
+}
+
 /* ---- refusals -----------------------------------------------------------
  * Each names the specific thing that is missing, not "unimplemented". */
-#define CH_NO_FILTERS \
-    "this node builds no BIP157/158 compact block filter index, so there is " \
-    "nothing to serve or scan. The block data and the undo data needed to " \
-    "build one are both on disk, so this is a missing index rather than " \
-    "missing information -- but it is an index, not a formatter"
 #define CH_NO_SNAPSHOT \
     "this node has no assumeutxo snapshot support: no writer for Core's " \
     "UTXO snapshot format and no second chainstate to load one into " \
@@ -2824,22 +3153,13 @@ static int desc_spk_at(const desc_t* d, long i, u8 spk[128], u32* spklen,
         *ec=-5; *em="Descriptor type not scannable"; return 0;
     }
 }
-static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
+/* Expand scanobjects (descriptor strings or {desc,range}) into concrete
+ * scriptPubKeys. Shared by scantxoutset, scanblocks and
+ * getdescriptoractivity so the three cannot drift in what they accept. */
+static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlens,
+                               int cap, int* ntgt_io, long* ec, const char** em){
     static char perr[192];
-    const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
-    if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
-    if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
-    if (strcmp(action, "start")){
-        snprintf(perr, sizeof perr, "Invalid action '%s'", action);
-        *ec = -8; *em = perr; return 0; }
-    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
-        *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
-    if (!g_scan_run){ *ec = -1; *em = "UTXO scan unavailable in this process"; return 0; }
-
-    static u8 targets[SCAN_MAX_TARGETS][128];
-    static u32 tlens[SCAN_MAX_TARGETS];
-    int ntgt = 0;
-    const rj_val* objs = params->items[1];
+    int ntgt = *ntgt_io;
     for (unsigned long oi = 0; oi < objs->nitems; oi++){
         const rj_val* ob = objs->items[oi];
         const char* dstr = 0; long rbegin = 0, rend = -1;
@@ -2876,11 +3196,32 @@ static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const 
         long lo = 0, hi = 0;
         if (d.ranged){ lo = rbegin; hi = (rend >= 0) ? rend : 1000; }   /* Core's default range */
         for (long i = lo; i <= hi; i++){
-            if (ntgt >= SCAN_MAX_TARGETS){ *ec=-8; *em="Too many scan targets"; return 0; }
+            if (ntgt >= cap){ *ec=-8; *em="Too many scan targets"; return 0; }
             if (!desc_spk_at(&d, i, targets[ntgt], &tlens[ntgt], ec, em)) return 0;
             ntgt++;
         }
     }
+    *ntgt_io = ntgt;
+    return 1;
+}
+
+static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char perr[192];
+    const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
+    if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
+    if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
+    if (strcmp(action, "start")){
+        snprintf(perr, sizeof perr, "Invalid action '%s'", action);
+        *ec = -8; *em = perr; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    if (!g_scan_run){ *ec = -1; *em = "UTXO scan unavailable in this process"; return 0; }
+
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    const rj_val* objs = params->items[1];
+    if (!scan_expand_objects(objs, targets, tlens, SCAN_MAX_TARGETS, &ntgt, ec, em)) return 0;
     if (!ntgt){ *ec=-8; *em="scanobjects argument is required for the start action"; return 0; }
 
     static rpc_scan_hit_t hits[SCAN_MAX_HITS];
@@ -2960,9 +3301,9 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "waitfornewblock")) return cmd_waitfornewblock(params, res, ec, em);
     if (!strcmp(m, "waitforblockheight")) return cmd_waitforblockheight(params, res, ec, em);
     if (!strcmp(m, "waitforblock")) return cmd_waitforblock(params, res, ec, em);
-    if (!strcmp(m, "getblockfilter") || !strcmp(m, "scanblocks") ||
-        !strcmp(m, "getdescriptoractivity"))
-        return ch_unsupported(CH_NO_FILTERS, ec, em);
+    if (!strcmp(m, "getblockfilter")) return cmd_getblockfilter(params, res, ec, em);
+    if (!strcmp(m, "scanblocks")) return cmd_scanblocks(params, res, ec, em);
+    if (!strcmp(m, "getdescriptoractivity")) return cmd_getdescriptoractivity(params, res, ec, em);
     if (!strcmp(m, "dumptxoutset") || !strcmp(m, "loadtxoutset"))
         return ch_unsupported(CH_NO_SNAPSHOT, ec, em);
     if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
