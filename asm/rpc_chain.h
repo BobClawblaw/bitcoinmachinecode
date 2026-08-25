@@ -34,6 +34,15 @@ int rpc_chain_open(const char* dir);
 long rpc_chain_read_block_at(long h, unsigned char* buf, long cap);
 long rpc_chain_tip_height(void);
 
+/* Attach the undo-data reader (daemon/undo_log.c's undo_replay), so
+ * getblockfilter can include the spent-prevout elements BIP158 requires.
+ * Without it, filters are refused for every non-genesis block rather than
+ * served missing elements. */
+void rpc_chain_set_undo(long (*replay)(long height,
+        int (*cb)(void*, const unsigned char*, unsigned int, unsigned long long,
+                  unsigned int, unsigned char, const unsigned char*, unsigned short),
+        void*));
+
 /* Core -prune setting (MiB; 0 off, 1 manual) for getblockchaininfo's
  * pruned/automatic_pruning/prune_target_size fields. */
 void rpc_chain_set_prune_mib(long mib);

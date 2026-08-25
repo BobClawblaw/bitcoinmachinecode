@@ -2994,6 +2994,13 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);
+    /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
+    { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
+                                            unsigned long long, unsigned int, unsigned char,
+                                            const unsigned char*, unsigned short), void*);
+      rpc_chain_set_undo((long (*)(long, int (*)(void*, const unsigned char*, unsigned int,
+                                                 unsigned long long, unsigned int, unsigned char,
+                                                 const unsigned char*, unsigned short), void*))undo_replay); }
     /* the wallet rescan reads the archive through rpc_chain's store handle */
     { static unsigned char rescan_buf[4*1024*1024];   /* one max-size block */
       rpc_wops_set_scanner(rpc_chain_read_block_at, rescan_buf, (long)sizeof rescan_buf,
