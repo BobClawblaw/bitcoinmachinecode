@@ -548,6 +548,25 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   proves the production path end-to-end — forks+execs the REAL `bitcoin_rpcd`
   and drives it with the REAL `bitcoin_cli` plus raw sockets — 23 checks
   byte-exact. Together the client and server close the RPC-transport OPEN item.
+- **Read-side + util + live-node RPC surface at Core parity** (2026-08-24/25) —
+  the blockchain-query layer (`asm/rpc_chain.c`) and a live-node layer
+  (`asm/rpc_node.c`) verified BYTE-FOR-BYTE against a scratch Bitcoin Core
+  oracle by differential harnesses in `validation/`. Added, each proven
+  identical to Core (divergences documented, not fudged): `getdifficulty`;
+  `gettxoutproof`/`verifytxoutproof` (BIP37 partial merkle tree — proofs are
+  byte-identical and each node verifies the other's); `decodescript` (incl. the
+  inferred `desc` — Core's `InferDescriptor` no-keystore rules); `createmultisig`
+  (incl. the descriptor with Core's 8-char checksum); `validateaddress`
+  (fixing three field bugs the differential caught: a garbage P2WSH
+  `witness_program`, `P2TR isscript=false`, a stray `ischange`); and `desc` on
+  `getblock`/`getrawtransaction` scriptPubKey output. **The RPC server is now
+  embedded in the serve daemon** (`daemon/main.c`), bridging its fork model with
+  a `MAP_SHARED` status region the download worker publishes into, so the
+  live-node RPCs `getconnectioncount`, `getnetworkinfo`, `getpeerinfo` (real
+  peer addr/version/subver/services), `getmempoolinfo`, `getrawmempool` and
+  `getchaintips` answer from a running node — verified live in production. Still
+  absent: `sendrawtransaction` (needs a parent→worker relay channel), wallet
+  and mining RPCs, and a descriptor engine (`deriveaddresses`/`getdescriptorinfo`).
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine
