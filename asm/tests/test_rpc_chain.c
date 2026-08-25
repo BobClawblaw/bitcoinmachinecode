@@ -1054,6 +1054,29 @@ int main(void){
          rpc_known_method("dumptxoutset") && rpc_known_method("getchainstates") &&
          rpc_known_method("waitforblock") && rpc_known_method("verifychain")); }
 
+    /* ---- submitheader ----
+     * A header the node already has is a no-op returning null, exactly as
+     * Core answers. Anything else is refused rather than answered with the
+     * null that would mean "accepted". ---- */
+    { char gh[161]; memcpy(gh, GENESIS_HEX, 160); gh[160] = 0;
+      char pj[200]; snprintf(pj, sizeof pj, "[\"%s\"]", gh);
+      long e; const char* m; rj_val* r2 = call("submitheader", pj, &e, &m);
+      ck("submitheader on a header we already have -> null",
+         r2 && r2->typ == RJ_NULL);
+      rj_free(r2);
+      /* flip a byte of the nonce: a well-formed header we do not have */
+      gh[159] = (gh[159] == 'c') ? 'd' : 'c';
+      snprintf(pj, sizeof pj, "[\"%s\"]", gh);
+      r2 = call("submitheader", pj, &e, &m);
+      ck("an unknown header is REFUSED, not silently accepted",
+         r2 == NULL && e == -1 && m && strstr(m, "download worker"));
+      rj_free(r2); }
+    expect_err("submitheader on short hex -> Core's -22", "submitheader",
+               "[\"0011\"]", -22, "Block header decode failed");
+    expect_err("submitheader on non-hex -> -22", "submitheader",
+               "[\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"]",
+               -22, "Block header decode failed");
+
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
