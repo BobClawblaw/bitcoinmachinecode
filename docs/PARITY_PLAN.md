@@ -81,8 +81,10 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       fundrawtransaction, bumpfee
 
 ### T8 — PSBT (BIP174)
-- [ ] createpsbt, walletcreatefundedpsbt, walletprocesspsbt, combinepsbt,
-      finalizepsbt, decodepsbt, utxoupdatepsbt
+- [~] createpsbt (v0, Core-validated) + decodepsbt (byte-identical to Core) DONE.
+      This also fixed incident #44: decoderawtransaction was minimal; now routes
+      through rpc_chain's full tx_to_json (Core shape). Remaining: combinepsbt,
+      finalizepsbt, walletprocesspsbt (wallet), utxoupdatepsbt, joinpsbts.
 
 ### T9 — Indexes
 - [ ] txindex (global) → getrawtransaction without blockhash; getindexinfo
