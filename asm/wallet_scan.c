@@ -35,12 +35,15 @@
  *
  * ON-DISK FORMAT -- <path>, appended in height order:
  *
- *     "BMCWSCN1"                        8-byte magic
+ *     "BMCWSCN2"                        8-byte magic
  *     u32 tip_scanned                   highest height covered
  *     u32 n_records
- *     then n_records x 54 bytes:
+ *     then n_records x 86 bytes:
  *       u32 height | u8[32] txid (WIRE order) | u32 vout | u64 value
  *       u8 kind (0 receive, 1 spend) | u32 keyidx | u8 branch
+ *       u8[32] prev_txid -- on a SPEND, the outpoint that was spent; zero on
+ *                           a receive. See wallet_scan.h for why one txid is
+ *                           not enough to answer "is this output unspent".
  *
  * The header is written LAST, after every record is durable, so a crash
  * mid-scan leaves a file whose header still describes the previous complete
@@ -55,9 +58,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#define WSCAN_MAGIC "BMCWSCN1"
+#define WSCAN_MAGIC "BMCWSCN2"
 #define WSCAN_HDR   16
-#define WSCAN_REC   54
+#define WSCAN_REC   86
 
 /* ---- owned-outpoint set -------------------------------------------------
  * Open addressing over (txid,vout). Sized by the caller's cap so a wallet
@@ -317,6 +320,7 @@ long wscan_run(long from, long to,
                       rec[w++] = 1;                                  /* kind: spend */
                       for (int k=0;k<4;k++) rec[w++] = (unsigned char)(o->keyidx >> (8*k));
                       rec[w++] = o->branch;
+                      memcpy(rec + w, q, 32); w += 32;                /* the SPENT outpoint */
                       if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto shortwrite;
                       nrec++;
                   }
@@ -346,6 +350,7 @@ long wscan_run(long from, long to,
                       rec[w++] = 0;                                  /* kind: receive */
                       for (int k=0;k<4;k++) rec[w++] = (unsigned char)(kidx >> (8*k));
                       rec[w++] = br;
+                      memset(rec + w, 0, 32); w += 32;                /* no prev on a receive */
                       if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto shortwrite;
                       nrec++;
                       if (!wscan_set_add(&own, txidbuf, (unsigned int)i, val, kidx, br)){
@@ -419,6 +424,7 @@ long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out){
         r->kind = rec[w++];
         r->keyidx = 0; for (int k=0;k<4;k++) r->keyidx |= (unsigned int)rec[w++] << (8*k);
         r->branch = rec[w++];
+        memcpy(r->prev_txid, rec + w, 32); w += 32;
         got++;
     }
     fclose(f);
