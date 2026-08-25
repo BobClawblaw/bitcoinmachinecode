@@ -177,3 +177,14 @@ interp_swap_recs + checksig/checkmultisig subroutines. These are intertwined wit
 script_eval's frame (rbp-relative slots, r13/r14 = stack-top/alt-top), so they are
 being written together; the interp helpers (interp_swap_recs etc.) are internal to
 script_eval's call graph, not standalone.
+
+## script_eval TRANSCRIBED + LINKS (2026-08-25) -- semantic verification still TODO
+bitcoin_interp.S now contains the complete AArch64 port of asm/bitcoin_interp.asm:
+script_eval (full ~2000-line opcode-dispatch VM: pre-scan, controls, stack, mono/bin/
+within, crypto, CODESEPARATOR, CHECKSIG(ADD/verify), CHECKMULTISIG(verify), CLTV/CSV
+with real tx context, cleanstack/tapscript) + interp_push_num/_bool/_require_depth/
+_swap_recs/_sig_encoding_ok/_checksig/_checksig_add/_checkmultisig + is_opsuccess(_c)/
+interp_memeq. It ASSEMBLES and LINKS clean against codec+sighash+crypto objects.
+IMPORTANT: this is a faithful transcription, NOT yet semantically verified. Next step:
+build the whole-VM differential harness (pure-Python EvalScript over ~90 opcodes +
+CLTV/CSV with tx context) driving a C script_state provider, + real Core/block vectors.
