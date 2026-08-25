@@ -80,6 +80,10 @@ t_sighash: t_sighash.c bitcoin_sighash.o bitcoin_hash.o sha256.o
 	$(CC) $(CFLAGS) -o t_sighash t_sighash.c bitcoin_sighash.o bitcoin_hash.o sha256.o
 fuzz_sighash:
 	python3 fuzz_sighash.py 1 3000
+t_bip143: t_bip143.c bitcoin_bip143.o bitcoin_hash.o sha256.o
+	$(CC) $(CFLAGS) -o t_bip143 t_bip143.c bitcoin_bip143.o bitcoin_hash.o sha256.o
+fuzz_bip143:
+	python3 fuzz_bip143.py 1 2000
 t_der: t_der.c bitcoin_script.o
 	$(CC) $(CFLAGS) -o t_der t_der.c bitcoin_script.o
 fuzz_der:
