@@ -21,21 +21,59 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include "node_config.h"
 
 extern unsigned long mpool_struct_size(unsigned long slots);
+extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
 extern long mpool_del(void* mp, const unsigned char txid[32]);
 extern long mpool_count(void* mp);
+extern unsigned long mpool_policy_state_size(unsigned long n);
+extern void mpool_policy_state_init(void* st, unsigned long n);
 
 /* Published to bitcoin_serve.asm, which declares these extern. Defined HERE
  * so the dependency runs C -> asm and not the reverse: when the asm owned
  * them, every target linking this file without bitcoin_serve.o failed to
- * link. A null area means "use the asm's static fallback". */
+ * link. A null area means "use the asm's static fallback".
+ *
+ * MEMPOOL COHERENCE (2026-08-25): the regions are MAP_SHARED and allocated
+ * BEFORE the serve fork, so the download worker, every inbound serve child,
+ * and the parent's RPC thread all see ONE mempool instead of divergent
+ * copy-on-write copies (previously the parent's getrawmempool was always
+ * empty). Three consequences, each handled here:
+ *   1. mpool_init must run ONCE (here, pre-fork) -- the per-process lazy init
+ *      in bitcoin_serve.asm would WIPE the shared pool on every new inbound
+ *      connection. mp_ext_inited tells the asm to skip its init call.
+ *   2. Writers now cross processes, so put/del/policy-add need a
+ *      PTHREAD_PROCESS_SHARED mutex (mp_lock/mp_unlock; no-ops when the
+ *      static per-process fallback is in use). NOT robust: a writer dying
+ *      mid-critical-section (SIGKILL) leaves the lock held -- acceptable for
+ *      now because writers are the worker (systemd-managed) and serve
+ *      children (exit via normal paths), and a robust mutex would push
+ *      EOWNERDEAD recovery onto every call site.
+ *   3. The tx-accept POLICY state (fee/ancestor registry, previously a
+ *      per-process malloc in tx_accept.c) moves into a shared region too --
+ *      otherwise the structural pool is shared but the fee bookkeeping that
+ *      getmempoolinfo/getmempoolentry report from is not. Same lock covers
+ *      it: every mutation site (policy add via tx-accept, expiry, reorg
+ *      reconcile) takes mp_lock.
+ * The one remaining unlocked touch is bitcoin_serve.asm's mpool_get when
+ * serving getdata(MSG_TX): a concurrent backward-shift delete or a reorg
+ * blob rebuild can hand it stale bytes. Worst case is relaying a tx the pool
+ * just dropped -- peers re-validate everything; documented, not load-bearing. */
 void*         mp_ext_area    = 0;
 void*         mp_ext_blob    = 0;
 unsigned long mp_ext_slots   = 0;
 unsigned long mp_ext_blobcap = 0;
+unsigned long mp_ext_inited  = 0;   /* 1 => mpool_init already ran (skip in asm) */
+void*         mp_ext_polstate = 0;  /* shared policy state (tx_accept.c) */
+unsigned long mp_ext_polstate_n = 0;
+
+static pthread_mutex_t* g_mp_mutex = 0;   /* in its own shared page */
+
+void mp_lock(void){   if (g_mp_mutex) pthread_mutex_lock(g_mp_mutex); }
+void mp_unlock(void){ if (g_mp_mutex) pthread_mutex_unlock(g_mp_mutex); }
 
 /* ---- expiry bookkeeping -------------------------------------------------
  * Open-addressed, same shape as the mempool itself so the two stay in step.
@@ -64,8 +102,8 @@ int mempool_configure(void){
     while(slots < (blob_cap / 512UL) && slots < (1UL<<22)) slots <<= 1;
 
     unsigned long struct_sz = mpool_struct_size(slots);
-    void* area = mmap(0, struct_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    void* blob = mmap(0, (size_t)blob_cap, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    void* area = mmap(0, struct_sz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    void* blob = mmap(0, (size_t)blob_cap, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
     if(area==MAP_FAILED || blob==MAP_FAILED){
         if(area!=MAP_FAILED) munmap(area, struct_sz);
         if(blob!=MAP_FAILED) munmap(blob, (size_t)blob_cap);
@@ -78,14 +116,58 @@ int mempool_configure(void){
     mp_ext_blobcap = (unsigned long)blob_cap;
     g_mp_area      = area;
 
+    /* Init the pool ONCE, pre-fork (see coherence note above). */
+    mpool_init(area, slots, blob, (unsigned long)blob_cap);
+    mp_ext_inited = 1;
+
+    /* Cross-process lock, in its own shared page. If it cannot be set up,
+     * fall back to the per-process pools (unshare) rather than run a shared
+     * pool without a lock. */
+    { void* pg = mmap(0, sizeof(pthread_mutex_t), PROT_READ|PROT_WRITE,
+                      MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+      pthread_mutexattr_t at;
+      if (pg==MAP_FAILED || pthread_mutexattr_init(&at)!=0 ||
+          pthread_mutexattr_setpshared(&at, PTHREAD_PROCESS_SHARED)!=0 ||
+          pthread_mutex_init((pthread_mutex_t*)pg, &at)!=0){
+          if (pg!=MAP_FAILED) munmap(pg, sizeof(pthread_mutex_t));
+          munmap(area, struct_sz); munmap(blob, (size_t)blob_cap);
+          mp_ext_area=0; mp_ext_blob=0; mp_ext_slots=0; mp_ext_blobcap=0;
+          mp_ext_inited=0; g_mp_area=0;
+          fprintf(stderr,"[mempool] process-shared lock unavailable -- falling back to the built-in 2MiB mempool\n");
+          return 0;
+      }
+      g_mp_mutex = (pthread_mutex_t*)pg; }
+
+    /* Shared tx-accept policy state (fee/ancestor registry), init'd once
+     * pre-fork; tx_accept.c uses this instead of a per-process malloc. */
+    { unsigned long pn = 4096;
+      unsigned long psz = mpool_policy_state_size(pn);
+      void* ps = mmap(0, psz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+      if (ps!=MAP_FAILED){ mpool_policy_state_init(ps, pn);
+                           mp_ext_polstate = ps; mp_ext_polstate_n = pn; } }
+
     g_seen_mask = slots - 1;
     g_seen = (mp_seen_t*)mmap(0, sizeof(mp_seen_t)*slots, PROT_READ|PROT_WRITE,
-                              MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                              MAP_SHARED|MAP_ANONYMOUS, -1, 0);
     if(g_seen==MAP_FAILED){ g_seen=0; g_seen_mask=0; }   /* expiry off, pool still sized */
 
-    fprintf(stderr,"[mempool] maxmempool=%ldMB -> %lu slots, %lluMB tx storage%s\n",
-            mb, slots, blob_cap>>20, g_seen?"":" (expiry tracking unavailable)");
+    fprintf(stderr,"[mempool] maxmempool=%ldMB -> %lu slots, %lluMB tx storage (shared, locked%s%s)\n",
+            mb, slots, blob_cap>>20,
+            mp_ext_polstate?"":", policy state per-process",
+            g_seen?"":", expiry tracking unavailable");
     return 1;
+}
+
+/* Arrival time of a pool tx (0 if unknown) -- for RPC "time" fields. */
+long mempool_time_of(const unsigned char txid[32]){
+    if(!g_seen) return 0;
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        if(!e->used) return 0;
+        if(!memcmp(e->txid, txid, 32)) return e->t;
+    }
+    return 0;
 }
 
 /* Record an accepted tx's arrival time. Called from the accept path. */
@@ -110,12 +192,14 @@ long mempool_expire_now(void){
     if(hours <= 0) return 0;
     long cutoff = (long)time(0) - hours*3600;
     long removed = 0;
+    mp_lock();
     for(unsigned long i=0;i<=g_seen_mask;i++){
         mp_seen_t* e = &g_seen[i];
         if(!e->used || e->t > cutoff) continue;
         if(mpool_del(g_mp_area, e->txid) == 1) removed++;
         e->used = 0;                              /* forget either way */
     }
+    mp_unlock();
     if(removed)
         fprintf(stderr,"[mempool] expired %ld tx older than %ldh (%ld remain)\n",
                 removed, hours, mpool_count(g_mp_area));
