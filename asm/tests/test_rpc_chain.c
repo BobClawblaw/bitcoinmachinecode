@@ -618,6 +618,41 @@ int main(void){
         expect_err("cms invalid key", "createmultisig", "[1, [\"deadbeef\"]]", -5, "Invalid public key: deadbeef");
     }
 
+    /* ---- getblockstats (block-only fields; the synthetic archive has no undo,
+     * so fee/feerate/utxo_size_inc keys are omitted -- as against a pruned node).
+     * The full field set is oracle-verified live; here we regression the
+     * block-only computation on synthetic block 3 (segwit cb + legacy spend +
+     * segwit spend). ins=2, outs=3, total_out=4999000000+1000, subsidy=50 BTC. */
+    { char p[128];
+      snprintf(p, sizeof p, "[%d]", 3);
+      r = call("getblockstats", p, &ec, &em);
+      ck_str("gbs height", S(r,"height"), "3");
+      ck_str("gbs txs", S(r,"txs"), "3");
+      ck_str("gbs ins (non-coinbase)", S(r,"ins"), "2");
+      ck_str("gbs outs", S(r,"outs"), "3");
+      ck_str("gbs total_out (non-coinbase)", S(r,"total_out"), "4999001000");
+      ck_str("gbs subsidy @ h3", S(r,"subsidy"), "5000000000");
+      ck_str("gbs utxo_increase = outs-ins", S(r,"utxo_increase"), "1");
+      ck_str("gbs swtxs (segwit spend only)", S(r,"swtxs"), "1");
+      ck_str("gbs blockhash", S(r,"blockhash"), g_hash[3]);
+      /* undo_3.dat (written by the fee test above) is present, so the fee fields
+       * ARE computed: prevout values 5000000000, 4999000000 vs outputs
+       * 4999000000, 1000 -> fees 1000000 and 4998999000. */
+      ck_str("gbs totalfee", S(r,"totalfee"), "4999999000");
+      ck_str("gbs maxfee", S(r,"maxfee"), "4998999000");
+      ck_str("gbs minfee", S(r,"minfee"), "1000000");
+      ck_str("gbs avgfee = totalfee/(txs-1)", S(r,"avgfee"), "2499999500");
+      ck("gbs feerate_percentiles present (undo available)", G(r,"feerate_percentiles") != NULL);
+      rj_free(r);
+      /* by blockhash must equal by height */
+      snprintf(p, sizeof p, "[\"%s\"]", g_hash[3]);
+      rj_val* r2 = call("getblockstats", p, &ec, &em);
+      ck_str("gbs by-hash height matches", S(r2,"height"), "3");
+      ck_str("gbs by-hash total_out matches", S(r2,"total_out"), "4999001000");
+      rj_free(r2);
+      expect_err("gbs height out of range", "getblockstats", "[999]", -8, "Target block height out of range");
+    }
+
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
