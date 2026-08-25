@@ -84,6 +84,21 @@ int main(void){
       ck("converttopsbt(signed) errors -22", rc==0 && e2==-22 && m2 && strstr(m2,"scriptSigs"));
       rj_free(r2); rj_free(p2); }
 
+    /* --- combinepsbt: idempotent merge of identical PSBTs == the PSBT (matches
+     * Core); the field-union across differing PSBTs is verified live vs Core. --- */
+    { long ec; const char* em; rpc_wallet w; memset(&w,0,sizeof w);
+      const char* P = "cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAAAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA";
+      char pj[512]; snprintf(pj,sizeof pj,"[[\"%s\",\"%s\"]]",P,P);
+      rj_val* p1=rj_parse(pj,strlen(pj)); rj_val* r1=NULL; rpc_dispatch("combinepsbt",p1,&w,&r1,&ec,&em);
+      ck("combinepsbt([P,P]) == P (idempotent, Core-matched)", r1 && r1->typ==RJ_STR && !strcmp(r1->str,P));
+      rj_free(r1); rj_free(p1);
+      /* different unsigned txs -> Core-exact error */
+      const char* P2 = "cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAkAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA";
+      char pj2[512]; snprintf(pj2,sizeof pj2,"[[\"%s\",\"%s\"]]",P,P2);
+      rj_val* p3=rj_parse(pj2,strlen(pj2)); rj_val* r3=NULL; long e3; const char* m3; int rc3=rpc_dispatch("combinepsbt",p3,&w,&r3,&e3,&m3);
+      ck("combinepsbt(different txs) errors -8", rc3==0 && e3==-8 && m3 && strstr(m3,"same transaction"));
+      rj_free(r3); rj_free(p3); }
+
     /* --- decodepsbt round-trip (our createpsbt PSBT -> our decodepsbt),
      * byte-identical to Core's decodepsbt (verified live). --- */
     { long ec; const char* em;
