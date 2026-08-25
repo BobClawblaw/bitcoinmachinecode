@@ -670,3 +670,44 @@ the spend path is driven to the broadcast step (this harness has no download
 worker, so reaching `sendrawtransaction`'s own "no download worker" error is
 proof that selection, change, fee and signing all succeeded). Insufficient
 funds is Core's `-6` naming the amount actually available.
+
+## Slice 14 — subsystem 3 of 5: BIP157/158 compact block filters — (2026-08-25)
+`getblockfilter`, `scanblocks` and `getdescriptoractivity` now answer.
+
+### The builder is Core-byte-validated
+`asm/block_filter.c` implements BIP158's basic filter — element collection
+(output scripts + spent-prevout scripts, OP_RETURN and empty excluded,
+de-duplicated), SipHash-2-4 keyed with the block hash's first 16 bytes, the
+128-bit-multiply mapping onto [0, N·M), and Golomb-Rice coding at P=19,
+M=784931. `tests/test_block_filter.c` compares it **byte-for-byte** against
+Bitcoin Core's own filters for two real mainnet blocks, frozen from the
+oracle: 501726 (coinbase-only — N=1, filter `019170b8`, so a wrong SipHash
+rotation fails pinpointed) and 700038 (91 txs, 129 spent prevouts, 827
+filter bytes — collection, dedup and the encoder at realistic size). Both
+filter-header chain links are verified against Core's too, and the RPC test
+confirms the real mainnet genesis block yields Core's `017fa880`.
+
+### Where the data comes from, and the honest bounds
+The spent-prevout scripts come from the daemon's per-block undo data
+(`undo_<h>.dat`, injected via `rpc_chain_set_undo`). Undo files exist only
+inside the retention window (~200 blocks below the tip), so:
+- `getblockfilter` REFUSES outside the window rather than serving a filter
+  missing its spent-prevout elements — a light client shown such a filter
+  would wrongly conclude a block does not touch its coins. Genesis is the
+  one height with legitimately no undo data and is served always.
+- The `header` field is **omitted**: it chains from genesis, so computing it
+  honestly needs every prior filter, and a fabricated chain head would
+  poison every later link.
+
+### `scanblocks` / `getdescriptoractivity` scan blocks, not filters
+Both walk the blocks directly — exact, no false positives to re-check —
+expanding scan objects through the same descriptor path `scantxoutset` uses,
+so `addr()`/`raw()`/`wpkh()`/ranged descriptors behave identically across
+the three methods. Documented divergence, also carried in the `scanblocks`
+result itself: spends are recognised for outpoints received **within** the
+scanned set (the same forward walk `wallet_scan.c` uses); a block that only
+spends a coin received before the range is not flagged. The range is capped
+(250k blocks) because the walk reads every block, where Core's index lookup
+does not. `getdescriptoractivity` scans the given blocks in height order
+sharing one matched-outpoint set, so cross-block receive→spend pairs within
+the given set are reported.
