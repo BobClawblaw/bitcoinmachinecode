@@ -128,6 +128,36 @@ int main(void){
       ck("decoderaw scriptPubKey.asm populated", sp && rj_obj_get(sp,"asm") && strlen(rj_obj_get(sp,"asm")->str)>0);
       rj_free(res); rj_free(params); }
 
+    /* --- joinpsbts: merge two distinct v0 PSBTs into one whose unsigned tx
+     * spends all inputs and creates all outputs. Core's joinpsbts SHUFFLES the
+     * inputs/outputs (privacy), so there is no byte-stable Core target; parity
+     * is SEMANTIC: same version/locktime and same multiset of inputs/outputs.
+     * Our output is deterministic (P1-first concat); this exact base64 was fed
+     * LIVE to Core's decodepsbt and matched Core's own joinpsbts output as a set
+     * (version 2, locktime 0, both outpoints, both output scripts). --- */
+    { long ec; const char* em; rpc_wallet w; memset(&w,0,sizeof w);
+      const char* J1 = "cHNidP8BAFICAAAAAREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACqAAAAAAD9////AaCGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAAA";
+      const char* J2 = "cHNidP8BAFUCAAAAASIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC7AwAAAAD+////AUANAwAAAAAAGXapFHe/8gxg5SLfqjNQw5sDCl0AToOaiKwgoQcAAAAA";
+      char pj[600]; snprintf(pj,sizeof pj,"[[\"%s\",\"%s\"]]",J1,J2);
+      rj_val* p=rj_parse(pj,strlen(pj)); rj_val* r=NULL; int rc=rpc_dispatch("joinpsbts",p,&w,&r,&ec,&em);
+      ck("joinpsbts([J1,J2]) deterministic v0 PSBT (Core-validated as set)",
+         rc==1 && r && r->typ==RJ_STR && !strcmp(r->str,
+         "cHNidP8BAJ0CAAAAAhEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACqAAAAAAD9////IgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALsDAAAAAP7///8CoIYBAAAAAAAWABR1HnboGZGW1FSUHEXRs6Mj8UM71kANAwAAAAAAGXapFHe/8gxg5SLfqjNQw5sDCl0AToOaiKwAAAAAAAAAAAA="));
+      if (r && r->typ==RJ_STR) printf("     join: %s\n", r->str);
+      rj_free(r); rj_free(p);
+      /* fewer than two PSBTs -> Core-exact -8 */
+      char pj1[400]; snprintf(pj1,sizeof pj1,"[[\"%s\"]]",J1);
+      rj_val* pa=rj_parse(pj1,strlen(pj1)); rj_val* ra=NULL; long e2; const char* m2; int rc2=rpc_dispatch("joinpsbts",pa,&w,&ra,&e2,&m2);
+      ck("joinpsbts(one psbt) errors -8", rc2==0 && e2==-8 && m2 && strstr(m2,"two PSBTs"));
+      rj_free(ra); rj_free(pa);
+      /* our joined PSBT decodes (round-trips) to 2-in/2-out v0 */
+      char dj[700]; snprintf(dj,sizeof dj,"[\"cHNidP8BAJ0CAAAAAhEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACqAAAAAAD9////IgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALsDAAAAAP7///8CoIYBAAAAAAAWABR1HnboGZGW1FSUHEXRs6Mj8UM71kANAwAAAAAAGXapFHe/8gxg5SLfqjNQw5sDCl0AToOaiKwAAAAAAAAAAAA=\"]");
+      rj_val* pd=rj_parse(dj,strlen(dj)); rj_val* rd=NULL; rpc_dispatch("decodepsbt",pd,&w,&rd,&ec,&em);
+      rj_val* txo=rd?rj_obj_get(rd,"tx"):NULL;
+      rj_val* vin=txo?rj_obj_get(txo,"vin"):NULL; rj_val* vout=txo?rj_obj_get(txo,"vout"):NULL;
+      ck("joined PSBT round-trips to 2-in 2-out", vin&&vin->nitems==2 && vout&&vout->nitems==2);
+      rj_free(rd); rj_free(pd); }
+
     /* --- error parity --- */
     long ec; const char* em;
     { rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],[{\"notanaddress\":0.1}]]",&ec,&em);
