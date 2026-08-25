@@ -554,7 +554,32 @@ static rj_val* script_pubkey_json_x(const u8* s, size_t n, int want_desc){
 /* ---- TxToUniv (core_io.cpp), include_hex=true, no undo data ---- */
 static rj_val* amount_json(u64 sats){ return rj_numf("%llu.%08llu", sats / 100000000ULL, sats % 100000000ULL); }
 
-static rj_val* tx_to_json(const u8* tx, const txw_t* w){
+/* Read the per-input prevout VALUES from undo_<h>.dat, in block order (all
+ * non-coinbase inputs, tx-by-tx). Lets getblock v2 report per-tx fees without
+ * a UTXO lookup. Record layout (daemon/undo_log.c): txid[32] index(4)
+ * value(8) height(4) is_coinbase(1) script_len(2) script[len] -- 51-byte
+ * header + script. Returns count, or -1 if the file is absent/pruned (Core
+ * always has undo; we keep only a window, so fees are recent-blocks-only). */
+static long undo_block_values(long h, u64* out, long cap){
+    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
+    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
+    long got = 0, off = 0; ssize_t rd;
+    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
+    close(fd);
+    if (got != sb.st_size){ free(buf); return -1; }
+    long n = 0;
+    while (off + 51 <= sb.st_size && n < cap){
+        out[n++] = rd64(buf + off + 36);            /* value at offset 36 */
+        u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
+        off += 51 + (long)slen;
+    }
+    free(buf);
+    return (off == sb.st_size) ? n : -1;            /* trailing garbage -> unusable */
+}
+
+static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
     rj_val* o = rj_obj();
     u8 txid[32], wtxid[32]; char hx[65];
     u8* scratch = malloc(w->len ? w->len : 1);
@@ -610,8 +635,9 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w){
 
     p = w->vout; read_varint(p, tx + w->len, &c); p += c;
     rj_val* vout = rj_arr();
+    u64 out_total = 0;
     for (u64 i = 0; i < w->n_out; i++){
-        u64 val = rd64(p); p += 8;
+        u64 val = rd64(p); p += 8; out_total += val;
         u64 sl = read_varint(p, tx + w->len, &c); p += c;
         rj_val* out = rj_obj();
         rj_obj_set(out, "value", amount_json(val));
@@ -621,6 +647,11 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w){
         rj_arr_push(vout, out);
     }
     rj_obj_set(o, "vout", vout);
+    /* fee = sum(prevout values) - sum(output values), when the caller supplied
+     * the input total from the block's undo data (getblock v2). in_total < 0
+     * means "not available" (coinbase, or undo file pruned/absent). */
+    if (in_total >= 0 && (u64)in_total >= out_total)
+        rj_obj_set(o, "fee", amount_json((u64)in_total - out_total));
     char* h = malloc(w->len*2 + 1); if (h){ hex_of(h, tx, w->len); rj_obj_set(o, "hex", rj_str(h)); free(h); }
     return o;
 }
@@ -754,6 +785,11 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     size_t stripped = 80 + c;
     rj_val* txs = rj_arr();
     rj_val* cb = NULL;
+    /* per-tx fees for verbosity 2: prevout values from the block's undo file
+     * (in block order, non-coinbase inputs). undo_n < 0 -> undo pruned/absent
+     * (fee omitted, honest -- we keep only a recent-heights window). */
+    static u64 undo_vals[600000]; long undo_n = -1, undo_cur = 0;
+    if (verbosity >= 2) undo_n = undo_block_values(h, undo_vals, (long)(sizeof undo_vals / sizeof undo_vals[0]));
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -1; *em = "Block decode failed"; return 0; }
@@ -776,7 +812,13 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
             if (scratch){ tx_txid(txid, p, w.len, scratch, w.len); free(scratch); } else memset(txid, 0, 32);
             hex_rev(hx, txid, 32); rj_arr_push(txs, rj_str(hx));
         } else {
-            rj_arr_push(txs, tx_to_json(p, &w));
+            long long in_total = -1;
+            if (i > 0 && undo_n >= 0 && undo_cur + (long)w.n_in <= undo_n){
+                in_total = 0;
+                for (u64 k = 0; k < w.n_in; k++) in_total += (long long)undo_vals[undo_cur + k];
+            }
+            if (i > 0 && undo_n >= 0) undo_cur += (long)w.n_in;   /* advance even if capped */
+            rj_arr_push(txs, tx_to_json(p, &w, in_total));
         }
         p += w.len;
     }
@@ -881,7 +923,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
             }
             rj_val* o = rj_obj();
             rj_obj_set(o, "in_active_chain", rj_bool(1));
-            rj_val* t = tx_to_json(p, &w);
+            rj_val* t = tx_to_json(p, &w, -1);   /* verbosity 1: no fee (Core parity) */
             /* splice TxToUniv's members into our object to keep Core's order */
             for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }
             for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
