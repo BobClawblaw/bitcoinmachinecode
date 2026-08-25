@@ -42,20 +42,21 @@ and runs natively.
       test_scalar PASS native; 900+ diff-fuzz vs Python big-int mod n: 0 fail.
       sc_add/sub/mul/sqr/inv. Fixed SCA_ADD carry-propagation bug (must
       `ldr; adcs x,x,xzr; str` -- `adcs x,xzr,xzr` overwrote limbs). (2026-08-24)
-- [ ] secp256k1_point / point_ct / ecdsa / schnorr / taproot
-                                          (the security-critical core; validate
-                                           against *_{fe,scalar,glv,scalar}_c.c
-                                           oracles + Python int oracle)
-    - [x] secp256k1_scalar  -> port/arm64/secp256k1_scalar.S   test_scalar PASS
-          native (12/12 incl. sc_inv and 3*inv(3)==1); ~13.5k-case differential
-          fuzz vs Python big-int mod n (add/sub/mul/sqr/inv, full-range operands)
-          0 failures. Fixed 2 real bugs: (1) sc_mul clobbered callee-saved x22
-          (AAPCS violation -> main's live x22 corrupt -> SIGSEGV); (2) sc_mul fold
-          carry-propagation loop `cmp`-clobbered the C flag between `adcs` steps,
-          silently dropping each column carry at tmp[k+2] -> result off by DELTA.
-          (2026-08-25)
-    - [ ] secp256k1_point / point_ct / ecdsa / schnorr / glv  <- NEXT
-          (sc_inv_var binary-xgcd still needs porting for ecdsa_verify s^{-1})
+- [x] secp256k1_point (core group ops)   -> port/arm64/secp256k1_point.S
+      repo test_point (2G) PASS native; ~83k-vector differential fuzz vs a
+      fresh pure-Python Jacobian secp256k1 oracle over 7 seeds (point_double,
+      point_add, point_add_mixed, +_zr incl. z-ratio, w=4 windowed
+      point_scalar_mul; out-of-place AND in-place; degenerate shapes
+      q==p/double-branch, opposite->inf, x==0/(0,0)): 0 failures.
+      Fixed 3 real bugs: (1) scalar_mul held loop state in x19/x20/x22 which
+      point_add/add_mixed/double CLOBBER (their own r/p/q/zr ptrs) -> heal in
+      x23..x28 (never touched by leaf point_*/fe_*); (2) top-of-file
+      `.note.GNU-stack` swallowed all code into the note section (moved to EOF);
+      (3) interval branches `sub x28,#1; b.mi/b.pl` used plain `sub` (no NZCV)
+      so they read STALE flags and over-ran the window loop -> `subs`. (2026-08-25)
+    - [ ] secp256k1_point_ct / point_scalar_mul_fixed / point_scalar_mul_glv
+    - [ ] secp256k1_ecdsa / schnorr       <- NEXT (needs point_scalar_mul_fixed
+          for the u1*G term + sc_inv_var/s^{-1})
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
