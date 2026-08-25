@@ -64,7 +64,21 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       5 blocks (pre/post-segwit); fee/feerate/utxo_size_inc need undo (omitted
       where absent, honest divergence) and are verified via synthetic undo in
       test_rpc_chain. Numeric-height + blockhash forms both work.
-- [ ] scantxoutset — needs the COMPLETE UTXO set; BLOCKED on the rebuild.
+- [x] scantxoutset — ORACLE-VERIFIED TO THE SATOSHI on real data. The
+      whole-set scanner lives in the tool-derived reader TU (same
+      fingerprint/quiescence discipline, munmap-everything life cycle);
+      scan targets expand through the SAME descriptor engine
+      deriveaddresses uses (strings or {desc,range}; checksums optional as
+      in Core; ranged default 1000); per-unspent desc reuses the existing
+      inferred-descriptor helper (addr(...)#checksum, matching the oracle's
+      own output). Synchronous scans: status -> null, abort -> false
+      (Core's no-scan answers, oracle-verified); overflow past the 32768-hit
+      cap is an ERROR, never silent truncation. PROOF: scanning the parked
+      pre-rebuild state (165,717,308 outputs, ~109s) for the Counterparty
+      burn address found 3135 unspents / 2130.99791495 BTC -- EXACTLY the
+      oracle's own scantxoutset result for the same descriptor. Also
+      upgraded desc_parse_core's unknown-function error to Core's exact
+      "'X' is not a valid descriptor function" shape.
 - [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (after T4)
 
 ### T3 — Mining-info RPCs  [oracle-verifiable, non-wallet]
