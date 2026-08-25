@@ -366,6 +366,13 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
     secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
     secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
     bitcoin_addr.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o
+# reorg_drill -- REAL-DATA reorg exercise (tools, not part of `make test`:
+# it needs a real datadir COPY, which CI does not have). Same sources as
+# test_reorg so it drives the identical production paths.
+DRILLSRCS := $(patsubst tests/test_reorg.c,tests/reorg_drill.c,$(REORGSRCS))
+tests/reorg_drill: $(DRILLSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 -Wall -o $@ $(DRILLSRCS) $(REORGOBJS) -lpthread
+
 tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 -Wall -o $@ $(REORGSRCS) $(REORGOBJS) -lpthread
 
