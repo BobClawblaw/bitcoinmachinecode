@@ -354,3 +354,4 @@ bench-results/
 asm/tests/test_muhash
 asm/tests/test_utxo_setinfo
 asm/daemon/utxo_setinfo
+asm/tests/test_utxo_ghost_resume
