@@ -335,9 +335,13 @@ int main(void){
          r == NULL && ec == -8 && em && strstr(em, "descriptors argument"));
       rj_free(r); }
 
-    { rj_val* r = call("fundrawtransaction", "[\"00\"]", &ec, &em);
-      ck("fundrawtransaction refuses, naming coin selection and the P2WPKH gap",
-         r == NULL && ec == -1 && em && strstr(em, "coin selection") && strstr(em, "P2WPKH"));
+    { /* fundrawtransaction is implemented now (rpc_wallet_ops.c); in this
+       * harness no rescan has run, so it refuses at the coin-knowledge step
+       * rather than pretending to select from coins it cannot see */
+      rj_val* r = call("fundrawtransaction",
+                       "[\"0200000000010000000000000000000000000000\"]", &ec, &em);
+      ck("fundrawtransaction without a rescan refuses at the funding step",
+         r == NULL && ec == -4 && em && strstr(em, "rescan"));
       rj_free(r);
       r = call("descriptorprocesspsbt", "[\"x\",[]]", &ec, &em);
       ck("descriptorprocesspsbt refuses, naming the missing descriptor->key path",

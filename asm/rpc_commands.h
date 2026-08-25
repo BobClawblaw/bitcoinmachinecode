@@ -32,6 +32,10 @@ typedef struct {
  *   caller buffer at least 24 bytes. */
 void rpc_amounts(long long sats, char* out, size_t outcap);
 
+/* The inverse: a Core BTC amount string -> satoshis, or -1 if malformed.
+ * Shared so the spend path cannot round differently from the renderer. */
+long long rpc_amount_to_sat(const char* s);
+
 /* Dispatch one JSON-RPC method with params. Builds a `result` value into
  * *result (heap; caller rj_free) on success (returns 1) or fills *err_code /
  * *err_msg (static string, no free) and returns 0 on an RPC error. */

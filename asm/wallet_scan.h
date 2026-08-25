@@ -15,7 +15,18 @@ typedef struct {
 
 int wscan_key_cmp(const void* a, const void* b);
 
-/* One wallet event: an output paying us, or an input spending one. */
+/* One wallet event: an output paying us, or an input spending one.
+ *
+ * A SPEND needs two identities and carrying only one is not enough:
+ *   txid/vout  -- the SPENDING transaction and the index of the input's
+ *                 outpoint, which is what listsinceblock reports;
+ *   prev_txid  -- the txid of the outpoint that was SPENT.
+ * Without prev_txid, "is this output still unspent" can only be answered by
+ * matching on (vout, key, value), which collides whenever a wallet receives
+ * two equal-valued outputs at the same index to the same key -- and a
+ * collision there makes coin selection spend an already-spent output, which
+ * produces an invalid transaction rather than a wrong number. prev_txid is
+ * zero on a receive. */
 typedef struct {
     unsigned int  height;
     unsigned char txid[32];   /* WIRE order, as the archive stores it */
@@ -24,6 +35,7 @@ typedef struct {
     unsigned char kind;       /* 0 receive, 1 spend */
     unsigned int  keyidx;
     unsigned char branch;
+    unsigned char prev_txid[32];  /* spend only: the outpoint that was spent */
 } wscan_rec;
 
 /* sha256d, supplied by the linking target (bitcoin_hash.o / sha256.o). */
