@@ -7,6 +7,23 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- incident #44: decoderawtransaction returned a minimal, non-Core shape
+
+Found while building decodepsbt (its "tx" field reuses the tx decoder).
+`decoderawtransaction` was served by rpc_commands.c's cmd_decoderaw, a
+hand-rolled decoder that emitted only {locktime, vin, vout} with an empty
+scriptPubKey "asm"/"desc" -- missing txid, hash, version, size, vsize, weight,
+about half of Core's fields. Prior "verification" only checked vin/vout
+consistency, so the gap went unnoticed.
+
+The FULL, Core-verified decoder already existed: rpc_chain.c's tx_to_json, which
+getblock verbosity>=2 uses and which is differentially oracle-tested. Fix:
+exposed it as rpc_chain_decode_rawtx() and routed BOTH decoderawtransaction and
+decodepsbt's "tx" through it (stripping the "hex" field tx_to_json adds for
+getblock/getrawtransaction but which decoderawtransaction omits). Both are now
+byte-identical to Core (verified live). Lesson mirrors #43: a "done" RPC that was
+only spot-checked, not full-field diffed, hid a real parity gap.
+
 ## 2026-08-25 -- incident #43: chainwork.dat corrupt for the entire post-segwit chain
 
 Found while oracle-verifying the new mining RPCs. `getnetworkhashps` diverged
