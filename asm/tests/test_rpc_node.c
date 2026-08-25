@@ -21,6 +21,37 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned
     return 1;
 }
 
+/* Fake tx-submit worker: acks whatever the parent stages, recording the
+ * tx_submit_test flag it saw so the test can prove sendrawtransaction clears
+ * it (a stale 1 would turn a real broadcast into a dry run). */
+static volatile int g_tw_run = 1;
+static int g_tw_saw_test[8];      /* per handled submission, in order */
+static int g_tw_n;
+static int g_tw_verdict = 1;      /* what to report back */
+/* g_tw_last is captured by the PARENT before pthread_create: reading it in
+ * the new thread would race the parent's first submission, which can be
+ * staged and the seq bumped before the thread is ever scheduled -- the
+ * worker would then start from the already-bumped value and wait forever. */
+static volatile unsigned long long g_tw_last;
+static void* fake_txworker(void* arg){
+    node_status_t* ns = (node_status_t*)arg;
+    unsigned long long last = g_tw_last;
+    while (g_tw_run){
+        if (ns->tx_submit_seq != last){
+            last = ns->tx_submit_seq;
+            if (g_tw_n < 8) g_tw_saw_test[g_tw_n++] = ns->tx_submit_test;
+            ns->tx_submit_result = g_tw_verdict;
+            ns->tx_submit_fee = 12345;
+            snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
+                     g_tw_verdict == 1 ? "" : "min relay fee not met");
+            __sync_synchronize();
+            ns->tx_submit_ack = last;
+        }
+        struct timespec ts = {0, 200000}; nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
 static int g_fw_len_ok = -1;   /* fake_worker's view of the staged length */
 static void* fake_worker(void* arg){
     node_status_t* ns = (node_status_t*)arg;
@@ -753,6 +784,117 @@ int main(void){
       rpc_node_set_addednodes(NULL, 0); }
 
     rpc_node_set_addrbook(NULL, NULL, NULL);
+
+    /* ---- testmempoolaccept ----
+     * Without a download worker there is nothing to ask, and the method says
+     * so rather than answering from the parent's own guess. */
+    { rpc_node_set_status_rw(NULL);
+      const char* j = "[[\"0200000001000000000000000000000000000000000000000000000000000000000000000000000000000000fdffffff0100000000000000000000000000\"]]";
+      rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; ec = 0;
+      rc = rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      ck("testmempoolaccept with no worker -> -4", rc == 0 && ec == -4);
+      rj_free(r); rj_free(p); }
+
+    { rpc_node_set_status_rw(&st);
+      pthread_t th; g_tw_run = 1; g_tw_n = 0; g_tw_verdict = 1;
+      g_tw_last = st.tx_submit_seq;          /* captured BEFORE the thread starts */
+      pthread_create(&th, 0, fake_txworker, &st);
+
+      /* a well-formed legacy tx (the createrawtransaction KAT body) */
+      const char* TX1 = "020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000";
+      char j[1200]; snprintf(j, sizeof j, "[[\"%s\"]]", TX1);
+      rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; rc = rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      ck("testmempoolaccept -> array of one", rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1);
+      { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("entry carries txid and wtxid", e0 && S(e0,"txid") && S(e0,"wtxid"));
+        ck("a non-witness tx has wtxid == txid",
+           e0 && S(e0,"txid") && S(e0,"wtxid") && !strcmp(S(e0,"txid"), S(e0,"wtxid")));
+        ck("allowed:true from the worker's verdict",
+           e0 && S(e0,"allowed") && !strcmp(S(e0,"allowed"), "1"));
+        ck("vsize reported when allowed", e0 && S(e0,"vsize"));
+        ck("fees.base carries the worker's fee (12345 sat)",
+           e0 && rj_obj_get(e0,"fees") &&
+           !strcmp(S(rj_obj_get(e0,"fees"),"base"), "0.00012345"));
+        /* package feerate is not computed here, so it must be absent */
+        ck("effective-feerate is omitted, not guessed",
+           e0 && rj_obj_get(e0,"fees") &&
+           rj_obj_get(rj_obj_get(e0,"fees"),"effective-feerate") == NULL);
+        ck("a single tx carries no package-error",
+           e0 && rj_obj_get(e0,"package-error") == NULL); }
+      rj_free(r); rj_free(p);
+      ck("the worker saw tx_submit_test set", g_tw_n >= 1 && g_tw_saw_test[0] == 1);
+
+      /* a rejection carries the worker's reason and no fee/vsize */
+      g_tw_verdict = -26;
+      p = rj_parse(j, strlen(j));
+      r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("allowed:false on rejection", e0 && !strcmp(S(e0,"allowed"), "0"));
+        ck("reject-reason is the worker's text",
+           e0 && S(e0,"reject-reason") && !strcmp(S(e0,"reject-reason"), "min relay fee not met"));
+        ck("no fees on a rejected tx", e0 && rj_obj_get(e0,"fees") == NULL);
+        ck("no vsize on a rejected tx", e0 && rj_obj_get(e0,"vsize") == NULL); }
+      rj_free(r); rj_free(p);
+      g_tw_verdict = 1;
+
+      /* more than one tx: every entry must carry package-error, because this
+       * node cannot see an in-array parent from a later child */
+      { char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
+        p = rj_parse(j2, strlen(j2));
+        r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+        ck("two txs -> two entries", r && r->nitems == 2);
+        ck("both entries carry package-error naming the missing package policy",
+           r && r->nitems == 2 &&
+           S(r->items[0],"package-error") && S(r->items[1],"package-error") &&
+           strstr(S(r->items[0],"package-error"), "package policy"));
+        rj_free(r); rj_free(p); }
+
+      /* sendrawtransaction MUST clear the flag the dry run left set */
+      { int before = g_tw_n;
+        char j3[1200]; snprintf(j3, sizeof j3, "[\"%s\"]", TX1);
+        p = rj_parse(j3, strlen(j3));
+        r = NULL; rpc_node_dispatch("sendrawtransaction", p, &r, &ec, &em);
+        rj_free(r); rj_free(p);
+        ck("sendrawtransaction after testmempoolaccept clears tx_submit_test",
+           g_tw_n > before && g_tw_saw_test[g_tw_n-1] == 0); }
+
+      g_tw_run = 0; pthread_join(th, 0);
+
+      /* argument validation happens before anything is staged */
+      { rj_val* q = rj_parse("[[]]", 4);
+        r = NULL; ec = 0;
+        rc = rpc_node_dispatch("testmempoolaccept", q, &r, &ec, &em);
+        ck("an empty array -> -8", rc == 0 && ec == -8);
+        rj_free(r); rj_free(q); }
+      { char big[3000]; int n = snprintf(big, sizeof big, "[[");
+        for (int i = 0; i < 26; i++) n += snprintf(big+n, sizeof big-n, "%s\"00112233445566778899\"", i?",":"");
+        snprintf(big+n, sizeof big-n, "]]");
+        rj_val* q = rj_parse(big, strlen(big));
+        r = NULL; ec = 0;
+        rc = rpc_node_dispatch("testmempoolaccept", q, &r, &ec, &em);
+        ck("26 transactions -> -8 (Core caps at 25)", rc == 0 && ec == -8);
+        rj_free(r); rj_free(q); }
+      { rj_val* q = rj_parse("[[\"zz\"]]", 8);
+        r = NULL; ec = 0;
+        rc = rpc_node_dispatch("testmempoolaccept", q, &r, &ec, &em);
+        ck("undecodable hex -> -22 for the WHOLE call, not a short array",
+           rc == 0 && ec == -22);
+        rj_free(r); rj_free(q); }
+      rpc_node_set_status_rw(NULL); }
+
+    /* submitpackage / private broadcast name their gaps */
+    { r = NULL; ec = 0; em = NULL;
+      rc = rpc_node_dispatch("submitpackage", NULL, &r, &ec, &em);
+      ck("submitpackage -> -1 naming the missing package validation",
+         rc == 0 && ec == -1 && em && strstr(em, "package validation"));
+      rj_free(r);
+      r = NULL; ec = 0; em = NULL;
+      rc = rpc_node_dispatch("getprivatebroadcastinfo", NULL, &r, &ec, &em);
+      ck("getprivatebroadcastinfo -> -1 naming the missing queue",
+         rc == 0 && ec == -1 && em && strstr(em, "private broadcast"));
+      rj_free(r); }
 
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);
