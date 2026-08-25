@@ -68,19 +68,31 @@ void rpc_node_set_status(const node_status_t* st);
 void rpc_node_set_status_rw(node_status_t* st);
 
 /* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED
- * pre-fork region) so getrawmempool/getmempoolinfo report the real pool
- * instead of this process's empty copy. Everything is optional: all-NULL (the
- * standalone rpcd, or the static per-process fallback) keeps the previous
- * empty-pool reporting. lk/ulk are the cross-process lock; time_of/fee lookups
- * may be NULL independently (fields degrade to absent/zero bookkeeping).
- * Passed as pointers rather than read via extern so rpc_node.o does not drag
- * daemon/mempool_cfg.c into every test binary that links it. */
-void rpc_node_set_mempool(void* mp, void* polstate, long long maxbytes,
-                          long (*count)(void*),
-                          void (*lk)(void), void (*ulk)(void),
-                          long (*time_of)(const unsigned char*),
-                          long (*pol_entry)(void*, const unsigned char*,
-                                            unsigned long long*, unsigned long long*));
+ * pre-fork region) so getrawmempool/getmempoolinfo/getmempoolentry report the
+ * real pool instead of this process's empty copy. EVERYTHING is injected as
+ * data/function pointers -- rpc_node.o declares no mempool externs, so it
+ * never drags bitcoin_mempool.o / mempool_cfg.c / the policy TU into the many
+ * test binaries that link it (an extern mpool_count did exactly that once).
+ * Every member is optional: NULL members degrade the affected fields to
+ * absent/zero bookkeeping; a NULL/all-NULL struct keeps the previous
+ * empty-pool reporting (standalone rpcd, static per-process fallback). */
+struct mp_entry_info;   /* mempool_entry.h; only implementations need it */
+typedef struct {
+    void*     mp;             /* structural pool (bitcoin_mempool.asm layout) */
+    void*     polstate;       /* tx-accept policy registry (fees, graph) */
+    long long maxbytes;       /* configured -maxmempool, bytes */
+    long (*count)(void*);                                       /* mpool_count */
+    const unsigned char* (*get)(void*, const unsigned char*, unsigned long*); /* mpool_get */
+    void (*lock)(void);                                         /* mp_lock */
+    void (*unlock)(void);                                       /* mp_unlock */
+    long (*time_of)(const unsigned char*);                      /* arrival time */
+    long (*pol_entry)(void*, const unsigned char*,
+                      unsigned long long*, unsigned long long*);/* fee/size */
+    long (*pol_entry_info)(void*, const unsigned char*,
+                           struct mp_entry_info*);              /* full graph */
+    void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
+} rpc_mempool_hooks;
+void rpc_node_set_mempool(const rpc_mempool_hooks* h);   /* copied; NULL detaches */
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
