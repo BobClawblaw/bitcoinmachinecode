@@ -1,4 +1,12 @@
 # PROJECT PLAN — Bitcoin Node in 100% AI-generated Machine Code
+#
+# STATUS 2026-08-25: the goal below is substantially REACHED. The node
+# follows the live network unattended; its UTXO set is proven byte-identical
+# to Bitcoin Core's (MuHash at height 963,967, no filters/overrides); and it
+# serves most of Core's RPC surface (docs/PARITY_PLAN.md is the live
+# method-by-method tracker, which has superseded this file for current
+# work). This file remains the historical plan-of-record. DEPLOYMENT.md
+# describes running it; README.md carries the current status narrative.
 
 # Location: /storage/bitcoinmachinecode
 # Goal: a working Bitcoin client for Linux implemented as x86-64 assembly,
