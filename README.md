@@ -563,10 +563,20 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   embedded in the serve daemon** (`daemon/main.c`), bridging its fork model with
   a `MAP_SHARED` status region the download worker publishes into, so the
   live-node RPCs `getconnectioncount`, `getnetworkinfo`, `getpeerinfo` (real
-  peer addr/version/subver/services), `getmempoolinfo`, `getrawmempool` and
-  `getchaintips` answer from a running node — verified live in production. Still
-  absent: `sendrawtransaction` (needs a parent→worker relay channel), wallet
-  and mining RPCs, and a descriptor engine (`deriveaddresses`/`getdescriptorinfo`).
+  peer addr/version/subver/services, plus per-socket byte/last-activity meters
+  from the kernel's `TCP_INFO`), `getmempoolinfo`, `getrawmempool` and
+  `getchaintips` answer from a running node — verified live in production. A
+  **descriptor engine** (`asm/bip32_ckdpub.c`) adds `getdescriptorinfo` and
+  `deriveaddresses` — BIP32 public derivation (CKDpub over the verified secp/
+  hmac asm) building `pkh`/`wpkh`/`sh(wpkh)` addresses, verified byte-for-byte
+  against Core's own `deriveaddresses`. `getblock` verbosity 2 now also emits a
+  per-tx `fee` where undo data exists. **`sendrawtransaction`** is wired through
+  the fork model: the RPC parent stages the raw tx into the `MAP_SHARED` region
+  and the download worker (which owns the peer legs) validates + mempool-accepts
+  it and relays it to peers — the plumbing is unit-tested over a socketpair
+  (`tests/test_tx_submit.c`); the live peer-relay proof lands once the UTXO
+  rebuild completes (a real tx can't validate against a partial UTXO set). Still
+  absent: wallet and mining RPCs.
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine
