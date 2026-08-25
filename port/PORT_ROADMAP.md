@@ -40,9 +40,18 @@ and runs natively.
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
       (2026-08-24)
-- [ ] bitcoin_net / bitcoin_p2p           (raw-syscall sockets + framers)
+- [x] bitcoin_net / bitcoin_p2p           (raw-syscall sockets + framers) and
+      bitcoin_headers (persistent header chain) -> port/arm64/bitcoin_{net,p2p,headers}.S
+      test_net / test_p2p / test_p2p_inv / test_headers PASS native
+- [x] bitcoin_store (multi-file blk + index)  -> port/arm64/bitcoin_store.S
+      test_store 41 PASS native + t_roll rollover verified (caught MAX_FILE
+      0x80000000->0x08000000 bug). (2026-08-24)
+- [x] LIVE FULL-BLOCK DOWNLOAD MILESTONE  live_blocks.c: 30 real mainnet blocks
+      (segwit, >=1.8MB) fetched via getdata BLOCK, header-hash verified vs the
+      verified 963k header chain, prev-links checked, coinbase parsed by the
+      ported bitcoin_tx, persisted via bitcoin_store + read back: 0 failures
+      natively. Blk/index now in data/ (blk00000.dat + index.dat).
 - [ ] bitcoin_cons (cons_verify)          [in DAEMONOBJS]
-- [ ] bitcoin_store / store_fast / utxo*  (UTXO mmap/LSM stores)
 - [ ] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
       taproot_verify / strip_witness / tapagg / multisig / sigops ...
 - [ ] bitcoind.asm                        (daemon entry; links everything above)
