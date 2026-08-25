@@ -262,7 +262,7 @@ int main(void){
       ck("getindexinfo(non-string) -> empty object (Core-lenient)", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr); }
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
-    expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
+    expect_err("unknown method still -32601", "nosuchrpcmethod", "[]", -32601, "Method not found");
 
     long ec; const char* em; rj_val* r;
 
@@ -903,6 +903,156 @@ int main(void){
                  "[\"start\", [\"notadesc\"]]", -5, "'notadesc' is not a valid descriptor function");
       rpc_chain_set_utxoscan(0);
     }
+
+    /* ==== the rest of Core's Blockchain category (2026-08-25) ==========
+     * The fixture is 4 blocks: genesis (1 tx) + heights 1,2 (1 tx each) +
+     * height 3 (3 txs) = 6 transactions total. */
+
+    /* ---- getchainstates: exactly one chainstate, always ---- */
+    r = call("getchainstates", "[]", &ec, &em);
+    ck("getchainstates -> object", r && r->typ == RJ_OBJ);
+    ck_str("getchainstates headers", S(r,"headers"), "3");
+    { rj_val* csa = r ? rj_obj_get(r,"chainstates") : NULL;
+      ck("exactly one chainstate (no snapshot support, so never two)",
+         csa && csa->typ == RJ_ARR && csa->nitems == 1);
+      rj_val* cs = (csa && csa->nitems) ? csa->items[0] : NULL;
+      ck_str("chainstate blocks", cs ? S(cs,"blocks") : NULL, "3");
+      ck_str("chainstate bestblockhash agrees with getbestblockhash",
+             cs ? S(cs,"bestblockhash") : NULL, g_hash[3]);
+      ck_str("chainstate validated", cs ? S(cs,"validated") : NULL, "1");
+      /* Core's coin-cache byte fields describe a LevelDB + coin cache this
+       * node does not have; they must be absent, not zero. */
+      ck("coins_db_cache_bytes is omitted, not zeroed",
+         cs && rj_obj_get(cs,"coins_db_cache_bytes") == NULL);
+      ck("coins_tip_cache_bytes is omitted, not zeroed",
+         cs && rj_obj_get(cs,"coins_tip_cache_bytes") == NULL); }
+    rj_free(r);
+
+    /* ---- getdeploymentinfo: heights come from the GENERATED header, so
+     * this asserts the node reports what its script-flag path enforces ---- */
+    r = call("getdeploymentinfo", "[]", &ec, &em);
+    ck("getdeploymentinfo -> object", r && r->typ == RJ_OBJ);
+    ck_str("getdeploymentinfo hash is the tip", S(r,"hash"), g_hash[3]);
+    ck_str("getdeploymentinfo height is the tip", S(r,"height"), "3");
+    { rj_val* dep = r ? rj_obj_get(r,"deployments") : NULL;
+      ck("Core's five buried deployments, no more", dep && dep->nmembers == 5);
+      rj_val* seg = dep ? rj_obj_get(dep,"segwit") : NULL;
+      ck_str("segwit type is buried", seg ? S(seg,"type") : NULL, "buried");
+      ck_str("segwit height is the generated SFC_HEIGHT_SEGWIT",
+             seg ? S(seg,"height") : NULL, "481824");
+      ck_str("segwit is NOT active at fixture height 3",
+             seg ? S(seg,"active") : NULL, "0");
+      rj_val* b34 = dep ? rj_obj_get(dep,"bip34") : NULL;
+      ck_str("bip34 height is the generated SFC_HEIGHT_BIP34",
+             b34 ? S(b34,"height") : NULL, "227931"); }
+    { rj_val* sf = r ? rj_obj_get(r,"script_flags") : NULL;
+      /* at height 4 only the unconditional flags apply */
+      ck("script_flags at a pre-activation height is exactly P2SH + TAPROOT",
+         sf && sf->typ == RJ_ARR && sf->nitems == 2 &&
+         !strcmp(sf->items[0]->str, "P2SH") && !strcmp(sf->items[1]->str, "TAPROOT")); }
+    rj_free(r);
+    /* the blockhash argument selects a different block */
+    { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[1]);
+      r = call("getdeploymentinfo", pj, &ec, &em);
+      ck_str("getdeploymentinfo(blockhash) reports that block", S(r,"height"), "1");
+      rj_free(r); }
+    expect_err("getdeploymentinfo on an unknown hash -> -5", "getdeploymentinfo",
+               "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
+               -5, "Block not found");
+
+    /* ---- getchaintxstats ---- */
+    r = call("getchaintxstats", "[]", &ec, &em);
+    ck("getchaintxstats -> object", r && r->typ == RJ_OBJ);
+    ck_str("window_final_block_height", S(r,"window_final_block_height"), "3");
+    /* the fixture is shorter than the 4320-block default, so the window
+     * clamps to the chain */
+    ck_str("window clamps to the chain length", S(r,"window_block_count"), "3");
+    ck_str("window_tx_count counts heights 1..3 = 1+1+3", S(r,"window_tx_count"), "5");
+    ck_str("txcount is the CUMULATIVE count including genesis", S(r,"txcount"), "6");
+    ck("txrate present when the window has a positive interval",
+       rj_obj_get(r,"txrate") != NULL);
+    rj_free(r);
+    { /* an explicit window */
+      r = call("getchaintxstats", "[1]", &ec, &em);
+      ck_str("window=1 counts only the tip block's 3 txs", S(r,"window_tx_count"), "3");
+      rj_free(r); }
+    { /* window 0: Core emits no window_tx_count/txrate for an empty window */
+      r = call("getchaintxstats", "[0]", &ec, &em);
+      ck_str("window=0 -> window_block_count 0", S(r,"window_block_count"), "0");
+      ck("window=0 emits no txrate", r && rj_obj_get(r,"txrate") == NULL);
+      rj_free(r); }
+    expect_err("a window past the chain -> -8", "getchaintxstats", "[9999]", -8,
+               "Invalid block count: should be between 0 and the block's height - 1");
+
+    /* ---- verifychain ----
+     * The fixture's synthetic headers carry bits 0x1d00ffff with nonce 0, so
+     * they have no valid proof of work. That makes level 1 the sharpest test
+     * available here: it must return FALSE. A level-1 check that returned
+     * true on these blocks would not be checking anything. */
+    r = call("verifychain", "[0,4]", &ec, &em);
+    ck_str("verifychain level 0 (readable) -> true", r ? r->str : NULL, "1");
+    rj_free(r);
+    r = call("verifychain", "[1,4]", &ec, &em);
+    ck_str("verifychain level 1 -> FALSE (synthetic headers have no valid PoW)",
+           r ? r->str : NULL, "0");
+    rj_free(r);
+    r = call("verifychain", "[2,4]", &ec, &em);
+    ck_str("verifychain level 2 -> false (no undo data in the fixture)",
+           r ? r->str : NULL, "0");
+    rj_free(r);
+    { long e3; const char* m3; rj_val* r3 = call("verifychain", "[3,4]", &e3, &m3);
+      ck("verifychain level 3 REFUSES rather than returning a downgraded true",
+         r3 == NULL && e3 == -1 && m3 && strstr(m3, "checklevel 0-2"));
+      rj_free(r3); }
+    { long e4; const char* m4; rj_val* r4 = call("verifychain", "[]", &e4, &m4);
+      ck("bare verifychain (Core default level 3) refuses too, naming the range",
+         r4 == NULL && e4 == -1 && m4 && strstr(m4, "checklevel 2 or lower"));
+      rj_free(r4); }
+    expect_err("verifychain level 9 -> -8", "verifychain", "[9]", -8,
+               "Invalid checklevel: must be 0-4");
+
+    /* ---- waitfor* : satisfied conditions return immediately ---- */
+    r = call("waitforblockheight", "[1,1000]", &ec, &em);
+    ck("waitforblockheight below the tip returns at once",
+       r && r->typ == RJ_OBJ);
+    ck_str("...reporting the current tip height", S(r,"height"), "3");
+    ck_str("...and its hash", S(r,"hash"), g_hash[3]);
+    rj_free(r);
+    { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\",1000]", g_hash[3]);
+      r = call("waitforblock", pj, &ec, &em);
+      ck("waitforblock on the CURRENT tip hash returns at once", r && r->typ == RJ_OBJ);
+      ck_str("...with that height", S(r,"height"), "3");
+      rj_free(r); }
+    { /* nothing will arrive; the short timeout must expire and return the
+       * current tip, which is Core's own on-timeout behaviour */
+      r = call("waitfornewblock", "[100]", &ec, &em);
+      ck("waitfornewblock times out and returns the current tip",
+         r && r->typ == RJ_OBJ);
+      ck_str("...at the unchanged height", S(r,"height"), "3");
+      rj_free(r); }
+    expect_err("waitforblockheight with no height -> -8", "waitforblockheight", "[]",
+               -8, "waitforblockheight requires a height");
+
+    /* ---- the refusals name what is missing ---- */
+    { struct { const char* m; const char* needle; } R[] = {
+        {"getblockfilter", "filter"}, {"scanblocks", "filter"},
+        {"getdescriptoractivity", "filter"},
+        {"dumptxoutset", "snapshot"}, {"loadtxoutset", "snapshot"},
+        {"preciousblock", "fork choice"}, {"pruneblockchain", "fork choice"},
+        {"savemempool", "mempool.dat"}, {"importmempool", "mempool.dat"} };
+      int all = 1;
+      for (unsigned i = 0; i < sizeof R / sizeof *R; i++){
+          long e; const char* m; rj_val* rr = call(R[i].m, "[]", &e, &m);
+          if (!(rr == NULL && e == -1 && m && strstr(m, R[i].needle))){
+              printf("      (%s: ec=%ld em=%s)\n", R[i].m, e, m ? m : "(null)");
+              all = 0;
+          }
+          rj_free(rr);
+      }
+      ck("every unsupported Blockchain method errors with the reason named", all);
+      ck("rpc_known_method covers them too",
+         rpc_known_method("dumptxoutset") && rpc_known_method("getchainstates") &&
+         rpc_known_method("waitforblock") && rpc_known_method("verifychain")); }
 
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);

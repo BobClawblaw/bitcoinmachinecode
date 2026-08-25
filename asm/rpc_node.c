@@ -463,6 +463,100 @@ static int cmd_getmempoolinfo(rj_val** res){
     *res = o;
     return 1;
 }
+/* ==== gettxspendingprevout ==============================================
+ * Core lists it under Blockchain, but it is a pure mempool query and the
+ * pool enumeration lives here, so it lives here too. For each outpoint the
+ * caller names, report the mempool transaction spending it, if any -- and
+ * report the outpoint with no `spendingtxid` when nothing does, which is
+ * what Core returns rather than omitting the entry. */
+static int gtsp_hex32_wire(const char* h, unsigned char out[32]){
+    if (!h || strlen(h) != 64) return 0;
+    for (int i = 0; i < 32; i++){
+        int hi, lo; char a = h[i*2], b = h[i*2+1];
+        if (a>='0'&&a<='9') hi=a-'0'; else if (a>='a'&&a<='f') hi=a-'a'+10;
+        else if (a>='A'&&a<='F') hi=a-'A'+10; else return 0;
+        if (b>='0'&&b<='9') lo=b-'0'; else if (b>='a'&&b<='f') lo=b-'a'+10;
+        else if (b>='A'&&b<='F') lo=b-'A'+10; else return 0;
+        out[31-i] = (unsigned char)((hi<<4)|lo);      /* display -> wire */
+    }
+    return 1;
+}
+
+/* Does mempool tx `tx` spend (txid_wire, vout)? Walks the input list only. */
+static int gtsp_spends(const unsigned char* tx, unsigned long len,
+                       const unsigned char txid_wire[32], unsigned long vout){
+    if (len < 10) return 0;
+    unsigned long p = 4;
+    if (len > 6 && tx[4] == 0x00 && tx[5] == 0x01) p = 6;   /* segwit marker */
+    unsigned long cc;
+    unsigned long n_in = mp_varint(tx + p, &cc); p += cc;
+    if (n_in == 0 || n_in > 100000) return 0;
+    for (unsigned long i = 0; i < n_in; i++){
+        if (p + 36 > len) return 0;
+        unsigned long vo = (unsigned long)tx[p+32] | ((unsigned long)tx[p+33]<<8) |
+                           ((unsigned long)tx[p+34]<<16) | ((unsigned long)tx[p+35]<<24);
+        if (vo == vout && !memcmp(tx + p, txid_wire, 32)) return 1;
+        p += 36;
+        unsigned long ssl = mp_varint(tx + p, &cc); p += cc + ssl + 4;
+        if (p > len) return 0;
+    }
+    return 0;
+}
+
+static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
+                                    long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR){
+        *ec = -8; *em = "Invalid parameter, outputs is not an array"; return 0; }
+    const rj_val* list = params->items[0];
+    if (list->nitems == 0){
+        *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
+    /* validate the whole list before touching the pool, so a bad entry
+     * cannot produce a half-answered array */
+    for (size_t i = 0; i < list->nitems; i++){
+        const rj_val* e = list->items[i];
+        unsigned char t[32];
+        rj_val* tid = (e->typ == RJ_OBJ) ? rj_obj_get(e, "txid") : NULL;
+        rj_val* vo  = (e->typ == RJ_OBJ) ? rj_obj_get(e, "vout") : NULL;
+        if (!tid || tid->typ != RJ_STR || !gtsp_hex32_wire(tid->str, t)){
+            *ec = -8; *em = "Invalid parameter, expected hex txid"; return 0; }
+        if (!vo || vo->typ != RJ_NUM || atol(vo->str) < 0){
+            *ec = -8; *em = "Invalid parameter, vout must be a non-negative integer"; return 0; }
+    }
+    static const char* HEXD = "0123456789abcdef";
+    rj_val* arr = rj_arr();
+    if (g_mph.mp) mpl();
+    for (size_t i = 0; i < list->nitems; i++){
+        const rj_val* e = list->items[i];
+        unsigned char want[32];
+        gtsp_hex32_wire(rj_obj_get((rj_val*)e, "txid")->str, want);
+        unsigned long vout = (unsigned long)atol(rj_obj_get((rj_val*)e, "vout")->str);
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "txid", rj_str(rj_obj_get((rj_val*)e, "txid")->str));
+        rj_obj_set(o, "vout", rj_numf("%lu", vout));
+        if (g_mph.mp){
+            unsigned long n = mp_slot_count(g_mph.mp);
+            for (unsigned long k = 0; k < n; k++){
+                mp_ent me;
+                if (mp_slot(g_mph.mp, k, &me) != 1) continue;
+                if (!gtsp_spends(me.tx, me.len, want, vout)) continue;
+                char hx[65];
+                for (int b = 0; b < 32; b++){
+                    unsigned char v = me.txid[31-b];
+                    hx[b*2] = HEXD[v>>4]; hx[b*2+1] = HEXD[v&15];
+                }
+                hx[64] = 0;
+                rj_obj_set(o, "spendingtxid", rj_str(hx));
+                break;
+            }
+        }
+        rj_arr_push(arr, o);
+    }
+    if (g_mph.mp) mpu();
+    *res = arr;
+    return 1;
+}
+
 static int cmd_getrawmempool(const rj_val* params, rj_val** res){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
      * txids (display byte order). Verbose entries carry the fields this node
@@ -936,6 +1030,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
+    "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
     "setban", "setnetworkactive", "ping",
@@ -950,6 +1045,19 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
+    if (!strcmp(m, "gettxspendingprevout")) return cmd_gettxspendingprevout(params, res, ec, em);
+    if (!strcmp(m, "getmempoolcluster"))
+        return cmd_net_unsupported(
+            "this node's mempool has no cluster linearization: it tracks the "
+            "ancestor/descendant graph (see getmempoolancestors) but not "
+            "Core's cluster mempool structure, so there are no clusters to "
+            "report", ec, em);
+    if (!strcmp(m, "getblockfrompeer"))
+        return cmd_net_unsupported(
+            "peer connections belong to the forked download worker, which "
+            "chooses what to fetch from its own headers-first schedule; there "
+            "is no parent-to-worker channel for a targeted block request, so "
+            "this call would change nothing", ec, em);
     if (!strcmp(m, "getnettotals"))       return cmd_getnettotals(res);
     if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res);
     if (!strcmp(m, "getaddrmaninfo"))     return cmd_getaddrmaninfo(res);
