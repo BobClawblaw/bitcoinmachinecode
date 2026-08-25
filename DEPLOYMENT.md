@@ -150,6 +150,18 @@ count, uptime.
   against your Core oracle's `gettxoutsetinfo muhash <height>`, is the
   strongest statement this software can make about itself. Run it after
   anything eventful.
+- **Exercise the reorg path deliberately, because mainnet rarely will.**
+  A 1-block mainnet reorg happens every few weeks, so a node can run for
+  months with its most destructive code path (disconnect, UTXO rewrite,
+  archive truncate, mempool reconcile) never executed on real data.
+  `asm/tests/reorg_drill <datadir-COPY> --depth 3` disconnects the last N
+  real blocks and reconnects the SAME blocks, requiring the UTXO walk and
+  the tip hash to return to exactly their prior values -- a total assertion,
+  since the expected end state IS the start state. Build the copy from a
+  STOPPED daemon in one pass (index/headers/chainwork, the utxo_* state, the
+  undo_<h>.dat files for the depth being drilled, and the blk file holding
+  the tip blocks -- typically ~13 GB, not the whole 1.4 TB archive). The
+  drill refuses the production datadir by path; do not override that.
 - **Never point tools at a datadir a daemon is writing** unless the tool has
   the fingerprint/quiescence discipline (`utxo_setinfo` and the RPC readers
   do; ad-hoc scripts do not).
