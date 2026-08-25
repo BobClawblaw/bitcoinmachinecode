@@ -21,6 +21,10 @@ extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
+extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str);
+/* message signing (asm/wallet_msgsign.c): Core-byte-compatible compact sigs. */
+extern int  msg_sign_core(const unsigned char priv_be[32], const char* message, char sig_b64[96]);
+extern int  msg_verify_core(const char* address, const char* message, const char* sig_b64);
 
 /* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
  * rpc_commands_set_utxo_store's own doc comment in the header. */
@@ -566,11 +570,148 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     return 1;
 }
 
+/* ---- signmessagewithprivkey / verifymessage (pure, no wallet state) --------
+ * Core rpc/signmessage.cpp. Both are non-wallet in Core (the scratch oracle
+ * serves them), so these are cross-verified against it: a signature ours emits
+ * verifies under Core, and Core's verifies under ours. Compact-sig bytes are
+ * Core-compatible via msg_sign_core (see wallet_msgsign.c). */
+static int cmd_signmessagewithprivkey(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* wif = rpc_param_str(params, 0, ec, em); if (!wif) return 0;
+    const char* msg = rpc_param_str(params, 1, ec, em); if (!msg) return 0;
+    unsigned char pay[64]; long pl = 0;
+    if (!wallet_base58check_decode(pay, (long)sizeof pay, &pl, wif) || pl < 33 || pay[0] != 0x80){
+        *ec = -5; *em = "Invalid private key"; return 0; }
+    /* WIF payload: 0x80 | priv[32] | [0x01 if compressed]. msg_sign_core emits
+     * the compressed-pubkey header (31..34); an uncompressed WIF would need the
+     * 27..30 header, which this path does not produce -- reject it plainly
+     * rather than emit a signature that verifies under the wrong address. */
+    if (pl == 33){ *ec = -5; *em = "Uncompressed keys are not supported by signmessage"; return 0; }
+    if (pl != 34 || pay[33] != 0x01){ *ec = -5; *em = "Invalid private key"; return 0; }
+    char sig[96];
+    if (msg_sign_core(pay + 1, msg, sig) != 0){ *ec = -5; *em = "Sign failed"; return 0; }
+    *result = rj_str(sig);
+    return 1;
+}
+static int cmd_verifymessage(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* addr = rpc_param_str(params, 0, ec, em); if (!addr) return 0;
+    const char* sig  = rpc_param_str(params, 1, ec, em); if (!sig)  return 0;
+    const char* msg  = rpc_param_str(params, 2, ec, em); if (!msg)  return 0;
+    int r = msg_verify_core(addr, msg, sig);   /* 1 match, 0 no-match, <0 malformed */
+    if (r < 0){ *ec = -5; *em = "Malformed base64 encoding"; return 0; }
+    *result = rj_bool(r == 1);
+    return 1;
+}
+
+/* ---- createrawtransaction (pure serialization, no wallet state) ------------
+ * Core rpc/rawtransaction.cpp. Builds an unsigned tx from explicit inputs and
+ * outputs (no fee/change logic -- that is a funding concern). Non-wallet in
+ * Core, so oracle-verifiable byte-for-byte. Default version 2; sequence
+ * defaults follow Core: replaceable -> 0xfffffffd, else locktime!=0 ->
+ * 0xfffffffe, else 0xffffffff. */
+enum { CRT_P2PKH=1, CRT_P2WPKH=2, CRT_P2SH=3, CRT_P2WSH=4, CRT_P2TR=5 };
+static long crt_addr_to_spk(const char* addr, unsigned char* spk){
+    int type=0; unsigned char ver=0, h160[20], prog[32];
+    if (!wallet_validate_address(addr, &type, &ver, h160, prog)) return 0;
+    switch (type){
+        case CRT_P2PKH:  spk[0]=0x76;spk[1]=0xa9;spk[2]=0x14;memcpy(spk+3,h160,20);spk[23]=0x88;spk[24]=0xac;return 25;
+        case CRT_P2SH:   spk[0]=0xa9;spk[1]=0x14;memcpy(spk+2,h160,20);spk[22]=0x87;return 23;
+        case CRT_P2WPKH: spk[0]=0x00;spk[1]=0x14;memcpy(spk+2,h160,20);return 22;
+        case CRT_P2WSH:  spk[0]=0x00;spk[1]=0x20;memcpy(spk+2,prog,32);return 34;
+        case CRT_P2TR:   spk[0]=0x51;spk[1]=0x20;memcpy(spk+2,prog,32);return 34;
+        default: return 0;
+    }
+}
+/* BTC decimal string -> satoshis; -1 on parse error or >8 decimals. */
+static long long crt_amount_to_sat(const char* s){
+    long long whole=0, frac=0; int fdig=0, seen=0;
+    const char* p=s; if (*p=='-') return -1;
+    while (*p>='0'&&*p<='9'){ whole=whole*10+(*p-'0'); p++; seen=1; }
+    if (*p=='.'){ p++; while (*p>='0'&&*p<='9'){ if (fdig>=8) return -1; frac=frac*10+(*p-'0'); fdig++; p++; seen=1; } }
+    if (*p || !seen) return -1;
+    while (fdig<8){ frac*=10; fdig++; }
+    return whole*100000000LL + frac;
+}
+static long crt_varint(unsigned char* o, unsigned long long v){
+    if (v<0xfd){ o[0]=(unsigned char)v; return 1; }
+    if (v<=0xffff){ o[0]=0xfd; o[1]=(unsigned char)v; o[2]=(unsigned char)(v>>8); return 3; }
+    if (v<=0xffffffffULL){ o[0]=0xfe; for(int i=0;i<4;i++) o[1+i]=(unsigned char)(v>>(8*i)); return 5; }
+    o[0]=0xff; for(int i=0;i<8;i++) o[1+i]=(unsigned char)(v>>(8*i)); return 9;
+}
+static int cmd_createrawtransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_ARR){
+        *ec=-8; *em="Invalid parameters, expected an inputs array and outputs"; return 0; }
+    const rj_val* ins = params->items[0];
+    const rj_val* outs = params->items[1];
+    long locktime=0;
+    if (params->nitems>=3 && params->items[2]->typ==RJ_NUM) locktime=strtol(params->items[2]->str,0,10);
+    int replaceable=1;   /* modern Core defaults to opt-in RBF (replaceable=true) */
+    if (params->nitems>=4 && params->items[3]->typ==RJ_BOOL) replaceable=(params->items[3]->str[0]=='1');
+    unsigned long defseq = replaceable ? 0xfffffffdUL : (locktime!=0 ? 0xfffffffeUL : 0xffffffffUL);
+
+    static unsigned char tx[131072]; long n=0;
+    tx[n++]=2; tx[n++]=0; tx[n++]=0; tx[n++]=0;                 /* version 2 LE */
+    n += crt_varint(tx+n, (unsigned long long)ins->nitems);
+    for (size_t i=0;i<ins->nitems;i++){
+        const rj_val* in=ins->items[i];
+        if (in->typ!=RJ_OBJ){ *ec=-8; *em="Invalid parameter, expected input object"; return 0; }
+        rj_val* tid=rj_obj_get(in,"txid"); rj_val* vout=rj_obj_get(in,"vout");
+        if (!tid||tid->typ!=RJ_STR||strlen(tid->str)!=64||!vout||vout->typ!=RJ_NUM){
+            *ec=-8; *em="Invalid parameter, missing/invalid txid or vout"; return 0; }
+        unsigned char id[32];
+        if (!hex_to_bytes(id,tid->str,64)){ *ec=-8; *em="txid must be hexadecimal string"; return 0; }
+        for (int k=0;k<32;k++) tx[n+k]=id[31-k];               /* display -> wire */
+        n+=32;
+        unsigned long vo=strtoul(vout->str,0,10);
+        tx[n++]=(unsigned char)vo;tx[n++]=(unsigned char)(vo>>8);tx[n++]=(unsigned char)(vo>>16);tx[n++]=(unsigned char)(vo>>24);
+        tx[n++]=0;                                             /* empty scriptSig */
+        rj_val* seq=rj_obj_get(in,"sequence");
+        unsigned long s=(seq&&seq->typ==RJ_NUM)?strtoul(seq->str,0,10):defseq;
+        tx[n++]=(unsigned char)s;tx[n++]=(unsigned char)(s>>8);tx[n++]=(unsigned char)(s>>16);tx[n++]=(unsigned char)(s>>24);
+    }
+    /* outputs: accept either an object {addr:amt,...} or an array of single-key
+     * objects (both are valid Core forms). Flatten to (key,val) pairs. */
+    const rj_member* omem=NULL; size_t onm=0; const rj_val* oarr=NULL;
+    if (outs->typ==RJ_OBJ){ omem=outs->members; onm=outs->nmembers; }
+    else if (outs->typ==RJ_ARR){ oarr=outs; onm=outs->nitems; }
+    else { *ec=-8; *em="Invalid parameter, expected outputs object or array"; return 0; }
+    n += crt_varint(tx+n, (unsigned long long)onm);
+    for (size_t i=0;i<onm;i++){
+        const char* key; const rj_val* val;
+        if (omem){ key=omem[i].key; val=omem[i].val; }
+        else { const rj_val* e=oarr->items[i];
+               if (e->typ!=RJ_OBJ||e->nmembers<1){ *ec=-8; *em="Invalid output"; return 0; }
+               key=e->members[0].key; val=e->members[0].val; }
+        if (!strcmp(key,"data")){
+            if (val->typ!=RJ_STR){ *ec=-8; *em="Data is not a valid hex-encoded value"; return 0; }
+            size_t dl=strlen(val->str); if (dl&1){ *ec=-8; *em="Data hex has odd length"; return 0; }
+            size_t db=dl/2; if (db>80){ *ec=-8; *em="Data too long for OP_RETURN"; return 0; }
+            unsigned char data[80]; if (db && !hex_to_bytes(data,val->str,dl)){ *ec=-8; *em="Invalid data hex"; return 0; }
+            for (int k=0;k<8;k++) tx[n++]=0;                   /* value 0 */
+            unsigned char spk[100]; long sl=0; spk[sl++]=0x6a; /* OP_RETURN */
+            if (db<=75){ spk[sl++]=(unsigned char)db; } else { spk[sl++]=0x4c; spk[sl++]=(unsigned char)db; }
+            memcpy(spk+sl,data,db); sl+=db;
+            n+=crt_varint(tx+n,(unsigned long long)sl); memcpy(tx+n,spk,sl); n+=sl;
+        } else {
+            long long sat=(val->typ==RJ_NUM)?crt_amount_to_sat(val->str):-1;
+            if (sat<0){ *ec=-3; *em="Invalid amount"; return 0; }
+            unsigned char spk[40]; long sl=crt_addr_to_spk(key,spk);
+            if (sl==0){ static char e[128]; snprintf(e,sizeof e,"Invalid Bitcoin address: %s",key); *ec=-5; *em=e; return 0; }
+            for (int k=0;k<8;k++) tx[n++]=(unsigned char)((unsigned long long)sat>>(8*k));
+            n+=crt_varint(tx+n,(unsigned long long)sl); memcpy(tx+n,spk,sl); n+=sl;
+        }
+    }
+    tx[n++]=(unsigned char)locktime;tx[n++]=(unsigned char)(locktime>>8);tx[n++]=(unsigned char)(locktime>>16);tx[n++]=(unsigned char)(locktime>>24);
+    char* hex=malloc((size_t)n*2+1); if (!hex){ *ec=-7; *em="oom"; return 0; }
+    bin_to_hex(hex,tx,(size_t)n); *result=rj_str(hex); free(hex);
+    return 1;
+}
+
 /* ---- dispatch table ---- */
 int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
+        "signmessagewithprivkey","verifymessage","createrawtransaction",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -599,6 +740,12 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_getbalance(params, w, err_code, err_msg, result);
     if (!strcmp(method, "decoderawtransaction"))
         return cmd_decoderaw(params, err_code, err_msg, result);
+    if (!strcmp(method, "signmessagewithprivkey"))
+        return cmd_signmessagewithprivkey(params, err_code, err_msg, result);
+    if (!strcmp(method, "verifymessage"))
+        return cmd_verifymessage(params, err_code, err_msg, result);
+    if (!strcmp(method, "createrawtransaction"))
+        return cmd_createrawtransaction(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
      * serve daemon's shared status; -1 means "not one of its methods". */
     {
