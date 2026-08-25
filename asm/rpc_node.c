@@ -11,6 +11,7 @@
  * values true for THIS node, not the oracle's numbers.
  */
 #include "rpc_node.h"
+#include "mempool_entry.h"
 #include "version_gen.h"
 #include <string.h>
 #include <stdio.h>
@@ -157,31 +158,13 @@ static int cmd_getpeerinfo(rj_val** res){
 #define MEMPOOL_MAXBYTES   300000000LL     /* 300 MB default (config default) */
 #define MEMPOOL_MINFEE_BTC 0.00001000      /* min relay fee, BTC/kvB */
 
-static void* g_mp;                   /* shared structural pool (or NULL) */
-static void* g_mp_pol;               /* shared policy state (fees; or NULL) */
-static long long g_mp_maxbytes = MEMPOOL_MAXBYTES;
-static void (*g_mp_lk)(void);
-static void (*g_mp_ulk)(void);
-static long (*g_mp_time_of)(const unsigned char*);
-static long (*g_mp_pol_entry)(void*, const unsigned char*,
-                              unsigned long long*, unsigned long long*);
-static long (*g_mp_count)(void*);   /* mpool_count, injected -- NOT an extern,
-                                     * so rpc_node.o never drags
-                                     * bitcoin_mempool.o into its consumers */
+static rpc_mempool_hooks g_mph;      /* zeroed = no pool injected */
 
-void rpc_node_set_mempool(void* mp, void* polstate, long long maxbytes,
-                          long (*count)(void*),
-                          void (*lk)(void), void (*ulk)(void),
-                          long (*time_of)(const unsigned char*),
-                          long (*pol_entry)(void*, const unsigned char*,
-                                            unsigned long long*, unsigned long long*)){
-    g_mp = mp; g_mp_pol = polstate;
-    if (maxbytes > 0) g_mp_maxbytes = maxbytes;
-    g_mp_count = count;
-    g_mp_lk = lk; g_mp_ulk = ulk; g_mp_time_of = time_of; g_mp_pol_entry = pol_entry;
+void rpc_node_set_mempool(const rpc_mempool_hooks* h){
+    if (h) g_mph = *h; else memset(&g_mph, 0, sizeof g_mph);
 }
-static void mpl(void){ if (g_mp_lk) g_mp_lk(); }
-static void mpu(void){ if (g_mp_ulk) g_mp_ulk(); }
+static void mpl(void){ if (g_mph.lock) g_mph.lock(); }
+static void mpu(void){ if (g_mph.unlock) g_mph.unlock(); }
 
 /* Slot layout per bitcoin_mempool.asm's header (same walk daemon/reorg.c
  * uses): +0 n, +8 mask, +16 blob, then 48-byte slots at +40 --
@@ -241,16 +224,16 @@ static unsigned long mp_tx_vsize(const unsigned char* tx, unsigned long len){
 
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
-    if (g_mp){
+    if (g_mph.mp){
         mpl();
-        count = g_mp_count ? g_mp_count(g_mp) : 0;
-        unsigned long n = mp_slot_count(g_mp);
+        count = g_mph.count ? g_mph.count(g_mph.mp) : 0;
+        unsigned long n = mp_slot_count(g_mph.mp);
         for (unsigned long i=0;i<n;i++){ mp_ent e;
-            if (mp_slot(g_mp,i,&e) != 1) continue;
+            if (mp_slot(g_mph.mp,i,&e) != 1) continue;
             bytes += mp_tx_vsize(e.tx, e.len);
             blob_used += e.len;
             unsigned long long f,s;
-            if (g_mp_pol && g_mp_pol_entry && g_mp_pol_entry(g_mp_pol,e.txid,&f,&s)) total_fee += f;
+            if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s)) total_fee += f;
         }
         mpu();
     }
@@ -262,7 +245,7 @@ static int cmd_getmempoolinfo(rj_val** res){
      * stored tx bytes + 48B/slot structural overhead for the live entries. */
     rj_obj_set(o, "usage", rj_numf("%llu", blob_used + (unsigned long long)count*48));
     rj_obj_set(o, "total_fee", rj_numf("%llu.%08llu", total_fee/100000000ULL, total_fee%100000000ULL));
-    rj_obj_set(o, "maxmempool", rj_numf("%lld", g_mp_maxbytes));
+    rj_obj_set(o, "maxmempool", rj_numf("%lld", g_mph.maxbytes > 0 ? g_mph.maxbytes : MEMPOOL_MAXBYTES));
     rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
@@ -285,12 +268,12 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
         if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
     }
     rj_val* out = verbose ? rj_obj() : rj_arr();
-    if (g_mp){
+    if (g_mph.mp){
         static const char* HEXD = "0123456789abcdef";
         mpl();
-        unsigned long n = mp_slot_count(g_mp);
+        unsigned long n = mp_slot_count(g_mph.mp);
         for (unsigned long i=0;i<n;i++){ mp_ent e;
-            if (mp_slot(g_mp,i,&e) != 1) continue;
+            if (mp_slot(g_mph.mp,i,&e) != 1) continue;
             char hx[65];
             for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
             hx[64]=0;
@@ -299,10 +282,10 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
             unsigned long w = mp_tx_weight(e.tx, e.len);
             rj_obj_set(ent, "vsize", rj_numf("%lu", (w+3)/4));
             rj_obj_set(ent, "weight", rj_numf("%lu", w));
-            rj_obj_set(ent, "time", rj_numf("%ld", g_mp_time_of ? g_mp_time_of(e.txid) : 0));
+            rj_obj_set(ent, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(e.txid) : 0));
             unsigned long long f=0,s=0;
             rj_val* fees = rj_obj();
-            if (g_mp_pol && g_mp_pol_entry && g_mp_pol_entry(g_mp_pol,e.txid,&f,&s))
+            if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s))
                 rj_obj_set(fees, "base", rj_numf("%llu.%08llu", f/100000000ULL, f%100000000ULL));
             rj_obj_set(ent, "fees", fees);
             rj_obj_set(out, hx, ent);
@@ -310,6 +293,103 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
         mpu();
     }
     *res = out;
+    return 1;
+}
+
+/* getmempoolentry txid (Core rpc/mempool.cpp entryToJSON, documented field
+ * set minus master's cluster-mempool extras). Field sources, honestly:
+ *   vsize/weight     parsed from the stored tx bytes (BIP141).
+ *   wtxid            sha256d over the FULL serialization (== txid for legacy).
+ *   time             the accept-path arrival stamp (0 if unknown).
+ *   height           NOT tracked at accept time -- reported 0, the same
+ *                    documented-gap convention getpeerinfo uses.
+ *   counts/fees      the tx-accept policy registry's graph, snapshotted under
+ *                    mp_lock; ancestor/descendant SIZES are true BIP141 vsize
+ *                    sums (each member's bytes re-read from the pool), unlike
+ *                    the registry's raw-length bookkeeping.
+ *   fees.modified    == fees.base (no prioritisetransaction).
+ *   depends/spentby  direct graph edges, filtered to txs still in the pool.
+ * Errors are Core-exact: -8 bad txid (same message shape), -5 not in pool. */
+static void mpe_hex(char* dst, const unsigned char* internal){
+    static const char* HEXD = "0123456789abcdef";
+    for (int k=0;k<32;k++){ unsigned char b=internal[31-k]; dst[k*2]=HEXD[b>>4]; dst[k*2+1]=HEXD[b&15]; }
+    dst[64]=0;
+}
+static rj_val* mpe_amount(unsigned long long sat){
+    return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
+}
+static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char embuf[128];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
+        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    const char* hx = params->items[0]->str;
+    size_t hl = strlen(hx);
+    if (hl != 64){
+        snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", hl, hx);
+        *ec = -8; *em = embuf; return 0; }
+    unsigned char txid[32];
+    for (int i=0;i<32;i++){
+        int a=srt_hex1(hx[i*2]), b=srt_hex1(hx[i*2+1]);
+        if (a<0||b<0){ snprintf(embuf,sizeof embuf,"txid must be hexadecimal string (not '%s')",hx);
+                       *ec=-8; *em=embuf; return 0; }
+        txid[31-i]=(unsigned char)((a<<4)|b);           /* display -> internal */
+    }
+    if (!g_mph.mp || !g_mph.get){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    mpl();
+    unsigned long len=0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
+    if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    rj_val* o = rj_obj();
+    unsigned long w = mp_tx_weight(tx, len);
+    rj_obj_set(o, "vsize", rj_numf("%lu", (w+3)/4));
+    rj_obj_set(o, "weight", rj_numf("%lu", w));
+    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
+    rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
+
+    mp_entry_info inf; int have_inf = 0;
+    if (g_mph.polstate && g_mph.pol_entry_info)
+        have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
+    /* ancestor/descendant vsize sums over set members STILL IN THE POOL */
+    unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0;
+    if (have_inf){
+        for (int i=0;i<inf.n_anc;i++){ unsigned long l2=0;
+            const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
+            if (t2){ anc_vs += (mp_tx_weight(t2,l2)+3)/4; anc_n++; } }
+        for (int i=0;i<inf.n_desc;i++){ unsigned long l2=0;
+            const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
+            if (t2){ desc_vs += (mp_tx_weight(t2,l2)+3)/4; desc_n++; } }
+    } else { anc_n=1; desc_n=1; anc_vs=desc_vs=(w+3)/4; }
+    rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
+    rj_obj_set(o, "descendantsize", rj_numf("%llu", desc_vs));
+    rj_obj_set(o, "ancestorcount", rj_numf("%d", anc_n));
+    rj_obj_set(o, "ancestorsize", rj_numf("%llu", anc_vs));
+
+    { unsigned char wt[32]; char whx[65];
+      if (g_mph.sha256d){ g_mph.sha256d(wt, tx, len); mpe_hex(whx, wt); }
+      else mpe_hex(whx, txid);                       /* degrade: txid */
+      rj_obj_set(o, "wtxid", rj_str(whx)); }
+
+    { rj_val* fees = rj_obj();
+      unsigned long long base = have_inf ? inf.fee : 0;
+      rj_obj_set(fees, "base", mpe_amount(base));
+      rj_obj_set(fees, "modified", mpe_amount(base));
+      rj_obj_set(fees, "ancestor", mpe_amount(have_inf ? inf.anc_fee : base));
+      rj_obj_set(fees, "descendant", mpe_amount(have_inf ? inf.desc_fee : base));
+      rj_obj_set(o, "fees", fees); }
+
+    { rj_val* dep = rj_arr();
+      if (have_inf) for (int i=0;i<inf.n_depends;i++){ unsigned long l2=0;
+          if (g_mph.get(g_mph.mp, inf.depends[i], &l2)){ char h2[65]; mpe_hex(h2, inf.depends[i]); rj_arr_push(dep, rj_str(h2)); } }
+      rj_obj_set(o, "depends", dep); }
+    { rj_val* sb = rj_arr();
+      if (have_inf) for (int i=0;i<inf.n_spentby;i++){ unsigned long l2=0;
+          if (g_mph.get(g_mph.mp, inf.spentby[i], &l2)){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
+      rj_obj_set(o, "spentby", sb); }
+    rj_obj_set(o, "unbroadcast", rj_bool(0));
+    mpu();
+    *res = o;
     return 1;
 }
 
@@ -385,7 +465,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getmempoolinfo", "getrawmempool", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -398,6 +478,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
+    if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
     if (!strcmp(m, "sendrawtransaction")) return cmd_sendrawtransaction(params, res, ec, em);
     return -1;
 }
