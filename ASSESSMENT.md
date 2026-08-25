@@ -187,7 +187,7 @@ architecture handles the whole modern chain — segwit, taproot, script-path
 spends at inscription scale — on real data.
 
 But **"can it replace Bitcoin Core" is not a close question today**: no mining,
-no PSBT, no wallets, no testnet, no light-client indexes, a read-only RPC surface (Core-parity blockchain/util/live-node queries, but no sendrawtransaction/mining/wallet RPCs),
+no PSBT, no wallets, no testnet, no light-client indexes, a read-plus-submit RPC surface (Core-parity blockchain/util/live-node queries, a descriptor engine, and a sendrawtransaction relay path, but no mining/wallet RPCs),
 and a node that until today crashed the first time a peer pushed it a block.
 And **"is it consensus-correct" is an open question**, not a settled one, with
 at least eight known chain-split-direction defects found so far (incidents
