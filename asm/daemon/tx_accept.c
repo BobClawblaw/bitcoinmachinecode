@@ -267,6 +267,44 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     return 1;
 }
 
+/* tx_accept_test_reason: would this tx be accepted RIGHT NOW? Runs the same
+ * consensus/script validation and the same mempool policy checks as
+ * tx_accept_validate_reason, but stops at the policy commit boundary
+ * (mpool_policy_test) so nothing is inserted, nothing is evicted, and no
+ * fee-estimation sample is recorded. Behind testmempoolaccept.
+ *
+ * Sharing the implementation is the point: an answer from a second,
+ * parallel copy of these rules would be an answer about a mempool this node
+ * does not have. *fee_out (satoshis) is filled when the fee was computed. */
+long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
+                           unsigned long txlen, char* reason, unsigned long rcap,
+                           unsigned long long* fee_out){
+    extern long mpool_policy_test(void*, void*, void*, const unsigned char*, unsigned long,
+                                  const unsigned char*, void*, unsigned long long*);
+    if (reason && rcap) reason[0] = 0;
+    if (fee_out) *fee_out = 0;
+    if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
+    void* placeholder_utxo = (void*)1;
+    if (!txval_modern(tx, (long)txlen, placeholder_utxo)){
+        const char* r = txval_modern_reason();
+        if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+        return -26;
+    }
+    mp_lock();
+    long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,
+                                placeholder_utxo, fee_out);
+    mp_unlock();
+    if (pt != 1){
+        const char* r = mpool_policy_reason(g_pol);
+        if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
+        if (r && strstr(r, "already")) return -27;
+        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+        return -26;
+    }
+    return 1;
+}
+
 /* log_block_stored_inbound(hash32, height, bytes): called from
  * bitcoin_serve.asm's .do_block, the ONLY place a peer-pushed block
  * (unsolicited, or in response to our own .do_inv-triggered getdata) is
