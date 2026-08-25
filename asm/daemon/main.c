@@ -2959,6 +2959,20 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                                     long, long*, long*, unsigned long long*, unsigned long long*,
                                     int*, char*, unsigned long);
       rpc_chain_set_utxoscan(utxo_scan_rpc_run); }
+    /* getnodeaddresses / getaddrmaninfo read the persistent address book.
+     * Its own handle, opened here: the download worker runs in the FORKED
+     * child and its handle is not reachable from the parent's RPC thread.
+     * amr_* re-reads peers.dat per call, so two handles see the same file. */
+    { static unsigned char rpc_ab[64];
+      if (!g_cfg.connect_only && amr_init(rpc_ab) == 1)
+          rpc_node_set_addrbook(rpc_ab, amr_count,
+                                (int (*)(void*, long, unsigned char*))amr_get_i);
+      else
+          fprintf(stderr, "[rpc] address book unavailable; "
+                          "getnodeaddresses/getaddrmaninfo will report empty\n"); }
+    /* getaddednodeinfo reports the operator's addnode= list verbatim. */
+    rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
+                            g_cfg.n_addnode);
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
