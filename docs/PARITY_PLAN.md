@@ -60,7 +60,25 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       getmininginfo = documented v31 field set. NOTE: this uncovered and FIXED
       incident #43 -- chainwork.dat corrupt for the whole post-segwit chain
       (getblock/getblockheader chainwork wrong); regenerated + verified + live.
-- [ ] getblocktemplate (BIP22/23) — large; diff structure vs oracle
+- [x] getblocktemplate (BIP22/23) — the deterministic frame is FULLY
+      oracle-verified: at our tip, previousblockhash and mintime (MTP+1)
+      match the oracle's records exactly; bits/target/version/rules
+      (csv, !segwit, taproot)/limits/mutable/noncerange/vbavailable/
+      vbrequired/capabilities all diff clean; coinbasevalue = exact
+      subsidy + our pool's fees. The 2016-block difficulty retarget
+      (rpc_chain_retarget, arith_uint256-faithful incl the /4..x4 clamp,
+      pow-limit cap, and GetCompact sign-bit shuffle) reproduces 8/8 REAL
+      historical retargets from production headers (incl 481824).
+      default_witness_commitment recomputed over the template's tx order
+      (empty-template constant frozen as a KAT). Transactions come from
+      the shared mempool via the same injected hooks (parents-before-
+      children order, 1-based depends, fee from the policy registry,
+      weight via tx_walk). DOCUMENTED GAPS: per-tx "sigops" is the legacy
+      count x4 only (P2SH/witness sigops need prevout scripts this path
+      does not resolve -- a lower bound); longpollid is emitted (prevhash+
+      counter) but hanging longpoll is not honored; BIP23 proposal mode
+      rejected as Invalid mode; tx order is valid but not fee-optimal
+      (no package feerate sort).
 - [ ] submitblock, prioritisetransaction
 
 ### T4 — Mempool coherence
