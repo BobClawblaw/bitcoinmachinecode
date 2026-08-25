@@ -442,3 +442,82 @@ broadcast queue; `sendrawtransaction` relays to every live peer leg at once).
 
 ### Category status
 All 20 of Core's Rawtransactions methods now dispatch.
+
+## Slice 11 — Control, and the last three — (2026-08-25)
+`help`, `logging`, `getrpcinfo`, `getmemoryinfo`, `getopenrpcinfo`,
+`rpc.discover`, plus `submitheader`, `exportasmap` and `enumeratesigners`.
+**With these, all 155 of Bitcoin Core's RPC methods dispatch.**
+
+### `help` is generated, and it is now an invariant
+`help` builds its list by merging the four dispatch tables through new
+per-module enumerators (`rpc_wallet_method_at`, `rpc_wops_method_at`,
+`rpc_node_method_at`, `rpc_chain_method_at`), sorted and de-duplicated. A
+method added to a dispatcher appears automatically; there is no second
+hand-maintained list to fall out of step.
+
+That makes a cross-module test possible for the first time:
+`tests/test_rpc_control.c` sweeps **every** method `help` advertises through
+`rpc_dispatch` and asserts none answers `-32601 Method not found`. A method
+that reached a table but never got a line in its module's dispatch ladder
+would be advertised, reported known, and then fail — and no per-module test
+can see that, because it needs all four modules linked together. The sweep
+currently covers 155 methods. (`stop` and the `waitfor*` family are skipped
+by name — one fires the shutdown handler, the others block for their
+timeout; both are exercised in their own tests.)
+
+`help` does **not** carry Core's per-method usage text. Those are ~150
+hand-written blocks that would have to be kept in step with the
+implementations by hand, and a usage string that has drifted from its method
+is worse than none. `help "<method>"` says whether the method is served and
+points at this document; an unknown command gets Core's exact
+`help: unknown command: <x>`.
+
+### `getrpcinfo`
+`active_commands` is a one-element array naming `getrpcinfo` itself. That is
+not a simplification: the RPC server accepts and services one connection at a
+time on a single thread, so while `getrpcinfo` runs it is necessarily the
+only active command. `logpath` resolves the bare `bitcoind.log` the daemon
+opens against the datadir it runs in, so it is the real path.
+
+### `logging` reports this node's kinds, and refuses to pretend they toggle
+`node_log.asm` emits eight fixed kinds — INFO, HSHK, HDRS, BLOCK, CONS,
+STORE, ERROR, SERVE — with no runtime gate: every event is written
+unconditionally, deliberately, so the logger holds no global mutable state
+and can link anywhere. The read form reports those eight, all true, because
+they really are all emitted. **These are not Core's category names**, because
+they are not Core's categories, and claiming Core's list with invented
+booleans would be worse. The mutating form is refused: a caller who switched
+a category "off" and kept seeing it in the log would be worse off than one
+told the switch does not exist.
+
+### `getmemoryinfo`
+Mode `"mallocinfo"` is real — glibc's `malloc_info(3)` XML, the same document
+Core forwards. The default mode `"stats"` reports Core's **secure allocator**
+locked-page pool; this node has no secure allocator, so those six numbers
+would describe nothing, and it is refused with that said rather than zeroed.
+
+### `submitheader`
+Core returns null for a header it already has. That case this node answers
+exactly: the hash is looked up in the index and null returned. A header it
+does not have would have to be added to the chain, and the header chain
+belongs to the forked download worker (`headers.dat` is its file) with no
+parent-to-worker channel — so that case is refused rather than answered with
+the null that means "accepted". Bad input gets Core's `-22 Block header
+decode failed`.
+
+### Refused
+`getopenrpcinfo` / `rpc.discover` (an OpenRPC document restates every
+method's schema — a second specification to hand-maintain; `help` gives the
+generated list instead); `exportasmap` (no asmap: peers are not bucketed by
+AS); `enumeratesigners` (no external signer interface at all — there is no
+`-signer` to restart with, and `walletdisplayaddress` reports the same gap).
+
+## Parity status: complete
+All 155 of Core's RPC methods dispatch, across 11 slices. Counting honestly,
+the node answers most of them from real state, reproduces Core's exact answer
+where its own situation makes that the correct one, and refuses the rest with
+the specific missing capability named. The refusals are concentrated in five
+subsystems this node does not have: a wallet rescan, segwit wallet
+signing/coin selection, BIP157/158 filters, assumeutxo snapshots, and
+external signer support. Every one of them is named at the point of refusal,
+so no caller is told a capability exists when it does not.
