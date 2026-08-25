@@ -59,4 +59,10 @@ void rpc_chain_set_mempool(const void* hooks_rpc_mempool, long (*sigop_cost)(con
  * incl the /4..x4 clamp and pow-limit cap); exported for hermetic KATs. */
 unsigned int rpc_chain_retarget(unsigned int old_bits, long timespan);
 
+/* gettxoutsetinfo's injected reader (daemon/utxo_setinfo_rpc.c). The out
+ * pointer is rpc_chain.c's rpc_usi_out_t; passed as void* so consumers of
+ * this header need no extra types. */
+void rpc_chain_set_utxosetinfo(long (*run)(int want_muhash, void* out,
+                                           char* msg, unsigned long mcap));
+
 #endif /* RPC_CHAIN_H */

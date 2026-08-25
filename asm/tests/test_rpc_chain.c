@@ -193,6 +193,20 @@ static void build_archive(void){
 static int g_stopped = 0;
 static void on_stop(void){ g_stopped = 1; }
 
+/* gettxoutsetinfo stub reader: fixed numbers; height 3 = the fixture tip so
+ * bestblock can be cross-checked against getbestblockhash. */
+static int g_usi_stub_busy = 0;
+static long usi_stub_run(int want_muhash, void* outv, char* msg, unsigned long mcap){
+    struct { long height; unsigned long long txouts, bogosize, total_amount;
+             unsigned char muhash[32]; int muhash_valid; } *o = outv;
+    if (g_usi_stub_busy){ if (msg&&mcap) snprintf(msg,mcap,"UTXO set is being written (stub)"); return 0; }
+    o->height = 3; o->txouts = 12345; o->bogosize = 999;
+    o->total_amount = 12345678900ULL;
+    for (int i=0;i<32;i++) o->muhash[i] = (unsigned char)i;
+    o->muhash_valid = want_muhash;
+    return 1;
+}
+
 int main(void){
     /* deterministic sig/pubkey bytes satisfying strict DER + compressed-prefix checks */
     SIG[0]=0x30; SIG[1]=0x44; SIG[2]=0x02; SIG[3]=0x20; for (int i = 0; i < 32; i++) SIG[4+i] = (unsigned char)(0x11 + i);
@@ -762,6 +776,50 @@ int main(void){
       ck("retarget clamps timespan to /4", rpc_chain_retarget(0x1d00ffff, 1) == 0x1c3fffc0);
       ck("retarget modern bits, faster blocks", rpc_chain_retarget(0x1702905c, 1100000) == 0x170254e3);
       ck("retarget modern bits, slower blocks", rpc_chain_retarget(0x1702905c, 1300000) == 0x1702c169);
+    }
+
+    /* ---- gettxoutsetinfo: dispatch + shape over an injected STUB reader
+     * (the real reader is the tool-derived daemon/utxo_setinfo_rpc.c, whose
+     * numbers get their proof at the parity capstone against both the
+     * standalone tool and the Core oracle). ---- */
+    {
+      extern void rpc_chain_set_utxosetinfo(long (*)(int, void*, char*, unsigned long));
+      /* no reader injected -> unavailable */
+      { long e0; const char* m0; rj_val* r0 = NULL;
+        rj_val* p0 = rj_parse("[]", 2);
+        int rc0 = rpc_chain_dispatch("gettxoutsetinfo", p0, &r0, &e0, &m0);
+        ck("gettxoutsetinfo without a reader -> unavailable", rc0==0 && e0==-1);
+        rj_free(r0); rj_free(p0); }
+      rpc_chain_set_utxosetinfo(usi_stub_run);
+      r = call("gettxoutsetinfo", "[]", &ec, &em);
+      ck("usi default (muhash) dispatched", r && r->typ == RJ_OBJ);
+      ck_str("usi.height", S(r,"height"), "3");
+      ck_str("usi.txouts", S(r,"txouts"), "12345");
+      ck_str("usi.bogosize", S(r,"bogosize"), "999");
+      ck_str("usi.total_amount", S(r,"total_amount"), "123.45678900");
+      ck("usi.muhash present (64 hex)", S(r,"muhash") && strlen(S(r,"muhash"))==64);
+      { rj_val* bb = call("getbestblockhash", "[]", &ec, &em);
+        ck("usi.bestblock == header hash at reported height (tip=3 here)",
+           bb && S(r,"bestblock") && !strcmp(S(r,"bestblock"), bb->str));
+        rj_free(bb); }
+      rj_free(r);
+      r = call("gettxoutsetinfo", "[\"none\"]", &ec, &em);
+      ck("usi none -> muhash absent", r && rj_obj_get(r,"muhash")==NULL && S(r,"txouts"));
+      rj_free(r);
+      expect_err("usi hash_serialized_3 -> honest refusal", "gettxoutsetinfo",
+                 "[\"hash_serialized_3\"]", -8,
+                 "hash_serialized_3 hash type not implemented (this node computes muhash)");
+      expect_err("usi bad hash_type -> Core message shape", "gettxoutsetinfo",
+                 "[\"bogus\"]", -8, "'bogus' is not a valid hash_type");
+      g_usi_stub_busy = 1;
+      { long e1; const char* m1; rj_val* r1 = NULL;
+        rj_val* p1 = rj_parse("[]", 2);
+        int rc1 = rpc_chain_dispatch("gettxoutsetinfo", p1, &r1, &e1, &m1);
+        ck("usi busy reader -> -1 with the busy message",
+           rc1==0 && e1==-1 && m1 && strstr(m1,"being written"));
+        rj_free(r1); rj_free(p1); }
+      g_usi_stub_busy = 0;
+      rpc_chain_set_utxosetinfo(0);
     }
 
     /* ---- uptime / stop ---- */
