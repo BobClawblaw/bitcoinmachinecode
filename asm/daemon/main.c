@@ -2449,6 +2449,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(txsub_worker_ready()){
                 unsigned long tlen = g_node_status->tx_submit_len;
                 if(tlen==0 || tlen>RPC_TXSUBMIT_MAX){ result=-22; snprintf(reason,sizeof reason,"TX decode failed"); }
+                else if(g_node_status->tx_submit_test){
+                    /* testmempoolaccept: same checks, no insertion, no relay */
+                    extern long tx_accept_test_reason(void*, const unsigned char*,
+                                     const unsigned char*, unsigned long, char*,
+                                     unsigned long, unsigned long long*);
+                    extern int tx_txid(unsigned char[32], const unsigned char*, unsigned long,
+                                       unsigned char*, unsigned long);
+                    static unsigned char tscratch[2000*81 + 8];
+                    unsigned char tid[32];
+                    unsigned long long fee = 0;
+                    if(!tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen,
+                                tscratch, sizeof tscratch)){
+                        result=-22; snprintf(reason,sizeof reason,"TX decode failed");
+                    } else {
+                        result = (int)tx_accept_test_reason(txsub_mp_area, tid,
+                                     (const unsigned char*)g_node_status->tx_submit_buf, tlen,
+                                     reason, sizeof reason, &fee);
+                    }
+                    g_node_status->tx_submit_fee = fee;
+                }
                 else { int relayed=0;
                     result = txsub_accept_and_relay(txsub_mp_area,
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
