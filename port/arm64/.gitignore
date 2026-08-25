@@ -1,0 +1,4 @@
+# ARM port build artifacts — don't commit binaries/objects
+*.o
+*.so
+test_sha256
