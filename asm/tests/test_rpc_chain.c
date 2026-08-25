@@ -1035,8 +1035,6 @@ int main(void){
 
     /* ---- the refusals name what is missing ---- */
     { struct { const char* m; const char* needle; } R[] = {
-        {"getblockfilter", "filter"}, {"scanblocks", "filter"},
-        {"getdescriptoractivity", "filter"},
         {"dumptxoutset", "snapshot"}, {"loadtxoutset", "snapshot"},
         {"preciousblock", "fork choice"}, {"pruneblockchain", "fork choice"},
         {"savemempool", "mempool.dat"}, {"importmempool", "mempool.dat"} };
@@ -1053,6 +1051,71 @@ int main(void){
       ck("rpc_known_method covers them too",
          rpc_known_method("dumptxoutset") && rpc_known_method("getchainstates") &&
          rpc_known_method("waitforblock") && rpc_known_method("verifychain")); }
+
+    /* ---- getblockfilter / scanblocks / getdescriptoractivity ----
+     * The builder itself is Core-byte-validated in test_block_filter.c; here
+     * the RPC plumbing is checked on the fixture chain. Height 0 is the REAL
+     * mainnet genesis block, and genesis needs no undo data (its coinbase
+     * spends nothing), so its filter must come out as Core's own 017fa880
+     * even with no undo reader attached. */
+    { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[0]);
+      r = call("getblockfilter", pj, &ec, &em);
+      ck("getblockfilter serves the genesis block", r && r->typ == RJ_OBJ);
+      ck_str("genesis filter is BYTE-IDENTICAL to Core's", S(r,"filter"), "017fa880");
+      /* the header chains from genesis and cannot be computed without every
+       * prior filter -- it must be ABSENT, never fabricated */
+      ck("no filter header is fabricated", r && rj_obj_get(r,"header") == NULL);
+      rj_free(r); }
+    { /* any other height needs undo data; none is attached here, and the
+       * refusal must say WHY a filter without it would be wrong */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[2]);
+      long e2; const char* m2; rj_val* r2 = call("getblockfilter", pj, &e2, &m2);
+      ck("a non-genesis block without undo data is refused",
+         r2 == NULL && e2 == -1 && m2 && strstr(m2, "undo"));
+      ck("...explaining that a filter missing elements would mislead",
+         r2 == NULL && m2 && strstr(m2, "missing elements"));
+      rj_free(r2); }
+    { long e2; const char* m2;
+      rj_val* r2 = call("getblockfilter",
+          "[\"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f\",\"exotic\"]",
+          &e2, &m2);
+      ck("an unknown filtertype -> -5", r2 == NULL && e2 == -5);
+      rj_free(r2); }
+
+    /* scanblocks: the genesis coinbase pays the well-known P2PK output;
+     * scan for it by raw() descriptor and genesis must be the ONLY hit */
+    { const char* GEN_SPK =
+        "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61de"
+        "b649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac";
+      char pj[400];
+      snprintf(pj, sizeof pj, "[\"start\",[\"raw(%s)\"],0,3]", GEN_SPK);
+      r = call("scanblocks", pj, &ec, &em);
+      ck("scanblocks start runs", r && r->typ == RJ_OBJ);
+      ck_str("scanned the requested range", S(r,"to_height"), "3");
+      { rj_val* rb = r ? rj_obj_get(r,"relevant_blocks") : NULL;
+        ck("exactly one relevant block", rb && rb->typ == RJ_ARR && rb->nitems == 1);
+        ck_str("...and it is genesis", (rb && rb->nitems) ? rb->items[0]->str : NULL, g_hash[0]); }
+      ck("the result carries the exact-scan divergence note",
+         r && S(r,"note") && strstr(S(r,"note"), "within the scanned range"));
+      rj_free(r);
+      /* status/abort answer Core's idle shapes */
+      r = call("scanblocks", "[\"status\"]", &ec, &em);
+      ck("scanblocks status -> null (scans are synchronous)", r && r->typ == RJ_NULL);
+      rj_free(r);
+      r = call("scanblocks", "[\"abort\"]", &ec, &em);
+      ck("scanblocks abort -> false", r && r->typ == RJ_BOOL && r->str[0] == '0');
+      rj_free(r);
+      /* getdescriptoractivity over genesis reports the receive */
+      snprintf(pj, sizeof pj, "[[\"%s\"],[\"raw(%s)\"]]", g_hash[0], GEN_SPK);
+      r = call("getdescriptoractivity", pj, &ec, &em);
+      ck("getdescriptoractivity runs", r && r->typ == RJ_OBJ);
+      { rj_val* a = r ? rj_obj_get(r,"activity") : NULL;
+        rj_val* a0 = (a && a->nitems) ? a->items[0] : NULL;
+        ck("one receive activity entry", a && a->nitems == 1 && a0);
+        ck_str("...typed receive", a0 ? S(a0,"type") : NULL, "receive");
+        ck_str("...with the 50 BTC amount", a0 ? S(a0,"amount") : NULL, "50.00000000");
+        ck_str("...at height 0", a0 ? S(a0,"height") : NULL, "0"); }
+      rj_free(r); }
 
     /* ---- submitheader ----
      * A header the node already has is a no-op returning null, exactly as
