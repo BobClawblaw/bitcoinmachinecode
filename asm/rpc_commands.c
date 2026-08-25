@@ -625,9 +625,11 @@ static void crt_b64(char* out, const unsigned char* in, long n){
  * wraps the unsigned tx in PSBT_GLOBAL_UNSIGNED_TX (key 0x00) with empty
  * per-input / per-output maps. Emits the stable BIP174 v0 format (not the
  * master oracle's v2 default). */
-static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
-    static unsigned char tx[131072]; long n; size_t nin, nout;
-    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed);   /* defined below */
+
+/* Wrap an unsigned tx (empty scriptSigs, no witness) as a base64 PSBTv0 with
+ * empty input/output maps. Returns malloc'd base64 (caller frees) or NULL. */
+static char* psbt_wrap_unsigned(const unsigned char* tx, long n, size_t nin, size_t nout){
     static unsigned char psbt[140000]; long p=0;
     psbt[p++]=0x70; psbt[p++]=0x73; psbt[p++]=0x62; psbt[p++]=0x74; psbt[p++]=0xff;  /* "psbt\xff" */
     psbt[p++]=0x01; psbt[p++]=0x00;                     /* keylen 1, key = PSBT_GLOBAL_UNSIGNED_TX */
@@ -636,8 +638,56 @@ static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_va
     psbt[p++]=0x00;                                     /* end of global map */
     for (size_t i=0;i<nin;i++)  psbt[p++]=0x00;         /* empty input maps */
     for (size_t i=0;i<nout;i++) psbt[p++]=0x00;         /* empty output maps */
-    char* b64=malloc((size_t)((p+2)/3)*4 + 1); if (!b64){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b64, psbt, p); *result=rj_str(b64); free(b64);
+    char* b64=malloc((size_t)((p+2)/3)*4 + 1); if (!b64) return NULL;
+    crt_b64(b64, psbt, p); return b64;
+}
+static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    static unsigned char tx[131072]; long n; size_t nin, nout;
+    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+    char* b64=psbt_wrap_unsigned(tx,n,nin,nout); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    *result=rj_str(b64); free(b64);
+    return 1;
+}
+
+/* converttopsbt (Core rpc/rawtransaction.cpp): a network-serialized tx -> PSBTv0.
+ * Strips input scriptSigs and witnesses to produce the unsigned tx the PSBT
+ * wraps. Errors if the tx carries signature data and permitsigdata is false
+ * (default), matching Core. */
+static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* hex = rpc_param_str(params,0,ec,em); if (!hex) return 0;
+    size_t hl=strlen(hex);
+    if ((hl&1)||hl/2<10||hl/2>200000){ *ec=-22; *em="TX decode failed"; return 0; }
+    unsigned long txlen=(unsigned long)(hl/2);
+    static unsigned char raw[200000];
+    if (!hex_to_bytes(raw,hex,hl)){ *ec=-22; *em="TX decode failed"; return 0; }
+    int permitsig = (params->nitems>=2 && params->items[1]->typ==RJ_BOOL && params->items[1]->str[0]=='1');
+    /* parse: version(4) [00 flag] n_in [outpoint(36) ssvarint ss seq(4)]... n_out ... locktime(4) */
+    unsigned long p=4, cc; int segwit=0;
+    if (raw[4]==0x00 && txlen>6 && raw[5]!=0x00){ segwit=1; p=6; }
+    unsigned long n_in=srw_varint(raw+p,&cc); p+=cc;
+    if (n_in==0||n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* build stripped unsigned tx */
+    static unsigned char utx[200000]; long u=0; int had_sig=segwit;
+    utx[u++]=raw[0];utx[u++]=raw[1];utx[u++]=raw[2];utx[u++]=raw[3];   /* version */
+    u+=crt_varint(utx+u,(unsigned long long)n_in);
+    for (unsigned long i=0;i<n_in;i++){
+        memcpy(utx+u, raw+p, 36); u+=36; p+=36;                        /* outpoint */
+        unsigned long ssl=srw_varint(raw+p,&cc); p+=cc;
+        if (ssl>0) had_sig=1;
+        p+=ssl;                                                        /* skip scriptSig */
+        utx[u++]=0x00;                                                 /* empty scriptSig */
+        memcpy(utx+u, raw+p, 4); u+=4; p+=4;                           /* sequence */
+    }
+    unsigned long nout_pos=p; unsigned long n_out=srw_varint(raw+p,&cc);
+    /* copy outputs region (n_out varint + outputs) verbatim */
+    unsigned long op=p; op+=cc;
+    for (unsigned long i=0;i<n_out;i++){ op+=8; unsigned long sl=srw_varint(raw+op,&cc); op+=cc+sl; }
+    memcpy(utx+u, raw+nout_pos, op-nout_pos); u+=(long)(op-nout_pos);
+    /* locktime: last 4 bytes of the tx (witness, if any, sits before locktime) */
+    utx[u++]=raw[txlen-4];utx[u++]=raw[txlen-3];utx[u++]=raw[txlen-2];utx[u++]=raw[txlen-1];
+    if (had_sig && !permitsig){ *ec=-22; *em="Inputs must not have scriptSigs and scriptWitnesses"; return 0; }
+    char* b64=psbt_wrap_unsigned(utx,u,(size_t)n_in,(size_t)n_out); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    *result=rj_str(b64); free(b64);
     return 1;
 }
 
@@ -944,7 +994,7 @@ int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
-        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt",
+        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -983,6 +1033,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_createpsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "decodepsbt"))
         return cmd_decodepsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "converttopsbt"))
+        return cmd_converttopsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
