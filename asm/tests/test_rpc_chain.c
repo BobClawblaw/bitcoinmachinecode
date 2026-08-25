@@ -193,6 +193,20 @@ static void build_archive(void){
 static int g_stopped = 0;
 static void on_stop(void){ g_stopped = 1; }
 
+/* gettxoutsetinfo stub reader: fixed numbers; height 3 = the fixture tip so
+ * bestblock can be cross-checked against getbestblockhash. */
+static int g_usi_stub_busy = 0;
+static long usi_stub_run(int want_muhash, void* outv, char* msg, unsigned long mcap){
+    struct { long height; unsigned long long txouts, bogosize, total_amount;
+             unsigned char muhash[32]; int muhash_valid; } *o = outv;
+    if (g_usi_stub_busy){ if (msg&&mcap) snprintf(msg,mcap,"UTXO set is being written (stub)"); return 0; }
+    o->height = 3; o->txouts = 12345; o->bogosize = 999;
+    o->total_amount = 12345678900ULL;
+    for (int i=0;i<32;i++) o->muhash[i] = (unsigned char)i;
+    o->muhash_valid = want_muhash;
+    return 1;
+}
+
 int main(void){
     /* deterministic sig/pubkey bytes satisfying strict DER + compressed-prefix checks */
     SIG[0]=0x30; SIG[1]=0x44; SIG[2]=0x02; SIG[3]=0x20; for (int i = 0; i < 32; i++) SIG[4+i] = (unsigned char)(0x11 + i);
@@ -212,7 +226,16 @@ int main(void){
       rj_val* rr = call("decodescript", "[\"76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac\"]", &bec, &bem);
       ck("decodescript works before chain open (not -28)", rr && rr->typ==RJ_OBJ && S(rr,"type")); rj_free(rr);
       rr = call("getdescriptorinfo", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]", &bec, &bem);
-      ck("getdescriptorinfo works before chain open", rr && rr->typ==RJ_OBJ && S(rr,"checksum")); rj_free(rr); }
+      ck("getdescriptorinfo works before chain open", rr && rr->typ==RJ_OBJ && S(rr,"checksum")); rj_free(rr);
+      /* getindexinfo: no optional indexes on this node -> {} (Core-exact for a
+       * node with no txindex/coinstatsindex/blockfilterindex), served pre-open. */
+      rr = call("getindexinfo", "[]", &bec, &bem);
+      ck("getindexinfo -> empty object (no indexes)", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr);
+      rr = call("getindexinfo", "[\"txindex\"]", &bec, &bem);
+      ck("getindexinfo(filter) -> empty object", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr);
+      /* Core does not type-check the arg -- a non-string still yields {} (live-verified). */
+      rr = call("getindexinfo", "[123]", &bec, &bem);
+      ck("getindexinfo(non-string) -> empty object (Core-lenient)", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr); }
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
     expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
@@ -695,6 +718,108 @@ int main(void){
       ck_str("mininginfo.pooledtx", S(r,"pooledtx"), "0");
       ck("mininginfo.warnings is an array", G(r,"warnings") && G(r,"warnings")->typ == RJ_ARR);
       rj_free(r);
+    }
+
+    /* ---- getblocktemplate (BIP22/23): deterministic frame on the fixture
+     * chain (tip=3, next height 4, no injected mempool -> empty template).
+     * The empty-template default_witness_commitment is a CONSTANT --
+     * sha256d(0^32 || 0^32) behind the aa21a9ed tag -- frozen from an
+     * independent reference computation. Retarget vectors likewise frozen
+     * from an arith_uint256-faithful reference (incl clamp + pow-limit). ---- */
+    {
+      expect_err("gbt without rules -> Core's segwit-rule error", "getblocktemplate", "[{}]",
+                 -8, "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})");
+      expect_err("gbt no params -> same error", "getblocktemplate", "[]",
+                 -8, "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})");
+      r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+      ck("gbt dispatched", r && r->typ == RJ_OBJ);
+      ck_str("gbt.height (tip+1)", S(r,"height"), "4");
+      ck_str("gbt.version", S(r,"version"), "536870912");
+      ck_str("gbt.coinbasevalue = 50 BTC subsidy (no fees)", S(r,"coinbasevalue"), "5000000000");
+      ck_str("gbt.sigoplimit", S(r,"sigoplimit"), "80000");
+      ck_str("gbt.weightlimit", S(r,"weightlimit"), "4000000");
+      ck_str("gbt.sizelimit", S(r,"sizelimit"), "4000000");
+      ck_str("gbt.noncerange", S(r,"noncerange"), "00000000ffffffff");
+      ck("gbt.transactions empty (no pool injected)",
+         G(r,"transactions") && G(r,"transactions")->typ == RJ_ARR && G(r,"transactions")->nitems == 0);
+      ck_str("gbt.default_witness_commitment (empty-template constant)",
+             S(r,"default_witness_commitment"),
+             "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9");
+      { rj_val* rls = G(r,"rules");
+        ck("gbt.rules [csv, !segwit, taproot]", rls && rls->typ==RJ_ARR && rls->nitems==3
+           && !strcmp(rls->items[0]->str,"csv") && !strcmp(rls->items[1]->str,"!segwit")
+           && !strcmp(rls->items[2]->str,"taproot")); }
+      ck("gbt.mutable has time/transactions/prevblock",
+         G(r,"mutable") && G(r,"mutable")->typ==RJ_ARR && G(r,"mutable")->nitems==3);
+      /* cross-checks against sibling RPCs on the same fixture */
+      { rj_val* bb = call("getbestblockhash", "[]", &ec, &em);
+        ck("gbt.previousblockhash == getbestblockhash", bb && S(r,"previousblockhash")
+           && !strcmp(S(r,"previousblockhash"), bb->str));
+        rj_free(bb); }
+      { rj_val* bh = call("getblockheader", "[\"tip\"]", &ec, &em); (void)bh; if (bh) rj_free(bh); }
+      { rj_val* mi = call("getmininginfo", "[]", &ec, &em);
+        ck("gbt.bits == tip bits (not a retarget height)",
+           mi && S(mi,"bits") && S(r,"bits") && !strcmp(S(r,"bits"), S(mi,"bits")));
+        rj_free(mi); }
+      { long mt = atol(S(r,"mintime") ? S(r,"mintime") : "0");
+        long ct = atol(S(r,"curtime") ? S(r,"curtime") : "0");
+        ck("gbt.curtime >= mintime > 0", mt > 0 && ct >= mt); }
+      ck("gbt.longpollid = prevhash+counter",
+         S(r,"longpollid") && strlen(S(r,"longpollid")) > 64
+         && !strncmp(S(r,"longpollid"), S(r,"previousblockhash"), 64));
+      rj_free(r);
+
+      /* retarget KATs (frozen reference vectors) */
+      ck("retarget same timespan keeps bits", rpc_chain_retarget(0x1d00ffff, 1209600) == 0x1d00ffff);
+      ck("retarget half timespan halves target", rpc_chain_retarget(0x1d00ffff, 604800) == 0x1c7fff80);
+      ck("retarget double timespan capped at pow limit", rpc_chain_retarget(0x1d00ffff, 2419200) == 0x1d00ffff);
+      ck("retarget clamps timespan to /4", rpc_chain_retarget(0x1d00ffff, 1) == 0x1c3fffc0);
+      ck("retarget modern bits, faster blocks", rpc_chain_retarget(0x1702905c, 1100000) == 0x170254e3);
+      ck("retarget modern bits, slower blocks", rpc_chain_retarget(0x1702905c, 1300000) == 0x1702c169);
+    }
+
+    /* ---- gettxoutsetinfo: dispatch + shape over an injected STUB reader
+     * (the real reader is the tool-derived daemon/utxo_setinfo_rpc.c, whose
+     * numbers get their proof at the parity capstone against both the
+     * standalone tool and the Core oracle). ---- */
+    {
+      extern void rpc_chain_set_utxosetinfo(long (*)(int, void*, char*, unsigned long));
+      /* no reader injected -> unavailable */
+      { long e0; const char* m0; rj_val* r0 = NULL;
+        rj_val* p0 = rj_parse("[]", 2);
+        int rc0 = rpc_chain_dispatch("gettxoutsetinfo", p0, &r0, &e0, &m0);
+        ck("gettxoutsetinfo without a reader -> unavailable", rc0==0 && e0==-1);
+        rj_free(r0); rj_free(p0); }
+      rpc_chain_set_utxosetinfo(usi_stub_run);
+      r = call("gettxoutsetinfo", "[]", &ec, &em);
+      ck("usi default (muhash) dispatched", r && r->typ == RJ_OBJ);
+      ck_str("usi.height", S(r,"height"), "3");
+      ck_str("usi.txouts", S(r,"txouts"), "12345");
+      ck_str("usi.bogosize", S(r,"bogosize"), "999");
+      ck_str("usi.total_amount", S(r,"total_amount"), "123.45678900");
+      ck("usi.muhash present (64 hex)", S(r,"muhash") && strlen(S(r,"muhash"))==64);
+      { rj_val* bb = call("getbestblockhash", "[]", &ec, &em);
+        ck("usi.bestblock == header hash at reported height (tip=3 here)",
+           bb && S(r,"bestblock") && !strcmp(S(r,"bestblock"), bb->str));
+        rj_free(bb); }
+      rj_free(r);
+      r = call("gettxoutsetinfo", "[\"none\"]", &ec, &em);
+      ck("usi none -> muhash absent", r && rj_obj_get(r,"muhash")==NULL && S(r,"txouts"));
+      rj_free(r);
+      expect_err("usi hash_serialized_3 -> honest refusal", "gettxoutsetinfo",
+                 "[\"hash_serialized_3\"]", -8,
+                 "hash_serialized_3 hash type not implemented (this node computes muhash)");
+      expect_err("usi bad hash_type -> Core message shape", "gettxoutsetinfo",
+                 "[\"bogus\"]", -8, "'bogus' is not a valid hash_type");
+      g_usi_stub_busy = 1;
+      { long e1; const char* m1; rj_val* r1 = NULL;
+        rj_val* p1 = rj_parse("[]", 2);
+        int rc1 = rpc_chain_dispatch("gettxoutsetinfo", p1, &r1, &e1, &m1);
+        ck("usi busy reader -> -1 with the busy message",
+           rc1==0 && e1==-1 && m1 && strstr(m1,"being written"));
+        rj_free(r1); rj_free(p1); }
+      g_usi_stub_busy = 0;
+      rpc_chain_set_utxosetinfo(0);
     }
 
     /* ---- uptime / stop ---- */

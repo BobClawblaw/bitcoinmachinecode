@@ -2116,6 +2116,7 @@ static unsigned char txsub_mp_area[40 + TXSUB_MP_SLOTS*48 + 8];
 static unsigned char txsub_mp_blob[2u<<20];
 static int           txsub_ready = 0;   /* 0 uninit, 1 ready, -1 init failed */
 static unsigned long long txsub_last_seq = 0;
+static unsigned long long blksub_last_seq = 0;
 
 /* Lazy one-time init of the worker's tx-accept path. Returns 1 ready, 0 not. */
 static int txsub_worker_ready(void){
@@ -2460,6 +2461,117 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             __sync_synchronize();
             g_node_status->tx_submit_ack = txsub_last_seq;
         }
+        /* submitblock channel: evaluate against the chain state this worker
+         * owns (daemon/blk_submit.c). This slice never connects a block --
+         * consensus-clean submissions answer "inconclusive" (BIP22's honest
+         * word for it) until the UTXO dry-run slice lands. */
+        if(g_node_status && g_node_status->blk_submit_seq != blksub_last_seq){
+            blksub_last_seq = g_node_status->blk_submit_seq;
+            extern long blk_submit_evaluate(const unsigned char*, unsigned long,
+                                            const unsigned char*, long, char*, unsigned long);
+            char reason[64]; reason[0]=0;
+            unsigned char tiph[32]; int have_tip = store_get_tip_hash(store_buf, tiph) == 1;
+            long tip = *(int*)(store_buf+24);
+            const unsigned char* sblk = (const unsigned char*)g_node_status->blk_submit_buf;
+            unsigned long slen = g_node_status->blk_submit_len;
+            int accepted = 0;
+            long ev = blk_submit_evaluate(sblk, slen, have_tip ? tiph : 0, tip, reason, sizeof reason);
+            if (ev == 1){
+                /* consensus-clean + tip-extending. CONNECT path: contextual
+                 * checks (correct next bits, timestamp window), the UTXO
+                 * dry run (the SAME verification phases a real apply runs,
+                 * stopped at the first mutation), then append + apply
+                 * through the normal catch-up pipeline + relay. Only a
+                 * fully-synced UTXO state can be dry-run against: mid
+                 * catch-up the honest answer stays "inconclusive". */
+                extern long utxo_live_dryrun_block(const unsigned char*, unsigned long long, long);
+                extern const char* utxo_live_last_reject(void);
+                extern unsigned int rpc_chain_retarget(unsigned int, long);
+                long applied = utxo_live_ok ? utxo_live_applied_height() : -1;
+                static unsigned char hb[4u<<20];   /* store_read_at scratch */
+                if (applied != tip){
+                    snprintf(reason, sizeof reason, "inconclusive");
+                } else {
+                    /* next-work check: a block whose header meets its OWN bits
+                     * but not the CHAIN's required bits must not connect. */
+                    unsigned int want_bits = 0, blk_bits =
+                        (unsigned)sblk[72] | ((unsigned)sblk[73]<<8) | ((unsigned)sblk[74]<<16) | ((unsigned)sblk[75]<<24);
+                    unsigned int tip_time = 0;
+                    if (store_read_at(store_buf, (u64)tip, hb, sizeof hb) >= 80){
+                        unsigned int tip_bits = (unsigned)hb[72]|((unsigned)hb[73]<<8)|((unsigned)hb[74]<<16)|((unsigned)hb[75]<<24);
+                        tip_time = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
+                        if ((tip + 1) % 2016 != 0) want_bits = tip_bits;
+                        else if (store_read_at(store_buf, (u64)(tip - 2015), hb, sizeof hb) >= 80){
+                            unsigned int first_time = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
+                            want_bits = rpc_chain_retarget(tip_bits, (long)tip_time - (long)first_time);
+                        }
+                    }
+                    /* median time past of the last 11 headers */
+                    unsigned int mtp = 0;
+                    { unsigned int tt[11]; int nn = 0;
+                      for (long h2 = tip; h2 >= 0 && nn < 11; h2--){
+                          if (store_read_at(store_buf, (u64)h2, hb, sizeof hb) < 80) break;
+                          tt[nn++] = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
+                      }
+                      for (int a2=0; a2<nn; a2++) for (int b2=a2+1; b2<nn; b2++)
+                          if (tt[b2] < tt[a2]){ unsigned int sw=tt[a2]; tt[a2]=tt[b2]; tt[b2]=sw; }
+                      if (nn) mtp = tt[nn/2]; }
+                    unsigned int blk_time = (unsigned)sblk[68]|((unsigned)sblk[69]<<8)|((unsigned)sblk[70]<<16)|((unsigned)sblk[71]<<24);
+                    if (!want_bits || blk_bits != want_bits){
+                        snprintf(reason, sizeof reason, "bad-diffbits");
+                    } else if (blk_time <= mtp){
+                        snprintf(reason, sizeof reason, "time-too-old");
+                    } else if ((long long)blk_time > (long long)time(NULL) + 7200){
+                        snprintf(reason, sizeof reason, "time-too-new");
+                    } else if (utxo_live_dryrun_block(sblk, slen, tip + 1) != 1){
+                        const char* rr = utxo_live_last_reject();
+                        snprintf(reason, sizeof reason, "%s", (rr && rr[0]) ? rr : "rejected");
+                    } else {
+                        /* CONNECT: append, then apply through the normal
+                         * catch-up pipeline (full re-verify -- deterministic
+                         * pass after the dry run; same undo/checkpoint
+                         * crash-safety as any network block). */
+                        unsigned char bh[32]; sha256d(bh, sblk, 80);
+                        if (store_append(store_buf, bh, sblk, (long)slen) < 0){
+                            snprintf(reason, sizeof reason, "rejected");
+                            fprintf(stderr,"[dl] submitblock: store_append FAILED\n");
+                        } else {
+                            long ar = utxo_live_catchup(store_buf);
+                            if (ar < 0){
+                                /* should be unreachable after a dry-run pass;
+                                 * scream, and let the existing recovery paths
+                                 * own the state (same as a bad network block). */
+                                fprintf(stderr,"[dl] submitblock: APPLY FAILED AFTER CLEAN DRY-RUN -- investigate\n");
+                                snprintf(reason, sizeof reason, "rejected");
+                            } else {
+                                /* headers.dat: keep the header mirror current
+                                 * (readers self-heal via header sync anyway) */
+                                { static unsigned char hstate[128];
+                                  if (hst_init(hstate) == 1 && hst_reload(hstate) >= 0)
+                                      hst_append(hstate, sblk, bh); }
+                                /* announce to the outbound legs (inv MSG_BLOCK) */
+                                { unsigned char inv[37]; inv[0]=1;
+                                  inv[1]=2; inv[2]=0; inv[3]=0; inv[4]=0;   /* MSG_BLOCK */
+                                  memcpy(inv+5, bh, 32);
+                                  int announced = 0;
+                                  for (int i2=0; i2<mux_n_out; i2++)
+                                      if (mux_out_fd[i2] >= 0 &&
+                                          p2p_write(mux_out_fd[i2], "inv", 3, inv, 37) > 0) announced++;
+                                  fprintf(stderr,"[dl] submitblock: CONNECTED h=%ld, announced to %d/%d legs\n",
+                                          tip + 1, announced, mux_n_out); }
+                                accepted = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            fprintf(stderr,"[dl] submitblock: %s (len=%lu tip=%ld)\n",
+                    accepted ? "accepted" : reason, (unsigned long)slen, tip);
+            snprintf((char*)g_node_status->blk_submit_reason, sizeof g_node_status->blk_submit_reason, "%s", reason);
+            g_node_status->blk_submit_result = accepted;
+            __sync_synchronize();
+            g_node_status->blk_submit_ack = blksub_last_seq;
+        }
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
@@ -2756,6 +2868,15 @@ static void serve_rpc_read_creds(const char* cfgpath, int* port,
 
 /* Start the embedded RPC server in the serve parent (non-blocking: rpc_server
  * runs its own accept thread). No-op with a log line if creds are absent. */
+/* getblocktemplate per-tx "sigops" (sigop COST units): the legacy count x4
+ * (WITNESS_SCALE_FACTOR). Core additionally counts P2SH-redeem and witness
+ * sigops, which need the prevout scripts -- a UTXO view this path does not
+ * resolve. A LOWER BOUND, documented in PARITY_PLAN; never fabricated. */
+static long gbt_sigops_legacy4(const unsigned char* tx, unsigned long len){
+    extern long tx_legacy_sigops(const unsigned char*, unsigned long);
+    return tx_legacy_sigops(tx, len) * 4;
+}
+
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
@@ -2769,6 +2890,38 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     else
         fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
+     * mempool_configure, written by the worker + inbound children) so
+     * getrawmempool/getmempoolinfo report the real pool. All-null when the
+     * static per-process fallback is in play (maxmempool=0). */
+    { extern void* mp_ext_area; extern void* mp_ext_polstate;
+      extern unsigned long mp_ext_blobcap;
+      extern void mp_lock(void); extern void mp_unlock(void);
+      extern long mempool_time_of(const unsigned char*);
+      extern long mpool_policy_entry(void*, const unsigned char*,
+                                     unsigned long long*, unsigned long long*);
+      extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
+      extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
+      extern long mpool_count(void*);
+      extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+      rpc_mempool_hooks h = {
+          .mp = mp_ext_area, .polstate = mp_ext_polstate,
+          .maxbytes = (long long)mp_ext_blobcap,
+          .count = mpool_count, .get = mpool_get,
+          .lock = mp_lock, .unlock = mp_unlock,
+          .time_of = mempool_time_of,
+          .pol_entry = mpool_policy_entry,
+          .pol_entry_info = mpool_policy_entry_info,
+          .estimate = mpool_policy_estimate,
+          /* main.c's existing extern types the length as long; the hooks
+           * member says unsigned long -- ABI-identical on x86-64 SysV. */
+          .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d };
+      rpc_node_set_mempool(&h);
+      /* getblocktemplate reads the same pool through rpc_chain */
+      rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
+    /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
+    { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
+      rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run); }
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){

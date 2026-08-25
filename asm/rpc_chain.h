@@ -49,4 +49,20 @@ int rpc_chain_known_method(const char* method);
  * tx_to_json output. Returns 1, or 0 with *ec / *em. */
 int rpc_chain_decode_rawtx(const unsigned char* tx, long txlen, rj_val** result, long* ec, const char** em);
 
+/* getblocktemplate's view of the shared mempool: same injected hooks struct
+ * rpc_node uses (rpc_node.h), plus the sigop-cost fn. All optional -- with
+ * nothing injected the template is empty (valid, feeless). */
+struct rpc_mempool_hooks_tag;   /* see rpc_node.h's rpc_mempool_hooks */
+void rpc_chain_set_mempool(const void* hooks_rpc_mempool, long (*sigop_cost)(const unsigned char*, unsigned long));
+
+/* Pure difficulty-retarget arithmetic (Core pow.cpp CalculateNextWorkRequired
+ * incl the /4..x4 clamp and pow-limit cap); exported for hermetic KATs. */
+unsigned int rpc_chain_retarget(unsigned int old_bits, long timespan);
+
+/* gettxoutsetinfo's injected reader (daemon/utxo_setinfo_rpc.c). The out
+ * pointer is rpc_chain.c's rpc_usi_out_t; passed as void* so consumers of
+ * this header need no extra types. */
+void rpc_chain_set_utxosetinfo(long (*run)(int want_muhash, void* out,
+                                           char* msg, unsigned long mcap));
+
 #endif /* RPC_CHAIN_H */

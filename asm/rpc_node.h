@@ -37,6 +37,9 @@ typedef struct {
 /* Max raw-tx bytes a sendrawtransaction submission can stage. A standard tx is
  * capped at 100k vbytes; 400000 covers the consensus weight bound with room. */
 #define RPC_TXSUBMIT_MAX 400000
+/* Max serialized block a submitblock can stage: the 4M-weight consensus
+ * bound (a block is at most 4MB serialized), with margin. */
+#define RPC_BLKSUBMIT_MAX 4100000
 
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
@@ -58,6 +61,16 @@ typedef struct {
     volatile int                tx_submit_result;
     char                        tx_submit_reason[128];
     unsigned char               tx_submit_buf[RPC_TXSUBMIT_MAX];
+
+    /* submitblock channel (parent RPC thread -> download worker), same
+     * seq/ack discipline as the tx channel above. result: 1 = accepted
+     * (RPC returns null), 0 = BIP22 reason string in blk_submit_reason. */
+    volatile unsigned long long blk_submit_seq;
+    volatile unsigned long long blk_submit_ack;
+    volatile unsigned long      blk_submit_len;
+    volatile int                blk_submit_result;
+    char                        blk_submit_reason[64];
+    unsigned char               blk_submit_buf[RPC_BLKSUBMIT_MAX];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
@@ -66,6 +79,35 @@ typedef struct {
  * sendrawtransaction, which stages into the submission channel above. */
 void rpc_node_set_status(const node_status_t* st);
 void rpc_node_set_status_rw(node_status_t* st);
+
+/* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED
+ * pre-fork region) so getrawmempool/getmempoolinfo/getmempoolentry report the
+ * real pool instead of this process's empty copy. EVERYTHING is injected as
+ * data/function pointers -- rpc_node.o declares no mempool externs, so it
+ * never drags bitcoin_mempool.o / mempool_cfg.c / the policy TU into the many
+ * test binaries that link it (an extern mpool_count did exactly that once).
+ * Every member is optional: NULL members degrade the affected fields to
+ * absent/zero bookkeeping; a NULL/all-NULL struct keeps the previous
+ * empty-pool reporting (standalone rpcd, static per-process fallback). */
+struct mp_entry_info;   /* mempool_entry.h; only implementations need it */
+typedef struct {
+    void*     mp;             /* structural pool (bitcoin_mempool.asm layout) */
+    void*     polstate;       /* tx-accept policy registry (fees, graph) */
+    long long maxbytes;       /* configured -maxmempool, bytes */
+    long (*count)(void*);                                       /* mpool_count */
+    const unsigned char* (*get)(void*, const unsigned char*, unsigned long*); /* mpool_get */
+    void (*lock)(void);                                         /* mp_lock */
+    void (*unlock)(void);                                       /* mp_unlock */
+    long (*time_of)(const unsigned char*);                      /* arrival time */
+    long (*pol_entry)(void*, const unsigned char*,
+                      unsigned long long*, unsigned long long*);/* fee/size */
+    long (*pol_entry_info)(void*, const unsigned char*,
+                           struct mp_entry_info*);              /* full graph */
+    long (*estimate)(void*, unsigned long long*,
+                     unsigned long long*);                      /* fee EMA+samples */
+    void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
+} rpc_mempool_hooks;
+void rpc_node_set_mempool(const rpc_mempool_hooks* h);   /* copied; NULL detaches */
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);

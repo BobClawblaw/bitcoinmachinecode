@@ -48,6 +48,8 @@
  *     block-relaying node; stop's reply names this project, not Core.
  */
 #include "rpc_chain.h"
+#include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
+#include "mempool_entry.h"
 #include "rpc_commands.h"
 #include "version_gen.h"
 
@@ -301,8 +303,8 @@ static double difficulty_of(u32 bits){
     while (shift > 29){ d /= 256.0; shift--; }
     return d;
 }
-static void target_hex(u32 bits, char out[65]){ /* arith_uint256::SetCompact, big-endian hex */
-    u8 t[32]; memset(t, 0, 32);
+static void target_bytes(u32 bits, u8 t[32]){ /* arith_uint256::SetCompact, big-endian */
+    memset(t, 0, 32);
     int size = bits >> 24;
     u32 word = bits & 0x007fffff;
     if (size <= 3){
@@ -316,7 +318,9 @@ static void target_hex(u32 bits, char out[65]){ /* arith_uint256::SetCompact, bi
             if (pos >= 0 && pos < 32) t[pos] = (u8)(word >> (8*i));
         }
     }
-    hex_of(out, t, 32);
+}
+static void target_hex(u32 bits, char out[65]){
+    u8 t[32]; target_bytes(bits, t); hex_of(out, t, 32);
 }
 static int cmp_u32(const void* a, const void* b){ u32 x = *(const u32*)a, y = *(const u32*)b; return x < y ? -1 : x > y; }
 static long median_time_past(long h){
@@ -800,6 +804,274 @@ static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
     rj_obj_set(o,"pooledtx", rj_numf("%d", 0));
     rj_obj_set(o,"chain", rj_str("main"));
     rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
+    *res = o;
+    return 1;
+}
+
+/* ==== getblocktemplate (BIP22/23, Core rpc/mining.cpp) =====================
+ * The deterministic frame -- previousblockhash, height, bits (incl the 2016-
+ * block retarget), target, mintime (MTP+1), version/rules/limits -- comes
+ * from our own chain state and is diffable against the oracle at the same
+ * tip. The transaction list comes from the SHARED mempool via the same
+ * injected hooks rpc_node uses (rpc_chain_set_mempool); with no pool
+ * injected the template is simply empty -- valid, just feeless. NOT
+ * implemented (documented): longpoll blocking (longpollid is emitted and
+ * changes per tip/template, but a hanging longpoll request is not honored),
+ * BIP23 proposal mode, and tx priority/ordering beyond parents-before-
+ * children (Core package-feerate-orders; any parent-first order is a VALID
+ * template, just not fee-optimal -- honesty note, not a correctness gap). */
+static rpc_mempool_hooks g_gbt_mph;
+static long (*g_gbt_sigop_cost)(const unsigned char*, unsigned long);
+static u64 gbs_subsidy(long h);        /* defined with getblockstats below */
+void rpc_chain_set_mempool(const void* hooks_rpc_mempool,
+                           long (*sigop_cost)(const unsigned char*, unsigned long)){
+    const rpc_mempool_hooks* h = (const rpc_mempool_hooks*)hooks_rpc_mempool;
+    if (h) g_gbt_mph = *h; else memset(&g_gbt_mph, 0, sizeof g_gbt_mph);
+    g_gbt_sigop_cost = sigop_cost;
+}
+
+/* arith_uint256::GetCompact (fNegative=false) over a big-endian 32-byte target */
+static u32 gbt_compact(const u8 t[32]){
+    int size = 32; while (size > 0 && t[32-size] == 0) size--;
+    u32 word = 0;
+    for (int i = 0; i < 3; i++){
+        int pos = 32 - size + i;               /* top 3 bytes */
+        word = (word << 8) | (u8)(pos < 32 && i < size ? t[pos] : 0);
+    }
+    if (size < 3) word <<= 8 * (3 - size);
+    if (word & 0x00800000){ word >>= 8; size++; }
+    return ((u32)size << 24) | (word & 0x007fffff);
+}
+
+/* Core pow.cpp CalculateNextWorkRequired: bits for height `tip+1`. */
+#define GBT_TIMESPAN 1209600L                   /* 14 days */
+/* Pure retarget arithmetic, exported for the hermetic KATs (vectors frozen
+ * from an arith_uint256-faithful reference implementation). */
+u32 rpc_chain_retarget(u32 old_bits, long ts){
+    if (ts < GBT_TIMESPAN/4) ts = GBT_TIMESPAN/4;
+    if (ts > GBT_TIMESPAN*4) ts = GBT_TIMESPAN*4;
+    /* new_target = old_target * ts / GBT_TIMESPAN over a 40-byte big int
+     * (little-endian limbs for the arithmetic, flipped from/to big-endian) */
+    u8 be[32]; target_bytes(old_bits, be);
+    u8 n[40]; memset(n, 0, sizeof n);
+    for (int i = 0; i < 32; i++) n[i] = be[31-i];          /* -> LE */
+    { unsigned long long carry = 0;                         /* *= ts */
+      for (int i = 0; i < 40; i++){
+          unsigned long long v = (unsigned long long)n[i] * (unsigned long long)ts + carry;
+          n[i] = (u8)v; carry = v >> 8;
+      } }
+    { unsigned long long rem = 0;                           /* /= GBT_TIMESPAN */
+      for (int i = 39; i >= 0; i--){
+          unsigned long long v = (rem << 8) | n[i];
+          n[i] = (u8)(v / (unsigned long long)GBT_TIMESPAN);
+          rem = v % (unsigned long long)GBT_TIMESPAN;
+      } }
+    int over = 0; for (int i = 32; i < 40; i++) if (n[i]) over = 1;
+    u8 out[32]; for (int i = 0; i < 32; i++) out[i] = n[31-i];   /* -> BE */
+    u8 lim[32]; target_bytes(0x1d00ffff, lim);
+    if (!over){ for (int i = 0; i < 32; i++){ if (out[i] > lim[i]){ over = 1; break; } if (out[i] < lim[i]) break; } }
+    if (over) memcpy(out, lim, 32);
+    return gbt_compact(out);
+}
+static u32 gbt_next_bits(long tip){
+    u8 hdr[80];
+    if (read_block_prefix(tip, hdr, 80) != 1) return 0;
+    u32 old_bits = rd32(hdr + 72);
+    if ((tip + 1) % 2016 != 0) return old_bits;
+    u32 last_time = rd32(hdr + 68);
+    if (read_block_prefix(tip - 2015, hdr, 80) != 1) return old_bits;
+    u32 first_time = rd32(hdr + 68);
+    return rpc_chain_retarget(old_bits, (long)last_time - (long)first_time);
+}
+
+/* Slot walk of the shared structural pool (bitcoin_mempool.asm's documented
+ * layout; the same walk daemon/reorg.c and rpc_node.c use). */
+typedef struct { const u8* txid; const u8* tx; unsigned long len; } gbt_ent;
+static long gbt_slot(void* mp, unsigned long i, gbt_ent* e){
+    u8* m = (u8*)mp;
+    unsigned long long mask; memcpy(&mask, m+8, 8);
+    if (i > mask) return -1;
+    u8* sl = m + 40 + i*48;
+    unsigned long long len; memcpy(&len, sl, 8);
+    if (len == 0xFFFFFFFFFFFFFFFFULL) return 0;
+    u8* blob; memcpy(&blob, m+16, 8);
+    unsigned long long off; memcpy(&off, sl+40, 8);
+    e->txid = sl+8; e->tx = blob+off; e->len = (unsigned long)len;
+    return 1;
+}
+
+#define GBT_MAX_TX 4000
+static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, const char** em){
+    /* template_request: rules MUST include "segwit" (Core-exact error) */
+    int segwit_rule = 0;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 && params->items[0]->typ == RJ_OBJ){
+        const rj_val* req = params->items[0];
+        const rj_val* rules = rj_obj_get((rj_val*)req, "rules");
+        if (rules && rules->typ == RJ_ARR)
+            for (unsigned long i = 0; i < rules->nitems; i++)
+                if (rules->items[i]->typ == RJ_STR && !strcmp(rules->items[i]->str, "segwit")) segwit_rule = 1;
+        const rj_val* mode = rj_obj_get((rj_val*)req, "mode");
+        if (mode && mode->typ == RJ_STR && strcmp(mode->str, "template")){
+            *ec = -8; *em = "Invalid mode"; return 0; }
+    }
+    if (!segwit_rule){
+        *ec = -8; *em = "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})";
+        return 0; }
+
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    u8 hdr[80];
+    if (read_block_prefix(tip, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
+    u8 tiphash[32]; sha256d(tiphash, hdr, 80);
+    u32 bits = gbt_next_bits(tip);
+    if (!bits){ *ec = -1; *em = "Block not available"; return 0; }
+    long height = tip + 1;
+    long mintime = median_time_past(tip) + 1;
+    long curtime = (long)time(NULL); if (curtime < mintime) curtime = mintime;
+
+    rj_val* o = rj_obj();
+    { rj_val* caps = rj_arr(); rj_arr_push(caps, rj_str("proposal"));
+      rj_obj_set(o, "capabilities", caps); }
+    rj_obj_set(o, "version", rj_numf("%d", 536870912));      /* 0x20000000 */
+    { rj_val* rls = rj_arr();
+      rj_arr_push(rls, rj_str("csv")); rj_arr_push(rls, rj_str("!segwit"));
+      rj_arr_push(rls, rj_str("taproot"));
+      rj_obj_set(o, "rules", rls); }
+    rj_obj_set(o, "vbavailable", rj_obj());
+    rj_obj_set(o, "vbrequired", rj_numf("%d", 0));
+    { char hx[65]; hex_rev(hx, tiphash, 32);
+      rj_obj_set(o, "previousblockhash", rj_str(hx));
+      static unsigned long long lp_ctr = 0;                  /* template id */
+      char lp[80]; snprintf(lp, sizeof lp, "%s%llu", hx, ++lp_ctr);
+      rj_obj_set(o, "longpollid", rj_str(lp)); }
+
+    /* ---- transaction list: shared pool, parents before children ---- */
+    unsigned long long fees_total = 0;
+    rj_val* txs = rj_arr();
+    if (g_gbt_mph.mp && g_gbt_mph.get){
+        static gbt_ent ents[GBT_MAX_TX];
+        static unsigned char emitted[GBT_MAX_TX];
+        static int order[GBT_MAX_TX];
+        long n = 0;
+        if (g_gbt_mph.lock) g_gbt_mph.lock();
+        { u8* m = (u8*)g_gbt_mph.mp; unsigned long long mask; memcpy(&mask, m+8, 8);
+          for (unsigned long i = 0; i <= mask && n < GBT_MAX_TX; i++){
+              gbt_ent e; if (gbt_slot(g_gbt_mph.mp, i, &e) == 1) ents[n++] = e; } }
+        memset(emitted, 0, (size_t)(n ? n : 1));
+        long emitted_n = 0;
+        /* iterative parents-first ordering via the policy graph */
+        for (long pass = 0; pass <= n && emitted_n < n; pass++){
+            long progress = 0;
+            for (long i = 0; i < n; i++){
+                if (emitted[i]) continue;
+                int ready = 1;
+                mp_entry_info inf; long have = 0;
+                if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info)
+                    have = g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &inf);
+                if (have){
+                    mp_entry_info* pi = &inf;
+                    for (int k = 0; k < pi->n_depends && ready; k++){
+                        int found_unemitted = 0;
+                        for (long j = 0; j < n; j++)
+                            if (!emitted[j] && !memcmp(ents[j].txid, pi->depends[k], 32)){ found_unemitted = 1; break; }
+                        if (found_unemitted) ready = 0;
+                    }
+                }
+                if (!ready) continue;
+                emitted[i] = 1; order[emitted_n++] = (int)i; progress = 1;
+            }
+            if (!progress) break;
+        }
+        /* render in order; depends[] are 1-based indices into this array */
+        for (long oi = 0; oi < emitted_n; oi++){
+            long i = order[oi];
+            unsigned long long fee = 0, fsz = 0; long have_fee = 0;
+            if (g_gbt_mph.polstate && g_gbt_mph.pol_entry)
+                have_fee = g_gbt_mph.pol_entry(g_gbt_mph.polstate, ents[i].txid, &fee, &fsz);
+            if (!have_fee) continue;    /* can't price it -> don't offer it */
+            rj_val* t = rj_obj();
+            { char* dhex = malloc(ents[i].len*2 + 1);
+              if (dhex){ hex_of(dhex, ents[i].tx, ents[i].len);
+                         rj_obj_set(t, "data", rj_str(dhex)); free(dhex); } }
+            { char hx[65]; hex_rev(hx, ents[i].txid, 32); rj_obj_set(t, "txid", rj_str(hx)); }
+            { u8 wt[32]; char hx[65];
+              int is_segwit = ents[i].len > 5 && ents[i].tx[4] == 0x00 && ents[i].tx[5] == 0x01;
+              if (is_segwit) sha256d(wt, ents[i].tx, ents[i].len); else memcpy(wt, ents[i].txid, 32);
+              hex_rev(hx, wt, 32); rj_obj_set(t, "hash", rj_str(hx)); }
+            { rj_val* dep = rj_arr();
+              mp_entry_info inf;
+              if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
+                  g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &inf)){
+                  mp_entry_info* pi = &inf;
+                  for (int k = 0; k < pi->n_depends; k++)
+                      for (long pj = 0; pj < oi; pj++)
+                          if (!memcmp(ents[order[pj]].txid, pi->depends[k], 32)){
+                              rj_arr_push(dep, rj_numf("%ld", pj + 1)); break; }
+              }
+              rj_obj_set(t, "depends", dep); }
+            rj_obj_set(t, "fee", rj_numf("%llu", fee));
+            fees_total += fee;
+            rj_obj_set(t, "sigops", rj_numf("%ld", g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0));
+            { const u8* p = ents[i].tx; const u8* end = p + ents[i].len; txw_t w;
+              rj_obj_set(t, "weight", rj_numf("%zu",
+                  tx_walk(p, end, &w) ? (w.stripped * 3 + w.len) : ents[i].len * 4)); }
+            rj_arr_push(txs, t);
+        }
+        if (g_gbt_mph.unlock) g_gbt_mph.unlock();
+    }
+    rj_obj_set(o, "transactions", txs);
+
+    rj_obj_set(o, "coinbaseaux", rj_obj());
+    rj_obj_set(o, "coinbasevalue", rj_numf("%llu", (unsigned long long)gbs_subsidy(height) + fees_total));
+    { char hx[65]; target_hex(bits, hx); rj_obj_set(o, "target", rj_str(hx)); }
+    rj_obj_set(o, "mintime", rj_numf("%ld", mintime));
+    { rj_val* mut = rj_arr();
+      rj_arr_push(mut, rj_str("time")); rj_arr_push(mut, rj_str("transactions"));
+      rj_arr_push(mut, rj_str("prevblock"));
+      rj_obj_set(o, "mutable", mut); }
+    rj_obj_set(o, "noncerange", rj_str("00000000ffffffff"));
+    rj_obj_set(o, "sigoplimit", rj_numf("%d", 80000));
+    rj_obj_set(o, "sizelimit", rj_numf("%d", 4000000));
+    rj_obj_set(o, "weightlimit", rj_numf("%d", 4000000));
+    rj_obj_set(o, "curtime", rj_numf("%ld", curtime));
+    { char bx[9]; snprintf(bx, sizeof bx, "%08x", bits); rj_obj_set(o, "bits", rj_str(bx)); }
+    rj_obj_set(o, "height", rj_numf("%ld", height));
+
+    /* default_witness_commitment: BIP141 -- wtxid merkle root with the
+     * coinbase's wtxid as 32 zero bytes, committed with a zero nonce:
+     * OP_RETURN 0x24 aa21a9ed sha256d(root || 0x00*32). Recomputed over the
+     * template's own tx order. */
+    { u8 (*leaves)[32] = malloc(32u * (unsigned)(txs->nitems + 1));
+      if (leaves){
+          memset(leaves[0], 0, 32);
+          for (unsigned long i = 0; i < txs->nitems; i++){
+              const char* hh = rj_obj_get(txs->items[i], "hash")->str;
+              for (int b = 0; b < 32; b++){
+                  unsigned hv; sscanf(hh + 2*b, "%2x", &hv);
+                  leaves[i+1][31-b] = (u8)hv;              /* display -> wire */
+              }
+          }
+          unsigned long cnt = txs->nitems + 1;
+          while (cnt > 1){
+              unsigned long w2 = 0;
+              for (unsigned long i = 0; i < cnt; i += 2){
+                  u8 pair[64];
+                  memcpy(pair, leaves[i], 32);
+                  memcpy(pair + 32, leaves[i + 1 < cnt ? i + 1 : i], 32);
+                  sha256d(leaves[w2++], pair, 64);
+              }
+              cnt = w2;
+          }
+          u8 pair[64], commit[32];
+          memcpy(pair, leaves[0], 32); memset(pair + 32, 0, 32);   /* nonce 0 */
+          sha256d(commit, pair, 64);
+          char spk[13 + 64 + 1];
+          memcpy(spk, "6a24aa21a9ed", 12);
+          hex_of(spk + 12, commit, 32);
+          rj_obj_set(o, "default_witness_commitment", rj_str(spk));
+          free(leaves);
+      } }
+
     *res = o;
     return 1;
 }
@@ -1928,7 +2200,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getchaintips","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","getchaintips","getindexinfo","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1958,6 +2230,80 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
     return 1;
 }
 
+/* getindexinfo (Core rpc/blockchain.cpp): status of every optional index the
+ * node runs (txindex, coinstatsindex, blockfilterindex). This node runs NONE
+ * of them -- getrawtransaction requires a blockhash (no txindex), there is no
+ * coinstatsindex or blockfilterindex -- so, exactly as Core does when no such
+ * index is enabled, the result is an empty object (an optional index_name
+ * filter cannot match anything either). The block/UTXO index that IS present
+ * is core chainstate, not one of getindexinfo's optional indexes. */
+static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    (void)params; (void)ec; (void)em;
+    /* Any index_name filter can only fail to match (we have no indexes), and
+     * Core does not type-check the arg -- it simply returns {} regardless
+     * (verified live: `getindexinfo 123` and `getindexinfo {..}` both give {}). */
+    *res = rj_obj();   /* {} -- no optional indexes enabled */
+    return 1;
+}
+
+/* ---- gettxoutsetinfo -------------------------------------------------------
+ * The reader (daemon/utxo_setinfo_rpc.c -- the SAME machinery as the
+ * standalone parity tool) is injected by the daemon; the standalone rpcd has
+ * none and reports unavailable. DOCUMENTED DIVERGENCES from Core: our default
+ * hash_type is muhash (the one hash we implement; Core defaults
+ * hash_serialized_3, which we refuse by name), and the coinstatsindex-only
+ * extras (total_unspendable_amount, block_info) are absent -- we run no such
+ * index, matching Core-without-the-index behavior. height is the UTXO
+ * APPLIED height (the state the numbers describe), which on a catching-up
+ * node intentionally lags the header tip. */
+typedef struct {
+    long height;
+    unsigned long long txouts, bogosize, total_amount;
+    unsigned char muhash[32];
+    int muhash_valid;
+} rpc_usi_out_t;
+static long (*g_usi_run)(int, void*, char*, unsigned long);
+void rpc_chain_set_utxosetinfo(long (*run)(int, void*, char*, unsigned long)){
+    g_usi_run = run;
+}
+static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char embuf[192];
+    int want_muhash = 1;   /* OUR default (documented divergence, see above) */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1){
+        if (params->items[0]->typ != RJ_STR){
+            *ec = -3; *em = "JSON value of type number is not of expected type string"; return 0; }
+        const char* ht = params->items[0]->str;
+        if (!strcmp(ht, "muhash")) want_muhash = 1;
+        else if (!strcmp(ht, "none")) want_muhash = 0;
+        else if (!strcmp(ht, "hash_serialized_3") || !strcmp(ht, "hash_serialized_2") || !strcmp(ht, "hash_serialized")){
+            snprintf(embuf, sizeof embuf, "%s hash type not implemented (this node computes muhash)", ht);
+            *ec = -8; *em = embuf; return 0; }
+        else {
+            snprintf(embuf, sizeof embuf, "'%s' is not a valid hash_type", ht);
+            *ec = -8; *em = embuf; return 0; }
+    }
+    if (!g_usi_run){ *ec = -1; *em = "UTXO set info unavailable in this process"; return 0; }
+    rpc_usi_out_t o; memset(&o, 0, sizeof o);
+    static char msg[256];
+    long r = g_usi_run(want_muhash, &o, msg, sizeof msg);
+    if (r == 0){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set busy"); *em = embuf; return 0; }
+    if (r != 1){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set read failed"); *em = embuf; return 0; }
+    rj_val* out = rj_obj();
+    rj_obj_set(out, "height", rj_numf("%ld", o.height));
+    { u8 hdr[80]; char hx[65];
+      if (read_block_prefix(o.height, hdr, 80) == 1){
+          u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32);
+          rj_obj_set(out, "bestblock", rj_str(hx));
+      } }
+    rj_obj_set(out, "txouts", rj_numf("%llu", o.txouts));
+    rj_obj_set(out, "bogosize", rj_numf("%llu", o.bogosize));
+    if (o.muhash_valid){ char mh[65]; hex_of(mh, o.muhash, 32); rj_obj_set(out, "muhash", rj_str(mh)); }
+    rj_obj_set(out, "total_amount", rj_numf("%llu.%08llu",
+        o.total_amount/100000000ULL, o.total_amount%100000000ULL));
+    *res = out;
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
@@ -1967,6 +2313,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "deriveaddresses")) return cmd_deriveaddresses(params, res, ec, em);
     if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
     if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
+    if (!strcmp(m, "getindexinfo")) return cmd_getindexinfo(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
@@ -1977,6 +2324,8 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockstats")) return cmd_getblockstats(params, res, ec, em);
     if (!strcmp(m, "getnetworkhashps")) return cmd_getnetworkhashps(params, res, ec, em);
     if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
+    if (!strcmp(m, "getblocktemplate")) return cmd_getblocktemplate(params, res, ec, em);
+    if (!strcmp(m, "gettxoutsetinfo")) return cmd_gettxoutsetinfo(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
