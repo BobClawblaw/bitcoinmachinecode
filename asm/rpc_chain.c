@@ -82,6 +82,8 @@ extern void sha256d(u8 out[32], const void* data, unsigned long len);
 extern void block_work(u8 work[16], unsigned bits);
 extern void chainwork_add(u8 out[16], const u8 a[16], const u8 b[16]);
 extern int  wallet_script_to_address(char* out, long cap, const u8* script, long slen);
+extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version,
+                                    unsigned char h160[20], unsigned char prog32[32]);
 extern void hash160(u8 out[20], const void* in, long long len);
 extern void sha256_full(u8 out[32], const void* msg, long long len);
 
@@ -1445,17 +1447,19 @@ extern int bip32_ckdpub_derive(const char* xpub, const unsigned* path, int n, u8
 extern int bip32_xpub_parse(const char* xpub, u8 pub33[33], u8 cc32[32]);
 extern int pubkey_parse(const u8* pub, unsigned long publen, u64 qx[4], u64 qy[4]);
 
-enum { DSC_PKH=0, DSC_WPKH=1, DSC_SHWPKH=2, DSC_PK=3, DSC_COMBO=4, DSC_TR=5, DSC_UNK=-1 };
+enum { DSC_PKH=0, DSC_WPKH=1, DSC_SHWPKH=2, DSC_PK=3, DSC_COMBO=4, DSC_TR=5, DSC_ADDR=6, DSC_RAW=7, DSC_UNK=-1 };
 typedef struct {
     int  script;
-    char key[160];       /* xpub or hex pubkey */
-    int  keytype;        /* 0 raw-pubkey, 1 xpub, 2 has-private (xprv/tprv), -1 bad */
+    char key[160];       /* xpub or hex pubkey; or the address text for addr() */
+    int  keytype;        /* 0 raw-pubkey, 1 xpub, 2 has-private, 3 addr, 4 raw, -1 bad */
     unsigned path[32];
     int  pathlen;        /* fixed components (before any '*') */
     int  ranged;         /* trailing slash-star present */
     int  hardened;       /* any hardened path element */
     u8   rawpub[65];     /* decoded raw pubkey (keytype 0) */
     int  rawlen;
+    u8   spk[520];       /* scriptPubKey for addr()/raw() */
+    int  spklen;
 } desc_t;
 
 /* Parse the descriptor core string (checksum already stripped) into d.
@@ -1471,7 +1475,33 @@ static int desc_parse_core(const char* core, desc_t* d, long* ec, const char** e
     else if (!strncmp(core,"pk(",3) && core[L-1]==')'){ d->script=DSC_PK; inner=core+3; ilen=L-4; }
     else if (!strncmp(core,"combo(",6) && core[L-1]==')'){ d->script=DSC_COMBO; inner=core+6; ilen=L-7; }
     else if (!strncmp(core,"tr(",3) && core[L-1]==')'){ d->script=DSC_TR; inner=core+3; ilen=L-4; }
+    else if (!strncmp(core,"addr(",5) && core[L-1]==')'){ d->script=DSC_ADDR; inner=core+5; ilen=L-6; }
+    else if (!strncmp(core,"raw(",4) && core[L-1]==')'){ d->script=DSC_RAW; inner=core+4; ilen=L-5; }
     else { *ec=-5; *em="Invalid descriptor function"; return 0; }
+
+    /* addr()/raw(): the content is an address or a raw hex script, not a key. */
+    if (d->script==DSC_ADDR){
+        char a[160]; if (ilen>=sizeof a){ *ec=-5; *em="Address too long"; return 0; }
+        memcpy(a,inner,ilen); a[ilen]=0;
+        int type=0; unsigned char ver=0, h160[20], prog[32];
+        if (!wallet_validate_address(a,&type,&ver,h160,prog)){ snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0; }
+        int sl=0;
+        switch (type){
+            case 1: d->spk[0]=0x76;d->spk[1]=0xa9;d->spk[2]=0x14;memcpy(d->spk+3,h160,20);d->spk[23]=0x88;d->spk[24]=0xac;sl=25; break;  /* P2PKH */
+            case 2: d->spk[0]=0x00;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);sl=22; break;                                                 /* P2WPKH */
+            case 3: d->spk[0]=0xa9;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);d->spk[22]=0x87;sl=23; break;                                  /* P2SH */
+            case 4: d->spk[0]=0x00;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2WSH */
+            case 5: d->spk[0]=0x51;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2TR */
+            default: snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0;
+        }
+        d->spklen=sl; snprintf(d->key,sizeof d->key,"%s",a); d->keytype=3; return 1;
+    }
+    if (d->script==DSC_RAW){
+        if ((ilen&1) || ilen/2>520){ *ec=-5; *em="Raw script invalid"; return 0; }
+        d->spklen=(int)(ilen/2);
+        for (int i=0;i<d->spklen;i++){ int hi=hex1(inner[i*2]), lo=hex1(inner[i*2+1]); if(hi<0||lo<0){ *ec=-5; *em="Raw script must be hex"; return 0; } d->spk[i]=(u8)((hi<<4)|lo); }
+        d->keytype=4; return 1;
+    }
 
     char key[256];
     if (ilen >= sizeof key){ *ec=-5; *em="Descriptor too long"; return 0; }
@@ -1574,7 +1604,7 @@ static int cmd_getdescriptorinfo(const rj_val* params, rj_val** res, long* ec, c
     rj_obj_set(o,"descriptor", rj_str(full));
     rj_obj_set(o,"checksum", rj_str(cks));
     rj_obj_set(o,"isrange", rj_bool(d.ranged));
-    rj_obj_set(o,"issolvable", rj_bool(1));
+    rj_obj_set(o,"issolvable", rj_bool(d.script != DSC_RAW && d.script != DSC_ADDR));  /* addr()/raw() carry no key */
     rj_obj_set(o,"hasprivatekeys", rj_bool(d.keytype==2));
     *res = o;
     return 1;
@@ -1613,6 +1643,15 @@ static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, con
         if (end-begin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
     }
     if (d.keytype==2){ *ec=-5; *em="Address derivation from extended private keys is not supported"; return 0; }
+
+    /* addr()/raw(): the address is the descriptor's own script's address. */
+    if (d.script==DSC_ADDR || d.script==DSC_RAW){
+        char addr[128]; addr[0]=0;
+        if (wallet_script_to_address(addr, sizeof addr, d.spk, d.spklen) <= 0 || !addr[0]){
+            *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
+        rj_val* arr = rj_arr(); rj_arr_push(arr, rj_str(addr));
+        *res = arr; return 1;
+    }
 
     rj_val* arr = rj_arr();
     long lo = d.ranged?begin:0, hi = d.ranged?end:0;
