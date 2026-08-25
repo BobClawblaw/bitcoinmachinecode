@@ -18,7 +18,9 @@ has cost in this codebase, not a precise estimate.
 Strongest area: P2P protocol depth and core consensus verification (script,
 segwit, taproot key-path, real mempool policy) — closer to Core than a
 project at this stage might suggest. Weakest area, by a wide margin: **the
-RPC surface**. Also fully absent as clean categories: mining, PSBT,
+RPC surface** *(retired 2026-08-25 — see the update below)*. Also fully
+absent as clean categories *(2026-08-21; mining and PSBT no longer absent —
+same update)*: mining, PSBT,
 multi-wallet/descriptor/watch-only wallets, chain selection (testnet/signet/
 regtest), and modern light-client indexing (blockfilter/coinstats). This
 tracks with the project's actual focus to date — proving consensus
@@ -320,7 +322,13 @@ Real, substantial: HD wallet (BIP32/39), message signing
 (`bitcoin_bip32.asm`, `bitcoin_bip39.asm`, `wallet_msgsign.c`).
 
 Missing:
-- **PSBT (BIP174)** — absent, zero hits anywhere.
+- **PSBT (BIP174)** — ~~absent, zero hits anywhere~~ **substantially present
+  since 2026-08-25**: `createpsbt`, `decodepsbt`, `converttopsbt`,
+  `combinepsbt`, `joinpsbts` (all oracle-verified, several byte-identical)
+  and `analyzepsbt` (full role machine, 14-vector oracle diff). Still
+  missing from the tranche: `finalizepsbt`/`walletprocesspsbt` (need a PSBT
+  signer) and `utxoupdatepsbt` (needs a UTXO lookup path) —
+  `docs/PARITY_PLAN.md` T8 has the per-method state.
 - **Descriptor wallets** — Core's modern default wallet type isn't present.
 - **Watch-only wallets** — absent.
 - **Multi-wallet** (`loadwallet`/`createwallet`/`listwallets`) — absent,

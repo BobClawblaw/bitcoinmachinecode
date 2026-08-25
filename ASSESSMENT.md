@@ -56,10 +56,16 @@ Real, and stronger than the project's age suggests:
 From `FEATURE_GAPS.md`, and this list is the reason the headline above says
 "not a node":
 
-- **The RPC surface is the largest gap by a wide margin.** One tranche of
-  blockchain-query calls exists. Most of Core's API does not.
-- **No mining support.** No block template assembly.
-- **No PSBT (BIP174).** No descriptor, multi-wallet, or watch-only wallets.
+- **The RPC surface is the largest gap by a wide margin.** *(Retired
+  2026-08-25 — see the addendum above; most of Core's API now exists, with
+  per-method verification recorded in `docs/PARITY_PLAN.md`.)*
+- **No mining support.** *(No longer true: `getblocktemplate`,
+  `submitblock`, `prioritisetransaction` landed 2026-08-25 — template frame
+  and retarget oracle-verified; the template's tx ordering is valid but not
+  fee-optimal, and per-tx sigops is a documented lower bound.)*
+- **No PSBT (BIP174).** *(No longer true: six methods since 2026-08-25,
+  mostly oracle-byte-exact; the signer-gated three remain absent.)* No
+  descriptor, multi-wallet, or watch-only wallets — still true.
 - **No chain selection** — no testnet, signet, or regtest. Mainnet only.
 - **No `blockfilterindex` (BIP157/158)**, so no light-client service.
 - **No `coinstatsindex`/`gettxoutsetinfo`**, which matters far more than it
@@ -200,8 +206,11 @@ implementation, having been 5.5× behind two days earlier. The verification
 architecture handles the whole modern chain — segwit, taproot, script-path
 spends at inscription scale — on real data.
 
-But **"can it replace Bitcoin Core" is not a close question today**: no mining,
-no PSBT, no wallets, no testnet, no light-client indexes, a read-plus-submit RPC surface (Core-parity blockchain/util/live-node queries, a descriptor engine, and a sendrawtransaction relay path, but no mining/wallet RPCs),
+But **"can it replace Bitcoin Core" is not a close question today**: no
+multiwallet/descriptor wallets, no testnet, no light-client indexes, an RPC
+surface that (as of 2026-08-25) now spans blockchain/util/live-node/mempool/
+mining/PSBT/submit but still lacks the wallet-management tranche and
+RPC-side spending,
 and a node that until today crashed the first time a peer pushed it a block.
 And **"is it consensus-correct" is an open question**, not a settled one, with
 at least eight known chain-split-direction defects found so far (incidents
