@@ -57,6 +57,49 @@ int main(void){
         "[[{\"txid\":\"" T "\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],777,false]",
         "020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000feffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac09030000");
 
+    /* --- createpsbt: PSBTv0 (BIP174) wrapping the same unsigned tx.
+     * This exact base64 was validated LIVE by Core's decodepsbt (psbt_version 0,
+     * correct tx/inputs/outputs). Structure: 70736274ff | 0100 <txlen> <tx> | 00
+     * (end global) | 00 (input map) | 00 (output map). --- */
+    { long ec; const char* em; const char* pj = "[[{\"txid\":\"" T "\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}]]";
+      rj_val* params = rj_parse(pj, strlen(pj));
+      rj_val* res=NULL; rpc_wallet w; memset(&w,0,sizeof w);
+      rpc_dispatch("createpsbt", params, &w, &res, &ec, &em);
+      ck("createpsbt -> Core-validated v0 PSBT",
+         res && res->typ==RJ_STR && !strcmp(res->str,
+         "cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAAAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA"));
+      if (res && res->typ==RJ_STR) printf("     psbt: %s\n", res->str);
+      rj_free(res); rj_free(params); }
+
+    /* --- decodepsbt round-trip (our createpsbt PSBT -> our decodepsbt),
+     * byte-identical to Core's decodepsbt (verified live). --- */
+    { long ec; const char* em;
+      const char* pj = "[\"cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAAAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA\"]";
+      rj_val* params = rj_parse(pj, strlen(pj)); rj_val* res=NULL; rpc_wallet w; memset(&w,0,sizeof w);
+      rpc_dispatch("decodepsbt", params, &w, &res, &ec, &em);
+      rj_val* txo = res?rj_obj_get(res,"tx"):NULL;
+      rj_val* pv = res?rj_obj_get(res,"psbt_version"):NULL;
+      rj_val* ins = res?rj_obj_get(res,"inputs"):NULL;
+      rj_val* outs = res?rj_obj_get(res,"outputs"):NULL;
+      ck("decodepsbt psbt_version 0", pv && !strcmp(pv->str,"0"));
+      ck("decodepsbt inputs/outputs counts", ins&&ins->nitems==1 && outs&&outs->nitems==1);
+      ck("decodepsbt tx decoded (has txid+version)", txo && rj_obj_get(txo,"txid") && rj_obj_get(txo,"version"));
+      rj_free(res); rj_free(params); }
+
+    /* --- decoderawtransaction now returns the FULL Core shape (was minimal
+     * {locktime,vin,vout}); has txid/version/size/vsize/weight, no "hex". --- */
+    { long ec; const char* em;
+      const char* pj = "[\"020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000\"]";
+      rj_val* params = rj_parse(pj, strlen(pj)); rj_val* res=NULL; rpc_wallet w; memset(&w,0,sizeof w);
+      rpc_dispatch("decoderawtransaction", params, &w, &res, &ec, &em);
+      ck("decoderaw has txid (64 hex)", res && rj_obj_get(res,"txid") && strlen(rj_obj_get(res,"txid")->str)==64);
+      ck("decoderaw version 2", res && rj_obj_get(res,"version") && !strcmp(rj_obj_get(res,"version")->str,"2"));
+      ck("decoderaw has size/vsize/weight", res && rj_obj_get(res,"size") && rj_obj_get(res,"vsize") && rj_obj_get(res,"weight"));
+      ck("decoderaw omits 'hex' (Core parity)", res && rj_obj_get(res,"hex")==NULL);
+      rj_val* sp = res && rj_obj_get(res,"vout") && rj_obj_get(res,"vout")->nitems ? rj_obj_get(rj_obj_get(res,"vout")->items[0],"scriptPubKey") : NULL;
+      ck("decoderaw scriptPubKey.asm populated", sp && rj_obj_get(sp,"asm") && strlen(rj_obj_get(sp,"asm")->str)>0);
+      rj_free(res); rj_free(params); }
+
     /* --- error parity --- */
     long ec; const char* em;
     { rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],[{\"notanaddress\":0.1}]]",&ec,&em);
