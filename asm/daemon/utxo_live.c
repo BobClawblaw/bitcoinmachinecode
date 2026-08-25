@@ -1745,6 +1745,34 @@ void* utxo_live_test_lst(void){ return &g_utxo_lst; }
 void* utxo_live_test_tbl(void){ return g_utxo_table; }
 long utxo_live_count(void){ return utxo_lsm_count(&g_utxo_lst); }
 
+/* GROUND-TRUTH live count: a full dedup walk (same primitive the setinfo
+ * tool and the capstone used), vs utxo_lsm_count()'s O(1) incremental
+ * counter. Added for incident #45 (the counter drifted +7,890,418 during
+ * the ghost-heavy rebuild while the walk stayed Core-exact). O(set size) --
+ * a diagnostic, never for the hot path. */
+static void ulwc_cb(void* ctx, const u8 key36[36], u64 value, u64 code,
+                    const u8* script, u64 slen){
+    (void)key36; (void)value; (void)code; (void)script; (void)slen;
+    (*(long*)ctx)++;
+}
+long utxo_live_walk_count(void){
+    long n = 0;
+    if (utxo_lsm_walk(&g_utxo_lst, g_utxo_table, (void*)ulwc_cb, &n) < 0) return -1;
+    return n;
+}
+
+/* Test/ops knob: drop the flush thresholds live (the caught-up downshift in
+ * utxo_live_catchup is the same operation). Incident #45's repro needs
+ * flushes DURING a ghost/heal cycle, which production hit at bulk scale and
+ * the default test-sized thresholds never reach. */
+/* Test/ops: force a flush now (same call catch-up's own cadence makes). */
+long utxo_live_flush(void){ return utxo_lsm_flush(&g_utxo_lst, g_utxo_table); }
+
+void utxo_live_set_flush_thresholds(u64 fill, u64 op){
+    g_utxo_lst.fill_threshold = fill;
+    g_utxo_lst.op_threshold = op;
+}
+
 /* Handles onto the ONE live writable LSM instance, so a caller that needs to
  * read the confirmed set (tests/test_reorg.c's expected-vs-actual UTXO diff,
  * and any in-process mempool prevout resolution) queries exactly the
