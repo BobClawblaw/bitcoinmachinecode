@@ -90,11 +90,47 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       finalizepsbt, walletprocesspsbt (wallet), utxoupdatepsbt (needs UTXO lookup).
 
 ### T9 — Indexes
-- [ ] txindex (global) → getrawtransaction without blockhash; getindexinfo
+- [x] getindexinfo — this node runs NONE of the optional indexes
+      (txindex/coinstatsindex/blockfilterindex), so it returns {} exactly as
+      Core does when none are enabled; verified live (Core is also lenient on a
+      non-string arg -> {}). The remaining index BUILDS below are the real work.
+- [ ] txindex (global) → getrawtransaction without blockhash
 - [ ] blockfilterindex → getblockfilter (BIP157/158)
 
 ### T10 — Networks
 - [ ] testnet3/testnet4 + signet chain params, net magic, DNS seeds, RPC ports
+
+## Gating analysis (2026-08-25, autonomous session)
+The safe + fully-oracle-verifiable-NOW RPC queue is exhausted after joinpsbts +
+getindexinfo. Every remaining item is blocked on one of:
+- **the UTXO rebuild** (in-daemon, ~79% and climbing): scantxoutset, and the
+  gettxoutsetinfo parity capstone (txouts/total_amount/MuHash vs oracle at tip).
+- **a supervised live-daemon deploy** (mp_ext_area → MAP_SHARED is a runtime
+  memory-model change; must not be flipped unsupervised): verbose getrawmempool,
+  getmempoolentry/ancestors/descendants, real getmempoolinfo bytes,
+  estimatesmartfee. The formatter/iterator can be built + hermetically tested in
+  a worktree first, but end-to-end verification needs the deploy.
+- **the heavy verify/solver stack** (deliberately kept out of rpc_commands):
+  analyzepsbt and verifychain. See the analyzepsbt note below.
+- **a wallet / signer** (no oracle to diff against): send*, listtransactions,
+  gettransaction, finalizepsbt, walletprocesspsbt, P2TR/multisig PSBT signing.
+- **an index we don't build**: getchaintxstats needs cumulative nChainTx (we
+  store per-block nTx only); getblockfilter needs blockfilterindex; scanblocks.
+- **policy divergence we don't chase**: getdeploymentinfo (script_flags).
+
+### analyzepsbt — ground truth captured (node/psbt.cpp), deferred
+Implementation needs three pieces we don't yet have wired into the PSBT path:
+(1) is_final requires ACTUAL script+signature VERIFICATION of the final
+witness/scriptSig against the spk (not just field presence); (2) the "missing"
+object needs a Solver/dummy-signer; (3) estimated_vsize/feerate needs a
+dummy-signed size estimate. Live-verified Core outputs to match when it lands:
+- bare v0 (no UTXO): input {has_utxo:false,is_final:false,next:"updater"},
+  top next:"updater", NO fee.
+- P2WPKH witness_utxo only (hash known, pubkey NOT): has_utxo:true,
+  is_final:false, next:"updater", missing:{pubkeys:[<hash160 from spk>]},
+  and fee IS computed (sum(utxo)-sum(out)) because all inputs have a UTXO.
+- next:"signer" only when the pubkey is known but a sig is missing (e.g. a
+  P2WSH/multisig whose witness_script lists the pubkeys).
 
 ## Process
 One tranche at a time: worktree → implement → hermetic + oracle tests → full
