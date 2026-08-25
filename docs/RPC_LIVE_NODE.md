@@ -71,10 +71,25 @@ field set**; the scratch oracle is master (31.99) and emits fields no release
 has (`tx_send_rate`, `inv_buckets`, cluster limits) — verify stable fields
 only.
 
-### Slice 4 — `sendrawtransaction` (hardest)
-Needs a path into `tx_accept_validate` (`tx_accept.c:195`) + relay, which today
-runs only inside serve children off the P2P `.do_tx` handler. Requires a
-parent→worker submission channel or an in-parent accept+relay path.
+### Slice 4 — `sendrawtransaction` — IMPLEMENTED (2026-08-25)
+The parent→worker submission channel. `node_status_t` (rpc_node.h) carries a
+staging buffer + `tx_submit_seq`/`tx_submit_ack`/`tx_submit_result`/reason. The
+RPC parent (`cmd_sendrawtransaction`, rpc_node.c) parses the hex, computes the
+txid, stages the raw tx under a mutex, bumps `tx_submit_seq`, and blocks on the
+ack. The download worker polls the seq at the top of its loop (`main.c`), lazily
+inits the mempool + UTXO snapshot on first submit, calls
+`txsub_accept_and_relay` (`daemon/tx_submit.c`) — `tx_accept_validate_reason`
+(the reason-capturing variant of `tx_accept_validate`, `tx_accept.c`) then an
+unsolicited `tx` push to every live peer leg via `p2p_write` — and writes the
+verdict + reason back, acking the seq. Core error codes (-22/-25/-26/-27) are
+mapped from the reject reason. The accept+relay path is unit-tested over a
+socketpair (`tests/test_tx_submit.c`, 17 checks); the live peer-relay proof is
+deferred until the UTXO rebuild completes (a real tx cannot validate against a
+partial UTXO set). Chosen the worker-side design (not in-parent accept) because
+the worker owns both the peer legs and the live UTXO-writer state, so no
+cross-process mempool coherence is needed — the mempool lives in the worker.
+Known limitation: the worker's UTXO snapshot is taken once on the first
+submission (a future refinement can re-snapshot per submit for freshness).
 
 ### Slice 5 — `getchaintips`
 Reuse `daemon/reorg.c` fork-choice data for reorg candidates (not persisted
