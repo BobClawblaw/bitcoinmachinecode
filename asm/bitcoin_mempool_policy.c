@@ -488,3 +488,84 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
     }
     return 0;
 }
+
+/* ---- getmempoolentry support (2026-08-25) ---------------------------------
+ * Snapshot one tx's graph neighborhood into the POD bridge struct
+ * (mempool_entry.h). Callers hold mp_lock. Walks by node INDEX (children
+ * reference parents by index, and RBF re-adds append new nodes), deduping
+ * output by txid. The registry can hold stale nodes (RBF-evicted txs whose
+ * bytes are gone from the structural pool); the RPC side filters set members
+ * against the pool -- this walker reports the registry as-is.
+ * Returns 1 found / 0 miss. */
+#include "mempool_entry.h"
+
+static int mpe_seen(unsigned char set[][32], int n, const unsigned char* txid){
+    for (int i=0;i<n;i++) if (!memcmp(set[i],txid,32)) return 1;
+    return 0;
+}
+
+long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_info* out){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC || !out) return 0;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    long self = -1;
+    for (uint32_t i = n; i > 0; i--)             /* newest registration wins */
+        if (!memcmp(t[i-1].txid, txid, 32)){ self = (long)(i-1); break; }
+    if (self < 0) return 0;
+    memset(out, 0, sizeof *out);
+    out->fee  = t[self].fee;
+    out->size = t[self].size;
+
+    /* direct parents */
+    for (uint32_t k=0; k<t[self].n_parents && out->n_depends<MPE_MAX_SET; k++){
+        uint32_t p = t[self].parent[k];
+        if (p >= n) continue;
+        if (!mpe_seen(out->depends, out->n_depends, t[p].txid))
+            memcpy(out->depends[out->n_depends++], t[p].txid, 32);
+    }
+    /* direct children: any node listing self as a parent */
+    for (uint32_t i=0; i<n && out->n_spentby<MPE_MAX_SET; i++){
+        if ((long)i == self) continue;
+        for (uint32_t k=0; k<t[i].n_parents; k++)
+            if (t[i].parent[k] == (uint32_t)self){
+                if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
+                    memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
+                break;
+            }
+    }
+
+    /* transitive ancestors incl self (BFS over parent edges, by index) */
+    { uint32_t stack[MPE_MAX_SET]; int sp=0; 
+      memcpy(out->anc[out->n_anc++], t[self].txid, 32); out->anc_fee = t[self].fee;
+      stack[sp++] = (uint32_t)self;
+      while (sp > 0){
+          uint32_t cur = stack[--sp];
+          for (uint32_t k=0; k<t[cur].n_parents; k++){
+              uint32_t p = t[cur].parent[k];
+              if (p >= n || mpe_seen(out->anc, out->n_anc, t[p].txid)) continue;
+              if (out->n_anc >= MPE_MAX_SET) break;
+              memcpy(out->anc[out->n_anc++], t[p].txid, 32);
+              out->anc_fee += t[p].fee;
+              if (sp < MPE_MAX_SET) stack[sp++] = p;
+          }
+      } }
+    /* transitive descendants incl self (BFS; child edges found by scan) */
+    { uint32_t stack[MPE_MAX_SET]; int sp=0;
+      memcpy(out->desc[out->n_desc++], t[self].txid, 32); out->desc_fee = t[self].fee;
+      stack[sp++] = (uint32_t)self;
+      while (sp > 0){
+          uint32_t cur = stack[--sp];
+          for (uint32_t i=0; i<n; i++){
+              if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
+              int child = 0;
+              for (uint32_t k=0; k<t[i].n_parents; k++)
+                  if (t[i].parent[k] == cur){ child = 1; break; }
+              if (!child) continue;
+              if (out->n_desc >= MPE_MAX_SET) break;
+              memcpy(out->desc[out->n_desc++], t[i].txid, 32);
+              out->desc_fee += t[i].fee;
+              if (sp < MPE_MAX_SET) stack[sp++] = i;
+          }
+      } }
+    return 1;
+}
