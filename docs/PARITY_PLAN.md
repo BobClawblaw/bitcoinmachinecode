@@ -200,8 +200,32 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 - [ ] estimaterawfee (hidden/debug RPC -- low value, deferred)
 
 ### T6 — Wallet-state RPCs on the RPC surface
-- [ ] sendtoaddress, sendmany, listtransactions, gettransaction,
-      getreceivedbyaddress, getunconfirmedbalance
+- [x] listtransactions + gettransaction + getwalletinfo — journal-backed
+      (wallet_txlog.c's crc-guarded BMCTX v1 records of every wallet send).
+      VERIFICATION BOUND stated in code: no oracle wallet exists, so the
+      proof is round-trip through the REAL txlog_append writer, with Core's
+      shapes and sign conventions (send amount/fee negative; txids emitted
+      display-order from the journal's internal-order hex; torn/crc-bad
+      records skipped as absent data). HONEST GAPS: only "send" category
+      exists (the journal records sends); confirmations reported 0 (the
+      journal does not track them -- never invented). getwalletinfo:
+      format "bmc" (own store, stated), balance from the injected UTXO set,
+      txcount from the journal, private_keys_enabled iff a seed is loaded.
+- [x] daemon wallet BOOTSTRAP: serve_start_rpc now loads the CLI's own
+      wallet store (bmcwallet.dat; BMC_WALLET_PASS env or <store>.pass,
+      the CLI's exact resolution order) and hands the RPC layer the seed --
+      getnewaddress/getaddressinfo/getwalletinfo go live on a daemon with a
+      store present; absent store = unconfigured, exactly as before. The
+      mnemonic buffer is wiped after seed derivation.
+- [ ] sendtoaddress/sendmany via RPC — DEFERRED with a design question:
+      Core auto-selects inputs and auto-computes fees from wallet state;
+      our live daemon tracks no wallet UTXOs (rpc_wallet's injected set is
+      for harnesses; the addr index is not configured in production).
+      Needs: a wallet-UTXO source (addr index build, or scan-at-startup) +
+      a fee policy (EMA-based) -- a supervised design, not an overnight
+      wiring job. The CLI primitive (explicit UTXOs + key) remains the
+      working path.
+- [ ] getreceivedbyaddress, getunconfirmedbalance (same UTXO-source gate)
 
 ### T7 — Wallet management (multiwallet)
 - [ ] createwallet/loadwallet/unloadwallet/listwallets, backupwallet,

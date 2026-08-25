@@ -1303,11 +1303,163 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
 }
 
 /* ---- dispatch table ---- */
+/* ==== wallet-state RPCs over the transaction journal ======================
+ * (wallet_txlog.c: BMCTX v1, append-only, crc-guarded records of every send
+ * the wallet made.) VERIFICATION BOUND, stated plainly: there is no oracle
+ * wallet to diff against, so these are verified by round-trip -- a journal
+ * written through the REAL txlog_append is read back through these RPCs --
+ * and the field set is the honest subset the journal actually holds:
+ *   - only "send" category records exist (the journal records sends);
+ *   - confirmations is 0 and no blockhash/blockheight fields are emitted
+ *     (the journal does not track confirmations -- absent, never invented);
+ *   - amounts follow Core's sign conventions (send amount and fee negative);
+ *   - the journal stores txids in INTERNAL byte order; these RPCs emit
+ *     display order like every other txid in the API. */
+static int wsl_hexb(const char* h, unsigned char* out, int n){
+    for (int i=0;i<n;i++){ int a=0,b=0; char c=h[i*2], d=h[i*2+1];
+        if(c>='0'&&c<='9')a=c-'0'; else if(c>='a'&&c<='f')a=c-'a'+10; else return 0;
+        if(d>='0'&&d<='9')b=d-'0'; else if(d>='a'&&d<='f')b=d-'a'+10; else return 0;
+        out[i]=(unsigned char)((a<<4)|b); }
+    return 1;
+}
+typedef struct { unsigned long long ts; unsigned char txid[32];
+                 long long amount, fee; unsigned char dest[20];
+                 unsigned long inputs; long rawlen; } wsl_rec_t;
+static unsigned long wsl_crc(const char* s, long n){
+    unsigned long h = 2166136261UL;
+    for (long i=0;i<n;i++){ h ^= (unsigned char)s[i]; h *= 16777619UL; }
+    return h;
+}
+/* parse the journal (default path in the daemon's cwd/datadir); crc-bad or
+ * torn lines are skipped exactly as the tool-side reader philosophy demands
+ * -- a torn record is absent data, not data. Returns records found. */
+static int wsl_read(wsl_rec_t* recs, int cap){
+    const char* candidates[2] = { "bmcwallet.dat.txlog", "data/bmcwallet.dat.txlog" };
+    FILE* f = 0;
+    for (int i=0;i<2 && !f;i++) f = fopen(candidates[i], "r");
+    if (!f) return 0;
+    char line[600]; int n = 0;
+    while (n < cap && fgets(line, sizeof line, f)){
+        if (line[0]=='#' || line[0]=='\n' || !strncmp(line,"BMCTX",5)) continue;
+        char txh[80], desth[48], crch[16];
+        wsl_rec_t r;
+        int got = sscanf(line, "%llu sent %79s %lld %lld %47s %lu %ld %15s",
+                         &r.ts, txh, &r.amount, &r.fee, desth, &r.inputs, &r.rawlen, crch);
+        if (got != 8 || strlen(txh)!=64 || strlen(desth)!=40) continue;
+        /* crc over the 8-field prefix exactly as the writer computed it */
+        { char pre[512];
+          int pl = snprintf(pre, sizeof pre, "%llu sent %s %lld %lld %s %lu %ld",
+                            r.ts, txh, r.amount, r.fee, desth, r.inputs, r.rawlen);
+          char want[16]; snprintf(want, sizeof want, "%08lx", wsl_crc(pre, pl));
+          if (strcmp(want, crch)) continue; }
+        if (!wsl_hexb(txh, r.txid, 32) || !wsl_hexb(desth, r.dest, 20)) continue;
+        recs[n++] = r;
+    }
+    fclose(f);
+    return n;
+}
+#define WSL_MAX 4096
+static rj_val* wsl_entry(const wsl_rec_t* r){
+    rj_val* e = rj_obj();
+    /* dest h160 -> its P2PKH address via the same helper every other RPC uses */
+    { unsigned char spk[25];
+      spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, r->dest, 20); spk[23]=0x88; spk[24]=0xac;
+      char addr[128]; addr[0]=0;
+      if (wallet_script_to_address(addr, sizeof addr, spk, 25) > 0 && addr[0])
+          rj_obj_set(e, "address", rj_str(addr)); }
+    rj_obj_set(e, "category", rj_str("send"));
+    { char am[32]; rpc_amounts(-r->amount, am, sizeof am); rj_obj_set(e, "amount", rj_numf("%s", am)); }
+    { char fe[32]; rpc_amounts(-r->fee, fe, sizeof fe); rj_obj_set(e, "fee", rj_numf("%s", fe)); }
+    rj_obj_set(e, "confirmations", rj_numf("%d", 0));   /* journal tracks none */
+    { char hx[65]; static const char* HD="0123456789abcdef";
+      for (int k=0;k<32;k++){ unsigned char b=r->txid[31-k]; hx[k*2]=HD[b>>4]; hx[k*2+1]=HD[b&15]; }
+      hx[64]=0; rj_obj_set(e, "txid", rj_str(hx)); }
+    rj_obj_set(e, "time", rj_numf("%llu", r->ts));
+    rj_obj_set(e, "timereceived", rj_numf("%llu", r->ts));
+    { rj_val* wc = rj_arr(); rj_obj_set(e, "walletconflicts", wc); }
+    rj_obj_set(e, "abandoned", rj_bool(0));
+    return e;
+}
+/* listtransactions ("label" count skip): newest LAST like Core; count default
+ * 10, skip from the end (Core semantics: the last `count` after skipping
+ * `skip` most recent). */
+static int cmd_listtransactions(const rj_val* params, long* ec, const char** em, rj_val** result){
+    (void)ec; (void)em;
+    long count = 10, skip = 0;
+    if (params && params->typ==RJ_ARR){
+        if (params->nitems>=2 && params->items[1]->typ==RJ_NUM) count = atol(params->items[1]->str);
+        if (params->nitems>=3 && params->items[2]->typ==RJ_NUM) skip = atol(params->items[2]->str);
+    }
+    if (count < 0){ *ec=-8; *em="Negative count"; return 0; }
+    if (skip < 0){ *ec=-8; *em="Negative from"; return 0; }
+    static wsl_rec_t recs[WSL_MAX];
+    int n = wsl_read(recs, WSL_MAX);
+    long hi = n - skip;            /* exclusive end after skipping most recent */
+    long lo = hi - count;
+    if (lo < 0) lo = 0;
+    rj_val* arr = rj_arr();
+    for (long i = lo; i < hi; i++) rj_arr_push(arr, wsl_entry(&recs[i]));
+    *result = arr;
+    return 1;
+}
+static int cmd_gettransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params || params->typ!=RJ_ARR || params->nitems<1 || params->items[0]->typ!=RJ_STR ||
+        strlen(params->items[0]->str)!=64){
+        *ec=-8; *em="Invalid txid"; return 0; }
+    unsigned char want[32];
+    { unsigned char disp[32];
+      if (!wsl_hexb(params->items[0]->str, disp, 32)){ *ec=-8; *em="Invalid txid"; return 0; }
+      for (int i=0;i<32;i++) want[i] = disp[31-i]; }         /* display -> internal */
+    static wsl_rec_t recs[WSL_MAX];
+    int n = wsl_read(recs, WSL_MAX);
+    for (int i = n-1; i >= 0; i--){
+        if (memcmp(recs[i].txid, want, 32)) continue;
+        rj_val* o = rj_obj();
+        { char am[32]; rpc_amounts(-recs[i].amount, am, sizeof am); rj_obj_set(o, "amount", rj_numf("%s", am)); }
+        { char fe[32]; rpc_amounts(-recs[i].fee, fe, sizeof fe); rj_obj_set(o, "fee", rj_numf("%s", fe)); }
+        rj_obj_set(o, "confirmations", rj_numf("%d", 0));
+        rj_obj_set(o, "txid", rj_str(params->items[0]->str));
+        { rj_val* wc = rj_arr(); rj_obj_set(o, "walletconflicts", wc); }
+        rj_obj_set(o, "time", rj_numf("%llu", recs[i].ts));
+        rj_obj_set(o, "timereceived", rj_numf("%llu", recs[i].ts));
+        { rj_val* det = rj_arr(); rj_arr_push(det, wsl_entry(&recs[i]));
+          rj_obj_set(o, "details", det); }
+        *result = o;
+        return 1;
+    }
+    *ec = -5; *em = "Invalid or non-wallet transaction id";
+    return 0;
+}
+static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
+    static wsl_rec_t recs[WSL_MAX];
+    int n = wsl_read(recs, WSL_MAX);
+    unsigned long long bal = 0;
+    if (w) for (unsigned long i = 0; i < w->utxo_n; i++) bal += w->utxo_val[i];
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "walletname", rj_str("bmcwallet"));
+    rj_obj_set(o, "walletversion", rj_numf("%d", 1));
+    rj_obj_set(o, "format", rj_str("bmc"));           /* own format, stated */
+    { char am[32]; rpc_amounts((long long)bal, am, sizeof am); rj_obj_set(o, "balance", rj_numf("%s", am)); }
+    rj_obj_set(o, "unconfirmed_balance", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "immature_balance", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "txcount", rj_numf("%d", n));
+    rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
+    rj_obj_set(o, "paytxfee", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
+    rj_obj_set(o, "avoid_reuse", rj_bool(0));
+    rj_obj_set(o, "scanning", rj_bool(0));
+    rj_obj_set(o, "descriptors", rj_bool(0));
+    rj_obj_set(o, "external_signer", rj_bool(0));
+    *result = o;
+    return 1;
+}
+
 int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
         "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
+        "listtransactions","gettransaction","getwalletinfo",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -1354,6 +1506,12 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_joinpsbts(params, err_code, err_msg, result);
     if (!strcmp(method, "analyzepsbt"))
         return cmd_analyzepsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "listtransactions"))
+        return cmd_listtransactions(params, err_code, err_msg, result);
+    if (!strcmp(method, "gettransaction"))
+        return cmd_gettransaction(params, err_code, err_msg, result);
+    if (!strcmp(method, "getwalletinfo"))
+        return cmd_getwalletinfo(w, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
