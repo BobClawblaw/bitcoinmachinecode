@@ -42,6 +42,16 @@ and runs natively.
                                           (the security-critical core; validate
                                            against *_{fe,scalar,glv,scalar}_c.c
                                            oracles + Python int oracle)
+    - [x] secp256k1_scalar  -> port/arm64/secp256k1_scalar.S   test_scalar PASS
+          native (12/12 incl. sc_inv and 3*inv(3)==1); ~13.5k-case differential
+          fuzz vs Python big-int mod n (add/sub/mul/sqr/inv, full-range operands)
+          0 failures. Fixed 2 real bugs: (1) sc_mul clobbered callee-saved x22
+          (AAPCS violation -> main's live x22 corrupt -> SIGSEGV); (2) sc_mul fold
+          carry-propagation loop `cmp`-clobbered the C flag between `adcs` steps,
+          silently dropping each column carry at tmp[k+2] -> result off by DELTA.
+          (2026-08-25)
+    - [ ] secp256k1_point / point_ct / ecdsa / schnorr / glv  <- NEXT
+          (sc_inv_var binary-xgcd still needs porting for ecdsa_verify s^{-1})
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.

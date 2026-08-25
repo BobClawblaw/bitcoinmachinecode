@@ -4,6 +4,8 @@
 test_*
 t_ripemd
 fz_tx
+fz_fe
+fz_sc
 t_roll
 live_blocks
 live_download
