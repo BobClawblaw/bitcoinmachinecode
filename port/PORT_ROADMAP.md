@@ -54,9 +54,11 @@ and runs natively.
       `.note.GNU-stack` swallowed all code into the note section (moved to EOF);
       (3) interval branches `sub x28,#1; b.mi/b.pl` used plain `sub` (no NZCV)
       so they read STALE flags and over-ran the window loop -> `subs`. (2026-08-25)
-    - [ ] secp256k1_point_ct / point_scalar_mul_fixed / point_scalar_mul_glv
-    - [ ] secp256k1_ecdsa / schnorr       <- NEXT (needs point_scalar_mul_fixed
-          for the u1*G term + sc_inv_var/s^{-1})
+    - [x] point_scalar_mul_fixed (k*G comb) -> same file; G_COMB_TABLE (converted
+          dq->.quad) in .rodata; verified vs Python k*G across 7 seeds, 0 fail.
+          R held in memory, only calls point_add_mixed -> no register-clobber
+          hazard. (2026-08-25)
+    - [ ] secp256k1_point_ct / point_scalar_mul_glv
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.

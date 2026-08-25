@@ -460,4 +460,270 @@ N_EXP:
 	.byte 0xfe,0xff,0xff,0xff,0xff,0xff,0xff,0xff
 	.byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
 
+/* ============================================================================
+ * int sc_inv_var(r[4]=x0, a[4]=x1) : r = a^{-1} mod n  -- VARIABLE-TIME
+ *   Binary extended GCD (Stein): invariants bx1*a==u, bx2*a==v mod n.
+ *   Start u=a, v=n, bx1=1, bx2=0. Strip powers of 2 (halving u/bx1 then
+ *   v/bx2 mod n); both odd -> subtract smaller from larger (and x's mod n via
+ *   sc_sub); difference is even -> next strip. Ends u==1 (ans bx1) or v==1
+ *   (ans bx2). Returns w0=1 (r written) or w0=0 (a==0). PUBLIC-scalar only
+ *   (signing uses sc_inv, the constant-time Fermat). Calls sc_sub (leaf,
+ *   preserves x19+). Frame: u@sp+0 v@sp+32 bx1@sp+64 bx2@sp+96.
+ *   Helpers .Lf_shr1 and .Lf_halve are reachable only via bl.
+ * ========================================================================== */
+	.global sc_inv_var
+	.type   sc_inv_var, %function
+sc_inv_var:
+	stp  x29, x30, [sp, #-16]!
+	mov  x29, sp
+	stp  x19, x20, [sp, #-16]!
+	sub  sp, sp, #128
+	mov  x19, x0                 /* out (persistent across sc_sub) */
+
+	/* a == 0 -> fail */
+	ldr  x4, [x1, #0]
+	ldr  x5, [x1, #8]
+	orr  x4, x4, x5
+	ldr  x5, [x1, #16]
+	orr  x4, x4, x5
+	ldr  x5, [x1, #24]
+	orr  x4, x4, x5
+	cbz  x4, .Lf_fail
+
+	/* u=a v=n bx1=1 bx2=0 */
+	ldr  x4, [x1, #0]
+	ldr  x5, [x1, #8]
+	ldr  x6, [x1, #16]
+	ldr  x7, [x1, #24]
+	str  x4, [sp, #0]
+	str  x5, [sp, #8]
+	str  x6, [sp, #16]
+	str  x7, [sp, #24]
+	LAddr x4, N_LIMBS
+	ldr  x5, [x4, #0]
+	ldr  x6, [x4, #8]
+	ldr  x7, [x4, #16]
+	ldr  x8, [x4, #24]
+	str  x5, [sp, #32]
+	str  x6, [sp, #40]
+	str  x7, [sp, #48]
+	str  x8, [sp, #56]
+	mov  x5, #1
+	str  x5, [sp, #64]
+	str  xzr, [sp, #72]
+	str  xzr, [sp, #80]
+	str  xzr, [sp, #88]
+	str  xzr, [sp, #96]
+	str  xzr, [sp, #104]
+	str  xzr, [sp, #112]
+	str  xzr, [sp, #120]
+
+.Lf_loop:
+	/* u == 1 ? (u0==1, u1..u3==0) -> ret bx1 */
+	ldr  x4, [sp, #0]
+	cmp  x4, #1
+	b.ne .Lf_chkv
+	ldr  x5, [sp, #8]
+	ldr  x6, [sp, #16]
+	orr  x5, x5, x6
+	ldr  x6, [sp, #24]
+	orr  x5, x5, x6
+	cbz  x5, .Lf_retx1
+.Lf_chkv:
+	/* v == 1 ? -> ret bx2 */
+	ldr  x4, [sp, #32]
+	cmp  x4, #1
+	b.ne .Lf_stripu
+	ldr  x5, [sp, #40]
+	ldr  x6, [sp, #48]
+	orr  x5, x5, x6
+	ldr  x6, [sp, #56]
+	orr  x5, x5, x6
+	cbz  x5, .Lf_retx2
+.Lf_stripu:
+	ldr  x4, [sp, #0]
+	tst  x4, #1
+	b.ne .Lf_stripv
+	mov  x0, sp
+	bl   .Lf_shr1
+	add  x0, sp, #64
+	bl   .Lf_halve
+	b    .Lf_stripu
+.Lf_stripv:
+	ldr  x4, [sp, #32]
+	tst  x4, #1
+	b.ne .Lf_cmp
+	add  x0, sp, #32
+	bl   .Lf_shr1
+	add  x0, sp, #96
+	bl   .Lf_halve
+	b    .Lf_stripv
+
+.Lf_cmp:
+	/* u >= v ? (compare top limb down); v remaining when u < v */
+	ldr  x4, [sp, #24]
+	ldr  x5, [sp, #56]
+	cmp  x4, x5
+	b.lo .Lf_vbig
+	b.hi .Lf_ubig
+	ldr  x4, [sp, #16]
+	ldr  x5, [sp, #48]
+	cmp  x4, x5
+	b.lo .Lf_vbig
+	b.hi .Lf_ubig
+	ldr  x4, [sp, #8]
+	ldr  x5, [sp, #40]
+	cmp  x4, x5
+	b.lo .Lf_vbig
+	b.hi .Lf_ubig
+	ldr  x4, [sp, #0]
+	ldr  x5, [sp, #32]
+	cmp  x4, x5
+	b.lo .Lf_vbig
+.Lf_ubig:
+	/* u -= v */
+	ldr  x4, [sp, #0]
+	ldr  x5, [sp, #32]
+	subs x4, x4, x5
+	str  x4, [sp, #0]
+	ldr  x5, [sp, #40]
+	ldr  x6, [sp, #8]
+	sbcs x6, x6, x5
+	str  x6, [sp, #8]
+	ldr  x5, [sp, #48]
+	ldr  x6, [sp, #16]
+	sbcs x6, x6, x5
+	str  x6, [sp, #16]
+	ldr  x5, [sp, #56]
+	ldr  x6, [sp, #24]
+	sbcs x6, x6, x5
+	str  x6, [sp, #24]
+	/* bx1 = sc_sub(bx1, bx2) */
+	add  x0, sp, #64
+	mov  x1, x0
+	add  x2, sp, #96
+	bl   sc_sub
+	b    .Lf_loop
+.Lf_vbig:
+	/* v -= u */
+	ldr  x4, [sp, #32]
+	ldr  x5, [sp, #0]
+	subs x4, x4, x5
+	str  x4, [sp, #32]
+	ldr  x5, [sp, #8]
+	ldr  x6, [sp, #40]
+	sbcs x6, x6, x5
+	str  x6, [sp, #40]
+	ldr  x5, [sp, #16]
+	ldr  x6, [sp, #48]
+	sbcs x6, x6, x5
+	str  x6, [sp, #48]
+	ldr  x5, [sp, #24]
+	ldr  x6, [sp, #56]
+	sbcs x6, x6, x5
+	str  x6, [sp, #56]
+	/* bx2 = sc_sub(bx2, bx1) */
+	add  x0, sp, #96
+	mov  x1, x0
+	add  x2, sp, #64
+	bl   sc_sub
+	b    .Lf_loop
+
+.Lf_retx1:
+	add  x0, sp, #64
+	b    .Lf_store
+.Lf_retx2:
+	add  x0, sp, #96
+.Lf_store:
+	mov  x2, x19
+	ldp  x4, x5,  [x0]
+	ldp  x6, x7,  [x0, #16]
+	stp  x4, x5,  [x2]
+	stp  x6, x7,  [x2, #16]
+	mov  w0, #1
+	b    .Lf_out
+.Lf_fail:
+	mov  w0, #0
+.Lf_out:
+	add  sp, sp, #128
+	ldp  x19, x20, [sp], #16
+	ldp  x29, x30, [sp], #16
+	ret
+	.size sc_inv_var, .-sc_inv_var
+
+/* .Lf_shr1(x0)  : [x0] 4 limbs >>= 1 (plain). Uses x4-x13 only. */
+.Lf_shr1:
+	ldr  x4, [x0, #0]
+	ldr  x5, [x0, #8]
+	ldr  x6, [x0, #16]
+	ldr  x7, [x0, #24]
+	lsr  x8, x4, #1
+	lsl  x9, x5, #63
+	orr  x8, x8, x9
+	lsr  x9, x5, #1
+	lsl  x10, x6, #63
+	orr  x9, x9, x10
+	lsr  x10, x6, #1
+	lsl  x11, x7, #63
+	orr  x10, x10, x11
+	lsr  x11, x7, #1
+	str  x8,  [x0, #0]
+	str  x9,  [x0, #8]
+	str  x10, [x0, #16]
+	str  x11, [x0, #24]
+	ret
+
+/* .Lf_halve(x0) : [x0] (in [0,n)) /= 2 mod n. odd: (x+n)>>1 w/ carry-in bit.
+   Uses x4-x13 only. */
+.Lf_halve:
+	ldr  x4, [x0, #0]
+	ldr  x5, [x0, #8]
+	ldr  x6, [x0, #16]
+	ldr  x7, [x0, #24]
+	tst  x4, #1
+	b.eq .Lf_hm
+	LAddr x9, N_LIMBS
+	ldr  x10, [x9, #0]
+	ldr  x11, [x9, #8]
+	ldr  x12, [x9, #16]
+	ldr  x13, [x9, #24]
+	adds x4, x4, x10
+	adcs x5, x5, x11
+	adcs x6, x6, x12
+	adcs x7, x7, x13
+	adc  x8, xzr, xzr          /* x8 = bit 256 of x+n */
+	lsr  x9, x4, #1
+	lsl  x10, x5, #63
+	orr  x9, x9, x10
+	lsr  x10, x5, #1
+	lsl  x11, x6, #63
+	orr  x10, x10, x11
+	lsr  x11, x6, #1
+	lsl  x12, x7, #63
+	orr  x11, x11, x12
+	lsr  x12, x7, #1
+	lsl  x13, x8, #63
+	orr  x12, x12, x13
+	str  x9,  [x0, #0]
+	str  x10, [x0, #8]
+	str  x11, [x0, #16]
+	str  x12, [x0, #24]
+	ret
+.Lf_hm:
+	lsr  x8, x4, #1
+	lsl  x9, x5, #63
+	orr  x8, x8, x9
+	lsr  x9, x5, #1
+	lsl  x10, x6, #63
+	orr  x9, x9, x10
+	lsr  x10, x6, #1
+	lsl  x11, x7, #63
+	orr  x10, x10, x11
+	lsr  x11, x7, #1
+	str  x8,  [x0, #0]
+	str  x9,  [x0, #8]
+	str  x10, [x0, #16]
+	str  x11, [x0, #24]
+	ret
+
 	.section .note.GNU-stack,"",%progbits
