@@ -212,7 +212,16 @@ int main(void){
       rj_val* rr = call("decodescript", "[\"76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac\"]", &bec, &bem);
       ck("decodescript works before chain open (not -28)", rr && rr->typ==RJ_OBJ && S(rr,"type")); rj_free(rr);
       rr = call("getdescriptorinfo", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]", &bec, &bem);
-      ck("getdescriptorinfo works before chain open", rr && rr->typ==RJ_OBJ && S(rr,"checksum")); rj_free(rr); }
+      ck("getdescriptorinfo works before chain open", rr && rr->typ==RJ_OBJ && S(rr,"checksum")); rj_free(rr);
+      /* getindexinfo: no optional indexes on this node -> {} (Core-exact for a
+       * node with no txindex/coinstatsindex/blockfilterindex), served pre-open. */
+      rr = call("getindexinfo", "[]", &bec, &bem);
+      ck("getindexinfo -> empty object (no indexes)", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr);
+      rr = call("getindexinfo", "[\"txindex\"]", &bec, &bem);
+      ck("getindexinfo(filter) -> empty object", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr);
+      /* Core does not type-check the arg -- a non-string still yields {} (live-verified). */
+      rr = call("getindexinfo", "[123]", &bec, &bem);
+      ck("getindexinfo(non-string) -> empty object (Core-lenient)", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr); }
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
     expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
