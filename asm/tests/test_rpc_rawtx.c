@@ -158,6 +158,78 @@ int main(void){
       ck("joined PSBT round-trips to 2-in 2-out", vin&&vin->nitems==2 && vout&&vout->nitems==2);
       rj_free(rd); rj_free(pd); }
 
+    /* --- analyzepsbt: every expectation below is the EXACT field value the
+     * scratch Core oracle produced live for the same PSBT (14-vector diff, all
+     * match; representative 8 frozen here). Covers: no-UTXO; P2WPKH missing
+     * pubkey vs missing sig (updater vs signer hinges on whether the pubkey is
+     * derivable from bip32_deriv/partial_sig); finalized (extractor); P2SH
+     * missing redeem via non_witness_utxo (missing reported) vs via
+     * witness_utxo only (missing DROPPED -- Core's require_witness_sig early-
+     * return in SignPSBTInput fires before out_sigdata is filled); vsize with
+     * Core's 71-byte dummy sig (2-input case is the discriminator: 72 would
+     * give 181, Core says 180); P2SH-P2WPKH redeem-push scriptSig accounting
+     * (vsize 136); and sign-aware fee/feerate with CFeeRate's floor-toward
+     * -inf division on a negative-fee PSBT (-0.00367648, not -0.00367647). */
+    { rpc_wallet w; memset(&w,0,sizeof w);
+      struct { const char* name; const char* psbt; const char* next;
+               const char* in0_next; int has_utxo, is_final;
+               const char* vsize; const char* feerate; const char* fee;
+               const char* miss_kind; } av[] = {
+      {"bare (no utxo)",
+       "cHNidP8BAFICAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD9////AZBfAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAAA",
+       "updater","updater",0,0,NULL,NULL,NULL,NULL},
+      {"P2WPKH wutxo, pubkey unknown -> updater/missing pubkeys",
+       "cHNidP8BAFICAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD9////AZBfAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAEBH6CGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAA==",
+       "updater","updater",1,0,NULL,NULL,"0.00010000","pubkeys"},
+      {"P2WPKH + bip32 -> signer, vsize 110",
+       "cHNidP8BAFICAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD9////AZBfAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAEBH6CGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YiBgJ5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmAR1HnboACICAnm+Zn753LusVaBilc6HCwcCm/zbLc4o2VnygVsW+BeYBHUedugA",
+       "signer","signer",1,0,"110","0.00090909","0.00010000","signatures"},
+      {"finalized -> extractor",
+       "cHNidP8BAFICAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD9////AZBfAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAEBH6CGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YBCGsCRzBEAiABljnub793/La6NrQeZQMfPMYhNGZuuAQHlaxwpDEilwIgUG5CAnvALdjQTQNljhbTU0NALvDJ6Bd8uxizBWhYIBUBIQJ5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmAAiAgJ5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmAR1HnboAA==",
+       "extractor","extractor",1,1,"110","0.00090909","0.00010000",NULL},
+      {"P2SH missing redeem via non_witness_utxo -> missing.redeemscript",
+       "cHNidP8BAFUCAAAAAf3g0y6Njj4QeRVZXgdyFdOgZlejCVYA19+4QmcLLWYRAAAAAAD9////AZBfAQAAAAAAGXapFHUedugZkZbUVJQcRdGzoyPxQzvWiKwAAAAAAAEAUwIAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP////8BoIYBAAAAAAAXqRR1HnboGZGW1FSUHEXRs6Mj8UM71ocAAAAAAAA=",
+       "updater","updater",1,0,NULL,NULL,"0.00010000","redeemscript"},
+      {"P2SH missing redeem via witness_utxo only -> missing DROPPED",
+       "cHNidP8BAFUCAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACqAAAAAAD9////AZBfAQAAAAAAGXapFHUedugZkZbUVJQcRdGzoyPxQzvWiKwAAAAAAAEBIKCGAQAAAAAAF6kUdR526BmRltRUlBxF0bOjI/FDO9aHAAA=",
+       "updater","updater",1,0,NULL,NULL,"0.00010000",NULL},
+      {"2x P2WPKH + bip32 -> vsize 180 (71-byte dummy sig)",
+       "cHNidP8BAH4CAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADMAAAAAAD9////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM0BAAAAAP3///8B8EkCAAAAAAAZdqkUdR526BmRltRUlBxF0bOjI/FDO9aIrAAAAAAAAQEfoIYBAAAAAAAWABR1HnboGZGW1FSUHEXRs6Mj8UM71iIGAnm+Zn753LusVaBilc6HCwcCm/zbLc4o2VnygVsW+BeYCHUedugAAAAAAAEBH6CGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YiBgJ5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmAh1HnboAAAAAAAA",
+       "signer","signer",1,0,"180","0.00277777","0.00050000","signatures"},
+      {"P2SH-P2WPKH negative fee -> -0.00050000 / feerate floor -0.00367648",
+       "cHNidP8BAFUCAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADMAAAAAAD9////AfBJAgAAAAAAGXapFHUedugZkZbUVJQcRdGzoyPxQzvWiKwAAAAAAAEBIKCGAQAAAAAAF6kUvP63KLWEJT1fP3C8t4Dp7yGKaPSHAQQWABR1HnboGZGW1FSUHEXRs6Mj8UM71iIGAnm+Zn753LusVaBilc6HCwcCm/zbLc4o2VnygVsW+BeYCHUedugAAAAAAAA=",
+       "signer","signer",1,0,"136","-0.00367648","-0.00050000","signatures"},
+      };
+      for (unsigned k=0;k<sizeof av/sizeof av[0];k++){
+        char pj[4096]; snprintf(pj,sizeof pj,"[\"%s\"]",av[k].psbt);
+        long ec2; const char* em2; rj_val* pr=rj_parse(pj,strlen(pj)); rj_val* r=NULL;
+        int rc=rpc_dispatch("analyzepsbt",pr,&w,&r,&ec2,&em2);
+        char lbl[160]; snprintf(lbl,sizeof lbl,"analyzepsbt: %s",av[k].name);
+        rj_val* nx=r?rj_obj_get(r,"next"):NULL;
+        rj_val* ins=r?rj_obj_get(r,"inputs"):NULL;
+        rj_val* i0=ins&&ins->nitems?ins->items[0]:NULL;
+        rj_val* i0n=i0?rj_obj_get(i0,"next"):NULL;
+        rj_val* hu=i0?rj_obj_get(i0,"has_utxo"):NULL;
+        rj_val* fi=i0?rj_obj_get(i0,"is_final"):NULL;
+        rj_val* vs=r?rj_obj_get(r,"estimated_vsize"):NULL;
+        rj_val* fr=r?rj_obj_get(r,"estimated_feerate"):NULL;
+        rj_val* fe=r?rj_obj_get(r,"fee"):NULL;
+        rj_val* ms=i0?rj_obj_get(i0,"missing"):NULL;
+        int ok = rc==1 && nx && !strcmp(nx->str,av[k].next)
+              && i0n && !strcmp(i0n->str,av[k].in0_next)
+              && hu && hu->typ==RJ_BOOL && (hu->str[0]=='1')==(av[k].has_utxo!=0)
+              && fi && fi->typ==RJ_BOOL && (fi->str[0]=='1')==(av[k].is_final!=0)
+              && ((av[k].vsize==NULL)==(vs==NULL)) && (!vs || !strcmp(vs->str,av[k].vsize))
+              && ((av[k].feerate==NULL)==(fr==NULL)) && (!fr || !strcmp(fr->str,av[k].feerate))
+              && ((av[k].fee==NULL)==(fe==NULL)) && (!fe || !strcmp(fe->str,av[k].fee))
+              && ((av[k].miss_kind==NULL)==(ms==NULL)) && (!ms || rj_obj_get(ms,av[k].miss_kind)!=NULL);
+        ck(lbl, ok);
+        if (!ok && r){ printf("     next=%s in0=%s vs=%s fr=%s fee=%s miss=%s\n",
+            nx?nx->str:"-", i0n?i0n->str:"-", vs?vs->str:"-", fr?fr->str:"-", fe?fe->str:"-", ms?"y":"-"); }
+        rj_free(r); rj_free(pr);
+      }
+    }
+
     /* --- error parity --- */
     long ec; const char* em;
     { rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],[{\"notanaddress\":0.1}]]",&ec,&em);
