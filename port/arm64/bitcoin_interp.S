@@ -308,6 +308,7 @@ script_eval:
 	stp  x21,x22,[sp,#-16]!
 	stp  x23,x24,[sp,#-16]!
 	sub  sp,sp,#0xC0
+	mov  x24,sp			/* interp_* helper frame-slot base */
 	mov  x20,x0			/* state */
 
 	/* per-thread scratch addresses */
@@ -391,6 +392,11 @@ script_eval:
 .prescan_done:
 
 .loop:
+	/* if pc >= pend -> done (x86 cmp rbp-0x18; jae .loop_done) */
+	ldr  x2,[sp,#SL_PC]
+	ldr  x3,[sp,#SL_PEND]
+	cmp  x2,x3
+	b.hs .loop_done
 	bl   vfexec_all_true
 	str  x0,[sp,#SL_FEXEC]
 	/* get_op */
@@ -682,10 +688,10 @@ script_eval:
 	ldr  w2,[x21]
 	cmp  w2,#2
 	b.hs .tap_minif
-	cbnz w2,.if_minif_ok
+	cbz  w2,.if_minif_ok		/* len==0 -> ok (false) */
 	ldrb w3,[x21,#ELEM_DATA_OFF]
 	cmp  w3,#1
-	b.eq .if_minif_ok
+	b.eq .if_minif_ok		/* len==1 && byte==1 -> ok */
 .tap_minif:
 	mov  w0,#SE_TAPSCRIPT_MINIMALIF
 	b    .err_ret0
@@ -699,7 +705,7 @@ script_eval:
 	ldr  w2,[x21]
 	cmp  w2,#2
 	b.hs .wif_minif
-	cbnz w2,.if_minif_ok
+	cbz  w2,.if_minif_ok
 	ldrb w3,[x21,#ELEM_DATA_OFF]
 	cmp  w3,#1
 	b.eq .if_minif_ok
@@ -756,7 +762,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -849,16 +855,14 @@ script_eval:
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#2
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_dup_index
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#2
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_dup_index
 	b    .next_op
 
@@ -870,9 +874,8 @@ script_eval:
 1:	CSTK
 	bl   stack_depth
 	sub  x0,x0,#3
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_dup_index
 	subs x19,x19,#1
 	b.ne 1b
@@ -886,9 +889,8 @@ script_eval:
 1:	CSTK
 	bl   stack_depth
 	sub  x0,x0,#4
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_dup_index
 	subs x19,x19,#1
 	b.ne 1b
@@ -902,17 +904,15 @@ script_eval:
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#4
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_elem_ptr
 	mov  x21,x0
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#2
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_elem_ptr
 	mov  x22,x0
 	bl   interp_swap_recs
@@ -920,17 +920,15 @@ script_eval:
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#3
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_elem_ptr
 	mov  x21,x0
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#1
-	mov  x1,x0
+	mov  x2,x0
 	CSTK
-	mov  x2,x1
 	bl   stack_elem_ptr
 	mov  x22,x0
 	bl   interp_swap_recs
@@ -948,14 +946,10 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_elem_ptr
+	mov  x9,x0			/* src elem ptr (sp-6) */
 	ldr  x3,[sp,#SL_ET0]
-	mov  x0,x3
-	mov  x1,x0
-	mov  x1,x0
-	/* rsi = elem ptr */
-	mov  x9,x0
-	mov  x0,x3
-	mov  x1,x9
+	mov  x0,x3			/* dst = et0 */
+	mov  x1,x9			/* src */
 	bl   elem_move
 	CSTK
 	bl   stack_depth
@@ -1004,7 +998,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1079,7 +1073,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1133,26 +1127,37 @@ script_eval:
 	mov  x0,#3
 	bl   interp_require_depth
 	cbnz x0,.err_ret0
-	mov  x19,#2
-1:	CSTK
+	/* ROT: (x1 x2 x3) -> (x2 x3 x1). swap(sp-3,sp-2) then swap(sp-2,sp-1). */
+	CSTK
 	bl   stack_depth
 	sub  x0,x0,#3
-	add  x0,x0,x19
 	mov  x2,x0
 	CSTK
 	bl   stack_elem_ptr
-	mov  x21,x0		/* a = sp-3 .. sp-2 */
+	mov  x21,x0		/* a = sp-3 */
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#2
-	add  x0,x0,x19
 	mov  x2,x0
 	CSTK
 	bl   stack_elem_ptr
-	mov  x22,x0		/* b = sp-2 .. sp-1 */
+	mov  x22,x0		/* b = sp-2 */
 	bl   interp_swap_recs
-	subs x19,x19,#1
-	b.ne 1b
+	CSTK
+	bl   stack_depth
+	sub  x0,x0,#2
+	mov  x2,x0
+	CSTK
+	bl   stack_elem_ptr
+	mov  x21,x0		/* a = sp-2 */
+	CSTK
+	bl   stack_depth
+	sub  x0,x0,#1
+	mov  x2,x0
+	CSTK
+	bl   stack_elem_ptr
+	mov  x22,x0		/* b = sp-1 */
+	bl   interp_swap_recs
 	b    .next_op
 
 .op_swap:
@@ -1258,7 +1263,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1291,14 +1296,14 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
 	mov  x2,#4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	mov  x22,x0		/* bn */
 	cmp  x19,#1
@@ -1379,28 +1384,28 @@ script_eval:
 	CSTK
 	bl   stack_second_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
 	mov  x2,#4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	mov  x22,x0		/* bn1 */
 	/* bn2 = top */
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
 	mov  x2,#4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	mov  x23,x0		/* bn2 */
 	cmp  x19,#1
@@ -1495,7 +1500,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1517,7 +1522,7 @@ script_eval:
 	CSTK
 	bl   stack_third_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1525,13 +1530,13 @@ script_eval:
 	bl   scriptnum_decode
 	mov  x23,x0		/* val */
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	/* min = second */
 	CSTK
 	bl   stack_second_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1539,13 +1544,13 @@ script_eval:
 	bl   scriptnum_decode
 	mov  x22,x0		/* min */
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	/* max = top */
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1553,7 +1558,7 @@ script_eval:
 	bl   scriptnum_decode
 	mov  x19,x0		/* max */
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	/* f = (min<=val) && (val<max) */
 	cmp  x22,x23
@@ -1695,7 +1700,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1725,14 +1730,14 @@ script_eval:
 	CSTK
 	bl   stack_second_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
 	mov  x2,#4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
-	ldr  x3,[x3]
+	ldr  w3,[x3]
 	cbnz x3,.snum_fail
 	mov  x19,x0		/* num */
 	bl   interp_checksig_add
@@ -1773,7 +1778,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1799,7 +1804,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1847,7 +1852,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1915,7 +1920,7 @@ script_eval:
 	CSTK
 	bl   stack_top_ptr
 	mov  x21,x0
-	ldr  x2,[x21]
+	ldr  w2,[x21]
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
@@ -1959,11 +1964,12 @@ script_eval:
  * ========================================================================== */
 
 	/* interp_require_depth(min=x0) -> x0=0 ok / SE_INVALID_STACK_OPERATION */
+	/* interp_require_depth(min=x0) -> x0=0 ok / SE_INVALID_STACK_OPERATION.
+	 * Inlines stack_depth (*&sp == [state+8]) -- a `bl stack_depth` here would
+	 * clobber x30 and the trailing `ret` would self-loop (tail-ret trap). */
 interp_require_depth:
 	mov  x9,x0
-	add  x0,x20,#8
-	ldr  x1,[x20]
-	bl   stack_depth
+	ldr  x0,[x20,#8]
 	cmp  x0,x9
 	b.hs 1f
 	mov  w0,#SE_INVALID_STACK_OPERATION
@@ -1990,55 +1996,47 @@ interp_swap_recs:
 	ret
 	.size interp_swap_recs,.-interp_swap_recs
 
-	/* interp_push_num(&sp=x0, elems=x1, value=x2) -> ok 1/0 */
 interp_push_num:
-	mov  x19,x0
-	mov  x20,x1
-	mov  x21,x2
-	mov  x0,x21
-	bl   scriptnum_serialize	/* x0=ptr, x1=len (AAPCS pair in x0/x1) */
-	mov  x22,x1			/* len */
-	mov  x10,x0			/* ptr */
-	LAddr x11, interp_tmp
-	mov  x2,x22
-	mov  x1,x10
-	mov  x0,x11
-	cbz  x2,1f
-0:	ldrb w3,[x1],#1
-	strb w3,[x0],#1
-	subs x2,x2,#1
-	b.ne 0b
-1:	mov  x0,x19
-	mov  x1,x20
-	mov  x2,x11
-	mov  x3,x22
+	stp  x29,x30,[sp,#-16]!
+	stp  x27,x28,[sp,#-16]!
+	stp  x25,x26,[sp,#-16]!
+	mov  x25,x0		/* &sp */
+	mov  x26,x1		/* elems */
+	mov  x27,x2		/* value */
+	mov  x0,x27
+	bl   scriptnum_serialize	/* x0=ptr, x1=len */
+	mov  x2,x0		/* data ptr */
+	mov  x3,x1		/* len */
+	mov  x0,x25
+	mov  x1,x26
 	bl   stack_push
-	mov  x19,xzr
-	mov  x20,xzr
-	mov  x21,xzr
-	mov  x22,xzr
+	ldp  x25,x26,[sp],#16
+	ldp  x27,x28,[sp],#16
+	ldp  x29,x30,[sp],#16
 	ret
-	.size interp_push_num,.-interp_push_num
+.size interp_push_num,.-interp_push_num
 
 	/* interp_push_bool(&sp=x0, elems=x1, bool=x2) -> 1/0 */
 interp_push_bool:
-	mov  x19,x0
-	mov  x20,x1
-	mov  x9,x2
+	stp  x29,x30,[sp,#-16]!
+	stp  x25,x26,[sp,#-16]!
+	mov  x25,x0		/* &sp */
+	mov  x26,x1		/* elems */
+	mov  x9,x2		/* bool */
 	LAddr x10, interp_tmp
 	mov  w3,#0
 	cbz  x9,1f
 	mov  w3,#1
 1:	strb w3,[x10]
-	mov  x0,x19
-	mov  x1,x20
 	mov  x2,x10
 	mov  x3,x9		/* len 0/1 */
+	mov  x0,x25
+	mov  x1,x26
 	bl   stack_push
-	mov  x19,xzr
-	mov  x20,xzr
+	ldp  x25,x26,[sp],#16
+	ldp  x29,x30,[sp],#16
 	ret
-	.size interp_push_bool,.-interp_push_bool
+.size interp_push_bool,.-interp_push_bool
 
 	/* interp_sig_encoding_ok(sig_elem=x0) -> x0=1 ok / 0 -> SCRIPT_ERR_SIG_DER */
 interp_sig_encoding_ok:

@@ -39,3 +39,4 @@ t_checksig
 t_codec
 t_stack
 t_interp
+t_eval

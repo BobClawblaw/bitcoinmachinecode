@@ -188,3 +188,19 @@ interp_memeq. It ASSEMBLES and LINKS clean against codec+sighash+crypto objects.
 IMPORTANT: this is a faithful transcription, NOT yet semantically verified. Next step:
 build the whole-VM differential harness (pure-Python EvalScript over ~90 opcodes +
 CLTV/CSV with tx context) driving a C script_state provider, + real Core/block vectors.
+
+## script_eval MAIN VM -- DIFFERENTIAL-VERIFIED (2026-08-25)
+The full opcode-dispatch VM (all non-CHECKSIG opcodes) is verified against an independent
+pure-Python EvalScript mirror (eval_oracle.py) with EXACT rc + err_out + final-stack equality:
+32 seeds x 400 = 12,800 scripted cases, 0 fails. Ops covered: controls IF/NOTIF/ELSE/ENDIF,
+VERIFY/RETURN, TOALT/FROMALT, 2DROP/2DUP/3DUP/2OVER/2ROT/2SWAP/IFDUP/DEPTH/DROP/DUP/NIP/
+OVER/PICK/ROLL/ROT/SWAP/TUCK/SIZE, EQUAL(VERIFY), mono(1ADD..0NOTEQUAL), bin(ADD..MAX),
+WITHIN, crypto(RIPEMD160/SHA1/SHA256/HASH160/HASH256), CODESEPARATOR, CLTV/CSV (real tx
+context), pushnum, tapscript prescan/cleanstack/minimal-if, empty-script end-of-loop.
+Real asm bugs found+fixed via this harness: get_op lacked its 2nd return (pushlen); missing
+pc>=pend .loop_done check; minimal-if cbz-vs-cbnz; helper x1-then-CSTK idx clobber; 2ROT
+bottom-2 (fix: index depth-6/depth-5); ROT loop indices; leaf helpers not preserving x19-x24
+and x30 (tail-ret trap); x24 never set to frame base (interp helpers read garbage slots);
+element len read as 64-bit instead of u32 (OP_SIZE pitfall) at 19 sites.
+REMAINING slice: interp_checksig/_checksig_add/_checkmultisig (CHECKSIG/CHECKMULTISIG paths
++ C checksig_fn callback interop) still crash under the stub-plumbing test -- next debug item.

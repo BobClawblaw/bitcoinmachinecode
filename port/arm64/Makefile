@@ -92,6 +92,10 @@ fuzz_stack:
 	python3 fuzz_stack.py 1 500
 t_interp: t_interp.c bitcoin_interp.o bitcoin_scriptcodec.o
 	$(CC) $(CFLAGS) -o t_interp t_interp.c bitcoin_interp.o bitcoin_scriptcodec.o
+t_eval: t_eval.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_sighash.o bitcoin_hash.o sha256.o sha1.o ripemd160.o
+	$(CC) $(CFLAGS) -o t_eval t_eval.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_sighash.o bitcoin_hash.o sha256.o sha1.o ripemd160.o
+fuzz_eval:
+	python3 eval_oracle.py 1 400
 CKSOBJS=bitcoin_checksig.o bitcoin_sighash.o bitcoin_bip143.o bitcoin_script.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o bitcoin_hash.o sha256.o
 t_checksig: t_checksig.c $(CKSOBJS)
 	$(CC) $(CFLAGS) -o t_checksig t_checksig.c $(CKSOBJS)

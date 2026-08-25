@@ -662,9 +662,11 @@ get_op:
 .gop_done:
 	str  x4,[x3]
 	add  x0,x2,#1
+	mov  x1,x6		/* return pushlen in x1 (x86 RDX) */
 	ret
 .gop_bad:
 	mov  w0,#0
+	mov  x1,#0
 	ret
 	.size get_op,.-get_op
 
