@@ -1965,6 +1965,8 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     /* pure util methods: no chain state needed (Core serves them always). */
     if (!strcmp(m, "getdescriptorinfo")) return cmd_getdescriptorinfo(params, res, ec, em);
     if (!strcmp(m, "deriveaddresses")) return cmd_deriveaddresses(params, res, ec, em);
+    if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
+    if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
@@ -1980,7 +1982,5 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
-    if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
-    if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     return -1;
 }
