@@ -127,3 +127,9 @@ blocks, and a stride-5,000 sweep walked straight past it. A census result is a
 statement about its sampling interval. When the number it produces is the
 reason not to fix something, re-sample at the density the conclusion needs
 before believing it.
+
+**Final note 2026-08-25.** The chain this census surveyed has now been fully
+replayed and rebuilt through the live tip, and the resulting set proven
+byte-identical to Core's by MuHash (`README.md`). The census's record above —
+what it predicted, what it missed and why — stands unedited as a document
+about sampling, which was always its real subject.

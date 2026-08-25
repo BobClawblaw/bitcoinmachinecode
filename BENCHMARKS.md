@@ -1,5 +1,14 @@
 # Benchmarks — bitcoinmachinecode vs Bitcoin Core
 
+**Scope note 2026-08-25.** Nothing below is invalidated by the day's changes
+(RPC surface, shared mempool, parity capstone) — no measured hot path was
+altered. Two new operation costs worth knowing that are NOT benchmarked
+below: a full `gettxoutsetinfo` walk over the 165.7M-entry set is ~90 s
+without MuHash and ~6 min with it; a whole-set `scantxoutset` is ~90–110 s.
+Both refuse on a datadir being written rather than returning a fast wrong
+answer.
+
+
 Written 2026-08-22. Every number here was produced by `scripts/bench_vs_core.sh`
 on one machine in one sitting; nothing is transcribed from memory or from a
 previous session. Re-running that script is how you check any claim below.

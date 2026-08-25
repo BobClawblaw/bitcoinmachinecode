@@ -1,6 +1,14 @@
 # PLAN — Block-level script verification
 
-Status: Written 2026-08-18. **Stages A, B, and C done, 2026-08-19** (legacy
+Status: Written 2026-08-18. **PLAN COMPLETE — Stage D's end state achieved
+2026-08-25:** the from-genesis, full-verification rebuild reached the live
+tip and the resulting UTXO set was proven byte-identical to Bitcoin Core's
+(`gettxoutsetinfo muhash` at height 963,967: count, amount, bogosize and
+MuHash all exact, with no filters and no overrides — the acceptance test
+this plan was written to reach; see `README.md` Status and `LOG.md`).
+Original status trail follows.
+
+ **Stages A, B, and C done, 2026-08-19** (legacy
 SignatureHash complete, FindAndDelete, OP_CODESEPARATOR strip, dispatch
 verified across P2PK/P2PKH/P2SH/bare-multisig, activation-height flag
 schedule) -- see "Stage B0/B1/B2 done", its "CLOSED" follow-up, and "Stage C

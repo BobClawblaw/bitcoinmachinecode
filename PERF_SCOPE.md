@@ -1,5 +1,14 @@
 # Performance scope — bulk UTXO rebuild / full-verification replay
 
+**Closure note 2026-08-25.** The rebuild this document profiles is finished:
+genesis to the live tip, ending in the MuHash parity proof (`README.md`).
+The final stretch was dominated by ghost-healing (rollback + fresh re-apply
+per block after a crashed run, ~10 blk/s through the modern era), which is a
+recovery mode, not a representative replay rate — the height-banded numbers
+below remain the citable ones. Two artifacts of that stretch became
+incidents #45 and #46 in `LOG.md`.
+
+
 Written 2026-08-21, during Stage D's full-chain replay (see
 `PLAN_SCRIPT_VERIFY.md`). This is a profile-grounded inventory of where the
 replay's cycles actually go and what the real levers are — not a roadmap
