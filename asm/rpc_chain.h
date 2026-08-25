@@ -44,4 +44,9 @@ int rpc_chain_dispatch(const char* method, const rj_val* params,
 /* Is `method` one this module implements? (for rpc_known_method) */
 int rpc_chain_known_method(const char* method);
 
+/* Full-tx decoder (Core decoderawtransaction shape). Shared by
+ * decoderawtransaction and decodepsbt so both use the getblock-verified
+ * tx_to_json output. Returns 1, or 0 with *ec / *em. */
+int rpc_chain_decode_rawtx(const unsigned char* tx, long txlen, rj_val** result, long* ec, const char** em);
+
 #endif /* RPC_CHAIN_H */
