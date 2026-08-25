@@ -1534,6 +1534,7 @@ static int ds_p2sh_addr(const u8* s, size_t n, char* out, long cap){
 }
 
 static int desc_checksum(const char* span, char out[9]);   /* defined below */
+int rpc_chain_desc_checksum(const char* span, char out[9]){ return desc_checksum(span, out); }
 
 /* InferDescriptor for a bare scriptPubKey with no keystore (Core
  * descriptor.cpp InferScript fallbacks): pk()/multi() when the key material is

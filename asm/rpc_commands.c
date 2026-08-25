@@ -10,6 +10,7 @@
 #include "rpc_commands.h"
 #include "rpc_chain.h"
 #include "rpc_node.h"
+#include "rpc_wallet_ops.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1563,6 +1564,7 @@ int rpc_known_method(const char* method) {
         NULL
     };
     for (int i = 0; known[i]; i++) if (!strcmp(method, known[i])) return 1;
+    if (rpc_wops_known_method(method)) return 1;
     if (rpc_node_known_method(method)) return 1;
     return rpc_chain_known_method(method);
 }
@@ -1613,6 +1615,13 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_getbalances(w, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
+    /* the rest of Core's Wallet category (rpc_wallet_ops.c) -- labels, wallet
+     * inventory, output locks, message signing, descriptor reporting, and the
+     * lifecycle methods a single-seed wallet cannot honour. */
+    {
+        int r = rpc_wops_dispatch(method, params, w, result, err_code, err_msg);
+        if (r >= 0) return r;
+    }
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
      * serve daemon's shared status; -1 means "not one of its methods". */
     {
