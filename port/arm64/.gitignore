@@ -51,3 +51,7 @@ t_undo_c
 undo_log.o
 lsm_stub.o
 fuzz_undo
+
+ibd
+vobj/
+btc_scriptverify.o
