@@ -260,7 +260,51 @@ The mistake was the same one every time:
 
 ---
 
-## 7. Working on this machine
+## 7. Gate results are read in one step; git acts in a separate step
+
+Earned 2026-08-25: a merge went to `main` with a FAILED full-suite gate
+(`REAL_EXIT=2`, a link error) because the commit/merge/push were chained
+after a `tail` of the gate log with `&&` — and `tail` succeeds no matter
+what the log says. The chain executed on the tail's exit code, not the
+gate's. Rule: READ the gate result as its own step, confirm `REAL_EXIT=0`
+and zero failures explicitly, and only then run git commands, un-chained
+from anything whose exit code is not the gate's. The complement, earned the
+same day by a user asking "why are we gating a docs push?": the gate binds to
+what it can detect. A commit whose `git diff --name-only` is provably
+`*.md`-only cannot change a build artifact or a test outcome, and gating it
+re-proves known-green code at fifteen minutes per proof — the mechanical
+name-list check IS the verification for that class. Anything non-`.md` in
+the list, full gate, no judgment calls. Related recurring class,
+same day: any test that `#include`s `daemon/main.c` as a translation unit
+(`test_dial_budget`) needs every new `daemon/*.c` added to its own source
+list — check `DIALSRCS` whenever a daemon source file is born.
+
+## 8. Test fixtures get the same bounds scrutiny as production code
+
+Earned 2026-08-25: a hand-built 65-byte coinbase written into `u8[64]`
+stack buffers had been copy-pasted across SEVEN test fixtures. One byte of
+undefined behavior whose landing spot depended on each binary's stack
+layout: six suites passed for days by luck, and the seventh — a new test —
+"flaked" in a way that cost an hour to trace to the fixture rather than the
+code under test. Widening a buffer is free; debugging layout-dependent UB
+in a test you trusted is not. A fixture that builds byte structures is
+production code with worse review pressure.
+
+## 9. A counter is not a measurement
+
+Earned 2026-08-25 (incident #45): the LSM's O(1) live-entry counter drifted
++7,890,418 during the ghost-heavy rebuild while the actual set stayed
+byte-perfect (the MuHash proved it). The root cause was an unverifiable
+assumption — "the persisted base was written with the WAL empty" — broken
+undetectably by a kill between a flush's manifest write and its WAL
+truncate. Rules that fell out: an incrementally-maintained counter is
+telemetry until reconciled against a ground-truth walk; any restore
+arithmetic whose correctness depends on a crash not having happened in a
+specific window is wrong by construction (detect the window, or pay for the
+recount); and when a cheap number and an expensive measurement disagree,
+the measurement is the number.
+
+## 10. Working on this machine
 
 See the repo README for the full topology. The traps that recur:
 
