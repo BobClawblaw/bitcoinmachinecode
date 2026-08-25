@@ -34,6 +34,14 @@ void rpc_wops_set_scanner(long (*read_block)(long h, unsigned char* buf, long ca
 
 /* 1 if this txid was marked abandoned (gettransaction reports it). */
 int  rpc_wops_is_abandoned(const char* txid_display);
+
+/* Look one of the wallet's own outputs up by outpoint (from the rescan
+ * records), for signrawtransactionwithwallet: BIP143 commits to each
+ * input's value and scriptPubKey, and for the wallet's own coins the scan
+ * carries both. Fills the value and the key's h160; 0 if unknown. */
+int  rpc_wops_own_coin(const void* wallet_seed, const unsigned char txid_wire[32],
+                       unsigned int vout, unsigned long long* value_out,
+                       unsigned char h160_out[20]);
 void rpc_wops_reset_locks(void);
 
 #endif
