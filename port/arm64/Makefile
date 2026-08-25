@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -50,6 +50,11 @@ test_tx: bitcoin_tx.o bitcoin_hash.o sha256.o $(ASMDIR)/tests/test_tx.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_tx.c bitcoin_tx.o bitcoin_hash.o sha256.o -I$(ASMDIR)
 test_txtxid: bitcoin_tx.o bitcoin_hash.o sha256.o $(ASMDIR)/tests/test_txtxid.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_txtxid.c bitcoin_tx.o bitcoin_hash.o sha256.o -I$(ASMDIR)
+
+test_store: bitcoin_store.o $(ASMDIR)/tests/test_store.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_store.c bitcoin_store.o -I$(ASMDIR)
+t_roll: bitcoin_store.o t_roll.c
+	$(CC) $(CFLAGS) -o $@ t_roll.c bitcoin_store.o -I$(ASMDIR) -include sys/stat.h
 
 fuzz: so
 	python3 fuzz_all.py
