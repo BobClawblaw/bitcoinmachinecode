@@ -7,6 +7,31 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- incident #43: chainwork.dat corrupt for the entire post-segwit chain
+
+Found while oracle-verifying the new mining RPCs. `getnetworkhashps` diverged
+from Core for windows near height 500000, which traced to `getblockheader`'s
+`chainwork` field being wrong for EVERY height >= 481824 -- exactly the
+segwit-activation height and the witness-stripped-archive boundary (see the
+2026-08-22 archive incident). chainwork matched Core through 481824, then drifted
+(undercounting) for the remaining ~482k blocks.
+
+Root cause is the persisted `chainwork.dat` file, NOT the computation: recomputing
+cumulative work from `headers.dat`'s nBits via the existing `block_work()` +
+`chainwork_add()` primitives matches Core byte-for-byte at every height
+(500000 -> ...cda532266f9147b519e933, identical to Core). The file was written
+wrong during the witness-stripped-archive repair episode; `block_work` is correct.
+
+Fix: `daemon/chainwork_build.c` regenerates `chainwork.dat` from `headers.dat`.
+The rebuilt file was verified against the live oracle at 10 heights across the
+chain (all match) and swapped into production (corrupt file preserved as
+`chainwork.dat.corrupt-20260825`). Daemon restarted -- graceful SIGTERM
+checkpoint at 659738, clean resume (reload applied_height=659738, 68.4M UTXOs
+intact), embedded RPC now serves correct chainwork. This was masked because
+`getnetworkhashps` uses a chainwork DIFFERENCE (the constant offset cancels far
+past the corruption), so only windows straddling the transition zone exposed it;
+absolute `chainwork` in getblock/getblockheader/getchaintips was wrong all along.
+
 ## 2026-08-25 -- incident #42: node_handshake frame overlap ate every real peer's version payload
 
 Found while wiring `getpeerinfo`: it (and the `[dl] outbound` log line) showed

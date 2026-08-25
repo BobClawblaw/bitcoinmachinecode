@@ -552,6 +552,11 @@ BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
 
+# chainwork_build -- regenerate chainwork.dat from headers.dat (block_work sum).
+# Fixes the post-segwit chainwork.dat corruption; block_work itself is correct.
+daemon/chainwork_build: daemon/chainwork_build.c bitcoin_chainwork.o
+	$(CC) -no-pie -O2 -o $@ daemon/chainwork_build.c bitcoin_chainwork.o
+
 # test_truncate_guard_prim -- store_truncate_to must REFUSE an out-of-order
 # archive and leave the block data intact. Asserts on the BLOCK FILES, not
 # just index.dat: the test that missed the original ~600GB loss checked only

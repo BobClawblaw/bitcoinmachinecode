@@ -55,7 +55,11 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 - [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (after T4)
 
 ### T3 — Mining-info RPCs  [oracle-verifiable, non-wallet]
-- [ ] getmininginfo, getnetworkhashps — diff vs oracle
+- [x] getnetworkhashps + getmininginfo — getnetworkhashps diffed byte-for-byte
+      vs oracle (incl. float formatting) at multiple heights/windows;
+      getmininginfo = documented v31 field set. NOTE: this uncovered and FIXED
+      incident #43 -- chainwork.dat corrupt for the whole post-segwit chain
+      (getblock/getblockheader chainwork wrong); regenerated + verified + live.
 - [ ] getblocktemplate (BIP22/23) — large; diff structure vs oracle
 - [ ] submitblock, prioritisetransaction
 

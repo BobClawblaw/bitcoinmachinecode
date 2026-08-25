@@ -653,6 +653,28 @@ int main(void){
       expect_err("gbs height out of range", "getblockstats", "[999]", -8, "Target block height out of range");
     }
 
+    /* ---- getnetworkhashps / getmininginfo (chainwork from the header fallback,
+     * which is block_work-correct). Exact values are oracle-verified live; here
+     * we regress the plumbing, error parity, and getmininginfo shape. ---- */
+    {
+      r = call("getnetworkhashps", "[]", &ec, &em);
+      ck("getnetworkhashps returns a positive number", r && r->typ == RJ_NUM && atof(r->str) > 0.0); rj_free(r);
+      r = call("getnetworkhashps", "[120,3]", &ec, &em);
+      ck("getnetworkhashps by height returns a number", r && r->typ == RJ_NUM); rj_free(r);
+      expect_err("gnh nblocks=0 rejected", "getnetworkhashps", "[0]", -8, "Invalid nblocks. Must be a positive number or -1.");
+      expect_err("gnh height out of range", "getnetworkhashps", "[120, 999]", -8, "Block does not exist at specified height");
+
+      r = call("getmininginfo", "[]", &ec, &em);
+      ck_str("mininginfo.blocks", S(r,"blocks"), "3");
+      ck_str("mininginfo.chain", S(r,"chain"), "main");
+      ck("mininginfo.bits present (8 hex)", S(r,"bits") && strlen(S(r,"bits")) == 8);
+      ck("mininginfo.difficulty present", G(r,"difficulty") != NULL);
+      ck("mininginfo.networkhashps present", G(r,"networkhashps") != NULL);
+      ck_str("mininginfo.pooledtx", S(r,"pooledtx"), "0");
+      ck("mininginfo.warnings is an array", G(r,"warnings") && G(r,"warnings")->typ == RJ_ARR);
+      rj_free(r);
+    }
+
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
