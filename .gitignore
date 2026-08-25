@@ -182,6 +182,7 @@ asm/tests/test_rpc_chain
 asm/tests/test_txoutproof
 asm/tests/test_rpc_node
 asm/tests/test_rpc_msg
+asm/tests/test_rpc_rawtx
 asm/rpc_json.o
 asm/rpc_net.o
 asm/rpc_commands.o
