@@ -315,6 +315,7 @@ static void mpe_hex(char* dst, const unsigned char* internal){
     for (int k=0;k<32;k++){ unsigned char b=internal[31-k]; dst[k*2]=HEXD[b>>4]; dst[k*2+1]=HEXD[b&15]; }
     dst[64]=0;
 }
+static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
@@ -340,7 +341,15 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
     unsigned long len=0;
     const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
     if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+    rj_val* o = mpe_entry_obj(txid, tx, len);
+    mpu();
+    *res = o;
+    return 1;
+}
 
+/* Build one getmempoolentry-shaped object (assumes mp_lock HELD; also the
+ * per-member body of the verbose getmempoolancestors/-descendants forms). */
+static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len){
     rj_val* o = rj_obj();
     unsigned long w = mp_tx_weight(tx, len);
     rj_obj_set(o, "vsize", rj_numf("%lu", (w+3)/4));
@@ -388,9 +397,68 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
           if (g_mph.get(g_mph.mp, inf.spentby[i], &l2)){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
       rj_obj_set(o, "spentby", sb); }
     rj_obj_set(o, "unbroadcast", rj_bool(0));
+    return o;
+}
+
+/* getmempoolancestors / getmempooldescendants (Core rpc/mempool.cpp): the
+ * tx's transitive in-mempool ancestors (txs it depends on) or descendants
+ * (txs depending on it), EXCLUDING the tx itself -- verified live on the
+ * oracle. Non-verbose: array of txids; verbose: object keyed by txid with
+ * the same entry shape as getmempoolentry. Same -8/-5 error parity. The set
+ * comes from the same mp_lock'd mpool_policy_entry_info snapshot the entry
+ * uses, filtered to members still in the structural pool. */
+static int cmd_mpe_relatives(const rj_val* params, rj_val** res, long* ec, const char** em,
+                             int want_desc){
+    static char embuf[128];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
+        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    const char* hx = params->items[0]->str;
+    size_t hl = strlen(hx);
+    if (hl != 64){
+        snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", hl, hx);
+        *ec = -8; *em = embuf; return 0; }
+    unsigned char txid[32];
+    for (int i=0;i<32;i++){
+        int a=srt_hex1(hx[i*2]), b=srt_hex1(hx[i*2+1]);
+        if (a<0||b<0){ snprintf(embuf,sizeof embuf,"txid must be hexadecimal string (not '%s')",hx);
+                       *ec=-8; *em=embuf; return 0; }
+        txid[31-i]=(unsigned char)((a<<4)|b);
+    }
+    int verbose = 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL &&
+        params->items[1]->str && params->items[1]->str[0]=='1') verbose = 1;
+    if (!g_mph.mp || !g_mph.get){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    mpl();
+    unsigned long len=0;
+    if (!g_mph.get(g_mph.mp, txid, &len)){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    mp_entry_info inf; int have_inf = 0;
+    if (g_mph.polstate && g_mph.pol_entry_info)
+        have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
+    rj_val* out = verbose ? rj_obj() : rj_arr();
+    if (have_inf){
+        int n = want_desc ? inf.n_desc : inf.n_anc;
+        unsigned char (*set)[32] = want_desc ? inf.desc : inf.anc;
+        for (int i=0;i<n;i++){
+            if (!memcmp(set[i], txid, 32)) continue;         /* EXCLUDING self */
+            unsigned long l2=0;
+            const unsigned char* t2 = g_mph.get(g_mph.mp, set[i], &l2);
+            if (!t2) continue;                               /* stale registry entry */
+            char h2[65]; mpe_hex(h2, set[i]);
+            if (verbose) rj_obj_set(out, h2, mpe_entry_obj(set[i], t2, l2));
+            else         rj_arr_push(out, rj_str(h2));
+        }
+    }
     mpu();
-    *res = o;
+    *res = out;
     return 1;
+}
+static int cmd_getmempoolancestors(const rj_val* params, rj_val** res, long* ec, const char** em){
+    return cmd_mpe_relatives(params, res, ec, em, 0);
+}
+static int cmd_getmempooldescendants(const rj_val* params, rj_val** res, long* ec, const char** em){
+    return cmd_mpe_relatives(params, res, ec, em, 1);
 }
 
 /* sendrawtransaction: parse the raw-tx hex, stage it into the shared
@@ -465,7 +533,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getmempoolinfo", "getrawmempool", "getmempoolentry", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -479,6 +547,8 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
+    if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
+    if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);
     if (!strcmp(m, "sendrawtransaction")) return cmd_sendrawtransaction(params, res, ec, em);
     return -1;
 }

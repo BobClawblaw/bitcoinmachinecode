@@ -269,6 +269,48 @@ int main(void){
              && dp->items[0]->str && !strcmp(dp->items[0]->str,pidhex)); }
         rj_free(r); rj_free(pp);
 
+        /* ---- getmempoolancestors / getmempooldescendants: EXCLUDING self
+         * (oracle-verified), non-verbose arrays + verbose entry objects ---- */
+        { char aj[128]; snprintf(aj,sizeof aj,"[\"%s\"]",pidhex);
+          rj_val* ap=rj_parse(aj,strlen(aj)); r=NULL;
+          rc=rpc_node_dispatch("getmempoolancestors",ap,&r,&ec,&em);
+          ck("ancestors(parent) -> []", rc==1 && r && r->typ==RJ_ARR && r->nitems==0);
+          rj_free(r); rj_free(ap);
+          snprintf(aj,sizeof aj,"[\"%s\"]",cidhex);
+          ap=rj_parse(aj,strlen(aj)); r=NULL;
+          rc=rpc_node_dispatch("getmempoolancestors",ap,&r,&ec,&em);
+          ck("ancestors(child) -> [parent]", rc==1 && r && r->typ==RJ_ARR && r->nitems==1
+             && r->items[0]->str && !strcmp(r->items[0]->str,pidhex));
+          rj_free(r); rj_free(ap);
+          snprintf(aj,sizeof aj,"[\"%s\"]",pidhex);
+          ap=rj_parse(aj,strlen(aj)); r=NULL;
+          rc=rpc_node_dispatch("getmempooldescendants",ap,&r,&ec,&em);
+          ck("descendants(parent) -> [child]", rc==1 && r && r->typ==RJ_ARR && r->nitems==1
+             && r->items[0]->str && !strcmp(r->items[0]->str,cidhex));
+          rj_free(r); rj_free(ap);
+          snprintf(aj,sizeof aj,"[\"%s\"]",cidhex);
+          ap=rj_parse(aj,strlen(aj)); r=NULL;
+          rc=rpc_node_dispatch("getmempooldescendants",ap,&r,&ec,&em);
+          ck("descendants(child) -> []", rc==1 && r && r->typ==RJ_ARR && r->nitems==0);
+          rj_free(r); rj_free(ap);
+          /* verbose: entry-shaped member objects */
+          snprintf(aj,sizeof aj,"[\"%s\", true]",cidhex);
+          ap=rj_parse(aj,strlen(aj)); r=NULL;
+          rc=rpc_node_dispatch("getmempoolancestors",ap,&r,&ec,&em);
+          ck("ancestors(child,true) -> {parent: entry}", rc==1 && r && r->typ==RJ_OBJ && r->nmembers==1);
+          { rj_val* pe = r?rj_obj_get(r,pidhex):NULL;
+            ck("verbose ancestor entry has fees.base + descendantcount 2",
+               pe && rj_obj_get(pe,"fees") && S(rj_obj_get(pe,"fees"),"base")
+               && !strcmp(S(rj_obj_get(pe,"fees"),"base"),"0.00010000")
+               && S(pe,"descendantcount") && !strcmp(S(pe,"descendantcount"),"2")); }
+          rj_free(r); rj_free(ap);
+          /* -5 miss parity */
+          ap=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000001\"]",68);
+          r=NULL; long e5; const char* m5;
+          rc=rpc_node_dispatch("getmempoolancestors",ap,&r,&e5,&m5);
+          ck("ancestors miss -> -5", rc==0 && e5==-5 && m5 && !strcmp(m5,"Transaction not in mempool"));
+          rj_free(r); rj_free(ap); }
+
         /* error parity: -5 not in mempool; -8 bad txid with Core's message */
         { rj_val* p5=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000001\"]",68);
           r=NULL; long e5; const char* m5; rc=rpc_node_dispatch("getmempoolentry",p5,&r,&e5,&m5);
