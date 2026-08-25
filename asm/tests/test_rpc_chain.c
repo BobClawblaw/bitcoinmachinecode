@@ -207,6 +207,30 @@ static long usi_stub_run(int want_muhash, void* outv, char* msg, unsigned long m
     return 1;
 }
 
+/* scantxoutset stub scanner: reports one hit for the FIRST target spk at
+ * height 2, scan height 3 (the fixture tip, so bestblock/blockhash resolve). */
+static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens, int nspk,
+                          void* hitsv, long hits_cap, long* hits_n,
+                          long* out_height, unsigned long long* out_scanned,
+                          unsigned long long* out_total, int* out_overflow,
+                          char* msg, unsigned long mcap){
+    (void)hits_cap; (void)msg; (void)mcap;
+    struct { unsigned char txid[32]; unsigned int vout;
+             unsigned long long value; unsigned long long height; int coinbase;
+             unsigned char spk[128]; unsigned int spklen; } *hits = hitsv;
+    if (nspk < 1) return -1;
+    memset(hits[0].txid, 0x77, 32);
+    hits[0].vout = 7;
+    hits[0].value = 123456;
+    hits[0].height = 2;
+    hits[0].coinbase = 0;
+    hits[0].spklen = spklens[0];
+    memcpy(hits[0].spk, spks, spklens[0]);
+    *hits_n = 1; *out_height = 3; *out_scanned = 150;
+    *out_total = 123456; *out_overflow = 0;
+    return 1;
+}
+
 int main(void){
     /* deterministic sig/pubkey bytes satisfying strict DER + compressed-prefix checks */
     SIG[0]=0x30; SIG[1]=0x44; SIG[2]=0x02; SIG[3]=0x20; for (int i = 0; i < 32; i++) SIG[4+i] = (unsigned char)(0x11 + i);
@@ -820,6 +844,64 @@ int main(void){
         rj_free(r1); rj_free(p1); }
       g_usi_stub_busy = 0;
       rpc_chain_set_utxosetinfo(0);
+    }
+
+    /* ---- scantxoutset: dispatch + shape over an injected STUB scanner (the
+     * real scanner shares the tool-derived reader TU; its numbers get their
+     * proof at the parity capstone -- oracle target frozen: the Counterparty
+     * burn address, 3135 unspents / 2130.99791495 BTC at oracle h=964017).
+     * Synchronous scans: status -> null, abort -> false (Core's no-scan
+     * answers, oracle-verified). ---- */
+    {
+      extern void rpc_chain_set_utxoscan(long (*)(const unsigned char*, const unsigned int*,
+                    int, void*, long, long*, long*, unsigned long long*, unsigned long long*,
+                    int*, char*, unsigned long));
+      r = call("scantxoutset", "[\"status\"]", &ec, &em);
+      ck("scan status (no scan) -> null", r && r->typ == RJ_NULL); rj_free(r);
+      r = call("scantxoutset", "[\"abort\"]", &ec, &em);
+      ck("scan abort (no scan) -> false", r && r->typ == RJ_BOOL && r->str[0]=='0'); rj_free(r);
+      expect_err("scan bad action -> Core message", "scantxoutset", "[\"frobnicate\"]",
+                 -8, "Invalid action 'frobnicate'");
+      expect_err("scan start without scanobjects -> -8", "scantxoutset", "[\"start\"]",
+                 -8, "scanobjects argument is required for the start action");
+      { long e0; const char* m0; rj_val* r0=NULL;
+        rj_val* p0 = rj_parse("[\"start\", [\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]]", 55);
+        (void)p0; if (p0) rj_free(p0);
+        /* no scanner injected -> unavailable */
+        const char* pj0 = "[\"start\", [\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]]";
+        p0 = rj_parse(pj0, strlen(pj0)); r0=NULL;
+        int rc0 = rpc_chain_dispatch("scantxoutset", p0, &r0, &e0, &m0);
+        ck("scan start without a scanner -> unavailable", rc0==0 && e0==-1);
+        rj_free(r0); rj_free(p0); }
+      rpc_chain_set_utxoscan(scan_stub_run);
+      { const char* pj1 = "[\"start\", [\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]]";
+        rj_val* p1 = rj_parse(pj1, strlen(pj1)); r = NULL;
+        int rc1 = rpc_chain_dispatch("scantxoutset", p1, &r, &ec, &em);
+        ck("scan start dispatched", rc1==1 && r && r->typ==RJ_OBJ);
+        ck("scan success true", r && rj_obj_get(r,"success") && rj_obj_get(r,"success")->str[0]=='1');
+        ck_str("scan txouts", S(r,"txouts"), "150");
+        ck_str("scan height (from runner)", S(r,"height"), "3");
+        ck_str("scan total_amount", S(r,"total_amount"), "0.00123456");
+        { rj_val* u1 = rj_obj_get(r,"unspents");
+          ck("scan one unspent", u1 && u1->typ==RJ_ARR && u1->nitems==1);
+          rj_val* e1 = (u1 && u1->nitems) ? u1->items[0] : NULL;
+          ck("unspent txid/vout/amount", e1 && S(e1,"txid") && strlen(S(e1,"txid"))==64
+             && S(e1,"vout") && !strcmp(S(e1,"vout"),"7")
+             && S(e1,"amount") && !strcmp(S(e1,"amount"),"0.00123456"));
+          ck("unspent scriptPubKey hex matches the target",
+             e1 && S(e1,"scriptPubKey") && !strcmp(S(e1,"scriptPubKey"),
+             "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac"));
+          ck("unspent desc = addr(...)#checksum (inferred)",
+             e1 && S(e1,"desc") && !strncmp(S(e1,"desc"),"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)#",41));
+          ck("unspent coinbase false + height 2", e1 && rj_obj_get(e1,"coinbase")
+             && rj_obj_get(e1,"coinbase")->str[0]=='0' && S(e1,"height") && !strcmp(S(e1,"height"),"2"));
+          ck("unspent confirmations = scanh - h + 1 = 2",
+             e1 && S(e1,"confirmations") && !strcmp(S(e1,"confirmations"),"2"));
+          ck("unspent blockhash present (64 hex)", e1 && S(e1,"blockhash") && strlen(S(e1,"blockhash"))==64); }
+        rj_free(r); rj_free(p1); }
+      expect_err("scan invalid descriptor -> Core message shape", "scantxoutset",
+                 "[\"start\", [\"notadesc\"]]", -5, "'notadesc' is not a valid descriptor function");
+      rpc_chain_set_utxoscan(0);
     }
 
     /* ---- uptime / stop ---- */
