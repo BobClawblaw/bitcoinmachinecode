@@ -79,7 +79,16 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       counter) but hanging longpoll is not honored; BIP23 proposal mode
       rejected as Invalid mode; tx order is valid but not fee-optimal
       (no package feerate sort).
-- [ ] submitblock, prioritisetransaction
+- [x] prioritisetransaction + getprioritisedtransactions -- parent-local
+      fee-delta map (like Core's: in-memory operator hints, cleared on
+      restart); deltas ACCUMULATE, zero-sum entries erased, tx need not be
+      in the mempool, fees.modified = base + delta in getmempoolentry,
+      companion shows modified_fee (sats) only when in-mempool -- every
+      semantic oracle-verified. Also fixed a latent bug: rpc_node.c never
+      included stdlib.h, so atof/atol/atoll were implicitly declared (int
+      returns) -- estimatesmartfee's conf_target parse worked only by ABI
+      accident.
+- [ ] submitblock (needs the worker's block-accept path; heavy, deferred)
 
 ### T4 — Mempool coherence
 - [x] mp_ext_area/blob/policy-state MAP_SHARED, init-once pre-fork
