@@ -83,7 +83,7 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 ### T8 — PSBT (BIP174)
 - [~] createpsbt (v0, Core-validated) + decodepsbt (byte-identical to Core) DONE.
       This also fixed incident #44: decoderawtransaction was minimal; now routes
-      through rpc_chain's full tx_to_json (Core shape). converttopsbt DONE. Remaining: combinepsbt,
+      through rpc_chain's full tx_to_json (Core shape). converttopsbt + combinepsbt DONE. Remaining:
       finalizepsbt, walletprocesspsbt (wallet), utxoupdatepsbt, joinpsbts.
 
 ### T9 — Indexes
