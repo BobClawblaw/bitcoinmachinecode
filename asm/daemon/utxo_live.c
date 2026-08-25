@@ -78,6 +78,7 @@ typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
                               u64 value, u32 height, u8 is_coinbase,
                               const u8* script, u16 slen);
 extern long undo_replay(long height, undo_replay_cb cb, void* ctx);
+extern long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn);
 
 /* ---- STAGE D / CROSS-TX PARALLEL VERIFY (2026-08-19): per-input script
  * verification + coinbase maturity (daemon/tx_verify.c). Called ONCE per
@@ -888,9 +889,34 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
  * that no longer matches the block's real input count -- which the unapply
  * pre-flight gate below treats as corruption and refuses, turning a
  * survivable crash into a permanently un-disconnectable height. */
+/* Reverse a ghost application of block h (undo_<h>.dat exists but its
+ * checkpoint never landed). Defined below with the STAGE B disconnect
+ * helpers it reuses. 1 rolled back / 0 failed. */
+static int rollback_unapplied_block(const u8* blockbuf, u64 blocklen, long h);
+
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
-    if (g_undo_enabled && height >= 0) undo_discard(height);
+    /* GHOST GUARD (closes the multi-block WAL-vs-checkpoint window, 2026-08-25):
+     * an undo_<h>.dat here can only mean h was applied -- partially or fully --
+     * by a previous process whose checkpoint never landed (a clean apply +
+     * checkpoint keeps its undo file, but catch-up/reorg only ever hand us
+     * h > the checkpointed height, and both the in-process failure rollback
+     * and the disconnect path discard the file when they finish). The old
+     * code blindly undo_discard()ed it "so a fresh apply starts clean" --
+     * destroying the ONE piece of data that could reverse the ghost
+     * application, right before the fresh apply rejected on the ghost's
+     * already-spent inputs. Seen live 2026-08-24 at height 963915: boot
+     * recovery healed applied+1 but the drift was multi-block, and the
+     * DEGRADED retry loop could never recover because this discard had
+     * already destroyed the later ghosts' undo data. Roll the ghost back
+     * instead, then apply fresh; refuse to apply on rollback failure rather
+     * than proceed on inconsistent state. */
+    if (g_undo_enabled && height >= 0) {
+        char upath[64]; struct stat usb;
+        snprintf(upath, sizeof upath, "undo_%ld.dat", height);
+        if (stat(upath, &usb) == 0 && !rollback_unapplied_block(blockbuf, blocklen, height))
+            return 0;
+    }
     return apply_block_inner(blockbuf, blocklen);
 }
 
@@ -1063,6 +1089,39 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
  * failing tx), and deleting a never-created output returns "already
  * absent" (0), not an error -- the same tolerance del_created_on_output
  * already relies on for the real disconnect path. */
+/* rollback_unapplied_block(blockbuf, blocklen, h): reverse a GHOST
+ * application of block h -- one that ran (partially or fully) in a previous
+ * process without its checkpoint landing, leaving undo_<h>.dat behind. The
+ * same restore-then-delete two-step as the disconnect path, with the
+ * torn-tail-tolerant reader (a kill mid-undo-append leaves a torn record
+ * whose delete never ran -- see utxo_live_recover_partial_block's header).
+ * Discards the undo file on success so a fresh apply starts clean.
+ * Returns 1 rolled back / 0 failed (undo file left in place). */
+static int rollback_unapplied_block(const u8* blockbuf, u64 blocklen, long h){
+    long saved_apply = g_apply_height;
+    g_apply_height = h;
+    int saved = g_undo_enabled;
+    g_undo_enabled = 0;
+
+    int fatal = 0, torn = 0;
+    long r = undo_replay_tolerant(h, undo_restore_cb, &fatal, &torn);
+    del_created_ctx_t dc = { 0, 0 };
+    int ok = walk_block_txs(blockbuf, blocklen, &dc, 0, del_created_on_output, &dc.txid, (u64)-1);
+
+    g_undo_enabled = saved;
+    g_apply_height = saved_apply;
+
+    if (r < 0 || fatal || !ok || dc.fatal) {
+        fprintf(stderr, "[utxo_live] ghost-rollback FAILED at height %ld: restore r=%ld fatal=%d walk ok=%d del_fatal=%d -- state may be inconsistent\n",
+                h, r, fatal, ok, dc.fatal);
+        return 0;
+    }
+    undo_discard(h);
+    fprintf(stderr, "[utxo_live] rolled back ghost application of block %ld (%ld prevout(s) restored%s) -- re-applying fresh\n",
+            h, r, torn ? ", torn trailing undo record ignored" : "");
+    return 1;
+}
+
 static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_inclusive){
     long height = g_apply_height;
     int saved = g_undo_enabled;
@@ -1128,44 +1187,45 @@ static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_
  *
  * Same-machine SIGKILL needs no fsync here: write() data that returned is
  * visible to the next process via the page cache. */
-extern long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn);
-
 long utxo_live_recover_partial_block(void* store_buf){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
-    long h = g_applied_height + 1;
-    char upath[64]; snprintf(upath, sizeof upath, "undo_%ld.dat", h);
-    struct stat sb;
-    if (stat(upath, &sb) != 0) return 0;
+
+    /* MULTI-BLOCK (2026-08-25): the drift is one block only when every
+     * checkpoint persisted -- but the persist can fail (disk full, ENOSPC)
+     * and the reorg reconnect's checkpoint failure also used to continue, so
+     * the ghost run can be several blocks deep. Production hit exactly this
+     * at height 963915 on 2026-08-24: boot recovery healed applied+1, then
+     * catch-up rejected the NEXT ghost. Find the whole contiguous ghost run
+     * and roll it back DESCENDING (disconnect is LIFO: a later block's undo
+     * restores prevouts an earlier ghost created; deleting the earlier
+     * ghost's outputs must come after). */
+    long lo = g_applied_height + 1;
+    long hi = lo - 1;
+    for (long h = lo; ; h++){
+        char upath[64]; snprintf(upath, sizeof upath, "undo_%ld.dat", h);
+        struct stat sb;
+        if (stat(upath, &sb) != 0) break;
+        hi = h;
+    }
+    if (hi < lo) return 0;
 
     static u8 blockbuf[8<<20];
-    long len = store_read_at(store_buf, (u64)h, blockbuf, sizeof blockbuf);
-    if (len < 81) {
-        fprintf(stderr, "[utxo_live] RECOVERY: undo_%ld.dat exists (block %ld began applying before the last checkpoint) but block %ld is unreadable (len=%ld) -- cannot roll back, leaving it for retry\n",
-                h, h, h, len);
-        return -1;
+    long rolled = 0;
+    for (long h = hi; h >= lo; h--){
+        long len = store_read_at(store_buf, (u64)h, blockbuf, sizeof blockbuf);
+        if (len < 81) {
+            fprintf(stderr, "[utxo_live] RECOVERY: undo_%ld.dat exists (block %ld began applying before the last checkpoint) but block %ld is unreadable (len=%ld) -- cannot roll back, leaving it for retry\n",
+                    h, h, h, len);
+            return -1;
+        }
+        if (!rollback_unapplied_block(blockbuf, (u64)len, h)) {
+            fprintf(stderr, "[utxo_live] RECOVERY FAILED at height %ld -- state may be inconsistent\n", h);
+            return -1;
+        }
+        rolled++;
     }
-
-    long saved_apply = g_apply_height;
-    g_apply_height = h;
-    int saved = g_undo_enabled;
-    g_undo_enabled = 0;
-
-    int fatal = 0, torn = 0;
-    long r = undo_replay_tolerant(h, undo_restore_cb, &fatal, &torn);
-    del_created_ctx_t dc = { 0, 0 };
-    int ok = walk_block_txs(blockbuf, (u64)len, &dc, 0, del_created_on_output, &dc.txid, (u64)-1);
-
-    g_undo_enabled = saved;
-    g_apply_height = saved_apply;
-
-    if (r < 0 || fatal || !ok || dc.fatal) {
-        fprintf(stderr, "[utxo_live] RECOVERY FAILED at height %ld: restore r=%ld fatal=%d walk ok=%d del_fatal=%d -- state may be inconsistent\n",
-                h, r, fatal, ok, dc.fatal);
-        return -1;
-    }
-    undo_discard(h);
-    fprintf(stderr, "[utxo_live] RECOVERY: rolled back partially-applied block %ld (previous process died after its spends were durable but before its checkpoint): %ld prevout(s) restored%s, created outputs removed; catch-up will re-apply it\n",
-            h, r, torn ? " (torn trailing undo record ignored -- its delete never ran)" : "");
+    fprintf(stderr, "[utxo_live] RECOVERY: rolled back %ld ghost block(s) [%ld..%ld] (previous process died after their spends were durable but before their checkpoints); catch-up will re-apply them\n",
+            rolled, lo, hi);
     return 1;
 }
 
@@ -1486,8 +1546,19 @@ long utxo_live_catchup(void* store_buf){
          * bounded fraction of total replay time in exchange for closing an
          * unbounded-drift crash window. */
         if (!persist_applied_height(g_applied_height)) {
-            fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld after block %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n",
-                    g_applied_height, h);
+            /* STOP, don't continue (2026-08-25). The old comment claimed
+             * continuing was "safe, puts/dels are idempotent" -- false since
+             * Stage D verifies before applying: every un-checkpointed block
+             * applied past this point re-verifies on the next boot against
+             * its own already-durable spends and rejects. The ghost guard in
+             * apply_block_at now heals that, but there is no reason to keep
+             * growing an unbounded ghost run on a disk that cannot persist a
+             * 12-byte checkpoint -- stop at the boundary and let the caller
+             * retry/backoff. Block h itself IS durably applied; worst case on
+             * a dead disk is a one-block ghost the guard rolls back. */
+            fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld after block %ld -- stopping catch-up at this boundary (%ld block(s) applied this call)\n",
+                    g_applied_height, h, applied);
+            break;
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
 
