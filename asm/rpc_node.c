@@ -108,10 +108,10 @@ static int cmd_getpeerinfo(rj_val** res){
               rj_obj_set(o, "services", rj_str(h)); }
             { rj_val* sn = rj_arr(); services_names(p->services, sn); rj_obj_set(o, "servicesnames", sn); }
             rj_obj_set(o, "relaytxes", rj_bool(1));
-            rj_obj_set(o, "lastsend", rj_numf("%d", 0));
-            rj_obj_set(o, "lastrecv", rj_numf("%d", 0));
-            rj_obj_set(o, "bytessent", rj_numf("%d", 0));
-            rj_obj_set(o, "bytesrecv", rj_numf("%d", 0));
+            rj_obj_set(o, "lastsend", rj_numf("%lld", (long long)p->last_send));
+            rj_obj_set(o, "lastrecv", rj_numf("%lld", (long long)p->last_recv));
+            rj_obj_set(o, "bytessent", rj_numf("%lld", (long long)p->bytes_sent));
+            rj_obj_set(o, "bytesrecv", rj_numf("%lld", (long long)p->bytes_recv));
             rj_obj_set(o, "conntime", rj_numf("%lld", (long long)p->conn_time));
             rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
             rj_obj_set(o, "version", rj_numf("%u", p->proto));
