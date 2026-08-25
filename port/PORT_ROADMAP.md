@@ -58,7 +58,19 @@ and runs natively.
           dq->.quad) in .rodata; verified vs Python k*G across 7 seeds, 0 fail.
           R held in memory, only calls point_add_mixed -> no register-clobber
           hazard. (2026-08-25)
-    - [ ] secp256k1_point_ct / point_scalar_mul_glv
+    - [x] secp256k1_scalar.S += sc_inv_var (binary xgcd, variable-time): 20k
+          diff-fuzz vs Python pow(a,-1,n), 0 fail. Fixed u/v==1 check OR-ing the
+          low limb (==1) so cbz never fired -> infinite loop; OR only upper 3.
+    - [x] secp256k1_ecdsa.S (ecdsa_verify + ecdsa_x_eq_mod_n): ~34k-vector
+          diff-fuzz vs an INDEPENDENT pure-Python ECDSA signer+verifier
+          (valid sigs, corrupted z/r/s/Q, out-of-range r/s, r=0/s=0)
+          8 seeds, 0 failures. GLV deferred: u2*Q via the verified
+          point_scalar_mul (== the kill-switch fallback). (2026-08-25)
+    - [ ] secp256k1_point_ct  (constant-time, for signing only -- NOT needed
+          for IBD/verify; skip for now)
+    - [ ] point_scalar_mul_glv / sc_split_lambda  (perf; deferred)
+    - [ ] schnorr_verify + secp256k1_taproot (BIP340/341)  <- NEXT in the core
+          (needs pubkey_parse; used for taproot outputs)
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
