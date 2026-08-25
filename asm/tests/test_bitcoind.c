@@ -18,6 +18,8 @@
 
 extern long node_make_version(unsigned char* out);
 extern int  node_handshake(int fd);
+extern unsigned char g_peer_version_payload[256];
+extern long g_peer_version_len;
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern int  p2p_read(int fd, char cmd_out[12], void* pl, unsigned cap, unsigned* len_out);
@@ -31,6 +33,11 @@ static void fake_peer(int cfd){
     /* read client version */
     if (p2p_read(cfd, cmd, rbuf, sizeof rbuf, &plen) <= 0) return;
     /* send peer version (102B) + verack */
+    /* REALISTIC 102-byte version (UA "/Satoshi:27.1.0/"). The original fake
+     * sent 86 bytes (empty UA) -- short enough to fit under the frame overlap
+     * that broke the capture against every real peer (real versions are
+     * 102-125B and trampled node_handshake's cmd buffer). Real-sized payload
+     * or the test proves nothing. */
     unsigned char v[102];
     unsigned char* p=v;
     p[0]=0x80;p[1]=0x11;p[2]=0x01;p[3]=0x00;                 /* version */
@@ -38,9 +45,9 @@ static void fake_peer(int cfd){
     memset(p+12,0,8);                                         /* ts=0 */
     memset(p+20,0,26); memset(p+46,0,26);                     /* addrs */
     memset(p+72,0,8); v[72]=0x99;                             /* nonce */
-    v[80]=0;                                                  /* empty UA */
-    memset(p+81,0,4+1);                                       /* start_height, relay */
-    p2p_write(cfd, "version", 7, v, 86);
+    v[80]=16; memcpy(v+81, "/Satoshi:27.1.0/", 16);          /* UA */
+    memset(p+97,0,4+1);                                       /* start_height, relay */
+    p2p_write(cfd, "version", 7, v, 102);
     p2p_write(cfd, "verack", 6, "", 0);
     /* read client verack */
     for (int i=0;i<8;i++){
@@ -77,6 +84,16 @@ int main(void){
     cki("connect", fd>=0, 1);
     int r = node_handshake(fd);
     cki("node_handshake ok", r, 1);
+    /* --- the handshake must CAPTURE the peer's version payload (getpeerinfo
+     * and the [dl] outbound log line both parse it) --- */
+    cki("captured peer version len", g_peer_version_len, 102);
+    unsigned pproto=0; memcpy(&pproto, g_peer_version_payload, 4);
+    cki("captured proto", pproto, 0x00011180u);
+    unsigned long long psvc=0; memcpy(&psvc, g_peer_version_payload+4, 8);
+    cki("captured services", (long)psvc, 1);
+    cki("captured nonce byte", g_peer_version_payload[72], 0x99);
+    cki("captured UA len", g_peer_version_payload[80], 16);
+    cki("captured UA bytes", memcmp(g_peer_version_payload+81, "/Satoshi:27.1.0/", 16)==0, 1);
     close(fd); waitpid(pid,0,0); close(ls);
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
