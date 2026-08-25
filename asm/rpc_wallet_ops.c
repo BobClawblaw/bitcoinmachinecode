@@ -593,6 +593,12 @@ static const char* const WOP_METHODS[] = {
     NULL
 };
 
+
+const char* rpc_wops_method_at(int i){
+    int n = 0;
+    while (WOP_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? WOP_METHODS[i] : NULL;
+}
 int rpc_wops_known_method(const char* m){
     for (int i = 0; WOP_METHODS[i]; i++) if (!strcmp(m, WOP_METHODS[i])) return 1;
     return 0;

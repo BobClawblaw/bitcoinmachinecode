@@ -132,6 +132,11 @@ void rpc_node_set_addednodes(const char (*list)[64], int n);
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
 
+/* Enumerate the methods this module serves; NULL past the end. `help`
+ * builds its list from these tables, so it cannot drift from what the
+ * dispatchers actually answer. */
+const char* rpc_node_method_at(int i);
+
 /* Dispatch a live-node method. Returns 1 (result set), 0 (error: ec and em
  * set), or -1 (not ours -- caller keeps looking). */
 int rpc_node_dispatch(const char* method, const rj_val* params,

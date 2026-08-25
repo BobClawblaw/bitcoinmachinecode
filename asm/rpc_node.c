@@ -1171,6 +1171,12 @@ static const char* const NODE_METHODS[] = {
     "setban", "setnetworkactive", "ping",
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
+
+const char* rpc_node_method_at(int i){
+    int n = 0;
+    while (NODE_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? NODE_METHODS[i] : NULL;
+}
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
