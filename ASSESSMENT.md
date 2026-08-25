@@ -68,8 +68,12 @@ From `FEATURE_GAPS.md`, and this list is the reason the headline above says
   descriptor, multi-wallet, or watch-only wallets — still true.
 - **No chain selection** — no testnet, signet, or regtest. Mainnet only.
 - **No `blockfilterindex` (BIP157/158)**, so no light-client service.
-- **No `coinstatsindex`/`gettxoutsetinfo`**, which matters far more than it
-  sounds — see §4.
+- **No `coinstatsindex`/`gettxoutsetinfo`** ~~, which matters far more than
+  it sounds — see §4~~ *(half-retired 2026-08-25: `gettxoutsetinfo` now
+  exists as an RPC and as the standalone tool, and the §4 concern it stood
+  for — proving the set — is settled: MuHash byte-identical to Core at the
+  live tip. The incremental `coinstatsindex` itself remains absent; every
+  measurement is a full O(set) walk.)*
 - **No `txindex`.**
 - **It has never served a peer at tip.** The keep-up serve path was crashing
   on the first block a peer pushed until today (incident #18), which means it
@@ -184,19 +188,27 @@ that had just been rewritten. The reasonable inference is that more remain.
 
 In rough order of how much each would move it:
 
-1. ~~**A UTXO set hash matching Core at a given height.**~~ **Done
-   (2026-08-23), and it matches on the production set at height 792,979.**
-   What remains of this item is fixing the two divergences it found above, and
-   re-running it as the replay advances (each run needs a quiesced datadir, and
-   the tool refuses on a busy one rather than guessing).
+1. ~~**A UTXO set hash matching Core at a given height.**~~ **Fully done
+   (2026-08-25): MuHash byte-identical to Core at height 963,967 — the live
+   tip — with no filters, no overrides, no corrected fields; the two
+   divergences the earlier runs found were rebuilt away.** Nothing remains
+   of this item.
 2. **The differential corpus method applied to every consensus path**, not the
    three or four it has reached. It is the only method that has ever found a
    false accept here.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
-4. **A full replay to tip, clean** — necessary, and demonstrably not
-   sufficient.
-5. **Serving at tip without crashing**, which has never happened.
+4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the
+   full-verification rebuild reached the live tip.** Necessary, and — as
+   this document said — demonstrably not sufficient, which is why item 1
+   mattered more.
+5. ~~**Serving at tip without crashing**, which has never happened.~~
+   **Happening (2026-08-25): the node serves at tip and follows the network,
+   through multiple deliberate restarts and one live incident (#46, a
+   duplicate-append race) in which the daemon did NOT crash — the verify
+   layer refused the bad block and the node kept serving in a bounded
+   degraded loop until the one-block remedy.** The honest residue: hours of
+   at-tip service so far, not months.
 
 ## 6. Summary judgement
 
