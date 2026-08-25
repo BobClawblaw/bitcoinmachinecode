@@ -1617,7 +1617,8 @@ rpc_net.o: rpc_net.c rpc_net.h rpc_json.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_net.c
 rpc_commands.o: rpc_commands.c rpc_commands.h rpc_json.h rpc_node.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_commands.c
-rpc_chain.o: rpc_chain.c rpc_chain.h rpc_json.h rpc_commands.h version_gen.h
+rpc_chain.o: rpc_chain.c rpc_chain.h rpc_json.h rpc_commands.h version_gen.h \
+    rpc_node.h script_flags_consts.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_chain.c
 rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_node.c
