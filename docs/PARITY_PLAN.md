@@ -83,8 +83,11 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 ### T8 — PSBT (BIP174)
 - [~] createpsbt (v0, Core-validated) + decodepsbt (byte-identical to Core) DONE.
       This also fixed incident #44: decoderawtransaction was minimal; now routes
-      through rpc_chain's full tx_to_json (Core shape). converttopsbt + combinepsbt DONE. Remaining:
-      finalizepsbt, walletprocesspsbt (wallet), utxoupdatepsbt, joinpsbts.
+      through rpc_chain's full tx_to_json (Core shape). converttopsbt + combinepsbt + joinpsbts DONE.
+      joinpsbts: Core SHUFFLES inputs/outputs (privacy) so there is no byte-stable target; ours is
+      deterministic (P1-first concat) and verified SEMANTICALLY vs Core (Core's decodepsbt reads our
+      output as v0 / version 2 / locktime 0 with the identical input+output multiset). Remaining:
+      finalizepsbt, walletprocesspsbt (wallet), utxoupdatepsbt (needs UTXO lookup).
 
 ### T9 — Indexes
 - [ ] txindex (global) → getrawtransaction without blockhash; getindexinfo
