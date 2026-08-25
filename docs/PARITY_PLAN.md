@@ -88,7 +88,24 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       included stdlib.h, so atof/atol/atoll were implicitly declared (int
       returns) -- estimatesmartfee's conf_target parse worked only by ABI
       accident.
-- [ ] submitblock (needs the worker's block-accept path; heavy, deferred)
+- [~] submitblock -- plumbing + consensus evaluation LANDED; the connect
+      step is the follow-up. What works now: the RPC transport accepts the
+      ~8MB hex payload (the request buffer was a fixed 256KB stack array
+      that silently truncated -- now heap-grown to 9MB with a linear header
+      scan); a 4MB shared block channel (same seq/ack discipline as
+      sendrawtransaction) carries it to the download worker, which runs
+      daemon/blk_submit.c: duplicate check vs tip, PoW vs the header's own
+      bits (high-hash), cons_verify (bad-txnmrklroot), the BIP141 witness-
+      commitment check (bad-witness-merkle-match -- the stripped-archive
+      lesson), tip-linkage. A consensus-clean, tip-extending block answers
+      "inconclusive" -- BIP22's honest word -- because CONNECTING it needs a
+      UTXO-level dry run of the apply path first: appending an un-dry-run
+      block could wedge catch-up exactly like the witness-stripped archive
+      did. That dry-run + append + apply + relay is the follow-up slice.
+      Tests: the evaluator on the REAL genesis block with targeted
+      corruptions pinning every reason string; the channel handshake
+      against a fake worker; the 600KB transport round-trip on the real
+      server.
 
 ### T4 — Mempool coherence
 - [x] mp_ext_area/blob/policy-state MAP_SHARED, init-once pre-fork

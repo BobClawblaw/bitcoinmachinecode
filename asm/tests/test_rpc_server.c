@@ -295,6 +295,25 @@ int main(void) {
     run_cli(port, "bitcoin", "bitcoin", "listunspent", NULL);
     ck_out("listunspent (no addr index configured, real server)", "[]\n");
 
+    /* ============ 14. large request (2026-08-25 transport fix) ============
+     * The request buffer was a fixed 256KB stack array that silently
+     * truncated bigger bodies -- submitblock's ~8MB hex could never arrive.
+     * A 600KB params payload to an unknown method must now be read IN FULL
+     * and parsed: the -32601 Method-not-found reply proves the body crossed
+     * the old limit intact (a truncated body is a JSON parse error). */
+    { size_t big_n = 600*1024;
+      char* bigp = malloc(big_n + 1);
+      memset(bigp, 'a', big_n); bigp[big_n] = 0;
+      size_t cap = big_n + 4096;
+      char* body = malloc(cap);
+      snprintf(body, cap, "{\"id\":9,\"method\":\"nosuchmethod\",\"params\":[\"%s\"]}", bigp);
+      char* req = malloc(cap + 2048);
+      make_post(req, cap + 2048, port, "bitcoin", "bitcoin", body, NULL);
+      raw_exchange(port, req, strlen(req));
+      ck("600KB request parsed past the old 256KB cap (-32601, not a parse error)",
+         has_substr(raw_out, "Method not found"));
+      free(req); free(body); free(bigp); }
+
     /* ---- teardown ---- */
     kill(srv, SIGTERM);
     waitpid(srv, NULL, 0);

@@ -5,6 +5,8 @@
 #include "../rpc_json.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <pthread.h>
 
 /* Link stub: mpool_policy_add resolves confirmed prevouts through this. Any
  * outpoint not found in the policy's own outreg resolves to a 100000-sat
@@ -19,12 +21,32 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned
     return 1;
 }
 
+static int g_fw_len_ok = -1;   /* fake_worker's view of the staged length */
+static void* fake_worker(void* arg){
+    node_status_t* ns = (node_status_t*)arg;
+    for (int spins=0; spins<400000; spins++){
+        if (ns->blk_submit_seq != ns->blk_submit_ack){
+            g_fw_len_ok = (ns->blk_submit_len == 162);
+            snprintf((char*)ns->blk_submit_reason, sizeof ns->blk_submit_reason, "duplicate");
+            ns->blk_submit_result = 0;
+            __sync_synchronize();
+            ns->blk_submit_ack = ns->blk_submit_seq;
+            return 0;
+        }
+        struct timespec ts={0,1000000}; nanosleep(&ts,0);
+    }
+    return 0;
+}
+
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o,k) : 0; return v ? v->str : 0; }
 
 int main(void){
-    node_status_t st = { .n_out = 8, .n_inbound = 3, .tip_height = 800000, .start_time = 0 };
+    /* static: node_status_t now carries the 4MB submitblock channel buffer,
+     * far too large for the stack. */
+    static node_status_t st;
+    st.n_out = 8; st.n_inbound = 3; st.tip_height = 800000; st.start_time = 0;
     rpc_node_set_status(&st);
     long ec; const char* em; rj_val* r;
 
@@ -463,6 +485,34 @@ int main(void){
 
       /* detach again so the empty-pool checks stay valid for later runs */
       rpc_node_set_mempool(NULL); }
+
+    /* ---- submitblock: decode errors parent-side; the staging handshake
+     * against a fake worker thread that acks with a BIP22 string (the real
+     * worker half -- daemon/blk_submit.c -- has its own test on the actual
+     * genesis block). ---- */
+    { rpc_node_set_status_rw(&st);
+      /* decode errors never reach the channel */
+      const char* j1="[\"abc\"]"; rj_val* p8=rj_parse(j1,strlen(j1)); r=NULL; long eb; const char* mb;
+      int rcb=rpc_node_dispatch("submitblock",p8,&r,&eb,&mb);
+      ck("submitblock odd hex -> -22 Block decode failed", rcb==0 && eb==-22 && mb && !strcmp(mb,"Block decode failed"));
+      rj_free(r); rj_free(p8);
+      { const char* j2="[\"zz\"]"; p8=rj_parse(j2,strlen(j2)); } r=NULL;
+      rcb=rpc_node_dispatch("submitblock",p8,&r,&eb,&mb);
+      ck("submitblock short/bad -> -22", rcb==0 && eb==-22);
+      rj_free(r); rj_free(p8);
+      /* handshake: fake worker acks "duplicate" (fake_worker at file scope) */
+      { pthread_t th; pthread_create(&th, 0, fake_worker, &st);
+        /* 162 zero bytes >= the 81-byte floor */
+        static char big[162*2+16]; memset(big,'0',162*2);
+        char pj3[400]; snprintf(pj3,sizeof pj3,"[\"%.*s\"]",162*2,big);
+        rj_val* pb=rj_parse(pj3,strlen(pj3)); r=NULL;
+        rcb=rpc_node_dispatch("submitblock",pb,&r,&eb,&mb);
+        pthread_join(th,0);
+        ck("fake worker saw staged 162 bytes", g_fw_len_ok==1);
+        ck("submitblock round-trip -> BIP22 string from worker",
+           rcb==1 && r && r->typ==RJ_STR && !strcmp(r->str,"duplicate"));
+        rj_free(r); rj_free(pb); }
+      rpc_node_set_status_rw(NULL); }
 
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);
