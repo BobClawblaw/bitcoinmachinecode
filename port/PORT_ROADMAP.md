@@ -167,3 +167,13 @@ bitcoin_scriptcodec.asm is FULLY ported to port/arm64/bitcoin_scriptcodec.S and 
   stack_push(_copy), stack_dup/erase/insert_index, stack_swap_two, elem_move, get_op,
   vfexec_sp_reset/push/pop/depth/toggle_top/all_true (10 seeds x 500 scripted cases, 0 fail).
 NEXT: bitcoin_interp.asm -- script_eval, the opcode-dispatch VM (the last consensus module).
+
+## bitcoin_interp.S port started (2026-08-25)
+Ported+verified: is_opsuccess (BIP342 OP_SUCCESSx, exhaustive 0..255), is_opsuccess_c,
+interp_memeq. Files/globals created (interp_tmp, bool_buf, interp_err, interp_slice,
+cms_* buffers). REMAINING (the project's last & biggest consensus module):
+script_eval (~2000-line opcode-dispatch VM) + interp_push_num/interp_push_bool +
+interp_swap_recs + checksig/checkmultisig subroutines. These are intertwined with
+script_eval's frame (rbp-relative slots, r13/r14 = stack-top/alt-top), so they are
+being written together; the interp helpers (interp_swap_recs etc.) are internal to
+script_eval's call graph, not standalone.

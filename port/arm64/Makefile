@@ -90,6 +90,8 @@ t_stack: t_stack.c bitcoin_scriptcodec.o
 	$(CC) $(CFLAGS) -o t_stack t_stack.c bitcoin_scriptcodec.o
 fuzz_stack:
 	python3 fuzz_stack.py 1 500
+t_interp: t_interp.c bitcoin_interp.o bitcoin_scriptcodec.o
+	$(CC) $(CFLAGS) -o t_interp t_interp.c bitcoin_interp.o bitcoin_scriptcodec.o
 CKSOBJS=bitcoin_checksig.o bitcoin_sighash.o bitcoin_bip143.o bitcoin_script.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o bitcoin_hash.o sha256.o
 t_checksig: t_checksig.c $(CKSOBJS)
 	$(CC) $(CFLAGS) -o t_checksig t_checksig.c $(CKSOBJS)

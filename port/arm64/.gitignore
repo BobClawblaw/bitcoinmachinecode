@@ -38,3 +38,4 @@ t_bip143
 t_checksig
 t_codec
 t_stack
+t_interp
