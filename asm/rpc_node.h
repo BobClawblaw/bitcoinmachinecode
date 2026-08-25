@@ -118,7 +118,10 @@ void rpc_node_set_addrbook(void* ab, long (*count)(void*),
 /* Hand the RPC layer the operator's addnode= list (node_config's
  * g_cfg.addnode / n_addnode), so getaddednodeinfo reports the real
  * configured nodes and whether each is currently connected. */
-void rpc_node_set_addednodes(const char (*list)[64], int n);   /* copied; NULL detaches */
+/* BORROWED, not copied: the list must outlive the RPC server. The only
+ * caller passes node_config's g_cfg.addnode, a long-lived global. Pass
+ * (NULL, 0) to detach. */
+void rpc_node_set_addednodes(const char (*list)[64], int n);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);

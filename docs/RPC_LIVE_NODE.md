@@ -292,3 +292,74 @@ backed by real wallet state, 6 reproduce Core's exact answer for this node's
 situation, and 30 refuse with the specific missing capability named. The
 methods that would need a wallet rescan and the eight above are the whole of
 what remains, and both are subsystem-sized rather than method-sized.
+
+## Slice 9 — the Blockchain category — (2026-08-25)
+The last 19. Eight are real, eleven refuse.
+
+**`getdeploymentinfo` reports what the node enforces, not what Core says.**
+The buried-deployment heights come from `script_flags_consts.h`, which
+`validation/gen_script_flags.py` now generates alongside the existing `.inc`
+— the same parse of Core's `kernel/chainparams.cpp`, with a self-check that
+refuses to let the two drift. Hand-copying `481824` into `rpc_chain.c` would
+have reintroduced exactly the drift that generator exists to prevent. The
+five heights match the oracle's `getdeploymentinfo` exactly.
+
+**`getchainstates`** always reports exactly one chainstate, which is this
+node's permanent condition — there is no snapshot loader. Core's
+`coins_db_cache_bytes` / `coins_tip_cache_bytes` describe a LevelDB and a
+coin cache this node does not have (its UTXO set is an LSM), so those fields
+are omitted rather than zeroed.
+
+**`getchaintxstats`** reads only the tx-count varint after each 80-byte
+header — ~89 bytes per block, not the blocks. The cumulative `txcount` is
+the same cheap scan over the whole chain, cached against the tip so the
+first call pays once. If any height is unreadable (a pruned or holed
+archive) the field is **omitted rather than reported low**: a short count
+that looks real is worse than an absent one, because the caller cannot tell
+the difference.
+
+**`verifychain`** implements checklevels 0–2 for real: read from disk,
+recompute the header hash and check it against the index, check PoW against
+the header's own bits, recompute the merkle root from the transactions, and
+require undo data to be present. Levels 3 and 4 disconnect and reconnect
+through the UTXO writer, which lives in the forked download worker and is
+not reachable from the RPC thread — so they are **refused, not silently
+downgraded**. `verifychain` returns a bare boolean with no room to say "I did
+less than you asked", so a `true` from a downgraded level 4 would be a plain
+untruth. Core's default is checklevel 3, so a bare `verifychain` gets that
+refusal with the supported range named.
+
+The test exercises this on a fixture whose synthetic headers carry
+`0x1d00ffff` with nonce 0 — no valid proof of work — and asserts level 1
+returns **false**. A level-1 check that passed there would not be checking
+anything.
+
+**`waitforblock` / `waitforblockheight` / `waitfornewblock`** poll the same
+`refresh()` every other method uses. *Documented divergence:* Core treats
+timeout 0 as "wait indefinitely". This node's RPC server accepts and services
+one connection at a time on a single thread (`rpc_server.c`), so an
+indefinite wait would wedge every other RPC for as long as no block arrived.
+The wait is capped at 30 s; on expiry these return the current tip, which is
+exactly what Core returns when its own timeout expires. The result shape is
+identical — only the ceiling differs, and the caller can call again.
+
+**`gettxspendingprevout`** lives in `rpc_node.c` with the pool enumeration,
+though Core files it under Blockchain. An outpoint nothing spends still
+yields an entry with no `spendingtxid`, as Core does — omitting it would
+silently shift the caller's indexes. The whole list is validated before the
+pool is touched, so a bad entry cannot produce a partially-answered array.
+
+**Refused, each naming the specific gap:** `getblockfilter`, `scanblocks`,
+`getdescriptoractivity` (no BIP157/158 filter index — the block and undo data
+needed to build one are both on disk, so this is a missing index, not missing
+information); `dumptxoutset`, `loadtxoutset` (no assumeutxo: no writer for
+Core's snapshot format and no second chainstate to load one into);
+`preciousblock`, `pruneblockchain` (fork choice is owned by the forked
+download worker, with no channel for the parent to steer it);
+`savemempool`, `importmempool` (no `mempool.dat` reader or writer);
+`getmempoolcluster` (the pool tracks the ancestor/descendant graph but not
+Core's cluster structure); `getblockfrompeer` (no parent-to-worker channel
+for a targeted block request).
+
+### Category status
+All 38 of Core's Blockchain methods now dispatch.
