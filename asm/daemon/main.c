@@ -2756,6 +2756,15 @@ static void serve_rpc_read_creds(const char* cfgpath, int* port,
 
 /* Start the embedded RPC server in the serve parent (non-blocking: rpc_server
  * runs its own accept thread). No-op with a log line if creds are absent. */
+/* getblocktemplate per-tx "sigops" (sigop COST units): the legacy count x4
+ * (WITNESS_SCALE_FACTOR). Core additionally counts P2SH-redeem and witness
+ * sigops, which need the prevout scripts -- a UTXO view this path does not
+ * resolve. A LOWER BOUND, documented in PARITY_PLAN; never fabricated. */
+static long gbt_sigops_legacy4(const unsigned char* tx, unsigned long len){
+    extern long tx_legacy_sigops(const unsigned char*, unsigned long);
+    return tx_legacy_sigops(tx, len) * 4;
+}
+
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
@@ -2795,7 +2804,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           /* main.c's existing extern types the length as long; the hooks
            * member says unsigned long -- ABI-identical on x86-64 SysV. */
           .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d };
-      rpc_node_set_mempool(&h); }
+      rpc_node_set_mempool(&h);
+      /* getblocktemplate reads the same pool through rpc_chain */
+      rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){

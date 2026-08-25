@@ -12,7 +12,7 @@
  * (also policy-capped well below 64). */
 #define MPE_MAX_SET 64
 
-typedef struct {
+typedef struct mp_entry_info {
     unsigned long long fee;          /* this tx, sat */
     unsigned long long size;         /* this tx, raw serialized bytes (registry unit) */
     /* DIRECT edges */

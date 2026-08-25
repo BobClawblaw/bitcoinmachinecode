@@ -70,7 +70,7 @@ UTXOLSMOBJS := bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utx
 DAEMONOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
     node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o \
-    bitcoin_serve.o bitcoin_mempool.o bitcoin_cmpct.o bitcoin_idxscan.o \
+    bitcoin_serve.o bitcoin_mempool.o bitcoin_sigops.o bitcoin_cmpct.o bitcoin_idxscan.o \
     bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
