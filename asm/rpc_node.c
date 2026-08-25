@@ -461,6 +461,57 @@ static int cmd_getmempooldescendants(const rj_val* params, rj_val** res, long* e
     return cmd_mpe_relatives(params, res, ec, em, 1);
 }
 
+/* estimatesmartfee conf_target ("estimate_mode") -- Core rpc/fees.cpp shape
+ * and argument validation, over THIS node's estimator. Core's estimator is a
+ * confirmed-block bucket tracker; ours is the tx-accept policy layer's EMA of
+ * accepted feerates (sat/kB, bitcoin_mempool_policy.c) -- an honest,
+ * DIFFERENT estimator, so the NUMBER is ours, only the contract is Core's:
+ *   - conf_target outside [1,1008] -> -8, Core's exact message.
+ *   - estimate_mode other than unset/economical/conservative (any case) ->
+ *     -8, Core's exact message. Both modes return the same EMA (one
+ *     estimator; the economical/conservative split is meaningless for it).
+ *   - no samples yet -> {"errors":["Insufficient data or no feerate found"],
+ *     "blocks":N} exactly like a fresh Core node.
+ *   - otherwise {"feerate": BTC/kvB, "blocks": N}, floored at the min relay
+ *     fee, with N = the target clamped to >= 2 (Core's minimum horizon --
+ *     estimatesmartfee 1 answers with "blocks": 2, verified on the oracle). */
+static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_NUM){
+        *ec = -3; *em = "JSON value of type null is not of expected type number"; return 0; }
+    long target = atol(params->items[0]->str);
+    if (target < 1 || target > 1008){
+        *ec = -8; *em = "Invalid conf_target, must be between 1 and 1008"; return 0; }
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR){
+        const char* m = params->items[1]->str; char lo[16]; size_t i=0;
+        for (; m[i] && i+1<sizeof lo; i++) lo[i] = (char)(m[i]>='A'&&m[i]<='Z' ? m[i]+32 : m[i]);
+        lo[i]=0;
+        if (strcmp(lo,"unset") && strcmp(lo,"economical") && strcmp(lo,"conservative")){
+            *ec = -8; *em = "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"";
+            return 0; }
+    }
+    long blocks = target < 2 ? 2 : target;
+    rj_val* o = rj_obj();
+    unsigned long long satperkb=0, samples=0; int have=0;
+    if (g_mph.polstate && g_mph.estimate){
+        mpl();
+        have = (int)g_mph.estimate(g_mph.polstate, &satperkb, &samples);
+        mpu();
+    }
+    if (!have || samples == 0){
+        rj_val* errs = rj_arr();
+        rj_arr_push(errs, rj_str("Insufficient data or no feerate found"));
+        rj_obj_set(o, "errors", errs);
+    } else {
+        unsigned long long floor_satkvb = 1000;   /* min relay fee, 0.00001 BTC/kvB */
+        if (satperkb < floor_satkvb) satperkb = floor_satkvb;
+        rj_obj_set(o, "feerate", rj_numf("%llu.%08llu", satperkb/100000000ULL, satperkb%100000000ULL));
+    }
+    rj_obj_set(o, "blocks", rj_numf("%ld", blocks));
+    *res = o;
+    return 1;
+}
+
 /* sendrawtransaction: parse the raw-tx hex, stage it into the shared
  * submission channel, and block on the download worker's verdict (mempool
  * accept + relay to peers). Core rpc/rawtransaction.cpp: returns the txid on
@@ -533,7 +584,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -549,6 +600,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
     if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
     if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);
+    if (!strcmp(m, "estimatesmartfee"))   return cmd_estimatesmartfee(params, res, ec, em);
     if (!strcmp(m, "sendrawtransaction")) return cmd_sendrawtransaction(params, res, ec, em);
     return -1;
 }

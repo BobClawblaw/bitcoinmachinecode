@@ -96,7 +96,16 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       objects; -8/-5 error parity shared with getmempoolentry.
 
 ### T5 — Fee estimation
-- [ ] estimatesmartfee / estimaterawfee from mempool feerate buckets + recent blocks
+- [x] estimatesmartfee -- Core's CONTRACT (arg validation with Core-exact -8
+      messages incl the conf_target [1,1008] range and estimate_mode list;
+      blocks clamps to >= 2, oracle-verified; fresh node returns
+      {"errors":["Insufficient data or no feerate found"],"blocks":N}) over
+      OUR estimator: the tx-accept policy layer's EMA of accepted feerates
+      (shared state, read under mp_lock), floored at min relay fee. The
+      NUMBER is honestly ours -- Core's bucket tracker needs confirmed-block
+      history we don't keep. economical/conservative accepted (case-insens.)
+      but return the same EMA (one estimator). Deploy batched (build-side).
+- [ ] estimaterawfee (hidden/debug RPC -- low value, deferred)
 
 ### T6 — Wallet-state RPCs on the RPC surface
 - [ ] sendtoaddress, sendmany, listtransactions, gettransaction,

@@ -128,6 +128,16 @@ uint64_t mpool_policy_estimate_feerate(void* st){
     return *(uint64_t*)((char*)st + 24);   /* EMA, sat/kB */
 }
 
+/* estimatesmartfee support: the EMA plus its sample count, so the RPC can
+ * distinguish "no data yet" (Core's errors path) from a real estimate. */
+long mpool_policy_estimate(void* st, unsigned long long* satperkb,
+                           unsigned long long* samples){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
+    if (satperkb) *satperkb = *(uint64_t*)((char*)st + 24);
+    if (samples)  *samples  = *(uint64_t*)((char*)st + 32);
+    return 1;
+}
+
 const char* mpool_policy_reason(void* pol){ (void)pol; return _mpol_last_reason; }
 
 /* ========================================================================== */
