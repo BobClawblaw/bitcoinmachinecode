@@ -49,6 +49,9 @@
  */
 #include "rpc_chain.h"
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
+#include "script_flags_consts.h"  /* buried-deployment heights, generated from
+                                   * Core's chainparams -- the SAME parse the
+                                   * script-flag path assembles against */
 #include "mempool_entry.h"
 #include "rpc_commands.h"
 #include "version_gen.h"
@@ -2198,11 +2201,418 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     return 1;
 }
 
+/* ==== the remaining Blockchain category (2026-08-25) =====================
+ * Same rule as the network and wallet slices: real state, or Core's exact
+ * answer for this node's situation, or an explicit refusal naming the gap.
+ * Shapes taken off the running oracle, not from memory. */
+
+/* ---- getchainstates -----------------------------------------------------
+ * Core reports one entry per chainstate; a node with no assumeutxo snapshot
+ * loaded has exactly one, which is this node's permanent condition (there is
+ * no snapshot loader -- see loadtxoutset below). So the single-element array
+ * is the complete answer, not a first element. */
+static int cmd_getchainstates(rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
+    u8 rec[48]; read_idx_rec(tip, rec);
+    char hx[65];
+    long hh = headers_height(tip);
+    rj_val* cs = rj_obj();
+    rj_obj_set(cs, "blocks", rj_numf("%ld", tip));
+    hex_rev(hx, rec, 32); rj_obj_set(cs, "bestblockhash", rj_str(hx));
+    u32 bits = rd32(hdr + 72);
+    rj_obj_set(cs, "bits", rj_strf("%08x", bits));
+    target_hex(bits, hx); rj_obj_set(cs, "target", rj_str(hx));
+    rj_obj_set(cs, "difficulty", rj_double(difficulty_of(bits)));
+    double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
+    if (prog > 1.0) prog = 1.0;
+    rj_obj_set(cs, "verificationprogress", rj_double(prog));
+    /* coins_db_cache_bytes / coins_tip_cache_bytes are Core's LevelDB and
+     * in-memory coin cache sizes. This node has neither -- its UTXO set is
+     * an LSM with its own sizing -- so the fields are OMITTED rather than
+     * filled with a number that would describe a cache that does not exist. */
+    rj_obj_set(cs, "validated", rj_bool(1));
+    rj_val* arr = rj_arr(); rj_arr_push(arr, cs);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "headers", rj_numf("%ld", hh));
+    rj_obj_set(o, "chainstates", arr);
+    *res = o;
+    return 1;
+}
+
+/* ---- getdeploymentinfo --------------------------------------------------
+ * The heights come from script_flags_consts.h, which validation/
+ * gen_script_flags.py generates from Core's own kernel/chainparams.cpp --
+ * the SAME parse that produces the .inc the script-flag path assembles
+ * against. So this reports what the node actually ENFORCES; it cannot drift
+ * from consensus behaviour by being edited on its own, and a Core upgrade
+ * that moved a height would move both together.
+ *
+ * P2SH, WITNESS and TAPROOT are not listed: Core buries them at height 0
+ * unconditionally (with two by-hash exceptions), and this Core reports
+ * exactly the five below. */
+static void gdi_dep(rj_val* o, const char* name, long h, long tip){
+    rj_val* d = rj_obj();
+    rj_obj_set(d, "type", rj_str("buried"));
+    rj_obj_set(d, "active", rj_bool(tip + 1 >= h));   /* active AT the next block */
+    rj_obj_set(d, "height", rj_numf("%ld", h));
+    rj_obj_set(o, name, d);
+}
+
+static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    /* Core takes an optional blockhash; default is the tip. */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR){
+        long h;
+        if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+        tip = h;
+    }
+    u8 rec[48]; if (!read_idx_rec(tip, rec)){ *ec = -1; *em = "Block not available"; return 0; }
+    char hx[65]; hex_rev(hx, rec, 32);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "hash", rj_str(hx));
+    rj_obj_set(o, "height", rj_numf("%ld", tip));
+    /* script_flags: the flags this node applies to the NEXT block, in Core's
+     * sorted order. P2SH/WITNESS/TAPROOT are unconditional here. */
+    rj_val* sf = rj_arr();
+    long next = tip + 1;
+    if (next >= SFC_HEIGHT_CLTV)   rj_arr_push(sf, rj_str("CHECKLOCKTIMEVERIFY"));
+    if (next >= SFC_HEIGHT_CSV)    rj_arr_push(sf, rj_str("CHECKSEQUENCEVERIFY"));
+    if (next >= SFC_HEIGHT_DERSIG) rj_arr_push(sf, rj_str("DERSIG"));
+    if (next >= SFC_HEIGHT_SEGWIT) rj_arr_push(sf, rj_str("NULLDUMMY"));
+    rj_arr_push(sf, rj_str("P2SH"));
+    rj_arr_push(sf, rj_str("TAPROOT"));
+    if (next >= SFC_HEIGHT_SEGWIT) rj_arr_push(sf, rj_str("WITNESS"));
+    rj_obj_set(o, "script_flags", sf);
+    rj_val* dep = rj_obj();
+    gdi_dep(dep, "bip34",  SFC_HEIGHT_BIP34,  tip);
+    gdi_dep(dep, "bip66",  SFC_HEIGHT_DERSIG, tip);
+    gdi_dep(dep, "bip65",  SFC_HEIGHT_CLTV,   tip);
+    gdi_dep(dep, "csv",    SFC_HEIGHT_CSV,    tip);
+    gdi_dep(dep, "segwit", SFC_HEIGHT_SEGWIT, tip);
+    rj_obj_set(o, "deployments", dep);
+    *res = o;
+    return 1;
+}
+
+/* ---- getchaintxstats ----------------------------------------------------
+ * The window figures are a cheap scan: only the tx-count varint that follows
+ * each 80-byte header is needed, so this reads ~89 bytes per block, not the
+ * blocks themselves.
+ *
+ * `txcount` is the CUMULATIVE count to the tip, which Core keeps in its
+ * block index (nChainTx) and this node does not store anywhere. It is
+ * computed here by the same cheap prefix scan over the whole chain and
+ * cached against the tip, so the first call pays for it once. If ANY height
+ * is unreadable -- a pruned or holed archive -- the field is omitted rather
+ * than reported low: a short count that looks like a real one is worse than
+ * an absent one, because the caller cannot tell the difference. */
+static long gcts_txn_at(long h){
+    u8 pre[89];
+    if (read_block_prefix(h, pre, sizeof pre) != 1) return -1;
+    u64 c; u64 n = read_varint(pre + 80, pre + sizeof pre, &c);
+    if (c == 0) return -1;
+    return (long)n;
+}
+
+static int cmd_getchaintxstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long final_h = tip;
+    if (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+        params->items[1]->typ == RJ_STR){
+        if (!lookup_block_param(params, 1, 2, &final_h, ec, em)) return 0;
+    }
+    /* Core's default window is one month of blocks, clamped to the chain. */
+    long window = 30L * 24 * 60 * 60 / 600;          /* 4320 */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_NUM){
+        window = atol(params->items[0]->str);
+        if (window < 0 || window > final_h){
+            *ec = -8; *em = "Invalid block count: should be between 0 and the block's height - 1";
+            return 0; }
+    }
+    if (window > final_h) window = final_h;
+
+    u8 hdr[80];
+    if (read_block_prefix(final_h, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
+    u32 final_time = rd32(hdr + 68);
+    u8 rec[48]; read_idx_rec(final_h, rec);
+    char hx[65]; hex_rev(hx, rec, 32);
+
+    long long win_tx = 0; int win_ok = 1;
+    for (long h = final_h - window + 1; h <= final_h && window > 0; h++){
+        long n = gcts_txn_at(h);
+        if (n < 0){ win_ok = 0; break; }
+        win_tx += n;
+    }
+    long win_interval = 0;
+    if (window > 0){
+        u8 h0[80];
+        if (read_block_prefix(final_h - window, h0, 80) == 1)
+            win_interval = (long)final_time - (long)rd32(h0 + 68);
+    }
+
+    /* cumulative count, cached per tip */
+    static long  gcts_cached_h = -1;
+    static long long gcts_cached_n = -1;
+    long long total = -1;
+    if (gcts_cached_h == final_h) total = gcts_cached_n;
+    else {
+        long long acc = 0; int ok = 1;
+        for (long h = 0; h <= final_h; h++){
+            long n = gcts_txn_at(h);
+            if (n < 0){ ok = 0; break; }
+            acc += n;
+        }
+        if (ok){ total = acc; gcts_cached_h = final_h; gcts_cached_n = acc; }
+    }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "time", rj_numf("%u", final_time));
+    /* omitted when the archive could not be walked end to end -- see above */
+    if (total >= 0) rj_obj_set(o, "txcount", rj_numf("%lld", total));
+    rj_obj_set(o, "window_final_block_hash", rj_str(hx));
+    rj_obj_set(o, "window_final_block_height", rj_numf("%ld", final_h));
+    rj_obj_set(o, "window_block_count", rj_numf("%ld", window));
+    if (window > 0){
+        rj_obj_set(o, "window_interval", rj_numf("%ld", win_interval));
+        if (win_ok){
+            rj_obj_set(o, "window_tx_count", rj_numf("%lld", win_tx));
+            if (win_interval > 0)
+                rj_obj_set(o, "txrate", rj_double((double)win_tx / (double)win_interval));
+        }
+    }
+    *res = o;
+    return 1;
+}
+
+/* ---- verifychain --------------------------------------------------------
+ * Core's checklevels are cumulative: 0 read from disk, 1 verify block
+ * validity, 2 verify undo data, 3 disconnect, 4 reconnect. This node
+ * implements 0-2 for real -- it reads each block, recomputes its header
+ * hash and checks it against the index, checks the PoW against the header's
+ * own bits, recomputes the merkle root from the transactions, and (level 2)
+ * requires the undo file to be present and non-empty.
+ *
+ * Levels 3 and 4 need a full disconnect/reconnect through the UTXO writer,
+ * which lives in the forked download worker and is not reachable from the
+ * RPC thread. They are REFUSED rather than silently downgraded: verifychain
+ * returns a bare boolean with no room to say "I did less than you asked",
+ * so a `true` from a downgraded level 4 would be a straight untruth. Core's
+ * default checklevel is 3, so a bare `verifychain` gets that refusal, with
+ * the supported range named. */
+static int vc_merkle_ok(const u8* blk, long blen, const u8 want_root[32]){
+    const u8* p = blk + 80; const u8* end = blk + blen;
+    u64 c; u64 ntx = read_varint(p, end, &c);
+    if (c == 0 || ntx == 0 || ntx > 100000) return 0;
+    p += c;
+    u8 (*leaves)[32] = malloc((size_t)ntx * 32);
+    if (!leaves) return 0;
+    u8* scratch = NULL; size_t scap = 0;
+    int ok = 1;
+    for (u64 i = 0; i < ntx; i++){
+        txw_t w;
+        if (!tx_walk(p, end, &w)){ ok = 0; break; }
+        if (w.len > scap){ u8* g = realloc(scratch, w.len); if (!g){ ok = 0; break; } scratch = g; scap = w.len; }
+        if (tx_txid(leaves[i], p, w.len, scratch, w.len) != 1){ ok = 0; break; }
+        p += w.len;
+    }
+    free(scratch);
+    if (ok){
+        u64 n = ntx;
+        while (n > 1){
+            u64 w2 = 0;
+            for (u64 i = 0; i < n; i += 2){
+                u8 pair[64];
+                memcpy(pair, leaves[i], 32);
+                memcpy(pair + 32, leaves[(i + 1 < n) ? i + 1 : i], 32);
+                sha256d(leaves[w2++], pair, 64);
+            }
+            n = w2;
+        }
+        ok = memcmp(leaves[0], want_root, 32) == 0;
+    }
+    free(leaves);
+    return ok;
+}
+
+/* PoW: sha256d(header) <= target(bits), both compared big-endian-wise over
+ * the display order of the hash. */
+static int vc_pow_ok(const u8 hash_wire[32], u32 bits){
+    u8 tgt[32]; target_bytes(bits, tgt);          /* big-endian target */
+    for (int i = 0; i < 32; i++){
+        u8 hb = hash_wire[31 - i];                /* -> big-endian */
+        if (hb < tgt[i]) return 1;
+        if (hb > tgt[i]) return 0;
+    }
+    return 1;                                     /* exactly equal is valid */
+}
+
+static int cmd_verifychain(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long level = 3, nblocks = 6;                  /* Core's defaults */
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM) level = atol(params->items[0]->str);
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_NUM) nblocks = atol(params->items[1]->str);
+    }
+    if (level < 0 || level > 4){ *ec = -8; *em = "Invalid checklevel: must be 0-4"; return 0; }
+    if (level > 2){
+        *ec = -1;
+        *em = "this node implements verifychain checklevel 0-2 (read, "
+              "header/PoW/merkle, undo data present). Levels 3 and 4 disconnect "
+              "and reconnect blocks through the UTXO writer, which lives in the "
+              "forked download worker and is not reachable from the RPC thread. "
+              "verifychain answers with a bare boolean, so returning true for a "
+              "level it did not perform would be a plain untruth -- pass "
+              "checklevel 2 or lower";
+        return 0;
+    }
+    if (nblocks <= 0 || nblocks > tip + 1) nblocks = tip + 1;
+
+    int ok = 1;
+    for (long h = tip; h > tip - nblocks && h >= 0 && ok; h--){
+        long blen = read_block(h);
+        if (blen < 81){ ok = 0; break; }          /* level 0: readable */
+        if (level >= 1){
+            u8 hash[32]; sha256d(hash, g_blockbuf, 80);
+            u8 rec[48];
+            if (!read_idx_rec(h, rec) || memcmp(hash, rec, 32) != 0){ ok = 0; break; }
+            u32 bits = rd32(g_blockbuf + 72);
+            if (!vc_pow_ok(hash, bits)){ ok = 0; break; }
+            if (!vc_merkle_ok(g_blockbuf, blen, g_blockbuf + 36)){ ok = 0; break; }
+        }
+        if (level >= 2){
+            char up[64]; struct stat ub;
+            snprintf(up, sizeof up, "undo_%ld.dat", h);
+            if (stat(up, &ub) != 0 || ub.st_size <= 0){ ok = 0; break; }
+        }
+    }
+    *res = rj_bool(ok);
+    return 1;
+}
+
+/* ---- waitforblock / waitforblockheight / waitfornewblock ----------------
+ * Real: the tip is polled through the same refresh() every other method
+ * uses, so these see a new block as soon as the index does.
+ *
+ * DOCUMENTED DIVERGENCE: Core treats timeout 0 as "wait indefinitely". This
+ * node's RPC server accepts and services ONE connection at a time on a
+ * single thread (rpc_server.c's server_thread), so an indefinite wait would
+ * wedge every other RPC for as long as no block arrived. The wait is
+ * therefore capped at WFB_CAP_MS. On expiry these return the CURRENT tip,
+ * which is exactly what Core returns when its own timeout expires -- the
+ * result shape is identical; only the ceiling on how long it will wait
+ * differs, and the caller can simply call again. */
+#define WFB_CAP_MS 30000
+
+static void wfb_result(long h, rj_val** res){
+    u8 rec[48]; char hx[65];
+    rj_val* o = rj_obj();
+    if (read_idx_rec(h, rec)){ hex_rev(hx, rec, 32); rj_obj_set(o, "hash", rj_str(hx)); }
+    rj_obj_set(o, "height", rj_numf("%ld", h));
+    *res = o;
+}
+
+/* Poll until `done(tip)`, or the deadline. Returns the tip it stopped at. */
+static long wfb_poll(long timeout_ms, int (*done)(long, const void*), const void* ctx){
+    if (timeout_ms <= 0 || timeout_ms > WFB_CAP_MS) timeout_ms = WFB_CAP_MS;
+    long waited = 0;
+    for (;;){
+        long tip = refresh();
+        if (tip >= 0 && done(tip, ctx)) return tip;
+        if (waited >= timeout_ms) return tip;
+        struct timespec ts = {0, 100L * 1000 * 1000};   /* 100 ms */
+        nanosleep(&ts, NULL);
+        waited += 100;
+    }
+}
+static int wfb_changed(long tip, const void* ctx){ return tip != *(const long*)ctx; }
+static int wfb_atleast(long tip, const void* ctx){ return tip >= *(const long*)ctx; }
+/* ctx is the caller's hash in WIRE order (already reversed from the display
+ * string), matching how index.dat stores it -- comparing a display-order
+ * buffer here would simply never match and the call would always time out. */
+static int wfb_hash_is(long tip, const void* ctx){
+    u8 rec[48];
+    return read_idx_rec(tip, rec) && memcmp(rec, ctx, 32) == 0;
+}
+
+static long wfb_timeout_arg(const rj_val* params, size_t i){
+    if (params && params->typ == RJ_ARR && params->nitems > i &&
+        params->items[i]->typ == RJ_NUM) return atol(params->items[i]->str);
+    return 0;
+}
+
+static int cmd_waitfornewblock(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long start = refresh();
+    if (start < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long tip = wfb_poll(wfb_timeout_arg(params, 0), wfb_changed, &start);
+    wfb_result(tip < 0 ? start : tip, res);
+    return 1;
+}
+
+static int cmd_waitforblockheight(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (refresh() < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_NUM){
+        *ec = -8; *em = "waitforblockheight requires a height"; return 0; }
+    long want = atol(params->items[0]->str);
+    long tip = wfb_poll(wfb_timeout_arg(params, 1), wfb_atleast, &want);
+    wfb_result(tip, res);
+    return 1;
+}
+
+static int cmd_waitforblock(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (refresh() < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    const char* hs = rpc_param_str(params, 0, ec, em); if (!hs) return 0;
+    u8 disp[32], wire[32];
+    if (!parse_hash_param(hs, 1, disp, ec, em)) return 0;
+    for (int i = 0; i < 32; i++) wire[i] = disp[31-i];
+    long tip = wfb_poll(wfb_timeout_arg(params, 1), wfb_hash_is, wire);
+    wfb_result(tip, res);
+    return 1;
+}
+
+/* ---- refusals -----------------------------------------------------------
+ * Each names the specific thing that is missing, not "unimplemented". */
+#define CH_NO_FILTERS \
+    "this node builds no BIP157/158 compact block filter index, so there is " \
+    "nothing to serve or scan. The block data and the undo data needed to " \
+    "build one are both on disk, so this is a missing index rather than " \
+    "missing information -- but it is an index, not a formatter"
+#define CH_NO_SNAPSHOT \
+    "this node has no assumeutxo snapshot support: no writer for Core's " \
+    "UTXO snapshot format and no second chainstate to load one into " \
+    "(getchainstates always reports exactly one). Its UTXO set is an LSM " \
+    "with its own on-disk format, which is not Core's and is not interchangeable"
+#define CH_NO_FORKCHOICE_RPC \
+    "fork choice is owned by the forked download worker (daemon/reorg.c), " \
+    "which is not reachable from the RPC thread; there is no channel for the " \
+    "parent to steer it, so this call would change nothing"
+#define CH_NO_MEMPOOL_FILE \
+    "this node does not persist its mempool: there is no mempool.dat writer " \
+    "or reader, and Core's serialization is not implemented. The pool is " \
+    "rebuilt from the network on restart"
+
+static int ch_unsupported(const char* msg, long* ec, const char** em){
+    *ec = -1; *em = msg; return 0;
+}
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","scantxoutset","getchaintips","getindexinfo","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","scantxoutset","getchaintips","getindexinfo","uptime","stop",
+    /* the rest of Core's Blockchain category (2026-08-25) */
+    "getchainstates","getdeploymentinfo","getchaintxstats","verifychain",
+    "waitforblock","waitforblockheight","waitfornewblock",
+    "getblockfilter","scanblocks","getdescriptoractivity",
+    "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
+    "savemempool","importmempool", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -2490,6 +2900,22 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "scantxoutset")) return cmd_scantxoutset(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
+    if (!strcmp(m, "getchainstates")) return cmd_getchainstates(res, ec, em);
+    if (!strcmp(m, "getdeploymentinfo")) return cmd_getdeploymentinfo(params, res, ec, em);
+    if (!strcmp(m, "getchaintxstats")) return cmd_getchaintxstats(params, res, ec, em);
+    if (!strcmp(m, "verifychain")) return cmd_verifychain(params, res, ec, em);
+    if (!strcmp(m, "waitfornewblock")) return cmd_waitfornewblock(params, res, ec, em);
+    if (!strcmp(m, "waitforblockheight")) return cmd_waitforblockheight(params, res, ec, em);
+    if (!strcmp(m, "waitforblock")) return cmd_waitforblock(params, res, ec, em);
+    if (!strcmp(m, "getblockfilter") || !strcmp(m, "scanblocks") ||
+        !strcmp(m, "getdescriptoractivity"))
+        return ch_unsupported(CH_NO_FILTERS, ec, em);
+    if (!strcmp(m, "dumptxoutset") || !strcmp(m, "loadtxoutset"))
+        return ch_unsupported(CH_NO_SNAPSHOT, ec, em);
+    if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
+        return ch_unsupported(CH_NO_FORKCHOICE_RPC, ec, em);
+    if (!strcmp(m, "savemempool") || !strcmp(m, "importmempool"))
+        return ch_unsupported(CH_NO_MEMPOOL_FILE, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
