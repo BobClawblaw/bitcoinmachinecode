@@ -1928,7 +1928,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getchaintips","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getchaintips","getindexinfo","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1958,6 +1958,22 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
     return 1;
 }
 
+/* getindexinfo (Core rpc/blockchain.cpp): status of every optional index the
+ * node runs (txindex, coinstatsindex, blockfilterindex). This node runs NONE
+ * of them -- getrawtransaction requires a blockhash (no txindex), there is no
+ * coinstatsindex or blockfilterindex -- so, exactly as Core does when no such
+ * index is enabled, the result is an empty object (an optional index_name
+ * filter cannot match anything either). The block/UTXO index that IS present
+ * is core chainstate, not one of getindexinfo's optional indexes. */
+static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    (void)params; (void)ec; (void)em;
+    /* Any index_name filter can only fail to match (we have no indexes), and
+     * Core does not type-check the arg -- it simply returns {} regardless
+     * (verified live: `getindexinfo 123` and `getindexinfo {..}` both give {}). */
+    *res = rj_obj();   /* {} -- no optional indexes enabled */
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
@@ -1967,6 +1983,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "deriveaddresses")) return cmd_deriveaddresses(params, res, ec, em);
     if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
     if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
+    if (!strcmp(m, "getindexinfo")) return cmd_getindexinfo(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
