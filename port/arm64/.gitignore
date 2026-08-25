@@ -42,3 +42,7 @@ t_interp
 t_eval
 t_utxo
 fuzz_utxo
+t_utxo
+t_ustore
+fuzz_utxo
+fuzz_ustore

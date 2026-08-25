@@ -234,3 +234,26 @@ concurrent session); bitcoin_sigops DONE (2026-08-25 this session):
       accurate; segwit marker+flag skip): 47k script (acc+inacc) + 23.5k tx + 1.2k
       large-script (0xfd/0xfe/0xff slen) + 32 big-count (n_in/n_out up to 300k) cases,
       0 fail across 6 seeds. (port/arm64/bitcoin_sigops.S, fuzz_sigops.py, fz_sigops.c)
+
+## 2026-08-25 — bitcoin_utxo_store.S ported + verified (persistent UTXO store, s6 core #2)
+AArch64 port of the WAL+checkpoint persistent UTXO store (utxo.dat append log,
+utxo.idx snapshot, crash-safe reload = checkpoint + WAL-tail replay; same on-disk
+framing as x86). Exports: init, init_ro, put, del, count, get, clear, sync, reload,
+close over raw syscalls (openat/read/write/lseek/fsync/close; arm64 fsync=82).
+Differential-fuzzed vs a Python dict oracle over a C driver t_ustore that does
+random put/del/get + periodic sync/reload in a scratch dir; the oracle REQUIRES
+reload to reproduce the exact live set (keys/36B, value, height/is_coinbase code,
+slen, script). 10 seeds x 600 ops = 6,000 ops + 60+ reload reconstructions: 0 fail,
+exact asm==exp line-for-line (restart-resume validated both via checkpoint and,
+when the checkpoint is removed, pure WAL replay).
+PITFALL defeated: the root cause of hours of 'reload returns empty set' was
+AArch64 `svc` NOT setting NZCV, so `bl/ge/lt` right after a syscall branches on
+STALE flags from before the call -- a successful positive read() x0>0 could still
+take `b.lt .rbad` and report failure. Fix: `tbnz x0,#63,.rbad` (tests the sign
+bit, no flags). Also honored: mac_read_exact must NOT use callee-saved x21 as its
+internal counter (reload holds its idx fd in x21 across calls) -- used x9 instead;
+and the reload idr-header check disconfirmed-sized fields need 8-multiple ldr
+immediates, so unaligned packed fields are read via register-offset (add xN,base,#off;
+ldr xD,[xN]).
+s6/UTXO core: bitcoin_utxo (in-memory) + bitcoin_utxo_store (persistent) both done.
+Next: bitcoin_sigops, bitcoin_undo, then the IBD driver for full download->verify->UTXO.

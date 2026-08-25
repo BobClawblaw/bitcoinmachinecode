@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_sigops
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_sigops
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -95,6 +95,8 @@ t_interp: t_interp.c bitcoin_interp.o bitcoin_scriptcodec.o
 t_eval: t_eval.c bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_sighash.o bitcoin_hash.o sha256.o sha1.o ripemd160.o
 	@$(CC) $(CFLAGS) -o $@ $+
 t_utxo: t_utxo.c bitcoin_utxo.o
+	@$(CC) $(CFLAGS) -o $@ $+
+t_ustore: t_ustore.c bitcoin_utxo_store.o bitcoin_utxo.o
 	@$(CC) $(CFLAGS) -o $@ $+
 fuzz_eval:
 	python3 eval_oracle.py 1 400
