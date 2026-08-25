@@ -172,6 +172,67 @@ int main(void){
         h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
         rpc_node_set_mempool(&h); }
 
+      /* ---- gettxspendingprevout (Core lists it under Blockchain; the pool
+       * enumeration lives here). LHEX spends outpoint (wire txid
+       * 67452301..b1a3, vout 0), so its DISPLAY txid is that reversed. ---- */
+      { const char* SPENT_DISP =
+            "a3b1c2d4e5f6079889abcdef0123456789abcdef0123456789abcdef01234567";
+        char pj[400];
+        snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", SPENT_DISP);
+        rj_val* p = rj_parse(pj, strlen(pj));
+        r = NULL; int rcs = rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("gettxspendingprevout -> array", rcs == 1 && r && r->typ == RJ_ARR && r->nitems == 1);
+        { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+          ck("the outpoint is echoed back", e0 && S(e0,"txid") &&
+             !strcmp(S(e0,"txid"), SPENT_DISP) && !strcmp(S(e0,"vout"), "0"));
+          /* both pool entries spend it (the segwit tx is the same body), so
+             any one of the two txids is a correct answer */
+          ck("spendingtxid names a mempool tx that really spends it",
+             e0 && S(e0,"spendingtxid") &&
+             (!strcmp(S(e0,"spendingtxid"),
+                      "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a") ||
+              !strcmp(S(e0,"spendingtxid"),
+                      "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"))); }
+        rj_free(r); rj_free(p);
+
+        /* an unspent outpoint: the ENTRY still appears, with no spendingtxid.
+         * Omitting the entry would silently shift the caller's indexes. */
+        snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":7}]]", SPENT_DISP);
+        p = rj_parse(pj, strlen(pj));
+        r = NULL; rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("an unspent outpoint still yields an entry", r && r->nitems == 1);
+        ck("...with no spendingtxid",
+           r && r->nitems && rj_obj_get(r->items[0], "spendingtxid") == NULL);
+        rj_free(r); rj_free(p);
+
+        /* a malformed second entry rejects the WHOLE call, so the caller
+         * never gets a partially-answered array it might index by position */
+        snprintf(pj, sizeof pj,
+                 "[[{\"txid\":\"%s\",\"vout\":0},{\"txid\":\"zz\",\"vout\":0}]]", SPENT_DISP);
+        p = rj_parse(pj, strlen(pj));
+        r = NULL; ec = 0;
+        int rcb = rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("a malformed entry rejects the whole list -> -8", rcb == 0 && ec == -8);
+        rj_free(r); rj_free(p);
+
+        p = rj_parse("[[]]", 4);
+        r = NULL; ec = 0;
+        rcb = rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("an empty outputs array -> -8 (Core rejects it too)", rcb == 0 && ec == -8);
+        rj_free(r); rj_free(p); }
+
+      /* the two node-side Blockchain refusals name what is missing */
+      { r = NULL; ec = 0; em = NULL;
+        int rcb = rpc_node_dispatch("getmempoolcluster", NULL, &r, &ec, &em);
+        ck("getmempoolcluster -> -1 naming the missing cluster structure",
+           rcb == 0 && ec == -1 && em && strstr(em, "cluster"));
+        rj_free(r);
+        r = NULL; ec = 0; em = NULL;
+        rcb = rpc_node_dispatch("getblockfrompeer", NULL, &r, &ec, &em);
+        ck("getblockfrompeer -> -1 naming the missing worker channel",
+           rcb == 0 && ec == -1 && em && strstr(em, "download worker"));
+        rj_free(r); }
+
       r = NULL; rpc_node_dispatch("getrawmempool", NULL, &r, &ec, &em);
       ck("shared pool: getrawmempool has 2 txids", r && r->typ == RJ_ARR && r->nitems == 2);
       int saw_l=0, saw_w=0;
