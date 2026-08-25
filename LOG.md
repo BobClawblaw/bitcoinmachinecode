@@ -7,6 +7,27 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- incident #46 FIXED: append linkage gate closes the keep-up race
+
+The root fix for the duplicate-append (964031's bytes landing at 964032):
+idxscan_append_locked -- the flock-guarded atomic-height primitive BOTH racy
+writers use (keep-up mux legs and inbound .do_block children) -- now checks,
+INSIDE the same critical section that assigns the height, that the block's
+prev field (header bytes 4..36) equals the current tip record's hash. A
+mismatch returns the new -2 (refused, not-tip-linked) with the lock released
+and the store untouched. The TOCTOU is structurally closed: the staleness
+that caused the incident was validation using a leg's pass-start chain view
+while the height was assigned at append time. store_append_shared stays
+check-free by design (parallel IBD writes disjoint non-sequential heights);
+the reorg path reconnects through the nolocked variant under its own outer
+lock, unaffected. Callers: the inbound path already dropped on <=0; node_sync
+gets fail code 10 so the log distinguishes "stale duplicate refused" from a
+real append error, and the next rotation rebuilds a fresh locator.
+
+tests/test_append_linkage replays the incident byte-shape: A, B-linking-A,
+then B AGAIN (prev=A, tip=B) -> refused -2 with the tip untouched; a
+garbage-prev block likewise; a genuinely-next block still appends normally.
+
 ## 2026-08-25 -- incident #45 FIXED: the counter drift was the flush crash window
 
 ROOT CAUSE, proven by a deterministic repro (tests/test_lsm_count_drift.c):

@@ -755,7 +755,18 @@ node_sync_multi:
     mov  ecx, [rbp-0x54]    ; blen is a DWORD -- 32-bit load!
     call idxscan_append_locked
     cmp  rax, -1
-    jne .fchk9
+    je   .app_err
+    cmp  rax, -2
+    jne  .fchk9
+    ; -2: not-tip-linked (incident #46's linkage gate) -- a sibling writer
+    ; landed this block first, or the peer served a stale/competing block.
+    ; Not a leg failure in the ordinary sense, but ending the pass here is
+    ; correct either way: the locator is stale, and the next rotation
+    ; rebuilds it from the true tip. Distinct fail code so the log
+    ; distinguishes "append error" from "stale duplicate refused".
+    mov  dword [rel sync_fail_code], 10
+    jmp  .fail
+    .app_err:
     mov  dword [rel sync_fail_code], 9
     jmp  .fail
     .fchk9:
