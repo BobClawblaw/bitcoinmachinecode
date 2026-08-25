@@ -76,7 +76,10 @@ int main(void){
     ck("mempool loaded true", r && S(r,"loaded") && !strcmp(S(r,"loaded"), "1"));
     ck("mempool size 0", r && S(r,"size") && !strcmp(S(r,"size"), "0"));
     ck("mempool maxmempool 300MB", r && S(r,"maxmempool") && !strcmp(S(r,"maxmempool"), "300000000"));
-    ck("mempool minrelayfee", r && S(r,"minrelayfee") && !strcmp(S(r,"minrelayfee"), "0.00001000"));
+    ck("mempool minrelaytxfee (Core field name, not minrelayfee)",
+       r && S(r,"minrelaytxfee") && !strcmp(S(r,"minrelaytxfee"), "0.00001000") && S(r,"minrelayfee")==NULL);
+    ck("mempool permitbaremultisig present", r && S(r,"permitbaremultisig") != NULL);
+    ck("mempool maxdatacarriersize present", r && S(r,"maxdatacarriersize") && !strcmp(S(r,"maxdatacarriersize"),"100000"));
     rj_free(r);
     /* getrawmempool: [] non-verbose, {} verbose */
     r = NULL; rpc_node_dispatch("getrawmempool", NULL, &r, &ec, &em);
