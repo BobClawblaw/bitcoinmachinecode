@@ -599,3 +599,74 @@ time on a single thread, so a rescan blocks every other RPC for its duration —
 as it must, there being nowhere else to run it. `rescanblockchain` takes
 Core's `start_height`/`stop_height`, and a bounded range is the way to keep
 that window short.
+
+## Slice 13 — subsystem 2 of 5: coin selection, change, fees, the spend family — (2026-08-25)
+`sendtoaddress`, `sendmany`, `send`, `sendall`, `fundrawtransaction` and
+`walletcreatefundedpsbt` now work end to end: select coins from the rescan,
+add change, compute a fee from the node's own estimator, sign through the
+existing signer, broadcast through the existing channel.
+
+### Signing is delegated, deliberately
+The spend path builds the transaction and then calls
+`signrawtransactionwithwallet` through `rpc_dispatch`. `rpc_commands.c`'s
+signer already handles legacy, P2SH, BIP143 v0 and P2SH-wrapped v0, and its
+P2WPKH output is Core-validated. A second signer here would be a second thing
+to keep correct — and this is the one place in the node where getting signing
+subtly wrong loses money rather than returning a wrong number. Nothing in the
+spend path calls `wallet_core.c`'s legacy-P2PKH `wallet_send_tx`; the gap
+recorded in slice 8 is closed by never touching it.
+
+To make that delegation work, `signrawtransactionwithwallet` now synthesizes
+prevout entries from the wallet's own rescan records for any input outpoint
+the wallet owns (BIP143 commits to each input's value and scriptPubKey, and
+the scan carries both). Core's wallet knows its own outputs when signing;
+without this, signing a `fundrawtransaction` result would demand the caller
+re-supply data the wallet already has. Caller-provided prevtxs win over
+synthesized ones.
+
+### The scan format grew a field, and why
+A spend record now carries `prev_txid` — the outpoint that was **spent** —
+alongside the spending transaction's own txid (format bumped to `BMCWSCN2`).
+Without it, "is this output still unspent" could only be answered by matching
+on (vout, key, value), which collides whenever a wallet receives two
+equal-valued outputs at the same index to the same key. A collision there
+makes coin selection spend an already-spent output — an **invalid
+transaction**, not merely a wrong number. The selector now matches on the
+actual outpoint.
+
+### Selection, change, fees
+- Largest-first selection, iterating because the fee depends on the input
+  count. This is simpler than Core's branch-and-bound and says so: it always
+  pays a correct fee for the transaction it builds; it does not search for
+  the cheapest input set.
+- Size is modelled in weight units (P2WPKH inputs: 41 vB base + 108 WU of
+  witness), so vsize is Core's ceil(weight/4).
+- Change below 294 sat (P2WPKH dust) is dropped into the fee rather than
+  created — an output that costs more to spend than it is worth. Change goes
+  to `m/84'/0'/0'/0/1`, exactly what `getrawchangeaddress` hands out.
+- The fee rate comes from the node's own `estimatesmartfee` (the EMA over
+  accepted transactions), floored at the 1000 sat/kvB minimum relay rate
+  when the estimator has no data — a floor, not an invented confidence.
+- **Locked outputs are excluded from selection.** The test locks the
+  wallet's only coin and asserts funding then fails rather than spending a
+  coin the operator reserved.
+
+### The inputless/segwit ambiguity
+An inputless transaction's serialization — `version | 00 | n_out` — is
+byte-identical to a segwit marker+flag, which is exactly why Core's
+`fundrawtransaction` carries an `iswitness` heuristic parameter. This node
+funds ONLY the inputless form (it cannot value inputs it did not select — no
+txindex), so the inputless reading wins by construction, and a transaction
+that genuinely carries inputs is refused either way. Stated at the parse.
+
+### Still refusing
+`walletprocesspsbt` (PSBT signing needs per-input PSBT field surgery the
+signer does not do), `bumpfee`/`psbtbumpfee` (RBF replacement needs the
+original transaction's full input set and fee, which needs a txindex).
+
+### Tested
+The funded transaction is signed to completion **with a real witness** and
+the spend path is driven to the broadcast step (this harness has no download
+worker, so reaching `sendrawtransaction`'s own "no download worker" error is
+proof that selection, change, fee and signing all succeeded). Insufficient
+funds is Core's `-6` naming the amount actually available.
