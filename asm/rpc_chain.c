@@ -1749,7 +1749,8 @@ static int desc_parse_core(const char* core, desc_t* d, long* ec, const char** e
     else if (!strncmp(core,"tr(",3) && core[L-1]==')'){ d->script=DSC_TR; inner=core+3; ilen=L-4; }
     else if (!strncmp(core,"addr(",5) && core[L-1]==')'){ d->script=DSC_ADDR; inner=core+5; ilen=L-6; }
     else if (!strncmp(core,"raw(",4) && core[L-1]==')'){ d->script=DSC_RAW; inner=core+4; ilen=L-5; }
-    else { *ec=-5; *em="Invalid descriptor function"; return 0; }
+    else { snprintf(perr, sizeof perr, "'%s' is not a valid descriptor function", core);
+           *ec=-5; *em=perr; return 0; }   /* Core's exact message shape */
 
     /* addr()/raw(): the content is an address or a raw hex script, not a key. */
     if (d->script==DSC_ADDR){
@@ -2200,7 +2201,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","getchaintips","getindexinfo","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","scantxoutset","getchaintips","getindexinfo","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -2304,6 +2305,165 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
     return 1;
 }
 
+/* ---- scantxoutset ----------------------------------------------------------
+ * action start: expand the scanobjects (descriptor strings or {desc,range})
+ * into concrete scriptPubKeys with the SAME descriptor engine
+ * deriveaddresses uses, hand them to the injected whole-set scanner
+ * (daemon/utxo_setinfo_rpc.c's utxo_scan_rpc_run -- the tool-derived reader
+ * with the fingerprint/quiescence discipline), and render Core's exact
+ * result shape. Scans here are SYNCHRONOUS (the walk takes ~90s), so
+ * "status" is always null and "abort" always false, exactly what Core
+ * answers when no scan is in progress. Checksums on scan descriptors are
+ * optional (verified when present), unlike deriveaddresses.
+ * height/confirmations are relative to the UTXO APPLIED height -- the state
+ * that was scanned. */
+typedef struct {
+    unsigned char txid[32]; unsigned int vout;
+    unsigned long long value; unsigned long long height; int coinbase;
+    unsigned char spk[128]; unsigned int spklen;
+} rpc_scan_hit_t;
+static long (*g_scan_run)(const unsigned char*, const unsigned int*, int,
+                          void*, long, long*, long*, unsigned long long*,
+                          unsigned long long*, int*, char*, unsigned long);
+void rpc_chain_set_utxoscan(long (*run)(const unsigned char*, const unsigned int*, int,
+                                        void*, long, long*, long*, unsigned long long*,
+                                        unsigned long long*, int*, char*, unsigned long)){
+    g_scan_run = run;
+}
+#define SCAN_MAX_TARGETS 4096
+#define SCAN_MAX_HITS    32768
+/* spk for descriptor d at index i (i ignored for un-ranged). 1 ok / 0 fail. */
+static int desc_spk_at(const desc_t* d, long i, u8 spk[128], u32* spklen,
+                       long* ec, const char** em){
+    if (d->script==DSC_ADDR || d->script==DSC_RAW){
+        if (d->spklen > 128){ *ec=-5; *em="Descriptor script too large"; return 0; }
+        memcpy(spk, d->spk, d->spklen); *spklen = (u32)d->spklen; return 1;
+    }
+    u8 pub[65]; int pl=0;
+    if (!desc_pub_at(d, i, pub, &pl)){ *ec=-5; *em="Key derivation failed"; return 0; }
+    u8 h[20];
+    switch (d->script){
+    case DSC_PKH:
+        hash160(h, pub, pl);
+        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3,h,20); spk[23]=0x88; spk[24]=0xac;
+        *spklen=25; return 1;
+    case DSC_WPKH:
+        hash160(h, pub, pl);
+        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2,h,20); *spklen=22; return 1;
+    case DSC_SHWPKH: {
+        u8 redeem[22]; hash160(h, pub, pl);
+        redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2,h,20);
+        hash160(h, redeem, 22);
+        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2,h,20); spk[22]=0x87; *spklen=23; return 1; }
+    case DSC_PK:
+        spk[0]=(u8)pl; memcpy(spk+1,pub,(size_t)pl); spk[1+pl]=0xac; *spklen=(u32)(pl+2); return 1;
+    default:
+        *ec=-5; *em="Descriptor type not scannable"; return 0;
+    }
+}
+static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char perr[192];
+    const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
+    if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
+    if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
+    if (strcmp(action, "start")){
+        snprintf(perr, sizeof perr, "Invalid action '%s'", action);
+        *ec = -8; *em = perr; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    if (!g_scan_run){ *ec = -1; *em = "UTXO scan unavailable in this process"; return 0; }
+
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    const rj_val* objs = params->items[1];
+    for (unsigned long oi = 0; oi < objs->nitems; oi++){
+        const rj_val* ob = objs->items[oi];
+        const char* dstr = 0; long rbegin = 0, rend = -1;
+        if (ob->typ == RJ_STR) dstr = ob->str;
+        else if (ob->typ == RJ_OBJ){
+            rj_val* dv = rj_obj_get((rj_val*)ob, "desc");
+            if (!dv || dv->typ != RJ_STR){ *ec=-8; *em="Descriptor needs to be provided in scan object"; return 0; }
+            dstr = dv->str;
+            rj_val* rv = rj_obj_get((rj_val*)ob, "range");
+            if (rv){
+                if (rv->typ==RJ_NUM){ rbegin=0; rend=(long)strtoll(rv->str,NULL,10); }
+                else if (rv->typ==RJ_ARR && rv->nitems==2 && rv->items[0]->typ==RJ_NUM && rv->items[1]->typ==RJ_NUM){
+                    rbegin=(long)strtoll(rv->items[0]->str,NULL,10);
+                    rend=(long)strtoll(rv->items[1]->str,NULL,10); }
+                else { *ec=-8; *em="Invalid range"; return 0; }
+                if (rbegin<0 || rend<rbegin){ *ec=-8; *em="Invalid range"; return 0; }
+                if (rend-rbegin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
+            }
+        } else { *ec=-8; *em="Invalid scan object"; return 0; }
+        /* checksum optional here (Core scan accepts bare descriptors) */
+        char core[320];
+        { const char* hash = strchr(dstr, '#');
+          size_t cl = hash ? (size_t)(hash-dstr) : strlen(dstr);
+          if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
+          memcpy(core, dstr, cl); core[cl]=0;
+          if (hash){
+              char cks[9];
+              if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
+              if (strlen(hash+1)!=8 || strcmp(hash+1,cks)){
+                  snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
+                  *ec=-5; *em=perr; return 0; } } }
+        desc_t d;
+        if (!desc_parse_core(core, &d, ec, em)) return 0;
+        long lo = 0, hi = 0;
+        if (d.ranged){ lo = rbegin; hi = (rend >= 0) ? rend : 1000; }   /* Core's default range */
+        for (long i = lo; i <= hi; i++){
+            if (ntgt >= SCAN_MAX_TARGETS){ *ec=-8; *em="Too many scan targets"; return 0; }
+            if (!desc_spk_at(&d, i, targets[ntgt], &tlens[ntgt], ec, em)) return 0;
+            ntgt++;
+        }
+    }
+    if (!ntgt){ *ec=-8; *em="scanobjects argument is required for the start action"; return 0; }
+
+    static rpc_scan_hit_t hits[SCAN_MAX_HITS];
+    long hits_n = 0, sheight = 0; int overflow = 0;
+    unsigned long long scanned = 0, total_sat = 0;
+    static char msg[256];
+    long r = g_scan_run(&targets[0][0], tlens, ntgt, hits, SCAN_MAX_HITS, &hits_n,
+                        &sheight, &scanned, &total_sat, &overflow, msg, sizeof msg);
+    if (r == 0){ *ec=-1; snprintf(perr,sizeof perr,"%s",msg[0]?msg:"UTXO set busy"); *em=perr; return 0; }
+    if (r != 1){ *ec=-1; snprintf(perr,sizeof perr,"%s",msg[0]?msg:"UTXO scan failed"); *em=perr; return 0; }
+    if (overflow){ *ec=-1; *em="Scan matched more outputs than this node can return"; return 0; }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "success", rj_bool(1));
+    rj_obj_set(o, "txouts", rj_numf("%llu", scanned));
+    rj_obj_set(o, "height", rj_numf("%ld", sheight));
+    { u8 hdr[80]; char hx[65];
+      if (read_block_prefix(sheight, hdr, 80) == 1){
+          u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32);
+          rj_obj_set(o, "bestblock", rj_str(hx)); } }
+    rj_val* uns = rj_arr();
+    for (long i = 0; i < hits_n; i++){
+        rpc_scan_hit_t* h = &hits[i];
+        rj_val* e = rj_obj();
+        { char hx[65]; hex_rev(hx, h->txid, 32); rj_obj_set(e, "txid", rj_str(hx)); }
+        rj_obj_set(e, "vout", rj_numf("%u", h->vout));
+        { char* sh2 = malloc((size_t)h->spklen*2+1);
+          if (sh2){ hex_of(sh2, h->spk, h->spklen); rj_obj_set(e, "scriptPubKey", rj_str(sh2)); free(sh2); } }
+        { char* di = desc_inner_of(h->spk, h->spklen); char* dc = desc_with_checksum(di);
+          if (dc){ rj_obj_set(e, "desc", rj_str(dc)); free(dc); } free(di); }
+        rj_obj_set(e, "amount", rj_numf("%llu.%08llu", h->value/100000000ULL, h->value%100000000ULL));
+        rj_obj_set(e, "coinbase", rj_bool(h->coinbase));
+        rj_obj_set(e, "height", rj_numf("%llu", h->height));
+        { u8 hdr[80]; char hx[65];
+          if (read_block_prefix((long)h->height, hdr, 80) == 1){
+              u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32);
+              rj_obj_set(e, "blockhash", rj_str(hx)); } }
+        rj_obj_set(e, "confirmations", rj_numf("%lld", (long long)sheight - (long long)h->height + 1));
+        rj_arr_push(uns, e);
+    }
+    rj_obj_set(o, "unspents", uns);
+    rj_obj_set(o, "total_amount", rj_numf("%llu.%08llu", total_sat/100000000ULL, total_sat%100000000ULL));
+    *res = o;
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
@@ -2326,6 +2486,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
     if (!strcmp(m, "getblocktemplate")) return cmd_getblocktemplate(params, res, ec, em);
     if (!strcmp(m, "gettxoutsetinfo")) return cmd_gettxoutsetinfo(params, res, ec, em);
+    if (!strcmp(m, "scantxoutset")) return cmd_scantxoutset(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
