@@ -22,6 +22,7 @@ extern void point_add(u64 r[12], const u64 p[12], const u64 q[12]);
 extern void point_add_mixed(u64 r[12], const u64 p[12], const u64 xy[8]);
 extern void point_add_mixed_zr(u64 r[12], const u64 p[12], const u64 xy[8], u64 zr[4]);
 extern void point_scalar_mul(u64 r[12], const u64 xy[8], const u64 k[4]);
+extern void point_scalar_mul_fixed(u64 r[12], const u64 k[4]);
 extern void fe_inv(u64 r[4], const u64 a[4]);
 extern void fe_mul(u64 r[4], const u64 a[4], const u64 b[4]);
 extern void fe_sqr(u64 r[4], const u64 a[4]);
@@ -74,6 +75,9 @@ int main(void){
         } else if (strcmp(op, "scalar") == 0){
             rdlimbs(XY, &p, 8); rdlimbs(K, &p, 4);
             point_scalar_mul(R, XY, K);
+        } else if (strcmp(op, "fixed") == 0){
+            rdlimbs(K, &p, 4);
+            point_scalar_mul_fixed(R, K);
         } else {
             fprintf(stderr, "bad op: %s\n", op); continue;
         }

@@ -42,6 +42,20 @@
 	add  \rd, sp, #(32*(\n))
 	.endm
 
+	/* address of a symbol (adrp + add :lo12:) */
+	.macro LAddr rd, sym
+	adrp \rd, \sym
+	add  \rd, \rd, :lo12:\sym
+	.endm
+
+	/* ---- fixed-base G comb table (w=4): T[j][i] = i*2^(4j)*G affine ----
+	 * entry offset = ((j*15)+(i-1))*64. Auto-generated upstream; converted
+	 * dq -> .quad by ../../asm/g_comb_table.inc. Reused by ecdsa u1*G. */
+	.section .rodata
+	.balign 16
+	.include "g_comb_table.S.inc"
+	.text
+
 /* ============================================================================
  * point_double(r=x0, p=x1)
  * slots: S0=A S1=B S2=C S3=(X1+B)^2->D S4=E S5=F S6=work S7=8C
@@ -859,6 +873,148 @@ point_scalar_mul:
 	ldp  x29, x30, [sp], #16
 	ret
 	.size point_scalar_mul, .-point_scalar_mul
+
+/* ============================================================================
+ * point_scalar_mul_fixed(out=x0, k=x1)  out = k*G  (fixed-base G comb, w=4)
+ * result = sum_j T[j][digit_j] over the 64 4-bit windows of k, via up to 64
+ * point_add_mixed (Jacobian + affine), NO doublings. R is held in memory at
+ * sp+0 (never a register across the add_mixed calls, which clobber x19..x22);
+ * loop state x23..x27 is untouched by point_add_mixed.
+ *   x23=out  x24=kbuf(sp+96)  x25=j  x26=G_COMB_TABLE base
+ * Frame: R[12]@sp+0 (96B), kbuf@sp+96 (32B); sub 160, kbuf @+96.
+ * ========================================================================== */
+	.global point_scalar_mul_fixed
+	.type   point_scalar_mul_fixed, %function
+point_scalar_mul_fixed:
+	stp  x29, x30, [sp, #-16]!
+	mov  x29, sp
+	stp  x23, x24, [sp, #-16]!
+	stp  x25, x26, [sp, #-16]!
+	stp  x27, x28, [sp, #-16]!
+	sub  sp, sp, #160
+	mov  x23, x0                 /* out */
+	add  x24, sp, #96            /* kbuf */
+	/* copy k (x1) -> kbuf */
+	ldr  x4, [x1, #0]
+	ldr  x5, [x1, #8]
+	ldr  x6, [x1, #16]
+	ldr  x7, [x1, #24]
+	str  x4, [x24, #0]
+	str  x5, [x24, #8]
+	str  x6, [x24, #16]
+	str  x7, [x24, #24]
+	/* k == 0 -> infinity */
+	ldr  x4, [x24, #0]
+	ldr  x5, [x24, #8]
+	orr  x4, x4, x5
+	ldr  x5, [x24, #16]
+	orr  x4, x4, x5
+	ldr  x5, [x24, #24]
+	orr  x4, x4, x5
+	cbz  x4, 8f
+	LAddr x26, G_COMB_TABLE
+	/* ---- find first j (0..63) with digit != 0 ---- */
+	mov  x25, #0
+2:	mov  x9, x25
+	lsl  x9, x9, #2
+	mov  x10, x9
+	lsr  x10, x10, #6
+	and  x9, x9, #63
+	ldr  x8, [x24, x10, lsl #3]
+	lsrv x8, x8, x9
+	and  x8, x8, #15
+	cbnz x8, 3f
+	add  x25, x25, #1
+	cmp  x25, #64
+	b.lo 2b
+	b    8f                    /* all digits zero */
+	/* ---- init R = T[j][digit] (affine) ---- */
+3:	sub  x9, x8, #1            /* d-1 */
+	mov  x10, x25
+	mov  x11, #15
+	mul  x10, x10, x11
+	add  x10, x10, x9         /* (j*15)+(d-1) */
+	mov  x11, #64
+	mul  x10, x10, x11
+	add  x10, x10, x26        /* table + offset */
+	mov  x0, sp               /* R */
+	ldp  x2, x3,  [x10]
+	ldp  x4, x5,  [x10, #16]
+	ldp  x6, x7,  [x10, #32]
+	ldp  x8, x9,  [x10, #48]
+	stp  x2, x3,  [x0]
+	stp  x4, x5,  [x0, #16]
+	stp  x6, x7,  [x0, #32]
+	stp  x8, x9,  [x0, #48]
+	mov  x11, #1
+	str  x11, [x0, #64]
+	str  xzr, [x0, #72]
+	str  xzr, [x0, #80]
+	str  xzr, [x0, #88]
+	add  x25, x25, #1
+	cmp  x25, #64
+	b.hs 6f
+	/* ---- accumulate remaining j = 63 .. next .. ---- */
+4:	mov  x9, x25
+	lsl  x9, x9, #2
+	mov  x10, x9
+	lsr  x10, x10, #6
+	and  x9, x9, #63
+	ldr  x8, [x24, x10, lsl #3]
+	lsrv x8, x8, x9
+	and  x8, x8, #15
+	cbz  x8, 5f
+	sub  x9, x8, #1
+	mov  x10, x25
+	mov  x11, #15
+	mul  x10, x10, x11
+	add  x10, x10, x9
+	mov  x11, #64
+	mul  x10, x10, x11
+	add  x10, x10, x26        /* xy = T[j][digit] (rodata) */
+	mov  x0, sp               /* r = R */
+	mov  x1, sp               /* p = R (in-place, verified) */
+	mov  x2, x10              /* affine xy */
+	bl   point_add_mixed
+5:	add  x25, x25, #1
+	cmp  x25, #64
+	b.lo 4b
+6:	/* copy R (sp+0) -> out (x23), 12 limbs */
+	mov  x0, x23
+	ldp  x2, x3,  [sp]
+	ldp  x4, x5,  [sp, #16]
+	ldp  x6, x7,  [sp, #32]
+	ldp  x8, x9,  [sp, #48]
+	stp  x2, x3,  [x0]
+	stp  x4, x5,  [x0, #16]
+	stp  x6, x7,  [x0, #32]
+	stp  x8, x9,  [x0, #48]
+	ldp  x2, x3,  [sp, #64]
+	ldp  x4, x5,  [sp, #80]
+	stp  x2, x3,  [x0, #64]
+	stp  x4, x5,  [x0, #80]
+	b    9f
+	/* ---- zero scalar: infinity (1,1,0) ---- */
+8:	mov  x6, #1
+	str  x6,  [x23, #0]
+	str  xzr, [x23, #8]
+	str  xzr, [x23, #16]
+	str  xzr, [x23, #24]
+	str  x6,  [x23, #32]
+	str  xzr, [x23, #40]
+	str  xzr, [x23, #48]
+	str  xzr, [x23, #56]
+	str  xzr, [x23, #64]
+	str  xzr, [x23, #72]
+	str  xzr, [x23, #80]
+	str  xzr, [x23, #88]
+9:	add  sp, sp, #160
+	ldp  x27, x28, [sp], #16
+	ldp  x25, x26, [sp], #16
+	ldp  x23, x24, [sp], #16
+	ldp  x29, x30, [sp], #16
+	ret
+	.size point_scalar_mul_fixed, .-point_scalar_mul_fixed
 
 	.section .note.GNU-stack,"",%progbits
 

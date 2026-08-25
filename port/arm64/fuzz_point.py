@@ -155,6 +155,9 @@ def main():
             kk%=N
             exp=fmt_p(scalar_ladder((Q[0],Q[1]),kk))
             addv("scalar",fmt(Q[0])+" "+fmt(Q[1])+" "+" ".join("%016x"%x for x in limbs(kk)),exp)
+            # fixed-base: kk*G
+            ge=fmt_p(scalar_ladder((Gx,Gy),kk))
+            addv("fixed"," ".join("%016x"%x for x in limbs(kk)),ge)
     payload="\n".join(vectors)+"\n"
     r=subprocess.run([BIN],input=payload,capture_output=True,text=True)
     if r.returncode!=0:
