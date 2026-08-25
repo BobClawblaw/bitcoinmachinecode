@@ -294,6 +294,7 @@ asm/tests/test_utxo_live_count
 asm/tests/test_utxo_recover
 asm/tests/test_utxo_catchup_crash_resume
 asm/tests/test_archive_truncate_nonmonotonic
+asm/tests/test_append_linkage
 asm/tests/test_prune_nonmonotonic
 asm/tests/test_utxo_catchup_shutdown
 asm/tests/test_utxo_crash_recovery
