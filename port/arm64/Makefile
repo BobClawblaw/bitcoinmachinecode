@@ -32,9 +32,10 @@ test_sha512: sha512.o $(ASMDIR)/tests/test_sha512.c
 test_ripemd160: ripemd160.o $(ASMDIR)/tests/test_ripemd160.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_ripemd160.c ripemd160.o -I$(ASMDIR)
 
-harness: test_sha256 test_sha512 test_ripemd160 test_net test_p2p test_p2p_inv test_headers
+harness: test_sha256 test_sha512 test_ripemd160 test_net test_p2p test_p2p_inv test_headers test_tx test_txtxid test_store t_roll
 	./test_sha256 && ./test_sha512 && ./test_ripemd160 && \
-	./test_net && ./test_p2p && ./test_p2p_inv && ./test_headers
+	./test_net && ./test_p2p && ./test_p2p_inv && ./test_headers && \
+	./test_tx >/dev/null && ./test_txtxid >/dev/null && ./test_store >/dev/null && ./t_roll >/dev/null
 
 # net layer harnesses (also link bitcoin_hash + sha256 for the frame checksum)
 test_net: bitcoin_net.o bitcoin_hash.o sha256.o $(ASMDIR)/tests/test_net.c

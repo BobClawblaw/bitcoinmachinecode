@@ -3,3 +3,10 @@
 *.so
 test_*
 t_ripemd
+fz_tx
+t_roll
+live_blocks
+live_download
+live_download_g
+live_handshake
+live_hs_g
