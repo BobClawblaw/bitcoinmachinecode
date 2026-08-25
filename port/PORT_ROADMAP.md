@@ -32,7 +32,13 @@ and runs natively.
 - [x] bitcoin_hash -> port/arm64/bitcoin_hash.S  sha256d fuzz vs hashlib; genesis
       block hash byte-exact; pow_check(genesis) PASS; merkle_root n=1..1000 vs
       Python reference: 0 fail. Built on ported sha256 (single source of truth).
-- [ ] secp256k1_fe / scalar / point / point_ct / ecdsa / schnorr / taproot
+- [x] secp256k1_fe (prime field)      -> port/arm64/secp256k1_fe.S   repo
+      test_fe PASS native; 6400+ diff cases vs Python big-int (add/sub/mul/sqr/
+      inv, incl. non-canonical/full-range for mul) 0 fail. Fixed 6 real bugs
+      (see worklog): SUB-borrow flag, C-value-vs-address, carry-in-feedback in
+      columns+fold, multi-bit column carries, T*slot operand swap in fe_inv,
+      128Bit-overlap fold. (2026-08-24)
+- [ ] secp256k1_scalar / point / point_ct / ecdsa / schnorr / taproot
                                           (the security-critical core; validate
                                            against *_{fe,scalar,glv,scalar}_c.c
                                            oracles + Python int oracle)
