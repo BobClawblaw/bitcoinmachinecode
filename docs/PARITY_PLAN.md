@@ -74,8 +74,23 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       size/bytes/usage/total_fee/maxmempool. BUILD-SIDE ONLY so far: the live
       daemon still runs the MAP_PRIVATE build; deploy batched post-rebuild,
       then live-verify (inbound tx -> parent getrawmempool).
-- [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (needs a
-      parent-index walk over the shared policy graph -- state is shared now)
+- [x] getmempoolentry -- full documented field set minus master's
+      cluster-mempool extras (vsize_adjusted/chunkweight/fees.chunk;
+      bip125-replaceable is gone in modern Core). Graph fields from a
+      mp_lock'd snapshot of the shared policy registry
+      (mpool_policy_entry_info): depends/spentby direct edges,
+      ancestor/descendant transitive closures INCLUDING self, fees summed over
+      the set, sizes as true BIP141 vsize sums (each member's bytes re-read
+      from the pool). Semantics verified against a live oracle chain (child
+      anccount=2, ancsize=sum of member vsizes, fees.anc=sum incl self,
+      parent desccount incl self, spentby). wtxid = sha256d(full
+      serialization). Error parity: -5 not-in-mempool, -8 with Core's exact
+      bad-txid message. DOCUMENTED GAPS: height=0 (entry height untracked at
+      accept), unbroadcast=false. Hermetic test drives a REAL parent->child
+      chain through the REAL mpool_policy_add path. Deploy batched with the
+      rest (build-side).
+- [ ] getmempoolancestors / getmempooldescendants (same
+      mpool_policy_entry_info snapshot, rendered as arrays/objects)
 
 ### T5 — Fee estimation
 - [ ] estimatesmartfee / estimaterawfee from mempool feerate buckets + recent blocks

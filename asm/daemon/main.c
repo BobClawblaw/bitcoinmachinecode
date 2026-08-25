@@ -2779,9 +2779,21 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long mempool_time_of(const unsigned char*);
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
+      extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
       extern long mpool_count(void*);
-      rpc_node_set_mempool(mp_ext_area, mp_ext_polstate, (long long)mp_ext_blobcap,
-                           mpool_count, mp_lock, mp_unlock, mempool_time_of, mpool_policy_entry); }
+      extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+      rpc_mempool_hooks h = {
+          .mp = mp_ext_area, .polstate = mp_ext_polstate,
+          .maxbytes = (long long)mp_ext_blobcap,
+          .count = mpool_count, .get = mpool_get,
+          .lock = mp_lock, .unlock = mp_unlock,
+          .time_of = mempool_time_of,
+          .pol_entry = mpool_policy_entry,
+          .pol_entry_info = mpool_policy_entry_info,
+          /* main.c's existing extern types the length as long; the hooks
+           * member says unsigned long -- ABI-identical on x86-64 SysV. */
+          .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d };
+      rpc_node_set_mempool(&h); }
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){

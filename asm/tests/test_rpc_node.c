@@ -6,6 +6,19 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Link stub: mpool_policy_add resolves confirmed prevouts through this. Any
+ * outpoint not found in the policy's own outreg resolves to a 100000-sat
+ * P2WPKH -- enough to make fees real without a UTXO store. */
+long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned long index,
+                                    unsigned long long* val, const unsigned char** spk,
+                                    unsigned long* spklen){
+    (void)u;(void)txid;(void)index;
+    static const unsigned char SPK[22] = {0x00,0x14, 0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,
+                                          0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99};
+    *val = 100000; *spk = SPK; *spklen = 22;
+    return 1;
+}
+
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o,k) : 0; return v ? v->str : 0; }
@@ -122,7 +135,9 @@ int main(void){
       unsigned char wid[32]; memset(wid, 0xA5, 32);
       ck("test pool: put legacy", mpool_put(pool, lid, ltx, lln) == 1);
       ck("test pool: put segwit", mpool_put(pool, wid, wtx, wln) == 1);
-      rpc_node_set_mempool(pool, NULL, 8388608, mpool_count, NULL, NULL, NULL, NULL);
+      { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+        h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+        rpc_node_set_mempool(&h); }
 
       r = NULL; rpc_node_dispatch("getrawmempool", NULL, &r, &ec, &em);
       ck("shared pool: getrawmempool has 2 txids", r && r->typ == RJ_ARR && r->nitems == 2);
@@ -152,8 +167,121 @@ int main(void){
       ck("shared pool: maxmempool = injected 8388608", r && S(r,"maxmempool") && !strcmp(S(r,"maxmempool"),"8388608"));
       rj_free(r);
 
+      /* ---- getmempoolentry: drive a REAL parent->child chain through the
+       * REAL policy accept path (mpool_policy_add), then assert the graph
+       * fields. The resolver stub below supplies prevout values, so fees are
+       * genuine policy-computed numbers: parent spends a 100000-sat confirmed
+       * prevout -> fee 10000 (one 90000-sat P2WPKH out); child spends the
+       * parent's output -> fee 90000 - 80000 = 10000. ---- */
+      { extern void mpool_policy_init(void*, unsigned long long, unsigned, unsigned,
+                                      unsigned, unsigned, unsigned);
+        extern long mpool_policy_add(void*, void*, void*, const unsigned char*,
+                                     unsigned long, const unsigned char*, void*);
+        extern unsigned long mpool_policy_state_size(unsigned long);
+        extern void mpool_policy_state_init(void*, unsigned long);
+        extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
+        extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+        extern int tx_txid(unsigned char*, const unsigned char*, unsigned long,
+                           unsigned char*, unsigned long);
+        static unsigned char polcfg[128];
+        static unsigned char polstate[1<<22];
+        mpool_policy_init(polcfg, 1, 25, 101000, 25, 101000, 1);
+        if (mpool_policy_state_size(4096) > sizeof polstate){ ck("polstate fits", 0); }
+        mpool_policy_state_init(polstate, 4096);
+
+        /* parent: spends confirmed prevout 0x33..33:0, one 90000-sat P2WPKH out */
+        static unsigned char ptx[200]; unsigned long pln=0;
+        ptx[pln++]=2;ptx[pln++]=0;ptx[pln++]=0;ptx[pln++]=0;         /* version */
+        ptx[pln++]=1;                                                 /* 1 in */
+        for(int i=0;i<32;i++) ptx[pln++]=0x33;                        /* prev txid */
+        ptx[pln++]=0;ptx[pln++]=0;ptx[pln++]=0;ptx[pln++]=0;          /* vout 0 */
+        ptx[pln++]=0;                                                 /* scriptsig */
+        ptx[pln++]=0xfd;ptx[pln++]=0xff;ptx[pln++]=0xff;ptx[pln++]=0xff;
+        ptx[pln++]=1;                                                 /* 1 out */
+        unsigned long long pv=90000; for(int i=0;i<8;i++) ptx[pln++]=(unsigned char)(pv>>(8*i));
+        ptx[pln++]=22; ptx[pln++]=0x00; ptx[pln++]=0x14; for(int i=0;i<20;i++) ptx[pln++]=0x44;
+        ptx[pln++]=0;ptx[pln++]=0;ptx[pln++]=0;ptx[pln++]=0;          /* locktime */
+        unsigned char pid[32]; static unsigned char scratch[4096];
+        ck("parent txid computed", tx_txid(pid, ptx, pln, scratch, sizeof scratch)==1);
+        ck("policy add parent", mpool_policy_add(polcfg, polstate, pool, ptx, pln, pid, (void*)1)==1);
+
+        /* child: spends parent:0, one 80000-sat out */
+        static unsigned char ctx[200]; unsigned long cln=0;
+        ctx[cln++]=2;ctx[cln++]=0;ctx[cln++]=0;ctx[cln++]=0;
+        ctx[cln++]=1;
+        for(int i=0;i<32;i++) ctx[cln++]=pid[i];
+        ctx[cln++]=0;ctx[cln++]=0;ctx[cln++]=0;ctx[cln++]=0;
+        ctx[cln++]=0;
+        ctx[cln++]=0xfd;ctx[cln++]=0xff;ctx[cln++]=0xff;ctx[cln++]=0xff;
+        ctx[cln++]=1;
+        unsigned long long cv=80000; for(int i=0;i<8;i++) ctx[cln++]=(unsigned char)(cv>>(8*i));
+        ctx[cln++]=22; ctx[cln++]=0x00; ctx[cln++]=0x14; for(int i=0;i<20;i++) ctx[cln++]=0x55;
+        ctx[cln++]=0;ctx[cln++]=0;ctx[cln++]=0;ctx[cln++]=0;
+        unsigned char cid[32];
+        ck("child txid computed", tx_txid(cid, ctx, cln, scratch, sizeof scratch)==1);
+        ck("policy add child", mpool_policy_add(polcfg, polstate, pool, ctx, cln, cid, (void*)1)==1);
+
+        { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+          h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+          h.get = mpool_get; h.polstate = polstate;
+          h.pol_entry_info = mpool_policy_entry_info;
+          rpc_node_set_mempool(&h); }
+
+        char pidhex[65]; static const char* HD="0123456789abcdef";
+        for (int k=0;k<32;k++){ unsigned char b=pid[31-k]; pidhex[k*2]=HD[b>>4]; pidhex[k*2+1]=HD[b&15]; }
+        pidhex[64]=0;
+        char cidhex[65];
+        for (int k=0;k<32;k++){ unsigned char b=cid[31-k]; cidhex[k*2]=HD[b>>4]; cidhex[k*2+1]=HD[b&15]; }
+        cidhex[64]=0;
+
+        char pj[128]; snprintf(pj,sizeof pj,"[\"%s\"]",pidhex);
+        rj_val* pp=rj_parse(pj,strlen(pj)); r=NULL;
+        rc = rpc_node_dispatch("getmempoolentry", pp, &r, &ec, &em);
+        ck("entry(parent) dispatched", rc==1 && r!=NULL);
+        ck("entry(parent) fees.base 0.00010000",
+           r && rj_obj_get(r,"fees") && S(rj_obj_get(r,"fees"),"base") && !strcmp(S(rj_obj_get(r,"fees"),"base"),"0.00010000"));
+        ck("entry(parent) descendantcount 2 (self+child)",
+           r && S(r,"descendantcount") && !strcmp(S(r,"descendantcount"),"2"));
+        ck("entry(parent) ancestorcount 1",
+           r && S(r,"ancestorcount") && !strcmp(S(r,"ancestorcount"),"1"));
+        ck("entry(parent) fees.descendant 0.00020000 (both fees)",
+           r && rj_obj_get(r,"fees") && S(rj_obj_get(r,"fees"),"descendant") && !strcmp(S(rj_obj_get(r,"fees"),"descendant"),"0.00020000"));
+        { rj_val* sb = r?rj_obj_get(r,"spentby"):NULL;
+          ck("entry(parent) spentby [child]", sb && sb->typ==RJ_ARR && sb->nitems==1
+             && sb->items[0]->str && !strcmp(sb->items[0]->str,cidhex)); }
+        { rj_val* dp = r?rj_obj_get(r,"depends"):NULL;
+          ck("entry(parent) depends []", dp && dp->typ==RJ_ARR && dp->nitems==0); }
+        ck("entry(parent) wtxid==txid (legacy, sha256d not injected)",
+           r && S(r,"wtxid") && !strcmp(S(r,"wtxid"),pidhex));
+        ck("entry(parent) vsize == 82 (legacy: size==vsize)", r && S(r,"vsize") && !strcmp(S(r,"vsize"),"82"));
+        rj_free(r); rj_free(pp);
+
+        snprintf(pj,sizeof pj,"[\"%s\"]",cidhex);
+        pp=rj_parse(pj,strlen(pj)); r=NULL;
+        rc = rpc_node_dispatch("getmempoolentry", pp, &r, &ec, &em);
+        ck("entry(child) ancestorcount 2 / descendantcount 1",
+           rc==1 && r && S(r,"ancestorcount") && !strcmp(S(r,"ancestorcount"),"2")
+           && S(r,"descendantcount") && !strcmp(S(r,"descendantcount"),"1"));
+        ck("entry(child) fees.ancestor 0.00020000",
+           r && rj_obj_get(r,"fees") && S(rj_obj_get(r,"fees"),"ancestor") && !strcmp(S(rj_obj_get(r,"fees"),"ancestor"),"0.00020000"));
+        { rj_val* dp = r?rj_obj_get(r,"depends"):NULL;
+          ck("entry(child) depends [parent]", dp && dp->typ==RJ_ARR && dp->nitems==1
+             && dp->items[0]->str && !strcmp(dp->items[0]->str,pidhex)); }
+        rj_free(r); rj_free(pp);
+
+        /* error parity: -5 not in mempool; -8 bad txid with Core's message */
+        { rj_val* p5=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000001\"]",68);
+          r=NULL; long e5; const char* m5; rc=rpc_node_dispatch("getmempoolentry",p5,&r,&e5,&m5);
+          ck("entry miss -> -5 Transaction not in mempool", rc==0 && e5==-5 && m5 && !strcmp(m5,"Transaction not in mempool"));
+          rj_free(r); rj_free(p5); }
+        { rj_val* p8=rj_parse("[\"deadbeef\"]",12);
+          r=NULL; long e8; const char* m8; rc=rpc_node_dispatch("getmempoolentry",p8,&r,&e8,&m8);
+          ck("entry bad txid -> -8 Core message", rc==0 && e8==-8 && m8 && strstr(m8,"txid must be of length 64 (not 8, for 'deadbeef')"));
+          rj_free(r); rj_free(p8); }
+      }
+
       /* detach again so the empty-pool checks stay valid for later runs */
-      rpc_node_set_mempool(NULL, NULL, 300000000LL, NULL, NULL, NULL, NULL, NULL); }
+      rpc_node_set_mempool(NULL); }
 
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);
