@@ -2227,10 +2227,11 @@ interp_checkmultisig:
 	ldr  w2,[sp,#0x48]
 	add  w2,w2,w22
 	add  w2,w2,#3
-	ldr  x3,[sp,#0x38]
-	sub  x3,x3,x2
-	mov  x2,x3
-	bl   stack_elem_ptr
+		ldr  x3,[sp,#0x38]
+		sub  x3,x3,x2
+		mov  x2,x3
+		ldr  x1,[x20]		/* elems (x1 clobbered by earlier stack_elem_ptr bl!) */
+		bl   stack_elem_ptr
 	ldr  w2,[x0]
 	cbnz w2,.err_nulldummy
 .cms_dummy_ok:

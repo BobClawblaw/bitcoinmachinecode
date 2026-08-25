@@ -204,3 +204,11 @@ and x30 (tail-ret trap); x24 never set to frame base (interp helpers read garbag
 element len read as 64-bit instead of u32 (OP_SIZE pitfall) at 19 sites.
 REMAINING slice: interp_checksig/_checksig_add/_checkmultisig (CHECKSIG/CHECKMULTISIG paths
 + C checksig_fn callback interop) still crash under the stub-plumbing test -- next debug item.
+
+## 2026-08-25 — s5 script/consensus COMPLETE (interpreter done)
+script_eval (bitcoin_interp.S) is now FULLY differential-verified, including the
+whole CHECKSIG/CHECKMULTISIG plumbing, two fixes:
+- script_find_and_delete saved-reg/local (x19/x20) overlap in bitcoin_sighash.S
+- interp_checkmultisig NULLDUMMY missing x1-elems reload in bitcoin_interp.S
+24,000 targeted cms/checksig cases + 1,200 VM regressions: 0 fail. Full harness pass.
+Next: s6 daemon link (UTXO store + bitcoind + mempool) then s7 full IBD + UTXO build.

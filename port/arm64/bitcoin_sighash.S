@@ -203,14 +203,17 @@ script_op_len:
 	.global script_find_and_delete
 	.type script_find_and_delete, %function
 script_find_and_delete:
-	stp  x29, x30, [sp, #-16]!
-	mov  x29, sp
-	/* locals on stack, base x26 */
-	stp  x19, x20, [sp, #-16]!
-	stp  x21, x22, [sp, #-16]!
-	stp  x23, x24, [sp, #-16]!
-	stp  x25, x26, [sp, #-16]!
-	mov  x26, sp                 /* locals base */
+		/* locals BELOW saved regs in a separate 0x40 frame (was overlapping the x19/x20
+		 * saved slots at +48/+56 with out@48/outend@56, corrupting the caller's x19/x20 on
+		 * return: x20 got restored to outend == cms_scstrip0+dstcap == cms_scstrip1). */
+		stp  x29, x30, [sp, #-16]!
+		mov  x29, sp
+		stp  x19, x20, [sp, #-16]!
+		stp  x21, x22, [sp, #-16]!
+		stp  x23, x24, [sp, #-16]!
+		stp  x25, x26, [sp, #-16]!
+		sub  sp, sp, #0x40
+		mov  x26, sp                 /* locals base (saved regs live above at +0x40..) */
 	/* store args: dst@0 dstcap@8 needle@16 needlelen@24 end@32 pc@40 out@48 outend@56 */
 	str  x0, [x26, #0]
 	str  x1, [x26, #8]
@@ -296,6 +299,7 @@ script_find_and_delete:
 .fad_overflow:
 	mov  x0, #-1
 .fad_ret:
+	add  sp, sp, #0x40
 	ldp  x25, x26, [sp], #16
 	ldp  x23, x24, [sp], #16
 	ldp  x21, x22, [sp], #16
