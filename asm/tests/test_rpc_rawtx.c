@@ -301,6 +301,56 @@ int main(void){
              r2 && rj_obj_get(r2,"txcount") && !strcmp(rj_obj_get(r2,"txcount")->str,"2")
              && rj_obj_get(r2,"format") && !strcmp(rj_obj_get(r2,"format")->str,"bmc")
              && rj_obj_get(r2,"private_keys_enabled") && rj_obj_get(r2,"private_keys_enabled")->str[0]=='0');
+          /* ORACLE-DIFFED 2026-08-25 (the scratch Core ran disablewallet=1
+           * until then): Core's modern getwalletinfo has NO balance fields --
+           * they moved to getbalances -- and DOES carry blank/flags. */
+          ck("getwalletinfo emits no balance fields (Core parity)",
+             r2 && rj_obj_get(r2,"balance")==NULL && rj_obj_get(r2,"unconfirmed_balance")==NULL
+             && rj_obj_get(r2,"immature_balance")==NULL && rj_obj_get(r2,"paytxfee")==NULL);
+          ck("getwalletinfo has blank + flags (Core parity)",
+             r2 && rj_obj_get(r2,"blank") && rj_obj_get(r2,"flags")
+             && rj_obj_get(r2,"flags")->typ==RJ_ARR);
+          rj_free(r2); rj_free(pr); }
+        /* ORACLE-DIFFED 2026-08-25 against a REAL Core wallet holding a real
+         * mainnet transaction (watch-only import of a recently-active
+         * address). Two shape corrections the diff forced:
+         *   - gettransaction.details[] entries are Core's REDUCED shape
+         *     {address,category,amount,vout,fee,abandoned}, NOT a copy of a
+         *     listtransactions entry: we had been putting six top-level
+         *     fields (txid/time/timereceived/confirmations/walletconflicts)
+         *     inside details[0], where Core never puts them;
+         *   - every entry carries `vout` and `mempoolconflicts`.
+         * `fee` IS correct here: Core documents it as "negative and only
+         * available for the send category", and every journal record is a
+         * send. */
+        { char pj4[128];
+          snprintf(pj4,sizeof pj4,"[\"%s\"]",
+                   "1111111111111111111111111111111111111111111111111111111111111111");
+          rj_val* p4=rj_parse(pj4,strlen(pj4)); rj_val* r4=NULL;
+          rpc_dispatch("gettransaction",p4,&w,&r4,&ec2,&em2);
+          rj_val* det = r4 ? rj_obj_get(r4,"details") : NULL;
+          rj_val* d0 = det && det->nitems ? det->items[0] : NULL;
+          ck("details[0] is Core's REDUCED shape (no txid/time/confirmations)",
+             d0 && rj_obj_get(d0,"txid")==NULL && rj_obj_get(d0,"time")==NULL
+             && rj_obj_get(d0,"confirmations")==NULL && rj_obj_get(d0,"walletconflicts")==NULL);
+          ck("details[0] has address/category/amount/vout/fee/abandoned",
+             d0 && rj_obj_get(d0,"address") && rj_obj_get(d0,"category")
+             && rj_obj_get(d0,"amount") && rj_obj_get(d0,"vout")
+             && rj_obj_get(d0,"fee") && rj_obj_get(d0,"abandoned"));
+          rj_free(r4); rj_free(p4); }
+        { rj_val* pr=rj_parse("[]",2); rj_val* r2=NULL;
+          rpc_dispatch("listtransactions",pr,&w,&r2,&ec2,&em2);
+          rj_val* e0 = r2 && r2->nitems ? r2->items[0] : NULL;
+          ck("entry has vout + mempoolconflicts (Core parity)",
+             e0 && rj_obj_get(e0,"vout") && rj_obj_get(e0,"mempoolconflicts")
+             && rj_obj_get(e0,"mempoolconflicts")->typ==RJ_ARR);
+          rj_free(r2); rj_free(pr); }
+        { rj_val* pr=rj_parse("[]",2); rj_val* r2=NULL;
+          rpc_dispatch("getbalances",pr,&w,&r2,&ec2,&em2);
+          rj_val* mine = r2 ? rj_obj_get(r2,"mine") : NULL;
+          ck("getbalances mine.{trusted,untrusted_pending,immature,nonmempool}",
+             mine && rj_obj_get(mine,"trusted") && rj_obj_get(mine,"untrusted_pending")
+             && rj_obj_get(mine,"immature") && rj_obj_get(mine,"nonmempool"));
           rj_free(r2); rj_free(pr); }
         chdir(oldcwd);
       } }
