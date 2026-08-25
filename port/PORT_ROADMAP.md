@@ -38,7 +38,11 @@ and runs natively.
       (see worklog): SUB-borrow flag, C-value-vs-address, carry-in-feedback in
       columns+fold, multi-bit column carries, T*slot operand swap in fe_inv,
       128Bit-overlap fold. (2026-08-24)
-- [ ] secp256k1_scalar / point / point_ct / ecdsa / schnorr / taproot
+- [x] secp256k1_scalar (arith mod n)  -> port/arm64/secp256k1_scalar.S repo
+      test_scalar PASS native; 900+ diff-fuzz vs Python big-int mod n: 0 fail.
+      sc_add/sub/mul/sqr/inv. Fixed SCA_ADD carry-propagation bug (must
+      `ldr; adcs x,x,xzr; str` -- `adcs x,xzr,xzr` overwrote limbs). (2026-08-24)
+- [ ] secp256k1_point / point_ct / ecdsa / schnorr / taproot
                                           (the security-critical core; validate
                                            against *_{fe,scalar,glv,scalar}_c.c
                                            oracles + Python int oracle)

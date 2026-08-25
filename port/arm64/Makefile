@@ -59,8 +59,6 @@ t_roll: bitcoin_store.o t_roll.c
 	$(CC) $(CFLAGS) -o $@ t_roll.c bitcoin_store.o -I$(ASMDIR) -include sys/stat.h
 
 test_fe: secp256k1_fe.o $(ASMDIR)/tests/test_fe.c
-test_scalar: secp256k1_scalar.o $(ASMDIR)/tests/test_scalar.c
-	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_scalar.c secp256k1_scalar.o -I$(ASMDIR)
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_fe.c secp256k1_fe.o -I$(ASMDIR)
 test_scalar: secp256k1_scalar.o $(ASMDIR)/tests/test_scalar.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_scalar.c secp256k1_scalar.o -I$(ASMDIR)
