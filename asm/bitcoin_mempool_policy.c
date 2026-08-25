@@ -467,3 +467,24 @@ long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
     _mpol_last_reason = "accepted";
     return 1;
 }
+
+/* ---- RPC read helpers (2026-08-25, shared-mempool coherence slice) --------
+ * The node table is append-only within a state generation (RBF/reorg wipe and
+ * rebuild it), so a txid can appear more than once after an RBF cycle: walk
+ * BACKWARD so the newest registration wins. Callers hold mp_lock. A miss just
+ * means "fee unknown" (e.g. tx registered before a reorg policy-state reset);
+ * callers must treat it as absent data, never as fee 0 truth. */
+long mpool_policy_entry(void* st, const unsigned char txid[32],
+                        unsigned long long* fee, unsigned long long* size){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    for (uint32_t i = n; i > 0; i--){
+        if (!memcmp(t[i-1].txid, txid, 32)){
+            if (fee)  *fee  = t[i-1].fee;
+            if (size) *size = t[i-1].size;
+            return 1;
+        }
+    }
+    return 0;
+}

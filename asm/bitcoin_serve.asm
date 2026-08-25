@@ -109,6 +109,11 @@ extern mp_ext_area
 extern mp_ext_blob
 extern mp_ext_slots
 extern mp_ext_blobcap
+; MEMPOOL COHERENCE (2026-08-25): when the C-provided region is MAP_SHARED it
+; is mpool_init'd ONCE pre-fork (mempool_cfg.c) and mp_ext_inited is 1 --
+; re-running mpool_init here (per process, per lazy-init) would WIPE the
+; shared pool every time an inbound child starts. Skip init, adopt the region.
+extern mp_ext_inited
 ; resolved once at init to whichever region is in play; every later mempool
 ; call goes through this, so there is exactly one place that decides.
 mp_cur:         dq 0
@@ -210,6 +215,8 @@ node_serve_loop:
 .mp_external:
     ; --- C-provided, -maxmempool sized ---
     mov  [mp_cur], rax
+    cmp  qword [mp_ext_inited], 0
+    jne  .mp_inited          ; shared region: init already ran pre-fork
     mov  rdi, rax
     mov  rsi, [mp_ext_slots]
     mov  rdx, [mp_ext_blob]
