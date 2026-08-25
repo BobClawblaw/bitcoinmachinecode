@@ -107,7 +107,18 @@ typedef struct {
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
 } rpc_mempool_hooks;
-void rpc_node_set_mempool(const rpc_mempool_hooks* h);   /* copied; NULL detaches */
+void rpc_node_set_mempool(const rpc_mempool_hooks* h);
+
+/* Hand the RPC layer the persistent address book (bitcoin_addrmgr.asm), so
+ * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
+ * pointers for the same no-link-fanout reason as the mempool hooks. */
+void rpc_node_set_addrbook(void* ab, long (*count)(void*),
+                           int (*get_i)(void*, long, unsigned char*));
+
+/* Hand the RPC layer the operator's addnode= list (node_config's
+ * g_cfg.addnode / n_addnode), so getaddednodeinfo reports the real
+ * configured nodes and whether each is currently connected. */
+void rpc_node_set_addednodes(const char (*list)[64], int n);   /* copied; NULL detaches */
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
