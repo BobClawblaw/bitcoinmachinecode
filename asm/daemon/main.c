@@ -2116,6 +2116,7 @@ static unsigned char txsub_mp_area[40 + TXSUB_MP_SLOTS*48 + 8];
 static unsigned char txsub_mp_blob[2u<<20];
 static int           txsub_ready = 0;   /* 0 uninit, 1 ready, -1 init failed */
 static unsigned long long txsub_last_seq = 0;
+static unsigned long long blksub_last_seq = 0;
 
 /* Lazy one-time init of the worker's tx-accept path. Returns 1 ready, 0 not. */
 static int txsub_worker_ready(void){
@@ -2459,6 +2460,28 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             g_node_status->tx_submit_result = result;
             __sync_synchronize();
             g_node_status->tx_submit_ack = txsub_last_seq;
+        }
+        /* submitblock channel: evaluate against the chain state this worker
+         * owns (daemon/blk_submit.c). This slice never connects a block --
+         * consensus-clean submissions answer "inconclusive" (BIP22's honest
+         * word for it) until the UTXO dry-run slice lands. */
+        if(g_node_status && g_node_status->blk_submit_seq != blksub_last_seq){
+            blksub_last_seq = g_node_status->blk_submit_seq;
+            extern long blk_submit_evaluate(const unsigned char*, unsigned long,
+                                            const unsigned char*, long, char*, unsigned long);
+            char reason[64]; reason[0]=0;
+            unsigned char tiph[32]; int have_tip = store_get_tip_hash(store_buf, tiph) == 1;
+            long tip = *(int*)(store_buf+24);
+            long ev = blk_submit_evaluate((const unsigned char*)g_node_status->blk_submit_buf,
+                                          g_node_status->blk_submit_len,
+                                          have_tip ? tiph : 0, tip, reason, sizeof reason);
+            if (ev == 1) snprintf(reason, sizeof reason, "inconclusive");
+            fprintf(stderr,"[dl] submitblock: %s (len=%lu tip=%ld)\n",
+                    reason, (unsigned long)g_node_status->blk_submit_len, tip);
+            snprintf((char*)g_node_status->blk_submit_reason, sizeof g_node_status->blk_submit_reason, "%s", reason);
+            g_node_status->blk_submit_result = 0;      /* never accepted this slice */
+            __sync_synchronize();
+            g_node_status->blk_submit_ack = blksub_last_seq;
         }
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;

@@ -517,6 +517,61 @@ static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, co
     return 1;
 }
 
+/* submitblock (BIP22): decode the hex block and stage it into the shared
+ * block channel; the download worker -- the only process that owns chain
+ * state -- evaluates it (daemon/blk_submit.c) and acks. Result null on
+ * accept, else a BIP22 reason string. -22 "Block decode failed" for
+ * malformed hex, exactly like Core. The worker polls at its loop top, so a
+ * node deep in catch-up may not answer within the window: reported as an
+ * honest timeout (-4), never a fabricated verdict. */
+#define SBK_WAIT_MS   90000
+#define SBK_POLL_US   3000
+static int cmd_submitblock(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_STR){
+        *ec = -1; *em = "submitblock requires a hex block"; return 0; }
+    const char* hex = params->items[0]->str;
+    size_t hl = strlen(hex);
+    if ((hl & 1) || hl/2 < 81 || hl/2 > RPC_BLKSUBMIT_MAX){
+        *ec = -22; *em = "Block decode failed"; return 0; }
+    unsigned long n = (unsigned long)(hl/2);
+    if (!g_status_rw){ *ec = -4; *em = "Block submission unavailable (no download worker)"; return 0; }
+
+    pthread_mutex_lock(&g_submit_lock);
+    node_status_t* st = g_status_rw;
+    for (unsigned long i = 0; i < n; i++){
+        int hi = srt_hex1(hex[i*2]), lo = srt_hex1(hex[i*2+1]);
+        if (hi < 0 || lo < 0){ pthread_mutex_unlock(&g_submit_lock);
+            *ec = -22; *em = "Block decode failed"; return 0; }
+        st->blk_submit_buf[i] = (unsigned char)((hi<<4)|lo);
+    }
+    st->blk_submit_len = n;
+    st->blk_submit_result = 0;
+    st->blk_submit_reason[0] = 0;
+    unsigned long long myseq = st->blk_submit_seq + 1;
+    __sync_synchronize();
+    st->blk_submit_seq = myseq;
+
+    int waited = 0, done = 0, result = 0;
+    static char reason[64];
+    reason[0] = 0;
+    while (waited < SBK_WAIT_MS*1000){
+        if (st->blk_submit_ack == myseq){
+            result = st->blk_submit_result;
+            memcpy(reason, (const void*)st->blk_submit_reason, sizeof reason);
+            reason[sizeof reason - 1] = 0;
+            done = 1; break;
+        }
+        struct timespec ts = {0, SBK_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SBK_POLL_US;
+    }
+    pthread_mutex_unlock(&g_submit_lock);
+    if (!done){ *ec = -4; *em = "Block submission timed out (node may be catching up)"; return 0; }
+    if (result == 1){ *res = rj_null(); return 1; }          /* Core: null */
+    *res = rj_str(reason[0] ? reason : "rejected");
+    return 1;
+}
+
 /* ---- prioritisetransaction / getprioritisedtransactions ------------------
  * (Core rpc/mining.cpp). A fee-delta map consulted by getmempoolentry's
  * fees.modified. PARENT-LOCAL by design: the deltas only influence what THIS
@@ -677,7 +732,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -696,6 +751,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "estimatesmartfee"))   return cmd_estimatesmartfee(params, res, ec, em);
     if (!strcmp(m, "prioritisetransaction"))      return cmd_prioritisetransaction(params, res, ec, em);
     if (!strcmp(m, "getprioritisedtransactions")) return cmd_getprioritisedtransactions(res);
+    if (!strcmp(m, "submitblock"))        return cmd_submitblock(params, res, ec, em);
     if (!strcmp(m, "sendrawtransaction")) return cmd_sendrawtransaction(params, res, ec, em);
     return -1;
 }
