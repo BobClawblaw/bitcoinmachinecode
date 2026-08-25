@@ -354,7 +354,7 @@ tests/test_undo_asm_diff: tests/test_undo_asm_diff.c tests/undo_log_ref.o bitcoi
 # sha256d) is documented in this Makefile as misbehaving under aggressive C
 # optimisation, and this harness sits directly on top of it.
 REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/archive_verify.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o \
@@ -450,7 +450,7 @@ tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJ
 # checkpoint periodically during a long catch-up, not just on a (rare, during
 # bulk mode) compaction or at the very end of the call.
 CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -460,7 +460,7 @@ tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_T
 # back everything it already committed (coinbase + any earlier-in-block tx),
 # not just the failing tx -- see rollback_partial_apply in daemon/utxo_live.c daemon/block_witness.c. bitcoin_cmpct.o
 ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -473,7 +473,7 @@ tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS)
 # block get re-verified against UTXO state it already spent -- see the
 # per-block persist_applied_height() call in daemon/utxo_live.c daemon/block_witness.c. bitcoin_cmpct.o
 CRASHRESUMESRCS := tests/test_utxo_catchup_crash_resume.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -484,7 +484,7 @@ tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(RE
 # destroy its own repair data (the 2026-08-24 height-963915 production
 # failure, distilled). See utxo_live.c's ghost guard in apply_block_at.
 GHOSTRESUMESRCS := tests/test_utxo_ghost_resume.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_ghost_resume: $(GHOSTRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -495,7 +495,7 @@ tests/test_utxo_ghost_resume: $(GHOSTRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS)
 # persisted, instead of being ignored until systemd's TimeoutStopSec SIGKILLs
 # the worker mid-block (every stop/restart did exactly that until 2026-08-22).
 SHUTDOWNSRCS := tests/test_utxo_catchup_shutdown.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -507,7 +507,7 @@ tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS
 # re-applied, never rejected as "already-spent". Three kill points incl. a
 # forced mac_flush inside the block; key-by-key diff vs a never-crashed run.
 CRASHRECSRCS := tests/test_utxo_crash_recovery.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -521,7 +521,7 @@ tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS) 
 # must both genuinely exercise the block-wide worker pool and still report
 # the correct failing tx.
 CROSSTXSRCS := tests/test_cross_tx_verify.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -534,7 +534,7 @@ tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TES
 # input's script correctly, not read corrupted/dangling memory. See the
 # test file's own header comment for full root-cause detail.
 BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c bitcoin_mempool_policy.c \
+    daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c
 tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -1640,8 +1640,14 @@ tests/test_rpc_signraw: tests/test_rpc_signraw.c rpc_commands.o rpc_json.o $(RPC
 # live-node RPC module (rpc_node.c): fake node_status_t -> dispatch -> assert.
 # bitcoin_tx.o supplies tx_txid (used by sendrawtransaction); -lpthread for the
 # submission-channel mutex.
-tests/test_rpc_node: tests/test_rpc_node.c rpc_node.o rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 -o $@ tests/test_rpc_node.c rpc_node.o rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
+tests/test_rpc_node: tests/test_rpc_node.c rpc_node.o rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o
+	$(CC) -no-pie -O2 -o $@ tests/test_rpc_node.c rpc_node.o rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o -lpthread
+
+# test_mempool_shared -- the MAP_SHARED pre-fork mempool: child writes under
+# the cross-process lock, parent sees the txs; init-once (mp_ext_inited)
+# survives fork. The property the 2026-08-25 coherence slice exists for.
+tests/test_mempool_shared: tests/test_mempool_shared.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c bitcoin_mempool.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 -o $@ tests/test_mempool_shared.c daemon/mempool_cfg.c daemon/node_config.c bitcoin_mempool_policy.c bitcoin_mempool.o bitcoin_hash.o sha256.o -lpthread
 
 
 # bitcoin_p2p.asm inv parsers (incoming protocol codecs).
@@ -1792,7 +1798,7 @@ prereq-check:
 	    --format summary --check > /dev/null
 
 
-test: abi-check callee-saved-check prereq-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial daemon/bitcoind tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_probe_bound tests/test_utxo_prefetch_race tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_chain tests/test_txoutproof tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_signraw tests/test_rpc_node tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_bip30_overwrite tests/test_utxo_unspendable tests/test_txv_parse_diff tests/test_txv_classify_diff tests/test_segwit_classify_diff tests/test_txvb_parse_diff tests/test_txv_pools_diff tests/test_strip_witness_diff tests/test_tapagg_diff tests/test_txv_dispatch_diff tests/test_wv0_drv_diff tests/test_svs_drv_diff tests/test_checksig_diff tests/test_bip143_diff tests/test_taproot_verify_diff tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch tests/test_mv_parse_bounds tests/test_txv_cs_maxsize tests/test_bip341_diff \
+test: abi-check callee-saved-check prereq-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_outbound_mux tests/test_redial daemon/bitcoind tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_lsm tests/test_utxo_probe_bound tests/test_utxo_prefetch_race tests/test_utxo_live_count tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/smoke_interp tests/test_interp tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_mempool_shared tests/test_rpc_chain tests/test_txoutproof tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_signraw tests/test_rpc_node tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_bip30_overwrite tests/test_utxo_unspendable tests/test_txv_parse_diff tests/test_txv_classify_diff tests/test_segwit_classify_diff tests/test_txvb_parse_diff tests/test_txv_pools_diff tests/test_strip_witness_diff tests/test_tapagg_diff tests/test_txv_dispatch_diff tests/test_wv0_drv_diff tests/test_svs_drv_diff tests/test_checksig_diff tests/test_bip143_diff tests/test_taproot_verify_diff tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch tests/test_mv_parse_bounds tests/test_txv_cs_maxsize tests/test_bip341_diff \
 tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_undo_asm_diff tests/test_reorg tests/test_dial_budget tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_utxo_ghost_resume tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz tests/test_taproot_parallel_arena tests/test_taproot_block_diff
 	./tests/test_abi_stack_align
 	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
@@ -1838,6 +1844,7 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_bech32
 	./tests/test_mempool
 	./tests/test_mempool_policy
+	./tests/test_mempool_shared
 	./tests/test_txtxid
 	./tests/test_pubkey
 	./tests/test_sighash
