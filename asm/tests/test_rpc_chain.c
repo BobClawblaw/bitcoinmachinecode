@@ -372,6 +372,68 @@ int main(void){
     }
     expect_err("getblock unknown hash", "getblock", "[\"0000000000000000000000000000000000000000000000000000000000000001\"]", -5, "Block not found");
 
+    /* ---- getdescriptorinfo / deriveaddresses (descriptor engine) ----
+     * Ground truth captured from bitcoin-cli getdescriptorinfo/deriveaddresses
+     * on the BIP32 test-vector-1 master xpub (seed 000102..0f). */
+    {
+      const char* XP = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+      char p[400];
+      /* getdescriptorinfo: canonical descriptor, checksum, flags */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)\"]", XP);
+      r = call("getdescriptorinfo", p, &ec, &em);
+      ck_str("gdi checksum", S(r,"checksum"), "wvk84d79");
+      { char want[420]; snprintf(want, sizeof want, "wpkh(%s/0/*)#wvk84d79", XP);
+        ck_str("gdi canonical descriptor", S(r,"descriptor"), want); }
+      ck_str("gdi isrange", S(r,"isrange"), "1");
+      ck_str("gdi issolvable", S(r,"issolvable"), "1");
+      ck_str("gdi hasprivatekeys", S(r,"hasprivatekeys"), "0");
+      rj_free(r);
+      /* bad checksum rejected with Core's exact message */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#00000000\"]", XP);
+      expect_err("gdi bad checksum", "getdescriptorinfo", p, -5,
+                 "Provided checksum '00000000' does not match computed checksum 'wvk84d79'");
+      /* invalid key rejected */
+      expect_err("gdi invalid key", "getdescriptorinfo", "[\"wpkh(notakey)\"]", -5, "key 'notakey' is not valid");
+
+      /* deriveaddresses: wpkh ranged [0,2] -> Core's addresses */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#wvk84d79\", [0,2]]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck("da wpkh returns 3 addrs", r && r->typ == RJ_ARR && r->nitems == 3);
+      ck_str("da wpkh [0]", r&&r->nitems>0?r->items[0]->str:NULL, "bc1qp5wfcq48h6d63wyy9qz0awtpfqwwv4sma86mhz");
+      ck_str("da wpkh [1]", r&&r->nitems>1?r->items[1]->str:NULL, "bc1qrfxr69jqnhwufxgkqgcdep9prq4j4vuw2wyg0v");
+      ck_str("da wpkh [2]", r&&r->nitems>2?r->items[2]->str:NULL, "bc1qhvd6suvqzjcu9pxjhrwhtrlj85ny3n2mqql5w4");
+      rj_free(r);
+      /* pkh ranged, single-int range 3 -> indices 0..3 (4 addresses) */
+      snprintf(p, sizeof p, "[\"pkh(%s/0/*)#xgqkr0nt\", 3]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck("da pkh single-int range -> 4 addrs", r && r->typ == RJ_ARR && r->nitems == 4);
+      ck_str("da pkh [0]", r&&r->nitems>0?r->items[0]->str:NULL, "12CL4K2eVqj7hQTix7dM7CVHCkpP17Pry3");
+      ck_str("da pkh [2]", r&&r->nitems>2?r->items[2]->str:NULL, "1J4LVanjHMu3JkXbVrahNuQCTGCRRgfWWx");
+      rj_free(r);
+      /* sh(wpkh) ranged [0,2] */
+      snprintf(p, sizeof p, "[\"sh(wpkh(%s/0/*))#knyhj9av\", [0,2]]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck_str("da sh(wpkh) [0]", r&&r->nitems>0?r->items[0]->str:NULL, "3AfyxhpBVVLmBR4ZYX2onGzRqjv5QZ7FqD");
+      ck_str("da sh(wpkh) [2]", r&&r->nitems>2?r->items[2]->str:NULL, "3EZQk4F8GURH5sqVMLTFisD17yNeKa7Dfs");
+      rj_free(r);
+      /* fixed non-ranged path -> single address, no range arg */
+      snprintf(p, sizeof p, "[\"wpkh(%s/44/5)#u9t23g20\"]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck("da fixed -> 1 addr", r && r->typ == RJ_ARR && r->nitems == 1);
+      ck_str("da fixed [0]", r&&r->nitems>0?r->items[0]->str:NULL, "bc1q0k2xl6ppmegpnxl7qvday08x0fyhv2k22vdea9");
+      rj_free(r);
+      /* error parity: missing checksum, range mismatches, pk() has no address */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)\", [0,1]]", XP);
+      expect_err("da missing checksum", "deriveaddresses", p, -5, "Missing checksum");
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#wvk84d79\"]", XP);
+      expect_err("da ranged needs range", "deriveaddresses", p, -8, "Range must be specified for a ranged descriptor");
+      snprintf(p, sizeof p, "[\"wpkh(%s/44/5)#u9t23g20\", [0,1]]", XP);
+      expect_err("da unranged rejects range", "deriveaddresses", p, -8, "Range should not be specified for an un-ranged descriptor");
+      expect_err("da pk has no address", "deriveaddresses",
+                 "[\"pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7\"]",
+                 -5, "Descriptor does not have a corresponding address");
+    }
+
     /* ---- getblockchaininfo ---- */
     r = call("getblockchaininfo", "[]", &ec, &em);
     ck_str("chaininfo.chain", S(r,"chain"), "main");
