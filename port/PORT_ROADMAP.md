@@ -36,7 +36,10 @@ and runs natively.
                                           (the security-critical core; validate
                                            against *_{fe,scalar,glv,scalar}_c.c
                                            oracles + Python int oracle)
-- [ ] bitcoin_tx (tx parse/txid)          [in DAEMONOBJS]
+- [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
+      test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
+      oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
+      (2026-08-24)
 - [ ] bitcoin_net / bitcoin_p2p           (raw-syscall sockets + framers)
 - [ ] bitcoin_cons (cons_verify)          [in DAEMONOBJS]
 - [ ] bitcoin_store / store_fast / utxo*  (UTXO mmap/LSM stores)
