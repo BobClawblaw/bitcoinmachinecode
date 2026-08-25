@@ -147,25 +147,122 @@ static int cmd_getpeerinfo(rj_val** res){
 
 /* getmempoolinfo / getrawmempool.
  *
- * Fork-model caveat (docs/RPC_LIVE_NODE.md): the mempool is MAP_PRIVATE, so
- * each inbound serve child accepts into its own copy-on-write mempool -- there
- * is no single coherent mempool to report. These serve the SERVE PROCESS's own
- * mempool, which for the common `listen=0` config (no inbound children, worker
- * doesn't accept loose txs) is empty. A shared mempool that makes inbound
- * children's txs visible needs a MAP_SHARED region + cross-process locking on
- * the tx-accept path -- deferred as its own slice. The config fields
- * (maxmempool, fees) are always accurate. */
+ * COHERENT since 2026-08-25: daemon/mempool_cfg.c maps the pool MAP_SHARED
+ * pre-fork and rpc_node_set_mempool hands it to this layer, so the parent's
+ * RPC thread reports the ONE pool the download worker and every inbound serve
+ * child write into (previously each process had a divergent copy-on-write
+ * pool and these RPCs reported this process's -- always-empty -- copy). With
+ * no pool injected (standalone rpcd, static fallback) they still report the
+ * empty pool, exactly as before. */
 #define MEMPOOL_MAXBYTES   300000000LL     /* 300 MB default (config default) */
 #define MEMPOOL_MINFEE_BTC 0.00001000      /* min relay fee, BTC/kvB */
 
+static void* g_mp;                   /* shared structural pool (or NULL) */
+static void* g_mp_pol;               /* shared policy state (fees; or NULL) */
+static long long g_mp_maxbytes = MEMPOOL_MAXBYTES;
+static void (*g_mp_lk)(void);
+static void (*g_mp_ulk)(void);
+static long (*g_mp_time_of)(const unsigned char*);
+static long (*g_mp_pol_entry)(void*, const unsigned char*,
+                              unsigned long long*, unsigned long long*);
+static long (*g_mp_count)(void*);   /* mpool_count, injected -- NOT an extern,
+                                     * so rpc_node.o never drags
+                                     * bitcoin_mempool.o into its consumers */
+
+void rpc_node_set_mempool(void* mp, void* polstate, long long maxbytes,
+                          long (*count)(void*),
+                          void (*lk)(void), void (*ulk)(void),
+                          long (*time_of)(const unsigned char*),
+                          long (*pol_entry)(void*, const unsigned char*,
+                                            unsigned long long*, unsigned long long*)){
+    g_mp = mp; g_mp_pol = polstate;
+    if (maxbytes > 0) g_mp_maxbytes = maxbytes;
+    g_mp_count = count;
+    g_mp_lk = lk; g_mp_ulk = ulk; g_mp_time_of = time_of; g_mp_pol_entry = pol_entry;
+}
+static void mpl(void){ if (g_mp_lk) g_mp_lk(); }
+static void mpu(void){ if (g_mp_ulk) g_mp_ulk(); }
+
+/* Slot layout per bitcoin_mempool.asm's header (same walk daemon/reorg.c
+ * uses): +0 n, +8 mask, +16 blob, then 48-byte slots at +40 --
+ * [+0 len][+8 txid[32]][+40 blob_off], len==~0 marking empty. */
+typedef struct { const unsigned char* txid; const unsigned char* tx; unsigned long len; } mp_ent;
+static long mp_slot(void* mp, unsigned long i, mp_ent* e){
+    unsigned char* m = (unsigned char*)mp;
+    unsigned long long mask; memcpy(&mask, m+8, 8);
+    if (i > mask) return -1;
+    unsigned char* s = m + 40 + i*48;
+    unsigned long long len; memcpy(&len, s, 8);
+    if (len == 0xFFFFFFFFFFFFFFFFULL) return 0;
+    unsigned char* blob; memcpy(&blob, m+16, 8);
+    unsigned long long off; memcpy(&off, s+40, 8);
+    e->txid = s+8; e->tx = blob+off; e->len = (unsigned long)len;
+    return 1;
+}
+static unsigned long mp_slot_count(void* mp){
+    unsigned long long mask; memcpy(&mask, (unsigned char*)mp+8, 8);
+    return (unsigned long)mask + 1;
+}
+
+/* BIP141 vsize of a raw tx: weight = base*3 + total, vsize = ceil(weight/4).
+ * base is computed by walking the serialization (a local parser instead of
+ * linking strip_witness/bitcoin_segwit.c into every rpc_node.o consumer). On
+ * any parse anomaly fall back to base=total (legacy layout: vsize == size). */
+static unsigned long mp_varint(const unsigned char* p, unsigned long* c){
+    if (p[0] < 0xfd){ *c=1; return p[0]; }
+    if (p[0] == 0xfd){ *c=3; return (unsigned long)p[1] | ((unsigned long)p[2]<<8); }
+    if (p[0] == 0xfe){ *c=5; return (unsigned long)p[1]|((unsigned long)p[2]<<8)|((unsigned long)p[3]<<16)|((unsigned long)p[4]<<24); }
+    *c=9; unsigned long v=0; for(int i=0;i<8 && i<4;i++) v |= (unsigned long)p[1+i]<<(8*i); return v;
+}
+static unsigned long mp_tx_weight(const unsigned char* tx, unsigned long len){
+    if (len < 10) return len*4;
+    int segwit = (tx[4]==0x00 && tx[5]==0x01);
+    if (!segwit) return len*4;                     /* base == total */
+    unsigned long p = 6, c;
+    unsigned long nin = mp_varint(tx+p,&c); p+=c;
+    for (unsigned long i=0;i<nin;i++){ if (p+36>len) return len*4;
+        p+=36; unsigned long sl=mp_varint(tx+p,&c); p+=c+sl+4; if (p>len) return len*4; }
+    unsigned long nout = mp_varint(tx+p,&c); p+=c;
+    for (unsigned long i=0;i<nout;i++){ if (p+8>len) return len*4;
+        p+=8; unsigned long sl=mp_varint(tx+p,&c); p+=c+sl; if (p>len) return len*4; }
+    unsigned long wit_start = p;
+    for (unsigned long i=0;i<nin;i++){
+        unsigned long items=mp_varint(tx+p,&c); p+=c;
+        for (unsigned long k=0;k<items;k++){ unsigned long il=mp_varint(tx+p,&c); p+=c+il; if (p>len) return len*4; }
+    }
+    if (p+4 != len) return len*4;                  /* anomaly: fall back */
+    unsigned long wit_bytes = p - wit_start;
+    unsigned long base = len - 2 - wit_bytes;      /* minus marker+flag+witness */
+    return base*3 + len;
+}
+static unsigned long mp_tx_vsize(const unsigned char* tx, unsigned long len){
+    return (mp_tx_weight(tx,len) + 3) / 4;
+}
+
 static int cmd_getmempoolinfo(rj_val** res){
+    long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
+    if (g_mp){
+        mpl();
+        count = g_mp_count ? g_mp_count(g_mp) : 0;
+        unsigned long n = mp_slot_count(g_mp);
+        for (unsigned long i=0;i<n;i++){ mp_ent e;
+            if (mp_slot(g_mp,i,&e) != 1) continue;
+            bytes += mp_tx_vsize(e.tx, e.len);
+            blob_used += e.len;
+            unsigned long long f,s;
+            if (g_mp_pol && g_mp_pol_entry && g_mp_pol_entry(g_mp_pol,e.txid,&f,&s)) total_fee += f;
+        }
+        mpu();
+    }
     rj_val* o = rj_obj();
     rj_obj_set(o, "loaded", rj_bool(1));
-    rj_obj_set(o, "size", rj_numf("%d", 0));
-    rj_obj_set(o, "bytes", rj_numf("%d", 0));
-    rj_obj_set(o, "usage", rj_numf("%d", 0));
-    rj_obj_set(o, "total_fee", rj_numf("%.8f", 0.0));
-    rj_obj_set(o, "maxmempool", rj_numf("%lld", (long long)MEMPOOL_MAXBYTES));
+    rj_obj_set(o, "size", rj_numf("%ld", count));
+    rj_obj_set(o, "bytes", rj_numf("%llu", bytes));
+    /* Core's usage is its allocator bookkeeping; ours is the honest analog:
+     * stored tx bytes + 48B/slot structural overhead for the live entries. */
+    rj_obj_set(o, "usage", rj_numf("%llu", blob_used + (unsigned long long)count*48));
+    rj_obj_set(o, "total_fee", rj_numf("%llu.%08llu", total_fee/100000000ULL, total_fee%100000000ULL));
+    rj_obj_set(o, "maxmempool", rj_numf("%lld", g_mp_maxbytes));
     rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
@@ -178,14 +275,41 @@ static int cmd_getmempoolinfo(rj_val** res){
     return 1;
 }
 static int cmd_getrawmempool(const rj_val* params, rj_val** res){
-    /* verbose (params[0]==true) -> object keyed by txid; else -> array of txids.
-     * Empty either way for this process's mempool. */
+    /* verbose (params[0]==true) -> object keyed by txid; else -> array of
+     * txids (display byte order). Verbose entries carry the fields this node
+     * genuinely tracks: vsize, weight, time (0 if unknown), and fees.base;
+     * ancestor/descendant aggregates come with getmempoolentry (next slice). */
     int verbose = 0;
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         const rj_val* v = params->items[0];
         if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
     }
-    *res = verbose ? rj_obj() : rj_arr();
+    rj_val* out = verbose ? rj_obj() : rj_arr();
+    if (g_mp){
+        static const char* HEXD = "0123456789abcdef";
+        mpl();
+        unsigned long n = mp_slot_count(g_mp);
+        for (unsigned long i=0;i<n;i++){ mp_ent e;
+            if (mp_slot(g_mp,i,&e) != 1) continue;
+            char hx[65];
+            for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+            hx[64]=0;
+            if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
+            rj_val* ent = rj_obj();
+            unsigned long w = mp_tx_weight(e.tx, e.len);
+            rj_obj_set(ent, "vsize", rj_numf("%lu", (w+3)/4));
+            rj_obj_set(ent, "weight", rj_numf("%lu", w));
+            rj_obj_set(ent, "time", rj_numf("%ld", g_mp_time_of ? g_mp_time_of(e.txid) : 0));
+            unsigned long long f=0,s=0;
+            rj_val* fees = rj_obj();
+            if (g_mp_pol && g_mp_pol_entry && g_mp_pol_entry(g_mp_pol,e.txid,&f,&s))
+                rj_obj_set(fees, "base", rj_numf("%llu.%08llu", f/100000000ULL, f%100000000ULL));
+            rj_obj_set(ent, "fees", fees);
+            rj_obj_set(out, hx, ent);
+        }
+        mpu();
+    }
+    *res = out;
     return 1;
 }
 
