@@ -35,7 +35,33 @@ partially-applied block (`f2faf3b`, `96b555e`). A scratch Bitcoin Core
 development oracle: block hashes cross-validated at 14 heights, and after
 the genesis fix index/body/header/Core agree at 12 heights including 0.
 
-## RPC surface — still the biggest gap, first tranche landed 2026-08-21
+**Update 2026-08-25.** The "weakest area by a wide margin" verdict above is
+retired. Closed in one sustained push (each method's verification standard
+recorded in `docs/PARITY_PLAN.md`, divergences documented at the call site):
+the full mempool tranche (`getmempoolinfo`/`getrawmempool`/`getmempoolentry`/
+`getmempoolancestors`/`getmempooldescendants`/`prioritisetransaction`/
+`getprioritisedtransactions`) over a mempool made genuinely coherent — one
+MAP_SHARED, cross-process-locked pool replacing the per-process
+copy-on-write copies; `estimatesmartfee` (Core's contract over our own
+accepted-feerate EMA, stated as such); mining's `getblocktemplate`
+(frame diffed against Core at the same tip; retarget reproduces 8/8 real
+historical boundaries) and `submitblock` end-to-end (8 MB transport, 4 MB
+worker channel, BIP22 strings, connect gated on a dry run of the real apply
+path); `gettxoutsetinfo` + `scantxoutset` (the parity-capstone instruments
+as RPCs — scan verified against Core to the satoshi on 165.7M outputs);
+PSBT `analyzepsbt` (14-vector oracle diff) and `joinpsbts`; journal-backed
+`listtransactions`/`gettransaction`/`getwalletinfo` with the no-oracle
+verification bound stated in code; `getindexinfo`. Still absent, still
+honest: `sendtoaddress`/`sendmany` via RPC (needs a wallet-UTXO source and
+a fee policy — a design, not a wiring job), txindex/blockfilter index
+builds, coinstatsindex, testnet/signet/regtest chains, longpoll, BIP23
+proposal mode, and everything in the wallet-management tranche
+(multiwallet, descriptors, encryption). The same day also proved the UTXO
+set byte-identical to Core's (MuHash, no filters, no overrides — see
+`README.md`), which converts several of this document's "unverified"
+hedges below into verified facts.
+
+## RPC surface — the biggest gap until 2026-08-25; first tranche 2026-08-21
 
 **Implemented** (`asm/rpc_chain.c`, dispatched from `rpc_dispatch` in
 `asm/rpc_commands.c`; shapes follow Core v31's `blockchain.cpp` /
