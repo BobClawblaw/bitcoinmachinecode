@@ -7,6 +7,51 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- REAL-DATA reorg drill: disconnect/reconnect proven at chain height
+
+The gap: reorg was the last major consensus path whose only evidence was
+SYNTHETIC. The UTXO set is MuHash-proven byte-identical to Core, scripts are
+corpus-proven on real spends, blocks are replay-proven from genesis -- but
+disconnect/reconnect had only ever run on chains this project built itself
+(tests/test_reorg.c). The live daemon has executed ZERO real reorgs; mainnet
+supplies roughly one 1-block reorg every few weeks, so "it has not happened"
+is not reassurance for the most destructive path in the tree (it disconnects
+blocks, rewrites UTXO state, truncates the archive and reconciles the
+mempool -- and today's incidents #45/#46 were all in machinery a reorg drives
+at once).
+
+tests/reorg_drill.c closes it. Against a COPY of the real datadir at real
+chain height, it disconnects the last N real blocks and reconnects THE SAME
+blocks (captured before the truncate), so the expected end state IS the start
+state and the assertion is total rather than approximate.
+
+RESULT at height 964047, depth 3 (real blocks of 1.74/1.75/1.82 MB):
+    before: applied=964047 count=165,710,384 walk=165,710,384
+    after:  applied=964047 count=165,710,384 walk=165,710,384
+applied height back at the tip, the UTXO WALK back to EXACTLY its prior value
+across 165.7M entries, tip hash unchanged, and the incremental counter
+agreeing with the walk BOTH before and after -- incident #45's fix holding
+through a full disconnect/reconnect cycle.
+
+THE TWO FAILED RUNS BEFORE IT WERE WORTH AS MUCH, because both were harness
+bugs that demonstrated the engine's safety properties on real data:
+  1. The block source read from the archive INSIDE the callback, but
+     reorg_execute truncates the index before calling back (store_read_at ->
+     -2). The engine failed CLEANLY and left the chain at the fork point --
+     not half-applied. Fix: capture the blocks up front.
+  2. A snapshot whose undo files were copied in a different pass than the
+     UTXO state. The unapply pre-flight REFUSED: "undo records=0 but block
+     spends 6698 inputs (undo data missing, pruned, or stale)". A reorg
+     engine that unapplied blindly there would have silently corrupted 6,698
+     UTXOs. Fix: copy the datadir in ONE pass from a stopped daemon.
+
+PRACTICAL NOTE (in DEPLOYMENT.md): the drill needs only ~13 GB, not the
+1.4 TB archive -- index/headers/chainwork, the utxo_* state, the undo_<h>.dat
+files for the drilled depth, and the single blk file holding the tip blocks.
+It refuses the production datadir by path. Built as a tools target,
+deliberately OUTSIDE `make test`: it needs a real datadir copy, which CI does
+not have.
+
 ## 2026-08-25 -- differential SCRIPT-EXECUTION corpus: 1128 mutations, zero divergences
 
 ASSESSMENT.md sect.5 item 2 ("the differential corpus method applied to every
