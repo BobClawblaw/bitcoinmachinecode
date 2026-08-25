@@ -894,6 +894,195 @@ static int cmd_joinpsbts(const rj_val* params, long* ec, const char** em, rj_val
     return 1;
 }
 
+/* ---- analyzepsbt (Core node/psbt.cpp AnalyzePSBT) --------------------------
+ * Roles order CREATOR < UPDATER < SIGNER < FINALIZER < EXTRACTOR; the psbt's
+ * "next" is the minimum (earliest still-needed) across inputs. Per input we
+ * resolve the UTXO (witness_utxo/non_witness_utxo), decide finality, and if not
+ * final work out what a signer still needs by inspecting the effective script.
+ *
+ * is_final here is PRESENCE-of-a-final-field based: unlike Core we do not re-run
+ * consensus script verification on the final data, so a deliberately malformed
+ * final field would be reported final here but not by Core -- for all conformant
+ * PSBTs the results match. Coverage of the "missing"/vsize logic: P2WPKH, P2PKH,
+ * and the P2SH/P2WSH wrappers (missing redeem/witness script); other script
+ * types fall through to next=updater with no "missing" (documented divergence).*/
+#define APR_UPDATER 1
+#define APR_SIGNER 2
+#define APR_FINALIZER 3
+#define APR_EXTRACTOR 4
+static const char* apsbt_role(int r){
+    return r==APR_UPDATER?"updater":r==APR_SIGNER?"signer":r==APR_FINALIZER?"finalizer":"extractor"; }
+static long apsbt_vilen(unsigned long n){ return n<0xfd?1: n<=0xffff?3: n<=0xffffffffUL?5:9; }
+/* pubkey (via bip32_deriv 0x06 or partial_sig 0x02) with hash160==keyid present? */
+static int apsbt_key_known(const psbt_kv* kv, int nkv, const unsigned char keyid[20], int* has_sig){
+    int known=0; if (has_sig) *has_sig=0;
+    for (int i=0;i<nkv;i++){
+        unsigned long kl=kv[i].kl; if (kl!=34 && kl!=66) continue;      /* 1 + 33|65 */
+        unsigned char t=kv[i].k[0]; if (t!=0x02 && t!=0x06) continue;   /* partial_sig | bip32 */
+        unsigned char h[20]; hash160(h, kv[i].k+1, (long long)(kl-1));
+        if (!memcmp(h,keyid,20)){ known=1; if (t==0x02 && has_sig) *has_sig=1; }
+    }
+    return known;
+}
+static void apsbt_hex(char* dst, const unsigned char* b, int n){ for(int i=0;i<n;i++) sprintf(dst+2*i,"%02x",b[i]); }
+
+static int cmd_analyzepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_STR){
+        *ec=-8; *em="Invalid parameters, expected a PSBT string"; return 0; }
+    static unsigned char buf[400000]; long blen;
+    if (!crt_b64dec(params->items[0]->str, buf, sizeof buf, &blen) || blen<5 || memcmp(buf,"psbt\xff",5)!=0){
+        *ec=-22; *em="TX decode failed"; return 0; }
+    long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(buf,blen,&p,g,PSBT_MAXKV);
+    const unsigned char* utx=NULL;
+    for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; break; }
+    rj_val* out=rj_obj();
+    if (!utx){ rj_obj_set(out,"error",rj_str("PSBT cannot be made into a valid transaction")); *result=out; return 1; }
+
+    unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
+    #define APSBT_MAXIN 5000
+    static unsigned long in_vout[APSBT_MAXIN];
+    if (n_in>APSBT_MAXIN){ *ec=-22; *em="PSBT too large"; return 0; }
+    for (unsigned long k=0;k<n_in;k++){
+        in_vout[k]=(unsigned long)(utx[q+32]|(utx[q+33]<<8)|(utx[q+34]<<16)|((unsigned long)utx[q+35]<<24));
+        q+=36; unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl+4;
+    }
+    unsigned long n_out=srw_varint(utx+q,&cc); long out_start=q; q+=cc;
+    long long out_sum=0;
+    for (unsigned long k=0;k<n_out;k++){
+        long long v=0; for(int b=0;b<8;b++) v|=((long long)utx[q+b])<<(8*b);
+        out_sum+=v; q+=8; unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl;
+    }
+    long outs_bytes = q - out_start;   /* n_out varint + all output bodies */
+
+    rj_val* inputs=rj_arr();
+    int psbt_next=APR_EXTRACTOR, all_utxo=1, all_signable=1, any_wit=0;
+    long long in_sum=0;
+    long est_base = 4 + 4 + apsbt_vilen(n_in) + outs_bytes;   /* version+locktime+in_count+outputs */
+    long est_wit = 0;
+
+    for (unsigned long i=0;i<n_in;i++){
+        psbt_kv kv[PSBT_MAXKV]; int nkv=psbt_parse_map(buf,blen,&p,kv,PSBT_MAXKV);
+        rj_val* ia=rj_obj();
+        const unsigned char* spk=NULL; unsigned long spklen=0; long long uval=-1;
+        const unsigned char *fin_sig=NULL,*fin_wit=NULL,*redeem=NULL,*wscript=NULL,*nwu=NULL,*wu=NULL;
+        unsigned long fin_sig_l=0,fin_wit_l=0,redeem_l=0,wscript_l=0,wu_l=0;
+        for (int j=0;j<nkv;j++){
+            if (kv[j].kl!=1) continue; unsigned char t=kv[j].k[0];
+            if (t==0x00) nwu=kv[j].v;
+            else if (t==0x01){ wu=kv[j].v; wu_l=kv[j].vl; }
+            else if (t==0x04){ redeem=kv[j].v; redeem_l=kv[j].vl; }
+            else if (t==0x05){ wscript=kv[j].v; wscript_l=kv[j].vl; }
+            else if (t==0x07){ fin_sig=kv[j].v; fin_sig_l=kv[j].vl; }
+            else if (t==0x08){ fin_wit=kv[j].v; fin_wit_l=kv[j].vl; }
+        }
+        if (wu && wu_l>=9){ long long v=0; for(int b=0;b<8;b++) v|=((long long)wu[b])<<(8*b);
+            unsigned long sl=srw_varint(wu+8,&cc); spk=wu+8+cc; spklen=sl; uval=v; }
+        else if (nwu){
+            long qq=4; unsigned long ni=srw_varint(nwu+qq,&cc); qq+=cc;
+            for(unsigned long k=0;k<ni;k++){ qq+=36; unsigned long sl=srw_varint(nwu+qq,&cc); qq+=cc+sl+4; }
+            unsigned long no=srw_varint(nwu+qq,&cc); qq+=cc;
+            for(unsigned long k=0;k<no;k++){
+                long long v=0; for(int b=0;b<8;b++) v|=((long long)nwu[qq+b])<<(8*b);
+                unsigned long sl=srw_varint(nwu+qq+8,&cc);
+                if (k==in_vout[i]){ uval=v; spk=nwu+qq+8+cc; spklen=sl; }
+                qq+=8+cc+sl;
+            }
+        }
+        int has_utxo = (spk!=NULL);
+        rj_obj_set(ia,"has_utxo", rj_bool(has_utxo));
+        if (!has_utxo){ all_utxo=0; all_signable=0; } else in_sum+=uval;
+
+        int is_final = (fin_sig || fin_wit) ? 1 : 0;
+        int role=APR_UPDATER, is_wit=0, solvable=0; rj_val* missing=NULL;
+        long est_ss_l=0, est_wit_l=0;
+
+        if (is_final){
+            role=APR_EXTRACTOR; solvable=1;
+            if (fin_sig) est_ss_l=(long)fin_sig_l;
+            if (fin_wit){ est_wit_l=(long)fin_wit_l; is_wit=1; }
+        } else if (has_utxo){
+            const unsigned char* es=spk; unsigned long esl=spklen; int resolved=0;
+            if (spklen==23 && spk[0]==0xa9 && spk[1]==0x14 && spk[22]==0x87){        /* P2SH */
+                if (!redeem){ char hx[41]; apsbt_hex(hx,spk+2,20);
+                    missing=rj_obj(); rj_obj_set(missing,"redeemscript",rj_str(hx)); resolved=1; }
+                else { es=redeem; esl=redeem_l;
+                    est_ss_l=1+(long)redeem_l; }   /* scriptSig = push of redeem */
+            }
+            if (!resolved && esl==34 && es[0]==0x00 && es[1]==0x20){                 /* P2WSH */
+                if (!wscript){ char hx[65]; apsbt_hex(hx,es+2,32);
+                    missing=rj_obj(); rj_obj_set(missing,"witnessscript",rj_str(hx)); resolved=1; }
+                else { es=wscript; esl=wscript_l; is_wit=1; }
+            }
+            if (!resolved){
+                unsigned char keyid[20]; int have_keyid=0;
+                if (esl==22 && es[0]==0x00 && es[1]==0x14){ memcpy(keyid,es+2,20); have_keyid=1; is_wit=1; }
+                else if (esl==25 && es[0]==0x76 && es[1]==0xa9 && es[2]==0x14 && es[23]==0x88 && es[24]==0xac){
+                    memcpy(keyid,es+3,20); have_keyid=1; }
+                if (have_keyid){
+                    int has_sig=0, known=apsbt_key_known(kv,nkv,keyid,&has_sig);
+                    char hx[41]; apsbt_hex(hx,keyid,20);
+                    if (has_sig){ role=APR_FINALIZER; solvable=1; }
+                    else if (known){ role=APR_SIGNER; solvable=1;
+                        missing=rj_obj(); rj_val* a=rj_arr(); rj_arr_push(a,rj_str(hx));
+                        rj_obj_set(missing,"signatures",a); }
+                    else { missing=rj_obj(); rj_val* a=rj_arr(); rj_arr_push(a,rj_str(hx));
+                        rj_obj_set(missing,"pubkeys",a); }
+                    /* Core's DUMMY_SIGNATURE_CREATOR sig is 32+32+7 = 71 bytes
+                     * (sign.cpp DummySignatureCreator(32,32)). Witness stack
+                     * ser: count(1)+len(1)+71+len(1)+33; scriptSig same bytes. */
+                    if (is_wit) est_wit_l=1+1+71+1+33; else est_ss_l+=1+71+1+33;
+                }
+                /* else: unhandled script -> next=updater, no "missing" */
+            }
+            /* Core (psbt.cpp SignPSBTInput): when the UTXO came from
+             * witness_utxo ONLY, a witness signature is required
+             * (require_witness_sig) and its `!sigdata.witness` early-return
+             * fires BEFORE out_sigdata is filled -- so unless the script
+             * resolved to a witness shape (P2WPKH, or P2WSH with its witness
+             * script present, incl. behind P2SH), all "missing" info is
+             * DROPPED and the input reports next=updater with no "missing".
+             * Verified live: P2PKH / P2SH-no-redeem / P2WSH-no-wscript with
+             * only a witness_utxo -> no missing; the same scripts via
+             * non_witness_utxo -> missing reported. */
+            if (wu && !nwu && !is_wit){
+                role=APR_UPDATER; solvable=0;
+                if (missing){ rj_free(missing); missing=NULL; }
+            }
+        }
+
+        rj_obj_set(ia,"is_final", rj_bool(is_final));
+        rj_obj_set(ia,"next", rj_str(apsbt_role(role)));
+        if (missing) rj_obj_set(ia,"missing",missing);
+        rj_arr_push(inputs,ia);
+        if (role<psbt_next) psbt_next=role;
+        if (is_wit) any_wit=1;
+        if (!solvable) all_signable=0;
+        est_base += 36 + apsbt_vilen((unsigned long)est_ss_l) + est_ss_l + 4;
+        if (est_wit_l) est_wit += est_wit_l; else if (is_wit) est_wit += 1;
+    }
+
+    rj_obj_set(out,"inputs",inputs);
+    if (all_utxo){
+        long long fee = in_sum - out_sum;
+        long long af = fee<0 ? -fee : fee; const char* sg = fee<0 ? "-" : "";
+        if (all_signable){
+            long weight = est_base*4 + (any_wit ? 2 + est_wit : 0);
+            long vsize = (weight + 3) / 4;
+            rj_obj_set(out,"estimated_vsize", rj_numf("%ld", vsize));
+            /* CFeeRate: sat/kvB = floor(fee*1000 / vsize) toward -inf
+             * (feefrac EvaluateFeeDown), then rendered as BTC/kvB. */
+            long long num = fee*1000, spervk = num/vsize;
+            if (num%vsize != 0 && (num<0)) spervk--;
+            long long ar = spervk<0 ? -spervk : spervk; const char* sr = spervk<0 ? "-" : "";
+            rj_obj_set(out,"estimated_feerate", rj_numf("%s%lld.%08lld", sr, ar/100000000LL, ar%100000000LL));
+        }
+        rj_obj_set(out,"fee", rj_numf("%s%lld.%08lld", sg, af/100000000LL, af%100000000LL));
+    }
+    rj_obj_set(out,"next", rj_str(apsbt_role(psbt_next)));
+    *result=out;
+    return 1;
+}
+
 /* ---- signrawtransactionwithkey (pure, no wallet state) ---------------------
  * Core rpc/rawtransaction.cpp signrawtransactionwithkey. Signs an unsigned tx
  * with explicitly provided keys against provided prevtxs, returning
@@ -1118,7 +1307,7 @@ int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
-        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts",
+        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -1163,6 +1352,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_combinepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "joinpsbts"))
         return cmd_joinpsbts(params, err_code, err_msg, result);
+    if (!strcmp(method, "analyzepsbt"))
+        return cmd_analyzepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
