@@ -999,6 +999,10 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     memcpy((void*)s->tx_submit_buf, stage, n);
     s->tx_submit_len = n;
     s->tx_submit_result = 0;
+    /* explicit: a stale 1 left by a previous testmempoolaccept would turn a
+     * real submission into a dry run and report a txid for a tx that was
+     * never accepted or relayed. */
+    s->tx_submit_test = 0;
     s->tx_submit_reason[0] = 0;
     unsigned long long myseq = s->tx_submit_seq + 1;
     __sync_synchronize();
@@ -1028,9 +1032,140 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     return 0;
 }
 
+/* ==== testmempoolaccept ==================================================
+ * Rides the SAME parent->worker channel as sendrawtransaction, with
+ * tx_submit_test set, so the worker runs tx_accept_test_reason: identical
+ * consensus/script validation and identical mempool policy checks, stopping
+ * at the policy commit boundary. The verdict therefore comes from the real
+ * mempool, not from a parallel copy of its rules.
+ *
+ * DOCUMENTED DIVERGENCE -- package policy. Core validates the array as a
+ * PACKAGE: a child may spend a parent that appears earlier in the same call.
+ * This node evaluates each transaction independently against the mempool as
+ * it stands, because the dry run deliberately inserts nothing, so an earlier
+ * transaction in the array is invisible to a later one. When more than one
+ * transaction is passed, every entry therefore carries Core's own
+ * `package-error` field saying so. A child spending an in-array parent will
+ * report `missing-inputs`, which is the truth about what this node checked.
+ */
+#define TMA_MAX 25
+
+static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
+                     int* result_out, char reason[128], unsigned long long* fee_out){
+    memcpy((void*)s->tx_submit_buf, tx, n);
+    s->tx_submit_len = n;
+    s->tx_submit_result = 0;
+    s->tx_submit_fee = 0;
+    s->tx_submit_test = 1;
+    s->tx_submit_reason[0] = 0;
+    unsigned long long myseq = s->tx_submit_seq + 1;
+    __sync_synchronize();
+    s->tx_submit_seq = myseq;
+    int waited = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (s->tx_submit_ack == myseq){
+            *result_out = s->tx_submit_result;
+            *fee_out = s->tx_submit_fee;
+            memcpy(reason, (const void*)s->tx_submit_reason, 128);
+            reason[127] = 0;
+            return 1;
+        }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    return 0;
+}
+
+static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
+        *ec = -8; *em = "Invalid parameter, rawtxs must be a non-empty array"; return 0; }
+    const rj_val* list = params->items[0];
+    if (list->nitems > TMA_MAX){
+        *ec = -8; *em = "Array must contain between 1 and 25 transactions"; return 0; }
+    if (!g_status_rw){
+        *ec = -4; *em = "Mempool acceptance testing unavailable (no download worker)"; return 0; }
+
+    /* decode every transaction BEFORE staging any of them: a bad hex string
+     * in the middle would otherwise leave the caller with a half-length
+     * array whose positions no longer line up with the input. */
+    static unsigned char stage[TMA_MAX][RPC_TXSUBMIT_MAX];
+    unsigned long lens[TMA_MAX];
+    for (size_t i = 0; i < list->nitems; i++){
+        if (list->items[i]->typ != RJ_STR){ *ec = -22; *em = "TX decode failed"; return 0; }
+        const char* hex = list->items[i]->str; size_t hl = strlen(hex);
+        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
+        lens[i] = (unsigned long)(hl/2);
+        for (unsigned long k = 0; k < lens[i]; k++){
+            int hi = srt_hex1(hex[k*2]), lo = srt_hex1(hex[k*2+1]);
+            if (hi < 0 || lo < 0){ *ec = -22; *em = "TX decode failed"; return 0; }
+            stage[i][k] = (unsigned char)((hi<<4)|lo);
+        }
+    }
+
+    static const char* HEXD = "0123456789abcdef";
+    node_status_t* s = g_status_rw;
+    rj_val* arr = rj_arr();
+    pthread_mutex_lock(&g_submit_lock);
+    for (size_t i = 0; i < list->nitems; i++){
+        rj_val* e = rj_obj();
+        unsigned char id[32], wid[32];
+        static unsigned char scratch[2000*81+8];
+        int have_id = tx_txid(id, stage[i], lens[i], scratch, sizeof scratch) == 1;
+        char hx[65];
+        if (have_id){
+            for (int k=0;k<32;k++){ unsigned char b=id[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+            hx[64]=0; rj_obj_set(e, "txid", rj_str(hx));
+            /* wtxid: sha256d of the full serialization for a segwit tx, else
+             * the txid itself */
+            int segwit = lens[i] > 6 && stage[i][4] == 0x00 && stage[i][5] == 0x01;
+            if (segwit && g_mph.sha256d) g_mph.sha256d(wid, stage[i], lens[i]);
+            else memcpy(wid, id, 32);
+            for (int k=0;k<32;k++){ unsigned char b=wid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+            hx[64]=0; rj_obj_set(e, "wtxid", rj_str(hx));
+        }
+        if (list->nitems > 1)
+            rj_obj_set(e, "package-error",
+                       rj_str("this node validates each transaction independently "
+                              "against the current mempool; it does not implement "
+                              "package policy, so a child spending a parent that "
+                              "appears earlier in this array will report missing-inputs"));
+        int result = 0; char reason[128] = {0}; unsigned long long fee = 0;
+        if (!have_id){
+            rj_obj_set(e, "allowed", rj_bool(0));
+            rj_obj_set(e, "reject-reason", rj_str("TX decode failed"));
+        } else if (!tma_stage(s, stage[i], lens[i], &result, reason, &fee)){
+            /* no verdict: `allowed` is OMITTED, which is exactly how Core
+             * marks a transaction it could not fully validate */
+            rj_obj_set(e, "reject-reason", rj_str("mempool acceptance test timed out"));
+        } else if (result == 1){
+            unsigned long w = mp_tx_weight(stage[i], lens[i]);
+            unsigned long vsz = (w + 3) / 4;
+            rj_obj_set(e, "allowed", rj_bool(1));
+            rj_obj_set(e, "vsize", rj_numf("%lu", vsz));
+            rj_obj_set(e, "vsize_bip141", rj_numf("%lu", vsz));
+            rj_val* fees = rj_obj();
+            rj_obj_set(fees, "base", rj_numf("%llu.%08llu", fee/100000000ULL, fee%100000000ULL));
+            /* effective-feerate/effective-includes describe package feerate,
+             * which this node does not compute -- omitted, not guessed. */
+            rj_obj_set(e, "fees", fees);
+        } else {
+            rj_obj_set(e, "allowed", rj_bool(0));
+            rj_obj_set(e, "reject-reason", rj_str(reason[0] ? reason : "transaction rejected"));
+        }
+        rj_arr_push(arr, e);
+    }
+    s->tx_submit_test = 0;
+    pthread_mutex_unlock(&g_submit_lock);
+    *res = arr;
+    return 1;
+}
+
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
+    "testmempoolaccept", "submitpackage",
+    "getprivatebroadcastinfo", "abortprivatebroadcast",
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
     "setban", "setnetworkactive", "ping",
@@ -1046,6 +1181,19 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
     if (!strcmp(m, "gettxspendingprevout")) return cmd_gettxspendingprevout(params, res, ec, em);
+    if (!strcmp(m, "testmempoolaccept")) return cmd_testmempoolaccept(params, res, ec, em);
+    if (!strcmp(m, "submitpackage"))
+        return cmd_net_unsupported(
+            "this node has no package validation: transactions are accepted "
+            "one at a time against the mempool as it stands, so a child "
+            "cannot be validated against an unconfirmed parent in the same "
+            "call. Submit the parent first with sendrawtransaction, then the "
+            "child", ec, em);
+    if (!strcmp(m, "getprivatebroadcastinfo") || !strcmp(m, "abortprivatebroadcast"))
+        return cmd_net_unsupported(
+            "this node has no private broadcast queue: sendrawtransaction "
+            "relays to every live peer leg immediately, so there is no "
+            "pending private broadcast to report on or abort", ec, em);
     if (!strcmp(m, "getmempoolcluster"))
         return cmd_net_unsupported(
             "this node's mempool has no cluster linearization: it tracks the "

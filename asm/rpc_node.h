@@ -59,6 +59,12 @@ typedef struct {
     volatile unsigned long long tx_submit_ack;   /* worker bumps after handling */
     volatile unsigned long      tx_submit_len;
     volatile int                tx_submit_result;
+    /* 1 = testmempoolaccept: the worker runs the SAME validation and policy
+     * checks but stops at the mempool commit boundary, so the pool is not
+     * mutated and the tx is not relayed. Set by the parent before the seq
+     * bump, alongside tx_submit_len. */
+    volatile int                tx_submit_test;
+    volatile unsigned long long tx_submit_fee;    /* satoshis, dry run only */
     char                        tx_submit_reason[128];
     unsigned char               tx_submit_buf[RPC_TXSUBMIT_MAX];
 

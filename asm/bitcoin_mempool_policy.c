@@ -234,9 +234,20 @@ static int find_claim(void* st, const unsigned char prev[32], uint32_t index){
 /* ========================================================================== */
 /* ADD: atomic policy gate + structural store + bookkeeping                   */
 /* ========================================================================== */
-long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
-                      const unsigned char* tx, unsigned long txlen,
-                      const unsigned char txid[32], void* utxo){
+/* The accept path and the DRY-RUN path are the same code, parameterised.
+ * testmempoolaccept must answer with the mempool's real verdict, and a
+ * second implementation of these checks would drift from this one -- the
+ * same reason signrawtransactionwithwallet delegates rather than
+ * re-implementing. `commit` is the only difference: with commit == 0 this
+ * returns 1 at the commit boundary having changed nothing, exactly as
+ * utxo_live_dryrun_block() returns at its Phase 5 boundary.
+ *
+ * `fee_out`, when non-NULL, receives the computed fee (satoshis) on any
+ * path that got far enough to compute one. */
+static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
+                          const unsigned char* tx, unsigned long txlen,
+                          const unsigned char txid[32], void* utxo,
+                          int commit, unsigned long long* fee_out){
     unsigned char prev[MPOL_MAX_IN][32];
     uint32_t idx[MPOL_MAX_IN], seq[MPOL_MAX_IN];
     unsigned long long sum_out = 0, sum_in = 0;
@@ -254,6 +265,7 @@ long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
     }
     if (sum_in < sum_out){ _mpol_last_reason = "negative fee"; return 0; }
     uint64_t fee = sum_in - sum_out;
+    if (fee_out) *fee_out = (unsigned long long)fee;
     /* min relay feerate floor: fee >= txlen * relay_fee_rate */
     if (fee < (uint64_t)txlen * pol->relay_fee_rate){
         _mpol_last_reason = "fee below min relay fee"; return 0; }
@@ -350,6 +362,9 @@ long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
     }
 
     /* ================= commit ============================================ */
+    /* dry run: every check above has passed and nothing has been mutated yet,
+     * so this is the exact point at which "would it be accepted" is answered. */
+    if (!commit) return 1;
     /* 1. structural store (evict RBF conflicts first) */
     {
         /* snapshot the txids we evict (node indices can shift during removal) */
@@ -476,6 +491,25 @@ long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
 
     _mpol_last_reason = "accepted";
     return 1;
+}
+
+/* The committing accept path -- unchanged behaviour, one caller-visible
+ * function, so nothing that used mpool_policy_add sees a difference. */
+long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
+                      const unsigned char* tx, unsigned long txlen,
+                      const unsigned char txid[32], void* utxo){
+    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL);
+}
+
+/* Dry run for testmempoolaccept: same checks, same reject reasons
+ * (mpool_policy_reason), no insertion and no eviction. Returns 1 if the tx
+ * WOULD be accepted right now, 0 otherwise. */
+long mpool_policy_test(mpol_cfg* pol, void* st, void* mp,
+                       const unsigned char* tx, unsigned long txlen,
+                       const unsigned char txid[32], void* utxo,
+                       unsigned long long* fee_out){
+    if (fee_out) *fee_out = 0;
+    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 0, fee_out);
 }
 
 /* ---- RPC read helpers (2026-08-25, shared-mempool coherence slice) --------
