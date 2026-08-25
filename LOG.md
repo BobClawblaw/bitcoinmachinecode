@@ -7,6 +7,162 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- RPC full-field audit (post-#44): two more parity gaps closed
+
+Applying the incident-#44 lesson (spot-checked "done" RPCs hide gaps), did a
+systematic full-field diff of the existing RPC surface against the oracle. Most
+(getblock/getblockheader/getrawtransaction/getchaintips/decodescript/
+createmultisig/getblockchaininfo) were already complete. Two real gaps found and
+fixed:
+  1. getmempoolinfo emitted "minrelayfee" -- Core's field is "minrelaytxfee".
+     Renamed; also added the released policy fields permitbaremultisig +
+     maxdatacarriersize. (Master-only cluster fields limitclustercount/size/
+     optimal are deliberately omitted -- bleeding-edge, no release has them.)
+  2. getdescriptorinfo/deriveaddresses rejected addr()/raw() descriptors with
+     "Invalid descriptor function". Added both: addr(<address>) builds the spk
+     from the address, raw(<hex>) takes the script directly; both issolvable=
+     false (no key). Verified byte-for-byte vs oracle (P2PKH/bech32 addr, raw).
+getnetworkinfo's only "missing" fields (tx_send_rate, inv_buckets) are master-
+only telemetry, correctly omitted.
+
+## 2026-08-25 -- incident #44: decoderawtransaction returned a minimal, non-Core shape
+
+Found while building decodepsbt (its "tx" field reuses the tx decoder).
+`decoderawtransaction` was served by rpc_commands.c's cmd_decoderaw, a
+hand-rolled decoder that emitted only {locktime, vin, vout} with an empty
+scriptPubKey "asm"/"desc" -- missing txid, hash, version, size, vsize, weight,
+about half of Core's fields. Prior "verification" only checked vin/vout
+consistency, so the gap went unnoticed.
+
+The FULL, Core-verified decoder already existed: rpc_chain.c's tx_to_json, which
+getblock verbosity>=2 uses and which is differentially oracle-tested. Fix:
+exposed it as rpc_chain_decode_rawtx() and routed BOTH decoderawtransaction and
+decodepsbt's "tx" through it (stripping the "hex" field tx_to_json adds for
+getblock/getrawtransaction but which decoderawtransaction omits). Both are now
+byte-identical to Core (verified live). Lesson mirrors #43: a "done" RPC that was
+only spot-checked, not full-field diffed, hid a real parity gap.
+
+## 2026-08-25 -- incident #43: chainwork.dat corrupt for the entire post-segwit chain
+
+Found while oracle-verifying the new mining RPCs. `getnetworkhashps` diverged
+from Core for windows near height 500000, which traced to `getblockheader`'s
+`chainwork` field being wrong for EVERY height >= 481824 -- exactly the
+segwit-activation height and the witness-stripped-archive boundary (see the
+2026-08-22 archive incident). chainwork matched Core through 481824, then drifted
+(undercounting) for the remaining ~482k blocks.
+
+Root cause is the persisted `chainwork.dat` file, NOT the computation: recomputing
+cumulative work from `headers.dat`'s nBits via the existing `block_work()` +
+`chainwork_add()` primitives matches Core byte-for-byte at every height
+(500000 -> ...cda532266f9147b519e933, identical to Core). The file was written
+wrong during the witness-stripped-archive repair episode; `block_work` is correct.
+
+Fix: `daemon/chainwork_build.c` regenerates `chainwork.dat` from `headers.dat`.
+The rebuilt file was verified against the live oracle at 10 heights across the
+chain (all match) and swapped into production (corrupt file preserved as
+`chainwork.dat.corrupt-20260825`). Daemon restarted -- graceful SIGTERM
+checkpoint at 659738, clean resume (reload applied_height=659738, 68.4M UTXOs
+intact), embedded RPC now serves correct chainwork. This was masked because
+`getnetworkhashps` uses a chainwork DIFFERENCE (the constant offset cancels far
+past the corruption), so only windows straddling the transition zone exposed it;
+absolute `chainwork` in getblock/getblockheader/getchaintips was wrong all along.
+
+## 2026-08-25 -- incident #42: node_handshake frame overlap ate every real peer's version payload
+
+Found while wiring `getpeerinfo`: it (and the `[dl] outbound` log line) showed
+blank version/subver/services for every connected peer, even though the parse
+code was correct. gdb against a live peer gave the smoking gun -- the
+handshake's cmd buffer contained `"0.4/"`, the tail of `/Prometheus:30.0.4/`.
+
+`node_handshake`'s stack frame had TWO overlaps of the incident-#11/#31 class:
+`plen@-0xd8` sat inside `cmd[8..11]`, and the 128-byte payload buffer at
+`-0x140` spanned to `-0xc1` -- placing cmd at payload offset 96. Any peer
+version payload LONGER than 96 bytes overwrote cmd with its own tail, the
+"version" command compare then failed, and the capture never ran. Every real
+Core peer sends 102-125 bytes; only short lab payloads fit. **That is exactly
+why the loopback test never caught it: its fake peer sent 86 bytes with an
+empty user-agent.** The capture had worked in production until 2026-08-18 --
+it broke the day the node's own UA grew (single-source version.inc, 20213d8),
+which is what pushed real reply payloads past the overlap.
+
+Two more defects fixed in the same pass: a version message >128 bytes failed
+the WHOLE handshake (`p2p_read` returns -2 -> `.fail`), silently dropping any
+peer with a long UA (cap is 256 now); and both handshakes loaded the u32 plen
+with an 8-byte read, dragging in adjacent garbage. New frame: payload@-0x2e0
+cap 0x100, plen@-0xc8, `sub rsp 0x338` -- which also restores 16-byte RSP
+alignment at the `p2p_*` calls. `test_bitcoind`'s fake peer now sends a
+realistic 102-byte version with a UA and asserts the exact captured
+len/proto/services/UA; verified against 7 real mainnet peers (102/105/125-byte
+versions, incl. FutureBit's long UA). abi-check, callee-saved-check,
+stack-align and all handshake/net/sync suites pass. Category: liveness /
+observability (no chain-split; a blank RPC field and a dropped-peer class, not
+a wrong verdict). Merged c316b10.
+
+## 2026-08-25 -- incident #41: the resume-REJECT window -- a ghost block run left the UTXO set unrecoverable
+
+Root cause of a live production failure, and a direct consequence of incident
+#40 (below). After a restart the UTXO catch-up rejected height 963915 --
+`input references a missing/already-spent UTXO` -- then span forever in a
+DEGRADED retry loop with no UTXO tracking. The block was fine; our UTXO set
+was one-plus blocks ahead of the persisted checkpoint (spends are WAL-durable
+before the height marker is written), so re-verifying it found its own inputs
+already spent.
+
+The one-block window was already closed (per-block checkpoint + boot
+recovery). Three gaps combined to make a MULTI-block ghost run unrecoverable:
+(1) a failed `persist_applied_height` used to warn AND CONTINUE ("safe,
+puts/dels are idempotent" -- false since Stage D verifies BEFORE applying), and
+the reorg reconnect's checkpoint failure also continues, so the drift can be
+several blocks; (2) boot recovery healed only applied+1; (3) the killer --
+`apply_block_at` blindly `undo_discard()`ed the height before applying,
+destroying the one piece of data that could reverse a ghost, an instant before
+the fresh apply rejected on the ghost's own already-spent inputs.
+
+Fix (daemon/utxo_live.c): every block-apply is now idempotent. An undo file at
+a height ABOVE the checkpoint means "roll this ghost back first, then apply
+fresh" (never discard); boot recovery rolls back the whole contiguous ghost
+run DESCENDING (disconnect is LIFO; chained cross-block spends make the order
+load-bearing); a failed checkpoint stops catch-up at the boundary instead of
+growing the run. `tests/test_utxo_ghost_resume.c` (23 checks): a 2-block ghost
+run with spends chained across the ghosts, healed through a simulated restart;
+the guard healing an in-process re-apply. **Negative control against unfixed
+main reproduces the production failure exactly** (FATAL apply, catchup -1,
+phantom outputs) -- 7 FAILs old, 23/23 new. This retires the "never interrupt
+a catch-up" operational hazard: kill/restart mid-rebuild now self-heals.
+Merged 34fc701.
+
+## 2026-08-25 -- incident #40 (self-inflicted, operational): a broad pkill took down production AND the Tier 3 benchmark
+
+Recorded because the log is only useful if it includes the operator errors.
+While cleaning up a scratch serve instance I ran `pkill -f 'bitcoind serve'`.
+That substring matched EVERY `bitcoind serve` on the box, killing the
+production `bmc-bitcoind` (tip 963911, 5h40m uptime) and the Tier 3 vs-Core
+benchmark (at 83.6%, ~6h of progress) alongside the intended scratch process.
+Both shut down cleanly; production restarted via systemd and recovered to its
+exact tip with no data loss, but the resume then surfaced incident #41 a few
+blocks later, and Tier 3 (a timed run) was unrecoverable. Standing rule
+recorded: kill by full datadir path or exact PID, never a shared substring --
+production (`.../data`) and the bench (`bench-tier3/ours`) both match
+`bitcoind`/`serve`.
+
+## 2026-08-25 -- incident #39: RPC response buffer over-read -- memory disclosure to the client
+
+`rpc_server.c` serialized every reply into a fixed 256 KB stack buffer via
+`rj_write`, then `write(cfd, bodybuf, bodylen)` where `bodylen` was
+`rj_write`'s return value -- the value's FULL serialized length, NOT the
+truncated number of bytes actually placed in the buffer. For any response over
+256 KB (`getblock`/`getrawtransaction` on any modern block is multiple MB) this
+wrote the full length from a 256 KB buffer: ~10.7 MB of adjacent process memory
+streamed to the client, and the response past 256 KB was raw heap rather than
+JSON. A remote RPC client could disclose server memory just by requesting
+`getblock <block> 2`. Fix: `rj_write_alloc()` serializes once into a
+right-sized malloc'd buffer (no truncation), the response path uses it with a
+short-write loop; `rj_write` also had an `out[cap]` off-by-one NUL write, fixed,
+and is now documented as "return value is the full length, never a length into
+`out`". Found by pushing on RPC/getblock parity (the same push that produced the
+byte-identical read-side surface). Category: memory-safety / security (local
+RPC is loopback-bound, but it is a genuine info-leak on the wire). Merged b576c63.
+
 ## 2026-08-24 -- incident #38: the overflow audit -- every hand-written length bound, classified and fixed
 
 After #33/#34/#36/#37 all turned out to be the same units/overflow error, a

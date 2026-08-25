@@ -14,10 +14,27 @@
 #include "version_gen.h"
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <time.h>
 
 static const node_status_t* g_status;
+static node_status_t*       g_status_rw;     /* writable handle for submission */
+static pthread_mutex_t      g_submit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void rpc_node_set_status(const node_status_t* st){ g_status = st; }
+void rpc_node_set_status_rw(node_status_t* st){ g_status_rw = st; if (!g_status) g_status = st; }
+
+/* txid of a raw tx (BIP141: hash of the no-witness serialization); worker
+ * recomputes independently for the mempool. */
+extern int tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long txlen,
+                   unsigned char* scratch, unsigned long scratchcap);
+
+static int srt_hex1(char c){
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='a'&&c<='f') return c-'a'+10;
+    if (c>='A'&&c<='F') return c-'A'+10;
+    return -1;
+}
 
 /* our node advertises NODE_NETWORK(1) only (see bitcoind.asm version msg) */
 #define NODE_LOCAL_SERVICES 0x0000000000000001ULL
@@ -108,10 +125,10 @@ static int cmd_getpeerinfo(rj_val** res){
               rj_obj_set(o, "services", rj_str(h)); }
             { rj_val* sn = rj_arr(); services_names(p->services, sn); rj_obj_set(o, "servicesnames", sn); }
             rj_obj_set(o, "relaytxes", rj_bool(1));
-            rj_obj_set(o, "lastsend", rj_numf("%d", 0));
-            rj_obj_set(o, "lastrecv", rj_numf("%d", 0));
-            rj_obj_set(o, "bytessent", rj_numf("%d", 0));
-            rj_obj_set(o, "bytesrecv", rj_numf("%d", 0));
+            rj_obj_set(o, "lastsend", rj_numf("%lld", (long long)p->last_send));
+            rj_obj_set(o, "lastrecv", rj_numf("%lld", (long long)p->last_recv));
+            rj_obj_set(o, "bytessent", rj_numf("%lld", (long long)p->bytes_sent));
+            rj_obj_set(o, "bytesrecv", rj_numf("%lld", (long long)p->bytes_recv));
             rj_obj_set(o, "conntime", rj_numf("%lld", (long long)p->conn_time));
             rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
             rj_obj_set(o, "version", rj_numf("%u", p->proto));
@@ -150,9 +167,13 @@ static int cmd_getmempoolinfo(rj_val** res){
     rj_obj_set(o, "total_fee", rj_numf("%.8f", 0.0));
     rj_obj_set(o, "maxmempool", rj_numf("%lld", (long long)MEMPOOL_MAXBYTES));
     rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
-    rj_obj_set(o, "minrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
+    rj_obj_set(o, "permitbaremultisig", rj_bool(1));       /* standard relay policy */
+    rj_obj_set(o, "maxdatacarriersize", rj_numf("%d", 100000));
+    /* Master-only cluster-mempool fields (limitclustercount/size, optimal) are
+     * deliberately omitted -- bleeding-edge, no released Core has them. */
     *res = o;
     return 1;
 }
@@ -168,9 +189,79 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
     return 1;
 }
 
+/* sendrawtransaction: parse the raw-tx hex, stage it into the shared
+ * submission channel, and block on the download worker's verdict (mempool
+ * accept + relay to peers). Core rpc/rawtransaction.cpp: returns the txid on
+ * success; -22 on decode failure, -25 missing inputs, -26 policy/consensus
+ * reject (reason surfaced), -27 already known. Only meaningful inside the serve
+ * daemon (which has the worker + peer legs); the standalone bitcoin_rpcd has no
+ * worker, so g_status_rw is NULL and this reports the node as unavailable. */
+#define SRT_WAIT_MS   90000     /* worker pickup can wait behind a 60s leg sync */
+#define SRT_POLL_US   3000
+
+static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_STR){
+        *ec = -8; *em = "Invalid parameter, hexstring required"; return 0; }
+    const char* hex = params->items[0]->str;
+    size_t hl = strlen(hex);
+    if ((hl & 1) || hl/2 == 0 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
+    unsigned long n = (unsigned long)(hl/2);
+    static unsigned char stage[RPC_TXSUBMIT_MAX];   /* under g_submit_lock */
+    static char          txidhex[65];
+    static char          reason[128];
+
+    if (!g_status_rw){ *ec = -4; *em = "Transaction relay unavailable (no download worker)"; return 0; }
+
+    pthread_mutex_lock(&g_submit_lock);
+    int okhex = 1;
+    for (unsigned long i=0;i<n;i++){ int hi=srt_hex1(hex[i*2]),lo=srt_hex1(hex[i*2+1]); if(hi<0||lo<0){okhex=0;break;} stage[i]=(unsigned char)((hi<<4)|lo); }
+    if (!okhex){ pthread_mutex_unlock(&g_submit_lock); *ec=-22; *em="TX decode failed"; return 0; }
+
+    /* txid for the success result (display order) */
+    { unsigned char id[32]; static unsigned char scratch[2000*81+8];
+      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ pthread_mutex_unlock(&g_submit_lock); *ec=-22; *em="TX decode failed"; return 0; }
+      static const char* HEXD = "0123456789abcdef";
+      for (int i=0;i<32;i++){ unsigned char b=id[31-i]; txidhex[i*2]=HEXD[b>>4]; txidhex[i*2+1]=HEXD[b&15]; }
+      txidhex[64]=0; }
+
+    /* stage into shared memory: buffer + len published BEFORE the seq bump */
+    node_status_t* s = g_status_rw;
+    memcpy((void*)s->tx_submit_buf, stage, n);
+    s->tx_submit_len = n;
+    s->tx_submit_result = 0;
+    s->tx_submit_reason[0] = 0;
+    unsigned long long myseq = s->tx_submit_seq + 1;
+    __sync_synchronize();
+    s->tx_submit_seq = myseq;                        /* worker wakes on this */
+
+    /* wait for the worker to ack this exact seq */
+    int waited = 0, done = 0, result = 0;
+    reason[0] = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (s->tx_submit_ack == myseq){
+            result = s->tx_submit_result;
+            memcpy(reason, (const void*)s->tx_submit_reason, sizeof reason);
+            reason[sizeof reason-1]=0;
+            done = 1; break;
+        }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    pthread_mutex_unlock(&g_submit_lock);
+
+    if (!done){ *ec=-4; *em="Transaction submission timed out"; return 0; }
+    if (result == 1){ *res = rj_str(txidhex); return 1; }
+    /* worker put a negative Core error code in result and the reason text */
+    static char embuf[160];
+    snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "transaction rejected");
+    *ec = result < 0 ? result : -26; *em = embuf;
+    return 0;
+}
+
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getmempoolinfo", "getrawmempool", NULL
+    "getmempoolinfo", "getrawmempool", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -183,5 +274,6 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
+    if (!strcmp(m, "sendrawtransaction")) return cmd_sendrawtransaction(params, res, ec, em);
     return -1;
 }

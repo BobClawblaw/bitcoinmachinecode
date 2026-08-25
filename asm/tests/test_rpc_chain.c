@@ -204,8 +204,15 @@ int main(void){
     build_archive();
     rpc_chain_set_stop_handler(on_stop);
 
-    /* ---- before open: chain methods report warmup, others untouched ---- */
+    /* ---- before open: chain methods report warmup, but PURE util methods
+     * (decodescript/createmultisig/getdescriptorinfo) work without the chain
+     * open, matching Core -- they need no chain state. ---- */
     expect_err("getblockcount before open -> -28", "getblockcount", "[]", -28, "Loading block index...");
+    { long bec; const char* bem;
+      rj_val* rr = call("decodescript", "[\"76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac\"]", &bec, &bem);
+      ck("decodescript works before chain open (not -28)", rr && rr->typ==RJ_OBJ && S(rr,"type")); rj_free(rr);
+      rr = call("getdescriptorinfo", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]", &bec, &bem);
+      ck("getdescriptorinfo works before chain open", rr && rr->typ==RJ_OBJ && S(rr,"checksum")); rj_free(rr); }
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
     expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
@@ -318,11 +325,26 @@ int main(void){
       ck_str("blk3 v1 tx[1] == legacy spend txid", tx && tx->nitems > 1 ? tx->items[1]->str : NULL, g_tx1_txid);
       ck_str("blk3 v1 tx[2] == segwit spend txid", tx && tx->nitems > 2 ? tx->items[2]->str : NULL, g_tx2_txid);
       rj_free(r);
+      /* Write undo_3.dat so getblock v2 can compute fees from spent prevout
+       * values (block 3 is height 3). Two spends, in block order:
+       *   tx[1] legacy_spend: 1 input worth 50.0 BTC  -> fee 0.01 (out 49.99)
+       *   tx[2] segwit_spend: 1 input worth 49.99 BTC -> fee 49.98999 (out 1000 sat)
+       * Record: txid[32] idx(u32) value(u64@36) height(u32) is_coinbase(u8@48) slen(u16@49) */
+      { unsigned char rec[102]; memset(rec, 0, sizeof rec);
+        put_u64(rec+36, 5000000000ULL);      /* record 0 value */
+        put_u64(rec+51+36, 4999000000ULL);   /* record 1 value */
+        FILE* uf = fopen("undo_3.dat", "wb");
+        ck("undo_3.dat opened", uf != NULL);
+        if (uf){ fwrite(rec, 1, 102, uf); fclose(uf); }
+      }
       snprintf(p, sizeof p, "[\"%s\", 2]", g_hash[3]);
       r = call("getblock", p, &ec, &em);
       tx = G(r,"tx");
       rj_val* t1 = tx && tx->nitems > 1 ? tx->items[1] : NULL;
       rj_val* t2 = tx && tx->nitems > 2 ? tx->items[2] : NULL;
+      ck("v2 coinbase tx[0] has no fee (Core parity)", tx && tx->nitems ? G(tx->items[0],"fee") == NULL : 0);
+      ck_str("v2 tx[1].fee (0.01 from undo)", S(t1,"fee"), "0.01000000");
+      ck_str("v2 tx[2].fee (49.98999 from undo)", S(t2,"fee"), "49.98999000");
       ck_str("v2 tx[1].txid == v1 txid", S(t1,"txid"), g_tx1_txid);
       ck_str("v2 tx[2].txid == v1 txid", S(t2,"txid"), g_tx2_txid);
       ck_str("v2 tx[2].hash == wtxid (!= txid)", S(t2,"hash"), g_tx2_wtxid);
@@ -356,6 +378,83 @@ int main(void){
       rj_free(r);
     }
     expect_err("getblock unknown hash", "getblock", "[\"0000000000000000000000000000000000000000000000000000000000000001\"]", -5, "Block not found");
+
+    /* ---- getdescriptorinfo / deriveaddresses (descriptor engine) ----
+     * Ground truth captured from bitcoin-cli getdescriptorinfo/deriveaddresses
+     * on the BIP32 test-vector-1 master xpub (seed 000102..0f). */
+    {
+      const char* XP = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+      char p[400];
+      /* getdescriptorinfo: canonical descriptor, checksum, flags */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)\"]", XP);
+      r = call("getdescriptorinfo", p, &ec, &em);
+      ck_str("gdi checksum", S(r,"checksum"), "wvk84d79");
+      { char want[420]; snprintf(want, sizeof want, "wpkh(%s/0/*)#wvk84d79", XP);
+        ck_str("gdi canonical descriptor", S(r,"descriptor"), want); }
+      ck_str("gdi isrange", S(r,"isrange"), "1");
+      ck_str("gdi issolvable", S(r,"issolvable"), "1");
+      ck_str("gdi hasprivatekeys", S(r,"hasprivatekeys"), "0");
+      rj_free(r);
+      /* bad checksum rejected with Core's exact message */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#00000000\"]", XP);
+      expect_err("gdi bad checksum", "getdescriptorinfo", p, -5,
+                 "Provided checksum '00000000' does not match computed checksum 'wvk84d79'");
+      /* invalid key rejected */
+      expect_err("gdi invalid key", "getdescriptorinfo", "[\"wpkh(notakey)\"]", -5, "key 'notakey' is not valid");
+
+      /* deriveaddresses: wpkh ranged [0,2] -> Core's addresses */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#wvk84d79\", [0,2]]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck("da wpkh returns 3 addrs", r && r->typ == RJ_ARR && r->nitems == 3);
+      ck_str("da wpkh [0]", r&&r->nitems>0?r->items[0]->str:NULL, "bc1qp5wfcq48h6d63wyy9qz0awtpfqwwv4sma86mhz");
+      ck_str("da wpkh [1]", r&&r->nitems>1?r->items[1]->str:NULL, "bc1qrfxr69jqnhwufxgkqgcdep9prq4j4vuw2wyg0v");
+      ck_str("da wpkh [2]", r&&r->nitems>2?r->items[2]->str:NULL, "bc1qhvd6suvqzjcu9pxjhrwhtrlj85ny3n2mqql5w4");
+      rj_free(r);
+      /* pkh ranged, single-int range 3 -> indices 0..3 (4 addresses) */
+      snprintf(p, sizeof p, "[\"pkh(%s/0/*)#xgqkr0nt\", 3]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck("da pkh single-int range -> 4 addrs", r && r->typ == RJ_ARR && r->nitems == 4);
+      ck_str("da pkh [0]", r&&r->nitems>0?r->items[0]->str:NULL, "12CL4K2eVqj7hQTix7dM7CVHCkpP17Pry3");
+      ck_str("da pkh [2]", r&&r->nitems>2?r->items[2]->str:NULL, "1J4LVanjHMu3JkXbVrahNuQCTGCRRgfWWx");
+      rj_free(r);
+      /* sh(wpkh) ranged [0,2] */
+      snprintf(p, sizeof p, "[\"sh(wpkh(%s/0/*))#knyhj9av\", [0,2]]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck_str("da sh(wpkh) [0]", r&&r->nitems>0?r->items[0]->str:NULL, "3AfyxhpBVVLmBR4ZYX2onGzRqjv5QZ7FqD");
+      ck_str("da sh(wpkh) [2]", r&&r->nitems>2?r->items[2]->str:NULL, "3EZQk4F8GURH5sqVMLTFisD17yNeKa7Dfs");
+      rj_free(r);
+      /* fixed non-ranged path -> single address, no range arg */
+      snprintf(p, sizeof p, "[\"wpkh(%s/44/5)#u9t23g20\"]", XP);
+      r = call("deriveaddresses", p, &ec, &em);
+      ck("da fixed -> 1 addr", r && r->typ == RJ_ARR && r->nitems == 1);
+      ck_str("da fixed [0]", r&&r->nitems>0?r->items[0]->str:NULL, "bc1q0k2xl6ppmegpnxl7qvday08x0fyhv2k22vdea9");
+      rj_free(r);
+      /* error parity: missing checksum, range mismatches, pk() has no address */
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)\", [0,1]]", XP);
+      expect_err("da missing checksum", "deriveaddresses", p, -5, "Missing checksum");
+      snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#wvk84d79\"]", XP);
+      expect_err("da ranged needs range", "deriveaddresses", p, -8, "Range must be specified for a ranged descriptor");
+      snprintf(p, sizeof p, "[\"wpkh(%s/44/5)#u9t23g20\", [0,1]]", XP);
+      expect_err("da unranged rejects range", "deriveaddresses", p, -8, "Range should not be specified for an un-ranged descriptor");
+      expect_err("da pk has no address", "deriveaddresses",
+                 "[\"pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7\"]",
+                 -5, "Descriptor does not have a corresponding address");
+
+      /* addr()/raw() descriptors (audit gap, incident-#44 pattern) -- verified
+       * vs oracle: getdescriptorinfo issolvable=false, deriveaddresses returns
+       * the address itself. */
+      r = call("getdescriptorinfo", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]", &ec, &em);
+      ck_str("gdi addr() checksum", S(r,"checksum"), "gxt8zcpx");
+      ck_str("gdi addr() issolvable=false", S(r,"issolvable"), "0");
+      ck_str("gdi addr() isrange=false", S(r,"isrange"), "0");
+      rj_free(r);
+      r = call("deriveaddresses", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)#gxt8zcpx\"]", &ec, &em);
+      ck_str("da addr() returns the address", r&&r->typ==RJ_ARR&&r->nitems?r->items[0]->str:NULL, "1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9");
+      rj_free(r);
+      r = call("getdescriptorinfo", "[\"raw(76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac)\"]", &ec, &em);
+      ck("gdi raw() issolvable=false", S(r,"issolvable") && !strcmp(S(r,"issolvable"),"0"));
+      rj_free(r);
+    }
 
     /* ---- getblockchaininfo ---- */
     r = call("getblockchaininfo", "[]", &ec, &em);
@@ -539,6 +638,63 @@ int main(void){
         snprintf(p, sizeof p, "[1, [\"%s\"], \"bech32m\"]", K1);
         expect_err("cms bech32m rejected", "createmultisig", p, -5, "createmultisig cannot create bech32m multisig addresses");
         expect_err("cms invalid key", "createmultisig", "[1, [\"deadbeef\"]]", -5, "Invalid public key: deadbeef");
+    }
+
+    /* ---- getblockstats (block-only fields; the synthetic archive has no undo,
+     * so fee/feerate/utxo_size_inc keys are omitted -- as against a pruned node).
+     * The full field set is oracle-verified live; here we regression the
+     * block-only computation on synthetic block 3 (segwit cb + legacy spend +
+     * segwit spend). ins=2, outs=3, total_out=4999000000+1000, subsidy=50 BTC. */
+    { char p[128];
+      snprintf(p, sizeof p, "[%d]", 3);
+      r = call("getblockstats", p, &ec, &em);
+      ck_str("gbs height", S(r,"height"), "3");
+      ck_str("gbs txs", S(r,"txs"), "3");
+      ck_str("gbs ins (non-coinbase)", S(r,"ins"), "2");
+      ck_str("gbs outs", S(r,"outs"), "3");
+      ck_str("gbs total_out (non-coinbase)", S(r,"total_out"), "4999001000");
+      ck_str("gbs subsidy @ h3", S(r,"subsidy"), "5000000000");
+      ck_str("gbs utxo_increase = outs-ins", S(r,"utxo_increase"), "1");
+      ck_str("gbs swtxs (segwit spend only)", S(r,"swtxs"), "1");
+      ck_str("gbs blockhash", S(r,"blockhash"), g_hash[3]);
+      /* undo_3.dat (written by the fee test above) is present, so the fee fields
+       * ARE computed: prevout values 5000000000, 4999000000 vs outputs
+       * 4999000000, 1000 -> fees 1000000 and 4998999000. */
+      ck_str("gbs totalfee", S(r,"totalfee"), "4999999000");
+      ck_str("gbs maxfee", S(r,"maxfee"), "4998999000");
+      ck_str("gbs minfee", S(r,"minfee"), "1000000");
+      ck_str("gbs avgfee = totalfee/(txs-1)", S(r,"avgfee"), "2499999500");
+      ck("gbs feerate_percentiles present (undo available)", G(r,"feerate_percentiles") != NULL);
+      rj_free(r);
+      /* by blockhash must equal by height */
+      snprintf(p, sizeof p, "[\"%s\"]", g_hash[3]);
+      rj_val* r2 = call("getblockstats", p, &ec, &em);
+      ck_str("gbs by-hash height matches", S(r2,"height"), "3");
+      ck_str("gbs by-hash total_out matches", S(r2,"total_out"), "4999001000");
+      rj_free(r2);
+      expect_err("gbs height out of range", "getblockstats", "[999]", -8, "Target block height out of range");
+    }
+
+    /* ---- getnetworkhashps / getmininginfo (chainwork from the header fallback,
+     * which is block_work-correct). Exact values are oracle-verified live; here
+     * we regress the plumbing, error parity, and getmininginfo shape. ---- */
+    {
+      r = call("getnetworkhashps", "[]", &ec, &em);
+      ck("getnetworkhashps returns a positive number", r && r->typ == RJ_NUM && atof(r->str) > 0.0); rj_free(r);
+      r = call("getnetworkhashps", "[120,3]", &ec, &em);
+      ck("getnetworkhashps by height returns a number", r && r->typ == RJ_NUM); rj_free(r);
+      expect_err("gnh nblocks=0 rejected", "getnetworkhashps", "[0]", -8, "Invalid nblocks. Must be a positive number or -1.");
+      expect_err("gnh height out of range", "getnetworkhashps", "[120, 999]", -8, "Block does not exist at specified height");
+
+      r = call("getmininginfo", "[]", &ec, &em);
+      ck_str("mininginfo.blocks", S(r,"blocks"), "3");
+      ck_str("mininginfo.chain", S(r,"chain"), "main");
+      ck("mininginfo.bits present (8 hex)", S(r,"bits") && strlen(S(r,"bits")) == 8);
+      ck("mininginfo.difficulty present", G(r,"difficulty") != NULL);
+      ck("mininginfo.networkhashps present", G(r,"networkhashps") != NULL);
+      ck_str("mininginfo.pooledtx", S(r,"pooledtx"), "0");
+      ck("mininginfo.warnings is an array", G(r,"warnings") && G(r,"warnings")->typ == RJ_ARR);
+      rj_free(r);
     }
 
     /* ---- uptime / stop ---- */

@@ -2099,6 +2099,33 @@ static long dl_catchup(const char* dir, int min_workers){
 static long      utxo_fail_streak  = 0;
 static long long utxo_retry_at_ms  = 0;
 
+/* ---- sendrawtransaction submission channel (worker side) ------------------
+ * The RPC parent stages a raw tx into g_node_status->tx_submit_* and bumps
+ * tx_submit_seq; the worker picks it up at the top of its loop (see below),
+ * validates + mempool-accepts + relays it to its peer legs, and acks. The
+ * mempool + UTXO snapshot are lazy-initialized on the first submission so the
+ * one-time utxo_lsm_reload cost is never paid during normal sync. */
+extern int  tx_dispatch_init(void);
+extern int  tx_policy_init(void);
+extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
+extern int  txsub_accept_and_relay(void* mp_area, const unsigned char* tx, unsigned long len,
+                                   const int* peer_fds, int n_fds,
+                                   char* reason, unsigned long rcap, int* relayed_out);
+#define TXSUB_MP_SLOTS 1024
+static unsigned char txsub_mp_area[40 + TXSUB_MP_SLOTS*48 + 8];
+static unsigned char txsub_mp_blob[2u<<20];
+static int           txsub_ready = 0;   /* 0 uninit, 1 ready, -1 init failed */
+static unsigned long long txsub_last_seq = 0;
+
+/* Lazy one-time init of the worker's tx-accept path. Returns 1 ready, 0 not. */
+static int txsub_worker_ready(void){
+    if (txsub_ready) return txsub_ready == 1;
+    if (!tx_dispatch_init() || !tx_policy_init()){ txsub_ready = -1; return 0; }
+    mpool_init(txsub_mp_area, TXSUB_MP_SLOTS, txsub_mp_blob, sizeof txsub_mp_blob);
+    txsub_ready = 1;
+    return 1;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -2380,8 +2407,59 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
             g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
-            for(int i=0;i<RPC_MAX_PEERS;i++)                        /* retire dead slots */
-                if(!(i < mux_n_out && mux_out_fd[i] >= 0)) g_node_status->peers[i].used = 0; }
+            long long nows = (long long)time(NULL);
+            for(int i=0;i<RPC_MAX_PEERS;i++){
+                if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
+                /* per-socket byte + last-activity meters from the kernel: no
+                 * asm changes, no double counting -- TCP_INFO is authoritative
+                 * (getpeerinfo bytessent/bytesrecv/lastsend/lastrecv). The
+                 * kernel struct is read by offset into a local mirror of its
+                 * stable uapi layout, so this does not depend on the glibc
+                 * header's tcp_info version (older ones lack the byte fields). */
+                struct bmc_tcp_info {
+                    unsigned char  _s[7];                 /* state..wscale/flags */
+                    unsigned int   rto, ato, snd_mss, rcv_mss;
+                    unsigned int   unacked, sacked, lost, retrans, fackets;
+                    unsigned int   last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
+                    unsigned int   pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss, reordering;
+                    unsigned int   rcv_rtt, rcv_space, total_retrans;
+                    unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+                } ti;
+                socklen_t tl = sizeof ti;
+                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0){
+                    rpc_peer_t* pr = &g_node_status->peers[i];
+                    /* byte fields only if the kernel returned a struct large
+                     * enough to include them */
+                    if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
+                        pr->bytes_sent = (long long)ti.bytes_acked;
+                        pr->bytes_recv = (long long)ti.bytes_received;
+                    }
+                    if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
+                        pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
+                        pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
+                    }
+                }
+            } }
+        /* sendrawtransaction: pick up a staged submission from the RPC parent,
+         * validate + mempool-accept + relay to peer legs, then ack the seq. */
+        if(g_node_status && g_node_status->tx_submit_seq != txsub_last_seq){
+            txsub_last_seq = g_node_status->tx_submit_seq;
+            int result; char reason[128]; reason[0]=0;
+            if(txsub_worker_ready()){
+                unsigned long tlen = g_node_status->tx_submit_len;
+                if(tlen==0 || tlen>RPC_TXSUBMIT_MAX){ result=-22; snprintf(reason,sizeof reason,"TX decode failed"); }
+                else { int relayed=0;
+                    result = txsub_accept_and_relay(txsub_mp_area,
+                                 (const unsigned char*)g_node_status->tx_submit_buf, tlen,
+                                 mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
+                    if(result==1) fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs\n", relayed, mux_n_out);
+                }
+            } else { result=-4; snprintf(reason,sizeof reason,"mempool init failed"); }
+            snprintf((char*)g_node_status->tx_submit_reason, sizeof g_node_status->tx_submit_reason, "%s", reason);
+            g_node_status->tx_submit_result = result;
+            __sync_synchronize();
+            g_node_status->tx_submit_ack = txsub_last_seq;
+        }
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
@@ -2690,7 +2768,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         fprintf(stderr, "[rpc] block archive opened (chain RPCs live)\n");
     else
         fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
-    rpc_node_set_status(g_node_status);
+    rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){

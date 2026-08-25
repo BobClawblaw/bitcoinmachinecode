@@ -548,6 +548,35 @@ built as part of the same AI-authored assembly / C-verified work as the node:
   proves the production path end-to-end — forks+execs the REAL `bitcoin_rpcd`
   and drives it with the REAL `bitcoin_cli` plus raw sockets — 23 checks
   byte-exact. Together the client and server close the RPC-transport OPEN item.
+- **Read-side + util + live-node RPC surface at Core parity** (2026-08-24/25) —
+  the blockchain-query layer (`asm/rpc_chain.c`) and a live-node layer
+  (`asm/rpc_node.c`) verified BYTE-FOR-BYTE against a scratch Bitcoin Core
+  oracle by differential harnesses in `validation/`. Added, each proven
+  identical to Core (divergences documented, not fudged): `getdifficulty`;
+  `gettxoutproof`/`verifytxoutproof` (BIP37 partial merkle tree — proofs are
+  byte-identical and each node verifies the other's); `decodescript` (incl. the
+  inferred `desc` — Core's `InferDescriptor` no-keystore rules); `createmultisig`
+  (incl. the descriptor with Core's 8-char checksum); `validateaddress`
+  (fixing three field bugs the differential caught: a garbage P2WSH
+  `witness_program`, `P2TR isscript=false`, a stray `ischange`); and `desc` on
+  `getblock`/`getrawtransaction` scriptPubKey output. **The RPC server is now
+  embedded in the serve daemon** (`daemon/main.c`), bridging its fork model with
+  a `MAP_SHARED` status region the download worker publishes into, so the
+  live-node RPCs `getconnectioncount`, `getnetworkinfo`, `getpeerinfo` (real
+  peer addr/version/subver/services, plus per-socket byte/last-activity meters
+  from the kernel's `TCP_INFO`), `getmempoolinfo`, `getrawmempool` and
+  `getchaintips` answer from a running node — verified live in production. A
+  **descriptor engine** (`asm/bip32_ckdpub.c`) adds `getdescriptorinfo` and
+  `deriveaddresses` — BIP32 public derivation (CKDpub over the verified secp/
+  hmac asm) building `pkh`/`wpkh`/`sh(wpkh)` addresses, verified byte-for-byte
+  against Core's own `deriveaddresses`. `getblock` verbosity 2 now also emits a
+  per-tx `fee` where undo data exists. **`sendrawtransaction`** is wired through
+  the fork model: the RPC parent stages the raw tx into the `MAP_SHARED` region
+  and the download worker (which owns the peer legs) validates + mempool-accepts
+  it and relays it to peers — the plumbing is unit-tested over a socketpair
+  (`tests/test_tx_submit.c`); the live peer-relay proof lands once the UTXO
+  rebuild completes (a real tx can't validate against a partial UTXO set). Still
+  absent: wallet and mining RPCs.
 - **Live-wire end-to-end sighash spend** (`tests/test_e2e_sighash.c`) — the
   full wallet->validator path exercised as ONE integrated test across a real
   process boundary, not isolated pre-generated vectors: it builds a genuine

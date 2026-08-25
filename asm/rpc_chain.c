@@ -82,6 +82,8 @@ extern void sha256d(u8 out[32], const void* data, unsigned long len);
 extern void block_work(u8 work[16], unsigned bits);
 extern void chainwork_add(u8 out[16], const u8 a[16], const u8 b[16]);
 extern int  wallet_script_to_address(char* out, long cap, const u8* script, long slen);
+extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version,
+                                    unsigned char h160[20], unsigned char prog32[32]);
 extern void hash160(u8 out[20], const void* in, long long len);
 extern void sha256_full(u8 out[32], const void* msg, long long len);
 
@@ -554,7 +556,56 @@ static rj_val* script_pubkey_json_x(const u8* s, size_t n, int want_desc){
 /* ---- TxToUniv (core_io.cpp), include_hex=true, no undo data ---- */
 static rj_val* amount_json(u64 sats){ return rj_numf("%llu.%08llu", sats / 100000000ULL, sats % 100000000ULL); }
 
-static rj_val* tx_to_json(const u8* tx, const txw_t* w){
+/* Read the per-input prevout VALUES from undo_<h>.dat, in block order (all
+ * non-coinbase inputs, tx-by-tx). Lets getblock v2 report per-tx fees without
+ * a UTXO lookup. Record layout (daemon/undo_log.c): txid[32] index(4)
+ * value(8) height(4) is_coinbase(1) script_len(2) script[len] -- 51-byte
+ * header + script. Returns count, or -1 if the file is absent/pruned (Core
+ * always has undo; we keep only a window, so fees are recent-blocks-only). */
+static long undo_block_values(long h, u64* out, long cap){
+    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
+    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
+    long got = 0, off = 0; ssize_t rd;
+    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
+    close(fd);
+    if (got != sb.st_size){ free(buf); return -1; }
+    long n = 0;
+    while (off + 51 <= sb.st_size && n < cap){
+        out[n++] = rd64(buf + off + 36);            /* value at offset 36 */
+        u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
+        off += 51 + (long)slen;
+    }
+    free(buf);
+    return (off == sb.st_size) ? n : -1;            /* trailing garbage -> unusable */
+}
+
+/* Like undo_block_values but also returns each spent prevout's script length
+ * (for getblockstats' utxo_size_inc). Fills vals[] and slens[] in block order;
+ * returns count or -1 (absent/pruned/garbage). */
+static long undo_block_prevouts(long h, u64* vals, u32* slens, long cap){
+    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
+    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
+    long got = 0, off = 0; ssize_t rd;
+    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
+    close(fd);
+    if (got != sb.st_size){ free(buf); return -1; }
+    long n = 0;
+    while (off + 51 <= sb.st_size && n < cap){
+        u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
+        vals[n] = rd64(buf + off + 36);
+        slens[n] = slen;
+        n++;
+        off += 51 + (long)slen;
+    }
+    free(buf);
+    return (off == sb.st_size) ? n : -1;
+}
+
+static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
     rj_val* o = rj_obj();
     u8 txid[32], wtxid[32]; char hx[65];
     u8* scratch = malloc(w->len ? w->len : 1);
@@ -610,8 +661,9 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w){
 
     p = w->vout; read_varint(p, tx + w->len, &c); p += c;
     rj_val* vout = rj_arr();
+    u64 out_total = 0;
     for (u64 i = 0; i < w->n_out; i++){
-        u64 val = rd64(p); p += 8;
+        u64 val = rd64(p); p += 8; out_total += val;
         u64 sl = read_varint(p, tx + w->len, &c); p += c;
         rj_val* out = rj_obj();
         rj_obj_set(out, "value", amount_json(val));
@@ -621,6 +673,11 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w){
         rj_arr_push(vout, out);
     }
     rj_obj_set(o, "vout", vout);
+    /* fee = sum(prevout values) - sum(output values), when the caller supplied
+     * the input total from the block's undo data (getblock v2). in_total < 0
+     * means "not available" (coinbase, or undo file pruned/absent). */
+    if (in_total >= 0 && (u64)in_total >= out_total)
+        rj_obj_set(o, "fee", amount_json((u64)in_total - out_total));
     char* h = malloc(w->len*2 + 1); if (h){ hex_of(h, tx, w->len); rj_obj_set(o, "hex", rj_str(h)); free(h); }
     return o;
 }
@@ -686,6 +743,67 @@ static int cmd_getdifficulty(rj_val** res, long* ec, const char** em){
     *res = rj_double(difficulty_of(bits));   /* Core: difficulty of the current tip */
     return 1;
 }
+
+/* getnetworkhashps (Core rpc/mining.cpp GetNetworkHashPS): estimated network
+ * hashes/sec from the cumulative-work delta over a window of `nblocks` blocks
+ * ending at `height` (defaults 120, tip). Computed from chainwork.dat + header
+ * timestamps -- no UTXO dependency, so verifiable now. arith_uint256.getdouble()
+ * replicated word-by-word (high 32-bit word first). */
+static double gnh_getdouble(const u8 w[16]){
+    double r=0; for (int i=3;i>=0;i--) r = r*4294967296.0 + (double)rd32(w+i*4); return r;
+}
+static int cmd_getnetworkhashps(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec=-28; *em="Loading block index..."; return 0; }
+    long nblocks=120, height=-1;
+    if (param_present(params,0)){ long long v; if(!rpc_param_i64(params,0,&v,ec,em)) return 0; nblocks=(long)v; }
+    if (param_present(params,1)){ long long v; if(!rpc_param_i64(params,1,&v,ec,em)) return 0; height=(long)v; }
+    if (nblocks < -1 || nblocks == 0){ *ec=-8; *em="Invalid nblocks. Must be a positive number or -1."; return 0; }
+    if (height < -1 || height > tip){ *ec=-8; *em="Block does not exist at specified height"; return 0; }
+    long pbh = (height>=0) ? height : tip;
+    if (pbh == 0){ *res=rj_numf("%d",0); return 1; }
+    if (nblocks == -1) nblocks = pbh % 2016 + 1;
+    if (nblocks > pbh) nblocks = pbh;
+    u8 hdr[80];
+    if (read_block_prefix(pbh, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+    long mn=(long)rd32(hdr+68), mx=mn, pb0=pbh;
+    for (long i=0;i<nblocks;i++){ pb0--;
+        if (read_block_prefix(pb0, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+        long t=(long)rd32(hdr+68); if(t<mn)mn=t; if(t>mx)mx=t; }
+    if (mn==mx){ *res=rj_numf("%d",0); return 1; }
+    u8 cw1[16], cw0[16];
+    if (!chainwork_at(pbh,cw1) || !chainwork_at(pb0,cw0)){ *ec=-1; *em="Chainwork not available"; return 0; }
+    u8 wd[16]; int borrow=0;
+    for (int i=0;i<16;i++){ int d=(int)cw1[i]-(int)cw0[i]-borrow; if(d<0){d+=256;borrow=1;}else borrow=0; wd[i]=(u8)d; }
+    *res = rj_double(gnh_getdouble(wd) / (double)(mx-mn));
+    return 1;
+}
+
+/* getmininginfo (Core rpc/mining.cpp): the documented v31 field set -- blocks,
+ * bits, difficulty, networkhashps, pooledtx, chain, warnings. The master oracle
+ * adds bleeding-edge fields (target, next, blockmintxfee) the project policy
+ * does not chase; the shared fields are oracle-verifiable. pooledtx reflects
+ * THIS process's mempool (0 for the read-only rpcd / listen=0 node, as
+ * getmempoolinfo). */
+static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec=-28; *em="Loading block index..."; return 0; }
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1){ *ec=-1; *em="Block not available"; return 0; }
+    u32 bits = rd32(hdr+72);
+    rj_val* o = rj_obj();
+    rj_obj_set(o,"blocks", rj_numf("%ld", tip));
+    { char b[9]; snprintf(b,sizeof b,"%08x",(unsigned)bits); rj_obj_set(o,"bits", rj_str(b)); }
+    rj_obj_set(o,"difficulty", rj_double(difficulty_of(bits)));
+    { rj_val* nh=NULL; long e2; const char* m2;
+      if (cmd_getnetworkhashps(NULL,&nh,&e2,&m2)) rj_obj_set(o,"networkhashps", nh);
+      else rj_obj_set(o,"networkhashps", rj_numf("%d",0)); }
+    rj_obj_set(o,"pooledtx", rj_numf("%d", 0));
+    rj_obj_set(o,"chain", rj_str("main"));
+    rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
+    *res = o;
+    return 1;
+}
+
 static int cmd_getbestblockhash(rj_val** res, long* ec, const char** em){
     long tip = refresh();
     u8 rec[48];
@@ -754,6 +872,11 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     size_t stripped = 80 + c;
     rj_val* txs = rj_arr();
     rj_val* cb = NULL;
+    /* per-tx fees for verbosity 2: prevout values from the block's undo file
+     * (in block order, non-coinbase inputs). undo_n < 0 -> undo pruned/absent
+     * (fee omitted, honest -- we keep only a recent-heights window). */
+    static u64 undo_vals[600000]; long undo_n = -1, undo_cur = 0;
+    if (verbosity >= 2) undo_n = undo_block_values(h, undo_vals, (long)(sizeof undo_vals / sizeof undo_vals[0]));
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -1; *em = "Block decode failed"; return 0; }
@@ -776,7 +899,13 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
             if (scratch){ tx_txid(txid, p, w.len, scratch, w.len); free(scratch); } else memset(txid, 0, 32);
             hex_rev(hx, txid, 32); rj_arr_push(txs, rj_str(hx));
         } else {
-            rj_arr_push(txs, tx_to_json(p, &w));
+            long long in_total = -1;
+            if (i > 0 && undo_n >= 0 && undo_cur + (long)w.n_in <= undo_n){
+                in_total = 0;
+                for (u64 k = 0; k < w.n_in; k++) in_total += (long long)undo_vals[undo_cur + k];
+            }
+            if (i > 0 && undo_n >= 0) undo_cur += (long)w.n_in;   /* advance even if capped */
+            rj_arr_push(txs, tx_to_json(p, &w, in_total));
         }
         p += w.len;
     }
@@ -881,7 +1010,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
             }
             rj_val* o = rj_obj();
             rj_obj_set(o, "in_active_chain", rj_bool(1));
-            rj_val* t = tx_to_json(p, &w);
+            rj_val* t = tx_to_json(p, &w, -1);   /* verbosity 1: no fee (Core parity) */
             /* splice TxToUniv's members into our object to keep Core's order */
             for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }
             for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
@@ -1303,6 +1432,240 @@ static int desc_checksum(const char* span, char out[9]){
     return 1;
 }
 
+/* ---- descriptor engine: getdescriptorinfo + deriveaddresses ----------------
+ * Core rpc/output_script.cpp + descriptor.cpp. getdescriptorinfo parses a
+ * descriptor, validates its checksum, and reports isrange/issolvable/
+ * hasprivatekeys. deriveaddresses does BIP32 public derivation (CKDpub, in
+ * bip32_ckdpub.c, verified byte-for-byte against Core) and builds addresses.
+ *
+ * Supported key material: an xpub (mainnet) or a raw compressed/uncompressed
+ * pubkey. Supported output functions for address derivation: pkh, wpkh,
+ * sh(wpkh(...)). pk()/tr()/combo() parse and checksum in getdescriptorinfo but
+ * deriveaddresses reports them as not having a single corresponding address
+ * (pk) or as unsupported (tr/combo) rather than fabricating one. */
+extern int bip32_ckdpub_derive(const char* xpub, const unsigned* path, int n, u8 out[33]);
+extern int bip32_xpub_parse(const char* xpub, u8 pub33[33], u8 cc32[32]);
+extern int pubkey_parse(const u8* pub, unsigned long publen, u64 qx[4], u64 qy[4]);
+
+enum { DSC_PKH=0, DSC_WPKH=1, DSC_SHWPKH=2, DSC_PK=3, DSC_COMBO=4, DSC_TR=5, DSC_ADDR=6, DSC_RAW=7, DSC_UNK=-1 };
+typedef struct {
+    int  script;
+    char key[160];       /* xpub or hex pubkey; or the address text for addr() */
+    int  keytype;        /* 0 raw-pubkey, 1 xpub, 2 has-private, 3 addr, 4 raw, -1 bad */
+    unsigned path[32];
+    int  pathlen;        /* fixed components (before any '*') */
+    int  ranged;         /* trailing slash-star present */
+    int  hardened;       /* any hardened path element */
+    u8   rawpub[65];     /* decoded raw pubkey (keytype 0) */
+    int  rawlen;
+    u8   spk[520];       /* scriptPubKey for addr()/raw() */
+    int  spklen;
+} desc_t;
+
+/* Parse the descriptor core string (checksum already stripped) into d.
+ * Returns 1 on success; 0 with *ec / *em set on a parse/validation error. */
+static int desc_parse_core(const char* core, desc_t* d, long* ec, const char** em){
+    static char perr[192];
+    memset(d, 0, sizeof *d); d->keytype = -1;
+    size_t L = strlen(core);
+    const char* inner; size_t ilen;
+    if (!strncmp(core,"pkh(",4) && core[L-1]==')'){ d->script=DSC_PKH; inner=core+4; ilen=L-5; }
+    else if (!strncmp(core,"wpkh(",5) && core[L-1]==')'){ d->script=DSC_WPKH; inner=core+5; ilen=L-6; }
+    else if (!strncmp(core,"sh(wpkh(",8) && L>=10 && core[L-1]==')' && core[L-2]==')'){ d->script=DSC_SHWPKH; inner=core+8; ilen=L-10; }
+    else if (!strncmp(core,"pk(",3) && core[L-1]==')'){ d->script=DSC_PK; inner=core+3; ilen=L-4; }
+    else if (!strncmp(core,"combo(",6) && core[L-1]==')'){ d->script=DSC_COMBO; inner=core+6; ilen=L-7; }
+    else if (!strncmp(core,"tr(",3) && core[L-1]==')'){ d->script=DSC_TR; inner=core+3; ilen=L-4; }
+    else if (!strncmp(core,"addr(",5) && core[L-1]==')'){ d->script=DSC_ADDR; inner=core+5; ilen=L-6; }
+    else if (!strncmp(core,"raw(",4) && core[L-1]==')'){ d->script=DSC_RAW; inner=core+4; ilen=L-5; }
+    else { *ec=-5; *em="Invalid descriptor function"; return 0; }
+
+    /* addr()/raw(): the content is an address or a raw hex script, not a key. */
+    if (d->script==DSC_ADDR){
+        char a[160]; if (ilen>=sizeof a){ *ec=-5; *em="Address too long"; return 0; }
+        memcpy(a,inner,ilen); a[ilen]=0;
+        int type=0; unsigned char ver=0, h160[20], prog[32];
+        if (!wallet_validate_address(a,&type,&ver,h160,prog)){ snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0; }
+        int sl=0;
+        switch (type){
+            case 1: d->spk[0]=0x76;d->spk[1]=0xa9;d->spk[2]=0x14;memcpy(d->spk+3,h160,20);d->spk[23]=0x88;d->spk[24]=0xac;sl=25; break;  /* P2PKH */
+            case 2: d->spk[0]=0x00;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);sl=22; break;                                                 /* P2WPKH */
+            case 3: d->spk[0]=0xa9;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);d->spk[22]=0x87;sl=23; break;                                  /* P2SH */
+            case 4: d->spk[0]=0x00;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2WSH */
+            case 5: d->spk[0]=0x51;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2TR */
+            default: snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0;
+        }
+        d->spklen=sl; snprintf(d->key,sizeof d->key,"%s",a); d->keytype=3; return 1;
+    }
+    if (d->script==DSC_RAW){
+        if ((ilen&1) || ilen/2>520){ *ec=-5; *em="Raw script invalid"; return 0; }
+        d->spklen=(int)(ilen/2);
+        for (int i=0;i<d->spklen;i++){ int hi=hex1(inner[i*2]), lo=hex1(inner[i*2+1]); if(hi<0||lo<0){ *ec=-5; *em="Raw script must be hex"; return 0; } d->spk[i]=(u8)((hi<<4)|lo); }
+        d->keytype=4; return 1;
+    }
+
+    char key[256];
+    if (ilen >= sizeof key){ *ec=-5; *em="Descriptor too long"; return 0; }
+    memcpy(key, inner, ilen); key[ilen]=0;
+    char* p = key;
+    if (*p == '['){                                   /* skip [origin] */
+        char* rb = strchr(p, ']');
+        if (!rb){ *ec=-5; *em="key origin start '[' with no matching ']'"; return 0; }
+        p = rb + 1;
+    }
+    /* keybody up to first '/' */
+    char* slash = strchr(p, '/');
+    size_t kb = slash ? (size_t)(slash - p) : strlen(p);
+    if (kb == 0 || kb >= sizeof d->key){ *ec=-5; *em="Invalid key"; return 0; }
+    memcpy(d->key, p, kb); d->key[kb]=0;
+
+    if (!strncmp(d->key,"xpub",4)){
+        u8 pub[33], cc[32];
+        if (!bip32_xpub_parse(d->key, pub, cc)){
+            snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
+        d->keytype = 1;
+    } else if (!strncmp(d->key,"xprv",4) || !strncmp(d->key,"tprv",4) || !strncmp(d->key,"tpub",4)){
+        d->keytype = 2;                               /* recognized; derivation unsupported */
+    } else {                                          /* raw hex pubkey */
+        size_t hl = strlen(d->key); int ok = (hl==66||hl==130) && !(hl&1);
+        for (size_t i=0; ok && i<hl; i++) if (hex1(d->key[i])<0) ok=0;
+        if (ok){
+            d->rawlen = (int)(hl/2);
+            for (int i=0;i<d->rawlen;i++) d->rawpub[i]=(u8)((hex1(d->key[i*2])<<4)|hex1(d->key[i*2+1]));
+            u64 qx[4], qy[4];
+            if (!pubkey_parse(d->rawpub,(unsigned long)d->rawlen,qx,qy)){
+                snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
+            d->keytype = 0;
+        } else { snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
+    }
+    /* path components */
+    if (slash){
+        char* q = slash;
+        while (*q == '/'){
+            q++;
+            char comp[32]; int ci=0;
+            while (*q && *q!='/' && ci<31) comp[ci++]=*q++;
+            comp[ci]=0;
+            if (!strcmp(comp,"*")){ d->ranged=1; if (*q=='/'){ *ec=-5; *em="'*' must be the last path element"; return 0; } break; }
+            int hard=0; size_t cl=strlen(comp);
+            if (cl && (comp[cl-1]=='\''||comp[cl-1]=='h'||comp[cl-1]=='H')){ hard=1; comp[cl-1]=0; cl--; }
+            if (cl==0){ *ec=-5; *em="Invalid path element"; return 0; }
+            unsigned v=0; for (size_t i=0;i<cl;i++){ if(comp[i]<'0'||comp[i]>'9'){ *ec=-5; *em="Invalid path element"; return 0; } v=v*10+(unsigned)(comp[i]-'0'); }
+            if (d->pathlen>=32){ *ec=-5; *em="Path too deep"; return 0; }
+            if (hard){ d->hardened=1; v|=0x80000000u; }
+            d->path[d->pathlen++]=v;
+        }
+    }
+    if (d->keytype==1 && d->hardened){ *ec=-5; *em="Cannot derive a hardened child from an xpub"; return 0; }
+    return 1;
+}
+
+/* build the address for a derived/raw compressed-or-uncompressed pubkey into
+ * out (>=128); returns 1 on success, 0 with *ec / *em on a no-address type. */
+static int desc_addr_for_pub(int script, const u8* pub, int publen, char* out, long cap, long* ec, const char** em){
+    u8 h[20]; hash160(h, pub, (long long)publen);
+    if (script==DSC_PKH){ u8 s[25]={0x76,0xa9,0x14}; memcpy(s+3,h,20); s[23]=0x88; s[24]=0xac; wallet_script_to_address(out,cap,s,25); return 1; }
+    if (script==DSC_WPKH){ if(publen!=33){ *ec=-5; *em="Uncompressed key not allowed for wpkh"; return 0; } u8 s[22]={0x00,0x14}; memcpy(s+2,h,20); wallet_script_to_address(out,cap,s,22); return 1; }
+    if (script==DSC_SHWPKH){ if(publen!=33){ *ec=-5; *em="Uncompressed key not allowed for wpkh"; return 0; } u8 rd[22]={0x00,0x14}; memcpy(rd+2,h,20); u8 rh[20]; hash160(rh,rd,22); u8 s[23]={0xa9,0x14}; memcpy(s+2,rh,20); s[22]=0x87; wallet_script_to_address(out,cap,s,23); return 1; }
+    if (script==DSC_PK){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
+    *ec=-5; *em="Descriptor derivation for this function is not supported"; return 0;
+}
+
+/* derive the compressed pubkey at range index `idx` (ignored when !ranged). */
+static int desc_pub_at(const desc_t* d, long idx, u8 pub[65], int* publen){
+    if (d->keytype==0){ memcpy(pub, d->rawpub, d->rawlen); *publen=d->rawlen; return 1; }
+    if (d->keytype==1){
+        unsigned path[33]; int n=d->pathlen;
+        for (int i=0;i<n;i++) path[i]=d->path[i];
+        if (d->ranged){ if (idx<0 || idx>0x7fffffffL) return 0; path[n++]=(unsigned)idx; }
+        u8 c[33]; if (!bip32_ckdpub_derive(d->key, path, n, c)) return 0;
+        memcpy(pub,c,33); *publen=33; return 1;
+    }
+    return 0;   /* keytype 2 (private) derivation unsupported */
+}
+
+static int cmd_getdescriptorinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* in = rpc_param_str(params, 0, ec, em); if (!in) return 0;
+    static char perr[192];
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
+    memcpy(core, in, cl); core[cl]=0;
+    char cks[9]; if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
+    if (hash){
+        const char* prov = hash+1;
+        if (strlen(prov)!=8 || strcmp(prov,cks)){
+            snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", prov, cks);
+            *ec=-5; *em=perr; return 0; }
+    }
+    desc_t d;
+    if (!desc_parse_core(core, &d, ec, em)) return 0;
+    char full[340]; snprintf(full,sizeof full,"%s#%s", core, cks);
+    rj_val* o = rj_obj();
+    rj_obj_set(o,"descriptor", rj_str(full));
+    rj_obj_set(o,"checksum", rj_str(cks));
+    rj_obj_set(o,"isrange", rj_bool(d.ranged));
+    rj_obj_set(o,"issolvable", rj_bool(d.script != DSC_RAW && d.script != DSC_ADDR));  /* addr()/raw() carry no key */
+    rj_obj_set(o,"hasprivatekeys", rj_bool(d.keytype==2));
+    *res = o;
+    return 1;
+}
+
+static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* in = rpc_param_str(params, 0, ec, em); if (!in) return 0;
+    static char perr[192];
+    const char* hash = strchr(in, '#');
+    if (!hash){ *ec=-5; *em="Missing checksum"; return 0; }
+    size_t cl = (size_t)(hash-in);
+    char core[320]; if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
+    memcpy(core, in, cl); core[cl]=0;
+    char cks[9]; if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
+    const char* prov = hash+1;
+    if (strlen(prov)!=8 || strcmp(prov,cks)){
+        snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", prov, cks);
+        *ec=-5; *em=perr; return 0; }
+    desc_t d;
+    if (!desc_parse_core(core, &d, ec, em)) return 0;
+
+    /* range argument (params[1]): int N -> [0,N]; [a,b] -> [a,b]; inclusive. */
+    long begin=0, end=0; int have_range=0;
+    if (params && params->typ==RJ_ARR && params->nitems>=2){
+        const rj_val* r = params->items[1];
+        if (r->typ==RJ_NUM){ have_range=1; begin=0; end=(long)strtoll(r->str,NULL,10); }
+        else if (r->typ==RJ_ARR && r->nitems==2 && r->items[0]->typ==RJ_NUM && r->items[1]->typ==RJ_NUM){
+            have_range=1; begin=(long)strtoll(r->items[0]->str,NULL,10); end=(long)strtoll(r->items[1]->str,NULL,10); }
+        else if (r->typ!=RJ_NULL){ *ec=-8; *em="Invalid range"; return 0; }
+    }
+    if (d.ranged && !have_range){ *ec=-8; *em="Range must be specified for a ranged descriptor"; return 0; }
+    if (!d.ranged && have_range){ *ec=-8; *em="Range should not be specified for an un-ranged descriptor"; return 0; }
+    if (have_range){
+        if (begin<0 || end<0){ *ec=-8; *em="Range should be greater or equal than 0"; return 0; }
+        if (end<begin){ *ec=-8; *em="Range specified as [begin,end] must not have begin after end"; return 0; }
+        if (end-begin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
+    }
+    if (d.keytype==2){ *ec=-5; *em="Address derivation from extended private keys is not supported"; return 0; }
+
+    /* addr()/raw(): the address is the descriptor's own script's address. */
+    if (d.script==DSC_ADDR || d.script==DSC_RAW){
+        char addr[128]; addr[0]=0;
+        if (wallet_script_to_address(addr, sizeof addr, d.spk, d.spklen) <= 0 || !addr[0]){
+            *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
+        rj_val* arr = rj_arr(); rj_arr_push(arr, rj_str(addr));
+        *res = arr; return 1;
+    }
+
+    rj_val* arr = rj_arr();
+    long lo = d.ranged?begin:0, hi = d.ranged?end:0;
+    for (long i=lo; i<=hi; i++){
+        u8 pub[65]; int pl=0;
+        if (!desc_pub_at(&d, i, pub, &pl)){ rj_free(arr); *ec=-5; *em="Key derivation failed"; return 0; }
+        char addr[128]; addr[0]=0;
+        if (!desc_addr_for_pub(d.script, pub, pl, addr, sizeof addr, ec, em)){ rj_free(arr); return 0; }
+        rj_arr_push(arr, rj_str(addr));
+    }
+    *res = arr;
+    return 1;
+}
+
 static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
     long long req;
     if (!rpc_param_i64(params, 0, &req, ec, em)) return 0;
@@ -1423,19 +1786,187 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
     return 1;
 }
 
+/* ---- getblockstats (Core rpc/blockchain.cpp) -------------------------------
+ * Per-block statistics. Block-only fields (sizes/weights/counts/subsidy/times/
+ * total_out/utxo_increase) are computed from block data and match Core exactly.
+ * The fee/feerate fields and utxo_size_inc{,_actual} need the block's spent
+ * prevout values+sizes (undo data); where undo is unavailable (our recent
+ * window only) those keys are OMITTED -- an honest divergence from a full node
+ * (which would error on a pruned block), consistent with getblock's fee
+ * omission. Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
+static u64 gbs_subsidy(long h){ long era=h/210000; if (era>=64) return 0; return 5000000000ULL >> era; }
+static long gbs_cs(u64 n){ if (n<253) return 1; if (n<=0xffff) return 3; if (n<=0xffffffffULL) return 5; return 9; }
+static int gbs_unspendable(const u8* s, u64 len){ return (len>0 && s[0]==0x6a) || len>10000; }
+static int gbs_cmp_u64(const void* a, const void* b){ u64 x=*(const u64*)a, y=*(const u64*)b; return (x<y)?-1:(x>y)?1:0; }
+typedef struct { long long fr, wt; } gbs_frp;
+static int gbs_cmp_frp(const void* a, const void* b){ long long x=((const gbs_frp*)a)->fr, y=((const gbs_frp*)b)->fr; return (x<y)?-1:(x>y)?1:0; }
+static long long gbs_median(u64* a, long n){ if (n==0) return 0; qsort(a,(size_t)n,sizeof(u64),gbs_cmp_u64); if (n%2==0) return (long long)((a[n/2-1]+a[n/2])/2); return (long long)a[n/2]; }
+
+static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh(); long h;
+    const rj_val* a0 = (params && params->typ==RJ_ARR && params->nitems>=1) ? params->items[0] : NULL;
+    if (a0 && a0->typ==RJ_NUM){            /* height form */
+        h = strtol(a0->str,0,10);
+        if (h < 0 || h > tip){ *ec=-8; *em="Target block height out of range"; return 0; }
+    } else {                                /* blockhash form */
+        if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    }
+    long len = read_block(h);
+    if (len < 0){ *ec=-1; *em="Block not available"; return 0; }
+    const u8* blk=g_blockbuf; const u8* end=blk+len;
+    u64 c; u64 ntx=read_varint(blk+80, end, &c);
+    const u8* p = blk+80+c;
+
+    static u64 uvals[600000]; static u32 uslens[600000];
+    long undo_n = undo_block_prevouts(h, uvals, uslens, 600000);
+    int have_undo = (undo_n >= 0); long undo_cur = 0;
+
+    long long inputs=0, outputs=0, total_out=0, total_size=0, total_weight=0;
+    long long swtotal_size=0, swtotal_weight=0, swtxs=0;
+    long long maxtxsize=0, mintxsize=0; int have_txsz=0;
+    long long utxos=0, utxo_size_inc=0, utxo_size_inc_actual=0;
+    long long maxfee=0, minfee=0, totalfee=0, maxfeerate=0, minfeerate=0; int have_fee=0;
+    static u64 txsize_arr[600000]; long txsize_n=0;
+    static u64 fee_arr[600000]; long fee_n=0;
+    static gbs_frp frp[600000]; long frp_n=0;
+
+    for (u64 i=0;i<ntx;i++){
+        txw_t w;
+        if (!tx_walk(p, end, &w)){ *ec=-1; *em="Block decode failed"; return 0; }
+        int coinbase=(i==0);
+        const u8* op=w.vout; u64 ccx; read_varint(op, end, &ccx); op += ccx;   /* skip vout count varint */
+        u64 tx_total_out=0;
+        for (u64 j=0;j<w.n_out;j++){
+            u64 val=rd64(op); op+=8; u64 cc2; u64 sl=read_varint(op,end,&cc2); const u8* spk=op+cc2; op+=cc2+sl;
+            tx_total_out += val;
+            long out_size = 8 + gbs_cs(sl) + (long)sl + 40;
+            outputs++; utxo_size_inc += out_size;
+            if (h==0) continue;
+            if (gbs_unspendable(spk, sl)) continue;
+            utxos++; utxo_size_inc_actual += out_size;
+        }
+        if (coinbase){ p += w.len; continue; }
+        inputs += (long long)w.n_in;
+        total_out += (long long)tx_total_out;
+        long long tx_size=(long long)w.len, weight=3*(long long)w.stripped+(long long)w.len;
+        txsize_arr[txsize_n++]=(u64)tx_size;
+        if (!have_txsz){ maxtxsize=mintxsize=tx_size; have_txsz=1; } else { if(tx_size>maxtxsize)maxtxsize=tx_size; if(tx_size<mintxsize)mintxsize=tx_size; }
+        total_size += tx_size; total_weight += weight;
+        if (w.segwit){ swtxs++; swtotal_size+=tx_size; swtotal_weight+=weight; }
+        if (have_undo && undo_cur+(long)w.n_in <= undo_n){
+            u64 tx_total_in=0;
+            for (u64 k=0;k<w.n_in;k++){ tx_total_in += uvals[undo_cur+k];
+                long ps=8+gbs_cs(uslens[undo_cur+k])+(long)uslens[undo_cur+k]+40; utxo_size_inc-=ps; utxo_size_inc_actual-=ps; }
+            long long txfee=(long long)tx_total_in-(long long)tx_total_out;
+            fee_arr[fee_n++]=(u64)txfee;
+            if (!have_fee){ maxfee=minfee=txfee; have_fee=1; } else { if(txfee>maxfee)maxfee=txfee; if(txfee<minfee)minfee=txfee; }
+            totalfee += txfee;
+            long long feerate = weight ? (txfee*4)/weight : 0;
+            frp[frp_n].fr=feerate; frp[frp_n].wt=weight; frp_n++;
+            if (frp_n==1||feerate>maxfeerate) maxfeerate=feerate;
+            if (frp_n==1||feerate<minfeerate) minfeerate=feerate;
+        }
+        if (have_undo) undo_cur += (long)w.n_in;
+        p += w.len;
+    }
+
+    rj_val* o=rj_obj();
+    long long vtxm1 = (long long)ntx - 1;
+    char hx[65]; { u8 rec[48]; if (read_idx_rec(h, rec)) hex_rev(hx, rec, 32); else hx[0]=0; }
+    if (have_undo){
+        rj_obj_set(o,"avgfee", rj_numf("%lld", vtxm1>0 ? totalfee/vtxm1 : 0));
+        rj_obj_set(o,"avgfeerate", rj_numf("%lld", total_weight ? (totalfee*4)/total_weight : 0));
+    }
+    rj_obj_set(o,"avgtxsize", rj_numf("%lld", vtxm1>0 ? total_size/vtxm1 : 0));
+    if (hx[0]) rj_obj_set(o,"blockhash", rj_str(hx));
+    if (have_undo){
+        gbs_frp* a=frp; qsort(a,(size_t)frp_n,sizeof(gbs_frp),gbs_cmp_frp);
+        long long pr[5]={0,0,0,0,0};
+        if (frp_n>0){
+            double wts[5]={total_weight/10.0,total_weight/4.0,total_weight/2.0,(total_weight*3.0)/4.0,(total_weight*9.0)/10.0};
+            int idx=0; long long cum=0;
+            for (long e=0;e<frp_n;e++){ cum+=a[e].wt; while(idx<5 && (double)cum>=wts[idx]){ pr[idx]=a[e].fr; idx++; } }
+            for (int k=idx;k<5;k++) pr[k]=a[frp_n-1].fr;
+        }
+        rj_val* fa=rj_arr(); for(int k=0;k<5;k++) rj_arr_push(fa, rj_numf("%lld", pr[k])); rj_obj_set(o,"feerate_percentiles", fa);
+    }
+    rj_obj_set(o,"height", rj_numf("%ld", h));
+    rj_obj_set(o,"ins", rj_numf("%lld", inputs));
+    if (have_undo){
+        rj_obj_set(o,"maxfee", rj_numf("%lld", maxfee));
+        rj_obj_set(o,"maxfeerate", rj_numf("%lld", maxfeerate));
+    }
+    rj_obj_set(o,"maxtxsize", rj_numf("%lld", maxtxsize));
+    if (have_undo) rj_obj_set(o,"medianfee", rj_numf("%lld", gbs_median(fee_arr, fee_n)));
+    rj_obj_set(o,"mediantime", rj_numf("%ld", median_time_past(h)));
+    rj_obj_set(o,"mediantxsize", rj_numf("%lld", gbs_median(txsize_arr, txsize_n)));
+    if (have_undo){
+        rj_obj_set(o,"minfee", rj_numf("%lld", have_fee?minfee:0));
+        rj_obj_set(o,"minfeerate", rj_numf("%lld", have_fee?minfeerate:0));
+    }
+    rj_obj_set(o,"mintxsize", rj_numf("%lld", have_txsz?mintxsize:0));
+    rj_obj_set(o,"outs", rj_numf("%lld", outputs));
+    rj_obj_set(o,"subsidy", rj_numf("%llu", (unsigned long long)gbs_subsidy(h)));
+    rj_obj_set(o,"swtotal_size", rj_numf("%lld", swtotal_size));
+    rj_obj_set(o,"swtotal_weight", rj_numf("%lld", swtotal_weight));
+    rj_obj_set(o,"swtxs", rj_numf("%lld", swtxs));
+    { u8 hdr[80]; long t=0; if (read_block_prefix(h,hdr,80)==1) t=rd32(hdr+68); rj_obj_set(o,"time", rj_numf("%ld", t)); }
+    rj_obj_set(o,"total_out", rj_numf("%lld", total_out));
+    rj_obj_set(o,"total_size", rj_numf("%lld", total_size));
+    rj_obj_set(o,"total_weight", rj_numf("%lld", total_weight));
+    if (have_undo) rj_obj_set(o,"totalfee", rj_numf("%lld", totalfee));
+    rj_obj_set(o,"txs", rj_numf("%llu", (unsigned long long)ntx));
+    rj_obj_set(o,"utxo_increase", rj_numf("%lld", outputs-inputs));
+    if (have_undo) rj_obj_set(o,"utxo_size_inc", rj_numf("%lld", utxo_size_inc));
+    rj_obj_set(o,"utxo_increase_actual", rj_numf("%lld", utxos-inputs));
+    if (have_undo) rj_obj_set(o,"utxo_size_inc_actual", rj_numf("%lld", utxo_size_inc_actual));
+    *res=o;
+    return 1;
+}
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
-    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig","getchaintips","uptime","stop", NULL
+    "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getchaintips","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
     return 0;
 }
+
+/* Public full-tx decoder (Core decoderawtransaction shape: txid/hash/version/
+ * size/vsize/weight/locktime/vin/vout with scriptPubKey asm+desc+address). The
+ * same tx_to_json getblock verbosity>=1 uses, so it is Core-verified. Standalone
+ * (no chain state). Returns 1, or 0 with *ec / *em on a malformed/trailing tx. */
+int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, const char** em){
+    txw_t w;
+    if (txlen < 10 || !tx_walk(tx, tx + txlen, &w) || (long)w.len != txlen){
+        *ec = -22; *em = "TX decode failed"; return 0; }
+    rj_val* o = tx_to_json(tx, &w, -1);
+    if (!o){ *ec = -7; *em = "out of memory"; return 0; }
+    /* tx_to_json emits "hex" for getblock/getrawtransaction; decoderawtransaction
+     * and decodepsbt's tx do NOT include it. Strip it. */
+    for (size_t i = 0; i < o->nmembers; i++){
+        if (!strcmp(o->members[i].key, "hex")){
+            free(o->members[i].key); rj_free(o->members[i].val);
+            for (size_t j = i + 1; j < o->nmembers; j++) o->members[j-1] = o->members[j];
+            o->nmembers--; break;
+        }
+    }
+    *result = o;
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
     if (!strcmp(m, "stop")) return cmd_stop(res);
+    /* pure util methods: no chain state needed (Core serves them always). */
+    if (!strcmp(m, "getdescriptorinfo")) return cmd_getdescriptorinfo(params, res, ec, em);
+    if (!strcmp(m, "deriveaddresses")) return cmd_deriveaddresses(params, res, ec, em);
+    if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
+    if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
@@ -1443,12 +1974,13 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockhash")) return cmd_getblockhash(params, res, ec, em);
     if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
     if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
+    if (!strcmp(m, "getblockstats")) return cmd_getblockstats(params, res, ec, em);
+    if (!strcmp(m, "getnetworkhashps")) return cmd_getnetworkhashps(params, res, ec, em);
+    if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
-    if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
-    if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     return -1;
 }

@@ -10,8 +10,8 @@ The short version, stated before the detail so it cannot be skipped:
 > Bitcoin Core for any real user today. On the one primitive that can be
 > compared like-for-like it is within ~1.2× of libsecp256k1. Its end-to-end
 > speed against Core has **never been measured**. Its consensus correctness is
-> being actively established and is not yet established: **thirty-five** defects
-> have been found (as of 2026-08-24), at least **eight** of them in the
+> being actively established and is not yet established: **forty-two** defects
+> have been found (as of 2026-08-25), at least **eight** of them in the
 > chain-splitting direction, and the discovery rate is not yet decelerating.
 > The most recent five were found *after* a clean genesis-to-963,000 replay,
 > by differential testing against Core rather than by replaying — which is the
@@ -88,8 +88,12 @@ storage work for the same chain.
 
 ## 4. The correctness picture, which matters more than the speed
 
-**Thirty-five numbered defects** (`LOG.md`, incidents #1–#35; this section's
-distribution analysis was written at #24 and the shape has held since). The
+**Forty-two numbered defects** (`LOG.md`, incidents #1–#42; this section's
+distribution analysis was written at #24 and the shape has held since; #39–#42,
+added 2026-08-25, are an RPC memory-disclosure, an operator pkill that took down
+production, the UTXO resume-REJECT window it exposed, and a handshake frame
+overlap that blanked peer versions — memory-safety/liveness, not chain-split).
+The
 five most recent are worth separating out, because none of them was reachable
 by replaying the chain: a `SETcc` that wrote eight bits where eleven numeric
 opcodes needed sixty-four (**5,050 false-ACCEPT divergences** from Core across
@@ -183,14 +187,15 @@ architecture handles the whole modern chain — segwit, taproot, script-path
 spends at inscription scale — on real data.
 
 But **"can it replace Bitcoin Core" is not a close question today**: no mining,
-no PSBT, no wallets, no testnet, no light-client indexes, a thin RPC surface,
+no PSBT, no wallets, no testnet, no light-client indexes, a read-plus-submit RPC surface (Core-parity blockchain/util/live-node queries, a descriptor engine, and a sendrawtransaction relay path, but no mining/wallet RPCs),
 and a node that until today crashed the first time a peer pushed it a block.
 And **"is it consensus-correct" is an open question**, not a settled one, with
 at least eight known chain-split-direction defects found so far (incidents
-#33–#35, added 2026-08-24, are liveness and memory-safety rather than
+#33–#42, added 2026-08-24/25, are liveness and memory-safety rather than
 chain-split: a keep-up failure, four cons_verify buffer-cap errors two of
-which smash the stack on peer data, and a `connect=` flag the fallback path
-ignored) and a discovery
+which smash the stack on peer data, a `connect=` flag the fallback path
+ignored, an RPC memory disclosure, a UTXO resume-REJECT window, and a handshake
+frame overlap) and a discovery
 rate that has not levelled off — the most recent found by differential testing
 *after* a clean full-chain replay, which is the strongest available evidence
 that a clean replay is not the finish line it looks like.
