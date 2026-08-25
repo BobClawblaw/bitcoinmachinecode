@@ -233,6 +233,15 @@ int main(void){
        !memcmp(rec[1].txid, tx2id, 32));
     ck("the spend is attributed to the key that owned the output",
        got > 1 && rec[1].keyidx == 0 && rec[1].branch == 0);
+    /* The spend must identify WHICH outpoint it consumed, or "is this output
+     * still unspent" can only be guessed at from value and key -- and a wrong
+     * guess makes coin selection spend a spent output. */
+    ck("the spend record carries the SPENT outpoint's txid",
+       got > 1 && !memcmp(rec[1].prev_txid, tx1id, 32));
+    ck("...which is NOT the spending transaction's own txid",
+       got > 1 && memcmp(rec[1].prev_txid, rec[1].txid, 32) != 0);
+    ck("a receive carries no prev_txid",
+       got > 0 && rec[0].prev_txid[0] == 0 && rec[0].prev_txid[31] == 0);
     ck("record 2 is the h2 receive of 10 BTC to CHANGE key 0",
        got > 2 && rec[2].height == 2 && rec[2].kind == 0 &&
        rec[2].value == 1000000000ULL && rec[2].keyidx == 0 && rec[2].branch == 1 &&

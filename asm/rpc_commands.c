@@ -521,6 +521,10 @@ static long crt_addr_to_spk(const char* addr, unsigned char* spk){
     }
 }
 /* BTC decimal string -> satoshis; -1 on parse error or >8 decimals. */
+/* Exposed below as rpc_amount_to_sat: the spend path in rpc_wallet_ops.c
+ * parses the same BTC amount strings, and a second parser that rounded
+ * differently would send a different number of satoshis than the caller
+ * asked for. */
 static long long crt_amount_to_sat(const char* s){
     long long whole=0, frac=0; int fdig=0, seen=0;
     const char* p=s; if (*p=='-') return -1;
@@ -530,6 +534,8 @@ static long long crt_amount_to_sat(const char* s){
     while (fdig<8){ frac*=10; fdig++; }
     return whole*100000000LL + frac;
 }
+
+long long rpc_amount_to_sat(const char* s){ return crt_amount_to_sat(s); }
 static long crt_varint(unsigned char* o, unsigned long long v){
     if (v<0xfd){ o[0]=(unsigned char)v; return 1; }
     if (v<=0xffff){ o[0]=0xfd; o[1]=(unsigned char)v; o[2]=(unsigned char)(v>>8); return 3; }
@@ -1606,10 +1612,68 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
     rj_val* fwd = rj_arr();
     rj_arr_push(fwd, rj_str(params->items[0]->str));
     rj_arr_push(fwd, keys);
-    if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR)
-        rj_arr_push(fwd, rj_clone(params->items[1]));
-    else
-        rj_arr_push(fwd, rj_arr());
+    /* prevtxs: the caller's, PLUS entries synthesized from the wallet's own
+     * rescan records for any input outpoint the wallet owns. Core's wallet
+     * knows its own outputs when signing; without this, signing a
+     * fundrawtransaction result would demand the caller re-supply data the
+     * wallet already has. Caller-provided entries come first, so an explicit
+     * prevtx always wins over a synthesized one. */
+    {
+        rj_val* pv = (params->nitems >= 2 && params->items[1]->typ == RJ_ARR)
+                     ? rj_clone(params->items[1]) : rj_arr();
+        const char* hx = params->items[0]->str;
+        size_t hl2 = strlen(hx);
+        if (!(hl2 & 1) && hl2/2 >= 10 && hl2/2 <= 200000){
+            static unsigned char txb[200000];
+            if (hex_to_bytes(txb, hx, hl2)){
+                unsigned long tl = (unsigned long)(hl2/2), q = 4, cc2;
+                if (tl > 6 && txb[4] == 0x00 && txb[5] == 0x01) q = 6;
+                unsigned long ni = srw_varint(txb + q, &cc2); q += cc2;
+                extern int rpc_wops_own_coin(const void*, const unsigned char*, unsigned int,
+                                             unsigned long long*, unsigned char*);
+                for (unsigned long i = 0; i < ni && ni <= 10000; i++){
+                    if (q + 36 > tl) break;
+                    const unsigned char* op = txb + q;
+                    unsigned int vo = (unsigned int)op[32] | ((unsigned int)op[33]<<8) |
+                                      ((unsigned int)op[34]<<16) | ((unsigned int)op[35]<<24);
+                    unsigned long long val; unsigned char h160[20];
+                    if (rpc_wops_own_coin(w->seed, op, vo, &val, h160)){
+                        /* skip if the caller already supplied this outpoint */
+                        char tid[65];
+                        for (int k = 0; k < 32; k++){
+                            static const char* H = "0123456789abcdef";
+                            unsigned char b = op[31-k];
+                            tid[k*2] = H[b>>4]; tid[k*2+1] = H[b&15];
+                        }
+                        tid[64] = 0;
+                        int have = 0;
+                        for (size_t j = 0; j < pv->nitems; j++){
+                            rj_val* t = rj_obj_get(pv->items[j], "txid");
+                            rj_val* v2 = rj_obj_get(pv->items[j], "vout");
+                            if (t && v2 && !strcmp(t->str, tid) &&
+                                (unsigned int)atol(v2->str) == vo){ have = 1; break; }
+                        }
+                        if (!have){
+                            rj_val* e = rj_obj();
+                            rj_obj_set(e, "txid", rj_str(tid));
+                            rj_obj_set(e, "vout", rj_numf("%u", vo));
+                            { char spkh[48]; unsigned char spk[22];
+                              spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h160, 20);
+                              bin_to_hex(spkh, spk, 22);
+                              rj_obj_set(e, "scriptPubKey", rj_str(spkh)); }
+                            { char am[32]; rpc_amounts((long long)val, am, sizeof am);
+                              rj_obj_set(e, "amount", rj_numf("%s", am)); }
+                            rj_arr_push(pv, e);
+                        }
+                    }
+                    q += 36;
+                    unsigned long sl2 = srw_varint(txb + q, &cc2); q += cc2 + sl2 + 4;
+                    if (q > tl) break;
+                }
+            }
+        }
+        rj_arr_push(fwd, pv);
+    }
     if (params->nitems >= 3 && params->items[2]->typ == RJ_STR)
         rj_arr_push(fwd, rj_str(params->items[2]->str));
 
@@ -2193,7 +2257,7 @@ static const char* const WALLET_METHODS[] = {
         "listtransactions","gettransaction","getwalletinfo","getbalances",
         "signrawtransactionwithwallet","simulaterawtransaction",
         "combinerawtransaction","finalizepsbt","utxoupdatepsbt",
-        "fundrawtransaction","descriptorprocesspsbt",
+        "descriptorprocesspsbt",
     /* Control, plus the three singletons Core files elsewhere */
     "help","logging","getrpcinfo","getmemoryinfo","getopenrpcinfo","rpc.discover",
     "exportasmap","enumeratesigners",
@@ -2462,15 +2526,6 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_finalizepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "utxoupdatepsbt"))
         return cmd_utxoupdatepsbt(params, err_code, err_msg, result);
-    if (!strcmp(method, "fundrawtransaction")){
-        *err_code = -1;
-        *err_msg = "this node cannot fund a transaction: it has no coin selection, "
-                   "no change policy and no fee estimation for wallet spends, and "
-                   "its wallet hands out P2WPKH addresses that wallet_core's "
-                   "legacy-P2PKH send path cannot spend. Supply inputs explicitly "
-                   "with createrawtransaction, then signrawtransactionwithwallet";
-        return 0;
-    }
     if (!strcmp(method, "descriptorprocesspsbt")){
         *err_code = -1;
         *err_msg = "this node cannot sign from descriptors: the descriptor engine "

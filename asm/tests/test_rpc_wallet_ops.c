@@ -445,8 +445,7 @@ int main(void){
         "migratewallet","setwalletflag","importdescriptors","createwalletdescriptor",
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
         "walletdisplayaddress",
-        "sendtoaddress","sendmany","send","sendall",
-        "walletcreatefundedpsbt","walletprocesspsbt","bumpfee","psbtbumpfee" };
+        "walletprocesspsbt","bumpfee","psbtbumpfee" };
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
@@ -490,15 +489,13 @@ int main(void){
             rj_free(r); rj_free(pp);
         }
         ck("every receive-side method refuses on a scan-less wallet", allrs); }
-      /* the spend refusal must name the ACTUAL blocker -- a P2PKH-only send
-       * path under a P2WPKH wallet -- and point at what does work, or a
-       * reader will assume it is merely unimplemented plumbing */
-      D("sendtoaddress", NULL);
-      ck("the spend family names the P2WPKH/P2PKH mismatch",
-         rc == 0 && em && strstr(em, "P2WPKH") && strstr(em, "P2PKH"));
-      ck("...and points at signrawtransactionwithwallet as what does work",
-         rc == 0 && em && strstr(em, "signrawtransactionwithwallet"));
-      rj_free(r); }
+      /* sendtoaddress is implemented now; on a scan-less wallet it refuses
+       * at the funding step (no coins are knowable) rather than pretending */
+      { rj_val* pp = P("[\"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\",1.0]");
+        D("sendtoaddress", pp);
+        ck("sendtoaddress before any scan refuses at funding",
+           rc == 0 && ec == -4 && em && strstr(em, "rescan"));
+        rj_free(r); rj_free(pp); } }
 
     /* ==== the wallet rescan, end to end =============================== */
     { static unsigned char rbuf[1 << 20];
@@ -611,6 +608,150 @@ int main(void){
         D("abandontransaction", p);
         ck("...and is idempotent", rc == 1);
         rj_free(r); rj_free(p); }
+
+      /* ==== coin selection, change and fees ========================== */
+      /* Spendable: the 10 BTC change output. The 50 BTC receive was spent at
+       * h2, so it must NOT be selectable -- if the spent-detection were the
+       * old value/key heuristic this would try to spend it. */
+      { rj_val* p = P("[]");
+        D("listunspent", p);       /* not this module, but proves the setup */
+        rj_free(r); rj_free(p); }
+
+      { /* fundrawtransaction over an inputless tx paying 1 BTC away */
+        const char* OUTS =
+          "02000000" "00" "01" "00e1f50500000000"
+          "16" "0014c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" "00000000";
+        char js[400]; snprintf(js, sizeof js, "[\"%s\"]", OUTS);
+        rj_val* p = P(js);
+        D("fundrawtransaction", p);
+        ck("fundrawtransaction funds an inputless transaction", rc == 1 && r);
+        ck("...returning hex, fee and changepos",
+           r && S(r,"hex") && S(r,"fee") && S(r,"changepos"));
+        ck("...with a change output added (the 10 BTC coin covers 1 BTC + fee)",
+           r && S(r,"changepos") && !strcmp(S(r,"changepos"), "1"));
+        { /* the fee must be positive and small -- a fee of 0 would mean the
+           * size model produced nothing, and a huge one a unit error */
+          long long fs = S(r,"fee") ? rpc_amount_to_sat(S(r,"fee")) : -1;
+          if (rc != 1) printf("      (fund failed: ec=%ld em=%s)\n", ec, em?em:"");
+          ck("the fee is positive", fs > 0);
+          ck("the fee is a sane size for a 1-in 2-out tx (< 0.001 BTC)", fs > 0 && fs < 100000); }
+        /* and the funded transaction must actually SIGN */
+        if (rc == 1 && S(r,"hex")) { char fj[2000];
+          snprintf(fj, sizeof fj, "[\"%s\"]", S(r,"hex"));
+          rj_val* fp = rj_parse(fj, strlen(fj));
+          rj_val* sr = NULL; long e2 = 0; const char* m2 = NULL;
+          int src = rpc_dispatch("signrawtransactionwithwallet", fp, &W, &sr, &e2, &m2);
+          if (src != 1) printf("      (sign failed: ec=%ld em=%s)\n", e2, m2?m2:"");
+          else if (sr && rj_obj_get(sr,"complete") && rj_obj_get(sr,"complete")->str[0] != '1'){
+              char b[1200]; rj_write(b, sizeof b, sr, 0);
+              printf("      (incomplete: %.900s)\n", b);
+          }
+          ck("the funded transaction signs to completion with the wallet's keys",
+             src == 1 && sr && rj_obj_get(sr,"complete") &&
+             rj_obj_get(sr,"complete")->str[0] == '1');
+          ck("...producing a witness (segwit signing, not the legacy path)",
+             src == 1 && sr && rj_obj_get(sr,"hex") &&
+             !strncmp(rj_obj_get(sr,"hex")->str + 8, "0001", 4));
+          rj_free(sr); rj_free(fp); }
+        else { ck("the funded transaction signs to completion with the wallet's keys", 0);
+               ck("...producing a witness (segwit signing, not the legacy path)", 0); }
+        rj_free(r); rj_free(p); }
+
+      { /* asking for more than the wallet holds is Core's -6, with the
+         * amount available named rather than a bare failure */
+        const char* BIG =
+          "02000000" "00" "01" "00e40b5402000000"
+          "16" "0014c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" "00000000";
+        char js[400]; snprintf(js, sizeof js, "[\"%s\"]", BIG);
+        rj_val* p = P(js);
+        D("fundrawtransaction", p);
+        ck("funding more than the wallet holds -> -6 Insufficient funds",
+           rc == 0 && ec == -6 && em && strstr(em, "Insufficient funds"));
+        ck("...naming what is actually available", rc == 0 && em && strstr(em, "available"));
+        rj_free(r); rj_free(p); }
+
+      { /* a transaction that already has inputs is refused, not mis-funded */
+        const char* WITHIN =
+          "02000000" "01"
+          "0100000000000000000000000000000000000000000000000000000000000000"
+          "00000000" "00" "fdffffff"
+          "01" "00e1f50500000000" "16"
+          "0014c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" "00000000";
+        char js[500]; snprintf(js, sizeof js, "[\"%s\"]", WITHIN);
+        rj_val* p = P(js);
+        D("fundrawtransaction", p);
+        ck("a transaction that already carries inputs is refused",
+           rc == 0 && ec == -8 && em && strstr(em, "inputless"));
+        rj_free(r); rj_free(p); }
+
+      { /* LOCKED coins must not be selected */
+        char hx[65]; static const char* H = "0123456789abcdef";
+        /* the change outpoint is tx2:0; recover its txid from listsinceblock */
+        rj_val* p0 = P("[]"); D("listsinceblock", p0);
+        const char* ctxid = NULL;
+        if (r){ rj_val* txs = rj_obj_get(r,"transactions");
+                for (size_t i = 0; txs && i < txs->nitems; i++)
+                    if (!strcmp(S(txs->items[i],"amount"), "10.00000000"))
+                        ctxid = S(txs->items[i],"txid"); }
+        char lockjs[200];
+        if (ctxid) snprintf(lockjs, sizeof lockjs,
+                            "[false,[{\"txid\":\"%s\",\"vout\":0}]]", ctxid);
+        else lockjs[0] = 0;
+        rj_free(r); rj_free(p0);
+        (void)hx; (void)H;
+        if (lockjs[0]){
+            rj_val* lp = P(lockjs);
+            D("lockunspent", lp);
+            ck("locked the wallet's only spendable coin", rc == 1);
+            rj_free(r); rj_free(lp);
+            const char* OUTS2 =
+              "02000000" "00" "01" "00e1f50500000000"
+              "16" "0014c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3" "00000000";
+            char js[400]; snprintf(js, sizeof js, "[\"%s\"]", OUTS2);
+            rj_val* p = P(js);
+            D("fundrawtransaction", p);
+            ck("a LOCKED output is not selected -- funding fails rather than "
+               "spending a coin the operator reserved",
+               rc == 0 && ec == -6);
+            rj_free(r); rj_free(p);
+            rj_val* up = P("[true]"); D("lockunspent", up); rj_free(r); rj_free(up);
+        } }
+
+      { /* sendtoaddress must get all the way to broadcast: this harness has
+         * no download worker, so reaching sendrawtransaction's own error is
+         * proof that selection, change, fee and SIGNING all succeeded */
+        rj_val* p = P("[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\",1.0]");
+        D("sendtoaddress", p);
+        ck("sendtoaddress funds and signs, then fails only at the broadcast",
+           rc == 0 && ec == -4 && em && strstr(em, "no download worker"));
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[\"notanaddress\",1.0]");
+        D("sendtoaddress", p);
+        ck("sendtoaddress to a bad address -> -5", rc == 0 && ec == -5);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\",999.0]");
+        D("sendtoaddress", p);
+        ck("sendtoaddress beyond the balance -> -6", rc == 0 && ec == -6);
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[{\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\":0.5}]");
+        D("walletcreatefundedpsbt", p);
+        ck("walletcreatefundedpsbt returns a PSBT with fee and changepos",
+           rc == 1 && r && S(r,"psbt") && S(r,"fee") && S(r,"changepos"));
+        ck("...and the PSBT decodes", rc == 1 && r && !strncmp(S(r,"psbt"), "cHNidP", 6));
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]]");
+        D("sendall", p);
+        ck("sendall sweeps and reaches the broadcast step",
+           rc == 0 && ec == -4 && em && strstr(em, "no download worker"));
+        rj_free(r); rj_free(p); }
+
+      { /* the two that still refuse must say WHY they specifically cannot */
+        D("bumpfee", NULL);
+        ck("bumpfee still refuses", rc == 0 && ec == -1);
+        rj_free(r); }
 
       rpc_wops_set_scanner(NULL, NULL, 0, NULL); }
 
