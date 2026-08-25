@@ -19,3 +19,7 @@ t_sm_g
 fz_invvar
 t_invv
 fz_ecdsa
+fz_schnorr
+fz_pub
+t_pub
+t_pub2
