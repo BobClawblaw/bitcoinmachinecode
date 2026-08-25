@@ -64,6 +64,10 @@ test_scalar: secp256k1_scalar.o $(ASMDIR)/tests/test_scalar.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_scalar.c secp256k1_scalar.o -I$(ASMDIR)
 test_point: secp256k1_point.o secp256k1_fe.o $(ASMDIR)/tests/test_point.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_point.c secp256k1_point.o secp256k1_fe.o -I$(ASMDIR)
+test_bech32: bech32.o $(ASMDIR)/tests/test_bech32.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_bech32.c bech32.o -I$(ASMDIR)
+fuzz_bech32: fz_bech32.c bech32.o
+	$(CC) $(CFLAGS) -o fz_bech32 fz_bech32.c bech32.o
 fuzz_point: fz_point.c secp256k1_point.o secp256k1_fe.o
 	$(CC) $(CFLAGS) -o fz_point fz_point.c secp256k1_point.o secp256k1_fe.o
 fuzz_sc: fz_sc.c secp256k1_scalar.o

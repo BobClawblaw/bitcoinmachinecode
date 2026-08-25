@@ -95,6 +95,14 @@ and runs natively.
       looped .fad_copy_unit->.fad_decode so post-first OP_CODESEPARATOR units were never
       stripped (-> .fad_mc); locate_nout now fully walks outputs+locktime so SINGLE
       quirk only fires on fully-valid txs. (2026-08-25)
+- [x] bech32 / bech32m (BIP173/BIP350 codec) -> port/arm64/bech32.S (bech32_init/
+      create_checksum/verify_checksum/convert_bits/encode/decode). Official
+      BIP173+BIP350 test vectors PASS native (valid, cross-spec reject, invalid,
+      real bc1q/bc1p encodes, convert_bits); 30k-vector differential fuzz across
+      12 seeds vs independent Python reference (polymod, convertbits, encode,
+      verify incl. cross-spec, decode round-trips + corruptions): 0 fail. Fixed:
+      un-saved x23 clobbered the caller in verify_checksum (O2-only crash);
+      convert_bits error return now full 64-bit -1. (2026-08-25)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script / sighash (+segwit_v0_sighash) /
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
       full stack VM, ~5000 lines of x86-64 across interp/sighash/checksig)
@@ -117,7 +125,7 @@ and runs natively.
 - [ ] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
       taproot_verify / strip_witness / tapagg / multisig / sigops ...
 - [ ] bitcoind.asm                        (daemon entry; links everything above)
-- [ ] Remaining leaf modules (bech32, bip32/bip39/bip143/bip341, keys, addr*,
+- [ ] Remaining leaf modules (bip32/bip39/bip143/bip341, keys, addr*,
       idx, idxscan, muhash, mempool, serve, cli, chainwork, cmpct, headers,
       net addrmgr, node_log, txv_, witness_v0, ...)
 
