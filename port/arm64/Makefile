@@ -80,6 +80,10 @@ t_sighash: t_sighash.c bitcoin_sighash.o bitcoin_hash.o sha256.o
 	$(CC) $(CFLAGS) -o t_sighash t_sighash.c bitcoin_sighash.o bitcoin_hash.o sha256.o
 fuzz_sighash:
 	python3 fuzz_sighash.py 1 3000
+t_der: t_der.c bitcoin_script.o
+	$(CC) $(CFLAGS) -o t_der t_der.c bitcoin_script.o
+fuzz_der:
+	python3 fuzz_der.py 1 3000
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 

@@ -103,6 +103,7 @@ and runs natively.
       verify incl. cross-spec, decode round-trips + corruptions): 0 fail. Fixed:
       un-saved x23 clobbered the caller in verify_checksum (O2-only crash);
       convert_bits error return now full 64-bit -1. (2026-08-25)
+- [x] bitcoin_script.S (be_to_limbs + der_parse_sig) -- sig pre-processing
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script / sighash (+segwit_v0_sighash) /
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
       full stack VM, ~5000 lines of x86-64 across interp/sighash/checksig)
