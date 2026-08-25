@@ -285,8 +285,7 @@ int main(int argc, char** argv) {
             "  \"address\": \"1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH\",\n"
             "  \"scriptPubKey\": \"76a914751e76e8199196d454941c45d1b3a323f1433bd688ac\",\n"
             "  \"isscript\": false,\n"
-            "  \"iswitness\": false,\n"
-            "  \"ischange\": false\n"
+            "  \"iswitness\": false\n"
             "}\n";
         ck_out("validateaddress pretty write(2)", want);
     }
