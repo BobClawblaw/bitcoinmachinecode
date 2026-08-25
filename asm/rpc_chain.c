@@ -2598,6 +2598,38 @@ static int cmd_waitforblock(const rj_val* params, rj_val** res, long* ec, const 
     "or reader, and Core's serialization is not implemented. The pool is " \
     "rebuilt from the network on restart"
 
+/* ---- submitheader --------------------------------------------------------
+ * Core decodes the header, and if it already knows it, returns null without
+ * doing anything. That case this node can answer exactly: look the hash up
+ * in the index and return null when it is a header we already have.
+ *
+ * A header we do NOT have would have to be added to the chain, and the
+ * header chain belongs to the forked download worker (headers.dat is its
+ * file). There is no channel for the parent to hand it one, so that case is
+ * refused rather than answered with the null that means "accepted". */
+static int cmd_submitheader(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* hx = rpc_param_str(params, 0, ec, em); if (!hx) return 0;
+    if (strlen(hx) != 160 || !is_hex_str(hx)){
+        *ec = -22; *em = "Block header decode failed"; return 0; }
+    u8 hdr[80];
+    for (int i = 0; i < 80; i++){
+        int a = hx[i*2], b = hx[i*2+1];
+        a = (a<='9') ? a-'0' : ((a|32)-'a'+10);
+        b = (b<='9') ? b-'0' : ((b|32)-'a'+10);
+        hdr[i] = (u8)((a<<4)|b);
+    }
+    u8 hash[32]; sha256d(hash, hdr, 80);
+    u8 disp[32]; for (int i = 0; i < 32; i++) disp[i] = hash[31-i];
+    long h;
+    if (height_by_hash(disp, &h)){ *res = rj_null(); return 1; }
+    *ec = -1;
+    *em = "this header is not already in the chain, and adding one is the "
+          "forked download worker's job -- headers.dat is its file and there "
+          "is no parent-to-worker channel for a submitted header. A header "
+          "this node already has returns null, as Core does";
+    return 0;
+}
+
 static int ch_unsupported(const char* msg, long* ec, const char** em){
     *ec = -1; *em = msg; return 0;
 }
@@ -2612,8 +2644,14 @@ static const char* const CHAIN_METHODS[] = {
     "waitforblock","waitforblockheight","waitfornewblock",
     "getblockfilter","scanblocks","getdescriptoractivity",
     "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
-    "savemempool","importmempool", NULL
+    "savemempool","importmempool","submitheader", NULL
 };
+
+const char* rpc_chain_method_at(int i){
+    int n = 0;
+    while (CHAIN_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? CHAIN_METHODS[i] : NULL;
+}
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
     return 0;
@@ -2900,6 +2938,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "scantxoutset")) return cmd_scantxoutset(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
+    if (!strcmp(m, "submitheader")) return cmd_submitheader(params, res, ec, em);
     if (!strcmp(m, "getchainstates")) return cmd_getchainstates(res, ec, em);
     if (!strcmp(m, "getdeploymentinfo")) return cmd_getdeploymentinfo(params, res, ec, em);
     if (!strcmp(m, "getchaintxstats")) return cmd_getchaintxstats(params, res, ec, em);
