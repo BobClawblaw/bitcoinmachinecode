@@ -257,3 +257,16 @@ immediates, so unaligned packed fields are read via register-offset (add xN,base
 ldr xD,[xN]).
 s6/UTXO core: bitcoin_utxo (in-memory) + bitcoin_utxo_store (persistent) both done.
 Next: bitcoin_sigops, bitcoin_undo, then the IBD driver for full download->verify->UTXO.
+
+## 2026-08-25 — bitcoin_undo.S ported+verified (UTXO reorg layer complete)
+Per-block undo store (append/load/replay[+tolerant]/discard/prune/prune_from), same
+on-disk "undo_<h>.dat" format as x86. Differential-fuzzed against the C oracle
+(asm/daemon/undo_log.c) directly: 16 seeds x 800 = 12,800 ops across all functions
+incl. absent files, negative heights, empty & large scripts, prune windows; 0 fail,
+byte-for-byte asm==C. AArch64: openat/unlinkat replace x86 open/unlink; raw syscalls.
+Pitfall: a 40MB static test array (u8 (*)[UMS]) faulted on this aarch64 build in the
+driver's ld-walk even in-bounds; switching to a heap buffer fixed it (static-array
+addressing quirk, unrelated to the port). undo_capture_and_del deferred (needs the
+not-yet-ported bitcoin_utxo_lsm get/del). s6 UTXO layer now: utxo (mem) + utxo_store
+(persist) + sigops + undo all native+verified. NEXT: the IBD driver (download ->
+cons_verify -> per-tx script verify -> UTXO apply) for full-chained download+verify.

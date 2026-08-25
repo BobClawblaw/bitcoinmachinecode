@@ -46,3 +46,8 @@ t_utxo
 t_ustore
 fuzz_utxo
 fuzz_ustore
+t_undo_asm
+t_undo_c
+undo_log.o
+lsm_stub.o
+fuzz_undo
