@@ -1092,8 +1092,10 @@ VERIFYOBJS := bitcoin_verify.c bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o \
     secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o bitcoin_hash.o sha256.o \
     ripemd160.o
-tests/verify_p2sh_shim: tests/verify_p2sh_shim.c $(VERIFYOBJS)
-	$(CC) -no-pie -O2 -o $@ tests/verify_p2sh_shim.c $(VERIFYOBJS)
+# TAPVERIFY (2026-08-25) pulls the taproot verifier in, so this shim links the
+# same object set test_taproot_verify_diff uses on top of VERIFYOBJS.
+tests/verify_p2sh_shim: tests/verify_p2sh_shim.c $(VERIFYOBJS) bitcoin_taproot_verify.o bitcoin_taproot_sighash.c bitcoin_segwit.c secp256k1_taproot.o secp256k1_schnorr.o bitcoin_tapagg.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_addr.o sha1.o bitcoin_strip_witness.o bitcoin_txv_pools.o bitcoin_witness_v0.c bitcoin_scriptverify.c
+	$(CC) -no-pie -O2 -o $@ tests/verify_p2sh_shim.c $(VERIFYOBJS) bitcoin_taproot_verify.o bitcoin_taproot_sighash.c bitcoin_segwit.c secp256k1_taproot.o secp256k1_schnorr.o bitcoin_tapagg.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_addr.o sha1.o bitcoin_strip_witness.o bitcoin_txv_pools.o bitcoin_witness_v0.c bitcoin_scriptverify.c -lpthread
 tests/test_verify_p2sh: tests/test_verify_p2sh.c $(VERIFYOBJS)
 	$(CC) -no-pie -O2 -o $@ tests/test_verify_p2sh.c $(VERIFYOBJS)
 

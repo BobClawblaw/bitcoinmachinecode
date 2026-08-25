@@ -370,3 +370,7 @@ asm/tests/hs_cap_probe
 asm/tests/hs_seq_probe
 asm/tests/test_mv_parse_bounds
 asm/tests/test_txv_cs_maxsize
+
+# Built from Bitcoin Core's tree (40MB, links its consensus libs); the
+# recipe lives in core_verify_oracle.cpp's header comment.
+validation/core_verify_oracle
