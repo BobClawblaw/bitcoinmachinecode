@@ -32,11 +32,81 @@ assembly.
 | `PLAN_SCRIPT_VERIFY.md` | The consensus-verification plan, and a one-line-per-wall table of every block that stopped the replay. |
 | `CHAIN_AHEAD_CENSUS.md` | Survey of the un-replayed chain against verifier limits, with an appended record of what it got right and wrong. |
 | `ENGINEERING_RULES.md` | The rules this project imposes on itself, each one earned by a specific failure. |
+| `docs/PARITY_PLAN.md` | Method-by-method RPC parity state: what is implemented, how each method was verified, and what is deliberately absent. |
+| `DEPLOYMENT.md` | How to run the daemon, prefaced by the reasons you should not. |
 | `worklog/` | Dated terse action logs. |
 
 ## Status
 
-**Current state (2026-08-24).** Block-level script verification (Stage D of
+**Current state (2026-08-25). The UTXO set is byte-identical to Bitcoin
+Core's, with no filter and no overrides.** The comparison the 2026-08-24
+entry below promised has been run. The from-genesis rebuild (write-time
+unspendable filter, so the stored set IS Core's definition rather than
+equal-through-a-filter) completed at 16:31; the daemon was stopped cleanly;
+and the quiesced set at height 963,967 was hashed and diffed against a local
+Core node's `gettxoutsetinfo muhash 963967`:
+
+    txouts         165,726,554                 == Core, exact
+    total_amount   2,007,466,988,462,591 sat   == Core, exact
+    bogosize       12,980,678,786              == Core, exact
+    muhash         1e3c77ad25f40961f1f757a77960b7c4
+                   9a5c7bd091597bd925d561a5c202c118  == Core, identical
+
+No read-time filter, no coin overrides, no corrected fields -- the two
+incident-#29 height defects the 08-24 text describes were rebuilt away.
+The MuHash equality means every one of 165.7 million entries -- outpoint,
+value, height, coinbase flag, script -- is byte-equal to Core's chainstate.
+As an independent probe of the same set, `scantxoutset` for the Counterparty
+burn address returns **3,135 unspents totalling 2,130.99791495 BTC**, matching
+Core's own scan to the satoshi. Two readers computed the numbers (the
+standalone tool and the RPC-embedded reader, which share one quiescence
+discipline by construction) and agree field-for-field.
+
+**The node now serves most of Core's RPC surface, and says exactly how each
+method was verified.** Added 2026-08-25, on top of the existing chain/wallet
+methods: the mempool tranche (`getmempoolinfo`, `getrawmempool`,
+`getmempoolentry`, `getmempoolancestors`, `getmempooldescendants`,
+`prioritisetransaction`, `getprioritisedtransactions`) over a mempool that is
+now **one MAP_SHARED, cross-process-locked pool** instead of a copy-on-write
+copy per process; `estimatesmartfee` (Core's contract over this node's own
+accepted-feerate EMA -- the number is ours and says so); `getblocktemplate`
+(deterministic frame diffed against Core at the same tip; the 2016-block
+retarget reproduces 8/8 real historical retargets bit-exact);
+**`submitblock` end-to-end** -- an 8 MB transport, a 4 MB parent-to-worker
+channel, BIP22 reason strings, and a connect step gated on a **dry run of the
+real apply path** (every verification phase, stopped at the first mutation);
+`gettxoutsetinfo` and `scantxoutset` (the capstone instruments, as RPCs);
+PSBT `analyzepsbt`/`joinpsbts`; and journal-backed wallet-state methods
+(`listtransactions`, `gettransaction`, `getwalletinfo`) whose verification
+bound -- round-trip, no oracle wallet exists -- is stated in the code rather
+than implied away. Where this node differs from Core deliberately (muhash as
+the default `gettxoutsetinfo` hash, absent coinstatsindex extras, a
+lower-bound `sigops` in templates), the divergence is documented at the call
+site, never silently approximated. `docs/PARITY_PLAN.md` tracks the method-
+by-method state, including what is NOT implemented and why.
+
+**Four production incidents in two days, each with a root cause, a fix and a
+regression test (`LOG.md` #43-#46):** chainwork.dat corrupt for the whole
+post-segwit chain (found because one RPC float differed from Core's);
+`decoderawtransaction` returning a minimal non-Core shape; the LSM live-
+counter drifting +7,890,418 during the rebuild -- root cause a kill landing
+between a flush's manifest write and its WAL truncate, so reload
+double-counted the folded tail (the SET was never wrong; the MuHash proved
+that before the counter bug was even diagnosed); and a keep-up race that
+appended the same block twice at adjacent heights, now structurally closed by
+a prev-linkage check inside the same critical section that assigns the
+height. The last two were found *by* the capstone run and *by* the deployed
+node within hours of each other, which is the project's verification story
+working as designed: instruments first, then claims.
+
+The daemon currently running is built from `main` and carries all of the
+above. `DEPLOYMENT.md` describes how to run it, and opens with the only
+deployment advice this project stands behind: no sane or rational human
+should ever run this software.
+
+---
+
+**Previous state (2026-08-24).** Block-level script verification (Stage D of
 `PLAN_SCRIPT_VERIFY.md`) has **completed its acceptance test**: a from-scratch,
 full-signature-verification replay of the real mainnet archive, no
 `assumevalid`, genesis through **height 963,000** -- within ~700 blocks of the
