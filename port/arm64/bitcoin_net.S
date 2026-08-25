@@ -1,0 +1,422 @@
+/* ============================================================================
+ * bitcoin_net.S -- AArch64 (ARMv8-A) port of asm/bitcoin_net.asm
+ * POSIX sockets + Bitcoin P2P message framing via raw Linux syscalls.
+ * AArch64 syscall ABI: args x0..x5, number in x8, `svc #0`, return in x0.
+ * (ARM64 numbers: read=63 write=64 close=57 socket=198 connect=203
+ *  setsockopt=208.) AAPCS64 arg mapping for SysV(x64):
+ *   x0,x1,x2,x3,x4  ~  rdi,rsi,rdx,rcx,r8.
+ * Calls sha256d (from the ported bitcoin_hash.S) for the frame checksum.
+ * All labels are unique per function (GAS requirement in this tree).
+ * ========================================================================== */
+
+	.extern sha256d
+
+	.text
+
+/* ============================================================================
+ * long fd_write_all(int fd, x0, const void *buf, x1, size_t n, x2) -> n or -1
+ * ========================================================================== */
+	.global fd_write_all
+	.type fd_write_all, %function
+fd_write_all:
+	stp x19, x20, [sp, #-16]!
+	stp x21, xzr, [sp, #-16]!
+	mov x19, x0
+	mov x20, x1
+	mov x21, x2
+	mov x12, #0                     /* done */
+.WAL:
+	cmp x12, x21
+	b.hs .WADONE
+	mov x0, x19
+	add x1, x20, x12
+	sub x2, x21, x12
+	mov x8, #64
+	svc #0
+	cmp x0, #0
+	b.gt .WAOK
+	mov x0, #-1
+	b .WARET
+.WAOK:
+	add x12, x12, x0
+	b .WAL
+.WADONE:
+	mov x0, x12
+.WARET:
+	ldp x21, xzr, [sp], #16
+	ldp x19, x20, [sp], #16
+	ret
+	.size fd_write_all, .-fd_write_all
+
+/* ============================================================================
+ * long fd_read_full(int fd, void *buf, size_t n) -> n / <n on eof / -1 on err
+ * ========================================================================== */
+	.global fd_read_full
+	.type fd_read_full, %function
+fd_read_full:
+	stp x19, x20, [sp, #-16]!
+	stp x21, xzr, [sp, #-16]!
+	mov x19, x0
+	mov x20, x1
+	mov x21, x2
+	mov x12, #0                     /* got */
+.RAL:
+	cmp x12, x21
+	b.hs .RAFULL
+	mov x0, x19
+	add x1, x20, x12
+	sub x2, x21, x12
+	mov x8, #63
+	svc #0
+	cmp x0, #0
+	b.gt .RAOK
+	b.eq .RAEOF
+	mov x0, #-1
+	b .RARET
+.RAOK:
+	add x12, x12, x0
+	b .RAL
+.RAEOF:
+	mov x0, x12
+	b .RARET
+.RAFULL:
+	mov x0, x12
+.RARET:
+	ldp x21, xzr, [sp], #16
+	ldp x19, x20, [sp], #16
+	ret
+	.size fd_read_full, .-fd_read_full
+
+/* === int fd_close(int fd) === */
+	.global fd_close
+	.type fd_close, %function
+fd_close:
+	mov x8, #57
+	svc #0
+	ret
+	.size fd_close, .-fd_close
+
+/* ============================================================================
+ * int tcp_connect_ip(u32 ip_le, u16 port_be) -> fd or -1
+ * ========================================================================== */
+	.global tcp_connect_ip
+	.type tcp_connect_ip, %function
+tcp_connect_ip:
+	stp x19, x20, [sp, #-16]!
+	stp x21, xzr, [sp, #-16]!
+	mov w19, w0
+	mov w20, w1
+	mov x0, #2
+	mov x1, #1
+	mov x2, #0
+	mov x8, #198
+	svc #0
+	cmp x0, #0
+	b.lt .TCIRT
+	mov x21, x0
+	sub sp, sp, #32
+	mov x0, #10
+	str x0, [sp, #0]
+	str xzr, [sp, #8]
+	mov x0, x21
+	mov x1, #1
+	mov x2, #20
+	mov x3, sp
+	mov x4, #16
+	mov x8, #208
+	svc #0
+	add sp, sp, #32
+	sub sp, sp, #32
+	str xzr, [sp, #0]
+	str xzr, [sp, #8]
+	mov w0, #2
+	strh w0, [sp, #0]
+	strh w20, [sp, #2]
+	str w19, [sp, #4]
+	mov x0, x21
+	mov x1, sp
+	mov x2, #16
+	mov x8, #203
+	svc #0
+	add sp, sp, #32
+	cmp x0, #0
+	b.lt .TCICLOSE
+	mov x0, x21
+	b .TCIRT
+.TCICLOSE:
+	mov x20, x0                     /* save -errno */
+	mov x0, x21
+	mov x8, #57
+	svc #0
+	mov x0, x20
+.TCIRT:
+	ldp x21, xzr, [sp], #16
+	ldp x19, x20, [sp], #16
+	ret
+	.size tcp_connect_ip, .-tcp_connect_ip
+
+/* ============================================================================
+ * cksum4(out4=x0, payload=x1, plen=x2): out[0:4] = sha256d(payload)[0:4]
+ * ========================================================================== */
+	.type cksum4, %function
+cksum4:
+	stp x29, x30, [sp, #-16]!
+	stp x19, x20, [sp, #-16]!
+	stp x21, xzr, [sp, #-16]!
+	sub sp, sp, #48
+	mov x19, x0
+	mov x20, x1
+	mov x21, x2
+	mov x0, sp
+	mov x1, x20
+	mov x2, x21
+	bl sha256d
+	ldr w0, [sp]
+	str w0, [x19]
+	add sp, sp, #48
+	ldp x21, xzr, [sp], #16
+	ldp x19, x20, [sp], #16
+	ldp x29, x30, [sp], #16
+	ret
+	.size cksum4, .-cksum4
+
+/* Put a u32 constant into wD (magic 0xd9b4bef9 is not a single MOV imm). */
+	.macro MOVCONST wD, hi, lo
+	mov \wD, #\lo
+	movk \wD, #\hi, lsl #16
+	.endm
+
+/* ============================================================================
+ * long p2p_frame(out=x0, cmd=x1, cmdlen=x2, payload=x3, plen=x4) -> 24+plen
+ * ========================================================================== */
+	.global p2p_frame
+	.type p2p_frame, %function
+p2p_frame:
+	stp x29, x30, [sp, #-16]!
+	stp x19, x20, [sp, #-16]!
+	stp x21, x22, [sp, #-16]!
+	stp x23, x24, [sp, #-16]!
+	mov x19, x0                     /* out */
+	mov x20, x1                     /* cmd */
+	mov x21, x2                     /* cmdlen */
+	mov x22, x3                     /* payload */
+	mov x23, x4                     /* plen */
+	MOVCONST w24, 0xd9b4, 0xbef9
+	str w24, [x19, #0]
+	add x0, x19, #4
+	str xzr, [x0, #0]
+	str xzr, [x0, #8]
+	/* copy min(cmdlen,12) cmd bytes -> out+4 */
+	mov x2, x21
+	cmp x2, #12
+	b.ls .PFC1
+	mov x2, #12
+.PFC1:
+	mov x3, #0
+.PFC2:
+	cmp x3, x2
+	b.hs .PFC3
+	add x4, x19, #4
+	add x5, x20, x3
+	ldrb w6, [x5]
+	add x7, x4, x3
+	strb w6, [x7]
+	add x3, x3, #1
+	b .PFC2
+.PFC3:
+	str w23, [x19, #16]
+	add x0, x19, #20
+	mov x1, x22
+	mov x2, x23
+	bl cksum4
+	/* copy plen payload bytes -> out+24 */
+	mov x3, #0
+.PFPL:
+	cmp x3, x23
+	b.hs .PFPLEND
+	add x4, x19, #24
+	add x5, x22, x3
+	ldrb w6, [x5]
+	add x7, x4, x3
+	strb w6, [x7]
+	add x3, x3, #1
+	b .PFPL
+.PFPLEND:
+	add x0, x23, #24
+	ldp x23, x24, [sp], #16
+	ldp x21, x22, [sp], #16
+	ldp x19, x20, [sp], #16
+	ldp x29, x30, [sp], #16
+	ret
+	.size p2p_frame, .-p2p_frame
+
+/* ============================================================================
+ * long p2p_write(fd=x0, cmd=x1, cmdlen=x2, payload=x3, plen=x4) -> sent/-1
+ * ========================================================================== */
+	.global p2p_write
+	.type p2p_write, %function
+p2p_write:
+	stp x29, x30, [sp, #-16]!
+	stp x19, x20, [sp, #-16]!
+	stp x21, x22, [sp, #-16]!
+	stp x23, x24, [sp, #-16]!
+	sub sp, sp, #48
+	mov x19, x0                     /* fd */
+	mov x20, x1                     /* cmd */
+	mov x21, x2                     /* cmdlen */
+	mov x22, x3                     /* payload */
+	mov x23, x4                     /* plen */
+	MOVCONST w24, 0xd9b4, 0xbef9
+	str w24, [sp, #0]
+	add x0, sp, #4
+	str xzr, [x0, #0]
+	str xzr, [x0, #8]
+	mov x2, x21
+	cmp x2, #12
+	b.ls .PWC1
+	mov x2, #12
+.PWC1:
+	mov x3, #0
+.PWC2:
+	cmp x3, x2
+	b.hs .PWC3
+	add x4, sp, #4
+	add x5, x20, x3
+	ldrb w6, [x5]
+	add x7, x4, x3
+	strb w6, [x7]
+	add x3, x3, #1
+	b .PWC2
+.PWC3:
+	str w23, [sp, #16]
+	add x0, sp, #20
+	mov x1, x22
+	mov x2, x23
+	bl cksum4
+	mov x0, x19
+	mov x1, sp
+	mov x2, #24
+	bl fd_write_all
+	cmp x0, #24
+	b.ne .PWF
+	mov x0, x19
+	mov x1, x22
+	mov x2, x23
+	bl fd_write_all
+	cmp x0, x23
+	b.ne .PWF
+	add x0, x23, #24
+	b .PWR
+.PWF:
+	mov x0, #-1
+.PWR:
+	add sp, sp, #48
+	ldp x23, x24, [sp], #16
+	ldp x21, x22, [sp], #16
+	ldp x19, x20, [sp], #16
+	ldp x29, x30, [sp], #16
+	ret
+	.size p2p_write, .-p2p_write
+
+/* ============================================================================
+ * int p2p_read(fd=x0, cmd_out=x1, payload=x2, cap=x3, plen_out=x4)
+ *   -> 1 ok / 0 eof / -1 err / -2 trunc
+ * Local frame: hdr[24]@sp+0..23, announced@24, tocopy@28, drain[64]@32..95.
+ * ========================================================================== */
+	.global p2p_read
+	.type p2p_read, %function
+p2p_read:
+	stp x29, x30, [sp, #-16]!
+	stp x19, x20, [sp, #-16]!
+	stp x21, x22, [sp, #-16]!
+	stp x23, x24, [sp, #-16]!
+	sub sp, sp, #96
+	mov x19, x0                     /* fd */
+	mov x20, x1                     /* cmd_out */
+	mov x21, x2                     /* payload */
+	mov x22, x3                     /* cap */
+	mov x23, x4                     /* plen_out */
+	mov x0, x19
+	mov x1, sp
+	mov x2, #24
+	bl fd_read_full
+	cmp x0, #24
+	b.ne .PREOF
+	ldr w24, [sp, #0]
+	MOVCONST w25, 0xd9b4, 0xbef9
+	cmp w24, w25
+	b.ne .PREOF
+	/* copy command -> cmd_out */
+	mov x3, #0
+.PRCMD:
+	cmp x3, #12
+	b.hs .PRCMDEND
+	add x4, sp, #4
+	add x5, x4, x3
+	ldrb w6, [x5]
+	add x7, x20, x3
+	strb w6, [x7]
+	add x3, x3, #1
+	b .PRCMD
+.PRCMDEND:
+	ldr w24, [sp, #16]
+	str w24, [sp, #24]              /* announced */
+	cmp w24, w22
+	b.ls .PRS1
+	mov w24, w22
+.PRS1:
+	str w24, [sp, #28]              /* tocopy */
+	cbz w24, .PRNOCPY
+	mov x0, x19
+	mov x1, x21
+	ldr w2, [sp, #28]
+	bl fd_read_full
+	ldr w1, [sp, #28]
+	cmp x0, x1
+	b.ne .PREOF
+.PRNOCPY:
+	/* drain announced - tocopy */
+	ldr w0, [sp, #24]
+	ldr w1, [sp, #28]
+	sub w2, w0, w1
+	cbz w2, .PRDONE
+.PRDRN:
+	mov w3, w2
+	cmp w3, #64
+	b.ls .PRAMT
+	mov w3, #64
+.PRAMT:
+	str w2, [sp, #92]
+	mov x0, x19
+	add x1, sp, #32
+	mov w2, w3
+	bl fd_read_full
+	ldr w2, [sp, #92]
+	cmp x0, #0
+	b.le .PRDONE
+	sub w2, w2, w0
+	cbnz w2, .PRDRN
+.PRDONE:
+	ldr w0, [sp, #24]
+	str w0, [x23]
+	ldr w0, [sp, #24]
+	ldr w1, [sp, #28]
+	cmp w0, w1
+	b.hi .PRTRUNC
+	mov x0, #1
+	b .PRRET
+.PRTRUNC:
+	mov x0, #-2
+	b .PRRET
+.PREOF:
+	mov x0, #0
+.PRRET:
+	add sp, sp, #96
+	ldp x23, x24, [sp], #16
+	ldp x21, x22, [sp], #16
+	ldp x19, x20, [sp], #16
+	ldp x29, x30, [sp], #16
+	ret
+	.size p2p_read, .-p2p_read
+
+	.section .note.GNU-stack,"",%progbits
