@@ -105,8 +105,12 @@ and runs natively.
       convert_bits error return now full 64-bit -1. (2026-08-25)
 - [x] bitcoin_script.S (be_to_limbs + der_parse_sig) -- sig pre-processing
 - [x] bitcoin_bip143.S (BIP143 segwit v0 sighash: swtx_parse_asm + segwit_v0_sighash_asm) -- 20k-vector diff-fuzz vs independent Python BIP143 (segwit+legacy tx, ALL/NONE/SINGLE x ACP, truncation): 0 fail
-- [ ] script/consensus layer: bitcoin_interp / bitcoin_script / checksig /
-      (checksig + witness-v0 remain; then the interp VM)
+- [x] bitcoin_checksig.S (sv_checksig_asm BSASE + sv_checksig_witness_v0_asm) --
+      exported script_find_and_delete/script_push_encode from bitcoin_sighash.S.
+      ~6k-vector diff-fuzz vs independent Python pipeline (DER->sighash->pub->ECDSA,
+      legacy+BIP143, valid+corrupt, compressed+uncompressed pub): 0 fail.
+- [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
+      mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
       full stack VM, ~5000 lines of x86-64 across interp/sighash/checksig)
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses

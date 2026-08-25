@@ -200,6 +200,8 @@ script_op_len:
  * script_find_and_delete(x0=dst,x1=dstcap,x2=src,x3=srclen,x4=needle,
  *                        x5=needlelen) -> x0=outlen or 0xFFFFFFFFFFFFFFFF
  * ========================================================================== */
+	.global script_find_and_delete
+	.type script_find_and_delete, %function
 script_find_and_delete:
 	stp  x29, x30, [sp, #-16]!
 	mov  x29, sp
@@ -304,6 +306,8 @@ script_find_and_delete:
 /* ============================================================================
  * script_push_encode(x0=dst,x1=dstcap,x2=data,x3=datalen) -> x0=outlen/-1
  * ========================================================================== */
+	.global script_push_encode
+	.type script_push_encode, %function
 script_push_encode:
 	cmp  x3, #0x4c
 	b.hs .spe_pd1

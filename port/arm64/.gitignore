@@ -35,3 +35,4 @@ t_sighash
 fuzz_sighash
 t_der
 t_bip143
+t_checksig
