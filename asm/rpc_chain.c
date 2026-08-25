@@ -2200,7 +2200,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","getchaintips","getindexinfo","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","getchaintips","getindexinfo","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -2246,6 +2246,64 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
     return 1;
 }
 
+/* ---- gettxoutsetinfo -------------------------------------------------------
+ * The reader (daemon/utxo_setinfo_rpc.c -- the SAME machinery as the
+ * standalone parity tool) is injected by the daemon; the standalone rpcd has
+ * none and reports unavailable. DOCUMENTED DIVERGENCES from Core: our default
+ * hash_type is muhash (the one hash we implement; Core defaults
+ * hash_serialized_3, which we refuse by name), and the coinstatsindex-only
+ * extras (total_unspendable_amount, block_info) are absent -- we run no such
+ * index, matching Core-without-the-index behavior. height is the UTXO
+ * APPLIED height (the state the numbers describe), which on a catching-up
+ * node intentionally lags the header tip. */
+typedef struct {
+    long height;
+    unsigned long long txouts, bogosize, total_amount;
+    unsigned char muhash[32];
+    int muhash_valid;
+} rpc_usi_out_t;
+static long (*g_usi_run)(int, void*, char*, unsigned long);
+void rpc_chain_set_utxosetinfo(long (*run)(int, void*, char*, unsigned long)){
+    g_usi_run = run;
+}
+static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char embuf[192];
+    int want_muhash = 1;   /* OUR default (documented divergence, see above) */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1){
+        if (params->items[0]->typ != RJ_STR){
+            *ec = -3; *em = "JSON value of type number is not of expected type string"; return 0; }
+        const char* ht = params->items[0]->str;
+        if (!strcmp(ht, "muhash")) want_muhash = 1;
+        else if (!strcmp(ht, "none")) want_muhash = 0;
+        else if (!strcmp(ht, "hash_serialized_3") || !strcmp(ht, "hash_serialized_2") || !strcmp(ht, "hash_serialized")){
+            snprintf(embuf, sizeof embuf, "%s hash type not implemented (this node computes muhash)", ht);
+            *ec = -8; *em = embuf; return 0; }
+        else {
+            snprintf(embuf, sizeof embuf, "'%s' is not a valid hash_type", ht);
+            *ec = -8; *em = embuf; return 0; }
+    }
+    if (!g_usi_run){ *ec = -1; *em = "UTXO set info unavailable in this process"; return 0; }
+    rpc_usi_out_t o; memset(&o, 0, sizeof o);
+    static char msg[256];
+    long r = g_usi_run(want_muhash, &o, msg, sizeof msg);
+    if (r == 0){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set busy"); *em = embuf; return 0; }
+    if (r != 1){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set read failed"); *em = embuf; return 0; }
+    rj_val* out = rj_obj();
+    rj_obj_set(out, "height", rj_numf("%ld", o.height));
+    { u8 hdr[80]; char hx[65];
+      if (read_block_prefix(o.height, hdr, 80) == 1){
+          u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32);
+          rj_obj_set(out, "bestblock", rj_str(hx));
+      } }
+    rj_obj_set(out, "txouts", rj_numf("%llu", o.txouts));
+    rj_obj_set(out, "bogosize", rj_numf("%llu", o.bogosize));
+    if (o.muhash_valid){ char mh[65]; hex_of(mh, o.muhash, 32); rj_obj_set(out, "muhash", rj_str(mh)); }
+    rj_obj_set(out, "total_amount", rj_numf("%llu.%08llu",
+        o.total_amount/100000000ULL, o.total_amount%100000000ULL));
+    *res = out;
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
@@ -2267,6 +2325,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getnetworkhashps")) return cmd_getnetworkhashps(params, res, ec, em);
     if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
     if (!strcmp(m, "getblocktemplate")) return cmd_getblocktemplate(params, res, ec, em);
+    if (!strcmp(m, "gettxoutsetinfo")) return cmd_gettxoutsetinfo(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
