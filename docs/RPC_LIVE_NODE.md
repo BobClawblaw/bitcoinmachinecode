@@ -521,3 +521,81 @@ subsystems this node does not have: a wallet rescan, segwit wallet
 signing/coin selection, BIP157/158 filters, assumeutxo snapshots, and
 external signer support. Every one of them is named at the point of refusal,
 so no caller is told a capability exists when it does not.
+
+## Slice 12 — subsystem 1 of 5: the wallet rescan — (2026-08-25)
+The eight methods that had to refuse for want of a receive-side view of the
+chain now answer from real data: `rescanblockchain`, `getreceivedbyaddress`,
+`getreceivedbylabel`, `listreceivedbyaddress`, `listreceivedbylabel`,
+`listaddressgroupings`, `listsinceblock`, `abandontransaction`.
+
+### What was missing, precisely
+The wallet knew about money from two places, neither of which was a history.
+`daemon/build_addr_index.c` inverts the **UTXO set**, so it answers "what does
+this address own right now" but knows nothing about outputs since spent and
+nothing about when anything arrived. `wallet_txlog.c` journals the sends this
+node itself made. So "how much has this address received" had no data behind
+it at all.
+
+`asm/wallet_scan.c` produces the missing thing: an ordered record of every
+wallet event with the height it happened at. Confirmations, received totals
+and since-block listings all follow from that.
+
+### What is matched
+An output is ours when its scriptPubKey is P2WPKH **or P2PKH** over one of the
+wallet's derived hash160s. Both forms are checked because they are the same
+key — `getnewaddress` hands out the bech32 rendering, but a payer given the
+P2PKH address of that key is still paying this wallet.
+
+An input is ours when its outpoint is one the scan already recorded as a
+receive. That is why the scan runs forward in height order keeping its own
+set of owned outpoints: a spend can only be recognised after the output it
+spends has been seen.
+
+The derivation window is 1000 indexes across both branches. That is a **real
+bound** — an output paid to a key beyond it is not found — which is why it is
+stated here and at the constant rather than buried.
+
+### Two places it refuses rather than under-report
+- **A height it cannot read abandons the whole scan.** A pruned or holed
+  archive is not "no wallet activity there", it is unknown, and a scan that
+  silently skipped it would understate every total derived from the result
+  with no way for the caller to tell. The error names the height.
+- **A full owned-outpoint set abandons too**, because past that point the scan
+  would start failing to recognise spends.
+
+On either failure nothing at the output path is disturbed: the header is
+written **last**, after every record is durable, so a crash or an abort leaves
+a file whose header still describes the previous complete scan — never a
+partial one that looks whole. A short or magic-less file reads as absent,
+which is the honest reading: no scan has completed.
+
+### No scan is a distinct state from a scan that found nothing
+Every receive-side method checks first, and refuses with `-4` naming the
+missing scan. Answering `0.00000000` before a scan has run would be
+indistinguishable to the caller from an address that genuinely received
+nothing. An address the wallet does not own is likewise Core's `-4 "Address
+not found in wallet"`, never a zero.
+
+### Notes
+- `getreceivedby*` counts **arrivals** and does not net out later spends — a
+  wallet's received total must not shrink as it pays people. The test asserts
+  this against a coin that is received and then spent.
+- `listaddressgroupings` returns exactly one group. A single-seed wallet has
+  one owner, and there is no partition of it into distinct owners — that is
+  the correct grouping, not a simplification.
+- `listsinceblock` emits the height and confirmations it scanned, and **omits**
+  `blockhash`/`blocktime`/`blockindex`: the scan records the height, and the
+  rest would have to be invented.
+- `abandontransaction` refuses a transaction the scan has seen with Core's
+  exact `-5 "Transaction not eligible for abandonment"`; an unseen one is
+  recorded in a marker store and the call is idempotent.
+- The derived key window is cached against the seed bytes. Without that, every
+  `getreceivedbyaddress` would repeat 2000 BIP32 derivations and 2000 point
+  multiplications, and `listreceivedbyaddress` would repeat them per candidate.
+
+### Cost, stated plainly
+A full rescan reads the archive. The RPC server services one connection at a
+time on a single thread, so a rescan blocks every other RPC for its duration —
+as it must, there being nowhere else to run it. `rescanblockchain` takes
+Core's `start_height`/`stop_height`, and a bounded range is the way to keep
+that window short.
