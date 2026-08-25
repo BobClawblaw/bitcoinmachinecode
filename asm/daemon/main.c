@@ -2380,8 +2380,39 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
             g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
-            for(int i=0;i<RPC_MAX_PEERS;i++)                        /* retire dead slots */
-                if(!(i < mux_n_out && mux_out_fd[i] >= 0)) g_node_status->peers[i].used = 0; }
+            long long nows = (long long)time(NULL);
+            for(int i=0;i<RPC_MAX_PEERS;i++){
+                if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
+                /* per-socket byte + last-activity meters from the kernel: no
+                 * asm changes, no double counting -- TCP_INFO is authoritative
+                 * (getpeerinfo bytessent/bytesrecv/lastsend/lastrecv). The
+                 * kernel struct is read by offset into a local mirror of its
+                 * stable uapi layout, so this does not depend on the glibc
+                 * header's tcp_info version (older ones lack the byte fields). */
+                struct bmc_tcp_info {
+                    unsigned char  _s[7];                 /* state..wscale/flags */
+                    unsigned int   rto, ato, snd_mss, rcv_mss;
+                    unsigned int   unacked, sacked, lost, retrans, fackets;
+                    unsigned int   last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
+                    unsigned int   pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss, reordering;
+                    unsigned int   rcv_rtt, rcv_space, total_retrans;
+                    unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+                } ti;
+                socklen_t tl = sizeof ti;
+                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0){
+                    rpc_peer_t* pr = &g_node_status->peers[i];
+                    /* byte fields only if the kernel returned a struct large
+                     * enough to include them */
+                    if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
+                        pr->bytes_sent = (long long)ti.bytes_acked;
+                        pr->bytes_recv = (long long)ti.bytes_received;
+                    }
+                    if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
+                        pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
+                        pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
+                    }
+                }
+            } }
         if(g_shutdown_requested){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             long long stop_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); stop_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
