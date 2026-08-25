@@ -31,12 +31,17 @@ UTXO: gettxoutsetinfo (daemon/utxo_setinfo.c).
 
 ## Tranches (ordered: verifiable value first)
 
-### T1 — Pure tx/message wallet RPCs  [status: IN PROGRESS]
-Wire existing wallet_core primitives onto JSON-RPC with Core shapes.
-- [ ] signmessage (msg_sign_core) + verifymessage — Core-byte-compatible sigs
-- [ ] createrawtransaction (wallet_createrawtx) — Core shape, decode round-trip
-- [ ] signrawtransactionwithkey (wallet_signrawtx_withkeys) — {hex,complete,errors}
-Verify: round-trips + existing test_msg_sign / test_wrpc_sign, shapes vs Core docs.
+### T1 — Pure tx/message wallet RPCs  [status: MOSTLY DONE]
+Wire existing primitives onto JSON-RPC with Core shapes.
+- [x] signmessagewithprivkey + verifymessage — cross-verified vs oracle BOTH
+      ways; frozen as KAT in test_rpc_msg (commit 8cbfff0, merged)
+- [x] createrawtransaction — byte-identical to oracle across all 5 output
+      script types + multi-in/out + OP_RETURN + locktime + replaceable
+      (test_rpc_rawtx, 11 KATs). Caught: modern Core defaults replaceable=true.
+- [ ] signrawtransactionwithkey — DEFERRED: full parity needs multi-type sighash
+      signing (legacy+P2WPKH+P2SH+P2WSH+P2TR); the existing wallet primitive is
+      P2PKH-only (25-byte prevout scripts). Its own focused task, not a
+      P2PKH-only stub claiming parity.
 
 ### T2 — Chain/UTXO query completion  [oracle-verifiable]
 - [ ] scantxoutset (start/status/abort over the UTXO set) — diff vs oracle
