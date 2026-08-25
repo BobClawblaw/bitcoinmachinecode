@@ -21,6 +21,10 @@ extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
+extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str);
+/* message signing (asm/wallet_msgsign.c): Core-byte-compatible compact sigs. */
+extern int  msg_sign_core(const unsigned char priv_be[32], const char* message, char sig_b64[96]);
+extern int  msg_verify_core(const char* address, const char* message, const char* sig_b64);
 
 /* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
  * rpc_commands_set_utxo_store's own doc comment in the header. */
@@ -566,11 +570,44 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     return 1;
 }
 
+/* ---- signmessagewithprivkey / verifymessage (pure, no wallet state) --------
+ * Core rpc/signmessage.cpp. Both are non-wallet in Core (the scratch oracle
+ * serves them), so these are cross-verified against it: a signature ours emits
+ * verifies under Core, and Core's verifies under ours. Compact-sig bytes are
+ * Core-compatible via msg_sign_core (see wallet_msgsign.c). */
+static int cmd_signmessagewithprivkey(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* wif = rpc_param_str(params, 0, ec, em); if (!wif) return 0;
+    const char* msg = rpc_param_str(params, 1, ec, em); if (!msg) return 0;
+    unsigned char pay[64]; long pl = 0;
+    if (!wallet_base58check_decode(pay, (long)sizeof pay, &pl, wif) || pl < 33 || pay[0] != 0x80){
+        *ec = -5; *em = "Invalid private key"; return 0; }
+    /* WIF payload: 0x80 | priv[32] | [0x01 if compressed]. msg_sign_core emits
+     * the compressed-pubkey header (31..34); an uncompressed WIF would need the
+     * 27..30 header, which this path does not produce -- reject it plainly
+     * rather than emit a signature that verifies under the wrong address. */
+    if (pl == 33){ *ec = -5; *em = "Uncompressed keys are not supported by signmessage"; return 0; }
+    if (pl != 34 || pay[33] != 0x01){ *ec = -5; *em = "Invalid private key"; return 0; }
+    char sig[96];
+    if (msg_sign_core(pay + 1, msg, sig) != 0){ *ec = -5; *em = "Sign failed"; return 0; }
+    *result = rj_str(sig);
+    return 1;
+}
+static int cmd_verifymessage(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* addr = rpc_param_str(params, 0, ec, em); if (!addr) return 0;
+    const char* sig  = rpc_param_str(params, 1, ec, em); if (!sig)  return 0;
+    const char* msg  = rpc_param_str(params, 2, ec, em); if (!msg)  return 0;
+    int r = msg_verify_core(addr, msg, sig);   /* 1 match, 0 no-match, <0 malformed */
+    if (r < 0){ *ec = -5; *em = "Malformed base64 encoding"; return 0; }
+    *result = rj_bool(r == 1);
+    return 1;
+}
+
 /* ---- dispatch table ---- */
 int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
+        "signmessagewithprivkey","verifymessage",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -599,6 +636,10 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_getbalance(params, w, err_code, err_msg, result);
     if (!strcmp(method, "decoderawtransaction"))
         return cmd_decoderaw(params, err_code, err_msg, result);
+    if (!strcmp(method, "signmessagewithprivkey"))
+        return cmd_signmessagewithprivkey(params, err_code, err_msg, result);
+    if (!strcmp(method, "verifymessage"))
+        return cmd_verifymessage(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
      * serve daemon's shared status; -1 means "not one of its methods". */
     {
