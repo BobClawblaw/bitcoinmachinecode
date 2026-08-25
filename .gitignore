@@ -246,6 +246,7 @@ asm/tests/test_outbound_mux
 asm/daemon/build_addr_index
 asm/daemon/build_migrate_compact
 asm/daemon/build_utxo
+asm/daemon/chainwork_build
 asm/daemon/flush_wal_tail
 asm/daemon/utxo_reload_check
 asm/tests/bench_ecdsa
