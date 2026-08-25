@@ -89,7 +89,7 @@ static u8 g_txid_scratch[1<<12];
 /* Same shape as test_utxo_checkpoint.c / test_apply_block_rollback.c's own
  * mk_and_mine: one coinbase tx, scriptPubKey = OP_1, minimum difficulty. */
 static long mk_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tag, u32 tstamp){
-    u8 tx[64], txid[32];
+    u8 tx[80], txid[32];   /* 65-byte coinbase: 64 overflowed by one (see test_blk_dryrun.c) */
     u8* q = tx;
     put32(q,1); q+=4;
     *q++ = 1;
@@ -128,7 +128,7 @@ static long mk_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tag, u32 ts
  * ordinary and succeed. Merkle root over 2 leaves: sha256d(cb_txid||tx1_txid). */
 static long mk_and_mine_spend(u8* raw, u8 hash[32], const u8 prev[32],
                               const u8 spend_txid[32], u32 tag, u32 tstamp){
-    u8 cb[64], cb_txid[32];
+    u8 cb[80], cb_txid[32];   /* 65-byte coinbase: 64 overflowed by one */
     u8* q = cb;
     put32(q,1); q+=4;
     *q++ = 1;

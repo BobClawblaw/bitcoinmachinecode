@@ -85,7 +85,7 @@ static u8 g_txid_scratch[1<<12];
 /* Same shape as test_utxo_checkpoint.c / test_apply_block_rollback.c's own
  * mk_and_mine: one coinbase tx, scriptPubKey = OP_1, minimum difficulty. */
 static long mk_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tag, u32 tstamp){
-    u8 tx[64], txid[32];
+    u8 tx[80], txid[32];   /* 65-byte coinbase: 64 overflowed by one (see test_blk_dryrun.c) */
     u8* q = tx;
     put32(q,1); q+=4;
     *q++ = 1;
@@ -213,7 +213,7 @@ int main(void){
     /* ---- Scenario A: valid same-block chained spend -> ACCEPT ---- */
     {
         u8 tx_bufs[3][512]; long tx_lens[3]; u8 txids[3][32];
-        u8 cb[64]; u8* q = cb;
+        u8 cb[80]; u8* q = cb;   /* 65-byte coinbase: 64 overflowed by one */
         put32(q,1); q+=4; *q++=1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
         *q++=4; put32(q,0x70000000u); q+=4; put32(q,0xffffffffu); q+=4;
         *q++=1; put64(q,50000000ULL); q+=8; *q++=1; *q++=0x51; put32(q,0); q+=4;
@@ -243,7 +243,7 @@ int main(void){
     /* ---- Scenario B: in-block double-spend -> REJECT the whole block ---- */
     {
         u8 tx_bufs[3][512]; long tx_lens[3]; u8 txids[3][32];
-        u8 cb[64]; u8* q = cb;
+        u8 cb[80]; u8* q = cb;   /* 65-byte coinbase: 64 overflowed by one */
         put32(q,1); q+=4; *q++=1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
         *q++=4; put32(q,0x71000000u); q+=4; put32(q,0xffffffffu); q+=4;
         *q++=1; put64(q,50000000ULL); q+=8; *q++=1; *q++=0x51; put32(q,0); q+=4;
@@ -285,7 +285,7 @@ int main(void){
     {
         enum { NTX = 12 }; /* coinbase + 10 spends + 1 slot spare, kept explicit */
         u8 tx_bufs[NTX][512]; long tx_lens[NTX]; u8 txids[NTX][32];
-        u8 cb[64]; u8* q = cb;
+        u8 cb[80]; u8* q = cb;   /* 65-byte coinbase: 64 overflowed by one */
         put32(q,1); q+=4; *q++=1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
         *q++=4; put32(q,0x72000000u); q+=4; put32(q,0xffffffffu); q+=4;
         *q++=1; put64(q,50000000ULL); q+=8; *q++=1; *q++=0x51; put32(q,0); q+=4;
