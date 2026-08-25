@@ -19,6 +19,20 @@ The short version, stated before the detail so it cannot be skipped:
 
 ---
 
+**Addendum 2026-08-25.** Two things changed materially since this was
+written, one in each direction of the ledger. For capability: the UTXO set
+is now proven **byte-identical to Bitcoin Core's** at height 963,967 —
+MuHash, txout count, total amount and bogosize all exact, no read-time
+filter, no overrides — and the node serves most of Core's RPC surface,
+including `getblocktemplate`, `submitblock`, the mempool tranche over a
+genuinely shared mempool, and the set-verification instruments as RPCs.
+For humility: getting there surfaced four production incidents in two days
+(`LOG.md` #43–#46) — a corrupt chainwork file, a non-Core RPC shape, a
+live-counter drift of +7.89M with a crash-window root cause, and a
+duplicate-append race on the live node. All four are root-caused, fixed and
+regression-tested, and all four existed in production first. The summary
+judgement below stands; the capability section under-claims.
+
 ## 1. What it can do
 
 Real, and stronger than the project's age suggests:
