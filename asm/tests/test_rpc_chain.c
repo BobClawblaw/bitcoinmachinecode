@@ -204,8 +204,15 @@ int main(void){
     build_archive();
     rpc_chain_set_stop_handler(on_stop);
 
-    /* ---- before open: chain methods report warmup, others untouched ---- */
+    /* ---- before open: chain methods report warmup, but PURE util methods
+     * (decodescript/createmultisig/getdescriptorinfo) work without the chain
+     * open, matching Core -- they need no chain state. ---- */
     expect_err("getblockcount before open -> -28", "getblockcount", "[]", -28, "Loading block index...");
+    { long bec; const char* bem;
+      rj_val* rr = call("decodescript", "[\"76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac\"]", &bec, &bem);
+      ck("decodescript works before chain open (not -28)", rr && rr->typ==RJ_OBJ && S(rr,"type")); rj_free(rr);
+      rr = call("getdescriptorinfo", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]", &bec, &bem);
+      ck("getdescriptorinfo works before chain open", rr && rr->typ==RJ_OBJ && S(rr,"checksum")); rj_free(rr); }
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
     expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
