@@ -144,3 +144,13 @@ and runs natively.
   a fresh AArch64 implementation matching the C-visible ABI.
 - SECURITY: this is untrusted, experiment-unaudited consensus code (see
   README top). Keep it offline/testnet, no real funds, no internet exposure.
+
+## Strategic update (2026-08-25): script VERIFICATION is unblocked
+The daemon's script validation path is C-orchestrated: bitcoin_scriptverify.c
+sv_run_v is a THIN WRAPPER over asm script_eval. Every crypto extern it needs
+(legacy_sighash, script_find_and_delete, script_push_encode, der_parse_sig,
+pubkey_parse, ecdsa_verify, be_to_limbs, segwit_v0_sighash) is now ported to
+port/arm64/* and differential-fuzz verified (30k/60k/20k/~6k vectors, 0 fail).
+So the crypto hooks for VerifyScript are complete. The single remaining
+consensus-critical asm module is `script_eval` in bitcoin_interp.asm (~3165
+lines + bitcoin_scriptcodec.asm). Port it and the C wrapper links unchanged.
