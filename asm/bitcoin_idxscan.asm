@@ -231,7 +231,9 @@ idxscan_tip:
 
 ; ----------------------------------------------------------------------------
 ; idxscan_append_locked(st, hash[32], raw, len)   (rdi,rsi,rdx,rcx)
-;   -> rax: height on success, -1 on error.
+;   -> rax: height on success, -1 on error, -2 refused: the block's prev
+;      field does not link to the current tip (incident #46's stale-duplicate
+;      race; see the linkage gate below).
 ;
 ;   CONCURRENT-SAFE "append the next sequential block" for opportunistic
 ;   multi-process writers that do NOT pre-partition disjoint heights among
@@ -269,6 +271,7 @@ idxscan_append_locked:
     push r13
     push r14
     push r15
+    sub  rsp, 0x48           ; 32B tip-hash scratch at [rbp-0x48] (+ alignment)
     mov  r12, rdi            ; st
     mov  r13, rsi            ; hash
     mov  r14, rdx            ; raw
@@ -284,6 +287,37 @@ idxscan_append_locked:
     ; ---- true current tip under lock, hole-aware ----
     call idxscan_tip           ; -> rax = tip (-1 if empty)
     lea  rbx, [rax+1]          ; height = tip + 1 (callee-saved across the call below)
+    ; ---- INCIDENT #46 linkage gate (2026-08-25): the block about to land at
+    ; tip+1 must actually LINK to the tip. Without this, a keep-up leg whose
+    ; sync pass started before a sibling stored the same block would append
+    ; that block AGAIN at tip+1 -- prev not even linking -- which is exactly
+    ; what happened live at height 964032: heights are assigned HERE at
+    ; append time, while the leg's validation used its pass-start chain view.
+    ; The check lives INSIDE this critical section (atomic with the height
+    ; decision, both writers covered); store_append_shared itself stays
+    ; check-free because parallel IBD legitimately writes disjoint,
+    ; non-sequential heights with caller-computed positions.
+    ;   rax = -2: refused, not-tip-linked (stale duplicate / competing block;
+    ;             duplicates die here, competing branches stay the reorg
+    ;             path's job -- reorg reconnects through the nolocked variant
+    ;             under its own outer lock, unaffected).
+    cmp  rax, -1
+    je   .linked               ; empty store: genesis bootstrap, nothing to link
+    imul rax, 48               ; index record offset = tip*48
+    mov  rdi, [r12+8]           ; idx_fd
+    lea  rsi, [rbp-0x48]         ; tip-hash scratch
+    mov  edx, 32
+    mov  r10, rax
+    mov  eax, 17                  ; pread64: record starts with the 32B hash
+    syscall
+    cmp  rax, 32
+    jne  .refuse                  ; unreadable tip record: refuse, never guess
+    lea  rsi, [rbp-0x48]
+    lea  rdi, [r14+4]              ; new block's prev field (header bytes 4..36)
+    mov  ecx, 32
+    repe cmpsb
+    jne  .refuse
+.linked:
     ; ---- delegate the actual write: store_append_shared(st, height, hash, raw, len) ----
     mov  rdi, r12
     mov  rsi, rbx
@@ -297,7 +331,21 @@ idxscan_append_locked:
     lea  rcx, [rax+1]
     imul rcx, 48
     mov  [r12+16], rcx         ; idx_len = (height+1)*48
+    jmp  .ret
+.refuse:
+    ; not-tip-linked: release the lock we took (the success path's unlock
+    ; happens inside store_append_shared, which we are not calling) and
+    ; report -2. The store is untouched.
+    mov  rdi, [r12+40]
+    test rdi, rdi
+    js   .refuse_done
+    mov  eax, 73              ; flock
+    mov  esi, 8               ; LOCK_UN
+    syscall
+.refuse_done:
+    mov  rax, -2
 .ret:
+    add  rsp, 0x48
     pop  r15
     pop  r14
     pop  r13
