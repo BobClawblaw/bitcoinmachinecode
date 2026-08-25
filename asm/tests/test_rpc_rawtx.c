@@ -71,6 +71,19 @@ int main(void){
       if (res && res->typ==RJ_STR) printf("     psbt: %s\n", res->str);
       rj_free(res); rj_free(params); }
 
+    /* --- converttopsbt: an unsigned raw tx -> the same PSBTv0 as createpsbt;
+     * a signed tx errors without permitsigdata (Core-exact message). --- */
+    { long ec; const char* em; rpc_wallet w; memset(&w,0,sizeof w);
+      const char* raw = "[\"020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000\"]";
+      rj_val* p1=rj_parse(raw,strlen(raw)); rj_val* r1=NULL; rpc_dispatch("converttopsbt",p1,&w,&r1,&ec,&em);
+      ck("converttopsbt(unsigned) == createpsbt PSBT", r1 && r1->typ==RJ_STR && !strcmp(r1->str,
+         "cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAAAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA"));
+      rj_free(r1); rj_free(p1);
+      const char* sg = "[\"02000000010100000000000000000000000000000000000000000000000000000000000000000000006b483045022100d9836bd05f96d48ac2540efe54033e1e1576c92212bfd116b63eea1669ff06ea02207f686907e6d374de78bd500cb6d4d26cd20e2aef4206c7a0b37e3745f7ad56aa0121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aafdffffff01605af405000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000\"]";
+      rj_val* p2=rj_parse(sg,strlen(sg)); rj_val* r2=NULL; long e2; const char* m2; int rc=rpc_dispatch("converttopsbt",p2,&w,&r2,&e2,&m2);
+      ck("converttopsbt(signed) errors -22", rc==0 && e2==-22 && m2 && strstr(m2,"scriptSigs"));
+      rj_free(r2); rj_free(p2); }
+
     /* --- decodepsbt round-trip (our createpsbt PSBT -> our decodepsbt),
      * byte-identical to Core's decodepsbt (verified live). --- */
     { long ec; const char* em;
