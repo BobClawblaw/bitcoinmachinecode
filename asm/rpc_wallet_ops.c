@@ -540,6 +540,33 @@ static int cmd_backupwallet(const rj_val* params, long* ec, const char** em, rj_
 #define WOP_NO_SIGNER \
     "no external signer is configured and this node has no signer interface"
 
+/* The spend family. This is the one gap worth stating precisely, because the
+ * pieces LOOK present and are not.
+ *
+ * wallet_core.c does have a send path -- wallet_sendtoaddress /
+ * wallet_send_tx -- but it is legacy P2PKH end to end: every prevout is
+ * assumed to be the spending key's P2PKH script, the destination is a P2PKH
+ * hash160, change returns to a P2PKH, and signing produces legacy
+ * SIGHASH_ALL scriptSigs with no witness. Meanwhile getnewaddress and
+ * getrawchangeaddress hand out P2WPKH (bech32) addresses, so the wallet's
+ * actual outputs are witness outputs that this path cannot spend.
+ *
+ * Wiring sendtoaddress onto it would build a transaction with an empty
+ * witness and a legacy scriptSig against a v0 witness prevout: the RPC would
+ * return a txid and the network would reject the transaction. A refusal is
+ * strictly better than a plausible txid for a transaction that can never
+ * confirm. Closing this properly means segwit wallet signing plus coin
+ * selection, change policy and fee estimation -- a subsystem, not an RPC
+ * shim -- and it is tracked as such. */
+#define WOP_NO_FUNDING \
+    "this node cannot construct a spend: its wallet hands out P2WPKH " \
+    "addresses but wallet_core's send path is legacy-P2PKH end to end " \
+    "(legacy scriptSigs, no witness), so it cannot spend the wallet's own " \
+    "outputs. There is also no coin selection, change policy or fee " \
+    "estimation. Signing an EXISTING transaction does work: use " \
+    "createrawtransaction then signrawtransactionwithwallet, which signs " \
+    "the inputs the wallet holds keys for and reports the rest in errors[]"
+
 static int wop_unsupported(const char* msg, long* ec, const char** em){
     *ec = -1; *em = msg; return 0;
 }
@@ -561,6 +588,8 @@ static const char* const WOP_METHODS[] = {
     "getreceivedbyaddress", "getreceivedbylabel",
     "listreceivedbyaddress", "listreceivedbylabel",
     "listaddressgroupings", "listsinceblock", "abandontransaction",
+    "sendtoaddress", "sendmany", "send", "sendall",
+    "walletcreatefundedpsbt", "walletprocesspsbt", "bumpfee", "psbtbumpfee",
     NULL
 };
 
@@ -612,6 +641,15 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
         !strcmp(m, "listreceivedbylabel") || !strcmp(m, "listaddressgroupings") ||
         !strcmp(m, "listsinceblock") || !strcmp(m, "abandontransaction"))
         return wop_unsupported(WOP_NO_RESCAN, ec, em);
+
+    /* the spend family -- see WOP_NO_FUNDING for why refusing is the only
+     * answer that does not hand the caller a transaction the network will
+     * reject */
+    if (!strcmp(m, "sendtoaddress") || !strcmp(m, "sendmany") ||
+        !strcmp(m, "send") || !strcmp(m, "sendall") ||
+        !strcmp(m, "walletcreatefundedpsbt") || !strcmp(m, "walletprocesspsbt") ||
+        !strcmp(m, "bumpfee") || !strcmp(m, "psbtbumpfee"))
+        return wop_unsupported(WOP_NO_FUNDING, ec, em);
 
     return -1;   /* unreachable while WOP_METHODS and this ladder agree */
 }

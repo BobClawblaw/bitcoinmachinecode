@@ -37,6 +37,10 @@ extern int  der_signature_export(unsigned char* out, const unsigned long long r[
 extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
 extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
 extern void hash160(unsigned char out[20], const void* in, long long len);
+extern void base58check_encode(char* out, const unsigned char* payload, long long paylen);
+extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
+                              const unsigned char* seed, long seedlen,
+                              const unsigned* indexes, long n);
 
 /* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
  * rpc_commands_set_utxo_store's own doc comment in the header. */
@@ -1552,12 +1556,163 @@ static int cmd_getbalances(const rpc_wallet* w, rj_val** result){
     return 1;
 }
 
+/* ==== signrawtransactionwithwallet ========================================
+ * Core: sign whatever inputs of a raw tx the WALLET holds keys for, and
+ * report per-input errors for the rest. That is exactly
+ * signrawtransactionwithkey with the key list sourced from the wallet
+ * instead of the caller, so this builds the key list and delegates rather
+ * than growing a second signer that could drift from the first. The
+ * delegate already handles legacy, P2SH, BIP143 v0 and P2SH-wrapped v0, so
+ * nothing is lost by the reuse.
+ *
+ * BOUNDED KEY WINDOW. The wallet derives keys on demand, so "the wallet's
+ * keys" is not a finite set. getnewaddress/getrawchangeaddress hand out
+ * index 0, and the CLI can be asked for an explicit index, so the window is
+ * indexes 0..SRWW_WINDOW-1 across both the receive and change branches.
+ * An input funded beyond that window is NOT silently skipped -- it lands in
+ * the `errors` array with complete:false, which is Core's own shape for an
+ * input it could not sign. */
+#define SRWW_WINDOW 20
+
+static void srww_wif(char out[64], const unsigned char priv[32]){
+    unsigned char pay[34];
+    pay[0] = 0x80; memcpy(pay + 1, priv, 32); pay[33] = 0x01;   /* compressed */
+    base58check_encode(out, pay, 34);
+}
+
+static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wallet* w,
+                                            long* ec, const char** em, rj_val** result){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_STR){
+        *ec = -8; *em = "Invalid parameters, expected a raw transaction hex string"; return 0; }
+    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+
+    /* [hexstring, [wif...], prevtxs, sighashtype] -- the delegate's shape.
+     * Core's signrawtransactionwithwallet takes (hexstring, prevtxs,
+     * sighashtype), so the caller's arg 1 is prevtxs and arg 2 is the
+     * sighash type; they shift by one here. */
+    rj_val* keys = rj_arr();
+    for (unsigned i = 0; i < SRWW_WINDOW; i++){
+        for (int chain = 0; chain <= 1; chain++){
+            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
+            unsigned char k[32], c[32]; char wif[64];
+            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+            srww_wif(wif, k);
+            rj_arr_push(keys, rj_str(wif));
+        }
+    }
+    rj_val* fwd = rj_arr();
+    rj_arr_push(fwd, rj_str(params->items[0]->str));
+    rj_arr_push(fwd, keys);
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR)
+        rj_arr_push(fwd, rj_clone(params->items[1]));
+    else
+        rj_arr_push(fwd, rj_arr());
+    if (params->nitems >= 3 && params->items[2]->typ == RJ_STR)
+        rj_arr_push(fwd, rj_str(params->items[2]->str));
+
+    int rc = cmd_signrawtransactionwithkey(fwd, ec, em, result);
+    rj_free(fwd);
+    return rc;
+}
+
+/* ==== simulaterawtransaction =============================================
+ * Core: the net balance change these transactions would cause for THIS
+ * wallet. Computable here without any funding machinery, because both
+ * halves are already known:
+ *   - an input is ours if its outpoint is in the wallet's own UTXO list
+ *     (rpc_wallet carries txid/vout/value), so its value leaves;
+ *   - an output is ours if its scriptPubKey is one of our derived P2WPKH
+ *     scripts, so its value arrives.
+ * An input whose outpoint we do not hold contributes nothing -- it is not
+ * our money either way -- which is the same treatment Core gives a
+ * not-ours input. */
+
+static int simraw_is_ours_spk(const rpc_wallet* w, const unsigned char* spk, unsigned long spklen){
+    if (spklen != 22 || spk[0] != 0x00 || spk[1] != 0x14) return 0;   /* P2WPKH only */
+    for (unsigned i = 0; i < SRWW_WINDOW; i++){
+        for (int chain = 0; chain <= 1; chain++){
+            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
+            unsigned char k[32], c[32], pub[33], h[20];
+            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+            scalar_to_pubkey(pub, k);
+            hash160(h, pub, 33);
+            if (!memcmp(h, spk + 2, 20)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_simulaterawtransaction(const rj_val* params, const rpc_wallet* w,
+                                      long* ec, const char** em, rj_val** result){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR){
+        *ec = -8; *em = "Invalid parameters, expected an array of raw transactions"; return 0; }
+    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    const rj_val* list = params->items[0];
+    long long delta = 0;
+    for (size_t t = 0; t < list->nitems; t++){
+        if (list->items[t]->typ != RJ_STR){ *ec = -22; *em = "TX decode failed"; return 0; }
+        const char* hx = list->items[t]->str; size_t hl = strlen(hx);
+        if ((hl & 1) || hl/2 < 10 || hl/2 > 400000){ *ec = -22; *em = "TX decode failed"; return 0; }
+        unsigned long txlen = (unsigned long)(hl/2);
+        unsigned char* tx = malloc(txlen);
+        if (!tx){ *ec = -7; *em = "oom"; return 0; }
+        if (!hex_to_bytes(tx, hx, hl)){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+
+        unsigned long p = 4, cc;
+        int segwit = (txlen > 6 && tx[4] == 0x00 && tx[5] == 0x01);
+        if (segwit) p = 6;
+        unsigned long n_in = srw_varint(tx + p, &cc); p += cc;
+        if (n_in == 0 || n_in > 100000){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+        for (unsigned long i = 0; i < n_in; i++){
+            if (p + 36 > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+            const unsigned char* op = tx + p;
+            unsigned long vo = (unsigned long)op[32] | ((unsigned long)op[33]<<8) |
+                               ((unsigned long)op[34]<<16) | ((unsigned long)op[35]<<24);
+            /* rpc_wallet.utxo_txid is in DISPLAY order -- rpc_commands and
+             * the transport test both render it forward with bin_to_hex to
+             * produce the txid a caller sees. The outpoint in the raw tx is
+             * in wire order, so it has to be reversed before comparing;
+             * comparing them directly would silently never match and report
+             * every spend of our own coins as a zero balance change. */
+            unsigned char disp[32];
+            for (int b = 0; b < 32; b++) disp[b] = op[31-b];
+            for (unsigned long u = 0; u < w->utxo_n; u++)
+                if (w->utxo_idx[u] == vo && !memcmp(w->utxo_txid[u], disp, 32)){
+                    delta -= (long long)w->utxo_val[u]; break; }
+            p += 36;
+            unsigned long ssl = srw_varint(tx + p, &cc); p += cc + ssl + 4;
+            if (p > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+        }
+        unsigned long n_out = srw_varint(tx + p, &cc); p += cc;
+        if (n_out > 100000){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+        for (unsigned long i = 0; i < n_out; i++){
+            if (p + 8 > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+            unsigned long long val = 0;
+            for (int b = 0; b < 8; b++) val |= (unsigned long long)tx[p+b] << (8*b);
+            p += 8;
+            unsigned long sl = srw_varint(tx + p, &cc); p += cc;
+            if (p + sl > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+            if (simraw_is_ours_spk(w, tx + p, sl)) delta += (long long)val;
+            p += sl;
+        }
+        free(tx);
+    }
+    rj_val* o = rj_obj();
+    char am[32]; rpc_amounts(delta, am, sizeof am);
+    rj_obj_set(o, "balance_change", rj_numf("%s", am));
+    *result = o;
+    return 1;
+}
+
 int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
         "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
         "listtransactions","gettransaction","getwalletinfo","getbalances",
+        "signrawtransactionwithwallet","simulaterawtransaction",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -1615,6 +1770,10 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_getbalances(w, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
+    if (!strcmp(method, "signrawtransactionwithwallet"))
+        return cmd_signrawtransactionwithwallet(params, w, err_code, err_msg, result);
+    if (!strcmp(method, "simulaterawtransaction"))
+        return cmd_simulaterawtransaction(params, w, err_code, err_msg, result);
     /* the rest of Core's Wallet category (rpc_wallet_ops.c) -- labels, wallet
      * inventory, output locks, message signing, descriptor reporting, and the
      * lifecycle methods a single-seed wallet cannot honour. */

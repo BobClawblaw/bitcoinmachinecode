@@ -59,6 +59,38 @@ void rj_obj_set(rj_val* o, const char* key, rj_val* v) {
     o->members[o->nmembers].val = v;
     o->nmembers++;
 }
+/* Deep copy; see rpc_json.h. Recursion depth is bounded by the parser's own
+ * nesting limit, so a hostile request cannot drive this past it. */
+rj_val* rj_clone(const rj_val* v){
+    if (!v) return NULL;
+    rj_val* c = NULL;
+    switch (v->typ){
+        case RJ_NULL: c = rj_null(); break;
+        case RJ_BOOL: c = rj_bool(v->str && v->str[0] == '1'); break;
+        case RJ_NUM:  c = rj_num(v->str ? v->str : "0"); break;
+        case RJ_STR:  c = rj_str(v->str ? v->str : ""); break;
+        case RJ_ARR:
+            c = rj_arr();
+            if (!c) return NULL;
+            for (size_t i = 0; i < v->nitems; i++){
+                rj_val* e = rj_clone(v->items[i]);
+                if (!e){ rj_free(c); return NULL; }
+                rj_arr_push(c, e);
+            }
+            break;
+        case RJ_OBJ:
+            c = rj_obj();
+            if (!c) return NULL;
+            for (size_t i = 0; i < v->nmembers; i++){
+                rj_val* e = rj_clone(v->members[i].val);
+                if (!e){ rj_free(c); return NULL; }
+                rj_obj_set(c, v->members[i].key, e);
+            }
+            break;
+    }
+    return c;
+}
+
 rj_val* rj_obj_get(const rj_val* o, const char* key) {
     for (size_t i = 0; i < o->nmembers; i++)
         if (!strcmp(o->members[i].key, key)) return o->members[i].val;

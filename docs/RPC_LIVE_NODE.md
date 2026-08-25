@@ -236,3 +236,59 @@ ranged descriptor can express it, because `*` has to be the final step. So
 wallet actually uses. Since `getnewaddress` and `getrawchangeaddress` always
 derive index 0, that is exactly two keys and the output is complete — it is
 not a truncation of a longer list.
+
+## Slice 8 — the Wallet category, part 2: the spend family — (2026-08-25)
+The last ten. Two are real; eight refuse, for one specific reason.
+
+**`signrawtransactionwithwallet`** — real, and it delegates. Core's method is
+`signrawtransactionwithkey` with the key list taken from the wallet instead
+of the caller, so it builds that list and calls the existing implementation
+rather than growing a second signer that could drift from the first. The
+delegate already handles legacy, P2SH, BIP143 v0 and P2SH-wrapped v0, so the
+reuse costs nothing. Note the argument shift: Core's wallet form is
+`(hexstring, prevtxs, sighashtype)` with no key array.
+
+The key window is bounded at indexes 0–19 across both branches, because
+"the wallet's keys" is not a finite set for an on-demand deriver. An input
+funded beyond that window is not silently skipped — it lands in `errors[]`
+with `complete: false`, which is Core's own shape for an input it could not
+sign.
+
+**`simulaterawtransaction`** — real, and needs no funding machinery: an input
+is ours when its outpoint is in the wallet's UTXO list, an output is ours
+when its scriptPubKey is one of our derived P2WPKH scripts. `rpc_wallet`'s
+`utxo_txid` is in DISPLAY order (that is how `bin_to_hex` renders it for
+callers), while the raw tx's outpoint is in wire order, so the comparison
+reverses. Getting that wrong would not crash — it would silently never
+match and report every spend of our own coins as a zero balance change.
+
+### Why `sendtoaddress` and its seven relatives refuse
+This is the one gap worth stating precisely, because the pieces look present
+and are not.
+
+`wallet_core.c` does have a send path — `wallet_sendtoaddress` /
+`wallet_send_tx` — but it is **legacy P2PKH end to end**: every prevout is
+assumed to be the spending key's P2PKH script, the destination is a P2PKH
+hash160, change returns to a P2PKH, and signing produces legacy
+`SIGHASH_ALL` scriptSigs with no witness. Meanwhile `getnewaddress` and
+`getrawchangeaddress` hand out **P2WPKH** addresses, so the wallet's actual
+outputs are witness outputs that this path cannot spend.
+
+Wiring `sendtoaddress` onto it would build a transaction carrying an empty
+witness and a legacy scriptSig against a v0 witness prevout. The RPC would
+return a txid and the network would reject the transaction. A refusal is
+strictly better than a plausible txid for something that can never confirm.
+
+So `sendtoaddress`, `sendmany`, `send`, `sendall`, `walletcreatefundedpsbt`,
+`walletprocesspsbt`, `bumpfee` and `psbtbumpfee` all return `-1` naming the
+mismatch, and pointing at what does work: `createrawtransaction` followed by
+`signrawtransactionwithwallet`. Closing this properly means segwit wallet
+signing plus coin selection, change policy and fee estimation — a subsystem,
+not an RPC shim.
+
+### Category status
+All 57 of Core's Wallet methods now dispatch. Counting honestly: 21 are
+backed by real wallet state, 6 reproduce Core's exact answer for this node's
+situation, and 30 refuse with the specific missing capability named. The
+methods that would need a wallet rescan and the eight above are the whole of
+what remains, and both are subsystem-sized rather than method-sized.

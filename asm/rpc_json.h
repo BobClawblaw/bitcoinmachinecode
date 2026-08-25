@@ -57,6 +57,12 @@ void rj_arr_push(rj_val* a, rj_val* v);
 void rj_obj_set(rj_val* o, const char* key, rj_val* v);
 rj_val* rj_obj_get(const rj_val* o, const char* key);
 
+/* Deep copy. The result owns everything and is rj_free()d independently of
+ * the source -- needed whenever a value parsed from a request has to be
+ * placed into a structure that will itself be freed. Returns NULL only for
+ * a NULL input or on OOM. */
+rj_val* rj_clone(const rj_val* v);
+
 /* Serialize v into out using Core's write() semantics.
  * pretty>0: Core pretty format (indent = pretty spaces/depth).
  * pretty==0: compact (no whitespace), still Core-exact.

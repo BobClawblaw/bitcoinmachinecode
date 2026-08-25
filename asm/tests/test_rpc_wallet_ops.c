@@ -360,7 +360,9 @@ int main(void){
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
         "walletdisplayaddress","rescanblockchain","getreceivedbyaddress",
         "getreceivedbylabel","listreceivedbyaddress","listreceivedbylabel",
-        "listaddressgroupings","listsinceblock","abandontransaction" };
+        "listaddressgroupings","listsinceblock","abandontransaction",
+        "sendtoaddress","sendmany","send","sendall",
+        "walletcreatefundedpsbt","walletprocesspsbt","bumpfee","psbtbumpfee" };
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
@@ -376,6 +378,15 @@ int main(void){
       D("getreceivedbyaddress", NULL);
       ck("the receive-side methods name the missing rescan",
          rc == 0 && em && strstr(em, "rescan"));
+      rj_free(r);
+      /* the spend refusal must name the ACTUAL blocker -- a P2PKH-only send
+       * path under a P2WPKH wallet -- and point at what does work, or a
+       * reader will assume it is merely unimplemented plumbing */
+      D("sendtoaddress", NULL);
+      ck("the spend family names the P2WPKH/P2PKH mismatch",
+         rc == 0 && em && strstr(em, "P2WPKH") && strstr(em, "P2PKH"));
+      ck("...and points at signrawtransactionwithwallet as what does work",
+         rc == 0 && em && strstr(em, "signrawtransactionwithwallet"));
       rj_free(r); }
 
     /* ---- the advertised table and the dispatch ladder must AGREE.
@@ -392,7 +403,9 @@ int main(void){
         "removeprunedfunds","exportwatchonlywallet","walletdisplayaddress",
         "rescanblockchain","getreceivedbyaddress","getreceivedbylabel",
         "listreceivedbyaddress","listreceivedbylabel","listaddressgroupings",
-        "listsinceblock","abandontransaction", NULL };
+        "listsinceblock","abandontransaction",
+        "sendtoaddress","sendmany","send","sendall","walletcreatefundedpsbt",
+        "walletprocesspsbt","bumpfee","psbtbumpfee", NULL };
       int agree = 1, count = 0;
       for (int i = 0; ALL[i]; i++){
           count++;
@@ -402,7 +415,7 @@ int main(void){
           rj_free(r);
       }
       ck("no method is advertised but unhandled", agree);
-      ck("all 38 wallet-ops methods are present", count == 38); }
+      ck("all 46 wallet-ops methods are present", count == 46); }
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
