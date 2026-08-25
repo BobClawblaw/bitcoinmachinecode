@@ -579,6 +579,30 @@ static long undo_block_values(long h, u64* out, long cap){
     return (off == sb.st_size) ? n : -1;            /* trailing garbage -> unusable */
 }
 
+/* Like undo_block_values but also returns each spent prevout's script length
+ * (for getblockstats' utxo_size_inc). Fills vals[] and slens[] in block order;
+ * returns count or -1 (absent/pruned/garbage). */
+static long undo_block_prevouts(long h, u64* vals, u32* slens, long cap){
+    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
+    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
+    long got = 0, off = 0; ssize_t rd;
+    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
+    close(fd);
+    if (got != sb.st_size){ free(buf); return -1; }
+    long n = 0;
+    while (off + 51 <= sb.st_size && n < cap){
+        u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
+        vals[n] = rd64(buf + off + 36);
+        slens[n] = slen;
+        n++;
+        off += 51 + (long)slen;
+    }
+    free(buf);
+    return (off == sb.st_size) ? n : -1;
+}
+
 static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
     rj_val* o = rj_obj();
     u8 txid[32], wtxid[32]; char hx[65];
@@ -1662,11 +1686,149 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
     return 1;
 }
 
+/* ---- getblockstats (Core rpc/blockchain.cpp) -------------------------------
+ * Per-block statistics. Block-only fields (sizes/weights/counts/subsidy/times/
+ * total_out/utxo_increase) are computed from block data and match Core exactly.
+ * The fee/feerate fields and utxo_size_inc{,_actual} need the block's spent
+ * prevout values+sizes (undo data); where undo is unavailable (our recent
+ * window only) those keys are OMITTED -- an honest divergence from a full node
+ * (which would error on a pruned block), consistent with getblock's fee
+ * omission. Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
+static u64 gbs_subsidy(long h){ long era=h/210000; if (era>=64) return 0; return 5000000000ULL >> era; }
+static long gbs_cs(u64 n){ if (n<253) return 1; if (n<=0xffff) return 3; if (n<=0xffffffffULL) return 5; return 9; }
+static int gbs_unspendable(const u8* s, u64 len){ return (len>0 && s[0]==0x6a) || len>10000; }
+static int gbs_cmp_u64(const void* a, const void* b){ u64 x=*(const u64*)a, y=*(const u64*)b; return (x<y)?-1:(x>y)?1:0; }
+typedef struct { long long fr, wt; } gbs_frp;
+static int gbs_cmp_frp(const void* a, const void* b){ long long x=((const gbs_frp*)a)->fr, y=((const gbs_frp*)b)->fr; return (x<y)?-1:(x>y)?1:0; }
+static long long gbs_median(u64* a, long n){ if (n==0) return 0; qsort(a,(size_t)n,sizeof(u64),gbs_cmp_u64); if (n%2==0) return (long long)((a[n/2-1]+a[n/2])/2); return (long long)a[n/2]; }
+
+static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh(); long h;
+    const rj_val* a0 = (params && params->typ==RJ_ARR && params->nitems>=1) ? params->items[0] : NULL;
+    if (a0 && a0->typ==RJ_NUM){            /* height form */
+        h = strtol(a0->str,0,10);
+        if (h < 0 || h > tip){ *ec=-8; *em="Target block height out of range"; return 0; }
+    } else {                                /* blockhash form */
+        if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    }
+    long len = read_block(h);
+    if (len < 0){ *ec=-1; *em="Block not available"; return 0; }
+    const u8* blk=g_blockbuf; const u8* end=blk+len;
+    u64 c; u64 ntx=read_varint(blk+80, end, &c);
+    const u8* p = blk+80+c;
+
+    static u64 uvals[600000]; static u32 uslens[600000];
+    long undo_n = undo_block_prevouts(h, uvals, uslens, 600000);
+    int have_undo = (undo_n >= 0); long undo_cur = 0;
+
+    long long inputs=0, outputs=0, total_out=0, total_size=0, total_weight=0;
+    long long swtotal_size=0, swtotal_weight=0, swtxs=0;
+    long long maxtxsize=0, mintxsize=0; int have_txsz=0;
+    long long utxos=0, utxo_size_inc=0, utxo_size_inc_actual=0;
+    long long maxfee=0, minfee=0, totalfee=0, maxfeerate=0, minfeerate=0; int have_fee=0;
+    static u64 txsize_arr[600000]; long txsize_n=0;
+    static u64 fee_arr[600000]; long fee_n=0;
+    static gbs_frp frp[600000]; long frp_n=0;
+
+    for (u64 i=0;i<ntx;i++){
+        txw_t w;
+        if (!tx_walk(p, end, &w)){ *ec=-1; *em="Block decode failed"; return 0; }
+        int coinbase=(i==0);
+        const u8* op=w.vout; u64 ccx; read_varint(op, end, &ccx); op += ccx;   /* skip vout count varint */
+        u64 tx_total_out=0;
+        for (u64 j=0;j<w.n_out;j++){
+            u64 val=rd64(op); op+=8; u64 cc2; u64 sl=read_varint(op,end,&cc2); const u8* spk=op+cc2; op+=cc2+sl;
+            tx_total_out += val;
+            long out_size = 8 + gbs_cs(sl) + (long)sl + 40;
+            outputs++; utxo_size_inc += out_size;
+            if (h==0) continue;
+            if (gbs_unspendable(spk, sl)) continue;
+            utxos++; utxo_size_inc_actual += out_size;
+        }
+        if (coinbase){ p += w.len; continue; }
+        inputs += (long long)w.n_in;
+        total_out += (long long)tx_total_out;
+        long long tx_size=(long long)w.len, weight=3*(long long)w.stripped+(long long)w.len;
+        txsize_arr[txsize_n++]=(u64)tx_size;
+        if (!have_txsz){ maxtxsize=mintxsize=tx_size; have_txsz=1; } else { if(tx_size>maxtxsize)maxtxsize=tx_size; if(tx_size<mintxsize)mintxsize=tx_size; }
+        total_size += tx_size; total_weight += weight;
+        if (w.segwit){ swtxs++; swtotal_size+=tx_size; swtotal_weight+=weight; }
+        if (have_undo && undo_cur+(long)w.n_in <= undo_n){
+            u64 tx_total_in=0;
+            for (u64 k=0;k<w.n_in;k++){ tx_total_in += uvals[undo_cur+k];
+                long ps=8+gbs_cs(uslens[undo_cur+k])+(long)uslens[undo_cur+k]+40; utxo_size_inc-=ps; utxo_size_inc_actual-=ps; }
+            long long txfee=(long long)tx_total_in-(long long)tx_total_out;
+            fee_arr[fee_n++]=(u64)txfee;
+            if (!have_fee){ maxfee=minfee=txfee; have_fee=1; } else { if(txfee>maxfee)maxfee=txfee; if(txfee<minfee)minfee=txfee; }
+            totalfee += txfee;
+            long long feerate = weight ? (txfee*4)/weight : 0;
+            frp[frp_n].fr=feerate; frp[frp_n].wt=weight; frp_n++;
+            if (frp_n==1||feerate>maxfeerate) maxfeerate=feerate;
+            if (frp_n==1||feerate<minfeerate) minfeerate=feerate;
+        }
+        if (have_undo) undo_cur += (long)w.n_in;
+        p += w.len;
+    }
+
+    rj_val* o=rj_obj();
+    long long vtxm1 = (long long)ntx - 1;
+    char hx[65]; { u8 rec[48]; if (read_idx_rec(h, rec)) hex_rev(hx, rec, 32); else hx[0]=0; }
+    if (have_undo){
+        rj_obj_set(o,"avgfee", rj_numf("%lld", vtxm1>0 ? totalfee/vtxm1 : 0));
+        rj_obj_set(o,"avgfeerate", rj_numf("%lld", total_weight ? (totalfee*4)/total_weight : 0));
+    }
+    rj_obj_set(o,"avgtxsize", rj_numf("%lld", vtxm1>0 ? total_size/vtxm1 : 0));
+    if (hx[0]) rj_obj_set(o,"blockhash", rj_str(hx));
+    if (have_undo){
+        gbs_frp* a=frp; qsort(a,(size_t)frp_n,sizeof(gbs_frp),gbs_cmp_frp);
+        long long pr[5]={0,0,0,0,0};
+        if (frp_n>0){
+            double wts[5]={total_weight/10.0,total_weight/4.0,total_weight/2.0,(total_weight*3.0)/4.0,(total_weight*9.0)/10.0};
+            int idx=0; long long cum=0;
+            for (long e=0;e<frp_n;e++){ cum+=a[e].wt; while(idx<5 && (double)cum>=wts[idx]){ pr[idx]=a[e].fr; idx++; } }
+            for (int k=idx;k<5;k++) pr[k]=a[frp_n-1].fr;
+        }
+        rj_val* fa=rj_arr(); for(int k=0;k<5;k++) rj_arr_push(fa, rj_numf("%lld", pr[k])); rj_obj_set(o,"feerate_percentiles", fa);
+    }
+    rj_obj_set(o,"height", rj_numf("%ld", h));
+    rj_obj_set(o,"ins", rj_numf("%lld", inputs));
+    if (have_undo){
+        rj_obj_set(o,"maxfee", rj_numf("%lld", maxfee));
+        rj_obj_set(o,"maxfeerate", rj_numf("%lld", maxfeerate));
+    }
+    rj_obj_set(o,"maxtxsize", rj_numf("%lld", maxtxsize));
+    if (have_undo) rj_obj_set(o,"medianfee", rj_numf("%lld", gbs_median(fee_arr, fee_n)));
+    rj_obj_set(o,"mediantime", rj_numf("%ld", median_time_past(h)));
+    rj_obj_set(o,"mediantxsize", rj_numf("%lld", gbs_median(txsize_arr, txsize_n)));
+    if (have_undo){
+        rj_obj_set(o,"minfee", rj_numf("%lld", have_fee?minfee:0));
+        rj_obj_set(o,"minfeerate", rj_numf("%lld", have_fee?minfeerate:0));
+    }
+    rj_obj_set(o,"mintxsize", rj_numf("%lld", have_txsz?mintxsize:0));
+    rj_obj_set(o,"outs", rj_numf("%lld", outputs));
+    rj_obj_set(o,"subsidy", rj_numf("%llu", (unsigned long long)gbs_subsidy(h)));
+    rj_obj_set(o,"swtotal_size", rj_numf("%lld", swtotal_size));
+    rj_obj_set(o,"swtotal_weight", rj_numf("%lld", swtotal_weight));
+    rj_obj_set(o,"swtxs", rj_numf("%lld", swtxs));
+    { u8 hdr[80]; long t=0; if (read_block_prefix(h,hdr,80)==1) t=rd32(hdr+68); rj_obj_set(o,"time", rj_numf("%ld", t)); }
+    rj_obj_set(o,"total_out", rj_numf("%lld", total_out));
+    rj_obj_set(o,"total_size", rj_numf("%lld", total_size));
+    rj_obj_set(o,"total_weight", rj_numf("%lld", total_weight));
+    if (have_undo) rj_obj_set(o,"totalfee", rj_numf("%lld", totalfee));
+    rj_obj_set(o,"txs", rj_numf("%llu", (unsigned long long)ntx));
+    rj_obj_set(o,"utxo_increase", rj_numf("%lld", outputs-inputs));
+    if (have_undo) rj_obj_set(o,"utxo_size_inc", rj_numf("%lld", utxo_size_inc));
+    rj_obj_set(o,"utxo_increase_actual", rj_numf("%lld", utxos-inputs));
+    if (have_undo) rj_obj_set(o,"utxo_size_inc_actual", rj_numf("%lld", utxo_size_inc_actual));
+    *res=o;
+    return 1;
+}
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getchaintips","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getchaintips","uptime","stop", NULL
 };
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
@@ -1686,6 +1848,7 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockhash")) return cmd_getblockhash(params, res, ec, em);
     if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
     if (!strcmp(m, "getblock")) return cmd_getblock(params, res, ec, em);
+    if (!strcmp(m, "getblockstats")) return cmd_getblockstats(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
