@@ -41,6 +41,13 @@ void rpc_chain_set_stop_handler(void (*fn)(void));
 int rpc_chain_dispatch(const char* method, const rj_val* params,
                        rj_val** result, long* ec, const char** em);
 
+/* Core's descriptor checksum (the 8 chars after '#') over a descriptor's
+ * inner span. Returns 1 and fills out[9] on success, 0 if the span contains
+ * a character the checksum alphabet does not cover. Exposed because the
+ * wallet-ops module renders descriptors too and must not carry a second,
+ * separately-drifting copy of this. */
+int rpc_chain_desc_checksum(const char* span, char out[9]);
+
 /* Is `method` one this module implements? (for rpc_known_method) */
 int rpc_chain_known_method(const char* method);
 
