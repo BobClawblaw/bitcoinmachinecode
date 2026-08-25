@@ -193,9 +193,20 @@ In rough order of how much each would move it:
    tip — with no filters, no overrides, no corrected fields; the two
    divergences the earlier runs found were rebuilt away.** Nothing remains
    of this item.
-2. **The differential corpus method applied to every consensus path**, not the
-   three or four it has reached. It is the only method that has ever found a
-   false accept here.
+2. ~~**The differential corpus method applied to every consensus path**, not
+   the three or four it has reached.~~ **Extended 2026-08-25 to the surface
+   that mattered most: SCRIPT EXECUTION on real mainnet spends.** Every
+   block-level differential before it drove `cons_verify` (merkle, PoW,
+   sizes, sigops) and never executed a script -- which is exactly why the
+   SETcc false-ACCEPT was invisible to a clean full-chain replay.
+   `validation/spend_corpus_diff.py` now runs real spends through the real
+   verifiers on both sides across all five script eras and mutates them to
+   force disagreement: **1,128 mutations, 1,128 agreements, zero
+   divergences, zero false-accepts**. It remains the only method that has
+   ever found a false accept here, and the bar it now sets is per-path
+   coverage depth (multisig combinations, CLTV/CSV timelock paths,
+   OP_CODESEPARATOR positions, annex-bearing taproot spends) rather than
+   whether scripts are exercised at all.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
 4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the
