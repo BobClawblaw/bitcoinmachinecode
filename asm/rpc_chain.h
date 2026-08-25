@@ -28,6 +28,12 @@
  * Until this succeeds every chain method answers -28 "Loading block index...". */
 int rpc_chain_open(const char* dir);
 
+/* Archive access for the wallet rescan: read one block by height (returns
+ * its length, or < 81 when unavailable) and the current tip. Same store
+ * handle the chain RPCs use -- not a second one over the same files. */
+long rpc_chain_read_block_at(long h, unsigned char* buf, long cap);
+long rpc_chain_tip_height(void);
+
 /* Core -prune setting (MiB; 0 off, 1 manual) for getblockchaininfo's
  * pruned/automatic_pruning/prune_target_size fields. */
 void rpc_chain_set_prune_mib(long mib);
