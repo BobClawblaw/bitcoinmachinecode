@@ -7,6 +7,41 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- CAPSTONE: UTXO set proven byte-identical to Bitcoin Core
+
+At quiesced height 963967 (rebuild caught up 16:31, clean SIGTERM stop,
+measured with the daemon down, restarted after):
+
+    field         Core oracle (gettxoutsetinfo muhash 963967)   this node
+    txouts        165,726,554                                   165,726,554   EXACT
+    total_amount  2,007,466,988,462,591 sat                     same          EXACT
+    bogosize      12,980,678,786                                same          EXACT
+    muhash        1e3c77ad25f40961f1f757a77960b7c49a5c7bd0      same          IDENTICAL
+                  91597bd925d561a5c202c118
+
+The muhash equality is the cryptographic proof: every one of 165.7M UTXOs --
+outpoint, value, height, coinbase flag, script -- byte-equal to Core's
+chainstate. scantxoutset for the Counterparty burn address also exact on the
+same set: 3135 unspents / 2130.99791495 BTC, matching the oracle's own scan
+to the satoshi. Instruments: daemon/utxo_setinfo (tool of record, --muhash,
+5m58s walk) and the RPC reader (daemon/utxo_setinfo_rpc.c), which agree with
+each other field-for-field. This is the Stage D acceptance test the
+write-time unspendable-filter rebuild (2026-08-23) was run for.
+
+## 2026-08-25 -- incident #45: utxo_lsm_count over-counts by 7,890,418 after the ghost-heavy rebuild
+
+Found BY the capstone run (the tool's own consistency cross-check, exit 4):
+the whole-set walk -- ground truth, and Core-exact per the muhash above --
+counts 165,726,554 live entries, while utxo_lsm_count()'s bookkeeping says
+173,616,972 (+7,890,418). Same wrong number the daemon heartbeat's `txouts=`
+label shows. CONTENT is proven correct; only the counter metadata is wrong.
+Likely mechanism: the rebuild healed ~870k ghost blocks (rollback then fresh
+re-apply per block); some pairing of those del/put cycles is not reflected in
+the counter. Fix is a counter reconciliation (recount from the walk at
+checkpoint, or audit the ghost-rollback path's accounting); NOT urgent for
+correctness -- every consumer that matters walks, none trusts the counter --
+but the heartbeat label lies until fixed.
+
 ## 2026-08-25 -- RPC full-field audit (post-#44): two more parity gaps closed
 
 Applying the incident-#44 lesson (spot-checked "done" RPCs hide gaps), did a
