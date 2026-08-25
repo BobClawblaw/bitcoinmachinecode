@@ -311,6 +311,70 @@ int main(void){
           ck("ancestors miss -> -5", rc==0 && e5==-5 && m5 && !strcmp(m5,"Transaction not in mempool"));
           rj_free(r); rj_free(ap); }
 
+        /* ---- estimatesmartfee: Core's contract over OUR EMA estimator.
+         * The two policy adds above fed the EMA real samples (fee 10000 over
+         * 82 bytes -> ~121951 sat/kB first sample; EMA converges toward it),
+         * so the feerate is a genuine policy-computed number. ---- */
+        { extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
+          { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+            h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+            h.get = mpool_get; h.polstate = polstate;
+            h.pol_entry_info = mpool_policy_entry_info;
+            h.estimate = mpool_policy_estimate;
+            rpc_node_set_mempool(&h); }
+          rj_val* fp=rj_parse("[6]",3); r=NULL;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
+          ck("esf(6) dispatched with feerate+blocks", rc==1 && r && S(r,"feerate") && S(r,"blocks") && !strcmp(S(r,"blocks"),"6"));
+          ck("esf(6) no errors array", r && rj_obj_get(r,"errors")==NULL);
+          { unsigned long long spk=0, n=0; mpool_policy_estimate(polstate,&spk,&n);
+            char want[32]; snprintf(want,sizeof want,"%llu.%08llu",
+                (spk<1000?1000ULL:spk)/100000000ULL, (spk<1000?1000ULL:spk)%100000000ULL);
+            ck("esf(6) feerate == policy EMA (floored)", n>0 && S(r,"feerate") && !strcmp(S(r,"feerate"),want)); }
+          rj_free(r); rj_free(fp);
+          /* conf_target 1 -> blocks clamps to 2 (oracle-verified) */
+          fp=rj_parse("[1]",3); r=NULL;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
+          ck("esf(1) -> blocks 2", rc==1 && r && S(r,"blocks") && !strcmp(S(r,"blocks"),"2"));
+          rj_free(r); rj_free(fp);
+          /* argument errors, Core-exact */
+          fp=rj_parse("[0]",3); r=NULL; long e8; const char* m8;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
+          ck("esf(0) -> -8 conf_target range", rc==0 && e8==-8 && m8 && !strcmp(m8,"Invalid conf_target, must be between 1 and 1008"));
+          rj_free(r); rj_free(fp);
+          fp=rj_parse("[1009]",6); r=NULL;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
+          ck("esf(1009) -> -8", rc==0 && e8==-8);
+          rj_free(r); rj_free(fp);
+          fp=rj_parse("[6, \"bogus\"]",12); r=NULL;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
+          ck("esf bad mode -> -8 Core message", rc==0 && e8==-8 && m8 && strstr(m8,"Invalid estimate_mode parameter"));
+          rj_free(r); rj_free(fp);
+          fp=rj_parse("[6, \"ECONOMICAL\"]",17); r=NULL;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
+          ck("esf ECONOMICAL accepted (case-insensitive)", rc==1 && r && S(r,"feerate"));
+          rj_free(r); rj_free(fp);
+          /* fresh estimator -> Core's insufficient-data shape */
+          { static unsigned char fresh[1<<22];
+            extern void mpool_policy_state_init(void*, unsigned long);
+            mpool_policy_state_init(fresh, 4096);
+            rpc_mempool_hooks h; memset(&h,0,sizeof h);
+            h.mp = pool; h.polstate = fresh; h.estimate = mpool_policy_estimate;
+            rpc_node_set_mempool(&h);
+            fp=rj_parse("[6]",3); r=NULL;
+            rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
+            rj_val* errs = r?rj_obj_get(r,"errors"):NULL;
+            ck("esf fresh estimator -> errors[Insufficient data...]", rc==1 && errs && errs->typ==RJ_ARR
+               && errs->nitems==1 && errs->items[0]->str
+               && !strcmp(errs->items[0]->str,"Insufficient data or no feerate found"));
+            ck("esf fresh -> no feerate field", r && rj_obj_get(r,"feerate")==NULL);
+            rj_free(r); rj_free(fp); }
+          /* restore the populated hooks for any later checks */
+          { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+            h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+            h.get = mpool_get; h.polstate = polstate;
+            h.pol_entry_info = mpool_policy_entry_info;
+            rpc_node_set_mempool(&h); } }
+
         /* error parity: -5 not in mempool; -8 bad txid with Core's message */
         { rj_val* p5=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000001\"]",68);
           r=NULL; long e5; const char* m5; rc=rpc_node_dispatch("getmempoolentry",p5,&r,&e5,&m5);
