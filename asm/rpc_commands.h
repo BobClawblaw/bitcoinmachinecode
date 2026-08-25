@@ -51,6 +51,10 @@ int rpc_param_i64(const rj_val* params, size_t i, long long* out,
 /* Human + machine model: is `method` a wallet command we dispatch? */
 int rpc_known_method(const char* method);
 
+/* Enumerate the wallet/util subset this module dispatches itself; NULL past
+ * the end. `help` merges this with the other modules' tables. */
+const char* rpc_wallet_method_at(int i);
+
 /* Long-lived UTXO LSM store handle backing gettxout (real Bitcoin Core
  * semantics: any confirmed outpoint, not wallet-scoped) and, once the
  * address index lands, listunspent/getbalance. Deliberately a SEPARATE

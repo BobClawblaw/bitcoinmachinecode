@@ -51,6 +51,9 @@ int rpc_chain_desc_checksum(const char* span, char out[9]);
 /* Is `method` one this module implements? (for rpc_known_method) */
 int rpc_chain_known_method(const char* method);
 
+/* Enumerate the methods this module serves; NULL past the end. */
+const char* rpc_chain_method_at(int i);
+
 /* Full-tx decoder (Core decoderawtransaction shape). Shared by
  * decoderawtransaction and decodepsbt so both use the getblock-verified
  * tx_to_json output. Returns 1, or 0 with *ec / *em. */
