@@ -23,8 +23,8 @@ interp_err:	.space 8
 interp_slice:	.space 32
 cms_keyrefs:	.space 1024
 cms_sigrefs:	.space 1024
-cms_scstrip0:	.space 8192
-cms_scstrip1:	.space 8192
+cms_scstrip0:	.space 10008	/* script_find_and_delete dstcap=10008 */
+cms_scstrip1:	.space 10008
 cms_needle:	.space 1300
 
 	.text
@@ -2208,6 +2208,7 @@ interp_checkmultisig:
 	mov  x2,#4
 	bl   scriptnum_decode
 	mov  w22,w0		/* nSigs */
+	str  w22,[sp,#0x40]	/* persist nSigs (w22 reused later as vPub ptr) */
 	tbnz w22,#31,.err_sigcount
 	ldr  w9,[sp,#0x48]
 	cmp  w22,w9
@@ -2372,9 +2373,10 @@ interp_checkmultisig:
 .cms_fail:
 	mov  w26,#0
 .cms_finish:
-	ldr  w2,[sp,#0x48]
-	add  w2,w2,w22		/* +nSigs */
-	add  w2,w2,#3
+	ldr  w2,[sp,#0x48]	/* nKeys */
+	ldr  w3,[sp,#0x40]	/* nSigs (reload: x22 was clobbered by the loop's vPub ptr) */
+	add  w2,w2,w3
+	add  w2,w2,#3		/* need+1 */
 	mov  x25,x2
 .pop_all:
 	cbz  x25,.pop_done
