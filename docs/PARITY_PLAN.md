@@ -38,10 +38,13 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 - [x] createrawtransaction — byte-identical to oracle across all 5 output
       script types + multi-in/out + OP_RETURN + locktime + replaceable
       (test_rpc_rawtx, 11 KATs). Caught: modern Core defaults replaceable=true.
-- [ ] signrawtransactionwithkey — DEFERRED: full parity needs multi-type sighash
-      signing (legacy+P2WPKH+P2SH+P2WSH+P2TR); the existing wallet primitive is
-      P2PKH-only (25-byte prevout scripts). Its own focused task, not a
-      P2PKH-only stub claiming parity.
+- [~] signrawtransactionwithkey — ECDSA single-sig DONE (P2PKH, P2WPKH,
+      P2SH-P2WPKH) with a hand-built BIP143 sighash + segwit serializer. Every
+      signature VALIDATED LIVE by Core's script engine (feed our signed tx back
+      to the oracle with empty keys -> complete:true), frozen as deterministic
+      KATs in test_rpc_signraw. STILL DEFERRED: P2WSH/P2SH multisig assembly and
+      P2TR key-path (needs a BIP340 Schnorr SIGNER, which does not exist in the
+      tree -- its own future "taproot signing" task).
 
 ### T2 — Chain/UTXO query completion  [oracle-verifiable]
 - [ ] scantxoutset (start/status/abort over the UTXO set) — diff vs oracle
