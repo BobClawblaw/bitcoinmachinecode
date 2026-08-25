@@ -289,3 +289,457 @@ check_minimal_push:
 	.size check_minimal_push, .-check_minimal_push
 
 	.section .note.GNU-stack,"",%progbits
+
+/* ============================================================================
+ * part 2: TLS-buffer getters, element-stack engine, get_op, vfexec condition
+ * stack. Mirrors asm/bitcoin_scriptcodec.asm lines ~63-978.
+ * Constants: ELEM_SIZE=528 (ELEM_DATA_OFF=4, len u32 @0, data[520] @4),
+ * MAX_STACK_SIZE=1000.
+ * ========================================================================== */
+
+	.section .bss
+	.align 4
+vfexec:		.space 1024	/* condition stack (bytes) */
+vfexec_sp:	.space 8
+
+	.text
+	.global elem_tmp0_addr
+	.type elem_tmp0_addr,%function
+elem_tmp0_addr:
+	LAddr x0, elem_tmp0
+	ret
+	.size elem_tmp0_addr,.-elem_tmp0_addr
+
+	.global elem_tmp1_addr
+	.type elem_tmp1_addr,%function
+elem_tmp1_addr:
+	LAddr x0, elem_tmp1
+	ret
+	.size elem_tmp1_addr,.-elem_tmp1_addr
+
+	.global elem_tmp2_addr
+	.type elem_tmp2_addr,%function
+elem_tmp2_addr:
+	LAddr x0, elem_tmp2
+	ret
+	.size elem_tmp2_addr,.-elem_tmp2_addr
+
+	.global elem_tmp3_addr
+	.type elem_tmp3_addr,%function
+elem_tmp3_addr:
+	LAddr x0, elem_tmp3
+	ret
+	.size elem_tmp3_addr,.-elem_tmp3_addr
+
+	.global snum_overflow_addr
+	.type snum_overflow_addr,%function
+snum_overflow_addr:
+	LAddr x0, snum_overflow
+	ret
+	.size snum_overflow_addr,.-snum_overflow_addr
+
+	.global stack_depth
+	.type stack_depth,%function
+stack_depth:
+	ldr x0,[x0]			/* *sp */
+	ret
+	.size stack_depth,.-stack_depth
+
+	.macro ELEM_PTR idxreg, elemsreg, outreg
+	mov  w9, #528
+	mul  \outreg, \idxreg, x9
+	add  \outreg, \outreg, \elemsreg
+	.endm
+
+	.global stack_top_ptr
+	.type stack_top_ptr,%function
+stack_top_ptr:				/* x0=&sp, x1=elems -> A record */
+	ldr x2,[x0]
+	sub x2,x2,#1
+	ELEM_PTR x2, x1, x0
+	ret
+	.size stack_top_ptr,.-stack_top_ptr
+
+	.global stack_second_ptr
+	.type stack_second_ptr,%function
+stack_second_ptr:
+	ldr x2,[x0]
+	sub x2,x2,#2
+	ELEM_PTR x2, x1, x0
+	ret
+	.size stack_second_ptr,.-stack_second_ptr
+
+	.global stack_third_ptr
+	.type stack_third_ptr,%function
+stack_third_ptr:
+	ldr x2,[x0]
+	sub x2,x2,#3
+	ELEM_PTR x2, x1, x0
+	ret
+	.size stack_third_ptr,.-stack_third_ptr
+
+	.global stack_elem_ptr
+	.type stack_elem_ptr,%function
+stack_elem_ptr:				/* x1=elems, x2=idx -> ptr */
+	ELEM_PTR x2, x1, x0
+	ret
+	.size stack_elem_ptr,.-stack_elem_ptr
+
+	.global stack_pop
+	.type stack_pop,%function
+stack_pop:				/* x0=&sp */
+	ldr x2,[x0]
+	cbz x2, 9f
+	sub x2,x2,#1
+	str x2,[x0]
+9:	ret
+	.size stack_pop,.-stack_pop
+
+	/* elem_move(dst_rec, src_rec) -- copies len + data. Only touches x0-x3. */
+	.global elem_move
+	.type elem_move,%function
+elem_move:
+	ldr  w2,[x1]
+	str  w2,[x0]
+	add  x0,x0,#4
+	add  x1,x1,#4
+	cbz  w2, 9f
+1:	ldrb w3,[x1],#1
+	strb w3,[x0],#1
+	subs w2,w2,#1
+	b.ne 1b
+9:	ret
+	.size elem_move,.-elem_move
+
+	.global stack_push
+	.type stack_push,%function
+stack_push:				/* x0=&sp,x1=elems,x2=data,x3=len */
+	mov  x12,x0
+	mov  x13,x1
+	mov  x14,x3			/* len */
+	ldr  x4,[x12]
+	cmp  x4,#1000
+	b.hs .sp_push_fail
+	ELEM_PTR x4, x13, x6
+	str  w14,[x6]			/* len */
+	add  x7,x6,#4
+	mov  x8,x14
+	cbz  x8, .sp_push_ok
+1:	ldrb w9,[x2],#1
+	strb w9,[x7],#1
+	subs x8,x8,#1
+	b.ne 1b
+.sp_push_ok:
+	ldr  x4,[x12]
+	add  x4,x4,#1
+	str  x4,[x12]
+	mov  w0,#1
+	ret
+.sp_push_fail:
+	mov  w0,#0
+	ret
+	.size stack_push,.-stack_push
+
+	.global stack_push_copy
+	.type stack_push_copy,%function
+stack_push_copy:			/* x0=&sp,x1=elems,x2=src_rec */
+	ldr  x4,[x0]
+	cmp  x4,#1000
+	b.hs .spc_fail
+	ELEM_PTR x4, x1, x6
+	ldr  w7,[x2]			/* len */
+	str  w7,[x6]
+	add  x8,x6,#4
+	add  x9,x2,#4
+	cbz  w7, .spc_ok
+1:	ldrb w10,[x9],#1
+	strb w10,[x8],#1
+	subs w7,w7,#1
+	b.ne 1b
+.spc_ok:
+	ldr  x4,[x0]
+	add  x4,x4,#1
+	str  x4,[x0]
+	mov  w0,#1
+	ret
+.spc_fail:
+	mov  w0,#0
+	ret
+	.size stack_push_copy,.-stack_push_copy
+
+	.global stack_dup_index
+	.type stack_dup_index,%function
+stack_dup_index:			/* x0=&sp,x1=elems,x2=raw_index */
+	ldr  x4,[x0]
+	cmp  x4,#1000
+	b.hs .sdi_fail
+	ELEM_PTR x2, x1, x6		/* src */
+	ELEM_PTR x4, x1, x7		/* dst */
+	ldr  w8,[x6]
+	str  w8,[x7]
+	add  x9,x7,#4
+	add  x10,x6,#4
+	mov  x11,x8
+	cbz  w8, .sdi_ok
+1:	ldrb w12,[x10],#1
+	strb w12,[x9],#1
+	subs w8,w8,#1
+	b.ne 1b
+.sdi_ok:
+	ldr  x4,[x0]
+	add  x4,x4,#1
+	str  x4,[x0]
+	mov  w0,#1
+	ret
+.sdi_fail:
+	mov  w0,#0
+	ret
+	.size stack_dup_index,.-stack_dup_index
+
+	.global stack_erase_index
+	.type stack_erase_index,%function
+stack_erase_index:			/* x0=&sp,x1=elems,x2=raw_index */
+	mov  x12,x0
+	mov  x13,x1
+	ldr  x4,[x12]			/* sp */
+	mov  x5,x2
+	add  x6,x5,#1			/* j = raw+1 */
+1:	cmp  x6,x4
+	b.hs .ser_done
+	/* src = elems + j*528 ; dst = elems + (j-1)*528.
+	 * NOTE: do NOT use ELEM_PTR with x9 (the macro's 528 constant reg). */
+	mov  w7,#528
+	mul  x8,x6,x7
+	add  x8,x8,x13		/* src (j) */
+	sub  x9,x6,#1
+	mul  x10,x9,x7
+	add  x10,x10,x13	/* dst (j-1) */
+	ldr  w11,[x8]
+	str  w11,[x10]
+	add  x16,x8,#4		/* src data */
+	add  x9,x10,#4		/* dst data */
+	cbz  w11, 2f
+3:	ldrb w17,[x16],#1
+	strb w17,[x9],#1
+	subs w11,w11,#1
+	b.ne 3b
+2:	add  x6,x6,#1
+	b    1b
+.ser_done:
+	ldr  x4,[x12]
+	sub  x4,x4,#1
+	str  x4,[x12]
+	ret
+	.size stack_erase_index,.-stack_erase_index
+
+	.global stack_insert_index
+	.type stack_insert_index,%function
+stack_insert_index:			/* x0=&sp,x1=elems,x2=raw,x3=data,x4=len */
+	mov  x12,x0
+	mov  x13,x1
+	mov  x14,x2			/* raw */
+	mov  x15,x3			/* data */
+	mov  x16,x4			/* len */
+	ldr  x4,[x12]
+	cmp  x4,#1000
+	b.hs .sii_fail
+	sub  x5,x4,#1			/* j = sp-1 */
+1:	cmp  x5,x14
+	b.lo .sii_sd
+	ELEM_PTR x5, x13, x7		/* src (j) */
+	add  x8,x5,#1
+	ELEM_PTR x8, x13, x8		/* dst (j+1) */
+	ldr  w11,[x7]
+	str  w11,[x8]
+	add  x9,x7,#4
+	add  x10,x8,#4
+	cbz  w11, 2f
+3:	ldrb w17,[x9],#1
+	strb w17,[x10],#1
+	subs w11,w11,#1
+	b.ne 3b
+2:	sub  x5,x5,#1
+	b    1b
+.sii_sd:
+	ELEM_PTR x14, x13, x7		/* rec */
+	str  w16,[x7]			/* len */
+	add  x8,x7,#4
+	mov  x17,x16
+	cbz  w17, 5f
+6:	ldrb w2,[x15],#1
+	strb w2,[x8],#1
+	subs w17,w17,#1
+	b.ne 6b
+5:	ldr  x4,[x12]
+	add  x4,x4,#1
+	str  x4,[x12]
+	mov  w0,#1
+	ret
+.sii_fail:
+	mov  w0,#0
+	ret
+	.size stack_insert_index,.-stack_insert_index
+
+	.global stack_swap_two
+	.type stack_swap_two,%function
+stack_swap_two:				/* x0=&sp,x1=elems */
+	stp  x29,x30,[sp,#-16]!		/* save our return addr; bl elem_move clobbers x30 */
+	mov  x29,sp
+	ldr  x2,[x0]
+	sub  x2,x2,#1
+	mov  w3,#528
+	mul  x4,x2,x3
+	add  x4,x4,x1			/* A */
+	ldr  x2,[x0]
+	sub  x2,x2,#2
+	mul  x5,x2,x3
+	add  x5,x5,x1			/* B */
+	LAddr x6, elem_tmp0
+	mov  x0,x6
+	mov  x1,x4
+	bl   elem_move			/* tmp0 = *A */
+	LAddr x6, elem_tmp1
+	mov  x0,x6
+	mov  x1,x5
+	bl   elem_move			/* tmp1 = *B */
+	mov  x0,x4
+	LAddr x1, elem_tmp1
+	bl   elem_move			/* *A = tmp1 */
+	mov  x0,x5
+	LAddr x1, elem_tmp0
+	bl   elem_move			/* *B = tmp0 */
+	ldp  x29,x30,[sp],#16
+	ret
+	.size stack_swap_two,.-stack_swap_two
+
+	/* get_op(&pc, pend) -> x0 = opcode+1 (success) / 0 (fail/end) */
+	.global get_op
+	.type get_op,%function
+get_op:
+	mov  x3,x0			/* &pc */
+	ldr  x4,[x0]			/* pc */
+	cmp  x4,x1
+	b.hs .gop_bad
+	ldrb w2,[x4]			/* opcode */
+	add  x4,x4,#1
+	cmp  w2,#0x4e
+	b.hi .gop_plain
+	cmp  w2,#0x4c
+	b.lo .gop_direct
+	b.eq .gop_pd1
+	cmp  w2,#0x4d
+	b.eq .gop_pd2
+	/* OP_PUSHDATA4 */
+	add  x5,x4,#4
+	cmp  x5,x1
+	b.hi .gop_bad
+	ldr  w6,[x4]
+	add  x4,x4,#4
+	b    .gop_sized
+.gop_plain:
+	mov  w6,#0
+	b    .gop_done
+.gop_direct:
+	mov  x6,x2
+	b    .gop_sized
+.gop_pd1:
+	cmp  x4,x1
+	b.hs .gop_bad
+	ldrb w6,[x4]
+	add  x4,x4,#1
+	b    .gop_sized
+.gop_pd2:
+	add  x5,x4,#2
+	cmp  x5,x1
+	b.hi .gop_bad
+	ldrh w6,[x4]
+	add  x4,x4,#2
+.gop_sized:
+	add  x5,x4,x6
+	cmp  x5,x1
+	b.hi .gop_bad
+	add  x4,x4,x6
+.gop_done:
+	str  x4,[x3]
+	add  x0,x2,#1
+	ret
+.gop_bad:
+	mov  w0,#0
+	ret
+	.size get_op,.-get_op
+
+	.global vfexec_sp_reset
+	.type vfexec_sp_reset,%function
+vfexec_sp_reset:
+	LAddr x0, vfexec_sp
+	str  xzr,[x0]
+	ret
+	.size vfexec_sp_reset,.-vfexec_sp_reset
+
+	.global vfexec_push
+	.type vfexec_push,%function
+vfexec_push:				/* x0 = 0/1 */
+	LAddr x2, vfexec_sp
+	ldr  x3,[x2]
+	LAddr x4, vfexec
+	strb w0,[x4,x3]
+	add  x3,x3,#1
+	str  x3,[x2]
+	ret
+	.size vfexec_push,.-vfexec_push
+
+	.global vfexec_pop
+	.type vfexec_pop,%function
+vfexec_pop:
+	LAddr x1, vfexec_sp
+	ldr  x2,[x1]
+	cbz  x2, 9f
+	sub  x2,x2,#1
+	str  x2,[x1]
+9:	ret
+	.size vfexec_pop,.-vfexec_pop
+
+	.global vfexec_depth
+	.type vfexec_depth,%function
+vfexec_depth:
+	LAddr x0, vfexec_sp
+	ldr  x0,[x0]
+	ret
+	.size vfexec_depth,.-vfexec_depth
+
+	.global vfexec_toggle_top
+	.type vfexec_toggle_top,%function
+vfexec_toggle_top:
+	LAddr x1, vfexec_sp
+	ldr  x2,[x1]
+	cbz  x2, 9f
+	LAddr x3, vfexec
+	sub  x2,x2,#1
+	ldrb w4,[x3,x2]
+	eor  w4,w4,#1
+	strb w4,[x3,x2]
+9:	ret
+	.size vfexec_toggle_top,.-vfexec_toggle_top
+
+	.global vfexec_all_true
+	.type vfexec_all_true,%function
+vfexec_all_true:
+	LAddr x1, vfexec_sp
+	ldr  x2,[x1]
+	LAddr x3, vfexec
+	mov  x4,#0
+1:	cmp  x4,x2
+	b.hs .vfa_yes
+	ldrb w5,[x3,x4]
+	cbz  w5,.vfa_no
+	add  x4,x4,#1
+	b    1b
+.vfa_no:
+	mov  w0,#0
+	ret
+.vfa_yes:
+	mov  w0,#1
+	ret
+	.size vfexec_all_true,.-vfexec_all_true
+
+	.section .note.GNU-stack,"",%progbits

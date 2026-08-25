@@ -159,3 +159,11 @@ lines + bitcoin_scriptcodec.asm). Port it and the C wrapper links unchanged.
 Ported + verified (150k vectors, 10 seeds, 0 fail): scriptnum_decode, scriptnum_serialize,
 cast_to_bool, der_sig_strict (BIP66), check_minimal_push. NEXT in this module: get_op,
 scriptnum elem boundary, then the element-stack engine (stack_push/pop/copy/dup/erase/insert), then vfExec, then script_eval (bitcoin_interp.asm).
+
+## interpreter foundation -- COMPLETE (2026-08-25)
+bitcoin_scriptcodec.asm is FULLY ported to port/arm64/bitcoin_scriptcodec.S and verified:
+- part 1: scriptnum_decode/serialize, cast_to_bool, der_sig_strict, check_minimal_push (150k vec, 10 seeds, 0 fail)
+- part 2: elem_tmp*_addr, snum_overflow_addr, stack depth/top/second/third/elem_ptr, stack_pop,
+  stack_push(_copy), stack_dup/erase/insert_index, stack_swap_two, elem_move, get_op,
+  vfexec_sp_reset/push/pop/depth/toggle_top/all_true (10 seeds x 500 scripted cases, 0 fail).
+NEXT: bitcoin_interp.asm -- script_eval, the opcode-dispatch VM (the last consensus module).
