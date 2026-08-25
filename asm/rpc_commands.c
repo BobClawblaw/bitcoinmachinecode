@@ -25,6 +25,17 @@ extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen
 /* message signing (asm/wallet_msgsign.c): Core-byte-compatible compact sigs. */
 extern int  msg_sign_core(const unsigned char priv_be[32], const char* message, char sig_b64[96]);
 extern int  msg_verify_core(const char* address, const char* message, const char* sig_b64);
+/* tx-signing primitives for signrawtransactionwithkey. */
+extern int  legacy_sighash(unsigned char out32[32], const unsigned char* tx, unsigned long txlen,
+                           unsigned long nIn, const unsigned char* scriptCode, unsigned long scLen,
+                           int hashtype, unsigned char* preimg, unsigned long cap);
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
+extern int  wallet_ecdsa_sign(unsigned long long r[4], unsigned long long s[4],
+                              const unsigned char z_be[32], const unsigned char priv_be[32]);
+extern int  der_signature_export(unsigned char* out, const unsigned long long r[4], const unsigned long long s[4]);
+extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
+extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
+extern void hash160(unsigned char out[20], const void* in, long long len);
 
 /* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
  * rpc_commands_set_utxo_store's own doc comment in the header. */
@@ -706,12 +717,231 @@ static int cmd_createrawtransaction(const rj_val* params, long* ec, const char**
     return 1;
 }
 
+/* ---- signrawtransactionwithkey (pure, no wallet state) ---------------------
+ * Core rpc/rawtransaction.cpp signrawtransactionwithkey. Signs an unsigned tx
+ * with explicitly provided keys against provided prevtxs, returning
+ * {hex, complete, errors}. This increment covers the ECDSA single-sig types:
+ * P2PKH, P2WPKH, and P2SH-P2WPKH (nested segwit). P2WSH/P2SH multisig and P2TR
+ * (Schnorr) are not signed here -- they surface in `errors` with complete:false
+ * -- because full multisig assembly and a BIP340 signer are separate tasks (the
+ * tree has no Schnorr signer today). Non-wallet in Core, so validity is
+ * cross-checked: a tx signed here is accepted by our own txval_modern (itself
+ * differentially tested against Core consensus). ECDSA nonce is not RFC6979, so
+ * signatures are valid but not byte-identical to Core's. */
+static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed){
+    if (p[0] < 0xfd){ *consumed=1; return p[0]; }
+    if (p[0]==0xfd){ *consumed=3; return (unsigned long)p[1] | ((unsigned long)p[2]<<8); }
+    if (p[0]==0xfe){ *consumed=5; return (unsigned long)p[1]|((unsigned long)p[2]<<8)|((unsigned long)p[3]<<16)|((unsigned long)p[4]<<24); }
+    *consumed=9; unsigned long v=0; for(int i=0;i<8;i++) v|=((unsigned long)p[1+i])<<(8*i); return v;
+}
+/* WIF -> 32-byte priv; *comp=1 if compressed. returns 1 ok. */
+static int srw_wif(const char* wif, unsigned char priv[32], int* comp){
+    unsigned char pay[64]; long pl=0;
+    if (!wallet_base58check_decode(pay,(long)sizeof pay,&pl,wif) || pl<33 || pay[0]!=0x80) return 0;
+    if (pl==34){ if (pay[33]!=0x01) return 0; *comp=1; }
+    else if (pl==33){ *comp=0; }
+    else return 0;
+    memcpy(priv, pay+1, 32);
+    return 1;
+}
+/* parse SIGHASH type string -> byte; default ALL. -1 on error. */
+static int srw_hashtype(const char* s){
+    if (!s) return 0x01;
+    int base=0, acp=0; const char* bar=strchr(s,'|');
+    size_t bl = bar ? (size_t)(bar-s) : strlen(s);
+    if (bl==3 && !strncmp(s,"ALL",3)) base=1;
+    else if (bl==4 && !strncmp(s,"NONE",4)) base=2;
+    else if (bl==6 && !strncmp(s,"SINGLE",6)) base=3;
+    else return -1;
+    if (bar){ if (!strcmp(bar+1,"ANYONECANPAY")) acp=0x80; else return -1; }
+    return base|acp;
+}
+typedef struct { unsigned char txid_wire[32]; unsigned long vout; unsigned char spk[64]; unsigned long spklen;
+                 unsigned long long amount; unsigned char redeem[128]; unsigned long redeemlen; } srw_prev_t;
+
+/* BIP143 segwit-v0 sighash. hp/hs/ho are the caller-selected hashPrevouts /
+ * hashSequence / hashOutputs (zeroed per the SIGHASH type). */
+static void srw_bip143(unsigned char z[32], const unsigned char ver4[4],
+                       const unsigned char hp[32], const unsigned char hs[32],
+                       const unsigned char outpoint36[36], const unsigned char* scode,
+                       unsigned long sclen, unsigned long long amount, unsigned seq,
+                       const unsigned char ho[32], unsigned long locktime, int hashtype){
+    unsigned char* pre=malloc((size_t)sclen+256); unsigned long n=0;
+    memcpy(pre+n,ver4,4); n+=4;
+    memcpy(pre+n,hp,32); n+=32;
+    memcpy(pre+n,hs,32); n+=32;
+    memcpy(pre+n,outpoint36,36); n+=36;
+    n+=crt_varint(pre+n,(unsigned long long)sclen); memcpy(pre+n,scode,sclen); n+=sclen;
+    for(int k=0;k<8;k++) pre[n++]=(unsigned char)(amount>>(8*k));
+    pre[n++]=(unsigned char)seq;pre[n++]=(unsigned char)(seq>>8);pre[n++]=(unsigned char)(seq>>16);pre[n++]=(unsigned char)(seq>>24);
+    memcpy(pre+n,ho,32); n+=32;
+    pre[n++]=(unsigned char)locktime;pre[n++]=(unsigned char)(locktime>>8);pre[n++]=(unsigned char)(locktime>>16);pre[n++]=(unsigned char)(locktime>>24);
+    unsigned ht=(unsigned)hashtype; pre[n++]=(unsigned char)ht;pre[n++]=(unsigned char)(ht>>8);pre[n++]=(unsigned char)(ht>>16);pre[n++]=(unsigned char)(ht>>24);
+    sha256d(z,pre,n); free(pre);
+}
+
+static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_STR || params->items[1]->typ!=RJ_ARR){
+        *ec=-8; *em="Invalid parameters, expected hexstring and privkeys array"; return 0; }
+    /* --- raw tx --- */
+    const char* txhex=params->items[0]->str; size_t thl=strlen(txhex);
+    if ((thl&1)||thl/2<10||thl/2>200000){ *ec=-22; *em="TX decode failed"; return 0; }
+    unsigned long txlen=(unsigned long)(thl/2);
+    static unsigned char tx[200000];
+    if (!hex_to_bytes(tx,txhex,thl)){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* --- keys --- */
+    const rj_val* pk=params->items[1];
+    int nk=(int)pk->nitems; if (nk>64) nk=64;
+    unsigned char kpriv[64][32]; unsigned char kpub[64][33]; unsigned char kh[64][20]; int ncomp[64]; int nkeys=0;
+    for (int i=0;i<(int)pk->nitems && nkeys<64;i++){
+        if (pk->items[i]->typ!=RJ_STR) continue;
+        int comp=1; if (!srw_wif(pk->items[i]->str,kpriv[nkeys],&comp)){ *ec=-8; *em="Invalid private key"; return 0; }
+        scalar_to_pubkey(kpub[nkeys],kpriv[nkeys]); wallet_key_h160(kh[nkeys],kpriv[nkeys]); ncomp[nkeys]=comp; nkeys++;
+    }
+    /* --- prevtxs --- */
+    static srw_prev_t prev[10000]; int nprev=0;
+    if (params->nitems>=3 && params->items[2]->typ==RJ_ARR){
+        const rj_val* pv=params->items[2];
+        for (size_t i=0;i<pv->nitems && nprev<10000;i++){
+            const rj_val* e=pv->items[i]; if (e->typ!=RJ_OBJ) continue;
+            rj_val* tid=rj_obj_get(e,"txid"); rj_val* vo=rj_obj_get(e,"vout"); rj_val* spk=rj_obj_get(e,"scriptPubKey");
+            if (!tid||tid->typ!=RJ_STR||strlen(tid->str)!=64||!vo||vo->typ!=RJ_NUM||!spk||spk->typ!=RJ_STR) continue;
+            srw_prev_t* P=&prev[nprev];
+            unsigned char idd[32]; if (!hex_to_bytes(idd,tid->str,64)) continue;
+            for (int k=0;k<32;k++) P->txid_wire[k]=idd[31-k];
+            P->vout=strtoul(vo->str,0,10);
+            size_t sl=strlen(spk->str); if ((sl&1)||sl/2>64) continue; P->spklen=(unsigned long)(sl/2);
+            if (!hex_to_bytes(P->spk,spk->str,sl)) continue;
+            rj_val* am=rj_obj_get(e,"amount"); P->amount = (am&&am->typ==RJ_NUM)? (unsigned long long)crt_amount_to_sat(am->str) : 0;
+            rj_val* rs=rj_obj_get(e,"redeemScript"); P->redeemlen=0;
+            if (rs&&rs->typ==RJ_STR){ size_t rl=strlen(rs->str); if (!(rl&1)&&rl/2<=128){ P->redeemlen=(unsigned long)(rl/2); hex_to_bytes(P->redeem,rs->str,rl); } }
+            nprev++;
+        }
+    }
+    int hashtype = (params->nitems>=4 && params->items[3]->typ==RJ_STR) ? srw_hashtype(params->items[3]->str) : 0x01;
+    if (hashtype<0){ *ec=-8; *em="Invalid sighash param"; return 0; }
+
+    /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
+    unsigned long p=4, cc; unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
+    if (n_in==0||n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    const unsigned char* in_outpoint[10000]; unsigned in_seq[10000];
+    for (unsigned long i=0;i<n_in;i++){
+        in_outpoint[i]=tx+p; p+=36;
+        unsigned long ssl=srw_varint(tx+p,&cc); p+=cc+ssl;
+        in_seq[i]=(unsigned)tx[p]|((unsigned)tx[p+1]<<8)|((unsigned)tx[p+2]<<16)|((unsigned)tx[p+3]<<24); p+=4;
+    }
+    unsigned long out_start=p; unsigned long n_out=srw_varint(tx+p,&cc); p+=cc;
+    for (unsigned long i=0;i<n_out;i++){ p+=8; unsigned long sl=srw_varint(tx+p,&cc); p+=cc+sl; }
+    unsigned long out_end=p; unsigned long locktime=(unsigned long)tx[p]|((unsigned long)tx[p+1]<<8)|((unsigned long)tx[p+2]<<16)|((unsigned long)tx[p+3]<<24);
+
+    /* --- BIP143 mid-hashes (SIGHASH_ALL, non-ACP baseline) --- */
+    unsigned char zero32[32]; memset(zero32,0,32);
+    unsigned char hashPrevouts[32], hashSequence[32], hashOutputs[32];
+    { static unsigned char b[10000*36]; unsigned long m=0; for(unsigned long i=0;i<n_in;i++){ memcpy(b+m,in_outpoint[i],36); m+=36; } sha256d(hashPrevouts,b,m); }
+    { static unsigned char b[10000*4]; unsigned long m=0; for(unsigned long i=0;i<n_in;i++){ unsigned sq=in_seq[i]; b[m++]=(unsigned char)sq;b[m++]=(unsigned char)(sq>>8);b[m++]=(unsigned char)(sq>>16);b[m++]=(unsigned char)(sq>>24);} sha256d(hashSequence,b,m); }
+    { unsigned long cc2; srw_varint(tx+out_start,&cc2); sha256d(hashOutputs, tx+out_start+cc2, out_end-(out_start+cc2)); }
+    int ht_base = hashtype & 0x1f, ht_acp = hashtype & 0x80;
+    const unsigned char* bip_hp = ht_acp ? zero32 : hashPrevouts;
+    const unsigned char* bip_hs = (ht_acp || ht_base!=1) ? zero32 : hashSequence;
+    /* hashOutputs: ALL -> all; SINGLE/NONE handled per-input below (defaults to ALL's set for ALL) */
+    const unsigned char* bip_ho = (ht_base==1) ? hashOutputs : zero32;
+
+    /* --- sign each input --- */
+    static unsigned char ss[10000][256]; unsigned long sslen[10000];      /* scriptSig per input */
+    static unsigned char witbuf[10000][256]; unsigned long witlen[10000]; int wititems[10000]; /* witness serialized (count+items) */
+    int any_segwit=0, complete=1;
+    rj_val* errors=rj_arr();
+    unsigned char* pre=malloc((size_t)txlen+8192); if (!pre){ *ec=-7; *em="oom"; return 0; }
+    for (unsigned long i=0;i<n_in;i++){
+        sslen[i]=0; witlen[i]=0; wititems[i]=0;
+        /* match prevout */
+        srw_prev_t* P=NULL; unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
+        for (int k=0;k<nprev;k++) if (prev[k].vout==vo && !memcmp(prev[k].txid_wire,in_outpoint[i],32)){ P=&prev[k]; break; }
+        const char* err=NULL;
+        if (!P){ err="Input not found or already spent"; }
+        else {
+            const unsigned char* spk=P->spk; unsigned long sl=P->spklen;
+            int found=-1;
+            unsigned char z[32]; unsigned long long r[4],s[4]; unsigned char der[80]; int dl;
+            if (sl==25 && spk[0]==0x76&&spk[1]==0xa9&&spk[2]==0x14&&spk[23]==0x88&&spk[24]==0xac){        /* P2PKH */
+                for (int k=0;k<nkeys;k++) if (!memcmp(kh[k],spk+3,20)){ found=k; break; }
+                if (found<0){ err="Keys not provided for this input"; }
+                else if (!legacy_sighash(z,tx,txlen,i,spk,25,hashtype,pre,(unsigned long)txlen+8192)){ err="sighash failed"; }
+                else { wallet_ecdsa_sign(r,s,z,kpriv[found]); dl=der_signature_export(der,r,s); der[dl]=(unsigned char)hashtype; dl++;
+                    unsigned long o=0; ss[i][o++]=(unsigned char)dl; memcpy(ss[i]+o,der,dl); o+=dl;
+                    ss[i][o++]=(unsigned char)33; memcpy(ss[i]+o,kpub[found],33); o+=33; sslen[i]=o; }
+            } else if (sl==22 && spk[0]==0x00&&spk[1]==0x14){                                             /* P2WPKH */
+                for (int k=0;k<nkeys;k++) if (!memcmp(kh[k],spk+2,20)){ found=k; break; }
+                if (found<0){ err="Keys not provided for this input"; }
+                else { unsigned char scode[25]={0x76,0xa9,0x14}; memcpy(scode+3,spk+2,20); scode[23]=0x88; scode[24]=0xac;
+                    srw_bip143(z, tx, bip_hp, bip_hs, in_outpoint[i], scode, 25, P->amount, in_seq[i], bip_ho, locktime, hashtype);
+                    wallet_ecdsa_sign(r,s,z,kpriv[found]); dl=der_signature_export(der,r,s); der[dl]=(unsigned char)hashtype; dl++;
+                    unsigned long o=0; witbuf[i][o++]=(unsigned char)dl; memcpy(witbuf[i]+o,der,dl); o+=dl;
+                    witbuf[i][o++]=33; memcpy(witbuf[i]+o,kpub[found],33); o+=33; witlen[i]=o; wititems[i]=2; any_segwit=1; }
+            } else if (sl==23 && spk[0]==0xa9&&spk[1]==0x14&&spk[22]==0x87 && P->redeemlen==22 && P->redeem[0]==0x00 && P->redeem[1]==0x14){ /* P2SH-P2WPKH */
+                unsigned char rh[20]; hash160(rh,P->redeem,22);
+                if (memcmp(rh,spk+2,20)){ err="redeemScript does not match scriptPubKey"; }
+                else { for (int k=0;k<nkeys;k++) if (!memcmp(kh[k],P->redeem+2,20)){ found=k; break; }
+                    if (found<0){ err="Keys not provided for this input"; }
+                    else { unsigned char scode[25]={0x76,0xa9,0x14}; memcpy(scode+3,P->redeem+2,20); scode[23]=0x88; scode[24]=0xac;
+                        srw_bip143(z, tx, bip_hp, bip_hs, in_outpoint[i], scode, 25, P->amount, in_seq[i], bip_ho, locktime, hashtype);
+                        wallet_ecdsa_sign(r,s,z,kpriv[found]); dl=der_signature_export(der,r,s); der[dl]=(unsigned char)hashtype; dl++;
+                        unsigned long o=0; witbuf[i][o++]=(unsigned char)dl; memcpy(witbuf[i]+o,der,dl); o+=dl;
+                        witbuf[i][o++]=33; memcpy(witbuf[i]+o,kpub[found],33); o+=33; witlen[i]=o; wititems[i]=2; any_segwit=1;
+                        /* scriptSig = push(redeemScript) */
+                        ss[i][0]=(unsigned char)P->redeemlen; memcpy(ss[i]+1,P->redeem,P->redeemlen); sslen[i]=1+P->redeemlen; } }
+            } else {
+                err="Unsupported script type (P2WSH/P2SH-multisig/P2TR signing not yet implemented)";
+            }
+        }
+        if (err){
+            complete=0;
+            rj_val* eo=rj_obj();
+            char idh[65]; unsigned char disp[32]; for(int k=0;k<32;k++) disp[k]=in_outpoint[i][31-k]; bin_to_hex(idh,disp,32);
+            rj_obj_set(eo,"txid",rj_str(idh));
+            rj_obj_set(eo,"vout",rj_numf("%lu",vo));
+            rj_obj_set(eo,"sequence",rj_numf("%u",in_seq[i]));
+            rj_obj_set(eo,"error",rj_str(err));
+            rj_arr_push(errors,eo);
+        }
+    }
+    free(pre);
+
+    /* --- serialize signed tx --- */
+    static unsigned char out[400000]; unsigned long n=0;
+    out[n++]=tx[0];out[n++]=tx[1];out[n++]=tx[2];out[n++]=tx[3];        /* version */
+    if (any_segwit){ out[n++]=0x00; out[n++]=0x01; }
+    n+=crt_varint(out+n,(unsigned long long)n_in);
+    for (unsigned long i=0;i<n_in;i++){
+        memcpy(out+n,in_outpoint[i],36); n+=36;
+        n+=crt_varint(out+n,(unsigned long long)sslen[i]); memcpy(out+n,ss[i],sslen[i]); n+=sslen[i];
+        out[n++]=(unsigned char)in_seq[i];out[n++]=(unsigned char)(in_seq[i]>>8);out[n++]=(unsigned char)(in_seq[i]>>16);out[n++]=(unsigned char)(in_seq[i]>>24);
+    }
+    memcpy(out+n,tx+out_start,out_end-out_start); n+=out_end-out_start;    /* outputs region verbatim */
+    if (any_segwit){
+        for (unsigned long i=0;i<n_in;i++){
+            if (wititems[i]==0){ out[n++]=0x00; }                          /* empty stack */
+            else { n+=crt_varint(out+n,(unsigned long long)wititems[i]); memcpy(out+n,witbuf[i],witlen[i]); n+=witlen[i]; }
+        }
+    }
+    out[n++]=(unsigned char)locktime;out[n++]=(unsigned char)(locktime>>8);out[n++]=(unsigned char)(locktime>>16);out[n++]=(unsigned char)(locktime>>24);
+
+    char* hex=malloc((size_t)n*2+1); if (!hex){ rj_free(errors); *ec=-7; *em="oom"; return 0; }
+    bin_to_hex(hex,out,(size_t)n);
+    rj_val* o=rj_obj();
+    rj_obj_set(o,"hex",rj_str(hex)); free(hex);
+    rj_obj_set(o,"complete",rj_bool(complete));
+    if (errors->nitems>0) rj_obj_set(o,"errors",errors); else rj_free(errors);
+    *result=o;
+    return 1;
+}
+
 /* ---- dispatch table ---- */
 int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
-        "signmessagewithprivkey","verifymessage","createrawtransaction",
+        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -746,6 +976,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_verifymessage(params, err_code, err_msg, result);
     if (!strcmp(method, "createrawtransaction"))
         return cmd_createrawtransaction(params, err_code, err_msg, result);
+    if (!strcmp(method, "signrawtransactionwithkey"))
+        return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
      * serve daemon's shared status; -1 means "not one of its methods". */
     {
