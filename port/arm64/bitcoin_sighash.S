@@ -42,9 +42,6 @@
 	.balign 16
 ls_scfbuf:
 	.space 20000
-	.global ls_used
-ls_used:
-	.quad 0
 	.text
 
 /* ============================================================================
@@ -854,12 +851,6 @@ legacy_locate_nout:
 		mov  x1, x10
 		bl   sha256d
 		mov  w0, #1
-		/* debug: record used length */
-		ldr  x9, [x28, #120]
-		ldr  x10, [x28, #56]
-		sub  x11, x9, x10
-		LAddr x16, ls_used
-		str  x11, [x16]
 		b    .ls_done
 	.ls_fail:
 		mov  w0, #0
