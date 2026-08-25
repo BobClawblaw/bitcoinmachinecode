@@ -19,11 +19,19 @@ and runs natively.
 5. Only mark DONE when the repo's own suite + differential fuzz pass natively.
 
 ## Status
-- [x] sha256  -> port/arm64/sha256.S   FIPS-180-4 harness PASS native; 882-case
+- [x] sha256  -> port/arm64/sha256.S      FIPS-180-4 harness PASS native; 882-case
       differential fuzz vs hashlib: 0 fail.   (2026-08-24)
-- [ ] sha1, sha512, ripemd160            (hashing primitives; easy, well-vectored)
-- [ ] bitcoin_hash                        (sha256d, block_hash, diff_target,
-                                           pow_check, merkle_root)   [in DAEMONOBJS]
+- [x] sha1    -> port/arm64/sha1.S        FIPS vectors + 270-case fuzz vs hashlib: 0.
+      (found + fixed halfword-swapped round constants via fuzz)
+- [x] sha512  -> port/arm64/sha512.S      repo harness ALL PASS + 301-case fuzz: 0.
+- [x] ripemd160-> port/arm64/ripemd160.S  repo harness ALL PASS (22 vectors incl.
+      len-boundaries + 1M-a) + 440-case fuzz vs hashlib: 0. Step tables parsed
+      programmatically from Bosselaers' canonical rmd160.c (left/right message
+      order, rotations as 32-s, f-selectors, K constants); fixed the tuple-rotation
+      bug (E,tt,B,C',D) verified in a Python model before the asm.
+- [x] bitcoin_hash -> port/arm64/bitcoin_hash.S  sha256d fuzz vs hashlib; genesis
+      block hash byte-exact; pow_check(genesis) PASS; merkle_root n=1..1000 vs
+      Python reference: 0 fail. Built on ported sha256 (single source of truth).
 - [ ] secp256k1_fe / scalar / point / point_ct / ecdsa / schnorr / taproot
                                           (the security-critical core; validate
                                            against *_{fe,scalar,glv,scalar}_c.c

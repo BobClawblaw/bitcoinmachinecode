@@ -1,30 +1,45 @@
 # Makefile for native AArch64 ports of the x86-64 assembly modules.
-# Usage: make <target-all>  e.g.  make sha256-test  ;  add more below as ported.
-#
-# Each port lives in this dir as <name>.S (AArch64 GNU as) and must expose the
-# SAME public symbols as the upstream asm/<name>.asm so existing C harnesses
-# link unchanged. Build with the native (host) aarch64 gcc.
+# Each port is <name>.S exposing the SAME symbols as upstream asm/<name>.asm so
+# the shared C harnesses link unchanged. Build with the native (host) aarch64 gcc.
+# Run from this directory (port/arm64); repo asm is two levels up (../../asm).
 
 CC     := gcc
 CFLAGS := -no-pie -O2
+ASMDIR := ../../asm
 
-.PHONY: all sha256-test clean
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash
 
-all: sha256-test
+.PHONY: all test-all harness so fuzz clean
 
-# ---- sha256.S : upstream interface = sha256_init/sha256_block/sha256_full ----
-sha256.o: sha256.S
-	$(CC) -c -o $@ sha256.S
+all: test-all
 
-test_sha256: sha256.o ../asm/tests/test_sha256.c
-	$(CC) $(CFLAGS) -o $@ ../asm/tests/test_sha256.c sha256.o -I../asm
+# one object + one shared lib per module
+%.o: %.S
+	$(CC) -c -o $@ $<
 
-sha256.so: sha256.S
-	$(CC) -shared -fPIC -o $@ sha256.S
+so: $(patsubst %,%.so,$(MODULES))
 
-sha256-test: test_sha256 sha256.so
-	./test_sha256
-	@python3 fuzz_sha256.py
+%.so: %.S
+	$(CC) -shared -fPIC -o $@ $<
+bitcoin_hash.so: bitcoin_hash.S sha256.S
+	$(CC) -shared -fPIC -o $@ bitcoin_hash.S sha256.S
+
+# repo C harness -> native test binary
+test_sha256: sha256.o $(ASMDIR)/tests/test_sha256.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_sha256.c sha256.o -I$(ASMDIR)
+test_sha512: sha512.o $(ASMDIR)/tests/test_sha512.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_sha512.c sha512.o -I$(ASMDIR)
+test_ripemd160: ripemd160.o $(ASMDIR)/tests/test_ripemd160.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_ripemd160.c ripemd160.o -I$(ASMDIR)
+
+harness: test_sha256 test_sha512 test_ripemd160
+	./test_sha256 && ./test_sha512 && ./test_ripemd160
+
+fuzz: so
+	python3 fuzz_all.py
+
+test-all: harness fuzz
+	@echo "ALL PORTED HASHING MODULES VERIFIED NATIVELY"
 
 clean:
-	rm -f *.o *.so test_sha256
+	rm -f *.o *.so test_sha256 test_sha512 test_ripemd160 t_ripemd
