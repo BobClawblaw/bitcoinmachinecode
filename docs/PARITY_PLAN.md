@@ -89,8 +89,11 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       accept), unbroadcast=false. Hermetic test drives a REAL parent->child
       chain through the REAL mpool_policy_add path. Deploy batched with the
       rest (build-side).
-- [ ] getmempoolancestors / getmempooldescendants (same
-      mpool_policy_entry_info snapshot, rendered as arrays/objects)
+- [x] getmempoolancestors / getmempooldescendants -- same
+      mpool_policy_entry_info snapshot; sets EXCLUDE the tx itself
+      (oracle-verified), stale registry members filtered against the pool;
+      non-verbose txid arrays, verbose = getmempoolentry-shaped member
+      objects; -8/-5 error parity shared with getmempoolentry.
 
 ### T5 — Fee estimation
 - [ ] estimatesmartfee / estimaterawfee from mempool feerate buckets + recent blocks
