@@ -838,6 +838,62 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
     return 1;
 }
 
+/* joinpsbts (Core rpc/rawtransaction.cpp): join distinct PSBTs into one whose
+ * unsigned tx spends all their inputs and creates all their outputs. Core
+ * builds a fresh tx (version 2, locktime 0) and appends each PSBT's inputs and
+ * outputs (with their per-input/output maps) in order. */
+static int cmd_joinpsbts(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_ARR||params->items[0]->nitems<2){
+        *ec=-8; *em="At least two PSBTs are required to join PSBTs."; return 0; }
+    const rj_val* arr=params->items[0]; int np=(int)arr->nitems; if (np>PSBT_MAXP) np=PSBT_MAXP;
+    static unsigned char bufs[PSBT_MAXP][200000]; long blens[PSBT_MAXP];
+    /* merged tx pieces + maps, in append order */
+    static unsigned char vin_buf[200000]; long vin_n=0; long total_in=0;
+    static unsigned char vout_buf[200000]; long vout_n=0; long total_out=0;
+    static psbt_kv imaps[PSBT_MAXIO][PSBT_MAXKV]; static int imaps_n[PSBT_MAXIO]; long tot_i=0;
+    static psbt_kv omaps[PSBT_MAXIO][PSBT_MAXKV]; static int omaps_n[PSBT_MAXIO]; long tot_o=0;
+    for (int pi=0; pi<np; pi++){
+        if (arr->items[pi]->typ!=RJ_STR){ *ec=-22; *em="TX decode failed"; return 0; }
+        if (!crt_b64dec(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi]) || blens[pi]<5 || memcmp(bufs[pi],"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+        long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
+        const unsigned char* utx=NULL; unsigned long utxl=0;
+        for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
+        if (!utx){ *ec=-22; *em="Only PSBTv0 (with an unsigned tx) can be joined"; return 0; }
+        /* parse this tx's inputs/outputs */
+        unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
+        for (unsigned long k=0;k<n_in;k++){
+            memcpy(vin_buf+vin_n, utx+q, 36); vin_n+=36; q+=36;   /* outpoint */
+            unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl;      /* skip (empty) scriptSig */
+            vin_buf[vin_n++]=0x00;                                 /* empty scriptSig */
+            memcpy(vin_buf+vin_n, utx+q, 4); vin_n+=4; q+=4;       /* sequence */
+            total_in++;
+        }
+        unsigned long n_out=srw_varint(utx+q,&cc); q+=cc;
+        for (unsigned long k=0;k<n_out;k++){
+            long os=q; q+=8; unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl;   /* value + spk */
+            memcpy(vout_buf+vout_n, utx+os, q-os); vout_n+=(long)(q-os); total_out++;
+        }
+        /* this PSBT's input/output maps, appended in order */
+        for (unsigned long k=0;k<n_in && tot_i<PSBT_MAXIO;k++){ imaps_n[tot_i]=psbt_parse_map(bufs[pi],blens[pi],&p,imaps[tot_i],PSBT_MAXKV); tot_i++; }
+        for (unsigned long k=0;k<n_out && tot_o<PSBT_MAXIO;k++){ omaps_n[tot_o]=psbt_parse_map(bufs[pi],blens[pi],&p,omaps[tot_o],PSBT_MAXKV); tot_o++; }
+    }
+    /* build merged unsigned tx: version 2, all inputs, all outputs, locktime 0 */
+    static unsigned char tx[420000]; long t=0;
+    tx[t++]=2;tx[t++]=0;tx[t++]=0;tx[t++]=0;
+    t+=crt_varint(tx+t,(unsigned long long)total_in); memcpy(tx+t,vin_buf,vin_n); t+=vin_n;
+    t+=crt_varint(tx+t,(unsigned long long)total_out); memcpy(tx+t,vout_buf,vout_n); t+=vout_n;
+    tx[t++]=0;tx[t++]=0;tx[t++]=0;tx[t++]=0;   /* locktime 0 */
+    /* serialize PSBT: magic | global(unsigned tx) | input maps | output maps */
+    static unsigned char out[440000]; long n=0;
+    out[n++]=0x70;out[n++]=0x73;out[n++]=0x62;out[n++]=0x74;out[n++]=0xff;
+    out[n++]=0x01; out[n++]=0x00; n+=crt_varint(out+n,(unsigned long long)t); memcpy(out+n,tx,t); n+=t; out[n++]=0x00;
+    for (long k=0;k<tot_i;k++) n+=psbt_ser_map(out+n,imaps[k],imaps_n[k]);
+    for (long k=0;k<tot_o;k++) n+=psbt_ser_map(out+n,omaps[k],omaps_n[k]);
+    char* b64=malloc((size_t)((n+2)/3)*4+1); if(!b64){ *ec=-7; *em="oom"; return 0; }
+    crt_b64(b64,out,n); *result=rj_str(b64); free(b64);
+    return 1;
+}
+
 /* ---- signrawtransactionwithkey (pure, no wallet state) ---------------------
  * Core rpc/rawtransaction.cpp signrawtransactionwithkey. Signs an unsigned tx
  * with explicitly provided keys against provided prevtxs, returning
@@ -1062,7 +1118,7 @@ int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
-        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt",
+        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -1105,6 +1161,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_converttopsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "combinepsbt"))
         return cmd_combinepsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "joinpsbts"))
+        return cmd_joinpsbts(params, err_code, err_msg, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
