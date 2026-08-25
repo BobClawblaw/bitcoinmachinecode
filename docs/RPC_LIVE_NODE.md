@@ -167,3 +167,72 @@ LE, port u16 BE, services u64 LE), Core's default `count=1`, the
 `count=0`-means-all form, the network filter, the prefix-match anchor, and
 that each mutator returns `-1` with a non-empty reason rather than a silent
 no-op.
+
+## Slice 7 — the Wallet category, part 1 — IMPLEMENTED (2026-08-25)
+`rpc_wallet_ops.c` adds 38 methods, chained from `rpc_dispatch()` exactly as
+`rpc_node`/`rpc_chain` are. Each is in one of three states, marked in the
+source and repeated here so nothing is mistaken for more than it is.
+
+**Backed by real wallet state.**
+- `setlabel` / `listlabels` / `getaddressesbylabel` over a new
+  `wallet_labels.c` store (`data/labels.dat`). Core's model is keyed by
+  ADDRESS — one label per address, many addresses per label — which is the
+  inverse of the pre-existing `wallet_book.c` (keyed by label, the CLI's
+  nickname book). The inversion cannot be expressed in the book's format, so
+  labels got their own store rather than a reinterpretation of another
+  module's file. The record puts the address first and takes the rest of the
+  line as the label, so Core labels containing spaces survive verbatim; a
+  label over 255 bytes or containing a newline is refused, never truncated.
+- `listwallets` / `listwalletdir` over the wallet file's presence.
+- `lockunspent` / `listlockunspent`. Core's lock set lives in memory and is
+  documented as lost when the node stops, so a process-lifetime set is exact
+  parity — persisting it would be the divergence. The list is validated
+  whole before anything mutates, so a bad entry cannot leave a half-applied
+  set.
+- `signmessage`, over BIP32-derived keys. Core signs only for a P2PKH
+  destination, so this does too, with Core's `-5` / `-3` / `-4` ladder. The
+  key search is bounded at 1000 indexes across both branches; beyond that it
+  reports "Private key not available", which is honest — this code did not
+  find the key — rather than wrong.
+- `backupwallet` really copies the file and really fails if it cannot,
+  removing a partial destination rather than reporting a success that left
+  a truncated backup.
+- `listdescriptors` / `gethdkeys`. Both were cross-checked against Core: the
+  emitted `#checksum` on each descriptor matches `getdescriptorinfo`
+  byte-for-byte, and Core deriving `<our account xpub>/0/0` yields the same
+  address as our own key at `m/84'/0'/0'/0/0` — which validates the xpub's
+  depth, parent fingerprint and child index, not just its shape.
+
+**Exactly Core's answer for this node's situation** — verified against the
+oracle, not merely plausible:
+- `walletlock`, `walletpassphrase`, `walletpassphrasechange` return `-15`
+  "Error: running with an unencrypted wallet, but `<method>` was called."
+  This wallet IS unencrypted, so that is the correct answer, not a stub.
+- `abortrescan` returns `false`. No rescan can be in flight here, and `false`
+  is the only answer this method could ever give.
+- `keypoolrefill` returns null. Keys are derived on demand from a BIP32 seed,
+  so "at least N keys are available" already holds for every N.
+
+**Refused, with the specific missing capability named.** `encryptwallet`
+(no keystore); `createwallet` / `loadwallet` / `unloadwallet` /
+`restorewallet` / `migratewallet` / `setwalletflag` (one wallet, loaded at
+startup, no multi-wallet manager); `importdescriptors` /
+`createwalletdescriptor` / `addhdkey` / `importprunedfunds` /
+`removeprunedfunds` / `exportwatchonlywallet` (a single seed with no import
+path); `walletdisplayaddress` (no external signer); and the receive-side
+family — `rescanblockchain`, `getreceivedbyaddress`, `getreceivedbylabel`,
+`listreceivedbyaddress`, `listreceivedbylabel`, `listaddressgroupings`,
+`listsinceblock`, `abandontransaction` — which all need a wallet rescan that
+does not exist. The wallet learns of its outputs only from the sends it
+journals. Answering `0.00000000` for `getreceivedbyaddress` would be a wrong
+answer wearing the costume of a real one: the caller could not tell it apart
+from an address that genuinely received nothing.
+
+### Known divergence: the derivation path is not a ranged descriptor
+This wallet derives `m/84'/0'/0'/<i>/<0|1>` — account index at depth 4,
+receive/change branch LAST. That is the reverse of BIP84's ordering, and no
+ranged descriptor can express it, because `*` has to be the final step. So
+`listdescriptors` emits the concrete, non-ranged descriptor for each key the
+wallet actually uses. Since `getnewaddress` and `getrawchangeaddress` always
+derive index 0, that is exactly two keys and the output is complete — it is
+not a truncation of a longer list.
