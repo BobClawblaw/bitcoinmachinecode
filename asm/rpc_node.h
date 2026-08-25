@@ -90,6 +90,8 @@ typedef struct {
                       unsigned long long*, unsigned long long*);/* fee/size */
     long (*pol_entry_info)(void*, const unsigned char*,
                            struct mp_entry_info*);              /* full graph */
+    long (*estimate)(void*, unsigned long long*,
+                     unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);   /* copied; NULL detaches */
