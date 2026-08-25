@@ -13,6 +13,9 @@
 #include "rpc_commands.h"
 
 int rpc_wops_known_method(const char* method);
+
+/* Enumerate the methods this module serves; NULL past the end. */
+const char* rpc_wops_method_at(int i);
 int rpc_wops_dispatch(const char* method, const rj_val* params, const rpc_wallet* w,
                       rj_val** result, long* err_code, const char** err_msg);
 
