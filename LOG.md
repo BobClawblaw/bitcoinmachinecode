@@ -7,6 +7,48 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- incident #45 FIXED: the counter drift was the flush crash window
+
+ROOT CAUSE, proven by a deterministic repro (tests/test_lsm_count_drift.c):
+a kill landing BETWEEN the flush's manifest write and its WAL truncate
+leaves a manifest whose persisted runs-only base already CONTAINS the WAL's
+ops, next to a WAL that still holds them. Reload's counter restore -- base +
+tail-pushes - tail-dels -- then double-counts the tail's net. One bulk WAL's
+net is exactly the +7,890,418 the rebuild showed; the set itself was never
+wrong (muhash-proven), and the memtable replay is idempotent, so only the
+counter lied. It self-corrected at the next boot compaction, which is why
+the post-capstone restart showed the true ~165.7M.
+
+FIX (bitcoin_utxo_lsm.asm, reload): the v2 manifest cannot distinguish a
+folded tail from an unfolded one, so base+tail is now trusted ONLY when the
+tail is EMPTY (the clean-shutdown case -- fast path unchanged); ANY
+non-empty tail takes the existing exact recount (mac_lsm_recount, O(run
+records), paid only on unclean-shutdown boots). Verified three ways: the
+repro's crash-window phase (drift +66 -> +0); the flush-heavy ghost/heal
+and fork-crash phases (never drifted -- proving the runtime paths were NOT
+the cause); and the REAL parked pre-rebuild state, which previously read
+lsm_count=173,616,972/inconsistent and now reads 165,717,308 == the walk,
+consistent:true (2m33s recount). New diagnostics: utxo_live_walk_count(),
+utxo_live_set_flush_thresholds(), utxo_live_flush().
+
+## 2026-08-25 -- incident #46: keep-up leg race appended the tip block TWICE
+
+At 16:58, ~14 min after the new-binary deploy, mux:2 and mux:3 both closed
+block 964031 from different peers; mux:2's copy landed at height 964032
+("bytes=1501577 tx=3431" identical on both store lines, and the dropped
+block's hash equaled 964031's). The store append path did not check
+prev-linkage under this race. The verify-before-apply layer REJECTed the
+impostor deterministically ("missing/already-spent UTXO, tx=1") and the
+DEGRADED retry loop held at its 300s backoff cap -- serving unaffected, UTXO
+tracking paused at 964031. REMEDY (user-authorized): stop; a one-off tool
+dropped exactly the one index record via store_truncate_index_only (the
+non-monotonic-safe primitive -- store_truncate_to's monotonic safety gate
+correctly REFUSED first, the same gate that once prevented a ~600GB loss);
+restart; the real 964032 then fetched and applied cleanly. ~13 minutes end
+to end, no data loss. OPEN FOLLOW-UP: the keep-up append path must check
+prev-linkage (or re-check the tip under the store lock) so a slow leg's
+duplicate can never land at tip+1.
+
 ## 2026-08-25 -- CAPSTONE: UTXO set proven byte-identical to Bitcoin Core
 
 At quiesced height 963967 (rebuild caught up 16:31, clean SIGTERM stop,
