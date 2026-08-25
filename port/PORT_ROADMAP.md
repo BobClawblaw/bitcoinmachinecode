@@ -212,3 +212,18 @@ whole CHECKSIG/CHECKMULTISIG plumbing, two fixes:
 - interp_checkmultisig NULLDUMMY missing x1-elems reload in bitcoin_interp.S
 24,000 targeted cms/checksig cases + 1,200 VM regressions: 0 fail. Full harness pass.
 Next: s6 daemon link (UTXO store + bitcoind + mempool) then s7 full IBD + UTXO build.
+
+## 2026-08-25 — bitcoin_utxo.S ported + verified (UTXO core, s6 building block)
+In-memory UTXO set: open-addressing hash table + bump-blob, backward-shift (Knuth R)
+deletion, utxo_walk_live visitor. AArch64 port in port/arm64/bitcoin_utxo.S, same
+exports+ABI. Differential-fuzzed vs independent Python dict oracle over a C driver:
+  - 24 seeds x 1500 = 36,000 mixed put/get/del/walk ops with full sorted-set dump
+    equality at EVERY step (keys/36B, value, height/is_coinbase code, slen, script): 0 fail
+  - 8 seeds x 4000 = 32,000 high-load ops (slots=32, live 22-30, heavy 4-byte-prefix
+    collisions -> long probe chains + near-full, frequent backward-shift deletes): 0 fail
+Pitfalls hit: (1) un-saved x23/x24/x25 in utxo_init clobbered the C caller (crash
+after init) -> loop must use caller-saved x9-x17 only; (2) utxo_walk_live loaded the
+index into x10 then reloaded x10 with the callback -> re-load index right before the
+key store; (3) empty-script put silently skipped by sscanf (empty trailing field,
+the strtok-style empty-token pitfall again) -> '-' sentinel. t_utxo.c + fuzz_utxo.py.
+s6/UTXO core underway: bitcoin_utxo done; bitcoin_utxo_store, bitcoin_sigops next.

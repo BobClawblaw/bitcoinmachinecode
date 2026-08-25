@@ -40,3 +40,5 @@ t_codec
 t_stack
 t_interp
 t_eval
+t_utxo
+fuzz_utxo
