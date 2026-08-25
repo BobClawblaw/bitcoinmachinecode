@@ -172,6 +172,7 @@ asm/tests/test_segwit_bounds_fuzz
 asm/tests/test_taproot_bounds_fuzz
 asm/tests/test_p2wpkh_real
 asm/tests/test_mempool_accept_modern
+asm/tests/test_mempool_shared
 asm/daemon/wallet_cli
 asm/daemon/bitcoin_cli
 asm/daemon/bitcoin_rpcd

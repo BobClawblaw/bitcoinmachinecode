@@ -18,9 +18,13 @@ live state:
 - **Inbound peers** are one forked child each, running the asm serve loop
   (`main.c:2721`). The parent keeps only a count (`g_inbound_n`, `main.c:663`)
   and PIDs for upload metering — no per-peer table anywhere.
-- **The mempool** (`mp_ext_area`) is `MAP_PRIVATE|MAP_ANONYMOUS`
-  (`mempool_cfg.c:67-68`) → copy-on-write per fork. Each inbound child accepts
-  txs into its **own** private copy; the parent never sees them.
+- **The mempool** (`mp_ext_area`) is `MAP_SHARED|MAP_ANONYMOUS` since
+  2026-08-25 (previously `MAP_PRIVATE` → copy-on-write per fork, each inbound
+  child accepting into its own invisible copy). One pool now, init'd ONCE
+  pre-fork (`mp_ext_inited` tells `bitcoin_serve.asm` to adopt, not re-init),
+  mutations under a `PTHREAD_PROCESS_SHARED` lock (`mp_lock`/`mp_unlock` in
+  `mempool_cfg.c`), and the tx-accept policy state (fees) shared alongside it
+  (`mp_ext_polstate`).
 
 So the work is not "start a thread" — it is "**bridge the fork boundary**"
 (shared memory published by the children, read by the parent's RPC thread),
@@ -62,14 +66,23 @@ slots claimed by each inbound child after `node_accept_handshake`
 (`main.c:2724`) — the child already materializes version/services text in
 `format_peer_version_info` (`main.c:839`), today only logged.
 
-### Slice 3 — `getmempoolinfo` / `getrawmempool`
-Flip `mp_ext_area`/`mp_ext_blob` to `MAP_SHARED` (`mempool_cfg.c:67-68`) so
-children's `mpool_put`s are parent-visible; add a slot-walk iterator to
-`bitcoin_mempool.asm` (only txid-keyed `mpool_get` exists). Reuse
-`mpool_policy_estimate_feerate` for the fee fields. Target the **documented v31
-field set**; the scratch oracle is master (31.99) and emits fields no release
-has (`tx_send_rate`, `inv_buckets`, cluster limits) — verify stable fields
-only.
+### Slice 3 — `getmempoolinfo` / `getrawmempool` — IMPLEMENTED (2026-08-25)
+`mp_ext_area`/`mp_ext_blob`/policy state flipped to `MAP_SHARED`; pool init'd
+once pre-fork (`mp_ext_inited`, adopted -- never re-init -- by
+`bitcoin_serve.asm`'s lazy init); every C mutation site (tx-accept policy add,
+expiry, reorg reconcile) under the new cross-process `mp_lock`. The RPC layer
+gets the pool via `rpc_node_set_mempool` (pointer injection, no link fanout)
+and walks slots with the same documented-layout C walk `daemon/reorg.c` uses.
+`getrawmempool` returns real txids (display order; verbose: vsize/weight/time/
+fees.base). `getmempoolinfo` reports real size / bytes (BIP141 vsize sum) /
+usage / total_fee / configured maxmempool. Hermetic proof:
+`tests/test_mempool_shared` (child writes under the lock, parent sees; init-
+once survives fork) + injected-pool KATs in `tests/test_rpc_node`. KNOWN
+NARROW RACE (documented in `mempool_cfg.c`): `bitcoin_serve.asm`'s lock-free
+`mpool_get` when serving getdata can see a mid-delete/mid-rebuild slot; worst
+case is relaying a dropped tx, which peers re-validate. NOT yet deployed to
+the live daemon — batched with the post-rebuild deploy; live verification
+(inbound child accepts a tx → parent getrawmempool shows it) happens then.
 
 ### Slice 4 — `sendrawtransaction` — IMPLEMENTED (2026-08-25)
 The parent→worker submission channel. `node_status_t` (rpc_node.h) carries a
