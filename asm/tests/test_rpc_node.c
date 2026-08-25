@@ -38,6 +38,17 @@ static void* fake_worker(void* arg){
     return 0;
 }
 
+/* Fake address book: two 18-byte records in the on-disk layout of
+ * bitcoin_addrmgr.asm -- ip u32 LE, port u16 BE, services u64 LE at [6],
+ * last_seen u32 LE at [14]. */
+static const unsigned char FAKE_AB[2][18] = {
+  { 0x4c,0x9c,0x0e,0x0b,  0x20,0x8d,  0x09,0x04,0,0,0,0,0,0,  0,0,0,0 },
+  { 0x01,0x02,0x03,0x04,  0x20,0x8d,  0x0d,0x00,0,0,0,0,0,0,  0,0,0,0 }
+};
+static long fake_ab_count(void* ab){ (void)ab; return 2; }
+static int fake_ab_get_i(void* ab, long i, unsigned char* out){
+    (void)ab; if (i < 0 || i > 1) return 0; memcpy(out, FAKE_AB[i], 18); return 1; }
+
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o,k) : 0; return v ? v->str : 0; }
@@ -513,6 +524,174 @@ int main(void){
            rcb==1 && r && r->typ==RJ_STR && !strcmp(r->str,"duplicate"));
         rj_free(r); rj_free(pb); }
       rpc_node_set_status_rw(NULL); }
+
+    /* ---- network / ops 12, shaped against the Core oracle (2026-08-25).
+     * The peer table was reset at line 117, so re-stage it here: two LIVE
+     * slots carrying counters, plus a NON-live slot whose bytes must NOT be
+     * counted -- that is the whole point of gating the sum on `used`. ---- */
+    memset(st.peers, 0, sizeof st.peers);
+    st.peers[0].used = 1; st.peers[0].bytes_sent = 4096;  st.peers[0].bytes_recv = 1048576;
+    st.peers[3].used = 1; st.peers[3].bytes_sent = 900;   st.peers[3].bytes_recv = 24;
+    st.peers[7].used = 0; st.peers[7].bytes_sent = 1<<20; st.peers[7].bytes_recv = 1<<20;
+    { r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
+      ck("getnettotals dispatched", rc == 1 && r && r->typ == RJ_OBJ);
+      ck("totalbytessent sums the LIVE peers only (4096+900, not the dead slot)",
+         S(r,"totalbytessent") && !strcmp(S(r,"totalbytessent"), "4996"));
+      ck("totalbytesrecv sums the LIVE peers only",
+         S(r,"totalbytesrecv") && !strcmp(S(r,"totalbytesrecv"), "1048600"));
+      ck("getnettotals has timemillis", rj_obj_get(r,"timemillis") != NULL);
+      { rj_val* up = rj_obj_get(r,"uploadtarget");
+        ck("uploadtarget object present", up && up->typ == RJ_OBJ);
+        /* Core's six sub-fields, in Core's order */
+        static const char* UT[] = {"timeframe","target","target_reached",
+                                   "serve_historical_blocks","bytes_left_in_cycle",
+                                   "time_left_in_cycle"};
+        int all = up != NULL;
+        for (int i = 0; up && i < 6; i++) if (!rj_obj_get(up, UT[i])) all = 0;
+        ck("uploadtarget carries all six Core fields", all); }
+      rj_free(r); }
+
+    /* no book injected yet -> honestly empty, never a fabricated peer */
+    { r = NULL; rc = rpc_node_dispatch("getnodeaddresses", NULL, &r, &ec, &em);
+      ck("getnodeaddresses with no book -> empty array",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r);
+      r = NULL; rc = rpc_node_dispatch("getaddrmaninfo", NULL, &r, &ec, &em);
+      ck("getaddrmaninfo with no book -> zeros",
+         rc == 1 && r && rj_obj_get(r,"ipv4") &&
+         !strcmp(S(rj_obj_get(r,"ipv4"),"total"), "0"));
+      rj_free(r); }
+
+    rpc_node_set_addrbook((void*)FAKE_AB, fake_ab_count, fake_ab_get_i);
+
+    { /* Core's default count is 1 -> exactly one address, not the whole book */
+      r = NULL; rc = rpc_node_dispatch("getnodeaddresses", NULL, &r, &ec, &em);
+      ck("getnodeaddresses default count == 1", rc == 1 && r && r->nitems == 1);
+      { rj_val* a0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("address decoded from the u32 LE ip field",
+           a0 && S(a0,"address") && !strcmp(S(a0,"address"), "76.156.14.11"));
+        ck("port decoded big-endian (8333)",
+           a0 && S(a0,"port") && !strcmp(S(a0,"port"), "8333"));
+        ck("services decoded little-endian (0x0409 = 1033)",
+           a0 && S(a0,"services") && !strcmp(S(a0,"services"), "1033"));
+        ck("network reported as ipv4",
+           a0 && S(a0,"network") && !strcmp(S(a0,"network"), "ipv4"));
+        ck("time field present", a0 && rj_obj_get(a0,"time") != NULL); }
+      rj_free(r); }
+
+    { const char* j = "[0]"; rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; rc = rpc_node_dispatch("getnodeaddresses", p, &r, &ec, &em);
+      ck("getnodeaddresses 0 -> the whole book", rc == 1 && r && r->nitems == 2);
+      rj_free(r); rj_free(p); }
+
+    { const char* j = "[0,\"onion\"]"; rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; rc = rpc_node_dispatch("getnodeaddresses", p, &r, &ec, &em);
+      ck("network filter the book cannot serve -> empty, not relabelled ipv4",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r); rj_free(p); }
+
+    { r = NULL; rc = rpc_node_dispatch("getaddrmaninfo", NULL, &r, &ec, &em);
+      ck("getaddrmaninfo dispatched", rc == 1 && r && r->typ == RJ_OBJ);
+      /* Core's exact key set, in Core's order */
+      static const char* NETS[] = {"ipv4","ipv6","onion","i2p","cjdns","all_networks"};
+      int shaped = r != NULL;
+      for (int i = 0; r && i < 6; i++){
+          rj_val* e = rj_obj_get(r, NETS[i]);
+          if (!e || !rj_obj_get(e,"new") || !rj_obj_get(e,"tried") || !rj_obj_get(e,"total"))
+              shaped = 0;
+      }
+      ck("getaddrmaninfo has Core's six networks x {new,tried,total}", shaped);
+      ck("ipv4 total == book count", r && rj_obj_get(r,"ipv4") &&
+         !strcmp(S(rj_obj_get(r,"ipv4"),"total"), "2"));
+      ck("ipv6 total == 0 (the book is v4-only)", r && rj_obj_get(r,"ipv6") &&
+         !strcmp(S(rj_obj_get(r,"ipv6"),"total"), "0"));
+      ck("all_networks total == book count", r && rj_obj_get(r,"all_networks") &&
+         !strcmp(S(rj_obj_get(r,"all_networks"),"total"), "2"));
+      rj_free(r); }
+
+    { r = NULL; rc = rpc_node_dispatch("listbanned", NULL, &r, &ec, &em);
+      ck("listbanned -> [] (same answer Core gives with nothing banned)",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r);
+      /* no addnode= configured -> [] , exactly as Core answers */
+      r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", NULL, &r, &ec, &em);
+      ck("getaddednodeinfo with no addnode= -> []",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r);
+      r = NULL; rc = rpc_node_dispatch("clearbanned", NULL, &r, &ec, &em);
+      ck("clearbanned -> null", rc == 1 && r && r->typ == RJ_NULL);
+      rj_free(r); }
+
+    /* The mutators REFUSE rather than silently no-op: a call that reports
+     * success while changing nothing is worse than an honest error. */
+    { static const char* MUT[] = {"addnode","disconnectnode","setban",
+                                  "setnetworkactive","ping"};
+      for (int i = 0; i < 5; i++){
+          r = NULL; ec = 0; em = NULL;
+          rc = rpc_node_dispatch(MUT[i], NULL, &r, &ec, &em);
+          char lbl[96]; snprintf(lbl, sizeof lbl,
+                                 "%s -> -1 with a reason (never a silent no-op)", MUT[i]);
+          ck(lbl, rc == 0 && ec == -1 && em && strlen(em) > 20);
+          rj_free(r);
+      }
+      ck("all twelve are owned by this module",
+         rpc_node_known_method("getnettotals") &&
+         rpc_node_known_method("getnodeaddresses") &&
+         rpc_node_known_method("getaddrmaninfo") &&
+         rpc_node_known_method("listbanned") &&
+         rpc_node_known_method("clearbanned") &&
+         rpc_node_known_method("getaddednodeinfo") &&
+         rpc_node_known_method("addnode") &&
+         rpc_node_known_method("disconnectnode") &&
+         rpc_node_known_method("setban") &&
+         rpc_node_known_method("setnetworkactive") &&
+         rpc_node_known_method("ping")); }
+
+    /* getaddednodeinfo over a real addnode= list. peers[0]/[3] are live but
+     * carry no addr string at this point, so stage one that matches. */
+    { static const char ADDED[2][64] = { "1.2.3.4", "9.9.9.9" };
+      rpc_node_set_addednodes(ADDED, 2);
+      strcpy(st.peers[0].addr, "1.2.3.4:8333"); st.peers[0].inbound = 0;
+      r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", NULL, &r, &ec, &em);
+      ck("getaddednodeinfo lists both configured nodes",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 2);
+      { rj_val* e0 = (r && r->nitems > 0) ? r->items[0] : 0;
+        rj_val* e1 = (r && r->nitems > 1) ? r->items[1] : 0;
+        ck("added node matched to a live peer -> connected true",
+           e0 && S(e0,"connected") && !strcmp(S(e0,"connected"), "1"));
+        ck("connected node carries one addresses[] entry with a direction",
+           e0 && rj_obj_get(e0,"addresses") && rj_obj_get(e0,"addresses")->nitems == 1 &&
+           !strcmp(S(rj_obj_get(e0,"addresses")->items[0], "connected"), "outbound"));
+        ck("unconnected added node -> connected false, addresses[] empty",
+           e1 && S(e1,"connected") && !strcmp(S(e1,"connected"), "0") &&
+           rj_obj_get(e1,"addresses") && rj_obj_get(e1,"addresses")->nitems == 0); }
+      rj_free(r);
+
+      /* prefix-only matches must NOT count: "1.2.3.4" vs peer "1.2.3.45" */
+      strcpy(st.peers[0].addr, "1.2.3.45:8333");
+      r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", NULL, &r, &ec, &em);
+      ck("host prefix of a longer IP does not count as connected",
+         rc == 1 && r && r->nitems == 2 &&
+         !strcmp(S(r->items[0],"connected"), "0"));
+      rj_free(r);
+      strcpy(st.peers[0].addr, "1.2.3.4:8333");
+
+      /* filter form, and Core's -24 for a node that was never added */
+      { const char* j = "[\"9.9.9.9\"]"; rj_val* p = rj_parse(j, strlen(j));
+        r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", p, &r, &ec, &em);
+        ck("getaddednodeinfo \"node\" filters to that node",
+           rc == 1 && r && r->nitems == 1 &&
+           !strcmp(S(r->items[0],"addednode"), "9.9.9.9"));
+        rj_free(r); rj_free(p); }
+      { const char* j = "[\"5.5.5.5\"]"; rj_val* p = rj_parse(j, strlen(j));
+        r = NULL; ec = 0; em = NULL;
+        rc = rpc_node_dispatch("getaddednodeinfo", p, &r, &ec, &em);
+        ck("unknown node -> Core's -24 'Error: Node has not been added.'",
+           rc == 0 && ec == -24 && em && !strcmp(em, "Error: Node has not been added."));
+        rj_free(r); rj_free(p); }
+      rpc_node_set_addednodes(NULL, 0); }
+
+    rpc_node_set_addrbook(NULL, NULL, NULL);
 
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);

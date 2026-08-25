@@ -148,6 +148,210 @@ static int cmd_getpeerinfo(rj_val** res){
     return 1;
 }
 
+/* ==== network / ops RPCs (2026-08-25) ====================================
+ * Twelve methods that report or steer the P2P layer. Every one is backed by
+ * state this node ALREADY keeps -- the shared peer table (rpc_peer_t, with
+ * per-socket byte counters from TCP_INFO) and the persistent address book
+ * (bitcoin_addrmgr.asm, 18-byte records) -- so none of them invents data.
+ *
+ * Where a capability genuinely does not exist here, the method says so
+ * rather than pretending: this node has no ban list, no addnode list, and
+ * no runtime network-disable switch, so listbanned/getaddednodeinfo return
+ * empty (exactly as Core does when nothing is banned or added) while
+ * setban/addnode/disconnectnode/setnetworkactive report -1 with a clear
+ * message instead of silently succeeding and changing nothing. A mutator
+ * that lies about having acted is worse than an absent one. */
+static long (*g_ab_count)(void*);
+static int  (*g_ab_get_i)(void*, long, unsigned char*);
+static void* g_ab;
+
+void rpc_node_set_addrbook(void* ab, long (*count)(void*),
+                           int (*get_i)(void*, long, unsigned char*)){
+    g_ab = ab; g_ab_count = count; g_ab_get_i = get_i;
+}
+
+static int cmd_getnettotals(rj_val** res){
+    long long sent = 0, recv = 0;
+    if (g_status)
+        for (int i = 0; i < RPC_MAX_PEERS; i++){
+            const rpc_peer_t* p = &g_status->peers[i];
+            if (!p->used) continue;
+            sent += p->bytes_sent; recv += p->bytes_recv;
+        }
+    rj_val* o = rj_obj();
+    /* Core counts bytes for the process lifetime including closed peers; we
+     * sum the LIVE peer table, which is what this node tracks. Documented
+     * divergence, not an approximation dressed as a total. */
+    rj_obj_set(o, "totalbytesrecv", rj_numf("%lld", recv));
+    rj_obj_set(o, "totalbytessent", rj_numf("%lld", sent));
+    { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+      rj_obj_set(o, "timemillis",
+                 rj_numf("%lld", (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000)); }
+    rj_val* up = rj_obj();
+    rj_obj_set(up, "timeframe", rj_numf("%d", 86400));
+    rj_obj_set(up, "target", rj_numf("%d", 0));
+    rj_obj_set(up, "target_reached", rj_bool(0));
+    rj_obj_set(up, "serve_historical_blocks", rj_bool(1));
+    rj_obj_set(up, "bytes_left_in_cycle", rj_numf("%d", 0));
+    rj_obj_set(up, "time_left_in_cycle", rj_numf("%d", 0));
+    rj_obj_set(o, "uploadtarget", up);
+    *res = o;
+    return 1;
+}
+
+/* getnodeaddresses ( count "network" ) -- straight out of the persistent
+ * address book. Core's default count is 1 (meaning 1% of known addresses,
+ * capped at 2500); 0 means "all". */
+static int cmd_getnodeaddresses(const rj_val* params, rj_val** res){
+    long want = 1;
+    const char* net = NULL;
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM)
+            want = atol(params->items[0]->str);
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_STR)
+            net = params->items[1]->str;
+    }
+    rj_val* arr = rj_arr();
+    /* The book stores IPv4 only, so a filter for any other network is
+     * honestly empty rather than IPv4 rows relabelled. */
+    if (net && strcmp(net, "ipv4")){ *res = arr; return 1; }
+    if (g_ab && g_ab_count && g_ab_get_i){
+        long n = g_ab_count(g_ab);
+        long cap = (want <= 0) ? n : want;
+        if (cap > 2500) cap = 2500;
+        for (long i = 0; i < n && (long)arr->nitems < cap; i++){
+            unsigned char r[18];
+            if (g_ab_get_i(g_ab, i, r) != 1) continue;
+            unsigned ip = (unsigned)r[0] | ((unsigned)r[1]<<8) | ((unsigned)r[2]<<16) | ((unsigned)r[3]<<24);
+            unsigned port = ((unsigned)r[4]<<8) | (unsigned)r[5];      /* stored BE */
+            unsigned long long svc = 0; for (int b=0;b<8;b++) svc |= (unsigned long long)r[6+b] << (8*b);
+            unsigned lastseen = (unsigned)r[14] | ((unsigned)r[15]<<8) | ((unsigned)r[16]<<16) | ((unsigned)r[17]<<24);
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "time", rj_numf("%u", lastseen));
+            rj_obj_set(e, "services", rj_numf("%llu", svc));
+            { char a[24]; snprintf(a, sizeof a, "%u.%u.%u.%u",
+                                   ip & 0xff, (ip>>8)&0xff, (ip>>16)&0xff, (ip>>24)&0xff);
+              rj_obj_set(e, "address", rj_str(a)); }
+            rj_obj_set(e, "port", rj_numf("%u", port));
+            rj_obj_set(e, "network", rj_str("ipv4"));   /* the book stores v4 only */
+            rj_arr_push(arr, e);
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
+/* getaddrmaninfo -- Core reports new/tried/total per network. This node's
+ * address book has no new/tried distinction (one flat table), so every
+ * record counts as `tried` (they are addresses we have recorded, and the
+ * book is fed by successful contact) and `new` is 0. Stated here and in the
+ * parity docs rather than split arbitrarily. */
+static int cmd_getaddrmaninfo(rj_val** res){
+    long n = (g_ab && g_ab_count) ? g_ab_count(g_ab) : 0;
+    rj_val* o = rj_obj();
+    static const char* nets[] = { "ipv4", "ipv6", "onion", "i2p", "cjdns" };
+    for (int i = 0; i < 5; i++){
+        rj_val* e = rj_obj();
+        long v = (i == 0) ? n : 0;      /* the book is IPv4-only */
+        rj_obj_set(e, "new", rj_numf("%d", 0));
+        rj_obj_set(e, "tried", rj_numf("%ld", v));
+        rj_obj_set(e, "total", rj_numf("%ld", v));
+        rj_obj_set(o, nets[i], e);
+    }
+    { rj_val* e = rj_obj();
+      rj_obj_set(e, "new", rj_numf("%d", 0));
+      rj_obj_set(e, "tried", rj_numf("%ld", n));
+      rj_obj_set(e, "total", rj_numf("%ld", n));
+      rj_obj_set(o, "all_networks", e); }
+    *res = o;
+    return 1;
+}
+
+/* getaddednodeinfo ( "node" ) -- this node DOES have an added-node list:
+ * `addnode=` in bitcoin.conf, parsed into g_cfg.addnode[] and honoured by
+ * the dialer (such peers are preferred and never evicted). Injected here
+ * rather than reached directly so rpc_node.c stays free of node_config. */
+static const char (*g_addnode)[64];
+static int g_n_addnode;
+
+void rpc_node_set_addednodes(const char (*list)[64], int n){
+    g_addnode = list; g_n_addnode = n;
+}
+
+/* An added node counts as connected when a live peer slot's "ip:port" starts
+ * with the configured host. addnode= entries may carry a port or not, so the
+ * comparison stops at the configured string's end and then requires a ':' or
+ * end-of-string -- otherwise "10.0.0.1" would match "10.0.0.19:8333". */
+static int addednode_conn_dir(const char* want, const char** dir){
+    if (!g_status) return 0;
+    size_t wl = strlen(want);
+    for (int i = 0; i < RPC_MAX_PEERS; i++){
+        const rpc_peer_t* p = &g_status->peers[i];
+        if (!p->used) continue;
+        if (strncmp(p->addr, want, wl)) continue;
+        if (p->addr[wl] && p->addr[wl] != ':') continue;
+        *dir = p->inbound ? "inbound" : "outbound";
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_getaddednodeinfo(const rj_val* params, rj_val** res){
+    const char* only = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR) only = params->items[0]->str;
+    rj_val* arr = rj_arr();
+    int matched = 0;
+    for (int i = 0; i < g_n_addnode; i++){
+        const char* n = g_addnode[i];
+        if (only && strcmp(only, n)) continue;
+        matched = 1;
+        const char* dir = NULL;
+        int up = addednode_conn_dir(n, &dir);
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "addednode", rj_str(n));
+        rj_obj_set(e, "connected", rj_bool(up));
+        rj_val* addrs = rj_arr();
+        if (up){
+            rj_val* a = rj_obj();
+            rj_obj_set(a, "address", rj_str(n));
+            rj_obj_set(a, "connected", rj_str(dir));
+            rj_arr_push(addrs, a);
+        }
+        rj_obj_set(e, "addresses", addrs);
+        rj_arr_push(arr, e);
+    }
+    if (only && !matched){
+        rj_free(arr);
+        return -24000;   /* caller maps: Core's RPC_CLIENT_NODE_NOT_ADDED */
+    }
+    *res = arr;
+    return 1;
+}
+
+/* listbanned: this node keeps no ban list. Core returns an empty array when
+ * nothing is banned, so an empty array here is the SAME answer, not a stub;
+ * the divergence is that nothing can ever populate it (see setban). */
+static int cmd_empty_array(rj_val** res){ *res = rj_arr(); return 1; }
+static int cmd_clearbanned(rj_val** res){ *res = rj_null(); return 1; }
+
+/* ping -- Core queues a ping to every peer and returns null immediately;
+ * the result shows up in getpeerinfo's pingtime. This node's peer legs are
+ * driven by the download worker, which sends its own keepalives; there is
+ * no RPC-triggered ping path, so this reports unavailable rather than
+ * returning null and doing nothing. */
+static int cmd_net_unsupported(const char* msg, long* ec, const char** em){
+    *ec = -1; *em = msg; return 0;
+}
+#define NET_NO_PEERCTL \
+    "peer connections are owned by the download worker, which dials and " \
+    "redials from the address book on its own policy; this node has no " \
+    "runtime peer-control path, so this call would change nothing. Set " \
+    "addnode= in bitcoin.conf and restart (getaddednodeinfo reports it)."
+#define NET_NO_BANLIST \
+    "this node keeps no ban list; misbehaving peers are dropped by the " \
+    "download worker and simply re-dialed from the address book"
+
 /* getmempoolinfo / getrawmempool.
  *
  * COHERENT since 2026-08-25: daemon/mempool_cfg.c maps the pool MAP_SHARED
@@ -732,6 +936,9 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
+    "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
+    "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
+    "setban", "setnetworkactive", "ping",
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
@@ -743,6 +950,21 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
+    if (!strcmp(m, "getnettotals"))       return cmd_getnettotals(res);
+    if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res);
+    if (!strcmp(m, "getaddrmaninfo"))     return cmd_getaddrmaninfo(res);
+    if (!strcmp(m, "listbanned"))         return cmd_empty_array(res);
+    if (!strcmp(m, "getaddednodeinfo")){
+        int rc = cmd_getaddednodeinfo(params, res);
+        if (rc == -24000){ *ec = -24; *em = "Error: Node has not been added."; return 0; }
+        return rc;
+    }
+    if (!strcmp(m, "clearbanned"))        return cmd_clearbanned(res);
+    if (!strcmp(m, "addnode"))            return cmd_net_unsupported(NET_NO_PEERCTL, ec, em);
+    if (!strcmp(m, "disconnectnode"))     return cmd_net_unsupported(NET_NO_PEERCTL, ec, em);
+    if (!strcmp(m, "setban"))             return cmd_net_unsupported(NET_NO_BANLIST, ec, em);
+    if (!strcmp(m, "setnetworkactive"))   return cmd_net_unsupported("this node has no runtime network-disable switch; stop the daemon to stop networking", ec, em);
+    if (!strcmp(m, "ping"))               return cmd_net_unsupported("this node has no RPC-triggered ping path; the download worker sends its own keepalives", ec, em);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
