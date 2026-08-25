@@ -75,8 +75,16 @@ and runs natively.
           pure-Python BIP340 across seeds 0 fail + OFFICIAL test vector PASS.
           (2026-08-25)
 ==> secp verification core COMPLETE: ECDSA + BIP340 both native+verified. Next:
+- [x] bitcoin_cons (cons_verify)      -> port/arm64/bitcoin_cons.S: block-level
+      checks (pow_check, tx walk via tx_parse, coinbase n_in==1, txids via
+      tx_txid, merkle_root == header root) using ONLY ported deps. Verified on
+      genesis (1) + corrupt-root/wrong-count/bad-tx negatives (0); C
+      reimplementation of the identical logic returns VALID too. Contains the
+      real 1 MiB tx_txid rebuild buffer on the stack (subs-flags bug fixed).
+      (2026-08-25)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script / sighash /
-      checksig / cons_verify / segwit + taproot script paths, mempool  <- NEXT
+      checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
+      full stack VM, ~5000 lines of x86-64 across interp/sighash/checksig)
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
