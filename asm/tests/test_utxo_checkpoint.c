@@ -78,7 +78,7 @@ static u8 g_txid_scratch[1<<12];
  * constant tests/test_reorg.c uses) so mining is instant. Single-tx block:
  * merkle root == that tx's own txid. */
 static long mk_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tag, u32 tstamp){
-    u8 tx[64], txid[32];
+    u8 tx[80], txid[32];   /* 65-byte coinbase: 64 overflowed by one (see test_blk_dryrun.c) */
     u8* q = tx;
     put32(q,1); q+=4;
     *q++ = 1;

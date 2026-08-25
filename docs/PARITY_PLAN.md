@@ -88,7 +88,45 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       included stdlib.h, so atof/atol/atoll were implicitly declared (int
       returns) -- estimatesmartfee's conf_target parse worked only by ABI
       accident.
-- [ ] submitblock (needs the worker's block-accept path; heavy, deferred)
+- [x] submitblock -- COMPLETE, including the connect step. What works now: the RPC transport accepts the
+      ~8MB hex payload (the request buffer was a fixed 256KB stack array
+      that silently truncated -- now heap-grown to 9MB with a linear header
+      scan); a 4MB shared block channel (same seq/ack discipline as
+      sendrawtransaction) carries it to the download worker, which runs
+      daemon/blk_submit.c: duplicate check vs tip, PoW vs the header's own
+      bits (high-hash), cons_verify (bad-txnmrklroot), the BIP141 witness-
+      commitment check (bad-witness-merkle-match -- the stripped-archive
+      lesson), tip-linkage. A consensus-clean, tip-extending block answers
+      "inconclusive" -- BIP22's honest word -- because CONNECTING it needs a
+      UTXO-level dry run of the apply path first: appending an un-dry-run
+      block could wedge catch-up exactly like the witness-stripped archive
+      did. That dry-run + append + apply + relay is the follow-up slice.
+      Tests: the evaluator on the REAL genesis block with targeted
+      corruptions pinning every reason string; the channel handshake
+      against a fake worker; the 600KB transport round-trip on the real
+      server.
+      CONNECT STEP (second commit): utxo_live_dryrun_block runs the SAME
+      verification phases (parse, witness commitment, BIP30, in-block dup,
+      full script verify) a real apply runs and stops at the Phase 5
+      boundary -- the first mutation -- with the reject reason captured
+      (utxo_live_last_reject). The worker connects a submitted block ONLY
+      when fully synced (applied == tip; otherwise "inconclusive"), after
+      contextual checks (bits must equal the chain's required next work incl
+      the 2016-block retarget -> "bad-diffbits"; timestamp > MTP(11) and
+      <= now+2h -> "time-too-old"/"time-too-new"), then dry-run -> reason on
+      reject -> else store_append + the NORMAL catch-up apply (same undo/
+      checkpoint crash-safety as any network block; a dry-run pass makes the
+      apply deterministic) + headers.dat append + inv(MSG_BLOCK) to the
+      outbound legs -> RPC returns null. tests/test_blk_dryrun proves
+      PURITY (clean dry run mutates nothing), REASONS, and COHERENCE
+      (the dry-run-passed block then applies cleanly) on a real synthetic
+      chain. UNTESTED-BY-SUITE: the worker-loop connect branch itself
+      (bits/MTP wiring) -- exercised at the supervised deploy, not before.
+      DRIVE-BY REAL BUG: hunting a "flaky" dry-run exposed a 65-byte
+      hand-built coinbase written into u8[64] stack buffers across SEVEN
+      test fixtures -- one byte of stack UB whose landing spot depended on
+      each binary's layout (test_apply_block_rollback et al passed by
+      luck). All widened to [80].
 
 ### T4 — Mempool coherence
 - [x] mp_ext_area/blob/policy-state MAP_SHARED, init-once pre-fork

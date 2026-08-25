@@ -79,7 +79,7 @@ static u8 g_txid_scratch[1<<12];
  * test_utxo_catchup_crash_resume.c). Returns len; fills hash + cb txid. */
 static long mk_and_mine(u8* raw, u8 hash[32], u8 cb_txid_out[32],
                         const u8 prev[32], u32 tag, u32 tstamp){
-    u8 tx[64], txid[32];
+    u8 tx[80], txid[32];   /* 65-byte coinbase: 64 overflowed by one (see test_blk_dryrun.c) */
     u8* q = tx;
     put32(q,1); q+=4;
     *q++ = 1;
@@ -120,7 +120,7 @@ static long mk_and_mine(u8* raw, u8 hash[32], u8 cb_txid_out[32],
 static long mk_and_mine_spend(u8* raw, u8 hash[32], u8 tx1_txid_out[32],
                               const u8 prev[32], const u8 spend_txid[32],
                               u32 tag, u32 tstamp){
-    u8 cb[64], cb_txid[32];
+    u8 cb[80], cb_txid[32];   /* 65-byte coinbase: 64 overflowed by one */
     u8* q = cb;
     put32(q,1); q+=4;
     *q++ = 1;

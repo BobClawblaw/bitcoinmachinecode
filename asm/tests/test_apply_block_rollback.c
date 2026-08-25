@@ -76,7 +76,10 @@ static u8 g_txid_scratch[1<<12];
 /* Same shape as test_utxo_checkpoint.c's mk_and_mine: one coinbase tx,
  * scriptPubKey = OP_1 (0x51), minimum difficulty (instant mining). */
 static long mk_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tag, u32 tstamp){
-    u8 tx[64], txid[32];
+    /* 80, not 64: the coinbase built here is 65 bytes. See
+     * test_blk_dryrun.c's mk_and_mine for the full story -- this test
+     * passed only by stack-layout luck. */
+    u8 tx[80], txid[32];
     u8* q = tx;
     put32(q,1); q+=4;
     *q++ = 1;
@@ -116,7 +119,7 @@ static long mk_and_mine(u8* raw, u8 hash[32], const u8 prev[32], u32 tag, u32 ts
  * Bitcoin's own duplicate-last-if-odd pairing (sha256d each level). */
 static long mk_and_mine_poison(u8* raw, u8 hash[32], const u8 prev[32],
                                const u8 spend_txid[32], u32 tag, u32 tstamp){
-    u8 cb[64], cb_txid[32];
+    u8 cb[80], cb_txid[32];   /* 65-byte coinbase; see mk_and_mine above */
     u8* q = cb;
     put32(q,1); q+=4;
     *q++ = 1;

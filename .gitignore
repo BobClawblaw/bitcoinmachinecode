@@ -340,6 +340,8 @@ config/bitcoin.conf.bak-*
 asm/tests/fixtures/
 asm/tests/fixtures/
 asm/tests/test_block_481827_pool_stack
+asm/tests/test_blk_dryrun
+asm/tests/test_blk_submit
 asm/tests/test_segwit_real
 asm/tests/test_segwit_coverage
 asm/tests/test_txvb_wprog_stable
