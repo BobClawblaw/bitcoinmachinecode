@@ -60,7 +60,25 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       getmininginfo = documented v31 field set. NOTE: this uncovered and FIXED
       incident #43 -- chainwork.dat corrupt for the whole post-segwit chain
       (getblock/getblockheader chainwork wrong); regenerated + verified + live.
-- [ ] getblocktemplate (BIP22/23) — large; diff structure vs oracle
+- [x] getblocktemplate (BIP22/23) — the deterministic frame is FULLY
+      oracle-verified: at our tip, previousblockhash and mintime (MTP+1)
+      match the oracle's records exactly; bits/target/version/rules
+      (csv, !segwit, taproot)/limits/mutable/noncerange/vbavailable/
+      vbrequired/capabilities all diff clean; coinbasevalue = exact
+      subsidy + our pool's fees. The 2016-block difficulty retarget
+      (rpc_chain_retarget, arith_uint256-faithful incl the /4..x4 clamp,
+      pow-limit cap, and GetCompact sign-bit shuffle) reproduces 8/8 REAL
+      historical retargets from production headers (incl 481824).
+      default_witness_commitment recomputed over the template's tx order
+      (empty-template constant frozen as a KAT). Transactions come from
+      the shared mempool via the same injected hooks (parents-before-
+      children order, 1-based depends, fee from the policy registry,
+      weight via tx_walk). DOCUMENTED GAPS: per-tx "sigops" is the legacy
+      count x4 only (P2SH/witness sigops need prevout scripts this path
+      does not resolve -- a lower bound); longpollid is emitted (prevhash+
+      counter) but hanging longpoll is not honored; BIP23 proposal mode
+      rejected as Invalid mode; tx order is valid but not fee-optimal
+      (no package feerate sort).
 - [ ] submitblock, prioritisetransaction
 
 ### T4 — Mempool coherence
@@ -74,11 +92,38 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       size/bytes/usage/total_fee/maxmempool. BUILD-SIDE ONLY so far: the live
       daemon still runs the MAP_PRIVATE build; deploy batched post-rebuild,
       then live-verify (inbound tx -> parent getrawmempool).
-- [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (needs a
-      parent-index walk over the shared policy graph -- state is shared now)
+- [x] getmempoolentry -- full documented field set minus master's
+      cluster-mempool extras (vsize_adjusted/chunkweight/fees.chunk;
+      bip125-replaceable is gone in modern Core). Graph fields from a
+      mp_lock'd snapshot of the shared policy registry
+      (mpool_policy_entry_info): depends/spentby direct edges,
+      ancestor/descendant transitive closures INCLUDING self, fees summed over
+      the set, sizes as true BIP141 vsize sums (each member's bytes re-read
+      from the pool). Semantics verified against a live oracle chain (child
+      anccount=2, ancsize=sum of member vsizes, fees.anc=sum incl self,
+      parent desccount incl self, spentby). wtxid = sha256d(full
+      serialization). Error parity: -5 not-in-mempool, -8 with Core's exact
+      bad-txid message. DOCUMENTED GAPS: height=0 (entry height untracked at
+      accept), unbroadcast=false. Hermetic test drives a REAL parent->child
+      chain through the REAL mpool_policy_add path. Deploy batched with the
+      rest (build-side).
+- [x] getmempoolancestors / getmempooldescendants -- same
+      mpool_policy_entry_info snapshot; sets EXCLUDE the tx itself
+      (oracle-verified), stale registry members filtered against the pool;
+      non-verbose txid arrays, verbose = getmempoolentry-shaped member
+      objects; -8/-5 error parity shared with getmempoolentry.
 
 ### T5 — Fee estimation
-- [ ] estimatesmartfee / estimaterawfee from mempool feerate buckets + recent blocks
+- [x] estimatesmartfee -- Core's CONTRACT (arg validation with Core-exact -8
+      messages incl the conf_target [1,1008] range and estimate_mode list;
+      blocks clamps to >= 2, oracle-verified; fresh node returns
+      {"errors":["Insufficient data or no feerate found"],"blocks":N}) over
+      OUR estimator: the tx-accept policy layer's EMA of accepted feerates
+      (shared state, read under mp_lock), floored at min relay fee. The
+      NUMBER is honestly ours -- Core's bucket tracker needs confirmed-block
+      history we don't keep. economical/conservative accepted (case-insens.)
+      but return the same EMA (one estimator). Deploy batched (build-side).
+- [ ] estimaterawfee (hidden/debug RPC -- low value, deferred)
 
 ### T6 — Wallet-state RPCs on the RPC surface
 - [ ] sendtoaddress, sendmany, listtransactions, gettransaction,

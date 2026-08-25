@@ -706,6 +706,64 @@ int main(void){
       rj_free(r);
     }
 
+    /* ---- getblocktemplate (BIP22/23): deterministic frame on the fixture
+     * chain (tip=3, next height 4, no injected mempool -> empty template).
+     * The empty-template default_witness_commitment is a CONSTANT --
+     * sha256d(0^32 || 0^32) behind the aa21a9ed tag -- frozen from an
+     * independent reference computation. Retarget vectors likewise frozen
+     * from an arith_uint256-faithful reference (incl clamp + pow-limit). ---- */
+    {
+      expect_err("gbt without rules -> Core's segwit-rule error", "getblocktemplate", "[{}]",
+                 -8, "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})");
+      expect_err("gbt no params -> same error", "getblocktemplate", "[]",
+                 -8, "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})");
+      r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+      ck("gbt dispatched", r && r->typ == RJ_OBJ);
+      ck_str("gbt.height (tip+1)", S(r,"height"), "4");
+      ck_str("gbt.version", S(r,"version"), "536870912");
+      ck_str("gbt.coinbasevalue = 50 BTC subsidy (no fees)", S(r,"coinbasevalue"), "5000000000");
+      ck_str("gbt.sigoplimit", S(r,"sigoplimit"), "80000");
+      ck_str("gbt.weightlimit", S(r,"weightlimit"), "4000000");
+      ck_str("gbt.sizelimit", S(r,"sizelimit"), "4000000");
+      ck_str("gbt.noncerange", S(r,"noncerange"), "00000000ffffffff");
+      ck("gbt.transactions empty (no pool injected)",
+         G(r,"transactions") && G(r,"transactions")->typ == RJ_ARR && G(r,"transactions")->nitems == 0);
+      ck_str("gbt.default_witness_commitment (empty-template constant)",
+             S(r,"default_witness_commitment"),
+             "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9");
+      { rj_val* rls = G(r,"rules");
+        ck("gbt.rules [csv, !segwit, taproot]", rls && rls->typ==RJ_ARR && rls->nitems==3
+           && !strcmp(rls->items[0]->str,"csv") && !strcmp(rls->items[1]->str,"!segwit")
+           && !strcmp(rls->items[2]->str,"taproot")); }
+      ck("gbt.mutable has time/transactions/prevblock",
+         G(r,"mutable") && G(r,"mutable")->typ==RJ_ARR && G(r,"mutable")->nitems==3);
+      /* cross-checks against sibling RPCs on the same fixture */
+      { rj_val* bb = call("getbestblockhash", "[]", &ec, &em);
+        ck("gbt.previousblockhash == getbestblockhash", bb && S(r,"previousblockhash")
+           && !strcmp(S(r,"previousblockhash"), bb->str));
+        rj_free(bb); }
+      { rj_val* bh = call("getblockheader", "[\"tip\"]", &ec, &em); (void)bh; if (bh) rj_free(bh); }
+      { rj_val* mi = call("getmininginfo", "[]", &ec, &em);
+        ck("gbt.bits == tip bits (not a retarget height)",
+           mi && S(mi,"bits") && S(r,"bits") && !strcmp(S(r,"bits"), S(mi,"bits")));
+        rj_free(mi); }
+      { long mt = atol(S(r,"mintime") ? S(r,"mintime") : "0");
+        long ct = atol(S(r,"curtime") ? S(r,"curtime") : "0");
+        ck("gbt.curtime >= mintime > 0", mt > 0 && ct >= mt); }
+      ck("gbt.longpollid = prevhash+counter",
+         S(r,"longpollid") && strlen(S(r,"longpollid")) > 64
+         && !strncmp(S(r,"longpollid"), S(r,"previousblockhash"), 64));
+      rj_free(r);
+
+      /* retarget KATs (frozen reference vectors) */
+      ck("retarget same timespan keeps bits", rpc_chain_retarget(0x1d00ffff, 1209600) == 0x1d00ffff);
+      ck("retarget half timespan halves target", rpc_chain_retarget(0x1d00ffff, 604800) == 0x1c7fff80);
+      ck("retarget double timespan capped at pow limit", rpc_chain_retarget(0x1d00ffff, 2419200) == 0x1d00ffff);
+      ck("retarget clamps timespan to /4", rpc_chain_retarget(0x1d00ffff, 1) == 0x1c3fffc0);
+      ck("retarget modern bits, faster blocks", rpc_chain_retarget(0x1702905c, 1100000) == 0x170254e3);
+      ck("retarget modern bits, slower blocks", rpc_chain_retarget(0x1702905c, 1300000) == 0x1702c169);
+    }
+
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
