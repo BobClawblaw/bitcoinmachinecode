@@ -69,8 +69,14 @@ and runs natively.
     - [ ] secp256k1_point_ct  (constant-time, for signing only -- NOT needed
           for IBD/verify; skip for now)
     - [ ] point_scalar_mul_glv / sc_split_lambda  (perf; deferred)
-    - [ ] schnorr_verify + secp256k1_taproot (BIP340/341)  <- NEXT in the core
-          (needs pubkey_parse; used for taproot outputs)
+    - [x] secp256k1_schnorr (BIP340 verify) + bitcoin_pubkey (fe_pow+parse)
+          -> port/arm64/secp256k1_schnorr.S + bitcoin_pubkey.S: pubkey_parse
+          8005 vecs (comp+uncomp+non-QR reject) 0 fail; schnorr vs independent
+          pure-Python BIP340 across seeds 0 fail + OFFICIAL test vector PASS.
+          (2026-08-25)
+==> secp verification core COMPLETE: ECDSA + BIP340 both native+verified. Next:
+- [ ] script/consensus layer: bitcoin_interp / bitcoin_script / sighash /
+      checksig / cons_verify / segwit + taproot script paths, mempool  <- NEXT
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
