@@ -47,8 +47,11 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       tree -- its own future "taproot signing" task).
 
 ### T2 — Chain/UTXO query completion  [oracle-verifiable]
-- [ ] scantxoutset (start/status/abort over the UTXO set) — diff vs oracle
-- [ ] getblockstats (per-height stats) — diff vs oracle
+- [x] getblockstats — 20 block-only fields diffed byte-for-byte vs oracle across
+      5 blocks (pre/post-segwit); fee/feerate/utxo_size_inc need undo (omitted
+      where absent, honest divergence) and are verified via synthetic undo in
+      test_rpc_chain. Numeric-height + blockhash forms both work.
+- [ ] scantxoutset — needs the COMPLETE UTXO set; BLOCKED on the rebuild.
 - [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (after T4)
 
 ### T3 — Mining-info RPCs  [oracle-verifiable, non-wallet]
