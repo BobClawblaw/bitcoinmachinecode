@@ -103,6 +103,9 @@ extern int  utxo_live_rewind_to(long height);
 
 /* bitcoin_mempool.asm / bitcoin_mempool_policy.c */
 extern long mpool_del(void* mp, const unsigned char txid[32]);
+/* shared-mempool cross-process lock (daemon/mempool_cfg.c; no-op fallback) */
+extern void mp_lock(void);
+extern void mp_unlock(void);
 extern long mpool_count(void* mp);
 extern long mpool_policy_add(void* pol, void* st, void* mp,
                              const unsigned char* tx, unsigned long txlen,
@@ -854,6 +857,12 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
     }
     size_t arena_used = 0;
 
+    /* Shared-mempool coherence: the snapshot->wipe->rebuild below must be one
+     * atomic step from every other process's point of view -- an inbound
+     * child's policy-add or the RPC thread's iteration landing mid-rebuild
+     * would see a half-emptied pool. mp_lock is a no-op for the per-process
+     * static fallback. */
+    mp_lock();
     long ncand = mempool_snapshot(m->mp, cand, REORG_MEMPOOL_MAX_TX);
     size_t snap_used = 0;
     for (long i = 0; i < ncand; i++){
@@ -896,6 +905,7 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
     }
 
     long final_n = mpool_count(m->mp);
+    mp_unlock();
     fprintf(stderr, "[reorg] mempool reconciled: %ld offered (%ld held + %ld from disconnected blocks), %ld accepted, %ld evicted, now %ld\n",
             ncand, from_mempool, ncand - from_mempool, accepted,
             ncand - accepted, final_n);
