@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <malloc.h>
 
 /* ---- extern wallet_core command layer (from asm/wallet_core.c) ---- */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
@@ -2181,8 +2183,10 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
     return 1;
 }
 
-int rpc_known_method(const char* method) {
-    static const char* const known[] = {
+/* The wallet/util subset rpc_commands.c dispatches itself. At file scope
+ * so `help` can enumerate it alongside the other modules' tables --
+ * one list, no second copy to fall out of step. */
+static const char* const WALLET_METHODS[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
         "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
@@ -2190,12 +2194,189 @@ int rpc_known_method(const char* method) {
         "signrawtransactionwithwallet","simulaterawtransaction",
         "combinerawtransaction","finalizepsbt","utxoupdatepsbt",
         "fundrawtransaction","descriptorprocesspsbt",
+    /* Control, plus the three singletons Core files elsewhere */
+    "help","logging","getrpcinfo","getmemoryinfo","getopenrpcinfo","rpc.discover",
+    "exportasmap","enumeratesigners",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
-        NULL
-    };
-    for (int i = 0; known[i]; i++) if (!strcmp(method, known[i])) return 1;
+    NULL
+};
+
+/* ==== Core's Control category, plus the three singletons (2026-08-25) ====
+ * These live here because rpc_commands.c is the only translation unit that
+ * can see every module's method table, which `help` needs. */
+
+/* Every method this node serves, merged from the four tables and sorted.
+ * Built from the tables themselves, so a method added to a dispatcher shows
+ * up here automatically and a hand-maintained second list cannot drift. */
+#define CTL_MAXM 512
+static int ctl_all_methods(const char* out[CTL_MAXM]){
+    int n = 0;
+    const char* m;
+    for (int i = 0; (m = rpc_wallet_method_at(i)) != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    for (int i = 0; (m = rpc_wops_method_at(i))   != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    for (int i = 0; (m = rpc_node_method_at(i))   != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    for (int i = 0; (m = rpc_chain_method_at(i))  != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    /* insertion sort; n is ~150 and this runs once per help call */
+    for (int i = 1; i < n; i++){
+        const char* k = out[i]; int j = i - 1;
+        while (j >= 0 && strcmp(out[j], k) > 0){ out[j+1] = out[j]; j--; }
+        out[j+1] = k;
+    }
+    /* de-duplicate: a name could legitimately appear in two tables */
+    int w = 0;
+    for (int i = 0; i < n; i++){
+        if (w > 0 && !strcmp(out[w-1], out[i])) continue;
+        out[w++] = out[i];
+    }
+    return w;
+}
+
+/* help ( "command" )
+ * Core answers with per-method usage text grouped by category. This node
+ * carries neither -- the usage strings are ~150 hand-written blocks that
+ * would have to be kept in step with the implementations by hand, and a
+ * usage string that has drifted from its method is worse than none. What it
+ * does have is the authoritative list of what it serves, taken from the
+ * dispatch tables themselves. */
+static int cmd_help(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* want = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR && params->items[0]->str[0])
+        want = params->items[0]->str;
+    if (want){
+        static char line[256];
+        if (!rpc_known_method(want)){
+            /* Core's exact text for an unknown command */
+            snprintf(line, sizeof line, "help: unknown command: %s", want);
+            *result = rj_str(line);
+            return 1;
+        }
+        snprintf(line, sizeof line,
+                 "%s\n\nThis node serves %s, but does not carry Bitcoin Core's "
+                 "per-method usage text. Consult Core's own `help %s` for the "
+                 "argument and result shapes; where this node diverges from "
+                 "them it is recorded in docs/RPC_LIVE_NODE.md.", want, want, want);
+        *result = rj_str(line);
+        return 1;
+    }
+    const char* all[CTL_MAXM];
+    int n = ctl_all_methods(all);
+    /* header + one line each */
+    size_t cap = 512 + (size_t)n * 40;
+    char* buf = malloc(cap);
+    if (!buf){ *ec = -7; *em = "oom"; return 0; }
+    int o = snprintf(buf, cap,
+        "== Methods served by this node (%d) ==\n"
+        "This list is generated from the dispatch tables, so it is exactly what\n"
+        "will be answered. Per-method usage text is not carried here; see\n"
+        "Core's own help for argument shapes and docs/RPC_LIVE_NODE.md for the\n"
+        "places this node deliberately diverges or refuses.\n\n", n);
+    for (int i = 0; i < n && o < (int)cap - 2; i++)
+        o += snprintf(buf + o, cap - (size_t)o, "%s\n", all[i]);
+    *result = rj_str(buf);
+    free(buf);
+    return 1;
+}
+
+/* getrpcinfo -- Core reports the commands currently executing and the log
+ * path. This node's RPC server accepts and services ONE connection at a time
+ * on a single thread (rpc_server.c), so at the moment getrpcinfo runs it is
+ * necessarily the only active command: the single-element array is the
+ * complete truth here, not a simplification. */
+static int cmd_getrpcinfo(rj_val** result){
+    rj_val* cmds = rj_arr();
+    rj_val* c = rj_obj();
+    rj_obj_set(c, "method", rj_str("getrpcinfo"));
+    rj_obj_set(c, "duration", rj_numf("%d", 0));
+    rj_arr_push(cmds, c);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "active_commands", cmds);
+    /* The daemon opens its log as the bare relative name "bitcoind.log" from
+     * the datadir it runs in (daemon/main.c), so resolving it against the
+     * cwd is the real path, not a guess. */
+    { char cwd[1024];
+      if (getcwd(cwd, sizeof cwd)){
+          char path[1200];
+          snprintf(path, sizeof path, "%s/bitcoind.log", cwd);
+          rj_obj_set(o, "logpath", rj_str(path));
+      } }
+    *result = o;
+    return 1;
+}
+
+/* logging ( ["include"] ["exclude"] )
+ * node_log.asm emits eight fixed kinds (INFO HSHK HDRS BLOCK CONS STORE
+ * ERROR SERVE) and has no runtime gate: every event is written
+ * unconditionally, by design -- the logger holds no global mutable state so
+ * it can link anywhere. The read form therefore reports this node's real
+ * kinds, all true because they really are all emitted. The mutating form is
+ * refused rather than accepted-and-ignored: a caller who turned a category
+ * "off" and kept seeing it in the log would be worse off than one told the
+ * switch does not exist. Note these are NOT Core's category names, because
+ * they are not Core's categories. */
+static int cmd_logging(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (params && params->typ == RJ_ARR && params->nitems >= 1){
+        *ec = -1;
+        *em = "this node's logger (node_log.asm) has no runtime category gate: "
+              "its eight kinds are always emitted, deliberately, so that it "
+              "holds no global mutable state and can link anywhere. Call "
+              "logging with no arguments to see them; there is nothing to "
+              "switch on or off";
+        return 0;
+    }
+    static const char* KINDS[] = { "info","hshk","hdrs","block","cons","store","error","serve" };
+    rj_val* o = rj_obj();
+    for (int i = 0; i < 8; i++) rj_obj_set(o, KINDS[i], rj_bool(1));
+    *result = o;
+    return 1;
+}
+
+/* getmemoryinfo ( "mode" )
+ * Core's default mode reports its SECURE ALLOCATOR's locked pool. This node
+ * has no secure allocator, so those six numbers describe nothing here and
+ * are refused rather than zeroed. Mode "mallocinfo" is real: glibc's
+ * malloc_info(3) emits the same XML Core forwards. */
+static int cmd_getmemoryinfo(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* mode = "stats";
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR) mode = params->items[0]->str;
+    if (!strcmp(mode, "mallocinfo")){
+        char* buf = NULL; size_t len = 0;
+        FILE* f = open_memstream(&buf, &len);
+        if (!f){ *ec = -7; *em = "oom"; return 0; }
+        int r = malloc_info(0, f);
+        fclose(f);
+        if (r != 0){ free(buf); *ec = -1; *em = "malloc_info failed"; return 0; }
+        *result = rj_str(buf ? buf : "");
+        free(buf);
+        return 1;
+    }
+    if (!strcmp(mode, "stats")){
+        *ec = -1;
+        *em = "getmemoryinfo \"stats\" reports Bitcoin Core's SECURE ALLOCATOR "
+              "locked-page pool. This node has no secure allocator, so those "
+              "numbers would describe nothing. Use mode \"mallocinfo\", which "
+              "returns glibc's real malloc_info(3) XML";
+        return 0;
+    }
+    *ec = -8; *em = "mode must be \"stats\" or \"mallocinfo\"";
+    return 0;
+}
+
+static int ctl_unsupported(const char* msg, long* ec, const char** em){
+    *ec = -1; *em = msg; return 0;
+}
+
+const char* rpc_wallet_method_at(int i){
+    int n = 0;
+    while (WALLET_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? WALLET_METHODS[i] : NULL;
+}
+
+int rpc_known_method(const char* method) {
+    for (int i = 0; WALLET_METHODS[i]; i++) if (!strcmp(method, WALLET_METHODS[i])) return 1;
     if (rpc_wops_known_method(method)) return 1;
     if (rpc_node_known_method(method)) return 1;
     return rpc_chain_known_method(method);
@@ -2251,6 +2432,30 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_signrawtransactionwithwallet(params, w, err_code, err_msg, result);
     if (!strcmp(method, "simulaterawtransaction"))
         return cmd_simulaterawtransaction(params, w, err_code, err_msg, result);
+    if (!strcmp(method, "help"))
+        return cmd_help(params, err_code, err_msg, result);
+    if (!strcmp(method, "getrpcinfo"))
+        return cmd_getrpcinfo(result);
+    if (!strcmp(method, "logging"))
+        return cmd_logging(params, err_code, err_msg, result);
+    if (!strcmp(method, "getmemoryinfo"))
+        return cmd_getmemoryinfo(params, err_code, err_msg, result);
+    if (!strcmp(method, "getopenrpcinfo") || !strcmp(method, "rpc.discover"))
+        return ctl_unsupported(
+            "this node publishes no OpenRPC service description: that document "
+            "restates every method's argument and result schema, which would be "
+            "a second specification to keep in step with the implementations by "
+            "hand. `help` lists what is served, generated from the dispatch "
+            "tables themselves", err_code, err_msg);
+    if (!strcmp(method, "exportasmap"))
+        return ctl_unsupported(
+            "this node uses no asmap: peer diversity is not bucketed by AS, so "
+            "there is no mapping to export", err_code, err_msg);
+    if (!strcmp(method, "enumeratesigners"))
+        return ctl_unsupported(
+            "this node has no external signer interface at all -- there is no "
+            "-signer option to restart with, and walletdisplayaddress reports "
+            "the same gap", err_code, err_msg);
     if (!strcmp(method, "combinerawtransaction"))
         return cmd_combinerawtransaction(params, err_code, err_msg, result);
     if (!strcmp(method, "finalizepsbt"))
