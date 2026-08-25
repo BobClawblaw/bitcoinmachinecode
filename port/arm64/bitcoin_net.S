@@ -343,8 +343,8 @@ p2p_read:
 	cmp x0, #24
 	b.ne .PREOF
 	ldr w24, [sp, #0]
-	MOVCONST w25, 0xd9b4, 0xbef9
-	cmp w24, w25
+	MOVCONST w18, 0xd9b4, 0xbef9   /* caller-saved scratch; never clobber x25+ */
+	cmp w24, w18
 	b.ne .PREOF
 	/* copy command -> cmd_out */
 	mov x3, #0
