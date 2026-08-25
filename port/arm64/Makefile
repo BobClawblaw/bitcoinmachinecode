@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_sigops
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -109,6 +109,10 @@ t_der: t_der.c bitcoin_script.o
 	$(CC) $(CFLAGS) -o t_der t_der.c bitcoin_script.o
 fuzz_der:
 	python3 fuzz_der.py 1 3000
+fuzz_sigops: fz_sigops
+	python3 fuzz_sigops.py 12345 4000 4
+fz_sigops: fz_sigops.c bitcoin_sigops.o bitcoin_scriptcodec.o
+	$(CC) $(CFLAGS) -o fz_sigops fz_sigops.c bitcoin_sigops.o bitcoin_scriptcodec.o
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 

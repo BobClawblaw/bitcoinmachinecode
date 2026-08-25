@@ -226,4 +226,11 @@ after init) -> loop must use caller-saved x9-x17 only; (2) utxo_walk_live loaded
 index into x10 then reloaded x10 with the callback -> re-load index right before the
 key store; (3) empty-script put silently skipped by sscanf (empty trailing field,
 the strtok-style empty-token pitfall again) -> '-' sentinel. t_utxo.c + fuzz_utxo.py.
-s6/UTXO core underway: bitcoin_utxo done; bitcoin_utxo_store, bitcoin_sigops next.
+s6/UTXO core underway: bitcoin_utxo done; bitcoin_utxo_store IN PROGRESS (a
+concurrent session); bitcoin_sigops DONE (2026-08-25 this session):
+- [x] bitcoin_sigops.S (sigop accounting) -> script_sigops / script_sigops_accurate /
+      tx_legacy_sigops, built on the already-ported get_op. Differential fuzz vs an
+      independent Python Core-equivalent oracle (multisig=20 inaccurate / DecodeOP_N
+      accurate; segwit marker+flag skip): 47k script (acc+inacc) + 23.5k tx + 1.2k
+      large-script (0xfd/0xfe/0xff slen) + 32 big-count (n_in/n_out up to 300k) cases,
+      0 fail across 6 seeds. (port/arm64/bitcoin_sigops.S, fuzz_sigops.py, fz_sigops.c)
