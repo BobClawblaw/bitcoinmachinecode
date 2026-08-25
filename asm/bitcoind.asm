@@ -90,11 +90,29 @@ node_handshake:
     push r13
     push r14
     push r15
-    sub  rsp, 0x140        ; locals ALL below save area (rbp-8..-40):
-                           ; version payload @ rbp-0xa0 (>=110B)
-                           ; cmd[12]      @ rbp-0xe0
-                           ; plen(4)      @ rbp-0xd8
-                           ; payload buf  @ rbp-0x140 (cap 0x80=128)
+    sub  rsp, 0x338        ; locals ALL below save area (rbp-8..-40):
+                           ; version payload @ rbp-0xa0 (>=112B: 81+UA26+5)
+                           ; cmd[12]      @ rbp-0xe0 (-0xe0..-0xd5)
+                           ; plen(4)      @ rbp-0xc8
+                           ; payload buf  @ rbp-0x2e0 (cap 0x100=256)
+                           ;
+                           ; LAYOUT IS LOAD-BEARING (2026-08-25). The old
+                           ; frame had TWO overlaps of the incident-#11/#31
+                           ; class: plen@-0xd8 sat INSIDE cmd[8..11], and the
+                           ; payload buf @-0x140 cap 0x80 spanned -0x140..
+                           ; -0xc1 -- placing cmd (and plen) at payload
+                           ; offsets 96/104. Any peer version payload LONGER
+                           ; than 96 bytes (every real Core peer: 102-125B;
+                           ; only short lab payloads fit) overwrote cmd with
+                           ; its own tail, the "version" compare failed, and
+                           ; the capture below never ran -- blank [dl]
+                           ; outbound log fields and zeroed getpeerinfo
+                           ; version/subver/services ever since the UA grew.
+                           ; The cap is 256 now: a version message of
+                           ; 129..256 bytes used to fail the WHOLE handshake
+                           ; (p2p_read -2 -> .fail), silently dropping any
+                           ; peer with a long UA. 0x338 also restores 16-byte
+                           ; RSP alignment at the calls (0x28+0x338 = 0x360).
     mov  r12, rdi           ; fd
     ; build version payload
     lea  rdi, [rbp-0xa0]
@@ -113,9 +131,9 @@ node_handshake:
     ; p2p_read(fd, cmd[12], payload, cap, &plen)
     mov  rdi, r12
     lea  rsi, [rbp-0xe0]    ; cmd
-    lea  rdx, [rbp-0x140]   ; payload
-    mov  ecx, 0x80
-    lea  r8, [rbp-0xd8]     ; plen
+    lea  rdx, [rbp-0x2e0]   ; payload (256B, clear of cmd/plen -- see above)
+    mov  ecx, 0x100
+    lea  r8, [rbp-0xc8]     ; plen (4 bytes, OUTSIDE cmd)
     call p2p_read
     cmp  rax, 0
     jle  .fail
@@ -126,7 +144,8 @@ node_handshake:
     mov  ecx, 7
     repe cmpsb
     jne  .nh_not_version
-    mov  rax, [rbp-0xd8]      ; plen
+    mov  eax, dword [rbp-0xc8]  ; plen is a u32 -- the old 8-byte load
+                                ; dragged in 4 adjacent garbage bytes
     cmp  rax, 256
     jbe  .nh_len_ok
     mov  rax, 256
@@ -134,7 +153,7 @@ node_handshake:
     mov  [rel g_peer_version_len], rax
     mov  rcx, rax
     lea  rdi, [rel g_peer_version_payload]
-    lea  rsi, [rbp-0x140]
+    lea  rsi, [rbp-0x2e0]
     rep  movsb
 .nh_not_version:
     ; --- is it "verack"? ---
@@ -153,7 +172,7 @@ node_handshake:
     mov  rdi, r12
     lea  rsi, [rel _pong]
     mov  rdx, 4
-    lea  rcx, [rbp-0x140]
+    lea  rcx, [rbp-0x2e0]
     mov  r8d, 8
     call p2p_write
     jmp  .read
@@ -169,7 +188,7 @@ node_handshake:
 .fail:
     mov  eax, 0
 .ret:
-    add  rsp, 0x140
+    add  rsp, 0x338
     pop  r15
     pop  r14
     pop  r13
@@ -245,7 +264,7 @@ node_accept_handshake:
 .got_version:
     ; capture the peer's raw version payload (side-effect only; actual
     ; field parsing happens in C -- see g_peer_version_payload's comment)
-    mov  rax, [rbp-0x54]      ; plen
+    mov  eax, dword [rbp-0x54]  ; plen u32 (8-byte load read garbage)
     cmp  rax, 256
     jbe  .gv_len_ok
     mov  rax, 256
