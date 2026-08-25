@@ -2890,6 +2890,39 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     else
         fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    /* Wallet bootstrap: if the CLI's own wallet store is present in the
+     * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
+     * CLI's own resolution order) and hand the RPC layer the seed --
+     * getnewaddress/getwalletinfo etc. then serve the REAL wallet. Absent
+     * store = wallet RPCs stay unconfigured, exactly as before. */
+    { extern int wallet_store_load(const char*, char*, int, char*, int);
+      extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
+                                       const char* pass, long passlen);
+      static unsigned char wseed[64];
+      static char mn[768], wpass[256];
+      const char* cand[2] = { "bmcwallet.dat", "data/bmcwallet.dat" };
+      for (int wi = 0; wi < 2; wi++){
+          struct stat wsb;
+          if (stat(cand[wi], &wsb) != 0) continue;
+          wpass[0] = 0;
+          { const char* sec = getenv("BMC_WALLET_PASS");
+            if (sec && sec[0]) snprintf(wpass, sizeof wpass, "%s", sec);
+            else { char pf[1064]; snprintf(pf, sizeof pf, "%s.pass", cand[wi]);
+                   FILE* f = fopen(pf, "r");
+                   if (f){ if (fgets(wpass, sizeof wpass, f)){ char* nl = strchr(wpass,'\n'); if (nl) *nl = 0; }
+                           fclose(f); } } }
+          if (wallet_store_load(cand[wi], mn, (int)sizeof mn, wpass, (int)sizeof wpass) == 0){
+              wallet_mnemonic_seed(wseed, mn, wpass[0] ? wpass : NULL,
+                                   wpass[0] ? (long)strlen(wpass) : 0);
+              memset(mn, 0, sizeof mn);           /* the mnemonic never lingers */
+              g_rpc_wallet.seed = wseed;
+              fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
+          } else {
+              fprintf(stderr, "[rpc] wallet store %s present but not loadable "
+                              "(encrypted? set BMC_WALLET_PASS or %s.pass)\n", cand[wi], cand[wi]);
+          }
+          break;
+      } }
     /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the
