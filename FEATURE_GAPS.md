@@ -148,18 +148,22 @@ RPCs, serve loop coexists). Landed: `getconnectioncount`, `getnetworkinfo`,
 `getpeerinfo` (outbound peer table over shared memory), `getmempoolinfo` /
 `getrawmempool` (the serve process's own mempool + accurate config), and
 `getchaintips` (active tip — side branches aren't persisted, which matches
-Core for a node with no forks). **Remaining:** `sendrawtransaction` — the one
-piece needing a parent→worker relay channel (the parent holds no peer sockets),
-deferred as its own careful slice; `getrawtransaction` without a block hash
-(mempool lookup); and a mempool coherent across the fork tree (`MAP_SHARED` +
-tx-accept-path locking) so a listening node's inbound-child txs appear in
-`getmempoolinfo`/`getrawmempool`.
-`createrawtransaction` was skipped as out of scope (the tx builder lives in
-the wallet CLI). Still absent as categories: wallet RPCs beyond the original
-8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest
-of util (`decodescript`, `validateaddress` and `createmultisig` are done;
-`deriveaddresses` / `getdescriptorinfo` are next but need a descriptor engine,
-and a `deriveaddresses`-free win is `getindexinfo`).
+Core for a node with no forks). **Remaining** *(as written then; audited
+2026-08-25 — nearly all closed)*: ~~`sendrawtransaction`~~ — **done** (the
+parent→worker channel exists; `submitblock` later rode the same pattern);
+`getrawtransaction` without a block hash — **still absent** (needs txindex
+or a mempool lookup, neither built); ~~a mempool coherent across the fork
+tree~~ — **done 2026-08-25** (`MAP_SHARED` pool + policy state under a
+`PTHREAD_PROCESS_SHARED` lock at every mutation site; an inbound child's
+accepts now appear in the parent's `getrawmempool`, proven cross-fork in
+`test_mempool_shared`). ~~`createrawtransaction` skipped as out of scope~~
+— later done, with Core-byte-identical KATs. ~~Still absent as
+categories~~ — **all since closed**: wallet-state RPCs (journal-backed
+`listtransactions`/`gettransaction`/`getwalletinfo`), mining
+(`getblocktemplate`/`submitblock`/`prioritisetransaction`),
+`estimatesmartfee`, the descriptor engine with `deriveaddresses`/
+`getdescriptorinfo` (plus `addr()`/`raw()` and scantxoutset's expansion path
+on top of it), and `getindexinfo`.
 
 **Effort for the remainder: medium** — the blockchain-query breadth is now
 done; what's left is the one architectural step (RPC ↔ live node state)
@@ -312,9 +316,14 @@ plus straightforward methods on top of it.
     guessing. `utxo_lsm_reload_ro` / `utxo_store_init_ro` make the whole read
     path genuinely read-only (the ordinary reload's `O_RDWR|O_CREAT` on
     utxo.dat/utxo.idx was the only write in the chain).
-  - Still missing, and deliberately: a live `gettxoutsetinfo` RPC, an
-    incrementally-maintained index (Core's `coinstatsindex` updates per block;
-    ours is a full O(set) walk), and `hash_serialized_3`.
+  - ~~Still missing, and deliberately: a live `gettxoutsetinfo` RPC~~ —
+    **done 2026-08-25**: the RPC exists, built on the same tool-derived
+    reader (one quiescence discipline by construction), refusing while the
+    set is being written rather than guessing. Still missing, still
+    deliberately: the incrementally-maintained index (Core's
+    `coinstatsindex` updates per block; ours is a full O(set) walk, ~90 s /
+    ~6 min with MuHash) and `hash_serialized_3` (refused by name; muhash is
+    our default).
 
 ## Wallet
 
@@ -381,10 +390,15 @@ Confirmed absent:
 
 ## Mining
 
-**Entirely absent.** No `getblocktemplate`, no `submitblock`, no block
-template construction, no stratum/pool-facing interface — confirmed via
-direct grep, zero hits across the whole `daemon/`/`rpc_commands.c` surface.
-This node can validate and relay blocks but cannot help build them.
+~~**Entirely absent.**~~ **Substantially present since 2026-08-25.**
+`getblocktemplate` (BIP22/23: deterministic frame diffed against Core at the
+same tip, the 2016-block retarget bit-exact against 8/8 real historical
+boundaries, witness commitment recomputed per template; documented gaps —
+sigops is a lower bound, tx ordering is valid but not fee-optimal, no
+longpoll), `submitblock` end-to-end (8 MB transport, 4 MB worker channel,
+BIP22 reason strings, connect gated on a dry run of the real apply path),
+and `prioritisetransaction`/`getprioritisedtransactions`. Still absent: any
+stratum/pool-facing interface, and BIP23 proposal mode.
 
 ## Ops / misc
 
