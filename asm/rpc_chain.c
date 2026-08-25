@@ -1895,6 +1895,30 @@ int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
     return 0;
 }
+
+/* Public full-tx decoder (Core decoderawtransaction shape: txid/hash/version/
+ * size/vsize/weight/locktime/vin/vout with scriptPubKey asm+desc+address). The
+ * same tx_to_json getblock verbosity>=1 uses, so it is Core-verified. Standalone
+ * (no chain state). Returns 1, or 0 with *ec / *em on a malformed/trailing tx. */
+int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, const char** em){
+    txw_t w;
+    if (txlen < 10 || !tx_walk(tx, tx + txlen, &w) || (long)w.len != txlen){
+        *ec = -22; *em = "TX decode failed"; return 0; }
+    rj_val* o = tx_to_json(tx, &w, -1);
+    if (!o){ *ec = -7; *em = "out of memory"; return 0; }
+    /* tx_to_json emits "hex" for getblock/getrawtransaction; decoderawtransaction
+     * and decodepsbt's tx do NOT include it. Strip it. */
+    for (size_t i = 0; i < o->nmembers; i++){
+        if (!strcmp(o->members[i].key, "hex")){
+            free(o->members[i].key); rj_free(o->members[i].val);
+            for (size_t j = i + 1; j < o->nmembers; j++) o->members[j-1] = o->members[j];
+            o->nmembers--; break;
+        }
+    }
+    *result = o;
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
