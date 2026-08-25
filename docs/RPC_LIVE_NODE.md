@@ -363,3 +363,82 @@ for a targeted block request).
 
 ### Category status
 All 38 of Core's Blockchain methods now dispatch.
+
+## Slice 10 — the Rawtransactions category — (2026-08-25)
+The last nine. Four are real, five refuse.
+
+### `testmempoolaccept` — one implementation, not two
+It rides the same parent→worker channel as `sendrawtransaction`, with a new
+`tx_submit_test` flag. On the worker side `tx_accept_test_reason` runs the
+identical consensus/script validation and the identical mempool policy
+checks, stopping at the policy **commit boundary**.
+
+That boundary is real, not a reimplementation: `mpool_policy_add` became a
+thin wrapper over a shared `mpol_add_core(..., commit)`, which returns 1 at
+the `/* commit */` marker when `commit` is 0 — the same shape as
+`utxo_live_dryrun_block()` returning at its Phase 5 boundary. The committing
+path is byte-for-byte the code it always was; a second copy of these rules
+would answer about a mempool this node does not have.
+
+`sendrawtransaction` now clears `tx_submit_test` explicitly. A stale `1` left
+by a dry run would turn a real broadcast into a no-op that still returned a
+txid — the test asserts the worker sees the flag cleared.
+
+**Documented divergence — package policy.** Core validates the array as a
+package: a child may spend a parent earlier in the same call. This node
+evaluates each transaction independently against the mempool as it stands,
+because the dry run deliberately inserts nothing, so an earlier entry is
+invisible to a later one. When more than one transaction is passed, every
+entry carries Core's own `package-error` field saying so, and a child
+spending an in-array parent reports `missing-inputs` — the truth about what
+was checked. `effective-feerate` and `effective-includes` describe package
+feerate and are omitted rather than guessed.
+
+### `finalizepsbt` — verified against the signer, not against itself
+Implements BIP174's Finalizer and Extractor for P2PKH, P2WPKH and
+P2SH-P2WPKH. An input of any other form is left untouched and `complete`
+comes back false, which is exactly what Core does for an input it cannot
+finalize.
+
+The test is a round trip with teeth: a PSBT is assembled carrying the real
+signature `signrawtransactionwithkey` produced for that input, and the
+extractor's output must come back **byte-identical** to the signer's own
+network serialization. A finalizer that assembled the witness stack even
+slightly differently fails that comparison; a shape check on
+`{hex, complete}` would not. Finalizing with `extract=false` and then
+finalizing the result again must extract the same bytes, proving the final
+fields were written, not merely reported.
+
+### `combinerawtransaction` — merges, or refuses; never silently drops
+For each input, if at most one supplied transaction carries signature data,
+that one is taken. If two carry **different** non-empty data for the same
+input, combining them needs Core's signature combiner (for multisig,
+assembling separate signatures into one scriptSig), which this node does not
+have — so it errors and points at `combinepsbt`, which merges properly at the
+PSBT level. Keeping one side would hand back a transaction missing signatures
+the caller supplied. Identical data on both sides is not a conflict and
+combines cleanly.
+
+Tested by signing one two-input transaction twice, each time with the prevout
+for only one input, and requiring the combination to reproduce the
+transaction signed with both at once.
+
+### `utxoupdatepsbt`
+Fills `PSBT_IN_WITNESS_UTXO` from the UTXO set for inputs whose scriptPubKey
+is a witness program — exactly what the method is documented to do. A
+non-witness input needs its whole previous transaction, which needs a txindex
+this node does not build, so those are left alone. The `descriptors`
+argument is **refused**, not ignored: a caller who passed descriptors and got
+a PSBT back without them would reasonably believe they had been applied.
+
+### Refused, each naming the gap
+`fundrawtransaction` (no coin selection, change policy or fee estimation, and
+the same P2WPKH-wallet / legacy-P2PKH-signer mismatch that blocks
+`sendtoaddress`); `descriptorprocesspsbt` (the descriptor engine derives
+addresses and scripts but has no path from a descriptor to a spending key);
+`submitpackage` (no package validation — submit the parent first, then the
+child); `getprivatebroadcastinfo` and `abortprivatebroadcast` (no private
+broadcast queue; `sendrawtransaction` relays to every live peer leg at once).
+
+### Category status
+All 20 of Core's Rawtransactions methods now dispatch.
