@@ -394,136 +394,17 @@ static int cmd_decoderaw(const rj_val* params, long* ec, const char** em, rj_val
     const char* hexstr = rpc_param_str(params, 0, ec, em);
     if (!hexstr) return 0;
     size_t hl = strlen(hexstr);
-    if (hl % 2 || hl / 2 > 16384) { *ec = -22; *em = "TX decode failed"; return 0; }
-    unsigned char* tx = malloc(hl / 2 ? hl / 2 : 1);
-    if (!tx) return 0;
+    if (hl % 2 || hl / 2 < 10 || hl / 2 > 200000) { *ec = -22; *em = "TX decode failed"; return 0; }
+    unsigned char* tx = malloc(hl / 2);
+    if (!tx) { *ec = -7; *em = "out of memory"; return 0; }
     if (!hex_to_bytes(tx, hexstr, hl)) { free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
-    /* Render Core-shaped decoderawtransaction (deterministic fields only:
-     * version/locktime/vin/vout with scriptPubKey hex + address/scriptSig hex).
-     * txid/hash/size/weight are computed from the raw bytes where derivable;
-     * vsize/weight use the legacy (non-witness) size when no witness marker. */
-    rj_val* o = rj_obj();
-    size_t txlen = hl / 2;
-    unsigned long p = 0;
-    unsigned long version = 0;
-    if (txlen >= 4) version = (unsigned long)tx[0] | ((unsigned long)tx[1]<<8) | ((unsigned long)tx[2]<<16) | ((unsigned long)tx[3]<<24);
-    p = 4;
-    /* detect segwit marker (0x00 followed by non-zero) */
-    int segwit = 0;
-    if (txlen >= 6 && tx[4] == 0x00 && tx[5] != 0x00) segwit = 1;
-
-    rj_val* vin = rj_arr();
-    unsigned long vin_pos = p;
-    unsigned long flags_pos = p;
-    if (segwit) { /* first byte after version is marker, then flag byte */
-        vin_pos = p + 2; flags_pos = p + 1;
-    }
-    /* parse vin count at vin_pos */
-    unsigned long cc;
-    unsigned long vin_start = vin_pos;
-    {
-        unsigned long q = vin_pos;
-        unsigned long n_in = 0;
-        int okv = 1;
-        unsigned char b = (q < txlen) ? tx[q] : 0;
-        if (b < 253) { n_in = b; q += 1; }
-        else if (b == 253) { if (q + 3 <= txlen) { n_in = (unsigned long)tx[q+1] | ((unsigned long)tx[q+2]<<8); q += 3; } else okv = 0; }
-        else if (b == 254) { if (q + 5 <= txlen) { n_in = (unsigned long)tx[q+1] | ((unsigned long)tx[q+2]<<8) | ((unsigned long)tx[q+3]<<16) | ((unsigned long)tx[q+4]<<24); q += 5; } else okv = 0; }
-        else { okv = 0; }
-        if (!okv) { free(tx); rj_free(o); *ec = -22; *em = "TX decode failed"; return 0; }
-        cc = q - vin_pos;
-        unsigned long pos = vin_pos + cc;
-        for (unsigned long i = 0; i < n_in && pos + 40 <= txlen; i++) {
-            /* prev txid: display-reversed */
-            char th[65];
-            for (int j = 0; j < 32; j++) { th[j*2] = "0123456789abcdef"[(tx[pos+31-j]>>4)&15]; th[j*2+1] = "0123456789abcdef"[tx[pos+31-j]&15]; }
-            th[64] = 0;
-            unsigned long pv = (unsigned long)tx[pos+32] | ((unsigned long)tx[pos+33]<<8) | ((unsigned long)tx[pos+34]<<16) | ((unsigned long)tx[pos+35]<<24);
-            pos += 36;
-            unsigned long sl = 0; unsigned char sb = tx[pos];
-            if (sb < 253) { sl = sb; pos += 1; } else if (sb == 253 && pos+3 <= txlen) { sl = (unsigned long)tx[pos+1] | ((unsigned long)tx[pos+2]<<8); pos += 3; }
-            else if (sb == 254 && pos+5 <= txlen) { sl = (unsigned long)tx[pos+1] | ((unsigned long)tx[pos+2]<<8) | ((unsigned long)tx[pos+3]<<16) | ((unsigned long)tx[pos+4]<<24); pos += 5; }
-            if (pos + sl > txlen) sl = txlen - pos;
-            char ssh[256]; ssh[0] = 0; if (sl <= 128) bin_to_hex(ssh, tx + pos, sl);
-            pos += sl;
-            unsigned long seq = (pos + 4 <= txlen) ? ((unsigned long)tx[pos] | ((unsigned long)tx[pos+1]<<8) | ((unsigned long)tx[pos+2]<<16) | ((unsigned long)tx[pos+3]<<24)) : 0;
-            if (pos + 4 <= txlen) pos += 4;
-            rj_val* ino = rj_obj();
-            rj_obj_set(ino, "txid", rj_str(th));
-            rj_obj_set(ino, "vout", rj_numf("%lu", pv));
-            rj_val* ss = rj_obj();
-            rj_obj_set(ss, "asm", rj_str(""));
-            rj_obj_set(ss, "hex", rj_str(ssh));
-            rj_obj_set(ino, "scriptSig", ss);
-            rj_obj_set(ino, "sequence", rj_numf("%lu", seq));
-            rj_arr_push(vin, ino);
-        }
-        /* Note: for decode we do not faithfully advance past witness data; the
-         * in-scope command layer decodes legacy layout. Out count begins after
-         * the inputs region above. */
-    }
-    rj_obj_set(o, "vin", vin);
-
-    /* vout -- locate start: after vin blocks. Recompute robustly: find output
-     * count by scanning. Here we rely on the legacy layout (no witness) which
-     * is what the command layer handles. */
-    rj_val* vouts = rj_arr();
-    /* determine out count position: after vin input records; for the legacy
-     * decode we compute from the raw stream starting at vin_start. */
-    {
-        unsigned long q = vin_start;
-        unsigned char b = (q < txlen) ? tx[q] : 0;
-        unsigned long n_in = 0;
-        if (b < 253) { n_in = b; q += 1; }
-        else if (b == 253 && q+3 <= txlen) { n_in = (unsigned long)tx[q+1] | ((unsigned long)tx[q+2]<<8); q += 3; }
-        else if (b == 254 && q+5 <= txlen) { n_in = (unsigned long)tx[q+1] | ((unsigned long)tx[q+2]<<8) | ((unsigned long)tx[q+3]<<16) | ((unsigned long)tx[q+4]<<24); q += 5; }
-        unsigned long pos = q;
-        for (unsigned long i = 0; i < n_in && pos + 36 <= txlen; i++) {
-            pos += 36;
-            unsigned char sb = (pos < txlen) ? tx[pos] : 0;
-            unsigned long sl = 0;
-            if (sb < 253) { sl = sb; pos += 1; } else if (sb == 253 && pos+3 <= txlen) { sl = (unsigned long)tx[pos+1]|((unsigned long)tx[pos+2]<<8); pos += 3; }
-            else if (sb == 254 && pos+5 <= txlen) { sl = (unsigned long)tx[pos+1]|((unsigned long)tx[pos+2]<<8)|((unsigned long)tx[pos+3]<<16)|((unsigned long)tx[pos+4]<<24); pos += 5; }
-            if (pos + sl <= txlen) pos += sl;
-            if (pos + 4 <= txlen) pos += 4;
-        }
-        unsigned char ob = (pos < txlen) ? tx[pos] : 0;
-        unsigned long n_out = 0;
-        if (ob < 253) { n_out = ob; pos += 1; }
-        else if (ob == 253 && pos+3 <= txlen) { n_out = (unsigned long)tx[pos+1]|((unsigned long)tx[pos+2]<<8); pos += 3; }
-        else if (ob == 254 && pos+5 <= txlen) { n_out = (unsigned long)tx[pos+1]|((unsigned long)tx[pos+2]<<8)|((unsigned long)tx[pos+3]<<16)|((unsigned long)tx[pos+4]<<24); pos += 5; }
-        for (unsigned long i = 0; i < n_out && pos + 8 <= txlen; i++) {
-            unsigned long long val = 0;
-            for (int j = 0; j < 8; j++) val |= (unsigned long long)tx[pos+j] << (8*j);
-            pos += 8;
-            unsigned char sb = (pos < txlen) ? tx[pos] : 0;
-            unsigned long sl = 0;
-            if (sb < 253) { sl = sb; pos += 1; } else if (sb == 253 && pos+3 <= txlen) { sl = (unsigned long)tx[pos+1]|((unsigned long)tx[pos+2]<<8); pos += 3; }
-            else if (sb == 254 && pos+5 <= txlen) { sl = (unsigned long)tx[pos+1]|((unsigned long)tx[pos+2]<<8)|((unsigned long)tx[pos+3]<<16)|((unsigned long)tx[pos+4]<<24); pos += 5; }
-            if (pos + sl > txlen) sl = txlen - pos;
-            char spkhex[512]; spkhex[0] = 0; if (sl <= 256) bin_to_hex(spkhex, tx + pos, sl);
-            char addr[96]; addr[0] = 0;
-            int t = wallet_script_to_address(addr, 96, tx + pos, (long)sl);
-            pos += sl;
-            rj_val* outo = rj_obj();
-            unsigned long long coin = RPC_SATOSHI;
-            rj_obj_set(outo, "value", rj_numf("%llu.%08llu", val / coin, val % coin));
-            rj_obj_set(outo, "n", rj_numf("%lu", i));
-            rj_val* sp = rj_obj();
-            rj_obj_set(sp, "asm", rj_str(""));
-            rj_obj_set(sp, "desc", rj_str(""));
-            rj_obj_set(sp, "hex", rj_str(spkhex));
-            if (addr[0]) rj_obj_set(sp, "address", rj_str(addr));
-            rj_obj_set(sp, "type", rj_str(spk_type(t)));
-            rj_obj_set(outo, "scriptPubKey", sp);
-            rj_arr_push(vouts, outo);
-        }
-    }
-    rj_obj_set(o, "vout", vouts);
-    rj_obj_set(o, "locktime", rj_numf("%lu", (txlen >= 4 ? ((unsigned long)tx[txlen-4] | ((unsigned long)tx[txlen-3]<<8) | ((unsigned long)tx[txlen-2]<<16) | ((unsigned long)tx[txlen-1]<<24)) : 0)));
+    /* Route to rpc_chain's full, getblock-verified tx decoder so
+     * decoderawtransaction returns the complete Core shape (txid/hash/version/
+     * size/vsize/weight + scriptPubKey asm/desc), not the former minimal
+     * {locktime,vin,vout}. */
+    int r = rpc_chain_decode_rawtx(tx, (long)(hl / 2), result, ec, em);
     free(tx);
-    *result = o;
-    return 1;
+    return r;
 }
 
 /* ---- gettxout against wallet UTXOs (Core-shaped; null when absent) ---- */
@@ -648,7 +529,11 @@ static long crt_varint(unsigned char* o, unsigned long long v){
     if (v<=0xffffffffULL){ o[0]=0xfe; for(int i=0;i<4;i++) o[1+i]=(unsigned char)(v>>(8*i)); return 5; }
     o[0]=0xff; for(int i=0;i<8;i++) o[1+i]=(unsigned char)(v>>(8*i)); return 9;
 }
-static int cmd_createrawtransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
+/* Build the unsigned tx (empty scriptSigs) shared by createrawtransaction and
+ * createpsbt. Fills tx (cap >= 131072), sets *out_n / *out_nin / *out_nout.
+ * Returns 1, or 0 with *ec / *em. */
+static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out_n,
+                              size_t* out_nin, size_t* out_nout, long* ec, const char** em){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected an inputs array and outputs"; return 0; }
     const rj_val* ins = params->items[0];
@@ -659,7 +544,7 @@ static int cmd_createrawtransaction(const rj_val* params, long* ec, const char**
     if (params->nitems>=4 && params->items[3]->typ==RJ_BOOL) replaceable=(params->items[3]->str[0]=='1');
     unsigned long defseq = replaceable ? 0xfffffffdUL : (locktime!=0 ? 0xfffffffeUL : 0xffffffffUL);
 
-    static unsigned char tx[131072]; long n=0;
+    long n=0;
     tx[n++]=2; tx[n++]=0; tx[n++]=0; tx[n++]=0;                 /* version 2 LE */
     n += crt_varint(tx+n, (unsigned long long)ins->nitems);
     for (size_t i=0;i<ins->nitems;i++){
@@ -712,8 +597,126 @@ static int cmd_createrawtransaction(const rj_val* params, long* ec, const char**
         }
     }
     tx[n++]=(unsigned char)locktime;tx[n++]=(unsigned char)(locktime>>8);tx[n++]=(unsigned char)(locktime>>16);tx[n++]=(unsigned char)(locktime>>24);
+    *out_n=n; *out_nin=ins->nitems; *out_nout=onm;
+    return 1;
+}
+
+static int cmd_createrawtransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
+    static unsigned char tx[131072]; long n; size_t nin, nout;
+    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
     char* hex=malloc((size_t)n*2+1); if (!hex){ *ec=-7; *em="oom"; return 0; }
     bin_to_hex(hex,tx,(size_t)n); *result=rj_str(hex); free(hex);
+    return 1;
+}
+
+/* base64 (standard alphabet, '=' padding). out must hold ceil(n/3)*4+1. */
+static void crt_b64(char* out, const unsigned char* in, long n){
+    static const char* B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    long o=0;
+    for (long i=0;i<n;i+=3){
+        long r=n-i; unsigned b0=in[i], b1=r>1?in[i+1]:0, b2=r>2?in[i+2]:0;
+        out[o++]=B[b0>>2]; out[o++]=B[((b0&3)<<4)|(b1>>4)];
+        out[o++]=r>1?B[((b1&15)<<2)|(b2>>6)]:'='; out[o++]=r>2?B[b2&63]:'=';
+    }
+    out[o]=0;
+}
+
+/* createpsbt (Core rpc/rawtransaction.cpp, creator role, PSBT v0 / BIP174):
+ * wraps the unsigned tx in PSBT_GLOBAL_UNSIGNED_TX (key 0x00) with empty
+ * per-input / per-output maps. Emits the stable BIP174 v0 format (not the
+ * master oracle's v2 default). */
+static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    static unsigned char tx[131072]; long n; size_t nin, nout;
+    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+    static unsigned char psbt[140000]; long p=0;
+    psbt[p++]=0x70; psbt[p++]=0x73; psbt[p++]=0x62; psbt[p++]=0x74; psbt[p++]=0xff;  /* "psbt\xff" */
+    psbt[p++]=0x01; psbt[p++]=0x00;                     /* keylen 1, key = PSBT_GLOBAL_UNSIGNED_TX */
+    p += crt_varint(psbt+p, (unsigned long long)n);     /* value length = txlen */
+    memcpy(psbt+p, tx, n); p += n;                      /* the unsigned tx */
+    psbt[p++]=0x00;                                     /* end of global map */
+    for (size_t i=0;i<nin;i++)  psbt[p++]=0x00;         /* empty input maps */
+    for (size_t i=0;i<nout;i++) psbt[p++]=0x00;         /* empty output maps */
+    char* b64=malloc((size_t)((p+2)/3)*4 + 1); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    crt_b64(b64, psbt, p); *result=rj_str(b64); free(b64);
+    return 1;
+}
+
+/* base64 decode; returns 1 and sets *outn, or 0 on a bad char. */
+static int crt_b64dec(const char* in, unsigned char* out, long cap, long* outn){
+    static signed char T[256]; static int init=0;
+    if (!init){ for (int i=0;i<256;i++) T[i]=-1;
+        const char* B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i=0;i<64;i++) T[(unsigned char)B[i]]=(signed char)i; init=1; }
+    unsigned acc=0; int bits=0; long o=0;
+    for (const char* q=in; *q; q++){
+        if (*q=='=' || *q=='\n' || *q=='\r' || *q==' ') continue;
+        signed char v=T[(unsigned char)*q]; if (v<0) return 0;
+        acc=(acc<<6)|(unsigned)v; bits+=6;
+        if (bits>=8){ bits-=8; if (o<cap) out[o++]=(unsigned char)((acc>>bits)&0xff); }
+    }
+    *outn=o; return 1;
+}
+static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed);   /* defined below */
+
+/* decodepsbt (Core rpc/rawtransaction.cpp), PSBT v0 shape: tx (decoded unsigned
+ * tx), global_xpubs, psbt_version, proprietary, unknown, inputs[], outputs[].
+ * Input/output maps are parsed to Core's field names where recognized; a
+ * freshly-created PSBT yields empty per-input/output objects, matching Core. */
+static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, unsigned long n){
+    char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
+}
+static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params,0,ec,em); if (!b64) return 0;
+    static unsigned char buf[200000]; long blen=0;
+    if (!crt_b64dec(b64,buf,sizeof buf,&blen) || blen<5 || memcmp(buf,"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+    long p=5; const unsigned char* utx=NULL; unsigned long utxlen=0; int psbtver=0;
+    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
+        const unsigned char* key=buf+p; p+=kl;
+        unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
+        if (kl>=1 && key[0]==0x00){ utx=val; utxlen=vl; }
+        else if (kl>=1 && key[0]==0xfb){ psbtver=(int)val[0]; }
+    }
+    rj_val* o=rj_obj();
+    long n_in=0, n_out=0;
+    if (utx){
+        rj_val* txo=NULL; long e2; const char* m2;
+        if (rpc_chain_decode_rawtx(utx,(long)utxlen,&txo,&e2,&m2)){
+            rj_val* vin=rj_obj_get(txo,"vin"); rj_val* vout=rj_obj_get(txo,"vout");
+            n_in = vin?(long)vin->nitems:0; n_out = vout?(long)vout->nitems:0;
+            rj_obj_set(o,"tx",txo);
+        }
+    }
+    rj_obj_set(o,"global_xpubs",rj_arr());
+    rj_obj_set(o,"psbt_version",rj_numf("%d",psbtver));
+    rj_obj_set(o,"proprietary",rj_arr());
+    rj_obj_set(o,"unknown",rj_obj());
+    rj_val* ins=rj_arr();
+    for (long i=0;i<n_in && p<blen;i++){
+        rj_val* io=rj_obj();
+        while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
+            const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
+            if (kl>=1){ switch (key[0]){
+                    case 0x04: psbt_field_hex(io,"redeem_script",val,vl); break;
+                    case 0x05: psbt_field_hex(io,"witness_script",val,vl); break;
+                    case 0x07: psbt_field_hex(io,"final_scriptSig",val,vl); break;
+                    default: break; } }
+        }
+        rj_arr_push(ins,io);
+    }
+    rj_obj_set(o,"inputs",ins);
+    rj_val* outs=rj_arr();
+    for (long i=0;i<n_out && p<blen;i++){
+        rj_val* oo=rj_obj();
+        while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
+            const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
+            if (kl>=1){ switch (key[0]){ case 0x00: psbt_field_hex(oo,"redeem_script",val,vl); break;
+                                         case 0x01: psbt_field_hex(oo,"witness_script",val,vl); break;
+                                         default: break; } }
+        }
+        rj_arr_push(outs,oo);
+    }
+    rj_obj_set(o,"outputs",outs);
+    *result=o;
     return 1;
 }
 
@@ -941,7 +944,7 @@ int rpc_known_method(const char* method) {
     static const char* const known[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
-        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey",
+        "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -976,6 +979,10 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_verifymessage(params, err_code, err_msg, result);
     if (!strcmp(method, "createrawtransaction"))
         return cmd_createrawtransaction(params, err_code, err_msg, result);
+    if (!strcmp(method, "createpsbt"))
+        return cmd_createpsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "decodepsbt"))
+        return cmd_decodepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
