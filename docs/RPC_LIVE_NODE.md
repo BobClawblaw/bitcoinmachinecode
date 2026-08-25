@@ -114,3 +114,56 @@ RPC output cannot be byte-matched against a moving master, so these are
 verified against the **documented Core v31 shapes** (as the rest of the RPC
 layer is) with the stable fields checked against the oracle — an honest bound,
 not a claimed byte-identity.
+
+## Slice 6 — the network/ops twelve — IMPLEMENTED (2026-08-25)
+`getnettotals`, `getnodeaddresses`, `getaddrmaninfo`, `getaddednodeinfo`,
+`listbanned`, `clearbanned`, `addnode`, `disconnectnode`, `setban`,
+`setnetworkactive`, `ping` (eleven methods; `getpeerinfo` already existed and
+completes Core's twelve-method Network category).
+
+Shapes were taken from the running oracle, not from memory: `getaddrmaninfo`'s
+key set and order (`ipv4`, `ipv6`, `onion`, `i2p`, `cjdns`, `all_networks`,
+each `{new,tried,total}`), `getnettotals`'s `uploadtarget` sub-object, and
+`getaddednodeinfo`'s `-24 "Error: Node has not been added."`.
+
+**Backed by real state.**
+- `getnettotals` sums the `bytes_sent`/`bytes_recv` counters the peer table
+  already carries (kernel `TCP_INFO`, per socket).
+- `getnodeaddresses` and `getaddrmaninfo` read the persistent address book
+  (`bitcoin_addrmgr.asm`, 18-byte records) through an injected handle. The
+  RPC thread opens its own handle because the download worker's lives in the
+  forked child; `amr_*` re-reads `peers.dat` per call, so both see one file.
+- `getaddednodeinfo` reports the operator's `addnode=` entries from
+  `bitcoin.conf` and marks each connected by matching a live peer slot —
+  anchored so `1.2.3.4` does not match a peer at `1.2.3.45`.
+
+**Documented divergences** — each is a real difference, not an approximation
+presented as a total:
+- `getnettotals` counts the **live** peer table. Core counts the process
+  lifetime including closed connections; this node keeps no such accumulator.
+- `getnettotals.uploadtarget` reports an unset target (`target: 0`,
+  `serve_historical_blocks: true`). There is no upload cap to report.
+- `getaddrmaninfo` has no new/tried split — the address book is one flat
+  table fed by contact, so every record counts as `tried` and `new` is 0.
+  The book is IPv4-only, so the other five networks are genuinely zero and a
+  `getnodeaddresses` filter for them returns empty rather than relabelled
+  IPv4 rows.
+- `listbanned` returns `[]` and `clearbanned` returns null — the same answers
+  Core gives with nothing banned. The divergence is that nothing can ever
+  populate the list, because there is no ban list to populate.
+- **The five mutators refuse.** `addnode`, `disconnectnode`, `setban`,
+  `setnetworkactive` and `ping` return `-1` with a reason. Peer connections
+  are owned by the forked download worker, which dials and redials from the
+  address book on its own policy; there is no runtime peer-control path, no
+  ban list, and no network-disable switch. Returning success while changing
+  nothing would be worse than an honest error — a caller that trusts a
+  `setban` that did not ban is strictly worse off than one told it cannot.
+  `addnode=` in `bitcoin.conf` plus a restart is the supported route, and the
+  error message says so.
+
+`tests/test_rpc_node.c` covers all twelve, including the dead-slot exclusion
+in the byte sum, the endianness of every decoded address-book field (IP u32
+LE, port u16 BE, services u64 LE), Core's default `count=1`, the
+`count=0`-means-all form, the network filter, the prefix-match anchor, and
+that each mutator returns `-1` with a non-empty reason rather than a silent
+no-op.
