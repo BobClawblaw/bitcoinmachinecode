@@ -6,6 +6,13 @@ of 2026-08-25 — not from memory. "Parity" here means **RPC-surface + behavior
 parity**, method by method, verified where verifiable. It does NOT resolve the
 separate, deeper open question of consensus correctness (LOG.md incidents).
 
+## CAPSTONE PASSED (2026-08-25)
+At height 963967: txouts, total_amount, bogosize and the MuHash of the entire
+UTXO set are byte-identical to Bitcoin Core's (oracle coinstatsindex answer at
+the same height); scantxoutset for the burn address matches to the satoshi.
+See LOG.md's capstone entry for the numbers, and incident #45 for the one
+finding it surfaced (utxo_lsm_count metadata over-count; content unaffected).
+
 ## Verification bound (honest)
 The scratch Core oracle (`/storage/core-oracle`, port 8335) is built **without
 wallet support**, so wallet-state RPCs cannot be oracle-diffed. Verification
