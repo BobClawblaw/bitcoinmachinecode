@@ -95,6 +95,7 @@ asm/tests/serve_test
 asm/tests/test_idx
 asm/tests/test_idx
 asm/tests/test_serve
+asm/tests/reorg_drill
 asm/tests/test_redial
 asm/bitcoin_idx.o
 asm/bitcoin_serve.o
