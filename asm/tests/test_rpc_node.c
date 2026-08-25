@@ -369,11 +369,86 @@ int main(void){
             ck("esf fresh -> no feerate field", r && rj_obj_get(r,"feerate")==NULL);
             rj_free(r); rj_free(fp); }
           /* restore the populated hooks for any later checks */
-          { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+          { extern long mpool_policy_entry(void*, const unsigned char*,
+                                           unsigned long long*, unsigned long long*);
+            rpc_mempool_hooks h; memset(&h,0,sizeof h);
             h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
             h.get = mpool_get; h.polstate = polstate;
+            h.pol_entry = mpool_policy_entry;
             h.pol_entry_info = mpool_policy_entry_info;
             rpc_node_set_mempool(&h); } }
+
+        /* ---- prioritisetransaction / getprioritisedtransactions: deltas
+         * accumulate, zero-sum entries erased, fees.modified = base + delta,
+         * companion shows modified_fee (sats) only when in mempool -- all
+         * oracle-verified semantics. Uses the real chain's parent tx
+         * (base fee 10000 sat). ---- */
+        { char pj2[160];
+          snprintf(pj2,sizeof pj2,"[\"%s\", 0, 1000]",pidhex);
+          rj_val* pp2=rj_parse(pj2,strlen(pj2)); r=NULL;
+          rc=rpc_node_dispatch("prioritisetransaction",pp2,&r,&ec,&em);
+          ck("pritx(+1000) -> true", rc==1 && r && r->typ==RJ_BOOL && r->str[0]=='1');
+          rj_free(r); rj_free(pp2);
+          /* fees.modified reflects the delta */
+          snprintf(pj2,sizeof pj2,"[\"%s\"]",pidhex);
+          pp2=rj_parse(pj2,strlen(pj2)); r=NULL;
+          rpc_node_dispatch("getmempoolentry",pp2,&r,&ec,&em);
+          ck("entry fees.modified = 0.00011000 (base+delta)",
+             r && rj_obj_get(r,"fees") && S(rj_obj_get(r,"fees"),"modified")
+             && !strcmp(S(rj_obj_get(r,"fees"),"modified"),"0.00011000"));
+          ck("entry fees.base unchanged 0.00010000",
+             r && rj_obj_get(r,"fees") && S(rj_obj_get(r,"fees"),"base")
+             && !strcmp(S(rj_obj_get(r,"fees"),"base"),"0.00010000"));
+          rj_free(r); rj_free(pp2);
+          /* companion: in-mempool entry carries modified_fee in sats */
+          r=NULL; rpc_node_dispatch("getprioritisedtransactions",NULL,&r,&ec,&em);
+          { rj_val* e = r?rj_obj_get(r,pidhex):NULL;
+            ck("gpt entry {fee_delta:1000,in_mempool:true,modified_fee:11000}",
+               e && S(e,"fee_delta") && !strcmp(S(e,"fee_delta"),"1000")
+               && rj_obj_get(e,"in_mempool") && rj_obj_get(e,"in_mempool")->str[0]=='1'
+               && S(e,"modified_fee") && !strcmp(S(e,"modified_fee"),"11000")); }
+          rj_free(r);
+          /* accumulate: +500 -> 1500 */
+          snprintf(pj2,sizeof pj2,"[\"%s\", 0, 500]",pidhex);
+          pp2=rj_parse(pj2,strlen(pj2)); r=NULL;
+          rpc_node_dispatch("prioritisetransaction",pp2,&r,&ec,&em); rj_free(r); rj_free(pp2);
+          r=NULL; rpc_node_dispatch("getprioritisedtransactions",NULL,&r,&ec,&em);
+          { rj_val* e = r?rj_obj_get(r,pidhex):NULL;
+            ck("gpt deltas ACCUMULATE (1500)", e && S(e,"fee_delta") && !strcmp(S(e,"fee_delta"),"1500")); }
+          rj_free(r);
+          /* not-in-mempool txid accepted; shows in_mempool:false, no modified_fee */
+          pp2=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000002\", 0, 250]",76);
+          r=NULL; rc=rpc_node_dispatch("prioritisetransaction",pp2,&r,&ec,&em);
+          ck("pritx not-in-mempool accepted -> true", rc==1 && r && r->typ==RJ_BOOL);
+          rj_free(r); rj_free(pp2);
+          r=NULL; rpc_node_dispatch("getprioritisedtransactions",NULL,&r,&ec,&em);
+          { rj_val* e = r?rj_obj_get(r,"0000000000000000000000000000000000000000000000000000000000000002"):NULL;
+            ck("gpt absent tx: in_mempool false, no modified_fee",
+               e && rj_obj_get(e,"in_mempool") && rj_obj_get(e,"in_mempool")->str[0]=='0'
+               && rj_obj_get(e,"modified_fee")==NULL); }
+          rj_free(r);
+          /* zero-sum erasure: -1500 removes the parent's entry */
+          snprintf(pj2,sizeof pj2,"[\"%s\", 0, -1500]",pidhex);
+          pp2=rj_parse(pj2,strlen(pj2)); r=NULL;
+          rpc_node_dispatch("prioritisetransaction",pp2,&r,&ec,&em); rj_free(r); rj_free(pp2);
+          r=NULL; rpc_node_dispatch("getprioritisedtransactions",NULL,&r,&ec,&em);
+          ck("gpt zero-sum entry ERASED", r && rj_obj_get(r,pidhex)==NULL);
+          rj_free(r);
+          /* dummy != 0 -> Core-exact -8 */
+          snprintf(pj2,sizeof pj2,"[\"%s\", 1.5, 100]",pidhex);
+          pp2=rj_parse(pj2,strlen(pj2)); r=NULL; long e8p; const char* m8p;
+          rc=rpc_node_dispatch("prioritisetransaction",pp2,&r,&e8p,&m8p);
+          ck("pritx dummy!=0 -> -8 Core message", rc==0 && e8p==-8 && m8p
+             && strstr(m8p,"Priority is no longer supported"));
+          rj_free(r); rj_free(pp2);
+          /* bad txid -> shared Core-exact -8 */
+          { const char* bj="[\"deadbeef\", 0, 100]"; pp2=rj_parse(bj,strlen(bj)); } r=NULL;
+          rc=rpc_node_dispatch("prioritisetransaction",pp2,&r,&e8p,&m8p);
+          ck("pritx bad txid -> -8", rc==0 && e8p==-8 && m8p && strstr(m8p,"not 8, for 'deadbeef'"));
+          rj_free(r); rj_free(pp2);
+          /* leave the map clean for later checks */
+          pp2=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000002\", 0, -250]",77);
+          r=NULL; rpc_node_dispatch("prioritisetransaction",pp2,&r,&ec,&em); rj_free(r); rj_free(pp2); }
 
         /* error parity: -5 not in mempool; -8 bad txid with Core's message */
         { rj_val* p5=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000001\"]",68);
