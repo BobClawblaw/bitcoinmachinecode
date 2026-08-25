@@ -45,6 +45,7 @@
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
+#include "../rpc_wallet_ops.h"
 #include "../rpc_node.h"     /* node_status_t + live-node RPC dispatch */
 static rpc_wallet     g_rpc_wallet;   /* zeroed: wallet RPCs report "not configured" */
 static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap failed */
@@ -2993,6 +2994,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);
+    /* the wallet rescan reads the archive through rpc_chain's store handle */
+    { static unsigned char rescan_buf[4*1024*1024];   /* one max-size block */
+      rpc_wops_set_scanner(rpc_chain_read_block_at, rescan_buf, (long)sizeof rescan_buf,
+                           rpc_chain_tip_height); }
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){

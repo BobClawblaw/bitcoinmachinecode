@@ -2634,6 +2634,20 @@ static int ch_unsupported(const char* msg, long* ec, const char** em){
     *ec = -1; *em = msg; return 0;
 }
 
+/* Expose the archive to the wallet rescan (rpc_wallet_ops.c). The scan needs
+ * exactly two things -- read a block by height, and know the tip -- and both
+ * already exist here behind the same store handle every chain RPC uses, so
+ * this hands them over rather than opening a second handle on the same
+ * files. Returns < 81 for a height that cannot be read, which the scanner
+ * treats as fatal (a skipped height would understate every total). */
+long rpc_chain_read_block_at(long h, unsigned char* buf, long cap){
+    if (!g_open) return -1;
+    long r = store_read_at(g_st, (unsigned long)h, buf, cap);
+    if (r < 0) return -3;
+    return r;
+}
+long rpc_chain_tip_height(void){ return refresh(); }
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",

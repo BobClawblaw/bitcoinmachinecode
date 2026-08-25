@@ -23,6 +23,17 @@ int rpc_wops_dispatch(const char* method, const rj_val* params, const rpc_wallet
  * Core, whose lock set is in memory and documented as lost on stop. Exposed
  * so a funding path can refuse to spend a locked output. */
 int  rpc_wops_is_locked(const unsigned char txid[32], unsigned long vout);
+
+/* Attach the block archive so the wallet rescan can run. BORROWED: the
+ * reader, its scratch buffer and the tip function must outlive the RPC
+ * server. Without this, rescanblockchain reports that no archive is
+ * attached rather than silently scanning nothing. */
+void rpc_wops_set_scanner(long (*read_block)(long h, unsigned char* buf, long cap),
+                          unsigned char* blockbuf, long bufcap,
+                          long (*tip)(void));
+
+/* 1 if this txid was marked abandoned (gettransaction reports it). */
+int  rpc_wops_is_abandoned(const char* txid_display);
 void rpc_wops_reset_locks(void);
 
 #endif
