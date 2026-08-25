@@ -214,6 +214,36 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     return 1;
 }
 
+/* tx_accept_validate_reason: like tx_accept_validate but surfaces the reject
+ * reason (for sendrawtransaction) and returns a Core RPC error code instead of
+ * a bare 0. Returns 1 on accept, or negative: -4 not-initialized, -22 decode,
+ * -25 missing inputs, -26 policy/consensus reject, -27 already known. The
+ * reason string is copied into `reason` (best-effort; empty on accept). Shares
+ * the same g_pol/g_pol_state/g_ready state as tx_accept_validate. */
+long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
+                               unsigned long txlen, char* reason, unsigned long rcap){
+    if (reason && rcap) reason[0] = 0;
+    if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
+    void* placeholder_utxo = (void*)1;
+    if (!txval_modern(tx, (long)txlen, placeholder_utxo)){
+        const char* r = txval_modern_reason();
+        if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+        fprintf(stderr, "[tx_accept] reject (txval): %s\n", r ? r : "");
+        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+        return -26;
+    }
+    if (mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo) != 1){
+        const char* r = mpool_policy_reason(g_pol);
+        if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
+        fprintf(stderr, "[tx_accept] reject (policy): %s\n", r ? r : "");
+        if (r && strstr(r, "already")) return -27;
+        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+        return -26;
+    }
+    mempool_note_accept(txid);
+    return 1;
+}
+
 /* log_block_stored_inbound(hash32, height, bytes): called from
  * bitcoin_serve.asm's .do_block, the ONLY place a peer-pushed block
  * (unsolicited, or in response to our own .do_inv-triggered getdata) is

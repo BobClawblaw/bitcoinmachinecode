@@ -136,6 +136,7 @@ asm/tests/test_utxo_store
 asm/tests/test_txval
 asm/tests/test_multisig
 asm/tests/test_bip32_extkey
+asm/tests/test_bip32_ckdpub
 asm/tests/test_bip39
 asm/tests/test_wallet
 asm/tests/test_e2e_sighash
@@ -266,6 +267,7 @@ asm/tests/test_truncate
 asm/tests/test_truncate_guard
 asm/tests/test_truncate_guard_prim
 asm/tests/test_tx_accept_e2e
+asm/tests/test_tx_submit
 asm/tests/test_tx_verify_parallel
 asm/tests/diff_add_ct_homog
 asm/tests/test_nop1_regression
@@ -357,3 +359,5 @@ asm/daemon/utxo_setinfo
 asm/tests/test_utxo_ghost_resume
 asm/tests/hs_cap_probe
 asm/tests/hs_seq_probe
+asm/tests/test_mv_parse_bounds
+asm/tests/test_txv_cs_maxsize

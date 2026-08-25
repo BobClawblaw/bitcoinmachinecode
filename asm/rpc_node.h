@@ -34,17 +34,38 @@ typedef struct {
  * the forked download worker / inbound children can publish into it and the
  * parent's RPC thread can read it. Single-word status fields are atomic enough
  * for a snapshot; the peer table is written slot-at-a-time by the one worker. */
+/* Max raw-tx bytes a sendrawtransaction submission can stage. A standard tx is
+ * capped at 100k vbytes; 400000 covers the consensus weight bound with room. */
+#define RPC_TXSUBMIT_MAX 400000
+
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
     volatile int       n_inbound;    /* live inbound peers   (serve parent)    */
     volatile long long tip_height;   /* current chain tip    (download worker) */
     volatile long long start_time;   /* node start, unix secs (parent, once)   */
     rpc_peer_t         peers[RPC_MAX_PEERS];  /* outbound peer table (worker)   */
+
+    /* sendrawtransaction submission channel (parent RPC thread -> download
+     * worker). The parent stages one tx at a time under g_submit_lock: fill
+     * tx_submit_buf/len, then bump tx_submit_seq (published last). The worker
+     * polls tx_submit_seq at the top of its loop, runs mempool-accept + relays
+     * the tx to its peer legs, writes tx_submit_result/reason, then sets
+     * tx_submit_ack = tx_submit_seq. result: 1 accepted, 0 rejected (reason
+     * set), negative = a Core RPC error code (reason set). */
+    volatile unsigned long long tx_submit_seq;   /* parent bumps after filling  */
+    volatile unsigned long long tx_submit_ack;   /* worker bumps after handling */
+    volatile unsigned long      tx_submit_len;
+    volatile int                tx_submit_result;
+    char                        tx_submit_reason[128];
+    unsigned char               tx_submit_buf[RPC_TXSUBMIT_MAX];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
- * NULL is valid -- methods that need it then report an empty/loading node. */
+ * NULL is valid -- methods that need it then report an empty/loading node.
+ * The const setter keeps status reads read-only; the writable variant is for
+ * sendrawtransaction, which stages into the submission channel above. */
 void rpc_node_set_status(const node_status_t* st);
+void rpc_node_set_status_rw(node_status_t* st);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
