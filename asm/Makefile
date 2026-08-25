@@ -648,7 +648,7 @@ DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/block_witness.c d
     daemon/upload_cap.c daemon/blk_submit.c daemon/reorg.c daemon/undo_log.c daemon/locator_build.c \
     daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c \
     bitcoin_mempool_policy.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
-    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c daemon/tx_submit.c wallet_msgsign.c
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c daemon/tx_submit.c daemon/utxo_setinfo_rpc.c wallet_msgsign.c
 tests/test_dial_budget: $(DIALSRCS) daemon/main.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H)
 	$(CC) -no-pie -O2 -o $@ $(DIALSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c -lpthread
 
