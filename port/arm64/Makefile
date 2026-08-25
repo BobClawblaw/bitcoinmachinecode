@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -72,8 +72,12 @@ fuzz_ecdsa: fz_ecdsa.c secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp25
 	$(CC) $(CFLAGS) -o fz_ecdsa fz_ecdsa.c secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o
 fuzz_schnorr: fz_schnorr.c secp256k1_schnorr.o bitcoin_pubkey.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o sha256.o
 	$(CC) $(CFLAGS) -o fz_schnorr fz_schnorr.c secp256k1_schnorr.o bitcoin_pubkey.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o sha256.o
-fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr
-	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024
+t_sighash: t_sighash.c bitcoin_sighash.o bitcoin_hash.o sha256.o
+	$(CC) $(CFLAGS) -o t_sighash t_sighash.c bitcoin_sighash.o bitcoin_hash.o sha256.o
+fuzz_sighash:
+	python3 fuzz_sighash.py 1 3000
+fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
+	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 
 test-all: harness fuzz
 	@echo "ALL PORTED HASHING + NETWORK MODULES VERIFIED NATIVELY"

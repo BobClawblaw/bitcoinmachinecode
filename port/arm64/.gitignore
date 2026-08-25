@@ -31,3 +31,5 @@ t_consC
 t_consD
 t_consF
 t_real
+t_sighash
+fuzz_sighash

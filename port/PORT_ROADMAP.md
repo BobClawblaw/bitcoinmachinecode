@@ -82,7 +82,20 @@ and runs natively.
       reimplementation of the identical logic returns VALID too. Contains the
       real 1 MiB tx_txid rebuild buffer on the stack (subs-flags bug fixed).
       (2026-08-25)
-- [ ] script/consensus layer: bitcoin_interp / bitcoin_script / sighash /
+- [x] legacy_sighash (SIGHASH legacy signature hash, core of checksig)
+      -> port/arm64/bitcoin_sighash.S (copy_bytes/parse_varint/write_varint/
+      script_op_len/script_push_encode/script_find_and_delete/legacy_locate_nout
+      + legacy_sighash). 30k-vector differential fuzz vs independent Python Core-
+      equivalent oracle (ALL/NONE/SINGLE x ANYONECANPAY, SINGLE out-of-range
+      uint256(1) quirk, codeseparator stripping, malformed/truncated rejection):
+      0 fail across 10 seeds. Fixed in-module bugs: 0xffff/0xffffffff out-of-range
+      compare immediates; `cmp reg,[mem]` is invalid AArch64 (-> CMd load macro);
+      `legacy_locate_nout` over-popped its frame; parse_varint failure propagated
+      newptr=0 (-> sentinel -1 so downstream bounds checks fail); script_find_and_delete
+      looped .fad_copy_unit->.fad_decode so post-first OP_CODESEPARATOR units were never
+      stripped (-> .fad_mc); locate_nout now fully walks outputs+locktime so SINGLE
+      quirk only fires on fully-valid txs. (2026-08-25)
+- [ ] script/consensus layer: bitcoin_interp / bitcoin_script / sighash (+segwit_v0_sighash) /
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
       full stack VM, ~5000 lines of x86-64 across interp/sighash/checksig)
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
