@@ -1315,6 +1315,7 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
  *   - amounts follow Core's sign conventions (send amount and fee negative);
  *   - the journal stores txids in INTERNAL byte order; these RPCs emit
  *     display order like every other txid in the API. */
+static void wsl_add_lastprocessedblock(rj_val* o);   /* defined below */
 static int wsl_hexb(const char* h, unsigned char* out, int n){
     for (int i=0;i<n;i++){ int a=0,b=0; char c=h[i*2], d=h[i*2+1];
         if(c>='0'&&c<='9')a=c-'0'; else if(c>='a'&&c<='f')a=c-'a'+10; else return 0;
@@ -1368,6 +1369,11 @@ static rj_val* wsl_entry(const wsl_rec_t* r){
       if (wallet_script_to_address(addr, sizeof addr, spk, 25) > 0 && addr[0])
           rj_obj_set(e, "address", rj_str(addr)); }
     rj_obj_set(e, "category", rj_str("send"));
+    /* Core emits `vout` on every entry. The journal records a destination
+     * but not which output index it landed at, so this is 0 -- the honest
+     * value for "not recorded", and the same convention getpeerinfo uses
+     * for counters this node does not track. */
+    rj_obj_set(e, "vout", rj_numf("%d", 0));
     { char am[32]; rpc_amounts(-r->amount, am, sizeof am); rj_obj_set(e, "amount", rj_numf("%s", am)); }
     { char fe[32]; rpc_amounts(-r->fee, fe, sizeof fe); rj_obj_set(e, "fee", rj_numf("%s", fe)); }
     rj_obj_set(e, "confirmations", rj_numf("%d", 0));   /* journal tracks none */
@@ -1377,7 +1383,20 @@ static rj_val* wsl_entry(const wsl_rec_t* r){
     rj_obj_set(e, "time", rj_numf("%llu", r->ts));
     rj_obj_set(e, "timereceived", rj_numf("%llu", r->ts));
     { rj_val* wc = rj_arr(); rj_obj_set(e, "walletconflicts", wc); }
+    { rj_val* mc = rj_arr(); rj_obj_set(e, "mempoolconflicts", mc); }
     rj_obj_set(e, "abandoned", rj_bool(0));
+    /* NOT emitted, because the journal does not record them and inventing
+     * them would be worse than their absence (oracle-diffed 2026-08-25
+     * against a wallet-enabled Core):
+     *   blockhash/blockheight/blockindex/blocktime -- the journal stores no
+     *     confirmation data at all, which is the same reason confirmations
+     *     is 0 above;
+     *   wtxid -- the journal stores the txid only, and for a segwit send
+     *     the wtxid is NOT derivable from it;
+     *   label / parent_descs -- this store has no labels and no descriptor
+     *     provenance.
+     * Each becomes emittable if the journal format grows the field; that is
+     * a store-format change, deliberately not smuggled in here. */
     return e;
 }
 /* listtransactions ("label" count skip): newest LAST like Core; count default
@@ -1420,36 +1439,114 @@ static int cmd_gettransaction(const rj_val* params, long* ec, const char** em, r
         rj_obj_set(o, "confirmations", rj_numf("%d", 0));
         rj_obj_set(o, "txid", rj_str(params->items[0]->str));
         { rj_val* wc = rj_arr(); rj_obj_set(o, "walletconflicts", wc); }
+        { rj_val* mc = rj_arr(); rj_obj_set(o, "mempoolconflicts", mc); }
         rj_obj_set(o, "time", rj_numf("%llu", recs[i].ts));
         rj_obj_set(o, "timereceived", rj_numf("%llu", recs[i].ts));
-        { rj_val* det = rj_arr(); rj_arr_push(det, wsl_entry(&recs[i]));
+        /* ORACLE-DIFFED 2026-08-25: Core's gettransaction.details[] entries
+         * are a REDUCED shape -- {address, category, amount, vout, label,
+         * parent_descs, abandoned} -- NOT a copy of a listtransactions
+         * entry. We had been pushing the full entry, which meant details[0]
+         * carried six fields Core never puts there (txid, time,
+         * timereceived, confirmations, walletconflicts, fee): those belong
+         * to the top-level object, and repeating them there is a shape
+         * Core consumers do not expect. */
+        { rj_val* det = rj_arr();
+          rj_val* d = rj_obj();
+          { unsigned char spk[25];
+            spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, recs[i].dest, 20);
+            spk[23]=0x88; spk[24]=0xac;
+            char addr[128]; addr[0]=0;
+            if (wallet_script_to_address(addr, sizeof addr, spk, 25) > 0 && addr[0])
+                rj_obj_set(d, "address", rj_str(addr)); }
+          rj_obj_set(d, "category", rj_str("send"));
+          { char am[32]; rpc_amounts(-(long long)recs[i].amount, am, sizeof am);
+            rj_obj_set(d, "amount", rj_numf("%s", am)); }
+          rj_obj_set(d, "vout", rj_numf("%d", 0));
+          { char fe[32]; rpc_amounts(-(long long)recs[i].fee, fe, sizeof fe);
+            rj_obj_set(d, "fee", rj_numf("%s", fe)); }   /* Core: sends only */
+          rj_obj_set(d, "abandoned", rj_bool(0));
+          rj_arr_push(det, d);
           rj_obj_set(o, "details", det); }
+        wsl_add_lastprocessedblock(o);
         *result = o;
         return 1;
     }
     *ec = -5; *em = "Invalid or non-wallet transaction id";
     return 0;
 }
+/* Core stamps every wallet answer with the chain state it was computed
+ * against (`lastprocessedblock`: hash + height), so a caller can tell a
+ * stale reply from a current one. We can supply it honestly -- the chain
+ * module owns the tip -- by asking the SAME dispatch a client would, which
+ * keeps this a one-way dependency (wallet -> chain) with no new coupling.
+ * Omitted entirely if the chain is not open, rather than reported as zero. */
+static void wsl_add_lastprocessedblock(rj_val* o){
+    rj_val* h = NULL; long ec; const char* em;
+    if (rpc_chain_dispatch("getbestblockhash", NULL, &h, &ec, &em) != 1 || !h) return;
+    rj_val* c = NULL;
+    if (rpc_chain_dispatch("getblockcount", NULL, &c, &ec, &em) != 1 || !c){ rj_free(h); return; }
+    rj_val* lpb = rj_obj();
+    rj_obj_set(lpb, "hash", rj_str(h->str));
+    rj_obj_set(lpb, "height", rj_numf("%s", c->str));
+    rj_obj_set(o, "lastprocessedblock", lpb);
+    rj_free(h); rj_free(c);
+}
+
+/* getwalletinfo -- ORACLE-DIFFED 2026-08-25 against a wallet-enabled Core.
+ * The scratch oracle ran with disablewallet=1 until then, which is why this
+ * shipped round-trip-verified only; enabling it (one config line -- the
+ * binary always had wallet support) turned the hedge into a real diff, and
+ * the diff found two things:
+ *   1. Core's modern getwalletinfo carries NO balance fields at all --
+ *      balance / unconfirmed_balance / immature_balance / paytxfee were
+ *      removed when getbalances took over. We were emitting four fields
+ *      Core does not have.
+ *   2. Core emits blank / birthtime / flags / lastprocessedblock (plus
+ *      keypoolsize_hd_internal for wallets using internal keys); we emitted
+ *      none of them.
+ * Names and shape now follow Core. Values stay ours and honest:
+ * walletversion 1 and format "bmc" deliberately say this is our own store,
+ * not a Core wallet, and descriptors=false because there is no descriptor
+ * wallet here. birthtime/lastprocessedblock are omitted rather than faked --
+ * this store records neither. */
 static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     static wsl_rec_t recs[WSL_MAX];
     int n = wsl_read(recs, WSL_MAX);
-    unsigned long long bal = 0;
-    if (w) for (unsigned long i = 0; i < w->utxo_n; i++) bal += w->utxo_val[i];
     rj_val* o = rj_obj();
     rj_obj_set(o, "walletname", rj_str("bmcwallet"));
     rj_obj_set(o, "walletversion", rj_numf("%d", 1));
-    rj_obj_set(o, "format", rj_str("bmc"));           /* own format, stated */
-    { char am[32]; rpc_amounts((long long)bal, am, sizeof am); rj_obj_set(o, "balance", rj_numf("%s", am)); }
-    rj_obj_set(o, "unconfirmed_balance", rj_numf("%.8f", 0.0));
-    rj_obj_set(o, "immature_balance", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "format", rj_str("bmc"));
     rj_obj_set(o, "txcount", rj_numf("%d", n));
     rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
-    rj_obj_set(o, "paytxfee", rj_numf("%.8f", 0.0));
     rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
     rj_obj_set(o, "avoid_reuse", rj_bool(0));
     rj_obj_set(o, "scanning", rj_bool(0));
     rj_obj_set(o, "descriptors", rj_bool(0));
     rj_obj_set(o, "external_signer", rj_bool(0));
+    rj_obj_set(o, "blank", rj_bool(w && w->seed ? 0 : 1));
+    { rj_val* fl = rj_arr(); rj_obj_set(o, "flags", fl); }
+    wsl_add_lastprocessedblock(o);
+    *result = o;
+    return 1;
+}
+
+/* getbalances -- where Core keeps balances now (the fields removed from
+ * getwalletinfo above). mine.{trusted,untrusted_pending,immature,
+ * nonmempool}: the injected UTXO set is by definition confirmed and
+ * spendable, so it lands in `trusted`; the rest are zero because this node
+ * tracks no wallet mempool -- stated, not guessed. */
+static int cmd_getbalances(const rpc_wallet* w, rj_val** result){
+    unsigned long long bal = 0;
+    if (w) for (unsigned long i = 0; i < w->utxo_n; i++) bal += w->utxo_val[i];
+    rj_val* o = rj_obj();
+    rj_val* mine = rj_obj();
+    { char am[32]; rpc_amounts((long long)bal, am, sizeof am);
+      rj_obj_set(mine, "trusted", rj_numf("%s", am)); }
+    rj_obj_set(mine, "untrusted_pending", rj_numf("%.8f", 0.0));
+    rj_obj_set(mine, "immature", rj_numf("%.8f", 0.0));
+    rj_obj_set(mine, "nonmempool", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "mine", mine);
+    wsl_add_lastprocessedblock(o);
     *result = o;
     return 1;
 }
@@ -1459,7 +1556,7 @@ int rpc_known_method(const char* method) {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
         "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
-        "listtransactions","gettransaction","getwalletinfo",
+        "listtransactions","gettransaction","getwalletinfo","getbalances",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
@@ -1512,6 +1609,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_gettransaction(params, err_code, err_msg, result);
     if (!strcmp(method, "getwalletinfo"))
         return cmd_getwalletinfo(w, result);
+    if (!strcmp(method, "getbalances"))
+        return cmd_getbalances(w, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the

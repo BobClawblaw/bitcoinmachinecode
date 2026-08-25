@@ -7,6 +7,59 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- wallet RPCs ORACLE-DIFFED: the hedge was hiding real shape bugs
+
+The wallet-state RPCs shipped earlier today with an honest hedge in their own
+header comment: "there is no oracle wallet to diff against, so these are
+verified by round-trip". That turned out to be a CONFIGURATION fact, not a
+capability one -- the scratch oracle's Core binary always had wallet support
+(ENABLE_WALLET=ON, sqlite found, 95 wallet symbols); a single line,
+disablewallet=1, was hiding it. Removing that line and restarting the SCRATCH
+oracle (never the production node) cost nothing and converted the hedge into
+a real differential. It immediately found bugs round-trip testing is
+structurally incapable of finding:
+
+getwalletinfo
+  * We emitted FOUR fields Core does not have: balance,
+    unconfirmed_balance, immature_balance, paytxfee. Core's modern
+    getwalletinfo carries NO balance fields at all -- they moved to
+    getbalances. We had been reproducing an older mental model of the API.
+  * We omitted blank and flags, which Core does emit.
+  * Added getbalances (mine.{trusted,untrusted_pending,immature,nonmempool}
+    -- key set matches Core exactly) and lastprocessedblock on both, sourced
+    through the existing chain dispatch and OMITTED rather than faked when
+    the chain is not open.
+  * Result: fields-we-emit-that-Core-does-not went 4 -> 0.
+
+listtransactions / gettransaction (diffed against a Core wallet holding a
+REAL mainnet transaction -- watch-only importdescriptors of a
+recently-active address, which populates genuine wallet history from the
+chain)
+  * gettransaction.details[] was a COPY of a listtransactions entry. Core's
+    details[] is a REDUCED shape {address,category,amount,vout,fee,
+    abandoned}; we were putting six top-level fields (txid, time,
+    timereceived, confirmations, walletconflicts) inside details[0], where
+    Core never puts them. 6 wrong fields -> 0.
+  * Added vout and mempoolconflicts to every entry.
+
+A FALSE ALARM WORTH RECORDING: the diff flagged `fee` as "we emit, Core does
+not" -- but Core's sampled transaction was a RECEIVE, and Core's own help
+says fee is "negative and only available for the send category". Every
+journal record is a send, so emitting it is correct. Deleting it on the
+strength of one sample would have been a regression caused by a sampling
+artifact; the fix was to read the spec, not the sample.
+
+STILL ABSENT, each documented in code with its reason rather than faked:
+blockhash/blockheight/blockindex/blocktime (the journal records no
+confirmation data -- the same root as confirmations:0), wtxid (not derivable
+from a stored txid for a segwit send), label/parent_descs (no labels or
+descriptor provenance in this store). Each becomes emittable only if the
+journal format grows the field, which is a store-format change and was
+deliberately not smuggled into a parity fix.
+
+Also enabled blockfilterindex=1 on the oracle, so BIP157/158 has a
+differential target if getblockfilter is ever implemented.
+
 ## 2026-08-25 -- REAL-DATA reorg drill: disconnect/reconnect proven at chain height
 
 The gap: reorg was the last major consensus path whose only evidence was
