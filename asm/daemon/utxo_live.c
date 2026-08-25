@@ -711,7 +711,19 @@ static int bip30_enforced(long height, const u8 hash32[32])
     return anc == 1 ? 0 : 1;
 }
 
+/* Last reject reason from apply_block_inner, for submitblock's BIP22 result.
+ * Reset on entry; only meaningful right after a 0 return. */
+static const char* g_last_reject = "";
+const char* utxo_live_last_reject(void){ return g_last_reject; }
+/* Dry-run mode: run every verification phase (0 through 4) and STOP at the
+ * Phase 5 boundary -- the first mutation -- returning 1. The whole point is
+ * that this is the SAME code path a real apply takes, so a dry-run pass
+ * guarantees the subsequent real apply of the same block against the same
+ * state succeeds (single-threaded worker; nothing moves in between). */
+static int g_dry_run = 0;
+
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
+    g_last_reject = "";
     if (blocklen < 81) return 0;
     const u8* p = blockbuf + 80;
     const u8* blkend = blockbuf + blocklen;
@@ -790,6 +802,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                                                  txid_scratch, sizeof txid_scratch, &wreason);
         if (wr != 1) {
             fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
+            g_last_reject = "bad-witness-merkle-match";
             return 0;
         }
     }
@@ -817,6 +830,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                             "(tried to overwrite transaction: output %u already unspent)\n",
                             g_apply_height, (unsigned long)t, (unsigned)o);
                     g_bip30_rejected = 1;
+                    g_last_reject = "bad-txns-BIP30";
                     return 0;
                 }
             }
@@ -849,6 +863,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     }
     if (dup) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld: in-block double-spend (duplicate outpoint)\n", g_apply_height);
+        g_last_reject = "bad-txns-inputs-duplicate";
         return 0;
     }
 
@@ -859,8 +874,13 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (!tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
                                      &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason)) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n", g_apply_height, (unsigned long)fail_tx, reason);
+        g_last_reject = reason;    /* tx_verify's own string, verbatim */
         return 0;
     }
+
+    /* Dry-run stops HERE: every verification phase has passed and the next
+     * line of the real path is the first put/del. */
+    if (g_dry_run) return 1;
 
     /* ---- Phase 5: sequential apply, exactly as before, reusing the
      * already-parsed tx array instead of re-parsing. A failure HERE is the
@@ -893,6 +913,20 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
  * checkpoint never landed). Defined below with the STAGE B disconnect
  * helpers it reuses. 1 rolled back / 0 failed. */
 static int rollback_unapplied_block(const u8* blockbuf, u64 blocklen, long h);
+
+/* Public dry-run for submitblock: verification phases only, no mutation, no
+ * undo/ghost interaction. Caller must hold the same preconditions the apply
+ * loop does (utxo_live_ok, single-threaded worker). 1 clean / 0 with
+ * utxo_live_last_reject() set. */
+long utxo_live_dryrun_block(const u8* blockbuf, u64 blocklen, long height){
+    long saved = g_apply_height;
+    g_apply_height = height;
+    g_dry_run = 1;
+    int r = apply_block_inner(blockbuf, blocklen);
+    g_dry_run = 0;
+    g_apply_height = saved;
+    return r;
+}
 
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
