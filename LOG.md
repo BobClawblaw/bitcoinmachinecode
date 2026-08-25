@@ -7,6 +7,59 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- differential SCRIPT-EXECUTION corpus: 1128 mutations, zero divergences
+
+ASSESSMENT.md sect.5 item 2 ("the differential corpus method applied to every
+consensus path") was the standing bar. Its gap, precisely: every existing
+block-level differential (corpus_diff, fullchain_diff, consensus_diff) drives
+cons_verify -- merkle root, PoW, sizes, sigops, duplicate txids -- and NEVER
+EXECUTES A SCRIPT. Every false-ACCEPT this project has found lived in the
+interpreter (the SETcc byte-width bug diverged on 5,050 scripts in the accept
+direction), invisible to replay because Core-running miners never mine a block
+that exercises it.
+
+validation/spend_corpus_diff.py closes it: real mainnet spends (scriptSig or
+witness, every prevout amount + spk, the spending tx, input index, and the
+height's true consensus flags) executed through the REAL verifiers on both
+sides, then mutated to force disagreement -- signature bit flips, DER length
+and leading-zero surgery, hashtype edits, push-opcode substitution,
+non-minimal encodings, truncation, leftover-stack junk, witness-region flips.
+Epoch-stratified across pre-BIP16, P2SH, dersig/CSV, segwit v0 and taproot.
+Two new shim verbs (asm/tests/verify_p2sh_shim.c): TAPVERIFY for v1 and
+WITVERIFY for v0 (native and P2SH-wrapped), so the witness eras are
+differentially checkable at all.
+
+RESULT: 188 spends, 1,128 mutations, 1,128 agreements, ZERO divergences,
+ZERO false-accepts.
+
+EIGHT HARNESS BUGS, ZERO NODE BUGS -- and the harness bugs are the lesson.
+Each ENTRY POINT wants a specific transaction serialization, and getting it
+wrong manufactures utterly convincing false divergences in BOTH directions:
+  * legacy  -> WITNESS-STRIPPED tx (Core's legacy SignatureHash omits witness
+    data). A legacy input INSIDE a segwit transaction -- one real tx here had
+    7 witness inputs out of 234 -- otherwise hashes the wrong bytes and
+    returns EVAL_FALSE on a spend the chain contains. This one presented as a
+    node defect for an hour.
+  * v0      -> RAW tx (BIP143 self-serializes).
+  * taproot -> WITNESS-STRIPPED tx (BIP341's SigMsg commits without witnesses).
+Plus: the shim was driving bitcoin_verify.c's SUPERSEDED standalone
+verify_script rather than the production bitcoin_scriptverify.c
+sv_verify_script -- a differential that drives code the node does not run
+measures a program nobody executes. And scriptSig-only mutations reached only
+the ASM side while Core saw an unmutated tx (nine phantom divergences, all
+P2SH-wrapped v0), and a P2A anchor (51024e73: witness v1 with a 2-byte
+program) was mis-routed to the legacy path.
+
+Method note for the next person: every apparent divergence in this session
+turned out to be input asymmetry between the two engines. The discipline that
+resolved each one was the same -- reproduce OUTSIDE the harness, establish
+ground truth independently (here: compute the BIP342 sighash in Python and ask
+Core's SCHNORR verb which message the signature validates against), then
+bisect. The taproot chase ran: commitment math correct -> envelope executes
+correctly in isolation -> our sighash is uninitialized stack garbage ->
+instrument all 37 early returns -> tx_parse fails -> production strips the
+witness first.
+
 ## 2026-08-25 -- incident #46 FIXED: append linkage gate closes the keep-up race
 
 The root fix for the duplicate-append (964031's bytes landing at 964032):
