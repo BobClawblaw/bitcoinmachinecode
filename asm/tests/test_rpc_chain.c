@@ -432,6 +432,21 @@ int main(void){
       expect_err("da pk has no address", "deriveaddresses",
                  "[\"pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7\"]",
                  -5, "Descriptor does not have a corresponding address");
+
+      /* addr()/raw() descriptors (audit gap, incident-#44 pattern) -- verified
+       * vs oracle: getdescriptorinfo issolvable=false, deriveaddresses returns
+       * the address itself. */
+      r = call("getdescriptorinfo", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]", &ec, &em);
+      ck_str("gdi addr() checksum", S(r,"checksum"), "gxt8zcpx");
+      ck_str("gdi addr() issolvable=false", S(r,"issolvable"), "0");
+      ck_str("gdi addr() isrange=false", S(r,"isrange"), "0");
+      rj_free(r);
+      r = call("deriveaddresses", "[\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)#gxt8zcpx\"]", &ec, &em);
+      ck_str("da addr() returns the address", r&&r->typ==RJ_ARR&&r->nitems?r->items[0]->str:NULL, "1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9");
+      rj_free(r);
+      r = call("getdescriptorinfo", "[\"raw(76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac)\"]", &ec, &em);
+      ck("gdi raw() issolvable=false", S(r,"issolvable") && !strcmp(S(r,"issolvable"),"0"));
+      rj_free(r);
     }
 
     /* ---- getblockchaininfo ---- */
