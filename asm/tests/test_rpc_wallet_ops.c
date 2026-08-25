@@ -31,6 +31,92 @@ extern void hash160(unsigned char out[20], const void* in, long long len);
 extern void base58check_encode(char* out, const unsigned char* payload, long long paylen);
 extern int  msg_verify_core(const char* address, const char* message, const char* sig_b64);
 
+/* ---- a tiny in-memory archive, so the rescan can actually be run --------
+ * Three blocks: h1 pays 50 BTC to the wallet's receive key 0, h2 spends it
+ * and pays 10 BTC back to change key 0. Served through the same read_block
+ * hook the daemon fills with rpc_chain's store handle. */
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
+extern void hash160(unsigned char out[20], const void* in, long long len);
+extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
+extern int  bip32_derive_path(unsigned char[32], unsigned char[32],
+                              const unsigned char*, long, const unsigned*, long);
+extern long wallet_p2wpkh_address(char*, long, const unsigned char[20]);
+
+#define FX_NB 3
+static unsigned char g_fx[FX_NB][2048];
+static long g_fxlen[FX_NB];
+static long g_fxtip = -1;
+static unsigned char g_r0_h160[20], g_c0_h160[20];
+static unsigned char g_tx1id[32];
+
+static long fx_read_block(long h, unsigned char* buf, long cap){
+    if (h < 0 || h >= FX_NB || g_fxlen[h] <= 0) return -3;
+    if (g_fxlen[h] > cap) return -1;
+    memcpy(buf, g_fx[h], (size_t)g_fxlen[h]);
+    return g_fxlen[h];
+}
+static long fx_tip(void){ return g_fxtip; }
+
+static long fx_u32(unsigned char* o, unsigned int v){
+    for (int i = 0; i < 4; i++) o[i] = (unsigned char)(v >> (8*i)); return 4; }
+static long fx_u64(unsigned char* o, unsigned long long v){
+    for (int i = 0; i < 8; i++) o[i] = (unsigned char)(v >> (8*i)); return 8; }
+
+static void fx_derive(const unsigned char* seed, unsigned idx, int br, unsigned char h[20]){
+    unsigned path[5] = {0x80000000u|84u, 0x80000000u, 0x80000000u, idx, (unsigned)br};
+    unsigned char k[32], c[32], pub[33];
+    if (bip32_derive_path(k, c, seed, 64, path, 5) != 1){ memset(h, 0, 20); return; }
+    scalar_to_pubkey(pub, k);
+    hash160(h, pub, 33);
+}
+
+static long fx_tx(unsigned char* o, const unsigned char* spend36,
+                  const unsigned long long* vals, const unsigned char* const* spks,
+                  const unsigned long* spklens, int nout){
+    long p = 0;
+    p += fx_u32(o + p, 2);
+    o[p++] = 1;
+    if (spend36){ memcpy(o + p, spend36, 36); p += 36; }
+    else { memset(o + p, 0, 32); p += 32; p += fx_u32(o + p, 0xffffffffu); }
+    o[p++] = 0;
+    p += fx_u32(o + p, 0xfffffffdu);
+    o[p++] = (unsigned char)nout;
+    for (int i = 0; i < nout; i++){
+        p += fx_u64(o + p, vals[i]);
+        o[p++] = (unsigned char)spklens[i];
+        memcpy(o + p, spks[i], spklens[i]); p += (long)spklens[i];
+    }
+    p += fx_u32(o + p, 0);
+    return p;
+}
+
+static void fx_build(const unsigned char* seed){
+    fx_derive(seed, 0, 0, g_r0_h160);
+    fx_derive(seed, 0, 1, g_c0_h160);
+    unsigned char w_r0[22] = {0x00,0x14}; memcpy(w_r0+2, g_r0_h160, 20);
+    unsigned char w_c0[22] = {0x00,0x14}; memcpy(w_c0+2, g_c0_h160, 20);
+    static unsigned char stranger[22] = {0x00,0x14};
+    for (int i = 0; i < 20; i++) stranger[2+i] = (unsigned char)(0xC0 + i);
+    { unsigned long long v[1] = {5000000000ULL};
+      const unsigned char* sp[1] = {stranger}; unsigned long sl[1] = {22};
+      unsigned char tx[512]; long l = fx_tx(tx, NULL, v, sp, sl, 1);
+      memset(g_fx[0], 0, 80); long p = 80; g_fx[0][p++] = 1;
+      memcpy(g_fx[0]+p, tx, (size_t)l); g_fxlen[0] = p + l; }
+    { unsigned long long v[1] = {5000000000ULL};
+      const unsigned char* sp[1] = {w_r0}; unsigned long sl[1] = {22};
+      unsigned char tx[512]; long l = fx_tx(tx, NULL, v, sp, sl, 1);
+      sha256d(g_tx1id, tx, (unsigned long)l);
+      memset(g_fx[1], 0, 80); long p = 80; g_fx[1][p++] = 1;
+      memcpy(g_fx[1]+p, tx, (size_t)l); g_fxlen[1] = p + l; }
+    { unsigned char op[36]; memcpy(op, g_tx1id, 32); fx_u32(op+32, 0);
+      unsigned long long v[2] = {1000000000ULL, 3999000000ULL};
+      const unsigned char* sp[2] = {w_c0, stranger}; unsigned long sl[2] = {22, 22};
+      unsigned char tx[512]; long l = fx_tx(tx, op, v, sp, sl, 2);
+      memset(g_fx[2], 0, 80); long p = 80; g_fx[2][p++] = 1;
+      memcpy(g_fx[2]+p, tx, (size_t)l); g_fxlen[2] = p + l; }
+    g_fxtip = 2;
+}
+
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get((rj_val*)o,k) : 0; return v ? v->str : 0; }
@@ -358,9 +444,7 @@ int main(void){
         "encryptwallet","createwallet","loadwallet","unloadwallet","restorewallet",
         "migratewallet","setwalletflag","importdescriptors","createwalletdescriptor",
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
-        "walletdisplayaddress","rescanblockchain","getreceivedbyaddress",
-        "getreceivedbylabel","listreceivedbyaddress","listreceivedbylabel",
-        "listaddressgroupings","listsinceblock","abandontransaction",
+        "walletdisplayaddress",
         "sendtoaddress","sendmany","send","sendall",
         "walletcreatefundedpsbt","walletprocesspsbt","bumpfee","psbtbumpfee" };
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
@@ -375,10 +459,37 @@ int main(void){
       ck("every unsupported wallet method errors with a substantive reason", allbad);
       /* the ones that cannot answer must say WHY, so a reader knows the gap
        * is a missing rescan and not a missing formatter */
-      D("getreceivedbyaddress", NULL);
-      ck("the receive-side methods name the missing rescan",
-         rc == 0 && em && strstr(em, "rescan"));
+      /* The receive-side family is implemented now, but this harness has no
+       * archive attached and no scan has run -- so each must say WHICH of
+       * those it is, and neither may answer 0.00000000. */
+      D("rescanblockchain", NULL);
+      ck("rescanblockchain with no archive attached says so",
+         rc == 0 && ec == -4 && em && strstr(em, "no block archive"));
       rj_free(r);
+      { rj_val* pa = P("[\"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\"]");
+        D("getreceivedbyaddress", pa);
+        ck("getreceivedbyaddress before any scan refuses rather than answering 0",
+           rc == 0 && ec == -4 && em && strstr(em, "no wallet rescan has completed"));
+        ck("...and says why a zero would be wrong",
+           rc == 0 && em && strstr(em, "genuinely received nothing"));
+        rj_free(r); rj_free(pa); }
+      { struct { const char* m; const char* p; } RS[] = {
+          {"getreceivedbylabel", "[\"hot\"]"},
+          {"listreceivedbyaddress", "[]"},
+          {"listreceivedbylabel", "[]"},
+          {"listaddressgroupings", "[]"},
+          {"listsinceblock", "[]"} };
+        int allrs = 1;
+        for (int i = 0; i < 5; i++){
+            rj_val* pp = P(RS[i].p);
+            D(RS[i].m, pp);
+            if (!(rc == 0 && ec == -4 && em && strstr(em, "rescan"))){
+                printf("      (%s: rc=%d ec=%ld em=%s)\n", RS[i].m, rc, ec, em?em:"");
+                allrs = 0;
+            }
+            rj_free(r); rj_free(pp);
+        }
+        ck("every receive-side method refuses on a scan-less wallet", allrs); }
       /* the spend refusal must name the ACTUAL blocker -- a P2PKH-only send
        * path under a P2WPKH wallet -- and point at what does work, or a
        * reader will assume it is merely unimplemented plumbing */
@@ -388,6 +499,120 @@ int main(void){
       ck("...and points at signrawtransactionwithwallet as what does work",
          rc == 0 && em && strstr(em, "signrawtransactionwithwallet"));
       rj_free(r); }
+
+    /* ==== the wallet rescan, end to end =============================== */
+    { static unsigned char rbuf[1 << 20];
+      fx_build(SEED);
+      rpc_wops_set_scanner(fx_read_block, rbuf, (long)sizeof rbuf, fx_tip);
+
+      char r0addr[96], c0addr[96];
+      wallet_p2wpkh_address(r0addr, sizeof r0addr, g_r0_h160);
+      wallet_p2wpkh_address(c0addr, sizeof c0addr, g_c0_h160);
+
+      D("rescanblockchain", NULL);
+      ck("rescanblockchain runs over the attached archive", rc == 1 && r);
+      ck("...reporting the range it covered",
+         r && S(r,"start_height") && !strcmp(S(r,"start_height"), "0") &&
+         S(r,"stop_height") && !strcmp(S(r,"stop_height"), "2"));
+      rj_free(r);
+
+      { char js[200]; snprintf(js, sizeof js, "[\"%s\"]", r0addr);
+        rj_val* p = P(js);
+        D("getreceivedbyaddress", p);
+        ck("getreceivedbyaddress now reports the REAL 50 BTC received",
+           rc == 1 && r && r->str && !strcmp(r->str, "50.00000000"));
+        rj_free(r); rj_free(p); }
+
+      { /* the coin was spent again, but `received` counts ARRIVALS -- it must
+         * not net out the spend, or a wallet's received total would shrink as
+         * it paid people */
+        char js[200]; snprintf(js, sizeof js, "[\"%s\"]", c0addr);
+        rj_val* p = P(js);
+        D("getreceivedbyaddress", p);
+        ck("change received counts separately, and the spend is not netted out",
+           rc == 1 && r && r->str && !strcmp(r->str, "10.00000000"));
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]");
+        D("getreceivedbyaddress", p);
+        ck("an address we do not own -> -4, never 0.00000000",
+           rc == 0 && ec == -4 && em && strstr(em, "not found in wallet"));
+        rj_free(r); rj_free(p); }
+
+      { /* tip is 2, so the h1 receive has exactly 2 confirmations */
+        char js[200]; snprintf(js, sizeof js, "[\"%s\",2]", r0addr);
+        rj_val* p = P(js);
+        D("getreceivedbyaddress", p);
+        ck("minconf 2 still counts a 2-confirmation receive",
+           rc == 1 && r && !strcmp(r->str, "50.00000000"));
+        rj_free(r); rj_free(p);
+        snprintf(js, sizeof js, "[\"%s\",3]", r0addr);
+        p = P(js);
+        D("getreceivedbyaddress", p);
+        ck("minconf 3 excludes it", rc == 1 && r && !strcmp(r->str, "0.00000000"));
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[]");
+        D("listreceivedbyaddress", p);
+        ck("listreceivedbyaddress lists the two addresses that received",
+           rc == 1 && r && r->typ == RJ_ARR && r->nitems == 2);
+        { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+          ck("...each with Core's address/amount/confirmations/label/txids",
+             e0 && S(e0,"address") && S(e0,"amount") && S(e0,"confirmations") &&
+             rj_obj_get(e0,"label") && rj_obj_get(e0,"txids") &&
+             rj_obj_get(e0,"txids")->nitems == 1); }
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[]");
+        D("listaddressgroupings", p);
+        ck("listaddressgroupings -> ONE group (a single-seed wallet has one owner)",
+           rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1 &&
+           r->items[0]->typ == RJ_ARR && r->items[0]->nitems == 2);
+        rj_free(r); rj_free(p); }
+
+      { rj_val* p = P("[]");
+        D("listsinceblock", p);
+        ck("listsinceblock returns every event", rc == 1 && r &&
+           rj_obj_get(r,"transactions") && rj_obj_get(r,"transactions")->nitems == 3);
+        { rj_val* txs = r ? rj_obj_get(r,"transactions") : 0;
+          rj_val* t0 = (txs && txs->nitems) ? txs->items[0] : 0;
+          rj_val* t1 = (txs && txs->nitems > 1) ? txs->items[1] : 0;
+          ck("the first is the receive",
+             t0 && S(t0,"category") && !strcmp(S(t0,"category"), "receive") &&
+             !strcmp(S(t0,"amount"), "50.00000000"));
+          ck("the second is the SEND, rendered negative as Core does",
+             t1 && S(t1,"category") && !strcmp(S(t1,"category"), "send") &&
+             !strcmp(S(t1,"amount"), "-50.00000000"));
+          ck("confirmations come from the scanned height",
+             t0 && S(t0,"confirmations") && !strcmp(S(t0,"confirmations"), "2"));
+          ck("no blockhash is invented", t0 && rj_obj_get(t0,"blockhash") == NULL); }
+        rj_free(r); rj_free(p); }
+
+      { static const char* H = "0123456789abcdef";
+        char id[65];
+        for (int k = 0; k < 32; k++){ unsigned char b = g_tx1id[31-k];
+            id[k*2] = H[b>>4]; id[k*2+1] = H[b&15]; }
+        id[64] = 0;
+        char hx[80]; snprintf(hx, sizeof hx, "[\"%s\"]", id);
+        rj_val* p = P(hx);
+        D("abandontransaction", p);
+        ck("abandoning a CONFIRMED transaction -> Core's -5",
+           rc == 0 && ec == -5 && em &&
+           !strcmp(em, "Transaction not eligible for abandonment"));
+        rj_free(r); rj_free(p); }
+      { const char* UNSEEN = "0000000000000000000000000000000000000000000000000000000000000009";
+        char hx[80]; snprintf(hx, sizeof hx, "[\"%s\"]", UNSEEN);
+        rj_val* p = P(hx);
+        D("abandontransaction", p);
+        ck("abandoning an unseen transaction succeeds", rc == 1 && r && r->typ == RJ_NULL);
+        rj_free(r); rj_free(p);
+        ck("...and is recorded", rpc_wops_is_abandoned(UNSEEN) == 1);
+        p = P(hx);
+        D("abandontransaction", p);
+        ck("...and is idempotent", rc == 1);
+        rj_free(r); rj_free(p); }
+
+      rpc_wops_set_scanner(NULL, NULL, 0, NULL); }
 
     /* ---- the advertised table and the dispatch ladder must AGREE.
      * A method listed in WOP_METHODS but missing from the ladder would

@@ -26,10 +26,12 @@
 
 #include "rpc_wallet_ops.h"
 #include "rpc_chain.h"
+#include "wallet_scan.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* ---- wallet_core / wallet_labels / descriptor externs -------------------- */
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version,
@@ -517,6 +519,528 @@ static int cmd_backupwallet(const rj_val* params, long* ec, const char** em, rj_
     return 1;
 }
 
+/* ==== the wallet rescan ==================================================
+ * asm/wallet_scan.c walks the archive and records every output paying this
+ * wallet and every input spending one. Everything below reads that record
+ * file; nothing here re-derives money from anywhere else, so a figure this
+ * module reports is a figure the scan actually saw.
+ *
+ * The archive reader and the tip are INJECTED rather than linked, for the
+ * same reason the mempool hooks and the address book are: rpc_wallet_ops.c
+ * has no business pulling the block store into every target that links it.
+ */
+static long (*g_wops_read_block)(long h, unsigned char* buf, long cap);
+static unsigned char* g_wops_blockbuf;
+static long g_wops_bufcap;
+static long (*g_wops_tip)(void);
+
+void rpc_wops_set_scanner(long (*read_block)(long, unsigned char*, long),
+                          unsigned char* blockbuf, long bufcap,
+                          long (*tip)(void)){
+    g_wops_read_block = read_block; g_wops_blockbuf = blockbuf;
+    g_wops_bufcap = bufcap; g_wops_tip = tip;
+}
+
+#define WOP_SCAN_REL   "walletscan.dat"
+/* The derivation window the scan covers. getnewaddress hands out index 0
+ * today, and the CLI can be asked for an explicit index; 1000 across both
+ * branches is generous. It is a REAL bound, not a formality: an output paid
+ * to a key beyond it is not found, which is why the number is stated here
+ * and in the docs rather than buried. */
+#define WOP_SCAN_KEYS  1000
+
+extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
+                              const unsigned char* seed, long seedlen,
+                              const unsigned* indexes, long n);
+
+/* Build the sorted key window. Returns the count, or 0 with no wallet.
+ *
+ * CACHED, because it is 2000 BIP32 derivations and 2000 point multiplies:
+ * without the cache every getreceivedbyaddress would repeat all of it, and
+ * listreceivedbyaddress would do so once per candidate. The cache is keyed
+ * on the seed bytes, so a different wallet rebuilds rather than silently
+ * answering from the previous one's keys. */
+static unsigned char g_ks_seed[64];
+static int g_ks_valid;
+static wscan_key* g_ks;
+static int g_ks_n;
+
+static int wop_keyset_cached(const rpc_wallet* w, const wscan_key** out){
+    if (!w || !w->seed){ *out = NULL; return 0; }
+    if (g_ks_valid && !memcmp(g_ks_seed, w->seed, 64)){ *out = g_ks; return g_ks_n; }
+    if (!g_ks) g_ks = malloc((size_t)(WOP_SCAN_KEYS*2) * sizeof *g_ks);
+    if (!g_ks){ *out = NULL; return 0; }
+    extern int wop_keyset(const rpc_wallet*, wscan_key*, int);
+    g_ks_n = wop_keyset(w, g_ks, WOP_SCAN_KEYS*2);
+    memcpy(g_ks_seed, w->seed, 64);
+    g_ks_valid = 1;
+    *out = g_ks;
+    return g_ks_n;
+}
+
+int wop_keyset(const rpc_wallet* w, wscan_key* keys, int cap){
+    if (!w || !w->seed) return 0;
+    int n = 0;
+    for (unsigned i = 0; i < WOP_SCAN_KEYS && n + 2 <= cap; i++){
+        for (int b = 0; b <= 1; b++){
+            unsigned path[5] = {0x80000000u|84u, 0x80000000u, 0x80000000u, i, (unsigned)b};
+            unsigned char k[32], c[32], pub[33];
+            if (bip32_derive_path(k, c, w->seed, 64, path, 5) != 1) continue;
+            scalar_to_pubkey(pub, k);
+            hash160(keys[n].h160, pub, 33);
+            keys[n].keyidx = i; keys[n].branch = (unsigned char)b;
+            n++;
+        }
+    }
+    qsort(keys, (size_t)n, sizeof keys[0], wscan_key_cmp);
+    return n;
+}
+
+/* hash160 of the key a record belongs to. */
+static int wop_rec_h160(const wscan_key* keys, int nk, const wscan_rec* r, unsigned char h[20]){
+    for (int i = 0; i < nk; i++)
+        if (keys[i].keyidx == r->keyidx && keys[i].branch == r->branch){
+            memcpy(h, keys[i].h160, 20); return 1; }
+    return 0;
+}
+
+/* The wallet's own P2WPKH address for a key, as getnewaddress renders it. */
+extern long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]);
+
+#define WOP_MAXREC 200000
+static wscan_rec* g_wop_recs;
+static long g_wop_nrec = -1;
+static long g_wop_tipscanned = -1;
+
+/* Load the record file once per process; re-loaded after a rescan. */
+static long wop_records(wscan_rec** out){
+    if (g_wop_nrec < 0){
+        if (!g_wop_recs) g_wop_recs = malloc((size_t)WOP_MAXREC * sizeof *g_wop_recs);
+        if (!g_wop_recs){ *out = NULL; return 0; }
+        char pb[512];
+        g_wop_nrec = wscan_read(wop_path(WOP_SCAN_REL, pb, sizeof pb),
+                                g_wop_recs, WOP_MAXREC, &g_wop_tipscanned);
+    }
+    *out = g_wop_recs;
+    return g_wop_nrec;
+}
+static void wop_records_invalidate(void){ g_wop_nrec = -1; g_wop_tipscanned = -1; }
+
+/* No scan yet is a distinct state from "scanned and found nothing", and the
+ * two must not be conflated: reporting 0.00000000 for an address when no
+ * scan has run tells the caller something false. */
+static int wop_need_scan(long* ec, const char** em){
+    wscan_rec* r; wop_records(&r);
+    if (g_wop_tipscanned >= 0) return 0;
+    *ec = -4;
+    *em = "no wallet rescan has completed, so this node does not know what "
+          "this wallet has received. Run rescanblockchain first; answering "
+          "0.00000000 here would be indistinguishable from an address that "
+          "genuinely received nothing";
+    return 1;
+}
+
+static int wop_confs(unsigned int height){
+    long tip = g_wops_tip ? g_wops_tip() : -1;
+    if (tip < 0 || (long)height > tip) return 0;
+    return (int)(tip - (long)height + 1);
+}
+
+/* rescanblockchain ( start_height stop_height ) */
+static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
+                                long* ec, const char** em, rj_val** res){
+    if (!w || !w->seed) return wop_err(ec, em, -4, "No wallet is loaded");
+    if (!g_wops_read_block || !g_wops_tip)
+        return wop_err(ec, em, -4,
+            "no block archive is attached to the RPC layer, so there is "
+            "nothing to rescan");
+    long tip = g_wops_tip();
+    if (tip < 0) return wop_err(ec, em, -28, "Loading block index...");
+    long from = 0, to = tip;
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM) from = atol(params->items[0]->str);
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_NUM) to   = atol(params->items[1]->str);
+    }
+    if (from < 0) return wop_err(ec, em, -8, "Invalid start_height");
+    if (to > tip) to = tip;
+    if (to < from) return wop_err(ec, em, -8, "Invalid stop_height: must be >= start_height");
+
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    char pb[512]; const char* path = wop_path(WOP_SCAN_REL, pb, sizeof pb);
+    static char err[256];
+    long n = wscan_run(from, to, keys, nk, g_wops_read_block,
+                       g_wops_blockbuf, g_wops_bufcap, path,
+                       1u << 20, NULL, NULL, err, sizeof err);
+    if (n < 0){ *ec = -1; *em = err[0] ? err : "rescan failed"; return 0; }
+    wop_records_invalidate();
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "start_height", rj_numf("%ld", from));
+    rj_obj_set(o, "stop_height",  rj_numf("%ld", to));
+    *res = o;
+    return 1;
+}
+
+/* Sum of receives to one hash160, at or above minconf. */
+static unsigned long long wop_received_h160(const unsigned char h160[20], int minconf,
+                                            const wscan_key* keys, int nk,
+                                            rj_val* txids_out){
+    wscan_rec* recs; long n = wop_records(&recs);
+    unsigned long long total = 0;
+    for (long i = 0; i < n; i++){
+        if (recs[i].kind != 0) continue;
+        unsigned char h[20];
+        if (!wop_rec_h160(keys, nk, &recs[i], h)) continue;
+        if (memcmp(h, h160, 20)) continue;
+        if (wop_confs(recs[i].height) < minconf) continue;
+        total += recs[i].value;
+        if (txids_out){
+            char hx[65];
+            static const char* H = "0123456789abcdef";
+            for (int k = 0; k < 32; k++){
+                unsigned char b = recs[i].txid[31-k];
+                hx[k*2] = H[b>>4]; hx[k*2+1] = H[b&15];
+            }
+            hx[64] = 0;
+            int dup = 0;
+            for (size_t j = 0; j < txids_out->nitems; j++)
+                if (!strcmp(txids_out->items[j]->str, hx)){ dup = 1; break; }
+            if (!dup) rj_arr_push(txids_out, rj_str(hx));
+        }
+    }
+    return total;
+}
+
+static int wop_minconf_arg(const rj_val* params, size_t i, int dflt){
+    if (params && params->typ == RJ_ARR && params->nitems > i &&
+        params->items[i]->typ == RJ_NUM) return (int)atol(params->items[i]->str);
+    return dflt;
+}
+
+/* Decode an address argument into the hash160 this wallet would match. */
+static int wop_addr_h160(const char* addr, unsigned char h160[20], long* ec, const char** em){
+    int t; unsigned char v, h[20], p32[32];
+    if (!wallet_validate_address(addr, &t, &v, h, p32) ||
+        (t != WOP_ADDR_P2PKH && t != WOP_ADDR_P2WPKH))
+        return wop_err(ec, em, -5, "Invalid Bitcoin address");
+    memcpy(h160, h, 20);
+    return 1;
+}
+
+static int cmd_getreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
+                                    long* ec, const char** em, rj_val** res){
+    const char* addr = wop_str_arg(params, 0);
+    if (!addr) return wop_err(ec, em, -8, "getreceivedbyaddress requires an address");
+    if (wop_need_scan(ec, em)) return 0;
+    unsigned char want[20];
+    if (!wop_addr_h160(addr, want, ec, em)) return 0;
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* Core: an address the wallet does not own is an error, not a zero --
+     * a zero would look like an owned address that received nothing. */
+    int mine = 0;
+    for (int i = 0; i < nk; i++) if (!memcmp(keys[i].h160, want, 20)){ mine = 1; break; }
+    if (!mine) return wop_err(ec, em, -4, "Address not found in wallet");
+    unsigned long long total = wop_received_h160(want, wop_minconf_arg(params, 1, 1), keys, nk, NULL);
+    char am[32]; rpc_amounts((long long)total, am, sizeof am);
+    *res = rj_numf("%s", am);
+    return 1;
+}
+
+static int cmd_getreceivedbylabel(const rj_val* params, const rpc_wallet* w,
+                                  long* ec, const char** em, rj_val** res){
+    const char* label = wop_str_arg(params, 0);
+    if (!label) return wop_err(ec, em, -8, "getreceivedbylabel requires a label");
+    if (wop_need_scan(ec, em)) return 0;
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    int minconf = wop_minconf_arg(params, 1, 1);
+    char pb[512]; const char* lp = wop_path(WOP_LABELS_REL, pb, sizeof pb);
+    int ln = lbl_count(lp), hits = 0;
+    unsigned long long total = 0;
+    for (int i = 0; i < ln; i++){
+        char a[128], l[256];
+        if (!lbl_get_i(lp, i, a, sizeof a, l, sizeof l)) continue;
+        if (strcmp(l, label)) continue;
+        unsigned char h[20];
+        long e2; const char* m2;
+        if (!wop_addr_h160(a, h, &e2, &m2)) continue;
+        hits++;
+        total += wop_received_h160(h, minconf, keys, nk, NULL);
+    }
+    if (!hits){
+        static char msg[320];
+        snprintf(msg, sizeof msg, "No addresses with label %s", label);
+        return wop_err(ec, em, -11, msg);
+    }
+    char am[32]; rpc_amounts((long long)total, am, sizeof am);
+    *res = rj_numf("%s", am);
+    return 1;
+}
+
+/* The label of an address, "" when unlabelled. */
+static void wop_label_of(const char* addr, char* out, int cap){
+    char pb[512];
+    lbl_get(wop_path(WOP_LABELS_REL, pb, sizeof pb), addr, out, cap);
+}
+
+static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
+                                     long* ec, const char** em, rj_val** res){
+    if (wop_need_scan(ec, em)) return 0;
+    int minconf = wop_minconf_arg(params, 0, 1);
+    int include_empty = 0;
+    if (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+        params->items[1]->typ == RJ_BOOL) include_empty = params->items[1]->str[0] == '1';
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* Only keys that actually appear in the scan are candidates, unless the
+     * caller asked for empties -- otherwise this would list 2000 addresses. */
+    wscan_rec* recs; long n = wop_records(&recs);
+    rj_val* arr = rj_arr();
+    for (int i = 0; i < nk; i++){
+        int seen = 0;
+        for (long r = 0; r < n && !seen; r++)
+            if (recs[r].kind == 0 && recs[r].keyidx == keys[i].keyidx &&
+                recs[r].branch == keys[i].branch) seen = 1;
+        if (!seen && !include_empty) continue;
+        char addr[96];
+        if (wallet_p2wpkh_address(addr, sizeof addr, keys[i].h160) < 0) continue;
+        rj_val* txids = rj_arr();
+        unsigned long long total = wop_received_h160(keys[i].h160, minconf, keys, nk, txids);
+        if (!total && !include_empty){ rj_free(txids); continue; }
+        /* confirmations: Core reports the deepest (oldest) contributing tx */
+        int confs = 0;
+        for (long r = 0; r < n; r++)
+            if (recs[r].kind == 0 && recs[r].keyidx == keys[i].keyidx &&
+                recs[r].branch == keys[i].branch){
+                int c = wop_confs(recs[r].height);
+                if (c > confs) confs = c;
+            }
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "address", rj_str(addr));
+        { char am[32]; rpc_amounts((long long)total, am, sizeof am);
+          rj_obj_set(e, "amount", rj_numf("%s", am)); }
+        rj_obj_set(e, "confirmations", rj_numf("%d", confs));
+        { char lab[256]; wop_label_of(addr, lab, sizeof lab);
+          rj_obj_set(e, "label", rj_str(lab)); }
+        rj_obj_set(e, "txids", txids);
+        rj_arr_push(arr, e);
+    }
+    *res = arr;
+    return 1;
+}
+
+static int cmd_listreceivedbylabel(const rj_val* params, const rpc_wallet* w,
+                                   long* ec, const char** em, rj_val** res){
+    if (wop_need_scan(ec, em)) return 0;
+    int minconf = wop_minconf_arg(params, 0, 1);
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    char pb[512]; const char* lp = wop_path(WOP_LABELS_REL, pb, sizeof pb);
+    int ln = lbl_count(lp);
+    rj_val* arr = rj_arr();
+    /* one entry per DISTINCT label that received something */
+    char seen[64][256]; int ns = 0;
+    for (int i = 0; i < ln && ns < 64; i++){
+        char a[128], l[256];
+        if (!lbl_get_i(lp, i, a, sizeof a, l, sizeof l)) continue;
+        int dup = 0;
+        for (int j = 0; j < ns; j++) if (!strcmp(seen[j], l)){ dup = 1; break; }
+        if (dup) continue;
+        snprintf(seen[ns++], 256, "%s", l);
+        unsigned long long total = 0; int confs = 0;
+        for (int k = 0; k < ln; k++){
+            char a2[128], l2[256];
+            if (!lbl_get_i(lp, k, a2, sizeof a2, l2, sizeof l2)) continue;
+            if (strcmp(l2, l)) continue;
+            unsigned char h[20]; long e2; const char* m2;
+            if (!wop_addr_h160(a2, h, &e2, &m2)) continue;
+            total += wop_received_h160(h, minconf, keys, nk, NULL);
+            wscan_rec* recs; long n = wop_records(&recs);
+            for (long r = 0; r < n; r++){
+                if (recs[r].kind != 0) continue;
+                unsigned char rh[20];
+                if (!wop_rec_h160(keys, nk, &recs[r], rh) || memcmp(rh, h, 20)) continue;
+                int c = wop_confs(recs[r].height);
+                if (c > confs) confs = c;
+            }
+        }
+        if (!total) continue;
+        rj_val* e = rj_obj();
+        { char am[32]; rpc_amounts((long long)total, am, sizeof am);
+          rj_obj_set(e, "amount", rj_numf("%s", am)); }
+        rj_obj_set(e, "confirmations", rj_numf("%d", confs));
+        rj_obj_set(e, "label", rj_str(l));
+        rj_arr_push(arr, e);
+    }
+    *res = arr;
+    return 1;
+}
+
+/* listaddressgroupings -- Core groups addresses proven to share ownership by
+ * having been spent together. This wallet is a single seed, so every address
+ * it owns is provably one owner: one group. That is the honest grouping, and
+ * it is also the maximally-correct one -- there is no partition of a
+ * single-seed wallet into distinct owners. */
+static int cmd_listaddressgroupings(const rpc_wallet* w, long* ec, const char** em, rj_val** res){
+    if (wop_need_scan(ec, em)) return 0;
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    wscan_rec* recs; long n = wop_records(&recs);
+    rj_val* group = rj_arr();
+    for (int i = 0; i < nk; i++){
+        unsigned long long bal = 0; int seen = 0;
+        for (long r = 0; r < n; r++){
+            if (recs[r].keyidx != keys[i].keyidx || recs[r].branch != keys[i].branch) continue;
+            seen = 1;
+            if (recs[r].kind == 0) bal += recs[r].value; else bal -= recs[r].value;
+        }
+        if (!seen) continue;
+        char addr[96];
+        if (wallet_p2wpkh_address(addr, sizeof addr, keys[i].h160) < 0) continue;
+        rj_val* e = rj_arr();
+        rj_arr_push(e, rj_str(addr));
+        { char am[32]; rpc_amounts((long long)bal, am, sizeof am);
+          rj_arr_push(e, rj_numf("%s", am)); }
+        { char lab[256]; wop_label_of(addr, lab, sizeof lab);
+          if (lab[0]) rj_arr_push(e, rj_str(lab)); }
+        rj_arr_push(group, e);
+    }
+    rj_val* arr = rj_arr();
+    if (group->nitems) rj_arr_push(arr, group); else rj_free(group);
+    *res = arr;
+    return 1;
+}
+
+/* listsinceblock ( "blockhash" target_confirmations ... ) */
+static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
+                              long* ec, const char** em, rj_val** res){
+    if (wop_need_scan(ec, em)) return 0;
+    long since = -1;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR && params->items[0]->str[0]){
+        /* resolve the block hash to a height through the chain module */
+        rj_val* hv = NULL; long e2; const char* m2;
+        rj_val* p1 = rj_arr(); rj_arr_push(p1, rj_str(params->items[0]->str));
+        int rc = rpc_chain_dispatch("getblockheader", p1, &hv, &e2, &m2);
+        rj_free(p1);
+        if (rc != 1 || !hv){ if (hv) rj_free(hv);
+            return wop_err(ec, em, -5, "Block not found"); }
+        rj_val* hh = rj_obj_get(hv, "height");
+        since = hh ? atol(hh->str) : -1;
+        rj_free(hv);
+        if (since < 0) return wop_err(ec, em, -5, "Block not found");
+    }
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    wscan_rec* recs; long n = wop_records(&recs);
+    rj_val* txs = rj_arr();
+    static const char* HEX = "0123456789abcdef";
+    for (long r = 0; r < n; r++){
+        if ((long)recs[r].height <= since) continue;
+        unsigned char h[20];
+        if (!wop_rec_h160(keys, nk, &recs[r], h)) continue;
+        char addr[96];
+        if (wallet_p2wpkh_address(addr, sizeof addr, h) < 0) continue;
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "address", rj_str(addr));
+        rj_obj_set(e, "category", rj_str(recs[r].kind == 0 ? "receive" : "send"));
+        { char am[32];
+          rpc_amounts(recs[r].kind == 0 ? (long long)recs[r].value
+                                        : -(long long)recs[r].value, am, sizeof am);
+          rj_obj_set(e, "amount", rj_numf("%s", am)); }
+        rj_obj_set(e, "vout", rj_numf("%u", recs[r].vout));
+        rj_obj_set(e, "confirmations", rj_numf("%d", wop_confs(recs[r].height)));
+        rj_obj_set(e, "blockheight", rj_numf("%u", recs[r].height));
+        { char hx[65];
+          for (int k = 0; k < 32; k++){
+              unsigned char b = recs[r].txid[31-k];
+              hx[k*2] = HEX[b>>4]; hx[k*2+1] = HEX[b&15];
+          }
+          hx[64] = 0;
+          rj_obj_set(e, "txid", rj_str(hx)); }
+        { char lab[256]; wop_label_of(addr, lab, sizeof lab);
+          if (lab[0]) rj_obj_set(e, "label", rj_str(lab)); }
+        rj_obj_set(e, "abandoned", rj_bool(0));
+        /* blockhash/blocktime/blockindex/time are NOT emitted: the scan
+         * records the height, and the rest would have to be invented. */
+        rj_arr_push(txs, e);
+    }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "transactions", txs);
+    rj_obj_set(o, "removed", rj_arr());
+    { long tip = g_wops_tip ? g_wops_tip() : -1;
+      if (tip >= 0){
+          rj_val* hv = NULL; long e2; const char* m2;
+          rj_val* p1 = rj_arr(); rj_arr_push(p1, rj_numf("%ld", tip));
+          if (rpc_chain_dispatch("getblockhash", p1, &hv, &e2, &m2) == 1 && hv)
+              rj_obj_set(o, "lastblock", rj_str(hv->str));
+          if (hv) rj_free(hv);
+          rj_free(p1);
+      } }
+    *res = o;
+    return 1;
+}
+
+/* abandontransaction "txid"
+ * Core abandons an UNCONFIRMED wallet transaction so its inputs can be
+ * respent. A transaction the scan has seen is confirmed, and Core refuses
+ * that with -5. A transaction this node journalled but never saw confirmed
+ * is the abandonable case, and the marker is recorded in labels-style
+ * sidecar so gettransaction can report abandoned:true. */
+#define WOP_ABANDON_REL "abandoned.dat"
+
+static int wop_txid_from_arg(const rj_val* params, unsigned char out_wire[32],
+                             char disp[65], long* ec, const char** em){
+    const char* t = wop_str_arg(params, 0);
+    if (!t || strlen(t) != 64) return wop_err(ec, em, -8, "Invalid or missing txid");
+    for (int i = 0; i < 32; i++){
+        int hi, lo; char a = t[i*2], b = t[i*2+1];
+        if (a>='0'&&a<='9') hi=a-'0'; else if ((a|32)>='a'&&(a|32)<='f') hi=(a|32)-'a'+10;
+        else return wop_err(ec, em, -8, "Invalid txid");
+        if (b>='0'&&b<='9') lo=b-'0'; else if ((b|32)>='a'&&(b|32)<='f') lo=(b|32)-'a'+10;
+        else return wop_err(ec, em, -8, "Invalid txid");
+        out_wire[31-i] = (unsigned char)((hi<<4)|lo);
+    }
+    snprintf(disp, 65, "%s", t);
+    return 1;
+}
+
+int rpc_wops_is_abandoned(const char* txid_display){
+    char pb[512]; const char* p = wop_path(WOP_ABANDON_REL, pb, sizeof pb);
+    FILE* f = fopen(p, "r");
+    if (!f) return 0;
+    char line[128]; int hit = 0;
+    while (fgets(line, sizeof line, f)){
+        size_t l = strlen(line);
+        while (l && (line[l-1]=='\n' || line[l-1]=='\r')) line[--l] = 0;
+        if (!strcmp(line, txid_display)){ hit = 1; break; }
+    }
+    fclose(f);
+    return hit;
+}
+
+static int cmd_abandontransaction(const rj_val* params, long* ec, const char** em, rj_val** res){
+    unsigned char wire[32]; char disp[65];
+    if (!wop_txid_from_arg(params, wire, disp, ec, em)) return 0;
+    if (wop_need_scan(ec, em)) return 0;
+    wscan_rec* recs; long n = wop_records(&recs);
+    for (long i = 0; i < n; i++)
+        if (!memcmp(recs[i].txid, wire, 32))
+            /* Core's exact refusal for a confirmed transaction */
+            return wop_err(ec, em, -5, "Transaction not eligible for abandonment");
+    if (rpc_wops_is_abandoned(disp)){ *res = rj_null(); return 1; }   /* idempotent */
+    char pb[512]; const char* p = wop_path(WOP_ABANDON_REL, pb, sizeof pb);
+    FILE* f = fopen(p, "a");
+    if (!f) return wop_err(ec, em, -4, "Could not write the abandoned-transaction store");
+    int bad = fprintf(f, "%s\n", disp) < 0;
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) bad = 1;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) return wop_err(ec, em, -4, "Could not write the abandoned-transaction store");
+    *res = rj_null();
+    return 1;
+}
+
 /* ==== the refusals =======================================================
  * Each names the specific missing capability. None of them pretends. */
 #define WOP_ONE_WALLET \
@@ -642,11 +1166,14 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
      * has no data behind it. Answering 0.00000000 would be a wrong answer
      * dressed as a real one -- the caller cannot tell it apart from an
      * address that genuinely received nothing. */
-    if (!strcmp(m, "rescanblockchain") || !strcmp(m, "getreceivedbyaddress") ||
-        !strcmp(m, "getreceivedbylabel") || !strcmp(m, "listreceivedbyaddress") ||
-        !strcmp(m, "listreceivedbylabel") || !strcmp(m, "listaddressgroupings") ||
-        !strcmp(m, "listsinceblock") || !strcmp(m, "abandontransaction"))
-        return wop_unsupported(WOP_NO_RESCAN, ec, em);
+    if (!strcmp(m, "rescanblockchain"))     return cmd_rescanblockchain(params, w, ec, em, res);
+    if (!strcmp(m, "getreceivedbyaddress")) return cmd_getreceivedbyaddress(params, w, ec, em, res);
+    if (!strcmp(m, "getreceivedbylabel"))   return cmd_getreceivedbylabel(params, w, ec, em, res);
+    if (!strcmp(m, "listreceivedbyaddress"))return cmd_listreceivedbyaddress(params, w, ec, em, res);
+    if (!strcmp(m, "listreceivedbylabel"))  return cmd_listreceivedbylabel(params, w, ec, em, res);
+    if (!strcmp(m, "listaddressgroupings")) return cmd_listaddressgroupings(w, ec, em, res);
+    if (!strcmp(m, "listsinceblock"))       return cmd_listsinceblock(params, w, ec, em, res);
+    if (!strcmp(m, "abandontransaction"))   return cmd_abandontransaction(params, ec, em, res);
 
     /* the spend family -- see WOP_NO_FUNDING for why refusing is the only
      * answer that does not hand the caller a transaction the network will
