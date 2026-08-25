@@ -318,11 +318,26 @@ int main(void){
       ck_str("blk3 v1 tx[1] == legacy spend txid", tx && tx->nitems > 1 ? tx->items[1]->str : NULL, g_tx1_txid);
       ck_str("blk3 v1 tx[2] == segwit spend txid", tx && tx->nitems > 2 ? tx->items[2]->str : NULL, g_tx2_txid);
       rj_free(r);
+      /* Write undo_3.dat so getblock v2 can compute fees from spent prevout
+       * values (block 3 is height 3). Two spends, in block order:
+       *   tx[1] legacy_spend: 1 input worth 50.0 BTC  -> fee 0.01 (out 49.99)
+       *   tx[2] segwit_spend: 1 input worth 49.99 BTC -> fee 49.98999 (out 1000 sat)
+       * Record: txid[32] idx(u32) value(u64@36) height(u32) is_coinbase(u8@48) slen(u16@49) */
+      { unsigned char rec[102]; memset(rec, 0, sizeof rec);
+        put_u64(rec+36, 5000000000ULL);      /* record 0 value */
+        put_u64(rec+51+36, 4999000000ULL);   /* record 1 value */
+        FILE* uf = fopen("undo_3.dat", "wb");
+        ck("undo_3.dat opened", uf != NULL);
+        if (uf){ fwrite(rec, 1, 102, uf); fclose(uf); }
+      }
       snprintf(p, sizeof p, "[\"%s\", 2]", g_hash[3]);
       r = call("getblock", p, &ec, &em);
       tx = G(r,"tx");
       rj_val* t1 = tx && tx->nitems > 1 ? tx->items[1] : NULL;
       rj_val* t2 = tx && tx->nitems > 2 ? tx->items[2] : NULL;
+      ck("v2 coinbase tx[0] has no fee (Core parity)", tx && tx->nitems ? G(tx->items[0],"fee") == NULL : 0);
+      ck_str("v2 tx[1].fee (0.01 from undo)", S(t1,"fee"), "0.01000000");
+      ck_str("v2 tx[2].fee (49.98999 from undo)", S(t2,"fee"), "49.98999000");
       ck_str("v2 tx[1].txid == v1 txid", S(t1,"txid"), g_tx1_txid);
       ck_str("v2 tx[2].txid == v1 txid", S(t2,"txid"), g_tx2_txid);
       ck_str("v2 tx[2].hash == wtxid (!= txid)", S(t2,"hash"), g_tx2_wtxid);
