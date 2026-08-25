@@ -65,4 +65,11 @@ unsigned int rpc_chain_retarget(unsigned int old_bits, long timespan);
 void rpc_chain_set_utxosetinfo(long (*run)(int want_muhash, void* out,
                                            char* msg, unsigned long mcap));
 
+/* scantxoutset's injected whole-set scanner (same reader TU). */
+void rpc_chain_set_utxoscan(long (*run)(const unsigned char* spks, const unsigned int* spklens,
+                                        int nspk, void* hits, long hits_cap, long* hits_n,
+                                        long* out_height, unsigned long long* out_scanned,
+                                        unsigned long long* out_total, int* out_overflow,
+                                        char* msg, unsigned long mcap));
+
 #endif /* RPC_CHAIN_H */
