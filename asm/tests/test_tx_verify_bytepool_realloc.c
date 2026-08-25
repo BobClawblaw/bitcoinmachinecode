@@ -275,7 +275,7 @@ int main(void){
     {
         enum { NTX = NBIG + 1 };
         u8 tx_bufs[NTX][512]; long tx_lens[NTX]; u8 txids[NTX][32];
-        u8 cb[64]; u8* q = cb;
+        u8 cb[80]; u8* q = cb;
         put32(q,1); q+=4; *q++=1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
         *q++=4; put32(q,0x62000000u); q+=4; put32(q,0xffffffffu); q+=4;
         *q++=1; put64(q,50000000ULL); q+=8; *q++=1; *q++=0x51; put32(q,0); q+=4;
