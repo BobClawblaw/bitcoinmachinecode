@@ -15,6 +15,8 @@
 #include "version_gen.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
+                        * which silently corrupted their return values */
 #include <pthread.h>
 #include <time.h>
 
@@ -316,6 +318,7 @@ static void mpe_hex(char* dst, const unsigned char* internal){
     dst[64]=0;
 }
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
+static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
@@ -382,8 +385,10 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
 
     { rj_val* fees = rj_obj();
       unsigned long long base = have_inf ? inf.fee : 0;
+      long long modified = (long long)base + pri_delta_of(txid);   /* prioritisetransaction */
+      long long am = modified < 0 ? -modified : modified;
       rj_obj_set(fees, "base", mpe_amount(base));
-      rj_obj_set(fees, "modified", mpe_amount(base));
+      rj_obj_set(fees, "modified", rj_numf("%s%lld.%08lld", modified<0?"-":"", am/100000000LL, am%100000000LL));
       rj_obj_set(fees, "ancestor", mpe_amount(have_inf ? inf.anc_fee : base));
       rj_obj_set(fees, "descendant", mpe_amount(have_inf ? inf.desc_fee : base));
       rj_obj_set(o, "fees", fees); }
@@ -512,6 +517,94 @@ static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, co
     return 1;
 }
 
+/* ---- prioritisetransaction / getprioritisedtransactions ------------------
+ * (Core rpc/mining.cpp). A fee-delta map consulted by getmempoolentry's
+ * fees.modified. PARENT-LOCAL by design: the deltas only influence what THIS
+ * process reports (entry/template views) -- like Core's, they are in-memory
+ * operator hints, not consensus state; a restart clears them. Deltas
+ * ACCUMULATE across calls and an entry whose sum returns to zero is erased
+ * (both oracle-verified). The tx need not be in the mempool (the delta
+ * simply waits -- in_mempool:false until it shows up). */
+#define PRI_MAX 256
+static struct { unsigned char txid[32]; long long delta; int used; } g_pri[PRI_MAX];
+
+static long long pri_delta_of(const unsigned char txid[32]){
+    for (int i = 0; i < PRI_MAX; i++)
+        if (g_pri[i].used && !memcmp(g_pri[i].txid, txid, 32)) return g_pri[i].delta;
+    return 0;
+}
+/* shared txid-arg validation (Core-exact -8 messages); display -> internal */
+static int pri_parse_txid(const rj_val* v, unsigned char txid[32], long* ec, const char** em){
+    static char embuf[128];
+    if (!v || v->typ != RJ_STR){
+        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    size_t hl = strlen(v->str);
+    if (hl != 64){
+        snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", hl, v->str);
+        *ec = -8; *em = embuf; return 0; }
+    for (int i = 0; i < 32; i++){
+        int a = srt_hex1(v->str[i*2]), b = srt_hex1(v->str[i*2+1]);
+        if (a < 0 || b < 0){
+            snprintf(embuf, sizeof embuf, "txid must be hexadecimal string (not '%s')", v->str);
+            *ec = -8; *em = embuf; return 0; }
+        txid[31-i] = (unsigned char)((a<<4)|b);
+    }
+    return 1;
+}
+
+static int cmd_prioritisetransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 3){
+        *ec = -1; *em = "prioritisetransaction requires txid, dummy, fee_delta"; return 0; }
+    unsigned char txid[32];
+    if (!pri_parse_txid(params->items[0], txid, ec, em)) return 0;
+    /* dummy must be 0/null (Core-exact message) */
+    { const rj_val* d = params->items[1];
+      int zero = (d->typ == RJ_NULL) ||
+                 (d->typ == RJ_NUM && atof(d->str) == 0.0);
+      if (!zero){
+          *ec = -8; *em = "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.";
+          return 0; } }
+    if (params->items[2]->typ != RJ_NUM){
+        *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
+    long long delta = atoll(params->items[2]->str);
+    int slot = -1;
+    for (int i = 0; i < PRI_MAX; i++){
+        if (g_pri[i].used && !memcmp(g_pri[i].txid, txid, 32)){ slot = i; break; }
+        if (slot < 0 && !g_pri[i].used) slot = i;
+    }
+    if (slot < 0){ *ec = -1; *em = "prioritisation table full"; return 0; }
+    if (!g_pri[slot].used){ memcpy(g_pri[slot].txid, txid, 32); g_pri[slot].delta = 0; g_pri[slot].used = 1; }
+    g_pri[slot].delta += delta;                       /* ACCUMULATES (Core) */
+    if (g_pri[slot].delta == 0) g_pri[slot].used = 0; /* zero-sum erased (Core) */
+    *res = rj_bool(1);
+    return 1;
+}
+
+static int cmd_getprioritisedtransactions(rj_val** res){
+    rj_val* o = rj_obj();
+    for (int i = 0; i < PRI_MAX; i++){
+        if (!g_pri[i].used) continue;
+        char hx[65]; mpe_hex(hx, g_pri[i].txid);
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "fee_delta", rj_numf("%lld", g_pri[i].delta));
+        unsigned long len = 0; int inpool = 0;
+        unsigned long long base = 0, fsz = 0;
+        if (g_mph.mp && g_mph.get){
+            mpl();
+            inpool = g_mph.get(g_mph.mp, g_pri[i].txid, &len) != NULL;
+            if (inpool && g_mph.polstate && g_mph.pol_entry)
+                g_mph.pol_entry(g_mph.polstate, g_pri[i].txid, &base, &fsz);
+            mpu();
+        }
+        rj_obj_set(e, "in_mempool", rj_bool(inpool));
+        if (inpool)
+            rj_obj_set(e, "modified_fee", rj_numf("%lld", (long long)base + g_pri[i].delta));
+        rj_obj_set(o, hx, e);
+    }
+    *res = o;
+    return 1;
+}
+
 /* sendrawtransaction: parse the raw-tx hex, stage it into the shared
  * submission channel, and block on the download worker's verdict (mempool
  * accept + relay to peers). Core rpc/rawtransaction.cpp: returns the txid on
@@ -584,7 +677,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "sendrawtransaction", NULL
 };
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
@@ -601,6 +694,8 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
     if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);
     if (!strcmp(m, "estimatesmartfee"))   return cmd_estimatesmartfee(params, res, ec, em);
+    if (!strcmp(m, "prioritisetransaction"))      return cmd_prioritisetransaction(params, res, ec, em);
+    if (!strcmp(m, "getprioritisedtransactions")) return cmd_getprioritisedtransactions(res);
     if (!strcmp(m, "sendrawtransaction")) return cmd_sendrawtransaction(params, res, ec, em);
     return -1;
 }
