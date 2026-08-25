@@ -169,6 +169,29 @@ int main(void) {
         rpc_amounts(2100000000000000LL, b, sizeof b); ck_str("max 21M", b, "21000000.00000000");
     }
 
+    /* ---- rj_clone: a DEEP copy, independently freeable ----------------
+     * Added for signrawtransactionwithwallet, which forwards a params array
+     * it does not own into one it does. A shallow copy there would free the
+     * caller's request nodes -- a use-after-free the caller could not see. */
+    {
+        const char* src = "{\"a\":[1,\"two\",{\"b\":true},null],\"c\":{\"d\":-3.5}}";
+        rj_val* o = rj_parse(src, strlen(src));
+        rj_val* c = rj_clone(o);
+        char b1[512], b2[512];
+        rj_write(b1, sizeof b1, o, 0);
+        rj_write(b2, sizeof b2, c, 0);
+        ck_str("rj_clone round-trips a nested value byte-for-byte", b2, b1);
+        /* free the SOURCE first, then read the clone: if the copy were
+         * shallow this is exactly where it would read freed memory. */
+        rj_free(o);
+        rj_write(b2, sizeof b2, c, 0);
+        ck_str("the clone survives its source being freed", b2, b1);
+        ck("cloned object keeps its members", rj_obj_get(c, "a") != NULL);
+        ck("cloned array keeps its length", rj_obj_get(c, "a")->nitems == 4);
+        rj_free(c);
+        ck("rj_clone(NULL) is NULL, not a crash", rj_clone(NULL) == NULL);
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }
