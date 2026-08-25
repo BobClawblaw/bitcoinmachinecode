@@ -82,6 +82,10 @@ fuzz_sighash:
 	python3 fuzz_sighash.py 1 3000
 t_bip143: t_bip143.c bitcoin_bip143.o bitcoin_hash.o sha256.o
 	$(CC) $(CFLAGS) -o t_bip143 t_bip143.c bitcoin_bip143.o bitcoin_hash.o sha256.o
+t_codec: t_codec.c bitcoin_scriptcodec.o
+	$(CC) $(CFLAGS) -o t_codec t_codec.c bitcoin_scriptcodec.o
+fuzz_codec:
+	python3 fuzz_codec.py 1 3000
 CKSOBJS=bitcoin_checksig.o bitcoin_sighash.o bitcoin_bip143.o bitcoin_script.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o bitcoin_hash.o sha256.o
 t_checksig: t_checksig.c $(CKSOBJS)
 	$(CC) $(CFLAGS) -o t_checksig t_checksig.c $(CKSOBJS)

@@ -154,3 +154,8 @@ port/arm64/* and differential-fuzz verified (30k/60k/20k/~6k vectors, 0 fail).
 So the crypto hooks for VerifyScript are complete. The single remaining
 consensus-critical asm module is `script_eval` in bitcoin_interp.asm (~3165
 lines + bitcoin_scriptcodec.asm). Port it and the C wrapper links unchanged.
+
+## interpreter foundation (2026-08-25): bitcoin_scriptcodec.S PURE primitives
+Ported + verified (150k vectors, 10 seeds, 0 fail): scriptnum_decode, scriptnum_serialize,
+cast_to_bool, der_sig_strict (BIP66), check_minimal_push. NEXT in this module: get_op,
+scriptnum elem boundary, then the element-stack engine (stack_push/pop/copy/dup/erase/insert), then vfExec, then script_eval (bitcoin_interp.asm).
