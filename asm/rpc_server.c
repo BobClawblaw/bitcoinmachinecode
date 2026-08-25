@@ -273,19 +273,41 @@ static void handle_request(int cfd, const char* body, size_t blen) {
     close(cfd);
 }
 
-/* Serve one connection: read the full request, authenticate, dispatch. */
+/* Serve one connection: read the full request, authenticate, dispatch.
+ *
+ * REQUEST BUFFER (2026-08-25): was a fixed 256KB stack array, which silently
+ * truncated anything larger -- submitblock's hex payload alone can be ~8MB
+ * (a 4MB-weight block). Now a heap buffer growing on demand up to
+ * RPC_REQ_MAX; oversize requests are dropped (connection closed) rather
+ * than half-parsed. The header-end scan resumes where the last read left
+ * off instead of rescanning from byte 0 (quadratic at MB sizes). */
+#define RPC_REQ_MAX (9u<<20)     /* 8MB hex block + JSON + headers, with margin */
 static void service_conn(int cfd) {
-    char buf[262144];
-    size_t got = 0;
+    size_t cap = 262144;
+    char* buf = malloc(cap);
+    if (!buf) { close(cfd); return; }
+    size_t got = 0, scanned = 0;
+    const char* hdrend = NULL;
     while (1) {
-        ssize_t n = read(cfd, buf + got, sizeof buf - 1 - got);
+        if (got + 1 >= cap) {
+            if (cap >= RPC_REQ_MAX) { free(buf); close(cfd); return; }
+            size_t ncap = cap * 2; if (ncap > RPC_REQ_MAX) ncap = RPC_REQ_MAX;
+            size_t hoff = hdrend ? (size_t)(hdrend - buf) : 0;
+            char* nb = realloc(buf, ncap);
+            if (!nb) { free(buf); close(cfd); return; }
+            if (hdrend) hdrend = nb + hoff;   /* pointer survives realloc */
+            buf = nb; cap = ncap;
+        }
+        ssize_t n = read(cfd, buf + got, cap - 1 - got);
         if (n <= 0) break;
         got += (size_t)n;
-        if (got + 1 >= sizeof buf) break;
         /* stop once headers + full Content-Length body are present */
-        const char* hdrend = NULL;
-        for (size_t i = 0; i + 3 < got; i++)
-            if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') { hdrend = buf + i; break; }
+        if (!hdrend) {
+            size_t start = scanned > 3 ? scanned - 3 : 0;
+            for (size_t i = start; i + 3 < got; i++)
+                if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') { hdrend = buf + i; break; }
+            scanned = got;
+        }
         if (hdrend) {
             size_t hdrlen = (size_t)(hdrend - buf);
             const char* clv = find_header(buf, hdrlen, "Content-Length", 14);
@@ -295,14 +317,14 @@ static void service_conn(int cfd) {
             if (nv < 0) break;
         }
     }
-    if (got == 0) { close(cfd); return; }
+    if (got == 0) { free(buf); close(cfd); return; }
     buf[got] = 0;
 
     /* parse HTTP request line + headers */
     const char *m, *path, *body; size_t mlen, plen, blen;
     if (!http_request_parse(buf, (size_t)got, &m, &mlen, &path, &plen, &body, &blen)) {
         const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        write(cfd, e, strlen(e)); close(cfd); return;
+        write(cfd, e, strlen(e)); free(buf); close(cfd); return;
     }
     (void)path; (void)plen;
 
@@ -314,13 +336,11 @@ static void service_conn(int cfd) {
             "HTTP/1.1 405 Method Not Allowed\r\n"
             "Content-Type: text/plain\r\n"
             "Content-Length: %zu\r\n\r\n%s", strlen(txt), txt);
-        write(cfd, resp, (size_t)rl); close(cfd); return;
+        write(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
     }
 
-    /* auth (Core: 401 + WWW-Authenticate when missing/incorrect) */
-    const char* hdrend = NULL;
-    for (size_t i = 0; i + 3 < got; i++)
-        if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') { hdrend = buf + i; break; }
+    /* auth (Core: 401 + WWW-Authenticate when missing/incorrect).
+     * hdrend was already located during the read loop above. */
     int authorized = 0;
     if (hdrend) {
         size_t hdrlen = (size_t)(hdrend - buf);
@@ -332,7 +352,7 @@ static void service_conn(int cfd) {
             "HTTP/1.1 401 Unauthorized\r\n"
             "WWW-Authenticate: %s\r\n"
             "Content-Length: 0\r\n\r\n", WWW_AUTH_HEADER);
-        write(cfd, resp, (size_t)rl); close(cfd); return;
+        write(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
     }
 
     handle_request(cfd, body, blen);

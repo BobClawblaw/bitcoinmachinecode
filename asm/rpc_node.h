@@ -37,6 +37,9 @@ typedef struct {
 /* Max raw-tx bytes a sendrawtransaction submission can stage. A standard tx is
  * capped at 100k vbytes; 400000 covers the consensus weight bound with room. */
 #define RPC_TXSUBMIT_MAX 400000
+/* Max serialized block a submitblock can stage: the 4M-weight consensus
+ * bound (a block is at most 4MB serialized), with margin. */
+#define RPC_BLKSUBMIT_MAX 4100000
 
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
@@ -58,6 +61,16 @@ typedef struct {
     volatile int                tx_submit_result;
     char                        tx_submit_reason[128];
     unsigned char               tx_submit_buf[RPC_TXSUBMIT_MAX];
+
+    /* submitblock channel (parent RPC thread -> download worker), same
+     * seq/ack discipline as the tx channel above. result: 1 = accepted
+     * (RPC returns null), 0 = BIP22 reason string in blk_submit_reason. */
+    volatile unsigned long long blk_submit_seq;
+    volatile unsigned long long blk_submit_ack;
+    volatile unsigned long      blk_submit_len;
+    volatile int                blk_submit_result;
+    char                        blk_submit_reason[64];
+    unsigned char               blk_submit_buf[RPC_BLKSUBMIT_MAX];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
