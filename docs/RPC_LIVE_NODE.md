@@ -764,3 +764,44 @@ which `asm/tests/.gitignore` ignores wholesale — so they died with the
 worktree and the suite broke in a fresh tree. They are regenerated
 (deterministic oracle bytes) and force-tracked: 30 KB of frozen KAT anchors
 that must never drift or go missing.
+
+## Slice 16 — subsystem 5 of 5: the external signer — (2026-08-26)
+`enumeratesigners` and `walletdisplayaddress` now speak Core's `-signer`
+protocol (HWI): the operator names a signing program with `signer=` in
+`bitcoin.conf`, and the node shells out to it — `<cmd> enumerate` for the
+device list, `<cmd> --fingerprint <fp> displayaddress --desc <descriptor>`
+to show an address on the device. With no signer configured, both answer
+Core's exact `Error: restart bitcoind with -signer=<cmd>`.
+
+The one sharp edge is quoting: the descriptor reaches a shell, and
+descriptors legitimately contain `()`, `'` and `#`. Every argument is
+single-quoted with embedded quotes rewritten via the POSIX `'\''` idiom.
+The test drives a fake HWI (a shell script written by the test) and asserts
+the descriptor comes back **byte-for-byte** — including a hostile one
+carrying `');echo pwned;'`, which must survive unexecuted. A device without
+a fingerprint is dropped from `enumeratesigners`, as Core drops it; a signer
+that exits nonzero or emits non-JSON produces an error naming what happened.
+`walletdisplayaddress` echoes the address the *signer* confirmed, not the
+one asked about — if the device shows something unexpected, the caller must
+see that.
+
+## The five subsystems: closed
+With this slice, everything the RPC surface once refused for want of a
+subsystem is either implemented or declined by design with the reasoning at
+the call site. What remains declined, and why, in one place:
+
+- **loadtxoutset** — every parity claim rests on locally-validated coins.
+- **bumpfee / psbtbumpfee / walletprocesspsbt** — RBF replacement and PSBT
+  field surgery; need the original tx's inputs (txindex) or per-input PSBT
+  editing the signer does not do.
+- **preciousblock / pruneblockchain / getblockfrompeer / addnode-family
+  mutators / setnetworkactive / ping / submitheader (unknown headers)** —
+  the forked download worker owns the peer legs, fork choice and the header
+  chain, with no parent-to-worker control channel.
+- **savemempool / importmempool** — no mempool.dat serialization.
+- **submitpackage / getmempoolcluster** — no package validation or cluster
+  mempool.
+- **encryptwallet + multi-wallet lifecycle + import/export family** — one
+  unencrypted single-seed wallet, loaded at startup.
+- **getopenrpcinfo / rpc.discover / exportasmap** — no OpenRPC document, no
+  asmap.
