@@ -1,15 +1,36 @@
 Synthesized feature-depth differential vs Core
-generated: 2026-08-26T09:48:55Z  elapsed: 0.0s
+generated: 2026-08-26T10:08:36Z  elapsed: 0.2s
 
-cases: 35  accept-parity ok: 35
+cases: 55  accept-parity ok: 55
 rule mutations: 95 (agree 95)
+interpreter probes: 7797 (agree 7797, of which Core accepts 5638)
 per feature (accept / mutations-agreed / divergences):
   cltv                     accept=1  mut_ok=3  div=0
   codesep                  accept=1  mut_ok=2  div=0
   csv                      accept=1  mut_ok=3  div=0
+  leafver/0xc2 unknown version, invalid script accept=1  mut_ok=0  div=0
   multisig-bare            accept=1  mut_ok=4  div=0
   multisig-p2sh            accept=1  mut_ok=4  div=0
   multisig-p2wsh           accept=1  mut_ok=3  div=0
+  opsuccess/126 alone      accept=1  mut_ok=0  div=0
+  opsuccess/129 alone      accept=1  mut_ok=0  div=0
+  opsuccess/131 alone      accept=1  mut_ok=0  div=0
+  opsuccess/134 alone      accept=1  mut_ok=0  div=0
+  opsuccess/137 alone      accept=1  mut_ok=0  div=0
+  opsuccess/138 alone      accept=1  mut_ok=0  div=0
+  opsuccess/141 alone      accept=1  mut_ok=0  div=0
+  opsuccess/142 alone      accept=1  mut_ok=0  div=0
+  opsuccess/149 alone      accept=1  mut_ok=0  div=0
+  opsuccess/153 alone      accept=1  mut_ok=0  div=0
+  opsuccess/186 is NOT OP_SUCCESS (must fail) accept=1  mut_ok=0  div=0
+  opsuccess/187 after OP_RETURN accept=1  mut_ok=0  div=0
+  opsuccess/187 alone      accept=1  mut_ok=0  div=0
+  opsuccess/187 inside an unexecuted OP_IF accept=1  mut_ok=0  div=0
+  opsuccess/187 then a truncated PUSHDATA accept=1  mut_ok=0  div=0
+  opsuccess/200 alone      accept=1  mut_ok=0  div=0
+  opsuccess/254 alone      accept=1  mut_ok=0  div=0
+  opsuccess/80 alone       accept=1  mut_ok=0  div=0
+  opsuccess/98 alone       accept=1  mut_ok=0  div=0
   p2sh-p2wpkh              accept=1  mut_ok=2  div=0
   p2sh-p2wsh               accept=1  mut_ok=3  div=0
   sighash-legacy-ALL       accept=1  mut_ok=2  div=0
