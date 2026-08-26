@@ -159,8 +159,14 @@ int main(void){
       memset(&o, 0, sizeof o);
       char msg[64];
       ck("csi_rpc_run serves", csi_rpc_run(1, &o, msg, sizeof msg) == 1);
-      ck("...same digest and counters", o.muhash_valid && memcmp(o.muhash, d_idx, 32) == 0
-                                        && o.txouts == tx && o.total_amount == amt);
+      /* the adapter REVERSES for presentation (Core's printed order --
+       * pinned after the first live parity check read identical digests as
+       * a mismatch) */
+      unsigned char d_rev[32];
+      for (int i = 0; i < 32; i++) d_rev[i] = d_idx[31 - i];
+      ck("...same digest (presentation order) and counters",
+         o.muhash_valid && memcmp(o.muhash, d_rev, 32) == 0
+         && o.txouts == tx && o.total_amount == amt);
     }
 
     printf("\n== 4: add-then-remove of the same coin nets out exactly ==\n");
