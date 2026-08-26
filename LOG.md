@@ -7,6 +7,35 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- relay grows up: orphan pool, parent fetch, re-announce, getdata service
+
+The receive-only relay becomes a real relay hop (daemon/tx_relay.c):
+
+ORPHAN POOL: out-of-order arrival is ordinary relay behaviour -- a child
+fetched before its parent was a "missing-inputs" reject and a refetch
+cycle. Now the -25 class parks the child (bounded: 256 txs / 2 MB /
+120 s TTL, oldest-evicted; a definitive non-missing reject frees the slot
+immediately), requests the missing parents on the same leg
+(MSG_WITNESS_TX, as every fetch here), and every accepted transaction
+sweeps the pool so multi-level chains cascade in -- the sweep re-runs with
+each newly accepted txid until a pass makes no progress.
+
+RE-ANNOUNCE: every relay accept (cascades included) queues its txid;
+once per worker rotation one inv per leg announces everything accepted
+since the last rotation, never back to a tx's own source. MSG_TX type --
+no BIP339 negotiation, so txid announcement is the correct dialect.
+
+GETDATA SERVICE: the drain answers MSG_TX / MSG_WITNESS_TX getdata from
+the pool (which stores the full witness serialization that validation
+consumed) and answers misses with notfound, so a peer's in-flight
+tracking is never left hanging. Block-type entries stay the serve path's
+business.
+
+Pinned in tests/test_tx_relay (35 checks): child-before-parent parks,
+requests the parent with the witness flag, and cascades in when the
+parent lands (real wallet-signed chain); pooled txs served byte-exact;
+misses notfound; announcements reach other legs and never the source.
+
 ## 2026-08-26 -- mempool admission now runs the CONSENSUS verifier (one engine, not two)
 
 The architectural close of today's whole incident family (#48/#49/#50 plus
