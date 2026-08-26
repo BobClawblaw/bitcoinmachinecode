@@ -38,6 +38,13 @@ long rpc_chain_tip_height(void);
  * getblockfilter can include the spent-prevout elements BIP158 requires.
  * Without it, filters are refused for every non-genesis block rather than
  * served missing elements. */
+/* Attach the snapshot-dump runner (daemon/utxo_setinfo_rpc.c) behind
+ * dumptxoutset. */
+void rpc_chain_set_utxodump(long (*run)(const char* path,
+        int (*hash_at)(long height, unsigned char out[32]),
+        long* out_height, unsigned long long* out_coins,
+        char* msg, unsigned long mcap));
+
 void rpc_chain_set_undo(long (*replay)(long height,
         int (*cb)(void*, const unsigned char*, unsigned int, unsigned long long,
                   unsigned int, unsigned char, const unsigned char*, unsigned short),
