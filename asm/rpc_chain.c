@@ -3266,6 +3266,17 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
  * index is enabled, the result is an empty object (an optional index_name
  * filter cannot match anything either). The block/UTXO index that IS present
  * is core chainstate, not one of getindexinfo's optional indexes. */
+/* The coinstats-index fast path (daemon/coinstats_index.c, via the daemon's
+ * adapter): same out-contract as the walk. Tried FIRST; returns 1 with the
+ * running state (instant), or 0 meaning "no valid index -- walk instead".
+ * Coverage semantics are identical: both describe the UTXO APPLIED height. */
+static long (*g_csi_run)(int, void*, char*, unsigned long);
+void rpc_chain_set_coinstats(long (*run)(int, void*, char*, unsigned long)){
+    g_csi_run = run;
+}
+static long (*g_csi_h)(void);           /* light height probe for getindexinfo */
+void rpc_chain_set_coinstats_height(long (*fn)(void)){ g_csi_h = fn; }
+
 static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     /* Core does not type-check the arg -- it returns {} for a non-matching
@@ -3290,6 +3301,19 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
         rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txindex", e);
+    }
+    if (g_csi_h && (!want || !strcmp(want, "coinstatsindex"))){
+        long ch = g_csi_h();
+        if (ch >= 0){
+            rj_val* e = rj_obj();
+            long tip = refresh();
+            /* "synced" against the UTXO applied height would always be true
+             * by construction; against the CHAIN tip it reports whether the
+             * apply loop itself is caught up -- the honest reading. */
+            rj_obj_set(e, "synced", rj_bool(tip >= 0 && ch >= tip));
+            rj_obj_set(e, "best_block_height", rj_numf("%ld", ch));
+            rj_obj_set(o, "coinstatsindex", e);
+        }
     }
     *res = o;
     return 1;
@@ -3331,10 +3355,12 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
             snprintf(embuf, sizeof embuf, "'%s' is not a valid hash_type", ht);
             *ec = -8; *em = embuf; return 0; }
     }
-    if (!g_usi_run){ *ec = -1; *em = "UTXO set info unavailable in this process"; return 0; }
+    if (!g_usi_run && !g_csi_run){ *ec = -1; *em = "UTXO set info unavailable in this process"; return 0; }
     rpc_usi_out_t o; memset(&o, 0, sizeof o);
     static char msg[256];
-    long r = g_usi_run(want_muhash, &o, msg, sizeof msg);
+    long r = 0;
+    if (g_csi_run) r = g_csi_run(want_muhash, &o, msg, sizeof msg);
+    if (r != 1 && g_usi_run) r = g_usi_run(want_muhash, &o, msg, sizeof msg);
     if (r == 0){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set busy"); *em = embuf; return 0; }
     if (r != 1){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set read failed"); *em = embuf; return 0; }
     rj_val* out = rj_obj();
