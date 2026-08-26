@@ -860,6 +860,10 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         close(fd);
         return -1;
     }
+    /* the peer's version told us how it sees US -- feed the self-address
+     * tally (daemon/addr_self.c) */
+    { extern void addrself_note_peer_view(const unsigned char*, long);
+      addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
     /* handshake done: tighten the recv bound so each node_sync pass returns
      * promptly when the peer is already at the chain tip */
     struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
@@ -2314,6 +2318,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
     }
 
+    { extern void addrself_init(unsigned short, int);
+      addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
     /* txid-index tail: establish coverage and close the gap between the
      * offline base build (or the previous run's tail) and the current tip.
      * After the archive verify -- a repair may have truncated heights the
@@ -2572,6 +2578,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
             int hk=node_handshake(cfd[i]);
             if(hk!=1 || !peer_has_witness(srcpool[i])){ close(cfd[i]); continue; }
+            { extern void addrself_note_peer_view(const unsigned char*, long);
+              addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
             mux_out_fd[mux_n_out]=cfd[i];
@@ -3042,6 +3050,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern long txrelay_announce(const int* fds, int nfds);
             txrelay_announce(mux_out_fd, mux_n_out);
         }
+        { extern long addrself_maybe_announce(const int*, int);
+          addrself_maybe_announce(mux_out_fd, mux_n_out); }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would
