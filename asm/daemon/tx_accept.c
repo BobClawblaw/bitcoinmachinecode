@@ -135,6 +135,13 @@ extern size_t mpool_policy_state_size(unsigned n);
 extern void   mpool_policy_state_init(void* st, unsigned n);
 extern long   mpool_count(void* mp);
 extern void   mempool_note_accept(const unsigned char txid[32]); /* daemon/mempool_cfg.c */
+/* daemon/zmq_notify.c. Staged on BOTH accept paths, right beside
+ * mempool_note_accept, because those two calls together are what "this node
+ * now holds this transaction" MEANS -- a notification fired from anywhere
+ * else could announce a transaction the mempool does not actually hold. A
+ * no-op when ZMQ is unconfigured, and safe in the serve children. */
+extern void   zmqn_tx_accepted(const unsigned char txid[32], const unsigned char* tx,
+                               unsigned long txlen);
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const u8* tx, unsigned long txlen,
                                const u8 txid[32], void* utxo);
@@ -231,6 +238,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
      * format has no timestamp field, so this parallel record is what makes
      * expiry possible without changing the slot layout. */
     mempool_note_accept(txid);
+    zmqn_tx_accepted(txid, tx, txlen);
     return 1;
 }
 
@@ -264,6 +272,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
         return -26;
     }
     mempool_note_accept(txid);
+    zmqn_tx_accepted(txid, tx, txlen);
     return 1;
 }
 
