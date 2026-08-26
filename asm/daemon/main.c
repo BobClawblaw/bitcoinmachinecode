@@ -164,6 +164,9 @@ extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_st
 extern int  zmqpub_add(const char* topic, const char* addr);
 extern int  zmqpub_active(void);
 extern void zmqpub_poll(void);
+extern void txit_boot(void* store_buf);                                       /* daemon/tx_index_tail.c */
+extern int  txit_active(void);
+extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void zmqpub_notify(const char* topic, const void* body, unsigned long blen);
 extern void zmqn_set_status(node_status_t* st);
 extern int  zmqn_drain(void);
@@ -239,6 +242,11 @@ static void rebuild_hash_index_after_reorg(void){
         fprintf(stderr,"[reorg] WARNING: hash index rebuild failed; block-by-hash serving is degraded until restart\n");
     else
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
+    /* the txid-index tail's covered-height watermark must follow a
+     * truncation too, or the reconnected blocks would be skipped as
+     * already-indexed (fires with tip == fork height on the mid-reorg
+     * invocation; the post-reconnect invocation is a no-op) */
+    { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
 }
 
 /* Build the hash->height index from the IN-MEMORY store (used where the chain
@@ -2201,11 +2209,29 @@ static unsigned long long txsub_last_seq = 0;
 static unsigned long long ctl_last_seq = 0;
 static unsigned long long blksub_last_seq = 0;
 
+/* The pool the worker's accepts land in: the cross-process SHARED pool
+ * (mempool_configure, pre-fork) when it exists, else the private fallback.
+ * Until 2026-08-26 this was unconditionally the private txsub_mp_area --
+ * which meant a sendrawtransaction accepted here was INVISIBLE to the
+ * parent's getrawmempool/getmempoolinfo (they read mp_ext_area via
+ * rpc_mempool_hooks below): the submission path predates the shared pool
+ * and was never re-pointed at it. The asm serve children already prefer
+ * mp_ext_area (bitcoin_serve.asm's .mp_external); this makes the worker
+ * consistent with them. */
+static void* txsub_pool(void){
+    extern void* mp_ext_area;
+    return mp_ext_area ? mp_ext_area : (void*)txsub_mp_area;
+}
+
 /* Lazy one-time init of the worker's tx-accept path. Returns 1 ready, 0 not. */
 static int txsub_worker_ready(void){
+    extern void* mp_ext_area;
     if (txsub_ready) return txsub_ready == 1;
     if (!tx_dispatch_init() || !tx_policy_init()){ txsub_ready = -1; return 0; }
-    mpool_init(txsub_mp_area, TXSUB_MP_SLOTS, txsub_mp_blob, sizeof txsub_mp_blob);
+    /* the shared pool was mpool_init'ed pre-fork (mp_ext_inited=1); only
+     * the private fallback still needs its init here */
+    if (!mp_ext_area)
+        mpool_init(txsub_mp_area, TXSUB_MP_SLOTS, txsub_mp_blob, sizeof txsub_mp_blob);
     txsub_ready = 1;
     return 1;
 }
@@ -2268,6 +2294,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             fprintf(stderr,"[dl] archive INTEGRITY CHECK FAILED and was not repaired -- continuing WITHOUT live UTXO tracking\n");
         }
     }
+
+    /* txid-index tail: establish coverage and close the gap between the
+     * offline base build (or the previous run's tail) and the current tip.
+     * After the archive verify -- a repair may have truncated heights the
+     * tail would otherwise trust. No base index => logs once and disables. */
+    if(archive_ok) txit_boot(store_buf);
 
     fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
     phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
@@ -2680,14 +2712,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 tscratch, sizeof tscratch)){
                         result=-22; snprintf(reason,sizeof reason,"TX decode failed");
                     } else {
-                        result = (int)tx_accept_test_reason(txsub_mp_area, tid,
+                        result = (int)tx_accept_test_reason(txsub_pool(), tid,
                                      (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                      reason, sizeof reason, &fee);
                     }
                     g_node_status->tx_submit_fee = fee;
                 }
                 else { int relayed=0;
-                    result = txsub_accept_and_relay(txsub_mp_area,
+                    result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
                     if(result==1) fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs\n", relayed, mux_n_out);
@@ -2860,6 +2892,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 mux_next_peer(i, srcpool, nsrc, out_port);
             }
             did |= (n>0)?1:0;
+            /* ---- transaction relay (receive side) -------------------------
+             * Peers announce txs on these full-relay legs (we advertise
+             * relay=1) and node_sync_multi's drains discard every inv
+             * unexamined -- so until 2026-08-26 the production mempool had
+             * never held a single P2P transaction. Drain the leg's buffered
+             * messages here, between sync passes: request announced txs
+             * (MSG_WITNESS_TX -- type 1 would hand back witness-stripped
+             * serializations, incident #10's exact bug shape) and run the
+             * replies through the same tx_accept_validate the inbound path
+             * uses, into the SHARED pool so the parent's mempool RPCs see
+             * them. Cost when nothing is buffered: one empty poll(2). */
+            if(mux_out_fd[i]>=0 && !mux_sync_budget_fired && txsub_worker_ready()){
+                extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+                long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                if(acc>0){
+                    extern long mpool_count(void*);
+                    fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
+                            i, mux_out_host[i], acc, mpool_count(txsub_pool()));
+                }
+            }
             /* ---- STAGE B: periodic fork probe -----------------------------
              * Runs only on a leg that just returned NOTHING, which is exactly
              * the situation a fork hides in: if the peer is on a competing
@@ -3009,17 +3061,18 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
                 }
-                /* ZMQ hashblock/rawblock. Published from this same choke
-                 * point for the same reason the log line is: it fires no
-                 * matter which path appended the block.
+                /* ZMQ hashblock/rawblock + the txid-index tail, from this
+                 * same choke point for the same reason the log line is: it
+                 * fires no matter which path appended the block.
                  *
-                 * EVERY new block is published, not just the tip. A catch-up
+                 * EVERY new block is handled, not just the tip. A catch-up
                  * burst advances the tip by many blocks at once, and a
                  * subscriber that received only the last one would silently
                  * miss the rest -- Core notifies per connected block, so this
                  * must too. The loop is bounded by the burst size and reads
-                 * each block from the archive it was just written to. */
-                if (zmqpub_active()){
+                 * each block ONCE from the archive it was just written to,
+                 * feeding both consumers. */
+                if (zmqpub_active() || txit_active()){
                     static unsigned char zb[RPC_BLKSUBMIT_MAX];
                     for (int zh = last_seen_tip + 1; zh <= now_tip; zh++){
                         long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
@@ -3027,6 +3080,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
                             continue;
                         }
+                        /* txindex tail: append this block's txid records so
+                         * getrawtransaction-by-txid keeps up with the tip
+                         * (idempotent by height -- a replayed height is a
+                         * no-op) */
+                        txit_on_block(store_buf, zh, zb, bl);
+                        if (!zmqpub_active()) continue;
                         /* The block HASH is sha256d over the 80-byte
                          * header, REVERSED: Core's notifier flips the bytes
                          * (data[31-i] = hash.begin()[i]) so the hashblock

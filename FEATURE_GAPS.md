@@ -250,8 +250,13 @@ plus straightforward methods on top of it.
 
 ## Indexing
 
-- **`txindex`** — explicitly ignored (confirmed this session);
-  `getrawtransaction` by bare txid won't work.
+- ~~**`txindex`** — explicitly ignored; `getrawtransaction` by bare txid
+  won't work.~~ — **DONE 2026-08-26**: offline base build
+  (`daemon/build_tx_index`, ~29 GB, 8-byte prefix keys exact-by-
+  verification) + daemon-maintained incremental tail
+  (`daemon/tx_index_tail.c`) that backfills at boot and follows the tip, so
+  `getrawtransaction <txid>` works with no block hash and `getindexinfo`
+  reports the real combined coverage.
 - **Address index** — `build_addr_index.c` exists but is a **standalone
   offline batch tool only**, zero references from `daemon/main.c`'s live
   boot path. Not a live, queryable index.
@@ -359,10 +364,15 @@ not just present as unused/tested-in-isolation code:
   *stripped* and the archive held 482k witness-less bodies (incident #10,
   `LOG.md`); the server side also ignored `MSG_WITNESS_*` requests, so this
   node could not serve blocks to a modern peer. Now requests and serves
-  `MSG_WITNESS_BLOCK`. **Remaining:** prefer/require `NODE_WITNESS` (0x8)
-  peers; serve the stripped form to a bare `MSG_BLOCK` request; and
-  **`MSG_WITNESS_TX` for transaction relay** — the mempool path still fetches
-  transactions without witnesses (same bug shape, not yet hit).
+  `MSG_WITNESS_BLOCK`. ~~`MSG_WITNESS_TX` for transaction relay~~ — **DONE
+  2026-08-26** with the receive-side tx relay (`daemon/tx_relay.c`, LOG
+  slice-20 entry): announced transactions are now actually fetched (they
+  were previously discarded unread), and fetched witness-complete.
+  **Remaining:** prefer/require `NODE_WITNESS` (0x8) peers; serve the
+  stripped form to a bare `MSG_BLOCK` request; BIP339 `wtxidrelay`; and
+  re-announcing relay-received transactions onward (receive-only today —
+  user-originated txs are pushed to all legs by the sendrawtransaction
+  path).
 - **Thread stacks / sighash buffers — FIXED 2026-08-22** (`9445268`): every
   daemon thread now gets an explicit 64 MB stack (`bmc_thread.h`,
   `BMC_THREAD_STACK_MB`); BIP143/BIP341 midstate hashes use bounded per-thread
