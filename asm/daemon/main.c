@@ -2334,13 +2334,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * validation stays on its (unavailable-shaped) fallback and rejects. */
     if (utxo_live_ok){
         typedef long (*txacc_resolver_t)(const unsigned char*, unsigned long,
-                                         unsigned long long*, const unsigned char**,
+                                         unsigned long long*, unsigned long*,
+                                         unsigned long*, const unsigned char**,
                                          unsigned long*);
         extern void tx_accept_set_resolver(txacc_resolver_t);
         extern long utxo_live_resolve(const unsigned char*, unsigned long,
-                                      unsigned long long*, const unsigned char**,
+                                      unsigned long long*, unsigned long*,
+                                      unsigned long*, const unsigned char**,
                                       unsigned long*);
+        extern void tx_accept_set_tip(long);
         tx_accept_set_resolver(utxo_live_resolve);
+        tx_accept_set_tip(*(int*)(store_buf+24));
     }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
@@ -3142,6 +3146,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     }
                 }
             }
+            /* keep mempool admission's maturity/flag anchor on the tip --
+             * unconditionally, not only when a publisher is active */
+            { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
             last_seen_tip = now_tip;
         }
         /* Drain transactions staged by the serve children (and by this
