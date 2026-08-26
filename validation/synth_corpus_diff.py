@@ -35,7 +35,7 @@ class this project cares about.
 Usage:  synth_corpus_diff.py [--only feature] [--seed S] [--oracle P] [--shim P]
 Exit 0 iff zero divergences. Writes synth_corpus_diff_report.{json,txt}.
 """
-import sys, os, json, time, hashlib, argparse
+import sys, os, json, time, hashlib, argparse, random
 import coincurve
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -253,8 +253,14 @@ class Case:
     """One synthesized spend and its mutations, in the shape verify_line reads.
     kind drives the verb: 'legacy'->VERIFY, 'v0'->WITVERIFY, 'v1'->TAPVERIFY."""
     def __init__(self, feature, kind, flags, spk_hex, tx_hex, ss_hex, amount,
-                 prevouts, idx=0):
+                 prevouts, idx=0, expect_accept=True):
         self.feature = feature
+        # Most synthesized spends must be ACCEPTED by Core (that is what
+        # validates the construction). A few are deliberately invalid -- e.g.
+        # an opcode just outside the OP_SUCCESS range, which proves the range
+        # boundary is real rather than a blanket accept -- and those assert
+        # agreement on REJECTION instead.
+        self.expect_accept = expect_accept
         self.d = {'kind': kind, 'idx': idx, 'flags': flags,
                   'tx_hex': tx_hex, 'ss_hex': ss_hex, 'scriptsig_hex': ss_hex,
                   'spk_hex': spk_hex, 'amount': amount, 'prevouts': prevouts,
@@ -468,6 +474,226 @@ def synth_taproot_scriptpath(with_annex):
     return c
 
 # ============================================================================
+# INTERPRETER SURFACE: bare-script probes where AGREEMENT is the assertion
+# ============================================================================
+# The spend synthesizers above must be ACCEPTED by Core to be meaningful. These
+# are different: most are deliberately invalid, and what matters is only that
+# both engines reach the SAME verdict -- a disagreement is a consensus
+# difference whichever way it points. That lets this section cover hundreds of
+# interpreter edges cheaply, including the arithmetic/comparison surface where
+# this project's ORIGINAL false accept (the SETcc byte-width bug) lived.
+
+class ScriptCase:
+    def __init__(self, name, spk, ss=b'', flags=None, expect=None):
+        self.name = name
+        self.spk = spk
+        self.ss = ss
+        self.flags = F_ALL if flags is None else flags
+        self.expect = expect      # optional: what Core SHOULD say (documents intent)
+
+# a fixed 1-in/1-out frame; no CHECKSIG runs in these probes, so its content
+# is irrelevant to the verdict -- only the scripts matter
+_IP_TX = serialize_tx(1, [(outpoint(0), b'', 0xffffffff)], [(DEST_VAL, DEST_SPK)], 0)
+
+def ip_line(c, engine):
+    # An EMPTY scriptSig must not be sent as an empty field: the shim splits on
+    # whitespace with strtok_r, which collapses runs of spaces, so an empty
+    # token would shift every later field left and the scriptPubKey would be
+    # read as the scriptSig. That produced a wall of phantom "divergences" on
+    # the first run of this sweep -- every probe with no scriptSig. "-" is the
+    # placeholder the shim already understands (it decodes to zero bytes).
+    ss = c.ss.hex() if c.ss else '-'
+    return 'VERIFY %08x %d %s %s %s' % (c.flags, 0, _IP_TX.hex(), ss, c.spk.hex())
+
+# --- opcode constants used below -------------------------------------------
+OP_1=0x51  # == OP_TRUE
+OP_1NEGATE=0x4f; OP_RESERVED=0x50; OP_NOP=0x61; OP_VER=0x62
+OP_IF=0x63; OP_NOTIF=0x64; OP_VERIF=0x65; OP_VERNOTIF=0x66
+OP_ELSE=0x67; OP_ENDIF=0x68; OP_VERIFY=0x69; OP_RETURN=0x6a
+OP_TOALTSTACK=0x6b; OP_2DUP=0x6e; OP_DROP2=0x6d
+OP_DUP2=0x6e; OP_DEPTH=0x74; OP_NIP=0x77; OP_OVER=0x78; OP_SWAP=0x7c
+OP_SIZE=0x82
+OP_EQUALVERIFY_=0x88
+OP_1ADD=0x8b; OP_1SUB=0x8c; OP_2MUL=0x8d; OP_2DIV=0x8e
+OP_NEGATE=0x8f; OP_ABS=0x90; OP_NOT=0x91; OP_0NOTEQUAL=0x92
+OP_ADD=0x93; OP_SUB=0x94; OP_MUL=0x95; OP_DIV=0x96; OP_MOD=0x97
+OP_LSHIFT=0x98; OP_RSHIFT=0x99
+OP_BOOLAND=0x9a; OP_BOOLOR=0x9b; OP_NUMEQUAL=0x9c; OP_NUMEQUALVERIFY=0x9d
+OP_NUMNOTEQUAL=0x9e; OP_LESSTHAN=0x9f; OP_GREATERTHAN=0xa0
+OP_LESSTHANOREQUAL=0xa1; OP_GREATERTHANOREQUAL=0xa2; OP_MIN=0xa3; OP_MAX=0xa4
+OP_WITHIN=0xa5
+OP_CAT=0x7e; OP_SUBSTR=0x7f; OP_LEFT=0x80; OP_RIGHT=0x81
+OP_INVERT=0x83; OP_AND=0x84; OP_OR=0x85; OP_XOR=0x86
+OP_NOP1=0xb0; OP_NOP4=0xb3; OP_NOP10=0xb9
+OP_PUSHDATA1=0x4c; OP_PUSHDATA2=0x4d
+
+DISABLED = [('OP_CAT',OP_CAT),('OP_SUBSTR',OP_SUBSTR),('OP_LEFT',OP_LEFT),
+            ('OP_RIGHT',OP_RIGHT),('OP_INVERT',OP_INVERT),('OP_AND',OP_AND),
+            ('OP_OR',OP_OR),('OP_XOR',OP_XOR),('OP_2MUL',OP_2MUL),
+            ('OP_2DIV',OP_2DIV),('OP_MUL',OP_MUL),('OP_DIV',OP_DIV),
+            ('OP_MOD',OP_MOD),('OP_LSHIFT',OP_LSHIFT),('OP_RSHIFT',OP_RSHIFT)]
+
+# The operand spread: sign boundaries, byte-width boundaries (where a wrong
+# SETcc/movzx width shows up), and the CScriptNum 4-byte ceiling.
+IP_NUMS = [0, 1, -1, 2, -2, 16, 17, -17, 127, 128, -128, 129, 255, 256, -256,
+           32767, 32768, -32768, 65535, 65536, 8388607, 8388608, -8388608,
+           2147483647, -2147483647]
+
+BINOPS = [('ADD',OP_ADD),('SUB',OP_SUB),('BOOLAND',OP_BOOLAND),('BOOLOR',OP_BOOLOR),
+          ('NUMEQUAL',OP_NUMEQUAL),('NUMNOTEQUAL',OP_NUMNOTEQUAL),
+          ('LESSTHAN',OP_LESSTHAN),('GREATERTHAN',OP_GREATERTHAN),
+          ('LESSTHANOREQUAL',OP_LESSTHANOREQUAL),
+          ('GREATERTHANOREQUAL',OP_GREATERTHANOREQUAL),
+          ('MIN',OP_MIN),('MAX',OP_MAX)]
+UNOPS  = [('1ADD',OP_1ADD),('1SUB',OP_1SUB),('NEGATE',OP_NEGATE),('ABS',OP_ABS),
+          ('NOT',OP_NOT),('0NOTEQUAL',OP_0NOTEQUAL)]
+
+def interpreter_cases(rng):
+    cs = []
+    A = cs.append
+
+    # ---- 1. arithmetic / comparison sweep (the SETcc surface) ----
+    # <a> <b> OP  -- VerifyScript accepts iff CastToBool(result) is true, so
+    # the verdict encodes the result's truthiness. A byte-width or sign error
+    # in any of these flips it for some operand pair.
+    for nm, op in BINOPS:
+        for a in IP_NUMS:
+            for b in IP_NUMS:
+                A(ScriptCase('bin/%s(%d,%d)' % (nm, a, b),
+                             push_num(a) + push_num(b) + bytes([op])))
+    for nm, op in UNOPS:
+        for a in IP_NUMS:
+            A(ScriptCase('un/%s(%d)' % (nm, a), push_num(a) + bytes([op])))
+    # OP_WITHIN is ternary and its boundary handling is exactly the kind of
+    # off-by-one a comparison bug produces
+    for a in (0, 1, -1, 127, 128, 2147483647):
+        for lo in (0, 1, 128):
+            for hi in (0, 1, 128, 2147483647):
+                A(ScriptCase('within(%d,%d,%d)' % (a, lo, hi),
+                             push_num(a) + push_num(lo) + push_num(hi) + bytes([OP_WITHIN])))
+
+    # ---- 2. CScriptNum limits ----
+    # 4 bytes is the arithmetic ceiling; a 5-byte operand must fail even
+    # though it is a perfectly legal PUSH.
+    A(ScriptCase('num/5-byte operand rejected',
+                 pushdata(b'\x01\x02\x03\x04\x05') + bytes([OP_1ADD]), expect=0))
+    A(ScriptCase('num/4-byte operand ok',
+                 pushdata(b'\x01\x02\x03\x04') + bytes([OP_1ADD])))
+    # non-minimally encoded numbers are still ACCEPTED as arithmetic input
+    # under consensus flags (MINIMALDATA is policy) -- both engines must agree
+    A(ScriptCase('num/negative zero 0x80', pushdata(b'\x80') + bytes([OP_NOT])))
+    A(ScriptCase('num/padded 0x0100', pushdata(b'\x01\x00') + bytes([OP_1ADD])))
+
+    # ---- 3. disabled opcodes: fail EVEN IN AN UNEXECUTED BRANCH ----
+    # Core checks these before the fExec gate (interpreter.cpp, CVE-2010-5137),
+    # which is the subtle part: an implementation that only rejects them when
+    # reached would accept scripts Core rejects.
+    for nm, op in DISABLED:
+        A(ScriptCase('disabled/%s executed' % nm, bytes([op]), expect=0))
+        A(ScriptCase('disabled/%s in unexecuted OP_IF branch' % nm,
+                     bytes([OP_0, OP_IF, op, OP_ENDIF, OP_TRUE]), expect=0))
+
+    # ---- 4. always-invalid opcodes (also pre-fExec) ----
+    for nm, op in (('OP_VERIF', OP_VERIF), ('OP_VERNOTIF', OP_VERNOTIF)):
+        A(ScriptCase('badop/%s executed' % nm, bytes([op]), expect=0))
+        A(ScriptCase('badop/%s unexecuted' % nm,
+                     bytes([OP_0, OP_IF, op, OP_ENDIF, OP_TRUE]), expect=0))
+    A(ScriptCase('badop/OP_RESERVED executed', bytes([OP_RESERVED]), expect=0))
+    A(ScriptCase('badop/OP_RESERVED unexecuted is FINE',
+                 bytes([OP_0, OP_IF, OP_RESERVED, OP_ENDIF, OP_TRUE]), expect=1))
+    A(ScriptCase('badop/OP_VER unexecuted is FINE',
+                 bytes([OP_0, OP_IF, OP_VER, OP_ENDIF, OP_TRUE]), expect=1))
+
+    # ---- 5. OP_RETURN ----
+    A(ScriptCase('return/executed', bytes([OP_RETURN]), expect=0))
+    A(ScriptCase('return/unexecuted branch still fails',
+                 bytes([OP_0, OP_IF, OP_RETURN, OP_ENDIF, OP_TRUE]), expect=1))
+
+    # ---- 6. conditionals ----
+    A(ScriptCase('cond/IF without ENDIF', bytes([OP_1, OP_IF, OP_TRUE]), expect=0))
+    A(ScriptCase('cond/ENDIF without IF', bytes([OP_1, OP_ENDIF]), expect=0))
+    A(ScriptCase('cond/ELSE without IF', bytes([OP_1, OP_ELSE, OP_TRUE]), expect=0))
+    A(ScriptCase('cond/double ELSE', bytes([OP_1, OP_IF, OP_TRUE, OP_ELSE, OP_TRUE,
+                                            OP_ELSE, OP_TRUE, OP_ENDIF]), expect=1))
+    A(ScriptCase('cond/IF on empty stack', bytes([OP_IF, OP_TRUE, OP_ENDIF]), expect=0))
+    A(ScriptCase('cond/nested IF taken', bytes([OP_1, OP_IF, OP_1, OP_IF, OP_TRUE,
+                                                OP_ENDIF, OP_ENDIF]), expect=1))
+    A(ScriptCase('cond/NOTIF inverts', bytes([OP_0, OP_NOTIF, OP_TRUE, OP_ENDIF]), expect=1))
+
+    # ---- 7. stack limits and underflow ----
+    A(ScriptCase('stack/underflow OP_ADD', bytes([OP_1, OP_ADD]), expect=0))
+    A(ScriptCase('stack/underflow OP_DUP on empty', bytes([OP_DUP]), expect=0))
+    A(ScriptCase('stack/empty stack at end', b'', expect=0))
+    A(ScriptCase('stack/false on top', bytes([OP_0]), expect=0))
+    # 520-byte element limit: 520 is legal, 521 is not
+    A(ScriptCase('stack/520-byte push ok', pushdata(b'\x2a' * 520) + bytes([OP_TRUE])))
+    A(ScriptCase('stack/521-byte push rejected',
+                 pushdata(b'\x2a' * 521) + bytes([OP_TRUE]), expect=0))
+    # 1000-element stack ceiling
+    A(ScriptCase('stack/1000 elements ok', bytes([OP_1]) * 999 + bytes([OP_TRUE])))
+    A(ScriptCase('stack/1001 elements rejected',
+                 bytes([OP_1]) * 1001 + bytes([OP_TRUE]), expect=0))
+
+    # ---- 8. the 201-opcode limit (counts UNEXECUTED opcodes too) ----
+    A(ScriptCase('opcount/201 non-push ok', bytes([OP_1]) + bytes([OP_NOP]) * 200 + bytes([OP_TRUE])))
+    A(ScriptCase('opcount/202 non-push rejected',
+                 bytes([OP_1]) + bytes([OP_NOP]) * 202 + bytes([OP_TRUE]), expect=0))
+    A(ScriptCase('opcount/unexecuted opcodes still count',
+                 bytes([OP_0, OP_IF]) + bytes([OP_NOP]) * 202 + bytes([OP_ENDIF, OP_TRUE]),
+                 expect=0))
+
+    # ---- 9. upgradable NOPs: fine under consensus flags ----
+    for nm, op in (('NOP1', OP_NOP1), ('NOP4', OP_NOP4), ('NOP10', OP_NOP10)):
+        A(ScriptCase('nop/%s is a no-op under consensus flags' % nm,
+                     bytes([OP_1, op]), expect=1))
+
+    # ---- 10. push encodings (all legal under consensus flags) ----
+    A(ScriptCase('push/PUSHDATA1 non-minimal is legal (MINIMALDATA is policy)',
+                 bytes([OP_PUSHDATA1, 1, 1]), expect=1))
+    A(ScriptCase('push/PUSHDATA2 non-minimal is legal',
+                 bytes([OP_PUSHDATA2, 1, 0, 1]), expect=1))
+    A(ScriptCase('push/truncated PUSHDATA1 rejected', bytes([OP_PUSHDATA1, 5, 1]), expect=0))
+    A(ScriptCase('push/push past end of script', bytes([0x05, 1, 2]), expect=0))
+    A(ScriptCase('push/OP_1NEGATE then ABS', bytes([OP_1NEGATE, OP_ABS]), expect=1))
+
+    # ---- 11. size / equality ----
+    A(ScriptCase('misc/OP_SIZE of empty is 0 -> false',
+                 bytes([OP_0, OP_SIZE]), expect=0))
+    A(ScriptCase('misc/OP_EQUAL on equal pushes',
+                 pushdata(b'abc') + pushdata(b'abc') + bytes([OP_EQUAL]), expect=1))
+    A(ScriptCase('misc/OP_EQUAL on different pushes',
+                 pushdata(b'abc') + pushdata(b'abd') + bytes([OP_EQUAL]), expect=0))
+    A(ScriptCase('misc/OP_DEPTH on empty', bytes([OP_DEPTH]), expect=0))
+    A(ScriptCase('misc/OP_VERIFY consumes truth',
+                 bytes([OP_1, OP_1, OP_VERIFY]), expect=1))
+    A(ScriptCase('misc/OP_VERIFY on false fails', bytes([OP_1, OP_0, OP_VERIFY]), expect=0))
+    return cs
+
+def run_script_case(c, core, asm, res):
+    res['ip_cases'] += 1
+    lc = ip_line(c, 'core'); la = ip_line(c, 'asm')
+    c_ok, c_err = core.ask(lc); a_ok, a_err = asm.ask(la)
+    if c_ok in ('unsupported', None) or a_ok in ('unsupported', None):
+        res['engine_fail'].append({'feature': 'interp:' + c.name,
+                                   'core': c_ok, 'asm': a_ok})
+        return
+    if c.expect is not None and c_ok != c.expect:
+        # The probe does not test what its name claims -- report it rather
+        # than let a mislabelled case pass as coverage.
+        res['ip_mislabelled'].append({'name': c.name, 'core': c_ok,
+                                      'expected': c.expect})
+    if c_ok == a_ok:
+        res['ip_agree'] += 1
+        if c_ok == 1: res['ip_accept'] += 1
+    else:
+        rec = {'feature': 'interp:' + c.name, 'core': c_ok, 'asm': a_ok,
+               'core_err': c_err, 'asm_err': a_err,
+               'spk': c.spk.hex()[:120], 'ss': c.ss.hex()[:80]}
+        res['mut_div'].append(rec)
+        if a_ok == 1 and c_ok == 0:
+            res['false_accept'].append(rec)
+
+# ============================================================================
 # driving both engines
 # ============================================================================
 def line_for(d, engine, mutated_tx_hex=None, mutated_ss_hex=None, alt_spk=None):
@@ -518,6 +744,24 @@ def run_case(c, core, asm, res):
     if c_ok in ('unsupported', None) or a_ok in ('unsupported', None):
         res['engine_fail'].append({'feature': c.feature, 'phase': 'accept',
                                    'core': c_ok, 'asm': a_ok, 'line': la[:200]})
+        return
+    if not c.expect_accept:
+        # a deliberate negative: Core must REJECT, and the ASM must agree
+        if c_ok == 1:
+            res['synth_bad'].append({'feature': c.feature,
+                                     'note': 'expected Core to REJECT but it accepted',
+                                     'line': lc[:300]})
+            return
+        if c_ok == a_ok:
+            res['accept_ok'] += 1
+            res['by_feature'][c.feature]['accept'] += 1
+        else:
+            res['accept_div'].append({'feature': c.feature, 'core': c_ok, 'asm': a_ok,
+                                      'core_err': c_err, 'asm_err': a_err})
+            res['by_feature'][c.feature]['div'] += 1
+            if a_ok == 1:
+                res['false_accept'].append({'feature': c.feature, 'core': c_ok,
+                                            'asm': a_ok, 'core_err': c_err})
         return
     if c_ok != 1:
         # our construction is wrong -- fail LOUDLY, do not compare further
@@ -668,6 +912,76 @@ def synth_sighash_taproot(name, ht):
         c.add_mut('committed output value changed',
                   mutated_tx_hex=rebuild([sig], [(DEST_VAL + 1, DEST_SPK), outs[1]]))
     return c
+
+def synth_tapscript_raw(name, leaf_script, extra_stack=(), leaf_ver=0xc0, annex=None,
+                        expect_accept=True):
+    """A taproot script-path spend carrying an ARBITRARY leaf script.
+
+    No signature is produced, because the cases this serves do not need one:
+    BIP342's OP_SUCCESSx makes a tapscript succeed WITHOUT EXECUTING, and an
+    unknown leaf version succeeds after the commitment check alone. Those are
+    accept-direction rules -- an implementation that failed to honour them
+    would reject what Core accepts -- and they are unreachable from ordinary
+    signed spends, so they get built directly."""
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    d = coincurve.PrivateKey(bytes([0xC5]) * 32)
+    if d.public_key.format(True)[0] == 3:
+        d = coincurve.PrivateKey((N - int.from_bytes(d.secret, 'big')).to_bytes(32, 'big'))
+    ix = d.public_key.format(True)[1:]
+    leaf = tapleaf(leaf_script, leaf_ver)
+    Q = coincurve.PublicKey.combine_keys(
+        [coincurve.PublicKey(b'\x02' + ix),
+         coincurve.PrivateKey(tagged('TapTweak', ix + leaf)).public_key]).format(True)
+    ox, par = Q[1:], Q[0] & 1
+    spk = b'\x51\x20' + ox
+    seq = 0xffffffff
+    outs = [(DEST_VAL, DEST_SPK)]
+    control = bytes([leaf_ver | par]) + ix
+    items = list(extra_stack) + [leaf_script, control]
+    if annex is not None: items.append(annex)
+    tx = serialize_tx(2, [(outpoint(0), b'', seq)], outs, 0, [items])
+    return Case(name, 'v1', F_ALL, spk.hex(), tx.hex(), '', IN_VAL, [(IN_VAL, spk.hex())],
+                expect_accept=expect_accept)
+
+# BIP342's OP_SUCCESSx set, taken from Core's IsOpSuccess (script.cpp) rather
+# than from memory: 80, 98, 126-129, 131-134, 137-138, 141-142, 149-153,
+# 187-254.
+def _op_success_values():
+    v = [80, 98]
+    for lo, hi in ((126,129),(131,134),(137,138),(141,142),(149,153),(187,254)):
+        v += list(range(lo, hi + 1))
+    return v
+
+def tapscript_cases():
+    """OP_SUCCESSx and unknown-leaf-version: both ACCEPT-direction rules."""
+    cs = []
+    ops = _op_success_values()
+    # a spread across every disjoint range, not just one representative
+    for op in (80, 98, 126, 129, 131, 134, 137, 138, 141, 142, 149, 153, 187, 200, 254):
+        assert op in ops
+        c = synth_tapscript_raw('opsuccess/%d alone' % op, bytes([op]))
+        cs.append(c)
+    # OP_SUCCESS wins even when the rest of the script is UNPARSEABLE: the
+    # scan is over raw bytes and happens before any parsing.
+    cs.append(synth_tapscript_raw('opsuccess/187 then a truncated PUSHDATA',
+                                  bytes([187, 0x4c, 0x7f, 0x01])))
+    # ...and even when it sits in a branch that would never execute
+    cs.append(synth_tapscript_raw('opsuccess/187 inside an unexecuted OP_IF',
+                                  bytes([0x00, 0x63, 187, 0x68, 0x51])))
+    # ...and even after an OP_RETURN, which would otherwise fail immediately
+    cs.append(synth_tapscript_raw('opsuccess/187 after OP_RETURN',
+                                  bytes([0x6a, 187])))
+    # a NON-success opcode in the same numeric neighbourhood must NOT succeed:
+    # 186 (0xba) is the last opcode below the 187-254 range.
+    cs.append(synth_tapscript_raw('opsuccess/186 is NOT OP_SUCCESS (must fail)',
+                                  bytes([186]), expect_accept=False))
+    # unknown leaf version: BIP341 says validation succeeds after the
+    # commitment check, with NO execution -- so even an invalid script passes
+    cs.append(synth_tapscript_raw('leafver/0xc2 unknown version, invalid script',
+                                  bytes([0x6a]), leaf_ver=0xc2))
+    # the tapscript OP_SUCCESS rule does NOT apply to witness v0 or legacy;
+    # those are covered by the interpreter sweep, where 187 is simply invalid.
+    return cs
 
 def synth_sighash_single_bug():
     """The SIGHASH_SINGLE bug: input index >= number of outputs.
@@ -821,6 +1135,7 @@ def all_cases():
     for name, ht in [('DEFAULT', 0x00)] + SIGHASH_NAMES:
         cs.append(synth_sighash_taproot(name, ht))
     cs.append(synth_sighash_single_bug())
+    cs += tapscript_cases()
     for v in ('p2sh-p2wpkh', 'p2sh-p2wsh'): cs.append(synth_p2sh_wrapped(v))
     for n, w in ((2, 0), (2, 1), (3, 2), (4, 1), (4, 3)):
         cs.append(synth_taproot_multileaf(n, w))
@@ -840,17 +1155,25 @@ def main():
     core = Engine(args.oracle, 'core'); asm = Engine(args.shim, 'asm')
     res = {'cases': 0, 'accept_ok': 0, 'muts': 0, 'mut_agree': 0,
            'accept_div': [], 'mut_div': [], 'false_accept': [], 'engine_fail': [],
-           'synth_bad': [], 'mut_didnt_flip': [], 'by_feature': {}}
+           'synth_bad': [], 'mut_didnt_flip': [], 'by_feature': {},
+           'ip_cases': 0, 'ip_agree': 0, 'ip_accept': 0, 'ip_mislabelled': []}
     t0 = time.time()
     for c in cases:
         run_case(c, core, asm, res)
         bf = res['by_feature'][c.feature]
         print('  %-24s accept=%d mut_ok=%d div=%d'
               % (c.feature, bf['accept'], bf['mut_ok'], bf['div']))
+    if not args.only:
+        ipc = interpreter_cases(random.Random(args.seed))
+        print('  interpreter surface: %d probes...' % len(ipc))
+        for c in ipc:
+            run_script_case(c, core, asm, res)
+        print('  %-24s agree=%d/%d (accept %d)'
+              % ('interpreter', res['ip_agree'], res['ip_cases'], res['ip_accept']))
     core.quit(); asm.quit()
     res['elapsed'] = round(time.time() - t0, 1)
     ndiv = len(res['accept_div']) + len(res['mut_div'])
-    nbad = len(res['synth_bad'])
+    nbad = len(res['synth_bad']) + len(res['ip_mislabelled'])
 
     with open(REPORT_JSON, 'w') as f: json.dump(res, f, indent=1)
     with open(REPORT_TXT, 'w') as f:
@@ -859,6 +1182,14 @@ def main():
                 % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), res['elapsed']))
         f.write('cases: %d  accept-parity ok: %d\n' % (res['cases'], res['accept_ok']))
         f.write('rule mutations: %d (agree %d)\n' % (res['muts'], res['mut_agree']))
+        f.write('interpreter probes: %d (agree %d, of which Core accepts %d)\n'
+                % (res['ip_cases'], res['ip_agree'], res['ip_accept']))
+        if res['ip_mislabelled']:
+            f.write('\nMISLABELLED interpreter probes (Core disagreed with the '
+                    'expectation the probe documents): %d\n' % len(res['ip_mislabelled']))
+            for m in res['ip_mislabelled']:
+                f.write('  %s: core=%d expected=%d\n'
+                        % (m['name'], m['core'], m['expected']))
         f.write('per feature (accept / mutations-agreed / divergences):\n')
         for feat, bf in sorted(res['by_feature'].items()):
             f.write('  %-24s accept=%d  mut_ok=%d  div=%d\n'
