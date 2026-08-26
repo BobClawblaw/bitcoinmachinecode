@@ -7,6 +7,35 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- the block filter index: whole-chain BIP158, with headers
+
+getblockfilter could serve only the ~200-block undo window and NEVER the
+header (BIP157 headers chain from genesis through every prior filter).
+Now: daemon/bfilter_index.c stores every filter + chained header
+(bfilters.dat/.idx, fixed 48-byte records, count trusted at min(header,
+size)); the backfill that makes history possible is
+daemon/build_block_filters.c, resolving every input's prevout script
+through THE TXID INDEX -- the reason this became feasible today at all --
+with a small parent-tx LRU (consolidations drain one parent). The DAEMON
+appends per applied block from that block's own undo records, and ADOPTS
+the files lazily: it leaves them alone while the offline backfill is far
+behind, then reconciles and closes the last gap from the undo window the
+moment it fits -- no restart between "backfill done" and "index live".
+Reorgs truncate records and the choke point's gap-close re-appends;
+crash discipline is boot reconciliation (grid truncate + orphan-data
+truncate), no per-block fsync at the choke point.
+
+getblockfilter now serves filter AND header from the index (undo-window
+fallback preserved, headerless as before); getindexinfo reports
+"basic block filter index" under Core's own name.
+
+PROOF at build time: filters AND chained headers byte-identical to the
+oracle's getblockfilter at sampled heights including the first real spend
+(h=170); tests/test_bfilter_index pins the machinery (header-chain fold,
+torn-tail reconcile, lazy adoption + gap close, reorg round-trip). The
+full-history backfill is running; the daemon adopts it automatically when
+it closes in.
+
 ## 2026-08-26 -- addr self-advertisement: the node finally tells the network where it lives
 
 Zero inbound peers, ever, had a simple cause: nothing ever advertised this
