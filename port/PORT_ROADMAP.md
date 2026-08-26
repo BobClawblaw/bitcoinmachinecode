@@ -125,6 +125,17 @@ and runs natively.
       descriptor + pool growth across 40 appended txs; oversized-spk and
       strip-fail rejects; 8 verify shapes x 3 local_idx). Fixed: v is a u64
       VALUE not a pointer (bogus double-deref in am[]). (2026-08-26)
+- [x] bitcoin_txv_dispatch.S (txvb_verify_one_asm + legacy_tx_view_asm -- the
+      per-input verification dispatch: shape dispatch to P2TR (tapagg_verify_asm) /
+      WV0 (sv_verify_witness_v0) / LEGACY (sv_verify_script w/ stripped tx view) /
+      WPASS, wprog resolution (wrapped ptr vs native spk offset), TLS lazy ltv_buf
+      for the stripped view). Differential vs verbatim tx_verify.c C ref
+      (test_txv_dispatch_diff.c): 16/16 PASS (real P2WSH accept end-to-end, both
+      wprog resolutions, accepts/rejects on plain + segwit-marked txs, P2TR
+      not-built + keypath garbage against a real descriptor, WPASS, and
+      legacy_tx_view bytes vs C strip_witness). Leaves sv_*=C (same as x86 tree;
+      they now provide sv_classify_segwit/sv_is_p2sh -> ported bitcoin_witness_segwit.o
+      excluded from this link). (2026-08-26)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
       mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
