@@ -134,6 +134,17 @@ and runs natively.
       (persist_only), D prune@100 (prune_all), E prune@-1 (clamp->persist),
       F prune@200 (clamp->prune_all), G empty store: ALL PASS; plus existing
       test_store 41 still PASS. Unlocks bitcoin_store_fast. (2026-08-26)
+- [x] bitcoin_store_fast  -> port/arm64/bitcoin_store_fast.S (commit <NEW>):
+      read-path fd cache (pread64, 8 slots @st+64, magic RDFC@+56) + mmap-backed
+      ZERO-COPY map cache (4 slots @st+128, magic MAP@+120). 11 exports:
+      store_rd_init/_close/_fd, store_read_meta/_at, store_rd_advise,
+      store_map_init/_close/_at/_advise, store_prune_safe. AArch64 syscalls:
+      openat=56 pread64=67 fstat=80 fadvise64=223 mmap=222 munmap=215 madvise=233.
+      VERIFIED by differential driver tfast.c: read_at/meta bytes == appended raw
+      for 12 blocks; prefill-meta (skip-lookup) path; cap->-4; map_at zero-copy
+      == raw; fd-cache; prune_safe(0) cache-invalidate + reads still correct;
+      70MB blocks forcing file-2 rollover with cross-file read_at + map grow +
+      map eviction; prune_all + prune.dat persisted. ALL PASS. (2026-08-26)
 - [x] LIVE FULL-BLOCK DOWNLOAD MILESTONE  live_blocks.c: 30 real mainnet blocks
       (segwit, >=1.8MB) fetched via getdata BLOCK, header-hash verified vs the
       verified 963k header chain, prev-links checked, coinbase parsed by the
