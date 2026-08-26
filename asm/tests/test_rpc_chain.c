@@ -1035,7 +1035,6 @@ int main(void){
 
     /* ---- the refusals name what is missing ---- */
     { struct { const char* m; const char* needle; } R[] = {
-        {"dumptxoutset", "snapshot"}, {"loadtxoutset", "snapshot"},
         {"preciousblock", "fork choice"}, {"pruneblockchain", "fork choice"},
         {"savemempool", "mempool.dat"}, {"importmempool", "mempool.dat"} };
       int all = 1;

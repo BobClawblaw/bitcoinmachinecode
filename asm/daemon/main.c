@@ -2976,6 +2976,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
       rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run); }
+    { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
+                                    long*, unsigned long long*, char*, unsigned long);
+      rpc_chain_set_utxodump(utxo_dump_rpc_run); }
     { extern long utxo_scan_rpc_run(const unsigned char*, const unsigned int*, int, void*,
                                     long, long*, long*, unsigned long long*, unsigned long long*,
                                     int*, char*, unsigned long);
