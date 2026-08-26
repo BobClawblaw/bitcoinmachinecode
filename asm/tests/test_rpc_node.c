@@ -1086,6 +1086,32 @@ int main(void){
     ck("null status -> connectioncount 0", r && r->str && !strcmp(r->str, "0"));
     rj_free(r);
 
+    /* getzmqnotifications: reports exactly the configured endpoints, in
+     * Core's shape and order. Unconfigured -> empty array (Core without any
+     * zmqpub options answers []), never a refusal -- an empty answer and a
+     * missing method are different facts to a subscriber probing support. */
+    rpc_node_set_zmq(NULL, NULL, NULL, NULL);
+    r = NULL; rc = rpc_node_dispatch("getzmqnotifications", NULL, &r, &ec, &em);
+    ck("getzmqnotifications unconfigured -> rc 1", rc == 1);
+    ck("getzmqnotifications unconfigured -> empty array",
+       r && r->typ == RJ_ARR && r->nitems == 0);
+    rj_free(r);
+
+    rpc_node_set_zmq("tcp://127.0.0.1:28332", NULL, NULL, "tcp://127.0.0.1:28333");
+    r = NULL; rc = rpc_node_dispatch("getzmqnotifications", NULL, &r, &ec, &em);
+    ck("getzmqnotifications -> 2 configured entries", rc == 1 && r && r->nitems == 2);
+    if (r && r->nitems == 2){
+        rj_val* e0 = r->items[0]; rj_val* e1 = r->items[1];
+        rj_val* t0 = rj_obj_get(e0, "type");    rj_val* a0 = rj_obj_get(e0, "address");
+        rj_val* t1 = rj_obj_get(e1, "type");    rj_val* a1 = rj_obj_get(e1, "address");
+        ck("entry 0 is pubhashblock at its address",
+           t0 && !strcmp(t0->str, "pubhashblock") && a0 && !strcmp(a0->str, "tcp://127.0.0.1:28332"));
+        ck("entry 1 is pubrawtx at its address (unset topics skipped, order kept)",
+           t1 && !strcmp(t1->str, "pubrawtx") && a1 && !strcmp(a1->str, "tcp://127.0.0.1:28333"));
+        ck("hwm present", rj_obj_get(e0, "hwm") != NULL);
+    }
+    rj_free(r);
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }
