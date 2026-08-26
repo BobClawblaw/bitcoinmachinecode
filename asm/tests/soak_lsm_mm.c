@@ -21,7 +21,7 @@ extern long utxo_lsm_del(void* lst, void* u, const unsigned char txid[32], unsig
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 extern void utxo_lsm_close(void* lst);
 extern long utxo_lsm_compact(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
@@ -64,7 +64,7 @@ typedef struct { long r; unsigned long long v; unsigned long h,cb; unsigned slen
 
 static void do_get(struct LST* l, void* u, unsigned i, unsigned idx, res_t* o){
     unsigned char t[32]; make_txid(t,i);
-    const unsigned char* sp=NULL; unsigned sl=0;
+    const unsigned char* sp=NULL; unsigned long sl=0;
     unsigned long long v=0; unsigned long h=0,cb=0;
     memset(o,0,sizeof *o);
     o->r = utxo_lsm_get(l,u,t,idx,&v,&h,&cb,&sp,&sl);

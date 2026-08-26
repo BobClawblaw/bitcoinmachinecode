@@ -22,7 +22,7 @@ extern long utxo_lsm_put(void* lst, void* u, const unsigned char txid[32],
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 extern void utxo_lsm_close(void* lst);
 extern void lsm_mm_stats(unsigned long long*, unsigned long long*, unsigned long long*);
 
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     for (long i = 0; i < n; i++) {
         unsigned k = (unsigned)((i * 2654435761u) % (NKEYS * 4));
         unsigned char t[32]; make_txid(t, k);
-        unsigned long long v; unsigned long h, cb; const unsigned char* sp; unsigned sl;
+        unsigned long long v; unsigned long h, cb; const unsigned char* sp; unsigned long sl;
         if (utxo_lsm_get(&lst, u, t, k & 3, &v, &h, &cb, &sp, &sl) == 1) found++;
     }
     clock_gettime(CLOCK_MONOTONIC, &b);

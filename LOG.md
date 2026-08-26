@@ -7,6 +7,58 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- first-contact caps: txval_modern rejected real txs as "malformed"
+
+Third and last member of today's reject-flood family: bitcoin_txval_modern.c
+capped transactions at 16 inputs AND 16 outputs, and its witness-strip
+buffer at 1 KB. Every synthetic fixture fit; real relayed traffic
+(exchange batching, consolidations, anything whose stripped size passes
+1 KB) mass-rejected as "malformed tx"/"malformed witness" -- ~30% of
+sampled real mempool txs. Caps are now sized from Core's standardness
+bound (100 kvB): MV_MAX_IN 2048, MV_MAX_OUT 4096, strip buffer 400 KB.
+mv_tx_t moved to a static (in[] is megabytes) with per-input zeroing at
+parse time so a non-segwit tx cannot inherit the previous tx's witness
+state. Pinned: test_mempool_accept_modern now runs a 20-in/60-out tx and
+asserts it is rejected at the RESOLVE stage, never the parse stage.
+
+## 2026-08-26 -- incident #49: utxo_lsm_get's slen was a 4-byte store into 8-byte callers
+
+Incident #48's fix (resolve against the live writer) did NOT stop the
+"prevout script too large" floods -- the same tx flipped allowed<->rejected
+on immediate retries (71/29 over 100 identical calls). The offline probe
+tool (daemon/utxo_probe_one) made it deterministic: utxo_lsm_get returned
+slen = 0x98000000016 for a 22-byte P2WPKH -- the REAL length in the low
+half, stale stack garbage in the high half.
+
+ROOT CAUSE: an ABI schism at the utxo_lsm_get boundary. The module's
+internal contract is u32 slen throughout, and its run-hit paths
+(mac_run_lookup, lsm_run_lookup_mm) stored 4 bytes straight through the
+caller's pointer. Eleven callers (rpc_commands.c gettxout + ten tests,
+including every LSM differential test) declared `unsigned* slen` and
+matched -- which is why no test ever caught it. But the daemon's
+consensus-adjacent callers (utxo_live apply, tx_verify, undo_log,
+tx_accept) had drifted to `unsigned long* slen`: the upper half of their
+variable was whatever the stack last held. Zero = works; nonzero =
+"prevout script too large". Fail-closed in every observed case, and the
+apply path never tripped it in practice (its prevouts resolve via prefetch
+/ memtable, where utxo_get already stored 8 bytes) -- but it was luck, not
+design, protecting consensus.
+
+FIX: the contract is now explicitly 64-bit. utxo_lsm_get routes every
+internal path's slen through its own scratch slot and publishes ONCE at
+.lg_found as a zero-extended 8-byte store; all eleven 4-byte callers were
+widened in the same commit. Regression: test_utxo_lsm poisons the caller's
+high half with 0xDEADBEEF before a run hit and asserts it comes back
+cleared. Offline proof on production data: 150/150 fresh mempool prevouts
+resolve with zero slen anomalies (was ~10% garbage per probe run,
+nondeterministic across runs).
+
+LESSON (recorded next to the P2WPKH scriptCode lesson, same shape): a
+verifier and its tests sharing one wrong assumption hide it -- ALL the LSM
+differential tests declared the same narrow type as the asm's store, so
+byte-exact diffing proved mutual consistency, not the public contract.
+The callers that disagreed were exactly the ones no differential covered.
+
 ## 2026-08-26 -- incident #48: relayed txs mass-rejected -- the tx_accept snapshot cannot coexist with a live writer
 
 Minutes after the relay deploy the log filled with `[tx_accept] reject

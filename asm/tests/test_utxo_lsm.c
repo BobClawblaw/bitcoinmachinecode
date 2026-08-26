@@ -28,7 +28,7 @@ extern long utxo_lsm_del(void* lst, void* u, const unsigned char txid[32], unsig
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
 extern long utxo_lsm_compact(void* lst);
@@ -131,7 +131,7 @@ int main(void) {
     ck("lsm_count 3", utxo_lsm_count(&lst), 3);
     ck("manifest_n still 0 (no flush)", lst.manifest_n, 0);
 
-    unsigned long long v; const unsigned char* s; unsigned sl; unsigned long h, cb;
+    unsigned long long v; const unsigned char* s; unsigned long sl; unsigned long h, cb;
     ck("get A0 (memtable)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &h, &cb, &s, &sl), 1);
     ck("get A0 value", v, 50000ULL);
     ck("get A0 height (memtable)", h, 100);
@@ -169,7 +169,15 @@ int main(void) {
     /* live keys now only findable via the flushed run (memtable is empty).
      * Checking height/is_coinbase here proves mac_flush's write and
      * mac_run_lookup's read agree on the new 15-byte record shape. */
+    /* incident #49 regression: the run-hit path once stored slen as 4 bytes
+     * while every daemon caller declares unsigned long* -- the upper half of
+     * the caller's variable kept stale stack garbage, and mempool prevout
+     * resolution nondeterministically failed "prevout script too large".
+     * POISON the upper half first: with the old 4-byte store this check
+     * reads back 0xDEADBEEF00000019 and fails loudly. */
+    sl = 0xDEADBEEF00000000UL;
     ck("get A0 (from run)", utxo_lsm_get(&lst, g_ux, tA, 0, &v, &h, &cb, &s, &sl), 1);
+    ck("get A0 slen FULL-WIDTH (poisoned high half cleared)", (long long)sl, 25);
     ck("get A0 value (from run)", v, 50000ULL);
     ck("get A0 height (from run)", h, 100);
     ck("get A0 is_coinbase (from run)", cb, 1);
@@ -302,7 +310,7 @@ int main(void) {
                     int ck_i = (round + c*13) % NKEYS;
                     unsigned char tc[32];
                     make_txid(tc, 0x11, (unsigned)ck_i);
-                    unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+                    unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned long gsl;
                     long r = utxo_lsm_get(&lst3, ux3, tc, 0, &gv, &gh, &gcb, &gs, &gsl);
                     if (live[ck_i]) {
                         if (r != 1 || gv != refval[ck_i] || gh != refheight[ck_i] || gcb != refcb[ck_i]) {
@@ -354,7 +362,7 @@ int main(void) {
         for (int k = 0; k < NKEYS; k++) {
             unsigned char tk[32];
             make_txid(tk, 0x11, (unsigned)k);
-            unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+            unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned long gsl;
             long r = utxo_lsm_get(&lst3b, ux3b, tk, 0, &gv, &gh, &gcb, &gs, &gsl);
             if (live[k]) {
                 if (r != 1 || gv != refval[k] || gh != refheight[k] || gcb != refcb[k]) {
@@ -433,7 +441,7 @@ int main(void) {
         for (int i = 0; i < SP_N; i += 7) {
             unsigned char tk[32];
             make_txid(tk, 0x22, (unsigned)i);
-            unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+            unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned long gsl;
             long r = utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gh, &gcb, &gs, &gsl);
             if (r != 1 || gv != sp_val[i] || gsl != 6 || gs[5] != (unsigned char)i
                 || gh != sp_height[i] || gcb != sp_cb[i]) {
@@ -443,7 +451,7 @@ int main(void) {
             }
         }
         {
-            unsigned char tk[32]; unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned gsl;
+            unsigned char tk[32]; unsigned long long gv; unsigned long gh, gcb; const unsigned char* gs; unsigned long gsl;
             make_txid(tk, 0x22, 0);
             if (utxo_lsm_get(&lst4, ux4, tk, 0, &gv, &gh, &gcb, &gs, &gsl) != 1) { sp_fails++; printf("FAIL: sparse first key absent\n"); }
             make_txid(tk, 0x22, SP_N-1);
@@ -521,7 +529,7 @@ int main(void) {
         mbuf[0] = gen; mbuf[1] = run_no;
         lst5.manifest_n = 1;
 
-        unsigned long long v5; unsigned long h5, cb5; const unsigned char* s5; unsigned sl5;
+        unsigned long long v5; unsigned long h5, cb5; const unsigned char* s5; unsigned long sl5;
         ck("oldfmt: get X (fallback linear scan)", utxo_lsm_get(&lst5, ux5, tX, 0, &v5, &h5, &cb5, &s5, &sl5), 1);
         ck("oldfmt: get X value", v5, valX);
         ck("oldfmt: get X height (unavailable -> 0, not garbage)", h5, 0);
@@ -583,7 +591,7 @@ int main(void) {
         long rc8 = utxo_lsm_compact(&lst5);
         ck("phase8: compact of 2 old-format runs succeeds", rc8, 1);
 
-        unsigned long long v8; unsigned long h8, cb8; const unsigned char* s8; unsigned sl8;
+        unsigned long long v8; unsigned long h8, cb8; const unsigned char* s8; unsigned long sl8;
         ck("phase8: get X after compact", utxo_lsm_get(&lst5, ux5, tX, 0, &v8, &h8, &cb8, &s8, &sl8), 1);
         ck("phase8: X value after compact", v8, valX);
         ck("phase8: X height still 0 after compact (never captured)", h8, 0);

@@ -43,7 +43,7 @@ extern long utxo_lsm_del(void* lst, void* u, const unsigned char txid[32], unsig
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 extern long utxo_lsm_count(void* lst);
 extern long utxo_lsm_reload(void* lst, void* u);
 extern long utxo_lsm_compact(void* lst);

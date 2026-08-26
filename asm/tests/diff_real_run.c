@@ -39,7 +39,7 @@ extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long ca
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 extern void lsm_mm_set_enabled(int on);
 extern long utxo_lsm_init(void* lst);
 extern void utxo_lsm_close(void* lst);
@@ -132,7 +132,7 @@ int main(int argc, char** argv){
         const u8* t = keys[i];
         u32 idx; memcpy(&idx,t+32,4);
         unsigned long long v1=0,v2=0; unsigned long h1=0,c1=0,h2=0,c2=0;
-        const unsigned char *s1=NULL,*s2=NULL; unsigned l1=0,l2=0;
+        const unsigned char *s1=NULL,*s2=NULL; unsigned long l1=0,l2=0;
         lsm_mm_set_enabled(1);
         long r1 = utxo_lsm_get(&lst,u,t,idx,&v1,&h1,&c1,&s1,&l1);
         lsm_mm_set_enabled(0);
