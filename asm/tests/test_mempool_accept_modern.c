@@ -240,6 +240,37 @@ int main(void){
         }
     }
 
+    /* ---- first-contact caps (2026-08-26): a 20-in/60-out tx must get PAST
+     * the structural stage. The parser once capped nin/nout at 16 and the
+     * witness-strip buffer at 1 KB, so real batching/consolidation txs were
+     * mass-rejected as "malformed tx" the first day the node fetched real
+     * relayed transactions. This tx's inputs resolve to nothing, so the
+     * expected verdict is a REJECT -- but at the resolve stage ("input not
+     * found in utxo"), never the parse stage. ---- */
+    {
+        static unsigned char big[8192];
+        int o = 0;
+        big[o++]=2; big[o++]=0; big[o++]=0; big[o++]=0;        /* version */
+        big[o++]=20;                                            /* nin */
+        for (int i = 0; i < 20; i++){
+            memset(big+o, 0xA0+i, 36); o += 36;                 /* outpoint */
+            big[o++]=0;                                         /* scriptSig len */
+            big[o++]=0xff; big[o++]=0xff; big[o++]=0xff; big[o++]=0xff;
+        }
+        big[o++]=60;                                            /* nout */
+        for (int i = 0; i < 60; i++){
+            memset(big+o, 0x01, 8); o += 8;                     /* value */
+            big[o++]=25;                                        /* spk len (P2PKH size) */
+            memset(big+o, 0x51, 25); o += 25;                   /* filler script */
+        }
+        big[o++]=0; big[o++]=0; big[o++]=0; big[o++]=0;         /* locktime */
+        int tv = txval_modern(big, o, ux);
+        const char* r = txval_modern_reason();
+        ckb("20-in/60-out tx passes the PARSE stage (rejected later, at resolve)",
+            tv == 0 && r && strcmp(r, "malformed tx") != 0 && strcmp(r, "malformed witness") != 0);
+        ckb("...with the resolve-stage reason", r && strstr(r, "not found") != NULL);
+    }
+
     printf("\n%s (%d checks, %d failures)\n", g_fails ? "TESTS FAILED" : "ALL PASS",
            g_checks, g_fails);
     return g_fails ? 1 : 0;

@@ -43,7 +43,7 @@ extern long utxo_lsm_del(void* lst, void* u, const unsigned char txid[32], unsig
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
 
@@ -159,7 +159,7 @@ int main(void) {
 
     /* the actual regression check: A must resolve as deleted, not as its
      * stale pre-spend value from the now-merged old run. */
-    unsigned long long v; unsigned long h, cb; const unsigned char* s; unsigned sl;
+    unsigned long long v; unsigned long h, cb; const unsigned char* s; unsigned long sl;
     long rA = utxo_lsm_get(&lst, g_ux, txidA, 0, &v, &h, &cb, &s, &sl);
     if (rA == 1) {
         printf("FAIL: key A resolved LIVE after compaction (value=%llu) -- this IS the bug: "
@@ -172,7 +172,7 @@ int main(void) {
 
     /* positive control: a genuinely-still-live key that WAS part of the
      * merged batch must still resolve correctly. */
-    unsigned long long v2; unsigned long h2, cb2; const unsigned char* s2; unsigned sl2;
+    unsigned long long v2; unsigned long h2, cb2; const unsigned char* s2; unsigned long sl2;
     long rD = utxo_lsm_get(&lst, g_ux, txidLastDummy, 0, &v2, &h2, &cb2, &s2, &sl2);
     ck("last dummy (genuinely live, in the merged batch) still resolves", rD, 1);
     if (rD == 1) {
