@@ -36,3 +36,4 @@ undo_log_ref.o
 test_tx_relay
 test_txindex_tail
 test_mempool_consensus_verify
+test_coinstats_index
