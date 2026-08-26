@@ -129,6 +129,12 @@ and runs natively.
       ported bitcoin_tx, persisted via bitcoin_store + read back: 0 failures
       natively. Blk/index now in data/ (blk00000.dat + index.dat).
 - [ ] bitcoin_cons (cons_verify)          [in DAEMONOBJS]
+- [x] bitcoin_strip_witness (void witness stripping; canonical read_cs + minimal
+      re-encode; consumed by modern txval + BIP341 stripped-commitment)
+      -> port/arm64/bitcoin_strip_witness.S (+hash160). Differential vs C twin
+      (bitcoin_segwit.c): synthetic 2183 cases + 3 real mainnet blocks (481824/413567/700000
+      = 4699 txs) + independent Python fuzz (~65k) + 1200 large-script (70KB scriptSig) ->
+      0 fail everywhere. (2026-08-25)
 - [ ] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
       taproot_verify / strip_witness / tapagg / multisig / sigops ...
 - [ ] bitcoind.asm                        (daemon entry; links everything above)

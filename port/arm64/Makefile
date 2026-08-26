@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_undo bitcoin_sigops
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_undo bitcoin_sigops bitcoin_strip_witness
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -100,6 +100,20 @@ t_ustore: t_ustore.c bitcoin_utxo_store.o bitcoin_utxo.o
 	@$(CC) $(CFLAGS) -o $@ $+
 t_undo_asm: t_undo.c bitcoin_undo.o
 	@$(CC) $(CFLAGS) -o $@ $+
+fuzz_undo:
+	python3 fuzz_undo.py 1 800
+fuzz_strip:
+	python3 fuzz_strip.py 1 1500
+# strip_witness differential vs the C twin (bitcoin_segwit.c): synthetic + real block corpus
+SWOBJS = bitcoin_strip_witness.o sha256.o ripemd160.o bitcoin_script.o secp256k1_ecdsa.o \
+         secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o
+test_strip: ../../asm/tests/test_strip_witness_diff.c ../../asm/bitcoin_segwit.c $(SWOBJS)
+	@$(CC) -no-pie -O2 -I../.. -o $@ ../../asm/tests/test_strip_witness_diff.c \
+		../../asm/bitcoin_segwit.c $(SWOBJS)
+fz_sw: fz_sw.c bitcoin_strip_witness.o sha256.o ripemd160.o
+	@$(CC) $(CFLAGS) -o $@ $+
+cmp_sw: cmp_sw.c ../../asm/bitcoin_segwit.c $(SWOBJS)
+	@$(CC) -no-pie -O2 -I../.. -o $@ cmp_sw.c ../../asm/bitcoin_segwit.c $(SWOBJS)
 fuzz_eval:
 	python3 eval_oracle.py 1 400
 CKSOBJS=bitcoin_checksig.o bitcoin_sighash.o bitcoin_bip143.o bitcoin_script.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o bitcoin_hash.o sha256.o

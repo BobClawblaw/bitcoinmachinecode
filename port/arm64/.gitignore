@@ -55,3 +55,5 @@ fuzz_undo
 ibd
 vobj/
 btc_scriptverify.o
+fz_sw
+cmp_sw
