@@ -7,6 +7,10 @@ test_ripemd160
 test_addr
 fullchain_shim
 
+# fixtures/ stays ignored as a whole (large blocks are fetched on demand),
+# but the BIP158 KAT anchors are FORCE-TRACKED (git add -f): they are frozen
+# oracle bytes the filter tests compare against byte-for-byte, 30KB total,
+# and a fixture that can drift or go missing is not an anchor.
 fixtures/
 test_bip143_diff
 test_bip30_overwrite

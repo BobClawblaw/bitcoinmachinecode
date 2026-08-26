@@ -2911,13 +2911,71 @@ static int cmd_getdescriptoractivity(const rj_val* params, rj_val** res, long* e
     return 1;
 }
 
+/* ---- dumptxoutset --------------------------------------------------------
+ * Streams the live UTXO set to a file in Core's snapshot serialization --
+ * asm/utxo_snapshot.c's encoder, pinned byte-for-byte against a snapshot
+ * the oracle Core actually wrote. The walk itself is the injected runner in
+ * daemon/utxo_setinfo_rpc.c, under the same quiescence discipline as
+ * gettxoutsetinfo (fingerprint before and after; a set that changed mid-walk
+ * discards the file rather than publishing a torn snapshot).
+ *
+ * Only type "latest" is supported: "rollback" reconstructs a historical
+ * state, which is the reorg machinery's job and it lives in the forked
+ * worker. txoutset_hash is OMITTED from the result -- computing it is a
+ * second full walk (gettxoutsetinfo muhash), and gluing a hash from a
+ * different walk onto this file would claim a correspondence nothing
+ * verified. Core's nchaintx is omitted for the same reason (it comes from a
+ * block-index field this node does not keep; getchaintxstats computes it on
+ * request). */
+static long (*g_utxo_dump)(const char*, int (*)(long, unsigned char*),
+                           long*, unsigned long long*, char*, unsigned long);
+void rpc_chain_set_utxodump(long (*run)(const char*, int (*)(long, unsigned char*),
+                                        long*, unsigned long long*, char*, unsigned long)){
+    g_utxo_dump = run;
+}
+
+static int gdump_hash_at(long height, unsigned char out[32]){
+    u8 rec[48];
+    if (!read_idx_rec(height, rec)) return 0;
+    memcpy(out, rec, 32);                       /* index stores wire order */
+    return 1;
+}
+
+static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* path = rpc_param_str(params, 0, ec, em); if (!path) return 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&
+        strcmp(params->items[1]->str, "latest")){
+        *ec = -8;
+        *em = "only type \"latest\" is supported: \"rollback\" reconstructs a "
+              "historical UTXO state, which is the reorg machinery's job and it "
+              "lives in the forked download worker";
+        return 0;
+    }
+    if (!g_utxo_dump){ *ec = -1; *em = "UTXO dump unavailable in this process"; return 0; }
+    long height = 0; unsigned long long coins = 0;
+    static char msg[256];
+    long r = g_utxo_dump(path, gdump_hash_at, &height, &coins, msg, sizeof msg);
+    if (r == 0){ *ec = -1; *em = msg[0] ? msg : "UTXO set busy"; return 0; }
+    if (r != 1){ *ec = -1; *em = msg[0] ? msg : "UTXO dump failed"; return 0; }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "coins_written", rj_numf("%llu", coins));
+    { u8 rec[48]; char hx[65];
+      if (read_idx_rec(height, rec)){ hex_rev(hx, rec, 32); rj_obj_set(o, "base_hash", rj_str(hx)); } }
+    rj_obj_set(o, "base_height", rj_numf("%ld", height));
+    rj_obj_set(o, "path", rj_str(path));
+    *res = o;
+    return 1;
+}
+
 /* ---- refusals -----------------------------------------------------------
  * Each names the specific thing that is missing, not "unimplemented". */
-#define CH_NO_SNAPSHOT \
-    "this node has no assumeutxo snapshot support: no writer for Core's " \
-    "UTXO snapshot format and no second chainstate to load one into " \
-    "(getchainstates always reports exactly one). Its UTXO set is an LSM " \
-    "with its own on-disk format, which is not Core's and is not interchangeable"
+#define CH_NO_SNAPSHOT_LOAD \
+    "this node will not load a UTXO snapshot: its UTXO set is built by full " \
+    "validation from genesis, and every parity claim it makes (the muhash " \
+    "match against Core) rests on every coin having been verified locally. " \
+    "Loading foreign state would discard exactly that property, and there is " \
+    "no second chainstate to background-validate it against as Core does. " \
+    "dumptxoutset (the export) is supported"
 #define CH_NO_FORKCHOICE_RPC \
     "fork choice is owned by the forked download worker (daemon/reorg.c), " \
     "which is not reachable from the RPC thread; there is no channel for the " \
@@ -3304,8 +3362,9 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblockfilter")) return cmd_getblockfilter(params, res, ec, em);
     if (!strcmp(m, "scanblocks")) return cmd_scanblocks(params, res, ec, em);
     if (!strcmp(m, "getdescriptoractivity")) return cmd_getdescriptoractivity(params, res, ec, em);
-    if (!strcmp(m, "dumptxoutset") || !strcmp(m, "loadtxoutset"))
-        return ch_unsupported(CH_NO_SNAPSHOT, ec, em);
+    if (!strcmp(m, "dumptxoutset")) return cmd_dumptxoutset(params, res, ec, em);
+    if (!strcmp(m, "loadtxoutset"))
+        return ch_unsupported(CH_NO_SNAPSHOT_LOAD, ec, em);
     if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
         return ch_unsupported(CH_NO_FORKCHOICE_RPC, ec, em);
     if (!strcmp(m, "savemempool") || !strcmp(m, "importmempool"))
