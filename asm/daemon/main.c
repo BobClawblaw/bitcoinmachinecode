@@ -157,6 +157,17 @@ extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
+/* ZMQ notifications: publisher (daemon/zmq_pub.c) + the cross-process
+ * staging ring (daemon/zmq_notify.c). The publisher owns sockets and so runs
+ * in the download worker ONLY; the ring is what lets the serve children
+ * contribute the transactions they accept. */
+extern int  zmqpub_add(const char* topic, const char* addr);
+extern int  zmqpub_active(void);
+extern void zmqpub_poll(void);
+extern void zmqpub_notify(const char* topic, const void* body, unsigned long blen);
+extern void zmqn_set_status(node_status_t* st);
+extern int  zmqn_drain(void);
+extern long store_read_at(void* st, unsigned long h, void* out, long cap);
 extern long node_ibd(int fd, void* st, void* hst, void* buf, long buflen); /* bitcoind.asm */
 extern long node_drain(int fd, void* st, void* buf, long buflen);          /* bitcoind.asm */
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count); /* bitcoind.asm */
@@ -2219,6 +2230,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * under-lock) so they can't collide, see that function's header comment
      * in bitcoin_idxscan.asm. */
     chdir(dir);
+    /* ZMQ publisher binds HERE, in the worker, because a PUB socket's
+     * subscriber fds are per-process and only this process can write to them.
+     * Binding is non-fatal: a busy port must not stop the node syncing. */
+    if (g_cfg.zmq_hashblock[0]) zmqpub_add("hashblock", g_cfg.zmq_hashblock);
+    if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
+    if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
+    if (g_cfg.zmq_rawtx[0])     zmqpub_add("rawtx",     g_cfg.zmq_rawtx);
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
@@ -2991,9 +3009,44 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
                 }
+                /* ZMQ hashblock/rawblock. Published from this same choke
+                 * point for the same reason the log line is: it fires no
+                 * matter which path appended the block.
+                 *
+                 * EVERY new block is published, not just the tip. A catch-up
+                 * burst advances the tip by many blocks at once, and a
+                 * subscriber that received only the last one would silently
+                 * miss the rest -- Core notifies per connected block, so this
+                 * must too. The loop is bounded by the burst size and reads
+                 * each block from the archive it was just written to. */
+                if (zmqpub_active()){
+                    static unsigned char zb[RPC_BLKSUBMIT_MAX];
+                    for (int zh = last_seen_tip + 1; zh <= now_tip; zh++){
+                        long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
+                        if (bl <= 0){
+                            fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
+                            continue;
+                        }
+                        /* The block HASH is sha256d over the 80-byte
+                         * header, REVERSED: Core's notifier flips the bytes
+                         * (data[31-i] = hash.begin()[i]) so the hashblock
+                         * topic carries the DISPLAY-order hash getblockhash
+                         * prints. Verified against real archived blocks by
+                         * tests/zmq_realblock_check. */
+                        unsigned char bh[32], bhr[32];
+                        sha256d(bh, zb, 80);
+                        for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                        zmqpub_notify("hashblock", bhr, 32);
+                        zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                    }
+                }
             }
             last_seen_tip = now_tip;
         }
+        /* Drain transactions staged by the serve children (and by this
+         * worker's own sendrawtransaction path) and service subscriber
+         * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
+        if (zmqpub_active()){ zmqpub_poll(); zmqn_drain(); }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
@@ -3198,6 +3251,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);
+    rpc_node_set_zmq(g_cfg.zmq_hashblock, g_cfg.zmq_hashtx,
+                     g_cfg.zmq_rawblock, g_cfg.zmq_rawtx);
     /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
     { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
                                             unsigned long long, unsigned int, unsigned char,
@@ -3860,6 +3915,12 @@ int main(int argc, char** argv){
                 * leaving it at the zero default would gate every dial and
                 * silently produce a node that never connects. */
                g_node_status->net_active = 1; }
+
+        /* Hand the ZMQ notification ring the shared block BEFORE the fork, so
+         * the download worker AND every inbound serve child inherit the same
+         * pointer -- a child that staged into its own private copy would
+         * publish nothing and report no error. */
+        zmqn_set_status(g_node_status);
 
         pid_t dl = fork();
         if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }

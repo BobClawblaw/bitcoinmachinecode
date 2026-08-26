@@ -301,6 +301,35 @@ long node_config_load(const char* path){
              * RPC layer shells out to it for enumeratesigners /
              * walletdisplayaddress. */
             snprintf(g_cfg.signer, sizeof g_cfg.signer, "%s", val); applied++; }
+        /* ---- Core -zmqpub<topic>=<address> ----
+         * Validated only for shape here; the bind happens at daemon start
+         * (zmqpub_add), because a bind failure must be reported once, in the
+         * daemon's own startup log, rather than while parsing a file. */
+        else if(!strcmp(key,"zmqpubhashblock")){ snprintf(g_cfg.zmq_hashblock,sizeof g_cfg.zmq_hashblock,"%s",val); applied++; }
+        else if(!strcmp(key,"zmqpubhashtx"))   { snprintf(g_cfg.zmq_hashtx,   sizeof g_cfg.zmq_hashtx,   "%s",val); applied++; }
+        else if(!strcmp(key,"zmqpubrawblock")) { snprintf(g_cfg.zmq_rawblock, sizeof g_cfg.zmq_rawblock, "%s",val); applied++; }
+        else if(!strcmp(key,"zmqpubrawtx"))    { snprintf(g_cfg.zmq_rawtx,    sizeof g_cfg.zmq_rawtx,    "%s",val); applied++; }
+        else if(!strcmp(key,"zmqpubsequence")){
+            /* REFUSED, deliberately, and this is not laziness.
+             *
+             * Core's `sequence` topic exists so a subscriber can track mempool
+             * membership EXACTLY: it carries A(dd) and R(emove) alongside
+             * C(onnect)/D(isconnect). This node has one clean choke point for
+             * "accepted" but no single one for "removed" -- eviction, expiry
+             * and reorg each call mpool_del independently.
+             *
+             * Publishing A without R would be worse than publishing nothing:
+             * a subscriber's model of the mempool would grow and never shrink,
+             * and it would have no way to know. So the topic refuses, loudly,
+             * instead of emitting a stream that quietly lies. */
+            fprintf(stderr,"[config] zmqpubsequence is NOT supported: this node has no single "
+                           "mempool-removal choke point, so it could publish adds but not "
+                           "removes -- a subscriber tracking membership from that would drift "
+                           "silently. Use zmqpubrawtx/zmqpubhashtx for arrivals.\n");
+            bad++; }
+        else if(!strncmp(key,"zmqpub",6)){
+            fprintf(stderr,"[config] unknown ZMQ topic '%s' (have: hashblock, hashtx, rawblock, rawtx)\n", key);
+            bad++; }
         else if(!strcmp(key,"blocksonly")){
             /* Core: do not participate in tx relay. We honour it by setting
              * relay=0 on ordinary outbound legs too, which is what the flag
