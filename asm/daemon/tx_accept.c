@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdint.h>
 #include "log_ts.h"
 
@@ -233,24 +234,61 @@ int tx_policy_init(void){
  * wasted signature-verification pass on a tx that would also have failed
  * fee/dedup checks), a correctness-over-throughput tradeoff worth revisiting
  * once this is under real traffic (task #49). */
+/* ---- P2P-path log summarizer -------------------------------------------
+ * The relay drain feeds hundreds of transactions a minute through here, and
+ * a per-transaction log line for each one turned the production log into an
+ * unreadable reject firehose the first day real relay traffic flowed (the
+ * majority class, "input not found in utxo", is ordinary out-of-order relay
+ * -- children of unconfirmed parents this node has no orphan pool for --
+ * exactly the churn Core hides behind -debug=mempoolrej). One summary line
+ * per window keeps the same information legible; the most recent
+ * NON-routine reject reason is carried in the line so a new failure class
+ * is still visible without the flood. The sendrawtransaction path
+ * (tx_accept_validate_reason) keeps full per-tx logging: user-submitted
+ * transactions are rare and each one matters. */
+#define TXACC_LOG_WINDOW_SECS 30
+static struct {
+    long acc, rej_missing, rej_invalid, rej_policy;
+    long t0;
+    char last_invalid[96];
+} g_alog;
+static void txacc_log_tick(void* mp_area){
+    long now = (long)time(NULL);
+    if (!g_alog.t0){ g_alog.t0 = now; return; }
+    if (now - g_alog.t0 < TXACC_LOG_WINDOW_SECS) return;
+    if (g_alog.acc || g_alog.rej_missing || g_alog.rej_invalid || g_alog.rej_policy)
+        fprintf(stderr, "[tx_accept] last %lds: +%ld accepted (mempool %ld) | rejected: %ld missing-inputs, %ld invalid%s%s%s, %ld policy\n",
+                now - g_alog.t0, g_alog.acc, mpool_count(mp_area),
+                g_alog.rej_missing, g_alog.rej_invalid,
+                g_alog.last_invalid[0] ? " (last: \"" : "",
+                g_alog.last_invalid[0] ? g_alog.last_invalid : "",
+                g_alog.last_invalid[0] ? "\")" : "",
+                g_alog.rej_policy);
+    memset(&g_alog, 0, sizeof g_alog);
+    g_alog.t0 = now;
+}
+
 long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen){
     if (!g_ready || !g_pol_ready) return 0;
+    txacc_log_tick(mp_area);
     void* placeholder_utxo = (void*)1; /* never dereferenced: mempool_resolve_confirmed_utxo ignores it */
     if (!txval_modern(tx, (long)txlen, placeholder_utxo)){
-        fprintf(stderr, "[tx_accept] reject (txval): %s\n", txval_modern_reason());
+        const char* r = txval_modern_reason();
+        if (r && strcmp(r, "input not found in utxo") == 0) g_alog.rej_missing++;
+        else {
+            g_alog.rej_invalid++;
+            snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
+        }
         return 0;
     }
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     mp_unlock();
     if (padd != 1){
-        fprintf(stderr, "[tx_accept] reject (policy): %s\n", mpool_policy_reason(g_pol));
+        g_alog.rej_policy++;
         return 0;
     }
-    static const char hexd[]="0123456789abcdef";
-    char ts[17]; for(int k=0;k<8;k++){ u8 b=txid[31-k]; ts[k*2]=hexd[b>>4]; ts[k*2+1]=hexd[b&0xf]; } ts[16]=0;
-    fprintf(stderr, "[tx_accept] accepted txid=%s.. vsize=%lu mempool_now=%ld\n",
-            ts, txlen, mpool_count(mp_area));
+    g_alog.acc++;
     /* Stamp arrival so -mempoolexpiry can evict it later. The mempool slot
      * format has no timestamp field, so this parallel record is what makes
      * expiry possible without changing the slot layout. */
