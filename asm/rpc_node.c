@@ -80,7 +80,10 @@ static int cmd_getnetworkinfo(rj_val** res){
       rj_obj_set(o, "localservicesnames", names); }
     rj_obj_set(o, "localrelay", rj_bool(1));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
-    rj_obj_set(o, "networkactive", rj_bool(1));
+    /* the REAL toggle state, not a constant: setnetworkactive changes it and
+     * getnetworkinfo must reflect that, or the two disagree about whether
+     * the node is talking to anyone. */
+    rj_obj_set(o, "networkactive", rj_bool(g_status ? g_status->net_active : 1));
     rj_obj_set(o, "connections", rj_numf("%d", n_out + n_in));
     rj_obj_set(o, "connections_in", rj_numf("%d", n_in));
     rj_obj_set(o, "connections_out", rj_numf("%d", n_out));
@@ -158,9 +161,11 @@ static int cmd_getpeerinfo(rj_val** res){
  * rather than pretending: this node has no ban list, no addnode list, and
  * no runtime network-disable switch, so listbanned/getaddednodeinfo return
  * empty (exactly as Core does when nothing is banned or added) while
- * setban/addnode/disconnectnode/setnetworkactive report -1 with a clear
- * message instead of silently succeeding and changing nothing. A mutator
- * that lies about having acted is worse than an absent one. */
+ * setban/addnode/disconnectnode/setnetworkactive are REAL as of 2026-08-26:
+ * they cross the ctl_* channel to the download worker, which owns the peer
+ * legs and is the only thing that may touch them. Each reports what it
+ * actually did, so a no-op (no such peer, already banned) becomes Core's
+ * error rather than a success that changed nothing. */
 static long (*g_ab_count)(void*);
 static int  (*g_ab_get_i)(void*, long, unsigned char*);
 static void* g_ab;
@@ -333,7 +338,6 @@ static int cmd_getaddednodeinfo(const rj_val* params, rj_val** res){
  * nothing is banned, so an empty array here is the SAME answer, not a stub;
  * the divergence is that nothing can ever populate it (see setban). */
 static int cmd_empty_array(rj_val** res){ *res = rj_arr(); return 1; }
-static int cmd_clearbanned(rj_val** res){ *res = rj_null(); return 1; }
 
 /* ping -- Core queues a ping to every peer and returns null immediately;
  * the result shows up in getpeerinfo's pingtime. This node's peer legs are
@@ -343,14 +347,6 @@ static int cmd_clearbanned(rj_val** res){ *res = rj_null(); return 1; }
 static int cmd_net_unsupported(const char* msg, long* ec, const char** em){
     *ec = -1; *em = msg; return 0;
 }
-#define NET_NO_PEERCTL \
-    "peer connections are owned by the download worker, which dials and " \
-    "redials from the address book on its own policy; this node has no " \
-    "runtime peer-control path, so this call would change nothing. Set " \
-    "addnode= in bitcoin.conf and restart (getaddednodeinfo reports it)."
-#define NET_NO_BANLIST \
-    "this node keeps no ban list; misbehaving peers are dropped by the " \
-    "download worker and simply re-dialed from the address book"
 
 /* getmempoolinfo / getrawmempool.
  *
@@ -463,6 +459,171 @@ static int cmd_getmempoolinfo(rj_val** res){
     *res = o;
     return 1;
 }
+/* ==== the peer-control channel (parent side) =============================
+ * Stage one command, bump the seq, wait for the worker's ack. Same shape as
+ * cmd_sendrawtransaction's staging, and the same reason: the worker owns the
+ * peer legs and is the only thing that may touch them. */
+#define CTL_WAIT_MS 3000
+#define CTL_POLL_US 500
+
+static int ctl_send(int op, const char* arg, long long num,
+                    long* ec, const char** em, int* result_out){
+    static char reason[128];
+    if (!g_status_rw){
+        *ec = -4;
+        *em = "peer control is unavailable: no download worker is attached, so "
+              "there is nothing holding the peer legs to command";
+        return 0;
+    }
+    node_status_t* s = g_status_rw;
+    pthread_mutex_lock(&g_submit_lock);
+    snprintf((char*)s->ctl_arg, sizeof s->ctl_arg, "%s", arg ? arg : "");
+    s->ctl_num = num;
+    s->ctl_op = op;
+    s->ctl_result = 0;
+    s->ctl_reason[0] = 0;
+    unsigned long long myseq = s->ctl_seq + 1;
+    __sync_synchronize();
+    s->ctl_seq = myseq;
+    int waited = 0, done = 0, result = 0;
+    reason[0] = 0;
+    while (waited < CTL_WAIT_MS * 1000){
+        if (s->ctl_ack == myseq){
+            result = s->ctl_result;
+            memcpy(reason, (const void*)s->ctl_reason, sizeof reason);
+            reason[sizeof reason - 1] = 0;
+            done = 1; break;
+        }
+        struct timespec ts = {0, CTL_POLL_US * 1000L}; nanosleep(&ts, NULL);
+        waited += CTL_POLL_US;
+    }
+    pthread_mutex_unlock(&g_submit_lock);
+    if (!done){ *ec = -4; *em = "the download worker did not answer the control request"; return 0; }
+    if (result < 0){
+        static char embuf[160];
+        snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "peer control failed");
+        *ec = result; *em = embuf;
+        return 0;
+    }
+    if (result_out) *result_out = result;
+    return 1;
+}
+
+/* addnode "node" "add|remove|onetry" */
+static int cmd_addnode(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* node = (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+                        params->items[0]->typ == RJ_STR) ? params->items[0]->str : NULL;
+    const char* cmd  = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                        params->items[1]->typ == RJ_STR) ? params->items[1]->str : NULL;
+    if (!node || !cmd){ *ec = -8; *em = "addnode requires a node and a command"; return 0; }
+    long long mode;
+    if      (!strcmp(cmd, "add"))    mode = 0;
+    else if (!strcmp(cmd, "remove")) mode = 1;
+    else if (!strcmp(cmd, "onetry")) mode = 2;
+    else { *ec = -8; *em = "command must be \"add\", \"remove\" or \"onetry\""; return 0; }
+    int r = 0;
+    if (!ctl_send(RPC_CTL_ADDNODE, node, mode, ec, em, &r)) return 0;
+    if (mode == 1 && r == 0){
+        /* Core: removing a node that was never added is an error, not a
+         * silent success -- the caller's mental model is wrong either way. */
+        *ec = -24; *em = "Error: Node has not been added."; return 0;
+    }
+    *res = rj_null();
+    return 1;
+}
+
+static int cmd_disconnectnode(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* addr = NULL; long long nodeid = -1;
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_STR) addr = params->items[0]->str;
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_NUM) nodeid = atoll(params->items[1]->str);
+        else if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM)
+            nodeid = atoll(params->items[0]->str);
+    }
+    if ((addr && addr[0] && nodeid >= 0)){
+        *ec = -32602; *em = "Only one of address and nodeid should be provided."; return 0; }
+    if ((!addr || !addr[0]) && nodeid < 0){
+        *ec = -32602; *em = "Only one of address and nodeid should be provided."; return 0; }
+    int r = 0;
+    if (!ctl_send(RPC_CTL_DISCONNECT, addr ? addr : "", nodeid, ec, em, &r)) return 0;
+    if (r == 0){ *ec = -29; *em = "Node not found in connected nodes"; return 0; }
+    *res = rj_null();
+    return 1;
+}
+
+/* setban "subnet" "add|remove" ( bantime absolute ) */
+static int cmd_setban(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* subnet = (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+                          params->items[0]->typ == RJ_STR) ? params->items[0]->str : NULL;
+    const char* cmd    = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                          params->items[1]->typ == RJ_STR) ? params->items[1]->str : NULL;
+    if (!subnet || !cmd){ *ec = -8; *em = "setban requires a subnet and a command"; return 0; }
+    int add;
+    if      (!strcmp(cmd, "add"))    add = 1;
+    else if (!strcmp(cmd, "remove")) add = 0;
+    else { *ec = -8; *em = "command must be \"add\" or \"remove\""; return 0; }
+    long long until = 0;
+    if (add){
+        long long bantime = 0; int absolute = 0;
+        if (params->nitems >= 3 && params->items[2]->typ == RJ_NUM) bantime = atoll(params->items[2]->str);
+        if (params->nitems >= 4 && params->items[3]->typ == RJ_BOOL) absolute = params->items[3]->str[0] == '1';
+        if (bantime <= 0) bantime = 60 * 60 * 24;          /* Core's default: 24h */
+        until = absolute ? bantime : (long long)time(NULL) + bantime;
+    }
+    int r = 0;
+    if (!ctl_send(RPC_CTL_SETBAN, subnet, until, ec, em, &r)) return 0;
+    if (r == 0){
+        *ec = -30;
+        *em = add ? "Error: IP/Subnet already banned"
+                  : "Error: Unban failed. Requested address/subnet was not previouslyManually banned.";
+        return 0;
+    }
+    *res = rj_null();
+    return 1;
+}
+
+static int cmd_clearbanned(rj_val** res, long* ec, const char** em){
+    if (!ctl_send(RPC_CTL_CLEARBANNED, "", 0, ec, em, NULL)) return 0;
+    *res = rj_null();
+    return 1;
+}
+
+/* listbanned -- straight out of the shared ban list; no channel round trip,
+ * because the parent can read what the worker enforces. */
+static int cmd_listbanned(rj_val** res){
+    rj_val* arr = rj_arr();
+    if (g_status){
+        long long now = (long long)time(NULL);
+        for (int i = 0; i < RPC_MAX_BANS; i++){
+            if (!g_status->bans[i].until) continue;
+            if (g_status->bans[i].until <= now) continue;   /* expired */
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "address", rj_str((const char*)g_status->bans[i].subnet));
+            rj_obj_set(e, "banned_until", rj_numf("%lld", (long long)g_status->bans[i].until));
+            rj_obj_set(e, "ban_created", rj_numf("%lld", (long long)g_status->bans[i].created));
+            rj_arr_push(arr, e);
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
+static int cmd_setnetworkactive(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_BOOL){
+        *ec = -8; *em = "setnetworkactive requires a boolean"; return 0; }
+    int on = params->items[0]->str[0] == '1';
+    if (!ctl_send(RPC_CTL_SETNETACTIVE, "", on, ec, em, NULL)) return 0;
+    *res = rj_bool(on);                       /* Core echoes the new state */
+    return 1;
+}
+
+static int cmd_ping(rj_val** res, long* ec, const char** em){
+    if (!ctl_send(RPC_CTL_PING, "", 0, ec, em, NULL)) return 0;
+    *res = rj_null();                         /* Core: queued, returns null */
+    return 1;
+}
+
 /* ==== gettxspendingprevout ==============================================
  * Core lists it under Blockchain, but it is a pure mempool query and the
  * pool enumeration lives here, so it lives here too. For each outpoint the
@@ -1215,18 +1376,18 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getnettotals"))       return cmd_getnettotals(res);
     if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res);
     if (!strcmp(m, "getaddrmaninfo"))     return cmd_getaddrmaninfo(res);
-    if (!strcmp(m, "listbanned"))         return cmd_empty_array(res);
+    if (!strcmp(m, "listbanned"))         return cmd_listbanned(res);
     if (!strcmp(m, "getaddednodeinfo")){
         int rc = cmd_getaddednodeinfo(params, res);
         if (rc == -24000){ *ec = -24; *em = "Error: Node has not been added."; return 0; }
         return rc;
     }
-    if (!strcmp(m, "clearbanned"))        return cmd_clearbanned(res);
-    if (!strcmp(m, "addnode"))            return cmd_net_unsupported(NET_NO_PEERCTL, ec, em);
-    if (!strcmp(m, "disconnectnode"))     return cmd_net_unsupported(NET_NO_PEERCTL, ec, em);
-    if (!strcmp(m, "setban"))             return cmd_net_unsupported(NET_NO_BANLIST, ec, em);
-    if (!strcmp(m, "setnetworkactive"))   return cmd_net_unsupported("this node has no runtime network-disable switch; stop the daemon to stop networking", ec, em);
-    if (!strcmp(m, "ping"))               return cmd_net_unsupported("this node has no RPC-triggered ping path; the download worker sends its own keepalives", ec, em);
+    if (!strcmp(m, "clearbanned"))        return cmd_clearbanned(res, ec, em);
+    if (!strcmp(m, "addnode"))            return cmd_addnode(params, res, ec, em);
+    if (!strcmp(m, "disconnectnode"))     return cmd_disconnectnode(params, res, ec, em);
+    if (!strcmp(m, "setban"))             return cmd_setban(params, res, ec, em);
+    if (!strcmp(m, "setnetworkactive"))   return cmd_setnetworkactive(params, res, ec, em);
+    if (!strcmp(m, "ping"))               return cmd_ping(res, ec, em);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
