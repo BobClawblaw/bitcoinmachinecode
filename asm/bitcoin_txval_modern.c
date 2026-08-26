@@ -71,7 +71,11 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
  * every input's prev_spk together for the combined sighash, further below
  * in this file. Sized to comfortably cover the fixed-size scriptPubKey
  * forms this validator actually supports (P2WPKH 22B, P2WSH/P2TR 34B). */
-#define PREV_SPK_BUF_MAX 42
+/* A prevout script can be anything consensus allowed when it was CREATED --
+ * up to MAX_SCRIPT_SIZE (10,000), and spending a nonstandard output IS
+ * standard. The first draft used 42, which "prevout script too large"-
+ * rejected every P2PK (67B) and bare-multisig (~105B) spend. */
+#define PREV_SPK_BUF_MAX 10000
 /* Mempool-admission witness-item cap. This is a simplified standardness
  * parser (inputs/outputs also bounded at 16 below); mempool policy may be
  * stricter than consensus, so a modest inline bound is fine here. It was 16,
@@ -92,7 +96,10 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
 #define MV_MAX_OUT 4096
 typedef struct {
     uint8_t outpoint[36];
-    uint8_t scriptSig[64]; uint32_t scriptSiglen;   /* 35 for P2SH-P2WSH (0x22 + 34); was 32, which silently truncated it */
+    uint8_t scriptSig[1650]; uint32_t scriptSiglen; /* MAX_STANDARD_SCRIPTSIG (Core policy).
+                                                     * Was 64 -- enough for the P2SH-P2WSH
+                                                     * push but "malformed tx" for every
+                                                     * real P2SH multisig spend. */
     uint32_t sequence;
     const uint8_t* wit[MV_MAX_WIT]; uint32_t witlen[MV_MAX_WIT]; uint32_t nwit;
     uint64_t amount;
@@ -192,7 +199,14 @@ static int mv_parse(mv_tx_t* T){
  * length of input 0 so a test can prove the fix rejects at PARSE rather than
  * accepting with a truncated length that a resolve-failure happens to hide. */
 int mv_test_parse(const uint8_t* tx, long txlen, uint32_t* wl0_out){
-    mv_tx_t T; memset(&T,0,sizeof T); T.tx=tx; T.txlen=txlen;
+    /* static, NOT stack: mv_tx_t is tens of MB since in[] grew to MV_MAX_IN
+     * with full-size prevout buffers -- a stack instance segfaulted this
+     * hook the moment the struct was widened (the same reason txval_modern's
+     * own T is static). Scalars reset here; mv_parse zeroes each input
+     * record as it fills it. */
+    static mv_tx_t T;
+    T.tx=tx; T.txlen=txlen;
+    T.version=0; T.nin=0; T.nout=0; T.out_total=0;
     int r = mv_parse(&T);
     if (wl0_out) *wl0_out = (r && T.nin>0 && T.in[0].nwit>0) ? T.in[0].witlen[0] : 0;
     return r;
@@ -285,8 +299,17 @@ int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
         if (sl == 34 && spk[0]==0x51 && spk[1]==0x20){
             if (in->scriptSiglen != 0){ g_reason="p2tr scriptSig must be empty"; return 0; }
             if (in->nwit != 1){ g_reason="p2tr keypath needs 1 witness item"; return 0; }
-            /* build prevouts/amounts/spks arrays for taproot_keypath_verify */
-            uint8_t po[16*36]; uint8_t am[16*8], sp[16*70];
+            /* build prevouts/amounts/spks arrays for taproot_keypath_verify.
+             * STATIC, sized by MV_MAX_IN: these were 16-input stack arrays
+             * that survived the cap raise unnoticed -- the k<T.nin loops
+             * below then wrote past them the moment a real >16-input
+             * taproot spend arrived (glibc fortify aborted the worker;
+             * without fortify this was peer-triggerable stack corruption).
+             * Single-threaded module (see T's own comment), so statics are
+             * safe and also stop burning ~160 KB of stack per call. */
+            static uint8_t po[MV_MAX_IN*36];
+            static uint8_t am[MV_MAX_IN*8];
+            static uint8_t sp[MV_MAX_IN*(1+PREV_SPK_BUF_MAX)];
             for (uint64_t k=0;k<T.nin;k++){ memcpy(po+k*36, T.in[k].outpoint, 36);
                 uint64_t a=T.in[k].amount; for(int b=0;b<8;b++) am[k*8+b]=(uint8_t)(a>>(8*b));
             }
@@ -294,7 +317,7 @@ int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
                 int off=0;
                 for (uint64_t k=0;k<T.nin;k++){
                     if (T.in[k].prev_spklen < 0xfd) sp[off++]=(uint8_t)T.in[k].prev_spklen;
-                    else return 0;
+                    else { g_reason = "taproot spend with a >252-byte co-input prevout script (unsupported)"; return 0; }
                     memcpy(sp+off, T.in[k].prev_spk, T.in[k].prev_spklen);
                     off += T.in[k].prev_spklen;
                 }
