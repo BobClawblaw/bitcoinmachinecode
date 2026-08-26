@@ -7,6 +7,47 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- incident #50: the caps raise left 16-sized taproot arrays -- worker crash loop
+
+The caps deploy (below) crash-looped the download worker within ~3 minutes:
+glibc fortify "*** buffer overflow detected ***" -> SIGABRT -> parent exits
+-> systemd restarts. Production was ROLLED BACK to the previous binary
+(deploy-20260826e) while the offline harness reproduced it: txval_modern's
+P2TR key-path arm builds per-input prevout/amount/spk arrays for
+taproot_keypath_verify on the STACK, still sized 16*36/16*8/16*70 -- the
+k<T.nin loops wrote past them the moment a real >16-input transaction
+carrying a taproot input arrived. The cap raise turned a latent bound into
+peer-triggerable stack corruption; fortify caught it, which is the
+difference between a crash loop and something worse.
+
+Reproduced and fixed OFFLINE (scratchpad txval_probe harness: 500 real
+oracle-mempool txs with oracle-resolved prevouts, gdb catching the abort at
+bitcoin_txval_modern.c:290). Fix: the arrays are static and sized by
+MV_MAX_IN. Same commit also widens the two remaining legit-script caps the
+live run exposed: PREV_SPK_BUF_MAX 42 -> 10,000 (42 rejected every P2PK and
+bare-multisig prevout as "prevout script too large") and scriptSig 64 ->
+1,650 (Core's MAX_STANDARD_SCRIPTSIG; 64 rejected every plain P2SH multisig
+spend as "malformed tx").
+
+Also in this batch: the P2P accept path's per-transaction log lines are
+replaced by a 30-second summary ("[tx_accept] last 30s: +N accepted
+(mempool M) | rejected: X missing-inputs, Y invalid (last: reason), Z
+policy") -- per-tx lines at real relay volume made the production log an
+unreadable firehose: the node looked broken from the log while it was in
+fact healthy. The sendrawtransaction path keeps full per-tx logging: user
+submissions are rare and each one matters. The most recent non-routine
+reject reason rides along in the summary so a NEW failure class is still
+visible without the flood.
+
+Post-fix corpus result: 500/500 real mempool txs run to completion, 455
+ACCEPTED; the 45 rejects are the two honest, stated mempool-admission
+bounds -- no legacy verify arm (P2PKH/P2PK/bare-multisig/plain-P2SH
+spends, "unsupported prevout script type") and taproot key-path-only
+(annex/script-path spends). Both are follow-up features, not bugs: they
+fail closed with named reasons. LESSON: raising a bound requires sweeping
+every array the OLD bound silently sized -- grep for the literal, not just
+the #define.
+
 ## 2026-08-26 -- first-contact caps: txval_modern rejected real txs as "malformed"
 
 Third and last member of today's reject-flood family: bitcoin_txval_modern.c
