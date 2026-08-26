@@ -724,6 +724,359 @@ open_idx_close:
     ret
     .size open_idx_close, .-open_idx_close
 
+
+/* ============================================================================
+ * store_set_prune(st, prune_height) -> 1 / -1
+ *   Persist the prune gate (no physical deletion) to prune.dat (4-byte LE).
+ * ========================================================================== */
+	.global store_set_prune
+	.type store_set_prune, %function
+store_set_prune:
+	stp  x19, x20, [sp, #-16]!
+	stp  x29, x30, [sp, #-16]!
+	sub  sp, sp, #16          /* 4-byte value @sp */
+	mov  x19, x0              /* st */
+	str  w1, [x19, #48]       /* st->prune_height = height */
+	/* openat(AT_FDCWD, prunename, O_RDWR|O_CREAT|O_TRUNC=0x242, 0644) */
+	mov  x8, #56
+	mov  x0, #-100
+	LAddr x1, prunename
+	mov  x2, #0x242
+	mov  x3, #420
+	svc  #0
+	tbnz x0, #63, .Ssp_fail
+	mov  x20, x0              /* fd */
+	/* write(fd, &val, 4) */
+	ldr  w9, [x19, #48]
+	str  w9, [sp]
+	mov  x0, x20
+	mov  x1, sp
+	mov  x2, #4
+	mov  x8, #64
+	svc  #0
+	cmp  x0, #4
+	b.ne .Ssp_wfail
+	mov  x8, #57
+	mov  x0, x20
+	svc  #0
+	mov  w0, #1
+	b    .Ssp_ok
+.Ssp_wfail:
+	mov  x8, #57
+	mov  x0, x20
+	svc  #0
+.Ssp_fail:
+	mov  x0, #-1
+.Ssp_ok:
+	add  sp, sp, #16
+	ldp  x29, x30, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ret
+	.size store_set_prune, .-store_set_prune
+
+/* ---------- unlink_blk(st, file_no) -- remove blk%05u.dat (ignore ENOENT) ---------- */
+	.type unlink_blk, %function
+unlink_blk:
+	stp  x29, x30, [sp, #-16]!
+	sub  sp, sp, #32          /* name[16] @sp */
+	mov  w9, w1               /* file_no (survives bl fmt_blkname) */
+	mov  x0, sp
+	mov  w1, w9
+	bl   fmt_blkname
+	/* unlinkat(AT_FDCWD, buf, 0) -- no plain unlink on arm64 */
+	mov  x8, #35
+	mov  x0, #-100
+	mov  x1, sp
+	mov  x2, #0
+	svc  #0                   /* rc ignored (ENOENT ok) */
+	add  sp, sp, #32
+	ldp  x29, x30, [sp], #16
+	ret
+	.size unlink_blk, .-unlink_blk
+
+/* ---------- read_idx_rec(st, height, buf) -> file_no / -1 ; fills buf[48] ---------- */
+	.type read_idx_rec, %function
+read_idx_rec:
+	stp  x19, x20, [sp, #-16]!
+	stp  x29, x30, [sp, #-16]!
+	mov  x19, x0              /* st */
+	mov  x20, x2              /* buf (callee-saved across syscalls) */
+	mov  x10, x1
+	mov  x11, #48
+	mul  x10, x10, x11        /* height*48 */
+	ldr  x0, [x19, #8]        /* idx_fd */
+	mov  x1, x10
+	mov  x2, #0
+	mov  x8, #62              /* lseek */
+	svc  #0
+	tbnz x0, #63, .Srr_er
+	ldr  x0, [x19, #8]
+	mov  x1, x20
+	mov  x2, #48
+	mov  x8, #63              /* read */
+	svc  #0
+	cmp  x0, #48
+	b.ne .Srr_er
+	ldr  w0, [x20, #32]       /* file_no */
+	b    .Srr_ok
+.Srr_er:
+	mov  x0, #-1
+.Srr_ok:
+	ldp  x29, x30, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ret
+	.size read_idx_rec, .-read_idx_rec
+
+/* ---------- write_idx_rec(st, height, buf) -> 1 / -1 ; writes buf[48] ---------- */
+	.type write_idx_rec, %function
+write_idx_rec:
+	stp  x19, x20, [sp, #-16]!
+	stp  x29, x30, [sp, #-16]!
+	mov  x19, x0
+	mov  x20, x2
+	mov  x10, x1
+	mov  x11, #48
+	mul  x10, x10, x11
+	ldr  x0, [x19, #8]
+	mov  x1, x10
+	mov  x2, #0
+	mov  x8, #62
+	svc  #0
+	tbnz x0, #63, .Swr_er
+	ldr  x0, [x19, #8]
+	mov  x1, x20
+	mov  x2, #48
+	mov  x8, #64              /* write */
+	svc  #0
+	cmp  x0, #48
+	b.ne .Swr_er
+	mov  w0, #1
+	b    .Swr_ok
+.Swr_er:
+	mov  x0, #-1
+.Swr_ok:
+	ldp  x29, x30, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ret
+	.size write_idx_rec, .-write_idx_rec
+
+/* ============================================================================
+ * store_prune(st, prune_height) -> 1 / -1
+ *   Set + persist the prune gate and PHYSICALLY delete pruned blk files;
+ *   compact the boundary file in place (read at old_off, write at new_off,
+ *   ftruncate). Mirrors x86 store_prune.
+ *   Frame (4 save pairs then sub 0x10080): recA[48]@sp+0x00, recB[48]@sp+0x30,
+ *   tip@+0x60 eff@+0x64 first@+0x68 h@+0x6C old_off@+0x70 size@+0x74
+ *   remaining@+0x78 chunk@+0x7C, 64KB copy buf@sp+0x80.
+ *   Regs: x19=st x20=fd w21=new_off x22=old_ptr x23=new_ptr w24=dl w25=h.
+ * ========================================================================== */
+	.global store_prune
+	.type store_prune, %function
+store_prune:
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
+	stp  x23, xzr, [sp, #-16]!
+	stp  x24, x25, [sp, #-16]!
+	stp  x29, x30, [sp, #-16]!
+	mov  x9, #0x80
+	movk x9, #0x1, lsl #16    /* 0x10080 */
+	sub  sp, sp, x9
+	mov  x19, x0              /* st */
+	ldr  w9, [x19, #24]       /* tip */
+	cmp  w9, #-1
+	b.eq .Spr_empty
+	str  w9, [sp, #0x60]      /* tip */
+	mov  w10, w1              /* requested prune_height */
+	tbz  w10, #31, .Spr_nonneg
+	mov  w10, #0
+.Spr_nonneg:
+	add  w11, w9, #1          /* tip+1 */
+	cmp  w10, w11
+	b.ls .Spr_clamped
+	mov  w10, w11
+.Spr_clamped:
+	str  w10, [x19, #48]      /* st->prune_height */
+	str  w10, [sp, #0x64]     /* eff */
+	cbz  w10, .Spr_persist_only
+	mov  x0, x19
+	mov  w1, w10
+	bl   store_set_prune      /* persist gate first */
+	/* if eff == tip+1 -> prune ALL files */
+	ldr  w9, [sp, #0x60]
+	add  w11, w9, #1
+	ldr  w10, [sp, #0x64]
+	cmp  w10, w11
+	b.eq .Spr_prune_all
+	/* first_retained_file = file_no of block at height=eff */
+	mov  x0, x19
+	mov  w1, w10
+	add  x2, sp, #0x00        /* recA */
+	bl   read_idx_rec
+	tbnz x0, #63, .Spr_fail
+	str  w0, [sp, #0x68]      /* first_retained_file */
+	/* delete files 0 .. first_retained_file-1 */
+	mov  w24, #0
+.Spr_delfiles:
+	ldr  w9, [sp, #0x68]
+	cmp  w24, w9
+	b.hs .Spr_deldone
+	mov  x0, x19
+	mov  w1, w24
+	bl   unlink_blk
+	add  w24, w24, #1
+	b    .Spr_delfiles
+.Spr_deldone:
+	/* compact boundary file (first_retained_file) in place */
+	mov  x0, x19
+	ldr  w1, [sp, #0x68]
+	bl   open_file
+	tbnz x0, #63, .Spr_fail
+	mov  x20, x0              /* fd */
+	mov  w21, #0              /* new_off */
+	ldr  w25, [sp, #0x64]     /* h = eff */
+.Spr_cmploop:
+	ldr  w9, [sp, #0x60]      /* tip */
+	cmp  w25, w9
+	b.hi .Spr_cmpdone
+	mov  x0, x19
+	mov  w1, w25
+	add  x2, sp, #0x00        /* recA */
+	bl   read_idx_rec
+	tbnz x0, #63, .Spr_fail
+	ldr  w9, [sp, #0x68]
+	cmp  w0, w9               /* rec.file_no == first_retained? */
+	b.ne .Spr_cmpdone
+	ldr  w9, [sp, #0x24]      /* recA+36 pos */
+	str  w9, [sp, #0x70]      /* old_off */
+	ldr  w9, [sp, #0x2C]      /* recA+44 size */
+	str  w9, [sp, #0x74]      /* size */
+	ldr  w9, [sp, #0x24]
+	uxtw x22, w9              /* old_ptr */
+	uxtw x23, w21             /* new_ptr */
+	ldr  w9, [sp, #0x74]
+	add  w9, w9, #8
+	str  w9, [sp, #0x78]      /* remaining = size+8 */
+.Spr_cpychunk:
+	ldr  w9, [sp, #0x78]
+	cbz  w9, .Spr_cpydone
+	movz w10, #0x1, lsl #16   /* 0x10000 */
+	cmp  w9, w10
+	b.hi .Spr_big             /* remaining > 0x10000 -> chunk=0x10000 */
+	mov  w10, w9              /* else chunk = remaining */
+.Spr_big:
+	str  w10, [sp, #0x7C]     /* chunk */
+	/* lseek(fd, old_ptr, 0); read(fd, buf, chunk) */
+	mov  x0, x20
+	mov  x1, x22
+	mov  x2, #0
+	mov  x8, #62
+	svc  #0
+	tbnz x0, #63, .Spr_fail
+	mov  x0, x20
+	add  x1, sp, #0x80
+	ldr  w2, [sp, #0x7C]
+	mov  x8, #63
+	svc  #0
+	ldr  w9, [sp, #0x7C]
+	cmp  x0, x9
+	b.ne .Spr_fail
+	/* lseek(fd, new_ptr, 0); write(fd, buf, chunk) */
+	mov  x0, x20
+	mov  x1, x23
+	mov  x2, #0
+	mov  x8, #62
+	svc  #0
+	tbnz x0, #63, .Spr_fail
+	mov  x0, x20
+	add  x1, sp, #0x80
+	ldr  w2, [sp, #0x7C]
+	mov  x8, #64
+	svc  #0
+	ldr  w9, [sp, #0x7C]
+	cmp  x0, x9
+	b.ne .Spr_fail
+	/* advance pointers / remaining */
+	ldr  w9, [sp, #0x7C]
+	uxtw x10, w9
+	add  x22, x22, x10
+	add  x23, x23, x10
+	ldr  w9, [sp, #0x78]      /* remaining */
+	sub  w9, w9, w10
+	str  w9, [sp, #0x78]
+	b    .Spr_cpychunk
+.Spr_cpydone:
+	/* copy recA -> recB (48), set recB.data_pos=new_off, write back */
+	add  x9, sp, #0x00
+	add  x10, sp, #0x30
+	add  x11, x9, #48
+.Spr_cpy48:
+	cmp  x9, x11
+	b.hs .Spr_cpy48d
+	ldr  w13, [x9], #4
+	str  w13, [x10], #4
+	b    .Spr_cpy48
+.Spr_cpy48d:
+	str  w21, [sp, #0x30+36]  /* recB+36 data_pos = new_off */
+	mov  x0, x19
+	mov  w1, w25
+	add  x2, sp, #0x30        /* recB */
+	bl   write_idx_rec
+	tbnz x0, #63, .Spr_fail
+	ldr  w9, [sp, #0x74]      /* size */
+	add  w9, w9, #8
+	add  w21, w21, w9         /* new_off += size+8 */
+	add  w25, w25, #1         /* h++ */
+	b    .Spr_cmploop
+.Spr_cmpdone:
+	/* ftruncate(fd, new_off) */
+	mov  x0, x20
+	uxtw x1, w21
+	mov  x8, #46              /* ftruncate */
+	svc  #0
+	tbnz x0, #63, .Spr_fail
+	mov  w0, #1
+	b    .Spr_done
+.Spr_prune_all:
+	mov  w24, #0
+.Spr_pall:
+	ldr  w9, [x19, #28]       /* cur_file_no */
+	cmp  w24, w9
+	b.hi .Spr_ok_ret
+	mov  x0, x19
+	mov  w1, w24
+	bl   unlink_blk
+	add  w24, w24, #1
+	b    .Spr_pall
+.Spr_ok_ret:
+	mov  w0, #1
+	b    .Spr_done
+.Spr_persist_only:
+	mov  x0, x19
+	mov  w1, #0
+	bl   store_set_prune
+	mov  w0, #1
+	b    .Spr_done
+.Spr_empty:
+	str  wzr, [x19, #48]
+	mov  x0, x19
+	mov  w1, #0
+	bl   store_set_prune
+	mov  w0, #1
+	b    .Spr_done
+.Spr_fail:
+	mov  x0, #-1
+.Spr_done:
+	mov  x9, #0x80
+	movk x9, #0x1, lsl #16    /* 0x10080 */
+	add  sp, sp, x9
+	ldp  x29, x30, [sp], #16
+	ldp  x24, x25, [sp], #16
+	ldp  x23, xzr, [sp], #16
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ret
+	.size store_prune, .-store_prune
+
 	.section .rodata
 idxname:   .asciz "index.dat"
 prunename: .asciz "prune.dat"
