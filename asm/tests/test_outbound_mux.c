@@ -101,7 +101,7 @@ static void mining_peer(int port_pipe, int grow_pipe){
      * version first as the outbound initiator via node_handshake) */
     char cmd[12]; unsigned char pl[4096]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;      /* node version */
-    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
       p2p_write(cfd,"verack",6,"",0); }
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;      /* node verack */
     int grow=5;

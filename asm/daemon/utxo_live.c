@@ -1781,6 +1781,29 @@ void utxo_live_set_flush_thresholds(u64 fill, u64 op){
 void* utxo_live_table(void){ return g_utxo_table; }
 void* utxo_live_lst(void){ return &g_utxo_lst; }
 
+/* Resolve one confirmed prevout against the LIVE writer state -- the
+ * in-process mempool resolution the comment above promises. Matches
+ * tx_accept.c's resolver contract (value/script/slen; height and coinbase
+ * discarded there by its own stated contract). The returned script pointer
+ * is valid until the next LSM operation, so callers must copy before
+ * yielding -- mv_resolve does. Incident #48: the worker validated relayed
+ * transactions against a SECOND, boot-latched LSM snapshot of the same
+ * datadir this writer mutates in place; lookups went incoherent within
+ * minutes (missing entries, garbage script lengths). utxo_setinfo's
+ * quiescence discipline exists precisely because a live LSM cannot be
+ * snapshot-read while written -- resolving against the writer itself is
+ * the coherent (and cheaper) alternative. */
+long utxo_live_resolve(const u8 txid[32], unsigned long index,
+                       unsigned long long* value, const u8** script,
+                       unsigned long* slen){
+    if (!g_utxo_table) return 0;
+    u64 v; unsigned long hh, cb;
+    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid, (u32)index,
+                     &v, &hh, &cb, script, slen) != 1) return 0;
+    *value = (unsigned long long)v;
+    return 1;
+}
+
 void utxo_live_close(void){
     utxo_lsm_close(&g_utxo_lst);
     g_recovery_checked = 0;

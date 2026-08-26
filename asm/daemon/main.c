@@ -94,6 +94,25 @@ extern long node_handshake(int fd);
 extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, see its header comment */
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
+
+/* NODE_WITNESS (service bit 0x8) gate, checked right after every OUTBOUND
+ * handshake that can lead to fetching blocks or transactions. A peer without
+ * the bit serves everything witness-STRIPPED no matter what getdata type we
+ * send -- the wire behaviour that silently stripped the whole segwit-era
+ * archive (incident #10). The BIP141 commitment check now rejects such
+ * blocks loudly, so a non-witness peer can no longer corrupt the archive --
+ * but it can still waste a leg failing every fetch, so refuse at dial time.
+ * A version payload too short to carry services is refused the same way:
+ * unknown is not "probably fine" on the path that feeds the archive. */
+static int peer_has_witness(const char* who){
+    unsigned long long services = 0;
+    if (g_peer_version_len >= 12)
+        memcpy(&services, g_peer_version_payload + 4, 8);
+    if (services & 0x8ULL) return 1;
+    fprintf(stderr, "[dial] %s lacks NODE_WITNESS (services=0x%llx) -- dropping\n",
+            who ? who : "?", services);
+    return 0;
+}
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
 /* STAGE B: the real multi-hash-locator entry point. node_sync is now a
  * count==1 shim over this (see bitcoind.asm). A single-hash locator is what
@@ -351,7 +370,7 @@ static long outbound_catchup(long max_blocks){
         if(fd<0) continue;
         struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-        if(node_handshake(fd)!=1){ close(fd); continue; }
+        if(node_handshake(fd)!=1 || !peer_has_witness(host)){ close(fd); continue; }
         static unsigned char loc[32];
         /* Anchor from the STORED TIP index record (index-hash read, robust to a
          * transiently-unreadable tip body -- avoiding the live-found genesis
@@ -411,7 +430,7 @@ static void fake_serve(int cfd){
     build_fake_chain();
     char cmd[12]; unsigned char pl[65536]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client version */
-    unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
     p2p_write(cfd,"verack",6,"",0);
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client verack */
     for(int n=0;n<64;n++){
@@ -440,7 +459,7 @@ static void full_serve(int cfd){
     fake_NB=8;                                   /* expose the WHOLE chain now */
     char cmd[12]; unsigned char pl[65536]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client version */
-    unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
     p2p_write(cfd,"verack",6,"",0);
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client verack */
     int gd=0;
@@ -835,7 +854,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     sigaction(SIGALRM,&old,NULL);
 
     if(fd<0) return -1;
-    if(fired || hk!=1){
+    if(fired || hk!=1 || !peer_has_witness(host)){
         if(fired) fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
                           host, OUTBOUND_DIAL_BUDGET_SECS);
         close(fd);
@@ -1490,7 +1509,7 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-    if(node_handshake(fd)!=1){ close(fd); return -1; }
+    if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
     return added;
@@ -1623,7 +1642,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons(8333));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-                    if(node_handshake(fdc)==1){
+                    if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
@@ -2306,6 +2325,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     g_in_utxo_reload = 1;                       /* see handle_shutdown_signal */
     int utxo_live_ok = archive_ok ? utxo_live_init(dir) : 0;
     g_in_utxo_reload = 0;
+    /* Incident #48: mempool prevout resolution in THIS process must query
+     * the live writer state, never a boot-latched snapshot of files the
+     * writer keeps mutating (misses + garbage script lengths within
+     * minutes). Injected before the first tx_accept use (the relay drain
+     * and the sendrawtransaction channel both init lazily, later). Without
+     * live UTXO tracking there is nothing coherent to resolve against, so
+     * validation stays on its (unavailable-shaped) fallback and rejects. */
+    if (utxo_live_ok){
+        typedef long (*txacc_resolver_t)(const unsigned char*, unsigned long,
+                                         unsigned long long*, const unsigned char**,
+                                         unsigned long*);
+        extern void tx_accept_set_resolver(txacc_resolver_t);
+        extern long utxo_live_resolve(const unsigned char*, unsigned long,
+                                      unsigned long long*, const unsigned char**,
+                                      unsigned long*);
+        tx_accept_set_resolver(utxo_live_resolve);
+    }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
     else fprintf(stderr,"[dl] worker: live UTXO state loaded (%.2fs)\n", phase_elapsed(&utxo_init_pt));
@@ -2495,7 +2531,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int fl=fcntl(cfd[i],F_GETFL,0); fcntl(cfd[i],F_SETFL,fl&~O_NONBLOCK);
             struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
             int hk=node_handshake(cfd[i]);
-            if(hk!=1){ close(cfd[i]); continue; }
+            if(hk!=1 || !peer_has_witness(srcpool[i])){ close(cfd[i]); continue; }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
             mux_out_fd[mux_n_out]=cfd[i];
@@ -2878,6 +2914,32 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
             }
+            /* ---- transaction relay (receive side) -------------------------
+             * Peers announce txs on these full-relay legs (we advertise
+             * relay=1) and node_sync_multi's drains discard every inv
+             * unexamined -- so until 2026-08-26 the production mempool had
+             * never held a single P2P transaction. Drain the leg's buffered
+             * messages here, BEFORE this rotation's sync pass: everything
+             * the peer sent since the last rotation is sitting in the
+             * socket buffer, and running the sync first would feed it all
+             * into .hdr_drain's discard (the first deploy ran the drain
+             * after the sync and accepted ~1 tx per 10 minutes; the invs
+             * were being eaten a rotation later). Announced txs are
+             * requested as MSG_WITNESS_TX -- type 1 would hand back
+             * witness-stripped serializations, incident #10's exact bug
+             * shape -- and replies run through the same tx_accept_validate
+             * the inbound path uses, into the SHARED pool so the parent's
+             * mempool RPCs see them. Cost when nothing is buffered: one
+             * empty poll(2). */
+            if(mux_out_fd[i]>=0 && txsub_worker_ready()){
+                extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+                long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                if(acc>0){
+                    extern long mpool_count(void*);
+                    fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
+                            i, mux_out_host[i], acc, mpool_count(txsub_pool()));
+                }
+            }
             /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
@@ -2892,26 +2954,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 mux_next_peer(i, srcpool, nsrc, out_port);
             }
             did |= (n>0)?1:0;
-            /* ---- transaction relay (receive side) -------------------------
-             * Peers announce txs on these full-relay legs (we advertise
-             * relay=1) and node_sync_multi's drains discard every inv
-             * unexamined -- so until 2026-08-26 the production mempool had
-             * never held a single P2P transaction. Drain the leg's buffered
-             * messages here, between sync passes: request announced txs
-             * (MSG_WITNESS_TX -- type 1 would hand back witness-stripped
-             * serializations, incident #10's exact bug shape) and run the
-             * replies through the same tx_accept_validate the inbound path
-             * uses, into the SHARED pool so the parent's mempool RPCs see
-             * them. Cost when nothing is buffered: one empty poll(2). */
-            if(mux_out_fd[i]>=0 && !mux_sync_budget_fired && txsub_worker_ready()){
-                extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
-                long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
-                if(acc>0){
-                    extern long mpool_count(void*);
-                    fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
-                            i, mux_out_host[i], acc, mpool_count(txsub_pool()));
-                }
-            }
             /* ---- STAGE B: periodic fork probe -----------------------------
              * Runs only on a leg that just returned NOTHING, which is exactly
              * the situation a fork hides in: if the peer is on a competing

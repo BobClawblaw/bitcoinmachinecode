@@ -211,7 +211,7 @@ int main(int argc, char** argv){
      * initiator). Mirror test_outbound_mux mining_peer. */
     char cmd[12]; unsigned char pl[16384]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;   /* node version */
-    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=1;
+    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=9;
       p2p_write(cfd,"version",7,v,86);
       p2p_write(cfd,"verack",6,"",0); }
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;   /* node verack */
