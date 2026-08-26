@@ -2345,6 +2345,42 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         extern void tx_accept_set_tip(long);
         tx_accept_set_resolver(utxo_live_resolve);
         tx_accept_set_tip(*(int*)(store_buf+24));
+
+        /* ---- coinstats index: continuous gettxoutsetinfo + a standing
+         * cryptographic parity instrument. Observers feed it every coin
+         * add/remove on the apply and reorg paths; it persists at the same
+         * per-block durability point as the applied height. Seeding costs a
+         * full walk (minutes) exactly once -- afterwards the persisted state
+         * is adopted instantly on every clean boot. Seeded HERE, before the
+         * catch-up loop starts writing, which is what makes the walk's
+         * quiescence requirement hold by construction. */
+        {
+            typedef void (*coin_fn)(const unsigned char*, unsigned int,
+                                    unsigned long long, unsigned long long,
+                                    unsigned long long, const unsigned char*,
+                                    unsigned long);
+            extern void utxo_live_set_coinstats(coin_fn, coin_fn,
+                                                void (*)(const char*), void (*)(long));
+            extern void undo_set_coin_observer(coin_fn);
+            extern void csi_on_add(const unsigned char*, unsigned int,
+                                   unsigned long long, unsigned long long,
+                                   unsigned long long, const unsigned char*, unsigned long);
+            extern void csi_on_remove(const unsigned char*, unsigned int,
+                                      unsigned long long, unsigned long long,
+                                      unsigned long long, const unsigned char*, unsigned long);
+            extern void csi_invalidate(const char*);
+            extern void csi_commit(long);
+            extern int  csi_boot(long);
+            extern int  csi_seed_from_walk(void*, void*, long);
+            extern void* utxo_live_lst(void);
+            extern void* utxo_live_table(void);
+            extern long utxo_live_applied_height(void);
+            utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
+            undo_set_coin_observer(csi_on_remove);
+            long ah = utxo_live_applied_height();
+            if (!csi_boot(ah))
+                csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+        }
     }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
@@ -3342,7 +3378,13 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
-      rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run); }
+      rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run);
+      { extern long csi_rpc_run(int, void*, char*, unsigned long);
+        extern long csi_file_height(void);
+        extern void rpc_chain_set_coinstats(long (*)(int, void*, char*, unsigned long));
+        extern void rpc_chain_set_coinstats_height(long (*)(void));
+        rpc_chain_set_coinstats(csi_rpc_run);
+        rpc_chain_set_coinstats_height(csi_file_height); } }
     { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
                                     long*, unsigned long long*, char*, unsigned long);
       rpc_chain_set_utxodump(utxo_dump_rpc_run); }
