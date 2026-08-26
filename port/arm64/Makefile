@@ -117,6 +117,17 @@ fuzz_sigops: fz_sigops
 	python3 fuzz_sigops.py 12345 4000 4
 fz_sigops: fz_sigops.c bitcoin_sigops.o bitcoin_scriptcodec.o
 	$(CC) $(CFLAGS) -o fz_sigops fz_sigops.c bitcoin_sigops.o bitcoin_scriptcodec.o
+
+# integrated IBD driver: downloads + cons_verify + per-tx sv_verify_script + UTXO apply
+IBDOBJS = bitcoin_net.o bitcoin_p2p.o bitcoin_hash.o sha256.o bitcoin_headers.o \
+          bitcoin_tx.o bitcoin_store.o bitcoin_cons.o bitcoin_utxo.o \
+          bitcoin_utxo_store.o bitcoin_undo.o bitcoin_sigops.o vobj/btc_scriptverify.o \
+          bitcoin_checksig.o bitcoin_sighash.o bitcoin_bip143.o bitcoin_script.o \
+          bitcoin_scriptcodec.o bitcoin_interp.o secp256k1_ecdsa.o secp256k1_point.o \
+          secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o secp256k1_schnorr.o \
+          sha1.o ripemd160.o
+ibd: ibd.c $(IBDOBJS)
+	$(CC) $(CFLAGS) -o ibd ibd.c $(IBDOBJS)
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 
