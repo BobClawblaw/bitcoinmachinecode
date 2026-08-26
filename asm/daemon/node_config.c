@@ -288,6 +288,11 @@ long node_config_load(const char* path){
             else if(cfg_addlist(g_cfg.connectn,&g_cfg.n_connect,val,key,&bad)){
                 g_cfg.connect_only = 1; applied++;
             } }
+        else if(!strcmp(key,"signer")){
+            /* Core: the external signer command (HWI). Stored verbatim; the
+             * RPC layer shells out to it for enumeratesigners /
+             * walletdisplayaddress. */
+            snprintf(g_cfg.signer, sizeof g_cfg.signer, "%s", val); applied++; }
         else if(!strcmp(key,"blocksonly")){
             /* Core: do not participate in tx relay. We honour it by setting
              * relay=0 on ordinary outbound legs too, which is what the flag
