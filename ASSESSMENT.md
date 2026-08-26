@@ -285,9 +285,34 @@ In rough order of how much each would move it:
    negative cases needed explicit "Core must REJECT" support rather than
    being counted as construction failures.
 
-   What remains uncovered here is resource accounting rather than semantics:
-   sigop budgets, the taproot per-input validation weight budget, and the
-   10,000-byte script bound.
+   **Resource accounting followed, and found a THIRD false accept.**
+   OP_CHECKMULTISIG's key count is charged to the 201-opcode budget in Core
+   (`nOpCount += nKeysCount`, then the limit re-check); this interpreter
+   validated the count against MAX_PUBKEYS_PER_MULTISIG but never charged it.
+   Ten 0-of-20 multisigs are ten opcodes and two hundred keys -- 210, over the
+   limit -- and verified here while Core rejected them with
+   SCRIPT_ERR_OP_COUNT. Accept direction again, and 0-of-N checks no
+   signatures, so no key material was needed to build one. Fixed in
+   `bitcoin_interp.asm`, with `tests/test_multisig_opcount.c` pinning the
+   9-vs-10 boundary (a fix that merely rejected multisig-heavy scripts would
+   fail the nine case) and confirmed to FAIL against the unfixed code.
+
+   The rest of the resource surface agrees: MAX_SCRIPT_SIZE at exactly
+   10,000/10,001, MAX_PUBKEYS_PER_MULTISIG at 20/21, and -- the cases most
+   likely to be got wrong by reusing the legacy limits -- the two that
+   tapscript does NOT inherit. Core gates both the 10,000-byte bound and the
+   201-opcode limit on (BASE || WITNESS_V0), so the SAME bytes must be legal
+   as a tapscript and rejected as legacy; both directions are asserted.
+   OP_CHECKMULTISIG(VERIFY) is confirmed disabled in tapscript. BIP342's
+   validation-weight budget is swept across its boundary (1..15 sigops
+   against a single duplicated signature) WITHOUT hardcoding where the
+   boundary falls -- Core defines it, and both engines must simply agree,
+   which they do, at 10.
+
+   Standing totals for this item: 74 synthesized spend cases, 95
+   rule-targeted mutations, 7,805 interpreter probes, zero divergences, on
+   top of the real-spend corpus. Three consensus bugs found by this method in
+   total, all in the accept direction, none reachable by sampling real blocks.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
 4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the

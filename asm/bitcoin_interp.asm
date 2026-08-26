@@ -2802,6 +2802,29 @@ interp_checkmultisig:
     jg    .err_pubcount
     mov   [rsp+24], r15d         ; locals: nKeys
 
+    ; ---- Core: nOpCount += nKeysCount, THEN re-check MAX_OPS_PER_SCRIPT
+    ; (interpreter.cpp's OP_CHECKMULTISIG arm). The key count is charged to
+    ; the opcode budget, not just the single opcode -- so ten 0-of-20
+    ; multisigs are 200 keys + 10 opcodes = 210 and must be REJECTED even
+    ; though only ten opcodes were executed.
+    ;
+    ; This was missing until 2026-08-26: the budget saw only the opcode, so
+    ; such a script verified here while Core rejected it with
+    ; SCRIPT_ERR_OP_COUNT -- a false accept in the chain-split direction,
+    ; found by validation/synth_corpus_diff.py's resource sweep. No key
+    ; material is needed to build one (0-of-N checks no signatures), so it
+    ; was trivially reachable in a bare or P2WSH script.
+    ;
+    ; rbp is script_eval's frame (see this file's header note on the shared
+    ; frame), so [rbp-0x28] is the same counter the main loop increments.
+    ; Tapscript never reaches here -- CHECKMULTISIG is disabled there --
+    ; so no sigversion gate is needed, matching Core's own arm.
+    movsxd rax, r15d
+    add   [rbp-0x28], rax
+    mov   rax, [rbp-0x28]
+    cmp   rax, MAX_OPS_PER_SCRIPT
+    ja    .err_opcount
+
     ; stacktop(nkeys+2) = m
     mov   eax, [rsp+24]
     add   eax, 2
@@ -3126,6 +3149,10 @@ interp_checkmultisig:
 .err_nulldummy:
     mov   rax, [rbp-0x70]
     mov   qword [rax], SCRIPT_ERR_SIG_NULLDUMMY
+    jmp   .err_exit
+.err_opcount:
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_OP_COUNT
     jmp   .err_exit
 .err_pubcount:
     mov   rax, [rbp-0x70]

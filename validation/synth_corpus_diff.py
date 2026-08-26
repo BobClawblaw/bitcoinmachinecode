@@ -260,6 +260,12 @@ class Case:
         # an opcode just outside the OP_SUCCESS range, which proves the range
         # boundary is real rather than a blanket accept -- and those assert
         # agreement on REJECTION instead.
+        # True  -> Core must ACCEPT (validates the construction)
+        # False -> Core must REJECT (a deliberate negative)
+        # None  -> either is fine; only AGREEMENT is asserted. Used where the
+        #          boundary is Core's to define and hardcoding it here would
+        #          test my arithmetic instead of the node (the BIP342
+        #          validation-weight sweep).
         self.expect_accept = expect_accept
         self.d = {'kind': kind, 'idx': idx, 'flags': flags,
                   'tx_hex': tx_hex, 'ss_hex': ss_hex, 'scriptsig_hex': ss_hex,
@@ -669,6 +675,132 @@ def interpreter_cases(rng):
     A(ScriptCase('misc/OP_VERIFY on false fails', bytes([OP_1, OP_0, OP_VERIFY]), expect=0))
     return cs
 
+# --- resource limits -------------------------------------------------------
+# Core's own constants (script/script.h), read rather than remembered:
+#   MAX_SCRIPT_SIZE 10000, MAX_OPS_PER_SCRIPT 201, MAX_PUBKEYS_PER_MULTISIG 20,
+#   MAX_STACK_SIZE 1000, VALIDATION_WEIGHT_OFFSET 50, PER_SIGOP_PASSED 50.
+# The two limits worth the most attention are the ones tapscript does NOT
+# inherit: interpreter.cpp gates both the 10,000-byte script bound and the
+# 201-opcode limit on (BASE || WITNESS_V0), so a tapscript is exempt from
+# both. An implementation that applied them uniformly would REJECT scripts
+# Core accepts.
+def _big_script(target_len, tail=None):
+    """A script of exactly target_len bytes that leaves a truthy stack.
+    Built from 520-byte pushes (which do NOT count toward the opcode limit --
+    Core only counts opcodes > OP_16) plus a filler push."""
+    tail = tail if tail is not None else bytes([OP_TRUE])
+    body = b''
+    chunk = pushdata(b'\x2a' * 520)                 # 3 + 520 = 523 bytes
+    while len(body) + len(chunk) + len(tail) + 2 <= target_len:
+        body += chunk
+    rem = target_len - len(body) - len(tail)
+    if rem == 1:
+        body += bytes([OP_1])                       # single-byte filler
+    elif rem >= 2:
+        body += pushdata(b'\x2a' * (rem - 1))       # 1 + (rem-1) = rem
+    out = body + tail
+    assert len(out) == target_len, (len(out), target_len)
+    return out
+
+def resource_script_cases():
+    """Legacy/bare probes for the size, opcode and pubkey-count ceilings."""
+    cs = []
+    A = cs.append
+    # --- MAX_SCRIPT_SIZE, at the boundary ---
+    A(ScriptCase('limit/script exactly 10000 bytes ok', _big_script(10000), expect=1))
+    A(ScriptCase('limit/script 10001 bytes rejected', _big_script(10001), expect=0))
+    # --- MAX_PUBKEYS_PER_MULTISIG ---
+    pks = [keypair(0xD0 + i)[1] for i in range(21)]
+    def cms(n):
+        # <dummy> <m=0> <pk..n> <n> OP_CHECKMULTISIG -- 0-of-n needs no
+        # signatures, so this isolates the KEY-COUNT rule from signing.
+        return (bytes([OP_0, OP_0]) + b''.join(pushdata(k) for k in pks[:n])
+                + push_num(n) + bytes([OP_CHECKMULTISIG]))
+    A(ScriptCase('limit/multisig 20 pubkeys ok', cms(20), expect=1))
+    A(ScriptCase('limit/multisig 21 pubkeys rejected', cms(21), expect=0))
+    # --- OP_CHECKMULTISIG adds its KEY COUNT to the opcode budget ---
+    # Core: nOpCount += nKeysCount, then the 201 check. Ten 0-of-20 multisigs
+    # are 10 opcodes + 200 keys = 210 > 201, so the budget must account for
+    # the keys, not just the opcodes.
+    A(ScriptCase('limit/9 x 0-of-20 multisig within the opcode budget',
+                 cms(20) * 9 + bytes([OP_TRUE]), expect=1))
+    A(ScriptCase('limit/10 x 0-of-20 multisig exceeds it (keys count)',
+                 cms(20) * 10 + bytes([OP_TRUE]), expect=0))
+    return cs
+
+def resource_asymmetry_cases():
+    """The same bytes, legal in tapscript and ILLEGAL in legacy. Testing each
+    side alone would not catch an implementation that applied one rule set
+    everywhere; testing the pair does."""
+    huge = (pushdata(b'\x2a' * 520) + bytes([OP_DROP])) * 20 + bytes([OP_TRUE])
+    return [
+        ScriptCase('limit/the >10000-byte script is REJECTED as legacy', huge, expect=0),
+        ScriptCase('limit/300 opcodes is REJECTED as legacy',
+                   bytes([OP_NOP]) * 300 + bytes([OP_TRUE]), expect=0),
+    ]
+
+def resource_tapscript_cases():
+    """Tapscript is EXEMPT from the script-size and opcode limits, and forbids
+    OP_CHECKMULTISIG outright. Each of these would be got wrong by an
+    implementation that simply reused the legacy limits."""
+    cs = []
+    # A script far past MAX_SCRIPT_SIZE, valid in tapscript. Each 520-byte
+    # push is immediately dropped so the stack ends with exactly one truthy
+    # element, which tapscript requires. 20 * (523 + 1) + 1 = 10,481 bytes.
+    huge = (pushdata(b'\x2a' * 520) + bytes([OP_DROP])) * 20 + bytes([OP_TRUE])
+    assert len(huge) > 10000
+    cs.append(synth_tapscript_raw('limit/tapscript >10000 bytes is legal', huge))
+    # >201 opcodes, legal in tapscript, illegal in legacy -- the SAME bytes
+    many_nops = bytes([OP_NOP]) * 300 + bytes([OP_TRUE])
+    cs.append(synth_tapscript_raw('limit/tapscript 300 opcodes is legal', many_nops))
+    # OP_CHECKMULTISIG is disabled in tapscript (BIP342)
+    cs.append(synth_tapscript_raw('limit/tapscript OP_CHECKMULTISIG is disabled',
+                                  bytes([OP_0, OP_0, OP_0, OP_CHECKMULTISIG]),
+                                  expect_accept=False))
+    cs.append(synth_tapscript_raw('limit/tapscript OP_CHECKMULTISIGVERIFY is disabled',
+                                  bytes([OP_0, OP_0, OP_0, 0xaf]),
+                                  expect_accept=False))
+    return cs
+
+def synth_tapscript_budget(k):
+    """A tapscript performing k+1 signature checks against ONE signature,
+    sweeping the BIP342 validation-weight budget.
+
+    The budget is GetSerializeSize(witness) + 50, and every sigop that passes
+    with a non-empty signature costs 50. Duplicating one signature with OP_DUP
+    is what makes the budget reachable at all: adding more signatures to the
+    witness would raise the budget faster than the sigops consume it.
+
+    The boundary is deliberately NOT hardcoded here -- several values of k are
+    swept and both engines must simply AGREE on each, so this tests our
+    accounting against Core's rather than against my arithmetic."""
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    spriv, spub = keypair(0xE0)
+    xonly = spub[1:]
+    # OP_DUP <pk> OP_CHECKSIGVERIFY, k times, then <pk> OP_CHECKSIG
+    leaf_script = (bytes([OP_DUP]) + pushdata(xonly) + bytes([0xad])) * k \
+                  + pushdata(xonly) + bytes([OP_CHECKSIG])
+    d = coincurve.PrivateKey(bytes([0xE1]) * 32)
+    if d.public_key.format(True)[0] == 3:
+        d = coincurve.PrivateKey((N - int.from_bytes(d.secret, 'big')).to_bytes(32, 'big'))
+    ix = d.public_key.format(True)[1:]
+    leaf = tapleaf(leaf_script)
+    Q = coincurve.PublicKey.combine_keys(
+        [coincurve.PublicKey(b'\x02' + ix),
+         coincurve.PrivateKey(tagged('TapTweak', ix + leaf)).public_key]).format(True)
+    ox, par = Q[1:], Q[0] & 1
+    spk = b'\x51\x20' + ox
+    seq = 0xffffffff
+    outs = [(DEST_VAL, DEST_SPK)]
+    ins = [(outpoint(0), seq)]
+    sh = taproot_sighash(ins, outs, [spk], [IN_VAL], 0, 0x00, version=2, tapleaf_hash=leaf)
+    sig = spriv.sign_schnorr(sh, bytes(32))
+    control = bytes([0xc0 | par]) + ix
+    items = [sig, leaf_script, control]
+    tx = serialize_tx(2, [(outpoint(0), b'', seq)], outs, 0, [items])
+    return Case('budget/tapscript %d sigops' % (k + 1), 'v1', F_ALL, spk.hex(),
+                tx.hex(), '', IN_VAL, [(IN_VAL, spk.hex())], expect_accept=None)
+
 def run_script_case(c, core, asm, res):
     res['ip_cases'] += 1
     lc = ip_line(c, 'core'); la = ip_line(c, 'asm')
@@ -744,6 +876,17 @@ def run_case(c, core, asm, res):
     if c_ok in ('unsupported', None) or a_ok in ('unsupported', None):
         res['engine_fail'].append({'feature': c.feature, 'phase': 'accept',
                                    'core': c_ok, 'asm': a_ok, 'line': la[:200]})
+        return
+    if c.expect_accept is None:
+        if c_ok == a_ok:
+            res['accept_ok'] += 1
+            res['by_feature'][c.feature]['accept'] += 1
+        else:
+            rec = {'feature': c.feature, 'core': c_ok, 'asm': a_ok,
+                   'core_err': c_err, 'asm_err': a_err}
+            res['accept_div'].append(rec)
+            res['by_feature'][c.feature]['div'] += 1
+            if a_ok == 1: res['false_accept'].append(rec)
         return
     if not c.expect_accept:
         # a deliberate negative: Core must REJECT, and the ASM must agree
@@ -1136,6 +1279,9 @@ def all_cases():
         cs.append(synth_sighash_taproot(name, ht))
     cs.append(synth_sighash_single_bug())
     cs += tapscript_cases()
+    cs += resource_tapscript_cases()
+    for k in range(0, 15):
+        cs.append(synth_tapscript_budget(k))
     for v in ('p2sh-p2wpkh', 'p2sh-p2wsh'): cs.append(synth_p2sh_wrapped(v))
     for n, w in ((2, 0), (2, 1), (3, 2), (4, 1), (4, 3)):
         cs.append(synth_taproot_multileaf(n, w))
@@ -1164,7 +1310,8 @@ def main():
         print('  %-24s accept=%d mut_ok=%d div=%d'
               % (c.feature, bf['accept'], bf['mut_ok'], bf['div']))
     if not args.only:
-        ipc = interpreter_cases(random.Random(args.seed))
+        ipc = (interpreter_cases(random.Random(args.seed))
+               + resource_script_cases() + resource_asymmetry_cases())
         print('  interpreter surface: %d probes...' % len(ipc))
         for c in ipc:
             run_script_case(c, core, asm, res)
