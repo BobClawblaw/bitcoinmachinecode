@@ -51,8 +51,8 @@ extern int  p2p_read(int fd, char cmd_out[12], void* payload, unsigned cap, unsi
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern const u8* mpool_get(void* mp, const u8* txid, unsigned long* len_out);
 extern long tx_accept_validate(void* mp, const u8 txid[32], const u8* tx, unsigned long len);
-extern long tx_accept_validate_reason(void* mp, const u8 txid[32], const u8* tx,
-                                      unsigned long len, char* reason, unsigned long rcap);
+extern long tx_accept_validate_p2p(void* mp, const u8 txid[32], const u8* tx,
+                                   unsigned long len);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* scratch, unsigned long scratchcap);
 
 #define TXR_MSG_TX          1u
@@ -237,9 +237,9 @@ static long txr_orphan_resolve(void* mp, const u8 accepted[32]){
             for (u32 k = 0; k < o->nparent; k++) if (!memcmp(o->parent[k], want, 32)) { hit = 1; break; }
             if (!hit) continue;
             u8 id[32];
-            char reason[96];
+            long rr = -26;
             if (tx_txid(id, o->buf, o->len, scratch2, sizeof scratch2) == 1 &&
-                tx_accept_validate_reason(mp, id, o->buf, o->len, reason, sizeof reason) == 1){
+                (rr = tx_accept_validate_p2p(mp, id, o->buf, o->len)) == 1){
                 got++; txr_orph_resolved++;
                 txr_ann_add(id, -1);           /* cascaded accepts announce everywhere */
                 memcpy(want, id, 32);          /* this accept may unlock ITS children */
@@ -249,7 +249,7 @@ static long txr_orphan_resolve(void* mp, const u8 accepted[32]){
             }
             /* still unresolvable (another parent missing, or a real reject):
              * leave it for the TTL; a definitive non-missing reject frees it */
-            if (!strstr(reason, "missing/already-spent")){ txr_orphan_free(o); txr_orph_dropped++; }
+            if (rr != -25){ txr_orphan_free(o); txr_orph_dropped++; }
         }
     }
     return got;
@@ -335,8 +335,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (outstanding > 0) outstanding--;
             u8 txid[32];
             if (plen >= 60 && tx_txid(txid, pl, plen, scratch, sizeof scratch) == 1){
-                char reason[96];
-                long r = tx_accept_validate_reason(mp, txid, pl, plen, reason, sizeof reason);
+                long r = tx_accept_validate_p2p(mp, txid, pl, plen);
                 if (r == 1){
                     accepted++;
                     txr_ann_add(txid, fd);
