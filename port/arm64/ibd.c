@@ -67,13 +67,30 @@ extern void node_log_event(long fd, int kind, unsigned a, unsigned b, unsigned c
 extern void node_log_str(long fd, int kind, const char* s, long len);
 #define NL(fd,kind,s) do{ const char*_s=(s); node_log_str((fd),(kind),_s,(long)strlen(_s)); }while(0)
 static long g_log=0;
+/* UTC-timestamped line writer (matches daemon/log_ts.h format:
+ * "YYYY-MM-DD HH:MM:SS.mmm <msg>"), so official log lines carry a timestamp
+ * even though the low-level all-asm node_log_str (like upstream node_log.asm)
+ * writes them raw. Prefix is built in C at the call site. */
+static void logline(long lfd, int kind, const char* msg, int n){
+    if(!lfd) return;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
+    struct tm tmv; gmtime_r(&ts.tv_sec,&tmv);
+    char b[640];
+    int p=snprintf(b,sizeof b,"%04d-%02d-%02d %02d:%02d:%02d.%03ld ",
+        tmv.tm_year+1900,tmv.tm_mon+1,tmv.tm_mday,tmv.tm_hour,tmv.tm_min,tmv.tm_sec,ts.tv_nsec/1000000);
+    if(p<0)p=0; if(p>(int)sizeof b)p=(int)sizeof b;
+    int m=n; if(m>(int)sizeof b - p - 1) m=(int)sizeof b - p - 1;
+    memcpy(b+p, msg, (size_t)m);
+    node_log_str(lfd, kind, b, (long)(p+m));
+}
 #define LLOG(kind, fmt, ...) do{ \
     fprintf(stderr, fmt, ##__VA_ARGS__); \
     if(g_log){ char _b[512]; int _n=snprintf(_b,sizeof _b,fmt, ##__VA_ARGS__); \
                if(_n<0)_n=0; if(_n>(int)sizeof _b)_n=(int)sizeof _b; \
                while(_n>0 && (_b[_n-1]=='\n'||_b[_n-1]=='\r')) _n--; \
-               node_log_str(g_log,(kind),_b,_n); } \
+               logline(g_log,(kind),_b,_n); } \
 }while(0)
+#define TLINE(kind,s) do{ logline(g_log,(kind),(s),(int)strlen(s)); }while(0)
 
 /* ---- helpers ---- */
 static void p16be(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
@@ -309,7 +326,7 @@ int main(int argc, char** argv){
     /* official log: <datadir>/logs/bitcoind.production.log (all-asm leveled logger) */
     mkdir("logs",0755);
     g_log = node_log_open("logs/bitcoind.production.log");
-    NL(g_log, 7, "node start (ibd download worker)");
+    TLINE(7, "node start (ibd download worker)");
     uint64_t flags = SV_SIGPUSHONLY | ((argc>5&&atoi(argv[5]))?SV_P2SH:0);
 
     /* ---- load verified header chain ---- */
@@ -472,10 +489,8 @@ done:
     fprintf(stderr,"\n%s\n",
         (valid==maxblk && bad_sig==0)? "IBD VERIFY SIGNED OFF NATIVELY (all blocks, all sigs)"
         : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)"));
-    if(g_log) node_log_str(g_log, 0,
+    if(g_log) TLINE(0,
         (valid==maxblk && bad_sig==0)? "IBD VERIFY SIGNED OFF NATIVELY (all blocks, all sigs)"
-        : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)"),
-        (long)strlen((valid==maxblk && bad_sig==0)? "IBD VERIFY SIGNED OFF NATIVELY (all blocks, all sigs)"
-        : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)")));
+        : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)"));
     return (bad_sig==0 && valid==maxblk)? 0 : 1;
 }
