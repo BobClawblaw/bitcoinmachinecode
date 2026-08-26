@@ -13,8 +13,23 @@
  * Deps (all already ported): store_get_at, store_get_file_fd, store_reload,
  *   store_get_tip, store_prune, block_hash, sha256d, tx_parse, fd_write_all.
  * cli_load_block uses raw AArch64 syscalls: lseek=62 (fd,off,whence), read=63.
+ *
+ * BLOCK BUFFER: the command frames each carry a CLI_BLK-byte on-stack block
+ * buffer so the CLI can read REAL full mainnet blocks (live_blocks fetches
+ * segwit blocks of ~1.6-1.8 MB; Core MAX_BLOCK_SERIALIZED_SIZE = 4,000,000).
+ * The upstream x86 CLI sized these buffers at 384B/2KB/16KB, so it could only
+ * inspect synthetic/small chains -- this AArch64 port enlarges them so the
+ * block-reading commands work against the real chain in data/. Must stay >=
+ * MAX_BLOCK_SERIALIZED_SIZE (4,000,000); 0x400000 = 4 MiB.
  * ==========================================================================*/
     .section .text
+
+    .equ CLI_BLK, 0x400000    /* 4 MiB block buffer per command frame */
+
+/* LB reg: load CLI_BLK (0x400000) into a register. 0x400000 = 0x40 << 16. */
+.macro LB reg
+    movz \reg, #0x40, lsl #16
+.endm
 
     .extern store_get_at
     .extern store_get_file_fd
@@ -362,7 +377,8 @@ cmd_getbestblockhash:
     stp  x19, x20, [sp, #-16]!
     stp  x21, x22, [sp, #-16]!
     stp  x23, x24, [sp, #-16]!
-    mov  x9,  #0x4060
+    LB x9
+    add  x9, x9, #0x60
     sub  sp, sp, x9
     mov  x19, x0            /* st */
     mov  x20, x1            /* out */
@@ -370,28 +386,31 @@ cmd_getbestblockhash:
     ldr  w9, [x19, #24]     /* tip */
     cmp  w9, #-1
     b.eq .gbbh_fail
-    /* cli_load_block(st, tip, blockbuf, 0x4000) */
+    /* cli_load_block(st, tip, blockbuf, CLI_BLK) */
     mov  x0, x19
     mov  w1, w9
     add  x2, sp, #0
-    mov  x3, #0x4000
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gbbh_fail
     cmp  x0, #80
     b.lo .gbbh_fail
-    /* block_hash(hbuf@sp+0x4000, blockbuf) */
-    add  x0, sp, #4, lsl #12
+    /* hbuf = sp+CLI_BLK ; block_hash(hbuf, blockbuf) */
+    LB x9
+    add  x0, sp, x9
     add  x1, sp, #0
     bl   block_hash
-    /* cli_rev32(rev@sp+0x4020, hbuf) */
-    add  x0, sp, #4, lsl #12
+    /* cli_rev32(rev=hbuf+0x20, hbuf) */
+    LB x9
+    add  x0, sp, x9
     add  x0, x0, #0x20
-    add  x1, sp, #4, lsl #12
+    sub  x1, x0, #0x20      /* hbuf = rev-0x20 */
     bl   cli_rev32
-    /* cli_hex(out, rev, 32) */
+    /* cli_hex(out, rev=hbuf+0x20, 32) */
     mov  x0, x20
-    add  x1, sp, #4, lsl #12
+    LB x9
+    add  x1, sp, x9
     add  x1, x1, #0x20
     mov  x2, #32
     bl   cli_hex
@@ -402,13 +421,15 @@ cmd_getbestblockhash:
 .gbbh_fail:
     mov  x0, #-1
 .gbbh_done:
-    mov  x9,  #0x4060
+    LB x9
+    add  x9, x9, #0x60
     add  sp, sp, x9
     ldp  x23, x24, [sp], #16
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
     ldp  x29, x30, [sp], #16
     ret
+.size cmd_getbestblockhash, .-cmd_getbestblockhash
 
 /* hex_char_only(byte=x0) -> w0 = 1 if hex digit / 0; leaf */
 hex_char_only:
@@ -475,7 +496,9 @@ cmd_getblockhash:
     stp  x19, x20, [sp, #-16]!
     stp  x21, x22, [sp, #-16]!
     stp  x23, x24, [sp, #-16]!
-    sub  sp, sp, #0x860
+    LB x9
+    add  x9, x9, #0x60
+    sub  sp, sp, x9
     mov  x19, x0            /* st */
     mov  x20, x1            /* hstr */
     mov  x21, x2            /* out */
@@ -488,24 +511,31 @@ cmd_getblockhash:
     b.eq .gbh2_fail
     cmp  w23, w9
     b.hi .gbh2_fail
-    /* cli_load_block(st, height, blockbuf, 0x800) */
+    /* cli_load_block(st, height, blockbuf, CLI_BLK) */
     mov  x0, x19
     mov  x1, x23
     add  x2, sp, #0
-    mov  x3, #0x800
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gbh2_fail
     cmp  x0, #80
     b.lo .gbh2_fail
-    add  x0, sp, #0x800
+    /* hbuf = sp+CLI_BLK ; block_hash(hbuf, blockbuf) */
+    LB x9
+    add  x0, sp, x9
     add  x1, sp, #0
     bl   block_hash
-    add  x0, sp, #0x820
-    add  x1, sp, #0x800
+    /* cli_rev32(rev=hbuf+0x20, hbuf) */
+    LB x9
+    add  x0, sp, x9
+    add  x0, x0, #0x20
+    sub  x1, x0, #0x20
     bl   cli_rev32
     mov  x0, x21
-    add  x1, sp, #0x820
+    LB x9
+    add  x1, sp, x9
+    add  x1, x1, #0x20
     mov  x2, #32
     bl   cli_hex
     mov  w9, #10
@@ -515,7 +545,9 @@ cmd_getblockhash:
 .gbh2_fail:
     mov  x0, #-1
 .gbh2_done:
-    add  sp, sp, #0x860
+    LB x9
+    add  x9, x9, #0x60
+    add  sp, sp, x9
     ldp  x23, x24, [sp], #16
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
@@ -530,7 +562,9 @@ cmd_getblock:
     stp  x19, x20, [sp, #-16]!
     stp  x21, x22, [sp, #-16]!
     stp  x23, x24, [sp, #-16]!
-    sub  sp, sp, #0x230
+    LB x9
+    add  x9, x9, #0x80
+    sub  sp, sp, x9
     mov  x19, x0            /* st */
     mov  x20, x1            /* arg */
     mov  x21, x2            /* out */
@@ -550,7 +584,7 @@ cmd_getblock:
     mov  x0, x19
     mov  x1, x23
     add  x2, sp, #0
-    mov  x3, #0x180
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gbk_fail
@@ -564,13 +598,18 @@ cmd_getblock:
     add  x0, x0, #1
     b    .gbk_done
 .gbk_byhash:
-    /* parse 64 hex -> bin (display), reverse to raw into rev */
-    add  x0, sp, #0x1b0
+    /* bin = sp+CLI_BLK ; parse 64 hex -> bin (display) */
+    LB x9
+    add  x0, sp, x9
     mov  x1, x20
     bl   cli_hex_to_bin
     cbz  w0, .gbk_fail
-    add  x0, sp, #0x1d0
-    add  x1, sp, #0x1b0
+    /* cli_rev32(rev=bin+0x20, bin) */
+    LB x9
+    add  x0, sp, x9
+    add  x0, x0, #0x20
+    add  x1, sp, #0
+    add  x1, x1, x9         /* bin = sp+CLI_BLK */
     bl   cli_rev32          /* rev = raw requested hash */
     ldr  w9, [x19, #24]
     cmp  w9, #-1
@@ -583,18 +622,23 @@ cmd_getblock:
     mov  x0, x19
     mov  w1, w23
     add  x2, sp, #0
-    mov  x3, #0x180
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gbk_next
     cmp  x0, #80
     b.lo .gbk_next
-    add  x0, sp, #0x1f0
+    /* hbuf = sp+CLI_BLK+0x40 ; block_hash(hbuf, blockbuf) */
+    LB x9
+    add  x0, sp, x9
+    add  x0, x0, #0x40
     add  x1, sp, #0
     bl   block_hash
-    /* compare hbuf vs rev (32 bytes) */
-    add  x9, sp, #0x1f0
-    add  x10, sp, #0x1d0
+    /* compare hbuf(base+0x40) vs rev(base+0x20), 32 bytes */
+    LB x9
+    add  x9, sp, x9
+    add  x10, x9, #0x20     /* rev */
+    add  x9, x9, #0x40      /* hbuf */
     mov  x11, #0
 .gbk_cmp:
     cmp  x11, #32
@@ -612,7 +656,7 @@ cmd_getblock:
     mov  x0, x19
     mov  w1, w23
     add  x2, sp, #0
-    mov  x3, #0x180
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gbk_fail
@@ -631,7 +675,9 @@ cmd_getblock:
 .gbk_fail:
     mov  x0, #-1
 .gbk_done:
-    add  sp, sp, #0x230
+    LB x9
+    add  x9, x9, #0x80
+    add  sp, sp, x9
     ldp  x23, x24, [sp], #16
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
@@ -706,14 +752,16 @@ cli_read_varint:
 #define L_GCP 128
 #define L_GIF 160
 #define L_GBB 224
-#define F_TX  0x2b0
+#define F_TX  (0xe0 + CLI_BLK)
 cmd_gettx:
     stp  x29, x30, [sp, #-16]!
     mov  x29, sp
     stp  x19, x20, [sp, #-16]!
     stp  x21, x22, [sp, #-16]!
     stp  x23, x24, [sp, #-16]!
-    sub  sp, sp, #F_TX
+    LB x9
+    add  x9, x9, #0xe0        /* F_TX = 0xe0 + CLI_BLK */
+    sub  sp, sp, x9
     mov  x19, x0            /* st */
     mov  x20, x1            /* txid hex */
     mov  x21, x2            /* out */
@@ -737,7 +785,7 @@ cmd_gettx:
     mov  x0, x19
     mov  w1, w23
     add  x2, sp, #L_GBB
-    mov  x3, #0x180
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gtx_next
@@ -848,7 +896,9 @@ cmd_gettx:
 .gtx_fail:
     mov  x0, #-1
 .gtx_done:
-    add  sp, sp, #F_TX
+    LB x9
+    add  x9, x9, #0xe0        /* F_TX */
+    add  sp, sp, x9
     ldp  x23, x24, [sp], #16
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16
@@ -872,14 +922,16 @@ fnd1_len = . - fnd1
 #define L_BSL 56
 #define L_BIF 64
 #define L_BBB 208
-#define F_GB  0x2b0
+#define F_GB  (0xd0 + CLI_BLK)
 cmd_getbalance:
     stp  x29, x30, [sp, #-16]!
     mov  x29, sp
     stp  x19, x20, [sp, #-16]!
     stp  x21, x22, [sp, #-16]!
     stp  x23, x24, [sp, #-16]!
-    sub  sp, sp, #F_GB
+    LB x9
+    add  x9, x9, #0xd0        /* F_GB = 0xd0 + CLI_BLK */
+    sub  sp, sp, x9
     mov  x19, x0            /* st */
     mov  x20, x1            /* out */
     mov  x21, x2            /* cap */
@@ -895,7 +947,7 @@ cmd_getbalance:
     mov  x0, x19
     mov  w1, w22
     add  x2, sp, #L_BBB
-    mov  x3, #0x180
+    LB x3
     bl   cli_load_block
     cmp  x0, #0
     b.le .gb_next
@@ -976,7 +1028,9 @@ cmd_getbalance:
 .gb_fail:
     mov  x0, #-1
 .gb_done:
-    add  sp, sp, #F_GB
+    LB x9
+    add  x9, x9, #0xd0        /* F_GB */
+    add  sp, sp, x9
     ldp  x23, x24, [sp], #16
     ldp  x21, x22, [sp], #16
     ldp  x19, x20, [sp], #16

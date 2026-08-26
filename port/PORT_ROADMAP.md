@@ -136,16 +136,27 @@ and runs natively.
       legacy_tx_view bytes vs C strip_witness). Leaves sv_*=C (same as x86 tree;
       they now provide sv_classify_segwit/sv_is_p2sh -> ported bitcoin_witness_segwit.o
       excluded from this link). (2026-08-26)
-- [ ] bitcoin_cli.S (WIP, NOT fully verified) -- all-asm node CLI. Pure helpers
-      cli_hex / cli_atoi / cli_hex_to_bin VERIFIED byte-exact (incl. genesis-hash
-      64-hex<->32B round-trip, bad-len/bad-char reject, signed/unsigned atoi).
-      bitcoin_cli.o assembles + links a native /tmp/bcli binary; command dispatch
-      + getblockcount/stop WORK (loads real data/ store, tip 30). BUT block-reading
-      commands (getblockhash/getbestblockhash/gettx/getbalance) return
-      "height out of range" because store_get_at returns -2 for valid heights
-      0.. in THIS data context (tip=29 via st+24 but idx_len@st+16 disagrees --
-      a pre-existing store-layer range behavior, NOT the new cli code). Needs a
-      follow-up store_get_at/idx_len fix before marking [x]. (2026-08-26, WIP)
+- [x] bitcoin_cli.S -- all-asm node CLI. Pure helpers cli_hex / cli_atoi /
+      cli_hex_to_bin VERIFIED byte-exact (genesis-hash 64hex<->32B round-trip,
+      bad-len/bad-char reject, signed/unsigned atoi; test_cli_helpers.c). The
+      block-reading commands (getblockhash/getbestblockhash/getblock/gettx/
+      getbalance) now WORK on REAL mainnet blocks: the earlier WIP diagnosis
+      ("store_get_at returns -2") was WRONG -- a probe proved store_get_at
+      returns 1 with correct meta for every height on the real data/ store. The
+      real cause: each command's on-stack block buffer (0x800=2KB etc., same as
+      the x86 original) was far smaller than live_blocks' ~1.6-1.8MB segwit
+      blocks, so cli_load_block's cap check bailed. FIX: enlarged every command
+      frame to a 4MiB (CLI_BLK=0x400000, >= Core MAX_BLOCK_SERIALIZED_SIZE)
+      block buffer (small work buffers relocated above it; GAS movz/movk for the
+      4MiB immediates) and bumped asm/daemon/cli.c out[] 1MiB->16MiB so getblock
+      can emit a full block as hex. Verified on the real data/ store:
+      getblockcount=30, getbestblockhash + getblockhash 0..29 return the
+      correct per-height header hashes (block 2 == double-SHA256 of its loaded
+      header), getblock by-number and by-hash return the exact raw block bytes,
+      getbalance=3459106374 (sum over the 30 stored coinbases), + all-asm
+      dispatch. NOTE: heights 28,29 in this live_blocks test store duplicate
+      blocks 0,1 (a store-population quirk, visible via getblock/getblockhash,
+      NOT a CLI bug). (2026-08-26)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
       mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a

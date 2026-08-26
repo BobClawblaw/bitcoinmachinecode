@@ -26,7 +26,7 @@ extern long store_reload(void* st);
 extern long cli_main(void* st, long argc, void** argv, unsigned char* out, long cap);
 
 static unsigned char store_buf[4096];
-static unsigned char out[1<<20];   /* up to 1 MB of CLI output */
+static unsigned char out[16<<20];   /* up to 16 MB of CLI output (4MB block -> 8MB hex, plus headroom) */
 
 int main(int argc, char** argv){
     if(argc < 3){ fprintf(stderr, "usage: cli <dir> <command> [args...]\n"); return 2; }
