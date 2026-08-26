@@ -136,6 +136,16 @@ and runs natively.
       legacy_tx_view bytes vs C strip_witness). Leaves sv_*=C (same as x86 tree;
       they now provide sv_classify_segwit/sv_is_p2sh -> ported bitcoin_witness_segwit.o
       excluded from this link). (2026-08-26)
+- [ ] bitcoin_cli.S (WIP, NOT fully verified) -- all-asm node CLI. Pure helpers
+      cli_hex / cli_atoi / cli_hex_to_bin VERIFIED byte-exact (incl. genesis-hash
+      64-hex<->32B round-trip, bad-len/bad-char reject, signed/unsigned atoi).
+      bitcoin_cli.o assembles + links a native /tmp/bcli binary; command dispatch
+      + getblockcount/stop WORK (loads real data/ store, tip 30). BUT block-reading
+      commands (getblockhash/getbestblockhash/gettx/getbalance) return
+      "height out of range" because store_get_at returns -2 for valid heights
+      0.. in THIS data context (tip=29 via st+24 but idx_len@st+16 disagrees --
+      a pre-existing store-layer range behavior, NOT the new cli code). Needs a
+      follow-up store_get_at/idx_len fix before marking [x]. (2026-08-26, WIP)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
       mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
