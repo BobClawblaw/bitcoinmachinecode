@@ -320,6 +320,17 @@ tap_leaf_hash:
 ; ============================================================================
 ; taproot_tweak_pubkey(out_x[32]=rdi, internal_x[32]=rsi, merkle_root=rdx)
 ;   BIP341 key-path: t=TapTweak(internal||mr) ; Q=lift(even)+t*G, even-normalize.
+;   RETURNS: 0 on failure, 1 on success with EVEN tweaked Y, 2 on success with
+;   ODD tweaked Y. The parity is not cosmetic -- BIP341 script-path spends
+;   carry it in control[0]&1 and Core VERIFIES it (pubkey.cpp CheckTapTweak ->
+;   secp256k1_xonly_pubkey_tweak_add_check, which takes parity as an INPUT).
+;   This function used to discard the parity after even-normalizing, so the
+;   caller could only compare x -- and a flipped control-block parity bit was
+;   ACCEPTED here while Core rejected it (WITNESS_PROGRAM_MISMATCH): a
+;   trivially reachable false-accept in the chain-split direction, found by
+;   validation/synth_corpus_diff.py on 2026-08-26. Both success values are
+;   truthy, so callers that only test "!= 1"... would be WRONG; every caller
+;   must treat >=1 as success and use the value for parity.
 ;   Frame (rbp-relative):
 ;     MSG=-0x90(64) DIGEST=-0xb0(32) T=-0xd0(32) PAFF=-0x110(64)
 ;     PJ=-0x170(96) TG=-0x1d0(96) Q=-0x230(96) Z2=-0x250(32)
@@ -478,9 +489,12 @@ taproot_tweak_pubkey:
     lea  rsi, [rbp+TW_Q+32]
     lea  rdx, [rbp+TW_ZI]
     call fe_mul
-    ; ---- even-normalize yr ----
+    ; ---- capture the tweaked Y parity BEFORE even-normalizing, and return
+    ; it to the caller: BIP341 control[0]&1 commits to exactly this bit. ----
+    xor  r15d, r15d
     test byte [rbp+TW_YR], 1
     jz   .even
+    mov  r15d, 1                         ; odd Y
     mov  rax, [P_LIMBS_TR]
     sub  rax, [rbp+TW_YR]
     mov  [rbp+TW_YR], rax
@@ -508,6 +522,7 @@ taproot_tweak_pubkey:
     bswap rax
     mov  [r12+24], rax
     mov  eax, 1
+    add  eax, r15d                       ; 1 = even Y, 2 = odd Y
     jmp  .twdone
 .fail:
     xor  eax, eax

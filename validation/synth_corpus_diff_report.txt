@@ -1,0 +1,16 @@
+Synthesized feature-depth differential vs Core
+generated: 2026-08-26T09:16:52Z  elapsed: 0.0s
+
+cases: 8  accept-parity ok: 8
+rule mutations: 26 (agree 26)
+per feature (accept / mutations-agreed / divergences):
+  cltv                     accept=1  mut_ok=3  div=0
+  codesep                  accept=1  mut_ok=2  div=0
+  csv                      accept=1  mut_ok=3  div=0
+  multisig-bare            accept=1  mut_ok=4  div=0
+  multisig-p2sh            accept=1  mut_ok=4  div=0
+  multisig-p2wsh           accept=1  mut_ok=3  div=0
+  taproot-scriptpath       accept=1  mut_ok=3  div=0
+  taproot-scriptpath-annex accept=1  mut_ok=4  div=0
+
+ZERO DIVERGENCES across synthesized feature spends and their rule-targeted mutations.

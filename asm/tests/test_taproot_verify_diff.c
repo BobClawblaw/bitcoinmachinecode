@@ -85,7 +85,7 @@ int main(void){
     int have_real = 0;
     if (tap_leaf_hash(lh, 0xc0, leaf, 1) == 1 &&
         tap_merkle_root(mr, lh, 1, ctrl, 33) == 1 &&
-        taproot_tweak_pubkey(q, ipk, mr) == 1){
+        taproot_tweak_pubkey(q, ipk, mr) >= 1){
         spk_ok[0]=0x51; spk_ok[1]=0x20; memcpy(spk_ok+2, q, 32);
         memcpy(spks+1, spk_ok, 34); memcpy(spks+36, spk_ok, 34);
         have_real = 1;
@@ -104,7 +104,7 @@ int main(void){
         u8 lh2[32], mr2[32], q2[32]; static u8 spk2[34];
         if (tap_leaf_hash(lh2, 0xc2, leaf, 1) == 1 &&
             tap_merkle_root(mr2, lh2, 1, ctrl2, 33) == 1 &&
-            taproot_tweak_pubkey(q2, ipk, mr2) == 1){
+            taproot_tweak_pubkey(q2, ipk, mr2) >= 1){
             spk2[0]=0x51; spk2[1]=0x20; memcpy(spk2+2, q2, 32);
             const u8* wu[2] = { leaf, ctrl2 }; u32 wlu[2] = { 1, 33 };
             diff("unknown leaf version accept", spk2, wu, wlu, 2, 0, 1);
@@ -115,7 +115,7 @@ int main(void){
         u8 lh3[32], mr3[32], q3[32]; static u8 spk3[34];
         if (tap_leaf_hash(lh3, 0xc0, leafs, 1) == 1 &&
             tap_merkle_root(mr3, lh3, 1, ctrls, 33) == 1 &&
-            taproot_tweak_pubkey(q3, ipk, mr3) == 1){
+            taproot_tweak_pubkey(q3, ipk, mr3) >= 1){
             spk3[0]=0x51; spk3[1]=0x20; memcpy(spk3+2, q3, 32);
             const u8* ws[2] = { leafs, ctrls }; u32 wls[2] = { 1, 33 };
             diff("OP_SUCCESSx leaf accept", spk3, ws, wls, 2, 0, 1);
@@ -132,7 +132,7 @@ int main(void){
         u8 lh4[32], mr4[32], q4[32]; static u8 spk4[34];
         if (tap_leaf_hash(lh4, 0xc0, leaff, 1) == 1 &&
             tap_merkle_root(mr4, lh4, 1, ctrl, 33) == 1 &&
-            taproot_tweak_pubkey(q4, ipk, mr4) == 1){
+            taproot_tweak_pubkey(q4, ipk, mr4) >= 1){
             spk4[0]=0x51; spk4[1]=0x20; memcpy(spk4+2, q4, 32);
             const u8* wf[2] = { leaff, ctrl }; u32 wlf[2] = { 1, 33 };
             diff("tapscript evaluates false", spk4, wf, wlf, 2, 0, 1);
