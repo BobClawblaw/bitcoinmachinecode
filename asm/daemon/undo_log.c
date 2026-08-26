@@ -295,6 +295,15 @@ extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
  * UTXO's OWN creation height/is_coinbase come from utxo_lsm_get and are
  * captured into the record so a later reorg-restore gets them right --
  * see this file's header comment. */
+/* coinstats-index observer: fired with the FULL captured coin when the del
+ * actually removed it. Registered by the worker; NULL in tests/tools. */
+static void (*g_undo_coin_obs)(const u8 txid[32], u32 index, u64 value, u64 height,
+                               u64 coinbase, const u8* script, unsigned long slen) = 0;
+void undo_set_coin_observer(void (*fn)(const u8*, u32, u64, u64, u64,
+                                       const u8*, unsigned long)){
+    g_undo_coin_obs = fn;
+}
+
 long undo_capture_and_del(void* lst, void* u, long height,
                            const u8 txid[32], u32 index){
     u64 value = 0;
@@ -305,5 +314,13 @@ long undo_capture_and_del(void* lst, void* u, long height,
     if (r != 1) return r;   /* 0 not-found, -1 err: pass through unchanged */
     if (undo_append_record(height, txid, index, value, (u32)utxo_height, (u8)is_coinbase, script, (u16)slen) != 1)
         return -1;
-    return utxo_lsm_del(lst, u, txid, index);
+    /* copy the script before the del: get()'s pointer is only valid until
+     * the next LSM call, and the observer needs the exact bytes */
+    static u8 scbuf[10000];
+    unsigned long scn = slen <= sizeof scbuf ? slen : 0;
+    if (scn && g_undo_coin_obs) memcpy(scbuf, script, scn);
+    long d = utxo_lsm_del(lst, u, txid, index);
+    if (d == 1 && g_undo_coin_obs && scn == slen)
+        g_undo_coin_obs(txid, index, value, (u64)utxo_height, (u64)is_coinbase, scbuf, slen);
+    return d;
 }
