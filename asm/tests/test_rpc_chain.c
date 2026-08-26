@@ -32,6 +32,8 @@ extern long store_append(void* st, const unsigned char* hash32, const void* blk,
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern void merkle_root(unsigned char out[32], void* hashes, unsigned long n);
+extern long store_read_at(void* st, unsigned long h, void* out, long cap);
+extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
@@ -136,6 +138,83 @@ static const char* GENESIS_HASH = "000000000019d6689c085ae165831e934ff763ae46a2a
 static const char* GENESIS_MERKLE = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 
 static unsigned char g_st[4096];
+
+/* ---- build a txid index over the fixture archive ------------------------
+ * Written here rather than by invoking daemon/build_tx_index so the test
+ * stays hermetic, but in the SAME format the builder emits -- if the two
+ * ever disagree the reader will reject this file and the assertions below
+ * fail, which is the point. */
+static void build_fixture_txindex(long tip){
+    typedef struct { unsigned char pre[8]; unsigned int h, off, len; } rec_t;
+    static rec_t recs[64]; int n = 0;
+    for (long h = 0; h <= tip; h++){
+        static unsigned char blk[4096];
+        long blen = store_read_at(g_st, (unsigned long)h, blk, sizeof blk);
+        if (blen < 81) continue;
+        const unsigned char* p = blk + 80;
+        unsigned long ntx = *p++;                 /* fixture blocks: < 0xfd txs */
+        for (unsigned long t = 0; t < ntx && n < 64; t++){
+            const unsigned char* s0 = p;
+            p += 4;
+            int sw = (p[0] == 0x00 && p[1] == 0x01);
+            if (sw) p += 2;
+            unsigned long nin = *p++;
+            for (unsigned long i = 0; i < nin; i++){
+                p += 36; unsigned long sl = *p++; p += sl + 4;
+            }
+            unsigned long nout = *p++;
+            for (unsigned long i = 0; i < nout; i++){
+                p += 8; unsigned long sl = *p++; p += sl;
+            }
+            if (sw){
+                for (unsigned long i = 0; i < nin; i++){
+                    unsigned long items = *p++;
+                    for (unsigned long k = 0; k < items; k++){ unsigned long il = *p++; p += il; }
+                }
+            }
+            p += 4;
+            unsigned int len = (unsigned int)(p - s0);
+            unsigned char txid[32]; static unsigned char scr[4096];
+            if (tx_txid(txid, s0, len, scr, sizeof scr) != 1) continue;
+            memcpy(recs[n].pre, txid, 8);
+            recs[n].h = (unsigned int)h;
+            recs[n].off = (unsigned int)(s0 - blk);
+            recs[n].len = len;
+            n++;
+        }
+    }
+    for (int i = 1; i < n; i++){                  /* sort by prefix */
+        rec_t k = recs[i]; int j = i - 1;
+        while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
+        recs[j+1] = k;
+    }
+    FILE* f = fopen("txindex.dat", "wb");
+    unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
+    fwrite(hdr, 1, 48, f);
+    for (int i = 0; i < n; i++){
+        unsigned char r[20];
+        memcpy(r, recs[i].pre, 8);
+        for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
+        for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
+        for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
+        fwrite(r, 1, 20, f);
+    }
+    unsigned long long sparse_off = 48 + (unsigned long long)n * 20;
+    unsigned char sp[16];                          /* one sample: record 0 */
+    memcpy(sp, recs[0].pre, 8);
+    for (int b = 0; b < 8; b++) sp[8+b] = (unsigned char)(48ULL >> (8*b));
+    fwrite(sp, 1, 16, f);
+    memcpy(hdr, "BMCTXIDX", 8);
+    for (int b = 0; b < 8; b++) hdr[8+b]  = (unsigned char)((unsigned long long)n >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[32+b] = 0;
+    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)tip >> (8*b));
+    fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
+    fclose(f);
+    printf("      (fixture txindex: %d records)\n", n);
+}
+
 static char g_hash[4][65];         /* display-order block hashes */
 static char g_cb_txid[4][65];      /* display-order coinbase txids */
 static char g_tx1_txid[65], g_tx2_txid[65], g_tx2_wtxid[65];
@@ -1138,6 +1217,73 @@ int main(void){
     expect_err("submitheader on non-hex -> -22", "submitheader",
                "[\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"]",
                -22, "Block header decode failed");
+
+    /* ---- getrawtransaction by TXID ALONE, via the txid index ----
+     * Without an index this had to refuse, which is the single most likely
+     * thing to break an application swapping this node in for Core. ---- */
+    { /* before the index exists, the refusal names what is missing */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_tx1_txid);
+      long e2; const char* m2; rj_val* r2 = call("getrawtransaction", pj, &e2, &m2);
+      ck("with no index, getrawtransaction by txid refuses and says why",
+         r2 == NULL && e2 == -5 && m2 && strstr(m2, "txindex"));
+      rj_free(r2); }
+
+    build_fixture_txindex(3);
+    /* no reopen needed: txi_open latches on success, so the index is picked
+     * up on the next lookup -- which is also what an operator building the
+     * index against a running node needs. */
+
+    { /* every fixture transaction must now resolve by txid alone, and the
+       * bytes must be IDENTICAL to what the blockhash path returns */
+      const char* ids[] = { g_cb_txid[1], g_cb_txid[2], g_tx1_txid, g_tx2_txid };
+      const char* blks[] = { g_hash[1], g_hash[2], g_hash[3], g_hash[3] };
+      int all = 1, same = 1;
+      for (int i = 0; i < 4; i++){
+          char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", ids[i]);
+          rj_val* a = call("getrawtransaction", pj, &ec, &em);
+          char pj2[200]; snprintf(pj2, sizeof pj2, "[\"%s\",0,\"%s\"]", ids[i], blks[i]);
+          rj_val* b = call("getrawtransaction", pj2, &ec, &em);
+          if (!a || !a->str){ all = 0; printf("      (no index hit for %.16s)\n", ids[i]); }
+          else if (!b || !b->str || strcmp(a->str, b->str)) same = 0;
+          rj_free(a); rj_free(b);
+      }
+      ck("every fixture tx resolves by txid alone", all);
+      ck("...and byte-identically to the blockhash path (one render path)", same); }
+
+    { /* verbosity 1 through the index carries the block context */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\",1]", g_tx2_txid);
+      r = call("getrawtransaction", pj, &ec, &em);
+      ck("verbosity 1 via the index returns an object", r && r->typ == RJ_OBJ);
+      ck_str("...with the txid", S(r,"txid"), g_tx2_txid);
+      ck_str("...and the blockhash the index resolved", S(r,"blockhash"), g_hash[3]);
+      ck("...and in_active_chain", r && S(r,"in_active_chain"));
+      rj_free(r); }
+
+    { /* a txid the index does not hold: the error must say the index is
+       * PARTIAL and name its range -- "not found" from a partial index is a
+       * different fact from "not found" on the whole chain */
+      long e2; const char* m2;
+      rj_val* r2 = call("getrawtransaction",
+                        "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
+                        &e2, &m2);
+      ck("an unindexed txid reports the index's COVERED RANGE",
+         r2 == NULL && e2 == -5 && m2 && strstr(m2, "covers heights"));
+      rj_free(r2); }
+
+    { /* getindexinfo now REPORTS the index, and reports it as synced only
+       * when it actually reaches the tip */
+      r = call("getindexinfo", "[]", &ec, &em);
+      rj_val* ti = r ? rj_obj_get(r, "txindex") : NULL;
+      ck("getindexinfo reports the txindex once built", ti && ti->typ == RJ_OBJ);
+      ck_str("...with the height it covers", ti ? S(ti,"best_block_height") : NULL, "3");
+      ck_str("...and synced, since it reaches the tip", ti ? S(ti,"synced") : NULL, "1");
+      rj_free(r);
+      r = call("getindexinfo", "[\"txindex\"]", &ec, &em);
+      ck("getindexinfo(txindex) filters to it", r && rj_obj_get(r,"txindex"));
+      rj_free(r);
+      r = call("getindexinfo", "[\"nosuch\"]", &ec, &em);
+      ck("getindexinfo(unknown) -> {}", r && r->typ == RJ_OBJ && r->nmembers == 0);
+      rj_free(r); }
 
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
