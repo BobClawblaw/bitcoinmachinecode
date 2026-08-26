@@ -49,7 +49,12 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                       unsigned long* out_len);
 
 /* ---------------- limits --------------------------------------------------- */
-#define MPOL_MAX_IN     32        /* inputs we will walk per tx */
+#define MPOL_MAX_IN     2048      /* inputs we will walk per tx -- was 32,
+                                   * which "malformed transaction"-rejected
+                                   * real consolidation txs the first day
+                                   * relay traffic flowed; sized to match
+                                   * txval's MV_MAX_IN (Core's 100 kvB
+                                   * standardness bound => ~1,500 max) */
 #define MPOL_MAX_PARENTS  16      /* direct parents tracked per node */
 
 static const char* _mpol_last_reason = "accepted";

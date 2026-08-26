@@ -7,6 +7,43 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- mempool admission now runs the CONSENSUS verifier (one engine, not two)
+
+The architectural close of today's whole incident family (#48/#49/#50 plus
+the cap sweep): mempool admission no longer has its own partial script
+verifier. tx_verify.c gained a resolver seam -- txv_connect_body is the
+EXACT body tx_verify_block_connect always had, with the one utxo_lsm_get
+call routed through a callback -- and a second thin entry,
+tx_verify_mempool(tx, txlen, next_height, resolver, ctx), that selects
+flags via script_flags_for_block(tip+1) and anchors coinbase maturity the
+same way block connection does. tx_accept now calls THAT, through a
+resolver that sees the live confirmed set PLUS unconfirmed mempool parents
+(mpool_get -> parse parent output). bitcoin_txval_modern.c stays only for
+its vector tests; it is off the accept path.
+
+What this buys, all at once, all through the replay-proven engine:
+  - legacy P2PKH/P2PK/bare-multisig/plain-P2SH spends validate (the
+    "unsupported prevout script type" class is gone);
+  - FULL taproot admission -- annex, script-path -- not key-path-only;
+  - children of unconfirmed mempool parents accept (Core's view+mempool
+    resolution); ancestor limits stay the policy layer's job;
+  - coinbase maturity enforced against the real tip (tx_accept_set_tip,
+    updated at boot and the new-block choke point; unknown tip fails
+    closed for coinbase spends only).
+
+Also: MPOL_MAX_IN 32 -> 2048 (the POLICY layer's own first-contact input
+cap, third of its kind today -- "malformed transaction" for real
+consolidation txs).
+
+Proof: tests/test_mempool_consensus_verify (12 checks, real wallet-signed
+legacy txs: legacy accept, unconfirmed-parent chain accept, missing-inputs
+class, tip-anchored maturity both ways); offline corpus of 500 real
+oracle-mempool txs with oracle-resolved prevouts through the FULL admission
+path: 491/500 accepted, every reject a legitimate low-fee policy call --
+zero unsupported, zero malformed, no crash. Block-path behaviour is
+bit-identical by construction (the wrapper passes the same flags/resolver
+the body always used); the full suite is the gate.
+
 ## 2026-08-26 -- incident #50: the caps raise left 16-sized taproot arrays -- worker crash loop
 
 The caps deploy (below) crash-looped the download worker within ~3 minutes:
