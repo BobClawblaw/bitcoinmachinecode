@@ -7,6 +7,63 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- tx relay receive side + txindex tail; incident #47 (mempool split)
+
+Three related gaps closed in one branch (txindex-tail-and-txrelay):
+
+**The mempool had never held a single P2P transaction.** We advertise
+relay=1, so peers announce txs on all eight full-relay legs -- and
+node_sync_multi's drains read every inv off the socket and discarded it
+unexamined (both `.hdr_drain` and `.blk_drain` only hunt for their own
+response type). Zero `[tx_accept]` lines in the production log; inbound
+serve children (the one path with a `tx` handler) have had zero real peers.
+getrawmempool answered from an empty pool, estimatesmartfee's EMA never fed,
+getblocktemplate built empty templates. Fix: `daemon/tx_relay.c`
+(txrelay_poll_leg), called between sync passes on each worker leg -- drains
+buffered messages, requests announced txs, validates replies through the
+same tx_accept_validate the inbound path uses. Requests use
+**MSG_WITNESS_TX (0x40000001)**: bare MSG_TX returns the witness-stripped
+serialization (incident #10's exact bug shape), which would fail signature
+validation and be re-fetched forever. Deliberately absent, stated in the
+module header: re-announcement to other peers, BIP339 wtxidrelay, answering
+tx getdata on worker legs. Hermetic proof over a socketpair leg:
+tests/test_tx_relay (15 checks: witness-typed getdata, pool+ring dedupe,
+reject handling, consumed-ping pong).
+
+**Incident #47 -- the worker's accepts were invisible to the RPC surface.**
+txsub_accept_and_relay (the sendrawtransaction worker handler) inserted into
+the worker's PRIVATE 1024-slot pool (txsub_mp_area), while the parent's
+getrawmempool/getmempoolinfo read the SHARED mempool_configure pool
+(mp_ext_area, rpc_mempool_hooks). A tx accepted via RPC was therefore never
+visible in mempool RPCs. Cause: tx_submit.c predates the shared-mempool
+tranche (2026-08-25) and was never re-pointed. Fix: txsub_pool() prefers
+mp_ext_area exactly as the asm serve children do (.mp_external); the private
+area remains only as the maxmempool=0 fallback. The new relay path uses the
+same pool, so P2P-accepted txs are visible to the parent's RPCs too.
+
+**The txid index now follows the tip.** build_tx_index produced a sorted,
+immutable txindex.dat and nothing maintained it, so getrawtransaction-by-
+txid went blind above the build height. `daemon/tx_index_tail.c` keeps an
+append-only UNSORTED tail (txindex.tail) of the same 20-byte records:
+txit_boot backfills the gap between max(base.to_height, tail max) and the
+archive tip (covers the offline-build->deploy gap and downtime); the
+new-block choke point appends per block (one O_APPEND write, sharing the
+ZMQ publish loop's single block read); appends are strictly monotonic by
+height, so a from-genesis UTXO replay appends nothing. A reorg rolls the
+watermark back via the post-truncation index-rebuild callback; stale tail
+records are harmless because the reader VERIFIES every candidate by
+recomputing the full txid from the current archive bytes -- the same
+property that makes torn crash-writes safe (boot truncates a torn remainder
+back to the record grid; its block is re-appended whole). The reader
+(rpc_chain.c) scans the tail after a base miss, remapping when the file
+grows; getindexinfo and the covered-range error report combined coverage.
+The per-block walk moved to daemon/txi_format.h, shared by builder and tail
+writer, so the two cannot drift (the lesson from the P2WPKH vector-generator
+bug: two copies of one walk is how shared wrong assumptions survive).
+Proof: tests/test_txindex_tail (21 checks) and test_rpc_chain's fixture now
+splits base (0..2) from tail (3), so its byte-identity assertions exercise
+both lookup paths.
+
 ## 2026-08-25 -- wallet RPCs ORACLE-DIFFED: the hedge was hiding real shape bugs
 
 The wallet-state RPCs shipped earlier today with an honest hedge in their own

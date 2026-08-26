@@ -1299,49 +1299,94 @@ static void txi_open(void){
             (unsigned long long)n, g_txi_from, g_txi_to);
 }
 
+/* ---- the incremental tail (daemon/tx_index_tail.c) ----------------------
+ * Unsorted records in the same 20-byte layout, appended by the download
+ * worker for every block after the base index's to_height. Remapped when
+ * the file grows, so lookups see newly accepted blocks without a restart.
+ * The scan is linear, which is fine because the tail only ever holds the
+ * span since the last offline rebuild. */
+static const u8* g_txi_tail;
+static u64 g_txi_tail_sz;          /* mapped size, bytes (whole records only) */
+static long g_txi_tail_maxh = -1;  /* highest height among mapped records */
+
+static void txi_tail_refresh(void){
+    struct stat sb;
+    if (stat("txindex.tail", &sb) != 0 || (u64)sb.st_size < TXI_REC) return;
+    u64 sz = (u64)sb.st_size - (u64)sb.st_size % TXI_REC;  /* ignore a torn last record */
+    if (g_txi_tail && sz == g_txi_tail_sz) return;
+    u64 scanned = g_txi_tail ? g_txi_tail_sz : 0;
+    if (g_txi_tail){ munmap((void*)g_txi_tail, (size_t)g_txi_tail_sz); g_txi_tail = NULL; g_txi_tail_sz = 0; }
+    int fd = open("txindex.tail", O_RDONLY);
+    if (fd < 0) return;
+    void* m = mmap(NULL, (size_t)sz, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return;
+    g_txi_tail = m; g_txi_tail_sz = sz;
+    if (scanned > sz){ scanned = 0; g_txi_tail_maxh = -1; }  /* shrank: folded into a rebuilt base */
+    for (u64 o = scanned; o + TXI_REC <= sz; o += TXI_REC){
+        const u8* r = g_txi_tail + o;
+        u32 hh = 0; for (int b = 0; b < 4; b++) hh |= (u32)r[8+b] << (8*b);
+        if ((long)hh > g_txi_tail_maxh) g_txi_tail_maxh = (long)hh;
+    }
+}
+
+/* VERIFY one candidate record: read the transaction out of the archive and
+ * compare the FULL txid. This is what makes an 8-byte key exact -- and what
+ * makes the unsorted tail crash-safe: a torn or stale record simply fails
+ * here instead of ever being returned as a wrong answer. */
+static int txi_verify_rec(const u8* r, const u8 txid_wire[32],
+                          long* h_out, u32* off_out, u32* len_out){
+    static u8 txbuf[4u << 20];
+    static u8 scratch[4u << 20];
+    u32 hh = 0, off = 0, ln = 0;
+    for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
+    for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
+    for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
+    long blen = read_block((long)hh);
+    if (blen < 81 || (u64)off + ln > (u64)blen || ln > sizeof txbuf) return 0;
+    memcpy(txbuf, g_blockbuf + off, ln);
+    u8 got[32];
+    if (tx_txid(got, txbuf, ln, scratch, sizeof scratch) != 1) return 0;
+    if (memcmp(got, txid_wire, 32)) return 0;          /* prefix collision */
+    *h_out = (long)hh; *off_out = off; *len_out = ln;
+    return 1;
+}
+
 /* Look a WIRE-order txid up. Returns 1 and fills height/offset/len, or 0. */
 static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
     txi_open();
-    if (!g_txi || !g_txi_n) return 0;
-    const u8* recs = g_txi + TXI_HDR;
-    const u8* sp   = g_txi + g_txi_sparse_off;
-    /* binary search the sparse index for the last sample <= our prefix */
-    u64 lo = 0, hi = g_txi_nsparse ? g_txi_nsparse - 1 : 0, start = 0;
-    while (g_txi_nsparse && lo <= hi){
-        u64 mid = lo + (hi - lo) / 2;
-        int c = memcmp(sp + mid * TXI_SPARSE, txid_wire, 8);
-        if (c <= 0){
-            u64 off = 0;
-            for (int i = 0; i < 8; i++) off |= (u64)sp[mid*TXI_SPARSE + 8 + i] << (8*i);
-            start = (off - TXI_HDR) / TXI_REC;
-            lo = mid + 1;
-        } else {
-            if (mid == 0) break;
-            hi = mid - 1;
+    if (g_txi && g_txi_n){
+        const u8* recs = g_txi + TXI_HDR;
+        const u8* sp   = g_txi + g_txi_sparse_off;
+        /* binary search the sparse index for the last sample <= our prefix */
+        u64 lo = 0, hi = g_txi_nsparse ? g_txi_nsparse - 1 : 0, start = 0;
+        while (g_txi_nsparse && lo <= hi){
+            u64 mid = lo + (hi - lo) / 2;
+            int c = memcmp(sp + mid * TXI_SPARSE, txid_wire, 8);
+            if (c <= 0){
+                u64 off = 0;
+                for (int i = 0; i < 8; i++) off |= (u64)sp[mid*TXI_SPARSE + 8 + i] << (8*i);
+                start = (off - TXI_HDR) / TXI_REC;
+                lo = mid + 1;
+            } else {
+                if (mid == 0) break;
+                hi = mid - 1;
+            }
+        }
+        for (u64 i = start; i < g_txi_n; i++){
+            const u8* r = recs + i * TXI_REC;
+            int c = memcmp(r, txid_wire, 8);
+            if (c < 0) continue;
+            if (c > 0) break;                  /* past the prefix group */
+            if (txi_verify_rec(r, txid_wire, h_out, off_out, len_out)) return 1;
         }
     }
-    static u8 txbuf[4u << 20];
-    static u8 scratch[4u << 20];
-    for (u64 i = start; i < g_txi_n; i++){
-        const u8* r = recs + i * TXI_REC;
-        int c = memcmp(r, txid_wire, 8);
-        if (c < 0) continue;
-        if (c > 0) break;                      /* past the prefix group */
-        u32 hh = 0, off = 0, ln = 0;
-        for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
-        for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
-        for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
-        /* VERIFY: read the transaction and compare the FULL txid. This is
-         * what makes an 8-byte key exact -- a colliding prefix is rejected
-         * here rather than returned as a wrong answer. */
-        long blen = read_block((long)hh);
-        if (blen < 81 || (u64)off + ln > (u64)blen || ln > sizeof txbuf) continue;
-        memcpy(txbuf, g_blockbuf + off, ln);
-        u8 got[32];
-        if (tx_txid(got, txbuf, ln, scratch, sizeof scratch) != 1) continue;
-        if (memcmp(got, txid_wire, 32)) continue;      /* prefix collision */
-        *h_out = (long)hh; *off_out = off; *len_out = ln;
-        return 1;
+    /* not in the base index -- the tail covers the heights after it */
+    txi_tail_refresh();
+    for (u64 o = 0; g_txi_tail && o + TXI_REC <= g_txi_tail_sz; o += TXI_REC){
+        const u8* r = g_txi_tail + o;
+        if (memcmp(r, txid_wire, 8)) continue;
+        if (txi_verify_rec(r, txid_wire, h_out, off_out, len_out)) return 1;
     }
     return 0;
 }
@@ -1377,10 +1422,11 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                  * covers: "not found" from a PARTIAL index is a different
                  * fact from "not found" on the whole chain, and a caller who
                  * cannot tell them apart will draw the wrong conclusion. */
+                long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
                 snprintf(nomsg, sizeof nomsg,
                          "No such transaction. The txid index covers heights %ld..%ld; "
                          "if the transaction is outside that range, rebuild the index "
-                         "over it or pass the block hash.", g_txi_from, g_txi_to);
+                         "over it or pass the block hash.", g_txi_from, cov_to);
                 *ec = -5; *em = nomsg; return 0;
             }
             *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
@@ -3230,15 +3276,19 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
     rj_val* o = rj_obj();
     txi_open();
     if (g_txi && (!want || !strcmp(want, "txindex"))){
-        /* Core reports {synced, best_block_height}. This index is built
-         * offline over a height RANGE, so "synced" means it reaches the tip
-         * -- a partial index reports false with its own best height, which
-         * is the honest reading and what a caller needs to decide whether to
-         * trust a miss. */
+        /* Core reports {synced, best_block_height}. Coverage is the offline
+         * base index plus the daemon-maintained tail (contiguous by
+         * construction -- the tail backfills any gap above the base), so
+         * "synced" means that combined range reaches the tip; a partial
+         * index reports false with its own best height, which is the honest
+         * reading and what a caller needs to decide whether to trust a
+         * miss. */
         rj_val* e = rj_obj();
         long tip = refresh();
-        rj_obj_set(e, "synced", rj_bool(tip >= 0 && g_txi_to >= tip));
-        rj_obj_set(e, "best_block_height", rj_numf("%ld", g_txi_to));
+        txi_tail_refresh();
+        long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+        rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
+        rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txindex", e);
     }
     *res = o;
