@@ -33,3 +33,5 @@ test_utxo_unspendable
 test_wv0_drv_diff
 test_bip341_diff
 undo_log_ref.o
+test_tx_relay
+test_txindex_tail
