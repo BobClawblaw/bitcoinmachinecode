@@ -237,7 +237,14 @@ int main(int argc, char** argv){
             start, start+maxblk-1, (unsigned long long)flags);
 
     /* ---- download+verify+apply loop (batched) ---- */
-    unsigned char work[1<<16];
+    /* work buffer doubles as the legacy_sighash preimage scratch. legacy_sighash
+     * materializes the full raw-input/output serialization in it (for
+     * hashPrevouts/hashOutputs), so it must be >= the largest tx's raw serialized
+     * size + overlay. 64KB silently overflowed on big txs (e.g. the 68KB
+     * 2000-output spam tx at h134329) -> legacy_sighash rc=0 -> spurious
+     * EVAL_FALSE on every large tx. 8MB covers the whole chain incl. 1MB legacy
+     * / 4MB witness-era txs. */
+    unsigned char* work = malloc(8u<<20); if(!work){ fprintf(stderr,"FAIL work alloc\n"); return 1; }
     unsigned char* scr = malloc(1<<22);
     long valid=0, bad_gate=0, bad_sig=0, spent=0, added=0, ntx=0, nsig=0;
     unsigned long long total_val_out=0, total_val_in=0;
@@ -321,7 +328,7 @@ int main(int argc, char** argv){
                             fprintf(stderr,"\n");
                             bad_sig++; continue;
                         }
-                        int rr=sv_verify_script(sigb,ssl,psp,pspl,flags,v,txo,tl,work,sizeof work);
+                        int rr=sv_verify_script(sigb,ssl,psp,pspl,flags,v,txo,tl,work,8u<<20);
                         if(rr!=0){ fprintf(stderr,"h%ld tx%lu in%lu SIGFAIL err=%d\n",h,ti,v,rr); bad_sig++;
                             static int dumped=0;
                             if(!dumped){ dumped=1;
