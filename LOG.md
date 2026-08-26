@@ -7,6 +7,21 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- addr self-advertisement: the node finally tells the network where it lives
+
+Zero inbound peers, ever, had a simple cause: nothing ever advertised this
+node's address. daemon/addr_self.c is Core's AdvertiseLocal in miniature:
+each peer's version message carries addr_recv -- us, as that peer sees us
+-- and the module tallies those views from the already-captured version
+payloads, trusting an IPv4 once TWO distinct peers agree (unroutable views
+-- loopback, RFC1918, zero -- never count). Once confident it announces
+one legacy addr entry [now, NETWORK|WITNESS, mapped IPv4, CONFIGURED
+port BE] to every live leg, and re-announces on Core's own 24h cadence.
+The configured port matters on this box: real Core owns 8333; advertising
+the old hardcoded constant would have pointed every prospective peer at
+the wrong daemon. tests/test_addr_self pins the two-peer confidence rule,
+the exact wire bytes, and the cadence no-op.
+
 ## 2026-08-26 -- the coinstats index: gettxoutsetinfo goes incremental, parity goes continuous
 
 `gettxoutsetinfo` was a ~6-minute quiesced full walk; Core's coinstatsindex
