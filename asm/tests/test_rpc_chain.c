@@ -143,8 +143,15 @@ static unsigned char g_st[4096];
  * Written here rather than by invoking daemon/build_tx_index so the test
  * stays hermetic, but in the SAME format the builder emits -- if the two
  * ever disagree the reader will reject this file and the assertions below
- * fail, which is the point. */
-static void build_fixture_txindex(long tip){
+ * fail, which is the point.
+ *
+ * Heights up to base_to land in the sorted base txindex.dat; heights above
+ * it are APPENDED UNSORTED to txindex.tail, the daemon-maintained tail
+ * format (daemon/tx_index_tail.c). Splitting the fixture this way makes
+ * every later by-txid assertion exercise BOTH lookup paths: the coinbase
+ * txids resolve through the base, the height-3 spends through the tail,
+ * and the byte-identity check proves the two render identically. */
+static void build_fixture_txindex(long base_to, long tip){
     typedef struct { unsigned char pre[8]; unsigned int h, off, len; } rec_t;
     static rec_t recs[64]; int n = 0;
     for (long h = 0; h <= tip; h++){
@@ -183,6 +190,21 @@ static void build_fixture_txindex(long tip){
             n++;
         }
     }
+    { /* heights above base_to: unsorted 20-byte records in the tail file */
+        FILE* tf = fopen("txindex.tail", "wb");
+        int kept = 0;
+        for (int i = 0; i < n; i++){
+            if (recs[i].h <= (unsigned int)base_to){ recs[kept++] = recs[i]; continue; }
+            unsigned char r[20];
+            memcpy(r, recs[i].pre, 8);
+            for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
+            for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
+            for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
+            fwrite(r, 1, 20, tf);
+        }
+        fclose(tf);
+        n = kept;
+    }
     for (int i = 1; i < n; i++){                  /* sort by prefix */
         rec_t k = recs[i]; int j = i - 1;
         while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
@@ -209,10 +231,10 @@ static void build_fixture_txindex(long tip){
     for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
     for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
     for (int b = 0; b < 4; b++) hdr[32+b] = 0;
-    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)tip >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)base_to >> (8*b));
     fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
     fclose(f);
-    printf("      (fixture txindex: %d records)\n", n);
+    printf("      (fixture txindex: %d base records + tail)\n", n);
 }
 
 static char g_hash[4][65];         /* display-order block hashes */
@@ -1228,7 +1250,7 @@ int main(void){
          r2 == NULL && e2 == -5 && m2 && strstr(m2, "txindex"));
       rj_free(r2); }
 
-    build_fixture_txindex(3);
+    build_fixture_txindex(2, 3);   /* base covers 0..2; height 3 lives in the TAIL */
     /* no reopen needed: txi_open latches on success, so the index is picked
      * up on the next lookup -- which is also what an operator building the
      * index against a running node needs. */
