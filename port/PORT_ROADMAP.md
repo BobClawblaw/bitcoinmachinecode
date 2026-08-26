@@ -123,6 +123,17 @@ and runs natively.
 - [x] bitcoin_store (multi-file blk + index)  -> port/arm64/bitcoin_store.S
       test_store 41 PASS native + t_roll rollover verified (caught MAX_FILE
       0x80000000->0x08000000 bug). (2026-08-24)
+- [x] bitcoin_store.S += store_append_shared/_nolock + open_idx_close
+      (concurrent-safe shared append; ends idxscan deferral). (2026-08-26)
+- [x] bitcoin_store.S += store_prune / store_set_prune / unlink_blk /
+      read_idx_rec / write_idx_rec (AArch64 PRUNING: persist gate to prune.dat,
+      delete fully-pruned blk files, in-place boundary-file compaction w/ 64KB
+      chunk copy + ftruncate). VERIFIED natively by t_prune.c (behavioral store
+      built by hand to store_append's exact on-disk format): Case A prune@80
+      (delete f0,f1 + compact f2), B prune@60 (mid-file compaction), C prune@0
+      (persist_only), D prune@100 (prune_all), E prune@-1 (clamp->persist),
+      F prune@200 (clamp->prune_all), G empty store: ALL PASS; plus existing
+      test_store 41 still PASS. Unlocks bitcoin_store_fast. (2026-08-26)
 - [x] LIVE FULL-BLOCK DOWNLOAD MILESTONE  live_blocks.c: 30 real mainnet blocks
       (segwit, >=1.8MB) fetched via getdata BLOCK, header-hash verified vs the
       verified 963k header chain, prev-links checked, coinbase parsed by the

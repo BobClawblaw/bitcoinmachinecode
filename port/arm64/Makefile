@@ -57,6 +57,8 @@ test_store: bitcoin_store.o $(ASMDIR)/tests/test_store.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_store.c bitcoin_store.o -I$(ASMDIR)
 t_roll: bitcoin_store.o t_roll.c
 	$(CC) $(CFLAGS) -o $@ t_roll.c bitcoin_store.o -I$(ASMDIR) -include sys/stat.h
+t_prune: bitcoin_store.o t_prune.c
+	$(CC) $(CFLAGS) -o $@ t_prune.c bitcoin_store.o
 
 test_fe: secp256k1_fe.o $(ASMDIR)/tests/test_fe.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_fe.c secp256k1_fe.o -I$(ASMDIR)
