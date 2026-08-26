@@ -117,6 +117,14 @@ and runs natively.
       Fixed: outgoing stack-args collided with L_NUMIN/L_REASON (reason write
       landed in the spks array); leaf_version must persist across bl (x11
       caller-saved, x86 held it in callee-saved rbx). (2026-08-26)
+- [x] bitcoin_tapagg.S (tapagg_build_asm / tapagg_verify_asm -- BIP341
+      aggregate-sighash arena build/verify, twin of tx_verify.c). Build deps
+      all native (txv_bytepool_reserve_asm, strip_witness_asm,
+      taproot_verify_input_asm). Differential vs verbatim C ref
+      (test_tapagg_diff.c, in port/arm64): 63/63 PASS (arena bytes +
+      descriptor + pool growth across 40 appended txs; oversized-spk and
+      strip-fail rejects; 8 verify shapes x 3 local_idx). Fixed: v is a u64
+      VALUE not a pointer (bogus double-deref in am[]). (2026-08-26)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
       mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
