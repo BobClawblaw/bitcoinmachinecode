@@ -421,6 +421,36 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     return 1;
 }
 
+/* tx_accept_validate_p2p: the RELAY path's entry. Same verdict classes as
+ * tx_accept_validate_reason (1 accept, -25 missing inputs, -26 other) so
+ * the orphan pool can class its parks -- but it logs through the 30-second
+ * SUMMARY, never per transaction. The drain briefly used _reason directly
+ * for the -25 class and silently brought the per-tx reject firehose back;
+ * per-tx lines belong to user submissions only. */
+long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
+                            unsigned long txlen){
+    if (!g_ready || !g_pol_ready) return -26;
+    txacc_log_tick(mp_area);
+    void* placeholder_utxo = (void*)1;
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (r && strstr(r, "missing/already-spent")){ g_alog.rej_missing++; return -25; }
+            g_alog.rej_invalid++;
+            snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
+            return -26;
+        }
+    }
+    mp_lock();
+    long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    mp_unlock();
+    if (padd != 1){ g_alog.rej_policy++; return -26; }
+    g_alog.acc++;
+    mempool_note_accept(txid);
+    zmqn_tx_accepted(txid, tx, txlen);
+    return 1;
+}
+
 /* tx_accept_validate_reason: like tx_accept_validate but surfaces the reject
  * reason (for sendrawtransaction) and returns a Core RPC error code instead of
  * a bare 0. Returns 1 on accept, or negative: -4 not-initialized, -22 decode,
