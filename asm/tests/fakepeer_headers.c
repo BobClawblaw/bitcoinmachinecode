@@ -56,7 +56,7 @@ static void serve_peer(int cfd){
     /* read our version, send peer version */
     if (p2p_read(cfd,cmd,rbuf,sizeof(rbuf),&plen)<=0) return;
     unsigned char v[102]; int o=0;
-    put_u32le(v+o,70016);o+=4; put_u64le(v+o,1);o+=8; put_u64le(v+o,(unsigned long long)time(NULL));o+=8;
+    put_u32le(v+o,70016);o+=4; put_u64le(v+o,9);o+=8; put_u64le(v+o,(unsigned long long)time(NULL));o+=8;
     put_u64le(v+o,1);o+=8; o+=16; put_u16be(v+o,8333);o+=2;
     put_u64le(v+o,1);o+=8; o+=16; put_u16be(v+o,0);o+=2;
     put_u64le(v+o,0x3333333333333333ULL);o+=8; const char*u="/fakepeer:0.1/"; v[o]=strlen(u);o++;memcpy(v+o,u,strlen(u));o+=strlen(u);
@@ -107,7 +107,7 @@ int main(void){
 
     /* send version (asm framing) */
     unsigned char v[102]; int o=0;
-    put_u32le(v+o,70016);o+=4; put_u64le(v+o,1);o+=8; put_u64le(v+o,(unsigned long long)time(NULL));o+=8;
+    put_u32le(v+o,70016);o+=4; put_u64le(v+o,9);o+=8; put_u64le(v+o,(unsigned long long)time(NULL));o+=8;
     put_u64le(v+o,1);o+=8; o+=16; put_u16be(v+o,8333);o+=2;
     put_u64le(v+o,1);o+=8; o+=16; put_u16be(v+o,0);o+=2;
     put_u64le(v+o,0x4444444444444444ULL);o+=8; const char*ua="/btcasm:0.1/";v[o]=strlen(ua);o++;memcpy(v+o,ua,strlen(ua));o+=strlen(ua);

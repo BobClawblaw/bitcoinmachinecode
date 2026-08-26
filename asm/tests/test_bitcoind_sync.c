@@ -86,7 +86,7 @@ static void fake_peer(int cfd){
     /* handshake: read client version, then send our version + verack,
      * then read+discard the client's verack. */
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;
-    unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
     p2p_write(cfd,"verack",6,"",0);
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;
     /* serve: strictly one command at a time, response per command */
