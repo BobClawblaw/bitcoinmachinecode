@@ -711,3 +711,56 @@ spends a coin received before the range is not flagged. The range is capped
 does not. `getdescriptoractivity` scans the given blocks in height order
 sharing one matched-outpoint set, so cross-block receive→spend pairs within
 the given set are reported.
+
+## Slice 15 — subsystem 4 of 5: assumeutxo snapshots — (2026-08-26)
+`dumptxoutset` is real; `loadtxoutset` refuses by design.
+
+### The encoder is pinned against a snapshot Core actually wrote
+`asm/utxo_snapshot.c` implements Core's snapshot serialization — the 51-byte
+header (magic, version 2, mainnet magic, base hash, coin count), Core's
+`VARINT`, `CompressAmount`, and all six special script-compression kinds plus
+the raw form. `tests/test_utxo_snapshot.c` pins it against **14 coin records
+lifted verbatim from a real snapshot the oracle Core wrote** (dumptxoutset at
+height 964065): every script kind, coinbase coins, amounts from 330 sat to
+50 BTC, all byte-identical, and the header against the oracle file's own
+first 51 bytes.
+
+### Proven at full scale against production data
+The dump runner (`daemon/utxo_setinfo_rpc.c`, same fingerprint/quiescence
+discipline as `gettxoutsetinfo`) was run against the reorg-drill copy of the
+production UTXO set: **165,710,384 coins — exactly the known walk count —
+streamed to an 11 GB file**, which an independent reference decoder then
+walked end-to-end: every record decodes, the file ends exactly at the last
+record boundary, and the header's count matches. Two real bugs were found by
+that run and fixed: the encoder's script bound was a "reasonable" 128 bytes
+where the real set carries junk up to the consensus 10,000 (the bound is now
+the consensus bound), and the runner's own temp file tripped the quiescence
+fingerprint via the datadir mtime — it is now created before the first
+fingerprint, so the only changes the check can see are the daemon's.
+
+### Layout divergence, stated
+Core groups all coins of one txid under a single `(txid, count)` prefix,
+because its chainstate iterates in txid order. The LSM walk does not, so
+every coin is written as its own single-coin group. The format permits it,
+the loader adds coins group by group, and the header's coin count is exact;
+the file is merely larger than Core's would be.
+
+Only type `"latest"` is served — `"rollback"` reconstructs historical state,
+which is the reorg machinery's job in the forked worker. `txoutset_hash` and
+`nchaintx` are omitted rather than glued on from unrelated walks
+(`gettxoutsetinfo` and `getchaintxstats` compute them on request).
+
+### Why loadtxoutset refuses
+This node's UTXO set is built by full validation from genesis, and every
+parity claim it makes — the muhash match against Core — rests on every coin
+having been verified locally. Loading foreign state would discard exactly
+that property, and there is no second chainstate to background-validate it
+against as Core does. The export is supported; the import is declined with
+that reasoning at the call site.
+
+### Note: the BIP158 KAT fixtures are now force-tracked
+The blockfilters slice froze its oracle fixtures into `tests/fixtures/`,
+which `asm/tests/.gitignore` ignores wholesale — so they died with the
+worktree and the suite broke in a fresh tree. They are regenerated
+(deterministic oracle bytes) and force-tracked: 30 KB of frozen KAT anchors
+that must never drift or go missing.
