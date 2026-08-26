@@ -123,6 +123,30 @@ static void utxo_dump(const void* U, const uint8_t* txid, unsigned long index){
     }
 }
 
+/* scan all UTXO slots: find records whose script starts with the aliased
+ * 410496b5 target (or that are 50 BTC P2PK), print their key+blob_off */
+static void scan_utxo(const void* U){
+    unsigned long mask=*(const unsigned long*)((const uint8_t*)U+8);
+    unsigned long slots=mask+1;
+    const uint8_t* blob=*(const uint8_t* const*)((const uint8_t*)U+16);
+    unsigned long long count=0;
+    for(unsigned long i=0;i<slots;i++){
+        const uint8_t* s=(const uint8_t*)U + 40 + i*48;
+        unsigned st; memcpy(&st,s+40,4);
+        if(st==0xFFFFFFFFUL) continue;
+        unsigned long long bo; memcpy(&bo,s,8);
+        const uint8_t* rec=blob+bo;
+        unsigned long long val,slen; memcpy(&val,rec,8); memcpy(&slen,rec+16,8);
+        if(slen>=6 && memcmp(rec+24,"\x41\x04\x96\xb5\x38\xe8",6)==0){
+            printf("   [%lu] txid=", i); for(int k=0;k<32;k++)printf("%02x",s[8+k]);
+            printf(" idx=%u blob_off=%llu value=%llu script=", st, bo, val);
+            unsigned cap=slen>40?40:(unsigned)slen; for(unsigned k=0;k<cap;k++)printf("%02x",rec[24+k]);
+            printf("\n"); count++;
+        }
+    }
+    printf("   total 410496b5-records found=%llu (slots=%lu)\n", count, slots);
+}
+
 static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin, unsigned long* nout){
     if(n<4+1+1) return -1;
     unsigned long o=4;
@@ -415,6 +439,7 @@ int main(int argc, char** argv){
     }
 done:
     LLOG(5, "DONE: blocks_valid=%ld bad_gate=%ld bad_sig=%ld\n", valid, bad_gate, bad_sig);
+    if(bad_sig || 1){ fprintf(stderr,"--- scan_utxo (410496b5 aliased record holders) ---\n"); scan_utxo(U); }
     LLOG(5, "      txs=%ld inputs_spent=%ld sigs_verified=%ld outputs_added=%ld utxo_count=%ld\n",
         ntx, spent, nsig, added, (long)utxo_count(U));
     LLOG(5, "      value_in=%llu value_out=%llu\n", (unsigned long long)total_val_in, (unsigned long long)total_val_out);
