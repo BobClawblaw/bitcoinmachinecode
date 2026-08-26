@@ -1565,7 +1565,7 @@ TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/tx_verify.c dae
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o \
-    bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o tests/txacc_bidx_stub.c
+    bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_script_flags.o tests/txacc_bidx_stub.c
 # test_mempool_consensus_verify -- admission runs the consensus verifier:
 # legacy P2PKH accept, unconfirmed-mempool-parent accept, missing-inputs
 # class, tip-anchored coinbase maturity. Real wallet-signed transactions.
@@ -1580,8 +1580,8 @@ tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXAC
 # test_tx_relay -- the worker's receive-side tx relay (daemon/tx_relay.c):
 # inv -> getdata(MSG_WITNESS_TX) -> validate+accept over a socketpair leg,
 # pool/ring dedupe, reject handling, and the consumed-ping pong.
-tests/test_tx_relay: tests/test_tx_relay.c tests/modern_spend.h daemon/tx_relay.c $(TXACCEPTOBJS) bitcoin_net.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 -o $@ tests/test_tx_relay.c daemon/tx_relay.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS)) bitcoin_net.o
+tests/test_tx_relay: tests/test_tx_relay.c tests/modern_spend.h daemon/tx_relay.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) bitcoin_net.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 -o $@ tests/test_tx_relay.c daemon/tx_relay.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o)
 
 tests/test_tx_submit: tests/test_tx_submit.c tests/modern_spend.h daemon/tx_submit.c $(TXACCEPTOBJS) bitcoin_net.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 -o $@ tests/test_tx_submit.c daemon/tx_submit.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS)) bitcoin_net.o
