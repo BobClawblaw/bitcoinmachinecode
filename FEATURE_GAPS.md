@@ -368,9 +368,15 @@ not just present as unused/tested-in-isolation code:
   2026-08-26** with the receive-side tx relay (`daemon/tx_relay.c`, LOG
   slice-20 entry): announced transactions are now actually fetched (they
   were previously discarded unread), and fetched witness-complete.
-  **Remaining:** prefer/require `NODE_WITNESS` (0x8) peers; serve the
-  stripped form to a bare `MSG_BLOCK` request; BIP339 `wtxidrelay`; and
-  re-announcing relay-received transactions onward (receive-only today —
+  ~~Prefer/require `NODE_WITNESS` (0x8) peers~~ — **DONE 2026-08-26**:
+  every outbound dial that can lead to fetching blocks or transactions
+  (mux legs, parallel leg fill, boot catch-up, dlc header/chunk workers)
+  checks the peer's advertised services right after the handshake and
+  drops non-witness peers at dial time (`peer_has_witness`,
+  daemon/main.c). **Remaining:** serve the stripped form to a bare
+  `MSG_BLOCK` request (affects only legacy inbound peers, of which this
+  node currently has none); BIP339 `wtxidrelay`; and re-announcing
+  relay-received transactions onward (receive-only today —
   user-originated txs are pushed to all legs by the sendrawtransaction
   path).
 - **Thread stacks / sighash buffers — FIXED 2026-08-22** (`9445268`): every
