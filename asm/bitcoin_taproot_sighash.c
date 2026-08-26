@@ -23,6 +23,10 @@ extern void tagged_hash256(uint8_t* out, const char* tag, uint64_t taglen,
                            const uint8_t* msg, uint64_t msglen);
 extern int  schnorr_verify(const uint8_t* sig, const uint8_t* pk,
                            const uint8_t* msg, int msglen);
+/* RETURNS 0 fail, 1 success with EVEN tweaked Y, 2 success with ODD tweaked Y.
+ * The parity is consensus-critical: BIP341 carries it in control[0]&1 and Core
+ * verifies it (CheckTapTweak -> secp256k1_xonly_pubkey_tweak_add_check). Test
+ * ">= 1" for success, never "== 1". */
 extern long taproot_tweak_pubkey(uint8_t* out_x, const uint8_t* internal_x,
                                  const uint8_t* merkle_root);
 extern long tap_leaf_hash(uint8_t out[32], uint8_t leaf_version,
@@ -982,9 +986,29 @@ int taproot_verify_input(const uint8_t* spk,
         *reason = "p2tr merkle root reconstruction failed"; return 0;
     }
     uint8_t computed_q[32];
-    if (taproot_tweak_pubkey(computed_q, internal_pk, merkle_root) != 1) {
+    long tw = taproot_tweak_pubkey(computed_q, internal_pk, merkle_root);
+    if (tw < 1) {
         *reason = "p2tr script-path internal pubkey invalid"; return 0;
     }
+    /* BIP341: the control block's low bit is the tweaked output key's Y
+     * PARITY, and it is part of the commitment -- Core checks it inside
+     * CheckTapTweak (secp256k1_xonly_pubkey_tweak_add_check takes parity as
+     * an input). Comparing only x leaves that bit unconstrained, so a spend
+     * with the bit flipped verified here while Core rejected it with
+     * WITNESS_PROGRAM_MISMATCH: a false-accept in the chain-split direction,
+     * reachable by flipping one witness bit on any script-path spend. Found
+     * by validation/synth_corpus_diff.py, 2026-08-26. */
+    {
+        int want_odd = (tw == 2);
+        int got_odd  = (control[0] & 1);
+        if (want_odd != got_odd) {
+            *reason = "p2tr control block parity mismatch"; return 0;
+        }
+    }
+    /* x AFTER parity: Core folds both into one tweak_add_check and so has no
+     * observable order, but the two engines here report a REASON, and the
+     * differential compares reason strings -- so they must agree on which
+     * check fires first. */
     if (memcmp(computed_q, spk + 2, 32) != 0) {
         *reason = "p2tr script-path commitment mismatch"; return 0;
     }
