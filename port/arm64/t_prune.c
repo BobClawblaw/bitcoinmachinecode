@@ -112,6 +112,73 @@ static int get_block(uint8_t* st, int b, uint8_t* out){
 static int fails=0;
 #define CHECK(cond,msg) do{ if(!(cond)){ printf("  FAIL: %s\n", msg); fails++; } }while(0)
 
+/* ---- Case H: large blocks >64KB exercise the multi-chunk compaction copy ---- */
+static int test_large_chunk(void){
+    int save=fails;
+    /* blocks: 0..1 in file0 (small), 2..4 in file1 (boundary) with LARGE sizes that
+       cross the 64KB copy-buffer boundary in the in-place compaction loop. */
+    const int SZ[5]={40, 40, 0x10000+0x50, 0x60, 0x20000}; /* sizes of blk0..4 */
+    const int FNO[5]={0,0,1,1,1};
+    uint64_t off[5]={0,0,0,0,0};
+    /* build files */
+    FILE* f0=fopen("blk00000.dat","wb");
+    FILE* f1=fopen("blk00001.dat","wb");
+    uint8_t hdr[8], *blk = malloc(0x20000+64);  /* scratch big block */
+    FILE* cur=f0; uint64_t pos[2]={0,0};
+    for(int b=0;b<5;b++){
+        if(FNO[b]==1 && cur==f0){ fclose(cur); cur=f1; }
+        for(int i=0;i<SZ[b];i++) blk[i]=(uint8_t)(b+i*7+1);
+        uint32_t L=SZ[b], M=MAGIC; memcpy(hdr,&L,4); memcpy(hdr+4,&M,4);
+        off[b]=pos[FNO[b]];
+        fwrite(hdr,1,8,cur); fwrite(blk,1,SZ[b],cur);
+        pos[FNO[b]]+=8+SZ[b];
+    }
+    fclose(cur);
+    /* index.dat: 5 records */
+    FILE* ix=fopen("index.dat","wb");
+    for(int b=0;b<5;b++){
+        unsigned char rec[48]; memset(rec,0,48);
+        memcpy(rec,pat,16); memcpy(rec+16,&b,4);
+        uint32_t fn=FNO[b]; memcpy(rec+32,&fn,4);
+        uint64_t p=off[b];  memcpy(rec+36,&p,8);
+        uint32_t s=SZ[b];   memcpy(rec+44,&s,4);
+        fwrite(rec,1,48,ix);
+    }
+    fclose(ix);
+    uint8_t st[1024]; memset(st,0,1024);
+    int fd=open("index.dat",O_RDWR);
+    if(fd<0){perror("open index");exit(1);}
+    *(int64_t*)(st+8)  = fd;
+    *(int64_t*)(st+16) = 5*48;      /* idx_len = 5 records */
+    *(int32_t*)(st+24) = 4;         /* tip = 4 (blocks 0..4) */
+    *(int32_t*)(st+28) = 1;         /* cur_file_no = 1 */
+    *(int32_t*)(st+0)  = -1;        /* cur_blk_fd */
+    *(int32_t*)(st+36) = MAGIC;
+    *(int32_t*)(st+48) = 0;
+    int rc=store_prune(st,2);     /* eff=2, first_retained_file=1 -> delete f0, compact f1 2..4 */
+    printf("%-28s prune(2) LARGE chunks\n","H_large_chunk");
+    CHECK(rc==1,"H rc==1");
+    CHECK(access("blk00000.dat",F_OK)!=0,"H file0 deleted");
+    struct stat sb; stat("blk00001.dat",&sb);
+    uint64_t expect = (8+(uint64_t)SZ[2]) + (8+(uint64_t)SZ[3]) + (8+(uint64_t)SZ[4]);
+    CHECK(sb.st_size==(off_t)expect,"H file1 compacted size");
+    /* read each retained block via get_at + pread, verify stripped of its pruned prefix */
+    uint8_t expectpat[0x20000+64];
+    int rfd=open("blk00001.dat",O_RDONLY);
+    uint64_t newoff=0;
+    for(int b=2;b<=4;b++){
+        for(int i=0;i<SZ[b];i++) expectpat[i]=(uint8_t)(b+i*7+1);
+        uint8_t buf[0x20000+64];
+        if(pread(rfd,buf,8+SZ[b],newoff)!= (ssize_t)(8+SZ[b])){ CHECK(0,"H pread fail"); break; }
+        if(memcmp(buf+8,expectpat,SZ[b])!=0){ CHECK(0,"H chunk content mismatch"); break; }
+        newoff += 8+SZ[b];
+    }
+    close(rfd);
+    free(blk);
+    close(*(int*)(st+8));
+    return fails-save;
+}
+
 /* verify full post-prune state for expected_eff (or -1 meaning 'no prune gate = all served') */
 static void verify_post(int eff, int deleted0, int deleted1, uint64_t expect_size[3],
                         uint8_t* st){
@@ -248,6 +315,15 @@ int main(void){
     }
 
     unlink("index.dat"); unlink("prune.dat");
+    /* Case H: large-block multi-chunk compaction (rebuild fresh dir of files) */
+    unlink("blk00000.dat"); unlink("blk00001.dat");
+    {
+        /* need a clean dir: remove leftovers from prior cases */
+        int df=test_large_chunk();
+        (void)df;
+    }
+
+    unlink("index.dat"); unlink("prune.dat"); unlink("blk00000.dat"); unlink("blk00001.dat");
     free(blocks);
 
     if(fails){ printf("\nRESULT: FAIL (%d)\n",fails); return 1; }
