@@ -41,7 +41,8 @@ extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsi
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
 typedef long (*txacc_resolver_t)(const u8 txid[32], unsigned long index,
-                                 unsigned long long* value, const u8** script,
+                                 unsigned long long* value, unsigned long* height,
+                                 unsigned long* is_coinbase, const u8** script,
                                  unsigned long* slen);
 extern void tx_accept_set_resolver(txacc_resolver_t fn);
 
@@ -117,12 +118,14 @@ static int no_bytes_pending(int fd){
  * resolver instead of the boot-latched snapshot. This stub stands in for
  * utxo_live_resolve, serving prevouts the snapshot has never seen. */
 static long stub_resolve(const u8 txid[32], unsigned long index,
-                         unsigned long long* value, const u8** script,
+                         unsigned long long* value, unsigned long* height,
+                         unsigned long* is_coinbase, const u8** script,
                          unsigned long* slen){
     for (int i = 0; i < modern_num_spends; i++){
         const msend_t* s = &modern_spends[i];
         if (!memcmp(txid, s->txid, 32) && index == 0){
-            *value = s->prev_amount; *script = s->prev_spk; *slen = s->prev_spklen;
+            *value = s->prev_amount; *height = 1; *is_coinbase = 0;
+            *script = s->prev_spk; *slen = s->prev_spklen;
             return 1;
         }
     }
