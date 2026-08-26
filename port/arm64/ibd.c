@@ -339,10 +339,15 @@ int main(int argc, char** argv){
     if(fread(hdr,112,(size_t)total,hf)!=(size_t)total){ fprintf(stderr,"read headers err\n"); return 1; }
     fclose(hf);
 
-    /* ---- UTXO + persistent store ---- */
-    unsigned long slots=1<<20; void* U=malloc(utxo_struct_size(slots));
-    uint8_t* bob=malloc(1u<<28);
-    utxo_init(U,slots,bob,1u<<28);
+    /* ---- UTXO + persistent store ----
+     * slots sized for LOW load (real chain ~1M UTXO by h146k, ~80M by tip):
+     * ibd previously used 1<<20 slots -> ~98% load at h146k triggered a
+     * real-key-distribution probe edge (MISSING-PREVOUT). Use 1<<24 slots
+     * (16M; ~768MB) -> <=~7% load at 146k, well inside the fuzz-verified
+     * regime. Blob 1<<30 (1GB) for output records (grow for full tip). */
+    unsigned long slots=1u<<23; void* U=malloc(utxo_struct_size(slots));
+    uint8_t* bob=malloc(1u<<30);
+    utxo_init(U,slots,bob,1u<<30);
     void* ST=calloc(1,64); utxo_store_init(ST);
 
     /* ---- connect + handshake ---- */
