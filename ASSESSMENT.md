@@ -203,10 +203,38 @@ In rough order of how much each would move it:
    verifiers on both sides across all five script eras and mutates them to
    force disagreement: **1,128 mutations, 1,128 agreements, zero
    divergences, zero false-accepts**. It remains the only method that has
-   ever found a false accept here, and the bar it now sets is per-path
-   coverage depth (multisig combinations, CLTV/CSV timelock paths,
-   OP_CODESEPARATOR positions, annex-bearing taproot spends) rather than
-   whether scripts are exercised at all.
+   ever found a false accept here. **Deepened 2026-08-26 to exactly the
+   per-path coverage this item asked for** (`validation/synth_corpus_diff.py`):
+   because those constructs are rare or absent in random blocks they are now
+   SYNTHESIZED and correctly signed rather than harvested -- multisig (bare /
+   P2SH / P2WSH, with NULLDUMMY, signature-ordering and threshold mutations),
+   CLTV and CSV (nLockTime / nSequence / tx-version predicate flips),
+   OP_CODESEPARATOR (signing over the wrong subscript), and taproot
+   script-path with and without an ANNEX. Core's own VerifyScript validates
+   every synthesized spend before the comparison, so a construction error
+   fails loudly instead of comparing garbage.
+
+   **It immediately found a second false accept, and a worse one.** The
+   BIP341 script-path commitment check compared only the tweaked output key's
+   X coordinate and ignored the control block's low bit -- the tweaked key's
+   Y PARITY, which Core verifies inside `CheckTapTweak`. Since Q = P + tG is
+   one point, its x and its parity are both determined, so that bit was
+   entirely unconstrained: flipping it on any otherwise-valid script-path
+   spend produced a transaction this node ACCEPTED and Core REJECTED
+   (`WITNESS_PROGRAM_MISMATCH`) -- a chain-split-direction false accept,
+   reachable by flipping one bit of witness data, with no key material and no
+   grinding. Fixed the same day, with a hermetic regression test
+   (`tests/test_taproot_parity.c`) confirmed to FAIL against the old code. The
+   exercise also exposed three frozen taproot vectors that hard-coded parity
+   `0xc0` without ever computing it: they were never valid spends, and passed
+   only because the verifier ignored the bit.
+
+   Current state: 8 synthesized features, 26 rule-targeted mutations, zero
+   divergences; and the real-spend corpus re-run at 129 spends / 774
+   mutations with zero divergences, confirming no regression. The bar this
+   item now sets is BREADTH of synthesized features (SIGHASH type
+   combinations, P2SH-wrapped witness variants, multi-leaf taproot trees)
+   rather than whether the rule-carrying paths are reached at all.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
 4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the
