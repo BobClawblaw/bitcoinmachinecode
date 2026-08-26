@@ -64,15 +64,14 @@ extern int  store_rd_init(void* st);
 extern long store_read_at(void* st, unsigned long h, void* out, long cap);
 extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
 
-#define TXI_MAGIC   "BMCTXIDX"
-#define TXI_HDR     48
-#define TXI_REC     20
-#define TXI_SPARSE  16
+/* record layout + the per-block transaction walk live in txi_format.h,
+ * shared with the daemon's incremental tail writer (tx_index_tail.c) so the
+ * two writers cannot drift on what a record means */
+#include "txi_format.h"
+
 #define SPARSE_STRIDE 256
 #define NBUCKETS    256
 #define BLOCKBUF    (4u << 20)
-
-typedef struct { u8 prefix[8]; u32 height; u32 offset; u32 len; } txi_rec;
 
 static int rec_cmp(const void* a, const void* b){
     const txi_rec* x = a; const txi_rec* y = b;
@@ -82,69 +81,6 @@ static int rec_cmp(const void* a, const void* b){
     if (x->height != y->height) return x->height < y->height ? -1 : 1;
     if (x->offset != y->offset) return x->offset < y->offset ? -1 : 1;
     return 0;
-}
-
-static u64 rd_varint(const u8* p, const u8* end, u64* consumed){
-    *consumed = 0;
-    if (p >= end) return 0;
-    u8 b = p[0];
-    if (b < 0xfd){ *consumed = 1; return b; }
-    if (b == 0xfd){ if (p+3 > end) return 0; *consumed = 3; return (u64)p[1] | ((u64)p[2]<<8); }
-    if (b == 0xfe){ if (p+5 > end) return 0; *consumed = 5;
-        return (u64)p[1] | ((u64)p[2]<<8) | ((u64)p[3]<<16) | ((u64)p[4]<<24); }
-    if (p+9 > end) return 0;
-    *consumed = 9;
-    u64 v = 0; for (int i = 0; i < 8; i++) v |= (u64)p[1+i] << (8*i);
-    return v;
-}
-
-/* Walk one block's transactions, calling back with (offset, len) for each. */
-static int walk_block(const u8* blk, long blen,
-                      void (*cb)(void*, const u8*, u32, u32), void* ctx){
-    const u8* p = blk + 80; const u8* end = blk + blen;
-    u64 cc, ntx = rd_varint(p, end, &cc);
-    if (!cc || !ntx) return 0;
-    p += cc;
-    for (u64 t = 0; t < ntx; t++){
-        const u8* s = p;
-        if (p + 4 > end) return 0;
-        p += 4;
-        int segwit = (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01);
-        if (segwit) p += 2;
-        u64 nin = rd_varint(p, end, &cc); if (!cc || !nin) return 0;
-        p += cc;
-        for (u64 i = 0; i < nin; i++){
-            if (p + 36 > end) return 0;
-            p += 36;
-            u64 sl = rd_varint(p, end, &cc); if (!cc) return 0;
-            p += cc + sl + 4;
-            if (p > end) return 0;
-        }
-        u64 nout = rd_varint(p, end, &cc); if (!cc) return 0;
-        p += cc;
-        for (u64 i = 0; i < nout; i++){
-            if (p + 8 > end) return 0;
-            p += 8;
-            u64 sl = rd_varint(p, end, &cc); if (!cc) return 0;
-            p += cc + sl;
-            if (p > end) return 0;
-        }
-        if (segwit){
-            for (u64 i = 0; i < nin; i++){
-                u64 items = rd_varint(p, end, &cc); if (!cc) return 0;
-                p += cc;
-                for (u64 k = 0; k < items; k++){
-                    u64 il = rd_varint(p, end, &cc); if (!cc) return 0;
-                    p += cc + il;
-                    if (p > end) return 0;
-                }
-            }
-        }
-        if (p + 4 > end) return 0;
-        p += 4;
-        cb(ctx, s, (u32)(s - blk), (u32)(p - s));
-    }
-    return 1;
 }
 
 typedef struct { FILE* bucket[NBUCKETS]; u32 height; u64 n; u8* scratch; } pass1_ctx;
@@ -202,7 +138,7 @@ int main(int argc, char** argv){
             return 1;
         }
         c.height = (u32)h;
-        if (!walk_block(blockbuf, blen, emit, &c)){
+        if (!txi_walk_block(blockbuf, blen, emit, &c)){
             fprintf(stderr, "[txindex] FATAL: block %ld is malformed; index abandoned\n", h);
             for (int i = 0; i < NBUCKETS; i++) fclose(c.bucket[i]);
             return 1;
