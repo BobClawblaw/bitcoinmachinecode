@@ -45,8 +45,8 @@ node_make_version:
     mov  r12, rdi           ; out (cursor base)
     ; protocol version -- from the single source of truth (version.inc)
     mov  dword [r12], NODE_PROTOCOL_VER
-    ; services = NODE_NETWORK(1), timestamp
-    mov  qword [r12+4], 1
+    ; services = NODE_NETWORK(1)|NODE_WITNESS(8) -- we serve witness blocks (fe3addb), timestamp
+    mov  qword [r12+4], 9
     mov  qword [r12+12], 1700000000
     ; addr_recv[26] at +20: zero, then port at +44
     lea  rdi, [r12+20]
