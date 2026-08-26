@@ -10,10 +10,13 @@
 #include "rpc_commands.h"
 #include "rpc_chain.h"
 #include "rpc_node.h"
+#include "rpc_wallet_ops.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <malloc.h>
 
 /* ---- extern wallet_core command layer (from asm/wallet_core.c) ---- */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
@@ -36,6 +39,10 @@ extern int  der_signature_export(unsigned char* out, const unsigned long long r[
 extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char priv_be[32]);
 extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
 extern void hash160(unsigned char out[20], const void* in, long long len);
+extern void base58check_encode(char* out, const unsigned char* payload, long long paylen);
+extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
+                              const unsigned char* seed, long seedlen,
+                              const unsigned* indexes, long n);
 
 /* extern LSM UTXO store lookup (asm/bitcoin_utxo_lsm.asm) -- see
  * rpc_commands_set_utxo_store's own doc comment in the header. */
@@ -514,6 +521,10 @@ static long crt_addr_to_spk(const char* addr, unsigned char* spk){
     }
 }
 /* BTC decimal string -> satoshis; -1 on parse error or >8 decimals. */
+/* Exposed below as rpc_amount_to_sat: the spend path in rpc_wallet_ops.c
+ * parses the same BTC amount strings, and a second parser that rounded
+ * differently would send a different number of satoshis than the caller
+ * asked for. */
 static long long crt_amount_to_sat(const char* s){
     long long whole=0, frac=0; int fdig=0, seen=0;
     const char* p=s; if (*p=='-') return -1;
@@ -523,6 +534,8 @@ static long long crt_amount_to_sat(const char* s){
     while (fdig<8){ frac*=10; fdig++; }
     return whole*100000000LL + frac;
 }
+
+long long rpc_amount_to_sat(const char* s){ return crt_amount_to_sat(s); }
 static long crt_varint(unsigned char* o, unsigned long long v){
     if (v<0xfd){ o[0]=(unsigned char)v; return 1; }
     if (v<=0xffff){ o[0]=0xfd; o[1]=(unsigned char)v; o[2]=(unsigned char)(v>>8); return 3; }
@@ -1303,17 +1316,1132 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
 }
 
 /* ---- dispatch table ---- */
-int rpc_known_method(const char* method) {
-    static const char* const known[] = {
+/* ==== wallet-state RPCs over the transaction journal ======================
+ * (wallet_txlog.c: BMCTX v1, append-only, crc-guarded records of every send
+ * the wallet made.) VERIFICATION BOUND, stated plainly: there is no oracle
+ * wallet to diff against, so these are verified by round-trip -- a journal
+ * written through the REAL txlog_append is read back through these RPCs --
+ * and the field set is the honest subset the journal actually holds:
+ *   - only "send" category records exist (the journal records sends);
+ *   - confirmations is 0 and no blockhash/blockheight fields are emitted
+ *     (the journal does not track confirmations -- absent, never invented);
+ *   - amounts follow Core's sign conventions (send amount and fee negative);
+ *   - the journal stores txids in INTERNAL byte order; these RPCs emit
+ *     display order like every other txid in the API. */
+static void wsl_add_lastprocessedblock(rj_val* o);   /* defined below */
+static int wsl_hexb(const char* h, unsigned char* out, int n){
+    for (int i=0;i<n;i++){ int a=0,b=0; char c=h[i*2], d=h[i*2+1];
+        if(c>='0'&&c<='9')a=c-'0'; else if(c>='a'&&c<='f')a=c-'a'+10; else return 0;
+        if(d>='0'&&d<='9')b=d-'0'; else if(d>='a'&&d<='f')b=d-'a'+10; else return 0;
+        out[i]=(unsigned char)((a<<4)|b); }
+    return 1;
+}
+typedef struct { unsigned long long ts; unsigned char txid[32];
+                 long long amount, fee; unsigned char dest[20];
+                 unsigned long inputs; long rawlen; } wsl_rec_t;
+static unsigned long wsl_crc(const char* s, long n){
+    unsigned long h = 2166136261UL;
+    for (long i=0;i<n;i++){ h ^= (unsigned char)s[i]; h *= 16777619UL; }
+    return h;
+}
+/* parse the journal (default path in the daemon's cwd/datadir); crc-bad or
+ * torn lines are skipped exactly as the tool-side reader philosophy demands
+ * -- a torn record is absent data, not data. Returns records found. */
+static int wsl_read(wsl_rec_t* recs, int cap){
+    const char* candidates[2] = { "bmcwallet.dat.txlog", "data/bmcwallet.dat.txlog" };
+    FILE* f = 0;
+    for (int i=0;i<2 && !f;i++) f = fopen(candidates[i], "r");
+    if (!f) return 0;
+    char line[600]; int n = 0;
+    while (n < cap && fgets(line, sizeof line, f)){
+        if (line[0]=='#' || line[0]=='\n' || !strncmp(line,"BMCTX",5)) continue;
+        char txh[80], desth[48], crch[16];
+        wsl_rec_t r;
+        int got = sscanf(line, "%llu sent %79s %lld %lld %47s %lu %ld %15s",
+                         &r.ts, txh, &r.amount, &r.fee, desth, &r.inputs, &r.rawlen, crch);
+        if (got != 8 || strlen(txh)!=64 || strlen(desth)!=40) continue;
+        /* crc over the 8-field prefix exactly as the writer computed it */
+        { char pre[512];
+          int pl = snprintf(pre, sizeof pre, "%llu sent %s %lld %lld %s %lu %ld",
+                            r.ts, txh, r.amount, r.fee, desth, r.inputs, r.rawlen);
+          char want[16]; snprintf(want, sizeof want, "%08lx", wsl_crc(pre, pl));
+          if (strcmp(want, crch)) continue; }
+        if (!wsl_hexb(txh, r.txid, 32) || !wsl_hexb(desth, r.dest, 20)) continue;
+        recs[n++] = r;
+    }
+    fclose(f);
+    return n;
+}
+#define WSL_MAX 4096
+static rj_val* wsl_entry(const wsl_rec_t* r){
+    rj_val* e = rj_obj();
+    /* dest h160 -> its P2PKH address via the same helper every other RPC uses */
+    { unsigned char spk[25];
+      spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, r->dest, 20); spk[23]=0x88; spk[24]=0xac;
+      char addr[128]; addr[0]=0;
+      if (wallet_script_to_address(addr, sizeof addr, spk, 25) > 0 && addr[0])
+          rj_obj_set(e, "address", rj_str(addr)); }
+    rj_obj_set(e, "category", rj_str("send"));
+    /* Core emits `vout` on every entry. The journal records a destination
+     * but not which output index it landed at, so this is 0 -- the honest
+     * value for "not recorded", and the same convention getpeerinfo uses
+     * for counters this node does not track. */
+    rj_obj_set(e, "vout", rj_numf("%d", 0));
+    { char am[32]; rpc_amounts(-r->amount, am, sizeof am); rj_obj_set(e, "amount", rj_numf("%s", am)); }
+    { char fe[32]; rpc_amounts(-r->fee, fe, sizeof fe); rj_obj_set(e, "fee", rj_numf("%s", fe)); }
+    rj_obj_set(e, "confirmations", rj_numf("%d", 0));   /* journal tracks none */
+    { char hx[65]; static const char* HD="0123456789abcdef";
+      for (int k=0;k<32;k++){ unsigned char b=r->txid[31-k]; hx[k*2]=HD[b>>4]; hx[k*2+1]=HD[b&15]; }
+      hx[64]=0; rj_obj_set(e, "txid", rj_str(hx)); }
+    rj_obj_set(e, "time", rj_numf("%llu", r->ts));
+    rj_obj_set(e, "timereceived", rj_numf("%llu", r->ts));
+    { rj_val* wc = rj_arr(); rj_obj_set(e, "walletconflicts", wc); }
+    { rj_val* mc = rj_arr(); rj_obj_set(e, "mempoolconflicts", mc); }
+    rj_obj_set(e, "abandoned", rj_bool(0));
+    /* NOT emitted, because the journal does not record them and inventing
+     * them would be worse than their absence (oracle-diffed 2026-08-25
+     * against a wallet-enabled Core):
+     *   blockhash/blockheight/blockindex/blocktime -- the journal stores no
+     *     confirmation data at all, which is the same reason confirmations
+     *     is 0 above;
+     *   wtxid -- the journal stores the txid only, and for a segwit send
+     *     the wtxid is NOT derivable from it;
+     *   label / parent_descs -- this store has no labels and no descriptor
+     *     provenance.
+     * Each becomes emittable if the journal format grows the field; that is
+     * a store-format change, deliberately not smuggled in here. */
+    return e;
+}
+/* listtransactions ("label" count skip): newest LAST like Core; count default
+ * 10, skip from the end (Core semantics: the last `count` after skipping
+ * `skip` most recent). */
+static int cmd_listtransactions(const rj_val* params, long* ec, const char** em, rj_val** result){
+    (void)ec; (void)em;
+    long count = 10, skip = 0;
+    if (params && params->typ==RJ_ARR){
+        if (params->nitems>=2 && params->items[1]->typ==RJ_NUM) count = atol(params->items[1]->str);
+        if (params->nitems>=3 && params->items[2]->typ==RJ_NUM) skip = atol(params->items[2]->str);
+    }
+    if (count < 0){ *ec=-8; *em="Negative count"; return 0; }
+    if (skip < 0){ *ec=-8; *em="Negative from"; return 0; }
+    static wsl_rec_t recs[WSL_MAX];
+    int n = wsl_read(recs, WSL_MAX);
+    long hi = n - skip;            /* exclusive end after skipping most recent */
+    long lo = hi - count;
+    if (lo < 0) lo = 0;
+    rj_val* arr = rj_arr();
+    for (long i = lo; i < hi; i++) rj_arr_push(arr, wsl_entry(&recs[i]));
+    *result = arr;
+    return 1;
+}
+static int cmd_gettransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params || params->typ!=RJ_ARR || params->nitems<1 || params->items[0]->typ!=RJ_STR ||
+        strlen(params->items[0]->str)!=64){
+        *ec=-8; *em="Invalid txid"; return 0; }
+    unsigned char want[32];
+    { unsigned char disp[32];
+      if (!wsl_hexb(params->items[0]->str, disp, 32)){ *ec=-8; *em="Invalid txid"; return 0; }
+      for (int i=0;i<32;i++) want[i] = disp[31-i]; }         /* display -> internal */
+    static wsl_rec_t recs[WSL_MAX];
+    int n = wsl_read(recs, WSL_MAX);
+    for (int i = n-1; i >= 0; i--){
+        if (memcmp(recs[i].txid, want, 32)) continue;
+        rj_val* o = rj_obj();
+        { char am[32]; rpc_amounts(-recs[i].amount, am, sizeof am); rj_obj_set(o, "amount", rj_numf("%s", am)); }
+        { char fe[32]; rpc_amounts(-recs[i].fee, fe, sizeof fe); rj_obj_set(o, "fee", rj_numf("%s", fe)); }
+        rj_obj_set(o, "confirmations", rj_numf("%d", 0));
+        rj_obj_set(o, "txid", rj_str(params->items[0]->str));
+        { rj_val* wc = rj_arr(); rj_obj_set(o, "walletconflicts", wc); }
+        { rj_val* mc = rj_arr(); rj_obj_set(o, "mempoolconflicts", mc); }
+        rj_obj_set(o, "time", rj_numf("%llu", recs[i].ts));
+        rj_obj_set(o, "timereceived", rj_numf("%llu", recs[i].ts));
+        /* ORACLE-DIFFED 2026-08-25: Core's gettransaction.details[] entries
+         * are a REDUCED shape -- {address, category, amount, vout, label,
+         * parent_descs, abandoned} -- NOT a copy of a listtransactions
+         * entry. We had been pushing the full entry, which meant details[0]
+         * carried six fields Core never puts there (txid, time,
+         * timereceived, confirmations, walletconflicts, fee): those belong
+         * to the top-level object, and repeating them there is a shape
+         * Core consumers do not expect. */
+        { rj_val* det = rj_arr();
+          rj_val* d = rj_obj();
+          { unsigned char spk[25];
+            spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, recs[i].dest, 20);
+            spk[23]=0x88; spk[24]=0xac;
+            char addr[128]; addr[0]=0;
+            if (wallet_script_to_address(addr, sizeof addr, spk, 25) > 0 && addr[0])
+                rj_obj_set(d, "address", rj_str(addr)); }
+          rj_obj_set(d, "category", rj_str("send"));
+          { char am[32]; rpc_amounts(-(long long)recs[i].amount, am, sizeof am);
+            rj_obj_set(d, "amount", rj_numf("%s", am)); }
+          rj_obj_set(d, "vout", rj_numf("%d", 0));
+          { char fe[32]; rpc_amounts(-(long long)recs[i].fee, fe, sizeof fe);
+            rj_obj_set(d, "fee", rj_numf("%s", fe)); }   /* Core: sends only */
+          rj_obj_set(d, "abandoned", rj_bool(0));
+          rj_arr_push(det, d);
+          rj_obj_set(o, "details", det); }
+        wsl_add_lastprocessedblock(o);
+        *result = o;
+        return 1;
+    }
+    *ec = -5; *em = "Invalid or non-wallet transaction id";
+    return 0;
+}
+/* Core stamps every wallet answer with the chain state it was computed
+ * against (`lastprocessedblock`: hash + height), so a caller can tell a
+ * stale reply from a current one. We can supply it honestly -- the chain
+ * module owns the tip -- by asking the SAME dispatch a client would, which
+ * keeps this a one-way dependency (wallet -> chain) with no new coupling.
+ * Omitted entirely if the chain is not open, rather than reported as zero. */
+static void wsl_add_lastprocessedblock(rj_val* o){
+    rj_val* h = NULL; long ec; const char* em;
+    if (rpc_chain_dispatch("getbestblockhash", NULL, &h, &ec, &em) != 1 || !h) return;
+    rj_val* c = NULL;
+    if (rpc_chain_dispatch("getblockcount", NULL, &c, &ec, &em) != 1 || !c){ rj_free(h); return; }
+    rj_val* lpb = rj_obj();
+    rj_obj_set(lpb, "hash", rj_str(h->str));
+    rj_obj_set(lpb, "height", rj_numf("%s", c->str));
+    rj_obj_set(o, "lastprocessedblock", lpb);
+    rj_free(h); rj_free(c);
+}
+
+/* getwalletinfo -- ORACLE-DIFFED 2026-08-25 against a wallet-enabled Core.
+ * The scratch oracle ran with disablewallet=1 until then, which is why this
+ * shipped round-trip-verified only; enabling it (one config line -- the
+ * binary always had wallet support) turned the hedge into a real diff, and
+ * the diff found two things:
+ *   1. Core's modern getwalletinfo carries NO balance fields at all --
+ *      balance / unconfirmed_balance / immature_balance / paytxfee were
+ *      removed when getbalances took over. We were emitting four fields
+ *      Core does not have.
+ *   2. Core emits blank / birthtime / flags / lastprocessedblock (plus
+ *      keypoolsize_hd_internal for wallets using internal keys); we emitted
+ *      none of them.
+ * Names and shape now follow Core. Values stay ours and honest:
+ * walletversion 1 and format "bmc" deliberately say this is our own store,
+ * not a Core wallet, and descriptors=false because there is no descriptor
+ * wallet here. birthtime/lastprocessedblock are omitted rather than faked --
+ * this store records neither. */
+static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
+    static wsl_rec_t recs[WSL_MAX];
+    int n = wsl_read(recs, WSL_MAX);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "walletname", rj_str("bmcwallet"));
+    rj_obj_set(o, "walletversion", rj_numf("%d", 1));
+    rj_obj_set(o, "format", rj_str("bmc"));
+    rj_obj_set(o, "txcount", rj_numf("%d", n));
+    rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
+    rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
+    rj_obj_set(o, "avoid_reuse", rj_bool(0));
+    rj_obj_set(o, "scanning", rj_bool(0));
+    rj_obj_set(o, "descriptors", rj_bool(0));
+    rj_obj_set(o, "external_signer", rj_bool(0));
+    rj_obj_set(o, "blank", rj_bool(w && w->seed ? 0 : 1));
+    { rj_val* fl = rj_arr(); rj_obj_set(o, "flags", fl); }
+    wsl_add_lastprocessedblock(o);
+    *result = o;
+    return 1;
+}
+
+/* getbalances -- where Core keeps balances now (the fields removed from
+ * getwalletinfo above). mine.{trusted,untrusted_pending,immature,
+ * nonmempool}: the injected UTXO set is by definition confirmed and
+ * spendable, so it lands in `trusted`; the rest are zero because this node
+ * tracks no wallet mempool -- stated, not guessed. */
+static int cmd_getbalances(const rpc_wallet* w, rj_val** result){
+    unsigned long long bal = 0;
+    if (w) for (unsigned long i = 0; i < w->utxo_n; i++) bal += w->utxo_val[i];
+    rj_val* o = rj_obj();
+    rj_val* mine = rj_obj();
+    { char am[32]; rpc_amounts((long long)bal, am, sizeof am);
+      rj_obj_set(mine, "trusted", rj_numf("%s", am)); }
+    rj_obj_set(mine, "untrusted_pending", rj_numf("%.8f", 0.0));
+    rj_obj_set(mine, "immature", rj_numf("%.8f", 0.0));
+    rj_obj_set(mine, "nonmempool", rj_numf("%.8f", 0.0));
+    rj_obj_set(o, "mine", mine);
+    wsl_add_lastprocessedblock(o);
+    *result = o;
+    return 1;
+}
+
+/* ==== signrawtransactionwithwallet ========================================
+ * Core: sign whatever inputs of a raw tx the WALLET holds keys for, and
+ * report per-input errors for the rest. That is exactly
+ * signrawtransactionwithkey with the key list sourced from the wallet
+ * instead of the caller, so this builds the key list and delegates rather
+ * than growing a second signer that could drift from the first. The
+ * delegate already handles legacy, P2SH, BIP143 v0 and P2SH-wrapped v0, so
+ * nothing is lost by the reuse.
+ *
+ * BOUNDED KEY WINDOW. The wallet derives keys on demand, so "the wallet's
+ * keys" is not a finite set. getnewaddress/getrawchangeaddress hand out
+ * index 0, and the CLI can be asked for an explicit index, so the window is
+ * indexes 0..SRWW_WINDOW-1 across both the receive and change branches.
+ * An input funded beyond that window is NOT silently skipped -- it lands in
+ * the `errors` array with complete:false, which is Core's own shape for an
+ * input it could not sign. */
+#define SRWW_WINDOW 20
+
+static void srww_wif(char out[64], const unsigned char priv[32]){
+    unsigned char pay[34];
+    pay[0] = 0x80; memcpy(pay + 1, priv, 32); pay[33] = 0x01;   /* compressed */
+    base58check_encode(out, pay, 34);
+}
+
+static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wallet* w,
+                                            long* ec, const char** em, rj_val** result){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_STR){
+        *ec = -8; *em = "Invalid parameters, expected a raw transaction hex string"; return 0; }
+    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+
+    /* [hexstring, [wif...], prevtxs, sighashtype] -- the delegate's shape.
+     * Core's signrawtransactionwithwallet takes (hexstring, prevtxs,
+     * sighashtype), so the caller's arg 1 is prevtxs and arg 2 is the
+     * sighash type; they shift by one here. */
+    rj_val* keys = rj_arr();
+    for (unsigned i = 0; i < SRWW_WINDOW; i++){
+        for (int chain = 0; chain <= 1; chain++){
+            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
+            unsigned char k[32], c[32]; char wif[64];
+            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+            srww_wif(wif, k);
+            rj_arr_push(keys, rj_str(wif));
+        }
+    }
+    rj_val* fwd = rj_arr();
+    rj_arr_push(fwd, rj_str(params->items[0]->str));
+    rj_arr_push(fwd, keys);
+    /* prevtxs: the caller's, PLUS entries synthesized from the wallet's own
+     * rescan records for any input outpoint the wallet owns. Core's wallet
+     * knows its own outputs when signing; without this, signing a
+     * fundrawtransaction result would demand the caller re-supply data the
+     * wallet already has. Caller-provided entries come first, so an explicit
+     * prevtx always wins over a synthesized one. */
+    {
+        rj_val* pv = (params->nitems >= 2 && params->items[1]->typ == RJ_ARR)
+                     ? rj_clone(params->items[1]) : rj_arr();
+        const char* hx = params->items[0]->str;
+        size_t hl2 = strlen(hx);
+        if (!(hl2 & 1) && hl2/2 >= 10 && hl2/2 <= 200000){
+            static unsigned char txb[200000];
+            if (hex_to_bytes(txb, hx, hl2)){
+                unsigned long tl = (unsigned long)(hl2/2), q = 4, cc2;
+                if (tl > 6 && txb[4] == 0x00 && txb[5] == 0x01) q = 6;
+                unsigned long ni = srw_varint(txb + q, &cc2); q += cc2;
+                extern int rpc_wops_own_coin(const void*, const unsigned char*, unsigned int,
+                                             unsigned long long*, unsigned char*);
+                for (unsigned long i = 0; i < ni && ni <= 10000; i++){
+                    if (q + 36 > tl) break;
+                    const unsigned char* op = txb + q;
+                    unsigned int vo = (unsigned int)op[32] | ((unsigned int)op[33]<<8) |
+                                      ((unsigned int)op[34]<<16) | ((unsigned int)op[35]<<24);
+                    unsigned long long val; unsigned char h160[20];
+                    if (rpc_wops_own_coin(w->seed, op, vo, &val, h160)){
+                        /* skip if the caller already supplied this outpoint */
+                        char tid[65];
+                        for (int k = 0; k < 32; k++){
+                            static const char* H = "0123456789abcdef";
+                            unsigned char b = op[31-k];
+                            tid[k*2] = H[b>>4]; tid[k*2+1] = H[b&15];
+                        }
+                        tid[64] = 0;
+                        int have = 0;
+                        for (size_t j = 0; j < pv->nitems; j++){
+                            rj_val* t = rj_obj_get(pv->items[j], "txid");
+                            rj_val* v2 = rj_obj_get(pv->items[j], "vout");
+                            if (t && v2 && !strcmp(t->str, tid) &&
+                                (unsigned int)atol(v2->str) == vo){ have = 1; break; }
+                        }
+                        if (!have){
+                            rj_val* e = rj_obj();
+                            rj_obj_set(e, "txid", rj_str(tid));
+                            rj_obj_set(e, "vout", rj_numf("%u", vo));
+                            { char spkh[48]; unsigned char spk[22];
+                              spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h160, 20);
+                              bin_to_hex(spkh, spk, 22);
+                              rj_obj_set(e, "scriptPubKey", rj_str(spkh)); }
+                            { char am[32]; rpc_amounts((long long)val, am, sizeof am);
+                              rj_obj_set(e, "amount", rj_numf("%s", am)); }
+                            rj_arr_push(pv, e);
+                        }
+                    }
+                    q += 36;
+                    unsigned long sl2 = srw_varint(txb + q, &cc2); q += cc2 + sl2 + 4;
+                    if (q > tl) break;
+                }
+            }
+        }
+        rj_arr_push(fwd, pv);
+    }
+    if (params->nitems >= 3 && params->items[2]->typ == RJ_STR)
+        rj_arr_push(fwd, rj_str(params->items[2]->str));
+
+    int rc = cmd_signrawtransactionwithkey(fwd, ec, em, result);
+    rj_free(fwd);
+    return rc;
+}
+
+/* ==== simulaterawtransaction =============================================
+ * Core: the net balance change these transactions would cause for THIS
+ * wallet. Computable here without any funding machinery, because both
+ * halves are already known:
+ *   - an input is ours if its outpoint is in the wallet's own UTXO list
+ *     (rpc_wallet carries txid/vout/value), so its value leaves;
+ *   - an output is ours if its scriptPubKey is one of our derived P2WPKH
+ *     scripts, so its value arrives.
+ * An input whose outpoint we do not hold contributes nothing -- it is not
+ * our money either way -- which is the same treatment Core gives a
+ * not-ours input. */
+
+static int simraw_is_ours_spk(const rpc_wallet* w, const unsigned char* spk, unsigned long spklen){
+    if (spklen != 22 || spk[0] != 0x00 || spk[1] != 0x14) return 0;   /* P2WPKH only */
+    for (unsigned i = 0; i < SRWW_WINDOW; i++){
+        for (int chain = 0; chain <= 1; chain++){
+            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
+            unsigned char k[32], c[32], pub[33], h[20];
+            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+            scalar_to_pubkey(pub, k);
+            hash160(h, pub, 33);
+            if (!memcmp(h, spk + 2, 20)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_simulaterawtransaction(const rj_val* params, const rpc_wallet* w,
+                                      long* ec, const char** em, rj_val** result){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR){
+        *ec = -8; *em = "Invalid parameters, expected an array of raw transactions"; return 0; }
+    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    const rj_val* list = params->items[0];
+    long long delta = 0;
+    for (size_t t = 0; t < list->nitems; t++){
+        if (list->items[t]->typ != RJ_STR){ *ec = -22; *em = "TX decode failed"; return 0; }
+        const char* hx = list->items[t]->str; size_t hl = strlen(hx);
+        if ((hl & 1) || hl/2 < 10 || hl/2 > 400000){ *ec = -22; *em = "TX decode failed"; return 0; }
+        unsigned long txlen = (unsigned long)(hl/2);
+        unsigned char* tx = malloc(txlen);
+        if (!tx){ *ec = -7; *em = "oom"; return 0; }
+        if (!hex_to_bytes(tx, hx, hl)){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+
+        unsigned long p = 4, cc;
+        int segwit = (txlen > 6 && tx[4] == 0x00 && tx[5] == 0x01);
+        if (segwit) p = 6;
+        unsigned long n_in = srw_varint(tx + p, &cc); p += cc;
+        if (n_in == 0 || n_in > 100000){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+        for (unsigned long i = 0; i < n_in; i++){
+            if (p + 36 > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+            const unsigned char* op = tx + p;
+            unsigned long vo = (unsigned long)op[32] | ((unsigned long)op[33]<<8) |
+                               ((unsigned long)op[34]<<16) | ((unsigned long)op[35]<<24);
+            /* rpc_wallet.utxo_txid is in DISPLAY order -- rpc_commands and
+             * the transport test both render it forward with bin_to_hex to
+             * produce the txid a caller sees. The outpoint in the raw tx is
+             * in wire order, so it has to be reversed before comparing;
+             * comparing them directly would silently never match and report
+             * every spend of our own coins as a zero balance change. */
+            unsigned char disp[32];
+            for (int b = 0; b < 32; b++) disp[b] = op[31-b];
+            for (unsigned long u = 0; u < w->utxo_n; u++)
+                if (w->utxo_idx[u] == vo && !memcmp(w->utxo_txid[u], disp, 32)){
+                    delta -= (long long)w->utxo_val[u]; break; }
+            p += 36;
+            unsigned long ssl = srw_varint(tx + p, &cc); p += cc + ssl + 4;
+            if (p > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+        }
+        unsigned long n_out = srw_varint(tx + p, &cc); p += cc;
+        if (n_out > 100000){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+        for (unsigned long i = 0; i < n_out; i++){
+            if (p + 8 > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+            unsigned long long val = 0;
+            for (int b = 0; b < 8; b++) val |= (unsigned long long)tx[p+b] << (8*b);
+            p += 8;
+            unsigned long sl = srw_varint(tx + p, &cc); p += cc;
+            if (p + sl > txlen){ free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
+            if (simraw_is_ours_spk(w, tx + p, sl)) delta += (long long)val;
+            p += sl;
+        }
+        free(tx);
+    }
+    rj_val* o = rj_obj();
+    char am[32]; rpc_amounts(delta, am, sizeof am);
+    rj_obj_set(o, "balance_change", rj_numf("%s", am));
+    *result = o;
+    return 1;
+}
+
+/* ==== combinerawtransaction ==============================================
+ * Core merges SIGNATURE DATA across partially signed copies of the same
+ * transaction, which for a multisig input means combining individual
+ * signatures out of several scriptSigs -- that is the signature-combiner in
+ * Core's ProduceSignature, which this node does not have.
+ *
+ * So this implements the case it can do exactly, and REFUSES the case it
+ * cannot rather than doing it wrongly: for each input, if at most one of the
+ * supplied transactions carries signature data, that one is taken. If two
+ * carry DIFFERENT non-empty data for the same input, combining them requires
+ * the merger, and silently keeping one would hand back a transaction missing
+ * signatures that the caller supplied -- so it errors and points at
+ * combinepsbt, which merges properly at the PSBT level. */
+typedef struct {
+    const unsigned char* op;      /* 36-byte outpoint */
+    const unsigned char* ss;  unsigned long sslen;   /* scriptSig */
+    const unsigned char* wit; unsigned long witlen;  /* serialized witness stack */
+    unsigned witems;
+    unsigned seq;
+} crt_in_t;
+
+/* Walk a raw tx into inputs + the outputs/locktime tail. 0 on malformed. */
+static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, int cap,
+                    int* n_in_out, unsigned long* out_start, unsigned long* out_end,
+                    int* segwit_out){
+    if (len < 10) return 0;
+    unsigned long p = 4, cc;
+    int segwit = (len > 6 && tx[4] == 0x00 && tx[5] == 0x01);
+    if (segwit) p = 6;
+    unsigned long n_in = srw_varint(tx + p, &cc); p += cc;
+    if (n_in == 0 || (int)n_in > cap) return 0;
+    for (unsigned long i = 0; i < n_in; i++){
+        if (p + 36 > len) return 0;
+        ins[i].op = tx + p; p += 36;
+        unsigned long sl = srw_varint(tx + p, &cc); p += cc;
+        if (p + sl + 4 > len) return 0;
+        ins[i].ss = tx + p; ins[i].sslen = sl; p += sl;
+        ins[i].seq = (unsigned)tx[p] | ((unsigned)tx[p+1]<<8) |
+                     ((unsigned)tx[p+2]<<16) | ((unsigned)tx[p+3]<<24);
+        p += 4;
+        ins[i].wit = NULL; ins[i].witlen = 0; ins[i].witems = 0;
+    }
+    *out_start = p;
+    unsigned long n_out = srw_varint(tx + p, &cc); p += cc;
+    for (unsigned long i = 0; i < n_out; i++){
+        if (p + 8 > len) return 0;
+        p += 8;
+        unsigned long sl = srw_varint(tx + p, &cc); p += cc + sl;
+        if (p > len) return 0;
+    }
+    *out_end = p;
+    if (segwit){
+        for (unsigned long i = 0; i < n_in; i++){
+            const unsigned char* wstart = tx + p;
+            unsigned long items = srw_varint(tx + p, &cc); p += cc;
+            for (unsigned long k = 0; k < items; k++){
+                unsigned long il = srw_varint(tx + p, &cc); p += cc + il;
+                if (p > len) return 0;
+            }
+            ins[i].wit = wstart; ins[i].witlen = (unsigned long)(tx + p - wstart);
+            ins[i].witems = (unsigned)items;
+        }
+    }
+    if (p + 4 > len) return 0;
+    *n_in_out = (int)n_in;
+    *segwit_out = segwit;
+    return 1;
+}
+
+#define CRT_MAXTX 16
+#define CRT_MAXIN 1000
+
+static int cmd_combinerawtransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
+        *ec = -8; *em = "Invalid parameter, expected an array of hex transactions"; return 0; }
+    const rj_val* arr = params->items[0];
+    if (arr->nitems > CRT_MAXTX){
+        *ec = -8; *em = "Too many transactions to combine"; return 0; }
+    static unsigned char bufs[CRT_MAXTX][200000]; unsigned long blen[CRT_MAXTX];
+    static crt_in_t ins[CRT_MAXTX][CRT_MAXIN];
+    int n_in[CRT_MAXTX], segwit[CRT_MAXTX];
+    unsigned long ostart[CRT_MAXTX], oend[CRT_MAXTX];
+    int np = (int)arr->nitems;
+    for (int i = 0; i < np; i++){
+        if (arr->items[i]->typ != RJ_STR){ *ec = -22; *em = "TX decode failed"; return 0; }
+        const char* h = arr->items[i]->str; size_t hl = strlen(h);
+        if ((hl & 1) || hl/2 < 10 || hl/2 > sizeof bufs[0]){ *ec = -22; *em = "TX decode failed"; return 0; }
+        blen[i] = (unsigned long)(hl/2);
+        if (!hex_to_bytes(bufs[i], h, hl)){ *ec = -22; *em = "TX decode failed"; return 0; }
+        if (!crt_walk(bufs[i], blen[i], ins[i], CRT_MAXIN, &n_in[i], &ostart[i], &oend[i], &segwit[i])){
+            *ec = -22; *em = "TX decode failed"; return 0; }
+        if (i > 0){
+            if (n_in[i] != n_in[0]){ *ec = -8; *em = "Input txids and vouts must match across all transactions"; return 0; }
+            for (int k = 0; k < n_in[0]; k++)
+                if (memcmp(ins[i][k].op, ins[0][k].op, 36)){
+                    *ec = -8; *em = "Input txids and vouts must match across all transactions"; return 0; }
+            if (oend[i] - ostart[i] != oend[0] - ostart[0] ||
+                memcmp(bufs[i] + ostart[i], bufs[0] + ostart[0], oend[0] - ostart[0])){
+                *ec = -8; *em = "Outputs must match across all transactions"; return 0; }
+        }
+    }
+    /* pick the signature data per input */
+    int pick[CRT_MAXIN];
+    for (int k = 0; k < n_in[0]; k++){
+        int chosen = -1;
+        for (int i = 0; i < np; i++){
+            if (ins[i][k].sslen == 0 && ins[i][k].witlen <= 1) continue;   /* empty */
+            if (chosen < 0){ chosen = i; continue; }
+            /* a second non-empty candidate: identical is fine, different is
+             * the merge case this node cannot perform */
+            const crt_in_t* a = &ins[chosen][k]; const crt_in_t* b = &ins[i][k];
+            if (a->sslen == b->sslen && !memcmp(a->ss, b->ss, a->sslen) &&
+                a->witlen == b->witlen &&
+                (a->witlen == 0 || !memcmp(a->wit, b->wit, a->witlen))) continue;
+            *ec = -22;
+            *em = "two of these transactions carry DIFFERENT signatures for the same "
+                  "input. Merging them needs the signature combiner (for multisig, "
+                  "assembling separate signatures into one scriptSig), which this node "
+                  "does not implement -- keeping one would silently discard the other. "
+                  "Use combinepsbt, which merges partial signatures properly";
+            return 0;
+        }
+        pick[k] = chosen < 0 ? 0 : chosen;
+    }
+    /* serialize: base tx 0's version/outputs/locktime, chosen input data */
+    int any_wit = 0;
+    for (int k = 0; k < n_in[0]; k++) if (ins[pick[k]][k].witlen > 1) any_wit = 1;
+    static unsigned char out[220000]; long o = 0;
+    memcpy(out, bufs[0], 4); o = 4;
+    if (any_wit){ out[o++] = 0x00; out[o++] = 0x01; }
+    o += crt_varint(out + o, (unsigned long long)n_in[0]);
+    for (int k = 0; k < n_in[0]; k++){
+        const crt_in_t* c = &ins[pick[k]][k];
+        memcpy(out + o, c->op, 36); o += 36;
+        o += crt_varint(out + o, (unsigned long long)c->sslen);
+        memcpy(out + o, c->ss, c->sslen); o += c->sslen;
+        unsigned sq = c->seq;
+        out[o++] = (unsigned char)sq; out[o++] = (unsigned char)(sq>>8);
+        out[o++] = (unsigned char)(sq>>16); out[o++] = (unsigned char)(sq>>24);
+    }
+    memcpy(out + o, bufs[0] + ostart[0], oend[0] - ostart[0]); o += (long)(oend[0] - ostart[0]);
+    if (any_wit){
+        for (int k = 0; k < n_in[0]; k++){
+            const crt_in_t* c = &ins[pick[k]][k];
+            if (c->witlen){ memcpy(out + o, c->wit, c->witlen); o += (long)c->witlen; }
+            else out[o++] = 0x00;                    /* empty stack for this input */
+        }
+    }
+    memcpy(out + o, bufs[0] + blen[0] - 4, 4); o += 4;   /* locktime */
+    char* hx = malloc((size_t)o * 2 + 1);
+    if (!hx){ *ec = -7; *em = "oom"; return 0; }
+    bin_to_hex(hx, out, (size_t)o);
+    *result = rj_str(hx); free(hx);
+    return 1;
+}
+
+/* ==== finalizepsbt =======================================================
+ * The Finalizer and Extractor roles (BIP174). For each input that carries
+ * partial signatures, build PSBT_IN_FINAL_SCRIPTSIG / _SCRIPTWITNESS from
+ * the signature(s) and the input's scriptPubKey, then drop the fields BIP174
+ * says a finalized input must not keep (partial sigs, sighash type, redeem
+ * and witness scripts, derivations).
+ *
+ * The script forms handled are the ones this node can build without a
+ * script solver: P2PKH, P2WPKH, and P2SH-P2WPKH. An input of any other form
+ * is LEFT ALONE and `complete` comes back false -- which is precisely what
+ * Core does for an input it cannot finalize, not a shortcut. Nothing is
+ * emitted that was not derived from data already in the PSBT. */
+#define FIN_MAXIO 1000
+#define FIN_MAXKV 128
+
+/* find a key whose first byte is `type` */
+static const psbt_kv* fin_find(const psbt_kv* kv, int n, unsigned char type){
+    for (int i = 0; i < n; i++) if (kv[i].kl >= 1 && kv[i].k[0] == type) return &kv[i];
+    return NULL;
+}
+static int fin_count(const psbt_kv* kv, int n, unsigned char type){
+    int c = 0; for (int i = 0; i < n; i++) if (kv[i].kl >= 1 && kv[i].k[0] == type) c++;
+    return c;
+}
+
+/* The scriptPubKey this input spends: from PSBT_IN_WITNESS_UTXO (value ||
+ * script) or, for a legacy input, by indexing PSBT_IN_NON_WITNESS_UTXO's
+ * outputs at the outpoint's vout. Returns 0 if neither is present. */
+static int fin_spk(const psbt_kv* kv, int n, unsigned long vout,
+                   const unsigned char** spk, unsigned long* spklen){
+    const psbt_kv* w = fin_find(kv, n, 0x01);
+    if (w && w->vl > 9){
+        unsigned long cc;
+        const unsigned char* p = w->v + 8;
+        unsigned long sl = srw_varint(p, &cc);
+        if (8 + cc + sl <= w->vl){ *spk = p + cc; *spklen = sl; return 1; }
+    }
+    const psbt_kv* nw = fin_find(kv, n, 0x00);
+    if (nw && nw->vl > 10){
+        const unsigned char* tx = nw->v; unsigned long len = nw->vl, cc;
+        unsigned long p = 4;
+        if (len > 6 && tx[4] == 0x00 && tx[5] == 0x01) p = 6;
+        unsigned long n_in = srw_varint(tx + p, &cc); p += cc;
+        for (unsigned long i = 0; i < n_in; i++){
+            if (p + 36 > len) return 0;
+            p += 36;
+            unsigned long sl = srw_varint(tx + p, &cc); p += cc + sl + 4;
+            if (p > len) return 0;
+        }
+        unsigned long n_out = srw_varint(tx + p, &cc); p += cc;
+        if (vout >= n_out) return 0;
+        for (unsigned long i = 0; i < n_out; i++){
+            if (p + 8 > len) return 0;
+            p += 8;
+            unsigned long sl = srw_varint(tx + p, &cc); p += cc;
+            if (p + sl > len) return 0;
+            if (i == vout){ *spk = tx + p; *spklen = sl; return 1; }
+            p += sl;
+        }
+    }
+    return 0;
+}
+
+/* Build the final scriptSig/witness for one input. Returns 1 when it could,
+ * filling ss/sslen and wit/witlen (witness = serialized stack incl. count).
+ * Returns 0 when the form is not one this node can finalize -- the caller
+ * then leaves the input untouched. */
+static int fin_build(const psbt_kv* kv, int n, const unsigned char* spk, unsigned long spklen,
+                     unsigned char* ss, unsigned long* sslen,
+                     unsigned char* wit, unsigned long* witlen){
+    *sslen = 0; *witlen = 0;
+    if (fin_count(kv, n, 0x02) != 1) return 0;        /* exactly one partial sig */
+    const psbt_kv* ps = fin_find(kv, n, 0x02);
+    if (!ps || ps->kl != 34 || ps->vl < 9 || ps->vl > 73) return 0;  /* 0x02||pub33 */
+    const unsigned char* pub = ps->k + 1;
+    const unsigned char* sig = ps->v; unsigned long siglen = ps->vl;
+
+    /* P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG */
+    if (spklen == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 &&
+        spk[23] == 0x88 && spk[24] == 0xac){
+        unsigned char h[20]; hash160(h, pub, 33);
+        if (memcmp(h, spk + 3, 20)) return 0;
+        unsigned long o = 0;
+        ss[o++] = (unsigned char)siglen; memcpy(ss + o, sig, siglen); o += siglen;
+        ss[o++] = 33; memcpy(ss + o, pub, 33); o += 33;
+        *sslen = o;
+        return 1;
+    }
+    /* P2WPKH: OP_0 <20>. scriptSig stays empty; witness is [sig, pubkey]. */
+    if (spklen == 22 && spk[0] == 0x00 && spk[1] == 0x14){
+        unsigned char h[20]; hash160(h, pub, 33);
+        if (memcmp(h, spk + 2, 20)) return 0;
+        unsigned long o = 0;
+        wit[o++] = 0x02;
+        wit[o++] = (unsigned char)siglen; memcpy(wit + o, sig, siglen); o += siglen;
+        wit[o++] = 33; memcpy(wit + o, pub, 33); o += 33;
+        *witlen = o;
+        return 1;
+    }
+    /* P2SH-P2WPKH: OP_HASH160 <20> OP_EQUAL, with the redeemScript being the
+     * v0 program. scriptSig is the single push of the redeemScript. */
+    if (spklen == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87){
+        const psbt_kv* rs = fin_find(kv, n, 0x04);
+        if (!rs || rs->vl != 22 || rs->v[0] != 0x00 || rs->v[1] != 0x14) return 0;
+        unsigned char rh[20]; hash160(rh, rs->v, 22);
+        if (memcmp(rh, spk + 2, 20)) return 0;
+        unsigned char h[20]; hash160(h, pub, 33);
+        if (memcmp(h, rs->v + 2, 20)) return 0;
+        ss[0] = 22; memcpy(ss + 1, rs->v, 22); *sslen = 23;
+        unsigned long o = 0;
+        wit[o++] = 0x02;
+        wit[o++] = (unsigned char)siglen; memcpy(wit + o, sig, siglen); o += siglen;
+        wit[o++] = 33; memcpy(wit + o, pub, 33); o += 33;
+        *witlen = o;
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    int extract = 1;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL)
+        extract = params->items[1]->str[0] == '1';
+    static unsigned char buf[200000]; long blen = 0;
+    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
+        *ec = -22; *em = "TX decode failed"; return 0; }
+    long p = 5;
+    static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
+    const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
+    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be finalized"; return 0; }
+    const unsigned char* utx = utxk->v; unsigned long utxl = utxk->vl;
+
+    /* walk the unsigned tx for the outpoints and the outputs/locktime tail */
+    static crt_in_t uin[FIN_MAXIO];
+    int n_in, sw; unsigned long ost, oen;
+    if (!crt_walk(utx, utxl, uin, FIN_MAXIO, &n_in, &ost, &oen, &sw)){
+        *ec = -22; *em = "TX decode failed"; return 0; }
+
+    static psbt_kv ikv[FIN_MAXIO][FIN_MAXKV]; static int in_n[FIN_MAXIO];
+    static unsigned char fss[FIN_MAXIO][256]; static unsigned long fsslen[FIN_MAXIO];
+    static unsigned char fwit[FIN_MAXIO][256]; static unsigned long fwitlen[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++) in_n[i] = psbt_parse_map(buf, blen, &p, ikv[i], FIN_MAXKV);
+    unsigned long n_out;
+    { unsigned long cc; n_out = srw_varint(utx + ost, &cc); }
+    static psbt_kv okv[FIN_MAXIO][FIN_MAXKV]; static int out_n[FIN_MAXIO];
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
+        out_n[i] = psbt_parse_map(buf, blen, &p, okv[i], FIN_MAXKV);
+
+    int complete = 1;
+    for (int i = 0; i < n_in; i++){
+        fsslen[i] = 0; fwitlen[i] = 0;
+        /* already finalized? */
+        const psbt_kv* f7 = fin_find(ikv[i], in_n[i], 0x07);
+        const psbt_kv* f8 = fin_find(ikv[i], in_n[i], 0x08);
+        if (f7 || f8){
+            if (f7){ memcpy(fss[i], f7->v, f7->vl > 256 ? 256 : f7->vl); fsslen[i] = f7->vl > 256 ? 256 : f7->vl; }
+            if (f8){ memcpy(fwit[i], f8->v, f8->vl > 256 ? 256 : f8->vl); fwitlen[i] = f8->vl > 256 ? 256 : f8->vl; }
+            continue;
+        }
+        const unsigned char* spk; unsigned long spklen;
+        unsigned long vout = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) |
+                             ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+        if (!fin_spk(ikv[i], in_n[i], vout, &spk, &spklen)){ complete = 0; continue; }
+        if (!fin_build(ikv[i], in_n[i], spk, spklen, fss[i], &fsslen[i], fwit[i], &fwitlen[i])){
+            fsslen[i] = 0; fwitlen[i] = 0; complete = 0; continue;
+        }
+    }
+
+    if (complete && extract){
+        /* Extractor: the network serialization */
+        int any_wit = 0;
+        for (int i = 0; i < n_in; i++) if (fwitlen[i] > 1) any_wit = 1;
+        static unsigned char out[220000]; long o = 0;
+        memcpy(out, utx, 4); o = 4;
+        if (any_wit){ out[o++] = 0x00; out[o++] = 0x01; }
+        o += crt_varint(out + o, (unsigned long long)n_in);
+        for (int i = 0; i < n_in; i++){
+            memcpy(out + o, uin[i].op, 36); o += 36;
+            o += crt_varint(out + o, (unsigned long long)fsslen[i]);
+            memcpy(out + o, fss[i], fsslen[i]); o += (long)fsslen[i];
+            unsigned sq = uin[i].seq;
+            out[o++]=(unsigned char)sq; out[o++]=(unsigned char)(sq>>8);
+            out[o++]=(unsigned char)(sq>>16); out[o++]=(unsigned char)(sq>>24);
+        }
+        memcpy(out + o, utx + ost, oen - ost); o += (long)(oen - ost);
+        if (any_wit)
+            for (int i = 0; i < n_in; i++){
+                if (fwitlen[i]){ memcpy(out + o, fwit[i], fwitlen[i]); o += (long)fwitlen[i]; }
+                else out[o++] = 0x00;
+            }
+        memcpy(out + o, utx + utxl - 4, 4); o += 4;
+        char* hx = malloc((size_t)o*2+1); if (!hx){ *ec=-7; *em="oom"; return 0; }
+        bin_to_hex(hx, out, (size_t)o);
+        rj_val* r = rj_obj();
+        rj_obj_set(r, "hex", rj_str(hx));
+        rj_obj_set(r, "complete", rj_bool(1));
+        free(hx);
+        *result = r;
+        return 1;
+    }
+
+    /* not extracting: re-serialize the PSBT with the final fields set and
+     * the now-forbidden ones dropped (BIP174: a finalized input keeps only
+     * the UTXO, the final scriptSig/witness, and proprietary/unknown keys) */
+    static unsigned char out[220000]; long o = 0;
+    out[o++]=0x70; out[o++]=0x73; out[o++]=0x62; out[o++]=0x74; out[o++]=0xff;
+    o += psbt_ser_map(out + o, gkv, gn);
+    for (int i = 0; i < n_in; i++){
+        psbt_kv keep[FIN_MAXKV]; int kn = 0;
+        int finalized = fsslen[i] || fwitlen[i];
+        for (int k = 0; k < in_n[i] && kn < FIN_MAXKV; k++){
+            unsigned char t = ikv[i][k].kl ? ikv[i][k].k[0] : 0xff;
+            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08))
+                continue;
+            keep[kn++] = ikv[i][k];
+        }
+        psbt_kv extra[2]; int en = 0;
+        unsigned char k7 = 0x07, k8 = 0x08;
+        if (finalized && fsslen[i]){ extra[en].k=&k7; extra[en].kl=1; extra[en].v=fss[i]; extra[en].vl=fsslen[i]; en++; }
+        if (finalized && fwitlen[i]){ extra[en].k=&k8; extra[en].kl=1; extra[en].v=fwit[i]; extra[en].vl=fwitlen[i]; en++; }
+        for (int k = 0; k < en && kn < FIN_MAXKV; k++) keep[kn++] = extra[k];
+        o += psbt_ser_map(out + o, keep, kn);
+    }
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
+        o += psbt_ser_map(out + o, okv[i], out_n[i]);
+    char* b = malloc((size_t)((o+2)/3)*4+1); if (!b){ *ec=-7; *em="oom"; return 0; }
+    crt_b64(b, out, o);
+    rj_val* r = rj_obj();
+    rj_obj_set(r, "psbt", rj_str(b));
+    rj_obj_set(r, "complete", rj_bool(complete));
+    free(b);
+    *result = r;
+    return 1;
+}
+
+/* ==== utxoupdatepsbt =====================================================
+ * Fills PSBT_IN_WITNESS_UTXO for every input whose outpoint the UTXO set
+ * knows and whose scriptPubKey is a witness program -- which is exactly what
+ * the method is documented to do ("Updates all segwit inputs ... with data
+ * from ... the UTXO set"). This node has no txindex and no mempool reachable
+ * from here, so a non-witness input cannot be given its full previous
+ * transaction; those inputs are left as they are.
+ *
+ * The `descriptors` argument would add redeem/witness scripts and BIP32
+ * derivations. That is not implemented, so supplying it is an ERROR rather
+ * than an argument quietly ignored -- a caller who passed descriptors and
+ * got a PSBT back without them would reasonably believe they were applied. */
+static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR && params->items[1]->nitems > 0){
+        *ec = -8;
+        *em = "the descriptors argument is not implemented by this node: it would add "
+              "redeem/witness scripts and BIP32 derivations to the PSBT. Call without "
+              "descriptors to fill witness UTXOs from the UTXO set";
+        return 0;
+    }
+    static unsigned char buf[200000]; long blen = 0;
+    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
+        *ec = -22; *em = "TX decode failed"; return 0; }
+    long p = 5;
+    static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
+    const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
+    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be updated"; return 0; }
+    static crt_in_t uin[FIN_MAXIO];
+    int n_in, sw; unsigned long ost, oen;
+    if (!crt_walk(utxk->v, utxk->vl, uin, FIN_MAXIO, &n_in, &ost, &oen, &sw)){
+        *ec = -22; *em = "TX decode failed"; return 0; }
+    static psbt_kv ikv[FIN_MAXIO][FIN_MAXKV]; static int in_n[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++) in_n[i] = psbt_parse_map(buf, blen, &p, ikv[i], FIN_MAXKV);
+    unsigned long n_out; { unsigned long cc; n_out = srw_varint(utxk->v + ost, &cc); }
+    static psbt_kv okv[FIN_MAXIO][FIN_MAXKV]; static int out_n[FIN_MAXIO];
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
+        out_n[i] = psbt_parse_map(buf, blen, &p, okv[i], FIN_MAXKV);
+
+    static unsigned char wu[FIN_MAXIO][128]; static unsigned long wulen[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++){
+        wulen[i] = 0;
+        if (fin_find(ikv[i], in_n[i], 0x01) || fin_find(ikv[i], in_n[i], 0x00)) continue;
+        if (!g_utxo_lst) continue;
+        unsigned long vout = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) |
+                             ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+        unsigned long long value; unsigned long height, cb; const unsigned char* spk; unsigned slen;
+        if (utxo_lsm_get(g_utxo_lst, g_utxo_u, uin[i].op, (unsigned)vout,
+                         &value, &height, &cb, &spk, &slen) != 1) continue;
+        /* witness_utxo is only correct for a witness program; a legacy
+         * prevout needs the whole previous transaction, which this node
+         * cannot produce (no txindex). Leave those alone. */
+        int is_wit = (slen == 22 && spk[0] == 0x00 && spk[1] == 0x14) ||
+                     (slen == 34 && (spk[0] == 0x00 || spk[0] == 0x51) && spk[1] == 0x20);
+        if (!is_wit || slen > 100) continue;
+        unsigned long o = 0;
+        for (int b = 0; b < 8; b++) wu[i][o++] = (unsigned char)(value >> (8*b));
+        o += (unsigned long)crt_varint(wu[i] + o, (unsigned long long)slen);
+        memcpy(wu[i] + o, spk, slen); o += slen;
+        wulen[i] = o;
+    }
+
+    static unsigned char out[220000]; long o = 0;
+    out[o++]=0x70; out[o++]=0x73; out[o++]=0x62; out[o++]=0x74; out[o++]=0xff;
+    o += psbt_ser_map(out + o, gkv, gn);
+    static unsigned char K1 = 0x01;
+    for (int i = 0; i < n_in; i++){
+        psbt_kv keep[FIN_MAXKV]; int kn = 0;
+        for (int k = 0; k < in_n[i] && kn < FIN_MAXKV; k++) keep[kn++] = ikv[i][k];
+        if (wulen[i] && kn < FIN_MAXKV){
+            keep[kn].k = &K1; keep[kn].kl = 1; keep[kn].v = wu[i]; keep[kn].vl = wulen[i]; kn++;
+        }
+        o += psbt_ser_map(out + o, keep, kn);
+    }
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
+        o += psbt_ser_map(out + o, okv[i], out_n[i]);
+    char* b = malloc((size_t)((o+2)/3)*4+1); if (!b){ *ec=-7; *em="oom"; return 0; }
+    crt_b64(b, out, o);
+    *result = rj_str(b); free(b);
+    return 1;
+}
+
+/* The wallet/util subset rpc_commands.c dispatches itself. At file scope
+ * so `help` can enumerate it alongside the other modules' tables --
+ * one list, no second copy to fall out of step. */
+static const char* const WALLET_METHODS[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
         "gettxout","listunspent","getbalance","decoderawtransaction",
         "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
+        "listtransactions","gettransaction","getwalletinfo","getbalances",
+        "signrawtransactionwithwallet","simulaterawtransaction",
+        "combinerawtransaction","finalizepsbt","utxoupdatepsbt",
+        "descriptorprocesspsbt",
+    /* Control, plus the three singletons Core files elsewhere */
+    "help","logging","getrpcinfo","getmemoryinfo","getopenrpcinfo","rpc.discover",
+    "exportasmap","enumeratesigners",
         /* createrawtransaction / signraw / sendraw are wired by the server card
          * which owns the tx-store lookup; the pure-wallet subset is dispatched
          * here. */
-        NULL
-    };
-    for (int i = 0; known[i]; i++) if (!strcmp(method, known[i])) return 1;
+    NULL
+};
+
+/* ==== Core's Control category, plus the three singletons (2026-08-25) ====
+ * These live here because rpc_commands.c is the only translation unit that
+ * can see every module's method table, which `help` needs. */
+
+/* Every method this node serves, merged from the four tables and sorted.
+ * Built from the tables themselves, so a method added to a dispatcher shows
+ * up here automatically and a hand-maintained second list cannot drift. */
+#define CTL_MAXM 512
+static int ctl_all_methods(const char* out[CTL_MAXM]){
+    int n = 0;
+    const char* m;
+    for (int i = 0; (m = rpc_wallet_method_at(i)) != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    for (int i = 0; (m = rpc_wops_method_at(i))   != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    for (int i = 0; (m = rpc_node_method_at(i))   != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    for (int i = 0; (m = rpc_chain_method_at(i))  != NULL && n < CTL_MAXM; i++) out[n++] = m;
+    /* insertion sort; n is ~150 and this runs once per help call */
+    for (int i = 1; i < n; i++){
+        const char* k = out[i]; int j = i - 1;
+        while (j >= 0 && strcmp(out[j], k) > 0){ out[j+1] = out[j]; j--; }
+        out[j+1] = k;
+    }
+    /* de-duplicate: a name could legitimately appear in two tables */
+    int w = 0;
+    for (int i = 0; i < n; i++){
+        if (w > 0 && !strcmp(out[w-1], out[i])) continue;
+        out[w++] = out[i];
+    }
+    return w;
+}
+
+/* help ( "command" )
+ * Core answers with per-method usage text grouped by category. This node
+ * carries neither -- the usage strings are ~150 hand-written blocks that
+ * would have to be kept in step with the implementations by hand, and a
+ * usage string that has drifted from its method is worse than none. What it
+ * does have is the authoritative list of what it serves, taken from the
+ * dispatch tables themselves. */
+static int cmd_help(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* want = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR && params->items[0]->str[0])
+        want = params->items[0]->str;
+    if (want){
+        static char line[256];
+        if (!rpc_known_method(want)){
+            /* Core's exact text for an unknown command */
+            snprintf(line, sizeof line, "help: unknown command: %s", want);
+            *result = rj_str(line);
+            return 1;
+        }
+        snprintf(line, sizeof line,
+                 "%s\n\nThis node serves %s, but does not carry Bitcoin Core's "
+                 "per-method usage text. Consult Core's own `help %s` for the "
+                 "argument and result shapes; where this node diverges from "
+                 "them it is recorded in docs/RPC_LIVE_NODE.md.", want, want, want);
+        *result = rj_str(line);
+        return 1;
+    }
+    const char* all[CTL_MAXM];
+    int n = ctl_all_methods(all);
+    /* header + one line each */
+    size_t cap = 512 + (size_t)n * 40;
+    char* buf = malloc(cap);
+    if (!buf){ *ec = -7; *em = "oom"; return 0; }
+    int o = snprintf(buf, cap,
+        "== Methods served by this node (%d) ==\n"
+        "This list is generated from the dispatch tables, so it is exactly what\n"
+        "will be answered. Per-method usage text is not carried here; see\n"
+        "Core's own help for argument shapes and docs/RPC_LIVE_NODE.md for the\n"
+        "places this node deliberately diverges or refuses.\n\n", n);
+    for (int i = 0; i < n && o < (int)cap - 2; i++)
+        o += snprintf(buf + o, cap - (size_t)o, "%s\n", all[i]);
+    *result = rj_str(buf);
+    free(buf);
+    return 1;
+}
+
+/* getrpcinfo -- Core reports the commands currently executing and the log
+ * path. This node's RPC server accepts and services ONE connection at a time
+ * on a single thread (rpc_server.c), so at the moment getrpcinfo runs it is
+ * necessarily the only active command: the single-element array is the
+ * complete truth here, not a simplification. */
+static int cmd_getrpcinfo(rj_val** result){
+    rj_val* cmds = rj_arr();
+    rj_val* c = rj_obj();
+    rj_obj_set(c, "method", rj_str("getrpcinfo"));
+    rj_obj_set(c, "duration", rj_numf("%d", 0));
+    rj_arr_push(cmds, c);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "active_commands", cmds);
+    /* The daemon opens its log as the bare relative name "bitcoind.log" from
+     * the datadir it runs in (daemon/main.c), so resolving it against the
+     * cwd is the real path, not a guess. */
+    { char cwd[1024];
+      if (getcwd(cwd, sizeof cwd)){
+          char path[1200];
+          snprintf(path, sizeof path, "%s/bitcoind.log", cwd);
+          rj_obj_set(o, "logpath", rj_str(path));
+      } }
+    *result = o;
+    return 1;
+}
+
+/* logging ( ["include"] ["exclude"] )
+ * node_log.asm emits eight fixed kinds (INFO HSHK HDRS BLOCK CONS STORE
+ * ERROR SERVE) and has no runtime gate: every event is written
+ * unconditionally, by design -- the logger holds no global mutable state so
+ * it can link anywhere. The read form therefore reports this node's real
+ * kinds, all true because they really are all emitted. The mutating form is
+ * refused rather than accepted-and-ignored: a caller who turned a category
+ * "off" and kept seeing it in the log would be worse off than one told the
+ * switch does not exist. Note these are NOT Core's category names, because
+ * they are not Core's categories. */
+static int cmd_logging(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (params && params->typ == RJ_ARR && params->nitems >= 1){
+        *ec = -1;
+        *em = "this node's logger (node_log.asm) has no runtime category gate: "
+              "its eight kinds are always emitted, deliberately, so that it "
+              "holds no global mutable state and can link anywhere. Call "
+              "logging with no arguments to see them; there is nothing to "
+              "switch on or off";
+        return 0;
+    }
+    static const char* KINDS[] = { "info","hshk","hdrs","block","cons","store","error","serve" };
+    rj_val* o = rj_obj();
+    for (int i = 0; i < 8; i++) rj_obj_set(o, KINDS[i], rj_bool(1));
+    *result = o;
+    return 1;
+}
+
+/* getmemoryinfo ( "mode" )
+ * Core's default mode reports its SECURE ALLOCATOR's locked pool. This node
+ * has no secure allocator, so those six numbers describe nothing here and
+ * are refused rather than zeroed. Mode "mallocinfo" is real: glibc's
+ * malloc_info(3) emits the same XML Core forwards. */
+static int cmd_getmemoryinfo(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* mode = "stats";
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR) mode = params->items[0]->str;
+    if (!strcmp(mode, "mallocinfo")){
+        char* buf = NULL; size_t len = 0;
+        FILE* f = open_memstream(&buf, &len);
+        if (!f){ *ec = -7; *em = "oom"; return 0; }
+        int r = malloc_info(0, f);
+        fclose(f);
+        if (r != 0){ free(buf); *ec = -1; *em = "malloc_info failed"; return 0; }
+        *result = rj_str(buf ? buf : "");
+        free(buf);
+        return 1;
+    }
+    if (!strcmp(mode, "stats")){
+        *ec = -1;
+        *em = "getmemoryinfo \"stats\" reports Bitcoin Core's SECURE ALLOCATOR "
+              "locked-page pool. This node has no secure allocator, so those "
+              "numbers would describe nothing. Use mode \"mallocinfo\", which "
+              "returns glibc's real malloc_info(3) XML";
+        return 0;
+    }
+    *ec = -8; *em = "mode must be \"stats\" or \"mallocinfo\"";
+    return 0;
+}
+
+static int ctl_unsupported(const char* msg, long* ec, const char** em){
+    *ec = -1; *em = msg; return 0;
+}
+
+const char* rpc_wallet_method_at(int i){
+    int n = 0;
+    while (WALLET_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? WALLET_METHODS[i] : NULL;
+}
+
+int rpc_known_method(const char* method) {
+    for (int i = 0; WALLET_METHODS[i]; i++) if (!strcmp(method, WALLET_METHODS[i])) return 1;
+    if (rpc_wops_known_method(method)) return 1;
     if (rpc_node_known_method(method)) return 1;
     return rpc_chain_known_method(method);
 }
@@ -1354,8 +2482,65 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_joinpsbts(params, err_code, err_msg, result);
     if (!strcmp(method, "analyzepsbt"))
         return cmd_analyzepsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "listtransactions"))
+        return cmd_listtransactions(params, err_code, err_msg, result);
+    if (!strcmp(method, "gettransaction"))
+        return cmd_gettransaction(params, err_code, err_msg, result);
+    if (!strcmp(method, "getwalletinfo"))
+        return cmd_getwalletinfo(w, result);
+    if (!strcmp(method, "getbalances"))
+        return cmd_getbalances(w, result);
     if (!strcmp(method, "signrawtransactionwithkey"))
         return cmd_signrawtransactionwithkey(params, err_code, err_msg, result);
+    if (!strcmp(method, "signrawtransactionwithwallet"))
+        return cmd_signrawtransactionwithwallet(params, w, err_code, err_msg, result);
+    if (!strcmp(method, "simulaterawtransaction"))
+        return cmd_simulaterawtransaction(params, w, err_code, err_msg, result);
+    if (!strcmp(method, "help"))
+        return cmd_help(params, err_code, err_msg, result);
+    if (!strcmp(method, "getrpcinfo"))
+        return cmd_getrpcinfo(result);
+    if (!strcmp(method, "logging"))
+        return cmd_logging(params, err_code, err_msg, result);
+    if (!strcmp(method, "getmemoryinfo"))
+        return cmd_getmemoryinfo(params, err_code, err_msg, result);
+    if (!strcmp(method, "getopenrpcinfo") || !strcmp(method, "rpc.discover"))
+        return ctl_unsupported(
+            "this node publishes no OpenRPC service description: that document "
+            "restates every method's argument and result schema, which would be "
+            "a second specification to keep in step with the implementations by "
+            "hand. `help` lists what is served, generated from the dispatch "
+            "tables themselves", err_code, err_msg);
+    if (!strcmp(method, "exportasmap"))
+        return ctl_unsupported(
+            "this node uses no asmap: peer diversity is not bucketed by AS, so "
+            "there is no mapping to export", err_code, err_msg);
+    if (!strcmp(method, "enumeratesigners")){
+        extern int rpc_signer_enumerate(rj_val**, long*, const char**);
+        return rpc_signer_enumerate(result, err_code, err_msg);
+    }
+    if (!strcmp(method, "combinerawtransaction"))
+        return cmd_combinerawtransaction(params, err_code, err_msg, result);
+    if (!strcmp(method, "finalizepsbt"))
+        return cmd_finalizepsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "utxoupdatepsbt"))
+        return cmd_utxoupdatepsbt(params, err_code, err_msg, result);
+    if (!strcmp(method, "descriptorprocesspsbt")){
+        *err_code = -1;
+        *err_msg = "this node cannot sign from descriptors: the descriptor engine "
+                   "derives addresses and scripts (deriveaddresses/getdescriptorinfo) "
+                   "but has no path from a descriptor to a spending key, so there is "
+                   "nothing to sign a PSBT with. Use signrawtransactionwithwallet on "
+                   "the extracted transaction";
+        return 0;
+    }
+    /* the rest of Core's Wallet category (rpc_wallet_ops.c) -- labels, wallet
+     * inventory, output locks, message signing, descriptor reporting, and the
+     * lifecycle methods a single-seed wallet cannot honour. */
+    {
+        int r = rpc_wops_dispatch(method, params, w, result, err_code, err_msg);
+        if (r >= 0) return r;
+    }
     /* live-node-state methods (rpc_node.c) -- peers/network/mempool from the
      * serve daemon's shared status; -1 means "not one of its methods". */
     {

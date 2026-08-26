@@ -6,6 +6,13 @@ of 2026-08-25 — not from memory. "Parity" here means **RPC-surface + behavior
 parity**, method by method, verified where verifiable. It does NOT resolve the
 separate, deeper open question of consensus correctness (LOG.md incidents).
 
+## CAPSTONE PASSED (2026-08-25)
+At height 963967: txouts, total_amount, bogosize and the MuHash of the entire
+UTXO set are byte-identical to Bitcoin Core's (oracle coinstatsindex answer at
+the same height); scantxoutset for the burn address matches to the satoshi.
+See LOG.md's capstone entry for the numbers, and incident #45 for the one
+finding it surfaced (utxo_lsm_count metadata over-count; content unaffected).
+
 ## Verification bound (honest)
 The scratch Core oracle (`/storage/core-oracle`, port 8335) is built **without
 wallet support**, so wallet-state RPCs cannot be oracle-diffed. Verification
@@ -64,7 +71,21 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       5 blocks (pre/post-segwit); fee/feerate/utxo_size_inc need undo (omitted
       where absent, honest divergence) and are verified via synthetic undo in
       test_rpc_chain. Numeric-height + blockhash forms both work.
-- [ ] scantxoutset — needs the COMPLETE UTXO set; BLOCKED on the rebuild.
+- [x] scantxoutset — ORACLE-VERIFIED TO THE SATOSHI on real data. The
+      whole-set scanner lives in the tool-derived reader TU (same
+      fingerprint/quiescence discipline, munmap-everything life cycle);
+      scan targets expand through the SAME descriptor engine
+      deriveaddresses uses (strings or {desc,range}; checksums optional as
+      in Core; ranged default 1000); per-unspent desc reuses the existing
+      inferred-descriptor helper (addr(...)#checksum, matching the oracle's
+      own output). Synchronous scans: status -> null, abort -> false
+      (Core's no-scan answers, oracle-verified); overflow past the 32768-hit
+      cap is an ERROR, never silent truncation. PROOF: scanning the parked
+      pre-rebuild state (165,717,308 outputs, ~109s) for the Counterparty
+      burn address found 3135 unspents / 2130.99791495 BTC -- EXACTLY the
+      oracle's own scantxoutset result for the same descriptor. Also
+      upgraded desc_parse_core's unknown-function error to Core's exact
+      "'X' is not a valid descriptor function" shape.
 - [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (after T4)
 
 ### T3 — Mining-info RPCs  [oracle-verifiable, non-wallet]
@@ -186,8 +207,32 @@ Wire existing primitives onto JSON-RPC with Core shapes.
 - [ ] estimaterawfee (hidden/debug RPC -- low value, deferred)
 
 ### T6 — Wallet-state RPCs on the RPC surface
-- [ ] sendtoaddress, sendmany, listtransactions, gettransaction,
-      getreceivedbyaddress, getunconfirmedbalance
+- [x] listtransactions + gettransaction + getwalletinfo — journal-backed
+      (wallet_txlog.c's crc-guarded BMCTX v1 records of every wallet send).
+      VERIFICATION BOUND stated in code: no oracle wallet exists, so the
+      proof is round-trip through the REAL txlog_append writer, with Core's
+      shapes and sign conventions (send amount/fee negative; txids emitted
+      display-order from the journal's internal-order hex; torn/crc-bad
+      records skipped as absent data). HONEST GAPS: only "send" category
+      exists (the journal records sends); confirmations reported 0 (the
+      journal does not track them -- never invented). getwalletinfo:
+      format "bmc" (own store, stated), balance from the injected UTXO set,
+      txcount from the journal, private_keys_enabled iff a seed is loaded.
+- [x] daemon wallet BOOTSTRAP: serve_start_rpc now loads the CLI's own
+      wallet store (bmcwallet.dat; BMC_WALLET_PASS env or <store>.pass,
+      the CLI's exact resolution order) and hands the RPC layer the seed --
+      getnewaddress/getaddressinfo/getwalletinfo go live on a daemon with a
+      store present; absent store = unconfigured, exactly as before. The
+      mnemonic buffer is wiped after seed derivation.
+- [ ] sendtoaddress/sendmany via RPC — DEFERRED with a design question:
+      Core auto-selects inputs and auto-computes fees from wallet state;
+      our live daemon tracks no wallet UTXOs (rpc_wallet's injected set is
+      for harnesses; the addr index is not configured in production).
+      Needs: a wallet-UTXO source (addr index build, or scan-at-startup) +
+      a fee policy (EMA-based) -- a supervised design, not an overnight
+      wiring job. The CLI primitive (explicit UTXOs + key) remains the
+      working path.
+- [ ] getreceivedbyaddress, getunconfirmedbalance (same UTXO-source gate)
 
 ### T7 — Wallet management (multiwallet)
 - [ ] createwallet/loadwallet/unloadwallet/listwallets, backupwallet,

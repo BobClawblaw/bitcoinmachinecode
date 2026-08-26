@@ -7,6 +7,8 @@
  * and Core's replaceable-default (true -> sequence 0xfffffffd) vs =false. */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "../rpc_commands.h"
 #include "../rpc_json.h"
 
@@ -229,6 +231,129 @@ int main(void){
         rj_free(r); rj_free(pr);
       }
     }
+
+    /* --- wallet-state RPCs over the journal: ROUND-TRIP through the REAL
+     * txlog_append writer (crc'd BMCTX v1 records) in an isolated tmpdir.
+     * The verification bound is stated in rpc_commands.c: no oracle wallet
+     * exists, so the proof is that what the wallet recorded is what the
+     * RPCs report, in Core's shapes and sign conventions. --- */
+    { char tdir[] = "/tmp/bmc_wsl_XXXXXX";
+      if (!mkdtemp(tdir)){ ck("wsl mkdtemp", 0); }
+      else {
+        char oldcwd[512]; getcwd(oldcwd, sizeof oldcwd);
+        chdir(tdir);
+        extern int txlog_append(const char*, unsigned long long, const unsigned char*,
+                                long long, long long, const unsigned char*, unsigned long, long);
+        unsigned char tx1[32], tx2[32], dest[20];
+        memset(tx1, 0x11, 32); memset(tx2, 0x22, 32);
+        /* dest = hash160 whose P2PKH address the entry must render */
+        { const char* DH = "fc7250a211deddc70ee5a2738de5f07817351cef"; /* 1Q1pE5vP... KAT addr */
+          for (int i=0;i<20;i++){ unsigned v; sscanf(DH+2*i,"%2x",&v); dest[i]=(unsigned char)v; } }
+        ck("wsl journal write 1", txlog_append("bmcwallet.dat.txlog", 1787000000ULL, tx1, 50000, 1000, dest, 2, 226)==0);
+        ck("wsl journal write 2", txlog_append("bmcwallet.dat.txlog", 1787000100ULL, tx2, 70000, 1500, dest, 1, 191)==0);
+        /* torn record must be skipped (bad crc) */
+        { FILE* f=fopen("bmcwallet.dat.txlog","a"); fprintf(f,"1787000200 sent %064d 1 1 %040d 1 1 deadbeef\n",0,0); fclose(f); }
+
+        rpc_wallet w; memset(&w,0,sizeof w);
+        long ec2; const char* em2;
+        { rj_val* pr=rj_parse("[]",2); rj_val* r2=NULL;
+          rpc_dispatch("listtransactions",pr,&w,&r2,&ec2,&em2);
+          ck("listtransactions -> 2 entries (torn record skipped)", r2 && r2->typ==RJ_ARR && r2->nitems==2);
+          rj_val* e0 = r2 && r2->nitems ? r2->items[0] : NULL;   /* oldest first */
+          ck("entry category send + negative amount (Core sign convention)",
+             e0 && rj_obj_get(e0,"category") && !strcmp(rj_obj_get(e0,"category")->str,"send")
+             && rj_obj_get(e0,"amount") && !strcmp(rj_obj_get(e0,"amount")->str,"-0.00050000"));
+          ck("entry fee negative", e0 && rj_obj_get(e0,"fee") && !strcmp(rj_obj_get(e0,"fee")->str,"-0.00001000"));
+          ck("entry address rendered from dest h160",
+             e0 && rj_obj_get(e0,"address") && !strcmp(rj_obj_get(e0,"address")->str,"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9"));
+          ck("entry txid display order (11.. internal -> reversed)",
+             e0 && rj_obj_get(e0,"txid") && !strncmp(rj_obj_get(e0,"txid")->str,"1111",4));
+          ck("entry time + confirmations 0", e0 && rj_obj_get(e0,"time")
+             && !strcmp(rj_obj_get(e0,"time")->str,"1787000000")
+             && rj_obj_get(e0,"confirmations") && !strcmp(rj_obj_get(e0,"confirmations")->str,"0"));
+          rj_free(r2); rj_free(pr); }
+        { rj_val* pr=rj_parse("[\"*\", 1]",8); rj_val* r2=NULL;
+          rpc_dispatch("listtransactions",pr,&w,&r2,&ec2,&em2);
+          ck("listtransactions count=1 -> newest only", r2 && r2->typ==RJ_ARR && r2->nitems==1
+             && !strncmp(rj_obj_get(r2->items[0],"txid")->str,"2222",4));
+          rj_free(r2); rj_free(pr); }
+        { char pj2[128];
+          snprintf(pj2,sizeof pj2,"[\"%s\"]",
+                   "2222222222222222222222222222222222222222222222222222222222222222");
+          rj_val* pr=rj_parse(pj2,strlen(pj2)); rj_val* r2=NULL;
+          int rc2=rpc_dispatch("gettransaction",pr,&w,&r2,&ec2,&em2);
+          ck("gettransaction by display txid", rc2==1 && r2 && rj_obj_get(r2,"amount")
+             && !strcmp(rj_obj_get(r2,"amount")->str,"-0.00070000"));
+          ck("gettransaction details[0] is the send entry", r2 && rj_obj_get(r2,"details")
+             && rj_obj_get(r2,"details")->nitems==1);
+          rj_free(r2); rj_free(pr); }
+        { rj_val* pr=rj_parse("[\"3333333333333333333333333333333333333333333333333333333333333333\"]",68);
+          (void)pr; if(pr) rj_free(pr);
+          const char* pj3 = "[\"3333333333333333333333333333333333333333333333333333333333333333\"]";
+          rj_val* p3=rj_parse(pj3,strlen(pj3)); rj_val* r3=NULL;
+          int rc3=rpc_dispatch("gettransaction",p3,&w,&r3,&ec2,&em2);
+          ck("gettransaction unknown -> -5 Core message", rc3==0 && ec2==-5
+             && em2 && !strcmp(em2,"Invalid or non-wallet transaction id"));
+          rj_free(r3); rj_free(p3); }
+        { rj_val* pr=rj_parse("[]",2); rj_val* r2=NULL;
+          rpc_dispatch("getwalletinfo",pr,&w,&r2,&ec2,&em2);
+          ck("getwalletinfo txcount 2 + format bmc + keys disabled (no seed)",
+             r2 && rj_obj_get(r2,"txcount") && !strcmp(rj_obj_get(r2,"txcount")->str,"2")
+             && rj_obj_get(r2,"format") && !strcmp(rj_obj_get(r2,"format")->str,"bmc")
+             && rj_obj_get(r2,"private_keys_enabled") && rj_obj_get(r2,"private_keys_enabled")->str[0]=='0');
+          /* ORACLE-DIFFED 2026-08-25 (the scratch Core ran disablewallet=1
+           * until then): Core's modern getwalletinfo has NO balance fields --
+           * they moved to getbalances -- and DOES carry blank/flags. */
+          ck("getwalletinfo emits no balance fields (Core parity)",
+             r2 && rj_obj_get(r2,"balance")==NULL && rj_obj_get(r2,"unconfirmed_balance")==NULL
+             && rj_obj_get(r2,"immature_balance")==NULL && rj_obj_get(r2,"paytxfee")==NULL);
+          ck("getwalletinfo has blank + flags (Core parity)",
+             r2 && rj_obj_get(r2,"blank") && rj_obj_get(r2,"flags")
+             && rj_obj_get(r2,"flags")->typ==RJ_ARR);
+          rj_free(r2); rj_free(pr); }
+        /* ORACLE-DIFFED 2026-08-25 against a REAL Core wallet holding a real
+         * mainnet transaction (watch-only import of a recently-active
+         * address). Two shape corrections the diff forced:
+         *   - gettransaction.details[] entries are Core's REDUCED shape
+         *     {address,category,amount,vout,fee,abandoned}, NOT a copy of a
+         *     listtransactions entry: we had been putting six top-level
+         *     fields (txid/time/timereceived/confirmations/walletconflicts)
+         *     inside details[0], where Core never puts them;
+         *   - every entry carries `vout` and `mempoolconflicts`.
+         * `fee` IS correct here: Core documents it as "negative and only
+         * available for the send category", and every journal record is a
+         * send. */
+        { char pj4[128];
+          snprintf(pj4,sizeof pj4,"[\"%s\"]",
+                   "1111111111111111111111111111111111111111111111111111111111111111");
+          rj_val* p4=rj_parse(pj4,strlen(pj4)); rj_val* r4=NULL;
+          rpc_dispatch("gettransaction",p4,&w,&r4,&ec2,&em2);
+          rj_val* det = r4 ? rj_obj_get(r4,"details") : NULL;
+          rj_val* d0 = det && det->nitems ? det->items[0] : NULL;
+          ck("details[0] is Core's REDUCED shape (no txid/time/confirmations)",
+             d0 && rj_obj_get(d0,"txid")==NULL && rj_obj_get(d0,"time")==NULL
+             && rj_obj_get(d0,"confirmations")==NULL && rj_obj_get(d0,"walletconflicts")==NULL);
+          ck("details[0] has address/category/amount/vout/fee/abandoned",
+             d0 && rj_obj_get(d0,"address") && rj_obj_get(d0,"category")
+             && rj_obj_get(d0,"amount") && rj_obj_get(d0,"vout")
+             && rj_obj_get(d0,"fee") && rj_obj_get(d0,"abandoned"));
+          rj_free(r4); rj_free(p4); }
+        { rj_val* pr=rj_parse("[]",2); rj_val* r2=NULL;
+          rpc_dispatch("listtransactions",pr,&w,&r2,&ec2,&em2);
+          rj_val* e0 = r2 && r2->nitems ? r2->items[0] : NULL;
+          ck("entry has vout + mempoolconflicts (Core parity)",
+             e0 && rj_obj_get(e0,"vout") && rj_obj_get(e0,"mempoolconflicts")
+             && rj_obj_get(e0,"mempoolconflicts")->typ==RJ_ARR);
+          rj_free(r2); rj_free(pr); }
+        { rj_val* pr=rj_parse("[]",2); rj_val* r2=NULL;
+          rpc_dispatch("getbalances",pr,&w,&r2,&ec2,&em2);
+          rj_val* mine = r2 ? rj_obj_get(r2,"mine") : NULL;
+          ck("getbalances mine.{trusted,untrusted_pending,immature,nonmempool}",
+             mine && rj_obj_get(mine,"trusted") && rj_obj_get(mine,"untrusted_pending")
+             && rj_obj_get(mine,"immature") && rj_obj_get(mine,"nonmempool"));
+          rj_free(r2); rj_free(pr); }
+        chdir(oldcwd);
+      } }
 
     /* --- error parity --- */
     long ec; const char* em;

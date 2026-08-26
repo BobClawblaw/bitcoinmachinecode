@@ -80,7 +80,10 @@ static int cmd_getnetworkinfo(rj_val** res){
       rj_obj_set(o, "localservicesnames", names); }
     rj_obj_set(o, "localrelay", rj_bool(1));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
-    rj_obj_set(o, "networkactive", rj_bool(1));
+    /* the REAL toggle state, not a constant: setnetworkactive changes it and
+     * getnetworkinfo must reflect that, or the two disagree about whether
+     * the node is talking to anyone. */
+    rj_obj_set(o, "networkactive", rj_bool(g_status ? g_status->net_active : 1));
     rj_obj_set(o, "connections", rj_numf("%d", n_out + n_in));
     rj_obj_set(o, "connections_in", rj_numf("%d", n_in));
     rj_obj_set(o, "connections_out", rj_numf("%d", n_out));
@@ -146,6 +149,203 @@ static int cmd_getpeerinfo(rj_val** res){
     }
     *res = arr;
     return 1;
+}
+
+/* ==== network / ops RPCs (2026-08-25) ====================================
+ * Twelve methods that report or steer the P2P layer. Every one is backed by
+ * state this node ALREADY keeps -- the shared peer table (rpc_peer_t, with
+ * per-socket byte counters from TCP_INFO) and the persistent address book
+ * (bitcoin_addrmgr.asm, 18-byte records) -- so none of them invents data.
+ *
+ * Where a capability genuinely does not exist here, the method says so
+ * rather than pretending: this node has no ban list, no addnode list, and
+ * no runtime network-disable switch, so listbanned/getaddednodeinfo return
+ * empty (exactly as Core does when nothing is banned or added) while
+ * setban/addnode/disconnectnode/setnetworkactive are REAL as of 2026-08-26:
+ * they cross the ctl_* channel to the download worker, which owns the peer
+ * legs and is the only thing that may touch them. Each reports what it
+ * actually did, so a no-op (no such peer, already banned) becomes Core's
+ * error rather than a success that changed nothing. */
+static long (*g_ab_count)(void*);
+static int  (*g_ab_get_i)(void*, long, unsigned char*);
+static void* g_ab;
+
+void rpc_node_set_addrbook(void* ab, long (*count)(void*),
+                           int (*get_i)(void*, long, unsigned char*)){
+    g_ab = ab; g_ab_count = count; g_ab_get_i = get_i;
+}
+
+static int cmd_getnettotals(rj_val** res){
+    long long sent = 0, recv = 0;
+    if (g_status)
+        for (int i = 0; i < RPC_MAX_PEERS; i++){
+            const rpc_peer_t* p = &g_status->peers[i];
+            if (!p->used) continue;
+            sent += p->bytes_sent; recv += p->bytes_recv;
+        }
+    rj_val* o = rj_obj();
+    /* Core counts bytes for the process lifetime including closed peers; we
+     * sum the LIVE peer table, which is what this node tracks. Documented
+     * divergence, not an approximation dressed as a total. */
+    rj_obj_set(o, "totalbytesrecv", rj_numf("%lld", recv));
+    rj_obj_set(o, "totalbytessent", rj_numf("%lld", sent));
+    { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+      rj_obj_set(o, "timemillis",
+                 rj_numf("%lld", (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000)); }
+    rj_val* up = rj_obj();
+    rj_obj_set(up, "timeframe", rj_numf("%d", 86400));
+    rj_obj_set(up, "target", rj_numf("%d", 0));
+    rj_obj_set(up, "target_reached", rj_bool(0));
+    rj_obj_set(up, "serve_historical_blocks", rj_bool(1));
+    rj_obj_set(up, "bytes_left_in_cycle", rj_numf("%d", 0));
+    rj_obj_set(up, "time_left_in_cycle", rj_numf("%d", 0));
+    rj_obj_set(o, "uploadtarget", up);
+    *res = o;
+    return 1;
+}
+
+/* getnodeaddresses ( count "network" ) -- straight out of the persistent
+ * address book. Core's default count is 1 (meaning 1% of known addresses,
+ * capped at 2500); 0 means "all". */
+static int cmd_getnodeaddresses(const rj_val* params, rj_val** res){
+    long want = 1;
+    const char* net = NULL;
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM)
+            want = atol(params->items[0]->str);
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_STR)
+            net = params->items[1]->str;
+    }
+    rj_val* arr = rj_arr();
+    /* The book stores IPv4 only, so a filter for any other network is
+     * honestly empty rather than IPv4 rows relabelled. */
+    if (net && strcmp(net, "ipv4")){ *res = arr; return 1; }
+    if (g_ab && g_ab_count && g_ab_get_i){
+        long n = g_ab_count(g_ab);
+        long cap = (want <= 0) ? n : want;
+        if (cap > 2500) cap = 2500;
+        for (long i = 0; i < n && (long)arr->nitems < cap; i++){
+            unsigned char r[18];
+            if (g_ab_get_i(g_ab, i, r) != 1) continue;
+            unsigned ip = (unsigned)r[0] | ((unsigned)r[1]<<8) | ((unsigned)r[2]<<16) | ((unsigned)r[3]<<24);
+            unsigned port = ((unsigned)r[4]<<8) | (unsigned)r[5];      /* stored BE */
+            unsigned long long svc = 0; for (int b=0;b<8;b++) svc |= (unsigned long long)r[6+b] << (8*b);
+            unsigned lastseen = (unsigned)r[14] | ((unsigned)r[15]<<8) | ((unsigned)r[16]<<16) | ((unsigned)r[17]<<24);
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "time", rj_numf("%u", lastseen));
+            rj_obj_set(e, "services", rj_numf("%llu", svc));
+            { char a[24]; snprintf(a, sizeof a, "%u.%u.%u.%u",
+                                   ip & 0xff, (ip>>8)&0xff, (ip>>16)&0xff, (ip>>24)&0xff);
+              rj_obj_set(e, "address", rj_str(a)); }
+            rj_obj_set(e, "port", rj_numf("%u", port));
+            rj_obj_set(e, "network", rj_str("ipv4"));   /* the book stores v4 only */
+            rj_arr_push(arr, e);
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
+/* getaddrmaninfo -- Core reports new/tried/total per network. This node's
+ * address book has no new/tried distinction (one flat table), so every
+ * record counts as `tried` (they are addresses we have recorded, and the
+ * book is fed by successful contact) and `new` is 0. Stated here and in the
+ * parity docs rather than split arbitrarily. */
+static int cmd_getaddrmaninfo(rj_val** res){
+    long n = (g_ab && g_ab_count) ? g_ab_count(g_ab) : 0;
+    rj_val* o = rj_obj();
+    static const char* nets[] = { "ipv4", "ipv6", "onion", "i2p", "cjdns" };
+    for (int i = 0; i < 5; i++){
+        rj_val* e = rj_obj();
+        long v = (i == 0) ? n : 0;      /* the book is IPv4-only */
+        rj_obj_set(e, "new", rj_numf("%d", 0));
+        rj_obj_set(e, "tried", rj_numf("%ld", v));
+        rj_obj_set(e, "total", rj_numf("%ld", v));
+        rj_obj_set(o, nets[i], e);
+    }
+    { rj_val* e = rj_obj();
+      rj_obj_set(e, "new", rj_numf("%d", 0));
+      rj_obj_set(e, "tried", rj_numf("%ld", n));
+      rj_obj_set(e, "total", rj_numf("%ld", n));
+      rj_obj_set(o, "all_networks", e); }
+    *res = o;
+    return 1;
+}
+
+/* getaddednodeinfo ( "node" ) -- this node DOES have an added-node list:
+ * `addnode=` in bitcoin.conf, parsed into g_cfg.addnode[] and honoured by
+ * the dialer (such peers are preferred and never evicted). Injected here
+ * rather than reached directly so rpc_node.c stays free of node_config. */
+static const char (*g_addnode)[64];
+static int g_n_addnode;
+
+void rpc_node_set_addednodes(const char (*list)[64], int n){
+    g_addnode = list; g_n_addnode = n;
+}
+
+/* An added node counts as connected when a live peer slot's "ip:port" starts
+ * with the configured host. addnode= entries may carry a port or not, so the
+ * comparison stops at the configured string's end and then requires a ':' or
+ * end-of-string -- otherwise "10.0.0.1" would match "10.0.0.19:8333". */
+static int addednode_conn_dir(const char* want, const char** dir){
+    if (!g_status) return 0;
+    size_t wl = strlen(want);
+    for (int i = 0; i < RPC_MAX_PEERS; i++){
+        const rpc_peer_t* p = &g_status->peers[i];
+        if (!p->used) continue;
+        if (strncmp(p->addr, want, wl)) continue;
+        if (p->addr[wl] && p->addr[wl] != ':') continue;
+        *dir = p->inbound ? "inbound" : "outbound";
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_getaddednodeinfo(const rj_val* params, rj_val** res){
+    const char* only = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR) only = params->items[0]->str;
+    rj_val* arr = rj_arr();
+    int matched = 0;
+    for (int i = 0; i < g_n_addnode; i++){
+        const char* n = g_addnode[i];
+        if (only && strcmp(only, n)) continue;
+        matched = 1;
+        const char* dir = NULL;
+        int up = addednode_conn_dir(n, &dir);
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "addednode", rj_str(n));
+        rj_obj_set(e, "connected", rj_bool(up));
+        rj_val* addrs = rj_arr();
+        if (up){
+            rj_val* a = rj_obj();
+            rj_obj_set(a, "address", rj_str(n));
+            rj_obj_set(a, "connected", rj_str(dir));
+            rj_arr_push(addrs, a);
+        }
+        rj_obj_set(e, "addresses", addrs);
+        rj_arr_push(arr, e);
+    }
+    if (only && !matched){
+        rj_free(arr);
+        return -24000;   /* caller maps: Core's RPC_CLIENT_NODE_NOT_ADDED */
+    }
+    *res = arr;
+    return 1;
+}
+
+/* listbanned: this node keeps no ban list. Core returns an empty array when
+ * nothing is banned, so an empty array here is the SAME answer, not a stub;
+ * the divergence is that nothing can ever populate it (see setban). */
+static int cmd_empty_array(rj_val** res){ *res = rj_arr(); return 1; }
+
+/* ping -- Core queues a ping to every peer and returns null immediately;
+ * the result shows up in getpeerinfo's pingtime. This node's peer legs are
+ * driven by the download worker, which sends its own keepalives; there is
+ * no RPC-triggered ping path, so this reports unavailable rather than
+ * returning null and doing nothing. */
+static int cmd_net_unsupported(const char* msg, long* ec, const char** em){
+    *ec = -1; *em = msg; return 0;
 }
 
 /* getmempoolinfo / getrawmempool.
@@ -259,6 +459,265 @@ static int cmd_getmempoolinfo(rj_val** res){
     *res = o;
     return 1;
 }
+/* ==== the peer-control channel (parent side) =============================
+ * Stage one command, bump the seq, wait for the worker's ack. Same shape as
+ * cmd_sendrawtransaction's staging, and the same reason: the worker owns the
+ * peer legs and is the only thing that may touch them. */
+#define CTL_WAIT_MS 3000
+#define CTL_POLL_US 500
+
+static int ctl_send(int op, const char* arg, long long num,
+                    long* ec, const char** em, int* result_out){
+    static char reason[128];
+    if (!g_status_rw){
+        *ec = -4;
+        *em = "peer control is unavailable: no download worker is attached, so "
+              "there is nothing holding the peer legs to command";
+        return 0;
+    }
+    node_status_t* s = g_status_rw;
+    pthread_mutex_lock(&g_submit_lock);
+    snprintf((char*)s->ctl_arg, sizeof s->ctl_arg, "%s", arg ? arg : "");
+    s->ctl_num = num;
+    s->ctl_op = op;
+    s->ctl_result = 0;
+    s->ctl_reason[0] = 0;
+    unsigned long long myseq = s->ctl_seq + 1;
+    __sync_synchronize();
+    s->ctl_seq = myseq;
+    int waited = 0, done = 0, result = 0;
+    reason[0] = 0;
+    while (waited < CTL_WAIT_MS * 1000){
+        if (s->ctl_ack == myseq){
+            result = s->ctl_result;
+            memcpy(reason, (const void*)s->ctl_reason, sizeof reason);
+            reason[sizeof reason - 1] = 0;
+            done = 1; break;
+        }
+        struct timespec ts = {0, CTL_POLL_US * 1000L}; nanosleep(&ts, NULL);
+        waited += CTL_POLL_US;
+    }
+    pthread_mutex_unlock(&g_submit_lock);
+    if (!done){ *ec = -4; *em = "the download worker did not answer the control request"; return 0; }
+    if (result < 0){
+        static char embuf[160];
+        snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "peer control failed");
+        *ec = result; *em = embuf;
+        return 0;
+    }
+    if (result_out) *result_out = result;
+    return 1;
+}
+
+/* addnode "node" "add|remove|onetry" */
+static int cmd_addnode(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* node = (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+                        params->items[0]->typ == RJ_STR) ? params->items[0]->str : NULL;
+    const char* cmd  = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                        params->items[1]->typ == RJ_STR) ? params->items[1]->str : NULL;
+    if (!node || !cmd){ *ec = -8; *em = "addnode requires a node and a command"; return 0; }
+    long long mode;
+    if      (!strcmp(cmd, "add"))    mode = 0;
+    else if (!strcmp(cmd, "remove")) mode = 1;
+    else if (!strcmp(cmd, "onetry")) mode = 2;
+    else { *ec = -8; *em = "command must be \"add\", \"remove\" or \"onetry\""; return 0; }
+    int r = 0;
+    if (!ctl_send(RPC_CTL_ADDNODE, node, mode, ec, em, &r)) return 0;
+    if (mode == 1 && r == 0){
+        /* Core: removing a node that was never added is an error, not a
+         * silent success -- the caller's mental model is wrong either way. */
+        *ec = -24; *em = "Error: Node has not been added."; return 0;
+    }
+    *res = rj_null();
+    return 1;
+}
+
+static int cmd_disconnectnode(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* addr = NULL; long long nodeid = -1;
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_STR) addr = params->items[0]->str;
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_NUM) nodeid = atoll(params->items[1]->str);
+        else if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM)
+            nodeid = atoll(params->items[0]->str);
+    }
+    if ((addr && addr[0] && nodeid >= 0)){
+        *ec = -32602; *em = "Only one of address and nodeid should be provided."; return 0; }
+    if ((!addr || !addr[0]) && nodeid < 0){
+        *ec = -32602; *em = "Only one of address and nodeid should be provided."; return 0; }
+    int r = 0;
+    if (!ctl_send(RPC_CTL_DISCONNECT, addr ? addr : "", nodeid, ec, em, &r)) return 0;
+    if (r == 0){ *ec = -29; *em = "Node not found in connected nodes"; return 0; }
+    *res = rj_null();
+    return 1;
+}
+
+/* setban "subnet" "add|remove" ( bantime absolute ) */
+static int cmd_setban(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* subnet = (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+                          params->items[0]->typ == RJ_STR) ? params->items[0]->str : NULL;
+    const char* cmd    = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                          params->items[1]->typ == RJ_STR) ? params->items[1]->str : NULL;
+    if (!subnet || !cmd){ *ec = -8; *em = "setban requires a subnet and a command"; return 0; }
+    int add;
+    if      (!strcmp(cmd, "add"))    add = 1;
+    else if (!strcmp(cmd, "remove")) add = 0;
+    else { *ec = -8; *em = "command must be \"add\" or \"remove\""; return 0; }
+    long long until = 0;
+    if (add){
+        long long bantime = 0; int absolute = 0;
+        if (params->nitems >= 3 && params->items[2]->typ == RJ_NUM) bantime = atoll(params->items[2]->str);
+        if (params->nitems >= 4 && params->items[3]->typ == RJ_BOOL) absolute = params->items[3]->str[0] == '1';
+        if (bantime <= 0) bantime = 60 * 60 * 24;          /* Core's default: 24h */
+        until = absolute ? bantime : (long long)time(NULL) + bantime;
+    }
+    int r = 0;
+    if (!ctl_send(RPC_CTL_SETBAN, subnet, until, ec, em, &r)) return 0;
+    if (r == 0){
+        *ec = -30;
+        *em = add ? "Error: IP/Subnet already banned"
+                  : "Error: Unban failed. Requested address/subnet was not previouslyManually banned.";
+        return 0;
+    }
+    *res = rj_null();
+    return 1;
+}
+
+static int cmd_clearbanned(rj_val** res, long* ec, const char** em){
+    if (!ctl_send(RPC_CTL_CLEARBANNED, "", 0, ec, em, NULL)) return 0;
+    *res = rj_null();
+    return 1;
+}
+
+/* listbanned -- straight out of the shared ban list; no channel round trip,
+ * because the parent can read what the worker enforces. */
+static int cmd_listbanned(rj_val** res){
+    rj_val* arr = rj_arr();
+    if (g_status){
+        long long now = (long long)time(NULL);
+        for (int i = 0; i < RPC_MAX_BANS; i++){
+            if (!g_status->bans[i].until) continue;
+            if (g_status->bans[i].until <= now) continue;   /* expired */
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "address", rj_str((const char*)g_status->bans[i].subnet));
+            rj_obj_set(e, "banned_until", rj_numf("%lld", (long long)g_status->bans[i].until));
+            rj_obj_set(e, "ban_created", rj_numf("%lld", (long long)g_status->bans[i].created));
+            rj_arr_push(arr, e);
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
+static int cmd_setnetworkactive(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_BOOL){
+        *ec = -8; *em = "setnetworkactive requires a boolean"; return 0; }
+    int on = params->items[0]->str[0] == '1';
+    if (!ctl_send(RPC_CTL_SETNETACTIVE, "", on, ec, em, NULL)) return 0;
+    *res = rj_bool(on);                       /* Core echoes the new state */
+    return 1;
+}
+
+static int cmd_ping(rj_val** res, long* ec, const char** em){
+    if (!ctl_send(RPC_CTL_PING, "", 0, ec, em, NULL)) return 0;
+    *res = rj_null();                         /* Core: queued, returns null */
+    return 1;
+}
+
+/* ==== gettxspendingprevout ==============================================
+ * Core lists it under Blockchain, but it is a pure mempool query and the
+ * pool enumeration lives here, so it lives here too. For each outpoint the
+ * caller names, report the mempool transaction spending it, if any -- and
+ * report the outpoint with no `spendingtxid` when nothing does, which is
+ * what Core returns rather than omitting the entry. */
+static int gtsp_hex32_wire(const char* h, unsigned char out[32]){
+    if (!h || strlen(h) != 64) return 0;
+    for (int i = 0; i < 32; i++){
+        int hi, lo; char a = h[i*2], b = h[i*2+1];
+        if (a>='0'&&a<='9') hi=a-'0'; else if (a>='a'&&a<='f') hi=a-'a'+10;
+        else if (a>='A'&&a<='F') hi=a-'A'+10; else return 0;
+        if (b>='0'&&b<='9') lo=b-'0'; else if (b>='a'&&b<='f') lo=b-'a'+10;
+        else if (b>='A'&&b<='F') lo=b-'A'+10; else return 0;
+        out[31-i] = (unsigned char)((hi<<4)|lo);      /* display -> wire */
+    }
+    return 1;
+}
+
+/* Does mempool tx `tx` spend (txid_wire, vout)? Walks the input list only. */
+static int gtsp_spends(const unsigned char* tx, unsigned long len,
+                       const unsigned char txid_wire[32], unsigned long vout){
+    if (len < 10) return 0;
+    unsigned long p = 4;
+    if (len > 6 && tx[4] == 0x00 && tx[5] == 0x01) p = 6;   /* segwit marker */
+    unsigned long cc;
+    unsigned long n_in = mp_varint(tx + p, &cc); p += cc;
+    if (n_in == 0 || n_in > 100000) return 0;
+    for (unsigned long i = 0; i < n_in; i++){
+        if (p + 36 > len) return 0;
+        unsigned long vo = (unsigned long)tx[p+32] | ((unsigned long)tx[p+33]<<8) |
+                           ((unsigned long)tx[p+34]<<16) | ((unsigned long)tx[p+35]<<24);
+        if (vo == vout && !memcmp(tx + p, txid_wire, 32)) return 1;
+        p += 36;
+        unsigned long ssl = mp_varint(tx + p, &cc); p += cc + ssl + 4;
+        if (p > len) return 0;
+    }
+    return 0;
+}
+
+static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
+                                    long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR){
+        *ec = -8; *em = "Invalid parameter, outputs is not an array"; return 0; }
+    const rj_val* list = params->items[0];
+    if (list->nitems == 0){
+        *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
+    /* validate the whole list before touching the pool, so a bad entry
+     * cannot produce a half-answered array */
+    for (size_t i = 0; i < list->nitems; i++){
+        const rj_val* e = list->items[i];
+        unsigned char t[32];
+        rj_val* tid = (e->typ == RJ_OBJ) ? rj_obj_get(e, "txid") : NULL;
+        rj_val* vo  = (e->typ == RJ_OBJ) ? rj_obj_get(e, "vout") : NULL;
+        if (!tid || tid->typ != RJ_STR || !gtsp_hex32_wire(tid->str, t)){
+            *ec = -8; *em = "Invalid parameter, expected hex txid"; return 0; }
+        if (!vo || vo->typ != RJ_NUM || atol(vo->str) < 0){
+            *ec = -8; *em = "Invalid parameter, vout must be a non-negative integer"; return 0; }
+    }
+    static const char* HEXD = "0123456789abcdef";
+    rj_val* arr = rj_arr();
+    if (g_mph.mp) mpl();
+    for (size_t i = 0; i < list->nitems; i++){
+        const rj_val* e = list->items[i];
+        unsigned char want[32];
+        gtsp_hex32_wire(rj_obj_get((rj_val*)e, "txid")->str, want);
+        unsigned long vout = (unsigned long)atol(rj_obj_get((rj_val*)e, "vout")->str);
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "txid", rj_str(rj_obj_get((rj_val*)e, "txid")->str));
+        rj_obj_set(o, "vout", rj_numf("%lu", vout));
+        if (g_mph.mp){
+            unsigned long n = mp_slot_count(g_mph.mp);
+            for (unsigned long k = 0; k < n; k++){
+                mp_ent me;
+                if (mp_slot(g_mph.mp, k, &me) != 1) continue;
+                if (!gtsp_spends(me.tx, me.len, want, vout)) continue;
+                char hx[65];
+                for (int b = 0; b < 32; b++){
+                    unsigned char v = me.txid[31-b];
+                    hx[b*2] = HEXD[v>>4]; hx[b*2+1] = HEXD[v&15];
+                }
+                hx[64] = 0;
+                rj_obj_set(o, "spendingtxid", rj_str(hx));
+                break;
+            }
+        }
+        rj_arr_push(arr, o);
+    }
+    if (g_mph.mp) mpu();
+    *res = arr;
+    return 1;
+}
+
 static int cmd_getrawmempool(const rj_val* params, rj_val** res){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
      * txids (display byte order). Verbose entries carry the fields this node
@@ -701,6 +1160,10 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     memcpy((void*)s->tx_submit_buf, stage, n);
     s->tx_submit_len = n;
     s->tx_submit_result = 0;
+    /* explicit: a stale 1 left by a previous testmempoolaccept would turn a
+     * real submission into a dry run and report a txid for a tx that was
+     * never accepted or relayed. */
+    s->tx_submit_test = 0;
     s->tx_submit_reason[0] = 0;
     unsigned long long myseq = s->tx_submit_seq + 1;
     __sync_synchronize();
@@ -730,10 +1193,151 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     return 0;
 }
 
+/* ==== testmempoolaccept ==================================================
+ * Rides the SAME parent->worker channel as sendrawtransaction, with
+ * tx_submit_test set, so the worker runs tx_accept_test_reason: identical
+ * consensus/script validation and identical mempool policy checks, stopping
+ * at the policy commit boundary. The verdict therefore comes from the real
+ * mempool, not from a parallel copy of its rules.
+ *
+ * DOCUMENTED DIVERGENCE -- package policy. Core validates the array as a
+ * PACKAGE: a child may spend a parent that appears earlier in the same call.
+ * This node evaluates each transaction independently against the mempool as
+ * it stands, because the dry run deliberately inserts nothing, so an earlier
+ * transaction in the array is invisible to a later one. When more than one
+ * transaction is passed, every entry therefore carries Core's own
+ * `package-error` field saying so. A child spending an in-array parent will
+ * report `missing-inputs`, which is the truth about what this node checked.
+ */
+#define TMA_MAX 25
+
+static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
+                     int* result_out, char reason[128], unsigned long long* fee_out){
+    memcpy((void*)s->tx_submit_buf, tx, n);
+    s->tx_submit_len = n;
+    s->tx_submit_result = 0;
+    s->tx_submit_fee = 0;
+    s->tx_submit_test = 1;
+    s->tx_submit_reason[0] = 0;
+    unsigned long long myseq = s->tx_submit_seq + 1;
+    __sync_synchronize();
+    s->tx_submit_seq = myseq;
+    int waited = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (s->tx_submit_ack == myseq){
+            *result_out = s->tx_submit_result;
+            *fee_out = s->tx_submit_fee;
+            memcpy(reason, (const void*)s->tx_submit_reason, 128);
+            reason[127] = 0;
+            return 1;
+        }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    return 0;
+}
+
+static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
+        *ec = -8; *em = "Invalid parameter, rawtxs must be a non-empty array"; return 0; }
+    const rj_val* list = params->items[0];
+    if (list->nitems > TMA_MAX){
+        *ec = -8; *em = "Array must contain between 1 and 25 transactions"; return 0; }
+    if (!g_status_rw){
+        *ec = -4; *em = "Mempool acceptance testing unavailable (no download worker)"; return 0; }
+
+    /* decode every transaction BEFORE staging any of them: a bad hex string
+     * in the middle would otherwise leave the caller with a half-length
+     * array whose positions no longer line up with the input. */
+    static unsigned char stage[TMA_MAX][RPC_TXSUBMIT_MAX];
+    unsigned long lens[TMA_MAX];
+    for (size_t i = 0; i < list->nitems; i++){
+        if (list->items[i]->typ != RJ_STR){ *ec = -22; *em = "TX decode failed"; return 0; }
+        const char* hex = list->items[i]->str; size_t hl = strlen(hex);
+        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
+        lens[i] = (unsigned long)(hl/2);
+        for (unsigned long k = 0; k < lens[i]; k++){
+            int hi = srt_hex1(hex[k*2]), lo = srt_hex1(hex[k*2+1]);
+            if (hi < 0 || lo < 0){ *ec = -22; *em = "TX decode failed"; return 0; }
+            stage[i][k] = (unsigned char)((hi<<4)|lo);
+        }
+    }
+
+    static const char* HEXD = "0123456789abcdef";
+    node_status_t* s = g_status_rw;
+    rj_val* arr = rj_arr();
+    pthread_mutex_lock(&g_submit_lock);
+    for (size_t i = 0; i < list->nitems; i++){
+        rj_val* e = rj_obj();
+        unsigned char id[32], wid[32];
+        static unsigned char scratch[2000*81+8];
+        int have_id = tx_txid(id, stage[i], lens[i], scratch, sizeof scratch) == 1;
+        char hx[65];
+        if (have_id){
+            for (int k=0;k<32;k++){ unsigned char b=id[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+            hx[64]=0; rj_obj_set(e, "txid", rj_str(hx));
+            /* wtxid: sha256d of the full serialization for a segwit tx, else
+             * the txid itself */
+            int segwit = lens[i] > 6 && stage[i][4] == 0x00 && stage[i][5] == 0x01;
+            if (segwit && g_mph.sha256d) g_mph.sha256d(wid, stage[i], lens[i]);
+            else memcpy(wid, id, 32);
+            for (int k=0;k<32;k++){ unsigned char b=wid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+            hx[64]=0; rj_obj_set(e, "wtxid", rj_str(hx));
+        }
+        if (list->nitems > 1)
+            rj_obj_set(e, "package-error",
+                       rj_str("this node validates each transaction independently "
+                              "against the current mempool; it does not implement "
+                              "package policy, so a child spending a parent that "
+                              "appears earlier in this array will report missing-inputs"));
+        int result = 0; char reason[128] = {0}; unsigned long long fee = 0;
+        if (!have_id){
+            rj_obj_set(e, "allowed", rj_bool(0));
+            rj_obj_set(e, "reject-reason", rj_str("TX decode failed"));
+        } else if (!tma_stage(s, stage[i], lens[i], &result, reason, &fee)){
+            /* no verdict: `allowed` is OMITTED, which is exactly how Core
+             * marks a transaction it could not fully validate */
+            rj_obj_set(e, "reject-reason", rj_str("mempool acceptance test timed out"));
+        } else if (result == 1){
+            unsigned long w = mp_tx_weight(stage[i], lens[i]);
+            unsigned long vsz = (w + 3) / 4;
+            rj_obj_set(e, "allowed", rj_bool(1));
+            rj_obj_set(e, "vsize", rj_numf("%lu", vsz));
+            rj_obj_set(e, "vsize_bip141", rj_numf("%lu", vsz));
+            rj_val* fees = rj_obj();
+            rj_obj_set(fees, "base", rj_numf("%llu.%08llu", fee/100000000ULL, fee%100000000ULL));
+            /* effective-feerate/effective-includes describe package feerate,
+             * which this node does not compute -- omitted, not guessed. */
+            rj_obj_set(e, "fees", fees);
+        } else {
+            rj_obj_set(e, "allowed", rj_bool(0));
+            rj_obj_set(e, "reject-reason", rj_str(reason[0] ? reason : "transaction rejected"));
+        }
+        rj_arr_push(arr, e);
+    }
+    s->tx_submit_test = 0;
+    pthread_mutex_unlock(&g_submit_lock);
+    *res = arr;
+    return 1;
+}
+
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
+    "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
+    "testmempoolaccept", "submitpackage",
+    "getprivatebroadcastinfo", "abortprivatebroadcast",
+    "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
+    "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
+    "setban", "setnetworkactive", "ping",
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
+
+const char* rpc_node_method_at(int i){
+    int n = 0;
+    while (NODE_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? NODE_METHODS[i] : NULL;
+}
 int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
@@ -743,6 +1347,47 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
     if (!strcmp(m, "getnetworkinfo"))     return cmd_getnetworkinfo(res);
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
+    if (!strcmp(m, "gettxspendingprevout")) return cmd_gettxspendingprevout(params, res, ec, em);
+    if (!strcmp(m, "testmempoolaccept")) return cmd_testmempoolaccept(params, res, ec, em);
+    if (!strcmp(m, "submitpackage"))
+        return cmd_net_unsupported(
+            "this node has no package validation: transactions are accepted "
+            "one at a time against the mempool as it stands, so a child "
+            "cannot be validated against an unconfirmed parent in the same "
+            "call. Submit the parent first with sendrawtransaction, then the "
+            "child", ec, em);
+    if (!strcmp(m, "getprivatebroadcastinfo") || !strcmp(m, "abortprivatebroadcast"))
+        return cmd_net_unsupported(
+            "this node has no private broadcast queue: sendrawtransaction "
+            "relays to every live peer leg immediately, so there is no "
+            "pending private broadcast to report on or abort", ec, em);
+    if (!strcmp(m, "getmempoolcluster"))
+        return cmd_net_unsupported(
+            "this node's mempool has no cluster linearization: it tracks the "
+            "ancestor/descendant graph (see getmempoolancestors) but not "
+            "Core's cluster mempool structure, so there are no clusters to "
+            "report", ec, em);
+    if (!strcmp(m, "getblockfrompeer"))
+        return cmd_net_unsupported(
+            "peer connections belong to the forked download worker, which "
+            "chooses what to fetch from its own headers-first schedule; there "
+            "is no parent-to-worker channel for a targeted block request, so "
+            "this call would change nothing", ec, em);
+    if (!strcmp(m, "getnettotals"))       return cmd_getnettotals(res);
+    if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res);
+    if (!strcmp(m, "getaddrmaninfo"))     return cmd_getaddrmaninfo(res);
+    if (!strcmp(m, "listbanned"))         return cmd_listbanned(res);
+    if (!strcmp(m, "getaddednodeinfo")){
+        int rc = cmd_getaddednodeinfo(params, res);
+        if (rc == -24000){ *ec = -24; *em = "Error: Node has not been added."; return 0; }
+        return rc;
+    }
+    if (!strcmp(m, "clearbanned"))        return cmd_clearbanned(res, ec, em);
+    if (!strcmp(m, "addnode"))            return cmd_addnode(params, res, ec, em);
+    if (!strcmp(m, "disconnectnode"))     return cmd_disconnectnode(params, res, ec, em);
+    if (!strcmp(m, "setban"))             return cmd_setban(params, res, ec, em);
+    if (!strcmp(m, "setnetworkactive"))   return cmd_setnetworkactive(params, res, ec, em);
+    if (!strcmp(m, "ping"))               return cmd_ping(res, ec, em);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);

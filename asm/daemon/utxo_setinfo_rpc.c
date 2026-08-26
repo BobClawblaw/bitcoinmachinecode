@@ -126,3 +126,271 @@ done:
 #undef XMAP
 #undef MSG
 }
+
+/* ---- scantxoutset's runner (2026-08-25) -----------------------------------
+ * Same quiescence discipline, same datadir sizing, same munmap-everything
+ * life cycle as utxo_setinfo_rpc_run above -- one TU, one set of the tool's
+ * inherited statics. The walk callback matches each live UTXO's script
+ * against the caller's target set and collects bounded hits. */
+typedef struct {
+    u8  txid[32]; u32 vout;
+    u64 value; u64 height; int coinbase;
+    u8  spk[128]; u32 spklen;
+} usi_scan_hit_t;
+
+typedef struct {
+    const u8* spks;        /* nspk fixed 128-byte slots */
+    const u32* spklens;
+    int nspk;
+    usi_scan_hit_t* hits;
+    long hits_cap, hits_n;
+    unsigned long long total_sat;
+    u64 scanned;
+    int overflow;          /* more matches than hits_cap -- reported, not hidden */
+} usi_scan_ctx_t;
+
+static void usi_scan_cb(void* ctxv, const u8 key36[36], u64 value, u64 code,
+                        const u8* script, u64 slen){
+    usi_scan_ctx_t* c = (usi_scan_ctx_t*)ctxv;
+    c->scanned++;
+    for (int i = 0; i < c->nspk; i++){
+        if (c->spklens[i] != (u32)slen) continue;
+        if (memcmp(c->spks + (size_t)i*128, script, slen) != 0) continue;
+        if (c->hits_n >= c->hits_cap){ c->overflow = 1; return; }
+        usi_scan_hit_t* h = &c->hits[c->hits_n++];
+        memcpy(h->txid, key36, 32);
+        memcpy(&h->vout, key36+32, 4);
+        h->value = value;
+        h->height = code >> 1;
+        h->coinbase = (int)(code & 1);
+        h->spklen = (u32)(slen > 128 ? 128 : slen);
+        memcpy(h->spk, script, h->spklen);
+        c->total_sat += value;
+        return;
+    }
+}
+
+/* 1 ok / 0 busy-or-inconsistent / -1 error; msg as in utxo_setinfo_rpc_run.
+ * spks: nspk 128-byte slots; out_height/out_scanned/out_total set on 1. */
+long utxo_scan_rpc_run(const unsigned char* spks, const unsigned int* spklens, int nspk,
+                       usi_scan_hit_t* hits, long hits_cap, long* hits_n,
+                       long* out_height, unsigned long long* out_scanned,
+                       unsigned long long* out_total, int* out_overflow,
+                       char* msg, unsigned long mcap){
+#define MSG(...) do{ if (msg && mcap) snprintf(msg, mcap, __VA_ARGS__); }while(0)
+    if (msg && mcap) msg[0] = 0;
+    fingerprint fp0, fp1, fp2;
+    char why[512] = "";
+    if (!fingerprint_take(&fp0)){ MSG("fingerprint failed"); return -1; }
+    sleep_ms(1500);
+    if (!fingerprint_take(&fp1)){ MSG("fingerprint failed"); return -1; }
+    if (fingerprint_diff(&fp0, &fp1, why, sizeof why)){
+        MSG("UTXO set is being written (%s) -- retry between blocks", why); return 0; }
+    long height = read_applied_height();
+    if (height < 0){ MSG("no readable utxo_applied_height.dat"); return -1; }
+
+    unsigned long slots;
+    { u64 tsz = file_size_or("utxo_lsm_table.map", 0);
+      slots = tsz > 48 ? (unsigned long)((tsz - 48) / 48) : (1UL << 22);
+      if (slots < (1UL << 20)) slots = 1UL << 20; }
+    u64 blob_cap = file_size_or("utxo_lsm_blob.map", 1UL << 30);
+    if (blob_cap < (256UL << 20)) blob_cap = 256UL << 20;
+    u64 tomb_cap = (u64)slots * 2, manifest_cap = 4096;
+
+    struct { void* p; u64 n; } maps[8]; int nmaps = 0;
+    long rc = -1;
+#define XMAP(var, size, what) do{ \
+        void* _m = mmap(0, (size), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); \
+        if (_m == MAP_FAILED){ MSG("mmap %s failed", what); goto done; } \
+        maps[nmaps].p = _m; maps[nmaps].n = (size); nmaps++; (var) = _m; }while(0)
+    void* u = 0; void* blob = 0; void* tomb = 0; void* mani = 0; void* scr = 0;
+    long ustruct = utxo_struct_size(slots);
+    XMAP(u, (u64)ustruct, "memtable");
+    XMAP(blob, blob_cap, "memtable blob");
+    utxo_init(u, slots, blob, blob_cap);
+    lsm_state_t lst; memset(&lst, 0, sizeof lst);
+    lst.op_threshold = (u64)slots * 2;
+    lst.fill_threshold = (u64)slots * 3 / 4;
+    XMAP(tomb, tomb_cap * 36, "tombstone list");
+    lst.tomb_buf = (u64)(uintptr_t)tomb; lst.tomb_cap = tomb_cap;
+    XMAP(mani, manifest_cap * 16, "manifest");
+    lst.manifest_buf = (u64)(uintptr_t)mani; lst.manifest_cap = manifest_cap;
+    XMAP(scr, 1UL << 20, "scratch");
+    lst.scratch_buf = (u64)(uintptr_t)scr; lst.scratch_cap = 1UL << 20;
+
+    if (utxo_lsm_reload_ro(&lst, u) < 0){ MSG("utxo_lsm_reload_ro failed"); goto done; }
+
+    usi_scan_ctx_t ctx; memset(&ctx, 0, sizeof ctx);
+    ctx.spks = spks; ctx.spklens = spklens; ctx.nspk = nspk;
+    ctx.hits = hits; ctx.hits_cap = hits_cap;
+    if (utxo_lsm_walk(&lst, u, (void*)usi_scan_cb, &ctx) < 0){
+        MSG("utxo_lsm_walk failed"); goto done; }
+
+    if (!fingerprint_take(&fp2)){ MSG("fingerprint failed"); goto done; }
+    if (fingerprint_diff(&fp0, &fp2, why, sizeof why)){
+        MSG("UTXO set changed during the read (%s) -- result discarded", why);
+        rc = 0; goto done; }
+
+    *hits_n = ctx.hits_n;
+    *out_height = height;
+    *out_scanned = ctx.scanned;
+    *out_total = ctx.total_sat;
+    *out_overflow = ctx.overflow;
+    rc = 1;
+done:
+    for (int i = 0; i < nmaps; i++) munmap(maps[i].p, maps[i].n);
+    return rc;
+#undef XMAP
+#undef MSG
+}
+
+/* ---- dumptxoutset's runner (2026-08-25) -----------------------------------
+ * Same quiescence discipline as the two runners above. Walks every live
+ * coin, streams it to `path` in Core's snapshot serialization
+ * (asm/utxo_snapshot.c, whose encoder is pinned byte-for-byte against a
+ * snapshot the oracle Core wrote), then seeks back and writes the real
+ * header once every coin is durable -- the same header-last discipline as
+ * wallet_scan.c, for the same reason.
+ *
+ * ONE DOCUMENTED LAYOUT DIVERGENCE: Core groups all coins of a txid under
+ * one (txid, count) prefix because its chainstate iterates in txid order.
+ * The LSM walk does not, so every coin is written as its own single-coin
+ * group. The format permits it (the loader just adds coins group by group)
+ * and the coin count in the header is exact; the file is merely larger than
+ * Core's would be. */
+extern long usnap_coin(unsigned int vout, unsigned long height, int coinbase,
+                       unsigned long long value, const unsigned char* spk,
+                       unsigned long spklen, unsigned char* out, unsigned long cap);
+extern long usnap_header(const unsigned char base_hash_wire[32],
+                         unsigned long long coins, unsigned char out[51]);
+
+typedef struct {
+    FILE* f;
+    unsigned long long coins;
+    int failed;
+} usi_dump_ctx_t;
+
+static void usi_dump_cb(void* ctxv, const u8 key36[36], u64 value, u64 code,
+                        const u8* script, u64 slen){
+    usi_dump_ctx_t* c = (usi_dump_ctx_t*)ctxv;
+    if (c->failed) return;
+    static unsigned char rec[10100]; long rl;   /* runner is single-threaded */
+    u32 vout; memcpy(&vout, key36 + 32, 4);
+    rl = usnap_coin(vout, (unsigned long)(code >> 1), (int)(code & 1),
+                    value, script, (unsigned long)slen, rec, sizeof rec);
+    if (rl < 0){ c->failed = 1; return; }
+    if (fwrite(key36, 1, 32, c->f) != 32){ c->failed = 1; return; }   /* txid */
+    unsigned char one = 0x01;                                          /* 1 coin */
+    if (fwrite(&one, 1, 1, c->f) != 1){ c->failed = 1; return; }
+    if (fwrite(rec, 1, (size_t)rl, c->f) != (size_t)rl){ c->failed = 1; return; }
+    c->coins++;
+}
+
+/* 1 ok / 0 busy / -1 error. hash_at(height, out32_wire) supplies the base
+ * block hash for the header (the RPC layer owns the height->hash index). */
+long utxo_dump_rpc_run(const char* path,
+                       int (*hash_at)(long height, unsigned char out[32]),
+                       long* out_height, unsigned long long* out_coins,
+                       char* msg, unsigned long mcap){
+#define MSG(...) do{ if (msg && mcap) snprintf(msg, mcap, __VA_ARGS__); }while(0)
+    if (msg && mcap) msg[0] = 0;
+    fingerprint fp0, fp1, fp2;
+    char why[512] = "";
+    /* The output file is created BEFORE the first fingerprint: the
+     * fingerprint covers the datadir's mtime, and creating a file bumps it
+     * -- the first full-set dump discarded its own result over exactly that
+     * self-inflicted "change". Everything the dump itself does after this
+     * point is appends to an already-existing file, which the directory
+     * fingerprint does not see; the closing rename happens after the final
+     * fingerprint. */
+    char pretmp[1024];
+    if (snprintf(pretmp, sizeof pretmp, "%s.tmp", path) >= (int)sizeof pretmp){
+        MSG("path too long"); return -1; }
+    { FILE* pf = fopen(pretmp, "wb");
+      if (!pf){ MSG("cannot open %s for writing", pretmp); return -1; }
+      fclose(pf); }
+    if (!fingerprint_take(&fp0)){ unlink(pretmp); MSG("fingerprint failed"); return -1; }
+    sleep_ms(1500);
+    if (!fingerprint_take(&fp1)){ unlink(pretmp); MSG("fingerprint failed"); return -1; }
+    if (fingerprint_diff(&fp0, &fp1, why, sizeof why)){
+        unlink(pretmp);
+        MSG("UTXO set is being written (%s) -- retry between blocks", why); return 0; }
+    long height = read_applied_height();
+    if (height < 0){ unlink(pretmp); MSG("no readable utxo_applied_height.dat"); return -1; }
+    unsigned char base[32];
+    if (!hash_at || hash_at(height, base) != 1){
+        unlink(pretmp);
+        MSG("cannot resolve the base block hash at height %ld", height); return -1; }
+
+    unsigned long slots;
+    { u64 tsz = file_size_or("utxo_lsm_table.map", 0);
+      slots = tsz > 48 ? (unsigned long)((tsz - 48) / 48) : (1UL << 22);
+      if (slots < (1UL << 20)) slots = 1UL << 20; }
+    u64 blob_cap = file_size_or("utxo_lsm_blob.map", 1UL << 30);
+    if (blob_cap < (256UL << 20)) blob_cap = 256UL << 20;
+    u64 tomb_cap = (u64)slots * 2, manifest_cap = 4096;
+
+    struct { void* p; u64 n; } maps[8]; int nmaps = 0;
+    long rc = -1;
+    FILE* f = NULL;
+    char tmp[1024]; tmp[0] = 0;
+#define XMAP(var, size, what) do{ \
+        void* _m = mmap(0, (size), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); \
+        if (_m == MAP_FAILED){ MSG("mmap %s failed", what); goto done; } \
+        maps[nmaps].p = _m; maps[nmaps].n = (size); nmaps++; (var) = _m; }while(0)
+    void* u = 0; void* blob = 0; void* tomb = 0; void* mani = 0; void* scr = 0;
+    long ustruct = utxo_struct_size(slots);
+    XMAP(u, (u64)ustruct, "memtable");
+    XMAP(blob, blob_cap, "memtable blob");
+    utxo_init(u, slots, blob, blob_cap);
+    lsm_state_t lst; memset(&lst, 0, sizeof lst);
+    lst.op_threshold = (u64)slots * 2;
+    lst.fill_threshold = (u64)slots * 3 / 4;
+    XMAP(tomb, tomb_cap * 36, "tombstone list");
+    lst.tomb_buf = (u64)(uintptr_t)tomb; lst.tomb_cap = tomb_cap;
+    XMAP(mani, manifest_cap * 16, "manifest");
+    lst.manifest_buf = (u64)(uintptr_t)mani; lst.manifest_cap = manifest_cap;
+    XMAP(scr, 1UL << 20, "scratch");
+    lst.scratch_buf = (u64)(uintptr_t)scr; lst.scratch_cap = 1UL << 20;
+
+    if (utxo_lsm_reload_ro(&lst, u) < 0){ MSG("utxo_lsm_reload_ro failed"); goto done; }
+
+    snprintf(tmp, sizeof tmp, "%s", pretmp);       /* created above, pre-fingerprint */
+    f = fopen(tmp, "wb");
+    if (!f){ MSG("cannot open %s for writing", tmp); goto done; }
+    { unsigned char zeros[51]; memset(zeros, 0, sizeof zeros);
+      if (fwrite(zeros, 1, 51, f) != 51){ MSG("short write"); goto done; } }
+
+    usi_dump_ctx_t ctx; memset(&ctx, 0, sizeof ctx);
+    ctx.f = f;
+    if (utxo_lsm_walk(&lst, u, (void*)usi_dump_cb, &ctx) < 0){
+        MSG("utxo_lsm_walk failed"); goto done; }
+    if (ctx.failed){ MSG("short write while streaming coins"); goto done; }
+
+    if (!fingerprint_take(&fp2)){ MSG("fingerprint failed"); goto done; }
+    if (fingerprint_diff(&fp0, &fp2, why, sizeof why)){
+        MSG("UTXO set changed during the dump (%s) -- file discarded", why);
+        rc = 0; goto done; }
+
+    { unsigned char hdr[51];
+      usnap_header(base, ctx.coins, hdr);
+      if (fflush(f) != 0 || fsync(fileno(f)) != 0 ||
+          fseek(f, 0, SEEK_SET) != 0 ||
+          fwrite(hdr, 1, 51, f) != 51 ||
+          fflush(f) != 0 || fsync(fileno(f)) != 0){
+          MSG("short write on the header"); goto done; } }
+    if (fclose(f) != 0){ f = NULL; MSG("close failed"); goto done; }
+    f = NULL;
+    if (rename(tmp, path) != 0){ MSG("rename to %s failed", path); goto done; }
+    tmp[0] = 0;
+    *out_height = height;
+    *out_coins = ctx.coins;
+    rc = 1;
+done:
+    if (f) fclose(f);
+    if (tmp[0]) unlink(tmp);
+    for (int i = 0; i < nmaps; i++) munmap(maps[i].p, maps[i].n);
+    return rc;
+#undef MSG
+}
+#undef XMAP

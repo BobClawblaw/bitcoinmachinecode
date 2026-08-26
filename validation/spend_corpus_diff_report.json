@@ -1,0 +1,26 @@
+{
+ "spends": 99,
+ "accept_ok": 99,
+ "both_reject": 0,
+ "muts": 594,
+ "mut_agree": 594,
+ "mut_both_accept": 26,
+ "engine_fail": 0,
+ "skipped_unsupported": 0,
+ "skipped_detail": {},
+ "accept_div": [],
+ "mut_div": [],
+ "false_accept": [],
+ "by_epoch": {
+  "pre-bip16": 9,
+  "bip16-dersig": 18,
+  "dersig-csv": 18,
+  "csv-segwit": 18,
+  "segwit-taproot": 18,
+  "taproot-tip": 18
+ },
+ "skipped_v0_witness": 0,
+ "elapsed": 2.5,
+ "tip": 964123,
+ "seed": 20260825
+}

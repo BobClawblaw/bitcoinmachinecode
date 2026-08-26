@@ -18,7 +18,9 @@ has cost in this codebase, not a precise estimate.
 Strongest area: P2P protocol depth and core consensus verification (script,
 segwit, taproot key-path, real mempool policy) — closer to Core than a
 project at this stage might suggest. Weakest area, by a wide margin: **the
-RPC surface**. Also fully absent as clean categories: mining, PSBT,
+RPC surface** *(retired 2026-08-25 — see the update below)*. Also fully
+absent as clean categories *(2026-08-21; mining and PSBT no longer absent —
+same update)*: mining, PSBT,
 multi-wallet/descriptor/watch-only wallets, chain selection (testnet/signet/
 regtest), and modern light-client indexing (blockfilter/coinstats). This
 tracks with the project's actual focus to date — proving consensus
@@ -35,7 +37,33 @@ partially-applied block (`f2faf3b`, `96b555e`). A scratch Bitcoin Core
 development oracle: block hashes cross-validated at 14 heights, and after
 the genesis fix index/body/header/Core agree at 12 heights including 0.
 
-## RPC surface — still the biggest gap, first tranche landed 2026-08-21
+**Update 2026-08-25.** The "weakest area by a wide margin" verdict above is
+retired. Closed in one sustained push (each method's verification standard
+recorded in `docs/PARITY_PLAN.md`, divergences documented at the call site):
+the full mempool tranche (`getmempoolinfo`/`getrawmempool`/`getmempoolentry`/
+`getmempoolancestors`/`getmempooldescendants`/`prioritisetransaction`/
+`getprioritisedtransactions`) over a mempool made genuinely coherent — one
+MAP_SHARED, cross-process-locked pool replacing the per-process
+copy-on-write copies; `estimatesmartfee` (Core's contract over our own
+accepted-feerate EMA, stated as such); mining's `getblocktemplate`
+(frame diffed against Core at the same tip; retarget reproduces 8/8 real
+historical boundaries) and `submitblock` end-to-end (8 MB transport, 4 MB
+worker channel, BIP22 strings, connect gated on a dry run of the real apply
+path); `gettxoutsetinfo` + `scantxoutset` (the parity-capstone instruments
+as RPCs — scan verified against Core to the satoshi on 165.7M outputs);
+PSBT `analyzepsbt` (14-vector oracle diff) and `joinpsbts`; journal-backed
+`listtransactions`/`gettransaction`/`getwalletinfo` with the no-oracle
+verification bound stated in code; `getindexinfo`. Still absent, still
+honest: `sendtoaddress`/`sendmany` via RPC (needs a wallet-UTXO source and
+a fee policy — a design, not a wiring job), txindex/blockfilter index
+builds, coinstatsindex, testnet/signet/regtest chains, longpoll, BIP23
+proposal mode, and everything in the wallet-management tranche
+(multiwallet, descriptors, encryption). The same day also proved the UTXO
+set byte-identical to Core's (MuHash, no filters, no overrides — see
+`README.md`), which converts several of this document's "unverified"
+hedges below into verified facts.
+
+## RPC surface — the biggest gap until 2026-08-25; first tranche 2026-08-21
 
 **Implemented** (`asm/rpc_chain.c`, dispatched from `rpc_dispatch` in
 `asm/rpc_commands.c`; shapes follow Core v31's `blockchain.cpp` /
@@ -120,18 +148,22 @@ RPCs, serve loop coexists). Landed: `getconnectioncount`, `getnetworkinfo`,
 `getpeerinfo` (outbound peer table over shared memory), `getmempoolinfo` /
 `getrawmempool` (the serve process's own mempool + accurate config), and
 `getchaintips` (active tip — side branches aren't persisted, which matches
-Core for a node with no forks). **Remaining:** `sendrawtransaction` — the one
-piece needing a parent→worker relay channel (the parent holds no peer sockets),
-deferred as its own careful slice; `getrawtransaction` without a block hash
-(mempool lookup); and a mempool coherent across the fork tree (`MAP_SHARED` +
-tx-accept-path locking) so a listening node's inbound-child txs appear in
-`getmempoolinfo`/`getrawmempool`.
-`createrawtransaction` was skipped as out of scope (the tx builder lives in
-the wallet CLI). Still absent as categories: wallet RPCs beyond the original
-8, mining (`getblocktemplate`/`submitblock`), `estimatesmartfee`, and the rest
-of util (`decodescript`, `validateaddress` and `createmultisig` are done;
-`deriveaddresses` / `getdescriptorinfo` are next but need a descriptor engine,
-and a `deriveaddresses`-free win is `getindexinfo`).
+Core for a node with no forks). **Remaining** *(as written then; audited
+2026-08-25 — nearly all closed)*: ~~`sendrawtransaction`~~ — **done** (the
+parent→worker channel exists; `submitblock` later rode the same pattern);
+`getrawtransaction` without a block hash — **still absent** (needs txindex
+or a mempool lookup, neither built); ~~a mempool coherent across the fork
+tree~~ — **done 2026-08-25** (`MAP_SHARED` pool + policy state under a
+`PTHREAD_PROCESS_SHARED` lock at every mutation site; an inbound child's
+accepts now appear in the parent's `getrawmempool`, proven cross-fork in
+`test_mempool_shared`). ~~`createrawtransaction` skipped as out of scope~~
+— later done, with Core-byte-identical KATs. ~~Still absent as
+categories~~ — **all since closed**: wallet-state RPCs (journal-backed
+`listtransactions`/`gettransaction`/`getwalletinfo`), mining
+(`getblocktemplate`/`submitblock`/`prioritisetransaction`),
+`estimatesmartfee`, the descriptor engine with `deriveaddresses`/
+`getdescriptorinfo` (plus `addr()`/`raw()` and scantxoutset's expansion path
+on top of it), and `getindexinfo`.
 
 **Effort for the remainder: medium** — the blockchain-query breadth is now
 done; what's left is the one architectural step (RPC ↔ live node state)
@@ -284,9 +316,14 @@ plus straightforward methods on top of it.
     guessing. `utxo_lsm_reload_ro` / `utxo_store_init_ro` make the whole read
     path genuinely read-only (the ordinary reload's `O_RDWR|O_CREAT` on
     utxo.dat/utxo.idx was the only write in the chain).
-  - Still missing, and deliberately: a live `gettxoutsetinfo` RPC, an
-    incrementally-maintained index (Core's `coinstatsindex` updates per block;
-    ours is a full O(set) walk), and `hash_serialized_3`.
+  - ~~Still missing, and deliberately: a live `gettxoutsetinfo` RPC~~ —
+    **done 2026-08-25**: the RPC exists, built on the same tool-derived
+    reader (one quiescence discipline by construction), refusing while the
+    set is being written rather than guessing. Still missing, still
+    deliberately: the incrementally-maintained index (Core's
+    `coinstatsindex` updates per block; ours is a full O(set) walk, ~90 s /
+    ~6 min with MuHash) and `hash_serialized_3` (refused by name; muhash is
+    our default).
 
 ## Wallet
 
@@ -294,7 +331,13 @@ Real, substantial: HD wallet (BIP32/39), message signing
 (`bitcoin_bip32.asm`, `bitcoin_bip39.asm`, `wallet_msgsign.c`).
 
 Missing:
-- **PSBT (BIP174)** — absent, zero hits anywhere.
+- **PSBT (BIP174)** — ~~absent, zero hits anywhere~~ **substantially present
+  since 2026-08-25**: `createpsbt`, `decodepsbt`, `converttopsbt`,
+  `combinepsbt`, `joinpsbts` (all oracle-verified, several byte-identical)
+  and `analyzepsbt` (full role machine, 14-vector oracle diff). Still
+  missing from the tranche: `finalizepsbt`/`walletprocesspsbt` (need a PSBT
+  signer) and `utxoupdatepsbt` (needs a UTXO lookup path) —
+  `docs/PARITY_PLAN.md` T8 has the per-method state.
 - **Descriptor wallets** — Core's modern default wallet type isn't present.
 - **Watch-only wallets** — absent.
 - **Multi-wallet** (`loadwallet`/`createwallet`/`listwallets`) — absent,
@@ -347,10 +390,15 @@ Confirmed absent:
 
 ## Mining
 
-**Entirely absent.** No `getblocktemplate`, no `submitblock`, no block
-template construction, no stratum/pool-facing interface — confirmed via
-direct grep, zero hits across the whole `daemon/`/`rpc_commands.c` surface.
-This node can validate and relay blocks but cannot help build them.
+~~**Entirely absent.**~~ **Substantially present since 2026-08-25.**
+`getblocktemplate` (BIP22/23: deterministic frame diffed against Core at the
+same tip, the 2016-block retarget bit-exact against 8/8 real historical
+boundaries, witness commitment recomputed per template; documented gaps —
+sigops is a lower bound, tx ordering is valid but not fee-optimal, no
+longpoll), `submitblock` end-to-end (8 MB transport, 4 MB worker channel,
+BIP22 reason strings, connect gated on a dry run of the real apply path),
+and `prioritisetransaction`/`getprioritisedtransactions`. Still absent: any
+stratum/pool-facing interface, and BIP23 proposal mode.
 
 ## Ops / misc
 

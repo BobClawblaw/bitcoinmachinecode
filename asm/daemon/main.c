@@ -45,6 +45,7 @@
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
+#include "../rpc_wallet_ops.h"
 #include "../rpc_node.h"     /* node_status_t + live-node RPC dispatch */
 static rpc_wallet     g_rpc_wallet;   /* zeroed: wallet RPCs report "not configured" */
 static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap failed */
@@ -620,6 +621,64 @@ static long long mux_out_nextretry[MUX_MAX_OUT];
 static int g_sync_fail_streak[MUX_MAX_OUT]; /* monotonic ms deadline before the next re-dial attempt */
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
 
+/* ---- runtime peer control (RPC ctl_* channel) ---------------------------
+ * The worker owns the legs, so it owns these. The parent asks; this decides.
+ * The runtime addnode list is SEPARATE from g_cfg.addnode (the operator's
+ * bitcoin.conf list): `addnode ... remove` must be able to drop a runtime
+ * addition without editing the config, and getaddednodeinfo reports the
+ * config list, so conflating them would make `remove` appear to fail. */
+#define CTL_MAX_ADDNODE 32
+static char g_ctl_addnode[CTL_MAX_ADDNODE][64];
+static int  g_ctl_n_addnode = 0;
+
+/* Is `ip` covered by a ban entry? Entries are either a bare address or
+ * a.b.c.d/LEN; matching is on the textual prefix for a bare address and on
+ * the leading octets for a /8, /16 or /24, which is what an operator
+ * realistically bans. A subnet form this cannot express is REFUSED at
+ * setban rather than silently stored and never enforced -- a ban that does
+ * not ban is worse than an error. */
+static int ctl_ban_covers(const char* entry, const char* ip){
+    const char* slash = strchr(entry, '/');
+    if(!slash) return strcmp(entry, ip) == 0;
+    int bits = atoi(slash + 1);
+    int octets = bits / 8;
+    if(octets <= 0 || octets > 4 || (bits % 8) != 0) return 0;
+    /* compare the first `octets` dotted components */
+    const char *a = entry, *b = ip;
+    for(int i = 0; i < octets; i++){
+        const char* ae = strchr(a, '.'); const char* be = strchr(b, '.');
+        size_t alen = ae ? (size_t)(ae - a) : strlen(a);
+        size_t blen = be ? (size_t)(be - b) : strlen(b);
+        if(i == octets - 1 && !ae) alen = (size_t)(slash - a);
+        if(alen != blen || strncmp(a, b, alen) != 0) return 0;
+        if(!ae || !be) return i == octets - 1;
+        a = ae + 1; b = be + 1;
+    }
+    return 1;
+}
+
+/* 1 if this address is currently banned. Called before every dial. */
+int ctl_is_banned(const char* ip){
+    if(!g_node_status) return 0;
+    long long now = (long long)time(NULL);
+    for(int i = 0; i < RPC_MAX_BANS; i++){
+        if(!g_node_status->bans[i].until) continue;
+        if(g_node_status->bans[i].until <= now){
+            g_node_status->bans[i].until = 0;      /* lazily expire */
+            continue;
+        }
+        if(ctl_ban_covers((const char*)g_node_status->bans[i].subnet, ip)) return 1;
+    }
+    return 0;
+}
+
+/* strip ":port" so a ban on the address matches a leg recorded as ip:port */
+static void ctl_ip_only(const char* hostport, char* out, size_t cap){
+    snprintf(out, cap, "%s", hostport ? hostport : "");
+    char* c = strrchr(out, ':');
+    if(c) *c = 0;
+}
+
 /* ---- graceful shutdown --------------------------------------------------
  * Previously SIGTERM/SIGINT had no handler at all (only SIGPIPE/SIGCHLD,
  * both ignored) -- every stop was a bare kill with zero shutdown log line,
@@ -1011,9 +1070,21 @@ static long do_outbound_sync(int i){
  * on a later rotation. */ 
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     if(mux_out_fd[i]>=0){ close(mux_out_fd[i]); mux_out_fd[i]=-1; }
+    /* setnetworkactive false: leave the slot dead rather than re-dialing.
+     * This is the ONE place outbound legs are established, so gating here
+     * gates every reconnect -- a toggle that only dropped the current legs
+     * would be undone by the next rotation. */
+    if(g_node_status && !g_node_status->net_active) return;
     /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
     int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
     mux_out_peer[i] = p;
+    /* a banned peer is not dialed. Checked HERE for the same reason: this is
+     * the only path to a new outbound leg. */
+    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+      if(ctl_is_banned(ip)){
+          fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, peers[p]);
+          return;
+      } }
     int fd = outbound_connect(peers[p], 300, out_port);
     if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable (leg stays down)\n", i, peers[p]); return; }
     mux_out_fd[i]=fd;
@@ -2116,6 +2187,7 @@ static unsigned char txsub_mp_area[40 + TXSUB_MP_SLOTS*48 + 8];
 static unsigned char txsub_mp_blob[2u<<20];
 static int           txsub_ready = 0;   /* 0 uninit, 1 ready, -1 init failed */
 static unsigned long long txsub_last_seq = 0;
+static unsigned long long ctl_last_seq = 0;
 static unsigned long long blksub_last_seq = 0;
 
 /* Lazy one-time init of the worker's tx-accept path. Returns 1 ready, 0 not. */
@@ -2441,6 +2513,133 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     }
                 }
             } }
+        /* peer control: one command per ack, executed HERE because this is the
+         * process that holds the legs. Every branch reports what it actually
+         * did -- 1 done, 0 no-op/not-found -- so the parent can map a no-op to
+         * Core's error rather than reporting a success that changed nothing. */
+        if(g_node_status && g_node_status->ctl_seq != ctl_last_seq){
+            ctl_last_seq = g_node_status->ctl_seq;
+            int op = g_node_status->ctl_op;
+            long long num = g_node_status->ctl_num;
+            char arg[128];
+            snprintf(arg, sizeof arg, "%s", (const char*)g_node_status->ctl_arg);
+            int result = 0; char reason[128]; reason[0] = 0;
+            if(op == RPC_CTL_SETNETACTIVE){
+                g_node_status->net_active = num ? 1 : 0;
+                if(!num){
+                    /* Core drops every connection when the network goes down;
+                     * anything less would leave the node still talking. */
+                    for(int i = 0; i < mux_n_out; i++)
+                        if(mux_out_fd[i] >= 0){ close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+                    fprintf(stderr,"[ctl] network DISABLED: dropped all outbound legs\n");
+                } else {
+                    fprintf(stderr,"[ctl] network enabled\n");
+                }
+                result = 1;
+            } else if(op == RPC_CTL_PING){
+                int sent = 0;
+                for(int i = 0; i < mux_n_out; i++)
+                    if(mux_out_fd[i] >= 0 &&
+                       p2p_write(mux_out_fd[i], "ping", 4, "\x11\x22\x33\x44\x55\x66\x77\x88", 8) > 0)
+                        sent++;
+                fprintf(stderr,"[ctl] ping queued to %d leg(s)\n", sent);
+                result = 1;
+            } else if(op == RPC_CTL_DISCONNECT){
+                char want[128]; ctl_ip_only(arg, want, sizeof want);
+                for(int i = 0; i < mux_n_out; i++){
+                    if(mux_out_fd[i] < 0) continue;
+                    char have[128]; ctl_ip_only(mux_out_host[i], have, sizeof have);
+                    int hit = (want[0] && !strcmp(have, want)) ||
+                              (!want[0] && num == (long long)i);
+                    if(!hit) continue;
+                    fprintf(stderr,"[ctl] disconnecting %s (leg %d)\n", mux_out_host[i], i);
+                    close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                    if(g_node_status) g_node_status->peers[i].used = 0;
+                    result = 1; break;
+                }
+            } else if(op == RPC_CTL_ADDNODE){
+                if(num == 1){                                  /* remove */
+                    for(int i = 0; i < g_ctl_n_addnode; i++)
+                        if(!strcmp(g_ctl_addnode[i], arg)){
+                            memmove(g_ctl_addnode[i], g_ctl_addnode[g_ctl_n_addnode - 1], 64);
+                            g_ctl_n_addnode--;
+                            result = 1; break;
+                        }
+                } else if(g_ctl_n_addnode < CTL_MAX_ADDNODE){
+                    int dup = 0;
+                    for(int i = 0; i < g_ctl_n_addnode; i++)
+                        if(!strcmp(g_ctl_addnode[i], arg)) dup = 1;
+                    if(!dup && num == 0){
+                        snprintf(g_ctl_addnode[g_ctl_n_addnode++], 64, "%s", arg);
+                        fprintf(stderr,"[ctl] addnode: %s (runtime list now %d)\n",
+                                arg, g_ctl_n_addnode);
+                    }
+                    result = 1;      /* onetry and duplicate-add are both "done" */
+                } else {
+                    result = -1;
+                    snprintf(reason, sizeof reason,
+                             "the runtime addnode list is full (%d)", CTL_MAX_ADDNODE);
+                }
+            } else if(op == RPC_CTL_SETBAN){
+                if(num == 0){                                  /* remove */
+                    for(int i = 0; i < RPC_MAX_BANS; i++)
+                        if(g_node_status->bans[i].until &&
+                           !strcmp((const char*)g_node_status->bans[i].subnet, arg)){
+                            g_node_status->bans[i].until = 0;
+                            result = 1; break;
+                        }
+                } else {
+                    /* refuse a subnet form the matcher cannot enforce */
+                    const char* sl = strchr(arg, '/');
+                    if(sl && (atoi(sl+1) % 8 || atoi(sl+1) < 8 || atoi(sl+1) > 32)){
+                        result = -1;
+                        snprintf(reason, sizeof reason,
+                                 "this node enforces only /8, /16, /24 and /32 subnets; "
+                                 "a prefix it cannot match would be stored and never enforced");
+                    } else {
+                        int dup = 0, slot = -1;
+                        for(int i = 0; i < RPC_MAX_BANS; i++){
+                            if(g_node_status->bans[i].until &&
+                               !strcmp((const char*)g_node_status->bans[i].subnet, arg)) dup = 1;
+                            if(!g_node_status->bans[i].until && slot < 0) slot = i;
+                        }
+                        if(dup) result = 0;
+                        else if(slot < 0){
+                            result = -1;
+                            snprintf(reason, sizeof reason, "the ban list is full (%d)", RPC_MAX_BANS);
+                        } else {
+                            snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", arg);
+                            g_node_status->bans[slot].created = (long long)time(NULL);
+                            __sync_synchronize();
+                            g_node_status->bans[slot].until = num;   /* published last */
+                            /* drop any live leg the new ban now covers */
+                            for(int i = 0; i < mux_n_out; i++){
+                                if(mux_out_fd[i] < 0) continue;
+                                char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
+                                if(ctl_ban_covers(arg, ip)){
+                                    fprintf(stderr,"[ctl] ban %s drops live leg %s\n", arg, mux_out_host[i]);
+                                    close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                                    g_node_status->peers[i].used = 0;
+                                }
+                            }
+                            fprintf(stderr,"[ctl] banned %s until %lld\n", arg, num);
+                            result = 1;
+                        }
+                    }
+                }
+            } else if(op == RPC_CTL_CLEARBANNED){
+                for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
+                fprintf(stderr,"[ctl] ban list cleared\n");
+                result = 1;
+            } else {
+                result = -1;
+                snprintf(reason, sizeof reason, "unknown control op %d", op);
+            }
+            snprintf((char*)g_node_status->ctl_reason, sizeof g_node_status->ctl_reason, "%s", reason);
+            g_node_status->ctl_result = result;
+            __sync_synchronize();
+            g_node_status->ctl_ack = ctl_last_seq;
+        }
         /* sendrawtransaction: pick up a staged submission from the RPC parent,
          * validate + mempool-accept + relay to peer legs, then ack the seq. */
         if(g_node_status && g_node_status->tx_submit_seq != txsub_last_seq){
@@ -2449,6 +2648,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(txsub_worker_ready()){
                 unsigned long tlen = g_node_status->tx_submit_len;
                 if(tlen==0 || tlen>RPC_TXSUBMIT_MAX){ result=-22; snprintf(reason,sizeof reason,"TX decode failed"); }
+                else if(g_node_status->tx_submit_test){
+                    /* testmempoolaccept: same checks, no insertion, no relay */
+                    extern long tx_accept_test_reason(void*, const unsigned char*,
+                                     const unsigned char*, unsigned long, char*,
+                                     unsigned long, unsigned long long*);
+                    extern int tx_txid(unsigned char[32], const unsigned char*, unsigned long,
+                                       unsigned char*, unsigned long);
+                    static unsigned char tscratch[2000*81 + 8];
+                    unsigned char tid[32];
+                    unsigned long long fee = 0;
+                    if(!tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen,
+                                tscratch, sizeof tscratch)){
+                        result=-22; snprintf(reason,sizeof reason,"TX decode failed");
+                    } else {
+                        result = (int)tx_accept_test_reason(txsub_mp_area, tid,
+                                     (const unsigned char*)g_node_status->tx_submit_buf, tlen,
+                                     reason, sizeof reason, &fee);
+                    }
+                    g_node_status->tx_submit_fee = fee;
+                }
                 else { int relayed=0;
                     result = txsub_accept_and_relay(txsub_mp_area,
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
@@ -2890,6 +3109,39 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     else
         fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    /* Wallet bootstrap: if the CLI's own wallet store is present in the
+     * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
+     * CLI's own resolution order) and hand the RPC layer the seed --
+     * getnewaddress/getwalletinfo etc. then serve the REAL wallet. Absent
+     * store = wallet RPCs stay unconfigured, exactly as before. */
+    { extern int wallet_store_load(const char*, char*, int, char*, int);
+      extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
+                                       const char* pass, long passlen);
+      static unsigned char wseed[64];
+      static char mn[768], wpass[256];
+      const char* cand[2] = { "bmcwallet.dat", "data/bmcwallet.dat" };
+      for (int wi = 0; wi < 2; wi++){
+          struct stat wsb;
+          if (stat(cand[wi], &wsb) != 0) continue;
+          wpass[0] = 0;
+          { const char* sec = getenv("BMC_WALLET_PASS");
+            if (sec && sec[0]) snprintf(wpass, sizeof wpass, "%s", sec);
+            else { char pf[1064]; snprintf(pf, sizeof pf, "%s.pass", cand[wi]);
+                   FILE* f = fopen(pf, "r");
+                   if (f){ if (fgets(wpass, sizeof wpass, f)){ char* nl = strchr(wpass,'\n'); if (nl) *nl = 0; }
+                           fclose(f); } } }
+          if (wallet_store_load(cand[wi], mn, (int)sizeof mn, wpass, (int)sizeof wpass) == 0){
+              wallet_mnemonic_seed(wseed, mn, wpass[0] ? wpass : NULL,
+                                   wpass[0] ? (long)strlen(wpass) : 0);
+              memset(mn, 0, sizeof mn);           /* the mnemonic never lingers */
+              g_rpc_wallet.seed = wseed;
+              fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
+          } else {
+              fprintf(stderr, "[rpc] wallet store %s present but not loadable "
+                              "(encrypted? set BMC_WALLET_PASS or %s.pass)\n", cand[wi], cand[wi]);
+          }
+          break;
+      } }
     /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the
@@ -2922,6 +3174,41 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
       rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run); }
+    { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
+                                    long*, unsigned long long*, char*, unsigned long);
+      rpc_chain_set_utxodump(utxo_dump_rpc_run); }
+    { extern long utxo_scan_rpc_run(const unsigned char*, const unsigned int*, int, void*,
+                                    long, long*, long*, unsigned long long*, unsigned long long*,
+                                    int*, char*, unsigned long);
+      rpc_chain_set_utxoscan(utxo_scan_rpc_run); }
+    /* getnodeaddresses / getaddrmaninfo read the persistent address book.
+     * Its own handle, opened here: the download worker runs in the FORKED
+     * child and its handle is not reachable from the parent's RPC thread.
+     * amr_* re-reads peers.dat per call, so two handles see the same file. */
+    { static unsigned char rpc_ab[64];
+      if (!g_cfg.connect_only && amr_init(rpc_ab) == 1)
+          rpc_node_set_addrbook(rpc_ab, amr_count,
+                                (int (*)(void*, long, unsigned char*))amr_get_i);
+      else
+          fprintf(stderr, "[rpc] address book unavailable; "
+                          "getnodeaddresses/getaddrmaninfo will report empty\n"); }
+    /* the external signer command, when the operator configured one */
+    { extern void rpc_signer_set_cmd(const char*);
+      rpc_signer_set_cmd(g_cfg.signer[0] ? g_cfg.signer : NULL); }
+    /* getaddednodeinfo reports the operator's addnode= list verbatim. */
+    rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
+                            g_cfg.n_addnode);
+    /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
+    { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
+                                            unsigned long long, unsigned int, unsigned char,
+                                            const unsigned char*, unsigned short), void*);
+      rpc_chain_set_undo((long (*)(long, int (*)(void*, const unsigned char*, unsigned int,
+                                                 unsigned long long, unsigned int, unsigned char,
+                                                 const unsigned char*, unsigned short), void*))undo_replay); }
+    /* the wallet rescan reads the archive through rpc_chain's store handle */
+    { static unsigned char rescan_buf[4*1024*1024];   /* one max-size block */
+      rpc_wops_set_scanner(rpc_chain_read_block_at, rescan_buf, (long)sizeof rescan_buf,
+                           rpc_chain_tip_height); }
     rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
@@ -3567,7 +3854,12 @@ int main(int argc, char** argv){
         if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
         else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
                g_node_status->tip_height = *(int*)(store_buf+24);
-               g_node_status->start_time = (long long)time(NULL); }
+               g_node_status->start_time = (long long)time(NULL);
+               /* MUST be set explicitly: the status block is zeroed shared
+                * memory, and net_active == 0 means "networking disabled" --
+                * leaving it at the zero default would gate every dial and
+                * silently produce a node that never connects. */
+               g_node_status->net_active = 1; }
 
         pid_t dl = fork();
         if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }

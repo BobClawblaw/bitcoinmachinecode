@@ -1,0 +1,83 @@
+Synthesized feature-depth differential vs Core
+generated: 2026-08-26T10:28:25Z  elapsed: 0.2s
+
+cases: 74  accept-parity ok: 74
+rule mutations: 95 (agree 95)
+interpreter probes: 7805 (agree 7805, of which Core accepts 5641)
+per feature (accept / mutations-agreed / divergences):
+  budget/tapscript 1 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 10 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 11 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 12 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 13 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 14 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 15 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 2 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 3 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 4 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 5 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 6 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 7 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 8 sigops accept=1  mut_ok=0  div=0
+  budget/tapscript 9 sigops accept=1  mut_ok=0  div=0
+  cltv                     accept=1  mut_ok=3  div=0
+  codesep                  accept=1  mut_ok=2  div=0
+  csv                      accept=1  mut_ok=3  div=0
+  leafver/0xc2 unknown version, invalid script accept=1  mut_ok=0  div=0
+  limit/tapscript 300 opcodes is legal accept=1  mut_ok=0  div=0
+  limit/tapscript >10000 bytes is legal accept=1  mut_ok=0  div=0
+  limit/tapscript OP_CHECKMULTISIG is disabled accept=1  mut_ok=0  div=0
+  limit/tapscript OP_CHECKMULTISIGVERIFY is disabled accept=1  mut_ok=0  div=0
+  multisig-bare            accept=1  mut_ok=4  div=0
+  multisig-p2sh            accept=1  mut_ok=4  div=0
+  multisig-p2wsh           accept=1  mut_ok=3  div=0
+  opsuccess/126 alone      accept=1  mut_ok=0  div=0
+  opsuccess/129 alone      accept=1  mut_ok=0  div=0
+  opsuccess/131 alone      accept=1  mut_ok=0  div=0
+  opsuccess/134 alone      accept=1  mut_ok=0  div=0
+  opsuccess/137 alone      accept=1  mut_ok=0  div=0
+  opsuccess/138 alone      accept=1  mut_ok=0  div=0
+  opsuccess/141 alone      accept=1  mut_ok=0  div=0
+  opsuccess/142 alone      accept=1  mut_ok=0  div=0
+  opsuccess/149 alone      accept=1  mut_ok=0  div=0
+  opsuccess/153 alone      accept=1  mut_ok=0  div=0
+  opsuccess/186 is NOT OP_SUCCESS (must fail) accept=1  mut_ok=0  div=0
+  opsuccess/187 after OP_RETURN accept=1  mut_ok=0  div=0
+  opsuccess/187 alone      accept=1  mut_ok=0  div=0
+  opsuccess/187 inside an unexecuted OP_IF accept=1  mut_ok=0  div=0
+  opsuccess/187 then a truncated PUSHDATA accept=1  mut_ok=0  div=0
+  opsuccess/200 alone      accept=1  mut_ok=0  div=0
+  opsuccess/254 alone      accept=1  mut_ok=0  div=0
+  opsuccess/80 alone       accept=1  mut_ok=0  div=0
+  opsuccess/98 alone       accept=1  mut_ok=0  div=0
+  p2sh-p2wpkh              accept=1  mut_ok=2  div=0
+  p2sh-p2wsh               accept=1  mut_ok=3  div=0
+  sighash-legacy-ALL       accept=1  mut_ok=2  div=0
+  sighash-legacy-ALL|ACP   accept=1  mut_ok=2  div=0
+  sighash-legacy-NONE      accept=1  mut_ok=1  div=0
+  sighash-legacy-NONE|ACP  accept=1  mut_ok=1  div=0
+  sighash-legacy-SINGLE    accept=1  mut_ok=2  div=0
+  sighash-legacy-SINGLE-bug accept=1  mut_ok=2  div=0
+  sighash-legacy-SINGLE|ACP accept=1  mut_ok=2  div=0
+  sighash-taproot-ALL      accept=1  mut_ok=3  div=0
+  sighash-taproot-ALL|ACP  accept=1  mut_ok=3  div=0
+  sighash-taproot-DEFAULT  accept=1  mut_ok=3  div=0
+  sighash-taproot-NONE     accept=1  mut_ok=2  div=0
+  sighash-taproot-NONE|ACP accept=1  mut_ok=2  div=0
+  sighash-taproot-SINGLE   accept=1  mut_ok=3  div=0
+  sighash-taproot-SINGLE|ACP accept=1  mut_ok=3  div=0
+  sighash-v0-ALL           accept=1  mut_ok=3  div=0
+  sighash-v0-ALL|ACP       accept=1  mut_ok=2  div=0
+  sighash-v0-NONE          accept=1  mut_ok=2  div=0
+  sighash-v0-NONE|ACP      accept=1  mut_ok=1  div=0
+  sighash-v0-SINGLE        accept=1  mut_ok=3  div=0
+  sighash-v0-SINGLE|ACP    accept=1  mut_ok=2  div=0
+  taproot-scriptpath       accept=1  mut_ok=3  div=0
+  taproot-scriptpath-annex accept=1  mut_ok=4  div=0
+  taproot-tree2-leaf0      accept=1  mut_ok=4  div=0
+  taproot-tree2-leaf1      accept=1  mut_ok=4  div=0
+  taproot-tree3-leaf2      accept=1  mut_ok=4  div=0
+  taproot-tree4-leaf1      accept=1  mut_ok=4  div=0
+  taproot-tree4-leaf3      accept=1  mut_ok=4  div=0
+
+ZERO DIVERGENCES across synthesized feature spends and their rule-targeted mutations.

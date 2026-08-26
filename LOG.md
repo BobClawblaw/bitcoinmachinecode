@@ -7,6 +7,255 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-25 -- wallet RPCs ORACLE-DIFFED: the hedge was hiding real shape bugs
+
+The wallet-state RPCs shipped earlier today with an honest hedge in their own
+header comment: "there is no oracle wallet to diff against, so these are
+verified by round-trip". That turned out to be a CONFIGURATION fact, not a
+capability one -- the scratch oracle's Core binary always had wallet support
+(ENABLE_WALLET=ON, sqlite found, 95 wallet symbols); a single line,
+disablewallet=1, was hiding it. Removing that line and restarting the SCRATCH
+oracle (never the production node) cost nothing and converted the hedge into
+a real differential. It immediately found bugs round-trip testing is
+structurally incapable of finding:
+
+getwalletinfo
+  * We emitted FOUR fields Core does not have: balance,
+    unconfirmed_balance, immature_balance, paytxfee. Core's modern
+    getwalletinfo carries NO balance fields at all -- they moved to
+    getbalances. We had been reproducing an older mental model of the API.
+  * We omitted blank and flags, which Core does emit.
+  * Added getbalances (mine.{trusted,untrusted_pending,immature,nonmempool}
+    -- key set matches Core exactly) and lastprocessedblock on both, sourced
+    through the existing chain dispatch and OMITTED rather than faked when
+    the chain is not open.
+  * Result: fields-we-emit-that-Core-does-not went 4 -> 0.
+
+listtransactions / gettransaction (diffed against a Core wallet holding a
+REAL mainnet transaction -- watch-only importdescriptors of a
+recently-active address, which populates genuine wallet history from the
+chain)
+  * gettransaction.details[] was a COPY of a listtransactions entry. Core's
+    details[] is a REDUCED shape {address,category,amount,vout,fee,
+    abandoned}; we were putting six top-level fields (txid, time,
+    timereceived, confirmations, walletconflicts) inside details[0], where
+    Core never puts them. 6 wrong fields -> 0.
+  * Added vout and mempoolconflicts to every entry.
+
+A FALSE ALARM WORTH RECORDING: the diff flagged `fee` as "we emit, Core does
+not" -- but Core's sampled transaction was a RECEIVE, and Core's own help
+says fee is "negative and only available for the send category". Every
+journal record is a send, so emitting it is correct. Deleting it on the
+strength of one sample would have been a regression caused by a sampling
+artifact; the fix was to read the spec, not the sample.
+
+STILL ABSENT, each documented in code with its reason rather than faked:
+blockhash/blockheight/blockindex/blocktime (the journal records no
+confirmation data -- the same root as confirmations:0), wtxid (not derivable
+from a stored txid for a segwit send), label/parent_descs (no labels or
+descriptor provenance in this store). Each becomes emittable only if the
+journal format grows the field, which is a store-format change and was
+deliberately not smuggled into a parity fix.
+
+Also enabled blockfilterindex=1 on the oracle, so BIP157/158 has a
+differential target if getblockfilter is ever implemented.
+
+## 2026-08-25 -- REAL-DATA reorg drill: disconnect/reconnect proven at chain height
+
+The gap: reorg was the last major consensus path whose only evidence was
+SYNTHETIC. The UTXO set is MuHash-proven byte-identical to Core, scripts are
+corpus-proven on real spends, blocks are replay-proven from genesis -- but
+disconnect/reconnect had only ever run on chains this project built itself
+(tests/test_reorg.c). The live daemon has executed ZERO real reorgs; mainnet
+supplies roughly one 1-block reorg every few weeks, so "it has not happened"
+is not reassurance for the most destructive path in the tree (it disconnects
+blocks, rewrites UTXO state, truncates the archive and reconciles the
+mempool -- and today's incidents #45/#46 were all in machinery a reorg drives
+at once).
+
+tests/reorg_drill.c closes it. Against a COPY of the real datadir at real
+chain height, it disconnects the last N real blocks and reconnects THE SAME
+blocks (captured before the truncate), so the expected end state IS the start
+state and the assertion is total rather than approximate.
+
+RESULT at height 964047, depth 3 (real blocks of 1.74/1.75/1.82 MB):
+    before: applied=964047 count=165,710,384 walk=165,710,384
+    after:  applied=964047 count=165,710,384 walk=165,710,384
+applied height back at the tip, the UTXO WALK back to EXACTLY its prior value
+across 165.7M entries, tip hash unchanged, and the incremental counter
+agreeing with the walk BOTH before and after -- incident #45's fix holding
+through a full disconnect/reconnect cycle.
+
+THE TWO FAILED RUNS BEFORE IT WERE WORTH AS MUCH, because both were harness
+bugs that demonstrated the engine's safety properties on real data:
+  1. The block source read from the archive INSIDE the callback, but
+     reorg_execute truncates the index before calling back (store_read_at ->
+     -2). The engine failed CLEANLY and left the chain at the fork point --
+     not half-applied. Fix: capture the blocks up front.
+  2. A snapshot whose undo files were copied in a different pass than the
+     UTXO state. The unapply pre-flight REFUSED: "undo records=0 but block
+     spends 6698 inputs (undo data missing, pruned, or stale)". A reorg
+     engine that unapplied blindly there would have silently corrupted 6,698
+     UTXOs. Fix: copy the datadir in ONE pass from a stopped daemon.
+
+PRACTICAL NOTE (in DEPLOYMENT.md): the drill needs only ~13 GB, not the
+1.4 TB archive -- index/headers/chainwork, the utxo_* state, the undo_<h>.dat
+files for the drilled depth, and the single blk file holding the tip blocks.
+It refuses the production datadir by path. Built as a tools target,
+deliberately OUTSIDE `make test`: it needs a real datadir copy, which CI does
+not have.
+
+## 2026-08-25 -- differential SCRIPT-EXECUTION corpus: 1128 mutations, zero divergences
+
+ASSESSMENT.md sect.5 item 2 ("the differential corpus method applied to every
+consensus path") was the standing bar. Its gap, precisely: every existing
+block-level differential (corpus_diff, fullchain_diff, consensus_diff) drives
+cons_verify -- merkle root, PoW, sizes, sigops, duplicate txids -- and NEVER
+EXECUTES A SCRIPT. Every false-ACCEPT this project has found lived in the
+interpreter (the SETcc byte-width bug diverged on 5,050 scripts in the accept
+direction), invisible to replay because Core-running miners never mine a block
+that exercises it.
+
+validation/spend_corpus_diff.py closes it: real mainnet spends (scriptSig or
+witness, every prevout amount + spk, the spending tx, input index, and the
+height's true consensus flags) executed through the REAL verifiers on both
+sides, then mutated to force disagreement -- signature bit flips, DER length
+and leading-zero surgery, hashtype edits, push-opcode substitution,
+non-minimal encodings, truncation, leftover-stack junk, witness-region flips.
+Epoch-stratified across pre-BIP16, P2SH, dersig/CSV, segwit v0 and taproot.
+Two new shim verbs (asm/tests/verify_p2sh_shim.c): TAPVERIFY for v1 and
+WITVERIFY for v0 (native and P2SH-wrapped), so the witness eras are
+differentially checkable at all.
+
+RESULT: 188 spends, 1,128 mutations, 1,128 agreements, ZERO divergences,
+ZERO false-accepts.
+
+EIGHT HARNESS BUGS, ZERO NODE BUGS -- and the harness bugs are the lesson.
+Each ENTRY POINT wants a specific transaction serialization, and getting it
+wrong manufactures utterly convincing false divergences in BOTH directions:
+  * legacy  -> WITNESS-STRIPPED tx (Core's legacy SignatureHash omits witness
+    data). A legacy input INSIDE a segwit transaction -- one real tx here had
+    7 witness inputs out of 234 -- otherwise hashes the wrong bytes and
+    returns EVAL_FALSE on a spend the chain contains. This one presented as a
+    node defect for an hour.
+  * v0      -> RAW tx (BIP143 self-serializes).
+  * taproot -> WITNESS-STRIPPED tx (BIP341's SigMsg commits without witnesses).
+Plus: the shim was driving bitcoin_verify.c's SUPERSEDED standalone
+verify_script rather than the production bitcoin_scriptverify.c
+sv_verify_script -- a differential that drives code the node does not run
+measures a program nobody executes. And scriptSig-only mutations reached only
+the ASM side while Core saw an unmutated tx (nine phantom divergences, all
+P2SH-wrapped v0), and a P2A anchor (51024e73: witness v1 with a 2-byte
+program) was mis-routed to the legacy path.
+
+Method note for the next person: every apparent divergence in this session
+turned out to be input asymmetry between the two engines. The discipline that
+resolved each one was the same -- reproduce OUTSIDE the harness, establish
+ground truth independently (here: compute the BIP342 sighash in Python and ask
+Core's SCHNORR verb which message the signature validates against), then
+bisect. The taproot chase ran: commitment math correct -> envelope executes
+correctly in isolation -> our sighash is uninitialized stack garbage ->
+instrument all 37 early returns -> tx_parse fails -> production strips the
+witness first.
+
+## 2026-08-25 -- incident #46 FIXED: append linkage gate closes the keep-up race
+
+The root fix for the duplicate-append (964031's bytes landing at 964032):
+idxscan_append_locked -- the flock-guarded atomic-height primitive BOTH racy
+writers use (keep-up mux legs and inbound .do_block children) -- now checks,
+INSIDE the same critical section that assigns the height, that the block's
+prev field (header bytes 4..36) equals the current tip record's hash. A
+mismatch returns the new -2 (refused, not-tip-linked) with the lock released
+and the store untouched. The TOCTOU is structurally closed: the staleness
+that caused the incident was validation using a leg's pass-start chain view
+while the height was assigned at append time. store_append_shared stays
+check-free by design (parallel IBD writes disjoint non-sequential heights);
+the reorg path reconnects through the nolocked variant under its own outer
+lock, unaffected. Callers: the inbound path already dropped on <=0; node_sync
+gets fail code 10 so the log distinguishes "stale duplicate refused" from a
+real append error, and the next rotation rebuilds a fresh locator.
+
+tests/test_append_linkage replays the incident byte-shape: A, B-linking-A,
+then B AGAIN (prev=A, tip=B) -> refused -2 with the tip untouched; a
+garbage-prev block likewise; a genuinely-next block still appends normally.
+
+## 2026-08-25 -- incident #45 FIXED: the counter drift was the flush crash window
+
+ROOT CAUSE, proven by a deterministic repro (tests/test_lsm_count_drift.c):
+a kill landing BETWEEN the flush's manifest write and its WAL truncate
+leaves a manifest whose persisted runs-only base already CONTAINS the WAL's
+ops, next to a WAL that still holds them. Reload's counter restore -- base +
+tail-pushes - tail-dels -- then double-counts the tail's net. One bulk WAL's
+net is exactly the +7,890,418 the rebuild showed; the set itself was never
+wrong (muhash-proven), and the memtable replay is idempotent, so only the
+counter lied. It self-corrected at the next boot compaction, which is why
+the post-capstone restart showed the true ~165.7M.
+
+FIX (bitcoin_utxo_lsm.asm, reload): the v2 manifest cannot distinguish a
+folded tail from an unfolded one, so base+tail is now trusted ONLY when the
+tail is EMPTY (the clean-shutdown case -- fast path unchanged); ANY
+non-empty tail takes the existing exact recount (mac_lsm_recount, O(run
+records), paid only on unclean-shutdown boots). Verified three ways: the
+repro's crash-window phase (drift +66 -> +0); the flush-heavy ghost/heal
+and fork-crash phases (never drifted -- proving the runtime paths were NOT
+the cause); and the REAL parked pre-rebuild state, which previously read
+lsm_count=173,616,972/inconsistent and now reads 165,717,308 == the walk,
+consistent:true (2m33s recount). New diagnostics: utxo_live_walk_count(),
+utxo_live_set_flush_thresholds(), utxo_live_flush().
+
+## 2026-08-25 -- incident #46: keep-up leg race appended the tip block TWICE
+
+At 16:58, ~14 min after the new-binary deploy, mux:2 and mux:3 both closed
+block 964031 from different peers; mux:2's copy landed at height 964032
+("bytes=1501577 tx=3431" identical on both store lines, and the dropped
+block's hash equaled 964031's). The store append path did not check
+prev-linkage under this race. The verify-before-apply layer REJECTed the
+impostor deterministically ("missing/already-spent UTXO, tx=1") and the
+DEGRADED retry loop held at its 300s backoff cap -- serving unaffected, UTXO
+tracking paused at 964031. REMEDY (user-authorized): stop; a one-off tool
+dropped exactly the one index record via store_truncate_index_only (the
+non-monotonic-safe primitive -- store_truncate_to's monotonic safety gate
+correctly REFUSED first, the same gate that once prevented a ~600GB loss);
+restart; the real 964032 then fetched and applied cleanly. ~13 minutes end
+to end, no data loss. OPEN FOLLOW-UP: the keep-up append path must check
+prev-linkage (or re-check the tip under the store lock) so a slow leg's
+duplicate can never land at tip+1.
+
+## 2026-08-25 -- CAPSTONE: UTXO set proven byte-identical to Bitcoin Core
+
+At quiesced height 963967 (rebuild caught up 16:31, clean SIGTERM stop,
+measured with the daemon down, restarted after):
+
+    field         Core oracle (gettxoutsetinfo muhash 963967)   this node
+    txouts        165,726,554                                   165,726,554   EXACT
+    total_amount  2,007,466,988,462,591 sat                     same          EXACT
+    bogosize      12,980,678,786                                same          EXACT
+    muhash        1e3c77ad25f40961f1f757a77960b7c49a5c7bd0      same          IDENTICAL
+                  91597bd925d561a5c202c118
+
+The muhash equality is the cryptographic proof: every one of 165.7M UTXOs --
+outpoint, value, height, coinbase flag, script -- byte-equal to Core's
+chainstate. scantxoutset for the Counterparty burn address also exact on the
+same set: 3135 unspents / 2130.99791495 BTC, matching the oracle's own scan
+to the satoshi. Instruments: daemon/utxo_setinfo (tool of record, --muhash,
+5m58s walk) and the RPC reader (daemon/utxo_setinfo_rpc.c), which agree with
+each other field-for-field. This is the Stage D acceptance test the
+write-time unspendable-filter rebuild (2026-08-23) was run for.
+
+## 2026-08-25 -- incident #45: utxo_lsm_count over-counts by 7,890,418 after the ghost-heavy rebuild
+
+Found BY the capstone run (the tool's own consistency cross-check, exit 4):
+the whole-set walk -- ground truth, and Core-exact per the muhash above --
+counts 165,726,554 live entries, while utxo_lsm_count()'s bookkeeping says
+173,616,972 (+7,890,418). Same wrong number the daemon heartbeat's `txouts=`
+label shows. CONTENT is proven correct; only the counter metadata is wrong.
+Likely mechanism: the rebuild healed ~870k ghost blocks (rollback then fresh
+re-apply per block); some pairing of those del/put cycles is not reflected in
+the counter. Fix is a counter reconciliation (recount from the walk at
+checkpoint, or audit the ghost-rollback path's accounting); NOT urgent for
+correctness -- every consumer that matters walks, none trusts the counter --
+but the heartbeat label lies until fixed.
+
 ## 2026-08-25 -- RPC full-field audit (post-#44): two more parity gaps closed
 
 Applying the incident-#44 lesson (spot-checked "done" RPCs hide gaps), did a

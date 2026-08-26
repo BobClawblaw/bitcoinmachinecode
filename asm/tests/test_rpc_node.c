@@ -21,6 +21,95 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned
     return 1;
 }
 
+/* Fake tx-submit worker: acks whatever the parent stages, recording the
+ * tx_submit_test flag it saw so the test can prove sendrawtransaction clears
+ * it (a stale 1 would turn a real broadcast into a dry run). */
+static volatile int g_tw_run = 1;
+static int g_tw_saw_test[8];      /* per handled submission, in order */
+static int g_tw_n;
+static int g_tw_verdict = 1;      /* what to report back */
+/* g_tw_last is captured by the PARENT before pthread_create: reading it in
+ * the new thread would race the parent's first submission, which can be
+ * staged and the seq bumped before the thread is ever scheduled -- the
+ * worker would then start from the already-bumped value and wait forever. */
+static volatile unsigned long long g_tw_last;
+static void* fake_txworker(void* arg){
+    node_status_t* ns = (node_status_t*)arg;
+    unsigned long long last = g_tw_last;
+    while (g_tw_run){
+        if (ns->tx_submit_seq != last){
+            last = ns->tx_submit_seq;
+            if (g_tw_n < 8) g_tw_saw_test[g_tw_n++] = ns->tx_submit_test;
+            ns->tx_submit_result = g_tw_verdict;
+            ns->tx_submit_fee = 12345;
+            snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
+                     g_tw_verdict == 1 ? "" : "min relay fee not met");
+            __sync_synchronize();
+            ns->tx_submit_ack = last;
+        }
+        struct timespec ts = {0, 200000}; nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
+/* Fake control worker: mirrors the real worker's ctl_* handler closely
+ * enough to drive the parent side end to end -- it applies bans to the
+ * SHARED list (which is the point: listbanned reads what the worker writes)
+ * and reports 0 for a no-op so the parent's error mapping is exercised. */
+static volatile int g_cw_run = 1;
+static volatile unsigned long long g_cw_last;
+static int g_cw_ops[16]; static int g_cw_nops;
+static void* fake_ctlworker(void* arg){
+    node_status_t* ns = (node_status_t*)arg;
+    unsigned long long last = g_cw_last;
+    while (g_cw_run){
+        if (ns->ctl_seq != last){
+            last = ns->ctl_seq;
+            int op = ns->ctl_op; long long num = ns->ctl_num;
+            char a[128]; snprintf(a, sizeof a, "%s", (const char*)ns->ctl_arg);
+            int result = 0;
+            if (g_cw_nops < 16) g_cw_ops[g_cw_nops++] = op;
+            if (op == RPC_CTL_SETNETACTIVE){ ns->net_active = num ? 1 : 0; result = 1; }
+            else if (op == RPC_CTL_PING) result = 1;
+            else if (op == RPC_CTL_ADDNODE) result = (num == 1) ? 0 : 1;  /* remove: not found */
+            else if (op == RPC_CTL_DISCONNECT) result = a[0] && !strcmp(a, "1.2.3.4") ? 1 : 0;
+            else if (op == RPC_CTL_SETBAN){
+                if (num == 0){
+                    result = 0;
+                    for (int i = 0; i < RPC_MAX_BANS; i++)
+                        if (ns->bans[i].until && !strcmp((const char*)ns->bans[i].subnet, a)){
+                            ns->bans[i].until = 0; result = 1; break; }
+                } else {
+                    int dup = 0, slot = -1;
+                    for (int i = 0; i < RPC_MAX_BANS; i++){
+                        if (ns->bans[i].until && !strcmp((const char*)ns->bans[i].subnet, a)) dup = 1;
+                        if (!ns->bans[i].until && slot < 0) slot = i;
+                    }
+                    if (dup || slot < 0) result = 0;
+                    else { snprintf((char*)ns->bans[slot].subnet, 64, "%s", a);
+                           ns->bans[slot].created = 111;
+                           ns->bans[slot].until = num; result = 1; }
+                }
+            }
+            else if (op == RPC_CTL_CLEARBANNED){
+                for (int i = 0; i < RPC_MAX_BANS; i++) ns->bans[i].until = 0;
+                result = 1;
+            }
+            ns->ctl_reason[0] = 0;
+            ns->ctl_result = result;
+            __sync_synchronize();
+            ns->ctl_ack = last;
+        }
+        struct timespec ts = {0, 200000}; nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
+/* local shorthands, in this file's own idiom (it dispatches through
+ * rpc_node_dispatch directly rather than rpc_dispatch) */
+#define P(j) rj_parse((j), strlen(j))
+#define D(m, p) (r = NULL, ec = 0, em = NULL, rc = rpc_node_dispatch((m), (p), &r, &ec, &em))
+
 static int g_fw_len_ok = -1;   /* fake_worker's view of the staged length */
 static void* fake_worker(void* arg){
     node_status_t* ns = (node_status_t*)arg;
@@ -37,6 +126,17 @@ static void* fake_worker(void* arg){
     }
     return 0;
 }
+
+/* Fake address book: two 18-byte records in the on-disk layout of
+ * bitcoin_addrmgr.asm -- ip u32 LE, port u16 BE, services u64 LE at [6],
+ * last_seen u32 LE at [14]. */
+static const unsigned char FAKE_AB[2][18] = {
+  { 0x4c,0x9c,0x0e,0x0b,  0x20,0x8d,  0x09,0x04,0,0,0,0,0,0,  0,0,0,0 },
+  { 0x01,0x02,0x03,0x04,  0x20,0x8d,  0x0d,0x00,0,0,0,0,0,0,  0,0,0,0 }
+};
+static long fake_ab_count(void* ab){ (void)ab; return 2; }
+static int fake_ab_get_i(void* ab, long i, unsigned char* out){
+    (void)ab; if (i < 0 || i > 1) return 0; memcpy(out, FAKE_AB[i], 18); return 1; }
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
@@ -64,7 +164,9 @@ int main(void){
     ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
     ck("connections_in 3",       r && S(r,"connections_in") && !strcmp(S(r,"connections_in"), "3"));
     ck("localrelay true",        r && S(r,"localrelay") && !strcmp(S(r,"localrelay"), "1"));
-    ck("networkactive true",     r && S(r,"networkactive") && !strcmp(S(r,"networkactive"), "1"));
+    ck("networkactive reflects the REAL toggle, not a constant "
+       "(unset in this status block, so false)",
+       r && S(r,"networkactive") && !strcmp(S(r,"networkactive"), "0"));
     { rj_val* nets = r ? rj_obj_get(r,"networks") : 0;
       ck("networks is a 5-entry array", nets && nets->typ == RJ_ARR && nets->nitems == 5);
       rj_val* n0 = (nets && nets->nitems) ? nets->items[0] : 0;
@@ -160,6 +262,67 @@ int main(void){
       { rpc_mempool_hooks h; memset(&h,0,sizeof h);
         h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
         rpc_node_set_mempool(&h); }
+
+      /* ---- gettxspendingprevout (Core lists it under Blockchain; the pool
+       * enumeration lives here). LHEX spends outpoint (wire txid
+       * 67452301..b1a3, vout 0), so its DISPLAY txid is that reversed. ---- */
+      { const char* SPENT_DISP =
+            "a3b1c2d4e5f6079889abcdef0123456789abcdef0123456789abcdef01234567";
+        char pj[400];
+        snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", SPENT_DISP);
+        rj_val* p = rj_parse(pj, strlen(pj));
+        r = NULL; int rcs = rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("gettxspendingprevout -> array", rcs == 1 && r && r->typ == RJ_ARR && r->nitems == 1);
+        { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+          ck("the outpoint is echoed back", e0 && S(e0,"txid") &&
+             !strcmp(S(e0,"txid"), SPENT_DISP) && !strcmp(S(e0,"vout"), "0"));
+          /* both pool entries spend it (the segwit tx is the same body), so
+             any one of the two txids is a correct answer */
+          ck("spendingtxid names a mempool tx that really spends it",
+             e0 && S(e0,"spendingtxid") &&
+             (!strcmp(S(e0,"spendingtxid"),
+                      "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a") ||
+              !strcmp(S(e0,"spendingtxid"),
+                      "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"))); }
+        rj_free(r); rj_free(p);
+
+        /* an unspent outpoint: the ENTRY still appears, with no spendingtxid.
+         * Omitting the entry would silently shift the caller's indexes. */
+        snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":7}]]", SPENT_DISP);
+        p = rj_parse(pj, strlen(pj));
+        r = NULL; rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("an unspent outpoint still yields an entry", r && r->nitems == 1);
+        ck("...with no spendingtxid",
+           r && r->nitems && rj_obj_get(r->items[0], "spendingtxid") == NULL);
+        rj_free(r); rj_free(p);
+
+        /* a malformed second entry rejects the WHOLE call, so the caller
+         * never gets a partially-answered array it might index by position */
+        snprintf(pj, sizeof pj,
+                 "[[{\"txid\":\"%s\",\"vout\":0},{\"txid\":\"zz\",\"vout\":0}]]", SPENT_DISP);
+        p = rj_parse(pj, strlen(pj));
+        r = NULL; ec = 0;
+        int rcb = rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("a malformed entry rejects the whole list -> -8", rcb == 0 && ec == -8);
+        rj_free(r); rj_free(p);
+
+        p = rj_parse("[[]]", 4);
+        r = NULL; ec = 0;
+        rcb = rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em);
+        ck("an empty outputs array -> -8 (Core rejects it too)", rcb == 0 && ec == -8);
+        rj_free(r); rj_free(p); }
+
+      /* the two node-side Blockchain refusals name what is missing */
+      { r = NULL; ec = 0; em = NULL;
+        int rcb = rpc_node_dispatch("getmempoolcluster", NULL, &r, &ec, &em);
+        ck("getmempoolcluster -> -1 naming the missing cluster structure",
+           rcb == 0 && ec == -1 && em && strstr(em, "cluster"));
+        rj_free(r);
+        r = NULL; ec = 0; em = NULL;
+        rcb = rpc_node_dispatch("getblockfrompeer", NULL, &r, &ec, &em);
+        ck("getblockfrompeer -> -1 naming the missing worker channel",
+           rcb == 0 && ec == -1 && em && strstr(em, "download worker"));
+        rj_free(r); }
 
       r = NULL; rpc_node_dispatch("getrawmempool", NULL, &r, &ec, &em);
       ck("shared pool: getrawmempool has 2 txids", r && r->typ == RJ_ARR && r->nitems == 2);
@@ -512,6 +675,403 @@ int main(void){
         ck("submitblock round-trip -> BIP22 string from worker",
            rcb==1 && r && r->typ==RJ_STR && !strcmp(r->str,"duplicate"));
         rj_free(r); rj_free(pb); }
+      rpc_node_set_status_rw(NULL); }
+
+    /* ---- network / ops 12, shaped against the Core oracle (2026-08-25).
+     * The peer table was reset at line 117, so re-stage it here: two LIVE
+     * slots carrying counters, plus a NON-live slot whose bytes must NOT be
+     * counted -- that is the whole point of gating the sum on `used`. ---- */
+    memset(st.peers, 0, sizeof st.peers);
+    st.peers[0].used = 1; st.peers[0].bytes_sent = 4096;  st.peers[0].bytes_recv = 1048576;
+    st.peers[3].used = 1; st.peers[3].bytes_sent = 900;   st.peers[3].bytes_recv = 24;
+    st.peers[7].used = 0; st.peers[7].bytes_sent = 1<<20; st.peers[7].bytes_recv = 1<<20;
+    { r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
+      ck("getnettotals dispatched", rc == 1 && r && r->typ == RJ_OBJ);
+      ck("totalbytessent sums the LIVE peers only (4096+900, not the dead slot)",
+         S(r,"totalbytessent") && !strcmp(S(r,"totalbytessent"), "4996"));
+      ck("totalbytesrecv sums the LIVE peers only",
+         S(r,"totalbytesrecv") && !strcmp(S(r,"totalbytesrecv"), "1048600"));
+      ck("getnettotals has timemillis", rj_obj_get(r,"timemillis") != NULL);
+      { rj_val* up = rj_obj_get(r,"uploadtarget");
+        ck("uploadtarget object present", up && up->typ == RJ_OBJ);
+        /* Core's six sub-fields, in Core's order */
+        static const char* UT[] = {"timeframe","target","target_reached",
+                                   "serve_historical_blocks","bytes_left_in_cycle",
+                                   "time_left_in_cycle"};
+        int all = up != NULL;
+        for (int i = 0; up && i < 6; i++) if (!rj_obj_get(up, UT[i])) all = 0;
+        ck("uploadtarget carries all six Core fields", all); }
+      rj_free(r); }
+
+    /* no book injected yet -> honestly empty, never a fabricated peer */
+    { r = NULL; rc = rpc_node_dispatch("getnodeaddresses", NULL, &r, &ec, &em);
+      ck("getnodeaddresses with no book -> empty array",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r);
+      r = NULL; rc = rpc_node_dispatch("getaddrmaninfo", NULL, &r, &ec, &em);
+      ck("getaddrmaninfo with no book -> zeros",
+         rc == 1 && r && rj_obj_get(r,"ipv4") &&
+         !strcmp(S(rj_obj_get(r,"ipv4"),"total"), "0"));
+      rj_free(r); }
+
+    rpc_node_set_addrbook((void*)FAKE_AB, fake_ab_count, fake_ab_get_i);
+
+    { /* Core's default count is 1 -> exactly one address, not the whole book */
+      r = NULL; rc = rpc_node_dispatch("getnodeaddresses", NULL, &r, &ec, &em);
+      ck("getnodeaddresses default count == 1", rc == 1 && r && r->nitems == 1);
+      { rj_val* a0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("address decoded from the u32 LE ip field",
+           a0 && S(a0,"address") && !strcmp(S(a0,"address"), "76.156.14.11"));
+        ck("port decoded big-endian (8333)",
+           a0 && S(a0,"port") && !strcmp(S(a0,"port"), "8333"));
+        ck("services decoded little-endian (0x0409 = 1033)",
+           a0 && S(a0,"services") && !strcmp(S(a0,"services"), "1033"));
+        ck("network reported as ipv4",
+           a0 && S(a0,"network") && !strcmp(S(a0,"network"), "ipv4"));
+        ck("time field present", a0 && rj_obj_get(a0,"time") != NULL); }
+      rj_free(r); }
+
+    { const char* j = "[0]"; rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; rc = rpc_node_dispatch("getnodeaddresses", p, &r, &ec, &em);
+      ck("getnodeaddresses 0 -> the whole book", rc == 1 && r && r->nitems == 2);
+      rj_free(r); rj_free(p); }
+
+    { const char* j = "[0,\"onion\"]"; rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; rc = rpc_node_dispatch("getnodeaddresses", p, &r, &ec, &em);
+      ck("network filter the book cannot serve -> empty, not relabelled ipv4",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r); rj_free(p); }
+
+    { r = NULL; rc = rpc_node_dispatch("getaddrmaninfo", NULL, &r, &ec, &em);
+      ck("getaddrmaninfo dispatched", rc == 1 && r && r->typ == RJ_OBJ);
+      /* Core's exact key set, in Core's order */
+      static const char* NETS[] = {"ipv4","ipv6","onion","i2p","cjdns","all_networks"};
+      int shaped = r != NULL;
+      for (int i = 0; r && i < 6; i++){
+          rj_val* e = rj_obj_get(r, NETS[i]);
+          if (!e || !rj_obj_get(e,"new") || !rj_obj_get(e,"tried") || !rj_obj_get(e,"total"))
+              shaped = 0;
+      }
+      ck("getaddrmaninfo has Core's six networks x {new,tried,total}", shaped);
+      ck("ipv4 total == book count", r && rj_obj_get(r,"ipv4") &&
+         !strcmp(S(rj_obj_get(r,"ipv4"),"total"), "2"));
+      ck("ipv6 total == 0 (the book is v4-only)", r && rj_obj_get(r,"ipv6") &&
+         !strcmp(S(rj_obj_get(r,"ipv6"),"total"), "0"));
+      ck("all_networks total == book count", r && rj_obj_get(r,"all_networks") &&
+         !strcmp(S(rj_obj_get(r,"all_networks"),"total"), "2"));
+      rj_free(r); }
+
+    { r = NULL; rc = rpc_node_dispatch("listbanned", NULL, &r, &ec, &em);
+      ck("listbanned -> [] (same answer Core gives with nothing banned)",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r);
+      /* no addnode= configured -> [] , exactly as Core answers */
+      r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", NULL, &r, &ec, &em);
+      ck("getaddednodeinfo with no addnode= -> []",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      rj_free(r);
+      r = NULL; rc = rpc_node_dispatch("clearbanned", NULL, &r, &ec, &em);
+      ck("clearbanned with no worker -> -4 (it is a real mutation now)",
+         rc == 0 && ec == -4);
+      rj_free(r); }
+
+    /* The mutators are REAL now (the ctl_* channel). With no worker attached
+     * they must say exactly that -- not pretend to have acted, and not claim
+     * the capability is missing when it is the worker that is absent. */
+    { static const char* MUT[] = {"addnode","disconnectnode","setban",
+                                  "setnetworkactive","ping"};
+      static const char* ARGS[] = {"[\"1.2.3.4\",\"add\"]", "[\"1.2.3.4\"]",
+                                   "[\"1.2.3.4\",\"add\"]", "[true]", "[]"};
+      rpc_node_set_status_rw(NULL);
+      for (int i = 0; i < 5; i++){
+          rj_val* p = rj_parse(ARGS[i], strlen(ARGS[i]));
+          r = NULL; ec = 0; em = NULL;
+          rc = rpc_node_dispatch(MUT[i], p, &r, &ec, &em);
+          char lbl[112]; snprintf(lbl, sizeof lbl,
+                                  "%s with no worker -> -4 naming the missing worker", MUT[i]);
+          ck(lbl, rc == 0 && ec == -4 && em && strstr(em, "download worker"));
+          rj_free(r); rj_free(p);
+      }
+      ck("all twelve are owned by this module",
+         rpc_node_known_method("getnettotals") &&
+         rpc_node_known_method("getnodeaddresses") &&
+         rpc_node_known_method("getaddrmaninfo") &&
+         rpc_node_known_method("listbanned") &&
+         rpc_node_known_method("clearbanned") &&
+         rpc_node_known_method("getaddednodeinfo") &&
+         rpc_node_known_method("addnode") &&
+         rpc_node_known_method("disconnectnode") &&
+         rpc_node_known_method("setban") &&
+         rpc_node_known_method("setnetworkactive") &&
+         rpc_node_known_method("ping")); }
+
+    /* getaddednodeinfo over a real addnode= list. peers[0]/[3] are live but
+     * carry no addr string at this point, so stage one that matches. */
+    { static const char ADDED[2][64] = { "1.2.3.4", "9.9.9.9" };
+      rpc_node_set_addednodes(ADDED, 2);
+      strcpy(st.peers[0].addr, "1.2.3.4:8333"); st.peers[0].inbound = 0;
+      r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", NULL, &r, &ec, &em);
+      ck("getaddednodeinfo lists both configured nodes",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 2);
+      { rj_val* e0 = (r && r->nitems > 0) ? r->items[0] : 0;
+        rj_val* e1 = (r && r->nitems > 1) ? r->items[1] : 0;
+        ck("added node matched to a live peer -> connected true",
+           e0 && S(e0,"connected") && !strcmp(S(e0,"connected"), "1"));
+        ck("connected node carries one addresses[] entry with a direction",
+           e0 && rj_obj_get(e0,"addresses") && rj_obj_get(e0,"addresses")->nitems == 1 &&
+           !strcmp(S(rj_obj_get(e0,"addresses")->items[0], "connected"), "outbound"));
+        ck("unconnected added node -> connected false, addresses[] empty",
+           e1 && S(e1,"connected") && !strcmp(S(e1,"connected"), "0") &&
+           rj_obj_get(e1,"addresses") && rj_obj_get(e1,"addresses")->nitems == 0); }
+      rj_free(r);
+
+      /* prefix-only matches must NOT count: "1.2.3.4" vs peer "1.2.3.45" */
+      strcpy(st.peers[0].addr, "1.2.3.45:8333");
+      r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", NULL, &r, &ec, &em);
+      ck("host prefix of a longer IP does not count as connected",
+         rc == 1 && r && r->nitems == 2 &&
+         !strcmp(S(r->items[0],"connected"), "0"));
+      rj_free(r);
+      strcpy(st.peers[0].addr, "1.2.3.4:8333");
+
+      /* filter form, and Core's -24 for a node that was never added */
+      { const char* j = "[\"9.9.9.9\"]"; rj_val* p = rj_parse(j, strlen(j));
+        r = NULL; rc = rpc_node_dispatch("getaddednodeinfo", p, &r, &ec, &em);
+        ck("getaddednodeinfo \"node\" filters to that node",
+           rc == 1 && r && r->nitems == 1 &&
+           !strcmp(S(r->items[0],"addednode"), "9.9.9.9"));
+        rj_free(r); rj_free(p); }
+      { const char* j = "[\"5.5.5.5\"]"; rj_val* p = rj_parse(j, strlen(j));
+        r = NULL; ec = 0; em = NULL;
+        rc = rpc_node_dispatch("getaddednodeinfo", p, &r, &ec, &em);
+        ck("unknown node -> Core's -24 'Error: Node has not been added.'",
+           rc == 0 && ec == -24 && em && !strcmp(em, "Error: Node has not been added."));
+        rj_free(r); rj_free(p); }
+      rpc_node_set_addednodes(NULL, 0); }
+
+    rpc_node_set_addrbook(NULL, NULL, NULL);
+
+    /* ---- testmempoolaccept ----
+     * Without a download worker there is nothing to ask, and the method says
+     * so rather than answering from the parent's own guess. */
+    { rpc_node_set_status_rw(NULL);
+      const char* j = "[[\"0200000001000000000000000000000000000000000000000000000000000000000000000000000000000000fdffffff0100000000000000000000000000\"]]";
+      rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; ec = 0;
+      rc = rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      ck("testmempoolaccept with no worker -> -4", rc == 0 && ec == -4);
+      rj_free(r); rj_free(p); }
+
+    { rpc_node_set_status_rw(&st);
+      pthread_t th; g_tw_run = 1; g_tw_n = 0; g_tw_verdict = 1;
+      g_tw_last = st.tx_submit_seq;          /* captured BEFORE the thread starts */
+      pthread_create(&th, 0, fake_txworker, &st);
+
+      /* a well-formed legacy tx (the createrawtransaction KAT body) */
+      const char* TX1 = "020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000";
+      char j[1200]; snprintf(j, sizeof j, "[[\"%s\"]]", TX1);
+      rj_val* p = rj_parse(j, strlen(j));
+      r = NULL; rc = rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      ck("testmempoolaccept -> array of one", rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1);
+      { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("entry carries txid and wtxid", e0 && S(e0,"txid") && S(e0,"wtxid"));
+        ck("a non-witness tx has wtxid == txid",
+           e0 && S(e0,"txid") && S(e0,"wtxid") && !strcmp(S(e0,"txid"), S(e0,"wtxid")));
+        ck("allowed:true from the worker's verdict",
+           e0 && S(e0,"allowed") && !strcmp(S(e0,"allowed"), "1"));
+        ck("vsize reported when allowed", e0 && S(e0,"vsize"));
+        ck("fees.base carries the worker's fee (12345 sat)",
+           e0 && rj_obj_get(e0,"fees") &&
+           !strcmp(S(rj_obj_get(e0,"fees"),"base"), "0.00012345"));
+        /* package feerate is not computed here, so it must be absent */
+        ck("effective-feerate is omitted, not guessed",
+           e0 && rj_obj_get(e0,"fees") &&
+           rj_obj_get(rj_obj_get(e0,"fees"),"effective-feerate") == NULL);
+        ck("a single tx carries no package-error",
+           e0 && rj_obj_get(e0,"package-error") == NULL); }
+      rj_free(r); rj_free(p);
+      ck("the worker saw tx_submit_test set", g_tw_n >= 1 && g_tw_saw_test[0] == 1);
+
+      /* a rejection carries the worker's reason and no fee/vsize */
+      g_tw_verdict = -26;
+      p = rj_parse(j, strlen(j));
+      r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("allowed:false on rejection", e0 && !strcmp(S(e0,"allowed"), "0"));
+        ck("reject-reason is the worker's text",
+           e0 && S(e0,"reject-reason") && !strcmp(S(e0,"reject-reason"), "min relay fee not met"));
+        ck("no fees on a rejected tx", e0 && rj_obj_get(e0,"fees") == NULL);
+        ck("no vsize on a rejected tx", e0 && rj_obj_get(e0,"vsize") == NULL); }
+      rj_free(r); rj_free(p);
+      g_tw_verdict = 1;
+
+      /* more than one tx: every entry must carry package-error, because this
+       * node cannot see an in-array parent from a later child */
+      { char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
+        p = rj_parse(j2, strlen(j2));
+        r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+        ck("two txs -> two entries", r && r->nitems == 2);
+        ck("both entries carry package-error naming the missing package policy",
+           r && r->nitems == 2 &&
+           S(r->items[0],"package-error") && S(r->items[1],"package-error") &&
+           strstr(S(r->items[0],"package-error"), "package policy"));
+        rj_free(r); rj_free(p); }
+
+      /* sendrawtransaction MUST clear the flag the dry run left set */
+      { int before = g_tw_n;
+        char j3[1200]; snprintf(j3, sizeof j3, "[\"%s\"]", TX1);
+        p = rj_parse(j3, strlen(j3));
+        r = NULL; rpc_node_dispatch("sendrawtransaction", p, &r, &ec, &em);
+        rj_free(r); rj_free(p);
+        ck("sendrawtransaction after testmempoolaccept clears tx_submit_test",
+           g_tw_n > before && g_tw_saw_test[g_tw_n-1] == 0); }
+
+      g_tw_run = 0; pthread_join(th, 0);
+
+      /* argument validation happens before anything is staged */
+      { rj_val* q = rj_parse("[[]]", 4);
+        r = NULL; ec = 0;
+        rc = rpc_node_dispatch("testmempoolaccept", q, &r, &ec, &em);
+        ck("an empty array -> -8", rc == 0 && ec == -8);
+        rj_free(r); rj_free(q); }
+      { char big[3000]; int n = snprintf(big, sizeof big, "[[");
+        for (int i = 0; i < 26; i++) n += snprintf(big+n, sizeof big-n, "%s\"00112233445566778899\"", i?",":"");
+        snprintf(big+n, sizeof big-n, "]]");
+        rj_val* q = rj_parse(big, strlen(big));
+        r = NULL; ec = 0;
+        rc = rpc_node_dispatch("testmempoolaccept", q, &r, &ec, &em);
+        ck("26 transactions -> -8 (Core caps at 25)", rc == 0 && ec == -8);
+        rj_free(r); rj_free(q); }
+      { rj_val* q = rj_parse("[[\"zz\"]]", 8);
+        r = NULL; ec = 0;
+        rc = rpc_node_dispatch("testmempoolaccept", q, &r, &ec, &em);
+        ck("undecodable hex -> -22 for the WHOLE call, not a short array",
+           rc == 0 && ec == -22);
+        rj_free(r); rj_free(q); }
+      rpc_node_set_status_rw(NULL); }
+
+    /* submitpackage / private broadcast name their gaps */
+    { r = NULL; ec = 0; em = NULL;
+      rc = rpc_node_dispatch("submitpackage", NULL, &r, &ec, &em);
+      ck("submitpackage -> -1 naming the missing package validation",
+         rc == 0 && ec == -1 && em && strstr(em, "package validation"));
+      rj_free(r);
+      r = NULL; ec = 0; em = NULL;
+      rc = rpc_node_dispatch("getprivatebroadcastinfo", NULL, &r, &ec, &em);
+      ck("getprivatebroadcastinfo -> -1 naming the missing queue",
+         rc == 0 && ec == -1 && em && strstr(em, "private broadcast"));
+      rj_free(r); }
+
+    /* ---- the peer-control channel, end to end ---- */
+    { pthread_t th; g_cw_run = 1; g_cw_nops = 0;
+      memset((void*)st.bans, 0, sizeof st.bans);
+      st.ctl_seq = st.ctl_ack = 0;
+      g_cw_last = st.ctl_seq;              /* captured BEFORE the thread starts */
+      rpc_node_set_status_rw(&st);
+      pthread_create(&th, 0, fake_ctlworker, &st);
+
+      { rj_val* p = P("[true]");
+        D("setnetworkactive", p);
+        ck("setnetworkactive true -> true, and the flag is set",
+           rc == 1 && r && !strcmp(r->str, "1") && st.net_active == 1);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[false]");
+        D("setnetworkactive", p);
+        ck("setnetworkactive false -> false, flag cleared",
+           rc == 1 && r && !strcmp(r->str, "0") && st.net_active == 0);
+        rj_free(r); rj_free(p); }
+      D("getnetworkinfo", NULL);
+      ck("getnetworkinfo now REPORTS the disabled network",
+         r && S(r,"networkactive") && !strcmp(S(r,"networkactive"), "0"));
+      rj_free(r);
+      { rj_val* p = P("[true]"); D("setnetworkactive", p); rj_free(r); rj_free(p); }
+
+      D("ping", NULL);
+      ck("ping -> null (queued, as Core does)", rc == 1 && r && r->typ == RJ_NULL);
+      rj_free(r);
+
+      /* --- bans: the parent must SEE what the worker wrote --- */
+      { rj_val* p = P("[\"5.6.7.8\",\"add\",3600]");
+        D("setban", p);
+        ck("setban add -> null", rc == 1 && r && r->typ == RJ_NULL);
+        rj_free(r); rj_free(p); }
+      D("listbanned", NULL);
+      ck("listbanned reads the SHARED list the worker wrote",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1);
+      { rj_val* b0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("...with Core's address/banned_until/ban_created",
+           b0 && S(b0,"address") && !strcmp(S(b0,"address"), "5.6.7.8") &&
+           rj_obj_get(b0,"banned_until") && rj_obj_get(b0,"ban_created")); }
+      rj_free(r);
+      { rj_val* p = P("[\"5.6.7.8\",\"add\"]");
+        D("setban", p);
+        ck("banning the same subnet twice -> Core's -30, not a false success",
+           rc == 0 && ec == -30 && em && strstr(em, "already banned"));
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"9.9.9.9\",\"remove\"]");
+        D("setban", p);
+        ck("unbanning something not banned -> -30", rc == 0 && ec == -30);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"5.6.7.8\",\"remove\"]");
+        D("setban", p);
+        ck("unbanning a real ban succeeds", rc == 1);
+        rj_free(r); rj_free(p); }
+      D("listbanned", NULL);
+      ck("...and it leaves the list", rc == 1 && r && r->nitems == 0);
+      rj_free(r);
+      { /* an expired ban must not be listed */
+        st.bans[0].until = 1; st.bans[0].created = 1;
+        snprintf((char*)st.bans[0].subnet, 64, "7.7.7.7");
+        D("listbanned", NULL);
+        ck("an EXPIRED ban is not listed", rc == 1 && r && r->nitems == 0);
+        rj_free(r); st.bans[0].until = 0; }
+      { rj_val* p = P("[\"1.2.3.0/24\",\"add\",1893456000,true]");
+        D("setban", p);
+        ck("setban with an absolute bantime succeeds", rc == 1);
+        rj_free(r); rj_free(p);
+        D("listbanned", NULL);
+        ck("...and the absolute time is stored verbatim",
+           rc == 1 && r && r->nitems == 1 &&
+           !strcmp(S(r->items[0],"banned_until"), "1893456000"));
+        rj_free(r); }
+      D("clearbanned", NULL);
+      ck("clearbanned -> null", rc == 1 && r && r->typ == RJ_NULL);
+      rj_free(r);
+      D("listbanned", NULL);
+      ck("...and the list is empty", rc == 1 && r && r->nitems == 0);
+      rj_free(r);
+
+      /* --- addnode / disconnectnode error mapping --- */
+      { rj_val* p = P("[\"1.2.3.4\",\"add\"]");
+        D("addnode", p);
+        ck("addnode add -> null", rc == 1 && r && r->typ == RJ_NULL);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\",\"remove\"]");
+        D("addnode", p);
+        ck("addnode remove of an unknown node -> Core's -24",
+           rc == 0 && ec == -24 && em && strstr(em, "has not been added"));
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\",\"bogus\"]");
+        D("addnode", p);
+        ck("an invalid addnode command -> -8", rc == 0 && ec == -8);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\"]");
+        D("disconnectnode", p);
+        ck("disconnectnode of a live peer succeeds", rc == 1);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"9.9.9.9\"]");
+        D("disconnectnode", p);
+        ck("disconnectnode of an unknown peer -> Core's -29",
+           rc == 0 && ec == -29 && em && strstr(em, "not found"));
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\",5]");
+        D("disconnectnode", p);
+        ck("both address and nodeid -> Core's -32602",
+           rc == 0 && ec == -32602 && em && strstr(em, "Only one of"));
+        rj_free(r); rj_free(p); }
+
+      ck("the worker saw every op type", g_cw_nops >= 10);
+      g_cw_run = 0; pthread_join(th, 0);
       rpc_node_set_status_rw(NULL); }
 
     /* a method we don't own -> -1 (caller keeps looking) */

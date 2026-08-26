@@ -95,6 +95,7 @@ asm/tests/serve_test
 asm/tests/test_idx
 asm/tests/test_idx
 asm/tests/test_serve
+asm/tests/reorg_drill
 asm/tests/test_redial
 asm/bitcoin_idx.o
 asm/bitcoin_serve.o
@@ -294,6 +295,7 @@ asm/tests/test_utxo_live_count
 asm/tests/test_utxo_recover
 asm/tests/test_utxo_catchup_crash_resume
 asm/tests/test_archive_truncate_nonmonotonic
+asm/tests/test_append_linkage
 asm/tests/test_prune_nonmonotonic
 asm/tests/test_utxo_catchup_shutdown
 asm/tests/test_utxo_crash_recovery
@@ -321,6 +323,7 @@ LSOverride
 asm/tests/test_lsm_sparse_diff
 asm/tests/soak_lsm_mm
 asm/tests/test_lsm_bloomsat
+asm/tests/test_lsm_count_drift
 asm/tests/diff_real_run
 asm/tests/live_ibd
 asm/tests/soak_mux_peer
@@ -368,3 +371,7 @@ asm/tests/hs_cap_probe
 asm/tests/hs_seq_probe
 asm/tests/test_mv_parse_bounds
 asm/tests/test_txv_cs_maxsize
+
+# Built from Bitcoin Core's tree (40MB, links its consensus libs); the
+# recipe lives in core_verify_oracle.cpp's header comment.
+validation/core_verify_oracle

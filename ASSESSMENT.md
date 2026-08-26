@@ -19,6 +19,20 @@ The short version, stated before the detail so it cannot be skipped:
 
 ---
 
+**Addendum 2026-08-25.** Two things changed materially since this was
+written, one in each direction of the ledger. For capability: the UTXO set
+is now proven **byte-identical to Bitcoin Core's** at height 963,967 —
+MuHash, txout count, total amount and bogosize all exact, no read-time
+filter, no overrides — and the node serves most of Core's RPC surface,
+including `getblocktemplate`, `submitblock`, the mempool tranche over a
+genuinely shared mempool, and the set-verification instruments as RPCs.
+For humility: getting there surfaced four production incidents in two days
+(`LOG.md` #43–#46) — a corrupt chainwork file, a non-Core RPC shape, a
+live-counter drift of +7.89M with a crash-window root cause, and a
+duplicate-append race on the live node. All four are root-caused, fixed and
+regression-tested, and all four existed in production first. The summary
+judgement below stands; the capability section under-claims.
+
 ## 1. What it can do
 
 Real, and stronger than the project's age suggests:
@@ -42,14 +56,24 @@ Real, and stronger than the project's age suggests:
 From `FEATURE_GAPS.md`, and this list is the reason the headline above says
 "not a node":
 
-- **The RPC surface is the largest gap by a wide margin.** One tranche of
-  blockchain-query calls exists. Most of Core's API does not.
-- **No mining support.** No block template assembly.
-- **No PSBT (BIP174).** No descriptor, multi-wallet, or watch-only wallets.
+- **The RPC surface is the largest gap by a wide margin.** *(Retired
+  2026-08-25 — see the addendum above; most of Core's API now exists, with
+  per-method verification recorded in `docs/PARITY_PLAN.md`.)*
+- **No mining support.** *(No longer true: `getblocktemplate`,
+  `submitblock`, `prioritisetransaction` landed 2026-08-25 — template frame
+  and retarget oracle-verified; the template's tx ordering is valid but not
+  fee-optimal, and per-tx sigops is a documented lower bound.)*
+- **No PSBT (BIP174).** *(No longer true: six methods since 2026-08-25,
+  mostly oracle-byte-exact; the signer-gated three remain absent.)* No
+  descriptor, multi-wallet, or watch-only wallets — still true.
 - **No chain selection** — no testnet, signet, or regtest. Mainnet only.
 - **No `blockfilterindex` (BIP157/158)**, so no light-client service.
-- **No `coinstatsindex`/`gettxoutsetinfo`**, which matters far more than it
-  sounds — see §4.
+- **No `coinstatsindex`/`gettxoutsetinfo`** ~~, which matters far more than
+  it sounds — see §4~~ *(half-retired 2026-08-25: `gettxoutsetinfo` now
+  exists as an RPC and as the standalone tool, and the §4 concern it stood
+  for — proving the set — is settled: MuHash byte-identical to Core at the
+  live tip. The incremental `coinstatsindex` itself remains absent; every
+  measurement is a full O(set) walk.)*
 - **No `txindex`.**
 - **It has never served a peer at tip.** The keep-up serve path was crashing
   on the first block a peer pushed until today (incident #18), which means it
@@ -164,19 +188,144 @@ that had just been rewritten. The reasonable inference is that more remain.
 
 In rough order of how much each would move it:
 
-1. ~~**A UTXO set hash matching Core at a given height.**~~ **Done
-   (2026-08-23), and it matches on the production set at height 792,979.**
-   What remains of this item is fixing the two divergences it found above, and
-   re-running it as the replay advances (each run needs a quiesced datadir, and
-   the tool refuses on a busy one rather than guessing).
-2. **The differential corpus method applied to every consensus path**, not the
-   three or four it has reached. It is the only method that has ever found a
-   false accept here.
+1. ~~**A UTXO set hash matching Core at a given height.**~~ **Fully done
+   (2026-08-25): MuHash byte-identical to Core at height 963,967 — the live
+   tip — with no filters, no overrides, no corrected fields; the two
+   divergences the earlier runs found were rebuilt away.** Nothing remains
+   of this item.
+2. ~~**The differential corpus method applied to every consensus path**, not
+   the three or four it has reached.~~ **Extended 2026-08-25 to the surface
+   that mattered most: SCRIPT EXECUTION on real mainnet spends.** Every
+   block-level differential before it drove `cons_verify` (merkle, PoW,
+   sizes, sigops) and never executed a script -- which is exactly why the
+   SETcc false-ACCEPT was invisible to a clean full-chain replay.
+   `validation/spend_corpus_diff.py` now runs real spends through the real
+   verifiers on both sides across all five script eras and mutates them to
+   force disagreement: **1,128 mutations, 1,128 agreements, zero
+   divergences, zero false-accepts**. It remains the only method that has
+   ever found a false accept here. **Deepened 2026-08-26 to exactly the
+   per-path coverage this item asked for** (`validation/synth_corpus_diff.py`):
+   because those constructs are rare or absent in random blocks they are now
+   SYNTHESIZED and correctly signed rather than harvested -- multisig (bare /
+   P2SH / P2WSH, with NULLDUMMY, signature-ordering and threshold mutations),
+   CLTV and CSV (nLockTime / nSequence / tx-version predicate flips),
+   OP_CODESEPARATOR (signing over the wrong subscript), and taproot
+   script-path with and without an ANNEX. Core's own VerifyScript validates
+   every synthesized spend before the comparison, so a construction error
+   fails loudly instead of comparing garbage.
+
+   **It immediately found a second false accept, and a worse one.** The
+   BIP341 script-path commitment check compared only the tweaked output key's
+   X coordinate and ignored the control block's low bit -- the tweaked key's
+   Y PARITY, which Core verifies inside `CheckTapTweak`. Since Q = P + tG is
+   one point, its x and its parity are both determined, so that bit was
+   entirely unconstrained: flipping it on any otherwise-valid script-path
+   spend produced a transaction this node ACCEPTED and Core REJECTED
+   (`WITNESS_PROGRAM_MISMATCH`) -- a chain-split-direction false accept,
+   reachable by flipping one bit of witness data, with no key material and no
+   grinding. Fixed the same day, with a hermetic regression test
+   (`tests/test_taproot_parity.c`) confirmed to FAIL against the old code. The
+   exercise also exposed three frozen taproot vectors that hard-coded parity
+   `0xc0` without ever computing it: they were never valid spends, and passed
+   only because the verifier ignored the bit.
+
+   **Breadth added the same day**, which is what that finding made the next
+   bar: 35 synthesized features and 95 rule-targeted mutations, zero
+   divergences. Every SIGHASH type (ALL/NONE/SINGLE x ANYONECANPAY) across
+   legacy, BIP143 v0 and taproot key-path -- including taproot DEFAULT's
+   64-byte signature form and the **SIGHASH_SINGLE bug** (input index past
+   the last output, where the sighash is the constant uint256(1) and a
+   signature over it is valid, so both engines must ACCEPT); P2SH-wrapped
+   witness in both P2WPKH and P2WSH form, exercising the unwrapping rather
+   than just the inner script; and multi-leaf taproot trees (2/3/4 leaves)
+   whose control blocks carry a real merkle PATH, mutated by corrupting a
+   sibling, truncating a level, flipping the parity, and substituting the
+   wrong leaf script. The real-spend corpus re-ran clean alongside it (99
+   spends / 594 mutations).
+
+   Generalizing the sighash functions also corrected a latent harness error
+   (the BIP341 SINGLE-output commitment matched NONE as well) that had never
+   fired because only DEFAULT was previously exercised -- and one genuine
+   harness artifact, where a P2SH scriptSig mutation reached Core but not the
+   ASM shim, briefly looked like a false accept until the two engines were
+   confirmed to be seeing different bytes. That is the standing hazard of
+   this method and the reason every reported divergence is chased to its
+   cause before it is believed.
+
+   **The interpreter surface followed** -- the one this item named as the
+   place the SETcc false accept originally lived. 7,797 bare-script probes,
+   all agreeing with Core, driven by a different assertion from the spend
+   synthesizers: most are deliberately invalid, so what is required is
+   AGREEMENT rather than acceptance, which makes wide coverage cheap.
+
+   The bulk is a systematic sweep of the arithmetic and comparison opcodes --
+   every binary op over 25 boundary operands (sign changes, byte-width
+   boundaries at 127/128/255/256/32767/65535/8388607, the CScriptNum 4-byte
+   ceiling), plus the unary ops and OP_WITHIN's range boundaries. That is
+   precisely the shape of the original bug: a wrong SETcc/movzx width flips
+   the verdict for some operand pair and nothing else.
+
+   The rest pins the structural rules an implementation can plausibly get
+   wrong in the ACCEPT direction: disabled opcodes and the 201-opcode limit
+   failing even in an UNEXECUTED branch (Core checks both before the fExec
+   gate); OP_VERIF/OP_VERNOTIF always invalid while OP_RESERVED/OP_VER are
+   fine when unexecuted; the 520-byte element and 1,000-element stack
+   ceilings at their exact boundaries; unbalanced conditionals; CScriptNum
+   4-vs-5-byte operands; and push-encoding edges. BIP342's OP_SUCCESSx is
+   covered across every disjoint range of Core's own IsOpSuccess, including
+   the cases that matter most -- OP_SUCCESS wins over an unparseable
+   remainder, over an unexecuted branch, and over a preceding OP_RETURN --
+   with opcode 186 (just below the range) asserted to still FAIL, so the
+   boundary is proven rather than assumed, and an unknown leaf version
+   succeeding after the commitment check alone.
+
+   Two harness faults surfaced and were fixed, neither a node bug: an empty
+   scriptSig sent as an empty whitespace-delimited field shifted every later
+   field left (a wall of phantom divergences on the first run), and the
+   negative cases needed explicit "Core must REJECT" support rather than
+   being counted as construction failures.
+
+   **Resource accounting followed, and found a THIRD false accept.**
+   OP_CHECKMULTISIG's key count is charged to the 201-opcode budget in Core
+   (`nOpCount += nKeysCount`, then the limit re-check); this interpreter
+   validated the count against MAX_PUBKEYS_PER_MULTISIG but never charged it.
+   Ten 0-of-20 multisigs are ten opcodes and two hundred keys -- 210, over the
+   limit -- and verified here while Core rejected them with
+   SCRIPT_ERR_OP_COUNT. Accept direction again, and 0-of-N checks no
+   signatures, so no key material was needed to build one. Fixed in
+   `bitcoin_interp.asm`, with `tests/test_multisig_opcount.c` pinning the
+   9-vs-10 boundary (a fix that merely rejected multisig-heavy scripts would
+   fail the nine case) and confirmed to FAIL against the unfixed code.
+
+   The rest of the resource surface agrees: MAX_SCRIPT_SIZE at exactly
+   10,000/10,001, MAX_PUBKEYS_PER_MULTISIG at 20/21, and -- the cases most
+   likely to be got wrong by reusing the legacy limits -- the two that
+   tapscript does NOT inherit. Core gates both the 10,000-byte bound and the
+   201-opcode limit on (BASE || WITNESS_V0), so the SAME bytes must be legal
+   as a tapscript and rejected as legacy; both directions are asserted.
+   OP_CHECKMULTISIG(VERIFY) is confirmed disabled in tapscript. BIP342's
+   validation-weight budget is swept across its boundary (1..15 sigops
+   against a single duplicated signature) WITHOUT hardcoding where the
+   boundary falls -- Core defines it, and both engines must simply agree,
+   which they do, at 10.
+
+   Standing totals for this item: 74 synthesized spend cases, 95
+   rule-targeted mutations, 7,805 interpreter probes, zero divergences, on
+   top of the real-spend corpus. Three consensus bugs found by this method in
+   total, all in the accept direction, none reachable by sampling real blocks.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
-4. **A full replay to tip, clean** — necessary, and demonstrably not
-   sufficient.
-5. **Serving at tip without crashing**, which has never happened.
+4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the
+   full-verification rebuild reached the live tip.** Necessary, and — as
+   this document said — demonstrably not sufficient, which is why item 1
+   mattered more.
+5. ~~**Serving at tip without crashing**, which has never happened.~~
+   **Happening (2026-08-25): the node serves at tip and follows the network,
+   through multiple deliberate restarts and one live incident (#46, a
+   duplicate-append race) in which the daemon did NOT crash — the verify
+   layer refused the bad block and the node kept serving in a bounded
+   degraded loop until the one-block remedy.** The honest residue: hours of
+   at-tip service so far, not months.
 
 ## 6. Summary judgement
 
@@ -186,8 +335,11 @@ implementation, having been 5.5× behind two days earlier. The verification
 architecture handles the whole modern chain — segwit, taproot, script-path
 spends at inscription scale — on real data.
 
-But **"can it replace Bitcoin Core" is not a close question today**: no mining,
-no PSBT, no wallets, no testnet, no light-client indexes, a read-plus-submit RPC surface (Core-parity blockchain/util/live-node queries, a descriptor engine, and a sendrawtransaction relay path, but no mining/wallet RPCs),
+But **"can it replace Bitcoin Core" is not a close question today**: no
+multiwallet/descriptor wallets, no testnet, no light-client indexes, an RPC
+surface that (as of 2026-08-25) now spans blockchain/util/live-node/mempool/
+mining/PSBT/submit but still lacks the wallet-management tranche and
+RPC-side spending,
 and a node that until today crashed the first time a peer pushed it a block.
 And **"is it consensus-correct" is an open question**, not a settled one, with
 at least eight known chain-split-direction defects found so far (incidents

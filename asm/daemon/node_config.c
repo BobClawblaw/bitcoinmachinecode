@@ -267,8 +267,16 @@ long node_config_load(const char* path){
          * changes nothing must say so on every boot, not be quietly ignored
          * alongside genuinely foreign keys like rpcuser. */
         else if(!strcmp(key,"txindex")){
-            if(iv) fprintf(stderr,"[config] txindex=1 IGNORED -- this node has no txid->block index; "
-                                  "getrawtransaction by txid alone will not work\n"); }
+            /* The index EXISTS as of 2026-08-26, but it is built OFFLINE by
+             * daemon/build_tx_index -- this daemon does not maintain it. So
+             * the flag still changes nothing, and still says so: what it
+             * would mean in Core (the node builds and keeps it current) is
+             * not what happens here. getrawtransaction picks the file up on
+             * its own when it is present, with or without this key. */
+            if(iv) fprintf(stderr,"[config] txindex=1 has no effect -- the txid index is built "
+                                  "OFFLINE (daemon/build_tx_index <datadir>) and is used "
+                                  "automatically when txindex.dat is present; this daemon "
+                                  "does not build or update it\n"); }
         else if(!strcmp(key,"assumevalid")){
             fprintf(stderr,"[config] assumevalid IGNORED -- block connection performs no script/signature "
                            "verification (cons_verify checks PoW, parsing, coinbase and merkle root only), "
@@ -288,6 +296,11 @@ long node_config_load(const char* path){
             else if(cfg_addlist(g_cfg.connectn,&g_cfg.n_connect,val,key,&bad)){
                 g_cfg.connect_only = 1; applied++;
             } }
+        else if(!strcmp(key,"signer")){
+            /* Core: the external signer command (HWI). Stored verbatim; the
+             * RPC layer shells out to it for enumeratesigners /
+             * walletdisplayaddress. */
+            snprintf(g_cfg.signer, sizeof g_cfg.signer, "%s", val); applied++; }
         else if(!strcmp(key,"blocksonly")){
             /* Core: do not participate in tx relay. We honour it by setting
              * relay=0 on ordinary outbound legs too, which is what the flag

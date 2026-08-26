@@ -49,6 +49,10 @@
  */
 #include "rpc_chain.h"
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
+#include "script_flags_consts.h"
+#include "block_filter.h"   /* BIP158 basic filters, Core-byte-validated */  /* buried-deployment heights, generated from
+                                   * Core's chainparams -- the SAME parse the
+                                   * script-flag path assembles against */
 #include "mempool_entry.h"
 #include "rpc_commands.h"
 #include "version_gen.h"
@@ -60,6 +64,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <signal.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1247,6 +1252,100 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     return 1;
 }
 
+/* ==== the txid index (daemon/build_tx_index.c) ===========================
+ * mmap'd read-only; absent is simply "no index", never an error. Records are
+ * 20 bytes sorted by an 8-byte txid PREFIX, with a sparse index every 256th
+ * record -- see the builder for why the key is truncated and why that is
+ * exact rather than probabilistic: a lookup reads every record sharing the
+ * prefix, pulls that transaction out of the archive, recomputes its txid and
+ * compares all 32 bytes. A prefix collision costs one extra read and is then
+ * rejected; it can never return the wrong transaction. */
+#define TXI_HDR    48
+#define TXI_REC    20
+#define TXI_SPARSE 16
+
+static const u8* g_txi;            /* mmap base, or NULL */
+static u64 g_txi_n, g_txi_sparse_off, g_txi_nsparse;
+static long g_txi_from = -1, g_txi_to = -1;
+
+/* Latches on SUCCESS, not on the first attempt: an index built while the
+ * node is running is then picked up on the next lookup instead of needing a
+ * restart. A failed open is one ENOENT syscall and only happens while there
+ * is no index at all, so the retry costs nothing worth measuring. */
+static void txi_open(void){
+    if (g_txi) return;
+    int fd = open("txindex.dat", O_RDONLY);
+    if (fd < 0) return;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size < TXI_HDR){ close(fd); return; }
+    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return;
+    const u8* b = m;
+    if (memcmp(b, "BMCTXIDX", 8)){ munmap(m, (size_t)sb.st_size); return; }
+    u64 n = 0, so = 0, ns = 0;
+    for (int i = 0; i < 8; i++) n  |= (u64)b[8+i]  << (8*i);
+    for (int i = 0; i < 8; i++) so |= (u64)b[16+i] << (8*i);
+    for (int i = 0; i < 8; i++) ns |= (u64)b[24+i] << (8*i);
+    u32 f = 0, t = 0;
+    for (int i = 0; i < 4; i++) f |= (u32)b[32+i] << (8*i);
+    for (int i = 0; i < 4; i++) t |= (u32)b[36+i] << (8*i);
+    /* a header that describes more than the file holds is a torn build */
+    if (so + ns * TXI_SPARSE > (u64)sb.st_size || TXI_HDR + n * TXI_REC != so){
+        munmap(m, (size_t)sb.st_size); return; }
+    g_txi = b; g_txi_n = n; g_txi_sparse_off = so; g_txi_nsparse = ns;
+    g_txi_from = (long)f; g_txi_to = (long)t;
+    fprintf(stderr, "[txindex] %llu records, heights [%ld,%ld]\n",
+            (unsigned long long)n, g_txi_from, g_txi_to);
+}
+
+/* Look a WIRE-order txid up. Returns 1 and fills height/offset/len, or 0. */
+static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
+    txi_open();
+    if (!g_txi || !g_txi_n) return 0;
+    const u8* recs = g_txi + TXI_HDR;
+    const u8* sp   = g_txi + g_txi_sparse_off;
+    /* binary search the sparse index for the last sample <= our prefix */
+    u64 lo = 0, hi = g_txi_nsparse ? g_txi_nsparse - 1 : 0, start = 0;
+    while (g_txi_nsparse && lo <= hi){
+        u64 mid = lo + (hi - lo) / 2;
+        int c = memcmp(sp + mid * TXI_SPARSE, txid_wire, 8);
+        if (c <= 0){
+            u64 off = 0;
+            for (int i = 0; i < 8; i++) off |= (u64)sp[mid*TXI_SPARSE + 8 + i] << (8*i);
+            start = (off - TXI_HDR) / TXI_REC;
+            lo = mid + 1;
+        } else {
+            if (mid == 0) break;
+            hi = mid - 1;
+        }
+    }
+    static u8 txbuf[4u << 20];
+    static u8 scratch[4u << 20];
+    for (u64 i = start; i < g_txi_n; i++){
+        const u8* r = recs + i * TXI_REC;
+        int c = memcmp(r, txid_wire, 8);
+        if (c < 0) continue;
+        if (c > 0) break;                      /* past the prefix group */
+        u32 hh = 0, off = 0, ln = 0;
+        for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
+        for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
+        for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
+        /* VERIFY: read the transaction and compare the FULL txid. This is
+         * what makes an 8-byte key exact -- a colliding prefix is rejected
+         * here rather than returned as a wrong answer. */
+        long blen = read_block((long)hh);
+        if (blen < 81 || (u64)off + ln > (u64)blen || ln > sizeof txbuf) continue;
+        memcpy(txbuf, g_blockbuf + off, ln);
+        u8 got[32];
+        if (tx_txid(got, txbuf, ln, scratch, sizeof scratch) != 1) continue;
+        if (memcmp(got, txid_wire, 32)) continue;      /* prefix collision */
+        *h_out = (long)hh; *off_out = off; *len_out = ln;
+        return 1;
+    }
+    return 0;
+}
+
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
@@ -1255,20 +1354,57 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
     if (strcmp(txs, GENESIS_CB_TXID) == 0){ *ec = -5; *em = "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"; return 0; }
     int verbosity = param_verbosity(params, 1, 0, ec, em);
     if (verbosity == -999) return 0;
+    /* The transaction is located either from the caller's blockhash or from
+     * the txid index; from there ONE render path serves both, so the two
+     * cannot drift in what they emit. `known_off` is the index's byte offset
+     * (-1 when we must scan the block for it). */
+    long h = -1, known_off = -1;
+    static char bs_buf[65];
+    const char* bs = NULL;
     if (!param_present(params, 2)){
-        *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
-        return 0;
+        u8 want_wire[32];
+        for (int i = 0; i < 32; i++) want_wire[i] = want_disp[31-i];
+        long th; u32 toff, tlen;
+        if (txi_lookup(want_wire, &th, &toff, &tlen)){
+            h = th; known_off = (long)toff; (void)tlen;
+            u8 rec[48];
+            if (read_idx_rec(h, rec)){ hex_rev(bs_buf, rec, 32); bs = bs_buf; }
+        } else {
+            txi_open();
+            static char nomsg[288];
+            if (g_txi){
+                /* An index EXISTS and does not hold it. Say which heights it
+                 * covers: "not found" from a PARTIAL index is a different
+                 * fact from "not found" on the whole chain, and a caller who
+                 * cannot tell them apart will draw the wrong conclusion. */
+                snprintf(nomsg, sizeof nomsg,
+                         "No such transaction. The txid index covers heights %ld..%ld; "
+                         "if the transaction is outside that range, rebuild the index "
+                         "over it or pass the block hash.", g_txi_from, g_txi_to);
+                *ec = -5; *em = nomsg; return 0;
+            }
+            *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
+            return 0;
+        }
+    } else {
+        bs = rpc_param_str(params, 2, ec, em); if (!bs) return 0;
+        u8 bdisp[32]; if (!parse_hash_param(bs, 3, bdisp, ec, em)) return 0;
+        if (!height_by_hash(bdisp, &h)){ *ec = -5; *em = "Block hash not found"; return 0; }
     }
-    const char* bs = rpc_param_str(params, 2, ec, em); if (!bs) return 0;
-    u8 bdisp[32]; if (!parse_hash_param(bs, 3, bdisp, ec, em)) return 0;
-    long h;
-    if (!height_by_hash(bdisp, &h)){ *ec = -5; *em = "Block hash not found"; return 0; }
+    if (!bs){ *ec = -1; *em = "Block not available"; return 0; }
     long len = read_block(h);
     if (len < 0){ *ec = -1; *em = "Block not available"; return 0; }
     const u8* blk = g_blockbuf; const u8* end = blk + len;
     u8 want[32]; for (int i = 0; i < 32; i++) want[i] = want_disp[31-i];
     u64 c; u64 ntx = read_varint(blk + 80, end, &c);
     const u8* p = blk + 80 + c;
+    if (known_off > 0 && known_off < len){
+        /* the index already knows where it is: start there and stop after
+         * one transaction. The txid is still recomputed and compared below,
+         * so a stale or wrong index entry cannot return the wrong tx. */
+        p = blk + known_off;
+        ntx = 1;
+    }
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)) break;
@@ -1534,6 +1670,7 @@ static int ds_p2sh_addr(const u8* s, size_t n, char* out, long cap){
 }
 
 static int desc_checksum(const char* span, char out[9]);   /* defined below */
+int rpc_chain_desc_checksum(const char* span, char out[9]){ return desc_checksum(span, out); }
 
 /* InferDescriptor for a bare scriptPubKey with no keystore (Core
  * descriptor.cpp InferScript fallbacks): pk()/multi() when the key material is
@@ -1749,7 +1886,8 @@ static int desc_parse_core(const char* core, desc_t* d, long* ec, const char** e
     else if (!strncmp(core,"tr(",3) && core[L-1]==')'){ d->script=DSC_TR; inner=core+3; ilen=L-4; }
     else if (!strncmp(core,"addr(",5) && core[L-1]==')'){ d->script=DSC_ADDR; inner=core+5; ilen=L-6; }
     else if (!strncmp(core,"raw(",4) && core[L-1]==')'){ d->script=DSC_RAW; inner=core+4; ilen=L-5; }
-    else { *ec=-5; *em="Invalid descriptor function"; return 0; }
+    else { snprintf(perr, sizeof perr, "'%s' is not a valid descriptor function", core);
+           *ec=-5; *em=perr; return 0; }   /* Core's exact message shape */
 
     /* addr()/raw(): the content is an address or a raw hex script, not a key. */
     if (d->script==DSC_ADDR){
@@ -2196,12 +2334,857 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     return 1;
 }
 
+/* ==== the remaining Blockchain category (2026-08-25) =====================
+ * Same rule as the network and wallet slices: real state, or Core's exact
+ * answer for this node's situation, or an explicit refusal naming the gap.
+ * Shapes taken off the running oracle, not from memory. */
+
+/* ---- getchainstates -----------------------------------------------------
+ * Core reports one entry per chainstate; a node with no assumeutxo snapshot
+ * loaded has exactly one, which is this node's permanent condition (there is
+ * no snapshot loader -- see loadtxoutset below). So the single-element array
+ * is the complete answer, not a first element. */
+static int cmd_getchainstates(rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    u8 hdr[80]; if (read_block_prefix(tip, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
+    u8 rec[48]; read_idx_rec(tip, rec);
+    char hx[65];
+    long hh = headers_height(tip);
+    rj_val* cs = rj_obj();
+    rj_obj_set(cs, "blocks", rj_numf("%ld", tip));
+    hex_rev(hx, rec, 32); rj_obj_set(cs, "bestblockhash", rj_str(hx));
+    u32 bits = rd32(hdr + 72);
+    rj_obj_set(cs, "bits", rj_strf("%08x", bits));
+    target_hex(bits, hx); rj_obj_set(cs, "target", rj_str(hx));
+    rj_obj_set(cs, "difficulty", rj_double(difficulty_of(bits)));
+    double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
+    if (prog > 1.0) prog = 1.0;
+    rj_obj_set(cs, "verificationprogress", rj_double(prog));
+    /* coins_db_cache_bytes / coins_tip_cache_bytes are Core's LevelDB and
+     * in-memory coin cache sizes. This node has neither -- its UTXO set is
+     * an LSM with its own sizing -- so the fields are OMITTED rather than
+     * filled with a number that would describe a cache that does not exist. */
+    rj_obj_set(cs, "validated", rj_bool(1));
+    rj_val* arr = rj_arr(); rj_arr_push(arr, cs);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "headers", rj_numf("%ld", hh));
+    rj_obj_set(o, "chainstates", arr);
+    *res = o;
+    return 1;
+}
+
+/* ---- getdeploymentinfo --------------------------------------------------
+ * The heights come from script_flags_consts.h, which validation/
+ * gen_script_flags.py generates from Core's own kernel/chainparams.cpp --
+ * the SAME parse that produces the .inc the script-flag path assembles
+ * against. So this reports what the node actually ENFORCES; it cannot drift
+ * from consensus behaviour by being edited on its own, and a Core upgrade
+ * that moved a height would move both together.
+ *
+ * P2SH, WITNESS and TAPROOT are not listed: Core buries them at height 0
+ * unconditionally (with two by-hash exceptions), and this Core reports
+ * exactly the five below. */
+static void gdi_dep(rj_val* o, const char* name, long h, long tip){
+    rj_val* d = rj_obj();
+    rj_obj_set(d, "type", rj_str("buried"));
+    rj_obj_set(d, "active", rj_bool(tip + 1 >= h));   /* active AT the next block */
+    rj_obj_set(d, "height", rj_numf("%ld", h));
+    rj_obj_set(o, name, d);
+}
+
+static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    /* Core takes an optional blockhash; default is the tip. */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR){
+        long h;
+        if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+        tip = h;
+    }
+    u8 rec[48]; if (!read_idx_rec(tip, rec)){ *ec = -1; *em = "Block not available"; return 0; }
+    char hx[65]; hex_rev(hx, rec, 32);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "hash", rj_str(hx));
+    rj_obj_set(o, "height", rj_numf("%ld", tip));
+    /* script_flags: the flags this node applies to the NEXT block, in Core's
+     * sorted order. P2SH/WITNESS/TAPROOT are unconditional here. */
+    rj_val* sf = rj_arr();
+    long next = tip + 1;
+    if (next >= SFC_HEIGHT_CLTV)   rj_arr_push(sf, rj_str("CHECKLOCKTIMEVERIFY"));
+    if (next >= SFC_HEIGHT_CSV)    rj_arr_push(sf, rj_str("CHECKSEQUENCEVERIFY"));
+    if (next >= SFC_HEIGHT_DERSIG) rj_arr_push(sf, rj_str("DERSIG"));
+    if (next >= SFC_HEIGHT_SEGWIT) rj_arr_push(sf, rj_str("NULLDUMMY"));
+    rj_arr_push(sf, rj_str("P2SH"));
+    rj_arr_push(sf, rj_str("TAPROOT"));
+    if (next >= SFC_HEIGHT_SEGWIT) rj_arr_push(sf, rj_str("WITNESS"));
+    rj_obj_set(o, "script_flags", sf);
+    rj_val* dep = rj_obj();
+    gdi_dep(dep, "bip34",  SFC_HEIGHT_BIP34,  tip);
+    gdi_dep(dep, "bip66",  SFC_HEIGHT_DERSIG, tip);
+    gdi_dep(dep, "bip65",  SFC_HEIGHT_CLTV,   tip);
+    gdi_dep(dep, "csv",    SFC_HEIGHT_CSV,    tip);
+    gdi_dep(dep, "segwit", SFC_HEIGHT_SEGWIT, tip);
+    rj_obj_set(o, "deployments", dep);
+    *res = o;
+    return 1;
+}
+
+/* ---- getchaintxstats ----------------------------------------------------
+ * The window figures are a cheap scan: only the tx-count varint that follows
+ * each 80-byte header is needed, so this reads ~89 bytes per block, not the
+ * blocks themselves.
+ *
+ * `txcount` is the CUMULATIVE count to the tip, which Core keeps in its
+ * block index (nChainTx) and this node does not store anywhere. It is
+ * computed here by the same cheap prefix scan over the whole chain and
+ * cached against the tip, so the first call pays for it once. If ANY height
+ * is unreadable -- a pruned or holed archive -- the field is omitted rather
+ * than reported low: a short count that looks like a real one is worse than
+ * an absent one, because the caller cannot tell the difference. */
+static long gcts_txn_at(long h){
+    u8 pre[89];
+    if (read_block_prefix(h, pre, sizeof pre) != 1) return -1;
+    u64 c; u64 n = read_varint(pre + 80, pre + sizeof pre, &c);
+    if (c == 0) return -1;
+    return (long)n;
+}
+
+static int cmd_getchaintxstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long final_h = tip;
+    if (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+        params->items[1]->typ == RJ_STR){
+        if (!lookup_block_param(params, 1, 2, &final_h, ec, em)) return 0;
+    }
+    /* Core's default window is one month of blocks, clamped to the chain. */
+    long window = 30L * 24 * 60 * 60 / 600;          /* 4320 */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_NUM){
+        window = atol(params->items[0]->str);
+        if (window < 0 || window > final_h){
+            *ec = -8; *em = "Invalid block count: should be between 0 and the block's height - 1";
+            return 0; }
+    }
+    if (window > final_h) window = final_h;
+
+    u8 hdr[80];
+    if (read_block_prefix(final_h, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
+    u32 final_time = rd32(hdr + 68);
+    u8 rec[48]; read_idx_rec(final_h, rec);
+    char hx[65]; hex_rev(hx, rec, 32);
+
+    long long win_tx = 0; int win_ok = 1;
+    for (long h = final_h - window + 1; h <= final_h && window > 0; h++){
+        long n = gcts_txn_at(h);
+        if (n < 0){ win_ok = 0; break; }
+        win_tx += n;
+    }
+    long win_interval = 0;
+    if (window > 0){
+        u8 h0[80];
+        if (read_block_prefix(final_h - window, h0, 80) == 1)
+            win_interval = (long)final_time - (long)rd32(h0 + 68);
+    }
+
+    /* cumulative count, cached per tip */
+    static long  gcts_cached_h = -1;
+    static long long gcts_cached_n = -1;
+    long long total = -1;
+    if (gcts_cached_h == final_h) total = gcts_cached_n;
+    else {
+        long long acc = 0; int ok = 1;
+        for (long h = 0; h <= final_h; h++){
+            long n = gcts_txn_at(h);
+            if (n < 0){ ok = 0; break; }
+            acc += n;
+        }
+        if (ok){ total = acc; gcts_cached_h = final_h; gcts_cached_n = acc; }
+    }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "time", rj_numf("%u", final_time));
+    /* omitted when the archive could not be walked end to end -- see above */
+    if (total >= 0) rj_obj_set(o, "txcount", rj_numf("%lld", total));
+    rj_obj_set(o, "window_final_block_hash", rj_str(hx));
+    rj_obj_set(o, "window_final_block_height", rj_numf("%ld", final_h));
+    rj_obj_set(o, "window_block_count", rj_numf("%ld", window));
+    if (window > 0){
+        rj_obj_set(o, "window_interval", rj_numf("%ld", win_interval));
+        if (win_ok){
+            rj_obj_set(o, "window_tx_count", rj_numf("%lld", win_tx));
+            if (win_interval > 0)
+                rj_obj_set(o, "txrate", rj_double((double)win_tx / (double)win_interval));
+        }
+    }
+    *res = o;
+    return 1;
+}
+
+/* ---- verifychain --------------------------------------------------------
+ * Core's checklevels are cumulative: 0 read from disk, 1 verify block
+ * validity, 2 verify undo data, 3 disconnect, 4 reconnect. This node
+ * implements 0-2 for real -- it reads each block, recomputes its header
+ * hash and checks it against the index, checks the PoW against the header's
+ * own bits, recomputes the merkle root from the transactions, and (level 2)
+ * requires the undo file to be present and non-empty.
+ *
+ * Levels 3 and 4 need a full disconnect/reconnect through the UTXO writer,
+ * which lives in the forked download worker and is not reachable from the
+ * RPC thread. They are REFUSED rather than silently downgraded: verifychain
+ * returns a bare boolean with no room to say "I did less than you asked",
+ * so a `true` from a downgraded level 4 would be a straight untruth. Core's
+ * default checklevel is 3, so a bare `verifychain` gets that refusal, with
+ * the supported range named. */
+static int vc_merkle_ok(const u8* blk, long blen, const u8 want_root[32]){
+    const u8* p = blk + 80; const u8* end = blk + blen;
+    u64 c; u64 ntx = read_varint(p, end, &c);
+    if (c == 0 || ntx == 0 || ntx > 100000) return 0;
+    p += c;
+    u8 (*leaves)[32] = malloc((size_t)ntx * 32);
+    if (!leaves) return 0;
+    u8* scratch = NULL; size_t scap = 0;
+    int ok = 1;
+    for (u64 i = 0; i < ntx; i++){
+        txw_t w;
+        if (!tx_walk(p, end, &w)){ ok = 0; break; }
+        if (w.len > scap){ u8* g = realloc(scratch, w.len); if (!g){ ok = 0; break; } scratch = g; scap = w.len; }
+        if (tx_txid(leaves[i], p, w.len, scratch, w.len) != 1){ ok = 0; break; }
+        p += w.len;
+    }
+    free(scratch);
+    if (ok){
+        u64 n = ntx;
+        while (n > 1){
+            u64 w2 = 0;
+            for (u64 i = 0; i < n; i += 2){
+                u8 pair[64];
+                memcpy(pair, leaves[i], 32);
+                memcpy(pair + 32, leaves[(i + 1 < n) ? i + 1 : i], 32);
+                sha256d(leaves[w2++], pair, 64);
+            }
+            n = w2;
+        }
+        ok = memcmp(leaves[0], want_root, 32) == 0;
+    }
+    free(leaves);
+    return ok;
+}
+
+/* PoW: sha256d(header) <= target(bits), both compared big-endian-wise over
+ * the display order of the hash. */
+static int vc_pow_ok(const u8 hash_wire[32], u32 bits){
+    u8 tgt[32]; target_bytes(bits, tgt);          /* big-endian target */
+    for (int i = 0; i < 32; i++){
+        u8 hb = hash_wire[31 - i];                /* -> big-endian */
+        if (hb < tgt[i]) return 1;
+        if (hb > tgt[i]) return 0;
+    }
+    return 1;                                     /* exactly equal is valid */
+}
+
+static int cmd_verifychain(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long level = 3, nblocks = 6;                  /* Core's defaults */
+    if (params && params->typ == RJ_ARR){
+        if (params->nitems >= 1 && params->items[0]->typ == RJ_NUM) level = atol(params->items[0]->str);
+        if (params->nitems >= 2 && params->items[1]->typ == RJ_NUM) nblocks = atol(params->items[1]->str);
+    }
+    if (level < 0 || level > 4){ *ec = -8; *em = "Invalid checklevel: must be 0-4"; return 0; }
+    if (level > 2){
+        *ec = -1;
+        *em = "this node implements verifychain checklevel 0-2 (read, "
+              "header/PoW/merkle, undo data present). Levels 3 and 4 disconnect "
+              "and reconnect blocks through the UTXO writer, which lives in the "
+              "forked download worker and is not reachable from the RPC thread. "
+              "verifychain answers with a bare boolean, so returning true for a "
+              "level it did not perform would be a plain untruth -- pass "
+              "checklevel 2 or lower";
+        return 0;
+    }
+    if (nblocks <= 0 || nblocks > tip + 1) nblocks = tip + 1;
+
+    int ok = 1;
+    for (long h = tip; h > tip - nblocks && h >= 0 && ok; h--){
+        long blen = read_block(h);
+        if (blen < 81){ ok = 0; break; }          /* level 0: readable */
+        if (level >= 1){
+            u8 hash[32]; sha256d(hash, g_blockbuf, 80);
+            u8 rec[48];
+            if (!read_idx_rec(h, rec) || memcmp(hash, rec, 32) != 0){ ok = 0; break; }
+            u32 bits = rd32(g_blockbuf + 72);
+            if (!vc_pow_ok(hash, bits)){ ok = 0; break; }
+            if (!vc_merkle_ok(g_blockbuf, blen, g_blockbuf + 36)){ ok = 0; break; }
+        }
+        if (level >= 2){
+            char up[64]; struct stat ub;
+            snprintf(up, sizeof up, "undo_%ld.dat", h);
+            if (stat(up, &ub) != 0 || ub.st_size <= 0){ ok = 0; break; }
+        }
+    }
+    *res = rj_bool(ok);
+    return 1;
+}
+
+/* ---- waitforblock / waitforblockheight / waitfornewblock ----------------
+ * Real: the tip is polled through the same refresh() every other method
+ * uses, so these see a new block as soon as the index does.
+ *
+ * DOCUMENTED DIVERGENCE: Core treats timeout 0 as "wait indefinitely". This
+ * node's RPC server accepts and services ONE connection at a time on a
+ * single thread (rpc_server.c's server_thread), so an indefinite wait would
+ * wedge every other RPC for as long as no block arrived. The wait is
+ * therefore capped at WFB_CAP_MS. On expiry these return the CURRENT tip,
+ * which is exactly what Core returns when its own timeout expires -- the
+ * result shape is identical; only the ceiling on how long it will wait
+ * differs, and the caller can simply call again. */
+#define WFB_CAP_MS 30000
+
+static void wfb_result(long h, rj_val** res){
+    u8 rec[48]; char hx[65];
+    rj_val* o = rj_obj();
+    if (read_idx_rec(h, rec)){ hex_rev(hx, rec, 32); rj_obj_set(o, "hash", rj_str(hx)); }
+    rj_obj_set(o, "height", rj_numf("%ld", h));
+    *res = o;
+}
+
+/* Poll until `done(tip)`, or the deadline. Returns the tip it stopped at. */
+static long wfb_poll(long timeout_ms, int (*done)(long, const void*), const void* ctx){
+    if (timeout_ms <= 0 || timeout_ms > WFB_CAP_MS) timeout_ms = WFB_CAP_MS;
+    long waited = 0;
+    for (;;){
+        long tip = refresh();
+        if (tip >= 0 && done(tip, ctx)) return tip;
+        if (waited >= timeout_ms) return tip;
+        struct timespec ts = {0, 100L * 1000 * 1000};   /* 100 ms */
+        nanosleep(&ts, NULL);
+        waited += 100;
+    }
+}
+static int wfb_changed(long tip, const void* ctx){ return tip != *(const long*)ctx; }
+static int wfb_atleast(long tip, const void* ctx){ return tip >= *(const long*)ctx; }
+/* ctx is the caller's hash in WIRE order (already reversed from the display
+ * string), matching how index.dat stores it -- comparing a display-order
+ * buffer here would simply never match and the call would always time out. */
+static int wfb_hash_is(long tip, const void* ctx){
+    u8 rec[48];
+    return read_idx_rec(tip, rec) && memcmp(rec, ctx, 32) == 0;
+}
+
+static long wfb_timeout_arg(const rj_val* params, size_t i){
+    if (params && params->typ == RJ_ARR && params->nitems > i &&
+        params->items[i]->typ == RJ_NUM) return atol(params->items[i]->str);
+    return 0;
+}
+
+static int cmd_waitfornewblock(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long start = refresh();
+    if (start < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long tip = wfb_poll(wfb_timeout_arg(params, 0), wfb_changed, &start);
+    wfb_result(tip < 0 ? start : tip, res);
+    return 1;
+}
+
+static int cmd_waitforblockheight(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (refresh() < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_NUM){
+        *ec = -8; *em = "waitforblockheight requires a height"; return 0; }
+    long want = atol(params->items[0]->str);
+    long tip = wfb_poll(wfb_timeout_arg(params, 1), wfb_atleast, &want);
+    wfb_result(tip, res);
+    return 1;
+}
+
+static int cmd_waitforblock(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (refresh() < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    const char* hs = rpc_param_str(params, 0, ec, em); if (!hs) return 0;
+    u8 disp[32], wire[32];
+    if (!parse_hash_param(hs, 1, disp, ec, em)) return 0;
+    for (int i = 0; i < 32; i++) wire[i] = disp[31-i];
+    long tip = wfb_poll(wfb_timeout_arg(params, 1), wfb_hash_is, wire);
+    wfb_result(tip, res);
+    return 1;
+}
+
+/* ==== BIP158 filters: getblockfilter / scanblocks / getdescriptoractivity =
+ * The construction lives in block_filter.c and is validated byte-for-byte
+ * against Core's own filters (tests/test_block_filter.c). What this layer
+ * adds is the DATA: the block from the archive, and the spent-prevout
+ * scripts from undo_<h>.dat via an injected undo_replay -- injected, like
+ * every other cross-module dependency here, so rpc_chain does not pull the
+ * daemon's undo module into every target that links it.
+ *
+ * THE HONEST BOUNDS, stated once here and enforced below:
+ *   - undo files exist only inside the daemon's retention window (~200
+ *     blocks below the tip). A filter for an older block cannot include the
+ *     spent-prevout elements, and a filter missing elements is WRONG -- a
+ *     light client would conclude "nothing relevant here" about a block that
+ *     spends its coins. So getblockfilter refuses outside the window rather
+ *     than serving a filter that lies by omission.
+ *   - the filter HEADER chains from genesis, so computing it needs every
+ *     filter before this one -- unknowable without a full index. The header
+ *     field is OMITTED, never fabricated.
+ *   - scanblocks/getdescriptoractivity walk the BLOCKS directly instead of
+ *     a filter index. Exact (no false positives), and spends are detected
+ *     for outpoints received within the scanned range (the same forward
+ *     walk wallet_scan.c uses); a block that only spends a coin received
+ *     BEFORE the range is not flagged. Each result says what was scanned. */
+typedef int (*ch_undo_cb)(void* ctx, const unsigned char* txid, unsigned int index,
+                          unsigned long long value, unsigned int height, unsigned char is_coinbase,
+                          const unsigned char* script, unsigned short slen);
+static long (*g_undo_replay)(long height, ch_undo_cb cb, void* ctx);
+void rpc_chain_set_undo(long (*replay)(long, ch_undo_cb, void*)){ g_undo_replay = replay; }
+
+#define GBF_MAX_PREV 40000
+typedef struct {
+    bf_script* v;
+    unsigned char (*buf)[128];
+    unsigned long n;
+    int overflow;
+} gbf_ctx;
+
+static int gbf_cb(void* ctxp, const u8* txid, u32 index, u64 value, u32 height,
+                  u8 is_coinbase, const u8* script, unsigned short slen){
+    (void)txid; (void)index; (void)value; (void)height; (void)is_coinbase;
+    gbf_ctx* c = (gbf_ctx*)ctxp;
+    if (c->n >= GBF_MAX_PREV || slen > 128){ c->overflow = 1; return 1; }
+    memcpy(c->buf[c->n], script, slen);
+    c->v[c->n].script = c->buf[c->n];
+    c->v[c->n].len = slen;
+    c->n++;
+    return 1;
+}
+
+static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long h;
+    if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&
+        strcmp(params->items[1]->str, "basic")){
+        *ec = -5; *em = "Unknown filtertype"; return 0; }
+    long blen = read_block(h);
+    if (blen < 81){ *ec = -1; *em = "Block not available"; return 0; }
+    /* the spent-prevout scripts, from undo data */
+    gbf_ctx c;
+    c.v = malloc(GBF_MAX_PREV * sizeof *c.v);
+    c.buf = malloc((size_t)GBF_MAX_PREV * 128);
+    if (!c.v || !c.buf){ free(c.v); free(c.buf); *ec = -7; *em = "oom"; return 0; }
+    c.n = 0; c.overflow = 0;
+    long ur = g_undo_replay ? g_undo_replay(h, gbf_cb, &c) : -1;
+    /* h == 0 is the one height with legitimately no undo data (the genesis
+     * coinbase spends nothing), so an absent file there is not a gap */
+    if ((ur < 0 && h != 0) || c.overflow){
+        free(c.v); free(c.buf);
+        *ec = -1;
+        *em = ur < 0
+            ? "no undo data for this block: it is outside the daemon's undo "
+              "retention window (~200 blocks below the tip). A filter built "
+              "without the spent-prevout scripts would be missing elements, and "
+              "a light client would wrongly conclude the block does not touch "
+              "its coins -- so no filter is served rather than a wrong one"
+            : "this block's undo data exceeds the filter builder's bounds";
+        return 0;
+    }
+    unsigned char hash[32]; sha256d(hash, g_blockbuf, 80);
+    static unsigned char flt[1 << 20];
+    long fl = bf_basic_build(g_blockbuf, (unsigned long)blen, hash,
+                             c.v, c.n, flt, sizeof flt);
+    free(c.v); free(c.buf);
+    if (fl < 0){ *ec = -1; *em = "filter construction failed"; return 0; }
+    char* hx = malloc((size_t)fl * 2 + 1);
+    if (!hx){ *ec = -7; *em = "oom"; return 0; }
+    for (long i = 0; i < fl; i++){
+        static const char* H = "0123456789abcdef";
+        hx[i*2] = H[flt[i]>>4]; hx[i*2+1] = H[flt[i]&15];
+    }
+    hx[fl*2] = 0;
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "filter", rj_str(hx));
+    free(hx);
+    /* header: chains from genesis; unknowable without every prior filter.
+     * OMITTED -- a fabricated chain head would poison every later link. */
+    *res = o;
+    return 1;
+}
+
+/* ---- scanblocks / getdescriptoractivity ---------------------------------
+ * Direct block walk. The scan objects are expanded to concrete scriptPubKeys
+ * through the SAME expansion cmd_scantxoutset uses (scan_expand_objects), so
+ * addr()/raw()/wpkh()/ranged descriptors behave identically across the two. */
+#define SB_MAX_OWN  65536
+
+typedef struct { unsigned char txid[32]; unsigned int vout; } sb_op;
+
+/* Scan ONE block, sharing the caller's matched-outpoint set so a spend of a
+ * coin received in an earlier scanned block is recognised. */
+static int sb_scan_block(long h,
+                         unsigned char (*spks)[128], unsigned int* spklens, int nspk,
+                         sb_op* own, unsigned long* nown_io,
+                         rj_val* hits_arr, rj_val* activity_arr,
+                         long* ec, const char** em){
+    unsigned long nown = *nown_io;
+    static const char* HEXC = "0123456789abcdef";
+    static char sberr[128];
+    {
+        long blen = read_block(h);
+        if (blen < 81){
+            snprintf(sberr, sizeof sberr, "block %ld could not be read; the scan would be incomplete", h);
+            *ec = -1; *em = sberr; return 0;
+        }
+        unsigned char bh[32]; sha256d(bh, g_blockbuf, 80);
+        int block_hit = 0;
+        const u8* p = g_blockbuf + 80;
+        const u8* end = g_blockbuf + blen;
+        u64 cc;
+        u64 ntx = read_varint(p, end, &cc);
+        if (cc == 0){ *ec = -1; *em = "malformed block"; return 0; }
+        p += cc;
+        for (u64 t = 0; t < ntx; t++){
+            txw_t w;
+            if (!tx_walk(p, end, &w)){ *ec = -1; *em = "malformed tx"; return 0; }
+            u8 txid[32];
+            { u8* scratch = malloc(w.len ? w.len : 1);
+              if (scratch){ tx_txid(txid, p, w.len, scratch, w.len); free(scratch); }
+              else memset(txid, 0, 32); }
+            /* inputs: a spend of an outpoint matched earlier in this range */
+            { const u8* q = w.vin;
+              u64 n_in = read_varint(q, end, &cc); q += cc;
+              for (u64 i = 0; i < n_in; i++){
+                  unsigned int vo = (unsigned int)q[32] | ((unsigned int)q[33]<<8) |
+                                    ((unsigned int)q[34]<<16) | ((unsigned int)q[35]<<24);
+                  for (unsigned long k = 0; k < nown; k++)
+                      if (own[k].vout == vo && !memcmp(own[k].txid, q, 32)){
+                          block_hit = 1;
+                          if (activity_arr){
+                              rj_val* e = rj_obj();
+                              rj_obj_set(e, "type", rj_str("spend"));
+                              rj_obj_set(e, "height", rj_numf("%ld", h));
+                              char hx[65];
+                              for (int b2 = 0; b2 < 32; b2++){ unsigned char v2 = txid[31-b2];
+                                  hx[b2*2]=HEXC[v2>>4]; hx[b2*2+1]=HEXC[v2&15]; }
+                              hx[64]=0;
+                              rj_obj_set(e, "txid", rj_str(hx));
+                              rj_arr_push(activity_arr, e);
+                          }
+                          break;
+                      }
+                  u64 sl = read_varint(q + 36, end, &cc);
+                  q += 36 + cc + sl + 4;
+              } }
+            /* outputs paying a watched script */
+            { const u8* q = w.vout;
+              u64 n_out = read_varint(q, end, &cc); q += cc;
+              for (u64 i = 0; i < n_out; i++){
+                  u64 val = 0;
+                  for (int b2 = 0; b2 < 8; b2++) val |= (u64)q[b2] << (8*b2);
+                  q += 8;
+                  u64 sl = read_varint(q, end, &cc); q += cc;
+                  const u8* spk = q; q += sl;
+                  for (int k = 0; k < nspk; k++){
+                      if ((u64)spklens[k] != sl || memcmp(spks[k], spk, sl)) continue;
+                      block_hit = 1;
+                      if (nown < SB_MAX_OWN){
+                          memcpy(own[nown].txid, txid, 32);
+                          own[nown].vout = (unsigned int)i;
+                          nown++;
+                      }
+                      if (activity_arr){
+                          rj_val* e = rj_obj();
+                          rj_obj_set(e, "type", rj_str("receive"));
+                          rj_obj_set(e, "height", rj_numf("%ld", h));
+                          char hx[65];
+                          for (int b2 = 0; b2 < 32; b2++){ unsigned char v2 = txid[31-b2];
+                              hx[b2*2]=HEXC[v2>>4]; hx[b2*2+1]=HEXC[v2&15]; }
+                          hx[64]=0;
+                          rj_obj_set(e, "txid", rj_str(hx));
+                          rj_obj_set(e, "vout", rj_numf("%llu", (unsigned long long)i));
+                          { char am[32]; rpc_amounts((long long)val, am, sizeof am);
+                            rj_obj_set(e, "amount", rj_numf("%s", am)); }
+                          rj_arr_push(activity_arr, e);
+                      }
+                      break;
+                  }
+              } }
+            p += w.len;
+        }
+        if (block_hit && hits_arr){
+            char hx[65];
+            for (int b2 = 0; b2 < 32; b2++){ unsigned char v2 = bh[31-b2];
+                hx[b2*2]=HEXC[v2>>4]; hx[b2*2+1]=HEXC[v2&15]; }
+            hx[64]=0;
+            rj_arr_push(hits_arr, rj_str(hx));
+        }
+    }
+    *nown_io = nown;
+    return 1;
+}
+
+static int sb_scan_range(long from, long to,
+                         unsigned char (*spks)[128], unsigned int* spklens, int nspk,
+                         rj_val* hits_arr, rj_val* activity_arr,
+                         long* ec, const char** em){
+    sb_op* own = malloc((size_t)SB_MAX_OWN * sizeof *own);
+    if (!own){ *ec = -7; *em = "oom"; return 0; }
+    unsigned long nown = 0;
+    for (long h = from; h <= to; h++)
+        if (!sb_scan_block(h, spks, spklens, nspk, own, &nown, hits_arr, activity_arr, ec, em)){
+            free(own); return 0; }
+    free(own);
+    return 1;
+}
+
+/* Defined with cmd_scantxoutset below; identical redefinition there is
+ * permitted by C and keeps the two textually adjacent uses in sync. */
+#define SCAN_MAX_TARGETS 4096
+static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlens,
+                               int cap, int* ntgt_io, long* ec, const char** em);
+
+/* scanblocks "start" [scanobjects] ( start_height stop_height ) --
+ * a direct, EXACT walk over the blocks in range rather than a probabilistic
+ * filter-index match (no false positives to re-check). DOCUMENTED
+ * DIVERGENCES from Core's filter-backed form, also stated in the result:
+ * spends are recognised for outpoints received WITHIN the scanned range (the
+ * same forward walk wallet_scan.c uses); a block that only spends a coin
+ * received before the range is not flagged. The walk reads every block, so
+ * the range is capped where Core's index lookup is not. */
+#define SB_MAX_RANGE 250000
+
+static int cmd_scanblocks(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
+    if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
+    if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
+    if (strcmp(action, "start")){ *ec = -8; *em = "Invalid action"; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    long tip = refresh();
+    if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    long from = 0, to = tip;
+    if (params->nitems >= 3 && params->items[2]->typ == RJ_NUM) from = atol(params->items[2]->str);
+    if (params->nitems >= 4 && params->items[3]->typ == RJ_NUM) to = atol(params->items[3]->str);
+    if (from < 0 || to < from){ *ec = -8; *em = "Invalid height range"; return 0; }
+    if (to > tip) to = tip;
+    if (to - from + 1 > SB_MAX_RANGE){
+        *ec = -8;
+        *em = "range too large: this node scans the blocks themselves (exact, no "
+              "filter index), and this range would read too much. Narrow "
+              "start_height/stop_height";
+        return 0;
+    }
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    if (!scan_expand_objects(params->items[1], targets, tlens, SCAN_MAX_TARGETS, &ntgt, ec, em))
+        return 0;
+    if (!ntgt){ *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    rj_val* hits = rj_arr();
+    if (!sb_scan_range(from, to, targets, tlens, ntgt, hits, NULL, ec, em)){
+        rj_free(hits); return 0; }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "from_height", rj_numf("%ld", from));
+    rj_obj_set(o, "to_height", rj_numf("%ld", to));
+    rj_obj_set(o, "relevant_blocks", hits);
+    rj_obj_set(o, "completed", rj_bool(1));
+    /* the divergence, in the result itself, so a caller who never read the
+     * docs still sees it */
+    rj_obj_set(o, "note",
+        rj_str("exact block scan (not a filter index): spends are detected only "
+               "for outputs received within the scanned range"));
+    *res = o;
+    return 1;
+}
+
+/* getdescriptoractivity [blockhashes] [scanobjects] -- the same walk,
+ * reporting the individual receives and spends instead of block hashes.
+ * The given blocks are scanned in HEIGHT order sharing one matched-outpoint
+ * set, so a spend in a later given block of a coin received in an earlier
+ * given block is recognised. */
+static int cmd_getdescriptoractivity(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 ||
+        params->items[0]->typ != RJ_ARR || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "getdescriptoractivity requires a blockhashes array and a scanobjects array";
+        return 0; }
+    if (refresh() < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
+    const rj_val* bhs = params->items[0];
+    if (bhs->nitems > 1024){ *ec = -8; *em = "too many blocks"; return 0; }
+    long heights[1024]; int nh = 0;
+    for (size_t i = 0; i < bhs->nitems; i++){
+        if (bhs->items[i]->typ != RJ_STR){ *ec = -8; *em = "blockhash must be a string"; return 0; }
+        u8 disp[32];
+        if (!parse_hash_param(bhs->items[i]->str, 1, disp, ec, em)) return 0;
+        long h;
+        if (!height_by_hash(disp, &h)){ *ec = -5; *em = "Block not found"; return 0; }
+        heights[nh++] = h;
+    }
+    /* height order, so the shared outpoint set sees receives before spends */
+    for (int i = 1; i < nh; i++){
+        long k = heights[i]; int j = i - 1;
+        while (j >= 0 && heights[j] > k){ heights[j+1] = heights[j]; j--; }
+        heights[j+1] = k;
+    }
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    if (!scan_expand_objects(params->items[1], targets, tlens, SCAN_MAX_TARGETS, &ntgt, ec, em))
+        return 0;
+    rj_val* act = rj_arr();
+    sb_op* own = malloc((size_t)SB_MAX_OWN * sizeof *own);
+    if (!own){ rj_free(act); *ec = -7; *em = "oom"; return 0; }
+    unsigned long nown = 0;
+    for (int i = 0; i < nh; i++)
+        if (!sb_scan_block(heights[i], targets, tlens, ntgt, own, &nown, NULL, act, ec, em)){
+            free(own); rj_free(act); return 0; }
+    free(own);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "activity", act);
+    *res = o;
+    return 1;
+}
+
+/* ---- dumptxoutset --------------------------------------------------------
+ * Streams the live UTXO set to a file in Core's snapshot serialization --
+ * asm/utxo_snapshot.c's encoder, pinned byte-for-byte against a snapshot
+ * the oracle Core actually wrote. The walk itself is the injected runner in
+ * daemon/utxo_setinfo_rpc.c, under the same quiescence discipline as
+ * gettxoutsetinfo (fingerprint before and after; a set that changed mid-walk
+ * discards the file rather than publishing a torn snapshot).
+ *
+ * Only type "latest" is supported: "rollback" reconstructs a historical
+ * state, which is the reorg machinery's job and it lives in the forked
+ * worker. txoutset_hash is OMITTED from the result -- computing it is a
+ * second full walk (gettxoutsetinfo muhash), and gluing a hash from a
+ * different walk onto this file would claim a correspondence nothing
+ * verified. Core's nchaintx is omitted for the same reason (it comes from a
+ * block-index field this node does not keep; getchaintxstats computes it on
+ * request). */
+static long (*g_utxo_dump)(const char*, int (*)(long, unsigned char*),
+                           long*, unsigned long long*, char*, unsigned long);
+void rpc_chain_set_utxodump(long (*run)(const char*, int (*)(long, unsigned char*),
+                                        long*, unsigned long long*, char*, unsigned long)){
+    g_utxo_dump = run;
+}
+
+static int gdump_hash_at(long height, unsigned char out[32]){
+    u8 rec[48];
+    if (!read_idx_rec(height, rec)) return 0;
+    memcpy(out, rec, 32);                       /* index stores wire order */
+    return 1;
+}
+
+static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* path = rpc_param_str(params, 0, ec, em); if (!path) return 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&
+        strcmp(params->items[1]->str, "latest")){
+        *ec = -8;
+        *em = "only type \"latest\" is supported: \"rollback\" reconstructs a "
+              "historical UTXO state, which is the reorg machinery's job and it "
+              "lives in the forked download worker";
+        return 0;
+    }
+    if (!g_utxo_dump){ *ec = -1; *em = "UTXO dump unavailable in this process"; return 0; }
+    long height = 0; unsigned long long coins = 0;
+    static char msg[256];
+    long r = g_utxo_dump(path, gdump_hash_at, &height, &coins, msg, sizeof msg);
+    if (r == 0){ *ec = -1; *em = msg[0] ? msg : "UTXO set busy"; return 0; }
+    if (r != 1){ *ec = -1; *em = msg[0] ? msg : "UTXO dump failed"; return 0; }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "coins_written", rj_numf("%llu", coins));
+    { u8 rec[48]; char hx[65];
+      if (read_idx_rec(height, rec)){ hex_rev(hx, rec, 32); rj_obj_set(o, "base_hash", rj_str(hx)); } }
+    rj_obj_set(o, "base_height", rj_numf("%ld", height));
+    rj_obj_set(o, "path", rj_str(path));
+    *res = o;
+    return 1;
+}
+
+/* ---- refusals -----------------------------------------------------------
+ * Each names the specific thing that is missing, not "unimplemented". */
+#define CH_NO_SNAPSHOT_LOAD \
+    "this node will not load a UTXO snapshot: its UTXO set is built by full " \
+    "validation from genesis, and every parity claim it makes (the muhash " \
+    "match against Core) rests on every coin having been verified locally. " \
+    "Loading foreign state would discard exactly that property, and there is " \
+    "no second chainstate to background-validate it against as Core does. " \
+    "dumptxoutset (the export) is supported"
+#define CH_NO_FORKCHOICE_RPC \
+    "fork choice is owned by the forked download worker (daemon/reorg.c), " \
+    "which is not reachable from the RPC thread; there is no channel for the " \
+    "parent to steer it, so this call would change nothing"
+#define CH_NO_MEMPOOL_FILE \
+    "this node does not persist its mempool: there is no mempool.dat writer " \
+    "or reader, and Core's serialization is not implemented. The pool is " \
+    "rebuilt from the network on restart"
+
+/* ---- submitheader --------------------------------------------------------
+ * Core decodes the header, and if it already knows it, returns null without
+ * doing anything. That case this node can answer exactly: look the hash up
+ * in the index and return null when it is a header we already have.
+ *
+ * A header we do NOT have would have to be added to the chain, and the
+ * header chain belongs to the forked download worker (headers.dat is its
+ * file). There is no channel for the parent to hand it one, so that case is
+ * refused rather than answered with the null that means "accepted". */
+static int cmd_submitheader(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* hx = rpc_param_str(params, 0, ec, em); if (!hx) return 0;
+    if (strlen(hx) != 160 || !is_hex_str(hx)){
+        *ec = -22; *em = "Block header decode failed"; return 0; }
+    u8 hdr[80];
+    for (int i = 0; i < 80; i++){
+        int a = hx[i*2], b = hx[i*2+1];
+        a = (a<='9') ? a-'0' : ((a|32)-'a'+10);
+        b = (b<='9') ? b-'0' : ((b|32)-'a'+10);
+        hdr[i] = (u8)((a<<4)|b);
+    }
+    u8 hash[32]; sha256d(hash, hdr, 80);
+    u8 disp[32]; for (int i = 0; i < 32; i++) disp[i] = hash[31-i];
+    long h;
+    if (height_by_hash(disp, &h)){ *res = rj_null(); return 1; }
+    *ec = -1;
+    *em = "this header is not already in the chain, and adding one is the "
+          "forked download worker's job -- headers.dat is its file and there "
+          "is no parent-to-worker channel for a submitted header. A header "
+          "this node already has returns null, as Core does";
+    return 0;
+}
+
+static int ch_unsupported(const char* msg, long* ec, const char** em){
+    *ec = -1; *em = msg; return 0;
+}
+
+/* Expose the archive to the wallet rescan (rpc_wallet_ops.c). The scan needs
+ * exactly two things -- read a block by height, and know the tip -- and both
+ * already exist here behind the same store handle every chain RPC uses, so
+ * this hands them over rather than opening a second handle on the same
+ * files. Returns < 81 for a height that cannot be read, which the scanner
+ * treats as fatal (a skipped height would understate every total). */
+long rpc_chain_read_block_at(long h, unsigned char* buf, long cap){
+    if (!g_open) return -1;
+    long r = store_read_at(g_st, (unsigned long)h, buf, cap);
+    if (r < 0) return -3;
+    return r;
+}
+long rpc_chain_tip_height(void){ return refresh(); }
+
 /* ---- dispatch ---- */
 static const char* const CHAIN_METHODS[] = {
     "getblockcount","getbestblockhash","getblockhash","getblockheader","getblock",
     "getblockchaininfo","getdifficulty","getrawtransaction","gettxoutproof","verifytxoutproof","decodescript","createmultisig",
-    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","getchaintips","getindexinfo","uptime","stop", NULL
+    "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","scantxoutset","getchaintips","getindexinfo","uptime","stop",
+    /* the rest of Core's Blockchain category (2026-08-25) */
+    "getchainstates","getdeploymentinfo","getchaintxstats","verifychain",
+    "waitforblock","waitforblockheight","waitfornewblock",
+    "getblockfilter","scanblocks","getdescriptoractivity",
+    "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
+    "savemempool","importmempool","submitheader", NULL
 };
+
+const char* rpc_chain_method_at(int i){
+    int n = 0;
+    while (CHAIN_METHODS[n]) n++;
+    return (i >= 0 && i < n) ? CHAIN_METHODS[i] : NULL;
+}
 int rpc_chain_known_method(const char* m){
     for (int i = 0; CHAIN_METHODS[i]; i++) if (!strcmp(m, CHAIN_METHODS[i])) return 1;
     return 0;
@@ -2238,11 +3221,27 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
  * filter cannot match anything either). The block/UTXO index that IS present
  * is core chainstate, not one of getindexinfo's optional indexes. */
 static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
-    (void)params; (void)ec; (void)em;
-    /* Any index_name filter can only fail to match (we have no indexes), and
-     * Core does not type-check the arg -- it simply returns {} regardless
-     * (verified live: `getindexinfo 123` and `getindexinfo {..}` both give {}). */
-    *res = rj_obj();   /* {} -- no optional indexes enabled */
+    (void)ec; (void)em;
+    /* Core does not type-check the arg -- it returns {} for a non-matching
+     * or nonsense filter (verified live: `getindexinfo 123` gives {}). */
+    const char* want = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR) want = params->items[0]->str;
+    rj_val* o = rj_obj();
+    txi_open();
+    if (g_txi && (!want || !strcmp(want, "txindex"))){
+        /* Core reports {synced, best_block_height}. This index is built
+         * offline over a height RANGE, so "synced" means it reaches the tip
+         * -- a partial index reports false with its own best height, which
+         * is the honest reading and what a caller needs to decide whether to
+         * trust a miss. */
+        rj_val* e = rj_obj();
+        long tip = refresh();
+        rj_obj_set(e, "synced", rj_bool(tip >= 0 && g_txi_to >= tip));
+        rj_obj_set(e, "best_block_height", rj_numf("%ld", g_txi_to));
+        rj_obj_set(o, "txindex", e);
+    }
+    *res = o;
     return 1;
 }
 
@@ -2304,6 +3303,177 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
     return 1;
 }
 
+/* ---- scantxoutset ----------------------------------------------------------
+ * action start: expand the scanobjects (descriptor strings or {desc,range})
+ * into concrete scriptPubKeys with the SAME descriptor engine
+ * deriveaddresses uses, hand them to the injected whole-set scanner
+ * (daemon/utxo_setinfo_rpc.c's utxo_scan_rpc_run -- the tool-derived reader
+ * with the fingerprint/quiescence discipline), and render Core's exact
+ * result shape. Scans here are SYNCHRONOUS (the walk takes ~90s), so
+ * "status" is always null and "abort" always false, exactly what Core
+ * answers when no scan is in progress. Checksums on scan descriptors are
+ * optional (verified when present), unlike deriveaddresses.
+ * height/confirmations are relative to the UTXO APPLIED height -- the state
+ * that was scanned. */
+typedef struct {
+    unsigned char txid[32]; unsigned int vout;
+    unsigned long long value; unsigned long long height; int coinbase;
+    unsigned char spk[128]; unsigned int spklen;
+} rpc_scan_hit_t;
+static long (*g_scan_run)(const unsigned char*, const unsigned int*, int,
+                          void*, long, long*, long*, unsigned long long*,
+                          unsigned long long*, int*, char*, unsigned long);
+void rpc_chain_set_utxoscan(long (*run)(const unsigned char*, const unsigned int*, int,
+                                        void*, long, long*, long*, unsigned long long*,
+                                        unsigned long long*, int*, char*, unsigned long)){
+    g_scan_run = run;
+}
+#define SCAN_MAX_TARGETS 4096
+#define SCAN_MAX_HITS    32768
+/* spk for descriptor d at index i (i ignored for un-ranged). 1 ok / 0 fail. */
+static int desc_spk_at(const desc_t* d, long i, u8 spk[128], u32* spklen,
+                       long* ec, const char** em){
+    if (d->script==DSC_ADDR || d->script==DSC_RAW){
+        if (d->spklen > 128){ *ec=-5; *em="Descriptor script too large"; return 0; }
+        memcpy(spk, d->spk, d->spklen); *spklen = (u32)d->spklen; return 1;
+    }
+    u8 pub[65]; int pl=0;
+    if (!desc_pub_at(d, i, pub, &pl)){ *ec=-5; *em="Key derivation failed"; return 0; }
+    u8 h[20];
+    switch (d->script){
+    case DSC_PKH:
+        hash160(h, pub, pl);
+        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3,h,20); spk[23]=0x88; spk[24]=0xac;
+        *spklen=25; return 1;
+    case DSC_WPKH:
+        hash160(h, pub, pl);
+        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2,h,20); *spklen=22; return 1;
+    case DSC_SHWPKH: {
+        u8 redeem[22]; hash160(h, pub, pl);
+        redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2,h,20);
+        hash160(h, redeem, 22);
+        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2,h,20); spk[22]=0x87; *spklen=23; return 1; }
+    case DSC_PK:
+        spk[0]=(u8)pl; memcpy(spk+1,pub,(size_t)pl); spk[1+pl]=0xac; *spklen=(u32)(pl+2); return 1;
+    default:
+        *ec=-5; *em="Descriptor type not scannable"; return 0;
+    }
+}
+/* Expand scanobjects (descriptor strings or {desc,range}) into concrete
+ * scriptPubKeys. Shared by scantxoutset, scanblocks and
+ * getdescriptoractivity so the three cannot drift in what they accept. */
+static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlens,
+                               int cap, int* ntgt_io, long* ec, const char** em){
+    static char perr[192];
+    int ntgt = *ntgt_io;
+    for (unsigned long oi = 0; oi < objs->nitems; oi++){
+        const rj_val* ob = objs->items[oi];
+        const char* dstr = 0; long rbegin = 0, rend = -1;
+        if (ob->typ == RJ_STR) dstr = ob->str;
+        else if (ob->typ == RJ_OBJ){
+            rj_val* dv = rj_obj_get((rj_val*)ob, "desc");
+            if (!dv || dv->typ != RJ_STR){ *ec=-8; *em="Descriptor needs to be provided in scan object"; return 0; }
+            dstr = dv->str;
+            rj_val* rv = rj_obj_get((rj_val*)ob, "range");
+            if (rv){
+                if (rv->typ==RJ_NUM){ rbegin=0; rend=(long)strtoll(rv->str,NULL,10); }
+                else if (rv->typ==RJ_ARR && rv->nitems==2 && rv->items[0]->typ==RJ_NUM && rv->items[1]->typ==RJ_NUM){
+                    rbegin=(long)strtoll(rv->items[0]->str,NULL,10);
+                    rend=(long)strtoll(rv->items[1]->str,NULL,10); }
+                else { *ec=-8; *em="Invalid range"; return 0; }
+                if (rbegin<0 || rend<rbegin){ *ec=-8; *em="Invalid range"; return 0; }
+                if (rend-rbegin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
+            }
+        } else { *ec=-8; *em="Invalid scan object"; return 0; }
+        /* checksum optional here (Core scan accepts bare descriptors) */
+        char core[320];
+        { const char* hash = strchr(dstr, '#');
+          size_t cl = hash ? (size_t)(hash-dstr) : strlen(dstr);
+          if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
+          memcpy(core, dstr, cl); core[cl]=0;
+          if (hash){
+              char cks[9];
+              if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
+              if (strlen(hash+1)!=8 || strcmp(hash+1,cks)){
+                  snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
+                  *ec=-5; *em=perr; return 0; } } }
+        desc_t d;
+        if (!desc_parse_core(core, &d, ec, em)) return 0;
+        long lo = 0, hi = 0;
+        if (d.ranged){ lo = rbegin; hi = (rend >= 0) ? rend : 1000; }   /* Core's default range */
+        for (long i = lo; i <= hi; i++){
+            if (ntgt >= cap){ *ec=-8; *em="Too many scan targets"; return 0; }
+            if (!desc_spk_at(&d, i, targets[ntgt], &tlens[ntgt], ec, em)) return 0;
+            ntgt++;
+        }
+    }
+    *ntgt_io = ntgt;
+    return 1;
+}
+
+static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char perr[192];
+    const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
+    if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
+    if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
+    if (strcmp(action, "start")){
+        snprintf(perr, sizeof perr, "Invalid action '%s'", action);
+        *ec = -8; *em = perr; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
+        *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
+    if (!g_scan_run){ *ec = -1; *em = "UTXO scan unavailable in this process"; return 0; }
+
+    static u8 targets[SCAN_MAX_TARGETS][128];
+    static u32 tlens[SCAN_MAX_TARGETS];
+    int ntgt = 0;
+    const rj_val* objs = params->items[1];
+    if (!scan_expand_objects(objs, targets, tlens, SCAN_MAX_TARGETS, &ntgt, ec, em)) return 0;
+    if (!ntgt){ *ec=-8; *em="scanobjects argument is required for the start action"; return 0; }
+
+    static rpc_scan_hit_t hits[SCAN_MAX_HITS];
+    long hits_n = 0, sheight = 0; int overflow = 0;
+    unsigned long long scanned = 0, total_sat = 0;
+    static char msg[256];
+    long r = g_scan_run(&targets[0][0], tlens, ntgt, hits, SCAN_MAX_HITS, &hits_n,
+                        &sheight, &scanned, &total_sat, &overflow, msg, sizeof msg);
+    if (r == 0){ *ec=-1; snprintf(perr,sizeof perr,"%s",msg[0]?msg:"UTXO set busy"); *em=perr; return 0; }
+    if (r != 1){ *ec=-1; snprintf(perr,sizeof perr,"%s",msg[0]?msg:"UTXO scan failed"); *em=perr; return 0; }
+    if (overflow){ *ec=-1; *em="Scan matched more outputs than this node can return"; return 0; }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "success", rj_bool(1));
+    rj_obj_set(o, "txouts", rj_numf("%llu", scanned));
+    rj_obj_set(o, "height", rj_numf("%ld", sheight));
+    { u8 hdr[80]; char hx[65];
+      if (read_block_prefix(sheight, hdr, 80) == 1){
+          u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32);
+          rj_obj_set(o, "bestblock", rj_str(hx)); } }
+    rj_val* uns = rj_arr();
+    for (long i = 0; i < hits_n; i++){
+        rpc_scan_hit_t* h = &hits[i];
+        rj_val* e = rj_obj();
+        { char hx[65]; hex_rev(hx, h->txid, 32); rj_obj_set(e, "txid", rj_str(hx)); }
+        rj_obj_set(e, "vout", rj_numf("%u", h->vout));
+        { char* sh2 = malloc((size_t)h->spklen*2+1);
+          if (sh2){ hex_of(sh2, h->spk, h->spklen); rj_obj_set(e, "scriptPubKey", rj_str(sh2)); free(sh2); } }
+        { char* di = desc_inner_of(h->spk, h->spklen); char* dc = desc_with_checksum(di);
+          if (dc){ rj_obj_set(e, "desc", rj_str(dc)); free(dc); } free(di); }
+        rj_obj_set(e, "amount", rj_numf("%llu.%08llu", h->value/100000000ULL, h->value%100000000ULL));
+        rj_obj_set(e, "coinbase", rj_bool(h->coinbase));
+        rj_obj_set(e, "height", rj_numf("%llu", h->height));
+        { u8 hdr[80]; char hx[65];
+          if (read_block_prefix((long)h->height, hdr, 80) == 1){
+              u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32);
+              rj_obj_set(e, "blockhash", rj_str(hx)); } }
+        rj_obj_set(e, "confirmations", rj_numf("%lld", (long long)sheight - (long long)h->height + 1));
+        rj_arr_push(uns, e);
+    }
+    rj_obj_set(o, "unspents", uns);
+    rj_obj_set(o, "total_amount", rj_numf("%llu.%08llu", total_sat/100000000ULL, total_sat%100000000ULL));
+    *res = o;
+    return 1;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
@@ -2326,8 +3496,27 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getmininginfo")) return cmd_getmininginfo(res, ec, em);
     if (!strcmp(m, "getblocktemplate")) return cmd_getblocktemplate(params, res, ec, em);
     if (!strcmp(m, "gettxoutsetinfo")) return cmd_gettxoutsetinfo(params, res, ec, em);
+    if (!strcmp(m, "scantxoutset")) return cmd_scantxoutset(params, res, ec, em);
     if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
     if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
+    if (!strcmp(m, "submitheader")) return cmd_submitheader(params, res, ec, em);
+    if (!strcmp(m, "getchainstates")) return cmd_getchainstates(res, ec, em);
+    if (!strcmp(m, "getdeploymentinfo")) return cmd_getdeploymentinfo(params, res, ec, em);
+    if (!strcmp(m, "getchaintxstats")) return cmd_getchaintxstats(params, res, ec, em);
+    if (!strcmp(m, "verifychain")) return cmd_verifychain(params, res, ec, em);
+    if (!strcmp(m, "waitfornewblock")) return cmd_waitfornewblock(params, res, ec, em);
+    if (!strcmp(m, "waitforblockheight")) return cmd_waitforblockheight(params, res, ec, em);
+    if (!strcmp(m, "waitforblock")) return cmd_waitforblock(params, res, ec, em);
+    if (!strcmp(m, "getblockfilter")) return cmd_getblockfilter(params, res, ec, em);
+    if (!strcmp(m, "scanblocks")) return cmd_scanblocks(params, res, ec, em);
+    if (!strcmp(m, "getdescriptoractivity")) return cmd_getdescriptoractivity(params, res, ec, em);
+    if (!strcmp(m, "dumptxoutset")) return cmd_dumptxoutset(params, res, ec, em);
+    if (!strcmp(m, "loadtxoutset"))
+        return ch_unsupported(CH_NO_SNAPSHOT_LOAD, ec, em);
+    if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
+        return ch_unsupported(CH_NO_FORKCHOICE_RPC, ec, em);
+    if (!strcmp(m, "savemempool") || !strcmp(m, "importmempool"))
+        return ch_unsupported(CH_NO_MEMPOOL_FILE, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);

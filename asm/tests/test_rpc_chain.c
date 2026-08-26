@@ -32,6 +32,8 @@ extern long store_append(void* st, const unsigned char* hash32, const void* blk,
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern void merkle_root(unsigned char out[32], void* hashes, unsigned long n);
+extern long store_read_at(void* st, unsigned long h, void* out, long cap);
+extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
@@ -136,6 +138,83 @@ static const char* GENESIS_HASH = "000000000019d6689c085ae165831e934ff763ae46a2a
 static const char* GENESIS_MERKLE = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 
 static unsigned char g_st[4096];
+
+/* ---- build a txid index over the fixture archive ------------------------
+ * Written here rather than by invoking daemon/build_tx_index so the test
+ * stays hermetic, but in the SAME format the builder emits -- if the two
+ * ever disagree the reader will reject this file and the assertions below
+ * fail, which is the point. */
+static void build_fixture_txindex(long tip){
+    typedef struct { unsigned char pre[8]; unsigned int h, off, len; } rec_t;
+    static rec_t recs[64]; int n = 0;
+    for (long h = 0; h <= tip; h++){
+        static unsigned char blk[4096];
+        long blen = store_read_at(g_st, (unsigned long)h, blk, sizeof blk);
+        if (blen < 81) continue;
+        const unsigned char* p = blk + 80;
+        unsigned long ntx = *p++;                 /* fixture blocks: < 0xfd txs */
+        for (unsigned long t = 0; t < ntx && n < 64; t++){
+            const unsigned char* s0 = p;
+            p += 4;
+            int sw = (p[0] == 0x00 && p[1] == 0x01);
+            if (sw) p += 2;
+            unsigned long nin = *p++;
+            for (unsigned long i = 0; i < nin; i++){
+                p += 36; unsigned long sl = *p++; p += sl + 4;
+            }
+            unsigned long nout = *p++;
+            for (unsigned long i = 0; i < nout; i++){
+                p += 8; unsigned long sl = *p++; p += sl;
+            }
+            if (sw){
+                for (unsigned long i = 0; i < nin; i++){
+                    unsigned long items = *p++;
+                    for (unsigned long k = 0; k < items; k++){ unsigned long il = *p++; p += il; }
+                }
+            }
+            p += 4;
+            unsigned int len = (unsigned int)(p - s0);
+            unsigned char txid[32]; static unsigned char scr[4096];
+            if (tx_txid(txid, s0, len, scr, sizeof scr) != 1) continue;
+            memcpy(recs[n].pre, txid, 8);
+            recs[n].h = (unsigned int)h;
+            recs[n].off = (unsigned int)(s0 - blk);
+            recs[n].len = len;
+            n++;
+        }
+    }
+    for (int i = 1; i < n; i++){                  /* sort by prefix */
+        rec_t k = recs[i]; int j = i - 1;
+        while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
+        recs[j+1] = k;
+    }
+    FILE* f = fopen("txindex.dat", "wb");
+    unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
+    fwrite(hdr, 1, 48, f);
+    for (int i = 0; i < n; i++){
+        unsigned char r[20];
+        memcpy(r, recs[i].pre, 8);
+        for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
+        for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
+        for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
+        fwrite(r, 1, 20, f);
+    }
+    unsigned long long sparse_off = 48 + (unsigned long long)n * 20;
+    unsigned char sp[16];                          /* one sample: record 0 */
+    memcpy(sp, recs[0].pre, 8);
+    for (int b = 0; b < 8; b++) sp[8+b] = (unsigned char)(48ULL >> (8*b));
+    fwrite(sp, 1, 16, f);
+    memcpy(hdr, "BMCTXIDX", 8);
+    for (int b = 0; b < 8; b++) hdr[8+b]  = (unsigned char)((unsigned long long)n >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[32+b] = 0;
+    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)tip >> (8*b));
+    fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
+    fclose(f);
+    printf("      (fixture txindex: %d records)\n", n);
+}
+
 static char g_hash[4][65];         /* display-order block hashes */
 static char g_cb_txid[4][65];      /* display-order coinbase txids */
 static char g_tx1_txid[65], g_tx2_txid[65], g_tx2_wtxid[65];
@@ -207,6 +286,30 @@ static long usi_stub_run(int want_muhash, void* outv, char* msg, unsigned long m
     return 1;
 }
 
+/* scantxoutset stub scanner: reports one hit for the FIRST target spk at
+ * height 2, scan height 3 (the fixture tip, so bestblock/blockhash resolve). */
+static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens, int nspk,
+                          void* hitsv, long hits_cap, long* hits_n,
+                          long* out_height, unsigned long long* out_scanned,
+                          unsigned long long* out_total, int* out_overflow,
+                          char* msg, unsigned long mcap){
+    (void)hits_cap; (void)msg; (void)mcap;
+    struct { unsigned char txid[32]; unsigned int vout;
+             unsigned long long value; unsigned long long height; int coinbase;
+             unsigned char spk[128]; unsigned int spklen; } *hits = hitsv;
+    if (nspk < 1) return -1;
+    memset(hits[0].txid, 0x77, 32);
+    hits[0].vout = 7;
+    hits[0].value = 123456;
+    hits[0].height = 2;
+    hits[0].coinbase = 0;
+    hits[0].spklen = spklens[0];
+    memcpy(hits[0].spk, spks, spklens[0]);
+    *hits_n = 1; *out_height = 3; *out_scanned = 150;
+    *out_total = 123456; *out_overflow = 0;
+    return 1;
+}
+
 int main(void){
     /* deterministic sig/pubkey bytes satisfying strict DER + compressed-prefix checks */
     SIG[0]=0x30; SIG[1]=0x44; SIG[2]=0x02; SIG[3]=0x20; for (int i = 0; i < 32; i++) SIG[4+i] = (unsigned char)(0x11 + i);
@@ -238,7 +341,7 @@ int main(void){
       ck("getindexinfo(non-string) -> empty object (Core-lenient)", rr && rr->typ==RJ_OBJ && rr->nitems==0); rj_free(rr); }
     ck("rpc_chain_open", rpc_chain_open(NULL) == 1);
     ck("rpc_known_method(getblock)", rpc_known_method("getblock") == 1);
-    expect_err("unknown method still -32601", "getchaintxstats", "[]", -32601, "Method not found");
+    expect_err("unknown method still -32601", "nosuchrpcmethod", "[]", -32601, "Method not found");
 
     long ec; const char* em; rj_val* r;
 
@@ -821,6 +924,366 @@ int main(void){
       g_usi_stub_busy = 0;
       rpc_chain_set_utxosetinfo(0);
     }
+
+    /* ---- scantxoutset: dispatch + shape over an injected STUB scanner (the
+     * real scanner shares the tool-derived reader TU; its numbers get their
+     * proof at the parity capstone -- oracle target frozen: the Counterparty
+     * burn address, 3135 unspents / 2130.99791495 BTC at oracle h=964017).
+     * Synchronous scans: status -> null, abort -> false (Core's no-scan
+     * answers, oracle-verified). ---- */
+    {
+      extern void rpc_chain_set_utxoscan(long (*)(const unsigned char*, const unsigned int*,
+                    int, void*, long, long*, long*, unsigned long long*, unsigned long long*,
+                    int*, char*, unsigned long));
+      r = call("scantxoutset", "[\"status\"]", &ec, &em);
+      ck("scan status (no scan) -> null", r && r->typ == RJ_NULL); rj_free(r);
+      r = call("scantxoutset", "[\"abort\"]", &ec, &em);
+      ck("scan abort (no scan) -> false", r && r->typ == RJ_BOOL && r->str[0]=='0'); rj_free(r);
+      expect_err("scan bad action -> Core message", "scantxoutset", "[\"frobnicate\"]",
+                 -8, "Invalid action 'frobnicate'");
+      expect_err("scan start without scanobjects -> -8", "scantxoutset", "[\"start\"]",
+                 -8, "scanobjects argument is required for the start action");
+      { long e0; const char* m0; rj_val* r0=NULL;
+        rj_val* p0 = rj_parse("[\"start\", [\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]]", 55);
+        (void)p0; if (p0) rj_free(p0);
+        /* no scanner injected -> unavailable */
+        const char* pj0 = "[\"start\", [\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]]";
+        p0 = rj_parse(pj0, strlen(pj0)); r0=NULL;
+        int rc0 = rpc_chain_dispatch("scantxoutset", p0, &r0, &e0, &m0);
+        ck("scan start without a scanner -> unavailable", rc0==0 && e0==-1);
+        rj_free(r0); rj_free(p0); }
+      rpc_chain_set_utxoscan(scan_stub_run);
+      { const char* pj1 = "[\"start\", [\"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)\"]]";
+        rj_val* p1 = rj_parse(pj1, strlen(pj1)); r = NULL;
+        int rc1 = rpc_chain_dispatch("scantxoutset", p1, &r, &ec, &em);
+        ck("scan start dispatched", rc1==1 && r && r->typ==RJ_OBJ);
+        ck("scan success true", r && rj_obj_get(r,"success") && rj_obj_get(r,"success")->str[0]=='1');
+        ck_str("scan txouts", S(r,"txouts"), "150");
+        ck_str("scan height (from runner)", S(r,"height"), "3");
+        ck_str("scan total_amount", S(r,"total_amount"), "0.00123456");
+        { rj_val* u1 = rj_obj_get(r,"unspents");
+          ck("scan one unspent", u1 && u1->typ==RJ_ARR && u1->nitems==1);
+          rj_val* e1 = (u1 && u1->nitems) ? u1->items[0] : NULL;
+          ck("unspent txid/vout/amount", e1 && S(e1,"txid") && strlen(S(e1,"txid"))==64
+             && S(e1,"vout") && !strcmp(S(e1,"vout"),"7")
+             && S(e1,"amount") && !strcmp(S(e1,"amount"),"0.00123456"));
+          ck("unspent scriptPubKey hex matches the target",
+             e1 && S(e1,"scriptPubKey") && !strcmp(S(e1,"scriptPubKey"),
+             "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac"));
+          ck("unspent desc = addr(...)#checksum (inferred)",
+             e1 && S(e1,"desc") && !strncmp(S(e1,"desc"),"addr(1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9)#",41));
+          ck("unspent coinbase false + height 2", e1 && rj_obj_get(e1,"coinbase")
+             && rj_obj_get(e1,"coinbase")->str[0]=='0' && S(e1,"height") && !strcmp(S(e1,"height"),"2"));
+          ck("unspent confirmations = scanh - h + 1 = 2",
+             e1 && S(e1,"confirmations") && !strcmp(S(e1,"confirmations"),"2"));
+          ck("unspent blockhash present (64 hex)", e1 && S(e1,"blockhash") && strlen(S(e1,"blockhash"))==64); }
+        rj_free(r); rj_free(p1); }
+      expect_err("scan invalid descriptor -> Core message shape", "scantxoutset",
+                 "[\"start\", [\"notadesc\"]]", -5, "'notadesc' is not a valid descriptor function");
+      rpc_chain_set_utxoscan(0);
+    }
+
+    /* ==== the rest of Core's Blockchain category (2026-08-25) ==========
+     * The fixture is 4 blocks: genesis (1 tx) + heights 1,2 (1 tx each) +
+     * height 3 (3 txs) = 6 transactions total. */
+
+    /* ---- getchainstates: exactly one chainstate, always ---- */
+    r = call("getchainstates", "[]", &ec, &em);
+    ck("getchainstates -> object", r && r->typ == RJ_OBJ);
+    ck_str("getchainstates headers", S(r,"headers"), "3");
+    { rj_val* csa = r ? rj_obj_get(r,"chainstates") : NULL;
+      ck("exactly one chainstate (no snapshot support, so never two)",
+         csa && csa->typ == RJ_ARR && csa->nitems == 1);
+      rj_val* cs = (csa && csa->nitems) ? csa->items[0] : NULL;
+      ck_str("chainstate blocks", cs ? S(cs,"blocks") : NULL, "3");
+      ck_str("chainstate bestblockhash agrees with getbestblockhash",
+             cs ? S(cs,"bestblockhash") : NULL, g_hash[3]);
+      ck_str("chainstate validated", cs ? S(cs,"validated") : NULL, "1");
+      /* Core's coin-cache byte fields describe a LevelDB + coin cache this
+       * node does not have; they must be absent, not zero. */
+      ck("coins_db_cache_bytes is omitted, not zeroed",
+         cs && rj_obj_get(cs,"coins_db_cache_bytes") == NULL);
+      ck("coins_tip_cache_bytes is omitted, not zeroed",
+         cs && rj_obj_get(cs,"coins_tip_cache_bytes") == NULL); }
+    rj_free(r);
+
+    /* ---- getdeploymentinfo: heights come from the GENERATED header, so
+     * this asserts the node reports what its script-flag path enforces ---- */
+    r = call("getdeploymentinfo", "[]", &ec, &em);
+    ck("getdeploymentinfo -> object", r && r->typ == RJ_OBJ);
+    ck_str("getdeploymentinfo hash is the tip", S(r,"hash"), g_hash[3]);
+    ck_str("getdeploymentinfo height is the tip", S(r,"height"), "3");
+    { rj_val* dep = r ? rj_obj_get(r,"deployments") : NULL;
+      ck("Core's five buried deployments, no more", dep && dep->nmembers == 5);
+      rj_val* seg = dep ? rj_obj_get(dep,"segwit") : NULL;
+      ck_str("segwit type is buried", seg ? S(seg,"type") : NULL, "buried");
+      ck_str("segwit height is the generated SFC_HEIGHT_SEGWIT",
+             seg ? S(seg,"height") : NULL, "481824");
+      ck_str("segwit is NOT active at fixture height 3",
+             seg ? S(seg,"active") : NULL, "0");
+      rj_val* b34 = dep ? rj_obj_get(dep,"bip34") : NULL;
+      ck_str("bip34 height is the generated SFC_HEIGHT_BIP34",
+             b34 ? S(b34,"height") : NULL, "227931"); }
+    { rj_val* sf = r ? rj_obj_get(r,"script_flags") : NULL;
+      /* at height 4 only the unconditional flags apply */
+      ck("script_flags at a pre-activation height is exactly P2SH + TAPROOT",
+         sf && sf->typ == RJ_ARR && sf->nitems == 2 &&
+         !strcmp(sf->items[0]->str, "P2SH") && !strcmp(sf->items[1]->str, "TAPROOT")); }
+    rj_free(r);
+    /* the blockhash argument selects a different block */
+    { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[1]);
+      r = call("getdeploymentinfo", pj, &ec, &em);
+      ck_str("getdeploymentinfo(blockhash) reports that block", S(r,"height"), "1");
+      rj_free(r); }
+    expect_err("getdeploymentinfo on an unknown hash -> -5", "getdeploymentinfo",
+               "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
+               -5, "Block not found");
+
+    /* ---- getchaintxstats ---- */
+    r = call("getchaintxstats", "[]", &ec, &em);
+    ck("getchaintxstats -> object", r && r->typ == RJ_OBJ);
+    ck_str("window_final_block_height", S(r,"window_final_block_height"), "3");
+    /* the fixture is shorter than the 4320-block default, so the window
+     * clamps to the chain */
+    ck_str("window clamps to the chain length", S(r,"window_block_count"), "3");
+    ck_str("window_tx_count counts heights 1..3 = 1+1+3", S(r,"window_tx_count"), "5");
+    ck_str("txcount is the CUMULATIVE count including genesis", S(r,"txcount"), "6");
+    ck("txrate present when the window has a positive interval",
+       rj_obj_get(r,"txrate") != NULL);
+    rj_free(r);
+    { /* an explicit window */
+      r = call("getchaintxstats", "[1]", &ec, &em);
+      ck_str("window=1 counts only the tip block's 3 txs", S(r,"window_tx_count"), "3");
+      rj_free(r); }
+    { /* window 0: Core emits no window_tx_count/txrate for an empty window */
+      r = call("getchaintxstats", "[0]", &ec, &em);
+      ck_str("window=0 -> window_block_count 0", S(r,"window_block_count"), "0");
+      ck("window=0 emits no txrate", r && rj_obj_get(r,"txrate") == NULL);
+      rj_free(r); }
+    expect_err("a window past the chain -> -8", "getchaintxstats", "[9999]", -8,
+               "Invalid block count: should be between 0 and the block's height - 1");
+
+    /* ---- verifychain ----
+     * The fixture's synthetic headers carry bits 0x1d00ffff with nonce 0, so
+     * they have no valid proof of work. That makes level 1 the sharpest test
+     * available here: it must return FALSE. A level-1 check that returned
+     * true on these blocks would not be checking anything. */
+    r = call("verifychain", "[0,4]", &ec, &em);
+    ck_str("verifychain level 0 (readable) -> true", r ? r->str : NULL, "1");
+    rj_free(r);
+    r = call("verifychain", "[1,4]", &ec, &em);
+    ck_str("verifychain level 1 -> FALSE (synthetic headers have no valid PoW)",
+           r ? r->str : NULL, "0");
+    rj_free(r);
+    r = call("verifychain", "[2,4]", &ec, &em);
+    ck_str("verifychain level 2 -> false (no undo data in the fixture)",
+           r ? r->str : NULL, "0");
+    rj_free(r);
+    { long e3; const char* m3; rj_val* r3 = call("verifychain", "[3,4]", &e3, &m3);
+      ck("verifychain level 3 REFUSES rather than returning a downgraded true",
+         r3 == NULL && e3 == -1 && m3 && strstr(m3, "checklevel 0-2"));
+      rj_free(r3); }
+    { long e4; const char* m4; rj_val* r4 = call("verifychain", "[]", &e4, &m4);
+      ck("bare verifychain (Core default level 3) refuses too, naming the range",
+         r4 == NULL && e4 == -1 && m4 && strstr(m4, "checklevel 2 or lower"));
+      rj_free(r4); }
+    expect_err("verifychain level 9 -> -8", "verifychain", "[9]", -8,
+               "Invalid checklevel: must be 0-4");
+
+    /* ---- waitfor* : satisfied conditions return immediately ---- */
+    r = call("waitforblockheight", "[1,1000]", &ec, &em);
+    ck("waitforblockheight below the tip returns at once",
+       r && r->typ == RJ_OBJ);
+    ck_str("...reporting the current tip height", S(r,"height"), "3");
+    ck_str("...and its hash", S(r,"hash"), g_hash[3]);
+    rj_free(r);
+    { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\",1000]", g_hash[3]);
+      r = call("waitforblock", pj, &ec, &em);
+      ck("waitforblock on the CURRENT tip hash returns at once", r && r->typ == RJ_OBJ);
+      ck_str("...with that height", S(r,"height"), "3");
+      rj_free(r); }
+    { /* nothing will arrive; the short timeout must expire and return the
+       * current tip, which is Core's own on-timeout behaviour */
+      r = call("waitfornewblock", "[100]", &ec, &em);
+      ck("waitfornewblock times out and returns the current tip",
+         r && r->typ == RJ_OBJ);
+      ck_str("...at the unchanged height", S(r,"height"), "3");
+      rj_free(r); }
+    expect_err("waitforblockheight with no height -> -8", "waitforblockheight", "[]",
+               -8, "waitforblockheight requires a height");
+
+    /* ---- the refusals name what is missing ---- */
+    { struct { const char* m; const char* needle; } R[] = {
+        {"preciousblock", "fork choice"}, {"pruneblockchain", "fork choice"},
+        {"savemempool", "mempool.dat"}, {"importmempool", "mempool.dat"} };
+      int all = 1;
+      for (unsigned i = 0; i < sizeof R / sizeof *R; i++){
+          long e; const char* m; rj_val* rr = call(R[i].m, "[]", &e, &m);
+          if (!(rr == NULL && e == -1 && m && strstr(m, R[i].needle))){
+              printf("      (%s: ec=%ld em=%s)\n", R[i].m, e, m ? m : "(null)");
+              all = 0;
+          }
+          rj_free(rr);
+      }
+      ck("every unsupported Blockchain method errors with the reason named", all);
+      ck("rpc_known_method covers them too",
+         rpc_known_method("dumptxoutset") && rpc_known_method("getchainstates") &&
+         rpc_known_method("waitforblock") && rpc_known_method("verifychain")); }
+
+    /* ---- getblockfilter / scanblocks / getdescriptoractivity ----
+     * The builder itself is Core-byte-validated in test_block_filter.c; here
+     * the RPC plumbing is checked on the fixture chain. Height 0 is the REAL
+     * mainnet genesis block, and genesis needs no undo data (its coinbase
+     * spends nothing), so its filter must come out as Core's own 017fa880
+     * even with no undo reader attached. */
+    { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[0]);
+      r = call("getblockfilter", pj, &ec, &em);
+      ck("getblockfilter serves the genesis block", r && r->typ == RJ_OBJ);
+      ck_str("genesis filter is BYTE-IDENTICAL to Core's", S(r,"filter"), "017fa880");
+      /* the header chains from genesis and cannot be computed without every
+       * prior filter -- it must be ABSENT, never fabricated */
+      ck("no filter header is fabricated", r && rj_obj_get(r,"header") == NULL);
+      rj_free(r); }
+    { /* any other height needs undo data; none is attached here, and the
+       * refusal must say WHY a filter without it would be wrong */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[2]);
+      long e2; const char* m2; rj_val* r2 = call("getblockfilter", pj, &e2, &m2);
+      ck("a non-genesis block without undo data is refused",
+         r2 == NULL && e2 == -1 && m2 && strstr(m2, "undo"));
+      ck("...explaining that a filter missing elements would mislead",
+         r2 == NULL && m2 && strstr(m2, "missing elements"));
+      rj_free(r2); }
+    { long e2; const char* m2;
+      rj_val* r2 = call("getblockfilter",
+          "[\"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f\",\"exotic\"]",
+          &e2, &m2);
+      ck("an unknown filtertype -> -5", r2 == NULL && e2 == -5);
+      rj_free(r2); }
+
+    /* scanblocks: the genesis coinbase pays the well-known P2PK output;
+     * scan for it by raw() descriptor and genesis must be the ONLY hit */
+    { const char* GEN_SPK =
+        "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61de"
+        "b649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac";
+      char pj[400];
+      snprintf(pj, sizeof pj, "[\"start\",[\"raw(%s)\"],0,3]", GEN_SPK);
+      r = call("scanblocks", pj, &ec, &em);
+      ck("scanblocks start runs", r && r->typ == RJ_OBJ);
+      ck_str("scanned the requested range", S(r,"to_height"), "3");
+      { rj_val* rb = r ? rj_obj_get(r,"relevant_blocks") : NULL;
+        ck("exactly one relevant block", rb && rb->typ == RJ_ARR && rb->nitems == 1);
+        ck_str("...and it is genesis", (rb && rb->nitems) ? rb->items[0]->str : NULL, g_hash[0]); }
+      ck("the result carries the exact-scan divergence note",
+         r && S(r,"note") && strstr(S(r,"note"), "within the scanned range"));
+      rj_free(r);
+      /* status/abort answer Core's idle shapes */
+      r = call("scanblocks", "[\"status\"]", &ec, &em);
+      ck("scanblocks status -> null (scans are synchronous)", r && r->typ == RJ_NULL);
+      rj_free(r);
+      r = call("scanblocks", "[\"abort\"]", &ec, &em);
+      ck("scanblocks abort -> false", r && r->typ == RJ_BOOL && r->str[0] == '0');
+      rj_free(r);
+      /* getdescriptoractivity over genesis reports the receive */
+      snprintf(pj, sizeof pj, "[[\"%s\"],[\"raw(%s)\"]]", g_hash[0], GEN_SPK);
+      r = call("getdescriptoractivity", pj, &ec, &em);
+      ck("getdescriptoractivity runs", r && r->typ == RJ_OBJ);
+      { rj_val* a = r ? rj_obj_get(r,"activity") : NULL;
+        rj_val* a0 = (a && a->nitems) ? a->items[0] : NULL;
+        ck("one receive activity entry", a && a->nitems == 1 && a0);
+        ck_str("...typed receive", a0 ? S(a0,"type") : NULL, "receive");
+        ck_str("...with the 50 BTC amount", a0 ? S(a0,"amount") : NULL, "50.00000000");
+        ck_str("...at height 0", a0 ? S(a0,"height") : NULL, "0"); }
+      rj_free(r); }
+
+    /* ---- submitheader ----
+     * A header the node already has is a no-op returning null, exactly as
+     * Core answers. Anything else is refused rather than answered with the
+     * null that would mean "accepted". ---- */
+    { char gh[161]; memcpy(gh, GENESIS_HEX, 160); gh[160] = 0;
+      char pj[200]; snprintf(pj, sizeof pj, "[\"%s\"]", gh);
+      long e; const char* m; rj_val* r2 = call("submitheader", pj, &e, &m);
+      ck("submitheader on a header we already have -> null",
+         r2 && r2->typ == RJ_NULL);
+      rj_free(r2);
+      /* flip a byte of the nonce: a well-formed header we do not have */
+      gh[159] = (gh[159] == 'c') ? 'd' : 'c';
+      snprintf(pj, sizeof pj, "[\"%s\"]", gh);
+      r2 = call("submitheader", pj, &e, &m);
+      ck("an unknown header is REFUSED, not silently accepted",
+         r2 == NULL && e == -1 && m && strstr(m, "download worker"));
+      rj_free(r2); }
+    expect_err("submitheader on short hex -> Core's -22", "submitheader",
+               "[\"0011\"]", -22, "Block header decode failed");
+    expect_err("submitheader on non-hex -> -22", "submitheader",
+               "[\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"]",
+               -22, "Block header decode failed");
+
+    /* ---- getrawtransaction by TXID ALONE, via the txid index ----
+     * Without an index this had to refuse, which is the single most likely
+     * thing to break an application swapping this node in for Core. ---- */
+    { /* before the index exists, the refusal names what is missing */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_tx1_txid);
+      long e2; const char* m2; rj_val* r2 = call("getrawtransaction", pj, &e2, &m2);
+      ck("with no index, getrawtransaction by txid refuses and says why",
+         r2 == NULL && e2 == -5 && m2 && strstr(m2, "txindex"));
+      rj_free(r2); }
+
+    build_fixture_txindex(3);
+    /* no reopen needed: txi_open latches on success, so the index is picked
+     * up on the next lookup -- which is also what an operator building the
+     * index against a running node needs. */
+
+    { /* every fixture transaction must now resolve by txid alone, and the
+       * bytes must be IDENTICAL to what the blockhash path returns */
+      const char* ids[] = { g_cb_txid[1], g_cb_txid[2], g_tx1_txid, g_tx2_txid };
+      const char* blks[] = { g_hash[1], g_hash[2], g_hash[3], g_hash[3] };
+      int all = 1, same = 1;
+      for (int i = 0; i < 4; i++){
+          char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", ids[i]);
+          rj_val* a = call("getrawtransaction", pj, &ec, &em);
+          char pj2[200]; snprintf(pj2, sizeof pj2, "[\"%s\",0,\"%s\"]", ids[i], blks[i]);
+          rj_val* b = call("getrawtransaction", pj2, &ec, &em);
+          if (!a || !a->str){ all = 0; printf("      (no index hit for %.16s)\n", ids[i]); }
+          else if (!b || !b->str || strcmp(a->str, b->str)) same = 0;
+          rj_free(a); rj_free(b);
+      }
+      ck("every fixture tx resolves by txid alone", all);
+      ck("...and byte-identically to the blockhash path (one render path)", same); }
+
+    { /* verbosity 1 through the index carries the block context */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\",1]", g_tx2_txid);
+      r = call("getrawtransaction", pj, &ec, &em);
+      ck("verbosity 1 via the index returns an object", r && r->typ == RJ_OBJ);
+      ck_str("...with the txid", S(r,"txid"), g_tx2_txid);
+      ck_str("...and the blockhash the index resolved", S(r,"blockhash"), g_hash[3]);
+      ck("...and in_active_chain", r && S(r,"in_active_chain"));
+      rj_free(r); }
+
+    { /* a txid the index does not hold: the error must say the index is
+       * PARTIAL and name its range -- "not found" from a partial index is a
+       * different fact from "not found" on the whole chain */
+      long e2; const char* m2;
+      rj_val* r2 = call("getrawtransaction",
+                        "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
+                        &e2, &m2);
+      ck("an unindexed txid reports the index's COVERED RANGE",
+         r2 == NULL && e2 == -5 && m2 && strstr(m2, "covers heights"));
+      rj_free(r2); }
+
+    { /* getindexinfo now REPORTS the index, and reports it as synced only
+       * when it actually reaches the tip */
+      r = call("getindexinfo", "[]", &ec, &em);
+      rj_val* ti = r ? rj_obj_get(r, "txindex") : NULL;
+      ck("getindexinfo reports the txindex once built", ti && ti->typ == RJ_OBJ);
+      ck_str("...with the height it covers", ti ? S(ti,"best_block_height") : NULL, "3");
+      ck_str("...and synced, since it reaches the tip", ti ? S(ti,"synced") : NULL, "1");
+      rj_free(r);
+      r = call("getindexinfo", "[\"txindex\"]", &ec, &em);
+      ck("getindexinfo(txindex) filters to it", r && rj_obj_get(r,"txindex"));
+      rj_free(r);
+      r = call("getindexinfo", "[\"nosuch\"]", &ec, &em);
+      ck("getindexinfo(unknown) -> {}", r && r->typ == RJ_OBJ && r->nmembers == 0);
+      rj_free(r); }
 
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
