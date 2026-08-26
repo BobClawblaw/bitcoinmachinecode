@@ -52,6 +52,64 @@ static void* fake_txworker(void* arg){
     return 0;
 }
 
+/* Fake control worker: mirrors the real worker's ctl_* handler closely
+ * enough to drive the parent side end to end -- it applies bans to the
+ * SHARED list (which is the point: listbanned reads what the worker writes)
+ * and reports 0 for a no-op so the parent's error mapping is exercised. */
+static volatile int g_cw_run = 1;
+static volatile unsigned long long g_cw_last;
+static int g_cw_ops[16]; static int g_cw_nops;
+static void* fake_ctlworker(void* arg){
+    node_status_t* ns = (node_status_t*)arg;
+    unsigned long long last = g_cw_last;
+    while (g_cw_run){
+        if (ns->ctl_seq != last){
+            last = ns->ctl_seq;
+            int op = ns->ctl_op; long long num = ns->ctl_num;
+            char a[128]; snprintf(a, sizeof a, "%s", (const char*)ns->ctl_arg);
+            int result = 0;
+            if (g_cw_nops < 16) g_cw_ops[g_cw_nops++] = op;
+            if (op == RPC_CTL_SETNETACTIVE){ ns->net_active = num ? 1 : 0; result = 1; }
+            else if (op == RPC_CTL_PING) result = 1;
+            else if (op == RPC_CTL_ADDNODE) result = (num == 1) ? 0 : 1;  /* remove: not found */
+            else if (op == RPC_CTL_DISCONNECT) result = a[0] && !strcmp(a, "1.2.3.4") ? 1 : 0;
+            else if (op == RPC_CTL_SETBAN){
+                if (num == 0){
+                    result = 0;
+                    for (int i = 0; i < RPC_MAX_BANS; i++)
+                        if (ns->bans[i].until && !strcmp((const char*)ns->bans[i].subnet, a)){
+                            ns->bans[i].until = 0; result = 1; break; }
+                } else {
+                    int dup = 0, slot = -1;
+                    for (int i = 0; i < RPC_MAX_BANS; i++){
+                        if (ns->bans[i].until && !strcmp((const char*)ns->bans[i].subnet, a)) dup = 1;
+                        if (!ns->bans[i].until && slot < 0) slot = i;
+                    }
+                    if (dup || slot < 0) result = 0;
+                    else { snprintf((char*)ns->bans[slot].subnet, 64, "%s", a);
+                           ns->bans[slot].created = 111;
+                           ns->bans[slot].until = num; result = 1; }
+                }
+            }
+            else if (op == RPC_CTL_CLEARBANNED){
+                for (int i = 0; i < RPC_MAX_BANS; i++) ns->bans[i].until = 0;
+                result = 1;
+            }
+            ns->ctl_reason[0] = 0;
+            ns->ctl_result = result;
+            __sync_synchronize();
+            ns->ctl_ack = last;
+        }
+        struct timespec ts = {0, 200000}; nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
+/* local shorthands, in this file's own idiom (it dispatches through
+ * rpc_node_dispatch directly rather than rpc_dispatch) */
+#define P(j) rj_parse((j), strlen(j))
+#define D(m, p) (r = NULL, ec = 0, em = NULL, rc = rpc_node_dispatch((m), (p), &r, &ec, &em))
+
 static int g_fw_len_ok = -1;   /* fake_worker's view of the staged length */
 static void* fake_worker(void* arg){
     node_status_t* ns = (node_status_t*)arg;
@@ -106,7 +164,9 @@ int main(void){
     ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
     ck("connections_in 3",       r && S(r,"connections_in") && !strcmp(S(r,"connections_in"), "3"));
     ck("localrelay true",        r && S(r,"localrelay") && !strcmp(S(r,"localrelay"), "1"));
-    ck("networkactive true",     r && S(r,"networkactive") && !strcmp(S(r,"networkactive"), "1"));
+    ck("networkactive reflects the REAL toggle, not a constant "
+       "(unset in this status block, so false)",
+       r && S(r,"networkactive") && !strcmp(S(r,"networkactive"), "0"));
     { rj_val* nets = r ? rj_obj_get(r,"networks") : 0;
       ck("networks is a 5-entry array", nets && nets->typ == RJ_ARR && nets->nitems == 5);
       rj_val* n0 = (nets && nets->nitems) ? nets->items[0] : 0;
@@ -711,20 +771,26 @@ int main(void){
          rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
       rj_free(r);
       r = NULL; rc = rpc_node_dispatch("clearbanned", NULL, &r, &ec, &em);
-      ck("clearbanned -> null", rc == 1 && r && r->typ == RJ_NULL);
+      ck("clearbanned with no worker -> -4 (it is a real mutation now)",
+         rc == 0 && ec == -4);
       rj_free(r); }
 
-    /* The mutators REFUSE rather than silently no-op: a call that reports
-     * success while changing nothing is worse than an honest error. */
+    /* The mutators are REAL now (the ctl_* channel). With no worker attached
+     * they must say exactly that -- not pretend to have acted, and not claim
+     * the capability is missing when it is the worker that is absent. */
     { static const char* MUT[] = {"addnode","disconnectnode","setban",
                                   "setnetworkactive","ping"};
+      static const char* ARGS[] = {"[\"1.2.3.4\",\"add\"]", "[\"1.2.3.4\"]",
+                                   "[\"1.2.3.4\",\"add\"]", "[true]", "[]"};
+      rpc_node_set_status_rw(NULL);
       for (int i = 0; i < 5; i++){
+          rj_val* p = rj_parse(ARGS[i], strlen(ARGS[i]));
           r = NULL; ec = 0; em = NULL;
-          rc = rpc_node_dispatch(MUT[i], NULL, &r, &ec, &em);
-          char lbl[96]; snprintf(lbl, sizeof lbl,
-                                 "%s -> -1 with a reason (never a silent no-op)", MUT[i]);
-          ck(lbl, rc == 0 && ec == -1 && em && strlen(em) > 20);
-          rj_free(r);
+          rc = rpc_node_dispatch(MUT[i], p, &r, &ec, &em);
+          char lbl[112]; snprintf(lbl, sizeof lbl,
+                                  "%s with no worker -> -4 naming the missing worker", MUT[i]);
+          ck(lbl, rc == 0 && ec == -4 && em && strstr(em, "download worker"));
+          rj_free(r); rj_free(p);
       }
       ck("all twelve are owned by this module",
          rpc_node_known_method("getnettotals") &&
@@ -895,6 +961,118 @@ int main(void){
       ck("getprivatebroadcastinfo -> -1 naming the missing queue",
          rc == 0 && ec == -1 && em && strstr(em, "private broadcast"));
       rj_free(r); }
+
+    /* ---- the peer-control channel, end to end ---- */
+    { pthread_t th; g_cw_run = 1; g_cw_nops = 0;
+      memset((void*)st.bans, 0, sizeof st.bans);
+      st.ctl_seq = st.ctl_ack = 0;
+      g_cw_last = st.ctl_seq;              /* captured BEFORE the thread starts */
+      rpc_node_set_status_rw(&st);
+      pthread_create(&th, 0, fake_ctlworker, &st);
+
+      { rj_val* p = P("[true]");
+        D("setnetworkactive", p);
+        ck("setnetworkactive true -> true, and the flag is set",
+           rc == 1 && r && !strcmp(r->str, "1") && st.net_active == 1);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[false]");
+        D("setnetworkactive", p);
+        ck("setnetworkactive false -> false, flag cleared",
+           rc == 1 && r && !strcmp(r->str, "0") && st.net_active == 0);
+        rj_free(r); rj_free(p); }
+      D("getnetworkinfo", NULL);
+      ck("getnetworkinfo now REPORTS the disabled network",
+         r && S(r,"networkactive") && !strcmp(S(r,"networkactive"), "0"));
+      rj_free(r);
+      { rj_val* p = P("[true]"); D("setnetworkactive", p); rj_free(r); rj_free(p); }
+
+      D("ping", NULL);
+      ck("ping -> null (queued, as Core does)", rc == 1 && r && r->typ == RJ_NULL);
+      rj_free(r);
+
+      /* --- bans: the parent must SEE what the worker wrote --- */
+      { rj_val* p = P("[\"5.6.7.8\",\"add\",3600]");
+        D("setban", p);
+        ck("setban add -> null", rc == 1 && r && r->typ == RJ_NULL);
+        rj_free(r); rj_free(p); }
+      D("listbanned", NULL);
+      ck("listbanned reads the SHARED list the worker wrote",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1);
+      { rj_val* b0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("...with Core's address/banned_until/ban_created",
+           b0 && S(b0,"address") && !strcmp(S(b0,"address"), "5.6.7.8") &&
+           rj_obj_get(b0,"banned_until") && rj_obj_get(b0,"ban_created")); }
+      rj_free(r);
+      { rj_val* p = P("[\"5.6.7.8\",\"add\"]");
+        D("setban", p);
+        ck("banning the same subnet twice -> Core's -30, not a false success",
+           rc == 0 && ec == -30 && em && strstr(em, "already banned"));
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"9.9.9.9\",\"remove\"]");
+        D("setban", p);
+        ck("unbanning something not banned -> -30", rc == 0 && ec == -30);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"5.6.7.8\",\"remove\"]");
+        D("setban", p);
+        ck("unbanning a real ban succeeds", rc == 1);
+        rj_free(r); rj_free(p); }
+      D("listbanned", NULL);
+      ck("...and it leaves the list", rc == 1 && r && r->nitems == 0);
+      rj_free(r);
+      { /* an expired ban must not be listed */
+        st.bans[0].until = 1; st.bans[0].created = 1;
+        snprintf((char*)st.bans[0].subnet, 64, "7.7.7.7");
+        D("listbanned", NULL);
+        ck("an EXPIRED ban is not listed", rc == 1 && r && r->nitems == 0);
+        rj_free(r); st.bans[0].until = 0; }
+      { rj_val* p = P("[\"1.2.3.0/24\",\"add\",1893456000,true]");
+        D("setban", p);
+        ck("setban with an absolute bantime succeeds", rc == 1);
+        rj_free(r); rj_free(p);
+        D("listbanned", NULL);
+        ck("...and the absolute time is stored verbatim",
+           rc == 1 && r && r->nitems == 1 &&
+           !strcmp(S(r->items[0],"banned_until"), "1893456000"));
+        rj_free(r); }
+      D("clearbanned", NULL);
+      ck("clearbanned -> null", rc == 1 && r && r->typ == RJ_NULL);
+      rj_free(r);
+      D("listbanned", NULL);
+      ck("...and the list is empty", rc == 1 && r && r->nitems == 0);
+      rj_free(r);
+
+      /* --- addnode / disconnectnode error mapping --- */
+      { rj_val* p = P("[\"1.2.3.4\",\"add\"]");
+        D("addnode", p);
+        ck("addnode add -> null", rc == 1 && r && r->typ == RJ_NULL);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\",\"remove\"]");
+        D("addnode", p);
+        ck("addnode remove of an unknown node -> Core's -24",
+           rc == 0 && ec == -24 && em && strstr(em, "has not been added"));
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\",\"bogus\"]");
+        D("addnode", p);
+        ck("an invalid addnode command -> -8", rc == 0 && ec == -8);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\"]");
+        D("disconnectnode", p);
+        ck("disconnectnode of a live peer succeeds", rc == 1);
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"9.9.9.9\"]");
+        D("disconnectnode", p);
+        ck("disconnectnode of an unknown peer -> Core's -29",
+           rc == 0 && ec == -29 && em && strstr(em, "not found"));
+        rj_free(r); rj_free(p); }
+      { rj_val* p = P("[\"1.2.3.4\",5]");
+        D("disconnectnode", p);
+        ck("both address and nodeid -> Core's -32602",
+           rc == 0 && ec == -32602 && em && strstr(em, "Only one of"));
+        rj_free(r); rj_free(p); }
+
+      ck("the worker saw every op type", g_cw_nops >= 10);
+      g_cw_run = 0; pthread_join(th, 0);
+      rpc_node_set_status_rw(NULL); }
 
     /* a method we don't own -> -1 (caller keeps looking) */
     r = NULL; rc = rpc_node_dispatch("getblockcount", NULL, &r, &ec, &em);
