@@ -2998,6 +2998,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* brief yield so we don't spin a CPU core when all legs are idle */
             if((i&1)==1){ usleep(20000); }
         }
+        /* propagate this rotation's relay accepts: one inv per leg covering
+         * everything accepted since the last rotation (never back to a tx's
+         * own source); peers fetch with getdata, which the drain answers
+         * from the pool */
+        if(txsub_worker_ready()){
+            extern long txrelay_announce(const int* fds, int nfds);
+            txrelay_announce(mux_out_fd, mux_n_out);
+        }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would

@@ -40,6 +40,16 @@ extern int  tx_policy_init(void);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+extern long txrelay_announce(const int* fds, int nfds);
+extern void tx_accept_set_tip(long tip);
+extern long wallet_send_tx(unsigned char* out_tx, long cap,
+                           const unsigned char toutid[][32], const unsigned long* tidx,
+                           const unsigned long long* tval, unsigned long n,
+                           const unsigned char to_h160[20],
+                           unsigned long long amount, unsigned long long fee,
+                           const unsigned char priv_be[32], unsigned long locktime);
+extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
+extern void wallet_make_p2pkh_script(unsigned char script[25], const unsigned char priv_be[32]);
 typedef long (*txacc_resolver_t)(const u8 txid[32], unsigned long index,
                                  unsigned long long* value, unsigned long* height,
                                  unsigned long* is_coinbase, const u8** script,
@@ -132,6 +142,16 @@ static long stub_resolve(const u8 txid[32], unsigned long index,
     return 0;
 }
 
+/* slurp any bytes an earlier case left on the peer end -- the orphan pool
+ * now requests missing parents even for unsolicited deliveries, so cases
+ * that feed orphans leave a getdata behind */
+static void drain_peer(int fd){
+    int fl = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    u8 junk[4096];
+    while (read(fd, junk, sizeof junk) > 0) {}
+    fcntl(fd, F_SETFL, fl);
+}
+
 static void send_inv1(int peer_fd, const u8 txid[32]){
     u8 inv[37];
     inv[0]=1; inv[1]=1; inv[2]=0; inv[3]=0; inv[4]=0;   /* count=1, type=MSG_TX */
@@ -144,7 +164,20 @@ int main(void){
     const msend_t* s  = &modern_spends[0];
     const msend_t* s2 = &modern_spends[1];
     const msend_t* seeds[2] = { s, s2 };
-    seed_utxos(seeds, 2);
+    /* an extra P2PKH coin for the ORPHAN-chain case, seeded through a
+     * synthetic msend_t so it lands in the same LSM the others do */
+    u8 chain_priv[32], chain_dpriv[32];
+    for (int i=0;i<32;i++){ chain_priv[i]=(u8)(0x77+i); chain_dpriv[i]=(u8)(0x33+i); }
+    static u8 chain_spk[25]; wallet_make_p2pkh_script(chain_spk, chain_priv);
+    static u8 chain_tid[32]; memset(chain_tid, 0xB7, 32);
+    msend_t chain_seed; memset(&chain_seed, 0, sizeof chain_seed);
+    chain_seed.name = "p2pkh_chain_seed"; chain_seed.txid = chain_tid;
+    chain_seed.prev_spk = chain_spk; chain_seed.prev_spklen = 25;
+    chain_seed.prev_amount = 10000000ull;
+    const msend_t* seeds3[3] = { s, s2, &chain_seed };
+    seed_utxos(seeds3, 3);
+    (void)seeds;
+    tx_accept_set_tip(500);
 
     if (!tx_dispatch_init()) { fprintf(stderr, "tx_dispatch_init failed\n"); return 1; }
     if (!tx_policy_init())   { fprintf(stderr, "tx_policy_init failed\n");   return 1; }
@@ -240,6 +273,88 @@ int main(void){
         ck("...and pooled", mpool_get(mp_area, txid3, &mlen) != NULL
                             && mlen == (unsigned long)s3->txlen);
         tx_accept_set_resolver(0);
+    }
+
+    printf("\n== 6: orphan pool -- child before parent resolves in cascade ==\n");
+    {
+        drain_peer(sp[1]);
+        static u8 ptx[4096], ctx_[4096];
+        unsigned long long tval[1] = { 10000000ull };
+        unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, chain_dpriv);
+        long pn = wallet_send_tx(ptx, sizeof ptx, (u8(*)[32])chain_tid, tidx, tval, 1,
+                                 to_h, 6000000ull, 10000ull, chain_priv, 0);
+        ck("parent signed", pn > 0);
+        u8 pid[32]; tx_txid(pid, ptx, (unsigned long)pn, tb, sizeof tb);
+        unsigned long long cval[1] = { 6000000ull };
+        long cn = wallet_send_tx(ctx_, sizeof ctx_, (u8(*)[32])pid, tidx, cval, 1,
+                                 to_h, 5000000ull, 10000ull, chain_dpriv, 0);
+        ck("child signed", cn > 0);
+        u8 cid[32]; tx_txid(cid, ctx_, (unsigned long)cn, tb, sizeof tb);
+
+        /* CHILD arrives first (unsolicited). It must be PARKED, not pooled,
+         * and its missing parent requested with the witness flag. */
+        p2p_write(sp[1], "tx", 2, ctx_, (unsigned)cn);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("child alone: nothing accepted", acc == 0);
+        unsigned long ml=0;
+        ck("child not pooled yet", mpool_get(mp_area, cid, &ml) == NULL);
+        char cmd[13]; static u8 pl2[4096];
+        int plen = read_msg(sp[1], cmd, pl2, sizeof pl2);
+        ck("parent requested (getdata)", plen == 37 && strcmp(cmd, "getdata") == 0);
+        ck("...MSG_WITNESS_TX for the parent txid",
+           plen == 37 && pl2[4] == 0x40 && memcmp(pl2+5, pid, 32) == 0);
+
+        /* PARENT arrives: both must land in the pool -- the accept sweeps
+         * the orphanage and the child cascades in. */
+        p2p_write(sp[1], "tx", 2, ptx, (unsigned)pn);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("parent + cascaded child accepted", acc == 2);
+        ck("parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
+        ck("child pooled via the orphan sweep", mpool_get(mp_area, cid, &ml) != NULL);
+    }
+
+    printf("\n== 7: getdata served from the pool; misses get notfound ==\n");
+    {
+        drain_peer(sp[1]);
+        /* case 1's accepted tx is pooled: ask for it with the witness type */
+        u8 txid1[32]; tx_txid(txid1, s->tx, (unsigned long)s->txlen, tb, sizeof tb);
+        u8 gd[1 + 2*36]; gd[0] = 2;
+        gd[1]=0x01; gd[2]=0; gd[3]=0; gd[4]=0x40; memcpy(gd+5, txid1, 32);
+        u8 nope[32]; memset(nope, 0xDD, 32);
+        gd[37]=0x01; gd[38]=0; gd[39]=0; gd[40]=0; memcpy(gd+41, nope, 32);
+        p2p_write(sp[1], "getdata", 7, gd, sizeof gd);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        char cmd[13]; static u8 pl3[8192];
+        int plen = read_msg(sp[1], cmd, pl3, sizeof pl3);
+        ck("pooled tx served as 'tx'", plen == s->txlen && strcmp(cmd, "tx") == 0
+                                       && memcmp(pl3, s->tx, (size_t)s->txlen) == 0);
+        plen = read_msg(sp[1], cmd, pl3, sizeof pl3);
+        ck("unknown hash answered with notfound", plen == 37 && strcmp(cmd, "notfound") == 0
+                                                  && memcmp(pl3+5, nope, 32) == 0);
+    }
+
+    printf("\n== 8: accepted txs are announced to OTHER legs, not the source ==\n");
+    {
+        int spB[2];
+        ck("second leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spB) == 0);
+        drain_peer(sp[1]);
+        txrelay_announce(NULL, 0);   /* discard announcements queued by earlier cases */
+        /* deliver a fresh acceptable tx on leg A: modern_spends[1]'s VALID
+         * form (its corrupted twin was rejected in case 3; the valid bytes
+         * were never accepted here) */
+        u8 txid2v[32]; tx_txid(txid2v, s2->tx, (unsigned long)s2->txlen, tb, sizeof tb);
+        p2p_write(sp[1], "tx", 2, s2->tx, (unsigned)s2->txlen);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("fresh tx accepted on leg A", acc == 1);
+        int fds[2] = { sp[0], spB[0] };
+        ck("announce flushed one entry", txrelay_announce(fds, 2) == 1);
+        char cmd[13]; static u8 pl4[4096];
+        int plen = read_msg(spB[1], cmd, pl4, sizeof pl4);
+        ck("leg B got the inv", plen == 37 && strcmp(cmd, "inv") == 0
+                                && pl4[1] == 1 && memcmp(pl4+5, txid2v, 32) == 0);
+        ck("leg A (the source) got nothing", no_bytes_pending(sp[1]));
+        close(spB[0]); close(spB[1]);
     }
 
     close(sp[0]); close(sp[1]);
