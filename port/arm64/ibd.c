@@ -123,28 +123,52 @@ static void utxo_dump(const void* U, const uint8_t* txid, unsigned long index){
     }
 }
 
-/* scan all UTXO slots: find records whose script starts with the aliased
- * 410496b5 target (or that are 50 BTC P2PK), print their key+blob_off */
-static void scan_utxo(const void* U){
+typedef struct { unsigned long long bo, len; const uint8_t* sc; } UREC;
+static int cmprec(const void*a,const void*b){const UREC*A=a,*B=b;return A->bo<B->bo?-1:A->bo>B->bo;}
+
+/* ---- UTXO integrity self-check (record-aliasing / corruption detector) ----
+ * The blob is APPEND-ONLY: every put appends 24+slen at the current fill and
+ * the fill counter only ever increases. Records for live slots can therefore
+ * NEVER overlap or be shared. This walks all live slots, sorts their blob_off,
+ * and (a) bounds-checks each record against fill, (b) flags any two live slots
+ * whose record spans overlap (the aliasing signature: one output's P2PK bytes
+ * surfacing as another key's script). Also (c) detects duplicate blob_off.
+ * Returns number of violations found (0 = clean).
+ */
+static long check_utxo_records(const void* U){
     unsigned long mask=*(const unsigned long*)((const uint8_t*)U+8);
     unsigned long slots=mask+1;
     const uint8_t* blob=*(const uint8_t* const*)((const uint8_t*)U+16);
-    unsigned long long count=0;
-    for(unsigned long i=0;i<slots;i++){
+    unsigned long long fill=*(const unsigned long long*)((const uint8_t*)U+32);
+    unsigned long long cap=*(const unsigned long long*)((const uint8_t*)U+24);
+    UREC* r=malloc(slots*sizeof(UREC));
+    unsigned long long n=0;
+    for(unsigned long long i=0;i<slots;i++){
         const uint8_t* s=(const uint8_t*)U + 40 + i*48;
         unsigned st; memcpy(&st,s+40,4);
         if(st==0xFFFFFFFFUL) continue;
-        unsigned long long bo; memcpy(&bo,s,8);
-        const uint8_t* rec=blob+bo;
-        unsigned long long val,slen; memcpy(&val,rec,8); memcpy(&slen,rec+16,8);
-        if(slen>=6 && memcmp(rec+24,"\x41\x04\x96\xb5\x38\xe8",6)==0){
-            printf("   [%lu] txid=", i); for(int k=0;k<32;k++)printf("%02x",s[8+k]);
-            printf(" idx=%u blob_off=%llu value=%llu script=", st, bo, val);
-            unsigned cap=slen>40?40:(unsigned)slen; for(unsigned k=0;k<cap;k++)printf("%02x",rec[24+k]);
-            printf("\n"); count++;
+        memcpy(&r[n].bo,s,8);
+        memcpy(&r[n].len,blob+r[n].bo+16,8);
+        r[n].sc=blob+r[n].bo+24; n++;
+    }
+    qsort(r,n,sizeof(UREC),cmprec);
+    long viol=0;
+    for(unsigned long long i=0;i<n;i++){
+        if(r[i].len>cap || r[i].bo+24+r[i].len>fill){
+            printf("UTXO-CHECK: record i=%llu OOB bo=%llu len=%llu fill=%llu cap=%llu\n",i,r[i].bo,r[i].len,fill,cap);
+            viol++;
+        }
+        if(i+1<n && r[i+1].bo < r[i].bo+24+r[i].len){
+            printf("UTXO-CHECK: OVERLAP live records\n  A bo=%llu len=%llu end=%llu scr=",r[i].bo,r[i].len,r[i].bo+24+r[i].len);
+            { unsigned c=r[i].len>40?40:(unsigned)r[i].len; for(unsigned k=0;k<c;k++)printf("%02x",r[i].sc[k]); }
+            printf("\n  B bo=%llu len=%llu end=%llu scr=",r[i+1].bo,r[i+1].len,r[i+1].bo+24+r[i+1].len);
+            { unsigned c=r[i+1].len>40?40:(unsigned)r[i+1].len; for(unsigned k=0;k<c;k++)printf("%02x",r[i+1].sc[k]); }
+            printf("\n");
+            viol++;
         }
     }
-    printf("   total 410496b5-records found=%llu (slots=%lu)\n", count, slots);
+    free(r);
+    return viol;
 }
 
 static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin, unsigned long* nout){
@@ -300,8 +324,8 @@ int main(int argc, char** argv){
 
     /* ---- UTXO + persistent store ---- */
     unsigned long slots=1<<20; void* U=malloc(utxo_struct_size(slots));
-    uint8_t* bob=malloc(1u<<27);
-    utxo_init(U,slots,bob,1u<<27);
+    uint8_t* bob=malloc(1u<<28);
+    utxo_init(U,slots,bob,1u<<28);
     void* ST=calloc(1,64); utxo_store_init(ST);
 
     /* ---- connect + handshake ---- */
@@ -429,7 +453,7 @@ int main(int argc, char** argv){
                 toff += tl;
             }
             if(bad){ bad_gate++; free(blk); continue; }
-            if((h%16)==0 || h==start+maxblk-1){ utxo_store_sync(ST,U); }
+            if((h%16)==0 || h==start+maxblk-1){ long vchk=check_utxo_records(U); if(vchk){ LLOG(6,"h%ld UTXO-CHECK VIOLATIONS=%ld\n",h,vchk);} utxo_store_sync(ST,U); }
             valid++;
             if(((h-start)%50)==0)
                 LLOG(3, "h%ld txs=%llu utxo=%ld spent=%ld sigs=%ld\n",
@@ -439,10 +463,10 @@ int main(int argc, char** argv){
     }
 done:
     LLOG(5, "DONE: blocks_valid=%ld bad_gate=%ld bad_sig=%ld\n", valid, bad_gate, bad_sig);
-    if(bad_sig || 1){ fprintf(stderr,"--- scan_utxo (410496b5 aliased record holders) ---\n"); scan_utxo(U); }
     LLOG(5, "      txs=%ld inputs_spent=%ld sigs_verified=%ld outputs_added=%ld utxo_count=%ld\n",
         ntx, spent, nsig, added, (long)utxo_count(U));
     LLOG(5, "      value_in=%llu value_out=%llu\n", (unsigned long long)total_val_in, (unsigned long long)total_val_out);
+    long vchk_end=check_utxo_records(U); if(vchk_end){ LLOG(6,"END UTXO-CHECK VIOLATIONS=%ld\n",vchk_end); }
     utxo_store_sync(ST,U);
     fd_close(fd);
     fprintf(stderr,"\n%s\n",
