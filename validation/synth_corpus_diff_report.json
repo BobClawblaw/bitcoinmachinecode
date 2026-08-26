@@ -1,6 +1,6 @@
 {
- "cases": 55,
- "accept_ok": 55,
+ "cases": 74,
+ "accept_ok": 74,
  "muts": 95,
  "mut_agree": 95,
  "accept_div": [],
@@ -250,6 +250,101 @@
    "mut_ok": 0,
    "div": 0
   },
+  "limit/tapscript >10000 bytes is legal": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "limit/tapscript 300 opcodes is legal": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "limit/tapscript OP_CHECKMULTISIG is disabled": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "limit/tapscript OP_CHECKMULTISIGVERIFY is disabled": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 1 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 2 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 3 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 4 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 5 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 6 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 7 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 8 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 9 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 10 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 11 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 12 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 13 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 14 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "budget/tapscript 15 sigops": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
   "p2sh-p2wpkh": {
    "accept": 1,
    "mut_ok": 2,
@@ -286,9 +381,9 @@
    "div": 0
   }
  },
- "ip_cases": 7797,
- "ip_agree": 7797,
- "ip_accept": 5638,
+ "ip_cases": 7805,
+ "ip_agree": 7805,
+ "ip_accept": 5641,
  "ip_mislabelled": [],
  "elapsed": 0.2
 }
