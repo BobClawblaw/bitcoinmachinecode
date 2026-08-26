@@ -114,6 +114,7 @@ e_leafbig:  db "p2tr tapscript too large",0
 e_merkle:   db "p2tr merkle root reconstruction failed",0
 e_intpk:    db "p2tr script-path internal pubkey invalid",0
 e_commit:   db "p2tr script-path commitment mismatch",0
+e_parity:   db "p2tr control block parity mismatch",0
 e_stackbig: db "p2tr tapscript initial stack too large",0
 e_elembig:  db "p2tr tapscript witness item exceeds 520 bytes",0
 e_overflow: db "p2tr tapscript initial stack overflow",0
@@ -321,8 +322,18 @@ taproot_verify_input_asm:
     inc  rsi                             ; control + 1
     lea  rdx, [rbp-0xf0]
     call taproot_tweak_pubkey
-    cmp  eax, 1
-    jne  .r_intpk
+    ; 0 = failure; 1 = success/even Y; 2 = success/odd Y. The parity is
+    ; consensus data (BIP341 control[0]&1) -- see the note in
+    ; secp256k1_taproot.asm and the C twin in bitcoin_taproot_sighash.c.
+    test eax, eax
+    jz   .r_intpk
+    ; control[0]&1 must equal (tweaked Y is odd)
+    dec  eax                             ; 0 = even, 1 = odd
+    mov  rcx, [rbp-0x78]                 ; control
+    movzx edx, byte [rcx]
+    and  edx, 1
+    cmp  eax, edx
+    jne  .r_parity
     ; memcmp(computed_q, spk + 2, 32)
     mov  rcx, [rbp-0x30]
     mov  rax, [rbp-0x110]
@@ -491,6 +502,8 @@ taproot_verify_input_asm:
 .r_leafbig:   lea rsi, [e_leafbig]
               jmp .reject
 .r_merkle:    lea rsi, [e_merkle]
+              jmp .reject
+.r_parity:    lea rsi, [e_parity]
               jmp .reject
 .r_intpk:     lea rsi, [e_intpk]
               jmp .reject

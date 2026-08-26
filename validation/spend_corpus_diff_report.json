@@ -1,10 +1,10 @@
 {
- "spends": 188,
- "accept_ok": 188,
+ "spends": 129,
+ "accept_ok": 129,
  "both_reject": 0,
- "muts": 1128,
- "mut_agree": 1128,
- "mut_both_accept": 77,
+ "muts": 774,
+ "mut_agree": 774,
+ "mut_both_accept": 40,
  "engine_fail": 0,
  "skipped_unsupported": 0,
  "skipped_detail": {},
@@ -12,15 +12,15 @@
  "mut_div": [],
  "false_accept": [],
  "by_epoch": {
-  "pre-bip16": 10,
-  "bip16-dersig": 36,
-  "dersig-csv": 34,
-  "csv-segwit": 36,
-  "segwit-taproot": 36,
-  "taproot-tip": 36
+  "pre-bip16": 9,
+  "bip16-dersig": 24,
+  "dersig-csv": 24,
+  "csv-segwit": 24,
+  "segwit-taproot": 24,
+  "taproot-tip": 24
  },
  "skipped_v0_witness": 0,
- "elapsed": 5.2,
- "tip": 964047,
+ "elapsed": 10.1,
+ "tip": 964115,
  "seed": 20260825
 }
