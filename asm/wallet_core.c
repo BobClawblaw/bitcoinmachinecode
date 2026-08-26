@@ -990,6 +990,19 @@ long wallet_send_tx(unsigned char* out_tx, long cap,
 }
 
 /* ============================================================================
+ * !!! LEGACY-P2PKH-ONLY -- NEVER WIRE TO THE RPC WALLET !!!
+ * Every prevout here is assumed to be the spending key's P2PKH script, the
+ * signatures are legacy SIGHASH_ALL scriptSigs with NO witness, and the
+ * destination/change are P2PKH. The RPC wallet's own addresses are P2WPKH:
+ * a transaction built here against its coins would carry an empty witness
+ * against a v0 witness prevout -- the RPC would return a txid, the network
+ * would reject the transaction. The RPC spend family signs via the
+ * delegated signrawtransactionwithwallet path instead (rpc_wallet_ops.c,
+ * WOP_NO_FUNDING's history). Legitimate callers today: the offline
+ * wallet_cli tool (explicitly legacy) and the test fixtures that need a
+ * deterministic legacy signer (test_send, test_mempool_consensus_verify,
+ * test_tx_relay's chain cases).
+ *
  * sendtoaddress -- pay `amount` to a destination from the wallet's own UTXOs,
  * doing greedy input selection (Core sendtoaddress within our wallet model).
  * Picks a subset of the wallet's UNSPENT P2PKH outputs (provided as a list of

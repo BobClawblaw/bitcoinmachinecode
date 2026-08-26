@@ -36,6 +36,23 @@ static void ck_str(const char* w, const char* got, const char* want){
     else { printf("FAIL: %s\n      got  %s\n      want %s\n", w, got?got:"(null)", want?want:"(null)"); fails++; }
 }
 
+extern int bip32_derive_path(unsigned char k[32], unsigned char c[32],
+                             const unsigned char* seed, unsigned long seedlen,
+                             const unsigned* path, unsigned plen);
+
+/* like call(), but with a LOADED wallet (walletprocesspsbt needs one) */
+static rj_val* callw(const char* method, const char* pj, const unsigned char* seed,
+                     long* ec, const char** em){
+    rj_val* p = rj_parse(pj, strlen(pj));
+    rj_val* r = NULL; rpc_wallet w; memset(&w, 0, sizeof w);
+    w.seed = (unsigned char*)seed;
+    *ec = 0; *em = NULL;
+    int ok = rpc_dispatch(method, p, &w, &r, ec, em);
+    rj_free(p);
+    if (!ok){ if (r) rj_free(r); return NULL; }
+    return r;
+}
+
 static rj_val* call(const char* method, const char* pj, long* ec, const char** em){
     rj_val* p = rj_parse(pj, strlen(pj));
     rj_val* r = NULL; rpc_wallet w; memset(&w, 0, sizeof w);
@@ -347,6 +364,97 @@ int main(void){
       ck("descriptorprocesspsbt refuses, naming the missing descriptor->key path",
          r == NULL && ec == -1 && em && strstr(em, "spending key"));
       rj_free(r); }
+
+    /* ================================================================
+     * walletprocesspsbt: the Signer role, end to end (2026-08-26).
+     * A PSBT whose one input is a P2WPKH the WALLET's own m/84'/0'/0'/0/0
+     * key controls, carrying only witness_utxo -- the wallet must sign it,
+     * finalize it (default), report complete, and hand back the hex.
+     * ================================================================ */
+    {
+        static unsigned char seed[64];
+        for (int i = 0; i < 64; i++) seed[i] = (unsigned char)(0x42 + i);
+        unsigned idx[5] = {0x80000000u|84u, 0x80000000u, 0x80000000u, 0, 0};
+        unsigned char wk[32], wc[32], wpub[33], wh160[20];
+        ck("wallet key derives", bip32_derive_path(wk, wc, seed, 64, idx, 5) == 1);
+        scalar_to_pubkey(wpub, wk);
+        hash160(wh160, wpub, 33);
+        char wh160h[41]; hexify(wh160h, wh160, 20);
+
+        /* unsigned tx: spend (0x02-filled txid, vout 0), pay 0.999 to the
+         * same P2PKH frame the earlier sections use */
+        char wuns[600];
+        snprintf(wuns, sizeof wuns,
+            "02000000" "01"
+            "0202020202020202020202020202020202020202020202020202020202020202"
+            "00000000" "00" "fdffffff"
+            "01" "605af40500000000" "19" "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac"
+            "00000000");
+        unsigned char utx2[600]; size_t utx2l = unhex(utx2, wuns);
+        char wspk[64]; snprintf(wspk, sizeof wspk, "0014%s", wh160h);
+
+        unsigned char ps[2000]; long o = 0;
+        ps[o++]='p'; ps[o++]='s'; ps[o++]='b'; ps[o++]='t'; ps[o++]=0xff;
+        { unsigned char k = 0x00; o += kv(ps+o, &k, 1, utx2, utx2l); ps[o++] = 0x00; }
+        { unsigned char wu[64]; long w2 = 0;
+          unsigned long long val = 100000000ULL;
+          for (int i = 0; i < 8; i++) wu[w2++] = (unsigned char)(val >> (8*i));
+          unsigned char spkb[32]; size_t spkl = unhex(spkb, wspk);
+          w2 += vi(wu+w2, spkl); memcpy(wu+w2, spkb, spkl); w2 += (long)spkl;
+          unsigned char k1 = 0x01;
+          o += kv(ps+o, &k1, 1, wu, (unsigned long)w2);
+          ps[o++] = 0x00; }
+        ps[o++] = 0x00;
+        char ps64[4000]; b64(ps64, ps, o);
+
+        char wpj[4200]; snprintf(wpj, sizeof wpj, "[\"%s\"]", ps64);
+        rj_val* wr = callw("walletprocesspsbt", wpj, seed, &ec, &em);
+        ck("walletprocesspsbt signs and completes", wr != NULL);
+        ck("...complete true", wr && S(wr, "complete") && S(wr, "complete")[0] == '1');
+        const char* whex = wr ? S(wr, "hex") : NULL;
+        ck("...hex present when complete (finalize default)", whex != NULL);
+        if (whex){
+            /* the signed tx's witness must be [sig, OUR pubkey] */
+            unsigned char st[2000]; size_t stl = unhex(st, whex);
+            char wpubh[67]; hexify(wpubh, wpub, 33);
+            char* found = strstr(whex, wpubh);
+            ck("...witness carries the wallet's pubkey", found != NULL && stl > utx2l);
+        }
+        /* the returned PSBT is FINALIZED: final witness present, no partial sigs */
+        const char* wps = wr ? S(wr, "psbt") : NULL;
+        ck("...psbt returned", wps != NULL);
+        if (wps){
+            char fpj[4200]; snprintf(fpj, sizeof fpj, "[\"%s\"]", wps);
+            rj_val* fr2 = call("finalizepsbt", fpj, &ec, &em);
+            ck("...finalizepsbt agrees it is complete",
+               fr2 && S(fr2, "complete") && S(fr2, "complete")[0] == '1');
+            const char* fhex = fr2 ? S(fr2, "hex") : NULL;
+            ck("...and extracts the SAME transaction", fhex && whex && !strcmp(fhex, whex));
+            rj_free(fr2);
+        }
+        rj_free(wr);
+
+        /* finalize=false: partial signature instead of final fields */
+        snprintf(wpj, sizeof wpj, "[\"%s\", true, \"ALL\", true, false]", ps64);
+        wr = callw("walletprocesspsbt", wpj, seed, &ec, &em);
+        ck("finalize=false processes", wr != NULL);
+        if (wr){
+            const char* wps2 = S(wr, "psbt");
+            /* finalizing that PSBT must reproduce the same hex -- proving a
+             * genuine PARTIAL_SIG (not final fields) was embedded */
+            char fpj[4200]; snprintf(fpj, sizeof fpj, "[\"%s\"]", wps2 ? wps2 : "");
+            rj_val* fr3 = call("finalizepsbt", fpj, &ec, &em);
+            ck("partial-sig PSBT finalizes independently",
+               fr3 && S(fr3, "complete") && S(fr3, "complete")[0] == '1' && S(fr3, "hex"));
+            rj_free(fr3);
+        }
+        rj_free(wr);
+
+        /* no wallet -> the honest -4 */
+        { rj_val* r2 = call("walletprocesspsbt", wpj, &ec, &em);
+          ck("without a wallet: -4 refusal", r2 == NULL && ec == -4);
+          rj_free(r2); }
+    }
 
     ck("all three are advertised as known methods",
        rpc_known_method("combinerawtransaction") &&

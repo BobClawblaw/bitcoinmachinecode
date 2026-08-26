@@ -1849,8 +1849,14 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "sendall"))                return cmd_sendall(params, w, ec, em, res);
     if (!strcmp(m, "fundrawtransaction"))     return cmd_fundrawtransaction(params, w, ec, em, res);
     if (!strcmp(m, "walletcreatefundedpsbt")) return cmd_walletcreatefundedpsbt(params, w, ec, em, res);
-    if (!strcmp(m, "walletprocesspsbt") ||
-        !strcmp(m, "bumpfee") || !strcmp(m, "psbtbumpfee"))
+    if (!strcmp(m, "walletprocesspsbt")){
+        /* real since 2026-08-26: the Signer role by delegation to the
+         * Core-validated signrawtransactionwithwallet path (rpc_commands.c) */
+        extern int rpc_cmd_walletprocesspsbt(const rj_val*, const rpc_wallet*,
+                                             long*, const char**, rj_val**);
+        return rpc_cmd_walletprocesspsbt(params, w, ec, em, res);
+    }
+    if (!strcmp(m, "bumpfee") || !strcmp(m, "psbtbumpfee"))
         return wop_unsupported(WOP_NO_FUNDING, ec, em);
 
     return -1;   /* unreachable while WOP_METHODS and this ladder agree */
