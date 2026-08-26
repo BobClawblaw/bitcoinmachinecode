@@ -2994,6 +2994,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       else
           fprintf(stderr, "[rpc] address book unavailable; "
                           "getnodeaddresses/getaddrmaninfo will report empty\n"); }
+    /* the external signer command, when the operator configured one */
+    { extern void rpc_signer_set_cmd(const char*);
+      rpc_signer_set_cmd(g_cfg.signer[0] ? g_cfg.signer : NULL); }
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);

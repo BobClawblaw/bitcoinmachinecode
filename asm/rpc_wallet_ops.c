@@ -1711,8 +1711,6 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
     "sends it journals, so there is no chain-scan to start, abort or bound. " \
     "This is why getreceivedbyaddress and the listreceivedby* family are " \
     "also absent rather than answering zero"
-#define WOP_NO_SIGNER \
-    "no external signer is configured and this node has no signer interface"
 
 /* The spend family. This is the one gap worth stating precisely, because the
  * pieces LOOK present and are not.
@@ -1809,7 +1807,24 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
         !strcmp(m, "addhdkey") || !strcmp(m, "importprunedfunds") ||
         !strcmp(m, "removeprunedfunds") || !strcmp(m, "exportwatchonlywallet"))
         return wop_unsupported(WOP_NO_IMPORT, ec, em);
-    if (!strcmp(m, "walletdisplayaddress")) return wop_unsupported(WOP_NO_SIGNER, ec, em);
+    if (!strcmp(m, "walletdisplayaddress")){
+        /* Core: walletdisplayaddress "address". The signer wants a
+         * DESCRIPTOR; an address becomes addr(<address>), which HWI
+         * accepts for display. */
+        extern int rpc_signer_display(const char*, const char*, rj_val**, long*, const char**);
+        extern int rpc_signer_configured(void);
+        const char* addr = wop_str_arg(params, 0);
+        if (!addr) return wop_err(ec, em, -8, "walletdisplayaddress requires an address");
+        if (!rpc_signer_configured())
+            return wop_err(ec, em, -1, "Error: restart bitcoind with -signer=<cmd>");
+        { int t; unsigned char v, h[20], p32[32];
+          if (!wallet_validate_address(addr, &t, &v, h, p32) ||
+              t < WOP_ADDR_P2PKH || t > WOP_ADDR_P2TR)
+              return wop_err(ec, em, -5, "Invalid address"); }
+        char desc[256];
+        snprintf(desc, sizeof desc, "addr(%s)", addr);
+        return rpc_signer_display(NULL, desc, res, ec, em);
+    }
 
     /* Everything that needs a receive-side view of the chain. The wallet
      * journals only its own SENDS, so "how much did this address receive"
