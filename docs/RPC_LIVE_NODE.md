@@ -973,3 +973,61 @@ notification per block even in catch-up bursts — a subscriber must see
 every block, not just the last of a burst. Publishing binds in the worker;
 a busy port logs and continues, because notifications must never stop the
 node syncing.
+
+## Slice 20 — the mempool gets fed: tx relay receive side, the shared-pool split, and the txindex tail — (2026-08-26)
+
+### The mempool had never held a P2P transaction
+The version message advertises relay=1, so peers announce transactions on
+all eight outbound full-relay legs — and the sync loop's drains read every
+`inv` off the socket and discarded it unexamined. The one code path with a
+`tx` handler (the inbound serve children) has had zero real peers. So every
+mempool-shaped answer this node gave was truthful about an empty pool that
+should not have been empty: getrawmempool `[]`, estimatesmartfee's EMA
+starved, getblocktemplate templates with only the coinbase.
+
+`daemon/tx_relay.c` is the missing receive half. Between sync passes on
+each worker leg it drains buffered messages: an announced tx it does not
+hold is requested and the reply validated through the same
+`tx_accept_validate` (full signature + policy) the inbound path uses. A
+consumed ping is answered — losing it would eventually cost the connection.
+When nothing is buffered the cost is one empty poll(2).
+
+### MSG_WITNESS_TX, learned the hard way once already
+Requests carry type 0x40000001, not bare MSG_TX: type 1 returns the
+witness-STRIPPED serialization — the same wire behaviour that silently
+stripped the whole segwit-era block archive (incident #10) — and a stripped
+segwit tx fails signature validation, so each would be fetched, rejected
+and re-announced forever. The hermetic test asserts on the getdata's actual
+type bytes.
+
+### Stated non-goals
+No re-announcement to other peers (user-originated txs are pushed by the
+sendrawtransaction path, which is the case where this node is the only
+holder); no BIP339 wtxidrelay (peers announce txids to us without it); no
+tx getdata service on worker legs. Each is written at the module head, not
+implied.
+
+### Incident #47: the worker's accepts were invisible to RPC
+`txsub_accept_and_relay` inserted into the worker's PRIVATE 1024-slot pool
+while the parent's mempool RPCs read the SHARED pool — sendrawtransaction
+returned a txid that getrawmempool then denied knowing. The submission path
+simply predates the shared-mempool tranche and was never re-pointed.
+`txsub_pool()` now prefers `mp_ext_area` exactly as the asm serve children
+do; the relay path uses the same, so P2P-accepted transactions are visible
+to the parent's RPCs.
+
+### The txid index follows the tip now
+Slice 18 left the index "built offline, does not follow the tip".
+`daemon/tx_index_tail.c` closes that: an append-only unsorted tail of the
+same 20-byte records, backfilled at boot from the archive (covering the
+offline-build→deploy gap and any downtime), appended per new block from the
+same choke point that publishes ZMQ (one block read feeds both), strictly
+monotonic by height so a from-genesis UTXO replay appends nothing. A reorg
+rolls the covered-height watermark back through the post-truncation
+index-rebuild callback; stale records are inert because every reader
+candidate is verified by recomputing the full txid from the current archive
+bytes — the property that also makes torn crash-writes safe. The reader
+scans the tail after a base miss and reports combined coverage in
+getindexinfo and the covered-range refusal. The per-block walk lives once,
+in `daemon/txi_format.h`, shared by the offline builder and the tail
+writer.
