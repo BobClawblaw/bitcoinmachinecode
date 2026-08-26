@@ -1794,12 +1794,13 @@ void* utxo_live_lst(void){ return &g_utxo_lst; }
  * snapshot-read while written -- resolving against the writer itself is
  * the coherent (and cheaper) alternative. */
 long utxo_live_resolve(const u8 txid[32], unsigned long index,
-                       unsigned long long* value, const u8** script,
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase, const u8** script,
                        unsigned long* slen){
     if (!g_utxo_table) return 0;
-    u64 v; unsigned long hh, cb;
+    u64 v;
     if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid, (u32)index,
-                     &v, &hh, &cb, script, slen) != 1) return 0;
+                     &v, height, is_coinbase, script, slen) != 1) return 0;
     *value = (unsigned long long)v;
     return 1;
 }
