@@ -159,7 +159,7 @@ int main(void){
     ck("getnetworkinfo dispatched", rc == 1 && r != NULL);
     ck("protocolversion 70016",  r && S(r,"protocolversion") && !strcmp(S(r,"protocolversion"), "70016"));
     ck("subversion is ours",     r && S(r,"subversion") && !strcmp(S(r,"subversion"), "/BitcoinMachineCode:0.0.1/"));
-    ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000001"));
+    ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000009"));
     ck("connections 11",         r && S(r,"connections") && !strcmp(S(r,"connections"), "11"));
     ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
     ck("connections_in 3",       r && S(r,"connections_in") && !strcmp(S(r,"connections_in"), "3"));
@@ -172,8 +172,9 @@ int main(void){
       rj_val* n0 = (nets && nets->nitems) ? nets->items[0] : 0;
       ck("networks[0].name ipv4", n0 && S(n0,"name") && !strcmp(S(n0,"name"), "ipv4")); }
     { rj_val* names = r ? rj_obj_get(r,"localservicesnames") : 0;
-      ck("localservicesnames [NETWORK]", names && names->typ == RJ_ARR && names->nitems == 1
-         && names->items[0]->str && !strcmp(names->items[0]->str, "NETWORK")); }
+      ck("localservicesnames [NETWORK, WITNESS]", names && names->typ == RJ_ARR && names->nitems == 2
+         && names->items[0]->str && !strcmp(names->items[0]->str, "NETWORK")
+         && names->items[1]->str && !strcmp(names->items[1]->str, "WITNESS")); }
     rj_free(r);
 
     /* getpeerinfo: populate a couple of fake outbound peers in the table */

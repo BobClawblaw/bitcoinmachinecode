@@ -7,6 +7,64 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- incident #48: relayed txs mass-rejected -- the tx_accept snapshot cannot coexist with a live writer
+
+Minutes after the relay deploy the log filled with `[tx_accept] reject
+(txval): prevout script too large` / `input not found in utxo` -- 177
+rejects to 1 accept. Reproduced deterministically: 18/20 real oracle-mempool
+transactions with CONFIRMED parents rejected through our own
+testmempoolaccept, and the SAME transaction flipped allowed->rejected seven
+minutes apart. Fail-closed throughout (nothing invalid was ever accepted;
+block validation uses the live LSM and was never affected) -- but the
+mempool starved.
+
+ROOT CAUSE: tx_accept.c resolves prevouts through its own utxo_lsm_reload
+SNAPSHOT, latched at first use. That is sound in a short-lived inbound
+serve child (no writer in-process, fresh snapshot per connection) -- the
+context it was written for. In the DOWNLOAD WORKER the live utxo_live
+writer mutates the same WAL/runs continuously, so the boot-latched
+snapshot's view goes incoherent within minutes: lookups miss entries or
+return garbage script lengths. utxo_setinfo refuses to read a busy datadir
+(fingerprint quiescence check) for exactly this reason; tx_accept never
+adopted that discipline, and nothing noticed for a day because the only
+path using it in production -- inbound .do_tx -- has never had a real peer.
+The relay drain armed the landmine.
+
+FIX: resolve against the LIVE writer in-process. utxo_live.c already
+exported utxo_live_table()/utxo_live_lst() with a comment promising exactly
+this consumer; utxo_live_resolve() completes it, and
+tx_accept_set_resolver() injects it in the worker right after
+utxo_live_init succeeds -- when set, the snapshot machinery is never even
+allocated. Serve children keep the snapshot (their context is the sound
+one). tests/test_tx_relay case 5 pins the shape: a prevout the snapshot
+never saw resolves through the injected resolver.
+
+Remaining known-honest bound: txs spending UNCONFIRMED parents still
+reject (confirmed-set-only resolution; ~8% of the oracle mempool sampled).
+Mempool-aware resolution is future work, stated, not smuggled.
+
+## 2026-08-26 -- relay drain ordering fix + NODE_WITNESS dial gate
+
+**Drain ordering (live finding, ~30 min after the slice-20 deploy):** the
+relay drain ran AFTER each leg's sync pass -- but the invs a peer sent since
+the last rotation are sitting in the socket buffer when the rotation starts,
+so the sync's .hdr_drain consumed and discarded nearly all of them before
+the relay drain ever looked. Observed live: 1 accepted tx in 10 minutes on
+8 legs. The drain now runs BEFORE the sync pass, so the whole inter-rotation
+buffer reaches the inv handler first; only invs arriving during the sync
+itself are still lost (bounded, documented).
+
+**NODE_WITNESS gate:** every outbound dial that can lead to fetching blocks
+or transactions (mux legs, parallel leg fill, boot catch-up, dlc
+header/chunk workers -- five call sites, one shared peer_has_witness())
+now refuses a peer whose version message lacks service bit 0x8. A
+non-witness peer serves everything witness-stripped regardless of getdata
+type (incident #10's wire behaviour); the BIP141 commitment check already
+makes that loud rather than corrupting, but such a peer would still waste a
+leg failing every fetch. A version payload too short to carry services is
+refused the same way -- unknown is not "probably fine" on the path that
+feeds the archive.
+
 ## 2026-08-26 -- tx relay receive side + txindex tail; incident #47 (mempool split)
 
 Three related gaps closed in one branch (txindex-tail-and-txrelay):

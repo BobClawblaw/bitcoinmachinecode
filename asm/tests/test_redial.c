@@ -75,7 +75,7 @@ static void build_chain(void){
 static void serve_conn(int cfd, int expose, int max_syncs){
     char cmd[12]; unsigned char pl[4096]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;      /* node version */
-    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
       p2p_write(cfd,"verack",6,"",0); }
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;      /* node verack */
     struct timeval tv; tv.tv_sec=0; tv.tv_usec=100000; setsockopt(cfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -129,7 +129,7 @@ static void peer(int port_pipe, int grow_pipe){
     int expose=5; int quit=0;
     char cmd2[12]; unsigned char pl2[4096]; unsigned plen2=0;
     plen2=0; p2p_read(c2,cmd2,pl2,sizeof pl2,&plen2); cmd2[11]=0;
-    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(c2,"version",7,v,86);
+    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(c2,"version",7,v,86);
       p2p_write(c2,"verack",6,"",0); }
     plen2=0; p2p_read(c2,cmd2,pl2,sizeof pl2,&plen2); cmd2[11]=0;
     struct timeval tv2; tv2.tv_sec=0; tv2.tv_usec=100000; setsockopt(c2,SOL_SOCKET,SO_RCVTIMEO,&tv2,sizeof tv2);

@@ -40,6 +40,10 @@ extern int  tx_policy_init(void);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+typedef long (*txacc_resolver_t)(const u8 txid[32], unsigned long index,
+                                 unsigned long long* value, const u8** script,
+                                 unsigned long* slen);
+extern void tx_accept_set_resolver(txacc_resolver_t fn);
 
 struct lsm_state {
     long log_fd, idx_fd;
@@ -107,6 +111,22 @@ static int no_bytes_pending(int fd){
     u8 junk[8]; int r = (int)read(fd, junk, sizeof junk);
     fcntl(fd, F_SETFL, fl);
     return r <= 0;
+}
+
+/* incident #48's fix, in miniature: resolution through an injected LIVE
+ * resolver instead of the boot-latched snapshot. This stub stands in for
+ * utxo_live_resolve, serving prevouts the snapshot has never seen. */
+static long stub_resolve(const u8 txid[32], unsigned long index,
+                         unsigned long long* value, const u8** script,
+                         unsigned long* slen){
+    for (int i = 0; i < modern_num_spends; i++){
+        const msend_t* s = &modern_spends[i];
+        if (!memcmp(txid, s->txid, 32) && index == 0){
+            *value = s->prev_amount; *script = s->prev_spk; *slen = s->prev_spklen;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void send_inv1(int peer_fd, const u8 txid[32]){
@@ -196,6 +216,27 @@ int main(void){
         int plen = read_msg(sp[1], cmd, pl, sizeof pl);
         ck("pong sent", plen == 8 && strcmp(cmd, "pong") == 0);
         ck("pong echoes the nonce", plen == 8 && memcmp(pl, nonce, 8) == 0);
+    }
+
+    printf("\n== 5: injected live resolver replaces the snapshot (incident #48) ==\n");
+    {
+        /* modern_spends[2]'s prevout was never seeded into the LSM, so the
+         * snapshot path CANNOT resolve it -- the exact shape of a live
+         * writer outrunning a boot-latched snapshot. */
+        const msend_t* s3 = &modern_spends[2];
+        u8 txid3[32]; tx_txid(txid3, s3->tx, (unsigned long)s3->txlen, tb, sizeof tb);
+        p2p_write(sp[1], "tx", 2, s3->tx, (unsigned)s3->txlen);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("snapshot path cannot resolve the unseeded prevout", acc == 0);
+        unsigned long mlen=0;
+        ck("...and the tx is not pooled", mpool_get(mp_area, txid3, &mlen) == NULL);
+        tx_accept_set_resolver(stub_resolve);
+        p2p_write(sp[1], "tx", 2, s3->tx, (unsigned)s3->txlen);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("resolved and accepted via the injected resolver", acc == 1);
+        ck("...and pooled", mpool_get(mp_area, txid3, &mlen) != NULL
+                            && mlen == (unsigned long)s3->txlen);
+        tx_accept_set_resolver(0);
     }
 
     close(sp[0]); close(sp[1]);
