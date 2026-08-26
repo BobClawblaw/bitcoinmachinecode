@@ -229,12 +229,34 @@ In rough order of how much each would move it:
    `0xc0` without ever computing it: they were never valid spends, and passed
    only because the verifier ignored the bit.
 
-   Current state: 8 synthesized features, 26 rule-targeted mutations, zero
-   divergences; and the real-spend corpus re-run at 129 spends / 774
-   mutations with zero divergences, confirming no regression. The bar this
-   item now sets is BREADTH of synthesized features (SIGHASH type
-   combinations, P2SH-wrapped witness variants, multi-leaf taproot trees)
-   rather than whether the rule-carrying paths are reached at all.
+   **Breadth added the same day**, which is what that finding made the next
+   bar: 35 synthesized features and 95 rule-targeted mutations, zero
+   divergences. Every SIGHASH type (ALL/NONE/SINGLE x ANYONECANPAY) across
+   legacy, BIP143 v0 and taproot key-path -- including taproot DEFAULT's
+   64-byte signature form and the **SIGHASH_SINGLE bug** (input index past
+   the last output, where the sighash is the constant uint256(1) and a
+   signature over it is valid, so both engines must ACCEPT); P2SH-wrapped
+   witness in both P2WPKH and P2WSH form, exercising the unwrapping rather
+   than just the inner script; and multi-leaf taproot trees (2/3/4 leaves)
+   whose control blocks carry a real merkle PATH, mutated by corrupting a
+   sibling, truncating a level, flipping the parity, and substituting the
+   wrong leaf script. The real-spend corpus re-ran clean alongside it (99
+   spends / 594 mutations).
+
+   Generalizing the sighash functions also corrected a latent harness error
+   (the BIP341 SINGLE-output commitment matched NONE as well) that had never
+   fired because only DEFAULT was previously exercised -- and one genuine
+   harness artifact, where a P2SH scriptSig mutation reached Core but not the
+   ASM shim, briefly looked like a false accept until the two engines were
+   confirmed to be seeing different bytes. That is the standing hazard of
+   this method and the reason every reported divergence is chased to its
+   cause before it is believed.
+
+   What this item would now ask for is a different KIND of coverage rather
+   than more of the same: script-size and resource limits (sigop budgets,
+   stack/element ceilings, the 10,000-byte script bound), and the
+   opcode-level interpreter surface (OP_SUCCESSx, disabled opcodes, minimal-
+   encoding edges) where the SETcc false accept originally lived.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
 4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the
