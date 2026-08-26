@@ -109,6 +109,14 @@ and runs natively.
       exported script_find_and_delete/script_push_encode from bitcoin_sighash.S.
       ~6k-vector diff-fuzz vs independent Python pipeline (DER->sighash->pub->ECDSA,
       legacy+BIP143, valid+corrupt, compressed+uncompressed pub): 0 fail.
+- [x] bitcoin_taproot_verify.S (taproot_verify_input_asm -- BIP341/342 input
+      dispatch: annex detection, key/script-path classify, control-block size
+      rules, merkle commitment at every leaf version, unknown-leaf early accept,
+      OP_SUCCESSx ordering, BIP342 weight budget, tapscript exec via script_eval).
+      Differential vs C twin (test_taproot_verify_diff.c): 27/27 PASS native.
+      Fixed: outgoing stack-args collided with L_NUMIN/L_REASON (reason write
+      landed in the spks array); leaf_version must persist across bl (x11
+      caller-saved, x86 held it in callee-saved rbx). (2026-08-26)
 - [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
       mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
       checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
