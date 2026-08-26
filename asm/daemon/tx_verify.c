@@ -707,16 +707,34 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     return all_ok;
 }
 
-/* tx_verify_block_connect(tx, txlen, height, block_hash32, lst, u, &reason)
- * -> 1 accept / 0 reject (reason set to a static string literal). Caller
- * must have already excluded the coinbase tx -- every input seen here is a
- * real spend, never a coinbase's null prevout. */
-int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block_hash32[32],
-                            void* lst, void* u, const char** reason){
+/* Prevout resolution callback for txv_connect_body: fills value / creation
+ * height / coinbase flag / script for one outpoint, returns 1 found / 0 not.
+ * The returned spk pointer need only stay valid until the NEXT resolver
+ * call -- the body copies it out immediately (same contract utxo_lsm_get
+ * has always had here). Introduced so MEMPOOL ADMISSION can run this exact,
+ * replay-proven verifier (legacy scripts, full BIP341/342 taproot,
+ * everything) with its own view -- live confirmed set PLUS unconfirmed
+ * mempool parents -- instead of maintaining a second, partial verifier
+ * (bitcoin_txval_modern.c grew three first-contact incidents in one day
+ * doing exactly that; it remains for its vector tests but is off the
+ * accept path). */
+typedef int (*txv_resolve_fn)(void* ctx, const u8 outpoint[36], u32 index,
+                              u64* value, u64* height, u64* is_coinbase,
+                              const u8** spk, unsigned long* spklen);
+
+typedef struct { void* lst; void* u; } txv_lsm_ctx_t;
+static int txv_resolve_lsm(void* ctxv, const u8 outpoint[36], u32 index,
+                           u64* value, u64* height, u64* is_coinbase,
+                           const u8** spk, unsigned long* spklen){
+    txv_lsm_ctx_t* c = ctxv;
+    return utxo_lsm_get(c->lst, c->u, outpoint, index, value, height, is_coinbase, spk, spklen) == 1;
+}
+
+static int txv_connect_body(const u8* tx, u64 txlen, long height, unsigned long long flags,
+                            txv_resolve_fn rf, void* rctx, const char** reason){
     u64 nin;
     if (!txv_parse(tx, txlen, &nin, reason)) return 0;
 
-    unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
     int has_taproot = 0;
 
     /* ---- pass 1 (sequential, unchanged in spirit from before): maturity
@@ -727,8 +745,8 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
     for (u64 i=0;i<nin;i++){
         u32 index; memcpy(&index, g_txv_in[i].outpoint+32, 4);
         u64 value=0, uheight=0, ucb=0; const u8* spk=0; unsigned long spklen=0;
-        long r = utxo_lsm_get(lst, u, g_txv_in[i].outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
-        if (r != 1) { *reason = "input references a missing/already-spent UTXO"; return 0; }
+        if (!rf(rctx, g_txv_in[i].outpoint, index, &value, &uheight, &ucb, &spk, &spklen))
+            { *reason = "input references a missing/already-spent UTXO"; return 0; }
         if (ucb) {
             long conf = height - (long)uheight;
             if (conf < COINBASE_MATURITY) { *reason = "immature coinbase spend (100-block rule)"; return 0; }
@@ -811,6 +829,32 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
      * verification for EVERY input classified above, taproot included. ---- */
     if (!txv_verify_all(tx, txlen, nin, flags, reason)) return 0;
     return 1;
+}
+
+/* tx_verify_block_connect(tx, txlen, height, block_hash32, lst, u, &reason)
+ * -> 1 accept / 0 reject (reason set to a static string literal). Caller
+ * must have already excluded the coinbase tx -- every input seen here is a
+ * real spend, never a coinbase's null prevout. Thin wrapper: the body above
+ * is IDENTICAL to what this function was before the resolver seam -- same
+ * flags source, same maturity rule, same reasons -- with the one
+ * utxo_lsm_get call routed through txv_resolve_lsm. */
+int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block_hash32[32],
+                            void* lst, void* u, const char** reason){
+    unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
+    txv_lsm_ctx_t c = { lst, u };
+    return txv_connect_body(tx, txlen, height, flags, txv_resolve_lsm, &c, reason);
+}
+
+/* tx_verify_mempool: the SAME verifier for mempool admission. next_height is
+ * the height the tx would confirm at (tip+1): it selects the script flags
+ * and anchors the coinbase-maturity check. The block-hash argument to
+ * script_flags_for_block exists only for Core's one historical taproot
+ * exception block, which no future height can be -- zeros are correct. */
+int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
+                      txv_resolve_fn rf, void* rctx, const char** reason){
+    static const u8 zero32[32];
+    unsigned long long flags = script_flags_for_block((unsigned long long)next_height, zero32);
+    return txv_connect_body(tx, txlen, next_height, flags, rf, rctx, reason);
 }
 
 /* ============================================================================
