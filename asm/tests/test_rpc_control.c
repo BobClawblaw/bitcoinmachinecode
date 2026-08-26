@@ -111,7 +111,9 @@ int main(void){
         {"getopenrpcinfo", "[]", "OpenRPC"},
         {"rpc.discover",   "[]", "OpenRPC"},
         {"exportasmap",    "[\"/tmp/x\"]", "asmap"},
-        {"enumeratesigners", "[]", "external signer"} };
+        /* enumeratesigners is implemented now (rpc_signer.c); with no
+         * signer= configured it answers Core's exact restart message */
+        {"enumeratesigners", "[]", "restart bitcoind with -signer"} };
       int all = 1;
       for (unsigned i = 0; i < sizeof R / sizeof *R; i++){
           rj_val* r = call(R[i].m, R[i].p, &ec, &em);
