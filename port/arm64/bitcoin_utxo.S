@@ -148,28 +148,35 @@ utxo_put:
 	mov  x23,#40           /* wrap to first slot */
 	b    .probe
 .found_empty:
-	/* write slot */
+	/* CAPACITY CHECK FIRST. If the blob is full we must return .full WITHOUT
+	 * touching the slot: writing the index+txid here then bailing to .full
+	 * leaves a DANGLING slot whose blob_off is stale -> a later utxo_get finds
+	 * the key (txid+index match) and returns ANOTHER record's script
+	 * (wrong-script aliasing). The old order wrote the slot before checking,
+	 * so once fill reached cap every put for a new key corrupted that key's
+	 * lookup. Keep the (identical, harmless) re-check below too. */
+	ldr  x8,[x19,#32]      /* fill */
+	ldr  x9,[sp,#0x18]     /* slen */
+	add  x9,x9,#24
+	add  x10,x8,x9         /* newfill = fill + 24 + slen */
+	ldr  x11,[x19,#24]     /* blob_cap */
+	cmp  x10,x11
+	b.hi .full             /* full: DO NOT write the slot; return 2 */
+	mov  x24,x8            /* x24 = fill (callee-saved: survives the bl below) */
+	/* write slot header */
 	add  x9,x19,x23
 	str  w21,[x9,#40]      /* index */
 	add  x0,x9,#8          /* txid dst */
 	mov  x1,x20            /* txid src */
 	mov  x2,#32
 	str  x23,[sp,#0x20]
-	bl   memcpy_asm
+	bl   memcpy_asm        /* clobbers x0-x17 incl. x8/x9/x11 */
 	ldr  x23,[sp,#0x20]
-	/* allocate blob record */
-	ldr  x8,[x19,#32]      /* fill */
-	ldr  x9,[sp,#0x18]     /* slen */
-	add  x9,x9,#24
-	add  x10,x8,x9
-	ldr  x11,[x19,#24]     /* blob_cap */
-	cmp  x10,x11
-	b.hi .full
-	/* record base = blob + fill */
+	/* record base = blob + fill(x24) */
 	ldr  x11,[x19,#16]
-	add  x11,x11,x8
-	add  x9,x19,x23
-	str  x8,[x9]           /* slot.blob_off = fill */
+	add  x11,x11,x24
+	add  x9,x19,x23        /* recompute slot base (x9/x11 were clobbered) */
+	str  x24,[x9]          /* slot.blob_off = fill */
 	str  x22,[x11]         /* value */
 	ldr  x9,[sp,#0x00]     /* height */
 	ldr  x10,[sp,#0x08]    /* is_coinbase */
