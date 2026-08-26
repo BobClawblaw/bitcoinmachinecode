@@ -1,9 +1,9 @@
 Differential SCRIPT-EXECUTION corpus vs Core
-generated: 2026-08-25T19:21:50Z  tip: 964047  elapsed: 5.2s  seed: 20260825
+generated: 2026-08-26T09:17:10Z  tip: 964115  elapsed: 10.1s  seed: 20260825
 
-spends: 188 (accept-parity ok 188, both-reject 0)
-mutations: 1128 (agree 1128, did-not-flip 77)
-by epoch: {"pre-bip16": 10, "bip16-dersig": 36, "dersig-csv": 34, "csv-segwit": 36, "segwit-taproot": 36, "taproot-tip": 36}
+spends: 129 (accept-parity ok 129, both-reject 0)
+mutations: 774 (agree 774, did-not-flip 40)
+by epoch: {"pre-bip16": 9, "bip16-dersig": 24, "dersig-csv": 24, "csv-segwit": 24, "segwit-taproot": 24, "taproot-tip": 24}
 routing: v1/taproot -> TAPVERIFY both sides;
          v0 (native + P2SH-wrapped) -> Core TAPVERIFY vs ASM WITVERIFY;
          pure non-witness -> VERIFY both sides.
