@@ -1,8 +1,8 @@
 Synthesized feature-depth differential vs Core
-generated: 2026-08-26T09:16:52Z  elapsed: 0.0s
+generated: 2026-08-26T09:48:55Z  elapsed: 0.0s
 
-cases: 8  accept-parity ok: 8
-rule mutations: 26 (agree 26)
+cases: 35  accept-parity ok: 35
+rule mutations: 95 (agree 95)
 per feature (accept / mutations-agreed / divergences):
   cltv                     accept=1  mut_ok=3  div=0
   codesep                  accept=1  mut_ok=2  div=0
@@ -10,7 +10,34 @@ per feature (accept / mutations-agreed / divergences):
   multisig-bare            accept=1  mut_ok=4  div=0
   multisig-p2sh            accept=1  mut_ok=4  div=0
   multisig-p2wsh           accept=1  mut_ok=3  div=0
+  p2sh-p2wpkh              accept=1  mut_ok=2  div=0
+  p2sh-p2wsh               accept=1  mut_ok=3  div=0
+  sighash-legacy-ALL       accept=1  mut_ok=2  div=0
+  sighash-legacy-ALL|ACP   accept=1  mut_ok=2  div=0
+  sighash-legacy-NONE      accept=1  mut_ok=1  div=0
+  sighash-legacy-NONE|ACP  accept=1  mut_ok=1  div=0
+  sighash-legacy-SINGLE    accept=1  mut_ok=2  div=0
+  sighash-legacy-SINGLE-bug accept=1  mut_ok=2  div=0
+  sighash-legacy-SINGLE|ACP accept=1  mut_ok=2  div=0
+  sighash-taproot-ALL      accept=1  mut_ok=3  div=0
+  sighash-taproot-ALL|ACP  accept=1  mut_ok=3  div=0
+  sighash-taproot-DEFAULT  accept=1  mut_ok=3  div=0
+  sighash-taproot-NONE     accept=1  mut_ok=2  div=0
+  sighash-taproot-NONE|ACP accept=1  mut_ok=2  div=0
+  sighash-taproot-SINGLE   accept=1  mut_ok=3  div=0
+  sighash-taproot-SINGLE|ACP accept=1  mut_ok=3  div=0
+  sighash-v0-ALL           accept=1  mut_ok=3  div=0
+  sighash-v0-ALL|ACP       accept=1  mut_ok=2  div=0
+  sighash-v0-NONE          accept=1  mut_ok=2  div=0
+  sighash-v0-NONE|ACP      accept=1  mut_ok=1  div=0
+  sighash-v0-SINGLE        accept=1  mut_ok=3  div=0
+  sighash-v0-SINGLE|ACP    accept=1  mut_ok=2  div=0
   taproot-scriptpath       accept=1  mut_ok=3  div=0
   taproot-scriptpath-annex accept=1  mut_ok=4  div=0
+  taproot-tree2-leaf0      accept=1  mut_ok=4  div=0
+  taproot-tree2-leaf1      accept=1  mut_ok=4  div=0
+  taproot-tree3-leaf2      accept=1  mut_ok=4  div=0
+  taproot-tree4-leaf1      accept=1  mut_ok=4  div=0
+  taproot-tree4-leaf3      accept=1  mut_ok=4  div=0
 
 ZERO DIVERGENCES across synthesized feature spends and their rule-targeted mutations.

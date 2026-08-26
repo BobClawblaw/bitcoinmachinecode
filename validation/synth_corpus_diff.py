@@ -106,19 +106,41 @@ def ecdsa_sig(priv, sighash, hashtype):
     return der + bytes([hashtype])
 
 # --- legacy SignatureHash (pre-segwit) --------------------------------------
+SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE, SIGHASH_ACP = 1, 2, 3, 0x80
+
 def legacy_sighash(tx_ins, tx_outs, nIn, script_code, hashtype, version=1, locktime=0):
-    # SIGHASH_ALL only (this harness never needs the exotic types for its rules)
-    assert (hashtype & 0x1f) == 1
+    """Core's SignatureHash, all types -- INCLUDING the SIGHASH_SINGLE bug.
+
+    When SIGHASH_SINGLE is used with nIn >= len(outputs) there is no matching
+    output to commit to, and Core (following Satoshi) returns the CONSTANT
+    uint256(1) rather than erroring. A signature over that constant is valid,
+    so both engines must accept such a spend -- it is a live consensus rule,
+    not a curiosity, and getting it wrong in either direction is a split."""
+    base = hashtype & 0x1f
+    acp  = hashtype & SIGHASH_ACP
+    if base == SIGHASH_SINGLE and nIn >= len(tx_outs):
+        return (1).to_bytes(32, 'little')          # the SIGHASH_SINGLE bug
+    ins = [tx_ins[nIn]] if acp else tx_ins
     s = bytearray()
     s += le(version, 4)
-    s += varint(len(tx_ins))
-    for i, (op, seq) in enumerate(tx_ins):
+    s += varint(len(ins))
+    for i, (op, seq) in enumerate(ins):
         s += op
-        if i == nIn: s += varint(len(script_code)) + script_code
-        else:        s += b'\x00'
-        s += le(seq, 4)
-    s += varint(len(tx_outs))
-    for val, spk in tx_outs:
+        signing = (acp and i == 0) or (not acp and i == nIn)
+        if signing: s += varint(len(script_code)) + script_code
+        else:       s += b'\x00'
+        # NONE/SINGLE zero every OTHER input's sequence
+        if not signing and base in (SIGHASH_NONE, SIGHASH_SINGLE): s += le(0, 4)
+        else:                                                      s += le(seq, 4)
+    if base == SIGHASH_NONE:
+        outs = []
+    elif base == SIGHASH_SINGLE:
+        # outputs truncated to nIn+1, all but the last BLANKED (-1 / empty)
+        outs = [(0xffffffffffffffff, b'')] * nIn + [tx_outs[nIn]]
+    else:
+        outs = list(tx_outs)
+    s += varint(len(outs))
+    for val, spk in outs:
         s += le(val, 8) + varint(len(spk)) + spk
     s += le(locktime, 4)
     s += le(hashtype, 4)
@@ -126,10 +148,22 @@ def legacy_sighash(tx_ins, tx_outs, nIn, script_code, hashtype, version=1, lockt
 
 # --- BIP143 v0 sighash -------------------------------------------------------
 def bip143_sighash(tx_ins, tx_outs, nIn, script_code, amount, hashtype, version=2, locktime=0):
-    assert (hashtype & 0x1f) == 1 and not (hashtype & 0x80)
-    hashPrevouts = dsha(b''.join(op for op, _ in tx_ins))
-    hashSequence = dsha(b''.join(le(seq, 4) for _, seq in tx_ins))
-    hashOutputs  = dsha(b''.join(le(v, 8) + varint(len(spk)) + spk for v, spk in tx_outs))
+    """BIP143, all types. The three mid-hashes are ZEROED per the spec's own
+    table -- hashPrevouts under ANYONECANPAY, hashSequence under ACP/NONE/
+    SINGLE, hashOutputs under NONE and under SINGLE-past-the-last-output."""
+    base = hashtype & 0x1f
+    acp  = bool(hashtype & SIGHASH_ACP)
+    Z = b'\x00' * 32
+    hashPrevouts = Z if acp else dsha(b''.join(op for op, _ in tx_ins))
+    hashSequence = (Z if (acp or base in (SIGHASH_NONE, SIGHASH_SINGLE))
+                    else dsha(b''.join(le(seq, 4) for _, seq in tx_ins)))
+    if base == SIGHASH_SINGLE:
+        hashOutputs = (dsha(le(tx_outs[nIn][0], 8) + varint(len(tx_outs[nIn][1])) + tx_outs[nIn][1])
+                       if nIn < len(tx_outs) else Z)
+    elif base == SIGHASH_NONE:
+        hashOutputs = Z
+    else:
+        hashOutputs = dsha(b''.join(le(v, 8) + varint(len(spk)) + spk for v, spk in tx_outs))
     op, seq = tx_ins[nIn]
     s = bytearray()
     s += le(version, 4) + hashPrevouts + hashSequence
@@ -167,7 +201,11 @@ def taproot_sighash(tx_ins, tx_outs, in_spks, in_amounts, nIn, hash_type,
     if annex is not None:
         a = varint(len(annex)) + annex
         m += sha(a)
-    if (hash_type & 3) in (2, 3):          # SINGLE
+    # BIP341 commits sha_single_output for SIGHASH_SINGLE ONLY. An earlier
+    # draft of this harness also matched NONE (& 3 == 2), which never fired
+    # because only DEFAULT was used -- it would have silently produced wrong
+    # sighashes the moment NONE was exercised.
+    if (hash_type & 3) == 3:               # SINGLE
         m += sha(le(tx_outs[nIn][0], 8) + varint(len(tx_outs[nIn][1])) + tx_outs[nIn][1])
     if ext:
         m += tapleaf_hash + bytes([0]) + le(codesep_pos, 4)
@@ -437,9 +475,12 @@ def line_for(d, engine, mutated_tx_hex=None, mutated_ss_hex=None, alt_spk=None):
     spk = alt_spk if alt_spk is not None else d['spk_hex']
     kind = d['kind']
     if kind == 'v1':
+        # every prevout, in input order: BIP341's sha_amounts/sha_scriptpubkeys
+        # commit to ALL of them, so a 2-input frame must supply both or the
+        # sighash differs and the spend "fails" for a harness reason.
         parts = ['TAPVERIFY', str(d['idx']), tx, str(len(d['prevouts']))]
-        for amt, s in [(d['amount'], spk)]:
-            parts += [str(amt), s]
+        for amt, sp in d['prevouts']:
+            parts += [str(amt), sp]
         return ' '.join(parts)
     if kind == 'v0':
         # ROUTING, as in spend_corpus_diff.py: Core's oracle has no WITVERIFY
@@ -451,8 +492,19 @@ def line_for(d, engine, mutated_tx_hex=None, mutated_ss_hex=None, alt_spk=None):
         # silently scoring the ASM's lone verdict as agreement -- that is how
         # this very bug surfaced.
         if engine == 'core':
-            return 'TAPVERIFY %d %s 1 %d %s' % (d['idx'], tx, d['amount'], spk)
-        return 'WITVERIFY %08x %d %s %d %s -' % (d['flags'], d['idx'], tx, d['amount'], spk)
+            parts = ['TAPVERIFY', str(d['idx']), tx, str(len(d['prevouts']))]
+            for amt, sp in d['prevouts']:
+                parts += [str(amt), sp]
+            return ' '.join(parts)
+        # The MUTATED scriptSig must reach the ASM side too. Core reads the
+        # scriptSig out of the transaction it is handed, so a mutation that
+        # only rewrote the tx would leave the two engines looking at DIFFERENT
+        # scriptSigs -- which is precisely what produced the first "false
+        # accept" reported for the P2SH-wrapped cases, and it was this
+        # harness's fault, not the node's.
+        ss = mutated_ss_hex if mutated_ss_hex is not None else (d.get('ss_hex') or '-')
+        return 'WITVERIFY %08x %d %s %d %s %s' % (d['flags'], d['idx'], tx,
+                                                  d['amount'], spk, ss)
     ss = mutated_ss_hex if mutated_ss_hex is not None else d['scriptsig_hex']
     return 'VERIFY %08x %d %s %s %s' % (d['flags'], d['idx'], tx, ss, spk)
 
@@ -502,6 +554,258 @@ def run_case(c, core, asm, res):
             if ma_ok == 1 and mc_ok == 0:
                 res['false_accept'].append(rec)
 
+# ============================================================================
+# BREADTH: SIGHASH combinations, P2SH-wrapped witness, multi-leaf taproot
+# ============================================================================
+# A 2-in / 2-out frame, so NONE/SINGLE/ANYONECANPAY are all MEANINGFUL: SINGLE
+# has a matching output to commit to, ACP has other inputs to exclude, and NONE
+# has outputs to drop. A 1-in/1-out frame makes several of these degenerate and
+# would test far less than it appears to.
+SIGHASH_NAMES = [('ALL', 0x01), ('NONE', 0x02), ('SINGLE', 0x03),
+                 ('ALL|ACP', 0x81), ('NONE|ACP', 0x82), ('SINGLE|ACP', 0x83)]
+
+_OTHER_PRIV, _OTHER_PUB = keypair(0x77)
+OTHER_SPK = b'\x00\x14' + hash160(_OTHER_PUB)     # input 1's prevout (never verified)
+OUT2_SPK  = b'\x00\x14' + hash160(hash160(b'out2'))
+
+def _frame2():
+    """(tx_ins, tx_outs) for the 2-in/2-out frame."""
+    ins  = [(outpoint(0), 0xfffffffd), (outpoint(1), 0xfffffffd)]
+    outs = [(DEST_VAL, DEST_SPK), (DEST_VAL // 2, OUT2_SPK)]
+    return ins, outs
+
+def synth_sighash_legacy(name, ht):
+    """P2PKH input 0 signed with `ht`; input 1 left unsigned (never verified)."""
+    priv, pub = keypair(0x80)
+    spk = bytes([OP_DUP, OP_HASH160]) + pushdata(hash160(pub)) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+    ins, outs = _frame2()
+    sh = legacy_sighash(ins, outs, 0, spk, ht, version=1, locktime=0)
+    sig = ecdsa_sig(priv, sh, ht)
+    ss = pushdata(sig) + pushdata(pub)
+    tx = serialize_tx(1, [(outpoint(0), ss, 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs, 0)
+    c = Case('sighash-legacy-' + name, 'legacy', F_ALL, spk.hex(), tx.hex(), ss.hex(),
+             IN_VAL, [(IN_VAL, spk.hex()), (IN_VAL, OTHER_SPK.hex())])
+    # the hashtype byte itself is signed data: changing it must invalidate
+    for other, oht in SIGHASH_NAMES:
+        if oht == ht: continue
+        bad = pushdata(sig[:-1] + bytes([oht])) + pushdata(pub)
+        c.add_mut('hashtype byte %s->%s' % (name, other), mutated_ss_hex=bad.hex())
+        break
+    # flipping a byte of the signed OUTPUT must break ALL and SINGLE (which
+    # commit to it) -- for NONE it legitimately does not, so it is only added
+    # where it is genuinely rule-violating.
+    if (ht & 0x1f) != SIGHASH_NONE:
+        outs_b = [(DEST_VAL + 1, DEST_SPK), outs[1]]
+        txb = serialize_tx(1, [(outpoint(0), ss, 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs_b, 0)
+        c.add_mut('committed output value changed', mutated_tx_hex=txb.hex())
+    return c
+
+def synth_sighash_v0(name, ht):
+    """Native P2WPKH input 0 signed with `ht` (BIP143)."""
+    priv, pub = keypair(0x81)
+    h = hash160(pub)
+    spk = b'\x00\x14' + h
+    script_code = bytes([OP_DUP, OP_HASH160]) + pushdata(h) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+    ins, outs = _frame2()
+    sh = bip143_sighash(ins, outs, 0, script_code, IN_VAL, ht)
+    sig = ecdsa_sig(priv, sh, ht)
+    wits = [[sig, pub], []]
+    tx = serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs, 0, wits)
+    c = Case('sighash-v0-' + name, 'v0', F_ALL, spk.hex(), tx.hex(), '', IN_VAL,
+             [(IN_VAL, spk.hex()), (IN_VAL, OTHER_SPK.hex())])
+    def rebuild(w0, o=outs):
+        return serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)],
+                            o, 0, [w0, []]).hex()
+    c.add_mut('hashtype byte flipped', mutated_tx_hex=rebuild([sig[:-1] + bytes([ht ^ 0x01]), pub]))
+    if (ht & 0x1f) != SIGHASH_NONE:
+        c.add_mut('committed output value changed',
+                  mutated_tx_hex=rebuild([sig, pub], [(DEST_VAL + 1, DEST_SPK), outs[1]]))
+    if not (ht & SIGHASH_ACP):
+        # the OTHER input's outpoint is committed via hashPrevouts unless ACP
+        alt = [(outpoint(0), b'', 0xfffffffd), (outpoint(9), b'', 0xfffffffd)]
+        c.add_mut('other input outpoint changed (hashPrevouts)',
+                  mutated_tx_hex=serialize_tx(2, alt, outs, 0, [[sig, pub], []]).hex())
+    return c
+
+def _tr_key(seed_byte, merkle=b''):
+    """(tweaked_priv, internal_x, output_x, output_parity) for a key-path spend."""
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    d = coincurve.PrivateKey(bytes([seed_byte]) * 32)
+    if d.public_key.format(True)[0] == 3:      # lift_x wants even Y
+        d = coincurve.PrivateKey((N - int.from_bytes(d.secret, 'big')).to_bytes(32, 'big'))
+    ix = d.public_key.format(True)[1:]
+    dt = d.add(tagged('TapTweak', ix + merkle))
+    Q = dt.public_key.format(True)
+    return dt, ix, Q[1:], Q[0] & 1
+
+def synth_sighash_taproot(name, ht):
+    """Taproot KEY-PATH spend signed with `ht`. hash_type 0x00 (DEFAULT) also
+    exercises BIP341's 64-byte signature form, where the byte is ABSENT."""
+    dt, ix, ox, par = _tr_key(0x82)
+    spk = b'\x51\x20' + ox
+    ins, outs = _frame2()
+    in_spks = [spk, OTHER_SPK]; in_amts = [IN_VAL, IN_VAL]
+    sh = taproot_sighash(ins, outs, in_spks, in_amts, 0, ht, version=2)
+    sig = dt.sign_schnorr(sh, bytes(32))
+    if ht != 0x00: sig = sig + bytes([ht])     # 65-byte form
+    wits = [[sig], []]
+    tx = serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs, 0, wits)
+    c = Case('sighash-taproot-' + name, 'v1', F_ALL, spk.hex(), tx.hex(), '', IN_VAL,
+             [(IN_VAL, spk.hex()), (IN_VAL, OTHER_SPK.hex())])
+    def rebuild(w0, o=outs):
+        return serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)],
+                            o, 0, [w0, []]).hex()
+    bad = bytearray(sig); bad[5] ^= 0x01
+    c.add_mut('schnorr signature bit flipped', mutated_tx_hex=rebuild([bytes(bad)]))
+    if ht == 0x00:
+        # BIP341: DEFAULT must be the 64-byte form. Appending an explicit 0x00
+        # byte is the one encoding the spec singles out as INVALID.
+        c.add_mut('explicit 0x00 hashtype byte appended (must be 64-byte form)',
+                  mutated_tx_hex=rebuild([sig + b'\x00']))
+    else:
+        c.add_mut('hashtype byte changed', mutated_tx_hex=rebuild([sig[:-1] + bytes([ht ^ 0x01])]))
+    if (ht & 0x1f) != SIGHASH_NONE:
+        c.add_mut('committed output value changed',
+                  mutated_tx_hex=rebuild([sig], [(DEST_VAL + 1, DEST_SPK), outs[1]]))
+    return c
+
+def synth_sighash_single_bug():
+    """The SIGHASH_SINGLE bug: input index >= number of outputs.
+
+    Satoshi's SignatureHash returns the CONSTANT uint256(1) instead of
+    erroring, and a signature over that constant is perfectly valid -- so the
+    spend must be ACCEPTED by both engines. It is a live consensus rule that
+    real mainnet transactions have relied on, and the 2-in/2-out frame above
+    can never reach it (input 0 always has a matching output), so it gets its
+    own 2-in/1-out frame with input 1 signed."""
+    priv, pub = keypair(0x88)
+    spk = bytes([OP_DUP, OP_HASH160]) + pushdata(hash160(pub)) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+    ins  = [(outpoint(0), 0xfffffffd), (outpoint(1), 0xfffffffd)]
+    outs = [(DEST_VAL, DEST_SPK)]                  # ONE output, input index 1
+    sh = legacy_sighash(ins, outs, 1, spk, 0x03, version=1, locktime=0)
+    assert sh == (1).to_bytes(32, 'little'), 'the bug case did not trigger'
+    sig = ecdsa_sig(priv, sh, 0x03)
+    ss = pushdata(sig) + pushdata(pub)
+    tx = serialize_tx(1, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), ss, 0xfffffffd)], outs, 0)
+    c = Case('sighash-legacy-SINGLE-bug', 'legacy', F_ALL, spk.hex(), tx.hex(), ss.hex(),
+             IN_VAL, [(IN_VAL, OTHER_SPK.hex()), (IN_VAL, spk.hex())], idx=1)
+    # the signature still has to be a real signature over that constant
+    bad = bytearray(sig); bad[10] ^= 0x01
+    c.add_mut('signature over the constant corrupted',
+              mutated_ss_hex=(pushdata(bytes(bad)) + pushdata(pub)).hex())
+    # a DIFFERENT pubkey must not satisfy the P2PKH
+    _, other = keypair(0x89)
+    c.add_mut('wrong pubkey', mutated_ss_hex=(pushdata(sig) + pushdata(other)).hex())
+    return c
+
+def synth_p2sh_wrapped(variant):
+    """P2SH-wrapped witness: the scriptSig is ONE push of the witness program,
+    and the real program lives in the redeemScript. Both engines must agree on
+    the unwrapping, not just on the inner script."""
+    priv, pub = keypair(0x90)
+    ins, outs = _frame2()
+    if variant == 'p2sh-p2wpkh':
+        h = hash160(pub)
+        redeem = b'\x00\x14' + h                       # the witness program
+        script_code = bytes([OP_DUP, OP_HASH160]) + pushdata(h) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+        sh = bip143_sighash(ins, outs, 0, script_code, IN_VAL, 0x01)
+        sig = ecdsa_sig(priv, sh, 0x01)
+        wit0 = [sig, pub]
+    else:                                              # p2sh-p2wsh (2-of-2)
+        k2, p2 = keypair(0x91)
+        ws = _multisig_script(2, [pub, p2])
+        redeem = b'\x00\x20' + sha(ws)
+        sh = bip143_sighash(ins, outs, 0, ws, IN_VAL, 0x01)
+        sig = ecdsa_sig(priv, sh, 0x01); sig2 = ecdsa_sig(k2, sh, 0x01)
+        wit0 = [b'', sig, sig2, ws]
+    spk = bytes([OP_HASH160]) + pushdata(hash160(redeem)) + bytes([OP_EQUAL])
+    ss = pushdata(redeem)
+    tx = serialize_tx(2, [(outpoint(0), ss, 0xfffffffd), (outpoint(1), b'', 0xfffffffd)],
+                      outs, 0, [wit0, []])
+    c = Case(variant, 'v0', F_ALL, spk.hex(), tx.hex(), ss.hex(), IN_VAL,
+             [(IN_VAL, spk.hex()), (IN_VAL, OTHER_SPK.hex())])
+    def rebuild(w0, sscript=ss):
+        return serialize_tx(2, [(outpoint(0), sscript, 0xfffffffd), (outpoint(1), b'', 0xfffffffd)],
+                            outs, 0, [w0, []]).hex()
+    bad = bytearray(wit0[1] if variant == 'p2sh-p2wsh' else wit0[0]); bad[10] ^= 0x01
+    w = list(wit0); w[1 if variant == 'p2sh-p2wsh' else 0] = bytes(bad)
+    c.add_mut('signature bit flipped', mutated_tx_hex=rebuild(w))
+    # a scriptSig that is not exactly the one push of the program -> the P2SH
+    # hash no longer matches, and (BIP141) the scriptSig must be push-only
+    c.add_mut('extra opcode appended to scriptSig',
+              mutated_tx_hex=rebuild(wit0, ss + bytes([OP_TRUE])),
+              mutated_ss_hex=(ss + bytes([OP_TRUE])).hex())
+    if variant == 'p2sh-p2wsh':
+        c.add_mut('nulldummy violated in the wrapped multisig',
+                  mutated_tx_hex=rebuild([b'\x01', wit0[1], wit0[2], wit0[3]]))
+    return c
+
+def synth_taproot_multileaf(nleaves, which):
+    """A taproot tree of `nleaves` leaves, spending leaf `which`. The control
+    block then carries a real MERKLE PATH (nleaves-1 levels deep for a
+    balanced tree), so the path reconstruction is exercised rather than the
+    single-leaf degenerate case where the path is empty."""
+    spriv, spub = keypair(0xA0 + which)
+    scripts = []
+    for i in range(nleaves):
+        _, p = keypair(0xA0 + i)
+        scripts.append(pushdata(p[1:]) + bytes([OP_CHECKSIG]))
+    leaves = [tapleaf(sc) for sc in scripts]
+    # build a balanced tree, recording the sibling path for `which`
+    path, level, idx = [], list(leaves), which
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level), 2):
+            if i + 1 < len(level):
+                a, b = level[i], level[i+1]
+                if i == (idx & ~1):
+                    path.append(b if idx % 2 == 0 else a)
+                nxt.append(tagged('TapBranch', min(a, b) + max(a, b)))
+            else:
+                nxt.append(level[i])          # odd node promoted unchanged
+        level = nxt; idx //= 2
+    root = level[0]
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    d = coincurve.PrivateKey(bytes([0xB0]) * 32)
+    if d.public_key.format(True)[0] == 3:
+        d = coincurve.PrivateKey((N - int.from_bytes(d.secret, 'big')).to_bytes(32, 'big'))
+    ix = d.public_key.format(True)[1:]
+    Q = coincurve.PublicKey.combine_keys(
+        [coincurve.PublicKey(b'\x02' + ix),
+         coincurve.PrivateKey(tagged('TapTweak', ix + root)).public_key]).format(True)
+    ox, par = Q[1:], Q[0] & 1
+    spk = b'\x51\x20' + ox
+    ins, outs = _frame2()
+    in_spks = [spk, OTHER_SPK]; in_amts = [IN_VAL, IN_VAL]
+    leaf = leaves[which]
+    sh = taproot_sighash(ins, outs, in_spks, in_amts, 0, 0x00, version=2, tapleaf_hash=leaf)
+    sig = spriv.sign_schnorr(sh, bytes(32))
+    control = bytes([0xc0 | par]) + ix + b''.join(path)
+    wits = [[sig, scripts[which], control], []]
+    tx = serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs, 0, wits)
+    feat = 'taproot-tree%d-leaf%d' % (nleaves, which)
+    c = Case(feat, 'v1', F_ALL, spk.hex(), tx.hex(), '', IN_VAL,
+             [(IN_VAL, spk.hex()), (IN_VAL, OTHER_SPK.hex())])
+    def rebuild(items):
+        return serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)],
+                            outs, 0, [items, []]).hex()
+    # corrupt one sibling in the path -> a different root -> commitment fails
+    if path:
+        badpath = bytearray(b''.join(path)); badpath[0] ^= 0x01
+        c.add_mut('merkle path sibling corrupted',
+                  mutated_tx_hex=rebuild([sig, scripts[which], bytes([0xc0 | par]) + ix + bytes(badpath)]))
+        # drop the last sibling: a SHORTER path is a different (shallower) tree
+        c.add_mut('merkle path truncated by one level',
+                  mutated_tx_hex=rebuild([sig, scripts[which],
+                                          bytes([0xc0 | par]) + ix + b''.join(path[:-1])]))
+    c.add_mut('control block parity flipped',
+              mutated_tx_hex=rebuild([sig, scripts[which], bytes([(0xc0 | par) ^ 1]) + ix + b''.join(path)]))
+    # present a DIFFERENT leaf's script with this leaf's path
+    other = (which + 1) % nleaves
+    c.add_mut('wrong leaf script for this path',
+              mutated_tx_hex=rebuild([sig, scripts[other], control]))
+    return c
+
 def all_cases():
     cs = []
     for v in ('bare', 'p2sh', 'p2wsh'): cs.append(synth_multisig(v))
@@ -509,6 +813,17 @@ def all_cases():
     cs.append(synth_codesep())
     cs.append(synth_taproot_scriptpath(False))
     cs.append(synth_taproot_scriptpath(True))
+    # ---- breadth (2026-08-26) ----
+    for name, ht in SIGHASH_NAMES:
+        cs.append(synth_sighash_legacy(name, ht))
+        cs.append(synth_sighash_v0(name, ht))
+    # taproot adds DEFAULT (0x00), whose signature is the 64-byte form
+    for name, ht in [('DEFAULT', 0x00)] + SIGHASH_NAMES:
+        cs.append(synth_sighash_taproot(name, ht))
+    cs.append(synth_sighash_single_bug())
+    for v in ('p2sh-p2wpkh', 'p2sh-p2wsh'): cs.append(synth_p2sh_wrapped(v))
+    for n, w in ((2, 0), (2, 1), (3, 2), (4, 1), (4, 3)):
+        cs.append(synth_taproot_multileaf(n, w))
     return cs
 
 def main():
