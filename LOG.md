@@ -7,6 +7,36 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-26 -- walletprocesspsbt: the PSBT Signer role, by delegation
+
+The last refused member of the PSBT family is real. walletprocesspsbt
+(rpc_commands.c rpc_cmd_walletprocesspsbt) works entirely by DELEGATION:
+extract the PSBT's unsigned transaction, synthesize prevtxs from the
+PSBT's own witness_utxo / non_witness_utxo fields, and run the whole thing
+through cmd_signrawtransactionwithwallet -- the Core-validated signing
+path every wallet spend already uses -- then splice the signed inputs back
+as BIP174 FINAL fields (finalize=true, Core's default) with finalizepsbt's
+established field-drop discipline, or as PARTIAL_SIG entries
+(finalize=false) for the two script forms this wallet actually signs
+(P2WPKH, P2PKH), refusing others by name. bip32derivs is accepted and
+ignored, stated in the header (this node adds no derivation metadata;
+the PSBT is valid without it). complete + hex semantics match Core.
+
+Pinned in test_rpc_psbtfinal (41 checks now): the wallet's own
+m/84'/0'/0'/0/0 key signs a witness_utxo-only PSBT to completion; the
+independent finalizepsbt extracts the SAME transaction byte-for-byte; the
+finalize=false partial-sig PSBT finalizes independently to the same hex;
+no wallet -> the honest -4.
+
+Also: wallet_core.c's legacy send path now carries a hard fence banner
+(LEGACY-P2PKH-ONLY, never wire to the P2WPKH RPC wallet) instead of
+relying on tribal knowledge -- it stays because the offline wallet_cli and
+the test fixtures are legitimate legacy-signer users.
+
+PSBT category state: create/decode/convert/combine/join/analyze/finalize/
+utxoupdate/walletprocess all real. Still refused with reasons: bumpfee /
+psbtbumpfee (RBF funding logic), descriptorprocesspsbt (descriptor->key).
+
 ## 2026-08-26 -- the block filter index: whole-chain BIP158, with headers
 
 getblockfilter could serve only the ~200-block undo window and NEVER the

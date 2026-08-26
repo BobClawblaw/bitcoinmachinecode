@@ -444,7 +444,10 @@ int main(void){
         "encryptwallet","createwallet","loadwallet","unloadwallet","restorewallet",
         "migratewallet","setwalletflag","importdescriptors","createwalletdescriptor",
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
-        "walletprocesspsbt","bumpfee","psbtbumpfee" };
+        "bumpfee","psbtbumpfee" };
+      /* walletprocesspsbt left this list 2026-08-26: it is REAL now (the
+       * Signer role by delegation, rpc_commands.c); its no-params behaviour
+       * is an ordinary -8/-4, covered by test_rpc_psbtfinal */
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
