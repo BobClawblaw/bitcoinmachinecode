@@ -145,7 +145,13 @@
 ;   long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index)
 ;                                                                -> 1 / -1
 ;   long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
-;                      u64* value, u8** script, u32* slen)      -> 1/0/-1
+;                      u64* value, unsigned long* height, unsigned long*
+;                      is_coinbase, u8** script, unsigned long* slen) -> 1/0/-1
+;                      (slen is a FULL 8-byte store -- incident #49: it was
+;                      a 4-byte store while every daemon caller declared
+;                      unsigned long*, leaving stale stack garbage in the
+;                      upper half and nondeterministically failing mempool
+;                      prevout resolution. All callers now declare 64-bit.)
 ;                      (on a disk-run hit, *script points into lst's
 ;                      internal scratch buffer -- valid only until the next
 ;                      utxo_lsm_get call, unlike a memtable hit's stable
@@ -1668,10 +1674,7 @@ utxo_lsm_get:
     add  rsp, 0x10
     cmp  eax, 1
     jne  .lg_no_memtable_hit
-    mov  eax, [rbp-0x110]
-    mov  rcx, [rbp-0x70]
-    mov  [rcx], eax
-    jmp  .lg_found
+    jmp  .lg_found          ; slen already in the scratch slot; published below
 .lg_no_memtable_hit:
 
     ; Check THIS generation's unflushed tombstone list before falling
@@ -1721,7 +1724,10 @@ utxo_lsm_get:
     mov  r9, [rbp-0x40]      ; &height
     mov  rax, [rbp-0x68]     ; &is_coinbase
     mov  r10, [rbp-0x48]     ; &script (r10: scratch, not an arg register)
-    mov  r11, [rbp-0x70]     ; &slen
+    lea  r11, [rbp-0x110]    ; &slen -> OWN scratch slot: the run lookups
+                              ; store 4 bytes (u32 internally); the caller's
+                              ; unsigned long* gets one full-width store at
+                              ; .lg_found instead of a torn half-write here
     sub  rsp, 0x28           ; 0x28 == 0x18 (mod 16): same call-site
                               ; alignment as before, one more arg slot
     mov  [rsp], rax
@@ -1738,6 +1744,21 @@ utxo_lsm_get:
     je   .lg_err
     jmp  .lg_run_loop
 .lg_found:
+    ; publish slen to the caller ONCE, full width. Every internal path
+    ; (utxo_get writes 8 bytes, the run lookups write 4) delivered it into
+    ; this function's own scratch slot; the 32-bit load below zero-extends,
+    ; so the 8-byte store cannot carry stale high bits. THE BUG THIS FIXES
+    ; (incident #49): the run paths previously stored 4 bytes straight
+    ; through the caller's pointer while every daemon caller declares
+    ; "unsigned long* slen" -- the upper half of the caller's variable kept
+    ; whatever the stack last held, and mempool validation nondeterministically
+    ; rejected real transactions with "prevout script too large" whenever
+    ; that garbage was nonzero. The public contract is now explicitly
+    ; 64-bit; the 11 callers that had matched the old 4-byte behaviour were
+    ; migrated in the same commit.
+    mov  eax, dword [rbp-0x110]
+    mov  rcx, [rbp-0x70]
+    mov  [rcx], rax
     mov  eax, 1
     jmp  .lg_done
 .lg_not_found:

@@ -48,7 +48,7 @@ extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
  * rpc_commands_set_utxo_store's own doc comment in the header. */
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height, unsigned long* is_coinbase,
-                          const unsigned char** script, unsigned* slen);
+                          const unsigned char** script, unsigned long* slen);
 
 /* wallet address type enum mirrors asm/wallet_core.c */
 #define WAL_ADDR_INVALID 0
@@ -438,7 +438,7 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     for (int i = 0; i < 32; i++) txid_wire[i] = txid_display[31 - i];
 
     if (!g_utxo_lst) { *result = rj_null(); return 1; }
-    unsigned long long value; unsigned long height, is_coinbase; const unsigned char* script; unsigned slen;
+    unsigned long long value; unsigned long height, is_coinbase; const unsigned char* script; unsigned long slen;
     long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &height, &is_coinbase, &script, &slen);
     if (r != 1) { *result = rj_null(); return 1; }
     (void)height; /* "confirmations" below is still a hardcoded placeholder,
@@ -2211,7 +2211,7 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
         if (!g_utxo_lst) continue;
         unsigned long vout = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) |
                              ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
-        unsigned long long value; unsigned long height, cb; const unsigned char* spk; unsigned slen;
+        unsigned long long value; unsigned long height, cb; const unsigned char* spk; unsigned long slen;
         if (utxo_lsm_get(g_utxo_lst, g_utxo_u, uin[i].op, (unsigned)vout,
                          &value, &height, &cb, &spk, &slen) != 1) continue;
         /* witness_utxo is only correct for a witness program; a legacy
