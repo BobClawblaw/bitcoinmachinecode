@@ -39,8 +39,9 @@ static int srt_hex1(char c){
     return -1;
 }
 
-/* our node advertises NODE_NETWORK(1) only (see bitcoind.asm version msg) */
-#define NODE_LOCAL_SERVICES 0x0000000000000001ULL
+/* our node advertises NODE_NETWORK(1)|NODE_WITNESS(8) -- it serves witness
+ * blocks (see bitcoind.asm's version msg, kept in sync with this) */
+#define NODE_LOCAL_SERVICES 0x0000000000000009ULL
 
 /* Core encodes CLIENT_VERSION as 10000*major + 100*minor + patch. */
 static long node_client_version(void){
@@ -77,6 +78,7 @@ static int cmd_getnetworkinfo(rj_val** res){
     { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)NODE_LOCAL_SERVICES);
       rj_obj_set(o, "localservices", rj_str(h)); }
     { rj_val* names = rj_arr(); rj_arr_push(names, rj_str("NETWORK"));
+      rj_arr_push(names, rj_str("WITNESS"));
       rj_obj_set(o, "localservicesnames", names); }
     rj_obj_set(o, "localrelay", rj_bool(1));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
