@@ -851,3 +851,63 @@ gated every dial and produced a node that silently never connects.
 `getblockfrompeer` and `preciousblock` also need the worker, but they need
 more than a command: a targeted block request and a fork-choice override
 respectively. The channel they would ride now exists.
+
+## Slice 18 — the txid index — (2026-08-26)
+`getrawtransaction <txid>` with no blockhash now works. It was the single
+most likely thing to break an application swapping this node in for Core.
+
+### The index
+`daemon/build_tx_index <datadir> [from] [to]` walks the archive and emits
+`txindex.dat`: 20-byte records sorted by an **8-byte txid prefix**, with a
+sparse sample every 256th record.
+
+The key is truncated for size — mainnet is ~1.43 billion transactions, and a
+full 32-byte key plus location would be ~63 GB plus as much again for the
+external sort. At 20 bytes it is ~29 GB. **The truncation is not a
+probabilistic shortcut:** a lookup reads every record sharing the prefix,
+pulls that transaction out of the archive, recomputes its txid and compares
+all 32 bytes. A prefix collision costs one extra read and is then rejected,
+so the answer is always the transaction asked for, or none. With ~1.4e9 keys
+in a 2^64 space a handful of collisions is expected, which is exactly why the
+reader scans neighbours instead of trusting the first prefix match.
+
+Two-pass external sort (as `build_addr_index` does, for the same reason the
+set does not fit in memory): bucket by `prefix[0]` into 256 files, then sort
+each bucket alone and concatenate — bucket *k* holds exactly the records
+starting with *k*, so concatenation is globally sorted. Header written last,
+so a crash leaves a file that reads as absent rather than a partial index
+that looks whole.
+
+A height it cannot read **abandons the build**. An index silently missing a
+block would answer "no such transaction" for everything in it.
+
+### Measured, on real blocks
+500 real mainnet blocks (963500–964000): 2,379,082 transactions in 3 seconds,
+48 MB. Extrapolated to the full chain: **~30 GB, ~30 minutes.** Structure
+verified independently — zero sort violations, zero sparse-index mismatches —
+and 25 randomly sampled records were resolved through Core: every recorded
+`(height, offset, len)` landed exactly on the transaction whose prefix it
+carried.
+
+### Reader
+One render path serves both lookups: the index supplies the height and byte
+offset, the blockhash argument supplies the height, and from there the same
+code runs — so the two cannot drift in what they emit. The test asserts the
+index path returns **byte-identical** output to the blockhash path.
+
+`txi_open` latches on **success**, not on first attempt, so an index built
+against a running node is picked up on the next lookup rather than needing a
+restart.
+
+A miss reports the index's covered **range**: "not found" from a partial
+index is a different fact from "not found" on the whole chain, and a caller
+who cannot tell them apart will draw the wrong conclusion.
+
+`getindexinfo` now reports `txindex` with `best_block_height`, and `synced`
+only when the index actually reaches the tip.
+
+### The honest limit
+The daemon does **not** maintain the index — it is built offline and does not
+follow the tip. `txindex=1` in the config therefore still changes nothing,
+and now says exactly that rather than claiming the feature is absent.
+Incremental maintenance is the obvious next step.
