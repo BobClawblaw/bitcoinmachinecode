@@ -805,3 +805,49 @@ the call site. What remains declined, and why, in one place:
   unencrypted single-seed wallet, loaded at startup.
 - **getopenrpcinfo / rpc.discover / exportasmap** — no OpenRPC document, no
   asmap.
+
+## Slice 17 — the parent→worker control channel — (2026-08-26)
+Seven RPCs refused for one structural reason: the forked download worker owns
+the peer legs, and the parent's RPC thread had no way to command it. That
+channel now exists, and `addnode`, `disconnectnode`, `setban`, `clearbanned`,
+`listbanned`, `setnetworkactive` and `ping` are real.
+
+### The channel
+Same seq/ack discipline as the `sendrawtransaction` and `submitblock`
+channels: the parent fills `ctl_op`/`ctl_arg`/`ctl_num` under
+`g_submit_lock`, bumps `ctl_seq` last, and waits for `ctl_ack`; the worker
+polls at the top of its loop and executes, because it is the process holding
+the legs.
+
+Every branch reports **what it actually did** — 1 done, 0 no-op — so the
+parent maps a no-op onto Core's error rather than a success that changed
+nothing: `-24` for removing a node never added, `-29` for disconnecting an
+unknown peer, `-30` for a duplicate ban or an unban of something not banned.
+
+### The ban list is shared, not channelled
+It lives in the shared status block because **both** sides need it: the
+parent serves `listbanned` straight out of it, and the worker checks it
+before every dial and drops any live leg a new ban covers. A ban only one
+side could see would be a ban that does not ban.
+
+Subnet matching handles a bare address and `/8`, `/16`, `/24`, `/32`. A
+prefix outside that set is **refused at `setban`** rather than stored and
+silently never enforced — the failure mode that would otherwise look exactly
+like a working ban.
+
+### Two places the enforcement had to go
+`mux_next_peer` is the single path to a new outbound leg, so both the ban
+check and the `net_active` gate live there. Gating anywhere else would have
+been undone by the next rotation — `setnetworkactive false` drops the current
+legs *and* stops them coming back, which is the difference between the toggle
+working and appearing to work for a few seconds.
+
+`net_active` is initialised to 1 explicitly. The status block is zeroed
+shared memory and 0 means "disabled", so leaving it at the default would have
+gated every dial and produced a node that silently never connects.
+`getnetworkinfo` now reports the real flag instead of a hardcoded `true`.
+
+### Still refusing
+`getblockfrompeer` and `preciousblock` also need the worker, but they need
+more than a command: a targeted block request and a fork-choice override
+respectively. The channel they would ride now exists.
