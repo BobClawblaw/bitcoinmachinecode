@@ -284,7 +284,15 @@ long csi_rpc_run(int want_muhash, void* outv, char* msg, unsigned long mcap){
     long h; unsigned char digest[32]; u64 tx, amt, bg;
     if (!csi_read_file(&h, NULL, digest, &tx, &amt, &bg)) return 0;
     o->height = h; o->txouts = tx; o->total_amount = amt; o->bogosize = bg;
-    if (want_muhash){ memcpy(o->muhash, digest, 32); o->muhash_valid = 1; }
+    if (want_muhash){
+        /* PRESENTATION byte order: the raw finalize output is the exact
+         * byte-reverse of what Core prints (the same trap utxo_setinfo.c
+         * documents and reverses) -- the first live parity check against
+         * the oracle read as a "total mismatch" that was really identical.
+         * Reverse here so the RPC's hex compares directly. */
+        for (int i = 0; i < 32; i++) o->muhash[i] = digest[31 - i];
+        o->muhash_valid = 1;
+    }
     else o->muhash_valid = 0;
     return 1;
 }
