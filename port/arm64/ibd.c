@@ -60,6 +60,21 @@ extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
 #define SV_P2SH        (1ULL<<0)
 #define SV_SIGPUSHONLY (1ULL<<5)
 
+/* all-asm leveled logger (node_log.S); kinds: 0 INFO 1 HSHK 2 HDRS 3 BLOCK
+ * 4 CONS 5 STORE 6 ERROR 7 SERVE. Official log = <datadir>/logs/bitcoind.production.log */
+extern long node_log_open(const char* path);
+extern void node_log_event(long fd, int kind, unsigned a, unsigned b, unsigned c);
+extern void node_log_str(long fd, int kind, const char* s, long len);
+#define NL(fd,kind,s) do{ const char*_s=(s); node_log_str((fd),(kind),_s,(long)strlen(_s)); }while(0)
+static long g_log=0;
+#define LLOG(kind, fmt, ...) do{ \
+    fprintf(stderr, fmt, ##__VA_ARGS__); \
+    if(g_log){ char _b[512]; int _n=snprintf(_b,sizeof _b,fmt, ##__VA_ARGS__); \
+               if(_n<0)_n=0; if(_n>(int)sizeof _b)_n=(int)sizeof _b; \
+               while(_n>0 && (_b[_n-1]=='\n'||_b[_n-1]=='\r')) _n--; \
+               node_log_str(g_log,(kind),_b,_n); } \
+}while(0)
+
 /* ---- helpers ---- */
 static void p16be(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 static void p32le(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
@@ -74,6 +89,38 @@ static int rd_varint(const unsigned char*p, unsigned long n, unsigned long long*
     else if(b==0xfe){ if(n<5)return -1; *out=(unsigned long long)p[1]|((unsigned long long)p[2]<<8)|
         ((unsigned long long)p[3]<<16)|((unsigned long long)p[4]<<24); return 5; }
     else { if(n<9)return -1; *out=rd64le(p+1); return 9; }
+}
+
+static unsigned fnv8(const uint8_t*p){ unsigned h=0x811c9dc5; for(int i=0;i<8;i++){h^=p[i]; h*=0x01000193;} return h; }
+/* dump every probed slot + the blob record for key (txid,index) in U, mirroring utxo_get */
+static void utxo_dump(const void* U, const uint8_t* txid, unsigned long index){
+    unsigned long mask = *(const unsigned long*)((const uint8_t*)U+8);
+    unsigned long slots = mask+1;
+    const uint8_t* blob = *(const uint8_t* const*)((const uint8_t*)U+16);
+    unsigned long home = (((unsigned long)fnv8(txid) ^ (unsigned long)index) & mask)*48 + 40;
+    unsigned long end = 40 + slots*48;
+    unsigned long off = home;
+    int step=0;
+    for(;;){
+        const uint8_t* s = (const uint8_t*)U + off;
+        unsigned st_idx; memcpy(&st_idx, s+40, 4);
+        unsigned long long blob_off; memcpy(&blob_off, s, 8);
+        int txid_m = memcmp(s+8, txid, 32)==0;
+        if(st_idx==0xFFFFFFFFUL){ printf("  slot[%d] EMPTY at off=%lu (home=%lu)\n", step, off, home); break; }
+        printf("  slot[%d] off=%lu stored_idx=%u txid_match=%d blob_off=%llu\n", step, off, st_idx, txid_m, blob_off);
+        if(txid_m && st_idx==(unsigned)index){
+            const uint8_t* rec = blob + blob_off;
+            unsigned long long val, slen; memcpy(&val,rec,8); memcpy(&slen,rec+16,8);
+            printf("  -> MATCH record: value=%llu slen=%llu script=", val, slen);
+            unsigned long cap = slen>64?64:(unsigned long)slen; unsigned k; for(k=0;k<cap;k++) printf("%02x", rec[24+k]);
+            if(slen>64) printf("...");
+            printf("\n");
+            break;
+        }
+        off += 48; if(off>=end) off=40;
+        if(off==home){ printf("  slot: wrap-to-home, MISS\n"); break; }
+        if(++step>100000){ printf("  slot: probe runaway\n"); break; }
+    }
 }
 
 static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin, unsigned long* nout){
@@ -211,6 +258,10 @@ int main(int argc, char** argv){
     if(argc<4){ fprintf(stderr,"usage: %s <peer> <start_height> <count> [datadir] [p2sh]\n", argv[0]); return 2; }
     long start=atol(argv[2]); long maxblk=atol(argv[3]);
     const char* dd= argc>4?argv[4]:"data"; mkdir(dd,0755); chdir(dd);
+    /* official log: <datadir>/logs/bitcoind.production.log (all-asm leveled logger) */
+    mkdir("logs",0755);
+    g_log = node_log_open("logs/bitcoind.production.log");
+    NL(g_log, 7, "node start (ibd download worker)");
     uint64_t flags = SV_SIGPUSHONLY | ((argc>5&&atoi(argv[5]))?SV_P2SH:0);
 
     /* ---- load verified header chain ---- */
@@ -233,7 +284,7 @@ int main(int argc, char** argv){
     unsigned char* rbuf=malloc(8*1024*1024);
     int fd=connect_peer(argv[1], rbuf);
     if(fd<0){ fprintf(stderr,"FAIL connect all peers\n"); return 1; }
-    fprintf(stderr,"PASS connect+handshake; IBD h=%ld..%ld flags=%llx\n",
+    LLOG(1, "PASS connect+handshake; IBD h=%ld..%ld flags=%llx\n",
             start, start+maxblk-1, (unsigned long long)flags);
 
     /* ---- download+verify+apply loop (batched) ---- */
@@ -291,7 +342,7 @@ int main(int argc, char** argv){
         /* process the window in height order */
         for(long k=0;k<nw;k++){
             long h=w+k;
-            if(h==173805){ flags |= SV_P2SH; fprintf(stderr,"P2SH ACTIVATED at h%ld flags=%llx\n",h,(unsigned long long)flags); }      /* BIP16 */
+            if(h==173805){ flags |= SV_P2SH; LLOG(4, "P2SH ACTIVATED at h%ld flags=%llx\n",h,(unsigned long long)flags); }      /* BIP16 */
             unsigned char* blk=gblk[k];
             if(!blk){ fprintf(stderr,"h%ld not collected\n",h); goto done; }
             int blklen=(int)glen[k];
@@ -323,15 +374,17 @@ int main(int argc, char** argv){
                         unsigned long long pval; unsigned long pheight=0,pcb=0; const uint8_t*psp; unsigned long pspl;
                         /* utxo_get returns 1=present, 0=absent */
                         if(utxo_get(U,ph,pidx,&pval,&pheight,&pcb,&psp,&pspl)==0){
-                            fprintf(stderr,"h%ld tx%lu in%lu MISSING-PREVOUT idx=%lu txid=",h,ti,v,pidx);
-                            for(int _k=0;_k<32;_k++)fprintf(stderr,"%02x",ph[_k]);
-                            fprintf(stderr,"\n");
+                            LLOG(6, "h%ld tx%lu in%lu MISSING-PREVOUT idx=%lu txid=",h,ti,v,pidx);
+                            for(int _k=0;_k<32;_k++){ fprintf(stderr,"%02x",ph[_k]); if(g_log){ char _hb[3]; snprintf(_hb,3,"%02x",ph[_k]); node_log_str(g_log,6,_hb,2);} }
+                            fprintf(stderr,"\n"); if(g_log) node_log_str(g_log,6,"\n",1);
                             bad_sig++; continue;
                         }
                         int rr=sv_verify_script(sigb,ssl,psp,pspl,flags,v,txo,tl,work,8u<<20);
-                        if(rr!=0){ fprintf(stderr,"h%ld tx%lu in%lu SIGFAIL err=%d\n",h,ti,v,rr); bad_sig++;
+                        if(rr!=0){ LLOG(6, "h%ld tx%lu in%lu SIGFAIL err=%d\n",h,ti,v,rr); bad_sig++;
                             static int dumped=0;
                             if(!dumped){ dumped=1;
+                                fprintf(stderr,"--- UTXO slot dump for failing prevout ---\n");
+                                utxo_dump(U, ph, pidx);
                                 FILE*fz=fopen("/tmp/fail_ctx.txt","w");
                                 fprintf(fz,"txlen=%lu nIn=%lu flags=%llx\n",tl,v,(unsigned long long)flags);
                                 fprintf(fz,"scriptSig(%lu)=",ssl); for(unsigned z=0;z<ssl;z++)fprintf(fz,"%02x",sigb[z]); fprintf(fz,"\n");
@@ -355,20 +408,25 @@ int main(int argc, char** argv){
             if((h%16)==0 || h==start+maxblk-1){ utxo_store_sync(ST,U); }
             valid++;
             if(((h-start)%50)==0)
-                fprintf(stderr,"  h%ld txs=%llu utxo=%ld spent=%ld sigs=%ld\n",
-                    h, nt, (long)utxo_count(U), spent, nsig);
+                LLOG(3, "h%ld txs=%llu utxo=%ld spent=%ld sigs=%ld\n",
+                        h, (unsigned long long)nt, (long)utxo_count(U), spent, nsig);
             free(blk); gblk[k]=0;
         }
     }
 done:
-    fprintf(stderr,"DONE: blocks_valid=%ld bad_gate=%ld bad_sig=%ld\n", valid, bad_gate, bad_sig);
-    fprintf(stderr,"      txs=%ld inputs_spent=%ld sigs_verified=%ld outputs_added=%ld utxo_count=%ld\n",
+    LLOG(5, "DONE: blocks_valid=%ld bad_gate=%ld bad_sig=%ld\n", valid, bad_gate, bad_sig);
+    LLOG(5, "      txs=%ld inputs_spent=%ld sigs_verified=%ld outputs_added=%ld utxo_count=%ld\n",
         ntx, spent, nsig, added, (long)utxo_count(U));
-    fprintf(stderr,"      value_in=%llu value_out=%llu\n", total_val_in, total_val_out);
+    LLOG(5, "      value_in=%llu value_out=%llu\n", (unsigned long long)total_val_in, (unsigned long long)total_val_out);
     utxo_store_sync(ST,U);
     fd_close(fd);
     fprintf(stderr,"\n%s\n",
         (valid==maxblk && bad_sig==0)? "IBD VERIFY SIGNED OFF NATIVELY (all blocks, all sigs)"
         : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)"));
+    if(g_log) node_log_str(g_log, 0,
+        (valid==maxblk && bad_sig==0)? "IBD VERIFY SIGNED OFF NATIVELY (all blocks, all sigs)"
+        : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)"),
+        (long)strlen((valid==maxblk && bad_sig==0)? "IBD VERIFY SIGNED OFF NATIVELY (all blocks, all sigs)"
+        : (bad_sig==0? "IBD GATE OK (sigs clean)" : "IBD INCOMPLETE (see failures above)")));
     return (bad_sig==0 && valid==maxblk)? 0 : 1;
 }

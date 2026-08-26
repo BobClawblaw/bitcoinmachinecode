@@ -139,7 +139,7 @@ IBDOBJS = bitcoin_net.o bitcoin_p2p.o bitcoin_hash.o sha256.o bitcoin_headers.o 
           bitcoin_checksig.o bitcoin_sighash.o bitcoin_bip143.o bitcoin_script.o \
           bitcoin_scriptcodec.o bitcoin_interp.o secp256k1_ecdsa.o secp256k1_point.o \
           secp256k1_fe.o secp256k1_scalar.o bitcoin_pubkey.o secp256k1_schnorr.o \
-          sha1.o ripemd160.o
+          sha1.o ripemd160.o node_log.o
 ibd: ibd.c $(IBDOBJS)
 	$(CC) $(CFLAGS) -o ibd ibd.c $(IBDOBJS)
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
