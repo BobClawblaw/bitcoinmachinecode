@@ -64,11 +64,27 @@ static void* g_table = 0;
 static struct lsm_state g_lst;
 static int   g_ready = 0;
 
+/* Incident #48: an injected LIVE resolver replaces the snapshot below.
+ * The snapshot (utxo_lsm_reload of the datadir) is only coherent while
+ * nothing writes the LSM -- true in a short-lived inbound serve child,
+ * FALSE in the download worker, whose own utxo_live writer mutates the
+ * same files continuously: within minutes lookups returned misses and
+ * garbage script lengths ("prevout script too large" floods) and the
+ * mempool starved. The worker injects utxo_live_resolve (the same
+ * process's writer state, coherent by construction); when set, the
+ * snapshot machinery is never even allocated. */
+typedef long (*txacc_resolver_t)(const u8 txid[32], unsigned long index,
+                                 unsigned long long* value, const u8** script,
+                                 unsigned long* slen);
+static txacc_resolver_t g_resolver = 0;
+void tx_accept_set_resolver(txacc_resolver_t fn){ g_resolver = fn; }
+
 /* tx_dispatch_init(void) -> 1 ok / 0 failed. Called once per connection,
  * at node_serve_loop entry. A failure here disables tx validation for this
  * connection (see tx_accept_validate) but must not take the connection
  * down -- relay/serving of blocks and everything else keeps working. */
 int tx_dispatch_init(void){
+    if (g_resolver){ g_ready = 1; return 1; }   /* live resolver: no snapshot */
     unsigned long slots = 1UL << TXACC_SLOTS_LOG2;
     u64 blob_cap = TXACC_BLOB_BYTES;
     u64 fill_threshold = (u64)slots * 3 / 4;
@@ -121,6 +137,7 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
                                     unsigned long long* value, const u8** script,
                                     unsigned long* slen){
     (void)u;
+    if (g_resolver) return g_resolver(txid, index, value, script, slen);
     if (!g_ready) return 0;
     unsigned long height, is_coinbase;
     return utxo_lsm_get(&g_lst, g_table, txid, (u32)index, value, &height, &is_coinbase, script, slen);

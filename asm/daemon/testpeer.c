@@ -33,7 +33,7 @@ static long mk(unsigned char* b, const unsigned char prev[32], unsigned hgt){
 static void serve(int cfd){
     char cmd[12]; unsigned char pl[65536]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen);
-    unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
     p2p_write(cfd,"verack",6,"",0);
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen);
     for(int n=0;n<50;n++){
