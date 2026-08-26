@@ -98,30 +98,35 @@
 /* frame locals (offset from locals base = sp after "sub sp,#FRAME")*/
 /* callee-saved live across the whole fn: x19 spk x20 wit x21 witlen x22 nwit*/
 /*   x23 tx x24 txlen x25 n_in x26 prevouts x27 amounts x28 spks*/
-.set L_NUMIN, 0
-.set L_REASON, 8
-.set L_ANNEX, 16
-.set L_ANNEXLEN, 24
-.set L_EFF, 32
-.set L_NINIT, 40
-.set L_CONTROL, 48
-.set L_CLEN, 56
-.set L_SCRIPT, 64
-.set L_SLEN, 72
-.set L_WEIGHT, 80
-.set L_SP, 88
-.set L_MAIN, 96
-.set L_ALT, 104
-.set L_WORK, 112
-.set L_LEAF, 128  /* 32 B -> 128..159*/
-.set L_MERKLE, 160  /* 32 B -> 160..191*/
-.set L_Q, 192  /* 32 B -> 192..223*/
-.set L_ERR, 224           /* 8 B  -> 224..231*/
-.set L_CTX, 240           /* 96 B -> 240..335*/
-.set L_ST, 336            /* 120 B -> 336..455*/
-.set L_LEAFV, 456         /* 8 B  (leaf_version, persists across bl) -> 456..463*/
-.set L_X, 464             /* 40 B outgoing stack-arg area (arg9+), -> 464..503*/
-.set FRAME, 0x200         /* 16-aligned, covers locals up to 503*/
+/* Outgoing stack-arg scratch zone FIRST (AAPCS: a callee reads arg9 at its
+   entry SP+0, arg10 at SP+8, ... -- so outgoing args MUST live at [sp+0..]).
+   The keypath calls (taproot_keypath_verify{,annex}, 10/13 args) are the only
+   ones that use the zone; all other leaf calls pass <=8 register args.
+   Persistent locals therefore start ABOVE the zone. */
+.set L_XOUT, 0            /* 48 B outgoing scratch for arg9+ -> 0..47*/
+.set L_NUMIN, 48
+.set L_REASON, 56
+.set L_ANNEX, 64
+.set L_ANNEXLEN, 72
+.set L_EFF, 80
+.set L_NINIT, 88
+.set L_CONTROL, 96
+.set L_CLEN, 104
+.set L_SCRIPT, 112
+.set L_SLEN, 120
+.set L_WEIGHT, 128
+.set L_SP, 136
+.set L_MAIN, 144
+.set L_ALT, 152
+.set L_WORK, 160
+.set L_LEAF, 176           /* 32 B -> 176..207*/
+.set L_MERKLE, 208         /* 32 B -> 208..239*/
+.set L_Q, 240              /* 32 B -> 240..271*/
+.set L_ERR, 272            /* 8 B  -> 272..279*/
+.set L_CTX, 280            /* 96 B -> 280..375*/
+.set L_ST, 376             /* 120 B -> 376..495*/
+.set L_LEAFV, 496          /* 8 B  (leaf_version, persists across bl) -> 496..503*/
+.set FRAME, 0x200          /* 16-aligned, covers locals up to 503*/
 
 /* .tbss TLS arenas (Initial-Exec; PIE + non-PIE) -------------------------*/
     .section .tbss,"awT",@nobits
@@ -244,9 +249,9 @@ taproot_verify_input_asm:
     mov  x5, x25  /* n_in*/
     mov  x6, x26  /* prevouts*/
     mov  x7, x27  /* amounts*/
-    str  x28, [sp, #L_X]  /* spks (arg9)*/
+    str  x28, [sp, #(L_XOUT+0)]  /* spks (arg9)*/
     ldr  x9, [sp, #L_NUMIN]
-    str  x9, [sp, #(L_X+8)]  /* num_inputs (arg10)*/
+    str  x9, [sp, #(L_XOUT+8)]  /* num_inputs (arg10)*/
     ldr  x9, [sp, #L_ANNEX]
     cbnz x9, .kp_annex
     bl   taproot_keypath_verify
@@ -255,10 +260,10 @@ taproot_verify_input_asm:
 .kp_annex:
 /* taproot_keypath_verify_annex(..., num_inputs, annex, annexlen, NULL)*/
     ldr  x9, [sp, #L_ANNEX]
-    str  x9, [sp, #(L_X+16)]  /* arg11 annex*/
+    str  x9, [sp, #(L_XOUT+16)]  /* arg11 annex*/
     ldr  x9, [sp, #L_ANNEXLEN]
-    str  x9, [sp, #(L_X+24)]  /* arg12 annexlen*/
-    str  xzr, [sp, #(L_X+32)]  /* arg13 NULL*/
+    str  x9, [sp, #(L_XOUT+24)]  /* arg12 annexlen*/
+    str  xzr, [sp, #(L_XOUT+32)]  /* arg13 NULL*/
     bl   taproot_keypath_verify_annex
     cbnz w0, .accept
     b    .r_kp_ax
