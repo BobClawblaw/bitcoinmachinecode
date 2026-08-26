@@ -1,5 +1,5 @@
 Differential SCRIPT-EXECUTION corpus vs Core
-generated: 2026-08-26T09:49:09Z  tip: 964120  elapsed: 4.5s  seed: 20260825
+generated: 2026-08-26T10:08:48Z  tip: 964120  elapsed: 2.4s  seed: 20260825
 
 spends: 99 (accept-parity ok 99, both-reject 0)
 mutations: 594 (agree 594, did-not-flip 26)

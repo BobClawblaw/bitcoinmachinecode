@@ -252,11 +252,42 @@ In rough order of how much each would move it:
    this method and the reason every reported divergence is chased to its
    cause before it is believed.
 
-   What this item would now ask for is a different KIND of coverage rather
-   than more of the same: script-size and resource limits (sigop budgets,
-   stack/element ceilings, the 10,000-byte script bound), and the
-   opcode-level interpreter surface (OP_SUCCESSx, disabled opcodes, minimal-
-   encoding edges) where the SETcc false accept originally lived.
+   **The interpreter surface followed** -- the one this item named as the
+   place the SETcc false accept originally lived. 7,797 bare-script probes,
+   all agreeing with Core, driven by a different assertion from the spend
+   synthesizers: most are deliberately invalid, so what is required is
+   AGREEMENT rather than acceptance, which makes wide coverage cheap.
+
+   The bulk is a systematic sweep of the arithmetic and comparison opcodes --
+   every binary op over 25 boundary operands (sign changes, byte-width
+   boundaries at 127/128/255/256/32767/65535/8388607, the CScriptNum 4-byte
+   ceiling), plus the unary ops and OP_WITHIN's range boundaries. That is
+   precisely the shape of the original bug: a wrong SETcc/movzx width flips
+   the verdict for some operand pair and nothing else.
+
+   The rest pins the structural rules an implementation can plausibly get
+   wrong in the ACCEPT direction: disabled opcodes and the 201-opcode limit
+   failing even in an UNEXECUTED branch (Core checks both before the fExec
+   gate); OP_VERIF/OP_VERNOTIF always invalid while OP_RESERVED/OP_VER are
+   fine when unexecuted; the 520-byte element and 1,000-element stack
+   ceilings at their exact boundaries; unbalanced conditionals; CScriptNum
+   4-vs-5-byte operands; and push-encoding edges. BIP342's OP_SUCCESSx is
+   covered across every disjoint range of Core's own IsOpSuccess, including
+   the cases that matter most -- OP_SUCCESS wins over an unparseable
+   remainder, over an unexecuted branch, and over a preceding OP_RETURN --
+   with opcode 186 (just below the range) asserted to still FAIL, so the
+   boundary is proven rather than assumed, and an unknown leaf version
+   succeeding after the commitment check alone.
+
+   Two harness faults surfaced and were fixed, neither a node bug: an empty
+   scriptSig sent as an empty whitespace-delimited field shifted every later
+   field left (a wall of phantom divergences on the first run), and the
+   negative cases needed explicit "Core must REJECT" support rather than
+   being counted as construction failures.
+
+   What remains uncovered here is resource accounting rather than semantics:
+   sigop budgets, the taproot per-input validation weight budget, and the
+   10,000-byte script bound.
 3. **A measured, fairly-controlled end-to-end comparison against Core with
    `-assumevalid=0`.** Until then, no end-to-end speed claim should be made.
 4. ~~**A full replay to tip, clean**~~ — **done (2026-08-25): the

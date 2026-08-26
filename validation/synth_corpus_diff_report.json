@@ -1,6 +1,6 @@
 {
- "cases": 35,
- "accept_ok": 35,
+ "cases": 55,
+ "accept_ok": 55,
  "muts": 95,
  "mut_agree": 95,
  "accept_div": [],
@@ -150,6 +150,106 @@
    "mut_ok": 2,
    "div": 0
   },
+  "opsuccess/80 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/98 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/126 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/129 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/131 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/134 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/137 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/138 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/141 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/142 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/149 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/153 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/187 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/200 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/254 alone": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/187 then a truncated PUSHDATA": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/187 inside an unexecuted OP_IF": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/187 after OP_RETURN": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "opsuccess/186 is NOT OP_SUCCESS (must fail)": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "leafver/0xc2 unknown version, invalid script": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
   "p2sh-p2wpkh": {
    "accept": 1,
    "mut_ok": 2,
@@ -186,5 +286,9 @@
    "div": 0
   }
  },
- "elapsed": 0.0
+ "ip_cases": 7797,
+ "ip_agree": 7797,
+ "ip_accept": 5638,
+ "ip_mislabelled": [],
+ "elapsed": 0.2
 }
