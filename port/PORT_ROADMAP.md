@@ -134,7 +134,7 @@ and runs natively.
       (persist_only), D prune@100 (prune_all), E prune@-1 (clamp->persist),
       F prune@200 (clamp->prune_all), G empty store: ALL PASS; plus existing
       test_store 41 still PASS. Unlocks bitcoin_store_fast. (2026-08-26)
-- [x] bitcoin_store_fast  -> port/arm64/bitcoin_store_fast.S (commit <NEW>):
+- [x] bitcoin_store_fast  -> port/arm64/bitcoin_store_fast.S (commit d824396):
       read-path fd cache (pread64, 8 slots @st+64, magic RDFC@+56) + mmap-backed
       ZERO-COPY map cache (4 slots @st+128, magic MAP@+120). 11 exports:
       store_rd_init/_close/_fd, store_read_meta/_at, store_rd_advise,
