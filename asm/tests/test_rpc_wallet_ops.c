@@ -444,7 +444,6 @@ int main(void){
         "encryptwallet","createwallet","loadwallet","unloadwallet","restorewallet",
         "migratewallet","setwalletflag","importdescriptors","createwalletdescriptor",
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
-        "walletdisplayaddress",
         "walletprocesspsbt","bumpfee","psbtbumpfee" };
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
@@ -456,6 +455,13 @@ int main(void){
           rj_free(r);
       }
       ck("every unsupported wallet method errors with a substantive reason", allbad);
+      /* walletdisplayaddress is implemented now (rpc_signer.c): with no
+       * signer configured it answers Core's exact restart message */
+      { rj_val* pp = P("[\"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\"]");
+        D("walletdisplayaddress", pp);
+        ck("walletdisplayaddress without a signer -> Core's restart message",
+           rc == 0 && ec == -1 && em && strstr(em, "restart bitcoind with -signer"));
+        rj_free(r); rj_free(pp); }
       /* the ones that cannot answer must say WHY, so a reader knows the gap
        * is a missing rescan and not a missing formatter */
       /* The receive-side family is implemented now, but this harness has no

@@ -2515,11 +2515,10 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return ctl_unsupported(
             "this node uses no asmap: peer diversity is not bucketed by AS, so "
             "there is no mapping to export", err_code, err_msg);
-    if (!strcmp(method, "enumeratesigners"))
-        return ctl_unsupported(
-            "this node has no external signer interface at all -- there is no "
-            "-signer option to restart with, and walletdisplayaddress reports "
-            "the same gap", err_code, err_msg);
+    if (!strcmp(method, "enumeratesigners")){
+        extern int rpc_signer_enumerate(rj_val**, long*, const char**);
+        return rpc_signer_enumerate(result, err_code, err_msg);
+    }
     if (!strcmp(method, "combinerawtransaction"))
         return cmd_combinerawtransaction(params, err_code, err_msg, result);
     if (!strcmp(method, "finalizepsbt"))
