@@ -73,12 +73,12 @@ parse_varint:
 	ret
 .pv_wide:
 	mov  x4, #2
+	cmp  w2, #0xfd
+	b.eq .pv_load            /* 0xfd: 2-byte value */
+	mov  x4, #4
 	cmp  w2, #0xfe
-	b.eq .pv_load
-	mov  x4, #8
-	cmp  w2, #0xff
-	b.eq .pv_load
-	/* 0xfd: width 2 */
+	b.eq .pv_load            /* 0xfe: 4-byte value */
+	mov  x4, #8              /* 0xff: 8-byte value */
 .pv_load:
 	add  x5, x3, x4
 	cmp  x5, x1
