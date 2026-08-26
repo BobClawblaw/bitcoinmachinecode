@@ -322,13 +322,13 @@ plus straightforward methods on top of it.
     path genuinely read-only (the ordinary reload's `O_RDWR|O_CREAT` on
     utxo.dat/utxo.idx was the only write in the chain).
   - ~~Still missing, and deliberately: a live `gettxoutsetinfo` RPC~~ —
-    **done 2026-08-25**: the RPC exists, built on the same tool-derived
-    reader (one quiescence discipline by construction), refusing while the
-    set is being written rather than guessing. Still missing, still
-    deliberately: the incrementally-maintained index (Core's
-    `coinstatsindex` updates per block; ours is a full O(set) walk, ~90 s /
-    ~6 min with MuHash) and `hash_serialized_3` (refused by name; muhash is
-    our default).
+    **done 2026-08-25**; ~~the incrementally-maintained index~~ — **DONE
+    2026-08-26** (`daemon/coinstats_index.c`): per-block MuHash fold with
+    Fermat-inverse removal, persisted at the block durability point,
+    seeded once by walk, adopted instantly thereafter; the RPC answers in
+    ~33 ms and the incremental digest is PROVEN character-identical to the
+    oracle's at a height folded incrementally (964204). Still refused by
+    name: `hash_serialized_3` (muhash is our default).
 
 ## Wallet
 
@@ -409,6 +409,9 @@ Confirmed absent:
 - **ZMQ notification interface** — zero hits.
 - **REST interface** (separate from JSON-RPC) — zero hits.
 - **UPnP / NAT-PMP** automatic port forwarding — zero hits.
+- ~~Addr self-advertisement~~ — **DONE 2026-08-26** (`daemon/addr_self.c`):
+  external IPv4 from two agreeing peers' addr_recv views, announced with
+  the CONFIGURED port on the 24h cadence.
 
 ## Mining
 
