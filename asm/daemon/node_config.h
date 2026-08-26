@@ -55,6 +55,13 @@ typedef struct {
     int  listen;                 /* Core -listen                             */
     int  blocksonly;
     char signer[512];   /* external signer command (Core -signer / HWI); "" = none */             /* Core -blocksonly: no tx relay            */
+    /* Core -zmqpub<topic>=<address>. One address per topic; topics sharing an
+     * address share one socket, as in Core. Empty = that topic is not
+     * published. See daemon/zmq_pub.c. */
+    char zmq_hashblock[64];
+    char zmq_hashtx[64];
+    char zmq_rawblock[64];
+    char zmq_rawtx[64];
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */

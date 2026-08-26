@@ -19,6 +19,9 @@ asm/tests/probe_own_serve
 asm/tests/parconn_test
 asm/tests/live_five
 asm/tests/test_abi_stack_align
+asm/tests/test_zmq_ring
+asm/tests/zmq_pub_drill
+asm/tests/zmq_realblock_check
 asm/tests/test_add
 asm/tests/test_addm
 asm/tests/test_bitcoind
