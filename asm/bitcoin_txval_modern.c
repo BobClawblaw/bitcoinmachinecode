@@ -80,6 +80,16 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
  * stack. CONSENSUS block validation is daemon/tx_verify.c, which pools the
  * items and admits the full ~1004-item range -- see TXV_MAX_WIT_ITEMS. */
 #define MV_MAX_WIT 100
+/* Input/output bounds for mempool admission. These were BOTH 16 -- fine for
+ * every synthetic fixture, and a mass-rejector ("malformed tx") the first
+ * day the node fetched REAL relayed transactions: exchange batching and
+ * consolidation txs routinely carry hundreds of inputs/outputs. Core's
+ * standardness cap is MAX_STANDARD_TX_WEIGHT (400k WU = 100 kvB), which
+ * bounds inputs at ~1,500 (P2WPKH ~68 vB each) and outputs at ~3,200
+ * (~31 vB each); the sizes below cover the full standard range with slack.
+ * Consensus block validation is daemon/tx_verify.c with its own bounds. */
+#define MV_MAX_IN  2048
+#define MV_MAX_OUT 4096
 typedef struct {
     uint8_t outpoint[36];
     uint8_t scriptSig[64]; uint32_t scriptSiglen;   /* 35 for P2SH-P2WSH (0x22 + 34); was 32, which silently truncated it */
@@ -94,7 +104,7 @@ typedef struct {
     const uint8_t* tx; int64_t txlen;
     uint64_t version;
     uint64_t nin, nout;
-    inrec_t in[16];
+    inrec_t in[MV_MAX_IN];
     uint64_t out_total;
 } mv_tx_t;
 
@@ -127,10 +137,16 @@ static int mv_parse(mv_tx_t* T){
     int segwit = (p[0]==0x00 && p[1]==0x01);
     if (segwit) p += 2;
     uint64_t nin = rd_cs(&p, end, &ok);
-    if (!ok || nin == 0 || nin > 16) return 0;
+    if (!ok || nin == 0 || nin > MV_MAX_IN) return 0;
     T->nin = nin;
     for (uint64_t i=0;i<nin;i++){
         inrec_t* in = &T->in[i];
+        /* T is static now (in[] alone is ~2.8 MB -- too large to memset per
+         * call, never mind carve from the stack); each input record is
+         * zeroed here, exactly when it is about to be filled, so state from
+         * the previous transaction (a non-segwit tx after a segwit one
+         * would otherwise inherit stale wit/nwit) cannot leak forward. */
+        memset(in, 0, sizeof *in);
         if (p + 36 > end) return 0;
         memcpy(in->outpoint, p, 36); p += 36;
         uint64_t sl = rd_cs(&p, end, &ok);
@@ -144,7 +160,7 @@ static int mv_parse(mv_tx_t* T){
         in->sequence = (uint32_t)(p[0]|(p[1]<<8)|(p[2]<<16)|((uint32_t)p[3]<<24)); p += 4;
     }
     uint64_t nout = rd_cs(&p, end, &ok);
-    if (!ok || nout > 16) return 0;
+    if (!ok || nout > MV_MAX_OUT) return 0;
     T->nout = nout;
     T->out_total = 0;
     for (uint64_t i=0;i<nout;i++){
@@ -215,13 +231,24 @@ static const char* g_reason = "accepted";
 const char* txval_last_reason(void){ return g_reason; }
 int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
     g_reason = "accepted";
-    mv_tx_t T; memset(&T, 0, sizeof T); T.tx = tx; T.txlen = txlen;
+    /* static: in[MV_MAX_IN] is megabytes. Callers are single-threaded by
+     * architecture (the download worker's main loop; one serve child per
+     * inbound connection) -- consensus block validation never comes through
+     * here (daemon/tx_verify.c). Scalars reset here; per-input records are
+     * zeroed in mv_parse as they are filled. */
+    static mv_tx_t T;
+    T.tx = tx; T.txlen = txlen;
+    T.version = 0; T.nin = 0; T.nout = 0; T.out_total = 0;
     if (!mv_parse(&T)){ g_reason = "malformed tx"; return 0; }
     if (T.nin == 0 || T.nout == 0){ g_reason = "empty inputs/outputs"; return 0; }
     if (!mv_resolve(&T, utxo, &g_reason)) return 0;
 
-    /* strip witness for BIP341 (taproot) -- BIP143 paths accept full segwit */
-    static uint8_t ns[1024];
+    /* strip witness for BIP341 (taproot) -- BIP143 paths accept full segwit.
+     * Sized for the LARGEST STANDARD transaction (100 kvB), not the 1 KB the
+     * first draft used -- which "malformed witness"-rejected every real tx
+     * whose stripped serialization passed 1 KB, the same first-contact
+     * failure shape as the 16-input cap above. */
+    static uint8_t ns[400*1024];
     long nslen = strip_witness(tx, txlen, ns, sizeof ns);
     if (nslen <= 0){ g_reason = "malformed witness"; return 0; }
 
