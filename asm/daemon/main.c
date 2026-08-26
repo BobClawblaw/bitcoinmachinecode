@@ -186,6 +186,11 @@ extern void zmqpub_poll(void);
 extern void txit_boot(void* store_buf);                                       /* daemon/tx_index_tail.c */
 extern int  txit_active(void);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
+extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
+typedef int (*bfi_undo_cb_t)(void*, const unsigned char*, unsigned int, unsigned long long,
+                             unsigned int, unsigned char, const unsigned char*, unsigned short);
+extern void bfi_set_undo_replay(long (*fn)(long, bfi_undo_cb_t, void*));
+extern void bfi_on_truncate(long new_tip);
 extern void zmqpub_notify(const char* topic, const void* body, unsigned long blen);
 extern void zmqn_set_status(node_status_t* st);
 extern int  zmqn_drain(void);
@@ -266,6 +271,7 @@ static void rebuild_hash_index_after_reorg(void){
      * already-indexed (fires with tip == fork height on the mid-reorg
      * invocation; the post-reconnect invocation is a no-op) */
     { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
+    { extern void bfi_on_truncate(long); bfi_on_truncate(*(int*)(store_buf+24)); }
 }
 
 /* Build the hash->height index from the IN-MEMORY store (used where the chain
@@ -2320,6 +2326,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
 
     { extern void addrself_init(unsigned short, int);
       addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
+    { extern long undo_replay(long, bfi_undo_cb_t, void*);
+      bfi_set_undo_replay(undo_replay); }
     /* txid-index tail: establish coverage and close the gap between the
      * offline base build (or the previous run's tail) and the current tip.
      * After the archive verify -- a repair may have truncated heights the
@@ -3172,7 +3180,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                  * must too. The loop is bounded by the burst size and reads
                  * each block ONCE from the archive it was just written to,
                  * feeding both consumers. */
-                if (zmqpub_active() || txit_active()){
+                if (zmqpub_active() || txit_active() || 1 /* bfi probes cheaply */){
                     static unsigned char zb[RPC_BLKSUBMIT_MAX];
                     for (int zh = last_seen_tip + 1; zh <= now_tip; zh++){
                         long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
@@ -3185,6 +3193,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * (idempotent by height -- a replayed height is a
                          * no-op) */
                         txit_on_block(store_buf, zh, zb, bl);
+                        /* filter index tail: adopt/append (cheap probe when
+                         * the backfill has not closed in yet) */
+                        bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
                         if (!zmqpub_active()) continue;
                         /* The block HASH is sha256d over the 80-byte
                          * header, REVERSED: Core's notifier flips the bytes

@@ -2813,6 +2813,26 @@ static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, cons
         *ec = -5; *em = "Unknown filtertype"; return 0; }
     long blen = read_block(h);
     if (blen < 81){ *ec = -1; *em = "Block not available"; return 0; }
+    /* the persistent index serves filter AND header without undo data --
+     * try it before the undo-window path even collects prevouts */
+    { extern int bfi_get_file(long, unsigned char*, unsigned long, unsigned long*, unsigned char*);
+      static unsigned char iflt[1 << 20]; unsigned long ifl; unsigned char ihdr[32];
+      if (bfi_get_file(h, iflt, sizeof iflt, &ifl, ihdr)){
+          char* hx = malloc(ifl * 2 + 1);
+          if (!hx){ *ec = -7; *em = "oom"; return 0; }
+          for (unsigned long i = 0; i < ifl; i++){
+              static const char* H = "0123456789abcdef";
+              hx[i*2] = H[iflt[i]>>4]; hx[i*2+1] = H[iflt[i]&15];
+          }
+          hx[ifl*2] = 0;
+          rj_val* o = rj_obj();
+          rj_obj_set(o, "filter", rj_str(hx));
+          free(hx);
+          char hh[65]; hex_rev(hh, ihdr, 32);
+          rj_obj_set(o, "header", rj_str(hh));
+          *res = o;
+          return 1;
+      } }
     /* the spent-prevout scripts, from undo data */
     gbf_ctx c;
     c.v = malloc(GBF_MAX_PREV * sizeof *c.v);
@@ -3302,6 +3322,15 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txindex", e);
     }
+    { extern long bfi_probe_count(void);
+      long bn = bfi_probe_count();
+      if (bn >= 0 && (!want || !strcmp(want, "basic block filter index"))){
+          rj_val* e = rj_obj();
+          long tip = refresh();
+          rj_obj_set(e, "synced", rj_bool(tip >= 0 && bn - 1 >= tip));
+          rj_obj_set(e, "best_block_height", rj_numf("%ld", bn - 1));
+          rj_obj_set(o, "basic block filter index", e);
+      } }
     if (g_csi_h && (!want || !strcmp(want, "coinstatsindex"))){
         long ch = g_csi_h();
         if (ch >= 0){
