@@ -41,7 +41,7 @@ static void fake_peer(int cfd){
     unsigned char v[102];
     unsigned char* p=v;
     p[0]=0x80;p[1]=0x11;p[2]=0x01;p[3]=0x00;                 /* version */
-    memset(p+4,0,8); p[4]=1;                                  /* services=1 */
+    memset(p+4,0,8); p[4]=9;                                  /* services=NETWORK|WITNESS */
     memset(p+12,0,8);                                         /* ts=0 */
     memset(p+20,0,26); memset(p+46,0,26);                     /* addrs */
     memset(p+72,0,8); v[72]=0x99;                             /* nonce */
@@ -63,7 +63,7 @@ int main(void){
     long n = node_make_version(vb);
     cki("version len", n, 81 + NODE_UA_STRING_LEN + 5);
     cki("version field", vb[0]==0x80&&vb[1]==0x11&&vb[2]==0x01&&vb[3]==0x00, 1);
-    cki("services=1", vb[4]==1, 1);
+    cki("services=9 (NETWORK|WITNESS)", vb[4]==9, 1);
     unsigned long long ts; memcpy(&ts,vb+12,8); cki("timestamp", (long)ts, 1700000000);
     unsigned short pr; memcpy(&pr,vb+44,2); cki("addr_recv port 0x8d20", pr, 0x8d20);
     memcpy(&pr,vb+70,2); cki("addr_from port 0x8d20", pr, 0x8d20);
@@ -90,7 +90,7 @@ int main(void){
     unsigned pproto=0; memcpy(&pproto, g_peer_version_payload, 4);
     cki("captured proto", pproto, 0x00011180u);
     unsigned long long psvc=0; memcpy(&psvc, g_peer_version_payload+4, 8);
-    cki("captured services", (long)psvc, 1);
+    cki("captured services", (long)psvc, 9);
     cki("captured nonce byte", g_peer_version_payload[72], 0x99);
     cki("captured UA len", g_peer_version_payload[80], 16);
     cki("captured UA bytes", memcmp(g_peer_version_payload+81, "/Satoshi:27.1.0/", 16)==0, 1);

@@ -39,8 +39,9 @@ static int srt_hex1(char c){
     return -1;
 }
 
-/* our node advertises NODE_NETWORK(1) only (see bitcoind.asm version msg) */
-#define NODE_LOCAL_SERVICES 0x0000000000000001ULL
+/* our node advertises NODE_NETWORK(1)|NODE_WITNESS(8) -- it serves witness
+ * blocks (see bitcoind.asm's version msg, kept in sync with this) */
+#define NODE_LOCAL_SERVICES 0x0000000000000009ULL
 
 /* Core encodes CLIENT_VERSION as 10000*major + 100*minor + patch. */
 static long node_client_version(void){
@@ -77,6 +78,7 @@ static int cmd_getnetworkinfo(rj_val** res){
     { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)NODE_LOCAL_SERVICES);
       rj_obj_set(o, "localservices", rj_str(h)); }
     { rj_val* names = rj_arr(); rj_arr_push(names, rj_str("NETWORK"));
+      rj_arr_push(names, rj_str("WITNESS"));
       rj_obj_set(o, "localservicesnames", names); }
     rj_obj_set(o, "localrelay", rj_bool(1));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
@@ -281,6 +283,41 @@ static int g_n_addnode;
 
 void rpc_node_set_addednodes(const char (*list)[64], int n){
     g_addnode = list; g_n_addnode = n;
+}
+
+/* getzmqnotifications -- the four configured publish endpoints, injected the
+ * same way as the added-node list so this file stays free of node_config.
+ * Core's answer is [{type:"pubhashtx", address, hwm}, ...], one entry per
+ * CONFIGURED topic, in Core's own fixed order.
+ *
+ * hwm is reported as 0, and that is a statement, not a shrug: Core's field
+ * is libzmq's send high-water mark (default 1000 queued messages). This
+ * publisher has no such queue -- the kernel socket buffer is the only
+ * buffering, and a subscriber that falls behind it is dropped (see
+ * zmq_pub.c). 0 is ZMQ's own encoding of "no limit set here", which is the
+ * closest true description of that behaviour. */
+static const char* g_zmq_ep[4];   /* hashblock, hashtx, rawblock, rawtx */
+
+void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
+                      const char* rawblock, const char* rawtx){
+    g_zmq_ep[0] = hashblock; g_zmq_ep[1] = hashtx;
+    g_zmq_ep[2] = rawblock;  g_zmq_ep[3] = rawtx;
+}
+
+static int cmd_getzmqnotifications(rj_val** res){
+    static const char* const NAMES[4] =
+        { "pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx" };
+    rj_val* arr = rj_arr();
+    for (int i = 0; i < 4; i++){
+        if (!g_zmq_ep[i] || !g_zmq_ep[i][0]) continue;
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "type",    rj_str(NAMES[i]));
+        rj_obj_set(o, "address", rj_str(g_zmq_ep[i]));
+        rj_obj_set(o, "hwm",     rj_num("0"));
+        rj_arr_push(arr, o);
+    }
+    *res = arr;
+    return 1;
 }
 
 /* An added node counts as connected when a live peer slot's "ip:port" starts
@@ -1329,7 +1366,7 @@ static const char* const NODE_METHODS[] = {
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
-    "setban", "setnetworkactive", "ping",
+    "setban", "setnetworkactive", "ping", "getzmqnotifications",
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
 
@@ -1388,6 +1425,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "setban"))             return cmd_setban(params, res, ec, em);
     if (!strcmp(m, "setnetworkactive"))   return cmd_setnetworkactive(params, res, ec, em);
     if (!strcmp(m, "ping"))               return cmd_ping(res, ec, em);
+    if (!strcmp(m, "getzmqnotifications")) return cmd_getzmqnotifications(res);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
     if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);

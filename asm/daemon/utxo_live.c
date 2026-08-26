@@ -295,6 +295,24 @@ static long read_applied_height(void){
     return h;
 }
 
+/* ---- coinstats-index observers (daemon/coinstats_index.c) ---------------
+ * Registered by the worker at boot; NULL everywhere else (tests, tools),
+ * so no link set changes. add/remove fire only on REAL state transitions
+ * (put returned 1 / del of a coin that existed) -- the property that makes
+ * a crash-resumed re-apply a no-op stream and a partial-apply rollback an
+ * exactly-cancelling one. invalidate fires on the paths whose events this
+ * module cannot describe (pre-BIP34 coinbase overwrite, spends outside the
+ * undo-capture path). */
+typedef void (*csi_coin_fn)(const u8 txid[32], u32 index, u64 value, u64 height,
+                            u64 coinbase, const u8* script, unsigned long slen);
+static csi_coin_fn g_csi_add = 0, g_csi_rm = 0;
+static void (*g_csi_inval)(const char*) = 0;
+static void (*g_csi_commit)(long) = 0;   /* per-block durability point */
+void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
+                             void (*inval)(const char*), void (*commit)(long)){
+    g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
+}
+
 static int persist_applied_height(long h){
     u8 buf[12];
     u32 magic = UTXO_APPLIED_HEIGHT_MAGIC;
@@ -312,6 +330,10 @@ static int persist_applied_height(long h){
     }
     int dfd = open(".", O_RDONLY);
     if (dfd >= 0) { fsync(dfd); close(dfd); }
+    /* the coinstats index persists at the SAME durability point, so its
+     * stored height can only ever match or trail the applied height by a
+     * crash window -- which boot detects and re-seeds */
+    if (g_csi_commit) g_csi_commit(h);
     return 1;
 }
 
@@ -344,6 +366,7 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
         UTXO_LIVE_TEST_CRASH_AT(UTXO_LIVE_CRASH_AFTER_INPUTS, g_test_input_count);
         return;
     }
+    if (g_csi_inval) g_csi_inval("spend outside undo capture (bulk mode)");
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, txid, index);
     if (r == -1) ctx->fatal = 1;
 }
@@ -398,7 +421,14 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
      * the second put writes the new one, which is what the WAL replays in
      * order on reload. Live-count is unchanged (one del, one put) because the
      * outpoint exists both before and after. */
+    if (r == 1 && g_csi_add)
+        g_csi_add(ctx->txid, out_index, value, (u64)g_apply_height,
+                  (u64)ctx->is_coinbase, script, slen);
     if (r == 0 && ctx->is_coinbase) {
+        /* the OLD coin's fields are not in scope here, so this overwrite's
+         * remove-event cannot be described -- pre-BIP34 heights only, which
+         * a live-seeded index never replays */
+        if (g_csi_inval) g_csi_inval("pre-BIP34 duplicate-coinbase overwrite");
         if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, ctx->txid, out_index) < 0) {
             ctx->fatal = 1; return;
         }
@@ -407,6 +437,7 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
         fprintf(stderr, "[utxo_live] h=%ld: duplicate coinbase outpoint overwritten (Core: AddCoins overwrite=fCoinbase)\n",
                 g_apply_height);
     } else if (r == 0) {
+        if (g_csi_inval) g_csi_inval("non-coinbase duplicate outpoint");
         /* A NON-coinbase duplicate. Core does not tolerate this at all: its
          * AddCoin throws "Attempted to overwrite an unspent coin" when
          * possible_overwrite is false. BIP30 is what makes it unreachable, and
@@ -1072,6 +1103,8 @@ static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
     long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value,
                           (u64)height, (u64)is_coinbase, script, (u32)slen);
     if (r == -1 || r == 2) { *fatal = 1; return 0; }
+    if (r == 1 && g_csi_add)
+        g_csi_add(txid, index, value, (u64)height, (u64)is_coinbase, script, (unsigned long)slen);
     return 1;
 }
 
@@ -1099,8 +1132,15 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
      * created output, on rollback/unapply paths only. */
     u64 v=0; unsigned long hh=0, cb=0, sl=0; const u8* sc=0;
     if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1) return;
+    /* copy the script BEFORE the del: get()'s pointer is only valid until
+     * the next LSM call, and the remove-event needs the exact bytes */
+    static u8 scbuf[10000];
+    unsigned long scn = sl <= sizeof scbuf ? sl : 0;
+    if (scn) memcpy(scbuf, sc, scn);
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index);
     if (r == -1) c->fatal = 1;
+    else if (r == 1 && g_csi_rm && scn == sl)
+        g_csi_rm(c->txid, out_index, v, (u64)hh, (u64)cb, scbuf, sl);
 }
 
 /* rollback_partial_apply(blockbuf, blocklen, upto_t_inclusive): reverse
@@ -1780,6 +1820,30 @@ void utxo_live_set_flush_thresholds(u64 fill, u64 op){
  * that could lag it. */
 void* utxo_live_table(void){ return g_utxo_table; }
 void* utxo_live_lst(void){ return &g_utxo_lst; }
+
+/* Resolve one confirmed prevout against the LIVE writer state -- the
+ * in-process mempool resolution the comment above promises. Matches
+ * tx_accept.c's resolver contract (value/script/slen; height and coinbase
+ * discarded there by its own stated contract). The returned script pointer
+ * is valid until the next LSM operation, so callers must copy before
+ * yielding -- mv_resolve does. Incident #48: the worker validated relayed
+ * transactions against a SECOND, boot-latched LSM snapshot of the same
+ * datadir this writer mutates in place; lookups went incoherent within
+ * minutes (missing entries, garbage script lengths). utxo_setinfo's
+ * quiescence discipline exists precisely because a live LSM cannot be
+ * snapshot-read while written -- resolving against the writer itself is
+ * the coherent (and cheaper) alternative. */
+long utxo_live_resolve(const u8 txid[32], unsigned long index,
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase, const u8** script,
+                       unsigned long* slen){
+    if (!g_utxo_table) return 0;
+    u64 v;
+    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid, (u32)index,
+                     &v, height, is_coinbase, script, slen) != 1) return 0;
+    *value = (unsigned long long)v;
+    return 1;
+}
 
 void utxo_live_close(void){
     utxo_lsm_close(&g_utxo_lst);

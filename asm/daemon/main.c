@@ -94,6 +94,25 @@ extern long node_handshake(int fd);
 extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, see its header comment */
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
+
+/* NODE_WITNESS (service bit 0x8) gate, checked right after every OUTBOUND
+ * handshake that can lead to fetching blocks or transactions. A peer without
+ * the bit serves everything witness-STRIPPED no matter what getdata type we
+ * send -- the wire behaviour that silently stripped the whole segwit-era
+ * archive (incident #10). The BIP141 commitment check now rejects such
+ * blocks loudly, so a non-witness peer can no longer corrupt the archive --
+ * but it can still waste a leg failing every fetch, so refuse at dial time.
+ * A version payload too short to carry services is refused the same way:
+ * unknown is not "probably fine" on the path that feeds the archive. */
+static int peer_has_witness(const char* who){
+    unsigned long long services = 0;
+    if (g_peer_version_len >= 12)
+        memcpy(&services, g_peer_version_payload + 4, 8);
+    if (services & 0x8ULL) return 1;
+    fprintf(stderr, "[dial] %s lacks NODE_WITNESS (services=0x%llx) -- dropping\n",
+            who ? who : "?", services);
+    return 0;
+}
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
 /* STAGE B: the real multi-hash-locator entry point. node_sync is now a
  * count==1 shim over this (see bitcoind.asm). A single-hash locator is what
@@ -157,6 +176,20 @@ extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
 extern long store_get_tip(void* st);
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
+/* ZMQ notifications: publisher (daemon/zmq_pub.c) + the cross-process
+ * staging ring (daemon/zmq_notify.c). The publisher owns sockets and so runs
+ * in the download worker ONLY; the ring is what lets the serve children
+ * contribute the transactions they accept. */
+extern int  zmqpub_add(const char* topic, const char* addr);
+extern int  zmqpub_active(void);
+extern void zmqpub_poll(void);
+extern void txit_boot(void* store_buf);                                       /* daemon/tx_index_tail.c */
+extern int  txit_active(void);
+extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
+extern void zmqpub_notify(const char* topic, const void* body, unsigned long blen);
+extern void zmqn_set_status(node_status_t* st);
+extern int  zmqn_drain(void);
+extern long store_read_at(void* st, unsigned long h, void* out, long cap);
 extern long node_ibd(int fd, void* st, void* hst, void* buf, long buflen); /* bitcoind.asm */
 extern long node_drain(int fd, void* st, void* buf, long buflen);          /* bitcoind.asm */
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count); /* bitcoind.asm */
@@ -228,6 +261,11 @@ static void rebuild_hash_index_after_reorg(void){
         fprintf(stderr,"[reorg] WARNING: hash index rebuild failed; block-by-hash serving is degraded until restart\n");
     else
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
+    /* the txid-index tail's covered-height watermark must follow a
+     * truncation too, or the reconnected blocks would be skipped as
+     * already-indexed (fires with tip == fork height on the mid-reorg
+     * invocation; the post-reconnect invocation is a no-op) */
+    { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
 }
 
 /* Build the hash->height index from the IN-MEMORY store (used where the chain
@@ -332,7 +370,7 @@ static long outbound_catchup(long max_blocks){
         if(fd<0) continue;
         struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-        if(node_handshake(fd)!=1){ close(fd); continue; }
+        if(node_handshake(fd)!=1 || !peer_has_witness(host)){ close(fd); continue; }
         static unsigned char loc[32];
         /* Anchor from the STORED TIP index record (index-hash read, robust to a
          * transiently-unreadable tip body -- avoiding the live-found genesis
@@ -392,7 +430,7 @@ static void fake_serve(int cfd){
     build_fake_chain();
     char cmd[12]; unsigned char pl[65536]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client version */
-    unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
     p2p_write(cfd,"verack",6,"",0);
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client verack */
     for(int n=0;n<64;n++){
@@ -421,7 +459,7 @@ static void full_serve(int cfd){
     fake_NB=8;                                   /* expose the WHOLE chain now */
     char cmd[12]; unsigned char pl[65536]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client version */
-    unsigned char v[102]; memset(v,0,sizeof v); v[4]=1; p2p_write(cfd,"version",7,v,86);
+    unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
     p2p_write(cfd,"verack",6,"",0);
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); /* client verack */
     int gd=0;
@@ -816,12 +854,16 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     sigaction(SIGALRM,&old,NULL);
 
     if(fd<0) return -1;
-    if(fired || hk!=1){
+    if(fired || hk!=1 || !peer_has_witness(host)){
         if(fired) fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
                           host, OUTBOUND_DIAL_BUDGET_SECS);
         close(fd);
         return -1;
     }
+    /* the peer's version told us how it sees US -- feed the self-address
+     * tally (daemon/addr_self.c) */
+    { extern void addrself_note_peer_view(const unsigned char*, long);
+      addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
     /* handshake done: tighten the recv bound so each node_sync pass returns
      * promptly when the peer is already at the chain tip */
     struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
@@ -1471,7 +1513,7 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-    if(node_handshake(fd)!=1){ close(fd); return -1; }
+    if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
     return added;
@@ -1604,7 +1646,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons(8333));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-                    if(node_handshake(fdc)==1){
+                    if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
@@ -2190,11 +2232,29 @@ static unsigned long long txsub_last_seq = 0;
 static unsigned long long ctl_last_seq = 0;
 static unsigned long long blksub_last_seq = 0;
 
+/* The pool the worker's accepts land in: the cross-process SHARED pool
+ * (mempool_configure, pre-fork) when it exists, else the private fallback.
+ * Until 2026-08-26 this was unconditionally the private txsub_mp_area --
+ * which meant a sendrawtransaction accepted here was INVISIBLE to the
+ * parent's getrawmempool/getmempoolinfo (they read mp_ext_area via
+ * rpc_mempool_hooks below): the submission path predates the shared pool
+ * and was never re-pointed at it. The asm serve children already prefer
+ * mp_ext_area (bitcoin_serve.asm's .mp_external); this makes the worker
+ * consistent with them. */
+static void* txsub_pool(void){
+    extern void* mp_ext_area;
+    return mp_ext_area ? mp_ext_area : (void*)txsub_mp_area;
+}
+
 /* Lazy one-time init of the worker's tx-accept path. Returns 1 ready, 0 not. */
 static int txsub_worker_ready(void){
+    extern void* mp_ext_area;
     if (txsub_ready) return txsub_ready == 1;
     if (!tx_dispatch_init() || !tx_policy_init()){ txsub_ready = -1; return 0; }
-    mpool_init(txsub_mp_area, TXSUB_MP_SLOTS, txsub_mp_blob, sizeof txsub_mp_blob);
+    /* the shared pool was mpool_init'ed pre-fork (mp_ext_inited=1); only
+     * the private fallback still needs its init here */
+    if (!mp_ext_area)
+        mpool_init(txsub_mp_area, TXSUB_MP_SLOTS, txsub_mp_blob, sizeof txsub_mp_blob);
     txsub_ready = 1;
     return 1;
 }
@@ -2219,6 +2279,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * under-lock) so they can't collide, see that function's header comment
      * in bitcoin_idxscan.asm. */
     chdir(dir);
+    /* ZMQ publisher binds HERE, in the worker, because a PUB socket's
+     * subscriber fds are per-process and only this process can write to them.
+     * Binding is non-fatal: a busy port must not stop the node syncing. */
+    if (g_cfg.zmq_hashblock[0]) zmqpub_add("hashblock", g_cfg.zmq_hashblock);
+    if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
+    if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
+    if (g_cfg.zmq_rawtx[0])     zmqpub_add("rawtx",     g_cfg.zmq_rawtx);
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
@@ -2251,11 +2318,76 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
     }
 
+    { extern void addrself_init(unsigned short, int);
+      addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
+    /* txid-index tail: establish coverage and close the gap between the
+     * offline base build (or the previous run's tail) and the current tip.
+     * After the archive verify -- a repair may have truncated heights the
+     * tail would otherwise trust. No base index => logs once and disables. */
+    if(archive_ok) txit_boot(store_buf);
+
     fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
     phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
     g_in_utxo_reload = 1;                       /* see handle_shutdown_signal */
     int utxo_live_ok = archive_ok ? utxo_live_init(dir) : 0;
     g_in_utxo_reload = 0;
+    /* Incident #48: mempool prevout resolution in THIS process must query
+     * the live writer state, never a boot-latched snapshot of files the
+     * writer keeps mutating (misses + garbage script lengths within
+     * minutes). Injected before the first tx_accept use (the relay drain
+     * and the sendrawtransaction channel both init lazily, later). Without
+     * live UTXO tracking there is nothing coherent to resolve against, so
+     * validation stays on its (unavailable-shaped) fallback and rejects. */
+    if (utxo_live_ok){
+        typedef long (*txacc_resolver_t)(const unsigned char*, unsigned long,
+                                         unsigned long long*, unsigned long*,
+                                         unsigned long*, const unsigned char**,
+                                         unsigned long*);
+        extern void tx_accept_set_resolver(txacc_resolver_t);
+        extern long utxo_live_resolve(const unsigned char*, unsigned long,
+                                      unsigned long long*, unsigned long*,
+                                      unsigned long*, const unsigned char**,
+                                      unsigned long*);
+        extern void tx_accept_set_tip(long);
+        tx_accept_set_resolver(utxo_live_resolve);
+        tx_accept_set_tip(*(int*)(store_buf+24));
+
+        /* ---- coinstats index: continuous gettxoutsetinfo + a standing
+         * cryptographic parity instrument. Observers feed it every coin
+         * add/remove on the apply and reorg paths; it persists at the same
+         * per-block durability point as the applied height. Seeding costs a
+         * full walk (minutes) exactly once -- afterwards the persisted state
+         * is adopted instantly on every clean boot. Seeded HERE, before the
+         * catch-up loop starts writing, which is what makes the walk's
+         * quiescence requirement hold by construction. */
+        {
+            typedef void (*coin_fn)(const unsigned char*, unsigned int,
+                                    unsigned long long, unsigned long long,
+                                    unsigned long long, const unsigned char*,
+                                    unsigned long);
+            extern void utxo_live_set_coinstats(coin_fn, coin_fn,
+                                                void (*)(const char*), void (*)(long));
+            extern void undo_set_coin_observer(coin_fn);
+            extern void csi_on_add(const unsigned char*, unsigned int,
+                                   unsigned long long, unsigned long long,
+                                   unsigned long long, const unsigned char*, unsigned long);
+            extern void csi_on_remove(const unsigned char*, unsigned int,
+                                      unsigned long long, unsigned long long,
+                                      unsigned long long, const unsigned char*, unsigned long);
+            extern void csi_invalidate(const char*);
+            extern void csi_commit(long);
+            extern int  csi_boot(long);
+            extern int  csi_seed_from_walk(void*, void*, long);
+            extern void* utxo_live_lst(void);
+            extern void* utxo_live_table(void);
+            extern long utxo_live_applied_height(void);
+            utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
+            undo_set_coin_observer(csi_on_remove);
+            long ah = utxo_live_applied_height();
+            if (!csi_boot(ah))
+                csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+        }
+    }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
     if(!utxo_live_ok) fprintf(stderr,"[dl] utxo_live_init failed -- continuing WITHOUT live UTXO tracking\n");
     else fprintf(stderr,"[dl] worker: live UTXO state loaded (%.2fs)\n", phase_elapsed(&utxo_init_pt));
@@ -2445,7 +2577,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int fl=fcntl(cfd[i],F_GETFL,0); fcntl(cfd[i],F_SETFL,fl&~O_NONBLOCK);
             struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
             int hk=node_handshake(cfd[i]);
-            if(hk!=1){ close(cfd[i]); continue; }
+            if(hk!=1 || !peer_has_witness(srcpool[i])){ close(cfd[i]); continue; }
+            { extern void addrself_note_peer_view(const unsigned char*, long);
+              addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
             mux_out_fd[mux_n_out]=cfd[i];
@@ -2662,14 +2796,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 tscratch, sizeof tscratch)){
                         result=-22; snprintf(reason,sizeof reason,"TX decode failed");
                     } else {
-                        result = (int)tx_accept_test_reason(txsub_mp_area, tid,
+                        result = (int)tx_accept_test_reason(txsub_pool(), tid,
                                      (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                      reason, sizeof reason, &fee);
                     }
                     g_node_status->tx_submit_fee = fee;
                 }
                 else { int relayed=0;
-                    result = txsub_accept_and_relay(txsub_mp_area,
+                    result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
                     if(result==1) fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs\n", relayed, mux_n_out);
@@ -2828,6 +2962,32 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
             }
+            /* ---- transaction relay (receive side) -------------------------
+             * Peers announce txs on these full-relay legs (we advertise
+             * relay=1) and node_sync_multi's drains discard every inv
+             * unexamined -- so until 2026-08-26 the production mempool had
+             * never held a single P2P transaction. Drain the leg's buffered
+             * messages here, BEFORE this rotation's sync pass: everything
+             * the peer sent since the last rotation is sitting in the
+             * socket buffer, and running the sync first would feed it all
+             * into .hdr_drain's discard (the first deploy ran the drain
+             * after the sync and accepted ~1 tx per 10 minutes; the invs
+             * were being eaten a rotation later). Announced txs are
+             * requested as MSG_WITNESS_TX -- type 1 would hand back
+             * witness-stripped serializations, incident #10's exact bug
+             * shape -- and replies run through the same tx_accept_validate
+             * the inbound path uses, into the SHARED pool so the parent's
+             * mempool RPCs see them. Cost when nothing is buffered: one
+             * empty poll(2). */
+            if(mux_out_fd[i]>=0 && txsub_worker_ready()){
+                extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+                long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                if(acc>0){
+                    extern long mpool_count(void*);
+                    fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
+                            i, mux_out_host[i], acc, mpool_count(txsub_pool()));
+                }
+            }
             /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
@@ -2882,6 +3042,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* brief yield so we don't spin a CPU core when all legs are idle */
             if((i&1)==1){ usleep(20000); }
         }
+        /* propagate this rotation's relay accepts: one inv per leg covering
+         * everything accepted since the last rotation (never back to a tx's
+         * own source); peers fetch with getdata, which the drain answers
+         * from the pool */
+        if(txsub_worker_ready()){
+            extern long txrelay_announce(const int* fds, int nfds);
+            txrelay_announce(mux_out_fd, mux_n_out);
+        }
+        { extern long addrself_maybe_announce(const int*, int);
+          addrself_maybe_announce(mux_out_fd, mux_n_out); }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would
@@ -2991,9 +3161,54 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
                 }
+                /* ZMQ hashblock/rawblock + the txid-index tail, from this
+                 * same choke point for the same reason the log line is: it
+                 * fires no matter which path appended the block.
+                 *
+                 * EVERY new block is handled, not just the tip. A catch-up
+                 * burst advances the tip by many blocks at once, and a
+                 * subscriber that received only the last one would silently
+                 * miss the rest -- Core notifies per connected block, so this
+                 * must too. The loop is bounded by the burst size and reads
+                 * each block ONCE from the archive it was just written to,
+                 * feeding both consumers. */
+                if (zmqpub_active() || txit_active()){
+                    static unsigned char zb[RPC_BLKSUBMIT_MAX];
+                    for (int zh = last_seen_tip + 1; zh <= now_tip; zh++){
+                        long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
+                        if (bl <= 0){
+                            fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
+                            continue;
+                        }
+                        /* txindex tail: append this block's txid records so
+                         * getrawtransaction-by-txid keeps up with the tip
+                         * (idempotent by height -- a replayed height is a
+                         * no-op) */
+                        txit_on_block(store_buf, zh, zb, bl);
+                        if (!zmqpub_active()) continue;
+                        /* The block HASH is sha256d over the 80-byte
+                         * header, REVERSED: Core's notifier flips the bytes
+                         * (data[31-i] = hash.begin()[i]) so the hashblock
+                         * topic carries the DISPLAY-order hash getblockhash
+                         * prints. Verified against real archived blocks by
+                         * tests/zmq_realblock_check. */
+                        unsigned char bh[32], bhr[32];
+                        sha256d(bh, zb, 80);
+                        for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                        zmqpub_notify("hashblock", bhr, 32);
+                        zmqpub_notify("rawblock", zb, (unsigned long)bl);
+                    }
+                }
             }
+            /* keep mempool admission's maturity/flag anchor on the tip --
+             * unconditionally, not only when a publisher is active */
+            { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
             last_seen_tip = now_tip;
         }
+        /* Drain transactions staged by the serve children (and by this
+         * worker's own sendrawtransaction path) and service subscriber
+         * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
+        if (zmqpub_active()){ zmqpub_poll(); zmqn_drain(); }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
@@ -3173,7 +3388,13 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
-      rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run); }
+      rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run);
+      { extern long csi_rpc_run(int, void*, char*, unsigned long);
+        extern long csi_file_height(void);
+        extern void rpc_chain_set_coinstats(long (*)(int, void*, char*, unsigned long));
+        extern void rpc_chain_set_coinstats_height(long (*)(void));
+        rpc_chain_set_coinstats(csi_rpc_run);
+        rpc_chain_set_coinstats_height(csi_file_height); } }
     { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
                                     long*, unsigned long long*, char*, unsigned long);
       rpc_chain_set_utxodump(utxo_dump_rpc_run); }
@@ -3198,6 +3419,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);
+    rpc_node_set_zmq(g_cfg.zmq_hashblock, g_cfg.zmq_hashtx,
+                     g_cfg.zmq_rawblock, g_cfg.zmq_rawtx);
     /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
     { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
                                             unsigned long long, unsigned int, unsigned char,
@@ -3860,6 +4083,12 @@ int main(int argc, char** argv){
                 * leaving it at the zero default would gate every dial and
                 * silently produce a node that never connects. */
                g_node_status->net_active = 1; }
+
+        /* Hand the ZMQ notification ring the shared block BEFORE the fork, so
+         * the download worker AND every inbound serve child inherit the same
+         * pointer -- a child that staged into its own private copy would
+         * publish nothing and report no error. */
+        zmqn_set_status(g_node_status);
 
         pid_t dl = fork();
         if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }

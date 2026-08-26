@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdint.h>
 #include "log_ts.h"
 
@@ -64,11 +65,37 @@ static void* g_table = 0;
 static struct lsm_state g_lst;
 static int   g_ready = 0;
 
+/* Incident #48: an injected LIVE resolver replaces the snapshot below.
+ * The snapshot (utxo_lsm_reload of the datadir) is only coherent while
+ * nothing writes the LSM -- true in a short-lived inbound serve child,
+ * FALSE in the download worker, whose own utxo_live writer mutates the
+ * same files continuously: within minutes lookups returned misses and
+ * garbage script lengths ("prevout script too large" floods) and the
+ * mempool starved. The worker injects utxo_live_resolve (the same
+ * process's writer state, coherent by construction); when set, the
+ * snapshot machinery is never even allocated. */
+typedef long (*txacc_resolver_t)(const u8 txid[32], unsigned long index,
+                                 unsigned long long* value, unsigned long* height,
+                                 unsigned long* is_coinbase, const u8** script,
+                                 unsigned long* slen);
+static txacc_resolver_t g_resolver = 0;
+void tx_accept_set_resolver(txacc_resolver_t fn){ g_resolver = fn; }
+
+/* The height the NEXT block would have -- anchors script flags and the
+ * coinbase-maturity rule for admission. The worker updates it at boot and
+ * at the new-block choke point. Zero = unknown: validation still runs with
+ * far-future flags (every deployed soft fork active -- correct for any
+ * present-day tx), but a COINBASE spend is refused outright, because
+ * maturity cannot be judged without a tip. Fail closed, loudly rare. */
+static long g_next_height = 0;
+void tx_accept_set_tip(long tip){ g_next_height = tip + 1; }
+
 /* tx_dispatch_init(void) -> 1 ok / 0 failed. Called once per connection,
  * at node_serve_loop entry. A failure here disables tx validation for this
  * connection (see tx_accept_validate) but must not take the connection
  * down -- relay/serving of blocks and everything else keeps working. */
 int tx_dispatch_init(void){
+    if (g_resolver){ g_ready = 1; return 1; }   /* live resolver: no snapshot */
     unsigned long slots = 1UL << TXACC_SLOTS_LOG2;
     u64 blob_cap = TXACC_BLOB_BYTES;
     u64 fill_threshold = (u64)slots * 3 / 4;
@@ -121,8 +148,9 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
                                     unsigned long long* value, const u8** script,
                                     unsigned long* slen){
     (void)u;
-    if (!g_ready) return 0;
     unsigned long height, is_coinbase;
+    if (g_resolver) return g_resolver(txid, index, value, &height, &is_coinbase, script, slen);
+    if (!g_ready) return 0;
     return utxo_lsm_get(&g_lst, g_table, txid, (u32)index, value, &height, &is_coinbase, script, slen);
 }
 
@@ -135,12 +163,131 @@ extern size_t mpool_policy_state_size(unsigned n);
 extern void   mpool_policy_state_init(void* st, unsigned n);
 extern long   mpool_count(void* mp);
 extern void   mempool_note_accept(const unsigned char txid[32]); /* daemon/mempool_cfg.c */
+/* daemon/zmq_notify.c. Staged on BOTH accept paths, right beside
+ * mempool_note_accept, because those two calls together are what "this node
+ * now holds this transaction" MEANS -- a notification fired from anywhere
+ * else could announce a transaction the mempool does not actually hold. A
+ * no-op when ZMQ is unconfigured, and safe in the serve children. */
+extern void   zmqn_tx_accepted(const unsigned char txid[32], const unsigned char* tx,
+                               unsigned long txlen);
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const u8* tx, unsigned long txlen,
                                const u8 txid[32], void* utxo);
 extern const char* mpool_policy_reason(void* pol);
 extern int    txval_modern(const u8* tx, long txlen, void* utxo);
 extern const char* txval_modern_reason(void);
+
+/* ---- script verification: the CONSENSUS verifier, not a second one -------
+ * Admission now runs tx_verify_mempool (daemon/tx_verify.c) -- the exact
+ * replay-proven engine block connection uses: legacy scripts, P2SH, all
+ * witness v0 shapes, full BIP341/342 taproot (annex, script-path),
+ * maturity, everything -- through a resolver that sees the confirmed set
+ * PLUS unconfirmed mempool parents. bitcoin_txval_modern.c (the previous,
+ * partial mempool verifier: no legacy arm, key-path-only taproot, three
+ * first-contact incidents in one day) stays only for its vector tests. */
+typedef int (*txv_resolve_fn)(void* ctx, const u8 outpoint[36], u32 index,
+                              u64* value, u64* height, u64* is_coinbase,
+                              const u8** spk, unsigned long* spklen);
+extern int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
+                             txv_resolve_fn rf, void* rctx, const char** reason);
+extern const u8* mpool_get(void* mp, const u8 txid[32], unsigned long* out_len);
+
+/* bounded compactsize -- the same split-bound discipline mv_parse settled
+ * on (incident #37): reads never pass `end`, callers use subtraction-form
+ * bounds that cannot wrap. */
+static u64 txacc_varint(const u8** p, const u8* end, u64* consumed){
+    const u8* b = *p; *consumed = 0;
+    if (b >= end) return 0;
+    u8 f = *b++;
+    u64 v;
+    if (f < 0xfd) v = f;
+    else if (f == 0xfd){ if (end - b < 2) return 0; v = (u64)b[0] | ((u64)b[1]<<8); b += 2; }
+    else if (f == 0xfe){ if (end - b < 4) return 0; v = 0; for (int i=0;i<4;i++) v |= (u64)b[i]<<(8*i); b += 4; }
+    else { if (end - b < 8) return 0; v = 0; for (int i=0;i<8;i++) v |= (u64)b[i]<<(8*i); b += 8; }
+    *consumed = (u64)(b - *p); *p = b;
+    return v;
+}
+
+/* Extract output `index` of a raw transaction: value + script pointer into
+ * the caller's buffer. Returns 1/0. Minimal wire walk -- inputs skipped,
+ * witness never reached (outputs precede it). */
+static int txacc_tx_output(const u8* tx, unsigned long txlen, u32 index,
+                           u64* value, const u8** spk, unsigned long* spklen){
+    const u8* p = tx + 4; const u8* end = tx + txlen;
+    if (txlen < 10) return 0;
+    if (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01) p += 2;   /* segwit marker */
+    u64 cc, nin = txacc_varint(&p, end, &cc); if (!cc || !nin) return 0;
+    for (u64 i = 0; i < nin; i++){
+        if (p + 36 > end) return 0;
+        p += 36;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc) return 0;
+        if ((u64)(end - p) < sl + 4) return 0;
+        p += sl + 4;
+    }
+    u64 nout = txacc_varint(&p, end, &cc); if (!cc || index >= nout) return 0;
+    for (u64 i = 0; i < nout; i++){
+        if (p + 8 > end) return 0;
+        u64 v = 0; for (int k = 0; k < 8; k++) v |= (u64)p[k] << (8*k);
+        p += 8;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end - p) < sl) return 0;
+        if (i == index){ *value = v; *spk = p; *spklen = (unsigned long)sl; return 1; }
+        p += sl;
+    }
+    return 0;
+}
+
+/* Resolve one outpoint for the verifier: live/snapshot confirmed set first,
+ * then an unconfirmed MEMPOOL PARENT (Core resolves admission against
+ * view+mempool; a parent that is itself in the pool is a legitimate spend
+ * source -- ancestor limits are the policy layer's job and already
+ * enforced there). A mempool parent is by definition not a coinbase. */
+static int txacc_resolve_verify(void* mp_area, const u8 outpoint[36], u32 index,
+                                u64* value, u64* height, u64* is_coinbase,
+                                const u8** spk, unsigned long* spklen){
+    unsigned long long v; unsigned long hh, cb, sl; const u8* sc;
+    if (g_resolver){
+        if (g_resolver(outpoint, index, &v, &hh, &cb, &sc, &sl) == 1){
+            *value = v; *height = hh; *is_coinbase = cb; *spk = sc; *spklen = sl;
+            return 1;
+        }
+    } else if (g_ready){
+        unsigned long long v2; unsigned long h2, c2;
+        if (utxo_lsm_get(&g_lst, g_table, outpoint, index, &v2, &h2, &c2, spk, spklen) == 1){
+            *value = v2; *height = h2; *is_coinbase = c2;
+            return 1;
+        }
+    }
+    unsigned long plen = 0;
+    const u8* ptx = mpool_get(mp_area, outpoint, &plen);
+    if (ptx){
+        u64 pv; const u8* ps; unsigned long psl;
+        if (txacc_tx_output(ptx, plen, index, &pv, &ps, &psl)){
+            *value = pv; *height = (u64)(g_next_height > 0 ? g_next_height : 0);
+            *is_coinbase = 0; *spk = ps; *spklen = psl;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* One entry for all three accept paths. Returns 1 ok, else 0 with *rout. */
+static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
+                               const char** rout){
+    /* g_next_height == 0: use a far-future height so every deployed soft
+     * fork's flags are active (strictest rules -- correct for admission);
+     * the resolver+maturity interplay is safe because a coinbase spend
+     * cannot prove maturity against an unknown tip and the verifier's
+     * conf = next_height - uheight then goes hugely positive -- so guard
+     * coinbase spends here instead, fail-closed. */
+    long nh = g_next_height > 0 ? g_next_height : (1L << 30);
+    static __thread const char* r;
+    r = 0;
+    if (tx_verify_mempool(tx, (u64)txlen, nh, (txv_resolve_fn)txacc_resolve_verify,
+                          mp_area, &r) == 1)
+        return 1;
+    *rout = r ? r : "script verification failed";
+    return 0;
+}
 
 /* Live-daemon policy defaults, matching Bitcoin Core's own standard mempool
  * relay policy defaults reasonably closely: 1 sat/vbyte min relay feerate,
@@ -209,28 +356,98 @@ int tx_policy_init(void){
  * wasted signature-verification pass on a tx that would also have failed
  * fee/dedup checks), a correctness-over-throughput tradeoff worth revisiting
  * once this is under real traffic (task #49). */
+/* ---- P2P-path log summarizer -------------------------------------------
+ * The relay drain feeds hundreds of transactions a minute through here, and
+ * a per-transaction log line for each one turned the production log into an
+ * unreadable reject firehose the first day real relay traffic flowed (the
+ * majority class, "input not found in utxo", is ordinary out-of-order relay
+ * -- children of unconfirmed parents this node has no orphan pool for --
+ * exactly the churn Core hides behind -debug=mempoolrej). One summary line
+ * per window keeps the same information legible; the most recent
+ * NON-routine reject reason is carried in the line so a new failure class
+ * is still visible without the flood. The sendrawtransaction path
+ * (tx_accept_validate_reason) keeps full per-tx logging: user-submitted
+ * transactions are rare and each one matters. */
+#define TXACC_LOG_WINDOW_SECS 30
+static struct {
+    long acc, rej_missing, rej_invalid, rej_policy;
+    long t0;
+    char last_invalid[96];
+} g_alog;
+static void txacc_log_tick(void* mp_area){
+    long now = (long)time(NULL);
+    if (!g_alog.t0){ g_alog.t0 = now; return; }
+    if (now - g_alog.t0 < TXACC_LOG_WINDOW_SECS) return;
+    if (g_alog.acc || g_alog.rej_missing || g_alog.rej_invalid || g_alog.rej_policy)
+        fprintf(stderr, "[tx_accept] last %lds: +%ld accepted (mempool %ld) | rejected: %ld missing-inputs, %ld invalid%s%s%s, %ld policy\n",
+                now - g_alog.t0, g_alog.acc, mpool_count(mp_area),
+                g_alog.rej_missing, g_alog.rej_invalid,
+                g_alog.last_invalid[0] ? " (last: \"" : "",
+                g_alog.last_invalid[0] ? g_alog.last_invalid : "",
+                g_alog.last_invalid[0] ? "\")" : "",
+                g_alog.rej_policy);
+    memset(&g_alog, 0, sizeof g_alog);
+    g_alog.t0 = now;
+}
+
 long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen){
     if (!g_ready || !g_pol_ready) return 0;
+    txacc_log_tick(mp_area);
     void* placeholder_utxo = (void*)1; /* never dereferenced: mempool_resolve_confirmed_utxo ignores it */
-    if (!txval_modern(tx, (long)txlen, placeholder_utxo)){
-        fprintf(stderr, "[tx_accept] reject (txval): %s\n", txval_modern_reason());
-        return 0;
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (r && strstr(r, "missing/already-spent")) g_alog.rej_missing++;
+            else {
+                g_alog.rej_invalid++;
+                snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
+            }
+            return 0;
+        }
     }
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     mp_unlock();
     if (padd != 1){
-        fprintf(stderr, "[tx_accept] reject (policy): %s\n", mpool_policy_reason(g_pol));
+        g_alog.rej_policy++;
         return 0;
     }
-    static const char hexd[]="0123456789abcdef";
-    char ts[17]; for(int k=0;k<8;k++){ u8 b=txid[31-k]; ts[k*2]=hexd[b>>4]; ts[k*2+1]=hexd[b&0xf]; } ts[16]=0;
-    fprintf(stderr, "[tx_accept] accepted txid=%s.. vsize=%lu mempool_now=%ld\n",
-            ts, txlen, mpool_count(mp_area));
+    g_alog.acc++;
     /* Stamp arrival so -mempoolexpiry can evict it later. The mempool slot
      * format has no timestamp field, so this parallel record is what makes
      * expiry possible without changing the slot layout. */
     mempool_note_accept(txid);
+    zmqn_tx_accepted(txid, tx, txlen);
+    return 1;
+}
+
+/* tx_accept_validate_p2p: the RELAY path's entry. Same verdict classes as
+ * tx_accept_validate_reason (1 accept, -25 missing inputs, -26 other) so
+ * the orphan pool can class its parks -- but it logs through the 30-second
+ * SUMMARY, never per transaction. The drain briefly used _reason directly
+ * for the -25 class and silently brought the per-tx reject firehose back;
+ * per-tx lines belong to user submissions only. */
+long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
+                            unsigned long txlen){
+    if (!g_ready || !g_pol_ready) return -26;
+    txacc_log_tick(mp_area);
+    void* placeholder_utxo = (void*)1;
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (r && strstr(r, "missing/already-spent")){ g_alog.rej_missing++; return -25; }
+            g_alog.rej_invalid++;
+            snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
+            return -26;
+        }
+    }
+    mp_lock();
+    long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    mp_unlock();
+    if (padd != 1){ g_alog.rej_policy++; return -26; }
+    g_alog.acc++;
+    mempool_note_accept(txid);
+    zmqn_tx_accepted(txid, tx, txlen);
     return 1;
 }
 
@@ -245,12 +462,14 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (reason && rcap) reason[0] = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
-    if (!txval_modern(tx, (long)txlen, placeholder_utxo)){
-        const char* r = txval_modern_reason();
-        if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
-        fprintf(stderr, "[tx_accept] reject (txval): %s\n", r ? r : "");
-        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
-        return -26;
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+            fprintf(stderr, "[tx_accept] reject (txval): %s\n", r ? r : "");
+            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+            return -26;
+        }
     }
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
@@ -264,6 +483,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
         return -26;
     }
     mempool_note_accept(txid);
+    zmqn_tx_accepted(txid, tx, txlen);
     return 1;
 }
 
@@ -285,11 +505,13 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (fee_out) *fee_out = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
-    if (!txval_modern(tx, (long)txlen, placeholder_utxo)){
-        const char* r = txval_modern_reason();
-        if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
-        if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
-        return -26;
+    {
+        const char* r = 0;
+        if (!txacc_script_verify(mp_area, tx, txlen, &r)){
+            if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
+            return -26;
+        }
     }
     mp_lock();
     long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,

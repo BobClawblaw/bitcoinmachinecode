@@ -159,7 +159,7 @@ int main(void){
     ck("getnetworkinfo dispatched", rc == 1 && r != NULL);
     ck("protocolversion 70016",  r && S(r,"protocolversion") && !strcmp(S(r,"protocolversion"), "70016"));
     ck("subversion is ours",     r && S(r,"subversion") && !strcmp(S(r,"subversion"), "/BitcoinMachineCode:0.0.1/"));
-    ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000001"));
+    ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000009"));
     ck("connections 11",         r && S(r,"connections") && !strcmp(S(r,"connections"), "11"));
     ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
     ck("connections_in 3",       r && S(r,"connections_in") && !strcmp(S(r,"connections_in"), "3"));
@@ -172,8 +172,9 @@ int main(void){
       rj_val* n0 = (nets && nets->nitems) ? nets->items[0] : 0;
       ck("networks[0].name ipv4", n0 && S(n0,"name") && !strcmp(S(n0,"name"), "ipv4")); }
     { rj_val* names = r ? rj_obj_get(r,"localservicesnames") : 0;
-      ck("localservicesnames [NETWORK]", names && names->typ == RJ_ARR && names->nitems == 1
-         && names->items[0]->str && !strcmp(names->items[0]->str, "NETWORK")); }
+      ck("localservicesnames [NETWORK, WITNESS]", names && names->typ == RJ_ARR && names->nitems == 2
+         && names->items[0]->str && !strcmp(names->items[0]->str, "NETWORK")
+         && names->items[1]->str && !strcmp(names->items[1]->str, "WITNESS")); }
     rj_free(r);
 
     /* getpeerinfo: populate a couple of fake outbound peers in the table */
@@ -1084,6 +1085,32 @@ int main(void){
     rpc_node_set_status(NULL);
     r = NULL; rpc_node_dispatch("getconnectioncount", NULL, &r, &ec, &em);
     ck("null status -> connectioncount 0", r && r->str && !strcmp(r->str, "0"));
+    rj_free(r);
+
+    /* getzmqnotifications: reports exactly the configured endpoints, in
+     * Core's shape and order. Unconfigured -> empty array (Core without any
+     * zmqpub options answers []), never a refusal -- an empty answer and a
+     * missing method are different facts to a subscriber probing support. */
+    rpc_node_set_zmq(NULL, NULL, NULL, NULL);
+    r = NULL; rc = rpc_node_dispatch("getzmqnotifications", NULL, &r, &ec, &em);
+    ck("getzmqnotifications unconfigured -> rc 1", rc == 1);
+    ck("getzmqnotifications unconfigured -> empty array",
+       r && r->typ == RJ_ARR && r->nitems == 0);
+    rj_free(r);
+
+    rpc_node_set_zmq("tcp://127.0.0.1:28332", NULL, NULL, "tcp://127.0.0.1:28333");
+    r = NULL; rc = rpc_node_dispatch("getzmqnotifications", NULL, &r, &ec, &em);
+    ck("getzmqnotifications -> 2 configured entries", rc == 1 && r && r->nitems == 2);
+    if (r && r->nitems == 2){
+        rj_val* e0 = r->items[0]; rj_val* e1 = r->items[1];
+        rj_val* t0 = rj_obj_get(e0, "type");    rj_val* a0 = rj_obj_get(e0, "address");
+        rj_val* t1 = rj_obj_get(e1, "type");    rj_val* a1 = rj_obj_get(e1, "address");
+        ck("entry 0 is pubhashblock at its address",
+           t0 && !strcmp(t0->str, "pubhashblock") && a0 && !strcmp(a0->str, "tcp://127.0.0.1:28332"));
+        ck("entry 1 is pubrawtx at its address (unset topics skipped, order kept)",
+           t1 && !strcmp(t1->str, "pubrawtx") && a1 && !strcmp(a1->str, "tcp://127.0.0.1:28333"));
+        ck("hwm present", rj_obj_get(e0, "hwm") != NULL);
+    }
     rj_free(r);
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);

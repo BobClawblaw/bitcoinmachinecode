@@ -250,8 +250,13 @@ plus straightforward methods on top of it.
 
 ## Indexing
 
-- **`txindex`** — explicitly ignored (confirmed this session);
-  `getrawtransaction` by bare txid won't work.
+- ~~**`txindex`** — explicitly ignored; `getrawtransaction` by bare txid
+  won't work.~~ — **DONE 2026-08-26**: offline base build
+  (`daemon/build_tx_index`, ~29 GB, 8-byte prefix keys exact-by-
+  verification) + daemon-maintained incremental tail
+  (`daemon/tx_index_tail.c`) that backfills at boot and follows the tip, so
+  `getrawtransaction <txid>` works with no block hash and `getindexinfo`
+  reports the real combined coverage.
 - **Address index** — `build_addr_index.c` exists but is a **standalone
   offline batch tool only**, zero references from `daemon/main.c`'s live
   boot path. Not a live, queryable index.
@@ -317,13 +322,13 @@ plus straightforward methods on top of it.
     path genuinely read-only (the ordinary reload's `O_RDWR|O_CREAT` on
     utxo.dat/utxo.idx was the only write in the chain).
   - ~~Still missing, and deliberately: a live `gettxoutsetinfo` RPC~~ —
-    **done 2026-08-25**: the RPC exists, built on the same tool-derived
-    reader (one quiescence discipline by construction), refusing while the
-    set is being written rather than guessing. Still missing, still
-    deliberately: the incrementally-maintained index (Core's
-    `coinstatsindex` updates per block; ours is a full O(set) walk, ~90 s /
-    ~6 min with MuHash) and `hash_serialized_3` (refused by name; muhash is
-    our default).
+    **done 2026-08-25**; ~~the incrementally-maintained index~~ — **DONE
+    2026-08-26** (`daemon/coinstats_index.c`): per-block MuHash fold with
+    Fermat-inverse removal, persisted at the block durability point,
+    seeded once by walk, adopted instantly thereafter; the RPC answers in
+    ~33 ms and the incremental digest is PROVEN character-identical to the
+    oracle's at a height folded incrementally (964204). Still refused by
+    name: `hash_serialized_3` (muhash is our default).
 
 ## Wallet
 
@@ -359,10 +364,27 @@ not just present as unused/tested-in-isolation code:
   *stripped* and the archive held 482k witness-less bodies (incident #10,
   `LOG.md`); the server side also ignored `MSG_WITNESS_*` requests, so this
   node could not serve blocks to a modern peer. Now requests and serves
-  `MSG_WITNESS_BLOCK`. **Remaining:** prefer/require `NODE_WITNESS` (0x8)
-  peers; serve the stripped form to a bare `MSG_BLOCK` request; and
-  **`MSG_WITNESS_TX` for transaction relay** — the mempool path still fetches
-  transactions without witnesses (same bug shape, not yet hit).
+  `MSG_WITNESS_BLOCK`. ~~`MSG_WITNESS_TX` for transaction relay~~ — **DONE
+  2026-08-26** with the receive-side tx relay (`daemon/tx_relay.c`, LOG
+  slice-20 entry): announced transactions are now actually fetched (they
+  were previously discarded unread), and fetched witness-complete.
+  ~~Prefer/require `NODE_WITNESS` (0x8) peers~~ — **DONE 2026-08-26**:
+  every outbound dial that can lead to fetching blocks or transactions
+  (mux legs, parallel leg fill, boot catch-up, dlc header/chunk workers)
+  checks the peer's advertised services right after the handshake and
+  drops non-witness peers at dial time (`peer_has_witness`,
+  daemon/main.c). ~~Re-announcing relay-received transactions~~ — **DONE
+  2026-08-26**: accepts queue their txid, one inv per leg per rotation
+  announces them (never back to the source), the drain serves
+  MSG_TX/MSG_WITNESS_TX getdata from the pool and answers misses with
+  notfound, and an ORPHAN POOL parks missing-inputs children, fetches
+  their parents witness-typed, and cascades them in when the parent
+  lands. Mempool admission itself now runs the CONSENSUS verifier
+  (tx_verify_mempool: legacy scripts, full taproot, confirmed set +
+  mempool parents, tip-anchored maturity). **Remaining:** serve the
+  stripped form to a bare `MSG_BLOCK` request (affects only legacy
+  inbound peers, of which this node currently has none) and BIP339
+  `wtxidrelay`.
 - **Thread stacks / sighash buffers — FIXED 2026-08-22** (`9445268`): every
   daemon thread now gets an explicit 64 MB stack (`bmc_thread.h`,
   `BMC_THREAD_STACK_MB`); BIP143/BIP341 midstate hashes use bounded per-thread
@@ -387,6 +409,9 @@ Confirmed absent:
 - **ZMQ notification interface** — zero hits.
 - **REST interface** (separate from JSON-RPC) — zero hits.
 - **UPnP / NAT-PMP** automatic port forwarding — zero hits.
+- ~~Addr self-advertisement~~ — **DONE 2026-08-26** (`daemon/addr_self.c`):
+  external IPv4 from two agreeing peers' addr_recv views, announced with
+  the CONFIGURED port on the 24h cadence.
 
 ## Mining
 
