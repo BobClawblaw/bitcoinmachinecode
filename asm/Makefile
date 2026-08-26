@@ -577,6 +577,12 @@ BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
 tests/zmq_realblock_check: tests/zmq_realblock_check.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 -o $@ tests/zmq_realblock_check.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
+# utxo_probe_one -- diagnostic: resolve outpoints against a fresh read-only
+# LSM reload through BOTH read paths (point lookup + full walk). The tool
+# that made incident #49's nondeterministic slen corruption deterministic.
+daemon/utxo_probe_one: daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 -o $@ daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
+
 daemon/build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 

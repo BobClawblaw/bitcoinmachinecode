@@ -34,7 +34,7 @@ extern long utxo_lsm_put(void* lst, void* u, const u8 txid[32], unsigned index,
                           const u8* script, unsigned slen);
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height, unsigned long* is_coinbase,
-                          const u8** script, unsigned* slen);
+                          const u8** script, unsigned long* slen);
 
 #define UNDO_MAX_SCRIPT 10000
 typedef struct {
@@ -135,7 +135,7 @@ int main(void){
     cki("undo_capture_and_del A0", r, 1);
 
     {
-        unsigned long long v; unsigned long h, cb; const unsigned char* s; unsigned sl;
+        unsigned long long v; unsigned long h, cb; const unsigned char* s; unsigned long sl;
         cki("A0 now missing from live set (spent)", utxo_lsm_get(&lst, g_ux, txidA, 0, &v, &h, &cb, &s, &sl), 0);
     }
 
