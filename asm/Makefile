@@ -569,6 +569,12 @@ tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REOR
 BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
     bitcoin_store_fast.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o \
     bitcoin_idxscan.o
+# txid -> (height, offset, len) index. Same two-pass external sort as
+# build_addr_index (the record set is far too large for one qsort), and the
+# same header-last durability discipline as wallet_scan.
+daemon/build_tx_index: daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
 

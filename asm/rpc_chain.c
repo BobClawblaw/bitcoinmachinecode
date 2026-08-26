@@ -64,6 +64,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <signal.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1251,6 +1252,100 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     return 1;
 }
 
+/* ==== the txid index (daemon/build_tx_index.c) ===========================
+ * mmap'd read-only; absent is simply "no index", never an error. Records are
+ * 20 bytes sorted by an 8-byte txid PREFIX, with a sparse index every 256th
+ * record -- see the builder for why the key is truncated and why that is
+ * exact rather than probabilistic: a lookup reads every record sharing the
+ * prefix, pulls that transaction out of the archive, recomputes its txid and
+ * compares all 32 bytes. A prefix collision costs one extra read and is then
+ * rejected; it can never return the wrong transaction. */
+#define TXI_HDR    48
+#define TXI_REC    20
+#define TXI_SPARSE 16
+
+static const u8* g_txi;            /* mmap base, or NULL */
+static u64 g_txi_n, g_txi_sparse_off, g_txi_nsparse;
+static long g_txi_from = -1, g_txi_to = -1;
+
+/* Latches on SUCCESS, not on the first attempt: an index built while the
+ * node is running is then picked up on the next lookup instead of needing a
+ * restart. A failed open is one ENOENT syscall and only happens while there
+ * is no index at all, so the retry costs nothing worth measuring. */
+static void txi_open(void){
+    if (g_txi) return;
+    int fd = open("txindex.dat", O_RDONLY);
+    if (fd < 0) return;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size < TXI_HDR){ close(fd); return; }
+    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return;
+    const u8* b = m;
+    if (memcmp(b, "BMCTXIDX", 8)){ munmap(m, (size_t)sb.st_size); return; }
+    u64 n = 0, so = 0, ns = 0;
+    for (int i = 0; i < 8; i++) n  |= (u64)b[8+i]  << (8*i);
+    for (int i = 0; i < 8; i++) so |= (u64)b[16+i] << (8*i);
+    for (int i = 0; i < 8; i++) ns |= (u64)b[24+i] << (8*i);
+    u32 f = 0, t = 0;
+    for (int i = 0; i < 4; i++) f |= (u32)b[32+i] << (8*i);
+    for (int i = 0; i < 4; i++) t |= (u32)b[36+i] << (8*i);
+    /* a header that describes more than the file holds is a torn build */
+    if (so + ns * TXI_SPARSE > (u64)sb.st_size || TXI_HDR + n * TXI_REC != so){
+        munmap(m, (size_t)sb.st_size); return; }
+    g_txi = b; g_txi_n = n; g_txi_sparse_off = so; g_txi_nsparse = ns;
+    g_txi_from = (long)f; g_txi_to = (long)t;
+    fprintf(stderr, "[txindex] %llu records, heights [%ld,%ld]\n",
+            (unsigned long long)n, g_txi_from, g_txi_to);
+}
+
+/* Look a WIRE-order txid up. Returns 1 and fills height/offset/len, or 0. */
+static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
+    txi_open();
+    if (!g_txi || !g_txi_n) return 0;
+    const u8* recs = g_txi + TXI_HDR;
+    const u8* sp   = g_txi + g_txi_sparse_off;
+    /* binary search the sparse index for the last sample <= our prefix */
+    u64 lo = 0, hi = g_txi_nsparse ? g_txi_nsparse - 1 : 0, start = 0;
+    while (g_txi_nsparse && lo <= hi){
+        u64 mid = lo + (hi - lo) / 2;
+        int c = memcmp(sp + mid * TXI_SPARSE, txid_wire, 8);
+        if (c <= 0){
+            u64 off = 0;
+            for (int i = 0; i < 8; i++) off |= (u64)sp[mid*TXI_SPARSE + 8 + i] << (8*i);
+            start = (off - TXI_HDR) / TXI_REC;
+            lo = mid + 1;
+        } else {
+            if (mid == 0) break;
+            hi = mid - 1;
+        }
+    }
+    static u8 txbuf[4u << 20];
+    static u8 scratch[4u << 20];
+    for (u64 i = start; i < g_txi_n; i++){
+        const u8* r = recs + i * TXI_REC;
+        int c = memcmp(r, txid_wire, 8);
+        if (c < 0) continue;
+        if (c > 0) break;                      /* past the prefix group */
+        u32 hh = 0, off = 0, ln = 0;
+        for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
+        for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
+        for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
+        /* VERIFY: read the transaction and compare the FULL txid. This is
+         * what makes an 8-byte key exact -- a colliding prefix is rejected
+         * here rather than returned as a wrong answer. */
+        long blen = read_block((long)hh);
+        if (blen < 81 || (u64)off + ln > (u64)blen || ln > sizeof txbuf) continue;
+        memcpy(txbuf, g_blockbuf + off, ln);
+        u8 got[32];
+        if (tx_txid(got, txbuf, ln, scratch, sizeof scratch) != 1) continue;
+        if (memcmp(got, txid_wire, 32)) continue;      /* prefix collision */
+        *h_out = (long)hh; *off_out = off; *len_out = ln;
+        return 1;
+    }
+    return 0;
+}
+
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
@@ -1259,20 +1354,57 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
     if (strcmp(txs, GENESIS_CB_TXID) == 0){ *ec = -5; *em = "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"; return 0; }
     int verbosity = param_verbosity(params, 1, 0, ec, em);
     if (verbosity == -999) return 0;
+    /* The transaction is located either from the caller's blockhash or from
+     * the txid index; from there ONE render path serves both, so the two
+     * cannot drift in what they emit. `known_off` is the index's byte offset
+     * (-1 when we must scan the block for it). */
+    long h = -1, known_off = -1;
+    static char bs_buf[65];
+    const char* bs = NULL;
     if (!param_present(params, 2)){
-        *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
-        return 0;
+        u8 want_wire[32];
+        for (int i = 0; i < 32; i++) want_wire[i] = want_disp[31-i];
+        long th; u32 toff, tlen;
+        if (txi_lookup(want_wire, &th, &toff, &tlen)){
+            h = th; known_off = (long)toff; (void)tlen;
+            u8 rec[48];
+            if (read_idx_rec(h, rec)){ hex_rev(bs_buf, rec, 32); bs = bs_buf; }
+        } else {
+            txi_open();
+            static char nomsg[288];
+            if (g_txi){
+                /* An index EXISTS and does not hold it. Say which heights it
+                 * covers: "not found" from a PARTIAL index is a different
+                 * fact from "not found" on the whole chain, and a caller who
+                 * cannot tell them apart will draw the wrong conclusion. */
+                snprintf(nomsg, sizeof nomsg,
+                         "No such transaction. The txid index covers heights %ld..%ld; "
+                         "if the transaction is outside that range, rebuild the index "
+                         "over it or pass the block hash.", g_txi_from, g_txi_to);
+                *ec = -5; *em = nomsg; return 0;
+            }
+            *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
+            return 0;
+        }
+    } else {
+        bs = rpc_param_str(params, 2, ec, em); if (!bs) return 0;
+        u8 bdisp[32]; if (!parse_hash_param(bs, 3, bdisp, ec, em)) return 0;
+        if (!height_by_hash(bdisp, &h)){ *ec = -5; *em = "Block hash not found"; return 0; }
     }
-    const char* bs = rpc_param_str(params, 2, ec, em); if (!bs) return 0;
-    u8 bdisp[32]; if (!parse_hash_param(bs, 3, bdisp, ec, em)) return 0;
-    long h;
-    if (!height_by_hash(bdisp, &h)){ *ec = -5; *em = "Block hash not found"; return 0; }
+    if (!bs){ *ec = -1; *em = "Block not available"; return 0; }
     long len = read_block(h);
     if (len < 0){ *ec = -1; *em = "Block not available"; return 0; }
     const u8* blk = g_blockbuf; const u8* end = blk + len;
     u8 want[32]; for (int i = 0; i < 32; i++) want[i] = want_disp[31-i];
     u64 c; u64 ntx = read_varint(blk + 80, end, &c);
     const u8* p = blk + 80 + c;
+    if (known_off > 0 && known_off < len){
+        /* the index already knows where it is: start there and stop after
+         * one transaction. The txid is still recomputed and compared below,
+         * so a stale or wrong index entry cannot return the wrong tx. */
+        p = blk + known_off;
+        ntx = 1;
+    }
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)) break;
@@ -3089,11 +3221,27 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
  * filter cannot match anything either). The block/UTXO index that IS present
  * is core chainstate, not one of getindexinfo's optional indexes. */
 static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
-    (void)params; (void)ec; (void)em;
-    /* Any index_name filter can only fail to match (we have no indexes), and
-     * Core does not type-check the arg -- it simply returns {} regardless
-     * (verified live: `getindexinfo 123` and `getindexinfo {..}` both give {}). */
-    *res = rj_obj();   /* {} -- no optional indexes enabled */
+    (void)ec; (void)em;
+    /* Core does not type-check the arg -- it returns {} for a non-matching
+     * or nonsense filter (verified live: `getindexinfo 123` gives {}). */
+    const char* want = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+        params->items[0]->typ == RJ_STR) want = params->items[0]->str;
+    rj_val* o = rj_obj();
+    txi_open();
+    if (g_txi && (!want || !strcmp(want, "txindex"))){
+        /* Core reports {synced, best_block_height}. This index is built
+         * offline over a height RANGE, so "synced" means it reaches the tip
+         * -- a partial index reports false with its own best height, which
+         * is the honest reading and what a caller needs to decide whether to
+         * trust a miss. */
+        rj_val* e = rj_obj();
+        long tip = refresh();
+        rj_obj_set(e, "synced", rj_bool(tip >= 0 && g_txi_to >= tip));
+        rj_obj_set(e, "best_block_height", rj_numf("%ld", g_txi_to));
+        rj_obj_set(o, "txindex", e);
+    }
+    *res = o;
     return 1;
 }
 
