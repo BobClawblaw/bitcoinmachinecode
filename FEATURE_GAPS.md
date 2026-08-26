@@ -373,12 +373,18 @@ not just present as unused/tested-in-isolation code:
   (mux legs, parallel leg fill, boot catch-up, dlc header/chunk workers)
   checks the peer's advertised services right after the handshake and
   drops non-witness peers at dial time (`peer_has_witness`,
-  daemon/main.c). **Remaining:** serve the stripped form to a bare
-  `MSG_BLOCK` request (affects only legacy inbound peers, of which this
-  node currently has none); BIP339 `wtxidrelay`; and re-announcing
-  relay-received transactions onward (receive-only today —
-  user-originated txs are pushed to all legs by the sendrawtransaction
-  path).
+  daemon/main.c). ~~Re-announcing relay-received transactions~~ — **DONE
+  2026-08-26**: accepts queue their txid, one inv per leg per rotation
+  announces them (never back to the source), the drain serves
+  MSG_TX/MSG_WITNESS_TX getdata from the pool and answers misses with
+  notfound, and an ORPHAN POOL parks missing-inputs children, fetches
+  their parents witness-typed, and cascades them in when the parent
+  lands. Mempool admission itself now runs the CONSENSUS verifier
+  (tx_verify_mempool: legacy scripts, full taproot, confirmed set +
+  mempool parents, tip-anchored maturity). **Remaining:** serve the
+  stripped form to a bare `MSG_BLOCK` request (affects only legacy
+  inbound peers, of which this node currently has none) and BIP339
+  `wtxidrelay`.
 - **Thread stacks / sighash buffers — FIXED 2026-08-22** (`9445268`): every
   daemon thread now gets an explicit 64 MB stack (`bmc_thread.h`,
   `BMC_THREAD_STACK_MB`); BIP143/BIP341 midstate hashes use bounded per-thread
