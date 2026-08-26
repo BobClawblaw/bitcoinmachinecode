@@ -492,6 +492,238 @@ store_append:
 	ret
 	.size store_append, .-store_append
 
+
+
+/* ==========================================================================
+ * store_append_shared(st,height,hash[32],raw,len)       (x0..x4)
+ * store_append_shared_nolock(st,height,hash[32],raw,len)
+ *   CONCURRENT-SAFE append: writes frame [u32 len][u32 magic]+raw at the TRUE
+ *   current end of the blk file (lseek SEEK_END under flock st+40), and the
+ *   48-byte index record at height*48 on idx_fd. Disjoint heights land each
+ *   record at its own slot; payloads append at a consistent sequential offset.
+ *   shared (dolock=1) takes/releases the st+40 append flock for this call;
+ *   nolocked (dolock=0) skips it (caller already holds the lock). Returns
+ *   height on success, -1 on error. AArch64 flock = 32 (LOCK_EX=2, LOCK_UN=8).
+ * ========================================================================== */
+    .global store_append_shared
+    .type store_append_shared, %function
+store_append_shared:
+    mov  x5, #1
+    b    store_append_shared_x
+    .size store_append_shared, .-store_append_shared
+
+    .global store_append_shared_nolock
+    .type store_append_shared_nolock, %function
+store_append_shared_nolock:
+    mov  x5, #0
+    b    store_append_shared_x
+    .size store_append_shared_nolock, .-store_append_shared_nolock
+
+    .type store_append_shared_x, %function
+store_append_shared_x:
+    stp  x19, x20, [sp, #-16]!
+    stp  x21, x22, [sp, #-16]!
+    stp  x29, x30, [sp, #-16]!
+    sub  sp, sp, #96          /* len@0 dolock@8 filelen@16 datapos@24 fileno@32 hdr@40 rec@48 */
+    mov  x19, x0             /* st */
+    mov  x20, x1             /* height */
+    mov  x21, x2             /* hash */
+    mov  x22, x3             /* raw */
+    str  x4, [sp, #0]        /* len */
+    str  x5, [sp, #8]        /* dolock */
+    /* acquire flock if dolock && st+40 >= 0 */
+    ldr  x9, [sp, #8]
+    cbz  x9, .Sx_hlock
+    ldr  x9, [x19, #40]
+    tbz  x9, #63, .Sx_flk
+    b    .Sx_hlock
+.Sx_flk:
+    mov  x0, x9
+    mov  x8, #32
+    mov  x1, #2              /* LOCK_EX */
+    svc  #0
+.Sx_hlock:
+    /* ensure idx_fd (st+8) open */
+    ldr  x9, [x19, #8]
+    tbz  x9, #63, .Sx_hidxok
+    mov  x0, x19
+    bl   open_idx_close
+.Sx_hidxok:
+    /* ensure blk_fd (st+0) open */
+    ldr  x9, [x19, #0]
+    tbz  x9, #63, .Sx_hblkok
+    mov  x0, x19
+    ldr  w1, [x19, #28]
+    bl   open_file
+    cmp  x0, #0
+    b.lt .Sx_err
+.Sx_hblkok:
+.Sx_repos:
+    /* lseek(blk_fd, 0, SEEK_END=2) -> true file length */
+    mov  x8, #62
+    ldr  x0, [x19, #0]
+    mov  x1, #0
+    mov  x2, #2
+    svc  #0
+    tbnz x0, #63, .Sx_err
+    str  x0, [sp, #16]       /* true_file_len */
+.Sx_rollck:
+    /* if true_len + 8 + len > MAX_FILE -> roll */
+    ldr  x10, [sp, #16]
+    add  x10, x10, #8
+    ldr  x11, [sp, #0]
+    add  x10, x10, x11
+    movz x12, #0x0800, lsl#16 /* MAX_FILE = 0x08000000 */
+    cmp  x10, x12
+    b.ls .Sx_nroll
+    mov  x8, #57
+    ldr  x0, [x19, #0]
+    svc  #0
+    mov  x9, #-1
+    str  x9, [x19, #0]
+    ldr  w9, [x19, #28]
+    add  w9, w9, #1
+    str  w9, [x19, #28]
+    mov  x0, x19
+    ldr  w1, [x19, #28]
+    bl   open_file
+    cmp  x0, #0
+    b.lt .Sx_err
+    b    .Sx_repos
+.Sx_nroll:
+    ldr  x9, [sp, #16]
+    str  x9, [sp, #24]       /* data_pos */
+    ldr  w9, [x19, #28]
+    str  w9, [sp, #32]       /* file_no */
+    /* frame header [u32 len][u32 magic] at sp+40 */
+    ldr  w9, [sp, #0]
+    str  w9, [sp, #40]
+    ldr  w9, [x19, #36]
+    str  w9, [sp, #44]
+    /* lseek(blk_fd, data_pos, 0) */
+    mov  x8, #62
+    ldr  x0, [x19, #0]
+    ldr  x1, [sp, #24]
+    mov  x2, #0
+    svc  #0
+    tbnz x0, #63, .Sx_err
+    /* write frame (8) */
+    mov  x8, #64
+    ldr  x0, [x19, #0]
+    add  x1, sp, #40
+    mov  x2, #8
+    svc  #0
+    cmp  x0, #8
+    b.ne .Sx_err
+    /* write raw */
+    mov  x8, #64
+    ldr  x0, [x19, #0]
+    mov  x1, x22
+    ldr  x2, [sp, #0]
+    svc  #0
+    ldr  x9, [sp, #0]
+    cmp  x0, x9
+    b.ne .Sx_err
+    /* build index record [48] at sp+48: hash32 + file_no u32 + pos u64 + size u32 */
+    add  x0, sp, #48
+    mov  x1, x21
+    mov  x2, #32
+    bl   __stcopy
+    ldr  w9, [sp, #32]
+    str  w9, [sp, #80]       /* rec+32 file_no */
+    ldr  x9, [sp, #24]
+    str  x9, [sp, #84]       /* rec+36 pos */
+    ldr  w9, [sp, #0]
+    str  w9, [sp, #92]       /* rec+44 size */
+    /* lseek(idx_fd, height*48, 0) */
+    mov  x8, #62
+    ldr  x0, [x19, #8]
+    mov  x9, x20
+    mov  x10, #48
+    mul  x9, x9, x10
+    mov  x1, x9
+    mov  x2, #0
+    svc  #0
+    tbnz x0, #63, .Sx_err
+    /* write rec (48) */
+    mov  x8, #64
+    ldr  x0, [x19, #8]
+    add  x1, sp, #48
+    mov  x2, #48
+    svc  #0
+    cmp  x0, #48
+    b.ne .Sx_err
+.Sx_hlockdone:
+    /* release if dolock */
+    ldr  x9, [sp, #8]
+    cbz  x9, .Sx_ret
+    ldr  x9, [x19, #40]
+    tbz  x9, #63, .Sx_unl
+    b    .Sx_ret
+.Sx_unl:
+    mov  x0, x9
+    mov  x8, #32
+    mov  x1, #8              /* LOCK_UN */
+    svc  #0
+    b    .Sx_ret
+.Sx_err:
+    /* release if dolock, return -1 */
+    ldr  x9, [sp, #8]
+    cbz  x9, .Sx_err2
+    ldr  x9, [x19, #40]
+    tbz  x9, #63, .Sx_err_u
+    b    .Sx_err2
+.Sx_err_u:
+    mov  x0, x9
+    mov  x8, #32
+    mov  x1, #8
+    svc  #0
+.Sx_err2:
+    mov  x0, #-1
+    b    .Sx_done
+.Sx_ret:
+    mov  x0, x20              /* height */
+.Sx_done:
+    add  sp, sp, #96
+    ldp  x29, x30, [sp], #16
+    ldp  x21, x22, [sp], #16
+    ldp  x19, x20, [sp], #16
+    ret
+    .size store_append_shared_x, .-store_append_shared_x
+
+/* ---------- __stcopy(dst=x0, src=x1, n=x2) ---------- */
+    .type __stcopy, %function
+__stcopy:
+    mov  x3, #0
+.Lstc:
+    cmp  x3, x2
+    b.hs .Lstcd
+    ldrb w4, [x1, x3]
+    strb w4, [x0, x3]
+    add  x3, x3, #1
+    b    .Lstc
+.Lstcd:
+    ret
+    .size __stcopy, .-__stcopy
+
+/* ---------- open_idx_close(st=x0): reopen index.dat -> st+8 (non-leaf) ---------- */
+    .type open_idx_close, %function
+open_idx_close:
+    stp  x19, x30, [sp, #-16]!
+    mov  x19, x0
+    mov  x0, #-100            /* AT_FDCWD */
+    LAddr x1, idxname
+    mov  x2, #0x42            /* O_RDWR|O_CREAT */
+    mov  x3, #0644
+    mov  x8, #56              /* openat */
+    svc  #0
+    tbnz x0, #63, .Sx_ocd
+    str  x0, [x19, #8]        /* idx_fd */
+.Sx_ocd:
+    ldp  x19, x30, [sp], #16
+    ret
+    .size open_idx_close, .-open_idx_close
+
 	.section .rodata
 idxname:   .asciz "index.dat"
 prunename: .asciz "prune.dat"
