@@ -911,3 +911,65 @@ The daemon does **not** maintain the index — it is built offline and does not
 follow the tip. `txindex=1` in the config therefore still changes nothing,
 and now says exactly that rather than claiming the feature is absent.
 Incremental maintenance is the obvious next step.
+
+## Slice 19 — ZMQ notifications — (2026-08-26)
+`zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` in
+bitcoin.conf now work, speaking to any libzmq subscriber. This is the
+notification interface most Bitcoin infrastructure (explorers, indexers,
+LND) expects from a node it replaces Core with.
+
+### ZMTP written out, not linked
+libzmq exists on this box only as a runtime .so — no headers — and linking it
+would be this project's first external dependency beyond libc, against the
+grain of a codebase that writes its own secp256k1 and JSON. The publisher
+side of ZMTP 3.1 is small (a 64-byte greeting, one READY each way,
+length-prefixed frames), so `daemon/zmq_pub.c` implements it directly.
+
+That choice is only defensible if it interoperates, so the proof is
+`tests/zmq_interop.py`: a REAL libzmq 4.3.5 subscriber receives the
+handshake, Core's three-part message shape `[topic][body][seq u32 LE]`,
+5000-byte LONG frames (the 8-byte big-endian length path every real block
+takes), and contiguous per-topic sequence numbers. The harness itself was
+proven able to fail: two deliberately sabotaged publishers (little-endian
+LONG lengths; subscriptions ignored) are both detected.
+
+The sabotage round found a harness bug worth recording: publisher-side
+filtering CANNOT be checked through a libzmq SUB socket, because libzmq
+also filters on receive — a publisher that floods everything looks
+identical. That check now reads raw bytes off the TCP socket and asserts on
+what was actually sent.
+
+### The cross-process ring
+Transactions are accepted by the inbound serve CHILDREN, but a PUB socket's
+subscriber fds live in one process (the download worker). The bridge is a
+16-slot MPSC ring in the pre-fork MAP_SHARED status block: producers claim
+slots with an atomic increment and set `ready` last behind a barrier; the
+worker drains each rotation. Overrun drops (correct for PUB — a slow
+subscriber must never stall consensus) but is COUNTED and logged, never
+silent. `tests/test_zmq_ring` exercises it with real forked producers,
+including the lapped-ring and mid-write cases.
+
+### The byte order Core actually uses
+Core's notifier REVERSES hashes before sending — `data[31-i] =
+hash.begin()[i]` — so hashblock/hashtx carry the DISPLAY-order hash, the
+same string `getblockhash` prints. The first draft of this slice published
+wire order: plausible, self-consistent, and matching nothing a subscriber
+would ever compare against. Caught by writing the wire bytes into the
+real-block check below and reading them against Core's own output.
+`tests/zmq_realblock_check` now asserts, for real archived blocks, that
+hex(published bytes) equals Core's `getblockhash` string exactly.
+
+### What refuses, and why
+`zmqpubsequence` is refused at config parse, loudly. Core's `sequence`
+topic exists to track mempool MEMBERSHIP — adds and removes. This node has
+one clean choke point for "accepted" but none for "removed" (eviction,
+expiry and reorg each call mpool_del independently), so it could publish
+adds without removes: a subscriber's mempool model would grow forever and
+never learn it was wrong. A stream that quietly lies is worse than a
+refusal that explains itself.
+
+Blocks are published from the tip-watch choke point in the worker, one
+notification per block even in catch-up bursts — a subscriber must see
+every block, not just the last of a burst. Publishing binds in the worker;
+a busy port logs and continues, because notifications must never stop the
+node syncing.

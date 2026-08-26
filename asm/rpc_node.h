@@ -50,6 +50,13 @@ typedef struct {
 #define RPC_CTL_PING           6
 #define RPC_MAX_BANS           64
 
+/* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
+ * 16 slots is generous: the worker drains every rotation, so a slot lives for
+ * milliseconds. Slot payload matches the sendrawtransaction bound, so any
+ * transaction this node will accept also fits the ring. */
+#define RPC_ZMQ_RING           16
+#define RPC_ZMQ_TXMAX          RPC_TXSUBMIT_MAX
+
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
     volatile int       n_inbound;    /* live inbound peers   (serve parent)    */
@@ -122,6 +129,34 @@ typedef struct {
     volatile int                blk_submit_result;
     char                        blk_submit_reason[64];
     unsigned char               blk_submit_buf[RPC_BLKSUBMIT_MAX];
+
+    /* ==== ZMQ transaction notification ring ====
+     * MANY producers, ONE consumer, and that asymmetry is the whole reason
+     * this exists. Transactions are accepted into the mempool by the INBOUND
+     * SERVE CHILDREN (bitcoin_serve.asm -> tx_accept_validate), which are
+     * separate processes, while the ZMQ publisher owns a listening socket and
+     * its subscriber fds and so can live in only ONE process (the download
+     * worker). A child cannot write to the worker's sockets, so accepted
+     * transactions are staged HERE -- in the pre-fork MAP_SHARED status block
+     * every process inherits -- and the worker drains them.
+     *
+     * Without this, zmqpubrawtx would carry only this node's OWN
+     * sendrawtransaction submissions and would miss every transaction
+     * arriving from the network, which is the entire point of the topic.
+     *
+     * A producer claims a slot with an atomic increment on zmq_seq, fills it,
+     * and publishes `ready` LAST behind a barrier, so the consumer never sees
+     * a half-written slot. Overrun (producers lapping the consumer) is
+     * detected by the consumer, which skips ahead and counts what it lost:
+     * dropping is correct for a PUB socket, but dropping SILENTLY is not. */
+    volatile unsigned long long zmq_seq;    /* slots claimed (producers)       */
+    volatile unsigned long long zmq_lost;   /* messages lost to overrun        */
+    struct {
+        volatile unsigned long long ready;  /* seq+1 once filled; 0 = empty    */
+        volatile unsigned long      len;    /* raw tx length                   */
+        unsigned char               txid[32];          /* WIRE order           */
+        unsigned char               tx[RPC_ZMQ_TXMAX];
+    } zmq_ring[RPC_ZMQ_RING];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
@@ -173,6 +208,10 @@ void rpc_node_set_addrbook(void* ab, long (*count)(void*),
  * caller passes node_config's g_cfg.addnode, a long-lived global. Pass
  * (NULL, 0) to detach. */
 void rpc_node_set_addednodes(const char (*list)[64], int n);
+/* The four zmqpub endpoints from bitcoin.conf ("" / NULL = not published),
+ * behind getzmqnotifications. Injected like the added-node list above. */
+void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
+                      const char* rawblock, const char* rawtx);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
