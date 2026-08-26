@@ -56,4 +56,8 @@ ibd
 vobj/
 btc_scriptverify.o
 fz_sw
-cmp_sw
+cmp_swt_full
+t_fullfuzz_fixed
+t_fullfuzz_old
+t_full_old
+t_repro
