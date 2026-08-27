@@ -28,8 +28,22 @@
 ; ============================================================================
     default rel
     global script_flags_for_block
+    global sfc_chain
 
 %include "script_flags_consts.inc"
+
+; ----------------------------------------------------------------------------
+; sfc_chain -- runtime chain selector: 0 = mainnet (the static default, so
+; every caller that never selects a chain gets exactly the old behaviour),
+; 1 = regtest. Written once by chainparams_select() (daemon/chainparams.c)
+; before any block is verified, never again -- the unsynchronized read below
+; is safe. Regtest's buried heights come from the same generator run
+; (SFC_R_HEIGHT_*, CRegTestParams); the two mainnet exception hashes cannot
+; occur on a regtest chain (different genesis), so the exception compares are
+; skipped entirely there.
+; ----------------------------------------------------------------------------
+section .data
+sfc_chain: dd 0
 
 section .text
 
@@ -41,6 +55,9 @@ section .text
 script_flags_for_block:
     push  rbx
     mov   rbx, rdi                 ; height (survives the hash compares)
+
+    cmp   dword [sfc_chain], 0
+    jne   .regtest
 
     ; ---- exception 1: BIP16 ----
     lea   rax, [rel SFC_EXC_BIP16_HASH]
@@ -95,5 +112,27 @@ script_flags_for_block:
     jb    .skip_segwit
     or    rax, (1<<SFC_BIT_NULLDUMMY)
 .skip_segwit:
+    pop   rbx
+    ret
+
+; ---- regtest: same base flags, no exceptions, CRegTestParams heights ----
+.regtest:
+    mov   rax, (1<<SFC_BIT_P2SH) | (1<<SFC_BIT_WITNESS) | (1<<SFC_BIT_TAPROOT)
+    cmp   rbx, SFC_R_HEIGHT_DERSIG
+    jb    .r_skip_dersig
+    or    rax, (1<<SFC_BIT_DERSIG)
+.r_skip_dersig:
+    cmp   rbx, SFC_R_HEIGHT_CLTV
+    jb    .r_skip_cltv
+    or    rax, (1<<SFC_BIT_CLTV)
+.r_skip_cltv:
+    cmp   rbx, SFC_R_HEIGHT_CSV
+    jb    .r_skip_csv
+    or    rax, (1<<SFC_BIT_CSV)
+.r_skip_csv:
+    cmp   rbx, SFC_R_HEIGHT_SEGWIT
+    jb    .r_skip_segwit
+    or    rax, (1<<SFC_BIT_NULLDUMMY)
+.r_skip_segwit:
     pop   rbx
     ret

@@ -54,6 +54,11 @@ void rpc_chain_set_undo(long (*replay)(long height,
  * pruned/automatic_pruning/prune_target_size fields. */
 void rpc_chain_set_prune_mib(long mib);
 
+/* Runtime chain selection (daemon/chainparams.c). Defaults are mainnet;
+ * the daemon calls this once after chainparams_select(). `name` must point
+ * at storage that outlives the RPC server (chainparams' names are static). */
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting);
+
 /* What `stop` does after building its reply. Default: SIGTERM to self (the
  * rpcd main loop's handler shuts the server down). Tests install a no-op. */
 void rpc_chain_set_stop_handler(void (*fn)(void));

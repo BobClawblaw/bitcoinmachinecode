@@ -13,4 +13,11 @@
 #define SFC_HEIGHT_CSV    419328
 #define SFC_HEIGHT_SEGWIT 481824   /* WITNESS + NULLDUMMY (BIP147) */
 
+/* regtest (CRegTestParams) */
+#define SFC_R_HEIGHT_BIP34  1
+#define SFC_R_HEIGHT_DERSIG 1   /* BIP66 */
+#define SFC_R_HEIGHT_CLTV   1   /* BIP65 */
+#define SFC_R_HEIGHT_CSV    1
+#define SFC_R_HEIGHT_SEGWIT 0
+
 #endif
