@@ -161,6 +161,34 @@ static const char* PEERS[] = {
 #define NPEERS 49
 static int g_npeer=0;
 static char g_peer_host[4096];   /* last-connected host (for [catchup] log) */
+/* ---- discovered-peer book (x86 dl_bootstrap/amr model): seeds are used ONLY
+ * to discover real peers via getaddr; download clients dial DISTINCT peers from
+ * this book instead of the seeds themselves. ---- */
+#define BOOK_MAX 1024
+static char   g_book[BOOK_MAX][16];   /* dotted-quad IPv4s, deduped */
+static int    g_nbook=0;
+static int    g_booki=0;              /* book rotation cursor for re-dials */
+static void book_add_ip(unsigned ip){
+    char s[16]; snprintf(s,sizeof s,"%u.%u.%u.%u",(ip>>24)&0xff,(ip>>16)&0xff,(ip>>8)&0xff,ip&0xff);
+    for(int i=0;i<g_nbook;i++) if(!strcmp(g_book[i],s)) return;
+    if(g_nbook<BOOK_MAX){ strncpy(g_book[g_nbook],s,15); g_book[g_nbook][15]=0; g_nbook++; }
+}
+static int parse_addr(const unsigned char* p, unsigned plen){
+    if(plen<1) return 0;
+    unsigned long long n; int v;
+    if(p[0]<0xfd){ n=p[0]; v=1; }
+    else if(p[0]==0xfd){ if(plen<3)return 0; n=p[1]|(p[2]<<8); v=3; }
+    else if(p[0]==0xfe){ if(plen<5)return 0; n=(unsigned long long)p[1]|((unsigned long long)p[2]<<8)|((unsigned long long)p[3]<<16)|((unsigned long long)p[4]<<24); v=5; }
+    else { if(plen<9)return 0; n=0; for(int i=0;i<8;i++) n=(n<<8)|p[8+i]; v=9; }
+    unsigned long long off=v; int added=0;
+    for(unsigned long long i=0;i<n && off+30<=plen;i++){
+        off += 4+8;   /* time + services */
+        unsigned ip=((unsigned)p[off+12]<<24)|((unsigned)p[off+13]<<16)|((unsigned)p[off+14]<<8)|(unsigned)p[off+15];
+        off += 16+2;  /* IPv6 (::ffff:a.b.c.d) + port */
+        if(ip){ book_add_ip(ip); added++; }
+    }
+    return added;
+}
 /* bounded TCP dial: nonblocking connect + poll(2) so a dead/unroutable peer
  * fails in ~6s instead of blocking on the kernel's ~2min SYN-retry timeout.
  * Returns a blocked-connection fd (connected) or -1 within ~6s. */
@@ -173,12 +201,12 @@ static int tcp_dial_bounded(unsigned ip, unsigned short port){
     if(rc==0) return fd;
     if(errno!=EINPROGRESS){ close(fd); return -1; }
     struct pollfd pf; pf.fd=fd; pf.events=POLLOUT; pf.revents=0;
-    if(poll(&pf,1,6000)<=0){ close(fd); return -1; }
+    if(poll(&pf,1,2000)<=0){ close(fd); return -1; }
     int so=0; socklen_t sl=sizeof so;
     if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&so,&sl)<0 || so!=0){ close(fd); return -1; }
     return fd;
 }
-static int connect_peer(const char* host,unsigned char* rbuf){
+static int connect_peer(const char* host,unsigned char* rbuf,int discover){
     int tries=0;
     for(int attempt=0;; attempt++){
         const char* ph = (attempt==0 && host)? host : PEERS[g_npeer % NPEERS];
@@ -209,13 +237,32 @@ static int connect_peer(const char* host,unsigned char* rbuf){
                     if(strncmp(cmd,"version",7)==0&&!sv){ p2p_write(fd,"verack",6,rbuf,0); sv=1; }
                     else if(strncmp(cmd,"verack",6)==0) gv=1;
                 }
-                if(sv&&gv){ snprintf(g_peer_host,sizeof g_peer_host,"%s",ph); return fd; }
+                if(sv&&gv){
+                    if(discover){
+                        /* x86 addr_gather: solicit discovered peers via getaddr and
+                         * drain addr messages into the book (seed used only to learn
+                         * real peers). Bounded with SO_RCVTIMEO so a silent peer
+                         * can't hang the drain; restored to blocking after. */
+                        struct timeval tv; tv.tv_sec=8; tv.tv_usec=0;
+                        setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                        p2p_write(fd,"getaddr",7,0,0);
+                        for(int k=0;k<25;k++){ char cmd2[12]; unsigned pl2=0;
+                            int r2=p2p_read(fd,cmd2,rbuf,8*1024*1024,&pl2); cmd2[11]=0;
+                            if(r2<=0) break;
+                            if(strncmp(cmd2,"addr",4)==0) parse_addr(rbuf,pl2);
+                            else if(strncmp(cmd2,"ping",4)==0) p2p_write(fd,"pong",4,0,0);
+                        }
+                        tv.tv_sec=0; tv.tv_usec=0;
+                        setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                    }
+                    snprintf(g_peer_host,sizeof g_peer_host,"%s",ph); g_npeer++; return fd;
+                }
                 fd_close(fd);
             }
             g_npeer++;
         }
-        if(tries++>NPEERS*3) return -1;
-        usleep(100000);
+        if(tries++>40) return -1;
+        usleep(50000);
     }
 }
 static int req_window(int fd, const unsigned char* hdr, long w, long nw){
@@ -364,7 +411,12 @@ static void log_peers(void){
 static int rotate_client(int j, unsigned char* hdr){
     if(g_fd[j]>=0) fd_close(g_fd[j]);
     g_fd[j]=-1;
-    int nfd=connect_peer(0, g_rbuf[j]);
+    /* redial via the DISCOVERED book (1014+ peers incl. known-good), not the
+       stale static fallback: rotation cycles the book so a client that hit a
+       dead/non-serving peer hops to the next real candidate. */
+    char bookh[16]; const char* host=0;
+    if(g_nbook>0){ snprintf(bookh,sizeof bookh,"%s",g_book[(g_booki++)%g_nbook]); host=bookh; }
+    int nfd=connect_peer(host, g_rbuf[j], 0);
     if(nfd<0){
         int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){ g_win[k].owner=-1; break; }
         return -1;
@@ -491,18 +543,43 @@ int main(int argc, char** argv){
     { char* tok=strtok(peerl,","); while(tok && ng<16){ given[ng++]=tok; tok=strtok(0,","); } }
     unsigned char* work = malloc(8u<<20);
     unsigned char* scr = malloc(1<<22);
+    unsigned char* discrbuf = malloc(8*1024*1024);
     for(int i=0;i<MAXC;i++){ g_fd[i]=-1; }
+    /* Pre-seed the book with KNOWN-GOOD real peer IPs (the static list we have
+       verified actually serve blocks), so the downloader never depends on the
+       noisy getaddr haul. These are peer IPs, NOT seeds (x86 dl_bootstrap keeps
+       known-good peers first; per-peer discovery follows). */
+    for(int i=0;i<NPEERS && PEERS[i];i++){
+        unsigned ip=0; struct in_addr a;
+        if(inet_pton(AF_INET,PEERS[i],&a)) ip=a.s_addr;
+        if(ip) book_add_ip(ip);
+    }
+    /* PHASE A: DISCOVERY ONLY. Connect each given seed, exchange getaddr into
+       the book, then DROP the seed -- seeds are peer SOURCES, never download
+       peers (x86 dl_bootstrap model). */
+    for(int s=0;s<ng;s++){
+        int f=connect_peer(given[s], discrbuf, 1);
+        if(f>=0){ fprintf(stderr,"[boot] seed %s -> discovered (dropped)\n", g_peer_host); fd_close(f); }
+    }
+    fprintf(stderr,"[boot] discovered +%d peer(s) via getaddr (book now %d)\n", g_nbook, g_nbook);
+    fprintf(stderr,"[boot] peer book: ");
+    for(int i=0;i<g_nbook && i<24;i++) fprintf(stderr,"%s%s", i?",":"", g_book[i]);
+    fprintf(stderr,"\n");
+    /* PHASE B: dial DISTINCT DISCOVERED peers as the download clients (static
+       list only if discovery returned nothing) -- x86 live[]/claimed pool. */
+    int bi=0;
     g_ncli=0;
     for(int j=0;j<ncli;j++){
         g_rbuf[j]=malloc(8*1024*1024);
-        const char* host = j<ng ? given[j] : 0;
-        int fd=connect_peer(host, g_rbuf[j]);
+        const char* host = bi<g_nbook ? g_book[bi++] : 0;
+        int fd=connect_peer(host, g_rbuf[j], 0);
         if(fd<0){ fprintf(stderr,"[catchup] client %d: no peer available\n",j); break; }
         g_fd[j]=fd;
         snprintf(g_peer_name[j],sizeof g_peer_name[j],"%s",g_peer_host);
         LLOG(7, "[catchup] client %d connected: %s fd=%d (LSM-RESUME)\n", j, g_peer_host, fd);
         g_ncli++;
     }
+    free(discrbuf);
     if(g_ncli<=0){ fprintf(stderr,"FAIL connect any peer\n"); return 1; }
     fprintf(stderr,"[catchup] %d/%d clients connected\n", g_ncli, ncli);
 
