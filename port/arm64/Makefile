@@ -168,7 +168,11 @@ ibd: ibd.c $(IBDOBJS)
 # utxo_lsm_reload. Handles utxo_lsm_put's .full (2) with flush+retry.
 IBDLSMOBJS = $(IBDOBJS) bitcoin_utxo_lsm.o utxo_lsm_mm.o
 ibd_lsm: ibd_lsm.c $(IBDLSMOBJS)
-	$(CC) $(CFLAGS) -o ibd_lsm ibd_lsm.c $(IBDLSMOBJS)
+	@$(CC) $(CFLAGS) -o ibd_lsm ibd_lsm.c $(IBDLSMOBJS)
+# multi-client (<=16 parallel peers) resumable downloader: poll() mux over the
+# client pool + x86 startup banner + [catchup]/[dl] logging (log parity with x86).
+ibd_par: ibd_par.c $(IBDLSMOBJS)
+	@$(CC) $(CFLAGS) -o ibd_par ibd_par.c $(IBDLSMOBJS)
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 
