@@ -195,7 +195,8 @@ static void dlc_alarm(int s){ (void)s; mux_budget_fired=1; }
  * Log lines match x86 main.c dlc_worker exactly. ---- */
 static int dlc_worker(int w, long end_h, char live[][64], int nlive, int slot0,
                       volatile long* next_claim, volatile long* done_count,
-                      volatile dlc_stat_t* mystat, volatile int* claimed){
+                      volatile dlc_stat_t* mystat, volatile int* claimed,
+                      volatile int* banned){
     struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=dlc_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL);
     static unsigned char st[4096]; if(store_init(st)!=1){ tsline("[dlc w%d] no store\n",w); return 1; }
     store_reload(st);
@@ -231,6 +232,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive, int slot0,
                 int ok=0;
                 for(int a=0;a<nlive && !ok;a++){
                     int idx=(slot+a)%nlive;
+                    if(banned[idx]) continue;   /* already proved itself useless this run */
                     if(claimed[idx]) continue;
                     const char* cand=live[idx];
                     unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) continue;
@@ -264,8 +266,12 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive, int slot0,
                     stalled++;
                     /* Bans are an optimisation not a correctness property -- a
                        slow peer beats no peer. x86 lifts bans at stalled==10/25;
-                       we keep the pool open by simply retrying, and only give up
-                       after many rounds (x86 "peers exhausted"). */
+                       match it exactly. */
+                    if(stalled==10 || stalled==25){
+                        int lifted=0;
+                        for(int q=0;q<nlive;q++) if(banned[q]){ banned[q]=0; lifted++; }
+                        if(lifted) tsline("[dlc w%d] no reachable peer -- amnesty, un-banned %d peer(s)\n", w, lifted);
+                    }
                     if(stalled>40){ tsline("[dlc w%d] peers exhausted\n",w); break; }
                     sleep(3); slot=(slot+7)%(nlive>0?nlive:1); continue;
                 }
@@ -425,7 +431,8 @@ int main(int argc, char** argv){
     volatile long* done_count=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     volatile dlc_stat_t* stats=mmap(NULL,sizeof(dlc_stat_t)*(size_t)nwork,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     volatile int* claimed=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-    if(next_claim==MAP_FAILED||done_count==MAP_FAILED||stats==MAP_FAILED||claimed==MAP_FAILED){ tsline("[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
+    volatile int* banned=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED||done_count==MAP_FAILED||stats==MAP_FAILED||claimed==MAP_FAILED||banned==MAP_FAILED){ tsline("[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
     for(int i=0;i<nwork;i++) stats[i].held_idx=-1;
     *next_claim=start_h; *done_count=0;
 
@@ -433,7 +440,7 @@ int main(int argc, char** argv){
     pid_t kids[64]; pid_t opid[64];
     for(int w=0;w<nwork;w++){
         pid_t p=fork();
-        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed)); }
+        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed, banned)); }
         kids[w]=p; opid[w]=p;
     }
     long prev_blocks[64]={0}; long prev_rchar[64]={0}; long prev_wbytes[64]={0}; int dead_ticks[64]={0};
@@ -476,9 +483,9 @@ int main(int argc, char** argv){
                         long bidx=stats[w].held_idx;
                         const char* why="kept";
                         if(bidx>=0 && bidx<nlive){
-                            int usable=0; for(int q=0;q<nlive;q++) if(claimed[q]==0) usable++; /* approx */
-                            if(usable > MIN_USABLE_PEERS){ claimed[bidx]=0; nbanned++; why="BANNED"; }
-                            else why="floor";
+                            int usable=0; for(int q=0;q<nlive;q++) if(!banned[q]) usable++;
+                            if(usable > MIN_USABLE_PEERS){ banned[bidx]=1; nbanned++; why="BANNED"; }
+                            else why="floor";   /* at floor: still rotate worker, keep peer selectable */
                         }
                         kill(opid[w],SIGUSR1);
                         dead_ticks[w]=0;
@@ -517,6 +524,7 @@ int main(int argc, char** argv){
     munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
     munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nwork);
     munmap((void*)claimed,sizeof(int)*(size_t)nlive);
+    munmap((void*)banned,sizeof(int)*(size_t)nlive);
     tsline("[dlc] catch-up done: %ld new blocks written\n", total);
     return 0;
 }
