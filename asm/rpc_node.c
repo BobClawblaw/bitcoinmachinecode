@@ -1349,8 +1349,21 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
 static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const char** em){
     /* VOID: bitcoin_cmpct.asm sets no return value (tests/test_bip152.c has
      * had it right all along). Declaring it int and checking for 1 reads
-     * whatever happened to be in rax -- which silently dropped every result. */
-    extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen);
+     * whatever happened to be in rax -- which silently dropped every result.
+     *
+     * WEAK because many targets link rpc_node.o without bitcoin_cmpct.o, and
+     * the same trick bitcoin_mempool_policy.c uses for tx_parse/tx_txid keeps
+     * them linking. Core keys tx-results by wtxid, so without it this call
+     * cannot answer in Core's shape -- it refuses rather than keying the
+     * results by something else. */
+    extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen)
+        __attribute__((weak));
+    if (!tx_wtxid){
+        *ec = -1;
+        *em = "submitpackage is unavailable in this build: results are keyed by "
+              "wtxid and the wtxid primitive is not linked in";
+        return 0;
+    }
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
         *ec = -8; *em = "Invalid parameter, package must be a non-empty array"; return 0; }
