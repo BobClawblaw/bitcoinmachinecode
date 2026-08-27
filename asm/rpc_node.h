@@ -36,7 +36,11 @@ typedef struct {
  * for a snapshot; the peer table is written slot-at-a-time by the one worker. */
 /* Max raw-tx bytes a sendrawtransaction submission can stage. A standard tx is
  * capped at 100k vbytes; 400000 covers the consensus weight bound with room. */
-#define RPC_TXSUBMIT_MAX 400000
+/* Core's MAX_PACKAGE_WEIGHT is 404000, and weight >= serialized size, so a
+ * whole package always fits in this buffer; a single transaction is bounded
+ * far below it by MAX_STANDARD_TX_WEIGHT. */
+#define RPC_TXSUBMIT_MAX 404000
+#define RPC_PKG_MAX      25          /* Core MAX_PACKAGE_COUNT */
 /* Max serialized block a submitblock can stage: the 4M-weight consensus
  * bound (a block is at most 4MB serialized), with margin. */
 #define RPC_BLKSUBMIT_MAX 4100000
@@ -83,6 +87,27 @@ typedef struct {
     volatile unsigned long long tx_submit_fee;    /* satoshis, dry run only */
     char                        tx_submit_reason[128];
     unsigned char               tx_submit_buf[RPC_TXSUBMIT_MAX];
+
+    /* ==== package submission (submitpackage) =============================
+     * Rides the SAME seq/ack channel: tx_submit_buf carries the package's
+     * transactions CONCATENATED (each is self-delimiting, so the worker
+     * walks them with tx_parse and no length table is needed) and
+     * tx_submit_pkg_n says how many. 0 means an ordinary single
+     * transaction and every existing caller keeps its behaviour untouched.
+     *
+     * Results are per-transaction because Core's submitpackage reports them
+     * that way: a package can be partly accepted, and saying only "failed"
+     * would hide which member was the problem. pkg_msg carries the
+     * package-level verdict ("success", or a package-policy reason). */
+    volatile int                tx_submit_pkg_n;          /* 0 = single tx */
+    volatile int                pkg_result[RPC_PKG_MAX];  /* 1 ok / 0 rejected */
+    volatile unsigned long long pkg_fee[RPC_PKG_MAX];     /* satoshis */
+    volatile unsigned long long pkg_vsize[RPC_PKG_MAX];
+    char                        pkg_reason[RPC_PKG_MAX][64];
+    char                        pkg_msg[128];
+    /* the aggregate the package was actually evaluated against, so the RPC can
+     * report Core's effective-feerate instead of guessing one */
+    volatile unsigned long long pkg_eff_fee, pkg_eff_vsize;
 
     /* ==== peer-control channel (parent RPC thread -> download worker) ====
      * The worker owns the peer legs; the parent owns the RPC surface. Before
