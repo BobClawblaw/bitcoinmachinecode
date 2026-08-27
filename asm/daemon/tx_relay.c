@@ -62,6 +62,8 @@ extern int  mpol_package_well_formed(const u8* const* txs, const unsigned long* 
                                      int n, u8* txids, unsigned long long* vsz,
                                      const char** why);
 extern void mpol_package_fee_context(unsigned long long fee, unsigned long long vsize);
+extern void mpol_package_context(const u8* const* txs, const unsigned long* lens,
+                                 const u8* txids, int n);
 extern void txacc_package_overlay(const u8* const* txs, const unsigned long* lens,
                                   const u8* txids, int n);
 extern long tx_accept_test_reason(void* mp, const u8* txid, const u8* tx, unsigned long len,
@@ -367,6 +369,7 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
      * not in the mempool yet. */
     unsigned long long tot_fee = 0, tot_vsize = 0;
     int all_ok = 1;
+    mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
     for (int i = 0; i < 2; i++){
         char r[128]; r[0] = 0; unsigned long long fee = 0;
@@ -375,11 +378,13 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
         else { all_ok = 0; break; }     /* not something a package can rescue */
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
     if (!all_ok) return 0;
 
     /* pass 2: commit with the package feerate in effect */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
+    mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
     for (int i = 0; i < 2; i++)
         if (tx_accept_validate_p2p(mp, txids + i*32, txs[i], lens[i]) != 1) committed = 0;
@@ -387,6 +392,7 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
      * floor for ordinary single-transaction relay, and an overlay left set
      * would let an unrelated transaction resolve against a package member. */
     txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
 
     if (committed){
