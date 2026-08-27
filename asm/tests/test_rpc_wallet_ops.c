@@ -450,7 +450,7 @@ int main(void){
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
     { static const char* REFUSE[] = {
         "migratewallet","setwalletflag","createwalletdescriptor",
-        "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet" };
+        "addhdkey","importprunedfunds","removeprunedfunds" };
       /* walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
        * encryptwallet left 2026-08-27 (real; -8 asserted below).
        * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
@@ -458,7 +458,12 @@ int main(void){
        * exercised at the end of this file.
        * bumpfee/psbtbumpfee left 2026-08-27: REAL now (Core feebumper
        * semantics; differentially proven on regtest) -- bad-arg forms
-       * asserted below. */
+       * asserted below.
+       * exportwatchonlywallet left 2026-08-27: REAL now -- the wallet's whole
+       * key set is its two concrete descriptors (see listdescriptors), so the
+       * export is complete rather than truncated, and the round trip through
+       * restorewallet is proven in validation/bumpfee_regtest_e2e.sh. Its
+       * bad-arg form is asserted just below. */
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
@@ -469,6 +474,11 @@ int main(void){
           rj_free(r);
       }
       ck("every unsupported wallet method errors with a substantive reason", allbad);
+      /* exportwatchonlywallet is real, so it must reject a MISSING
+       * destination with Core's -8 rather than refuse wholesale */
+      D("exportwatchonlywallet", NULL);
+      ck("exportwatchonlywallet with no destination -> -8", rc == 0 && ec == -8);
+      rj_free(r);
       /* encryptwallet is wired (daemon/wallet_enc_state.c): with no passphrase
        * argument it is an ordinary parameter error, not a stub refusal. */
       { D("encryptwallet", NULL);

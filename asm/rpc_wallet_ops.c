@@ -111,6 +111,9 @@ static int wop_name_ok(const char* n){
 
 #define WOP_WATCH_REL  "bmcwallet.watch"     /* watch-only shell marker  */
 #define WOP_DESCS_REL  "descriptors.dat"     /* imported descriptors     */
+/* header of an exportwatchonlywallet file: what lets restorewallet tell an
+ * exported watch-only wallet from a seed backup and install the right kind */
+#define WOP_WATCH_EXPORT_MAGIC "BMCWATCHEXPORT v1"
 
 /* forward decl: the ACTIVE wallet may scope wallet files into a subdir */
 static const char* wop_wallet_prefix(void);
@@ -486,7 +489,20 @@ static int cmd_restorewallet(const rj_val* params, long* ec, const char** em, rj
         snprintf(perr, sizeof perr, "Wallet \"%s\" already exists.", name);
         return wop_err(ec, em, -36, perr);      /* Core: RPC_WALLET_ALREADY_EXISTS */
     }
+    /* An exportwatchonlywallet file is also a valid backup -- Core says so
+     * explicitly ("can be imported into another node using restorewallet"),
+     * and it installs a WATCH-ONLY wallet rather than a seed one. Detected by
+     * its header so the two kinds cannot be confused. */
+    int watch_export = 0;
+    { FILE* bf = fopen(backup, "r");
+      if (bf){ char hdr[64]; hdr[0] = 0;
+               if (fgets(hdr, sizeof hdr, bf) &&
+                   !strncmp(hdr, WOP_WATCH_EXPORT_MAGIC, strlen(WOP_WATCH_EXPORT_MAGIC)))
+                   watch_export = 1;
+               fclose(bf); } }
+
     /* prove the backup loads BEFORE installing it */
+    if (!watch_export)
     { char mn[768], ps[256]; ps[0] = 0;
       if (wallet_store_load(backup, mn, (int)sizeof mn, ps, (int)sizeof ps) != 0){
           memset(mn, 0, sizeof mn);
@@ -495,6 +511,35 @@ static int cmd_restorewallet(const rj_val* params, long* ec, const char** em, rj
     char dir[640];
     if (!wop_wallet_mkdir(name, dir, sizeof dir))
         return wop_err(ec, em, -4, "could not create the wallet directory");
+    if (watch_export){
+        /* the marker makes it a watch-only wallet; the descriptors are the
+         * export's body, with the header line dropped */
+        char mk[720]; snprintf(mk, sizeof mk, "%s/%s", dir, WOP_WATCH_REL);
+        FILE* mf = fopen(mk, "w");
+        if (!mf) return wop_err(ec, em, -4, "could not write the wallet");
+        fputs("BMCWATCH v1\n", mf); fclose(mf);
+        char dp[720]; snprintf(dp, sizeof dp, "%s/%s", dir, WOP_DESCS_REL);
+        FILE* in = fopen(backup, "r"); FILE* outf = in ? fopen(dp, "w") : NULL;
+        if (!in || !outf){ if (in) fclose(in); if (outf) fclose(outf);
+            return wop_err(ec, em, -4, "could not copy the exported descriptors"); }
+        char line[512]; int first = 1;
+        while (fgets(line, sizeof line, in)){
+            if (first){ first = 0; continue; }      /* drop the header */
+            fputs(line, outf);
+        }
+        fclose(in); fclose(outf);
+        wop_watch_keys_invalidate();
+        if (!wop_activate(name, ec, em)) return 0;
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "name", rj_str(name));
+        rj_val* wn = rj_arr();
+        rj_arr_push(wn, rj_str("watch-only wallet restored from an export: "
+                               "run rescanblockchain to find its history"));
+        rj_obj_set(o, "warnings", wn);
+        *res = o;
+        return 1;
+    }
+
     char dst[720]; snprintf(dst, sizeof dst, "%s/%s", dir, WOP_WALLET_REL);
     FILE* in = fopen(backup, "rb"); FILE* outf = in ? fopen(dst, "wb") : NULL;
     if (!in || !outf){ if (in) fclose(in); return wop_err(ec, em, -4, "could not copy the backup"); }
@@ -804,6 +849,85 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
     rj_val* o = rj_obj();
     rj_obj_set(o, "wallet_name", rj_str(rpc_wops_active_wallet_name()));
     rj_obj_set(o, "descriptors", arr);
+    *res = o;
+    return 1;
+}
+
+/* ==== exportwatchonlywallet ===============================================
+ * Core: "creates a wallet file at the specified destination containing a
+ * watchonly version of the current wallet", importable elsewhere with
+ * restorewallet. That is expressible here, and completely, for the reason
+ * listdescriptors documents above: this wallet derives
+ * m/84'/0'/0'/<i>/<0|1> with the branch LAST, so a ranged descriptor cannot
+ * describe it -- but it only ever uses index 0, so its ENTIRE key set is the
+ * two concrete descriptors that get written. This is not a truncated export.
+ *
+ * The file is the same descriptors.dat format a watch-only wallet already
+ * loads, behind a header line so restorewallet can tell an exported
+ * watch-only wallet from a seed backup and install the right kind.
+ *
+ * STATED OMISSION: Core's export also carries the wallet's transactions and
+ * address book. This one carries the descriptors -- the part that makes the
+ * wallet watchable at all. A restored export finds its history by
+ * rescanning, which is what a watch-only wallet on this node does anyway. */
+static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
+                                     long* ec, const char** em, rj_val** res){
+    const char* dest = wop_str_arg(params, 0);
+    if (!dest || !dest[0])
+        return wop_err(ec, em, -8, "exportwatchonlywallet requires a destination path");
+
+    /* gather this wallet's public descriptors, from whichever kind it is */
+    char descs[WOP_MAX_DESCS][340];
+    long ranges[WOP_MAX_DESCS], nexts[WOP_MAX_DESCS];
+    int nd = 0;
+    if (w && w->seed){
+        for (int ch = 0; ch <= 1 && nd < WOP_MAX_DESCS; ch++){
+            rj_val* e = wop_desc_entry(w->seed, ch);
+            if (!e) continue;
+            rj_val* d = rj_obj_get(e, "desc");
+            if (d && d->str){
+                snprintf(descs[nd], sizeof descs[nd], "%s", d->str);
+                ranges[nd] = 1; nexts[nd] = 0; nd++;
+            }
+            rj_free(e);
+        }
+    } else if (g_aw_watchonly){
+        wop_descs_load();
+        for (int i = 0; i < g_wd_n && nd < WOP_MAX_DESCS; i++){
+            snprintf(descs[nd], sizeof descs[nd], "%s", g_wd[i].desc);
+            ranges[nd] = g_wd[i].range; nexts[nd] = g_wd[i].next; nd++;
+        }
+    } else {
+        return wop_err(ec, em, -4, "No wallet is loaded");
+    }
+    if (nd == 0)
+        return wop_err(ec, em, -4, "this wallet has no descriptors to export "
+                                   "(a blank watch-only wallet: importdescriptors first)");
+
+    /* refuse to clobber: an export that silently overwrote a wallet file
+     * would be the worst possible way to learn the path was wrong */
+    { struct stat sb;
+      if (stat(dest, &sb) == 0)
+          return wop_err(ec, em, -4, "the destination already exists; "
+                                     "exportwatchonlywallet will not overwrite it"); }
+
+    FILE* f = fopen(dest, "w");
+    if (!f) return wop_err(ec, em, -4, "could not write the export file");
+    fputs(WOP_WATCH_EXPORT_MAGIC "\n", f);
+    for (int i = 0; i < nd; i++)
+        fprintf(f, "%s\t%ld\t%ld\n", descs[i], ranges[i], nexts[i]);
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0){ fclose(f);
+        return wop_err(ec, em, -4, "could not flush the export file"); }
+    fclose(f);
+
+    /* Core answers with the FULL path it wrote */
+    char abs[1024];
+    if (dest[0] == '/') snprintf(abs, sizeof abs, "%s", dest);
+    else { char cwd[768];
+           if (getcwd(cwd, sizeof cwd)) snprintf(abs, sizeof abs, "%s/%s", cwd, dest);
+           else snprintf(abs, sizeof abs, "%s", dest); }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "exported_file", rj_str(abs));
     *res = o;
     return 1;
 }
@@ -2859,9 +2983,11 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "migratewallet") || !strcmp(m, "setwalletflag"))
         return wop_unsupported(WOP_ONE_WALLET, ec, em);
     if (!strcmp(m, "importdescriptors")) return cmd_importdescriptors(params, w, ec, em, res);
+    if (!strcmp(m, "exportwatchonlywallet"))
+        return cmd_exportwatchonlywallet(params, w, ec, em, res);
     if (!strcmp(m, "createwalletdescriptor") ||
         !strcmp(m, "addhdkey") || !strcmp(m, "importprunedfunds") ||
-        !strcmp(m, "removeprunedfunds") || !strcmp(m, "exportwatchonlywallet"))
+        !strcmp(m, "removeprunedfunds"))
         return wop_unsupported(WOP_NO_IMPORT, ec, em);
     if (!strcmp(m, "walletdisplayaddress")){
         /* Core: walletdisplayaddress "address". The signer wants a
