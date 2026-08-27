@@ -478,6 +478,41 @@ else
   fail "no second mature coinbase for the package test"
 fi
 
+echo "== exportwatchonlywallet -> restorewallet round trip =="
+# Core promises the export "can be imported into another node using
+# restorewallet", so the test is the ROUND TRIP, not that a file appeared.
+# What must survive is the descriptor set: restore it under a new name and
+# the restored wallet must list exactly what the original exported.
+EXP="$WORK/watchonly-export.dat"
+EF=$(bmc exportwatchonlywallet "[\"$EXP\"]" | jq_ "d['result']['exported_file']")
+[ -s "$EF" ] && ok "exportwatchonlywallet wrote $EF ($(stat -c%s "$EF") bytes)" \
+             || fail "no export file at ${EF:-<none>}"
+SRC_DESCS=$(bmc listdescriptors | jq_ "json.dumps(sorted(e['desc'] for e in d['result']['descriptors']))")
+# it must refuse to clobber -- an export that silently overwrote a wallet
+# file would be the worst way to learn the path was wrong
+CLOB=$(bmc exportwatchonlywallet "[\"$EXP\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print(d['error']['message'] if d.get('error') else 'OVERWROTE')")
+case "$CLOB" in
+  *"will not overwrite"*) ok "a second export refuses to clobber the file" ;;
+  *)                      fail "export clobbered an existing file: $CLOB" ;;
+esac
+
+RW=$(bmc restorewallet "[\"wo-restored\",\"$EXP\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('ERR:'+d['error']['message'] if d.get('error') else d['result']['name'])")
+[ "$RW" = "wo-restored" ] && ok "restorewallet installed the export as a wallet" \
+                          || fail "restorewallet: $RW"
+DST_DESCS=$(bmc listdescriptors | jq_ "json.dumps(sorted(e['desc'] for e in d['result']['descriptors']))")
+[ "$SRC_DESCS" = "$DST_DESCS" ] \
+  && ok "the restored watch-only wallet has exactly the exported descriptors" \
+  || fail "descriptors differ: src=$SRC_DESCS dst=$DST_DESCS"
+WO=$(bmc getwalletinfo | jq_ "str(d['result'].get('private_keys_enabled','?'))")
+[ "$WO" = "False" ] && ok "...and it is watch-only (private_keys_enabled=false)" \
+                    || fail "restored wallet reports private_keys_enabled=$WO"
+# back to the wallet the rest of the script uses
+bmc loadwallet "[\"\"]" >/dev/null 2>&1 || true
+
 echo "== the OFFLINE utxo builder agrees with the live writer on genesis =="
 # Core writes no chain's genesis coinbase to its chainstate. The live writer
 # has skipped it since 2026-08-22; the offline batch builder did not, so a set
