@@ -335,17 +335,13 @@ static int lsock(int port){
  * new bitcoin_serve.asm `.do_block` keep-up path stores any block a peer later
  * pushes). Returns the count of blocks added on success, 0/-1 on no-network.
  * Sieve out peers that hang: a 10s recv timeout + per-seed cap. */
-static const char* catchup_seeds[] = {
-    "seed.bitcoin.sipa.be",
-    "dnsseed.bluematt.me",
-    "seed.bitcoinstats.com",
-    "seed.bitcoin.jonasschnelli.ch",
-    "seed.btc.petertodd.net",
-    "seed.bitcharcoal.com",
-    "seed.bitcoin.wiz.biz",
-    "dnsseed.bitcoin.dashjr.org",
-    "seed.bitnodes.io"
-};
+/* DNS seed hostnames come from the SELECTED CHAIN (daemon/chainparams.c owns
+ * the per-chain lists, mainnet's being the set that always lived here).
+ * These two are set right after chainparams_select() in main(); the static
+ * defaults keep every pre-chain-selection tool path on mainnet behaviour. */
+static const char* const catchup_seeds_default[] = { "seed.bitcoin.sipa.be" };
+static const char* const* g_seed_hosts = catchup_seeds_default;
+static int g_n_seed_hosts = 1;
 static void anchor_locator(unsigned char loc[32]);   /* fwd decl (defined below) */
 /* Wall-clock alarm handler: raise SIGALRM after CATCHUP_MAX_SECS so the
  * synchronous node_sync catch-up (blocking on a real seed) is interrupted and
@@ -367,8 +363,8 @@ static long outbound_catchup(long max_blocks){
      * contact seeds the operator disabled. Under -connect the configured
      * nodes are used instead. */
     const char* clist[CFG_MAX_NODES];
-    const char** srcs = catchup_seeds;
-    size_t nsrcs = sizeof(catchup_seeds)/sizeof(catchup_seeds[0]);
+    const char** srcs = (const char**)g_seed_hosts;
+    size_t nsrcs = (size_t)g_n_seed_hosts;
     if(g_cfg.connect_only){
         for(int i=0;i<g_cfg.n_connect;i++) clist[i]=g_cfg.connectn[i];
         srcs = clist; nsrcs = (size_t)g_cfg.n_connect;
@@ -1923,7 +1919,7 @@ static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     static unsigned char ab[64];
     if(amr_init(ab)!=1){ fprintf(stderr,"[dlc] amr_init failed\n"); return 0; }
-    long disc=dl_bootstrap(ab, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])));
+    long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
 
     static char pool[DLC_MAXPOOL][64];
@@ -2538,8 +2534,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_cfg.connect_only){
             fprintf(stderr,"[dl] no reachable connect= peers; staying offline (connect= means these are the ONLY peers)\n");
         } else {
-            fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
-            for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+            if(pool_len > 0){
+                fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
+                for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+            } else {
+                /* a chain with NO seeds (regtest) has no fallback to offer --
+                 * say so instead of announcing a fallback that adds nothing */
+                fprintf(stderr,"[dl] no peers and this chain has no DNS seeds; staying offline (use connect=/addnode=)\n");
+            }
         }
     }
     /* ---- MULTI-PEER DOWNLOAD: establish up to 8 live legs by dialing the
@@ -3444,7 +3446,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* chain identity + rules for the RPC layer (regtest: halving 150,
      * fPowNoRetargeting; mainnet values are rpc_chain's own defaults) */
     rpc_chain_set_chainparams(g_chainp->name, g_chainp->halving_interval,
-                              g_chainp->pow_no_retargeting);
+                              g_chainp->pow_no_retargeting,
+                              g_chainp->allow_min_difficulty,
+                              g_chainp->pow_limit_bits,
+                              g_chainp->enforce_bip94);
     /* getblocktemplate proposal mode evaluates through the worker's
      * submit channel (rpc_node.c owns the staging) */
     { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
@@ -3814,6 +3819,9 @@ int main(int argc, char** argv){
     if(!chainparams_select(g_cfg.chain)) return 1;
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
       wallet_set_chain(g_chainp->bech32_hrp, g_chainp->p2pkh_version, g_chainp->p2sh_version); }
+    if(g_chainp->dns_seed_hosts && g_chainp->n_dns_seed_hosts > 0){
+        g_seed_hosts = g_chainp->dns_seed_hosts; g_n_seed_hosts = g_chainp->n_dns_seed_hosts;
+    } else { g_n_seed_hosts = 0; }   /* regtest: no seeds, ever */
     static char effdir[4200];                    /* the PER-CHAIN datadir */
     chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
     if(g_chainp->id != CHAIN_MAIN){
@@ -4282,7 +4290,7 @@ int main(int argc, char** argv){
         zmqn_set_status(g_node_status);
 
         pid_t dl = fork();
-        if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), g_chainp->default_port); _exit(0); }
+        if(dl==0){ serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port); _exit(0); }
         g_dl_worker_pid = dl;   /* so serve_mux's shutdown handling can forward SIGTERM to it */
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
         fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
@@ -4290,7 +4298,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), g_chainp->default_port, l);
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
