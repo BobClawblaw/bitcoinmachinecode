@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../daemon/node_config.h"
 #include <unistd.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -180,6 +181,10 @@ int main(void){
     tx_accept_set_tip(500);
 
     if (!tx_dispatch_init()) { fprintf(stderr, "tx_dispatch_init failed\n"); return 1; }
+    /* relay fixtures are synthetic (anyone-can-spend outputs): run policy
+     * under Core's own regtest escape hatch (-acceptnonstdtxn) so this test
+     * keeps exercising the relay/orphan machinery, not IsStandardTx. */
+    { extern node_config_t g_cfg; g_cfg.acceptnonstdtxn = 1; }
     if (!tx_policy_init())   { fprintf(stderr, "tx_policy_init failed\n");   return 1; }
     mpool_init(mp_area, 1024, mp_blob, sizeof mp_blob);
 
