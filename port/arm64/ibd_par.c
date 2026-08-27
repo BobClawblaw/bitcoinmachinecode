@@ -411,6 +411,10 @@ static long g_next_issue=0;/* next window INDEX to issue (in height units /WB) *
 #define DEAD_WEIGHT_BPS   32768.0   /* x86 node_config default */
 #define DEAD_WEIGHT_TICKS 3         /* x86 node_config default */
 static long g_client_bytes[MAXC];   /* bytes received via each client */
+/* x86 dl_catchup aggregate download-stats accumulators (main.c) */
+static double g_cum_recv=0.0, g_cum_write=0.0;
+static long   g_disk_written=0;            /* bytes appended to blk/index store files */
+static long   g_last_recv=0, g_last_write=0;
 static int  g_client_ticks[MAXC];   /* consecutive zero-progress ticks (Dragging) */
 static long g_blocks_last[MAXC];    /* for +N blk/s delta */
 static long g_bytes_last[MAXC];     /* for bytes/s delta */
@@ -427,6 +431,19 @@ static void dlc_fmt_rate(char* buf, size_t cap, double bps){
     else if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
     else if(v>=1024.0){ v/=1024.0; unit="KB"; }
     snprintf(buf,cap,"%.1f%s/s",v,unit);
+}
+/* ==== x86 main.c dlc_fmt_bytes / dlc_fmt_elapsed (byte-for-byte) ==== */
+static void dlc_fmt_bytes(char* buf, size_t cap, double bytes){
+    const char* unit="B"; double v=bytes;
+    if(v>=1024.0*1024.0*1024.0){ v/=1024.0*1024.0*1024.0; unit="GB"; }
+    else if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
+    else if(v>=1024.0){ v/=1024.0; unit="KB"; }
+    snprintf(buf,cap,"%.1f%s",v,unit);
+}
+static void dlc_fmt_elapsed(char* buf, size_t cap, long secs){
+    if(secs<0) secs=0;
+    long h=secs/3600, m=(secs%3600)/60, s=secs%60;
+    snprintf(buf,cap,"%ld:%02ld:%02ld",h,m,s);
 }
 
 static void win_reset(struct win* w, long w0, long n){
@@ -707,8 +724,14 @@ int main(int argc, char** argv){
                 g_last_dlc=now;
                 long elapsed = now-g_catchup_start;
                 long present = next_apply; if(present<0) present=0;
-                LLOG(7, "[dlc] == elapsed %lds | overall: %ld/%ld stored (%.2f%% of window) ==\n",
-                        elapsed, present, G_maxblk, 100.0*(double)present/(double)(G_maxblk>=1?G_maxblk:1));
+                /* x86 main.c overall line: real-tip % + holes + gap-free */
+                long _cur_tip = present>0 ? (start+present-1) : -1;
+                long _holes = _cur_tip>=0 ? (_cur_tip+1-present) : 0;
+                double _overall_pct = 100.0*(double)present/(double)(G_maxblk>=1?G_maxblk:1);
+                double _span_pct = _cur_tip>=0 ? 100.0*(double)present/(double)(_cur_tip+1) : 0.0;
+                char _elapsed[16]; dlc_fmt_elapsed(_elapsed,sizeof _elapsed,elapsed);
+                LLOG(7, "[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
+                        _elapsed, present, G_maxblk, _overall_pct, _holes, _cur_tip, _span_pct);
                 LLOG(7, "[dlc] -- peer status (%ld/%d worker(s) active) --\n", (long)g_ncli, g_ncli);
                 /* the unique head-of-line blocker window: owner is the dragging candidate */
                 long target_base = start+next_apply;
@@ -744,7 +767,31 @@ int main(int argc, char** argv){
                         j, g_peer_name[j][0]?g_peer_name[j]:"(connecting)", g_client_chunks[j], b,
                         blkrate, bw, "", flag, drag);
                 }
-                LLOG(7, "[dlc] -- workers replaced this run: %ld --\n", g_nreplaced);
+                /* x86 main.c aggregate download-stats block (network recv vs disk write) */
+                { long _rnow=0; for(int _j=0;_j<g_ncli;_j++) _rnow+=g_client_bytes[_j];
+                  if(g_last_recv>0){ double _tr=(double)(_rnow-g_last_recv); g_cum_recv+=_tr; }
+                  g_last_recv=_rnow;
+                  if(g_last_write>0){ double _tw=(double)(g_disk_written-g_last_write); g_cum_write+=_tw; }
+                  g_last_write=g_disk_written;
+                  static double _pr=0,_pw=0;
+                  double _cr=g_cum_recv; double _cw=g_cum_write;
+                  double _tick_bytes=_cr-_pr; double _tick_w=_cw-_pw; _pr=_cr; _pw=_cw;
+                  char _tb[16],_tba[16],_cb[16],_wtb[16],_wtt[16],_wb[16];
+                  dlc_fmt_bytes(_tb,sizeof _tb,_tick_bytes);
+                  dlc_fmt_rate(_tba,sizeof _tba,_tick_bytes/10.0);
+                  dlc_fmt_bytes(_cb,sizeof _cb,_cr);
+                  dlc_fmt_bytes(_wtb,sizeof _wtb,_tick_w);
+                  dlc_fmt_rate(_wtt,sizeof _wtt,_tick_w/10.0);
+                  dlc_fmt_bytes(_wb,sizeof _wb,_cw);
+                  LLOG(7, "[dlc] -- network recv this tick: %s (%s) | total recv: %s || disk write this tick: %s (%s) | total written: %s --\n",
+                          _tb,_tba,_cb,_wtb,_wtt,_wb);
+                  LLOG(7, "[dlc] -- peers banned this run: %ld of %d --\n", g_nreplaced, g_ncli);
+                  long _es=elapsed; if(_es<1)_es=1;
+                  char _avr[16],_avw[16];
+                  dlc_fmt_rate(_avr,sizeof _avr,_cr/(double)_es);
+                  dlc_fmt_rate(_avw,sizeof _avw,_cw/(double)_es);
+                  LLOG(7, "[dlc] -- average since start: %s recv, %s write --\n",_avr,_avw);
+                }
             }
         }
         /* apply windows strictly in height order */
@@ -766,7 +813,8 @@ int main(int argc, char** argv){
                 unsigned char bh32[32]; block_hash(bh32, blk);
                 uint64_t bflags = script_flags_for_block((uint64_t)h, bh32);
                 if(cons_verify(blk, blklen, scr, 1<<22)!=1){ fprintf(stderr,"h%ld BAD cons_verify\n",h); bad_gate++; free(blk); continue; }
-                { if(store_append(store_buf,bh32,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
+                { if(store_append(store_buf,bh32,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; }
+                  g_disk_written += blklen + 48;  /* block payload + index.dat record */ }
                 unsigned char* txc=blk+80;
                 unsigned long long nt; int vv=rd_varint(txc,(unsigned long)(blklen-80),&nt);
                 if(vv<0){ fprintf(stderr,"h%ld bad txcount\n",h); bad_gate++; free(blk); continue; }
