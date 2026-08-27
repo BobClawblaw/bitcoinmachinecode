@@ -392,6 +392,52 @@ else
   fail "no second mature coinbase for the package test"
 fi
 
+echo "== mempool.dat: our dump read by Core, and Core's dump read by us =="
+# Format interop, in both directions. A round trip through our own code
+# proves only that we agree with ourselves.
+SAVED=$(bmc savemempool | jq_ "d['result']['filename']")
+if [ -n "${SAVED:-}" ] && [ -s "$SAVED" ]; then
+  ok "savemempool wrote $(stat -c%s "$SAVED") bytes"
+  OURN=$(python3 -c "
+import struct,sys
+d=open('$SAVED','rb').read()
+v,=struct.unpack('<Q',d[0:8])
+n,=struct.unpack('<Q',d[8:16]) if v==1 else (0,)
+print(n)")
+  [ "${OURN:-0}" -ge 1 ] && ok "our dump lists $OURN transactions" \
+                         || fail "our dump lists no transactions"
+
+  # CORE must be able to load it. importmempool is the read path Core would
+  # use at startup, so this is the real compatibility question.
+  cp "$SAVED" "$CORE_DIR/regtest/ours.dat"
+  CORE_IMPORT=$(core importmempool "$CORE_DIR/regtest/ours.dat" 2>&1 | head -3)
+  case "$CORE_IMPORT" in
+    *error*|*Error*) fail "Core could not load our mempool.dat: $CORE_IMPORT" ;;
+    *)               ok  "Bitcoin Core loaded our mempool.dat" ;;
+  esac
+
+  # and the other direction: Core writes, we read.
+  CORE_SAVED=$(core savemempool | python3 -c "import sys,json;print(json.load(sys.stdin)['filename'])")
+  if [ -s "$CORE_SAVED" ]; then
+    ok "Core wrote its own dump ($(stat -c%s "$CORE_SAVED") bytes)"
+    CV=$(python3 -c "
+import struct
+d=open('$CORE_SAVED','rb').read()
+print(struct.unpack('<Q',d[0:8])[0])")
+    ok "Core's dump is version $CV (we read 1 and 2)"
+    IMP=$(bmc importmempool "[\"$CORE_SAVED\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('ok' if d['error'] is None else d['error']['message'])")
+    [ "$IMP" = "ok" ] && ok "we read Core's own mempool.dat (version $CV)" \
+                      || fail "importmempool on Core's dump: $IMP"
+  else
+    fail "Core did not write a dump"
+  fi
+else
+  fail "savemempool produced nothing"
+fi
+
 echo
 [ $FAILURES -eq 0 ] && echo "ALL TESTS PASSED (0 failures)" || echo "FAILURES: $FAILURES"
 exit $((FAILURES>0))

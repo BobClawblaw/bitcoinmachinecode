@@ -1212,6 +1212,111 @@ static int cmd_getprioritisedtransactions(rj_val** res){
 #define SRT_WAIT_MS   90000     /* worker pickup can wait behind a 60s leg sync */
 #define SRT_POLL_US   3000
 
+/* ==== savemempool / importmempool -- Core's mempool.dat ====================
+ * The pool is shared memory the parent can read directly under the same lock
+ * getrawmempool uses, so the DUMP happens here. The LOAD cannot: admitting a
+ * transaction is the worker's job, so import re-submits each one through the
+ * same channel sendrawtransaction uses and every entry gets the full
+ * consensus and policy treatment on the way back in. Core re-validates on
+ * load too -- a dump is a hint about what was interesting, never a licence
+ * to skip checks.
+ *
+ * Paths are relative to the process CWD, which is the per-chain datadir (the
+ * daemon chdirs there at boot, the same reason bmcwallet.dat resolves), so
+ * "mempool.dat" lands beside the chain data exactly as in Core.
+ */
+extern long mempool_dump_write(const char* path, const unsigned char* const* txs,
+                               const unsigned long* lens, const long long* times,
+                               const long long* deltas, long n,
+                               const unsigned char* extra_txids,
+                               const long long* extra_deltas, long n_extra);
+extern long mempool_dump_read(const char* path,
+                              int (*sink)(void*, const unsigned char*, unsigned long,
+                                          long long, long long),
+                              void* ctx, char* err, unsigned long errcap);
+
+#define MPD_MAX_DUMP 200000
+
+static int cmd_savemempool(rj_val** res, long* ec, const char** em){
+    if (!g_mph.mp){ *ec = -4; *em = "no mempool is attached to this RPC server"; return 0; }
+    static const unsigned char* txs[MPD_MAX_DUMP];
+    static unsigned long        lens[MPD_MAX_DUMP];
+    static long long            times[MPD_MAX_DUMP], deltas[MPD_MAX_DUMP];
+    long n = 0;
+    mpl();
+    unsigned long slots = mp_slot_count(g_mph.mp);
+    for (unsigned long i = 0; i < slots && n < MPD_MAX_DUMP; i++){
+        mp_ent e;
+        if (mp_slot(g_mph.mp, i, &e) != 1) continue;
+        txs[n]    = e.tx;
+        lens[n]   = e.len;
+        times[n]  = g_mph.time_of ? (long long)g_mph.time_of(e.txid) : 0;
+        deltas[n] = (long long)pri_delta_of(e.txid);
+        n++;
+    }
+    /* The write happens under the pool lock ON PURPOSE: the entry pointers
+     * above are into the shared blob, and releasing the lock first would let
+     * an eviction move the bytes out from under the writer. */
+    long w = mempool_dump_write("mempool.dat", txs, lens, times, deltas, n, NULL, NULL, 0);
+    mpu();
+    if (w < 0){ *ec = -1; *em = "unable to dump mempool to disk"; return 0; }
+
+    char cwd[1024]; char full[1200];
+    if (getcwd(cwd, sizeof cwd)) snprintf(full, sizeof full, "%s/mempool.dat", cwd);
+    else snprintf(full, sizeof full, "mempool.dat");
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "filename", rj_str(full));
+    *res = o;
+    return 1;
+}
+
+typedef struct { long accepted, rejected; } mpd_import_ctx;
+static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
+                          long long t, long long d){
+    (void)t; (void)d;   /* entry time and fee delta are not restorable here --
+                         * see the divergence note at the call site */
+    mpd_import_ctx* c = (mpd_import_ctx*)vctx;
+    if (!g_status_rw) return -1;
+    node_status_t* st = g_status_rw;
+    pthread_mutex_lock(&g_submit_lock);
+    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; return 0; }
+    memcpy((void*)st->tx_submit_buf, tx, len);
+    st->tx_submit_len = len;
+    st->tx_submit_test = 0;
+    st->tx_submit_pkg_n = 0;
+    st->tx_submit_reason[0] = 0;
+    unsigned long long myseq = st->tx_submit_seq + 1;
+    __sync_synchronize();
+    st->tx_submit_seq = myseq;
+    int waited = 0, ok = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); break; }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    pthread_mutex_unlock(&g_submit_lock);
+    if (ok) c->accepted++; else c->rejected++;
+    return 0;                       /* a rejected entry is not a file error */
+}
+
+static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* path = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems > 0 &&
+        params->items[0]->typ == RJ_STR) path = params->items[0]->str;
+    if (!path || !path[0]){ *ec = -8; *em = "filepath is required"; return 0; }
+    if (!g_status_rw){
+        *ec = -4; *em = "no download worker is attached, so nothing can admit these transactions"; return 0; }
+    mpd_import_ctx c = {0, 0};
+    char err[160]; err[0] = 0;
+    long r = mempool_dump_read(path, mpd_import_one, &c, err, sizeof err);
+    if (r < 0){ static char m[200]; snprintf(m, sizeof m, "Unable to import mempool: %s", err[0]?err:"malformed file");
+                *ec = -1; *em = m; return 0; }
+    fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld\n",
+            path, c.accepted, c.rejected, r);
+    *res = rj_obj();               /* Core returns an empty object */
+    return 1;
+}
+
 static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_STR){
@@ -1563,7 +1668,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
-    "testmempoolaccept", "submitpackage",
+    "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
@@ -1588,6 +1693,8 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "gettxspendingprevout")) return cmd_gettxspendingprevout(params, res, ec, em);
     if (!strcmp(m, "testmempoolaccept")) return cmd_testmempoolaccept(params, res, ec, em);
     if (!strcmp(m, "submitpackage")) return cmd_submitpackage(params, res, ec, em);
+    if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
+    if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo") || !strcmp(m, "abortprivatebroadcast"))
         return cmd_net_unsupported(
             "this node has no private broadcast queue: sendrawtransaction "
