@@ -168,6 +168,21 @@ static char g_peer_host[4096];   /* last-connected host (for [catchup] log) */
 static char   g_book[BOOK_MAX][16];   /* dotted-quad IPv4s, deduped */
 static int    g_nbook=0;
 static int    g_booki=0;              /* book rotation cursor for re-dials */
+/* ---- proven-peer pool: peers that actually SERVED >=1 block. Rotation prefers
+ * these (they work) over raw getaddr-discovered junk, matching the x86 model of
+ * downloading only from real, serving full nodes. ---- */
+#define PROVEN_MAX 128
+static char   g_proven[PROVEN_MAX][64];
+static int    g_nproven=0;
+static int    g_proveni=0;
+static long   g_head_w0=-1;     /* head-of-line slow-trickle defense state */
+static int    g_head_ticks=0;
+static time_t g_head_last_t=0;
+static void proven_add(const char* host){
+    if(!host||!host[0]) return;
+    for(int i=0;i<g_nproven;i++) if(!strcmp(g_proven[i],host)) return;
+    if(g_nproven<PROVEN_MAX){ strncpy(g_proven[g_nproven],host,63); g_proven[g_nproven][63]=0; g_nproven++; }
+}
 /* book_add_ip takes the ip in NETWORK order (struct sockaddr_in.sin_addr.s_addr:
  * memory bytes a,b,c,d == the dotted quad). On a little-endian host the u32
  * value is d<<24|c<<16|b<<8|a, so format LSB-first to print a.b.c.d. */
@@ -227,6 +242,12 @@ static int connect_peer(const char* host,unsigned char* rbuf,int discover){
                 /* dial used a nonblocking socket; handshake reads must BLOCK,
                  * so clear O_NONBLOCK now (p2p_read/write are not EAGAIN-safe). */
                 int fl=fcntl(fd,F_GETFL,0); if(fl>=0) fcntl(fd,F_SETFL,fl & ~O_NONBLOCK);
+                /* Bound every read so a peer dribbling a huge block can't freeze
+                 * the single-threaded poll mux: a stall >CLIENT_RCVTIMEO is
+                 * treated as EOF and the client is rotated. (x86 avoids this by
+                 * forking 16 workers; here the timeout is the robust surrogate.) */
+                { struct timeval tv; tv.tv_sec=20; tv.tv_usec=0;
+                  setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); }
                 unsigned char v[256]; int o=0;
                 v[o]=0x7f;o+=1;v[o]=0x11;o+=1;v[o]=0x01;o+=1;v[o]=0x00;o+=1;
                 v[o]=1;o+=8;
@@ -412,17 +433,29 @@ static void log_peers(void){
             g_peer_name[j][0]?g_peer_name[j]:"?", g_client_served[j]);
     LLOG(7, "%s\n", b);
 }
+/* Free a window's downloaded block buffers and reset collection state.
+ * EVERY reset-for-rerequest (rotate/borrow) must call this, else the
+ * already-received w->blk[z] mallocs leak ~16MB per rotation and heap
+ * corruption kills the run at ~1000 blocks (SIGBUS / silent stall). */
+static void win_clear(struct win* w){
+    for(int z=0;z<w->n;z++){ if(w->blk[z]){ free(w->blk[z]); w->blk[z]=0; } }
+    w->collected=0;
+    for(int z=0;z<w->n;z++) w->have[z]=0;
+}
 /* dialect a client to a NEW peer and re-request whatever window it owns
  * (used for EOF rejoin and for dead-weight "early-kill" worker rotation).
  * On total dial failure the client's window is released (owner=-1). */
 static int rotate_client(int j, unsigned char* hdr){
     if(g_fd[j]>=0) fd_close(g_fd[j]);
     g_fd[j]=-1;
-    /* redial via the DISCOVERED book (1014+ peers incl. known-good), not the
-       stale static fallback: rotation cycles the book so a client that hit a
-       dead/non-serving peer hops to the next real candidate. */
+    /* redial via the PROVEN pool first (peers that served real blocks), then
+       the DISCOVERED book (getaddr junk); connect_peer still has the static
+       resolved-node fallback. This keeps downloads on serving full nodes and
+       stops EOF-prone discovered peers from stalling workers (the [dlc] w14/w15
+       0-block stall). */
     char bookh[16]; const char* host=0;
-    if(g_nbook>0){ snprintf(bookh,sizeof bookh,"%s",g_book[(g_booki++)%g_nbook]); host=bookh; }
+    if(g_nproven>0){ snprintf(bookh,sizeof bookh,"%s",g_proven[(g_proveni++)%g_nproven]); host=bookh; }
+    else if(g_nbook>0){ snprintf(bookh,sizeof bookh,"%s",g_book[(g_booki++)%g_nbook]); host=bookh; }
     int nfd=connect_peer(host, g_rbuf[j], 0);
     if(nfd<0){
         int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){ g_win[k].owner=-1; break; }
@@ -433,8 +466,7 @@ static int rotate_client(int j, unsigned char* hdr){
     int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){
         long n2=g_win[k].n;
         req_window(nfd, hdr, g_win[k].w0, n2);
-        g_win[k].collected=0;
-        for(int q=0;q<n2;q++) g_win[k].have[q]=0;
+        win_clear(&g_win[k]);
         break;
     }
     return 0;
@@ -559,7 +591,7 @@ int main(int argc, char** argv){
     for(int i=0;i<NPEERS && PEERS[i];i++){
         unsigned ip=0; struct in_addr a;
         if(inet_pton(AF_INET,PEERS[i],&a)) ip=a.s_addr;
-        if(ip) book_add_ip(ip);
+        if(ip){ book_add_ip(ip); char s[16]; snprintf(s,sizeof s,"%s",PEERS[i]); proven_add(s); }
     }
     /* Resolve the given seeds to their real FULL-NODE IPs and add those to the
        book first: we download FROM the peers the seeds point to (the seeds
@@ -569,7 +601,8 @@ int main(int argc, char** argv){
         if(getaddrinfo(given[s],NULL,&h,&res)==0){
             for(struct addrinfo* ai=res; ai; ai=ai->ai_next){
                 unsigned ip=((struct sockaddr_in*)ai->ai_addr)->sin_addr.s_addr;
-                if(ip) book_add_ip(ip);
+                char ph[16]; if(!inet_ntop(AF_INET,&ip,ph,sizeof ph)) ph[0]=0;
+                if(ip){ book_add_ip(ip); if(ph[0]) proven_add(ph); }
             }
             freeaddrinfo(res);
         }
@@ -645,6 +678,9 @@ int main(int argc, char** argv){
             cmd[11]=0;
             if(strncmp(cmd,"block",5)==0){
                 unsigned char hh[32]; block_hash(hh,g_rbuf[j]);
+                /* this client's peer just proved productive -> remember it for
+                   rotation (discard non-serving discovered junk). */
+                if(g_peer_name[j][0]) proven_add(g_peer_name[j]);
                 /* route to the active window owning this height */
                 for(int k=0;k<g_nwin;k++){
                     struct win* w=&g_win[k];
@@ -811,8 +847,8 @@ int main(int argc, char** argv){
                 int orphan=-1;
                 for(int q=0;q<g_nwin;q++) if(g_win[q].owner<0){ orphan=q; break; }
                 if(orphan>=0){
-                    struct win* wn=&g_win[orphan]; wn->owner=freec; wn->collected=0;
-                    for(int z=0;z<wn->n;z++) wn->have[z]=0;
+                    struct win* wn=&g_win[orphan]; wn->owner=freec;
+                    win_clear(wn);
                     if(req_window(g_fd[freec], hdr, wn->w0, wn->n)!=0){ wn->owner=-1; }
                 } else if(next_issue<nwin_total){
                     long w0b = start + next_issue*WB;
@@ -829,6 +865,62 @@ int main(int argc, char** argv){
                         next_apply, G_maxblk, g_ncli, g_fast?0L:(long)utxo_lsm_count(g_lst));
                 log_peers();
                 hb_last = next_apply;
+            }
+        }
+        /* ---- head-of-line defense: ensure the strict-order blocking window
+           ALWAYS has an active, productive owner. Two failure modes:
+           (a) owner<0 (orphan after a failed rotation) -> borrow a client;
+           (b) owner alive but delivering so SLOWLY the head stalls while other
+               windows finish (zero-progress drag detection misses a trickle) ->
+               replace the slow owner with a proven peer. ---- */
+        {
+            long tb = start+next_apply;
+            int hk=-1;
+            for(int i=0;i<g_nwin;i++) if(g_win[i].w0==tb){ hk=i; break; }
+            if(hk>=0 && g_win[hk].n>0){
+                struct win* hw=&g_win[hk];
+                int complete=1;
+                for(int z=0;z<hw->n;z++) if(!hw->have[z]){ complete=0; break; }
+                if(hw->owner<0){
+                    if(!complete){
+                        int borrow=-1;
+                        for(int ci=0; ci<g_ncli && borrow<0; ci++){
+                            if(g_fd[ci]<0) continue;
+                            for(int q=0;q<g_nwin;q++) if(g_win[q].owner==ci){
+                                int full=1; for(int z=0;z<g_win[q].n;z++) if(!g_win[q].have[z]){full=0;break;}
+                                if(full){ borrow=ci; break; }
+                            }
+                        }
+                        if(borrow<0) for(int ci=0; ci<g_ncli && borrow<0; ci++) if(g_fd[ci]>=0) borrow=ci;
+                        if(borrow>=0){
+                            for(int q=0;q<g_nwin;q++) if(g_win[q].owner==borrow) g_win[q].owner=-1;
+                            hw->owner=borrow;
+                            win_clear(hw);
+                            req_window(g_fd[borrow], hdr, hw->w0, hw->n);
+                            LLOG(7,"[dlc]   head h%ld orphaned -> re-issued to client %d\n", tb, borrow);
+                        }
+                    }
+                    /* orphaned-but-complete is applied by the apply loop anyway */
+                } else if(!complete){
+                    /* head-age trickle defense: if ANY window has been the
+                       strict-order head (blocking next_apply) for >=DEAD_WEIGHT_TICKS
+                       ticks yet is still incomplete, it IS the bottleneck (the 
+                       earlier collected==prev test let a peer drip 1 block/tick
+                       forever without tripping). Replace its peer. Tick-gated. */
+                    time_t nowt=time(NULL);
+                    if(nowt - g_head_last_t >= DL_TICK){
+                        g_head_last_t=nowt;
+                        if(g_head_w0!=tb){ g_head_w0=tb; g_head_ticks=0; }
+                        else g_head_ticks++;   /* same head blocking one more tick */
+                        if(g_head_ticks>=DEAD_WEIGHT_TICKS){
+                            LLOG(7,"[dlc]   head h%ld SLOW %ds (collected %ld/%ld, owner w%d %s) -> replacing peer\n",
+                                tb, DEAD_WEIGHT_TICKS*DL_TICK, hw->collected, hw->n, hw->owner,
+                                g_peer_name[hw->owner][0]?g_peer_name[hw->owner]:"(connecting)");
+                            if(rotate_client(hw->owner, hdr)==0){ g_nreplaced++; g_head_ticks=0; }
+                            else { g_head_ticks=0; fprintf(stderr,"[dlc] head rotate dial FAILED (retrying)\n"); }
+                        }
+                    }
+                }
             }
         }
     }
