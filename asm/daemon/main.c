@@ -3224,6 +3224,20 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         /* filter index tail: adopt/append (cheap probe when
                          * the backfill has not closed in yet) */
                         bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                        /* mempool reconciliation (Core removeForBlock):
+                         * confirmed txs leave pool+policy graph, txs
+                         * CONFLICTING with this block's spends leave with
+                         * their descendants, and the rolling minfee floor
+                         * may decay again. Before this call nothing removed
+                         * mined txs at all -- they lingered until
+                         * -mempoolexpiry (LOG.md 2026-08-27 survey #1). */
+                        { extern long tx_accept_block_connect(void*, const unsigned char*, unsigned long);
+                          extern void* mp_ext_area;
+                          if (txsub_worker_ready() && mp_ext_area){
+                              long mr = tx_accept_block_connect(mp_ext_area, zb, (unsigned long)bl);
+                              if (mr > 0)
+                                  fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                          } }
                         if (!zmqpub_active()) continue;
                         /* The block HASH is sha256d over the 80-byte
                          * header, REVERSED: Core's notifier flips the bytes
