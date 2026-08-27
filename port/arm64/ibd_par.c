@@ -445,6 +445,25 @@ static void dlc_fmt_elapsed(char* buf, size_t cap, long secs){
     long h=secs/3600, m=(secs%3600)/60, s=secs%60;
     snprintf(buf,cap,"%ld:%02ld:%02ld",h,m,s);
 }
+/* x86 idxscan_progress: scan index.dat for true archive tip + dense record count */
+static void dlc_scan_progress(long* out_tip, long* out_present){
+    *out_tip=-1; *out_present=0;
+    int fd=open("index.dat",O_RDONLY);
+    if(fd<0) return;
+    struct stat st; if(fstat(fd,&st)!=0){ close(fd); return; }
+    long n=st.st_size/48;
+    if(n<=0){ close(fd); return; }
+    unsigned char* buf=malloc((size_t)n*48);
+    if(!buf){ close(fd); return; }
+    ssize_t got=read(fd,buf,(size_t)n*48); close(fd);
+    if(got<0){ free(buf); return; }
+    long cnt=0, tip=-1;
+    for(long h=0;h<n;h++){ int nz=0;
+        for(int i=0;i<48;i++) if(buf[h*48+i]){ nz=1; break; }
+        if(nz){ cnt++; tip=h; } }
+    *out_present=cnt; *out_tip=tip;
+    free(buf);
+}
 
 static void win_reset(struct win* w, long w0, long n){
     memset(w,0,sizeof *w);
@@ -723,15 +742,15 @@ int main(int argc, char** argv){
             if(now - g_last_dlc >= DL_TICK){
                 g_last_dlc=now;
                 long elapsed = now-g_catchup_start;
-                long present = next_apply; if(present<0) present=0;
-                /* x86 main.c overall line: real-tip % + holes + gap-free */
-                long _cur_tip = present>0 ? (start+present-1) : -1;
-                long _holes = _cur_tip>=0 ? (_cur_tip+1-present) : 0;
-                double _overall_pct = 100.0*(double)present/(double)(G_maxblk>=1?G_maxblk:1);
-                double _span_pct = _cur_tip>=0 ? 100.0*(double)present/(double)(_cur_tip+1) : 0.0;
+                /* x86 main.c overall line: real-tip % + holes + gap-free (archive scan) */
+                long _ct,_pres; dlc_scan_progress(&_ct,&_pres);
+                long _holes = _ct>=0 ? (_ct+1-_pres) : 0;
+                long _endp1 = start+G_maxblk; if(_endp1<1)_endp1=1;
+                double _overall_pct = 100.0*(double)_pres/(double)_endp1;
+                double _span_pct = _ct>=0 ? 100.0*(double)_pres/(double)(_ct+1) : 0.0;
                 char _elapsed[16]; dlc_fmt_elapsed(_elapsed,sizeof _elapsed,elapsed);
                 LLOG(7, "[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
-                        _elapsed, present, G_maxblk, _overall_pct, _holes, _cur_tip, _span_pct);
+                        _elapsed, _pres, _endp1, _overall_pct, _holes, _ct, _span_pct);
                 LLOG(7, "[dlc] -- peer status (%ld/%d worker(s) active) --\n", (long)g_ncli, g_ncli);
                 /* the unique head-of-line blocker window: owner is the dragging candidate */
                 long target_base = start+next_apply;
@@ -769,9 +788,9 @@ int main(int argc, char** argv){
                 }
                 /* x86 main.c aggregate download-stats block (network recv vs disk write) */
                 { long _rnow=0; for(int _j=0;_j<g_ncli;_j++) _rnow+=g_client_bytes[_j];
-                  if(g_last_recv>0){ double _tr=(double)(_rnow-g_last_recv); g_cum_recv+=_tr; }
+                  double _tr=(double)(_rnow-g_last_recv); if(_tr>0) g_cum_recv+=_tr; else if(_tr<0) g_cum_recv=_rnow;
                   g_last_recv=_rnow;
-                  if(g_last_write>0){ double _tw=(double)(g_disk_written-g_last_write); g_cum_write+=_tw; }
+                  double _tw=(double)(g_disk_written-g_last_write); if(_tw>0) g_cum_write+=_tw; else if(_tw<0) g_cum_write=g_disk_written;
                   g_last_write=g_disk_written;
                   static double _pr=0,_pw=0;
                   double _cr=g_cum_recv; double _cw=g_cum_write;
