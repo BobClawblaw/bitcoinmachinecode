@@ -40,6 +40,7 @@
  * forever and a dropped tx becomes requestable again as the window rolls.
  */
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <poll.h>
 #include <time.h>
@@ -54,6 +55,18 @@ extern long tx_accept_validate(void* mp, const u8 txid[32], const u8* tx, unsign
 extern long tx_accept_validate_p2p(void* mp, const u8 txid[32], const u8* tx,
                                    unsigned long len);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* scratch, unsigned long scratchcap);
+/* package validation, shared verbatim with the submitpackage RPC path so a
+ * package that arrives over the wire and one that arrives over RPC are held
+ * to exactly the same rules */
+extern int  mpol_package_well_formed(const u8* const* txs, const unsigned long* lens,
+                                     int n, u8* txids, unsigned long long* vsz,
+                                     const char** why);
+extern void mpol_package_fee_context(unsigned long long fee, unsigned long long vsize);
+extern void txacc_package_overlay(const u8* const* txs, const unsigned long* lens,
+                                  const u8* txids, int n);
+extern long tx_accept_test_reason(void* mp, const u8* txid, const u8* tx, unsigned long len,
+                                  char* reason, unsigned long rcap, unsigned long long* fee);
+extern int  txacc_fee_reconsiderable(const char* reason);
 
 #define TXR_MSG_TX          1u
 #define TXR_MSG_WITNESS_TX  0x40000001u
@@ -78,6 +91,67 @@ static int txr_ring_has(const u8* txid){
 static void txr_ring_add(const u8* txid){
     memcpy(txr_ring[txr_ring_w % TXR_RING], txid, 8);
     txr_ring_w++;
+}
+
+/* ---- reconsiderable set (Core's m_lazy_recent_rejects_reconsiderable) ----
+ * A transaction rejected ONLY because it did not clear a fee floor is the
+ * one reject a CPFP child can overturn, so it must not be treated like any
+ * other reject. Core keeps those identifiers in a filter SEPARATE from its
+ * ordinary recent-rejects filter for exactly one reason: AlreadyHaveTx must
+ * answer "no" for them, so that when a child turns up later the parent can
+ * be requested AGAIN and the pair resubmitted as a package.
+ *
+ * Our request ring is the analogue of that already-have check, and it would
+ * otherwise suppress precisely the re-fetch 1p1c depends on. So membership
+ * here buys a bounded number of ring bypasses -- bounded, because an
+ * unbounded one is a re-fetch loop with a peer that keeps sending a tx we
+ * keep rejecting. Entries expire on the same 120 s clock as the orphan pool
+ * they pair with; nothing is remembered longer than the child that might
+ * rescue it. */
+static long long txr_now_ms(void);      /* defined with the orphan pool below */
+
+#define TXR_RECON_MAX      64
+#define TXR_RECON_TTL_MS   120000
+#define TXR_RECON_REFETCH  2            /* ring bypasses granted per entry */
+typedef struct { u8 txid[32]; int used; int refetch; long long t_ms; } txr_recon_t;
+static txr_recon_t txr_recon[TXR_RECON_MAX];
+static long txr_recon_n, txr_1p1c_ok, txr_1p1c_fail;   /* counters for the caller's log */
+
+static void txr_recon_add(const u8 txid[32]){
+    long long now = txr_now_ms();
+    int oldest = 0;
+    for (int i = 0; i < TXR_RECON_MAX; i++){
+        if (txr_recon[i].used && !memcmp(txr_recon[i].txid, txid, 32)){
+            txr_recon[i].t_ms = now; txr_recon[i].refetch = TXR_RECON_REFETCH; return; }
+        if (!txr_recon[i].used){ oldest = i; goto place; }
+        if (txr_recon[i].t_ms < txr_recon[oldest].t_ms) oldest = i;
+    }
+place:
+    memcpy(txr_recon[oldest].txid, txid, 32);
+    txr_recon[oldest].used = 1;
+    txr_recon[oldest].refetch = TXR_RECON_REFETCH;
+    txr_recon[oldest].t_ms = now;
+    txr_recon_n++;
+}
+
+/* is this txid a fee-only reject worth re-fetching? consumes one bypass */
+static int txr_recon_allow_refetch(const u8 txid[32]){
+    long long now = txr_now_ms();
+    for (int i = 0; i < TXR_RECON_MAX; i++){
+        if (!txr_recon[i].used || memcmp(txr_recon[i].txid, txid, 32)) continue;
+        if (now - txr_recon[i].t_ms > TXR_RECON_TTL_MS){ txr_recon[i].used = 0; return 0; }
+        if (txr_recon[i].refetch <= 0) return 0;
+        txr_recon[i].refetch--;
+        return 1;
+    }
+    return 0;
+}
+
+static void txr_recon_expire(void){
+    long long now = txr_now_ms();
+    for (int i = 0; i < TXR_RECON_MAX; i++)
+        if (txr_recon[i].used && now - txr_recon[i].t_ms > TXR_RECON_TTL_MS)
+            txr_recon[i].used = 0;
 }
 
 /* ---- orphan pool ---------------------------------------------------------
@@ -249,11 +323,118 @@ static long txr_orphan_resolve(void* mp, const u8 accepted[32]){
                 break;                          /* restart the sweep with the new parent */
             }
             /* still unresolvable (another parent missing, or a real reject):
-             * leave it for the TTL; a definitive non-missing reject frees it */
-            if (rr != -25){ txr_orphan_free(o); txr_orph_dropped++; }
+             * leave it for the TTL; a definitive non-missing reject frees it.
+             * -28 is NOT definitive -- a fee-only reject is the verdict a
+             * descendant can still overturn, so that child stays parked. */
+            if (rr != -25 && rr != -28){ txr_orphan_free(o); txr_orph_dropped++; }
         }
     }
     return got;
+}
+
+/* ---- 1p1c package relay (Core's Find1P1CPackage) -------------------------
+ * The case this exists for: a parent that pays too little to enter the
+ * mempool on its own, and a child that pays for both. Validated one at a
+ * time -- which is all the drain could do before this -- the parent is
+ * rejected on fee and the child is then a permanent orphan, so the pair
+ * never propagates no matter how much the child pays. Core's answer is to
+ * notice that a just-rejected-for-fee parent has a child waiting in the
+ * orphanage and submit the two together as a package, where the child's fee
+ * is allowed to lift the parent over the floor.
+ *
+ * One parent and one child is the whole of it, deliberately: that is the
+ * shape Core relays (package relay proper, with sendpackages negotiation,
+ * is a separate protocol) and it covers ordinary CPFP. Deeper chains still
+ * resolve the way they always did, through the orphan pool, whenever every
+ * member clears the floor by itself.
+ *
+ * The validation is not a second implementation -- it is the same
+ * well-formedness check, the same overlay, the same two passes, and the
+ * same fee context that submitpackage runs. A package off the wire and a
+ * package off the RPC socket must not be able to disagree. */
+static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
+                           const u8* child, unsigned long clen){
+    const u8* txs[2]  = { parent, child };
+    unsigned long lens[2] = { plen, clen };
+    u8 txids[64];
+    unsigned long long vsz[2];
+    const char* why = "";
+
+    if (!mpol_package_well_formed(txs, lens, 2, txids, vsz, &why)) return 0;
+
+    /* pass 1: dry run under the overlay, to learn the real fees. The overlay
+     * is what lets the child resolve its prevout against a parent that is
+     * not in the mempool yet. */
+    unsigned long long tot_fee = 0, tot_vsize = 0;
+    int all_ok = 1;
+    txacc_package_overlay(txs, lens, txids, 2);
+    for (int i = 0; i < 2; i++){
+        char r[128]; r[0] = 0; unsigned long long fee = 0;
+        long rc = tx_accept_test_reason(mp, txids + i*32, txs[i], lens[i], r, sizeof r, &fee);
+        if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += vsz[i]; }
+        else { all_ok = 0; break; }     /* not something a package can rescue */
+    }
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    if (!all_ok) return 0;
+
+    /* pass 2: commit with the package feerate in effect */
+    int committed = 1;
+    mpol_package_fee_context(tot_fee, tot_vsize);
+    txacc_package_overlay(txs, lens, txids, 2);
+    for (int i = 0; i < 2; i++)
+        if (tx_accept_validate_p2p(mp, txids + i*32, txs[i], lens[i]) != 1) committed = 0;
+    /* ALWAYS cleared, on every path: a fee context left set would relax the
+     * floor for ordinary single-transaction relay, and an overlay left set
+     * would let an unrelated transaction resolve against a package member. */
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_fee_context(0, 0);
+
+    if (committed){
+        txr_ann_add(txids,      -1);    /* both are new to the network: */
+        txr_ann_add(txids + 32, -1);    /* announce on every leg */
+        txr_1p1c_ok++;
+        /* Worth a line each time: a 1p1c acceptance is a rare event, not the
+         * per-transaction firehose the drain deliberately keeps out of the
+         * log. Txids are printed the way Core displays them -- byte-reversed
+         * from the wire order they are stored in. */
+        char ph[17], ch[17];
+        for (int b = 0; b < 8; b++){
+            sprintf(ph + b*2, "%02x", txids[31 - b]);
+            sprintf(ch + b*2, "%02x", txids[63 - b]);
+        }
+        fprintf(stderr, "[txrelay] 1p1c accepted: parent %s.. + child %s.. "
+                        "(package %llu sat / %llu vB)\n",
+                ph, ch, (unsigned long long)tot_fee, (unsigned long long)tot_vsize);
+    } else {
+        txr_1p1c_fail++;
+    }
+    return committed;
+}
+
+/* A parent has just been rejected for fee alone. If some parked orphan
+ * names it as a parent, that orphan is the child the package needs; try
+ * each such child until one package sticks. Returns transactions accepted
+ * (2 on success -- both members entered the mempool). */
+static long txr_try_1p1c(void* mp, const u8 parent_txid[32],
+                         const u8* parent, unsigned long plen){
+    for (int i = 0; i < TXR_ORPHAN_MAX; i++){
+        txr_orphan_t* o = &txr_orph[i];
+        if (!o->buf) continue;
+        int hit = 0;
+        for (u32 k = 0; k < o->nparent; k++)
+            if (!memcmp(o->parent[k], parent_txid, 32)) { hit = 1; break; }
+        if (!hit) continue;
+        if (txr_submit_1p1c(mp, parent, plen, o->buf, o->len)){
+            u8 cid[32]; memcpy(cid, o->txid, 32);
+            txr_orphan_free(o);
+            txr_orph_resolved++;
+            /* the CHILD is what a grandchild names as its parent, so the
+             * cascade sweep has to run on the child's txid, not the
+             * parent's -- sweeping the parent would find nothing. */
+            return 2 + txr_orphan_resolve(mp, cid);
+        }
+    }
+    return 0;
 }
 
 static long txr_orphan_resolve(void* mp, const u8 accepted[32]);
@@ -280,6 +461,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
     long accepted = 0;
     int outstanding = 0;                 /* getdata entries awaiting replies */
     txr_orphan_expire();
+    txr_recon_expire();
     long long deadline = txr_now_ms() + max_ms;
 
     for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
@@ -349,6 +531,15 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                     accepted++;
                     txr_ann_add(txid, fd);
                     accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */
+                } else if (r == -28){
+                    /* fee-only reject -- the one verdict a CPFP child can
+                     * overturn. If a child is already parked for this
+                     * parent, the two go in together; if not, remember the
+                     * parent as reconsiderable so that when a child does
+                     * turn up we are allowed to fetch this parent again. */
+                    long got = txr_try_1p1c(mp, txid, pl, plen);
+                    if (got) accepted += got;
+                    else     txr_recon_add(txid);
                 } else if (r == -25){
                     /* missing inputs: ordinary out-of-order relay. Park the
                      * child and fetch its parents from THIS leg right now --
@@ -361,7 +552,11 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                     unsigned want = 0;
                     for (u32 k = 0; k < npar; k++){
                         unsigned long got_len;
-                        if (txr_ring_has(par[k])) continue;
+                        /* a parent we rejected on fee alone is exactly the
+                         * one we DO want again, now that its child is here:
+                         * the ring would otherwise suppress the re-fetch
+                         * that 1p1c is built on */
+                        if (txr_ring_has(par[k]) && !txr_recon_allow_refetch(par[k])) continue;
                         if (mpool_get(mp, par[k], &got_len)) continue;
                         u8* o = gd + 1 + want*36;
                         o[0] = (u8)(TXR_MSG_WITNESS_TX);       o[1] = 0;
@@ -418,4 +613,21 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
          * headers-driven pass. */
     }
     return accepted;
+}
+
+/* Relay-pool counters for the heartbeat. These existed from the start but
+ * nothing ever read them, so the orphan pool's behaviour was invisible in
+ * the log -- a pool that was silently dropping everything would have looked
+ * exactly like a quiet one. Returns non-zero if anything is worth printing. */
+long txrelay_stats(long* parked, long* resolved, long* dropped,
+                   long* p1c_ok, long* p1c_fail, long* orphans_held){
+    long held = 0;
+    for (int i = 0; i < TXR_ORPHAN_MAX; i++) if (txr_orph[i].buf) held++;
+    if (parked)   *parked   = txr_orph_parked;
+    if (resolved) *resolved = txr_orph_resolved;
+    if (dropped)  *dropped  = txr_orph_dropped;
+    if (p1c_ok)   *p1c_ok   = txr_1p1c_ok;
+    if (p1c_fail) *p1c_fail = txr_1p1c_fail;
+    if (orphans_held) *orphans_held = held;
+    return txr_orph_parked || txr_1p1c_ok || txr_1p1c_fail || held;
 }
