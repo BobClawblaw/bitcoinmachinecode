@@ -185,10 +185,27 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …). As of 2026-08-27 the live binary is
-  **`bitcoind.deploy-20260827x`**; the rollback one step back is
-  `…-20260827w`.
+  **`bitcoind.deploy-20260827z`**; the rollback one step back is
+  `…-20260827y`.
 
-  The four that changed live behaviour most, newest first:
+  NOTE ON BOOT TIME from `z` onward: boot now includes a ~60 s
+  `[boot] tx-validation snapshot ready (61.49s)` step. That is deliberate --
+  the read-only UTXO snapshot moved from per-inbound-connection to once
+  pre-fork (see `y`/`z` below), so the cost is paid while the node is
+  starting instead of by every peer that connects. A boot that seems to hang
+  for a minute there is working as intended; the line is printed when it
+  finishes.
+
+  The six that changed live behaviour most, newest first:
+  - **`z`** (`1b62d67`) — inbound serving no longer stalls. Every forked
+    serve child used to open its own UTXO snapshot (60–83 s) before
+    answering anything; now opened once pre-fork and inherited. Measured:
+    63 s to serve a block before, under a second after.
+  - **`y`** (`392872b`) — the boot hash index was keyed BACKWARDS
+    (index.dat holds wire order, the loader reversed it), so the node served
+    no block requested by getdata, ever. Verify after any deploy touching
+    this: a getdata for a known block must return it promptly.
+
   - **`x`** (`386dc22`) — `savemempool`/`importmempool` in Core's
     `mempool.dat` format. Verified live: a 284 KB dump of 184 real
     transactions that an independent parser walks to exactly the file
