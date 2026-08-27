@@ -88,7 +88,7 @@ int main(int argc, char**argv){
     printf("PASS connect fd=%d\n",fd);
 
     /* version handshake */
-    unsigned char v[102]; int o=0;
+    unsigned char v[256]; int o=0;
     p32le(v+o,70016); o+=4; p64le(v+o,1); o+=8; p64le(v+o,(unsigned long long)time(NULL)); o+=8;
     p64le(v+o,1); o+=8; o+=16; p16be(v+o,8333); o+=2; p64le(v+o,1); o+=8; o+=16; p16be(v+o,0); o+=2;
     p64le(v+o,0x1111111111111111ULL); o+=8;

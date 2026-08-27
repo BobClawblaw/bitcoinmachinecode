@@ -77,7 +77,7 @@ int main(int argc, char**argv){
     printf("PASS connect fd=%d\n", fd);
 
     /* send version */
-    unsigned char v[102]; int o=0;
+    unsigned char v[256]; int o=0;
     p32le(v+o,70016); o+=4;
     p64le(v+o,1); o+=8;
     p64le(v+o,(unsigned long long)time(NULL)); o+=8;

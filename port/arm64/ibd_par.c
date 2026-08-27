@@ -191,7 +191,7 @@ static int connect_peer(const char* host,unsigned char* rbuf){
                 /* dial used a nonblocking socket; handshake reads must BLOCK,
                  * so clear O_NONBLOCK now (p2p_read/write are not EAGAIN-safe). */
                 int fl=fcntl(fd,F_GETFL,0); if(fl>=0) fcntl(fd,F_SETFL,fl & ~O_NONBLOCK);
-                unsigned char v[102]; int o=0;
+                unsigned char v[256]; int o=0;
                 v[o]=0x7f;o+=1;v[o]=0x11;o+=1;v[o]=0x01;o+=1;v[o]=0x00;o+=1;
                 v[o]=1;o+=8;
                 unsigned long long nt=(unsigned long long)time(NULL);
@@ -568,7 +568,7 @@ int main(int argc, char** argv){
                                 if(pr==1) added++; else if(pr==0) put_dup++; else { fprintf(stderr,"h%ld PUT ERR\n",h); bad=1; break; }
                             } }
                     } else {
-                        uint8_t ph[32]; unsigned long pidx; unsigned char sigb[520]; unsigned long ssl;
+                        uint8_t ph[32]; unsigned long pidx; unsigned char sigb[10000]; unsigned long ssl;
                         for(v=0;v<nin;v++){
                             if(tx_in(txo,tl,v,ph,&pidx,sigb,&ssl)!=0) continue;
                             unsigned long long pval; unsigned long pheight=0,pcb=0; const uint8_t*psp; unsigned long pspl;

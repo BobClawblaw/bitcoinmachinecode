@@ -293,7 +293,7 @@ static int connect_peer(const char* host,unsigned char* rbuf){
         if(!ip){ g_npeer++; } else {
             int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
             if(fd>=0){
-                unsigned char v[102]; int o=0;
+                unsigned char v[256]; int o=0;
                 p32le(v+o,70016); o+=4; p64le(v+o,1); o+=8; p64le(v+o,(unsigned long long)time(NULL)); o+=8;
                 p64le(v+o,1); o+=8; o+=16; p16be(v+o,8333); o+=2; p64le(v+o,1); o+=8; o+=16; p16be(v+o,0); o+=2;
                 p64le(v+o,0x1111111111111111ULL); o+=8;
@@ -451,7 +451,7 @@ int main(int argc, char** argv){
                             utxo_put(U,txid,v,val,h,1,sp,spl); added++; total_val_out+=val;
                         } }
                 } else {
-                    uint8_t ph[32]; unsigned long pidx; unsigned char sigb[520]; unsigned long ssl;
+                    uint8_t ph[32]; unsigned long pidx; unsigned char sigb[10000]; unsigned long ssl;
                     for(v=0;v<nin;v++){
                         if(tx_in(txo,tl,v,ph,&pidx,sigb,&ssl)!=0) continue;
                         unsigned long long pval; unsigned long pheight=0,pcb=0; const uint8_t*psp; unsigned long pspl;
