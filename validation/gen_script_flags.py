@@ -65,6 +65,25 @@ SEGWIT = height("SegwitHeight") # WITNESS + NULLDUMMY (BIP147, simultaneous)
 print("heights: BIP34=%d BIP66(DERSIG)=%d BIP65(CLTV)=%d CSV=%d Segwit(WITNESS+NULLDUMMY)=%d"
       % (BIP34, BIP66, BIP65, CSV, SEGWIT))
 
+# ---- 2b. CRegTestParams heights (regtest chain selection). Same fields, same
+#      discipline: read from Core's source, never remembered. Regtest's two
+#      mainnet exception hashes cannot occur (different genesis), so only the
+#      buried heights are chain-dependent. ----
+crt = re.search(r"class CRegTestParams : public CChainParams\s*\{.*?\n\};", src, re.S)
+if not crt: sys.exit("could not find CRegTestParams class body in " + SRC)
+rmain = crt.group(0)
+def rheight(field):
+    m = re.search(r"consensus\.%s\s*=\s*(\d+)" % field, rmain)
+    if not m: sys.exit("could not find consensus.%s in CRegTestParams" % field)
+    return int(m.group(1))
+R_BIP34 = rheight("BIP34Height")
+R_BIP65 = rheight("BIP65Height")
+R_BIP66 = rheight("BIP66Height")
+R_CSV   = rheight("CSVHeight")
+R_SEGWIT = rheight("SegwitHeight")
+print("regtest heights: BIP34=%d BIP66=%d BIP65=%d CSV=%d Segwit=%d"
+      % (R_BIP34, R_BIP66, R_BIP65, R_CSV, R_SEGWIT))
+
 exc = re.findall(
     r"script_flag_exceptions\.emplace\(\s*//\s*(\w+) exception\s*\n\s*uint256\{\"([0-9a-f]{64})\"\},\s*([A-Z0-9_| ]+)\);",
     main)
@@ -117,6 +136,12 @@ lines.append("%%define SFC_HEIGHT_CLTV %d ; BIP65Height" % BIP65)
 lines.append("%%define SFC_HEIGHT_CSV %d ; CSVHeight" % CSV)
 lines.append("%%define SFC_HEIGHT_SEGWIT %d ; SegwitHeight (WITNESS+NULLDUMMY)" % SEGWIT)
 lines.append("")
+lines.append("; regtest (CRegTestParams) -- selected at runtime via sfc_chain")
+lines.append("%%define SFC_R_HEIGHT_DERSIG %d ; regtest BIP66Height" % R_BIP66)
+lines.append("%%define SFC_R_HEIGHT_CLTV %d ; regtest BIP65Height" % R_BIP65)
+lines.append("%%define SFC_R_HEIGHT_CSV %d ; regtest CSVHeight" % R_CSV)
+lines.append("%%define SFC_R_HEIGHT_SEGWIT %d ; regtest SegwitHeight" % R_SEGWIT)
+lines.append("")
 lines.append("section .rodata")
 for label, hexhash, rawbytes, bits in exceptions:
     lines.append("; %s exception: display hash %s -> flags 0x%x" % (label, hexhash, bits))
@@ -145,6 +170,13 @@ hdr = [
     "#define SFC_HEIGHT_CSV    %d" % CSV,
     "#define SFC_HEIGHT_SEGWIT %d   /* WITNESS + NULLDUMMY (BIP147) */" % SEGWIT,
     "",
+    "/* regtest (CRegTestParams) */",
+    "#define SFC_R_HEIGHT_BIP34  %d" % R_BIP34,
+    "#define SFC_R_HEIGHT_DERSIG %d   /* BIP66 */" % R_BIP66,
+    "#define SFC_R_HEIGHT_CLTV   %d   /* BIP65 */" % R_BIP65,
+    "#define SFC_R_HEIGHT_CSV    %d" % R_CSV,
+    "#define SFC_R_HEIGHT_SEGWIT %d" % R_SEGWIT,
+    "",
     "#endif",
     "",
 ]
@@ -163,6 +195,14 @@ if not (h1 and h2 and h3 and h4 and len(exc_lines) == 2):
     sys.exit("SELF-CHECK FAILED: could not re-parse the generated .inc")
 if (int(h1[0]), int(h2[0]), int(h3[0]), int(h4[0])) != (BIP66, BIP65, CSV, SEGWIT):
     sys.exit("SELF-CHECK FAILED: re-parsed heights do not match what was written")
+r1 = re.findall(r"%define SFC_R_HEIGHT_DERSIG\s+(\d+)", again)
+r2 = re.findall(r"%define SFC_R_HEIGHT_CLTV\s+(\d+)", again)
+r3 = re.findall(r"%define SFC_R_HEIGHT_CSV\s+(\d+)", again)
+r4 = re.findall(r"%define SFC_R_HEIGHT_SEGWIT\s+(\d+)", again)
+if not (r1 and r2 and r3 and r4):
+    sys.exit("SELF-CHECK FAILED: could not re-parse the regtest heights")
+if (int(r1[0]), int(r2[0]), int(r3[0]), int(r4[0])) != (R_BIP66, R_BIP65, R_CSV, R_SEGWIT):
+    sys.exit("SELF-CHECK FAILED: re-parsed regtest heights do not match")
 for label, hexbytes in exc_lines:
     got = bytes(int(x, 16) for x in hexbytes.split(", "))
     want = next(rb for lb, hh, rb, fl in exceptions if lb.upper() == label)
@@ -178,5 +218,8 @@ def cdef(name):
 if (cdef("SFC_HEIGHT_BIP34"), cdef("SFC_HEIGHT_DERSIG"), cdef("SFC_HEIGHT_CLTV"),
     cdef("SFC_HEIGHT_CSV"), cdef("SFC_HEIGHT_SEGWIT")) != (BIP34, BIP66, BIP65, CSV, SEGWIT):
     sys.exit("SELF-CHECK FAILED: the C header does not match the .inc heights")
+if (cdef("SFC_R_HEIGHT_BIP34"), cdef("SFC_R_HEIGHT_DERSIG"), cdef("SFC_R_HEIGHT_CLTV"),
+    cdef("SFC_R_HEIGHT_CSV"), cdef("SFC_R_HEIGHT_SEGWIT")) != (R_BIP34, R_BIP66, R_BIP65, R_CSV, R_SEGWIT):
+    sys.exit("SELF-CHECK FAILED: the C header does not match the regtest heights")
 print("self-check ok: %d heights + %d exception hashes re-parse correctly, "
       "and the C mirror agrees" % (4, len(exc_lines)))
