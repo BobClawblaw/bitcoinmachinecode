@@ -213,9 +213,19 @@ static int parse_addr(const unsigned char* p, unsigned plen){
 /* bounded TCP dial: nonblocking connect + poll(2) so a dead/unroutable peer
  * fails in ~6s instead of blocking on the kernel's ~2min SYN-retry timeout.
  * Returns a blocked-connection fd (connected) or -1 within ~6s. */
-static int tcp_dial_bounded(unsigned ip, unsigned short port){
+static int tcp_dial_bounded(unsigned ip, unsigned short port, int src_idx){
     int fd=socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0);
     if(fd<0) return -1;
+    if(src_idx>=0 && ((ip & 0xff000000)==0x7f000000)){
+        /* Multihome the download clients: bind each to a DIFFERENT loopback
+         * source (127.0.0.1..127.0.0.16) so every client connection to a local
+         * oracle is an independent peer (a single shared 127.0.0.1 source makes
+         * all 16 look identical to the server). 127/8 all routes locally. */
+        struct sockaddr_in sb; memset(&sb,0,sizeof sb);
+        sb.sin_family=AF_INET;
+        sb.sin_addr.s_addr = htonl(0x7f000000u + (((unsigned)src_idx + 1) & 0xff));
+        if(bind(fd,(struct sockaddr*)&sb,sizeof sb)<0){ close(fd); return -1; }
+    }
     struct sockaddr_in sa; memset(&sa,0,sizeof sa);
     sa.sin_family=AF_INET; sa.sin_addr.s_addr=ip; sa.sin_port=port;
     int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
@@ -227,7 +237,7 @@ static int tcp_dial_bounded(unsigned ip, unsigned short port){
     if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&so,&sl)<0 || so!=0){ close(fd); return -1; }
     return fd;
 }
-static int connect_peer(const char* host,unsigned char* rbuf,int discover){
+static int connect_peer(const char* host,unsigned char* rbuf,int discover,int src_idx){
     int tries=0;
     for(int attempt=0;; attempt++){
         const char* ph = (attempt==0 && host)? host : PEERS[g_npeer % NPEERS];
@@ -236,7 +246,7 @@ static int connect_peer(const char* host,unsigned char* rbuf,int discover){
         if(!ip){ struct addrinfo h,*res=NULL; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
                  if(getaddrinfo(ph,NULL,&h,&res)==0&&res){ ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr; freeaddrinfo(res);} }
         if(!ip){ g_npeer++; } else {
-            int fd=tcp_dial_bounded(ip,(unsigned short)htons(8333));
+            int fd=tcp_dial_bounded(ip,(unsigned short)htons(8333),src_idx);
             if(fd>=0){
                 /* dial used a nonblocking socket; handshake reads must BLOCK,
                  * so clear O_NONBLOCK now (p2p_read/write are not EAGAIN-safe). */
@@ -501,7 +511,7 @@ static int rotate_client(int j, unsigned char* hdr){
     char bookh[16]; const char* host=0;
     if(g_nproven>0){ snprintf(bookh,sizeof bookh,"%s",g_proven[(g_proveni++)%g_nproven]); host=bookh; }
     else if(g_nbook>0){ snprintf(bookh,sizeof bookh,"%s",g_book[(g_booki++)%g_nbook]); host=bookh; }
-    int nfd=connect_peer(host, g_rbuf[j], 0);
+    int nfd=connect_peer(host, g_rbuf[j], 0, j);
     if(nfd<0){
         int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){ g_win[k].owner=-1; break; }
         return -1;
@@ -648,7 +658,7 @@ int main(int argc, char** argv){
        the book, then DROP the seed -- seeds are peer SOURCES, never download
        peers (x86 dl_bootstrap model). */
     for(int s=0;s<ng;s++){
-        int f=connect_peer(given[s], discrbuf, 1);
+        int f=connect_peer(given[s], discrbuf, 1, -1);
         if(f>=0){ fprintf(stderr,"[boot] seed %s -> discovered (dropped)\n", g_peer_host); fd_close(f); }
     }
     fprintf(stderr,"[boot] discovered +%d peer(s) via getaddr (book now %d)\n", g_nbook, g_nbook);
@@ -657,12 +667,22 @@ int main(int argc, char** argv){
     fprintf(stderr,"\n");
     /* PHASE B: dial DISTINCT DISCOVERED peers as the download clients (static
        list only if discovery returned nothing) -- x86 live[]/claimed pool. */
-    int bi=0;
+    int bi=0; int gi=0;
     g_ncli=0;
     for(int j=0;j<ncli;j++){
         g_rbuf[j]=malloc(8*1024*1024);
-        const char* host = bi<g_nbook ? g_book[bi++] : 0;
-        int fd=connect_peer(host, g_rbuf[j], 0);
+        /* Operator-passed IP-literal peers (e.g. a local full node / oracle,
+           127.0.0.1:8333) ARE download clients -- cycle all clients onto them.
+           Seed HOSTNAMES are NOT downloaders (they only discover peers), so a
+           bare hostname falls through to the discovered book, preserving the
+           x86 seeds-are-discovery-only rule. */
+        const char* host=0;
+        for(int t=0; ng>0 && t<ng; t++){
+            struct in_addr _a;
+            if(inet_pton(AF_INET,given[(gi+t)%ng],&_a)){ host=given[(gi+t)%ng]; gi++; break; }
+        }
+        if(!host) host = bi<g_nbook ? g_book[bi++] : 0;
+        int fd=connect_peer(host, g_rbuf[j], 0, j);
         if(fd<0){ fprintf(stderr,"[catchup] client %d: no peer available\n",j); break; }
         g_fd[j]=fd;
         snprintf(g_peer_name[j],sizeof g_peer_name[j],"%s",g_peer_host);
