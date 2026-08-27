@@ -3881,7 +3881,16 @@ int main(int argc, char** argv){
       reorg_set_pow_rules(g_chainp->pow_no_retargeting,
                           g_chainp->allow_min_difficulty,
                           g_chainp->enforce_bip94,
-                          g_chainp->pow_limit_bits); }
+                          g_chainp->pow_limit_bits);
+      /* SAY SO. The check is injected and default-off, so an inert one is
+       * indistinguishable from a working one by observing accepted blocks --
+       * every block is accepted either way. test_reorg proves the wiring in
+       * the suite; this line is the same evidence for a running node, and it
+       * prints the knobs so a wrong-chain arming is visible too. */
+      fprintf(stderr,"[config] pow  : nBits schedule enforcement ON"
+                     " (no_retarget=%d min_diff=%d bip94=%d powlimit=%08x)\n",
+              g_chainp->pow_no_retargeting, g_chainp->allow_min_difficulty,
+              g_chainp->enforce_bip94, g_chainp->pow_limit_bits); }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
     chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
     if(g_chainp->id != CHAIN_MAIN){
