@@ -181,18 +181,18 @@ svs_redeem:
 	.global sv_verify_script_asm
 	.type sv_verify_script_asm, %function
 sv_verify_script_asm:
+	/* AAPCS: x19..x28 are CALLEE-SAVED and must be pushed BEFORE being
+	 * clobbered by argument calibration. The old entry moved the args into
+	 * x19..x28 (and read the stack args into x25/x26) first, then pushed,
+	 * so the prologue saved the ARG values and the epilogue restored them
+	 * -- clobbering whatever the caller kept in x19..x28. Same class of
+	 * bug fixed in bitcoin_witness_v0_drv.S. Read the 2 stack args
+	 * (work,workcap) into caller-saved x9/x10 first, push the caller's
+	 * x19..x28, then calibrate. */
 	/* entry: x0=ss x1=ssl x2=spk x3=spl x4=flags x5=nIn x6=tx x7=txlen,
 	   [sp,#0]=work [sp,#8]=workcap */
-	mov  x19, x0                       /* scriptSig */
-	mov  x20, x1                       /* ssl */
-	mov  x21, x2                       /* scriptPubKey */
-	mov  x22, x3                       /* spl */
-	mov  x23, x4                       /* flags */
-	mov  x24, x5                       /* nIn */
-	mov  x27, x6                       /* tx */
-	mov  x28, x7                       /* txlen */
-	ldr  x25, [sp, #0]                 /* work */
-	ldr  x26, [sp, #8]                 /* workcap */
+	ldr  x9,  [sp, #0]                 /* work */
+	ldr  x10, [sp, #8]                 /* workcap */
 	stp  x29, x30, [sp, #-16]!
 	mov  x29, sp
 	stp  x19, x20, [sp, #-16]!
@@ -201,6 +201,16 @@ sv_verify_script_asm:
 	stp  x25, x26, [sp, #-16]!
 	stp  x27, x28, [sp, #-16]!
 	sub  sp, sp, #160
+	mov  x19, x0                       /* scriptSig */
+	mov  x20, x1                       /* ssl */
+	mov  x21, x2                       /* scriptPubKey */
+	mov  x22, x3                       /* spl */
+	mov  x23, x4                       /* flags */
+	mov  x24, x5                       /* nIn */
+	mov  x27, x6                       /* tx */
+	mov  x28, x7                       /* txlen */
+	mov  x25, x9                       /* work */
+	mov  x26, x10                      /* workcap */
 
 	TLSLAZY x10, svs_main_e, ARENA_LO, ARENA_HI
 	str  x10, [sp, #LOC_MAIN]
@@ -295,11 +305,15 @@ sv_verify_script_asm:
 	mov  x1, x20
 	bl   .Lpush_only
 	cbz  w0, .Lr_pushonly
-	ldr  x9, [sp, #LOC_CP_SP]
-	cbz  x9, .Lr_invstack
 
+	/* TLSLAZY clobbers x9 (it uses x9 as its TLS-slot-address scratch), so
+	 * cp.sp must be reloaded from the frame AFTER the lazy alloc, not held
+	 * in x9 across it -- the old code loaded cp.sp into x9 first, then
+	 * reused the clobbered x9 here, corrupting the top-of-stack index. */
 	TLSLAZY x13, svs_redeem, REDEEM_LO, 0
 	str  x13, [sp, #LOC_REDEEM]
+	ldr  x9, [sp, #LOC_CP_SP]
+	cbz  x9, .Lr_invstack
 	/* rl = *(u32*)(copy_e + (sp-1)*ELEM_SIZE) */
 	sub  x9, x9, #1
 	mov  x10, #ELEM_SIZE

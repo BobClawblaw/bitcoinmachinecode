@@ -227,17 +227,25 @@ and runs natively.
       node_announce_tip) -> port/arm64/bitcoin_serve.S (loops: ping/getaddr/getdata/
       getheaders/getblocks/getblocktxn/inv/tx/block/sendcmpct/sendheaders/feefilter;
       compact blocks; tip-watch announce). Part of the native daemon link.
-- [ ] bitcoin_scriptverify_drv.asm  (sv_verify_script_asm; legacy/P2SH driver, TLS
+- [x] bitcoin_scriptverify_drv.asm  (sv_verify_script_asm; legacy/P2SH driver, TLS
       arenas via .tbss) -> port/arm64/bitcoin_scriptverify_drv.S. COMPILES CLEAN +
-      exports exact x86 globals (svs_main_e/copy_e/redeem), but its differential
-      driver (test_svs_drv_diff) does NOT fully pass yet: on the scriptPubKey
-      re-run the asm hands sv_verify_script a corrupted script pointer — a
-      suspected real port bug, OPEN (do not mark done until it passes).
-- [ ] bitcoin_witness_v0_drv.asm   (sv_verify_witness_v0_asm; .tbss arenas/implied
+      exports exact x86 globals (svs_main_e/copy_e/redeem); differential driver
+      (test_svs_drv_diff) now 0-fail ALL PASS (15/15, native AArch64 link against
+      ported objects). 3 port bugs fixed: (1) TLSLAZY clobbered x9 (cp.sp loaded
+      into x9 was destroyed before the P2SH redeem index math -> corrupted
+      redeem script pointer); (2)+(3) entry calibrated x19..x28 from the args
+      BEFORE pushing, so the prologue saved arg values and the epilogue restored
+      them, clobbering the caller's callee-saved x19..x28 (AAPCS violation).
+- [x] bitcoin_witness_v0_drv.asm   (sv_verify_witness_v0_asm; .tbss arenas/implied
       P2WPKH) -> port/arm64/bitcoin_witness_v0_drv.S. COMPILES CLEAN + exports
-      globals (wv0_main_e/wv0_p2wpkh); frame-overflow + callee-saved-count bugs
-      fixed, but the differential harness still shows an x26-ABI anomaly — OPEN
-      (do not mark done until it passes).
+      globals (wv0_main_e/wv0_p2wpkh); differential driver (test_wv0_drv_diff)
+      now 0-fail ALL PASS (21/21, native AArch64 link against ported objects).
+      Port bugs fixed: (1) epilogue popped only 5 of 6 pushed pairs, shifted by
+      one pair (x26 plus every other callee-saved reg restored from the wrong
+      slot, x30 never got the real return address -> garbage ret); (2) entry
+      calibrated x19..x28 before pushing -> caller's callee-saved x28/x19 etc
+      clobbered (the "x26-ABI anomaly": main held its result in w19 across the
+      call and read garbage).
 - [x] (link-gap fill) bitcoin_store_ext.S (store_get_tip_hash / store_validates_
       prevhash / store_layout_monotonic / store_truncate_to / store_truncate_index_only)
       + bitcoin_sighash_all_ext.S (sighash_all) -- the DAEMONOBJS C (main.c/reorg.c/

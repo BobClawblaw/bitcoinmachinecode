@@ -101,19 +101,21 @@ wv0_p2wpkh:
 	.global sv_verify_witness_v0_asm
 	.type sv_verify_witness_v0_asm, %function
 sv_verify_witness_v0_asm:
+	/* AAPCS: x19..x28 are CALLEE-SAVED. The callee must push the CALLER's
+	 * values before using them as scratch. The old entry calibrated
+	 * x19/x20/x21/x22/x23/x28 from the args and read the stack args into
+	 * x1..x4 BEFORE pushing, so the prologue stored the arg values in the
+	 * save slots and the epilogue restored those -- silently clobbering
+	 * whatever the caller kept in x19..x28 (observed: main held its result
+	 * in w19 across the call and got garbage). Fix: read the 4 stack args
+	 * into caller-saved x9..x12 first, push (saving the real caller's
+	 * x19..x28), then calibrate from x0..x7/x9..x12. */
 	/* x0=prog x1=proglen(w) x2=wit x3=witlen x4=nwit(w) x5=amount
 	   x6=flags x7=nIn [sp,0]=tx [sp,8]=txlen [sp,16]=work [sp,24]=workcap */
-	mov  x19, x0                       /* prog */
-	mov  w20, w1                       /* proglen */
-	mov  x21, x2                       /* wit */
-	mov  x22, x3                       /* witlen */
-	mov  w23, w4                       /* nwit */
-	mov  x28, x5                       /* amount */
-	/* read stack-passed args while sp is still at entry */
-	ldr  x1, [sp, #0]                  /* tx */
-	ldr  x2, [sp, #8]                  /* txlen */
-	ldr  x3, [sp, #16]                 /* work */
-	ldr  x4, [sp, #24]                 /* workcap */
+	ldr  x9,  [sp, #0]      /* tx */
+	ldr  x10, [sp, #8]      /* txlen */
+	ldr  x11, [sp, #16]     /* work */
+	ldr  x12, [sp, #24]     /* workcap */
 	stp  x29, x30, [sp, #-16]!
 	mov  x29, sp
 	stp  x19, x20, [sp, #-16]!
@@ -122,17 +124,23 @@ sv_verify_witness_v0_asm:
 	stp  x25, x26, [sp, #-16]!
 	stp  x27, x28, [sp, #-16]!
 	sub  sp, sp, #208
+	mov  x19, x0            /* prog */
+	mov  w20, w1            /* proglen */
+	mov  x21, x2            /* wit */
+	mov  x22, x3            /* witlen */
+	mov  w23, w4            /* nwit */
+	mov  x28, x5            /* amount */
 
 	/* ctx region = { tx, txlen, nIn, work, workcap, 0,0,0, amount } */
-	str  x1, [sp, #W_CTX+0]
-	str  x2, [sp, #W_CTX+8]
-	str  x7, [sp, #W_CTX+16]
-	str  x3, [sp, #W_CTX+24]
-	str  x4, [sp, #W_CTX+32]
+	str  x9,  [sp, #W_CTX+0]
+	str  x10, [sp, #W_CTX+8]
+	str  x7,  [sp, #W_CTX+16]
+	str  x11, [sp, #W_CTX+24]
+	str  x12, [sp, #W_CTX+32]
 	str  xzr, [sp, #W_CTX+40]
 	str  xzr, [sp, #W_CTX+48]
 	str  x28, [sp, #W_CTX+56]
-	str  x6, [sp, #W_FLAGS]            /* flags (preserved for sv_run_v) */
+	str  x6,  [sp, #W_FLAGS]            /* flags (preserved for sv_run_v) */
 
 	/* this thread's stack arena, lazily malloc'd */
 	TLSLAZY x16, wv0_main_e, ARENA_LO, ARENA_HI
@@ -298,7 +306,15 @@ sv_verify_witness_v0_asm:
 .Wr_cleanstack: mov w0, #ERR_CLEANSTACK;   b .Wout
 .Wr_evalfalse:  mov w0, #ERR_EVAL_FALSE
 .Wout:
+	/* Epilogue must mirror the prologue, which saves SIX pairs bottom-up:
+	 * x29,x30 / x19,x20 / x21,x22 / x23,x24 / x25,x26 / x27,x28, pushed in
+	 * that order so x27,x28 sit lowest (at the restored-sp start) and
+	 * x29,x30 highest. The old epilogue popped only FIVE pairs starting at
+	 * x25,x26 -- one pair short and shifted -- so every callee-saved
+	 * register (incl. x26) was restored from the wrong slot and x30 never
+	 * got its real return address (garbage `ret`). */
 	add  sp, sp, #208
+	ldp  x27, x28, [sp], #16
 	ldp  x25, x26, [sp], #16
 	ldp  x23, x24, [sp], #16
 	ldp  x21, x22, [sp], #16
