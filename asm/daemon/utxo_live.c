@@ -786,7 +786,17 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     static const u8 MAINNET_GENESIS[32] = {   /* wire (sha256d) order */
         0x6f,0xe2,0x8c,0x0a,0xb6,0xf1,0xb3,0x72,0xc1,0xa6,0xa2,0x46,0xae,0x63,0xf7,0x4f,
         0x93,0x1e,0x83,0x65,0xe1,0x5a,0x08,0x9c,0x68,0xd6,0x19,0x00,0x00,0x00,0x00,0x00 };
-    if (g_apply_height == 0 && memcmp(blk_hash, MAINNET_GENESIS, 32) == 0) return 1;
+    /* regtest genesis, same rule (Core never writes ANY chain's genesis
+     * coinbase to its chainstate). Static bytes rather than a chainparams.c
+     * link dependency -- this file is compiled into many tools and tests
+     * that never select a chain, and matching both hashes is chain-agnostic.
+     * (display 0f9188f1...466e2206 reversed; the derivation is verified
+     * against Core's asserted hash by tests/test_chainparams.c.) */
+    static const u8 REGTEST_GENESIS[32] = {   /* wire (sha256d) order */
+        0x06,0x22,0x6e,0x46,0x11,0x1a,0x0b,0x59,0xca,0xaf,0x12,0x60,0x43,0xeb,0x5b,0xbf,
+        0x28,0xc3,0x4f,0x3a,0x5e,0x33,0x2a,0x1f,0xc7,0xb2,0xb7,0x3c,0xf1,0x88,0x91,0x0f };
+    if (g_apply_height == 0 && (memcmp(blk_hash, MAINNET_GENESIS, 32) == 0 ||
+                                memcmp(blk_hash, REGTEST_GENESIS, 32) == 0)) return 1;
 
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
      * used), building the tx array tx_verify.c also consumes. txs/pn_outs

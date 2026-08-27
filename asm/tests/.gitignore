@@ -41,4 +41,4 @@ test_addr_self
 test_bfilter_index
 test_aes
 test_wallet_crypter
-test_mempool_evict
+test_mempool_evicttest_chainparams
