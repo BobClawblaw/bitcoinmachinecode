@@ -248,23 +248,33 @@ tables and the writers themselves.
   - Core's `package-error` is `"TOKEN, debug detail"` naming the offending
     txid and wtxid in prose; ours carries the token alone. The verdict
     matches; the diagnostic string is shorter.
-- **Six wallet-import RPCs refuse**, all the same shape: `migratewallet`
-  (no legacy wallet to migrate from), `createwalletdescriptor` and `addhdkey`
-  (need a key-import path this wallet does not have), `importprunedfunds` /
-  `removeprunedfunds` (need a wallet transaction store), and `setwalletflag`
-  (would set a flag that changes nothing, which is worse than refusing). The
-  reason is structural and stated at each call site — this wallet is a single
-  BIP32 seed with no import path.
-  **`exportwatchonlywallet` left this list 2026-08-27**: it needs no import
-  path at all. The wallet's entire key set IS its two concrete descriptors
-  (branch-last derivation, index 0 only — see `listdescriptors`), so the
-  export is complete rather than truncated, `restorewallet` reads the format
-  back, and the round trip is proven in the regtest e2e. Core's export also
-  carries transactions and the address book; ours carries the descriptors,
-  and a restored export finds its history by rescanning.
-  NOTE the rest of wallet management shipped:
-  `createwallet`/`loadwallet`/`unloadwallet`/`restorewallet`/
-  `importdescriptors` are all real.
+- ~~**Wallet-import RPCs**~~ — **ONE left, 2026-08-27.** Five of the six were
+  not actually blocked; they shared a reason ("a single BIP32 seed with no
+  import path") that was wrong for them, or had stopped being true:
+  - **`migratewallet`** and **`createwalletdescriptor`** answer Core's OWN
+    verdict for a wallet of this shape — "already a descriptor wallet", and
+    "Descriptor already exists" for the type it has. Real answers reached the
+    same way Core reaches them. `createwalletdescriptor`'s other three types
+    are refused with the SPECIFIC reason: the key derivation is trivial, but
+    a descriptor whose outputs the rescan cannot recognise and
+    `getnewaddress` will never hand out would be a descriptor in name only.
+  - **`importprunedfunds` / `removeprunedfunds`** import no KEY material —
+    only the knowledge that an output we already own exists, which is what
+    made them look blocked. Built from pieces that existed: `verifytxoutproof`
+    for the BIP37 walk and in-chain check, `wscan_spk_h160` for "is this
+    ours", and a new `wscan_write` that owns the on-disk layout.
+  - **`setwalletflag`** implements `avoid_reuse` for real — coin selection
+    skips a destination this wallet has already spent from, and
+    `getwalletinfo` reports it. A stored-and-ignored flag would be worse than
+    refusing.
+
+  **Still refused: `addhdkey`**, and its reason is the true one — adopting a
+  foreign HD key needs a key store this single-seed wallet does not have.
+
+  Proven on regtest against a real chain: removing a confirmed wallet output
+  drops the balance by exactly its 50 BTC, importing it back with a real
+  `gettxoutproof` restores it to the satoshi, a second import does not
+  double-count, and a garbage proof is refused.
 - ~~**`build_utxo.c` includes the genesis coinbase**~~ — **CLOSED
   2026-08-27.** The rule now lives in `daemon/genesis_skip.h`, included by
   both the live writer and the offline builder, because a second copy of
