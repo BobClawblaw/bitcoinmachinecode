@@ -106,6 +106,13 @@ static void fake_peer(int cfd){
             int found=-1; for(int i=0;i<NB;i++) if(memcmp(pl+5,bh[i],32)==0) found=i;
             if(found>=0) p2p_write(cfd,"block",5,blocks[found],(unsigned)blen[found]);
             else p2p_write(cfd,"block",5,"",0);
+        } else if(strncmp(cmd,"verack",6)==0 || strncmp(cmd,"wtxidrelay",10)==0){
+            /* BIP339: our node now sends wtxidrelay after version, before
+             * verack -- the handshake's single post-version read (above)
+             * consumes the wtxidrelay, leaving the verack for this loop.
+             * Both are ignorable handshake trailers, not a reason to drop. */
+            nreq--;   /* don't count handshake trailers against the budget */
+            continue;
         } else {
             /* got a non-serve command mid-session; just drop the session */
             return;

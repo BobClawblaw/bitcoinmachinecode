@@ -3,6 +3,7 @@
  * loopback fake peer.
  */
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <stdint.h>
 #include <sys/socket.h>
@@ -27,6 +28,7 @@ extern long fd_read_full(int fd, void* buf, long n);
 
 static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
+static int g_saw_wtxidrelay = 0;   /* set by fake_peer: BIP339 msg seen before verack */
 
 static void fake_peer(int cfd){
     char cmd[12]; unsigned char rbuf[1024]; unsigned plen=0;
@@ -49,10 +51,12 @@ static void fake_peer(int cfd){
     memset(p+97,0,4+1);                                       /* start_height, relay */
     p2p_write(cfd, "version", 7, v, 102);
     p2p_write(cfd, "verack", 6, "", 0);
-    /* read client verack */
+    /* read the client's post-version messages: BIP339 wtxidrelay must
+     * arrive BEFORE its verack */
     for (int i=0;i<8;i++){
         if (p2p_read(cfd, cmd, rbuf, sizeof rbuf, &plen) <= 0) break;
         cmd[11]=0;
+        if (strncmp(cmd,"wtxidrelay",10)==0) g_saw_wtxidrelay = 1;
         if (strncmp(cmd,"verack",6)==0) break;
     }
 }
@@ -72,6 +76,7 @@ int main(void){
     cki("UA bytes", memcmp(vb+81, NODE_UA_STRING, NODE_UA_STRING_LEN)==0, 1);
     unsigned sh; memcpy(&sh, vb+81+NODE_UA_STRING_LEN, 4); cki("start_height=0", sh, 0);
     cki("relay=1", vb[81+NODE_UA_STRING_LEN+4], 1);
+    g_saw_wtxidrelay = 0;   /* reset before the live handshake below */
 
     /* --- node_handshake over loopback --- */
     int ls=socket(AF_INET,SOCK_STREAM,0);
@@ -79,11 +84,13 @@ int main(void){
     bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
     listen(ls,1);
     pid_t pid=fork();
-    if(pid==0){ int c=accept(ls,0,0); fake_peer(c); close(c); _exit(0); }
+    if(pid==0){ int c=accept(ls,0,0); fake_peer(c); close(c); _exit(g_saw_wtxidrelay ? 0 : 3); }
     int fd = tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port);  /* sin_port is already BE */
     cki("connect", fd>=0, 1);
     int r = node_handshake(fd);
     cki("node_handshake ok", r, 1);
+    /* the wtxidrelay assertion is checked via the child's exit status
+     * below (the flag is set in the forked fake_peer, not this process) */
     /* --- the handshake must CAPTURE the peer's version payload (getpeerinfo
      * and the [dl] outbound log line both parse it) --- */
     cki("captured peer version len", g_peer_version_len, 102);
@@ -94,7 +101,11 @@ int main(void){
     cki("captured nonce byte", g_peer_version_payload[72], 0x99);
     cki("captured UA len", g_peer_version_payload[80], 16);
     cki("captured UA bytes", memcmp(g_peer_version_payload+81, "/Satoshi:27.1.0/", 16)==0, 1);
-    close(fd); waitpid(pid,0,0); close(ls);
+    close(fd);
+    { int st=0; waitpid(pid,&st,0);
+      cki("BIP339: wtxidrelay sent after version, before verack (child saw it)",
+          WIFEXITED(st) && WEXITSTATUS(st)==0, 1); }
+    close(ls);
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
