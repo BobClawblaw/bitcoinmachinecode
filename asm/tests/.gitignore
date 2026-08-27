@@ -44,3 +44,4 @@ test_wallet_crypter
 test_mempool_evicttest_chainparams
 test_mempool_evict
 test_chainparams
+test_addr_index_tail
