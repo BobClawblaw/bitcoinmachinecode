@@ -863,6 +863,10 @@ static void dial_fail_errno(const char* what, int rc){
 
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
     g_dial_fail[0] = 0;
+    /* a named peer configured as "host:port" is dialled on ITS port, not the
+     * chain default (node_config.c keeps the host bare and the port beside
+     * it). 0 = nothing configured for this host. */
+    { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(host,NULL,&h,&res)!=0){
         snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
@@ -1559,7 +1563,8 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
                             unsigned char* hdrbuf, size_t hdrbuf_sz){
     unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) return -1;
-    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
+    int cport = node_config_peer_port(cand);
+    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }

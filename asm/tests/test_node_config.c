@@ -124,14 +124,36 @@ int main(void){
         printf("PASS: node_config_is_manual identifies addnode+connect peers only\n");
     else { printf("FAIL: is_manual wrong\n"); failures++; }
 
-    /* 13. host:port -- the default port is stripped and kept; anything else is
-     *     REJECTED rather than silently dialled on 8333 */
-    wr("bmc_t11.conf", "addnode=4.4.4.4:8333\naddnode=5.5.5.5:18333\n");
+    /* 13. host:port -- ANY port is honoured (Core does), the host is stored
+     *     BARE (those strings reach inet_pton/address-book paths) and the
+     *     port lands in the parallel array that the dial paths read through
+     *     node_config_peer_port. This used to reject every non-default port,
+     *     which dropped the entry SILENTLY and left the node at peers=0/0. */
+    wr("bmc_t11.conf", "addnode=4.4.4.4:8333\naddnode=5.5.5.5:18333\n"
+                       "addnode=6.6.6.6\n");
     node_config_load("bmc_t11.conf");
-    if (g_cfg.n_addnode==1 && !strcmp(g_cfg.addnode[0],"4.4.4.4"))
-        printf("PASS: :8333 stripped, non-default port rejected (not silently redirected)\n");
-    else { printf("FAIL: port handling (n=%d first=%s)\n",
-                  g_cfg.n_addnode, g_cfg.n_addnode?g_cfg.addnode[0]:"-"); failures++; }
+    if (g_cfg.n_addnode==3
+        && !strcmp(g_cfg.addnode[0],"4.4.4.4") && !strcmp(g_cfg.addnode[1],"5.5.5.5")
+        && !strcmp(g_cfg.addnode[2],"6.6.6.6")
+        && node_config_peer_port("4.4.4.4")==8333
+        && node_config_peer_port("5.5.5.5")==18333   /* the case that used to be dropped */
+        && node_config_peer_port("6.6.6.6")==0       /* no port named -> chain default */
+        && node_config_peer_port("9.9.9.9")==0)      /* not configured at all */
+        printf("PASS: any host:port is honoured; host stored bare, port beside it\n");
+    else { printf("FAIL: port handling (n=%d first=%s p5=%d p6=%d)\n",
+                  g_cfg.n_addnode, g_cfg.n_addnode?g_cfg.addnode[0]:"-",
+                  node_config_peer_port("5.5.5.5"), node_config_peer_port("6.6.6.6"));
+           failures++; }
+
+    /* 13b. a malformed or out-of-range port is still refused outright -- the
+     *      point of the change was to honour real ports, not to stop
+     *      validating. */
+    wr("bmc_t11b.conf", "addnode=7.7.7.7:0\naddnode=8.8.8.8:70000\n"
+                        "addnode=9.9.9.9:abc\n");
+    node_config_load("bmc_t11b.conf");
+    if (g_cfg.n_addnode==0)
+        printf("PASS: port 0, out-of-range and non-numeric ports are all refused\n");
+    else { printf("FAIL: bad ports accepted (n=%d)\n", g_cfg.n_addnode); failures++; }
 
     /* 14. more entries than the fixed array holds must not overflow it */
     { char big[8192]; int o=0;
