@@ -910,18 +910,19 @@ int main(int argc, char** argv){
                     time_t nowt=time(NULL);
                     if(nowt - g_head_last_t >= DL_TICK){
                         g_head_last_t=nowt;
-                        /* DIAGNOSTIC: head state every tick (which missing blocks,
-                           owner, owner fd liveness) so a no-rotation freeze is
-                           identifiable in the log. */
-                        { char hav[96]; int hp=0; hp+=snprintf(hav,sizeof hav,"["); 
-                          for(int z=0;z<hw->n;z++){ if(z<80) hp+=snprintf(hav+hp,sizeof hav-hp,"%c",hw->have[z]?'1':'.'); }
-                          snprintf(hav+hp,sizeof hav-hp,"]");
-                          int ofd = (hw->owner>=0 && g_fd[hw->owner]>=0) ? g_fd[hw->owner] : -1;
-                          LLOG(7,"[dlc]   HDIAG head h%ld owner w%d fd=%d collected %ld/%ld %s\n",
-                               tb, hw->owner, ofd, hw->collected, hw->n, hav);
-                        }
                         if(g_head_w0!=tb){ g_head_w0=tb; g_head_ticks=0; }
                         else g_head_ticks++;   /* same head blocking one more tick */
+                        /* DIAGNOSTIC only while a head is actually stalling (>=2
+                           consecutive ticks on the same window) -- silent when
+                           healthy so the log stays tight. */
+                        if(g_head_ticks>=1){
+                            char hav[96]; int hp=0; hp+=snprintf(hav,sizeof hav,"[");
+                            for(int z=0;z<hw->n;z++){ if(z<80) hp+=snprintf(hav+hp,sizeof hav-hp,"%c",hw->have[z]?'1':'.'); }
+                            snprintf(hav+hp,sizeof hav-hp,"]");
+                            int ofd = (hw->owner>=0 && g_fd[hw->owner]>=0) ? g_fd[hw->owner] : -1;
+                            LLOG(7,"[dlc]   HDIAG head h%ld owner w%d fd=%d collected %ld/%ld %s\n",
+                                 tb, hw->owner, ofd, hw->collected, hw->n, hav);
+                        }
                         if(g_head_ticks>=DEAD_WEIGHT_TICKS){
                             LLOG(7,"[dlc]   head h%ld SLOW %ds (collected %ld/%ld, owner w%d %s) -> replacing peer\n",
                                 tb, DEAD_WEIGHT_TICKS*DL_TICK, hw->collected, hw->n, hw->owner,

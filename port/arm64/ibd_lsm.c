@@ -211,7 +211,7 @@ static int connect_peer(const char* host,unsigned char* rbuf){
                     if(strncmp(cmd,"version",7)==0&&!sv){ p2p_write(fd,"verack",6,rbuf,0); sv=1; }
                     else if(strncmp(cmd,"verack",6)==0) gv=1;
                 }
-                if(sv&&gv){ fprintf(stderr,"  [peer %s fd=%d]\n",ph,fd); return fd; }
+                if(sv&&gv){ fprintf(stderr,"  [peer %s fd=%d]\n",ph,fd); g_npeer++; return fd; }
                 fd_close(fd);
             }
             g_npeer++;
@@ -455,6 +455,7 @@ int main(int argc, char** argv){
             if(vv<0){ fprintf(stderr,"h%ld bad txcount\n",h); bad_gate++; free(blk); continue; }
             unsigned long toff=80+vv;
             int bad=0;
+            long miss_logged=0, miss_total=0;   /* per-block missing-prevout rate limit */
             for(unsigned long ti=0; ti<nt; ti++){
                 unsigned long nin,nout;
                 long tl=tx_walk(blk+toff,(unsigned long)blklen-toff,&nin,&nout);
@@ -476,8 +477,9 @@ int main(int argc, char** argv){
                         unsigned long long pval; unsigned long pheight=0,pcb=0; const uint8_t*psp; unsigned long pspl;
                         long gr=utxo_lsm_get(g_lst,g_utxo,ph,pidx,&pval,&pheight,&pcb,&psp,&pspl);
                         if(gr==0){
-                            LLOG(6, "h%ld tx%lu in%lu MISSING-PREVOUT idx=%lu\n",h,ti,v,pidx);
-                            missing++; bad_sig++; continue;
+                            missing++; bad_sig++; miss_total++;
+                            if(miss_logged<10){ LLOG(6, "h%ld tx%lu in%lu MISSING-PREVOUT idx=%lu\n",h,ti,v,pidx); miss_logged++; }
+                            continue;
                         }
                         if(gr<0){ fprintf(stderr,"h%ld tx%lu LSM GET ERR\n",h,ti); bad=1; break; }
                         int rr=sv_verify_script(sigb,ssl,psp,pspl,bflags,v,txo,tl,work,8u<<20);
@@ -496,6 +498,8 @@ int main(int argc, char** argv){
                 }
                 toff += tl;
             }
+            if(miss_total>10)
+                LLOG(6, "h%ld MISSING-PREVOUT total=%ld (first 10 shown)\n", h, miss_total);
             if(bad){ bad_gate++; free(blk); continue; }
             if((h-start+1)%G_flush_every==0 || h==start+G_maxblk-1){
                 long fr=utxo_lsm_flush(g_lst,g_utxo);
