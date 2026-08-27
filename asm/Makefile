@@ -1841,14 +1841,14 @@ tests/test_wallet_scan: tests/test_wallet_scan.c wallet_scan.o wallet_scan_hash.
 	$(CC) -no-pie -O2 -o $@ tests/test_wallet_scan.c wallet_scan.o wallet_scan_hash.o \
 	    $(WALLETPRIMS)
 
-tests/test_rpc_control: tests/test_rpc_control.c rpc_commands.o rpc_json.o wallet_txlog.c $(RPCLIBS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 -o $@ tests/test_rpc_control.c rpc_commands.o rpc_json.o wallet_txlog.c $(RPCLIBS) -lpthread
+tests/test_rpc_control: tests/test_rpc_control.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 -o $@ tests/test_rpc_control.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
-tests/test_rpc_psbtfinal: tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o wallet_txlog.c $(RPCLIBS)
-	$(CC) -no-pie -O2 -o $@ tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o wallet_txlog.c $(RPCLIBS) -lpthread
+tests/test_rpc_psbtfinal: tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o $(RPCLIBS)
+	$(CC) -no-pie -O2 -o $@ tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
-tests/test_rpc_rawtx: tests/test_rpc_rawtx.c rpc_commands.o rpc_json.o wallet_txlog.c $(RPCLIBS)
-	$(CC) -no-pie -O2 -o $@ tests/test_rpc_rawtx.c rpc_commands.o rpc_json.o wallet_txlog.c $(RPCLIBS) -lpthread
+tests/test_rpc_rawtx: tests/test_rpc_rawtx.c rpc_commands.o rpc_json.o $(RPCLIBS)
+	$(CC) -no-pie -O2 -o $@ tests/test_rpc_rawtx.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 tests/test_rpc_signraw: tests/test_rpc_signraw.c rpc_commands.o rpc_json.o $(RPCLIBS)
 	$(CC) -no-pie -O2 -o $@ tests/test_rpc_signraw.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
