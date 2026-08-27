@@ -37,6 +37,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
+#include "addr_index_fmt.h"
 
 typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32; typedef uint16_t u16;
 
@@ -45,8 +46,11 @@ typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32; typedef uint16_t
 #define SPARSE_STRIDE 256
 #define NBUCKETS 256
 
-/* record types (mirrors rpc_commands.c's WAL_ADDR_* enum) */
-enum { T_INVALID=0, T_P2PKH=1, T_P2WPKH=2, T_P2SH=3, T_P2WSH=4, T_P2TR=5 };
+/* record types + the classifier live in addr_index_fmt.h now, shared with
+ * the live tail (daemon/addr_index_tail.c) so the two can never disagree.
+ * T_* aliases keep this file's original names readable. */
+enum { T_INVALID=AXF_INVALID, T_P2PKH=AXF_P2PKH, T_P2WPKH=AXF_P2WPKH,
+       T_P2SH=AXF_P2SH, T_P2WSH=AXF_P2WSH, T_P2TR=AXF_P2TR };
 
 #pragma pack(push,1)
 typedef struct { u8 type_tag; u8 hash[32]; u8 txid[32]; u32 vout; u64 value; } addr_rec;   /* 77 bytes */
@@ -54,22 +58,7 @@ typedef struct { u8 type_tag; u8 hash[32]; u64 file_off; } sparse_ent;          
 #pragma pack(pop)
 
 static int classify(const u8* s, u32 slen, u8* hash_out /*32 bytes*/) {
-    if (slen == 25 && s[0]==0x76 && s[1]==0xa9 && s[2]==0x14 && s[23]==0x88 && s[24]==0xac) {
-        memset(hash_out, 0, 32); memcpy(hash_out, s+3, 20); return T_P2PKH;
-    }
-    if (slen == 22 && s[0]==0x00 && s[1]==0x14) {
-        memset(hash_out, 0, 32); memcpy(hash_out, s+2, 20); return T_P2WPKH;
-    }
-    if (slen == 23 && s[0]==0xa9 && s[1]==0x14 && s[22]==0x87) {
-        memset(hash_out, 0, 32); memcpy(hash_out, s+2, 20); return T_P2SH;
-    }
-    if (slen == 34 && s[0]==0x00 && s[1]==0x20) {
-        memcpy(hash_out, s+2, 32); return T_P2WSH;
-    }
-    if (slen == 34 && s[0]==0x51 && s[1]==0x20) {
-        memcpy(hash_out, s+2, 32); return T_P2TR;
-    }
-    return T_INVALID;
+    return axf_classify(s, slen, hash_out);
 }
 
 static double now_s(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }

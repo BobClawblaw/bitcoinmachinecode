@@ -191,6 +191,9 @@ extern int  zmqpub_add(const char* topic, const char* addr);
 extern int  zmqpub_active(void);
 extern void zmqpub_poll(void);
 extern void txit_boot(void* store_buf);                                       /* daemon/tx_index_tail.c */
+extern void axt_boot(void* store_buf);                                        /* daemon/addr_index_tail.c (EXTENSION index) */
+extern void axt_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
+extern int  axt_active(void);
 extern int  txit_active(void);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
@@ -278,6 +281,7 @@ static void rebuild_hash_index_after_reorg(void){
      * already-indexed (fires with tip == fork height on the mid-reorg
      * invocation; the post-reconnect invocation is a no-op) */
     { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
+    { extern void axt_on_truncate(void*); axt_on_truncate(store_buf); }
     { extern void bfi_on_truncate(long); bfi_on_truncate(*(int*)(store_buf+24)); }
 }
 
@@ -2345,12 +2349,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     { extern void addrself_init(unsigned short, int);
       addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
     { extern long undo_replay(long, bfi_undo_cb_t, void*);
-      bfi_set_undo_replay(undo_replay); }
+      bfi_set_undo_replay(undo_replay);
+      /* the address index consumes the same undo stream (spent prevout
+       * scripts); registered the same way for the same link-layering reason */
+      { extern void axt_set_undo_replay(long (*)(long, bfi_undo_cb_t, void*));
+        axt_set_undo_replay(undo_replay); } }
     /* txid-index tail: establish coverage and close the gap between the
      * offline base build (or the previous run's tail) and the current tip.
      * After the archive verify -- a repair may have truncated heights the
      * tail would otherwise trust. No base index => logs once and disables. */
     if(archive_ok) txit_boot(store_buf);
+    /* live address index (EXTENSION -- Core has no such index): only when
+     * the operator asked with addrindex=1 */
+    if(archive_ok && g_cfg.addrindex) axt_boot(store_buf);
 
     fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
     phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
@@ -3224,6 +3235,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         /* filter index tail: adopt/append (cheap probe when
                          * the backfill has not closed in yet) */
                         bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                        /* address index (extension): ADDs from the block,
+                         * DELs/TOUCHes from its undo records */
+                        axt_on_block(store_buf, zh, zb, bl);
                         if (!zmqpub_active()) continue;
                         /* The block HASH is sha256d over the 80-byte
                          * header, REVERSED: Core's notifier flips the bytes

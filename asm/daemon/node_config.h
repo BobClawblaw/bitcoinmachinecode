@@ -61,6 +61,9 @@ typedef struct {
                                     link dependency, it is compiled into many
                                     tools that never select a chain).        */
     int  listen;                 /* Core -listen                             */
+    int  addrindex;              /* EXTENSION (no Core equivalent): live
+                                    address index, daemon/addr_index_tail.c.
+                                    Default 0; must be on before IBD.        */
     int  blocksonly;
     char signer[512];   /* external signer command (Core -signer / HWI); "" = none */             /* Core -blocksonly: no tx relay            */
     /* Core -zmqpub<topic>=<address>. One address per topic; topics sharing an

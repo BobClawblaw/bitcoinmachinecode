@@ -7,6 +7,52 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Live address index (EXTENSION): addrindex=1, getaddressbalance/getaddresstxids
+
+FEATURE_GAPS' "build_addr_index.c is an offline batch tool only" item is
+closed: the daemon now maintains a LIVE address index at the same new-block
+choke point as the txid/filter tails, config-gated by addrindex=1 (default
+OFF -- Bitcoin Core has NO address index; this is a deliberate extension in
+the old addrindex-patch spirit, and every surface says so).
+
+SHARED CLASSIFIER (daemon/addr_index_fmt.h): the script->address-key
+classification moved out of build_addr_index.c into one header the offline
+builder and the live tail both compile -- the two indexes structurally
+cannot disagree about what an address is (the node_config.c duplicate-parser
+lesson applied preemptively).
+
+LIVE JOURNAL (daemon/addr_index_tail.c): addrindex.tail, fixed 82-byte
+records, strictly height-ascending, one write(2) per block. ADDs from the
+block's own outputs; DELs from that block's undo records (the only place a
+spent output's script still exists -- bfilter_index.c's registered
+undo_replay pattern, same link-layering reason); TOUCHes carry the SPENDING
+tx's txid so history can name spends (a DEL's txid field must hold the spent
+outpoint to cancel its ADD). Torn final records truncate back onto the grid;
+reorgs truncate by height from the file end -- unlike the txid tail these
+records are NOT self-verifying against the archive, so stale ones must be
+physically removed. Coverage is from genesis: enabling addrindex on an
+already-synced node cannot recover spends below the undo retention window,
+so boot REFUSES loudly instead of building an index that lies (the honest
+form of old-Core's "-txindex requires -reindex").
+
+RPCs (rpc_chain.c, EXTENSIONS): getaddressbalance -> {balance, received,
+utxos} and getaddresstxids -> deduplicated funder+spender txids, accepting a
+string, an array, or the addrindex patch's {"addresses":[...]}; the
+disabled-state error says exactly how to enable. getindexinfo gains an
+"addressindex" entry alongside the real Core indexes.
+
+PROVEN against Core ground truth (private netns, isolated regtest pair,
+31/31): balances and utxo counts equal scantxoutset TO THE SATOSHI for
+legacy/P2SH-segwit/bech32/bech32m; an exact-outpoint spend drives balance to
+0 while received stays and the spender's txid appears; multi-address and
+object forms sum correctly; invalid address -> -5. The first run of that
+harness produced a real agreement the harness itself misread: Core's miner
+wallet respent a freshly-funded output mid-test and BOTH sides reported the
+resulting zero balance -- the assertion was wrong, not the index.
+tests/test_addr_index_tail (15 checks) covers the journal semantics
+hermetically. Full make -k test green: 190 suites.
+
+----------------------------------------------------------------------------
 ## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core
 
 The node now runs mainnet OR regtest, selected by Core's own config key
