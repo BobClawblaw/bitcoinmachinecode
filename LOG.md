@@ -7,6 +7,47 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Core-style mempool management: TrimToSize eviction, dynamic minfee, config-wired limits
+
+Prompted by a PRODUCTION FREEZE (mempool stuck at exactly 4096; the shared
+policy-state graph was fixed-size). The hotfix (size the graph to the pool's
+slot capacity, 70a754a) unfroze it, but the real gap was that our pool
+REJECTED new txs when full instead of evicting cheap ones. Now it does what
+Core does.
+
+TRIMTOSIZE EVICTION (bitcoin_mempool_policy.c): when mpool_put reports the
+pool full, evict the lowest-feerate LEAF transactions (leaf = desc_cnt==1,
+i.e. only itself -- Core's descendant-count convention) until the incoming
+tx fits, refusing to evict anything paying as much or more. The graph
+surgery is careful: evict_leaf decrements every ancestor's desc counters,
+purges the node's claims/outreg, swap-removes with full parent/claim index
+fixups. The last evicted feerate (+ incrementalrelayfee) becomes the
+pool's DYNAMIC mempoolminfee floor (st+48); a tx below it is rejected up
+front. Stated divergence: Core evicts whole descendant PACKAGES by
+descendant score; we evict individual lowest-feerate leaves -- identical
+for childless entries (the vast majority), cheapest-leaf-first for chains,
+always progressing.
+
+BLOB RECLAIM (daemon/mempool_compact.c): the structural pool's tx-blob was
+a bump allocator that never reclaimed freed bytes ("not compacted"), so
+eviction freed a slot but no space and the retry still failed. Compaction
+slides every live entry's blob region down to close the gaps and resets the
+fill pointer, carrying each slot's index through the sort so it is
+O(n log n), not O(n^2). Called from the eviction loop before each retry.
+
+DYNAMIC mempoolminfee reported by getmempoolinfo = max(static relay fee,
+eviction floor) -- rises under congestion, exactly Core's field.
+
+CONFIG-WIRED (Core exposes each; defaults unchanged and equal to Core's):
+minrelaytxfee, incrementalrelayfee (BTC/kvB -> sat/vByte at the boundary),
+limitancestorcount, limitancestorsize, limitdescendantcount,
+limitdescendantsize, mempoolfullrbf -- all read from bitcoin.conf and
+threaded into mpool_policy_init; a new [config] mpol log line reports them.
+
+Proof: tests/test_mempool_evict -- a high-feerate tx evicts the cheapest
+resident, the floor rises, a below-floor tx is rejected, and every survivor
+stays resolvable (graph intact after the swap-remove fixups).
+
 ## 2026-08-26 -- walletprocesspsbt: the PSBT Signer role, by delegation
 
 The last refused member of the PSBT family is real. walletprocesspsbt
