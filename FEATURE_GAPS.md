@@ -374,14 +374,28 @@ plus straightforward methods on top of it.
 
 ## Observed while wiring RPC — not fixed here, flagged for the consensus/storage owners
 
-- **`index.dat` hash byte order vs `bitcoin_idx.asm`.** Verified on the
-  production archive (`pread` of record 0, read-only): records store the
-  hash in **wire (raw sha256d) order**. `bitcoin_idx.asm`'s
-  `idx_build_from_file` header comment says DISPLAY order and byte-reverses
-  every record before `idx_put`, so the table `main.c`'s boot builds from
-  `index.dat` is keyed on reversed hashes. Whether the serve path's
-  `idx_get` compensates was not checked. `rpc_chain.c` sidesteps it by
-  building its own table from raw record bytes.
+- ~~**`index.dat` hash byte order vs `bitcoin_idx.asm`**~~ — **CHECKED AND
+  FIXED 2026-08-27** (`392872b`), and it was worse than this entry guessed.
+  index.dat holds WIRE order; the loader reversed every record believing it
+  held display order, so the boot hash index was keyed on DISPLAY hashes
+  while the serve loop looks up with the hash as it arrives on the p2p wire.
+  `.gd_block` could never hit: **the node served no block requested by
+  getdata, ever** — not even a notfound. Three tests missed it because each
+  encoded the loader's belief rather than the file's contents (test_serve
+  built its own index without reversing, bench_hashidx compared against a
+  reference that reversed identically, test_truncate reversed its lookups);
+  all three now build and look up the way production and the wire do.
+- ~~**Inbound serving stalled 63 s per connection**~~ — **FIXED 2026-08-27**
+  (`1b62d67`), found while proving the above. Every forked serve child opened
+  its own read-only UTXO snapshot before its read loop, and
+  `utxo_lsm_reload` costs 60–83 s on the real set, so a peer got no response
+  at all — not even the feefilter — until it had long since hung up. Now
+  opened once in the parent pre-fork and inherited copy-on-write, the same
+  discipline the shared mempool beside it already used and the same thing
+  Core does (`InitCoinsDB` once in `LoadChainstate`; Core never re-opens the
+  UTXO per connection and never forks per connection). Measured on mainnet:
+  63 s to serve a block before, under a second after. It also stopped each of
+  245 possible inbound peers mapping its own copy of the snapshot.
 - ~~**Production archive record 0 is block 1, not genesis.**~~ — **FIXED
   2026-08-22.** Confirmed against Core that record index was consistently
   real height − 1 across the whole archive, so `apply_block_at` handed
