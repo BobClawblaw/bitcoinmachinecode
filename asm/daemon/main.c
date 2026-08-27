@@ -3322,6 +3322,26 @@ static long gbt_sigops_legacy4(const unsigned char* tx, unsigned long len){
     return tx_legacy_sigops(tx, len) * 4;
 }
 
+/* wallet-encryption glue: the live seed the RPC wallet points at, and the
+ * loaded mnemonic encryptwallet seals. Installed/read via the extern hooks
+ * wallet_enc_state.c and rpc_wallet_ops.c call. */
+static unsigned char g_wallet_seed[64];
+static char g_wallet_mnemonic[768];
+static char g_wallet_bip39pass[256];
+static void wenc_install_seed(const unsigned char* s){
+    if (s){ memcpy(g_wallet_seed, s, 64); g_rpc_wallet.seed = g_wallet_seed; }
+    else  { memset(g_wallet_seed, 0, 64); g_rpc_wallet.seed = 0; }
+}
+/* Registered with wallet_enc_state.c as its mnemonic provider (see
+ * wenc_set_mnemonic_provider). wenc_current_mnemonic() lives there so the RPC
+ * layer and unit tests link against the state module, not this file. */
+static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pcap){
+    if (!g_wallet_mnemonic[0]) return 0;
+    snprintf(out, (size_t)cap, "%s", g_wallet_mnemonic);
+    snprintf(pass_out, (size_t)pcap, "%s", g_wallet_bip39pass);
+    return 1;
+}
+
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
@@ -3340,10 +3360,22 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * CLI's own resolution order) and hand the RPC layer the seed --
      * getnewaddress/getwalletinfo etc. then serve the REAL wallet. Absent
      * store = wallet RPCs stay unconfigured, exactly as before. */
+    /* wallet encryption (daemon/wallet_enc_state.c): the seed installer lets
+     * walletpassphrase/walletlock flip the live RPC seed at runtime, and the
+     * mnemonic provider lets encryptwallet seal the loaded wallet. If an
+     * ENCRYPTED store exists, adopt it locked and skip the plaintext load. */
+    { extern void wenc_set_seed_installer(void (*)(const unsigned char*));
+      extern void wenc_set_mnemonic_provider(int (*)(char*, long, char*, long));
+      extern int  wenc_boot(const char*);
+      wenc_set_seed_installer(wenc_install_seed);
+      wenc_set_mnemonic_provider(provide_wallet_mnemonic);
+      char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
+      if (wenc_boot(".") || wenc_boot(wd)){
+          fprintf(stderr, "[rpc] encrypted wallet adopted (locked)\n");
+      } else {
     { extern int wallet_store_load(const char*, char*, int, char*, int);
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
                                        const char* pass, long passlen);
-      static unsigned char wseed[64];
       static char mn[768], wpass[256];
       const char* cand[2] = { "bmcwallet.dat", "data/bmcwallet.dat" };
       for (int wi = 0; wi < 2; wi++){
@@ -3357,17 +3389,20 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                    if (f){ if (fgets(wpass, sizeof wpass, f)){ char* nl = strchr(wpass,'\n'); if (nl) *nl = 0; }
                            fclose(f); } } }
           if (wallet_store_load(cand[wi], mn, (int)sizeof mn, wpass, (int)sizeof wpass) == 0){
-              wallet_mnemonic_seed(wseed, mn, wpass[0] ? wpass : NULL,
+              wallet_mnemonic_seed(g_wallet_seed, mn, wpass[0] ? wpass : NULL,
                                    wpass[0] ? (long)strlen(wpass) : 0);
-              memset(mn, 0, sizeof mn);           /* the mnemonic never lingers */
-              g_rpc_wallet.seed = wseed;
+              g_rpc_wallet.seed = g_wallet_seed;
+              /* keep the mnemonic available so encryptwallet can seal it */
+              snprintf(g_wallet_mnemonic, sizeof g_wallet_mnemonic, "%s", mn);
+              snprintf(g_wallet_bip39pass, sizeof g_wallet_bip39pass, "%s", wpass);
+              memset(mn, 0, sizeof mn);
               fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
           } else {
               fprintf(stderr, "[rpc] wallet store %s present but not loadable "
                               "(encrypted? set BMC_WALLET_PASS or %s.pass)\n", cand[wi], cand[wi]);
           }
           break;
-      } }
+      } } } }
     /* Hand the RPC layer the SHARED mempool (allocated pre-fork by
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the
