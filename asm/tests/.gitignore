@@ -60,3 +60,21 @@ test_wallet_scan
 test_txoq_ipc
 test_package_policy
 test_mempool_persist
+
+# ---- compiled test binaries, by SHAPE rather than by name ----
+# The list above grew one line per binary, so every new test silently
+# committed its executable until someone noticed (twice now: 7536924, and
+# again with test_truc_policy / test_ephemeral_dust on 2026-08-27). A
+# compiled binary here has no extension and a source always does, so ignore
+# the build products and un-ignore every source suffix.
+test_*
+bench_*
+smoke_*
+!*.c
+!*.h
+!*.asm
+!*.S
+!*.py
+!*.inc
+!*.csv
+!*.md
