@@ -1,5 +1,15 @@
 # Live-node RPCs in the serve daemon — design
 
+> **Status 2026-08-27 (design doc, now implemented).** The bridge described
+> here shipped and grew well past the seven methods below: the `serve` daemon
+> now answers Core's full RPC surface (155/155), including the live mempool
+> (with feerate eviction and a dynamic `mempoolminfee`), wallet-encryption
+> RPCs (`encryptwallet`/`walletpassphrase`/`walletlock`), and the index
+> queries (`txindex`/`coinstatsindex`/`blockfilterindex`). The embedded RPC
+> server binds `rpcport` from `bitcoin.conf` (production `8331`; default per
+> chain is 8332 mainnet / 18443 regtest). This file remains the design record
+> of how the fork-boundary state bridge was built.
+
 Goal: answer the RPCs that need **live** node state — `getconnectioncount`,
 `getpeerinfo`, `getnetworkinfo`, `getmempoolinfo`, `getrawmempool`,
 `sendrawtransaction`, `getchaintips` — which the standalone `bitcoin_rpcd`
