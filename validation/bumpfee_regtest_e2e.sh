@@ -271,6 +271,35 @@ SUM2=$(bmc listunspent | jq_ "sum(round(float(u['amount'])*1e8) for u in d['resu
 [ "$BAL2" = "$SUM2" ] && ok "getbalance still excludes the immature coinbase ($BAL2 sat)" \
                       || fail "getbalance $BAL2 != spendable sum $SUM2"
 
+echo "== gettxout via the download-worker IPC, diffed against Core =="
+# The RPC lives in the serve parent and has no UTXO handle; it asks the worker
+# over a socketpair. Before that existed it answered null for EVERY outpoint,
+# which does not mean "unknown" -- it means "spent". Diffing against Core is
+# the check that matters: same outpoint, same answer.
+UTX=$(bmc listunspent | jq_ "next((u['txid'],u['vout']) for u in d['result'] if u['spendable'])" 2>/dev/null | tr -d "(),'" )
+set -- $UTX; UT=$1; UV=$2
+if [ -n "${UT:-}" ]; then
+  OURS=$(bmc gettxout "[\"$UT\",$UV]" | jq_ "json.dumps([float(d['result']['value']), d['result']['scriptPubKey']['hex'], d['result']['coinbase']]) if d['result'] else 'null'")
+  THEIRS=$(core gettxout "$UT" "$UV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(json.dumps([float(d['value']),d['scriptPubKey']['hex'],d['coinbase']]) if d else 'null')")
+  [ "$OURS" = "$THEIRS" ] && ok "gettxout on an unspent coin matches Core exactly" \
+                          || fail "gettxout mismatch: ours=$OURS core=$THEIRS"
+  [ "$OURS" != "null" ] && ok "gettxout returns the coin (not null) for an unspent outpoint" \
+                        || fail "gettxout returned null for a coin listunspent reports"
+else
+  fail "no spendable coin to query"
+fi
+
+# a SPENT outpoint must be null from both -- the bump's original input was
+# consumed by the replacement, which is now confirmed.
+SPENT_OURS=$(bmc gettxout "[\"$UTXO_TXID\",0]" | jq_ "'null' if d['result'] is None else 'present'")
+SPENT_CORE=$(core gettxout "$UTXO_TXID" 0 | python3 -c "
+import sys,json
+raw=sys.stdin.read().strip()
+print('null' if not raw or json.loads(raw) is None else 'present')")
+[ "$SPENT_OURS" = "null" ] && [ "$SPENT_CORE" = "null" ] \
+  && ok "a spent outpoint is null from both nodes" \
+  || fail "spent outpoint: ours=$SPENT_OURS core=$SPENT_CORE"
+
 echo
 [ $FAILURES -eq 0 ] && echo "ALL TESTS PASSED (0 failures)" || echo "FAILURES: $FAILURES"
 exit $((FAILURES>0))
