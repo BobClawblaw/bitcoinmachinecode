@@ -2265,6 +2265,21 @@ static unsigned long long blksub_last_seq = 0;
  * and was never re-pointed at it. The asm serve children already prefer
  * mp_ext_area (bitcoin_serve.asm's .mp_external); this makes the worker
  * consistent with them. */
+/* mined-tx pruner for utxo_live's block-connect callback: delete the
+ * confirmed tx from the SHARED structural pool under the cross-process lock.
+ * The policy registry keeps its (stale) node -- by design; every RPC filters
+ * registry entries against the pool (see mpool_policy_entry_info's header). */
+void serve_mined_prune(const unsigned char txid[32]){
+    extern long mpool_del(void*, const unsigned char*);
+    extern void* mp_ext_area;
+    extern void mp_lock(void); extern void mp_unlock(void);
+    void* mp = mp_ext_area;
+    if (!mp) return;
+    mp_lock();
+    mpool_del(mp, txid);
+    mp_unlock();
+}
+
 static void* txsub_pool(void){
     extern void* mp_ext_area;
     return mp_ext_area ? mp_ext_area : (void*)txsub_mp_area;
@@ -2377,6 +2392,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         extern void tx_accept_set_tip(long);
         tx_accept_set_resolver(utxo_live_resolve);
         tx_accept_set_tip(*(int*)(store_buf+24));
+        /* prune just-mined txs from the shared pool at block-connect (see
+         * utxo_live.c g_mined_cb -- before this, only the reorg path did) */
+        { extern void utxo_live_set_mined_cb(void (*)(const unsigned char[32]));
+          extern long mpool_del(void*, const unsigned char*);
+          extern void serve_mined_prune(const unsigned char*);
+          utxo_live_set_mined_cb(serve_mined_prune); }
 
         /* ---- coinstats index: continuous gettxoutsetinfo + a standing
          * cryptographic parity instrument. Observers feed it every coin
@@ -2856,15 +2877,30 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * word for it) until the UTXO dry-run slice lands. */
         if(g_node_status && g_node_status->blk_submit_seq != blksub_last_seq){
             blksub_last_seq = g_node_status->blk_submit_seq;
-            extern long blk_submit_evaluate(const unsigned char*, unsigned long,
-                                            const unsigned char*, long, char*, unsigned long);
+            extern long blk_submit_evaluate_ex(const unsigned char*, unsigned long,
+                                               const unsigned char*, long, int, char*, unsigned long);
             char reason[64]; reason[0]=0;
             unsigned char tiph[32]; int have_tip = store_get_tip_hash(store_buf, tiph) == 1;
             long tip = *(int*)(store_buf+24);
             const unsigned char* sblk = (const unsigned char*)g_node_status->blk_submit_buf;
             unsigned long slen = g_node_status->blk_submit_len;
             int accepted = 0;
-            long ev = blk_submit_evaluate(sblk, slen, have_tip ? tiph : 0, tip, reason, sizeof reason);
+            int proposal = g_node_status->blk_submit_proposal;
+            /* BIP23 proposal: prev must be OUR TIP or the answer is Core's
+             * "inconclusive-not-best-prevblk"; PoW is NOT checked (the
+             * template is unmined -- Core TestBlockValidity fCheckPOW=false);
+             * and nothing is ever connected. */
+            if (proposal && (!have_tip || slen < 81 || memcmp(sblk + 4, tiph, 32) != 0)){
+                snprintf(reason, sizeof reason, "inconclusive-not-best-prevblk");
+                fprintf(stderr,"[dl] proposal: %s (len=%lu tip=%ld)\n", reason, (unsigned long)slen, tip);
+                snprintf((char*)g_node_status->blk_submit_reason, sizeof g_node_status->blk_submit_reason, "%s", reason);
+                g_node_status->blk_submit_result = 0;
+                __sync_synchronize();
+                g_node_status->blk_submit_ack = blksub_last_seq;
+                continue;
+            }
+            long ev = blk_submit_evaluate_ex(sblk, slen, have_tip ? tiph : 0, tip,
+                                             proposal ? 0 : 1, reason, sizeof reason);
             if (ev == 1){
                 /* consensus-clean + tip-extending. CONNECT path: contextual
                  * checks (correct next bits, timestamp window), the UTXO
@@ -2915,6 +2951,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     } else if (utxo_live_dryrun_block(sblk, slen, tip + 1) != 1){
                         const char* rr = utxo_live_last_reject();
                         snprintf(reason, sizeof reason, "%s", (rr && rr[0]) ? rr : "rejected");
+                    } else if (proposal){
+                        /* valid proposal: report success, NEVER connect */
+                        accepted = 1;
                     } else {
                         /* CONNECT: append, then apply through the normal
                          * catch-up pipeline (full re-verify -- deterministic
@@ -2954,8 +2993,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     }
                 }
             }
-            fprintf(stderr,"[dl] submitblock: %s (len=%lu tip=%ld)\n",
-                    accepted ? "accepted" : reason, (unsigned long)slen, tip);
+            fprintf(stderr,"[dl] %s: %s (len=%lu tip=%ld)\n",
+                    proposal ? "proposal" : "submitblock",
+                    accepted ? (proposal ? "valid" : "accepted") : reason, (unsigned long)slen, tip);
             snprintf((char*)g_node_status->blk_submit_reason, sizeof g_node_status->blk_submit_reason, "%s", reason);
             g_node_status->blk_submit_result = accepted;
             __sync_synchronize();
@@ -3387,6 +3427,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * fPowNoRetargeting; mainnet values are rpc_chain's own defaults) */
     rpc_chain_set_chainparams(g_chainp->name, g_chainp->halving_interval,
                               g_chainp->pow_no_retargeting);
+    /* getblocktemplate proposal mode evaluates through the worker's
+     * submit channel (rpc_node.c owns the staging) */
+    { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
+      rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
     /* Wallet bootstrap: if the CLI's own wallet store is present in the
      * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the

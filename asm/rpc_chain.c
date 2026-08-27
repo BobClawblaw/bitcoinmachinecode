@@ -307,6 +307,14 @@ static void chainwork_hex(const u8 w[16], char out[65]){
  * chainparams.c; the daemon calls rpc_chain_set_chainparams() after
  * chainparams_select(). Regtest: name "regtest", halving 150,
  * fPowNoRetargeting (GBT keeps the tip's nBits forever). */
+/* getblocktemplate proposal mode: evaluation runs in the download worker
+ * (the chain-state owner) via the same staging channel submitblock uses;
+ * rpc_node.c owns that channel, so the daemon injects its helper here.
+ * NULL (standalone rpcd, tests) => an honest "unavailable". Returns 1 valid,
+ * 0 reason filled, -2 decode, -3 timeout, -1 unavailable. */
+static long (*g_gbt_proposal)(const char* hex, char* reason, unsigned long rcap) = 0;
+void rpc_chain_set_proposal(long (*fn)(const char*, char*, unsigned long)){ g_gbt_proposal = fn; }
+
 static const char* g_chain_name = "main";
 static long g_halving_interval  = 210000;
 static int  g_pow_no_retarget   = 0;
@@ -931,6 +939,24 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
             for (unsigned long i = 0; i < rules->nitems; i++)
                 if (rules->items[i]->typ == RJ_STR && !strcmp(rules->items[i]->str, "segwit")) segwit_rule = 1;
         const rj_val* mode = rj_obj_get((rj_val*)req, "mode");
+        if (mode && mode->typ == RJ_STR && !strcmp(mode->str, "proposal")){
+            /* BIP23 proposal: full validation of a caller-built block WITHOUT
+             * PoW and WITHOUT connecting -- Core's TestBlockValidity via the
+             * worker's dry-run path. null = valid, else the BIP22 reason. */
+            const rj_val* data = rj_obj_get((rj_val*)req, "data");
+            if (!data || data->typ != RJ_STR){
+                *ec = -8; *em = "Missing data String key for proposal"; return 0; }
+            if (!g_gbt_proposal){
+                *ec = -1; *em = "Block proposal evaluation unavailable (no download worker)"; return 0; }
+            static char reason[64];
+            long pr = g_gbt_proposal(data->str, reason, sizeof reason);
+            if (pr == 1){ *res = rj_null(); return 1; }
+            if (pr == -2){ *ec = -22; *em = "Block decode failed"; return 0; }
+            if (pr == -3){ *ec = -4; *em = "Block proposal timed out (node may be catching up)"; return 0; }
+            if (pr == -1){ *ec = -1; *em = "Block proposal evaluation unavailable (no download worker)"; return 0; }
+            *res = rj_str(reason[0] ? reason : "rejected");
+            return 1;
+        }
         if (mode && mode->typ == RJ_STR && strcmp(mode->str, "template")){
             *ec = -8; *em = "Invalid mode"; return 0; }
     }
@@ -977,30 +1003,88 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         { u8* m = (u8*)g_gbt_mph.mp; unsigned long long mask; memcpy(&mask, m+8, 8);
           for (unsigned long i = 0; i <= mask && n < GBT_MAX_TX; i++){
               gbt_ent e; if (gbt_slot(g_gbt_mph.mp, i, &e) == 1) ents[n++] = e; } }
-        memset(emitted, 0, (size_t)(n ? n : 1));
-        long emitted_n = 0;
-        /* iterative parents-first ordering via the policy graph */
-        for (long pass = 0; pass <= n && emitted_n < n; pass++){
-            long progress = 0;
-            for (long i = 0; i < n; i++){
-                if (emitted[i]) continue;
-                int ready = 1;
-                mp_entry_info inf; long have = 0;
-                if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info)
-                    have = g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &inf);
-                if (have){
-                    mp_entry_info* pi = &inf;
-                    for (int k = 0; k < pi->n_depends && ready; k++){
-                        int found_unemitted = 0;
-                        for (long j = 0; j < n; j++)
-                            if (!emitted[j] && !memcmp(ents[j].txid, pi->depends[k], 32)){ found_unemitted = 1; break; }
-                        if (found_unemitted) ready = 0;
-                    }
-                }
-                if (!ready) continue;
-                emitted[i] = 1; order[emitted_n++] = (int)i; progress = 1;
+        /* ---- ancestor-package greedy selection (Core addPackageTxs) ----
+         * Repeatedly pick the candidate whose ANCESTOR PACKAGE (its not-yet-
+         * selected in-pool ancestors + itself) has the highest package
+         * feerate; emit that package parents-first; repeat. CPFP falls out:
+         * a high-fee child lifts its cheap parent's package score. Weight
+         * and sigop budgets are Core's (4M weight / 80k cost, minus the
+         * 4000-weight / 400-sigop coinbase reservation); an over-budget
+         * package is skipped and selection continues. Tie-break: smaller
+         * txid (Core tie-breaks inside its modified-set comparator; the
+         * ordering difference is score-equal, documented divergence). */
+        static mp_entry_info infs[GBT_MAX_TX];
+        static unsigned char have_inf[GBT_MAX_TX];
+        static unsigned long long tfee[GBT_MAX_TX], tsize[GBT_MAX_TX];
+        static long tweight[GBT_MAX_TX], tsig[GBT_MAX_TX];
+        static unsigned char skipped[GBT_MAX_TX];
+        for (long i = 0; i < n; i++){
+            have_inf[i] = 0; skipped[i] = 0; emitted[i] = 0;
+            tfee[i] = 0; tsize[i] = 1;
+            if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
+                g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &infs[i])){
+                have_inf[i] = 1; tfee[i] = infs[i].fee; tsize[i] = infs[i].size ? infs[i].size : 1;
             }
-            if (!progress) break;
+            { const u8* tp = ents[i].tx; const u8* tend = tp + ents[i].len; txw_t w;
+              tweight[i] = tx_walk(tp, tend, &w) ? (long)(w.stripped * 3 + w.len) : (long)(ents[i].len * 4); }
+            tsig[i] = (have_inf[i] && infs[i].sigop_cost)
+                        ? (long)infs[i].sigop_cost
+                        : (g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0);
+        }
+        long emitted_n = 0;
+        long long budget_w = 4000000 - 4000, budget_s = 80000 - 400;
+        long long used_w = 0, used_s = 0;
+        for (long round = 0; round < n; round++){
+            long best = -1;
+            unsigned long long bf = 0, bs = 1;
+            for (long i = 0; i < n; i++){
+                if (emitted[i] || skipped[i] || !have_inf[i]) continue;
+                /* package = ancestors (incl self) minus already-emitted */
+                unsigned long long pf = infs[i].anc_fee, ps = infs[i].anc_size;
+                int unresolved = 0;
+                for (int a = 0; a < infs[i].n_anc; a++){
+                    if (!memcmp(infs[i].anc[a], ents[i].txid, 32)) continue;   /* self */
+                    long j = -1;
+                    for (long m = 0; m < n; m++)
+                        if (!memcmp(ents[m].txid, infs[i].anc[a], 32)){ j = m; break; }
+                    if (j < 0){ unresolved = 1; break; }       /* registry-stale */
+                    if (emitted[j]){ pf -= tfee[j]; ps -= tsize[j]; }
+                    else if (skipped[j]){ unresolved = 1; break; }
+                }
+                if (unresolved){ skipped[i] = 1; continue; }
+                if (ps == 0) ps = 1;
+                /* pf/ps > bf/bs  <=>  pf*bs > bf*ps (fits: fee<2^40, size<2^24) */
+                int better = (best < 0) || (pf * bs > bf * ps) ||
+                             (pf * bs == bf * ps && memcmp(ents[i].txid, ents[best].txid, 32) < 0);
+                if (better){ best = i; bf = pf; bs = ps; }
+            }
+            if (best < 0) break;
+            /* collect the package as candidate indexes */
+            int pkg[MPE_MAX_SET]; int np = 0;
+            long long ww = 0, ss = 0;
+            for (int a = 0; a < infs[best].n_anc && np < MPE_MAX_SET; a++){
+                long j = -1;
+                for (long m = 0; m < n; m++)
+                    if (!memcmp(ents[m].txid, infs[best].anc[a], 32)){ j = m; break; }
+                if (j < 0 || emitted[j]) continue;
+                pkg[np++] = (int)j; ww += tweight[j]; ss += tsig[j];
+            }
+            if (np == 0){ skipped[best] = 1; continue; }
+            if (used_w + ww > budget_w || used_s + ss > budget_s){
+                skipped[best] = 1;                   /* try lighter packages */
+                continue;
+            }
+            /* parents-first inside the package: a child's ancestor set is a
+             * strict superset of its parent's, so ascending n_anc is a valid
+             * topological order */
+            for (int a = 0; a < np; a++)
+                for (int b = a + 1; b < np; b++)
+                    if (infs[pkg[b]].n_anc < infs[pkg[a]].n_anc){ int t_ = pkg[a]; pkg[a] = pkg[b]; pkg[b] = t_; }
+            for (int a = 0; a < np; a++){
+                emitted[pkg[a]] = 1;
+                order[emitted_n++] = pkg[a];
+            }
+            used_w += ww; used_s += ss;
         }
         /* render in order; depends[] are 1-based indices into this array */
         for (long oi = 0; oi < emitted_n; oi++){
@@ -1031,7 +1115,14 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
               rj_obj_set(t, "depends", dep); }
             rj_obj_set(t, "fee", rj_numf("%llu", fee));
             fees_total += fee;
-            rj_obj_set(t, "sigops", rj_numf("%ld", g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0));
+            /* exact BIP141 cost stamped at accept time (tx_accept.c);
+             * legacy-x4 lower bound only if the stamp is absent */
+            { mp_entry_info sinf; long ssig = 0;
+              if (g_gbt_mph.pol_entry_info &&
+                  g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &sinf) && sinf.sigop_cost)
+                  ssig = (long)sinf.sigop_cost;
+              else if (g_gbt_sigop_cost) ssig = g_gbt_sigop_cost(ents[i].tx, ents[i].len);
+              rj_obj_set(t, "sigops", rj_numf("%ld", ssig)); }
             { const u8* p = ents[i].tx; const u8* end = p + ents[i].len; txw_t w;
               rj_obj_set(t, "weight", rj_numf("%zu",
                   tx_walk(p, end, &w) ? (w.stripped * 3 + w.len) : ents[i].len * 4)); }

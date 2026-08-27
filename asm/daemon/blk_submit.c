@@ -94,9 +94,13 @@ static void bsub_target(u32 bits, u8 t[32]){
 
 /* 1 = would-be-acceptable so far (caller answers "inconclusive" this slice),
  * 0 = reason set. tip_hash/tip_height come from the store the worker owns. */
-long blk_submit_evaluate(const u8* blk, unsigned long len,
-                         const u8 tip_hash[32], long tip_height,
-                         char* reason, unsigned long rcap){
+/* check_pow=0 is BIP23 proposal mode (Core TestBlockValidity's fCheckPOW=
+ * false): the caller is validating an UNMINED template, so the hash-vs-
+ * target check is skipped; everything else is identical. */
+long blk_submit_evaluate_ex(const u8* blk, unsigned long len,
+                            const u8 tip_hash[32], long tip_height,
+                            int check_pow,
+                            char* reason, unsigned long rcap){
     if (reason && rcap) reason[0] = 0;
 #define RSN(s) do{ if (reason && rcap) snprintf(reason, rcap, "%s", s); }while(0)
     if (len < 81){ RSN("Block decode failed"); return 0; }
@@ -105,7 +109,8 @@ long blk_submit_evaluate(const u8* blk, unsigned long len,
     if (tip_hash && !memcmp(hash, tip_hash, 32)){ RSN("duplicate"); return 0; }
 
     /* PoW against the header's own bits (Core CheckProofOfWork) */
-    { u32 bits = (u32)blk[72] | ((u32)blk[73]<<8) | ((u32)blk[74]<<16) | ((u32)blk[75]<<24);
+    if (check_pow){
+      u32 bits = (u32)blk[72] | ((u32)blk[73]<<8) | ((u32)blk[74]<<16) | ((u32)blk[75]<<24);
       u8 target[32], hbe[32];
       bsub_target(bits, target);
       for (int i = 0; i < 32; i++) hbe[i] = hash[31-i];      /* LE hash -> BE */
@@ -144,4 +149,11 @@ long blk_submit_evaluate(const u8* blk, unsigned long len,
 
     return 1;   /* consensus-clean and tip-extending; caller: "inconclusive" */
 #undef RSN
+}
+
+/* legacy entry: full check including PoW (submitblock path, tests) */
+long blk_submit_evaluate(const u8* blk, unsigned long len,
+                         const u8 tip_hash[32], long tip_height,
+                         char* reason, unsigned long rcap){
+    return blk_submit_evaluate_ex(blk, len, tip_hash, tip_height, 1, reason, rcap);
 }
