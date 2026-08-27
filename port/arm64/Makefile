@@ -112,6 +112,15 @@ fuzz_lsm: t_lsm
 	python3 fuzz_lsm.py 1 800
 t_undo_asm: t_undo.c bitcoin_undo.o
 	@$(CC) $(CFLAGS) -o $@ $+
+# LSM-backed UTXO-set builder (daemon/build_utxo.c -> our ported utxo_lsm store).
+# Needs utxo_stats(->muhash) in addition to the x86 BUILDUTXOOBJS set, which
+# omitted them; bitcoin_cons for tx-level gates. AArch64-native build.
+build_utxo: ../../asm/daemon/build_utxo.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_idxscan.o bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_utxo_stats.o bitcoin_muhash.o ripemd160.o
+	@$(CC) $(CFLAGS) -I../.. -I../../asm/daemon -o $@ ../../asm/daemon/build_utxo.c $(filter %.o,$^) -lpthread
+# AArch64-native full-block download + persist (live_blocks.c): getdata BLOCK,
+# verify header-hash/prev-link/coinbase, store_append -> blk%05u.dat + index.dat.
+live_blocks: live_blocks.c bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_tx.o bitcoin_hash.o sha256.o
+	@$(CC) $(CFLAGS) -o $@ $+
 fuzz_undo:
 	python3 fuzz_undo.py 1 800
 fuzz_strip:

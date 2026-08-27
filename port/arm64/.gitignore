@@ -51,6 +51,7 @@ t_undo_asm
 t_undo_c
 t_lsm
 t_pct
+build_utxo
 undo_log.o
 lsm_stub.o
 fuzz_undo

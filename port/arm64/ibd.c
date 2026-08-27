@@ -50,6 +50,10 @@ extern long   utxo_del(void* u, const uint8_t* txid, unsigned long index);
 extern long   utxo_count(void* u);
 extern long   utxo_store_init(void* st);
 extern long   utxo_store_sync(void* st, void* u);
+/* block archive (bitcoin_store.S): persist each verified downloaded block to
+ * the datadir's blk%05u.dat + index.dat so the downloaded chain lands on disk. */
+extern int    store_init(void* st);
+extern int    store_append(void* st, const void* hash, const void* raw, unsigned long long len);
 
 /* C VerifyScript over the ported VM+checksig (asm/bitcoin_scriptverify.c) */
 extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
@@ -349,6 +353,7 @@ int main(int argc, char** argv){
     uint8_t* bob=malloc(1u<<30);
     utxo_init(U,slots,bob,1u<<30);
     void* ST=calloc(1,64); utxo_store_init(ST);
+    void* BS=calloc(1,64); store_init(BS);   /* block archive -> blk%05u.dat + index.dat */
 
     /* ---- connect + handshake ---- */
     unsigned char* rbuf=malloc(8*1024*1024);
@@ -418,6 +423,9 @@ int main(int argc, char** argv){
             int blklen=(int)glen[k];
             /* block gate */
             if(cons_verify(blk, blklen, scr, 1<<22)!=1){ fprintf(stderr,"h%ld BAD cons_verify\n",h); bad_gate++; free(blk); continue; }
+            /* persist the verified block to the on-disk archive (blk%05u.dat + index.dat) */
+            { unsigned char bh[32]; block_hash(bh, blk);
+              if(store_append(BS,bh,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
             /* walk txs */
             unsigned char* txc=blk+80;
             unsigned long long nt; int vv=rd_varint(txc,(unsigned long)(blklen-80),&nt);
