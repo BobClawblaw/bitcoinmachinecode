@@ -222,9 +222,17 @@ static void handle_request(int cfd, const char* body, size_t blen) {
             } else {
                 rj_val* result = NULL; long dec = 0; const char* dem = NULL;
                 int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
+                /* A V2 NOTIFICATION (no id) gets no response whatever the
+                 * method did. This flag used to be set only on the success
+                 * path, so a notification whose method FAILED was answered
+                 * with a full error body -- a spec violation that stayed
+                 * invisible while the only method the tests notified with
+                 * always succeeded. Core decides the same way, after
+                 * execution and regardless of outcome (httprpc.cpp: "Even
+                 * though we do execute notifications, we do not respond to
+                 * them"). */
+                if (v2 && !has_id) is_v2_notification = 1;
                 if (ok) {
-                    /* V2 notifications: no id -> 204 no body */
-                    if (v2 && !has_id) is_v2_notification = 1;
                     reply = build_reply(result, 0, 0, NULL, v2, id, has_id);
                     status = HTTP_OK;
                 } else {
