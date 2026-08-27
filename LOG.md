@@ -7,6 +7,50 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- mempool.dat, both directions
+
+`savemempool` and `importmempool` are real, in Core's format, and the
+interop is proven BOTH ways against a running Core: Core loads the dump this
+node writes, and this node loads the dump Core writes.
+
+FORMAT. uint64 version; for v2 an obfuscation key; uint64 count; then per
+transaction the witness serialization, an int64 entry time and an int64 fee
+delta; then the leftover delta map and the unbroadcast set. We WRITE version
+1 -- not a divergence invented here, it is Core's own `-persistmempoolv1`
+form and Core reads it unconditionally. v2's obfuscation exists to stop
+antivirus software mangling the file, and its key is random, so no writer
+could produce a byte-comparable artifact anyway. We READ both, because a
+file handed to us was most likely written by a default Core.
+
+THE BUG THE INTEROP TEST CAUGHT, and the reason it is worth writing interop
+tests at all. The v2 key is serialized as a VECTOR -- a compact-size length
+prefix, then the bytes -- so the body starts at offset 17, not 16. Core says
+so in a comment ("Use vector serialization for convenient compact size
+prefix"). Reading it as a bare 8-byte key decodes the transaction COUNT
+correctly, because that is 8 bytes at an 8-aligned offset, and then fails on
+the first transaction.
+
+The unit test did not catch it, and the reason is the instructive part: the
+v2 fixture was built by the test itself, from the same wrong assumption the
+reader held. The two agreed and both were wrong. A self-built fixture only
+tests a format if it is built FROM the format. It is now built to Core's
+layout, and the comment says why.
+
+WHERE EACH HALF RUNS. The dump reads the shared pool directly under the same
+lock getrawmempool uses, and writes while still holding it -- the entry
+pointers are into the shared blob, and releasing first would let an eviction
+move the bytes out from under the writer. The load cannot be done in the
+parent: admitting a transaction is the worker's job, so import re-submits
+each one through the channel sendrawtransaction uses and every entry gets
+the full consensus and policy treatment on the way back in. Core
+re-validates on load too.
+
+NOT RESTORED, stated rather than glossed: entry times and fee deltas (a
+re-admitted transaction gets a fresh time, and this node has no
+prioritisetransaction path to replay a delta into), and the unbroadcast set,
+which this node does not track because sendrawtransaction relays to every
+live leg immediately.
+
 ## 2026-08-27 -- package relay: submitpackage, and a child paying for its parent
 
 The point of a package is that a transaction which cannot stand alone gets

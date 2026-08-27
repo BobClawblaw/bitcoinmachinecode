@@ -208,6 +208,17 @@ tables and the writers themselves.
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
   165.7M-coin scale).
+- ~~**Mempool persistence (`savemempool`/`importmempool`)**~~ — **CLOSED
+  2026-08-27.** Core's `mempool.dat`, verified in BOTH directions against a
+  running Core: it loads the dump this node writes, and this node loads the
+  dump it writes. We write version 1 (Core's own `-persistmempoolv1` form,
+  read unconditionally; v2's obfuscation key is random so no writer can
+  produce a byte-comparable artifact) and read both. `importmempool`
+  re-submits each transaction through the normal admission path. Not
+  restored: entry times, fee deltas, and the unbroadcast set — each stated at
+  the call site. *(This item was missing from the 2026-08-27 audit of this
+  list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
+  accurate than what it replaced but not complete.)*
 - **Package relay — PARTLY CLOSED 2026-08-27.** `submitpackage` is real:
   context-free package policy with Core's reason strings, in-package parent
   resolution, and Core's effective feerate, so a parent below the relay floor

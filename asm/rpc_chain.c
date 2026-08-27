@@ -3422,7 +3422,7 @@ static const char* const CHAIN_METHODS[] = {
     "waitforblock","waitforblockheight","waitfornewblock",
     "getblockfilter","scanblocks","getdescriptoractivity",
     "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
-    "savemempool","importmempool","submitheader", NULL
+    "submitheader", NULL
 };
 
 const char* rpc_chain_method_at(int i){
@@ -3921,8 +3921,6 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
         return ch_unsupported(CH_NO_SNAPSHOT_LOAD, ec, em);
     if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
         return ch_unsupported(CH_NO_FORKCHOICE_RPC, ec, em);
-    if (!strcmp(m, "savemempool") || !strcmp(m, "importmempool"))
-        return ch_unsupported(CH_NO_MEMPOOL_FILE, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
