@@ -54,6 +54,16 @@ void rpc_chain_set_undo(long (*replay)(long height,
  * pruned/automatic_pruning/prune_target_size fields. */
 void rpc_chain_set_prune_mib(long mib);
 
+/* getblocktemplate BIP23 proposal evaluation (daemon injects rpc_node's
+ * staging helper; NULL => refused as unavailable). fn returns 1 valid /
+ * 0 reason filled / -2 decode / -3 timeout / -1 unavailable. */
+void rpc_chain_set_proposal(long (*fn)(const char* hex, char* reason, unsigned long rcap));
+
+/* Runtime chain selection (daemon/chainparams.c). Defaults are mainnet;
+ * the daemon calls this once after chainparams_select(). `name` must point
+ * at storage that outlives the RPC server (chainparams' names are static). */
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting);
+
 /* What `stop` does after building its reply. Default: SIGTERM to self (the
  * rpcd main loop's handler shuts the server down). Tests install a no-op. */
 void rpc_chain_set_stop_handler(void (*fn)(void));

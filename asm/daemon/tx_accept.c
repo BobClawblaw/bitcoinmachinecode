@@ -27,6 +27,7 @@
 #include <time.h>
 #include <stdint.h>
 #include "log_ts.h"
+#include "node_config.h"
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -270,6 +271,110 @@ static int txacc_resolve_verify(void* mp_area, const u8 outpoint[36], u32 index,
     return 0;
 }
 
+/* ---- exact BIP141 sigop cost (Core GetTransactionSigOpCost) ---------------
+ * legacy (scriptSig+outputs, inaccurate-20 multisig) x4, plus P2SH redeem
+ * (accurate) x4, plus witness sigops x1 (P2WPKH=1, P2WSH=accurate count of
+ * the last witness item; v1+ taproot = 0), resolving each prevout script the
+ * same way the verifier does (confirmed set, then mempool parents). Computed
+ * ONCE at accept time and stored in the policy registry
+ * (mpool_policy_set_sigops) so getblocktemplate reports Core's number, not a
+ * lower bound. Returns the cost, or -1 if a prevout cannot be resolved
+ * (callers skip the stamp; the template then falls back to legacy x4). */
+extern long tx_legacy_sigops(const u8*, unsigned long);
+extern long script_sigops_accurate(const u8*, unsigned long);
+extern long mpool_policy_set_sigops(void*, const u8 txid[32], unsigned int);
+
+static int sgc_last_push(const u8* sc, unsigned long sl, const u8** out, unsigned long* outl){
+    const u8* p = sc; const u8* end = sc + sl;
+    const u8* last = 0; unsigned long lastl = 0;
+    while (p < end){
+        u8 op = *p++;
+        unsigned long n;
+        if (op <= 0x4b) n = op;
+        else if (op == 0x4c){ if (p >= end) return 0; n = *p++; }
+        else if (op == 0x4d){ if (p+2 > end) return 0; n = (unsigned long)p[0] | ((unsigned long)p[1]<<8); p += 2; }
+        else if (op == 0x4e){ if (p+4 > end) return 0; n = (unsigned long)p[0]|((unsigned long)p[1]<<8)|((unsigned long)p[2]<<16)|((unsigned long)p[3]<<24); p += 4; }
+        else if (op <= 0x60) { last = p; lastl = 0; continue; }  /* OP_1NEGATE/OP_N: not data we need */
+        else return 0;                                            /* not push-only */
+        if ((unsigned long)(end - p) < n) return 0;
+        last = p; lastl = n; p += n;
+    }
+    if (!last) return 0;
+    *out = last; *outl = lastl;
+    return 1;
+}
+
+static long sgc_witness_sigops(int wver, const u8* prog, unsigned long proglen,
+                               const u8* wit_last, unsigned long wit_lastl){
+    if (wver == 0){
+        if (proglen == 20) return 1;                              /* P2WPKH */
+        if (proglen == 32 && wit_last)                            /* P2WSH  */
+            return script_sigops_accurate(wit_last, wit_lastl);
+        return 0;
+    }
+    return 0;                                                     /* v1+ */
+}
+
+static long txacc_sigop_cost(void* mp_area, const u8* tx, unsigned long txlen){
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (txlen < 10) return -1;
+    p += 4;
+    int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
+    if (segwit) p += 2;
+    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc || nin == 0 || nin > 100000) return -1;
+    struct { const u8* prev; u32 idx; const u8* ss; unsigned long ssl; } in[512];
+    if (nin > 512) return -1;                                     /* far above standardness */
+    for (u64 i = 0; i < nin; i++){
+        if ((unsigned long)(end - p) < 36) return -1;
+        in[i].prev = p; memcpy(&in[i].idx, p+32, 4); p += 36;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return -1;
+        in[i].ss = p; in[i].ssl = (unsigned long)sl; p += sl;
+        if ((unsigned long)(end - p) < 4) return -1;
+        p += 4;
+    }
+    u64 nout = txacc_varint(&p, end, &cc); if (!cc) return -1;
+    for (u64 i = 0; i < nout; i++){
+        if ((unsigned long)(end - p) < 8) return -1;
+        p += 8;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return -1;
+        p += sl;
+    }
+    /* witness stacks: remember each input's LAST item (the witnessScript) */
+    const u8* wlast[512]; unsigned long wlastl[512];
+    for (u64 i = 0; i < nin; i++){ wlast[i] = 0; wlastl[i] = 0; }
+    if (segwit){
+        for (u64 i = 0; i < nin; i++){
+            u64 nitem = txacc_varint(&p, end, &cc); if (!cc) return -1;
+            for (u64 k = 0; k < nitem; k++){
+                u64 il = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < il) return -1;
+                wlast[i] = p; wlastl[i] = (unsigned long)il; p += il;
+            }
+        }
+    }
+
+    long cost = tx_legacy_sigops(tx, txlen) * 4;
+    for (u64 i = 0; i < nin; i++){
+        u64 v, h, cb; const u8* spk; unsigned long spkl;
+        if (!txacc_resolve_verify(mp_area, in[i].prev, in[i].idx, &v, &h, &cb, &spk, &spkl))
+            return -1;
+        int is_p2sh = (spkl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87);
+        const u8* red = 0; unsigned long redl = 0;
+        if (is_p2sh && in[i].ssl &&
+            sgc_last_push(in[i].ss, in[i].ssl, &red, &redl) && red)
+            cost += script_sigops_accurate(red, redl) * 4;
+        /* witness program: direct, or via the P2SH redeem */
+        const u8* ws = spk; unsigned long wsl = spkl;
+        if (is_p2sh){ ws = red; wsl = redl; }
+        if (ws && wsl >= 4 && wsl <= 42 &&
+            (ws[0] == 0x00 || (ws[0] >= 0x51 && ws[0] <= 0x60)) &&
+            (unsigned long)ws[1] + 2 == wsl && ws[1] >= 2 && ws[1] <= 40){
+            int wver = ws[0] == 0x00 ? 0 : ws[0] - 0x50;
+            cost += sgc_witness_sigops(wver, ws + 2, ws[1], wlast[i], wlastl[i]);
+        }
+    }
+    return cost;
+}
+
 /* One entry for all three accept paths. Returns 1 ok, else 0 with *rout. */
 static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                                const char** rout){
@@ -317,9 +422,30 @@ extern void mp_unlock(void);
 
 /* tx_policy_init(void) -> 1 ok / 0 failed. Called once per connection
  * alongside tx_dispatch_init. */
+/* stamp the registry after a successful accept (holds mp_lock briefly) */
+static void txacc_note_sigops(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen){
+    long c = txacc_sigop_cost(mp_area, tx, txlen);
+    if (c < 0) return;                 /* unresolvable: leave 0 (fallback) */
+    mp_lock();
+    mpool_policy_set_sigops(g_pol_state, txid, (unsigned int)c);
+    mp_unlock();
+}
+
 int tx_policy_init(void){
-    mpool_policy_init(g_pol, TXACC_RELAY_FEE_RATE, TXACC_MAX_ANC, TXACC_MAX_ANC_BYTES,
-                      TXACC_MAX_DESC, TXACC_MAX_DESC_BYTES, TXACC_RBF_ENABLED);
+    /* config-driven where Core exposes the knob (defaults match Core's own);
+     * falls back to the compiled defaults if the config layer is absent (a
+     * standalone test that never calls node_config_load). */
+    extern node_config_t g_cfg;
+    unsigned long long relay = g_cfg.minrelaytxfee_satvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satvb : TXACC_RELAY_FEE_RATE;
+    unsigned anc  = g_cfg.limitancestorcount   > 0 ? (unsigned)g_cfg.limitancestorcount   : TXACC_MAX_ANC;
+    unsigned ancb = g_cfg.limitancestorsize_kvb> 0 ? (unsigned)(g_cfg.limitancestorsize_kvb*1000) : TXACC_MAX_ANC_BYTES;
+    unsigned dsc  = g_cfg.limitdescendantcount > 0 ? (unsigned)g_cfg.limitdescendantcount : TXACC_MAX_DESC;
+    unsigned dscb = g_cfg.limitdescendantsize_kvb>0? (unsigned)(g_cfg.limitdescendantsize_kvb*1000): TXACC_MAX_DESC_BYTES;
+    unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
+    mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
+    { extern void mpool_policy_set_incremental(void*, unsigned long long);
+      if (g_cfg.incrementalrelayfee_satvb > 0)
+          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb); }
     if (mp_ext_polstate){
         /* shared, already mpool_policy_state_init'd once pre-fork -- adopting
          * it (NOT re-initing) is what keeps fee bookkeeping coherent across
@@ -413,6 +539,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
         return 0;
     }
     g_alog.acc++;
+    txacc_note_sigops(mp_area, txid, tx, txlen);
     /* Stamp arrival so -mempoolexpiry can evict it later. The mempool slot
      * format has no timestamp field, so this parallel record is what makes
      * expiry possible without changing the slot layout. */
@@ -446,6 +573,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     mp_unlock();
     if (padd != 1){ g_alog.rej_policy++; return -26; }
     g_alog.acc++;
+    txacc_note_sigops(mp_area, txid, tx, txlen);
     mempool_note_accept(txid);
     zmqn_tx_accepted(txid, tx, txlen);
     return 1;
@@ -482,6 +610,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
         if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
         return -26;
     }
+    txacc_note_sigops(mp_area, txid, tx, txlen);
     mempool_note_accept(txid);
     zmqn_tx_accepted(txid, tx, txlen);
     return 1;

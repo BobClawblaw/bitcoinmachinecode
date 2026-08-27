@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 #include <stddef.h>
 
 /* ---------------- asm glue (declared; resolved at link) ------------------- */
@@ -45,6 +46,7 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
 extern long mpool_put(void* mp, const unsigned char txid[32],
                       const unsigned char* tx, unsigned long txlen);
 extern long mpool_del(void* mp, const unsigned char txid[32]);
+extern void mpool_compact(void* mp);   /* daemon/mempool_compact.c -- reclaim freed blob bytes */
 extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                       unsigned long* out_len);
 
@@ -76,12 +78,15 @@ typedef struct { unsigned char txid[32]; uint32_t index; uint32_t _p; uint64_t v
 /* claim entry: a prevout already consumed by an accepted mempool tx
  *   [0..31] prevout txid, [32..35] index, [36..39] claimer tx index (40 bytes) */
 typedef struct { unsigned char prev[32]; uint32_t index; uint32_t claimer; } mpol_claim;
-/* tx node: graph/limits info for an accepted tx (112 bytes)                 */
+/* tx node: graph/limits info for an accepted tx                             */
 typedef struct {
     unsigned char txid[32];
     uint64_t size, fee;
     uint32_t anc_cnt, anc_bytes;
     uint32_t desc_cnt, desc_bytes;
+    uint32_t sigop_cost;       /* BIP141 sigop cost (x4 units), set post-add
+                                  by mpool_policy_set_sigops -- accept-time
+                                  data the RPC template reads back exactly   */
     uint32_t n_parents;
     uint32_t parent[MPOL_MAX_PARENTS];
 } mpol_node;
@@ -101,6 +106,13 @@ static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)s
 /* ========================================================================== */
 /* public API                                                                 */
 /* ========================================================================== */
+
+/* TrimToSize eviction helpers (defined below, used by mpool_policy_add) */
+static int fr_less(const mpol_node* a, const mpol_node* b);
+static int fr_incoming_le(uint64_t fee, uint64_t txlen, const mpol_node* n);
+static int lowest_feerate_leaf(void* st);
+static void evict_leaf(void* st, void* mp, int ci);
+static void mpol_set_minfee(void* st, uint64_t satvb);
 
 /* size of one policy-state buffer holding up to `n` transactions */
 size_t mpool_policy_state_size(unsigned n){
@@ -127,6 +139,13 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->max_desc_bytes  = max_desc_bytes;
     pol->rbf_enabled     = rbf_enabled;
     pol->incremental_fee = relay_fee_rate * 1000;  /* 1KB at relay rate */
+}
+
+/* Core -incrementalrelayfee, set independently of the min relay fee.
+ * `satvb` is sat/vByte; incremental_fee is the sat cost of 1 kvB. */
+void mpool_policy_set_incremental(void* polv, unsigned long long satvb){
+    mpol_cfg* pol = (mpol_cfg*)polv;
+    if (satvb > 0) pol->incremental_fee = satvb * 1000;
 }
 
 uint64_t mpool_policy_estimate_feerate(void* st){
@@ -274,6 +293,12 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     /* min relay feerate floor: fee >= txlen * relay_fee_rate */
     if (fee < (uint64_t)txlen * pol->relay_fee_rate){
         _mpol_last_reason = "fee below min relay fee"; return 0; }
+    /* dynamic mempool minimum (rises under congestion via eviction, st+48):
+     * a tx paying below the current floor cannot survive TrimToSize, so
+     * reject it up front -- Core's mempoolminfee gate. */
+    { uint64_t floor = *(uint64_t*)((char*)st+48);
+      if (floor > 0 && fee < (uint64_t)txlen * floor){
+          _mpol_last_reason = "mempool min fee not met"; return 0; } }
 
     /* --- duplicate check --- */
     if (find_node(st, txid) >= 0){ _mpol_last_reason = "duplicate tx"; return 0; }
@@ -404,7 +429,34 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         }
     }
 
-    if (mpool_put(mp, txid, tx, txlen) != 1){ _mpol_last_reason = "mempool store failed"; return 0; }
+    { long put = mpool_put(mp, txid, tx, txlen);
+      if (put == 2){
+          /* pool full: TrimToSize -- evict lowest-feerate leaves until the
+           * incoming tx fits, refusing to evict anything paying as much or
+           * more (that would drop a better tx for a worse one). */
+          mpol_node* t2 = mpol_nodes_base(st);
+          uint64_t last_evicted = 0;
+          while (put == 2){
+              int v = lowest_feerate_leaf(st);
+              if (v < 0) break;                         /* nothing to evict */
+              if (fr_incoming_le(fee, txlen, &t2[v])){
+                  /* incoming does not beat the cheapest evictable tx: it is
+                   * below the effective minimum -- raise the floor and reject */
+                  mpol_set_minfee(st, ((uint64_t)t2[v].fee / (t2[v].size ? t2[v].size : 1))
+                                      + pol->incremental_fee / 1000);
+                  _mpol_last_reason = "mempool full; fee below eviction threshold";
+                  return 0;
+              }
+              last_evicted = (uint64_t)t2[v].fee / (t2[v].size ? t2[v].size : 1);
+              evict_leaf(st, mp, v);
+              mpool_compact(mp);            /* reclaim the freed blob bytes so the retry can store */
+              t2 = mpol_nodes_base(st);
+              put = mpool_put(mp, txid, tx, txlen);
+          }
+          if (put == 1)
+              mpol_set_minfee(st, last_evicted + pol->incremental_fee / 1000);
+      }
+      if (put != 1){ _mpol_last_reason = "mempool store failed"; return 0; } }
 
     /* 2. add outreg entries for outputs (re-walk outputs after inputs) */
     /*    (we already sum_out; re-walk to get per-output index + value)      */
@@ -471,6 +523,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         t2[myidx].anc_bytes = (uint32_t)anc_bytes;
         t2[myidx].desc_cnt = 1;
         t2[myidx].desc_bytes = (uint32_t)txlen;
+        t2[myidx].sigop_cost = 0;
         t2[myidx].n_parents = (uint32_t)n_par;
         for (int k=0;k<MPOL_MAX_PARENTS;k++)
             t2[myidx].parent[k] = 0xFFFFFFFFu;
@@ -500,6 +553,84 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
 
 /* The committing accept path -- unchanged behaviour, one caller-visible
  * function, so nothing that used mpool_policy_add sees a difference. */
+/* ================= TrimToSize eviction (Core -maxmempool behaviour) =========
+ * When mpool_put reports the pool full, evict the lowest-feerate LEAF
+ * transactions (a leaf has no in-mempool descendants, so removing it never
+ * orphans another entry) until the incoming tx fits -- unless the incoming
+ * tx's feerate does not beat what it would evict, in which case it is
+ * rejected as below the dynamic minimum. The last evicted feerate becomes
+ * the pool's dynamic mempoolminfee floor (st+48).
+ *
+ * DIVERGENCE, stated: Core evicts whole descendant PACKAGES by descendant
+ * feerate; this evicts individual lowest-feerate leaves. For entries with no
+ * in-mempool children (the vast majority) the two coincide; for chains it
+ * removes the cheapest leaf first and works inward -- always dropping the
+ * cheapest fee-paying data and always making progress. */
+static int fr_less(const mpol_node* a, const mpol_node* b){
+    return (unsigned __int128)a->fee * b->size < (unsigned __int128)b->fee * a->size;
+}
+static int fr_incoming_le(uint64_t fee, uint64_t txlen, const mpol_node* n){
+    return (unsigned __int128)fee * n->size <= (unsigned __int128)n->fee * txlen;
+}
+static int lowest_feerate_leaf(void* st){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    int best = -1;
+    for (uint32_t i=0;i<n;i++){
+        if (t[i].desc_cnt > 1) continue;   /* leaf: only itself as descendant */
+        if (best < 0 || fr_less(&t[i], &t[best])) best = (int)i;
+    }
+    return best;
+}
+static void decr_ancestors(void* st, int ci, uint32_t sz){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    static uint8_t seen[1u<<20];
+    if (n > (1u<<20)) return;
+    memset(seen, 0, n);
+    uint32_t stack[512]; int sp = 0;
+    for (uint32_t k=0;k<t[ci].n_parents && sp<512;k++){
+        uint32_t p = t[ci].parent[k];
+        if (p < n && !seen[p]){ seen[p]=1; stack[sp++]=p; }
+    }
+    while (sp){
+        uint32_t a = stack[--sp];
+        if (t[a].desc_cnt) t[a].desc_cnt--;
+        if (t[a].desc_bytes >= sz) t[a].desc_bytes -= sz; else t[a].desc_bytes = 0;
+        for (uint32_t k=0;k<t[a].n_parents && sp<512;k++){
+            uint32_t p = t[a].parent[k];
+            if (p < n && !seen[p]){ seen[p]=1; stack[sp++]=p; }
+        }
+    }
+}
+static void evict_leaf(void* st, void* mp, int ci){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t* nptr = (uint32_t*)((char*)st+16);
+    unsigned char ct[32]; memcpy(ct, t[ci].txid, 32);
+    uint32_t sz = t[ci].size;
+    decr_ancestors(st, ci, sz);
+    mpool_del(mp, ct);
+    { mpol_claim* c = mpol_claims_base(st);
+      uint32_t* ncl = (uint32_t*)((char*)st+12);
+      for (uint32_t i=0;i<*ncl;){ if (c[i].claimer==(uint32_t)ci){ c[i]=c[*ncl-1]; (*ncl)--; } else i++; } }
+    { mpol_out* o = mpol_outreg_base(st);
+      uint32_t* no = (uint32_t*)((char*)st+8);
+      for (uint32_t i=0;i<*no;){ if (memcmp(o[i].txid,ct,32)==0){ o[i]=o[*no-1]; (*no)--; } else i++; } }
+    uint32_t last = *nptr - 1;
+    t[ci] = t[last];
+    (*nptr)--;
+    if ((uint32_t)ci == last) return;
+    uint32_t n = *nptr;
+    for (uint32_t j=0;j<n;j++)
+        for (uint32_t k=0;k<t[j].n_parents;k++)
+            if (t[j].parent[k]==last) t[j].parent[k]=(uint32_t)ci;
+    { mpol_claim* c = mpol_claims_base(st);
+      uint32_t ncl = *(uint32_t*)((char*)st+12);
+      for (uint32_t i=0;i<ncl;i++) if (c[i].claimer==last) c[i].claimer=(uint32_t)ci; }
+}
+static void mpol_set_minfee(void* st, uint64_t satvb){ *(uint64_t*)((char*)st+48) = satvb; }
+uint64_t mpool_policy_min_fee(void* st){ return *(uint64_t*)((char*)st+48); }
+
 long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
                       const unsigned char* tx, unsigned long txlen,
                       const unsigned char txid[32], void* utxo){
@@ -538,6 +669,19 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
     return 0;
 }
 
+/* Record a tx's exact BIP141 sigop cost (x4 units) after acceptance.
+ * tx_accept.c computes it with the prevout scripts in hand (P2SH redeem +
+ * witness portions need them); the GBT template reads it back through
+ * mpool_policy_entry_info. Caller holds mp_lock. */
+long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    for (uint32_t i = n; i > 0; i--)
+        if (!memcmp(t[i-1].txid, txid, 32)){ t[i-1].sigop_cost = cost; return 1; }
+    return 0;
+}
+
 /* ---- getmempoolentry support (2026-08-25) ---------------------------------
  * Snapshot one tx's graph neighborhood into the POD bridge struct
  * (mempool_entry.h). Callers hold mp_lock. Walks by node INDEX (children
@@ -564,6 +708,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     memset(out, 0, sizeof *out);
     out->fee  = t[self].fee;
     out->size = t[self].size;
+    out->sigop_cost = t[self].sigop_cost;
 
     /* direct parents */
     for (uint32_t k=0; k<t[self].n_parents && out->n_depends<MPE_MAX_SET; k++){
@@ -586,6 +731,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     /* transitive ancestors incl self (BFS over parent edges, by index) */
     { uint32_t stack[MPE_MAX_SET]; int sp=0; 
       memcpy(out->anc[out->n_anc++], t[self].txid, 32); out->anc_fee = t[self].fee;
+      out->anc_size = t[self].size;
       stack[sp++] = (uint32_t)self;
       while (sp > 0){
           uint32_t cur = stack[--sp];
@@ -595,6 +741,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
               if (out->n_anc >= MPE_MAX_SET) break;
               memcpy(out->anc[out->n_anc++], t[p].txid, 32);
               out->anc_fee += t[p].fee;
+              out->anc_size += t[p].size;
               if (sp < MPE_MAX_SET) stack[sp++] = p;
           }
       } }

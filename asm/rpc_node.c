@@ -485,7 +485,14 @@ static int cmd_getmempoolinfo(rj_val** res){
     rj_obj_set(o, "usage", rj_numf("%llu", blob_used + (unsigned long long)count*48));
     rj_obj_set(o, "total_fee", rj_numf("%llu.%08llu", total_fee/100000000ULL, total_fee%100000000ULL));
     rj_obj_set(o, "maxmempool", rj_numf("%lld", g_mph.maxbytes > 0 ? g_mph.maxbytes : MEMPOOL_MAXBYTES));
-    rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    /* mempoolminfee is the DYNAMIC effective floor: max of the static relay
+     * fee and the eviction-raised floor (mpool_policy_min_fee, sat/vByte ->
+     * BTC/kvB). It rises under congestion exactly as Core's does. */
+    { double dyn_btc = 0.0;
+      if (g_mph.polstate && g_mph.min_fee){ unsigned long long satvb = g_mph.min_fee(g_mph.polstate);
+                           dyn_btc = (double)satvb / 1e5; }
+      double eff = dyn_btc > MEMPOOL_MINFEE_BTC ? dyn_btc : MEMPOOL_MINFEE_BTC;
+      rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", eff)); }
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
@@ -1022,47 +1029,68 @@ static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, co
  * honest timeout (-4), never a fabricated verdict. */
 #define SBK_WAIT_MS   90000
 #define SBK_POLL_US   3000
-static int cmd_submitblock(const rj_val* params, rj_val** res, long* ec, const char** em){
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
-        params->items[0]->typ != RJ_STR){
-        *ec = -1; *em = "submitblock requires a hex block"; return 0; }
-    const char* hex = params->items[0]->str;
+/* Shared stager for submitblock AND getblocktemplate's proposal mode: hex ->
+ * the cross-process channel, wait for the worker's ack. Returns 1 result-ok
+ * (result/reason filled), -2 decode, -1 unavailable, -3 timeout. */
+static long sbk_stage(const char* hex, int proposal, int* result,
+                      char* reason, unsigned long rcap){
     size_t hl = strlen(hex);
-    if ((hl & 1) || hl/2 < 81 || hl/2 > RPC_BLKSUBMIT_MAX){
-        *ec = -22; *em = "Block decode failed"; return 0; }
+    if ((hl & 1) || hl/2 < 81 || hl/2 > RPC_BLKSUBMIT_MAX) return -2;
     unsigned long n = (unsigned long)(hl/2);
-    if (!g_status_rw){ *ec = -4; *em = "Block submission unavailable (no download worker)"; return 0; }
+    if (!g_status_rw) return -1;
 
     pthread_mutex_lock(&g_submit_lock);
     node_status_t* st = g_status_rw;
     for (unsigned long i = 0; i < n; i++){
         int hi = srt_hex1(hex[i*2]), lo = srt_hex1(hex[i*2+1]);
-        if (hi < 0 || lo < 0){ pthread_mutex_unlock(&g_submit_lock);
-            *ec = -22; *em = "Block decode failed"; return 0; }
+        if (hi < 0 || lo < 0){ pthread_mutex_unlock(&g_submit_lock); return -2; }
         st->blk_submit_buf[i] = (unsigned char)((hi<<4)|lo);
     }
     st->blk_submit_len = n;
     st->blk_submit_result = 0;
+    st->blk_submit_proposal = proposal;
     st->blk_submit_reason[0] = 0;
     unsigned long long myseq = st->blk_submit_seq + 1;
     __sync_synchronize();
     st->blk_submit_seq = myseq;
 
-    int waited = 0, done = 0, result = 0;
-    static char reason[64];
-    reason[0] = 0;
+    int waited = 0, done = 0;
     while (waited < SBK_WAIT_MS*1000){
         if (st->blk_submit_ack == myseq){
-            result = st->blk_submit_result;
-            memcpy(reason, (const void*)st->blk_submit_reason, sizeof reason);
-            reason[sizeof reason - 1] = 0;
+            *result = st->blk_submit_result;
+            if (reason && rcap){
+                unsigned long rl = rcap < sizeof st->blk_submit_reason ? rcap : sizeof st->blk_submit_reason;
+                memcpy(reason, (const void*)st->blk_submit_reason, rl);
+                reason[rl - 1] = 0;
+            }
             done = 1; break;
         }
         struct timespec ts = {0, SBK_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SBK_POLL_US;
     }
     pthread_mutex_unlock(&g_submit_lock);
-    if (!done){ *ec = -4; *em = "Block submission timed out (node may be catching up)"; return 0; }
+    return done ? 1 : -3;
+}
+
+/* rpc_chain's getblocktemplate proposal hook (rpc_chain_set_proposal).
+ * 1 valid / 0 reason / -2 decode / -3 timeout / -1 unavailable. */
+long rpc_node_submit_proposal(const char* hex, char* reason, unsigned long rcap){
+    int result = 0;
+    long r = sbk_stage(hex, 1, &result, reason, rcap);
+    if (r != 1) return r;
+    return result == 1 ? 1 : 0;
+}
+
+static int cmd_submitblock(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_STR){
+        *ec = -1; *em = "submitblock requires a hex block"; return 0; }
+    int result = 0;
+    static char reason[64]; reason[0] = 0;
+    long r = sbk_stage(params->items[0]->str, 0, &result, reason, sizeof reason);
+    if (r == -2){ *ec = -22; *em = "Block decode failed"; return 0; }
+    if (r == -1){ *ec = -4; *em = "Block submission unavailable (no download worker)"; return 0; }
+    if (r == -3){ *ec = -4; *em = "Block submission timed out (node may be catching up)"; return 0; }
     if (result == 1){ *res = rj_null(); return 1; }          /* Core: null */
     *res = rj_str(reason[0] ? reason : "rejected");
     return 1;

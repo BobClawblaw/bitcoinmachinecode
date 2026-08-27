@@ -127,6 +127,9 @@ typedef struct {
     volatile unsigned long long blk_submit_ack;
     volatile unsigned long      blk_submit_len;
     volatile int                blk_submit_result;
+    volatile int                blk_submit_proposal; /* 1 = BIP23 proposal:
+                                   evaluate fully (PoW excepted) but NEVER
+                                   connect; result/reason as for submit */
     char                        blk_submit_reason[64];
     unsigned char               blk_submit_buf[RPC_BLKSUBMIT_MAX];
 
@@ -192,6 +195,7 @@ typedef struct {
     long (*estimate)(void*, unsigned long long*,
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
+    unsigned long long (*min_fee)(void*);   /* dynamic mempoolminfee, sat/vByte (polstate) */
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 

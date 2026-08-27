@@ -378,3 +378,4 @@ asm/tests/test_txv_cs_maxsize
 # Built from Bitcoin Core's tree (40MB, links its consensus libs); the
 # recipe lives in core_verify_oracle.cpp's header comment.
 validation/core_verify_oracle
+regtest-e2e/

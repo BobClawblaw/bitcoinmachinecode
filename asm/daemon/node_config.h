@@ -52,7 +52,18 @@ typedef struct {
     int  connect_timeout_ms;     /* Core -timeout    (def 5000ms)            */
     int  peer_timeout_s;         /* Core -peertimeout(def 60s)               */
     int  port;                   /* Core -port                               */
+    int  port_explicit;          /* 1 = port= appeared in the config file, so
+                                    chain selection must NOT re-default it   */
+    char chain[16];              /* Core -chain: "main" (default), "regtest".
+                                    Stored here; main.c passes it to
+                                    chainparams_select() (daemon/chainparams.c
+                                    -- node_config.c itself stays free of that
+                                    link dependency, it is compiled into many
+                                    tools that never select a chain).        */
     int  listen;                 /* Core -listen                             */
+    int  addrindex;              /* EXTENSION (no Core equivalent): live
+                                    address index, daemon/addr_index_tail.c.
+                                    Default 0; must be on before IBD.        */
     int  blocksonly;
     char signer[512];   /* external signer command (Core -signer / HWI); "" = none */             /* Core -blocksonly: no tx relay            */
     /* Core -zmqpub<topic>=<address>. One address per topic; topics sharing an
@@ -68,6 +79,15 @@ typedef struct {
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
     long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
+    /* mempool policy limits (Core exposes each of these). Fees are stored in
+     * sat/vByte (Core's config is BTC/kvB; parsed at the boundary). */
+    long minrelaytxfee_satvb;    /* Core -minrelaytxfee (default 1 sat/vB)   */
+    long incrementalrelayfee_satvb; /* Core -incrementalrelayfee (default 1) */
+    long limitancestorcount;     /* Core -limitancestorcount (default 25)    */
+    long limitancestorsize_kvb;  /* Core -limitancestorsize (kvB, default 101)*/
+    long limitdescendantcount;   /* Core -limitdescendantcount (default 25)  */
+    long limitdescendantsize_kvb;/* Core -limitdescendantsize (kvB, def 101) */
+    int  mempoolfullrbf;         /* Core -mempoolfullrbf (default 1)         */
 
     /* ---- peer sourcing (Core -dnsseed/-seednode/-addnode/-connect) ----
      * Until now the DNS seed list was compiled in and there was no way to

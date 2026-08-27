@@ -7,6 +7,312 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Live address index (EXTENSION): addrindex=1, getaddressbalance/getaddresstxids
+
+FEATURE_GAPS' "build_addr_index.c is an offline batch tool only" item is
+closed: the daemon now maintains a LIVE address index at the same new-block
+choke point as the txid/filter tails, config-gated by addrindex=1 (default
+OFF -- Bitcoin Core has NO address index; this is a deliberate extension in
+the old addrindex-patch spirit, and every surface says so).
+
+SHARED CLASSIFIER (daemon/addr_index_fmt.h): the script->address-key
+classification moved out of build_addr_index.c into one header the offline
+builder and the live tail both compile -- the two indexes structurally
+cannot disagree about what an address is (the node_config.c duplicate-parser
+lesson applied preemptively).
+
+LIVE JOURNAL (daemon/addr_index_tail.c): addrindex.tail, fixed 82-byte
+records, strictly height-ascending, one write(2) per block. ADDs from the
+block's own outputs; DELs from that block's undo records (the only place a
+spent output's script still exists -- bfilter_index.c's registered
+undo_replay pattern, same link-layering reason); TOUCHes carry the SPENDING
+tx's txid so history can name spends (a DEL's txid field must hold the spent
+outpoint to cancel its ADD). Torn final records truncate back onto the grid;
+reorgs truncate by height from the file end -- unlike the txid tail these
+records are NOT self-verifying against the archive, so stale ones must be
+physically removed. Coverage is from genesis: enabling addrindex on an
+already-synced node cannot recover spends below the undo retention window,
+so boot REFUSES loudly instead of building an index that lies (the honest
+form of old-Core's "-txindex requires -reindex").
+
+RPCs (rpc_chain.c, EXTENSIONS): getaddressbalance -> {balance, received,
+utxos} and getaddresstxids -> deduplicated funder+spender txids, accepting a
+string, an array, or the addrindex patch's {"addresses":[...]}; the
+disabled-state error says exactly how to enable. getindexinfo gains an
+"addressindex" entry alongside the real Core indexes.
+
+PROVEN against Core ground truth (private netns, isolated regtest pair,
+31/31): balances and utxo counts equal scantxoutset TO THE SATOSHI for
+legacy/P2SH-segwit/bech32/bech32m; an exact-outpoint spend drives balance to
+0 while received stays and the spender's txid appears; multi-address and
+object forms sum correctly; invalid address -> -5. The first run of that
+harness produced a real agreement the harness itself misread: Core's miner
+wallet respent a freshly-funded output mid-test and BOTH sides reported the
+resulting zero balance -- the assertion was wrong, not the index.
+tests/test_addr_index_tail (15 checks) covers the journal semantics
+hermetically. Full make -k test green: 190 suites.
+## 2026-08-27 -- Mining polish: ancestor-package templates, exact sigops, BIP23 proposals, longpoll
+
+getblocktemplate closes its four documented gaps against Core (stratum stays
+out of scope -- a pool-facing protocol, not a Core RPC).
+
+ANCESTOR-PACKAGE SELECTION (rpc_chain.c): template txs are now chosen by
+Core's addPackageTxs rule -- repeatedly take the candidate whose ancestor
+package (its not-yet-selected in-pool ancestors + itself) has the highest
+package feerate, emit it parents-first, under Core's weight/sigop budgets
+(4M/80k minus the 4000/400 coinbase reservation). CPFP falls out: a high-fee
+child lifts its cheap parent in ahead of better standalone txs. The policy
+bridge grew anc_size (summed in the same BFS as anc_fee) to make the package
+feerate computable. Unit-proven in test_rpc_chain: a 3-tx pool laid out
+[M, P, C] in slot order (the old emitter's order) must template as [P, C, M]
+with C.depends=[P] and coinbasevalue carrying all 7000 sat of fees.
+Divergence, documented at the call site: score-equal ties break by txid, not
+Core's internal iterator order.
+
+EXACT SIGOPS: the template's per-tx "sigops" was a legacy-x4 lower bound
+(no prevout view at render time). Now the BIP141 cost -- legacy x4 + P2SH
+redeem (accurate) x4 + witness x1 (P2WPKH=1, P2WSH=accurate over the last
+witness item, v1+ = 0) -- is computed ONCE at accept time in tx_accept.c,
+where the resolver has every prevout script in hand, and stored in the
+policy registry node (mpool_policy_set_sigops); the template reads it back.
+Registry nodes without the stamp fall back to the old lower bound.
+
+BIP23 PROPOSAL MODE: getblocktemplate {"mode":"proposal","data":...}
+evaluates through the worker's submitblock staging channel with a proposal
+flag: PoW is NOT checked (Core TestBlockValidity fCheckPOW=false -- the
+template is unmined), prev != tip answers Core's exact
+"inconclusive-not-best-prevblk", and a valid proposal NEVER connects.
+blk_submit_evaluate grew a check_pow parameter (the old entry delegates).
+
+LONGPOLL: templates already carried longpollid (tiphash+counter); a request
+CARRYING one now blocks until the tip moves. The RPC server's accept loop is
+deliberately serial, so a longpoll request is handed to a detached waiter
+thread that polls the tip through a shared-state-free primitive (pread of
+index.dat's last record) and re-enters the SERIAL path through the new
+handler mutex only after the tip differs from the longpollid's embedded
+prev-hash (or 60s). Divergence, documented: Core also wakes on substantial
+mempool change; this wakes on tip change/timeout only.
+
+MINED-TX PRUNE (found by the differential, fixed because templates depend on
+it): the normal block-apply path never removed CONFIRMED txs from the shared
+mempool -- only the reorg reconnect path did. bmc's pool held 11 long-mined
+txs the oracle had dropped, and any of them would have made a template
+double-spend. utxo_live.c now fires a mined-tx callback per applied block's
+txids; the worker's hook mpool_del's them from the shared pool under the
+cross-process lock (the policy registry keeps its stale nodes by design --
+every reader already filters against the pool).
+
+DIFFERENTIAL (vs the scratch Core regtest oracle, 15/15): identical template
+tx sets and per-tx fees; per-tx sigops identical INCLUDING a P2SH
+0-of-1-CHECKMULTISIG spend (cost 4) and a P2WSH 0-of-2 spend (cost 2);
+parent-before-child on both nodes for a CPFP pair; equal coinbasevalue;
+valid proposal -> null on BOTH nodes, corrupted merkle ->
+"bad-txnmrklroot" on both, corrupted prev -> "inconclusive-not-best-prevblk"
+on both (verbatim); a longpoll pending at 4s returned only after the next
+block with the new height; both pools empty after the mine (the prune,
+live).
+## 2026-08-27 -- Wallet management: multi-wallet, watch-only descriptors, Branch-and-Bound
+
+The last big parity category. Three pieces, each riding machinery that
+already existed rather than growing a parallel copy.
+
+MULTI-WALLET (rpc_wallet_ops.c): createwallet / loadwallet / unloadwallet /
+restorewallet / listwallets / listwalletdir are real. Named wallets live
+under wallets/<name>/ beneath the data root (Core's own layout); the default
+wallet stays at the legacy root path, so production is untouched. Every
+wallet file (store, labels, scan journal, abandoned set, descriptors) is
+scoped per-wallet through the ONE path helper all readers already used
+(wop_path). The DIVERGENCE is stated where it bites: exactly one wallet is
+ACTIVE at a time (this node's seed slot, label store and caches are
+single-instance) -- loadwallet switches rather than adding, and its result
+carries a warning saying so. The switched-to seed is installed through the
+SAME installer the encryption unlock path uses (wenc_install_seed,
+registered by the daemon); a process with no installer (standalone rpcd)
+refuses the lifecycle honestly. createwallet with a passphrase is refused
+(at-rest encryption remains a default-wallet feature, wallet_enc_state.c
+being single-instance); named stores are created from a fresh /dev/urandom
+BIP39 mnemonic.
+
+WATCH-ONLY via importdescriptors: createwallet <name> true creates a
+keyless shell; importdescriptors accepts pkh/wpkh/sh(wpkh) descriptors
+(xpub or bare-pubkey key material) through the SAME engine deriveaddresses
+already proved against Core -- rpc_chain.c exports three narrow calls
+(rpc_desc_normalize/expand/address_at) instead of a second parser. The
+descriptor expansion feeds the SAME wscan_key window the HD wallet scans
+with (entry = scriptPubKey hash160; for sh(wpkh) that is the P2SH script
+hash, and wallet_scan.c grew the 23-byte P2SH arm), so rescanblockchain,
+getreceivedbyaddress, listsinceblock and friends work unchanged. Signing
+paths answer Core's exact "Error: Private keys are disabled for this
+wallet". getnewaddress hands out the next descriptor index -- the same
+derivation deriveaddresses answers, so they cannot disagree (asserted
+against the Core-captured vectors in the test).
+
+BRANCH-AND-BOUND (wallet_bnb.c): Core SelectCoinsBnB semantics -- effective
+values, the changeless window [target, target+cost_of_change], descending
+DFS with Core's pruning, waste minimization with the per-input
+(fee_now - fee_long_term) term, 100k-node cap -- pure integer code, no
+globals. Wired ahead of the existing largest-first selector in the funding
+path (sendtoaddress/fundrawtransaction/send/sendall/walletcreatefundedpsbt);
+BnB finding nothing falls back, never fails.
+
+PROOF: tests/test_coinselect_bnb (8 cases incl. multi-coin exact match and
+the waste tie-break); test_rpc_wallet_ops grew the full lifecycle (create/
+dup-create -4/path-escape -8/unload/load-missing -18 with Core's text/
+reload) and a HERMETIC watch-only end-to-end -- the fixture seed's own
+account xpub imported into a fresh watch wallet, rescanned over the fixture
+archive, seeing byte-for-byte the 50 BTC the seed wallet sees at the same
+address. Core ground truth captured live from a scratch regtest oracle
+(error codes/texts; a Core watch-only wallet importing the same key
+material as tpub derives the same witness program and sees the funded
+7.5 BTC). Divergences stated: single-active-wallet; importdescriptors is
+watch-only-scoped; migratewallet/setwalletflag/createwalletdescriptor and
+the pruned-funds pair still refuse with reasons.
+
+----------------------------------------------------------------------------
+## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core
+
+The node now runs mainnet OR regtest, selected by Core's own config key
+(`chain=regtest` / `regtest=1` in bitcoin.conf). Everything chain-specific
+moved behind daemon/chainparams.{h,c}; the static default is MAINNET, so a
+process that never selects a chain (every tool, every test, production) is
+byte-identical to before.
+
+WHAT IS CHAIN-SELECTED: net magic (a runtime dword in bitcoin_net.asm's
+frames, fabfb5da on regtest), default P2P/RPC ports (18444/18443), the
+GENESIS BLOCK (derived from the mainnet bytes by patching nTime/nBits/nNonce
+exactly as Core's CreateGenesisBlock does, then hash-ASSERTED against Core's
+own hashGenesisBlock before selection can succeed), the script-flag schedule
+(bitcoin_script_flags.asm branches on a runtime selector; regtest heights
+GENERATED from CRegTestParams by the same gen_script_flags.py that emits the
+mainnet table), subsidy halving (150), GBT next-work (fPowNoRetargeting),
+address params (0x6f/0xc4/bcrt through wallet_set_chain), the RPC-reported
+chain name, and dns_seeds=off. NOT chain-selected, deliberately: the archive
+container marker (our own file format; chains never share a datadir).
+
+DATADIR ISOLATION (operator requirement): Core's layout exactly -- mainnet
+at the datadir root, regtest under <datadir>/regtest/, bitcoin.conf shared
+at the root. Logs live in <chain-datadir>/logs/, and the filename itself is
+chain-tagged (bitcoind.log / bitcoind.regtest.log) so aggregated views can
+never confuse chains. A fresh non-main datadir SELF-SEEDS its genesis at
+archive index 0 (the mainnet archive got genesis by one-time injection).
+
+BUGS THE FIRST REGTEST BOOT FOUND (all latent on mainnet):
+ 1. headers.dat off-by-one: a FRESH header mirror stored every block one
+    height low, because dlc_span treats file position as height and a
+    getheaders response never includes the locator point. bmc h=1 held
+    Core's block 2. Fix: seed the chain's own genesis header at position 0
+    when the mirror is empty -- which would have bitten a fresh MAINNET
+    datadir identically.
+ 2. The forked download worker re-chdir()'d into the BASE datadir, so the
+    UTXO store landed in the root while the archive lived in regtest/ --
+    one chain's state split across two dirs. dir is now the effective
+    per-chain dir everywhere after boot.
+ 3. connect= x book filter: dl_pool_from_book rightly drops loopback from
+    a GOSSIPED book, but it also dropped the OPERATOR'S connect=127.0.0.1,
+    leaving the live worker permanently offline. With connect= the pool is
+    now the connect list verbatim (Core: "these are the ONLY peers").
+ 4. Hardcoded 8333 in six dial sites + two out_port call sites -> the
+    chain's default_port.
+
+PROVEN AGAINST CORE (scratch regtest oracle, build/bin/bitcoind):
+ - Core mined 160 blocks; bmc synced them; ALL 161 HEIGHTS byte-identical
+   (getblockhash 0..160), tips equal.
+ - gettxoutsetinfo muhash IDENTICAL (4599bb4c...def34a1), height 160,
+   txouts 160, total 7725 BTC -- which also proves the halving at 150
+   (149*50 + 11*25) on both sides.
+ - A block built from BMC'S OWN getblocktemplate (height 161, coinbasevalue
+   2_500_000_000 -- halved; bits 207fffff -- no retarget) was CPU-mined and
+   ACCEPTED BY CORE via submitblock; both tips advanced to the same hash.
+ - Live-follow: Core mined more; bmc tracked the tip in real time (166=166).
+ - Tx relay: a Core wallet tx reached bmc's mempool over the regtest wire.
+   KNOWN LIMIT: a tx announced exactly once during a leg's sync pass is
+   drained unexamined (the pre-rotation txrelay_poll_leg catches the
+   Poisson re-announcements; on mainnet traffic this loses nothing
+   observable, on a quiet regtest the FIRST inv can wait for Core's
+   ~10-minute unbroadcast re-announce before it lands).
+
+tests/test_chainparams: 29 checks -- genesis derivation vs Core's asserted
+hashes (both chains), the asm globals actually flipping, the regtest flag
+schedule vs generated heights, per-chain datadirs, testnet/signet refused.
+Full make -k test green: 189 suites, 0 failures.
+
+----------------------------------------------------------------------------
+## 2026-08-27 -- Wallet at-rest encryption: encryptwallet / walletpassphrase{,change} / walletlock
+
+Finished the parked wallet-encryption WIP and wired it end to end. The wallet
+can now be encrypted at rest under a passphrase, Core-compatibly, with the
+live RPC seed gated behind an unlock timer.
+
+CIPHER (bitcoin_aes.c): AES-256, FIPS-197 block cipher + CBC. Passes the known-
+answer vectors in tests/test_aes (block enc/dec, CBC round-trip, padding,
+short-ciphertext rejection).
+
+CRYPTER (daemon/wallet_crypter.c): Core's BytesToKeySHA512AES key derivation
+(SHA-512 of passphrase||salt, iterated) producing the 32-byte key + 16-byte IV,
+then a sealed container: magic, salt, iteration count, the AES-256-CBC-wrapped
+seed, and a SHA-256 checksum. seal / open / rewrap. Proven byte-identical to
+OpenSSL's KDF (oracle-generated vectors) and round-trip correct, including that
+rewrap leaves the seed ciphertext untouched -- tests/test_wallet_crypter.
+
+STATE MACHINE (daemon/wallet_enc_state.c): boots an encrypted store LOCKED
+(seed NULL); walletpassphrase re-derives the seed from the sealed mnemonic and
+installs it into the live RPC wallet for N seconds via a registered setter;
+expiry or walletlock clears it and re-NULLs the live seed; walletpassphrase-
+change re-wraps in place; encryptwallet seals the currently-loaded plaintext
+wallet, removes the plaintext store, and leaves it locked. The mnemonic
+PROVIDER is a registered callback (wenc_set_mnemonic_provider) so the RPC layer
+and unit tests link the state module without daemon/main.c.
+
+RPCs (rpc_wallet_ops.c): the four commands with Core-exact error codes/text
+(-15 unencrypted, -14 wrong passphrase, -8 usage, -4 not loaded). encryptwallet
+left the "refusals" list in test_rpc_wallet_ops (it is real now).
+
+BUILD: the wenc translation units live in DAEMON_RPCOBJS and RPCLIBS (the two
+RPC bundles, never linked together), not DAEMONSRCS, since rpc_wallet_ops.o and
+main.c both reference the symbols. Full make -k test green (79 suites).
+
+----------------------------------------------------------------------------
+## 2026-08-27 -- Core-style mempool management: TrimToSize eviction, dynamic minfee, config-wired limits
+
+Prompted by a PRODUCTION FREEZE (mempool stuck at exactly 4096; the shared
+policy-state graph was fixed-size). The hotfix (size the graph to the pool's
+slot capacity, 70a754a) unfroze it, but the real gap was that our pool
+REJECTED new txs when full instead of evicting cheap ones. Now it does what
+Core does.
+
+TRIMTOSIZE EVICTION (bitcoin_mempool_policy.c): when mpool_put reports the
+pool full, evict the lowest-feerate LEAF transactions (leaf = desc_cnt==1,
+i.e. only itself -- Core's descendant-count convention) until the incoming
+tx fits, refusing to evict anything paying as much or more. The graph
+surgery is careful: evict_leaf decrements every ancestor's desc counters,
+purges the node's claims/outreg, swap-removes with full parent/claim index
+fixups. The last evicted feerate (+ incrementalrelayfee) becomes the
+pool's DYNAMIC mempoolminfee floor (st+48); a tx below it is rejected up
+front. Stated divergence: Core evicts whole descendant PACKAGES by
+descendant score; we evict individual lowest-feerate leaves -- identical
+for childless entries (the vast majority), cheapest-leaf-first for chains,
+always progressing.
+
+BLOB RECLAIM (daemon/mempool_compact.c): the structural pool's tx-blob was
+a bump allocator that never reclaimed freed bytes ("not compacted"), so
+eviction freed a slot but no space and the retry still failed. Compaction
+slides every live entry's blob region down to close the gaps and resets the
+fill pointer, carrying each slot's index through the sort so it is
+O(n log n), not O(n^2). Called from the eviction loop before each retry.
+
+DYNAMIC mempoolminfee reported by getmempoolinfo = max(static relay fee,
+eviction floor) -- rises under congestion, exactly Core's field.
+
+CONFIG-WIRED (Core exposes each; defaults unchanged and equal to Core's):
+minrelaytxfee, incrementalrelayfee (BTC/kvB -> sat/vByte at the boundary),
+limitancestorcount, limitancestorsize, limitdescendantcount,
+limitdescendantsize, mempoolfullrbf -- all read from bitcoin.conf and
+threaded into mpool_policy_init; a new [config] mpol log line reports them.
+
+Proof: tests/test_mempool_evict -- a high-feerate tx evicts the cheapest
+resident, the floor rises, a below-floor tx is rejected, and every survivor
+stays resolvable (graph intact after the swap-remove fixups).
+
 ## 2026-08-26 -- walletprocesspsbt: the PSBT Signer role, by delegation
 
 The last refused member of the PSBT family is real. walletprocesspsbt

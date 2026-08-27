@@ -129,12 +129,26 @@ void wallet_pubkey(unsigned char pub[33], const unsigned char priv_be[32]) {
     scalar_to_pubkey(pub, priv_be);
 }
 
-/* P2PKH mainnet address for a 32-byte BE private key. */
+/* ---- chain address parameters (runtime-selected) -------------------------
+ * Statics default to MAINNET ("bc", 0x00, 0x05): every existing consumer of
+ * this file behaves exactly as before unless the daemon selects another chain
+ * (daemon/chainparams.c calls wallet_set_chain after chainparams_select).
+ * Regtest: hrp "bcrt", P2PKH 0x6f, P2SH 0xc4 (Core CRegTestParams). */
+static const char*   g_wal_hrp      = "bc";
+static long long     g_wal_hrplen   = 2;
+static unsigned char g_wal_p2pkh_ver = 0x00;
+static unsigned char g_wal_p2sh_ver  = 0x05;
+void wallet_set_chain(const char* hrp, unsigned char p2pkh_ver, unsigned char p2sh_ver){
+    g_wal_hrp = hrp; g_wal_hrplen = (long long)strlen(hrp);
+    g_wal_p2pkh_ver = p2pkh_ver; g_wal_p2sh_ver = p2sh_ver;
+}
+
+/* P2PKH address (chain version byte) for a 32-byte BE private key. */
 int wallet_address(char out[64], const unsigned char priv_be[32]) {
     unsigned char pub[33], h[20], payload[21];
     scalar_to_pubkey(pub, priv_be);
     hash160(h, pub, 33);
-    payload[0] = 0x00;                       /* mainnet version */
+    payload[0] = g_wal_p2pkh_ver;            /* chain version byte */
     memcpy(payload + 1, h, 20);
     base58check_encode(out, payload, 21);    /* verified primitive */
     return 0;
@@ -359,7 +373,7 @@ long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]) {
     data[dl++] = 0;                     /* witness version v0 */
     for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
     bech32_init();
-    long long sl = bech32_encode(out, "bc", 2, data, dl, 0);  /* spec 0 = bech32 */
+    long long sl = bech32_encode(out, g_wal_hrp, g_wal_hrplen, data, dl, 0);  /* spec 0 = bech32 */
     return (sl >= 0 && sl < cap) ? (long)sl : -1;
 }
 
@@ -393,7 +407,7 @@ long wallet_p2wsh_address(char* out, long cap, const unsigned char h256[32]) {
     data[dl++] = 0;                     /* witness version v0 */
     for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
     bech32_init();
-    long long sl = bech32_encode(out, "bc", 2, data, dl, 0);  /* spec 0 = bech32 */
+    long long sl = bech32_encode(out, g_wal_hrp, g_wal_hrplen, data, dl, 0);  /* spec 0 = bech32 */
     return (sl >= 0 && sl < cap) ? (long)sl : -1;
 }
 
@@ -411,7 +425,7 @@ long wallet_p2tr_address(char* out, long cap, const unsigned char xonly[32]) {
     data[dl++] = 1;                     /* witness version v1 (taproot) */
     for (long long i = 0; i < n5; i++) data[dl++] = d5[i];
     bech32_init();
-    long long sl = bech32_encode(out, "bc", 2, data, dl, 1);  /* spec 1 = bech32m */
+    long long sl = bech32_encode(out, g_wal_hrp, g_wal_hrplen, data, dl, 1);  /* spec 1 = bech32m */
     return (sl >= 0 && sl < cap) ? (long)sl : -1;
 }
 
@@ -468,8 +482,8 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
         version[0] = pay[0];
         if (plen == 21) {                       /* version + 20 hash */
             memcpy(h160, pay + 1, 20);
-            *type_ = (pay[0] == 0x00) ? WAL_ADDR_P2PKH
-                   : (pay[0] == 0x05) ? WAL_ADDR_P2SH : WAL_ADDR_UNKNOWN;
+            *type_ = (pay[0] == g_wal_p2pkh_ver) ? WAL_ADDR_P2PKH
+                   : (pay[0] == g_wal_p2sh_ver)  ? WAL_ADDR_P2SH : WAL_ADDR_UNKNOWN;
             return 1;
         }
         *type_ = WAL_ADDR_UNKNOWN;
@@ -486,7 +500,7 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
         for (char* p = hrp; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p + 32);
         long long hrplen = (long long)strlen(hrp);
         /* witness v0 uses bech32 (spec 0); witness v1 (taproot) uses bech32m (spec 1). */
-        if (hrplen == 2 && hrp[0] == 'b' && hrp[1] == 'c' && n5 >= 8) {
+        if (hrplen == g_wal_hrplen && !strcmp(hrp, g_wal_hrp) && n5 >= 8) {
             if (bech32_verify_checksum(hrp, hrplen, d5, n5, 1) == 1 && d5[0] == 1) {
                 /* P2TR: witness version 1, 32-byte program, bech32m. */
                 unsigned char bytes[64];
@@ -530,7 +544,7 @@ int wallet_script_to_address(char* out, long cap, const unsigned char* script, l
         script[23] == 0x88 && script[24] == 0xac) {
         /* P2PKH: version 0x00 || h160 */
         unsigned char payload[21];
-        payload[0] = 0x00;
+        payload[0] = g_wal_p2pkh_ver;
         memcpy(payload + 1, script + 3, 20);
         base58check_encode(out, payload, 21);
         return WAL_ADDR_P2PKH;
@@ -543,7 +557,7 @@ int wallet_script_to_address(char* out, long cap, const unsigned char* script, l
     if (slen == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87) {
         /* P2SH: OP_HASH160 PUSH20 <h160> OP_EQUAL -- version 0x05 || h160 */
         unsigned char payload[21];
-        payload[0] = 0x05;
+        payload[0] = g_wal_p2sh_ver;
         memcpy(payload + 1, script + 2, 20);
         base58check_encode(out, payload, 21);
         return WAL_ADDR_P2SH;

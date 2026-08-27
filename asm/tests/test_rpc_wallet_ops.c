@@ -142,6 +142,14 @@ static int wallet_p2pkh_addr(int is_change, char out[128]){
     return 1;
 }
 
+/* ---- multi-wallet test installer: stands in for wenc_install_seed ------- */
+static unsigned char g_tw_seed[64]; static int g_tw_have;
+void tw_install(const unsigned char* sd){
+    if (sd){ memcpy(g_tw_seed, sd, 64); g_tw_have = 1; }
+    else g_tw_have = 0;
+}
+const unsigned char* tw_seed(void){ return g_tw_have ? g_tw_seed : 0; }
+
 int main(void){
     tt_isolate();   /* the label store and the fake wallet file are ours alone */
     for (int i = 0; i < 64; i++) SEED[i] = (unsigned char)(0x11 * (i + 1));
@@ -441,13 +449,14 @@ int main(void){
 
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
     { static const char* REFUSE[] = {
-        "encryptwallet","createwallet","loadwallet","unloadwallet","restorewallet",
-        "migratewallet","setwalletflag","importdescriptors","createwalletdescriptor",
+        "migratewallet","setwalletflag","createwalletdescriptor",
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
         "bumpfee","psbtbumpfee" };
-      /* walletprocesspsbt left this list 2026-08-26: it is REAL now (the
-       * Signer role by delegation, rpc_commands.c); its no-params behaviour
-       * is an ordinary -8/-4, covered by test_rpc_psbtfinal */
+      /* walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
+       * encryptwallet left 2026-08-27 (real; -8 asserted below).
+       * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
+       * left 2026-08-27: MULTI-WALLET is real now -- the whole lifecycle is
+       * exercised at the end of this file. */
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
@@ -458,6 +467,11 @@ int main(void){
           rj_free(r);
       }
       ck("every unsupported wallet method errors with a substantive reason", allbad);
+      /* encryptwallet is wired (daemon/wallet_enc_state.c): with no passphrase
+       * argument it is an ordinary parameter error, not a stub refusal. */
+      { D("encryptwallet", NULL);
+        ck("encryptwallet with no passphrase -> -8 (wired, not a stub)", rc == 0 && ec == -8);
+        rj_free(r); }
       /* walletdisplayaddress is implemented now (rpc_signer.c): with no
        * signer configured it answers Core's exact restart message */
       { rj_val* pp = P("[\"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\"]");
@@ -791,6 +805,176 @@ int main(void){
       }
       ck("no method is advertised but unhandled", agree);
       ck("all 46 wallet-ops methods are present", count == 46); }
+
+    /* ==== multi-wallet lifecycle (2026-08-27) ========================== */
+    {
+      extern void rpc_wops_set_seed_installer(void (*)(const unsigned char*));
+      extern const char* rpc_wops_active_wallet_name(void);
+      extern int rpc_wops_watchonly(void);
+      extern int rpc_wops_watch_newaddress(char*, long, long*, const char**);
+
+      rpc_wops_set_seed_installer(0);   /* first: no installer -> honest -4 */
+      rj_val* p = P("[\"w1\"]");
+      D("createwallet", p);
+      ck("createwallet without an installer -> -4 (standalone rpcd case)",
+         rc == 0 && ec == -4 && em && strstr(em, "no seed installer"));
+      rj_free(r); rj_free(p);
+
+      rpc_wops_set_seed_installer(tw_install);
+
+      p = P("[\"w1\"]");
+      D("createwallet", p);
+      ck("createwallet w1 -> {name:w1}", rc == 1 && r && S(r,"name") && !strcmp(S(r,"name"), "w1"));
+      rj_free(r); rj_free(p);
+      ck("createwallet installed a fresh seed", tw_seed() != 0);
+      W.seed = tw_seed();
+      ck("active wallet name is w1",
+         rpc_wops_active_wallet_name() && !strcmp(rpc_wops_active_wallet_name(), "w1"));
+
+      D("listwallets", NULL);
+      ck("listwallets -> [w1]", rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1 &&
+         !strcmp(r->items[0]->str, "w1"));
+      rj_free(r);
+
+      p = P("[\"w1\"]");
+      D("createwallet", p);
+      ck("createwallet duplicate -> -4 already exists",
+         rc == 0 && ec == -4 && em && strstr(em, "already exists"));
+      rj_free(r); rj_free(p);
+
+      p = P("[\"../evil\"]");
+      D("createwallet", p);
+      ck("path-escaping name refused -8", rc == 0 && ec == -8);
+      rj_free(r); rj_free(p);
+
+      D("unloadwallet", NULL);
+      ck("unloadwallet -> {warnings:[]}", rc == 1 && r && r->typ == RJ_OBJ);
+      rj_free(r);
+      W.seed = tw_seed();
+      ck("unload cleared the seed", W.seed == 0);
+
+      D("listwallets", NULL);
+      ck("listwallets after unload -> []", rc == 1 && r && r->nitems == 0);
+      rj_free(r);
+
+      p = P("[\"nosuch\"]");
+      D("loadwallet", p);
+      ck("loadwallet missing -> -18 Core text", rc == 0 && ec == -18 &&
+         em && strstr(em, "does not exist or is not loaded"));
+      rj_free(r); rj_free(p);
+
+      p = P("[\"w1\"]");
+      D("loadwallet", p);
+      ck("loadwallet w1 reloads", rc == 1 && r && S(r,"name") && !strcmp(S(r,"name"), "w1"));
+      rj_free(r); rj_free(p);
+      W.seed = tw_seed();
+      ck("reload restored a seed", W.seed != 0);
+
+      /* ---- watch-only wallet + importdescriptors ---- */
+      p = P("[\"watch1\", true]");
+      D("createwallet", p);
+      ck("createwallet watch-only", rc == 1 && r && S(r,"name") && !strcmp(S(r,"name"), "watch1"));
+      rj_free(r); rj_free(p);
+      W.seed = tw_seed();
+      ck("watch-only wallet has NO seed", W.seed == 0 && rpc_wops_watchonly());
+
+      /* import the Core-verified test-vector descriptor (see
+       * test_rpc_chain.c: addresses captured from bitcoin-cli) */
+      p = P("[[{\"desc\":\"wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*)#wvk84d79\",\"range\":10,\"timestamp\":\"now\"}]]");
+      D("importdescriptors", p);
+      ck("importdescriptors -> [{success:true}]",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1 &&
+         S(r->items[0],"success") && !strcmp(S(r->items[0],"success"), "1"));
+      rj_free(r); rj_free(p);
+
+      { char a[128]; long ec2; const char* em2;
+        ck("watch getnewaddress [0] == Core's deriveaddresses[0]",
+           rpc_wops_watch_newaddress(a, sizeof a, &ec2, &em2) == 1 &&
+           !strcmp(a, "bc1qp5wfcq48h6d63wyy9qz0awtpfqwwv4sma86mhz"));
+        ck("watch getnewaddress [1] == Core's deriveaddresses[1]",
+           rpc_wops_watch_newaddress(a, sizeof a, &ec2, &em2) == 1 &&
+           !strcmp(a, "bc1qrfxr69jqnhwufxgkqgcdep9prq4j4vuw2wyg0v")); }
+
+      p = P("[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\", 1.0]");
+      D("sendtoaddress", p);
+      ck("watch-only send -> Core's private-keys-disabled error",
+         rc == 0 && ec == -4 && em &&
+         !strcmp(em, "Error: Private keys are disabled for this wallet"));
+      rj_free(r); rj_free(p);
+
+      D("listdescriptors", NULL);
+      { rj_val* ds = r ? rj_obj_get(r, "descriptors") : 0;
+        ck("listdescriptors shows the import, next_index 2",
+           rc == 1 && ds && ds->typ == RJ_ARR && ds->nitems == 1 &&
+           S(ds->items[0],"next_index") && !strcmp(S(ds->items[0],"next_index"), "2")); }
+      rj_free(r);
+
+      /* restorewallet from the w1 store file as a backup */
+      { char bpath[512]; struct stat sb;
+        const char* cands[2] = { "data/wallets/w1/bmcwallet.dat", "wallets/w1/bmcwallet.dat" };
+        bpath[0]=0;
+        for (int i=0;i<2;i++) if (stat(cands[i],&sb)==0){ snprintf(bpath,sizeof bpath,"%s",cands[i]); break; }
+        char pp[600]; snprintf(pp, sizeof pp, "[\"w2\",\"%s\"]", bpath);
+        rj_val* p2 = P(pp);
+        D("restorewallet", p2);
+        ck("restorewallet w2 from w1's store", rc == 1 && r && S(r,"name") && !strcmp(S(r,"name"), "w2"));
+        rj_free(r); rj_free(p2);
+        W.seed = tw_seed();
+        ck("restored wallet has a seed", W.seed != 0); }
+
+      /* ---- HERMETIC watch-only end-to-end: the fixture chain ----------
+       * Import the FIXTURE SEED's own account xpub into a fresh watch-only
+       * wallet, rescan the same 3-block fixture archive, and the watch
+       * wallet must see exactly what the seed wallet saw at the same
+       * address -- import -> descriptor keyset -> scan -> journal ->
+       * balance, with zero shared state (its journal lives under
+       * wallets/watchfx/). */
+      { /* the fixture wallet's account xpub, via its own gethdkeys */
+        static unsigned char rbuf2[8192];
+        rpc_wops_set_scanner(fx_read_block, rbuf2, (long)sizeof rbuf2, fx_tip);
+        W.seed = SEED;
+        D("gethdkeys", NULL);
+        char fxpub[144]; fxpub[0] = 0;
+        if (rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1 && S(r->items[0],"xpub"))
+            snprintf(fxpub, sizeof fxpub, "%s", S(r->items[0],"xpub"));
+        rj_free(r);
+        ck("fixture account xpub obtained", fxpub[0] != 0);
+
+        rj_val* p2 = P("[\"watchfx\", true]");
+        D("createwallet", p2); rj_free(r); rj_free(p2);
+        W.seed = tw_seed();
+        ck("watchfx created watch-only", W.seed == 0 && rpc_wops_watchonly());
+
+        char req[600];
+        snprintf(req, sizeof req,
+                 "[[{\"desc\":\"wpkh(%s/0/*)\",\"range\":5,\"timestamp\":\"now\"}]]", fxpub);
+        p2 = P(req);
+        D("importdescriptors", p2);
+        ck("watchfx import (checksum appended by the engine)",
+           rc == 1 && r && r->nitems == 1 && S(r->items[0],"success") &&
+           !strcmp(S(r->items[0],"success"), "1"));
+        rj_free(r); rj_free(p2);
+
+        D("rescanblockchain", NULL);
+        ck("watchfx rescan over the fixture archive", rc == 1);
+        rj_free(r);
+
+        char r0addr[128];
+        wallet_p2wpkh_address(r0addr, sizeof r0addr, g_r0_h160);
+        char q[200]; snprintf(q, sizeof q, "[\"%s\"]", r0addr);
+        p2 = P(q);
+        D("getreceivedbyaddress", p2);
+        ck("watch-only wallet sees the fixture's 50 BTC receive",
+           rc == 1 && r && r->str && !strcmp(r->str, "50.00000000"));
+        rj_free(r); rj_free(p2);
+        rpc_wops_set_scanner(NULL, NULL, 0, NULL);
+      }
+
+      /* back to the fixture wallet so nothing after this block changes */
+      D("unloadwallet", NULL); rj_free(r);
+      rpc_wops_set_seed_installer(0);
+      W.seed = SEED;
+    }
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;

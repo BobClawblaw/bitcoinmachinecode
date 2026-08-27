@@ -301,6 +301,28 @@ static void chainwork_hex(const u8 w[16], char out[65]){
 }
 
 /* ---- header math (Core GetDifficulty / DeriveTarget / GetMedianTimePast) ---- */
+/* ---- chain parameters (runtime-selected; daemon/chainparams.c) ----------
+ * Statics default to MAINNET so every existing consumer of rpc_chain.o
+ * (standalone rpcd, tests) behaves exactly as before without linking
+ * chainparams.c; the daemon calls rpc_chain_set_chainparams() after
+ * chainparams_select(). Regtest: name "regtest", halving 150,
+ * fPowNoRetargeting (GBT keeps the tip's nBits forever). */
+/* getblocktemplate proposal mode: evaluation runs in the download worker
+ * (the chain-state owner) via the same staging channel submitblock uses;
+ * rpc_node.c owns that channel, so the daemon injects its helper here.
+ * NULL (standalone rpcd, tests) => an honest "unavailable". Returns 1 valid,
+ * 0 reason filled, -2 decode, -3 timeout, -1 unavailable. */
+static long (*g_gbt_proposal)(const char* hex, char* reason, unsigned long rcap) = 0;
+void rpc_chain_set_proposal(long (*fn)(const char*, char*, unsigned long)){ g_gbt_proposal = fn; }
+
+static const char* g_chain_name = "main";
+static long g_halving_interval  = 210000;
+static int  g_pow_no_retarget   = 0;
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting){
+    g_chain_name = name; g_halving_interval = halving_interval;
+    g_pow_no_retarget = pow_no_retargeting;
+}
+
 static double difficulty_of(u32 bits){
     int shift = (bits >> 24) & 0xff;
     double d = (double)0x0000ffff / (double)(bits & 0x00ffffff);
@@ -807,7 +829,7 @@ static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
       if (cmd_getnetworkhashps(NULL,&nh,&e2,&m2)) rj_obj_set(o,"networkhashps", nh);
       else rj_obj_set(o,"networkhashps", rj_numf("%d",0)); }
     rj_obj_set(o,"pooledtx", rj_numf("%d", 0));
-    rj_obj_set(o,"chain", rj_str("main"));
+    rj_obj_set(o,"chain", rj_str(g_chain_name));
     rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
     *res = o;
     return 1;
@@ -882,6 +904,7 @@ static u32 gbt_next_bits(long tip){
     u8 hdr[80];
     if (read_block_prefix(tip, hdr, 80) != 1) return 0;
     u32 old_bits = rd32(hdr + 72);
+    if (g_pow_no_retarget) return old_bits;     /* regtest: fPowNoRetargeting */
     if ((tip + 1) % 2016 != 0) return old_bits;
     u32 last_time = rd32(hdr + 68);
     if (read_block_prefix(tip - 2015, hdr, 80) != 1) return old_bits;
@@ -916,6 +939,24 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
             for (unsigned long i = 0; i < rules->nitems; i++)
                 if (rules->items[i]->typ == RJ_STR && !strcmp(rules->items[i]->str, "segwit")) segwit_rule = 1;
         const rj_val* mode = rj_obj_get((rj_val*)req, "mode");
+        if (mode && mode->typ == RJ_STR && !strcmp(mode->str, "proposal")){
+            /* BIP23 proposal: full validation of a caller-built block WITHOUT
+             * PoW and WITHOUT connecting -- Core's TestBlockValidity via the
+             * worker's dry-run path. null = valid, else the BIP22 reason. */
+            const rj_val* data = rj_obj_get((rj_val*)req, "data");
+            if (!data || data->typ != RJ_STR){
+                *ec = -8; *em = "Missing data String key for proposal"; return 0; }
+            if (!g_gbt_proposal){
+                *ec = -1; *em = "Block proposal evaluation unavailable (no download worker)"; return 0; }
+            static char reason[64];
+            long pr = g_gbt_proposal(data->str, reason, sizeof reason);
+            if (pr == 1){ *res = rj_null(); return 1; }
+            if (pr == -2){ *ec = -22; *em = "Block decode failed"; return 0; }
+            if (pr == -3){ *ec = -4; *em = "Block proposal timed out (node may be catching up)"; return 0; }
+            if (pr == -1){ *ec = -1; *em = "Block proposal evaluation unavailable (no download worker)"; return 0; }
+            *res = rj_str(reason[0] ? reason : "rejected");
+            return 1;
+        }
         if (mode && mode->typ == RJ_STR && strcmp(mode->str, "template")){
             *ec = -8; *em = "Invalid mode"; return 0; }
     }
@@ -962,30 +1003,88 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         { u8* m = (u8*)g_gbt_mph.mp; unsigned long long mask; memcpy(&mask, m+8, 8);
           for (unsigned long i = 0; i <= mask && n < GBT_MAX_TX; i++){
               gbt_ent e; if (gbt_slot(g_gbt_mph.mp, i, &e) == 1) ents[n++] = e; } }
-        memset(emitted, 0, (size_t)(n ? n : 1));
-        long emitted_n = 0;
-        /* iterative parents-first ordering via the policy graph */
-        for (long pass = 0; pass <= n && emitted_n < n; pass++){
-            long progress = 0;
-            for (long i = 0; i < n; i++){
-                if (emitted[i]) continue;
-                int ready = 1;
-                mp_entry_info inf; long have = 0;
-                if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info)
-                    have = g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &inf);
-                if (have){
-                    mp_entry_info* pi = &inf;
-                    for (int k = 0; k < pi->n_depends && ready; k++){
-                        int found_unemitted = 0;
-                        for (long j = 0; j < n; j++)
-                            if (!emitted[j] && !memcmp(ents[j].txid, pi->depends[k], 32)){ found_unemitted = 1; break; }
-                        if (found_unemitted) ready = 0;
-                    }
-                }
-                if (!ready) continue;
-                emitted[i] = 1; order[emitted_n++] = (int)i; progress = 1;
+        /* ---- ancestor-package greedy selection (Core addPackageTxs) ----
+         * Repeatedly pick the candidate whose ANCESTOR PACKAGE (its not-yet-
+         * selected in-pool ancestors + itself) has the highest package
+         * feerate; emit that package parents-first; repeat. CPFP falls out:
+         * a high-fee child lifts its cheap parent's package score. Weight
+         * and sigop budgets are Core's (4M weight / 80k cost, minus the
+         * 4000-weight / 400-sigop coinbase reservation); an over-budget
+         * package is skipped and selection continues. Tie-break: smaller
+         * txid (Core tie-breaks inside its modified-set comparator; the
+         * ordering difference is score-equal, documented divergence). */
+        static mp_entry_info infs[GBT_MAX_TX];
+        static unsigned char have_inf[GBT_MAX_TX];
+        static unsigned long long tfee[GBT_MAX_TX], tsize[GBT_MAX_TX];
+        static long tweight[GBT_MAX_TX], tsig[GBT_MAX_TX];
+        static unsigned char skipped[GBT_MAX_TX];
+        for (long i = 0; i < n; i++){
+            have_inf[i] = 0; skipped[i] = 0; emitted[i] = 0;
+            tfee[i] = 0; tsize[i] = 1;
+            if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
+                g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &infs[i])){
+                have_inf[i] = 1; tfee[i] = infs[i].fee; tsize[i] = infs[i].size ? infs[i].size : 1;
             }
-            if (!progress) break;
+            { const u8* tp = ents[i].tx; const u8* tend = tp + ents[i].len; txw_t w;
+              tweight[i] = tx_walk(tp, tend, &w) ? (long)(w.stripped * 3 + w.len) : (long)(ents[i].len * 4); }
+            tsig[i] = (have_inf[i] && infs[i].sigop_cost)
+                        ? (long)infs[i].sigop_cost
+                        : (g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0);
+        }
+        long emitted_n = 0;
+        long long budget_w = 4000000 - 4000, budget_s = 80000 - 400;
+        long long used_w = 0, used_s = 0;
+        for (long round = 0; round < n; round++){
+            long best = -1;
+            unsigned long long bf = 0, bs = 1;
+            for (long i = 0; i < n; i++){
+                if (emitted[i] || skipped[i] || !have_inf[i]) continue;
+                /* package = ancestors (incl self) minus already-emitted */
+                unsigned long long pf = infs[i].anc_fee, ps = infs[i].anc_size;
+                int unresolved = 0;
+                for (int a = 0; a < infs[i].n_anc; a++){
+                    if (!memcmp(infs[i].anc[a], ents[i].txid, 32)) continue;   /* self */
+                    long j = -1;
+                    for (long m = 0; m < n; m++)
+                        if (!memcmp(ents[m].txid, infs[i].anc[a], 32)){ j = m; break; }
+                    if (j < 0){ unresolved = 1; break; }       /* registry-stale */
+                    if (emitted[j]){ pf -= tfee[j]; ps -= tsize[j]; }
+                    else if (skipped[j]){ unresolved = 1; break; }
+                }
+                if (unresolved){ skipped[i] = 1; continue; }
+                if (ps == 0) ps = 1;
+                /* pf/ps > bf/bs  <=>  pf*bs > bf*ps (fits: fee<2^40, size<2^24) */
+                int better = (best < 0) || (pf * bs > bf * ps) ||
+                             (pf * bs == bf * ps && memcmp(ents[i].txid, ents[best].txid, 32) < 0);
+                if (better){ best = i; bf = pf; bs = ps; }
+            }
+            if (best < 0) break;
+            /* collect the package as candidate indexes */
+            int pkg[MPE_MAX_SET]; int np = 0;
+            long long ww = 0, ss = 0;
+            for (int a = 0; a < infs[best].n_anc && np < MPE_MAX_SET; a++){
+                long j = -1;
+                for (long m = 0; m < n; m++)
+                    if (!memcmp(ents[m].txid, infs[best].anc[a], 32)){ j = m; break; }
+                if (j < 0 || emitted[j]) continue;
+                pkg[np++] = (int)j; ww += tweight[j]; ss += tsig[j];
+            }
+            if (np == 0){ skipped[best] = 1; continue; }
+            if (used_w + ww > budget_w || used_s + ss > budget_s){
+                skipped[best] = 1;                   /* try lighter packages */
+                continue;
+            }
+            /* parents-first inside the package: a child's ancestor set is a
+             * strict superset of its parent's, so ascending n_anc is a valid
+             * topological order */
+            for (int a = 0; a < np; a++)
+                for (int b = a + 1; b < np; b++)
+                    if (infs[pkg[b]].n_anc < infs[pkg[a]].n_anc){ int t_ = pkg[a]; pkg[a] = pkg[b]; pkg[b] = t_; }
+            for (int a = 0; a < np; a++){
+                emitted[pkg[a]] = 1;
+                order[emitted_n++] = pkg[a];
+            }
+            used_w += ww; used_s += ss;
         }
         /* render in order; depends[] are 1-based indices into this array */
         for (long oi = 0; oi < emitted_n; oi++){
@@ -1016,7 +1115,14 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
               rj_obj_set(t, "depends", dep); }
             rj_obj_set(t, "fee", rj_numf("%llu", fee));
             fees_total += fee;
-            rj_obj_set(t, "sigops", rj_numf("%ld", g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0));
+            /* exact BIP141 cost stamped at accept time (tx_accept.c);
+             * legacy-x4 lower bound only if the stamp is absent */
+            { mp_entry_info sinf; long ssig = 0;
+              if (g_gbt_mph.pol_entry_info &&
+                  g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &sinf) && sinf.sigop_cost)
+                  ssig = (long)sinf.sigop_cost;
+              else if (g_gbt_sigop_cost) ssig = g_gbt_sigop_cost(ents[i].tx, ents[i].len);
+              rj_obj_set(t, "sigops", rj_numf("%ld", ssig)); }
             { const u8* p = ents[i].tx; const u8* end = p + ents[i].len; txw_t w;
               rj_obj_set(t, "weight", rj_numf("%zu",
                   tx_walk(p, end, &w) ? (w.stripped * 3 + w.len) : ents[i].len * 4)); }
@@ -1221,7 +1327,7 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     u8 rec[48]; read_idx_rec(tip, rec);
     char hx[65];
     rj_val* o = rj_obj();
-    rj_obj_set(o, "chain", rj_str("main"));
+    rj_obj_set(o, "chain", rj_str(g_chain_name));
     rj_obj_set(o, "blocks", rj_numf("%ld", tip));
     long hh = headers_height(tip);
     rj_obj_set(o, "headers", rj_numf("%ld", hh));
@@ -2122,6 +2228,86 @@ static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, con
     return 1;
 }
 
+/* ---- exported descriptor API (wallet management) ---------------------------
+ * rpc_wallet_ops.c's importdescriptors / watch-only wallets need the SAME
+ * parse + CKDpub derivation this file already proved against Core, without a
+ * second engine growing next to it. Three narrow entry points:
+ *
+ *   rpc_desc_normalize  checksum-verify (or append) and classify;
+ *   rpc_desc_expand     h160s to SCAN for over an index range -- the key hash
+ *                       for pkh/wpkh, the P2SH SCRIPT hash for sh(wpkh), i.e.
+ *                       exactly the 20 bytes that appear in the scriptPubKey
+ *                       (wallet_scan.c matches P2WPKH/P2PKH/P2SH by that hash);
+ *   rpc_desc_address_at the address at one index, byte-identical to what
+ *                       deriveaddresses answers (same code path).
+ *
+ * Script types reported: 0 pkh, 1 wpkh, 2 sh(wpkh). Everything else that
+ * parses (pk/tr/combo/addr/raw) is refused for wallet use with a reason --
+ * a watch-only wallet must only claim scripts it can actually recognize in
+ * the chain scan. */
+int rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
+                       char* err, unsigned long errcap){
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
+    memcpy(core, in, cl); core[cl]=0;
+    char cks[9];
+    if (!desc_checksum(core, cks)){ snprintf(err,errcap,"Invalid characters in descriptor"); return 0; }
+    if (hash && (strlen(hash+1)!=8 || strcmp(hash+1,cks))){
+        snprintf(err,errcap,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
+        return 0; }
+    desc_t d; long ec2; const char* em2;
+    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
+    if (d.keytype==2){ snprintf(err,errcap,"private-key descriptors are not supported for import"); return 0; }
+    if (!(d.script==DSC_PKH || d.script==DSC_WPKH || d.script==DSC_SHWPKH)){
+        snprintf(err,errcap,"only pkh/wpkh/sh(wpkh) descriptors can be imported for watching"); return 0; }
+    if (is_range) *is_range = d.ranged;
+    if ((long)snprintf(out, (size_t)cap, "%s#%s", core, cks) >= cap){
+        snprintf(err,errcap,"Descriptor too long"); return 0; }
+    return 1;
+}
+
+long rpc_desc_expand(const char* in, long start, long count,
+                     unsigned char (*h160s)[20], long cap, int* script_type,
+                     char* err, unsigned long errcap){
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return -1; }
+    memcpy(core, in, cl); core[cl]=0;
+    desc_t d; long ec2; const char* em2;
+    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return -1; }
+    if (script_type)
+        *script_type = d.script==DSC_PKH ? 0 : d.script==DSC_WPKH ? 1 : 2;
+    if (!d.ranged){ start = 0; count = 1; }
+    long n = 0;
+    for (long i = start; i < start+count && n < cap; i++, n++){
+        u8 pub[65]; int pl=0;
+        if (!desc_pub_at(&d, i, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return -1; }
+        if (d.script!=DSC_PKH && pl!=33){ snprintf(err,errcap,"Uncompressed key not allowed for wpkh"); return -1; }
+        u8 kh[20]; hash160(kh, pub, pl);
+        if (d.script==DSC_SHWPKH){
+            u8 rd[22]={0x00,0x14}; memcpy(rd+2,kh,20);
+            hash160(h160s[n], rd, 22);           /* the P2SH script hash */
+        } else memcpy(h160s[n], kh, 20);
+    }
+    return n;
+}
+
+int rpc_desc_address_at(const char* in, long idx, char* out, long cap,
+                        char* err, unsigned long errcap){
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
+    memcpy(core, in, cl); core[cl]=0;
+    desc_t d; long ec2; const char* em2;
+    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
+    u8 pub[65]; int pl=0;
+    if (!desc_pub_at(&d, idx, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return 0; }
+    if (!desc_addr_for_pub(d.script, pub, pl, out, cap, &ec2, &em2)){
+        snprintf(err,errcap,"%s", em2); return 0; }
+    return 1;
+}
+
 static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
     long long req;
     if (!rpc_param_i64(params, 0, &req, ec, em)) return 0;
@@ -2250,7 +2436,7 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
  * window only) those keys are OMITTED -- an honest divergence from a full node
  * (which would error on a pruned block), consistent with getblock's fee
  * omission. Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
-static u64 gbs_subsidy(long h){ long era=h/210000; if (era>=64) return 0; return 5000000000ULL >> era; }
+static u64 gbs_subsidy(long h){ long era=h/g_halving_interval; if (era>=64) return 0; return 5000000000ULL >> era; }
 static long gbs_cs(u64 n){ if (n<253) return 1; if (n<=0xffff) return 3; if (n<=0xffffffffULL) return 5; return 9; }
 static int gbs_unspendable(const u8* s, u64 len){ return (len>0 && s[0]==0x6a) || len>10000; }
 static int gbs_cmp_u64(const void* a, const void* b){ u64 x=*(const u64*)a, y=*(const u64*)b; return (x<y)?-1:(x>y)?1:0; }
@@ -3240,6 +3426,9 @@ static const char* const CHAIN_METHODS[] = {
     "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","scantxoutset","getchaintips","getindexinfo","uptime","stop",
     /* the rest of Core's Blockchain category (2026-08-25) */
     "getchainstates","getdeploymentinfo","getchaintxstats","verifychain",
+    /* EXTENSIONS (no Core equivalent): served from the live address index,
+     * daemon/addr_index_tail.c, only when the operator set addrindex=1 */
+    "getaddressbalance","getaddresstxids",
     "waitforblock","waitforblockheight","waitfornewblock",
     "getblockfilter","scanblocks","getdescriptoractivity",
     "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
@@ -3297,6 +3486,116 @@ void rpc_chain_set_coinstats(long (*run)(int, void*, char*, unsigned long)){
 static long (*g_csi_h)(void);           /* light height probe for getindexinfo */
 void rpc_chain_set_coinstats_height(long (*fn)(void)){ g_csi_h = fn; }
 
+/* ---- EXTENSION RPCs: the live address index --------------------------------
+ * Bitcoin Core has NO address index and no RPC of these names; these exist in
+ * the spirit of the old addrindex patch set (getaddressbalance /
+ * getaddresstxids) and are served from daemon/addr_index_tail.c's journal.
+ * They answer only when the operator enabled addrindex=1; otherwise the error
+ * says exactly how to turn the index on. Input: a single address string, an
+ * array of addresses, or the addrindex patch's {"addresses":[...]} object.
+ * getaddressbalance: {"balance","received","utxos"} summed over the inputs
+ * (satoshis; "received" = every output ever created for the address).
+ * getaddresstxids: deduplicated txids (display hex) of every transaction that
+ * created an output for -- or spent one from -- the given addresses, in index
+ * (chain) order. */
+extern long axt_read_address(int type, const unsigned char hash[32],
+                             unsigned long long* balance, unsigned long long* received,
+                             long* nutxo, unsigned char* txids, long txid_cap);
+extern long axt_probe_covered(void);
+
+#define AXR_TXID_CAP 100000
+
+/* collect the address strings from any accepted param shape; returns count
+ * or -1 on a malformed request */
+static long axr_collect(const rj_val* params, const rj_val** out, long cap){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1) return -1;
+    const rj_val* a = params->items[0];
+    if (a->typ == RJ_STR){ out[0] = a; return 1; }
+    if (a->typ == RJ_OBJ){
+        const rj_val* arr = rj_obj_get((rj_val*)a, "addresses");
+        if (!arr || arr->typ != RJ_ARR) return -1;
+        a = arr;
+    }
+    if (a->typ != RJ_ARR) return -1;
+    long n = 0;
+    for (unsigned long i = 0; i < a->nitems && n < cap; i++){
+        if (a->items[i]->typ != RJ_STR) return -1;
+        out[n++] = a->items[i];
+    }
+    return n;
+}
+
+/* decode one address into the index key; 1 ok / 0 invalid */
+static int axr_key(const char* addr, int* type, unsigned char key[32]){
+    int t = 0; unsigned char ver, h160[20], prog[32];
+    if (!wallet_validate_address(addr, &t, &ver, h160, prog)) return 0;
+    if (t < 1 || t > 5) return 0;               /* WAL_ADDR_* 1..5 == AXF_* */
+    memset(key, 0, 32);
+    if (t == 4 || t == 5) memcpy(key, prog, 32);        /* P2WSH / P2TR */
+    else                  memcpy(key, h160, 20);        /* 20-byte types */
+    *type = t;
+    return 1;
+}
+
+static int axr_enabled(long* ec, const char** em){
+    if (axt_probe_covered() >= 0) return 1;
+    *ec = -1;
+    *em = "Address index not available (extension; set addrindex=1 in bitcoin.conf "
+          "before the node syncs -- Core itself has no address index)";
+    return 0;
+}
+
+static int cmd_getaddressbalance(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const rj_val* addrs[64];
+    long na = axr_collect(params, addrs, 64);
+    if (na < 1){ *ec = -8; *em = "getaddressbalance(address | [addresses] | {\"addresses\":[...]})"; return 0; }
+    if (!axr_enabled(ec, em)) return 0;
+    unsigned long long bal = 0, rcv = 0; long utxos = 0;
+    static unsigned char txids[AXR_TXID_CAP * 32];
+    for (long i = 0; i < na; i++){
+        int t; unsigned char key[32];
+        if (!axr_key(addrs[i]->str, &t, key)){ *ec = -5; *em = "Invalid address"; return 0; }
+        unsigned long long b, r; long nu;
+        if (axt_read_address(t, key, &b, &r, &nu, txids, 0) < 0){
+            *ec = -1; *em = "Address index unreadable"; return 0; }
+        bal += b; rcv += r; utxos += nu;
+    }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "balance",  rj_numf("%llu", bal));
+    rj_obj_set(o, "received", rj_numf("%llu", rcv));
+    rj_obj_set(o, "utxos",    rj_numf("%ld", utxos));
+    *res = o;
+    return 1;
+}
+
+static int cmd_getaddresstxids(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const rj_val* addrs[64];
+    long na = axr_collect(params, addrs, 64);
+    if (na < 1){ *ec = -8; *em = "getaddresstxids(address | [addresses] | {\"addresses\":[...]})"; return 0; }
+    if (!axr_enabled(ec, em)) return 0;
+    static unsigned char txids[AXR_TXID_CAP * 32];
+    rj_val* arr = rj_arr();
+    for (long i = 0; i < na; i++){
+        int t; unsigned char key[32];
+        if (!axr_key(addrs[i]->str, &t, key)){ rj_free(arr); *ec = -5; *em = "Invalid address"; return 0; }
+        unsigned long long b, r; long nu;
+        long n = axt_read_address(t, key, &b, &r, &nu, txids, AXR_TXID_CAP);
+        if (n < 0){ rj_free(arr); *ec = -1; *em = "Address index unreadable"; return 0; }
+        for (long k = 0; k < n; k++){
+            char hx[65];
+            hex_rev(hx, txids + k * 32, 32);    /* wire -> display order */
+            /* cross-address dedup: linear over what's already in the array
+             * (na is <=64 and per-address lists are already unique) */
+            int dup = 0;
+            for (unsigned long e = 0; e < arr->nitems; e++)
+                if (!strcmp(arr->items[e]->str, hx)){ dup = 1; break; }
+            if (!dup) rj_arr_push(arr, rj_str(hx));
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
 static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     /* Core does not type-check the arg -- it returns {} for a non-matching
@@ -3330,6 +3629,16 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
           rj_obj_set(e, "synced", rj_bool(tip >= 0 && bn - 1 >= tip));
           rj_obj_set(e, "best_block_height", rj_numf("%ld", bn - 1));
           rj_obj_set(o, "basic block filter index", e);
+      } }
+    { long an = axt_probe_covered();
+      if (an >= 0 && (!want || !strcmp(want, "addressindex"))){
+          /* EXTENSION index (Core has no address index); reported here so an
+           * operator can see coverage the same way as the real Core indexes */
+          rj_val* e = rj_obj();
+          long tip = refresh();
+          rj_obj_set(e, "synced", rj_bool(tip >= 0 && an >= tip));
+          rj_obj_set(e, "best_block_height", rj_numf("%ld", an));
+          rj_obj_set(o, "addressindex", e);
       } }
     if (g_csi_h && (!want || !strcmp(want, "coinstatsindex"))){
         long ch = g_csi_h();
@@ -3589,6 +3898,8 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
     if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     if (!strcmp(m, "getindexinfo")) return cmd_getindexinfo(params, res, ec, em);
+    if (!strcmp(m, "getaddressbalance")) return cmd_getaddressbalance(params, res, ec, em);
+    if (!strcmp(m, "getaddresstxids")) return cmd_getaddresstxids(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);

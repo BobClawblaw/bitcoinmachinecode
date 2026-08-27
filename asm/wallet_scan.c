@@ -161,11 +161,19 @@ static unsigned long wscan_varint(const unsigned char* p, const unsigned char* e
     return v;
 }
 
-/* scriptPubKey -> our hash160, if it is a form this wallet can own. */
+/* scriptPubKey -> our hash160, if it is a form this wallet can own.
+ * P2SH added 2026-08-27 for watch-only sh(wpkh(...)) descriptors: the key
+ * array entry for those is the P2SH SCRIPT hash (rpc_desc_expand), so the
+ * exact-match lookup below stays a plain 20-byte compare. HD-seed wallets
+ * never put a script hash in their key window, so the extra arm cannot
+ * change what they match (a 160-bit collision between a key hash and a
+ * script hash is not a real event). */
 static int wscan_spk_h160(const unsigned char* spk, unsigned long len, const unsigned char** h){
     if (len == 22 && spk[0] == 0x00 && spk[1] == 0x14){ *h = spk + 2; return 1; }   /* P2WPKH */
     if (len == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 &&
         spk[23] == 0x88 && spk[24] == 0xac){ *h = spk + 3; return 1; }              /* P2PKH  */
+    if (len == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87){
+        *h = spk + 2; return 1; }                                                   /* P2SH   */
     return 0;
 }
 

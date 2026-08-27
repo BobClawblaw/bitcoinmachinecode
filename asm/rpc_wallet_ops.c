@@ -27,6 +27,7 @@
 #include "rpc_wallet_ops.h"
 #include "rpc_chain.h"
 #include "wallet_scan.h"
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,27 +65,85 @@ enum { WOP_ADDR_INVALID = 0, WOP_ADDR_P2PKH, WOP_ADDR_P2WPKH,
 #define WOP_LABELS_REL  "labels.dat"
 #define WOP_WALLET_REL  "bmcwallet.dat"
 
+#define WOP_WALLET_NAME "bmcwallet"   /* the default wallet's display name */
+
+/* ==== multi-wallet state (single-ACTIVE-wallet model) ====================
+ * Core can serve many loaded wallets at once, routed by /wallet/<name>
+ * endpoints. This node's wallet machinery (seed slot, label store, scan
+ * journal, caches) is single-instance, so exactly ONE wallet is active at a
+ * time: createwallet/loadwallet switch to it, unloadwallet leaves none.
+ * That divergence is stated in the loadwallet error when a second concurrent
+ * load is attempted, not hidden.
+ *
+ * g_aw_state: 0 = boot default (the legacy store, loaded by the daemon at
+ * startup when present); 1 = an explicitly loaded wallet (g_aw_name); 2 =
+ * explicitly none (after unloadwallet). */
+static char g_aw_name[64];
+static int  g_aw_state;
+static int  g_aw_watchonly;          /* active wallet has no keys, only
+                                        imported descriptors */
+static void (*g_aw_install_seed)(const unsigned char*);   /* daemon-registered */
+void rpc_wops_set_seed_installer(void (*fn)(const unsigned char*)){ g_aw_install_seed = fn; }
+
+const char* rpc_wops_active_wallet_name(void){
+    if (g_aw_state == 2) return NULL;
+    return g_aw_state == 1 ? g_aw_name : WOP_WALLET_NAME;
+}
+int rpc_wops_watchonly(void){ return g_aw_watchonly; }
+
+/* Reject anything that could escape the wallets/ directory. Core's rule
+ * (util/string.h + wallet.cpp): letters, digits and a safe punctuation set,
+ * no path separators, no leading dot. */
+static int wop_name_ok(const char* n){
+    if (!n || !*n || strlen(n) >= sizeof g_aw_name) return 0;
+    if (n[0] == '.') return 0;
+    for (const char* p = n; *p; p++)
+        if (!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||
+              *p=='-'||*p=='_'||*p=='.')) return 0;
+    return 1;
+}
+
+#define WOP_WATCH_REL  "bmcwallet.watch"     /* watch-only shell marker  */
+#define WOP_DESCS_REL  "descriptors.dat"     /* imported descriptors     */
+
+/* forward decl: the ACTIVE wallet may scope wallet files into a subdir */
+static const char* wop_wallet_prefix(void);
+
 static const char* wop_path(const char* rel, char* buf, size_t cap){
-    snprintf(buf, cap, "data/%s", rel);
+    const char* wp = wop_wallet_prefix();
+    snprintf(buf, cap, "data/%s%s", wp, rel);
     struct stat sb;
     if (stat(buf, &sb) == 0) return buf;
-    snprintf(buf, cap, "%s", rel);
+    snprintf(buf, cap, "%s%s", wp, rel);
     if (stat(buf, &sb) == 0) return buf;
     /* Neither exists yet. Writers need a path anyway: prefer data/ when that
      * directory is present, else the cwd -- the same choice the CLI makes. */
-    if (stat("data", &sb) == 0 && S_ISDIR(sb.st_mode)) snprintf(buf, cap, "data/%s", rel);
-    else snprintf(buf, cap, "%s", rel);
+    if (stat("data", &sb) == 0 && S_ISDIR(sb.st_mode)) snprintf(buf, cap, "data/%s%s", wp, rel);
+    else snprintf(buf, cap, "%s%s", wp, rel);
     return buf;
 }
 static int wop_exists(const char* rel){
     char b[512]; struct stat sb;
-    snprintf(b, sizeof b, "data/%s", rel); if (stat(b, &sb) == 0) return 1;
-    snprintf(b, sizeof b, "%s", rel);      return stat(b, &sb) == 0;
+    const char* wp = wop_wallet_prefix();
+    snprintf(b, sizeof b, "data/%s%s", wp, rel); if (stat(b, &sb) == 0) return 1;
+    snprintf(b, sizeof b, "%s%s", wp, rel);      return stat(b, &sb) == 0;
+}
+/* "" for the default wallet; "wallets/<name>/" for a named one. A static
+ * buffer is fine: single RPC thread, and the prefix changes only inside
+ * load/create which run on that thread. */
+static const char* wop_wallet_prefix(void){
+    static char pfx[96];
+    if (g_aw_state == 1 && g_aw_name[0]){
+        snprintf(pfx, sizeof pfx, "wallets/%s/", g_aw_name);
+        return pfx;
+    }
+    return "";
 }
 
-/* The single wallet's name. This node loads one wallet from a fixed path, so
- * the name is fixed too; Core would report the wallet's directory name. */
-#define WOP_WALLET_NAME "bmcwallet"
+/* The DEFAULT wallet's name. Named wallets (multi-wallet, 2026-08-27) live
+ * under wallets/<name>/ beneath the same data root; the default wallet stays
+ * at the legacy root path so production is untouched. */
+
 
 /* ---- small helpers ------------------------------------------------------ */
 static int wop_err(long* ec, const char** em, long code, const char* msg){
@@ -182,24 +241,304 @@ static int cmd_getaddressesbylabel(const rj_val* params, long* ec, const char** 
 
 static int cmd_listwallets(rj_val** res){
     rj_val* arr = rj_arr();
-    /* Core lists LOADED wallets. This node loads its one wallet at startup
-     * when the store exists, so presence of the store is the load state. */
-    if (wop_exists(WOP_WALLET_REL)) rj_arr_push(arr, rj_str(WOP_WALLET_NAME));
+    /* Core lists LOADED wallets. Exactly one can be active here (see the
+     * multi-wallet state note above); after unloadwallet the list is empty. */
+    const char* n = rpc_wops_active_wallet_name();
+    if (n && (g_aw_state == 1 || wop_exists(WOP_WALLET_REL)))
+        rj_arr_push(arr, rj_str(n));
     *res = arr;
     return 1;
 }
 
 static int cmd_listwalletdir(rj_val** res){
     rj_val* arr = rj_arr();
-    if (wop_exists(WOP_WALLET_REL)){
-        rj_val* e = rj_obj();
-        rj_obj_set(e, "name", rj_str(WOP_WALLET_NAME));
-        rj_obj_set(e, "warnings", rj_arr());
-        rj_arr_push(arr, e);
-    }
+    /* the default wallet at the legacy root path... */
+    { char b[512]; struct stat sb;
+      snprintf(b, sizeof b, "data/%s", WOP_WALLET_REL);
+      int have = stat(b, &sb) == 0;
+      if (!have){ snprintf(b, sizeof b, "%s", WOP_WALLET_REL); have = stat(b, &sb) == 0; }
+      if (have){
+          rj_val* e = rj_obj();
+          rj_obj_set(e, "name", rj_str(WOP_WALLET_NAME));
+          rj_obj_set(e, "warnings", rj_arr());
+          rj_arr_push(arr, e);
+      } }
+    /* ...plus every named wallet under wallets/ (key store or watch shell) */
+    { const char* roots[2] = { "data/wallets", "wallets" };
+      for (int r = 0; r < 2; r++){
+          DIR* d = opendir(roots[r]); if (!d) continue;
+          struct dirent* de;
+          while ((de = readdir(d))){
+              if (de->d_name[0] == '.') continue;
+              char b[600]; struct stat sb;
+              snprintf(b, sizeof b, "%s/%s/%s", roots[r], de->d_name, WOP_WALLET_REL);
+              int have = stat(b, &sb) == 0;
+              if (!have){ snprintf(b, sizeof b, "%s/%s/%s", roots[r], de->d_name, WOP_WATCH_REL);
+                          have = stat(b, &sb) == 0; }
+              if (!have) continue;
+              /* don't double-report a wallet visible under both roots */
+              int dup = 0;
+              for (unsigned long i = 0; i < arr->nitems; i++){
+                  rj_val* nm = rj_obj_get(arr->items[i], "name");
+                  if (nm && nm->str && !strcmp(nm->str, de->d_name)){ dup = 1; break; }
+              }
+              if (dup) continue;
+              rj_val* e = rj_obj();
+              rj_obj_set(e, "name", rj_str(de->d_name));
+              rj_obj_set(e, "warnings", rj_arr());
+              rj_arr_push(arr, e);
+          }
+          closedir(d);
+      } }
     rj_val* o = rj_obj();
     rj_obj_set(o, "wallets", arr);
     *res = o;
+    return 1;
+}
+
+/* ==== wallet lifecycle (createwallet / loadwallet / unloadwallet /
+ *      restorewallet), 2026-08-27 ========================================= */
+extern int  wallet_store_create(const char* path, const char* mnemonic, const char* pass);
+extern int  wallet_store_load(const char* path, char* mnemonic_out, int cap,
+                              char* pass_out, int pcap);
+extern int  wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
+                                 const char* pass, long passlen);
+extern int  wallet_mnemonic_generate(char out[256]);   /* wallet_core.c, 1 = ok */
+static void wop_watch_keys_invalidate(void);
+static void wop_records_invalidate(void);
+
+/* Make wallets/<name>/ under whichever root wop_path would write to. */
+static int wop_wallet_mkdir(const char* name, char* dir, size_t cap){
+    struct stat sb;
+    const char* root = (stat("data", &sb) == 0 && S_ISDIR(sb.st_mode)) ? "data" : ".";
+    char b[600];
+    snprintf(b, sizeof b, "%s/wallets", root);       mkdir(b, 0700);
+    snprintf(b, sizeof b, "%s/wallets/%s", root, name); mkdir(b, 0700);
+    if (stat(b, &sb) != 0 || !S_ISDIR(sb.st_mode)) return 0;
+    snprintf(dir, cap, "%s", b);
+    return 1;
+}
+static int wop_named_store_path(const char* name, const char* rel, char* buf, size_t cap){
+    char b[600]; struct stat sb;
+    snprintf(b, sizeof b, "data/wallets/%s/%s", name, rel);
+    if (stat(b, &sb) == 0){ snprintf(buf, cap, "%s", b); return 1; }
+    snprintf(b, sizeof b, "wallets/%s/%s", name, rel);
+    if (stat(b, &sb) == 0){ snprintf(buf, cap, "%s", b); return 1; }
+    return 0;
+}
+
+/* Switch the active wallet, deriving + installing the seed (or clearing it
+ * for a watch-only shell). Resets every per-wallet cache. Returns 1, or 0
+ * with ec/em set. */
+static int wop_activate(const char* name, long* ec, const char** em){
+    static char perr[256];
+    int is_default = (!name || !*name || !strcmp(name, WOP_WALLET_NAME));
+    char store[640]; int watch = 0;
+    if (is_default){
+        char b[512]; struct stat sb;
+        snprintf(b, sizeof b, "data/%s", WOP_WALLET_REL);
+        if (stat(b, &sb) != 0){ snprintf(b, sizeof b, "%s", WOP_WALLET_REL);
+                                 if (stat(b, &sb) != 0){
+            *ec = -18; *em = "Requested wallet does not exist or is not loaded"; return 0; } }
+        snprintf(store, sizeof store, "%s", b);
+    } else {
+        if (!wop_name_ok(name)) { *ec = -8; *em = "Invalid wallet name"; return 0; }
+        if (wop_named_store_path(name, WOP_WALLET_REL, store, sizeof store)) watch = 0;
+        else if (wop_named_store_path(name, WOP_WATCH_REL, store, sizeof store)) watch = 1;
+        else { *ec = -18; *em = "Requested wallet does not exist or is not loaded"; return 0; }
+    }
+    if (!g_aw_install_seed){
+        *ec = -4; *em = "wallet switching is unavailable: no seed installer registered "
+                        "(the standalone RPC daemon serves the boot wallet only)"; return 0; }
+    if (!watch){
+        static char mn[768], pass[256];
+        pass[0] = 0;
+        { const char* sec = getenv("BMC_WALLET_PASS");
+          if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec);
+          else { char pf[700]; snprintf(pf, sizeof pf, "%s.pass", store);
+                 FILE* f = fopen(pf, "r");
+                 if (f){ if (fgets(pass, sizeof pass, f)){ char* nl = strchr(pass, '\n'); if (nl) *nl = 0; }
+                         fclose(f); } } }
+        if (wallet_store_load(store, mn, (int)sizeof mn, pass, (int)sizeof pass) != 0){
+            memset(mn, 0, sizeof mn); memset(pass, 0, sizeof pass);
+            snprintf(perr, sizeof perr, "Wallet file verification failed. Failed to load "
+                     "wallet store %s (encrypted? set BMC_WALLET_PASS or %s.pass)", store, store);
+            *ec = -18; *em = perr; return 0;
+        }
+        static unsigned char seed[64];
+        wallet_mnemonic_seed(seed, mn, pass[0] ? pass : NULL, pass[0] ? (long)strlen(pass) : 0);
+        memset(mn, 0, sizeof mn); memset(pass, 0, sizeof pass);
+        g_aw_install_seed(seed);
+        memset(seed, 0, sizeof seed);
+        g_aw_watchonly = 0;
+    } else {
+        g_aw_install_seed(NULL);       /* no keys: watch-only */
+        g_aw_watchonly = 1;
+    }
+    if (is_default){ g_aw_state = 0; g_aw_name[0] = 0; }
+    else { g_aw_state = 1; snprintf(g_aw_name, sizeof g_aw_name, "%s", name); }
+    wop_records_invalidate();
+    wop_watch_keys_invalidate();
+    return 1;
+}
+
+static int cmd_loadwallet(const rj_val* params, long* ec, const char** em, rj_val** res){
+    const char* name = wop_str_arg(params, 0);
+    if (!name) return wop_err(ec, em, -8, "loadwallet requires a wallet name");
+    if (!wop_activate(name, ec, em)) return 0;
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "name", rj_str(rpc_wops_active_wallet_name()));
+    rj_val* w = rj_arr();
+    rj_arr_push(w, rj_str("this node serves ONE active wallet at a time; loading "
+                          "a wallet switches to it (Core would keep both loaded)"));
+    rj_obj_set(o, "warnings", w);
+    *res = o;
+    return 1;
+}
+
+static int cmd_unloadwallet(const rj_val* params, long* ec, const char** em, rj_val** res){
+    const char* cur = rpc_wops_active_wallet_name();
+    if (!cur || (g_aw_state == 0 && !wop_exists(WOP_WALLET_REL)))
+        return wop_err(ec, em, -18, "Requested wallet does not exist or is not loaded");
+    const char* name = wop_str_arg(params, 0);
+    if (name && *name && strcmp(name, cur))
+        return wop_err(ec, em, -18, "Requested wallet does not exist or is not loaded");
+    if (!g_aw_install_seed)
+        return wop_err(ec, em, -4, "wallet switching is unavailable: no seed installer registered");
+    g_aw_install_seed(NULL);
+    g_aw_state = 2; g_aw_name[0] = 0; g_aw_watchonly = 0;
+    wop_records_invalidate();
+    wop_watch_keys_invalidate();
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "warnings", rj_arr());
+    *res = o;
+    return 1;
+}
+
+static int cmd_createwallet(const rj_val* params, long* ec, const char** em, rj_val** res){
+    static char perr[192];
+    const char* name = wop_str_arg(params, 0);
+    if (!name || !*name) return wop_err(ec, em, -8, "createwallet requires a wallet name");
+    if (!wop_name_ok(name) || !strcmp(name, WOP_WALLET_NAME))
+        return wop_err(ec, em, -8, "Invalid wallet name");
+    if (!g_aw_install_seed)
+        return wop_err(ec, em, -4, "wallet switching is unavailable: no seed installer "
+                       "registered (the standalone RPC daemon serves the boot wallet only)");
+    int disable_priv = 0, blank = 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL && !strcmp(params->items[1]->str,"1")) disable_priv = 1;
+    if (params->nitems >= 3 && params->items[2]->typ == RJ_BOOL && !strcmp(params->items[2]->str,"1")) blank = 1;
+    if (params->nitems >= 4 && params->items[3]->typ == RJ_STR && params->items[3]->str[0])
+        return wop_err(ec, em, -4,
+            "wallet creation with a passphrase is not supported for named wallets on "
+            "this node; at-rest encryption serves the default wallet (encryptwallet)");
+    char st[640];
+    if (wop_named_store_path(name, WOP_WALLET_REL, st, sizeof st) ||
+        wop_named_store_path(name, WOP_WATCH_REL, st, sizeof st)){
+        snprintf(perr, sizeof perr, "Wallet \"%s\" already exists.", name);
+        return wop_err(ec, em, -4, perr);
+    }
+    char dir[640];
+    if (!wop_wallet_mkdir(name, dir, sizeof dir))
+        return wop_err(ec, em, -4, "could not create the wallet directory");
+    if (disable_priv || blank){
+        char b[720]; snprintf(b, sizeof b, "%s/%s", dir, WOP_WATCH_REL);
+        FILE* f = fopen(b, "w");
+        if (!f) return wop_err(ec, em, -4, "could not write the wallet");
+        fputs("BMCWATCH v1\n", f); fclose(f);
+    } else {
+        char mn[256];
+        if (!wallet_mnemonic_generate(mn))
+            return wop_err(ec, em, -4, "mnemonic generation failed");
+        char b[720]; snprintf(b, sizeof b, "%s/%s", dir, WOP_WALLET_REL);
+        int rc = wallet_store_create(b, mn, "");
+        memset(mn, 0, sizeof mn);
+        if (rc != 0) return wop_err(ec, em, -4, "could not write the wallet store");
+    }
+    if (!wop_activate(name, ec, em)) return 0;   /* Core loads on create */
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "name", rj_str(name));
+    rj_val* w = rj_arr();
+    if (disable_priv || blank)
+        rj_arr_push(w, rj_str("watch-only wallet: import descriptors with "
+                              "importdescriptors, then rescanblockchain"));
+    rj_obj_set(o, "warnings", w);
+    *res = o;
+    return 1;
+}
+
+static int cmd_restorewallet(const rj_val* params, long* ec, const char** em, rj_val** res){
+    static char perr[192];
+    const char* name = wop_str_arg(params, 0);
+    const char* backup = wop_str_arg(params, 1);
+    if (!name || !backup)
+        return wop_err(ec, em, -8, "restorewallet requires a wallet name and a backup path");
+    if (!wop_name_ok(name) || !strcmp(name, WOP_WALLET_NAME))
+        return wop_err(ec, em, -8, "Invalid wallet name");
+    char st[640];
+    if (wop_named_store_path(name, WOP_WALLET_REL, st, sizeof st) ||
+        wop_named_store_path(name, WOP_WATCH_REL, st, sizeof st)){
+        snprintf(perr, sizeof perr, "Wallet \"%s\" already exists.", name);
+        return wop_err(ec, em, -36, perr);      /* Core: RPC_WALLET_ALREADY_EXISTS */
+    }
+    /* prove the backup loads BEFORE installing it */
+    { char mn[768], ps[256]; ps[0] = 0;
+      if (wallet_store_load(backup, mn, (int)sizeof mn, ps, (int)sizeof ps) != 0){
+          memset(mn, 0, sizeof mn);
+          return wop_err(ec, em, -18, "Backup file does not exist or is not a wallet store"); }
+      memset(mn, 0, sizeof mn); memset(ps, 0, sizeof ps); }
+    char dir[640];
+    if (!wop_wallet_mkdir(name, dir, sizeof dir))
+        return wop_err(ec, em, -4, "could not create the wallet directory");
+    char dst[720]; snprintf(dst, sizeof dst, "%s/%s", dir, WOP_WALLET_REL);
+    FILE* in = fopen(backup, "rb"); FILE* outf = in ? fopen(dst, "wb") : NULL;
+    if (!in || !outf){ if (in) fclose(in); return wop_err(ec, em, -4, "could not copy the backup"); }
+    { char buf[4096]; size_t n;
+      while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+          if (fwrite(buf, 1, n, outf) != n){ fclose(in); fclose(outf);
+              return wop_err(ec, em, -4, "could not copy the backup"); } }
+    fclose(in); fclose(outf);
+    if (!wop_activate(name, ec, em)) return 0;
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "name", rj_str(name));
+    rj_obj_set(o, "warnings", rj_arr());
+    *res = o;
+    return 1;
+}
+
+#define WOP_MAX_DESCS 16
+typedef struct { char desc[340]; long range; long next; int script; } wop_desc_t;
+static wop_desc_t g_wd[WOP_MAX_DESCS];
+static int  g_wd_n = -1;                  /* -1 = not loaded from file */
+static wscan_key* g_wk;                   /* descriptor-derived key window */
+static int  g_wk_n = -1;
+static void wop_watch_keys_invalidate(void){ g_wd_n = -1; g_wk_n = -1; }
+
+static int wop_descs_load(void){
+    if (g_wd_n >= 0) return g_wd_n;
+    g_wd_n = 0;
+    char pb[512]; FILE* f = fopen(wop_path(WOP_DESCS_REL, pb, sizeof pb), "r");
+    if (!f) return 0;
+    char line[512];
+    while (g_wd_n < WOP_MAX_DESCS && fgets(line, sizeof line, f)){
+        char* t1 = strchr(line, '\t'); if (!t1) continue;
+        *t1 = 0;
+        long range = strtol(t1+1, NULL, 10);
+        char* t2 = strchr(t1+1, '\t');
+        long next = t2 ? strtol(t2+1, NULL, 10) : 0;
+        wop_desc_t* d = &g_wd[g_wd_n];
+        snprintf(d->desc, sizeof d->desc, "%s", line);
+        d->range = range > 0 ? range : 1; d->next = next; d->script = 1;
+        g_wd_n++;
+    }
+    fclose(f);
+    return g_wd_n;
+}
+static int wop_descs_save(void){
+    char pb[512]; FILE* f = fopen(wop_path(WOP_DESCS_REL, pb, sizeof pb), "w");
+    if (!f) return 0;
+    for (int i = 0; i < g_wd_n; i++)
+        fprintf(f, "%s\t%ld\t%ld\n", g_wd[i].desc, g_wd[i].range, g_wd[i].next);
+    fclose(f);
     return 1;
 }
 
@@ -429,6 +768,27 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
         return wop_err(ec, em, -1,
             "listdescriptors true would export private keys; this node does not "
             "serve private key material over RPC. Use the wallet CLI on the host.");
+    if ((!w || !w->seed) && g_aw_watchonly){
+        /* watch-only: report the imported descriptors verbatim */
+        wop_descs_load();
+        rj_val* arr = rj_arr();
+        for (int i = 0; i < g_wd_n; i++){
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "desc", rj_str(g_wd[i].desc));
+            rj_obj_set(e, "active", rj_bool(i == 0));
+            rj_val* rg = rj_arr();
+            rj_arr_push(rg, rj_numf("%d", 0));
+            rj_arr_push(rg, rj_numf("%ld", g_wd[i].range - 1));
+            rj_obj_set(e, "range", rg);
+            rj_obj_set(e, "next_index", rj_numf("%ld", g_wd[i].next));
+            rj_arr_push(arr, e);
+        }
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "wallet_name", rj_str(rpc_wops_active_wallet_name()));
+        rj_obj_set(o, "descriptors", arr);
+        *res = o;
+        return 1;
+    }
     if (!w || !w->seed) return wop_err(ec, em, -4, "No wallet is loaded");
     rj_val* arr = rj_arr();
     for (int ch = 0; ch <= 1; ch++){
@@ -436,7 +796,7 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
         if (e) rj_arr_push(arr, e);
     }
     rj_val* o = rj_obj();
-    rj_obj_set(o, "wallet_name", rj_str(WOP_WALLET_NAME));
+    rj_obj_set(o, "wallet_name", rj_str(rpc_wops_active_wallet_name()));
     rj_obj_set(o, "descriptors", arr);
     *res = o;
     return 1;
@@ -462,17 +822,76 @@ static int cmd_gethdkeys(const rj_val* params, const rpc_wallet* w, rj_val** res
  * These are not refusals. This node's wallet IS unencrypted, and the answers
  * below are byte-for-byte what Core returns for an unencrypted wallet --
  * verified against the oracle. encryptwallet is the one real gap. */
+/* wallet encryption state machine (daemon/wallet_enc_state.c) */
+extern int  wenc_is_encrypted(void);
+extern int  wenc_encrypt(const char* mn, const char* mn_pass, const char* wpass, long wplen);
+extern int  wenc_unlock(const char* pass, long plen, long seconds);
+extern void wenc_lock(void);
+extern int  wenc_change(const char* oldp, long ol, const char* newp, long nl);
+/* the loaded mnemonic, exposed by the daemon so encryptwallet can seal it */
+extern int  wenc_current_mnemonic(char* out, long cap, char* pass_out, long pcap);
+
 static int cmd_walletlock(long* ec, const char** em){
-    return wop_err(ec, em, -15,
-        "Error: running with an unencrypted wallet, but walletlock was called.");
+    if (!wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an unencrypted wallet, but walletlock was called.");
+    wenc_lock();
+    return 1;   /* Core returns null on success */
 }
-static int cmd_walletpassphrase(long* ec, const char** em){
-    return wop_err(ec, em, -15,
-        "Error: running with an unencrypted wallet, but walletpassphrase was called.");
+static int cmd_walletpassphrase(const rj_val* params, long* ec, const char** em){
+    if (!wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an unencrypted wallet, but walletpassphrase was called.");
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 ||
+        params->items[0]->typ != RJ_STR || params->items[1]->typ != RJ_NUM)
+        return wop_err(ec, em, -8, "walletpassphrase(passphrase, timeout)");
+    const char* pass = params->items[0]->str;
+    long secs = atol(params->items[1]->str);
+    if (secs <= 0) return wop_err(ec, em, -8, "Timeout must be a positive integer");
+    if (wenc_unlock(pass, (long)strlen(pass), secs) != 1)
+        return wop_err(ec, em, -14,
+            "Error: The wallet passphrase entered was incorrect.");
+    return 1;
 }
-static int cmd_walletpassphrasechange(long* ec, const char** em){
-    return wop_err(ec, em, -15,
-        "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
+static int cmd_walletpassphrasechange(const rj_val* params, long* ec, const char** em){
+    if (!wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 ||
+        params->items[0]->typ != RJ_STR || params->items[1]->typ != RJ_STR)
+        return wop_err(ec, em, -8, "walletpassphrasechange(old, new)");
+    const char* op = params->items[0]->str;
+    const char* np = params->items[1]->str;
+    if (wenc_change(op, (long)strlen(op), np, (long)strlen(np)) != 1)
+        return wop_err(ec, em, -14,
+            "Error: The wallet passphrase entered was incorrect.");
+    return 1;
+}
+static int wop_named_active(void){ return g_aw_state == 1; }
+static int cmd_encryptwallet(const rj_val* params, const rpc_wallet* w,
+                             long* ec, const char** em, rj_val** res){
+    if (wop_named_active())
+        return wop_err(ec, em, -4,
+            "at-rest encryption serves the DEFAULT wallet on this node "
+            "(daemon/wallet_enc_state.c is single-instance); load the default "
+            "wallet to encrypt it");
+    if (wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an encrypted wallet, but encryptwallet was called.");
+    if (!w || !w->seed)
+        return wop_err(ec, em, -4, "Error: the wallet is not loaded, cannot encrypt");
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR)
+        return wop_err(ec, em, -8, "encryptwallet(passphrase)");
+    const char* pass = params->items[0]->str;
+    if (strlen(pass) < 1) return wop_err(ec, em, -8, "passphrase can not be empty");
+    static char mn[768], mp[256];
+    if (wenc_current_mnemonic(mn, sizeof mn, mp, sizeof mp) != 1)
+        return wop_err(ec, em, -4, "Error: could not read the wallet mnemonic to encrypt");
+    int r = wenc_encrypt(mn, mp[0]?mp:0, pass, (long)strlen(pass));
+    memset(mn, 0, sizeof mn); memset(mp, 0, sizeof mp);
+    if (r != 1) return wop_err(ec, em, -4, "Error: failed to write the encrypted wallet");
+    *res = rj_str("wallet encrypted; The wallet is now locked. Use walletpassphrase to unlock it.");
+    return 1;
 }
 
 /* ==== rescan state =======================================================
@@ -565,7 +984,50 @@ static int g_ks_valid;
 static wscan_key* g_ks;
 static int g_ks_n;
 
+/* ---- watch-only descriptor keyset ---------------------------------------
+ * A watch-only wallet has no seed; its scan window comes from the imported
+ * descriptors instead: for slot s and index i the entry is
+ *   { h160 = the 20 bytes rpc_desc_expand computes, keyidx = i, branch = s }
+ * so every journal record maps back to (descriptor, index) for address
+ * rendering, exactly as an HD record maps to (branch, index). Slot count is
+ * bounded by the branch byte (255) and total entries by the same window the
+ * HD wallet uses. */
+long rpc_desc_expand(const char* in, long start, long count,
+                     unsigned char (*h160s)[20], long cap, int* script_type,
+                     char* err, unsigned long errcap);
+int  rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
+                        char* err, unsigned long errcap);
+int  rpc_desc_address_at(const char* in, long idx, char* out, long cap,
+                         char* err, unsigned long errcap);
+
+static int wop_watch_keyset(const wscan_key** out){
+    if (g_wk_n >= 0){ *out = g_wk; return g_wk_n; }
+    int nd = wop_descs_load();
+    if (!g_wk) g_wk = malloc((size_t)(WOP_SCAN_KEYS*2) * sizeof *g_wk);
+    if (!g_wk){ *out = NULL; return 0; }
+    g_wk_n = 0;
+    static unsigned char h[WOP_SCAN_KEYS*2][20];
+    for (int sdx = 0; sdx < nd && sdx < 255; sdx++){
+        long cap = WOP_SCAN_KEYS*2 - g_wk_n;
+        long want = g_wd[sdx].range < cap ? g_wd[sdx].range : cap;
+        char err[128]; int sc;
+        long n = rpc_desc_expand(g_wd[sdx].desc, 0, want, h, want, &sc, err, sizeof err);
+        if (n < 0) continue;
+        g_wd[sdx].script = sc;
+        for (long i = 0; i < n; i++){
+            memcpy(g_wk[g_wk_n].h160, h[i], 20);
+            g_wk[g_wk_n].keyidx = (unsigned)i;
+            g_wk[g_wk_n].branch = (unsigned char)sdx;
+            g_wk_n++;
+        }
+    }
+    qsort(g_wk, (size_t)g_wk_n, sizeof g_wk[0], wscan_key_cmp);
+    *out = g_wk;
+    return g_wk_n;
+}
+
 static int wop_keyset_cached(const rpc_wallet* w, const wscan_key** out){
+    if ((!w || !w->seed) && g_aw_watchonly) return wop_watch_keyset(out);
     if (!w || !w->seed){ *out = NULL; return 0; }
     if (g_ks_valid && !memcmp(g_ks_seed, w->seed, 64)){ *out = g_ks; return g_ks_n; }
     if (!g_ks) g_ks = malloc((size_t)(WOP_SCAN_KEYS*2) * sizeof *g_ks);
@@ -594,6 +1056,111 @@ int wop_keyset(const rpc_wallet* w, wscan_key* keys, int cap){
     }
     qsort(keys, (size_t)n, sizeof keys[0], wscan_key_cmp);
     return n;
+}
+
+/* ==== importdescriptors (watch-only wallets), 2026-08-27 =================
+ * Core imports descriptors into any descriptor wallet. This node's HD wallet
+ * is seed-defined, so descriptor import is supported for WATCH-ONLY wallets
+ * (createwallet name true) -- stated in the error for the seed case rather
+ * than half-imported. Result shape matches Core: one {success[,error]} per
+ * request, and a warnings entry telling the caller to rescan (Core rescans
+ * from `timestamp` automatically; here the rescan is the explicit
+ * rescanblockchain the rest of this file already documents). */
+static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
+                                 long* ec, const char** em, rj_val** res){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR)
+        return wop_err(ec, em, -8, "importdescriptors requires an array of requests");
+    if (!g_aw_watchonly)
+        return wop_err(ec, em, -4,
+            (w && w->seed)
+              ? "importdescriptors on this node serves watch-only wallets "
+                "(createwallet <name> true); the loaded wallet's keys come from "
+                "its own seed and cannot adopt foreign descriptors"
+              : "no wallet is loaded");
+    const rj_val* reqs = params->items[0];
+    wop_descs_load();
+    rj_val* arr = rj_arr();
+    int added = 0;
+    for (unsigned long i = 0; i < reqs->nitems; i++){
+        rj_val* r = rj_obj();
+        const rj_val* q = reqs->items[i];
+        const rj_val* dv = q->typ == RJ_OBJ ? rj_obj_get((rj_val*)q, "desc") : NULL;
+        char norm[340]; char err[192]; int is_range = 0;
+        if (!dv || dv->typ != RJ_STR){
+            rj_obj_set(r, "success", rj_bool(0));
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "code", rj_numf("%d", -8));
+            rj_obj_set(e, "message", rj_str("Descriptor not found."));
+            rj_obj_set(r, "error", e);
+            rj_arr_push(arr, r); continue;
+        }
+        if (!rpc_desc_normalize(dv->str, norm, sizeof norm, &is_range, err, sizeof err)){
+            rj_obj_set(r, "success", rj_bool(0));
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "code", rj_numf("%d", -5));
+            rj_obj_set(e, "message", rj_str(err));
+            rj_obj_set(r, "error", e);
+            rj_arr_push(arr, r); continue;
+        }
+        long range = 1;
+        if (is_range){
+            const rj_val* rg = rj_obj_get((rj_val*)q, "range");
+            range = 1000;                            /* the scan window default */
+            if (rg && rg->typ == RJ_NUM) range = strtol(rg->str, NULL, 10) + 1;
+            else if (rg && rg->typ == RJ_ARR && rg->nitems == 2 &&
+                     rg->items[1]->typ == RJ_NUM)
+                range = strtol(rg->items[1]->str, NULL, 10) + 1;
+            if (range < 1) range = 1;
+            if (range > WOP_SCAN_KEYS) range = WOP_SCAN_KEYS;
+        }
+        int dup = 0;
+        for (int k = 0; k < g_wd_n; k++) if (!strcmp(g_wd[k].desc, norm)){ dup = 1; break; }
+        if (!dup && g_wd_n >= WOP_MAX_DESCS){
+            rj_obj_set(r, "success", rj_bool(0));
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "code", rj_numf("%d", -4));
+            rj_obj_set(e, "message", rj_str("descriptor limit reached"));
+            rj_obj_set(r, "error", e);
+            rj_arr_push(arr, r); continue;
+        }
+        if (!dup){
+            wop_desc_t* d = &g_wd[g_wd_n++];
+            snprintf(d->desc, sizeof d->desc, "%s", norm);
+            d->range = range; d->next = 0; d->script = 1;
+            added++;
+        }
+        rj_obj_set(r, "success", rj_bool(1));
+        rj_val* wa = rj_arr();
+        rj_arr_push(wa, rj_str("run rescanblockchain to discover this descriptor's "
+                               "history (this node does not rescan on import)"));
+        rj_obj_set(r, "warnings", wa);
+        rj_arr_push(arr, r);
+    }
+    if (added){ wop_descs_save(); g_wk_n = -1; wop_records_invalidate(); }
+    *res = arr;
+    return 1;
+}
+
+/* The next unused receive address of a watch-only wallet: descriptor slot 0's
+ * next index (bumped and persisted). Exported for rpc_commands.c's
+ * getnewaddress, whose HD path needs a seed this wallet does not have. */
+int rpc_wops_watch_newaddress(char* out, long cap, long* ec, const char** em){
+    static char perr[192];
+    if (!g_aw_watchonly) return 0;
+    if (wop_descs_load() < 1)
+        return wop_err(ec, em, -4, "watch-only wallet has no descriptors: importdescriptors first");
+    wop_desc_t* d = &g_wd[0];
+    if (d->next >= d->range)
+        return wop_err(ec, em, -4, "descriptor range exhausted");
+    char err[128];
+    if (!rpc_desc_address_at(d->desc, d->next, out, cap, err, sizeof err)){
+        snprintf(perr, sizeof perr, "%s", err);
+        return wop_err(ec, em, -4, perr);
+    }
+    d->next++;
+    wop_descs_save();
+    return 1;
 }
 
 /* hash160 of the key a record belongs to. */
@@ -672,7 +1239,8 @@ int rpc_wops_own_coin(const void* wseed, const unsigned char txid_wire[32], unsi
 /* rescanblockchain ( start_height stop_height ) */
 static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
                                 long* ec, const char** em, rj_val** res){
-    if (!w || !w->seed) return wop_err(ec, em, -4, "No wallet is loaded");
+    if ((!w || !w->seed) && !g_aw_watchonly)   /* watch-only rescans by descriptor keyset */
+        return wop_err(ec, em, -4, "No wallet is loaded");
     if (!g_wops_read_block || !g_wops_tip)
         return wop_err(ec, em, -4,
             "no block archive is attached to the RPC layer, so there is "
@@ -1310,7 +1878,49 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
     unsigned long long rate = wf_feerate_sat_kvb(conf_target);
     int pick[WF_MAX_IN];
     unsigned long long fee = 0, change = 0;
-    int nin = wf_select(coins, nc, target, out_wu, rate, pick, &fee, &change);
+    /* ---- Branch-and-Bound first (Core SelectCoinsBnB; wallet_bnb.c) ----
+     * A changeless solution beats every change-making one: no change output
+     * to pay for now, no future fee to spend it. Effective values subtract
+     * each input's own fee; the BnB target is the recipients plus the
+     * NON-input fees (overhead + recipient outputs, no change); the window
+     * is what change would cost -- creating it now at the target rate plus
+     * spending it later at Core's DEFAULT_DISCARD_FEE (10000 sat/kvB over a
+     * ~68 vbyte P2WPKH input). Falls back to the iterative largest-first
+     * selector below whenever BnB finds nothing. */
+    int nin = -1;
+    {
+        extern long wallet_bnb_select(const unsigned long long*, const long long*, int,
+                                      unsigned long long, unsigned long long, int*, int);
+        static int order[4096]; static unsigned long long eff[4096];
+        unsigned long long in_fee =
+            ((unsigned long long)wf_vsize(WF_IN_BASE_WU + WF_IN_WIT_WU) * rate + 999) / 1000;
+        int ne = 0;
+        for (int i = 0; i < nc && ne < 4096; i++)
+            if (coins[i].value > in_fee){ order[ne] = i; eff[ne] = coins[i].value - in_fee; ne++; }
+        for (int i = 1; i < ne; i++){                     /* sort DESCENDING by eff */
+            int oi = order[i]; unsigned long long ei = eff[i]; int j = i - 1;
+            while (j >= 0 && eff[j] < ei){ order[j+1] = order[j]; eff[j+1] = eff[j]; j--; }
+            order[j+1] = oi; eff[j+1] = ei;
+        }
+        long base_wu = WF_OVERHEAD_WU + out_wu;
+        unsigned long long base_fee = ((unsigned long long)wf_vsize(base_wu) * rate + 999) / 1000;
+        unsigned long long change_out_cost =
+            ((unsigned long long)wf_vsize(wf_out_wu(22)) * rate + 999) / 1000;
+        unsigned long long change_spend_cost = (68ULL * 10000ULL + 999) / 1000;
+        int bpick[WF_MAX_IN];
+        long bn = wallet_bnb_select(eff, NULL, ne, target + base_fee,
+                                    change_out_cost + change_spend_cost,
+                                    bpick, WF_MAX_IN);
+        if (bn > 0){
+            unsigned long long sum = 0;
+            for (long k = 0; k < bn; k++){ pick[k] = order[bpick[k]]; sum += coins[order[bpick[k]]].value; }
+            nin = (int)bn;
+            fee = sum - target;               /* changeless: the excess is fee */
+            change = 0;
+        }
+    }
+    if (nin < 0)
+        nin = wf_select(coins, nc, target, out_wu, rate, pick, &fee, &change);
     if (nin < 0){
         unsigned long long have = 0;
         for (int i = 0; i < nc; i++) have += coins[i].value;
@@ -1795,15 +2405,17 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "gethdkeys"))           return cmd_gethdkeys(params, w, res);
 
     if (!strcmp(m, "walletlock"))              return cmd_walletlock(ec, em);
-    if (!strcmp(m, "walletpassphrase"))        return cmd_walletpassphrase(ec, em);
-    if (!strcmp(m, "walletpassphrasechange"))  return cmd_walletpassphrasechange(ec, em);
-
-    if (!strcmp(m, "encryptwallet"))       return wop_unsupported(WOP_NO_ENCRYPTION, ec, em);
-    if (!strcmp(m, "createwallet") || !strcmp(m, "loadwallet") ||
-        !strcmp(m, "unloadwallet") || !strcmp(m, "restorewallet") ||
-        !strcmp(m, "migratewallet") || !strcmp(m, "setwalletflag"))
+    if (!strcmp(m, "walletpassphrase"))        return cmd_walletpassphrase(params, ec, em);
+    if (!strcmp(m, "walletpassphrasechange"))  return cmd_walletpassphrasechange(params, ec, em);
+    if (!strcmp(m, "encryptwallet"))           return cmd_encryptwallet(params, w, ec, em, res);
+    if (!strcmp(m, "createwallet"))    return cmd_createwallet(params, ec, em, res);
+    if (!strcmp(m, "loadwallet"))      return cmd_loadwallet(params, ec, em, res);
+    if (!strcmp(m, "unloadwallet"))    return cmd_unloadwallet(params, ec, em, res);
+    if (!strcmp(m, "restorewallet"))   return cmd_restorewallet(params, ec, em, res);
+    if (!strcmp(m, "migratewallet") || !strcmp(m, "setwalletflag"))
         return wop_unsupported(WOP_ONE_WALLET, ec, em);
-    if (!strcmp(m, "importdescriptors") || !strcmp(m, "createwalletdescriptor") ||
+    if (!strcmp(m, "importdescriptors")) return cmd_importdescriptors(params, w, ec, em, res);
+    if (!strcmp(m, "createwalletdescriptor") ||
         !strcmp(m, "addhdkey") || !strcmp(m, "importprunedfunds") ||
         !strcmp(m, "removeprunedfunds") || !strcmp(m, "exportwatchonlywallet"))
         return wop_unsupported(WOP_NO_IMPORT, ec, em);
@@ -1843,6 +2455,12 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     /* the spend family -- see WOP_NO_FUNDING for why refusing is the only
      * answer that does not hand the caller a transaction the network will
      * reject */
+    if (g_aw_watchonly &&
+        (!strcmp(m, "sendtoaddress") || !strcmp(m, "sendmany") || !strcmp(m, "send") ||
+         !strcmp(m, "sendall") || !strcmp(m, "signmessage") ||
+         !strcmp(m, "walletprocesspsbt") || !strcmp(m, "fundrawtransaction") ||
+         !strcmp(m, "walletcreatefundedpsbt")))
+        return wop_err(ec, em, -4, "Error: Private keys are disabled for this wallet");
     if (!strcmp(m, "sendtoaddress"))          return cmd_sendtoaddress(params, w, ec, em, res);
     if (!strcmp(m, "sendmany"))               return cmd_sendmany(params, w, ec, em, res);
     if (!strcmp(m, "send"))                   return cmd_send(params, w, ec, em, res);
