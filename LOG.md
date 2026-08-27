@@ -7,6 +7,67 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- nBits schedule enforcement (bad-diffbits), one rule engine
+
+Closes a consensus gap this repo had documented against itself. reorg.c's
+own comment used to read: "Retarget validation is a real gap in this node's
+consensus rules; it is pre-existing, it is called out in this stage's
+report, and chainwork comparison is what contains it." A peer could serve
+headers claiming any nBits it liked; nothing checked the claim against the
+schedule Core computes. Cumulative-work fork choice contained the damage
+(a trivially-mined chain scores near zero) but containment is not
+validation.
+
+ONE IMPLEMENTATION, THREE CONSUMERS. bitcoin_pow_rules.c is Core pow.cpp's
+GetNextWorkRequired / CalculateNextWorkRequired, MOVED (not copied) out of
+rpc_chain.c's gbt_next_bits and rpc_chain_retarget. getblocktemplate, the
+apply path (utxo_live) and fork evaluation (reorg_analyze) now share it, so
+mining and enforcement cannot drift: a template this node builds is by
+construction one its own validator accepts. rpc_chain_retarget survives as
+a thin wrapper keeping the frozen hermetic KAT surface. Every consumer
+supplies its own ancestor-header reader (archive pread for the daemon, the
+candidate's own run above the attach point for reorg, an in-memory mirror
+for the replay tool).
+
+Chain-aware, passed EXPLICITLY rather than through hidden globals:
+fPowNoRetargeting (regtest), fPowAllowMinDifficultyBlocks with the
+20-minute exception and Core's walk-back loop (testnet4), enforce_BIP94
+(the boundary retarget bases on the FIRST block of the period), and
+Satoshi's 2015-gap timespan measurement on mainnet.
+
+PROOF BEFORE WIRING -- validation/pow_replay.c replays the rule against
+every header of the real chains and demands an exact nBits match at every
+height:
+  mainnet   964,265 heights,  478 boundaries,      0 min-difficulty
+  testnet4  149,954 heights,   74 boundaries, 101,009 min-difficulty,
+                                               16,491 walk-back re-anchors
+Both clean. Core accepted every one of those headers; our rule agrees with
+every one of them, so the rule is Core's rule over every input the real
+world has produced. The testnet4 run is what matters most -- it exercises
+the min-difficulty and walk-back paths 100k+ times, and mainnet touches
+neither.
+
+INJECTED, DEFAULT OFF. The hermetic suites build synthetic chains with
+arbitrary bits, so only the daemon -- which knows the selected chain --
+arms the rules (main.c, right after chainparams_select). Both enforcement
+points fail CLOSED: pow_check_bits returning -1 (an ancestor header
+unreadable) rejects, because refusing to evaluate is safer than accepting
+unevaluated, and every legitimate path has its ancestors stored. The apply
+path enforces the same rule the fork path does, so a route that skips
+analyze still cannot land a bad-diffbits block; the dry run enforces it
+too, so submitblock and GBT proposal answer Core's "bad-diffbits" without
+touching state.
+
+THE TEST THAT MATTERS. test_pow_rules pins the engine and pow_replay pins
+it against reality, but neither proves the enforcement is actually WIRED --
+and default-off means a wiring bug (setter never called, height off by one,
+reader returning the wrong ancestor) would enforce NOTHING while the whole
+suite stayed green. That is the worst failure mode consensus code has, so
+test_reorg's "nBits schedule wired into analyze" case arms the rules on a
+synthetic regtest chain and asserts a candidate with unscheduled bits is
+rejected. Verified fail-then-pass by sabotage: with the arming call removed
+the bad candidate is ACCEPTED (got=0, expected -1) and the case fails.
+
 ## 2026-08-27 -- the networking pair: stripped-block serving + BIP339 wtxidrelay
 
 Two long-standing FEATURE_GAPS networking items, closed together.
