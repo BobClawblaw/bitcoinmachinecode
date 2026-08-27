@@ -814,7 +814,9 @@ the call site. What remains declined, and why, in one place:
   addnode-family mutators, `setnetworkactive` and `ping` left this entry in
   slice 17 — the parent→worker control channel below made them real —
   and `submitheader` is handled. Corrected 2026-08-27.)*
-- **savemempool / importmempool** — no mempool.dat serialization.
+- ~~**savemempool / importmempool**~~ — **REAL 2026-08-27**: Core's
+  `mempool.dat`, written as version 1 and read as either, verified in both
+  directions against a real Core.
 - ~~**submitpackage**~~ — **REAL 2026-08-27** (slice 21): package policy,
   in-package parent resolution and Core's effective feerate, so a parent
   below the relay floor is accepted when its child pays for it. Still
