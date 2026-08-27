@@ -84,6 +84,22 @@ R_SEGWIT = rheight("SegwitHeight")
 print("regtest heights: BIP34=%d BIP66=%d BIP65=%d CSV=%d Segwit=%d"
       % (R_BIP34, R_BIP66, R_BIP65, R_CSV, R_SEGWIT))
 
+# ---- 2c. CTestNet4Params heights (testnet4 chain selection). ----
+ct4 = re.search(r"class CTestNet4Params : public CChainParams\s*\{.*?\n\};", src, re.S)
+if not ct4: sys.exit("could not find CTestNet4Params class body in " + SRC)
+t4 = ct4.group(0)
+def theight(field):
+    m = re.search(r"consensus\.%s\s*=\s*(\d+)" % field, t4)
+    if not m: sys.exit("could not find consensus.%s in CTestNet4Params" % field)
+    return int(m.group(1))
+T_BIP34 = theight("BIP34Height")
+T_BIP65 = theight("BIP65Height")
+T_BIP66 = theight("BIP66Height")
+T_CSV   = theight("CSVHeight")
+T_SEGWIT = theight("SegwitHeight")
+print("testnet4 heights: BIP34=%d BIP66=%d BIP65=%d CSV=%d Segwit=%d"
+      % (T_BIP34, T_BIP66, T_BIP65, T_CSV, T_SEGWIT))
+
 exc = re.findall(
     r"script_flag_exceptions\.emplace\(\s*//\s*(\w+) exception\s*\n\s*uint256\{\"([0-9a-f]{64})\"\},\s*([A-Z0-9_| ]+)\);",
     main)
@@ -142,6 +158,12 @@ lines.append("%%define SFC_R_HEIGHT_CLTV %d ; regtest BIP65Height" % R_BIP65)
 lines.append("%%define SFC_R_HEIGHT_CSV %d ; regtest CSVHeight" % R_CSV)
 lines.append("%%define SFC_R_HEIGHT_SEGWIT %d ; regtest SegwitHeight" % R_SEGWIT)
 lines.append("")
+lines.append("; testnet4 (CTestNet4Params) -- selected at runtime via sfc_chain")
+lines.append("%%define SFC_T_HEIGHT_DERSIG %d ; testnet4 BIP66Height" % T_BIP66)
+lines.append("%%define SFC_T_HEIGHT_CLTV %d ; testnet4 BIP65Height" % T_BIP65)
+lines.append("%%define SFC_T_HEIGHT_CSV %d ; testnet4 CSVHeight" % T_CSV)
+lines.append("%%define SFC_T_HEIGHT_SEGWIT %d ; testnet4 SegwitHeight" % T_SEGWIT)
+lines.append("")
 lines.append("section .rodata")
 for label, hexhash, rawbytes, bits in exceptions:
     lines.append("; %s exception: display hash %s -> flags 0x%x" % (label, hexhash, bits))
@@ -177,6 +199,13 @@ hdr = [
     "#define SFC_R_HEIGHT_CSV    %d" % R_CSV,
     "#define SFC_R_HEIGHT_SEGWIT %d" % R_SEGWIT,
     "",
+    "/* testnet4 (CTestNet4Params) */",
+    "#define SFC_T_HEIGHT_BIP34  %d" % T_BIP34,
+    "#define SFC_T_HEIGHT_DERSIG %d   /* BIP66 */" % T_BIP66,
+    "#define SFC_T_HEIGHT_CLTV   %d   /* BIP65 */" % T_BIP65,
+    "#define SFC_T_HEIGHT_CSV    %d" % T_CSV,
+    "#define SFC_T_HEIGHT_SEGWIT %d" % T_SEGWIT,
+    "",
     "#endif",
     "",
 ]
@@ -203,6 +232,14 @@ if not (r1 and r2 and r3 and r4):
     sys.exit("SELF-CHECK FAILED: could not re-parse the regtest heights")
 if (int(r1[0]), int(r2[0]), int(r3[0]), int(r4[0])) != (R_BIP66, R_BIP65, R_CSV, R_SEGWIT):
     sys.exit("SELF-CHECK FAILED: re-parsed regtest heights do not match")
+t1 = re.findall(r"%define SFC_T_HEIGHT_DERSIG\s+(\d+)", again)
+t2 = re.findall(r"%define SFC_T_HEIGHT_CLTV\s+(\d+)", again)
+t3 = re.findall(r"%define SFC_T_HEIGHT_CSV\s+(\d+)", again)
+t4x = re.findall(r"%define SFC_T_HEIGHT_SEGWIT\s+(\d+)", again)
+if not (t1 and t2 and t3 and t4x):
+    sys.exit("SELF-CHECK FAILED: could not re-parse the testnet4 heights")
+if (int(t1[0]), int(t2[0]), int(t3[0]), int(t4x[0])) != (T_BIP66, T_BIP65, T_CSV, T_SEGWIT):
+    sys.exit("SELF-CHECK FAILED: re-parsed testnet4 heights do not match")
 for label, hexbytes in exc_lines:
     got = bytes(int(x, 16) for x in hexbytes.split(", "))
     want = next(rb for lb, hh, rb, fl in exceptions if lb.upper() == label)
@@ -221,5 +258,8 @@ if (cdef("SFC_HEIGHT_BIP34"), cdef("SFC_HEIGHT_DERSIG"), cdef("SFC_HEIGHT_CLTV")
 if (cdef("SFC_R_HEIGHT_BIP34"), cdef("SFC_R_HEIGHT_DERSIG"), cdef("SFC_R_HEIGHT_CLTV"),
     cdef("SFC_R_HEIGHT_CSV"), cdef("SFC_R_HEIGHT_SEGWIT")) != (R_BIP34, R_BIP66, R_BIP65, R_CSV, R_SEGWIT):
     sys.exit("SELF-CHECK FAILED: the C header does not match the regtest heights")
+if (cdef("SFC_T_HEIGHT_BIP34"), cdef("SFC_T_HEIGHT_DERSIG"), cdef("SFC_T_HEIGHT_CLTV"),
+    cdef("SFC_T_HEIGHT_CSV"), cdef("SFC_T_HEIGHT_SEGWIT")) != (T_BIP34, T_BIP66, T_BIP65, T_CSV, T_SEGWIT):
+    sys.exit("SELF-CHECK FAILED: the C header does not match the testnet4 heights")
 print("self-check ok: %d heights + %d exception hashes re-parse correctly, "
       "and the C mirror agrees" % (4, len(exc_lines)))

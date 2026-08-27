@@ -292,6 +292,45 @@ and its chain limits are cluster limits -- this node targets the classic
 ancestor/descendant model its config knobs expose; differential cases
 where v31 diverges from classic policy are recorded as version-target
 deltas, not failures).
+## 2026-08-27 -- Testnet4 as a third chain: full sync + muhash proven against Core
+
+chain=testnet4 (or testnet4=1) joins main/regtest. Unlike regtest this is a
+REAL public network: real PoW with retargeting, min-difficulty exceptions,
+DNS seeds, live peers.
+
+PARAMS (CTestNet4Params, all read from Core's source): magic 1c163f28, ports
+48333/48332, halving 210000, powLimit 1d00ffff, activation heights generated
+by gen_script_flags.py (all =1; sfc_chain==2 branch), prefixes 0x6f/0xc4/tb.
+The GENESIS is testnet4's own 2024 block (different coinbase message and an
+anyone-can-try OP_CHECKSIG output) -- constructed from Core's
+CreateGenesisBlock recipe and verified against BOTH of Core's asserts
+(hashGenesisBlock AND hashMerkleRoot) before pasting, re-verified at select
+time and in tests/test_chainparams (43 checks).
+
+WORK RULES for getblocktemplate, from Core pow.cpp: the 20-minute
+min-difficulty exception (a template whose curtime is >2*spacing past the
+parent gets powLimit bits), the walk-back to the last non-min-difficulty
+bits, and BIP94 (testnet4's timewarp fix: the retarget bases on the FIRST
+block of the period, which can never carry the min-difficulty exception).
+Validation itself still accepts each header's own nBits and relies on
+cumulative-work fork choice (the documented divergence in reorg.c).
+
+DNS seeds moved into chainparams (per-chain lists; mainnet's nine unchanged,
+testnet4's two from Core's vSeeds, regtest none) -- main.c's hardcoded seed
+array is gone.
+
+PROVEN against the standing testnet4 oracle (/storage/core-oracle-testnet4):
+ - Synced the WHOLE CHAIN from it: 149,954 blocks, 0 holes, ~1h40m download
+   + ~16 min UTXO apply, then live-following its tip.
+ - Block hashes identical at every spot height checked, including Core's own
+   assumevalid anchor (123613).
+ - gettxoutsetinfo muhash BYTE-IDENTICAL at height 149954:
+   c328db399742e13aa39693542b30d190ba7794a6628d5be80883ba1eb85d9895,
+   txouts 14,227,876, total 7,497,249.9497424 tBTC. The UTXO set is now
+   proven identical to Core on ALL THREE supported chains.
+ - The wallet, loaded into the native testnet4 node, hands out
+   tb1qkme6640...23jduz -- character-identical to the address funded via the
+   oracle on 08-26 (same seed, same key, correct chain HRP natively).
 
 ----------------------------------------------------------------------------
 ## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core

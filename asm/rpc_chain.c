@@ -318,9 +318,18 @@ void rpc_chain_set_proposal(long (*fn)(const char*, char*, unsigned long)){ g_gb
 static const char* g_chain_name = "main";
 static long g_halving_interval  = 210000;
 static int  g_pow_no_retarget   = 0;
-void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting){
+static int  g_allow_min_diff    = 0;          /* testnet4: 20-min exception  */
+static u32  g_pow_limit_bits    = 0x1d00ffff; /* compact powLimit            */
+static int  g_enforce_bip94     = 0;          /* testnet4: retarget from the
+                                                 FIRST block of the period   */
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting,
+                               int allow_min_difficulty, unsigned int pow_limit_bits,
+                               int enforce_bip94){
     g_chain_name = name; g_halving_interval = halving_interval;
     g_pow_no_retarget = pow_no_retargeting;
+    g_allow_min_diff = allow_min_difficulty;
+    g_pow_limit_bits = pow_limit_bits;
+    g_enforce_bip94 = enforce_bip94;
 }
 
 static double difficulty_of(u32 bits){
@@ -900,16 +909,38 @@ u32 rpc_chain_retarget(u32 old_bits, long ts){
     if (over) memcpy(out, lim, 32);
     return gbt_compact(out);
 }
-static u32 gbt_next_bits(long tip){
+/* Core pow.cpp GetNextWorkRequired, chain-aware. curtime is the template's
+ * block time (testnet4's 20-minute min-difficulty exception depends on it;
+ * Core passes pblock->GetBlockTime() the same way). */
+static u32 gbt_next_bits(long tip, long curtime){
     u8 hdr[80];
     if (read_block_prefix(tip, hdr, 80) != 1) return 0;
     u32 old_bits = rd32(hdr + 72);
     if (g_pow_no_retarget) return old_bits;     /* regtest: fPowNoRetargeting */
-    if ((tip + 1) % 2016 != 0) return old_bits;
+    if ((tip + 1) % 2016 != 0){
+        if (g_allow_min_diff){
+            u32 prev_time = rd32(hdr + 68);
+            /* testnet rule: >2*10min after the parent -> min-difficulty */
+            if (curtime > (long)prev_time + 2*600) return g_pow_limit_bits;
+            /* else the last non-min-difficulty block's bits (walk back,
+             * stopping at a period boundary -- Core's exact loop) */
+            long h = tip; u32 bits = old_bits;
+            while (h > 0 && (h % 2016) != 0 && bits == g_pow_limit_bits){
+                h--;
+                if (read_block_prefix(h, hdr, 80) != 1) break;
+                bits = rd32(hdr + 72);
+            }
+            return bits;
+        }
+        return old_bits;
+    }
     u32 last_time = rd32(hdr + 68);
     if (read_block_prefix(tip - 2015, hdr, 80) != 1) return old_bits;
     u32 first_time = rd32(hdr + 68);
-    return rpc_chain_retarget(old_bits, (long)last_time - (long)first_time);
+    /* BIP94 (testnet4): the retarget bases on the FIRST block of the period,
+     * whose bits can never be a min-difficulty exception. */
+    u32 base_bits = g_enforce_bip94 ? rd32(hdr + 72) : old_bits;
+    return rpc_chain_retarget(base_bits, (long)last_time - (long)first_time);
 }
 
 /* Slot walk of the shared structural pool (bitcoin_mempool.asm's documented
@@ -969,11 +1000,11 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
     u8 hdr[80];
     if (read_block_prefix(tip, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
     u8 tiphash[32]; sha256d(tiphash, hdr, 80);
-    u32 bits = gbt_next_bits(tip);
-    if (!bits){ *ec = -1; *em = "Block not available"; return 0; }
     long height = tip + 1;
     long mintime = median_time_past(tip) + 1;
     long curtime = (long)time(NULL); if (curtime < mintime) curtime = mintime;
+    u32 bits = gbt_next_bits(tip, curtime);
+    if (!bits){ *ec = -1; *em = "Block not available"; return 0; }
 
     rj_val* o = rj_obj();
     { rj_val* caps = rj_arr(); rj_arr_push(caps, rj_str("proposal"));

@@ -62,7 +62,9 @@ void rpc_chain_set_proposal(long (*fn)(const char* hex, char* reason, unsigned l
 /* Runtime chain selection (daemon/chainparams.c). Defaults are mainnet;
  * the daemon calls this once after chainparams_select(). `name` must point
  * at storage that outlives the RPC server (chainparams' names are static). */
-void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting);
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting,
+                               int allow_min_difficulty, unsigned int pow_limit_bits,
+                               int enforce_bip94);
 
 /* What `stop` does after building its reply. Default: SIGTERM to self (the
  * rpcd main loop's handler shuts the server down). Tests install a no-op. */

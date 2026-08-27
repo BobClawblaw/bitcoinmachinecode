@@ -30,8 +30,9 @@
 #ifndef CHAINPARAMS_H
 #define CHAINPARAMS_H
 
-#define CHAIN_MAIN    0
-#define CHAIN_REGTEST 1
+#define CHAIN_MAIN     0
+#define CHAIN_REGTEST  1
+#define CHAIN_TESTNET4 2
 
 typedef struct {
     int          id;                 /* CHAIN_* */
@@ -52,13 +53,25 @@ typedef struct {
     unsigned char wif_version;       /* base58Prefixes[SECRET_KEY] */
     const char*  bech32_hrp;
     int          dns_seeds;          /* regtest: none, ever */
+    /* testnet4: fPowAllowMinDifficultyBlocks -- a block whose time is more
+     * than 2*10min after its parent may use pow_limit_bits (relevant to
+     * getblocktemplate; validation accepts each header's own nBits and
+     * relies on cumulative work, see reorg.c) */
+    int          allow_min_difficulty;
+    int          enforce_bip94;      /* testnet4: retarget from the period's
+                                        FIRST block (timewarp fix)          */
+    /* the chain's DNS seed hostnames (bootstrap-only; see main.c). NULL/0
+     * for chains with none (regtest). */
+    const char* const* dns_seed_hosts;
+    int          n_dns_seed_hosts;
 } chainparams_t;
 
 /* The selected chain. Statically CHAIN_MAIN. */
 extern const chainparams_t* g_chainp;
 
-/* Select by Core's -chain= name ("main" or "regtest"; "test"/"signet" are
- * recognised and REFUSED loudly rather than half-supported). Returns 1 ok,
+/* Select by Core's -chain= name ("main", "regtest" or "testnet4";
+ * "test"/"testnet" (ambiguous, testnet3) and "signet" are recognised and
+ * REFUSED loudly rather than half-supported). Returns 1 ok,
  * 0 unknown/unsupported. Also writes the two asm globals. Call before any
  * network or block activity; calling twice with the same name is harmless. */
 int chainparams_select(const char* name);
