@@ -147,8 +147,8 @@ static int cfg_addlist(char list[][64], int* n, const char* val, const char* key
          * this guard only refuses ports that could never be honoured. Checked
          * against both chain defaults because chain= may appear on any line
          * of the file relative to this entry. */
-        if(p != 8333 && p != 18444){
-            fprintf(stderr,"[config] %s=%s -- only a chain's default P2P port (8333 main, 18444 regtest) is supported for named peers; ignoring this entry\n", key, val);
+        if(p != 8333 && p != 18444 && p != 48333){
+            fprintf(stderr,"[config] %s=%s -- only a chain's default P2P port (8333 main, 48333 testnet4, 18444 regtest) is supported for named peers; ignoring this entry\n", key, val);
             (*bad)++; return 0;
         }
         *colon = 0;
@@ -251,6 +251,9 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"regtest")){      /* Core: -regtest (bool form) */
             t=clamp_int(iv,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest"); applied++; } }
+        else if(!strcmp(key,"testnet4")){     /* Core: -testnet4 (bool form) */
+            t=clamp_int(iv,0,1,key,&bad);
+            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4"); applied++; } }
         else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
             char tmp[64]; snprintf(tmp,sizeof tmp,"%s",val);
             char* colon = strrchr(tmp,':');
