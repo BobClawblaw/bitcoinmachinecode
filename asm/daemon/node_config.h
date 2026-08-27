@@ -52,6 +52,14 @@ typedef struct {
     int  connect_timeout_ms;     /* Core -timeout    (def 5000ms)            */
     int  peer_timeout_s;         /* Core -peertimeout(def 60s)               */
     int  port;                   /* Core -port                               */
+    int  port_explicit;          /* 1 = port= appeared in the config file, so
+                                    chain selection must NOT re-default it   */
+    char chain[16];              /* Core -chain: "main" (default), "regtest".
+                                    Stored here; main.c passes it to
+                                    chainparams_select() (daemon/chainparams.c
+                                    -- node_config.c itself stays free of that
+                                    link dependency, it is compiled into many
+                                    tools that never select a chain).        */
     int  listen;                 /* Core -listen                             */
     int  blocksonly;
     char signer[512];   /* external signer command (Core -signer / HWI); "" = none */             /* Core -blocksonly: no tx relay            */
