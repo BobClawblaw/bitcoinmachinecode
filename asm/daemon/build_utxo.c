@@ -48,6 +48,7 @@
  *              whole archive before committing to the real, memory- and
  *              time-expensive populate run.
  */
+#include "genesis_skip.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +108,7 @@ static void* g_utxo = 0;
 static struct lsm_state g_lst;
 static int   g_dry_run = 0;
 static long  g_puts=0, g_dels=0, g_put_dup=0, g_coinbase_skips=0, g_ntx=0;
+static long  g_genesis_skipped=0;   /* the genesis coinbase Core never stores */
 static long  g_fatal = 0; /* -1 from utxo_lsm_put/del: I/O error or (put) table full */
 static const u8 ZERO32[32] = {0};
 
@@ -291,6 +293,14 @@ int main(int argc, char** argv){
             continue;
         }
 
+        /* Core writes NO chain's genesis coinbase to its chainstate, and the
+         * LIVE writer has skipped it since 2026-08-22 -- this offline builder
+         * did not, so the two writers disagreed about what the UTXO set is
+         * and a set built here was one coin richer than Core's forever. Same
+         * predicate, one definition (daemon/genesis_skip.h). */
+        { u8 bh[32]; block_hash(bh, blockbuf);
+          if (bmc_is_genesis_block(h, bh)){ g_genesis_skipped++; continue; } }
+
         const u8* p = blockbuf + 80;
         const u8* blkend = blockbuf + len;
         u64 consumed;
@@ -349,8 +359,8 @@ int main(int argc, char** argv){
     double t1 = now_s();
     fprintf(stderr, "\n[build_utxo] %s range=[%ld,%ld] elapsed=%.1fs\n",
             g_fatal ? "ABORTED (fatal error)" : "DONE", start_h, end_h, t1-t0);
-    fprintf(stderr, "[build_utxo] total tx=%ld puts=%ld dels=%ld put_dup=%ld coinbase_skips=%ld\n",
-            g_ntx, g_puts, g_dels, g_put_dup, g_coinbase_skips);
+    fprintf(stderr, "[build_utxo] total tx=%ld puts=%ld dels=%ld put_dup=%ld coinbase_skips=%ld genesis_skipped=%ld\n",
+            g_ntx, g_puts, g_dels, g_put_dup, g_coinbase_skips, g_genesis_skipped);
     fprintf(stderr, "[build_utxo] CORRUPTION: bad_hash=%ld bad_parse=%ld (blocks entirely skipped: %ld)\n",
             g_bad_hash, g_bad_parse, g_bad_heights_n);
     if (g_bad_heights_n > 0) {
