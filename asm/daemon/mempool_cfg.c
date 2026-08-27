@@ -139,8 +139,14 @@ int mempool_configure(void){
       g_mp_mutex = (pthread_mutex_t*)pg; }
 
     /* Shared tx-accept policy state (fee/ancestor registry), init'd once
-     * pre-fork; tx_accept.c uses this instead of a per-process malloc. */
-    { unsigned long pn = 4096;
+     * pre-fork; tx_accept.c uses this instead of a per-process malloc.
+     * SIZE == the pool's slot capacity: the policy graph needs one node per
+     * mempool entry, so a smaller cap freezes acceptance the instant the
+     * graph fills while the pool still has room -- which is exactly what a
+     * fixed 4096 did in production (mempool stuck at exactly 4096, every
+     * further tx rejected by mpool_policy_add having no node slot). Sizing
+     * to `slots` makes the two limits coincide so it cannot recur. */
+    { unsigned long pn = slots;
       unsigned long psz = mpool_policy_state_size(pn);
       void* ps = mmap(0, psz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
       if (ps!=MAP_FAILED){ mpool_policy_state_init(ps, pn);
