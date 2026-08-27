@@ -1480,6 +1480,16 @@ static int cmd_gettransaction(const rj_val* params, long* ec, const char** em, r
           rj_obj_set(d, "abandoned", rj_bool(0));
           rj_arr_push(det, d);
           rj_obj_set(o, "details", det); }
+        /* bumpfee linkage (rpc_wallet_ops.c's bumped.dat sidecar): Core
+         * reports replaced_by_txid / replaces_txid from mapWallet; ours
+         * come from the sidecar the bump wrote. Absent = no field, like
+         * Core omitting them for an unreplaced tx. */
+        { extern int rpc_wops_bump_link(const char*, char*, size_t, char*, size_t);
+          char rb[80], rp[80];
+          if (rpc_wops_bump_link(params->items[0]->str, rb, sizeof rb, rp, sizeof rp)){
+              if (rb[0]) rj_obj_set(o, "replaced_by_txid", rj_str(rb));
+              if (rp[0]) rj_obj_set(o, "replaces_txid", rj_str(rp));
+          } }
         wsl_add_lastprocessedblock(o);
         *result = o;
         return 1;

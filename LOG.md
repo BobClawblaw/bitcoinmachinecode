@@ -7,6 +7,53 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- bumpfee / psbtbumpfee: the last two wallet refusals
+
+The RBF fee-bump family is real (Core wallet/feebumper.cpp semantics).
+bumpfee signs and broadcasts; psbtbumpfee returns the unsigned PSBT.
+
+WHERE THE ORIGINAL LIVES. The original of a bump is an UNCONFIRMED wallet
+transaction, and this wallet journals METADATA, not raw bytes -- so the
+mempool is the only place it still exists. rpc_node_mempool_rawtx() copies
+it out under the pool lock. Two honest consequences, each refused with its
+own message rather than papered over: a wallet tx that has fallen out of
+the mempool cannot be re-bumped (Core can, from mapWallet), and "is this
+ours" is decided by input ownership against the scan records.
+
+FEE ARITHMETIC, and a real divergence found by reading Core's source
+instead of trusting the comment. Core's EstimateFeeRate builds the base
+rate as CFeeRate(old_fee, txSize), whose GetFeePerK evaluates the rational
+DOWN, and then adds 1 sat/kvB -- Core's own comment says exactly why:
+"calculated from the tx fee/vsize, so it may have been rounded down. Add 1
+satoshi to the result." This implementation had been computing the base
+with a ROUND-UP division and then adding the same 1, double-compensating
+and overpaying 1 sat/kvB on every bump whose fee*1000 is not a multiple of
+its vsize. Now truncating, like Core. The CHECK side was already right:
+Core's CFeeRate::GetFee rounds UP (EvaluateFeeUp), matching the
+(rate*vsize + 999)/1000 used for every fee comparison.
+
+The four CheckFeeRate gates run in Core's order with Core's messages
+(below mempool minimum; total < oldFee + incrementalFee; total < required
+fee; total > -maxtxfee), and all five refusal strings were verified
+verbatim against src/wallet/ in the Core tree.
+
+DOCUMENTED DIVERGENCES, refused rather than half-implemented:
+  - the increase comes from the CHANGE output only (shrunk, or dropped to
+    fees under the 294-sat P2WPKH dust threshold). Core's CreateTransaction
+    may add further wallet inputs when change cannot cover it; this keeps
+    the input set fixed and refuses.
+  - the `outputs` and `original_change_index` options are refused.
+gettransaction reports replaced_by_txid / replaces_txid from a bumped.dat
+sidecar, since this wallet has no mapWallet to carry the linkage.
+
+COVERAGE, stated honestly: the suite pins the wiring and the argument
+surface (missing txid -> -8, unknown txid -> Core's -5 text, both verbs).
+The fee arithmetic and the change/dust path are NOT yet covered by an
+end-to-end test -- they were verified by differential reading against
+Core's source, which is what caught the rounding bug above. An e2e bump
+against the regtest Core pair is the obvious next step and is not claimed
+as done.
+
 ## 2026-08-27 -- nBits schedule enforcement (bad-diffbits), one rule engine
 
 Closes a consensus gap this repo had documented against itself. reorg.c's
