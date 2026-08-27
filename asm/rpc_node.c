@@ -1358,18 +1358,20 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
      * results by something else. */
     extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen)
         __attribute__((weak));
-    if (!tx_wtxid){
-        *ec = -1;
-        *em = "submitpackage is unavailable in this build: results are keyed by "
-              "wtxid and the wtxid primitive is not linked in";
-        return 0;
-    }
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
         *ec = -8; *em = "Invalid parameter, package must be a non-empty array"; return 0; }
     const rj_val* list = params->items[0];
     if (list->nitems > RPC_PKG_MAX){
         *ec = -8; *em = "Array must contain between 1 and 25 transactions"; return 0; }
+    /* AFTER the parameter checks: a malformed call gets Core's -8 whatever
+     * this build links. */
+    if (!tx_wtxid){
+        *ec = -1;
+        *em = "submitpackage is unavailable in this build: results are keyed by "
+              "wtxid and the wtxid primitive is not linked in";
+        return 0;
+    }
     if (!g_status_rw){
         *ec = -4; *em = "no download worker is attached, so nothing can validate a package"; return 0; }
 
