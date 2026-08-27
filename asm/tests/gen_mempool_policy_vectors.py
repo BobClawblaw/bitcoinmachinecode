@@ -53,7 +53,7 @@ class RefPolicy:
         self.rbf=rbf
         self.utxo={}      # (txid,index)->value  (confirmed)
         self.out={}       # (txid,index)->value  (mempool outputs; owner==txid)
-        self.claims={}    # (prev_txid,index)->claimer_txid
+        self.claims={}; self.node_ins={}    # (prev_txid,index)->claimer_txid
         self.nodes={}     # txid -> dict
         self.est=0; self.est_n=0
 
@@ -102,13 +102,23 @@ class RefPolicy:
         conf=set()
         for (t,i,seq) in ins2:
             if (t,i) in self.claims: conf.add(self.claims[(t,i)])
-        # BIP125 replaceable check: new tx must have a non-final input
-        any_repl = any(s != 0xffffffff for (_,_,s) in ins2)
+        # RBF, Core semantics (2026-08-27 mempool-policy parity): with
+        # rbf(==fullrbf) ON, no signaling requirement at all; with it OFF the
+        # REPLACED txs must signal (classic BIP125 rule 1 -- checked on the
+        # conflicts, never on the replacement). Rules 3+4: pay all replaced
+        # fees AND the increment covers the replacement's own vsize at the
+        # incremental rate (fixtures are non-witness: vsize == len).
         if conf:
-            if not self.rbf: return 0,"rbf-off"
-            if not any_repl: return 0,"not-replaceable"
+            if not self.rbf:
+                for c in conf:
+                    c_ins = self.node_ins.get(c, [])
+                    if not any(s < 0xfffffffe for (_,_,s) in c_ins):
+                        return 0,"conflict-not-signaling"
             repl_fee=sum(self.nodes[c]['fee'] for c in conf)
-            if fee < repl_fee + self.incr: return 0,"rbf-low"
+            if fee < repl_fee: return 0,"rbf-low"
+            need = self.incr * len(tx) // 1000
+            if need == 0: need = 1
+            if fee - repl_fee < need: return 0,"rbf-low"
         # ancestors
         parents={t for (t,i,seq) in ins2 if (t,i) in self.out}
         anc=set()
@@ -130,6 +140,7 @@ class RefPolicy:
         for (t,i,seq) in ins2: self.claims[(t,i)]=txid
         self.nodes[txid]={'size':len(tx),'fee':fee,'parents':parents,
                           'des':1,'des_bytes':len(tx)}
+        self.node_ins[txid]=list(ins2)
         for a in anc:
             self.nodes[a]['des']+=1; self.nodes[a]['des_bytes']+=len(tx)
         for p in parents: self.nodes[p]['children'].add(txid)
@@ -205,9 +216,11 @@ step_add(t,0)
 # double-spend: spend COIN_C with non-replaceable seq
 t=mk_tx([(COIN_C,0)],[(90000,b'\x51')],seqs=[0xffffffff]); tid1=sha256d(t)
 r,_=mp.add(t,tid1,"x"); assert r==1; s["steps"].append(("add",t.hex(),tid1.hex(),1))
-# a SECOND tx, same prevout, non-replaceable -> oracle 'not-replaceable'
+# a SECOND tx, same prevout: under fullrbf (Core default) this is a
+# replacement ATTEMPT regardless of signaling -- and it fails rule 3, paying
+# less than the tx it would replace ('insufficient fee').
 t=mk_tx([(COIN_C,0)],[(95000,b'\x51')],seqs=[0xffffffff]); 
-r,_=mp.add(t,sha256d(t),"x"); assert r==0 and _=="not-replaceable",(r,_)
+r,_=mp.add(t,sha256d(t),"x"); assert r==0 and _=="rbf-low",(r,_)
 s["steps"].append(("add",t.hex(),sha256d(t).hex(),0))
 # RBF: spend COIN_D replaceable
 t=mk_tx([(COIN_D,0)],[(92000,b'\x51')],seqs=[0xfffffffe]); tidD1=sha256d(t)
@@ -218,13 +231,22 @@ r,_=mp.add(t,tidD2,"x"); assert r==1
 s["steps"].append(("add",t.hex(),tidD2.hex(),1))
 s["steps"].append(("present",tidD1.hex(),0))   # D1 evicted
 s["steps"].append(("present",tidD2.hex(),1))   # D2 present
-# RBF insufficient: spend COIN_E 5000 fee, then replacement 5500 (<5000+1000)
+# RBF rule 4 (Core): the increment must cover the REPLACEMENT'S OWN VSIZE at
+# the incremental rate -- ~66 sat for these fixtures, NOT a flat 1 kvB. A
+# +500 sat bump therefore succeeds (the flat-1000 gate was this node's old
+# divergence); a +0 bump fails rule 3/4.
 t=mk_tx([(COIN_E,0)],[(95000,b'\x51')],seqs=[0xfffffffe]); tidE1=sha256d(t)
 r,_=mp.add(t,tidE1,"x"); assert r==1; s["steps"].append(("add",t.hex(),tidE1.hex(),1))
-t=mk_tx([(COIN_E,0)],[(94500,b'\x51')],seqs=[0xfffffffe])
+t=mk_tx([(COIN_E,0)],[(94500,b'\x51')],seqs=[0xfffffffe]); tidE2=sha256d(t)
+r,_=mp.add(t,tidE2,"x"); assert r==1,(r,_)
+s["steps"].append(("add",t.hex(),tidE2.hex(),1))
+s["steps"].append(("present",tidE1.hex(),0))
+s["steps"].append(("present",tidE2.hex(),1))
+# and an EQUAL-fee replacement fails rule 3/4 ('insufficient fee')
+t=mk_tx([(COIN_E,0)],[(94500,b'\x52')],seqs=[0xfffffffe])
 r,_=mp.add(t,sha256d(t),"x"); assert r==0 and _=="rbf-low",(r,_)
 s["steps"].append(("add",t.hex(),sha256d(t).hex(),0))
-s["steps"].append(("present",tidE1.hex(),1))
+s["steps"].append(("present",tidE2.hex(),1))
 scenarios.append(s)
 
 # ---- S2: ancestor limit (max_anc=3) -----------------------------------------

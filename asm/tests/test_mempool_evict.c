@@ -24,6 +24,7 @@ extern long   utxo_get(void* u, const u8 txid[32], unsigned long index, u64* val
 extern void   utxo_init(void* u, unsigned long slots, void* blob, unsigned long cap);
 extern long   utxo_put(void* u, const u8 txid[32], unsigned index, u64 value, u64 h, u64 cb, const u8* spk, unsigned slen);
 extern void   mpool_policy_init(void* pol, u64 relay, unsigned, unsigned, unsigned, unsigned, unsigned);
+extern void mpool_policy_set_acceptnonstd(void*, unsigned);
 extern void   mpool_policy_state_init(void* st, unsigned n);
 extern long   mpool_policy_add(void* pol, void* st, void* mp, const u8* tx, unsigned long txlen, const u8 txid[32], void* utxo);
 extern const char* mpool_policy_reason(void* pol);
@@ -63,6 +64,10 @@ int main(void){
     static u8 pol[128], st[1<<20];
     memset(st, 0, sizeof st);
     mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+    /* fixtures are synthetic, deliberately non-standard txs: run under
+     * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
+     * keeps exercising fee/graph mechanics, not IsStandardTx. */
+    mpool_policy_set_acceptnonstd(pol, 1);
     mpool_policy_state_init(st, 256);
 
     /* TINY pool: blob holds only ~4 of these ~70-byte txs */
@@ -108,7 +113,8 @@ int main(void){
       long r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
       ck("below-floor tx rejected", r == 0);
       const char* why = mpool_policy_reason(pol);
-      ck("...for a fee/min-fee reason", why && (strstr(why,"min fee") || strstr(why,"eviction threshold") || strstr(why,"below")));
+      ck("...for a fee/min-fee reason (Core strings: relay floor or rolling floor)",
+         why && (strstr(why,"min relay fee not met") || strstr(why,"mempool min fee not met") || strstr(why,"mempool full")));
       unsigned long l;
       ck("...and it is NOT in the pool", mpool_get(mp, id, &l) == NULL);
       ck("...survivors still resolvable (graph intact)",

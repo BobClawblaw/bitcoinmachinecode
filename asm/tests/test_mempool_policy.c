@@ -37,6 +37,7 @@ extern void   mpool_policy_init(void* pol, unsigned long long relay_fee_rate,
                                 unsigned max_anc, unsigned max_anc_bytes,
                                 unsigned max_desc, unsigned max_desc_bytes,
                                 unsigned rbf_enabled);
+extern void mpool_policy_set_acceptnonstd(void*, unsigned);
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char* tx, unsigned long txlen,
                                const unsigned char txid[32], void* utxo);
@@ -116,6 +117,10 @@ static int run_scenario(int si,
     static unsigned char stbuf[1<<20];
     memset(stbuf, 0, sizeof stbuf);
     mpool_policy_init(pol, 1, max_anc, max_anc_bytes, max_desc, max_desc_bytes, rbf);
+    /* fixtures are synthetic, deliberately non-standard txs: run under
+     * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
+     * keeps exercising fee/graph mechanics, not IsStandardTx. */
+    mpool_policy_set_acceptnonstd(pol, 1);
     mpool_policy_state_init(stbuf, 256);
 
     /* structural mempool */
