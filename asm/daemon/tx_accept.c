@@ -27,6 +27,7 @@
 #include <time.h>
 #include <stdint.h>
 #include "log_ts.h"
+#include "node_config.h"
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -318,8 +319,20 @@ extern void mp_unlock(void);
 /* tx_policy_init(void) -> 1 ok / 0 failed. Called once per connection
  * alongside tx_dispatch_init. */
 int tx_policy_init(void){
-    mpool_policy_init(g_pol, TXACC_RELAY_FEE_RATE, TXACC_MAX_ANC, TXACC_MAX_ANC_BYTES,
-                      TXACC_MAX_DESC, TXACC_MAX_DESC_BYTES, TXACC_RBF_ENABLED);
+    /* config-driven where Core exposes the knob (defaults match Core's own);
+     * falls back to the compiled defaults if the config layer is absent (a
+     * standalone test that never calls node_config_load). */
+    extern node_config_t g_cfg;
+    unsigned long long relay = g_cfg.minrelaytxfee_satvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satvb : TXACC_RELAY_FEE_RATE;
+    unsigned anc  = g_cfg.limitancestorcount   > 0 ? (unsigned)g_cfg.limitancestorcount   : TXACC_MAX_ANC;
+    unsigned ancb = g_cfg.limitancestorsize_kvb> 0 ? (unsigned)(g_cfg.limitancestorsize_kvb*1000) : TXACC_MAX_ANC_BYTES;
+    unsigned dsc  = g_cfg.limitdescendantcount > 0 ? (unsigned)g_cfg.limitdescendantcount : TXACC_MAX_DESC;
+    unsigned dscb = g_cfg.limitdescendantsize_kvb>0? (unsigned)(g_cfg.limitdescendantsize_kvb*1000): TXACC_MAX_DESC_BYTES;
+    unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
+    mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
+    { extern void mpool_policy_set_incremental(void*, unsigned long long);
+      if (g_cfg.incrementalrelayfee_satvb > 0)
+          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb); }
     if (mp_ext_polstate){
         /* shared, already mpool_policy_state_init'd once pre-fork -- adopting
          * it (NOT re-initing) is what keeps fee bookkeeping coherent across
