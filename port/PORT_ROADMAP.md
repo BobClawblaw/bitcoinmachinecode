@@ -415,3 +415,27 @@ utxo.idx checkpoint removed -> pure WAL+manifest+runs replay). Verification:
 800 iters, 0 fail. Now UNBLOCKS undo_capture_and_del and the daemon's disk-backed
 UTXO at scale (s8's ~80M-output modern tip needs the LSM-backed store, not just the
 in-mem table). Added to Makefile MODULES + t_lsm/fuzz_lsm targets; roadmap [x].
+
+## 2026-08-27 — durable real IBD in data/ + x86-exact log format + LSM-resume proven (s7 milestone)
+- node_log production format FIXED to match x86 exactly: node_log_str used to PREPEND the
+  level kind (SERVE/BLOCK/...) before the caller's timestamp. Production lines are now
+  timestamp-first ("YYYY-MM-DD HH:MM:SS.mmm <msg>"), identical to asm/daemon/log_ts.h and
+  the x86 node. (port/arm64/node_log.S, commit 298dfec)
+- Real 140,000-block mainnet IBD, download + full verify natively on AArch64:
+  blocks_valid=140000 bad_gate=0 bad_sig=0, tx=1,230,768, sigs=1,947,578, value-in/out
+  cross-checked, utxo_count=752,760. Verified archive (473 MB blk + 6.7 MB index) re-homed
+  into repo data/ (nothing in /tmp).
+- INDEPENDENT LSM cross-validation: build_utxo (LSM store replay over the whole archive) =
+  tx=1230768 puts=2700340 dels=1947578 live=752760 EXACTLY matches the ibd in-memory counts.
+  Two independent native consensus paths agree.
+- RESUMPTION proven with the persistent LSM UTXO: ibd_lsm reloaded data/'s LSM at h140000
+  (archive tip), downloaded+persisted 1,500 more real blocks to h141500 (blk00003.dat
+  +38MB, index +1500 rec), LSM live 752760->807301, 16 flushes, full_retries=0,
+  reload_after_close MATCH, MISSING_PREVOUT=0 bad_gate=0 bad_sig=0. Live durable log grows
+  at data/logs/bitcoind.production.log (timestamp-first).
+- data/ now holds 141,500 verified native blocks + durable LSM UTXO (live 807,301) +
+  headers.dat. Cross-validated against oracle paths pending (MuHash vs Core at matching
+  height = long-lead: Core already synced past h141k).
+- NEXT: continue grinding the download toward tip with ibd_lsm into data/ (resumes at
+  archive tip each run); grow LSM sizing before the segwit->tip leg (live UTXO -> ~80M
+  outputs: slots 1<<27, multi-GB blob); MuHash parity vs Core.
