@@ -307,21 +307,27 @@ int main(int argc, char** argv) {
     /* ---------- 7. gettxout: real Core semantics (any confirmed outpoint via
      * the LSM UTXO store, not the wallet's own outputs -- see rpc_commands_
      * set_utxo_store's doc comment). This harness's in-process rpc_dispatch
-     * never calls that setter, so it's exactly a fresh/unconfigured server
-     * with no chain data loaded: every outpoint (wallet's own included)
-     * correctly comes back null, same as real Core before it's synced. ---- */
+     * never calls that setter, so this is a server that CANNOT ANSWER.
+     * It used to return null for every outpoint, which is not "I don't know"
+     * -- null means "that output is not unspent", i.e. spent. A server with
+     * no UTXO handle must refuse instead of asserting that about every coin
+     * in existence (2026-08-27; the live daemon was doing exactly this). ---- */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
         char tx0[65]; { char* d="0123456789abcdef"; for(int i=0;i<32;i++){tx0[i*2]=d[utxo_txid[0][i]>>4];tx0[i*2+1]=d[utxo_txid[0][i]&15];} tx0[64]=0; }
-        /* exec: gettxout <txid> 0 -- wallet's own outpoint, but no UTXO store
-         * configured in this harness, so still null (not an error) */
+        /* exec: gettxout <txid> 0 -- no UTXO store in this harness, so the
+         * server refuses rather than claiming the output is spent */
         run_cli(portfixed, "gettxout", tx0, "0", NULL);
-        ck("gettxout (no store configured) exit 0", last_req_exit == 0);
-        ck_out("gettxout (no store configured) prints nothing (null result)", "");
-        /* unknown txid -> null -> bitcoin-cli prints nothing */
+        ck("gettxout without a UTXO store is an error, not null", last_req_exit != 0);
+        ck_out("gettxout without a UTXO store prints nothing on stdout", "");
+        ck("gettxout refusal names the missing capability",
+           strstr(err_buf, "live UTXO set") != NULL);
+        if (!strstr(err_buf, "live UTXO set")) printf("      got stderr: [%s]\n", err_buf);
+        /* an unknown txid is the SAME refusal here: without a store this
+         * server cannot distinguish "spent" from "never existed" either. */
         run_cli(portfixed, "gettxout", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "0", NULL);
-        ck("gettxout unknown exit 0", last_req_exit == 0);
-        ck_out("gettxout unknown prints nothing (null result)", "");
+        ck("gettxout unknown txid also refuses (no store)", last_req_exit != 0);
+        ck_out("gettxout unknown txid prints nothing on stdout", "");
     }
 
     /* ---------- 8. unknown method -> JSON-RPC error -> bitcoin-cli stderr ---- */
