@@ -120,6 +120,7 @@ static long G_maxblk=0, G_total=0, G_flush_every=100, G_force_start=-1;
 static int    G_slots_log2=20;
 static unsigned long G_slots;
 static uint64_t G_blob_cap, G_fill, G_op, G_tomb_cap, G_scratch_cap, G_manifest_cap;
+static int g_fast=0;   /* FAST (cons-only) mode: skip ECDSA+UTXO apply, match x86 dl_catchup */
 
 #define LSM_BARRIER() __asm__ __volatile__("" ::: "memory", "x19","x20","x21","x22","x23","x24","x25","x26","x27","x28")
 
@@ -386,13 +387,14 @@ static int rotate_client(int j, unsigned char* hdr){
 
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* a peer closing mid-write must not kill us */
-    if(argc<3){ fprintf(stderr,"usage: %s <peer-list> <count> [datadir] [slots_log2] [flush_every] [clients] [start]\n",argv[0]); return 2; }
+    if(argc<3){ fprintf(stderr,"usage: %s <peer-list> <count> [datadir] [slots_log2] [flush_every] [clients] [start] [fast]\n",argv[0]); return 2; }
     G_maxblk=atol(argv[2]);
     const char* dd= argc>3?argv[3]:"data";
     G_slots_log2 = argc>4?atoi(argv[4]):20;
     G_flush_every = argc>5?atol(argv[5]):100;
     int ncli = argc>6?atoi(argv[6]):16;
     G_force_start = argc>7?atol(argv[7]):-1;
+    g_fast = argc>8 ? atoi(argv[8]) : 0;   /* 1 = cons-only fast download (x86 dl_catchup parity) */
     if(ncli<1)ncli=1; if(ncli>MAXC)ncli=MAXC;
     mkdir(dd,0755); chdir(dd);
     mkdir("logs",0755);
@@ -430,6 +432,8 @@ int main(int argc, char** argv){
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     store_reload(store_buf);
 
+    long rel=-1, live0=-1;
+    if(!g_fast){
     G_slots = 1UL<<G_slots_log2;
     G_blob_cap = 1UL<<30;
     long ustruct = utxo_struct_size(G_slots);
@@ -458,8 +462,9 @@ int main(int argc, char** argv){
     long rel = utxo_lsm_reload(g_lst, g_utxo);
     LSM_BARRIER();
     if(rel<0){ fprintf(stderr,"utxo_lsm_reload FAILED (%ld)\n",rel); return 1; }
-    long live0 = utxo_lsm_count(g_lst);
+    live0 = utxo_lsm_count(g_lst);
     LSM_BARRIER();
+    }   /* end if(!g_fast) LSM setup */
 
     long tip = *(int*)(store_buf+24);
     if(tip < 0){ fprintf(stderr,"empty archive -- can't resume (need build_utxo/ibd to seed first)\n"); return 1; }
@@ -467,12 +472,17 @@ int main(int argc, char** argv){
     if(start < tip+1){ fprintf(stderr,"WARNING: requested start=%ld below tip+1; resuming from tip+1=%ld\n",start,tip+1); start=tip+1; }
     if(start+G_maxblk>G_total) G_maxblk=G_total-start;
     if(G_maxblk<=0){ fprintf(stderr,"nothing to download (archive tip %ld, headers %ld)\n",tip,G_total); return 0; }
-    LLOG(0, "LSM reload: replayed=%ld live_at_archive_tip(h%ld)=%ld memtable=2^%d runs=%lu\n",
+    if(g_fast){
+        LLOG(0, "FAST cons-only mode (x86 dl_catchup parity): no ECDSA/UTXO apply; run build_utxo afterwards\n");
+    } else {
+        LLOG(0, "LSM reload: replayed=%ld live_at_archive_tip(h%ld)=%ld memtable=2^%d runs=%lu\n",
             rel, tip, live0, G_slots_log2, (unsigned long)g_lst->manifest_n);
-    fprintf(stderr,"[ibd_par] archive tip=%ld -> resume h=%ld..%ld count=%ld, %d clients, LSM live0=%ld\n",
-            tip, start, start+G_maxblk-1, G_maxblk, ncli, live0);
-    LLOG(7, "RESUME h=%ld..%ld count=%ld clients=%d archive_tip=%ld\n",
-            start, start+G_maxblk-1, G_maxblk, ncli, tip);
+    }
+    fprintf(stderr,"[ibd_par] archive tip=%ld -> resume h=%ld..%ld count=%ld, %d clients%s\n",
+        tip, start, start+G_maxblk-1, G_maxblk, ncli, g_fast?" [FAST cons-only]":", LSM live0=");
+    if(!g_fast) fprintf(stderr,"  LSM live0=%ld\n", live0);
+    LLOG(7, "RESUME h=%ld..%ld count=%ld clients=%d archive_tip=%ld%s\n",
+        start, start+G_maxblk-1, G_maxblk, ncli, tip, g_fast?" [FAST]":"");
 
     /* ---- connect the CLIENT POOL (up to 16) ---- */
     char peerl[4096];
@@ -628,6 +638,7 @@ int main(int argc, char** argv){
                 if(vv<0){ fprintf(stderr,"h%ld bad txcount\n",h); bad_gate++; free(blk); continue; }
                 unsigned long toff=80+vv;
                 int bad=0;
+                if(!g_fast){
                 for(unsigned long ti=0; ti<nt; ti++){
                     unsigned long nin,nout;
                     long tl=tx_walk(blk+toff,(unsigned long)blklen-toff,&nin,&nout);
@@ -669,8 +680,9 @@ int main(int argc, char** argv){
                     }
                     toff += tl;
                 }
+                }   /* end if(!g_fast) ECDSA/UTXO apply */
                 if(bad){ bad_gate++; free(blk); continue; }
-                if((h-start+1)%G_flush_every==0 || h==start+G_maxblk-1){
+                if(!g_fast && ((h-start+1)%G_flush_every==0 || h==start+G_maxblk-1)){
                     long fr=utxo_lsm_flush(g_lst,g_utxo);
                     if(fr<0){ LLOG(6,"h%ld FLUSH ERR\n",h); }
                     else { g_flushes++; }
@@ -679,9 +691,7 @@ int main(int argc, char** argv){
                 }
                 valid++;
                 if(((h-start)%50)==0)
-                    LLOG(3, "h%ld txs=%llu utxo=%ld spent=%ld sigs=%ld runs=%lu\n",
-                            h, (unsigned long long)nt, (long)utxo_lsm_count(g_lst), spent, nsig,
-                            (unsigned long)g_lst->manifest_n);
+                    LLOG(3, "h%ld txs=%llu%s\n", h, (unsigned long long)nt, g_fast?" [FAST]":"");
                 free(blk); w->blk[kk]=0;
             }
             next_apply += nw;
@@ -710,40 +720,45 @@ int main(int argc, char** argv){
             /* [dl] heartbeat every ~1000 blocks */
             if(next_apply - hb_last >= 1000){
                 LLOG(7, "[dl] progress: %ld/%ld blocks verified, %d clients, live utxo=%ld\n",
-                        next_apply, G_maxblk, g_ncli, (long)utxo_lsm_count(g_lst));
+                        next_apply, G_maxblk, g_ncli, g_fast?0L:(long)utxo_lsm_count(g_lst));
                 log_peers();
                 hb_last = next_apply;
             }
         }
     }
 done:
-    { long fr=utxo_lsm_flush(g_lst,g_utxo); if(fr==1) g_flushes++; }
-    long liveF = utxo_lsm_count(g_lst);
+    if(!g_fast){ long fr=utxo_lsm_flush(g_lst,g_utxo); if(fr==1) g_flushes++; }
+    long liveF = g_fast ? 0 : utxo_lsm_count(g_lst);
     LLOG(5, "DONE: valid=%ld bad_gate=%ld MISSING_PREVOUT=%ld bad_sig=%ld\n", valid, bad_gate, missing, bad_sig);
     LLOG(5, "      txs=%ld spent=%ld sigs=%ld added=%ld put_dup=%ld del_err=%ld\n",
         ntx, spent, nsig, added, put_dup, del_err);
-    LLOG(5, "      LSM final live=%ld runs=%lu flushes=%ld full_retries=%ld\n",
-        liveF, (unsigned long)g_lst->manifest_n, g_flushes, g_full_retries);
+    if(!g_fast)
+        LLOG(5, "      LSM final live=%ld runs=%lu flushes=%ld full_retries=%ld\n",
+            liveF, (unsigned long)g_lst->manifest_n, g_flushes, g_full_retries);
+    else if(valid>0)
+        LLOG(5, "      FAST cons-only: archive extended to h%ld (run build_utxo to build+verify the UTXO)\n", start+G_maxblk-1);
     LLOG(7, "[dl] final: valid=%ld MISSING_PREVOUT=%ld (%d clients)\n", valid, missing, g_ncli);
     fprintf(stderr,"\n[RESUME] archive tip=%ld -> downloaded h=%ld..%ld  MISSING_PREVOUT=%ld\n",
             tip, start, start+G_maxblk-1, missing);
 
-    utxo_lsm_close(g_lst);
-    void* u2 = malloc(utxo_struct_size(G_slots));
-    void* blob2 = malloc(G_blob_cap);
-    utxo_init(u2, G_slots, blob2, G_blob_cap);
-    struct lsm_state* l2 = calloc(1,sizeof(struct lsm_state));
-    l2->op_threshold=G_op; l2->fill_threshold=G_fill;
-    l2->tomb_buf=calloc(1,G_tomb_cap*36); l2->tomb_cap=G_tomb_cap;
-    l2->manifest_buf=calloc(1,G_manifest_cap*16); l2->manifest_cap=G_manifest_cap;
-    l2->scratch_buf=malloc(G_scratch_cap); l2->scratch_cap=G_scratch_cap;
-    long rel2 = utxo_lsm_reload(l2, u2);
-    LSM_BARRIER();
-    long liveP = rel2<0 ? -1 : utxo_lsm_count(l2);
-    utxo_lsm_close(l2);
-    LLOG(5, "PERSISTENCE CHECK: reload_after_close live=%ld (final live was %ld) %s\n",
-        liveP, liveF, (liveP==liveF && liveP>=0)? "MATCH" : "MISMATCH");
-    fprintf(stderr,"[PERSISTENCE] reload_after_close live=%ld vs downloader final %ld\n", liveP, liveF);
+    if(!g_fast){
+        utxo_lsm_close(g_lst);
+        void* u2 = malloc(utxo_struct_size(G_slots));
+        void* blob2 = malloc(G_blob_cap);
+        utxo_init(u2, G_slots, blob2, G_blob_cap);
+        struct lsm_state* l2 = calloc(1,sizeof(struct lsm_state));
+        l2->op_threshold=G_op; l2->fill_threshold=G_fill;
+        l2->tomb_buf=calloc(1,G_tomb_cap*36); l2->tomb_cap=G_tomb_cap;
+        l2->manifest_buf=calloc(1,G_manifest_cap*16); l2->manifest_cap=G_manifest_cap;
+        l2->scratch_buf=malloc(G_scratch_cap); l2->scratch_cap=G_scratch_cap;
+        long rel2 = utxo_lsm_reload(l2, u2);
+        LSM_BARRIER();
+        long liveP = rel2<0 ? -1 : utxo_lsm_count(l2);
+        utxo_lsm_close(l2);
+        LLOG(5, "PERSISTENCE CHECK: reload_after_close live=%ld (final live was %ld) %s\n",
+            liveP, liveF, (liveP==liveF && liveP>=0)? "MATCH" : "MISMATCH");
+        fprintf(stderr,"[PERSISTENCE] reload_after_close live=%ld vs downloader final %ld\n", liveP, liveF);
+    }
 
     for(int j=0;j<g_ncli;j++) if(g_fd[j]>=0) fd_close(g_fd[j]);
     TLINE(0, (missing==0 && bad_gate==0 && bad_sig==0)
