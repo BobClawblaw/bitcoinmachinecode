@@ -259,8 +259,17 @@ and runs natively.
       lsm_get_scratch TLS. Diff-fuzz vs pure-Python LSM oracle (t_lsm.c): 15 seeds
       x400-600 ops, reload/reload_ro reconstruction (with checkpoint removed) +
       per-flush/compact run+manifest byte-compare: 0 fail. (2026-08-26)
+- [x] bitcoin_chainwork  (reorg/fork-choice primitive: u256_div 256-bit div,
+      block_work Core GetBlockProof, chainwork_add/cmp 128-bit, + the
+      store_chainwork_* persistent chainwork.dat store incl. init/append/
+      get_at/get_tip/reload/truncate) -> port/arm64/bitcoin_chainwork.S. Repo
+      test_chainwork.c ALL PASS native. NEW differential fuzz
+      (port/arm64/fuzz_chainwork.py) vs an independent Python big-int oracle:
+      u256_div/block_work/chainwork_add/chainwork_cmp + real store ops
+      (cumulative accumulation, reload, truncate rollback) -- 8 seeds, 0 fail.
+      (2026-08-27; .S landed 560d77c, this run adds the differential verify.)
 - [ ] Remaining leaf modules (bip32/bip39/bip143/bip341, keys, addr*,
-      idx, idxscan, muhash, mempool, serve, cli, chainwork, cmpct, headers,
+      idx, idxscan, muhash, mempool, serve, cli, cmpct, headers,
       net addrmgr, node_log, txv_, witness_v0, ...)
 
 ## Notes
