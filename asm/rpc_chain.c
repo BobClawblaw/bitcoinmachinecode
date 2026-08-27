@@ -3255,6 +3255,9 @@ static const char* const CHAIN_METHODS[] = {
     "getdescriptorinfo","deriveaddresses","getblockstats","getnetworkhashps","getmininginfo","getblocktemplate","gettxoutsetinfo","scantxoutset","getchaintips","getindexinfo","uptime","stop",
     /* the rest of Core's Blockchain category (2026-08-25) */
     "getchainstates","getdeploymentinfo","getchaintxstats","verifychain",
+    /* EXTENSIONS (no Core equivalent): served from the live address index,
+     * daemon/addr_index_tail.c, only when the operator set addrindex=1 */
+    "getaddressbalance","getaddresstxids",
     "waitforblock","waitforblockheight","waitfornewblock",
     "getblockfilter","scanblocks","getdescriptoractivity",
     "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
@@ -3312,6 +3315,116 @@ void rpc_chain_set_coinstats(long (*run)(int, void*, char*, unsigned long)){
 static long (*g_csi_h)(void);           /* light height probe for getindexinfo */
 void rpc_chain_set_coinstats_height(long (*fn)(void)){ g_csi_h = fn; }
 
+/* ---- EXTENSION RPCs: the live address index --------------------------------
+ * Bitcoin Core has NO address index and no RPC of these names; these exist in
+ * the spirit of the old addrindex patch set (getaddressbalance /
+ * getaddresstxids) and are served from daemon/addr_index_tail.c's journal.
+ * They answer only when the operator enabled addrindex=1; otherwise the error
+ * says exactly how to turn the index on. Input: a single address string, an
+ * array of addresses, or the addrindex patch's {"addresses":[...]} object.
+ * getaddressbalance: {"balance","received","utxos"} summed over the inputs
+ * (satoshis; "received" = every output ever created for the address).
+ * getaddresstxids: deduplicated txids (display hex) of every transaction that
+ * created an output for -- or spent one from -- the given addresses, in index
+ * (chain) order. */
+extern long axt_read_address(int type, const unsigned char hash[32],
+                             unsigned long long* balance, unsigned long long* received,
+                             long* nutxo, unsigned char* txids, long txid_cap);
+extern long axt_probe_covered(void);
+
+#define AXR_TXID_CAP 100000
+
+/* collect the address strings from any accepted param shape; returns count
+ * or -1 on a malformed request */
+static long axr_collect(const rj_val* params, const rj_val** out, long cap){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1) return -1;
+    const rj_val* a = params->items[0];
+    if (a->typ == RJ_STR){ out[0] = a; return 1; }
+    if (a->typ == RJ_OBJ){
+        const rj_val* arr = rj_obj_get((rj_val*)a, "addresses");
+        if (!arr || arr->typ != RJ_ARR) return -1;
+        a = arr;
+    }
+    if (a->typ != RJ_ARR) return -1;
+    long n = 0;
+    for (unsigned long i = 0; i < a->nitems && n < cap; i++){
+        if (a->items[i]->typ != RJ_STR) return -1;
+        out[n++] = a->items[i];
+    }
+    return n;
+}
+
+/* decode one address into the index key; 1 ok / 0 invalid */
+static int axr_key(const char* addr, int* type, unsigned char key[32]){
+    int t = 0; unsigned char ver, h160[20], prog[32];
+    if (!wallet_validate_address(addr, &t, &ver, h160, prog)) return 0;
+    if (t < 1 || t > 5) return 0;               /* WAL_ADDR_* 1..5 == AXF_* */
+    memset(key, 0, 32);
+    if (t == 4 || t == 5) memcpy(key, prog, 32);        /* P2WSH / P2TR */
+    else                  memcpy(key, h160, 20);        /* 20-byte types */
+    *type = t;
+    return 1;
+}
+
+static int axr_enabled(long* ec, const char** em){
+    if (axt_probe_covered() >= 0) return 1;
+    *ec = -1;
+    *em = "Address index not available (extension; set addrindex=1 in bitcoin.conf "
+          "before the node syncs -- Core itself has no address index)";
+    return 0;
+}
+
+static int cmd_getaddressbalance(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const rj_val* addrs[64];
+    long na = axr_collect(params, addrs, 64);
+    if (na < 1){ *ec = -8; *em = "getaddressbalance(address | [addresses] | {\"addresses\":[...]})"; return 0; }
+    if (!axr_enabled(ec, em)) return 0;
+    unsigned long long bal = 0, rcv = 0; long utxos = 0;
+    static unsigned char txids[AXR_TXID_CAP * 32];
+    for (long i = 0; i < na; i++){
+        int t; unsigned char key[32];
+        if (!axr_key(addrs[i]->str, &t, key)){ *ec = -5; *em = "Invalid address"; return 0; }
+        unsigned long long b, r; long nu;
+        if (axt_read_address(t, key, &b, &r, &nu, txids, 0) < 0){
+            *ec = -1; *em = "Address index unreadable"; return 0; }
+        bal += b; rcv += r; utxos += nu;
+    }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "balance",  rj_numf("%llu", bal));
+    rj_obj_set(o, "received", rj_numf("%llu", rcv));
+    rj_obj_set(o, "utxos",    rj_numf("%ld", utxos));
+    *res = o;
+    return 1;
+}
+
+static int cmd_getaddresstxids(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const rj_val* addrs[64];
+    long na = axr_collect(params, addrs, 64);
+    if (na < 1){ *ec = -8; *em = "getaddresstxids(address | [addresses] | {\"addresses\":[...]})"; return 0; }
+    if (!axr_enabled(ec, em)) return 0;
+    static unsigned char txids[AXR_TXID_CAP * 32];
+    rj_val* arr = rj_arr();
+    for (long i = 0; i < na; i++){
+        int t; unsigned char key[32];
+        if (!axr_key(addrs[i]->str, &t, key)){ rj_free(arr); *ec = -5; *em = "Invalid address"; return 0; }
+        unsigned long long b, r; long nu;
+        long n = axt_read_address(t, key, &b, &r, &nu, txids, AXR_TXID_CAP);
+        if (n < 0){ rj_free(arr); *ec = -1; *em = "Address index unreadable"; return 0; }
+        for (long k = 0; k < n; k++){
+            char hx[65];
+            hex_rev(hx, txids + k * 32, 32);    /* wire -> display order */
+            /* cross-address dedup: linear over what's already in the array
+             * (na is <=64 and per-address lists are already unique) */
+            int dup = 0;
+            for (unsigned long e = 0; e < arr->nitems; e++)
+                if (!strcmp(arr->items[e]->str, hx)){ dup = 1; break; }
+            if (!dup) rj_arr_push(arr, rj_str(hx));
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
 static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     /* Core does not type-check the arg -- it returns {} for a non-matching
@@ -3345,6 +3458,16 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
           rj_obj_set(e, "synced", rj_bool(tip >= 0 && bn - 1 >= tip));
           rj_obj_set(e, "best_block_height", rj_numf("%ld", bn - 1));
           rj_obj_set(o, "basic block filter index", e);
+      } }
+    { long an = axt_probe_covered();
+      if (an >= 0 && (!want || !strcmp(want, "addressindex"))){
+          /* EXTENSION index (Core has no address index); reported here so an
+           * operator can see coverage the same way as the real Core indexes */
+          rj_val* e = rj_obj();
+          long tip = refresh();
+          rj_obj_set(e, "synced", rj_bool(tip >= 0 && an >= tip));
+          rj_obj_set(e, "best_block_height", rj_numf("%ld", an));
+          rj_obj_set(o, "addressindex", e);
       } }
     if (g_csi_h && (!want || !strcmp(want, "coinstatsindex"))){
         long ch = g_csi_h();
@@ -3604,6 +3727,8 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
     if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
     if (!strcmp(m, "getindexinfo")) return cmd_getindexinfo(params, res, ec, em);
+    if (!strcmp(m, "getaddressbalance")) return cmd_getaddressbalance(params, res, ec, em);
+    if (!strcmp(m, "getaddresstxids")) return cmd_getaddresstxids(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
     if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
     if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
