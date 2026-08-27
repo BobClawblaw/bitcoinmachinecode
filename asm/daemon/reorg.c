@@ -51,6 +51,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include "reorg.h"
+#include "../bitcoin_pow_rules.h"
 #include "utxo_walk.h"
 
 /* ---------------- externs: assembly + sibling C modules ------------------ */
@@ -390,9 +391,16 @@ long reorg_headers_ingest(reorg_cand_t* c, const unsigned char* payload, long pl
  * against whatever target the header itself claims). A peer is therefore free
  * to serve a long chain of trivially-mined low-difficulty headers -- which is
  * exactly why fork choice below is CUMULATIVE WORK and not height: such a
- * chain scores near zero and can never out-weigh ours. Retarget validation is
- * a real gap in this node's consensus rules; it is pre-existing, it is called
- * out in this stage's report, and chainwork comparison is what contains it. */
+ * chain scores near zero and can never out-weigh ours.
+ *
+ * Retarget validation is NO LONGER the gap it used to be (2026-08-27):
+ * reorg_analyze below checks every candidate header's nBits against
+ * GetNextWorkRequired via the shared rule engine (bitcoin_pow_rules.c, the
+ * same implementation getblocktemplate and the apply path use, proven over
+ * every real mainnet + testnet4 header) once base_height is known -- this
+ * function cannot, because a header's REQUIRED bits depend on its height.
+ * The apply path (utxo_live) enforces the same rule again at reconnect, so
+ * even a path that skips analyze cannot land a bad-diffbits block. */
 static int headers_chain_valid(const reorg_cand_t* c){
     for (long i = 0; i < c->n; i++){
         if (!pow_check(c->hdr[i])){
@@ -405,6 +413,39 @@ static int headers_chain_valid(const reorg_cand_t* c){
         }
     }
     return 1;
+}
+
+/* nBits schedule knobs -- INJECTED (default off) because the hermetic reorg
+ * suites build synthetic chains with arbitrary bits; the daemon arms this
+ * right after chainparams_select (main.c), same pattern as utxo_live's. */
+static int g_rg_powr_enabled, g_rg_no_rt, g_rg_mindiff, g_rg_bip94;
+static unsigned int g_rg_lim;
+void reorg_set_pow_rules(int no_retarget, int allow_min_diff,
+                         int enforce_bip94, unsigned int pow_limit_bits){
+    g_rg_no_rt = no_retarget; g_rg_mindiff = allow_min_diff;
+    g_rg_bip94 = enforce_bip94; g_rg_lim = pow_limit_bits;
+    g_rg_powr_enabled = 1;
+}
+/* composite header reader for a candidate: heights above base_height come
+ * from the candidate's own header run, everything at or below it from the
+ * archive (80-byte pread via the cached read fds). */
+typedef struct { void* st; const reorg_cand_t* c; } rg_powr_ctx;
+extern int store_rd_fd(void* st, unsigned file_no);
+static int rg_hdr_at(void* vctx, long h, unsigned char hdr[80]){
+    const rg_powr_ctx* x = (const rg_powr_ctx*)vctx;
+    if (h > x->c->base_height){
+        long i = h - x->c->base_height - 1;
+        if (i < 0 || i >= x->c->n) return 0;
+        memcpy(hdr, x->c->hdr[i], 80);
+        return 1;
+    }
+    unsigned long long meta[3];
+    if (store_get_at(x->st, (unsigned long long)h, meta) != 1) return 0;
+    int fd = store_rd_fd(x->st, (unsigned)meta[2]);
+    if (fd < 0) return 0;
+    /* +8 skips the [len][magic] frame header -- store_read_meta's own
+     * pread does exactly this (bitcoin_store_fast.asm) */
+    return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
 
 long reorg_analyze(void* st, reorg_cand_t* c){
@@ -447,6 +488,26 @@ long reorg_analyze(void* st, reorg_cand_t* c){
         fprintf(stderr, "[reorg] candidate REJECTED: its first header attaches to a block we do not have (within %d of our tip)\n",
                 REORG_MAX_DEPTH);
         return -1;
+    }
+
+    /* ---- nBits schedule: every candidate header must carry exactly the
+     * bits GetNextWorkRequired demands for its height (Core's bad-diffbits).
+     * Heights are known now that base_height is: hdr[i] sits at
+     * base_height+1+i. The composite reader serves ancestors from the
+     * candidate run itself above the attach point and from the archive at or
+     * below it. -1 (unreadable ancestor) rejects: refusing to evaluate is
+     * safer than accepting unevaluated. ---- */
+    if (g_rg_powr_enabled){
+        rg_powr_ctx x = { st, c };
+        for (long i = 0; i < c->n; i++){
+            long h = c->base_height + 1 + i;
+            int pr = pow_check_bits(h, c->hdr[i], rg_hdr_at, &x,
+                                    g_rg_no_rt, g_rg_mindiff, g_rg_bip94, g_rg_lim);
+            if (pr != 1){
+                fprintf(stderr, "[reorg] candidate REJECTED: header %ld (height %ld) bad-diffbits\n", i, h);
+                return -1;
+            }
+        }
     }
 
     /* ---- FORK-POINT WALK: advance along both chains together from

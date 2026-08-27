@@ -50,3 +50,4 @@ test_block_strip
 test_rpc_control
 test_rpc_psbtfinal
 test_rpc_wallet_ops
+test_pow_rules
