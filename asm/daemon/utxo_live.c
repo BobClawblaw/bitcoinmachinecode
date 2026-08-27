@@ -763,6 +763,44 @@ const char* utxo_live_last_reject(void){ return g_last_reject; }
  * state succeeds (single-threaded worker; nothing moves in between). */
 static int g_dry_run = 0;
 
+/* ---- nBits schedule enforcement (bad-diffbits) ---------------------------
+ * Core's ContextualCheckBlockHeader: a block whose nBits differs from
+ * GetNextWorkRequired(parent) is consensus-invalid. The rule engine is the
+ * SHARED bitcoin_pow_rules.c -- the same implementation getblocktemplate
+ * uses, proven against every header of the real mainnet chain (964,251
+ * heights, 478 boundaries) and the real testnet4 chain (149,954 heights,
+ * 101k min-difficulty blocks) by validation/pow_replay.c BEFORE being wired
+ * here (LOG.md 2026-08-27).
+ *
+ * INJECTED, default OFF: the hermetic suites build synthetic chains whose
+ * headers carry arbitrary nBits (test_reorg, test_cross_tx_verify, ...);
+ * only the daemon -- which knows the selected chain -- registers the rules
+ * (main.c, right after chainparams_select). Ancestor headers are read
+ * straight from the block archive (g_bip30_store), 80 bytes per lookup via
+ * the cached read fds; every apply path stores ancestors before applying,
+ * and the submitblock dry-run's ancestors are the live chain. */
+#include "../bitcoin_pow_rules.h"
+extern int  store_get_at(void* st, u64 height, u64 out_meta[3]);
+extern int  store_rd_fd(void* st, unsigned file_no);
+static int  g_powr_enabled;
+static int  g_powr_no_rt, g_powr_mindiff, g_powr_bip94;
+static unsigned int g_powr_lim;
+void utxo_live_set_pow_rules(int no_retarget, int allow_min_diff,
+                             int enforce_bip94, unsigned int pow_limit_bits){
+    g_powr_no_rt = no_retarget; g_powr_mindiff = allow_min_diff;
+    g_powr_bip94 = enforce_bip94; g_powr_lim = pow_limit_bits;
+    g_powr_enabled = 1;
+}
+static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
+    u64 meta[3];
+    if (!ctx || store_get_at(ctx, (u64)h, meta) != 1) return 0;
+    int fd = store_rd_fd(ctx, (unsigned)meta[2]);
+    if (fd < 0) return 0;
+    /* +8 skips the [len][magic] frame header -- store_read_meta's own
+     * pread does exactly this (bitcoin_store_fast.asm) */
+    return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
+}
+
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     g_last_reject = "";
     if (blocklen < 81) return 0;
@@ -812,6 +850,19 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     if (g_apply_height == 0 && (memcmp(blk_hash, MAINNET_GENESIS, 32) == 0 ||
                                 memcmp(blk_hash, REGTEST_GENESIS, 32) == 0 ||
                                 memcmp(blk_hash, TESTNET4_GENESIS, 32) == 0)) return 1;
+
+    /* nBits schedule (see the block comment above apply_block_inner). The
+     * check runs for the dry-run too -- submitblock and GBT proposal answer
+     * Core's "bad-diffbits" without touching state. -1 (an ancestor header
+     * unreadable) also rejects: refusing to evaluate is safer than accepting
+     * unevaluated, and every legitimate path has its ancestors stored. */
+    if (g_powr_enabled && g_apply_height >= 1){
+        int pr = pow_check_bits(g_apply_height, blockbuf,
+                                powr_hdr_from_store, g_bip30_store,
+                                g_powr_no_rt, g_powr_mindiff,
+                                g_powr_bip94, g_powr_lim);
+        if (pr != 1){ g_last_reject = "bad-diffbits"; return 0; }
+    }
 
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
      * used), building the tx array tx_verify.c also consumes. txs/pn_outs

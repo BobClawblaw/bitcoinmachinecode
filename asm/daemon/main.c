@@ -3867,6 +3867,21 @@ int main(int argc, char** argv){
     if(g_chainp->dns_seed_hosts && g_chainp->n_dns_seed_hosts > 0){
         g_seed_hosts = g_chainp->dns_seed_hosts; g_n_seed_hosts = g_chainp->n_dns_seed_hosts;
     } else { g_n_seed_hosts = 0; }   /* regtest: no seeds, ever */
+    /* nBits schedule enforcement (bad-diffbits): arm the shared rule engine
+     * (bitcoin_pow_rules.c) in the apply path with the selected chain's
+     * knobs. Only the daemon arms it -- hermetic suites build synthetic
+     * chains with arbitrary bits and never call this. Proven against every
+     * real mainnet + testnet4 header before wiring (validation/pow_replay). */
+    { extern void utxo_live_set_pow_rules(int, int, int, unsigned int);
+      extern void reorg_set_pow_rules(int, int, int, unsigned int);
+      utxo_live_set_pow_rules(g_chainp->pow_no_retargeting,
+                              g_chainp->allow_min_difficulty,
+                              g_chainp->enforce_bip94,
+                              g_chainp->pow_limit_bits);
+      reorg_set_pow_rules(g_chainp->pow_no_retargeting,
+                          g_chainp->allow_min_difficulty,
+                          g_chainp->enforce_bip94,
+                          g_chainp->pow_limit_bits); }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
     chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
     if(g_chainp->id != CHAIN_MAIN){

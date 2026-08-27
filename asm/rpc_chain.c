@@ -48,6 +48,7 @@
  *     block-relaying node; stop's reply names this project, not Core.
  */
 #include "rpc_chain.h"
+#include "bitcoin_pow_rules.h"
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
 #include "script_flags_consts.h"
 #include "block_filter.h"   /* BIP158 basic filters, Core-byte-validated */  /* buried-deployment heights, generated from
@@ -879,68 +880,26 @@ static u32 gbt_compact(const u8 t[32]){
     return ((u32)size << 24) | (word & 0x007fffff);
 }
 
-/* Core pow.cpp CalculateNextWorkRequired: bits for height `tip+1`. */
-#define GBT_TIMESPAN 1209600L                   /* 14 days */
-/* Pure retarget arithmetic, exported for the hermetic KATs (vectors frozen
- * from an arith_uint256-faithful reference implementation). */
+/* Pure retarget arithmetic -- MOVED to bitcoin_pow_rules.c (one
+ * implementation for GBT and validation; proven against every header of the
+ * real mainnet and testnet4 chains, see validation/pow_replay.c). This
+ * wrapper keeps the hermetic KAT surface (vectors frozen from an
+ * arith_uint256-faithful reference) at its historical name/signature,
+ * pinned to the mainnet powLimit the KATs were generated under. */
 u32 rpc_chain_retarget(u32 old_bits, long ts){
-    if (ts < GBT_TIMESPAN/4) ts = GBT_TIMESPAN/4;
-    if (ts > GBT_TIMESPAN*4) ts = GBT_TIMESPAN*4;
-    /* new_target = old_target * ts / GBT_TIMESPAN over a 40-byte big int
-     * (little-endian limbs for the arithmetic, flipped from/to big-endian) */
-    u8 be[32]; target_bytes(old_bits, be);
-    u8 n[40]; memset(n, 0, sizeof n);
-    for (int i = 0; i < 32; i++) n[i] = be[31-i];          /* -> LE */
-    { unsigned long long carry = 0;                         /* *= ts */
-      for (int i = 0; i < 40; i++){
-          unsigned long long v = (unsigned long long)n[i] * (unsigned long long)ts + carry;
-          n[i] = (u8)v; carry = v >> 8;
-      } }
-    { unsigned long long rem = 0;                           /* /= GBT_TIMESPAN */
-      for (int i = 39; i >= 0; i--){
-          unsigned long long v = (rem << 8) | n[i];
-          n[i] = (u8)(v / (unsigned long long)GBT_TIMESPAN);
-          rem = v % (unsigned long long)GBT_TIMESPAN;
-      } }
-    int over = 0; for (int i = 32; i < 40; i++) if (n[i]) over = 1;
-    u8 out[32]; for (int i = 0; i < 32; i++) out[i] = n[31-i];   /* -> BE */
-    u8 lim[32]; target_bytes(0x1d00ffff, lim);
-    if (!over){ for (int i = 0; i < 32; i++){ if (out[i] > lim[i]){ over = 1; break; } if (out[i] < lim[i]) break; } }
-    if (over) memcpy(out, lim, 32);
-    return gbt_compact(out);
+    return pow_retarget_bits(old_bits, ts, 0x1d00ffff);
 }
-/* Core pow.cpp GetNextWorkRequired, chain-aware. curtime is the template's
- * block time (testnet4's 20-minute min-difficulty exception depends on it;
- * Core passes pblock->GetBlockTime() the same way). */
+/* Core pow.cpp GetNextWorkRequired via the SHARED rule engine
+ * (bitcoin_pow_rules.c) -- the same pow_expected_bits validation enforces,
+ * so a template this node builds is by construction one its own validator
+ * accepts. The adapter reads ancestor headers out of the archive. */
+static int gbt_hdr_at(void* ctx, long h, u8 hdr[80]){
+    (void)ctx; return read_block_prefix(h, hdr, 80) == 1 ? 1 : 0;
+}
 static u32 gbt_next_bits(long tip, long curtime){
-    u8 hdr[80];
-    if (read_block_prefix(tip, hdr, 80) != 1) return 0;
-    u32 old_bits = rd32(hdr + 72);
-    if (g_pow_no_retarget) return old_bits;     /* regtest: fPowNoRetargeting */
-    if ((tip + 1) % 2016 != 0){
-        if (g_allow_min_diff){
-            u32 prev_time = rd32(hdr + 68);
-            /* testnet rule: >2*10min after the parent -> min-difficulty */
-            if (curtime > (long)prev_time + 2*600) return g_pow_limit_bits;
-            /* else the last non-min-difficulty block's bits (walk back,
-             * stopping at a period boundary -- Core's exact loop) */
-            long h = tip; u32 bits = old_bits;
-            while (h > 0 && (h % 2016) != 0 && bits == g_pow_limit_bits){
-                h--;
-                if (read_block_prefix(h, hdr, 80) != 1) break;
-                bits = rd32(hdr + 72);
-            }
-            return bits;
-        }
-        return old_bits;
-    }
-    u32 last_time = rd32(hdr + 68);
-    if (read_block_prefix(tip - 2015, hdr, 80) != 1) return old_bits;
-    u32 first_time = rd32(hdr + 68);
-    /* BIP94 (testnet4): the retarget bases on the FIRST block of the period,
-     * whose bits can never be a min-difficulty exception. */
-    u32 base_bits = g_enforce_bip94 ? rd32(hdr + 72) : old_bits;
-    return rpc_chain_retarget(base_bits, (long)last_time - (long)first_time);
+    return pow_expected_bits(tip + 1, curtime, gbt_hdr_at, NULL,
+                             g_pow_no_retarget, g_allow_min_diff,
+                             g_enforce_bip94, g_pow_limit_bits);
 }
 
 /* Slot walk of the shared structural pool (bitcoin_mempool.asm's documented

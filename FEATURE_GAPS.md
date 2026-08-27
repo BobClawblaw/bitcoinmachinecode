@@ -96,6 +96,19 @@ CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
 - **`walletprocesspsbt`** — the PSBT Signer role by delegation
   (`rpc_wallet_ops.c`); `finalizepsbt`/`utxoupdatepsbt` are real
   (`rpc_commands.c`).
+- **nBits schedule enforcement (Core's `bad-diffbits`)** — a peer's headers
+  must now carry exactly the bits `GetNextWorkRequired` demands for their
+  height, checked in fork evaluation (`reorg_analyze`) AND at apply
+  (`utxo_live`), including the submitblock/GBT-proposal dry run. One shared
+  rule engine (`asm/bitcoin_pow_rules.c`) also backs `getblocktemplate`, so
+  mining and validation cannot drift. Chain-aware: fPowNoRetargeting,
+  fPowAllowMinDifficultyBlocks + the 20-minute exception + Core's walk-back,
+  BIP94. Replayed against every header of the real mainnet chain (964,265
+  heights, 478 boundaries) and the real testnet4 chain (149,954 heights,
+  101,009 min-difficulty blocks, 16,491 walk-back re-anchors) —
+  `validation/pow_replay.c`, both exact. This closes the gap `reorg.c`
+  itself used to call out: "retarget validation is a real gap in this node's
+  consensus rules ... chainwork comparison is what contains it."
 - **wtxidrelay (BIP339)** + **stripped-block serving to bare MSG_BLOCK** +
   **addr self-advertisement** (`daemon/addr_self.c`) + **NODE_WITNESS peer
   preference** — the networking gaps the 08-25 P2P section listed as remaining.

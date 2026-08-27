@@ -795,6 +795,54 @@ static void case_not_heavier(void){
     utxo_live_close();
 }
 
+/* ========================================================================
+ * CASE: the nBits schedule check is actually WIRED into reorg_analyze.
+ *
+ * bitcoin_pow_rules.c is proven on its own (test_pow_rules) and against
+ * every header of the real mainnet and testnet4 chains
+ * (validation/pow_replay). Neither proves the thing that actually protects
+ * this node: that ARMING the rules makes reorg_analyze reject. Enforcement
+ * is injected and default-OFF so the hermetic suites can keep building
+ * synthetic chains with arbitrary bits -- which means a wiring bug (setter
+ * never called, height off by one, reader handing back the wrong ancestor)
+ * would enforce NOTHING while every other test stayed green. That is the
+ * worst failure mode consensus code has, so it gets its own case.
+ *
+ * run_case forks per case, so arming the global here cannot leak into any
+ * other case in this binary.
+ * ======================================================================== */
+static void case_bad_diffbits_wired(void){
+    const long nbase = 6, nwin = 2;
+    build_base(nbase, 0x207fffffu);
+    build_branch(win, nwin, nbase, 0x30000000u, 0x207fffffu);
+
+    harness_open();
+    store_chain(nbase, 0);
+
+    /* regtest knobs: fPowNoRetargeting means the required bits at every
+     * height are simply the parent's -- so "same bits as base" is
+     * schedule-valid and any other value is bad-diffbits. */
+    reorg_set_pow_rules(1 /*no_retarget*/, 0 /*min_diff*/, 0 /*bip94*/,
+                        0x207fffffu);
+
+    static reorg_cand_t c; memset(&c,0,sizeof c);
+    reorg_build_locator(store_buf, &c);
+    cand_from_blocks(&c, win, nwin);
+    ckm("a candidate carrying the scheduled bits survives the check",
+        reorg_analyze(store_buf,&c) != -1);
+
+    /* identical shape, one bit harder than the parent: still valid PoW (the
+     * nonce is ground until pow_check passes) but NOT the scheduled bits. */
+    build_branch(win, nwin, nbase, 0x40000000u, 0x207ffffeu);
+    static reorg_cand_t c2; memset(&c2,0,sizeof c2);
+    reorg_build_locator(store_buf, &c2);
+    cand_from_blocks(&c2, win, nwin);
+    ck("a candidate with unscheduled nBits is REJECTED",
+       reorg_analyze(store_buf,&c2), -1);
+
+    utxo_live_close();
+}
+
 /* ======================================================================== */
 /* CASE: hostile / invalid candidate chains are rejected BEFORE any damage  */
 /* ======================================================================== */
@@ -1407,6 +1455,7 @@ int main(void){
     total += run_case("reorg shorter-but-heavier",      case_reorg_shorter_but_heavier);
     total += run_case("competing chain not heavier",    case_not_heavier);
     total += run_case("invalid candidate chains",       case_invalid_candidates);
+    total += run_case("nBits schedule wired into analyze", case_bad_diffbits_wired);
     total += run_case("undo pre-flight gate",           case_undo_preflight_gate);
     total += run_case("mempool reconciliation",         case_mempool);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);

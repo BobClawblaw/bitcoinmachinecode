@@ -99,6 +99,15 @@ long reorg_execute(void* st, long fork_height, long nblocks,
  * deliberately does not guess.) NULL disables the callback. */
 void reorg_set_index_rebuild(void (*cb)(void));
 
+/* Arm the nBits schedule check (Core's bad-diffbits) in reorg_analyze with
+ * the selected chain's knobs. INJECTED and default-OFF: the hermetic suites
+ * build synthetic chains with arbitrary bits, so only the daemon -- which
+ * knows the chain -- arms it (main.c, right after chainparams_select).
+ * The rule engine itself is bitcoin_pow_rules.c, shared with the apply path
+ * and getblocktemplate. */
+void reorg_set_pow_rules(int no_retarget, int allow_min_diff,
+                         int enforce_bip94, unsigned int pow_limit_bits);
+
 /* ---- mempool reconciliation (step 7) ---- */
 typedef struct {
     void*    mp;         /* bitcoin_mempool.asm object */
