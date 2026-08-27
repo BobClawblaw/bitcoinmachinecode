@@ -459,6 +459,98 @@ else
   fail "no second mature coinbase for the package test"
 fi
 
+echo "== BIP431 TRUC (version=3) topology, asked of both nodes =="
+# TRUC is pure policy, so testmempoolaccept answers it without touching
+# either mempool -- and asking BOTH nodes the same question is the only way
+# to know our reading of the rules matches the reference implementation's.
+# createrawtransaction always emits version 2; the version is patched in the
+# raw hex BEFORE signing, so the signature commits to the version we mean.
+v3(){ python3 -c "import sys; h=sys.argv[1]; print('03000000'+h[8:])" "$1"; }
+
+read -r T_TXID T_VAL <<TRUCEOF
+$(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'TRUCPY'
+import struct,sys
+d=open(sys.argv[1],'rb').read()
+S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+if not S: sys.exit("unexpected scan format")
+h,n=struct.unpack('<II',d[8:16]); body=d[16:]
+seen=0
+for i in range(n):
+    r=body[i*S:(i+1)*S]
+    ht,=struct.unpack('<I',r[0:4]); val,=struct.unpack('<Q',r[40:48])
+    kind=r[48]; branch=r[53]
+    if kind==0 and branch==0 and ht<=h-100:
+        seen+=1
+        if seen==3:            # coinbases 1 and 2 are spent by the tests above
+            print(r[4:36][::-1].hex(), val); break
+else:
+    sys.exit("no third mature coinbase")
+TRUCPY
+)
+TRUCEOF
+
+if [ -n "${T_TXID:-}" ]; then
+  TD=$(core -rpcwallet=e2ecore getnewaddress)
+  # parent: two outputs, so a SECOND child is possible without an input
+  # conflict -- that is what isolates the descendant rule from RBF
+  PA=$(python3 -c "print('%.8f'%(($T_VAL//2 - 5000)/1e8))")
+  TP_RAW=$(bmc createrawtransaction "[[{\"txid\":\"$T_TXID\",\"vout\":0,\"sequence\":4294967293}],{\"$CHANGE\":$PA,\"$TD\":$PA}]" | jq_ "d['result']")
+  TP_SIGNED=$(bmc signrawtransactionwithwallet "[\"$(v3 "$TP_RAW")\"]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('v3 parent signing incomplete')")
+  TP_TXID=$(bmc decoderawtransaction "[\"$TP_SIGNED\"]" | jq_ "d['result']['txid']")
+  TP_VER=$(bmc decoderawtransaction "[\"$TP_SIGNED\"]" | jq_ "d['result']['version']")
+  [ "$TP_VER" = "3" ] && ok "the parent really is version=3 after signing" \
+                      || fail "parent version is $TP_VER, expected 3"
+  TP_SPK=$(bmc decoderawtransaction "[\"$TP_SIGNED\"]" | jq_ "d['result']['vout'][0]['scriptPubKey']['hex']")
+  TPREV="[{\"txid\":\"$TP_TXID\",\"vout\":0,\"scriptPubKey\":\"$TP_SPK\",\"amount\":$PA}]"
+
+  CA=$(python3 -c "print('%.8f'%(($T_VAL//2 - 25000)/1e8))")
+  TC_RAW=$(bmc createrawtransaction "[[{\"txid\":\"$TP_TXID\",\"vout\":0,\"sequence\":4294967293}],{\"$TD\":$CA}]" | jq_ "d['result']")
+  TC3=$(bmc signrawtransactionwithwallet "[\"$(v3 "$TC_RAW")\",$TPREV]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('v3 child signing incomplete')")
+  TC2=$(bmc signrawtransactionwithwallet "[\"$TC_RAW\",$TPREV]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('v2 child signing incomplete')")
+
+  # One question, asked of both nodes, reduced to a comparable summary:
+  # (allowed / reject-reason / package-error). The package-error is compared
+  # on its leading TOKEN only -- Core's field is "TOKEN, debug detail" and the
+  # detail names the offending txid and wtxid in prose. We carry the token
+  # alone; that is a stated gap in a diagnostic string, not in the verdict.
+  truc_ask(){   # $1..$n raw hex
+    local arr="" c=""
+    for h in "$@"; do arr="$arr$c\"$h\""; c=","; done
+    local OURS CORE
+    OURS=$(bmc testmempoolaccept "[[$arr]]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+if d.get('error'): sys.exit('RPC error: '+json.dumps(d['error']))
+print(';'.join(str(e.get('allowed'))+'/'+str(e.get('reject-reason','-'))+'/'+str(e.get('package-error','-')).split(',')[0] for e in d['result']))")
+    CORE=$(core testmempoolaccept "[$arr]" 2>/dev/null | python3 -c "
+import sys,json
+r=json.load(sys.stdin)
+print(';'.join(str(e.get('allowed'))+'/'+str(e.get('reject-reason','-'))+'/'+str(e.get('package-error','-')).split(',')[0] for e in r))")
+    echo "$OURS|$CORE"
+  }
+
+  R=$(truc_ask "$TP_SIGNED"); O=${R%%|*}; C=${R##*|}
+  [ "$O" = "$C" ] && ok "a lone v3 parent: both nodes agree ($O)" \
+                  || fail "lone v3 parent: ours=[$O] core=[$C]"
+
+  R=$(truc_ask "$TP_SIGNED" "$TC3"); O=${R%%|*}; C=${R##*|}
+  [ "$O" = "$C" ] && ok "v3 parent + v3 child: both nodes agree ($O)" \
+                  || fail "v3 parent + v3 child: ours=[$O] core=[$C]"
+
+  R=$(truc_ask "$TP_SIGNED" "$TC2"); O=${R%%|*}; C=${R##*|}
+  [ "$O" = "$C" ] && ok "a v2 child of a v3 parent: both nodes agree ($O)" \
+                  || fail "v2 child of a v3 parent: ours=[$O] core=[$C]"
+  # Core rejects this as a PACKAGE, not per member: `allowed` is omitted on
+  # every entry and the reason lands in package-error. Checking reject-reason
+  # alone would look like a disagreement when there is none.
+  case "$O" in
+    *TRUC-violation*) ok "...and both name it a TRUC-violation, at package level" ;;
+    *)                fail "a v2 child of a v3 parent was not rejected as TRUC: $O" ;;
+  esac
+else
+  fail "no third mature coinbase for the TRUC test"
+fi
+
 echo "== mempool.dat: our dump read by Core, and Core's dump read by us =="
 # Format interop, in both directions. A round trip through our own code
 # proves only that we agree with ourselves.
