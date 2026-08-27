@@ -155,11 +155,19 @@ node_log_str:
 	stp  x29,x30,[sp,#-16]!
 	stp  x19,x20,[sp,#-16]!
 	stp  x21,x22,[sp,#-16]!
-	sub  sp, sp, #160	/* line buffer */
+	sub  sp, sp, #512	/* line buffer (arbitrary-length msgs must be clamped, not silently dropped) */
 	mov  x19, x0		/* fd */
 	mov  x20, x1		/* kind (unused: production line is timestamp-first like x86 log_ts.h) */
 	mov  x21, x2		/* s */
 	mov  x22, x3		/* len */
+	/* CLAMP len to fit the 512-byte line buffer; the copy loop below is
+	 * otherwise unbounded and an over-long [dl]/[dlc]/[dl] peers line
+	 * (e.g. 16-worker peer status ~380B) would run past [sp,sp+512) and
+	 * clobber the saved x21/x22/x19/x20/x29/x30 -> return into garbage ->
+	 * SIGBUS (~every 1000 blocks, exactly; pc/bp show log/peer text). */
+	mov  x9, #511
+	cmp  x22, x9
+	csel x22, x9, x22, hi
 	mov  x0, sp
 	mov  x1, x21
 	mov  x2, x22
@@ -181,7 +189,7 @@ node_log_str:
 	mov  x0, x19
 	mov  x1, sp
 	bl   fd_write_all
-	add  sp, sp, #160
+	add  sp, sp, #512
 	ldp  x21,x22,[sp],#16
 	ldp  x19,x20,[sp],#16
 	ldp  x29,x30,[sp],#16
