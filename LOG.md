@@ -7,6 +7,64 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- the node could not serve a single block, for TWO reasons
+
+FEATURE_GAPS carried one unverified line: index.dat records "store the hash
+in wire order" while bitcoin_idx.asm's loader claims display order and
+reverses every record, and "whether the serve path's idx_get compensates was
+not checked". Checking it found two independent defects, either of which
+alone made inbound block serving impossible. Together they masked each
+other, which is why the first fix appeared to change nothing.
+
+CAUSE 1 -- THE INDEX WAS KEYED BACKWARDS (392872b). index.dat holds WIRE
+(raw sha256d) order: production record 0 is genesis as 6fe28c0ab6f1b372...,
+the exact reverse of its display form. idx_build_from_file byte-reversed
+every record on the belief the file held display order, so the boot hash
+index was keyed on DISPLAY hashes. The serve loop passes idx_get the hash
+exactly as it arrives on the p2p wire, so .gd_block could never hit: a
+getdata for a block we hold fell through and the peer got nothing, not even
+a notfound. Proven in isolation before changing anything -- display FOUND at
+the right height, wire MISS, garbage MISS both ways.
+
+WHY THREE TESTS MISSED IT, which is the part worth keeping. test_serve
+built its OWN index with a plain idx_put loop (no reversal), so in the test
+the table was wire-keyed and the serve loop worked -- it proved the serve
+loop correct against an index nobody builds that way. bench_hashidx compared
+the asm loader against a C reference that reversed IDENTICALLY, so the two
+agreed with each other and were both keyed backwards. test_truncate reversed
+every hash before looking it up, matching the loader and no consumer. Each
+test encoded the code's belief rather than the file's contents. All three
+now build the index the way production does and look up the way the wire
+does.
+
+CAUSE 2 -- 63 SECONDS OF SILENCE PER INBOUND CONNECTION (1b62d67). Every
+forked serve child opened its OWN read-only UTXO snapshot before entering
+its read loop, and utxo_lsm_reload costs 60-83 s on the real 165M-entry set.
+During that window the child sent NOTHING -- not even the feefilter the loop
+normally emits immediately -- so every probe timed out at 20-30 s and real
+peers would hang up far sooner. A 240 s probe got the block at 63 s, which
+is what identified it.
+
+Fixed by giving the snapshot the discipline the shared mempool DIRECTLY
+ABOVE IT already had: serve_txdv_preinit runs the init once in the parent
+pre-fork and children inherit it copy-on-write. Bitcoin Core does the same
+-- InitCoinsDB/InitCoinsCache run once in LoadChainstate and every peer
+thread reads one shared view; Core never re-opens the UTXO per connection
+and never forks per connection. Measured on mainnet: 63 s to serve, before;
+under a second after, with the 61.49 s now paid once at boot and logged.
+
+TWO CORRECTIONS TO MY OWN WORK during the hunt, both instructive. The
+`h=-1` that made genuine index hits look like failures was MY probe reading
+the height variable in the same printf argument list as the call that sets
+it -- C does not order argument evaluation. And I twice suspected the
+stripped-block serving added earlier the same day; it was innocent, and
+pointing the same probe at a real Core (which served it immediately)
+is what proved the instrument sound and stopped me chasing my own tooling.
+
+Incidentally confirmed in production: a bare MSG_BLOCK getdata returns
+806,153 bytes where the full block is 1,575,376 -- the stripped-block
+serving added earlier today works on real segwit blocks.
+
 ## 2026-08-27 -- mempool.dat, both directions
 
 `savemempool` and `importmempool` are real, in Core's format, and the
