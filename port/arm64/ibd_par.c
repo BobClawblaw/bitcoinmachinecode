@@ -326,12 +326,23 @@ static struct win g_win[MAXC];
 static int g_nwin=0;       /* number of windows currently assigned to clients */
 static int g_ncli=0;       /* number of live clients */
 static int g_fd[MAXC];     /* client fds */
+static char g_peer_name[MAXC][128];   /* each client's connected peer host */
+static long g_client_served[MAXC];    /* blocks applied via each client */
 static unsigned char* g_rbuf[MAXC];
 static long g_next_issue=0;/* next window INDEX to issue (in height units /WB) */
 
 static void win_reset(struct win* w, long w0, long n){
     memset(w,0,sizeof *w);
     w->w0=w0; w->n=n; w->owner=-1;
+}
+/* one timestamped line listing every live client's peer host + blocks served */
+static void log_peers(void){
+    char b[1024]; int p=0;
+    p+=snprintf(b+p,(sizeof b)-p,"[dl] peers:");
+    for(int j=0;j<g_ncli;j++)
+        p+=snprintf(b+p,(sizeof b)-p," c%d=%s(%ld)", j,
+            g_peer_name[j][0]?g_peer_name[j]:"?", g_client_served[j]);
+    LLOG(7, "%s\n", b);
 }
 
 #define NODE_VERSION_MAJOR 1
@@ -443,6 +454,7 @@ int main(int argc, char** argv){
         int fd=connect_peer(host, g_rbuf[j]);
         if(fd<0){ fprintf(stderr,"[catchup] client %d: no peer available\n",j); break; }
         g_fd[j]=fd;
+        snprintf(g_peer_name[j],sizeof g_peer_name[j],"%s",g_peer_host);
         LLOG(7, "[catchup] client %d connected: %s fd=%d (LSM-RESUME)\n", j, g_peer_host, fd);
         g_ncli++;
     }
@@ -494,6 +506,7 @@ int main(int argc, char** argv){
                             /* since ncli scan uses g_ncli, set fd=-1 and skip it forever */
                             g_fd[j]=-1; continue; }
                 g_fd[j]=nfd;
+                snprintf(g_peer_name[j],sizeof g_peer_name[j],"%s",g_peer_host);
                 LLOG(7, "[catchup] client %d reconnected: %s fd=%d\n", j, g_peer_host, nfd);
                 int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){
                     /* re-request whatever it still owns */
@@ -610,6 +623,8 @@ int main(int argc, char** argv){
                 free(blk); w->blk[kk]=0;
             }
             next_apply += nw;
+            /* credit this window's blocks to its client and log the peer */
+            if(w->owner>=0) g_client_served[w->owner]+=nw;
             /* free the window slot: remove by shifting the tail in */
             for(int i=k;i<g_nwin-1;i++) g_win[i]=g_win[i+1];
             g_nwin--;
@@ -634,6 +649,7 @@ int main(int argc, char** argv){
             if(next_apply - hb_last >= 1000){
                 LLOG(7, "[dl] progress: %ld/%ld blocks verified, %d clients, live utxo=%ld\n",
                         next_apply, G_maxblk, g_ncli, (long)utxo_lsm_count(g_lst));
+                log_peers();
                 hb_last = next_apply;
             }
         }
