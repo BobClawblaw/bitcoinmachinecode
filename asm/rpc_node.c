@@ -485,7 +485,14 @@ static int cmd_getmempoolinfo(rj_val** res){
     rj_obj_set(o, "usage", rj_numf("%llu", blob_used + (unsigned long long)count*48));
     rj_obj_set(o, "total_fee", rj_numf("%llu.%08llu", total_fee/100000000ULL, total_fee%100000000ULL));
     rj_obj_set(o, "maxmempool", rj_numf("%lld", g_mph.maxbytes > 0 ? g_mph.maxbytes : MEMPOOL_MAXBYTES));
-    rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    /* mempoolminfee is the DYNAMIC effective floor: max of the static relay
+     * fee and the eviction-raised floor (mpool_policy_min_fee, sat/vByte ->
+     * BTC/kvB). It rises under congestion exactly as Core's does. */
+    { double dyn_btc = 0.0;
+      if (g_mph.polstate && g_mph.min_fee){ unsigned long long satvb = g_mph.min_fee(g_mph.polstate);
+                           dyn_btc = (double)satvb / 1e5; }
+      double eff = dyn_btc > MEMPOOL_MINFEE_BTC ? dyn_btc : MEMPOOL_MINFEE_BTC;
+      rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", eff)); }
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
