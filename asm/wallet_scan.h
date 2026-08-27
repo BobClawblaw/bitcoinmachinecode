@@ -80,4 +80,19 @@ long wscan_run(long from, long to,
  * or -1 when there is no usable file. */
 long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out);
 
+/* Rewrite the whole record file from an array, with the same header-last
+ * durability discipline wscan_run uses. Behind importprunedfunds and
+ * removeprunedfunds, which edit the record set WITHOUT rescanning the chain.
+ * Returns 0, or -1 with `err` filled; on failure `path` is not disturbed. */
+int wscan_write(const char* path, const wscan_rec* recs, long n, long tip,
+                char* err, unsigned long errcap);
+
+/* The scriptPubKey forms this wallet recognises: P2WPKH, P2PKH, P2SH. Sets
+ * *h to the 20-byte hash inside and returns 1, else 0. Exported so callers
+ * that decide "is this output ours" outside the scan loop (importprunedfunds)
+ * ask the SAME question the scan asks -- a second copy of this would let the
+ * two disagree about what the wallet owns. */
+int wscan_spk_h160(const unsigned char* spk, unsigned long len,
+                   const unsigned char** h);
+
 #endif
