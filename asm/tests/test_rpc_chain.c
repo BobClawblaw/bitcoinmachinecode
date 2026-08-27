@@ -1262,9 +1262,11 @@ int main(void){
                -8, "waitforblockheight requires a height");
 
     /* ---- the refusals name what is missing ---- */
+    /* savemempool/importmempool left this list on 2026-08-27: they are real
+     * and dispatched by rpc_node.c now, so a call reaching THIS table would
+     * mean the node dispatcher had stopped claiming them. */
     { struct { const char* m; const char* needle; } R[] = {
-        {"preciousblock", "fork choice"}, {"pruneblockchain", "fork choice"},
-        {"savemempool", "mempool.dat"}, {"importmempool", "mempool.dat"} };
+        {"preciousblock", "fork choice"}, {"pruneblockchain", "fork choice"} };
       int all = 1;
       for (unsigned i = 0; i < sizeof R / sizeof *R; i++){
           long e; const char* m; rj_val* rr = call(R[i].m, "[]", &e, &m);
@@ -1275,6 +1277,9 @@ int main(void){
           rj_free(rr);
       }
       ck("every unsupported Blockchain method errors with the reason named", all);
+      /* and the two that moved are NOT claimed by the chain table any more */
+      ck("savemempool/importmempool are no longer chain-table refusals",
+         rpc_chain_dispatch("savemempool", NULL, &(rj_val*){0}, &(long){0}, &(const char*){0}) == -1);
       ck("rpc_known_method covers them too",
          rpc_known_method("dumptxoutset") && rpc_known_method("getchainstates") &&
          rpc_known_method("waitforblock") && rpc_known_method("verifychain")); }
