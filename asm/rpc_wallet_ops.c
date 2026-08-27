@@ -2719,6 +2719,45 @@ static int cmd_bumpfee_common(const rj_val* params, const rpc_wallet* w,
     { char pb[512]; FILE* f = fopen(wop_path("bumped.dat", pb, sizeof pb), "a");
       if (f){ fprintf(f, "%s %s\n", txd, newtxid); fclose(f); } }
 
+    /* ...and BOTH transactions into the wallet's send journal, which is what
+     * makes that sidecar reachable at all. gettransaction answers from the
+     * journal, and until now nothing in the DAEMON ever wrote it -- only the
+     * wallet_cli tool did -- so a bump performed over RPC produced a linkage
+     * that no RPC could then read back. Writing only the replacement would
+     * leave replaced_by_txid, the direction a caller actually asks for,
+     * still unreachable on the original.
+     *
+     * The amount is the non-change total and the destination the first
+     * non-change output, matching what the CLI records for a send. A bump
+     * keeps the original outputs and takes the fee from change, so these are
+     * the same on both rows -- only the fee differs, which is the point. */
+    { long long sent = 0; unsigned char dest[20]; int have_dest = 0;
+      for (int i = 0; i < nout; i++){
+          if (i == change_idx) continue;
+          sent += (long long)outs[i].value;
+          if (!have_dest && outs[i].spklen >= 22 &&
+              outs[i].spk[0] == 0x00 && outs[i].spk[1] == 0x14){
+              memcpy(dest, outs[i].spk + 2, 20); have_dest = 1;      /* P2WPKH */
+          } else if (!have_dest && outs[i].spklen == 25 && outs[i].spk[0] == 0x76){
+              memcpy(dest, outs[i].spk + 3, 20); have_dest = 1;      /* P2PKH  */
+          }
+      }
+      if (!have_dest) memset(dest, 0, 20);
+      unsigned char nid[32];
+      if (wop_hex32_le(newtxid, nid)){   /* display -> internal, the order the journal stores */
+          extern int txlog_append_sent(const char*, const unsigned char[32],
+                                       long long, long long, const unsigned char[20],
+                                       unsigned long, long);
+          /* The journal sits beside the WALLET, so it has to be resolved the
+           * way every other wallet file is. Passing NULL takes the library's
+           * "data/bmcwallet.dat" default, which is the CLI's layout, not the
+           * daemon's -- on a per-chain datadir there is no data/ directory
+           * and the write silently goes nowhere. */
+          char wb[512]; const char* wpath = wop_path("bmcwallet.dat", wb, sizeof wb);
+          txlog_append_sent(wpath, txw, sent, old_fee, dest, (unsigned long)nin, rlen);
+          txlog_append_sent(wpath, nid, sent, new_fee, dest, (unsigned long)nin, p2);
+      } }
+
     rj_val* o = rj_obj();
     rj_obj_set(o, "txid", rj_str(newtxid));
     free(newtxid);
