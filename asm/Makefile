@@ -807,7 +807,7 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_net.o bitcoin_p2p.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
-    bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
+    bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_sigops.o
 # SERVETXVALSRCS is defined at the top of this file -- see the "expanded when read" note there.
 tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
@@ -1596,7 +1596,7 @@ TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/tx_verify.c dae
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o \
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o sha256.o \
-    bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_script_flags.o tests/txacc_bidx_stub.c
+    bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_script_flags.o bitcoin_sigops.o tests/txacc_bidx_stub.c
 # test_mempool_consensus_verify -- admission runs the consensus verifier:
 # legacy P2PKH accept, unconfirmed-mempool-parent accept, missing-inputs
 # class, tip-anchored coinbase maturity. Real wallet-signed transactions.
@@ -1718,8 +1718,10 @@ tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json
 tests/test_zmq_ring: tests/test_zmq_ring.c daemon/zmq_notify.c daemon/zmq_pub.c
 	$(CC) -O2 -o $@ tests/test_zmq_ring.c daemon/zmq_notify.c daemon/zmq_pub.c
 
-tests/test_rpc_chain: tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 -o $@ tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
+tests/test_rpc_chain: tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H) \
+    bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c mempool_entry.h
+	$(CC) -no-pie -O2 -o $@ tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) \
+	    bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c -lpthread
 
 # BIP37 partial merkle tree behind gettxoutproof/verifytxoutproof: a
 # known-answer vector (block 100000) plus proof round-trips. No archive/oracle.

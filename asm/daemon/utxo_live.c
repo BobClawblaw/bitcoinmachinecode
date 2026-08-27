@@ -192,6 +192,16 @@ static long  g_applied_height = -1;
 /* Height whose block is currently being applied -- the key undo records are
  * filed under. Set by apply_block_at before any walk begins. */
 static long  g_apply_height = -1;
+
+/* Mined-transaction callback: the serve worker registers a hook that removes
+ * each just-CONFIRMED txid from the shared mempool, so getblocktemplate can
+ * never offer an already-mined (now double-spending) transaction. Only the
+ * reorg reconnect path did this before -- the normal apply path left mined
+ * txs in the pool forever (found by the mining-polish template differential:
+ * bmc's pool held 11 confirmed txs Core's had dropped). NULL (tools, tests,
+ * catch-up-only processes) = no-op. */
+static void (*g_mined_cb)(const unsigned char txid[32]) = 0;
+void utxo_live_set_mined_cb(void (*cb)(const unsigned char[32])){ g_mined_cb = cb; }
 /* Undo capture master switch. ON by default: the whole point of Stage B is
  * that undo data accumulates during NORMAL operation so a reorg that shows
  * up later has something to disconnect with. Turned off only while
@@ -936,6 +946,8 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
         if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
     }
+    if (!ctx.fatal && g_mined_cb)
+        for (u64 t=0; t<ntx; t++) g_mined_cb(txs[t].txid);
     return ctx.fatal ? 0 : 1;
 }
 

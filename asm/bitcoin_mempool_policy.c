@@ -78,12 +78,15 @@ typedef struct { unsigned char txid[32]; uint32_t index; uint32_t _p; uint64_t v
 /* claim entry: a prevout already consumed by an accepted mempool tx
  *   [0..31] prevout txid, [32..35] index, [36..39] claimer tx index (40 bytes) */
 typedef struct { unsigned char prev[32]; uint32_t index; uint32_t claimer; } mpol_claim;
-/* tx node: graph/limits info for an accepted tx (112 bytes)                 */
+/* tx node: graph/limits info for an accepted tx                             */
 typedef struct {
     unsigned char txid[32];
     uint64_t size, fee;
     uint32_t anc_cnt, anc_bytes;
     uint32_t desc_cnt, desc_bytes;
+    uint32_t sigop_cost;       /* BIP141 sigop cost (x4 units), set post-add
+                                  by mpool_policy_set_sigops -- accept-time
+                                  data the RPC template reads back exactly   */
     uint32_t n_parents;
     uint32_t parent[MPOL_MAX_PARENTS];
 } mpol_node;
@@ -520,6 +523,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         t2[myidx].anc_bytes = (uint32_t)anc_bytes;
         t2[myidx].desc_cnt = 1;
         t2[myidx].desc_bytes = (uint32_t)txlen;
+        t2[myidx].sigop_cost = 0;
         t2[myidx].n_parents = (uint32_t)n_par;
         for (int k=0;k<MPOL_MAX_PARENTS;k++)
             t2[myidx].parent[k] = 0xFFFFFFFFu;
@@ -665,6 +669,19 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
     return 0;
 }
 
+/* Record a tx's exact BIP141 sigop cost (x4 units) after acceptance.
+ * tx_accept.c computes it with the prevout scripts in hand (P2SH redeem +
+ * witness portions need them); the GBT template reads it back through
+ * mpool_policy_entry_info. Caller holds mp_lock. */
+long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    for (uint32_t i = n; i > 0; i--)
+        if (!memcmp(t[i-1].txid, txid, 32)){ t[i-1].sigop_cost = cost; return 1; }
+    return 0;
+}
+
 /* ---- getmempoolentry support (2026-08-25) ---------------------------------
  * Snapshot one tx's graph neighborhood into the POD bridge struct
  * (mempool_entry.h). Callers hold mp_lock. Walks by node INDEX (children
@@ -691,6 +708,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     memset(out, 0, sizeof *out);
     out->fee  = t[self].fee;
     out->size = t[self].size;
+    out->sigop_cost = t[self].sigop_cost;
 
     /* direct parents */
     for (uint32_t k=0; k<t[self].n_parents && out->n_depends<MPE_MAX_SET; k++){
@@ -713,6 +731,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     /* transitive ancestors incl self (BFS over parent edges, by index) */
     { uint32_t stack[MPE_MAX_SET]; int sp=0; 
       memcpy(out->anc[out->n_anc++], t[self].txid, 32); out->anc_fee = t[self].fee;
+      out->anc_size = t[self].size;
       stack[sp++] = (uint32_t)self;
       while (sp > 0){
           uint32_t cur = stack[--sp];
@@ -722,6 +741,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
               if (out->n_anc >= MPE_MAX_SET) break;
               memcpy(out->anc[out->n_anc++], t[p].txid, 32);
               out->anc_fee += t[p].fee;
+              out->anc_size += t[p].size;
               if (sp < MPE_MAX_SET) stack[sp++] = p;
           }
       } }

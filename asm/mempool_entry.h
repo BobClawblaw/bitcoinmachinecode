@@ -26,9 +26,16 @@ typedef struct mp_entry_info {
     int n_anc;                       /* |ancestors| incl self */
     unsigned char anc[MPE_MAX_SET][32];
     unsigned long long anc_fee;
+    unsigned long long anc_size;     /* bytes over the same set (for the
+                                        ancestor-package feerate GBT sorts by) */
     int n_desc;                      /* |descendants| incl self */
     unsigned char desc[MPE_MAX_SET][32];
     unsigned long long desc_fee;
+    /* BIP141 sigop COST (x4 units), computed with prevout scripts at accept
+     * time (tx_accept.c) and stored in the registry node; 0 for nodes
+     * registered before the field existed or for genuinely sigop-free txs
+     * (taproot keyspend-only) -- consumers treat it as exact. */
+    unsigned int sigop_cost;
 } mp_entry_info;
 
 #endif
