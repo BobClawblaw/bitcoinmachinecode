@@ -219,38 +219,79 @@ tables and the writers themselves.
   the call site. *(This item was missing from the 2026-08-27 audit of this
   list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
   accurate than what it replaced but not complete.)*
-- **Package relay — PARTLY CLOSED 2026-08-27.** `submitpackage` is real:
-  context-free package policy with Core's reason strings, in-package parent
-  resolution, and Core's effective feerate, so a parent below the relay floor
-  is accepted when its child pays for it. Proven end to end against a real
-  Core, which accepts the identical package
-  (`validation/bumpfee_regtest_e2e.sh`). STILL OPEN: p2p 1-parent-1-child
-  package RELAY (this is submission, not relay), TRUC/v3 and ephemeral-dust
-  policy, `replaced-transactions` reporting, and `testmempoolaccept`'s
-  package mode, which still evaluates each member independently and says so
-  at its own call site.
-- **Seven wallet-import RPCs refuse**, all the same shape: `migratewallet`,
-  `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
-  `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`. The
-  reason is structural and stated at the call site — this wallet is a single
-  BIP32 seed with no import path. NOTE the rest of wallet management shipped:
+- ~~**Package relay**~~ — **CLOSED 2026-08-27 (evening).** All five parts:
+  - `submitpackage` (context-free package policy with Core's reason strings,
+    in-package parent resolution, Core's effective feerate);
+  - **p2p 1p1c package RELAY** — a parent rejected for fee ALONE is now
+    classed `-28` "reconsiderable" (Core's `TX_RECONSIDERABLE`) instead of
+    being collapsed into the general reject class, and the drain submits it
+    with a waiting orphan child as a package (Core's `Find1P1CPackage`).
+    Both arrival orders work: a reconsiderable parent buys a bounded number
+    of request-ring bypasses so a child arriving later can trigger a
+    re-fetch, which is exactly why Core keeps that filter separate from
+    recent-rejects;
+  - **BIP431 TRUC/v3** topology, both directions of the inheritance rule;
+  - **ephemeral dust** (one dust output, 0-fee carrier, child must sweep);
+  - **`replaced-transactions`** — top level of `submitpackage`, as the union
+    across members (NOT per member);
+  - **`testmempoolaccept` package mode** — the array is staged as one package
+    through the same path `submitpackage` uses, stopped before the commit.
+
+  The wire path and the RPC path share one implementation of package
+  validation, so a package off the wire and one off the RPC socket cannot
+  disagree. Proven against Core v31.99 on regtest
+  (`validation/bumpfee_regtest_e2e.sh`, 46 checks).
+
+  STATED GAPS, both strictly more conservative than Core:
+  - **TRUC sibling eviction** is not implemented, so a second TRUC child is
+    refused rather than being allowed to replace its sibling under RBF rules.
+  - Core's `package-error` is `"TOKEN, debug detail"` naming the offending
+    txid and wtxid in prose; ours carries the token alone. The verdict
+    matches; the diagnostic string is shorter.
+- **Six wallet-import RPCs refuse**, all the same shape: `migratewallet`
+  (no legacy wallet to migrate from), `createwalletdescriptor` and `addhdkey`
+  (need a key-import path this wallet does not have), `importprunedfunds` /
+  `removeprunedfunds` (need a wallet transaction store), and `setwalletflag`
+  (would set a flag that changes nothing, which is worse than refusing). The
+  reason is structural and stated at each call site — this wallet is a single
+  BIP32 seed with no import path.
+  **`exportwatchonlywallet` left this list 2026-08-27**: it needs no import
+  path at all. The wallet's entire key set IS its two concrete descriptors
+  (branch-last derivation, index 0 only — see `listdescriptors`), so the
+  export is complete rather than truncated, `restorewallet` reads the format
+  back, and the round trip is proven in the regtest e2e. Core's export also
+  carries transactions and the address book; ours carries the descriptors,
+  and a restored export finds its history by rescanning.
+  NOTE the rest of wallet management shipped:
   `createwallet`/`loadwallet`/`unloadwallet`/`restorewallet`/
   `importdescriptors` are all real.
-- **`build_utxo.c` (the OFFLINE batch tool) includes the genesis coinbase**
-  that Core omits. The LIVE writer does not — `daemon/utxo_live.c` skips it
-  explicitly for mainnet, regtest and testnet4. Previously filed here as a
-  "live writer" divergence, which was wrong.
-- **`bumpfee`'s replaced-by linkage is write-only in practice** — the
-  `bumped.dat` sidecar is written with both txids, but `gettransaction`
-  resolves a txid against the wallet SEND JOURNAL, so a transaction
-  broadcast outside that path is not one it will report on. The
-  `replaced_by_txid`/`replaces_txid` fields are therefore not reachable for
-  such a transaction (found 2026-08-27 while building the bumpfee e2e).
-- **`lsm_get_scratch` is 4 MiB + 64 KiB of per-thread TLS.** Moving it to a
-  lazily-allocated heap buffer would cut the per-thread footprint. This is a
-  FOOTPRINT item, not a correctness one: an earlier note here called it
-  non-thread-safe and pending — it has been thread-local
-  (`section .tbss`, Initial-Exec) since the incident-#13 work.
+- ~~**`build_utxo.c` includes the genesis coinbase**~~ — **CLOSED
+  2026-08-27.** The rule now lives in `daemon/genesis_skip.h`, included by
+  both the live writer and the offline builder, because a second copy of
+  three chain hashes is how two writers come to disagree about what the UTXO
+  set is. Proven on real regtest blocks in the e2e.
+  Found while fixing it: **`daemon/build_utxo` had not LINKED** since
+  `utxo_script_unspendable` was added to it — missing from its object list,
+  and the tool is not part of `make test`, so nothing caught it. It is in the
+  gate now, which is the actual fix.
+- ~~**`bumpfee`'s replaced-by linkage is write-only in practice**~~ —
+  **CLOSED 2026-08-27.** The cause was one layer down from where this was
+  filed: `gettransaction` answers from the wallet SEND JOURNAL, and *nothing
+  in the daemon ever wrote that journal* — only the `wallet_cli` tool did. A
+  bump performed over RPC therefore recorded a linkage no RPC could read
+  back. Both transactions are journalled now, not just the replacement:
+  `replaced_by_txid` on the ORIGINAL is the direction a caller actually asks
+  for. Both directions proven in the regtest e2e.
+- **`lsm_get_scratch` is 4 MiB + 64 KiB of per-thread TLS** — MEASURED
+  2026-08-27 and deliberately NOT changed. The download worker runs 33
+  threads, so this is ~134 MiB of demand-paged `.tbss` against that process's
+  3.8 GB RSS, on a 60 GB machine with 45 GB available. Buying it back means
+  calling `malloc` from hand-written assembly at four sites in the UTXO read
+  path — the hottest and most safety-critical code in the tree. Bad trade at
+  this size; recorded as a measurement rather than left as vague debt. (It is
+  a FOOTPRINT item, not a correctness one: an earlier note here called it
+  non-thread-safe and pending — it has been thread-local, `section .tbss`,
+  Initial-Exec, since the incident-#13 work.)
 - **testnet / signet** — REFUSED by design (`daemon/chainparams.c` rejects
   `chain=test`/`signet` loudly rather than run the wrong rules). Supported:
   **main, regtest and testnet4** — testnet4's whole chain synced with a
