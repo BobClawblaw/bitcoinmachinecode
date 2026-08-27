@@ -883,14 +883,14 @@ int main(int argc, char** argv){
                 if(bad){ bad_gate++; free(blk); continue; }
                 if(((h-start+1)%G_flush_every==0 || h==start+G_maxblk-1)){
                     long fr=utxo_lsm_flush(g_lst,g_utxo);
-                    if(fr<0){ LLOG(6,"h%ld FLUSH ERR\n",h); }
-                    else { g_flushes++; }
-                    LLOG(5, "h%ld FLUSH ok runs=%lu live=%ld\n", h,
-                            (unsigned long)g_lst->manifest_n, (long)utxo_lsm_count(g_lst));
+                    if(fr<0){ LLOG(6,"[dl] utxo flush FAILED at height %ld\n",h); }
+                    else { g_flushes++;
+                        /* x86 [dl] updating utxo: line (daemon/main.c) */
+                        LLOG(6, "[dl] updating utxo: applied %ld block(s), now at height %ld, live=%ld\n",
+                                G_flush_every, h, (long)utxo_lsm_count(g_lst));
+                    }
                 }
                 valid++;
-                if(((h-start)%50)==0)
-                    LLOG(3, "h%ld txs=%llu\n", h, (unsigned long long)nt);
                 free(blk); w->blk[kk]=0;
             }
             next_apply += nw;
