@@ -223,7 +223,12 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive, int slot0,
                       volatile dlc_stat_t* mystat, volatile int* claimed,
                       volatile int* banned){
     struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=dlc_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL);
-    static unsigned char st[4096]; if(store_init(st)!=1){ tsline("[dlc w%d] no store\n",w); return 1; }
+    /* append.lock: each fork worker opens its OWN copy so flock() semantics on
+     * the fat OPEN FILE DESCRIPTION exclude siblings (inherited fds would not).
+     * x86: "[dlc w%d] no lock". */
+    int lfd_open=open("append.lock", O_RDWR|O_CREAT, 0644);
+    if(lfd_open<0){ tsline("[dlc w%d] no lock\n",w); return 1; }
+    static unsigned char st[4096]; if(store_init(st)!=1){ tsline("[dlc w%d] no store\n",w); close(lfd_open); return 1; }
     store_reload(st);
     static unsigned char scr[1<<22];
     int slot=slot0; long total=0; long stalled=0;
@@ -366,6 +371,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive, int slot0,
         }
     }
     if(fd>=0) fd_close(fd); if(held>=0) claimed[held]=0;
+    if(lfd_open>=0) close(lfd_open);
     tsline("[dlc w%d] done: blocks=%ld\n", w, total);
     return 0;
 }
@@ -450,14 +456,17 @@ int main(int argc, char** argv){
     if(start_h>end_h){ tsline("[dlc] archive already complete through %ld\n", end_h); return 0; }
     tsline("[dlc] span [%ld,%ld] (%ld heights)\n", start_h, end_h, end_h-start_h+1);
 
-    /* pre-size index.dat grow-only + append.lock */
+    /* index.dat may have been over-grown (blank pre-sized records) by any
+     * store that set idx_len = file size. Restore it to the REAL data boundary
+     * (tip+1)*48 == start_h*48 so store_append resumes appending at the true
+     * height and actually persists (before: it wrote index records at idx_len=
+     * filesize -> nothing above the real tip hit disk). Truncating to the
+     * last real non-zero record is safe -- it only drops the blank over-growth.
+     * Then let store_append grow index.dat naturally. */
     {
         int ix=open("index.dat", O_RDWR|O_CREAT, 0644);
-        if(ix>=0){ struct stat sb; long cur=0; if(fstat(ix,&sb)==0) cur=sb.st_size;
-            long need=(end_h+1)*48; if(need<cur) need=cur;
-            if(ftruncate(ix,need)){ tsline("[dlc] ftruncate index.dat failed: %s\n", strerror(errno)); }
-            close(ix);
-        } else tsline("[dlc] open index.dat failed: %s\n", strerror(errno));
+        if(ix>=0){ if(ftruncate(ix,(off_t)(start_h)*48)!=0) tsline("[dlc] ftruncate index.dat failed: %s\n", strerror(errno)); close(ix); }
+        else tsline("[dlc] open index.dat failed: %s\n", strerror(errno));
         int lf=open("append.lock", O_RDWR|O_CREAT, 0644); if(lf>=0) close(lf);
     }
 
