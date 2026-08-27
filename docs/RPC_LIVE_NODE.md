@@ -228,8 +228,9 @@ oracle, not merely plausible:
 `restorewallet` / `migratewallet` / `setwalletflag` (one wallet, loaded at
 startup, no multi-wallet manager); `importdescriptors` /
 `createwalletdescriptor` / `addhdkey` / `importprunedfunds` /
-`removeprunedfunds` / `exportwatchonlywallet` (a single seed with no import
-path); `walletdisplayaddress` (no external signer); and the receive-side
+`removeprunedfunds` (a single seed with no import path — `createwallet`,
+`loadwallet`, `unloadwallet`, `restorewallet`, `importdescriptors` and
+`exportwatchonlywallet` have all since become real); `walletdisplayaddress` (no external signer); and the receive-side
 family — `rescanblockchain`, `getreceivedbyaddress`, `getreceivedbylabel`,
 `listreceivedbyaddress`, `listreceivedbylabel`, `listaddressgroupings`,
 `listsinceblock`, `abandontransaction` — which all need a wallet rescan that
@@ -397,15 +398,23 @@ would answer about a mempool this node does not have.
 by a dry run would turn a real broadcast into a no-op that still returned a
 txid — the test asserts the worker sees the flag cleared.
 
-**Documented divergence — package policy.** Core validates the array as a
-package: a child may spend a parent earlier in the same call. This node
-evaluates each transaction independently against the mempool as it stands,
-because the dry run deliberately inserts nothing, so an earlier entry is
-invisible to a later one. When more than one transaction is passed, every
-entry carries Core's own `package-error` field saying so, and a child
-spending an in-array parent reports `missing-inputs` — the truth about what
-was checked. `effective-feerate` and `effective-includes` describe package
-feerate and are omitted rather than guessed.
+**Package mode — REAL since 2026-08-27 (evening).** An array of more than
+one transaction is validated as a PACKAGE, the way Core validates it: a child
+may spend a parent earlier in the same call, and the members are weighed
+against the fee floors together. It runs through the SAME staged package path
+`submitpackage` uses, stopped after its dry run — a separate "test"
+implementation would be a second copy of the rules, free to drift from the
+one that decides real admissions, which is the one thing this call must never
+do. `package-error` now means what it means in Core: a genuine package-level
+rejection.
+
+The differential against Core found a real bug in the first cut, which no
+unit test with a stubbed worker could have: pass 1 computes the package
+aggregate, so it necessarily runs WITHOUT the fee context, and a member that
+only clears the floor because of the package is still marked rejected there.
+Stopping after pass 1 reported `allowed:false` for exactly the transaction
+package validation exists to admit. Pass 2 runs in test mode too now, as a
+test rather than a commit.
 
 ### `finalizepsbt` — verified against the signer, not against itself
 Implements BIP174's Finalizer and Extractor for P2PKH, P2WPKH and
@@ -822,15 +831,21 @@ the call site. What remains declined, and why, in one place:
   directions against a real Core.
 - ~~**submitpackage**~~ — **REAL 2026-08-27** (slice 21): package policy,
   in-package parent resolution and Core's effective feerate, so a parent
-  below the relay floor is accepted when its child pays for it. Still
-  refused: **getmempoolcluster** (no cluster mempool).
+  below the relay floor is accepted when its child pays for it. The rest of
+  package relay closed the same evening (slice 23): p2p 1p1c relay, TRUC/v3,
+  ephemeral dust, `replaced-transactions`, `testmempoolaccept` package mode.
+  Still refused: **getmempoolcluster** (no cluster mempool).
 - ~~**encryptwallet + multi-wallet lifecycle**~~ — both REAL (encryption
   2026-08-27, the multi-wallet lifecycle the same week). Of the
-  import/export family only seven remain refused, all needing a path to
+  import/export family six remain refused, all needing a path to
   ADOPT foreign key material a single-seed wallet does not have:
   `migratewallet`, `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
-  `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`.
-  `importdescriptors` is real.
+  `importprunedfunds`, `removeprunedfunds`.
+  `importdescriptors` is real, and **`exportwatchonlywallet` became real
+  2026-08-27 (evening)** — it needs no import path at all, since this
+  wallet's entire key set IS the two concrete descriptors it exports
+  (branch-last derivation, index 0 only). `restorewallet` reads the format
+  back; the round trip is proven in the regtest e2e.
 - **getopenrpcinfo / rpc.discover / exportasmap** — no OpenRPC document, no
   asmap.
 
@@ -1138,10 +1153,20 @@ Proven end to end: the parent is refused ALONE with "min relay fee not met",
 then accepted as part of the package — and Bitcoin Core accepts the identical
 package (`validation/bumpfee_regtest_e2e.sh`).
 
-STILL OPEN: p2p 1-parent-1-child package RELAY (this is submission), TRUC/v3
-and ephemeral-dust policy, `replaced-transactions`, and
-`testmempoolaccept`'s package mode, which still evaluates each member
-independently and says so at its own call site.
+CLOSED the same evening, all of it: p2p 1p1c package RELAY (a fee-only
+reject is classed `-28` "reconsiderable", and the drain submits such a parent
+together with a waiting orphan child — Core's `Find1P1CPackage`; both arrival
+orders work, because a reconsiderable parent buys a bounded number of
+request-ring bypasses so a later child can trigger a re-fetch), BIP431
+TRUC/v3 topology, ephemeral dust, `replaced-transactions` (top level, as the
+union across members), and `testmempoolaccept`'s package mode.
+
+STATED GAPS, both strictly more conservative than Core: TRUC **sibling
+eviction** is not implemented, so a second TRUC child is refused rather than
+allowed to replace its sibling under RBF rules; and Core's `package-error`
+carries `"TOKEN, debug detail"` naming the offending txid and wtxid in prose,
+where ours carries the token alone. The verdicts match — the regtest
+comparison matches on the token and says so where it does it.
 
 ## Slice 22 — mempool.dat, both directions — (2026-08-27)
 
@@ -1185,3 +1210,85 @@ every live leg immediately.
 Verified on the live mainnet node: a 284,485-byte dump of 184 real
 transactions that an independent parser walks to exactly the file length,
 zero trailing bytes, all entry times nonzero.
+
+## Slice 23 — package relay, closed end to end — (2026-08-27, evening)
+
+Five parts. The theme is a transaction whose fee only makes sense alongside a
+relative: it could not reach this node over the wire, and could not be
+described back to a caller in Core's words.
+
+### 1p1c package relay
+
+`submitpackage` (slice 21) let a caller submit a CPFP pair. Nothing let one
+arrive over the wire. A parent below the relay floor was rejected, its child
+became a permanent orphan, and the pattern the network actually uses to
+unstick a stuck parent could not reach this node at all.
+
+Core splits the fee-only failure out of the general reject class
+(`TX_RECONSIDERABLE`) precisely because it is the ONE verdict a descendant
+can overturn; everything else is final. The relay entry collapsed both into
+`-26`, so the drain could not tell a parent worth resubmitting inside a
+package from one worth discarding. It returns `-28` for the two fee reasons
+now — and `submitpackage` had its own inline copy of that same pair of
+strings, so both call one predicate and cannot drift.
+
+The reverse arrival order needed the other half of Core's design. Core keeps
+reconsiderable identifiers in a filter SEPARATE from recent-rejects so
+`AlreadyHaveTx` answers "no" and the parent can be requested AGAIN once a
+child turns up. Our request ring is that already-have check, and it would
+have suppressed exactly the re-fetch 1p1c depends on. Membership buys a
+bounded number of ring bypasses — bounded, because an unbounded one is a
+re-fetch loop with a peer that keeps sending a transaction we keep rejecting.
+
+The validation is not a second implementation: same well-formedness check,
+same overlay, same two passes, same fee context `submitpackage` runs. A
+package off the wire and one off the RPC socket must not be able to disagree.
+
+### TRUC (BIP431) and ephemeral dust
+
+The rule that is easy to get backwards is that half of TRUC's constraints
+apply to NON-v3 transactions — a v2 child may not spend a v3 parent either —
+and getting that wrong leaves open exactly the pinning hole TRUC exists to
+close. Both directions are enforced and both are tested.
+
+Ephemeral dust has two rules that only work as a pair: the carrier must pay
+ZERO fee (so no miner is tempted to mine it alone and strand the dust), and a
+child must sweep every dust output of its unconfirmed parents (so the parent
+can only be mined alongside the transaction that cleans up). An
+implementation with only one still passes the other's tests, so each is
+tested separately.
+
+### What only a real Core found
+
+Three defects this session survived a green hermetic suite and were caught by
+the regtest differential:
+
+1. `testmempoolaccept` package mode reported `allowed:false` for exactly the
+   transaction package validation exists to admit — pass 1 computes the
+   aggregate, so it runs without the fee context, and stopping there leaves a
+   rescued member marked rejected.
+2. `replaced-transactions` is TOP LEVEL in `submitpackage`, as the union
+   across members — not the per-member field it looks like it should be.
+3. TRUC did not fire inside a package **at all**. During package validation a
+   member's parent is not in the mempool, it is another member, so
+   `find_node` missed, the transaction looked parentless, and a v2 child of a
+   v3 parent sailed through. The package overlay resolves PREVOUTS; it does
+   not say who is in the package. A membership context now does.
+
+One differential failure was in the test rather than the node, and is worth
+recording because it looks exactly like a real divergence: the two regtest
+nodes are peered, so a replacement submitted to one relays to the other in
+milliseconds, and the second node then answers "already in mempool" with no
+replacements at all. Core reported `[]`. The test cuts the link first now.
+
+### Stated gaps
+
+Both strictly more conservative than Core, neither silent:
+
+- **TRUC sibling eviction** is not implemented. A second TRUC child is
+  refused rather than allowed to replace its sibling under RBF rules.
+- Core's `package-error` is `"TOKEN, debug detail"`, naming the offending
+  txid and wtxid in prose; ours carries the token alone. The verdicts match,
+  so the regtest comparison matches on the token — and says so where it does.
+
+Regtest e2e against Core v31.99: **46 checks, 0 failures.**
