@@ -35,6 +35,18 @@ default rel
 
 extern sha256d
 
+; ----------------------------------------------------------------------------
+; net_magic -- the 4-byte network message-start, as the little-endian dword
+; that lands in the frame verbatim. Statically MAINNET (f9 be b4 d9), so every
+; existing tool and test that never selects a chain behaves exactly as before.
+; chainparams_select() (daemon/chainparams.c) overwrites it for regtest
+; (fa bf b5 da) BEFORE any socket is opened; it is never written again, so the
+; unsynchronized reads below are safe.
+; ----------------------------------------------------------------------------
+section .data
+global net_magic
+net_magic: dd 0xd9b4bef9
+
 section .text
 
 ; ============================================================================
@@ -255,8 +267,9 @@ p2p_frame:
     mov  r14, rdx
     mov  r15, rcx
     mov  rbx, r8
-    ; out[0..4] magic
-    mov  dword [r12], 0xd9b4bef9
+    ; out[0..4] magic (runtime chain-selected; see net_magic above)
+    mov  eax, [net_magic]
+    mov  [r12], eax
     ; out[4..16] command (zero then copy <=12)
     lea  rdi, [r12+4]
     xor  eax, eax
@@ -314,7 +327,8 @@ p2p_write:
     mov  r15, rcx
     mov  rbx, r8
     ; header buffer at rbp-0x58 .. rbp-0x41 (24 bytes)
-    mov  dword [rbp-0x58], 0xd9b4bef9
+    mov  eax, [net_magic]
+    mov  [rbp-0x58], eax
     lea  rdi, [rbp-0x54]
     xor  eax, eax
     mov  rcx, 12
@@ -397,9 +411,9 @@ p2p_read:
     cmp  rax, 24
     jne  .eof_or_err
 
-    ; --- verify magic ---
+    ; --- verify magic (runtime chain-selected; see net_magic above) ---
     mov  eax, [rbp-0x58]
-    cmp  eax, 0xd9b4bef9
+    cmp  eax, [net_magic]
     jne  .eof_or_err
 
     ; --- copy command (12B) to cmd_out ---

@@ -1,0 +1,72 @@
+/* daemon/chainparams.h -- runtime chain selection (mainnet / regtest).
+ *
+ * One global parameter set, selected ONCE at boot from `chain=` in
+ * bitcoin.conf (node_config.c) before any socket, block, or address is
+ * touched, and never changed again -- so every reader can use the plain
+ * globals without synchronization, exactly like Core's Params() singleton.
+ *
+ * The default is MAINNET, statically: a process that never calls
+ * chainparams_select() (every existing tool, test, and the production
+ * daemon's current config) behaves byte-identically to before this file
+ * existed. That includes two runtime globals OWNED BY ASSEMBLY and only
+ * WRITTEN here:
+ *   - net_magic  (bitcoin_net.asm)         wire message-start dword
+ *   - sfc_chain  (bitcoin_script_flags.asm) activation-schedule selector
+ *
+ * What is deliberately NOT chain-selected:
+ *   - The block-archive container marker (bitcoin_store.asm's
+ *     [len][f9beb4d9] framing, archive_verify's ARCHIVE_MAGIC): that is this
+ *     project's own FILE format, not the wire protocol. Chains never share a
+ *     datadir (chainparams_datadir appends "/regtest", Core's own layout),
+ *     so distinguishing them by container marker would only break every
+ *     existing offline tool for no isolation gain.
+ *
+ * Every numeric value below is read out of Core's kernel/chainparams.cpp
+ * (CMainParams / CRegTestParams) -- kept next to a citation comment, and the
+ * genesis blocks are verified against Core's own asserted hashes by
+ * tests/test_chainparams.c, which hashes the byte arrays with block_hash and
+ * compares. Never trust these constants unhashed.
+ */
+#ifndef CHAINPARAMS_H
+#define CHAINPARAMS_H
+
+#define CHAIN_MAIN    0
+#define CHAIN_REGTEST 1
+
+typedef struct {
+    int          id;                 /* CHAIN_* */
+    const char*  name;               /* "main" / "regtest" (Core's -chain=) */
+    unsigned int magic;              /* wire message-start, as the LE dword */
+    int          default_port;       /* P2P listen/dial */
+    int          default_rpc_port;
+    /* genesis, raw block bytes + its sha256d hash in WIRE (internal) order */
+    const unsigned char* genesis;
+    long                 genesis_len;
+    const unsigned char* genesis_hash;   /* [32] */
+    long         halving_interval;   /* nSubsidyHalvingInterval */
+    int          pow_no_retargeting; /* fPowNoRetargeting */
+    unsigned int pow_limit_bits;     /* powLimit as compact nBits */
+    /* address encodings */
+    unsigned char p2pkh_version;     /* base58Prefixes[PUBKEY_ADDRESS] */
+    unsigned char p2sh_version;      /* base58Prefixes[SCRIPT_ADDRESS] */
+    unsigned char wif_version;       /* base58Prefixes[SECRET_KEY] */
+    const char*  bech32_hrp;
+    int          dns_seeds;          /* regtest: none, ever */
+} chainparams_t;
+
+/* The selected chain. Statically CHAIN_MAIN. */
+extern const chainparams_t* g_chainp;
+
+/* Select by Core's -chain= name ("main" or "regtest"; "test"/"signet" are
+ * recognised and REFUSED loudly rather than half-supported). Returns 1 ok,
+ * 0 unknown/unsupported. Also writes the two asm globals. Call before any
+ * network or block activity; calling twice with the same name is harmless. */
+int chainparams_select(const char* name);
+
+/* Core's datadir layout: mainnet lives at the datadir root, every other
+ * chain in a subdirectory named after it ("<datadir>/regtest"). Writes the
+ * effective path (creating the subdirectory if missing) into out. Returns
+ * out for convenience. */
+const char* chainparams_datadir(const char* base, char* out, long cap);
+
+#endif

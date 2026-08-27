@@ -44,6 +44,8 @@ node_config_t g_cfg = {
     .connect_timeout_ms    = 5000,     /* Core v31 -timeout default          */
     .peer_timeout_s        = 60,
     .port                  = 8333,
+    .port_explicit         = 0,
+    .chain                 = "main",
     .listen                = 1,
     .blocksonly            = 0,
     .bind_addr             = "",     /* empty == INADDR_ANY */
@@ -90,6 +92,8 @@ static void set_defaults(void){
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
+    g_cfg.port_explicit         = 0;
+    snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
@@ -138,8 +142,13 @@ static int cfg_addlist(char list[][64], int* n, const char* val, const char* key
     { char* colon = strrchr(host,':');
       if(colon){
         int p = atoi(colon+1);
-        if(p != 8333){
-            fprintf(stderr,"[config] %s=%s -- only the default P2P port (8333) is supported for named peers; ignoring this entry\n", key, val);
+        /* 8333 (main) or 18444 (regtest) -- the port is stripped here and the
+         * dial paths use the chain's own g_cfg.port for every connection, so
+         * this guard only refuses ports that could never be honoured. Checked
+         * against both chain defaults because chain= may appear on any line
+         * of the file relative to this entry. */
+        if(p != 8333 && p != 18444){
+            fprintf(stderr,"[config] %s=%s -- only a chain's default P2P port (8333 main, 18444 regtest) is supported for named peers; ignoring this entry\n", key, val);
             (*bad)++; return 0;
         }
         *colon = 0;
@@ -236,7 +245,12 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"peertimeout")){  /* Core: peer inactivity, s   */
             t=clamp_int(iv,5,3600,key,&bad);  if(t>=0){g_cfg.peer_timeout_s=t;applied++;} }
         else if(!strcmp(key,"port")){         /* Core: P2P listen port      */
-            t=clamp_int(iv,1,65535,key,&bad); if(t>=0){g_cfg.port=t;applied++;} }
+            t=clamp_int(iv,1,65535,key,&bad); if(t>=0){g_cfg.port=t;g_cfg.port_explicit=1;applied++;} }
+        else if(!strcmp(key,"chain")){        /* Core: -chain=main|regtest  */
+            snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",val); applied++; }
+        else if(!strcmp(key,"regtest")){      /* Core: -regtest (bool form) */
+            t=clamp_int(iv,0,1,key,&bad);
+            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest"); applied++; } }
         else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
             char tmp[64]; snprintf(tmp,sizeof tmp,"%s",val);
             char* colon = strrchr(tmp,':');

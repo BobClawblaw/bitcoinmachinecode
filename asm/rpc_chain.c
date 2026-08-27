@@ -301,6 +301,20 @@ static void chainwork_hex(const u8 w[16], char out[65]){
 }
 
 /* ---- header math (Core GetDifficulty / DeriveTarget / GetMedianTimePast) ---- */
+/* ---- chain parameters (runtime-selected; daemon/chainparams.c) ----------
+ * Statics default to MAINNET so every existing consumer of rpc_chain.o
+ * (standalone rpcd, tests) behaves exactly as before without linking
+ * chainparams.c; the daemon calls rpc_chain_set_chainparams() after
+ * chainparams_select(). Regtest: name "regtest", halving 150,
+ * fPowNoRetargeting (GBT keeps the tip's nBits forever). */
+static const char* g_chain_name = "main";
+static long g_halving_interval  = 210000;
+static int  g_pow_no_retarget   = 0;
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting){
+    g_chain_name = name; g_halving_interval = halving_interval;
+    g_pow_no_retarget = pow_no_retargeting;
+}
+
 static double difficulty_of(u32 bits){
     int shift = (bits >> 24) & 0xff;
     double d = (double)0x0000ffff / (double)(bits & 0x00ffffff);
@@ -807,7 +821,7 @@ static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
       if (cmd_getnetworkhashps(NULL,&nh,&e2,&m2)) rj_obj_set(o,"networkhashps", nh);
       else rj_obj_set(o,"networkhashps", rj_numf("%d",0)); }
     rj_obj_set(o,"pooledtx", rj_numf("%d", 0));
-    rj_obj_set(o,"chain", rj_str("main"));
+    rj_obj_set(o,"chain", rj_str(g_chain_name));
     rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
     *res = o;
     return 1;
@@ -882,6 +896,7 @@ static u32 gbt_next_bits(long tip){
     u8 hdr[80];
     if (read_block_prefix(tip, hdr, 80) != 1) return 0;
     u32 old_bits = rd32(hdr + 72);
+    if (g_pow_no_retarget) return old_bits;     /* regtest: fPowNoRetargeting */
     if ((tip + 1) % 2016 != 0) return old_bits;
     u32 last_time = rd32(hdr + 68);
     if (read_block_prefix(tip - 2015, hdr, 80) != 1) return old_bits;
@@ -1221,7 +1236,7 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     u8 rec[48]; read_idx_rec(tip, rec);
     char hx[65];
     rj_val* o = rj_obj();
-    rj_obj_set(o, "chain", rj_str("main"));
+    rj_obj_set(o, "chain", rj_str(g_chain_name));
     rj_obj_set(o, "blocks", rj_numf("%ld", tip));
     long hh = headers_height(tip);
     rj_obj_set(o, "headers", rj_numf("%ld", hh));
@@ -2250,7 +2265,7 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
  * window only) those keys are OMITTED -- an honest divergence from a full node
  * (which would error on a pruned block), consistent with getblock's fee
  * omission. Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
-static u64 gbs_subsidy(long h){ long era=h/210000; if (era>=64) return 0; return 5000000000ULL >> era; }
+static u64 gbs_subsidy(long h){ long era=h/g_halving_interval; if (era>=64) return 0; return 5000000000ULL >> era; }
 static long gbs_cs(u64 n){ if (n<253) return 1; if (n<=0xffff) return 3; if (n<=0xffffffffULL) return 5; return 9; }
 static int gbs_unspendable(const u8* s, u64 len){ return (len>0 && s[0]==0x6a) || len>10000; }
 static int gbs_cmp_u64(const void* a, const void* b){ u64 x=*(const u64*)a, y=*(const u64*)b; return (x<y)?-1:(x>y)?1:0; }
