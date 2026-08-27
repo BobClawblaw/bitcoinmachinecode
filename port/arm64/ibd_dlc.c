@@ -188,11 +188,44 @@ static int dlc_dial_bounded(const char* ip, int wait_ms){
     return fd;
 }
 
-/* dl_bootstrap: resolve the DNS seeds to real peer IPs, add to book (exact
- * [boot] lines). Seednode getaddr not solicited here (headers already local);
- * keeps the discovery-side parity lines. */
+/* Bitcoin version/verack handshake on an already-connected fd. Bounded reads
+ * (SO_RCVTIMEO) so a non-Bitcoin socket can't hang it. Returns 1 on success
+ * (version received + verack'd + peer's verack seen), else 0. */
+static int dlc_handshake(int fd){
+    struct timeval tv; tv.tv_sec=3; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    unsigned char v[256]; int o=0;
+    v[o++]=0x7f;v[o++]=0x11;v[o++]=0x01;v[o++]=0x00; v[o++]=1;
+    long long now=(long long)time(NULL); for(int i=0;i<8;i++){v[o++]=(unsigned char)(now&0xff);now>>=8;}
+    for(int i=0;i<8;i++)v[o++]=0; for(int i=0;i<16;i++)v[o++]=0;
+    for(int i=0;i<8;i++)v[o++]=0; for(int i=0;i<16;i++)v[o++]=0;
+    unsigned long long nn=0x1111111111111111ULL; for(int i=0;i<8;i++){v[o++]=(unsigned char)(nn&0xff);nn>>=8;}
+    const char* ua="/Satoshi:0.18.0/"; v[o++]=strlen(ua); memcpy(v+o,ua,strlen(ua)); o+=strlen(ua);
+    v[o++]=0;v[o++]=0;v[o++]=0;v[o++]=0; v[o++]=1;
+    if(p2p_write(fd,"version",7,v,o)<=0) return 0;
+    char cmd[12]; unsigned pl=0; int sv=0,gv=0; static unsigned char hbin[8*1024*1024];
+    for(int i=0;i<16&&!(sv&&gv);i++){
+        int r=p2p_read(fd,cmd,hbin,8*1024*1024,&pl); cmd[11]=0; if(r<=0) break;
+        if(!strncmp(cmd,"version",7)&&!sv){ if(p2p_write(fd,"verack",6,0,0)<=0) break; sv=1; }
+        else if(!strncmp(cmd,"verack",6)) gv=1;
+    }
+    return (sv&&gv)?1:0;
+}
+
+/* dl_bootstrap: prime the book with KNOWN-GOOD serving node IPs (the actual
+ * mainnet full nodes this port has downloaded real blocks from), then resolve
+ * the DNS seeds into it too. Without this the DNS seed haul is ~1 usable node
+ * per 139 candidates in this environment and the downloader starves. Same
+ * known-good-first idea as x86's peers.good (added before the DNS loop so the
+ * probe finds real nodes first). */
 static long dl_bootstrap(void){
     long total=0;
+    /* proven-serving node IPs (seen delivering real blocks in ibd_par/ibd_lsm) */
+    static const char* good[]={
+        "66.181.35.130","203.56.149.66","184.174.97.161","68.114.136.133",
+        "138.68.227.57","82.181.245.129","76.186.126.222","155.4.245.33",
+        "209.227.228.193","62.245.76.144","172.232.181.77","172.234.197.86"
+    };
+    for(unsigned i=0;i<sizeof(good)/sizeof(good[0]);i++) if(amr_add(good[i])) total++;
     for(int i=0;i<NSEEDS && i<12;i++){
         struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
         long got=0;
@@ -269,27 +302,11 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive, int slot0,
                     if(!__sync_bool_compare_and_swap(&claimed[idx],0,1)) continue;
                     int fdc=dlc_dial_bounded(cand,8000);
                     if(fdc<0){ claimed[idx]=0; continue; }
-                    struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-                    /* handshake: version/verack (same as connect_peer) */
-                    unsigned char v[256]; int o=0;
-                    v[o++]=0x7f;v[o++]=0x11;v[o++]=0x01;v[o++]=0x00; v[o++]=1;
-                    long long now=(long long)time(NULL); for(int i=0;i<8;i++){v[o+i]=(unsigned char)(now&0xff);now>>=8;} o+=8;
-                    for(int i=0;i<8;i++)v[o++]=0; for(int i=0;i<16;i++)v[o++]=0;
-                    for(int i=0;i<8;i++)v[o++]=0; for(int i=0;i<16;i++)v[o++]=0;
-                    unsigned long long nn=0x1111111111111111ULL; for(int i=0;i<8;i++){v[o++]=nn&0xff;nn>>=8;}
-                    const char* ua="/Satoshi:0.18.0/"; v[o++]=strlen(ua); memcpy(v+o,ua,strlen(ua)); o+=strlen(ua);
-                    v[o++]=0;v[o++]=0;v[o++]=0;v[o++]=0; v[o++]=1;
-                    if(p2p_write(fdc,"version",7,v,o)>0){
-                        char cmd[12]; unsigned pl=0; int sv=0,gv=0;
-                        for(int i=0;i<20&&!(sv&&gv);i++){
-                            int r=p2p_read(fdc,cmd,v,8*1024*1024,&pl); cmd[11]=0; if(r<=0)break;
-                            if(!strncmp(cmd,"version",7)&&!sv){ p2p_write(fdc,"verack",6,0,0); sv=1; }
-                            else if(!strncmp(cmd,"verack",6)) gv=1;
-                        }
-                        if(sv&&gv){ fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
-                            mystat->held_idx=idx; snprintf((char*)mystat->peer,63,"%s",cand);
-                            mystat->chunks=0; mystat->blocks=0; mystat->timeouts=0;
-                        } else { claimed[idx]=0; fd_close(fdc); }
+                    if(dlc_handshake(fdc)){
+                        struct timeval tv2; tv2.tv_sec=20; tv2.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv2,sizeof tv2);
+                        fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        mystat->held_idx=idx; snprintf((char*)mystat->peer,63,"%s",cand);
+                        mystat->chunks=0; mystat->blocks=0; mystat->timeouts=0;
                     } else { claimed[idx]=0; fd_close(fdc); }
                 }
                 if(!ok){
@@ -424,13 +441,65 @@ int main(int argc, char** argv){
     int from=0, rounds=0;
     while(nlive<want && from<npool){
         int ntry=npool-from; if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
-        int gotc=0;
-        for(int k=0;k<ntry && nlive<want;k++){
-            int idx=from+k;
-            int fdc=dlc_dial_bounded(pool[idx],8000);
-            if(fdc>=0){ strncpy(live[nlive],pool[idx],63); nlive++; gotc++; close(fdc); }
+        /* x86-faithful PARALLEL probe round: nonblocking-dial the whole batch,
+         * multi-round poll for connect completion, then handshake-verify only
+         * the few that connected. (Serial dial+handshake over 141 hosts was
+         * O(pool x timeout) and hung the probe for minutes.) */
+        int BATCH=ntry; if(BATCH>64) BATCH=64;
+        int cfd[64]; int pmap[64];
+        for(int b=0;b<BATCH;b++){ cfd[b]=-1; pmap[b]=-1; }
+        for(int b=0;b<BATCH;b++){
+            unsigned uip; if(inet_pton(AF_INET,pool[from+b],&uip)!=1){ cfd[b]=-1; continue; }
+            int s=socket(AF_INET,SOCK_STREAM|SOCK_NONBLOCK,0);
+            if(s<0){ cfd[b]=-1; continue; }
+            struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
+            sa.sin_addr.s_addr=uip; sa.sin_port=htons(DEFAULT_PORT);
+            int rc=connect(s,(struct sockaddr*)&sa,sizeof sa);
+            if(rc!=0 && errno!=EINPROGRESS){ close(s); cfd[b]=-1; continue; }
+            cfd[b]=s;
         }
-        from+=ntry; rounds++;
+        struct pollfd pol[64]; static char prdy[64]; int nf=0;
+        for(int b=0;b<BATCH;b++){ if(cfd[b]<0) continue;
+            pol[nf].fd=cfd[b]; pol[nf].events=POLLOUT; pol[nf].revents=0; pmap[nf]=b; prdy[nf]=0; nf++; }
+        /* x86 dlc_probe_round: poll in ROUNDS within a wall-clock budget, not
+         * once -- a single poll() returns as soon as the FIRST fd connects, so
+         * every slower (but valid) peer looks not-ready and is closed. */
+        if(nf>0){
+            long long pr_end;
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+              pr_end = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL + 8000; }
+            for(;;){
+                long long pr_now;
+                { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                  pr_now = ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
+                int left=(int)(pr_end-pr_now); if(left<=0) break;
+                int r=poll(pol,nf,left); if(r<=0) break;
+                int pending=0;
+                for(int j=0;j<nf;j++){
+                    if(pol[j].fd<0) continue;
+                    if(pol[j].revents & POLLOUT){ prdy[j]=1; pol[j].fd=-pol[j].fd; } /* poll skips <0 */
+                    else pending++;
+                    pol[j].revents=0;
+                }
+                if(!pending) break;
+            }
+            for(int j=0;j<nf;j++) if(pol[j].fd<0) pol[j].fd=-pol[j].fd; /* restore */
+        }
+        int gotc=0;
+        for(int j=0;j<nf;j++){
+            int b=pmap[j]; if(b<0) continue;
+            if(!prdy[j]){ close(cfd[b]); cfd[b]=-1; continue; }
+            int so=0; socklen_t sl=sizeof so;
+            if(getsockopt(cfd[b],SOL_SOCKET,SO_ERROR,&so,&sl)!=0||so!=0){ close(cfd[b]); cfd[b]=-1; continue; }
+            int fl=fcntl(cfd[b],F_GETFL,0); if(fl>=0) fcntl(cfd[b],F_SETFL,fl&~O_NONBLOCK);
+            /* promote only peers that complete a Bitcoin handshake (probe
+             * itself is POLLOUT-only; non-Bitcoin hosts would otherwise
+             * flood live[] and stall workers in "(connecting)" retries) */
+            if(dlc_handshake(cfd[b])){ strncpy(live[nlive],pool[from+b],63); nlive++; gotc++; }
+            close(cfd[b]); cfd[b]=-1;
+            if(nlive>=want) break;
+        }
+        from+=BATCH; rounds++;
     }
     tsline("[dlc] %d confirmed-live peer(s) (%d probe round(s))\n", nlive, rounds);
     if(nlive<=0){ tsline("[dlc] no live peers; skipping catch-up\n"); return 0; }
