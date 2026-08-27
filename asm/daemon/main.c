@@ -4160,6 +4160,22 @@ int main(int argc, char** argv){
      * before the fork, so every child inherits the same region rather than
      * each falling back to the 2 MiB static. */
     mempool_configure();
+    /* Open the read-only UTXO snapshot the tx-validation path needs ONCE,
+     * here, PRE-FORK -- for exactly the reason the mempool above is done
+     * pre-fork. bitcoin_serve.asm used to do it lazily per CONNECTION, and
+     * utxo_lsm_reload costs 60-83 s on the real set: every inbound peer waited
+     * that long before we sent so much as a feefilter, so in practice we
+     * served nobody. Bitcoin Core opens its coins view once in LoadChainstate
+     * and shares it across peer threads; children here inherit this one
+     * copy-on-write, which also stops each peer mapping its own copy.
+     * Non-fatal: on failure the serve path drops inbound tx rather than
+     * accepting unvalidated ones, exactly as before. */
+    { extern int serve_txdv_preinit(void);
+      phase_timer_t txdv_pt; phase_start(&txdv_pt);
+      int ok = serve_txdv_preinit();
+      fprintf(stderr, "[boot] tx-validation snapshot %s (%.2fs) -- inbound peers inherit it\n",
+              ok ? "ready" : "UNAVAILABLE (inbound tx will be dropped, not accepted)",
+              phase_elapsed(&txdv_pt)); }
     /* Each chain keeps its own logs under <chain-datadir>/logs/ -- the asm
      * logger (node_log_open) writes there via the cwd, so a regtest run can
      * never interleave with the mainnet log. */

@@ -150,6 +150,30 @@ s_lastheight: dq 0 ; height just returned by idxscan_append_locked in .do_block,
 
 section .text
 
+; ============================================================================
+; serve_txdv_preinit() -> 1 if the tx-validation path is usable, else 0.
+;   Runs the read-only UTXO snapshot + mempool policy init ONCE, intended to
+;   be called by the parent BEFORE forking (see the note in node_serve_loop).
+;   Idempotent: a second call is a no-op, and the per-connection guard skips
+;   its own init once this has run.
+; ============================================================================
+global serve_txdv_preinit
+serve_txdv_preinit:
+    push rbp
+    mov  rbp, rsp                 ; rsp%16==0 here, so the calls below are aligned
+    cmp  byte [tx_dv_initdone], 1
+    je   .pre_done
+    call tx_dispatch_init
+    mov  byte [tx_dv_ok], al
+    call tx_policy_init
+    and  al, byte [tx_dv_ok]
+    mov  byte [tx_dv_ok], al
+    mov  byte [tx_dv_initdone], 1
+.pre_done:
+    movzx eax, byte [tx_dv_ok]
+    pop  rbp
+    ret
+
 global node_serve_loop
 node_serve_loop:
     push rbp
@@ -226,8 +250,20 @@ node_serve_loop:
 .mp_inited:
     mov  byte [mp_initdone], 1
 .mpready:
-    ; init this connection's read-only UTXO snapshot + mempool policy state
-    ; once per process (same lazy-init-guard shape as mpool_init above).
+    ; init this connection's read-only UTXO snapshot + mempool policy state.
+    ; NORMALLY ALREADY DONE: serve_txdv_preinit runs this once in the parent
+    ; BEFORE the fork (daemon/main.c), so every inbound child inherits the
+    ; snapshot copy-on-write instead of opening its own. This guard is the
+    ; fallback for callers that never pre-init (the test harnesses).
+    ;
+    ; Why pre-fork: utxo_lsm_reload takes 60-83 s on the real 165M-entry set,
+    ; and doing it HERE meant every inbound peer waited that long before we
+    ; sent even a feefilter -- real peers hang up first, so inbound serving
+    ; was effectively dead. Bitcoin Core opens its coins view once at startup
+    ; (InitCoinsDB in node/chainstate.cpp) and shares it across peer threads;
+    ; the shared mempool directly above already follows the same discipline
+    ; via mp_ext_inited. This just gives the UTXO snapshot the same treatment.
+    ; (2026-08-27)
     ; Non-fatal on failure -- .do_tx checks tx_dv_ready and falls back to
     ; dropping inbound tx (not accepting unvalidated ones) rather than
     ; taking the whole connection down.
