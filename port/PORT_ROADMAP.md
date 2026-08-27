@@ -212,7 +212,37 @@ and runs natively.
       0 fail everywhere. (2026-08-25)
 - [ ] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
       taproot_verify / strip_witness / tapagg / multisig / sigops ...
-- [ ] bitcoind.asm                        (daemon entry; links everything above)
+- [x] bitcoind.asm                        (daemon entry; links everything above)
+      -> port/arm64/bitcoind.S (14 exports: node_make_version / node_handshake /
+      node_accept_handshake / node_sync / node_sync_multi / node_serve_block /
+      node_serve_block_by_hash / node_drain / node_fetch_headers / node_ibd_headers /
+      node_ibd_blocks / node_ibd_blocks_x / node_ibd_blocks_s / node_ibd, plus
+      sync_fail_code / g_peer_version_payload / g_peer_version_len). DAEMONOBJS/parity:
+      the NATIVE AArch64 `daemon/bitcoind` now LINKS (98 objects, no project-undefined
+      symbols) and `./bitcoind sync <dir>` runs its full startup/self-check cleanly:
+      `sync: ok=1 blocks=8 height=7` EXIT=0. node_ibd independently proven via
+      tests/test_ibd_full.c rebuilt natively (1200-block single-connection IBD):
+      ALL TESTS PASSED. (2026-08-26)
+- [x] bitcoin_serve.asm                    (P2P server half: node_serve_loop +
+      node_announce_tip) -> port/arm64/bitcoin_serve.S (loops: ping/getaddr/getdata/
+      getheaders/getblocks/getblocktxn/inv/tx/block/sendcmpct/sendheaders/feefilter;
+      compact blocks; tip-watch announce). Part of the native daemon link.
+- [ ] bitcoin_scriptverify_drv.asm  (sv_verify_script_asm; legacy/P2SH driver, TLS
+      arenas via .tbss) -> port/arm64/bitcoin_scriptverify_drv.S. COMPILES CLEAN +
+      exports exact x86 globals (svs_main_e/copy_e/redeem), but its differential
+      driver (test_svs_drv_diff) does NOT fully pass yet: on the scriptPubKey
+      re-run the asm hands sv_verify_script a corrupted script pointer — a
+      suspected real port bug, OPEN (do not mark done until it passes).
+- [ ] bitcoin_witness_v0_drv.asm   (sv_verify_witness_v0_asm; .tbss arenas/implied
+      P2WPKH) -> port/arm64/bitcoin_witness_v0_drv.S. COMPILES CLEAN + exports
+      globals (wv0_main_e/wv0_p2wpkh); frame-overflow + callee-saved-count bugs
+      fixed, but the differential harness still shows an x26-ABI anomaly — OPEN
+      (do not mark done until it passes).
+- [x] (link-gap fill) bitcoin_store_ext.S (store_get_tip_hash / store_validates_
+      prevhash / store_layout_monotonic / store_truncate_to / store_truncate_index_only)
+      + bitcoin_sighash_all_ext.S (sighash_all) -- the DAEMONOBJS C (main.c/reorg.c/
+      archive_verify.c/wallet_core.c) referenced these but the already-ported .S did
+      not export them; supplied as new additive files so the daemon links.
 - [x] bitcoin_utxo_lsm (LSM-tree persistent UTXO store: per-run 3-seed FNV Bloom
       filter + sparse index + crash-safe manifest (MAGIC_MANIFEST2 + total_live)
       + open-addressing tomb hash + k-way merge compact + WAL-tail reload, layered
