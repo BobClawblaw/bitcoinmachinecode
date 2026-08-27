@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <signal.h>
 #include <poll.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -66,6 +67,11 @@ extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                             uint64_t flags, unsigned long nIn,
                             const unsigned char* tx, unsigned long txlen,
                             unsigned char* work, unsigned long workcap);
+/* per-block consensus flags (Core GetBlockScriptFlags): P2SH|WITNESS|TAPROOT
+ * base + height-gated DERSIG/CLTV/CSV/NULLDUMMY. Block validation must NOT use
+ * standardness flags (e.g. SIGPushOnly) -- a flat SV_SIGPUSHONLY falsely rejected
+ * the non-push-only scriptSig spends at h163684/h164675 (ERR_SIG_PUSHONLY=26). */
+extern uint64_t script_flags_for_block(uint64_t height, const uint8_t hash32[32]);
 #define SV_P2SH        (1ULL<<0)
 #define SV_SIGPUSHONLY (1ULL<<5)
 
@@ -333,6 +339,7 @@ static void win_reset(struct win* w, long w0, long n){
 #define NODE_VERSION_PATCH 0
 
 int main(int argc, char** argv){
+    signal(SIGPIPE, SIG_IGN);   /* a peer closing mid-write must not kill us */
     if(argc<3){ fprintf(stderr,"usage: %s <peer-list> <count> [datadir] [slots_log2] [flush_every] [clients] [start]\n",argv[0]); return 2; }
     G_maxblk=atol(argv[2]);
     const char* dd= argc>3?argv[3]:"data";
@@ -361,7 +368,7 @@ int main(int argc, char** argv){
       while(*p){ char* e=strchr(p,'\n'); if(!e)break; *e=0; if(*p) TLINE(7,p); p=e+1; }
     }
     TLINE(7,"node start (ibd_par multi-client LSM download worker)");
-    uint64_t flags = SV_SIGPUSHONLY;
+    uint64_t flags = 0;   /* per-block consensus flags set inside the apply loop */
 
     /* ---- verified header chain ---- */
     FILE*hf=fopen("headers.dat","rb");
@@ -537,9 +544,10 @@ int main(int argc, char** argv){
                 unsigned char* blk=w->blk[kk];
                 if(!blk){ fprintf(stderr,"h%ld not collected\n",h); goto done; }
                 int blklen=(int)w->len[kk];
+                unsigned char bh32[32]; block_hash(bh32, blk);
+                uint64_t bflags = script_flags_for_block((uint64_t)h, bh32);
                 if(cons_verify(blk, blklen, scr, 1<<22)!=1){ fprintf(stderr,"h%ld BAD cons_verify\n",h); bad_gate++; free(blk); continue; }
-                { unsigned char bh[32]; block_hash(bh, blk);
-                  if(store_append(store_buf,bh,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
+                { if(store_append(store_buf,bh32,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
                 unsigned char* txc=blk+80;
                 unsigned long long nt; int vv=rd_varint(txc,(unsigned long)(blklen-80),&nt);
                 if(vv<0){ fprintf(stderr,"h%ld bad txcount\n",h); bad_gate++; free(blk); continue; }
@@ -570,7 +578,7 @@ int main(int argc, char** argv){
                                 missing++; bad_sig++; continue;
                             }
                             if(gr<0){ fprintf(stderr,"h%ld tx%lu LSM GET ERR\n",h,ti); bad=1; break; }
-                            int rr=sv_verify_script(sigb,ssl,psp,pspl,flags,v,txo,tl,work,8u<<20);
+                            int rr=sv_verify_script(sigb,ssl,psp,pspl,bflags,v,txo,tl,work,8u<<20);
                             if(rr!=0){ LLOG(6, "h%ld tx%lu in%lu SIGFAIL err=%d\n",h,ti,v,rr); bad_sig++; }
                             else { nsig++; }
                             long dr=utxo_lsm_del(g_lst,g_utxo,ph,pidx);

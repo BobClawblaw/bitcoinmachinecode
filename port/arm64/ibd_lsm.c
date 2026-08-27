@@ -77,6 +77,10 @@ extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                             unsigned char* work, unsigned long workcap);
 #define SV_P2SH        (1ULL<<0)
 #define SV_SIGPUSHONLY (1ULL<<5)
+/* per-block consensus flags (Core GetBlockScriptFlags); block validation must
+ * NOT use standardness flags like SIGPushOnly (falsely rejects the non-push-only
+ * scriptSig spends at h163684/h164675). */
+extern uint64_t script_flags_for_block(uint64_t height, const uint8_t hash32[32]);
 
 extern long node_log_open(const char* path);
 extern void node_log_str(long fd, int kind, const char* s, long len);
@@ -442,9 +446,10 @@ int main(int argc, char** argv){
             unsigned char* blk=gblk[k];
             if(!blk){ fprintf(stderr,"h%ld not collected\n",h); goto done; }
             int blklen=(int)glen[k];
+            unsigned char bh32[32]; block_hash(bh32, blk);
+            uint64_t bflags = script_flags_for_block((uint64_t)h, bh32);
             if(cons_verify(blk, blklen, scr, 1<<22)!=1){ fprintf(stderr,"h%ld BAD cons_verify\n",h); bad_gate++; free(blk); continue; }
-            { unsigned char bh[32]; block_hash(bh, blk);
-              if(store_append(store_buf,bh,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
+            { if(store_append(store_buf,bh32,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
             unsigned char* txc=blk+80;
             unsigned long long nt; int vv=rd_varint(txc,(unsigned long)(blklen-80),&nt);
             if(vv<0){ fprintf(stderr,"h%ld bad txcount\n",h); bad_gate++; free(blk); continue; }
@@ -475,7 +480,7 @@ int main(int argc, char** argv){
                             missing++; bad_sig++; continue;
                         }
                         if(gr<0){ fprintf(stderr,"h%ld tx%lu LSM GET ERR\n",h,ti); bad=1; break; }
-                        int rr=sv_verify_script(sigb,ssl,psp,pspl,flags,v,txo,tl,work,8u<<20);
+                        int rr=sv_verify_script(sigb,ssl,psp,pspl,bflags,v,txo,tl,work,8u<<20);
                         if(rr!=0){ LLOG(6, "h%ld tx%lu in%lu SIGFAIL err=%d\n",h,ti,v,rr); bad_sig++; }
                         else { nsig++; }
                         long dr=utxo_lsm_del(g_lst,g_utxo,ph,pidx);

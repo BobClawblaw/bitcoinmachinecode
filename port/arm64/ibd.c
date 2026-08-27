@@ -63,6 +63,10 @@ extern int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
                             unsigned char* work, unsigned long workcap);
 #define SV_P2SH        (1ULL<<0)
 #define SV_SIGPUSHONLY (1ULL<<5)
+/* per-block consensus flags (Core GetBlockScriptFlags); block validation must
+ * NOT use standardness flags like SIGPushOnly (falsely rejects non-push-only
+ * scriptSig spends, e.g. h163684/h164675). */
+extern uint64_t script_flags_for_block(uint64_t height, const uint8_t hash32[32]);
 
 /* all-asm leveled logger (node_log.S); kinds: 0 INFO 1 HSHK 2 HDRS 3 BLOCK
  * 4 CONS 5 STORE 6 ERROR 7 SERVE. Official log = <datadir>/logs/bitcoind.production.log */
@@ -331,7 +335,7 @@ int main(int argc, char** argv){
     mkdir("logs",0755);
     g_log = node_log_open("logs/bitcoind.production.log");
     TLINE(7, "node start (ibd download worker)");
-    uint64_t flags = SV_SIGPUSHONLY | ((argc>5&&atoi(argv[5]))?SV_P2SH:0);
+    uint64_t flags = 0;   /* per-block consensus flags computed in the apply loop */
 
     /* ---- load verified header chain ---- */
     FILE*hf=fopen("headers.dat","rb");
@@ -422,10 +426,11 @@ int main(int argc, char** argv){
             if(!blk){ fprintf(stderr,"h%ld not collected\n",h); goto done; }
             int blklen=(int)glen[k];
             /* block gate */
+            unsigned char bh32[32]; block_hash(bh32, blk);
+            uint64_t bflags = script_flags_for_block((uint64_t)h, bh32);
             if(cons_verify(blk, blklen, scr, 1<<22)!=1){ fprintf(stderr,"h%ld BAD cons_verify\n",h); bad_gate++; free(blk); continue; }
             /* persist the verified block to the on-disk archive (blk%05u.dat + index.dat) */
-            { unsigned char bh[32]; block_hash(bh, blk);
-              if(store_append(BS,bh,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
+            { if(store_append(BS,bh32,blk,(unsigned long long)blklen)<0){ fprintf(stderr,"h%ld STORE_APPEND FAIL\n",h); bad_gate++; free(blk); continue; } }
             /* walk txs */
             unsigned char* txc=blk+80;
             unsigned long long nt; int vv=rd_varint(txc,(unsigned long)(blklen-80),&nt);
@@ -457,7 +462,7 @@ int main(int argc, char** argv){
                             fprintf(stderr,"\n"); if(g_log) node_log_str(g_log,6,"\n",1);
                             bad_sig++; continue;
                         }
-                        int rr=sv_verify_script(sigb,ssl,psp,pspl,flags,v,txo,tl,work,8u<<20);
+                        int rr=sv_verify_script(sigb,ssl,psp,pspl,bflags,v,txo,tl,work,8u<<20);
                         if(rr!=0){ LLOG(6, "h%ld tx%lu in%lu SIGFAIL err=%d\n",h,ti,v,rr); bad_sig++;
                             static int dumped=0;
                             if(!dumped){ dumped=1;
