@@ -157,12 +157,10 @@ node_log_str:
 	stp  x21,x22,[sp,#-16]!
 	sub  sp, sp, #160	/* line buffer */
 	mov  x19, x0		/* fd */
-	mov  x20, x1		/* kind */
+	mov  x20, x1		/* kind (unused: production line is timestamp-first like x86 log_ts.h) */
 	mov  x21, x2		/* s */
 	mov  x22, x3		/* len */
 	mov  x0, sp
-	mov  w1, w20
-	bl   put_kind
 	mov  x1, x21
 	mov  x2, x22
 	cbnz x2, .ap
