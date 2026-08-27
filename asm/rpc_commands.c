@@ -1669,7 +1669,8 @@ static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     rj_obj_set(o, "txcount", rj_numf("%d", n));
     rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
     rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
-    rj_obj_set(o, "avoid_reuse", rj_bool(0));
+    { extern int rpc_wops_avoid_reuse(void);
+      rj_obj_set(o, "avoid_reuse", rj_bool(rpc_wops_avoid_reuse() ? 1 : 0)); }
     rj_obj_set(o, "scanning", rj_bool(0));
     { extern int rpc_wops_watchonly(void);
       rj_obj_set(o, "descriptors", rj_bool(rpc_wops_watchonly() ? 1 : 0)); }
