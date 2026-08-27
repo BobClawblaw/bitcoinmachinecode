@@ -18,6 +18,8 @@
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
                         * which silently corrupted their return values */
 #include <pthread.h>
+#include <unistd.h>  /* getcwd -- implicitly declared until 2026-08-27, which on
+                      * this ABI means int, truncating the returned pointer */
 #include <time.h>
 
 static const node_status_t* g_status;
@@ -1388,14 +1390,20 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
  * at the policy commit boundary. The verdict therefore comes from the real
  * mempool, not from a parallel copy of its rules.
  *
- * DOCUMENTED DIVERGENCE -- package policy. Core validates the array as a
- * PACKAGE: a child may spend a parent that appears earlier in the same call.
- * This node evaluates each transaction independently against the mempool as
- * it stands, because the dry run deliberately inserts nothing, so an earlier
- * transaction in the array is invisible to a later one. When more than one
- * transaction is passed, every entry therefore carries Core's own
- * `package-error` field saying so. A child spending an in-array parent will
- * report `missing-inputs`, which is the truth about what this node checked.
+ * An array of more than one transaction is validated as a PACKAGE, the way
+ * Core validates it: a child may spend a parent that appears earlier in the
+ * same call, and the members are weighed against the fee floors together.
+ * That runs through the SAME staged package path submitpackage uses, stopped
+ * after its dry run -- a separate "test" implementation would be a second
+ * copy of the rules, free to drift from the one that decides real
+ * admissions, which is the one thing this call must never do.
+ *
+ * Until 2026-08-27 each member was checked independently against the mempool
+ * as it stood, so a child spending an in-array parent came back
+ * missing-inputs and every entry carried a package-error saying the node did
+ * not implement package policy. `package-error` now means what it means in
+ * Core: a genuine package-level rejection (bad ordering, an internal
+ * conflict, too many transactions).
  */
 #define TMA_MAX 25
 
@@ -1522,6 +1530,8 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     static char r_reason[RPC_PKG_MAX][64];
     char pmsg[128]; pmsg[0] = 0;
     unsigned long long eff_fee = 0, eff_vsize = 0;
+    static unsigned char replaced[RPC_PKG_REPLACED_MAX][32];
+    int n_replaced = 0;
     if (got){
         for (int i = 0; i < n; i++){
             r_result[i] = st->pkg_result[i];
@@ -1531,6 +1541,9 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         }
         snprintf(pmsg, sizeof pmsg, "%s", (const char*)st->tx_submit_reason);
         eff_fee = st->pkg_eff_fee; eff_vsize = st->pkg_eff_vsize;
+        n_replaced = st->pkg_replaced_n;
+        if (n_replaced > RPC_PKG_REPLACED_MAX) n_replaced = RPC_PKG_REPLACED_MAX;
+        if (n_replaced > 0) memcpy(replaced, (const void*)st->pkg_replaced, (size_t)n_replaced * 32);
     }
     st->tx_submit_pkg_n = 0;          /* leave the channel as a single-tx one */
     pthread_mutex_unlock(&g_submit_lock);
@@ -1576,6 +1589,17 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         rj_obj_set(results, whex, e);
     }
     rj_obj_set(o, "tx-results", results);
+    /* Top level, not per member: a package's replacements are reported once,
+     * as the union across its members. Always present, empty array included
+     * -- Core pushes it unconditionally on this path, and a caller that
+     * checks "did this replace anything" should not have to distinguish
+     * "replaced nothing" from "field missing". */
+    { rj_val* rep = rj_arr();
+      for (int k = 0; k < n_replaced; k++){
+          char rhex[65]; mpe_hex(rhex, replaced[k]);
+          rj_arr_push(rep, rj_str(rhex));
+      }
+      rj_obj_set(o, "replaced-transactions", rep); }
     *res = o;
     return 1;
 }
@@ -1610,6 +1634,119 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     static const char* HEXD = "0123456789abcdef";
     node_status_t* s = g_status_rw;
     rj_val* arr = rj_arr();
+
+    /* ---- package mode: more than one transaction ------------------------
+     * Staged as one unit and dry-run by txsub_package, so in-array parents
+     * are visible to their children and the fee floors see the aggregate. */
+    if (list->nitems > 1){
+        int n = (int)list->nitems;
+        static unsigned char raw[RPC_TXSUBMIT_MAX];
+        unsigned long off[TMA_MAX]; unsigned long total = 0;
+        for (int i = 0; i < n; i++){
+            if (total + lens[i] > sizeof raw){
+                *ec = -22; *em = "TX decode failed"; return 0; }
+            memcpy(raw + total, stage[i], lens[i]);
+            off[i] = total; total += lens[i];
+        }
+        pthread_mutex_lock(&g_submit_lock);
+        memcpy((void*)s->tx_submit_buf, raw, total);
+        s->tx_submit_len   = total;
+        s->tx_submit_test  = 1;          /* dry run: pass 1 only, commits nothing */
+        s->tx_submit_pkg_n = n;
+        s->tx_submit_reason[0] = 0;
+        s->pkg_msg[0] = 0;
+        unsigned long long myseq = s->tx_submit_seq + 1;
+        __sync_synchronize();
+        s->tx_submit_seq = myseq;
+        int waited = 0, got = 0;
+        while (waited < SRT_WAIT_MS*1000){
+            if (s->tx_submit_ack == myseq){ got = 1; break; }
+            struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+            waited += SRT_POLL_US;
+        }
+        static int r_result[TMA_MAX];
+        static unsigned long long r_fee[TMA_MAX], r_vsize[TMA_MAX];
+        static char r_reason[TMA_MAX][64];
+        char pmsg[128]; pmsg[0] = 0;
+        unsigned long long eff_fee = 0, eff_vsize = 0;
+        if (got){
+            for (int i = 0; i < n; i++){
+                r_result[i] = s->pkg_result[i];
+                r_fee[i]    = s->pkg_fee[i];
+                r_vsize[i]  = s->pkg_vsize[i];
+                snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)s->pkg_reason[i]);
+            }
+            snprintf(pmsg, sizeof pmsg, "%s", (const char*)s->tx_submit_reason);
+            eff_fee = s->pkg_eff_fee; eff_vsize = s->pkg_eff_vsize;
+        }
+        s->tx_submit_pkg_n = 0;
+        s->tx_submit_test  = 0;
+        pthread_mutex_unlock(&g_submit_lock);
+        if (!got){
+            *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
+
+        /* a package-level rejection is reported on EVERY entry, because none
+         * of them got an individual verdict -- that is what Core's
+         * package-error means */
+        /* "transaction failed" is the one package_msg that means "the
+         * members were each judged, look at their own verdicts". Everything
+         * else -- ill-formed package, TRUC violation -- is a statement about
+         * the package as a whole, and Core gives no member an `allowed`. */
+        int pkg_failed = (pmsg[0] && strcmp(pmsg, "success") != 0);
+        int pkg_level  = pkg_failed && strcmp(pmsg, "transaction failed") != 0;
+        for (int i = 0; i < n; i++){
+            rj_val* e = rj_obj();
+            unsigned char id[32], wid[32];
+            static unsigned char sc[2000*81+8];
+            char hx[65];
+            if (tx_txid(id, raw + off[i], lens[i], sc, sizeof sc) == 1){
+                for (int k=0;k<32;k++){ unsigned char b=id[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+                hx[64]=0; rj_obj_set(e, "txid", rj_str(hx));
+                int segwit = lens[i] > 6 && raw[off[i]+4] == 0x00 && raw[off[i]+5] == 0x01;
+                if (segwit && g_mph.sha256d) g_mph.sha256d(wid, raw + off[i], lens[i]);
+                else memcpy(wid, id, 32);
+                for (int k=0;k<32;k++){ unsigned char b=wid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
+                hx[64]=0; rj_obj_set(e, "wtxid", rj_str(hx));
+            }
+            if (pkg_level){
+                /* no member was individually validated: `allowed` is OMITTED,
+                 * which is exactly how Core marks that */
+                rj_obj_set(e, "package-error", rj_str(pmsg));
+            } else if (r_result[i]){
+                rj_obj_set(e, "allowed", rj_bool(1));
+                rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
+                rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
+                rj_val* f = rj_obj();
+                rj_obj_set(f, "base", mpe_amount(r_fee[i]));
+                if (eff_vsize){
+                    /* the feerate the package was ACTUALLY weighed against,
+                     * and the members whose fee and vsize went into it */
+                    rj_obj_set(f, "effective-feerate", mpe_amount(eff_fee * 1000ULL / eff_vsize));
+                    rj_val* inc = rj_arr();
+                    for (int k = 0; k < n; k++){
+                        if (!r_result[k]) continue;
+                        unsigned char ik[32], wk[32]; char wkhex[65];
+                        if (tx_txid(ik, raw + off[k], lens[k], sc, sizeof sc) != 1) continue;
+                        int sw = lens[k] > 6 && raw[off[k]+4] == 0x00 && raw[off[k]+5] == 0x01;
+                        if (sw && g_mph.sha256d) g_mph.sha256d(wk, raw + off[k], lens[k]);
+                        else memcpy(wk, ik, 32);
+                        mpe_hex(wkhex, wk);
+                        rj_arr_push(inc, rj_str(wkhex));
+                    }
+                    rj_obj_set(f, "effective-includes", inc);
+                }
+                rj_obj_set(e, "fees", f);
+            } else {
+                rj_obj_set(e, "allowed", rj_bool(0));
+                rj_obj_set(e, "reject-reason",
+                           rj_str(r_reason[i][0] ? r_reason[i] : "transaction rejected"));
+            }
+            rj_arr_push(arr, e);
+        }
+        *res = arr;
+        return 1;
+    }
+
     pthread_mutex_lock(&g_submit_lock);
     for (size_t i = 0; i < list->nitems; i++){
         rj_val* e = rj_obj();
@@ -1628,12 +1765,6 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             for (int k=0;k<32;k++){ unsigned char b=wid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
             hx[64]=0; rj_obj_set(e, "wtxid", rj_str(hx));
         }
-        if (list->nitems > 1)
-            rj_obj_set(e, "package-error",
-                       rj_str("this node validates each transaction independently "
-                              "against the current mempool; it does not implement "
-                              "package policy, so a child spending a parent that "
-                              "appears earlier in this array will report missing-inputs"));
         int result = 0; char reason[128] = {0}; unsigned long long fee = 0;
         if (!have_id){
             rj_obj_set(e, "allowed", rj_bool(0));

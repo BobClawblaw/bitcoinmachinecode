@@ -83,6 +83,19 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                    * Core allows up to limitancestorcount(25)-1
                                    * distinct direct parents; 24 covers it. */
 #define MPOL_MAX_REPLACEMENTS 100 /* Core MAX_REPLACEMENT_CANDIDATES */
+
+/* ---- BIP431 TRUC (topologically restricted until confirmation) ------------
+ * A version=3 transaction buys predictable RBF by accepting a much tighter
+ * shape: at most one unconfirmed ancestor and one unconfirmed descendant, a
+ * small size cap, and no mixing with non-TRUC unconfirmed relatives. The
+ * point is that a TRUC parent's fee can always be raised by its single
+ * child, and neither can be pinned by a stranger attaching megabytes of
+ * low-feerate descendants. Core's numbers, not ours. */
+#define TRUC_VERSION           3
+#define TRUC_MAX_VSIZE         10000
+#define TRUC_CHILD_MAX_VSIZE   1000
+#define TRUC_ANCESTOR_LIMIT    2
+#define TRUC_DESCENDANT_LIMIT  2
 #define MPOL_PKG_MAX     128      /* descendant-set walk bound: desc_cnt is
                                    * capped at max_desc (25) by admission, so
                                    * 128 is comfortable headroom */
@@ -99,6 +112,40 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
  * single-transaction traffic, so mpol_package_fee_context(0,0) is the reset
  * and the package path calls it on every exit. */
 static uint64_t g_pkg_fee = 0, g_pkg_vsize = 0;
+
+/* ---- package MEMBERSHIP context -----------------------------------------
+ * The fee context above says what the package pays; this says who is in it.
+ * TRUC needs the second, because in a package a member's parent is not in
+ * the mempool yet -- it is another member. Without this the topology rules
+ * simply do not fire during package validation: find_node() misses, the
+ * transaction looks parentless, and a v2 child of a v3 parent sails through
+ * the very check meant to stop it (caught by the regtest differential
+ * against Core, not by any test of ours). Set and cleared by the caller
+ * around both validation passes, exactly like the fee context. */
+#define MPOL_PKG_CTX_MAX 25
+static const unsigned char* g_pkg_tx[MPOL_PKG_CTX_MAX];
+static unsigned long        g_pkg_len[MPOL_PKG_CTX_MAX];
+static unsigned char        g_pkg_txid[MPOL_PKG_CTX_MAX][32];
+static int                  g_pkg_n = 0;
+
+void mpol_package_context(const unsigned char* const* txs, const unsigned long* lens,
+                          const unsigned char* txids, int n){
+    if (!txs || n <= 0){ g_pkg_n = 0; return; }
+    if (n > MPOL_PKG_CTX_MAX) n = MPOL_PKG_CTX_MAX;
+    for (int i = 0; i < n; i++){
+        g_pkg_tx[i] = txs[i]; g_pkg_len[i] = lens[i];
+        memcpy(g_pkg_txid[i], txids + i*32, 32);
+    }
+    g_pkg_n = n;
+}
+
+/* index of the package member with this txid, or -1 */
+static int mpol_pkg_find(const unsigned char txid[32]){
+    for (int i = 0; i < g_pkg_n; i++)
+        if (!memcmp(g_pkg_txid[i], txid, 32)) return i;
+    return -1;
+}
+
 void mpol_package_fee_context(unsigned long long fee, unsigned long long vsize){
     g_pkg_fee = (uint64_t)fee; g_pkg_vsize = (uint64_t)vsize;
 }
@@ -143,6 +190,11 @@ typedef struct {
                                   policy-parity merge)                       */
     uint32_t n_parents;
     uint32_t parent[MPOL_MAX_PARENTS];
+    uint32_t version;          /* nVersion. BIP431 TRUC rules turn on a
+                                  PARENT's version, so it must outlive the
+                                  parent's own acceptance -- there is nowhere
+                                  else to read it from at child time without
+                                  re-parsing the parent out of the pool. */
 } mpol_node;
 
 #define MPOL_MAGIC 0x504F4C59u
@@ -369,9 +421,40 @@ static uint64_t dust_threshold(unsigned long spk_len, int spk_type, uint64_t rat
 }
 
 /* Returns NULL if standard, else Core's reason string. */
+/* Core MAX_DUST_OUTPUTS_PER_TX. One dust output is permitted at the
+ * standardness stage so that EPHEMERAL dust -- dust created and swept inside
+ * the same package -- is expressible at all; the two rules that keep it safe
+ * (0-fee, and the child must sweep it) live in mpol_add_core, where the fee
+ * and the parent are known. */
+#define MPOL_MAX_DUST_OUTPUTS 1
+
+/* dust output indices of a transaction, Core GetDust. NULL_DATA outputs are
+ * unspendable and so never dust. */
+static int mpol_dust_outputs(const mpol_cfg* pol, const unsigned char* tx,
+                             unsigned long txlen, const mpol_txmeta* m,
+                             uint32_t* out, int cap){
+    const unsigned char* p = m->out_start; const unsigned char* end = tx + txlen;
+    int ok, n = 0;
+    for (unsigned long i = 0; i < m->n_out; i++){
+        if (p + 8 > end) break;
+        uint64_t v = 0; for (int k=0;k<8;k++) v |= ((uint64_t)p[k])<<(8*k);
+        p += 8;
+        uint64_t sl = rd_varint(&p, end, &ok); if (!ok || p + sl > end) break;
+        int t = classify_spk(p, (unsigned long)sl);
+        if (t != SPK_NULLDATA &&
+            v < dust_threshold((unsigned long)sl, t, pol->dust_relay_kvb)){
+            if (n < cap) out[n] = (uint32_t)i;
+            n++;
+        }
+        p += sl;
+    }
+    return n;
+}
+
 static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
                                    unsigned long txlen, const mpol_txmeta* m,
-                                   const unsigned char prev0[32], uint32_t idx0){
+                                   const unsigned char prev0[32], uint32_t idx0,
+                                   int* n_dust_out){
     /* a coinbase is never valid as a pool tx (Core: "coinbase") */
     { int nullprev = 1; for (int i=0;i<32;i++) if (prev0[i]) { nullprev = 0; break; }
       if (nullprev && idx0 == 0xffffffffu) return "coinbase"; }
@@ -400,18 +483,17 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
           if (t == SPK_NULLDATA){
               datacarrier_used += sl;
               if (datacarrier_used > pol->datacarrier_bytes) return "datacarrier";
-          } else if (t != SPK_ANCHOR){
-              /* dust: unspendable outputs (NULL_DATA) skip; P2A is exempt in
-               * Core only as an EPHEMERAL dust carrier (out of scope) --
-               * treat it like any spendable output for the threshold. */
-              if (v < dust_threshold((unsigned long)sl, t, pol->dust_relay_kvb))
-                  return "dust";
-          } else {
-              if (v < dust_threshold((unsigned long)sl, t, pol->dust_relay_kvb))
-                  return "dust";
           }
           p += sl;
       } }
+    /* Dust is counted, not rejected on sight, and the count is checked AFTER
+     * the output loop -- both are Core's placement. Rejecting the first dust
+     * output inline also reported "dust" for a transaction whose real problem
+     * was a later nonstandard output. */
+    { uint32_t didx[8];
+      int nd = mpol_dust_outputs(pol, tx, txlen, m, didx, 8);
+      if (n_dust_out) *n_dust_out = nd;
+      if (nd > MPOL_MAX_DUST_OUTPUTS) return "dust"; }
     /* PreChecks' own size floor runs AFTER IsStandardTx in Core, so a tiny
      * tx with a nonstandard output still reports "scriptpubkey". */
     if (m->nonwit_len < 65) return "tx-size-small";          /* MIN_STANDARD_TX_NONWITNESS_SIZE */
@@ -651,6 +733,21 @@ static int worst_package(void* st){
 /* ========================================================================== */
 /* ADD: atomic policy gate + structural store + bookkeeping                   */
 /* ========================================================================== */
+/* The txids this add REPLACED, for submitpackage's replaced-transactions.
+ * The eviction set is built inside the RBF check and was then used and
+ * discarded, so an accepted replacement could not say what it displaced --
+ * Core reports exactly this list, so the information has to survive the
+ * call. Reset at the top of every add: a stale list would credit one
+ * transaction with a previous transaction's replacements. */
+static unsigned char _mpol_replaced[MPOL_MAX_REPLACEMENTS + MPOL_PKG_MAX][32];
+static int _mpol_replaced_n;
+
+int mpol_last_replaced(unsigned char* out, int cap){
+    int n = _mpol_replaced_n < cap ? _mpol_replaced_n : cap;
+    if (out && n > 0) memcpy(out, _mpol_replaced, (size_t)n * 32);
+    return n;
+}
+
 static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                           const unsigned char* tx, unsigned long txlen,
                           const unsigned char txid[32], void* utxo,
@@ -658,12 +755,14 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     static unsigned char prev[MPOL_MAX_IN][32];
     static uint32_t idx[MPOL_MAX_IN], seq[MPOL_MAX_IN];
     mpol_txmeta meta;
+    _mpol_replaced_n = 0;
     int n_in = parse_tx(tx, txlen, prev, idx, seq, &meta);
     if (n_in <= 0){ _mpol_last_reason = "malformed transaction"; return 0; }
     uint64_t vsize = meta.vsize;
 
     /* --- standardness (Core IsStandardTx order: before fees) --------------- */
-    { const char* r = standard_checks(pol, tx, txlen, &meta, prev[0], idx[0]);
+    int n_dust = 0;
+    { const char* r = standard_checks(pol, tx, txlen, &meta, prev[0], idx[0], &n_dust);
       if (r){ _mpol_last_reason = r; return 0; } }
 
     /* --- duplicate check (before fee resolution: Core's order) ------------- */
@@ -685,6 +784,52 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     if (sum_in < meta.sum_out){ _mpol_last_reason = "bad-txns-in-belowout"; return 0; }
     uint64_t fee = sum_in - meta.sum_out;
     if (fee_out) *fee_out = (unsigned long long)fee;
+
+    /* ---- ephemeral dust (Core PreCheckEphemeralTx / CheckEphemeralSpends) --
+     * Dust is normally refused because it costs more to spend than it is
+     * worth, and left in the UTXO set forever. Core carves out one case: dust
+     * that is created and swept inside the same package never reaches the
+     * UTXO set, and that is how an anchor output for fee-bumping is possible
+     * at all. Two rules keep the carve-out safe, and they only work together:
+     *
+     *   1. a transaction carrying dust must pay ZERO fee, so a miner has no
+     *      incentive to mine it ALONE and strand the dust; and
+     *   2. a child must sweep every dust output of its unconfirmed parents,
+     *      so the only way the parent gets mined is together with the child
+     *      that cleans up after it.
+     *
+     * Drop rule 1 and dust becomes profitable to strand; drop rule 2 and the
+     * dust survives in the UTXO set exactly as before. */
+    if (!pol->accept_nonstd){
+        if (n_dust > 0 && fee != 0){
+            /* Core's reject reason is the bare "dust"; the explanation ("tx
+             * with dust output must be 0-fee") is its debug string. */
+            _mpol_last_reason = "dust"; return 0;
+        }
+        /* rule 2: every dust output of every UNCONFIRMED parent must be spent
+         * by this transaction. A confirmed parent's dust is already in the
+         * UTXO set and is not this transaction's problem. */
+        for (int i = 0; i < n_in; i++){
+            int dup = 0;
+            for (int k = 0; k < i; k++) if (!memcmp(prev[k], prev[i], 32)){ dup = 1; break; }
+            if (dup) continue;                      /* parent already handled */
+            unsigned long plen = 0;
+            const unsigned char* ptx = mpool_get(mp, prev[i], &plen);
+            if (!ptx || !plen) continue;            /* not an unconfirmed parent */
+            mpol_txmeta pm;
+            static unsigned char pprev[MPOL_MAX_IN][32];
+            static uint32_t pidx[MPOL_MAX_IN], pseq[MPOL_MAX_IN];
+            if (parse_tx(ptx, plen, pprev, pidx, pseq, &pm) <= 0) continue;
+            uint32_t didx[8];
+            int nd = mpol_dust_outputs(pol, ptx, plen, &pm, didx, 8);
+            for (int d = 0; d < nd && d < 8; d++){
+                int swept = 0;
+                for (int k = 0; k < n_in && !swept; k++)
+                    if (!memcmp(prev[k], prev[i], 32) && idx[k] == didx[d]) swept = 1;
+                if (!swept){ _mpol_last_reason = "missing-ephemeral-spends"; return 0; }
+            }
+        }
+    }
 
     /* ---- fee floors, over the PACKAGE aggregate when one is in effect ----
      * Core evaluates a package member against the package's EFFECTIVE
@@ -834,6 +979,112 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             _mpol_last_reason = "too-long-mempool-chain"; return 0; }
     }
 
+    /* --- BIP431 TRUC topology (Core SingleTRUCChecks) ----------------------
+     * Runs for EVERY transaction, not only v3 ones: half of these rules are
+     * about what a non-TRUC transaction may not spend. Skipped wholesale
+     * under -acceptnonstdtxn, like the rest of policy.
+     *
+     * Core reports every one of these as the single reject reason
+     * "TRUC-violation" and carries the specific rule in a debug string, so
+     * that is the reason surfaced here too -- a caller diffing reject-reason
+     * against Core must see the same token.
+     *
+     * KNOWN DELTA, stated rather than hidden: Core measures these against
+     * the SIGOP-ADJUSTED vsize, and this layer only has the BIP141 vsize at
+     * add time (sigop cost is recorded after the fact). The two differ only
+     * for sigop-dense transactions, where Core's figure is the larger, so
+     * this is marginally more permissive there -- never less. */
+    if (!pol->accept_nonstd){
+        const int is_truc = (meta.version == TRUC_VERSION);
+
+        /* A parent may be in the MEMPOOL or, during package validation, be
+         * another member of the same package -- Core counts both, and only
+         * counting mempool parents makes every one of these rules a no-op
+         * inside a package. */
+        int pkg_par[MPOL_MAX_IN]; int n_pkg_par = 0;
+        for (int i=0;i<n_in && g_pkg_n;i++){
+            if (find_node(st, prev[i]) >= 0) continue;      /* counted as a mempool parent */
+            int m = mpol_pkg_find(prev[i]);
+            if (m < 0) continue;
+            int dup = 0;
+            for (int k=0;k<n_pkg_par;k++) if (pkg_par[k]==m){ dup = 1; break; }
+            if (!dup && n_pkg_par < MPOL_MAX_IN) pkg_par[n_pkg_par++] = m;
+        }
+        /* the version of an in-package parent, read from its own bytes */
+        #define PKG_VER(mi) ((uint32_t)(g_pkg_tx[mi][0] | (g_pkg_tx[mi][1]<<8) | \
+                             (g_pkg_tx[mi][2]<<16) | ((uint32_t)g_pkg_tx[mi][3]<<24)))
+
+        /* inheritance, both directions, from both sources */
+        for (int k=0;k<n_par;k++)
+            if (is_truc != (t[par_idx[k]].version == TRUC_VERSION)){
+                _mpol_last_reason = "TRUC-violation"; return 0; }
+        for (int k=0;k<n_pkg_par;k++)
+            if (is_truc != (PKG_VER(pkg_par[k]) == TRUC_VERSION)){
+                _mpol_last_reason = "TRUC-violation"; return 0; }
+
+        if (is_truc){
+            if (vsize > TRUC_MAX_VSIZE){ _mpol_last_reason = "TRUC-violation"; return 0; }
+            if (n_par + n_pkg_par + 1 > TRUC_ANCESTOR_LIMIT){
+                _mpol_last_reason = "TRUC-violation"; return 0; }
+            const int has_parent = (n_par + n_pkg_par) > 0;
+            if (has_parent){
+                if (vsize > TRUC_CHILD_MAX_VSIZE){
+                    _mpol_last_reason = "TRUC-violation"; return 0; }
+            }
+            if (n_par > 0){
+                const mpol_node* pn = &t[par_idx[0]];
+                /* anc_cnt includes the parent itself, so >1 means the parent
+                 * already has an ancestor of its own */
+                if ((uint64_t)pn->anc_cnt + n_pkg_par + 1 > TRUC_ANCESTOR_LIMIT){
+                    _mpol_last_reason = "TRUC-violation"; return 0; }
+                /* the parent gets exactly one child. An existing child that
+                 * THIS transaction is replacing does not count against the
+                 * limit -- otherwise a TRUC child could never be fee-bumped,
+                 * which is the entire purpose of the topology. */
+                int child_replaced = 0;
+                for (int e=0; e<n_evict && !child_replaced; e++){
+                    int ei = find_node(st, evict_set[e]);
+                    if (ei < 0) continue;
+                    for (uint32_t q=0; q<t[ei].n_parents; q++)
+                        if (t[ei].parent[q] == (uint32_t)par_idx[0]){ child_replaced = 1; break; }
+                }
+                /* desc_cnt includes the parent itself */
+                if ((uint64_t)pn->desc_cnt + 1 > TRUC_DESCENDANT_LIMIT && !child_replaced){
+                    /* Core would additionally consider evicting the sibling
+                     * under RBF rules (sibling eviction) and accepting this
+                     * one; that is not implemented here, so a second child
+                     * is refused. Strictly more conservative than Core:
+                     * nothing is accepted that Core would reject. */
+                    _mpol_last_reason = "TRUC-violation"; return 0;
+                }
+            }
+            /* Within a package, the sibling and grandchild cases have no
+             * mempool entries to read: they have to be found by walking the
+             * other members' inputs. */
+            if (has_parent && g_pkg_n > 1){
+                const unsigned char* ptxid = n_par > 0 ? t[par_idx[0]].txid
+                                                       : g_pkg_txid[pkg_par[0]];
+                for (int m = 0; m < g_pkg_n; m++){
+                    if (!memcmp(g_pkg_txid[m], txid, 32)) continue;      /* ourselves */
+                    mpol_txmeta om;
+                    static unsigned char oprev[MPOL_MAX_IN][32];
+                    static uint32_t oidx[MPOL_MAX_IN], oseq[MPOL_MAX_IN];
+                    int on = parse_tx(g_pkg_tx[m], g_pkg_len[m], oprev, oidx, oseq, &om);
+                    for (int q = 0; q < on; q++){
+                        /* a second child of our parent: descendant limit */
+                        if (!memcmp(oprev[q], ptxid, 32)){
+                            _mpol_last_reason = "TRUC-violation"; return 0; }
+                        /* a child of OURS, while we already have a parent:
+                         * that would be three generations */
+                        if (!memcmp(oprev[q], txid, 32)){
+                            _mpol_last_reason = "TRUC-violation"; return 0; }
+                    }
+                }
+            }
+        }
+        #undef PKG_VER
+    }
+
     /* ================= commit ============================================ */
     if (!commit) return 1;
 
@@ -841,6 +1092,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
         if (ci >= 0) remove_node(st, mp, ci);
+        /* recorded whether or not the node was still present: it is in the
+         * eviction set because this transaction conflicts with it */
+        if (_mpol_replaced_n < (int)(sizeof _mpol_replaced / 32))
+            memcpy(_mpol_replaced[_mpol_replaced_n++], evict_set[e], 32);
     }
     /* the eviction may have invalidated the ancestor INDEX list; parents are
      * re-found below by txid via prev[] when linking, so recompute par_idx. */
@@ -978,6 +1233,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         t2[myidx].desc_cnt = 1;
         t2[myidx].desc_bytes = (uint32_t)vsize;
         t2[myidx].n_parents = (uint32_t)n_par;
+        t2[myidx].version = meta.version;
         for (int k=0;k<MPOL_MAX_PARENTS;k++)
             t2[myidx].parent[k] = 0xFFFFFFFFu;
         for (int k=0;k<n_par && k<MPOL_MAX_PARENTS;k++)
