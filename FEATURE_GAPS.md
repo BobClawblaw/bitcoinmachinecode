@@ -63,6 +63,80 @@ set byte-identical to Core's (MuHash, no filters, no overrides — see
 `README.md`), which converts several of this document's "unverified"
 hedges below into verified facts.
 
+**Update 2026-08-27 — current state.** A large batch has landed since the
+08-25 survey. This block is the authoritative "where we are"; the sectioned
+body below is the older narrative, annotated inline where an item has closed.
+
+CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
+- **txindex** — offline base build + daemon-maintained incremental tail
+  (`daemon/tx_index_tail.c`); `getrawtransaction <txid>` works with no block
+  hash.
+- **coinstatsindex** — incremental per-block MuHash fold, persisted, adopted
+  instantly on boot; `gettxoutsetinfo` answers in ~33 ms and the digest is
+  proven character-identical to Core's oracle at a folded height
+  (`daemon/coinstats_index.c`).
+- **blockfilterindex** (BIP157/158) — whole-chain filter index AND filter
+  headers, tip-following (`daemon/bfilter_index.c`,
+  `daemon/build_block_filters.c`).
+- **Receive-side tx relay + orphan pool + re-announce + getdata service** —
+  announced txs are fetched witness-typed, missing-parent children parked and
+  cascaded, accepts re-announced to peers, MSG_TX/MSG_WITNESS_TX getdata
+  served (`daemon/tx_relay.c`). Mempool admission runs the CONSENSUS verifier
+  (`tx_verify_mempool`).
+- **Core-style mempool management** — TrimToSize feerate eviction of
+  lowest-feerate leaves, blob compaction, dynamic `mempoolminfee`, and the
+  Core-exposed limits (`minrelaytxfee`/`incrementalrelayfee`/
+  `limitancestor{count,size}`/`limitdescendant{count,size}`/`mempoolfullrbf`)
+  wired to `bitcoin.conf` (`bitcoin_mempool_policy.c`, `daemon/mempool_compact.c`).
+  This also fixed a production freeze at exactly 4096 txs.
+- **Wallet at-rest encryption** — `encryptwallet` / `walletpassphrase` /
+  `walletpassphrasechange` / `walletlock`, AES-256 (FIPS-197) + Core's
+  BytesToKeySHA512AES crypter proven byte-identical to OpenSSL
+  (`bitcoin_aes.c`, `daemon/wallet_crypter.c`, `daemon/wallet_enc_state.c`).
+- **`walletprocesspsbt`** — the PSBT Signer role by delegation
+  (`rpc_wallet_ops.c`); `finalizepsbt`/`utxoupdatepsbt` are real
+  (`rpc_commands.c`).
+- **wtxidrelay (BIP339)** + **stripped-block serving to bare MSG_BLOCK** +
+  **addr self-advertisement** (`daemon/addr_self.c`) + **NODE_WITNESS peer
+  preference** — the networking gaps the 08-25 P2P section listed as remaining.
+- **Chain selection — regtest** — `chain=regtest`/`regtest=1` selects Core's
+  regtest chain: runtime network magic, derived+hash-asserted regtest
+  genesis, generated regtest script-flag schedule, subsidy halving 150,
+  fPowNoRetargeting, `bcrt`/0x6f/0xc4 addresses, per-chain datadir
+  (`<datadir>/regtest/`) and chain-tagged logs (`daemon/chainparams.c`,
+  `bitcoin_net.asm` `net_magic`, `bitcoin_script_flags.asm` `sfc_chain`).
+  Differentially proven against a scratch Core regtest: 161/161 block hashes
+  identical, `gettxoutsetinfo` muhash identical, a block built from bmc's own
+  `getblocktemplate` mined and ACCEPTED by Core, live tip-follow, wallet tx
+  relayed into bmc's mempool. `tests/test_chainparams` (29 checks).
+
+REMAINING gaps, precisely (this is the real backlog):
+- **Wallet management** — multiwallet (`createwallet`/`loadwallet`/
+  `unloadwallet`), descriptor wallets, and watch-only are DISPATCHED but
+  honestly refused (`rpc_wallet_ops.c` `wop_unsupported(WOP_ONE_WALLET/
+  WOP_NO_IMPORT)`). Needs a descriptor engine + wallet-DB layer; the largest
+  remaining chunk.
+- **Live address index** — `build_addr_index.c` exists but is an OFFLINE
+  batch tool only, no live-boot reference in `daemon/main.c`.
+- **Mining polish** — no longpoll, no BIP23 proposal mode, tx ordering valid
+  but not fee-optimal, sigops a lower bound; no stratum/pool interface.
+- **Full-verification IBD benchmark vs Core** (`-assumevalid=0
+  -stopatheight`, second scratch datadir) — still not run; the one
+  like-for-like end-to-end speed comparison.
+- **`lsm_get_scratch`** — 4 MiB asm-TLS scratch (`bitcoin_utxo_lsm.asm`, only
+  the non-mmap fallback uses it) should move to heap.
+- **Two live UTXO-writer divergences** — the batch `build_utxo.c` includes
+  the genesis coinbase Core omits; `utxo_lsm_put` keeps the EARLIER coin on a
+  BIP30 duplicate where Core's `possible_overwrite=true` keeps the later one.
+  Both invisible in practice, corrected at read time, but live code.
+- **testnet / signet** — REFUSED by design (`daemon/chainparams.c` loudly
+  rejects `chain=test`/`signet` rather than run the wrong rules); only main
+  and regtest are supported.
+- **Tor/I2P/onion, REST interface, UPnP/NAT-PMP, Bitcoin-Qt GUI** — absent by
+  design (not gaps for an asm/daemon consensus project).
+- **`assumevalid` / `assumeutxo`** — still deliberately unwired (see Consensus
+  section); `assumevalid` is small, `assumeutxo` is large.
+
 ## RPC surface — the biggest gap until 2026-08-25; first tranche 2026-08-21
 
 **Implemented** (`asm/rpc_chain.c`, dispatched from `rpc_dispatch` in
@@ -235,18 +309,35 @@ plus straightforward methods on top of it.
     rejections, `0xab` inside a pubkey push) — all negatives pin the exact
     rejection reason. No remaining known taproot consensus gap other than
     the deferred items below.
-- **Chain selection** — mainnet only. No testnet/signet/regtest handling in
+- ~~**Chain selection** — mainnet only. No testnet/signet/regtest handling in
   `node_config.c`; mainnet magic bytes are hardcoded directly in
   `bitcoin_net.asm`/`bitcoin_store.asm` (3 literal occurrences each), no
-  chain-params abstraction layer. **Large** — would need a real indirection
-  threaded through many files.
+  chain-params abstraction layer.~~ — **REGTEST DONE 2026-08-27**
+  (`daemon/chainparams.c`). `chain=regtest`/`regtest=1` selects Core's
+  regtest chain through a single chain-params layer: the network magic is now
+  a runtime dword (`bitcoin_net.asm` `net_magic`), the script-flag schedule
+  branches on a runtime selector (`bitcoin_script_flags.asm` `sfc_chain`) with
+  regtest heights generated from `CRegTestParams`, the genesis is derived from
+  the mainnet bytes and hash-asserted against Core's own value, and each chain
+  gets its own datadir (`<datadir>/regtest/`) + chain-tagged logs. Proven
+  block-for-block and muhash-identical against a scratch Core regtest, with a
+  bmc-built `getblocktemplate` block accepted by Core. testnet/signet remain
+  REFUSED by design (only main and regtest supported). The block-archive
+  container marker stays mainnet's `f9beb4d9` deliberately — it is this
+  project's own file format, not the wire protocol, and chains never share a
+  datadir.
 - **Package relay** (Core's v3/ephemeral-dust multi-tx package acceptance,
   distinct from the RBF/ancestor-limit checks below) — not confirmed either
   way with high confidence; worth a closer look if it matters.
 - Mempool policy (RBF/BIP125 replacement-fee checks, ancestor/descendant
   count+byte-budget limits) is **genuinely implemented**, not stubbed
-  (`bitcoin_mempool_policy.c:256-339`) — positive surprise, expected this to
-  be thin.
+  (`bitcoin_mempool_policy.c`) — positive surprise, expected this to be thin.
+  **Extended 2026-08-27:** now also does Core-style TrimToSize (evict
+  lowest-feerate leaves + blob compaction), a dynamic `mempoolminfee`, and
+  reads the Core-exposed limits from `bitcoin.conf`
+  (`minrelaytxfee`/`incrementalrelayfee`/`limitancestor{count,size}`/
+  `limitdescendant{count,size}`/`mempoolfullrbf`). Divergence from Core:
+  individual-leaf eviction, not descendant-package eviction.
 
 ## Indexing
 
@@ -260,8 +351,10 @@ plus straightforward methods on top of it.
 - **Address index** — `build_addr_index.c` exists but is a **standalone
   offline batch tool only**, zero references from `daemon/main.c`'s live
   boot path. Not a live, queryable index.
-- **`blockfilterindex`** (BIP157/158, "neutrino" light-client support) —
-  absent. No hits for blockfilter/bip157/bip158/cfilter/golomb-rice.
+- ~~**`blockfilterindex`** (BIP157/158, "neutrino" light-client support) —
+  absent.~~ — **DONE 2026-08-26** (`daemon/bfilter_index.c`,
+  `daemon/build_block_filters.c`): whole-chain BIP158 basic filters AND the
+  filter-header chain, tip-following; `getblockfilter` serves them.
 - **`coinstatsindex` / `gettxoutsetinfo`** — **the read side now exists**
   (2026-08-23, branch `utxo-set-hash`). `daemon/utxo_setinfo` computes
   `txouts`, `total_amount`, `bogosize` and a **MuHash3072** set hash over a
@@ -334,19 +427,31 @@ plus straightforward methods on top of it.
 
 Real, substantial: HD wallet (BIP32/39), message signing
 (`bitcoin_bip32.asm`, `bitcoin_bip39.asm`, `wallet_msgsign.c`).
+**At-rest encryption DONE 2026-08-27** (`bitcoin_aes.c`,
+`daemon/wallet_crypter.c`, `daemon/wallet_enc_state.c`): `encryptwallet` /
+`walletpassphrase` / `walletpassphrasechange` / `walletlock`, AES-256 under
+Core's BytesToKeySHA512AES KDF (proven byte-identical to OpenSSL), the live
+RPC seed gated behind an unlock timer.
 
 Missing:
 - **PSBT (BIP174)** — ~~absent, zero hits anywhere~~ **substantially present
   since 2026-08-25**: `createpsbt`, `decodepsbt`, `converttopsbt`,
   `combinepsbt`, `joinpsbts` (all oracle-verified, several byte-identical)
-  and `analyzepsbt` (full role machine, 14-vector oracle diff). Still
-  missing from the tranche: `finalizepsbt`/`walletprocesspsbt` (need a PSBT
-  signer) and `utxoupdatepsbt` (needs a UTXO lookup path) —
-  `docs/PARITY_PLAN.md` T8 has the per-method state.
+  and `analyzepsbt` (full role machine, 14-vector oracle diff).
+  ~~Still missing from the tranche: `finalizepsbt`/`walletprocesspsbt` /
+  `utxoupdatepsbt`.~~ — **DONE 2026-08-26**: `walletprocesspsbt` is the PSBT
+  Signer role by delegation (`rpc_wallet_ops.c`), and `finalizepsbt` /
+  `utxoupdatepsbt` are real (`rpc_commands.c`). `descriptorprocesspsbt`
+  honestly refuses (no descriptor engine). `docs/PARITY_PLAN.md` T8 has the
+  per-method state.
 - **Descriptor wallets** — Core's modern default wallet type isn't present.
-- **Watch-only wallets** — absent.
-- **Multi-wallet** (`loadwallet`/`createwallet`/`listwallets`) — absent,
-  single implicit wallet only.
+  DISPATCHED but refused (`importdescriptors`/`createwalletdescriptor`/
+  `addhdkey` → `wop_unsupported(WOP_NO_IMPORT)`). Needs a descriptor engine.
+- **Watch-only wallets** — absent (`exportwatchonlywallet` refuses).
+- **Multi-wallet** (`loadwallet`/`createwallet`/`listwallets`) — DISPATCHED
+  but refused (`wop_unsupported(WOP_ONE_WALLET)`); single implicit wallet
+  only. Wallet management (multiwallet + descriptors + watch-only) is the
+  largest remaining gap.
 - Coin selection — present but basic (`listunspent`/`getbalance` exist); no
   evidence of a sophisticated algorithm like Core's Branch-and-Bound. Not
   confirmed in depth either way.
@@ -381,10 +486,10 @@ not just present as unused/tested-in-isolation code:
   their parents witness-typed, and cascades them in when the parent
   lands. Mempool admission itself now runs the CONSENSUS verifier
   (tx_verify_mempool: legacy scripts, full taproot, confirmed set +
-  mempool parents, tip-anchored maturity). **Remaining:** serve the
-  stripped form to a bare `MSG_BLOCK` request (affects only legacy
-  inbound peers, of which this node currently has none) and BIP339
-  `wtxidrelay`.
+  mempool parents, tip-anchored maturity). ~~**Remaining:** serve the
+  stripped form to a bare `MSG_BLOCK` request and BIP339 `wtxidrelay`.~~ —
+  **BOTH DONE 2026-08-26/27** (`daemon/block_strip.c`; `wtxidrelay`
+  handshake in `bitcoind.asm`).
 - **Thread stacks / sighash buffers — FIXED 2026-08-22** (`9445268`): every
   daemon thread now gets an explicit 64 MB stack (`bmc_thread.h`,
   `BMC_THREAD_STACK_MB`); BIP143/BIP341 midstate hashes use bounded per-thread
