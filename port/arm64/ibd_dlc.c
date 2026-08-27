@@ -145,6 +145,31 @@ static int amr_add(const char* ip){
 }
 static int amr_count(void){ return g_nbook; }
 
+/* ---- known-good peer persistence (x86 dl_load/save_good_peers, peers.good):
+ * remember which peers actually SERVED blocks and try them first next boot. */
+#define DL_GOODPEERS_FILE "peers.good"
+#define DL_GOODPEERS_MAX  256
+static int dl_load_good_peers(char out[][64], int cap){
+    FILE* f=fopen(DL_GOODPEERS_FILE,"r"); if(!f) return 0;
+    int n=0; char line[128];
+    while(n<cap && fgets(line,sizeof line,f)){
+        size_t L=strlen(line);
+        while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
+        if(!L) continue;
+        struct in_addr t; if(inet_pton(AF_INET,line,&t)!=1) continue; /* ignore junk */
+        strncpy(out[n],line,63); out[n][63]=0; n++;
+    }
+    fclose(f); return n;
+}
+static void dl_save_good_peers(char peers[][64], int n){
+    if(n<=0) return;
+    FILE* f=fopen(DL_GOODPEERS_FILE ".tmp","w"); if(!f) return;
+    for(int i=0;i<n && i<DL_GOODPEERS_MAX;i++) fprintf(f,"%s\n",peers[i]);
+    fflush(f); fsync(fileno(f)); fclose(f);
+    rename(DL_GOODPEERS_FILE ".tmp", DL_GOODPEERS_FILE);
+    tsline("[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
+}
+
 /* bounded dial (non-blocking connect + poll(2)) for the liveness probe */
 static int dlc_dial_bounded(const char* ip, int wait_ms){
     unsigned uip; if(inet_pton(AF_INET,ip,&uip)!=1) return -1;
@@ -372,9 +397,18 @@ int main(int argc, char** argv){
     long disc=dl_bootstrap();
     tsline("[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count());
 
-    /* build candidate pool from the book + any got */
+    /* build candidate pool: known-good peers from last boot FIRST, then the
+     * DNS-discovered book (exact x86 priority order -- peers that delivered
+     * blocks last run outrank merely-seen addresses). */
     static char pool[DLC_MAXPOOL][64]; int npool=0;
-    for(int i=0;i<g_nbook && npool<DLC_MAXPOOL;i++){ strncpy(pool[npool],g_book[i],63); pool[npool][63]=0; npool++; }
+    int ngood = dl_load_good_peers(pool, DLC_MAXPOOL);
+    npool += ngood;
+    if(ngood) tsline("[dlc] %d known-good peer(s) from a previous run tried first\n", ngood);
+    for(int i=0;i<g_nbook && npool<DLC_MAXPOOL;i++){
+        int dup=0; for(int j=0;j<npool;j++) if(!strcmp(pool[j],g_book[i])){dup=1;break;}
+        if(dup) continue;
+        strncpy(pool[npool],g_book[i],63); pool[npool][63]=0; npool++;
+    }
     tsline("[dlc] %d candidate peer(s) in pool\n", npool);
     if(npool<=0){ tsline("[dlc] no peers discovered; skipping catch-up\n"); return 0; }
 
@@ -521,6 +555,19 @@ int main(int argc, char** argv){
     }
     long total=*done_count;
     for(int w=0;w<nwork;w++) if(kids[w]>0) waitpid(kids[w],NULL,0);
+    /* remember who actually served blocks for next boot (x86 dl_save_good_peers;
+     * MUST run before stats is unmapped) */
+    {
+        static char good[DL_GOODPEERS_MAX][64]; int ngood=0;
+        for(int w=0; w<nwork && ngood<DL_GOODPEERS_MAX; w++){
+            if(stats[w].blocks<=0) continue;
+            const char* ip=(const char*)stats[w].peer; if(!ip[0]) continue;
+            int dup=0; for(int j=0;j<ngood;j++) if(!strcmp(good[j],ip)){dup=1;break;}
+            if(dup) continue;
+            strncpy(good[ngood],ip,63); good[ngood][63]=0; ngood++;
+        }
+        dl_save_good_peers(good, ngood);
+    }
     munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
     munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nwork);
     munmap((void*)claimed,sizeof(int)*(size_t)nlive);
