@@ -159,6 +159,13 @@ static void send_inv1(int peer_fd, const u8 txid[32]){
     memcpy(inv+5, txid, 32);
     p2p_write(peer_fd, "inv", 3, inv, 37);
 }
+/* BIP339: announce by wtxid (MSG_WTX = type 5) */
+static void send_invwtx(int peer_fd, const u8 wtxid[32]){
+    u8 inv[37];
+    inv[0]=1; inv[1]=5; inv[2]=0; inv[3]=0; inv[4]=0;   /* count=1, type=MSG_WTX */
+    memcpy(inv+5, wtxid, 32);
+    p2p_write(peer_fd, "inv", 3, inv, 37);
+}
 
 int main(void){
     tt_isolate();
@@ -278,6 +285,20 @@ int main(void){
         ck("...and pooled", mpool_get(mp_area, txid3, &mlen) != NULL
                             && mlen == (unsigned long)s3->txlen);
         tx_accept_set_resolver(0);
+    }
+
+    printf("\n== 5b: a wtxid (MSG_WTX) inv is requested with a MSG_WTX getdata ==\n");
+    {
+        drain_peer(sp[1]);
+        u8 wid[32]; memset(wid, 0x5c, 32);
+        send_invwtx(sp[1], wid);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        char cmd[13]; static u8 plw[4096];
+        int plen = read_msg(sp[1], cmd, plw, sizeof plw);
+        ck("MSG_WTX inv -> a getdata is sent", plen == 37 && strcmp(cmd, "getdata") == 0);
+        ck("...entry type is MSG_WTX (5), the wtxid dialect",
+           plen == 37 && plw[1] == 5 && plw[2] == 0 && plw[3] == 0 && plw[4] == 0);
+        ck("...for the announced wtxid", plen == 37 && memcmp(plw+5, wid, 32) == 0);
     }
 
     printf("\n== 6: orphan pool -- child before parent resolves in cascade ==\n");

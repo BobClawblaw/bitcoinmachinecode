@@ -57,6 +57,7 @@ extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* scratch, 
 
 #define TXR_MSG_TX          1u
 #define TXR_MSG_WITNESS_TX  0x40000001u
+#define TXR_MSG_WTX         5u          /* BIP339: wtxid-based tx inv/getdata */
 #define TXR_MAX_REQ         32          /* getdata entries per pass */
 #define TXR_MAX_MSGS        64          /* messages per pass -- a leg cannot monopolise the rotation */
 #define TXR_PAYLOAD_CAP     (2u << 20)  /* > max consensus tx size */
@@ -313,13 +314,21 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 if (e + 36 > pl + plen) break;
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 |
                                 (unsigned)e[2]<<16 | (unsigned)e[3]<<24;
-                if (type != TXR_MSG_TX) continue;      /* blocks: headers-driven keep-up */
+                /* accept BOTH txid (MSG_TX) and wtxid (MSG_WTX, BIP339)
+                 * announcements; blocks are headers-driven keep-up */
+                unsigned req_type;
+                if (type == TXR_MSG_TX) req_type = TXR_MSG_WITNESS_TX;   /* request witness form */
+                else if (type == TXR_MSG_WTX) req_type = TXR_MSG_WTX;    /* wtxid: the getdata echoes it */
+                else continue;
                 unsigned long got_len;
                 if (txr_ring_has(e + 4)) continue;     /* recently requested */
-                if (mpool_get(mp, e + 4, &got_len)) continue;   /* already have it */
+                /* pool-dedup only makes sense for a txid announcement; a
+                 * wtxid keys differently, so a wtxid we already hold may be
+                 * re-fetched once -- tx_accept's own dedup absorbs it */
+                if (type == TXR_MSG_TX && mpool_get(mp, e + 4, &got_len)) continue;
                 u8* o = gd + 1 + want*36;
-                o[0] = (u8)(TXR_MSG_WITNESS_TX);       o[1] = 0;
-                o[2] = 0; o[3] = (u8)(TXR_MSG_WITNESS_TX >> 24);
+                o[0] = (u8)req_type; o[1] = (u8)(req_type >> 8);
+                o[2] = (u8)(req_type >> 16); o[3] = (u8)(req_type >> 24);
                 memcpy(o + 4, e + 4, 32);
                 txr_ring_add(e + 4);
                 want++;

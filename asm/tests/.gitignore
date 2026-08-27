@@ -41,9 +41,9 @@ test_addr_self
 test_bfilter_index
 test_aes
 test_wallet_crypter
-test_mempool_evicttest_chainparams
 test_mempool_evict
 test_chainparams
 test_addr_index_tail
 test_coinselect_bnb
 test_mempool_core_parity
+test_block_strip

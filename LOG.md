@@ -7,6 +7,35 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- the networking pair: stripped-block serving + BIP339 wtxidrelay
+
+Two long-standing FEATURE_GAPS networking items, closed together.
+
+STRIPPED-BLOCK SERVING (bare MSG_BLOCK). The serve loop held only the full
+(witness) serialization and sent it for every block getdata -- fine for a
+modern peer (MSG_WITNESS_BLOCK), but a strict pre-BIP144 peer asking for a
+bare MSG_BLOCK cannot parse the segwit marker/flag bytes. daemon/
+block_strip.c produces the non-witness form (header + tx count + each tx
+stripped via the KAT-proven strip_witness_asm), and the serve arm now
+checks the getdata's witness bit: set -> full block; clear -> stripped.
+A strip failure serves NOTHING (never a wrong form). Proof
+(test_block_strip, real mainnet block 700038): stripped length ==
+Core strippedsize (20118), header byte-identical, and the merkle root of
+the stripped transactions == the header's committed root -- the content
+proof, since the merkle tree commits to non-witness txids. Re-strip is a
+no-op.
+
+BIP339 wtxidrelay. Both handshake roles (node_handshake outbound,
+node_accept_handshake inbound) now send `wtxidrelay` after version and
+before verack. Deliberately NO per-leg negotiation state: we announce our
+own txs by txid (which every peer understands), so advertising wtxidrelay
+only tells peers they MAY announce to us by wtxid -- and the relay drain
+now accepts MSG_WTX (type 5) invs alongside MSG_TX (type 1), requesting a
+type-5 inv with a type-5 getdata (the wtxid dialect; pool-dedup applies
+only to txid announcements, tx_accept's own dedup absorbs a wtxid re-
+fetch). test_bitcoind asserts (via the forked fake peer's exit status)
+that wtxidrelay arrives before verack; test_tx_relay pins the MSG_WTX
+inv -> MSG_WTX getdata path.
 ## 2026-08-27 -- Live address index (EXTENSION): addrindex=1, getaddressbalance/getaddresstxids
 
 FEATURE_GAPS' "build_addr_index.c is an offline batch tool only" item is
