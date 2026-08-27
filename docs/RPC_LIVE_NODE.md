@@ -289,8 +289,8 @@ witness and a legacy scriptSig against a v0 witness prevout. The RPC would
 return a txid and the network would reject the transaction. A refusal is
 strictly better than a plausible txid for something that can never confirm.
 
-So `sendtoaddress`, `sendmany`, `send`, `sendall`, `walletcreatefundedpsbt`,
-`walletprocesspsbt`, `bumpfee` and `psbtbumpfee` all return `-1` naming the
+So `sendtoaddress`, `sendmany`, `send`, `sendall` and `walletcreatefundedpsbt`
+all return `-1` naming the
 mismatch, and pointing at what does work: `createrawtransaction` followed by
 `signrawtransactionwithwallet`. Closing this properly means segwit wallet
 signing plus coin selection, change policy and fee estimation — a subsystem,
@@ -670,9 +670,12 @@ txindex), so the inputless reading wins by construction, and a transaction
 that genuinely carries inputs is refused either way. Stated at the parse.
 
 ### Still refusing
-`walletprocesspsbt` (PSBT signing needs per-input PSBT field surgery the
-signer does not do), `bumpfee`/`psbtbumpfee` (RBF replacement needs the
-original transaction's full input set and fee, which needs a txindex).
+Nothing in this group. `walletprocesspsbt` became real 2026-08-26 (Signer
+role by delegation); `bumpfee`/`psbtbumpfee` became real 2026-08-27 — the
+original transaction's input set and fee are read from the MEMPOOL entry
+rather than a txindex, which is where an unconfirmed original actually
+lives. See LOG.md for the Core-parity notes and the documented
+divergences.
 
 ### Tested
 The funded transaction is signed to completion **with a real witness** and
@@ -801,9 +804,11 @@ subsystem is either implemented or declined by design with the reasoning at
 the call site. What remains declined, and why, in one place:
 
 - **loadtxoutset** — every parity claim rests on locally-validated coins.
-- **bumpfee / psbtbumpfee / walletprocesspsbt** — RBF replacement and PSBT
-  field surgery; need the original tx's inputs (txindex) or per-input PSBT
-  editing the signer does not do.
+- ~~**bumpfee / psbtbumpfee / walletprocesspsbt**~~ — all three are REAL
+  now (walletprocesspsbt 2026-08-26, the bump pair 2026-08-27). The bump
+  reads the original from the mempool entry; it draws the increase from
+  change only and refuses `outputs`/`original_change_index`, both stated at
+  the call site.
 - **preciousblock / pruneblockchain / getblockfrompeer / addnode-family
   mutators / setnetworkactive / ping / submitheader (unknown headers)** —
   the forked download worker owns the peer legs, fork choice and the header
