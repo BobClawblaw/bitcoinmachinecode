@@ -431,6 +431,14 @@ testnet4 chains. Before it, a peer could serve headers claiming any
 difficulty; only cumulative-work fork choice contained the damage, and
 containment is not validation.
 
+One more from later the same day, because it is the cleanest example of the
+pattern. Implementing Core's `mempool.dat` came with a unit test that
+round-tripped the obfuscated v2 form and passed — and the format was still
+wrong, because the test built its own v2 fixture from the same mistaken
+assumption the reader held. The two agreed with each other. Only running the
+file past a real Core, and a real Core's file past us, exposed it. A
+self-built fixture tests a format only if it is built FROM the format.
+
 Net: capability keeps moving, end-to-end speed vs Core is **still**
 unmeasured, and the discovery rate is **still** not decelerating. The
 judgement stands.
