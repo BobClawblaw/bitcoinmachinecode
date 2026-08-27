@@ -47,6 +47,7 @@ node_config_t g_cfg = {
     .port_explicit         = 0,
     .chain                 = "main",
     .listen                = 1,
+    .addrindex             = 0,      /* extension index: off unless asked    */
     .blocksonly            = 0,
     .bind_addr             = "",     /* empty == INADDR_ANY */
     .par                   = 0,      /* Core -par default: auto              */
@@ -95,6 +96,7 @@ static void set_defaults(void){
     g_cfg.port_explicit         = 0;
     snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
+    g_cfg.addrindex             = 0;
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
@@ -248,6 +250,8 @@ long node_config_load(const char* path){
             t=clamp_int(iv,1,65535,key,&bad); if(t>=0){g_cfg.port=t;g_cfg.port_explicit=1;applied++;} }
         else if(!strcmp(key,"chain")){        /* Core: -chain=main|regtest  */
             snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",val); applied++; }
+        else if(!strcmp(key,"addrindex")){    /* EXTENSION: live addr index */
+            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.addrindex=t;applied++;} }
         else if(!strcmp(key,"regtest")){      /* Core: -regtest (bool form) */
             t=clamp_int(iv,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest"); applied++; } }
