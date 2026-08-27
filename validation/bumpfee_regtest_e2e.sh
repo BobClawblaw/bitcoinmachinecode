@@ -300,6 +300,98 @@ print('null' if not raw or json.loads(raw) is None else 'present')")
   && ok "a spent outpoint is null from both nodes" \
   || fail "spent outpoint: ours=$SPENT_OURS core=$SPENT_CORE"
 
+echo "== submitpackage: a child paying for a parent that cannot stand alone =="
+# The whole point of package relay. The parent pays a fee BELOW the min relay
+# floor, so it is refused on its own; the child pays enough for both, so the
+# package clears the floor on its aggregate feerate. The standalone refusal is
+# checked FIRST: without it, "the parent is in the mempool" proves nothing.
+read -r P_TXID P_VAL <<PKGEOF
+$(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'PKGPY'
+import struct,sys
+d=open(sys.argv[1],'rb').read()
+S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+if not S: sys.exit("unexpected scan format")
+h,n=struct.unpack('<II',d[8:16]); body=d[16:]
+seen=0
+for i in range(n):
+    r=body[i*S:(i+1)*S]
+    ht,=struct.unpack('<I',r[0:4]); val,=struct.unpack('<Q',r[40:48])
+    kind=r[48]; branch=r[53]
+    if kind==0 and branch==0 and ht<=h-100:
+        seen+=1
+        if seen==2:            # the bump test already spent the first
+            print(r[4:36][::-1].hex(), val); break
+else:
+    sys.exit("no second mature coinbase")
+PKGPY
+)
+PKGEOF
+if [ -n "${P_TXID:-}" ]; then
+  PKG_DEST=$(core -rpcwallet=e2ecore getnewaddress)
+  P_CH=$((P_VAL - 100))                       # 100 sat on ~141 vB: below the floor
+  P_CH_BTC=$(python3 -c "print('%.8f'%($P_CH/1e8))")
+  PRAW=$(bmc createrawtransaction "[[{\"txid\":\"$P_TXID\",\"vout\":0,\"sequence\":4294967293}],{\"$CHANGE\":$P_CH_BTC}]" | jq_ "d['result']")
+  PSIGNED=$(bmc signrawtransactionwithwallet "[\"$PRAW\"]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('parent signing incomplete')")
+
+  ALONE=$(bmc sendrawtransaction "[\"$PSIGNED\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('accepted' if d['error'] is None else d['error']['message'])")
+  case "$ALONE" in
+    *"fee not met"*) ok "the parent alone is refused: $ALONE" ;;
+    *)               fail "parent alone was not fee-refused (got: $ALONE)" ;;
+  esac
+
+  PTXID=$(bmc decoderawtransaction "[\"$PSIGNED\"]" | jq_ "d['result']['txid']")
+  C_VAL=$((P_CH - 20000))
+  C_BTC=$(python3 -c "print('%.8f'%($C_VAL/1e8))")
+  CRAW=$(bmc createrawtransaction "[[{\"txid\":\"$PTXID\",\"vout\":0,\"sequence\":4294967293}],{\"$PKG_DEST\":$C_BTC}]" | jq_ "d['result']")
+  # The child's input exists ONLY inside this package -- it is in neither the
+  # UTXO set nor the mempool -- so the signer is handed the prevout
+  # explicitly. BIP143 commits to the value and scriptPubKey, and nothing on
+  # chain can supply them yet.
+  P_SPK=$(bmc decoderawtransaction "[\"$PSIGNED\"]" | jq_ "d['result']['vout'][0]['scriptPubKey']['hex']")
+  P_AMT=$(python3 -c "print('%.8f'%($P_CH/1e8))")
+  PREVTXS="[{\"txid\":\"$PTXID\",\"vout\":0,\"scriptPubKey\":\"$P_SPK\",\"amount\":$P_AMT}]"
+  CSIGNED=$(bmc signrawtransactionwithwallet "[\"$CRAW\",$PREVTXS]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('child signing incomplete')")
+
+  PKG=$(bmc submitpackage "[[\"$PSIGNED\",\"$CSIGNED\"]]")
+  PMSG=$(echo "$PKG" | jq_ "d['result']['package_msg']")
+  if [ "$PMSG" = "success" ]; then
+    ok "submitpackage accepts the pair (package_msg=success)"
+  else
+    # print the per-transaction errors too: "transaction failed" alone does
+    # not say WHICH member, and that is the only useful part.
+    fail "submitpackage said: $PMSG -- $(echo "$PKG" | jq_ "'; '.join(k[:12]+': '+v.get('error','ok') for k,v in d['result']['tx-results'].items())")"
+  fi
+  NRES=$(echo "$PKG" | jq_ "len(d['result']['tx-results'])")
+  [ "$NRES" = "2" ] && ok "tx-results has an entry per submitted wtxid" \
+                    || fail "tx-results has $NRES entries, expected 2"
+  HASEFF=$(echo "$PKG" | jq_ "1 if any('effective-feerate' in v.get('fees',{}) for v in d['result']['tx-results'].values()) else 0")
+  [ "$HASEFF" = "1" ] && ok "fees carry Core's effective-feerate/effective-includes" \
+                      || fail "effective-feerate missing from tx-results"
+
+  INPOOL=$(bmc getmempoolentry "[\"$PTXID\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('yes' if d['error'] is None else 'no')")
+  [ "$INPOOL" = "yes" ] && ok "the below-floor parent is in the mempool via the package" \
+                        || fail "parent not in the mempool after submitpackage"
+
+  sleep 2
+  CORE_PKG=$(core submitpackage "[\"$PSIGNED\",\"$CSIGNED\"]" 2>&1 | python3 -c "
+import sys,json
+raw=sys.stdin.read().strip()
+try:    print(json.loads(raw).get('package_msg','?'))
+except Exception: print(raw.splitlines()[0] if raw else 'no output')")
+  case "$CORE_PKG" in
+    success|*already*) ok "Bitcoin Core accepts the same package ($CORE_PKG)" ;;
+    *)                 fail "Core rejected the package: $CORE_PKG" ;;
+  esac
+else
+  fail "no second mature coinbase for the package test"
+fi
+
 echo
 [ $FAILURES -eq 0 ] && echo "ALL TESTS PASSED (0 failures)" || echo "FAILURES: $FAILURES"
 exit $((FAILURES>0))
