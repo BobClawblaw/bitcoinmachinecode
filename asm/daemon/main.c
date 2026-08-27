@@ -3399,9 +3399,14 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * ENCRYPTED store exists, adopt it locked and skip the plaintext load. */
     { extern void wenc_set_seed_installer(void (*)(const unsigned char*));
       extern void wenc_set_mnemonic_provider(int (*)(char*, long, char*, long));
+      extern void rpc_wops_set_seed_installer(void (*)(const unsigned char*));
       extern int  wenc_boot(const char*);
       wenc_set_seed_installer(wenc_install_seed);
       wenc_set_mnemonic_provider(provide_wallet_mnemonic);
+      /* multi-wallet (rpc_wallet_ops.c): loadwallet/createwallet install the
+       * switched-to wallet's seed through the SAME installer the encryption
+       * unlock path uses -- one seed slot, one way to write it. */
+      rpc_wops_set_seed_installer(wenc_install_seed);
       char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
       if (wenc_boot(".") || wenc_boot(wd)){
           fprintf(stderr, "[rpc] encrypted wallet adopted (locked)\n");
