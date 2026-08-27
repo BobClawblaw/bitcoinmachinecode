@@ -173,6 +173,8 @@ ibd_lsm: ibd_lsm.c $(IBDLSMOBJS)
 # client pool + x86 startup banner + [catchup]/[dl] logging (log parity with x86).
 ibd_par: ibd_par.c $(IBDLSMOBJS)
 	@$(CC) $(CFLAGS) -o ibd_par ibd_par.c $(IBDLSMOBJS)
+ibd_dlc: ibd_dlc.c $(IBDOBJS)
+	@$(CC) $(CFLAGS) -o ibd_dlc ibd_dlc.c $(IBDOBJS)
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 
