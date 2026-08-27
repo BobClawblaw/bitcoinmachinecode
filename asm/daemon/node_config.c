@@ -62,6 +62,10 @@ node_config_t g_cfg = {
     .limitdescendantcount  = 25,     /* Core -limitdescendantcount default   */
     .limitdescendantsize_kvb = 101,  /* Core -limitdescendantsize default    */
     .mempoolfullrbf        = 1,      /* Core -mempoolfullrbf default (v28+)  */
+    .dustrelayfee_satkvb   = 3000,   /* Core DUST_RELAY_TX_FEE               */
+    .datacarrier           = 1,      /* Core -datacarrier default            */
+    .datacarriersize       = 100000, /* Core v31 -datacarriersize default    */
+    .acceptnonstdtxn       = 0,      /* Core -acceptnonstdtxn default        */
     .dnsseed               = 1,      /* Core -dnsseed default: on            */
     .connect_only          = 0,
     .n_seednode            = 0,
@@ -111,6 +115,10 @@ static void set_defaults(void){
     g_cfg.limitdescendantcount  = 25;
     g_cfg.limitdescendantsize_kvb = 101;
     g_cfg.mempoolfullrbf        = 1;
+    g_cfg.dustrelayfee_satkvb   = 3000;
+    g_cfg.datacarrier           = 1;
+    g_cfg.datacarriersize       = 100000;
+    g_cfg.acceptnonstdtxn       = 0;
     g_cfg.dnsseed               = 1;
     g_cfg.connect_only          = 0;
     g_cfg.n_seednode = g_cfg.n_addnode = g_cfg.n_connect = 0;
@@ -295,6 +303,16 @@ long node_config_load(const char* path){
             t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitdescendantsize_kvb=t; applied++; } }
         else if(!strcmp(key,"mempoolfullrbf")){
             g_cfg.mempoolfullrbf = (iv != 0); applied++; }
+        else if(!strcmp(key,"dustrelayfee")){  /* Core: BTC/kvB -> sat/kvB */
+            double b = atof(val);
+            if(b >= 0 && b < 1.0){ g_cfg.dustrelayfee_satkvb = (long)(b*1e8 + 0.5); applied++; }
+            else { fprintf(stderr,"[config] dustrelayfee=%s out of range -- ignoring\n", val); bad++; } }
+        else if(!strcmp(key,"datacarrier")){
+            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.datacarrier=t;applied++;} }
+        else if(!strcmp(key,"datacarriersize")){
+            t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.datacarriersize=t;applied++;} }
+        else if(!strcmp(key,"acceptnonstdtxn")){
+            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.acceptnonstdtxn=t;applied++;} }
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
