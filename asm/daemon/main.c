@@ -3380,6 +3380,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                                      unsigned long long*, unsigned long long*);
       extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
       extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
+      extern unsigned long long mpool_policy_min_fee(void*);
       extern long mpool_count(void*);
       extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
       rpc_mempool_hooks h = {
@@ -3393,7 +3394,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           .estimate = mpool_policy_estimate,
           /* main.c's existing extern types the length as long; the hooks
            * member says unsigned long -- ABI-identical on x86-64 SysV. */
-          .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d };
+          .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d,
+          .min_fee = mpool_policy_min_fee };
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }

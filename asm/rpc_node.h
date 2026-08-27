@@ -192,6 +192,7 @@ typedef struct {
     long (*estimate)(void*, unsigned long long*,
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
+    unsigned long long (*min_fee)(void*);   /* dynamic mempoolminfee, sat/vByte (polstate) */
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 

@@ -52,6 +52,13 @@ node_config_t g_cfg = {
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
     .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
+    .minrelaytxfee_satvb   = 1,      /* Core -minrelaytxfee 0.00001 BTC/kvB  */
+    .incrementalrelayfee_satvb = 1,  /* Core -incrementalrelayfee default    */
+    .limitancestorcount    = 25,     /* Core -limitancestorcount default     */
+    .limitancestorsize_kvb = 101,    /* Core -limitancestorsize default (kvB)*/
+    .limitdescendantcount  = 25,     /* Core -limitdescendantcount default   */
+    .limitdescendantsize_kvb = 101,  /* Core -limitdescendantsize default    */
+    .mempoolfullrbf        = 1,      /* Core -mempoolfullrbf default (v28+)  */
     .dnsseed               = 1,      /* Core -dnsseed default: on            */
     .connect_only          = 0,
     .n_seednode            = 0,
@@ -91,6 +98,13 @@ static void set_defaults(void){
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
     g_cfg.maxuploadtarget_mb    = 0;
+    g_cfg.minrelaytxfee_satvb   = 1;
+    g_cfg.incrementalrelayfee_satvb = 1;
+    g_cfg.limitancestorcount    = 25;
+    g_cfg.limitancestorsize_kvb = 101;
+    g_cfg.limitdescendantcount  = 25;
+    g_cfg.limitdescendantsize_kvb = 101;
+    g_cfg.mempoolfullrbf        = 1;
     g_cfg.dnsseed               = 1;
     g_cfg.connect_only          = 0;
     g_cfg.n_seednode = g_cfg.n_addnode = g_cfg.n_connect = 0;
@@ -243,6 +257,26 @@ long node_config_load(const char* path){
             t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; applied++; } }
         else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
             t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
+        /* mempool policy limits (Core limit-count/size, relay fees, mempoolfullrbf).
+         * The two fees are BTC/kvB in Core's config; convert to sat/vByte:
+         * sat/vB = round(BTC/kvB * 1e8 / 1000) = round(BTC/kvB * 1e5). */
+        else if(!strcmp(key,"minrelaytxfee") || !strcmp(key,"incrementalrelayfee")){
+            double btc = atof(val);
+            long satvb = (long)(btc * 1e5 + 0.5);
+            if(satvb < 0) satvb = 0;
+            if(!strcmp(key,"minrelaytxfee"))      g_cfg.minrelaytxfee_satvb = satvb;
+            else                                  g_cfg.incrementalrelayfee_satvb = satvb;
+            applied++; }
+        else if(!strcmp(key,"limitancestorcount")){
+            t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitancestorcount=t; applied++; } }
+        else if(!strcmp(key,"limitancestorsize")){   /* Core: kvB */
+            t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitancestorsize_kvb=t; applied++; } }
+        else if(!strcmp(key,"limitdescendantcount")){
+            t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitdescendantcount=t; applied++; } }
+        else if(!strcmp(key,"limitdescendantsize")){ /* Core: kvB */
+            t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitdescendantsize_kvb=t; applied++; } }
+        else if(!strcmp(key,"mempoolfullrbf")){
+            g_cfg.mempoolfullrbf = (iv != 0); applied++; }
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
@@ -401,6 +435,10 @@ void node_config_log(void){
             g_cfg.utxo_bulk_gap_blocks, g_cfg.utxo_compact_threshold);
     fprintf(stderr,"[config] pool : maxmempool=%ldMB mempoolexpiry=%ldh maxuploadtarget=%ldMB\n",
             g_cfg.maxmempool_mb, g_cfg.mempoolexpiry_h, g_cfg.maxuploadtarget_mb);
+    fprintf(stderr,"[config] mpol : minrelay=%ld inc=%ld sat/vB, anc=%ld/%ldkvB desc=%ld/%ldkvB fullrbf=%d\n",
+            g_cfg.minrelaytxfee_satvb, g_cfg.incrementalrelayfee_satvb,
+            g_cfg.limitancestorcount, g_cfg.limitancestorsize_kvb,
+            g_cfg.limitdescendantcount, g_cfg.limitdescendantsize_kvb, g_cfg.mempoolfullrbf);
     fprintf(stderr,"[config] res  : par=%d (%s) maxreceivebuffer=%d*1000B\n",
             g_cfg.par, g_cfg.par==0?"auto":(g_cfg.par<0?"leave cores free":"fixed"),
             g_cfg.maxrecvbuffer_kb);
