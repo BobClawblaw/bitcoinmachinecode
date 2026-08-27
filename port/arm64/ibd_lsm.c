@@ -67,6 +67,11 @@ extern long   utxo_lsm_get(void* lst, void* u, const uint8_t txid[32], unsigned 
                            const uint8_t** script, unsigned long* slen);
 extern long   utxo_lsm_count(void* lst);
 extern long   utxo_lsm_flush(void* lst, void* u);
+/* x86 compacts the LSM every UTXO_LIVE_COMPACT_THRESHOLD (12) flushes to bound
+ * the run count (runs>threshold = growing per-get disk-run scan + the run-file
+ * spam that made my earlier builds write 1005 utxo_run_*.dat). Faithful parity. */
+extern long   utxo_lsm_compact(void* lst);
+#define UTXO_COMPACT_EVERY 12
 extern long   utxo_lsm_reload(void* lst, void* u);
 extern void   utxo_lsm_close(void* lst);
 
@@ -505,6 +510,13 @@ int main(int argc, char** argv){
                 long fr=utxo_lsm_flush(g_lst,g_utxo);
                 if(fr<0){ LLOG(6,"h%ld FLUSH ERR\n",h); }
                 else { g_flushes++; }
+                /* x86 parity: compact every 12th flush so run count stays
+                 * bounded (no utxo_run_*.dat spam; bounded per-get disk scan). */
+                if(g_flushes>=1 && g_flushes%UTXO_COMPACT_EVERY==0){
+                    long cr=utxo_lsm_compact(g_lst);
+                    if(cr<0) LLOG(6,"h%ld COMPACT ERR\n",h);
+                    else if(cr>0) LLOG(5,"h%ld COMPACT runs->%lu\n",h,(unsigned long)g_lst->manifest_n);
+                }
                 LLOG(5, "h%ld FLUSH ok runs=%lu live=%ld\n", h,
                         (unsigned long)g_lst->manifest_n, (long)utxo_lsm_count(g_lst));
             }
