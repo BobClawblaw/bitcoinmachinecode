@@ -7,6 +7,52 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- gettxout answers for real: the RPC asks the download worker
+
+The embedded RPC server lives in the serve PARENT, which has no handle on
+the live UTXO set -- the download worker owns it in another process. The
+handler's `if (!g_utxo_lst) return null` therefore fired on every request,
+and null is not "I cannot say": in gettxout it means "that output is not
+unspent". The live node was answering, confidently and wrongly, that every
+coin in existence is spent. Confirmed against production with the previous
+block's coinbase, which cannot be spent.
+
+WHY NOT A READ-ONLY VIEW IN THE PARENT. That was the obvious fix and it is
+SAFE -- the manifest and compaction publish tmp+fsync+rename so a
+cross-process reader sees old-or-new and never torn, and lsm_get_scratch is
+already thread-local. It fails on COST: utxo_lsm_reload_ro measures
+60.4/61.9/72.1/73.2/79.4/82.6 s on the real 165M-entry set across six
+production boots, and every new block invalidates the view, so even a cached
+one makes the first call after each block block for a minute.
+
+WHAT IT DOES INSTEAD. A socketpair created before the fork; the parent asks,
+the worker answers from the set it already has open, in microseconds. The
+worker replies ONLY at a quiescent point in its loop, after the catch-up
+call: utxo_lsm_get is thread-safe by itself, but this module guarantees
+get() and flush() never overlap BY CONSTRUCTION, and a query thread in the
+worker would have broken precisely that guarantee.
+
+THE PROPERTY THIS HAD TO KEEP is not "usually right", it is NEVER WRONG.
+Every failure path refuses: no worker, timeout, short read, lost framing.
+And the response ECHOES the outpoint it answers -- without that, a query
+that timed out would leave its reply in the socket and the NEXT query would
+read a perfectly well-formed response about a DIFFERENT coin. Magic alone
+cannot catch that. tests/test_txoq_ipc pins the hit, the absent case, the
+two refusal cases and the stale-reply case; the stale one was verified
+fail-then-pass by removing the echo check, which makes it return the wrong
+coin's value.
+
+PROVEN AGAINST CORE. validation/bumpfee_regtest_e2e.sh now diffs gettxout
+against Core's on the same outpoint: value, scriptPubKey hex and the
+coinbase flag match exactly, and a spent outpoint is null from both nodes.
+
+That first real diff immediately caught something else: gettxout emitted
+`value` as a JSON STRING where Core emits a NUMBER (ValueFromAmount is
+UniValue VNUM). Every other amount in rpc_commands.c already used rj_numf;
+gettxout was the lone holdout, invisible for as long as it only ever
+returned null. Fixed here, together with the same shape bug in
+listunspent's `amount` and getbalance's result.
+
 ## 2026-08-27 -- bumpfee proven end to end against a real Bitcoin Core
 
 `validation/bumpfee_regtest_e2e.sh` closes the coverage gap the bumpfee

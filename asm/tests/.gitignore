@@ -57,3 +57,4 @@ test_rpc_signer
 test_taproot_parity
 test_utxo_snapshot
 test_wallet_scan
+test_txoq_ipc

@@ -62,6 +62,19 @@ static void* g_utxo_lst = NULL;
 static void* g_utxo_u = NULL;
 void rpc_commands_set_utxo_store(void* lst, void* u) { g_utxo_lst = lst; g_utxo_u = u; }
 
+/* gettxout's out-of-process path. The embedded RPC server (serve parent) has
+ * no UTXO handle -- the download worker owns that state -- so daemon/main.c
+ * installs a query that asks the worker over a socketpair. 1 found /
+ * 0 genuinely absent / -1 cannot answer (no worker, busy, timeout). The
+ * standalone rpcd sets the store above instead and never uses this. */
+#define TXO_SPK_CAP 16384u
+typedef long (*rpc_txo_query_fn)(const unsigned char txid_wire[32], unsigned int vout,
+                                 unsigned long long* value, unsigned long* height,
+                                 unsigned long* is_coinbase, unsigned char* spk,
+                                 unsigned long spk_cap, unsigned long* spk_len);
+static rpc_txo_query_fn g_txo_query = NULL;
+void rpc_commands_set_txo_query(rpc_txo_query_fn fn) { g_txo_query = fn; }
+
 /* ---- scriptPubKey(hash) -> UTXO reverse index (asm/daemon/build_addr_
  * index.c) backing listunspent/getbalance. Same "opaque handle, separate
  * from rpc_wallet" pattern as the UTXO store above. Mmap'd read-only by
@@ -379,7 +392,7 @@ static int cmd_getbalance(const rj_val* params, const rpc_wallet* w, long* ec, c
             if (wallet_coin_mature(&coins[i], tip)) sum += coins[i].value;
         free(coins);
         char amt2[24]; rpc_amounts((long long)sum, amt2, sizeof amt2);
-        *result = rj_str(amt2);
+        *result = rj_numf("%s", amt2);   /* Core: amounts are JSON numbers */
         return 1;
     }
     unsigned char type_tag, hash[32];
@@ -392,7 +405,7 @@ static int cmd_getbalance(const rj_val* params, const rpc_wallet* w, long* ec, c
         free(recs);
     }
     char amt[24]; rpc_amounts((long long)total, amt, sizeof amt);
-    *result = rj_str(amt);
+    *result = rj_numf("%s", amt);       /* Core: amounts are JSON numbers */
     return 1;
 }
 
@@ -434,7 +447,7 @@ static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, 
             if (addr[0]) rj_obj_set(o, "address", rj_str(addr));
             rj_obj_set(o, "label", rj_str(""));
             rj_obj_set(o, "scriptPubKey", rj_str(scripthex));
-            rj_obj_set(o, "amount", rj_str(amt));
+            rj_obj_set(o, "amount", rj_numf("%s", amt));
             rj_obj_set(o, "confirmations", rj_numf("%d", confs));
             /* an immature coinbase is listed but NOT spendable, which is what
              * Core reports; dropping it entirely would hide a real coin. */
@@ -466,7 +479,7 @@ static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, 
             if (addr[0]) rj_obj_set(o, "address", rj_str(addr));
             rj_obj_set(o, "label", rj_str(""));
             rj_obj_set(o, "scriptPubKey", rj_str(scripthex));
-            rj_obj_set(o, "amount", rj_str(amt));
+            rj_obj_set(o, "amount", rj_numf("%s", amt));
             rj_obj_set(o, "confirmations", rj_numf("%d", 0));
             rj_obj_set(o, "spendable", rj_bool(1));
             rj_obj_set(o, "solvable", rj_bool(1));
@@ -520,30 +533,34 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     unsigned char txid_wire[32];
     for (int i = 0; i < 32; i++) txid_wire[i] = txid_display[31 - i];
 
-    /* No UTXO store installed = this server CANNOT ANSWER, which is not the
-     * same as "that output is spent" -- and null means the latter. Only the
-     * standalone rpcd calls rpc_commands_set_utxo_store; the embedded server
-     * in daemon/main.c never has, so every gettxout on the live node was
-     * confidently reporting every coin in existence as spent.
-     *
-     * Refusing is the honest answer until the RPC can reach the live set.
-     * It cannot today: the download worker owns that state in ANOTHER
-     * process, and building a read-only view here costs a full
-     * utxo_lsm_reload_ro -- measured at 60-83s on the real 165M-entry set
-     * across six production boots, and invalidated by every new block, so it
-     * is not a viable per-call path. The fix is a request/response channel to
-     * the worker, which already answers utxo_lsm_get in microseconds; see
-     * FEATURE_GAPS.md. */
-    if (!g_utxo_lst) {
+    /* Two ways to reach the UTXO set, and a refusal if neither is available.
+     * null is NOT "I cannot say" here -- it means "that output is not
+     * unspent", so a server that cannot look must never answer with it. */
+    unsigned long long value = 0; unsigned long height = 0, is_coinbase = 0;
+    const unsigned char* script = NULL; unsigned long slen = 0;
+    unsigned char spkbuf[TXO_SPK_CAP];   /* per-call: the RPC server is threaded */
+    long r;
+    if (g_utxo_lst) {
+        /* in-process handle (the standalone rpcd) */
+        r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout,
+                         &value, &height, &is_coinbase, &script, &slen);
+        if (r != 1) r = 0;
+    } else if (g_txo_query) {
+        /* out of process: ask the download worker, which owns the live set */
+        r = g_txo_query(txid_wire, (unsigned)vout, &value, &height, &is_coinbase,
+                        spkbuf, sizeof spkbuf, &slen);
+        if (r == 1) script = spkbuf;
+    } else {
+        r = -1;
+    }
+    if (r < 0) {
         *ec = -1;
-        *em = "gettxout cannot be answered by this server: it has no handle on "
-              "the live UTXO set (the download worker owns it in another "
-              "process). Returning null would claim the output is spent, which "
-              "this node has not established";
+        *em = "gettxout cannot be answered right now: this server has no handle "
+              "on the live UTXO set and the download worker that owns it did "
+              "not answer. Returning null would claim the output is spent, "
+              "which this node has not established";
         return 0;
     }
-    unsigned long long value; unsigned long height, is_coinbase; const unsigned char* script; unsigned long slen;
-    long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &height, &is_coinbase, &script, &slen);
     if (r != 1) { *result = rj_null(); return 1; }
     (void)height; /* "confirmations" below is still a hardcoded placeholder,
                    * like "bestblock" -- wiring those to the real chain tip
@@ -559,7 +576,11 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     rj_val* o = rj_obj();
     rj_obj_set(o, "bestblock", rj_str("0000000000000000000000000000000000000000000000000000000000000000"));
     rj_obj_set(o, "confirmations", rj_numf("%d", 0));
-    rj_obj_set(o, "value", rj_str(amt));
+    /* a NUMBER, not a string: Core's ValueFromAmount emits UniValue VNUM and
+     * every other amount in this file already uses rj_numf. gettxout was the
+     * one holdout, which stayed invisible while it only ever returned null --
+     * the first real diff against Core caught it. */
+    rj_obj_set(o, "value", rj_numf("%s", amt));
     rj_val* sp = rj_obj();
     rj_obj_set(sp, "asm", rj_str(""));
     rj_obj_set(sp, "desc", rj_str(""));

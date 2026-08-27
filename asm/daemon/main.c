@@ -34,6 +34,7 @@
 #include <time.h>
 #include <signal.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -773,6 +774,123 @@ static void upl_sample(void){
         if(w > upl_last[i]){ added += (long)(w - upl_last[i]); upl_last[i]=w; }
     }
     if(added>0) upload_note_and_check(added);
+}
+
+/* ==== gettxout IPC: the RPC asks the download worker =======================
+ * The RPC server runs in the SERVE PARENT, which holds no handle on the live
+ * UTXO set -- the download worker owns it in another process. gettxout used
+ * to answer null there, which does not mean "I cannot say", it means "that
+ * output is spent": the node was asserting that about every coin in
+ * existence.
+ *
+ * Building a read-only view in the parent was measured and rejected:
+ * utxo_lsm_reload_ro costs 60-83 s on the real 165M-entry set and every new
+ * block invalidates it (FEATURE_GAPS.md). So the parent ASKS the worker,
+ * which already has the set open and answers utxo_lsm_get in microseconds.
+ *
+ * WHY A POLLED SERVICE POINT AND NOT A THREAD IN THE WORKER: utxo_lsm_get is
+ * thread-safe on its own (lsm_get_scratch is TLS), but this module's
+ * architecture guarantees get() and flush() never overlap "by construction" --
+ * a query thread racing the worker's own writes would break exactly that
+ * guarantee. So the worker answers only at a quiescent point in its loop,
+ * after the catch-up call, where no put/del/flush is in flight.
+ *
+ * Failure is always a REFUSAL, never a guess: no worker, a timeout, a short
+ * read, a dead socket -- every one of them returns -1 and gettxout says it
+ * cannot answer. The one thing this must never do is fall back to null. */
+#define TXOQ_MAGIC   0x51584f54u          /* "TOXQ" */
+#define TXOQ_SPK_CAP 16384u
+#define TXOQ_TIMEOUT_MS 2000              /* a tip-height block apply is ~0.1s */
+typedef struct { unsigned int magic, vout; unsigned char txid[32]; } txoq_req;
+/* The response ECHOES the outpoint it answers. Without that, a query that
+ * timed out would leave its response sitting in the socket and the NEXT query
+ * would read it -- a perfectly well-formed reply about the WRONG coin. Magic
+ * alone cannot catch that. With the echo, a stale reply is recognised, drained
+ * and skipped. */
+typedef struct { unsigned int magic; int found; unsigned long long value;
+                 unsigned long height; unsigned int is_coinbase, spklen;
+                 unsigned char txid[32]; unsigned int vout; } txoq_resp;
+static int g_txoq_parent = -1;            /* parent end (RPC side) */
+static int g_txoq_worker = -1;            /* worker end */
+static pthread_mutex_t g_txoq_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* read exactly n bytes unless the deadline passes; 1 ok, 0 timeout/short */
+static int txoq_read_all(int fd, void* buf, size_t n, int timeout_ms){
+    unsigned char* p = (unsigned char*)buf; size_t got = 0;
+    while(got < n){
+        struct pollfd pf = { fd, POLLIN, 0 };
+        int pr = poll(&pf, 1, timeout_ms);
+        if(pr <= 0) return 0;                          /* timeout or error */
+        ssize_t r = read(fd, p + got, n - got);
+        if(r <= 0){ if(r < 0 && errno == EINTR) continue; return 0; }
+        got += (size_t)r;
+    }
+    return 1;
+}
+
+/* The RPC-side query. Returns 1 found / 0 absent / -1 cannot answer.
+ * Serialised: there is one channel and the RPC server is threaded. */
+static long txoq_query(const unsigned char txid_wire[32], unsigned int vout,
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase,
+                       unsigned char* spk, unsigned long spk_cap, unsigned long* spk_len){
+    if(g_txoq_parent < 0) return -1;
+    long rc = -1;
+    pthread_mutex_lock(&g_txoq_lock);
+    txoq_req q; q.magic = TXOQ_MAGIC; q.vout = vout; memcpy(q.txid, txid_wire, 32);
+    if(send(g_txoq_parent, &q, sizeof q, MSG_NOSIGNAL) != (ssize_t)sizeof q) goto out;
+    txoq_resp rp;
+    unsigned char body[TXOQ_SPK_CAP];
+    /* Skip any replies left over from an earlier timed-out query. Bounded so a
+     * pathologically backed-up channel cannot spin here. */
+    for(int skip = 0; ; skip++){
+        if(skip > 8) goto out;                         /* still desynced: refuse */
+        if(!txoq_read_all(g_txoq_parent, &rp, sizeof rp, TXOQ_TIMEOUT_MS)) goto out;
+        if(rp.magic != TXOQ_MAGIC) goto out;           /* framing lost: refuse, never guess */
+        if(rp.spklen > TXOQ_SPK_CAP) goto out;
+        if(rp.spklen && !txoq_read_all(g_txoq_parent, body, rp.spklen, TXOQ_TIMEOUT_MS)) goto out;
+        if(rp.vout == vout && memcmp(rp.txid, txid_wire, 32) == 0) break;   /* ours */
+        /* else: a stale reply about a different outpoint -- drained, try again */
+    }
+    if(rp.spklen > spk_cap) goto out;                  /* cannot deliver: refuse */
+    if(rp.found != 1){ rc = 0; goto out; }             /* genuinely not unspent */
+    if(rp.spklen) memcpy(spk, body, rp.spklen);
+    *value = rp.value; *height = rp.height;
+    *is_coinbase = rp.is_coinbase; *spk_len = rp.spklen;
+    rc = 1;
+out:
+    pthread_mutex_unlock(&g_txoq_lock);
+    return rc;
+}
+
+/* Worker side: answer every pending query, then return. Called ONLY from the
+ * quiescent point in the worker loop. Never blocks -- a parent that went away
+ * or a partial request just ends the round. */
+extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vout,
+                              unsigned long long* value, unsigned long* height,
+                              unsigned long* is_coinbase,
+                              const unsigned char** script, unsigned long* slen);
+static void txoq_service(void){
+    if(g_txoq_worker < 0) return;
+    for(int guard = 0; guard < 64; guard++){
+        struct pollfd pf = { g_txoq_worker, POLLIN, 0 };
+        if(poll(&pf, 1, 0) <= 0) return;               /* nothing pending */
+        txoq_req q;
+        if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
+        if(q.magic != TXOQ_MAGIC) return;              /* desynced: stop, do not guess */
+        txoq_resp rp; memset(&rp, 0, sizeof rp);
+        rp.magic = TXOQ_MAGIC; rp.found = 0;
+        memcpy(rp.txid, q.txid, 32); rp.vout = q.vout;   /* echo: see txoq_resp */
+        const unsigned char* script = NULL; unsigned long slen = 0;
+        unsigned long long value = 0; unsigned long h = 0, cb = 0;
+        if(utxo_live_lsm_get(q.txid, q.vout, &value, &h, &cb, &script, &slen) == 1
+           && slen <= TXOQ_SPK_CAP){
+            rp.found = 1; rp.value = value; rp.height = h;
+            rp.is_coinbase = (unsigned int)cb; rp.spklen = (unsigned int)slen;
+        }
+        if(send(g_txoq_worker, &rp, sizeof rp, MSG_NOSIGNAL) != (ssize_t)sizeof rp) return;
+        if(rp.spklen && send(g_txoq_worker, script, rp.spklen, MSG_NOSIGNAL) != (ssize_t)rp.spklen) return;
+    }
 }
 
 static volatile sig_atomic_t g_inbound_n = 0;
@@ -3260,6 +3378,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         ar, utxo_live_applied_height(), live_utxo_disp(), phase_elapsed(&utxo_ct_pt));
             }
         }
+        /* QUIESCENT POINT: catch-up has returned, so no put/del/flush is in
+         * flight and a point query cannot race the writer. This is the only
+         * place the worker answers gettxout. */
+        txoq_service();
         /* new-block announcement: one choke point watching the store's tip,
          * so it fires no matter which path appended (mux keep-up leg,
          * realtime getdata loop, catch-up). Hash read straight from the
@@ -4363,12 +4485,34 @@ int main(int argc, char** argv){
          * publish nothing and report no error. */
         zmqn_set_status(g_node_status);
 
+        /* gettxout IPC channel, created BEFORE the fork so both sides inherit
+         * it: the RPC in this parent asks the worker, which owns the live
+         * UTXO set. If the socketpair cannot be made we simply do not install
+         * the query hook and gettxout keeps refusing -- degraded, never
+         * wrong. */
+        { int sv[2];
+          if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){ g_txoq_parent = sv[0]; g_txoq_worker = sv[1]; }
+          else fprintf(stderr,"[serve] gettxout IPC unavailable (socketpair: %s) -- gettxout will refuse\n", strerror(errno)); }
+
         pid_t dl = fork();
-        if(dl==0){ serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port); _exit(0); }
+        if(dl==0){
+            if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
+            _exit(0);
+        }
+        if(g_txoq_worker >= 0){ close(g_txoq_worker); g_txoq_worker = -1; }
         g_dl_worker_pid = dl;   /* so serve_mux's shutdown handling can forward SIGTERM to it */
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
         fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
         /* Embedded JSON-RPC server (parent), non-blocking own accept thread. */
+        if(g_txoq_parent >= 0){
+            extern void rpc_commands_set_txo_query(long (*)(const unsigned char[32], unsigned int,
+                                                            unsigned long long*, unsigned long*,
+                                                            unsigned long*, unsigned char*,
+                                                            unsigned long, unsigned long*));
+            rpc_commands_set_txo_query(txoq_query);
+            fprintf(stderr,"[rpc] gettxout answers via the download worker (IPC)\n");
+        }
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */

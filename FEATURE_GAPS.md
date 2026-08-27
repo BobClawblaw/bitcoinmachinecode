@@ -96,26 +96,31 @@ CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
 - **`walletprocesspsbt`** — the PSBT Signer role by delegation
   (`rpc_wallet_ops.c`); `finalizepsbt`/`utxoupdatepsbt` are real
   (`rpc_commands.c`).
-- **`gettxout` cannot reach the live UTXO set (refuses since 2026-08-27)** —
-  only the standalone `rpcd` calls `rpc_commands_set_utxo_store`; the
-  embedded server in `daemon/main.c` never has, so `g_utxo_lst` is NULL and
-  every call returned `null`. That is not "unknown", it is "not unspent" —
-  the live node was confidently reporting **every coin in existence as
-  spent**. It now REFUSES with a message naming the missing capability;
-  wrong answers are worse than no answer.
-  **Why the obvious fix was rejected:** building a read-only view in the RPC
-  (`utxo_lsm_reload_ro`, which is safe — the manifest publishes
-  tmp+fsync+rename so a cross-process reader sees old-or-new never torn, and
-  `lsm_get_scratch` is already thread-local) costs a full reload, MEASURED at
-  60.4/61.9/72.1/73.2/79.4/82.6 s on the real 165M-entry set across six
-  production boots. Every new block invalidates it, so a cache does not help
-  — the first call after each block would pay a minute.
-  **The real fix:** a request/response channel from the serve parent to the
-  DOWNLOAD WORKER, which already holds the live set and answers
-  `utxo_lsm_get` in microseconds. That is a new IPC path and a new failure
-  surface on a live daemon, so it is deliberately not bolted on in passing.
-  Precedent for the shape: `gettxoutsetinfo` answers in ~33 ms from the
-  maintained coinstats index, with the quiesced walk only as a fallback.
+- ~~**`gettxout` cannot reach the live UTXO set**~~ — **FIXED 2026-08-27**
+  (`refusal` then the real fix). The embedded RPC server runs in the serve
+  PARENT and has no UTXO handle; it used to answer `null` for every outpoint,
+  which does not mean "unknown" — it means "spent". The node was asserting
+  that about every coin in existence.
+  Building a read-only view in the parent was measured and REJECTED on cost,
+  not safety: `utxo_lsm_reload_ro` takes 60.4/61.9/72.1/73.2/79.4/82.6 s on
+  the real 165M-entry set (six production boots) and every block invalidates
+  it. Instead the parent ASKS the download worker over a socketpair created
+  before the fork; the worker already has the set open and answers
+  `utxo_lsm_get` in microseconds.
+  The worker replies only at a QUIESCENT point in its loop (after the
+  catch-up call). `utxo_lsm_get` is thread-safe on its own — `lsm_get_scratch`
+  is TLS — but this module guarantees `get()` and `flush()` never overlap *by
+  construction*, and a query thread would have broken exactly that.
+  Every failure is a REFUSAL, never a guess: no worker, timeout, short read,
+  lost framing. The response echoes the outpoint it answers, because a
+  timed-out query leaves its reply in the socket and the next query would
+  otherwise read a well-formed answer about the WRONG coin (`test_txoq_ipc`
+  pins this; verified fail-then-pass).
+  Proven in `validation/bumpfee_regtest_e2e.sh`: `gettxout` on an unspent coin
+  matches **Core's `gettxout` exactly**, and a spent outpoint is null from both.
+  That first real diff also caught `value` being emitted as a JSON *string*
+  where Core emits a *number* — fixed here, along with the same shape bug in
+  `listunspent.amount` and `getbalance`.
 - ~~**`connect=<host>:<port>` ignores a non-default port**~~ — **FIXED
   2026-08-27** (`be7ef33`): any port is honoured, the host stays stored bare
   and the port rides a parallel array read via `node_config_peer_port()`.
