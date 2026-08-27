@@ -93,8 +93,11 @@ extern long p2p_getdata_block(void* out, const unsigned char hash[32]);
 extern long p2p_headers_count(const void* payload, long plen);
 
 extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
-extern void tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long txlen,
-                    unsigned char* buf, unsigned long buflen);
+/* RETURNS int (1 ok / 0 malformed); bitcoin_tx.asm's .fail path is
+ * `xor eax, eax`. Declared void here until 2026-08-27, which made a failed
+ * txid computation invisible to this caller. */
+extern int tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long txlen,
+                   unsigned char* buf, unsigned long buflen);
 
 /* daemon/utxo_live.c */
 extern int  utxo_live_can_unapply(const void* blockbuf, uint64_t blocklen, long height);
@@ -886,7 +889,9 @@ static long collect_block_txs(const unsigned char* blk, uint64_t len,
             unsigned char* dst = arena + *arena_used;
             memcpy(dst, p, (size_t)txlen);
             *arena_used += (size_t)txlen;
-            tx_txid(out[nout].txid, dst, (unsigned long)txlen, txid_scratch, sizeof txid_scratch);
+            /* a txid we could not compute must not be handed back as one */
+            if (tx_txid(out[nout].txid, dst, (unsigned long)txlen,
+                        txid_scratch, sizeof txid_scratch) != 1) break;
             out[nout].tx = dst;
             out[nout].len = (unsigned long)txlen;
             nout++;
