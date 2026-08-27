@@ -168,8 +168,12 @@ static char g_peer_host[4096];   /* last-connected host (for [catchup] log) */
 static char   g_book[BOOK_MAX][16];   /* dotted-quad IPv4s, deduped */
 static int    g_nbook=0;
 static int    g_booki=0;              /* book rotation cursor for re-dials */
+/* book_add_ip takes the ip in NETWORK order (struct sockaddr_in.sin_addr.s_addr:
+ * memory bytes a,b,c,d == the dotted quad). On a little-endian host the u32
+ * value is d<<24|c<<16|b<<8|a, so format LSB-first to print a.b.c.d. */
 static void book_add_ip(unsigned ip){
-    char s[16]; snprintf(s,sizeof s,"%u.%u.%u.%u",(ip>>24)&0xff,(ip>>16)&0xff,(ip>>8)&0xff,ip&0xff);
+    char s[16];
+    snprintf(s,sizeof s,"%u.%u.%u.%u", ip&0xff,(ip>>8)&0xff,(ip>>16)&0xff,(ip>>24)&0xff);
     for(int i=0;i<g_nbook;i++) if(!strcmp(g_book[i],s)) return;
     if(g_nbook<BOOK_MAX){ strncpy(g_book[g_nbook],s,15); g_book[g_nbook][15]=0; g_nbook++; }
 }
@@ -183,8 +187,11 @@ static int parse_addr(const unsigned char* p, unsigned plen){
     unsigned long long off=v; int added=0;
     for(unsigned long long i=0;i<n && off+30<=plen;i++){
         off += 4+8;   /* time + services */
-        unsigned ip=((unsigned)p[off+12]<<24)|((unsigned)p[off+13]<<16)|((unsigned)p[off+14]<<8)|(unsigned)p[off+15];
-        off += 16+2;  /* IPv6 (::ffff:a.b.c.d) + port */
+        /* IPv4 carried in the low 4 bytes of the 16-byte IPv6 (::ffff:a.b.c.d);
+           build in NETWORK order (a|b<<8|c<<16|d<<24 on LE) for book_add_ip. */
+        unsigned ip=(unsigned)p[off+12] | ((unsigned)p[off+13]<<8)
+                  | ((unsigned)p[off+14]<<16) | ((unsigned)p[off+15]<<24);
+        off += 16+2;  /* rest of IPv6 + port */
         if(ip){ book_add_ip(ip); added++; }
     }
     return added;
@@ -554,6 +561,19 @@ int main(int argc, char** argv){
         if(inet_pton(AF_INET,PEERS[i],&a)) ip=a.s_addr;
         if(ip) book_add_ip(ip);
     }
+    /* Resolve the given seeds to their real FULL-NODE IPs and add those to the
+       book first: we download FROM the peers the seeds point to (the seeds
+       themselves stay discovery/drop-only). */
+    for(int s=0;s<ng;s++){
+        struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+        if(getaddrinfo(given[s],NULL,&h,&res)==0){
+            for(struct addrinfo* ai=res; ai; ai=ai->ai_next){
+                unsigned ip=((struct sockaddr_in*)ai->ai_addr)->sin_addr.s_addr;
+                if(ip) book_add_ip(ip);
+            }
+            freeaddrinfo(res);
+        }
+    }
     /* PHASE A: DISCOVERY ONLY. Connect each given seed, exchange getaddr into
        the book, then DROP the seed -- seeds are peer SOURCES, never download
        peers (x86 dl_bootstrap model). */
@@ -777,22 +797,31 @@ int main(int argc, char** argv){
             /* free the window slot: remove by shifting the tail in */
             for(int i=k;i<g_nwin-1;i++) g_win[i]=g_win[i+1];
             g_nwin--;
-            /* the freed slot's client (owner of the removed window) can take the next window */
+            /* the freed slot's client can take the next work: FIRST adopt any
+               orphaned (owner<0, released-on-failed-rotate) window so a stalled
+               head-of-line window can never deadlock the in-order apply; else
+               issue a brand-new window. */
             int freec = -1;
-            /* find any client that is not currently owning a window */
-            /* owners of remaining windows: */
             for(int ci=0; ci<g_ncli; ci++){
                 int owns=0;
                 for(int q=0;q<g_nwin;q++) if(g_win[q].owner==ci){ owns=1; break; }
                 if(!owns){ freec=ci; break; }
             }
-            if(freec>=0 && next_issue<nwin_total){
-                long w0b = start + next_issue*WB;
-                long nb = WB; if(w0b+nb>start+G_maxblk) nb = start+G_maxblk-w0b;
-                struct win* wn=&g_win[g_nwin++];
-                win_reset(wn, w0b, nb); wn->owner=freec;
-                if(req_window(g_fd[freec], hdr, w0b, nb)==0) next_issue++;
-                else { g_nwin--; }
+            if(freec>=0){
+                int orphan=-1;
+                for(int q=0;q<g_nwin;q++) if(g_win[q].owner<0){ orphan=q; break; }
+                if(orphan>=0){
+                    struct win* wn=&g_win[orphan]; wn->owner=freec; wn->collected=0;
+                    for(int z=0;z<wn->n;z++) wn->have[z]=0;
+                    if(req_window(g_fd[freec], hdr, wn->w0, wn->n)!=0){ wn->owner=-1; }
+                } else if(next_issue<nwin_total){
+                    long w0b = start + next_issue*WB;
+                    long nb = WB; if(w0b+nb>start+G_maxblk) nb = start+G_maxblk-w0b;
+                    struct win* wn=&g_win[g_nwin++];
+                    win_reset(wn, w0b, nb); wn->owner=freec;
+                    if(req_window(g_fd[freec], hdr, w0b, nb)==0) next_issue++;
+                    else { g_nwin--; }
+                }
             }
             /* [dl] heartbeat every ~1000 blocks */
             if(next_apply - hb_last >= 1000){
