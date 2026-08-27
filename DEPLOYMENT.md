@@ -184,9 +184,9 @@ count, uptime.
   ```
 
   The snapshot names march a letter per deploy on a given day
-  (`…-20260827o`, `p`, `q`, …). As of 2026-08-27 the live binary is
-  **`bitcoind.deploy-20260827z`**; the rollback one step back is
-  `…-20260827y`.
+  (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
+  2026-08-27 the live binary is **`bitcoind.deploy-20260827aa`**; the
+  rollback one step back is `…-20260827z`.
 
   NOTE ON BOOT TIME from `z` onward: boot now includes a ~60 s
   `[boot] tx-validation snapshot ready (61.49s)` step. That is deliberate --
@@ -196,7 +196,30 @@ count, uptime.
   for a minute there is working as intended; the line is printed when it
   finishes.
 
-  The six that changed live behaviour most, newest first:
+  The seven that changed live behaviour most, newest first:
+  - **`aa`** (`9404ffb`) — package relay, closed end to end: p2p 1p1c
+    relay, BIP431 TRUC/v3, ephemeral dust, `replaced-transactions`, and
+    `testmempoolaccept` package mode; plus `exportwatchonlywallet` and the
+    bumpfee replaced-by linkage made reachable.
+
+    A POLICY deploy, so the number to watch is the `policy` count in the
+    30-second `[tx_accept]` summary — a new rule that is subtly too strict
+    shows up there as mainnet transactions this node refuses and the rest of
+    the network accepts. Measured over the first ten minutes: 0–2 policy
+    rejects per window against 39–81 accepts, versus a baseline of ~5 before
+    the deploy. Not over-rejecting.
+
+    New in the heartbeat: a `[txrelay] orphans:` line. Those counters
+    existed from the start and NOTHING EVER READ THEM, so a pool silently
+    dropping everything looked exactly like a quiet one. First live reading
+    was `79 held, 346 parked, 73 resolved, 194 dropped` — the 256-entry pool
+    is evicting more than it resolves under real mainnet orphan traffic,
+    which is bounded-by-design rather than broken (the network re-announces),
+    but it is exactly the kind of thing the line exists to show.
+
+    `1p1c: 0 accepted, 0 failed` at first reading. That path is proven
+    against Core on regtest; it had not yet been exercised on mainnet, which
+    needs a below-floor parent whose child also reaches us.
   - **`z`** (`1b62d67`) — inbound serving no longer stalls. Every forked
     serve child used to open its own UTXO snapshot (60–83 s) before
     answering anything; now opened once pre-fork and inherited. Measured:
