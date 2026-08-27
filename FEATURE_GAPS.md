@@ -96,18 +96,35 @@ CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
 - **`walletprocesspsbt`** — the PSBT Signer role by delegation
   (`rpc_wallet_ops.c`); `finalizepsbt`/`utxoupdatepsbt` are real
   (`rpc_commands.c`).
-- **`connect=<host>:<port>` ignores a non-default port** — the node accepts
-  `connect=`/`addnode=` peers only on the selected chain's DEFAULT P2P port
-  (8333 main, 18444 regtest, 48333 testnet4) and logs+ignores any other,
-  where Core takes any `host:port`. Consequence: a node pointed at a peer on
-  a non-standard port sits silently at tip=0 with `peers=0/0`. Found
-  2026-08-27 while writing `validation/bumpfee_regtest_e2e.sh`.
-- **`getbalance`/`listunspent` read the address index, not the wallet scan**
-  — the address index is an extension (`addrindex=1`, default OFF), so on a
-  default node a funded wallet reports `0.00000000` and an empty
-  `listunspent` even though `walletscan.dat` correctly holds every receive.
-  The two wallet views should agree, or the RPCs should fall back to the
-  scan. Found 2026-08-27, same script.
+- **`gettxout` cannot reach the live UTXO set (refuses since 2026-08-27)** —
+  only the standalone `rpcd` calls `rpc_commands_set_utxo_store`; the
+  embedded server in `daemon/main.c` never has, so `g_utxo_lst` is NULL and
+  every call returned `null`. That is not "unknown", it is "not unspent" —
+  the live node was confidently reporting **every coin in existence as
+  spent**. It now REFUSES with a message naming the missing capability;
+  wrong answers are worse than no answer.
+  **Why the obvious fix was rejected:** building a read-only view in the RPC
+  (`utxo_lsm_reload_ro`, which is safe — the manifest publishes
+  tmp+fsync+rename so a cross-process reader sees old-or-new never torn, and
+  `lsm_get_scratch` is already thread-local) costs a full reload, MEASURED at
+  60.4/61.9/72.1/73.2/79.4/82.6 s on the real 165M-entry set across six
+  production boots. Every new block invalidates it, so a cache does not help
+  — the first call after each block would pay a minute.
+  **The real fix:** a request/response channel from the serve parent to the
+  DOWNLOAD WORKER, which already holds the live set and answers
+  `utxo_lsm_get` in microseconds. That is a new IPC path and a new failure
+  surface on a live daemon, so it is deliberately not bolted on in passing.
+  Precedent for the shape: `gettxoutsetinfo` answers in ~33 ms from the
+  maintained coinstats index, with the quiesced walk only as a fallback.
+- ~~**`connect=<host>:<port>` ignores a non-default port**~~ — **FIXED
+  2026-08-27** (`be7ef33`): any port is honoured, the host stays stored bare
+  and the port rides a parallel array read via `node_config_peer_port()`.
+- ~~**`getbalance`/`listunspent` read the address index**~~ — **FIXED
+  2026-08-27** (`0994198`): with no address argument they enumerate the
+  wallet's coins from the rescan records (spent-ness from the scan's own
+  spend records); an explicit address still uses the index. Scan format grew
+  `is_coinbase` (BMCWSCN3) so coinbase maturity is respected; older BMCWSCN2
+  files are still read.
 - **nBits schedule enforcement (Core's `bad-diffbits`)** — a peer's headers
   must now carry exactly the bits `GetNextWorkRequired` demands for their
   height, checked in fork evaluation (`reorg_analyze`) AND at apply
