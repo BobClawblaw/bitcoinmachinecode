@@ -35,7 +35,8 @@
 ; ----------------------------------------------------------------------------
 ; sfc_chain -- runtime chain selector: 0 = mainnet (the static default, so
 ; every caller that never selects a chain gets exactly the old behaviour),
-; 1 = regtest. Written once by chainparams_select() (daemon/chainparams.c)
+; 1 = regtest, 2 = testnet4. Written once by chainparams_select()
+; (daemon/chainparams.c)
 ; before any block is verified, never again -- the unsynchronized read below
 ; is safe. Regtest's buried heights come from the same generator run
 ; (SFC_R_HEIGHT_*, CRegTestParams); the two mainnet exception hashes cannot
@@ -57,7 +58,11 @@ script_flags_for_block:
     mov   rbx, rdi                 ; height (survives the hash compares)
 
     cmp   dword [sfc_chain], 0
-    jne   .regtest
+    je    .mainnet
+    cmp   dword [sfc_chain], 2
+    je    .testnet4
+    jmp   .regtest
+.mainnet:
 
     ; ---- exception 1: BIP16 ----
     lea   rax, [rel SFC_EXC_BIP16_HASH]
@@ -134,5 +139,27 @@ script_flags_for_block:
     jb    .r_skip_segwit
     or    rax, (1<<SFC_BIT_NULLDUMMY)
 .r_skip_segwit:
+    pop   rbx
+    ret
+
+; ---- testnet4: same base flags, no exceptions, CTestNet4Params heights ----
+.testnet4:
+    mov   rax, (1<<SFC_BIT_P2SH) | (1<<SFC_BIT_WITNESS) | (1<<SFC_BIT_TAPROOT)
+    cmp   rbx, SFC_T_HEIGHT_DERSIG
+    jb    .t_skip_dersig
+    or    rax, (1<<SFC_BIT_DERSIG)
+.t_skip_dersig:
+    cmp   rbx, SFC_T_HEIGHT_CLTV
+    jb    .t_skip_cltv
+    or    rax, (1<<SFC_BIT_CLTV)
+.t_skip_cltv:
+    cmp   rbx, SFC_T_HEIGHT_CSV
+    jb    .t_skip_csv
+    or    rax, (1<<SFC_BIT_CSV)
+.t_skip_csv:
+    cmp   rbx, SFC_T_HEIGHT_SEGWIT
+    jb    .t_skip_segwit
+    or    rax, (1<<SFC_BIT_NULLDUMMY)
+.t_skip_segwit:
     pop   rbx
     ret
