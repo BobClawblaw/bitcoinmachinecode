@@ -7,6 +7,41 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Wallet at-rest encryption: encryptwallet / walletpassphrase{,change} / walletlock
+
+Finished the parked wallet-encryption WIP and wired it end to end. The wallet
+can now be encrypted at rest under a passphrase, Core-compatibly, with the
+live RPC seed gated behind an unlock timer.
+
+CIPHER (bitcoin_aes.c): AES-256, FIPS-197 block cipher + CBC. Passes the known-
+answer vectors in tests/test_aes (block enc/dec, CBC round-trip, padding,
+short-ciphertext rejection).
+
+CRYPTER (daemon/wallet_crypter.c): Core's BytesToKeySHA512AES key derivation
+(SHA-512 of passphrase||salt, iterated) producing the 32-byte key + 16-byte IV,
+then a sealed container: magic, salt, iteration count, the AES-256-CBC-wrapped
+seed, and a SHA-256 checksum. seal / open / rewrap. Proven byte-identical to
+OpenSSL's KDF (oracle-generated vectors) and round-trip correct, including that
+rewrap leaves the seed ciphertext untouched -- tests/test_wallet_crypter.
+
+STATE MACHINE (daemon/wallet_enc_state.c): boots an encrypted store LOCKED
+(seed NULL); walletpassphrase re-derives the seed from the sealed mnemonic and
+installs it into the live RPC wallet for N seconds via a registered setter;
+expiry or walletlock clears it and re-NULLs the live seed; walletpassphrase-
+change re-wraps in place; encryptwallet seals the currently-loaded plaintext
+wallet, removes the plaintext store, and leaves it locked. The mnemonic
+PROVIDER is a registered callback (wenc_set_mnemonic_provider) so the RPC layer
+and unit tests link the state module without daemon/main.c.
+
+RPCs (rpc_wallet_ops.c): the four commands with Core-exact error codes/text
+(-15 unencrypted, -14 wrong passphrase, -8 usage, -4 not loaded). encryptwallet
+left the "refusals" list in test_rpc_wallet_ops (it is real now).
+
+BUILD: the wenc translation units live in DAEMON_RPCOBJS and RPCLIBS (the two
+RPC bundles, never linked together), not DAEMONSRCS, since rpc_wallet_ops.o and
+main.c both reference the symbols. Full make -k test green (79 suites).
+
+----------------------------------------------------------------------------
 ## 2026-08-27 -- Core-style mempool management: TrimToSize eviction, dynamic minfee, config-wired limits
 
 Prompted by a PRODUCTION FREEZE (mempool stuck at exactly 4096; the shared
