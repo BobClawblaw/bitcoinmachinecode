@@ -2474,6 +2474,7 @@ static int txsub_package(char* msg, unsigned long mcap){
     extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*,
                                       unsigned long, char*, unsigned long, unsigned long long*);
     extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
+    extern int  txacc_fee_reconsiderable(const char* reason);
     node_status_t* st = g_node_status;
     int n = st->tx_submit_pkg_n;
     if (n <= 0 || n > RPC_PKG_MAX){ snprintf(msg, mcap, "package-too-many-transactions"); return 0; }
@@ -2523,8 +2524,7 @@ static int txsub_package(char* msg, unsigned long mcap){
             st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
             tot_fee += fee; tot_vsize += st->pkg_vsize[i];
         } else {
-            int fee_only = (!strcmp(r, "min relay fee not met") ||
-                            !strcmp(r, "mempool min fee not met"));
+            int fee_only = txacc_fee_reconsiderable(r);
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
             if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
@@ -3614,6 +3614,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
                         upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
+            /* Relay-pool health. Silent when nothing has been parked, so a
+             * node with no orphan traffic prints nothing extra. */
+            { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
+              long pk=0, rs=0, dr=0, ok=0, fl=0, held=0;
+              if(txrelay_stats(&pk,&rs,&dr,&ok,&fl,&held))
+                  fprintf(stderr,"[txrelay] orphans: %ld held, %ld parked, %ld resolved, "
+                                 "%ld dropped; 1p1c: %ld accepted, %ld failed\n",
+                          held, pk, rs, dr, ok, fl); }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
