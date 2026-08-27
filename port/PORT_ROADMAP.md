@@ -162,10 +162,12 @@ and runs natively.
       dispatch. NOTE: heights 28,29 in this live_blocks test store duplicate
       blocks 0,1 (a store-population quirk, visible via getblock/getblockhash,
       NOT a CLI bug). (2026-08-26)
-- [ ] script/consensus layer: bitcoin_interp / bitcoin_script VM /
-      mempool -- NEXT: the interpreter VM (~5000 lines), then UTXO, then daemon.
-      checksig / segwit + taproot script paths, mempool  <- NEXT (large: a
-      full stack VM, ~5000 lines of x86-64 across interp/sighash/checksig)
+- [x] script/consensus layer: bitcoin_interp / bitcoin_script VM /
+      mempool -- the interpreter VM (bitcoin_interp/scriptcodec), checksig /
+      segwit + taproot script paths are ported + differential-verified; the
+      live IBD path exercises them end-to-end (cons_verify + full ECDSA + UTXO
+      with 0 bad_gate/0 MISSING-PREVOUT on a clean base). mempool = C-level
+      (portable), no asm port. (2026-08-25, re-verified 2026-08-27)
 - [x] bitcoin_tx (tx parse/txid)        -> port/arm64/bitcoin_tx.S  repo harnesses
       test_tx + test_txtxid PASS native; ~8.5k-case differential fuzz vs Python
       oracle (legacy+segwit txids, tx_parse fields, malformed rejection): 0 fail.
@@ -203,15 +205,18 @@ and runs natively.
       verified 963k header chain, prev-links checked, coinbase parsed by the
       ported bitcoin_tx, persisted via bitcoin_store + read back: 0 failures
       natively. Blk/index now in data/ (blk00000.dat + index.dat).
-- [ ] bitcoin_cons (cons_verify)          [in DAEMONOBJS]
+- [x] bitcoin_cons (cons_verify)          [in DAEMONOBJS] -- ported + exercised by
+      the live IBD path (0 bad_gate over hundreds of thousands of applied blocks)
 - [x] bitcoin_strip_witness (void witness stripping; canonical read_cs + minimal
       re-encode; consumed by modern txval + BIP341 stripped-commitment)
       -> port/arm64/bitcoin_strip_witness.S (+hash160). Differential vs C twin
       (bitcoin_segwit.c): synthetic 2183 cases + 3 real mainnet blocks (481824/413567/700000
       = 4699 txs) + independent Python fuzz (~65k) + 1200 large-script (70KB scriptSig) ->
       0 fail everywhere. (2026-08-25)
-- [ ] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
-      taproot_verify / strip_witness / tapagg / multisig / sigops ...
+- [x] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
+      taproot_verify / strip_witness / tapagg / multisig / sigops ... (all ported +
+      differential-verified; the interpreter VM / sighash / checksig / segwit / taproot
+      / tapagg / sigops modules complete -- see their individual [x] entries above)
 - [x] bitcoind.asm                        (daemon entry; links everything above)
       -> port/arm64/bitcoind.S (14 exports: node_make_version / node_handshake /
       node_accept_handshake / node_sync / node_sync_multi / node_serve_block /
