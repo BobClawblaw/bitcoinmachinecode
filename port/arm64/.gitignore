@@ -1,6 +1,14 @@
 # ARM port build artifacts — don't commit binaries/objects
 *.o
 *.so
+*.tmp
+ibd_par
+ibd_dlc
+fz_bech32
+fz_sigops
+t_chk
+t_cons3g
+t_consA
 test_*
 t_ripemd
 fz_tx
