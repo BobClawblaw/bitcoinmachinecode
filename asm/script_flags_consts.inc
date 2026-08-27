@@ -25,6 +25,12 @@
 %define SFC_R_HEIGHT_CSV 1 ; regtest CSVHeight
 %define SFC_R_HEIGHT_SEGWIT 0 ; regtest SegwitHeight
 
+; testnet4 (CTestNet4Params) -- selected at runtime via sfc_chain
+%define SFC_T_HEIGHT_DERSIG 1 ; testnet4 BIP66Height
+%define SFC_T_HEIGHT_CLTV 1 ; testnet4 BIP65Height
+%define SFC_T_HEIGHT_CSV 1 ; testnet4 CSVHeight
+%define SFC_T_HEIGHT_SEGWIT 1 ; testnet4 SegwitHeight
+
 section .rodata
 ; BIP16 exception: display hash 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22 -> flags 0x0
 SFC_EXC_BIP16_HASH: db 0x22, 0x9c, 0x4f, 0xac, 0x88, 0xba, 0xb1, 0x94, 0xeb, 0x08, 0xf1, 0xa5, 0x28, 0xcc, 0x30, 0x8d, 0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75, 0xdc, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00

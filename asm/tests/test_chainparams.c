@@ -106,6 +106,31 @@ int main(void){
        (script_flags_for_block(SFC_HEIGHT_SEGWIT-1, nohash) & F_NULLDUMMY) == 0 &&
        (script_flags_for_block(SFC_HEIGHT_SEGWIT,   nohash) & F_NULLDUMMY) != 0);
 
+    printf("\n== 4b: testnet4 ==\n");
+    ck("select(testnet4) succeeds (internal hash assert passed)", chainparams_select("testnet4") == 1);
+    ck("selected", g_chainp->id == CHAIN_TESTNET4 && !strcmp(g_chainp->name, "testnet4"));
+    block_hash(got, g_chainp->genesis);
+    hx32(want, "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043");
+    ck("testnet4 genesis hash == Core's assert", memcmp(got, want, 32) == 0);
+    ck("stored testnet4 genesis_hash matches", memcmp(g_chainp->genesis_hash, got, 32) == 0);
+    ck("CTestNet4Params values: magic/port/rpc/halving/retarget/mindiff/bip94/powlimit",
+       g_chainp->magic == 0x283f161cu && g_chainp->default_port == 48333 &&
+       g_chainp->default_rpc_port == 48332 && g_chainp->halving_interval == 210000 &&
+       g_chainp->pow_no_retargeting == 0 && g_chainp->allow_min_difficulty == 1 &&
+       g_chainp->enforce_bip94 == 1 && g_chainp->pow_limit_bits == 0x1d00ffffu);
+    ck("address params 0x6f/0xc4/0xef/tb",
+       g_chainp->p2pkh_version == 0x6f && g_chainp->p2sh_version == 0xc4 &&
+       g_chainp->wif_version == 0xef && !strcmp(g_chainp->bech32_hrp, "tb"));
+    ck("testnet4 has DNS seeds", g_chainp->dns_seeds == 1 && g_chainp->n_dns_seed_hosts == 2);
+    ck("net_magic flipped to 1c163f28 (LE dword 283f161c)", net_magic == 0x283f161cu);
+    ck("sfc_chain is now 2", sfc_chain == 2);
+    ck("testnet4 h=1: everything active (CTestNet4Params heights)",
+       script_flags_for_block(1, nohash) == F_ALL);
+    ck("testnet4 h=0: base flags only (SegwitHeight 1, unlike regtest's 0)",
+       script_flags_for_block(0, nohash) == (F_P2SH|F_WITNESS|F_TAPROOT));
+    ck("select(main) restores from testnet4",
+       chainparams_select("main") == 1 && net_magic == 0xd9b4bef9u && sfc_chain == 0);
+
     printf("\n== 5: per-chain datadirs ==\n");
     { char out[256];
       mkdir("/tmp/bmc-cp-test", 0755);   /* parent for the subdir mkdir */
@@ -116,10 +141,15 @@ int main(void){
       struct stat sb;
       ck("regtest datadir is base/regtest and was created",
          !strcmp(out, "/tmp/bmc-cp-test/regtest") && stat(out, &sb) == 0 && S_ISDIR(sb.st_mode));
+      chainparams_select("testnet4");
+      chainparams_datadir("/tmp/bmc-cp-test", out, sizeof out);
+      ck("testnet4 datadir is base/testnet4 and was created",
+         !strcmp(out, "/tmp/bmc-cp-test/testnet4") && stat(out, &sb) == 0 && S_ISDIR(sb.st_mode));
       chainparams_select("main"); }
 
     printf("\n== 6: refusals ==\n");
-    ck("testnet refused",  chainparams_select("test") == 0);
+    ck("legacy testnet3 names refused",
+       chainparams_select("test") == 0 && chainparams_select("testnet") == 0);
     ck("signet refused",   chainparams_select("signet") == 0);
     ck("garbage refused",  chainparams_select("florin") == 0);
     ck("a refused select leaves the previous chain in force", g_chainp->id == CHAIN_MAIN);
