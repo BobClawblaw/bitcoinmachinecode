@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include "bmc_thread.h"
 #include <signal.h>
 #include <sys/socket.h>
@@ -282,6 +283,77 @@ static void handle_request(int cfd, const char* body, size_t blen) {
  * than half-parsed. The header-end scan resumes where the last read left
  * off instead of rescanning from byte 0 (quadratic at MB sizes). */
 #define RPC_REQ_MAX (9u<<20)     /* 8MB hex block + JSON + headers, with margin */
+
+/* ---- getblocktemplate longpoll (BIP22) -------------------------------------
+ * The accept loop is deliberately SERIAL (one request at a time; the wallet
+ * and chain handlers are not concurrent-safe), so a longpoll request cannot
+ * simply block inside its handler -- it would stall every other RPC. Instead
+ * a request whose body carries a "longpollid" is handed to a detached waiter
+ * thread that (a) polls the CHAIN TIP through a shared-state-free primitive
+ * -- a direct pread of index.dat's last 48-byte record, whose first 32 bytes
+ * are the tip hash -- and (b) only after the tip differs from the
+ * longpollid's embedded prev-hash (or a 60s cap; Core also wakes on
+ * substantial mempool change -- divergence, documented here) re-enters the
+ * SERIAL execution path by taking the same mutex the accept loop holds
+ * around every handler. Handlers therefore never run concurrently. */
+static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LP_MAX_WAIT_S  60
+#define LP_POLL_MS     250
+
+static int lp_tip_hash(unsigned char out[32]){
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return 0;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz < 48){ close(fd); return 0; }
+    off_t last = (sz / 48 - 1) * 48;
+    int ok = pread(fd, out, 32, last) == 32;
+    close(fd);
+    return ok;
+}
+
+typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
+
+static void* lp_waiter(void* arg){
+    lp_req_t* r = (lp_req_t*)arg;
+    if (r->have_prev){
+        for (int waited = 0; waited < LP_MAX_WAIT_S * 1000; waited += LP_POLL_MS){
+            unsigned char cur[32];
+            if (lp_tip_hash(cur) && memcmp(cur, r->prev, 32) != 0) break;   /* tip moved */
+            struct timespec ts = {0, LP_POLL_MS * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+    }
+    pthread_mutex_lock(&g_exec_lock);
+    handle_request(r->cfd, r->buf + r->body_off, r->blen);
+    pthread_mutex_unlock(&g_exec_lock);
+    free(r->buf); free(r);
+    return NULL;
+}
+
+/* extract the 64-hex prev-tip embedded in the request's longpollid ("<tip
+ * display hex><counter>"); wire order out. 0 if absent/malformed (the waiter
+ * then answers immediately, which is also what Core does for an unknown id). */
+static int lp_extract_prev(const char* body, size_t blen, unsigned char out[32]){
+    const char* k = NULL;
+    for (size_t i = 0; i + 12 <= blen; i++)
+        if (!memcmp(body + i, "\"longpollid\"", 12)){ k = body + i + 12; break; }
+    if (!k) return 0;
+    const char* end = body + blen;
+    while (k < end && (*k == ':' || *k == ' ' || *k == '\t')) k++;
+    if (k >= end || *k != '"') return 0;
+    k++;
+    if ((size_t)(end - k) < 64) return 0;
+    for (int b = 0; b < 32; b++){
+        unsigned hi, lo;
+        char c1 = k[b*2], c2 = k[b*2+1];
+        hi = (c1 >= '0' && c1 <= '9') ? (unsigned)(c1-'0') : (c1 >= 'a' && c1 <= 'f') ? (unsigned)(c1-'a'+10) : 99;
+        lo = (c2 >= '0' && c2 <= '9') ? (unsigned)(c2-'0') : (c2 >= 'a' && c2 <= 'f') ? (unsigned)(c2-'a'+10) : 99;
+        if (hi > 15 || lo > 15) return 0;
+        out[31-b] = (unsigned char)((hi<<4)|lo);   /* display -> wire */
+    }
+    return 1;
+}
+
 static void service_conn(int cfd) {
     size_t cap = 262144;
     char* buf = malloc(cap);
@@ -355,7 +427,33 @@ static void service_conn(int cfd) {
         write(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
     }
 
+    /* longpoll: a getblocktemplate carrying a longpollid waits OFF-THREAD
+     * (see the block comment above lp_waiter) */
+    { int is_lp = 0;
+      for (size_t i = 0; !is_lp && i + 12 <= blen; i++)
+          if (!memcmp(body + i, "\"longpollid\"", 12)) is_lp = 1;
+      if (is_lp){
+          int has_gbt = 0;
+          for (size_t i = 0; !has_gbt && i + 16 <= blen; i++)
+              if (!memcmp(body + i, "getblocktemplate", 16)) has_gbt = 1;
+          if (has_gbt){
+              lp_req_t* r = malloc(sizeof *r);
+              if (r){
+                  r->cfd = cfd; r->buf = buf; r->body_off = (size_t)(body - buf); r->blen = blen;
+                  r->have_prev = lp_extract_prev(body, blen, r->prev);
+                  pthread_t th;
+                  if (bmc_pthread_create(&th, lp_waiter, r) == 0){
+                      pthread_detach(th);
+                      return;                        /* r owns buf + cfd now */
+                  }
+                  free(r);                           /* fall through: serial */
+              }
+          }
+      } }
+    pthread_mutex_lock(&g_exec_lock);
     handle_request(cfd, body, blen);
+    pthread_mutex_unlock(&g_exec_lock);
+    free(buf);
 }
 
 static void* server_thread(void* arg) {

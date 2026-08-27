@@ -21,6 +21,7 @@
 #include "../rpc_json.h"
 #include "../rpc_commands.h"
 #include "../rpc_chain.h"
+#include "../rpc_node.h"      /* rpc_mempool_hooks (the CPFP-selection section) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,6 +139,29 @@ static const char* GENESIS_HASH = "000000000019d6689c085ae165831e934ff763ae46a2a
 static const char* GENESIS_MERKLE = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 
 static unsigned char g_st[4096];
+
+/* bitcoin_mempool_policy.c resolves confirmed prevouts through this hook;
+ * the CPFP section's single-table bitcoin_utxo.asm fixture passes through
+ * (same stub shape as tests/test_mempool_policy.c). */
+extern long utxo_get(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, unsigned long* height,
+                     unsigned long* is_coinbase, const unsigned char** script,
+                     unsigned long* slen);
+long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsigned long index,
+                     unsigned long long* value, const unsigned char** script,
+                     unsigned long* slen){
+    unsigned long h_unused, cb_unused;
+    return utxo_get(u, txid, index, value, &h_unused, &cb_unused, script, slen);
+}
+/* display-order hex of a wire hash (local copy; rpc_chain.c's is static) */
+static void trc_hex_rev(char* out, const unsigned char* b, size_t n){
+    for (size_t i = 0; i < n; i++){
+        static const char* hd = "0123456789abcdef";
+        out[2*i]   = hd[b[n-1-i] >> 4];
+        out[2*i+1] = hd[b[n-1-i] & 15];
+    }
+    out[2*n] = 0;
+}
 
 /* ---- build a txid index over the fixture archive ------------------------
  * Written here rather than by invoking daemon/build_tx_index so the test
@@ -893,6 +917,102 @@ int main(void){
          S(r,"longpollid") && strlen(S(r,"longpollid")) > 64
          && !strncmp(S(r,"longpollid"), S(r,"previousblockhash"), 64));
       rj_free(r);
+
+      /* ---- ancestor-package (CPFP) selection: a real 3-tx pool ----
+       * Slot order is M, P, C (M FIRST). The old parents-first slot-order
+       * emitter returned [M, P, C]; Core's addPackageTxs must return
+       * [P, C, M]: the package {P,C} (fee 5500 over ~122B, ~45 sat/B)
+       * outscores standalone M (~24 sat/B), and C lifts its cheap parent P
+       * (~8 sat/B alone) in with it. Fees are proven through coinbasevalue
+       * (subsidy 5e9 + 7000) and the child's depends[] points at P. */
+      {
+        extern void   mpool_init(void*, unsigned long, void*, unsigned long);
+        extern long   mpool_count(void*);
+        extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+        extern void   utxo_init(void*, unsigned long, void*, unsigned long);
+        extern long   utxo_put(void*, const unsigned char*, unsigned long,
+                               unsigned long long, unsigned long, unsigned long,
+                               const unsigned char*, unsigned long);
+        extern void   mpool_policy_state_init(void*, unsigned);
+        extern void   mpool_policy_init(void*, unsigned long long, unsigned, unsigned,
+                                        unsigned, unsigned, unsigned);
+        extern long   mpool_policy_add(void*, void*, void*, const unsigned char*,
+                                       unsigned long, const unsigned char*, void*);
+        extern long   mpool_policy_entry(void*, const unsigned char*,
+                                         unsigned long long*, unsigned long long*);
+        struct mp_entry_info;
+        extern long   mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
+        extern void   sha256d(unsigned char*, const void*, unsigned long);
+
+        static unsigned char pol[128], stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8], mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8], ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+        mpool_policy_state_init(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+
+        /* two confirmed prevouts */
+        unsigned char prevM[32], prevP[32];
+        memset(prevM, 0xAA, 32); memset(prevP, 0xBB, 32);
+        utxo_put(ux, prevM, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+        utxo_put(ux, prevP, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+
+        /* minimal legacy tx: ver|1in(prev,idx,emptySS)|1out(val,OP_TRUE)|lock */
+        unsigned char txM[64], txP[64], txC[64];
+        unsigned char idM[32], idP[32], idC[32];
+        #define MKTX(buf, id, prev, pidx, val) do{ \
+            unsigned char* q = (buf); \
+            memcpy(q, "\x01\x00\x00\x00", 4); q += 4; \
+            *q++ = 1; memcpy(q, (prev), 32); q += 32; \
+            unsigned v_ = (pidx); memcpy(q, &v_, 4); q += 4; \
+            *q++ = 0; memcpy(q, "\xff\xff\xff\xff", 4); q += 4; \
+            *q++ = 1; unsigned long long a_ = (val); memcpy(q, &a_, 8); q += 8; \
+            *q++ = 1; *q++ = 0x51; \
+            memcpy(q, "\x00\x00\x00\x00", 4); q += 4; \
+            sha256d((id), (buf), (unsigned long)(q - (buf))); }while(0)
+        MKTX(txM, idM, prevM, 0, 98500ULL);   /* fee 1500 */
+        MKTX(txP, idP, prevP, 0, 99500ULL);   /* fee  500 */
+        MKTX(txC, idC, idP,   0, 94500ULL);   /* fee 5000, spends P:0 */
+
+        /* slot order: M FIRST, then P, then C */
+        ck("cpfp: M accepted", mpool_policy_add(pol, stbuf, mp, txM, 61, idM, ux) == 1);
+        ck("cpfp: P accepted", mpool_policy_add(pol, stbuf, mp, txP, 61, idP, ux) == 1);
+        ck("cpfp: C accepted", mpool_policy_add(pol, stbuf, mp, txC, 61, idC, ux) == 1);
+
+        rpc_mempool_hooks h; memset(&h, 0, sizeof h);
+        h.mp = mp; h.polstate = stbuf;
+        h.count = mpool_count; h.get = mpool_get;
+        h.pol_entry = mpool_policy_entry;
+        h.pol_entry_info = mpool_policy_entry_info;
+        h.sha256d = sha256d;
+        rpc_chain_set_mempool(&h, NULL);
+
+        r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+        ck("cpfp gbt dispatched", r && r->typ == RJ_OBJ);
+        rj_val* txs2 = G(r, "transactions");
+        ck("cpfp: all 3 selected", txs2 && txs2->typ == RJ_ARR && txs2->nitems == 3);
+        if (txs2 && txs2->nitems == 3){
+            char hP[65], hC[65], hM[65];
+            trc_hex_rev(hP, idP, 32); trc_hex_rev(hC, idC, 32); trc_hex_rev(hM, idM, 32);
+            const char* t0 = rj_obj_get(txs2->items[0], "txid")->str;
+            const char* t1 = rj_obj_get(txs2->items[1], "txid")->str;
+            const char* t2 = rj_obj_get(txs2->items[2], "txid")->str;
+            ck("cpfp order[0] = P (cheap parent, lifted by its child)", !strcmp(t0, hP));
+            ck("cpfp order[1] = C (the paying child)",                  !strcmp(t1, hC));
+            ck("cpfp order[2] = M (standalone middle feerate LAST)",    !strcmp(t2, hM));
+            rj_val* dep = rj_obj_get(txs2->items[1], "depends");
+            ck("cpfp C.depends = [1] (P's 1-based index)",
+               dep && dep->typ == RJ_ARR && dep->nitems == 1 && !strcmp(dep->items[0]->str, "1"));
+        }
+        ck_str("cpfp coinbasevalue = subsidy + 7000 fees", S(r,"coinbasevalue"), "5000007000");
+        rj_free(r);
+
+        /* restore the empty pool for the sections below */
+        { rpc_mempool_hooks h0; memset(&h0, 0, sizeof h0);
+          rpc_chain_set_mempool(&h0, NULL); }
+      }
 
       /* retarget KATs (frozen reference vectors) */
       ck("retarget same timespan keeps bits", rpc_chain_retarget(0x1d00ffff, 1209600) == 0x1d00ffff);
