@@ -2137,6 +2137,86 @@ static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, con
     return 1;
 }
 
+/* ---- exported descriptor API (wallet management) ---------------------------
+ * rpc_wallet_ops.c's importdescriptors / watch-only wallets need the SAME
+ * parse + CKDpub derivation this file already proved against Core, without a
+ * second engine growing next to it. Three narrow entry points:
+ *
+ *   rpc_desc_normalize  checksum-verify (or append) and classify;
+ *   rpc_desc_expand     h160s to SCAN for over an index range -- the key hash
+ *                       for pkh/wpkh, the P2SH SCRIPT hash for sh(wpkh), i.e.
+ *                       exactly the 20 bytes that appear in the scriptPubKey
+ *                       (wallet_scan.c matches P2WPKH/P2PKH/P2SH by that hash);
+ *   rpc_desc_address_at the address at one index, byte-identical to what
+ *                       deriveaddresses answers (same code path).
+ *
+ * Script types reported: 0 pkh, 1 wpkh, 2 sh(wpkh). Everything else that
+ * parses (pk/tr/combo/addr/raw) is refused for wallet use with a reason --
+ * a watch-only wallet must only claim scripts it can actually recognize in
+ * the chain scan. */
+int rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
+                       char* err, unsigned long errcap){
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
+    memcpy(core, in, cl); core[cl]=0;
+    char cks[9];
+    if (!desc_checksum(core, cks)){ snprintf(err,errcap,"Invalid characters in descriptor"); return 0; }
+    if (hash && (strlen(hash+1)!=8 || strcmp(hash+1,cks))){
+        snprintf(err,errcap,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
+        return 0; }
+    desc_t d; long ec2; const char* em2;
+    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
+    if (d.keytype==2){ snprintf(err,errcap,"private-key descriptors are not supported for import"); return 0; }
+    if (!(d.script==DSC_PKH || d.script==DSC_WPKH || d.script==DSC_SHWPKH)){
+        snprintf(err,errcap,"only pkh/wpkh/sh(wpkh) descriptors can be imported for watching"); return 0; }
+    if (is_range) *is_range = d.ranged;
+    if ((long)snprintf(out, (size_t)cap, "%s#%s", core, cks) >= cap){
+        snprintf(err,errcap,"Descriptor too long"); return 0; }
+    return 1;
+}
+
+long rpc_desc_expand(const char* in, long start, long count,
+                     unsigned char (*h160s)[20], long cap, int* script_type,
+                     char* err, unsigned long errcap){
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return -1; }
+    memcpy(core, in, cl); core[cl]=0;
+    desc_t d; long ec2; const char* em2;
+    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return -1; }
+    if (script_type)
+        *script_type = d.script==DSC_PKH ? 0 : d.script==DSC_WPKH ? 1 : 2;
+    if (!d.ranged){ start = 0; count = 1; }
+    long n = 0;
+    for (long i = start; i < start+count && n < cap; i++, n++){
+        u8 pub[65]; int pl=0;
+        if (!desc_pub_at(&d, i, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return -1; }
+        if (d.script!=DSC_PKH && pl!=33){ snprintf(err,errcap,"Uncompressed key not allowed for wpkh"); return -1; }
+        u8 kh[20]; hash160(kh, pub, pl);
+        if (d.script==DSC_SHWPKH){
+            u8 rd[22]={0x00,0x14}; memcpy(rd+2,kh,20);
+            hash160(h160s[n], rd, 22);           /* the P2SH script hash */
+        } else memcpy(h160s[n], kh, 20);
+    }
+    return n;
+}
+
+int rpc_desc_address_at(const char* in, long idx, char* out, long cap,
+                        char* err, unsigned long errcap){
+    char core[320]; const char* hash = strchr(in, '#');
+    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
+    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
+    memcpy(core, in, cl); core[cl]=0;
+    desc_t d; long ec2; const char* em2;
+    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
+    u8 pub[65]; int pl=0;
+    if (!desc_pub_at(&d, idx, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return 0; }
+    if (!desc_addr_for_pub(d.script, pub, pl, out, cap, &ec2, &em2)){
+        snprintf(err,errcap,"%s", em2); return 0; }
+    return 1;
+}
+
 static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
     long long req;
     if (!rpc_param_i64(params, 0, &req, ec, em)) return 0;
