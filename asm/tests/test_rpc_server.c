@@ -202,7 +202,12 @@ int main(void) {
      * -datadir=, so the wallet's own default address correctly resolves
      * to zero, same as real Core before it's synced. */
     run_cli(port, "bitcoin", "bitcoin", "getbalance", NULL);
-    ck_out("getbalance (no addr index configured, real server)", "0.00000000\n");
+    /* getbalance answers from the wallet RESCAN now (2026-08-27), and this
+     * server has none: "I have not looked" must not be reported as
+     * 0.00000000. Empty stdout, and a -4 on stderr naming what to run. */
+    ck_out("getbalance without a rescan prints nothing (real server)", "");
+    ck("getbalance without a rescan errors naming rescanblockchain (real server)",
+       strstr(err_buf, "-4") && strstr(err_buf, "rescanblockchain"));
 
     /* ============ 3. unknown method -> bitcoin_cli stderr ------------------ */
     run_cli(port, "bitcoin", "bitcoin", "nosuchmethod", NULL);
@@ -274,7 +279,10 @@ int main(void) {
     ck("non-object -32700 parse error",
        has_substr(raw_out, "\"message\":\"Top-level object parse error\""));
 
-    /* ============ 11. V2 notification -> 204 no body (raw) ================= */
+    /* ============ 11. V2 notification -> 204 no body (raw) =================
+     * getbalance FAILS on this server (no rescan), which makes this the
+     * stronger form of the check: a notification gets no response even when
+     * the method errors. That path used to emit a full error body. */
     make_post(req, sizeof req, port, "bitcoin", "bitcoin",
               "{\"jsonrpc\":\"2.0\",\"method\":\"getbalance\",\"params\":[]}", NULL);
     raw_exchange(port, req, strlen(req));
@@ -282,18 +290,23 @@ int main(void) {
     ck("V2 notification no body", strlen(raw_out) == (size_t)(strstr(raw_out, "\r\n\r\n") + 4 - raw_out));
 
     /* ============ 12. V1 request -> both result+error fields (raw) ========= */
+    /* uses a method that SUCCEEDS on a server with no rescan: this case is
+     * about the V1 envelope carrying result AND error:null, not about which
+     * method produced the result. */
     make_post(req, sizeof req, port, "bitcoin", "bitcoin",
-              "{\"id\":1,\"method\":\"getbalance\",\"params\":[]}", NULL);
+              "{\"id\":1,\"method\":\"getnewaddress\",\"params\":[]}", NULL);
     raw_exchange(port, req, strlen(req));
     ck("V1 success envelope has error:null",
-       has_substr(raw_out, "\"result\":\"0.00000000\",\"error\":null,\"id\":1"));
+       has_substr(raw_out, "\"error\":null,\"id\":1") && has_substr(raw_out, "\"result\":\""));
 
     /* ============ 13. wrong method on parametrized - GET handled above ====== */
     /* listunspent, same real-index story as getbalance above: no addr
      * index configured, so the wallet's own default address correctly
      * owns nothing yet -- an empty array. */
     run_cli(port, "bitcoin", "bitcoin", "listunspent", NULL);
-    ck_out("listunspent (no addr index configured, real server)", "[]\n");
+    ck_out("listunspent without a rescan prints nothing (real server)", "");
+    ck("listunspent without a rescan errors naming rescanblockchain (real server)",
+       strstr(err_buf, "-4") && strstr(err_buf, "rescanblockchain"));
 
     /* ============ 14. large request (2026-08-25 transport fix) ============
      * The request buffer was a fixed 256KB stack array that silently
