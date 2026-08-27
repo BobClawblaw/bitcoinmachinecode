@@ -31,6 +31,9 @@ extern long mpool_del(void* mp, const unsigned char txid[32]);
 extern long mpool_count(void* mp);
 extern unsigned long mpool_policy_state_size(unsigned long n);
 extern void mpool_policy_state_init(void* st, unsigned long n);
+extern void mpool_policy_set_poolcap(void* st, unsigned long long cap);
+extern void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*));
+extern long mpool_policy_expire_one(void* st, void* mp, const unsigned char txid[32]);
 
 /* Published to bitcoin_serve.asm, which declares these extern. Defined HERE
  * so the dependency runs C -> asm and not the reverse: when the asm owned
@@ -89,6 +92,8 @@ static unsigned long tx_hash(const unsigned char* txid){
     for(int i=0;i<32;i++){ h ^= txid[i]; h *= 1099511628211UL; }
     return h;
 }
+
+static void mempool_forget(const unsigned char txid[32]);
 
 /* Size the region from Core's -maxmempool (MB). Slots are derived from the
  * byte budget at a conservative ~512B per tx and rounded to a power of two,
@@ -150,7 +155,12 @@ int mempool_configure(void){
       unsigned long psz = mpool_policy_state_size(pn);
       void* ps = mmap(0, psz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
       if (ps!=MAP_FAILED){ mpool_policy_state_init(ps, pn);
+                           mpool_policy_set_poolcap(ps, blob_cap);   /* rolling-decay speed-up thresholds */
                            mp_ext_polstate = ps; mp_ext_polstate_n = pn; } }
+    /* removals (eviction, RBF, expiry, block reconcile) clear their
+     * arrival-time entry through this hook so the parallel table cannot
+     * accumulate ghosts of txs the pool no longer holds. */
+    mpool_policy_set_forget_cb(mempool_forget);
 
     g_seen_mask = slots - 1;
     g_seen = (mp_seen_t*)mmap(0, sizeof(mp_seen_t)*slots, PROT_READ|PROT_WRITE,
@@ -189,11 +199,23 @@ void mempool_note_accept(const unsigned char txid[32]){
     }
 }
 
-/* Evict anything older than -mempoolexpiry hours. Returns entries removed.
- * Safe to call often: it is a linear scan of a bounded table and does nothing
- * when expiry is disabled or the pool is empty. */
+/* Clear one arrival-time entry (the policy layer's removal hook). */
+static void mempool_forget(const unsigned char txid[32]){
+    if(!g_seen) return;
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        if(!e->used) return;
+        if(!memcmp(e->txid, txid, 32)){ e->used = 0; return; }
+    }
+}
+
+/* Evict anything older than -mempoolexpiry hours -- WITH its descendants
+ * and its policy-graph bookkeeping (Core CTxMemPool::Expire; the previous
+ * structural-only delete left descendant txs with phantom parents and
+ * leaked graph slots). Safe to call often. */
 long mempool_expire_now(void){
-    if(!g_seen || !g_mp_area) return 0;
+    if(!g_seen || !g_mp_area || !mp_ext_polstate) return 0;
     long hours = g_cfg.mempoolexpiry_h;
     if(hours <= 0) return 0;
     long cutoff = (long)time(0) - hours*3600;
@@ -202,12 +224,14 @@ long mempool_expire_now(void){
     for(unsigned long i=0;i<=g_seen_mask;i++){
         mp_seen_t* e = &g_seen[i];
         if(!e->used || e->t > cutoff) continue;
-        if(mpool_del(g_mp_area, e->txid) == 1) removed++;
-        e->used = 0;                              /* forget either way */
+        unsigned char txid[32]; memcpy(txid, e->txid, 32);
+        long r = mpool_policy_expire_one(mp_ext_polstate, g_mp_area, txid);
+        if (r > 0) removed += r;
+        else e->used = 0;   /* not in the graph (pre-policy legacy entry) */
     }
     mp_unlock();
     if(removed)
-        fprintf(stderr,"[mempool] expired %ld tx older than %ldh (%ld remain)\n",
+        fprintf(stderr,"[mempool] expired %ld tx older than %ldh incl. descendants (%ld remain)\n",
                 removed, hours, mpool_count(g_mp_area));
     return removed;
 }

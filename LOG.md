@@ -7,6 +7,133 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Mempool policy Core-parity: IMPLEMENTED and differentially proven
+
+All eight survey gaps (next entry down) are closed in
+bitcoin_mempool_policy.c (rewritten around the same flat-buffer state) plus
+surgical changes to daemon/{tx_accept,mempool_cfg,main}.c and rpc_node.c:
+
+ - BLOCK-CONNECT RECONCILIATION: mpool_policy_block_connect (Core
+   removeForBlock + removeConflicts) runs at the worker's per-block choke
+   point under the pool lock: confirmed txs leave pool+graph alone (their
+   children stay), txs conflicting with a block's spends leave WITH their
+   descendants, and the rolling floor's decay gate opens.
+ - PACKAGE EVICTION: TrimToSize evicts argmin of max(own, with-descendants
+   feerate) together with its whole descendant set; with-descendant fee
+   aggregates are maintained incrementally (desc_fee beside desc_cnt/
+   desc_bytes), so eviction stays one O(n) scan. The removed PACKAGE
+   feerate + incrementalrelayfee becomes the floor; an incoming tx that IS
+   the worst is refused "mempool full".
+ - ROLLING MINFEE: sat/kvB, lazy exponential decay per Core's GetMinFee
+   (12h halflife, /2 under half-full, /4 under quarter-full, zero below
+   incrementalrelayfee/2, gated on a block since the last bump; integer
+   q16 table, libm-free). getmempoolinfo's conversion updated.
+ - RBF: signaling checked on the REPLACED txs, only when fullrbf=0 (the
+   old code required the REPLACEMENT to signal -- backwards, and always);
+   conflicts evicted WITH descendants, their fees counted in rule 3;
+   disjointness; no-new-unconfirmed-inputs; <=100 evicted; rule 4 priced
+   at the replacement's own VSIZE. Core's strings throughout.
+ - VSIZE everywhere fee/limit math happens (was raw serialized length).
+ - STANDARDNESS (IsStandardTx + PreChecks order): version 1..3, weight
+   400k, scriptsig 1650/push-only, scriptpubkey classifier (incl. P2A and
+   future witness), datacarrier budget, dust (Core's 148/67-byte spend-
+   cost model, CFeeRate::GetFee never-zero rounding), tx-size-small AFTER
+   the output checks (Core's order -- caught by the unit test), coinbase.
+   New config keys: dustrelayfee, datacarrier, datacarriersize,
+   acceptnonstdtxn (defaults = Core's; the synthetic-fixture vector tests
+   now run under acceptnonstdtxn, Core's own regtest escape hatch).
+ - EXPIRY: descendant packages through the policy layer (the old
+   structural-only delete left children with phantom parents and leaked
+   graph slots); arrival-table ghosts cleared via a removal callback.
+
+PROOF. tests/test_mempool_core_parity: 72 checks over every rule above
+including the reject strings and a white-box decay check.
+tests/mempool_policy_vec.h regenerated from a Core-semantics reference
+model (the old model contained the backwards signaling rule).
+validation/mempool_policy_diff.py: DIFFERENTIAL ADMISSION against the v31
+oracle -- two isolated nodes (the oracle's chain fed to bmc over RPC
+submitblock, no P2P coupling), identical raw txs to both
+sendrawtransactions: 10/10 - simple accept, zero-fee, dust, datacarrier
+(both at -datacarriersize=83), RBF accept + insufficient-fee, 25-deep
+chain both-accept, quiet mempoolminfee equal (oracle pinned to the classic
+minrelay this node implements) -- and the 26th chain link asserted as the
+EXPECTED version delta (v31 cluster limits accept it; classic
+"too-long-mempool-chain" refuses).
+
+KNOWN DELTAS (stated): TRUC/v3 topology, package relay/submitpackage,
+ephemeral anchors, sibling eviction; v31's cluster-mempool chain/eviction
+model (this node implements the classic ancestor/descendant model its
+knobs expose); BIP125 inherited signaling simplified to direct signaling
+(moot under fullrbf, the default); v31's 0.1 sat/vB minrelay default (we
+keep the classic 1 sat/vB); bmc sendrawtransaction has no client-side
+maxfeerate guard (RPC-surface, not admission policy).
+
+MERGE NOTES (for the parent; mining-polish touches the same files): the
+policy-node struct gained raw_len+desc_fee and size became VSIZE;
+MPOL_HDR 64->96 (floor sat/kvB at +48, last-update +56, pool bytes +64,
+blob cap +72, flags +80); MPOL_MAX_PARENTS 16->24. mining-polish's
+mined-tx pruning (utxo_live callback -> bare mpool_del) is SUBSUMED by
+mpool_policy_block_connect, which also cleans the policy graph -- prefer
+this path (a bare mpool_del before it is harmless but redundant). Its
+mpool_policy_set_sigops should graft as one more mpol_node field + a
+txid-lookup setter; pol_entry sizes now report vsize (what
+getmempoolentry wants).
+
+----------------------------------------------------------------------------
+## 2026-08-27 -- Mempool policy Core-parity: gap survey (implementation follows)
+
+Directive: "our mempool policy must be the same as Core". Survey of
+daemon/tx_accept.c + bitcoin_mempool_policy.c against Core's
+validation.cpp MemPoolAccept / txmempool.cpp / policy/{policy,rbf}.cpp
+(read from /storage/bitcoin-core-source, v31 tree). Gaps found, in
+severity order:
+
+ 1. NO BLOCK-CONNECT RECONCILIATION. Nothing removes a confirmed tx (or
+    txs conflicting with a block's spends) from the pool or the policy
+    graph at the new-block choke point -- Core's removeForBlock has no
+    counterpart. Mined txs linger until -mempoolexpiry; RBF conflict
+    scans and ancestor accounting run against ghosts.
+ 2. Eviction is per-LEAF, not per descendant PACKAGE (was documented as a
+    divergence; now closing): Core evicts argmin of max(own feerate,
+    with-descendants feerate) AND its whole descendant set, floors at the
+    removed PACKAGE feerate + incrementalrelayfee.
+ 3. mempoolminfee never DECAYS: Core's rolling floor halves every 12h
+    (faster when the pool is under 1/2 / 1/4 full), zeroes below
+    incrementalrelayfee/2, and only decays once a block has connected
+    since the last bump. Ours is a ratchet.
+ 4. RBF is a sketch, and one rule points the WRONG WAY: we require the
+    REPLACEMENT to signal BIP125; Core requires the REPLACED tx to signal
+    -- and only when fullrbf is off (default on since v28). Missing: rule
+    2 (no new unconfirmed inputs), rule 5 (<=100 evicted incl.
+    descendants), evicting conflicts' DESCENDANTS (we leave children with
+    phantom parents), the disjointness check (we would accept a
+    replacement that spends an output of the tx it evicts), and rule 4
+    charges a flat 1kvB instead of incremental * replacement vsize.
+ 5. Fee arithmetic uses RAW tx length, not VSIZE, everywhere (relay
+    floor, limits, eviction feerates, estimator) -- stricter than Core
+    for witness txs, wrong for parity.
+ 6. Expiry leaks: mempool_expire_now does the structural delete only --
+    policy graph nodes/claims/outreg survive, descendants of expired txs
+    survive with phantom parents (Core expires descendants too).
+ 7. No standardness layer: version bounds, tx-size (weight 400k),
+    tx-size-small (<65), scriptsig-size (1650), scriptsig-not-pushonly,
+    scriptpubkey type check, datacarrier budget, dust (3000 sat/kvB
+    discard rate, 148/67-byte spend-cost model), coinbase-as-tx.
+ 8. Reject strings are homegrown; Core's exact strings ("mempool min fee
+    not met", "min relay fee not met", "bad-txns-inputs-missingorspent",
+    "txn-already-in-mempool", "too-long-mempool-chain", "insufficient
+    fee", "txn-mempool-conflict", "mempool full", ...) surface through
+    RPC and matter for differential testing.
+
+Known deltas that stay (stated, not attempted): TRUC/v3 topology rules,
+package relay/submitpackage, ephemeral anchors, sibling eviction, and the
+v31 oracle's CLUSTER mempool (its TrimToSize evicts linearization chunks
+and its chain limits are cluster limits -- this node targets the classic
+ancestor/descendant model its config knobs expose; differential cases
+where v31 diverges from classic policy are recorded as version-target
+deltas, not failures).
+
+----------------------------------------------------------------------------
 ## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core
 
 The node now runs mainnet OR regtest, selected by Core's own config key
