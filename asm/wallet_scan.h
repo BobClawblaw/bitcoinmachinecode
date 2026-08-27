@@ -36,7 +36,18 @@ typedef struct {
     unsigned int  keyidx;
     unsigned char branch;
     unsigned char prev_txid[32];  /* spend only: the outpoint that was spent */
+    unsigned char is_coinbase;    /* receive only: the tx was its block's
+                                   * first, so the coin needs 100 confirmations
+                                   * before it is spendable. Only a format-3
+                                   * file carries this; see wscan_flags_known */
 } wscan_rec;
+
+/* 1 when the scan file that produced these records was format 3 or newer and
+ * therefore carries a real is_coinbase per record; 0 when it was an older
+ * format, where is_coinbase reads 0 for every record because the flag was
+ * never stored. A balance that must respect coinbase maturity has to know
+ * the difference between "not a coinbase" and "the file cannot say". */
+int wscan_flags_known(void);
 
 /* sha256d, supplied by the linking target (bitcoin_hash.o / sha256.o). */
 void wscan_sha256d(unsigned char out[32], const void* data, unsigned long len);

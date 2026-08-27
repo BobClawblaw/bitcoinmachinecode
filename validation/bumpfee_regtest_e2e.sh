@@ -140,8 +140,10 @@ read -r UTXO_TXID UTXO_VAL <<EOF
 $(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'PY'
 import struct,sys
 d=open(sys.argv[1],'rb').read()
-assert d[:8]==b'BMCWSCN2', "unexpected scan format"
-h,n=struct.unpack('<II',d[8:16]); body=d[16:]; S=86
+# format 3 adds a trailing is_coinbase byte; 2 is still readable
+S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+if not S: sys.exit("unexpected scan format %r" % d[:8])
+h,n=struct.unpack('<II',d[8:16]); body=d[16:]
 for i in range(n):
     r=body[i*S:(i+1)*S]
     ht,=struct.unpack('<I',r[0:4]); val,=struct.unpack('<Q',r[40:48])
@@ -229,6 +231,45 @@ echo "$CORE_POOL" | grep -q "$NEW"  && ok "Bitcoin Core accepted the replacement
                                     || fail "Core does not have the replacement: $CORE_POOL"
 echo "$CORE_POOL" | grep -q "$ORIG" && fail "Core still holds the original" \
                                     || ok "Core dropped the original"
+
+echo "== wallet view (getbalance/listunspent from the rescan, not the addrindex) =="
+# Until 2026-08-27 these read the ADDRESS INDEX, an extension that is OFF by
+# default, so a fully funded wallet reported 0.00000000 with an empty
+# listunspent while walletscan.dat held every receive. They now answer from
+# the scan records probed against the live UTXO set.
+BAL=$(bmc getbalance | jq_ "round(float(d['result'])*1e8)")
+NUTXO=$(bmc listunspent | jq_ "len(d['result'])")
+[ "${BAL:-0}" -gt 0 ] 2>/dev/null && ok "getbalance reports the funded wallet ($BAL sat)" \
+                                  || fail "getbalance is $BAL on a funded wallet"
+[ "${NUTXO:-0}" -gt 0 ] 2>/dev/null && ok "listunspent returns the wallet coins ($NUTXO)" \
+                                    || fail "listunspent empty on a funded wallet"
+
+# the balance must equal the sum of the SPENDABLE entries listunspent reports
+SUM=$(bmc listunspent | jq_ "sum(round(float(u['amount'])*1e8) for u in d['result'] if u['spendable'])")
+[ "$BAL" = "$SUM" ] && ok "getbalance == sum of spendable listunspent entries" \
+                    || fail "getbalance $BAL != spendable sum $SUM"
+
+# a FRESH coinbase is immature: listed, not spendable, and not in the balance
+core generatetoaddress 1 "$ADDR" >/dev/null
+CORE_H2=$(core getblockcount)
+for i in $(seq 30); do
+  [ "$(bmc getblockcount | jq_ "d['result']")" = "$CORE_H2" ] && break; sleep 2
+done
+bmc rescanblockchain '[0]' >/dev/null; sleep 2
+BAL2=$(bmc getbalance | jq_ "round(float(d['result'])*1e8)")
+IMM=$(bmc listunspent | jq_ "sum(1 for u in d['result'] if not u['spendable'])")
+IMMSAT=$(bmc listunspent | jq_ "sum(round(float(u['amount'])*1e8) for u in d['result'] if not u['spendable'])")
+SUM2=$(bmc listunspent | jq_ "sum(round(float(u['amount'])*1e8) for u in d['result'] if u['spendable'])")
+[ "$IMM" -ge 1 ] 2>/dev/null && ok "a fresh coinbase is listed but not spendable ($IMM immature)" \
+                             || fail "immature coinbase not marked unspendable"
+# NOT "the balance is unchanged" -- confirming the replacement legitimately
+# moves it (a coinbase was spent, change came back). The invariant that
+# actually proves exclusion is that the balance still equals the SPENDABLE
+# total while a non-zero immature total sits outside it.
+[ "${IMMSAT:-0}" -gt 0 ] 2>/dev/null && ok "the immature coinbase carries value ($IMMSAT sat)" \
+                                     || fail "immature coin has no value to exclude"
+[ "$BAL2" = "$SUM2" ] && ok "getbalance still excludes the immature coinbase ($BAL2 sat)" \
+                      || fail "getbalance $BAL2 != spendable sum $SUM2"
 
 echo
 [ $FAILURES -eq 0 ] && echo "ALL TESTS PASSED (0 failures)" || echo "FAILURES: $FAILURES"
