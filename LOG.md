@@ -7,6 +7,64 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Wallet management: multi-wallet, watch-only descriptors, Branch-and-Bound
+
+The last big parity category. Three pieces, each riding machinery that
+already existed rather than growing a parallel copy.
+
+MULTI-WALLET (rpc_wallet_ops.c): createwallet / loadwallet / unloadwallet /
+restorewallet / listwallets / listwalletdir are real. Named wallets live
+under wallets/<name>/ beneath the data root (Core's own layout); the default
+wallet stays at the legacy root path, so production is untouched. Every
+wallet file (store, labels, scan journal, abandoned set, descriptors) is
+scoped per-wallet through the ONE path helper all readers already used
+(wop_path). The DIVERGENCE is stated where it bites: exactly one wallet is
+ACTIVE at a time (this node's seed slot, label store and caches are
+single-instance) -- loadwallet switches rather than adding, and its result
+carries a warning saying so. The switched-to seed is installed through the
+SAME installer the encryption unlock path uses (wenc_install_seed,
+registered by the daemon); a process with no installer (standalone rpcd)
+refuses the lifecycle honestly. createwallet with a passphrase is refused
+(at-rest encryption remains a default-wallet feature, wallet_enc_state.c
+being single-instance); named stores are created from a fresh /dev/urandom
+BIP39 mnemonic.
+
+WATCH-ONLY via importdescriptors: createwallet <name> true creates a
+keyless shell; importdescriptors accepts pkh/wpkh/sh(wpkh) descriptors
+(xpub or bare-pubkey key material) through the SAME engine deriveaddresses
+already proved against Core -- rpc_chain.c exports three narrow calls
+(rpc_desc_normalize/expand/address_at) instead of a second parser. The
+descriptor expansion feeds the SAME wscan_key window the HD wallet scans
+with (entry = scriptPubKey hash160; for sh(wpkh) that is the P2SH script
+hash, and wallet_scan.c grew the 23-byte P2SH arm), so rescanblockchain,
+getreceivedbyaddress, listsinceblock and friends work unchanged. Signing
+paths answer Core's exact "Error: Private keys are disabled for this
+wallet". getnewaddress hands out the next descriptor index -- the same
+derivation deriveaddresses answers, so they cannot disagree (asserted
+against the Core-captured vectors in the test).
+
+BRANCH-AND-BOUND (wallet_bnb.c): Core SelectCoinsBnB semantics -- effective
+values, the changeless window [target, target+cost_of_change], descending
+DFS with Core's pruning, waste minimization with the per-input
+(fee_now - fee_long_term) term, 100k-node cap -- pure integer code, no
+globals. Wired ahead of the existing largest-first selector in the funding
+path (sendtoaddress/fundrawtransaction/send/sendall/walletcreatefundedpsbt);
+BnB finding nothing falls back, never fails.
+
+PROOF: tests/test_coinselect_bnb (8 cases incl. multi-coin exact match and
+the waste tie-break); test_rpc_wallet_ops grew the full lifecycle (create/
+dup-create -4/path-escape -8/unload/load-missing -18 with Core's text/
+reload) and a HERMETIC watch-only end-to-end -- the fixture seed's own
+account xpub imported into a fresh watch wallet, rescanned over the fixture
+archive, seeing byte-for-byte the 50 BTC the seed wallet sees at the same
+address. Core ground truth captured live from a scratch regtest oracle
+(error codes/texts; a Core watch-only wallet importing the same key
+material as tpub derives the same witness program and sees the funded
+7.5 BTC). Divergences stated: single-active-wallet; importdescriptors is
+watch-only-scoped; migratewallet/setwalletflag/createwalletdescriptor and
+the pruned-funds pair still refuse with reasons.
+
+----------------------------------------------------------------------------
 ## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core
 
 The node now runs mainnet OR regtest, selected by Core's own config key

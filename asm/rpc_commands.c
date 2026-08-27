@@ -1526,7 +1526,9 @@ static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     static wsl_rec_t recs[WSL_MAX];
     int n = wsl_read(recs, WSL_MAX);
     rj_val* o = rj_obj();
-    rj_obj_set(o, "walletname", rj_str("bmcwallet"));
+    { extern const char* rpc_wops_active_wallet_name(void);
+      const char* wn = rpc_wops_active_wallet_name();
+      rj_obj_set(o, "walletname", rj_str(wn ? wn : "")); }
     rj_obj_set(o, "walletversion", rj_numf("%d", 1));
     rj_obj_set(o, "format", rj_str("bmc"));
     rj_obj_set(o, "txcount", rj_numf("%d", n));
@@ -1534,7 +1536,8 @@ static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
     rj_obj_set(o, "avoid_reuse", rj_bool(0));
     rj_obj_set(o, "scanning", rj_bool(0));
-    rj_obj_set(o, "descriptors", rj_bool(0));
+    { extern int rpc_wops_watchonly(void);
+      rj_obj_set(o, "descriptors", rj_bool(rpc_wops_watchonly() ? 1 : 0)); }
     rj_obj_set(o, "external_signer", rj_bool(0));
     rj_obj_set(o, "blank", rj_bool(w && w->seed ? 0 : 1));
     { rj_val* fl = rj_arr(); rj_obj_set(o, "flags", fl); }
@@ -2660,7 +2663,22 @@ int rpc_dispatch(const char* method, const rj_val* params,
                  rj_val** result, long* err_code, const char** err_msg) {
     *err_code = 0; *err_msg = NULL; *result = NULL;
     if (!strcmp(method, "getnewaddress") || !strcmp(method, "getrawchangeaddress")) {
-        if (!w->seed) { *err_code = 32603; *err_msg = "wallet seed not configured"; return 0; }
+        if (!w->seed) {
+            /* a WATCH-ONLY wallet (multi-wallet, 2026-08-27) hands out the
+             * next unused address of its first imported descriptor -- the
+             * same derivation deriveaddresses answers, so getnewaddress and
+             * deriveaddresses can never disagree */
+            extern int rpc_wops_watchonly(void);
+            extern int rpc_wops_watch_newaddress(char*, long, long*, const char**);
+            if (rpc_wops_watchonly()){
+                char a[128];
+                int r = rpc_wops_watch_newaddress(a, sizeof a, err_code, err_msg);
+                if (r != 1) return 0;
+                *result = rj_str(a);
+                return 1;
+            }
+            *err_code = 32603; *err_msg = "wallet seed not configured"; return 0;
+        }
         return cmd_getnewaddr(method, w, result);
     }
     if (!strcmp(method, "validateaddress") || !strcmp(method, "getaddressinfo"))
