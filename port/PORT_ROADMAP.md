@@ -66,8 +66,13 @@ and runs natively.
           (valid sigs, corrupted z/r/s/Q, out-of-range r/s, r=0/s=0)
           8 seeds, 0 failures. GLV deferred: u2*Q via the verified
           point_scalar_mul (== the kill-switch fallback). (2026-08-25)
-    - [ ] secp256k1_point_ct  (constant-time, for signing only -- NOT needed
-          for IBD/verify; skip for now)
+    - [x] secp256k1_point_ct  (constant-time, for signing only -- now done)
+          -> port/arm64/secp256k1_point_ct.S (pointh_add/pointh_double/
+          point_scalar_mul_ct, complete RCB formulas, branch-free CT ladder;
+          21,255-vector differential vs the variable-time point_scalar_mul AND
+          pure-Python secp256k1, 14 seeds, 0 mismatches incl. edges k=0,1,n-1,n).
+          UNBLOCKS the DAEMONOBJS/ibd daemon link (bitcoind + wallet signing).
+          (2026-08-26)
     - [ ] point_scalar_mul_glv / sc_split_lambda  (perf; deferred)
     - [x] secp256k1_schnorr (BIP340 verify) + bitcoin_pubkey (fe_pow+parse)
           -> port/arm64/secp256k1_schnorr.S + bitcoin_pubkey.S: pubkey_parse

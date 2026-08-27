@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -74,6 +74,12 @@ fuzz_point: fz_point.c secp256k1_point.o secp256k1_fe.o
 	$(CC) $(CFLAGS) -o fz_point fz_point.c secp256k1_point.o secp256k1_fe.o
 fuzz_sc: fz_sc.c secp256k1_scalar.o
 	$(CC) $(CFLAGS) -o fz_sc fz_sc.c secp256k1_scalar.o
+# constant-time point layer (pointh_add/pointh_double/point_scalar_mul_ct):
+# differential fuzz vs the variable-time point_scalar_mul + pure-Python secp256k1
+t_pct: t_pct.c secp256k1_point_ct.o secp256k1_point.o secp256k1_fe.o
+	$(CC) $(CFLAGS) -o t_pct t_pct.c secp256k1_point_ct.o secp256k1_point.o secp256k1_fe.o
+fuzz_pct: t_pct
+	python3 fuzz_pct.py 8 150 ./t_pct
 fuzz_ecdsa: fz_ecdsa.c secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o
 	$(CC) $(CFLAGS) -o fz_ecdsa fz_ecdsa.c secp256k1_ecdsa.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o
 fuzz_schnorr: fz_schnorr.c secp256k1_schnorr.o bitcoin_pubkey.o secp256k1_point.o secp256k1_fe.o secp256k1_scalar.o sha256.o

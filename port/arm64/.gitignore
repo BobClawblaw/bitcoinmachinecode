@@ -50,6 +50,7 @@ fuzz_ustore
 t_undo_asm
 t_undo_c
 t_lsm
+t_pct
 undo_log.o
 lsm_stub.o
 fuzz_undo
