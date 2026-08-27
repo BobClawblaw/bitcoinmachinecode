@@ -46,3 +46,4 @@ test_mempool_evict
 test_chainparams
 test_addr_index_tail
 test_coinselect_bnb
+test_mempool_core_parity

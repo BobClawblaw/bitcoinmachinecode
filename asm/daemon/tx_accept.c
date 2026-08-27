@@ -444,8 +444,19 @@ int tx_policy_init(void){
     unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
     mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
     { extern void mpool_policy_set_incremental(void*, unsigned long long);
+      extern void mpool_policy_set_dust(void*, unsigned long long);
+      extern void mpool_policy_set_datacarrier(void*, unsigned long long);
+      extern void mpool_policy_set_acceptnonstd(void*, unsigned);
       if (g_cfg.incrementalrelayfee_satvb > 0)
-          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb); }
+          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb);
+      if (g_cfg.dustrelayfee_satkvb > 0)
+          mpool_policy_set_dust(g_pol, (unsigned long long)g_cfg.dustrelayfee_satkvb);
+      /* datacarrier=0 == a zero budget: every OP_RETURN output rejected as
+       * "datacarrier" (Core reports "scriptpubkey" for that shape -- close
+       * enough to be honest, stated here). */
+      mpool_policy_set_datacarrier(g_pol, g_cfg.datacarrier
+          ? (unsigned long long)g_cfg.datacarriersize : 0ULL);
+      if (g_cfg.acceptnonstdtxn) mpool_policy_set_acceptnonstd(g_pol, 1); }
     if (mp_ext_polstate){
         /* shared, already mpool_policy_state_init'd once pre-fork -- adopting
          * it (NOT re-initing) is what keeps fee bookkeeping coherent across
@@ -654,6 +665,21 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
         return -26;
     }
     return 1;
+}
+
+/* tx_accept_block_connect: the download worker's per-block mempool
+ * reconciliation (Core removeForBlock + removeConflicts + the rolling-fee
+ * decay gate), called from main.c's new-block choke point with the raw
+ * block bytes. Holds the cross-process pool lock. No-op until the shared
+ * pool + policy state exist. */
+long tx_accept_block_connect(void* mp_area, const unsigned char* block,
+                             unsigned long blen){
+    extern long mpool_policy_block_connect(void*, void*, const unsigned char*, unsigned long);
+    if (!g_pol_ready || !g_pol_state || !mp_area) return 0;
+    mp_lock();
+    long r = mpool_policy_block_connect(g_pol_state, mp_area, block, blen);
+    mp_unlock();
+    return r;
 }
 
 /* log_block_stored_inbound(hash32, height, bytes): called from

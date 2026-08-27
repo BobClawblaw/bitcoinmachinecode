@@ -87,7 +87,11 @@ typedef struct {
     long limitancestorsize_kvb;  /* Core -limitancestorsize (kvB, default 101)*/
     long limitdescendantcount;   /* Core -limitdescendantcount (default 25)  */
     long limitdescendantsize_kvb;/* Core -limitdescendantsize (kvB, def 101) */
-    int  mempoolfullrbf;         /* Core -mempoolfullrbf (default 1)         */
+    int  mempoolfullrbf;
+    long dustrelayfee_satkvb;    /* Core -dustrelayfee (sat/kvB, def 3000)   */
+    int  datacarrier;            /* Core -datacarrier (def 1)                */
+    long datacarriersize;        /* Core -datacarriersize (vbytes, v31:100000)*/
+    int  acceptnonstdtxn;        /* Core -acceptnonstdtxn (def 0)            */         /* Core -mempoolfullrbf (default 1)         */
 
     /* ---- peer sourcing (Core -dnsseed/-seednode/-addnode/-connect) ----
      * Until now the DNS seed list was compiled in and there was no way to

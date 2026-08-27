@@ -2269,21 +2269,6 @@ static unsigned long long blksub_last_seq = 0;
  * and was never re-pointed at it. The asm serve children already prefer
  * mp_ext_area (bitcoin_serve.asm's .mp_external); this makes the worker
  * consistent with them. */
-/* mined-tx pruner for utxo_live's block-connect callback: delete the
- * confirmed tx from the SHARED structural pool under the cross-process lock.
- * The policy registry keeps its (stale) node -- by design; every RPC filters
- * registry entries against the pool (see mpool_policy_entry_info's header). */
-void serve_mined_prune(const unsigned char txid[32]){
-    extern long mpool_del(void*, const unsigned char*);
-    extern void* mp_ext_area;
-    extern void mp_lock(void); extern void mp_unlock(void);
-    void* mp = mp_ext_area;
-    if (!mp) return;
-    mp_lock();
-    mpool_del(mp, txid);
-    mp_unlock();
-}
-
 static void* txsub_pool(void){
     extern void* mp_ext_area;
     return mp_ext_area ? mp_ext_area : (void*)txsub_mp_area;
@@ -2403,12 +2388,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         extern void tx_accept_set_tip(long);
         tx_accept_set_resolver(utxo_live_resolve);
         tx_accept_set_tip(*(int*)(store_buf+24));
-        /* prune just-mined txs from the shared pool at block-connect (see
-         * utxo_live.c g_mined_cb -- before this, only the reorg path did) */
-        { extern void utxo_live_set_mined_cb(void (*)(const unsigned char[32]));
-          extern long mpool_del(void*, const unsigned char*);
-          extern void serve_mined_prune(const unsigned char*);
-          utxo_live_set_mined_cb(serve_mined_prune); }
+        /* Mined-tx pruning happens at the new-block choke point via
+         * tx_accept_block_connect (Core removeForBlock: pool + policy graph
+         * + conflict eviction + minfee decay gate). The earlier
+         * utxo_live_set_mined_cb(serve_mined_prune) registration -- a plain
+         * mpool_del that predated the policy-aware path by hours -- was
+         * removed at the 2026-08-27 policy-parity merge as subsumed;
+         * utxo_live.c keeps the (now unregistered) g_mined_cb plumbing. */
 
         /* ---- coinstats index: continuous gettxoutsetinfo + a standing
          * cryptographic parity instrument. Observers feed it every coin
@@ -3278,6 +3264,24 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         /* address index (extension): ADDs from the block,
                          * DELs/TOUCHes from its undo records */
                         axt_on_block(store_buf, zh, zb, bl);
+                        /* mempool reconciliation (Core removeForBlock):
+                         * confirmed txs leave pool+policy graph, txs
+                         * CONFLICTING with this block's spends leave with
+                         * their descendants, and the rolling minfee floor
+                         * may decay again. Before this call nothing removed
+                         * mined txs at all -- they lingered until
+                         * -mempoolexpiry (LOG.md 2026-08-27 survey #1).
+                         * This SUBSUMES mining-polish's plain mined-tx
+                         * mpool_del callback (it also cleans the policy
+                         * graph and counts conflicts) -- that callback path
+                         * was removed at the 2026-08-27 policy-parity merge. */
+                        { extern long tx_accept_block_connect(void*, const unsigned char*, unsigned long);
+                          extern void* mp_ext_area;
+                          if (txsub_worker_ready() && mp_ext_area){
+                              long mr = tx_accept_block_connect(mp_ext_area, zb, (unsigned long)bl);
+                              if (mr > 0)
+                                  fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                          } }
                         if (!zmqpub_active()) continue;
                         /* The block HASH is sha256d over the 80-byte
                          * header, REVERSED: Core's notifier flips the bytes
