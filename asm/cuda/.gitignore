@@ -1,0 +1,5 @@
+cuda_header_audit
+cuda_txid_reindex
+cuda_autodetect_test
+cuda_bench
+cuda_ecdsa_verify
