@@ -51,3 +51,9 @@ test_rpc_control
 test_rpc_psbtfinal
 test_rpc_wallet_ops
 test_pow_rules
+test_block_filter
+test_multisig_opcount
+test_rpc_signer
+test_taproot_parity
+test_utxo_snapshot
+test_wallet_scan
