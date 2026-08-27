@@ -420,6 +420,16 @@ static long g_nreplaced=0;
 static long g_blk_w0=-1, g_blk_collected=-1;  /* head-of-line window progress */
 static long g_fd_cap[MAXC];         /* current window base each client owns */
 
+/* x86 dlc_fmt_rate (main.c): human-scaled B/KB/MB/GB with "/s" -- byte-for-byte
+ * log parity requires KB/MB/GB scaling, NOT raw "%ldB/s". */
+static void dlc_fmt_rate(char* buf, size_t cap, double bps){
+    const char* unit="B"; double v=bps;
+    if(v>=1024.0*1024.0*1024.0){ v/=1024.0*1024.0*1024.0; unit="GB"; }
+    else if(v>=1024.0*1024.0){ v/=1024.0*1024.0; unit="MB"; }
+    else if(v>=1024.0){ v/=1024.0; unit="KB"; }
+    snprintf(buf,cap,"%.1f%s/s",v,unit);
+}
+
 static void win_reset(struct win* w, long w0, long n){
     memset(w,0,sizeof *w);
     w->w0=w0; w->n=n; w->owner=-1;
@@ -674,7 +684,7 @@ int main(int argc, char** argv){
                 rotate_client(j, hdr);
                 continue;
             }
-            g_client_bytes[j]+=(long)plen;
+            g_client_bytes[j]+=(long)plen;   /* live socket bytes this client read */
             cmd[11]=0;
             if(strncmp(cmd,"block",5)==0){
                 unsigned char hh[32]; block_hash(hh,g_rbuf[j]);
@@ -719,7 +729,7 @@ int main(int argc, char** argv){
                     long b=g_client_served[j];
                     long blkrate=(b-g_blocks_last[j])/DL_TICK; if(blkrate<0)blkrate=0; g_blocks_last[j]=b;
                     long by=g_client_bytes[j]; long byrate=(by-g_bytes_last[j])/DL_TICK; if(byrate<0)byrate=0; g_bytes_last[j]=by;
-                    char bw[16]; snprintf(bw,sizeof bw,"%ldB/s",byrate);
+                    char bw[16]; dlc_fmt_rate(bw,sizeof bw,(double)byrate);
                     char drag[32]="", flag[48]="";
                     if(j==blkowner){
                         if(blkw0==g_blk_w0){
