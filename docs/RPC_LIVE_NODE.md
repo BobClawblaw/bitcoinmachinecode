@@ -837,10 +837,10 @@ the call site. What remains declined, and why, in one place:
   Still refused: **getmempoolcluster** (no cluster mempool).
 - ~~**encryptwallet + multi-wallet lifecycle**~~ — both REAL (encryption
   2026-08-27, the multi-wallet lifecycle the same week). Of the
-  import/export family six remain refused, all needing a path to
-  ADOPT foreign key material a single-seed wallet does not have:
-  `migratewallet`, `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
-  `importprunedfunds`, `removeprunedfunds`.
+  import/export family only **`addhdkey`** remains refused, and its reason is
+  the true one: adopting a foreign HD key needs a key store a single-seed
+  wallet does not have. The other five closed 2026-08-27 (evening) — see
+  slice 24.
   `importdescriptors` is real, and **`exportwatchonlywallet` became real
   2026-08-27 (evening)** — it needs no import path at all, since this
   wallet's entire key set IS the two concrete descriptors it exports
@@ -1292,3 +1292,81 @@ Both strictly more conservative than Core, neither silent:
   so the regtest comparison matches on the token — and says so where it does.
 
 Regtest e2e against Core v31.99: **46 checks, 0 failures.**
+
+## Slice 24 — the wallet refusals that were not refusals — (2026-08-27, evening)
+
+Six wallet RPCs refused with one shared reason: "a single BIP32 seed with no
+import path". For five of them that reason was wrong, or had quietly stopped
+being true as other features shipped.
+
+### The two that Core also refuses
+
+`migratewallet` and `createwalletdescriptor` now answer Core's own verdict.
+Core refuses `migratewallet` on a wallet that is already a descriptor wallet,
+and refuses `createwalletdescriptor` for an address type the wallet already
+has. Both are true of every wallet here, so these are real answers reached
+the same way — not placeholders wearing an error's clothes.
+
+`createwalletdescriptor`'s other three types are refused with the specific
+reason rather than a blanket one. Deriving the KEY for a `tr()` or `pkh()`
+descriptor over the same BIP32 path is trivial; the problem is that the
+rescan matches P2WPKH and `getnewaddress` hands out bech32, so such a
+descriptor would be one in name only and the wallet would silently fail to
+see funds paid to it.
+
+### The pair that imports no keys
+
+`importprunedfunds` / `removeprunedfunds` import no key material at all —
+only the knowledge that an output the wallet already owns exists. That is
+what made them look blocked by a missing import path. Every piece was
+already built and tested:
+
+- the BIP37 proof is verified by `verifytxoutproof`, **called as an RPC
+  rather than reimplemented**, so the partial-merkle-tree walk and the "is
+  this block in our chain" check are the same code the standalone call uses;
+- "is this output ours" is answered by `wscan_spk_h160` against the same key
+  window the rescan uses — exported for this, so the two cannot come to
+  disagree about what the wallet owns;
+- the record set is rewritten through a new `wscan_write`, which owns the
+  on-disk layout and writes the header LAST, so a crash leaves either the
+  previous complete file or the new one, never a half-written record set.
+
+The transaction is decoded by `decoderawtransaction` rather than parsed
+again here — a second transaction parser is not something this file needs.
+
+### The flag that had to do something
+
+`setwalletflag` implements `avoid_reuse` for real. A flag that is stored and
+then ignored is worse than a refusal: it tells the caller the wallet avoids
+reusing addresses when it does not. So `wf_coins` skips a coin whose
+destination this wallet has already spent from (Core's `IsSpentKey`), and
+`getwalletinfo` reports the flag.
+
+### Still refused
+
+`addhdkey` — and the reason is the true one. Adopting a foreign HD key needs
+a key store this single-seed wallet does not have.
+
+### Three refusal texts that had become false
+
+Deleted with the calls that used them. They claimed this node had no
+multi-wallet manager, no encryption path and no rescan — all three shipped
+weeks ago. **A stale refusal is worse than no refusal**: it is a confident,
+specific, wrong explanation, and a reader has no way to tell it from a live
+one.
+
+### Proof
+
+Against a real regtest chain, because "the call succeeded" proves nothing:
+remove a confirmed wallet output and the balance falls by exactly its 50 BTC;
+import it back with a real `gettxoutproof` and the balance returns to the
+satoshi; import the same transaction twice and it does not double-count; hand
+it a garbage proof and it is refused.
+
+The first run of that test passed while doing nothing at all — the coin it
+picked had already been spent by an earlier case, so removing it could not
+change the balance either way. The fixture now requires a mature UNSPENT
+receive. A test that passes for the wrong reason is the failure mode worth
+naming.
+
+Regtest e2e: **54 checks, 0 failures.**
