@@ -127,6 +127,16 @@ node_handshake:
     call p2p_write
     cmp  rax, 24
     jl   .fail
+    ; BIP339: advertise wtxid-based relay (after version, before verack). We
+    ; announce our own txs by txid (universally understood), so we keep no
+    ; per-leg negotiation state -- this only tells the peer it MAY announce
+    ; to us by wtxid, which the relay drain now accepts (MSG_WTX invs).
+    mov  rdi, r12
+    lea  rsi, [rel _wtxidrelay]
+    mov  rdx, 10
+    xor  ecx, ecx
+    xor  r8d, r8d
+    call p2p_write
 .read:
     ; p2p_read(fd, cmd[12], payload, cap, &plen)
     mov  rdi, r12
@@ -287,6 +297,13 @@ node_accept_handshake:
     call p2p_write
     cmp  rax, 24
     jl   .fail
+    ; BIP339 wtxidrelay -- after version, before verack (same as outbound)
+    mov  rdi, r12
+    lea  rsi, [rel _wtxidrelay]
+    mov  rdx, 10
+    xor  ecx, ecx
+    xor  r8d, r8d
+    call p2p_write
     ; send our verack
     mov  rdi, r12
     lea  rsi, [rel _verack]
@@ -2054,6 +2071,7 @@ g_peer_version_len:     dq 0
 section .rodata
 _version: db "version",0
 _verack:  db "verack",0
+_wtxidrelay: db "wtxidrelay",0
 _ping:    db "ping",0
 _pong:    db "pong",0
 _getheaders: db "getheaders",0

@@ -32,6 +32,7 @@ default rel
     extern idx_get
     extern idx_put
     extern store_append
+    extern block_strip_witness
     extern idxscan_append_locked
     extern store_validates_prevhash
     extern cons_verify
@@ -712,6 +713,36 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jle  .gd_next
+    ; BIP144: a bare MSG_BLOCK (witness flag 0x40000000 CLEAR) from a strict
+    ; pre-segwit peer wants the STRIPPED serialization -- it cannot parse the
+    ; segwit marker/flag bytes in the full form. The type u32 is still at
+    ; [rbx]; if the witness bit is set (MSG_WITNESS_BLOCK) send sb_buf as is,
+    ; else strip into bt_buf (free inside this arm) and send that. Length
+    ; from node_serve_block is in eax.
+    mov  ecx, [rbx]
+    test ecx, 0x40000000
+    jnz  .gdb_send_full         ; witness requested: full block
+    ; block_strip_witness(sb_buf, len, bt_buf, 8<<20) -> stripped len / 0
+    mov  [s_ptr], rbx
+    lea  rdi, [sb_buf]
+    movsxd rsi, eax
+    lea  rdx, [bt_buf]
+    mov  rcx, (8<<20)
+    call block_strip_witness
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jle  .gd_next               ; strip failed -> serve nothing (never a wrong form)
+    mov  r8d, eax
+    mov  [s_ptr], rbx
+    mov  rdi, r12
+    lea  rsi, [cn_block]
+    mov  rdx, 5
+    lea  rcx, [bt_buf]
+    call p2p_write
+    mov  rbx, [s_ptr]
+    add  qword [s_served], 1
+    jmp  .gd_next
+.gdb_send_full:
     mov  r8d, eax           ; block length (p2p_write arg5 = r8)
     ; p2p_write(fd,"block",5,sb_buf,len)
     mov  [s_ptr], rbx
