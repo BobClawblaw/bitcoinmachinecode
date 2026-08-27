@@ -45,3 +45,4 @@ test_mempool_evicttest_chainparams
 test_mempool_evict
 test_chainparams
 test_addr_index_tail
+test_coinselect_bnb
