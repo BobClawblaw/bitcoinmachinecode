@@ -185,9 +185,26 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …). As of 2026-08-27 the live binary is
-  **`bitcoind.deploy-20260827r`** (regtest merge `7acf207` — inert on
-  mainnet), which also moved the asm logger to the per-chain
-  `logs/bitcoind.log` (`data/logs/` in production).
+  **`bitcoind.deploy-20260827w`**; the rollback one step back is
+  `…-20260827v`.
+
+  The three that changed live behaviour most, newest first:
+  - **`w`** (`385c9bb`) — `submitpackage` real; `gettxout` answers via the
+    download-worker IPC; `getbalance`/`listunspent` answer from the wallet
+    rescan. Verified live: `submitpackage` returns Core's `-8` parameter
+    errors rather than the old `-1` refusal, and `gettxout` returns a real
+    coin whose value and scriptPubKey match the block.
+  - **`v`** (`8c19627`) — the `gettxout` IPC and the `connect=` per-peer
+    port fix. Before this, `gettxout` answered `null` for every outpoint on
+    the live node, which does not mean "unknown" — it means "spent".
+  - **`u`** (`d291510`) — **nBits schedule enforcement** (`bad-diffbits`).
+    A consensus change: watch the first blocks after this kind of deploy for
+    a `bad-diffbits` reject, and roll back to the previous snapshot if one
+    appears. None did — 32 blocks applied cleanly on the first run.
+
+  A consensus-affecting deploy earns a look at the log before you walk away;
+  the earlier letters (`o`–`t`) were mempool management, wallet encryption
+  and chain selection, all of which are inert on mainnet or additive.
 - **Never `cp` onto the running binary path** (`cp new daemon/bitcoind` while
   the service runs) — that is `ETXTBSY`. `make`/`ld` is fine because it
   unlinks first; a plain `cp` is not. Stop first, or write to a new name.

@@ -97,10 +97,29 @@ closes most of what `FEATURE_GAPS.md` still listed as absent:
 - **P2P completeness.** BIP339 `wtxidrelay`, `MSG_WITNESS_*` block/tx fetching
   with witness-only peer preference, stripped-block serving to legacy peers,
   and self-address advertisement (`daemon/addr_self.c`).
+- **Difficulty-schedule enforcement (`bad-diffbits`).** Every block's `nBits`
+  must be exactly what Core's `GetNextWorkRequired` demands for its height,
+  checked at apply AND in fork evaluation, through one rule engine
+  (`asm/bitcoin_pow_rules.c`) that `getblocktemplate` also uses — so a
+  template this node builds is by construction one its own validator accepts.
+  Replayed against **every header of the real mainnet chain** (964,265
+  heights, 478 retarget boundaries) and the real testnet4 chain (149,954
+  heights, 101,009 min-difficulty blocks, 16,491 walk-back re-anchors), exact
+  on both. This closed a gap `daemon/reorg.c` had documented against itself.
+- **Fee bumping and packages.** `bumpfee`/`psbtbumpfee` follow Core's
+  feebumper arithmetic, and `submitpackage` accepts a parent that is below
+  the relay floor when its child pays for it (Core's effective feerate).
+  Both are proven against a real Core on regtest, which accepts the identical
+  replacement and the identical package
+  (`validation/bumpfee_regtest_e2e.sh`).
+- **`gettxout` answers from the live UTXO set.** The RPC runs in the serve
+  parent, which holds no handle on that set, so it asks the download worker
+  over a socketpair. Before this it returned `null` for every outpoint —
+  which does not mean "unknown", it means "spent".
 
 Configuration, running modes, and a precise **"exactly like Core vs.
 deliberately different"** ledger are documented in their own sections below.
-Full test suite: **189 harnesses, 0 failures** (`make -k test`).
+Full test suite: **223 harnesses, 0 failures** (`make -k test`).
 
 ---
 

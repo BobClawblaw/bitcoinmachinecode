@@ -223,6 +223,46 @@ gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
 etc. — are similarly built ad hoc; see each file's header for the intended
 link set, or the `.gitignore` for the expected output names.)
 
+### 2.3b Calling an asm symbol from C: check the real contract
+
+Four separate bugs on 2026-08-27 came from C declaring an asm symbol
+differently from what the asm actually does. The compiler cannot catch any of
+them, and every one passed the whole test suite:
+
+| symbol | asm truth | what C claimed | consequence |
+|---|---|---|---|
+| `utxo_lsm_walk` | returns `long` | implicit → `int` | live count truncated to 32 bits |
+| `csi_read_file` | defined later in the file | implicit | six pointer args unchecked |
+| `tx_txid` | returns `int` (`.fail` is `xor eax,eax`) | `void` in two files | a failed txid computation was invisible; the unwritten buffer was then used to evict mempool entries |
+| `tx_wtxid` | sets **no** return value | `int`, checked `!= 1` | read whatever was in `rax`; silently dropped every `submitpackage` result |
+
+So, before declaring one: read the asm's return path. `xor eax, eax` on a
+failure label means it returns a value and you must check it. No `eax`/`rax`
+write before `ret` means it returns nothing and you must not.
+
+Two of these were only found because a change gave a previously-infallible
+path a real failure mode. Prefer one declaration per symbol in a shared
+header over a local `extern` per file; where the codebase already has a
+declaration, adopt it rather than writing a second one.
+
+### 2.3c Adding a call to a widely-linked object
+
+`rpc_node.o` is linked by roughly a dozen targets. Adding one `tx_wtxid` call
+to it broke **ten** of them at link time — the daemon built fine, because the
+daemon happens to link `bitcoin_cmpct.o`. Only `make -k test` shows this.
+
+The codebase's convention for an optional dependency is
+`__attribute__((weak))` plus a guard that refuses when the symbol is absent
+(`bitcoin_mempool_policy.c` does this for `tx_parse`/`tx_txid`). Prefer that
+to adding an object to a dozen link lines. Put the guard AFTER parameter
+validation, so a malformed call still gets the normal error in every build.
+
+Related, same family: a new `daemon/*.c` must be added to `DIALSRCS` too
+(anything `#include`-ing `daemon/main.c` as a TU), and an object must appear
+in exactly ONE of the bundles that get linked together — `bitcoin_pow_rules.o`
+in both `DAEMON_RPCOBJS` and `DAEMONSRCS` produced "multiple definition" and
+a daemon that would not link.
+
 ### 2.4 Randomized ctypes stress (optional, shared-lib targets)
 
 ```bash
