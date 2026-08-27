@@ -1688,8 +1688,12 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         /* a package-level rejection is reported on EVERY entry, because none
          * of them got an individual verdict -- that is what Core's
          * package-error means */
+        /* "transaction failed" is the one package_msg that means "the
+         * members were each judged, look at their own verdicts". Everything
+         * else -- ill-formed package, TRUC violation -- is a statement about
+         * the package as a whole, and Core gives no member an `allowed`. */
         int pkg_failed = (pmsg[0] && strcmp(pmsg, "success") != 0);
-        int pkg_level  = pkg_failed && strncmp(pmsg, "package", 7) == 0;
+        int pkg_level  = pkg_failed && strcmp(pmsg, "transaction failed") != 0;
         for (int i = 0; i < n; i++){
             rj_val* e = rj_obj();
             unsigned char id[32], wid[32];

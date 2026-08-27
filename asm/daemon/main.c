@@ -2478,6 +2478,8 @@ static int txsub_package(char* msg, unsigned long mcap){
     extern int mpol_package_well_formed(const unsigned char* const*, const unsigned long*,
                                         int, unsigned char*, unsigned long long*, const char**);
     extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void mpol_package_context(const unsigned char* const*, const unsigned long*,
+                                     const unsigned char*, int);
     extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*,
                                       const unsigned char*, int);
     extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*,
@@ -2524,6 +2526,10 @@ static int txsub_package(char* msg, unsigned long mcap){
     /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
     unsigned long long tot_fee = 0, tot_vsize = 0;
     int all_ok = 1;
+    int truc_violation = 0;
+    /* membership as well as prevouts: the overlay lets a child RESOLVE its
+     * parent, but TRUC has to know the parent is in the package at all. */
+    mpol_package_context(txs, lens, txids, n);
     txacc_package_overlay(txs, lens, txids, n);
     for (int i = 0; i < n; i++){
         char r[128]; r[0] = 0; unsigned long long fee = 0;
@@ -2539,15 +2545,32 @@ static int txsub_package(char* msg, unsigned long mcap){
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
             if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
-            else all_ok = 0;      /* not something a package can rescue */
+            else {
+                all_ok = 0;      /* not something a package can rescue */
+                /* A TRUC violation is a statement about the package's SHAPE,
+                 * so Core rejects the package as a whole and gives no member
+                 * an individual verdict. Reporting it against one member
+                 * would say the others were fine, which is not what was
+                 * decided. */
+                if (!strcmp(r, "TRUC-violation")) truc_violation = 1;
+            }
         }
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
 
     if (!all_ok){
         mpol_package_fee_context(0, 0);
-        snprintf(msg, mcap, "transaction failed");
         st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
+        if (truc_violation){
+            snprintf(msg, mcap, "TRUC-violation");
+            for (int i = 0; i < n; i++){
+                st->pkg_result[i] = 0;
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+            }
+            return 0;
+        }
+        snprintf(msg, mcap, "transaction failed");
         return 0;
     }
 
@@ -2564,6 +2587,7 @@ static int txsub_package(char* msg, unsigned long mcap){
         st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
         int all_pass = 1;
         mpol_package_fee_context(tot_fee, tot_vsize);
+        mpol_package_context(txs, lens, txids, n);
         txacc_package_overlay(txs, lens, txids, n);
         for (int i = 0; i < n; i++){
             char r[128]; r[0] = 0; unsigned long long fee = 0;
@@ -2578,6 +2602,7 @@ static int txsub_package(char* msg, unsigned long mcap){
             }
         }
         txacc_package_overlay(NULL, NULL, NULL, 0);
+        mpol_package_context(NULL, NULL, NULL, 0);
         mpol_package_fee_context(0, 0);
         snprintf(msg, mcap, "success");   /* package-level verdict; per-member above */
         return all_pass;
@@ -2586,6 +2611,7 @@ static int txsub_package(char* msg, unsigned long mcap){
     /* ---- pass 2: commit, with the package feerate in effect -------------- */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
+    mpol_package_context(txs, lens, txids, n);
     txacc_package_overlay(txs, lens, txids, n);
     for (int i = 0; i < n; i++){
         char r[128]; r[0] = 0; int relayed = 0;
@@ -2618,6 +2644,7 @@ static int txsub_package(char* msg, unsigned long mcap){
      * ordinary single-transaction traffic, and an overlay left set would let
      * an unrelated transaction resolve against a package member. */
     txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
 
     st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
