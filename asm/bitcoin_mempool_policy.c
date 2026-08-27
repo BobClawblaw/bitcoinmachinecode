@@ -1001,8 +1001,12 @@ long mpool_policy_test(mpol_cfg* pol, void* st, void* mp,
  * daemon always links them. */
 extern int  tx_parse(unsigned char info[64], const unsigned char* p, unsigned long cap)
     __attribute__((weak));
-extern void tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long len,
-                    unsigned char* scratch, unsigned long scratch_cap)
+/* RETURNS int (1 ok / 0 malformed) -- bitcoin_tx.asm's .fail path is
+ * `xor eax, eax`. This was declared void here and in daemon/reorg.c, which
+ * made that failure structurally invisible to both callers: on a malformed
+ * transaction they would have carried on with an unwritten txid buffer. */
+extern int tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long len,
+                   unsigned char* scratch, unsigned long scratch_cap)
     __attribute__((weak));
 
 long mpool_policy_block_connect(void* st, void* mp,
@@ -1021,7 +1025,8 @@ long mpool_policy_block_connect(void* st, void* mp,
         if (tx_parse(info, p, (unsigned long)(end - p)) != 1) return removed;
         uint64_t txlen; memcpy(&txlen, info, 8);
         unsigned char txid[32];
-        tx_txid(txid, p, (unsigned long)txlen, scratch, sizeof scratch);
+        /* a txid we could not compute must not be used to evict anything */
+        if (tx_txid(txid, p, (unsigned long)txlen, scratch, sizeof scratch) != 1) return removed;
         if (j > 0){
             /* the confirmed tx leaves alone; txs CONFLICTING with its spends
              * leave with their descendants */
@@ -1153,5 +1158,96 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
               if (sp < MPE_MAX_SET) stack[sp++] = i;
           }
       } }
+    return 1;
+}
+
+/* ==========================================================================
+ * PACKAGE policy -- context-free checks (Core policy/packages.cpp).
+ *
+ * These are the checks that need no chain state: they look only at the
+ * transactions handed in together. Everything stateful (in-package parent
+ * resolution, package feerate) is layered on top elsewhere; this is the part
+ * that can be settled by reading the bytes.
+ *
+ * Lives here rather than in a new file so it reuses parse_tx -- the same
+ * walker the single-transaction policy path uses. A second parser is how a
+ * package and a lone transaction start disagreeing about what a transaction
+ * IS, which is exactly the class of bug this module exists to avoid.
+ *
+ * Reason strings are Core's, verbatim, so a caller can diff them.
+ * ========================================================================== */
+#define PKG_MAX_COUNT   25
+#define PKG_MAX_WEIGHT  404000
+
+/* 1 = well formed. 0 = not, with *reason set to Core's exact string.
+ * txids_out (optional, n*32 bytes) receives each transaction's txid in wire
+ * order so a caller that already needs them does not walk the package twice. */
+int mpol_package_well_formed(const unsigned char* const* txs,
+                             const unsigned long* lens, int n,
+                             unsigned char* txids_out, const char** reason){
+    static const char* dummy; if (!reason) reason = &dummy;
+    *reason = "";
+    if (n <= 0){ *reason = "package-not-sorted"; return 0; }   /* nothing sane to say */
+    /* tx_txid is weak here (targets link this file without bitcoin_tx.o). No
+     * txids means no duplicate or topology check, and answering "well formed"
+     * without having run them would be a lie. */
+    if (!tx_txid){ *reason = "package-checks-unavailable"; return 0; }
+    if (n > PKG_MAX_COUNT){ *reason = "package-too-many-transactions"; return 0; }
+
+    static unsigned char txid[PKG_MAX_COUNT][32];
+    static unsigned char prev[MPOL_MAX_IN][32];
+    static uint32_t idx[MPOL_MAX_IN], seq[MPOL_MAX_IN];
+    /* every input of every tx, kept for the conflict and topology passes */
+    static unsigned char all_prev[PKG_MAX_COUNT][MPOL_MAX_IN][32];
+    static uint32_t all_idx[PKG_MAX_COUNT][MPOL_MAX_IN];
+    static int all_n[PKG_MAX_COUNT];
+
+    unsigned long long total_weight = 0;
+    static unsigned char scratch[1 << 20];
+    for (int i = 0; i < n; i++){
+        mpol_txmeta m;
+        int n_in = parse_tx(txs[i], lens[i], prev, idx, seq, &m);
+        /* A malformed member is not a package-policy failure -- Core would
+         * have rejected it in CheckTransaction long before this. Say what is
+         * true rather than inventing a package reason for it. */
+        if (n_in <= 0){ *reason = "package-contains-unparseable-transaction"; return 0; }
+        total_weight += m.weight;
+        all_n[i] = n_in;
+        for (int k = 0; k < n_in; k++){ memcpy(all_prev[i][k], prev[k], 32); all_idx[i][k] = idx[k]; }
+        if (tx_txid(txid[i], txs[i], lens[i], scratch, sizeof scratch) != 1){
+            *reason = "package-contains-unparseable-transaction"; return 0; }
+        if (txids_out) memcpy(txids_out + (size_t)i * 32, txid[i], 32);
+    }
+
+    /* A single transaction reports its own weight violation, not a package
+     * one -- Core is explicit that this reads better for the caller. */
+    if (n > 1 && total_weight > PKG_MAX_WEIGHT){ *reason = "package-too-large"; return 0; }
+
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (!memcmp(txid[i], txid[j], 32)){ *reason = "package-contains-duplicates"; return 0; }
+
+    /* TOPOLOGY: parents must precede children. Core keeps a set of "this tx
+     * and everything after it" and fails if an input names anything in it --
+     * note the current tx's OWN txid is still present while its inputs are
+     * checked, so a transaction spending itself is caught here too. */
+    for (int i = 0; i < n; i++)
+        for (int k = 0; k < all_n[i]; k++)
+            for (int j = i; j < n; j++)          /* j starts at i, deliberately */
+                if (!memcmp(all_prev[i][k], txid[j], 32)){ *reason = "package-not-sorted"; return 0; }
+
+    /* CONFLICTS: no two transactions may spend the same outpoint. Inputs are
+     * compared ACROSS transactions only -- Core batch-adds each tx's inputs
+     * after checking it, precisely so a duplicate input WITHIN one tx is not
+     * reported here; that is a consensus error (bad-txns-inputs-duplicate)
+     * and belongs to CheckTransaction. Comparing one input at a time would
+     * silently relabel it. */
+    for (int i = 0; i < n; i++)
+        for (int k = 0; k < all_n[i]; k++)
+            for (int j = 0; j < i; j++)
+                for (int q = 0; q < all_n[j]; q++)
+                    if (all_idx[i][k] == all_idx[j][q] &&
+                        !memcmp(all_prev[i][k], all_prev[j][q], 32)){
+                        *reason = "conflict-in-package"; return 0; }
     return 1;
 }
