@@ -33,12 +33,12 @@ WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
 WORK=${WORK:-/tmp/bumpfee-e2e-$$}
 CORE_DIR=$WORK/core
 BMC_DIR=$WORK/bmc
-# CORE_P2P MUST be regtest's DEFAULT 18444: this node accepts connect= only on
-# a chain's default P2P port and logs+ignores any other ("only a chain's
-# default P2P port ... is supported for named peers"), unlike Core which takes
-# any host:port. Pick that wrong and bmc simply never dials, sitting at tip=0.
-# Core also binds P2P+1 (18445) as its tor target, so keep 18445 free too.
-CORE_P2P=18444; CORE_RPC=19460
+# Deliberately a NON-default regtest P2P port. Until 2026-08-27 this node
+# honoured connect= only on a chain's default port and logged+ignored any
+# other, so bmc never dialled and sat at tip=0 with peers=0/0; running this
+# script on a non-default port is therefore also a regression test for that
+# fix. (Core binds P2P+1 as its tor target, so leave the next port free.)
+CORE_P2P=19444; CORE_RPC=19460
 BMC_P2P=19555;  BMC_RPC=19446
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 
@@ -102,8 +102,9 @@ echo "  core up (pid $CORE_PID)"
 # data/bmcwallet.dat relative to CWD, so give it a throwaway CWD.
 mkdir -p "$WORK/wgen/data"
 ( cd "$WORK/wgen" && "$WALLET_CLI" init >/dev/null 2>&1 )
+[ -s "$WORK/wgen/data/bmcwallet.dat" ] || { echo "wallet_cli init produced no wallet (is $WALLET_CLI built?)"; exit 2; }
 mkdir -p "$BMC_DIR/regtest"
-cp "$WORK/wgen/data/bmcwallet.dat" "$BMC_DIR/regtest/bmcwallet.dat"
+cp "$WORK/wgen/data/bmcwallet.dat" "$BMC_DIR/regtest/bmcwallet.dat" || exit 2
 
 ( cd /storage/bitcoinmachinecode/asm && nohup "$BMC_BIN" serve "$BMC_DIR" \
     > "$WORK/bmc.log" 2>&1 & echo $! > "$WORK/bmc.pid" )
@@ -114,6 +115,7 @@ echo "  bmc up (pids $BMC_PIDS)"
 
 ADDR=$(bmc getnewaddress | jq_ "d['result']")
 CHANGE=$(bmc getrawchangeaddress | jq_ "d['result']")
+[ -n "$ADDR" ] && [ -n "$CHANGE" ] || { echo "wallet did not load (no seed); see $WORK/bmc.log"; exit 2; }
 echo "  wallet receive=$ADDR change=$CHANGE"
 
 echo "== fund: 101 blocks to the wallet, so a mature coinbase is spendable =="
