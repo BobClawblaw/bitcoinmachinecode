@@ -58,3 +58,4 @@ test_taproot_parity
 test_utxo_snapshot
 test_wallet_scan
 test_txoq_ipc
+test_package_policy
