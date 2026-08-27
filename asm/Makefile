@@ -98,6 +98,7 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_poin
 # linked-but-not-a-prerequisite.
 DAEMON_RPCOBJS := rpc_server.o rpc_commands.o rpc_chain.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o rpc_json.o rpc_net.o rpc_node.o \
     rpc_wallet_ops.o wallet_labels.o wallet_scan.o wallet_scan_hash.o \
+    daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c \
     bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
 
 .PHONY: all asm test clean abi-check callee-saved-check prereq-check
@@ -1641,7 +1642,7 @@ RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
 # path), bitcoin_idx.o (hash->height), bitcoin_tx.o (tx_txid), bitcoin_chainwork.o
 # (block_work/chainwork_add fallback when chainwork.dat is absent).
 RPCCHAIN := rpc_chain.o block_filter.o bip32_ckdpub.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
-RPCLIBS := wallet_core.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o rpc_wallet_ops.o wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c $(RPCCHAIN)
+RPCLIBS := wallet_core.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o rpc_wallet_ops.o wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN)
 
 # rpc_wallet_ops.o -- the rest of Core's Wallet category (labels, wallet
 # inventory, output locks, signmessage, descriptor reporting, and the
@@ -1795,10 +1796,8 @@ tests/test_rpc_signraw: tests/test_rpc_signraw.c rpc_commands.o rpc_json.o $(RPC
 # descriptor reporting). Isolated: it writes a label store and a stand-in
 # wallet file by bare relative name.
 tests/test_rpc_wallet_ops: tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o $(RPCLIBS) \
-    daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c \
     $(TEST_TMPDIR_H) rpc_wallet_ops.h rpc_commands.h rpc_chain.h rpc_json.h
-	$(CC) -no-pie -O2 -o $@ tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o $(RPCLIBS) \
-	    daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c -lpthread
+	$(CC) -no-pie -O2 -o $@ tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 tests/test_rpc_node: tests/test_rpc_node.c rpc_node.o rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c mempool_entry.h
 	$(CC) -no-pie -O2 -o $@ tests/test_rpc_node.c rpc_node.o rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c -lpthread
@@ -1870,7 +1869,7 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # bitcoin_chainwork.o for the cumulative-work primitives they run on.
 DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/block_witness.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/reorg.c \
     daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
-    daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/blk_submit.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/wallet_crypter.c daemon/wallet_enc_state.c bitcoin_aes.c wallet_store.c \
+    daemon/net_policy.c daemon/node_config.c daemon/mempool_cfg.c daemon/upload_cap.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/blk_submit.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c wallet_store.c \
     bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c wallet_msgsign.c
 # Embedded RPC server (docs/RPC_LIVE_NODE.md): DAEMON_RPCOBJS is defined near
