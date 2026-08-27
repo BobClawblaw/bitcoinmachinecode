@@ -18,8 +18,19 @@
 
 A Bitcoin node for Linux built as **100% AI-generated machine code** — every line of
 assembly is authored by an AI assistant, none by a human. The security-critical
-crypto (SHA-256, secp256k1 field/point/scalar/ECDSA) is written directly in x86-64
-assembly.
+crypto (SHA-256, SHA-512, secp256k1 field/point/scalar/ECDSA/Schnorr, AES-256) is
+written directly in x86-64 assembly.
+
+It is a **full node**, not a demo: it does headers-first IBD and full-signature
+block validation (genesis to within a few hundred blocks of the live tip, no
+`assumevalid`), maintains a chain-scale LSM UTXO set proven byte-identical to
+Bitcoin Core's, follows the mainnet tip unattended, relays transactions through
+a Core-style mempool, serves Core's JSON-RPC surface, maintains the
+`txindex` / `coinstatsindex` / `blockfilterindex` optional indexes, has an
+HD/BIP39 wallet with at-rest encryption, and can run on **mainnet or regtest**.
+What it does *not* do — and what it does *differently* from Core on purpose — is
+spelled out in **`FEATURE_GAPS.md`** and the *Exactly like Core vs. deliberately
+different* section below.
 
 ## Where to look
 
@@ -38,7 +49,62 @@ assembly.
 
 ## Status
 
-**Current state (2026-08-25). The UTXO set is byte-identical to Bitcoin
+**Current state (2026-08-27). A live full node on mainnet with the Core RPC
+surface, all three optional indexes, a Core-style mempool, wallet-at-rest
+encryption, and a regtest mode proven block-for-block against Bitcoin Core.**
+
+The daemon (`bmc-bitcoind`) follows the mainnet tip unattended and is verified
+continuously against a local Core node. On top of the byte-identical UTXO set
+and the RPC surface described in the 2026-08-25 note below, the work since then
+closes most of what `FEATURE_GAPS.md` still listed as absent:
+
+- **Transaction relay + mempool, the way Core runs it.** Announced txs are
+  fetched witness-complete and admitted through the *consensus* verifier
+  (`daemon/tx_verify.c`: legacy + full taproot, confirmed set + in-mempool
+  parents, tip-anchored maturity), parked in an **orphan pool** when a parent
+  is missing, and **re-announced** to peers. The pool is a byte-budgeted
+  (`maxmempool`) structure that **evicts** the lowest-feerate transactions when
+  full — Core's `TrimToSize` — raises a **dynamic `mempoolminfee`** as it
+  evicts, and reclaims freed bytes by compacting its blob
+  (`daemon/mempool_compact.c`). Ancestor/descendant limits, `minrelaytxfee`,
+  `incrementalrelayfee`, and `mempoolfullrbf` are all read from `bitcoin.conf`
+  at Core's own defaults. (This replaced an earlier "reject when full" pool
+  that froze production at exactly 4096 entries; both the immediate hotfix and
+  the real eviction fix shipped 2026-08-27, `LOG.md`.)
+- **All three optional indexes.** `txindex` (offline base build + a
+  daemon-maintained tail, so `getrawtransaction <txid>` works with no block
+  hash), `coinstatsindex` (a per-block incremental MuHash fold, proven
+  character-identical to Core's at a height folded incrementally, so
+  `gettxoutsetinfo muhash` answers in ~33 ms instead of a full walk), and
+  `blockfilterindex` (whole-chain BIP157/158 basic filters **and** their header
+  chain, tip-following).
+- **Wallet at-rest encryption.** `encryptwallet` / `walletpassphrase` /
+  `walletpassphrasechange` / `walletlock`, sealing the wallet's BIP39 mnemonic
+  under Core's `BytesToKeySHA512AES` key derivation over an AES-256-CBC
+  container (FIPS-197 block cipher in `asm/bitcoin_aes.c`, proven byte-identical
+  to OpenSSL's KDF). The live RPC seed is gated behind an unlock timer.
+- **Regtest chain selection.** `chain=regtest` (or `regtest=1`) in
+  `bitcoin.conf` switches the node to Core's regtest network — its magic,
+  genesis, ports, no-retargeting difficulty rule, 150-block halving, and
+  everything-active-from-height-1 script schedule. Each chain lives in its own
+  datadir subtree (`<datadir>/regtest/`, logs under `logs/` with a chain-tagged
+  filename) so state can never cross chains. **Differentially proven against a
+  scratch Core regtest node:** bmc synced 160 Core-mined blocks with all 161
+  block hashes byte-identical, its `gettxoutsetinfo muhash` identical to Core's,
+  a block built from **bmc's own `getblocktemplate`** was CPU-mined and
+  **accepted by Core** via `submitblock`, it followed Core's tip live, and a
+  Core wallet transaction relayed into bmc's mempool over the wire.
+- **P2P completeness.** BIP339 `wtxidrelay`, `MSG_WITNESS_*` block/tx fetching
+  with witness-only peer preference, stripped-block serving to legacy peers,
+  and self-address advertisement (`daemon/addr_self.c`).
+
+Configuration, running modes, and a precise **"exactly like Core vs.
+deliberately different"** ledger are documented in their own sections below.
+Full test suite: **189 harnesses, 0 failures** (`make -k test`).
+
+---
+
+**Previous state (2026-08-25). The UTXO set is byte-identical to Bitcoin
 Core's, with no filter and no overrides.** The comparison the 2026-08-24
 entry below promised has been run. The from-genesis rebuild (write-time
 unspendable filter, so the stored set IS Core's definition rather than
@@ -905,6 +971,167 @@ hash-match / chain-link / PoW / consensus (`CHAIN VERIFIED`).
     undergone an *independent third-party* audit; the internal audit is complete,
     tracked in-repo, and green.
 
+## Running modes
+
+`daemon/bitcoind <mode> <datadir> [args]` — the datadir is where the chain,
+UTXO store, indexes, wallet, and `logs/` live (see *Storing the chain*).
+
+| mode | arguments | what it does |
+|---|---|---|
+| `serve` | `<datadir> [port] [nwant] [workers]` | **The normal way to run.** Self-healing: discovers peers, fills any archive gap and catches up to the real tip (built-in `dl_catchup`, ≥8 chunk-claiming workers), then opens for inbound service. `port` defaults to the chain's P2P port; `nwant` outbound peers (default 3); `workers` catch-up threads (default 16). |
+| `follow` | `<datadir>` | Extend the chain from a peer and keep following the tip; no inbound serving. |
+| `ibd` | `<datadir>` | One assembly pass: headers-first persist → `getdata` block bodies → validate → store. |
+| `sync` | `<datadir>` | Loopback-fakepeer sync smoke test (the `test_bitcoind_sync` harness path). |
+| `server-test` / `serve-test` | `<datadir> …` | Inbound-serve test harnesses. |
+
+## Configuration
+
+Durable tuning is read from **`bitcoin.conf`** in the datadir (or the path in
+`$BITCOIN_CONF`), `key=value`, `#` comments, unknown keys ignored — the same
+file the standalone RPC daemon reads, so the two can share it. Every key below
+is a real Bitcoin Core option honoured by name and unit; defaults equal Core's
+except where the node is deliberately more conservative. Parsed in
+`asm/daemon/node_config.c`.
+
+**Chain selection**
+
+| key | default | meaning |
+|---|---|---|
+| `chain` | `main` | `main` or `regtest`. `testnet`/`signet` are recognised and **refused** (the node will not start on a chain whose rules it does not implement). |
+| `regtest` | `0` | `regtest=1` is the boolean form of `chain=regtest`. |
+
+Each non-main chain runs in its own datadir subtree (`<datadir>/regtest/`) with
+its own logs (`logs/bitcoind.regtest.log`); `bitcoin.conf` stays shared at the
+datadir root. See *Storing the chain*.
+
+**Network / peers**
+
+| key | default | meaning |
+|---|---|---|
+| `port` | `8333` (main) / `18444` (regtest) | P2P listen/dial port. An explicit `port=` overrides the chain default. |
+| `bind` | any | listen address, `addr[:port]`. |
+| `listen` | `1` | accept inbound connections. |
+| `connect` | — | connect ONLY to these peers (repeatable); disables discovery, `dnsseed`, and `listen` unless those are set explicitly. Loopback/RFC1918 addresses are honoured here (they are an operator instruction), unlike gossiped peers. |
+| `addnode` / `seednode` | — | add a peer / seed to the pool (repeatable). |
+| `dnsseed` | `1` (main), `0` (regtest) | use DNS seeds for bootstrap. |
+| `maxconnections` | `200` | total connection budget. |
+| `timeout` | `5000` | connect timeout, ms. |
+| `peertimeout` | `60` | peer inactivity timeout, s. |
+| `maxreceivebuffer` | `5000` | per-peer receive cap, ×1000 bytes. |
+| `blocksonly` | `0` | do not relay transactions. |
+
+**Mempool policy** (all Core defaults)
+
+| key | default | meaning |
+|---|---|---|
+| `maxmempool` | `300` | mempool byte budget, MB. Full pool → feerate eviction. |
+| `mempoolexpiry` | `336` | drop txs older than this, hours. |
+| `minrelaytxfee` | `0.00001` | relay/mempool floor, BTC/kvB. |
+| `incrementalrelayfee` | `0.00001` | RBF / dynamic-minfee increment, BTC/kvB. |
+| `limitancestorcount` | `25` | max in-mempool ancestors. |
+| `limitancestorsize` | `101` | max ancestor set, kvB. |
+| `limitdescendantcount` | `25` | max in-mempool descendants. |
+| `limitdescendantsize` | `101` | max descendant set, kvB. |
+| `mempoolfullrbf` | `1` | allow full-RBF replacement. |
+
+**UTXO / validation / storage**
+
+| key | default | meaning |
+|---|---|---|
+| `dbcache` | `1024` | UTXO memtable sizing, MiB. |
+| `par` | `0` (auto) | script-verification worker threads. |
+| `prune` | `0` (off) | pruning target, MiB. |
+| `checkblocks` | `6` | blocks to verify at startup. |
+| `checklevel` | `3` | startup verification depth. |
+| `assumevalid` | Core default | skip signature checks up to this block. |
+| `stopatheight` | `0` (off) | stop syncing at this height. |
+| `txindex` | `0` | maintain the full transaction index tail. |
+| `maxuploadtarget` | `0` (none) | upload budget, MB. |
+
+**Other**
+
+| key | default | meaning |
+|---|---|---|
+| `signer` | — | external signer command (Core `-signer` / HWI). |
+| `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` / `zmqpubsequence` | — | ZMQ publisher endpoints (`tcp://…`), one per topic. |
+
+RPC credentials (`rpcuser`, `rpcpassword`, `rpcport`) are read from the same
+file by the embedded RPC server; `rpcport` defaults to `8332` (main) / `18443`
+(regtest).
+
+## Exactly like Core vs. deliberately different
+
+This node is built to agree with Bitcoin Core **byte-for-byte where agreement is
+consensus-visible**, and to diverge only where Core relies on machinery this
+project has not built — never silently. Every divergence below is documented at
+its call site in the code, and the "like Core" claims are backed by the
+differential tests named.
+
+### Byte-for-byte / behaviour-identical
+
+- **Script-verification flags** are *generated from Core's own source*
+  (`validation/gen_script_flags.py` parses `kernel/chainparams.cpp` and
+  `script/interpreter.h`), never hand-transcribed — including the two historical
+  BIP16/Taproot exception blocks matched by hash. Re-run after a Core upgrade.
+- **The UTXO set is byte-identical.** At mainnet height 963,967 the MuHash3072
+  over the whole set equals Core's `gettxoutsetinfo muhash` exactly — no filter,
+  no coin overrides — which means every one of ~165.7M entries (outpoint, value,
+  height, coinbase flag, script) matches. Re-proven on regtest against a scratch
+  Core node.
+- **Consensus validation:** legacy + segwit (BIP143) + taproot key-path and
+  script-path (BIP341/342) sighash and verification, P2SH/CSV/CLTV/NULLDUMMY at
+  Core's exact activation heights, BIP30, BIP141 witness-commitment. Full-chain
+  replay from genesis to ~h963k rejected nothing the real chain contains.
+- **Difficulty retarget** arithmetic reproduces **8/8 real historical retarget
+  boundaries bit-exact**; `getblocktemplate`'s `bits` field is diffed against
+  Core at the same tip.
+- **Genesis** for both chains is hashed and *asserted* against Core's own
+  `hashGenesisBlock` string before the chain can be selected (regtest is
+  derived from the mainnet block exactly as Core's `CreateGenesisBlock` does).
+- **JSON-RPC** shapes follow Core's `blockchain.cpp` / `rawtransaction.cpp` /
+  `core_io.cpp` field-for-field with Core-exact error codes and messages; merkle
+  proofs (`gettxoutproof`) are byte-identical and cross-verify bidirectionally;
+  `decodescript` / `validateaddress` / `createmultisig` diff byte-for-byte
+  against a scratch-Core oracle including descriptor checksums.
+- **Config defaults** equal Core's (the tables above), and the mempool honours
+  Core's `TrimToSize` semantics, dynamic `mempoolminfee`, and ancestor/
+  descendant limits.
+
+### Deliberately different (documented, never silent)
+
+- **Storage format is our own**, not Core's. Blocks live in one append-only
+  framed archive (`blk00000.dat` + a positional `index.dat` + `headers.dat`),
+  and the UTXO set is a custom Bloom-filtered LSM — not `blk*.dat` + a LevelDB
+  chainstate. The archive container marker is a constant, not chain-tagged
+  (chains never share a datadir, so isolation comes from the directory, not the
+  marker).
+- **Mempool eviction is per-leaf, not per-package.** Core evicts whole
+  descendant packages by descendant feerate; this evicts the lowest-feerate
+  *leaf* and works inward. The two coincide for the common no-children case
+  (`bitcoin_mempool_policy.c`).
+- **Wallet is a single implicit HD wallet.** No multi-wallet, no descriptor
+  *engine*, no watch-only — `createwallet` / `loadwallet` / `importdescriptors`
+  and friends are dispatched but return an honest "unsupported", and
+  `descriptorprocesspsbt` refuses rather than guessing.
+- **`gettxoutsetinfo` defaults to `muhash`.** `hash_serialized_3` is *refused*
+  (Core itself refuses it for an arbitrary height; only muhash is stored by the
+  index and answerable off-tip). Coinstats "extras" beyond the core fields are
+  omitted, stated in the result.
+- **Only `main` and `regtest`.** `testnet` / `signet` are refused outright
+  rather than run under the wrong chain's rules.
+- **Not present at all** (also in `FEATURE_GAPS.md`): Tor/I2P/onion, REST
+  interface, UPnP/NAT-PMP, GUI. Mining is `getblocktemplate`/`submitblock` with
+  a *lower-bound* `sigops` and valid-but-not-fee-optimal tx ordering, no
+  longpoll, no BIP23 proposal mode, no stratum.
+- **Header nBits retarget is not consensus-enforced** on incoming headers: the
+  node relies on cumulative-work fork choice (a low-difficulty header chain
+  scores near zero and can never outweigh the real chain), documented in
+  `daemon/reorg.c`. Harmless on regtest (one chain) and on mainnet (real work).
+- **One quiet edge in tx relay:** a transaction announced exactly once during a
+  leg's sync pass can be drained unexamined; Core's periodic re-announcement
+  delivers it on the next pass. Lossless on mainnet traffic; on a silent regtest
+  the *first* inv may wait for Core's ~10-minute re-announce.
+
 ## Layout
 
 ```
@@ -938,8 +1165,10 @@ bitcoinmachinecode/
 |   +-- bitcoin_bip39.asm      # BIP39 mnemonic<->seed (PBKDF2-HMAC-SHA512)
 |   +-- wordlist.inc           # 2048-word BIP39 English wordlist (9-byte records)
 |   +-- bitcoin_multisig.asm   # p2sh_hash + multisig_verify (OP_CHECKMULTISIG)
-|   +-- wallet_core.c          # wallet primitives glue over asm crypto
-|   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer over mempool + UTXO
+|   +-- bitcoin_script_flags.asm # per-height script-verify flag schedule (generated from Core; runtime chain selector)
+|   +-- bitcoin_aes.c          # AES-256 (FIPS-197 block + CBC): wallet-at-rest cipher
+|   +-- wallet_core.c          # wallet primitives glue over asm crypto (address encodings are chain-selected)
+|   +-- bitcoin_mempool_policy.c # policy/RBF/fee layer + TrimToSize feerate eviction + dynamic minfee
 |   +-- version.inc            # SINGLE SOURCE OF TRUTH for node wire identity (app version, user-agent, protocol version)
 |   +-- gen_version_header.py  # build tool: derives C version_gen.h from version.inc
 |   +-- version_gen.h          # GENERATED from version.inc (git-ignored)
@@ -977,19 +1206,41 @@ bitcoinmachinecode/
 |       +-- utxo_walk.h       # shared block input/output walker (build_utxo.c + utxo_live.c)
 |       +-- utxo_live.c       # live daemon's own LSM UTXO instance: single-writer catch-up in the download worker
 |       +-- tx_accept.c       # live daemon's inbound tx acceptance: per-connection read-only LSM snapshot + mempool policy/txval dispatch
+|       +-- tx_verify.c       # consensus verifier used for mempool admission (legacy + full taproot, confirmed set + mempool parents)
+|       +-- tx_relay.c        # receive-side tx relay: fetch announced txs witness-complete, orphan pool, re-announce
+|       +-- tx_index_tail.c   # daemon-maintained txindex tail over the offline base build
+|       +-- coinstats_index.c # per-block incremental MuHash fold -> instant gettxoutsetinfo, continuous Core parity
+|       +-- bfilter_index.c   # whole-chain BIP157/158 basic filters + filter-header chain, tip-following
+|       +-- block_strip.c     # serve the witness-stripped form of a block to legacy (non-witness) peers
+|       +-- addr_self.c       # self-address advertisement (external IP from agreeing peers, configured port)
+|       +-- mempool_compact.c # reclaim freed bytes in the mempool blob after eviction
+|       +-- chainparams.h/.c  # runtime chain selection (main / regtest): magic, genesis, ports, script schedule, address encodings
+|       +-- wallet_crypter.c  # Core's BytesToKeySHA512AES KDF + AES-256-CBC sealed wallet container (seal/open/rewrap)
+|       +-- wallet_enc_state.c # encryptwallet/walletpassphrase{,change}/walletlock lock-state machine
 |       +-- cli.c             # thin driver for the asm cli_main
 +-- data/                    # durable chain storage: ONE unified archive
-|                           # (blk00000.dat..blkNNNNN.dat + index.dat + headers.dat)
+|                           # (blk00000.dat..blkNNNNN.dat + index.dat + headers.dat),
+|                           # the LSM UTXO store, the optional indexes, the wallet,
+|                           # and logs/. Non-main chains live in data/<chain>/ .
 +-- README.md
 ```
 
 ## Storing the chain
 
-Blocks persist to the current working directory as `blk00000.dat` (append-only
-framed blocks) + `index.dat` (positional height index) + `bitcoind.log`. The
-durable home is **`data/`** under the project root, on the `/storage` NVMe
-mount (ext4, ~2.6 TB free — room for a full archive node; pruned mode fits in
-just a few GB). Point the daemon/CLI there:
+Blocks persist to the datadir as `blk00000.dat` (append-only framed blocks) +
+`index.dat` (positional height index) + `headers.dat`, alongside the LSM UTXO
+store, the optional indexes, the wallet, and a `logs/` directory. The durable
+home is **`data/`** under the project root, on the `/storage` NVMe mount (ext4,
+~2.6 TB free — room for a full archive node; pruned mode fits in just a few GB).
+
+**Per-chain isolation.** Mainnet uses the datadir root; every other chain gets
+its own subtree — `<datadir>/regtest/` — so a regtest run can never touch
+mainnet state. `bitcoin.conf` is shared at the datadir root; logs are per-chain
+and chain-tagged (`logs/bitcoind.log` on mainnet, `logs/bitcoind.regtest.log`
+under the regtest subtree). A fresh non-main datadir self-seeds its own genesis
+at archive index 0.
+
+Point the daemon/CLI there:
 
 ```bash
 cd /storage/bitcoinmachinecode/asm/daemon
@@ -1002,6 +1253,10 @@ cd /storage/bitcoinmachinecode/asm/daemon
 # real chain tip on its own (dl_catchup, >=8 chunk-claiming workers), THEN
 # opens for inbound service -- no external tooling needed for normal operation:
 ./bitcoind serve /storage/bitcoinmachinecode/data 8333
+
+# regtest: set `chain=regtest` (or `regtest=1`) in the datadir's bitcoin.conf,
+# then run against a local Core -regtest node. State lands in data/regtest/:
+./bitcoind serve /storage/bitcoinmachinecode/data     # port/dir/logs auto-select regtest
 
 # standalone bulk-download tool (same chunk-claiming engine as dl_catchup),
 # for a very large initial catch-up or offline reindexing:

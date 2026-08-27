@@ -1,5 +1,25 @@
 # Bitcoin Core feature-parity plan
 
+> ## Status: RPC surface COMPLETE — 155/155 methods, all 5 subsystems (2026-08-26)
+>
+> Every method in the registered tables is implemented, and all five
+> subsystems closed the same day: mempool tranche, mining (`getblocktemplate`/
+> `submitblock`), `gettxoutsetinfo`/`scantxoutset`, PSBT, and the external
+> signer (`fac5793`, subsystem 5 of 5). The per-method records below stand as
+> the verification trail. Since then the RPC layer also gained: the txid
+> index (`getrawtransaction` by txid alone), the coinstats index (incremental
+> `gettxoutsetinfo`, ~33 ms, proven identical to the oracle), the BIP158 block
+> filter index, `walletprocesspsbt`/`finalizepsbt`/`utxoupdatepsbt`, wallet
+> at-rest encryption RPCs, and regtest-aware chain reporting.
+>
+> **This document is about the RPC surface only.** For what the node does NOT
+> yet do relative to Core — the wallet-management tranche (multiwallet,
+> descriptor wallets, watch-only), a live address index, mining polish
+> (longpoll, BIP23 proposal mode), and the full-verification IBD benchmark —
+> see **`FEATURE_GAPS.md`**, which is the current honest gap inventory.
+> Consensus correctness remains the separate, deeper question (LOG.md
+> incidents); RPC-surface parity does not resolve it.
+
 Grounded in the actual registered method tables (`rpc_commands.c`, `rpc_node.c`,
 `rpc_chain.c`) and the wallet surface (`daemon/wallet_cli.c`, `wallet_core.c`) as
 of 2026-08-25 — not from memory. "Parity" here means **RPC-surface + behavior

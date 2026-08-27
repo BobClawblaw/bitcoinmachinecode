@@ -1,5 +1,11 @@
 # Performance scope — bulk UTXO rebuild / full-verification replay
 
+**Still-current note 2026-08-27.** This document profiles the historical bulk
+rebuild, which remains closed (below). The 08-26/08-27 feature work (RPC
+surface, mempool eviction, indexes, wallet encryption, regtest) touched none
+of the verify/storage hot paths profiled here; the levers in §4 are unchanged
+and still un-landed pending an explicit perf pass.
+
 **Closure note 2026-08-25.** The rebuild this document profiles is finished:
 genesis to the live tip, ending in the MuHash parity proof (`README.md`).
 The final stretch was dominated by ghost-healing (rollback + fresh re-apply

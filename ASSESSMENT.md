@@ -33,6 +33,44 @@ duplicate-append race on the live node. All four are root-caused, fixed and
 regression-tested, and all four existed in production first. The summary
 judgement below stands; the capability section under-claims.
 
+**Addendum 2026-08-27.** The capability ledger has moved substantially again;
+the summary judgement's *spirit* still holds (end-to-end IBD speed vs Core is
+STILL unmeasured, so "not a drop-in node" remains true) but several specific
+"cannot do" lines below are now false. Landed since 08-25 (all in `main`,
+evidence in `FEATURE_GAPS.md`'s 2026-08-27 update):
+
+- **RPC parity is complete** — all methods and all five subsystems (155/155,
+  2026-08-26). The "largest gap by a wide margin" line in §2 is fully retired.
+- **The full indexing tier exists** — txindex (base + live tail),
+  coinstatsindex (incremental MuHash, instant `gettxoutsetinfo`),
+  blockfilterindex (BIP157/158).
+- **Mempool is a real mempool** — consensus-verifier admission, Core-style
+  TrimToSize feerate eviction, dynamic `mempoolminfee`, config-wired limits,
+  and receive-side tx relay with an orphan pool. (This also fixed a live
+  production freeze at exactly 4096 txs — a 43rd-plus incident, root-caused.)
+- **Wallet-at-rest encryption** — AES-256 under Core's BytesToKeySHA512AES,
+  proven byte-identical to OpenSSL.
+- **Regtest chain selection, differentially proven** — this is the important
+  one for §4's argument. The node now runs Core's regtest chain, and against
+  a scratch Core regtest oracle it produced **161/161 identical block hashes**
+  after syncing Core's chain, an **identical `gettxoutsetinfo` muhash**, and a
+  block built from its **own `getblocktemplate` that Core accepted** via
+  `submitblock`. That gives this project, for the first time, a *deterministic
+  differential harness against Core* (regtest mines instantly) instead of only
+  the mainnet replay — exactly the "differential testing against Core rather
+  than replaying" §4 argues is the real correctness signal. The UTXO set is
+  now proven byte-identical to Core on **two** chains (mainnet h=963,967 and
+  regtest), not one.
+
+What has NOT changed, and keeps the headline honest: end-to-end IBD speed vs
+Core is still unmeasured (the benchmark in §5 remains un-run); wallet
+management (multiwallet/descriptors/watch-only) is still absent; and the
+defect-discovery process is the reason to trust the above — the regtest work
+itself surfaced four latent bugs (a fresh-`headers.dat` off-by-one that would
+have hit a fresh mainnet datadir too, a worker chdir splitting one chain's
+state across two dirs, a connect-only peer-filter bug, and hardcoded ports),
+all found by differential testing, none by replay.
+
 ## 1. What it can do
 
 Real, and stronger than the project's age suggests:

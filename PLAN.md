@@ -1,5 +1,16 @@
 # PROJECT PLAN — Bitcoin Node in 100% AI-generated Machine Code
 #
+# STATUS 2026-08-27: since the 08-25 note, the parity work ran to completion
+# and shipped to the live mainnet daemon: full RPC surface (155/155), a
+# Core-style mempool (feerate eviction + dynamic mempoolminfee + config-wired
+# limits), live txindex / coinstatsindex (incremental muhash, proven
+# byte-identical to Core) / BIP158 filter index, at-rest wallet encryption,
+# and REGTEST chain selection proven against a scratch Core node (161/161
+# identical block hashes, identical muhash, a node-templated block accepted by
+# Core). FEATURE_GAPS.md is the current gap inventory; LOG.md (2026-08-27) has
+# the detail. Remaining non-trivial gaps: multi-wallet / descriptor /
+# watch-only wallets, testnet/signet chains, a full-verification IBD benchmark.
+#
 # STATUS 2026-08-25: the goal below is substantially REACHED. The node
 # follows the live network unattended; its UTXO set is proven byte-identical
 # to Bitcoin Core's (MuHash at height 963,967, no filters/overrides); and it

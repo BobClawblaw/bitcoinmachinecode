@@ -1,5 +1,12 @@
 # PLAN — Block-level script verification
 
+> **Status 2026-08-27.** Complete and in production. Stage E (assumevalid,
+> then production), described below as "not started", is done: the verifier
+> runs in the live mainnet daemon and the node has followed the tip
+> unattended for days. Regtest chain selection later re-proved the same
+> verifier on Core's regtest chain (identical block hashes and UTXO muhash).
+> The rest of this file is the historical plan-of-record.
+
 Status: Written 2026-08-18. **PLAN COMPLETE — Stage D's end state achieved
 2026-08-25:** the from-genesis, full-verification rebuild reached the live
 tip and the resulting UTXO set was proven byte-identical to Bitcoin Core's

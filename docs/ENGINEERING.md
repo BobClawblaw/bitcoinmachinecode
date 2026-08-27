@@ -43,6 +43,15 @@ generate keys and addresses, derive BIP32/BIP39 wallets, validate and sign
 real transactions (legacy P2PKH, P2SH/multisig, P2WPKH/P2WSH, P2TR), and speak
 a Bitcoin-Core-compatible JSON-RPC over HTTP.
 
+**Delivered capability, 2026-08-27.** Beyond the roles above, the node now
+serves Core's full RPC surface (155/155 methods), runs a Core-style mempool
+(byte-budgeted with feerate eviction and a dynamic `mempoolminfee`, all limits
+config-wired), maintains live `txindex`, `coinstatsindex` (incremental muhash
+proven byte-identical to Core), and BIP158 `blockfilterindex`, encrypts the
+wallet at rest (`encryptwallet`/`walletpassphrase`/`walletlock`, Core's
+BytesToKeySHA512AES + AES-256), and supports **regtest chain selection** (§4.3). `FEATURE_GAPS.md` is the current gap inventory; `LOG.md` (2026-08-27
+entries) has the detail.
+
 **Status:** Inside this repo the internal AI-driven security audit is complete
 and green, but the software has **not** had an independent *human* security
 audit. Treat it as untrusted until it has. See the warning banner in
@@ -429,15 +438,22 @@ scripts/worklog.sh [YYYY-MM-DD]   # open (create+seed) today's daily worklog
 
 Read by `bitcoin_rpcd` (and modeled after Bitcoin Core). Current contents:
 
+> **Ports, corrected 2026-08-27.** RPC and P2P must not collide. Production
+> runs `port=8332` (P2P) and `rpcport=8331` (JSON-RPC). The embedded `serve`
+> RPC server binds `rpcport` from this file, defaulting to the selected chain's
+> RPC port when unset (8332 mainnet / 18443 regtest).
+
 | key | value | meaning |
 |-----|-------|---------|
-| `rpcport` | `8332` | RPC/JSON-RPC listen port |
+| `rpcport` | `8331` | RPC/JSON-RPC listen port (must differ from `port`) |
 | `port` | `8332` | P2P listen port |
+| `chain` | `main` | chain selection: `main` or `regtest` (`regtest=1` also works); see §4.3 |
 | `listen` | `1` | accept inbound |
 | `maxconnections` | `256` | connection cap |
 | `rpcuser` / `rpcpassword` | `bitcoin`/`bitcoin` | HTTP Basic auth |
 | `dbcache`, `prune`, `blocksonly` | `4096`/`0`/`0` | resource/cache hints |
 | `prune` | (commented `=5000`) | uncomment to enable pruned storage |
+| mempool policy | Core defaults | `minrelaytxfee`, `incrementalrelayfee`, `limit{ancestor,descendant}{count,size}`, `mempoolfullrbf` — all read here (LOG.md 2026-08-27) |
 | `privacy`, `whitelist`, `txindex`, `paranoid` | ... | misc flags |
 
 ### 4.2 Environment / invocation defaults
@@ -451,7 +467,31 @@ Read by `bitcoin_rpcd` (and modeled after Bitcoin Core). Current contents:
   project's own node is frequently run on **28333** to avoid the clash (see
   worklog).
 
-### 4.3 Seeds & peer lists
+### 4.3 Chain selection (`main` / `regtest`, 2026-08-27)
+
+`chain=regtest` (or `regtest=1`) in `bitcoin.conf` runs the node on Bitcoin
+Core's regression-test chain instead of mainnet. Everything chain-specific
+lives behind `daemon/chainparams.{h,c}`; the compiled default is mainnet, so a
+config without a `chain` key is byte-identical to before this existed.
+
+- **Datadir isolation.** Mainnet state lives at the datadir root; every other
+  chain gets its own subdirectory (`<datadir>/regtest/`, Core's own layout),
+  so chains can never share block/UTXO/wallet state. `bitcoin.conf` stays
+  shared at the root. Logs live under `<chain-datadir>/logs/` and the filename
+  is chain-tagged: `bitcoind.log` on mainnet, `bitcoind.regtest.log` on
+  regtest.
+- **What is chain-selected:** P2P message magic (regtest `fabfb5da`), default
+  ports (P2P 18444 / RPC 18443), the genesis block (derived from the mainnet
+  bytes and hash-asserted against Core's `hashGenesisBlock` before selection
+  succeeds), the script-flag activation schedule (regtest heights generated
+  from `CRegTestParams`), subsidy halving (150), `getblocktemplate` next-work
+  (`fPowNoRetargeting`), address encodings (`0x6f`/`0xc4`/`bcrt`), and DNS
+  seeds (off). Proven differentially against a scratch Core regtest node:
+  161/161 identical block hashes, identical `gettxoutsetinfo` muhash, and a
+  block built from the node's own `getblocktemplate` accepted by Core via
+  `submitblock`. See LOG.md 2026-08-27 and `tests/test_chainparams.c`.
+
+### 4.4 Seeds & peer lists
 
 - `seeds.txt` — the initial DNS seed hostnames.
 - `internet_peers.txt` / `good_internet_peers.txt` — harvested peer address
