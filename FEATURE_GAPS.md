@@ -96,6 +96,18 @@ CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
 - **`walletprocesspsbt`** — the PSBT Signer role by delegation
   (`rpc_wallet_ops.c`); `finalizepsbt`/`utxoupdatepsbt` are real
   (`rpc_commands.c`).
+- **`connect=<host>:<port>` ignores a non-default port** — the node accepts
+  `connect=`/`addnode=` peers only on the selected chain's DEFAULT P2P port
+  (8333 main, 18444 regtest, 48333 testnet4) and logs+ignores any other,
+  where Core takes any `host:port`. Consequence: a node pointed at a peer on
+  a non-standard port sits silently at tip=0 with `peers=0/0`. Found
+  2026-08-27 while writing `validation/bumpfee_regtest_e2e.sh`.
+- **`getbalance`/`listunspent` read the address index, not the wallet scan**
+  — the address index is an extension (`addrindex=1`, default OFF), so on a
+  default node a funded wallet reports `0.00000000` and an empty
+  `listunspent` even though `walletscan.dat` correctly holds every receive.
+  The two wallet views should agree, or the RPCs should fall back to the
+  scan. Found 2026-08-27, same script.
 - **nBits schedule enforcement (Core's `bad-diffbits`)** — a peer's headers
   must now carry exactly the bits `GetNextWorkRequired` demands for their
   height, checked in fork evaluation (`reorg_analyze`) AND at apply

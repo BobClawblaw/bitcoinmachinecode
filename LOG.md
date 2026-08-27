@@ -7,6 +7,50 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- bumpfee proven end to end against a real Bitcoin Core
+
+`validation/bumpfee_regtest_e2e.sh` closes the coverage gap the bumpfee
+entry below admitted to. The hermetic suite can only reach the argument
+surface (missing txid -> -8, unknown txid -> Core's -5); the parts that
+move money -- the fee arithmetic and the change adjustment -- are only
+observable end to end. The script stands up a scratch Core regtest and a
+bmc regtest from nothing, funds a fresh wallet, broadcasts an original with
+change, bumps it, and asserts six things. It passes from scratch, twice,
+and cleans up after itself.
+
+The decisive assertion is not that our node likes its own result but that
+**Bitcoin Core accepts the replacement into its mempool and drops the
+original**. It does.
+
+The fee assertion recomputes Core's formula in the script, independent of
+the implementation: floor(old_fee*1000/vsize) + 1 + max(incrementalrelayfee,
+5000), then ceil(rate*vsize/1000). Observed on a 141-vB original paying
+10,000 sat: floor(70921.98)=70921, +1+5000 = 75922 sat/kvB, ceil -> 10,706
+sat. The node returned exactly 10,706, and the change output shrank by
+exactly 706 sat with the payment output untouched. The two roundings go in
+OPPOSITE directions (GetFeePerK down, GetFee up), which is what made the
+overpay bug fixed earlier today easy to introduce.
+
+TWO REAL FINDINGS while building it, neither a bumpfee bug:
+  - **connect= only honours a chain's DEFAULT P2P port.** `connect=127.0.0.1:19444`
+    on regtest is logged and IGNORED ("only a chain's default P2P port ...
+    is supported for named peers"); the node then sits at tip=0 with
+    peers=0/0. Core accepts any host:port. The script pins CORE_P2P to
+    18444 with a comment; the limitation itself is worth closing.
+  - **getbalance/listunspent read the ADDRESS INDEX, not the wallet scan.**
+    The address index is an extension, default OFF, so on a node without
+    `addrindex=1` a funded wallet reports 0.00000000 and an empty
+    listunspent while walletscan.dat correctly holds every receive. That is
+    a surprising split for anyone funding a fresh node; bumpfee itself is
+    unaffected because it reads the scan records.
+
+Also confirmed: the bumped.dat linkage sidecar is written with both txids,
+but gettransaction resolves a txid against the wallet's SEND JOURNAL, so a
+transaction broadcast via createrawtransaction/sendrawtransaction (as this
+script does, deliberately avoiding coin selection) is not one it will
+report on. The replaced_by_txid/replaces_txid fields are therefore NOT
+exercised by this script -- stated, not glossed.
+
 ## 2026-08-27 -- bumpfee / psbtbumpfee: the last two wallet refusals
 
 The RBF fee-bump family is real (Core wallet/feebumper.cpp semantics).
@@ -51,8 +95,8 @@ surface (missing txid -> -8, unknown txid -> Core's -5 text, both verbs).
 The fee arithmetic and the change/dust path are NOT yet covered by an
 end-to-end test -- they were verified by differential reading against
 Core's source, which is what caught the rounding bug above. An e2e bump
-against the regtest Core pair is the obvious next step and is not claimed
-as done.
+against the regtest Core pair was the obvious next step; it was written and
+is passing the same day -- see the entry above.
 
 ## 2026-08-27 -- nBits schedule enforcement (bad-diffbits), one rule engine
 
