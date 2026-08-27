@@ -520,7 +520,28 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     unsigned char txid_wire[32];
     for (int i = 0; i < 32; i++) txid_wire[i] = txid_display[31 - i];
 
-    if (!g_utxo_lst) { *result = rj_null(); return 1; }
+    /* No UTXO store installed = this server CANNOT ANSWER, which is not the
+     * same as "that output is spent" -- and null means the latter. Only the
+     * standalone rpcd calls rpc_commands_set_utxo_store; the embedded server
+     * in daemon/main.c never has, so every gettxout on the live node was
+     * confidently reporting every coin in existence as spent.
+     *
+     * Refusing is the honest answer until the RPC can reach the live set.
+     * It cannot today: the download worker owns that state in ANOTHER
+     * process, and building a read-only view here costs a full
+     * utxo_lsm_reload_ro -- measured at 60-83s on the real 165M-entry set
+     * across six production boots, and invalidated by every new block, so it
+     * is not a viable per-call path. The fix is a request/response channel to
+     * the worker, which already answers utxo_lsm_get in microseconds; see
+     * FEATURE_GAPS.md. */
+    if (!g_utxo_lst) {
+        *ec = -1;
+        *em = "gettxout cannot be answered by this server: it has no handle on "
+              "the live UTXO set (the download worker owns it in another "
+              "process). Returning null would claim the output is spent, which "
+              "this node has not established";
+        return 0;
+    }
     unsigned long long value; unsigned long height, is_coinbase; const unsigned char* script; unsigned long slen;
     long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &height, &is_coinbase, &script, &slen);
     if (r != 1) { *result = rj_null(); return 1; }
