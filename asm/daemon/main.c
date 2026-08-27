@@ -2516,8 +2516,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_cfg.connect_only){
             fprintf(stderr,"[dl] no reachable connect= peers; staying offline (connect= means these are the ONLY peers)\n");
         } else {
-            fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
-            for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+            if(pool_len > 0){
+                fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
+                for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+            } else {
+                /* a chain with NO seeds (regtest) has no fallback to offer --
+                 * say so instead of announcing a fallback that adds nothing */
+                fprintf(stderr,"[dl] no peers and this chain has no DNS seeds; staying offline (use connect=/addnode=)\n");
+            }
         }
     }
     /* ---- MULTI-PEER DOWNLOAD: establish up to 8 live legs by dialing the
