@@ -273,6 +273,16 @@ and runs natively.
       u256_div/block_work/chainwork_add/chainwork_cmp + real store ops
       (cumulative accumulation, reload, truncate rollback) -- 8 seeds, 0 fail.
       (2026-08-27; .S landed 560d77c, this run adds the differential verify.)
+- [x] bitcoin_muhash (MuHash3072 multiset hash, mod p = 2^3072 - 1103717)
+      -> port/arm64/bitcoin_muhash.S. Repo test_muhash ALL PASS native (ChaCha20
+      keystream, ToNum3072, Num3072::Multiply, whole-set hashes, order-
+      independence + shard-combine, negative control, is_overflow/FullReduce
+      boundaries) against Bitcoin Core's OWN generated vectors. NEW independent
+      differential fuzz (port/arm64/fuzz_muhash.py) vs a pure-Python big-int
+      oracle drives num3072_mul (48x48 schoolbook + 2-pass reduction) with
+      full-width raw 3072-bit operands, x*1, x*x, canonical operands: 80,000+
+      mults across 16 seeds, 0 fail. Unlocks utxo_stats muhash + the s8
+      set-hash/MuHash-vs-Core parity check. (2026-08-27)
 - [ ] Remaining leaf modules (bip32/bip39/bip143/bip341, keys, addr*,
       idx, idxscan, muhash, mempool, serve, cli, cmpct, headers,
       net addrmgr, node_log, txv_, witness_v0, ...)
