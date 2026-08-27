@@ -7,6 +7,74 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core
+
+The node now runs mainnet OR regtest, selected by Core's own config key
+(`chain=regtest` / `regtest=1` in bitcoin.conf). Everything chain-specific
+moved behind daemon/chainparams.{h,c}; the static default is MAINNET, so a
+process that never selects a chain (every tool, every test, production) is
+byte-identical to before.
+
+WHAT IS CHAIN-SELECTED: net magic (a runtime dword in bitcoin_net.asm's
+frames, fabfb5da on regtest), default P2P/RPC ports (18444/18443), the
+GENESIS BLOCK (derived from the mainnet bytes by patching nTime/nBits/nNonce
+exactly as Core's CreateGenesisBlock does, then hash-ASSERTED against Core's
+own hashGenesisBlock before selection can succeed), the script-flag schedule
+(bitcoin_script_flags.asm branches on a runtime selector; regtest heights
+GENERATED from CRegTestParams by the same gen_script_flags.py that emits the
+mainnet table), subsidy halving (150), GBT next-work (fPowNoRetargeting),
+address params (0x6f/0xc4/bcrt through wallet_set_chain), the RPC-reported
+chain name, and dns_seeds=off. NOT chain-selected, deliberately: the archive
+container marker (our own file format; chains never share a datadir).
+
+DATADIR ISOLATION (operator requirement): Core's layout exactly -- mainnet
+at the datadir root, regtest under <datadir>/regtest/, bitcoin.conf shared
+at the root. Logs live in <chain-datadir>/logs/, and the filename itself is
+chain-tagged (bitcoind.log / bitcoind.regtest.log) so aggregated views can
+never confuse chains. A fresh non-main datadir SELF-SEEDS its genesis at
+archive index 0 (the mainnet archive got genesis by one-time injection).
+
+BUGS THE FIRST REGTEST BOOT FOUND (all latent on mainnet):
+ 1. headers.dat off-by-one: a FRESH header mirror stored every block one
+    height low, because dlc_span treats file position as height and a
+    getheaders response never includes the locator point. bmc h=1 held
+    Core's block 2. Fix: seed the chain's own genesis header at position 0
+    when the mirror is empty -- which would have bitten a fresh MAINNET
+    datadir identically.
+ 2. The forked download worker re-chdir()'d into the BASE datadir, so the
+    UTXO store landed in the root while the archive lived in regtest/ --
+    one chain's state split across two dirs. dir is now the effective
+    per-chain dir everywhere after boot.
+ 3. connect= x book filter: dl_pool_from_book rightly drops loopback from
+    a GOSSIPED book, but it also dropped the OPERATOR'S connect=127.0.0.1,
+    leaving the live worker permanently offline. With connect= the pool is
+    now the connect list verbatim (Core: "these are the ONLY peers").
+ 4. Hardcoded 8333 in six dial sites + two out_port call sites -> the
+    chain's default_port.
+
+PROVEN AGAINST CORE (scratch regtest oracle, build/bin/bitcoind):
+ - Core mined 160 blocks; bmc synced them; ALL 161 HEIGHTS byte-identical
+   (getblockhash 0..160), tips equal.
+ - gettxoutsetinfo muhash IDENTICAL (4599bb4c...def34a1), height 160,
+   txouts 160, total 7725 BTC -- which also proves the halving at 150
+   (149*50 + 11*25) on both sides.
+ - A block built from BMC'S OWN getblocktemplate (height 161, coinbasevalue
+   2_500_000_000 -- halved; bits 207fffff -- no retarget) was CPU-mined and
+   ACCEPTED BY CORE via submitblock; both tips advanced to the same hash.
+ - Live-follow: Core mined more; bmc tracked the tip in real time (166=166).
+ - Tx relay: a Core wallet tx reached bmc's mempool over the regtest wire.
+   KNOWN LIMIT: a tx announced exactly once during a leg's sync pass is
+   drained unexamined (the pre-rotation txrelay_poll_leg catches the
+   Poisson re-announcements; on mainnet traffic this loses nothing
+   observable, on a quiet regtest the FIRST inv can wait for Core's
+   ~10-minute unbroadcast re-announce before it lands).
+
+tests/test_chainparams: 29 checks -- genesis derivation vs Core's asserted
+hashes (both chains), the asm globals actually flipping, the regtest flag
+schedule vs generated heights, per-chain datadirs, testnet/signet refused.
+Full make -k test green: 189 suites, 0 failures.
+
+----------------------------------------------------------------------------
 ## 2026-08-27 -- Wallet at-rest encryption: encryptwallet / walletpassphrase{,change} / walletlock
 
 Finished the parked wallet-encryption WIP and wired it end to end. The wallet

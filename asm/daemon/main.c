@@ -43,6 +43,13 @@
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 #include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "chainparams.h" /* runtime chain selection (main / regtest)   */
+
+/* The node log path, chain-tagged so an aggregated view can never confuse
+ * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
+ * (all under the per-chain datadir's own logs/). Set at boot right after
+ * chainparams_select; the static default covers every tool-mode caller. */
+static char g_logpath[64] = "logs/bitcoind.log";
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
@@ -372,7 +379,7 @@ static long outbound_catchup(long max_blocks){
         if(getaddrinfo(host,NULL,&h,&res)!=0) continue;
         unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
         freeaddrinfo(res);
-        int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
+        int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
         if(fd<0) continue;
         struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -1259,7 +1266,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         if(!dl_resolve1(g_cfg.addnode[i], ipd)){
             fprintf(stderr,"[boot] addnode=%s did not resolve\n", g_cfg.addnode[i]); continue; }
         if(inet_pton(AF_INET,ipd,&ip)!=1) continue;
-        if(amr_add(ab,ip,(unsigned short)htons(8333),1,(unsigned)time(NULL))>0) total++;
+        if(amr_add(ab,ip,(unsigned short)htons((unsigned short)g_chainp->default_port),1,(unsigned)time(NULL))>0) total++;
         fprintf(stderr,"[boot] addnode %s -> %s\n", g_cfg.addnode[i], ipd);
     }
 
@@ -1286,7 +1293,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
             for(struct addrinfo* ai=res; ai && got<64; ai=ai->ai_next){
                 struct sockaddr_in* sa=(struct sockaddr_in*)ai->ai_addr;
                 unsigned ip=sa->sin_addr.s_addr;
-                if(ip && amr_add(ab,ip,(unsigned short)htons(8333),1,(unsigned)time(NULL))>0) got++;
+                if(ip && amr_add(ab,ip,(unsigned short)htons((unsigned short)g_chainp->default_port),1,(unsigned)time(NULL))>0) got++;
             }
             freeaddrinfo(res);
         }
@@ -1516,7 +1523,7 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
                             unsigned char* hdrbuf, size_t hdrbuf_sz){
     unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) return -1;
-    int fd=tcp_connect_ip(ip,(unsigned short)htons(8333));
+    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
@@ -1535,6 +1542,17 @@ static long dlc_headers(char live[][64], int nlive){
     struct stat hs;
     if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
     long have = hst_count(hst);
+    if(have==0){
+        /* Fresh mirror: seed the chain's own genesis header at position 0.
+         * dlc_span and the chunk workers treat headers.dat POSITION as
+         * HEIGHT, and a getheaders response never includes the locator
+         * point itself -- without this seed a fresh datadir stored every
+         * block one height low (found on the first regtest boot: bmc's
+         * h=1 held Core's block 2; the production mainnet mirror predates
+         * the genesis-at-index-0 fix and was built with genesis present). */
+        unsigned char gh[32]; block_hash(gh, g_chainp->genesis);
+        if(hst_append(hst, g_chainp->genesis, gh)>=0) have = hst_count(hst);
+    }
     unsigned char loc[32]; memset(loc,0,32);
     if(have>0){
         static unsigned char rec[112];
@@ -1649,7 +1667,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                      * workers sharing one starves both instead of using a
                      * second distinct peer that's sitting idle. */
                     if(!__sync_bool_compare_and_swap(&claimed[idx],0,1)) continue;
-                    int fdc=tcp_connect_ip(ip,(unsigned short)htons(8333));
+                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
@@ -1763,7 +1781,7 @@ static int dlc_probe_round(char pool[][64], int from, int ntry,
         if(fd<0){ cfd[nc++]=-1; continue; }
         int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
         struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
-        sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons(8333);
+        sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)g_chainp->default_port);
         int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
         if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
         cfd[nc++]=fd;
@@ -2472,7 +2490,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * said "seeds are bootstrap-only ... never downloading from the seeds
      * themselves" -- the redial path just never honoured it. */
     const char* srcpool[64]; int nsrc=0;
-    for(int i=0;i<npool && nsrc<64;i++){ srcpool[nsrc++]=dle[i]; }
+    if(g_cfg.connect_only){
+        /* connect= means these are the ONLY peers -- verbatim, bypassing the
+         * public-IP book filter (which rightly drops loopback/RFC1918 from a
+         * gossiped book, but an OPERATOR-NAMED peer may live there: a local
+         * regtest Core is 127.0.0.1, and dl_pool_from_book's a==127 skip left
+         * this worker permanently offline with 'no reachable connect= peers'
+         * while the peer was up -- found on the first regtest live-follow). */
+        for(int i=0;i<g_cfg.n_connect && nsrc<64;i++) srcpool[nsrc++]=g_cfg.connectn[i];
+    } else {
+        for(int i=0;i<npool && nsrc<64;i++) srcpool[nsrc++]=dle[i];
+    }
     if(nsrc==0){
         /* Discovery found nothing: DEGRADED fallback so the node still syncs.
          * Normally the seeds are bootstrap-only; this is only an emergency.
@@ -3293,7 +3321,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
  * treats them as foreign keys, so we read them here). */
 static void serve_rpc_read_creds(const char* cfgpath, int* port,
                                  char* user, size_t ucap, char* pass, size_t pcap){
-    *port = 8332; user[0] = 0; pass[0] = 0;
+    *port = g_chainp->default_rpc_port;   /* 8332 main / 18443 regtest */
+    user[0] = 0; pass[0] = 0;
     if (!cfgpath) return;
     FILE* f = fopen(cfgpath, "r"); if (!f) return;
     char line[1024];
@@ -3354,6 +3383,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         fprintf(stderr, "[rpc] block archive opened (chain RPCs live)\n");
     else
         fprintf(stderr, "[rpc] no archive index -- chain RPCs will report -28 until built\n");
+    /* chain identity + rules for the RPC layer (regtest: halving 150,
+     * fPowNoRetargeting; mainnet values are rpc_chain's own defaults) */
+    rpc_chain_set_chainparams(g_chainp->name, g_chainp->halving_interval,
+                              g_chainp->pow_no_retargeting);
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
     /* Wallet bootstrap: if the CLI's own wallet store is present in the
      * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
@@ -3615,7 +3648,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     fprintf(stderr,"[serve] inbound %s:%d %s (pid %d) %s\n", ipbuf,
                             ntohs(ca.sin_port), hok==1?"connected":"handshake failed", getpid(), pv);
                     if(hok==1)
-                        node_serve_loop(c, node_log_open("bitcoind.log"), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+                        node_serve_loop(c, node_log_open(g_logpath), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
                 }
                 close(c);
@@ -3704,18 +3737,61 @@ int main(int argc, char** argv){
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
       node_config_log(); }
+    /* Chain selection (daemon/chainparams.c). bitcoin.conf lives at -- and
+     * was just read from -- the BASE datadir; each non-main chain gets its
+     * own SUBDIRECTORY of it (Core's layout: <datadir>/regtest), so chains
+     * can never share block/UTXO/wallet state. Everything below this point
+     * operates on the cwd, so the chdir into the per-chain dir isolates all
+     * of it at once. Must run before mempool_configure/store_init (their
+     * files land in the per-chain dir) and before any socket (net_magic). */
+    if(!chainparams_select(g_cfg.chain)) return 1;
+    { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
+      wallet_set_chain(g_chainp->bech32_hrp, g_chainp->p2pkh_version, g_chainp->p2sh_version); }
+    static char effdir[4200];                    /* the PER-CHAIN datadir */
+    chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
+    if(g_chainp->id != CHAIN_MAIN){
+        if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
+        if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
+        if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
+        fprintf(stderr, "[boot] chain=%s datadir=%s port=%d dnsseed=%d\n",
+                g_chainp->name, effdir, g_cfg.port, g_cfg.dnsseed);
+    }
     /* Size the relay mempool from -maxmempool BEFORE any serve loop runs, and
      * before the fork, so every child inherits the same region rather than
      * each falling back to the 2 MiB static. */
     mempool_configure();
-    dir = absp;
+    /* Each chain keeps its own logs under <chain-datadir>/logs/ -- the asm
+     * logger (node_log_open) writes there via the cwd, so a regtest run can
+     * never interleave with the mainnet log. */
+    mkdir("logs", 0755);
+    if(g_chainp->id != CHAIN_MAIN)
+        snprintf(g_logpath, sizeof g_logpath, "logs/bitcoind.%s.log", g_chainp->name);
+    /* `dir` is the EFFECTIVE (per-chain) datadir from here on: the forked
+     * download worker re-chdir()s into it and utxo_live opens its files
+     * there -- on the first regtest boot the worker's chdir(absp) put the
+     * UTXO store and chainwork in the BASE dir while the archive lived in
+     * regtest/, splitting one chain's state across two dirs. absp keeps the
+     * BASE for the config path (bitcoin.conf stays shared at the root). */
+    dir = effdir;
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
+    /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
+     * mainnet archive got genesis by a one-time injection, 5f36dee -- a
+     * regtest dir is created empty every time, so the daemon must do it).
+     * Everything downstream (locator build, catch-up, script-flag heights,
+     * the UTXO walk's skip-genesis-coinbase rule) already assumes index ==
+     * height with genesis at 0. */
+    if(g_chainp->id != CHAIN_MAIN && *(int*)(store_buf+24) == -1){
+        unsigned char gh[32]; block_hash(gh, g_chainp->genesis);
+        if(store_append(store_buf, gh, g_chainp->genesis, (unsigned long)g_chainp->genesis_len) < 0){  /* returns new height (0) or -1 */
+            fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
+        fprintf(stderr,"[boot] %s genesis seeded at height 0\n", g_chainp->name);
+    }
 
     if(strcmp(mode,"sync")==0){
         /* Connect to a built-in loopback fake peer (forked in-process), exactly
          * like the verified tests/test_bitcoind_sync harness, so the IBD
          * exchange matches node_sync cadence. */
-        int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
+        int lfd = node_log_open(g_logpath);   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (sync mode)", 22);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -3749,7 +3825,7 @@ int main(int argc, char** argv){
          * a re-derived-hash guard, and store_appends into the block store. */
         static unsigned char hstb[256];
         if(hst_init(hstb)!=1){ fprintf(stderr,"hst_init failed\n"); return 1; }
-        int lfd = node_log_open("bitcoind.log");
+        int lfd = node_log_open(g_logpath);
         node_log_str(lfd, 0, "node start (ibd mode)", 21);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -3777,7 +3853,7 @@ int main(int argc, char** argv){
          * mines after we synchronized. Logs tip growth each pass. This is the
          * live synchronization loop over the verified asm IB D core. */
         store_reload(store_buf);            /* continue from persisted tip */
-        int lfd = node_log_open("bitcoind.log");
+        int lfd = node_log_open(g_logpath);
         node_log_str(lfd, 0, "node start (follow mode)", 23);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -3879,7 +3955,7 @@ int main(int argc, char** argv){
             printf("[server-test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
             exit((ok0&&okh)?0:2);
         }else{
-            int lfd=node_log_open("bitcoind.log");
+            int lfd=node_log_open(g_logpath);
             close(sv[1]);
             int svo=serve_loop(sv[0], lfd);
             int st; waitpid(pid,&st,0); close(sv[0]);
@@ -4095,7 +4171,7 @@ int main(int argc, char** argv){
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
 
-        int lfd = node_log_open("bitcoind.log");   /* all-asm leveled logger */
+        int lfd = node_log_open(g_logpath);   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly
          * (fork-based inbound serving in the parent) AND continuously download
@@ -4139,7 +4215,7 @@ int main(int argc, char** argv){
         zmqn_set_status(g_node_status);
 
         pid_t dl = fork();
-        if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333); _exit(0); }
+        if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), g_chainp->default_port); _exit(0); }
         g_dl_worker_pid = dl;   /* so serve_mux's shutdown handling can forward SIGTERM to it */
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
         fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
@@ -4147,7 +4223,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), 8333, l);
+        return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), g_chainp->default_port, l);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -4166,7 +4242,7 @@ int main(int argc, char** argv){
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
-        int lfd = node_log_open("bitcoind.log");
+        int lfd = node_log_open(g_logpath);
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
