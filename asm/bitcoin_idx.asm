@@ -24,8 +24,9 @@
 ;
 ; idx_build_from_file is the boot-time bulk loader: scans a positional
 ; index.dat (48-byte records: presence = first 4 bytes non-zero, hash stored
-; in big-endian DISPLAY order at rec[0..31]) and idx_puts every present
-; record's byte-reversed (wire/LE) hash. Same buffered-pread64 approach as
+; in WIRE (raw sha256d) order at rec[0..31]) and idx_puts each present
+; record's hash UNCHANGED -- the serve loop looks up with the hash as it
+; arrives on the p2p wire, so the table must be keyed the same way. Same buffered-pread64 approach as
 ; asm/bitcoin_idxscan.asm (192KB window, 4096 records/read) instead of a
 ; per-record C fread + byte-reverse + call -- on the real ~962k-record
 ; archive this cut build_hash_index from ~186s to a small fraction of a
@@ -284,8 +285,8 @@ idx_count:
 ; ============================================================================
 ; idx_build_from_file(idx, path)   (rdi, rsi)  -> rax: 0 ok, -1 can't open.
 ;   Bulk-loads idx from a positional index.dat: buffered pread64 (192KB
-;   window) instead of a per-record open/seek/read, byte-reverses each
-;   present record's display-order hash into wire/LE order, and idx_puts it.
+;   window) instead of a per-record open/seek/read, and idx_puts each present
+;   record's hash exactly as stored (wire order).
 ;   Registers persistent across idx_put calls (idx_put only guarantees
 ;   rbx/r12-r15 survive a call, per SysV/this codebase's own convention):
 ;   r12=idx, r14=fd, r15=n, rbx=pos, r13=full (records in the current read).
@@ -373,22 +374,19 @@ idx_build_from_file:
     mov  edx, [rax]
     test edx, edx
     jz   .nextrec                                  ; hole, skip
-    ; byte-reverse the 32-byte display-order hash at [rax] into le[]
-    xor  r10, r10
-.rev:
-    cmp  r10, 32
-    jge  .revdone
-    mov  r11, 31
-    sub  r11, r10
-    movzx r8d, byte [rax+r11]
-    mov  [rbp-0x48+r10], r8b
-    inc  r10
-    jmp  .rev
-.revdone:
+    ; NO byte reversal. index.dat records hold the hash in WIRE (raw sha256d)
+    ; order -- verified against the production archive: record 0 is genesis as
+    ; 6fe28c0a..., the exact reverse of its display form. This loop used to
+    ; reverse every record "into wire order" on the belief that the file held
+    ; DISPLAY order, which keyed the table backwards from every consumer: the
+    ; serve loop passes idx_get the hash straight off the p2p wire, so no
+    ; getdata could ever hit and the node served no block requested by hash.
+    ; (2026-08-27. test_serve missed it for years because it built its own
+    ; index with a plain idx_put loop instead of this function.)
     mov  rdx, rbx
     add  rdx, rcx                                   ; height = pos + i
     mov  rdi, r12
-    lea  rsi, [rbp-0x48]
+    mov  rsi, rax                                   ; record hash, as stored
     call idx_put
 .nextrec:
     mov  rcx, [rbp-0x50]

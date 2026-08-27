@@ -75,6 +75,35 @@ int main(void){
     idx_init(idx, 256);
     for(int i=0;i<TEST_NB;i++) idx_put(idx, bhash[i], i);
 
+    /* THE INDEX PRODUCTION ACTUALLY USES. daemon/main.c builds the serve
+     * loop's table with idx_build_from_file over index.dat, not with the
+     * idx_put loop above -- so this test proved the serve loop worked against
+     * an index nobody builds that way. Both constructions must agree, and the
+     * key must be the hash AS IT ARRIVES ON THE WIRE, because that is what
+     * the getdata handler passes to idx_get.
+     * (2026-08-27: they did not agree. index.dat stores wire order, and
+     * idx_build_from_file byte-reversed every record on the belief that it
+     * held display order, leaving the live node unable to serve any block
+     * requested by hash.) */
+    { extern long idx_build_from_file(void* idx, const char* path);
+      extern int  idx_get(void* idx, const unsigned char hash[32], long* height);
+      static unsigned char pidx[24 + 256*48];
+      idx_init(pidx, 256);
+      if (idx_build_from_file(pidx, "index.dat") < 0){
+          printf("FAIL idx_build_from_file could not read index.dat\n"); return 1; }
+      int bad = 0;
+      for (int i = 0; i < TEST_NB; i++){
+          long h = -1;
+          int found = idx_get(pidx, bhash[i], &h);
+          if (found != 1 || h != i){
+              if (!bad) printf("      first mismatch: block %d found=%d h=%ld\n", i, found, h);
+              bad++;
+          }
+      }
+      if (bad) printf("FAIL the production index (idx_build_from_file) misses %d/%d wire-order lookups\n", bad, TEST_NB);
+      else     printf("ok  : the production index construction answers wire-order lookups\n");
+      if (bad) return 1; }
+
     static unsigned char out[1<<20];
     /* loopback TCP */
     int ls=socket(AF_INET,SOCK_STREAM,0);

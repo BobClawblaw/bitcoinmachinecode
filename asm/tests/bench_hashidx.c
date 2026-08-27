@@ -2,9 +2,9 @@
  * hash->height index build (build_hash_index in daemon/main.c).
  *
  *   OLD (baseline) : verbatim copy of build_hash_index's C loop (fopen +
- *                     sequential fread + C byte-reverse + idx_put per record).
+ *                     sequential fread + idx_put per record).
  *   NEW            : asm/bitcoin_idx.asm:idx_build_from_file -- buffered
- *                     pread64 (192KB window) doing the same scan/reverse/put
+ *                     pread64 (192KB window) doing the same scan/put
  *                     entirely in one asm call.
  *
  * Runs read-only against a SNAPSHOT of index.dat (copied first) so it's safe
@@ -38,8 +38,11 @@ static void build_hash_index_c(void* ht_idx){
     for(long h=0;h<n;h++){
         if(fread(rec,1,48,f)!=48) break;
         if(rec[0]==0&&rec[1]==0&&rec[2]==0&&rec[3]==0) continue;
-        unsigned char le[32]; for(int k=0;k<32;k++) le[k]=rec[31-k];
-        idx_put(ht_idx, le, h);
+        /* index.dat holds WIRE order; key the table with the bytes as
+         * stored. This reference used to reverse, matching the loader's old
+         * (wrong) belief -- the two agreed with each other and both were
+         * keyed backwards from the serve loop. Fixed 2026-08-27. */
+        idx_put(ht_idx, rec, h);
     }
     fclose(f);
 }
@@ -99,10 +102,9 @@ int main(int argc, char** argv){
         if (fread(rec,1,48,f)!=48) break;
         if (!(rec[0]||rec[1]||rec[2]||rec[3])) continue;
         if (h % 4001 != 0) continue;
-        unsigned char le[32]; for(int k=0;k<32;k++) le[k]=rec[31-k];
         long hc=-1, ha=-1;
-        int fc = idx_get(idx_c, le, &hc);
-        int fa = idx_get(idx_a, le, &ha);
+        int fc = idx_get(idx_c, rec, &hc);      /* wire order, as stored */
+        int fa = idx_get(idx_a, rec, &ha);
         checked++;
         if (hc!=h || ha!=h) dup_seen++; /* hash duplicated at an earlier height -- expected */
         if (!fc || !fa || fc!=fa || hc!=ha) {
