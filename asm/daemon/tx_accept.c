@@ -625,12 +625,30 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     return 1;
 }
 
+/* The two -- and only two -- policy verdicts a package may overturn, in
+ * Core's words. Exported so the relay drain and the submitpackage path
+ * cannot drift apart on what "reconsiderable" means. */
+int txacc_fee_reconsiderable(const char* reason){
+    return reason && (!strcmp(reason, "min relay fee not met") ||
+                      !strcmp(reason, "mempool min fee not met"));
+}
+
 /* tx_accept_validate_p2p: the RELAY path's entry. Same verdict classes as
  * tx_accept_validate_reason (1 accept, -25 missing inputs, -26 other) so
  * the orphan pool can class its parks -- but it logs through the 30-second
  * SUMMARY, never per transaction. The drain briefly used _reason directly
  * for the -25 class and silently brought the per-tx reject firehose back;
- * per-tx lines belong to user submissions only. */
+ * per-tx lines belong to user submissions only.
+ *
+ * One extra class the RPC entries do not need: -28, "reconsiderable". Core
+ * splits a fee-only failure (TX_RECONSIDERABLE: min relay fee not met, or
+ * mempool min fee not met) out of the general reject class precisely because
+ * it is the one verdict a CPFP child can overturn -- everything else is
+ * final, and no amount of fee from a descendant makes an invalid parent
+ * valid. Those are the same two strings txsub_package already treats as
+ * rescuable, kept in one place here. Collapsing them into -26, as this used
+ * to, is what made 1p1c relay impossible: the drain could not tell a parent
+ * worth re-submitting inside a package from one worth discarding. */
 long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
                             unsigned long txlen){
     if (!g_ready || !g_pol_ready) return -26;
@@ -648,7 +666,12 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     mp_unlock();
-    if (padd != 1){ g_alog.rej_policy++; return -26; }
+    if (padd != 1){
+        g_alog.rej_policy++;
+        const char* r = mpool_policy_reason(g_pol);
+        if (r && txacc_fee_reconsiderable(r)) return -28;
+        return -26;
+    }
     g_alog.acc++;
     txacc_note_sigops(mp_area, txid, tx, txlen);
     mempool_note_accept(txid);
