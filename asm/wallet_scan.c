@@ -183,7 +183,7 @@ static unsigned long wscan_varint(const unsigned char* p, const unsigned char* e
  * never put a script hash in their key window, so the extra arm cannot
  * change what they match (a 160-bit collision between a key hash and a
  * script hash is not a real event). */
-static int wscan_spk_h160(const unsigned char* spk, unsigned long len, const unsigned char** h){
+int wscan_spk_h160(const unsigned char* spk, unsigned long len, const unsigned char** h){
     if (len == 22 && spk[0] == 0x00 && spk[1] == 0x14){ *h = spk + 2; return 1; }   /* P2WPKH */
     if (len == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 &&
         spk[23] == 0x88 && spk[24] == 0xac){ *h = spk + 3; return 1; }              /* P2PKH  */
@@ -461,4 +461,67 @@ long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out){
     }
     fclose(f);
     return got;
+}
+
+/* ---- wscan_write --------------------------------------------------------
+ * Rewrite the whole record file from an in-memory array, with the SAME
+ * durability discipline wscan_run uses: records into a temp file, fsync,
+ * header written LAST, fsync, rename. A crash therefore leaves either the
+ * previous complete file or the new complete one -- never a half-written
+ * record set that a reader would take as whole.
+ *
+ * This exists because importprunedfunds/removeprunedfunds edit the wallet's
+ * record set without rescanning the chain, and the alternative -- a second
+ * copy of the record layout in the RPC layer -- is how a format grows two
+ * writers that disagree. The packing below is the only other place that
+ * knows WSCAN_REC, and it sits beside the one in wscan_run for that reason.
+ *
+ * Returns 0 on success, -1 on failure with `err` filled; on failure nothing
+ * at `path` is disturbed. */
+int wscan_write(const char* path, const wscan_rec* recs, long n, long tip,
+                char* err, unsigned long errcap){
+    if (!path || (n > 0 && !recs)){
+        if (err && errcap) snprintf(err, errcap, "bad arguments");
+        return -1; }
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* f = fopen(tmp, "wb");
+    if (!f){ if (err && errcap) snprintf(err, errcap, "cannot create %s", tmp); return -1; }
+    unsigned char hdr[WSCAN_HDR];
+    memset(hdr, 0, sizeof hdr);
+    if (fwrite(hdr, 1, sizeof hdr, f) != sizeof hdr) goto fail;   /* placeholder */
+    for (long i = 0; i < n; i++){
+        const wscan_rec* r = &recs[i];
+        unsigned char rec[WSCAN_REC]; unsigned long w = 0;
+        for (int k=0;k<4;k++) rec[w++] = (unsigned char)(r->height >> (8*k));
+        memcpy(rec + w, r->txid, 32); w += 32;
+        for (int k=0;k<4;k++) rec[w++] = (unsigned char)(r->vout >> (8*k));
+        for (int k=0;k<8;k++) rec[w++] = (unsigned char)(r->value >> (8*k));
+        rec[w++] = r->kind;
+        for (int k=0;k<4;k++) rec[w++] = (unsigned char)(r->keyidx >> (8*k));
+        rec[w++] = r->branch;
+        memcpy(rec + w, r->prev_txid, 32); w += 32;
+        rec[w++] = r->is_coinbase;
+        if (w != WSCAN_REC) goto fail;      /* layout drift, caught here */
+        if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto fail;
+    }
+    { memcpy(hdr, WSCAN_MAGIC, 8);
+      unsigned int t32 = (unsigned int)(tip < 0 ? 0 : tip), n32 = (unsigned int)n;
+      for (int k=0;k<4;k++) hdr[8+k]  = (unsigned char)(t32 >> (8*k));
+      for (int k=0;k<4;k++) hdr[12+k] = (unsigned char)(n32 >> (8*k));
+      if (fflush(f) != 0 || fsync(fileno(f)) != 0) goto fail;
+      if (fseek(f, 0, SEEK_SET) != 0) goto fail;
+      if (fwrite(hdr, 1, sizeof hdr, f) != sizeof hdr) goto fail;
+      if (fflush(f) != 0 || fsync(fileno(f)) != 0) goto fail; }
+    if (fclose(f) != 0){ unlink(tmp);
+        if (err && errcap) snprintf(err, errcap, "close failed on %s", tmp);
+        return -1; }
+    if (rename(tmp, path) != 0){ unlink(tmp);
+        if (err && errcap) snprintf(err, errcap, "rename %s -> %s failed", tmp, path);
+        return -1; }
+    return 0;
+fail:
+    fclose(f); unlink(tmp);
+    if (err && errcap) snprintf(err, errcap, "short write to %s", tmp);
+    return -1;
 }

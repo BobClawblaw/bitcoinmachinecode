@@ -478,6 +478,98 @@ else
   fail "no second mature coinbase for the package test"
 fi
 
+echo "== importprunedfunds / removeprunedfunds, with a REAL proof =="
+# Core's pair for a pruned node: hand it a transaction plus a BIP37 merkle
+# proof and it learns of the funds without rescanning. The test is the round
+# trip against a real chain -- remove a confirmed wallet output from the
+# record set, watch the balance drop, import it back with a real gettxoutproof,
+# and watch the balance return. Asserting the calls "succeeded" would prove
+# nothing; the balance is what the wallet actually believes.
+# The coin must be mature AND UNSPENT: removing a receive that is already
+# spent contributes nothing to the balance, so the test would pass whatever
+# the code did. (It did exactly that on the first run.)
+read -r PF_TXID PF_HEIGHT <<PFEOF
+$(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'PFPY'
+import struct,sys
+d=open(sys.argv[1],'rb').read()
+S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+if not S: sys.exit("unexpected scan format")
+h,n=struct.unpack('<II',d[8:16]); body=d[16:]
+recs=[body[i*S:(i+1)*S] for i in range(n)]
+spent=set()
+for r in recs:
+    if r[48]==1:
+        vout,=struct.unpack('<I',r[36:40])
+        spent.add((r[54:86], vout))          # (prev_txid, vout) of the spend
+for r in recs:
+    ht,=struct.unpack('<I',r[0:4])
+    if r[48]!=0 or ht>h-100: continue
+    vout,=struct.unpack('<I',r[36:40])
+    if (r[4:36], vout) in spent: continue    # already spent: worthless here
+    print(r[4:36][::-1].hex(), ht); break
+else:
+    sys.exit("no mature UNSPENT receive to test with")
+PFPY
+)
+PFEOF
+if [ -n "${PF_TXID:-}" ]; then
+  BAL_BEFORE=$(bmc getbalance | jq_ "round(d['result']*1e8)")
+  # no txindex on this regtest node, so both lookups take the blockhash --
+  # which the scan record's height gives us
+  PF_BLOCK=$(bmc getblockhash "[$PF_HEIGHT]" | jq_ "d['result']")
+  PROOF=$(bmc gettxoutproof "[[\"$PF_TXID\"],\"$PF_BLOCK\"]" | jq_ "d['result']")
+  PF_RAW=$(bmc getrawtransaction "[\"$PF_TXID\",0,\"$PF_BLOCK\"]" | jq_ "d['result']")
+  [ -n "$PROOF" ] && [ -n "$PF_RAW" ] && ok "got a real proof and raw tx for $PF_TXID" \
+                                     || fail "could not build the proof fixture"
+
+  RM=$(bmc removeprunedfunds "[\"$PF_TXID\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('ERR:'+d['error']['message'] if d.get('error') else 'ok')")
+  [ "$RM" = "ok" ] && ok "removeprunedfunds dropped the transaction" \
+                   || fail "removeprunedfunds: $RM"
+  BAL_AFTER=$(bmc getbalance | jq_ "round(d['result']*1e8)")
+  [ "$BAL_AFTER" -lt "$BAL_BEFORE" ] \
+    && ok "the balance FELL after the removal ($BAL_BEFORE -> $BAL_AFTER sat)" \
+    || fail "balance unchanged by removeprunedfunds: $BAL_BEFORE -> $BAL_AFTER"
+
+  # a second removal must now say Core's "does not belong to this wallet"
+  RM2=$(bmc removeprunedfunds "[\"$PF_TXID\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print(d['error']['message'] if d.get('error') else 'REMOVED-AGAIN')")
+  case "$RM2" in
+    *"does not belong to this wallet"*) ok "...and removing it again is Core's -4" ;;
+    *)                                  fail "second removal: $RM2" ;;
+  esac
+
+  IMP=$(bmc importprunedfunds "[\"$PF_RAW\",\"$PROOF\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('ERR:'+d['error']['message'] if d.get('error') else 'ok')")
+  [ "$IMP" = "ok" ] && ok "importprunedfunds accepted the tx with its proof" \
+                    || fail "importprunedfunds: $IMP"
+  BAL_BACK=$(bmc getbalance | jq_ "round(d['result']*1e8)")
+  [ "$BAL_BACK" = "$BAL_BEFORE" ] \
+    && ok "the balance came BACK to exactly what it was ($BAL_BACK sat)" \
+    || fail "balance after import: $BAL_BACK, expected $BAL_BEFORE"
+
+  # importing twice must not double-count
+  bmc importprunedfunds "[\"$PF_RAW\",\"$PROOF\"]" >/dev/null 2>&1
+  BAL_TWICE=$(bmc getbalance | jq_ "round(d['result']*1e8)")
+  [ "$BAL_TWICE" = "$BAL_BEFORE" ] \
+    && ok "importing the same tx twice does not double-count" \
+    || fail "double import changed the balance: $BAL_TWICE"
+
+  # a garbage proof must be refused
+  BADP=$(bmc importprunedfunds "[\"$PF_RAW\",\"00\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print(d['error']['message'] if d.get('error') else 'ACCEPTED')")
+  case "$BADP" in
+    ACCEPTED) fail "a garbage proof was accepted" ;;
+    *)        ok "a garbage proof is refused: ${BADP%%:*}" ;;
+  esac
+else
+  fail "no mature wallet receive for the pruned-funds test"
+fi
+
 echo "== exportwatchonlywallet -> restorewallet round trip =="
 # Core promises the export "can be imported into another node using
 # restorewallet", so the test is the ROUND TRIP, not that a file appeared.
