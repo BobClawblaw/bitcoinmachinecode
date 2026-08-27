@@ -355,6 +355,33 @@ print('accepted' if d['error'] is None else d['error']['message'])")
   PREVTXS="[{\"txid\":\"$PTXID\",\"vout\":0,\"scriptPubKey\":\"$P_SPK\",\"amount\":$P_AMT}]"
   CSIGNED=$(bmc signrawtransactionwithwallet "[\"$CRAW\",$PREVTXS]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('child signing incomplete')")
 
+  # testmempoolaccept in PACKAGE mode, on both nodes, while neither has seen
+  # the pair. This is the case that used to be impossible: the child spends a
+  # parent that exists only inside the array, so validating the members
+  # independently reports missing-inputs. Core is asked the same question and
+  # the two answers are compared, not just ours checked for plausibility.
+  TMA_OURS=$(bmc testmempoolaccept "[[\"$PSIGNED\",\"$CSIGNED\"]]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+if d.get('error'): sys.exit('RPC error: '+json.dumps(d['error']))
+r=d['result']
+print(len(r), ','.join(str(e.get('allowed')) for e in r),
+      'eff' if all('effective-feerate' in e.get('fees',{}) for e in r) else 'noeff',
+      'pkgerr' if any('package-error' in e for e in r) else 'nopkgerr')")
+  TMA_CORE=$(core testmempoolaccept "[\"$PSIGNED\",\"$CSIGNED\"]" 2>/dev/null | python3 -c "
+import sys,json
+r=json.load(sys.stdin)
+print(len(r), ','.join(str(e.get('allowed')) for e in r),
+      'eff' if all('effective-feerate' in e.get('fees',{}) for e in r) else 'noeff',
+      'pkgerr' if any('package-error' in e for e in r) else 'nopkgerr')")
+  [ "$TMA_OURS" = "$TMA_CORE" ] \
+    && ok "testmempoolaccept package mode agrees with Core: $TMA_OURS" \
+    || fail "testmempoolaccept package mode: ours=[$TMA_OURS] core=[$TMA_CORE]"
+  case "$TMA_OURS" in
+    "2 True,True"*) ok "the child spending an in-array parent is allowed" ;;
+    *)              fail "package mode did not allow the pair: $TMA_OURS" ;;
+  esac
+
   PKG=$(bmc submitpackage "[[\"$PSIGNED\",\"$CSIGNED\"]]")
   PMSG=$(echo "$PKG" | jq_ "d['result']['package_msg']")
   if [ "$PMSG" = "success" ]; then
@@ -388,6 +415,46 @@ except Exception: print(raw.splitlines()[0] if raw else 'no output')")
     success|*already*) ok "Bitcoin Core accepts the same package ($CORE_PKG)" ;;
     *)                 fail "Core rejected the package: $CORE_PKG" ;;
   esac
+  # replaced-transactions: Core reports it ONCE at the top level, as the
+  # union across the package's members. This package replaces nothing, so
+  # both nodes must say so with an empty array -- present, not missing.
+  REP_OURS=$(echo "$PKG" | jq_ "json.dumps(d['result'].get('replaced-transactions','MISSING'))")
+  [ "$REP_OURS" = "[]" ] \
+    && ok "replaced-transactions is an empty array on a non-replacing package" \
+    || fail "replaced-transactions on a non-replacing package: $REP_OURS"
+
+  # ...and now one that DOES replace: a second child spending the same parent
+  # output, paying more. Both nodes must name the same displaced txid.
+  CTXID=$(bmc decoderawtransaction "[\"$CSIGNED\"]" | jq_ "d['result']['txid']")
+  C2_VAL=$((C_VAL - 30000))
+  C2_BTC=$(python3 -c "print('%.8f'%($C2_VAL/1e8))")
+  C2RAW=$(bmc createrawtransaction "[[{\"txid\":\"$PTXID\",\"vout\":0,\"sequence\":4294967293}],{\"$PKG_DEST\":$C2_BTC}]" | jq_ "d['result']")
+  C2SIGNED=$(bmc signrawtransactionwithwallet "[\"$C2RAW\",$PREVTXS]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('replacement signing incomplete')")
+  # The two nodes are peered, so a replacement submitted to one RELAYS to the
+  # other within milliseconds -- and a node that already has the transaction
+  # answers "already in mempool" and reports no replacements at all. Cut the
+  # link first, so each node performs the replacement itself and reports on
+  # its own work. (This bit the first run of this test: Core answered [] and
+  # it looked like a disagreement about the field.)
+  core disconnectnode "127.0.0.1:$BMC_P2P" >/dev/null 2>&1 \
+    || core setban "127.0.0.1" add 600 >/dev/null 2>&1 || true
+  sleep 1
+  REP2_OURS=$(bmc submitpackage "[[\"$C2SIGNED\"]]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+if d.get('error'): sys.exit('RPC error: '+json.dumps(d['error']))
+print(json.dumps(sorted(d['result'].get('replaced-transactions','MISSING'))))")
+  REP2_CORE=$(core submitpackage "[\"$C2SIGNED\"]" 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(json.dumps(sorted(d.get('replaced-transactions','MISSING'))))")
+  core setban "127.0.0.1" remove >/dev/null 2>&1 || true
+  [ "$REP2_OURS" = "[\"$CTXID\"]" ] \
+    && ok "replaced-transactions names the displaced child" \
+    || fail "replaced-transactions: got $REP2_OURS, expected [\"$CTXID\"]"
+  [ "$REP2_OURS" = "$REP2_CORE" ] \
+    && ok "...and Core reports exactly the same list" \
+    || fail "replaced-transactions differs: ours=$REP2_OURS core=$REP2_CORE"
 else
   fail "no second mature coinbase for the package test"
 fi
