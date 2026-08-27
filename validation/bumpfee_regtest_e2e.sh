@@ -184,6 +184,25 @@ NEW=$(echo "$BUMP"    | jq_ "d['result']['txid']")
 NEWFEE=$(echo "$BUMP" | jq_ "round(d['result']['fee']*1e8)")
 echo "  replacement $NEW  fee=$NEWFEE sat"
 
+# (0) the bump must be REACHABLE afterwards. gettransaction answers from the
+# wallet's send journal, and until 2026-08-27 nothing in the daemon ever wrote
+# it -- only the wallet_cli tool did -- so a bump performed over RPC recorded a
+# replaced-by linkage that no RPC could then read back. Both directions are
+# checked: replaced_by_txid on the original is the one a caller actually asks
+# for, and it is the one that needs the ORIGINAL to be journalled too.
+RB=$(bmc gettransaction "[\"$ORIG\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('ERR:'+json.dumps(d['error']) if d.get('error') else d['result'].get('replaced_by_txid','MISSING'))")
+[ "$RB" = "$NEW" ] && ok "gettransaction(original).replaced_by_txid == the replacement" \
+                   || fail "replaced_by_txid: got $RB, expected $NEW"
+RP=$(bmc gettransaction "[\"$NEW\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('ERR:'+json.dumps(d['error']) if d.get('error') else d['result'].get('replaces_txid','MISSING'))")
+[ "$RP" = "$ORIG" ] && ok "gettransaction(replacement).replaces_txid == the original" \
+                    || fail "replaces_txid: got $RP, expected $ORIG"
+
 echo "== assertions =="
 # (1) Core's formula, recomputed here, independent of the implementation
 EXPECT=$(python3 -c "
@@ -457,6 +476,27 @@ print(json.dumps(sorted(d.get('replaced-transactions','MISSING'))))")
     || fail "replaced-transactions differs: ours=$REP2_OURS core=$REP2_CORE"
 else
   fail "no second mature coinbase for the package test"
+fi
+
+echo "== the OFFLINE utxo builder agrees with the live writer on genesis =="
+# Core writes no chain's genesis coinbase to its chainstate. The live writer
+# has skipped it since 2026-08-22; the offline batch builder did not, so a set
+# built by the tool was one coin richer than one built by the node -- the two
+# writers disagreed about what the UTXO set IS. A dry run over the regtest
+# archive proves the skip on real blocks, without building a store.
+BU=${BUILD_UTXO:-$(dirname "$BMC_BIN")/build_utxo}
+if [ -x "$BU" ]; then
+  BUOUT=$("$BU" "$BMC_DIR/regtest" 16 1 --dry-run 0 0 2>&1 | grep -E "genesis_skipped|total tx=")
+  case "$BUOUT" in
+    *genesis_skipped=1*) ok "build_utxo skips the genesis coinbase, as the live writer does" ;;
+    *)                   fail "build_utxo did not skip genesis: $BUOUT" ;;
+  esac
+  case "$BUOUT" in
+    *puts=0*) ok "...and wrote no UTXO for it" ;;
+    *)        fail "build_utxo created a UTXO for genesis: $BUOUT" ;;
+  esac
+else
+  fail "build_utxo not built at $BU"
 fi
 
 echo "== BIP431 TRUC (version=3) topology, asked of both nodes =="
