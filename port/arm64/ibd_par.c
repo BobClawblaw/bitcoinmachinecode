@@ -328,8 +328,21 @@ static int g_ncli=0;       /* number of live clients */
 static int g_fd[MAXC];     /* client fds */
 static char g_peer_name[MAXC][128];   /* each client's connected peer host */
 static long g_client_served[MAXC];    /* blocks applied via each client */
+static long g_client_chunks[MAXC];    /* windows applied via each client */
 static unsigned char* g_rbuf[MAXC];
 static long g_next_issue=0;/* next window INDEX to issue (in height units /WB) */
+/* ---- dl_catchup worker-health tracking (x86 log parity: [dlc] table) ---- */
+#define DL_TICK           10
+#define DEAD_WEIGHT_BPS   32768.0   /* x86 node_config default */
+#define DEAD_WEIGHT_TICKS 3         /* x86 node_config default */
+static long g_client_bytes[MAXC];   /* bytes received via each client */
+static int  g_client_ticks[MAXC];   /* consecutive zero-progress ticks (Dragging) */
+static long g_blocks_last[MAXC];    /* for +N blk/s delta */
+static long g_bytes_last[MAXC];     /* for bytes/s delta */
+static time_t g_last_dlc=0, g_catchup_start=0;
+static long g_nreplaced=0;
+static long g_blk_w0=-1, g_blk_collected=-1;  /* head-of-line window progress */
+static long g_fd_cap[MAXC];         /* current window base each client owns */
 
 static void win_reset(struct win* w, long w0, long n){
     memset(w,0,sizeof *w);
@@ -343,6 +356,28 @@ static void log_peers(void){
         p+=snprintf(b+p,(sizeof b)-p," c%d=%s(%ld)", j,
             g_peer_name[j][0]?g_peer_name[j]:"?", g_client_served[j]);
     LLOG(7, "%s\n", b);
+}
+/* dialect a client to a NEW peer and re-request whatever window it owns
+ * (used for EOF rejoin and for dead-weight "early-kill" worker rotation).
+ * On total dial failure the client's window is released (owner=-1). */
+static int rotate_client(int j, unsigned char* hdr){
+    if(g_fd[j]>=0) fd_close(g_fd[j]);
+    g_fd[j]=-1;
+    int nfd=connect_peer(0, g_rbuf[j]);
+    if(nfd<0){
+        int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){ g_win[k].owner=-1; break; }
+        return -1;
+    }
+    g_fd[j]=nfd;
+    snprintf(g_peer_name[j],sizeof g_peer_name[j],"%s",g_peer_host);
+    int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){
+        long n2=g_win[k].n;
+        req_window(nfd, hdr, g_win[k].w0, n2);
+        g_win[k].collected=0;
+        for(int q=0;q<n2;q++) g_win[k].have[q]=0;
+        break;
+    }
+    return 0;
 }
 
 #define NODE_VERSION_MAJOR 1
@@ -496,31 +531,10 @@ int main(int argc, char** argv){
             if(r<=0){
                 /* client died: reconnect + re-request its current window (if any) */
                 LLOG(6, "[catchup] client %d peer EOF r=%d; reconnect\n", j, r);
-                fd_close(g_fd[j]); g_fd[j]=-1;
-                int nfd=connect_peer(0, g_rbuf[j]);
-                if(nfd<0){ fprintf(stderr,"client %d: no peer on re-dial\n",j);
-                            /* mark this client dead; its window stays unassigned and will
-                               be re-issued by a live client via free_win below */
-                            int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){ g_win[k].owner=-1; break; }
-                            /* drop the fd slot: compact live clients by swapping the last in */
-                            /* since ncli scan uses g_ncli, set fd=-1 and skip it forever */
-                            g_fd[j]=-1; continue; }
-                g_fd[j]=nfd;
-                snprintf(g_peer_name[j],sizeof g_peer_name[j],"%s",g_peer_host);
-                LLOG(7, "[catchup] client %d reconnected: %s fd=%d\n", j, g_peer_host, nfd);
-                int k; for(k=0;k<g_nwin;k++) if(g_win[k].owner==j){
-                    /* re-request whatever it still owns */
-                    long n2=g_win[k].n;
-                    req_window(nfd, hdr, g_win[k].w0, n2);
-                    /* leave collected=0 for the window if it might have been partial:
-                       reset collected to 0 is wrong (already-collected bytes are refetched
-                       harmlessly via getdata re-request); simplest: reset collected count */
-                    g_win[k].collected=0;
-                    for(int q=0;q<n2;q++) g_win[k].have[q]=0;
-                    break;
-                }
+                rotate_client(j, hdr);
                 continue;
             }
+            g_client_bytes[j]+=(long)plen;
             cmd[11]=0;
             if(strncmp(cmd,"block",5)==0){
                 unsigned char hh[32]; block_hash(hh,g_rbuf[j]);
@@ -539,6 +553,54 @@ int main(int argc, char** argv){
                 }
             } else if(strncmp(cmd,"ping",4)==0){
                 p2p_write(g_fd[j],"pong",4,g_rbuf[j],plen);
+            }
+        }
+        /* ---- [dlc] worker-health tick (x86 dl_catchup log parity) ---- */
+        {
+            time_t now=time(NULL);
+            if(g_catchup_start==0) g_catchup_start=now;
+            if(now - g_last_dlc >= DL_TICK){
+                g_last_dlc=now;
+                long elapsed = now-g_catchup_start;
+                long present = next_apply; if(present<0) present=0;
+                LLOG(7, "[dlc] == elapsed %lds | overall: %ld/%ld stored (%.2f%% of window) ==\n",
+                        elapsed, present, G_maxblk, 100.0*(double)present/(double)(G_maxblk>=1?G_maxblk:1));
+                LLOG(7, "[dlc] -- peer status (%ld/%d worker(s) active) --\n", (long)g_ncli, g_ncli);
+                /* the unique head-of-line blocker window: owner is the dragging candidate */
+                long target_base = start+next_apply;
+                int blk_i=-1;
+                for(int i=0;i<g_nwin;i++) if(g_win[i].w0==target_base){ blk_i=i; break; }
+                long blkw0=-1, blkcol=-1; int blkowner=-1;
+                if(blk_i>=0){ blkw0=g_win[blk_i].w0; blkcol=g_win[blk_i].collected; blkowner=g_win[blk_i].owner; }
+                for(int j=0;j<g_ncli;j++){
+                    long b=g_client_served[j];
+                    long blkrate=(b-g_blocks_last[j])/DL_TICK; if(blkrate<0)blkrate=0; g_blocks_last[j]=b;
+                    long by=g_client_bytes[j]; long byrate=(by-g_bytes_last[j])/DL_TICK; if(byrate<0)byrate=0; g_bytes_last[j]=by;
+                    char bw[16]; snprintf(bw,sizeof bw,"%ldB/s",byrate);
+                    char drag[32]="", flag[48]="";
+                    if(j==blkowner){
+                        if(blkw0==g_blk_w0){
+                            if(blkcol==g_blk_collected){ g_client_ticks[j]++; }
+                            else { g_client_ticks[j]=0; }
+                        } else { g_blk_w0=blkw0; g_client_ticks[j]=0; }
+                        g_blk_collected=blkcol;
+                        if(g_client_ticks[j]>0)
+                            snprintf(drag,sizeof drag," (Dragging: %d of %d)",g_client_ticks[j],DEAD_WEIGHT_TICKS);
+                        if(g_client_ticks[j]>=DEAD_WEIGHT_TICKS){
+                            g_client_ticks[j]=0;
+                            snprintf(flag,sizeof flag," [early-kill, last %s]",bw);
+                            LLOG(7,"[dlc]   w%d %s DRAGGING: no block progress %ds -> replacing worker\n",
+                                    j, g_peer_name[j][0]?g_peer_name[j]:"(connecting)", DEAD_WEIGHT_TICKS*DL_TICK);
+                            if(rotate_client(j, hdr)==0){ g_nreplaced++;
+                                LLOG(7,"[dlc]   w%d replaced by %s fd=%d\n", j, g_peer_host, g_fd[j]);
+                            }
+                        }
+                    } else g_client_ticks[j]=0;
+                    LLOG(7, "[dlc]   w%d %-21s chunks=%-4ld blocks=%-8ld (+%ld blk/s, %s)%s%s%s\n",
+                        j, g_peer_name[j][0]?g_peer_name[j]:"(connecting)", g_client_chunks[j], b,
+                        blkrate, bw, "", flag, drag);
+                }
+                LLOG(7, "[dlc] -- workers replaced this run: %ld --\n", g_nreplaced);
             }
         }
         /* apply windows strictly in height order */
@@ -624,7 +686,7 @@ int main(int argc, char** argv){
             }
             next_apply += nw;
             /* credit this window's blocks to its client and log the peer */
-            if(w->owner>=0) g_client_served[w->owner]+=nw;
+            if(w->owner>=0){ g_client_served[w->owner]+=nw; g_client_chunks[w->owner]++; }
             /* free the window slot: remove by shifting the tail in */
             for(int i=k;i<g_nwin-1;i++) g_win[i]=g_win[i+1];
             g_nwin--;
