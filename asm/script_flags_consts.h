@@ -20,4 +20,11 @@
 #define SFC_R_HEIGHT_CSV    1
 #define SFC_R_HEIGHT_SEGWIT 0
 
+/* testnet4 (CTestNet4Params) */
+#define SFC_T_HEIGHT_BIP34  1
+#define SFC_T_HEIGHT_DERSIG 1   /* BIP66 */
+#define SFC_T_HEIGHT_CLTV   1   /* BIP65 */
+#define SFC_T_HEIGHT_CSV    1
+#define SFC_T_HEIGHT_SEGWIT 1
+
 #endif
