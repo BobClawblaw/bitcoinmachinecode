@@ -44,9 +44,6 @@ static long filesize(const char* path){
  * this test's synthetic hashes) write/compare hashes in plain, unreversed
  * order, so queries against the loaded index must reverse first to match
  * what idx_build_from_file actually inserted. */
-static void reverse32(unsigned char out[32], const unsigned char in[32]){
-    for (int i=0;i<32;i++) out[i] = in[31-i];
-}
 
 /* IDX layout: +0 n, +8 mask, +16 reserved[8], +24.. slots (48B stride) */
 #define IDX_SLOTS 64
@@ -103,17 +100,19 @@ int main(void){
         long rc = idx_build_from_file(g_idx, "index.dat");
         cki("idx_build_from_file rc", rc, 0);
         cki("idx_count == 3 after truncate", idx_count(g_idx), 3);
+        /* look up with the hash AS STORED (wire order) -- index.dat holds
+         * wire order and the loader no longer reverses it, so this is also
+         * the order the serve loop passes idx_get. Reversing here matched
+         * the loader's old, wrong belief. Fixed 2026-08-27. */
         for (int h=0; h<3; h++){
             long got_h = -999;
-            unsigned char rev[32]; reverse32(rev, hashes[h]);
-            int found = idx_get(g_idx, rev, &got_h);
+            int found = idx_get(g_idx, hashes[h], &got_h);
             cki("idx_get finds surviving height (found flag)", found, 1);
             cki("idx_get finds surviving height (value)", got_h, h);
         }
         for (int h=3; h<5; h++){
             long got_h = -999;
-            unsigned char rev[32]; reverse32(rev, hashes[h]);
-            int found = idx_get(g_idx, rev, &got_h);
+            int found = idx_get(g_idx, hashes[h], &got_h);
             cki("idx_get must NOT find truncated-away height", found, 0);
         }
 

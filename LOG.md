@@ -7,6 +7,335 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- mempool.dat, both directions
+
+`savemempool` and `importmempool` are real, in Core's format, and the
+interop is proven BOTH ways against a running Core: Core loads the dump this
+node writes, and this node loads the dump Core writes.
+
+FORMAT. uint64 version; for v2 an obfuscation key; uint64 count; then per
+transaction the witness serialization, an int64 entry time and an int64 fee
+delta; then the leftover delta map and the unbroadcast set. We WRITE version
+1 -- not a divergence invented here, it is Core's own `-persistmempoolv1`
+form and Core reads it unconditionally. v2's obfuscation exists to stop
+antivirus software mangling the file, and its key is random, so no writer
+could produce a byte-comparable artifact anyway. We READ both, because a
+file handed to us was most likely written by a default Core.
+
+THE BUG THE INTEROP TEST CAUGHT, and the reason it is worth writing interop
+tests at all. The v2 key is serialized as a VECTOR -- a compact-size length
+prefix, then the bytes -- so the body starts at offset 17, not 16. Core says
+so in a comment ("Use vector serialization for convenient compact size
+prefix"). Reading it as a bare 8-byte key decodes the transaction COUNT
+correctly, because that is 8 bytes at an 8-aligned offset, and then fails on
+the first transaction.
+
+The unit test did not catch it, and the reason is the instructive part: the
+v2 fixture was built by the test itself, from the same wrong assumption the
+reader held. The two agreed and both were wrong. A self-built fixture only
+tests a format if it is built FROM the format. It is now built to Core's
+layout, and the comment says why.
+
+WHERE EACH HALF RUNS. The dump reads the shared pool directly under the same
+lock getrawmempool uses, and writes while still holding it -- the entry
+pointers are into the shared blob, and releasing first would let an eviction
+move the bytes out from under the writer. The load cannot be done in the
+parent: admitting a transaction is the worker's job, so import re-submits
+each one through the channel sendrawtransaction uses and every entry gets
+the full consensus and policy treatment on the way back in. Core
+re-validates on load too.
+
+NOT RESTORED, stated rather than glossed: entry times and fee deltas (a
+re-admitted transaction gets a fresh time, and this node has no
+prioritisetransaction path to replay a delta into), and the unbroadcast set,
+which this node does not track because sendrawtransaction relays to every
+live leg immediately.
+
+## 2026-08-27 -- package relay: submitpackage, and a child paying for its parent
+
+The point of a package is that a transaction which cannot stand alone gets
+in because another one pays for it. That is now real, and the e2e proves it
+in the only way that counts: the parent is FIRST refused on its own with
+"min relay fee not met", and then accepted as part of the package -- and
+Bitcoin Core accepts the identical package.
+
+THREE PIECES.
+1. Context-free policy (bitcoin_mempool_policy.c) -- count, weight,
+   duplicates, topological order, conflicts, with Core's exact reason
+   strings. Built on parse_tx, the same walker the single-transaction path
+   uses; a second parser is how a package and a lone transaction start
+   disagreeing about what a transaction IS.
+2. In-package parent resolution (daemon/tx_accept.c) -- a child must be able
+   to resolve a parent that is in neither the chain nor the mempool. THE
+   TRAP, hit on the first wiring: this node has TWO prevout resolvers, the
+   script verifier's and the one mempool policy charges fees through. Adding
+   the overlay to only the first makes the child verify and then fail fee
+   computation with bad-txns-inputs-missingorspent. Both now share one
+   helper.
+3. Effective feerate -- the two fee floors are evaluated against the package
+   aggregate when a package is in effect. Those two floors are the ONLY
+   checks a package may relax: a member that fails anything else is invalid
+   or non-standard on its own terms and no amount of fee from a child
+   changes that.
+
+TWO PASSES, and the order is the design. Pass 1 is a DRY RUN with the
+overlay installed, so every member's real fee and vsize become known without
+inserting anything; only then is the package feerate known, and only then
+does pass 2 commit. Inserting optimistically and checking the aggregate
+afterwards would mean removing transactions that should never have been
+accepted, and a failure partway through that removal leaves the mempool
+holding a transaction below the floor.
+
+RESULT SHAPE IS CORE'S, not a reduced one of our own -- package_msg,
+tx-results keyed by wtxid, txid / vsize / vsize_bip141 /
+fees{base, effective-feerate, effective-includes} / error, and Core's own
+"package-not-validated" for members that never got an individual verdict.
+effective-feerate is the aggregate the package was actually evaluated
+against and effective-includes lists every member whose fee went into it, so
+both are reported rather than omitted. "replaced-transactions" is absent,
+which is Core's own convention (the field is optional there); this node does
+not track package-driven RBF evictions.
+
+A BUG THIS FOUND, and the reason the first run returned zero results:
+tx_wtxid in bitcoin_cmpct.asm sets NO return value, but rpc_node.c declared
+it int and checked for 1 -- reading whatever happened to be in rax and
+silently dropping every entry. tests/test_bip152.c had the void declaration
+right all along. Third inconsistent-declaration bug of the day, after the
+implicit declarations in 73d813b and tx_txid's void/int split.
+
+NOT DONE, and not claimed: p2p 1-parent-1-child package RELAY (this is
+submission, not relay), TRUC/v3 and ephemeral dust policy,
+replaced-transactions reporting, and testmempoolaccept's package mode --
+which still evaluates each member independently and says so in its own
+documented divergence.
+
+## 2026-08-27 -- gettxout answers for real: the RPC asks the download worker
+
+The embedded RPC server lives in the serve PARENT, which has no handle on
+the live UTXO set -- the download worker owns it in another process. The
+handler's `if (!g_utxo_lst) return null` therefore fired on every request,
+and null is not "I cannot say": in gettxout it means "that output is not
+unspent". The live node was answering, confidently and wrongly, that every
+coin in existence is spent. Confirmed against production with the previous
+block's coinbase, which cannot be spent.
+
+WHY NOT A READ-ONLY VIEW IN THE PARENT. That was the obvious fix and it is
+SAFE -- the manifest and compaction publish tmp+fsync+rename so a
+cross-process reader sees old-or-new and never torn, and lsm_get_scratch is
+already thread-local. It fails on COST: utxo_lsm_reload_ro measures
+60.4/61.9/72.1/73.2/79.4/82.6 s on the real 165M-entry set across six
+production boots, and every new block invalidates the view, so even a cached
+one makes the first call after each block block for a minute.
+
+WHAT IT DOES INSTEAD. A socketpair created before the fork; the parent asks,
+the worker answers from the set it already has open, in microseconds. The
+worker replies ONLY at a quiescent point in its loop, after the catch-up
+call: utxo_lsm_get is thread-safe by itself, but this module guarantees
+get() and flush() never overlap BY CONSTRUCTION, and a query thread in the
+worker would have broken precisely that guarantee.
+
+THE PROPERTY THIS HAD TO KEEP is not "usually right", it is NEVER WRONG.
+Every failure path refuses: no worker, timeout, short read, lost framing.
+And the response ECHOES the outpoint it answers -- without that, a query
+that timed out would leave its reply in the socket and the NEXT query would
+read a perfectly well-formed response about a DIFFERENT coin. Magic alone
+cannot catch that. tests/test_txoq_ipc pins the hit, the absent case, the
+two refusal cases and the stale-reply case; the stale one was verified
+fail-then-pass by removing the echo check, which makes it return the wrong
+coin's value.
+
+PROVEN AGAINST CORE. validation/bumpfee_regtest_e2e.sh now diffs gettxout
+against Core's on the same outpoint: value, scriptPubKey hex and the
+coinbase flag match exactly, and a spent outpoint is null from both nodes.
+
+That first real diff immediately caught something else: gettxout emitted
+`value` as a JSON STRING where Core emits a NUMBER (ValueFromAmount is
+UniValue VNUM). Every other amount in rpc_commands.c already used rj_numf;
+gettxout was the lone holdout, invisible for as long as it only ever
+returned null. Fixed here, together with the same shape bug in
+listunspent's `amount` and getbalance's result.
+
+## 2026-08-27 -- bumpfee proven end to end against a real Bitcoin Core
+
+`validation/bumpfee_regtest_e2e.sh` closes the coverage gap the bumpfee
+entry below admitted to. The hermetic suite can only reach the argument
+surface (missing txid -> -8, unknown txid -> Core's -5); the parts that
+move money -- the fee arithmetic and the change adjustment -- are only
+observable end to end. The script stands up a scratch Core regtest and a
+bmc regtest from nothing, funds a fresh wallet, broadcasts an original with
+change, bumps it, and asserts six things. It passes from scratch, twice,
+and cleans up after itself.
+
+The decisive assertion is not that our node likes its own result but that
+**Bitcoin Core accepts the replacement into its mempool and drops the
+original**. It does.
+
+The fee assertion recomputes Core's formula in the script, independent of
+the implementation: floor(old_fee*1000/vsize) + 1 + max(incrementalrelayfee,
+5000), then ceil(rate*vsize/1000). Observed on a 141-vB original paying
+10,000 sat: floor(70921.98)=70921, +1+5000 = 75922 sat/kvB, ceil -> 10,706
+sat. The node returned exactly 10,706, and the change output shrank by
+exactly 706 sat with the payment output untouched. The two roundings go in
+OPPOSITE directions (GetFeePerK down, GetFee up), which is what made the
+overpay bug fixed earlier today easy to introduce.
+
+TWO REAL FINDINGS while building it, neither a bumpfee bug:
+  - **connect= only honours a chain's DEFAULT P2P port.** `connect=127.0.0.1:19444`
+    on regtest is logged and IGNORED ("only a chain's default P2P port ...
+    is supported for named peers"); the node then sits at tip=0 with
+    peers=0/0. Core accepts any host:port. The script pins CORE_P2P to
+    18444 with a comment; the limitation itself is worth closing.
+  - **getbalance/listunspent read the ADDRESS INDEX, not the wallet scan.**
+    The address index is an extension, default OFF, so on a node without
+    `addrindex=1` a funded wallet reports 0.00000000 and an empty
+    listunspent while walletscan.dat correctly holds every receive. That is
+    a surprising split for anyone funding a fresh node; bumpfee itself is
+    unaffected because it reads the scan records.
+
+Also confirmed: the bumped.dat linkage sidecar is written with both txids,
+but gettransaction resolves a txid against the wallet's SEND JOURNAL, so a
+transaction broadcast via createrawtransaction/sendrawtransaction (as this
+script does, deliberately avoiding coin selection) is not one it will
+report on. The replaced_by_txid/replaces_txid fields are therefore NOT
+exercised by this script -- stated, not glossed.
+
+## 2026-08-27 -- bumpfee / psbtbumpfee: the last two wallet refusals
+
+The RBF fee-bump family is real (Core wallet/feebumper.cpp semantics).
+bumpfee signs and broadcasts; psbtbumpfee returns the unsigned PSBT.
+
+WHERE THE ORIGINAL LIVES. The original of a bump is an UNCONFIRMED wallet
+transaction, and this wallet journals METADATA, not raw bytes -- so the
+mempool is the only place it still exists. rpc_node_mempool_rawtx() copies
+it out under the pool lock. Two honest consequences, each refused with its
+own message rather than papered over: a wallet tx that has fallen out of
+the mempool cannot be re-bumped (Core can, from mapWallet), and "is this
+ours" is decided by input ownership against the scan records.
+
+FEE ARITHMETIC, and a real divergence found by reading Core's source
+instead of trusting the comment. Core's EstimateFeeRate builds the base
+rate as CFeeRate(old_fee, txSize), whose GetFeePerK evaluates the rational
+DOWN, and then adds 1 sat/kvB -- Core's own comment says exactly why:
+"calculated from the tx fee/vsize, so it may have been rounded down. Add 1
+satoshi to the result." This implementation had been computing the base
+with a ROUND-UP division and then adding the same 1, double-compensating
+and overpaying 1 sat/kvB on every bump whose fee*1000 is not a multiple of
+its vsize. Now truncating, like Core. The CHECK side was already right:
+Core's CFeeRate::GetFee rounds UP (EvaluateFeeUp), matching the
+(rate*vsize + 999)/1000 used for every fee comparison.
+
+The four CheckFeeRate gates run in Core's order with Core's messages
+(below mempool minimum; total < oldFee + incrementalFee; total < required
+fee; total > -maxtxfee), and all five refusal strings were verified
+verbatim against src/wallet/ in the Core tree.
+
+DOCUMENTED DIVERGENCES, refused rather than half-implemented:
+  - the increase comes from the CHANGE output only (shrunk, or dropped to
+    fees under the 294-sat P2WPKH dust threshold). Core's CreateTransaction
+    may add further wallet inputs when change cannot cover it; this keeps
+    the input set fixed and refuses.
+  - the `outputs` and `original_change_index` options are refused.
+gettransaction reports replaced_by_txid / replaces_txid from a bumped.dat
+sidecar, since this wallet has no mapWallet to carry the linkage.
+
+COVERAGE, stated honestly: the suite pins the wiring and the argument
+surface (missing txid -> -8, unknown txid -> Core's -5 text, both verbs).
+The fee arithmetic and the change/dust path are NOT yet covered by an
+end-to-end test -- they were verified by differential reading against
+Core's source, which is what caught the rounding bug above. An e2e bump
+against the regtest Core pair was the obvious next step; it was written and
+is passing the same day -- see the entry above.
+
+## 2026-08-27 -- nBits schedule enforcement (bad-diffbits), one rule engine
+
+Closes a consensus gap this repo had documented against itself. reorg.c's
+own comment used to read: "Retarget validation is a real gap in this node's
+consensus rules; it is pre-existing, it is called out in this stage's
+report, and chainwork comparison is what contains it." A peer could serve
+headers claiming any nBits it liked; nothing checked the claim against the
+schedule Core computes. Cumulative-work fork choice contained the damage
+(a trivially-mined chain scores near zero) but containment is not
+validation.
+
+ONE IMPLEMENTATION, THREE CONSUMERS. bitcoin_pow_rules.c is Core pow.cpp's
+GetNextWorkRequired / CalculateNextWorkRequired, MOVED (not copied) out of
+rpc_chain.c's gbt_next_bits and rpc_chain_retarget. getblocktemplate, the
+apply path (utxo_live) and fork evaluation (reorg_analyze) now share it, so
+mining and enforcement cannot drift: a template this node builds is by
+construction one its own validator accepts. rpc_chain_retarget survives as
+a thin wrapper keeping the frozen hermetic KAT surface. Every consumer
+supplies its own ancestor-header reader (archive pread for the daemon, the
+candidate's own run above the attach point for reorg, an in-memory mirror
+for the replay tool).
+
+Chain-aware, passed EXPLICITLY rather than through hidden globals:
+fPowNoRetargeting (regtest), fPowAllowMinDifficultyBlocks with the
+20-minute exception and Core's walk-back loop (testnet4), enforce_BIP94
+(the boundary retarget bases on the FIRST block of the period), and
+Satoshi's 2015-gap timespan measurement on mainnet.
+
+PROOF BEFORE WIRING -- validation/pow_replay.c replays the rule against
+every header of the real chains and demands an exact nBits match at every
+height:
+  mainnet   964,265 heights,  478 boundaries,      0 min-difficulty
+  testnet4  149,954 heights,   74 boundaries, 101,009 min-difficulty,
+                                               16,491 walk-back re-anchors
+Both clean. Core accepted every one of those headers; our rule agrees with
+every one of them, so the rule is Core's rule over every input the real
+world has produced. The testnet4 run is what matters most -- it exercises
+the min-difficulty and walk-back paths 100k+ times, and mainnet touches
+neither.
+
+INJECTED, DEFAULT OFF. The hermetic suites build synthetic chains with
+arbitrary bits, so only the daemon -- which knows the selected chain --
+arms the rules (main.c, right after chainparams_select). Both enforcement
+points fail CLOSED: pow_check_bits returning -1 (an ancestor header
+unreadable) rejects, because refusing to evaluate is safer than accepting
+unevaluated, and every legitimate path has its ancestors stored. The apply
+path enforces the same rule the fork path does, so a route that skips
+analyze still cannot land a bad-diffbits block; the dry run enforces it
+too, so submitblock and GBT proposal answer Core's "bad-diffbits" without
+touching state.
+
+THE TEST THAT MATTERS. test_pow_rules pins the engine and pow_replay pins
+it against reality, but neither proves the enforcement is actually WIRED --
+and default-off means a wiring bug (setter never called, height off by one,
+reader returning the wrong ancestor) would enforce NOTHING while the whole
+suite stayed green. That is the worst failure mode consensus code has, so
+test_reorg's "nBits schedule wired into analyze" case arms the rules on a
+synthetic regtest chain and asserts a candidate with unscheduled bits is
+rejected. Verified fail-then-pass by sabotage: with the arming call removed
+the bad candidate is ACCEPTED (got=0, expected -1) and the case fails.
+
+## 2026-08-27 -- the networking pair: stripped-block serving + BIP339 wtxidrelay
+
+Two long-standing FEATURE_GAPS networking items, closed together.
+
+STRIPPED-BLOCK SERVING (bare MSG_BLOCK). The serve loop held only the full
+(witness) serialization and sent it for every block getdata -- fine for a
+modern peer (MSG_WITNESS_BLOCK), but a strict pre-BIP144 peer asking for a
+bare MSG_BLOCK cannot parse the segwit marker/flag bytes. daemon/
+block_strip.c produces the non-witness form (header + tx count + each tx
+stripped via the KAT-proven strip_witness_asm), and the serve arm now
+checks the getdata's witness bit: set -> full block; clear -> stripped.
+A strip failure serves NOTHING (never a wrong form). Proof
+(test_block_strip, real mainnet block 700038): stripped length ==
+Core strippedsize (20118), header byte-identical, and the merkle root of
+the stripped transactions == the header's committed root -- the content
+proof, since the merkle tree commits to non-witness txids. Re-strip is a
+no-op.
+
+BIP339 wtxidrelay. Both handshake roles (node_handshake outbound,
+node_accept_handshake inbound) now send `wtxidrelay` after version and
+before verack. Deliberately NO per-leg negotiation state: we announce our
+own txs by txid (which every peer understands), so advertising wtxidrelay
+only tells peers they MAY announce to us by wtxid -- and the relay drain
+now accepts MSG_WTX (type 5) invs alongside MSG_TX (type 1), requesting a
+type-5 inv with a type-5 getdata (the wtxid dialect; pool-dedup applies
+only to txid announcements, tx_accept's own dedup absorbs a wtxid re-
+fetch). test_bitcoind asserts (via the forked fake peer's exit status)
+that wtxidrelay arrives before verack; test_tx_relay pins the MSG_WTX
+inv -> MSG_WTX getdata path.
 ## 2026-08-27 -- Live address index (EXTENSION): addrindex=1, getaddressbalance/getaddresstxids
 
 FEATURE_GAPS' "build_addr_index.c is an offline batch tool only" item is
@@ -167,6 +496,170 @@ material as tpub derives the same witness program and sees the funded
 7.5 BTC). Divergences stated: single-active-wallet; importdescriptors is
 watch-only-scoped; migratewallet/setwalletflag/createwalletdescriptor and
 the pruned-funds pair still refuse with reasons.
+## 2026-08-27 -- Mempool policy Core-parity: IMPLEMENTED and differentially proven
+
+All eight survey gaps (next entry down) are closed in
+bitcoin_mempool_policy.c (rewritten around the same flat-buffer state) plus
+surgical changes to daemon/{tx_accept,mempool_cfg,main}.c and rpc_node.c:
+
+ - BLOCK-CONNECT RECONCILIATION: mpool_policy_block_connect (Core
+   removeForBlock + removeConflicts) runs at the worker's per-block choke
+   point under the pool lock: confirmed txs leave pool+graph alone (their
+   children stay), txs conflicting with a block's spends leave WITH their
+   descendants, and the rolling floor's decay gate opens.
+ - PACKAGE EVICTION: TrimToSize evicts argmin of max(own, with-descendants
+   feerate) together with its whole descendant set; with-descendant fee
+   aggregates are maintained incrementally (desc_fee beside desc_cnt/
+   desc_bytes), so eviction stays one O(n) scan. The removed PACKAGE
+   feerate + incrementalrelayfee becomes the floor; an incoming tx that IS
+   the worst is refused "mempool full".
+ - ROLLING MINFEE: sat/kvB, lazy exponential decay per Core's GetMinFee
+   (12h halflife, /2 under half-full, /4 under quarter-full, zero below
+   incrementalrelayfee/2, gated on a block since the last bump; integer
+   q16 table, libm-free). getmempoolinfo's conversion updated.
+ - RBF: signaling checked on the REPLACED txs, only when fullrbf=0 (the
+   old code required the REPLACEMENT to signal -- backwards, and always);
+   conflicts evicted WITH descendants, their fees counted in rule 3;
+   disjointness; no-new-unconfirmed-inputs; <=100 evicted; rule 4 priced
+   at the replacement's own VSIZE. Core's strings throughout.
+ - VSIZE everywhere fee/limit math happens (was raw serialized length).
+ - STANDARDNESS (IsStandardTx + PreChecks order): version 1..3, weight
+   400k, scriptsig 1650/push-only, scriptpubkey classifier (incl. P2A and
+   future witness), datacarrier budget, dust (Core's 148/67-byte spend-
+   cost model, CFeeRate::GetFee never-zero rounding), tx-size-small AFTER
+   the output checks (Core's order -- caught by the unit test), coinbase.
+   New config keys: dustrelayfee, datacarrier, datacarriersize,
+   acceptnonstdtxn (defaults = Core's; the synthetic-fixture vector tests
+   now run under acceptnonstdtxn, Core's own regtest escape hatch).
+ - EXPIRY: descendant packages through the policy layer (the old
+   structural-only delete left children with phantom parents and leaked
+   graph slots); arrival-table ghosts cleared via a removal callback.
+
+PROOF. tests/test_mempool_core_parity: 72 checks over every rule above
+including the reject strings and a white-box decay check.
+tests/mempool_policy_vec.h regenerated from a Core-semantics reference
+model (the old model contained the backwards signaling rule).
+validation/mempool_policy_diff.py: DIFFERENTIAL ADMISSION against the v31
+oracle -- two isolated nodes (the oracle's chain fed to bmc over RPC
+submitblock, no P2P coupling), identical raw txs to both
+sendrawtransactions: 10/10 - simple accept, zero-fee, dust, datacarrier
+(both at -datacarriersize=83), RBF accept + insufficient-fee, 25-deep
+chain both-accept, quiet mempoolminfee equal (oracle pinned to the classic
+minrelay this node implements) -- and the 26th chain link asserted as the
+EXPECTED version delta (v31 cluster limits accept it; classic
+"too-long-mempool-chain" refuses).
+
+KNOWN DELTAS (stated): TRUC/v3 topology, package relay/submitpackage,
+ephemeral anchors, sibling eviction; v31's cluster-mempool chain/eviction
+model (this node implements the classic ancestor/descendant model its
+knobs expose); BIP125 inherited signaling simplified to direct signaling
+(moot under fullrbf, the default); v31's 0.1 sat/vB minrelay default (we
+keep the classic 1 sat/vB); bmc sendrawtransaction has no client-side
+maxfeerate guard (RPC-surface, not admission policy).
+
+MERGE NOTES (for the parent; mining-polish touches the same files): the
+policy-node struct gained raw_len+desc_fee and size became VSIZE;
+MPOL_HDR 64->96 (floor sat/kvB at +48, last-update +56, pool bytes +64,
+blob cap +72, flags +80); MPOL_MAX_PARENTS 16->24. mining-polish's
+mined-tx pruning (utxo_live callback -> bare mpool_del) is SUBSUMED by
+mpool_policy_block_connect, which also cleans the policy graph -- prefer
+this path (a bare mpool_del before it is harmless but redundant). Its
+mpool_policy_set_sigops should graft as one more mpol_node field + a
+txid-lookup setter; pol_entry sizes now report vsize (what
+getmempoolentry wants).
+
+----------------------------------------------------------------------------
+## 2026-08-27 -- Mempool policy Core-parity: gap survey (implementation follows)
+
+Directive: "our mempool policy must be the same as Core". Survey of
+daemon/tx_accept.c + bitcoin_mempool_policy.c against Core's
+validation.cpp MemPoolAccept / txmempool.cpp / policy/{policy,rbf}.cpp
+(read from /storage/bitcoin-core-source, v31 tree). Gaps found, in
+severity order:
+
+ 1. NO BLOCK-CONNECT RECONCILIATION. Nothing removes a confirmed tx (or
+    txs conflicting with a block's spends) from the pool or the policy
+    graph at the new-block choke point -- Core's removeForBlock has no
+    counterpart. Mined txs linger until -mempoolexpiry; RBF conflict
+    scans and ancestor accounting run against ghosts.
+ 2. Eviction is per-LEAF, not per descendant PACKAGE (was documented as a
+    divergence; now closing): Core evicts argmin of max(own feerate,
+    with-descendants feerate) AND its whole descendant set, floors at the
+    removed PACKAGE feerate + incrementalrelayfee.
+ 3. mempoolminfee never DECAYS: Core's rolling floor halves every 12h
+    (faster when the pool is under 1/2 / 1/4 full), zeroes below
+    incrementalrelayfee/2, and only decays once a block has connected
+    since the last bump. Ours is a ratchet.
+ 4. RBF is a sketch, and one rule points the WRONG WAY: we require the
+    REPLACEMENT to signal BIP125; Core requires the REPLACED tx to signal
+    -- and only when fullrbf is off (default on since v28). Missing: rule
+    2 (no new unconfirmed inputs), rule 5 (<=100 evicted incl.
+    descendants), evicting conflicts' DESCENDANTS (we leave children with
+    phantom parents), the disjointness check (we would accept a
+    replacement that spends an output of the tx it evicts), and rule 4
+    charges a flat 1kvB instead of incremental * replacement vsize.
+ 5. Fee arithmetic uses RAW tx length, not VSIZE, everywhere (relay
+    floor, limits, eviction feerates, estimator) -- stricter than Core
+    for witness txs, wrong for parity.
+ 6. Expiry leaks: mempool_expire_now does the structural delete only --
+    policy graph nodes/claims/outreg survive, descendants of expired txs
+    survive with phantom parents (Core expires descendants too).
+ 7. No standardness layer: version bounds, tx-size (weight 400k),
+    tx-size-small (<65), scriptsig-size (1650), scriptsig-not-pushonly,
+    scriptpubkey type check, datacarrier budget, dust (3000 sat/kvB
+    discard rate, 148/67-byte spend-cost model), coinbase-as-tx.
+ 8. Reject strings are homegrown; Core's exact strings ("mempool min fee
+    not met", "min relay fee not met", "bad-txns-inputs-missingorspent",
+    "txn-already-in-mempool", "too-long-mempool-chain", "insufficient
+    fee", "txn-mempool-conflict", "mempool full", ...) surface through
+    RPC and matter for differential testing.
+
+Known deltas that stay (stated, not attempted): TRUC/v3 topology rules,
+package relay/submitpackage, ephemeral anchors, sibling eviction, and the
+v31 oracle's CLUSTER mempool (its TrimToSize evicts linearization chunks
+and its chain limits are cluster limits -- this node targets the classic
+ancestor/descendant model its config knobs expose; differential cases
+where v31 diverges from classic policy are recorded as version-target
+deltas, not failures).
+## 2026-08-27 -- Testnet4 as a third chain: full sync + muhash proven against Core
+
+chain=testnet4 (or testnet4=1) joins main/regtest. Unlike regtest this is a
+REAL public network: real PoW with retargeting, min-difficulty exceptions,
+DNS seeds, live peers.
+
+PARAMS (CTestNet4Params, all read from Core's source): magic 1c163f28, ports
+48333/48332, halving 210000, powLimit 1d00ffff, activation heights generated
+by gen_script_flags.py (all =1; sfc_chain==2 branch), prefixes 0x6f/0xc4/tb.
+The GENESIS is testnet4's own 2024 block (different coinbase message and an
+anyone-can-try OP_CHECKSIG output) -- constructed from Core's
+CreateGenesisBlock recipe and verified against BOTH of Core's asserts
+(hashGenesisBlock AND hashMerkleRoot) before pasting, re-verified at select
+time and in tests/test_chainparams (43 checks).
+
+WORK RULES for getblocktemplate, from Core pow.cpp: the 20-minute
+min-difficulty exception (a template whose curtime is >2*spacing past the
+parent gets powLimit bits), the walk-back to the last non-min-difficulty
+bits, and BIP94 (testnet4's timewarp fix: the retarget bases on the FIRST
+block of the period, which can never carry the min-difficulty exception).
+Validation itself still accepts each header's own nBits and relies on
+cumulative-work fork choice (the documented divergence in reorg.c).
+
+DNS seeds moved into chainparams (per-chain lists; mainnet's nine unchanged,
+testnet4's two from Core's vSeeds, regtest none) -- main.c's hardcoded seed
+array is gone.
+
+PROVEN against the standing testnet4 oracle (/storage/core-oracle-testnet4):
+ - Synced the WHOLE CHAIN from it: 149,954 blocks, 0 holes, ~1h40m download
+   + ~16 min UTXO apply, then live-following its tip.
+ - Block hashes identical at every spot height checked, including Core's own
+   assumevalid anchor (123613).
+ - gettxoutsetinfo muhash BYTE-IDENTICAL at height 149954:
+   c328db399742e13aa39693542b30d190ba7794a6628d5be80883ba1eb85d9895,
+   txouts 14,227,876, total 7,497,249.9497424 tBTC. The UTXO set is now
+   proven identical to Core on ALL THREE supported chains.
+ - The wallet, loaded into the native testnet4 node, hands out
+   tb1qkme6640...23jduz -- character-identical to the address funded via the
+   oracle on 08-26 (same seed, same key, correct chain HRP natively).
 
 ----------------------------------------------------------------------------
 ## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core

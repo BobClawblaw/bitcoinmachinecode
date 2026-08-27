@@ -48,6 +48,7 @@
  *     block-relaying node; stop's reply names this project, not Core.
  */
 #include "rpc_chain.h"
+#include "bitcoin_pow_rules.h"
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
 #include "script_flags_consts.h"
 #include "block_filter.h"   /* BIP158 basic filters, Core-byte-validated */  /* buried-deployment heights, generated from
@@ -318,9 +319,18 @@ void rpc_chain_set_proposal(long (*fn)(const char*, char*, unsigned long)){ g_gb
 static const char* g_chain_name = "main";
 static long g_halving_interval  = 210000;
 static int  g_pow_no_retarget   = 0;
-void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting){
+static int  g_allow_min_diff    = 0;          /* testnet4: 20-min exception  */
+static u32  g_pow_limit_bits    = 0x1d00ffff; /* compact powLimit            */
+static int  g_enforce_bip94     = 0;          /* testnet4: retarget from the
+                                                 FIRST block of the period   */
+void rpc_chain_set_chainparams(const char* name, long halving_interval, int pow_no_retargeting,
+                               int allow_min_difficulty, unsigned int pow_limit_bits,
+                               int enforce_bip94){
     g_chain_name = name; g_halving_interval = halving_interval;
     g_pow_no_retarget = pow_no_retargeting;
+    g_allow_min_diff = allow_min_difficulty;
+    g_pow_limit_bits = pow_limit_bits;
+    g_enforce_bip94 = enforce_bip94;
 }
 
 static double difficulty_of(u32 bits){
@@ -870,46 +880,26 @@ static u32 gbt_compact(const u8 t[32]){
     return ((u32)size << 24) | (word & 0x007fffff);
 }
 
-/* Core pow.cpp CalculateNextWorkRequired: bits for height `tip+1`. */
-#define GBT_TIMESPAN 1209600L                   /* 14 days */
-/* Pure retarget arithmetic, exported for the hermetic KATs (vectors frozen
- * from an arith_uint256-faithful reference implementation). */
+/* Pure retarget arithmetic -- MOVED to bitcoin_pow_rules.c (one
+ * implementation for GBT and validation; proven against every header of the
+ * real mainnet and testnet4 chains, see validation/pow_replay.c). This
+ * wrapper keeps the hermetic KAT surface (vectors frozen from an
+ * arith_uint256-faithful reference) at its historical name/signature,
+ * pinned to the mainnet powLimit the KATs were generated under. */
 u32 rpc_chain_retarget(u32 old_bits, long ts){
-    if (ts < GBT_TIMESPAN/4) ts = GBT_TIMESPAN/4;
-    if (ts > GBT_TIMESPAN*4) ts = GBT_TIMESPAN*4;
-    /* new_target = old_target * ts / GBT_TIMESPAN over a 40-byte big int
-     * (little-endian limbs for the arithmetic, flipped from/to big-endian) */
-    u8 be[32]; target_bytes(old_bits, be);
-    u8 n[40]; memset(n, 0, sizeof n);
-    for (int i = 0; i < 32; i++) n[i] = be[31-i];          /* -> LE */
-    { unsigned long long carry = 0;                         /* *= ts */
-      for (int i = 0; i < 40; i++){
-          unsigned long long v = (unsigned long long)n[i] * (unsigned long long)ts + carry;
-          n[i] = (u8)v; carry = v >> 8;
-      } }
-    { unsigned long long rem = 0;                           /* /= GBT_TIMESPAN */
-      for (int i = 39; i >= 0; i--){
-          unsigned long long v = (rem << 8) | n[i];
-          n[i] = (u8)(v / (unsigned long long)GBT_TIMESPAN);
-          rem = v % (unsigned long long)GBT_TIMESPAN;
-      } }
-    int over = 0; for (int i = 32; i < 40; i++) if (n[i]) over = 1;
-    u8 out[32]; for (int i = 0; i < 32; i++) out[i] = n[31-i];   /* -> BE */
-    u8 lim[32]; target_bytes(0x1d00ffff, lim);
-    if (!over){ for (int i = 0; i < 32; i++){ if (out[i] > lim[i]){ over = 1; break; } if (out[i] < lim[i]) break; } }
-    if (over) memcpy(out, lim, 32);
-    return gbt_compact(out);
+    return pow_retarget_bits(old_bits, ts, 0x1d00ffff);
 }
-static u32 gbt_next_bits(long tip){
-    u8 hdr[80];
-    if (read_block_prefix(tip, hdr, 80) != 1) return 0;
-    u32 old_bits = rd32(hdr + 72);
-    if (g_pow_no_retarget) return old_bits;     /* regtest: fPowNoRetargeting */
-    if ((tip + 1) % 2016 != 0) return old_bits;
-    u32 last_time = rd32(hdr + 68);
-    if (read_block_prefix(tip - 2015, hdr, 80) != 1) return old_bits;
-    u32 first_time = rd32(hdr + 68);
-    return rpc_chain_retarget(old_bits, (long)last_time - (long)first_time);
+/* Core pow.cpp GetNextWorkRequired via the SHARED rule engine
+ * (bitcoin_pow_rules.c) -- the same pow_expected_bits validation enforces,
+ * so a template this node builds is by construction one its own validator
+ * accepts. The adapter reads ancestor headers out of the archive. */
+static int gbt_hdr_at(void* ctx, long h, u8 hdr[80]){
+    (void)ctx; return read_block_prefix(h, hdr, 80) == 1 ? 1 : 0;
+}
+static u32 gbt_next_bits(long tip, long curtime){
+    return pow_expected_bits(tip + 1, curtime, gbt_hdr_at, NULL,
+                             g_pow_no_retarget, g_allow_min_diff,
+                             g_enforce_bip94, g_pow_limit_bits);
 }
 
 /* Slot walk of the shared structural pool (bitcoin_mempool.asm's documented
@@ -969,11 +959,11 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
     u8 hdr[80];
     if (read_block_prefix(tip, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
     u8 tiphash[32]; sha256d(tiphash, hdr, 80);
-    u32 bits = gbt_next_bits(tip);
-    if (!bits){ *ec = -1; *em = "Block not available"; return 0; }
     long height = tip + 1;
     long mintime = median_time_past(tip) + 1;
     long curtime = (long)time(NULL); if (curtime < mintime) curtime = mintime;
+    u32 bits = gbt_next_bits(tip, curtime);
+    if (!bits){ *ec = -1; *em = "Block not available"; return 0; }
 
     rj_val* o = rj_obj();
     { rj_val* caps = rj_arr(); rj_arr_push(caps, rj_str("proposal"));
@@ -3432,7 +3422,7 @@ static const char* const CHAIN_METHODS[] = {
     "waitforblock","waitforblockheight","waitfornewblock",
     "getblockfilter","scanblocks","getdescriptoractivity",
     "dumptxoutset","loadtxoutset","preciousblock","pruneblockchain",
-    "savemempool","importmempool","submitheader", NULL
+    "submitheader", NULL
 };
 
 const char* rpc_chain_method_at(int i){
@@ -3931,8 +3921,6 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
         return ch_unsupported(CH_NO_SNAPSHOT_LOAD, ec, em);
     if (!strcmp(m, "preciousblock") || !strcmp(m, "pruneblockchain"))
         return ch_unsupported(CH_NO_FORKCHOICE_RPC, ec, em);
-    if (!strcmp(m, "savemempool") || !strcmp(m, "importmempool"))
-        return ch_unsupported(CH_NO_MEMPOOL_FILE, ec, em);
     if (!strcmp(m, "getrawtransaction")) return cmd_getrawtransaction(params, res, ec, em);
     if (!strcmp(m, "gettxoutproof")) return cmd_gettxoutproof(params, res, ec, em);
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);

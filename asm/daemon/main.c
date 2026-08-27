@@ -34,6 +34,7 @@
 #include <time.h>
 #include <signal.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -335,17 +336,13 @@ static int lsock(int port){
  * new bitcoin_serve.asm `.do_block` keep-up path stores any block a peer later
  * pushes). Returns the count of blocks added on success, 0/-1 on no-network.
  * Sieve out peers that hang: a 10s recv timeout + per-seed cap. */
-static const char* catchup_seeds[] = {
-    "seed.bitcoin.sipa.be",
-    "dnsseed.bluematt.me",
-    "seed.bitcoinstats.com",
-    "seed.bitcoin.jonasschnelli.ch",
-    "seed.btc.petertodd.net",
-    "seed.bitcharcoal.com",
-    "seed.bitcoin.wiz.biz",
-    "dnsseed.bitcoin.dashjr.org",
-    "seed.bitnodes.io"
-};
+/* DNS seed hostnames come from the SELECTED CHAIN (daemon/chainparams.c owns
+ * the per-chain lists, mainnet's being the set that always lived here).
+ * These two are set right after chainparams_select() in main(); the static
+ * defaults keep every pre-chain-selection tool path on mainnet behaviour. */
+static const char* const catchup_seeds_default[] = { "seed.bitcoin.sipa.be" };
+static const char* const* g_seed_hosts = catchup_seeds_default;
+static int g_n_seed_hosts = 1;
 static void anchor_locator(unsigned char loc[32]);   /* fwd decl (defined below) */
 /* Wall-clock alarm handler: raise SIGALRM after CATCHUP_MAX_SECS so the
  * synchronous node_sync catch-up (blocking on a real seed) is interrupted and
@@ -367,8 +364,8 @@ static long outbound_catchup(long max_blocks){
      * contact seeds the operator disabled. Under -connect the configured
      * nodes are used instead. */
     const char* clist[CFG_MAX_NODES];
-    const char** srcs = catchup_seeds;
-    size_t nsrcs = sizeof(catchup_seeds)/sizeof(catchup_seeds[0]);
+    const char** srcs = (const char**)g_seed_hosts;
+    size_t nsrcs = (size_t)g_n_seed_hosts;
     if(g_cfg.connect_only){
         for(int i=0;i<g_cfg.n_connect;i++) clist[i]=g_cfg.connectn[i];
         srcs = clist; nsrcs = (size_t)g_cfg.n_connect;
@@ -779,6 +776,123 @@ static void upl_sample(void){
     if(added>0) upload_note_and_check(added);
 }
 
+/* ==== gettxout IPC: the RPC asks the download worker =======================
+ * The RPC server runs in the SERVE PARENT, which holds no handle on the live
+ * UTXO set -- the download worker owns it in another process. gettxout used
+ * to answer null there, which does not mean "I cannot say", it means "that
+ * output is spent": the node was asserting that about every coin in
+ * existence.
+ *
+ * Building a read-only view in the parent was measured and rejected:
+ * utxo_lsm_reload_ro costs 60-83 s on the real 165M-entry set and every new
+ * block invalidates it (FEATURE_GAPS.md). So the parent ASKS the worker,
+ * which already has the set open and answers utxo_lsm_get in microseconds.
+ *
+ * WHY A POLLED SERVICE POINT AND NOT A THREAD IN THE WORKER: utxo_lsm_get is
+ * thread-safe on its own (lsm_get_scratch is TLS), but this module's
+ * architecture guarantees get() and flush() never overlap "by construction" --
+ * a query thread racing the worker's own writes would break exactly that
+ * guarantee. So the worker answers only at a quiescent point in its loop,
+ * after the catch-up call, where no put/del/flush is in flight.
+ *
+ * Failure is always a REFUSAL, never a guess: no worker, a timeout, a short
+ * read, a dead socket -- every one of them returns -1 and gettxout says it
+ * cannot answer. The one thing this must never do is fall back to null. */
+#define TXOQ_MAGIC   0x51584f54u          /* "TOXQ" */
+#define TXOQ_SPK_CAP 16384u
+#define TXOQ_TIMEOUT_MS 2000              /* a tip-height block apply is ~0.1s */
+typedef struct { unsigned int magic, vout; unsigned char txid[32]; } txoq_req;
+/* The response ECHOES the outpoint it answers. Without that, a query that
+ * timed out would leave its response sitting in the socket and the NEXT query
+ * would read it -- a perfectly well-formed reply about the WRONG coin. Magic
+ * alone cannot catch that. With the echo, a stale reply is recognised, drained
+ * and skipped. */
+typedef struct { unsigned int magic; int found; unsigned long long value;
+                 unsigned long height; unsigned int is_coinbase, spklen;
+                 unsigned char txid[32]; unsigned int vout; } txoq_resp;
+static int g_txoq_parent = -1;            /* parent end (RPC side) */
+static int g_txoq_worker = -1;            /* worker end */
+static pthread_mutex_t g_txoq_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* read exactly n bytes unless the deadline passes; 1 ok, 0 timeout/short */
+static int txoq_read_all(int fd, void* buf, size_t n, int timeout_ms){
+    unsigned char* p = (unsigned char*)buf; size_t got = 0;
+    while(got < n){
+        struct pollfd pf = { fd, POLLIN, 0 };
+        int pr = poll(&pf, 1, timeout_ms);
+        if(pr <= 0) return 0;                          /* timeout or error */
+        ssize_t r = read(fd, p + got, n - got);
+        if(r <= 0){ if(r < 0 && errno == EINTR) continue; return 0; }
+        got += (size_t)r;
+    }
+    return 1;
+}
+
+/* The RPC-side query. Returns 1 found / 0 absent / -1 cannot answer.
+ * Serialised: there is one channel and the RPC server is threaded. */
+static long txoq_query(const unsigned char txid_wire[32], unsigned int vout,
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase,
+                       unsigned char* spk, unsigned long spk_cap, unsigned long* spk_len){
+    if(g_txoq_parent < 0) return -1;
+    long rc = -1;
+    pthread_mutex_lock(&g_txoq_lock);
+    txoq_req q; q.magic = TXOQ_MAGIC; q.vout = vout; memcpy(q.txid, txid_wire, 32);
+    if(send(g_txoq_parent, &q, sizeof q, MSG_NOSIGNAL) != (ssize_t)sizeof q) goto out;
+    txoq_resp rp;
+    unsigned char body[TXOQ_SPK_CAP];
+    /* Skip any replies left over from an earlier timed-out query. Bounded so a
+     * pathologically backed-up channel cannot spin here. */
+    for(int skip = 0; ; skip++){
+        if(skip > 8) goto out;                         /* still desynced: refuse */
+        if(!txoq_read_all(g_txoq_parent, &rp, sizeof rp, TXOQ_TIMEOUT_MS)) goto out;
+        if(rp.magic != TXOQ_MAGIC) goto out;           /* framing lost: refuse, never guess */
+        if(rp.spklen > TXOQ_SPK_CAP) goto out;
+        if(rp.spklen && !txoq_read_all(g_txoq_parent, body, rp.spklen, TXOQ_TIMEOUT_MS)) goto out;
+        if(rp.vout == vout && memcmp(rp.txid, txid_wire, 32) == 0) break;   /* ours */
+        /* else: a stale reply about a different outpoint -- drained, try again */
+    }
+    if(rp.spklen > spk_cap) goto out;                  /* cannot deliver: refuse */
+    if(rp.found != 1){ rc = 0; goto out; }             /* genuinely not unspent */
+    if(rp.spklen) memcpy(spk, body, rp.spklen);
+    *value = rp.value; *height = rp.height;
+    *is_coinbase = rp.is_coinbase; *spk_len = rp.spklen;
+    rc = 1;
+out:
+    pthread_mutex_unlock(&g_txoq_lock);
+    return rc;
+}
+
+/* Worker side: answer every pending query, then return. Called ONLY from the
+ * quiescent point in the worker loop. Never blocks -- a parent that went away
+ * or a partial request just ends the round. */
+extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vout,
+                              unsigned long long* value, unsigned long* height,
+                              unsigned long* is_coinbase,
+                              const unsigned char** script, unsigned long* slen);
+static void txoq_service(void){
+    if(g_txoq_worker < 0) return;
+    for(int guard = 0; guard < 64; guard++){
+        struct pollfd pf = { g_txoq_worker, POLLIN, 0 };
+        if(poll(&pf, 1, 0) <= 0) return;               /* nothing pending */
+        txoq_req q;
+        if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
+        if(q.magic != TXOQ_MAGIC) return;              /* desynced: stop, do not guess */
+        txoq_resp rp; memset(&rp, 0, sizeof rp);
+        rp.magic = TXOQ_MAGIC; rp.found = 0;
+        memcpy(rp.txid, q.txid, 32); rp.vout = q.vout;   /* echo: see txoq_resp */
+        const unsigned char* script = NULL; unsigned long slen = 0;
+        unsigned long long value = 0; unsigned long h = 0, cb = 0;
+        if(utxo_live_lsm_get(q.txid, q.vout, &value, &h, &cb, &script, &slen) == 1
+           && slen <= TXOQ_SPK_CAP){
+            rp.found = 1; rp.value = value; rp.height = h;
+            rp.is_coinbase = (unsigned int)cb; rp.spklen = (unsigned int)slen;
+        }
+        if(send(g_txoq_worker, &rp, sizeof rp, MSG_NOSIGNAL) != (ssize_t)sizeof rp) return;
+        if(rp.spklen && send(g_txoq_worker, script, rp.spklen, MSG_NOSIGNAL) != (ssize_t)rp.spklen) return;
+    }
+}
+
 static volatile sig_atomic_t g_inbound_n = 0;
 static pid_t g_dl_worker_pid = -1;       /* set by main() right after fork(); parent forwards SIGTERM here */
 static volatile sig_atomic_t g_dl_worker_exited = 0, g_dl_worker_status = 0;
@@ -842,9 +956,40 @@ static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
  * steady-state leg fill and mux_next_peer) runs OUTSIDE any enclosing alarm. */
 #define OUTBOUND_DIAL_BUDGET_SECS 20
 
+/* ---- why the last dial failed -------------------------------------------
+ * tcp_connect_ip (bitcoin_net.asm) deliberately returns the raw -errno "for
+ * diagnosis", and outbound_connect used to throw it away with `return -1`, so
+ * every caller could say no more than "unreachable". On 2026-08-27 a host
+ * freeze took all 8 legs down and then EVERY redial failed for 8 minutes
+ * straight; the log could not distinguish a dead network (ENETUNREACH) from
+ * fd exhaustion (EMFILE) from a peer refusing us (ECONNREFUSED) -- the
+ * difference between "the box is sick" and "the node is leaking descriptors".
+ * The information already existed, it was just discarded. Set on every
+ * failure path here, read by dial_fail_reason() at the call sites. */
+static char g_dial_fail[96] = "";
+static const char* dial_fail_reason(void){
+    return g_dial_fail[0] ? g_dial_fail : "unknown";
+}
+/* -rc is the raw -errno from tcp_connect_ip; render it, falling back to the
+ * number when it is not a value strerror knows. */
+static void dial_fail_errno(const char* what, int rc){
+    int e = -rc;
+    const char* m = (e > 0 && e < 200) ? strerror(e) : NULL;
+    if(m) snprintf(g_dial_fail, sizeof g_dial_fail, "%s: %s", what, m);
+    else  snprintf(g_dial_fail, sizeof g_dial_fail, "%s: rc=%d", what, rc);
+}
+
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
+    g_dial_fail[0] = 0;
+    /* a named peer configured as "host:port" is dialled on ITS port, not the
+     * chain default (node_config.c keeps the host bare and the port beside
+     * it). 0 = nothing configured for this host. */
+    { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(host,NULL,&h,&res)!=0) return -1;
+    if(getaddrinfo(host,NULL,&h,&res)!=0){
+        snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
+        return -1;
+    }
     unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);
 
@@ -870,10 +1015,18 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     mux_sync_budget_fired = saved_fired;
     sigaction(SIGALRM,&old,NULL);
 
-    if(fd<0) return -1;
+    if(fd<0){ dial_fail_errno("connect", fd); return -1; }
     if(fired || hk!=1 || !peer_has_witness(host)){
-        if(fired) fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
-                          host, OUTBOUND_DIAL_BUDGET_SECS);
+        if(fired){
+            snprintf(g_dial_fail,sizeof g_dial_fail,"dial budget %ds exceeded",
+                     OUTBOUND_DIAL_BUDGET_SECS);
+            fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
+                    host, OUTBOUND_DIAL_BUDGET_SECS);
+        } else if(hk!=1){
+            snprintf(g_dial_fail,sizeof g_dial_fail,"handshake failed (rc=%d)", hk);
+        } else {
+            snprintf(g_dial_fail,sizeof g_dial_fail,"peer lacks NODE_WITNESS");
+        }
         close(fd);
         return -1;
     }
@@ -1145,7 +1298,8 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
           return;
       } }
     int fd = outbound_connect(peers[p], 300, out_port);
-    if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable (leg stays down)\n", i, peers[p]); return; }
+    if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down)\n",
+                     i, peers[p], dial_fail_reason()); return; }
     mux_out_fd[i]=fd;
     strncpy(mux_out_host[i], peers[p], 63);
     anchor_locator(mux_out_loc[i]);
@@ -1527,7 +1681,8 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
                             unsigned char* hdrbuf, size_t hdrbuf_sz){
     unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) return -1;
-    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
+    int cport = node_config_peer_port(cand);
+    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
@@ -1923,7 +2078,7 @@ static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     static unsigned char ab[64];
     if(amr_init(ab)!=1){ fprintf(stderr,"[dlc] amr_init failed\n"); return 0; }
-    long disc=dl_bootstrap(ab, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])));
+    long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
 
     static char pool[DLC_MAXPOOL][64];
@@ -2269,21 +2424,6 @@ static unsigned long long blksub_last_seq = 0;
  * and was never re-pointed at it. The asm serve children already prefer
  * mp_ext_area (bitcoin_serve.asm's .mp_external); this makes the worker
  * consistent with them. */
-/* mined-tx pruner for utxo_live's block-connect callback: delete the
- * confirmed tx from the SHARED structural pool under the cross-process lock.
- * The policy registry keeps its (stale) node -- by design; every RPC filters
- * registry entries against the pool (see mpool_policy_entry_info's header). */
-void serve_mined_prune(const unsigned char txid[32]){
-    extern long mpool_del(void*, const unsigned char*);
-    extern void* mp_ext_area;
-    extern void mp_lock(void); extern void mp_unlock(void);
-    void* mp = mp_ext_area;
-    if (!mp) return;
-    mp_lock();
-    mpool_del(mp, txid);
-    mp_unlock();
-}
-
 static void* txsub_pool(void){
     extern void* mp_ext_area;
     return mp_ext_area ? mp_ext_area : (void*)txsub_mp_area;
@@ -2300,6 +2440,132 @@ static int txsub_worker_ready(void){
         mpool_init(txsub_mp_area, TXSUB_MP_SLOTS, txsub_mp_blob, sizeof txsub_mp_blob);
     txsub_ready = 1;
     return 1;
+}
+
+/* ==== submitpackage: validate a package, then commit it =====================
+ * Core's shape, reduced to what this node can honestly do.
+ *
+ * TWO PASSES, and the order matters. Pass 1 is a DRY RUN over the package
+ * with the in-package overlay installed, so a child can resolve a parent that
+ * is not in the mempool yet and every member's real fee and vsize become
+ * known WITHOUT inserting anything. Only then is the package feerate known,
+ * and only then can pass 2 commit.
+ *
+ * Doing it the other way round -- insert optimistically, then check the
+ * aggregate -- would mean removing transactions that should never have been
+ * accepted, and a failure partway through that removal leaves the mempool
+ * holding a transaction below the floor. The dry run costs a second
+ * validation pass and buys the property that nothing enters the pool until
+ * the whole package is known to be acceptable.
+ *
+ * A member may only be rescued by the package for the TWO fee reasons Core
+ * treats as reconsiderable ("min relay fee not met", "mempool min fee not
+ * met"). Anything else -- invalid, non-standard, conflicting -- is final: no
+ * amount of fee from a child makes an invalid parent valid.
+ *
+ * Returns 1 if the whole package was accepted, 0 otherwise (per-transaction
+ * results are published in the shared block either way). */
+static int txsub_package(char* msg, unsigned long mcap){
+    extern int mpol_package_well_formed(const unsigned char* const*, const unsigned long*,
+                                        int, unsigned char*, unsigned long long*, const char**);
+    extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*,
+                                      const unsigned char*, int);
+    extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*,
+                                      unsigned long, char*, unsigned long, unsigned long long*);
+    extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
+    node_status_t* st = g_node_status;
+    int n = st->tx_submit_pkg_n;
+    if (n <= 0 || n > RPC_PKG_MAX){ snprintf(msg, mcap, "package-too-many-transactions"); return 0; }
+    if (!txsub_worker_ready()){ snprintf(msg, mcap, "mempool init failed"); return 0; }
+
+    /* walk the concatenated buffer; each transaction is self-delimiting */
+    static const unsigned char* txs[RPC_PKG_MAX];
+    static unsigned long lens[RPC_PKG_MAX];
+    static unsigned char txids[RPC_PKG_MAX*32];
+    { const unsigned char* p = (const unsigned char*)st->tx_submit_buf;
+      const unsigned char* end = p + st->tx_submit_len;
+      for (int i = 0; i < n; i++){
+          unsigned char info[64];
+          if (tx_parse(info, p, (unsigned long)(end - p)) != 1){
+              snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; }
+          unsigned long long tl; memcpy(&tl, info, 8);
+          if (tl == 0 || p + tl > end){
+              snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; }
+          txs[i] = p; lens[i] = (unsigned long)tl; p += tl;
+      }
+      if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
+
+    const char* why = "";
+    static unsigned long long vsz[RPC_PKG_MAX];
+    if (!mpol_package_well_formed(txs, lens, n, txids, vsz, &why)){
+        snprintf(msg, mcap, "%s", why);
+        /* Core's word for a member that never got its own verdict because the
+         * package was rejected as a whole. */
+        for (int i = 0; i < n; i++){
+            st->pkg_result[i] = 0;
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+        }
+        return 0;
+    }
+
+    /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
+    unsigned long long tot_fee = 0, tot_vsize = 0;
+    int all_ok = 1;
+    txacc_package_overlay(txs, lens, txids, n);
+    for (int i = 0; i < n; i++){
+        char r[128]; r[0] = 0; unsigned long long fee = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
+                                        r, sizeof r, &fee);
+        st->pkg_fee[i] = fee;
+        st->pkg_vsize[i] = vsz[i];        /* BIP141 vsize, from the policy walker */
+        if (rc == 1){
+            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            tot_fee += fee; tot_vsize += st->pkg_vsize[i];
+        } else {
+            int fee_only = (!strcmp(r, "min relay fee not met") ||
+                            !strcmp(r, "mempool min fee not met"));
+            st->pkg_result[i] = 0;
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
+            else all_ok = 0;      /* not something a package can rescue */
+        }
+    }
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+
+    if (!all_ok){
+        mpol_package_fee_context(0, 0);
+        snprintf(msg, mcap, "transaction failed");
+        return 0;
+    }
+
+    /* ---- pass 2: commit, with the package feerate in effect -------------- */
+    int committed = 1;
+    mpol_package_fee_context(tot_fee, tot_vsize);
+    txacc_package_overlay(txs, lens, txids, n);
+    for (int i = 0; i < n; i++){
+        char r[128]; r[0] = 0; int relayed = 0;
+        int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
+                                        mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+        if (rc == 1){ st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; }
+        else {
+            st->pkg_result[i] = 0;
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            committed = 0;
+        }
+    }
+    /* ALWAYS cleared: a fee context left set would relax the floor for
+     * ordinary single-transaction traffic, and an overlay left set would let
+     * an unrelated transaction resolve against a package member. */
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_fee_context(0, 0);
+
+    st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
+    snprintf(msg, mcap, "%s", committed ? "success" : "transaction failed");
+    if (committed)
+        fprintf(stderr, "[dl] submitpackage: %d tx accepted, package fee %llu sat over %llu vB\n",
+                n, (unsigned long long)tot_fee, (unsigned long long)tot_vsize);
+    return committed;
 }
 
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
@@ -2403,12 +2669,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         extern void tx_accept_set_tip(long);
         tx_accept_set_resolver(utxo_live_resolve);
         tx_accept_set_tip(*(int*)(store_buf+24));
-        /* prune just-mined txs from the shared pool at block-connect (see
-         * utxo_live.c g_mined_cb -- before this, only the reorg path did) */
-        { extern void utxo_live_set_mined_cb(void (*)(const unsigned char[32]));
-          extern long mpool_del(void*, const unsigned char*);
-          extern void serve_mined_prune(const unsigned char*);
-          utxo_live_set_mined_cb(serve_mined_prune); }
+        /* Mined-tx pruning happens at the new-block choke point via
+         * tx_accept_block_connect (Core removeForBlock: pool + policy graph
+         * + conflict eviction + minfee decay gate). The earlier
+         * utxo_live_set_mined_cb(serve_mined_prune) registration -- a plain
+         * mpool_del that predated the policy-aware path by hours -- was
+         * removed at the 2026-08-27 policy-parity merge as subsumed;
+         * utxo_live.c keeps the (now unregistered) g_mined_cb plumbing. */
 
         /* ---- coinstats index: continuous gettxoutsetinfo + a standing
          * cryptographic parity instrument. Observers feed it every coin
@@ -2552,8 +2819,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_cfg.connect_only){
             fprintf(stderr,"[dl] no reachable connect= peers; staying offline (connect= means these are the ONLY peers)\n");
         } else {
-            fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
-            for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+            if(pool_len > 0){
+                fprintf(stderr,"[dl] no discovered peers; temporary seed fallback\n");
+                for(int i=0;i<pool_len && nsrc<8;i++){ srcpool[nsrc++]=peers[i]; }
+            } else {
+                /* a chain with NO seeds (regtest) has no fallback to offer --
+                 * say so instead of announcing a fallback that adds nothing */
+                fprintf(stderr,"[dl] no peers and this chain has no DNS seeds; staying offline (use connect=/addnode=)\n");
+            }
         }
     }
     /* ---- MULTI-PEER DOWNLOAD: establish up to 8 live legs by dialing the
@@ -2847,7 +3120,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_node_status && g_node_status->tx_submit_seq != txsub_last_seq){
             txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
-            if(txsub_worker_ready()){
+            if(g_node_status->tx_submit_pkg_n > 0){
+                result = txsub_package(reason, sizeof reason);
+            }
+            else if(txsub_worker_ready()){
                 unsigned long tlen = g_node_status->tx_submit_len;
                 if(tlen==0 || tlen>RPC_TXSUBMIT_MAX){ result=-22; snprintf(reason,sizeof reason,"TX decode failed"); }
                 else if(g_node_status->tx_submit_test){
@@ -3231,6 +3507,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         ar, utxo_live_applied_height(), live_utxo_disp(), phase_elapsed(&utxo_ct_pt));
             }
         }
+        /* QUIESCENT POINT: catch-up has returned, so no put/del/flush is in
+         * flight and a point query cannot race the writer. This is the only
+         * place the worker answers gettxout. */
+        txoq_service();
         /* new-block announcement: one choke point watching the store's tip,
          * so it fires no matter which path appended (mux keep-up leg,
          * realtime getdata loop, catch-up). Hash read straight from the
@@ -3278,6 +3558,24 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         /* address index (extension): ADDs from the block,
                          * DELs/TOUCHes from its undo records */
                         axt_on_block(store_buf, zh, zb, bl);
+                        /* mempool reconciliation (Core removeForBlock):
+                         * confirmed txs leave pool+policy graph, txs
+                         * CONFLICTING with this block's spends leave with
+                         * their descendants, and the rolling minfee floor
+                         * may decay again. Before this call nothing removed
+                         * mined txs at all -- they lingered until
+                         * -mempoolexpiry (LOG.md 2026-08-27 survey #1).
+                         * This SUBSUMES mining-polish's plain mined-tx
+                         * mpool_del callback (it also cleans the policy
+                         * graph and counts conflicts) -- that callback path
+                         * was removed at the 2026-08-27 policy-parity merge. */
+                        { extern long tx_accept_block_connect(void*, const unsigned char*, unsigned long);
+                          extern void* mp_ext_area;
+                          if (txsub_worker_ready() && mp_ext_area){
+                              long mr = tx_accept_block_connect(mp_ext_area, zb, (unsigned long)bl);
+                              if (mr > 0)
+                                  fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                          } }
                         if (!zmqpub_active()) continue;
                         /* The block HASH is sha256d over the 80-byte
                          * header, REVERSED: Core's notifier flips the bytes
@@ -3325,6 +3623,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * (rate-limited) instead of giving up at the initial dial. Uses the
          * proven outbound_connect path (works for reachable peers). */
         if(mux_n_out < MUX_WANT_OUT() && (rot % 8)==0){
+            /* ONE summary line per pass, not one per candidate: this loop walks
+             * the whole live pool (up to nsrc) when nothing connects, so a
+             * per-candidate log would flood exactly when the node is sickest. */
+            int topup_fail = 0; char topup_why[160] = "";
             for(int ci=0; ci<nsrc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
                 if(mux_n_out>=MUX_WANT_OUT()) break;
                 int already=0;
@@ -3342,8 +3644,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
                     mux_n_out++;
                 }
+                else { if(!topup_fail++) snprintf(topup_why,sizeof topup_why,"%s: %s",
+                                                  srcpool[ci], dial_fail_reason()); }
                 /* if outbound_connect to this one hung/refused, move on to next */
             }
+            if(topup_fail)
+                fprintf(stderr,"[dl] outbound top-up: %d dial(s) failed, first %s\n",
+                        topup_fail, topup_why);
         }
     }
 }
@@ -3440,7 +3747,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* chain identity + rules for the RPC layer (regtest: halving 150,
      * fPowNoRetargeting; mainnet values are rpc_chain's own defaults) */
     rpc_chain_set_chainparams(g_chainp->name, g_chainp->halving_interval,
-                              g_chainp->pow_no_retargeting);
+                              g_chainp->pow_no_retargeting,
+                              g_chainp->allow_min_difficulty,
+                              g_chainp->pow_limit_bits,
+                              g_chainp->enforce_bip94);
     /* getblocktemplate proposal mode evaluates through the worker's
      * submit channel (rpc_node.c owns the staging) */
     { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
@@ -3614,7 +3924,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * read past the pool (it may be smaller than nwant). */
     for(int i=0;i<nwant && i<pool_len && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
-        if(fd<0){ fprintf(stderr,"[mux] outbound %s failed\n", peers[i]); continue; }
+        if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 63);
         mux_out_fd[mux_n_out]=fd;
         mux_out_peer[mux_n_out]=i;
@@ -3810,6 +4120,33 @@ int main(int argc, char** argv){
     if(!chainparams_select(g_cfg.chain)) return 1;
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
       wallet_set_chain(g_chainp->bech32_hrp, g_chainp->p2pkh_version, g_chainp->p2sh_version); }
+    if(g_chainp->dns_seed_hosts && g_chainp->n_dns_seed_hosts > 0){
+        g_seed_hosts = g_chainp->dns_seed_hosts; g_n_seed_hosts = g_chainp->n_dns_seed_hosts;
+    } else { g_n_seed_hosts = 0; }   /* regtest: no seeds, ever */
+    /* nBits schedule enforcement (bad-diffbits): arm the shared rule engine
+     * (bitcoin_pow_rules.c) in the apply path with the selected chain's
+     * knobs. Only the daemon arms it -- hermetic suites build synthetic
+     * chains with arbitrary bits and never call this. Proven against every
+     * real mainnet + testnet4 header before wiring (validation/pow_replay). */
+    { extern void utxo_live_set_pow_rules(int, int, int, unsigned int);
+      extern void reorg_set_pow_rules(int, int, int, unsigned int);
+      utxo_live_set_pow_rules(g_chainp->pow_no_retargeting,
+                              g_chainp->allow_min_difficulty,
+                              g_chainp->enforce_bip94,
+                              g_chainp->pow_limit_bits);
+      reorg_set_pow_rules(g_chainp->pow_no_retargeting,
+                          g_chainp->allow_min_difficulty,
+                          g_chainp->enforce_bip94,
+                          g_chainp->pow_limit_bits);
+      /* SAY SO. The check is injected and default-off, so an inert one is
+       * indistinguishable from a working one by observing accepted blocks --
+       * every block is accepted either way. test_reorg proves the wiring in
+       * the suite; this line is the same evidence for a running node, and it
+       * prints the knobs so a wrong-chain arming is visible too. */
+      fprintf(stderr,"[config] pow  : nBits schedule enforcement ON"
+                     " (no_retarget=%d min_diff=%d bip94=%d powlimit=%08x)\n",
+              g_chainp->pow_no_retargeting, g_chainp->allow_min_difficulty,
+              g_chainp->enforce_bip94, g_chainp->pow_limit_bits); }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
     chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
     if(g_chainp->id != CHAIN_MAIN){
@@ -4277,16 +4614,38 @@ int main(int argc, char** argv){
          * publish nothing and report no error. */
         zmqn_set_status(g_node_status);
 
+        /* gettxout IPC channel, created BEFORE the fork so both sides inherit
+         * it: the RPC in this parent asks the worker, which owns the live
+         * UTXO set. If the socketpair cannot be made we simply do not install
+         * the query hook and gettxout keeps refusing -- degraded, never
+         * wrong. */
+        { int sv[2];
+          if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){ g_txoq_parent = sv[0]; g_txoq_worker = sv[1]; }
+          else fprintf(stderr,"[serve] gettxout IPC unavailable (socketpair: %s) -- gettxout will refuse\n", strerror(errno)); }
+
         pid_t dl = fork();
-        if(dl==0){ serve_download_worker(dir, catchup_seeds, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), g_chainp->default_port); _exit(0); }
+        if(dl==0){
+            if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
+            _exit(0);
+        }
+        if(g_txoq_worker >= 0){ close(g_txoq_worker); g_txoq_worker = -1; }
         g_dl_worker_pid = dl;   /* so serve_mux's shutdown handling can forward SIGTERM to it */
         fprintf(stderr,"[serve] download worker pid %d\n", (int)dl);
         fprintf(stderr,"[boot] boot phase complete (%.2fs total)\n", phase_elapsed(&boot_pt));
         /* Embedded JSON-RPC server (parent), non-blocking own accept thread. */
+        if(g_txoq_parent >= 0){
+            extern void rpc_commands_set_txo_query(long (*)(const unsigned char[32], unsigned int,
+                                                            unsigned long long*, unsigned long*,
+                                                            unsigned long*, unsigned char*,
+                                                            unsigned long, unsigned long*));
+            rpc_commands_set_txo_query(txoq_query);
+            fprintf(stderr,"[rpc] gettxout answers via the download worker (IPC)\n");
+        }
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, catchup_seeds, 0, (int)(sizeof(catchup_seeds)/sizeof(catchup_seeds[0])), g_chainp->default_port, l);
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){

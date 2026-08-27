@@ -1,6 +1,15 @@
 # Bitcoin Core feature-parity plan
 
-> ## Status: RPC surface COMPLETE — 155/155 methods, all 5 subsystems (2026-08-26)
+> ## Status: RPC surface COMPLETE — all methods, all 5 subsystems (2026-08-26)
+>
+> **Update 2026-08-27.** The surface is ~157 dispatched methods and three of
+> them stopped being refusals or wrong answers that day: `submitpackage` is
+> real (package policy + in-package parents + Core's effective feerate),
+> `gettxout` answers from the live UTXO set via a worker IPC instead of
+> returning `null` for every outpoint, and `getbalance`/`listunspent` answer
+> from the wallet rescan instead of a default-off index. Seven wallet-import
+> RPCs remain refused, by name, in `FEATURE_GAPS.md`. See
+> `docs/RPC_LIVE_NODE.md` slice 21.
 >
 > Every method in the registered tables is implemented, and all five
 > subsystems closed the same day: mempool tranche, mining (`getblocktemplate`/

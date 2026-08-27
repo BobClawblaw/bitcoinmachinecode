@@ -62,6 +62,10 @@ node_config_t g_cfg = {
     .limitdescendantcount  = 25,     /* Core -limitdescendantcount default   */
     .limitdescendantsize_kvb = 101,  /* Core -limitdescendantsize default    */
     .mempoolfullrbf        = 1,      /* Core -mempoolfullrbf default (v28+)  */
+    .dustrelayfee_satkvb   = 3000,   /* Core DUST_RELAY_TX_FEE               */
+    .datacarrier           = 1,      /* Core -datacarrier default            */
+    .datacarriersize       = 100000, /* Core v31 -datacarriersize default    */
+    .acceptnonstdtxn       = 0,      /* Core -acceptnonstdtxn default        */
     .dnsseed               = 1,      /* Core -dnsseed default: on            */
     .connect_only          = 0,
     .n_seednode            = 0,
@@ -111,10 +115,17 @@ static void set_defaults(void){
     g_cfg.limitdescendantcount  = 25;
     g_cfg.limitdescendantsize_kvb = 101;
     g_cfg.mempoolfullrbf        = 1;
+    g_cfg.dustrelayfee_satkvb   = 3000;
+    g_cfg.datacarrier           = 1;
+    g_cfg.datacarriersize       = 100000;
+    g_cfg.acceptnonstdtxn       = 0;
     g_cfg.dnsseed               = 1;
     g_cfg.connect_only          = 0;
     g_cfg.n_seednode = g_cfg.n_addnode = g_cfg.n_connect = 0;
     g_cfg.seednode[0][0] = g_cfg.addnode[0][0] = g_cfg.connectn[0][0] = 0;
+    memset(g_cfg.seednode_port, 0, sizeof g_cfg.seednode_port);
+    memset(g_cfg.addnode_port,  0, sizeof g_cfg.addnode_port);
+    memset(g_cfg.connectn_port, 0, sizeof g_cfg.connectn_port);
     g_cfg.prune_mib             = 0;
     g_cfg.checkblocks           = 6;
     g_cfg.checklevel            = 3;
@@ -123,13 +134,19 @@ static void set_defaults(void){
 
 /* Append one host to a repeatable-key list.
  *
- * Accepts "host" or "host:port". A per-entry port cannot be honoured yet --
- * every dial path downstream (dl_bootstrap, dlc_probe_round, the workers,
- * addr_gather_from) takes a bare IP string and dials one fixed port -- so a
- * NON-DEFAULT port is REJECTED rather than silently dialled on 8333. Being
- * loudly unsupported beats connecting somewhere the operator did not ask for.
+ * Accepts "host" or "host:port". ANY port is honoured: the host is stored
+ * bare (those strings flow into inet_pton()/address-book paths that must not
+ * see a suffix) and the port goes in the PARALLEL <list>_port array, which
+ * the dial paths consult through node_config_peer_port().
+ *
+ * This used to reject every port but a chain default, on the grounds that the
+ * dial paths took a bare IP and one fixed port. The cost was worse than the
+ * gap it papered over: pointing the node at a peer on any other port dropped
+ * the entry, and the node then sat at tip=0 with peers=0/0 looking healthy.
+ * Core accepts any host:port; so do we now.
  * Returns 1 if the entry was stored. */
-static int cfg_addlist(char list[][64], int* n, const char* val, const char* key, int* bad){
+static int cfg_addlist(char list[][64], unsigned short ports[], int* n,
+                       const char* val, const char* key, int* bad){
     char host[64];
     if(!*val){ fprintf(stderr,"[config] %s= empty -- ignoring\n", key); (*bad)++; return 0; }
     if(strlen(val) >= sizeof host){
@@ -141,18 +158,23 @@ static int cfg_addlist(char list[][64], int* n, const char* val, const char* key
         fprintf(stderr,"[config] %s=%s contains whitespace -- ignoring\n", key, val);
         (*bad)++; return 0;
     }
+    int port = 0;
     { char* colon = strrchr(host,':');
       if(colon){
-        int p = atoi(colon+1);
-        /* 8333 (main) or 18444 (regtest) -- the port is stripped here and the
-         * dial paths use the chain's own g_cfg.port for every connection, so
-         * this guard only refuses ports that could never be honoured. Checked
-         * against both chain defaults because chain= may appear on any line
-         * of the file relative to this entry. */
-        if(p != 8333 && p != 18444){
-            fprintf(stderr,"[config] %s=%s -- only a chain's default P2P port (8333 main, 18444 regtest) is supported for named peers; ignoring this entry\n", key, val);
+        /* IPv6 literals would need brackets to be unambiguous here; the dial
+         * paths are IPv4-only (AF_INET throughout), so a bare trailing colon
+         * group can only be a port. */
+        char* end = NULL;
+        long p = strtol(colon+1, &end, 10);
+        if(end == colon+1 || (end && *end)){
+            fprintf(stderr,"[config] %s=%s has a non-numeric port -- ignoring\n", key, val);
             (*bad)++; return 0;
         }
+        if(p < 1 || p > 65535){
+            fprintf(stderr,"[config] %s=%s port out of range (1-65535) -- ignoring\n", key, val);
+            (*bad)++; return 0;
+        }
+        port = (int)p;
         *colon = 0;
       } }
     if(!host[0]){ fprintf(stderr,"[config] %s=%s has no host part -- ignoring\n", key, val); (*bad)++; return 0; }
@@ -161,8 +183,23 @@ static int cfg_addlist(char list[][64], int* n, const char* val, const char* key
         fprintf(stderr,"[config] %s=%s ignored -- at most %d entries per key\n", key, val, CFG_MAX_NODES);
         (*bad)++; return 0;
     }
-    snprintf(list[*n], 64, "%s", host); (*n)++;
+    snprintf(list[*n], 64, "%s", host);
+    if(ports) ports[*n] = (unsigned short)port;
+    (*n)++;
     return 1;
+}
+
+/* See node_config.h. Scans all three named-peer lists; 0 means "no port was
+ * configured for this host", which callers read as "dial the chain default". */
+int node_config_peer_port(const char* host){
+    if(!host || !*host) return 0;
+    for(int i=0;i<g_cfg.n_connect;i++)
+        if(!strcmp(g_cfg.connectn[i], host) && g_cfg.connectn_port[i]) return g_cfg.connectn_port[i];
+    for(int i=0;i<g_cfg.n_addnode;i++)
+        if(!strcmp(g_cfg.addnode[i], host) && g_cfg.addnode_port[i]) return g_cfg.addnode_port[i];
+    for(int i=0;i<g_cfg.n_seednode;i++)
+        if(!strcmp(g_cfg.seednode[i], host) && g_cfg.seednode_port[i]) return g_cfg.seednode_port[i];
+    return 0;
 }
 
 int node_config_is_manual(const char* ip){
@@ -255,6 +292,9 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"regtest")){      /* Core: -regtest (bool form) */
             t=clamp_int(iv,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest"); applied++; } }
+        else if(!strcmp(key,"testnet4")){     /* Core: -testnet4 (bool form) */
+            t=clamp_int(iv,0,1,key,&bad);
+            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4"); applied++; } }
         else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
             char tmp[64]; snprintf(tmp,sizeof tmp,"%s",val);
             char* colon = strrchr(tmp,':');
@@ -295,6 +335,16 @@ long node_config_load(const char* path){
             t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitdescendantsize_kvb=t; applied++; } }
         else if(!strcmp(key,"mempoolfullrbf")){
             g_cfg.mempoolfullrbf = (iv != 0); applied++; }
+        else if(!strcmp(key,"dustrelayfee")){  /* Core: BTC/kvB -> sat/kvB */
+            double b = atof(val);
+            if(b >= 0 && b < 1.0){ g_cfg.dustrelayfee_satkvb = (long)(b*1e8 + 0.5); applied++; }
+            else { fprintf(stderr,"[config] dustrelayfee=%s out of range -- ignoring\n", val); bad++; } }
+        else if(!strcmp(key,"datacarrier")){
+            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.datacarrier=t;applied++;} }
+        else if(!strcmp(key,"datacarriersize")){
+            t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.datacarriersize=t;applied++;} }
+        else if(!strcmp(key,"acceptnonstdtxn")){
+            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.acceptnonstdtxn=t;applied++;} }
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
@@ -337,15 +387,15 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
             g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }
         else if(!strcmp(key,"seednode")){     /* Core: getaddr from, then drop */
-            if(cfg_addlist(g_cfg.seednode,&g_cfg.n_seednode,val,key,&bad)) applied++; }
+            if(cfg_addlist(g_cfg.seednode,g_cfg.seednode_port,&g_cfg.n_seednode,val,key,&bad)) applied++; }
         else if(!strcmp(key,"addnode")){      /* Core: prefer + keep connected */
-            if(cfg_addlist(g_cfg.addnode,&g_cfg.n_addnode,val,key,&bad)) applied++; }
+            if(cfg_addlist(g_cfg.addnode,g_cfg.addnode_port,&g_cfg.n_addnode,val,key,&bad)) applied++; }
         else if(!strcmp(key,"connect")){
             /* Core: connect ONLY to these; `connect=0` means no automatic
              * connections at all. Either form sets connect_only, which is
              * what the rest of the daemon keys off. */
             if(!strcmp(val,"0")){ g_cfg.n_connect = 0; g_cfg.connect_only = 1; applied++; }
-            else if(cfg_addlist(g_cfg.connectn,&g_cfg.n_connect,val,key,&bad)){
+            else if(cfg_addlist(g_cfg.connectn,g_cfg.connectn_port,&g_cfg.n_connect,val,key,&bad)){
                 g_cfg.connect_only = 1; applied++;
             } }
         else if(!strcmp(key,"signer")){

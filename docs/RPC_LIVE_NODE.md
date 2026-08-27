@@ -289,8 +289,8 @@ witness and a legacy scriptSig against a v0 witness prevout. The RPC would
 return a txid and the network would reject the transaction. A refusal is
 strictly better than a plausible txid for something that can never confirm.
 
-So `sendtoaddress`, `sendmany`, `send`, `sendall`, `walletcreatefundedpsbt`,
-`walletprocesspsbt`, `bumpfee` and `psbtbumpfee` all return `-1` naming the
+So `sendtoaddress`, `sendmany`, `send`, `sendall` and `walletcreatefundedpsbt`
+all return `-1` naming the
 mismatch, and pointing at what does work: `createrawtransaction` followed by
 `signrawtransactionwithwallet`. Closing this properly means segwit wallet
 signing plus coin selection, change policy and fee estimation — a subsystem,
@@ -362,14 +362,17 @@ pool is touched, so a bad entry cannot produce a partially-answered array.
 **Refused, each naming the specific gap:** `getblockfilter`, `scanblocks`,
 `getdescriptoractivity` (no BIP157/158 filter index — the block and undo data
 needed to build one are both on disk, so this is a missing index, not missing
-information); `dumptxoutset`, `loadtxoutset` (no assumeutxo: no writer for
-Core's snapshot format and no second chainstate to load one into);
-`preciousblock`, `pruneblockchain` (fork choice is owned by the forked
-download worker, with no channel for the parent to steer it);
-`savemempool`, `importmempool` (no `mempool.dat` reader or writer);
-`getmempoolcluster` (the pool tracks the ancestor/descendant graph but not
-Core's cluster structure); `getblockfrompeer` (no parent-to-worker channel
-for a targeted block request).
+information); `loadtxoutset` (no assumeutxo: no second chainstate to
+load a snapshot into — `dumptxoutset` became real later and is proven at
+full 165.7M-coin scale); `preciousblock`, `pruneblockchain` (fork choice is
+owned by the forked download worker); `getmempoolcluster` (the pool tracks
+the ancestor/descendant graph but not Core's cluster structure);
+`getblockfrompeer` (peer connections belong to the worker, and no targeted
+block request is wired through the control channel that slice 17 added).
+
+*Corrected 2026-08-27: `dumptxoutset` and the `savemempool`/`importmempool`
+pair are real and left this list; `getblockfrompeer`'s stated reason — "no
+parent-to-worker channel" — was superseded by slice 17, which built one.*
 
 ### Category status
 All 38 of Core's Blockchain methods now dispatch.
@@ -446,9 +449,9 @@ a PSBT back without them would reasonably believe they had been applied.
 the same P2WPKH-wallet / legacy-P2PKH-signer mismatch that blocks
 `sendtoaddress`); `descriptorprocesspsbt` (the descriptor engine derives
 addresses and scripts but has no path from a descriptor to a spending key);
-`submitpackage` (no package validation — submit the parent first, then the
-child); `getprivatebroadcastinfo` and `abortprivatebroadcast` (no private
+`getprivatebroadcastinfo` and `abortprivatebroadcast` (no private
 broadcast queue; `sendrawtransaction` relays to every live peer leg at once).
+`submitpackage` left this list on 2026-08-27 — see slice 21.
 
 ### Category status
 All 20 of Core's Rawtransactions methods now dispatch.
@@ -670,9 +673,12 @@ txindex), so the inputless reading wins by construction, and a transaction
 that genuinely carries inputs is refused either way. Stated at the parse.
 
 ### Still refusing
-`walletprocesspsbt` (PSBT signing needs per-input PSBT field surgery the
-signer does not do), `bumpfee`/`psbtbumpfee` (RBF replacement needs the
-original transaction's full input set and fee, which needs a txindex).
+Nothing in this group. `walletprocesspsbt` became real 2026-08-26 (Signer
+role by delegation); `bumpfee`/`psbtbumpfee` became real 2026-08-27 — the
+original transaction's input set and fee are read from the MEMPOOL entry
+rather than a txindex, which is where an unconfirmed original actually
+lives. See LOG.md for the Core-parity notes and the documented
+divergences.
 
 ### Tested
 The funded transaction is signed to completion **with a real witness** and
@@ -801,20 +807,37 @@ subsystem is either implemented or declined by design with the reasoning at
 the call site. What remains declined, and why, in one place:
 
 - **loadtxoutset** — every parity claim rests on locally-validated coins.
-- **bumpfee / psbtbumpfee / walletprocesspsbt** — RBF replacement and PSBT
-  field surgery; need the original tx's inputs (txindex) or per-input PSBT
-  editing the signer does not do.
-- **preciousblock / pruneblockchain / getblockfrompeer / addnode-family
-  mutators / setnetworkactive / ping / submitheader (unknown headers)** —
-  the forked download worker owns the peer legs, fork choice and the header
-  chain, with no parent-to-worker control channel.
-- **savemempool / importmempool** — no mempool.dat serialization.
-- **submitpackage / getmempoolcluster** — no package validation or cluster
-  mempool.
-- **encryptwallet + multi-wallet lifecycle + import/export family** — one
-  unencrypted single-seed wallet, loaded at startup.
+- ~~**bumpfee / psbtbumpfee / walletprocesspsbt**~~ — all three are REAL
+  now (walletprocesspsbt 2026-08-26, the bump pair 2026-08-27). The bump
+  reads the original from the mempool entry; it draws the increase from
+  change only and refuses `outputs`/`original_change_index`, both stated at
+  the call site.
+- **preciousblock / pruneblockchain / getblockfrompeer** — the forked
+  download worker owns fork choice and the header chain. *(The
+  addnode-family mutators, `setnetworkactive` and `ping` left this entry in
+  slice 17 — the parent→worker control channel below made them real —
+  and `submitheader` is handled. Corrected 2026-08-27.)*
+- ~~**savemempool / importmempool**~~ — **REAL 2026-08-27**: Core's
+  `mempool.dat`, written as version 1 and read as either, verified in both
+  directions against a real Core.
+- ~~**submitpackage**~~ — **REAL 2026-08-27** (slice 21): package policy,
+  in-package parent resolution and Core's effective feerate, so a parent
+  below the relay floor is accepted when its child pays for it. Still
+  refused: **getmempoolcluster** (no cluster mempool).
+- ~~**encryptwallet + multi-wallet lifecycle**~~ — both REAL (encryption
+  2026-08-27, the multi-wallet lifecycle the same week). Of the
+  import/export family only seven remain refused, all needing a path to
+  ADOPT foreign key material a single-seed wallet does not have:
+  `migratewallet`, `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
+  `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`.
+  `importdescriptors` is real.
 - **getopenrpcinfo / rpc.discover / exportasmap** — no OpenRPC document, no
   asmap.
+
+*This catalogue is a point-in-time snapshot that later slices supersede; the
+entries above were re-checked against the dispatch tables on 2026-08-27
+because several had gone stale in the direction of overstating what is
+missing.*
 
 ## Slice 17 — the parent→worker control channel — (2026-08-26)
 Seven RPCs refused for one structural reason: the forked download worker owns
@@ -1041,3 +1064,124 @@ scans the tail after a base miss and reports combined coverage in
 getindexinfo and the covered-range refusal. The per-block walk lives once,
 in `daemon/txi_format.h`, shared by the offline builder and the tail
 writer.
+
+## Slice 21 — gettxout answers, the wallet view, and submitpackage — (2026-08-27)
+
+Three RPCs that were answering the wrong thing, or nothing, now answer.
+
+### gettxout stopped lying
+`gettxout` returned `null` for every outpoint on the live node. `null` is not
+"I cannot say" — in `gettxout` it means "that output is not unspent". The
+node was asserting that about **every coin in existence**, and the cause was
+structural: only the standalone `rpcd` calls `rpc_commands_set_utxo_store`,
+so `g_utxo_lst` was NULL in the embedded server and the handler took its
+"no store" path on every request.
+
+Giving the RPC its own read-only view was measured and rejected on COST, not
+safety. It is safe — the manifest and compaction publish tmp+fsync+rename so
+a cross-process reader sees old-or-new and never torn, and `lsm_get_scratch`
+is thread-local. But `utxo_lsm_reload_ro` takes 60–83 s on the real
+165M-entry set (six production boots), and every new block invalidates the
+view, so even a cached one would block the first call after each block for a
+minute.
+
+Instead the parent ASKS the download worker over a socketpair created before
+the fork. The worker already holds the set open and answers `utxo_lsm_get` in
+microseconds. It replies only at a QUIESCENT point in its loop, after the
+catch-up call: `utxo_lsm_get` is thread-safe on its own, but this module
+guarantees `get()` and `flush()` never overlap *by construction*, and a query
+thread inside the worker would have broken exactly that.
+
+Every failure REFUSES — no worker, timeout, short read, lost framing — and
+the response ECHOES the outpoint it answers, because a query that times out
+leaves its reply in the socket and the next query would otherwise read a
+well-formed answer about a different coin. `tests/test_txoq_ipc` pins that,
+verified fail-then-pass.
+
+Proven against Core: `gettxout` on an unspent coin matches Core's answer
+exactly, and a spent outpoint is `null` from both nodes.
+
+### getbalance / listunspent read the wallet, not an extension
+Both answered from the ADDRESS INDEX, which is an extension gated behind
+`addrindex=1` and OFF by default — so a fully funded wallet reported
+`0.00000000` with an empty `listunspent` while `walletscan.dat` held every
+receive. With no address argument they now enumerate the wallet's coins from
+the rescan records; an explicit address still uses the index, which is the
+only thing that knows addresses that are not ours.
+
+Spent-ness comes from the scan's own spend records. Coinbase maturity needed
+a fact the scan never stored, so the format grew one byte (`BMCWSCN3` adds
+`is_coinbase`); an older `BMCWSCN2` file is still read rather than rejected.
+
+With no completed rescan these now ERROR rather than answering `0.00000000`:
+"I have not looked" and "you have nothing" are different answers.
+
+### submitpackage
+Real, in Core's shape: `package_msg`, `tx-results` keyed by wtxid with
+`txid` / `vsize` / `vsize_bip141` / `fees{base, effective-feerate,
+effective-includes}` / `error`, and Core's own `package-not-validated` for
+members that never got an individual verdict. `replaced-transactions` is
+absent, which is Core's convention (the field is optional there); this node
+does not track package-driven RBF evictions.
+
+Two passes, and the order is the design: a DRY RUN with the in-package
+overlay learns every member's real fee without inserting anything, and only
+then does the commit run with the package feerate in effect. Inserting
+optimistically and checking the aggregate afterwards would mean removing
+transactions that should never have been accepted.
+
+The two fee floors are the ONLY checks a package may relax. A member that
+fails anything else is invalid or non-standard on its own terms, and no
+amount of fee from a child changes that.
+
+Proven end to end: the parent is refused ALONE with "min relay fee not met",
+then accepted as part of the package — and Bitcoin Core accepts the identical
+package (`validation/bumpfee_regtest_e2e.sh`).
+
+STILL OPEN: p2p 1-parent-1-child package RELAY (this is submission), TRUC/v3
+and ephemeral-dust policy, `replaced-transactions`, and
+`testmempoolaccept`'s package mode, which still evaluates each member
+independently and says so at its own call site.
+
+## Slice 22 — mempool.dat, both directions — (2026-08-27)
+
+`savemempool` and `importmempool` are real, and the interop is proven BOTH
+ways against a running Core: it loads the dump this node writes, and this
+node loads the dump it writes.
+
+We WRITE version 1. That is Core's own `-persistmempoolv1` form, which it
+reads unconditionally; v2's obfuscation exists to stop antivirus software
+mangling the file and its key is random, so no writer could produce a
+byte-comparable artifact anyway. We READ both, because a file handed to us
+was most likely written by a default Core.
+
+**The bug the interop test caught.** The v2 obfuscation key is serialized as
+a VECTOR — a compact-size length prefix, then the bytes — so the body starts
+at offset 17, not 16. Core says so in a comment. Reading it as a bare 8-byte
+key decodes the transaction COUNT correctly, because that is 8 bytes at an
+8-aligned offset, and then fails on the first transaction.
+
+The unit test did not catch it, and that is the point worth keeping: the v2
+fixture was built by the test itself, from the same wrong assumption the
+reader held, so the two agreed and both were wrong. A self-built fixture only
+tests a format if it is built FROM the format.
+
+**Where each half runs.** The dump reads the shared pool under the same lock
+`getrawmempool` uses and writes while still holding it — the entry pointers
+are into the shared blob, and releasing first would let an eviction move the
+bytes out from under the writer. The load cannot happen in the parent:
+admitting a transaction is the worker's job, so import re-submits each one
+through the channel `sendrawtransaction` uses and every entry gets the full
+consensus and policy treatment on the way back in. Core re-validates on load
+too — a dump is a hint about what was interesting, never a licence to skip
+checks.
+
+**Not restored**, stated rather than glossed: entry times and fee deltas (a
+re-admitted transaction gets a fresh time, and there is no
+`prioritisetransaction` path to replay a delta into), and the unbroadcast
+set, which this node does not track because `sendrawtransaction` relays to
+every live leg immediately.
+
+Verified on the live mainnet node: a 284,485-byte dump of 184 real
+transactions that an independent parser walks to exactly the file length,
+zero trailing bytes, all entry times nonzero.

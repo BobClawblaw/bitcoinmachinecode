@@ -393,3 +393,52 @@ that a clean replay is not the finish line it looks like.
 The right characterisation is: a fast and increasingly capable **consensus
 verification engine**, in the middle of the work that would establish whether
 it is actually correct.
+
+---
+
+**Addendum 2026-08-27 (late).** A full day of feature work is the sort of
+thing that tempts a document like this to soften. It should not: the day's
+evidence STRENGTHENS the summary judgement above rather than weakening it.
+
+Roughly a dozen defects surfaced in one session, in code that had passed the
+suite. The instructive part is the split by how each was found:
+
+- **The full suite found what reading could not** — a new test wired into the
+  Makefile as an *argument* to another test, so it never ran while the suite
+  stayed green; a duplicated object that meant the daemon would not link; a
+  call added to a widely-linked object that broke ten targets; a JSON-RPC 2.0
+  notification answering with a body when its method failed.
+- **Differential reading against Core's source found the rest** — a fee-bump
+  that overpaid because it rounded the base feerate up *and* applied Core's
+  compensating `+1`; and four C-vs-asm declaration mismatches, one of which
+  silently discarded every result of a new RPC.
+
+Two of those only became visible *because* an earlier fix gave a
+previously-infallible code path a real failure mode. That is the same
+mechanism as the 08-25 finding: the defects were always there; nothing had
+yet asked the question that exposes them.
+
+One live defect is worth naming plainly, because it is the shape of thing
+this document exists to be honest about. `gettxout` returned `null` for every
+outpoint on the production node. `null` there does not mean "I don't know" —
+it means "that output is not unspent". The node had been confidently
+asserting that **every coin in existence is spent**, and no test caught it
+because the RPC had never been asked on a node that could answer.
+
+Against that, one real consensus gap closed: `nBits` schedule enforcement
+(`bad-diffbits`), verified against every header of the real mainnet and
+testnet4 chains. Before it, a peer could serve headers claiming any
+difficulty; only cumulative-work fork choice contained the damage, and
+containment is not validation.
+
+One more from later the same day, because it is the cleanest example of the
+pattern. Implementing Core's `mempool.dat` came with a unit test that
+round-tripped the obfuscated v2 form and passed — and the format was still
+wrong, because the test built its own v2 fixture from the same mistaken
+assumption the reader held. The two agreed with each other. Only running the
+file past a real Core, and a real Core's file past us, exposed it. A
+self-built fixture tests a format only if it is built FROM the format.
+
+Net: capability keeps moving, end-to-end speed vs Core is **still**
+unmeasured, and the discovery rate is **still** not decelerating. The
+judgement stands.

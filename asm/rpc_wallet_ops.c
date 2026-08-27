@@ -26,6 +26,12 @@
 
 #include "rpc_wallet_ops.h"
 #include "rpc_chain.h"
+/* rpc_node_mempool_rawtx (bumpfee reads the original out of the pool).
+ * Included for the PROTOTYPE, not convenience: without it the call was
+ * implicit, so the compiler assumed int for a long-returning function
+ * and the declaration in rpc_node.h was dead -- a signature change on
+ * either side would not have been caught. */
+#include "rpc_node.h"
 #include "wallet_scan.h"
 #include <dirent.h>
 #include <stdio.h>
@@ -1236,6 +1242,46 @@ int rpc_wops_own_coin(const void* wseed, const unsigned char txid_wire[32], unsi
     return 0;
 }
 
+/* See rpc_wallet_ops.h. A receive is unspent when no SPEND record names its
+ * outpoint -- a spend stores the outpoint it consumed as (prev_txid, vout).
+ * Deliberately self-contained: the embedded RPC server has no UTXO handle
+ * (only the standalone rpcd installs one) and the download worker writes
+ * that store from another process, so the scan is the only source here that
+ * is both available and safe.
+ *
+ * Returns -1 when no rescan has completed. A caller must NOT turn that into
+ * 0.00000000: "I have not looked" and "you have nothing" are different
+ * answers, and only one of them is true. */
+int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
+    if (!out || cap <= 0) return 0;
+    rpc_wallet w; memset(&w, 0, sizeof w); w.seed = (const unsigned char*)wseed;
+    const wscan_key* keys; int nk = wop_keyset_cached(&w, &keys);
+    wscan_rec* recs; long n = wop_records(&recs);
+    if (g_wop_tipscanned < 0) return -1;          /* no scan has completed */
+    int m = 0;
+    for (long i = 0; i < n && m < cap; i++){
+        if (recs[i].kind != 0) continue;          /* receives only */
+        int spent = 0;
+        for (long j = 0; j < n; j++){
+            if (recs[j].kind != 1) continue;
+            if (recs[j].vout == recs[i].vout &&
+                !memcmp(recs[j].prev_txid, recs[i].txid, 32)){ spent = 1; break; }
+        }
+        if (spent) continue;
+        rpc_wops_coin* c = &out[m];
+        memcpy(c->txid, recs[i].txid, 32);
+        c->vout   = recs[i].vout;
+        c->value  = recs[i].value;
+        c->height = recs[i].height;
+        c->is_coinbase = recs[i].is_coinbase ? 1 : 0;
+        c->branch = recs[i].branch;
+        memset(c->h160, 0, 20);
+        if (keys) wop_rec_h160(keys, nk, &recs[i], c->h160);
+        m++;
+    }
+    return m;
+}
+
 /* rescanblockchain ( start_height stop_height ) */
 static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
                                 long* ec, const char** em, rj_val** res){
@@ -2340,6 +2386,365 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
  * confirm. Closing this properly means segwit wallet signing plus coin
  * selection, change policy and fee estimation -- a subsystem, not an RPC
  * shim -- and it is tracked as such. */
+/* ==== bumpfee / psbtbumpfee (Core wallet/feebumper.cpp semantics) ==========
+ *
+ * The original of a bump is an UNCONFIRMED wallet transaction. This wallet
+ * journals metadata, not raw bytes, so the MEMPOOL is the only place the
+ * original still exists -- rpc_node_mempool_rawtx() copies it out under the
+ * pool lock. Consequences, each stated where it bites below:
+ *   - a wallet tx that has dropped out of the mempool cannot be re-bumped
+ *     (Core can: mapWallet stores the tx). Refused with its own message.
+ *   - "is this a wallet transaction" is decided by input ownership against
+ *     the scan records (Core consults mapWallet).
+ * Fee arithmetic mirrors Core's EstimateFeeRate/CheckFeeRate: the default
+ * bump rate is the original's feerate + 1 sat/kvB + max(incrementalrelayfee,
+ * WALLET_INCREMENTAL_RELAY_FEE = 5000 sat/kvB), floored by the estimator's
+ * rate for the conf target; an explicit fee_rate (sat/vB) bypasses the
+ * estimate but not the checks. The increase is taken from the CHANGE output
+ * (shrunk; dropped to fees when it falls under the P2WPKH dust threshold).
+ * DIVERGENCE (documented): Core's CreateTransaction may add further wallet
+ * inputs when change cannot cover the increase; this implementation keeps
+ * the input set fixed and refuses instead. Core's `outputs` /
+ * `original_change_index` options are refused, not half-implemented. */
+
+#define BF_WALLET_INCREMENTAL_KVB 5000ULL   /* Core WALLET_INCREMENTAL_RELAY_FEE */
+#define BF_MAXTXFEE_SAT 10000000ULL         /* Core -maxtxfee default, 0.1 BTC */
+
+/* Core's FormatMoney: BTC with trailing zeros stripped ("0.00001"). */
+static void bf_fmt_money(long long sat, char* out, size_t cap){
+    snprintf(out, cap, "%lld.%08lld", sat/100000000LL, sat%100000000LL);
+    size_t l = strlen(out);
+    while (l && out[l-1] == '0') out[--l] = 0;
+    if (l && out[l-1] == '.') out[--l] = 0;
+}
+
+/* one dispatched call, result freed by caller; 0 on dispatch error (ec/em set) */
+static int bf_call(const char* method, rj_val* params, const rpc_wallet* w,
+                   rj_val** r, long* ec, const char** em){
+    *r = NULL;
+    int rc = rpc_dispatch(method, params, w, r, ec, em);
+    rj_free(params);
+    if (rc != 1){ if (*r){ rj_free(*r); *r = NULL; } return 0; }
+    return 1;
+}
+
+static int cmd_bumpfee_common(const rj_val* params, const rpc_wallet* w,
+                              long* ec, const char** em, rj_val** res, int want_psbt){
+    if (rpc_wops_watchonly() && !want_psbt)
+        return wop_err(ec, em, -4, "bumpfee is not available with wallets that "
+                       "have private keys disabled. Use psbtbumpfee instead.");
+    if (wop_need_scan(ec, em)) return 0;
+
+    unsigned char txw[32]; char txd[65];
+    if (!wop_txid_from_arg(params, txw, txd, ec, em)) return 0;
+
+    /* ---- options ---- */
+    long long opt_fee_rate_kvb = -1;   /* sat/kvB, -1 = not given */
+    int conf_target = 0, replaceable = 1;
+    if (params && params->nitems >= 2 && params->items[1]->typ == RJ_OBJ){
+        const rj_val* o = params->items[1];
+        const rj_val *v_ct = rj_obj_get((rj_val*)o, "conf_target");
+        const rj_val *v_cT = rj_obj_get((rj_val*)o, "confTarget");
+        const rj_val *v_fr = rj_obj_get((rj_val*)o, "fee_rate");
+        if (v_ct && v_cT)
+            return wop_err(ec, em, -8, "confTarget and conf_target options should "
+                "not both be set. Use conf_target (confTarget is deprecated).");
+        if (!v_ct) v_ct = v_cT;
+        if (v_ct && v_fr)
+            return wop_err(ec, em, -8, "Cannot specify both conf_target and fee_rate. "
+                "Please provide either a confirmation target in blocks for automatic "
+                "fee estimation, or an explicit fee rate.");
+        if (v_ct){ if (v_ct->typ != RJ_NUM) return wop_err(ec, em, -8, "conf_target must be a number");
+                   conf_target = (int)atol(v_ct->str); }
+        if (v_fr){ if (v_fr->typ != RJ_NUM) return wop_err(ec, em, -3, "Invalid amount");
+                   double fr = atof(v_fr->str);
+                   if (fr <= 0) return wop_err(ec, em, -3, "Invalid amount");
+                   opt_fee_rate_kvb = (long long)(fr * 1000.0 + 0.5); }
+        { const rj_val* v = rj_obj_get((rj_val*)o, "replaceable");
+          if (v && v->typ == RJ_BOOL && v->str) replaceable = (v->str[0] == '1'); }
+        if (rj_obj_get((rj_val*)o, "outputs") || rj_obj_get((rj_val*)o, "original_change_index"))
+            /* DIVERGENCE: Core rebuilds with caller-supplied outputs; this
+             * wallet keeps the original outputs (change adjusted) only. */
+            return wop_err(ec, em, -8, "the 'outputs' and 'original_change_index' "
+                "options are not supported by this node; the bump keeps the "
+                "original outputs with the fee drawn from change");
+    }
+
+    /* ---- the original: must be in the mempool (see header comment) ---- */
+    static unsigned char raw[400000];
+    long rlen = rpc_node_mempool_rawtx(txw, raw, sizeof raw);
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    wscan_rec* recs; long nrec = wop_records(&recs);
+    if (rlen < 0){
+        /* mined? the scan saw this txid fund the wallet (its change output) */
+        for (long i = 0; i < nrec; i++)
+            if (recs[i].kind == 0 && !memcmp(recs[i].txid, txw, 32))
+                return wop_err(ec, em, -4, "Transaction has been mined, or is "
+                               "conflicted with a mined transaction");
+        return wop_err(ec, em, -5, "Invalid or non-wallet transaction id");
+    }
+
+    /* ---- entry facts: old fee, vsize, descendants ---- */
+    long long old_fee = -1, vsize = -1; int desc_count = 1;
+    { rj_val* p = rj_arr(); rj_arr_push(p, rj_str(txd)); rj_val* r;
+      if (!bf_call("getmempoolentry", p, w, &r, ec, em)) return 0;
+      rj_val* vs = rj_obj_get(r, "vsize");
+      rj_val* dc = rj_obj_get(r, "descendantcount");
+      rj_val* fees = rj_obj_get(r, "fees");
+      rj_val* base = fees ? rj_obj_get(fees, "base") : NULL;
+      if (vs) vsize = atoll(vs->str);
+      if (dc) desc_count = (int)atol(dc->str);
+      if (base) old_fee = rpc_amount_to_sat(base->str);
+      rj_free(r); }
+    if (vsize <= 0 || old_fee < 0)
+        return wop_err(ec, em, -4, "cannot read the original transaction's fee "
+                       "from the mempool entry");
+    if (desc_count > 1)
+        return wop_err(ec, em, -8, "Transaction has descendants in the mempool");
+
+    /* ---- decode the original ---- */
+    static char rawhex[800001];
+    wf_hex(rawhex, raw, rlen);
+    rj_val* dec = NULL;
+    { rj_val* p = rj_arr(); rj_arr_push(p, rj_str(rawhex));
+      if (!bf_call("decoderawtransaction", p, w, &dec, ec, em)) return 0; }
+    rj_val* vin = rj_obj_get(dec, "vin");
+    rj_val* vout = rj_obj_get(dec, "vout");
+    if (!vin || vin->typ != RJ_ARR || !vout || vout->typ != RJ_ARR || vin->nitems == 0){
+        rj_free(dec); return wop_err(ec, em, -4, "cannot decode the original transaction"); }
+
+    /* ---- inputs: every one must be a wallet-owned outpoint (require_mine;
+     * for the scan-record ownership rule see the header comment) ---- */
+    enum { BF_MAX_IN = 64, BF_MAX_OUT = 64 };
+    if (vin->nitems > BF_MAX_IN || vout->nitems > BF_MAX_OUT){
+        rj_free(dec); return wop_err(ec, em, -4, "transaction too large to bump"); }
+    unsigned char in_txid[BF_MAX_IN][32]; unsigned int in_vout[BF_MAX_IN];
+    unsigned long long in_val[BF_MAX_IN]; unsigned char in_h160[BF_MAX_IN][20];
+    int nin = (int)vin->nitems, owned = 0;
+    for (int i = 0; i < nin; i++){
+        rj_val* e = vin->items[i];
+        rj_val* t = rj_obj_get(e, "txid"); rj_val* n = rj_obj_get(e, "vout");
+        if (!t || !n){ rj_free(dec); return wop_err(ec, em, -4, "cannot decode the original transaction"); }
+        for (int k = 0; k < 32; k++){
+            unsigned b; sscanf(t->str + 2*k, "%2x", &b);
+            in_txid[i][31-k] = (unsigned char)b;         /* display -> wire */
+        }
+        in_vout[i] = (unsigned int)atol(n->str);
+        int found = 0;
+        for (long j = 0; j < nrec; j++)
+            if (recs[j].kind == 0 && recs[j].vout == in_vout[i] &&
+                !memcmp(recs[j].txid, in_txid[i], 32)){
+                in_val[i] = recs[j].value;
+                if (!wop_rec_h160(keys, nk, &recs[j], in_h160[i])) break;
+                found = 1; break;
+            }
+        if (found) owned++;
+    }
+    if (owned != nin){
+        rj_free(dec);
+        /* zero wallet inputs: not our transaction at all (Core: mapWallet
+         * miss, -5); some-but-not-all: Core's require_mine refusal (-4) */
+        return wop_err(ec, em, owned ? -4 : -5, owned
+            ? "Transaction contains inputs that don't belong to this wallet"
+            : "Invalid or non-wallet transaction id");
+    }
+
+    /* ---- outputs + change detection (branch-1 P2WPKH = our change) ---- */
+    wf_out outs[BF_MAX_OUT]; int nout = (int)vout->nitems, change_idx = -1;
+    for (int i = 0; i < nout; i++){
+        rj_val* e = vout->items[i];
+        rj_val* v = rj_obj_get(e, "value");
+        rj_val* spk = rj_obj_get(e, "scriptPubKey");
+        rj_val* hx = spk ? rj_obj_get(spk, "hex") : NULL;
+        if (!v || !hx){ rj_free(dec); return wop_err(ec, em, -4, "cannot decode the original transaction"); }
+        long long sat = rpc_amount_to_sat(v->str);
+        size_t hl = strlen(hx->str);
+        if (sat < 0 || hl/2 > sizeof outs[i].spk){ rj_free(dec); return wop_err(ec, em, -4, "cannot decode the original transaction"); }
+        outs[i].value = (unsigned long long)sat;
+        outs[i].spklen = hl/2;
+        for (size_t k = 0; k < hl/2; k++){ unsigned b; sscanf(hx->str + 2*k, "%2x", &b); outs[i].spk[k] = (unsigned char)b; }
+        if (outs[i].spklen == 22 && outs[i].spk[0] == 0x00 && outs[i].spk[1] == 0x14)
+            for (int j = 0; j < nk; j++)
+                if (keys[j].branch == 1 && !memcmp(keys[j].h160, outs[i].spk + 2, 20)){
+                    change_idx = i; break; }
+    }
+    rj_free(dec);
+
+    /* ---- fee targets (Core EstimateFeeRate / CheckFeeRate) ---- */
+    long long mempool_min_kvb = 1000, incr_kvb = 1000;
+    { rj_val* p = rj_arr(); rj_val* r;
+      if (bf_call("getmempoolinfo", p, w, &r, ec, em)){
+          rj_val* mm = rj_obj_get(r, "mempoolminfee");
+          rj_val* ir = rj_obj_get(r, "incrementalrelayfee");
+          if (mm) mempool_min_kvb = rpc_amount_to_sat(mm->str);
+          if (ir) incr_kvb = rpc_amount_to_sat(ir->str);
+          rj_free(r);
+      } else { *ec = 0; *em = NULL; } }
+    long long rate_kvb;
+    if (opt_fee_rate_kvb > 0) rate_kvb = opt_fee_rate_kvb;
+    else {
+        /* TRUNCATING, like Core's CFeeRate(old_fee, txSize) whose GetFeePerK
+         * evaluates the rational DOWN. Core's comment says why the +1 below
+         * exists: "calculated from the tx fee/vsize, so it may have been
+         * rounded down. Add 1 satoshi to the result." Rounding up here AND
+         * adding 1 would double-compensate and overpay by 1 sat/kvB on every
+         * bump whose fee*1000 is not a multiple of its vsize. */
+        long long orig_kvb = old_fee * 1000 / vsize;
+        long long wallet_incr = incr_kvb > (long long)BF_WALLET_INCREMENTAL_KVB
+                              ? incr_kvb : (long long)BF_WALLET_INCREMENTAL_KVB;
+        rate_kvb = orig_kvb + 1 + wallet_incr;
+        long long est = (long long)wf_feerate_sat_kvb(conf_target > 0 ? conf_target : 6);
+        if (est > rate_kvb) rate_kvb = est;
+    }
+    if (rate_kvb < mempool_min_kvb){
+        static char m[192]; char a[24], b[24];
+        bf_fmt_money(rate_kvb, a, sizeof a); bf_fmt_money(mempool_min_kvb, b, sizeof b);
+        snprintf(m, sizeof m, "New fee rate (%s) is lower than the minimum fee rate "
+                 "(%s) to get into the mempool -- ", a, b);
+        return wop_err(ec, em, -4, m);
+    }
+    long long new_fee = (rate_kvb * vsize + 999) / 1000;
+    long long incr_fee = (incr_kvb * vsize + 999) / 1000;
+    if (new_fee < old_fee + incr_fee){
+        static char m[224]; char a[24], b[24], c[24], d[24];
+        bf_fmt_money(new_fee, a, sizeof a); bf_fmt_money(old_fee + incr_fee, b, sizeof b);
+        bf_fmt_money(old_fee, c, sizeof c); bf_fmt_money(incr_fee, d, sizeof d);
+        snprintf(m, sizeof m, "Insufficient total fee %s, must be at least %s "
+                 "(oldFee %s + incrementalFee %s)", a, b, c, d);
+        return wop_err(ec, em, -8, m);
+    }
+    { long long required = (WF_MIN_RELAY_SAT_KVB * (long long)vsize + 999) / 1000;
+      if (new_fee < required){
+          static char m[160]; char a[24];
+          bf_fmt_money(required, a, sizeof a);
+          snprintf(m, sizeof m, "Insufficient total fee (cannot be less than "
+                   "required fee %s)", a);
+          return wop_err(ec, em, -8, m);
+      } }
+    if (new_fee > (long long)BF_MAXTXFEE_SAT){
+        static char m[192]; char a[24], b[24];
+        bf_fmt_money(new_fee, a, sizeof a); bf_fmt_money((long long)BF_MAXTXFEE_SAT, b, sizeof b);
+        snprintf(m, sizeof m, "Specified or calculated fee %s is too high (cannot "
+                 "be higher than -maxtxfee %s)", a, b);
+        return wop_err(ec, em, -4, m);
+    }
+
+    /* ---- take the increase from change (see header for the divergence) ---- */
+    if (change_idx < 0)
+        return wop_err(ec, em, -4, "the original transaction has no change output "
+            "this wallet can draw the fee increase from (Core would add inputs; "
+            "this node keeps the input set fixed)");
+    long long delta = new_fee - old_fee;
+    /* P2WPKH dust at Core's default -dustrelayfee (3000 sat/kvB): 31 vB of
+     * output + ~67.75 vB to later spend it -> 294 sat. The config knob lives
+     * in the daemon (node_config); this file also links into the standalone
+     * rpcd, so the DEFAULT is used here -- stated, not silently assumed. */
+    long long dust = 294;
+    long long ch = (long long)outs[change_idx].value - delta;
+    int drop_change = 0;
+    if (ch < dust){
+        /* the whole change joins the fee, exactly Core's dust-change rule */
+        drop_change = 1;
+        new_fee = old_fee + (long long)outs[change_idx].value;
+    } else outs[change_idx].value = (unsigned long long)ch;
+
+    /* ---- rebuild (same inputs; sequence signals per `replaceable`) ---- */
+    static unsigned char nraw[400000];
+    long p2 = 0;
+    unsigned int seq = replaceable ? 0xfffffffdu : 0xfffffffeu;
+    for (int i = 0; i < 4; i++) nraw[p2++] = (unsigned char)(2 >> (8*i));
+    p2 += wf_vi(nraw + p2, (unsigned long long)nin);
+    for (int i = 0; i < nin; i++){
+        memcpy(nraw + p2, in_txid[i], 32); p2 += 32;
+        for (int k = 0; k < 4; k++) nraw[p2++] = (unsigned char)(in_vout[i] >> (8*k));
+        nraw[p2++] = 0x00;
+        for (int k = 0; k < 4; k++) nraw[p2++] = (unsigned char)(seq >> (8*k));
+    }
+    p2 += wf_vi(nraw + p2, (unsigned long long)(nout - drop_change));
+    for (int i = 0; i < nout; i++){
+        if (drop_change && i == change_idx) continue;
+        for (int k = 0; k < 8; k++) nraw[p2++] = (unsigned char)(outs[i].value >> (8*k));
+        p2 += wf_vi(nraw + p2, outs[i].spklen);
+        memcpy(nraw + p2, outs[i].spk, outs[i].spklen); p2 += (long)outs[i].spklen;
+    }
+    for (int k = 0; k < 4; k++) nraw[p2++] = 0x00;
+    static char nhex[800001];
+    wf_hex(nhex, nraw, p2);
+
+    char oldfee_s[24], newfee_s[24];
+    rpc_amounts(old_fee, oldfee_s, sizeof oldfee_s);
+    rpc_amounts(new_fee, newfee_s, sizeof newfee_s);
+
+    if (want_psbt){
+        rj_val* p = rj_arr(); rj_arr_push(p, rj_str(nhex)); rj_val* r;
+        if (!bf_call("converttopsbt", p, w, &r, ec, em)) return 0;
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "psbt", rj_str(r->str ? r->str : ""));
+        rj_free(r);
+        rj_obj_set(o, "origfee", rj_numf("%s", oldfee_s));
+        rj_obj_set(o, "fee", rj_numf("%s", newfee_s));
+        rj_obj_set(o, "errors", rj_arr());
+        *res = o;
+        return 1;
+    }
+
+    /* ---- sign + broadcast (RBF admission enforces the replacement rules) ---- */
+    rj_val* pv = rj_arr();
+    for (int i = 0; i < nin; i++){
+        rj_val* e = rj_obj();
+        char tx[65];
+        for (int k = 0; k < 32; k++){
+            static const char* H = "0123456789abcdef";
+            unsigned char b = in_txid[i][31-k];
+            tx[k*2] = H[b>>4]; tx[k*2+1] = H[b&15];
+        }
+        tx[64] = 0;
+        rj_obj_set(e, "txid", rj_str(tx));
+        rj_obj_set(e, "vout", rj_numf("%u", in_vout[i]));
+        { char spkh[48]; unsigned char spk[22];
+          spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, in_h160[i], 20);
+          wf_hex(spkh, spk, 22);
+          rj_obj_set(e, "scriptPubKey", rj_str(spkh)); }
+        { char am[32]; rpc_amounts((long long)in_val[i], am, sizeof am);
+          rj_obj_set(e, "amount", rj_numf("%s", am)); }
+        rj_arr_push(pv, e);
+    }
+    char* sgn;
+    if (!wf_sign(w, nhex, pv, &sgn, ec, em)) return 0;
+    char* newtxid;
+    if (!wf_send(w, sgn, &newtxid, ec, em)){ free(sgn); return 0; }
+    free(sgn);
+
+    /* replaced-by linkage sidecar (gettransaction reports both directions) */
+    { char pb[512]; FILE* f = fopen(wop_path("bumped.dat", pb, sizeof pb), "a");
+      if (f){ fprintf(f, "%s %s\n", txd, newtxid); fclose(f); } }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "txid", rj_str(newtxid));
+    free(newtxid);
+    rj_obj_set(o, "origfee", rj_numf("%s", oldfee_s));
+    rj_obj_set(o, "fee", rj_numf("%s", newfee_s));
+    rj_obj_set(o, "errors", rj_arr());
+    *res = o;
+    return 1;
+}
+
+/* replaced_by/replaces lookup for gettransaction (rpc_commands.c). Fills
+ * either direction from the bumped.dat sidecar; empty string = no link. */
+int rpc_wops_bump_link(const char* txid_disp, char* replaced_by, size_t rb_cap,
+                       char* replaces, size_t rp_cap){
+    replaced_by[0] = 0; replaces[0] = 0;
+    char pb[512]; FILE* f = fopen(wop_path("bumped.dat", pb, sizeof pb), "r");
+    if (!f) return 0;
+    char oldid[80], newid[80]; int hit = 0;
+    while (fscanf(f, "%79s %79s", oldid, newid) == 2){
+        if (!strcmp(oldid, txid_disp)){ snprintf(replaced_by, rb_cap, "%s", newid); hit = 1; }
+        if (!strcmp(newid, txid_disp)){ snprintf(replaces, rp_cap, "%s", oldid); hit = 1; }
+    }
+    fclose(f);
+    return hit;
+}
+
 #define WOP_NO_FUNDING \
     "this node cannot construct a spend: its wallet hands out P2WPKH " \
     "addresses but wallet_core's send path is legacy-P2PKH end to end " \
@@ -2474,8 +2879,8 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
                                              long*, const char**, rj_val**);
         return rpc_cmd_walletprocesspsbt(params, w, ec, em, res);
     }
-    if (!strcmp(m, "bumpfee") || !strcmp(m, "psbtbumpfee"))
-        return wop_unsupported(WOP_NO_FUNDING, ec, em);
+    if (!strcmp(m, "bumpfee"))     return cmd_bumpfee_common(params, w, ec, em, res, 0);
+    if (!strcmp(m, "psbtbumpfee")) return cmd_bumpfee_common(params, w, ec, em, res, 1);
 
     return -1;   /* unreachable while WOP_METHODS and this ladder agree */
 }

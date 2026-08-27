@@ -63,11 +63,39 @@ set byte-identical to Core's (MuHash, no filters, no overrides — see
 `README.md`), which converts several of this document's "unverified"
 hedges below into verified facts.
 
+**Update 2026-08-27 (late) — this document was itself audited.** The
+"REMAINING gaps" list below had drifted badly: wallet management, the live
+address index, mining polish, testnet4 and ZMQ were all still filed as
+missing after they shipped, and the "two live UTXO-writer divergences" were
+wrong on both counts (the genesis-coinbase one is in the OFFLINE batch tool,
+not the live writer; the BIP30 one was fixed). A gap inventory that
+overstates is exactly as misleading as one that understates — it sends work
+at problems that are already solved. Every remaining item has now been
+re-checked by reading the dispatch tables and the writers, not this file.
+Also closed the same day: nBits schedule enforcement, `bumpfee`/
+`psbtbumpfee`, and `gettxout` — which had been returning `null`, i.e.
+"spent", for EVERY outpoint on the live node.
+
 **Update 2026-08-27 — current state.** A large batch has landed since the
 08-25 survey. This block is the authoritative "where we are"; the sectioned
 body below is the older narrative, annotated inline where an item has closed.
 
-CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
+CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`).
+The last four landed 2026-08-27 and are listed first:
+- **nBits schedule enforcement** (`bad-diffbits`) — one shared rule engine
+  (`asm/bitcoin_pow_rules.c`) behind getblocktemplate, the apply path and
+  fork evaluation, replayed against EVERY header of the real mainnet
+  (964,265 heights / 478 boundaries) and testnet4 (149,954 / 101,009
+  min-difficulty / 16,491 walk-backs) chains.
+- **`bumpfee` / `psbtbumpfee`** — Core feebumper semantics; proven end to
+  end against a real Core (`validation/bumpfee_regtest_e2e.sh`), which
+  ACCEPTS the replacement and drops the original.
+- **`gettxout`** — the RPC now asks the download worker over a socketpair;
+  diffed against Core's answer on the same outpoint. It had been returning
+  `null` for every outpoint, which means "spent", not "unknown".
+- **`getbalance`/`listunspent`** — answer from the wallet rescan rather than
+  the (default-OFF) address index, so a funded wallet no longer reports
+  `0.00000000`.
 - **txindex** — offline base build + daemon-maintained incremental tail
   (`daemon/tx_index_tail.c`); `getrawtransaction <txid>` works with no block
   hash.
@@ -96,6 +124,53 @@ CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
 - **`walletprocesspsbt`** — the PSBT Signer role by delegation
   (`rpc_wallet_ops.c`); `finalizepsbt`/`utxoupdatepsbt` are real
   (`rpc_commands.c`).
+- ~~**`gettxout` cannot reach the live UTXO set**~~ — **FIXED 2026-08-27**
+  (`refusal` then the real fix). The embedded RPC server runs in the serve
+  PARENT and has no UTXO handle; it used to answer `null` for every outpoint,
+  which does not mean "unknown" — it means "spent". The node was asserting
+  that about every coin in existence.
+  Building a read-only view in the parent was measured and REJECTED on cost,
+  not safety: `utxo_lsm_reload_ro` takes 60.4/61.9/72.1/73.2/79.4/82.6 s on
+  the real 165M-entry set (six production boots) and every block invalidates
+  it. Instead the parent ASKS the download worker over a socketpair created
+  before the fork; the worker already has the set open and answers
+  `utxo_lsm_get` in microseconds.
+  The worker replies only at a QUIESCENT point in its loop (after the
+  catch-up call). `utxo_lsm_get` is thread-safe on its own — `lsm_get_scratch`
+  is TLS — but this module guarantees `get()` and `flush()` never overlap *by
+  construction*, and a query thread would have broken exactly that.
+  Every failure is a REFUSAL, never a guess: no worker, timeout, short read,
+  lost framing. The response echoes the outpoint it answers, because a
+  timed-out query leaves its reply in the socket and the next query would
+  otherwise read a well-formed answer about the WRONG coin (`test_txoq_ipc`
+  pins this; verified fail-then-pass).
+  Proven in `validation/bumpfee_regtest_e2e.sh`: `gettxout` on an unspent coin
+  matches **Core's `gettxout` exactly**, and a spent outpoint is null from both.
+  That first real diff also caught `value` being emitted as a JSON *string*
+  where Core emits a *number* — fixed here, along with the same shape bug in
+  `listunspent.amount` and `getbalance`.
+- ~~**`connect=<host>:<port>` ignores a non-default port**~~ — **FIXED
+  2026-08-27** (`be7ef33`): any port is honoured, the host stays stored bare
+  and the port rides a parallel array read via `node_config_peer_port()`.
+- ~~**`getbalance`/`listunspent` read the address index**~~ — **FIXED
+  2026-08-27** (`0994198`): with no address argument they enumerate the
+  wallet's coins from the rescan records (spent-ness from the scan's own
+  spend records); an explicit address still uses the index. Scan format grew
+  `is_coinbase` (BMCWSCN3) so coinbase maturity is respected; older BMCWSCN2
+  files are still read.
+- **nBits schedule enforcement (Core's `bad-diffbits`)** — a peer's headers
+  must now carry exactly the bits `GetNextWorkRequired` demands for their
+  height, checked in fork evaluation (`reorg_analyze`) AND at apply
+  (`utxo_live`), including the submitblock/GBT-proposal dry run. One shared
+  rule engine (`asm/bitcoin_pow_rules.c`) also backs `getblocktemplate`, so
+  mining and validation cannot drift. Chain-aware: fPowNoRetargeting,
+  fPowAllowMinDifficultyBlocks + the 20-minute exception + Core's walk-back,
+  BIP94. Replayed against every header of the real mainnet chain (964,265
+  heights, 478 boundaries) and the real testnet4 chain (149,954 heights,
+  101,009 min-difficulty blocks, 16,491 walk-back re-anchors) —
+  `validation/pow_replay.c`, both exact. This closes the gap `reorg.c`
+  itself used to call out: "retarget validation is a real gap in this node's
+  consensus rules ... chainwork comparison is what contains it."
 - **wtxidrelay (BIP339)** + **stripped-block serving to bare MSG_BLOCK** +
   **addr self-advertisement** (`daemon/addr_self.c`) + **NODE_WITNESS peer
   preference** — the networking gaps the 08-25 P2P section listed as remaining.
@@ -110,32 +185,86 @@ CLOSED since 08-25 (evidence in parentheses; each verified against `asm/`):
   `getblocktemplate` mined and ACCEPTED by Core, live tip-follow, wallet tx
   relayed into bmc's mempool. `tests/test_chainparams` (29 checks).
 
-REMAINING gaps, precisely (this is the real backlog):
-- **Wallet management** — multiwallet (`createwallet`/`loadwallet`/
-  `unloadwallet`), descriptor wallets, and watch-only are DISPATCHED but
-  honestly refused (`rpc_wallet_ops.c` `wop_unsupported(WOP_ONE_WALLET/
-  WOP_NO_IMPORT)`). Needs a descriptor engine + wallet-DB layer; the largest
-  remaining chunk.
-- **Live address index** — `build_addr_index.c` exists but is an OFFLINE
-  batch tool only, no live-boot reference in `daemon/main.c`.
-- **Mining polish** — no longpoll, no BIP23 proposal mode, tx ordering valid
-  but not fee-optimal, sigops a lower bound; no stratum/pool interface.
+REMAINING gaps, precisely (this is the real backlog).
+
+**Re-verified 2026-08-27 against the code, not against this document.** The
+previous version of this list had gone stale in five places and was
+OVERSTATING the backlog — wallet management, the live address index, mining
+polish and testnet were all listed as missing after they had shipped, and the
+"two live UTXO-writer divergences" were wrong on both counts. An inventory
+that overstates is no more honest than one that understates; both are wrong
+about where the work is. What follows was checked by reading the dispatch
+tables and the writers themselves.
+
 - **Full-verification IBD benchmark vs Core** (`-assumevalid=0
-  -stopatheight`, second scratch datadir) — still not run; the one
-  like-for-like end-to-end speed comparison.
-- **`lsm_get_scratch`** — 4 MiB asm-TLS scratch (`bitcoin_utxo_lsm.asm`, only
-  the non-mmap fallback uses it) should move to heap.
-- **Two live UTXO-writer divergences** — the batch `build_utxo.c` includes
-  the genesis coinbase Core omits; `utxo_lsm_put` keeps the EARLIER coin on a
-  BIP30 duplicate where Core's `possible_overwrite=true` keeps the later one.
-  Both invisible in practice, corrected at read time, but live code.
-- **testnet / signet** — REFUSED by design (`daemon/chainparams.c` loudly
-  rejects `chain=test`/`signet` rather than run the wrong rules); only main
-  and regtest are supported.
+  -stopatheight`, second scratch datadir) — **still never run.** The one
+  like-for-like end-to-end speed comparison, and the only item here that is
+  purely a measurement rather than a capability.
+- **`assumevalid`** — parsed and then IGNORED, with a loud `[config]` line
+  saying so. This node verifies every script in every block; honouring
+  assumevalid would mean *skipping* that, so it is a deliberate refusal
+  rather than an unimplemented feature. Small to wire if ever wanted.
+- **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
+  this project makes rests on locally-validated coins, and importing a
+  snapshot would hollow that out. `dumptxoutset` is real (proven at full
+  165.7M-coin scale).
+- ~~**Mempool persistence (`savemempool`/`importmempool`)**~~ — **CLOSED
+  2026-08-27.** Core's `mempool.dat`, verified in BOTH directions against a
+  running Core: it loads the dump this node writes, and this node loads the
+  dump it writes. We write version 1 (Core's own `-persistmempoolv1` form,
+  read unconditionally; v2's obfuscation key is random so no writer can
+  produce a byte-comparable artifact) and read both. `importmempool`
+  re-submits each transaction through the normal admission path. Not
+  restored: entry times, fee deltas, and the unbroadcast set — each stated at
+  the call site. *(This item was missing from the 2026-08-27 audit of this
+  list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
+  accurate than what it replaced but not complete.)*
+- **Package relay — PARTLY CLOSED 2026-08-27.** `submitpackage` is real:
+  context-free package policy with Core's reason strings, in-package parent
+  resolution, and Core's effective feerate, so a parent below the relay floor
+  is accepted when its child pays for it. Proven end to end against a real
+  Core, which accepts the identical package
+  (`validation/bumpfee_regtest_e2e.sh`). STILL OPEN: p2p 1-parent-1-child
+  package RELAY (this is submission, not relay), TRUC/v3 and ephemeral-dust
+  policy, `replaced-transactions` reporting, and `testmempoolaccept`'s
+  package mode, which still evaluates each member independently and says so
+  at its own call site.
+- **Seven wallet-import RPCs refuse**, all the same shape: `migratewallet`,
+  `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
+  `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`. The
+  reason is structural and stated at the call site — this wallet is a single
+  BIP32 seed with no import path. NOTE the rest of wallet management shipped:
+  `createwallet`/`loadwallet`/`unloadwallet`/`restorewallet`/
+  `importdescriptors` are all real.
+- **`build_utxo.c` (the OFFLINE batch tool) includes the genesis coinbase**
+  that Core omits. The LIVE writer does not — `daemon/utxo_live.c` skips it
+  explicitly for mainnet, regtest and testnet4. Previously filed here as a
+  "live writer" divergence, which was wrong.
+- **`bumpfee`'s replaced-by linkage is write-only in practice** — the
+  `bumped.dat` sidecar is written with both txids, but `gettransaction`
+  resolves a txid against the wallet SEND JOURNAL, so a transaction
+  broadcast outside that path is not one it will report on. The
+  `replaced_by_txid`/`replaces_txid` fields are therefore not reachable for
+  such a transaction (found 2026-08-27 while building the bumpfee e2e).
+- **`lsm_get_scratch` is 4 MiB + 64 KiB of per-thread TLS.** Moving it to a
+  lazily-allocated heap buffer would cut the per-thread footprint. This is a
+  FOOTPRINT item, not a correctness one: an earlier note here called it
+  non-thread-safe and pending — it has been thread-local
+  (`section .tbss`, Initial-Exec) since the incident-#13 work.
+- **testnet / signet** — REFUSED by design (`daemon/chainparams.c` rejects
+  `chain=test`/`signet` loudly rather than run the wrong rules). Supported:
+  **main, regtest and testnet4** — testnet4's whole chain synced with a
+  byte-identical muhash vs Core.
 - **Tor/I2P/onion, REST interface, UPnP/NAT-PMP, Bitcoin-Qt GUI** — absent by
   design (not gaps for an asm/daemon consensus project).
-- **`assumevalid` / `assumeutxo`** — still deliberately unwired (see Consensus
-  section); `assumevalid` is small, `assumeutxo` is large.
+
+CLOSED since the previous revision of this list, each with its evidence in
+LOG.md: wallet management (multiwallet + watch-only descriptors + BnB coin
+selection), the live address index (`addrindex=1`), mining polish (CPFP
+templates, exact sigops, BIP23 proposal mode, longpoll), chain selection for
+regtest AND testnet4, nBits schedule enforcement, `bumpfee`/`psbtbumpfee`,
+and `gettxout` (which had been answering `null` — i.e. "spent" — for every
+outpoint on the live node).
 
 ## RPC surface — the biggest gap until 2026-08-25; first tranche 2026-08-21
 
@@ -348,9 +477,15 @@ plus straightforward methods on top of it.
   (`daemon/tx_index_tail.c`) that backfills at boot and follows the tip, so
   `getrawtransaction <txid>` works with no block hash and `getindexinfo`
   reports the real combined coverage.
-- **Address index** — `build_addr_index.c` exists but is a **standalone
-  offline batch tool only**, zero references from `daemon/main.c`'s live
-  boot path. Not a live, queryable index.
+- ~~**Address index**~~ — **LIVE since 2026-08-27** (`addrindex=1`, default
+  OFF because Core has no address index at all; this is a deliberate
+  extension). `daemon/addr_index_tail.c` maintains it at the same new-block
+  choke point as the txid and filter tails, sharing one classifier with the
+  offline builder so the two structurally cannot disagree. Described here as
+  "offline batch tool only" after it had shipped — corrected 2026-08-27.
+  Note the consequence recorded in the Wallet section: `getbalance`/
+  `listunspent` read this index for an explicit address, but answer from the
+  wallet RESCAN when no address is given.
 - ~~**`blockfilterindex`** (BIP157/158, "neutrino" light-client support) —
   absent.~~ — **DONE 2026-08-26** (`daemon/bfilter_index.c`,
   `daemon/build_block_filters.c`): whole-chain BIP158 basic filters AND the
@@ -444,14 +579,17 @@ Missing:
   `utxoupdatepsbt` are real (`rpc_commands.c`). `descriptorprocesspsbt`
   honestly refuses (no descriptor engine). `docs/PARITY_PLAN.md` T8 has the
   per-method state.
-- **Descriptor wallets** — Core's modern default wallet type isn't present.
-  DISPATCHED but refused (`importdescriptors`/`createwalletdescriptor`/
-  `addhdkey` → `wop_unsupported(WOP_NO_IMPORT)`). Needs a descriptor engine.
-- **Watch-only wallets** — absent (`exportwatchonlywallet` refuses).
-- **Multi-wallet** (`loadwallet`/`createwallet`/`listwallets`) — DISPATCHED
-  but refused (`wop_unsupported(WOP_ONE_WALLET)`); single implicit wallet
-  only. Wallet management (multiwallet + descriptors + watch-only) is the
-  largest remaining gap.
+- ~~**Descriptor wallets**~~ — **`importdescriptors` is REAL** since the
+  wallet-management merge; watch-only descriptors are tracked and rescanned.
+  Still refused: `createwalletdescriptor` and `addhdkey`, which would have to
+  ADOPT foreign key material this single-seed wallet has no path for.
+- ~~**Watch-only wallets**~~ — watch-only descriptors are supported;
+  `exportwatchonlywallet` still refuses (same import-path reason).
+- ~~**Multi-wallet**~~ — **REAL**: `createwallet`, `loadwallet`,
+  `unloadwallet`, `restorewallet` and `listwallets` all work; the lifecycle
+  is exercised end-to-end in `tests/test_rpc_wallet_ops`. This was described
+  here as "the largest remaining gap" long after it had shipped — corrected
+  2026-08-27.
 - Coin selection — present but basic (`listunspent`/`getbalance` exist); no
   evidence of a sophisticated algorithm like Core's Branch-and-Bound. Not
   confirmed in depth either way.
@@ -511,7 +649,12 @@ not just present as unused/tested-in-isolation code:
 
 Confirmed absent:
 - **Tor / I2P / onion support** — zero hits for tor/.onion/torcontrol.
-- **ZMQ notification interface** — zero hits.
+- ~~**ZMQ notification interface**~~ — **REAL since 2026-08-26**:
+  `hashblock`/`hashtx`/`rawblock`/`rawtx` publish over a hand-written ZMTP
+  3.1 PUB socket (`daemon/zmq_notify.c`, `daemon/zmq_pub.c`), with
+  `getzmqnotifications` dispatched. Core only exposes that method when built
+  WITH zmq, which the census Core was not — so this is one method BEYOND the
+  surface the census measured.
 - **REST interface** (separate from JSON-RPC) — zero hits.
 - **UPnP / NAT-PMP** automatic port forwarding — zero hits.
 - ~~Addr self-advertisement~~ — **DONE 2026-08-26** (`daemon/addr_self.c`):

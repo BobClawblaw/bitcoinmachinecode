@@ -56,6 +56,9 @@ extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
  * this exists and who needs it (daemon catch-up completion). */
 extern long utxo_lsm_flush(void* lst, void* u);
 extern long utxo_lsm_count(void* lst);
+/* returns the live entry count (or -1); NOT an int -- an implicit
+ * declaration here truncated it to 32 bits. */
+extern long utxo_lsm_walk(void* lst, void* u, void* cb, void* ctx);
 extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
 
@@ -756,12 +759,69 @@ static int bip30_enforced(long height, const u8 hash32[32])
  * Reset on entry; only meaningful right after a 0 return. */
 static const char* g_last_reject = "";
 const char* utxo_live_last_reject(void){ return g_last_reject; }
+
+/* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
+ * The RPC server runs in the serve PARENT and has no handle on this state --
+ * the download worker (this process) owns it. Called ONLY from the worker's
+ * quiescent service point, where no put/del/flush is in flight: utxo_lsm_get
+ * is thread-safe by itself but this module guarantees get() and flush() never
+ * overlap by construction, and that guarantee is what keeps this sound.
+ * Returns 1 found / 0 absent, and borrows the script from the LSM's own
+ * per-thread buffer -- the caller must copy it before the next call. */
+long utxo_live_lsm_get(const u8 txid_wire[32], unsigned int vout,
+                       u64* value, unsigned long* height, unsigned long* is_coinbase,
+                       const u8** script, unsigned long* slen){
+    extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
+                             unsigned long* height, unsigned long* is_coinbase,
+                             const u8** script, unsigned long* slen);
+    if (!g_utxo_table) return 0;
+    return utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid_wire, (u32)vout,
+                        value, height, is_coinbase, script, slen) == 1 ? 1 : 0;
+}
 /* Dry-run mode: run every verification phase (0 through 4) and STOP at the
  * Phase 5 boundary -- the first mutation -- returning 1. The whole point is
  * that this is the SAME code path a real apply takes, so a dry-run pass
  * guarantees the subsequent real apply of the same block against the same
  * state succeeds (single-threaded worker; nothing moves in between). */
 static int g_dry_run = 0;
+
+/* ---- nBits schedule enforcement (bad-diffbits) ---------------------------
+ * Core's ContextualCheckBlockHeader: a block whose nBits differs from
+ * GetNextWorkRequired(parent) is consensus-invalid. The rule engine is the
+ * SHARED bitcoin_pow_rules.c -- the same implementation getblocktemplate
+ * uses, proven against every header of the real mainnet chain (964,251
+ * heights, 478 boundaries) and the real testnet4 chain (149,954 heights,
+ * 101k min-difficulty blocks) by validation/pow_replay.c BEFORE being wired
+ * here (LOG.md 2026-08-27).
+ *
+ * INJECTED, default OFF: the hermetic suites build synthetic chains whose
+ * headers carry arbitrary nBits (test_reorg, test_cross_tx_verify, ...);
+ * only the daemon -- which knows the selected chain -- registers the rules
+ * (main.c, right after chainparams_select). Ancestor headers are read
+ * straight from the block archive (g_bip30_store), 80 bytes per lookup via
+ * the cached read fds; every apply path stores ancestors before applying,
+ * and the submitblock dry-run's ancestors are the live chain. */
+#include "../bitcoin_pow_rules.h"
+extern int  store_get_at(void* st, u64 height, u64 out_meta[3]);
+extern int  store_rd_fd(void* st, unsigned file_no);
+static int  g_powr_enabled;
+static int  g_powr_no_rt, g_powr_mindiff, g_powr_bip94;
+static unsigned int g_powr_lim;
+void utxo_live_set_pow_rules(int no_retarget, int allow_min_diff,
+                             int enforce_bip94, unsigned int pow_limit_bits){
+    g_powr_no_rt = no_retarget; g_powr_mindiff = allow_min_diff;
+    g_powr_bip94 = enforce_bip94; g_powr_lim = pow_limit_bits;
+    g_powr_enabled = 1;
+}
+static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
+    u64 meta[3];
+    if (!ctx || store_get_at(ctx, (u64)h, meta) != 1) return 0;
+    int fd = store_rd_fd(ctx, (unsigned)meta[2]);
+    if (fd < 0) return 0;
+    /* +8 skips the [len][magic] frame header -- store_read_meta's own
+     * pread does exactly this (bitcoin_store_fast.asm) */
+    return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
+}
 
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     g_last_reject = "";
@@ -805,8 +865,26 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     static const u8 REGTEST_GENESIS[32] = {   /* wire (sha256d) order */
         0x06,0x22,0x6e,0x46,0x11,0x1a,0x0b,0x59,0xca,0xaf,0x12,0x60,0x43,0xeb,0x5b,0xbf,
         0x28,0xc3,0x4f,0x3a,0x5e,0x33,0x2a,0x1f,0xc7,0xb2,0xb7,0x3c,0xf1,0x88,0x91,0x0f };
+    /* testnet4 (display 00000000da84f2ba...8bf043 reversed) */
+    static const u8 TESTNET4_GENESIS[32] = {  /* wire (sha256d) order */
+        0x43,0xf0,0x8b,0xda,0xb0,0x50,0xe3,0x5b,0x56,0x7c,0x86,0x4b,0x91,0xf4,0x7f,0x50,
+        0xae,0x72,0x5a,0xe2,0xde,0x53,0xbc,0xfb,0xba,0xf2,0x84,0xda,0x00,0x00,0x00,0x00 };
     if (g_apply_height == 0 && (memcmp(blk_hash, MAINNET_GENESIS, 32) == 0 ||
-                                memcmp(blk_hash, REGTEST_GENESIS, 32) == 0)) return 1;
+                                memcmp(blk_hash, REGTEST_GENESIS, 32) == 0 ||
+                                memcmp(blk_hash, TESTNET4_GENESIS, 32) == 0)) return 1;
+
+    /* nBits schedule (see the block comment above apply_block_inner). The
+     * check runs for the dry-run too -- submitblock and GBT proposal answer
+     * Core's "bad-diffbits" without touching state. -1 (an ancestor header
+     * unreadable) also rejects: refusing to evaluate is safer than accepting
+     * unevaluated, and every legitimate path has its ancestors stored. */
+    if (g_powr_enabled && g_apply_height >= 1){
+        int pr = pow_check_bits(g_apply_height, blockbuf,
+                                powr_hdr_from_store, g_bip30_store,
+                                g_powr_no_rt, g_powr_mindiff,
+                                g_powr_bip94, g_powr_lim);
+        if (pr != 1){ g_last_reject = "bad-diffbits"; return 0; }
+    }
 
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
      * used), building the tx array tx_verify.c also consumes. txs/pn_outs

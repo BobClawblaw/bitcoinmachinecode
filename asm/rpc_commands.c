@@ -62,6 +62,19 @@ static void* g_utxo_lst = NULL;
 static void* g_utxo_u = NULL;
 void rpc_commands_set_utxo_store(void* lst, void* u) { g_utxo_lst = lst; g_utxo_u = u; }
 
+/* gettxout's out-of-process path. The embedded RPC server (serve parent) has
+ * no UTXO handle -- the download worker owns that state -- so daemon/main.c
+ * installs a query that asks the worker over a socketpair. 1 found /
+ * 0 genuinely absent / -1 cannot answer (no worker, busy, timeout). The
+ * standalone rpcd sets the store above instead and never uses this. */
+#define TXO_SPK_CAP 16384u
+typedef long (*rpc_txo_query_fn)(const unsigned char txid_wire[32], unsigned int vout,
+                                 unsigned long long* value, unsigned long* height,
+                                 unsigned long* is_coinbase, unsigned char* spk,
+                                 unsigned long spk_cap, unsigned long* spk_len);
+static rpc_txo_query_fn g_txo_query = NULL;
+void rpc_commands_set_txo_query(rpc_txo_query_fn fn) { g_txo_query = fn; }
+
 /* ---- scriptPubKey(hash) -> UTXO reverse index (asm/daemon/build_addr_
  * index.c) backing listunspent/getbalance. Same "opaque handle, separate
  * from rpc_wallet" pattern as the UTXO store above. Mmap'd read-only by
@@ -333,6 +346,20 @@ static int addr_idx_build_script(unsigned char type_tag, const unsigned char has
 
 #define ADDR_IDX_MAX_MATCHES 200000
 
+#define WOP_COIN_CAP 200000
+/* Core matures a coinbase at 100 confirmations; everything else is spendable
+ * as soon as it is in a block, and the scan only records confirmed outputs.
+ * A scan file older than format 3 carries no coinbase flag (wscan_flags_known
+ * is 0): those coins are treated as spendable, which is right for any wallet
+ * that has never been paid a coinbase and is corrected by one rescan for one
+ * that has. Overstating here is bounded and visible; refusing to answer at
+ * all until every wallet rescans would be worse. */
+static int wallet_coin_mature(const rpc_wops_coin* c, long tip){
+    if (!c->is_coinbase) return 1;
+    if (tip < 0) return 0;                         /* unknown tip: do not claim */
+    return (tip - (long)c->height + 1) >= 100;
+}
+
 /* ---- getbalance: sum of the address index's entries for the resolved
  * address (param, or the wallet's own default address if omitted). ---- */
 static int cmd_getbalance(const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
@@ -340,6 +367,33 @@ static int cmd_getbalance(const rj_val* params, const rpc_wallet* w, long* ec, c
     if (params && params->typ == RJ_ARR && params->nitems > 0) {
         addr_param = rpc_param_str(params, 0, ec, em);
         if (!addr_param) return 0;
+    }
+    /* No address argument = Core's shape: the WHOLE WALLET. Answer from the
+     * rescan records + the live UTXO set, not the address index -- the index
+     * is an extension that is off by default, which used to make a funded
+     * wallet report 0.00000000. An explicit address still uses the index,
+     * since that is the only thing that knows about addresses not ours. */
+    if (!addr_param) {
+        rpc_wops_coin* coins = malloc(WOP_COIN_CAP * sizeof *coins);
+        if (!coins) { *ec = -32603; *em = "out of memory"; return 0; }
+        int n = rpc_wops_wallet_coins(w ? w->seed : NULL, coins, WOP_COIN_CAP);
+        if (n < 0) {
+            free(coins);
+            *ec = -4;
+            *em = "no wallet rescan has completed, so this node does not know "
+                  "what this wallet holds. Run rescanblockchain first; "
+                  "answering 0.00000000 here would be indistinguishable from "
+                  "a wallet that genuinely holds nothing";
+            return 0;
+        }
+        long tip = rpc_chain_tip_height();
+        unsigned long long sum = 0;
+        for (int i = 0; i < n; i++)
+            if (wallet_coin_mature(&coins[i], tip)) sum += coins[i].value;
+        free(coins);
+        char amt2[24]; rpc_amounts((long long)sum, amt2, sizeof amt2);
+        *result = rj_numf("%s", amt2);   /* Core: amounts are JSON numbers */
+        return 1;
     }
     unsigned char type_tag, hash[32];
     unsigned long long total = 0;
@@ -351,7 +405,7 @@ static int cmd_getbalance(const rj_val* params, const rpc_wallet* w, long* ec, c
         free(recs);
     }
     char amt[24]; rpc_amounts((long long)total, amt, sizeof amt);
-    *result = rj_str(amt);
+    *result = rj_numf("%s", amt);       /* Core: amounts are JSON numbers */
     return 1;
 }
 
@@ -364,6 +418,48 @@ static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, 
         if (!addr_param) return 0;
     }
     rj_val* arr = rj_arr();
+    if (!addr_param) {
+        rpc_wops_coin* coins = malloc(WOP_COIN_CAP * sizeof *coins);
+        if (!coins) { rj_free(arr); *ec = -32603; *em = "out of memory"; return 0; }
+        int n = rpc_wops_wallet_coins(w ? w->seed : NULL, coins, WOP_COIN_CAP);
+        if (n < 0) {
+            free(coins); rj_free(arr);
+            *ec = -4;
+            *em = "no wallet rescan has completed, so this node does not know "
+                  "what this wallet holds. Run rescanblockchain first";
+            return 0;
+        }
+        long tip = rpc_chain_tip_height();
+        for (int i = 0; i < n; i++) {
+            unsigned char spk[22]; spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, coins[i].h160, 20);
+            char txidhex[65]; unsigned char disp[32];
+            for (int k = 0; k < 32; k++) disp[k] = coins[i].txid[31-k];
+            bin_to_hex(txidhex, disp, 32);
+            char scripthex[70]; bin_to_hex(scripthex, spk, 22);
+            char addr[96]; addr[0] = 0;
+            wallet_script_to_address(addr, sizeof addr, spk, 22);
+            char amt[24]; rpc_amounts((long long)coins[i].value, amt, sizeof amt);
+            int confs = tip >= 0 ? (int)(tip - (long)coins[i].height + 1) : 0;
+            int mature = wallet_coin_mature(&coins[i], tip);
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "txid", rj_str(txidhex));
+            rj_obj_set(o, "vout", rj_numf("%u", coins[i].vout));
+            if (addr[0]) rj_obj_set(o, "address", rj_str(addr));
+            rj_obj_set(o, "label", rj_str(""));
+            rj_obj_set(o, "scriptPubKey", rj_str(scripthex));
+            rj_obj_set(o, "amount", rj_numf("%s", amt));
+            rj_obj_set(o, "confirmations", rj_numf("%d", confs));
+            /* an immature coinbase is listed but NOT spendable, which is what
+             * Core reports; dropping it entirely would hide a real coin. */
+            rj_obj_set(o, "spendable", rj_bool(mature));
+            rj_obj_set(o, "solvable", rj_bool(1));
+            rj_obj_set(o, "safe", rj_bool(mature));
+            rj_arr_push(arr, o);
+        }
+        free(coins);
+        *result = arr;
+        return 1;
+    }
     unsigned char type_tag, hash[32];
     if (addr_idx_resolve(addr_param, w, &type_tag, hash)) {
         addr_idx_rec* recs = malloc(ADDR_IDX_MAX_MATCHES * sizeof(addr_idx_rec));
@@ -383,7 +479,7 @@ static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, 
             if (addr[0]) rj_obj_set(o, "address", rj_str(addr));
             rj_obj_set(o, "label", rj_str(""));
             rj_obj_set(o, "scriptPubKey", rj_str(scripthex));
-            rj_obj_set(o, "amount", rj_str(amt));
+            rj_obj_set(o, "amount", rj_numf("%s", amt));
             rj_obj_set(o, "confirmations", rj_numf("%d", 0));
             rj_obj_set(o, "spendable", rj_bool(1));
             rj_obj_set(o, "solvable", rj_bool(1));
@@ -437,9 +533,34 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     unsigned char txid_wire[32];
     for (int i = 0; i < 32; i++) txid_wire[i] = txid_display[31 - i];
 
-    if (!g_utxo_lst) { *result = rj_null(); return 1; }
-    unsigned long long value; unsigned long height, is_coinbase; const unsigned char* script; unsigned long slen;
-    long r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout, &value, &height, &is_coinbase, &script, &slen);
+    /* Two ways to reach the UTXO set, and a refusal if neither is available.
+     * null is NOT "I cannot say" here -- it means "that output is not
+     * unspent", so a server that cannot look must never answer with it. */
+    unsigned long long value = 0; unsigned long height = 0, is_coinbase = 0;
+    const unsigned char* script = NULL; unsigned long slen = 0;
+    unsigned char spkbuf[TXO_SPK_CAP];   /* per-call: the RPC server is threaded */
+    long r;
+    if (g_utxo_lst) {
+        /* in-process handle (the standalone rpcd) */
+        r = utxo_lsm_get(g_utxo_lst, g_utxo_u, txid_wire, (unsigned)vout,
+                         &value, &height, &is_coinbase, &script, &slen);
+        if (r != 1) r = 0;
+    } else if (g_txo_query) {
+        /* out of process: ask the download worker, which owns the live set */
+        r = g_txo_query(txid_wire, (unsigned)vout, &value, &height, &is_coinbase,
+                        spkbuf, sizeof spkbuf, &slen);
+        if (r == 1) script = spkbuf;
+    } else {
+        r = -1;
+    }
+    if (r < 0) {
+        *ec = -1;
+        *em = "gettxout cannot be answered right now: this server has no handle "
+              "on the live UTXO set and the download worker that owns it did "
+              "not answer. Returning null would claim the output is spent, "
+              "which this node has not established";
+        return 0;
+    }
     if (r != 1) { *result = rj_null(); return 1; }
     (void)height; /* "confirmations" below is still a hardcoded placeholder,
                    * like "bestblock" -- wiring those to the real chain tip
@@ -455,7 +576,11 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     rj_val* o = rj_obj();
     rj_obj_set(o, "bestblock", rj_str("0000000000000000000000000000000000000000000000000000000000000000"));
     rj_obj_set(o, "confirmations", rj_numf("%d", 0));
-    rj_obj_set(o, "value", rj_str(amt));
+    /* a NUMBER, not a string: Core's ValueFromAmount emits UniValue VNUM and
+     * every other amount in this file already uses rj_numf. gettxout was the
+     * one holdout, which stayed invisible while it only ever returned null --
+     * the first real diff against Core caught it. */
+    rj_obj_set(o, "value", rj_numf("%s", amt));
     rj_val* sp = rj_obj();
     rj_obj_set(sp, "asm", rj_str(""));
     rj_obj_set(sp, "desc", rj_str(""));
@@ -1480,6 +1605,16 @@ static int cmd_gettransaction(const rj_val* params, long* ec, const char** em, r
           rj_obj_set(d, "abandoned", rj_bool(0));
           rj_arr_push(det, d);
           rj_obj_set(o, "details", det); }
+        /* bumpfee linkage (rpc_wallet_ops.c's bumped.dat sidecar): Core
+         * reports replaced_by_txid / replaces_txid from mapWallet; ours
+         * come from the sidecar the bump wrote. Absent = no field, like
+         * Core omitting them for an unreplaced tx. */
+        { extern int rpc_wops_bump_link(const char*, char*, size_t, char*, size_t);
+          char rb[80], rp[80];
+          if (rpc_wops_bump_link(params->items[0]->str, rb, sizeof rb, rp, sizeof rp)){
+              if (rb[0]) rj_obj_set(o, "replaced_by_txid", rj_str(rb));
+              if (rp[0]) rj_obj_set(o, "replaces_txid", rj_str(rp));
+          } }
         wsl_add_lastprocessedblock(o);
         *result = o;
         return 1;

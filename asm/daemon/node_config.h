@@ -87,7 +87,11 @@ typedef struct {
     long limitancestorsize_kvb;  /* Core -limitancestorsize (kvB, default 101)*/
     long limitdescendantcount;   /* Core -limitdescendantcount (default 25)  */
     long limitdescendantsize_kvb;/* Core -limitdescendantsize (kvB, def 101) */
-    int  mempoolfullrbf;         /* Core -mempoolfullrbf (default 1)         */
+    int  mempoolfullrbf;
+    long dustrelayfee_satkvb;    /* Core -dustrelayfee (sat/kvB, def 3000)   */
+    int  datacarrier;            /* Core -datacarrier (def 1)                */
+    long datacarriersize;        /* Core -datacarriersize (vbytes, v31:100000)*/
+    int  acceptnonstdtxn;        /* Core -acceptnonstdtxn (def 0)            */         /* Core -mempoolfullrbf (default 1)         */
 
     /* ---- peer sourcing (Core -dnsseed/-seednode/-addnode/-connect) ----
      * Until now the DNS seed list was compiled in and there was no way to
@@ -104,6 +108,14 @@ typedef struct {
     char seednode[CFG_MAX_NODES][64];  /* getaddr from, then drop            */
     char addnode [CFG_MAX_NODES][64];  /* prefer, and never evict            */
     char connectn[CFG_MAX_NODES][64];  /* the ONLY peers, when non-empty     */
+    /* Per-entry P2P port from a "host:port" value, 0 when the entry named no
+     * port (dial the chain default). Kept PARALLEL to the host arrays rather
+     * than folded into the strings on purpose: those strings flow into
+     * inet_pton()/address-book paths that must keep seeing a bare host. Look
+     * one up with node_config_peer_port(). */
+    unsigned short seednode_port[CFG_MAX_NODES];
+    unsigned short addnode_port [CFG_MAX_NODES];
+    unsigned short connectn_port[CFG_MAX_NODES];
 
     /* ---- chain / storage (Core -prune/-checkblocks/-checklevel/
      *                       -stopatheight) ---- */
@@ -136,5 +148,12 @@ const char* node_config_path(const char* datadir, char* buf, unsigned long cap);
  * otherwise the dead-weight eviction pass would ban the very nodes the
  * operator pinned, and a connect= node list would empty itself. */
 int node_config_is_manual(const char* ip);
+
+/* The P2P port configured for a named peer via "host:port" in bitcoin.conf,
+ * or 0 when that entry named no port (callers dial the chain default). Any
+ * port is honoured -- restricting named peers to a chain's default port made
+ * pointing this node at a scratch peer impossible, and it failed SILENTLY
+ * (the entry was dropped and the node then sat at tip=0 with peers=0/0). */
+int node_config_peer_port(const char* host);
 
 #endif

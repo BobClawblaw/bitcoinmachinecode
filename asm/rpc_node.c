@@ -405,6 +405,23 @@ void rpc_node_set_mempool(const rpc_mempool_hooks* h){
 static void mpl(void){ if (g_mph.lock) g_mph.lock(); }
 static void mpu(void){ if (g_mph.unlock) g_mph.unlock(); }
 
+/* Copy one mempool transaction's raw bytes out under the pool lock.
+ * For the wallet's bumpfee (rpc_wallet_ops.c): the original of a replacement
+ * is an UNCONFIRMED wallet tx, and this node's wallet journal deliberately
+ * stores metadata, not raw bytes -- the pool is the only place the original
+ * still exists. Returns the length, or -1 when the tx is not in the pool (or
+ * this process has no pool hooks -- the standalone rpcd). */
+long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap){
+    if (!g_mph.mp || !g_mph.get) return -1;
+    mpl();
+    unsigned long len = 0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid_wire, &len);
+    long r = -1;
+    if (tx && len > 0 && len <= cap){ memcpy(out, tx, len); r = (long)len; }
+    mpu();
+    return r;
+}
+
 /* Slot layout per bitcoin_mempool.asm's header (same walk daemon/reorg.c
  * uses): +0 n, +8 mask, +16 blob, then 48-byte slots at +40 --
  * [+0 len][+8 txid[32]][+40 blob_off], len==~0 marking empty. */
@@ -486,11 +503,12 @@ static int cmd_getmempoolinfo(rj_val** res){
     rj_obj_set(o, "total_fee", rj_numf("%llu.%08llu", total_fee/100000000ULL, total_fee%100000000ULL));
     rj_obj_set(o, "maxmempool", rj_numf("%lld", g_mph.maxbytes > 0 ? g_mph.maxbytes : MEMPOOL_MAXBYTES));
     /* mempoolminfee is the DYNAMIC effective floor: max of the static relay
-     * fee and the eviction-raised floor (mpool_policy_min_fee, sat/vByte ->
-     * BTC/kvB). It rises under congestion exactly as Core's does. */
+     * fee and the eviction-raised ROLLING floor (mpool_policy_min_fee,
+     * sat/kvB -> BTC/kvB). It rises under congestion and decays with Core's
+     * half-life schedule. */
     { double dyn_btc = 0.0;
-      if (g_mph.polstate && g_mph.min_fee){ unsigned long long satvb = g_mph.min_fee(g_mph.polstate);
-                           dyn_btc = (double)satvb / 1e5; }
+      if (g_mph.polstate && g_mph.min_fee){ unsigned long long satkvb = g_mph.min_fee(g_mph.polstate);
+                           dyn_btc = (double)satkvb / 1e8; }
       double eff = dyn_btc > MEMPOOL_MINFEE_BTC ? dyn_btc : MEMPOOL_MINFEE_BTC;
       rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", eff)); }
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
@@ -1194,6 +1212,111 @@ static int cmd_getprioritisedtransactions(rj_val** res){
 #define SRT_WAIT_MS   90000     /* worker pickup can wait behind a 60s leg sync */
 #define SRT_POLL_US   3000
 
+/* ==== savemempool / importmempool -- Core's mempool.dat ====================
+ * The pool is shared memory the parent can read directly under the same lock
+ * getrawmempool uses, so the DUMP happens here. The LOAD cannot: admitting a
+ * transaction is the worker's job, so import re-submits each one through the
+ * same channel sendrawtransaction uses and every entry gets the full
+ * consensus and policy treatment on the way back in. Core re-validates on
+ * load too -- a dump is a hint about what was interesting, never a licence
+ * to skip checks.
+ *
+ * Paths are relative to the process CWD, which is the per-chain datadir (the
+ * daemon chdirs there at boot, the same reason bmcwallet.dat resolves), so
+ * "mempool.dat" lands beside the chain data exactly as in Core.
+ */
+extern long mempool_dump_write(const char* path, const unsigned char* const* txs,
+                               const unsigned long* lens, const long long* times,
+                               const long long* deltas, long n,
+                               const unsigned char* extra_txids,
+                               const long long* extra_deltas, long n_extra);
+extern long mempool_dump_read(const char* path,
+                              int (*sink)(void*, const unsigned char*, unsigned long,
+                                          long long, long long),
+                              void* ctx, char* err, unsigned long errcap);
+
+#define MPD_MAX_DUMP 200000
+
+static int cmd_savemempool(rj_val** res, long* ec, const char** em){
+    if (!g_mph.mp){ *ec = -4; *em = "no mempool is attached to this RPC server"; return 0; }
+    static const unsigned char* txs[MPD_MAX_DUMP];
+    static unsigned long        lens[MPD_MAX_DUMP];
+    static long long            times[MPD_MAX_DUMP], deltas[MPD_MAX_DUMP];
+    long n = 0;
+    mpl();
+    unsigned long slots = mp_slot_count(g_mph.mp);
+    for (unsigned long i = 0; i < slots && n < MPD_MAX_DUMP; i++){
+        mp_ent e;
+        if (mp_slot(g_mph.mp, i, &e) != 1) continue;
+        txs[n]    = e.tx;
+        lens[n]   = e.len;
+        times[n]  = g_mph.time_of ? (long long)g_mph.time_of(e.txid) : 0;
+        deltas[n] = (long long)pri_delta_of(e.txid);
+        n++;
+    }
+    /* The write happens under the pool lock ON PURPOSE: the entry pointers
+     * above are into the shared blob, and releasing the lock first would let
+     * an eviction move the bytes out from under the writer. */
+    long w = mempool_dump_write("mempool.dat", txs, lens, times, deltas, n, NULL, NULL, 0);
+    mpu();
+    if (w < 0){ *ec = -1; *em = "unable to dump mempool to disk"; return 0; }
+
+    char cwd[1024]; char full[1200];
+    if (getcwd(cwd, sizeof cwd)) snprintf(full, sizeof full, "%s/mempool.dat", cwd);
+    else snprintf(full, sizeof full, "mempool.dat");
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "filename", rj_str(full));
+    *res = o;
+    return 1;
+}
+
+typedef struct { long accepted, rejected; } mpd_import_ctx;
+static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
+                          long long t, long long d){
+    (void)t; (void)d;   /* entry time and fee delta are not restorable here --
+                         * see the divergence note at the call site */
+    mpd_import_ctx* c = (mpd_import_ctx*)vctx;
+    if (!g_status_rw) return -1;
+    node_status_t* st = g_status_rw;
+    pthread_mutex_lock(&g_submit_lock);
+    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; return 0; }
+    memcpy((void*)st->tx_submit_buf, tx, len);
+    st->tx_submit_len = len;
+    st->tx_submit_test = 0;
+    st->tx_submit_pkg_n = 0;
+    st->tx_submit_reason[0] = 0;
+    unsigned long long myseq = st->tx_submit_seq + 1;
+    __sync_synchronize();
+    st->tx_submit_seq = myseq;
+    int waited = 0, ok = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); break; }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    pthread_mutex_unlock(&g_submit_lock);
+    if (ok) c->accepted++; else c->rejected++;
+    return 0;                       /* a rejected entry is not a file error */
+}
+
+static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* path = NULL;
+    if (params && params->typ == RJ_ARR && params->nitems > 0 &&
+        params->items[0]->typ == RJ_STR) path = params->items[0]->str;
+    if (!path || !path[0]){ *ec = -8; *em = "filepath is required"; return 0; }
+    if (!g_status_rw){
+        *ec = -4; *em = "no download worker is attached, so nothing can admit these transactions"; return 0; }
+    mpd_import_ctx c = {0, 0};
+    char err[160]; err[0] = 0;
+    long r = mempool_dump_read(path, mpd_import_one, &c, err, sizeof err);
+    if (r < 0){ static char m[200]; snprintf(m, sizeof m, "Unable to import mempool: %s", err[0]?err:"malformed file");
+                *ec = -1; *em = m; return 0; }
+    fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld\n",
+            path, c.accepted, c.rejected, r);
+    *res = rj_obj();               /* Core returns an empty object */
+    return 1;
+}
+
 static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_STR){
@@ -1302,6 +1425,161 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     return 0;
 }
 
+/* ==== submitpackage =========================================================
+ * Core's shape: a package-level verdict plus one result per transaction,
+ * keyed by WTXID exactly as Core keys them.
+ *
+ * The whole package rides one staging of the submit channel (concatenated,
+ * each transaction self-delimiting) so the worker sees it as a unit -- which
+ * is the point. Submitting the members one at a time is what this node could
+ * already do, and it cannot accept a parent whose fee only clears the floor
+ * because of its child.
+ *
+ * The result follows Core's schema rather than a reduced one of our own:
+ * package_msg, tx-results keyed by wtxid with txid / vsize / vsize_bip141 /
+ * fees{base, effective-feerate, effective-includes} / error, and Core's own
+ * "package-not-validated" for members that never got an individual verdict
+ * because the package was rejected as a whole.
+ *
+ * effective-feerate is the feerate the package was actually evaluated
+ * against -- the aggregate the worker used for the fee floors -- and
+ * effective-includes lists every member whose fee and vsize went into it.
+ * That is exactly what the number means, so it is reported rather than
+ * omitted.
+ *
+ * "replaced-transactions" is absent, which is Core's own convention: the
+ * field is optional there and Core omits it when nothing was replaced. This
+ * node does not track package-driven RBF evictions, so it never emits it.
+ */
+static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const char** em){
+    /* VOID: bitcoin_cmpct.asm sets no return value (tests/test_bip152.c has
+     * had it right all along). Declaring it int and checking for 1 reads
+     * whatever happened to be in rax -- which silently dropped every result.
+     *
+     * WEAK because many targets link rpc_node.o without bitcoin_cmpct.o, and
+     * the same trick bitcoin_mempool_policy.c uses for tx_parse/tx_txid keeps
+     * them linking. Core keys tx-results by wtxid, so without it this call
+     * cannot answer in Core's shape -- it refuses rather than keying the
+     * results by something else. */
+    extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen)
+        __attribute__((weak));
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
+        *ec = -8; *em = "Invalid parameter, package must be a non-empty array"; return 0; }
+    const rj_val* list = params->items[0];
+    if (list->nitems > RPC_PKG_MAX){
+        *ec = -8; *em = "Array must contain between 1 and 25 transactions"; return 0; }
+    /* AFTER the parameter checks: a malformed call gets Core's -8 whatever
+     * this build links. */
+    if (!tx_wtxid){
+        *ec = -1;
+        *em = "submitpackage is unavailable in this build: results are keyed by "
+              "wtxid and the wtxid primitive is not linked in";
+        return 0;
+    }
+    if (!g_status_rw){
+        *ec = -4; *em = "no download worker is attached, so nothing can validate a package"; return 0; }
+
+    int n = (int)list->nitems;
+    static unsigned char raw[RPC_TXSUBMIT_MAX];
+    static unsigned long off[RPC_PKG_MAX];
+    static unsigned long tlen[RPC_PKG_MAX];
+    unsigned long total = 0;
+    for (int i = 0; i < n; i++){
+        const rj_val* e = list->items[i];
+        if (!e || e->typ != RJ_STR || !e->str){
+            *ec = -22; *em = "TX decode failed"; return 0; }
+        size_t hl = strlen(e->str);
+        if (hl % 2 || hl/2 == 0 || total + hl/2 > sizeof raw){
+            *ec = -22; *em = "TX decode failed"; return 0; }
+        for (size_t k = 0; k < hl/2; k++){
+            int a = srt_hex1(e->str[k*2]), b = srt_hex1(e->str[k*2+1]);
+            if (a < 0 || b < 0){ *ec = -22; *em = "TX decode failed"; return 0; }
+            raw[total + k] = (unsigned char)((a<<4)|b);
+        }
+        off[i] = total; tlen[i] = hl/2; total += hl/2;
+    }
+
+    node_status_t* st = g_status_rw;
+    pthread_mutex_lock(&g_submit_lock);
+    memcpy((void*)st->tx_submit_buf, raw, total);
+    st->tx_submit_len = total;
+    st->tx_submit_test = 0;
+    st->tx_submit_pkg_n = n;
+    st->tx_submit_reason[0] = 0;
+    st->pkg_msg[0] = 0;
+    unsigned long long myseq = st->tx_submit_seq + 1;
+    __sync_synchronize();
+    st->tx_submit_seq = myseq;
+    int waited = 0, got = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (st->tx_submit_ack == myseq){ got = 1; break; }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    static int  r_result[RPC_PKG_MAX];
+    static unsigned long long r_fee[RPC_PKG_MAX], r_vsize[RPC_PKG_MAX];
+    static char r_reason[RPC_PKG_MAX][64];
+    char pmsg[128]; pmsg[0] = 0;
+    unsigned long long eff_fee = 0, eff_vsize = 0;
+    if (got){
+        for (int i = 0; i < n; i++){
+            r_result[i] = st->pkg_result[i];
+            r_fee[i]    = st->pkg_fee[i];
+            r_vsize[i]  = st->pkg_vsize[i];
+            snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)st->pkg_reason[i]);
+        }
+        snprintf(pmsg, sizeof pmsg, "%s", (const char*)st->tx_submit_reason);
+        eff_fee = st->pkg_eff_fee; eff_vsize = st->pkg_eff_vsize;
+    }
+    st->tx_submit_pkg_n = 0;          /* leave the channel as a single-tx one */
+    pthread_mutex_unlock(&g_submit_lock);
+
+    if (!got){
+        *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "package_msg", rj_str(pmsg[0] ? pmsg : "success"));
+    rj_val* results = rj_obj();
+    for (int i = 0; i < n; i++){
+        unsigned char w[32], t[32]; char whex[65], thex[65];
+        tx_wtxid(w, raw + off[i], tlen[i]);
+        { static unsigned char sc[1<<20];
+          if (tx_txid(t, raw + off[i], tlen[i], sc, sizeof sc) != 1) continue; }
+        mpe_hex(whex, w);            /* mpe_hex writes DISPLAY order already */
+        mpe_hex(thex, t);
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "txid", rj_str(thex));
+        rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
+        rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
+        if (r_result[i]){
+            rj_val* f = rj_obj();
+            rj_obj_set(f, "base", mpe_amount(r_fee[i]));
+            if (eff_vsize){
+                /* Core reports this per KvB, as an amount */
+                unsigned long long per_kvb = eff_fee * 1000ULL / eff_vsize;
+                rj_obj_set(f, "effective-feerate", mpe_amount(per_kvb));
+                rj_val* inc = rj_arr();
+                for (int k = 0; k < n; k++){
+                    if (!r_result[k]) continue;
+                    unsigned char wk[32]; char wkhex[65];
+                    tx_wtxid(wk, raw + off[k], tlen[k]);
+                    mpe_hex(wkhex, wk);
+                    rj_arr_push(inc, rj_str(wkhex));
+                }
+                rj_obj_set(f, "effective-includes", inc);
+            }
+            rj_obj_set(e, "fees", f);
+        } else if (r_reason[i][0]){
+            rj_obj_set(e, "error", rj_str(r_reason[i]));
+        }
+        rj_obj_set(results, whex, e);
+    }
+    rj_obj_set(o, "tx-results", results);
+    *res = o;
+    return 1;
+}
+
 static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
@@ -1390,7 +1668,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
-    "testmempoolaccept", "submitpackage",
+    "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
@@ -1414,13 +1692,9 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
     if (!strcmp(m, "gettxspendingprevout")) return cmd_gettxspendingprevout(params, res, ec, em);
     if (!strcmp(m, "testmempoolaccept")) return cmd_testmempoolaccept(params, res, ec, em);
-    if (!strcmp(m, "submitpackage"))
-        return cmd_net_unsupported(
-            "this node has no package validation: transactions are accepted "
-            "one at a time against the mempool as it stands, so a child "
-            "cannot be validated against an unconfirmed parent in the same "
-            "call. Submit the parent first with sendrawtransaction, then the "
-            "child", ec, em);
+    if (!strcmp(m, "submitpackage")) return cmd_submitpackage(params, res, ec, em);
+    if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
+    if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo") || !strcmp(m, "abortprivatebroadcast"))
         return cmd_net_unsupported(
             "this node has no private broadcast queue: sendrawtransaction "

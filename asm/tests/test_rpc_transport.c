@@ -252,18 +252,21 @@ int main(int argc, char** argv) {
         ck_out("getrawchangeaddress prints raw address", expect);
     }
 
-    /* ---------- 3. getbalance: string result, Core amount ---------- */
-    /* getbalance now answers from the real scriptPubKey->UTXO address
-     * index (asm/daemon/build_addr_index.c), not the wallet's own fake
-     * utxo_* arrays -- see rpc_commands_set_addr_index's doc comment.
-     * This harness's in-process rpc_dispatch never calls that setter, so
-     * it's exactly a fresh/unconfigured server: the wallet's own default
-     * address (correctly) resolves to zero balance, same as real Core
-     * before it's synced. */
+    /* ---------- 3. getbalance with no rescan: an ERROR, not a number -------
+     * getbalance answers from the wallet rescan records (2026-08-27; it used
+     * to read the address index, an extension that is off by default, which
+     * made a funded wallet report 0.00000000). This harness has no completed
+     * rescan, and "I have not looked" must not be reported as "you have
+     * nothing" -- the two are different answers and only one is true. So the
+     * contract here is a -4 naming what to run, and an empty stdout. */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
         run_cli(portfixed, "getbalance", NULL);
-        ck_out("getbalance (no addr index configured)", "0.00000000\n");
+        ck_out("getbalance without a rescan prints nothing on stdout", "");
+        ck("getbalance without a rescan is an error naming rescanblockchain",
+           strstr(err_buf, "-4") && strstr(err_buf, "rescanblockchain"));
+        if (!(strstr(err_buf, "-4") && strstr(err_buf, "rescanblockchain")))
+            printf("      got stderr: [%s]\n", err_buf);
     }
 
     /* ---------- 4. wire framing: request body captured on the socket ---------- */
@@ -290,34 +293,41 @@ int main(int argc, char** argv) {
         ck_out("validateaddress pretty write(2)", want);
     }
 
-    /* ---------- 6. listunspent: array of objects ---------- */
-    /* Same real-index story as getbalance above: no addr index configured
-     * in this harness, so the wallet's own default address (correctly)
-     * owns nothing yet -- an empty array, same as real Core pre-sync. */
+    /* ---------- 6. listunspent with no rescan: same contract as getbalance --
+     * An empty array would claim the wallet owns nothing, which this server
+     * has not established. See the getbalance case above. */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
         run_cli(portfixed, "listunspent", NULL);
-        ck_out("listunspent (no addr index configured)", "[]\n");
+        ck_out("listunspent without a rescan prints nothing on stdout", "");
+        ck("listunspent without a rescan is an error naming rescanblockchain",
+           strstr(err_buf, "-4") && strstr(err_buf, "rescanblockchain"));
     }
 
     /* ---------- 7. gettxout: real Core semantics (any confirmed outpoint via
      * the LSM UTXO store, not the wallet's own outputs -- see rpc_commands_
      * set_utxo_store's doc comment). This harness's in-process rpc_dispatch
-     * never calls that setter, so it's exactly a fresh/unconfigured server
-     * with no chain data loaded: every outpoint (wallet's own included)
-     * correctly comes back null, same as real Core before it's synced. ---- */
+     * never calls that setter, so this is a server that CANNOT ANSWER.
+     * It used to return null for every outpoint, which is not "I don't know"
+     * -- null means "that output is not unspent", i.e. spent. A server with
+     * no UTXO handle must refuse instead of asserting that about every coin
+     * in existence (2026-08-27; the live daemon was doing exactly this). ---- */
     {
         char portfixed[64]; snprintf(portfixed, sizeof portfixed, "-rpcport=%d", srv_port);
         char tx0[65]; { char* d="0123456789abcdef"; for(int i=0;i<32;i++){tx0[i*2]=d[utxo_txid[0][i]>>4];tx0[i*2+1]=d[utxo_txid[0][i]&15];} tx0[64]=0; }
-        /* exec: gettxout <txid> 0 -- wallet's own outpoint, but no UTXO store
-         * configured in this harness, so still null (not an error) */
+        /* exec: gettxout <txid> 0 -- no UTXO store in this harness, so the
+         * server refuses rather than claiming the output is spent */
         run_cli(portfixed, "gettxout", tx0, "0", NULL);
-        ck("gettxout (no store configured) exit 0", last_req_exit == 0);
-        ck_out("gettxout (no store configured) prints nothing (null result)", "");
-        /* unknown txid -> null -> bitcoin-cli prints nothing */
+        ck("gettxout without a UTXO store is an error, not null", last_req_exit != 0);
+        ck_out("gettxout without a UTXO store prints nothing on stdout", "");
+        ck("gettxout refusal names the missing capability",
+           strstr(err_buf, "live UTXO set") != NULL);
+        if (!strstr(err_buf, "live UTXO set")) printf("      got stderr: [%s]\n", err_buf);
+        /* an unknown txid is the SAME refusal here: without a store this
+         * server cannot distinguish "spent" from "never existed" either. */
         run_cli(portfixed, "gettxout", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "0", NULL);
-        ck("gettxout unknown exit 0", last_req_exit == 0);
-        ck_out("gettxout unknown prints nothing (null result)", "");
+        ck("gettxout unknown txid also refuses (no store)", last_req_exit != 0);
+        ck_out("gettxout unknown txid prints nothing on stdout", "");
     }
 
     /* ---------- 8. unknown method -> JSON-RPC error -> bitcoin-cli stderr ---- */
