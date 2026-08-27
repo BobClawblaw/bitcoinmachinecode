@@ -41,6 +41,10 @@ typedef struct {
  * far below it by MAX_STANDARD_TX_WEIGHT. */
 #define RPC_TXSUBMIT_MAX 404000
 #define RPC_PKG_MAX      25          /* Core MAX_PACKAGE_COUNT */
+/* Core MAX_REPLACEMENT_CANDIDATES is the per-transaction ceiling; a package
+ * of 25 could in principle displace more, but the list is diagnostic and a
+ * flat cap keeps the shared block a fixed size. */
+#define RPC_PKG_REPLACED_MAX 100
 /* Max serialized block a submitblock can stage: the 4M-weight consensus
  * bound (a block is at most 4MB serialized), with margin. */
 #define RPC_BLKSUBMIT_MAX 4100000
@@ -108,6 +112,12 @@ typedef struct {
     /* the aggregate the package was actually evaluated against, so the RPC can
      * report Core's effective-feerate instead of guessing one */
     volatile unsigned long long pkg_eff_fee, pkg_eff_vsize;
+    /* the union of everything the package's members replaced by RBF. Core
+     * reports this ONCE at the top level of submitpackage, not per member,
+     * which is why it is accumulated across the package rather than kept
+     * alongside pkg_result. */
+    volatile int                pkg_replaced_n;
+    unsigned char               pkg_replaced[RPC_PKG_REPLACED_MAX][32];
 
     /* ==== peer-control channel (parent RPC thread -> download worker) ====
      * The worker owns the peer legs; the parent owns the RPC surface. Before

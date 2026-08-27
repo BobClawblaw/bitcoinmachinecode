@@ -2464,7 +2464,16 @@ static int txsub_worker_ready(void){
  * amount of fee from a child makes an invalid parent valid.
  *
  * Returns 1 if the whole package was accepted, 0 otherwise (per-transaction
- * results are published in the shared block either way). */
+ * results are published in the shared block either way).
+ *
+ * With tx_submit_test set this stops after pass 1 and commits nothing --
+ * which is precisely what testmempoolaccept on an array means. Core applies
+ * package policy to a multi-transaction testmempoolaccept, and running the
+ * SAME dry run the real submission runs is the only way the answer can be
+ * trusted: a separate "test" implementation is a second set of rules that
+ * will drift from the first. Until this existed, testmempoolaccept checked
+ * each member against the mempool as it stood, so a child spending an
+ * in-array parent was reported as missing-inputs. */
 static int txsub_package(char* msg, unsigned long mcap){
     extern int mpol_package_well_formed(const unsigned char* const*, const unsigned long*,
                                         int, unsigned char*, unsigned long long*, const char**);
@@ -2497,6 +2506,8 @@ static int txsub_package(char* msg, unsigned long mcap){
       }
       if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
 
+    st->pkg_replaced_n = 0;
+    const int test_only = st->tx_submit_test ? 1 : 0;
     const char* why = "";
     static unsigned long long vsz[RPC_PKG_MAX];
     if (!mpol_package_well_formed(txs, lens, n, txids, vsz, &why)){
@@ -2536,7 +2547,40 @@ static int txsub_package(char* msg, unsigned long mcap){
     if (!all_ok){
         mpol_package_fee_context(0, 0);
         snprintf(msg, mcap, "transaction failed");
+        st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
         return 0;
+    }
+
+    /* testmempoolaccept: the answer is a dry run, but it needs BOTH passes.
+     * Pass 1 runs without the package fee context -- it has to, since that
+     * is where the aggregate is computed -- so a member that only clears the
+     * floor because of the package is still marked rejected there. The real
+     * submission overwrites that verdict in pass 2, under the context; a
+     * test that stopped after pass 1 reported allowed:false for exactly the
+     * transaction package validation exists to admit. So pass 2 runs here
+     * too, as a test rather than a commit: same overlay, same fee context,
+     * nothing inserted and nothing relayed. */
+    if (test_only){
+        st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
+        int all_pass = 1;
+        mpol_package_fee_context(tot_fee, tot_vsize);
+        txacc_package_overlay(txs, lens, txids, n);
+        for (int i = 0; i < n; i++){
+            char r[128]; r[0] = 0; unsigned long long fee = 0;
+            long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
+                                            r, sizeof r, &fee);
+            if (rc == 1){
+                st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = fee;
+            } else {
+                st->pkg_result[i] = 0;
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+                all_pass = 0;
+            }
+        }
+        txacc_package_overlay(NULL, NULL, NULL, 0);
+        mpol_package_fee_context(0, 0);
+        snprintf(msg, mcap, "success");   /* package-level verdict; per-member above */
+        return all_pass;
     }
 
     /* ---- pass 2: commit, with the package feerate in effect -------------- */
@@ -2547,7 +2591,23 @@ static int txsub_package(char* msg, unsigned long mcap){
         char r[128]; r[0] = 0; int relayed = 0;
         int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
                                         mux_out_fd, mux_n_out, r, sizeof r, &relayed);
-        if (rc == 1){ st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; }
+        if (rc == 1){
+            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            /* whatever THIS member displaced by RBF, folded into the
+             * package-wide union Core reports at the top level. Read
+             * immediately: the next member's accept overwrites it. */
+            extern int mpol_last_replaced(unsigned char* out, int cap);
+            unsigned char rep[RPC_PKG_REPLACED_MAX][32];
+            int nrep = mpol_last_replaced((unsigned char*)rep, RPC_PKG_REPLACED_MAX);
+            for (int k = 0; k < nrep; k++){
+                int dup = 0;
+                for (int q = 0; q < st->pkg_replaced_n; q++)
+                    if (!memcmp((const void*)st->pkg_replaced[q], rep[k], 32)){ dup = 1; break; }
+                if (dup) continue;
+                if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break;
+                memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep[k], 32);
+            }
+        }
         else {
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
