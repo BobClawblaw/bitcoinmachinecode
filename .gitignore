@@ -379,3 +379,25 @@ asm/tests/test_txv_cs_maxsize
 # recipe lives in core_verify_oracle.cpp's header comment.
 validation/core_verify_oracle
 regtest-e2e/
+
+# ---- secrets and scratch datadirs, by NAME rather than by path ----
+# 2026-08-27: `git add -A` swept a testnet4 e2e datadir into a commit,
+# including bmcwallet.dat.pass -- because the rule above was written as
+# `data/bmcwallet.dat.pass`, anchored to ONE directory. A wallet passphrase
+# is a secret wherever it sits, so match it by name everywhere.
+*.pass
+bmcwallet.dat
+*.mnemonic
+
+# archived WIP patches: local scratch from an earlier session, swept in by the
+# same `git add -A`
+.archived-wip-patches/
+
+# scratch e2e datadirs (chain archives, UTXO maps -- GB of rebuildable data)
+testnet4-e2e/
+regtest-e2e/
+*-e2e/
+
+# deploy snapshots: ~31MB binaries, one per deploy, kept on the host as the
+# rollback path. They are build products, not source.
+asm/daemon/bitcoind.deploy-*
