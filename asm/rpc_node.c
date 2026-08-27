@@ -18,6 +18,8 @@
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
                         * which silently corrupted their return values */
 #include <pthread.h>
+#include <unistd.h>  /* getcwd -- implicitly declared until 2026-08-27, which on
+                      * this ABI means int, truncating the returned pointer */
 #include <time.h>
 
 static const node_status_t* g_status;
