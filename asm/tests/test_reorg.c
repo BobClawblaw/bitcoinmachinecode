@@ -928,6 +928,10 @@ static void case_mempool(void){
                               * whatever the builder chose, and fee policy is
                               * not what this case is testing */,
                       25, 101000, 25, 101000, 1);
+    /* synthetic reorg fixtures are non-standard by construction: run under
+     * Core's own regtest escape hatch (-acceptnonstdtxn). */
+    { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+      mpool_policy_set_acceptnonstd(pol, 1); }
     unsigned pol_n = 512;
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);
