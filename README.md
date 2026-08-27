@@ -116,6 +116,10 @@ closes most of what `FEATURE_GAPS.md` still listed as absent:
   parent, which holds no handle on that set, so it asks the download worker
   over a socketpair. Before this it returned `null` for every outpoint —
   which does not mean "unknown", it means "spent".
+- **Mempool persistence.** `savemempool`/`importmempool` in Core's
+  `mempool.dat` format, verified in **both** directions against a running
+  Core: it loads the dump this node writes, and this node loads the dump it
+  writes.
 
 Configuration, running modes, and a precise **"exactly like Core vs.
 deliberately different"** ledger are documented in their own sections below.

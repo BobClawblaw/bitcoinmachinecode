@@ -185,10 +185,17 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …). As of 2026-08-27 the live binary is
-  **`bitcoind.deploy-20260827w`**; the rollback one step back is
-  `…-20260827v`.
+  **`bitcoind.deploy-20260827x`**; the rollback one step back is
+  `…-20260827w`.
 
-  The three that changed live behaviour most, newest first:
+  The four that changed live behaviour most, newest first:
+  - **`x`** (`386dc22`) — `savemempool`/`importmempool` in Core's
+    `mempool.dat` format. Verified live: a 284 KB dump of 184 real
+    transactions that an independent parser walks to exactly the file
+    length. `importmempool` was deliberately NOT run on the live node —
+    it would re-submit every transaction through admission for no
+    operational reason.
+
   - **`w`** (`385c9bb`) — `submitpackage` real; `gettxout` answers via the
     download-worker IPC; `getbalance`/`listunspent` answer from the wallet
     rescan. Verified live: `submitpackage` returns Core's `-8` parameter

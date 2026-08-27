@@ -362,14 +362,17 @@ pool is touched, so a bad entry cannot produce a partially-answered array.
 **Refused, each naming the specific gap:** `getblockfilter`, `scanblocks`,
 `getdescriptoractivity` (no BIP157/158 filter index — the block and undo data
 needed to build one are both on disk, so this is a missing index, not missing
-information); `dumptxoutset`, `loadtxoutset` (no assumeutxo: no writer for
-Core's snapshot format and no second chainstate to load one into);
-`preciousblock`, `pruneblockchain` (fork choice is owned by the forked
-download worker, with no channel for the parent to steer it);
-`savemempool`, `importmempool` (no `mempool.dat` reader or writer);
-`getmempoolcluster` (the pool tracks the ancestor/descendant graph but not
-Core's cluster structure); `getblockfrompeer` (no parent-to-worker channel
-for a targeted block request).
+information); `loadtxoutset` (no assumeutxo: no second chainstate to
+load a snapshot into — `dumptxoutset` became real later and is proven at
+full 165.7M-coin scale); `preciousblock`, `pruneblockchain` (fork choice is
+owned by the forked download worker); `getmempoolcluster` (the pool tracks
+the ancestor/descendant graph but not Core's cluster structure);
+`getblockfrompeer` (peer connections belong to the worker, and no targeted
+block request is wired through the control channel that slice 17 added).
+
+*Corrected 2026-08-27: `dumptxoutset` and the `savemempool`/`importmempool`
+pair are real and left this list; `getblockfrompeer`'s stated reason — "no
+parent-to-worker channel" — was superseded by slice 17, which built one.*
 
 ### Category status
 All 38 of Core's Blockchain methods now dispatch.
@@ -1139,3 +1142,46 @@ STILL OPEN: p2p 1-parent-1-child package RELAY (this is submission), TRUC/v3
 and ephemeral-dust policy, `replaced-transactions`, and
 `testmempoolaccept`'s package mode, which still evaluates each member
 independently and says so at its own call site.
+
+## Slice 22 — mempool.dat, both directions — (2026-08-27)
+
+`savemempool` and `importmempool` are real, and the interop is proven BOTH
+ways against a running Core: it loads the dump this node writes, and this
+node loads the dump it writes.
+
+We WRITE version 1. That is Core's own `-persistmempoolv1` form, which it
+reads unconditionally; v2's obfuscation exists to stop antivirus software
+mangling the file and its key is random, so no writer could produce a
+byte-comparable artifact anyway. We READ both, because a file handed to us
+was most likely written by a default Core.
+
+**The bug the interop test caught.** The v2 obfuscation key is serialized as
+a VECTOR — a compact-size length prefix, then the bytes — so the body starts
+at offset 17, not 16. Core says so in a comment. Reading it as a bare 8-byte
+key decodes the transaction COUNT correctly, because that is 8 bytes at an
+8-aligned offset, and then fails on the first transaction.
+
+The unit test did not catch it, and that is the point worth keeping: the v2
+fixture was built by the test itself, from the same wrong assumption the
+reader held, so the two agreed and both were wrong. A self-built fixture only
+tests a format if it is built FROM the format.
+
+**Where each half runs.** The dump reads the shared pool under the same lock
+`getrawmempool` uses and writes while still holding it — the entry pointers
+are into the shared blob, and releasing first would let an eviction move the
+bytes out from under the writer. The load cannot happen in the parent:
+admitting a transaction is the worker's job, so import re-submits each one
+through the channel `sendrawtransaction` uses and every entry gets the full
+consensus and policy treatment on the way back in. Core re-validates on load
+too — a dump is a hint about what was interesting, never a licence to skip
+checks.
+
+**Not restored**, stated rather than glossed: entry times and fee deltas (a
+re-admitted transaction gets a fresh time, and there is no
+`prioritisetransaction` path to replay a delta into), and the unbroadcast
+set, which this node does not track because `sendrawtransaction` relays to
+every live leg immediately.
+
+Verified on the live mainnet node: a 284,485-byte dump of 184 real
+transactions that an independent parser walks to exactly the file length,
+zero trailing bytes, all entry times nonzero.
