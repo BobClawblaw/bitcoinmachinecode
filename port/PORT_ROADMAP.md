@@ -208,6 +208,14 @@ and runs natively.
 - [ ] bitcoin_interp / scriptcodec / sighash / checksig / script / segwit /
       taproot_verify / strip_witness / tapagg / multisig / sigops ...
 - [ ] bitcoind.asm                        (daemon entry; links everything above)
+- [x] bitcoin_utxo_lsm (LSM-tree persistent UTXO store: per-run 3-seed FNV Bloom
+      filter + sparse index + crash-safe manifest (MAGIC_MANIFEST2 + total_live)
+      + open-addressing tomb hash + k-way merge compact + WAL-tail reload, layered
+      on the ported bitcoin_utxo / bitcoin_utxo_store tiers + C mmap-cache fast
+      path utxo_lsm_mm.c) -> port/arm64/bitcoin_utxo_lsm.S, 11 exports incl.
+      lsm_get_scratch TLS. Diff-fuzz vs pure-Python LSM oracle (t_lsm.c): 15 seeds
+      x400-600 ops, reload/reload_ro reconstruction (with checkpoint removed) +
+      per-flush/compact run+manifest byte-compare: 0 fail. (2026-08-26)
 - [ ] Remaining leaf modules (bip32/bip39/bip143/bip341, keys, addr*,
       idx, idxscan, muhash, mempool, serve, cli, chainwork, cmpct, headers,
       net addrmgr, node_log, txv_, witness_v0, ...)
@@ -342,7 +350,25 @@ incl. absent files, negative heights, empty & large scripts, prune windows; 0 fa
 byte-for-byte asm==C. AArch64: openat/unlinkat replace x86 open/unlink; raw syscalls.
 Pitfall: a 40MB static test array (u8 (*)[UMS]) faulted on this aarch64 build in the
 driver's ld-walk even in-bounds; switching to a heap buffer fixed it (static-array
-addressing quirk, unrelated to the port). undo_capture_and_del deferred (needs the
+address quirk, unrelated to the port). undo_capture_and_del deferred (needs the
 not-yet-ported bitcoin_utxo_lsm get/del). s6 UTXO layer now: utxo (mem) + utxo_store
 (persist) + sigops + undo all native+verified. NEXT: the IBD driver (download ->
 cons_verify -> per-tx script verify -> UTXO apply) for full-chained download+verify.
+
+## 2026-08-26 — bitcoin_utxo_lsm.S ported+verified (LSM UTXO store, s6 core #3)
+AArch64 port of asm/bitcoin_utxo_lsm.asm (4004 lines -> port/arm64/bitcoin_utxo_lsm.S,
+3206 lines): the log-structured-merge persistent UTXO -- in-memory memtable (the
+ported in-mem utxo) + tombstones + sorted immutable runs on disk + manifest, with
+flush / compact / reload(_ro) / walk. 12 exports all present: lsm_get_scratch,
+utxo_lsm_{init,put,del,count,close,get,flush,reload_ro,reload,walk,compact}. The
+"mm" memtable-map layer (lsm_run_lookup_mm / lsm_mm_invalidate_all) are C
+(asm/utxo_lsm_mm.c, C on the x86 tree too). Builds on the ported bitcoin_utxo
+(in-mem) + bitcoin_utxo_store (persistent WAL) + sha256.
+Differential driver t_lsm.c + fuzz_lsm.py (pure-Python LSM model: memtable dict +
+tombstones + sorted runs + manifest; byte-compares run files + manifest after every
+flush/compact/reload incl. 3-seed FNV bloom + sparse index; final reload_ro with the
+utxo.idx checkpoint removed -> pure WAL+manifest+runs replay). Verification:
+17 seeds x 150-1200 iters, 0 failures; make-integrated `make fuzz_lsm` = seed 1
+800 iters, 0 fail. Now UNBLOCKS undo_capture_and_del and the daemon's disk-backed
+UTXO at scale (s8's ~80M-output modern tip needs the LSM-backed store, not just the
+in-mem table). Added to Makefile MODULES + t_lsm/fuzz_lsm targets; roadmap [x].

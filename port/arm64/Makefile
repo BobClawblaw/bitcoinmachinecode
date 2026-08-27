@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_undo bitcoin_sigops bitcoin_strip_witness
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -100,6 +100,10 @@ t_utxo: t_utxo.c bitcoin_utxo.o
 	@$(CC) $(CFLAGS) -o $@ $+
 t_ustore: t_ustore.c bitcoin_utxo_store.o bitcoin_utxo.o
 	@$(CC) $(CFLAGS) -o $@ $+
+t_lsm: t_lsm.c bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o ../../asm/utxo_lsm_mm.c sha256.o
+	@$(CC) $(CFLAGS) -o $@ t_lsm.c bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o ../../asm/utxo_lsm_mm.c sha256.o
+fuzz_lsm: t_lsm
+	python3 fuzz_lsm.py 1 800
 t_undo_asm: t_undo.c bitcoin_undo.o
 	@$(CC) $(CFLAGS) -o $@ $+
 fuzz_undo:
