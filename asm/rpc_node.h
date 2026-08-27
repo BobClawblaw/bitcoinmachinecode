@@ -230,4 +230,8 @@ const char* rpc_node_method_at(int i);
 int rpc_node_dispatch(const char* method, const rj_val* params,
                       rj_val** result, long* ec, const char** em);
 
+/* bumpfee (rpc_wallet_ops.c): raw bytes of one mempool tx, copied out under
+ * the pool lock. Returns length or -1 (absent, or no pool in this process). */
+long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap);
+
 #endif

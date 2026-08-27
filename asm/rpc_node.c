@@ -405,6 +405,23 @@ void rpc_node_set_mempool(const rpc_mempool_hooks* h){
 static void mpl(void){ if (g_mph.lock) g_mph.lock(); }
 static void mpu(void){ if (g_mph.unlock) g_mph.unlock(); }
 
+/* Copy one mempool transaction's raw bytes out under the pool lock.
+ * For the wallet's bumpfee (rpc_wallet_ops.c): the original of a replacement
+ * is an UNCONFIRMED wallet tx, and this node's wallet journal deliberately
+ * stores metadata, not raw bytes -- the pool is the only place the original
+ * still exists. Returns the length, or -1 when the tx is not in the pool (or
+ * this process has no pool hooks -- the standalone rpcd). */
+long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap){
+    if (!g_mph.mp || !g_mph.get) return -1;
+    mpl();
+    unsigned long len = 0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid_wire, &len);
+    long r = -1;
+    if (tx && len > 0 && len <= cap){ memcpy(out, tx, len); r = (long)len; }
+    mpu();
+    return r;
+}
+
 /* Slot layout per bitcoin_mempool.asm's header (same walk daemon/reorg.c
  * uses): +0 n, +8 mask, +16 blob, then 48-byte slots at +40 --
  * [+0 len][+8 txid[32]][+40 blob_off], len==~0 marking empty. */

@@ -450,13 +450,15 @@ int main(void){
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
     { static const char* REFUSE[] = {
         "migratewallet","setwalletflag","createwalletdescriptor",
-        "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
-        "bumpfee","psbtbumpfee" };
+        "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet" };
       /* walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
        * encryptwallet left 2026-08-27 (real; -8 asserted below).
        * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
        * left 2026-08-27: MULTI-WALLET is real now -- the whole lifecycle is
-       * exercised at the end of this file. */
+       * exercised at the end of this file.
+       * bumpfee/psbtbumpfee left 2026-08-27: REAL now (Core feebumper
+       * semantics; differentially proven on regtest) -- bad-arg forms
+       * asserted below. */
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
@@ -771,10 +773,20 @@ int main(void){
            rc == 0 && ec == -4 && em && strstr(em, "no download worker"));
         rj_free(r); rj_free(p); }
 
-      { /* the two that still refuse must say WHY they specifically cannot */
+      { /* bumpfee is real: with no/bad txid it is an ordinary -8, and with
+           an unknown txid it is Core's -5 (no journal, not-in-mempool) */
         D("bumpfee", NULL);
-        ck("bumpfee still refuses", rc == 0 && ec == -1);
-        rj_free(r); }
+        ck("bumpfee with no txid -> -8 (wired, not a stub)", rc == 0 && ec == -8);
+        rj_free(r);
+        rj_val* pb = P("[\"00000000000000000000000000000000000000000000000000000000000000ff\"]");
+        D("bumpfee", pb);
+        ck("bumpfee unknown txid -> -5 Core's text",
+           rc == 0 && ec == -5 && em && !strcmp(em, "Invalid or non-wallet transaction id"));
+        rj_free(r); rj_free(pb);
+        pb = P("[\"00000000000000000000000000000000000000000000000000000000000000ff\"]");
+        D("psbtbumpfee", pb);
+        ck("psbtbumpfee unknown txid -> -5", rc == 0 && ec == -5);
+        rj_free(r); rj_free(pb); }
 
       rpc_wops_set_scanner(NULL, NULL, 0, NULL); }
 
