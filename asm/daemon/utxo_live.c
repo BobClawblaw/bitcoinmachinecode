@@ -56,6 +56,9 @@ extern long utxo_lsm_del(void* lst, void* u, const u8 txid[32], u32 index);
  * this exists and who needs it (daemon catch-up completion). */
 extern long utxo_lsm_flush(void* lst, void* u);
 extern long utxo_lsm_count(void* lst);
+/* returns the live entry count (or -1); NOT an int -- an implicit
+ * declaration here truncated it to 32 bits. */
+extern long utxo_lsm_walk(void* lst, void* u, void* cb, void* ctx);
 extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
 

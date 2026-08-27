@@ -274,6 +274,12 @@ long csi_file_height(void){
     return h;
 }
 
+/* Forward declaration: csi_rpc_run below calls csi_read_file, which is
+ * DEFINED further down this file. Without this the call was implicit, so
+ * none of its six pointer arguments was type-checked. */
+int csi_read_file(long* height, unsigned char blockhash[32], unsigned char digest[32],
+                  u64* txouts, u64* amount, u64* bogo);
+
 /* RPC adapter: the same out-contract as the walk reader
  * (rpc_chain.c rpc_usi_out_t: height, txouts, bogosize, total_amount,
  * muhash[32], muhash_valid). Returns 1 served / 0 no-valid-index. */
