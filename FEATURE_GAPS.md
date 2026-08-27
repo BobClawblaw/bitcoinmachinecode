@@ -208,9 +208,16 @@ tables and the writers themselves.
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
   165.7M-coin scale).
-- **Package relay** — Core's v3 / ephemeral-dust multi-transaction package
-  acceptance is absent (`daemon/tx_accept.c` has no package path). Single-tx
-  acceptance, RBF and CPFP mining templates are all real.
+- **Package relay — PARTLY CLOSED 2026-08-27.** `submitpackage` is real:
+  context-free package policy with Core's reason strings, in-package parent
+  resolution, and Core's effective feerate, so a parent below the relay floor
+  is accepted when its child pays for it. Proven end to end against a real
+  Core, which accepts the identical package
+  (`validation/bumpfee_regtest_e2e.sh`). STILL OPEN: p2p 1-parent-1-child
+  package RELAY (this is submission, not relay), TRUC/v3 and ephemeral-dust
+  policy, `replaced-transactions` reporting, and `testmempoolaccept`'s
+  package mode, which still evaluates each member independently and says so
+  at its own call site.
 - **Seven wallet-import RPCs refuse**, all the same shape: `migratewallet`,
   `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
   `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`. The

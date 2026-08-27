@@ -136,6 +136,45 @@ int tx_dispatch_init(void){
     return g_ready;
 }
 
+/* ---- package overlay ------------------------------------------------------
+ * The transactions of the package currently being validated, so a child can
+ * resolve a parent that is not in the mempool yet. Set for the duration of
+ * ONE package validation by the worker (single-threaded for this) and
+ * ALWAYS cleared afterwards: a stale entry here would let an unrelated
+ * transaction resolve an input against a package member that was never
+ * accepted, which is a way to admit something spending a non-existent coin.
+ * txacc_package_overlay(NULL,NULL,NULL,0) is the reset. */
+#define TXACC_PKG_MAX 25
+static const u8*    g_pkg_tx[TXACC_PKG_MAX];
+static unsigned long g_pkg_len[TXACC_PKG_MAX];
+static u8            g_pkg_txid[TXACC_PKG_MAX][32];
+static int           g_pkg_n = 0;
+void txacc_package_overlay(const u8* const* txs, const unsigned long* lens,
+                           const u8* txids, int n){
+    if (n > TXACC_PKG_MAX) n = TXACC_PKG_MAX;
+    g_pkg_n = (n > 0 && txs && lens && txids) ? n : 0;
+    for (int i = 0; i < g_pkg_n; i++){
+        g_pkg_tx[i] = txs[i]; g_pkg_len[i] = lens[i];
+        memcpy(g_pkg_txid[i], txids + (size_t)i * 32, 32);
+    }
+}
+
+/* Resolve an outpoint against the in-package parents. 1 = found. Shared by
+ * BOTH resolvers below: the script verifier's and the one mempool policy uses
+ * for fees. Putting it in only one of them is a trap -- the child would then
+ * verify but fail fee computation with bad-txns-inputs-missingorspent, which
+ * is what happened the first time this was wired. */
+static int txacc_tx_output(const u8* tx, unsigned long txlen, u32 index,
+                           u64* value, const u8** spk, unsigned long* spklen);
+static int txacc_pkg_resolve(const u8 outpoint[32], u32 index,
+                             u64* value, const u8** spk, unsigned long* spklen){
+    for (int pi = 0; pi < g_pkg_n; pi++){
+        if (memcmp(g_pkg_txid[pi], outpoint, 32)) continue;
+        return txacc_tx_output(g_pkg_tx[pi], g_pkg_len[pi], index, value, spk, spklen);
+    }
+    return 0;
+}
+
 /* mempool_resolve_confirmed_utxo: see bitcoin_mempool_policy.c's and
  * bitcoin_txval_modern.c's own externs for the full rationale. `u` is
  * unused -- this always reads the per-connection snapshot above.
@@ -150,6 +189,19 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
                                     unsigned long* slen){
     (void)u;
     unsigned long height, is_coinbase;
+    /* in-package parents first: during a package dry run the parent is not in
+     * the mempool or the chain yet, and this is the resolver mempool policy
+     * charges fees through. DIVERGENCE, deliberate and confined to the dry
+     * run: a parent resolved here looks CONFIRMED to the policy, so ancestor
+     * limits are not charged across it while fees are being computed. The
+     * commit pass inserts the parent first, so the child's ancestor
+     * accounting there is the real one. */
+    if (g_pkg_n){
+        u64 pv; const u8* ps; unsigned long psl;
+        if (txacc_pkg_resolve(txid, (u32)index, &pv, &ps, &psl)){
+            *value = pv; *script = ps; *slen = psl; return 1;
+        }
+    }
     if (g_resolver) return g_resolver(txid, index, value, &height, &is_coinbase, script, slen);
     if (!g_ready) return 0;
     return utxo_lsm_get(&g_lst, g_table, txid, (u32)index, value, &height, &is_coinbase, script, slen);
@@ -255,6 +307,20 @@ static int txacc_resolve_verify(void* mp_area, const u8 outpoint[36], u32 index,
         unsigned long long v2; unsigned long h2, c2;
         if (utxo_lsm_get(&g_lst, g_table, outpoint, index, &v2, &h2, &c2, spk, spklen) == 1){
             *value = v2; *height = h2; *is_coinbase = c2;
+            return 1;
+        }
+    }
+    /* ---- in-package parents -------------------------------------------
+     * A package is validated before any of it is in the mempool, so a child
+     * spending a parent from the same package would otherwise resolve to
+     * nothing and report missing-inputs. Core resolves in-package parents
+     * exactly like mempool ones; this layer sits immediately before the
+     * mempool lookup and is EMPTY outside a package submission. */
+    if (g_pkg_n){
+        u64 pv; const u8* ps; unsigned long psl;
+        if (txacc_pkg_resolve(outpoint, index, &pv, &ps, &psl)){
+            *value = pv; *height = (u64)(g_next_height > 0 ? g_next_height : 0);
+            *is_coinbase = 0; *spk = ps; *spklen = psl;
             return 1;
         }
     }

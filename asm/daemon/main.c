@@ -2442,6 +2442,132 @@ static int txsub_worker_ready(void){
     return 1;
 }
 
+/* ==== submitpackage: validate a package, then commit it =====================
+ * Core's shape, reduced to what this node can honestly do.
+ *
+ * TWO PASSES, and the order matters. Pass 1 is a DRY RUN over the package
+ * with the in-package overlay installed, so a child can resolve a parent that
+ * is not in the mempool yet and every member's real fee and vsize become
+ * known WITHOUT inserting anything. Only then is the package feerate known,
+ * and only then can pass 2 commit.
+ *
+ * Doing it the other way round -- insert optimistically, then check the
+ * aggregate -- would mean removing transactions that should never have been
+ * accepted, and a failure partway through that removal leaves the mempool
+ * holding a transaction below the floor. The dry run costs a second
+ * validation pass and buys the property that nothing enters the pool until
+ * the whole package is known to be acceptable.
+ *
+ * A member may only be rescued by the package for the TWO fee reasons Core
+ * treats as reconsiderable ("min relay fee not met", "mempool min fee not
+ * met"). Anything else -- invalid, non-standard, conflicting -- is final: no
+ * amount of fee from a child makes an invalid parent valid.
+ *
+ * Returns 1 if the whole package was accepted, 0 otherwise (per-transaction
+ * results are published in the shared block either way). */
+static int txsub_package(char* msg, unsigned long mcap){
+    extern int mpol_package_well_formed(const unsigned char* const*, const unsigned long*,
+                                        int, unsigned char*, unsigned long long*, const char**);
+    extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*,
+                                      const unsigned char*, int);
+    extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*,
+                                      unsigned long, char*, unsigned long, unsigned long long*);
+    extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
+    node_status_t* st = g_node_status;
+    int n = st->tx_submit_pkg_n;
+    if (n <= 0 || n > RPC_PKG_MAX){ snprintf(msg, mcap, "package-too-many-transactions"); return 0; }
+    if (!txsub_worker_ready()){ snprintf(msg, mcap, "mempool init failed"); return 0; }
+
+    /* walk the concatenated buffer; each transaction is self-delimiting */
+    static const unsigned char* txs[RPC_PKG_MAX];
+    static unsigned long lens[RPC_PKG_MAX];
+    static unsigned char txids[RPC_PKG_MAX*32];
+    { const unsigned char* p = (const unsigned char*)st->tx_submit_buf;
+      const unsigned char* end = p + st->tx_submit_len;
+      for (int i = 0; i < n; i++){
+          unsigned char info[64];
+          if (tx_parse(info, p, (unsigned long)(end - p)) != 1){
+              snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; }
+          unsigned long long tl; memcpy(&tl, info, 8);
+          if (tl == 0 || p + tl > end){
+              snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; }
+          txs[i] = p; lens[i] = (unsigned long)tl; p += tl;
+      }
+      if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
+
+    const char* why = "";
+    static unsigned long long vsz[RPC_PKG_MAX];
+    if (!mpol_package_well_formed(txs, lens, n, txids, vsz, &why)){
+        snprintf(msg, mcap, "%s", why);
+        /* Core's word for a member that never got its own verdict because the
+         * package was rejected as a whole. */
+        for (int i = 0; i < n; i++){
+            st->pkg_result[i] = 0;
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+        }
+        return 0;
+    }
+
+    /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
+    unsigned long long tot_fee = 0, tot_vsize = 0;
+    int all_ok = 1;
+    txacc_package_overlay(txs, lens, txids, n);
+    for (int i = 0; i < n; i++){
+        char r[128]; r[0] = 0; unsigned long long fee = 0;
+        long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
+                                        r, sizeof r, &fee);
+        st->pkg_fee[i] = fee;
+        st->pkg_vsize[i] = vsz[i];        /* BIP141 vsize, from the policy walker */
+        if (rc == 1){
+            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            tot_fee += fee; tot_vsize += st->pkg_vsize[i];
+        } else {
+            int fee_only = (!strcmp(r, "min relay fee not met") ||
+                            !strcmp(r, "mempool min fee not met"));
+            st->pkg_result[i] = 0;
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
+            else all_ok = 0;      /* not something a package can rescue */
+        }
+    }
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+
+    if (!all_ok){
+        mpol_package_fee_context(0, 0);
+        snprintf(msg, mcap, "transaction failed");
+        return 0;
+    }
+
+    /* ---- pass 2: commit, with the package feerate in effect -------------- */
+    int committed = 1;
+    mpol_package_fee_context(tot_fee, tot_vsize);
+    txacc_package_overlay(txs, lens, txids, n);
+    for (int i = 0; i < n; i++){
+        char r[128]; r[0] = 0; int relayed = 0;
+        int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
+                                        mux_out_fd, mux_n_out, r, sizeof r, &relayed);
+        if (rc == 1){ st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; }
+        else {
+            st->pkg_result[i] = 0;
+            snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+            committed = 0;
+        }
+    }
+    /* ALWAYS cleared: a fee context left set would relax the floor for
+     * ordinary single-transaction traffic, and an overlay left set would let
+     * an unrelated transaction resolve against a package member. */
+    txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_fee_context(0, 0);
+
+    st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
+    snprintf(msg, mcap, "%s", committed ? "success" : "transaction failed");
+    if (committed)
+        fprintf(stderr, "[dl] submitpackage: %d tx accepted, package fee %llu sat over %llu vB\n",
+                n, (unsigned long long)tot_fee, (unsigned long long)tot_vsize);
+    return committed;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -2994,7 +3120,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_node_status && g_node_status->tx_submit_seq != txsub_last_seq){
             txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
-            if(txsub_worker_ready()){
+            if(g_node_status->tx_submit_pkg_n > 0){
+                result = txsub_package(reason, sizeof reason);
+            }
+            else if(txsub_worker_ready()){
                 unsigned long tlen = g_node_status->tx_submit_len;
                 if(tlen==0 || tlen>RPC_TXSUBMIT_MAX){ result=-22; snprintf(reason,sizeof reason,"TX decode failed"); }
                 else if(g_node_status->tx_submit_test){

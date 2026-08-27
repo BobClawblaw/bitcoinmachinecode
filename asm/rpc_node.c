@@ -1320,6 +1320,146 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     return 0;
 }
 
+/* ==== submitpackage =========================================================
+ * Core's shape: a package-level verdict plus one result per transaction,
+ * keyed by WTXID exactly as Core keys them.
+ *
+ * The whole package rides one staging of the submit channel (concatenated,
+ * each transaction self-delimiting) so the worker sees it as a unit -- which
+ * is the point. Submitting the members one at a time is what this node could
+ * already do, and it cannot accept a parent whose fee only clears the floor
+ * because of its child.
+ *
+ * The result follows Core's schema rather than a reduced one of our own:
+ * package_msg, tx-results keyed by wtxid with txid / vsize / vsize_bip141 /
+ * fees{base, effective-feerate, effective-includes} / error, and Core's own
+ * "package-not-validated" for members that never got an individual verdict
+ * because the package was rejected as a whole.
+ *
+ * effective-feerate is the feerate the package was actually evaluated
+ * against -- the aggregate the worker used for the fee floors -- and
+ * effective-includes lists every member whose fee and vsize went into it.
+ * That is exactly what the number means, so it is reported rather than
+ * omitted.
+ *
+ * "replaced-transactions" is absent, which is Core's own convention: the
+ * field is optional there and Core omits it when nothing was replaced. This
+ * node does not track package-driven RBF evictions, so it never emits it.
+ */
+static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const char** em){
+    /* VOID: bitcoin_cmpct.asm sets no return value (tests/test_bip152.c has
+     * had it right all along). Declaring it int and checking for 1 reads
+     * whatever happened to be in rax -- which silently dropped every result. */
+    extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen);
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
+        params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
+        *ec = -8; *em = "Invalid parameter, package must be a non-empty array"; return 0; }
+    const rj_val* list = params->items[0];
+    if (list->nitems > RPC_PKG_MAX){
+        *ec = -8; *em = "Array must contain between 1 and 25 transactions"; return 0; }
+    if (!g_status_rw){
+        *ec = -4; *em = "no download worker is attached, so nothing can validate a package"; return 0; }
+
+    int n = (int)list->nitems;
+    static unsigned char raw[RPC_TXSUBMIT_MAX];
+    static unsigned long off[RPC_PKG_MAX];
+    static unsigned long tlen[RPC_PKG_MAX];
+    unsigned long total = 0;
+    for (int i = 0; i < n; i++){
+        const rj_val* e = list->items[i];
+        if (!e || e->typ != RJ_STR || !e->str){
+            *ec = -22; *em = "TX decode failed"; return 0; }
+        size_t hl = strlen(e->str);
+        if (hl % 2 || hl/2 == 0 || total + hl/2 > sizeof raw){
+            *ec = -22; *em = "TX decode failed"; return 0; }
+        for (size_t k = 0; k < hl/2; k++){
+            int a = srt_hex1(e->str[k*2]), b = srt_hex1(e->str[k*2+1]);
+            if (a < 0 || b < 0){ *ec = -22; *em = "TX decode failed"; return 0; }
+            raw[total + k] = (unsigned char)((a<<4)|b);
+        }
+        off[i] = total; tlen[i] = hl/2; total += hl/2;
+    }
+
+    node_status_t* st = g_status_rw;
+    pthread_mutex_lock(&g_submit_lock);
+    memcpy((void*)st->tx_submit_buf, raw, total);
+    st->tx_submit_len = total;
+    st->tx_submit_test = 0;
+    st->tx_submit_pkg_n = n;
+    st->tx_submit_reason[0] = 0;
+    st->pkg_msg[0] = 0;
+    unsigned long long myseq = st->tx_submit_seq + 1;
+    __sync_synchronize();
+    st->tx_submit_seq = myseq;
+    int waited = 0, got = 0;
+    while (waited < SRT_WAIT_MS*1000){
+        if (st->tx_submit_ack == myseq){ got = 1; break; }
+        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
+        waited += SRT_POLL_US;
+    }
+    static int  r_result[RPC_PKG_MAX];
+    static unsigned long long r_fee[RPC_PKG_MAX], r_vsize[RPC_PKG_MAX];
+    static char r_reason[RPC_PKG_MAX][64];
+    char pmsg[128]; pmsg[0] = 0;
+    unsigned long long eff_fee = 0, eff_vsize = 0;
+    if (got){
+        for (int i = 0; i < n; i++){
+            r_result[i] = st->pkg_result[i];
+            r_fee[i]    = st->pkg_fee[i];
+            r_vsize[i]  = st->pkg_vsize[i];
+            snprintf(r_reason[i], sizeof r_reason[i], "%s", (const char*)st->pkg_reason[i]);
+        }
+        snprintf(pmsg, sizeof pmsg, "%s", (const char*)st->tx_submit_reason);
+        eff_fee = st->pkg_eff_fee; eff_vsize = st->pkg_eff_vsize;
+    }
+    st->tx_submit_pkg_n = 0;          /* leave the channel as a single-tx one */
+    pthread_mutex_unlock(&g_submit_lock);
+
+    if (!got){
+        *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "package_msg", rj_str(pmsg[0] ? pmsg : "success"));
+    rj_val* results = rj_obj();
+    for (int i = 0; i < n; i++){
+        unsigned char w[32], t[32]; char whex[65], thex[65];
+        tx_wtxid(w, raw + off[i], tlen[i]);
+        { static unsigned char sc[1<<20];
+          if (tx_txid(t, raw + off[i], tlen[i], sc, sizeof sc) != 1) continue; }
+        mpe_hex(whex, w);            /* mpe_hex writes DISPLAY order already */
+        mpe_hex(thex, t);
+        rj_val* e = rj_obj();
+        rj_obj_set(e, "txid", rj_str(thex));
+        rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
+        rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
+        if (r_result[i]){
+            rj_val* f = rj_obj();
+            rj_obj_set(f, "base", mpe_amount(r_fee[i]));
+            if (eff_vsize){
+                /* Core reports this per KvB, as an amount */
+                unsigned long long per_kvb = eff_fee * 1000ULL / eff_vsize;
+                rj_obj_set(f, "effective-feerate", mpe_amount(per_kvb));
+                rj_val* inc = rj_arr();
+                for (int k = 0; k < n; k++){
+                    if (!r_result[k]) continue;
+                    unsigned char wk[32]; char wkhex[65];
+                    tx_wtxid(wk, raw + off[k], tlen[k]);
+                    mpe_hex(wkhex, wk);
+                    rj_arr_push(inc, rj_str(wkhex));
+                }
+                rj_obj_set(f, "effective-includes", inc);
+            }
+            rj_obj_set(e, "fees", f);
+        } else if (r_reason[i][0]){
+            rj_obj_set(e, "error", rj_str(r_reason[i]));
+        }
+        rj_obj_set(results, whex, e);
+    }
+    rj_obj_set(o, "tx-results", results);
+    *res = o;
+    return 1;
+}
+
 static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
@@ -1432,13 +1572,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getpeerinfo"))        return cmd_getpeerinfo(res);
     if (!strcmp(m, "gettxspendingprevout")) return cmd_gettxspendingprevout(params, res, ec, em);
     if (!strcmp(m, "testmempoolaccept")) return cmd_testmempoolaccept(params, res, ec, em);
-    if (!strcmp(m, "submitpackage"))
-        return cmd_net_unsupported(
-            "this node has no package validation: transactions are accepted "
-            "one at a time against the mempool as it stands, so a child "
-            "cannot be validated against an unconfirmed parent in the same "
-            "call. Submit the parent first with sendrawtransaction, then the "
-            "child", ec, em);
+    if (!strcmp(m, "submitpackage")) return cmd_submitpackage(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo") || !strcmp(m, "abortprivatebroadcast"))
         return cmd_net_unsupported(
             "this node has no private broadcast queue: sendrawtransaction "

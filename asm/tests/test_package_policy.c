@@ -16,7 +16,8 @@
 
 extern int mpol_package_well_formed(const unsigned char* const* txs,
                                     const unsigned long* lens, int n,
-                                    unsigned char* txids_out, const char** reason);
+                                    unsigned char* txids_out,
+                                    unsigned long long* vsize_out, const char** reason);
 extern int tx_txid(unsigned char out[32], const unsigned char* tx,
                    unsigned long txlen, unsigned char* buf, unsigned long buflen);
 
@@ -77,18 +78,18 @@ int main(void){
     { memcpy(pv[0], atxid, 32); vo[0] = 0;
       unsigned long lb = mk_tx(b, pv, vo, 1, 1, 90000);
       const unsigned char* txs[2] = { a, b }; unsigned long ls[2] = { la, lb };
-      ck("parent then child is well formed", mpol_package_well_formed(txs, ls, 2, NULL, &why) == 1); }
+      ck("parent then child is well formed", mpol_package_well_formed(txs, ls, 2, NULL, NULL, &why) == 1); }
 
     /* 2. child BEFORE parent -> package-not-sorted */
     { memcpy(pv[0], atxid, 32); vo[0] = 0;
       unsigned long lb = mk_tx(b, pv, vo, 1, 1, 90000);
       const unsigned char* txs[2] = { b, a }; unsigned long ls[2] = { lb, la };
-      int r = mpol_package_well_formed(txs, ls, 2, NULL, &why);
+      int r = mpol_package_well_formed(txs, ls, 2, NULL, NULL, &why);
       ck("child before parent -> package-not-sorted", r == 0 && !strcmp(why, "package-not-sorted")); }
 
     /* 3. the same transaction twice -> package-contains-duplicates */
     { const unsigned char* txs[2] = { a, a }; unsigned long ls[2] = { la, la };
-      int r = mpol_package_well_formed(txs, ls, 2, NULL, &why);
+      int r = mpol_package_well_formed(txs, ls, 2, NULL, NULL, &why);
       ck("duplicate transaction -> package-contains-duplicates",
          r == 0 && !strcmp(why, "package-contains-duplicates")); }
 
@@ -96,7 +97,7 @@ int main(void){
     { memset(pv[0], 0x11, 32); vo[0] = 0;
       unsigned long lc = mk_tx(c, pv, vo, 1, 1, 50000);   /* same input as `a`, different outputs */
       const unsigned char* txs[2] = { a, c }; unsigned long ls[2] = { la, lc };
-      int r = mpol_package_well_formed(txs, ls, 2, NULL, &why);
+      int r = mpol_package_well_formed(txs, ls, 2, NULL, NULL, &why);
       ck("two txs on one outpoint -> conflict-in-package",
          r == 0 && !strcmp(why, "conflict-in-package")); }
 
@@ -108,21 +109,21 @@ int main(void){
       memcpy(pv[1], pv[0], 32);  vo[1] = 3;              /* the same outpoint twice */
       unsigned long lc = mk_tx(c, pv, vo, 2, 1, 50000);
       const unsigned char* txs[1] = { c }; unsigned long ls[1] = { lc };
-      int r = mpol_package_well_formed(txs, ls, 1, NULL, &why);
+      int r = mpol_package_well_formed(txs, ls, 1, NULL, NULL, &why);
       ck("a tx with a duplicated input is NOT conflict-in-package",
          !(r == 0 && !strcmp(why, "conflict-in-package"))); }
 
     /* 6. over the count limit */
     { const unsigned char* txs[26]; unsigned long ls[26];
       for(int i=0;i<26;i++){ txs[i]=a; ls[i]=la; }
-      int r = mpol_package_well_formed(txs, ls, 26, NULL, &why);
+      int r = mpol_package_well_formed(txs, ls, 26, NULL, NULL, &why);
       ck("26 transactions -> package-too-many-transactions",
          r == 0 && !strcmp(why, "package-too-many-transactions")); }
 
     /* 7. txids are handed back so a caller need not re-walk the package */
     { const unsigned char* txs[1] = { a }; unsigned long ls[1] = { la };
       unsigned char out[32];
-      int r = mpol_package_well_formed(txs, ls, 1, out, &why);
+      int r = mpol_package_well_formed(txs, ls, 1, out, NULL, &why);
       ck("txids_out is filled with the real txid", r == 1 && !memcmp(out, atxid, 32)); }
 
     if(failures) printf("\nFAILURES: %d\n", failures);

@@ -87,6 +87,22 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                    * capped at max_desc (25) by admission, so
                                    * 128 is comfortable headroom */
 
+/* ---- package effective-feerate context ----------------------------------
+ * Set for the duration of ONE package submission, by the worker, which is
+ * single-threaded for this. While set, the two fee floors in mpol_accept are
+ * evaluated against the package aggregate instead of the individual
+ * transaction -- Core's effective feerate, the mechanism by which a child
+ * pays for its parent.
+ *
+ * ALWAYS cleared by the caller when the package finishes, success or not. A
+ * value left set here would silently relax the fee floor for ordinary
+ * single-transaction traffic, so mpol_package_fee_context(0,0) is the reset
+ * and the package path calls it on every exit. */
+static uint64_t g_pkg_fee = 0, g_pkg_vsize = 0;
+void mpol_package_fee_context(unsigned long long fee, unsigned long long vsize){
+    g_pkg_fee = (uint64_t)fee; g_pkg_vsize = (uint64_t)vsize;
+}
+
 static const char* _mpol_last_reason = "accepted";
 
 /* ---------------- config (pol): caller fills via mpool_policy_init --------- */
@@ -670,15 +686,25 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     uint64_t fee = sum_in - meta.sum_out;
     if (fee_out) *fee_out = (unsigned long long)fee;
 
-    /* min relay floor over VSIZE (Core "min relay fee not met") */
-    if (fee < vsize * pol->relay_fee_rate){
-        _mpol_last_reason = "min relay fee not met"; return 0; }
-    /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
-    { uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
+    /* ---- fee floors, over the PACKAGE aggregate when one is in effect ----
+     * Core evaluates a package member against the package's EFFECTIVE
+     * FEERATE, which is what lets a child pay for a parent that could never
+     * get in alone (CPFP). Outside a package g_pkg_vsize is 0 and these are
+     * exactly the single-transaction checks they always were.
+     * These are the ONLY two checks a package may relax: a transaction that
+     * fails anything else is invalid or non-standard on its own terms, and no
+     * amount of fee from a child changes that. */
+    { uint64_t eff_fee   = g_pkg_vsize ? g_pkg_fee   : fee;
+      uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
+      /* min relay floor over VSIZE (Core "min relay fee not met") */
+      if (eff_fee < eff_vsize * pol->relay_fee_rate){
+          _mpol_last_reason = "min relay fee not met"; return 0; }
+      /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
+      uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
       if (fl > 0){
-          uint64_t need = fl * vsize / 1000;
+          uint64_t need = fl * eff_vsize / 1000;
           if (need == 0) need = 1;
-          if (fee < need){ _mpol_last_reason = "mempool min fee not met"; return 0; }
+          if (eff_fee < need){ _mpol_last_reason = "mempool min fee not met"; return 0; }
       } }
 
     /* --- conflicts + RBF (Core ReplacementChecks / classic BIP125) --------- */
@@ -1181,10 +1207,12 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
 
 /* 1 = well formed. 0 = not, with *reason set to Core's exact string.
  * txids_out (optional, n*32 bytes) receives each transaction's txid in wire
- * order so a caller that already needs them does not walk the package twice. */
+ * order and vsize_out (optional, n entries) each transaction's BIP141 vsize,
+ * so a caller that needs them does not walk the package a second time. */
 int mpol_package_well_formed(const unsigned char* const* txs,
                              const unsigned long* lens, int n,
-                             unsigned char* txids_out, const char** reason){
+                             unsigned char* txids_out,
+                             unsigned long long* vsize_out, const char** reason){
     static const char* dummy; if (!reason) reason = &dummy;
     *reason = "";
     if (n <= 0){ *reason = "package-not-sorted"; return 0; }   /* nothing sane to say */
@@ -1217,6 +1245,10 @@ int mpol_package_well_formed(const unsigned char* const* txs,
         if (tx_txid(txid[i], txs[i], lens[i], scratch, sizeof scratch) != 1){
             *reason = "package-contains-unparseable-transaction"; return 0; }
         if (txids_out) memcpy(txids_out + (size_t)i * 32, txid[i], 32);
+        /* BIP141 vsize from the SAME walker the fee floors are charged
+         * against -- deriving it a second way is how a package and a lone
+         * transaction start disagreeing about what a transaction costs. */
+        if (vsize_out) vsize_out[i] = m.vsize;
     }
 
     /* A single transaction reports its own weight violation, not a package

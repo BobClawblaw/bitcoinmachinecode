@@ -7,6 +7,64 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 -- package relay: submitpackage, and a child paying for its parent
+
+The point of a package is that a transaction which cannot stand alone gets
+in because another one pays for it. That is now real, and the e2e proves it
+in the only way that counts: the parent is FIRST refused on its own with
+"min relay fee not met", and then accepted as part of the package -- and
+Bitcoin Core accepts the identical package.
+
+THREE PIECES.
+1. Context-free policy (bitcoin_mempool_policy.c) -- count, weight,
+   duplicates, topological order, conflicts, with Core's exact reason
+   strings. Built on parse_tx, the same walker the single-transaction path
+   uses; a second parser is how a package and a lone transaction start
+   disagreeing about what a transaction IS.
+2. In-package parent resolution (daemon/tx_accept.c) -- a child must be able
+   to resolve a parent that is in neither the chain nor the mempool. THE
+   TRAP, hit on the first wiring: this node has TWO prevout resolvers, the
+   script verifier's and the one mempool policy charges fees through. Adding
+   the overlay to only the first makes the child verify and then fail fee
+   computation with bad-txns-inputs-missingorspent. Both now share one
+   helper.
+3. Effective feerate -- the two fee floors are evaluated against the package
+   aggregate when a package is in effect. Those two floors are the ONLY
+   checks a package may relax: a member that fails anything else is invalid
+   or non-standard on its own terms and no amount of fee from a child
+   changes that.
+
+TWO PASSES, and the order is the design. Pass 1 is a DRY RUN with the
+overlay installed, so every member's real fee and vsize become known without
+inserting anything; only then is the package feerate known, and only then
+does pass 2 commit. Inserting optimistically and checking the aggregate
+afterwards would mean removing transactions that should never have been
+accepted, and a failure partway through that removal leaves the mempool
+holding a transaction below the floor.
+
+RESULT SHAPE IS CORE'S, not a reduced one of our own -- package_msg,
+tx-results keyed by wtxid, txid / vsize / vsize_bip141 /
+fees{base, effective-feerate, effective-includes} / error, and Core's own
+"package-not-validated" for members that never got an individual verdict.
+effective-feerate is the aggregate the package was actually evaluated
+against and effective-includes lists every member whose fee went into it, so
+both are reported rather than omitted. "replaced-transactions" is absent,
+which is Core's own convention (the field is optional there); this node does
+not track package-driven RBF evictions.
+
+A BUG THIS FOUND, and the reason the first run returned zero results:
+tx_wtxid in bitcoin_cmpct.asm sets NO return value, but rpc_node.c declared
+it int and checked for 1 -- reading whatever happened to be in rax and
+silently dropping every entry. tests/test_bip152.c had the void declaration
+right all along. Third inconsistent-declaration bug of the day, after the
+implicit declarations in 73d813b and tx_txid's void/int split.
+
+NOT DONE, and not claimed: p2p 1-parent-1-child package RELAY (this is
+submission, not relay), TRUC/v3 and ephemeral dust policy,
+replaced-transactions reporting, and testmempoolaccept's package mode --
+which still evaluates each member independently and says so in its own
+documented divergence.
+
 ## 2026-08-27 -- gettxout answers for real: the RPC asks the download worker
 
 The embedded RPC server lives in the serve PARENT, which has no handle on
