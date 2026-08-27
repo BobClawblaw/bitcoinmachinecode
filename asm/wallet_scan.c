@@ -35,7 +35,8 @@
  *
  * ON-DISK FORMAT -- <path>, appended in height order:
  *
- *     "BMCWSCN2"                        8-byte magic
+ *     "BMCWSCN3"                        8-byte magic ("BMCWSCN2" = no
+ *                                       is_coinbase byte; still readable)
  *     u32 tip_scanned                   highest height covered
  *     u32 n_records
  *     then n_records x 86 bytes:
@@ -44,6 +45,10 @@
  *       u8[32] prev_txid -- on a SPEND, the outpoint that was spent; zero on
  *                           a receive. See wallet_scan.h for why one txid is
  *                           not enough to answer "is this output unspent".
+ *       u8 is_coinbase   -- on a RECEIVE, 1 when the paying tx was its
+ *                           block's first: the coin is unspendable until 100
+ *                           confirmations, and a balance that ignores that
+ *                           overstates what can actually be spent.
  *
  * The header is written LAST, after every record is durable, so a crash
  * mid-scan leaves a file whose header still describes the previous complete
@@ -58,9 +63,19 @@
 #include <string.h>
 #include <unistd.h>
 
-#define WSCAN_MAGIC "BMCWSCN2"
+/* Format 3 adds is_coinbase. An older BMCWSCN2 file is still READ (a forced
+ * rescan of every existing wallet would be a worse trade than a balance that
+ * cannot apply coinbase maturity until the next rescan) -- wscan_flags_known()
+ * reports which one the reader got. */
+#define WSCAN_MAGIC  "BMCWSCN3"
+#define WSCAN_MAGIC2 "BMCWSCN2"
 #define WSCAN_HDR   16
-#define WSCAN_REC   86
+#define WSCAN_REC   87
+#define WSCAN_REC_V2 86
+
+/* Set by wscan_read: whether the file it just read carries is_coinbase. */
+static int g_wscan_flags_known = 0;
+int wscan_flags_known(void){ return g_wscan_flags_known; }
 
 /* ---- owned-outpoint set -------------------------------------------------
  * Open addressing over (txid,vout). Sized by the caller's cap so a wallet
@@ -329,6 +344,7 @@ long wscan_run(long from, long to,
                       for (int k=0;k<4;k++) rec[w++] = (unsigned char)(o->keyidx >> (8*k));
                       rec[w++] = o->branch;
                       memcpy(rec + w, q, 32); w += 32;                /* the SPENT outpoint */
+                      rec[w++] = 0;                                  /* is_coinbase: n/a on a spend */
                       if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto shortwrite;
                       nrec++;
                   }
@@ -359,6 +375,7 @@ long wscan_run(long from, long to,
                       for (int k=0;k<4;k++) rec[w++] = (unsigned char)(kidx >> (8*k));
                       rec[w++] = br;
                       memset(rec + w, 0, 32); w += 32;                /* no prev on a receive */
+                      rec[w++] = (t == 0) ? 1 : 0;                    /* block's first tx = coinbase */
                       if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto shortwrite;
                       nrec++;
                       if (!wscan_set_add(&own, txidbuf, (unsigned int)i, val, kidx, br)){
@@ -413,16 +430,22 @@ long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out){
     FILE* f = fopen(path, "rb");
     if (!f) return 0;                       /* absent == no scan has completed */
     unsigned char hdr[WSCAN_HDR];
-    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr || memcmp(hdr, WSCAN_MAGIC, 8)){
-        fclose(f); return 0;                /* torn or foreign: treat as absent */
+    int v3 = 0;
+    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr){
+        fclose(f); return 0;                /* torn: treat as absent */
     }
+    if      (!memcmp(hdr, WSCAN_MAGIC,  8)) v3 = 1;
+    else if (!memcmp(hdr, WSCAN_MAGIC2, 8)) v3 = 0;   /* older: no is_coinbase */
+    else { fclose(f); return 0; }           /* foreign: treat as absent */
+    g_wscan_flags_known = v3;
+    const unsigned long recsz = v3 ? WSCAN_REC : WSCAN_REC_V2;
     unsigned int tip = 0, n = 0;
     for (int k=0;k<4;k++) tip |= (unsigned int)hdr[8+k]  << (8*k);
     for (int k=0;k<4;k++) n   |= (unsigned int)hdr[12+k] << (8*k);
     if (tip_out) *tip_out = (long)tip;
     long got = 0;
     unsigned char rec[WSCAN_REC];
-    while (got < cap && got < (long)n && fread(rec, 1, WSCAN_REC, f) == WSCAN_REC){
+    while (got < cap && got < (long)n && fread(rec, 1, recsz, f) == recsz){
         unsigned long w = 0;
         wscan_rec* r = &out[got];
         r->height = 0; for (int k=0;k<4;k++) r->height |= (unsigned int)rec[w++] << (8*k);
@@ -433,6 +456,7 @@ long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out){
         r->keyidx = 0; for (int k=0;k<4;k++) r->keyidx |= (unsigned int)rec[w++] << (8*k);
         r->branch = rec[w++];
         memcpy(r->prev_txid, rec + w, 32); w += 32;
+        r->is_coinbase = v3 ? rec[w++] : 0;   /* v2 cannot say; see wscan_flags_known */
         got++;
     }
     fclose(f);

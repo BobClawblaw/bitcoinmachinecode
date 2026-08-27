@@ -44,4 +44,35 @@ int  rpc_wops_own_coin(const void* wallet_seed, const unsigned char txid_wire[32
                        unsigned char h160_out[20]);
 void rpc_wops_reset_locks(void);
 
+/* ---- the wallet's own unspent outputs, from the rescan records ----------
+ * getbalance/listunspent historically answered from the ADDRESS INDEX, an
+ * extension that is OFF by default -- so on a default node a fully funded
+ * wallet reported 0.00000000 and an empty list while walletscan.dat held
+ * every receive. These enumerate the wallet's coins from the scan instead.
+ *
+ * Spent-ness comes from the scan's own SPEND records: a spend stores the
+ * outpoint it consumed as (prev_txid, vout), so a receive is unspent when no
+ * spend names it. The live UTXO set would also answer this, but the embedded
+ * RPC server holds no handle on it (only the standalone rpcd does), and the
+ * download worker writes that store from another process -- casual reads are
+ * not safe there. The scan is self-contained and always available.
+ *
+ * Coinbase maturity uses the per-record flag, which only a format-3 scan
+ * carries; wscan_flags_known() says whether the file could answer.
+ *
+ * Returns the number written (capped at cap), or -1 when no rescan has
+ * completed -- which callers must report as an error, never as a zero
+ * balance (they are not the same answer). */
+typedef struct {
+    unsigned char      txid[32];      /* WIRE order */
+    unsigned int       vout;
+    unsigned long long value;
+    unsigned long      height;
+    int                is_coinbase;
+    unsigned char      h160[20];      /* the wallet key that owns it */
+    unsigned char      branch;        /* 0 receive, 1 change */
+} rpc_wops_coin;
+
+int rpc_wops_wallet_coins(const void* wallet_seed, rpc_wops_coin* out, int cap);
+
 #endif

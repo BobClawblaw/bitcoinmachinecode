@@ -1242,6 +1242,46 @@ int rpc_wops_own_coin(const void* wseed, const unsigned char txid_wire[32], unsi
     return 0;
 }
 
+/* See rpc_wallet_ops.h. A receive is unspent when no SPEND record names its
+ * outpoint -- a spend stores the outpoint it consumed as (prev_txid, vout).
+ * Deliberately self-contained: the embedded RPC server has no UTXO handle
+ * (only the standalone rpcd installs one) and the download worker writes
+ * that store from another process, so the scan is the only source here that
+ * is both available and safe.
+ *
+ * Returns -1 when no rescan has completed. A caller must NOT turn that into
+ * 0.00000000: "I have not looked" and "you have nothing" are different
+ * answers, and only one of them is true. */
+int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
+    if (!out || cap <= 0) return 0;
+    rpc_wallet w; memset(&w, 0, sizeof w); w.seed = (const unsigned char*)wseed;
+    const wscan_key* keys; int nk = wop_keyset_cached(&w, &keys);
+    wscan_rec* recs; long n = wop_records(&recs);
+    if (g_wop_tipscanned < 0) return -1;          /* no scan has completed */
+    int m = 0;
+    for (long i = 0; i < n && m < cap; i++){
+        if (recs[i].kind != 0) continue;          /* receives only */
+        int spent = 0;
+        for (long j = 0; j < n; j++){
+            if (recs[j].kind != 1) continue;
+            if (recs[j].vout == recs[i].vout &&
+                !memcmp(recs[j].prev_txid, recs[i].txid, 32)){ spent = 1; break; }
+        }
+        if (spent) continue;
+        rpc_wops_coin* c = &out[m];
+        memcpy(c->txid, recs[i].txid, 32);
+        c->vout   = recs[i].vout;
+        c->value  = recs[i].value;
+        c->height = recs[i].height;
+        c->is_coinbase = recs[i].is_coinbase ? 1 : 0;
+        c->branch = recs[i].branch;
+        memset(c->h160, 0, 20);
+        if (keys) wop_rec_h160(keys, nk, &recs[i], c->h160);
+        m++;
+    }
+    return m;
+}
+
 /* rescanblockchain ( start_height stop_height ) */
 static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
                                 long* ec, const char** em, rj_val** res){
