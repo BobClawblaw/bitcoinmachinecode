@@ -651,6 +651,21 @@ static int worst_package(void* st){
 /* ========================================================================== */
 /* ADD: atomic policy gate + structural store + bookkeeping                   */
 /* ========================================================================== */
+/* The txids this add REPLACED, for submitpackage's replaced-transactions.
+ * The eviction set is built inside the RBF check and was then used and
+ * discarded, so an accepted replacement could not say what it displaced --
+ * Core reports exactly this list, so the information has to survive the
+ * call. Reset at the top of every add: a stale list would credit one
+ * transaction with a previous transaction's replacements. */
+static unsigned char _mpol_replaced[MPOL_MAX_REPLACEMENTS + MPOL_PKG_MAX][32];
+static int _mpol_replaced_n;
+
+int mpol_last_replaced(unsigned char* out, int cap){
+    int n = _mpol_replaced_n < cap ? _mpol_replaced_n : cap;
+    if (out && n > 0) memcpy(out, _mpol_replaced, (size_t)n * 32);
+    return n;
+}
+
 static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                           const unsigned char* tx, unsigned long txlen,
                           const unsigned char txid[32], void* utxo,
@@ -658,6 +673,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     static unsigned char prev[MPOL_MAX_IN][32];
     static uint32_t idx[MPOL_MAX_IN], seq[MPOL_MAX_IN];
     mpol_txmeta meta;
+    _mpol_replaced_n = 0;
     int n_in = parse_tx(tx, txlen, prev, idx, seq, &meta);
     if (n_in <= 0){ _mpol_last_reason = "malformed transaction"; return 0; }
     uint64_t vsize = meta.vsize;
@@ -841,6 +857,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
         if (ci >= 0) remove_node(st, mp, ci);
+        /* recorded whether or not the node was still present: it is in the
+         * eviction set because this transaction conflicts with it */
+        if (_mpol_replaced_n < (int)(sizeof _mpol_replaced / 32))
+            memcpy(_mpol_replaced[_mpol_replaced_n++], evict_set[e], 32);
     }
     /* the eviction may have invalidated the ancestor INDEX list; parents are
      * re-found below by txid via prev[] when linking, so recompute par_idx. */
