@@ -65,3 +65,7 @@ t_fullfuzz_fixed
 t_fullfuzz_old
 t_full_old
 t_repro
+ibd
+ibd_lsm
+build_utxo
+live_blocks

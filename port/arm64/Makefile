@@ -163,6 +163,12 @@ IBDOBJS = bitcoin_net.o bitcoin_p2p.o bitcoin_hash.o sha256.o bitcoin_headers.o 
           sha1.o ripemd160.o node_log.o
 ibd: ibd.c $(IBDOBJS)
 	$(CC) $(CFLAGS) -o ibd ibd.c $(IBDOBJS)
+# resumable LSM-backed downloader: ibd.c networking/cons + build_utxo.c LSM path
+# (bitcoin_utxo_lsm.o + utxo_lsm_mm.o). Resumes at archive tip+1 via
+# utxo_lsm_reload. Handles utxo_lsm_put's .full (2) with flush+retry.
+IBDLSMOBJS = $(IBDOBJS) bitcoin_utxo_lsm.o utxo_lsm_mm.o
+ibd_lsm: ibd_lsm.c $(IBDLSMOBJS)
+	$(CC) $(CFLAGS) -o ibd_lsm ibd_lsm.c $(IBDLSMOBJS)
 fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 	python3 fuzz_all.py && python3 fuzz_sc.py 1 400 && python3 fuzz_fe.py 1 400 && python3 fuzz_point.py ./fz_point 500 2024 && python3 fuzz_ecdsa.py ./fz_ecdsa 300 2024 && python3 fuzz_schnorr.py ./fz_schnorr 80 2024 && python3 fuzz_sighash.py 1 3000
 
