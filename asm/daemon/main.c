@@ -838,9 +838,36 @@ static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
  * steady-state leg fill and mux_next_peer) runs OUTSIDE any enclosing alarm. */
 #define OUTBOUND_DIAL_BUDGET_SECS 20
 
+/* ---- why the last dial failed -------------------------------------------
+ * tcp_connect_ip (bitcoin_net.asm) deliberately returns the raw -errno "for
+ * diagnosis", and outbound_connect used to throw it away with `return -1`, so
+ * every caller could say no more than "unreachable". On 2026-08-27 a host
+ * freeze took all 8 legs down and then EVERY redial failed for 8 minutes
+ * straight; the log could not distinguish a dead network (ENETUNREACH) from
+ * fd exhaustion (EMFILE) from a peer refusing us (ECONNREFUSED) -- the
+ * difference between "the box is sick" and "the node is leaking descriptors".
+ * The information already existed, it was just discarded. Set on every
+ * failure path here, read by dial_fail_reason() at the call sites. */
+static char g_dial_fail[96] = "";
+static const char* dial_fail_reason(void){
+    return g_dial_fail[0] ? g_dial_fail : "unknown";
+}
+/* -rc is the raw -errno from tcp_connect_ip; render it, falling back to the
+ * number when it is not a value strerror knows. */
+static void dial_fail_errno(const char* what, int rc){
+    int e = -rc;
+    const char* m = (e > 0 && e < 200) ? strerror(e) : NULL;
+    if(m) snprintf(g_dial_fail, sizeof g_dial_fail, "%s: %s", what, m);
+    else  snprintf(g_dial_fail, sizeof g_dial_fail, "%s: rc=%d", what, rc);
+}
+
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
+    g_dial_fail[0] = 0;
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(host,NULL,&h,&res)!=0) return -1;
+    if(getaddrinfo(host,NULL,&h,&res)!=0){
+        snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
+        return -1;
+    }
     unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);
 
@@ -866,10 +893,18 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     mux_sync_budget_fired = saved_fired;
     sigaction(SIGALRM,&old,NULL);
 
-    if(fd<0) return -1;
+    if(fd<0){ dial_fail_errno("connect", fd); return -1; }
     if(fired || hk!=1 || !peer_has_witness(host)){
-        if(fired) fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
-                          host, OUTBOUND_DIAL_BUDGET_SECS);
+        if(fired){
+            snprintf(g_dial_fail,sizeof g_dial_fail,"dial budget %ds exceeded",
+                     OUTBOUND_DIAL_BUDGET_SECS);
+            fprintf(stderr,"[dial] %s exceeded %ds dial budget; dropping\n",
+                    host, OUTBOUND_DIAL_BUDGET_SECS);
+        } else if(hk!=1){
+            snprintf(g_dial_fail,sizeof g_dial_fail,"handshake failed (rc=%d)", hk);
+        } else {
+            snprintf(g_dial_fail,sizeof g_dial_fail,"peer lacks NODE_WITNESS");
+        }
         close(fd);
         return -1;
     }
@@ -1141,7 +1176,8 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
           return;
       } }
     int fd = outbound_connect(peers[p], 300, out_port);
-    if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable (leg stays down)\n", i, peers[p]); return; }
+    if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down)\n",
+                     i, peers[p], dial_fail_reason()); return; }
     mux_out_fd[i]=fd;
     strncpy(mux_out_host[i], peers[p], 63);
     anchor_locator(mux_out_loc[i]);
@@ -3331,6 +3367,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * (rate-limited) instead of giving up at the initial dial. Uses the
          * proven outbound_connect path (works for reachable peers). */
         if(mux_n_out < MUX_WANT_OUT() && (rot % 8)==0){
+            /* ONE summary line per pass, not one per candidate: this loop walks
+             * the whole live pool (up to nsrc) when nothing connects, so a
+             * per-candidate log would flood exactly when the node is sickest. */
+            int topup_fail = 0; char topup_why[160] = "";
             for(int ci=0; ci<nsrc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
                 if(mux_n_out>=MUX_WANT_OUT()) break;
                 int already=0;
@@ -3348,8 +3388,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
                     mux_n_out++;
                 }
+                else { if(!topup_fail++) snprintf(topup_why,sizeof topup_why,"%s: %s",
+                                                  srcpool[ci], dial_fail_reason()); }
                 /* if outbound_connect to this one hung/refused, move on to next */
             }
+            if(topup_fail)
+                fprintf(stderr,"[dl] outbound top-up: %d dial(s) failed, first %s\n",
+                        topup_fail, topup_why);
         }
     }
 }
@@ -3623,7 +3668,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * read past the pool (it may be smaller than nwant). */
     for(int i=0;i<nwant && i<pool_len && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
-        if(fd<0){ fprintf(stderr,"[mux] outbound %s failed\n", peers[i]); continue; }
+        if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 63);
         mux_out_fd[mux_n_out]=fd;
         mux_out_peer[mux_n_out]=i;

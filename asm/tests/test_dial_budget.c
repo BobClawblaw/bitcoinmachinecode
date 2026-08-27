@@ -67,11 +67,49 @@ int main(void){
     if(fd >= 0){ printf("FAIL: expected -1 (the peer never completes a handshake)\n"); failures++; }
     else printf("PASS: rejected the trickling peer (got %.2fs)\n", el);
 
+    /* The budget path must SAY it was the budget -- before this, every dial
+     * failure logged the same bare "unreachable" regardless of cause. */
+    if(fd < 0){
+        const char* why = dial_fail_reason();
+        if(strstr(why, "dial budget") == NULL){
+            printf("FAIL: budget expiry reported as \"%s\", expected a dial-budget reason\n", why);
+            failures++;
+        } else printf("PASS: budget expiry is self-describing (\"%s\")\n", why);
+    }
+
     /* Generous ceiling: we assert the budget BOUNDS the dial, not its exact
      * value. Unfixed, this call does not return anywhere near this quickly. */
     double ceiling = OUTBOUND_DIAL_BUDGET_SECS + 10.0;
     if(el > ceiling){ printf("FAIL: took %.2fs, over the %.0fs ceiling -- dial not bounded\n", el, ceiling); failures++; }
     else printf("PASS: dial bounded by the budget (got %.2fs, ceiling %.0fs)\n", el, ceiling);
+
+    /* ---- a REFUSED dial carries its errno through ------------------------
+     * tcp_connect_ip returns the raw -errno; the whole point of this change is
+     * that outbound_connect no longer flattens it to -1. Bind a port, close it,
+     * and dial the corpse: connect() gives ECONNREFUSED and the reason string
+     * must say so. This is the case that would have made the 2026-08-27 dial
+     * storm readable at a glance. */
+    {
+        int t = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in b; memset(&b,0,sizeof b);
+        b.sin_family=AF_INET; b.sin_addr.s_addr=htonl(INADDR_LOOPBACK); b.sin_port=0;
+        bind(t,(struct sockaddr*)&b,sizeof b);
+        socklen_t bl=sizeof b; getsockname(t,(struct sockaddr*)&b,&bl);
+        int dead_port = ntohs(b.sin_port);
+        close(t);                       /* nothing listens there now */
+
+        printf("\n---- a refused dial reports its errno (port %d) ----\n", dead_port);
+        int rfd = outbound_connect("127.0.0.1", 300, dead_port);
+        if(rfd >= 0){ printf("FAIL: expected the dial to fail\n"); failures++; close(rfd); }
+        else {
+            const char* why = dial_fail_reason();
+            const char* want = strerror(ECONNREFUSED);
+            if(strstr(why, want) == NULL){
+                printf("FAIL: reported \"%s\", expected it to name \"%s\"\n", why, want);
+                failures++;
+            } else printf("PASS: refused dial names the errno (\"%s\")\n", why);
+        }
+    }
 
     if(failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");
