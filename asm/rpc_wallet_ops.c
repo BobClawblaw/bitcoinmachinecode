@@ -462,17 +462,70 @@ static int cmd_gethdkeys(const rj_val* params, const rpc_wallet* w, rj_val** res
  * These are not refusals. This node's wallet IS unencrypted, and the answers
  * below are byte-for-byte what Core returns for an unencrypted wallet --
  * verified against the oracle. encryptwallet is the one real gap. */
+/* wallet encryption state machine (daemon/wallet_enc_state.c) */
+extern int  wenc_is_encrypted(void);
+extern int  wenc_encrypt(const char* mn, const char* mn_pass, const char* wpass, long wplen);
+extern int  wenc_unlock(const char* pass, long plen, long seconds);
+extern void wenc_lock(void);
+extern int  wenc_change(const char* oldp, long ol, const char* newp, long nl);
+/* the loaded mnemonic, exposed by the daemon so encryptwallet can seal it */
+extern int  wenc_current_mnemonic(char* out, long cap, char* pass_out, long pcap);
+
 static int cmd_walletlock(long* ec, const char** em){
-    return wop_err(ec, em, -15,
-        "Error: running with an unencrypted wallet, but walletlock was called.");
+    if (!wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an unencrypted wallet, but walletlock was called.");
+    wenc_lock();
+    return 1;   /* Core returns null on success */
 }
-static int cmd_walletpassphrase(long* ec, const char** em){
-    return wop_err(ec, em, -15,
-        "Error: running with an unencrypted wallet, but walletpassphrase was called.");
+static int cmd_walletpassphrase(const rj_val* params, long* ec, const char** em){
+    if (!wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an unencrypted wallet, but walletpassphrase was called.");
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 ||
+        params->items[0]->typ != RJ_STR || params->items[1]->typ != RJ_NUM)
+        return wop_err(ec, em, -8, "walletpassphrase(passphrase, timeout)");
+    const char* pass = params->items[0]->str;
+    long secs = atol(params->items[1]->str);
+    if (secs <= 0) return wop_err(ec, em, -8, "Timeout must be a positive integer");
+    if (wenc_unlock(pass, (long)strlen(pass), secs) != 1)
+        return wop_err(ec, em, -14,
+            "Error: The wallet passphrase entered was incorrect.");
+    return 1;
 }
-static int cmd_walletpassphrasechange(long* ec, const char** em){
-    return wop_err(ec, em, -15,
-        "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
+static int cmd_walletpassphrasechange(const rj_val* params, long* ec, const char** em){
+    if (!wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
+    if (!params || params->typ != RJ_ARR || params->nitems < 2 ||
+        params->items[0]->typ != RJ_STR || params->items[1]->typ != RJ_STR)
+        return wop_err(ec, em, -8, "walletpassphrasechange(old, new)");
+    const char* op = params->items[0]->str;
+    const char* np = params->items[1]->str;
+    if (wenc_change(op, (long)strlen(op), np, (long)strlen(np)) != 1)
+        return wop_err(ec, em, -14,
+            "Error: The wallet passphrase entered was incorrect.");
+    return 1;
+}
+static int cmd_encryptwallet(const rj_val* params, const rpc_wallet* w,
+                             long* ec, const char** em, rj_val** res){
+    if (wenc_is_encrypted())
+        return wop_err(ec, em, -15,
+            "Error: running with an encrypted wallet, but encryptwallet was called.");
+    if (!w || !w->seed)
+        return wop_err(ec, em, -4, "Error: the wallet is not loaded, cannot encrypt");
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR)
+        return wop_err(ec, em, -8, "encryptwallet(passphrase)");
+    const char* pass = params->items[0]->str;
+    if (strlen(pass) < 1) return wop_err(ec, em, -8, "passphrase can not be empty");
+    static char mn[768], mp[256];
+    if (wenc_current_mnemonic(mn, sizeof mn, mp, sizeof mp) != 1)
+        return wop_err(ec, em, -4, "Error: could not read the wallet mnemonic to encrypt");
+    int r = wenc_encrypt(mn, mp[0]?mp:0, pass, (long)strlen(pass));
+    memset(mn, 0, sizeof mn); memset(mp, 0, sizeof mp);
+    if (r != 1) return wop_err(ec, em, -4, "Error: failed to write the encrypted wallet");
+    *res = rj_str("wallet encrypted; The wallet is now locked. Use walletpassphrase to unlock it.");
+    return 1;
 }
 
 /* ==== rescan state =======================================================
@@ -1795,10 +1848,9 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "gethdkeys"))           return cmd_gethdkeys(params, w, res);
 
     if (!strcmp(m, "walletlock"))              return cmd_walletlock(ec, em);
-    if (!strcmp(m, "walletpassphrase"))        return cmd_walletpassphrase(ec, em);
-    if (!strcmp(m, "walletpassphrasechange"))  return cmd_walletpassphrasechange(ec, em);
-
-    if (!strcmp(m, "encryptwallet"))       return wop_unsupported(WOP_NO_ENCRYPTION, ec, em);
+    if (!strcmp(m, "walletpassphrase"))        return cmd_walletpassphrase(params, ec, em);
+    if (!strcmp(m, "walletpassphrasechange"))  return cmd_walletpassphrasechange(params, ec, em);
+    if (!strcmp(m, "encryptwallet"))           return cmd_encryptwallet(params, w, ec, em, res);
     if (!strcmp(m, "createwallet") || !strcmp(m, "loadwallet") ||
         !strcmp(m, "unloadwallet") || !strcmp(m, "restorewallet") ||
         !strcmp(m, "migratewallet") || !strcmp(m, "setwalletflag"))

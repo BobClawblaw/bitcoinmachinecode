@@ -441,13 +441,18 @@ int main(void){
 
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
     { static const char* REFUSE[] = {
-        "encryptwallet","createwallet","loadwallet","unloadwallet","restorewallet",
+        "createwallet","loadwallet","unloadwallet","restorewallet",
         "migratewallet","setwalletflag","importdescriptors","createwalletdescriptor",
         "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet",
         "bumpfee","psbtbumpfee" };
       /* walletprocesspsbt left this list 2026-08-26: it is REAL now (the
        * Signer role by delegation, rpc_commands.c); its no-params behaviour
-       * is an ordinary -8/-4, covered by test_rpc_psbtfinal */
+       * is an ordinary -8/-4, covered by test_rpc_psbtfinal.
+       * encryptwallet left this list 2026-08-27: it is REAL now
+       * (daemon/wallet_enc_state.c); its no-params behaviour is an ordinary
+       * -8, asserted just below, and the seal/open round-trip is proven in
+       * test_wallet_crypter. walletlock/walletpassphrase/walletpassphrasechange
+       * are asserted above (-15 on an unencrypted wallet). */
       int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
       for (int i = 0; i < n; i++){
           D(REFUSE[i], NULL);
@@ -458,6 +463,11 @@ int main(void){
           rj_free(r);
       }
       ck("every unsupported wallet method errors with a substantive reason", allbad);
+      /* encryptwallet is wired (daemon/wallet_enc_state.c): with no passphrase
+       * argument it is an ordinary parameter error, not a stub refusal. */
+      { D("encryptwallet", NULL);
+        ck("encryptwallet with no passphrase -> -8 (wired, not a stub)", rc == 0 && ec == -8);
+        rj_free(r); }
       /* walletdisplayaddress is implemented now (rpc_signer.c): with no
        * signer configured it answers Core's exact restart message */
       { rj_val* pp = P("[\"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\"]");
