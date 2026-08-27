@@ -949,6 +949,13 @@ int main(void){
         static unsigned char ux[40 + 4096*48 + 8], ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+        /* the CPFP fixtures below are synthetic ~61-byte legacy txs --
+         * deliberately non-standard (tx-size-small, empty scriptSig); run
+         * under Core's own regtest escape hatch (-acceptnonstdtxn) so this
+         * section keeps testing PACKAGE SELECTION, not IsStandardTx (same
+         * treatment as tests/test_mempool_evict.c). */
+        { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+          mpool_policy_set_acceptnonstd(pol, 1); }
         mpool_policy_state_init(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);

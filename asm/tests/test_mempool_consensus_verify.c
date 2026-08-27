@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../daemon/node_config.h"
 #include <unistd.h>
 #include "test_tmpdir.h"
 
@@ -109,6 +110,10 @@ int main(void){
     seed_utxos(seeds, 2);
 
     if (!tx_dispatch_init()){ fprintf(stderr, "tx_dispatch_init failed\n"); return 1; }
+    /* fixtures exercise the CONSENSUS verifier with synthetic scripts; run
+     * policy under Core's regtest escape hatch (-acceptnonstdtxn) so
+     * standardness does not mask the verifier verdicts under test. */
+    { extern node_config_t g_cfg; g_cfg.acceptnonstdtxn = 1; }
     if (!tx_policy_init()){ fprintf(stderr, "tx_policy_init failed\n"); return 1; }
     mpool_init(mp_area, 1024, mp_blob, sizeof mp_blob);
     tx_accept_set_tip(500);                    /* both coins deeply confirmed */
