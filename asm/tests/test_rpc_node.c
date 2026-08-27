@@ -951,12 +951,21 @@ int main(void){
         rj_free(r); rj_free(q); }
       rpc_node_set_status_rw(NULL); }
 
-    /* submitpackage / private broadcast name their gaps */
+    /* submitpackage is REAL since 2026-08-27, so what is pinned here is its
+     * PARAMETER surface, which must answer the same way in any build: the
+     * package-validation refusal this used to assert is gone. */
     { r = NULL; ec = 0; em = NULL;
       rc = rpc_node_dispatch("submitpackage", NULL, &r, &ec, &em);
-      ck("submitpackage -> -1 naming the missing package validation",
-         rc == 0 && ec == -1 && em && strstr(em, "package validation"));
+      ck("submitpackage with no package -> -8", rc == 0 && ec == -8);
       rj_free(r);
+      { rj_val* big = rj_arr(); rj_val* outer = rj_arr();
+        for (int i = 0; i < 26; i++) rj_arr_push(big, rj_str("00"));
+        rj_arr_push(outer, big);
+        r = NULL; ec = 0; em = NULL;
+        rc = rpc_node_dispatch("submitpackage", outer, &r, &ec, &em);
+        ck("submitpackage with 26 transactions -> -8 (Core caps at 25)",
+           rc == 0 && ec == -8);
+        rj_free(r); rj_free(outer); }
       r = NULL; ec = 0; em = NULL;
       rc = rpc_node_dispatch("getprivatebroadcastinfo", NULL, &r, &ec, &em);
       ck("getprivatebroadcastinfo -> -1 naming the missing queue",
