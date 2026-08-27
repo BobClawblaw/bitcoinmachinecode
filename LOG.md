@@ -51,6 +51,66 @@ wallet respent a freshly-funded output mid-test and BOTH sides reported the
 resulting zero balance -- the assertion was wrong, not the index.
 tests/test_addr_index_tail (15 checks) covers the journal semantics
 hermetically. Full make -k test green: 190 suites.
+## 2026-08-27 -- Mining polish: ancestor-package templates, exact sigops, BIP23 proposals, longpoll
+
+getblocktemplate closes its four documented gaps against Core (stratum stays
+out of scope -- a pool-facing protocol, not a Core RPC).
+
+ANCESTOR-PACKAGE SELECTION (rpc_chain.c): template txs are now chosen by
+Core's addPackageTxs rule -- repeatedly take the candidate whose ancestor
+package (its not-yet-selected in-pool ancestors + itself) has the highest
+package feerate, emit it parents-first, under Core's weight/sigop budgets
+(4M/80k minus the 4000/400 coinbase reservation). CPFP falls out: a high-fee
+child lifts its cheap parent in ahead of better standalone txs. The policy
+bridge grew anc_size (summed in the same BFS as anc_fee) to make the package
+feerate computable. Unit-proven in test_rpc_chain: a 3-tx pool laid out
+[M, P, C] in slot order (the old emitter's order) must template as [P, C, M]
+with C.depends=[P] and coinbasevalue carrying all 7000 sat of fees.
+Divergence, documented at the call site: score-equal ties break by txid, not
+Core's internal iterator order.
+
+EXACT SIGOPS: the template's per-tx "sigops" was a legacy-x4 lower bound
+(no prevout view at render time). Now the BIP141 cost -- legacy x4 + P2SH
+redeem (accurate) x4 + witness x1 (P2WPKH=1, P2WSH=accurate over the last
+witness item, v1+ = 0) -- is computed ONCE at accept time in tx_accept.c,
+where the resolver has every prevout script in hand, and stored in the
+policy registry node (mpool_policy_set_sigops); the template reads it back.
+Registry nodes without the stamp fall back to the old lower bound.
+
+BIP23 PROPOSAL MODE: getblocktemplate {"mode":"proposal","data":...}
+evaluates through the worker's submitblock staging channel with a proposal
+flag: PoW is NOT checked (Core TestBlockValidity fCheckPOW=false -- the
+template is unmined), prev != tip answers Core's exact
+"inconclusive-not-best-prevblk", and a valid proposal NEVER connects.
+blk_submit_evaluate grew a check_pow parameter (the old entry delegates).
+
+LONGPOLL: templates already carried longpollid (tiphash+counter); a request
+CARRYING one now blocks until the tip moves. The RPC server's accept loop is
+deliberately serial, so a longpoll request is handed to a detached waiter
+thread that polls the tip through a shared-state-free primitive (pread of
+index.dat's last record) and re-enters the SERIAL path through the new
+handler mutex only after the tip differs from the longpollid's embedded
+prev-hash (or 60s). Divergence, documented: Core also wakes on substantial
+mempool change; this wakes on tip change/timeout only.
+
+MINED-TX PRUNE (found by the differential, fixed because templates depend on
+it): the normal block-apply path never removed CONFIRMED txs from the shared
+mempool -- only the reorg reconnect path did. bmc's pool held 11 long-mined
+txs the oracle had dropped, and any of them would have made a template
+double-spend. utxo_live.c now fires a mined-tx callback per applied block's
+txids; the worker's hook mpool_del's them from the shared pool under the
+cross-process lock (the policy registry keeps its stale nodes by design --
+every reader already filters against the pool).
+
+DIFFERENTIAL (vs the scratch Core regtest oracle, 15/15): identical template
+tx sets and per-tx fees; per-tx sigops identical INCLUDING a P2SH
+0-of-1-CHECKMULTISIG spend (cost 4) and a P2WSH 0-of-2 spend (cost 2);
+parent-before-child on both nodes for a CPFP pair; equal coinbasevalue;
+valid proposal -> null on BOTH nodes, corrupted merkle ->
+"bad-txnmrklroot" on both, corrupted prev -> "inconclusive-not-best-prevblk"
+on both (verbatim); a longpoll pending at 4s returned only after the next
+block with the new height; both pools empty after the mine (the prune,
+live).
 
 ----------------------------------------------------------------------------
 ## 2026-08-27 -- Regtest chain selection: chain=regtest, differentially proven against Core
