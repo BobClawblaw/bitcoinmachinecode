@@ -185,8 +185,13 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
-  2026-08-27 the live binary is **`bitcoind.deploy-20260827aa`**; the
-  rollback one step back is `…-20260827z`.
+  2026-08-27 the live binary is **`bitcoind.deploy-20260827ab`**; the
+  rollback one step back is `…-20260827aa`.
+
+  These snapshots are NOT in git (they are ~31 MB build products, and a
+  `git add -A` once swept twenty of them plus a scratch datadir into a
+  commit — see `.gitignore`). They live on the host, which is the whole
+  point: the rollback path must not depend on the network.
 
   NOTE ON BOOT TIME from `z` onward: boot now includes a ~60 s
   `[boot] tx-validation snapshot ready (61.49s)` step. That is deliberate --
@@ -196,7 +201,22 @@ count, uptime.
   for a minute there is working as intended; the line is printed when it
   finishes.
 
-  The seven that changed live behaviour most, newest first:
+  The eight that changed live behaviour most, newest first:
+  - **`ab`** (`e9b0d93`) — `getrawtransaction` falls back to the mempool,
+    which is Core's order and what its help promises ("by default, this call
+    only returns a transaction if it is in the mempool"). Before this it
+    consulted only the OFFLINE txid index, so an unconfirmed transaction —
+    the common case the call is reached for — came back `-5`, with a message
+    about index coverage that was true and beside the point. Found while
+    verifying deploy `aa` on the live node.
+
+    Verified live on five real unconfirmed mainnet transactions: each
+    returned serialization hashes to the txid that was asked for. The verbose
+    form on an unconfirmed transaction carries no `blockhash`,
+    `confirmations`, `time`, `blocktime` or `in_active_chain` — an
+    unconfirmed transaction is in no block, and filling any of those in
+    asserts a confirmation that has not happened. A confirmed transaction
+    still carries its block context.
   - **`aa`** (`9404ffb`) — package relay, closed end to end: p2p 1p1c
     relay, BIP431 TRUC/v3, ephemeral dust, `replaced-transactions`, and
     `testmempoolaccept` package mode; plus `exportwatchonlywallet` and the
