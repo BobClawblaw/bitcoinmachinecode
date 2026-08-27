@@ -759,6 +759,25 @@ static int bip30_enforced(long height, const u8 hash32[32])
  * Reset on entry; only meaningful right after a 0 return. */
 static const char* g_last_reject = "";
 const char* utxo_live_last_reject(void){ return g_last_reject; }
+
+/* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
+ * The RPC server runs in the serve PARENT and has no handle on this state --
+ * the download worker (this process) owns it. Called ONLY from the worker's
+ * quiescent service point, where no put/del/flush is in flight: utxo_lsm_get
+ * is thread-safe by itself but this module guarantees get() and flush() never
+ * overlap by construction, and that guarantee is what keeps this sound.
+ * Returns 1 found / 0 absent, and borrows the script from the LSM's own
+ * per-thread buffer -- the caller must copy it before the next call. */
+long utxo_live_lsm_get(const u8 txid_wire[32], unsigned int vout,
+                       u64* value, unsigned long* height, unsigned long* is_coinbase,
+                       const u8** script, unsigned long* slen){
+    extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
+                             unsigned long* height, unsigned long* is_coinbase,
+                             const u8** script, unsigned long* slen);
+    if (!g_utxo_table) return 0;
+    return utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid_wire, (u32)vout,
+                        value, height, is_coinbase, script, slen) == 1 ? 1 : 0;
+}
 /* Dry-run mode: run every verification phase (0 through 4) and STOP at the
  * Phase 5 boundary -- the first mutation -- returning 1. The whole point is
  * that this is the SAME code path a real apply takes, so a dry-run pass
