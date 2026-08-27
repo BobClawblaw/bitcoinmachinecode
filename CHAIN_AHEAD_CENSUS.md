@@ -1,5 +1,12 @@
 # Census: the un-replayed chain vs the verifier's limits
 
+> **Status 2026-08-27 (historical document).** The premise below — a chain
+> "ahead" of the verifier — is closed: the node replayed the whole chain to
+> the live tip and its UTXO set is proven byte-identical to Core's (MuHash).
+> The one hard wall flagged here (`TXV_MAX_WIT_ITEMS`) was raised before the
+> replay reached it; every shape below has since validated on real chain data.
+> Kept as the record of how the walls were found before they were hit.
+
 Written 2026-08-22, while the Stage D replay sat at height 498,786. Purpose:
 after a run of "first occurrence in history" consensus bugs (incidents
 #10–#15 in `LOG.md`), stop discovering walls one at a time. This samples the

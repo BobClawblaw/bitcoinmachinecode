@@ -1,5 +1,14 @@
 # Benchmarks — bitcoinmachinecode vs Bitcoin Core
 
+**Scope note 2026-08-27.** Nothing below is invalidated by the 08-26/08-27
+work either. The Core-style mempool (feerate eviction + dynamic minfee, LOG.md
+2026-08-27) changed the *tx-accept* path, not any benchmarked hot path (block
+verification, hashing, secp256k1, UTXO I/O); eviction runs only when the
+300 MB pool is full. Regtest chain selection adds one predicted branch to the
+P2P framing and script-flag paths (a runtime dword/selector load), unmeasurable
+against verify cost. The full-verification IBD benchmark vs Core (Tier 3) is
+still the one like-for-like comparison not yet run.
+
 **Scope note 2026-08-25.** Nothing below is invalidated by the day's changes
 (RPC surface, shared mempool, parity capstone) — no measured hot path was
 altered. Two new operation costs worth knowing that are NOT benchmarked
