@@ -50,7 +50,11 @@ class Peer:
             except OSError:
                 return None, None
             if not chunk:
-                return None, None
+                # the peer hung up: a fact, not silence. Core disconnects on
+                # several protocol violations (handshake-only messages after
+                # verack) and a report that could not tell that from "ignored"
+                # would call both nodes equal when they are not.
+                return '<disconnected>', b''
             self.buf += chunk
 
     def drain(self, secs=1.5):
@@ -60,6 +64,7 @@ class Peer:
             cmd, pl = self.recv_one(deadline)
             if cmd is None: return out
             out.append((cmd, pl))
+            if cmd == '<disconnected>': return out
 
 def version_payload(magic):
     return (struct.pack('<iQq', 70016, 9, int(time.time()))
@@ -116,6 +121,9 @@ def build_probes(tip_hash_le, tip_height):
     ('sendtxrcncl',   'sendtxrcncl',  struct.pack('<IQ', 1, 0), ()),
     ('wtxidrelay',    None,           None, (('wtxidrelay', b''),)),
     ('sendaddrv2',    None,           None, (('sendaddrv2', b''),)),
+    # the same two AFTER verack: handshake-only, Core disconnects
+    ('sendaddrv2_late', 'sendaddrv2', b'', ()),
+    ('wtxidrelay_late', 'wtxidrelay', b'', ()),
 ]
 
 def probe(host, port, magic, tip_hash_le=ZERO32, tip_height=0, wait=2.0):
