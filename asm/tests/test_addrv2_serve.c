@@ -44,9 +44,8 @@ extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
 extern long p2p_write(int, const char*, unsigned, const void*, unsigned);
 extern int  p2p_read(int, char[12], void*, unsigned, unsigned*);
-extern int  amr_init(void* ab);
-extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
 extern long g_peer_wants_addrv2;
+#include "../daemon/addrbook.h"
 
 static int failures=0;
 static void ck(const char*l,int ok){ if(ok) printf("PASS %s\n",l); else{ printf("FAIL %s\n",l); failures++; } }
@@ -77,24 +76,28 @@ static void build_store(void){
     store_append(stbuf, bh, BLOCK_RAW, (long)sizeof BLOCK_RAW);
     idx_init(idx, 64); idx_put(idx, bh, 0);
 }
+/* the version-2 book (peers2.dat) in the test's private CWD */
+static void book_reset(void){ unlink("peers.dat"); unlink("peers2.dat"); }
+static void book_add(const char* hostport, unsigned long long svc, unsigned seen){
+    ab2_t* b = ab2_open(".", 1); bmc_addr_t a;
+    if (b && bmc_addr_from_string_port(&a, hostport, 0)) ab2_add(b, &a, svc, seen);
+    ab2_close(b);
+}
 static void book3(void){
-    unlink("peers.dat");
-    static unsigned char ab[64]; amr_init(ab);
-    unsigned ip;
-    inet_pton(AF_INET,"5.6.7.8",&ip);     amr_add(ab, ip, htons(8333), 9,     1700000000u);
-    inet_pton(AF_INET,"9.10.11.12",&ip);  amr_add(ab, ip, htons(8333), 1,     1700000001u);
-    inet_pton(AF_INET,"200.1.2.3",&ip);   amr_add(ab, ip, htons(8334), 0x409, 1700000002u);
-    close(*(int*)ab);
+    book_reset();
+    book_add("5.6.7.8:8333", 9, 1700000000u);
+    book_add("9.10.11.12:8333", 1, 1700000001u);
+    book_add("200.1.2.3:8334", 0x409, 1700000002u);
 }
 static void book1200(void){
-    unlink("peers.dat");
-    static unsigned char ab[64]; amr_init(ab);
+    book_reset();
+    ab2_t* b = ab2_open(".", 1);
     for (unsigned k = 0; k < 1200; k++){
-        unsigned char b[4] = { 11, (unsigned char)(k >> 8), (unsigned char)k, 7 };
-        unsigned ip; memcpy(&ip, b, 4);
-        amr_add(ab, ip, htons(8333), 9, 1700000000u + k);
+        bmc_addr_t a; memset(&a, 0, sizeof a); a.net = BMC_NET_IPV4; a.len = 4;
+        a.addr[0] = 11; a.addr[1] = (unsigned char)(k >> 8); a.addr[2] = (unsigned char)k; a.addr[3] = 7; a.port = 8333;
+        ab2_add(b, &a, 9, 1700000000u + k);
     }
-    close(*(int*)ab);
+    ab2_close(b);
 }
 /* a serve child for the NEXT connection */
 static pid_t spawn_server(void){
@@ -222,20 +225,21 @@ int main(void){
     ck("getaddr answered from a 1200-record book", r > 0 && !strcmp(cmd, "addr"));
     ck("count prefix fd e8 03 (= 1000)", bl >= 3 && buf[0] == 0xfd && buf[1] == 0xe8 && buf[2] == 0x03);
     cki("payload length 3 + 1000*30", (long)bl, 3 + 1000*30);
-    /* every one of the 1000 records must be the planted entry k, in order:
-     * a reply of the right length made of wrong or repeated records would
-     * otherwise pass (the review's mutation of the loop did exactly that) */
-    { int bad = 0;
+    /* every one of the 1000 records must be a DISTINCT planted entry whose
+     * timestamp matches its address (the walk starts at a random offset when
+     * the book exceeds 1000, as Core's reply is randomised, so order is not
+     * pinned -- membership, consistency and uniqueness are) */
+    { int bad = 0; static unsigned char seen[1200]; memset(seen, 0, sizeof seen);
       for (unsigned k = 0; k < 1000 && bl == 3 + 1000*30; k++){
           const unsigned char* rr = buf + 3 + k*30;
           unsigned t = (unsigned)rr[0] | ((unsigned)rr[1]<<8) | ((unsigned)rr[2]<<16) | ((unsigned)rr[3]<<24);
-          int okrec = t == 1700000000u + k && rr[4] == 9 && rr[11] == 0
-                   && rr[22] == 0xff && rr[23] == 0xff
-                   && rr[24] == 11 && rr[25] == (unsigned char)(k >> 8) && rr[26] == (unsigned char)k && rr[27] == 7
+          unsigned idx = ((unsigned)rr[25] << 8) | rr[26];
+          int okrec = idx < 1200 && !seen[idx] && t == 1700000000u + idx && rr[4] == 9 && rr[11] == 0
+                   && rr[22] == 0xff && rr[23] == 0xff && rr[24] == 11 && rr[27] == 7
                    && rr[28] == 0x20 && rr[29] == 0x8d;
-          if (!okrec) bad++;
+          if (okrec) seen[idx] = 1; else bad++;
       }
-      ck("all 1000 records are the planted entries 0..999, in order, ports 20 8d", bl == 3 + 1000*30 && bad == 0); }
+      ck("all 1000 records are distinct planted entries with consistent timestamps, ports 20 8d", bl == 3 + 1000*30 && bad == 0); }
     /* Core answers getaddr once per connection and ignores repeats: a second
      * getaddr followed by a ping must yield the pong FIRST, not another addr */
     { unsigned char nonce[8] = {9,8,7,6,5,4,3,2};
@@ -283,6 +287,22 @@ int main(void){
     }
     /* and the same two messages BEFORE verack are, of course, fine: section
      * 3 already proved sendaddrv2 there; wtxidrelay is what section 1 saw */
+
+    printf("\n== 8. non-IPv4 entries: addrv2 carries them, legacy addr does not (Core IsAddrCompatible) ==\n");
+    /* Core's msg_addrv2 for the 3-record book plus onion pg6mm...:8335 and i2p c4gfn...:0 */
+    static const unsigned char CORE_V2_5[] = { 0x05,0x00,0xf1,0x53,0x65,0x09,0x01,0x04,0x05,0x06,0x07,0x08,0x20,0x8d,0x01,0xf1,0x53,0x65,0x01,0x01,0x04,0x09,0x0a,0x0b,0x0c,0x20,0x8d,0x02,0xf1,0x53,0x65,0xfd,0x09,0x04,0x01,0x04,0xc8,0x01,0x02,0x03,0x20,0x8e,0x03,0xf1,0x53,0x65,0x09,0x04,0x20,0x79,0xbc,0xc6,0x25,0x18,0x4b,0x05,0x19,0x49,0x75,0xc2,0x8b,0x66,0xb6,0x6b,0x04,0x69,0xf7,0xf6,0x55,0x6f,0xb1,0xac,0x31,0x89,0xa7,0x9b,0x40,0xdd,0xa3,0x2f,0x1f,0x20,0x8f,0x04,0xf1,0x53,0x65,0x09,0x05,0x20,0x17,0x0c,0x56,0xce,0x72,0xa5,0xa0,0xe6,0x23,0x06,0xa3,0xc7,0x08,0x43,0x18,0xee,0x3a,0x46,0x35,0x5d,0x17,0xf6,0x78,0x96,0xa0,0x9c,0x51,0xef,0xbe,0x23,0xfd,0x71,0x00,0x00 };
+    book3();
+    book_add("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8335", 9, 1700000003u);
+    book_add("c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p", 9, 1700000004u);
+    { pid_t sp = spawn_server(); int fdF = raw_client(70016, 0, &off, &wt);
+      r = getaddr_reply(fdF, cmd, buf, sizeof buf, &bl);
+      ck("legacy peer: addr with ONLY the 3 IPv4 records (== Core msg_addr)", r > 0 && !strcmp(cmd, "addr") && bl == sizeof CORE_V1_3 && !memcmp(buf, CORE_V1_3, bl));
+      close(fdF); kill(sp, 9); waitpid(sp, 0, 0); }
+    { pid_t sp = spawn_server(); int fdG = raw_client(70016, 1, &off, &wt);
+      r = getaddr_reply(fdG, cmd, buf, sizeof buf, &bl);
+      cki("addrv2 peer: all 5 entries, length == Core's", (long)bl, (long)sizeof CORE_V2_5);
+      ck("addrv2 bytes == Core msg_addrv2 (ipv4 x3, onion, i2p)", r > 0 && !strcmp(cmd, "addrv2") && bl == sizeof CORE_V2_5 && !memcmp(buf, CORE_V2_5, bl));
+      close(fdG); kill(sp, 9); waitpid(sp, 0, 0); }
 
     close(g_ls);
     printf(failures ? "\nFAILURES %d\n" : "\nALL TESTS PASSED (0 failures)\n", failures);
