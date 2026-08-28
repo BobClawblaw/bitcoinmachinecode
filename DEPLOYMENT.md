@@ -185,8 +185,8 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
-  2026-08-27 the live binary is **`bitcoind.deploy-20260827ab`**; the
-  rollback one step back is `…-20260827aa`.
+  2026-08-27 the live binary is **`bitcoind.deploy-20260827ac`**; the
+  rollback one step back is `…-20260827ab`.
 
   These snapshots are NOT in git (they are ~31 MB build products, and a
   `git add -A` once swept twenty of them plus a scratch datadir into a
@@ -201,7 +201,23 @@ count, uptime.
   for a minute there is working as intended; the line is printed when it
   finishes.
 
-  The eight that changed live behaviour most, newest first:
+  The nine that changed live behaviour most, newest first:
+  - **`ac`** (`ad59611`) — five of the six remaining wallet refusals were not
+    actually blocked: `migratewallet` and `createwalletdescriptor` answer
+    Core's own verdict for a wallet of this shape, `importprunedfunds` /
+    `removeprunedfunds` are real (they import no key material, only the
+    knowledge that an output we already own exists), and `setwalletflag`
+    implements `avoid_reuse` end to end.
+
+    Verified live: all five answer with Core's exact codes and messages.
+    `avoid_reuse` is OFF by default and the flag file does not exist, so the
+    production wallet's coin selection is unchanged by this deploy.
+
+    NOTE for operators: `removeprunedfunds` and `importprunedfunds` are the
+    first RPCs that WRITE the wallet's record file outside a rescan. They act
+    only when called, and `wscan_write` writes its header last, so an
+    interrupted call leaves the previous complete record set rather than a
+    partial one.
   - **`ab`** (`e9b0d93`) — `getrawtransaction` falls back to the mempool,
     which is Core's order and what its help promises ("by default, this call
     only returns a transaction if it is in the mempool"). Before this it
