@@ -55,12 +55,14 @@ static void ingest_addr1(const unsigned char* pl, long plen){
     for(long k=0;k<cnt;k++){
         const unsigned char* r = pl + base + k*30;
         if(base+k*30+30>plen) break;
-        /* v4 is in the last 4 bytes (12..15) of the 16-byte ip field; some
-         * peers put it at 0..3, so accept either local form. */
-        const unsigned char* ipb = r+12;
-        if(!is_public_v4(ipb)) ipb = r;               /* try the 0..3 form */
+        /* IPv4-mapped: ten zero bytes, ff ff, a.b.c.d at record offset 24.
+         * (Was offset 12 with a fallback to the timestamp -- see the same
+         * fix in daemon/addr_ingest.c, 2026-08-28.) */
+        static const unsigned char v4map[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        if(memcmp(r+12, v4map, 12)!=0) continue;
+        const unsigned char* ipb = r+24;
         if(!is_public_v4(ipb)) continue;
-        unsigned short port = (r[28]<<8)|r[29];      /* BE */
+        unsigned short port = htons((unsigned short)((r[28]<<8)|r[29]));  /* book stores BE */
         unsigned last = (unsigned)time(NULL);
         unsigned long long svc = (unsigned long long)r[4] | (unsigned long long)r[5]<<8 |
             (unsigned long long)r[6]<<16 |(unsigned long long)r[7]<<24 | (unsigned long long)r[8]<<32 |
@@ -94,7 +96,7 @@ static void ingest_addrv2(const unsigned char* pl, long plen){
         unsigned char a[4]={0,0,0,0};
         if(alen<=4){ for(unsigned long long x=0;x<alen&&pos<plen;x++) a[x]=pl[pos+x]; }
         pos+=alen;
-        unsigned short port=0; if(pos+1<plen) port=pl[pos]<<8|pl[pos+1]; pos+=2;
+        unsigned short port=0; if(pos+1<plen) port=htons((unsigned short)(pl[pos]<<8|pl[pos+1])); pos+=2;
         if(net==1 && alen==4 && is_public_v4(a)){
             unsigned ip=(unsigned)a[0]|(unsigned)a[1]<<8|(unsigned)a[2]<<16|(unsigned)a[3]<<24;
             amr_add(ab, ip, port, 1, (unsigned)time);
