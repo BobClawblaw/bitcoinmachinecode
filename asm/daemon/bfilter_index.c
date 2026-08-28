@@ -260,16 +260,30 @@ void bfi_on_block(void* store_buf, long h, const u8* blk, unsigned long blen){
          * closable from the undo window */
         long n = bfi_probe_count();
         if (n < 0) return;                           /* no files: builder not run */
-        if (h - n > BFI_ADOPT_GAP){
+        /* Judge the gap against the CHAIN TIP, not h. The daemon connects a
+         * catch-up burst by looping h from last_seen_tip+1, so early in a
+         * burst h is small while the tip is already far ahead -- h - n then
+         * goes NEGATIVE and this adopts at an arbitrarily large REAL gap.
+         * Not corrupting (the append below is guarded by g_n == h, and a gap
+         * close that outruns the undo window closes the index rather than
+         * storing a wrong filter) but it takes the index DOWN until
+         * build_block_filters is re-run -- the worst possible outcome for an
+         * unattended overnight backfill. The sibling tails read the tip the
+         * same way: addr_index_tail.c, tx_index_tail.c. Caught 2026-08-28 by
+         * validation/bfi_adopt_regtest_e2e.sh, whose builder happened to
+         * finish mid-burst and got "ADOPTED at 73 records (tip 1)". */
+        long tip = *(int*)((u8*)store_buf + 24);
+        if (tip < h) tip = h;                        /* h wins if the store header lags */
+        if (tip - n > BFI_ADOPT_GAP){
             if (!adopt_denied_logged){
-                fprintf(stderr, "[bfilter] index at %ld, tip %ld -- waiting for the backfill to close in\n", n, h);
+                fprintf(stderr, "[bfilter] index at %ld, tip %ld -- waiting for the backfill to close in\n", n, tip);
                 adopt_denied_logged = 1;
             }
             return;
         }
         if (bfi_open(1) < 0) return;
         fprintf(stderr, "[bfilter] ADOPTED at %ld records (tip %ld) -- closing the gap from undo data\n",
-                bfi_count(), h);
+                bfi_count(), tip);
     }
     /* close any gap below h from the archive + undo, then append h */
     static u8* gapbuf;
