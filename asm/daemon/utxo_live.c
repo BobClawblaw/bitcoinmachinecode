@@ -756,7 +756,7 @@ static int bip30_enforced(long height, const u8 hash32[32])
         static u8 buf[1u<<20];      /* block 227,931 is ~215 KB */
         u8 h[32];
         long len = g_bip30_store
-                 ? store_read_at(g_bip30_store, (u64)BIP30_BIP34_HEIGHT, buf, sizeof buf)
+                 ? store_read_at(g_bip30_store, (u64)(BIP30_BIP34_HEIGHT - 1), buf, sizeof buf)   /* real 227931 = daemon record 227930 */
                  : -1;
         if (len >= 80) {
             block_hash(h, buf);
@@ -990,7 +990,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      *
      * On mainnet the gate is off from height 227,932 to 1,983,701, so for a
      * node replaying the current chain this loop does not run at all. ---- */
-    if (bip30_enforced(g_apply_height, blk_hash)) {
+    if (bip30_enforced(g_apply_height + 1, blk_hash)) {   /* consensus height: store is daemon-shifted -1 */
         for (u64 t=0; t<ntx; t++){
             for (u32 o=0; o<pn_outs[t]; o++){
                 u64 v; unsigned long hh, cb, sl; const u8* sp;
@@ -1755,13 +1755,12 @@ long utxo_live_catchup(void* store_buf){
          * "missing/already-spent" -- because that block (and however many
          * after it) had already been durably applied before the crash, just
          * never checkpointed. See tests/test_utxo_catchup_crash_resume.c.
-         * fsync-per-block is not the throughput risk it looks like: bulk
-         * catch-up is already far slower than one fsync per block (observed
-         * production rate tops out around a few thousand blocks/sec even in
-         * the cheap early-chain stretch, and drops to single digits/sec once
-         * blocks carry real transaction volume), so this adds a small,
-         * bounded fraction of total replay time in exchange for closing an
-         * unbounded-drift crash window. */
+         * The applied-height durability point closes the unbounded-drift
+         * crash window. NOTE (2026-08-28): batching this fsync was tried and
+         * REVERTED -- it made the persisted applied_height lag the actually
+         * applied LSM, so a restart re-applied already-applied blocks and
+         * false-rejected their coinbases with bad-txns-BIP30. Per-block
+         * persistence is load-bearing for applied-height == LSM coherence. */
         if (!persist_applied_height(g_applied_height)) {
             /* STOP, don't continue (2026-08-25). The old comment claimed
              * continuing was "safe, puts/dels are idempotent" -- false since
