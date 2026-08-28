@@ -185,8 +185,8 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
-  2026-08-27 the live binary is **`bitcoind.deploy-20260827ad`**; the
-  rollback one step back is `…-20260827ac`.
+  2026-08-28 the live binary is **`bitcoind.deploy-20260828ae`**; the
+  rollback one step back is `…-20260827ad`.
 
   These snapshots are NOT in git (they are ~31 MB build products, and a
   `git add -A` once swept twenty of them plus a scratch datadir into a
@@ -201,7 +201,21 @@ count, uptime.
   for a minute there is working as intended; the line is printed when it
   finishes.
 
-  The ten that changed live behaviour most, newest first:
+  The eleven that changed live behaviour most, newest first:
+  - **`ae`** (`057c87d`) — **this node can serve the blocks it downloads
+    again.** The serve path's hash index was built once at boot; new blocks
+    are appended by the download WORKER, a different process, so the serve
+    parent and its children never learned about them. Every block received
+    during a run was a silent `getdata` miss, so the node never helped
+    propagate recent blocks — the only propagation that matters.
+
+    It passed the `y`/`z` serving checks because a caught-up node mostly
+    answers for HISTORICAL blocks, and those were in the archive at boot.
+    Found by `validation/p2p_inbound_probe.py`, which asks as a stranger.
+
+    What to watch after this deploy: a `[hashidx] +N height(s) now servable`
+    line should appear as new blocks arrive. If it never does, the top-up is
+    not running and serving is stale again.
   - **`ad`** (`90531b9`) — `addhdkey`, the last wallet refusal. **Carries an
     on-disk format bump**: the wallet record file gains an `hdkey` byte
     (BMCWSCN3 → BMCWSCN4), without which two HD keys resolve to each other's
