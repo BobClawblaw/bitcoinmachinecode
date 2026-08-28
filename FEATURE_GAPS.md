@@ -268,8 +268,24 @@ tables and the writers themselves.
     `getwalletinfo` reports it. A stored-and-ignored flag would be worse than
     refusing.
 
-  **Still refused: `addhdkey`**, and its reason is the true one — adopting a
-  foreign HD key needs a key store this single-seed wallet does not have.
+  ~~**Still refused: `addhdkey`**~~ — **CLOSED 2026-08-27 (late).** It was the
+  only one genuinely blocked, and closing it needed three things, not one:
+  the key is stored through the mnemonic's OWN KDF/cipher/tag (an xprv in
+  plaintext beside an encrypted seed would be the weakest thing in the
+  directory, so without a passphrase it refuses); the record format gained an
+  `hdkey` byte (**BMCWSCN4**) because two HD keys collide on
+  (keyidx, branch) and an output paying one resolved to the other's address;
+  and the signer now holds the added keys, since a wallet that watches
+  outputs it cannot sign reports coins as spendable that are not. Formats 2
+  and 3 still read, and `hdkey = 0` is the truth for them.
+
+  Two real bugs surfaced doing it: `bip32_extkey_serialize` hardcodes
+  **mainnet** version bytes in assembly, so every xpub this node produced was
+  rejected by Core on regtest/testnet4 ("key is not valid") — the pair now
+  lives in chainparams; and a chaincode aliasing bug in the second derivation
+  step.
+
+  **No wallet RPC is refused wholesale any more.**
 
   Proven on regtest against a real chain: removing a confirmed wallet output
   drops the balance by exactly its 50 BTC, importing it back with a real
