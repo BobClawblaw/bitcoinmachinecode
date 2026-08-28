@@ -201,9 +201,16 @@ tables and the writers themselves.
   like-for-like end-to-end speed comparison, and the only item here that is
   purely a measurement rather than a capability.
 - **`assumevalid`** — parsed and then IGNORED, with a loud `[config]` line
-  saying so. This node verifies every script in every block; honouring
-  assumevalid would mean *skipping* that, so it is a deliberate refusal
-  rather than an unimplemented feature. Small to wire if ever wanted.
+  saying so. This node verifies every script in every block
+  (`tx_verify_block_connect_all`, called from `daemon/utxo_live.c`'s apply
+  path ahead of any UTXO write, and proven by the full-archive replay);
+  honouring assumevalid would mean *skipping* that, so it is a deliberate
+  refusal rather than an unimplemented feature. Small to wire if ever wanted.
+  *(The `[config]` line itself was STALE until 2026-08-28 — it claimed block
+  connection did no script verification at all, describing the node as it was
+  before Stage D. It was believed over the code and briefly propagated into
+  this file. Log strings that explain a decision age exactly like refusal
+  strings do; see the wallet refusals deleted 2026-08-27.)*
 - **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
@@ -485,11 +492,10 @@ plus straightforward methods on top of it.
 
 ## Consensus / validation
 
-- **`assumevalid`** — explicitly ignored (`daemon/node_config.c:272-273`
-  logs "IGNORED"). Small to wire (config parsing already exists) but
-  deliberately not worth doing until Stage D's replay finishes — using it
-  now would mean skipping the exact verification this project is currently
-  proving. Revisit after.
+- **`assumevalid`** — explicitly ignored, with a `[config]` line saying so.
+  Small to wire (config parsing already exists), and still declined: it
+  exists to skip the per-input script verification that block connection
+  performs, which is the thing this project is for.
 - **`assumeutxo`** (Core's UTXO-snapshot-import) — absent. No real hits for
   assumeutxo/utxo.snapshot/dumptxoutset/loadtxoutset. **Large** — needs a
   new snapshot format plus a background-validation state machine; nothing
