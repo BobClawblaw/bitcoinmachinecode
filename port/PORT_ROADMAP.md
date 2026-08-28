@@ -384,6 +384,12 @@ and runs natively.
       byte-exact vs Core-equivalent reference; index/ntx edges) and
       test_addrmgr ALL PASS (p2p_addr_v1 serialization byte-exact) natively on
       ARM (2026-08-28). `make cmpct_diffs` (test_bip152 + test_addrmgr).
+- [x] BIP155 addrv2 (merged main): handshake offer+detect both roles,
+      g_peer_wants_addrv2 global, p2p_addr_v1 (fixed count+::ffff:) / p2p_addr_v2
+      encoders, serve getaddr once-gate + v1/v2 reply + post-verack disconnect.
+      VERIFIED vs Core: make addrv2_diffs (test_addrmgr + test_addrv2_serve ALL
+      PASS). Fixes: p2p_addr_v1 1-byte count+no-::ffff:, serve "send" dispatch
+      constant 0x64656e65->0x646e6573, + wtxidrelay offered both roles. (2026-08-28)
 - [x] Remaining consensus twin differentials built+run natively on ARM
       (2026-08-28), via `make consensus_diffs` (bitcoin_bip143/strip_witness/
       checksig/tapagg/txv_dispatch/taproot_verify/witness_v0_drv/
