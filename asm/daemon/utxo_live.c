@@ -831,13 +831,36 @@ void utxo_live_set_pow_rules(int no_retarget, int allow_min_diff,
     g_powr_bip94 = enforce_bip94; g_powr_lim = pow_limit_bits;
     g_powr_enabled = 1;
 }
-static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
+/* (old daemon-height getter removed 2026-08-28: superseded by
+ * powr_hdr_from_store_consensus below, which runs the retarget schedule on
+ * consensus heights -- see its comment for the -1 store-height shift.) */
+
+/* Consensus-height GETTER for the difficulty schedule. pow_expected_bits /
+ * pow_check_bits (bitcoin_pow_rules.c, shared, x86-correct) address ancestors
+ * by CONSENSUS height. Our archive store is daemon-height-indexed: record r
+ * holds real block r+1 (the headers.dat +1 genesis bias propagated into the
+ * block store), so daemon heights are -1 from consensus. Running the scheduled
+ * check on daemon heights misaligns the 2016-block retarget gate by one --
+ * which is invisible while difficulty is frozen at its minimum (every early
+ * retarget up to the first difficulty change), then rejects the FIRST real
+ * retarget block (daemon 32255 = real 32256) with bad-diffbits because it
+ * expects the previous epoch's bits. Fix: feed pow_check_bits consensus
+ * heights (apply_height+1) and translate here: real block R lives at daemon
+ * record R-1. Real block 0 (genesis) has no record -- only the very first
+ * retarget (real 2016's window) ever asks for it, so synthesize the mainnet
+ * genesis header (time 1231006505, bits 1d00ffff). */
+static int powr_hdr_from_store_consensus(void* ctx, long real_h, u8 hdr[80]){
+    if (real_h <= 0){
+        memset(hdr, 0, 80);
+        { u32 t = 1231006505u;       /* mainnet genesis time */
+          u32 b = 0x1d00ffffu;       /* mainnet genesis bits */
+          memcpy(hdr+68, &t, 4); memcpy(hdr+72, &b, 4); }
+        return 1;
+    }
     u64 meta[3];
-    if (!ctx || store_get_at(ctx, (u64)h, meta) != 1) return 0;
+    if (!ctx || store_get_at(ctx, (u64)(real_h - 1), meta) != 1) return 0;
     int fd = store_rd_fd(ctx, (unsigned)meta[2]);
     if (fd < 0) return 0;
-    /* +8 skips the [len][magic] frame header -- store_read_meta's own
-     * pread does exactly this (bitcoin_store_fast.asm) */
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
 
@@ -897,8 +920,8 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * unreadable) also rejects: refusing to evaluate is safer than accepting
      * unevaluated, and every legitimate path has its ancestors stored. */
     if (g_powr_enabled && g_apply_height >= 1){
-        int pr = pow_check_bits(g_apply_height, blockbuf,
-                                powr_hdr_from_store, g_bip30_store,
+        int pr = pow_check_bits(g_apply_height + 1, blockbuf,   /* consensus height */
+                                powr_hdr_from_store_consensus, g_bip30_store,
                                 g_powr_no_rt, g_powr_mindiff,
                                 g_powr_bip94, g_powr_lim);
         if (pr != 1){ g_last_reject = "bad-diffbits"; return 0; }
@@ -1697,7 +1720,7 @@ long utxo_live_catchup(void* store_buf){
             break;
         }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
-            fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up\n", h);
+            fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up (reason='%s')\n", h, g_last_reject);
             return -1;
         }
         /* Block h is now fully durable in the WAL but NOT yet checkpointed:
