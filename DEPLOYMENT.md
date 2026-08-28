@@ -185,8 +185,8 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
-  2026-08-28 the live binary is **`bitcoind.deploy-20260828ae`**; the
-  rollback one step back is `…-20260827ad`.
+  2026-08-28 the live binary is **`bitcoind.deploy-20260828af`**; the
+  rollback one step back is `…-20260828ae`.
 
   These snapshots are NOT in git (they are ~31 MB build products, and a
   `git add -A` once swept twenty of them plus a scratch datadir into a
@@ -201,7 +201,21 @@ count, uptime.
   for a minute there is working as intended; the line is printed when it
   finishes.
 
-  The eleven that changed live behaviour most, newest first:
+  The twelve that changed live behaviour most, newest first:
+  - **`af`** (`cab7e75`) — a `getdata` miss is answered with `notfound`
+    instead of silence, and BIP157 compact filters are SERVED
+    (`getcfilters`/`getcfheaders`/`getcfcheckpt`). Verified on the live
+    mainnet node: `notfound` for an unknown txid, and all three filter
+    messages answered for a covered height (10.8 KB + 15.6 KB of real
+    filters, a 130 B cfheaders, a 12.8 KB cfcheckpt).
+
+    **Operational note this exposed:** the mainnet filter index covers
+    heights 0–425,210 of 964,405 — the backfill was never finished, and the
+    daemon logs `[bfilter] index at 425211, tip N -- waiting for the backfill
+    to close in` on every block. Filters BELOW that height serve; above it we
+    correctly answer nothing, because we do not have them. Finishing the
+    backfill (`daemon/build_block_filters`) is what makes filter serving
+    useful to a light client on the current chain.
   - **`ae`** (`057c87d`) — **this node can serve the blocks it downloads
     again.** The serve path's hash index was built once at boot; new blocks
     are appended by the download WORKER, a different process, so the serve
@@ -213,9 +227,10 @@ count, uptime.
     answers for HISTORICAL blocks, and those were in the archive at boot.
     Found by `validation/p2p_inbound_probe.py`, which asks as a stranger.
 
-    What to watch after this deploy: a `[hashidx] +N height(s) now servable`
-    line should appear as new blocks arrive. If it never does, the top-up is
-    not running and serving is stale again.
+    CONFIRMED on mainnet 2026-08-28: `[hashidx] +1 height(s) now servable
+    (through 964405)`, and the live node then served that block — 1,636,818
+    bytes — to a probe that asked for it. That is the exact case that
+    returned silence before.
   - **`ad`** (`90531b9`) — `addhdkey`, the last wallet refusal. **Carries an
     on-disk format bump**: the wallet record file gains an `hdkey` byte
     (BMCWSCN3 → BMCWSCN4), without which two HD keys resolve to each other's
