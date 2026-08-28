@@ -196,26 +196,15 @@ that overstates is no more honest than one that understates; both are wrong
 about where the work is. What follows was checked by reading the dispatch
 tables and the writers themselves.
 
-- **BLOCKS DOWNLOADED AFTER BOOT CANNOT BE SERVED.** Found 2026-08-28 by
-  `validation/p2p_inbound_probe.py`, speaking the wire protocol to this node
-  and to Core on the same regtest chain. `getdata` for a block that was in
-  the archive at startup returns it; `getdata` for a block this node
-  downloaded *during the run* is answered with **silence**.
-
-  Mechanism: the serve path's in-memory hash index is built once, at boot,
-  by `idx_build_from_file` (`daemon/main.c`). The download worker appends
-  new blocks in ANOTHER process, so the serve parent — and every serve child
-  forked from it — never learns about them. `bitcoin_serve.asm`'s `.do_block`
-  does `idx_put`, but only for blocks a peer PUSHES to that child.
-
-  Consequence: this node never helps propagate recent blocks, which is the
-  only propagation that matters. It looked fine when block serving was
-  verified on 2026-08-27 because a caught-up node mostly answers for
-  historical blocks, and those were in the archive at boot.
-
-  The fix shape already exists one layer over: `rpc_chain.c`'s `refresh()`
-  tops its index up incrementally from `index.dat` on every chain RPC. The
-  serve path needs the same before it concludes a miss.
+- ~~**Blocks downloaded after boot cannot be served**~~ — **CLOSED
+  2026-08-28**, hours after being found. `serve_idx_topup` folds in every
+  height `index.dat` has gained since this process last looked: the parent
+  tops up before forking a serve child (so the child inherits a current
+  index) and the getdata handler tops up too (so a long-lived connection
+  cannot go stale). The same incremental top-up `rpc_chain.c`'s `refresh()`
+  already did for the RPC side — borrowed, not invented, which is why the RPC
+  layer never had the bug. Proven on regtest against Core: a block mined
+  minutes after boot is served without a restart.
 - **A `getdata` miss is answered with SILENCE, not `notfound`.** Core replies
   `notfound`; this node says nothing, so the peer waits out its own timeout.
   The relay drain (`daemon/tx_relay.c`) does send `notfound` — the SERVE path
