@@ -111,6 +111,7 @@ static const chainparams_t PARAMS_MAIN = {
     .pow_no_retargeting = 0, .pow_limit_bits = 0x1d00ffffu,
     .p2pkh_version = 0x00, .p2sh_version = 0x05, .wif_version = 0x80,
     .bech32_hrp = "bc",
+    .xpub_version = 0x0488B21Eu, .xprv_version = 0x0488ADE4u,
     .dns_seeds = 1,
     .allow_min_difficulty = 0,
     .enforce_bip94 = 0,
@@ -128,6 +129,7 @@ static const chainparams_t PARAMS_REGTEST = {
     .pow_no_retargeting = 1, .pow_limit_bits = 0x207fffffu,
     .p2pkh_version = 0x6f, .p2sh_version = 0xc4, .wif_version = 0xef,
     .bech32_hrp = "bcrt",
+    .xpub_version = 0x043587CFu, .xprv_version = 0x04358394u,
     .dns_seeds = 0,
     .allow_min_difficulty = 1,      /* Core regtest: true (moot: no retarget) */
     .enforce_bip94 = 0,
@@ -145,6 +147,7 @@ static const chainparams_t PARAMS_TESTNET4 = {
     .pow_no_retargeting = 0, .pow_limit_bits = 0x1d00ffffu,
     .p2pkh_version = 0x6f, .p2sh_version = 0xc4, .wif_version = 0xef,
     .bech32_hrp = "tb",
+    .xpub_version = 0x043587CFu, .xprv_version = 0x04358394u,
     .dns_seeds = 1,
     .allow_min_difficulty = 1,       /* fPowAllowMinDifficultyBlocks       */
     .enforce_bip94 = 1,              /* consensus.enforce_BIP94             */
