@@ -32,8 +32,6 @@ extern int  tcp_connect_ip(unsigned, unsigned short);
 extern long p2p_write(int,const char*,unsigned,const void*,unsigned);
 extern int  p2p_read(int,char[12],void*,unsigned,unsigned*);
 extern void fd_close(int);
-extern int  amr_add(void* ab, unsigned ip, unsigned short port, unsigned long long svc, unsigned lastseen);
-extern long amr_count(void* ab);
 extern long p2p_addr_count(const void* pl, long plen);
 extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c */
 
@@ -49,144 +47,104 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken;
                  long limit; /* > 0: consider at most this many records (caller's token budget) */ } ai_quota_t;
 
-static int ai_quota_ok(ai_quota_t* q, unsigned ip){
-    if(q->taken >= g_cfg.addr_max_per_response) return 0;
-    unsigned g = net_netgroup_v4(ip);
-    for(int i=0;i<q->n;i++){
-        if(q->ng[i]==g){
-            if(q->cnt[i] >= g_cfg.addr_max_per_netgroup) return 0;
-            q->cnt[i]++; q->taken++; return 1;
-        }
-    }
-    if(q->n < AI_MAX_PER_RESPONSE){ q->ng[q->n]=g; q->cnt[q->n]=1; q->n++; }
-    q->taken++;
-    return 1;
-}
 
 static void ai_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
 static void ai_u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
 static void ai_u16(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 
-static int ai_public_v4(const unsigned char* a){
-    if(a[0]==0||a[0]==127||a[0]>=240) return 0;
-    if(a[0]==10) return 0;
-    if(a[0]==192&&a[1]==168) return 0;
-    if(a[0]==172&&a[1]>=16&&a[1]<=31) return 0;
-    if(a[0]==169&&a[1]==254) return 0;
+
+/* ---- the book and the parsers, version 2 (2026-08-28) ----------------------
+ * Both parsers now go through daemon/netaddr.c (every BIP155 network) and
+ * write to the version-2 book (daemon/addrbook.c, peers2.dat). The legacy
+ * `void* ab` argument callers still pass is ignored: the book is opened
+ * lazily, once per process, read-write (this code runs in the download
+ * worker, the single writer). */
+#include "netaddr.h"
+#include "addrbook.h"
+static ab2_t* g_book;
+/* CompactSize reader (the addrv2 count); 1 ok / 0 truncated */
+static int ai_compact(const unsigned char* pl, long plen, unsigned long long* pos, unsigned long long* v){
+    if((long)*pos >= plen) return 0;
+    unsigned char c = pl[*pos];
+    if(c < 0xfd){ *v = c; *pos += 1; return 1; }
+    if(c == 0xfd){ if((long)*pos + 3 > plen) return 0; *v = (unsigned long long)pl[*pos+1] | ((unsigned long long)pl[*pos+2] << 8); *pos += 3; return 1; }
+    if(c == 0xfe){ if((long)*pos + 5 > plen) return 0; *v = 0; for(int i=0;i<4;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 5; return 1; }
+    if((long)*pos + 9 > plen) return 0; *v = 0; for(int i=0;i<8;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 9; return 1;
+}
+ab2_t* addr_book(void){
+    if(!g_book) g_book = ab2_open(".", 1);
+    return g_book;
+}
+static int ai_quota_ok_addr(ai_quota_t* q, const bmc_addr_t* a){
+    if(q->taken >= g_cfg.addr_max_per_response) return 0;
+    unsigned long long g = bmc_addr_group(a);
+    unsigned gk = (unsigned)(g ^ (g >> 32));
+    for(int i=0;i<q->n;i++){
+        if(q->ng[i]==gk){
+            if(q->cnt[i] >= g_cfg.addr_max_per_netgroup) return 0;
+            q->cnt[i]++; q->taken++; return 1;
+        }
+    }
+    if(q->n < AI_MAX_PER_RESPONSE){ q->ng[q->n]=gk; q->cnt[q->n]=1; q->n++; }
+    q->taken++;
     return 1;
 }
-
-/* v1 addr payload -> book. 30-byte records after the CompactSize count:
- * time(4) services(8) ip16(16) port(2 BE). An IPv4 is carried IPv4-MAPPED:
- * ten zero bytes, ff ff, then a.b.c.d at 24..27 of the record.
- *
- * FIXED 2026-08-28. This read the address from record offset 12 -- the
- * FIRST four bytes of the ip16 field, which are 00 00 00 00 for every mapped
- * IPv4 Core sends -- and then "fell back" to offset 0, the timestamp, so a
- * v1 reply either yielded nothing or wrote a FABRICATED address made of time
- * bytes (e.g. 60.154.176.104 for t=0x68b09a3c) with the real port into the
- * book. Found by an adversarial review that executed this function on
- * Core's own msg_addr bytes. Anything not in the mapped form is skipped. */
-static long ai_ingest_addr1(void* ab, const unsigned char* pl, long plen, ai_quota_t* q){
+static long ai_ingest_one(ab2_t* b, const bmc_addr_t* a, unsigned long long svc, unsigned tm, ai_quota_t* q){
+    if(!bmc_addr_is_routable(a)) return 0;
+    if(!ai_quota_ok_addr(q, a)) return 0;
+    /* Core: a time in the future or before 2001 is replaced by now-5d */
+    unsigned now = (unsigned)time(NULL);
+    if(tm > now + 600 || tm < 100000000u) tm = now - 5*24*3600;
+    return ab2_add(b, a, svc, tm) > 0 ? 1 : 0;
+}
+/* legacy `addr`: CompactSize count, then 30-byte records; IPv4 arrives
+ * ::ffff:-mapped, IPv6 native (see netaddr.c). Before 2026-08-28 this read
+ * the IPv4 from the wrong offset and fabricated addresses from timestamps. */
+static long ai_ingest_addr1(void* unused, const unsigned char* pl, long plen, ai_quota_t* q){
+    (void)unused;
     long cnt = p2p_addr_count(pl, plen); if(cnt<=0) return 0;
     long base = (pl[0]<0xfd)?1:(pl[0]==0xfd?3:(pl[0]==0xfe?5:9));
+    ab2_t* b = addr_book(); if(!b) return 0;
     long added=0;
-    static const unsigned char v4map[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
     for(long k=0;k<cnt;k++){
         if(q->limit > 0 && k >= q->limit) break;         /* token budget exhausted */
-        const unsigned char* r = pl + base + k*30;
         if(base+k*30+30>plen) break;
-        if(memcmp(r+12, v4map, 12)!=0) continue;        /* not an IPv4-mapped entry */
-        const unsigned char* ipb = r+24;
-        if(!ai_public_v4(ipb)) continue;
-        /* the book stores the port BIG-ENDIAN, exactly as it sits on the
-         * wire (see amr_add); this passed the host-order value, so every
-         * gossip-learned port was stored byte-swapped and, once getaddr
-         * replies worked, would have been served byte-swapped to Core */
-        unsigned short port = htons((unsigned short)((r[28]<<8)|r[29]));
-        unsigned long long svc = (unsigned long long)r[4] | (unsigned long long)r[5]<<8 |
-            (unsigned long long)r[6]<<16 |(unsigned long long)r[7]<<24 | (unsigned long long)r[8]<<32 |
-            (unsigned long long)r[9]<<40 |(unsigned long long)r[10]<<48 |(unsigned long long)r[11]<<56;
-        unsigned ip = (unsigned)ipb[0]|(unsigned)ipb[1]<<8|(unsigned)ipb[2]<<16|(unsigned)ipb[3]<<24;
-        if(!ai_quota_ok(q, ip)) continue;
-        if(amr_add(ab, ip, port, svc, (unsigned)time(NULL))>0) added++;
+        bmc_addr_t a; unsigned long long svc; unsigned tm;
+        if(bmc_addr_decode_v1(&a, &svc, &tm, pl + base + k*30, 30) != 30) continue;
+        added += ai_ingest_one(b, &a, svc, tm, q);
     }
     return added;
 }
-
-/* Read a CompactSize at *pos. Returns 0 on truncation. */
-static int ai_compact(const unsigned char* pl, long plen, unsigned long long* pos, unsigned long long* out){
-    if(*pos >= (unsigned long long)plen) return 0;
-    unsigned char c = pl[*pos];
-    if(c < 0xfd){ *out = c; *pos += 1; return 1; }
-    if(c == 0xfd){ if(*pos+3 > (unsigned long long)plen) return 0;
-        *out = (unsigned long long)pl[*pos+1] | ((unsigned long long)pl[*pos+2]<<8); *pos += 3; return 1; }
-    if(c == 0xfe){ if(*pos+5 > (unsigned long long)plen) return 0;
-        *out = (unsigned long long)pl[*pos+1] | ((unsigned long long)pl[*pos+2]<<8)
-             | ((unsigned long long)pl[*pos+3]<<16) | ((unsigned long long)pl[*pos+4]<<24); *pos += 5; return 1; }
-    if(*pos+9 > (unsigned long long)plen) return 0;
-    unsigned long long v=0; for(int i=0;i<8;i++) v |= (unsigned long long)pl[*pos+1+i]<<(8*i);
-    *out = v; *pos += 9; return 1;
-}
-
-/* addrv2 payload -> book (BIP155).
- *
- * REWRITTEN. The version inherited from daemon/addrgather.c could not parse a
- * real reply, which is why the first live test harvested 0 peers from 4 nodes
- * that each answered correctly. Three separate framing bugs:
- *
- *   1. count was read as a SINGLE BYTE. It is a CompactSize. A ~1000-address
- *      reply encodes as 0xfd,lo,hi -- so count came out 253 and every field
- *      after it was offset by two bytes.
- *   2. services was skipped with a protobuf-style `while(b & 0x80)` loop.
- *      CompactSize is not that encoding: services=1037 is 0xfd,0x0d,0x04,
- *      which that loop consumes as 2 bytes instead of 3, desynchronising the
- *      rest of the record.
- *   3. the loop guard was `pos+30 < plen`, assuming v1's fixed 30-byte
- *      records. addrv2 records are variable length -- an IPv4 entry is ~16
- *      bytes -- so a small reply (observed: plen=16, one address) was
- *      rejected outright and a large one was truncated early.
- *
- * Record layout per BIP155: time u32le, services CompactSize, networkID u8,
- * addr (CompactSize len + bytes), port u16be. */
-static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_quota_t* q){
+/* BIP155 `addrv2`: CompactSize count, then variable records for any network.
+ * An entry of an unknown network id is skipped over (Core does the same). */
+static long ai_ingest_addrv2(void* unused, const unsigned char* pl, long plen, ai_quota_t* q){
+    (void)unused;
     if(plen < 1) return 0;
     unsigned long long pos = 0, cnt = 0;
     if(!ai_compact(pl, plen, &pos, &cnt)) return 0;
+    if(cnt > 1000) return 0;                              /* Core: MAX_ADDR_TO_SEND, misbehaving */
+    ab2_t* b = addr_book(); if(!b) return 0;
     long added = 0;
-    for(unsigned long long k=0; k<cnt; k++){
+    for(unsigned long long k=0; k<cnt && (long)pos < plen; k++){
         if(q->limit > 0 && (long)k >= q->limit) break;   /* token budget exhausted */
-        if(pos + 4 > (unsigned long long)plen) break;
-        unsigned tm = (unsigned)pl[pos] | ((unsigned)pl[pos+1]<<8)
-                    | ((unsigned)pl[pos+2]<<16) | ((unsigned)pl[pos+3]<<24);
-        pos += 4;
-        unsigned long long svc = 0;
-        if(!ai_compact(pl, plen, &pos, &svc)) break;
-        if(pos >= (unsigned long long)plen) break;
-        unsigned net = pl[pos]; pos += 1;              /* networkID is a plain u8 */
-        unsigned long long alen = 0;
-        if(!ai_compact(pl, plen, &pos, &alen)) break;
-        if(pos + alen + 2 > (unsigned long long)plen) break;
-        const unsigned char* ad = pl + pos;
-        pos += alen;
-        unsigned short port = htons((unsigned short)((pl[pos]<<8) | pl[pos+1]));  /* book: BE on disk */
-        pos += 2;
-        if(net == 1 && alen == 4 && ai_public_v4(ad)){   /* 1 == IPv4 */
-            unsigned ip = (unsigned)ad[0] | (unsigned)ad[1]<<8 | (unsigned)ad[2]<<16 | (unsigned)ad[3]<<24;
-            if(!ai_quota_ok(q, ip)) continue;
-            if(amr_add(ab, ip, port, svc, tm) > 0) added++;
-        }
+        bmc_addr_t a; unsigned long long svc; unsigned tm; long used = 0;
+        long r = bmc_addr_decode_v2(&a, &svc, &tm, pl + pos, plen - (long)pos, &used);
+        if(r == -1) break;                                /* malformed: stop */
+        pos += (unsigned long long)used;
+        if(r == -2) continue;                             /* unknown network: skipped */
+        added += ai_ingest_one(b, &a, svc, tm, q);
     }
     return added;
 }
-
-/* Fold one received addr/addrv2 payload into the book. Public so the
- * parsers above can be tested on Core's own bytes without a live peer;
- * addr_gather_from uses the same functions with its per-peer quota. */
+/* Fold one received addr/addrv2 payload into the book, considering at most
+ * `limit` records (0 = all; the caller's token budget). Public so the parsers
+ * can be tested on Core's own bytes and so the outbound legs
+ * (daemon/tx_relay.c) share them. The `ab` argument is legacy and ignored. */
 long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
+    (void)ab;
     ai_quota_t quota; memset(&quota,0,sizeof quota); quota.limit = limit;
-    if(!strncmp(cmd,"addrv2",6)) return ai_ingest_addrv2(ab, pl, plen, &quota);
-    if(!strncmp(cmd,"addr",4))   return ai_ingest_addr1(ab, pl, plen, &quota);
+    if(!strncmp(cmd,"addrv2",6)) return ai_ingest_addrv2(NULL, pl, plen, &quota);
+    if(!strncmp(cmd,"addr",4))   return ai_ingest_addr1(NULL, pl, plen, &quota);
     return 0;
 }
 long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long plen){
@@ -255,14 +213,14 @@ long addr_gather_from(void* ab, const char* ip_str, int wait_s){
 /* Ask several peers in turn; stops early once `target` new entries land so a
  * healthy book costs one round trip, not npeers of them. */
 long addr_replenish(void* ab, char peers[][64], int npeers, int max_try, int wait_s, long target){
-    long total=0, before=amr_count(ab);
+    long total=0, before=ab2_count(addr_book());
     for(int i=0;i<npeers && i<max_try; i++){
         total += addr_gather_from(ab, peers[i], wait_s);
         if(target>0 && total>=target) break;
     }
     if(total>0)
         fprintf(stderr,"[addr] getaddr: +%ld new peer(s) from %d peer(s) asked (book %ld -> %ld)\n",
-                total, (int)(npeers<max_try?npeers:max_try), before, amr_count(ab));
+                total, (int)(npeers<max_try?npeers:max_try), before, ab2_count(addr_book()));
     else
         fprintf(stderr,"[addr] getaddr: no new peers returned (book %ld)\n", before);
     return total;
