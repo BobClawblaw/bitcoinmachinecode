@@ -818,10 +818,18 @@ Confirmed absent:
   and `daemon/dialer.c` (per-network routing, `-onlynet`, stream isolation).
   Proven with Bitcoin Core behind its own onion service on the real tor:
   Core reports us as an inbound peer with `"network": "onion"` and a
-  completed handshake; and with a real remote I2P stream. **Still absent:**
-  IPv6 sockets and therefore CJDNS (phase 4) -- the socket layer is
-  AF_INET only, so those peers are refused at the dialer with that reason
-  rather than timing out.
+  completed handshake; and with a real remote I2P stream. **Phase 4 also
+  landed 2026-08-28: IPv6 sockets (`daemon/net6.c`, v6-only listener beside
+  the IPv4 one) and therefore CJDNS.** Proven against a real cjdroute with
+  its tun up: Core binds its P2P port to our `fc00::/8` address, this node
+  dials it, and Core reports the peer as `"network": "cjdns"` with a
+  completed handshake; without `-cjdnsreachable` the peer is refused, as in
+  Core. **All five BIP155 networks are now storable, relayable and
+  dialable.** Remaining, and stated: no inbound onion service of our own
+  (`-listenonion` parses but this node does not yet ADD_ONION for itself --
+  `daemon/torcontrol.c` exists and is tested, it is not yet called at boot),
+  and I2P inbound (`STREAM ACCEPT`) is implemented but not yet wired to the
+  serve loop.
 - ~~**ZMQ notification interface**~~ — **REAL since 2026-08-26**:
   `hashblock`/`hashtx`/`rawblock`/`rawtx` publish over a hand-written ZMTP
   3.1 PUB socket (`daemon/zmq_notify.c`, `daemon/zmq_pub.c`), with
