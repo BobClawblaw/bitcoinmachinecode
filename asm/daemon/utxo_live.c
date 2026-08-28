@@ -62,6 +62,24 @@ extern long utxo_lsm_walk(void* lst, void* u, void* cb, void* ctx);
 extern long utxo_lsm_compact(void* lst);
 extern void utxo_lsm_close(void* lst);
 
+/* ARM PORT (see bitcoin_utxo_lsm.S reload path): utxo_lsm_reload() /
+ * utxo_lsm_compact() (which internally reloads/reconstructs the generation)
+ * violate AAPCS on the reload branch -- they clobber callee-saved x19..x28
+ * without restoring them. GCC keeps its globals base (g_utxo_lst etc.) in a
+ * callee-saved reg across the call, so the next global read after the reload
+ * dereferences a garbage base -> SIGSEGV (seen at utxo_live init's
+ * pre-catchup compact, manifest 15->1). A plain "memory" barrier is NOT
+ * enough (GCC keeps its base in x27 regardless); we must tell GCC every
+ * callee-saved reg is clobbered so it re-reads them from its own intact
+ * stack slots. Call this immediately after every utxo_lsm_reload/compact. */
+#ifdef __aarch64__
+#define UTXO_LSM_BARRIER() __asm__ __volatile__("" ::: "memory", \
+    "x19","x20","x21","x22","x23","x24","x25","x26","x27","x28")
+#else
+/* x86 SysV: the reload asm preserves rbx/r12-r15, so no reg-barrier needed. */
+#define UTXO_LSM_BARRIER() __asm__ __volatile__("" ::: "memory")
+#endif
+
 /* ---- STAGE B: per-block undo data (daemon/undo_log.c) --------------------
  * Stage A built these but deliberately left live_on_input untouched. They
  * are wired in below: every input the live daemon spends is now captured
@@ -1604,6 +1622,7 @@ int utxo_live_init(const char* dir){
     long r = have_prior_state
         ? utxo_lsm_reload(&g_utxo_lst, g_utxo_table)
         : utxo_lsm_init(&g_utxo_lst);
+    UTXO_LSM_BARRIER();   /* reload may clobber callee-saved regs (ARM) */
     int ok = have_prior_state ? (r != -1) : (r == 1);
     if (!ok) { fprintf(stderr, "[utxo_live] utxo_lsm_%s failed\n", have_prior_state ? "reload" : "init"); return 0; }
 
@@ -1630,6 +1649,7 @@ int utxo_live_init(const char* dir){
         u64 before = g_utxo_lst.manifest_n;
         if (before < 2) break;
         long cr = utxo_lsm_compact(&g_utxo_lst);
+        UTXO_LSM_BARRIER();   /* compact/reload may clobber callee-saved regs (ARM) */
         fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break; /* no progress -- stop rather than loop */
@@ -1778,6 +1798,7 @@ long utxo_live_catchup(void* store_buf){
          * (applied_height reset to -1) hit this wall at height 202134. */
         if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
+            UTXO_LSM_BARRIER();   /* ARM: reload/compact may clobber callee-saved regs */
             fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
                     h, g_utxo_lst.manifest_n, cr);
         }
@@ -1825,6 +1846,7 @@ long utxo_live_catchup(void* store_buf){
             unsigned long long before_n   = (unsigned long long)g_utxo_lst.manifest_n;
             unsigned long long before_len = (unsigned long long)g_utxo_lst.log_len;
             long fr = utxo_lsm_flush(&g_utxo_lst, g_utxo_table);
+            UTXO_LSM_BARRIER();   /* ARM: flush/reload may clobber callee-saved regs */
             if (fr == 1 && g_utxo_lst.log_len == 0)
                 fprintf(stderr, "[utxo_live] caught up: flushed the WAL tail (%llu bytes, manifest_n %llu -> %llu) so the next reload has nothing to replay\n",
                         before_len, before_n, (unsigned long long)g_utxo_lst.manifest_n);
@@ -1845,6 +1867,7 @@ long utxo_live_catchup(void* store_buf){
         }
         if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && !shutdown_requested()) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
+            UTXO_LSM_BARRIER();   /* ARM: reload/compact may clobber callee-saved regs */
             fprintf(stderr, "[utxo_live] compact manifest_n=%lu -> result=%ld\n", g_utxo_lst.manifest_n, cr);
         }
     }
@@ -1870,6 +1893,7 @@ long utxo_live_recover(void){
         u64 before = g_utxo_lst.manifest_n;
         if (before < 2) break;
         long cr = utxo_lsm_compact(&g_utxo_lst);
+        UTXO_LSM_BARRIER();   /* ARM: reload/compact may clobber callee-saved regs */
         fprintf(stderr, "[utxo_live] recover: compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break;   /* no progress -- stop */
@@ -1906,7 +1930,11 @@ long utxo_live_walk_count(void){
  * flushes DURING a ghost/heal cycle, which production hit at bulk scale and
  * the default test-sized thresholds never reach. */
 /* Test/ops: force a flush now (same call catch-up's own cadence makes). */
-long utxo_live_flush(void){ return utxo_lsm_flush(&g_utxo_lst, g_utxo_table); }
+long utxo_live_flush(void){
+    long r = utxo_lsm_flush(&g_utxo_lst, g_utxo_table);
+    UTXO_LSM_BARRIER();   /* ARM: flush/reload may clobber callee-saved regs */
+    return r;
+}
 
 void utxo_live_set_flush_thresholds(u64 fill, u64 op){
     g_utxo_lst.fill_threshold = fill;
@@ -1947,5 +1975,6 @@ long utxo_live_resolve(const u8 txid[32], unsigned long index,
 
 void utxo_live_close(void){
     utxo_lsm_close(&g_utxo_lst);
+    UTXO_LSM_BARRIER();   /* ARM: close may clobber callee-saved regs */
     g_recovery_checked = 0;
 }
