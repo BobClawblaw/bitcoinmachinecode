@@ -254,13 +254,75 @@ extern void idxscan_progress(long* out_tip, long* out_present);
  * here. Drops the periodic "[hashidx] N/M" progress print: the whole build
  * is now a small fraction of a second on the real archive (was ~186s), so
  * there's nothing left to show progress on. */
+/* Heights already folded into ht_idx. The boot build covers [0, this), and
+ * serve_idx_topup carries it forward from there. */
+static long g_htidx_next;
+
+static long htidx_file_heights(void){
+    struct stat sb;
+    if (stat("index.dat", &sb) != 0) return 0;
+    return (long)(sb.st_size / 48);
+}
+
 static int build_hash_index(void){
     ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);   /* last slot may need a full --- actually over-allocate */
     if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
     idx_init(ht_idx, HT_SLOTS);
     if(idx_build_from_file(ht_idx, "index.dat")<0){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
+    g_htidx_next = htidx_file_heights();
     fprintf(stderr,"[hashidx] indexed %ld stored heights\n", (long)idx_count(ht_idx));
     return 0;
+}
+
+/* serve_idx_topup -- fold every height index.dat has gained since this
+ * process last looked into the serve path's hash index.
+ *
+ * WHY THIS EXISTS: the hash index the serve path answers `getdata` from was
+ * built ONCE, at boot. New blocks are appended by the DOWNLOAD WORKER, which
+ * is a different process, so neither the serve parent nor any serve child
+ * forked from it ever learned about them. The result, found 2026-08-28 by
+ * validation/p2p_inbound_probe.py: a block that was in the archive at
+ * startup is served, and a block downloaded during the run is answered with
+ * silence -- so this node never helped propagate RECENT blocks, which is the
+ * only propagation that matters. Block serving had been verified the day
+ * before and passed, because a caught-up node mostly answers for historical
+ * blocks and those WERE in the archive at boot.
+ *
+ * This is the same incremental top-up rpc_chain.c's refresh() already does
+ * for the RPC side, which is why the RPC layer never had the bug.
+ *
+ * Cheap when nothing is new: one stat(2), then a return. Called from
+ * bitcoin_serve.asm at the top of getdata handling, so a long-lived
+ * connection cannot go stale either. */
+long serve_idx_topup(void){
+    if (!ht_idx) return 0;
+    long have = htidx_file_heights();
+    if (have <= g_htidx_next) return 0;
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return 0;
+    long added = 0;
+    unsigned char rec[48];
+    for (long h = g_htidx_next; h < have; h++){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48) break;
+        /* an all-zero record is a hole -- a height the store has not filled
+         * yet. Indexing it would map the zero hash to a height. */
+        int present = 0;
+        for (int i = 0; i < 32; i++) if (rec[i]){ present = 1; break; }
+        if (present && idx_put(ht_idx, rec, h) == 2){
+            /* index full: stop, and do NOT advance the cursor past the
+             * height we failed to add */
+            fprintf(stderr,"[hashidx] WARNING: hash index full at height %ld; "
+                           "blocks above it cannot be served until restart\n", h);
+            break;
+        }
+        g_htidx_next = h + 1;
+        if (present) added++;
+    }
+    close(fd);
+    if (added)
+        fprintf(stderr,"[hashidx] +%ld height(s) now servable (through %ld)\n",
+                added, g_htidx_next - 1);   /* parent-side; a child normally adds 0 */
+    return added;
 }
 
 /* STAGE B: rebuild the hash index in place after a reorg truncated the store.
@@ -273,10 +335,13 @@ static int build_hash_index(void){
 static void rebuild_hash_index_after_reorg(void){
     if(!ht_idx) return;
     idx_init(ht_idx, HT_SLOTS);
+    g_htidx_next = 0;             /* the rebuild re-reads the file from 0 */
     if(idx_build_from_file(ht_idx, "index.dat")<0)
         fprintf(stderr,"[reorg] WARNING: hash index rebuild failed; block-by-hash serving is degraded until restart\n");
-    else
+    else {
+        g_htidx_next = htidx_file_heights();
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
+    }
     /* the txid-index tail's covered-height watermark must follow a
      * truncation too, or the reconnected blocks would be skipped as
      * already-indexed (fires with tip == fork height on the mid-reorg
@@ -4074,6 +4139,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c=accept(l,(struct sockaddr*)&ca,&cal);
+            /* Fold new heights into the PARENT's index before forking, so
+             * the child inherits a current one and its own top-up is a
+             * no-op. Without this each child re-scans everything appended
+             * since boot, and says so in the log once per connection. */
+            if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window */
                 close(c); c = -1;
