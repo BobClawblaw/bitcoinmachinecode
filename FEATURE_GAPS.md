@@ -804,7 +804,24 @@ not just present as unused/tested-in-isolation code:
   stripped silently.
 
 Confirmed absent:
-- **Tor / I2P / onion support** — zero hits for tor/.onion/torcontrol.
+- ~~**Tor / I2P / onion support** — zero hits for tor/.onion/torcontrol.~~ —
+  **IN PROGRESS 2026-08-28, phase 1 of 4 landed:** a generic BIP155 address
+  type (`daemon/netaddr.c`, with SHA3-256 and RFC 4648 base32 for onion v3 /
+  b32.i2p names), a version-2 address book for every network
+  (`daemon/addrbook.c`, migrated from the IPv4-only `peers.dat`), ingest and
+  getaddr replies for all networks, real per-network RPC fields, and Core's
+  `addpeeraddress`. Proven against Core: it accepts our onion/i2p/cjdns
+  entries into its own addrman. **Phases 2-3 also landed 2026-08-28: this
+  node now DIALS BITCOIN PEERS OVER TOR AND I2P.** `daemon/socks5.c`
+  (Core's netbase Socks5 byte for byte), `daemon/torcontrol.c` (ADD_ONION
+  ED25519-V3, key persisted as Core names it), `daemon/i2psam.c` (SAM 3.1)
+  and `daemon/dialer.c` (per-network routing, `-onlynet`, stream isolation).
+  Proven with Bitcoin Core behind its own onion service on the real tor:
+  Core reports us as an inbound peer with `"network": "onion"` and a
+  completed handshake; and with a real remote I2P stream. **Still absent:**
+  IPv6 sockets and therefore CJDNS (phase 4) -- the socket layer is
+  AF_INET only, so those peers are refused at the dialer with that reason
+  rather than timing out.
 - ~~**ZMQ notification interface**~~ — **REAL since 2026-08-26**:
   `hashblock`/`hashtx`/`rawblock`/`rawtx` publish over a hand-written ZMTP
   3.1 PUB socket (`daemon/zmq_notify.c`, `daemon/zmq_pub.c`), with

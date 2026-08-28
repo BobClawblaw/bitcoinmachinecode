@@ -14,6 +14,7 @@
  */
 #include <string.h>
 #include <stdio.h>
+#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include "../rpc_node.h"
 
 extern void zmqpub_notify(const char* topic, const void* body, unsigned long blen);
