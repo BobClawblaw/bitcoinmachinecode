@@ -217,11 +217,32 @@ tables and the writers themselves.
   **byte-identical** to Core's for the same request. Requires the filter
   index to have been built (`daemon/build_block_filters`), exactly as Core
   requires `-blockfilterindex`.
-- **addrv2 (BIP155) is parsed but never NEGOTIATED.** `bitcoin_addrmgr.asm`
-  has the addrv2 codec, but the handshake never sends `sendaddrv2`, so no
-  peer will ever send us one (probe: Core offers it, we do not). This list
-  previously described addrv2 as "genuinely wired into the real serve loop",
-  which is true of the codec and false of the negotiation.
+- ~~**addrv2 (BIP155) is parsed but never NEGOTIATED.**~~ — **CLOSED
+  2026-08-28.** Both handshake roles offer `sendaddrv2` after version and
+  before verack, gated on peer protocol >= 70016 as Core does, and remember
+  the peer's own offer; such a peer gets BIP155-encoded `addrv2` for getaddr
+  replies and self-announcements. Proven against a real Core: it logs
+  `received: sendaddrv2` from us with no after-verack complaint, receives a
+  42-byte `addrv2` for its getaddr (its own size for those records), and its
+  getnodeaddresses lists every planted address. *(The claim that
+  `bitcoin_addrmgr.asm` "has the addrv2 codec" was also wrong: it had a
+  v1 encoder only, and the v1 encoder was itself wrong -- IPv4 at the wrong
+  offset with no ::ffff: marker, one-byte count -- with its test pinning the
+  mistake. And the serve loop's getaddr reply had NEVER answered anyone: its
+  loop bound lived in a register the callee took as an argument. All three
+  fixed the same day; `addrv2` decoding for the book exists only in
+  `daemon/addr_ingest.c`.)* An adversarial review before merge found two
+  more, both pre-existing and both fixed: the book stored ports in two byte
+  orders (604 of the live node's 5,990 records byte-swapped;
+  `validation/peers_dat_port_audit.py` repairs it), and the v1 ingest parser
+  read the IPv4 from the wrong offset and fabricated addresses from
+  timestamps. Later the same day: outbound legs fold addr/addrv2 gossip
+  into the book (Core's per-address token bucket + the existing quotas), a
+  post-verack sendaddrv2/wtxidrelay disconnects as in Core (the probe now
+  reports `<disconnected>` and reads identically for both nodes), and the
+  real daemon's per-leg negotiation is asserted end to end. Still IPv4-only
+  storage: Tor/I2P/CJDNS addresses now arrive but are not kept -- a
+  record-format change, and the node has no Tor/I2P transport to use them.
 - **Full-verification IBD benchmark vs Core** (`-assumevalid=0
   -stopatheight`, second scratch datadir) — **still never run.** The one
   like-for-like end-to-end speed comparison, and the only item here that is

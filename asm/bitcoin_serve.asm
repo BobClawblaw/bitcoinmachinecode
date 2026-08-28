@@ -29,6 +29,8 @@ default rel
     extern amr_count
     extern amr_get_i
     extern p2p_addr_v1
+extern p2p_addr_v2
+extern g_peer_wants_addrv2
     extern idx_get
     extern serve_idx_topup
     extern serve_cfilters
@@ -64,6 +66,7 @@ hp_buf:    times (2000*81+8) db 0 ; headers page buffer
 serve_txid_scratch: times SERVE_TXID_CAP*32 db 0  ; cons_verify scratch (own buffer)
 cn_pong:   db "pong",0
 cn_addr:   db "addr",0
+cn_addrv2: db "addrv2",0
 cn_block:  db "block",0
 cn_notfnd: db "notfound",0
 cn_head:   db "headers",0
@@ -92,6 +95,7 @@ s_peerfee: dq 0                   ; peer's `feefilter` (min relay feerate, sat/k
 s_myfee:   dq 1000                ; OUR min-relay-feerate (sat/kB) advertised to peers via
                                   ;   a `feefilter` message (1000 sat/kB = 1 sat/vB, Core default)
 s_feesent: db 0                   ; have we sent our `feefilter` to this peer yet
+s_addrsent: db 0                  ; getaddr answered once on this connection (Core: m_getaddr_recvd)
 s_lasttip: dq 0                   ; remembered stored tip (height) for tip-watch announce
 s_idxn:    dq 0                   ; # indexes parsed from getblocktxn
 s_idxbuf:  times (512*2) db 0      ; getblocktxn requested tx indexes (u16 LE each)
@@ -144,6 +148,7 @@ s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
 s_ptr:    dq 0
 s_p:      dq 0
+s_abound: dq 0        ; getaddr reply: loop bound (min(book,1000)), kept in MEMORY
 s_n:      dq 0
 s_served: dq 0
 s_tip:    dq 0
@@ -292,6 +297,7 @@ node_serve_loop:
     mov  qword [s_shdr], 0
     mov  qword [s_peerfee], 0
     mov  byte [s_feesent], 0
+    mov  byte [s_addrsent], 0
     mov  eax, [r14+24]           ; tip height (st[24])
     mov  [s_lasttip], rax
     ; feefilter_send(fd) -- 8-byte int64 LE min-relay-feerate (s_myfee)
@@ -345,10 +351,12 @@ node_serve_loop:
     je   .do_tx
     cmp  dword [s_cmd], 0x636f6c62   ; "bloc" ("block" command byte0..3, LE)
     je   .do_block
-    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct / sendheaders)
+    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct / sendheaders / sendaddrv2)
     je   .maybe_sendcmpct
     cmp  dword [s_cmd], 0x66656566   ; "feef" (feefilter)
     je   .maybe_feefilter
+    cmp  dword [s_cmd], 0x69787477   ; "wtxi" (wtxidrelay) -- a handshake-only
+    je   .done                       ;   message; after verack Core disconnects
     jmp  .next
 
 .do_verack:
@@ -600,56 +608,87 @@ node_serve_loop:
     ; "getaddr" -> dword0 "geta", index4..7 "ddr\0"
     cmp  dword [s_cmd+4], 0x00726464 ; "ddr\0"
     jne  .next
+    ; Core answers getaddr ONCE per connection and ignores repeats
+    ; (m_getaddr_recvd: "reduce resource waste"); a peer re-asking every
+    ; second would otherwise cost an open + up to 1000 lseek/read pairs +
+    ; a 30 KB write each time.
+    cmp  byte [s_addrsent], 0
+    jne  .next
+    mov  byte [s_addrsent], 1
     ; ---- addr reply ----
+    ; REWRITTEN 2026-08-28. This handler had never answered anyone: the loop
+    ; below kept its bound in rdx, which is also amr_get_i's out-pointer
+    ; argument, so after the first record the bound was a buffer address and
+    ; the loop walked off the end of the book for millions of iterations
+    ; (hermetic trace: records 0,18,36 read, then 54,72,90,... forever). With
+    ; a real-sized book it would then have overrun src_buf and ah_buf. The
+    ; old amr_init check was `jz` on a routine that returns 1 or -1, and the
+    ; fd it opened was never closed. Bound and counters now live in memory.
     lea  rdi, [amr_ab]
     call amr_init
-    test rax, rax
-    jz   .next
+    cmp  rax, 1
+    jne  .next
     lea  rdi, [amr_ab]
     call amr_count
-    mov  rdx, rax
-    cmp  rdx, 1000
+    test rax, rax
+    jle  .addr_close             ; empty/unreadable book: Core sends nothing either
+    cmp  rax, 1000               ; MAX_ADDR_TO_SEND, and the size of src_buf/ah_buf
     jbe  .acnt
-    mov  rdx, 1000
+    mov  rax, 1000
 .acnt:
-    xor  rax, rax            ; have = 0
-    xor  rcx, rcx            ; i = 0
+    mov  [s_abound], rax
+    mov  qword [s_p], 0          ; have
+    mov  qword [s_cnt], 0        ; i
 .aloop:
-    cmp  rcx, rdx
+    mov  rcx, [s_cnt]
+    cmp  rcx, [s_abound]
     jae  .adone
+    mov  rax, [s_p]
+    lea  r9,  [rax + rax*8]      ; have*9
+    shl  r9,  1                  ; have*18
+    lea  rdx, [src_buf + r9]     ; dst = src_buf + have*18
     lea  rdi, [amr_ab]
     mov  rsi, rcx
-    ; dst = src_buf + have*18  (scale 18 not encodable; compute rdx manually)
-    lea  r9,  [rax + rax*8]   ; have*9
-    shl  r9,  1               ; have*18
-    lea  rdx, [src_buf + r9]
-    ; save have/rcx across amr_get_i (callee-saved: rbx,r12-r15 only)
-    mov  [s_p], rax
-    mov  [s_cnt], rcx
     call amr_get_i
-    mov  rax, [s_p]
-    mov  rcx, [s_cnt]
     cmp  rax, 1
     jne  .anext
-    inc  rax                 ; have++
+    inc  qword [s_p]
 .anext:
-    inc  rcx
+    inc  qword [s_cnt]
     jmp  .aloop
 .adone:
-    test rax, rax
-    jz   .next
-    ; p2p_addr_v1(ah_buf, src_buf, have)
+    mov  rdx, [s_p]
+    test rdx, rdx
+    jz   .addr_close
+    ; Encoding follows the peer's handshake: BIP155 `addrv2` if it sent
+    ; sendaddrv2 before verack (Core sends only addrv2 to such a peer),
+    ; else the legacy `addr`.
+    cmp  qword [g_peer_wants_addrv2], 0
+    jne  .addr_v2
     lea  rdi, [ah_buf]
     lea  rsi, [src_buf]
-    mov  rdx, rax
     call p2p_addr_v1
-    mov  r8d, eax           ; addr payload length (p2p_write arg5 = r8)
-    ; p2p_write(fd,"addr",4, ah_buf, L)
+    mov  r8d, eax                ; payload length (p2p_write arg5 = r8)
     mov  rdi, r12
     lea  rsi, [cn_addr]
     mov  rdx, 4
     lea  rcx, [ah_buf]
     call p2p_write
+    jmp  .addr_close
+.addr_v2:
+    lea  rdi, [ah_buf]
+    lea  rsi, [src_buf]
+    call p2p_addr_v2
+    mov  r8d, eax
+    mov  rdi, r12
+    lea  rsi, [cn_addrv2]
+    mov  rdx, 6
+    lea  rcx, [ah_buf]
+    call p2p_write
+.addr_close:
+    mov  rdi, [amr_ab]           ; close the book fd (one open per getaddr, never closed before)
+    mov  eax, 3
+    syscall
     jmp  .next
 
 .maybe_getdata:
@@ -1213,6 +1252,12 @@ node_serve_loop:
     ;   cmd[4]=='c' && cmd[5]=='m' -> sendcmpct : BIP152 negotiation.
     cmp  byte [s_cmd+4], 'h'
     je   .do_sendheaders
+    ; sendaddrv2 is handshake-only (BIP155: before verack). This loop only
+    ; runs after verack, so one arriving here is a protocol violation; Core
+    ; disconnects ("sendaddrv2 received after verack"), and so do we -- an
+    ; offer we could not honour would be silently misleading. (2026-08-28)
+    cmp  byte [s_cmd+4], 'a'
+    je   .done
     cmp  byte [s_cmd+4], 'c'
     jne  .next
     cmp  byte [s_cmd+5], 'm'

@@ -46,7 +46,8 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 #define AI_MAX_PER_RESPONSE 256
 #define AI_MAX_PER_NETGROUP 16
 
-typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken; } ai_quota_t;
+typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken;
+                 long limit; /* > 0: consider at most this many records (caller's token budget) */ } ai_quota_t;
 
 static int ai_quota_ok(ai_quota_t* q, unsigned ip){
     if(q->taken >= g_cfg.addr_max_per_response) return 0;
@@ -75,20 +76,34 @@ static int ai_public_v4(const unsigned char* a){
     return 1;
 }
 
-/* v1 addr payload -> book. 30-byte records after the CompactSize count. */
+/* v1 addr payload -> book. 30-byte records after the CompactSize count:
+ * time(4) services(8) ip16(16) port(2 BE). An IPv4 is carried IPv4-MAPPED:
+ * ten zero bytes, ff ff, then a.b.c.d at 24..27 of the record.
+ *
+ * FIXED 2026-08-28. This read the address from record offset 12 -- the
+ * FIRST four bytes of the ip16 field, which are 00 00 00 00 for every mapped
+ * IPv4 Core sends -- and then "fell back" to offset 0, the timestamp, so a
+ * v1 reply either yielded nothing or wrote a FABRICATED address made of time
+ * bytes (e.g. 60.154.176.104 for t=0x68b09a3c) with the real port into the
+ * book. Found by an adversarial review that executed this function on
+ * Core's own msg_addr bytes. Anything not in the mapped form is skipped. */
 static long ai_ingest_addr1(void* ab, const unsigned char* pl, long plen, ai_quota_t* q){
     long cnt = p2p_addr_count(pl, plen); if(cnt<=0) return 0;
     long base = (pl[0]<0xfd)?1:(pl[0]==0xfd?3:(pl[0]==0xfe?5:9));
     long added=0;
+    static const unsigned char v4map[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
     for(long k=0;k<cnt;k++){
+        if(q->limit > 0 && k >= q->limit) break;         /* token budget exhausted */
         const unsigned char* r = pl + base + k*30;
         if(base+k*30+30>plen) break;
-        /* v4 lives in the last 4 bytes of the 16-byte ip field; some peers
-         * put it at 0..3, so accept either form. */
-        const unsigned char* ipb = r+12;
-        if(!ai_public_v4(ipb)) ipb = r;
+        if(memcmp(r+12, v4map, 12)!=0) continue;        /* not an IPv4-mapped entry */
+        const unsigned char* ipb = r+24;
         if(!ai_public_v4(ipb)) continue;
-        unsigned short port = (r[28]<<8)|r[29];
+        /* the book stores the port BIG-ENDIAN, exactly as it sits on the
+         * wire (see amr_add); this passed the host-order value, so every
+         * gossip-learned port was stored byte-swapped and, once getaddr
+         * replies worked, would have been served byte-swapped to Core */
+        unsigned short port = htons((unsigned short)((r[28]<<8)|r[29]));
         unsigned long long svc = (unsigned long long)r[4] | (unsigned long long)r[5]<<8 |
             (unsigned long long)r[6]<<16 |(unsigned long long)r[7]<<24 | (unsigned long long)r[8]<<32 |
             (unsigned long long)r[9]<<40 |(unsigned long long)r[10]<<48 |(unsigned long long)r[11]<<56;
@@ -140,6 +155,7 @@ static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_qu
     if(!ai_compact(pl, plen, &pos, &cnt)) return 0;
     long added = 0;
     for(unsigned long long k=0; k<cnt; k++){
+        if(q->limit > 0 && (long)k >= q->limit) break;   /* token budget exhausted */
         if(pos + 4 > (unsigned long long)plen) break;
         unsigned tm = (unsigned)pl[pos] | ((unsigned)pl[pos+1]<<8)
                     | ((unsigned)pl[pos+2]<<16) | ((unsigned)pl[pos+3]<<24);
@@ -153,7 +169,7 @@ static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_qu
         if(pos + alen + 2 > (unsigned long long)plen) break;
         const unsigned char* ad = pl + pos;
         pos += alen;
-        unsigned short port = (unsigned short)((pl[pos]<<8) | pl[pos+1]);
+        unsigned short port = htons((unsigned short)((pl[pos]<<8) | pl[pos+1]));  /* book: BE on disk */
         pos += 2;
         if(net == 1 && alen == 4 && ai_public_v4(ad)){   /* 1 == IPv4 */
             unsigned ip = (unsigned)ad[0] | (unsigned)ad[1]<<8 | (unsigned)ad[2]<<16 | (unsigned)ad[3]<<24;
@@ -162,6 +178,19 @@ static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_qu
         }
     }
     return added;
+}
+
+/* Fold one received addr/addrv2 payload into the book. Public so the
+ * parsers above can be tested on Core's own bytes without a live peer;
+ * addr_gather_from uses the same functions with its per-peer quota. */
+long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
+    ai_quota_t quota; memset(&quota,0,sizeof quota); quota.limit = limit;
+    if(!strncmp(cmd,"addrv2",6)) return ai_ingest_addrv2(ab, pl, plen, &quota);
+    if(!strncmp(cmd,"addr",4))   return ai_ingest_addr1(ab, pl, plen, &quota);
+    return 0;
+}
+long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long plen){
+    return addr_ingest_msg_n(ab, cmd, pl, plen, 0);
 }
 
 /* Connect, handshake, send getaddr, and fold replies into `ab` for up to

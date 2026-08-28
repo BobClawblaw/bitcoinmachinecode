@@ -86,7 +86,7 @@ static void build_chain(void){
  * CHILD, writes the bound port to port_pipe, then serves node_sync on the
  * first accepted (the node's outbound) connection. Exposes GROW blocks; a
  * 'M' byte on grow_pipe "mines" the next one. */
-static void mining_peer(int port_pipe, int grow_pipe){
+static void mining_peer(int port_pipe, int grow_pipe, int stat_pipe){
     int ls=socket(AF_INET,SOCK_STREAM,0);
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     if(bind(ls,(struct sockaddr*)&a,sizeof a)<0){ fprintf(stderr,"[peer] bind fail\n"); _exit(9); }
@@ -101,9 +101,20 @@ static void mining_peer(int port_pipe, int grow_pipe){
      * version first as the outbound initiator via node_handshake) */
     char cmd[12]; unsigned char pl[4096]; unsigned plen=0;
     plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;      /* node version */
-    { unsigned char v[102]; memset(v,0,sizeof v); v[4]=9; p2p_write(cfd,"version",7,v,86);
+    /* speak 70016 and offer BIP155 before our verack, so the REAL daemon's
+     * outbound handshake (a) offers sendaddrv2 back and (b) records our
+     * offer per leg -- the mux log line then carries addrv2=1 */
+    { unsigned char v[102]; memset(v,0,sizeof v); v[0]=0x80; v[1]=0x11; v[2]=0x01; v[4]=9;
+      p2p_write(cfd,"version",7,v,86);
+      p2p_write(cfd,"sendaddrv2",10,"",0);
       p2p_write(cfd,"verack",6,"",0); }
-    plen=0; p2p_read(cfd,cmd,pl,sizeof pl,&plen); cmd[11]=0;      /* node verack */
+    /* the node's pre-verack messages: wtxidrelay, then sendaddrv2 once our
+     * version arrived, then its verack */
+    for(int i=0;i<6;i++){
+        plen=0; if(p2p_read(cfd,cmd,pl,sizeof pl,&plen)<=0) break; cmd[11]=0;
+        if(strncmp(cmd,"sendaddrv2",10)==0 && stat_pipe>=0) write(stat_pipe,"S",1);
+        if(strncmp(cmd,"verack",6)==0) break;
+    }
     int grow=5;
     int gfd=grow_pipe>=0? grow_pipe : -1;
     if(gfd>=0){ int fl=fcntl(gfd,F_GETFL); fcntl(gfd,F_SETFL, fl|O_NONBLOCK); }
@@ -178,13 +189,13 @@ int main(int argc, char** argv){
     const char* ndir = tt_workdir();
 
     /* ---- start MINING PEER, get its OUT_PORT via pipe ---- */
-    int portpipe[2], growpipe[2];
-    if(pipe(portpipe)||pipe(growpipe)){ printf("FAIL pipe\n"); return 1; }
+    int portpipe[2], growpipe[2], statpipe[2];
+    if(pipe(portpipe)||pipe(growpipe)||pipe(statpipe)){ printf("FAIL pipe\n"); return 1; }
     pid_t peer=fork();
-    if(peer==0){ close(portpipe[0]); close(growpipe[1]);
-        mining_peer(portpipe[1], growpipe[0]); _exit(9);
+    if(peer==0){ close(portpipe[0]); close(growpipe[1]); close(statpipe[0]);
+        mining_peer(portpipe[1], growpipe[0], statpipe[1]); _exit(9);
     }
-    close(portpipe[1]); close(growpipe[0]);
+    close(portpipe[1]); close(growpipe[0]); close(statpipe[1]);
     unsigned char pb[4]; unsigned short out_port=0;
     { int nr=read(portpipe[0],pb,2); if(nr==2) out_port=pb[0]|(pb[1]<<8); }
     close(portpipe[0]);
@@ -200,6 +211,9 @@ int main(int argc, char** argv){
     snprintf(oport,sizeof oport,"%d",(int)out_port);
     pid_t node=fork();
     if(node==0){
+        /* the node's stderr goes to a file so the test can read its leg log */
+        int ef=open("node.err", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        if(ef>=0){ dup2(ef,2); close(ef); }
         char* av[] = { (char*)daemon, "serve-test", (char*)ndir, sport, "127.0.0.1", oport, "1", NULL };
         execv(daemon, av);
         perror("execv node"); _exit(9);
@@ -230,6 +244,17 @@ int main(int argc, char** argv){
     /* ---- the node pulled + stored + now serves the NEW block ---- */
     int s5 = inbound_getdata(serve_port, 5);
     cki("node serves freshly-mined block 5 (no restart)", s5, 1);
+
+    /* ---- BIP155 on a REAL outbound leg of the real daemon ---- */
+    { char c=0; int fl=fcntl(statpipe[0],F_GETFL); fcntl(statpipe[0],F_SETFL,fl|O_NONBLOCK);
+      int got = read(statpipe[0],&c,1)==1 && c=='S';
+      cki("daemon offered sendaddrv2 on its outbound handshake (peer saw it pre-verack)", got, 1); }
+    { FILE* f=fopen("node.err","r"); int seen=0, seen_v1=0; char line[512];
+      if(f){ while(fgets(line,sizeof line,f)){
+          if(strstr(line,"outbound 0 =") && strstr(line,"addrv2=1")) seen=1;
+          if(strstr(line,"outbound 0 =") && strstr(line,"addrv2=0")) seen_v1=1; }
+        fclose(f); }
+      cki("leg log records the peer's offer: 'outbound 0 = ... addrv2=1'", seen && !seen_v1, 1); }
 
     /* cleanup */
     write(growpipe[1],"Q",1);

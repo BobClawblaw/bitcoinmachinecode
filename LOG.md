@@ -7,6 +7,123 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-28 -- addrv2 negotiation, and the getaddr reply that had never worked
+
+The intent was one gap from FEATURE_GAPS: "addrv2 (BIP155) is parsed but
+never NEGOTIATED" -- neither handshake role ever sent `sendaddrv2`, so no
+peer ever sent us an addrv2 message and every Tor/I2P/CJDNS address on the
+network was invisible to this node. Both roles now offer it after version
+and before verack (the window Core requires; a late one gets the connection
+dropped), gated on peer protocol >= 70016 exactly as Core does, and record
+the peer's own offer in g_peer_wants_addrv2. A peer that asked gets
+BIP155-encoded addresses from us -- getaddr replies (bitcoin_serve.asm) and
+self-announcements (daemon/addr_self.c, per outbound leg) -- because Core
+never sends v1 to a peer that negotiated v2.
+
+Three things were found on the way that were not in the gap list.
+
+THE GETADDR REPLY HAD NEVER ANSWERED ANYONE. bitcoin_serve.asm's loop kept
+its bound in rdx, which is also amr_get_i's out-pointer argument; after the
+first record the bound was a buffer address and the loop walked off the end
+of the book for millions of iterations. A hermetic strace made it plain:
+records 0, 18, 36 read, then 54, 72, 90, ... forever. With the live node's
+5,990-record book it would also have overrun src_buf (1000 records) and
+ah_buf. The amr_init check was `jz` on a routine that returns 1 or -1, and
+the book fd was never closed. The live node was probed first and answered
+getaddr with silence; the hermetic repro then showed why.
+
+THE LEGACY `addr` ENCODER WAS WRONG, AND ITS TEST PINNED THE WRONG BYTES.
+p2p_addr_v1 wrote the IPv4 at bytes 12..15 of the 16-byte field with no
+::ffff: marker, so every address went out as the IPv6 address a.b.c.d::
+(Core would classify it as IPv6), and wrote a one-byte count while callers
+pass up to 1000. tests/test_addrmgr had been written FROM the encoder, so it
+asserted both mistakes. This is the failure mode the 2026-08-22 BIP143
+entry warned about -- a reference derived from the implementation instead of
+from Core -- and the same fix: the expected bytes are now produced by Core's
+own test_framework/messages.py (msg_addr / msg_addrv2), transcribed and
+checked programmatically against the hex Core printed.
+
+THE ADDRESS BOOK IS IPv4-ONLY (18-byte records), so "addrv2" here means
+Core's encoding of IPv4 entries; the network-id byte is always 1. Learning
+Tor/I2P addresses now REACHES us on the wire but nothing stores them yet.
+Stated, not hidden.
+
+PROOF. tests/test_addrv2_serve (25 checks, hermetic): both roles offer
+sendaddrv2 to a 70016 peer and withhold it from a 70015 one; a peer without
+the offer gets `addr` byte-equal to Core's msg_addr; a peer with it gets
+`addrv2` byte-equal to Core's msg_addrv2; a 1200-record book is answered
+with exactly 1000 (3-byte CompactSize) and the server survives; the flag is
+set/reset per handshake. The test was also linked against the UNFIXED
+objects: 14 of its checks fail there, so it is not vacuous.
+validation/addrv2_regtest_e2e.sh against a real Core (-debug=net): Core logs
+`received: sendaddrv2` on our outbound leg with no after-verack complaint;
+dialling us, Core sends getaddr and logs `received: addrv2 (42 bytes)` --
+Core's own size for those records -- and its getnodeaddresses then lists
+all three planted addresses with the big-endian port and the 3-byte
+services CompactSize parsed correctly; and the inbound probe's sendaddrv2
+line is identical for this node and for Core.
+
+ADVERSARIAL REVIEW, before merge. Three independent reviewers (x86-64 ABI,
+Core semantics, test vacuity) each with a skeptic trying to refute every
+finding. The ABI lens found nothing. Seven findings survived, all fixed the
+same day; two of them were worse than the gap this work set out to close:
+
+  - THE BOOK STORED PORTS IN TWO BYTE ORDERS. amr_add writes the u16 it is
+    given; the DNS-seed writers pass htons() (big-endian on disk, the
+    verbatim wire form the encoders copy), but both gossip-ingest paths
+    passed the host-order value. The live book: 5,990 records, 604 of them
+    byte-swapped -- every address learned from a peer would have been served
+    to Core as e.g. 1.2.3.4:36128 the moment getaddr replies started
+    working. The contract is now written on amr_add (port = wire form, BE
+    on disk), both ingest paths honour it, and validation/
+    peers_dat_port_audit.py repairs a book written under the old mix (a
+    swapped default-port record reads 8333 as a little-endian u16; a correct
+    one reads 36128; anything else is left alone and counted).
+  - THE v1 INGEST PARSER FABRICATED ADDRESSES. It read the IPv4 from record
+    offset 12 -- the first four bytes of the ip16 field, always zero for the
+    ::ffff:-mapped form Core sends -- then "fell back" to offset 0, the
+    timestamp, so a v1 reply either yielded nothing or wrote an address made
+    of time bytes (1.241.83.101 for Core's own test record) with the real
+    port. The reviewer proved it by executing the parser on Core's msg_addr
+    bytes; tests/test_addr_ingest_parse now does the same on every run, and
+    linked against the OLD parser it fails 14 checks.
+  - getaddr is now answered ONCE per connection (Core's m_getaddr_recvd);
+    a repeat is ignored.
+  - three test weaknesses: an e2e grep that matched its own probe line, a
+    tautological `ck(...,1)`, and a 1000-record cap check that never looked
+    at a record. All three now assert the thing they name; the cap check
+    compares every one of the 1000 records to the planted book.
+
+THE STATED GAPS, CLOSED THE SAME EVENING (second change, same day):
+  - Outbound legs now FOLD addr/addrv2 gossip into the book (daemon/
+    tx_relay.c) through the same parsers, with Core's per-peer token bucket
+    (1000 to start, 0.1/s refill) charged PER ADDRESS: a message declaring
+    more entries than the bucket holds is processed up to the budget and
+    the rest dropped. The first cut dropped the whole message when it did
+    not fit; its own test caught that (a 1000-entry flood against a bucket
+    down by 8 vanished entirely where Core would take 992). On top sits the
+    existing per-response (256) and per-/16 (16) quota. tests/test_tx_relay
+    5c: three from addrv2, two from addr, no duplicates on re-gossip, a
+    flood capped at 256, and the NEXT single address rate-limited because
+    the flood emptied the bucket.
+  - sendaddrv2 or wtxidrelay arriving AFTER verack now disconnects, as Core
+    does ("... received after verack"). The probe reports an EOF as
+    <disconnected> instead of silence -- it could not previously tell
+    "ignored" from "hung up", and a report that cannot tell those apart
+    calls two nodes equal when they are not. Both late messages now read
+    identically for this node and for Core.
+  - The per-leg wants-v2 verdict is in the leg log line (`addrv2=1`), and
+    tests/test_outbound_mux's fake peer now speaks 70016 and offers
+    sendaddrv2: the REAL daemon's outbound handshake offers it back (the
+    peer sees it pre-verack) and its leg log records the peer's offer. Run
+    against the previous binary, the log assertion fails.
+  Still stated: the book is IPv4-only (a record-format change, not a fix;
+  the node has no Tor/I2P transport, so the only use would be relaying such
+  addresses onward); getaddr replies are the first <=1000 entries, not a
+  randomised sample; the daemon's own addrv2 self-announcement is covered
+  by test_addr_self, not end to end (needs two agreeing public views).
+
+
 ## 2026-08-28 -- the closing pass, and why it takes the daemon down
 
 The long filter backfill was launched with a FIXED target (964000, the tip

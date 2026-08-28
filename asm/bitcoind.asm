@@ -114,6 +114,7 @@ node_handshake:
                            ; peer with a long UA. 0x338 also restores 16-byte
                            ; RSP alignment at the calls (0x28+0x338 = 0x360).
     mov  r12, rdi           ; fd
+    mov  qword [rel g_peer_wants_addrv2], 0   ; per-handshake: the peer has not asked yet
     ; build version payload
     lea  rdi, [rbp-0xa0]
     call node_make_version
@@ -165,6 +166,23 @@ node_handshake:
     lea  rdi, [rel g_peer_version_payload]
     lea  rsi, [rbp-0x2e0]
     rep  movsb
+    ; BIP155: offer addrv2 now that we know the peer's protocol version.
+    ; Core sends sendaddrv2 to any peer >= 70016 (older software may reject
+    ; a message it does not know, so it is withheld below that) and REQUIRES
+    ; it before verack -- ours goes out only after the peer's verack arrives
+    ; (.send_verack), so this is inside the window. Before 2026-08-28 this
+    ; node never offered it in either role, so no peer ever sent us addrv2
+    ; and every Tor/I2P/CJDNS address on the network was invisible to us.
+    mov  eax, dword [rbp-0x2e0]   ; peer protocol version = payload[0..3]
+    cmp  eax, 70016
+    jb   .read
+    mov  rdi, r12
+    lea  rsi, [rel _sendaddrv2]
+    mov  rdx, 10
+    xor  ecx, ecx
+    xor  r8d, r8d
+    call p2p_write
+    jmp  .read
 .nh_not_version:
     ; --- is it "verack"? ---
     lea  rdi, [rbp-0xe0]
@@ -172,6 +190,17 @@ node_handshake:
     mov  ecx, 6
     repe cmpsb
     je   .send_verack
+    ; --- is it "sendaddrv2"? the peer wants BIP155-encoded addresses from
+    ; us (getaddr replies, self-announcements). Remembered per handshake in
+    ; g_peer_wants_addrv2; the C side snapshots it per leg. ---
+    lea  rdi, [rbp-0xe0]
+    lea  rsi, [rel _sendaddrv2]
+    mov  ecx, 10
+    repe cmpsb
+    jne  .nh_not_sendaddrv2
+    mov  qword [rel g_peer_wants_addrv2], 1
+    jmp  .read
+.nh_not_sendaddrv2:
     ; --- is it "ping"? ---
     lea  rdi, [rbp-0xe0]
     lea  rsi, [rel _ping]
@@ -241,6 +270,7 @@ node_accept_handshake:
                            ; our version[128] @ rbp-0x180
                            ; recv[256]      @ rbp-0x300
     mov  r12, rdi          ; fd (callee-saved)
+    mov  qword [rel g_peer_wants_addrv2], 0   ; per-handshake reset (see node_handshake)
 .read_peer_version:
     ; wait for the peer's `version`
 .loop:
@@ -304,6 +334,19 @@ node_accept_handshake:
     xor  ecx, ecx
     xor  r8d, r8d
     call p2p_write
+    ; BIP155 sendaddrv2 -- also before verack, gated on the peer's version
+    ; exactly as in node_handshake (the peer's version is already in hand
+    ; here, at [rbp-0x300])
+    mov  eax, dword [rbp-0x300]
+    cmp  eax, 70016
+    jb   .av2_skip
+    mov  rdi, r12
+    lea  rsi, [rel _sendaddrv2]
+    mov  rdx, 10
+    xor  ecx, ecx
+    xor  r8d, r8d
+    call p2p_write
+.av2_skip:
     ; send our verack
     mov  rdi, r12
     lea  rsi, [rel _verack]
@@ -327,6 +370,15 @@ node_accept_handshake:
     mov  ecx, 6
     repe cmpsb
     je   .ok
+    ; "sendaddrv2"? remember that this peer wants addrv2 from us
+    lea  rdi, [rbp-0x48]
+    lea  rsi, [rel _sendaddrv2]
+    mov  ecx, 10
+    repe cmpsb
+    jne  .ah_not_sendaddrv2
+    mov  qword [rel g_peer_wants_addrv2], 1
+    jmp  .read_peer_verack
+.ah_not_sendaddrv2:
     ; ping? echo pong
     lea  rdi, [rbp-0x48]
     lea  rsi, [rel _ping]
@@ -2067,11 +2119,19 @@ global g_peer_version_payload
 global g_peer_version_len
 g_peer_version_payload: times 256 db 0
 g_peer_version_len:     dq 0
+; ---- BIP155: did the peer send `sendaddrv2` before verack? 1/0, reset at
+; the start of every handshake in both roles. Read by bitcoin_serve.asm
+; (getaddr reply encoding) and snapshotted per outbound leg by daemon/main.c
+; (self-announcement encoding). Same one-process-per-connection reasoning
+; as the version snapshot above.
+global g_peer_wants_addrv2
+g_peer_wants_addrv2:    dq 0
 
 section .rodata
 _version: db "version",0
 _verack:  db "verack",0
 _wtxidrelay: db "wtxidrelay",0
+_sendaddrv2: db "sendaddrv2",0
 _ping:    db "ping",0
 _pong:    db "pong",0
 _getheaders: db "getheaders",0

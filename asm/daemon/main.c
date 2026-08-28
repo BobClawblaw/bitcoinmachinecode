@@ -102,6 +102,7 @@ extern long node_handshake(int fd);
 extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, see its header comment */
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
+extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before verack (per handshake) */
 
 /* NODE_WITNESS (service bit 0x8) gate, checked right after every OUTBOUND
  * handshake that can lead to fetching blocks or transactions. A peer without
@@ -738,6 +739,9 @@ static int serve_loop(int fd, int lfd){
 #define MUX_WANT_OUT() ((int)(g_cfg.max_outbound > MUX_MAX_OUT ? MUX_MAX_OUT : \
                               (g_cfg.max_outbound < 1 ? 1 : g_cfg.max_outbound)))
 static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
+/* per-leg BIP155 verdict from the handshake: 1 = the peer sent sendaddrv2,
+ * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
+static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
 static int   mux_n_out = 0;
@@ -1377,9 +1381,10 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down)\n",
                      i, peers[p], dial_fail_reason()); return; }
     mux_out_fd[i]=fd;
+    mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
     strncpy(mux_out_host[i], peers[p], 63);
     anchor_locator(mux_out_loc[i]);
-    fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d)\n", i, peers[p], fd);
+    fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d\n", i, peers[p], fd, (int)mux_out_wants_v2[i]);
 }
 
 /* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
@@ -3087,11 +3092,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
             mux_out_fd[mux_n_out]=cfd[i];
+            mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
             mux_out_nextretry[mux_n_out]=0;
             { char pv[256]; format_peer_version_info(pv, sizeof pv);
-              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[i], cfd[i], pv); }
+              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out]); }
             rpc_fill_peer_slot(mux_n_out, srcpool[i]);   /* publish peer to getpeerinfo */
             mux_n_out++;
         }
@@ -3576,8 +3582,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern long txrelay_announce(const int* fds, int nfds);
             txrelay_announce(mux_out_fd, mux_n_out);
         }
-        { extern long addrself_maybe_announce(const int*, int);
-          addrself_maybe_announce(mux_out_fd, mux_n_out); }
+        { extern long addrself_maybe_announce(const int*, const unsigned char*, int);
+          addrself_maybe_announce(mux_out_fd, mux_out_wants_v2, mux_n_out); }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would
@@ -3807,11 +3813,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 63);
                     mux_out_fd[mux_n_out]=nfd;
+                    mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
                     mux_out_nextretry[mux_n_out]=0;
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
-                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[ci], nfd, pv); }
+                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[ci], nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
                     rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
                     mux_n_out++;
                 }
@@ -4098,9 +4105,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 63);
         mux_out_fd[mux_n_out]=fd;
+        mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
-        fprintf(stderr,"[mux] outbound %d = %s (fd %d)\n", mux_n_out, peers[i], fd);
+        fprintf(stderr,"[mux] outbound %d = %s (fd %d) addrv2=%d\n", mux_n_out, peers[i], fd, (int)mux_out_wants_v2[mux_n_out]);
         mux_n_out++;
     }
     fprintf(stderr, "serving on port %d (%d outbound peer(s))...\n", port, mux_n_out);
