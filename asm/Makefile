@@ -1670,8 +1670,8 @@ tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXAC
 # test_tx_relay -- the worker's receive-side tx relay (daemon/tx_relay.c):
 # inv -> getdata(MSG_WITNESS_TX) -> validate+accept over a socketpair leg,
 # pool/ring dedupe, reject handling, and the consumed-ping pong.
-tests/test_tx_relay: tests/test_tx_relay.c tests/modern_spend.h daemon/tx_relay.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) bitcoin_net.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 -o $@ tests/test_tx_relay.c daemon/tx_relay.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o)
+tests/test_tx_relay: tests/test_tx_relay.c tests/modern_spend.h daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 -o $@ tests/test_tx_relay.c daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o)
 
 tests/test_tx_submit: tests/test_tx_submit.c tests/modern_spend.h daemon/tx_submit.c $(TXACCEPTOBJS) bitcoin_net.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 -o $@ tests/test_tx_submit.c daemon/tx_submit.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS)) bitcoin_net.o

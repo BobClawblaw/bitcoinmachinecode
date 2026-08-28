@@ -46,7 +46,8 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 #define AI_MAX_PER_RESPONSE 256
 #define AI_MAX_PER_NETGROUP 16
 
-typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken; } ai_quota_t;
+typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken;
+                 long limit; /* > 0: consider at most this many records (caller's token budget) */ } ai_quota_t;
 
 static int ai_quota_ok(ai_quota_t* q, unsigned ip){
     if(q->taken >= g_cfg.addr_max_per_response) return 0;
@@ -92,6 +93,7 @@ static long ai_ingest_addr1(void* ab, const unsigned char* pl, long plen, ai_quo
     long added=0;
     static const unsigned char v4map[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
     for(long k=0;k<cnt;k++){
+        if(q->limit > 0 && k >= q->limit) break;         /* token budget exhausted */
         const unsigned char* r = pl + base + k*30;
         if(base+k*30+30>plen) break;
         if(memcmp(r+12, v4map, 12)!=0) continue;        /* not an IPv4-mapped entry */
@@ -153,6 +155,7 @@ static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_qu
     if(!ai_compact(pl, plen, &pos, &cnt)) return 0;
     long added = 0;
     for(unsigned long long k=0; k<cnt; k++){
+        if(q->limit > 0 && (long)k >= q->limit) break;   /* token budget exhausted */
         if(pos + 4 > (unsigned long long)plen) break;
         unsigned tm = (unsigned)pl[pos] | ((unsigned)pl[pos+1]<<8)
                     | ((unsigned)pl[pos+2]<<16) | ((unsigned)pl[pos+3]<<24);
@@ -180,11 +183,14 @@ static long ai_ingest_addrv2(void* ab, const unsigned char* pl, long plen, ai_qu
 /* Fold one received addr/addrv2 payload into the book. Public so the
  * parsers above can be tested on Core's own bytes without a live peer;
  * addr_gather_from uses the same functions with its per-peer quota. */
-long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long plen){
-    ai_quota_t quota; memset(&quota,0,sizeof quota);
+long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
+    ai_quota_t quota; memset(&quota,0,sizeof quota); quota.limit = limit;
     if(!strncmp(cmd,"addrv2",6)) return ai_ingest_addrv2(ab, pl, plen, &quota);
     if(!strncmp(cmd,"addr",4))   return ai_ingest_addr1(ab, pl, plen, &quota);
     return 0;
+}
+long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long plen){
+    return addr_ingest_msg_n(ab, cmd, pl, plen, 0);
 }
 
 /* Connect, handshake, send getaddr, and fold replies into `ab` for up to
