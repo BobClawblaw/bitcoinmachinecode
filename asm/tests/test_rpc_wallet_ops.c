@@ -448,37 +448,17 @@ int main(void){
       rj_free(r); rj_free(p); }
 
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
-    { static const char* REFUSE[] = { "addhdkey" };
-      /* walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
-       * encryptwallet left 2026-08-27 (real; -8 asserted below).
-       * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
-       * left 2026-08-27: MULTI-WALLET is real now -- the whole lifecycle is
-       * exercised at the end of this file.
-       * bumpfee/psbtbumpfee left 2026-08-27: REAL now (Core feebumper
-       * semantics; differentially proven on regtest) -- bad-arg forms
-       * asserted below.
-       * exportwatchonlywallet left 2026-08-27: REAL now -- the wallet's whole
-       * key set is its two concrete descriptors (see listdescriptors), so the
-       * export is complete rather than truncated, and the round trip through
-       * restorewallet is proven in validation/bumpfee_regtest_e2e.sh. Its
-       * bad-arg form is asserted just below.
-       * migratewallet, createwalletdescriptor, importprunedfunds and
-       * removeprunedfunds left 2026-08-27: the first two answer Core's own
-       * verdict for a wallet of this shape (already-a-descriptor-wallet /
-       * Descriptor already exists), and the pruned-funds pair is real -- it
-       * imports no KEY material, only the knowledge that an output we
-       * already own exists, which is what made it look blocked. Their
-       * argument forms are asserted below. */
-      int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
-      for (int i = 0; i < n; i++){
-          D(REFUSE[i], NULL);
-          if (!(rc == 0 && ec == -1 && em && strlen(em) > 30)){
-              printf("      (%s returned rc=%d ec=%ld)\n", REFUSE[i], rc, ec);
-              allbad = 0;
-          }
-          rj_free(r);
-      }
-      ck("every unsupported wallet method errors with a substantive reason", allbad);
+    {   /* Nothing is refused wholesale any more. addhdkey was the last, and
+         * it is real as of 2026-08-27 (evening) -- see below and slice 25.
+         * walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
+         * encryptwallet left 2026-08-27 (real; -8 asserted below).
+         * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
+         * left 2026-08-27: MULTI-WALLET is real now -- the whole lifecycle is
+         * exercised at the end of this file.
+         * bumpfee/psbtbumpfee left 2026-08-27: REAL now (Core feebumper
+         * semantics; differentially proven on regtest).
+         * exportwatchonlywallet, migratewallet, createwalletdescriptor and the
+         * pruned-funds pair left 2026-08-27 (evening). */
       /* exportwatchonlywallet is real, so it must reject a MISSING
        * destination with Core's -8 rather than refuse wholesale */
       D("exportwatchonlywallet", NULL);
@@ -511,6 +491,24 @@ int main(void){
       D("createwalletdescriptor", NULL);
       ck("createwalletdescriptor with no type -> -8", rc == 0 && ec == -8);
       rj_free(r);
+
+      /* addhdkey stores an extended PRIVATE key, so it refuses outright
+       * unless it can encrypt it -- an xprv written in the clear beside a
+       * passphrase-protected seed would be the weakest thing in the wallet
+       * directory. This harness has no passphrase, which is exactly that
+       * path; the real add is proven on regtest. */
+      { rj_val* p1 = P("[\"xprvBogus\"]");
+        D("addhdkey", p1);
+        ck("addhdkey without a passphrase refuses rather than storing a key in the clear",
+           rc == 0 && ec == -4 && em && strstr(em, "encrypted"));
+        rj_free(r); rj_free(p1); }
+      /* gethdkeys still answers, and still reports the seed */
+      { rj_val* gk = NULL; long e3; const char* m3;
+        if (rpc_dispatch("gethdkeys", NULL, &W, &gk, &e3, &m3) == 1)
+            ck("gethdkeys lists the seed's account xpub",
+               gk && gk->typ == RJ_ARR && gk->nitems >= 1);
+        else ck("gethdkeys lists the seed's account xpub", 0);
+        rj_free(gk); }
 
       /* setwalletflag: Core's flag vocabulary and its three distinct errors.
        * avoid_reuse is not stored-and-ignored -- wf_coins skips a coin whose
