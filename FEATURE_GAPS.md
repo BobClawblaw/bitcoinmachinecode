@@ -205,15 +205,18 @@ tables and the writers themselves.
   already did for the RPC side — borrowed, not invented, which is why the RPC
   layer never had the bug. Proven on regtest against Core: a block mined
   minutes after boot is served without a restart.
-- **A `getdata` miss is answered with SILENCE, not `notfound`.** Core replies
-  `notfound`; this node says nothing, so the peer waits out its own timeout.
-  The relay drain (`daemon/tx_relay.c`) does send `notfound` — the SERVE path
-  does not. Same probe.
-- **BIP157 compact filters are BUILT but never SERVED.** `getcfilters`,
-  `getcfheaders` and `getcfcheckpt` are not in `bitcoin_serve.asm`'s dispatch
-  at all, so this node answers none of them; Core with `-peerblockfilters=1`
-  answers all three. The filter index exists and is proven byte-identical to
-  Core's — it is simply not reachable over P2P.
+- ~~**A `getdata` miss is answered with SILENCE**~~ — **CLOSED 2026-08-28.**
+  Misses are collected and returned as `notfound`, the entries copied
+  verbatim. An unrecognised inv TYPE is still ignored rather than reported,
+  which is what Core does.
+- ~~**BIP157 compact filters are BUILT but never SERVED**~~ — **CLOSED
+  2026-08-28.** `getcfilters`, `getcfheaders` and `getcfcheckpt` are all
+  answered (`daemon/serve_cfilters.c`), from stateless `bfi_get_file`
+  lookups. Verified against Core on the same chain and not merely by message
+  name: the `cfilter`, `cfheaders` and `cfcheckpt` payloads are
+  **byte-identical** to Core's for the same request. Requires the filter
+  index to have been built (`daemon/build_block_filters`), exactly as Core
+  requires `-blockfilterindex`.
 - **addrv2 (BIP155) is parsed but never NEGOTIATED.** `bitcoin_addrmgr.asm`
   has the addrv2 codec, but the handshake never sends `sendaddrv2`, so no
   peer will ever send us one (probe: Core offers it, we do not). This list
