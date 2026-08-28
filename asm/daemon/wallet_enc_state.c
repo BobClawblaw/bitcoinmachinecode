@@ -15,6 +15,7 @@
  * seed access already makes.
  */
 #include <stdio.h>
+#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>

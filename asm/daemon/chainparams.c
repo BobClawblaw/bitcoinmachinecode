@@ -9,6 +9,7 @@
  * to succeed. A transcription error cannot boot.
  */
 #include <stdio.h>
+#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include <string.h>
 #include <sys/stat.h>
 #include "chainparams.h"

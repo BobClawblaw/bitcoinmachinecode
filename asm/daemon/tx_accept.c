@@ -791,6 +791,9 @@ __attribute__((weak)) int serve_cfilters(int fd, int kind,
                                          const unsigned char* pl, unsigned long plen){
     (void)fd; (void)kind; (void)pl; (void)plen; return 0;
 }
+__attribute__((weak)) long serve_getaddr(int fd, int wants_v2){
+    (void)fd; (void)wants_v2; return 0;
+}
 
 /* log_block_stored_inbound(hash32, height, bytes): called from
  * bitcoin_serve.asm's .do_block, the ONLY place a peer-pushed block

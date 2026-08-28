@@ -31,6 +31,7 @@
  * that it happened.
  */
 #include <stdio.h>
+#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
