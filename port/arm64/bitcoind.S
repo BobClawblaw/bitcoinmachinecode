@@ -224,7 +224,7 @@ node_handshake:
 	add  x1, x1, :lo12:_ping
 	mov  x2, #4
 	bl   .Lcmpeq
-	cbz  x0, .LNHread
+	cbz  x0, .LNH_neg
 	/* echo pong */
 	mov  x0, x19
 	adrp x1, _pong
@@ -232,6 +232,50 @@ node_handshake:
 	mov  x2, #4
 	add  x3, sp, #192
 	mov  x4, #8
+	bl   p2p_write
+	b    .LNHread
+.LNH_neg:
+	/* Not ping: if it's one of the post-handshake negotiation messages Core
+	 * sends (sendheaders/sendaddrv2/wtxidrelay/sendcmpct), ECHO it back 0-len,
+	 * exactly as paribd.c connect_handshake does. Without the ack Core v31
+	 * drops our block getdata (no block/notfound reply). */
+	add  x0, sp, #160
+	adrp x1, _sendheaders
+	add  x1, x1, :lo12:_sendheaders
+	mov  x2, #11
+	bl   .Lcmpeq
+	cbz  x0, 1f
+	mov  x2, #11
+	b    .LNH_echo
+1:	add  x0, sp, #160
+	adrp x1, _sendaddrv2
+	add  x1, x1, :lo12:_sendaddrv2
+	mov  x2, #10
+	bl   .Lcmpeq
+	cbz  x0, 2f
+	mov  x2, #10
+	b    .LNH_echo
+2:	add  x0, sp, #160
+	adrp x1, _wtxidrelay
+	add  x1, x1, :lo12:_wtxidrelay
+	mov  x2, #10
+	bl   .Lcmpeq
+	cbz  x0, 3f
+	mov  x2, #10
+	b    .LNH_echo
+3:	add  x0, sp, #160
+	adrp x1, _sendcmpct
+	add  x1, x1, :lo12:_sendcmpct
+	mov  x2, #9
+	bl   .Lcmpeq
+	cbz  x0, .LNHread
+	mov  x2, #9
+.LNH_echo:
+	/* echo the received cmd (0-len payload): p2p_write(fd,&cmd[sp+160],len,0,0) */
+	mov  x0, x19
+	add  x1, sp, #160
+	mov  x3, #0
+	mov  x4, #0
 	bl   p2p_write
 	b    .LNHread
 .LNH_send_verack:
@@ -1541,6 +1585,28 @@ node_ibd_blocks_s:
 	str  xzr, [sp, #24]              /* i = 0 */
 	str  xzr, [sp, #32]              /* total = 0 */
 	str  xzr, [sp, #56]              /* skipbudget = 0 */
+	/* paribd-style SETTLE: do a getheaders round-trip on this connection so Core
+	 * marks the peer block-servable. Core v31 silently DROPS a block `getdata`
+	 * sent on an unsettled connection (verack bundled with getdata); the working
+	 * x86 reference paribd always does a getheaders round-trip first. */
+	ldr  x0, [sp, #0]                /* hst */
+	mov  x1, #0
+	add  x2, sp, #160                /* rec */
+	bl   hst_get_at
+	cmp  x0, #0
+	b.le .LNIBS_fail
+	/* zero stop32 at sp+392..455 */
+	stp  xzr, xzr, [sp, #392]
+	stp  xzr, xzr, [sp, #408]
+	stp  xzr, xzr, [sp, #424]
+	stp  xzr, xzr, [sp, #440]
+	mov  x0, x19                     /* fd */
+	add  x1, sp, #240                /* locator32 = hash of record 0 */
+	mov  x2, #1                      /* locator count */
+	add  x3, sp, #392                /* stop32 (zeros) */
+	mov  x4, x22                     /* out_buf = caller download buffer */
+	add  x5, sp, #464                /* out_count (free footer word) */
+	bl   node_fetch_headers
 .LNIBS_loop:
 	ldr  x0, [sp, #24]
 	ldr  x1, [sp, #16]
@@ -1764,6 +1830,10 @@ _headers:	.ascii "headers\0"
 _getdata:	.ascii "getdata\0"
 _block:		.ascii "block\0"
 _inv:		.ascii "inv\0"
+_sendheaders:	.ascii "sendheaders\0"
+_sendaddrv2:	.ascii "sendaddrv2\0"
+_wtxidrelay:	.ascii "wtxidrelay\0"
+_sendcmpct:	.ascii "sendcmpct\0"
 ua_str:		.ascii "/BitcoinMachineCode:0.0.1/"
 
 	.section .note.GNU-stack,"",%progbits
