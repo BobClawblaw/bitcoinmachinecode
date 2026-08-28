@@ -51,6 +51,36 @@ txv_diffs: test_txv_parse_diff_asm test_txv_classify_diff_asm test_segwit_classi
 	./test_txv_classify_diff_asm
 	./test_segwit_classify_diff_asm
 
+# mempool twin + policy layer (bitcoin_mempool.S asm pool; C policy/compact
+# glue over it) driven against Python-oracle vectors
+POLY := bitcoin_mempool.o bitcoin_utxo.o bitcoin_tx.o bitcoin_hash.o sha256.o
+test_mempool_arm: $(ASMDIR)/tests/test_mempool.c bitcoin_mempool.o
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -o $@ $< bitcoin_mempool.o
+test_mempool_policy_arm: $(ASMDIR)/tests/test_mempool_policy.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -I$(ASMDIR)/daemon -o $@ $< ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+test_%_policy_arm: $(ASMDIR)/tests/test_%_policy.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -I$(ASMDIR)/daemon -o $@ $< ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+test_mempool_evict_arm: $(ASMDIR)/tests/test_mempool_evict.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -I$(ASMDIR)/daemon -o $@ $< ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+test_mempool_core_parity_arm: $(ASMDIR)/tests/test_mempool_core_parity.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -I$(ASMDIR)/daemon -o $@ $< ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c $(POLY)
+mempool_diffs: test_mempool_arm test_mempool_evict_arm test_mempool_core_parity_arm test_mempool_policy_arm test_package_policy_arm test_truc_policy_arm
+	./test_mempool_arm
+	./test_mempool_evict_arm
+	./test_mempool_core_parity_arm
+	./test_mempool_policy_arm
+	./test_package_policy_arm
+	./test_truc_policy_arm
+
+# compact blocks (BIP152) + addr manager
+test_bip152_arm: $(ASMDIR)/tests/test_bip152.c bitcoin_cmpct.o sha256.o bitcoin_hash.o bitcoin_tx.o
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -o $@ $< bitcoin_cmpct.o sha256.o bitcoin_hash.o bitcoin_tx.o
+test_addrmgr_arm: $(ASMDIR)/tests/test_addrmgr.c bitcoin_addrmgr.o
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -o $@ $< bitcoin_addrmgr.o
+cmpct_diffs: test_bip152_arm test_addrmgr_arm
+	./test_bip152_arm
+	./test_addrmgr_arm
+
 # repo C harness -> native test binary
 test_sha256: sha256.o $(ASMDIR)/tests/test_sha256.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_sha256.c sha256.o -I$(ASMDIR)

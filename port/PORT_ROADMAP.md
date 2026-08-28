@@ -374,9 +374,18 @@ and runs natively.
       parse_varint width-dispatch pitfall -- a recurring failure mode in this
       port; audited: RDCS advance counts were already correct, only the
       loads were off-by-one.
-- [ ] Remaining leaf modules (idx, idxscan, mempool, serve, cli, cmpct,
-      headers, net addrmgr, node_log, witness_v0, multisig,
-      utxo_stats, ...)
+- [x] bitcoin_mempool + policy layer: repo harnesses ALL PASS on ARM natively
+      (2026-08-28): test_mempool (asm pool unit), test_mempool_policy
+      (Python-oracle fee/relay/RBF/ancestor vectors), test_package_policy,
+      test_mempool_evict, test_mempool_core_parity (standardness/vsize/package
+      eviction/full RBF/expiry), test_truc_policy (BIP431 TRUC, 20 checks) --
+      0 failures everywhere; NO bug found (clean pass). `make mempool_diffs`.
+- [x] bitcoin_cmpct + bitcoin_addrmgr: test_bip152 ALL PASS (cmpctblock build
+      byte-exact vs Core-equivalent reference; index/ntx edges) and
+      test_addrmgr ALL PASS (p2p_addr_v1 serialization byte-exact) natively on
+      ARM (2026-08-28). `make cmpct_diffs` (test_bip152 + test_addrmgr).
+- [ ] Remaining leaf modules (idx, idxscan, serve, cli, headers,
+      node_log, witness_v0, multisig, utxo_stats, ...)
 
 ## Notes
 - Port is scalar-first (correct by construction). ARMv8 SHA2/crypto-extension
