@@ -603,7 +603,7 @@ daemon/build_addr_index: daemon/build_addr_index.c daemon/addr_index_fmt.h
 # resolved through the txid index. Resumable; never run after the daemon
 # has adopted the files (bfilter_index.c's writer-sequence contract).
 daemon/build_block_filters: daemon/build_block_filters.c daemon/bfilter_index.c daemon/txi_format.h block_filter.c block_filter.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 -o $@ daemon/build_block_filters.c daemon/bfilter_index.c block_filter.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 -o $@ daemon/build_block_filters.c daemon/bfilter_index.c block_filter.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
 
 daemon/build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o

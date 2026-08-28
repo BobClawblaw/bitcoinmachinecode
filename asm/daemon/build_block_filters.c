@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <pthread.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -99,9 +100,27 @@ static void* g_st;
 static u8* g_blockbuf2;                     /* parent-tx block reads */
 static u8* g_scratch;
 
+/* ---- per-thread resolver context ----------------------------------------
+ * Resolving a block's prevouts is thousands of INDEPENDENT random reads, so
+ * it parallelises perfectly -- but only if nothing mutable is shared. Three
+ * things were:
+ *   - the store's mapping cache, which lives INSIDE the state passed to
+ *     store_map_at (st+128), so each thread gets its own state;
+ *   - the tx_txid scratch buffer;
+ *   - the parent-tx LRU.
+ * Each thread therefore carries its own. The txid index is mmap'd read-only
+ * and shared freely. */
+#define LRU_N 128
+typedef struct {
+    u8*  st;                       /* own store state -> own mapping cache */
+    u8*  scratch;
+    struct { u8 txid[32]; u8* tx; unsigned long len; long stamp; } lru[LRU_N];
+    long stamp;
+} rctx_t;
+
 /* locate + verify a txid via the index; returns the tx bytes INSIDE
  * g_blockbuf2 (valid until the next call) and its length, or NULL. */
-static const u8* txi_find(const u8 txid_wire[32], unsigned long* txlen){
+static const u8* txi_find(rctx_t* rc, const u8 txid_wire[32], unsigned long* txlen){
     const u8* recs = g_txi + TXI_HDR;
     const u8* sp   = g_txi + g_txi_soff;
     u64 lo = 0, hi = g_txi_ns ? g_txi_ns - 1 : 0, start = 0;
@@ -125,12 +144,12 @@ static const u8* txi_find(const u8 txid_wire[32], unsigned long* txlen){
         for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
         for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
         u64 mo[2];
-        const u8* blk = store_map_at(g_st, hh, mo);
+        const u8* blk = store_map_at(rc->st, hh, mo);
         if (!blk) continue;
         u64 blen = mo[0];
         if (blen < 81 || (u64)off + ln > blen || ln > BLOCKBUF) continue;
         u8 got[32];
-        if (tx_txid(got, blk + off, ln, g_scratch, BLOCKBUF) != 1) continue;
+        if (tx_txid(got, blk + off, ln, rc->scratch, BLOCKBUF) != 1) continue;
         if (memcmp(got, txid_wire, 32)) continue;
         *txlen = ln;
         return blk + off;
@@ -144,12 +163,12 @@ static const u8* txi_find(const u8 txid_wire[32], unsigned long* txlen){
         for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
         for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
         u64 mo[2];
-        const u8* blk = store_map_at(g_st, hh, mo);
+        const u8* blk = store_map_at(rc->st, hh, mo);
         if (!blk) continue;
         u64 blen = mo[0];
         if (blen < 81 || (u64)off + ln > blen || ln > BLOCKBUF) continue;
         u8 got[32];
-        if (tx_txid(got, blk + off, ln, g_scratch, BLOCKBUF) != 1) continue;
+        if (tx_txid(got, blk + off, ln, rc->scratch, BLOCKBUF) != 1) continue;
         if (memcmp(got, txid_wire, 32)) continue;
         *txlen = ln;
         return blk + off;
@@ -158,32 +177,99 @@ static const u8* txi_find(const u8 txid_wire[32], unsigned long* txlen){
 }
 
 /* small LRU of resolved parent txs (consolidations drain one parent) */
-#define LRU_N 128
-static struct { u8 txid[32]; u8* tx; unsigned long len; long stamp; } g_lru[LRU_N];
-static long g_stamp;
-static const u8* parent_tx(const u8 txid[32], unsigned long* len){
+static const u8* parent_tx(rctx_t* c, const u8 txid[32], unsigned long* len){
     for (int i = 0; i < LRU_N; i++)
-        if (g_lru[i].tx && !memcmp(g_lru[i].txid, txid, 32)){
-            g_lru[i].stamp = ++g_stamp; *len = g_lru[i].len; return g_lru[i].tx; }
+        if (c->lru[i].tx && !memcmp(c->lru[i].txid, txid, 32)){
+            c->lru[i].stamp = ++c->stamp; *len = c->lru[i].len; return c->lru[i].tx; }
     unsigned long tl;
-    const u8* t = txi_find(txid, &tl);
+    const u8* t = txi_find(c, txid, &tl);
     if (!t) return NULL;
     int victim = 0;
     for (int i = 0; i < LRU_N; i++){
-        if (!g_lru[i].tx){ victim = i; break; }
-        if (g_lru[i].stamp < g_lru[victim].stamp) victim = i;
+        if (!c->lru[i].tx){ victim = i; break; }
+        if (c->lru[i].stamp < c->lru[victim].stamp) victim = i;
     }
-    free(g_lru[victim].tx);
-    g_lru[victim].tx = malloc(tl);
-    if (!g_lru[victim].tx) return NULL;
-    memcpy(g_lru[victim].tx, t, tl);
-    memcpy(g_lru[victim].txid, txid, 32);
-    g_lru[victim].len = tl; g_lru[victim].stamp = ++g_stamp;
+    free(c->lru[victim].tx);
+    c->lru[victim].tx = malloc(tl);
+    if (!c->lru[victim].tx) return NULL;
+    memcpy(c->lru[victim].tx, t, tl);
+    memcpy(c->lru[victim].txid, txid, 32);
+    c->lru[victim].len = tl; c->lru[victim].stamp = ++c->stamp;
     *len = tl;
-    return g_lru[victim].tx;
+    return c->lru[victim].tx;
+}
+
+/* ---- parallel prevout resolution ----------------------------------------
+ * Phase 1 walks the block and records every non-coinbase input's outpoint;
+ * phase 2 resolves them across N threads; phase 3 assembles the scripts in
+ * ORDER. Order matters only for reproducibility of the arena packing -- the
+ * filter itself sorts its elements -- but keeping it makes the threaded
+ * output byte-identical to the single-threaded output, which is how this is
+ * verified. */
+static int tx_output_spk_fwd(const u8* tx, unsigned long len, u32 index,
+                             const u8** spk, unsigned long* slen);
+
+typedef struct {
+    const u8* op;                 /* 36-byte outpoint, inside blockbuf */
+    u32  vout;
+    unsigned long long txi;       /* tx index in the block, for the error */
+    u8*  spk;                     /* resolved script, owned by this request */
+    unsigned long spklen;
+    int  ok;
+} req_t;
+
+typedef struct {
+    rctx_t* ctx;
+    req_t*  reqs;
+    long    n;
+    int     id, nthreads;
+} worker_arg_t;
+
+static void resolve_all(rctx_t* ctxs, int nthreads, req_t* reqs, long n);
+
+static void* resolve_worker(void* v){
+    worker_arg_t* w = (worker_arg_t*)v;
+    for (long i = w->id; i < w->n; i += w->nthreads){
+        req_t* r = &w->reqs[i];
+        unsigned long ptl;
+        const u8* ptx = parent_tx(w->ctx, r->op, &ptl);
+        const u8* spk; unsigned long slen;
+        if (!ptx || !tx_output_spk_fwd(ptx, ptl, r->vout, &spk, &slen)) continue;
+        r->spk = malloc(slen ? slen : 1);
+        if (!r->spk) continue;
+        memcpy(r->spk, spk, slen);
+        r->spklen = slen;
+        r->ok = 1;
+    }
+    return NULL;
+}
+
+/* Spread the requests over the threads and wait. Threads are created per
+ * block: at ~13 blocks/s that is a few hundred pthread_create a second,
+ * which is noise next to thousands of random reads, and it keeps the
+ * lifetime rules trivial. */
+static void resolve_all(rctx_t* ctxs, int nthreads, req_t* reqs, long n){
+    if (n <= 0) return;
+    if (nthreads <= 1){
+        worker_arg_t a = { &ctxs[0], reqs, n, 0, 1 };
+        resolve_worker(&a);
+        return;
+    }
+    pthread_t th[64];
+    static worker_arg_t args[64];
+    int started = 0;
+    for (int i = 0; i < nthreads; i++){
+        args[i] = (worker_arg_t){ &ctxs[i], reqs, n, i, nthreads };
+        if (pthread_create(&th[i], NULL, resolve_worker, &args[i]) == 0) started++;
+        else { /* fall back to doing this stripe inline rather than losing it */
+               resolve_worker(&args[i]); }
+    }
+    for (int i = 0; i < started; i++) pthread_join(th[i], NULL);
 }
 
 /* output `index` of a raw tx: script ptr + len. 1 ok / 0 malformed. */
+static int tx_output_spk_fwd(const u8* tx, unsigned long len, u32 index,
+                             const u8** spk, unsigned long* slen);
 static int tx_output_spk(const u8* tx, unsigned long len, u32 index,
                          const u8** spk, unsigned long* slen){
     const u8* p = tx + 4; const u8* end = tx + len;
@@ -237,6 +323,25 @@ int main(int argc, char** argv){
     if (n < 0){ if (!bfi_create()){ fprintf(stderr, "cannot create filter index files\n"); return 1; } n = 0; }
     fprintf(stderr, "[bfilter] resuming at height %ld, target %ld\n", n, to_h);
 
+    /* one resolver context per thread: its own store state (hence its own
+     * mapping cache), scratch and LRU. -j or BFI_THREADS picks the count. */
+    int nthreads = 8;
+    { const char* e = getenv("BFI_THREADS"); if (e && atoi(e) > 0) nthreads = atoi(e); }
+    if (nthreads > 64) nthreads = 64;
+    rctx_t* ctxs = calloc((size_t)nthreads, sizeof *ctxs);
+    if (!ctxs){ fprintf(stderr, "oom\n"); return 1; }
+    for (int i = 0; i < nthreads; i++){
+        ctxs[i].st = malloc(4096);
+        ctxs[i].scratch = malloc(BLOCKBUF);
+        if (!ctxs[i].st || !ctxs[i].scratch){ fprintf(stderr, "oom\n"); return 1; }
+        if (store_init(ctxs[i].st) != 1){ fprintf(stderr, "store_init failed\n"); return 1; }
+        store_reload(ctxs[i].st);
+        store_rd_init(ctxs[i].st);
+        store_map_init(ctxs[i].st);
+    }
+    fprintf(stderr, "[bfilter] resolving prevouts on %d thread(s)\n", nthreads);
+    static req_t reqs[MAX_PREV];
+
     u8* blockbuf = malloc(BLOCKBUF);
     g_blockbuf2 = malloc(BLOCKBUF);
     g_scratch = malloc(BLOCKBUF);
@@ -263,6 +368,70 @@ int main(int argc, char** argv){
         if (!cc){ fprintf(stderr, "[bfilter] FATAL: block %ld malformed\n", h); return 1; }
         p += cc;
         int fatal = 0;
+
+        /* ---- stage A: collect every non-coinbase outpoint (parse only,
+         * no IO) so stage B can resolve them all at once, in parallel. */
+        long nreq = 0;
+        { const u8* q = p; u64 c2;
+          for (u64 t = 0; t < ntx; t++){
+              if (q + 4 > end){ fatal = 1; break; }
+              q += 4;
+              int sw = (q + 2 <= end && q[0] == 0x00 && q[1] == 0x01);
+              if (sw) q += 2;
+              u64 nin2 = txi_rd_varint(q, end, &c2); if (!c2){ fatal = 1; break; }
+              q += c2;
+              for (u64 i = 0; i < nin2; i++){
+                  if (q + 36 > end){ fatal = 1; break; }
+                  const u8* op2 = q;
+                  q += 36;
+                  u64 sl2 = txi_rd_varint(q, end, &c2); if (!c2){ fatal = 1; break; }
+                  q += c2;
+                  if ((u64)(end - q) < sl2 + 4){ fatal = 1; break; }
+                  q += sl2 + 4;
+                  if (t == 0) continue;
+                  if (nreq >= MAX_PREV){ fprintf(stderr, "[bfilter] FATAL: h=%ld too many inputs\n", h); return 1; }
+                  reqs[nreq].op = op2;
+                  reqs[nreq].vout = (u32)(op2[32] | op2[33]<<8 | op2[34]<<16 | (u32)op2[35]<<24);
+                  reqs[nreq].txi = (unsigned long long)t;
+                  reqs[nreq].spk = NULL; reqs[nreq].spklen = 0; reqs[nreq].ok = 0;
+                  nreq++;
+              }
+              if (fatal) break;
+              u64 nout2 = txi_rd_varint(q, end, &c2); if (!c2){ fatal = 1; break; }
+              q += c2;
+              for (u64 i = 0; i < nout2; i++){
+                  if (q + 8 > end){ fatal = 1; break; }
+                  q += 8;
+                  u64 osl = txi_rd_varint(q, end, &c2); if (!c2){ fatal = 1; break; }
+                  q += c2;
+                  if ((u64)(end - q) < osl){ fatal = 1; break; }
+                  q += osl;
+              }
+              if (fatal) break;
+              if (sw){
+                  /* witness: one stack per input, each a vector of items */
+                  for (u64 i = 0; i < nin2 && !fatal; i++){
+                      u64 nit = txi_rd_varint(q, end, &c2); if (!c2){ fatal = 1; break; }
+                      q += c2;
+                      for (u64 k = 0; k < nit; k++){
+                          u64 il = txi_rd_varint(q, end, &c2); if (!c2){ fatal = 1; break; }
+                          q += c2;
+                          if ((u64)(end - q) < il){ fatal = 1; break; }
+                          q += il;
+                      }
+                  }
+                  if (fatal) break;
+              }
+              if (q + 4 > end){ fatal = 1; break; }
+              q += 4;                                   /* nLockTime */
+          } }
+        if (fatal){ fprintf(stderr, "[bfilter] FATAL: block %ld malformed (prepass)\n", h); return 1; }
+
+        /* ---- stage B: resolve them across threads. Independent random
+         * reads, so this is where the wall-clock actually goes. */
+        resolve_all(ctxs, nthreads, reqs, nreq);
+        long reqpos = 0;
+
         for (u64 t = 0; t < ntx && !fatal; t++){
             if (p + 4 > end){ fatal = 1; break; }
             p += 4;
@@ -279,10 +448,17 @@ int main(int argc, char** argv){
                 if ((u64)(end - p) < sl + 4){ fatal = 1; break; }
                 p += sl + 4;
                 if (t == 0) continue;                       /* coinbase input */
-                u32 vout = (u32)(op[32] | op[33]<<8 | op[34]<<16 | (u32)op[35]<<24);
-                unsigned long ptl; const u8* ptx = parent_tx(op, &ptl);
-                const u8* spk; unsigned long spklen;
-                if (!ptx || !tx_output_spk(ptx, ptl, vout, &spk, &spklen)){
+                /* stage C: take the answer stage B already produced. The
+                 * order matches because both walks visit inputs in the same
+                 * order -- asserted, not assumed. */
+                if (reqpos >= nreq || reqs[reqpos].op != op){
+                    fprintf(stderr, "[bfilter] FATAL: h=%ld prepass/walk disagree at input %ld\n", h, reqpos);
+                    return 1;
+                }
+                const u8* spk = reqs[reqpos].spk; unsigned long spklen = reqs[reqpos].spklen;
+                int resolved = reqs[reqpos].ok;
+                reqpos++;
+                if (!resolved){
                     fprintf(stderr, "[bfilter] FATAL: h=%ld tx=%llu prevout unresolvable via txindex\n",
                             h, (unsigned long long)t);
                     return 1;                                /* NEVER emit a filter missing elements */
@@ -298,7 +474,6 @@ int main(int argc, char** argv){
                         u8** nb = realloc(bigalloc, (size_t)nc * sizeof *nb);
                         if (!nb){ fprintf(stderr, "[bfilter] FATAL: h=%ld oom growing prevout list\n", h);
                                   for (int i = 0; i < nbig; i++) free(bigalloc[i]);
-        free(bigalloc);
                                   free(bigalloc); return 1; }
                         bigalloc = nb; bigcap = nc;
                     }
@@ -357,4 +532,9 @@ int main(int argc, char** argv){
     }
     fprintf(stderr, "[bfilter] DONE: %ld filters, %llds\n", bfi_count(), (long long)(time(NULL) - t0));
     return 0;
+}
+
+static int tx_output_spk_fwd(const u8* tx, unsigned long len, u32 index,
+                             const u8** spk, unsigned long* slen){
+    return tx_output_spk(tx, len, index, spk, slen);
 }
