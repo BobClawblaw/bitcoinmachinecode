@@ -110,12 +110,23 @@ static u8* g_scratch;
  *   - the parent-tx LRU.
  * Each thread therefore carries its own. The txid index is mmap'd read-only
  * and shared freely. */
-#define LRU_N 128
+/* Parent-tx cache: DIRECT-MAPPED, not an LRU list.
+ *
+ * It was a 128-entry array scanned linearly on every lookup, and perf put
+ * ~10% of the backfill's CPU in that scan. Enlarging it would have made
+ * that worse, not better -- the scan is O(N).
+ *
+ * A txid is already a uniform hash, so its low bits are a perfectly good
+ * index: one probe to look up, one store to insert, no eviction search. That
+ * removes the scan AND makes capacity cheap, so the cache grows from 128 to
+ * 4096 entries at the same time. A direct-mapped cache gives up some hit
+ * rate to collisions relative to a true LRU of the same size, and wins it
+ * straight back on capacity. */
+#define LRU_N 4096                 /* power of two: indexed by txid low bits */
 typedef struct {
     u8*  st;                       /* own store state -> own mapping cache */
     u8*  scratch;
-    struct { u8 txid[32]; u8* tx; unsigned long len; long stamp; } lru[LRU_N];
-    long stamp;
+    struct { u8 txid[32]; u8* tx; unsigned long len; } cache[LRU_N];
 } rctx_t;
 
 /* locate + verify a txid via the index; returns the tx bytes INSIDE
@@ -178,25 +189,25 @@ static const u8* txi_find(rctx_t* rc, const u8 txid_wire[32], unsigned long* txl
 
 /* small LRU of resolved parent txs (consolidations drain one parent) */
 static const u8* parent_tx(rctx_t* c, const u8 txid[32], unsigned long* len){
-    for (int i = 0; i < LRU_N; i++)
-        if (c->lru[i].tx && !memcmp(c->lru[i].txid, txid, 32)){
-            c->lru[i].stamp = ++c->stamp; *len = c->lru[i].len; return c->lru[i].tx; }
+    /* the txid IS a hash, so its low bits index the cache directly */
+    unsigned slot = ((unsigned)txid[0] | ((unsigned)txid[1] << 8) |
+                     ((unsigned)txid[2] << 16)) & (LRU_N - 1);
+    if (c->cache[slot].tx && !memcmp(c->cache[slot].txid, txid, 32)){
+        *len = c->cache[slot].len;
+        return c->cache[slot].tx;
+    }
     unsigned long tl;
     const u8* t = txi_find(c, txid, &tl);
     if (!t) return NULL;
-    int victim = 0;
-    for (int i = 0; i < LRU_N; i++){
-        if (!c->lru[i].tx){ victim = i; break; }
-        if (c->lru[i].stamp < c->lru[victim].stamp) victim = i;
-    }
-    free(c->lru[victim].tx);
-    c->lru[victim].tx = malloc(tl);
-    if (!c->lru[victim].tx) return NULL;
-    memcpy(c->lru[victim].tx, t, tl);
-    memcpy(c->lru[victim].txid, txid, 32);
-    c->lru[victim].len = tl; c->lru[victim].stamp = ++c->stamp;
+    /* the occupant of this slot loses -- one store, no search */
+    u8* room = realloc(c->cache[slot].tx, tl);
+    if (!room){ free(c->cache[slot].tx); c->cache[slot].tx = NULL; return NULL; }
+    memcpy(room, t, tl);
+    c->cache[slot].tx = room;
+    memcpy(c->cache[slot].txid, txid, 32);
+    c->cache[slot].len = tl;
     *len = tl;
-    return c->lru[victim].tx;
+    return room;
 }
 
 /* ---- parallel prevout resolution ----------------------------------------
