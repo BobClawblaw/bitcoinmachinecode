@@ -315,9 +315,39 @@ and runs natively.
       random empty/non-empty passphrases: 38,400 cases across 8 seeds,
       0 fail (byte-exact mnemonic, entropy, rc, 64-byte seed). `make fuzz_bip39`.
       (2026-08-28)
-- [ ] Remaining leaf modules (bip143/bip341, keys, addr*,
-      idx, idxscan, mempool, serve, cli, cmpct, headers,
-      net addrmgr, node_log, txv_, witness_v0, ...)
+- [x] secp256k1_taproot (BIP341 key-path tweak + script-path merkle tree:
+      tagged_hash256 / tap_leaf_hash / tap_branch_hash / tap_merkle_root /
+      taproot_tweak_pubkey) -> port/arm64/secp256k1_taproot.S. FRESH
+      ARM-native verification 2026-08-28: repo test_taproot_sighash PASSES
+      (48 checks: Core bip-0341 vectors, key/script-path schnorr, CHECKSIGADD,
+      annex, tapscript via bitcoin_interp); fuzz found + FIXED two real .S
+      bugs: (1) tap_leaf_hash bound constant was 0x3FFFC6 (CAP-58) instead of
+      TAP_PREIMG_CAP-70 = 0x003FFFBA -> slen in (4194234, 4194246] sailed
+      past the 4MiB TLS tap_preimg and SIGSEGV'd (x86 fails closed rc=0);
+      (2) tap_branch_hash called __tb_cmp with x0=tap_preimg+64/x1=a/x2=b --
+      it compared the DESTINATION SCRATCH BUFFER against a, not a vs b, so
+      the BIP341 lexicographic sibling sort almost always took the "a first"
+      branch -> UNSORTED TapBranch(a||b) for every b<a, wrong merkle root on
+      every >=1-sibling script-path spend (chain-split class; both test
+      failures reproduced in isolation, fixed, re-verified).
+- [x] bitcoin_bip341 (BIP341 TapSighash builder: ts_agg_hashes_asm /
+      taproot_sighash_asm, TLS-IE scratch) -> port/arm64/bitcoin_bip341.S.
+      NEVER COMPILED on ARM before 2026-08-28 (in MODULES but no .o, no
+      target ran it). Now: compiles clean; repo test_bip341_diff (asm vs C
+      twin bitcoin_taproot_sighash.c) 1684 cases 0 mismatches -- rc, ENTIRE
+      pre-poisoned preimage, digest -- across every hash type incl. the
+      invalid ones, key/script path, annex, SINGLE inside/past nout, all
+      input indices, cap sweep; AND an INDEPENDENT differential fuzz
+      (port/arm64/fuzz_taproot.py, self-contained gcc-from-.S driver):
+      pure-Python BIP341/342 oracle (hashlib + affine secp256k1) vs BOTH the
+      .S and the C twin -- 9664 cases over 8 seeds, 0 fail (byte-exact rc +
+      preimage + digest; helpers covered: taghash, leaf incl. CAP-70
+      boundary/oversize, branch, merkle root depth 0..7 + count-ignored,
+      tweak parity rc 1/2 + invalid lifts). `make fuzz_taproot`.
+      (2026-08-28)
+- [ ] Remaining leaf modules (idx, idxscan, mempool, serve, cli, cmpct,
+      headers, net addrmgr, node_log, txv_, witness_v0, multisig,
+      utxo_stats, ...)
 
 ## Notes
 - Port is scalar-first (correct by construction). ARMv8 SHA2/crypto-extension

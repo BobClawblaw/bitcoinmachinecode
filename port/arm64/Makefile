@@ -113,6 +113,10 @@ fuzz_lsm: t_lsm
 # independent pure-Python BIP39 differential fuzz (self-contained gcc-from-.S)
 fuzz_bip39:
 	python3 fuzz_bip39.py 8 1200
+# independent pure-Python BIP341/342 taproot differential (self-contained
+# gcc-from-.S driver; asm vs C twin vs Python oracle, byte-exact)
+fuzz_taproot:
+	python3 fuzz_taproot.py 8 1200
 t_undo_asm: t_undo.c bitcoin_undo.o
 	@$(CC) $(CFLAGS) -o $@ $+
 # LSM-backed UTXO-set builder (daemon/build_utxo.c -> our ported utxo_lsm store).

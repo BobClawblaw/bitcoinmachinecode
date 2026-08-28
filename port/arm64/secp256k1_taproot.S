@@ -123,11 +123,9 @@ tap_branch_hash:
     mov  x20,x1                /* a */
     mov  x21,x2                /* b */
     /* msg = sorted(a,b) at tap_preimg+64 */
-    TLS_ADDR x0, tap_preimg, x9
-    add  x0,x0,#64
-    mov  x1,x20
-    mov  x2,x21
-    bl   __tb_cmp             /* x22 = 1 if a<=b... returns which first */
+    mov  x0,x20                 /* a */
+    mov  x1,x21                 /* b */
+    bl   __tb_cmp             /* x22 = 1 if b<a (b first), 0 if a<=b (a first) */
     /* __tb_cmp returns x22 = order (0 -> a first, 1 -> b first) */
     cbnz x22,.Lbr_bfirst
     /* a first */
@@ -204,7 +202,7 @@ tap_leaf_hash:
     mov  x20,x2                /* script */
     mov  x21,x3                /* slen */
     /* bound: TAP_PREIMG_CAP - 70 >= slen */
-    mov  w9,#0xFFC6             /* 0x3FFFFC6 = TAP_PREIMG_CAP-70 */
+    mov  w9,#0xFFBA             /* 0x003FFFBA = TAP_PREIMG_CAP-70 (4194234) */
     movk w9,#0x003F,lsl#16
     cmp  x21,x9
     b.hi .Ltl_big
