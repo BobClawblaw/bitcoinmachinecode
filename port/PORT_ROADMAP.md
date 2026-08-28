@@ -283,8 +283,25 @@ and runs natively.
       full-width raw 3072-bit operands, x*1, x*x, canonical operands: 80,000+
       mults across 16 seeds, 0 fail. Unlocks utxo_stats muhash + the s8
       set-hash/MuHash-vs-Core parity check. (2026-08-27)
-- [ ] Remaining leaf modules (bip32/bip39/bip143/bip341, keys, addr*,
-      idx, idxscan, muhash, mempool, serve, cli, cmpct, headers,
+- [x] bitcoin_bip32 (BIP32 HD key derivation: bip32_master / bip32_ckd_priv /
+      bip32_derive_path / bip32_fingerprint / bip32_extkey_serialize) + the
+      deps it exercises (bitcoin_hmac hmac_sha512, bitcoin_keys
+      scalar_to_pubkey/scalar_small_nonzero, bitcoin_addr hash160) ->
+      port/arm64/bitcoin_bip32.S. Offline master 0fed12b already passed the
+      repo test_bip32_chain + test_bip32_extkey + official spec vectors; THIS
+      run adds the independent differential (port/arm64/fuzz_bip32.py) vs a
+      pure-Python BIP32 reference (HMAC-SHA512 + pure-Python secp256k1 EC mult
+      for the normal-branch pubkey, bug-for-bug scalar_small_nonzero rc
+      semantics) over random seeds + 1..12-deep paths with mixed
+      hardened/normal + boundary indices (0/0x7fffffff/0x80000000/0xffffffff),
+      plus fingerprint + priv/pub extkey serialization: 35,305 cases across
+      8 seeds, 0 fail (byte-exact k/c/fp/78-byte serialized extkey). Covers the
+      documented AArch64 BE-limb carry pitfall (each IL/k_par/n limb rev'd before
+      the adds/adcs mod-n reduction). Reproducible standalone:
+      `python3 port/arm64/fuzz_bip32.py` (self-contained gcc-from-.S driver).
+      (2026-08-28)
+- [ ] Remaining leaf modules (bip39/bip143/bip341, keys, addr*,
+      idx, idxscan, mempool, serve, cli, cmpct, headers,
       net addrmgr, node_log, txv_, witness_v0, ...)
 
 ## Notes
