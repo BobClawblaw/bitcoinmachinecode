@@ -503,10 +503,27 @@ PROT_READ    equ 1
 MAP_PRIVATE  equ 2
 MAP_NORESERVE equ 0x4000
 MADV_WILLNEED equ 3
+MADV_RANDOM   equ 1
 
 ; ----------------------------------------------------------------------------
 ; store_map_init(st) -- reset the mapping cache (unmapping anything live).
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; store_map_random(on) -- ask the kernel NOT to read ahead on the mappings
+; store_map_at creates from here on.
+;
+; Default OFF, and it must stay off for everyone who reads a block WHOLE:
+; those callers walk 1-4MB linearly and readahead is exactly what they want.
+; It is ON for one workload -- the filter backfill -- which reads a single
+; ~250-byte TRANSACTION out of a block chosen at random from anywhere in the
+; archive. Measured there: 2708 major faults/s against 122 MB/s of device
+; reads, i.e. ~45KB dragged in to use 250 bytes.
+; ----------------------------------------------------------------------------
+global store_map_random
+store_map_random:
+    mov  [rel smf_madv_random], edi
+    ret
+
 global store_map_init
 store_map_init:
     push rbp
@@ -689,6 +706,22 @@ map_file:
     jae  .fail                    ; mmap returns -errno in [-4095,-1]
     mov  [rbx+8], rax
     mov  [rbx+16], r15
+    ; opt-in MADV_RANDOM (store_map_random) -- off by default, so every
+    ; existing caller keeps the readahead it wants.
+    ; rax IS THE RETURN VALUE (.ret returns whatever is in it) and syscall
+    ; clobbers rax/rcx/r11, so the mapping pointer is saved across it. The
+    ; first version of this did not, and store_map_at returned madvise's 0 --
+    ; every prevout lookup then failed with "unresolvable via txindex", which
+    ; reads like an index problem and is not one.
+    cmp  dword [rel smf_madv_random], 0
+    je   .out
+    push rax
+    mov  rdi, rax
+    mov  rsi, r15
+    mov  edx, MADV_RANDOM
+    mov  eax, SYS_madvise
+    syscall
+    pop  rax
 .out:
     jmp  .ret
 .fail:
@@ -851,5 +884,8 @@ store_prune_safe:
     pop  rbx
     pop  rbp
     ret
+
+section .bss
+smf_madv_random: resd 1        ; store_map_random(): MADV_RANDOM for new mappings
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -53,6 +53,7 @@ extern long store_read_at(void* st, unsigned long h, void* out, long cap);
  * different file, and parent_tx copies out of it immediately. */
 extern const unsigned char* store_map_at(void* st, u64 h, u64 out[2]);
 extern void store_map_init(void* st);
+extern void store_map_random(int on);
 extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
 extern void sha256d(u8 out[32], const void* msg, long long len);
 
@@ -223,6 +224,10 @@ int main(int argc, char** argv){
     store_rd_init(store_buf);
     g_st = store_buf;
     store_map_init(g_st);      /* the mapping cache txi_find reads through */
+    /* This workload reads ONE transaction out of a block picked at random
+     * from the whole archive, so the kernel's readahead is pure waste --
+     * measured at ~45KB pulled in per 250 bytes used. */
+    store_map_random(1);
     long tip = *(int*)(store_buf + 24);
     if (to_h < 0 || to_h > tip) to_h = tip;
 
