@@ -43,6 +43,16 @@ extern int  store_init(void* st);
 extern int  store_reload(void* st);
 extern int  store_rd_init(void* st);
 extern long store_read_at(void* st, unsigned long h, void* out, long cap);
+/* store_map_at hands back a pointer straight INTO the page cache: zero
+ * copies, and zero syscalls once the file is mapped. That matters enormously
+ * here -- resolving one prevout needs ~250 bytes of a parent transaction,
+ * and store_read_at was copying the WHOLE parent block (up to 4MB) to get
+ * them. At ~3,000 inputs per modern block that was tens of megabytes read
+ * per block filtered, which is why this backfill was measured at 3.7
+ * blocks/s and ~40 hours. The pointer is valid until the next map of a
+ * different file, and parent_tx copies out of it immediately. */
+extern const unsigned char* store_map_at(void* st, u64 h, u64 out[2]);
+extern void store_map_init(void* st);
 extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
 extern void sha256d(u8 out[32], const void* msg, long long len);
 
@@ -113,13 +123,16 @@ static const u8* txi_find(const u8 txid_wire[32], unsigned long* txlen){
         for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
         for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
         for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
-        long blen = store_read_at(g_st, hh, g_blockbuf2, BLOCKBUF);
-        if (blen < 81 || (u64)off + ln > (u64)blen || ln > BLOCKBUF) continue;
+        u64 mo[2];
+        const u8* blk = store_map_at(g_st, hh, mo);
+        if (!blk) continue;
+        u64 blen = mo[0];
+        if (blen < 81 || (u64)off + ln > blen || ln > BLOCKBUF) continue;
         u8 got[32];
-        if (tx_txid(got, g_blockbuf2 + off, ln, g_scratch, BLOCKBUF) != 1) continue;
+        if (tx_txid(got, blk + off, ln, g_scratch, BLOCKBUF) != 1) continue;
         if (memcmp(got, txid_wire, 32)) continue;
         *txlen = ln;
-        return g_blockbuf2 + off;
+        return blk + off;
     }
     /* tail: unsorted scan */
     for (u64 o = 0; g_tail && o + TXI_REC <= g_tail_sz; o += TXI_REC){
@@ -129,13 +142,16 @@ static const u8* txi_find(const u8 txid_wire[32], unsigned long* txlen){
         for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
         for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
         for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
-        long blen = store_read_at(g_st, hh, g_blockbuf2, BLOCKBUF);
-        if (blen < 81 || (u64)off + ln > (u64)blen || ln > BLOCKBUF) continue;
+        u64 mo[2];
+        const u8* blk = store_map_at(g_st, hh, mo);
+        if (!blk) continue;
+        u64 blen = mo[0];
+        if (blen < 81 || (u64)off + ln > blen || ln > BLOCKBUF) continue;
         u8 got[32];
-        if (tx_txid(got, g_blockbuf2 + off, ln, g_scratch, BLOCKBUF) != 1) continue;
+        if (tx_txid(got, blk + off, ln, g_scratch, BLOCKBUF) != 1) continue;
         if (memcmp(got, txid_wire, 32)) continue;
         *txlen = ln;
-        return g_blockbuf2 + off;
+        return blk + off;
     }
     return NULL;
 }
@@ -206,6 +222,7 @@ int main(int argc, char** argv){
     store_reload(store_buf);
     store_rd_init(store_buf);
     g_st = store_buf;
+    store_map_init(g_st);      /* the mapping cache txi_find reads through */
     long tip = *(int*)(store_buf + 24);
     if (to_h < 0 || to_h > tip) to_h = tip;
 
@@ -229,7 +246,13 @@ int main(int argc, char** argv){
         if (blen < 81){ fprintf(stderr, "[bfilter] FATAL: block %ld unreadable (%ld)\n", h, blen); return 1; }
         /* collect every input's prevout script (coinbase skipped) */
         unsigned long np = 0, copyoff = 0;
-        u8* bigalloc[64]; int nbig = 0;
+        /* Prevout scripts too big for the inline arena. This was a FIXED
+         * array of 64, and a block with more than 64 such scripts aborted
+         * the whole backfill -- which is exactly what happened at height
+         * 425,211 (large bare-multisig was common in 2016), and why the
+         * mainnet filter index had been stuck there ever since. Nothing in
+         * consensus caps this at 64, so neither does this. */
+        u8** bigalloc = NULL; int nbig = 0, bigcap = 0;
         const u8* p = blockbuf + 80; const u8* end = blockbuf + blen;
         u64 cc, ntx = txi_rd_varint(p, end, &cc);
         if (!cc){ fprintf(stderr, "[bfilter] FATAL: block %ld malformed\n", h); return 1; }
@@ -264,13 +287,24 @@ int main(int argc, char** argv){
                     memcpy(prevcopy + copyoff, spk, spklen);
                     prev[np].script = prevcopy + copyoff; prev[np].len = spklen;
                     copyoff += spklen;
-                } else if (nbig < 64){
+                } else {
+                    if (nbig == bigcap){
+                        int nc = bigcap ? bigcap * 2 : 64;
+                        u8** nb = realloc(bigalloc, (size_t)nc * sizeof *nb);
+                        if (!nb){ fprintf(stderr, "[bfilter] FATAL: h=%ld oom growing prevout list\n", h);
+                                  for (int i = 0; i < nbig; i++) free(bigalloc[i]);
+        free(bigalloc);
+                                  free(bigalloc); return 1; }
+                        bigalloc = nb; bigcap = nc;
+                    }
                     bigalloc[nbig] = malloc(spklen);
-                    if (!bigalloc[nbig]){ fprintf(stderr, "oom\n"); return 1; }
+                    if (!bigalloc[nbig]){ fprintf(stderr, "[bfilter] FATAL: h=%ld oom\n", h);
+                                          for (int i = 0; i < nbig; i++) free(bigalloc[i]);
+                                          free(bigalloc); return 1; }
                     memcpy(bigalloc[nbig], spk, spklen);
                     prev[np].script = bigalloc[nbig]; prev[np].len = spklen;
                     nbig++;
-                } else { fprintf(stderr, "[bfilter] FATAL: h=%ld oversized prevout overflow\n", h); return 1; }
+                }
                 np++;
             }
             if (fatal) break;
