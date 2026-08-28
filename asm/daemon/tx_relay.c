@@ -454,6 +454,80 @@ static void txr_orphan_expire(void){
         }
 }
 
+/* ---- addr gossip on outbound legs (2026-08-28) ----------------------------
+ * A peer announces itself (Core's AdvertiseLocal) and relays a trickle of
+ * addresses it learned, as `addr` or -- to a peer that negotiated BIP155 --
+ * `addrv2`. This drain discarded both, so every leg's gossip was lost and
+ * the book only ever grew through the separate replenish connections
+ * (daemon/addr_ingest.c). Now folded into the book through the same parsers,
+ * with Core's per-peer token bucket (MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000
+ * to start, refilled at MAX_ADDR_RATE_PER_SECOND = 0.1) so a flooding peer
+ * cannot fill the book. Per address, as in Core: a message that declares
+ * more entries than the bucket holds is processed up to the budget and the
+ * rest is dropped (the parser takes a record limit).
+ * The book is opened lazily, once, in this (single-threaded) worker; the
+ * replenish path opens its own handle in the same process, and the serve
+ * children only read. */
+extern long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit);
+extern int  amr_init(void* ab);
+extern long p2p_addr_count(const void* pl, long plen);
+/* weak default: targets that link tx_relay.c without daemon/addr_ingest.c
+ * (a strong definition anywhere in the link wins) */
+__attribute__((weak)) long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
+    (void)ab; (void)cmd; (void)pl; (void)plen; (void)limit; return 0;
+}
+#define TXR_ADDR_BUCKET_MAX   1000.0     /* Core MAX_ADDR_PROCESSING_TOKEN_BUCKET */
+#define TXR_ADDR_RATE_PER_S   0.1        /* Core MAX_ADDR_RATE_PER_SECOND */
+#define TXR_ADDR_LEGS         64
+static struct { int fd; double tokens; long long t_ms; } txr_addr_bucket[TXR_ADDR_LEGS];
+static unsigned char txr_ab[64];
+static int  txr_ab_state;                /* 0 unopened, 1 open, -1 failed */
+long txr_addr_gossip_added, txr_addr_gossip_msgs, txr_addr_gossip_limited;
+
+/* number of entries a payload declares (v1: 30-byte records; v2: CompactSize
+ * count only -- the parser validates the rest) */
+static long txr_addr_declared(const char* cmd, const u8* pl, unsigned plen){
+    if (!memcmp(cmd, "addrv2", 7)){
+        if (plen < 1) return -1;
+        if (pl[0] < 0xfd) return pl[0];
+        if (pl[0] == 0xfd && plen >= 3) return (long)pl[1] | ((long)pl[2] << 8);
+        return -1;                                   /* > 65535: not a real message */
+    }
+    return p2p_addr_count(pl, plen);
+}
+static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen){
+    long n = txr_addr_declared(cmd, pl, plen);
+    if (n <= 0 || n > 1000) return 0;                /* Core: > MAX_ADDR_TO_SEND misbehaves */
+    /* per-leg token bucket, keyed by fd (a leg's fd is stable for its life) */
+    long long now = txr_now_ms();
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < TXR_ADDR_LEGS; i++){
+        if (txr_addr_bucket[i].fd == fd){ slot = i; break; }
+        if (free_slot < 0 && txr_addr_bucket[i].fd == 0) free_slot = i;
+    }
+    if (slot < 0){
+        if (free_slot < 0) free_slot = (int)(fd % TXR_ADDR_LEGS);
+        slot = free_slot;
+        txr_addr_bucket[slot].fd = fd; txr_addr_bucket[slot].tokens = TXR_ADDR_BUCKET_MAX;
+        txr_addr_bucket[slot].t_ms = now;
+    }
+    double* tk = &txr_addr_bucket[slot].tokens;
+    *tk += (double)(now - txr_addr_bucket[slot].t_ms) / 1000.0 * TXR_ADDR_RATE_PER_S;
+    if (*tk > TXR_ADDR_BUCKET_MAX) *tk = TXR_ADDR_BUCKET_MAX;
+    txr_addr_bucket[slot].t_ms = now;
+    long budget = (long)*tk;                          /* whole tokens available */
+    if (budget <= 0){ txr_addr_gossip_limited += n; return 0; }
+    if (budget > n) budget = n;
+    else txr_addr_gossip_limited += n - budget;         /* the tail Core would drop too */
+    *tk -= (double)budget;
+    if (txr_ab_state == 0) txr_ab_state = (amr_init(txr_ab) == 1) ? 1 : -1;
+    if (txr_ab_state < 0) return 0;
+    long added = addr_ingest_msg_n(txr_ab, cmd, pl, (long)plen, budget);
+    txr_addr_gossip_msgs++;
+    if (added > 0) txr_addr_gossip_added += added;
+    return added;
+}
+
 /* Drain one leg's buffered messages; fetch + validate announced txs.
  * Called between sync passes, single-threaded, so it cannot interleave with
  * node_sync_multi on the same fd. `max_ms` bounds the wait for getdata
@@ -614,8 +688,14 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (outstanding > 0) outstanding = 0;      /* stop waiting */
             continue;
         }
-        /* headers/addr/cmpctblock/...: not ours -- same discard the sync
-         * drains apply. A `block` push lost here is re-fetched by the next
+        if (!memcmp(cmd, "addr", 5) || !memcmp(cmd, "addrv2", 7)){
+            long added = txr_addr_ingest(fd, cmd, pl, plen);
+            if (added > 0)
+                fprintf(stderr, "[txrelay] %s gossip: +%ld address(es) to the book\n", cmd, added);
+            continue;
+        }
+        /* headers/cmpctblock/...: not ours -- same discard the sync drains
+         * apply. A `block` push lost here is re-fetched by the next
          * headers-driven pass. */
     }
     return accepted;

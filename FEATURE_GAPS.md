@@ -236,8 +236,13 @@ tables and the writers themselves.
   orders (604 of the live node's 5,990 records byte-swapped;
   `validation/peers_dat_port_audit.py` repairs it), and the v1 ingest parser
   read the IPv4 from the wrong offset and fabricated addresses from
-  timestamps. Still IPv4-only storage: Tor/I2P/CJDNS addresses now arrive
-  but are not kept.
+  timestamps. Later the same day: outbound legs fold addr/addrv2 gossip
+  into the book (Core's per-address token bucket + the existing quotas), a
+  post-verack sendaddrv2/wtxidrelay disconnects as in Core (the probe now
+  reports `<disconnected>` and reads identically for both nodes), and the
+  real daemon's per-leg negotiation is asserted end to end. Still IPv4-only
+  storage: Tor/I2P/CJDNS addresses now arrive but are not kept -- a
+  record-format change, and the node has no Tor/I2P transport to use them.
 - **Full-verification IBD benchmark vs Core** (`-assumevalid=0
   -stopatheight`, second scratch datadir) — **still never run.** The one
   like-for-like end-to-end speed comparison, and the only item here that is
