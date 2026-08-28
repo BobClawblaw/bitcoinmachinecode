@@ -419,4 +419,13 @@ p2p_read:
 	ret
 	.size p2p_read, .-p2p_read
 
+	/* net_magic (mainnet P2P message magic, 0xd9b4bef9) -- x86 bitcoin_net.asm */
+	.section .data
+	.align 2
+	.global net_magic
+	.type net_magic, %object
+net_magic:
+	.word 0xd9b4bef9
+	.size net_magic, 4
+
 	.section .note.GNU-stack,"",%progbits

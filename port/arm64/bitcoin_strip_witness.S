@@ -348,7 +348,6 @@ strip_witness_asm:
  * h = SHA-256(in); out = RIPEMD-160(h). Exact ABI twin of asm/bitcoin_addr.asm.
  * Needed by the C segwit path (p2wpkh/p2wsh) that the differential links.
  * -------------------------------------------------------------------------- */
-	.global hash160
 	.type hash160, %function
 hash160:
 	stp  x29, x30, [sp, #-16]!

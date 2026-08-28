@@ -91,4 +91,13 @@ script_flags_for_block:
     ret
     .size script_flags_for_block,.-script_flags_for_block
 
+    /* sfc_chain (script-flags chain-id, 0) -- x86 bitcoin_script_flags.asm */
+    .section .data
+    .align 2
+    .global sfc_chain
+    .type sfc_chain, %object
+sfc_chain:
+    .word 0
+    .size sfc_chain, 4
+
     .section .note.GNU-stack,"",@progbits
