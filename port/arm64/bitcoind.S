@@ -1635,7 +1635,7 @@ node_ibd_blocks_s:
 	mov  x0, x19
 	add  x1, sp, #64
 	mov  x2, x22
-	ldr  w3, [sp, #60]
+	ldr  w3, =0x4000000             /* receive cap = 64MB (>= max 4MB block) */
 	add  x4, sp, #52
 	bl   p2p_read
 	cmp  x0, #0
