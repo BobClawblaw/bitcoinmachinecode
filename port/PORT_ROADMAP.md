@@ -384,8 +384,17 @@ and runs natively.
       byte-exact vs Core-equivalent reference; index/ntx edges) and
       test_addrmgr ALL PASS (p2p_addr_v1 serialization byte-exact) natively on
       ARM (2026-08-28). `make cmpct_diffs` (test_bip152 + test_addrmgr).
+- [x] Remaining consensus twin differentials built+run natively on ARM
+      (2026-08-28), via `make consensus_diffs` (bitcoin_bip143/strip_witness/
+      checksig/tapagg/txv_dispatch/taproot_verify/witness_v0_drv/
+      scriptverify_drv/multisig): test_bip143_diff 987 (plus 53,220 with real
+      mainnet block 800000 = 3,721 real txs), strip_witness 2183, checksig 15,
+      tapagg 63, txv_dispatch 17, taproot_verify 27, wv0_drv 21, svs_drv 15,
+      multisig -- ALL PASS, 0 mismatches, NO new bugs (only the txv_parse RDCS
+      off-by-one from this drive). All asm twins now confirmed byte-exact vs
+      their C oracles on AArch64.
 - [ ] Remaining leaf modules (idx, idxscan, serve, cli, headers,
-      node_log, witness_v0, multisig, utxo_stats, ...)
+      node_log, utxo_stats, ...)
 
 ## Notes
 - Port is scalar-first (correct by construction). ARMv8 SHA2/crypto-extension
