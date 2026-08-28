@@ -263,6 +263,29 @@ in exactly ONE of the bundles that get linked together — `bitcoin_pow_rules.o`
 in both `DAEMON_RPCOBJS` and `DAEMONSRCS` produced "multiple definition" and
 a daemon that would not link.
 
+### 2.3d A test that shares the code's assumption proves nothing
+
+Three separate defects on 2026-08-27 hid behind tests that agreed with the
+implementation because they were built from the same belief:
+
+| what was tested | how the test was built | what it actually proved |
+|---|---|---|
+| `mempool.dat` v2 reader | the test built its own v2 fixture | that the reader agreed with the test's idea of v2 — both wrong about the key's compact-size prefix |
+| the boot hash index | `test_serve` built the index with its own `idx_put` loop | that the serve loop works against an index nobody builds that way |
+| the same index | `bench_hashidx` compared the asm loader to a C reference that reversed identically | that two implementations of the same mistake agree |
+
+The rule that falls out: **a fixture must be built from the format or the
+producer, never from the consumer under test.** For a file format, get a
+real file from the other implementation (`validation/bumpfee_regtest_e2e.sh`
+runs both directions against a real Core). For an internal structure, build
+it the way PRODUCTION builds it and query it the way the real caller queries
+it — `test_serve` now calls `idx_build_from_file` and looks up with the hash
+as it arrives on the wire.
+
+Corollary for live debugging: **validate the instrument before trusting a
+negative result.** A p2p probe that got silence from our node was only
+meaningful once the same probe got an immediate answer from a real Core.
+
 ### 2.4 Randomized ctypes stress (optional, shared-lib targets)
 
 ```bash

@@ -11,6 +11,13 @@ typedef struct {
     unsigned char h160[20];
     unsigned int  keyidx;     /* the <i> in m/84'/0'/0'/<i>/<branch> */
     unsigned char branch;     /* 0 receive, 1 change */
+    unsigned char hdkey;      /* WHICH HD key this came from: 0 = the wallet's
+                               * own seed, 1..N = a key added by addhdkey.
+                               * Without it two HD keys collide on
+                               * (keyidx, branch) and a record from one
+                               * resolves to the other's address -- the wallet
+                               * would then build a spend against the wrong
+                               * scriptPubKey. */
 } wscan_key;
 
 int wscan_key_cmp(const void* a, const void* b);
@@ -40,6 +47,11 @@ typedef struct {
                                    * first, so the coin needs 100 confirmations
                                    * before it is spendable. Only a format-3
                                    * file carries this; see wscan_flags_known */
+    unsigned char hdkey;          /* which HD key owns this output; see
+                                   * wscan_key. Only a format-4 file carries
+                                   * it, and 0 -- the wallet's own seed -- is
+                                   * both the default and what every older
+                                   * file means. */
 } wscan_rec;
 
 /* 1 when the scan file that produced these records was format 3 or newer and
@@ -79,5 +91,20 @@ long wscan_run(long from, long to,
  * the honest reading). *tip_out gets the highest height the file covers,
  * or -1 when there is no usable file. */
 long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out);
+
+/* Rewrite the whole record file from an array, with the same header-last
+ * durability discipline wscan_run uses. Behind importprunedfunds and
+ * removeprunedfunds, which edit the record set WITHOUT rescanning the chain.
+ * Returns 0, or -1 with `err` filled; on failure `path` is not disturbed. */
+int wscan_write(const char* path, const wscan_rec* recs, long n, long tip,
+                char* err, unsigned long errcap);
+
+/* The scriptPubKey forms this wallet recognises: P2WPKH, P2PKH, P2SH. Sets
+ * *h to the 20-byte hash inside and returns 1, else 0. Exported so callers
+ * that decide "is this output ours" outside the scan loop (importprunedfunds)
+ * ask the SAME question the scan asks -- a second copy of this would let the
+ * two disagree about what the wallet owns. */
+int wscan_spk_h160(const unsigned char* spk, unsigned long len,
+                   const unsigned char** h);
 
 #endif

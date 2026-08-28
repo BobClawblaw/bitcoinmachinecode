@@ -30,6 +30,8 @@ default rel
     extern amr_get_i
     extern p2p_addr_v1
     extern idx_get
+    extern serve_idx_topup
+    extern serve_cfilters
     extern idx_put
     extern store_append
     extern block_strip_witness
@@ -63,6 +65,7 @@ serve_txid_scratch: times SERVE_TXID_CAP*32 db 0  ; cons_verify scratch (own buf
 cn_pong:   db "pong",0
 cn_addr:   db "addr",0
 cn_block:  db "block",0
+cn_notfnd: db "notfound",0
 cn_head:   db "headers",0
 cn_inv:    db "inv",0
 cn_tx:     db "tx",0
@@ -75,6 +78,11 @@ cn_feeflt: db "feefilter",0
 ; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
 align 16
 bt_buf:    times (8<<20) db 0     ; compact-block output buffer
+; A getdata we cannot satisfy must be ANSWERED. Core replies `notfound`;
+; this path used to say nothing at all, so the peer sat waiting for its own
+; timeout on every miss -- and a peer that times out on us asks someone else
+; next time. 50 entries is the inv/getdata cap Core enforces on the way in.
+nf_buf:    times (1 + 50*36) db 0 ; notfound payload: count byte + 36B entries
 s_cmpct_v2:  dq 0                 ; peer negotiated compact blocks (sendcmpct version 2)
 s_cmpct_hb:  dq 0                 ; peer requested high-bandwidth mode (announce=1)
 s_cmpct_nonce: dq 0               ; nonce used for the compact block we announced
@@ -133,6 +141,7 @@ s_plen:   dq 0
 s_fh:     dq 0
 s_cmd:    times 16 db 0
 s_cnt:    dq 0
+s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
 s_ptr:    dq 0
 s_p:      dq 0
 s_n:      dq 0
@@ -149,6 +158,30 @@ s_lastheight: dq 0 ; height just returned by idxscan_append_locked in .do_block,
                     ; intact for the log_block_stored_inbound call right after
 
 section .text
+
+; ============================================================================
+; serve_txdv_preinit() -> 1 if the tx-validation path is usable, else 0.
+;   Runs the read-only UTXO snapshot + mempool policy init ONCE, intended to
+;   be called by the parent BEFORE forking (see the note in node_serve_loop).
+;   Idempotent: a second call is a no-op, and the per-connection guard skips
+;   its own init once this has run.
+; ============================================================================
+global serve_txdv_preinit
+serve_txdv_preinit:
+    push rbp
+    mov  rbp, rsp                 ; rsp%16==0 here, so the calls below are aligned
+    cmp  byte [tx_dv_initdone], 1
+    je   .pre_done
+    call tx_dispatch_init
+    mov  byte [tx_dv_ok], al
+    call tx_policy_init
+    and  al, byte [tx_dv_ok]
+    mov  byte [tx_dv_ok], al
+    mov  byte [tx_dv_initdone], 1
+.pre_done:
+    movzx eax, byte [tx_dv_ok]
+    pop  rbp
+    ret
 
 global node_serve_loop
 node_serve_loop:
@@ -226,8 +259,20 @@ node_serve_loop:
 .mp_inited:
     mov  byte [mp_initdone], 1
 .mpready:
-    ; init this connection's read-only UTXO snapshot + mempool policy state
-    ; once per process (same lazy-init-guard shape as mpool_init above).
+    ; init this connection's read-only UTXO snapshot + mempool policy state.
+    ; NORMALLY ALREADY DONE: serve_txdv_preinit runs this once in the parent
+    ; BEFORE the fork (daemon/main.c), so every inbound child inherits the
+    ; snapshot copy-on-write instead of opening its own. This guard is the
+    ; fallback for callers that never pre-init (the test harnesses).
+    ;
+    ; Why pre-fork: utxo_lsm_reload takes 60-83 s on the real 165M-entry set,
+    ; and doing it HERE meant every inbound peer waited that long before we
+    ; sent even a feefilter -- real peers hang up first, so inbound serving
+    ; was effectively dead. Bitcoin Core opens its coins view once at startup
+    ; (InitCoinsDB in node/chainstate.cpp) and shares it across peer threads;
+    ; the shared mempool directly above already follows the same discipline
+    ; via mp_ext_inited. This just gives the UTXO snapshot the same treatment.
+    ; (2026-08-27)
     ; Non-fatal on failure -- .do_tx checks tx_dv_ready and falls back to
     ; dropping inbound tx (not accepting unvalidated ones) rather than
     ; taking the whole connection down.
@@ -292,6 +337,8 @@ node_serve_loop:
     je   .maybe_getheaders
     cmp  dword [s_cmd], 0x62746567   ; "getb..." (getblocks / getblocktxn)
     je   .maybe_getb
+    cmp  dword [s_cmd], 0x63746567   ; "getc..." (getcfilters/-headers/-checkpt)
+    je   .maybe_getcf
     cmp  dword [s_cmd], 0x00766e69   ; "inv"
     je   .do_inv
     cmp  dword [s_cmd], 0x00007874   ; "tx"
@@ -612,6 +659,14 @@ node_serve_loop:
     mov  rax, [s_plen]
     cmp  rax, 37
     jb   .next
+    ; Fold in any height index.dat has gained since this process last looked.
+    ; The hash index below was built at BOOT; new blocks are appended by the
+    ; DOWNLOAD WORKER, a different process, so without this every block we
+    ; downloaded during the run is a silent miss and this node never helps
+    ; propagate recent blocks. Cheap when nothing is new (one stat), and done
+    ; here rather than per connection so a long-lived peer cannot go stale.
+    call serve_idx_topup
+    mov  qword [s_nf], 0      ; no misses yet for this getdata
     ; cnt = pl[0] (single-byte varint)
     movzx rax, byte [pl_buf]
     mov  [s_cnt], rax     ; item counter
@@ -620,7 +675,7 @@ node_serve_loop:
 .gd_loop:
     mov  rax, [s_cnt]
     test rax, rax
-    jle  .next
+    jle  .gd_done
     mov  rbx, [s_ptr]     ; item ptr (rbx is free here -- outer counter saved in the loop bound)
     ; type at rbx (u32 LE): 2=MSG_BLOCK -> serve block; 1=MSG_TX -> mempool tx;
     ; 4=MSG_CMPCT_BLOCK -> serve a compact block (BIP152, requester negotiated).
@@ -644,7 +699,7 @@ node_serve_loop:
     ; ---- serve a compact block (type 4) ----
     ; guard: peer must have negotiated sendcmpct v2
     cmp  qword [s_cmpct_v2], 1
-    jne  .gd_next
+    jne  .gd_miss
     ; hash at rbx+4 -> resolve to height
     mov  [s_ptr], rbx
     mov  rdi, [s_htidx]
@@ -653,7 +708,7 @@ node_serve_loop:
     call idx_get
     mov  rbx, [s_ptr]
     test rax, rax
-    jz   .gd_next
+    jz   .gd_miss
     ; load block into sb_buf
     mov  [s_ptr], rbx
     mov  rdi, [s_st]
@@ -663,7 +718,7 @@ node_serve_loop:
     call node_serve_block
     mov  rbx, [s_ptr]
     test rax, rax
-    jle  .gd_next
+    jle  .gd_miss
     mov  [s_blen_spill], rax
     ; choose/rotate the nonce (fixed seed is fine for deterministic tests)
     mov  rcx, [s_cmpct_nonce]
@@ -680,7 +735,7 @@ node_serve_loop:
     call cmpctblock_build
     mov  rbx, [s_ptr]
     test rax, rax
-    jle  .gd_next
+    jle  .gd_miss
     mov  r8d, eax           ; cmpctblock length
     ; p2p_write(fd, "cmpctblock", 10, bt_buf, len)
     mov  [s_ptr], rbx
@@ -702,7 +757,7 @@ node_serve_loop:
     call idx_get
     mov  rbx, [s_ptr]
     test rax, rax
-    jz   .gd_next
+    jz   .gd_miss
     ; node_serve_block(st, fh, sb_buf, cap)
     mov  [s_ptr], rbx
     mov  rdi, [s_st]         ; stable copy of st
@@ -712,7 +767,7 @@ node_serve_loop:
     call node_serve_block
     mov  rbx, [s_ptr]
     test rax, rax
-    jle  .gd_next
+    jle  .gd_miss
     ; BIP144: a bare MSG_BLOCK (witness flag 0x40000000 CLEAR) from a strict
     ; pre-segwit peer wants the STRIPPED serialization -- it cannot parse the
     ; segwit marker/flag bytes in the full form. The type u32 is still at
@@ -731,7 +786,7 @@ node_serve_loop:
     call block_strip_witness
     mov  rbx, [s_ptr]
     test rax, rax
-    jle  .gd_next               ; strip failed -> serve nothing (never a wrong form)
+    jle  .gd_miss               ; strip failed -> serve nothing (never a wrong form)
     mov  r8d, eax
     mov  [s_ptr], rbx
     mov  rdi, r12
@@ -766,7 +821,7 @@ node_serve_loop:
     call mpool_get
     mov  rbx, [s_ptr]
     test rax, rax
-    jz   .gd_next
+    jz   .gd_miss
     ; p2p_write(fd,"tx",2, ptr, len)
     mov  [s_ptr], rbx
     mov  rdi, r12
@@ -782,6 +837,40 @@ node_serve_loop:
     add  qword [s_served], 1
     mov  rbx, [s_ptr]
     jmp  .gd_next
+.gd_miss:
+    ; Could not serve this entry: copy its 36 bytes into the notfound reply.
+    ; rbx points at the entry (type u32 + 32B hash) -- exactly the shape
+    ; notfound carries, so it is copied verbatim rather than rebuilt.
+    mov  rax, [s_nf]
+    cmp  rax, 50
+    jae  .gd_next                 ; reply is full; the rest are simply dropped
+    lea  rdi, [nf_buf+1]
+    imul rcx, rax, 36
+    add  rdi, rcx
+    mov  rsi, rbx
+    mov  rcx, 36
+    push rbx
+    rep  movsb
+    pop  rbx
+    inc  qword [s_nf]
+    jmp  .gd_next
+
+.gd_done:
+    ; every entry handled -- tell the peer about the ones we could not serve
+    mov  rax, [s_nf]
+    test rax, rax
+    jz   .next
+    mov  byte [nf_buf], al        ; count (<=50, so a single-byte varint)
+    imul r8, rax, 36
+    inc  r8                       ; payload length = 1 + n*36
+    ; p2p_write(fd,"notfound",8,nf_buf,len)
+    mov  rdi, r12
+    lea  rsi, [cn_notfnd]
+    mov  rdx, 8
+    lea  rcx, [nf_buf]
+    call p2p_write
+    jmp  .next
+
 .gd_next:
     ; advance item pointer by 36 and decrement counter
     mov  rax, [s_ptr]
@@ -789,6 +878,33 @@ node_serve_loop:
     mov  [s_ptr], rax
     dec  qword [s_cnt]
     jmp  .gd_loop
+
+.maybe_getcf:
+    ; BIP157 compact filters. The index has existed and been proven
+    ; byte-identical to Core's for some time; none of these three messages
+    ; was in this dispatch, so a light client asking us got silence.
+    ; Distinguish on cmd[4..7]: "filt" / "head" / "chec".
+    mov  r9d, dword [s_cmd+4]
+    xor  r8d, r8d                  ; kind 0 = getcfilters
+    cmp  r9d, 0x746c6966           ; "filt" (getcf|ilt|ers)
+    je   .gcf_go
+    ; NOTE the offsets: after "getc" the next four bytes are "fhea" and
+    ; "fche", not "head"/"chec" -- getcfilters matched and the other two did
+    ; not, which is exactly what the probe reported.
+    mov  r8d, 1                    ; kind 1 = getcfheaders ("getcf|hea|ders")
+    cmp  r9d, 0x61656866           ; "fhea"
+    je   .gcf_go
+    mov  r8d, 2                    ; kind 2 = getcfcheckpt ("getcf|che|ckpt")
+    cmp  r9d, 0x65686366           ; "fche"
+    jne  .next
+.gcf_go:
+    ; serve_cfilters(fd, kind, pl_buf, plen)
+    mov  rdi, r12
+    mov  esi, r8d
+    lea  rdx, [pl_buf]
+    mov  rcx, [s_plen]
+    call serve_cfilters
+    jmp  .next
 
 .maybe_getheaders:
     ; "getheaders" = g e t h e a d e r s

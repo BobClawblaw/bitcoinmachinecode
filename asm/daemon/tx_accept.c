@@ -625,12 +625,30 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     return 1;
 }
 
+/* The two -- and only two -- policy verdicts a package may overturn, in
+ * Core's words. Exported so the relay drain and the submitpackage path
+ * cannot drift apart on what "reconsiderable" means. */
+int txacc_fee_reconsiderable(const char* reason){
+    return reason && (!strcmp(reason, "min relay fee not met") ||
+                      !strcmp(reason, "mempool min fee not met"));
+}
+
 /* tx_accept_validate_p2p: the RELAY path's entry. Same verdict classes as
  * tx_accept_validate_reason (1 accept, -25 missing inputs, -26 other) so
  * the orphan pool can class its parks -- but it logs through the 30-second
  * SUMMARY, never per transaction. The drain briefly used _reason directly
  * for the -25 class and silently brought the per-tx reject firehose back;
- * per-tx lines belong to user submissions only. */
+ * per-tx lines belong to user submissions only.
+ *
+ * One extra class the RPC entries do not need: -28, "reconsiderable". Core
+ * splits a fee-only failure (TX_RECONSIDERABLE: min relay fee not met, or
+ * mempool min fee not met) out of the general reject class precisely because
+ * it is the one verdict a CPFP child can overturn -- everything else is
+ * final, and no amount of fee from a descendant makes an invalid parent
+ * valid. Those are the same two strings txsub_package already treats as
+ * rescuable, kept in one place here. Collapsing them into -26, as this used
+ * to, is what made 1p1c relay impossible: the drain could not tell a parent
+ * worth re-submitting inside a package from one worth discarding. */
 long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
                             unsigned long txlen){
     if (!g_ready || !g_pol_ready) return -26;
@@ -648,7 +666,12 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
     mp_unlock();
-    if (padd != 1){ g_alog.rej_policy++; return -26; }
+    if (padd != 1){
+        g_alog.rej_policy++;
+        const char* r = mpool_policy_reason(g_pol);
+        if (r && txacc_fee_reconsiderable(r)) return -28;
+        return -26;
+    }
     g_alog.acc++;
     txacc_note_sigops(mp_area, txid, tx, txlen);
     mempool_note_accept(txid);
@@ -746,6 +769,27 @@ long tx_accept_block_connect(void* mp_area, const unsigned char* block,
     long r = mpool_policy_block_connect(g_pol_state, mp_area, block, blen);
     mp_unlock();
     return r;
+}
+
+/* serve_idx_topup: WEAK default. bitcoin_serve.asm calls this at the top of
+ * getdata handling to fold in heights index.dat has gained since boot; the
+ * real one lives in daemon/main.c, where ht_idx does. Several test targets
+ * link bitcoin_serve.o WITHOUT main.c -- the same reason
+ * log_block_stored_inbound lives in this file -- and for them "no new
+ * heights" is the honest answer, since nothing is appending any.
+ * A strong definition anywhere in the link overrides this one. */
+__attribute__((weak)) long serve_idx_topup(void){ return 0; }
+
+/* WEAK defaults for the serve-path callbacks that live outside this file, so
+ * targets linking bitcoin_serve.o without daemon/main.c or
+ * daemon/serve_cfilters.c still resolve them. A strong definition anywhere
+ * in the link wins. */
+__attribute__((weak)) long serve_height_of_hash(const unsigned char hash[32]){
+    (void)hash; return -1;
+}
+__attribute__((weak)) int serve_cfilters(int fd, int kind,
+                                         const unsigned char* pl, unsigned long plen){
+    (void)fd; (void)kind; (void)pl; (void)plen; return 0;
 }
 
 /* log_block_stored_inbound(hash32, height, bytes): called from

@@ -52,6 +52,13 @@ typedef struct {
     unsigned char p2sh_version;      /* base58Prefixes[SCRIPT_ADDRESS] */
     unsigned char wif_version;       /* base58Prefixes[SECRET_KEY] */
     const char*  bech32_hrp;
+    /* BIP32 extended-key version bytes. Core uses one pair for mainnet and
+     * ANOTHER for every test chain, and its descriptor parser rejects the
+     * wrong one outright -- an xpub handed to a regtest node is "not valid".
+     * Without these the whole extended-key surface (gethdkeys, addhdkey,
+     * listdescriptors' xpub) is silently mainnet-only. */
+    unsigned int xpub_version;    /* 0x0488B21E main / 0x043587CF test    */
+    unsigned int xprv_version;    /* 0x0488ADE4 main / 0x04358394 test    */
     int          dns_seeds;          /* regtest: none, ever */
     /* testnet4: fPowAllowMinDifficultyBlocks -- a block whose time is more
      * than 2*10min after its parent may use pow_limit_bits (relevant to

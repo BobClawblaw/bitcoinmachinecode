@@ -7,6 +7,175 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-27 (evening) -- package relay closed, end to end
+
+Five parts, one theme: a transaction whose fee only makes sense alongside a
+relative could not reach this node over the wire, and could not be described
+back to a caller in Core's words.
+
+1P1C PACKAGE RELAY (dc041a1). A parent that does not clear the relay floor
+alone was rejected, and its child was then an orphan forever no matter what
+it paid. CPFP worked over `submitpackage` and nowhere else, so the pattern
+the network actually uses to unstick a parent could not reach this node at
+all.
+
+Core splits the fee-only failure out of the general reject class
+(`TX_RECONSIDERABLE`) precisely because it is the ONE verdict a descendant
+can overturn -- everything else is final. Our relay entry collapsed both into
+-26, so the drain could not tell a parent worth resubmitting inside a package
+from one worth discarding. It returns -28 for the two fee reasons now, and
+`submitpackage` was carrying its own inline copy of that same pair of
+strings, so both call one predicate and cannot drift.
+
+The reverse arrival order needed a second piece, and this is the part worth
+keeping: Core keeps reconsiderable identifiers in a filter SEPARATE from
+recent-rejects so `AlreadyHaveTx` answers "no" and the parent can be fetched
+AGAIN once a child turns up. Our request ring is that already-have check, and
+it would have suppressed exactly the re-fetch 1p1c depends on. Membership
+buys a bounded number of ring bypasses -- bounded, because an unbounded one
+is a re-fetch loop with a peer sending a transaction we keep rejecting.
+
+The negative control matters here: with the reconsiderable class disabled,
+six checks fail. A test that passes both ways tests nothing.
+
+TESTMEMPOOLACCEPT PACKAGE MODE + REPLACED-TRANSACTIONS (9ef9fda). The
+differential against Core earned its keep, twice.
+
+First, a real bug no stubbed-worker unit test could have found: pass 1
+computes the package aggregate, so it necessarily runs WITHOUT the fee
+context, and a member that only clears the floor because of the package is
+still marked rejected there. The real submission overwrites that in pass 2.
+Stopping after pass 1 -- which is what a dry run naturally does -- therefore
+reported `allowed:false` for exactly the transaction package validation
+exists to admit. Core said true, we said false. Pass 2 now runs in test mode
+too, as a test rather than a commit.
+
+Second, `replaced-transactions` is TOP LEVEL in `submitpackage`, as the union
+across members, not a per-member field as I first assumed. Reading Core's
+schema instead of guessing it is the only reason that was right.
+
+The second differential failure was in the test, not the node: the two
+regtest nodes are peered, so a replacement submitted to one relays to the
+other in milliseconds and the second node answers "already in mempool" with
+no replacements at all. Core reported `[]` and it looked like a disagreement
+about the field. The test cuts the link first now, with a comment saying why.
+
+TRUC + EPHEMERAL DUST (37dec8b). The rule that is easy to get backwards is
+that half of BIP431's constraints apply to NON-v3 transactions -- a v2 child
+may not spend a v3 parent either -- and getting that wrong leaves open
+exactly the pinning hole TRUC exists to close. Both directions enforced,
+both tested.
+
+And the differential caught the same class of miss a third time: our TRUC
+rules did not fire inside a package AT ALL. During package validation a
+member's parent is not in the mempool, it is another member, so `find_node`
+missed, the transaction looked parentless, and a v2 child of a v3 parent
+sailed straight through. The package overlay resolves PREVOUTS; it does not
+say who is in the package. A membership context now does. That is three
+separate defects this session that only a real Core found -- the hermetic
+tests were all green each time.
+
+Ephemeral dust has two rules that only work as a pair: the dust carrier must
+pay ZERO fee (so no miner is tempted to mine it alone and strand the dust),
+and a child must sweep every dust output of its unconfirmed parents (so the
+parent can only be mined alongside the transaction that cleans up). An
+implementation with one of them still passes the other's tests, so they are
+tested separately.
+
+STATED GAPS, both strictly more conservative than Core, neither silent: TRUC
+sibling eviction is not implemented (a second child is refused rather than
+replacing its sibling under RBF rules), and Core's `package-error` carries
+"TOKEN, debug detail" where ours carries the token alone.
+
+THE SMALL ITEMS (463be38, 8269d9a).
+
+`bumpfee`'s replaced-by linkage was filed as "write-only in practice". The
+cause was one layer further down: `gettransaction` answers from the wallet
+send journal, and NOTHING IN THE DAEMON EVER WROTE IT -- only the wallet_cli
+tool did. A bump over RPC recorded a linkage no RPC could read back. The
+first fix wrote nothing at all, silently, because the library's NULL default
+resolves to the CLI's `data/` layout which does not exist on a per-chain
+datadir.
+
+The offline UTXO builder included the genesis coinbase that Core omits, while
+the live writer has skipped it since 2026-08-22 -- so the two writers
+disagreed about what the UTXO set IS. One header now, included by both.
+Found while fixing it: `daemon/build_utxo` had not LINKED for some time,
+because it is not in `make test`. It is now, which is the real fix.
+
+`exportwatchonlywallet` turned out to need no import path at all: this
+wallet's entire key set is its two concrete descriptors, so the export is
+complete rather than truncated, and `restorewallet` reads the format back.
+The round trip is the test -- proving a file appeared would prove nothing.
+
+NOT DONE, deliberately, with a measurement instead of a shrug: moving
+`lsm_get_scratch` off per-thread TLS. 33 worker threads, ~134 MiB of
+demand-paged .tbss, against 3.8 GB RSS on a box with 45 GB free -- bought
+back by calling malloc from hand-written assembly at four sites in the UTXO
+read path. Bad trade, recorded as such.
+
+Gate green throughout. Regtest e2e against Core v31.99: 46 checks, 0
+failures, up from 29 this morning.
+
+----------------------------------------------------------------------------
+## 2026-08-27 -- the node could not serve a single block, for TWO reasons
+
+FEATURE_GAPS carried one unverified line: index.dat records "store the hash
+in wire order" while bitcoin_idx.asm's loader claims display order and
+reverses every record, and "whether the serve path's idx_get compensates was
+not checked". Checking it found two independent defects, either of which
+alone made inbound block serving impossible. Together they masked each
+other, which is why the first fix appeared to change nothing.
+
+CAUSE 1 -- THE INDEX WAS KEYED BACKWARDS (392872b). index.dat holds WIRE
+(raw sha256d) order: production record 0 is genesis as 6fe28c0ab6f1b372...,
+the exact reverse of its display form. idx_build_from_file byte-reversed
+every record on the belief the file held display order, so the boot hash
+index was keyed on DISPLAY hashes. The serve loop passes idx_get the hash
+exactly as it arrives on the p2p wire, so .gd_block could never hit: a
+getdata for a block we hold fell through and the peer got nothing, not even
+a notfound. Proven in isolation before changing anything -- display FOUND at
+the right height, wire MISS, garbage MISS both ways.
+
+WHY THREE TESTS MISSED IT, which is the part worth keeping. test_serve
+built its OWN index with a plain idx_put loop (no reversal), so in the test
+the table was wire-keyed and the serve loop worked -- it proved the serve
+loop correct against an index nobody builds that way. bench_hashidx compared
+the asm loader against a C reference that reversed IDENTICALLY, so the two
+agreed with each other and were both keyed backwards. test_truncate reversed
+every hash before looking it up, matching the loader and no consumer. Each
+test encoded the code's belief rather than the file's contents. All three
+now build the index the way production does and look up the way the wire
+does.
+
+CAUSE 2 -- 63 SECONDS OF SILENCE PER INBOUND CONNECTION (1b62d67). Every
+forked serve child opened its OWN read-only UTXO snapshot before entering
+its read loop, and utxo_lsm_reload costs 60-83 s on the real 165M-entry set.
+During that window the child sent NOTHING -- not even the feefilter the loop
+normally emits immediately -- so every probe timed out at 20-30 s and real
+peers would hang up far sooner. A 240 s probe got the block at 63 s, which
+is what identified it.
+
+Fixed by giving the snapshot the discipline the shared mempool DIRECTLY
+ABOVE IT already had: serve_txdv_preinit runs the init once in the parent
+pre-fork and children inherit it copy-on-write. Bitcoin Core does the same
+-- InitCoinsDB/InitCoinsCache run once in LoadChainstate and every peer
+thread reads one shared view; Core never re-opens the UTXO per connection
+and never forks per connection. Measured on mainnet: 63 s to serve, before;
+under a second after, with the 61.49 s now paid once at boot and logged.
+
+TWO CORRECTIONS TO MY OWN WORK during the hunt, both instructive. The
+`h=-1` that made genuine index hits look like failures was MY probe reading
+the height variable in the same printf argument list as the call that sets
+it -- C does not order argument evaluation. And I twice suspected the
+stripped-block serving added earlier the same day; it was innocent, and
+pointing the same probe at a real Core (which served it immediately)
+is what proved the instrument sound and stopped me chasing my own tooling.
+
+Incidentally confirmed in production: a bare MSG_BLOCK getdata returns
+806,153 bytes where the full block is 1,575,376 -- the stripped-block
+serving added earlier today works on real segwit blocks.
+
 ## 2026-08-27 -- mempool.dat, both directions
 
 `savemempool` and `importmempool` are real, in Core's format, and the

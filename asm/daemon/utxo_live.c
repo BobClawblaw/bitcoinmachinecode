@@ -23,6 +23,7 @@
  * (manifest_n directly bounds .do_tx's per-lookup disk-run scan cost for
  * every inbound child once that's wired up).
  */
+#include "genesis_skip.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -894,25 +895,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * bare `height == 0` test silently dropped those (caught by both suites
      * failing, 2026-08-22). Only reachable at all because the archive now
      * stores real genesis at index 0 as of the same day. */
-    static const u8 MAINNET_GENESIS[32] = {   /* wire (sha256d) order */
-        0x6f,0xe2,0x8c,0x0a,0xb6,0xf1,0xb3,0x72,0xc1,0xa6,0xa2,0x46,0xae,0x63,0xf7,0x4f,
-        0x93,0x1e,0x83,0x65,0xe1,0x5a,0x08,0x9c,0x68,0xd6,0x19,0x00,0x00,0x00,0x00,0x00 };
-    /* regtest genesis, same rule (Core never writes ANY chain's genesis
-     * coinbase to its chainstate). Static bytes rather than a chainparams.c
-     * link dependency -- this file is compiled into many tools and tests
-     * that never select a chain, and matching both hashes is chain-agnostic.
-     * (display 0f9188f1...466e2206 reversed; the derivation is verified
-     * against Core's asserted hash by tests/test_chainparams.c.) */
-    static const u8 REGTEST_GENESIS[32] = {   /* wire (sha256d) order */
-        0x06,0x22,0x6e,0x46,0x11,0x1a,0x0b,0x59,0xca,0xaf,0x12,0x60,0x43,0xeb,0x5b,0xbf,
-        0x28,0xc3,0x4f,0x3a,0x5e,0x33,0x2a,0x1f,0xc7,0xb2,0xb7,0x3c,0xf1,0x88,0x91,0x0f };
-    /* testnet4 (display 00000000da84f2ba...8bf043 reversed) */
-    static const u8 TESTNET4_GENESIS[32] = {  /* wire (sha256d) order */
-        0x43,0xf0,0x8b,0xda,0xb0,0x50,0xe3,0x5b,0x56,0x7c,0x86,0x4b,0x91,0xf4,0x7f,0x50,
-        0xae,0x72,0x5a,0xe2,0xde,0x53,0xbc,0xfb,0xba,0xf2,0x84,0xda,0x00,0x00,0x00,0x00 };
-    if (g_apply_height == 0 && (memcmp(blk_hash, MAINNET_GENESIS, 32) == 0 ||
-                                memcmp(blk_hash, REGTEST_GENESIS, 32) == 0 ||
-                                memcmp(blk_hash, TESTNET4_GENESIS, 32) == 0)) return 1;
+    if (bmc_is_genesis_block((long)g_apply_height, blk_hash)) return 1;
 
     /* nBits schedule (see the block comment above apply_block_inner). The
      * check runs for the dry-run too -- submitblock and GBT proposal answer

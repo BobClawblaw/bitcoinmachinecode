@@ -182,8 +182,21 @@ int main(void){
     chain_seed.name = "p2pkh_chain_seed"; chain_seed.txid = chain_tid;
     chain_seed.prev_spk = chain_spk; chain_seed.prev_spklen = 25;
     chain_seed.prev_amount = 10000000ull;
-    const msend_t* seeds3[3] = { s, s2, &chain_seed };
-    seed_utxos(seeds3, 3);
+    /* two more P2PKH coins, one per 1p1c ordering case (cases 9 and 10) */
+    u8 cpf_priv[32], cpf_dpriv[32];
+    for (int i=0;i<32;i++){ cpf_priv[i]=(u8)(0x11+i); cpf_dpriv[i]=(u8)(0x99+i); }
+    static u8 cpf_spk[25]; wallet_make_p2pkh_script(cpf_spk, cpf_priv);
+    static u8 cpf_tid[32]; memset(cpf_tid, 0xC1, 32);
+    msend_t cpf_seed; memset(&cpf_seed, 0, sizeof cpf_seed);
+    cpf_seed.name = "p2pkh_1p1c_seed"; cpf_seed.txid = cpf_tid;
+    cpf_seed.prev_spk = cpf_spk; cpf_seed.prev_spklen = 25;
+    cpf_seed.prev_amount = 10000000ull;
+    static u8 cpf_tid2[32]; memset(cpf_tid2, 0xC2, 32);
+    msend_t cpf_seed2 = cpf_seed;
+    cpf_seed2.name = "p2pkh_1p1c_seed2"; cpf_seed2.txid = cpf_tid2;
+
+    const msend_t* seeds5[5] = { s, s2, &chain_seed, &cpf_seed, &cpf_seed2 };
+    seed_utxos(seeds5, 5);
     (void)seeds;
     tx_accept_set_tip(500);
 
@@ -381,6 +394,115 @@ int main(void){
                                 && pl4[1] == 1 && memcmp(pl4+5, txid2v, 32) == 0);
         ck("leg A (the source) got nothing", no_bytes_pending(sp[1]));
         close(spB[0]); close(spB[1]);
+    }
+
+    /* ---- 1p1c package relay -------------------------------------------
+     * The parent pays 50 sat on ~192 vB -- far under the 1 sat/vB relay
+     * floor -- so on its own it is rejected, and before 1p1c the child was
+     * then an orphan forever no matter what it paid. The child pays 5000
+     * sat, which lifts the PAIR over the floor. Both orderings are tested,
+     * because they take different paths: child-first finds the child
+     * already parked, parent-first has to remember the parent as
+     * reconsiderable and re-fetch it past the request ring. */
+    printf("\n== 9: 1p1c -- low-fee parent rescued by its child (child first) ==\n");
+    {
+        drain_peer(sp[1]);
+        static u8 ptx[4096], ctx9[4096];
+        unsigned long long tval[1] = { 10000000ull };
+        unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
+        /* fee 50 sat: below the floor for any tx of this size */
+        long pn = wallet_send_tx(ptx, sizeof ptx, (u8(*)[32])cpf_tid, tidx, tval, 1,
+                                 to_h, 10000000ull - 50ull, 50ull, cpf_priv, 0);
+        ck("low-fee parent signed", pn > 0);
+        u8 pid[32]; tx_txid(pid, ptx, (unsigned long)pn, tb, sizeof tb);
+        unsigned long long cval[1] = { 10000000ull - 50ull };
+        long cn = wallet_send_tx(ctx9, sizeof ctx9, (u8(*)[32])pid, tidx, cval, 1,
+                                 to_h, 10000000ull - 50ull - 5000ull, 5000ull, cpf_dpriv, 0);
+        ck("fee-paying child signed", cn > 0);
+        u8 cid[32]; tx_txid(cid, ctx9, (unsigned long)cn, tb, sizeof tb);
+        unsigned long ml = 0;
+
+        /* child first: parked, parent requested */
+        p2p_write(sp[1], "tx", 2, ctx9, (unsigned)cn);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("child alone: nothing accepted", acc == 0);
+        ck("child not pooled yet", mpool_get(mp_area, cid, &ml) == NULL);
+        drain_peer(sp[1]);
+
+        /* the parent now arrives and fails the floor ALONE -- the pair must
+         * go in together */
+        p2p_write(sp[1], "tx", 2, ptx, (unsigned)pn);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("parent + child accepted as a package", acc == 2);
+        ck("under-paying parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
+        ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+    }
+
+    printf("\n== 10: 1p1c -- parent arrives first, is refetched for its child ==\n");
+    {
+        drain_peer(sp[1]);
+        static u8 ptx[4096], ctx10[4096];
+        unsigned long long tval[1] = { 10000000ull };
+        unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
+        long pn = wallet_send_tx(ptx, sizeof ptx, (u8(*)[32])cpf_tid2, tidx, tval, 1,
+                                 to_h, 10000000ull - 50ull, 50ull, cpf_priv, 0);
+        u8 pid[32]; tx_txid(pid, ptx, (unsigned long)pn, tb, sizeof tb);
+        unsigned long long cval[1] = { 10000000ull - 50ull };
+        long cn = wallet_send_tx(ctx10, sizeof ctx10, (u8(*)[32])pid, tidx, cval, 1,
+                                 to_h, 10000000ull - 50ull - 5000ull, 5000ull, cpf_dpriv, 0);
+        u8 cid[32]; tx_txid(cid, ctx10, (unsigned long)cn, tb, sizeof tb);
+        unsigned long ml = 0;
+
+        /* PARENT first, with no child anywhere: rejected on fee, and
+         * remembered as reconsiderable rather than simply discarded */
+        p2p_write(sp[1], "tx", 2, ptx, (unsigned)pn);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("under-paying parent alone: not accepted", acc == 0);
+        ck("...and not pooled", mpool_get(mp_area, pid, &ml) == NULL);
+        drain_peer(sp[1]);
+
+        /* now the child. Its parent was requested moments ago, so the
+         * request ring would ordinarily suppress the re-fetch -- being
+         * reconsiderable is exactly what buys the bypass. */
+        p2p_write(sp[1], "tx", 2, ctx10, (unsigned)cn);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("child alone: nothing accepted", acc == 0);
+        char cmd[13]; static u8 pl5[4096];
+        int plen = read_msg(sp[1], cmd, pl5, sizeof pl5);
+        ck("reconsiderable parent re-requested past the ring",
+           plen == 37 && strcmp(cmd, "getdata") == 0 && memcmp(pl5+5, pid, 32) == 0);
+
+        /* the peer answers the re-fetch: package goes in */
+        p2p_write(sp[1], "tx", 2, ptx, (unsigned)pn);
+        acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("parent + child accepted as a package", acc == 2);
+        ck("under-paying parent pooled", mpool_get(mp_area, pid, &ml) != NULL);
+        ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+    }
+
+    printf("\n== 11: the package fee context does not leak ==\n");
+    {
+        /* A fee context left set after a package would quietly relax the
+         * floor for ordinary single-transaction relay -- the whole mempool
+         * would start accepting under-paying transactions. Prove a lone
+         * under-payer is still rejected AFTER the packages above. */
+        drain_peer(sp[1]);
+        static u8 solo[4096];
+        unsigned long long tval[1] = { 10000000ull };
+        unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, chain_dpriv);
+        u8 lone_tid[32]; memset(lone_tid, 0xC3, 32);
+        long n = wallet_send_tx(solo, sizeof solo, (u8(*)[32])lone_tid, tidx, tval, 1,
+                                to_h, 10000000ull - 50ull, 50ull, cpf_priv, 0);
+        ck("lone under-payer signed", n > 0);
+        u8 lid[32]; tx_txid(lid, solo, (unsigned long)n, tb, sizeof tb);
+        p2p_write(sp[1], "tx", 2, solo, (unsigned)n);
+        long acc = txrelay_poll_leg(sp[0], mp_area, 200);
+        unsigned long ml = 0;
+        ck("a lone under-paying tx is STILL rejected", acc == 0);
+        ck("...and not pooled", mpool_get(mp_area, lid, &ml) == NULL);
     }
 
     close(sp[0]); close(sp[1]);

@@ -1502,9 +1502,53 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
     long h = -1, known_off = -1;
     static char bs_buf[65];
     const char* bs = NULL;
-    if (!param_present(params, 2)){
+    const int have_blockhash = param_present(params, 2);
+    if (!have_blockhash){
         u8 want_wire[32];
         for (int i = 0; i < 32; i++) want_wire[i] = want_disp[31-i];
+
+        /* ---- MEMPOOL FIRST, which is Core's order --------------------------
+         * Core's GetTransaction consults the mempool before the txid index
+         * whenever no blockhash was given, and its own help says so: "By
+         * default, this call only returns a transaction if it is in the
+         * mempool." This node consulted only the OFFLINE index, so an
+         * unconfirmed transaction -- the common case the call is reached for
+         * -- came back as -5 "No such transaction", with a message about
+         * index coverage that was true and beside the point.
+         *
+         * rpc_node_mempool_rawtx copies the bytes out under the pool lock;
+         * nothing here holds a live pointer into shared memory that an
+         * eviction could move. */
+        {
+            static u8 mraw[RPC_TXSUBMIT_MAX];
+            long mlen = rpc_node_mempool_rawtx(want_wire, mraw, sizeof mraw);
+            if (mlen > 0){
+                if (verbosity <= 0){
+                    char* hx = malloc((size_t)mlen*2 + 1);
+                    if (!hx){ *ec = -7; *em = "out of memory"; return 0; }
+                    hex_of(hx, mraw, (size_t)mlen);
+                    *res = rj_str(hx); free(hx); return 1;
+                }
+                txw_t w;
+                if (!tx_walk(mraw, mraw + mlen, &w)){
+                    *ec = -5; *em = "Mempool transaction could not be parsed"; return 0; }
+                /* An unconfirmed transaction has NO block, so Core emits no
+                 * blockhash, no confirmations and no time/blocktime -- and no
+                 * in_active_chain either, which is documented as "only
+                 * present with explicit blockhash argument". Filling any of
+                 * them in would assert a confirmation that has not happened.
+                 *
+                 * KNOWN OMISSION: Core also adds `vsize_adjusted` (the
+                 * sigop-adjusted vsize) for a mempool hit. This node has no
+                 * -bytespersigop concept anywhere in its RPC surface yet, and
+                 * adding the field in ONE place while getmempoolentry and the
+                 * package RPCs still report plain vsize would be worse than
+                 * omitting it consistently. */
+                *res = tx_to_json(mraw, &w, -1);
+                return 1;
+            }
+        }
+
         long th; u32 toff, tlen;
         if (txi_lookup(want_wire, &th, &toff, &tlen)){
             h = th; known_off = (long)toff; (void)tlen;
@@ -1520,9 +1564,11 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                  * cannot tell them apart will draw the wrong conclusion. */
                 long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
                 snprintf(nomsg, sizeof nomsg,
-                         "No such transaction. The txid index covers heights %ld..%ld; "
-                         "if the transaction is outside that range, rebuild the index "
-                         "over it or pass the block hash.", g_txi_from, cov_to);
+                         "No such mempool or blockchain transaction. The txid index "
+                         "covers heights %ld..%ld; if the transaction is outside that "
+                         "range, rebuild the index over it or pass the block hash. "
+                         "Use gettransaction for wallet transactions.",
+                         g_txi_from, cov_to);
                 *ec = -5; *em = nomsg; return 0;
             }
             *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
@@ -1559,7 +1605,11 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                 hex_of(hx, p, w.len); *res = rj_str(hx); free(hx); return 1;
             }
             rj_val* o = rj_obj();
-            rj_obj_set(o, "in_active_chain", rj_bool(1));
+            /* Core: "only present with explicit blockhash argument". It used
+             * to be emitted unconditionally here, which the mempool path
+             * above makes plainly wrong -- an unconfirmed transaction is in
+             * no block at all. */
+            if (have_blockhash) rj_obj_set(o, "in_active_chain", rj_bool(1));
             rj_val* t = tx_to_json(p, &w, -1);   /* verbosity 1: no fee (Core parity) */
             /* splice TxToUniv's members into our object to keep Core's order */
             for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }

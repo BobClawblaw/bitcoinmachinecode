@@ -439,6 +439,27 @@ assumption the reader held. The two agreed with each other. Only running the
 file past a real Core, and a real Core's file past us, exposed it. A
 self-built fixture tests a format only if it is built FROM the format.
 
+And then the day's sharpest finding, which came from checking a single
+unverified line in the gap list rather than from building anything. That
+line said index.dat "stores the hash in wire order" while the loader claims
+display order, and that "whether the serve path compensates was not
+checked". It did not compensate. **The node had never served a block to any
+peer that asked for one** — the boot hash index was keyed backwards, so
+every getdata fell through silently. Behind it sat a second defect that
+would have produced the same symptom on its own: each forked serve child
+spent 60-83 s opening its own UTXO snapshot before answering anything.
+
+Both were in code that had passed every gate for months, and three separate
+tests had looked directly at the broken index without seeing it, because
+each was built from the implementation's belief rather than the file's
+contents.
+
+That is the pattern this document exists to insist on. A clean replay proves
+no real block was refused; a green suite proves no test disagreed with the
+code. Neither proves the node does what a peer expects of it. The two
+findings above were only reachable by asking a real peer's question of a
+real node and checking the answer against a real Core.
+
 Net: capability keeps moving, end-to-end speed vs Core is **still**
 unmeasured, and the discovery rate is **still** not decelerating. The
 judgement stands.

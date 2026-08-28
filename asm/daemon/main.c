@@ -254,13 +254,86 @@ extern void idxscan_progress(long* out_tip, long* out_present);
  * here. Drops the periodic "[hashidx] N/M" progress print: the whole build
  * is now a small fraction of a second on the real archive (was ~186s), so
  * there's nothing left to show progress on. */
+/* Heights already folded into ht_idx. The boot build covers [0, this), and
+ * serve_idx_topup carries it forward from there. */
+static long g_htidx_next;
+
+static long htidx_file_heights(void){
+    struct stat sb;
+    if (stat("index.dat", &sb) != 0) return 0;
+    return (long)(sb.st_size / 48);
+}
+
 static int build_hash_index(void){
     ht_idx=malloc(24 + (size_t)HT_SLOTS*48 + 64);   /* last slot may need a full --- actually over-allocate */
     if(!ht_idx){ fprintf(stderr,"alloc idx failed\n"); return -1; }
     idx_init(ht_idx, HT_SLOTS);
     if(idx_build_from_file(ht_idx, "index.dat")<0){ fprintf(stderr,"no index.dat for hash index\n"); return -1; }
+    g_htidx_next = htidx_file_heights();
     fprintf(stderr,"[hashidx] indexed %ld stored heights\n", (long)idx_count(ht_idx));
     return 0;
+}
+
+/* serve_height_of_hash -- the height for a block hash, from the serve path's
+ * own hash index. Behind daemon/serve_cfilters.c, which needs to turn a
+ * BIP157 request's stop_hash into a height and has no business reaching into
+ * ht_idx itself. Returns -1 when the hash is unknown. */
+long serve_height_of_hash(const unsigned char hash[32]){
+    if (!ht_idx) return -1;
+    long h = 0;
+    if (idx_get(ht_idx, hash, &h) != 1) return -1;
+    return h;
+}
+
+/* serve_idx_topup -- fold every height index.dat has gained since this
+ * process last looked into the serve path's hash index.
+ *
+ * WHY THIS EXISTS: the hash index the serve path answers `getdata` from was
+ * built ONCE, at boot. New blocks are appended by the DOWNLOAD WORKER, which
+ * is a different process, so neither the serve parent nor any serve child
+ * forked from it ever learned about them. The result, found 2026-08-28 by
+ * validation/p2p_inbound_probe.py: a block that was in the archive at
+ * startup is served, and a block downloaded during the run is answered with
+ * silence -- so this node never helped propagate RECENT blocks, which is the
+ * only propagation that matters. Block serving had been verified the day
+ * before and passed, because a caught-up node mostly answers for historical
+ * blocks and those WERE in the archive at boot.
+ *
+ * This is the same incremental top-up rpc_chain.c's refresh() already does
+ * for the RPC side, which is why the RPC layer never had the bug.
+ *
+ * Cheap when nothing is new: one stat(2), then a return. Called from
+ * bitcoin_serve.asm at the top of getdata handling, so a long-lived
+ * connection cannot go stale either. */
+long serve_idx_topup(void){
+    if (!ht_idx) return 0;
+    long have = htidx_file_heights();
+    if (have <= g_htidx_next) return 0;
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return 0;
+    long added = 0;
+    unsigned char rec[48];
+    for (long h = g_htidx_next; h < have; h++){
+        if (pread(fd, rec, 48, (off_t)h * 48) != 48) break;
+        /* an all-zero record is a hole -- a height the store has not filled
+         * yet. Indexing it would map the zero hash to a height. */
+        int present = 0;
+        for (int i = 0; i < 32; i++) if (rec[i]){ present = 1; break; }
+        if (present && idx_put(ht_idx, rec, h) == 2){
+            /* index full: stop, and do NOT advance the cursor past the
+             * height we failed to add */
+            fprintf(stderr,"[hashidx] WARNING: hash index full at height %ld; "
+                           "blocks above it cannot be served until restart\n", h);
+            break;
+        }
+        g_htidx_next = h + 1;
+        if (present) added++;
+    }
+    close(fd);
+    if (added)
+        fprintf(stderr,"[hashidx] +%ld height(s) now servable (through %ld)\n",
+                added, g_htidx_next - 1);   /* parent-side; a child normally adds 0 */
+    return added;
 }
 
 /* STAGE B: rebuild the hash index in place after a reorg truncated the store.
@@ -273,10 +346,13 @@ static int build_hash_index(void){
 static void rebuild_hash_index_after_reorg(void){
     if(!ht_idx) return;
     idx_init(ht_idx, HT_SLOTS);
+    g_htidx_next = 0;             /* the rebuild re-reads the file from 0 */
     if(idx_build_from_file(ht_idx, "index.dat")<0)
         fprintf(stderr,"[reorg] WARNING: hash index rebuild failed; block-by-hash serving is degraded until restart\n");
-    else
+    else {
+        g_htidx_next = htidx_file_heights();
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
+    }
     /* the txid-index tail's covered-height watermark must follow a
      * truncation too, or the reconnected blocks would be skipped as
      * already-indexed (fires with tip == fork height on the mid-reorg
@@ -2464,16 +2540,28 @@ static int txsub_worker_ready(void){
  * amount of fee from a child makes an invalid parent valid.
  *
  * Returns 1 if the whole package was accepted, 0 otherwise (per-transaction
- * results are published in the shared block either way). */
+ * results are published in the shared block either way).
+ *
+ * With tx_submit_test set this stops after pass 1 and commits nothing --
+ * which is precisely what testmempoolaccept on an array means. Core applies
+ * package policy to a multi-transaction testmempoolaccept, and running the
+ * SAME dry run the real submission runs is the only way the answer can be
+ * trusted: a separate "test" implementation is a second set of rules that
+ * will drift from the first. Until this existed, testmempoolaccept checked
+ * each member against the mempool as it stood, so a child spending an
+ * in-array parent was reported as missing-inputs. */
 static int txsub_package(char* msg, unsigned long mcap){
     extern int mpol_package_well_formed(const unsigned char* const*, const unsigned long*,
                                         int, unsigned char*, unsigned long long*, const char**);
     extern void mpol_package_fee_context(unsigned long long, unsigned long long);
+    extern void mpol_package_context(const unsigned char* const*, const unsigned long*,
+                                     const unsigned char*, int);
     extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*,
                                       const unsigned char*, int);
     extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*,
                                       unsigned long, char*, unsigned long, unsigned long long*);
     extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
+    extern int  txacc_fee_reconsiderable(const char* reason);
     node_status_t* st = g_node_status;
     int n = st->tx_submit_pkg_n;
     if (n <= 0 || n > RPC_PKG_MAX){ snprintf(msg, mcap, "package-too-many-transactions"); return 0; }
@@ -2496,6 +2584,8 @@ static int txsub_package(char* msg, unsigned long mcap){
       }
       if (p != end){ snprintf(msg, mcap, "package-contains-unparseable-transaction"); return 0; } }
 
+    st->pkg_replaced_n = 0;
+    const int test_only = st->tx_submit_test ? 1 : 0;
     const char* why = "";
     static unsigned long long vsz[RPC_PKG_MAX];
     if (!mpol_package_well_formed(txs, lens, n, txids, vsz, &why)){
@@ -2512,6 +2602,10 @@ static int txsub_package(char* msg, unsigned long mcap){
     /* ---- pass 1: dry run with the overlay, to learn the real fees -------- */
     unsigned long long tot_fee = 0, tot_vsize = 0;
     int all_ok = 1;
+    int truc_violation = 0;
+    /* membership as well as prevouts: the overlay lets a child RESOLVE its
+     * parent, but TRUC has to know the parent is in the package at all. */
+    mpol_package_context(txs, lens, txids, n);
     txacc_package_overlay(txs, lens, txids, n);
     for (int i = 0; i < n; i++){
         char r[128]; r[0] = 0; unsigned long long fee = 0;
@@ -2523,31 +2617,99 @@ static int txsub_package(char* msg, unsigned long mcap){
             st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
             tot_fee += fee; tot_vsize += st->pkg_vsize[i];
         } else {
-            int fee_only = (!strcmp(r, "min relay fee not met") ||
-                            !strcmp(r, "mempool min fee not met"));
+            int fee_only = txacc_fee_reconsiderable(r);
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
             if (fee_only){ tot_fee += fee; tot_vsize += st->pkg_vsize[i]; }
-            else all_ok = 0;      /* not something a package can rescue */
+            else {
+                all_ok = 0;      /* not something a package can rescue */
+                /* A TRUC violation is a statement about the package's SHAPE,
+                 * so Core rejects the package as a whole and gives no member
+                 * an individual verdict. Reporting it against one member
+                 * would say the others were fine, which is not what was
+                 * decided. */
+                if (!strcmp(r, "TRUC-violation")) truc_violation = 1;
+            }
         }
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
 
     if (!all_ok){
         mpol_package_fee_context(0, 0);
+        st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
+        if (truc_violation){
+            snprintf(msg, mcap, "TRUC-violation");
+            for (int i = 0; i < n; i++){
+                st->pkg_result[i] = 0;
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "package-not-validated");
+            }
+            return 0;
+        }
         snprintf(msg, mcap, "transaction failed");
         return 0;
+    }
+
+    /* testmempoolaccept: the answer is a dry run, but it needs BOTH passes.
+     * Pass 1 runs without the package fee context -- it has to, since that
+     * is where the aggregate is computed -- so a member that only clears the
+     * floor because of the package is still marked rejected there. The real
+     * submission overwrites that verdict in pass 2, under the context; a
+     * test that stopped after pass 1 reported allowed:false for exactly the
+     * transaction package validation exists to admit. So pass 2 runs here
+     * too, as a test rather than a commit: same overlay, same fee context,
+     * nothing inserted and nothing relayed. */
+    if (test_only){
+        st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
+        int all_pass = 1;
+        mpol_package_fee_context(tot_fee, tot_vsize);
+        mpol_package_context(txs, lens, txids, n);
+        txacc_package_overlay(txs, lens, txids, n);
+        for (int i = 0; i < n; i++){
+            char r[128]; r[0] = 0; unsigned long long fee = 0;
+            long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
+                                            r, sizeof r, &fee);
+            if (rc == 1){
+                st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = fee;
+            } else {
+                st->pkg_result[i] = 0;
+                snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
+                all_pass = 0;
+            }
+        }
+        txacc_package_overlay(NULL, NULL, NULL, 0);
+        mpol_package_context(NULL, NULL, NULL, 0);
+        mpol_package_fee_context(0, 0);
+        snprintf(msg, mcap, "success");   /* package-level verdict; per-member above */
+        return all_pass;
     }
 
     /* ---- pass 2: commit, with the package feerate in effect -------------- */
     int committed = 1;
     mpol_package_fee_context(tot_fee, tot_vsize);
+    mpol_package_context(txs, lens, txids, n);
     txacc_package_overlay(txs, lens, txids, n);
     for (int i = 0; i < n; i++){
         char r[128]; r[0] = 0; int relayed = 0;
         int rc = txsub_accept_and_relay(txsub_pool(), txs[i], lens[i],
                                         mux_out_fd, mux_n_out, r, sizeof r, &relayed);
-        if (rc == 1){ st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; }
+        if (rc == 1){
+            st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            /* whatever THIS member displaced by RBF, folded into the
+             * package-wide union Core reports at the top level. Read
+             * immediately: the next member's accept overwrites it. */
+            extern int mpol_last_replaced(unsigned char* out, int cap);
+            unsigned char rep[RPC_PKG_REPLACED_MAX][32];
+            int nrep = mpol_last_replaced((unsigned char*)rep, RPC_PKG_REPLACED_MAX);
+            for (int k = 0; k < nrep; k++){
+                int dup = 0;
+                for (int q = 0; q < st->pkg_replaced_n; q++)
+                    if (!memcmp((const void*)st->pkg_replaced[q], rep[k], 32)){ dup = 1; break; }
+                if (dup) continue;
+                if (st->pkg_replaced_n >= RPC_PKG_REPLACED_MAX) break;
+                memcpy((void*)st->pkg_replaced[st->pkg_replaced_n++], rep[k], 32);
+            }
+        }
         else {
             st->pkg_result[i] = 0;
             snprintf((char*)st->pkg_reason[i], sizeof st->pkg_reason[i], "%s", r);
@@ -2558,6 +2720,7 @@ static int txsub_package(char* msg, unsigned long mcap){
      * ordinary single-transaction traffic, and an overlay left set would let
      * an unrelated transaction resolve against a package member. */
     txacc_package_overlay(NULL, NULL, NULL, 0);
+    mpol_package_context(NULL, NULL, NULL, 0);
     mpol_package_fee_context(0, 0);
 
     st->pkg_eff_fee = tot_fee; st->pkg_eff_vsize = tot_vsize;
@@ -3614,6 +3777,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
                         upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
+            /* Relay-pool health. Silent when nothing has been parked, so a
+             * node with no orphan traffic prints nothing extra. */
+            { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
+              long pk=0, rs=0, dr=0, ok=0, fl=0, held=0;
+              if(txrelay_stats(&pk,&rs,&dr,&ok,&fl,&held))
+                  fprintf(stderr,"[txrelay] orphans: %ld held, %ld parked, %ld resolved, "
+                                 "%ld dropped; 1p1c: %ld accepted, %ld failed\n",
+                          held, pk, rs, dr, ok, fl); }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
@@ -3979,6 +4150,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c=accept(l,(struct sockaddr*)&ca,&cal);
+            /* Fold new heights into the PARENT's index before forking, so
+             * the child inherits a current one and its own top-up is a
+             * no-op. Without this each child re-scans everything appended
+             * since boot, and says so in the log once per connection. */
+            if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window */
                 close(c); c = -1;
@@ -4160,6 +4336,22 @@ int main(int argc, char** argv){
      * before the fork, so every child inherits the same region rather than
      * each falling back to the 2 MiB static. */
     mempool_configure();
+    /* Open the read-only UTXO snapshot the tx-validation path needs ONCE,
+     * here, PRE-FORK -- for exactly the reason the mempool above is done
+     * pre-fork. bitcoin_serve.asm used to do it lazily per CONNECTION, and
+     * utxo_lsm_reload costs 60-83 s on the real set: every inbound peer waited
+     * that long before we sent so much as a feefilter, so in practice we
+     * served nobody. Bitcoin Core opens its coins view once in LoadChainstate
+     * and shares it across peer threads; children here inherit this one
+     * copy-on-write, which also stops each peer mapping its own copy.
+     * Non-fatal: on failure the serve path drops inbound tx rather than
+     * accepting unvalidated ones, exactly as before. */
+    { extern int serve_txdv_preinit(void);
+      phase_timer_t txdv_pt; phase_start(&txdv_pt);
+      int ok = serve_txdv_preinit();
+      fprintf(stderr, "[boot] tx-validation snapshot %s (%.2fs) -- inbound peers inherit it\n",
+              ok ? "ready" : "UNAVAILABLE (inbound tx will be dropped, not accepted)",
+              phase_elapsed(&txdv_pt)); }
     /* Each chain keeps its own logs under <chain-datadir>/logs/ -- the asm
      * logger (node_log_open) writes there via the cwd, so a regtest run can
      * never interleave with the mainnet log. */

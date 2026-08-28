@@ -228,8 +228,9 @@ oracle, not merely plausible:
 `restorewallet` / `migratewallet` / `setwalletflag` (one wallet, loaded at
 startup, no multi-wallet manager); `importdescriptors` /
 `createwalletdescriptor` / `addhdkey` / `importprunedfunds` /
-`removeprunedfunds` / `exportwatchonlywallet` (a single seed with no import
-path); `walletdisplayaddress` (no external signer); and the receive-side
+`removeprunedfunds` (a single seed with no import path — `createwallet`,
+`loadwallet`, `unloadwallet`, `restorewallet`, `importdescriptors` and
+`exportwatchonlywallet` have all since become real); `walletdisplayaddress` (no external signer); and the receive-side
 family — `rescanblockchain`, `getreceivedbyaddress`, `getreceivedbylabel`,
 `listreceivedbyaddress`, `listreceivedbylabel`, `listaddressgroupings`,
 `listsinceblock`, `abandontransaction` — which all need a wallet rescan that
@@ -397,15 +398,23 @@ would answer about a mempool this node does not have.
 by a dry run would turn a real broadcast into a no-op that still returned a
 txid — the test asserts the worker sees the flag cleared.
 
-**Documented divergence — package policy.** Core validates the array as a
-package: a child may spend a parent earlier in the same call. This node
-evaluates each transaction independently against the mempool as it stands,
-because the dry run deliberately inserts nothing, so an earlier entry is
-invisible to a later one. When more than one transaction is passed, every
-entry carries Core's own `package-error` field saying so, and a child
-spending an in-array parent reports `missing-inputs` — the truth about what
-was checked. `effective-feerate` and `effective-includes` describe package
-feerate and are omitted rather than guessed.
+**Package mode — REAL since 2026-08-27 (evening).** An array of more than
+one transaction is validated as a PACKAGE, the way Core validates it: a child
+may spend a parent earlier in the same call, and the members are weighed
+against the fee floors together. It runs through the SAME staged package path
+`submitpackage` uses, stopped after its dry run — a separate "test"
+implementation would be a second copy of the rules, free to drift from the
+one that decides real admissions, which is the one thing this call must never
+do. `package-error` now means what it means in Core: a genuine package-level
+rejection.
+
+The differential against Core found a real bug in the first cut, which no
+unit test with a stubbed worker could have: pass 1 computes the package
+aggregate, so it necessarily runs WITHOUT the fee context, and a member that
+only clears the floor because of the package is still marked rejected there.
+Stopping after pass 1 reported `allowed:false` for exactly the transaction
+package validation exists to admit. Pass 2 runs in test mode too now, as a
+test rather than a commit.
 
 ### `finalizepsbt` — verified against the signer, not against itself
 Implements BIP174's Finalizer and Extractor for P2PKH, P2WPKH and
@@ -822,15 +831,19 @@ the call site. What remains declined, and why, in one place:
   directions against a real Core.
 - ~~**submitpackage**~~ — **REAL 2026-08-27** (slice 21): package policy,
   in-package parent resolution and Core's effective feerate, so a parent
-  below the relay floor is accepted when its child pays for it. Still
-  refused: **getmempoolcluster** (no cluster mempool).
+  below the relay floor is accepted when its child pays for it. The rest of
+  package relay closed the same evening (slice 23): p2p 1p1c relay, TRUC/v3,
+  ephemeral dust, `replaced-transactions`, `testmempoolaccept` package mode.
+  Still refused: **getmempoolcluster** (no cluster mempool).
 - ~~**encryptwallet + multi-wallet lifecycle**~~ — both REAL (encryption
   2026-08-27, the multi-wallet lifecycle the same week). Of the
-  import/export family only seven remain refused, all needing a path to
-  ADOPT foreign key material a single-seed wallet does not have:
-  `migratewallet`, `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
-  `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`.
-  `importdescriptors` is real.
+  import/export family **nothing remains refused**: five closed 2026-08-27
+  (evening, slice 24) and `addhdkey` the same night (slice 25).
+  `importdescriptors` is real, and **`exportwatchonlywallet` became real
+  2026-08-27 (evening)** — it needs no import path at all, since this
+  wallet's entire key set IS the two concrete descriptors it exports
+  (branch-last derivation, index 0 only). `restorewallet` reads the format
+  back; the round trip is proven in the regtest e2e.
 - **getopenrpcinfo / rpc.discover / exportasmap** — no OpenRPC document, no
   asmap.
 
@@ -1138,10 +1151,20 @@ Proven end to end: the parent is refused ALONE with "min relay fee not met",
 then accepted as part of the package — and Bitcoin Core accepts the identical
 package (`validation/bumpfee_regtest_e2e.sh`).
 
-STILL OPEN: p2p 1-parent-1-child package RELAY (this is submission), TRUC/v3
-and ephemeral-dust policy, `replaced-transactions`, and
-`testmempoolaccept`'s package mode, which still evaluates each member
-independently and says so at its own call site.
+CLOSED the same evening, all of it: p2p 1p1c package RELAY (a fee-only
+reject is classed `-28` "reconsiderable", and the drain submits such a parent
+together with a waiting orphan child — Core's `Find1P1CPackage`; both arrival
+orders work, because a reconsiderable parent buys a bounded number of
+request-ring bypasses so a later child can trigger a re-fetch), BIP431
+TRUC/v3 topology, ephemeral dust, `replaced-transactions` (top level, as the
+union across members), and `testmempoolaccept`'s package mode.
+
+STATED GAPS, both strictly more conservative than Core: TRUC **sibling
+eviction** is not implemented, so a second TRUC child is refused rather than
+allowed to replace its sibling under RBF rules; and Core's `package-error`
+carries `"TOKEN, debug detail"` naming the offending txid and wtxid in prose,
+where ours carries the token alone. The verdicts match — the regtest
+comparison matches on the token and says so where it does it.
 
 ## Slice 22 — mempool.dat, both directions — (2026-08-27)
 
@@ -1185,3 +1208,218 @@ every live leg immediately.
 Verified on the live mainnet node: a 284,485-byte dump of 184 real
 transactions that an independent parser walks to exactly the file length,
 zero trailing bytes, all entry times nonzero.
+
+## Slice 23 — package relay, closed end to end — (2026-08-27, evening)
+
+Five parts. The theme is a transaction whose fee only makes sense alongside a
+relative: it could not reach this node over the wire, and could not be
+described back to a caller in Core's words.
+
+### 1p1c package relay
+
+`submitpackage` (slice 21) let a caller submit a CPFP pair. Nothing let one
+arrive over the wire. A parent below the relay floor was rejected, its child
+became a permanent orphan, and the pattern the network actually uses to
+unstick a stuck parent could not reach this node at all.
+
+Core splits the fee-only failure out of the general reject class
+(`TX_RECONSIDERABLE`) precisely because it is the ONE verdict a descendant
+can overturn; everything else is final. The relay entry collapsed both into
+`-26`, so the drain could not tell a parent worth resubmitting inside a
+package from one worth discarding. It returns `-28` for the two fee reasons
+now — and `submitpackage` had its own inline copy of that same pair of
+strings, so both call one predicate and cannot drift.
+
+The reverse arrival order needed the other half of Core's design. Core keeps
+reconsiderable identifiers in a filter SEPARATE from recent-rejects so
+`AlreadyHaveTx` answers "no" and the parent can be requested AGAIN once a
+child turns up. Our request ring is that already-have check, and it would
+have suppressed exactly the re-fetch 1p1c depends on. Membership buys a
+bounded number of ring bypasses — bounded, because an unbounded one is a
+re-fetch loop with a peer that keeps sending a transaction we keep rejecting.
+
+The validation is not a second implementation: same well-formedness check,
+same overlay, same two passes, same fee context `submitpackage` runs. A
+package off the wire and one off the RPC socket must not be able to disagree.
+
+### TRUC (BIP431) and ephemeral dust
+
+The rule that is easy to get backwards is that half of TRUC's constraints
+apply to NON-v3 transactions — a v2 child may not spend a v3 parent either —
+and getting that wrong leaves open exactly the pinning hole TRUC exists to
+close. Both directions are enforced and both are tested.
+
+Ephemeral dust has two rules that only work as a pair: the carrier must pay
+ZERO fee (so no miner is tempted to mine it alone and strand the dust), and a
+child must sweep every dust output of its unconfirmed parents (so the parent
+can only be mined alongside the transaction that cleans up). An
+implementation with only one still passes the other's tests, so each is
+tested separately.
+
+### What only a real Core found
+
+Three defects this session survived a green hermetic suite and were caught by
+the regtest differential:
+
+1. `testmempoolaccept` package mode reported `allowed:false` for exactly the
+   transaction package validation exists to admit — pass 1 computes the
+   aggregate, so it runs without the fee context, and stopping there leaves a
+   rescued member marked rejected.
+2. `replaced-transactions` is TOP LEVEL in `submitpackage`, as the union
+   across members — not the per-member field it looks like it should be.
+3. TRUC did not fire inside a package **at all**. During package validation a
+   member's parent is not in the mempool, it is another member, so
+   `find_node` missed, the transaction looked parentless, and a v2 child of a
+   v3 parent sailed through. The package overlay resolves PREVOUTS; it does
+   not say who is in the package. A membership context now does.
+
+One differential failure was in the test rather than the node, and is worth
+recording because it looks exactly like a real divergence: the two regtest
+nodes are peered, so a replacement submitted to one relays to the other in
+milliseconds, and the second node then answers "already in mempool" with no
+replacements at all. Core reported `[]`. The test cuts the link first now.
+
+### Stated gaps
+
+Both strictly more conservative than Core, neither silent:
+
+- **TRUC sibling eviction** is not implemented. A second TRUC child is
+  refused rather than allowed to replace its sibling under RBF rules.
+- Core's `package-error` is `"TOKEN, debug detail"`, naming the offending
+  txid and wtxid in prose; ours carries the token alone. The verdicts match,
+  so the regtest comparison matches on the token — and says so where it does.
+
+Regtest e2e against Core v31.99: **46 checks, 0 failures.**
+
+## Slice 24 — the wallet refusals that were not refusals — (2026-08-27, evening)
+
+Six wallet RPCs refused with one shared reason: "a single BIP32 seed with no
+import path". For five of them that reason was wrong, or had quietly stopped
+being true as other features shipped.
+
+### The two that Core also refuses
+
+`migratewallet` and `createwalletdescriptor` now answer Core's own verdict.
+Core refuses `migratewallet` on a wallet that is already a descriptor wallet,
+and refuses `createwalletdescriptor` for an address type the wallet already
+has. Both are true of every wallet here, so these are real answers reached
+the same way — not placeholders wearing an error's clothes.
+
+`createwalletdescriptor`'s other three types are refused with the specific
+reason rather than a blanket one. Deriving the KEY for a `tr()` or `pkh()`
+descriptor over the same BIP32 path is trivial; the problem is that the
+rescan matches P2WPKH and `getnewaddress` hands out bech32, so such a
+descriptor would be one in name only and the wallet would silently fail to
+see funds paid to it.
+
+### The pair that imports no keys
+
+`importprunedfunds` / `removeprunedfunds` import no key material at all —
+only the knowledge that an output the wallet already owns exists. That is
+what made them look blocked by a missing import path. Every piece was
+already built and tested:
+
+- the BIP37 proof is verified by `verifytxoutproof`, **called as an RPC
+  rather than reimplemented**, so the partial-merkle-tree walk and the "is
+  this block in our chain" check are the same code the standalone call uses;
+- "is this output ours" is answered by `wscan_spk_h160` against the same key
+  window the rescan uses — exported for this, so the two cannot come to
+  disagree about what the wallet owns;
+- the record set is rewritten through a new `wscan_write`, which owns the
+  on-disk layout and writes the header LAST, so a crash leaves either the
+  previous complete file or the new one, never a half-written record set.
+
+The transaction is decoded by `decoderawtransaction` rather than parsed
+again here — a second transaction parser is not something this file needs.
+
+### The flag that had to do something
+
+`setwalletflag` implements `avoid_reuse` for real. A flag that is stored and
+then ignored is worse than a refusal: it tells the caller the wallet avoids
+reusing addresses when it does not. So `wf_coins` skips a coin whose
+destination this wallet has already spent from (Core's `IsSpentKey`), and
+`getwalletinfo` reports the flag.
+
+### Still refused
+
+`addhdkey` — and the reason is the true one. Adopting a foreign HD key needs
+a key store this single-seed wallet does not have.
+
+### Three refusal texts that had become false
+
+Deleted with the calls that used them. They claimed this node had no
+multi-wallet manager, no encryption path and no rescan — all three shipped
+weeks ago. **A stale refusal is worse than no refusal**: it is a confident,
+specific, wrong explanation, and a reader has no way to tell it from a live
+one.
+
+### Proof
+
+Against a real regtest chain, because "the call succeeded" proves nothing:
+remove a confirmed wallet output and the balance falls by exactly its 50 BTC;
+import it back with a real `gettxoutproof` and the balance returns to the
+satoshi; import the same transaction twice and it does not double-count; hand
+it a garbage proof and it is refused.
+
+The first run of that test passed while doing nothing at all — the coin it
+picked had already been spent by an earlier case, so removing it could not
+change the balance either way. The fixture now requires a mature UNSPENT
+receive. A test that passes for the wrong reason is the failure mode worth
+naming.
+
+Regtest e2e: **54 checks, 0 failures.**
+
+## Slice 25 — addhdkey, and the two bugs it uncovered — (2026-08-27, late)
+
+The last refusal, and the only one that was genuinely blocked rather than
+mislabelled. Three things had to be true first; skipping any of them makes
+the feature a hazard rather than a gap.
+
+**The key must be protected as the seed is.** An xprv in plaintext beside a
+passphrase-encrypted mnemonic silently becomes the weakest thing in the
+wallet directory, and that is the route an attacker takes. A new
+`wallet_secret_write` reuses the mnemonic's own KDF, cipher and tag — one
+implementation of the crypto, one place to review. With no passphrase
+available, `addhdkey` refuses rather than writing a private key in the clear.
+
+**Records must say which key they belong to.** The scan identified a key by
+`(keyidx, branch)` alone. Two HD keys collide on that immediately — both have
+an index-0 receive key — so an output paying key B resolved to key A's
+address, and the wallet would have built a spend against a scriptPubKey the
+coin is not locked to. That is why this needed an on-disk format bump
+(**BMCWSCN4** adds an `hdkey` byte) rather than being a pure RPC addition.
+Formats 2 and 3 still read, and `hdkey = 0` is the *truth* for them, not a
+default: they predate added keys entirely.
+
+**The signer must hold them.** `signrawtransactionwithwallet` offers every
+window key and lets the matcher choose, so the added keys' private halves
+join that list. A wallet that watches an added key's outputs but cannot sign
+them reports coins as spendable that are not.
+
+### Two real bugs, both found by the differential
+
+Core rejected **every xpub this node produced** on regtest — *"key is not
+valid"*. `bip32_extkey_serialize` hardcodes mainnet's version bytes in
+assembly, so the whole extended-key surface (`gethdkeys`, `addhdkey`,
+`listdescriptors`' xpub) was mainnet-only and silently wrong on regtest and
+testnet4. The version pair now sits in `chainparams` beside the other chain
+rules and is stamped over the serialization; `tprv` is accepted on input too.
+
+And one of mine: the second derivation step passed the same buffer as both
+the output and the parent chaincode. Whether an aliased call like that
+survives depends on the order the callee happens to write in.
+
+### Proof
+
+An xpub coming back proves nothing. Against a real chain: the address our key
+window derives matches what **Core** derives from the same xpub; the payment
+is recorded attributed to `hdkey=1` rather than the seed; the wallet **signs**
+an input locked to that key; and the network accepts the spend.
+
+The test earned its keep three times. It ran before the coin it needed had
+confirmed; it mined before the funding transaction had relayed to Core —
+mining an empty block, which reads as *"the wallet cannot see the added key"*,
+a far more alarming conclusion than the truth; and it consumed a coin the
+TRUC fixtures had reserved, which is why it now runs last.
+
+Regtest e2e: **64 checks, 0 failures.**

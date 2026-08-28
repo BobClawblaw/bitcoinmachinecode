@@ -28,6 +28,8 @@ static volatile int g_tw_run = 1;
 static int g_tw_saw_test[8];      /* per handled submission, in order */
 static int g_tw_n;
 static int g_tw_verdict = 1;      /* what to report back */
+static int g_tw_saw_pkg[8];       /* tx_submit_pkg_n per submission, in order */
+static const char* g_tw_pkg_msg = "success";   /* package-level verdict */
 /* g_tw_last is captured by the PARENT before pthread_create: reading it in
  * the new thread would race the parent's first submission, which can be
  * staged and the seq bumped before the thread is ever scheduled -- the
@@ -39,11 +41,30 @@ static void* fake_txworker(void* arg){
     while (g_tw_run){
         if (ns->tx_submit_seq != last){
             last = ns->tx_submit_seq;
-            if (g_tw_n < 8) g_tw_saw_test[g_tw_n++] = ns->tx_submit_test;
+            if (g_tw_n < 8){ g_tw_saw_pkg[g_tw_n] = ns->tx_submit_pkg_n;
+                             g_tw_saw_test[g_tw_n++] = ns->tx_submit_test; }
             ns->tx_submit_result = g_tw_verdict;
             ns->tx_submit_fee = 12345;
-            snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
-                     g_tw_verdict == 1 ? "" : "min relay fee not met");
+            if (ns->tx_submit_pkg_n > 0){
+                /* package dry run, as txsub_package publishes it */
+                int pn = ns->tx_submit_pkg_n;
+                int pkg_ok = !strcmp(g_tw_pkg_msg, "success");
+                for (int i = 0; i < pn; i++){
+                    ns->pkg_result[i] = pkg_ok ? (g_tw_verdict == 1) : 0;
+                    ns->pkg_fee[i]    = 12345;
+                    ns->pkg_vsize[i]  = 200;
+                    snprintf((char*)ns->pkg_reason[i], sizeof ns->pkg_reason[i], "%s",
+                             pkg_ok ? (g_tw_verdict == 1 ? "" : "min relay fee not met")
+                                    : "package-not-validated");
+                }
+                ns->pkg_eff_fee   = 12345ull * (unsigned)pn;
+                ns->pkg_eff_vsize = 200ull   * (unsigned)pn;
+                snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
+                         "%s", g_tw_pkg_msg);
+            } else {
+                snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
+                         g_tw_verdict == 1 ? "" : "min relay fee not met");
+            }
             __sync_synchronize();
             ns->tx_submit_ack = last;
         }
@@ -906,17 +927,48 @@ int main(void){
       rj_free(r); rj_free(p);
       g_tw_verdict = 1;
 
-      /* more than one tx: every entry must carry package-error, because this
-       * node cannot see an in-array parent from a later child */
-      { char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
+      /* more than one tx: PACKAGE mode. The array must go to the worker as
+       * one staged package with the dry-run flag set -- that is what lets a
+       * child see an in-array parent -- and come back with per-member
+       * verdicts and the package's effective feerate. */
+      { int before = g_tw_n;
+        char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
         p = rj_parse(j2, strlen(j2));
         r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
         ck("two txs -> two entries", r && r->nitems == 2);
-        ck("both entries carry package-error naming the missing package policy",
-           r && r->nitems == 2 &&
-           S(r->items[0],"package-error") && S(r->items[1],"package-error") &&
-           strstr(S(r->items[0],"package-error"), "package policy"));
+        ck("staged as a PACKAGE of 2, as a dry run",
+           g_tw_n > before && g_tw_saw_pkg[g_tw_n-1] == 2 && g_tw_saw_test[g_tw_n-1] == 1);
+        ck("no package-error when the package validates",
+           r && r->nitems == 2 && rj_obj_get(r->items[0],"package-error") == NULL);
+        ck("both members allowed", r && r->nitems == 2 &&
+           S(r->items[0],"allowed") && !strcmp(S(r->items[0],"allowed"), "1") &&
+           S(r->items[1],"allowed") && !strcmp(S(r->items[1],"allowed"), "1"));
+        /* the whole point of package mode: the feerate reported is the
+         * PACKAGE's, not each member's own */
+        { rj_val* f = r && r->nitems ? rj_obj_get(r->items[0],"fees") : 0;
+          ck("fees.effective-feerate is the package feerate",
+             f && S(f,"effective-feerate") &&
+             !strcmp(S(f,"effective-feerate"), "0.00061725"));   /* 24690 sat / 400 vB * 1000 */
+          rj_val* inc = f ? rj_obj_get(f,"effective-includes") : 0;
+          ck("effective-includes names both members",
+             inc && inc->typ == RJ_ARR && inc->nitems == 2); }
         rj_free(r); rj_free(p); }
+
+      /* a package-level rejection: no member got an individual verdict, so
+       * every entry carries package-error and NO `allowed` -- Core's shape */
+      { g_tw_pkg_msg = "package-contains-duplicates";
+        char j2[2400]; snprintf(j2, sizeof j2, "[[\"%s\",\"%s\"]]", TX1, TX1);
+        p = rj_parse(j2, strlen(j2));
+        r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+        ck("package-level reject -> package-error on every entry",
+           r && r->nitems == 2 &&
+           S(r->items[0],"package-error") &&
+           !strcmp(S(r->items[0],"package-error"), "package-contains-duplicates") &&
+           S(r->items[1],"package-error"));
+        ck("...and `allowed` is OMITTED, not false",
+           r && r->nitems == 2 && rj_obj_get(r->items[0],"allowed") == NULL);
+        rj_free(r); rj_free(p);
+        g_tw_pkg_msg = "success"; }
 
       /* sendrawtransaction MUST clear the flag the dry run left set */
       { int before = g_tw_n;

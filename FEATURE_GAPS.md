@@ -196,14 +196,47 @@ that overstates is no more honest than one that understates; both are wrong
 about where the work is. What follows was checked by reading the dispatch
 tables and the writers themselves.
 
+- ~~**Blocks downloaded after boot cannot be served**~~ — **CLOSED
+  2026-08-28**, hours after being found. `serve_idx_topup` folds in every
+  height `index.dat` has gained since this process last looked: the parent
+  tops up before forking a serve child (so the child inherits a current
+  index) and the getdata handler tops up too (so a long-lived connection
+  cannot go stale). The same incremental top-up `rpc_chain.c`'s `refresh()`
+  already did for the RPC side — borrowed, not invented, which is why the RPC
+  layer never had the bug. Proven on regtest against Core: a block mined
+  minutes after boot is served without a restart.
+- ~~**A `getdata` miss is answered with SILENCE**~~ — **CLOSED 2026-08-28.**
+  Misses are collected and returned as `notfound`, the entries copied
+  verbatim. An unrecognised inv TYPE is still ignored rather than reported,
+  which is what Core does.
+- ~~**BIP157 compact filters are BUILT but never SERVED**~~ — **CLOSED
+  2026-08-28.** `getcfilters`, `getcfheaders` and `getcfcheckpt` are all
+  answered (`daemon/serve_cfilters.c`), from stateless `bfi_get_file`
+  lookups. Verified against Core on the same chain and not merely by message
+  name: the `cfilter`, `cfheaders` and `cfcheckpt` payloads are
+  **byte-identical** to Core's for the same request. Requires the filter
+  index to have been built (`daemon/build_block_filters`), exactly as Core
+  requires `-blockfilterindex`.
+- **addrv2 (BIP155) is parsed but never NEGOTIATED.** `bitcoin_addrmgr.asm`
+  has the addrv2 codec, but the handshake never sends `sendaddrv2`, so no
+  peer will ever send us one (probe: Core offers it, we do not). This list
+  previously described addrv2 as "genuinely wired into the real serve loop",
+  which is true of the codec and false of the negotiation.
 - **Full-verification IBD benchmark vs Core** (`-assumevalid=0
   -stopatheight`, second scratch datadir) — **still never run.** The one
   like-for-like end-to-end speed comparison, and the only item here that is
   purely a measurement rather than a capability.
 - **`assumevalid`** — parsed and then IGNORED, with a loud `[config]` line
-  saying so. This node verifies every script in every block; honouring
-  assumevalid would mean *skipping* that, so it is a deliberate refusal
-  rather than an unimplemented feature. Small to wire if ever wanted.
+  saying so. This node verifies every script in every block
+  (`tx_verify_block_connect_all`, called from `daemon/utxo_live.c`'s apply
+  path ahead of any UTXO write, and proven by the full-archive replay);
+  honouring assumevalid would mean *skipping* that, so it is a deliberate
+  refusal rather than an unimplemented feature. Small to wire if ever wanted.
+  *(The `[config]` line itself was STALE until 2026-08-28 — it claimed block
+  connection did no script verification at all, describing the node as it was
+  before Stage D. It was believed over the code and briefly propagated into
+  this file. Log strings that explain a decision age exactly like refusal
+  strings do; see the wallet refusals deleted 2026-08-27.)*
 - **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
@@ -219,38 +252,105 @@ tables and the writers themselves.
   the call site. *(This item was missing from the 2026-08-27 audit of this
   list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
   accurate than what it replaced but not complete.)*
-- **Package relay — PARTLY CLOSED 2026-08-27.** `submitpackage` is real:
-  context-free package policy with Core's reason strings, in-package parent
-  resolution, and Core's effective feerate, so a parent below the relay floor
-  is accepted when its child pays for it. Proven end to end against a real
-  Core, which accepts the identical package
-  (`validation/bumpfee_regtest_e2e.sh`). STILL OPEN: p2p 1-parent-1-child
-  package RELAY (this is submission, not relay), TRUC/v3 and ephemeral-dust
-  policy, `replaced-transactions` reporting, and `testmempoolaccept`'s
-  package mode, which still evaluates each member independently and says so
-  at its own call site.
-- **Seven wallet-import RPCs refuse**, all the same shape: `migratewallet`,
-  `setwalletflag`, `createwalletdescriptor`, `addhdkey`,
-  `importprunedfunds`, `removeprunedfunds`, `exportwatchonlywallet`. The
-  reason is structural and stated at the call site — this wallet is a single
-  BIP32 seed with no import path. NOTE the rest of wallet management shipped:
-  `createwallet`/`loadwallet`/`unloadwallet`/`restorewallet`/
-  `importdescriptors` are all real.
-- **`build_utxo.c` (the OFFLINE batch tool) includes the genesis coinbase**
-  that Core omits. The LIVE writer does not — `daemon/utxo_live.c` skips it
-  explicitly for mainnet, regtest and testnet4. Previously filed here as a
-  "live writer" divergence, which was wrong.
-- **`bumpfee`'s replaced-by linkage is write-only in practice** — the
-  `bumped.dat` sidecar is written with both txids, but `gettransaction`
-  resolves a txid against the wallet SEND JOURNAL, so a transaction
-  broadcast outside that path is not one it will report on. The
-  `replaced_by_txid`/`replaces_txid` fields are therefore not reachable for
-  such a transaction (found 2026-08-27 while building the bumpfee e2e).
-- **`lsm_get_scratch` is 4 MiB + 64 KiB of per-thread TLS.** Moving it to a
-  lazily-allocated heap buffer would cut the per-thread footprint. This is a
-  FOOTPRINT item, not a correctness one: an earlier note here called it
-  non-thread-safe and pending — it has been thread-local
-  (`section .tbss`, Initial-Exec) since the incident-#13 work.
+- ~~**Package relay**~~ — **CLOSED 2026-08-27 (evening).** All five parts:
+  - `submitpackage` (context-free package policy with Core's reason strings,
+    in-package parent resolution, Core's effective feerate);
+  - **p2p 1p1c package RELAY** — a parent rejected for fee ALONE is now
+    classed `-28` "reconsiderable" (Core's `TX_RECONSIDERABLE`) instead of
+    being collapsed into the general reject class, and the drain submits it
+    with a waiting orphan child as a package (Core's `Find1P1CPackage`).
+    Both arrival orders work: a reconsiderable parent buys a bounded number
+    of request-ring bypasses so a child arriving later can trigger a
+    re-fetch, which is exactly why Core keeps that filter separate from
+    recent-rejects;
+  - **BIP431 TRUC/v3** topology, both directions of the inheritance rule;
+  - **ephemeral dust** (one dust output, 0-fee carrier, child must sweep);
+  - **`replaced-transactions`** — top level of `submitpackage`, as the union
+    across members (NOT per member);
+  - **`testmempoolaccept` package mode** — the array is staged as one package
+    through the same path `submitpackage` uses, stopped before the commit.
+
+  The wire path and the RPC path share one implementation of package
+  validation, so a package off the wire and one off the RPC socket cannot
+  disagree. Proven against Core v31.99 on regtest
+  (`validation/bumpfee_regtest_e2e.sh`, 46 checks).
+
+  STATED GAPS, both strictly more conservative than Core:
+  - **TRUC sibling eviction** is not implemented, so a second TRUC child is
+    refused rather than being allowed to replace its sibling under RBF rules.
+  - Core's `package-error` is `"TOKEN, debug detail"` naming the offending
+    txid and wtxid in prose; ours carries the token alone. The verdict
+    matches; the diagnostic string is shorter.
+- ~~**Wallet-import RPCs**~~ — **ONE left, 2026-08-27.** Five of the six were
+  not actually blocked; they shared a reason ("a single BIP32 seed with no
+  import path") that was wrong for them, or had stopped being true:
+  - **`migratewallet`** and **`createwalletdescriptor`** answer Core's OWN
+    verdict for a wallet of this shape — "already a descriptor wallet", and
+    "Descriptor already exists" for the type it has. Real answers reached the
+    same way Core reaches them. `createwalletdescriptor`'s other three types
+    are refused with the SPECIFIC reason: the key derivation is trivial, but
+    a descriptor whose outputs the rescan cannot recognise and
+    `getnewaddress` will never hand out would be a descriptor in name only.
+  - **`importprunedfunds` / `removeprunedfunds`** import no KEY material —
+    only the knowledge that an output we already own exists, which is what
+    made them look blocked. Built from pieces that existed: `verifytxoutproof`
+    for the BIP37 walk and in-chain check, `wscan_spk_h160` for "is this
+    ours", and a new `wscan_write` that owns the on-disk layout.
+  - **`setwalletflag`** implements `avoid_reuse` for real — coin selection
+    skips a destination this wallet has already spent from, and
+    `getwalletinfo` reports it. A stored-and-ignored flag would be worse than
+    refusing.
+
+  ~~**Still refused: `addhdkey`**~~ — **CLOSED 2026-08-27 (late).** It was the
+  only one genuinely blocked, and closing it needed three things, not one:
+  the key is stored through the mnemonic's OWN KDF/cipher/tag (an xprv in
+  plaintext beside an encrypted seed would be the weakest thing in the
+  directory, so without a passphrase it refuses); the record format gained an
+  `hdkey` byte (**BMCWSCN4**) because two HD keys collide on
+  (keyidx, branch) and an output paying one resolved to the other's address;
+  and the signer now holds the added keys, since a wallet that watches
+  outputs it cannot sign reports coins as spendable that are not. Formats 2
+  and 3 still read, and `hdkey = 0` is the truth for them.
+
+  Two real bugs surfaced doing it: `bip32_extkey_serialize` hardcodes
+  **mainnet** version bytes in assembly, so every xpub this node produced was
+  rejected by Core on regtest/testnet4 ("key is not valid") — the pair now
+  lives in chainparams; and a chaincode aliasing bug in the second derivation
+  step.
+
+  **No wallet RPC is refused wholesale any more.**
+
+  Proven on regtest against a real chain: removing a confirmed wallet output
+  drops the balance by exactly its 50 BTC, importing it back with a real
+  `gettxoutproof` restores it to the satoshi, a second import does not
+  double-count, and a garbage proof is refused.
+- ~~**`build_utxo.c` includes the genesis coinbase**~~ — **CLOSED
+  2026-08-27.** The rule now lives in `daemon/genesis_skip.h`, included by
+  both the live writer and the offline builder, because a second copy of
+  three chain hashes is how two writers come to disagree about what the UTXO
+  set is. Proven on real regtest blocks in the e2e.
+  Found while fixing it: **`daemon/build_utxo` had not LINKED** since
+  `utxo_script_unspendable` was added to it — missing from its object list,
+  and the tool is not part of `make test`, so nothing caught it. It is in the
+  gate now, which is the actual fix.
+- ~~**`bumpfee`'s replaced-by linkage is write-only in practice**~~ —
+  **CLOSED 2026-08-27.** The cause was one layer down from where this was
+  filed: `gettransaction` answers from the wallet SEND JOURNAL, and *nothing
+  in the daemon ever wrote that journal* — only the `wallet_cli` tool did. A
+  bump performed over RPC therefore recorded a linkage no RPC could read
+  back. Both transactions are journalled now, not just the replacement:
+  `replaced_by_txid` on the ORIGINAL is the direction a caller actually asks
+  for. Both directions proven in the regtest e2e.
+- **`lsm_get_scratch` is 4 MiB + 64 KiB of per-thread TLS** — MEASURED
+  2026-08-27 and deliberately NOT changed. The download worker runs 33
+  threads, so this is ~134 MiB of demand-paged `.tbss` against that process's
+  3.8 GB RSS, on a 60 GB machine with 45 GB available. Buying it back means
+  calling `malloc` from hand-written assembly at four sites in the UTXO read
+  path — the hottest and most safety-critical code in the tree. Bad trade at
+  this size; recorded as a measurement rather than left as vague debt. (It is
+  a FOOTPRINT item, not a correctness one: an earlier note here called it
+  non-thread-safe and pending — it has been thread-local, `section .tbss`,
+  Initial-Exec, since the incident-#13 work.)
 - **testnet / signet** — REFUSED by design (`daemon/chainparams.c` rejects
   `chain=test`/`signet` loudly rather than run the wrong rules). Supported:
   **main, regtest and testnet4** — testnet4's whole chain synced with a
@@ -265,6 +365,21 @@ templates, exact sigops, BIP23 proposal mode, longpoll), chain selection for
 regtest AND testnet4, nBits schedule enforcement, `bumpfee`/`psbtbumpfee`,
 and `gettxout` (which had been answering `null` — i.e. "spent" — for every
 outpoint on the live node).
+
+## How this list is checked (2026-08-28)
+
+Claims here were audited against evidence rather than against each other,
+after a `[config]` log string was believed over the code and briefly
+propagated into this file (see `assumevalid`). Two tools do it:
+
+- `validation/p2p_inbound_probe.py` — speaks the wire protocol as a stranger
+  and records what a node answers to each inbound message. Run it against
+  Bitcoin Core and against this node on the same chain and diff the reports.
+  A message Core answers and we ignore is a gap; it found three on the day it
+  was written.
+- an RPC-surface diff against a live Core: **155 Core methods, and the only
+  one missing here is `rpc.discover`** (OpenRPC). Re-verified 2026-08-28
+  against Core v31.99 rather than taken from an earlier claim.
 
 ## RPC surface — the biggest gap until 2026-08-25; first tranche 2026-08-21
 
@@ -374,14 +489,28 @@ plus straightforward methods on top of it.
 
 ## Observed while wiring RPC — not fixed here, flagged for the consensus/storage owners
 
-- **`index.dat` hash byte order vs `bitcoin_idx.asm`.** Verified on the
-  production archive (`pread` of record 0, read-only): records store the
-  hash in **wire (raw sha256d) order**. `bitcoin_idx.asm`'s
-  `idx_build_from_file` header comment says DISPLAY order and byte-reverses
-  every record before `idx_put`, so the table `main.c`'s boot builds from
-  `index.dat` is keyed on reversed hashes. Whether the serve path's
-  `idx_get` compensates was not checked. `rpc_chain.c` sidesteps it by
-  building its own table from raw record bytes.
+- ~~**`index.dat` hash byte order vs `bitcoin_idx.asm`**~~ — **CHECKED AND
+  FIXED 2026-08-27** (`392872b`), and it was worse than this entry guessed.
+  index.dat holds WIRE order; the loader reversed every record believing it
+  held display order, so the boot hash index was keyed on DISPLAY hashes
+  while the serve loop looks up with the hash as it arrives on the p2p wire.
+  `.gd_block` could never hit: **the node served no block requested by
+  getdata, ever** — not even a notfound. Three tests missed it because each
+  encoded the loader's belief rather than the file's contents (test_serve
+  built its own index without reversing, bench_hashidx compared against a
+  reference that reversed identically, test_truncate reversed its lookups);
+  all three now build and look up the way production and the wire do.
+- ~~**Inbound serving stalled 63 s per connection**~~ — **FIXED 2026-08-27**
+  (`1b62d67`), found while proving the above. Every forked serve child opened
+  its own read-only UTXO snapshot before its read loop, and
+  `utxo_lsm_reload` costs 60–83 s on the real set, so a peer got no response
+  at all — not even the feefilter — until it had long since hung up. Now
+  opened once in the parent pre-fork and inherited copy-on-write, the same
+  discipline the shared mempool beside it already used and the same thing
+  Core does (`InitCoinsDB` once in `LoadChainstate`; Core never re-opens the
+  UTXO per connection and never forks per connection). Measured on mainnet:
+  63 s to serve a block before, under a second after. It also stopped each of
+  245 possible inbound peers mapping its own copy of the snapshot.
 - ~~**Production archive record 0 is block 1, not genesis.**~~ — **FIXED
   2026-08-22.** Confirmed against Core that record index was consistently
   real height − 1 across the whole archive, so `apply_block_at` handed
@@ -404,11 +533,10 @@ plus straightforward methods on top of it.
 
 ## Consensus / validation
 
-- **`assumevalid`** — explicitly ignored (`daemon/node_config.c:272-273`
-  logs "IGNORED"). Small to wire (config parsing already exists) but
-  deliberately not worth doing until Stage D's replay finishes — using it
-  now would mean skipping the exact verification this project is currently
-  proving. Revisit after.
+- **`assumevalid`** — explicitly ignored, with a `[config]` line saying so.
+  Small to wire (config parsing already exists), and still declined: it
+  exists to skip the per-input script verification that block connection
+  performs, which is the thing this project is for.
 - **`assumeutxo`** (Core's UTXO-snapshot-import) — absent. No real hits for
   assumeutxo/utxo.snapshot/dumptxoutset/loadtxoutset. **Large** — needs a
   new snapshot format plus a background-validation state machine; nothing
@@ -600,7 +728,7 @@ Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
 - **BIP152 compact blocks** — both directions (`cmpctblock_build`,
   `p2p_blocktxn_build`, full message handling).
-- **wtxid relay, addrv2 (BIP155), feefilter, sendheaders** — all genuinely
+- **wtxid relay, feefilter, sendheaders** — all genuinely
   implemented and exchanged during real handshakes.
 - **Witness transport (BIP144) — FIXED 2026-08-22** (`31eac9a`, `fe3addb`):
   block requests were `MSG_BLOCK`, so every post-segwit block was fetched

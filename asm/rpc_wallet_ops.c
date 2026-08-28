@@ -32,6 +32,7 @@
  * and the declaration in rpc_node.h was dead -- a signature change on
  * either side would not have been caught. */
 #include "rpc_node.h"
+#include "daemon/chainparams.h"   /* extended-key version bytes per chain */
 #include "wallet_scan.h"
 #include <dirent.h>
 #include <stdio.h>
@@ -111,6 +112,9 @@ static int wop_name_ok(const char* n){
 
 #define WOP_WATCH_REL  "bmcwallet.watch"     /* watch-only shell marker  */
 #define WOP_DESCS_REL  "descriptors.dat"     /* imported descriptors     */
+/* header of an exportwatchonlywallet file: what lets restorewallet tell an
+ * exported watch-only wallet from a seed backup and install the right kind */
+#define WOP_WATCH_EXPORT_MAGIC "BMCWATCHEXPORT v1"
 
 /* forward decl: the ACTIVE wallet may scope wallet files into a subdir */
 static const char* wop_wallet_prefix(void);
@@ -128,6 +132,234 @@ static const char* wop_path(const char* rel, char* buf, size_t cap){
     else snprintf(buf, cap, "%s%s", wp, rel);
     return buf;
 }
+/* Extended-key version bytes for the ACTIVE chain, stamped over what
+ * bip32_extkey_serialize emits. That routine hardcodes mainnet's pair in
+ * assembly, so every xpub this node produced was a mainnet xpub -- which
+ * Core's descriptor parser rejects outright on regtest or testnet4 ("key
+ * ... is not valid"). Patching the four bytes here keeps the asm untouched
+ * and puts the chain rule where the other chain rules already live. */
+/* WEAK: several test targets link this object without chainparams.o, the
+ * same reason tx_wtxid is weak in rpc_node.c. A build without it falls back
+ * to mainnet's pair below, which is what those targets mean anyway. */
+extern const chainparams_t* g_chainp __attribute__((weak));
+
+static void wop_stamp_extkey_version(unsigned char ser[78], int want_priv){
+    unsigned int v = 0;
+    if (&g_chainp && g_chainp)
+        v = want_priv ? g_chainp->xprv_version : g_chainp->xpub_version;
+    if (!v) v = want_priv ? 0x0488ADE4u : 0x0488B21Eu;   /* mainnet default */
+    ser[0] = (unsigned char)(v >> 24); ser[1] = (unsigned char)(v >> 16);
+    ser[2] = (unsigned char)(v >> 8);  ser[3] = (unsigned char)v;
+}
+
+/* ==== added HD keys (addhdkey) ===========================================
+ * Core's addhdkey adds a BIP32 extended PRIVATE key to the wallet, to be
+ * used later by createwalletdescriptor. Getting this right needed three
+ * things, and skipping any of them makes the feature a hazard rather than a
+ * gap:
+ *
+ *  1. THE KEY MUST BE PROTECTED AS THE SEED IS. An xprv in plaintext beside
+ *     a passphrase-encrypted mnemonic would silently become the weakest
+ *     thing in the wallet directory. It goes through wallet_secret_write,
+ *     which reuses the mnemonic's own KDF, cipher and tag.
+ *
+ *  2. RECORDS MUST SAY WHICH KEY THEY BELONG TO. The scan identified a key
+ *     by (keyidx, branch) alone. Two HD keys collide on that immediately --
+ *     both have an index 0 receive key -- so an output paying key B would
+ *     resolve to key A's address, and the wallet would build a spend against
+ *     the wrong scriptPubKey. That is why the record format gained an hdkey
+ *     byte (BMCWSCN4) rather than this being a pure RPC addition.
+ *
+ *  3. THE SIGNER MUST HOLD THEM. signrawtransactionwithwallet offers every
+ *     window key and lets the matcher pick; an added key whose private half
+ *     never reached that list would produce coins the wallet reports as
+ *     spendable and then cannot sign.
+ *
+ * PATH CONVENTION: an added key is treated as an ACCOUNT node, and addresses
+ * come from <i>/<branch> beneath it -- the same tail this wallet derives
+ * under m/84'/0'/0', so one convention covers both. */
+#define WOP_HDKEYS_REL  "walletkeys.dat"
+#define WOP_HDK_MAGIC   "BMCHDK v1"
+#define WOP_MAX_HDKEYS  8            /* hdkey 0 is the seed; 1..7 added */
+
+extern int  wallet_secret_write(const char* path, const char* magic,
+                                const char* plaintext, const char* pass);
+extern int  wallet_secret_read(const char* path, const char* magic,
+                               char* out, int cap, const char* pass);
+extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen,
+                                      const char* str);
+extern int  bip32_ckd_priv(unsigned char k[32], unsigned char c[32],
+                           const unsigned char kpar[32], const unsigned char cpar[32],
+                           unsigned index);
+
+static char g_hdk[WOP_MAX_HDKEYS][128];   /* xprv strings; [0] unused (the seed) */
+static int  g_hdk_n = -1;                 /* count of ADDED keys, -1 = not loaded */
+
+/* the wallet passphrase, from the environment or <store>.pass -- the same
+ * lookup wop_activate does, kept in one place so the two cannot disagree
+ * about which secret protects this wallet */
+static int wop_wallet_pass(char* out, size_t cap){
+    out[0] = 0;
+    const char* sec = getenv("BMC_WALLET_PASS");
+    if (sec && sec[0]){ snprintf(out, cap, "%s", sec); return 1; }
+    char pb[512]; const char* store = wop_path(WOP_WALLET_REL, pb, sizeof pb);
+    char pf[700]; snprintf(pf, sizeof pf, "%s.pass", store);
+    FILE* f = fopen(pf, "r");
+    if (!f) return 0;
+    if (fgets(out, (int)cap, f)){ char* nl = strchr(out, '\n'); if (nl) *nl = 0; }
+    fclose(f);
+    return out[0] ? 1 : 0;
+}
+
+static int wop_hdkeys_load(void){
+    if (g_hdk_n >= 0) return g_hdk_n;
+    g_hdk_n = 0;
+    char pass[256];
+    if (!wop_wallet_pass(pass, sizeof pass)) return 0;
+    char pb[512]; struct stat sb;
+    const char* path = wop_path(WOP_HDKEYS_REL, pb, sizeof pb);
+    if (stat(path, &sb) != 0){ memset(pass, 0, sizeof pass); return 0; }
+    static char blob[WOP_MAX_HDKEYS * 128 + 64];
+    int rc = wallet_secret_read(path, WOP_HDK_MAGIC, blob, (int)sizeof blob, pass);
+    memset(pass, 0, sizeof pass);
+    if (rc != 0) return 0;                 /* wrong passphrase or tampered */
+    char* save = NULL;
+    for (char* t = strtok_r(blob, "\n", &save); t && g_hdk_n < WOP_MAX_HDKEYS - 1;
+         t = strtok_r(NULL, "\n", &save))
+        if (t[0]) snprintf(g_hdk[++g_hdk_n], sizeof g_hdk[0], "%s", t);
+    memset(blob, 0, sizeof blob);
+    return g_hdk_n;
+}
+
+static int wop_hdkeys_save(void){
+    char pass[256];
+    if (!wop_wallet_pass(pass, sizeof pass)) return 0;
+    static char blob[WOP_MAX_HDKEYS * 128 + 64];
+    blob[0] = 0;
+    for (int i = 1; i <= g_hdk_n; i++){
+        strncat(blob, g_hdk[i], sizeof blob - strlen(blob) - 2);
+        strncat(blob, "\n", sizeof blob - strlen(blob) - 1);
+    }
+    char pb[512];
+    int rc = wallet_secret_write(wop_path(WOP_HDKEYS_REL, pb, sizeof pb),
+                                 WOP_HDK_MAGIC, blob, pass);
+    memset(pass, 0, sizeof pass);
+    memset(blob, 0, sizeof blob);
+    return rc == 0;
+}
+
+/* xprv -> (key, chaincode). Returns 1 on a well-formed mainnet xprv. */
+static int wop_hdk_parse(const char* xprv, unsigned char k[32], unsigned char c[32]){
+    unsigned char dec[128]; long dl = 0;
+    if (!wallet_base58check_decode(dec, (long)sizeof dec, &dl, xprv)) return 0;
+    if (dl != 78) return 0;
+    /* A PRIVATE extended key, on either version pair -- mainnet xprv
+     * (0488ADE4) or the test-chain tprv (04358394). A key that is not
+     * private cannot sign, and accepting one would create exactly the
+     * unspendable-but-reported-spendable coins this design is avoiding. */
+    { unsigned int v = ((unsigned)dec[0]<<24)|((unsigned)dec[1]<<16)|
+                       ((unsigned)dec[2]<<8)|dec[3];
+      if (v != 0x0488ADE4u && v != 0x04358394u) return 0; }
+    if (dec[45] != 0x00) return 0;               /* private keys are 0x00-prefixed */
+    memcpy(c, dec + 13, 32);
+    memcpy(k, dec + 46, 32);
+    return 1;
+}
+
+/* the xpub string for an added key, as gethdkeys reports it */
+static int wop_hdk_xpub(const char* xprv, char out[128]){
+    unsigned char dec[128]; long dl = 0;
+    if (!wallet_base58check_decode(dec, (long)sizeof dec, &dl, xprv) || dl != 78) return 0;
+    unsigned char pub[33];
+    scalar_to_pubkey(pub, dec + 46);
+    unsigned char ser[78];
+    /* is_priv = 0: the PUBLIC form. gethdkeys reports xpubs, never xprvs --
+     * this node does not serve private key material over RPC. */
+    bip32_extkey_serialize(ser, 0, dec[4], dec + 5,
+                           (unsigned)((dec[9]<<24)|(dec[10]<<16)|(dec[11]<<8)|dec[12]),
+                           dec + 13, pub, 33);
+    wop_stamp_extkey_version(ser, 0);
+    base58check_encode(out, ser, 78);
+    return out[0] != 0;
+}
+
+/* the private key at <idx>/<branch> under added key `hdk` (1-based) */
+static int wop_hdk_derive(int hdk, unsigned idx, int branch, unsigned char out[32]){
+    if (hdk < 1 || hdk > g_hdk_n) return 0;
+    unsigned char k[32], c[32], k1[32], c1[32], c2[32];
+    if (!wop_hdk_parse(g_hdk[hdk], k, c)) return 0;
+    if (bip32_ckd_priv(k1, c1, k, c, idx) != 1) return 0;
+    /* c2, not c1, for the second step's OUTPUT chaincode: passing the same
+     * buffer as both output and parent aliases them, and whether that
+     * survives depends on the order the callee happens to write in. It
+     * silently produced the wrong key here -- the added key's addresses did
+     * not match what Core derived from the same xpub. */
+    if (bip32_ckd_priv(out, c2, k1, c1, (unsigned)branch) != 1) return 0;
+    return 1;
+}
+
+int rpc_wops_hdkey_count(void){ return wop_hdkeys_load(); }
+
+/* Every private key an ADDED hd key contributes over the signing window.
+ * signrawtransactionwithwallet appends these to the seed's, because a key
+ * the wallet watches but cannot sign for is worse than one it never had. */
+int rpc_wops_hdkey_privkeys(unsigned char (*out)[32], int cap, unsigned window){
+    int n = wop_hdkeys_load(), m = 0;
+    for (int h = 1; h <= n; h++)
+        for (unsigned i = 0; i < window && m < cap; i++)
+            for (int b = 0; b <= 1 && m < cap; b++)
+                if (wop_hdk_derive(h, i, b, out[m])) m++;
+    return m;
+}
+
+/* ==== wallet flags =======================================================
+ * Core has exactly one MUTABLE wallet flag, avoid_reuse, and setwalletflag
+ * exists to toggle it. A flag that is stored and then ignored would be worse
+ * than refusing the call: the caller would be told the wallet now avoids
+ * reusing addresses when it does not. So this is wired all the way through
+ * -- persisted here, honoured by coin selection in wf_coins, and reported by
+ * getwalletinfo and listunspent. */
+#define WOP_FLAGS_REL "walletflags.dat"
+static int g_wop_avoid_reuse = -1;        /* -1 = not loaded */
+
+static int wop_avoid_reuse_load(void){
+    if (g_wop_avoid_reuse >= 0) return g_wop_avoid_reuse;
+    g_wop_avoid_reuse = 0;
+    char pb[512]; FILE* f = fopen(wop_path(WOP_FLAGS_REL, pb, sizeof pb), "r");
+    if (!f) return 0;
+    char line[128];
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "avoid_reuse=", 12)) g_wop_avoid_reuse = (line[12] == '1');
+    fclose(f);
+    return g_wop_avoid_reuse;
+}
+int rpc_wops_avoid_reuse(void){ return wop_avoid_reuse_load(); }
+
+static int wop_avoid_reuse_save(int on){
+    char pb[512]; FILE* f = fopen(wop_path(WOP_FLAGS_REL, pb, sizeof pb), "w");
+    if (!f) return 0;
+    fprintf(f, "avoid_reuse=%d\n", on ? 1 : 0);
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0){ fclose(f); return 0; }
+    fclose(f);
+    g_wop_avoid_reuse = on ? 1 : 0;
+    return 1;
+}
+
+/* Core IsSpentKey: a destination counts as USED once any output paying it
+ * has been spent. Reusing such an address links the new payment to the old
+ * one on chain, which is what avoid_reuse exists to prevent. */
+static int wop_key_is_reused(const wscan_rec* recs, long n,
+                             unsigned keyidx, unsigned char branch){
+    for (long i = 0; i < n; i++){
+        if (recs[i].kind != 0) continue;
+        if (recs[i].keyidx != keyidx || recs[i].branch != branch) continue;
+        for (long j = 0; j < n; j++)
+            if (recs[j].kind == 1 && recs[j].vout == recs[i].vout &&
+                !memcmp(recs[j].prev_txid, recs[i].txid, 32)) return 1;
+    }
+    return 0;
+}
+
 static int wop_exists(const char* rel){
     char b[512]; struct stat sb;
     const char* wp = wop_wallet_prefix();
@@ -312,6 +544,7 @@ extern int  wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
 extern int  wallet_mnemonic_generate(char out[256]);   /* wallet_core.c, 1 = ok */
 static void wop_watch_keys_invalidate(void);
 static void wop_records_invalidate(void);
+static void wop_keyset_invalidate(void);
 
 /* Make wallets/<name>/ under whichever root wop_path would write to. */
 static int wop_wallet_mkdir(const char* name, char* dir, size_t cap){
@@ -486,7 +719,20 @@ static int cmd_restorewallet(const rj_val* params, long* ec, const char** em, rj
         snprintf(perr, sizeof perr, "Wallet \"%s\" already exists.", name);
         return wop_err(ec, em, -36, perr);      /* Core: RPC_WALLET_ALREADY_EXISTS */
     }
+    /* An exportwatchonlywallet file is also a valid backup -- Core says so
+     * explicitly ("can be imported into another node using restorewallet"),
+     * and it installs a WATCH-ONLY wallet rather than a seed one. Detected by
+     * its header so the two kinds cannot be confused. */
+    int watch_export = 0;
+    { FILE* bf = fopen(backup, "r");
+      if (bf){ char hdr[64]; hdr[0] = 0;
+               if (fgets(hdr, sizeof hdr, bf) &&
+                   !strncmp(hdr, WOP_WATCH_EXPORT_MAGIC, strlen(WOP_WATCH_EXPORT_MAGIC)))
+                   watch_export = 1;
+               fclose(bf); } }
+
     /* prove the backup loads BEFORE installing it */
+    if (!watch_export)
     { char mn[768], ps[256]; ps[0] = 0;
       if (wallet_store_load(backup, mn, (int)sizeof mn, ps, (int)sizeof ps) != 0){
           memset(mn, 0, sizeof mn);
@@ -495,6 +741,35 @@ static int cmd_restorewallet(const rj_val* params, long* ec, const char** em, rj
     char dir[640];
     if (!wop_wallet_mkdir(name, dir, sizeof dir))
         return wop_err(ec, em, -4, "could not create the wallet directory");
+    if (watch_export){
+        /* the marker makes it a watch-only wallet; the descriptors are the
+         * export's body, with the header line dropped */
+        char mk[720]; snprintf(mk, sizeof mk, "%s/%s", dir, WOP_WATCH_REL);
+        FILE* mf = fopen(mk, "w");
+        if (!mf) return wop_err(ec, em, -4, "could not write the wallet");
+        fputs("BMCWATCH v1\n", mf); fclose(mf);
+        char dp[720]; snprintf(dp, sizeof dp, "%s/%s", dir, WOP_DESCS_REL);
+        FILE* in = fopen(backup, "r"); FILE* outf = in ? fopen(dp, "w") : NULL;
+        if (!in || !outf){ if (in) fclose(in); if (outf) fclose(outf);
+            return wop_err(ec, em, -4, "could not copy the exported descriptors"); }
+        char line[512]; int first = 1;
+        while (fgets(line, sizeof line, in)){
+            if (first){ first = 0; continue; }      /* drop the header */
+            fputs(line, outf);
+        }
+        fclose(in); fclose(outf);
+        wop_watch_keys_invalidate();
+        if (!wop_activate(name, ec, em)) return 0;
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "name", rj_str(name));
+        rj_val* wn = rj_arr();
+        rj_arr_push(wn, rj_str("watch-only wallet restored from an export: "
+                               "run rescanblockchain to find its history"));
+        rj_obj_set(o, "warnings", wn);
+        *res = o;
+        return 1;
+    }
+
     char dst[720]; snprintf(dst, sizeof dst, "%s/%s", dir, WOP_WALLET_REL);
     FILE* in = fopen(backup, "rb"); FILE* outf = in ? fopen(dst, "wb") : NULL;
     if (!in || !outf){ if (in) fclose(in); return wop_err(ec, em, -4, "could not copy the backup"); }
@@ -557,6 +832,12 @@ typedef struct { unsigned char txid[32]; unsigned long vout; } wop_lock_t;
 static wop_lock_t g_locks[WOP_MAX_LOCKS];
 static int g_nlocks;
 
+/* one hex nibble, or -1 */
+static int wop_hex1(char c){
+    if (c>='0'&&c<='9') return c-'0';
+    if ((c|32)>='a'&&(c|32)<='f') return (c|32)-'a'+10;
+    return -1;
+}
 static int wop_hex32_le(const char* h, unsigned char out[32]){
     if (!h || strlen(h) != 64) return 0;
     for (int i = 0; i < 32; i++){
@@ -722,6 +1003,7 @@ static int wop_account_xpub(const unsigned char seed[64], char out[128]){
     }
     scalar_to_pubkey(pub, k);
     bip32_extkey_serialize(ser, 0, 3, fp, 0x80000000u, c, pub, 33);
+    wop_stamp_extkey_version(ser, 0);
     base58check_encode(out, ser, 78);
     return 1;
 }
@@ -808,6 +1090,276 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
     return 1;
 }
 
+/* ==== exportwatchonlywallet ===============================================
+ * Core: "creates a wallet file at the specified destination containing a
+ * watchonly version of the current wallet", importable elsewhere with
+ * restorewallet. That is expressible here, and completely, for the reason
+ * listdescriptors documents above: this wallet derives
+ * m/84'/0'/0'/<i>/<0|1> with the branch LAST, so a ranged descriptor cannot
+ * describe it -- but it only ever uses index 0, so its ENTIRE key set is the
+ * two concrete descriptors that get written. This is not a truncated export.
+ *
+ * The file is the same descriptors.dat format a watch-only wallet already
+ * loads, behind a header line so restorewallet can tell an exported
+ * watch-only wallet from a seed backup and install the right kind.
+ *
+ * STATED OMISSION: Core's export also carries the wallet's transactions and
+ * address book. This one carries the descriptors -- the part that makes the
+ * wallet watchable at all. A restored export finds its history by
+ * rescanning, which is what a watch-only wallet on this node does anyway. */
+/* ==== addhdkey / gethdkeys ==============================================
+ * Core: "Add a BIP 32 HD key to the wallet that can be used with
+ * 'createwalletdescriptor'". With no argument it generates one. */
+static int cmd_addhdkey(const rj_val* params, const rpc_wallet* w,
+                        long* ec, const char** em, rj_val** res){
+    if (rpc_wops_watchonly() || !w || !w->seed)
+        return wop_err(ec, em, -4,
+            "addhdkey is not available for wallets without private keys");
+    char pass[256];
+    if (!wop_wallet_pass(pass, sizeof pass))
+        return wop_err(ec, em, -4,
+            "addhdkey stores an extended PRIVATE key, and this node will only "
+            "store one encrypted. The wallet passphrase is not available "
+            "(set BMC_WALLET_PASS or provide <wallet>.pass)");
+    memset(pass, 0, sizeof pass);
+
+    int n = wop_hdkeys_load();
+    if (n >= WOP_MAX_HDKEYS - 1)
+        return wop_err(ec, em, -4, "this wallet already holds the maximum number of HD keys");
+
+    char xprv[128]; xprv[0] = 0;
+    const char* given = wop_str_arg(params, 0);
+    if (given && given[0]){
+        unsigned char k[32], c[32];
+        if (!wop_hdk_parse(given, k, c))
+            return wop_err(ec, em, -5, "Unable to parse HD key. Please provide a valid xprv");
+        memset(k, 0, 32); memset(c, 0, 32);
+        snprintf(xprv, sizeof xprv, "%s", given);
+    } else {
+        /* Core generates one when none is given. Ours comes from a fresh
+         * BIP39 mnemonic run through the same derivation the wallet's own
+         * seed uses -- no second source of randomness to review. */
+        char mn[256];
+        if (!wallet_mnemonic_generate(mn))
+            return wop_err(ec, em, -4, "key generation failed");
+        unsigned char seed[64], k[32], c[32], ser[78];
+        int ok = wallet_mnemonic_seed(seed, mn, "", 0) == 1;
+        memset(mn, 0, sizeof mn);
+        if (ok){ extern int bip32_master(unsigned char[32], unsigned char[32],
+                                         const unsigned char*, long);
+                 ok = bip32_master(k, c, seed, 64) == 1; }
+        memset(seed, 0, sizeof seed);
+        if (!ok) return wop_err(ec, em, -4, "key generation failed");
+        unsigned char kd[33]; kd[0] = 0x00; memcpy(kd + 1, k, 32);
+        unsigned char zfp[4] = {0,0,0,0};
+        bip32_extkey_serialize(ser, 1, 0, zfp, 0, c, kd, 33);
+        wop_stamp_extkey_version(ser, 1);
+        base58check_encode(xprv, ser, 78);
+        memset(k, 0, 32); memset(c, 0, 32); memset(kd, 0, 33);
+    }
+
+    /* refuse a duplicate: adding the same key twice would double every
+     * address it contributes to the window */
+    for (int i = 1; i <= g_hdk_n; i++)
+        if (!strcmp(g_hdk[i], xprv))
+            return wop_err(ec, em, -4, "This HD key is already in the wallet");
+
+    snprintf(g_hdk[++g_hdk_n], sizeof g_hdk[0], "%s", xprv);
+    if (!wop_hdkeys_save()){ g_hdk_n--;
+        return wop_err(ec, em, -4, "could not persist the HD key"); }
+    char xpub[128]; xpub[0] = 0;
+    wop_hdk_xpub(xprv, xpub);
+    memset(xprv, 0, sizeof xprv);
+    /* the key window and every record view change the moment a key is added */
+    wop_keyset_invalidate(); wop_records_invalidate(); wop_watch_keys_invalidate();
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "xpub", rj_str(xpub));
+    *res = o;
+    return 1;
+}
+
+/* ==== setwalletflag ======================================================
+ * Core's one mutable flag is avoid_reuse, and its errors are specific:
+ * unknown flag, immutable flag, and "already set to <value>" -- that last
+ * one matters, because a caller that sets a flag twice should learn the
+ * second call did nothing rather than be told it succeeded. */
+static int cmd_setwalletflag(const rj_val* params, long* ec, const char** em,
+                             rj_val** res){
+    const char* flag = wop_str_arg(params, 0);
+    if (!flag || !flag[0])
+        return wop_err(ec, em, -8, "setwalletflag requires a flag name");
+    static char msg[160];
+    /* Core's immutable flags are real flags that this call still refuses;
+     * naming them separately from "unknown" is the difference between "no
+     * such thing" and "not yours to change". */
+    if (!strcmp(flag, "disable_private_keys") || !strcmp(flag, "blank") ||
+        !strcmp(flag, "descriptor_wallet") || !strcmp(flag, "external_signer")){
+        snprintf(msg, sizeof msg, "Wallet flag is immutable: %s", flag);
+        return wop_err(ec, em, -8, msg);
+    }
+    if (strcmp(flag, "avoid_reuse")){
+        snprintf(msg, sizeof msg, "Unknown wallet flag: %s", flag);
+        return wop_err(ec, em, -8, msg);
+    }
+    int value = 1;
+    { const rj_val* v = (params && params->typ == RJ_ARR && params->nitems >= 2)
+                        ? params->items[1] : NULL;
+      if (v && v->typ == RJ_BOOL && v->str) value = (v->str[0] == '1');
+      else if (v && v->typ != RJ_NULL && v->typ != RJ_BOOL)
+          return wop_err(ec, em, -8, "value must be a boolean"); }
+    if (wop_avoid_reuse_load() == value){
+        snprintf(msg, sizeof msg, "Wallet flag is already set to %s: %s",
+                 value ? "true" : "false", flag);
+        return wop_err(ec, em, -8, msg);
+    }
+    if (!wop_avoid_reuse_save(value))
+        return wop_err(ec, em, -4, "could not persist the wallet flag");
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "flag_name", rj_str(flag));
+    rj_obj_set(o, "flag_state", rj_bool(value));
+    if (value)
+        rj_obj_set(o, "warnings", rj_str(
+            "You need to rescan the blockchain in order to correctly mark used "
+            "destinations in the past. Until this is done, some destinations may "
+            "be considered unused even if the opposite is the case."));
+    *res = o;
+    return 1;
+}
+
+/* ==== migratewallet ======================================================
+ * Core migrates a LEGACY (pre-descriptor) wallet to a descriptor one, and
+ * refuses when there is nothing to migrate: "Error: This wallet is already a
+ * descriptor wallet".
+ *
+ * That refusal is the correct answer for every wallet this node has. The
+ * store is a BIP32 seed whose keys are described by descriptors --
+ * listdescriptors reports them, importdescriptors consumes them,
+ * exportwatchonlywallet writes them. There is no legacy keypool form here to
+ * migrate FROM, so Core's own error is not a stand-in for an unimplemented
+ * feature; it is the verdict Core would reach on the same wallet. Answering
+ * it is more useful than the blanket refusal that used to sit here, which
+ * said this node had no multi-wallet manager -- untrue since the
+ * createwallet/loadwallet lifecycle shipped. */
+static int cmd_migratewallet(const rj_val* params, long* ec, const char** em){
+    /* Core: if a wallet name is given both here and on the endpoint, the two
+     * must be identical. We serve the active wallet, so a name that names a
+     * DIFFERENT wallet is the same mistake and gets the same -8. */
+    const char* name = wop_str_arg(params, 0);
+    if (name && name[0] && strcmp(name, rpc_wops_active_wallet_name()) != 0)
+        return wop_err(ec, em, -8,
+            "RPC endpoint wallet and wallet_name parameter specify different wallets");
+    return wop_err(ec, em, -4, "Error: This wallet is already a descriptor wallet");
+}
+
+/* ==== createwalletdescriptor =============================================
+ * Core creates the wallet's descriptor for an address type it does not
+ * already have one for, and errors "Descriptor already exists" when it does.
+ *
+ * This wallet has wpkh (bech32) descriptors for both the external and
+ * internal branch, so `bech32` gets Core's exact already-exists error -- a
+ * real verdict, reached the same way. The other three types are refused with
+ * the specific reason rather than a blanket one: deriving the KEY for them
+ * is trivial (same BIP32 path, different script), but a descriptor whose
+ * outputs the rescan cannot recognise and getnewaddress will never hand out
+ * would be a descriptor in name only, and the wallet would quietly fail to
+ * see funds paid to it. Refusing is the honest answer until the scan and the
+ * address path learn those script types. */
+static int cmd_createwalletdescriptor(const rj_val* params, const rpc_wallet* w,
+                                      long* ec, const char** em){
+    const char* type = wop_str_arg(params, 0);
+    if (!type || !type[0])
+        return wop_err(ec, em, -8, "createwalletdescriptor requires an address type");
+    static char msg[224];
+    int known = !strcmp(type, "legacy") || !strcmp(type, "p2sh-segwit") ||
+                !strcmp(type, "bech32") || !strcmp(type, "bech32m");
+    if (!known){
+        snprintf(msg, sizeof msg, "Unknown address type '%s'", type);
+        return wop_err(ec, em, -5, msg);        /* Core's wording and code */
+    }
+    if (!w || !w->seed){
+        if (rpc_wops_watchonly())
+            return wop_err(ec, em, -4,
+                "createwalletdescriptor needs the wallet's HD key; this is a "
+                "watch-only wallet. Use importdescriptors instead.");
+        return wop_err(ec, em, -4, "No wallet is loaded");
+    }
+    if (!strcmp(type, "bech32"))
+        /* True for the seed AND for every added key: addhdkey puts a key
+         * straight into the derivation window, so its wpkh descriptors exist
+         * from that moment -- there is no separate materialisation step for
+         * this call to perform. gethdkeys lists them; listdescriptors shows
+         * the seed's. */
+        return wop_err(ec, em, -4, "Descriptor already exists");
+    snprintf(msg, sizeof msg,
+             "this wallet derives only wpkh (bech32) keys: its rescan matches "
+             "P2WPKH scripts and getnewaddress hands out bech32 addresses, so a "
+             "'%s' descriptor would never be recognised or used. bech32 already "
+             "exists; see listdescriptors.", type);
+    return wop_err(ec, em, -4, msg);
+}
+
+static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
+                                     long* ec, const char** em, rj_val** res){
+    const char* dest = wop_str_arg(params, 0);
+    if (!dest || !dest[0])
+        return wop_err(ec, em, -8, "exportwatchonlywallet requires a destination path");
+
+    /* gather this wallet's public descriptors, from whichever kind it is */
+    char descs[WOP_MAX_DESCS][340];
+    long ranges[WOP_MAX_DESCS], nexts[WOP_MAX_DESCS];
+    int nd = 0;
+    if (w && w->seed){
+        for (int ch = 0; ch <= 1 && nd < WOP_MAX_DESCS; ch++){
+            rj_val* e = wop_desc_entry(w->seed, ch);
+            if (!e) continue;
+            rj_val* d = rj_obj_get(e, "desc");
+            if (d && d->str){
+                snprintf(descs[nd], sizeof descs[nd], "%s", d->str);
+                ranges[nd] = 1; nexts[nd] = 0; nd++;
+            }
+            rj_free(e);
+        }
+    } else if (g_aw_watchonly){
+        wop_descs_load();
+        for (int i = 0; i < g_wd_n && nd < WOP_MAX_DESCS; i++){
+            snprintf(descs[nd], sizeof descs[nd], "%s", g_wd[i].desc);
+            ranges[nd] = g_wd[i].range; nexts[nd] = g_wd[i].next; nd++;
+        }
+    } else {
+        return wop_err(ec, em, -4, "No wallet is loaded");
+    }
+    if (nd == 0)
+        return wop_err(ec, em, -4, "this wallet has no descriptors to export "
+                                   "(a blank watch-only wallet: importdescriptors first)");
+
+    /* refuse to clobber: an export that silently overwrote a wallet file
+     * would be the worst possible way to learn the path was wrong */
+    { struct stat sb;
+      if (stat(dest, &sb) == 0)
+          return wop_err(ec, em, -4, "the destination already exists; "
+                                     "exportwatchonlywallet will not overwrite it"); }
+
+    FILE* f = fopen(dest, "w");
+    if (!f) return wop_err(ec, em, -4, "could not write the export file");
+    fputs(WOP_WATCH_EXPORT_MAGIC "\n", f);
+    for (int i = 0; i < nd; i++)
+        fprintf(f, "%s\t%ld\t%ld\n", descs[i], ranges[i], nexts[i]);
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0){ fclose(f);
+        return wop_err(ec, em, -4, "could not flush the export file"); }
+    fclose(f);
+
+    /* Core answers with the FULL path it wrote */
+    char abs[1024];
+    if (dest[0] == '/') snprintf(abs, sizeof abs, "%s", dest);
+    else { char cwd[768];
+           if (getcwd(cwd, sizeof cwd)) snprintf(abs, sizeof abs, "%s/%s", cwd, dest);
+           else snprintf(abs, sizeof abs, "%s", dest); }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "exported_file", rj_str(abs));
+    *res = o;
+    return 1;
+}
+
 static int cmd_gethdkeys(const rj_val* params, const rpc_wallet* w, rj_val** res){
     (void)params;
     rj_val* arr = rj_arr();
@@ -820,6 +1372,18 @@ static int cmd_gethdkeys(const rj_val* params, const rpc_wallet* w, rj_val** res
         rj_obj_set(e, "has_private", rj_bool(1));
         rj_arr_push(arr, e);
     }
+    /* ...plus every key addhdkey added. Listing only the seed once added
+     * keys exist would hide half the wallet from a caller deciding which
+     * hdkey to pass to createwalletdescriptor. */
+    { int nh = wop_hdkeys_load();
+      for (int h = 1; h <= nh; h++){
+          char xp[128];
+          if (!wop_hdk_xpub(g_hdk[h], xp)) continue;
+          rj_val* e = rj_obj();
+          rj_obj_set(e, "xpub", rj_str(xp));
+          rj_obj_set(e, "has_private", rj_bool(1));
+          rj_arr_push(arr, e);
+      } }
     *res = arr;
     return 1;
 }
@@ -973,6 +1537,11 @@ void rpc_wops_set_scanner(long (*read_block)(long, unsigned char*, long),
  * to a key beyond it is not found, which is why the number is stated here
  * and in the docs rather than buried. */
 #define WOP_SCAN_KEYS  1000
+/* An ADDED hd key is new, so its address history is short; a smaller window
+ * per added key keeps the matcher (searched once per output of every
+ * transaction in the chain) from growing by an order of magnitude. */
+#define WOP_HDK_WINDOW 100
+#define WOP_KEYSET_CAP (WOP_SCAN_KEYS*2 + WOP_MAX_HDKEYS*WOP_HDK_WINDOW*2)
 
 extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
                               const unsigned char* seed, long seedlen,
@@ -987,6 +1556,10 @@ extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
  * answering from the previous one's keys. */
 static unsigned char g_ks_seed[64];
 static int g_ks_valid;
+/* the derived key window is a cache of the seed AND every added hd key, so
+ * adding a key must drop it -- otherwise the new key's addresses stay
+ * invisible until the process restarts */
+static void wop_keyset_invalidate(void){ g_ks_valid = 0; }
 static wscan_key* g_ks;
 static int g_ks_n;
 
@@ -1036,10 +1609,10 @@ static int wop_keyset_cached(const rpc_wallet* w, const wscan_key** out){
     if ((!w || !w->seed) && g_aw_watchonly) return wop_watch_keyset(out);
     if (!w || !w->seed){ *out = NULL; return 0; }
     if (g_ks_valid && !memcmp(g_ks_seed, w->seed, 64)){ *out = g_ks; return g_ks_n; }
-    if (!g_ks) g_ks = malloc((size_t)(WOP_SCAN_KEYS*2) * sizeof *g_ks);
+    if (!g_ks) g_ks = malloc((size_t)WOP_KEYSET_CAP * sizeof *g_ks);
     if (!g_ks){ *out = NULL; return 0; }
     extern int wop_keyset(const rpc_wallet*, wscan_key*, int);
-    g_ks_n = wop_keyset(w, g_ks, WOP_SCAN_KEYS*2);
+    g_ks_n = wop_keyset(w, g_ks, WOP_KEYSET_CAP);
     memcpy(g_ks_seed, w->seed, 64);
     g_ks_valid = 1;
     *out = g_ks;
@@ -1057,9 +1630,25 @@ int wop_keyset(const rpc_wallet* w, wscan_key* keys, int cap){
             scalar_to_pubkey(pub, k);
             hash160(keys[n].h160, pub, 33);
             keys[n].keyidx = i; keys[n].branch = (unsigned char)b;
+            keys[n].hdkey = 0;                     /* 0 = the wallet's own seed */
             n++;
         }
     }
+    /* ...then every key ADDED by addhdkey. They join the same window, so the
+     * rescan finds their outputs and getbalance counts them; without this the
+     * added key would be stored and otherwise inert. */
+    { int nh = wop_hdkeys_load();
+      for (int h = 1; h <= nh; h++)
+          for (unsigned i = 0; i < WOP_HDK_WINDOW && n + 2 <= cap; i++)
+              for (int b = 0; b <= 1; b++){
+                  unsigned char k[32], pub[33];
+                  if (!wop_hdk_derive(h, i, b, k)) continue;
+                  scalar_to_pubkey(pub, k);
+                  hash160(keys[n].h160, pub, 33);
+                  keys[n].keyidx = i; keys[n].branch = (unsigned char)b;
+                  keys[n].hdkey = (unsigned char)h;
+                  n++;
+              } }
     qsort(keys, (size_t)n, sizeof keys[0], wscan_key_cmp);
     return n;
 }
@@ -1171,8 +1760,13 @@ int rpc_wops_watch_newaddress(char* out, long cap, long* ec, const char** em){
 
 /* hash160 of the key a record belongs to. */
 static int wop_rec_h160(const wscan_key* keys, int nk, const wscan_rec* r, unsigned char h[20]){
+    /* hdkey FIRST: two HD keys both have an index-0 receive key, so matching
+     * on (keyidx, branch) alone hands back the wrong address as soon as a
+     * second key exists -- and the wallet would then build a spend against a
+     * scriptPubKey the coin is not locked to. */
     for (int i = 0; i < nk; i++)
-        if (keys[i].keyidx == r->keyidx && keys[i].branch == r->branch){
+        if (keys[i].hdkey == r->hdkey &&
+            keys[i].keyidx == r->keyidx && keys[i].branch == r->branch){
             memcpy(h, keys[i].h160, 20); return 1; }
     return 0;
 }
@@ -1746,6 +2340,12 @@ static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
                 !memcmp(recs[j].prev_txid, recs[i].txid, 32)){ spent = 1; break; }
         if (spent) continue;
         if (rpc_wops_is_locked(recs[i].txid, recs[i].vout)) continue;
+        /* avoid_reuse: skip a coin paying a destination this wallet has
+         * already spent from. Storing the flag and then selecting the coin
+         * anyway would tell the caller the wallet avoids reuse when it does
+         * not, which is worse than not having the flag. */
+        if (wop_avoid_reuse_load() &&
+            wop_key_is_reused(recs, n, recs[i].keyidx, recs[i].branch)) continue;
         memcpy(out[m].txid, recs[i].txid, 32);
         out[m].vout = recs[i].vout;
         out[m].value = recs[i].value;
@@ -2349,24 +2949,22 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
 
 /* ==== the refusals =======================================================
  * Each names the specific missing capability. None of them pretends. */
-#define WOP_ONE_WALLET \
-    "this node serves exactly one wallet, loaded at startup from " \
-    "data/bmcwallet.dat; it has no multi-wallet manager, so there is nothing " \
-    "for this call to create, load, unload or switch between"
-#define WOP_NO_ENCRYPTION \
-    "this node's wallet store is not encrypted and has no encryption path " \
-    "(wallet_store.c persists a BIP39 mnemonic; adding Core's AES keystore " \
-    "is unimplemented). walletlock/walletpassphrase already report the " \
-    "unencrypted state exactly as Core does"
+/* Three refusal texts lived here and every one of them had become FALSE as
+ * the features they described being absent shipped: WOP_ONE_WALLET said
+ * there was no multi-wallet manager (createwallet/loadwallet/unloadwallet/
+ * restorewallet are real), WOP_NO_ENCRYPTION said there was no encryption
+ * path (encryptwallet is real), WOP_NO_RESCAN said no rescan existed
+ * (rescanblockchain is real, and getbalance/listunspent answer from it).
+ * A stale refusal is worse than no refusal: it is a confident, specific,
+ * wrong explanation, and a reader has no way to tell it from a live one.
+ * Deleted 2026-08-27 with the calls that used them.
+ *
+ * WOP_NO_IMPORT survives because it is still true: adopting FOREIGN key
+ * material needs a key store this single-seed wallet does not have. */
 #define WOP_NO_IMPORT \
     "this wallet is a single BIP32 seed with no import path: it cannot adopt " \
     "foreign descriptors, keys or watch-only scripts, so there is nothing " \
     "this call could add"
-#define WOP_NO_RESCAN \
-    "no wallet rescan exists: the wallet learns of its outputs only from the " \
-    "sends it journals, so there is no chain-scan to start, abort or bound. " \
-    "This is why getreceivedbyaddress and the listreceivedby* family are " \
-    "also absent rather than answering zero"
 
 /* The spend family. This is the one gap worth stating precisely, because the
  * pieces LOOK present and are not.
@@ -2425,6 +3023,207 @@ static int bf_call(const char* method, rj_val* params, const rpc_wallet* w,
     int rc = rpc_dispatch(method, params, w, r, ec, em);
     rj_free(params);
     if (rc != 1){ if (*r){ rj_free(*r); *r = NULL; } return 0; }
+    return 1;
+}
+
+/* ==== importprunedfunds / removeprunedfunds ==============================
+ * Core's pair for a PRUNED node, which cannot rescan: you hand it a raw
+ * transaction plus a BIP37 merkle proof, and it adds the transaction to the
+ * wallet without touching the chain. Both were refused here as "no import
+ * path", which conflated two different things -- this call imports no KEY
+ * material, only the knowledge that an output we already own exists. Every
+ * piece it needs was already built and tested:
+ *
+ *   - the proof is verified by verifytxoutproof, called as an RPC rather
+ *     than reimplemented, so the BIP37 partial-merkle-tree walk and the
+ *     "is this block in our chain" check are the same code the standalone
+ *     call uses;
+ *   - "is this output ours" is answered by wscan_spk_h160 against the same
+ *     key window the rescan uses, exported for exactly this reason;
+ *   - the record set is rewritten through wscan_write, which owns the
+ *     on-disk layout, header-last, so a crash cannot leave a half file.
+ *
+ * What the wallet learns is a RECEIVE record per matching output, which is
+ * precisely what a rescan of that block would have produced. */
+
+static int cmd_importprunedfunds(const rj_val* params, const rpc_wallet* w,
+                                 long* ec, const char** em, rj_val** res){
+    const char* rawhex   = wop_str_arg(params, 0);
+    const char* proofhex = wop_str_arg(params, 1);
+    if (!rawhex || !proofhex)
+        return wop_err(ec, em, -8, "importprunedfunds requires a raw transaction and a proof");
+    /* Decoded by the RPC that already knows how to decode one, the same way
+     * bumpfee reads its original -- parsing the bytes again here would be a
+     * second transaction parser in a file that does not need one. */
+    rj_val* dec = NULL;
+    { rj_val* dp = rj_arr(); rj_arr_push(dp, rj_str(rawhex));
+      if (!bf_call("decoderawtransaction", dp, w, &dec, ec, em)) return 0; }
+    char txid_disp[65]; txid_disp[0] = 0;
+    { rj_val* t = rj_obj_get(dec, "txid");
+      if (t && t->str) snprintf(txid_disp, sizeof txid_disp, "%s", t->str); }
+    unsigned char txid[32];
+    if (!txid_disp[0] || !wop_hex32_le(txid_disp, txid)){
+        rj_free(dec);
+        return wop_err(ec, em, -22,
+            "TX decode failed. Make sure the tx has at least one input."); }
+
+    /* ---- the proof, through the RPC that already knows how to read one --- */
+    rj_val* pv = rj_arr(); rj_arr_push(pv, rj_str(proofhex));
+    rj_val* pr = NULL;
+    if (!bf_call("verifytxoutproof", pv, w, &pr, ec, em)){ rj_free(dec); return 0; }
+    int in_proof = 0;
+    if (pr && pr->typ == RJ_ARR)
+        for (size_t i = 0; i < pr->nitems; i++)
+            if (pr->items[i]->str && !strcmp(pr->items[i]->str, txid_disp)) in_proof = 1;
+    int proof_empty = !pr || pr->typ != RJ_ARR || pr->nitems == 0;
+    rj_free(pr);
+    if (proof_empty){
+        rj_free(dec);
+        /* our verifytxoutproof answers an empty array for BOTH a malformed
+         * proof and a block outside our chain, so the message names both
+         * rather than asserting which */
+        return wop_err(ec, em, -5,
+            "Something wrong with merkleblock: the proof did not verify, or its "
+            "block is not in this node's chain"); }
+    if (!in_proof){ rj_free(dec);
+        return wop_err(ec, em, -5, "Transaction given doesn't exist in proof"); }
+
+    /* ---- the block's height, from the header the proof carries ---------- */
+    if (strlen(proofhex) < 160){ rj_free(dec);
+        return wop_err(ec, em, -5, "Something wrong with merkleblock"); }
+    unsigned char hdr80[80];
+    for (int i = 0; i < 80; i++){
+        int a = wop_hex1(proofhex[i*2]), b = wop_hex1(proofhex[i*2+1]);
+        if (a < 0 || b < 0){ rj_free(dec);
+            return wop_err(ec, em, -5, "Something wrong with merkleblock"); }
+        hdr80[i] = (unsigned char)((a<<4)|b);
+    }
+    unsigned char bh[32];
+    { extern void sha256d(unsigned char*, const void*, unsigned long);
+      sha256d(bh, hdr80, 80); }
+    char bh_disp[65]; wop_txid_hex(bh, bh_disp);
+    long height = -1;
+    { rj_val* bp = rj_arr(); rj_arr_push(bp, rj_str(bh_disp));
+      rj_val* br = NULL;
+      if (!bf_call("getblockheader", bp, w, &br, ec, em)){ rj_free(dec); return 0; }
+      rj_val* hv = br ? rj_obj_get(br, "height") : NULL;
+      if (hv && hv->str) height = atol(hv->str);
+      rj_free(br); }
+    if (height < 0){ rj_free(dec);
+        return wop_err(ec, em, -5, "Block not found in chain"); }
+
+    /* ---- which outputs are ours -- the SAME question the rescan asks ---- */
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (nk <= 0){ rj_free(dec); return wop_err(ec, em, -4, "No wallet is loaded"); }
+    /* a coinbase is stated by the decoded transaction itself: its single
+     * input carries `coinbase` instead of a txid/vout, which is what
+     * tx_to_json emits for the null outpoint */
+    int is_cb = 0;
+    { rj_val* vin = rj_obj_get(dec, "vin");
+      if (vin && vin->typ == RJ_ARR && vin->nitems == 1 &&
+          rj_obj_get(vin->items[0], "coinbase")) is_cb = 1; }
+
+    wscan_rec* recs; long nrec = wop_records(&recs);
+    if (nrec < 0) nrec = 0;
+    static wscan_rec out[WOP_MAXREC];
+    long n_out = 0;
+    for (long i = 0; i < nrec && n_out < WOP_MAXREC; i++) out[n_out++] = recs[i];
+    long tip = g_wop_tipscanned;
+
+    int added = 0;
+    { rj_val* vout = rj_obj_get(dec, "vout");
+      for (size_t v = 0; vout && vout->typ == RJ_ARR && v < vout->nitems; v++){
+          rj_val* o = vout->items[v];
+          rj_val* amt = rj_obj_get(o, "value");
+          rj_val* spk = rj_obj_get(o, "scriptPubKey");
+          rj_val* shx = spk ? rj_obj_get(spk, "hex") : NULL;
+          rj_val* nv  = rj_obj_get(o, "n");
+          if (!amt || !amt->str || !shx || !shx->str) continue;
+          unsigned vidx = nv && nv->str ? (unsigned)atol(nv->str) : (unsigned)v;
+          long long sat = rpc_amount_to_sat(amt->str);
+          if (sat < 0) continue;
+          size_t sl2 = strlen(shx->str);
+          if ((sl2 & 1) || sl2/2 > 128) continue;
+          unsigned char spkb[128];
+          int bad = 0;
+          for (size_t k = 0; k < sl2/2; k++){
+              int a = wop_hex1(shx->str[k*2]), b = wop_hex1(shx->str[k*2+1]);
+              if (a < 0 || b < 0){ bad = 1; break; }
+              spkb[k] = (unsigned char)((a<<4)|b);
+          }
+          if (bad) continue;
+          const unsigned char* h160 = NULL;
+          if (!wscan_spk_h160(spkb, (unsigned long)(sl2/2), &h160)) continue;
+          for (int k = 0; k < nk; k++){
+              if (memcmp(keys[k].h160, h160, 20)) continue;
+              /* idempotent: an outpoint already recorded is left alone, so a
+               * repeated import is a no-op rather than a double credit */
+              int dup = 0;
+              for (long q = 0; q < n_out; q++)
+                  if (out[q].kind == 0 && out[q].vout == vidx &&
+                      !memcmp(out[q].txid, txid, 32)){ dup = 1; break; }
+              if (dup) break;
+              if (n_out >= WOP_MAXREC) break;
+              wscan_rec* r = &out[n_out++];
+              memset(r, 0, sizeof *r);
+              r->height = (unsigned)height;
+              memcpy(r->txid, txid, 32);
+              r->vout = vidx;
+              r->value = (unsigned long long)sat;
+              r->kind = 0;                       /* receive */
+              r->keyidx = keys[k].keyidx;
+              r->branch = keys[k].branch;
+              r->is_coinbase = (unsigned char)is_cb;
+              added++;
+              break;
+          }
+      } }
+    rj_free(dec);
+
+    if (!added)
+        return wop_err(ec, em, -5, "No addresses in wallet correspond to included transaction");
+
+    /* the imported block may sit past what the last rescan covered; the file
+     * must not claim to have scanned further than it has, so the tip only
+     * ever moves FORWARD to at most this block */
+    if (tip < height) tip = height;
+    { char pb[512]; char werr[192]; werr[0] = 0;
+      if (wscan_write(wop_path(WOP_SCAN_REL, pb, sizeof pb), out, n_out, tip,
+                      werr, sizeof werr) != 0){
+          static char msg[256];
+          snprintf(msg, sizeof msg, "could not write the wallet record file: %s", werr);
+          return wop_err(ec, em, -4, msg); } }
+    wop_records_invalidate();
+    *res = rj_null();
+    return 1;
+}
+
+static int cmd_removeprunedfunds(const rj_val* params, const rpc_wallet* w,
+                                 long* ec, const char** em, rj_val** res){
+    (void)w;
+    unsigned char txw[32]; char txd[65];
+    if (!wop_txid_from_arg(params, txw, txd, ec, em)) return 0;
+    wscan_rec* recs; long nrec = wop_records(&recs);
+    if (nrec < 0) nrec = 0;
+    static wscan_rec out[WOP_MAXREC];
+    long n_out = 0; int removed = 0;
+    for (long i = 0; i < nrec; i++){
+        if (!memcmp(recs[i].txid, txw, 32)){ removed++; continue; }
+        if (n_out < WOP_MAXREC) out[n_out++] = recs[i];
+    }
+    if (!removed){
+        static char msg[128];
+        snprintf(msg, sizeof msg, "Transaction %s does not belong to this wallet", txd);
+        return wop_err(ec, em, -4, msg);          /* Core's wording and code */
+    }
+    { char pb[512]; char werr[192]; werr[0] = 0;
+      if (wscan_write(wop_path(WOP_SCAN_REL, pb, sizeof pb), out, n_out,
+                      g_wop_tipscanned, werr, sizeof werr) != 0){
+          static char msg[256];
+          snprintf(msg, sizeof msg, "could not write the wallet record file: %s", werr);
+          return wop_err(ec, em, -4, msg); } }
+    wop_records_invalidate();
+    *res = rj_null();
     return 1;
 }
 
@@ -2719,6 +3518,45 @@ static int cmd_bumpfee_common(const rj_val* params, const rpc_wallet* w,
     { char pb[512]; FILE* f = fopen(wop_path("bumped.dat", pb, sizeof pb), "a");
       if (f){ fprintf(f, "%s %s\n", txd, newtxid); fclose(f); } }
 
+    /* ...and BOTH transactions into the wallet's send journal, which is what
+     * makes that sidecar reachable at all. gettransaction answers from the
+     * journal, and until now nothing in the DAEMON ever wrote it -- only the
+     * wallet_cli tool did -- so a bump performed over RPC produced a linkage
+     * that no RPC could then read back. Writing only the replacement would
+     * leave replaced_by_txid, the direction a caller actually asks for,
+     * still unreachable on the original.
+     *
+     * The amount is the non-change total and the destination the first
+     * non-change output, matching what the CLI records for a send. A bump
+     * keeps the original outputs and takes the fee from change, so these are
+     * the same on both rows -- only the fee differs, which is the point. */
+    { long long sent = 0; unsigned char dest[20]; int have_dest = 0;
+      for (int i = 0; i < nout; i++){
+          if (i == change_idx) continue;
+          sent += (long long)outs[i].value;
+          if (!have_dest && outs[i].spklen >= 22 &&
+              outs[i].spk[0] == 0x00 && outs[i].spk[1] == 0x14){
+              memcpy(dest, outs[i].spk + 2, 20); have_dest = 1;      /* P2WPKH */
+          } else if (!have_dest && outs[i].spklen == 25 && outs[i].spk[0] == 0x76){
+              memcpy(dest, outs[i].spk + 3, 20); have_dest = 1;      /* P2PKH  */
+          }
+      }
+      if (!have_dest) memset(dest, 0, 20);
+      unsigned char nid[32];
+      if (wop_hex32_le(newtxid, nid)){   /* display -> internal, the order the journal stores */
+          extern int txlog_append_sent(const char*, const unsigned char[32],
+                                       long long, long long, const unsigned char[20],
+                                       unsigned long, long);
+          /* The journal sits beside the WALLET, so it has to be resolved the
+           * way every other wallet file is. Passing NULL takes the library's
+           * "data/bmcwallet.dat" default, which is the CLI's layout, not the
+           * daemon's -- on a per-chain datadir there is no data/ directory
+           * and the write silently goes nowhere. */
+          char wb[512]; const char* wpath = wop_path("bmcwallet.dat", wb, sizeof wb);
+          txlog_append_sent(wpath, txw, sent, old_fee, dest, (unsigned long)nin, rlen);
+          txlog_append_sent(wpath, nid, sent, new_fee, dest, (unsigned long)nin, p2);
+      } }
+
     rj_val* o = rj_obj();
     rj_obj_set(o, "txid", rj_str(newtxid));
     free(newtxid);
@@ -2817,13 +3655,18 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "loadwallet"))      return cmd_loadwallet(params, ec, em, res);
     if (!strcmp(m, "unloadwallet"))    return cmd_unloadwallet(params, ec, em, res);
     if (!strcmp(m, "restorewallet"))   return cmd_restorewallet(params, ec, em, res);
-    if (!strcmp(m, "migratewallet") || !strcmp(m, "setwalletflag"))
-        return wop_unsupported(WOP_ONE_WALLET, ec, em);
+    if (!strcmp(m, "migratewallet"))    return cmd_migratewallet(params, ec, em);
+    if (!strcmp(m, "setwalletflag"))   return cmd_setwalletflag(params, ec, em, res);
     if (!strcmp(m, "importdescriptors")) return cmd_importdescriptors(params, w, ec, em, res);
-    if (!strcmp(m, "createwalletdescriptor") ||
-        !strcmp(m, "addhdkey") || !strcmp(m, "importprunedfunds") ||
-        !strcmp(m, "removeprunedfunds") || !strcmp(m, "exportwatchonlywallet"))
-        return wop_unsupported(WOP_NO_IMPORT, ec, em);
+    if (!strcmp(m, "exportwatchonlywallet"))
+        return cmd_exportwatchonlywallet(params, w, ec, em, res);
+    if (!strcmp(m, "createwalletdescriptor"))
+        return cmd_createwalletdescriptor(params, w, ec, em);
+    if (!strcmp(m, "importprunedfunds"))
+        return cmd_importprunedfunds(params, w, ec, em, res);
+    if (!strcmp(m, "removeprunedfunds"))
+        return cmd_removeprunedfunds(params, w, ec, em, res);
+    if (!strcmp(m, "addhdkey")) return cmd_addhdkey(params, w, ec, em, res);
     if (!strcmp(m, "walletdisplayaddress")){
         /* Core: walletdisplayaddress "address". The signer wants a
          * DESCRIPTOR; an address becomes addr(<address>), which HWI

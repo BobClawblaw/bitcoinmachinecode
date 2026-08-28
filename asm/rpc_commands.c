@@ -1669,7 +1669,8 @@ static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     rj_obj_set(o, "txcount", rj_numf("%d", n));
     rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
     rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
-    rj_obj_set(o, "avoid_reuse", rj_bool(0));
+    { extern int rpc_wops_avoid_reuse(void);
+      rj_obj_set(o, "avoid_reuse", rj_bool(rpc_wops_avoid_reuse() ? 1 : 0)); }
     rj_obj_set(o, "scanning", rj_bool(0));
     { extern int rpc_wops_watchonly(void);
       rj_obj_set(o, "descriptors", rj_bool(rpc_wops_watchonly() ? 1 : 0)); }
@@ -1747,6 +1748,15 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
             rj_arr_push(keys, rj_str(wif));
         }
     }
+    /* ...and every key addhdkey contributed. A wallet that WATCHES an added
+     * key's outputs (they are in the rescan window) but cannot sign for them
+     * would report coins as spendable and then fail at signing -- worse than
+     * never having had the key. */
+    { extern int rpc_wops_hdkey_privkeys(unsigned char (*out)[32], int cap, unsigned window);
+      static unsigned char hk[8 * SRWW_WINDOW * 2][32];
+      int nh = rpc_wops_hdkey_privkeys(hk, (int)(sizeof hk / sizeof hk[0]), SRWW_WINDOW);
+      for (int i = 0; i < nh; i++){ char wif[64]; srww_wif(wif, hk[i]); rj_arr_push(keys, rj_str(wif)); }
+      memset(hk, 0, sizeof hk); }
     rj_val* fwd = rj_arr();
     rj_arr_push(fwd, rj_str(params->items[0]->str));
     rj_arr_push(fwd, keys);

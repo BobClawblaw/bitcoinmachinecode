@@ -448,27 +448,118 @@ int main(void){
       rj_free(r); rj_free(p); }
 
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
-    { static const char* REFUSE[] = {
-        "migratewallet","setwalletflag","createwalletdescriptor",
-        "addhdkey","importprunedfunds","removeprunedfunds","exportwatchonlywallet" };
-      /* walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
-       * encryptwallet left 2026-08-27 (real; -8 asserted below).
-       * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
-       * left 2026-08-27: MULTI-WALLET is real now -- the whole lifecycle is
-       * exercised at the end of this file.
-       * bumpfee/psbtbumpfee left 2026-08-27: REAL now (Core feebumper
-       * semantics; differentially proven on regtest) -- bad-arg forms
-       * asserted below. */
-      int n = (int)(sizeof REFUSE / sizeof *REFUSE), allbad = 1;
-      for (int i = 0; i < n; i++){
-          D(REFUSE[i], NULL);
-          if (!(rc == 0 && ec == -1 && em && strlen(em) > 30)){
-              printf("      (%s returned rc=%d ec=%ld)\n", REFUSE[i], rc, ec);
-              allbad = 0;
-          }
-          rj_free(r);
-      }
-      ck("every unsupported wallet method errors with a substantive reason", allbad);
+    {   /* Nothing is refused wholesale any more. addhdkey was the last, and
+         * it is real as of 2026-08-27 (evening) -- see below and slice 25.
+         * walletprocesspsbt left this list 2026-08-26 (real; test_rpc_psbtfinal).
+         * encryptwallet left 2026-08-27 (real; -8 asserted below).
+         * createwallet/loadwallet/unloadwallet/restorewallet/importdescriptors
+         * left 2026-08-27: MULTI-WALLET is real now -- the whole lifecycle is
+         * exercised at the end of this file.
+         * bumpfee/psbtbumpfee left 2026-08-27: REAL now (Core feebumper
+         * semantics; differentially proven on regtest).
+         * exportwatchonlywallet, migratewallet, createwalletdescriptor and the
+         * pruned-funds pair left 2026-08-27 (evening). */
+      /* exportwatchonlywallet is real, so it must reject a MISSING
+       * destination with Core's -8 rather than refuse wholesale */
+      D("exportwatchonlywallet", NULL);
+      ck("exportwatchonlywallet with no destination -> -8", rc == 0 && ec == -8);
+      rj_free(r);
+
+      /* migratewallet: Core's verdict for a wallet that is ALREADY a
+       * descriptor wallet, which every wallet here is. -4, not a refusal. */
+      D("migratewallet", NULL);
+      ck("migratewallet -> Core's already-a-descriptor-wallet error",
+         rc == 0 && ec == -4 && em && strstr(em, "already a descriptor wallet"));
+      rj_free(r);
+
+      /* createwalletdescriptor: Core's codes, by argument */
+      { rj_val* p1 = P("[\"nonsense\"]");
+        D("createwalletdescriptor", p1);
+        ck("createwalletdescriptor unknown type -> -5", rc == 0 && ec == -5 &&
+           em && strstr(em, "Unknown address type"));
+        rj_free(r); rj_free(p1); }
+      { rj_val* p1 = P("[\"bech32\"]");
+        D("createwalletdescriptor", p1);
+        ck("createwalletdescriptor bech32 -> Descriptor already exists (-4)",
+           rc == 0 && ec == -4 && em && !strcmp(em, "Descriptor already exists"));
+        rj_free(r); rj_free(p1); }
+      { rj_val* p1 = P("[\"bech32m\"]");
+        D("createwalletdescriptor", p1);
+        ck("createwalletdescriptor bech32m -> refused with the SPECIFIC reason",
+           rc == 0 && ec == -4 && em && strstr(em, "derives only wpkh"));
+        rj_free(r); rj_free(p1); }
+      D("createwalletdescriptor", NULL);
+      ck("createwalletdescriptor with no type -> -8", rc == 0 && ec == -8);
+      rj_free(r);
+
+      /* addhdkey stores an extended PRIVATE key, so it refuses outright
+       * unless it can encrypt it -- an xprv written in the clear beside a
+       * passphrase-protected seed would be the weakest thing in the wallet
+       * directory. This harness has no passphrase, which is exactly that
+       * path; the real add is proven on regtest. */
+      { rj_val* p1 = P("[\"xprvBogus\"]");
+        D("addhdkey", p1);
+        ck("addhdkey without a passphrase refuses rather than storing a key in the clear",
+           rc == 0 && ec == -4 && em && strstr(em, "encrypted"));
+        rj_free(r); rj_free(p1); }
+      /* gethdkeys still answers, and still reports the seed */
+      { rj_val* gk = NULL; long e3; const char* m3;
+        if (rpc_dispatch("gethdkeys", NULL, &W, &gk, &e3, &m3) == 1)
+            ck("gethdkeys lists the seed's account xpub",
+               gk && gk->typ == RJ_ARR && gk->nitems >= 1);
+        else ck("gethdkeys lists the seed's account xpub", 0);
+        rj_free(gk); }
+
+      /* setwalletflag: Core's flag vocabulary and its three distinct errors.
+       * avoid_reuse is not stored-and-ignored -- wf_coins skips a coin whose
+       * destination this wallet has already spent from -- so the call is
+       * real rather than a recorded no-op. */
+      { rj_val* p1 = P("[\"nonsense\"]");
+        D("setwalletflag", p1);
+        ck("setwalletflag unknown flag -> -8 Unknown wallet flag",
+           rc == 0 && ec == -8 && em && strstr(em, "Unknown wallet flag"));
+        rj_free(r); rj_free(p1); }
+      { rj_val* p1 = P("[\"disable_private_keys\"]");
+        D("setwalletflag", p1);
+        ck("setwalletflag immutable flag -> -8 Wallet flag is immutable",
+           rc == 0 && ec == -8 && em && strstr(em, "immutable"));
+        rj_free(r); rj_free(p1); }
+      { rj_val* p1 = P("[\"avoid_reuse\"]");
+        D("setwalletflag", p1);
+        ck("setwalletflag avoid_reuse -> {flag_name, flag_state:true}",
+           rc == 1 && r && r->typ == RJ_OBJ &&
+           S(r,"flag_name") && !strcmp(S(r,"flag_name"), "avoid_reuse") &&
+           S(r,"flag_state") && !strcmp(S(r,"flag_state"), "1"));
+        ck("...with Core's rescan warning", r && S(r,"warnings"));
+        rj_free(r); rj_free(p1); }
+      { rj_val* p1 = P("[\"avoid_reuse\"]");
+        D("setwalletflag", p1);
+        ck("setting it twice -> -8 'already set to true'",
+           rc == 0 && ec == -8 && em && strstr(em, "already set to true"));
+        rj_free(r); rj_free(p1); }
+      /* getwalletinfo must now REPORT it, or the flag is invisible */
+      { rj_val* gi = NULL; long e2; const char* m2;
+        if (rpc_dispatch("getwalletinfo", NULL, &W, &gi, &e2, &m2) == 1)
+            ck("getwalletinfo reports avoid_reuse:true",
+               gi && S(gi,"avoid_reuse") && !strcmp(S(gi,"avoid_reuse"), "1"));
+        else ck("getwalletinfo reports avoid_reuse:true", 0);
+        rj_free(gi); }
+      /* put it back, so later cases see the default wallet */
+      { rj_val* p1 = P("[\"avoid_reuse\",false]");
+        D("setwalletflag", p1);
+        ck("clearing it again succeeds", rc == 1);
+        rj_free(r); rj_free(p1); }
+
+      /* the pruned-funds pair: argument handling. The real import path needs
+       * a chain and a proof, and is proven end to end on regtest. */
+      D("importprunedfunds", NULL);
+      ck("importprunedfunds with no arguments -> -8", rc == 0 && ec == -8);
+      rj_free(r);
+      { rj_val* p1 = P("[\"0000000000000000000000000000000000000000000000000000000000000001\"]");
+        D("removeprunedfunds", p1);
+        ck("removeprunedfunds on a txid the wallet lacks -> Core's -4",
+           rc == 0 && ec == -4 && em && strstr(em, "does not belong to this wallet"));
+        rj_free(r); rj_free(p1); }
       /* encryptwallet is wired (daemon/wallet_enc_state.c): with no passphrase
        * argument it is an ordinary parameter error, not a stub refusal. */
       { D("encryptwallet", NULL);

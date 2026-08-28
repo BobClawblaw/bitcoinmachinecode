@@ -1016,9 +1016,53 @@ int main(void){
         ck_str("cpfp coinbasevalue = subsidy + 7000 fees", S(r,"coinbasevalue"), "5000007000");
         rj_free(r);
 
+        /* ---- getrawtransaction falls back to the MEMPOOL ----------------
+         * Core consults the mempool before the txid index whenever no
+         * blockhash was given -- its help says "by default, this call only
+         * returns a transaction if it is in the mempool". This node used to
+         * consult only the OFFLINE index, so an unconfirmed transaction (the
+         * common case the call is reached for) came back -5 with a message
+         * about index coverage that was true and beside the point.
+         *
+         * rpc_node owns the locked accessor, so its hook copy has to be set
+         * too -- the daemon sets both from the same struct. */
+        rpc_node_set_mempool(&h);
+        { char hC[65], pj[96];
+          trc_hex_rev(hC, idC, 32);
+
+          snprintf(pj, sizeof pj, "[\"%s\"]", hC);
+          r = call("getrawtransaction", pj, &ec, &em);
+          { char want[200]; tohex(want, txC, 61);
+            ck_str("grt: an unconfirmed tx returns its raw hex", r ? r->str : NULL, want); }
+          rj_free(r);
+
+          snprintf(pj, sizeof pj, "[\"%s\",1]", hC);
+          r = call("getrawtransaction", pj, &ec, &em);
+          ck("grt: verbosity 1 on a mempool tx returns an object", r && r->typ == RJ_OBJ);
+          ck_str("...with the txid", S(r,"txid"), hC);
+          /* An unconfirmed transaction is in NO block, so every field that
+           * would assert a confirmation must be absent -- filling any of them
+           * in is a lie about the chain, not a cosmetic difference. */
+          ck("...and NO blockhash", r && rj_obj_get(r,"blockhash") == NULL);
+          ck("...and NO confirmations", r && rj_obj_get(r,"confirmations") == NULL);
+          ck("...and NO time/blocktime", r && rj_obj_get(r,"time") == NULL
+                                          && rj_obj_get(r,"blocktime") == NULL);
+          ck("...and NO in_active_chain (needs an explicit blockhash)",
+             r && rj_obj_get(r,"in_active_chain") == NULL);
+          rj_free(r);
+
+          /* a txid in NEITHER the pool nor the index still errors -5 */
+          { char nope[65]; unsigned char nid[32]; memset(nid, 0xDE, 32);
+            trc_hex_rev(nope, nid, 32);
+            snprintf(pj, sizeof pj, "[\"%s\"]", nope);
+            r = call("getrawtransaction", pj, &ec, &em);
+            ck("grt: unknown txid is still -5", r == NULL && ec == -5);
+            rj_free(r); } }
+
         /* restore the empty pool for the sections below */
         { rpc_mempool_hooks h0; memset(&h0, 0, sizeof h0);
-          rpc_chain_set_mempool(&h0, NULL); }
+          rpc_chain_set_mempool(&h0, NULL);
+          rpc_node_set_mempool(&h0); }
       }
 
       /* retarget KATs (frozen reference vectors) */
@@ -1410,7 +1454,12 @@ int main(void){
       ck("verbosity 1 via the index returns an object", r && r->typ == RJ_OBJ);
       ck_str("...with the txid", S(r,"txid"), g_tx2_txid);
       ck_str("...and the blockhash the index resolved", S(r,"blockhash"), g_hash[3]);
-      ck("...and in_active_chain", r && S(r,"in_active_chain"));
+      /* Core documents in_active_chain as "only present with explicit
+       * blockhash argument", and no blockhash was passed here. It used to be
+       * emitted unconditionally, which the mempool path makes plainly wrong:
+       * an unconfirmed transaction is in no block at all. */
+      ck("...and NO in_active_chain, which needs an explicit blockhash",
+         r && rj_obj_get(r,"in_active_chain") == NULL);
       rj_free(r); }
 
     { /* a txid the index does not hold: the error must say the index is

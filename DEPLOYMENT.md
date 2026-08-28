@@ -184,11 +184,137 @@ count, uptime.
   ```
 
   The snapshot names march a letter per deploy on a given day
-  (`…-20260827o`, `p`, `q`, …). As of 2026-08-27 the live binary is
-  **`bitcoind.deploy-20260827x`**; the rollback one step back is
-  `…-20260827w`.
+  (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
+  2026-08-28 the live binary is **`bitcoind.deploy-20260828af`**; the
+  rollback one step back is `…-20260828ae`.
 
-  The four that changed live behaviour most, newest first:
+  These snapshots are NOT in git (they are ~31 MB build products, and a
+  `git add -A` once swept twenty of them plus a scratch datadir into a
+  commit — see `.gitignore`). They live on the host, which is the whole
+  point: the rollback path must not depend on the network.
+
+  NOTE ON BOOT TIME from `z` onward: boot now includes a ~60 s
+  `[boot] tx-validation snapshot ready (61.49s)` step. That is deliberate --
+  the read-only UTXO snapshot moved from per-inbound-connection to once
+  pre-fork (see `y`/`z` below), so the cost is paid while the node is
+  starting instead of by every peer that connects. A boot that seems to hang
+  for a minute there is working as intended; the line is printed when it
+  finishes.
+
+  The twelve that changed live behaviour most, newest first:
+  - **`af`** (`cab7e75`) — a `getdata` miss is answered with `notfound`
+    instead of silence, and BIP157 compact filters are SERVED
+    (`getcfilters`/`getcfheaders`/`getcfcheckpt`). Verified on the live
+    mainnet node: `notfound` for an unknown txid, and all three filter
+    messages answered for a covered height (10.8 KB + 15.6 KB of real
+    filters, a 130 B cfheaders, a 12.8 KB cfcheckpt).
+
+    **Operational note this exposed:** the mainnet filter index covers
+    heights 0–425,210 of 964,405 — the backfill was never finished, and the
+    daemon logs `[bfilter] index at 425211, tip N -- waiting for the backfill
+    to close in` on every block. Filters BELOW that height serve; above it we
+    correctly answer nothing, because we do not have them. Finishing the
+    backfill (`daemon/build_block_filters`) is what makes filter serving
+    useful to a light client on the current chain.
+  - **`ae`** (`057c87d`) — **this node can serve the blocks it downloads
+    again.** The serve path's hash index was built once at boot; new blocks
+    are appended by the download WORKER, a different process, so the serve
+    parent and its children never learned about them. Every block received
+    during a run was a silent `getdata` miss, so the node never helped
+    propagate recent blocks — the only propagation that matters.
+
+    It passed the `y`/`z` serving checks because a caught-up node mostly
+    answers for HISTORICAL blocks, and those were in the archive at boot.
+    Found by `validation/p2p_inbound_probe.py`, which asks as a stranger.
+
+    CONFIRMED on mainnet 2026-08-28: `[hashidx] +1 height(s) now servable
+    (through 964405)`, and the live node then served that block — 1,636,818
+    bytes — to a probe that asked for it. That is the exact case that
+    returned silence before.
+  - **`ad`** (`90531b9`) — `addhdkey`, the last wallet refusal. **Carries an
+    on-disk format bump**: the wallet record file gains an `hdkey` byte
+    (BMCWSCN3 → BMCWSCN4), without which two HD keys resolve to each other's
+    addresses.
+
+    That bump is INERT until something writes the file. Formats 2 and 3 still
+    read, and `hdkey = 0` is the truth for them rather than a default — they
+    predate added keys. Verified on the live node: the wallet's answers
+    (`getbalance`, `getwalletinfo`, `gethdkeys`, `listdescriptors`) are
+    byte-identical across the restart and `walletscan.dat` is untouched, still
+    BMCWSCN2. It is rewritten as v4 only by a rescan or a
+    pruned-funds call.
+
+    Also fixes a defect that was never about addhdkey: every xpub this node
+    produced carried MAINNET version bytes, so Core rejected them outright on
+    regtest and testnet4. Mainnet output is unchanged (verified: still
+    `xpub…`).
+
+    Before deploying this one the wallet files were copied to
+    `/mnt/archive/bmc-backup/20260828-predeploy-ad/`, which is the right
+    reflex for any deploy that can rewrite them.
+  - **`ac`** (`ad59611`) — five of the six remaining wallet refusals were not
+    actually blocked: `migratewallet` and `createwalletdescriptor` answer
+    Core's own verdict for a wallet of this shape, `importprunedfunds` /
+    `removeprunedfunds` are real (they import no key material, only the
+    knowledge that an output we already own exists), and `setwalletflag`
+    implements `avoid_reuse` end to end.
+
+    Verified live: all five answer with Core's exact codes and messages.
+    `avoid_reuse` is OFF by default and the flag file does not exist, so the
+    production wallet's coin selection is unchanged by this deploy.
+
+    NOTE for operators: `removeprunedfunds` and `importprunedfunds` are the
+    first RPCs that WRITE the wallet's record file outside a rescan. They act
+    only when called, and `wscan_write` writes its header last, so an
+    interrupted call leaves the previous complete record set rather than a
+    partial one.
+  - **`ab`** (`e9b0d93`) — `getrawtransaction` falls back to the mempool,
+    which is Core's order and what its help promises ("by default, this call
+    only returns a transaction if it is in the mempool"). Before this it
+    consulted only the OFFLINE txid index, so an unconfirmed transaction —
+    the common case the call is reached for — came back `-5`, with a message
+    about index coverage that was true and beside the point. Found while
+    verifying deploy `aa` on the live node.
+
+    Verified live on five real unconfirmed mainnet transactions: each
+    returned serialization hashes to the txid that was asked for. The verbose
+    form on an unconfirmed transaction carries no `blockhash`,
+    `confirmations`, `time`, `blocktime` or `in_active_chain` — an
+    unconfirmed transaction is in no block, and filling any of those in
+    asserts a confirmation that has not happened. A confirmed transaction
+    still carries its block context.
+  - **`aa`** (`9404ffb`) — package relay, closed end to end: p2p 1p1c
+    relay, BIP431 TRUC/v3, ephemeral dust, `replaced-transactions`, and
+    `testmempoolaccept` package mode; plus `exportwatchonlywallet` and the
+    bumpfee replaced-by linkage made reachable.
+
+    A POLICY deploy, so the number to watch is the `policy` count in the
+    30-second `[tx_accept]` summary — a new rule that is subtly too strict
+    shows up there as mainnet transactions this node refuses and the rest of
+    the network accepts. Measured over the first ten minutes: 0–2 policy
+    rejects per window against 39–81 accepts, versus a baseline of ~5 before
+    the deploy. Not over-rejecting.
+
+    New in the heartbeat: a `[txrelay] orphans:` line. Those counters
+    existed from the start and NOTHING EVER READ THEM, so a pool silently
+    dropping everything looked exactly like a quiet one. First live reading
+    was `79 held, 346 parked, 73 resolved, 194 dropped` — the 256-entry pool
+    is evicting more than it resolves under real mainnet orphan traffic,
+    which is bounded-by-design rather than broken (the network re-announces),
+    but it is exactly the kind of thing the line exists to show.
+
+    `1p1c: 0 accepted, 0 failed` at first reading. That path is proven
+    against Core on regtest; it had not yet been exercised on mainnet, which
+    needs a below-floor parent whose child also reaches us.
+  - **`z`** (`1b62d67`) — inbound serving no longer stalls. Every forked
+    serve child used to open its own UTXO snapshot (60–83 s) before
+    answering anything; now opened once pre-fork and inherited. Measured:
+    63 s to serve a block before, under a second after.
+  - **`y`** (`392872b`) — the boot hash index was keyed BACKWARDS
+    (index.dat holds wire order, the loader reversed it), so the node served
+    no block requested by getdata, ever. Verify after any deploy touching
+    this: a getdata for a known block must return it promptly.
+
   - **`x`** (`386dc22`) — `savemempool`/`importmempool` in Core's
     `mempool.dat` format. Verified live: a 284 KB dump of 184 real
     transactions that an independent parser walks to exactly the file
