@@ -17,7 +17,8 @@ typedef unsigned char u8;
 extern void addrself_init(unsigned short listen_port, int listen_enabled);
 extern void addrself_note_peer_view(const u8* payload, long len);
 extern long addrself_build(u8 out[64], long now);
-extern long addrself_maybe_announce(const int* fds, int nfds);
+extern long addrself_build_v2(u8 out[64], long now);
+extern long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds);
 
 static int fails = 0;
 static void ck(const char* l, int cond){
@@ -53,15 +54,17 @@ int main(void){
     mk_version(v, pub2);    addrself_note_peer_view(v, 102);
     mk_version(v, pub);     addrself_note_peer_view(v, 102);
     { int none[1] = { -1 };
-      ck("one vote (plus noise) is not confidence", addrself_maybe_announce(none, 1) == 0); }
+      ck("one vote (plus noise) is not confidence", addrself_maybe_announce(none, NULL, 1) == 0); }
     mk_version(v, pub);     addrself_note_peer_view(v, 102);   /* second agreeing peer */
 
     printf("\n== the announced message, byte for byte ==\n");
-    int sp[2];
+    int sp[2], sq[2];
     ck("socketpair", socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    ck("socketpair (addrv2 leg)", socketpair(AF_UNIX, SOCK_STREAM, 0, sq) == 0);
     long before = (long)time(NULL);
-    { int fds[2] = { sp[0], -1 };
-      ck("announce to the one live leg", addrself_maybe_announce(fds, 2) == 1); }
+    /* three legs: one legacy, one dead, one that sent sendaddrv2 */
+    { int fds[3] = { sp[0], -1, sq[0] }; u8 wants[3] = { 0, 0, 1 };
+      ck("announce to the two live legs", addrself_maybe_announce(fds, wants, 3) == 2); }
     u8 hdr[24], pl[64];
     ck("p2p header read", read_n(sp[1], hdr, 24) == 24);
     ck("command addr", memcmp(hdr+4, "addr\0\0\0\0\0\0\0\0", 12) == 0);
@@ -75,14 +78,32 @@ int main(void){
     ck("the CONFIRMED ip, not the noise ip", memcmp(pl+25, pub, 4) == 0);
     ck("configured port 8332, big-endian", pl[29] == 0x20 && pl[30] == 0x8c);
 
+    printf("\n== the addrv2 leg gets the BIP155 form (Core's MaybeSendAddr never sends v1 to it) ==\n");
+    ck("p2p header read (v2 leg)", read_n(sq[1], hdr, 24) == 24);
+    ck("command addrv2", memcmp(hdr+4, "addrv2\0\0\0\0\0\0", 12) == 0);
+    plen = (unsigned)hdr[16] | ((unsigned)hdr[17]<<8) | ((unsigned)hdr[18]<<16) | ((unsigned)hdr[19]<<24);
+    ck("payload length 14 (count, time, services CompactSize, net, len, ip4, port)", plen == 14 && read_n(sq[1], pl, 14) == 14);
+    ck("count 1", pl[0] == 1);
+    { unsigned t = (unsigned)pl[1] | ((unsigned)pl[2]<<8) | ((unsigned)pl[3]<<16) | ((unsigned)pl[4]<<24);
+      ck("timestamp is now-ish", (long)t >= before && (long)t <= before + 60); }
+    ck("services 9 as a one-byte CompactSize", pl[5] == 9);
+    ck("network id 1 (IPv4), address length 4", pl[6] == 1 && pl[7] == 4);
+    ck("the CONFIRMED ip", memcmp(pl+8, pub, 4) == 0);
+    ck("configured port 8332, big-endian", pl[12] == 0x20 && pl[13] == 0x8c);
+    /* and the builder's bytes match Core's CAddress.serialize_v2 shape for
+     * (t, svc 9, 203.0.113.77, 8332) apart from the live timestamp */
+    { u8 b[64]; long n = addrself_build_v2(b, 0x65535300L);
+      static const u8 CORE[] = { 0x01, 0x00,0x53,0x53,0x65, 0x09, 0x01, 0x04, 203,0,113,77, 0x20,0x8c };
+      ck("addrself_build_v2 == Core serialize_v2 bytes", n == (long)sizeof CORE && memcmp(b, CORE, n) == 0); }
+
     printf("\n== cadence: an immediate re-announce is a no-op ==\n");
     { int fds[1] = { sp[0] };
-      ck("within 24h -> nothing sent", addrself_maybe_announce(fds, 1) == 0); }
+      ck("within 24h -> nothing sent", addrself_maybe_announce(fds, NULL, 1) == 0); }
     { int fl = fcntl(sp[1], F_GETFL, 0); fcntl(sp[1], F_SETFL, fl | O_NONBLOCK);
       u8 junk[8];
       ck("no wire bytes", read(sp[1], junk, sizeof junk) <= 0); }
 
-    close(sp[0]); close(sp[1]);
+    close(sp[0]); close(sp[1]); close(sq[0]); close(sq[1]);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

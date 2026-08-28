@@ -15,13 +15,19 @@
  * behind its own NAT weirdness; two independent agreeing views is Core's
  * own "score >= 2" shape for locals learned this way).
  *
- * WHAT WE ANNOUNCE: one legacy `addr` entry -- time(4) services(8) ip(16,
- * IPv4-mapped) port(2 BE) -- with OUR services (NETWORK|WITNESS, the same
- * word the version message advertises) and the CONFIGURED listen port, not
- * a constant: this box's Core owns 8333, we listen on 8332, and
+ * WHAT WE ANNOUNCE: one address entry with OUR services (NETWORK|WITNESS,
+ * the same word the version message advertises) and the CONFIGURED listen
+ * port, not a constant: this box's Core owns 8333, we listen on 8332, and
  * advertising 8333 sends every prospective peer to the wrong daemon.
  * Announced to every live leg when first learned and re-announced every
  * 24h (Core's own cadence); peers gossip it onward. Gated on listen=1.
+ *
+ * ENCODING follows each leg's handshake (2026-08-28): a peer that sent
+ * `sendaddrv2` before verack gets a BIP155 `addrv2` entry -- time(4)
+ * services(CompactSize) net(1)=IPv4 len(1)=4 ip(4) port(2 BE) -- and every
+ * other peer the legacy `addr` entry -- time(4) services(8) ip(16,
+ * IPv4-mapped) port(2 BE). That is Core's MaybeSendAddr: it never sends v1
+ * to a peer that asked for v2.
  */
 #include <stdio.h>
 #include "log_ts.h"
@@ -95,18 +101,42 @@ long addrself_build(u8 out[64], long now){
     return p - out;
 }
 
+/* The BIP155 `addrv2` form of the same announcement (14 bytes for an IPv4
+ * entry with a one-byte services CompactSize). Exposed for the test. */
+long addrself_build_v2(u8 out[64], long now){
+    u8* p = out;
+    *p++ = 1;                                        /* count */
+    u32 t = (u32)now;
+    for (int i = 0; i < 4; i++) *p++ = (u8)(t >> (8*i));
+    u64 sv = ASELF_SERVICES;                         /* services as CompactSize */
+    if (sv < 0xfd) *p++ = (u8)sv;
+    else if (sv <= 0xffff){ *p++ = 0xfd; *p++ = (u8)sv; *p++ = (u8)(sv >> 8); }
+    else if (sv <= 0xffffffffULL){ *p++ = 0xfe; for (int i = 0; i < 4; i++) *p++ = (u8)(sv >> (8*i)); }
+    else { *p++ = 0xff; for (int i = 0; i < 8; i++) *p++ = (u8)(sv >> (8*i)); }
+    *p++ = 1;                                        /* network id: IPv4 */
+    *p++ = 4;                                        /* address length */
+    memcpy(p, g_ip, 4); p += 4;
+    *p++ = (u8)(g_port >> 8); *p++ = (u8)(g_port & 0xff);  /* port, BE */
+    return p - out;
+}
+
 /* Announce to every live leg when confident and due (first time, then every
- * 24h). Cheap no-op otherwise; called once per worker rotation. */
-long addrself_maybe_announce(const int* fds, int nfds){
+ * 24h). Cheap no-op otherwise; called once per worker rotation. wants_v2[i]
+ * is that leg's handshake verdict (1 = it sent sendaddrv2); NULL = all v1. */
+long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds){
     if (!g_enabled || !g_confident) return 0;
     long now = (long)time(NULL);
     if (g_last_announce && now - g_last_announce < ASELF_PERIOD_S) return 0;
-    u8 msg[64];
+    u8 msg[64], msg2[64];
     long n = addrself_build(msg, now);
+    long n2 = addrself_build_v2(msg2, now);
     long sent = 0;
     for (int i = 0; i < nfds; i++){
         if (fds[i] < 0) continue;
-        if (p2p_write(fds[i], "addr", 4, msg, (unsigned)n) > 0) sent++;
+        int v2 = wants_v2 && wants_v2[i];
+        long w = v2 ? p2p_write(fds[i], "addrv2", 6, msg2, (unsigned)n2)
+                    : p2p_write(fds[i], "addr",   4, msg,  (unsigned)n);
+        if (w > 0) sent++;
     }
     if (sent){
         g_last_announce = now;
