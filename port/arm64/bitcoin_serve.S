@@ -95,6 +95,8 @@ s_cnt:       .zero 8
 s_ptr:       .zero 8
 s_nf:        .zero 8                    /* notfound entries accumulated for THIS getdata */
 s_p:         .zero 8
+s_addrsent:  .zero 1        /* getaddr answered once per conn (Core: m_getaddr_recvd) */
+s_abound:    .zero 8        /* getaddr loop bound in MEMORY (was clobbered in rdx) */
 s_n:         .zero 8
 s_served:    .zero 8
 s_tip:       .zero 8
@@ -114,6 +116,7 @@ s_myfee:     .quad 1000               /* our min-relay-feerate (sat/kB) */
 	.section .rodata
 cn_pong:   .ascii "pong\0"
 cn_addr:   .ascii "addr\0"
+cn_addrv2: .ascii "addrv2\0"
 cn_block:  .ascii "block\0"
 cn_head:   .ascii "headers\0"
 cn_inv:    .ascii "inv\0"
@@ -313,6 +316,8 @@ node_serve_loop:
 	str  xzr, [x9]
 	LOADADDR x9, s_feesent
 	strb wzr, [x9]
+	LOADADDR x9, s_addrsent
+	strb wzr, [x9]        /* getaddr answered once per conn (Core: m_getaddr_recvd) */
 	ldr  w9, [x21, #24]               /* tip height = st[24] */
 	LOADADDR x10, s_lasttip
 	str  x9, [x10]
@@ -389,14 +394,19 @@ node_serve_loop:
 	movk w24, #0x6362, lsl #16        /* "bloc" */
 	cmp  w23, w24
 	b.eq .do_block
-	mov  w24, #0x6e65
-	movk w24, #0x6465, lsl #16        /* "send" */
+	mov  w24, #0x6573
+	movk w24, #0x646e, lsl #16        /* "send" (0x646e6573) */
 	cmp  w23, w24
 	b.eq .maybe_sendcmpct
 	mov  w24, #0x6566
 	movk w24, #0x6665, lsl #16        /* "feef" */
 	cmp  w23, w24
 	b.eq .maybe_feefilter
+	mov  w24, #0x7477
+	movk w24, #0x6978, lsl #16        /* "wtxi" (wtxidrelay) -- handshake-only;
+	                                     after verack Core disconnects */
+	cmp  w23, w24
+	b.eq .done
 	b    .next
 
 .do_verack:
@@ -604,43 +614,75 @@ node_serve_loop:
 	movk w10, #0x0072, lsl #16        /* "ddr\0" */
 	cmp  w9, w10
 	b.ne .next
+	/* Core answers getaddr ONCE per connection (m_getaddr_recvd) */
+	LOADADDR x9, s_addrsent
+	ldrb w9, [x9]
+	cbnz w9, .next
+	LOADADDR x9, s_addrsent
+	mov  w10, #1
+	strb w10, [x9]
+	/* open + count the address book */
 	LOADADDR x0, amr_ab
 	bl   amr_init
-	cbz  x0, .next
+	cmp  x0, #1
+	b.ne .next                        /* amr_init returns 1 or -1; only 1 opens */
 	LOADADDR x0, amr_ab
 	bl   amr_count
-	mov  x9, x0                       /* n */
-	cmp  x9, #1000
-	b.ls 5f
-	mov  x9, #1000
-5:	mov  x10, #0                      /* have */
-	mov  x11, #0                      /* i */
-.LSV_aloop:
-	cmp  x11, x9
-	b.hs .LSV_adone
+	cmp  x0, #0
+	b.le .LGA_close                   /* empty book: Core sends nothing either */
+	cmp  x0, #1000                    /* MAX_ADDR_TO_SEND = size of src_buf/ah_buf */
+	b.ls .LGA_bound
+	mov  x0, #1000
+.LGA_bound:
+	LOADADDR x9, s_abound
+	str  x0, [x9]                     /* bound live in MEMORY (never clobbered) */
+	LOADADDR x9, s_p
+	str  xzr, [x9]                    /* have = 0 */
+	LOADADDR x9, s_cnt
+	str  xzr, [x9]                    /* i = 0 */
+.LGA_aloop:
+	LOADADDR x9, s_abound
+	ldr  x9, [x9]
+	LOADADDR x10, s_cnt
+	ldr  x10, [x10]                   /* i */
+	cmp  x10, x9
+	b.hs .LGA_adone
 	LOADADDR x0, amr_ab
-	mov  x1, x11
-	/* dst = src_buf + have*18 */
-	mov  x2, x10
+	mov  x1, x10                      /* i */
+	LOADADDR x9, s_p
+	ldr  x9, [x9]                     /* have */
+	mov  x2, x9
 	mov  x3, #18
 	mul  x2, x2, x3
-	LOADADDR x3, src_buf
-	add  x2, x3, x2
-	str  x10, [sp, #0]                /* save have */
-	str  x11, [sp, #8]                /* save i */
+	LOADADDR x9, src_buf
+	add  x2, x9, x2                   /* dst = src_buf + have*18 */
 	bl   amr_get_i
-	ldr  x10, [sp, #0]
-	ldr  x11, [sp, #8]
+	/* amr_get_i clobbered scratch; reload counters from memory */
+	LOADADDR x9, s_p
+	ldr  x9, [x9]                     /* have */
+	LOADADDR x10, s_cnt
+	ldr  x10, [x10]                   /* i */
 	cmp  x0, #1
-	b.ne 6f
-	add  x10, x10, #1                 /* have++ */
-6:	add  x11, x11, #1
-	b    .LSV_aloop
-.LSV_adone:
-	cbz  x10, .next
+	b.ne .LGA_nocopy
+	add  x9, x9, #1                   /* have++ */
+	LOADADDR x11, s_p
+	str  x9, [x11]
+.LGA_nocopy:
+	add  x10, x10, #1                 /* i++ */
+	LOADADDR x11, s_cnt
+	str  x10, [x11]
+	b    .LGA_aloop
+.LGA_adone:
+	LOADADDR x9, s_p
+	ldr  x9, [x9]
+	cbz  x9, .LGA_close
+	/* BIP155: addrv2 if the peer asked in handshake, else legacy addr */
+	LOADADDR x10, g_peer_wants_addrv2
+	ldr  x10, [x10]
+	cbnz x10, .LGA_v2
 	LOADADDR x0, ah_buf
 	LOADADDR x1, src_buf
-	mov  x2, x10
+	mov  x2, x9
 	bl   p2p_addr_v1
 	mov  x4, x0                       /* payload len */
 	mov  x0, x19
@@ -648,6 +690,23 @@ node_serve_loop:
 	mov  x2, #4
 	LOADADDR x3, ah_buf
 	bl   p2p_write
+	b    .LGA_close
+.LGA_v2:
+	LOADADDR x0, ah_buf
+	LOADADDR x1, src_buf
+	mov  x2, x9
+	bl   p2p_addr_v2
+	mov  x4, x0
+	mov  x0, x19
+	LOADADDR x1, cn_addrv2
+	mov  x2, #6
+	LOADADDR x3, ah_buf
+	bl   p2p_write
+.LGA_close:
+	LOADADDR x9, amr_ab
+	ldr  x0, [x9]                     /* book fd (one open per getaddr) */
+	mov  x8, #57                      /* close */
+	svc  #0
 	b    .next
 
 .maybe_getdata:
@@ -1249,6 +1308,8 @@ node_serve_loop:
 	ldrb w9, [x9, #4]
 	cmp  w9, #'h'
 	b.eq .do_sendheaders
+	cmp  w9, #'a'
+	b.eq .done            /* "sendaddrv2" after verack: handshake-only; Core disconnects */
 	cmp  w9, #'c'
 	b.ne .next
 	LOADADDR x9, s_cmd

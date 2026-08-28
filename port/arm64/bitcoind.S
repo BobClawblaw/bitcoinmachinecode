@@ -184,6 +184,14 @@ node_handshake:
 	bl   p2p_write
 	cmp  x0, #24
 	b.lt .NHfail
+	/* BIP339: advertise wtxid relay after version, before verack (x86 parity) */
+	mov  x0, x19
+	adrp x1, _wtxidrelay
+	add  x1, x1, :lo12:_wtxidrelay
+	mov  x2, #10
+	mov  x3, #0
+	mov  x4, #0
+	bl   p2p_write
 .LNHread:
 	mov  x0, x19
 	add  x1, sp, #160                /* cmd */
@@ -394,6 +402,14 @@ node_accept_handshake:
 	bl   p2p_write
 	cmp  x0, #24
 	b.lt .LAHfail
+	/* BIP339: advertise wtxid relay after version, before verack (x86 parity) */
+	mov  x0, x19
+	adrp x1, _wtxidrelay
+	add  x1, x1, :lo12:_wtxidrelay
+	mov  x2, #10
+	mov  x3, #0
+	mov  x4, #0
+	bl   p2p_write
 	/* BIP155 offer: if peer proto >= 70016, send sendaddrv2 before verack
 	 * (mirrors bitcoind.asm node_accept_handshake) */
 	ldr  w10, [sp, #192]

@@ -81,6 +81,10 @@ cmpct_diffs: test_bip152_arm test_addrmgr_arm
 	./test_bip152_arm
 	./test_addrmgr_arm
 
+# BIP155 addrv2 end-to-end + address codec (vs Core's serialize bytes)
+addrv2_diffs:
+	@bash addrv2_diffs.sh
+
 # all consensus twin differentials (asm vs C oracle): bip143, strip_witness,
 # checksig, tapagg, txv_dispatch, taproot_verify, wv0_drv, svs_drv, multisig
 consensus_diffs:

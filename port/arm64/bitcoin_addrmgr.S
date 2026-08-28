@@ -201,8 +201,12 @@ amr_lookup:
 	.size amr_lookup, .-amr_lookup
 
 /* p2p_addr_v1(out, src, n) -> bytes written
- *   addr v1: count varint(1B) then n x 30B [time u32][services u64]
- *   [ip16 v4-mapped at 12..15][port u16 BE] */
+ *   Legacy `addr` payload: CompactSize count then n x 30B records
+ *   [time u32][services u64][ip16(IPv4-mapped ::ffff:a.b.c.d)][port u16 BE].
+ *   Matches merged main 2026-08-28: proper CompactSize count AND the
+ *   ::ffff: marker (before, IPv4 was written at 12..15 -> classified IPv6,
+ *   and count was a single byte while callers pass up to 1000). Reference:
+ *   Core test_framework/messages.py CAddress. */
 p2p_addr_v1:
 	stp  x19, x20, [sp, #-16]!
 	stp  x21, x22, [sp, #-16]!
@@ -210,36 +214,128 @@ p2p_addr_v1:
 	mov  x19, x0                 /* out */
 	mov  x20, x1                 /* src */
 	mov  x21, x2                 /* n */
-	strb w21, [x19]              /* count varint (1-byte, <=252 assumed) */
-	mov  x22, #1                 /* cursor */
+	mov  x0, x19
+	mov  x1, x21
+	bl   amr_put_csize           /* count as CompactSize */
+	mov  x22, x0                 /* cursor */
 	mov  x23, #0                 /* i */
-.Pav_loop:
+.Pav1_loop:
 	cmp  x23, x21
-	b.ge .Pav_done
+	b.ge .Pav1_done
 	mov  x9, #18
 	mul  x9, x23, x9
 	add  x11, x20, x9            /* src rec */
-	add  x10, x19, x22           /* dest */
-	ldr  w12, [x11, #14]         /* time = last_seen */
-	str  w12, [x10]
+	add  x10, x19, x22           /* dst */
+	ldr  w12, [x11, #14]         /* time */
+	str  w12, [x10]              /* 0..3 */
 	ldr  x12, [x11, #6]          /* services */
-	str  x12, [x10, #4]
-	ldr  w12, [x11]              /* ip */
-	str  w12, [x10, #12]
+	str  x12, [x10, #4]          /* 4..11 */
+	str  xzr, [x10, #12]         /* 12..19 zero */
+	str  wzr, [x10, #20]         /* 20..21 zero */
+	mov  w12, #0xffff
+	strh w12, [x10, #22]         /* 22..23 = 0xffff (IPv4-mapped) */
+	ldr  w12, [x11]              /* a.b.c.d */
+	str  w12, [x10, #24]         /* 24..27 */
 	ldrh w12, [x11, #4]          /* port BE */
-	strh w12, [x10, #28]
-	str  xzr, [x10, #16]         /* zero v6 padding 16..23 */
-	str  wzr, [x10, #24]         /* zero 24..27 (4B only: don't clobber port @28) */
+	strh w12, [x10, #28]         /* 28..29 */
 	add  x22, x22, #30
 	add  x23, x23, #1
-	b    .Pav_loop
-.Pav_done:
+	b    .Pav1_loop
+.Pav1_done:
 	mov  x0, x22
 	ldp  x23, x30, [sp], #16
 	ldp  x21, x22, [sp], #16
 	ldp  x19, x20, [sp], #16
 	ret
 	.size p2p_addr_v1, .-p2p_addr_v1
+
+/* amr_put_csize(dst x0, value x1) -> x0 = bytes written (1/3/5/9)
+ *   Bitcoin CompactSize. Leaf, no stack, clobbers x0,x1,x2 only. */
+amr_put_csize:
+	cmp  x1, #0xfd
+	b.lo 1f
+	cmp  x1, #0x10000
+	b.hs 2f
+	mov  w2, #0xfd
+	strb w2, [x0]
+	strh w1, [x0, #1]
+	mov  x0, #3
+	ret
+1:
+	strb w1, [x0]
+	mov  x0, #1
+	ret
+2:
+	mov  x3, #0x100000000
+	cmp  x1, x3
+	b.hs 3f
+	mov  w2, #0xfe
+	strb w2, [x0]
+	str  w1, [x0, #1]
+	mov  x0, #5
+	ret
+3:
+	mov  w2, #0xff
+	strb w2, [x0]
+	str  x1, [x0, #1]
+	mov  x0, #9
+	ret
+
+/* p2p_addr_v2(out, src, n) -> bytes written
+ *   BIP155 addrv2 payload: CompactSize count then per record
+ *   [time u32][services CompactSize][net id=1 IPv4][addr len=4][a.b.c.d]
+ *   [port u16 BE]. Same 18-byte amr records as v1; book holds IPv4 only.
+ *   Reference: Core test_framework/messages.py CAddress.serialize_v2. */
+	.global p2p_addr_v2
+	.type p2p_addr_v2, %function
+p2p_addr_v2:
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
+	stp  x23, x30, [sp, #-16]!
+	mov  x19, x0                 /* out */
+	mov  x20, x1                 /* src */
+	mov  x21, x2                 /* n */
+	mov  x0, x19
+	mov  x1, x21
+	bl   amr_put_csize           /* count varint */
+	mov  x22, x0                 /* cursor */
+	mov  x23, #0                 /* i */
+.Pav2_loop:
+	cmp  x23, x21
+	b.ge .Pav2_done
+	mov  x9, #18
+	mul  x9, x23, x9
+	add  x11, x20, x9            /* src rec */
+	/* time u32 */
+	add  x10, x19, x22
+	ldr  w12, [x11, #14]
+	str  w12, [x10]
+	add  x22, x22, #4
+	/* services -> CompactSize */
+	add  x0, x19, x22
+	ldr  x1, [x11, #6]
+	bl   amr_put_csize
+	add  x22, x22, x0
+	/* netid=1, addrlen=4, a.b.c.d, port BE */
+	add  x10, x19, x22
+	mov  w12, #1
+	strb w12, [x10]
+	mov  w12, #4
+	strb w12, [x10, #1]
+	ldr  w12, [x11]
+	str  w12, [x10, #2]
+	ldrh w12, [x11, #4]
+	strh w12, [x10, #6]
+	add  x22, x22, #8
+	add  x23, x23, #1
+	b    .Pav2_loop
+.Pav2_done:
+	mov  x0, x22
+	ldp  x23, x30, [sp], #16
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ret
+	.size p2p_addr_v2, .-p2p_addr_v2
 
 /* p2p_addr_count(pl, plen) -> #entries / -1 : parse leading CompactSize,
  *   reject if payload can't hold count*30 records. */
