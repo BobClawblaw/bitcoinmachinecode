@@ -155,7 +155,7 @@ def build_driver(d):
                'sha256.S','sha512.S','ripemd160.S','bitcoin_hash.S',
                'secp256k1_point.S','secp256k1_fe.S','secp256k1_scalar.S']
     here = os.path.dirname(os.path.abspath(__file__))
-    cmd = ['gcc', '-O2', '-o', os.path.join(d, 'b32_driver'), drv] + \
+    cmd = ['gcc', '-O2', '-march=armv8.2-a+sha2', '-o', os.path.join(d, 'b32_driver'), drv] + \
           [os.path.join(here, s) for s in srclist]
     if subprocess.run(cmd).returncode != 0:
         sys.exit('driver build failed: ' + ' '.join(cmd))

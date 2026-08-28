@@ -21,6 +21,16 @@ and runs natively.
 ## Status
 - [x] sha256  -> port/arm64/sha256.S      FIPS-180-4 harness PASS native; 882-case
       differential fuzz vs hashlib: 0 fail.   (2026-08-24)
+      + ARMv8 SHA2 crypto-extension acceleration 2026-08-28: sha256.S now also
+      carries sha256_block_shani (CRYPTOGAMS ARMv8 SHA2 core) and sha256_block
+      lazily probes ID_AA64ISAR0_EL1.SHA2 and tail-calls it when present
+      (scalar remains the portable fallback) -- mirroring x86's SHA-NI path.
+      Differential-verified sha256_block_shani == scalar on 2,000,000 random
+      (state,block) pairs + full edge sweep; test_sha256 KAT + fuzz_sha256
+      (hashlib) + the whole taproot suite re-verified on the dispatched path.
+      BENCH: sha256_block 4.40M -> 34.66M blk/s = 7.88x; sha256_full ~2.1 GB/s.
+      Compile sha256.S with -march=armv8.2-a+sha2 (Makefile CARCH /
+      build_daemon.sh / self-contained fuzz drivers updated).
 - [x] sha1    -> port/arm64/sha1.S        FIPS vectors + 270-case fuzz vs hashlib: 0.
       (found + fixed halfword-swapped round constants via fuzz)
 - [x] sha512  -> port/arm64/sha512.S      repo harness ALL PASS + 301-case fuzz: 0.

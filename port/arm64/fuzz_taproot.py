@@ -436,7 +436,8 @@ def build_driver(drv):
         src = os.path.join(PORT, m + ".S")
         if not os.path.exists(src):
             src = os.path.join(REPO, "asm", m + ".c")
-        r = subprocess.run(["gcc","-c","-O2","-I",os.path.join(REPO,"asm"),
+        r = subprocess.run(["gcc","-c","-O2","-march=armv8.2-a+sha2",
+                            "-I",os.path.join(REPO,"asm"),
                             "-o",o,src])
         if r.returncode: raise SystemExit("compile failed: " + m)
         objs.append(o)

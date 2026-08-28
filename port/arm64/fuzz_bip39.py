@@ -150,7 +150,7 @@ def build_driver(d):
     with open(drv, 'w') as f:
         f.write(DRIVER)
     srclist = ['bitcoin_bip39.S', 'sha256.S', 'bitcoin_hmac.S', 'sha512.S']
-    cmd = ['gcc', '-O2', '-I', HERE, '-o', os.path.join(d, 'b39_driver'), drv] + \
+    cmd = ['gcc', '-O2', '-march=armv8.2-a+sha2', '-I', HERE, '-o', os.path.join(d, 'b39_driver'), drv] + \
           [os.path.join(HERE, s) for s in srclist]
     r = subprocess.run(cmd)
     if r.returncode != 0:

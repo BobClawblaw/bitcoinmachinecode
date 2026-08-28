@@ -17,7 +17,7 @@ for m in $DAEMONOBJS; do
     elif [ -f "../../asm/$m.c" ]; then src="../../asm/$m.c";
     else echo "NO SOURCE for $m" >> "$LOG"; FAIL=1; continue; fi
     if [ ! -f "$m.o" ] || [ "$src" -nt "$m.o" ]; then
-        gcc -no-pie -O2 -I../../asm -I../../asm/daemon -c "$src" -o "$m.o" >>"$LOG" 2>&1 \
+        gcc -no-pie -O2 -march=armv8.2-a+sha2 -I../../asm -I../../asm/daemon -c "$src" -o "$m.o" >>"$LOG" 2>&1 \
           || { echo "OBJECT FAIL $m" >> "$LOG"; FAIL=1; }
     fi
 done

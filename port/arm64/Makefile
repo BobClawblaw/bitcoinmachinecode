@@ -14,8 +14,11 @@ MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bit
 all: test-all
 
 # one object + one shared lib per module
+# -march=armv8.2-a+sha2: sha256.S's crypto-extension block (SHA256H/SU0/SU1)
+# needs the SHA2 ISA; harmless for the other modules.
+CARCH := -march=armv8.2-a+sha2
 %.o: %.S
-	$(CC) -c -o $@ $<
+	$(CC) $(CARCH) -c -o $@ $<
 
 so: $(patsubst %,%.so,$(MODULES))
 
