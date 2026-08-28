@@ -347,6 +347,30 @@ long node_config_load(const char* path){
             t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.acceptnonstdtxn=t;applied++;} }
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
+        /* ---- anonymity networks (2026-08-28) ---- */
+        else if(!strcmp(key,"proxy")){        /* Core -proxy=ip:port        */
+            snprintf(g_cfg.proxy,sizeof g_cfg.proxy,"%s",val); applied++; }
+        else if(!strcmp(key,"onion")){        /* Core -onion=ip:port        */
+            snprintf(g_cfg.onion_proxy,sizeof g_cfg.onion_proxy,"%s",val); applied++; }
+        else if(!strcmp(key,"torcontrol")){   /* Core -torcontrol=ip:port   */
+            snprintf(g_cfg.torcontrol,sizeof g_cfg.torcontrol,"%s",val); applied++; }
+        else if(!strcmp(key,"torpassword")){
+            snprintf(g_cfg.torpassword,sizeof g_cfg.torpassword,"%s",val); applied++; }
+        else if(!strcmp(key,"listenonion")){
+            g_cfg.listenonion = iv?1:0; applied++; }
+        else if(!strcmp(key,"i2psam")){       /* Core -i2psam=ip:port       */
+            snprintf(g_cfg.i2psam,sizeof g_cfg.i2psam,"%s",val); applied++; }
+        else if(!strcmp(key,"i2pacceptincoming")){
+            g_cfg.i2pacceptincoming = iv?1:0; applied++; }
+        else if(!strcmp(key,"cjdnsreachable")){
+            g_cfg.cjdnsreachable = iv?1:0; applied++; }
+        else if(!strcmp(key,"proxyrandomize")){
+            g_cfg.proxyrandomize = iv?1:0; applied++; }
+        else if(!strcmp(key,"onlynet")){      /* Core -onlynet, repeatable  */
+            if(g_cfg.n_onlynet < 6){
+                snprintf(g_cfg.onlynet[g_cfg.n_onlynet],8,"%s",val);
+                g_cfg.n_onlynet++; applied++;
+            } else fprintf(stderr,"[config] onlynet: at most 6 networks\n"); }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
         else if(!strcmp(key,"prune")){
