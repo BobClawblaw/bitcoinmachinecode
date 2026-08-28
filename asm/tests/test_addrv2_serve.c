@@ -16,6 +16,9 @@
  *   5. OUTBOUND role (node_handshake): we offer sendaddrv2 to a 70016 peer
  *      once its version arrives, withhold it from a 70015 peer, and record
  *      the peer's own sendaddrv2 in g_peer_wants_addrv2.
+ *   6. A sendaddrv2 or wtxidrelay arriving AFTER verack is a protocol
+ *      violation (both are handshake-only); Core disconnects, and so does
+ *      the serve loop -- the connection closes instead of being ignored.
  */
 #include <stdio.h>
 #include <string.h>
@@ -255,6 +258,31 @@ int main(void){
     cki("g_peer_wants_addrv2 reset to 0 for a peer that did not ask", wants, 0);
     seen = outbound_case(70016, 0, &wants);
     ck("70016 peer that stays silent: offered, not recorded", (seen & 2) == 2 && wants == 0);
+
+    printf("\n== 7. sendaddrv2 / wtxidrelay AFTER verack: disconnect, as Core does ==\n");
+    book3();
+    for (int which = 0; which < 2; which++){
+        const char* late = which ? "wtxidrelay" : "sendaddrv2";
+        pid_t sp = spawn_server();
+        int fdE = raw_client(70016, 0, &off, &wt);
+        p2p_write(fdE, late, 10, "", 0);
+        unsigned char nonce[8] = {1,1,2,3,5,8,13,21};
+        p2p_write(fdE, "ping", 4, nonce, 8);
+        r = p2p_read(fdE, cmd, buf, sizeof buf, &bl);
+        char l[96]; snprintf(l, sizeof l, "late %s: connection closed (no pong, read <= 0)", late);
+        ck(l, r <= 0);
+        /* the serve child must LEAVE its loop on its own; bounded wait so a
+         * loop that keeps serving (the pre-2026-08-28 behaviour) fails here
+         * instead of hanging the harness */
+        int st = 0, exited = 0;
+        for (int w = 0; w < 30 && !exited; w++){ if (waitpid(sp, &st, WNOHANG) == sp) exited = 1; else usleep(100000); }
+        if (!exited){ kill(sp, 9); waitpid(sp, 0, 0); }
+        snprintf(l, sizeof l, "late %s: serve child left its loop on its own (exit 0)", late);
+        ck(l, exited && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        close(fdE);
+    }
+    /* and the same two messages BEFORE verack are, of course, fine: section
+     * 3 already proved sendaddrv2 there; wtxidrelay is what section 1 saw */
 
     close(g_ls);
     printf(failures ? "\nFAILURES %d\n" : "\nALL TESTS PASSED (0 failures)\n", failures);
