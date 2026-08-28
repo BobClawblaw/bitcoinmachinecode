@@ -56,25 +56,25 @@
 	b.eq .Lr2\@
 	cmp  w9, #0xfe
 	b.eq .Lr4\@
-	/* 0xff -> 8-byte */
+	/* 0xff -> 8-byte (value = p[1..8]; #1 skips the 0xff discriminator) */
 	add  x10, x26, #9
 	cmp  x10, x27
 	b.hi \fail
-	ldr  x9, [x26]
+	ldr  x9, [x26, #1]
 	add  x26, x26, #9
 	b    .Lrdone\@
 .Lr4\@:
 	add  x10, x26, #5
 	cmp  x10, x27
 	b.hi \fail
-	ldr  w9, [x26]
+	ldr  w9, [x26, #1]
 	add  x26, x26, #5
 	b    .Lrdone\@
 .Lr2\@:
 	add  x10, x26, #3
 	cmp  x10, x27
 	b.hi \fail
-	ldrh w9, [x26]
+	ldrh w9, [x26, #1]
 	add  x26, x26, #3
 	b    .Lrdone\@
 .Lr1\@:

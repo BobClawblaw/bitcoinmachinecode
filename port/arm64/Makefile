@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness bitcoind bitcoin_serve bitcoin_scriptverify_drv bitcoin_witness_v0_drv bitcoin_store_ext bitcoin_sighash_all_ext
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness bitcoind bitcoin_serve bitcoin_scriptverify_drv bitcoin_witness_v0_drv bitcoin_store_ext bitcoin_sighash_all_ext bitcoin_txv_parse bitcoin_txv_classify bitcoin_segwit_classify bitcoin_txv_pools
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -26,6 +26,30 @@ so: $(patsubst %,%.so,$(MODULES))
 	$(CC) -shared -fPIC -o $@ $<
 bitcoin_hash.so: bitcoin_hash.S sha256.S
 	$(CC) -shared -fPIC -o $@ bitcoin_hash.S sha256.S
+
+# block-decode/classify twin differentials (asm vs C tx_verify.c txv_parse)
+TXVC := $(addprefix ../../asm/,bitcoin_taproot_sighash.c bitcoin_pow_rules.c \
+        daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
+        daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c \
+        bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c)
+TXVO := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.o \
+        bitcoin_chainwork.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_cons.o \
+        bitcoin_p2p.o bitcoin_net.o bitcoin_mempool.o bitcoin_utxo_lsm.o \
+        utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o \
+        bitcoin_headers.o bitcoin_interp.o bitcoin_scriptcodec.o \
+        bitcoin_script_flags.o bitcoin_sighash.o bitcoin_script.o \
+        bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o \
+        secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
+        secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o \
+        ripemd160.o bitcoin_addr.o sha1.o bitcoin_utxo_stats.o \
+        bitcoin_muhash.o bitcoin_txv_pools.o
+test_%_diff_asm: $(ASMDIR)/tests/test_%_diff.c bitcoin_%.o $(TXVC) $(TXVO)
+	@$(CC) -no-pie -O2 -I$(ASMDIR)/tests -I$(ASMDIR) -I$(ASMDIR)/daemon \
+	  -o $@ $< bitcoin_$*.o $(TXVC) $(TXVO) -lpthread
+txv_diffs: test_txv_parse_diff_asm test_txv_classify_diff_asm test_segwit_classify_diff_asm
+	./test_txv_parse_diff_asm
+	./test_txv_classify_diff_asm
+	./test_segwit_classify_diff_asm
 
 # repo C harness -> native test binary
 test_sha256: sha256.o $(ASMDIR)/tests/test_sha256.c

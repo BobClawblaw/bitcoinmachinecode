@@ -355,8 +355,27 @@ and runs natively.
       boundary/oversize, branch, merkle root depth 0..7 + count-ignored,
       tweak parity rc 1/2 + invalid lifts). `make fuzz_taproot`.
       (2026-08-28)
+- [x] bitcoin_txv_parse / bitcoin_txv_classify / bitcoin_segwit_classify /
+      bitcoin_txv_pools (block decode + $ classify twin of tx_verify.c's C)
+      -> port/arm64/*.S. ARM-native differential vs the C oracle 2026-08-28:
+      repo harnesses (asm twin vs C txv_test_parse/txvb_classify/
+      sv_classify_segwit) BUILT on ARM for the first time (x86-only before,
+      same gap as bip341). `make txv_diffs`.
+      * test_txv_classify_diff    288 / 0 mismatch
+      * test_segwit_classify_diff 21,729 / 0
+      * test_txv_parse_diff       synthetic 1019 / 0, PLUS real mainnet
+        block 800000 (3721 txs + per-97th truncation fuzz = 24,891 cases) / 0
+      FOUND + FIXED a REAL ARM bug while wiring it up: the RDCS wide-varint
+      loads in bitcoin_txv_parse.S read the 0xfd/0xfe/0xff DISCRIMINATOR byte
+      as the low byte of the length ([x26] instead of [x26,#1]) -> any tx
+      with a multi-byte length field parsed a garbage (huge) length and
+      rejected VALID txs as "truncated" (failing shapes 4/6 = big_varint;
+      299 mismatches pre-fix -> 0 post-fix). Same class as the documented
+      parse_varint width-dispatch pitfall -- a recurring failure mode in this
+      port; audited: RDCS advance counts were already correct, only the
+      loads were off-by-one.
 - [ ] Remaining leaf modules (idx, idxscan, mempool, serve, cli, cmpct,
-      headers, net addrmgr, node_log, txv_, witness_v0, multisig,
+      headers, net addrmgr, node_log, witness_v0, multisig,
       utxo_stats, ...)
 
 ## Notes
