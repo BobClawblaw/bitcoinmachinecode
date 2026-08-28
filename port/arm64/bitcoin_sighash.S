@@ -38,8 +38,19 @@
 	cmp  \rd, x16
 	.endm
 
-	.section .bss
+/* TLS Initial-Exec address of a .tbss symbol into d (clobbers x10). x86
+ * parity: the scriptCode scratch below is PER-THREAD; the threaded verify
+ * workers must each get their own buffer or they race on the shared one. */
+	.macro TLS_ADDR d, sym
+	adrp \d, :gottprel:\sym
+	ldr  \d, [\d, #:gottprel_lo12:\sym]
+	mrs  x10, tpidr_el0
+	add  \d, \d, x10
+	.endm
+
+	.section .tbss,"awT",@nobits
 	.balign 16
+	.global ls_scfbuf
 ls_scfbuf:
 	.space 20000
 	.text
@@ -566,7 +577,7 @@ legacy_locate_nout:
 		b    .ls_done
 	.ls_no_single_check:
 		/* ---- codeseparator-strip scriptCode into scratch buffer ---- */
-		LAddr x0, ls_scfbuf
+		TLS_ADDR x0, ls_scfbuf     /* per-thread (parallel verify: no sharing) */
 		str  x0, [x28, #208]          /* scfbuf_addr */
 		mov  x1, #20000
 		ldr  x2, [x28, #32]           /* scriptCode */
