@@ -7,6 +7,41 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-28 -- the closing pass, and why it takes the daemon down
+
+The long filter backfill was launched with a FIXED target (964000, the tip
+at the time). The tip moves ~6/hour, so on completion the index sits ~500
+short, the adopt gate (144) correctly declines, and the whole multi-hour
+run sits on disk unused. validation/bfi_closing_pass.sh waits for the
+running builder, then does the short second pass to the current tip.
+
+It stops the daemon to do it, which is worth explaining because the
+opposite was said earlier in this session and was wrong.
+
+Adoption itself needs no restart -- the tail probes per connected block.
+But the builder and the daemon's tail BOTH append to bfilters.dat/.idx and
+there is no lock between them: bfi_open takes none. The 144 gate is the
+only thing keeping them apart, and the closing pass is precisely the
+operation that walks the index ACROSS that gate while writing. A block
+connecting while the gap is between 0 and 144 makes the daemon adopt
+mid-build, and two processes then append to the same files. The window is
+roughly 15s of a ~1min pass against ~600s block spacing -- call it 2.5%
+per pass -- and the cost of losing is a corrupt index and a full rebuild.
+Any SECOND pass is far worse, because the gap starts inside the threshold.
+
+So: build with the daemon down, then start it and let it adopt cleanly.
+Downtime is dominated by the UTXO reload (~4min), not the build (~1min).
+
+Guards, all three exercised live before arming:
+  - refuses if another build_block_filters is running against the datadir
+  - refuses if the log already shows ADOPTED (never write files the daemon
+    owns)
+  - refuses if the remaining gap exceeds MAX_GAP=5000, which would mean
+    hours of downtime and means the first backfill died early
+It also declines to build at all when the gap is already <=144, and warns
+if systemd had to SIGKILL the daemon (checkpoint may lag; the ghost guard
+handles it on boot, but it should be visible).
+
 ## 2026-08-28 -- the filter index adopt gate judged the wrong height
 
 The blockfilter index is adopted LAZILY: while the offline backfill is far
