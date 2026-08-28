@@ -780,6 +780,18 @@ long tx_accept_block_connect(void* mp_area, const unsigned char* block,
  * A strong definition anywhere in the link overrides this one. */
 __attribute__((weak)) long serve_idx_topup(void){ return 0; }
 
+/* WEAK defaults for the serve-path callbacks that live outside this file, so
+ * targets linking bitcoin_serve.o without daemon/main.c or
+ * daemon/serve_cfilters.c still resolve them. A strong definition anywhere
+ * in the link wins. */
+__attribute__((weak)) long serve_height_of_hash(const unsigned char hash[32]){
+    (void)hash; return -1;
+}
+__attribute__((weak)) int serve_cfilters(int fd, int kind,
+                                         const unsigned char* pl, unsigned long plen){
+    (void)fd; (void)kind; (void)pl; (void)plen; return 0;
+}
+
 /* log_block_stored_inbound(hash32, height, bytes): called from
  * bitcoin_serve.asm's .do_block, the ONLY place a peer-pushed block
  * (unsolicited, or in response to our own .do_inv-triggered getdata) is

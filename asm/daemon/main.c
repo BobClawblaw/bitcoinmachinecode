@@ -274,6 +274,17 @@ static int build_hash_index(void){
     return 0;
 }
 
+/* serve_height_of_hash -- the height for a block hash, from the serve path's
+ * own hash index. Behind daemon/serve_cfilters.c, which needs to turn a
+ * BIP157 request's stop_hash into a height and has no business reaching into
+ * ht_idx itself. Returns -1 when the hash is unknown. */
+long serve_height_of_hash(const unsigned char hash[32]){
+    if (!ht_idx) return -1;
+    long h = 0;
+    if (idx_get(ht_idx, hash, &h) != 1) return -1;
+    return h;
+}
+
 /* serve_idx_topup -- fold every height index.dat has gained since this
  * process last looked into the serve path's hash index.
  *
