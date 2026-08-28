@@ -709,10 +709,17 @@ Missing:
   per-method state.
 - ~~**Descriptor wallets**~~ — **`importdescriptors` is REAL** since the
   wallet-management merge; watch-only descriptors are tracked and rescanned.
-  Still refused: `createwalletdescriptor` and `addhdkey`, which would have to
-  ADOPT foreign key material this single-seed wallet has no path for.
-- ~~**Watch-only wallets**~~ — watch-only descriptors are supported;
-  `exportwatchonlywallet` still refuses (same import-path reason).
+  *(This paragraph claimed `createwalletdescriptor` and `addhdkey` were
+  "still refused" until 2026-08-28, when all three methods below were probed
+  against the LIVE node and answered. Both had closed on 08-27; the summary
+  block above said so while this line did not. Stale in the same direction as
+  the `assumevalid` log string — see "How this list is checked".)*
+  `addhdkey` is REAL (a second HD key the wallet can actually spend);
+  `createwalletdescriptor` answers Core's own verdict for the type this
+  wallet has and refuses the other three with a specific reason.
+- ~~**Watch-only wallets**~~ — watch-only descriptors are supported, and
+  `exportwatchonlywallet` is REAL (closed 2026-08-27; this line claimed it
+  still refused until 2026-08-28).
 - ~~**Multi-wallet**~~ — **REAL**: `createwallet`, `loadwallet`,
   `unloadwallet`, `restorewallet` and `listwallets` all work; the lifecycle
   is exercised end-to-end in `tests/test_rpc_wallet_ops`. This was described

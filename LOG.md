@@ -7,6 +7,90 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-28 -- the closing pass, and why it takes the daemon down
+
+The long filter backfill was launched with a FIXED target (964000, the tip
+at the time). The tip moves ~6/hour, so on completion the index sits ~500
+short, the adopt gate (144) correctly declines, and the whole multi-hour
+run sits on disk unused. validation/bfi_closing_pass.sh waits for the
+running builder, then does the short second pass to the current tip.
+
+It stops the daemon to do it, which is worth explaining because the
+opposite was said earlier in this session and was wrong.
+
+Adoption itself needs no restart -- the tail probes per connected block.
+But the builder and the daemon's tail BOTH append to bfilters.dat/.idx and
+there is no lock between them: bfi_open takes none. The 144 gate is the
+only thing keeping them apart, and the closing pass is precisely the
+operation that walks the index ACROSS that gate while writing. A block
+connecting while the gap is between 0 and 144 makes the daemon adopt
+mid-build, and two processes then append to the same files. The window is
+roughly 15s of a ~1min pass against ~600s block spacing -- call it 2.5%
+per pass -- and the cost of losing is a corrupt index and a full rebuild.
+Any SECOND pass is far worse, because the gap starts inside the threshold.
+
+So: build with the daemon down, then start it and let it adopt cleanly.
+Downtime is dominated by the UTXO reload (~4min), not the build (~1min).
+
+Guards, all three exercised live before arming:
+  - refuses if another build_block_filters is running against the datadir
+  - refuses if the log already shows ADOPTED (never write files the daemon
+    owns)
+  - refuses if the remaining gap exceeds MAX_GAP=5000, which would mean
+    hours of downtime and means the first backfill died early
+It also declines to build at all when the gap is already <=144, and warns
+if systemd had to SIGKILL the daemon (checkpoint may lag; the ghost guard
+handles it on boot, but it should be visible).
+
+## 2026-08-28 -- the filter index adopt gate judged the wrong height
+
+The blockfilter index is adopted LAZILY: while the offline backfill is far
+behind, the daemon leaves the files alone; once the remaining gap fits the
+undo retention window it adopts, closes the gap from undo data and owns the
+files from then on. The gate was
+
+    if (h - n > BFI_ADOPT_GAP)          /* h = the block being connected */
+
+and h is NOT the tip. The daemon connects a catch-up burst by looping h from
+last_seen_tip+1, so on a boot with no UTXO state that loop starts at h=1
+while the store is already at the real tip. For a partially built index of n
+records, h - n then goes NEGATIVE and the gate adopts at an arbitrarily
+large REAL gap.
+
+Not corrupting -- the append is guarded by `g_n == h` so an out-of-order
+block writes nothing, and a gap close that outruns the undo window closes
+the index rather than storing a wrong filter. But "closes the index" is
+exactly the wrong outcome for an unattended overnight backfill: the run
+completes and the daemon never picks it up until build_block_filters is
+re-run. The sibling tails already read the tip from the store header
+(addr_index_tail.c:258, tx_index_tail.c:188); bfilter_index.c was the only
+one that did not.
+
+FOUND BY ACCIDENT, which is the point worth recording. A new regtest proof
+of the adoption path happened to run its builder while the daemon was still
+draining its first 272-block burst, and logged
+
+    [bfilter] ADOPTED at 73 records (tip 1) -- closing the gap from undo data
+
+The "(tip 1)" was the tell. Chasing it turned a test-sequencing annoyance
+into a real defect.
+
+PROOF, two scripts, both differential against a real Core with
+blockfilterindex=1:
+  validation/bfi_adopt_regtest_e2e.sh -- declines past 144, adopts within
+    144, closes the gap from undo, keeps up, and every sampled filter is
+    byte-identical to Core across all three provenances (backfilled,
+    gap-closed, live-appended). 13/13.
+  validation/bfi_burst_regression.sh -- deterministic repro of the defect:
+    build a partial index, drop the UTXO state, reboot so the whole chain
+    replays as one burst with h < n. Against the OLD binary it adopts at
+    "tip 1" with a real gap of 300; against the fixed one it declines and
+    reports "index at 201, tip 500".
+
+Also corrected: adopting needs NO daemon restart and no downtime -- the
+probe runs per connected block. An earlier note in this log implying a stop
+was required was wrong.
+
 ## 2026-08-27 (evening) -- package relay closed, end to end
 
 Five parts, one theme: a transaction whose fee only makes sense alongside a
