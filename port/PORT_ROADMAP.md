@@ -300,7 +300,22 @@ and runs natively.
       the adds/adcs mod-n reduction). Reproducible standalone:
       `python3 port/arm64/fuzz_bip32.py` (self-contained gcc-from-.S driver).
       (2026-08-28)
-- [ ] Remaining leaf modules (bip39/bip143/bip341, keys, addr*,
+- [x] bitcoin_bip39 (BIP39 mnemonic <-> entropy/seed: bip39_generate /
+      bip39_validate / bip39_mnemonic_to_entropy / bip39_mnemonic_to_seed)
+      -> port/arm64/bitcoin_bip39.S (deps sha256_full + hmac_sha512 + sha512).
+      Repo harness test_bip39 (24 official vectors + TREZOR passphrase seeds +
+      positive/negative corruption cases) PASSES natively (it had NOT been
+      built/run on ARM before -- the port Makefile had no target). NEW
+      independent differential fuzz (port/arm64/fuzz_bip39.py, a self-contained
+      gcc-from-.S driver) vs a pure-Python BIP39 oracle (11-bit group codec +
+      SHA-256 checksum + PBKDF2-HMAC-SHA512 c=2048 via hashlib; wordlist parsed
+      from the same bip39_words.S.inc so both index identical words) over
+      random entropy of ALL legal sizes (128..256), valid + corrupted
+      (bad-checksum / unknown-word / wrong-count / shuffled) mnemonics, and
+      random empty/non-empty passphrases: 38,400 cases across 8 seeds,
+      0 fail (byte-exact mnemonic, entropy, rc, 64-byte seed). `make fuzz_bip39`.
+      (2026-08-28)
+- [ ] Remaining leaf modules (bip143/bip341, keys, addr*,
       idx, idxscan, mempool, serve, cli, cmpct, headers,
       net addrmgr, node_log, txv_, witness_v0, ...)
 

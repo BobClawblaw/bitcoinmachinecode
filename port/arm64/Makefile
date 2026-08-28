@@ -110,6 +110,9 @@ t_lsm: t_lsm.c bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o ../../asm/
 	@$(CC) $(CFLAGS) -o $@ t_lsm.c bitcoin_utxo_lsm.o bitcoin_utxo_store.o bitcoin_utxo.o ../../asm/utxo_lsm_mm.c sha256.o
 fuzz_lsm: t_lsm
 	python3 fuzz_lsm.py 1 800
+# independent pure-Python BIP39 differential fuzz (self-contained gcc-from-.S)
+fuzz_bip39:
+	python3 fuzz_bip39.py 8 1200
 t_undo_asm: t_undo.c bitcoin_undo.o
 	@$(CC) $(CFLAGS) -o $@ $+
 # LSM-backed UTXO-set builder (daemon/build_utxo.c -> our ported utxo_lsm store).
