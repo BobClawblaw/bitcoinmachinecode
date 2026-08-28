@@ -41,6 +41,7 @@
  */
 #include <string.h>
 #include <stdio.h>
+#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include <stdlib.h>
 #include <poll.h>
 #include <time.h>
@@ -465,11 +466,10 @@ static void txr_orphan_expire(void){
  * cannot fill the book. Per address, as in Core: a message that declares
  * more entries than the bucket holds is processed up to the budget and the
  * rest is dropped (the parser takes a record limit).
- * The book is opened lazily, once, in this (single-threaded) worker; the
- * replenish path opens its own handle in the same process, and the serve
- * children only read. */
+ * The book (daemon/addrbook.c, peers2.dat) is owned by daemon/addr_ingest.c
+ * in this single-threaded worker; the serve children and the RPC parent
+ * open it read-only. */
 extern long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit);
-extern int  amr_init(void* ab);
 extern long p2p_addr_count(const void* pl, long plen);
 /* weak default: targets that link tx_relay.c without daemon/addr_ingest.c
  * (a strong definition anywhere in the link wins) */
@@ -480,8 +480,6 @@ __attribute__((weak)) long addr_ingest_msg_n(void* ab, const char* cmd, const un
 #define TXR_ADDR_RATE_PER_S   0.1        /* Core MAX_ADDR_RATE_PER_SECOND */
 #define TXR_ADDR_LEGS         64
 static struct { int fd; double tokens; long long t_ms; } txr_addr_bucket[TXR_ADDR_LEGS];
-static unsigned char txr_ab[64];
-static int  txr_ab_state;                /* 0 unopened, 1 open, -1 failed */
 long txr_addr_gossip_added, txr_addr_gossip_msgs, txr_addr_gossip_limited;
 
 /* number of entries a payload declares (v1: 30-byte records; v2: CompactSize
@@ -520,9 +518,7 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     if (budget > n) budget = n;
     else txr_addr_gossip_limited += n - budget;         /* the tail Core would drop too */
     *tk -= (double)budget;
-    if (txr_ab_state == 0) txr_ab_state = (amr_init(txr_ab) == 1) ? 1 : -1;
-    if (txr_ab_state < 0) return 0;
-    long added = addr_ingest_msg_n(txr_ab, cmd, pl, (long)plen, budget);
+    long added = addr_ingest_msg_n(NULL, cmd, pl, (long)plen, budget);
     txr_addr_gossip_msgs++;
     if (added > 0) txr_addr_gossip_added += added;
     return added;

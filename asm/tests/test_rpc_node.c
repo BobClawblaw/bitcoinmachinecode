@@ -151,13 +151,17 @@ static void* fake_worker(void* arg){
 /* Fake address book: two 18-byte records in the on-disk layout of
  * bitcoin_addrmgr.asm -- ip u32 LE, port u16 BE, services u64 LE at [6],
  * last_seen u32 LE at [14]. */
-static const unsigned char FAKE_AB[2][18] = {
-  { 0x4c,0x9c,0x0e,0x0b,  0x20,0x8d,  0x09,0x04,0,0,0,0,0,0,  0,0,0,0 },
-  { 0x01,0x02,0x03,0x04,  0x20,0x8d,  0x0d,0x00,0,0,0,0,0,0,  0,0,0,0 }
-};
-static long fake_ab_count(void* ab){ (void)ab; return 2; }
-static int fake_ab_get_i(void* ab, long i, unsigned char* out){
-    (void)ab; if (i < 0 || i > 1) return 0; memcpy(out, FAKE_AB[i], 18); return 1; }
+#include "../daemon/addrbook.h"
+static ab2_rec_t FAKE_AB[3];
+static void fake_ab_init(void){
+    bmc_addr_from_string_port(&FAKE_AB[0].a, "76.156.14.11:8333", 0); FAKE_AB[0].services = 0x409; FAKE_AB[0].last_seen = 1700000000u;
+    bmc_addr_from_string_port(&FAKE_AB[1].a, "1.2.3.4:8333", 0);      FAKE_AB[1].services = 13;    FAKE_AB[1].last_seen = 1700000001u;
+    bmc_addr_from_string_port(&FAKE_AB[2].a, "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333", 0);
+    FAKE_AB[2].services = 9; FAKE_AB[2].last_seen = 1700000002u;
+}
+static long fake_ab_count(void* ab){ (void)ab; return 3; }
+static int fake_ab_get_i(void* ab, long i, ab2_rec_t* out){
+    (void)ab; if (i < 0 || i > 2) return 0; *out = FAKE_AB[i]; return 1; }
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
@@ -736,13 +740,13 @@ int main(void){
          !strcmp(S(rj_obj_get(r,"ipv4"),"total"), "0"));
       rj_free(r); }
 
-    rpc_node_set_addrbook((void*)FAKE_AB, fake_ab_count, fake_ab_get_i);
+    fake_ab_init(); rpc_node_set_addrbook((void*)FAKE_AB, fake_ab_count, fake_ab_get_i);
 
     { /* Core's default count is 1 -> exactly one address, not the whole book */
       r = NULL; rc = rpc_node_dispatch("getnodeaddresses", NULL, &r, &ec, &em);
       ck("getnodeaddresses default count == 1", rc == 1 && r && r->nitems == 1);
       { rj_val* a0 = (r && r->nitems) ? r->items[0] : 0;
-        ck("address decoded from the u32 LE ip field",
+        ck("address printed from the v2 record",
            a0 && S(a0,"address") && !strcmp(S(a0,"address"), "76.156.14.11"));
         ck("port decoded big-endian (8333)",
            a0 && S(a0,"port") && !strcmp(S(a0,"port"), "8333"));
@@ -755,13 +759,15 @@ int main(void){
 
     { const char* j = "[0]"; rj_val* p = rj_parse(j, strlen(j));
       r = NULL; rc = rpc_node_dispatch("getnodeaddresses", p, &r, &ec, &em);
-      ck("getnodeaddresses 0 -> the whole book", rc == 1 && r && r->nitems == 2);
+      ck("getnodeaddresses 0 -> the whole book (3)", rc == 1 && r && r->nitems == 3);
       rj_free(r); rj_free(p); }
 
     { const char* j = "[0,\"onion\"]"; rj_val* p = rj_parse(j, strlen(j));
       r = NULL; rc = rpc_node_dispatch("getnodeaddresses", p, &r, &ec, &em);
-      ck("network filter the book cannot serve -> empty, not relabelled ipv4",
-         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 0);
+      ck("network filter onion -> exactly the onion entry",
+         rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1
+         && S(r->items[0],"network") && !strcmp(S(r->items[0],"network"), "onion")
+         && S(r->items[0],"address") && !strcmp(S(r->items[0],"address"), "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"));
       rj_free(r); rj_free(p); }
 
     { r = NULL; rc = rpc_node_dispatch("getaddrmaninfo", NULL, &r, &ec, &em);
@@ -777,10 +783,12 @@ int main(void){
       ck("getaddrmaninfo has Core's six networks x {new,tried,total}", shaped);
       ck("ipv4 total == book count", r && rj_obj_get(r,"ipv4") &&
          !strcmp(S(rj_obj_get(r,"ipv4"),"total"), "2"));
-      ck("ipv6 total == 0 (the book is v4-only)", r && rj_obj_get(r,"ipv6") &&
+      ck("ipv6 total == 0 (none in the book)", r && rj_obj_get(r,"ipv6") &&
          !strcmp(S(rj_obj_get(r,"ipv6"),"total"), "0"));
-      ck("all_networks total == book count", r && rj_obj_get(r,"all_networks") &&
-         !strcmp(S(rj_obj_get(r,"all_networks"),"total"), "2"));
+      ck("onion total == 1 (per-network counts are real)", r && rj_obj_get(r,"onion") &&
+         !strcmp(S(rj_obj_get(r,"onion"),"total"), "1"));
+      ck("all_networks total == book count (3)", r && rj_obj_get(r,"all_networks") &&
+         !strcmp(S(rj_obj_get(r,"all_networks"),"total"), "3"));
       rj_free(r); }
 
     { r = NULL; rc = rpc_node_dispatch("listbanned", NULL, &r, &ec, &em);

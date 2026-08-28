@@ -74,6 +74,18 @@ typedef struct {
     char zmq_rawblock[64];
     char zmq_rawtx[64];
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
+    /* ---- anonymity networks (2026-08-28). Core's names and defaults. ---- */
+    char proxy[64];              /* -proxy=ip:port   SOCKS5 for every network that has no more specific proxy */
+    char onion_proxy[64];        /* -onion=ip:port   SOCKS5 for .onion (default: proxy) */
+    char torcontrol[64];         /* -torcontrol=ip:port (default 127.0.0.1:9051) */
+    char torpassword[128];       /* -torpassword (else cookie auth) */
+    int  listenonion;            /* -listenonion: create an onion service (default 1 when torcontrol is reachable) */
+    char i2psam[64];             /* -i2psam=ip:port  SAM bridge; empty = i2p disabled */
+    int  i2pacceptincoming;      /* -i2pacceptincoming (default 1) */
+    int  cjdnsreachable;         /* -cjdnsreachable */
+    int  proxyrandomize;         /* -proxyrandomize (default 1): per-connection SOCKS5 credentials */
+    char onlynet[6][8];          /* -onlynet (repeatable); empty list = all networks */
+    int  n_onlynet;
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */

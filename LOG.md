@@ -7,6 +7,144 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-28 -- every network a peer can live on: the address model, phase 1
+
+FEATURE_GAPS has said "Tor / I2P / onion support -- zero hits" since the
+first survey, and until today the node's entire idea of an address was one
+IPv4 in a u32. This is the first of four phases towards Tor, I2P and CJDNS
+(then SOCKS5 to a local tor, SAM 3.1 to a local i2pd, IPv6 + fc00::/8 with
+a locally built cjdroute); it makes the node able to STORE, PARSE, PRINT
+and RELAY an address of any BIP155 network, which every transport needs
+first.
+
+THE ADDRESS TYPE (daemon/netaddr.c): net id + raw bytes + port, with Core's
+string forms. Two primitives the tree did not have: SHA3-256 (Keccak-f[1600],
+bitcoin_sha3.c) because a Tor v3 onion name carries a checksum
+SHA3-256(".onion checksum" || pubkey || 3)[0..1] that Core verifies on parse,
+and RFC 4648 base32 (base32.c; not bech32, which has its own charset).
+Both are pinned to NIST / RFC vectors AND to Core's own example addresses
+from p2p_addrv2_relay.py: the 35 raw bytes of pg6mm...scryd.onion decode
+and re-encode exactly, and its checksum computes to the 21 47 inside them.
+The addrv2 and legacy record codecs decode Core's five-network msg_addrv2
+(ipv4, ipv6, torv3, i2p, cjdns; generated with Core's messages.py) and
+re-encode it byte-exact.
+
+THE BOOK, VERSION 2 (daemon/addrbook.c, peers2.dat): 48-byte records for
+any network, dedup by (net, addr, port) as addrman does, an in-memory hash
+index, eviction of the oldest entry at 65,536, and a ONE-TIME migration of
+the legacy 18-byte IPv4 peers.dat on first open (the live book: 6,622
+entries, 3 ms; the old file is left untouched). Everything that touched the
+old book now goes through it: ingest (all networks, quotas keyed by a
+per-network group), the getaddr reply (now in C, daemon/serve_addr.c, called
+from the asm serve loop: addrv2 with every network to a BIP155 peer, legacy
+addr with only ipv4/ipv6 to anyone else -- Core's IsAddrCompatible), the
+seeds, the dial pool (IPv4 only until the transports land: a Tor address in
+the pool would be a dial the node cannot make), and the RPCs --
+getnodeaddresses with a REAL network filter, getaddrmaninfo with real
+per-network counts, getpeerinfo's network from the peer's address, and a new
+addpeeraddress (Core's RPC, over the worker's control channel because the
+worker is the book's only writer).
+
+PROOF against a real Core: our book planted with three IPv4s, Core's example
+onion and i2p addresses and a CJDNS address; Core (with -proxy, -i2psam and
+-cjdnsreachable so it considers those networks reachable -- it drops
+addresses of networks it cannot reach, ProcessAddrs) dials us, sends
+getaddr, logs `received: addrv2 (149 bytes)` -- its own serializer's size
+for those six records -- and its getnodeaddresses then lists each one under
+Core's own network filter: onion, i2p, cjdns. addpeeraddress: success/error
+shape identical to Core's, and the planted address reaches Core on its next
+getaddr. 37 checks, 0 failures.
+
+Also fixed on the way, because a log line was pointed at: six daemon files
+(tx_relay.c, zmq_notify.c, zmq_pub.c, wallet_enc_state.c, chainparams.c,
+and the new addrbook.c) wrote to stderr without the timestamp wrapper every
+other daemon line uses; "[txrelay] addrv2 gossip" was the one that showed.
+
+PHASES 2 AND 3, SAME DAY: THE TRANSPORTS, AND THE NODE SPEAKS BITCOIN OVER
+TOR. daemon/socks5.c (RFC 1928/1929, byte-for-byte Core's netbase.cpp
+Socks5: greeting, optional user/pass subnegotiation, CONNECT with ATYP
+DOMAINNAME so tor resolves the .onion and we never do a DNS lookup for
+one), daemon/torcontrol.c (PROTOCOLINFO -> cookie AUTHENTICATE -> ADD_ONION
+NEW:ED25519-V3, the key persisted in onion_v3_private_key exactly as Core
+names it, the returned ServiceID validated as a real v3 onion before it is
+announced), daemon/i2psam.c (SAM 3.1: HELLO, SESSION CREATE STYLE=STREAM
+with Core's parameters, STREAM CONNECT/ACCEPT, each stream its OWN socket;
+.b32.i2p = base32(sha256(destination)) in I2P's base64 alphabet), and
+daemon/dialer.c, which is the one place that decides HOW to reach a peer:
+onion through SOCKS5 with per-connection credentials for stream isolation
+(Core's -proxyrandomize), i2p through the SAM session, IPv4 direct or
+through -proxy, and IPv6/CJDNS REFUSED with the true reason ("needs an
+IPv6 socket") rather than a timeout. outbound_connect routes by network and
+the dial pool now admits every network the transports can actually reach,
+so an address we cannot dial stays in the book and is still served to peers
+but never wastes a dial. Core's config keys: -proxy -onion -torcontrol
+-torpassword -listenonion -i2psam -i2pacceptincoming -cjdnsreachable
+-proxyrandomize -onlynet.
+
+PROOF, all against real daemons on this box, nothing mocked:
+  - validation/tor_regtest_e2e.sh: Bitcoin Core runs on regtest behind its
+    OWN onion service (its -listenonion through the real tor). Our node is
+    given the .onion in its book, dials it through SOCKS5, completes the
+    Bitcoin handshake, and CORE reports it: network "onion", subver
+    /BitcoinMachineCode:0.0.1/, version >= 70016, bytes received over the
+    circuit.
+  - validation/i2p_regtest_e2e.sh: the daemon brings up its own SAM session
+    at boot, reports and persists its own .b32.i2p, accepts an i2p address
+    at port 0 (its canonical form) into the book, serves it as network=i2p,
+    and a node WITHOUT -i2psam refuses the same peer instead of hanging.
+  - a real remote I2P stream: STREAM CONNECT to stats.i2p answered
+    "HTTP/1.1 403 Denied" in 4s -- a genuine HTTP reply from a genuine
+    remote destination, carried both ways through the router.
+  - tests/test_socks5, tests/test_torcontrol, tests/test_i2psam: fake
+    servers that RECORD the wire bytes, so the formats are pinned to Core's
+    (greeting 05 01 00; ADD_ONION NEW:ED25519-V3 Port=<chain default>,...;
+    SESSION CREATE ... SIGNATURE_TYPE=7 i2cp.leaseSetEncType=4,0), with the
+    I2P destination and its b32 in tests/i2p_vec.h taken from the REAL
+    router so the base64 alphabet and the b32 derivation are checked
+    against its own answer.
+
+TWO ENVIRONMENT LESSONS, recorded because they cost real time. The packaged
+i2pd (2.49.0) segfaulted 66 times in 45 minutes and never built a tunnel;
+2.61.0 built from source has crashed zero times, and the difference is the
+whole reason the I2P work is provable at all. And this box is behind a
+symmetric NAT, so it cannot publish its own leaseset: a SELF-connect over
+I2P always returns CANT_REACH_PEER "LeaseSet not found", which reads
+exactly like a client bug and is not one -- connect to a real remote
+instead.
+
+PHASE 4, SAME DAY: IPv6 SOCKETS AND CJDNS. A CJDNS address IS an fc00::/8
+IPv6 address on a tun interface, so there was no way to "do cjdns without
+ipv6" -- the socket layer had to grow a v6 half first. daemon/net6.c is it:
+tcp_connect_ip6 (same fail-fast receive bound tcp_connect_ip sets) and
+lsock6, deliberately IPV6_V6ONLY because a dual-stack wildcard listener also
+answers IPv4 on the same port and would collide with the node's own IPv4
+listener, which is bound separately. serve_mux now polls BOTH listeners and
+names an inbound peer by its real network, so a cjdns peer can reach us as
+well as be reached. The dialer routes ipv6/cjdns to the new socket, gates
+cjdns on -cjdnsreachable exactly as Core does (Core cannot detect a cjdns
+interface either), and reports "no IPv6 stack on this host" when there is
+none instead of pretending.
+
+PROOF (validation/cjdns_regtest_e2e.sh), against a REAL cjdns router built
+from source and running with its tun up: Bitcoin Core binds its regtest P2P
+port to our fc00::/8 address, this node dials it over the tun, and Core
+reports the peer as network "cjdns", subver /BitcoinMachineCode:0.0.1/,
+version >= 70016, bytes received. The negative is checked too: without
+-cjdnsreachable the same peer never enters the dial pool.
+
+A defect the cjdns test found in the phase-2/3 wiring, before it could
+matter in production: THE DIAL POOL DROPPED THE PORT. dl_pool_from_book
+emitted only the host, so every dial went to the chain's default port --
+right for most mainnet peers and wrong for everyone else, and invisible
+until a peer on a non-default port had to be reached. The pool now carries
+host:port ([v6]:port for IPv6/CJDNS) and outbound_connect honours it.
+
+THE HOST'S IPv6 WAS DELIBERATELY OFF (/etc/sysctl.d/99-disable-ipv6.conf).
+It was enabled at RUNTIME ONLY -- that file is untouched, so a reboot
+restores the original policy -- and cjdroute's UDP transport was pinned to
+loopback so this local test router listens on no public interface. Its
+connectTo is empty: it peers with nobody.
+
 ## 2026-08-28 -- addrv2 negotiation, and the getaddr reply that had never worked
 
 The intent was one gap from FEATURE_GAPS: "addrv2 (BIP155) is parsed but

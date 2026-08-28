@@ -147,7 +147,9 @@ static int cmd_getpeerinfo(rj_val** res){
             rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
             rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
             rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));
-            rj_obj_set(o, "network", rj_str("ipv4"));
+            { bmc_addr_t pa; const char* nn = "ipv4";
+              if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
+              rj_obj_set(o, "network", rj_str(nn)); }
             rj_arr_push(arr, o);
         }
     }
@@ -170,13 +172,31 @@ static int cmd_getpeerinfo(rj_val** res){
  * legs and is the only thing that may touch them. Each reports what it
  * actually did, so a no-op (no such peer, already banned) becomes Core's
  * error rather than a success that changed nothing. */
+/* ---- the address book, version 2 (2026-08-28): every BIP155 network.
+ * Injected as pointers (no-link-fanout, as before), now with the v2 record
+ * shape. rpc_node_set_addrbook_dir opens the real book read-only and
+ * re-reads it per call (the download worker is the writer). */
+#include "daemon/netaddr.h"
+#include "daemon/addrbook.h"
 static long (*g_ab_count)(void*);
-static int  (*g_ab_get_i)(void*, long, unsigned char*);
+static int  (*g_ab_get)(void*, long, ab2_rec_t*);
 static void* g_ab;
+static char  g_ab_dir[512];
 
 void rpc_node_set_addrbook(void* ab, long (*count)(void*),
-                           int (*get_i)(void*, long, unsigned char*)){
-    g_ab = ab; g_ab_count = count; g_ab_get_i = get_i;
+                           int (*get)(void*, long, ab2_rec_t*)){
+    g_ab = ab; g_ab_count = count; g_ab_get = get;
+}
+static long real_ab_count(void* b){ ab2_refresh((ab2_t*)b); return ab2_count((ab2_t*)b); }
+static int  real_ab_get(void* b, long i, ab2_rec_t* r){ return ab2_get((const ab2_t*)b, i, r); }
+void rpc_node_set_addrbook_dir(const char* dir){
+    snprintf(g_ab_dir, sizeof g_ab_dir, "%s", dir);
+    ab2_t* b = ab2_open(dir, 0);
+    if (b) rpc_node_set_addrbook(b, real_ab_count, real_ab_get);
+}
+/* the book may not exist yet at boot (created by the worker's first add) */
+static void ab_late_open(void){
+    if (!g_ab && g_ab_dir[0]){ ab2_t* b = ab2_open(g_ab_dir, 0); if (b) rpc_node_set_addrbook(b, real_ab_count, real_ab_get); }
 }
 
 static int cmd_getnettotals(rj_val** res){
@@ -211,7 +231,7 @@ static int cmd_getnettotals(rj_val** res){
 /* getnodeaddresses ( count "network" ) -- straight out of the persistent
  * address book. Core's default count is 1 (meaning 1% of known addresses,
  * capped at 2500); 0 means "all". */
-static int cmd_getnodeaddresses(const rj_val* params, rj_val** res){
+static int cmd_getnodeaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
     long want = 1;
     const char* net = NULL;
     if (params && params->typ == RJ_ARR){
@@ -221,47 +241,51 @@ static int cmd_getnodeaddresses(const rj_val* params, rj_val** res){
             net = params->items[1]->str;
     }
     rj_val* arr = rj_arr();
-    /* The book stores IPv4 only, so a filter for any other network is
-     * honestly empty rather than IPv4 rows relabelled. */
-    if (net && strcmp(net, "ipv4")){ *res = arr; return 1; }
-    if (g_ab && g_ab_count && g_ab_get_i){
+    int want_net = -1;
+    if (net){
+        want_net = bmc_net_from_name(net);
+        /* Core raises on a name it does not know rather than answering an
+         * empty list, which would read as "we have none of those" */
+        if (want_net < 0){ rj_free(arr); *ec = -8; *em = "Network not recognized: Cannot decode network"; return 0; }
+    }
+    if (want < 0){ rj_free(arr); *ec = -8; *em = "Address count out of range"; return 0; }
+    ab_late_open();
+    if (g_ab && g_ab_count && g_ab_get){
         long n = g_ab_count(g_ab);
         long cap = (want <= 0) ? n : want;
         if (cap > 2500) cap = 2500;
         for (long i = 0; i < n && (long)arr->nitems < cap; i++){
-            unsigned char r[18];
-            if (g_ab_get_i(g_ab, i, r) != 1) continue;
-            unsigned ip = (unsigned)r[0] | ((unsigned)r[1]<<8) | ((unsigned)r[2]<<16) | ((unsigned)r[3]<<24);
-            unsigned port = ((unsigned)r[4]<<8) | (unsigned)r[5];      /* stored BE */
-            unsigned long long svc = 0; for (int b=0;b<8;b++) svc |= (unsigned long long)r[6+b] << (8*b);
-            unsigned lastseen = (unsigned)r[14] | ((unsigned)r[15]<<8) | ((unsigned)r[16]<<16) | ((unsigned)r[17]<<24);
+            ab2_rec_t r;
+            if (g_ab_get(g_ab, i, &r) != 1) continue;
+            if (want_net >= 0 && r.a.net != want_net) continue;
             rj_val* e = rj_obj();
-            rj_obj_set(e, "time", rj_numf("%u", lastseen));
-            rj_obj_set(e, "services", rj_numf("%llu", svc));
-            { char a[24]; snprintf(a, sizeof a, "%u.%u.%u.%u",
-                                   ip & 0xff, (ip>>8)&0xff, (ip>>16)&0xff, (ip>>24)&0xff);
-              rj_obj_set(e, "address", rj_str(a)); }
-            rj_obj_set(e, "port", rj_numf("%u", port));
-            rj_obj_set(e, "network", rj_str("ipv4"));   /* the book stores v4 only */
+            rj_obj_set(e, "time", rj_numf("%u", r.last_seen));
+            rj_obj_set(e, "services", rj_numf("%llu", r.services));
+            { char a[96]; bmc_addr_to_string(a, sizeof a, &r.a); rj_obj_set(e, "address", rj_str(a)); }
+            rj_obj_set(e, "port", rj_numf("%u", r.a.port));
+            rj_obj_set(e, "network", rj_str(bmc_net_name(r.a.net)));
             rj_arr_push(arr, e);
         }
     }
     *res = arr;
     return 1;
 }
-
 /* getaddrmaninfo -- Core reports new/tried/total per network. This node's
  * address book has no new/tried distinction (one flat table), so every
  * record counts as `tried` (they are addresses we have recorded, and the
  * book is fed by successful contact) and `new` is 0. Stated here and in the
  * parity docs rather than split arbitrarily. */
 static int cmd_getaddrmaninfo(rj_val** res){
+    ab_late_open();
     long n = (g_ab && g_ab_count) ? g_ab_count(g_ab) : 0;
+    long per[7] = {0};
+    if (g_ab && g_ab_get) for (long i = 0; i < n; i++){ ab2_rec_t r; if (g_ab_get(g_ab, i, &r) == 1 && r.a.net < 7) per[r.a.net]++; }
     rj_val* o = rj_obj();
     static const char* nets[] = { "ipv4", "ipv6", "onion", "i2p", "cjdns" };
-    for (int i = 0; i < 5; i++){
+    static const int   netid[] = { BMC_NET_IPV4, BMC_NET_IPV6, BMC_NET_TORV3, BMC_NET_I2P, BMC_NET_CJDNS };
+    for (int i = 0; i < 5; i++) {
         rj_val* e = rj_obj();
-        long v = (i == 0) ? n : 0;      /* the book is IPv4-only */
+        long v = per[netid[i]];
         rj_obj_set(e, "new", rj_numf("%d", 0));
         rj_obj_set(e, "tried", rj_numf("%ld", v));
         rj_obj_set(e, "total", rj_numf("%ld", v));
@@ -596,6 +620,32 @@ static int cmd_addnode(const rj_val* params, rj_val** res, long* ec, const char*
     return 1;
 }
 
+/* addpeeraddress "address" port ( tried ) -- Core's test/ops hook that
+ * inserts one address into the address manager. Goes over the control
+ * channel because the download worker is the book's only writer (2026-08-28:
+ * the version-2 book accepts any BIP155 network, so this is also how an
+ * operator seeds an onion/i2p/cjdns peer by hand). Core's result shape:
+ * {success: bool, error?: "failed-adding-to-new"}. */
+static int cmd_addpeeraddress(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const char* addr = (params && params->typ == RJ_ARR && params->nitems >= 1 &&
+                        params->items[0]->typ == RJ_STR) ? params->items[0]->str : NULL;
+    long port = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                 params->items[1]->typ == RJ_NUM) ? atol(params->items[1]->str) : -1;
+    int tried = (params && params->typ == RJ_ARR && params->nitems >= 3 &&
+                 params->items[2]->typ == RJ_BOOL) ? (params->items[2]->str[0] == '1') : 0;
+    if (!addr || port < 0){ *ec = -8; *em = "addpeeraddress requires an address and a port"; return 0; }
+    if (port > 65535){ *ec = -8; *em = "Invalid port"; return 0; }
+    bmc_addr_t a;
+    if (!bmc_addr_from_string(&a, addr)){ *ec = -8; *em = "Invalid address"; return 0; }
+    char hp[128]; a.port = (unsigned short)port; bmc_addr_to_string_port(hp, sizeof hp, &a);
+    int r = 0;
+    if (!ctl_send(RPC_CTL_ADDPEERADDRESS, hp, tried, ec, em, &r)) return 0;
+    rj_val* o = rj_obj();
+    if (r != 1) rj_obj_set(o, "error", rj_str(tried ? "failed-adding-to-tried" : "failed-adding-to-new"));
+    rj_obj_set(o, "success", rj_bool(r == 1));
+    *res = o;
+    return 1;
+}
 static int cmd_disconnectnode(const rj_val* params, rj_val** res, long* ec, const char** em){
     const char* addr = NULL; long long nodeid = -1;
     if (params && params->typ == RJ_ARR){
@@ -1802,7 +1852,7 @@ static const char* const NODE_METHODS[] = {
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
-    "clearbanned", "getaddednodeinfo", "addnode", "disconnectnode",
+    "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
@@ -1844,7 +1894,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
             "is no parent-to-worker channel for a targeted block request, so "
             "this call would change nothing", ec, em);
     if (!strcmp(m, "getnettotals"))       return cmd_getnettotals(res);
-    if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res);
+    if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res, ec, em);
     if (!strcmp(m, "getaddrmaninfo"))     return cmd_getaddrmaninfo(res);
     if (!strcmp(m, "listbanned"))         return cmd_listbanned(res);
     if (!strcmp(m, "getaddednodeinfo")){
@@ -1854,6 +1904,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     }
     if (!strcmp(m, "clearbanned"))        return cmd_clearbanned(res, ec, em);
     if (!strcmp(m, "addnode"))            return cmd_addnode(params, res, ec, em);
+    if (!strcmp(m, "addpeeraddress"))     return cmd_addpeeraddress(params, res, ec, em);
     if (!strcmp(m, "disconnectnode"))     return cmd_disconnectnode(params, res, ec, em);
     if (!strcmp(m, "setban"))             return cmd_setban(params, res, ec, em);
     if (!strcmp(m, "setnetworkactive"))   return cmd_setnetworkactive(params, res, ec, em);
