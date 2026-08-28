@@ -233,3 +233,87 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
     snprintf(mnemonic_out, cap, "%s", mnemonic_plain);
     return 0;
 }
+
+/* ==== generic encrypted secret blob ======================================
+ * addhdkey stores extra BIP32 extended PRIVATE keys, and they must be
+ * protected exactly as the mnemonic is -- an xprv sitting in plaintext
+ * beside a passphrase-protected seed would quietly become the weakest thing
+ * in the wallet directory, and an attacker would take that route.
+ *
+ * So rather than a second encryption scheme, this reuses the SAME
+ * deriv_key/ctr_xor/make_tag the mnemonic uses. One implementation of the
+ * crypto, one place to review, and a wrong passphrase is detected here for
+ * the same reason it is there: the tag will not recompute.
+ *
+ * `magic` lets a caller keep its own file type (e.g. "BMCHDK v1") while
+ * sharing the format. Returns 0 on success, -1 on failure.
+ */
+int wallet_secret_write(const char* path, const char* magic,
+                        const char* plaintext, const char* pass){
+    if (!path || !magic || !plaintext) return -1;
+    if (!pass || !pass[0]) return -1;      /* refuse to write a secret in the clear */
+    int n = (int)strlen(plaintext);
+    unsigned char K[64]; deriv_key(K, pass);
+    unsigned char* ct = (unsigned char*)malloc((size_t)n + 1);
+    if (!ct) return -1;
+    ctr_xor(ct, (const unsigned char*)plaintext, n, K);
+    unsigned char tag[32];
+    make_tag(tag, K, ct, n);
+    char taghex[65];
+    hex_encode(taghex, tag, 32);
+    char* cthex = (char*)malloc((size_t)n*2 + 1);
+    if (!cthex){ free(ct); return -1; }
+    hex_encode(cthex, ct, n);
+    FILE* f = fopen(path, "w");
+    if (!f){ free(ct); free(cthex); return -1; }
+    fprintf(f, "%s\n", magic);
+    fprintf(f, "kdf=pbkdf2-hmac-sha512\n");
+    fprintf(f, "cipher=ctr-sha512\n");
+    fprintf(f, "tag=%s\n", taghex);
+    fprintf(f, "%s\n", cthex);
+    int ok = (fflush(f) == 0);
+    fclose(f);
+    chmod(path, 0600);
+    memset(K, 0, sizeof K);
+    free(ct); free(cthex);
+    return ok ? 0 : -1;
+}
+
+int wallet_secret_read(const char* path, const char* magic,
+                       char* out, int cap, const char* pass){
+    if (!path || !magic || !out || cap <= 1) return -1;
+    out[0] = 0;
+    if (!pass || !pass[0]) return -1;
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    char line[4096], taghex[65] = {0};
+    char* cthex = NULL;
+    int seen_magic = 0;
+    while (fgets(line, sizeof line, f)){
+        size_t l = strlen(line);
+        while (l && (line[l-1]=='\n' || line[l-1]=='\r')) line[--l] = 0;
+        if (!line[0]) continue;
+        if (!strncmp(line, magic, strlen(magic))){ seen_magic = 1; continue; }
+        if (!strncmp(line, "kdf=", 4) || !strncmp(line, "cipher=", 7)) continue;
+        if (!strncmp(line, "tag=", 4)){ snprintf(taghex, sizeof taghex, "%s", line+4); continue; }
+        if (!cthex){ cthex = strdup(line); }
+    }
+    fclose(f);
+    if (!seen_magic || !cthex || !taghex[0]){ free(cthex); return -1; }
+    int ctn = (int)strlen(cthex) / 2;
+    if (ctn <= 0 || ctn >= cap){ free(cthex); return -1; }
+    unsigned char* ct = (unsigned char*)malloc((size_t)ctn + 1);
+    unsigned char want[32];
+    if (!ct || hex_decode(ct, cthex) != ctn || hex_decode(want, taghex) != 32){
+        free(ct); free(cthex); return -1; }
+    unsigned char K[64]; deriv_key(K, pass);
+    unsigned char tag[32];
+    make_tag(tag, K, ct, ctn);
+    if (memcmp(tag, want, 32) != 0){          /* wrong passphrase, or tampering */
+        memset(K, 0, sizeof K); free(ct); free(cthex); return -1; }
+    ctr_xor((unsigned char*)out, ct, ctn, K);
+    out[ctn] = 0;
+    memset(K, 0, sizeof K);
+    free(ct); free(cthex);
+    return 0;
+}
