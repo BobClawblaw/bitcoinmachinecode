@@ -33,6 +33,8 @@
 	.extern mpool_get
 	.extern tx_dispatch_init
 	.extern tx_policy_init
+	.extern serve_idx_topup
+	.extern serve_cfilters
 	.extern tx_accept_validate
 	.extern log_block_stored_inbound
 	.extern tx_txid
@@ -62,6 +64,7 @@ sb_buf:      .zero (8<<20)            /* single block buffer */
 hp_buf:      .zero (2000*81+8)        /* headers page buffer */
 serve_txid_scratch: .zero SERVE_TXID_CAP*32
 bt_buf:      .zero (8<<20)            /* compact-block output buffer */
+nf_buf:      .zero (1 + 50*36)        /* notfound payload: count byte + 36B entries */
 s_cmpct_v2:  .zero 8
 s_cmpct_hb:  .zero 8
 s_cmpct_nonce: .zero 8
@@ -90,6 +93,7 @@ s_fh:        .zero 8
 s_cmd:       .zero 16
 s_cnt:       .zero 8
 s_ptr:       .zero 8
+s_nf:        .zero 8                    /* notfound entries accumulated for THIS getdata */
 s_p:         .zero 8
 s_n:         .zero 8
 s_served:    .zero 8
@@ -120,6 +124,7 @@ cn_btxn:   .ascii "blocktxn\0"
 cn_cmpct:  .ascii "cmpctblock\0"
 cn_sendhd: .ascii "sendheaders\0"
 cn_feeflt: .ascii "feefilter\0"
+cn_notfnd:.ascii "notfound\0"
 
 	.text
 
@@ -179,6 +184,41 @@ cn_feeflt: .ascii "feefilter\0"
 	mov  x0, #1
 	ret
 	.size .Ls_varint_put, .-.Ls_varint_put
+
+/* ============================================================================
+ * serve_txdv_preinit() -> 1 if the tx-validation path is usable, else 0.
+ *   Runs the read-only UTXO snapshot + mempool policy init ONCE, intended to
+ *   be called by the parent BEFORE forking (daemon/main.c), so every inbound
+ *   child inherits the snapshot copy-on-write instead of opening its own (the
+ *   per-connection lazy-init below is the fallback for callers that never
+ *   pre-init, e.g. the test harnesses). Idempotent: a second call is a no-op.
+ * ========================================================================== */
+	.global serve_txdv_preinit
+	.type serve_txdv_preinit, %function
+serve_txdv_preinit:
+	stp  x29, x30, [sp, #-16]!
+	mov  x29, sp
+	LOADADDR x9, tx_dv_initdone
+	ldrb w9, [x9]
+	cmp  w9, #1
+	b.eq .pre_done
+	bl   tx_dispatch_init
+	LOADADDR x9, tx_dv_ok
+	strb w0, [x9]
+	bl   tx_policy_init
+	LOADADDR x9, tx_dv_ok
+	ldrb w1, [x9]
+	and  w0, w0, w1
+	strb w0, [x9]
+	LOADADDR x9, tx_dv_initdone
+	mov  w1, #1
+	strb w1, [x9]
+.pre_done:
+	LOADADDR x9, tx_dv_ok
+	ldrb w0, [x9]
+	ldp  x29, x30, [sp], #16
+	ret
+	.size serve_txdv_preinit, .-serve_txdv_preinit
 
 /* ============================================================================
  * node_serve_loop(fd, lfd, st, ht_idx, out_buf, out_cap) -> # blocks served
@@ -317,22 +357,26 @@ node_serve_loop:
 	movk w24, #0x6172, lsl #16        /* "vera" -> verack */
 	cmp  w23, w24
 	b.eq .do_verack
-	mov  w24, #0x7465
-	movk w24, #0x6174, lsl #16        /* "geta" */
+	mov  w24, #0x6567
+	movk w24, #0x6174, lsl #16        /* "geta" (getaddr) */
 	cmp  w23, w24
 	b.eq .maybe_getaddr
-	mov  w24, #0x7465
-	movk w24, #0x6474, lsl #16        /* "getd" */
+	mov  w24, #0x6567
+	movk w24, #0x6474, lsl #16        /* "getd" (getdata) */
 	cmp  w23, w24
 	b.eq .maybe_getdata
-	mov  w24, #0x7465
-	movk w24, #0x6874, lsl #16        /* "geth" */
+	mov  w24, #0x6567
+	movk w24, #0x6874, lsl #16        /* "geth" (getheaders) */
 	cmp  w23, w24
 	b.eq .maybe_getheaders
-	mov  w24, #0x7465
-	movk w24, #0x6274, lsl #16        /* "getb" */
+	mov  w24, #0x6567
+	movk w24, #0x6274, lsl #16        /* "getb" (getblocks / getblocktxn) */
 	cmp  w23, w24
 	b.eq .maybe_getb
+	mov  w24, #0x6567
+	movk w24, #0x6374, lsl #16        /* "getc" (getcfilters/-headers/-checkpt) */
+	cmp  w23, w24
+	b.eq .maybe_getcf
 	mov  w24, #0x6e69
 	movk w24, #0x0076, lsl #16        /* "inv" */
 	cmp  w23, w24
@@ -617,6 +661,14 @@ node_serve_loop:
 	ldr  x9, [x9]
 	cmp  x9, #37
 	b.lo .next
+	/* Fold in any height index.dat has gained since this process last
+	 * looked (the hash index was built at boot; the DOWNLOAD WORKER, a
+	 * different process, appends new blocks -- without this every block we
+	 * downloaded during the run is a silent miss). Cheap when nothing is
+	 * new (one stat), and done here rather than per connection. */
+	bl   serve_idx_topup
+	LOADADDR x10, s_nf
+	str  xzr, [x10]                   /* no misses yet for this getdata */
 	LOADADDR x9, pl_buf
 	ldrb w10, [x9]                    /* cnt */
 	LOADADDR x11, s_cnt
@@ -627,7 +679,7 @@ node_serve_loop:
 .LSV_gd_loop:
 	LOADADDR x9, s_cnt
 	ldr  x9, [x9]
-	cbz  x9, .next
+	cbz  x9, .gd_done
 	LOADADDR x9, s_ptr
 	ldr  x9, [x9]                     /* item */
 	ldr  w10, [x9]                    /* type */
@@ -644,14 +696,14 @@ node_serve_loop:
 	LOADADDR x10, s_cmpct_v2
 	ldr  x10, [x10]
 	cmp  x10, #1
-	b.ne .gd_next
+	b.ne .gd_miss
 	str  x9, [sp, #0]
 	mov  x0, x22
 	add  x1, x9, #4
 	LOADADDR x2, s_fh
 	bl   idx_get
 	ldr  x9, [sp, #0]
-	cbz  x0, .gd_next
+	cbz  x0, .gd_miss
 	str  x9, [sp, #0]                 /* s_ptr */
 	mov  x0, x21
 	LOADADDR x1, s_fh
@@ -661,7 +713,7 @@ node_serve_loop:
 	bl   node_serve_block
 	ldr  x9, [sp, #0]
 	cmp  x0, #0
-	b.le .gd_next
+	b.le .gd_miss
 	LOADADDR x10, s_blen_spill
 	str  x0, [x10]
 	/* choose/rotate nonce */
@@ -682,7 +734,7 @@ node_serve_loop:
 	bl   cmpctblock_build
 	ldr  x9, [sp, #0]
 	cmp  x0, #0
-	b.le .gd_next
+	b.le .gd_miss
 	mov  x4, x0                       /* cmpctblock len */
 	str  x9, [sp, #0]
 	mov  x0, x19
@@ -704,7 +756,7 @@ node_serve_loop:
 	LOADADDR x2, s_fh
 	bl   idx_get
 	ldr  x9, [sp, #0]
-	cbz  x0, .gd_next
+	cbz  x0, .gd_miss
 	str  x9, [sp, #0]
 	mov  x0, x21
 	LOADADDR x1, s_fh
@@ -714,7 +766,7 @@ node_serve_loop:
 	bl   node_serve_block
 	ldr  x9, [sp, #0]
 	cmp  x0, #0
-	b.le .gd_next
+	b.le .gd_miss
 	mov  x4, x0                        /* block len */
 	str  x9, [sp, #0]
 	mov  x0, x19
@@ -737,7 +789,7 @@ node_serve_loop:
 	LOADADDR x2, s_n
 	bl   mpool_get
 	ldr  x9, [sp, #0]
-	cbz  x0, .gd_next
+	cbz  x0, .gd_miss
 	mov  x3, x0                        /* tx bytes ptr (mpool blob) */
 	str  x9, [sp, #0]
 	mov  x0, x19
@@ -753,6 +805,49 @@ node_serve_loop:
 	str  x11, [x10]
 	b    .gd_next
 
+.gd_miss:
+	/* Could not serve this entry: copy its 36 bytes (type u32 + 32B hash)
+	 * into the notfound reply. x9 points at the entry -- exactly the shape
+	 * notfound carries, so it is copied verbatim rather than rebuilt. */
+	LOADADDR x10, s_nf
+	ldr  x11, [x10]
+	cmp  x11, #50
+	b.hs .gd_next                     /* reply full; the rest are dropped */
+	LOADADDR x12, nf_buf
+	add  x12, x12, #1                 /* nf_buf[0] holds the count */
+	add  x12, x12, x11, lsl #5        /* 36*n = 32n + 4n */
+	add  x12, x12, x11, lsl #2
+	mov  x13, #0
+1:	cmp  x13, #36
+	b.hs 2f
+	ldrb w14, [x9, x13]
+	strb w14, [x12, x13]
+	add  x13, x13, #1
+	b    1b
+2:	add  x11, x11, #1
+	LOADADDR x10, s_nf
+	str  x11, [x10]
+	b    .gd_next
+
+.gd_done:
+	/* every entry handled -- tell the peer about the ones we could not serve */
+	LOADADDR x9, s_nf
+	ldr  x9, [x9]
+	cbz  x9, .next
+	LOADADDR x10, nf_buf
+	strb w9, [x10]                    /* count (<=50, so a single-byte varint) */
+	mov  x11, x9
+	add  x11, x11, x9, lsl #5
+	add  x11, x11, x9, lsl #2
+	add  x11, x11, #1                 /* payload len = 1 + 36*count */
+	mov  x0, x19
+	LOADADDR x1, cn_notfnd
+	mov  x2, #8
+	LOADADDR x3, nf_buf
+	mov  x4, x11
+	bl   p2p_write
+	b    .next
+
 .gd_next:
 	LOADADDR x9, s_ptr
 	ldr  x9, [x9]
@@ -764,6 +859,36 @@ node_serve_loop:
 	sub  x9, x9, #1
 	str  x9, [x10]
 	b    .LSV_gd_loop
+
+.maybe_getcf:
+	/* BIP157 compact-filter serving: getcfilters / getcfheaders / getcfcheckpt.
+	 * Distinguish on cmd[4..7]: "filt" / "fhea" / "fche". */
+	LOADADDR x9, s_cmd
+	ldr  w10, [x9, #4]
+	mov  w11, #0                      /* kind 0 = getcfilters */
+	mov  w12, #0x6966
+	movk w12, #0x746c, lsl #16        /* "filt" */
+	cmp  w10, w12
+	b.eq .gcf_go
+	mov  w11, #1                      /* kind 1 = getcfheaders */
+	mov  w12, #0x6866
+	movk w12, #0x6165, lsl #16        /* "fhea" */
+	cmp  w10, w12
+	b.eq .gcf_go
+	mov  w11, #2                      /* kind 2 = getcfcheckpt */
+	mov  w12, #0x6366
+	movk w12, #0x6568, lsl #16        /* "fche" */
+	cmp  w10, w12
+	b.ne .next
+.gcf_go:
+	/* serve_cfilters(fd, kind, pl_buf, plen) */
+	mov  x0, x19
+	mov  w1, w11
+	LOADADDR x2, pl_buf
+	LOADADDR x3, s_plen
+	ldr  x3, [x3]
+	bl   serve_cfilters
+	b    .next
 
 .maybe_getheaders:
 	LOADADDR x9, s_cmd

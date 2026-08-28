@@ -325,6 +325,17 @@ store_rd_advise:
 /* ============================================================================
  * store_map_init(st)  -- reset the mapping cache, unmapping anything live.
  * ========================================================================== */
+/* store_map_random(on): opt-in MADV_RANDOM for mappings created from now on.
+ * Default off so every existing caller keeps the readahead it wants; the
+ * filter backfill opts in (reads single txs out of random blocks). */
+	.global store_map_random
+	.type store_map_random, %function
+store_map_random:
+	adrp x9, smf_madv_random
+	str  w0, [x9, :lo12:smf_madv_random]
+	ret
+	.size store_map_random, .-store_map_random
+
 store_map_init:
 	stp  x19, x20, [sp, #-16]!
 	stp  x21, x29, [sp, #-16]!
@@ -486,6 +497,19 @@ map_file:
 	mov  x5, #0                  /* offset */
 	svc  #0
 	tbnz x0, #63, .Sf_mf_fail    /* bit63 set -> -errno */
+	/* opt-in MADV_RANDOM (store_map_random) -- off by default, so every
+	 * existing caller keeps the readahead it wants. x0 IS the return value;
+	 * madvise clobbers x0, so the mapping base is saved across the svc. */
+	adrp x9, smf_madv_random
+	ldr  w9, [x9, :lo12:smf_madv_random]
+	cbz  w9, .Sf_mf_nomadv
+	mov  x9, x0                  /* save map base */
+	mov  x1, x23                 /* length (maplen) */
+	mov  x2, #1                  /* MADV_RANDOM */
+	mov  x8, #233                /* madvise */
+	svc  #0
+	mov  x0, x9                  /* restore map base */
+.Sf_mf_nomadv:
 	str  x0, [x22, #8]           /* addr */
 	str  x23, [x22, #16]         /* maplen */
 	b    .Sf_mf_ret
@@ -603,5 +627,11 @@ store_prune_safe:
 	ldp  x19, x20, [sp], #16
 	ret
 	.size store_prune_safe, .-store_prune_safe
+
+	.section .bss
+	.align 4
+	.global smf_madv_random
+smf_madv_random:
+	.skip 4                        /* store_map_random(): MADV_RANDOM for new mappings */
 
 	.section .note.GNU-stack,"",%progbits
