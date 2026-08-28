@@ -380,9 +380,19 @@ long node_config_load(const char* path){
                                   "automatically when txindex.dat is present; this daemon "
                                   "does not build or update it\n"); }
         else if(!strcmp(key,"assumevalid")){
-            fprintf(stderr,"[config] assumevalid IGNORED -- block connection performs no script/signature "
-                           "verification (cons_verify checks PoW, parsing, coinbase and merkle root only), "
-                           "so there is nothing for it to skip\n"); }
+            /* This string was STALE and said the opposite of the truth: it
+             * claimed block connection performs no script verification,
+             * describing the node as it was before Stage D wired
+             * tx_verify_block_connect_all into utxo_live.c's apply path.
+             * Nobody updated it when that landed, and it is exactly the sort
+             * of confident, specific, wrong explanation that a reader (or a
+             * later session) takes at face value -- this one did, on
+             * 2026-08-28, and briefly "corrected" the docs to match it.
+             * Fixed with the reason that is actually true. */
+            fprintf(stderr,"[config] assumevalid IGNORED -- this node verifies every input script in "
+                           "every block it connects (tx_verify_block_connect_all, ahead of any UTXO "
+                           "write), which is the whole point of it; assumevalid exists to SKIP that, "
+                           "so it is declined rather than unimplemented\n"); }
 
         else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
             g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }
