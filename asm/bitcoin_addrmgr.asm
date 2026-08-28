@@ -79,6 +79,14 @@ amr_count:
     ret
 
 ; amr_add(ab, ip rsi, port dx, services rcx, lastseen r8) -> 1/0/-1
+;   CONTRACT (made explicit 2026-08-28): `ip` is the 4 address bytes in
+;   network order as a u32 (what inet_pton yields); `port` is the 16-bit
+;   value AS IT SITS ON THE WIRE, i.e. callers pass htons(host_port), so the
+;   record holds the port big-endian. The encoders (p2p_addr_v1/_v2) copy
+;   both fields to the wire verbatim. The DNS-seed writers always did this;
+;   the gossip ingest paths passed host order until 2026-08-28, which put a
+;   byte-swapped port in every record they wrote. validation/
+;   peers_dat_port_audit.py repairs a book written under the old mix.
 global amr_add
 amr_add:
     push rbp
@@ -219,11 +227,50 @@ amr_lookup:
 ; ============================================================================
 ; addr (v1) codec
 ; ============================================================================
+; amr_put_csize(dst rdi, value rsi) -> rax = bytes written (1/3/5/9)
+;   Bitcoin CompactSize. Leaf, no stack, clobbers rax only.
+amr_put_csize:
+    cmp  rsi, 0xfd
+    jb   .one
+    cmp  rsi, 0x10000
+    jae  .big
+    mov  byte [rdi], 0xfd
+    mov  [rdi+1], si
+    mov  eax, 3
+    ret
+.one:
+    mov  [rdi], sil
+    mov  eax, 1
+    ret
+.big:
+    mov  rax, 0x100000000
+    cmp  rsi, rax
+    jae  .nine
+    mov  byte [rdi], 0xfe
+    mov  [rdi+1], esi
+    mov  eax, 5
+    ret
+.nine:
+    mov  byte [rdi], 0xff
+    mov  [rdi+1], rsi
+    mov  eax, 9
+    ret
+
 ; p2p_addr_v1(out, src[18 records], n) -> bytes written
-;   Bitcoin `addr` v1 payload: count varint (n, 1-byte assumed <=252) then per
-;   record 30 bytes: [time u32][services u64][ip 16 (v4 at 12..15)][port u16 BE].
-;   src[i] is our 18-byte amr record (ip u32 LE, port u16 BE, services u64 LE,
-;   last_seen u32 LE) -> mapped into the 30-byte wire record.
+;   Bitcoin legacy `addr` payload: CompactSize count, then per record 30
+;   bytes: [time u32][services u64][ip16][port u16 BE], where ip16 is the
+;   IPv4-MAPPED IPv6 form ::ffff:a.b.c.d -- bytes 12..21 zero, 22..23 0xff,
+;   24..27 the address.
+;   src[i] is our 18-byte amr record (ip u32 as stored, port u16 BE,
+;   services u64 LE, last_seen u32 LE).
+;
+;   REWRITTEN 2026-08-28. The previous encoder (a) wrote the IPv4 at bytes
+;   12..15 -- the FIRST four bytes of the IPv6 field, with no ::ffff: marker
+;   -- so every address went out as the IPv6 address a.b.c.d::, which Core
+;   classifies as IPv6, not IPv4; and (b) wrote the count as a single byte
+;   while callers pass up to 1000. tests/test_addrmgr pinned BOTH mistakes,
+;   having been written from the encoder rather than from the format; the
+;   reference bytes are now Core's own (test_framework/messages.py CAddress).
 global p2p_addr_v1
 p2p_addr_v1:
     push rbp
@@ -237,37 +284,96 @@ p2p_addr_v1:
     mov  r12, rdi            ; out
     mov  r13, rsi            ; src records
     mov  rbx, rdx            ; n
-    mov  byte [r12], bl      ; count varint (1-byte)
-    mov  r14, 1              ; output cursor
-    mov  r15, 0              ; i
+    mov  rdi, r12
+    mov  rsi, rbx
+    call amr_put_csize       ; count as CompactSize
+    mov  r14, rax            ; output cursor
+    xor  r15d, r15d          ; i
 .loop:
     cmp  r15, rbx
     jge  .done
-    ; source record = r13 + r15*18
     mov  rax, r15
     imul rax, 18
     lea  rsi, [r13+rax]      ; src rec
-    ; dest = r12 + r14
-    lea  rdi, [r12+r14]
-    ; [0..3] time = last_seen (src+14)
+    lea  rdi, [r12+r14]      ; dst rec
     mov  ecx, [rsi+14]
-    mov  [rdi], ecx
-    ; [4..11] services = src+6 (u64 LE)
+    mov  [rdi], ecx          ; [0..3]   time = last_seen
     mov  rcx, [rsi+6]
-    mov  [rdi+4], rcx
-    ; [12..15] ip = src+0 (u32 LE) into the 16-byte v4-mapped field
-    mov  ecx, [rsi]          ; ip u32 LE
-    mov  [rdi+12], ecx
-    ; [28..29] port = src+4 (u16 BE) -> wire port is BE
+    mov  [rdi+4], rcx        ; [4..11]  services (u64 LE)
+    mov  qword [rdi+12], 0   ; [12..19] ip16: ten zero bytes ...
+    mov  word  [rdi+20], 0
+    mov  word  [rdi+22], 0xffff ; [22..23] ... then ff ff (IPv4-mapped)
+    mov  ecx, [rsi]
+    mov  [rdi+24], ecx       ; [24..27] a.b.c.d
     mov  cx, [rsi+4]
-    mov  [rdi+28], cx
-    ; leave [16..27] zeroed (existing stack buf assumed pre-zeroed by caller
-    ; only for the LAST written slot; safer: zero the v6 padding each time)
-    mov  qword [rdi+16], 0
-    mov  qword [rdi+20], 0
-    mov  dword [rdi+24], 0
-    ; cursor += 30
+    mov  [rdi+28], cx        ; [28..29] port, BE as stored
     add  r14, 30
+    inc  r15
+    jmp  .loop
+.done:
+    mov  rax, r14
+    add  rsp, 0x10
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; p2p_addr_v2(out, src[18 records], n) -> bytes written
+;   BIP155 `addrv2` payload: CompactSize count, then per record
+;   [time u32][services CompactSize][network id u8 = 1 (IPv4)]
+;   [address length CompactSize = 4][a.b.c.d][port u16 BE].
+;   Same 18-byte amr source records as p2p_addr_v1. The book holds IPv4
+;   only, so every record is network 1; a peer that negotiated addrv2 gets
+;   this form because Core sends ONLY addrv2 to such a peer and a v1 `addr`
+;   to a peer that asked for v2 is legal but never what Core does.
+;   Worst case per record is 4+9+1+1+4+2 = 21 bytes < the 30 of v1, so a
+;   buffer sized for p2p_addr_v1 fits.
+;   Reference bytes: Core's test_framework/messages.py CAddress.serialize_v2.
+global p2p_addr_v2
+p2p_addr_v2:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x10           ; [rbp-0x30] = current src record pointer
+    mov  r12, rdi            ; out
+    mov  r13, rsi            ; src records
+    mov  rbx, rdx            ; n
+    mov  rdi, r12
+    mov  rsi, rbx
+    call amr_put_csize
+    mov  r14, rax            ; cursor
+    xor  r15d, r15d          ; i
+.loop:
+    cmp  r15, rbx
+    jge  .done
+    mov  rax, r15
+    imul rax, 18
+    lea  rsi, [r13+rax]
+    mov  [rbp-0x30], rsi     ; src rec (rsi is an argument register below)
+    lea  rdi, [r12+r14]
+    mov  ecx, [rsi+14]
+    mov  [rdi], ecx          ; time
+    add  r14, 4
+    lea  rdi, [r12+r14]
+    mov  rsi, [rsi+6]        ; services u64 -> CompactSize
+    call amr_put_csize
+    add  r14, rax
+    mov  rsi, [rbp-0x30]
+    lea  rdi, [r12+r14]
+    mov  byte [rdi], 1       ; BIP155 network id: IPv4
+    mov  byte [rdi+1], 4     ; address length (CompactSize, one byte)
+    mov  ecx, [rsi]
+    mov  [rdi+2], ecx        ; a.b.c.d
+    mov  cx, [rsi+4]
+    mov  [rdi+6], cx         ; port BE as stored
+    add  r14, 8
     inc  r15
     jmp  .loop
 .done:

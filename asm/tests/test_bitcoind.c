@@ -29,6 +29,7 @@ extern long fd_read_full(int fd, void* buf, long n);
 static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
 static int g_saw_wtxidrelay = 0;   /* set by fake_peer: BIP339 msg seen before verack */
+static int g_saw_sendaddrv2 = 0;   /* set by fake_peer: BIP155 offer seen before verack */
 
 static void fake_peer(int cfd){
     char cmd[12]; unsigned char rbuf[1024]; unsigned plen=0;
@@ -57,6 +58,7 @@ static void fake_peer(int cfd){
         if (p2p_read(cfd, cmd, rbuf, sizeof rbuf, &plen) <= 0) break;
         cmd[11]=0;
         if (strncmp(cmd,"wtxidrelay",10)==0) g_saw_wtxidrelay = 1;
+        if (strncmp(cmd,"sendaddrv2",10)==0) g_saw_sendaddrv2 = 1;
         if (strncmp(cmd,"verack",6)==0) break;
     }
 }
@@ -77,6 +79,7 @@ int main(void){
     unsigned sh; memcpy(&sh, vb+81+NODE_UA_STRING_LEN, 4); cki("start_height=0", sh, 0);
     cki("relay=1", vb[81+NODE_UA_STRING_LEN+4], 1);
     g_saw_wtxidrelay = 0;   /* reset before the live handshake below */
+    g_saw_sendaddrv2 = 0;
 
     /* --- node_handshake over loopback --- */
     int ls=socket(AF_INET,SOCK_STREAM,0);
@@ -84,7 +87,9 @@ int main(void){
     bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
     listen(ls,1);
     pid_t pid=fork();
-    if(pid==0){ int c=accept(ls,0,0); fake_peer(c); close(c); _exit(g_saw_wtxidrelay ? 0 : 3); }
+    if(pid==0){ int c=accept(ls,0,0); fake_peer(c); close(c);
+                /* bit 0: no wtxidrelay seen; bit 1: no sendaddrv2 seen */
+                _exit((g_saw_wtxidrelay ? 0 : 1) | (g_saw_sendaddrv2 ? 0 : 2)); }
     int fd = tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port);  /* sin_port is already BE */
     cki("connect", fd>=0, 1);
     int r = node_handshake(fd);
@@ -104,7 +109,9 @@ int main(void){
     close(fd);
     { int st=0; waitpid(pid,&st,0);
       cki("BIP339: wtxidrelay sent after version, before verack (child saw it)",
-          WIFEXITED(st) && WEXITSTATUS(st)==0, 1); }
+          WIFEXITED(st) && (WEXITSTATUS(st) & 1)==0, 1);
+      cki("BIP155: sendaddrv2 offered after version, before verack (peer is 70016)",
+          WIFEXITED(st) && (WEXITSTATUS(st) & 2)==0, 1); }
     close(ls);
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
