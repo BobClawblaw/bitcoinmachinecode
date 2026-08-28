@@ -170,6 +170,7 @@ extern int  amr_init(void* ab);
 #include "netaddr.h"
 #include "addrbook.h"
 #include "dialer.h"
+#include "net6.h"
 extern ab2_t* addr_book(void);
 static int book_add_ipv4(unsigned ip_netorder, int port){
     bmc_addr_t a; memset(&a, 0, sizeof a);
@@ -414,6 +415,24 @@ static int lsock(int port){
     int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     if(bind(l,(struct sockaddr*)&a,sizeof a)<0){ fprintf(stderr,"[net] bind failed: %s\n", strerror(errno)); return -1; }
     if(listen(l,8)<0){ fprintf(stderr,"[net] listen failed: %s\n", strerror(errno)); return -1; }
+    return l;
+}
+/* The IPv6 half of the listener (2026-08-28). Separate socket, v6-only, so
+ * it cannot collide with the IPv4 one above; -1 when the host has no IPv6,
+ * which is not an error -- the node simply serves v4 only. A CJDNS peer
+ * reaches us here, on the fc00::/8 address of the tun interface. */
+static int lsock_v6(int port){
+    unsigned char any[16]; memset(any, 0, 16);
+    const unsigned char* bindaddr = NULL;
+    if(g_cfg.bind_addr[0]){
+        bmc_addr_t b;
+        if(bmc_addr_from_string(&b, g_cfg.bind_addr) && (b.net == BMC_NET_IPV6 || b.net == BMC_NET_CJDNS)){
+            memcpy(any, b.addr, 16); bindaddr = any;
+        } else return -1;            /* bind= names a v4 address: no v6 listener */
+    }
+    int l = lsock6(bindaddr, port, 8);
+    if(l >= 0) fprintf(stderr,"[net] listening on IPv6 %s:%d (cjdns peers arrive here)\n",
+                       bindaddr ? g_cfg.bind_addr : "[::]", port);
     return l;
 }
 
@@ -1068,9 +1087,10 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * unchanged, including DNS names (seeds, addnode=, connect=), which only
      * the resolver can turn into an address. */
     { bmc_addr_t da;
-      if (bmc_addr_from_string(&da, host)){
-          { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
-          da.port = (unsigned short)out_port;
+      /* accepts "1.2.3.4", "1.2.3.4:8333", "[fc00::1]:8333", "<56>.onion:8333"
+       * and the bare forms; a DNS name falls through to the resolver below */
+      if (bmc_addr_from_string_port(&da, host, (unsigned short)out_port)){
+          { int cp = node_config_peer_port(host); if(cp) da.port = (unsigned short)cp; }
           if (da.net != BMC_NET_IPV4){
               const char* why = "";
               if (!dialer_net_reachable(da.net)){
@@ -1097,8 +1117,16 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * chain default (node_config.c keeps the host bare and the port beside
      * it). 0 = nothing configured for this host. */
     { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
+    /* a literal IPv4 (with or without ":port") is resolved here without DNS;
+     * anything else is a name the resolver must answer */
+    char hbare[128]; snprintf(hbare, sizeof hbare, "%s", host);
+    { bmc_addr_t v4;
+      if (bmc_addr_from_string_port(&v4, host, (unsigned short)out_port) && v4.net == BMC_NET_IPV4){
+          out_port = v4.port;
+          bmc_addr_to_string(hbare, sizeof hbare, &v4);
+      } }
     struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(host,NULL,&h,&res)!=0){
+    if(getaddrinfo(hbare,NULL,&h,&res)!=0){
         snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
         return -1;
     }
@@ -1640,7 +1668,11 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
          * only if it was actually produced -- a slot left empty would be
          * dialled as "" and, worse, still counted, suppressing the seed
          * fallback (2026-08-28 review, caught before deploy). */
-        if(bmc_addr_to_string(out[got], 64, &r.a) <= 0) continue;
+        /* host:port ([v6]:port for IPv6/CJDNS): the book records the peer's
+         * real port and the chain default is only a fallback for names.
+         * Dropping it here sent every dial to the default port -- which is
+         * right for most mainnet peers and wrong for everyone else. */
+        if(bmc_addr_to_string_port(out[got], 64, &r.a) <= 0) continue;
         got++;
     }
     return got;
@@ -4129,7 +4161,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     fprintf(stderr, "[rpc] JSON-RPC server on 127.0.0.1:%d (live-node + chain, user=%s)\n", actual, user);
 }
 
-static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l){
+static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
      * The sole non-`-connect` caller passes `catchup_seeds` -- the six DNS
@@ -4171,11 +4203,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
      * negative fd and returns revents==0 for it, so the accept branch below
      * is naturally dead in outbound-only mode -- no separate code path. */
-    struct pollfd pfds[MUX_MAX_OUT+1];
+    struct pollfd pfds[MUX_MAX_OUT+2];
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* the IPv6 listener sits beside it; -1 when the host has no IPv6,
+         * and poll() ignores a negative fd, so this is dead weight then */
+        int v6slot = nfds;
+        pfds[nfds].fd=l6;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
         if(g_dl_worker_exited && !g_shutdown_requested){
             int st = (int)g_dl_worker_status;
@@ -4209,10 +4245,27 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
           long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
                            nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
           if(nms >= next_expiry_ms){ next_expiry_ms = nms + 60000L; mempool_expire_now(); } }
-        /* inbound accept -> fork a serve child (unchanged semantics) */
-        if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
+        /* inbound accept -> fork a serve child (unchanged semantics).
+         * Either listener can be ready; the v6 one carries cjdns peers. */
+        int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
+        int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
+        if(ready_v4 || ready_v6){
+            struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
-            int c=accept(l,(struct sockaddr*)&ca,&cal);
+            int c;
+            char peerdesc[80];
+            if(ready_v4){
+                c = accept(l,(struct sockaddr*)&ca,&cal);
+                snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
+            } else {
+                c = accept(l6,(struct sockaddr*)&ca6,&cal6);
+                bmc_addr_t pa; memset(&pa, 0, sizeof pa);
+                pa.len = 16; memcpy(pa.addr, &ca6.sin6_addr, 16);
+                pa.net = (pa.addr[0] == 0xfc) ? BMC_NET_CJDNS : BMC_NET_IPV6;
+                pa.port = ntohs(ca6.sin6_port);
+                bmc_addr_to_string_port(peerdesc, sizeof peerdesc, &pa);
+                if(c >= 0) fprintf(stderr,"[serve] inbound %s (%s)\n", peerdesc, bmc_net_name(pa.net));
+            }
             /* Fold new heights into the PARENT's index before forking, so
              * the child inherits a current one and its own top-up is a
              * no-op. Without this each child re-scans everything appended
@@ -4239,8 +4292,6 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 c = -1;
             }
             if(c>=0){
-                char ipbuf[INET_ADDRSTRLEN]; ipbuf[0]=0;
-                inet_ntop(AF_INET,&ca.sin_addr,ipbuf,sizeof ipbuf);
                 /* Refresh our in-memory store extent from the on-disk archive
                  * so this (and each forked child) serves blocks the download
                  * WORKER appended since boot -- serving reads block bytes fresh
@@ -4257,16 +4308,17 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     close(l);
                     int hok = node_accept_handshake(c);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
-                    fprintf(stderr,"[serve] inbound %s:%d %s (pid %d) %s\n", ipbuf,
-                            ntohs(ca.sin_port), hok==1?"connected":"handshake failed", getpid(), pv);
+                    close(l6 >= 0 ? l6 : l);
+                    fprintf(stderr,"[serve] inbound %s %s (pid %d) %s\n", peerdesc,
+                            hok==1?"connected":"handshake failed", getpid(), pv);
                     if(hok==1)
                         node_serve_loop(c, node_log_open(g_logpath), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
                 }
                 close(c);
                 if(w > 0){ g_inbound_n++; upl_track(w); }
-                fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d (%d/%d inbound)\n",
-                        ipbuf, ntohs(ca.sin_port), w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
+                fprintf(stderr,"[serve] inbound %s accepted -> child pid %d (%d/%d inbound)\n",
+                        peerdesc, w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
@@ -4900,7 +4952,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l);
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, lsock_v6(port));
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -4923,7 +4975,7 @@ int main(int argc, char** argv){
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
-        return serve_mux(port, peer, nwant, 1, out_port, l);
+        return serve_mux(port, peer, nwant, 1, out_port, l, lsock_v6(port));
     }
     return 2;
 }

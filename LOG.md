@@ -112,12 +112,38 @@ I2P always returns CANT_REACH_PEER "LeaseSet not found", which reads
 exactly like a client bug and is not one -- connect to a real remote
 instead.
 
-STILL NOT DONE (phase 4): IPv6 sockets, and therefore CJDNS. The node's
-socket layer is AF_INET only (tcp_connect_ip takes a u32, the listener is
-sockaddr_in), so an IPv6 or fc00::/8 peer is refused at the dialer with
-that reason stated. The host also has net.ipv6.conf.all.disable_ipv6=1 and
-no ::1, which a test would need lifted. cjdroute is built at
-/storage/cjdns-build/cjdns/cjdroute for that phase.
+PHASE 4, SAME DAY: IPv6 SOCKETS AND CJDNS. A CJDNS address IS an fc00::/8
+IPv6 address on a tun interface, so there was no way to "do cjdns without
+ipv6" -- the socket layer had to grow a v6 half first. daemon/net6.c is it:
+tcp_connect_ip6 (same fail-fast receive bound tcp_connect_ip sets) and
+lsock6, deliberately IPV6_V6ONLY because a dual-stack wildcard listener also
+answers IPv4 on the same port and would collide with the node's own IPv4
+listener, which is bound separately. serve_mux now polls BOTH listeners and
+names an inbound peer by its real network, so a cjdns peer can reach us as
+well as be reached. The dialer routes ipv6/cjdns to the new socket, gates
+cjdns on -cjdnsreachable exactly as Core does (Core cannot detect a cjdns
+interface either), and reports "no IPv6 stack on this host" when there is
+none instead of pretending.
+
+PROOF (validation/cjdns_regtest_e2e.sh), against a REAL cjdns router built
+from source and running with its tun up: Bitcoin Core binds its regtest P2P
+port to our fc00::/8 address, this node dials it over the tun, and Core
+reports the peer as network "cjdns", subver /BitcoinMachineCode:0.0.1/,
+version >= 70016, bytes received. The negative is checked too: without
+-cjdnsreachable the same peer never enters the dial pool.
+
+A defect the cjdns test found in the phase-2/3 wiring, before it could
+matter in production: THE DIAL POOL DROPPED THE PORT. dl_pool_from_book
+emitted only the host, so every dial went to the chain's default port --
+right for most mainnet peers and wrong for everyone else, and invisible
+until a peer on a non-default port had to be reached. The pool now carries
+host:port ([v6]:port for IPv6/CJDNS) and outbound_connect honours it.
+
+THE HOST'S IPv6 WAS DELIBERATELY OFF (/etc/sysctl.d/99-disable-ipv6.conf).
+It was enabled at RUNTIME ONLY -- that file is untouched, so a reboot
+restores the original policy -- and cjdroute's UDP transport was pinned to
+loopback so this local test router listens on no public interface. Its
+connectTo is empty: it peers with nobody.
 
 ## 2026-08-28 -- addrv2 negotiation, and the getaddr reply that had never worked
 

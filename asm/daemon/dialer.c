@@ -4,15 +4,18 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include "dialer.h"
 #include "socks5.h"
 #include "i2psam.h"
 #include "node_config.h"
+#include "net6.h"
 #include "log_ts.h"
 
 extern int tcp_connect_ip(unsigned ip_netorder, unsigned short port_be);
 
 static int      g_ready;
+static int      g_have_v6;      /* an AF_INET6 socket can be created here */
 static i2psam_t g_i2p;
 static int      g_i2p_ok;
 static char     g_sam_ip[64]; static int g_sam_port;
@@ -36,6 +39,12 @@ static int onlynet_allows(int net){
 int dialer_init(void){
     if (g_ready) return g_i2p_ok + (g_onion_ip[0] ? 1 : 0) + (g_cfg.cjdnsreachable ? 1 : 0);
     g_ready = 1;
+    /* Does this host have IPv6 at all? Creating the socket is the only
+     * honest test -- the box may have the module loaded and the stack
+     * disabled by sysctl. */
+    { int t = socket(AF_INET6, SOCK_STREAM, 0);
+      if (t >= 0){ g_have_v6 = 1; close(t); }
+      else log_fprintf(stderr, "[dial] no IPv6 on this host: ipv6 and cjdns peers are unreachable\n"); }
     split_hostport(g_cfg.proxy, g_proxy_ip, sizeof g_proxy_ip, &g_proxy_port);
     /* Core: -onion defaults to -proxy; "0" disables onion entirely */
     if (!split_hostport(g_cfg.onion_proxy, g_onion_ip, sizeof g_onion_ip, &g_onion_port)){
@@ -54,17 +63,21 @@ int dialer_init(void){
         }
     }
     if (g_cfg.cjdnsreachable && onlynet_allows(BMC_NET_CJDNS))
-        log_fprintf(stderr, "[dial] cjdns reachable (fc00::/8 dialled directly)\n");
+        log_fprintf(stderr, "[dial] cjdns reachable (fc00::/8 over IPv6%s)\n",
+                    g_have_v6 ? "" : " -- but this host has no IPv6, so it is not");
     return g_i2p_ok + (g_onion_ip[0] ? 1 : 0) + (g_cfg.cjdnsreachable ? 1 : 0);
 }
 int dialer_net_reachable(int net){
     if (!onlynet_allows(net)) return 0;
     switch (net){
     case BMC_NET_IPV4:  return 1;
-    case BMC_NET_IPV6:  return 0;                  /* no IPv6 socket path yet (phase 4) */
+    case BMC_NET_IPV6:  return g_have_v6;
     case BMC_NET_TORV3: return g_onion_ip[0] != 0;
     case BMC_NET_I2P:   return g_i2p_ok;
-    case BMC_NET_CJDNS: return g_cfg.cjdnsreachable;   /* still needs the IPv6 socket path */
+    /* CJDNS is an fc00::/8 address on a tun interface: it needs the IPv6
+     * socket path AND the operator saying the interface is there, exactly
+     * as Core requires -cjdnsreachable (it cannot detect it either). */
+    case BMC_NET_CJDNS: return g_cfg.cjdnsreachable && g_have_v6;
     default: return 0;
     }
 }
@@ -109,12 +122,15 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
         int fd = tcp_connect_ip(ip, htons(a->port));
         if (fd < 0) *why = "connect failed";
         return fd; }
-    case BMC_NET_IPV6: case BMC_NET_CJDNS:
-        /* the node has no AF_INET6 socket path yet; refuse here rather than
-         * pretend, so the reason in the log is the true one (phase 4) */
-        *why = (a->net == BMC_NET_CJDNS) ? "cjdns needs an IPv6 socket (not built yet)"
-                                         : "ipv6 not supported yet";
-        return -1;
+    case BMC_NET_IPV6: case BMC_NET_CJDNS: {
+        if (!g_have_v6){ *why = "no IPv6 stack on this host"; return -1; }
+        if (a->net == BMC_NET_CJDNS && !g_cfg.cjdnsreachable){
+            *why = "cjdns not enabled (-cjdnsreachable)"; return -1; }
+        /* a CJDNS peer is reached by connecting to its fc00::/8 address over
+         * the tun interface -- the same socket as any other IPv6 peer */
+        int fd = tcp_connect_ip6(a->addr, a->port);
+        if (fd < 0) *why = "connect failed";
+        return fd; }
     default:
         *why = "unknown network"; return -1;
     }
