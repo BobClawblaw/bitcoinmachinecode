@@ -20,7 +20,17 @@
 	add  \rd, \rd, :lo12:\sym
 	.endm
 
-	.section .bss
+/* TLS Initial-Exec address of a .tbss symbol into d (clobbers x17 -- never
+ * used in this file). Scratch buffers are PER-THREAD (x86 parity): the
+ * threaded daemon verifies many inputs across worker threads concurrently. */
+	.macro TLS_ADDR d, sym
+	adrp \d, :gottprel:\sym
+	ldr  \d, [\d, #:gottprel_lo12:\sym]
+	mrs  x17, tpidr_el0
+	add  \d, \d, x17
+	.endm
+
+	.section .tbss,"awT",@nobits
 	.balign 16
 	.global cks_needle
 cks_needle:
@@ -88,7 +98,7 @@ sv_checksig_asm:
 	bl   der_parse_sig
 	cbz  w0, .cs_zero
 	/* script_push_encode(needle, 600, sig, siglen) -> nlen */
-	LAddr x0, cks_needle
+	TLS_ADDR x0, cks_needle
 	mov  x1, #600
 	ldr  x2, [x28, #K_SIG]
 	ldr  x3, [x28, #K_SIGLEN]
@@ -97,13 +107,13 @@ sv_checksig_asm:
 	b.lt .cs_zero
 	str  x0, [x28, #K_NLEN]
 	/* script_find_and_delete(scF, 20000, slice.p, slice.n, needle, nlen) */
-	LAddr x0, cks_scf
+	TLS_ADDR x0, cks_scf
 	str  x0, [x28, #K_SCF]
 	mov  x1, #20000
 	ldr  x9, [x28, #K_SLICE]
 	ldr  x2, [x9, #0]
 	ldr  x3, [x9, #8]
-	LAddr x4, cks_needle
+	TLS_ADDR x4, cks_needle
 	ldr  x5, [x28, #K_NLEN]
 	bl   script_find_and_delete
 	cmp  x0, #0
@@ -203,7 +213,7 @@ sv_checksig_witness_v0_asm:
 	ldr  x10, [x28, #K_SLICE]
 	ldr  x6, [x10, #0]          /* slice.p */
 	ldr  x7, [x10, #8]          /* slice.n */
-	LAddr x11, cks_pre
+	TLS_ADDR x11, cks_pre
 	mov  x12, #0x10000
 	sub  sp, sp, #16
 	str  x11, [sp]              /* pre */

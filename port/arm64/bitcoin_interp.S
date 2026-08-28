@@ -15,7 +15,7 @@
  * interp_push_bool + checksig/multisig subroutines.
  * ========================================================================== */
 
-	.section .bss
+	.section .tbss,"awT",@nobits
 	.align 4
 interp_tmp:	.space 528
 bool_buf:	.space 8
@@ -299,6 +299,17 @@ interp_memeq:
 	add  \rd, \rd, :lo12:\sym
 .endm
 
+/* TLS Initial-Exec address of a .tbss symbol into d (clobbers x17 -- free,
+ * never used in this file, unlike x10 which is a live scratch here). The
+ * threaded daemon verifies many inputs across worker threads; the scratch
+ * buffers below are PER-THREAD (x86 parity). */
+.macro TLS_ADDR d, sym
+	adrp \d, :gottprel:\sym
+	ldr  \d, [\d, #:gottprel_lo12:\sym]
+	mrs  x17, tpidr_el0
+	add  \d, \d, x17
+.endm
+
 	.global script_eval
 	.type   script_eval,%function
 script_eval:
@@ -312,27 +323,27 @@ script_eval:
 	mov  x20,x0			/* state */
 
 	/* per-thread scratch addresses */
-	LAddr x2, interp_tmp
+	TLS_ADDR x2, interp_tmp
 	str  x2,[sp,#SL_ITMP]
-	LAddr x2, bool_buf
+	TLS_ADDR x2, bool_buf
 	str  x2,[sp,#SL_BOOL]
-	LAddr x2, interp_err
+	TLS_ADDR x2, interp_err
 	str  x2,[sp,#SL_IERR]
-	LAddr x2, interp_slice
+	TLS_ADDR x2, interp_slice
 	str  x2,[sp,#SL_ISLICE]
-	LAddr x2, cms_keyrefs
+	TLS_ADDR x2, cms_keyrefs
 	str  x2,[sp,#SL_CSK]
-	LAddr x2, cms_sigrefs
+	TLS_ADDR x2, cms_sigrefs
 	str  x2,[sp,#SL_CSS]
-	LAddr x2, elem_tmp0
+	TLS_ADDR x2, elem_tmp0
 	str  x2,[sp,#SL_ET0]
-	LAddr x2, elem_tmp1
+	TLS_ADDR x2, elem_tmp1
 	str  x2,[sp,#SL_ET1]
-	LAddr x2, elem_tmp2
+	TLS_ADDR x2, elem_tmp2
 	str  x2,[sp,#SL_ET2]
-	LAddr x2, elem_tmp3
+	TLS_ADDR x2, elem_tmp3
 	str  x2,[sp,#SL_ET3]
-	LAddr x2, snum_overflow
+	TLS_ADDR x2, snum_overflow
 	str  x2,[sp,#SL_SNUMOVF]
 
 	/* script size limit (BASE/WITNESS_V0) */
@@ -1982,7 +1993,7 @@ interp_require_depth:
 interp_swap_recs:
 	stp  x29,x30,[sp,#-16]!
 	mov  x29,sp
-	LAddr x10, elem_tmp0
+	TLS_ADDR x10, elem_tmp0
 	mov  x0,x10
 	mov  x1,x21
 	bl   elem_move		/* tmp0 = *a */
@@ -2023,7 +2034,7 @@ interp_push_bool:
 	mov  x25,x0		/* &sp */
 	mov  x26,x1		/* elems */
 	mov  x9,x2		/* bool */
-	LAddr x10, interp_tmp
+	TLS_ADDR x10, interp_tmp
 	mov  w3,#0
 	cbz  x9,1f
 	mov  w3,#1
@@ -2082,7 +2093,7 @@ interp_checksig:
 	mov  w0,#-1
 	b    .cs_end
 .cs_enc_ok:
-	LAddr x12, interp_slice
+	TLS_ADDR x12, interp_slice
 	ldr  x11,[x24,#SL_BECH]
 	str  x11,[x12]
 	ldr  x13,[x24,#SL_PEND]
@@ -2130,7 +2141,7 @@ interp_checksig_add:
 	cbz  w19,.csa_false
 	ldr  x0,[x20,#96]
 	cbz  x0,.csa_false
-	LAddr x12, interp_slice
+	TLS_ADDR x12, interp_slice
 	ldr  x11,[x24,#SL_BECH]
 	str  x11,[x12]
 	ldr  x13,[x24,#SL_PEND]
@@ -2248,7 +2259,7 @@ interp_checkmultisig:
 	ldr  x1,[x20]
 	mov  x2,x4
 	bl   stack_elem_ptr
-	LAddr x5, cms_keyrefs
+	TLS_ADDR x5, cms_keyrefs
 	add  x5,x5,x25,lsl #3
 	str  x0,[x5]
 	add  x25,x25,#1
@@ -2269,7 +2280,7 @@ interp_checkmultisig:
 	ldr  x1,[x20]
 	mov  x2,x4
 	bl   stack_elem_ptr
-	LAddr x5, cms_sigrefs
+	TLS_ADDR x5, cms_sigrefs
 	add  x5,x5,x25,lsl #3
 	str  x0,[x5]
 	add  x25,x25,#1
@@ -2288,28 +2299,28 @@ interp_checkmultisig:
 	ldr  w2,[sp,#0x40]
 	cmp  w25,w2
 	b.ge .cms_strip_done
-	LAddr x5, cms_sigrefs
+	TLS_ADDR x5, cms_sigrefs
 	add  x5,x5,x25,lsl #3
 	ldr  x7,[x5]		/* sigs[j] elem ptr */
 	ldr  w8,[x7]		/* siglen */
 	add  x9,x7,#ELEM_DATA_OFF
-	LAddr x0, cms_needle
+	TLS_ADDR x0, cms_needle
 	mov  x1,#600
 	mov  x2,x9
 	mov  x3,x8
 	bl   script_push_encode
 	mov  x26,x0		/* needlelen */
 	tbnz w25,#0,.strip_dst1
-	LAddr x27, cms_scstrip0
+	TLS_ADDR x27, cms_scstrip0
 	b    .strip_call
 .strip_dst1:
-	LAddr x27, cms_scstrip1
+	TLS_ADDR x27, cms_scstrip1
 .strip_call:
 	mov  x0,x27
 	mov  x1,#10008
 	ldr  x2,[sp,#0x28]
 	ldr  x3,[sp,#0x20]
-	LAddr x4, cms_needle
+	TLS_ADDR x4, cms_needle
 	mov  x5,x26
 	bl   script_find_and_delete
 	str  x27,[sp,#0x28]
@@ -2317,7 +2328,7 @@ interp_checkmultisig:
 	add  x25,x25,#1
 	b    .cms_strip_loop
 .cms_strip_done:
-	LAddr x10, interp_slice
+	TLS_ADDR x10, interp_slice
 	ldr  x11,[sp,#0x28]
 	str  x11,[x10]
 	ldr  x12,[sp,#0x20]
@@ -2332,10 +2343,10 @@ interp_checkmultisig:
 	ldr  w2,[sp,#0x48]
 	cmp  w26,w2
 	b.ge .cms_end
-	LAddr x5, cms_sigrefs
+	TLS_ADDR x5, cms_sigrefs
 	add  x5,x5,x25,lsl #3
 	ldr  x21,[x5]			/* vSig elem */
-	LAddr x7, cms_keyrefs
+	TLS_ADDR x7, cms_keyrefs
 	add  x7,x7,x26,lsl #3
 	ldr  x22,[x7]			/* vPub elem */
 	mov  x0,x21
@@ -2352,7 +2363,7 @@ interp_checkmultisig:
 	ldr  w2,[x21]			/* siglen */
 	add  x3,x22,#ELEM_DATA_OFF
 	ldr  w4,[x22]			/* publen */
-	LAddr x5, interp_slice
+	TLS_ADDR x5, interp_slice
 	ldr  x6,[x20,#96]
 	cbz  x6,.key_fail
 	blr  x6

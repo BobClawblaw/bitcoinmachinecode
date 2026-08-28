@@ -22,7 +22,18 @@
 	add  \rd, \rd, :lo12:\sym
 	.endm
 
-	.section .bss
+/* TLS Initial-Exec address of a .tbss symbol into d (clobbers x17 -- free at
+ * every conversion site here; the only x17 use in the file, line ~567, is a
+ * different local routine). Scratch buffers are PER-THREAD (x86 parity): the
+ * threaded daemon verifies many inputs across worker threads concurrently. */
+	.macro TLS_ADDR d, sym
+	adrp \d, :gottprel:\sym
+	ldr  \d, [\d, #:gottprel_lo12:\sym]
+	mrs  x17, tpidr_el0
+	add  \d, \d, x17
+	.endm
+
+	.section .tbss,"awT",@nobits
 	.balign 16
 	.global scriptnum_buf
 scriptnum_buf:
@@ -45,7 +56,7 @@ elem_tmp3: .space 528
 	.global scriptnum_decode
 	.type scriptnum_decode, %function
 scriptnum_decode:
-	LAddr x9, snum_overflow
+	TLS_ADDR x9, snum_overflow
 	str  xzr, [x9]                  /* overflow = 0 */
 	cmp  x0, x2                     /* len vs maxsize */
 	b.ls 1f
@@ -90,7 +101,7 @@ scriptnum_decode:
 	.global scriptnum_serialize
 	.type scriptnum_serialize, %function
 scriptnum_serialize:
-	LAddr x3, scriptnum_buf
+	TLS_ADDR x3, scriptnum_buf
 	mov  x4, x0                     /* value */
 	cbz  x4, .sz_zero
 	mov  x5, #0                     /* neg flag */
@@ -297,7 +308,7 @@ check_minimal_push:
  * MAX_STACK_SIZE=1000.
  * ========================================================================== */
 
-	.section .bss
+	.section .tbss,"awT",@nobits
 	.align 4
 vfexec:		.space 1024	/* condition stack (bytes) */
 vfexec_sp:	.space 8
@@ -306,35 +317,35 @@ vfexec_sp:	.space 8
 	.global elem_tmp0_addr
 	.type elem_tmp0_addr,%function
 elem_tmp0_addr:
-	LAddr x0, elem_tmp0
+	TLS_ADDR x0, elem_tmp0
 	ret
 	.size elem_tmp0_addr,.-elem_tmp0_addr
 
 	.global elem_tmp1_addr
 	.type elem_tmp1_addr,%function
 elem_tmp1_addr:
-	LAddr x0, elem_tmp1
+	TLS_ADDR x0, elem_tmp1
 	ret
 	.size elem_tmp1_addr,.-elem_tmp1_addr
 
 	.global elem_tmp2_addr
 	.type elem_tmp2_addr,%function
 elem_tmp2_addr:
-	LAddr x0, elem_tmp2
+	TLS_ADDR x0, elem_tmp2
 	ret
 	.size elem_tmp2_addr,.-elem_tmp2_addr
 
 	.global elem_tmp3_addr
 	.type elem_tmp3_addr,%function
 elem_tmp3_addr:
-	LAddr x0, elem_tmp3
+	TLS_ADDR x0, elem_tmp3
 	ret
 	.size elem_tmp3_addr,.-elem_tmp3_addr
 
 	.global snum_overflow_addr
 	.type snum_overflow_addr,%function
 snum_overflow_addr:
-	LAddr x0, snum_overflow
+	TLS_ADDR x0, snum_overflow
 	ret
 	.size snum_overflow_addr,.-snum_overflow_addr
 
@@ -594,19 +605,19 @@ stack_swap_two:				/* x0=&sp,x1=elems */
 	sub  x2,x2,#2
 	mul  x5,x2,x3
 	add  x5,x5,x1			/* B */
-	LAddr x6, elem_tmp0
+	TLS_ADDR x6, elem_tmp0
 	mov  x0,x6
 	mov  x1,x4
 	bl   elem_move			/* tmp0 = *A */
-	LAddr x6, elem_tmp1
+	TLS_ADDR x6, elem_tmp1
 	mov  x0,x6
 	mov  x1,x5
 	bl   elem_move			/* tmp1 = *B */
 	mov  x0,x4
-	LAddr x1, elem_tmp1
+	TLS_ADDR x1, elem_tmp1
 	bl   elem_move			/* *A = tmp1 */
 	mov  x0,x5
-	LAddr x1, elem_tmp0
+	TLS_ADDR x1, elem_tmp0
 	bl   elem_move			/* *B = tmp0 */
 	ldp  x29,x30,[sp],#16
 	ret
@@ -673,7 +684,7 @@ get_op:
 	.global vfexec_sp_reset
 	.type vfexec_sp_reset,%function
 vfexec_sp_reset:
-	LAddr x0, vfexec_sp
+	TLS_ADDR x0, vfexec_sp
 	str  xzr,[x0]
 	ret
 	.size vfexec_sp_reset,.-vfexec_sp_reset
@@ -681,9 +692,9 @@ vfexec_sp_reset:
 	.global vfexec_push
 	.type vfexec_push,%function
 vfexec_push:				/* x0 = 0/1 */
-	LAddr x2, vfexec_sp
+	TLS_ADDR x2, vfexec_sp
 	ldr  x3,[x2]
-	LAddr x4, vfexec
+	TLS_ADDR x4, vfexec
 	strb w0,[x4,x3]
 	add  x3,x3,#1
 	str  x3,[x2]
@@ -693,7 +704,7 @@ vfexec_push:				/* x0 = 0/1 */
 	.global vfexec_pop
 	.type vfexec_pop,%function
 vfexec_pop:
-	LAddr x1, vfexec_sp
+	TLS_ADDR x1, vfexec_sp
 	ldr  x2,[x1]
 	cbz  x2, 9f
 	sub  x2,x2,#1
@@ -704,7 +715,7 @@ vfexec_pop:
 	.global vfexec_depth
 	.type vfexec_depth,%function
 vfexec_depth:
-	LAddr x0, vfexec_sp
+	TLS_ADDR x0, vfexec_sp
 	ldr  x0,[x0]
 	ret
 	.size vfexec_depth,.-vfexec_depth
@@ -712,10 +723,10 @@ vfexec_depth:
 	.global vfexec_toggle_top
 	.type vfexec_toggle_top,%function
 vfexec_toggle_top:
-	LAddr x1, vfexec_sp
+	TLS_ADDR x1, vfexec_sp
 	ldr  x2,[x1]
 	cbz  x2, 9f
-	LAddr x3, vfexec
+	TLS_ADDR x3, vfexec
 	sub  x2,x2,#1
 	ldrb w4,[x3,x2]
 	eor  w4,w4,#1
@@ -726,9 +737,9 @@ vfexec_toggle_top:
 	.global vfexec_all_true
 	.type vfexec_all_true,%function
 vfexec_all_true:
-	LAddr x1, vfexec_sp
+	TLS_ADDR x1, vfexec_sp
 	ldr  x2,[x1]
-	LAddr x3, vfexec
+	TLS_ADDR x3, vfexec
 	mov  x4,#0
 1:	cmp  x4,x2
 	b.hs .vfa_yes
