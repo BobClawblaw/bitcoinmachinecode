@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness bitcoind bitcoin_serve bitcoin_scriptverify_drv bitcoin_witness_v0_drv bitcoin_store_ext bitcoin_sighash_all_ext bitcoin_txv_parse bitcoin_txv_classify bitcoin_segwit_classify bitcoin_txv_pools bitcoin_checksig bitcoin_bip143 bitcoin_multisig
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness bitcoind bitcoin_serve bitcoin_scriptverify_drv bitcoin_witness_v0_drv bitcoin_store_ext bitcoin_sighash_all_ext bitcoin_txv_parse bitcoin_txv_classify bitcoin_segwit_classify bitcoin_txv_pools bitcoin_checksig bitcoin_bip143 bitcoin_multisig bitcoin_idx bitcoin_utxo_stats bitcoin_muhash
 
 .PHONY: all test-all harness so fuzz clean
 
