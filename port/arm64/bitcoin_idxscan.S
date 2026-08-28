@@ -322,12 +322,12 @@ idxscan_progress:
     str  x9,[sp]               /* running_tip = -1 */
     str  xzr,[sp,#8]           /* running_present = 0 */
 .ip_loop:
-    cmp  x23,x22
-    b.ge .ip_flush
-    sub  x9,x22,x23            /* remaining */
-    mov  x10,#4096
-    cmp  x9,x10
-    csel x24,x9,x10,gt          /* take = min(remaining,4096) */
+	cmp  x23,x22
+	b.ge .ip_flush
+	sub  x9,x22,x23            /* remaining */
+	mov  x10,#4096
+	cmp  x9,x10
+	csel x24,x10,x9,gt          /* take = min(remaining,4096): if rem>4096 take=4096 else rem */
     mov  x9,#48
     mul  x12,x24,x9             /* count */
     mul  x13,x23,x9             /* offset */
