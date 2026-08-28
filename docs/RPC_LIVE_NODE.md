@@ -837,10 +837,8 @@ the call site. What remains declined, and why, in one place:
   Still refused: **getmempoolcluster** (no cluster mempool).
 - ~~**encryptwallet + multi-wallet lifecycle**~~ — both REAL (encryption
   2026-08-27, the multi-wallet lifecycle the same week). Of the
-  import/export family only **`addhdkey`** remains refused, and its reason is
-  the true one: adopting a foreign HD key needs a key store a single-seed
-  wallet does not have. The other five closed 2026-08-27 (evening) — see
-  slice 24.
+  import/export family **nothing remains refused**: five closed 2026-08-27
+  (evening, slice 24) and `addhdkey` the same night (slice 25).
   `importdescriptors` is real, and **`exportwatchonlywallet` became real
   2026-08-27 (evening)** — it needs no import path at all, since this
   wallet's entire key set IS the two concrete descriptors it exports
@@ -1370,3 +1368,58 @@ receive. A test that passes for the wrong reason is the failure mode worth
 naming.
 
 Regtest e2e: **54 checks, 0 failures.**
+
+## Slice 25 — addhdkey, and the two bugs it uncovered — (2026-08-27, late)
+
+The last refusal, and the only one that was genuinely blocked rather than
+mislabelled. Three things had to be true first; skipping any of them makes
+the feature a hazard rather than a gap.
+
+**The key must be protected as the seed is.** An xprv in plaintext beside a
+passphrase-encrypted mnemonic silently becomes the weakest thing in the
+wallet directory, and that is the route an attacker takes. A new
+`wallet_secret_write` reuses the mnemonic's own KDF, cipher and tag — one
+implementation of the crypto, one place to review. With no passphrase
+available, `addhdkey` refuses rather than writing a private key in the clear.
+
+**Records must say which key they belong to.** The scan identified a key by
+`(keyidx, branch)` alone. Two HD keys collide on that immediately — both have
+an index-0 receive key — so an output paying key B resolved to key A's
+address, and the wallet would have built a spend against a scriptPubKey the
+coin is not locked to. That is why this needed an on-disk format bump
+(**BMCWSCN4** adds an `hdkey` byte) rather than being a pure RPC addition.
+Formats 2 and 3 still read, and `hdkey = 0` is the *truth* for them, not a
+default: they predate added keys entirely.
+
+**The signer must hold them.** `signrawtransactionwithwallet` offers every
+window key and lets the matcher choose, so the added keys' private halves
+join that list. A wallet that watches an added key's outputs but cannot sign
+them reports coins as spendable that are not.
+
+### Two real bugs, both found by the differential
+
+Core rejected **every xpub this node produced** on regtest — *"key is not
+valid"*. `bip32_extkey_serialize` hardcodes mainnet's version bytes in
+assembly, so the whole extended-key surface (`gethdkeys`, `addhdkey`,
+`listdescriptors`' xpub) was mainnet-only and silently wrong on regtest and
+testnet4. The version pair now sits in `chainparams` beside the other chain
+rules and is stamped over the serialization; `tprv` is accepted on input too.
+
+And one of mine: the second derivation step passed the same buffer as both
+the output and the parent chaincode. Whether an aliased call like that
+survives depends on the order the callee happens to write in.
+
+### Proof
+
+An xpub coming back proves nothing. Against a real chain: the address our key
+window derives matches what **Core** derives from the same xpub; the payment
+is recorded attributed to `hdkey=1` rather than the seed; the wallet **signs**
+an input locked to that key; and the network accepts the spend.
+
+The test earned its keep three times. It ran before the coin it needed had
+confirmed; it mined before the funding transaction had relayed to Core —
+mining an empty block, which reads as *"the wallet cannot see the added key"*,
+a far more alarming conclusion than the truth; and it consumed a coin the
+TRUC fixtures had reserved, which is why it now runs last.
+
+Regtest e2e: **64 checks, 0 failures.**

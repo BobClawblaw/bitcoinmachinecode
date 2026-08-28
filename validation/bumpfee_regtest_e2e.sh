@@ -63,6 +63,19 @@ bmc(){ local m=$1; shift; local p=${1:-[]}
   curl -s --user e2e:e2epw -H 'content-type:text/plain' \
     --data-binary "{\"jsonrpc\":\"1.0\",\"id\":\"e\",\"method\":\"$m\",\"params\":$p}" \
     http://127.0.0.1:$BMC_RPC/; }
+# Wait until OUR node has the height Core does. `sleep 3` is a guess, and a
+# rescan that runs before the block arrives simply scans to the old tip and
+# reports nothing -- which looks exactly like the wallet failing to see a
+# payment. (It did: the addhdkey case chased that for several runs.)
+wait_sync(){
+  local want i=0
+  want=$(core getblockcount 2>/dev/null)
+  while [ $i -lt 40 ]; do
+    [ "$(bmc getblockcount | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"])' 2>/dev/null)" = "$want" ] && return 0
+    sleep 1; i=$((i+1))
+  done
+  return 1
+}
 jq_(){ python3 -c "import sys,json;d=json.load(sys.stdin);
 e=d.get('error')
 sys.exit('RPC error: '+json.dumps(e)) if e else None
@@ -106,7 +119,12 @@ mkdir -p "$WORK/wgen/data"
 mkdir -p "$BMC_DIR/regtest"
 cp "$WORK/wgen/data/bmcwallet.dat" "$BMC_DIR/regtest/bmcwallet.dat" || exit 2
 
-( cd /storage/bitcoinmachinecode/asm && nohup "$BMC_BIN" serve "$BMC_DIR" \
+# addhdkey stores an extended PRIVATE key and REFUSES to write one in the
+# clear, so the node needs a wallet passphrase to exercise that path at all.
+# This is how an operator with an encrypted wallet runs it.
+export BMC_WALLET_PASS=e2e-test-passphrase
+( cd /storage/bitcoinmachinecode/asm && BMC_WALLET_PASS="$BMC_WALLET_PASS" \
+    nohup "$BMC_BIN" serve "$BMC_DIR" \
     > "$WORK/bmc.log" 2>&1 & echo $! > "$WORK/bmc.pid" )
 sleep 12
 BMC_PIDS=$(pgrep -f "serve $BMC_DIR" | tr '\n' ' ')
@@ -141,7 +159,7 @@ $(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'PY'
 import struct,sys
 d=open(sys.argv[1],'rb').read()
 # format 3 adds a trailing is_coinbase byte; 2 is still readable
-S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+S = {b'BMCWSCN4':88, b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
 if not S: sys.exit("unexpected scan format %r" % d[:8])
 h,n=struct.unpack('<II',d[8:16]); body=d[16:]
 for i in range(n):
@@ -328,7 +346,7 @@ read -r P_TXID P_VAL <<PKGEOF
 $(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'PKGPY'
 import struct,sys
 d=open(sys.argv[1],'rb').read()
-S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+S = {b'BMCWSCN4':88, b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
 if not S: sys.exit("unexpected scan format")
 h,n=struct.unpack('<II',d[8:16]); body=d[16:]
 seen=0
@@ -492,7 +510,7 @@ read -r PF_TXID PF_HEIGHT <<PFEOF
 $(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'PFPY'
 import struct,sys
 d=open(sys.argv[1],'rb').read()
-S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+S = {b'BMCWSCN4':88, b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
 if not S: sys.exit("unexpected scan format")
 h,n=struct.unpack('<II',d[8:16]); body=d[16:]
 recs=[body[i*S:(i+1)*S] for i in range(n)]
@@ -638,7 +656,7 @@ read -r T_TXID T_VAL <<TRUCEOF
 $(python3 - "$BMC_DIR/regtest/walletscan.dat" <<'TRUCPY'
 import struct,sys
 d=open(sys.argv[1],'rb').read()
-S = {b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+S = {b'BMCWSCN4':88, b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
 if not S: sys.exit("unexpected scan format")
 h,n=struct.unpack('<II',d[8:16]); body=d[16:]
 seen=0
@@ -719,8 +737,6 @@ else
 fi
 
 echo "== mempool.dat: our dump read by Core, and Core's dump read by us =="
-# Format interop, in both directions. A round trip through our own code
-# proves only that we agree with ourselves.
 SAVED=$(bmc savemempool | jq_ "d['result']['filename']")
 if [ -n "${SAVED:-}" ] && [ -s "$SAVED" ]; then
   ok "savemempool wrote $(stat -c%s "$SAVED") bytes"
@@ -765,5 +781,196 @@ else
 fi
 
 echo
+
+# LAST on purpose: this case SPENDS a mature coin, and every fixture above
+# picks its own coin out of the same scan. Running it earlier consumed the
+# one the TRUC section had reserved and broke three unrelated assertions.
+echo "== addhdkey: a second HD key that the wallet can actually SPEND =="
+# The danger this feature carries is a wallet that WATCHES an added key's
+# outputs and then cannot sign them -- coins reported as spendable that are
+# not. So the test is not "the call returned an xpub": it funds an address
+# from the added key, checks the balance sees it, and then SPENDS it.
+# The wallet's scan only knows CONFIRMED spends, so a coin that looks unspent
+# to it may already be spent by a MEMPOOL transaction -- and building on that
+# coin produces a REPLACEMENT, which fails the RBF fee rules and reports
+# "insufficient fee": a confusing way to be told the view is stale. Draining
+# the mempool is not an option (the ephemeral-dust parent pays 0 fee, so no
+# miner takes it), so collect what the mempool spends and exclude it.
+core -generate 1 >/dev/null 2>&1
+wait_sync || fail "our node never caught up to Core's height"
+bmc rescanblockchain >/dev/null 2>&1
+: > "$WORK/memraw.txt"
+for MID in $(bmc getrawmempool | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(' '.join(d['result']) if not d.get('error') else '')"); do
+  bmc getrawtransaction "[\"$MID\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['result'] if not d.get('error') else '')" >> "$WORK/memraw.txt"
+done
+ok "collected $(grep -c . "$WORK/memraw.txt") mempool transaction(s) to exclude from coin choice"
+
+HK=$(bmc addhdkey | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('ERR:'+d['error']['message'] if d.get('error') else d['result']['xpub'])")
+# tpub on regtest/testnet4, xpub on mainnet -- Core's descriptor parser
+# rejects the wrong pair outright, so the prefix IS the assertion
+case "$HK" in
+  tpub*|xpub*) ok "addhdkey generated and stored a key (${HK:0:14}...)" ;;
+  *)           fail "addhdkey: $HK" ;;
+esac
+NKEYS=$(bmc gethdkeys | jq_ "len(d['result'])")
+[ "$NKEYS" = "2" ] && ok "gethdkeys lists BOTH the seed and the added key" \
+                   || fail "gethdkeys returned $NKEYS entries, expected 2"
+# adding the same key twice must be refused, or its addresses would be
+# derived twice into the window
+DUP=$(bmc addhdkey "[\"$HK\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print(d['error']['message'] if d.get('error') else 'ACCEPTED')")
+case "$DUP" in
+  *"Unable to parse HD key"*) ok "an xPUB is refused: addhdkey takes a private key" ;;
+  *)                          fail "addhdkey accepted an xpub: $DUP" ;;
+esac
+
+# The added key's index-0 receive address, derived by CORE from the xpub our
+# node reported. Core is the independent party here: if we asked our own node
+# where to send the money, the test would only prove it agrees with itself.
+HK_DESC=$(core getdescriptorinfo "wpkh($HK/0/0)" | python3 -c "
+import sys,json
+try: print(json.load(sys.stdin)['descriptor'])
+except Exception: print('')")
+HK_ADDR=$(core deriveaddresses "$HK_DESC" 2>/dev/null | python3 -c "
+import sys,json
+try: print(json.load(sys.stdin)[0])
+except Exception: print('')")
+case "$HK_ADDR" in
+  bcrt1*) ok "added key's first address derives to $HK_ADDR" ;;
+  *)      fail "could not derive the added key's address (got '${HK_ADDR:-<empty>}')" ;;
+esac
+
+# Fund it the way the rest of this script moves money -- createrawtransaction,
+# signrawtransactionwithwallet, sendrawtransaction. (sendtoaddress is a
+# separate, still-limited path; using it here would test that instead.)
+read -r HF_TXID HF_VOUT HF_VAL <<HFEOF
+$(python3 - "$BMC_DIR/regtest/walletscan.dat" "$WORK/memraw.txt" <<'HFPY'
+import struct,sys
+d=open(sys.argv[1],'rb').read()
+S = {b'BMCWSCN4':88, b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+if not S: sys.exit("unexpected scan format")
+h,n=struct.unpack('<II',d[8:16]); body=d[16:]
+recs=[body[i*S:(i+1)*S] for i in range(n)]
+spent=set()
+for r in recs:
+    if r[48]==1:
+        vo,=struct.unpack('<I',r[36:40]); spent.add((r[54:86], vo))
+# ...and everything the MEMPOOL already spends
+def vi(b,p):
+    v=b[p]
+    if v<0xfd: return v,p+1
+    if v==0xfd: return int.from_bytes(b[p+1:p+3],'little'),p+3
+    if v==0xfe: return int.from_bytes(b[p+1:p+5],'little'),p+5
+    return int.from_bytes(b[p+1:p+9],'little'),p+9
+try:
+    for line in open(sys.argv[2]):
+        line=line.strip()
+        if not line: continue
+        b=bytes.fromhex(line); p=4
+        if b[4:6]==b'\x00\x01': p=6
+        nin,p=vi(b,p)
+        for _ in range(nin):
+            spent.add((b[p:p+32], int.from_bytes(b[p+32:p+36],'little')))
+            p+=36
+            sl,p=vi(b,p); p+=sl+4
+except Exception:
+    pass
+best=None
+for r in recs:
+    ht,=struct.unpack('<I',r[0:4])
+    if r[48]!=0 or ht>h-100: continue
+    vo,=struct.unpack('<I',r[36:40]); val,=struct.unpack('<Q',r[40:48])
+    if (r[4:36], vo) in spent: continue
+    if best is None or val>best[2]: best=(r[4:36][::-1].hex(), vo, val)
+if not best: sys.exit("no mature unspent coin to fund from")
+print(best[0], best[1], best[2])
+HFPY
+)
+HFEOF
+if [ -n "${HF_TXID:-}" ]; then
+  PAY_SAT=$((HF_VAL - 20000))
+  PAY_BTC=$(python3 -c "print('%.8f'%($PAY_SAT/1e8))")
+  FRAW=$(bmc createrawtransaction "[[{\"txid\":\"$HF_TXID\",\"vout\":$HF_VOUT}],{\"$HK_ADDR\":$PAY_BTC}]" | jq_ "d['result']")
+  FSIGNED=$(bmc signrawtransactionwithwallet "[\"$FRAW\"]" | jq_ "d['result']['hex'] if d['result'].get('complete') else sys.exit('funding signature incomplete')")
+  FTXID=$(bmc sendrawtransaction "[\"$FSIGNED\"]" | jq_ "d['result']")
+  [ -n "$FTXID" ] && ok "paid $PAY_BTC BTC to the added key's address ($FTXID)" \
+                  || fail "could not pay the added key's address"
+  # Core mines from ITS mempool, so the transaction has to relay across
+  # before the block is made. Generating immediately mines an empty block and
+  # the payment simply never confirms -- which reads as "the wallet cannot
+  # see the added key", a very different and much more alarming conclusion.
+  for _ in $(seq 30); do
+    core getmempoolentry "$FTXID" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  core getmempoolentry "$FTXID" >/dev/null 2>&1 \
+    && ok "the funding transaction relayed to Core" \
+    || fail "the funding transaction never reached Core; it cannot be mined"
+  core -generate 1 >/dev/null 2>&1
+  wait_sync || fail "our node never caught up to Core's height"
+  bmc rescanblockchain >/dev/null 2>&1
+
+  # THE POINT: the wallet must see an output paying a key it did not derive
+  # from its own seed. Before addhdkey this coin was simply invisible.
+  SEEN=$(python3 - "$BMC_DIR/regtest/walletscan.dat" "$FTXID" <<'SEENPY'
+import struct,sys
+d=open(sys.argv[1],'rb').read()
+S = {b'BMCWSCN4':88, b'BMCWSCN3':87, b'BMCWSCN2':86}.get(d[:8])
+want=bytes.fromhex(sys.argv[2])[::-1]
+h,n=struct.unpack('<II',d[8:16]); body=d[16:]
+for i in range(n):
+    r=body[i*S:(i+1)*S]
+    if r[48]==0 and r[4:36]==want:
+        print("hdkey=%d" % (r[87] if S==88 else 0)); break
+else:
+    print("MISSING")
+SEENPY
+)
+  case "$SEEN" in
+    hdkey=1) ok "the wallet recorded the output, attributed to the ADDED key ($SEEN)" ;;
+    hdkey=0) fail "the output was attributed to the SEED -- the hdkey field is not being written" ;;
+    *)       fail "the wallet did not see the added key's output ($SEEN)" ;;
+  esac
+
+  # ...and can SPEND it. If the signer lacks the added key's private half this
+  # is where it shows, which is the failure this whole design exists to avoid.
+  BACK=$(core -rpcwallet=e2ecore getnewaddress)
+  SP_BTC=$(python3 -c "print('%.8f'%(($PAY_SAT - 20000)/1e8))")
+  SRAW=$(bmc createrawtransaction "[[{\"txid\":\"$FTXID\",\"vout\":0}],{\"$BACK\":$SP_BTC}]" | jq_ "d['result']")
+  SSIGNED=$(bmc signrawtransactionwithwallet "[\"$SRAW\"]" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+if d.get('error'): sys.exit('RPC error: '+json.dumps(d['error']))
+r=d['result']
+print(r['hex'] if r.get('complete') else 'INCOMPLETE')")
+  [ "$SSIGNED" != "INCOMPLETE" ] && [ -n "$SSIGNED" ] \
+    && ok "the wallet SIGNED an input locked to the added key" \
+    || fail "could not sign the added key's output -- the signer lacks its private half"
+  if [ "$SSIGNED" != "INCOMPLETE" ] && [ -n "$SSIGNED" ]; then
+    STXID=$(bmc sendrawtransaction "[\"$SSIGNED\"]" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('ERR:'+d['error']['message'] if d.get('error') else d['result'])")
+    case "$STXID" in
+      ERR:*) fail "the signed spend was rejected: $STXID" ;;
+      *)     ok "...and the network accepted the spend ($STXID)" ;;
+    esac
+  fi
+else
+  fail "no mature unspent coin to fund the added key from"
+fi
+
+
+# Format interop, in both directions. A round trip through our own code
+# proves only that we agree with ourselves.
+
 [ $FAILURES -eq 0 ] && echo "ALL TESTS PASSED (0 failures)" || echo "FAILURES: $FAILURES"
 exit $((FAILURES>0))

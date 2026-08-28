@@ -67,10 +67,17 @@
  * rescan of every existing wallet would be a worse trade than a balance that
  * cannot apply coinbase maturity until the next rescan) -- wscan_flags_known()
  * reports which one the reader got. */
-#define WSCAN_MAGIC  "BMCWSCN3"
+/* Format 4 adds hdkey (which HD key owns the output). Formats 3 and 2 are
+ * still READ -- forcing every existing wallet to rescan would be a worse
+ * trade than a record set whose outputs are all attributed to the seed,
+ * which is exactly what they are on a wallet that has never called
+ * addhdkey. */
+#define WSCAN_MAGIC  "BMCWSCN4"
+#define WSCAN_MAGIC3 "BMCWSCN3"
 #define WSCAN_MAGIC2 "BMCWSCN2"
 #define WSCAN_HDR   16
-#define WSCAN_REC   87
+#define WSCAN_REC   88
+#define WSCAN_REC_V3 87
 #define WSCAN_REC_V2 86
 
 /* Set by wscan_read: whether the file it just read carries is_coinbase. */
@@ -88,6 +95,7 @@ typedef struct {
     unsigned long long value;
     unsigned int  keyidx;
     unsigned char branch;
+    unsigned char hdkey;      /* carried so the SPEND record can name it too */
     unsigned char used;
 } wscan_own;
 
@@ -118,7 +126,8 @@ static wscan_own* wscan_set_find(wscan_set* s, const unsigned char txid[32], uns
     return NULL;
 }
 static int wscan_set_add(wscan_set* s, const unsigned char txid[32], unsigned int vout,
-                         unsigned long long value, unsigned int keyidx, unsigned char branch){
+                         unsigned long long value, unsigned int keyidx, unsigned char branch,
+                         unsigned char hdkey){
     if (s->n * 4 >= (s->mask + 1) * 3) return 0;     /* keep load under 0.75 */
     unsigned long i = wscan_hash(txid, vout) & s->mask;
     for (unsigned long probe = 0; probe <= s->mask; probe++){
@@ -129,7 +138,7 @@ static int wscan_set_add(wscan_set* s, const unsigned char txid[32], unsigned in
         }
         memcpy(o->txid, txid, 32);
         o->vout = vout; o->value = value; o->keyidx = keyidx; o->branch = branch;
-        o->used = 1; s->n++;
+        o->hdkey = hdkey; o->used = 1; s->n++;
         return 1;
     }
     return 0;
@@ -137,7 +146,8 @@ static int wscan_set_add(wscan_set* s, const unsigned char txid[32], unsigned in
 
 /* ---- key set ------------------------------------------------------------ */
 static int wscan_key_find(const wscan_key* keys, int nkeys, const unsigned char h[20],
-                          unsigned int* keyidx, unsigned char* branch){
+                          unsigned int* keyidx, unsigned char* branch,
+                          unsigned char* hdkey){
     /* keys are sorted by hash160 so this is a binary search; the window is
      * a couple of thousand entries and this runs per output of every tx in
      * the chain, so a linear scan would dominate the whole rescan. */
@@ -145,7 +155,8 @@ static int wscan_key_find(const wscan_key* keys, int nkeys, const unsigned char 
     while (lo <= hi){
         int mid = lo + (hi - lo) / 2;
         int c = memcmp(keys[mid].h160, h, 20);
-        if (c == 0){ *keyidx = keys[mid].keyidx; *branch = keys[mid].branch; return 1; }
+        if (c == 0){ *keyidx = keys[mid].keyidx; *branch = keys[mid].branch;
+                     *hdkey = keys[mid].hdkey; return 1; }
         if (c < 0) lo = mid + 1; else hi = mid - 1;
     }
     return 0;
@@ -345,6 +356,7 @@ long wscan_run(long from, long to,
                       rec[w++] = o->branch;
                       memcpy(rec + w, q, 32); w += 32;                /* the SPENT outpoint */
                       rec[w++] = 0;                                  /* is_coinbase: n/a on a spend */
+                      rec[w++] = o->hdkey;                           /* inherited from the output spent */
                       if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto shortwrite;
                       nrec++;
                   }
@@ -362,9 +374,9 @@ long wscan_run(long from, long to,
                   unsigned long sl = wscan_varint(q, end, &cc);
                   q += cc;
                   const unsigned char* hh160;
-                  unsigned int kidx; unsigned char br;
+                  unsigned int kidx; unsigned char br, hdk;
                   if (wscan_spk_h160(q, sl, &hh160) &&
-                      wscan_key_find(keys, nkeys, hh160, &kidx, &br)){
+                      wscan_key_find(keys, nkeys, hh160, &kidx, &br, &hdk)){
                       unsigned char rec[WSCAN_REC]; unsigned long w = 0;
                       unsigned int hgt = (unsigned int)h;
                       for (int k=0;k<4;k++) rec[w++] = (unsigned char)(hgt >> (8*k));
@@ -376,9 +388,10 @@ long wscan_run(long from, long to,
                       rec[w++] = br;
                       memset(rec + w, 0, 32); w += 32;                /* no prev on a receive */
                       rec[w++] = (t == 0) ? 1 : 0;                    /* block's first tx = coinbase */
+                      rec[w++] = hdk;                                 /* which HD key owns it */
                       if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto shortwrite;
                       nrec++;
-                      if (!wscan_set_add(&own, txidbuf, (unsigned int)i, val, kidx, br)){
+                      if (!wscan_set_add(&own, txidbuf, (unsigned int)i, val, kidx, br, hdk)){
                           fclose(f); unlink(tmp); wscan_set_free(&own);
                           if (err && errcap)
                               snprintf(err, errcap,
@@ -430,15 +443,17 @@ long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out){
     FILE* f = fopen(path, "rb");
     if (!f) return 0;                       /* absent == no scan has completed */
     unsigned char hdr[WSCAN_HDR];
-    int v3 = 0;
+    int ver = 0;
     if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr){
         fclose(f); return 0;                /* torn: treat as absent */
     }
-    if      (!memcmp(hdr, WSCAN_MAGIC,  8)) v3 = 1;
-    else if (!memcmp(hdr, WSCAN_MAGIC2, 8)) v3 = 0;   /* older: no is_coinbase */
+    if      (!memcmp(hdr, WSCAN_MAGIC,  8)) ver = 4;
+    else if (!memcmp(hdr, WSCAN_MAGIC3, 8)) ver = 3;  /* no hdkey */
+    else if (!memcmp(hdr, WSCAN_MAGIC2, 8)) ver = 2;  /* older: no is_coinbase */
     else { fclose(f); return 0; }           /* foreign: treat as absent */
-    g_wscan_flags_known = v3;
-    const unsigned long recsz = v3 ? WSCAN_REC : WSCAN_REC_V2;
+    g_wscan_flags_known = (ver >= 3);
+    const unsigned long recsz = ver >= 4 ? WSCAN_REC
+                              : ver == 3 ? WSCAN_REC_V3 : WSCAN_REC_V2;
     unsigned int tip = 0, n = 0;
     for (int k=0;k<4;k++) tip |= (unsigned int)hdr[8+k]  << (8*k);
     for (int k=0;k<4;k++) n   |= (unsigned int)hdr[12+k] << (8*k);
@@ -456,7 +471,10 @@ long wscan_read(const char* path, wscan_rec* out, long cap, long* tip_out){
         r->keyidx = 0; for (int k=0;k<4;k++) r->keyidx |= (unsigned int)rec[w++] << (8*k);
         r->branch = rec[w++];
         memcpy(r->prev_txid, rec + w, 32); w += 32;
-        r->is_coinbase = v3 ? rec[w++] : 0;   /* v2 cannot say; see wscan_flags_known */
+        r->is_coinbase = ver >= 3 ? rec[w++] : 0; /* v2 cannot say; see wscan_flags_known */
+        /* pre-v4 files predate added HD keys, so every output in them belongs
+         * to the seed -- 0 is the truth for them, not a guess */
+        r->hdkey = ver >= 4 ? rec[w++] : 0;
         got++;
     }
     fclose(f);
@@ -502,6 +520,7 @@ int wscan_write(const char* path, const wscan_rec* recs, long n, long tip,
         rec[w++] = r->branch;
         memcpy(rec + w, r->prev_txid, 32); w += 32;
         rec[w++] = r->is_coinbase;
+        rec[w++] = r->hdkey;
         if (w != WSCAN_REC) goto fail;      /* layout drift, caught here */
         if (fwrite(rec, 1, WSCAN_REC, f) != WSCAN_REC) goto fail;
     }

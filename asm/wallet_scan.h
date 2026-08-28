@@ -11,6 +11,13 @@ typedef struct {
     unsigned char h160[20];
     unsigned int  keyidx;     /* the <i> in m/84'/0'/0'/<i>/<branch> */
     unsigned char branch;     /* 0 receive, 1 change */
+    unsigned char hdkey;      /* WHICH HD key this came from: 0 = the wallet's
+                               * own seed, 1..N = a key added by addhdkey.
+                               * Without it two HD keys collide on
+                               * (keyidx, branch) and a record from one
+                               * resolves to the other's address -- the wallet
+                               * would then build a spend against the wrong
+                               * scriptPubKey. */
 } wscan_key;
 
 int wscan_key_cmp(const void* a, const void* b);
@@ -40,6 +47,11 @@ typedef struct {
                                    * first, so the coin needs 100 confirmations
                                    * before it is spendable. Only a format-3
                                    * file carries this; see wscan_flags_known */
+    unsigned char hdkey;          /* which HD key owns this output; see
+                                   * wscan_key. Only a format-4 file carries
+                                   * it, and 0 -- the wallet's own seed -- is
+                                   * both the default and what every older
+                                   * file means. */
 } wscan_rec;
 
 /* 1 when the scan file that produced these records was format 3 or newer and
