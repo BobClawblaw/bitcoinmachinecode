@@ -351,10 +351,12 @@ node_serve_loop:
     je   .do_tx
     cmp  dword [s_cmd], 0x636f6c62   ; "bloc" ("block" command byte0..3, LE)
     je   .do_block
-    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct / sendheaders)
+    cmp  dword [s_cmd], 0x646e6573   ; "send" (sendcmpct / sendheaders / sendaddrv2)
     je   .maybe_sendcmpct
     cmp  dword [s_cmd], 0x66656566   ; "feef" (feefilter)
     je   .maybe_feefilter
+    cmp  dword [s_cmd], 0x69787477   ; "wtxi" (wtxidrelay) -- a handshake-only
+    je   .done                       ;   message; after verack Core disconnects
     jmp  .next
 
 .do_verack:
@@ -1250,6 +1252,12 @@ node_serve_loop:
     ;   cmd[4]=='c' && cmd[5]=='m' -> sendcmpct : BIP152 negotiation.
     cmp  byte [s_cmd+4], 'h'
     je   .do_sendheaders
+    ; sendaddrv2 is handshake-only (BIP155: before verack). This loop only
+    ; runs after verack, so one arriving here is a protocol violation; Core
+    ; disconnects ("sendaddrv2 received after verack"), and so do we -- an
+    ; offer we could not honour would be silently misleading. (2026-08-28)
+    cmp  byte [s_cmd+4], 'a'
+    je   .done
     cmp  byte [s_cmd+4], 'c'
     jne  .next
     cmp  byte [s_cmd+5], 'm'
