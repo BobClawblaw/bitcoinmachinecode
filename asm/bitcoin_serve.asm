@@ -30,6 +30,7 @@ default rel
     extern amr_get_i
     extern p2p_addr_v1
     extern idx_get
+    extern serve_idx_topup
     extern idx_put
     extern store_append
     extern block_strip_witness
@@ -648,6 +649,13 @@ node_serve_loop:
     mov  rax, [s_plen]
     cmp  rax, 37
     jb   .next
+    ; Fold in any height index.dat has gained since this process last looked.
+    ; The hash index below was built at BOOT; new blocks are appended by the
+    ; DOWNLOAD WORKER, a different process, so without this every block we
+    ; downloaded during the run is a silent miss and this node never helps
+    ; propagate recent blocks. Cheap when nothing is new (one stat), and done
+    ; here rather than per connection so a long-lived peer cannot go stale.
+    call serve_idx_topup
     ; cnt = pl[0] (single-byte varint)
     movzx rax, byte [pl_buf]
     mov  [s_cnt], rax     ; item counter

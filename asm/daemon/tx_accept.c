@@ -771,6 +771,15 @@ long tx_accept_block_connect(void* mp_area, const unsigned char* block,
     return r;
 }
 
+/* serve_idx_topup: WEAK default. bitcoin_serve.asm calls this at the top of
+ * getdata handling to fold in heights index.dat has gained since boot; the
+ * real one lives in daemon/main.c, where ht_idx does. Several test targets
+ * link bitcoin_serve.o WITHOUT main.c -- the same reason
+ * log_block_stored_inbound lives in this file -- and for them "no new
+ * heights" is the honest answer, since nothing is appending any.
+ * A strong definition anywhere in the link overrides this one. */
+__attribute__((weak)) long serve_idx_topup(void){ return 0; }
+
 /* log_block_stored_inbound(hash32, height, bytes): called from
  * bitcoin_serve.asm's .do_block, the ONLY place a peer-pushed block
  * (unsolicited, or in response to our own .do_inv-triggered getdata) is
