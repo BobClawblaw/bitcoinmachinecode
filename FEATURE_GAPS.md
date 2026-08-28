@@ -196,6 +196,40 @@ that overstates is no more honest than one that understates; both are wrong
 about where the work is. What follows was checked by reading the dispatch
 tables and the writers themselves.
 
+- **BLOCKS DOWNLOADED AFTER BOOT CANNOT BE SERVED.** Found 2026-08-28 by
+  `validation/p2p_inbound_probe.py`, speaking the wire protocol to this node
+  and to Core on the same regtest chain. `getdata` for a block that was in
+  the archive at startup returns it; `getdata` for a block this node
+  downloaded *during the run* is answered with **silence**.
+
+  Mechanism: the serve path's in-memory hash index is built once, at boot,
+  by `idx_build_from_file` (`daemon/main.c`). The download worker appends
+  new blocks in ANOTHER process, so the serve parent — and every serve child
+  forked from it — never learns about them. `bitcoin_serve.asm`'s `.do_block`
+  does `idx_put`, but only for blocks a peer PUSHES to that child.
+
+  Consequence: this node never helps propagate recent blocks, which is the
+  only propagation that matters. It looked fine when block serving was
+  verified on 2026-08-27 because a caught-up node mostly answers for
+  historical blocks, and those were in the archive at boot.
+
+  The fix shape already exists one layer over: `rpc_chain.c`'s `refresh()`
+  tops its index up incrementally from `index.dat` on every chain RPC. The
+  serve path needs the same before it concludes a miss.
+- **A `getdata` miss is answered with SILENCE, not `notfound`.** Core replies
+  `notfound`; this node says nothing, so the peer waits out its own timeout.
+  The relay drain (`daemon/tx_relay.c`) does send `notfound` — the SERVE path
+  does not. Same probe.
+- **BIP157 compact filters are BUILT but never SERVED.** `getcfilters`,
+  `getcfheaders` and `getcfcheckpt` are not in `bitcoin_serve.asm`'s dispatch
+  at all, so this node answers none of them; Core with `-peerblockfilters=1`
+  answers all three. The filter index exists and is proven byte-identical to
+  Core's — it is simply not reachable over P2P.
+- **addrv2 (BIP155) is parsed but never NEGOTIATED.** `bitcoin_addrmgr.asm`
+  has the addrv2 codec, but the handshake never sends `sendaddrv2`, so no
+  peer will ever send us one (probe: Core offers it, we do not). This list
+  previously described addrv2 as "genuinely wired into the real serve loop",
+  which is true of the codec and false of the negotiation.
 - **Full-verification IBD benchmark vs Core** (`-assumevalid=0
   -stopatheight`, second scratch datadir) — **still never run.** The one
   like-for-like end-to-end speed comparison, and the only item here that is
@@ -339,6 +373,21 @@ templates, exact sigops, BIP23 proposal mode, longpoll), chain selection for
 regtest AND testnet4, nBits schedule enforcement, `bumpfee`/`psbtbumpfee`,
 and `gettxout` (which had been answering `null` — i.e. "spent" — for every
 outpoint on the live node).
+
+## How this list is checked (2026-08-28)
+
+Claims here were audited against evidence rather than against each other,
+after a `[config]` log string was believed over the code and briefly
+propagated into this file (see `assumevalid`). Two tools do it:
+
+- `validation/p2p_inbound_probe.py` — speaks the wire protocol as a stranger
+  and records what a node answers to each inbound message. Run it against
+  Bitcoin Core and against this node on the same chain and diff the reports.
+  A message Core answers and we ignore is a gap; it found three on the day it
+  was written.
+- an RPC-surface diff against a live Core: **155 Core methods, and the only
+  one missing here is `rpc.discover`** (OpenRPC). Re-verified 2026-08-28
+  against Core v31.99 rather than taken from an earlier claim.
 
 ## RPC surface — the biggest gap until 2026-08-25; first tranche 2026-08-21
 
@@ -687,7 +736,7 @@ Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
 - **BIP152 compact blocks** — both directions (`cmpctblock_build`,
   `p2p_blocktxn_build`, full message handling).
-- **wtxid relay, addrv2 (BIP155), feefilter, sendheaders** — all genuinely
+- **wtxid relay, feefilter, sendheaders** — all genuinely
   implemented and exchanged during real handshakes.
 - **Witness transport (BIP144) — FIXED 2026-08-22** (`31eac9a`, `fe3addb`):
   block requests were `MSG_BLOCK`, so every post-segwit block was fetched
