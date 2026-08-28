@@ -56,6 +56,7 @@ typedef struct {
 #define RPC_CTL_CLEARBANNED    4
 #define RPC_CTL_SETNETACTIVE   5   /* ctl_num = 0/1 */
 #define RPC_CTL_PING           6
+#define RPC_CTL_ADDPEERADDRESS 7   /* ctl_arg = "host:port" (any BIP155 network), ctl_num = tried */
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
@@ -234,11 +235,13 @@ typedef struct {
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 
-/* Hand the RPC layer the persistent address book (bitcoin_addrmgr.asm), so
+/* Hand the RPC layer the persistent address book (daemon/addrbook.c v2), so
  * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
  * pointers for the same no-link-fanout reason as the mempool hooks. */
+#include "daemon/addrbook.h"
 void rpc_node_set_addrbook(void* ab, long (*count)(void*),
-                           int (*get_i)(void*, long, unsigned char*));
+                           int (*get)(void*, long, ab2_rec_t*));
+void rpc_node_set_addrbook_dir(const char* dir);
 
 /* Hand the RPC layer the operator's addnode= list (node_config's
  * g_cfg.addnode / n_addnode), so getaddednodeinfo reports the real
