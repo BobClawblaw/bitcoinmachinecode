@@ -401,3 +401,7 @@ regtest-e2e/
 # deploy snapshots: ~31MB binaries, one per deploy, kept on the host as the
 # rollback path. They are build products, not source.
 asm/daemon/bitcoind.deploy-*
+
+# ARM port build artifacts (this branch)
+scratch_daemon/
+port/arm64/daemon_out/
