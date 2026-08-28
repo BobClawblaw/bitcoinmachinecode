@@ -167,6 +167,10 @@ node_handshake:
 	sub  sp, sp, #432
 	/* locals: ver_payload@0 (128), plen@144(4), cmd@160(12), payload@192(256) */
 	mov  x19, x0                     /* fd */
+	/* BIP155: per-handshake reset -- peer has not asked for addrv2 yet */
+	adrp x10, g_peer_wants_addrv2
+	add  x10, x10, :lo12:g_peer_wants_addrv2
+	str  xzr, [x10]
 	/* build + send version */
 	mov  x0, sp
 	bl   node_make_version
@@ -210,6 +214,21 @@ node_handshake:
 	mov  x0, x1                        /* dst = payload */
 	add  x1, sp, #192                  /* src */
 	bl   .Lcopy
+	/* BIP155 offer: if peer proto >= 70016, send sendaddrv2 (mirrors
+	 * bitcoind.asm's post-version offer; withheld from older peers) */
+	ldr  w10, [sp, #192]
+	mov  w11, #0x1180
+	movk w11, #0x0001, lsl #16
+	cmp  w10, w11
+	b.lt .LNH_av2_skip
+	mov  x0, x19
+	adrp x1, _sendaddrv2
+	add  x1, x1, :lo12:_sendaddrv2
+	mov  x2, #10
+	mov  x3, #0
+	mov  x4, #0
+	bl   p2p_write
+.LNH_av2_skip:
 .LNH_not_version:
 	/* is it "verack"? */
 	add  x0, sp, #160
@@ -253,8 +272,12 @@ node_handshake:
 	mov  x2, #10
 	bl   .Lcmpeq
 	cbz  x0, 2f
-	mov  x2, #10
-	b    .LNH_echo
+	/* BIP155: peer wants addrv2 from us -- remember it, DON'T echo */
+	adrp x10, g_peer_wants_addrv2
+	add  x10, x10, :lo12:g_peer_wants_addrv2
+	mov  x11, #1
+	str  x11, [x10]
+	b    .LNHread
 2:	add  x0, sp, #160
 	adrp x1, _wtxidrelay
 	add  x1, x1, :lo12:_wtxidrelay
@@ -311,6 +334,10 @@ node_accept_handshake:
 	sub  sp, sp, #1024
 	/* cmd@0 (12), plen@16(4), ourver@32(128), recv@192(256) */
 	mov  x19, x0                     /* fd */
+	/* BIP155: per-handshake reset (see node_handshake) */
+	adrp x10, g_peer_wants_addrv2
+	add  x10, x10, :lo12:g_peer_wants_addrv2
+	str  xzr, [x10]
 .LAHloop:
 	mov  x0, x19
 	add  x1, sp, #0                  /* cmd */
@@ -367,6 +394,21 @@ node_accept_handshake:
 	bl   p2p_write
 	cmp  x0, #24
 	b.lt .LAHfail
+	/* BIP155 offer: if peer proto >= 70016, send sendaddrv2 before verack
+	 * (mirrors bitcoind.asm node_accept_handshake) */
+	ldr  w10, [sp, #192]
+	mov  w11, #0x1180
+	movk w11, #0x0001, lsl #16
+	cmp  w10, w11
+	b.lt .LAH_av2_skip
+	mov  x0, x19
+	adrp x1, _sendaddrv2
+	add  x1, x1, :lo12:_sendaddrv2
+	mov  x2, #10
+	mov  x3, #0
+	mov  x4, #0
+	bl   p2p_write
+.LAH_av2_skip:
 	/* send our verack */
 	mov  x0, x19
 	adrp x1, _verack
@@ -390,6 +432,19 @@ node_accept_handshake:
 	mov  x2, #6
 	bl   .Lcmpeq
 	cbnz x0, .LAHok
+	/* BIP155: peer wants addrv2 from us -- remember, keep waiting for verack */
+	add  x0, sp, #0
+	adrp x1, _sendaddrv2
+	add  x1, x1, :lo12:_sendaddrv2
+	mov  x2, #10
+	bl   .Lcmpeq
+	cbz  x0, .LAH_not_sendaddrv2
+	adrp x10, g_peer_wants_addrv2
+	add  x10, x10, :lo12:g_peer_wants_addrv2
+	mov  x11, #1
+	str  x11, [x10]
+	b    .LAHread_verack
+.LAH_not_sendaddrv2:
 	add  x0, sp, #0
 	adrp x1, _ping
 	add  x1, x1, :lo12:_ping
@@ -1817,6 +1872,14 @@ g_peer_version_payload:
 	.global g_peer_version_len
 	.type g_peer_version_len, @object
 g_peer_version_len:
+	.zero 8
+/* BIP155: peer sent `sendaddrv2` before verack? 1/0, reset at the start of
+ * every handshake in both roles. Read by bitcoin_serve.S (getaddr reply
+ * encoding) and snapshotted per outbound leg by daemon/main.c (self-
+ * announcement encoding). Mirrors asm/bitcoind.asm's g_peer_wants_addrv2. */
+	.global g_peer_wants_addrv2
+	.type g_peer_wants_addrv2, @object
+g_peer_wants_addrv2:
 	.zero 8
 
 /* ---- RO data: wire command names + user-agent ---- */
