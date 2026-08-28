@@ -185,8 +185,8 @@ count, uptime.
 
   The snapshot names march a letter per deploy on a given day
   (`…-20260827o`, `p`, `q`, …), doubling after `z` (`aa`, `ab`, …). As of
-  2026-08-27 the live binary is **`bitcoind.deploy-20260827ac`**; the
-  rollback one step back is `…-20260827ab`.
+  2026-08-27 the live binary is **`bitcoind.deploy-20260827ad`**; the
+  rollback one step back is `…-20260827ac`.
 
   These snapshots are NOT in git (they are ~31 MB build products, and a
   `git add -A` once swept twenty of them plus a scratch datadir into a
@@ -201,7 +201,28 @@ count, uptime.
   for a minute there is working as intended; the line is printed when it
   finishes.
 
-  The nine that changed live behaviour most, newest first:
+  The ten that changed live behaviour most, newest first:
+  - **`ad`** (`90531b9`) — `addhdkey`, the last wallet refusal. **Carries an
+    on-disk format bump**: the wallet record file gains an `hdkey` byte
+    (BMCWSCN3 → BMCWSCN4), without which two HD keys resolve to each other's
+    addresses.
+
+    That bump is INERT until something writes the file. Formats 2 and 3 still
+    read, and `hdkey = 0` is the truth for them rather than a default — they
+    predate added keys. Verified on the live node: the wallet's answers
+    (`getbalance`, `getwalletinfo`, `gethdkeys`, `listdescriptors`) are
+    byte-identical across the restart and `walletscan.dat` is untouched, still
+    BMCWSCN2. It is rewritten as v4 only by a rescan or a
+    pruned-funds call.
+
+    Also fixes a defect that was never about addhdkey: every xpub this node
+    produced carried MAINNET version bytes, so Core rejected them outright on
+    regtest and testnet4. Mainnet output is unchanged (verified: still
+    `xpub…`).
+
+    Before deploying this one the wallet files were copied to
+    `/mnt/archive/bmc-backup/20260828-predeploy-ad/`, which is the right
+    reflex for any deploy that can rewrite them.
   - **`ac`** (`ad59611`) — five of the six remaining wallet refusals were not
     actually blocked: `migratewallet` and `createwalletdescriptor` answer
     Core's own verdict for a wallet of this shape, `importprunedfunds` /
