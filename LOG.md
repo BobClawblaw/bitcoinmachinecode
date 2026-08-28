@@ -94,15 +94,35 @@ same day; two of them were worse than the gap this work set out to close:
     at a record. All three now assert the thing they name; the cap check
     compares every one of the 1000 records to the planted book.
 
-NOT DONE, stated: outbound legs still ignore incoming addr/addrv2 (address
-ingestion happens on separate replenish connections, which already
-negotiate v2); a sendaddrv2 arriving AFTER verack is ignored where Core
-disconnects; getaddr replies are the first <=1000 book entries, not Core's
-randomised 23% sample; the four per-leg wants-v2 capture sites in main.c
-have no test (the daemon's self-announcement needs two agreeing public
-views, which loopback cannot supply); addresses fabricated by the old v1
-parser may still sit in the live book (unreachable, not harmful; the book
-replenishes itself).
+THE STATED GAPS, CLOSED THE SAME EVENING (second change, same day):
+  - Outbound legs now FOLD addr/addrv2 gossip into the book (daemon/
+    tx_relay.c) through the same parsers, with Core's per-peer token bucket
+    (1000 to start, 0.1/s refill) charged PER ADDRESS: a message declaring
+    more entries than the bucket holds is processed up to the budget and
+    the rest dropped. The first cut dropped the whole message when it did
+    not fit; its own test caught that (a 1000-entry flood against a bucket
+    down by 8 vanished entirely where Core would take 992). On top sits the
+    existing per-response (256) and per-/16 (16) quota. tests/test_tx_relay
+    5c: three from addrv2, two from addr, no duplicates on re-gossip, a
+    flood capped at 256, and the NEXT single address rate-limited because
+    the flood emptied the bucket.
+  - sendaddrv2 or wtxidrelay arriving AFTER verack now disconnects, as Core
+    does ("... received after verack"). The probe reports an EOF as
+    <disconnected> instead of silence -- it could not previously tell
+    "ignored" from "hung up", and a report that cannot tell those apart
+    calls two nodes equal when they are not. Both late messages now read
+    identically for this node and for Core.
+  - The per-leg wants-v2 verdict is in the leg log line (`addrv2=1`), and
+    tests/test_outbound_mux's fake peer now speaks 70016 and offers
+    sendaddrv2: the REAL daemon's outbound handshake offers it back (the
+    peer sees it pre-verack) and its leg log records the peer's offer. Run
+    against the previous binary, the log assertion fails.
+  Still stated: the book is IPv4-only (a record-format change, not a fix;
+  the node has no Tor/I2P transport, so the only use would be relaying such
+  addresses onward); getaddr replies are the first <=1000 entries, not a
+  randomised sample; the daemon's own addrv2 self-announcement is covered
+  by test_addr_self, not end to end (needs two agreeing public views).
+
 
 ## 2026-08-28 -- the closing pass, and why it takes the daemon down
 

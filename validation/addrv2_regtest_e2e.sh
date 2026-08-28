@@ -108,6 +108,12 @@ L_BMC=$(echo "$P_BMC" | grep -E "^\s*sendaddrv2 "); L_CORE=$(echo "$P_CORE" | gr
 echo "    bmc : $L_BMC"; echo "    core: $L_CORE"
 echo "$L_BMC" | grep -q "peer offers it too: True" && ok "this node offers sendaddrv2 back" || fail "this node does not offer sendaddrv2"
 [ "$(echo "$L_BMC" | sed 's/ *$//')" = "$(echo "$L_CORE" | sed 's/ *$//')" ] && ok "probe line identical to Core's" || fail "probe line differs from Core's"
+for late in sendaddrv2_late wtxidrelay_late; do
+  LB=$(echo "$P_BMC" | grep -E "^\s*$late "); LC=$(echo "$P_CORE" | grep -E "^\s*$late ")
+  echo "    bmc : $LB"; echo "    core: $LC"
+  echo "$LB" | grep -q "<disconnected>" && ok "$late: this node disconnects (Core: '... received after verack')" || fail "$late: this node did not disconnect: $LB"
+  [ "$(echo "$LB" | sed 's/ *$//')" = "$(echo "$LC" | sed 's/ *$//')" ] && ok "$late: probe line identical to Core's" || fail "$late: differs from Core: $LC"
+done
 G_BMC=$(echo "$P_BMC" | grep -E "^\s*getaddr "); echo "    bmc : $G_BMC"
 # anchored on the REPLY column: the probe's own line starts with "getaddr",
 # so a bare grep for "addr" matched even "(silence)" (review, 2026-08-28)

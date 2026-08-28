@@ -1384,7 +1384,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
     strncpy(mux_out_host[i], peers[p], 63);
     anchor_locator(mux_out_loc[i]);
-    fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d)\n", i, peers[p], fd);
+    fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d\n", i, peers[p], fd, (int)mux_out_wants_v2[i]);
 }
 
 /* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
@@ -3097,7 +3097,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             anchor_locator(mux_out_loc[mux_n_out]);
             mux_out_nextretry[mux_n_out]=0;
             { char pv[256]; format_peer_version_info(pv, sizeof pv);
-              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[i], cfd[i], pv); }
+              fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out]); }
             rpc_fill_peer_slot(mux_n_out, srcpool[i]);   /* publish peer to getpeerinfo */
             mux_n_out++;
         }
@@ -3818,7 +3818,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     anchor_locator(mux_out_loc[mux_n_out]);
                     mux_out_nextretry[mux_n_out]=0;
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
-                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s\n", mux_n_out, srcpool[ci], nfd, pv); }
+                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[ci], nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
                     rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
                     mux_n_out++;
                 }
@@ -4108,7 +4108,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
-        fprintf(stderr,"[mux] outbound %d = %s (fd %d)\n", mux_n_out, peers[i], fd);
+        fprintf(stderr,"[mux] outbound %d = %s (fd %d) addrv2=%d\n", mux_n_out, peers[i], fd, (int)mux_out_wants_v2[mux_n_out]);
         mux_n_out++;
     }
     fprintf(stderr, "serving on port %d (%d outbound peer(s))...\n", port, mux_n_out);

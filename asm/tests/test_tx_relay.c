@@ -41,6 +41,9 @@ extern int  tx_policy_init(void);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+extern int  amr_init(void* ab);
+extern long amr_count(void* ab);
+extern int  amr_get_i(void* ab, long i, void* out);
 extern long txrelay_announce(const int* fds, int nfds);
 extern void tx_accept_set_tip(long tip);
 extern long wallet_send_tx(unsigned char* out_tx, long cap,
@@ -312,6 +315,66 @@ int main(void){
         ck("...entry type is MSG_WTX (5), the wtxid dialect",
            plen == 37 && plw[1] == 5 && plw[2] == 0 && plw[3] == 0 && plw[4] == 0);
         ck("...for the announced wtxid", plen == 37 && memcmp(plw+5, wid, 32) == 0);
+    }
+
+    printf("\n== 5c: addr / addrv2 gossip on the leg is folded into the book ==\n");
+    {
+        /* Core's msg_addrv2 / msg_addr bytes for (5.6.7.8:8333 svc 9)
+         * (9.10.11.12:8333 svc 1) (200.1.2.3:8334 svc 0x409) -- the same
+         * vectors tests/test_addrmgr pins -- and a second v1 set with
+         * different addresses. Until 2026-08-28 the drain discarded both. */
+        static const u8 V2[] = { 0x03,
+          0x00,0xf1,0x53,0x65, 0x09, 0x01, 0x04, 5,6,7,8, 0x20,0x8d,
+          0x01,0xf1,0x53,0x65, 0x01, 0x01, 0x04, 9,10,11,12, 0x20,0x8d,
+          0x02,0xf1,0x53,0x65, 0xfd,0x09,0x04, 0x01, 0x04, 200,1,2,3, 0x20,0x8e };
+        static u8 V1[1+2*30];
+        { u8* r = V1; *r++ = 2;
+          for (int k = 0; k < 2; k++){
+              u8 ip[4] = { (u8)(40+k), 50, 60, 70 };
+              memset(r, 0, 30); r[0] = 1; r[4] = 9; r[22] = 0xff; r[23] = 0xff;
+              memcpy(r+24, ip, 4); r[28] = 0x20; r[29] = 0x8d; r += 30; } }
+        unlink("peers.dat");
+        p2p_write(sp[1], "addrv2", 6, V2, (unsigned)sizeof V2);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        static u8 ab[64]; ck("book opened", amr_init(ab) == 1);
+        ck("3 addresses from addrv2 in the book", amr_count(ab) == 3);
+        { u8 rec[18]; amr_get_i(ab, 2, rec);
+          ck("record 2 = 200.1.2.3, port bytes 20 8e (BE on disk)", rec[0]==200 && rec[3]==3 && rec[4]==0x20 && rec[5]==0x8e); }
+        p2p_write(sp[1], "addr", 4, V1, (unsigned)sizeof V1);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("2 more from a legacy addr (::ffff: form, offset 24)", amr_count(ab) == 5);
+        p2p_write(sp[1], "addrv2", 6, V2, (unsigned)sizeof V2);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("re-gossiped addresses are not duplicated", amr_count(ab) == 5);
+        /* a hostile 1000-entry message: bounded by the per-response quota
+         * (g_cfg.addr_max_per_response, default 256) and the /16 netgroup cap */
+        static u8 flood[3 + 1000*30];
+        { u8* r = flood; *r++ = 0xfd; *r++ = 0xe8; *r++ = 0x03;
+          for (int k = 0; k < 1000; k++){
+              memset(r, 0, 30); r[0] = 1; r[4] = 9; r[22] = 0xff; r[23] = 0xff;
+              r[24] = (u8)(100 + (k >> 8)); r[25] = (u8)k; r[26] = 7; r[27] = 9;   /* distinct, public */
+              r[28] = 0x20; r[29] = 0x8d; r += 30; } }
+        p2p_write(sp[1], "addr", 4, flood, (unsigned)sizeof flood);
+        txrelay_poll_leg(sp[0], mp_area, 500);
+        long after = amr_count(ab);
+        { char l[120]; snprintf(l, sizeof l, "flood bounded by the per-response/netgroup quota (added %ld, 0 < n <= 256)", after - 5);
+          ck(l, after - 5 > 0 && after - 5 <= 256); }
+        /* Core's token bucket: the flood was charged per address (992 of its
+         * 1000 fit the 1000-token bucket already down by 8), so the bucket is
+         * now empty and a fresh single-address gossip must be rate-limited --
+         * not added -- until the 0.1/s refill, which no test-time span reaches */
+        static const u8 ONE[] = { 0x01, 0x00,0xf1,0x53,0x65, 0x09, 0x01, 0x04, 77,78,79,80, 0x20,0x8d };
+        p2p_write(sp[1], "addrv2", 6, ONE, (unsigned)sizeof ONE);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        ck("bucket exhausted by the flood: the next address is rate-limited (Core MAX_ADDR_RATE_PER_SECOND)", amr_count(ab) == after);
+        /* the leg is still alive afterwards */
+        u8 nonce[8] = {8,7,6,5,4,3,2,1};
+        p2p_write(sp[1], "ping", 4, nonce, 8);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        char cmd[13]; static u8 pl2[64];
+        int plen = read_msg(sp[1], cmd, pl2, sizeof pl2);
+        ck("leg still answers ping after the gossip", plen == 8 && strcmp(cmd, "pong") == 0);
+        close(*(int*)ab);
     }
 
     printf("\n== 6: orphan pool -- child before parent resolves in cascade ==\n");
