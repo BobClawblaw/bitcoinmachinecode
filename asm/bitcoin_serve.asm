@@ -7,7 +7,7 @@
 ; entirely in machine code:
 ;
 ;   ping       -> pong (echo up to 8-byte nonce)
-;   getaddr    -> addr (address book via amr_* + p2p_addr_v1)
+;   getaddr    -> addr / addrv2 (daemon/serve_addr.c, from the v2 book)
 ;   getdata    -> block (hash looked up O(1) via bitcoin_idx, served via
 ;                        node_serve_block; MSG_BLOCK wire type check at +0)
 ;   getheaders -> headers (locator resolved via the hash index; 2000x81B page)
@@ -25,11 +25,7 @@
 default rel
     extern p2p_read
     extern p2p_write
-    extern amr_init
-    extern amr_count
-    extern amr_get_i
-    extern p2p_addr_v1
-extern p2p_addr_v2
+    extern serve_getaddr
 extern g_peer_wants_addrv2
     extern idx_get
     extern serve_idx_topup
@@ -609,86 +605,16 @@ node_serve_loop:
     cmp  dword [s_cmd+4], 0x00726464 ; "ddr\0"
     jne  .next
     ; Core answers getaddr ONCE per connection and ignores repeats
-    ; (m_getaddr_recvd: "reduce resource waste"); a peer re-asking every
-    ; second would otherwise cost an open + up to 1000 lseek/read pairs +
-    ; a 30 KB write each time.
+    ; (m_getaddr_recvd: "reduce resource waste").
     cmp  byte [s_addrsent], 0
     jne  .next
     mov  byte [s_addrsent], 1
-    ; ---- addr reply ----
-    ; REWRITTEN 2026-08-28. This handler had never answered anyone: the loop
-    ; below kept its bound in rdx, which is also amr_get_i's out-pointer
-    ; argument, so after the first record the bound was a buffer address and
-    ; the loop walked off the end of the book for millions of iterations
-    ; (hermetic trace: records 0,18,36 read, then 54,72,90,... forever). With
-    ; a real-sized book it would then have overrun src_buf and ah_buf. The
-    ; old amr_init check was `jz` on a routine that returns 1 or -1, and the
-    ; fd it opened was never closed. Bound and counters now live in memory.
-    lea  rdi, [amr_ab]
-    call amr_init
-    cmp  rax, 1
-    jne  .next
-    lea  rdi, [amr_ab]
-    call amr_count
-    test rax, rax
-    jle  .addr_close             ; empty/unreadable book: Core sends nothing either
-    cmp  rax, 1000               ; MAX_ADDR_TO_SEND, and the size of src_buf/ah_buf
-    jbe  .acnt
-    mov  rax, 1000
-.acnt:
-    mov  [s_abound], rax
-    mov  qword [s_p], 0          ; have
-    mov  qword [s_cnt], 0        ; i
-.aloop:
-    mov  rcx, [s_cnt]
-    cmp  rcx, [s_abound]
-    jae  .adone
-    mov  rax, [s_p]
-    lea  r9,  [rax + rax*8]      ; have*9
-    shl  r9,  1                  ; have*18
-    lea  rdx, [src_buf + r9]     ; dst = src_buf + have*18
-    lea  rdi, [amr_ab]
-    mov  rsi, rcx
-    call amr_get_i
-    cmp  rax, 1
-    jne  .anext
-    inc  qword [s_p]
-.anext:
-    inc  qword [s_cnt]
-    jmp  .aloop
-.adone:
-    mov  rdx, [s_p]
-    test rdx, rdx
-    jz   .addr_close
-    ; Encoding follows the peer's handshake: BIP155 `addrv2` if it sent
-    ; sendaddrv2 before verack (Core sends only addrv2 to such a peer),
-    ; else the legacy `addr`.
-    cmp  qword [g_peer_wants_addrv2], 0
-    jne  .addr_v2
-    lea  rdi, [ah_buf]
-    lea  rsi, [src_buf]
-    call p2p_addr_v1
-    mov  r8d, eax                ; payload length (p2p_write arg5 = r8)
+    ; The reply is built in C from the version-2 book (daemon/serve_addr.c,
+    ; every BIP155 network) -- this loop used to read the legacy IPv4-only
+    ; book here. serve_getaddr(fd, wants_v2)
     mov  rdi, r12
-    lea  rsi, [cn_addr]
-    mov  rdx, 4
-    lea  rcx, [ah_buf]
-    call p2p_write
-    jmp  .addr_close
-.addr_v2:
-    lea  rdi, [ah_buf]
-    lea  rsi, [src_buf]
-    call p2p_addr_v2
-    mov  r8d, eax
-    mov  rdi, r12
-    lea  rsi, [cn_addrv2]
-    mov  rdx, 6
-    lea  rcx, [ah_buf]
-    call p2p_write
-.addr_close:
-    mov  rdi, [amr_ab]           ; close the book fd (one open per getaddr, never closed before)
-    mov  eax, 3
-    syscall
+    mov  rsi, [g_peer_wants_addrv2]
+    call serve_getaddr
     jmp  .next
 
 .maybe_getdata:

@@ -163,6 +163,20 @@ extern void node_log_str(int fd, int kind, const char* s, long len);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
 extern int  amr_init(void* ab);
+/* ---- address book, version 2 (daemon/addrbook.c, peers2.dat): every BIP155
+ * network. The legacy amr_* (peers.dat, IPv4 only) is migrated on first open
+ * and no longer written. addr_book() is the worker's read-write handle
+ * (daemon/addr_ingest.c). */
+#include "netaddr.h"
+#include "addrbook.h"
+#include "dialer.h"
+extern ab2_t* addr_book(void);
+static int book_add_ipv4(unsigned ip_netorder, int port){
+    bmc_addr_t a; memset(&a, 0, sizeof a);
+    a.net = BMC_NET_IPV4; a.len = 4; memcpy(a.addr, &ip_netorder, 4); a.port = (unsigned short)port;
+    ab2_t* b = addr_book(); if(!b) return -1;
+    return ab2_add(b, &a, 1, (unsigned)time(NULL));
+}
 extern long amr_count(void* ab);
 extern int  amr_get_i(void* ab, long i, void* out);
 extern long p2p_addr_v1(void* out, const void* src, long n);
@@ -583,24 +597,11 @@ static int serve_loop(int fd, int lfd){
         if(memcmp(cmd,"ping",4)==0){
             p2p_write(fd,"pong",4, pl, (plen>=8)?8:0);   /* echo nonce */
         } else if(memcmp(cmd,"getaddr",7)==0){
-            /* A connected peer asked us for our address book. Reply with an
-             * `addr` message built from peers.dat via the asm address manager
-             * (amr_* + p2p_addr_v1). This is the addr-relay half of recursive
-             * peer discovery -- answering makes the network treat us as a real
-             * full client and reciprocate. */
-            static unsigned char ab[64];
-            if(amr_init(ab)==1){
-                static unsigned char rec[18]; long cnt = amr_count(ab);
-                long n= cnt>1000?1000:cnt;           /* cap a single addr msg */
-                static unsigned char src[1000*18];
-                long have=0;
-                for(long i=0;i<n;i++){ if(amr_get_i(ab,i,rec)==1) memcpy(src+have*18,rec,18), have++; }
-                if(have>0){
-                    static unsigned char ah[1000*30+4];
-                    long L = p2p_addr_v1(ah, src, have);
-                    p2p_write(fd,"addr",4, ah, (unsigned)L);
-                }
-            }
+            /* the same reply the asm serve loop gives (daemon/serve_addr.c,
+             * from the version-2 book); this test-mode loop never learns the
+             * peer's BIP155 preference, so legacy addr */
+            extern long serve_getaddr(int, int);
+            serve_getaddr(fd, 0);
         } else if(memcmp(cmd,"getdata",7)==0){
             /* payload: count varint then per item: [type int32 LE][hash32].
              * The wire inventory `type` is a 4-byte little-endian int32
@@ -1061,6 +1062,37 @@ static void dial_fail_errno(const char* what, int rc){
 
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
     g_dial_fail[0] = 0;
+    /* ---- any BIP155 network (2026-08-28) ----------------------------------
+     * A host that parses as a Tor/I2P/CJDNS/IPv6 address goes to its
+     * transport (daemon/dialer.c); anything else is the IPv4 path below,
+     * unchanged, including DNS names (seeds, addnode=, connect=), which only
+     * the resolver can turn into an address. */
+    { bmc_addr_t da;
+      if (bmc_addr_from_string(&da, host)){
+          { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
+          da.port = (unsigned short)out_port;
+          if (da.net != BMC_NET_IPV4){
+              const char* why = "";
+              if (!dialer_net_reachable(da.net)){
+                  snprintf(g_dial_fail, sizeof g_dial_fail, "%s unreachable: no transport configured", bmc_net_name(da.net));
+                  return -1;
+              }
+              int dfd = dialer_connect(&da, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
+              if (dfd < 0){ snprintf(g_dial_fail, sizeof g_dial_fail, "%s dial: %.60s", bmc_net_name(da.net), why); return -1; }
+              struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;   /* onion/i2p round trips are slow */
+              setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+              if (node_handshake(dfd) != 1 || !peer_has_witness(host)){
+                  snprintf(g_dial_fail, sizeof g_dial_fail, "%s handshake failed", bmc_net_name(da.net));
+                  close(dfd); return -1;
+              }
+              { extern void addrself_note_peer_view(const unsigned char*, long);
+                addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
+              struct timeval t2; t2.tv_sec = rcv_ms/1000; t2.tv_usec = (rcv_ms%1000)*1000;
+              setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &t2, sizeof t2);
+              fprintf(stderr, "[dial] %s connected via %s transport\n", host, bmc_net_name(da.net));
+              return dfd;
+          }
+      } }
     /* a named peer configured as "host:port" is dialled on ITS port, not the
      * chain default (node_config.c keeps the host bare and the port beside
      * it). 0 = nothing configured for this host. */
@@ -1505,7 +1537,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         if(!dl_resolve1(g_cfg.addnode[i], ipd)){
             fprintf(stderr,"[boot] addnode=%s did not resolve\n", g_cfg.addnode[i]); continue; }
         if(inet_pton(AF_INET,ipd,&ip)!=1) continue;
-        if(amr_add(ab,ip,(unsigned short)htons((unsigned short)g_chainp->default_port),1,(unsigned)time(NULL))>0) total++;
+        if(book_add_ipv4(ip, g_chainp->default_port)>0) total++;
         fprintf(stderr,"[boot] addnode %s -> %s\n", g_cfg.addnode[i], ipd);
     }
 
@@ -1532,7 +1564,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
             for(struct addrinfo* ai=res; ai && got<64; ai=ai->ai_next){
                 struct sockaddr_in* sa=(struct sockaddr_in*)ai->ai_addr;
                 unsigned ip=sa->sin_addr.s_addr;
-                if(ip && amr_add(ab,ip,(unsigned short)htons((unsigned short)g_chainp->default_port),1,(unsigned)time(NULL))>0) got++;
+                if(ip && book_add_ipv4(ip, g_chainp->default_port)>0) got++;
             }
             freeaddrinfo(res);
         }
@@ -1588,36 +1620,27 @@ static void dl_save_good_peers(char peers[][64], int n){
 }
 
 static int dl_pool_from_book(void* ab, char out[][64], int nitems){
-    long cnt=amr_count(ab); if(cnt<=0) return 0;
-    unsigned char rec[18]; int got=0;
-    /* iterate the WHOLE book (not just the first `nitems`) and keep plausible
-     * PUBLIC IPv4s, so stale/special-range garbage from prior runs never crowds
-     * the download pool. */
+    (void)ab;
+    /* Walk the whole version-2 book and keep the addresses this node can
+     * DIAL today. Until the SOCKS5/SAM/IPv6 transports land only IPv4 is
+     * dialable; a non-IPv4 entry is kept in the book (and served to peers)
+     * but not put in the pool. bmc_addr_is_routable already excludes the
+     * special ranges the old loop filtered by hand. */
+    ab2_t* b = addr_book(); if(!b) return 0;
+    long cnt = ab2_count(b); int got = 0;
     for(long i=0;i<cnt && got<nitems;i++){
-        if(amr_get_i(ab,i,rec)!=1) continue;
-        /* amr stores the ip as the 4 bytes passed to amr_add -- which we passed
-         * in NETWORK (big-endian) order (sin_addr.s_addr). The "u32 LE" in the
-         * asm comment is literal movement of those bytes, not an LE reorder.
-         * Reading with *(unsigned*) on an LE CPU would byte-swap and yield
-         * wrong/unreachable IPs (e.g. 97.158.36.82 for the real 82.36.158.97).
-         * Decode explicitly BIG-endian from the record bytes instead. */
-        unsigned ip = ((unsigned)rec[0]<<24)|((unsigned)rec[1]<<16)|((unsigned)rec[2]<<8)|(unsigned)rec[3];
-        unsigned a=(ip>>24)&0xff,b=(ip>>16)&0xff,c=(ip>>8)&0xff,d=ip&0xff;
-        /* skip special/reserved ranges that can't be a reachable peer:
-         * 0.0.0.0/8, 10/8 & 172.16/12 & 192.168/16 (RFC1918 -- could be peers
-         * but our resolver gives public ones; skip to be safe), 169.254/16
-         * link-local, 224-239 multicast, 240+ reserved, broadcast, and
-         * 255.127.0.0-style garbage seen in stale books. */
-        if(a==0) continue;
-        if(a==10) continue;
-        if(a==172 && b>=16 && b<=31) continue;
-        if(a==192 && b==168) continue;
-        if(a==169 && b==254) continue;
-        if(a==127) continue;
-        if(a>=224) continue;                     /* multicast + reserved + 255.x */
-        if(b==0&&c==0&&d==0) continue;
-        if(a==255&&b==255&&c==255&&d==255) continue;
-        snprintf(out[got],64,"%u.%u.%u.%u",a,b,c,d);
+        ab2_rec_t r; if(!ab2_get(b, i, &r)) continue;
+        /* every network this node can actually reach right now: IPv4 always,
+         * onion/i2p when their transports are configured (daemon/dialer.c).
+         * An address we cannot dial stays in the book and is still served to
+         * peers -- it just never enters the pool. */
+        if(!dialer_net_reachable(r.a.net)) continue;
+        if(!bmc_addr_is_routable(&r.a)) continue;
+        /* the caller's slots are 64 bytes; an IPv4 needs 16. Take the string
+         * only if it was actually produced -- a slot left empty would be
+         * dialled as "" and, worse, still counted, suppressing the seed
+         * fallback (2026-08-28 review, caught before deploy). */
+        if(bmc_addr_to_string(out[got], 64, &r.a) <= 0) continue;
         got++;
     }
     return got;
@@ -2157,10 +2180,10 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
 
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
-    static unsigned char ab[64];
-    if(amr_init(ab)!=1){ fprintf(stderr,"[dlc] amr_init failed\n"); return 0; }
+    ab2_t* ab = addr_book();
+    if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
     long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
-    fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
+    fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
 
     static char pool[DLC_MAXPOOL][64];
     int npool = 0, ngood = 0, nadd = 0;
@@ -2797,6 +2820,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
 
     { extern void addrself_init(unsigned short, int);
       addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
+    /* transports for the non-IPv4 networks (SOCKS5 to tor, SAM to i2pd).
+     * Cheap and silent when nothing is configured. */
+    dialer_init();
     { extern long undo_replay(long, bfi_undo_cb_t, void*);
       bfi_set_undo_replay(undo_replay);
       /* the address index consumes the same undo stream (spent prevout
@@ -2925,12 +2951,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * seed-DNS hostname to its A-records (real, current node IPs), fold the
      * distinct v4 endpoints into the persisted amr book (peers.dat), then dial
      * up to 8 of those DISCOVERED peers for download. */
-    static unsigned char ab[64];
-    if(amr_init(ab)==1){
+    ab2_t* ab = addr_book();
+    if(ab){
         long disc = dl_bootstrap(ab, peers, pool_len);
-        fprintf(stderr,"[boot] discovered +%ld peers (peers.dat now %ld)\n", disc, (long)amr_count(ab));
+        fprintf(stderr,"[boot] discovered +%ld peers (peers2.dat now %ld)\n", disc, (long)ab2_count(ab));
     } else {
-        fprintf(stderr,"[boot] amr_init failed; falling back to seed list\n");
+        fprintf(stderr,"[boot] address book unavailable; falling back to seed list\n");
     }
     static char dle[64][64];
     int npool = dl_pool_from_book(ab, dle, 64);
@@ -3223,6 +3249,35 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = -1;
                     snprintf(reason, sizeof reason,
                              "the runtime addnode list is full (%d)", CTL_MAX_ADDNODE);
+                }
+            } else if(op == RPC_CTL_ADDPEERADDRESS){
+                /* one address into the version-2 book (any BIP155 network);
+                 * the worker is the book's only writer, which is why this
+                 * crosses the channel instead of the RPC thread writing */
+                bmc_addr_t a;
+                /* port 0 is legal and is I2P's canonical form (Core's
+                 * I2P_SAM31_PORT is 0), so the ctl argument carries the port
+                 * separately after the last ':' and 0 is accepted */
+                char host[128]; long pnum = -1;
+                { const char* c = strrchr(arg, ':');
+                  host[0] = 0;
+                  if (c && c > arg){
+                      long hl = c - arg;
+                      const char* hs = arg;
+                      if (arg[0] == '[' && c[-1] == ']'){ hs = arg + 1; hl -= 2; }   /* [v6]:port */
+                      if (hl > 0 && (size_t)hl < sizeof host){
+                          memcpy(host, hs, (size_t)hl); host[hl] = 0; pnum = atol(c + 1); }
+                  } }
+                if(!host[0] || pnum < 0 || pnum > 65535 || !bmc_addr_from_string(&a, host)){
+                    result = -8; snprintf(reason, sizeof reason, "Invalid address");
+                } else if(!bmc_addr_is_routable(&a)){
+                    result = 0;                                /* Core: not added, success=false */
+                } else {
+                    a.port = (unsigned short)pnum;
+                    ab2_t* b = addr_book();
+                    int rc = b ? ab2_add(b, &a, 1, (unsigned)time(NULL)) : -1;
+                    result = rc == 1 ? 1 : 0;
+                    if(rc == 1) fprintf(stderr,"[ctl] addpeeraddress: %s -> book (%s)\n", arg, bmc_net_name(a.net));
                 }
             } else if(op == RPC_CTL_SETBAN){
                 if(num == 0){                                  /* remove */
@@ -4038,11 +4093,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * Its own handle, opened here: the download worker runs in the FORKED
      * child and its handle is not reachable from the parent's RPC thread.
      * amr_* re-reads peers.dat per call, so two handles see the same file. */
-    { static unsigned char rpc_ab[64];
-      if (!g_cfg.connect_only && amr_init(rpc_ab) == 1)
-          rpc_node_set_addrbook(rpc_ab, amr_count,
-                                (int (*)(void*, long, unsigned char*))amr_get_i);
-      else
+    { extern void rpc_node_set_addrbook_dir(const char*);
+      /* always: even with connect= the book is real (addpeeraddress writes
+       * it, getnodeaddresses reads it); the old gate hid it behind
+       * connect_only for no reason that survives the v2 book */
+      rpc_node_set_addrbook_dir(".");
+      if (0)
           fprintf(stderr, "[rpc] address book unavailable; "
                           "getnodeaddresses/getaddrmaninfo will report empty\n"); }
     /* the external signer command, when the operator configured one */
@@ -4083,11 +4139,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * looked like in production and why it is wrong. Seeds stay as the
      * emergency fallback they are documented to be: used only when the book
      * yields nothing, which is a genuinely fresh node. */
-    static unsigned char mux_ab[64];
     static char mux_dle[64][64];
     const char* bookpool[64]; int nbook = 0;
-    if(!g_cfg.connect_only && amr_init(mux_ab)==1){
-        int np = dl_pool_from_book(mux_ab, mux_dle, 64);
+    if(!g_cfg.connect_only && addr_book()){
+        int np = dl_pool_from_book(NULL, mux_dle, 64);
         for(int i=0;i<np && nbook<64;i++) bookpool[nbook++] = mux_dle[i];
     }
     if(nbook > 0){
