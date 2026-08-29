@@ -47,6 +47,33 @@ section .data
 global net_magic
 net_magic: dd 0xd9b4bef9
 
+; ---------------------------------------------------------------------------
+; BIP324 v2 transport dispatch.
+;
+; p2p_read/p2p_write are called from roughly sixty files and several hundred
+; call sites, so v2 cannot be plumbed through by giving every caller a
+; transport handle. Instead the dispatch lives HERE, keyed by file
+; descriptor: an fd that has completed a v2 handshake is flagged in
+; g_v2_active, and the two hooks below are filled in by the v2 module.
+;
+; A build that never links the v2 module leaves the hooks NULL and the table
+; zero, so p2p_read/p2p_write behave exactly as they always have -- no link
+; dependency is created, which is why this is a table in this object rather
+; than a C wrapper that would have to be added to sixty link lines.
+;
+; The flag is checked before the hook so the v1 path costs one compare and one
+; branch, not an indirect call.
+; ---------------------------------------------------------------------------
+V2_FD_MAX equ 4096
+global g_v2_hook_write
+global g_v2_hook_read
+global g_v2_active
+g_v2_hook_write: dq 0          ; long (*)(int fd, const char* cmd, u32 cmdlen,
+                               ;         const void* payload, u32 plen)
+g_v2_hook_read:  dq 0          ; int  (*)(int fd, char cmd_out[12], void* payload,
+                               ;         u32 cap, u32* plen_out)
+g_v2_active: times V2_FD_MAX db 0
+
 section .text
 
 ; ============================================================================
@@ -312,6 +339,17 @@ p2p_frame:
 ; ============================================================================
 global p2p_write
 p2p_write:
+    ; v2 dispatch (see g_v2_active above); falls through to v1 untouched
+    cmp  edi, V2_FD_MAX
+    jae  .v1
+    mov  eax, edi
+    cmp  byte [g_v2_active + rax], 0
+    je   .v1
+    mov  rax, [g_v2_hook_write]
+    test rax, rax
+    je   .v1
+    jmp  rax                    ; tail call: identical ABI, identical return
+.v1:
     push rbp
     mov  rbp, rsp
     push r12
@@ -387,6 +425,17 @@ p2p_write:
 ; ============================================================================
 global p2p_read
 p2p_read:
+    ; v2 dispatch (see g_v2_active above); falls through to v1 untouched
+    cmp  edi, V2_FD_MAX
+    jae  .v1
+    mov  eax, edi
+    cmp  byte [g_v2_active + rax], 0
+    je   .v1
+    mov  rax, [g_v2_hook_read]
+    test rax, rax
+    je   .v1
+    jmp  rax                    ; tail call: identical ABI, identical return
+.v1:
     push rbp
     mov  rbp, rsp
     push r12

@@ -45,8 +45,10 @@ node_make_version:
     mov  r12, rdi           ; out (cursor base)
     ; protocol version -- from the single source of truth (version.inc)
     mov  dword [r12], NODE_PROTOCOL_VER
-    ; services = NODE_NETWORK(1)|NODE_WITNESS(8) -- we serve witness blocks (fe3addb), timestamp
-    mov  qword [r12+4], 9
+    ; services -- see node_services in .data (NODE_P2P_V2 is ORed in at boot
+    ; when -v2transport is enabled); we serve witness blocks (fe3addb)
+    mov  rax, [node_services]
+    mov  [r12+4], rax
     mov  qword [r12+12], 1700000000
     ; addr_recv[26] at +20: zero, then port at +44
     lea  rdi, [r12+20]
@@ -2104,6 +2106,16 @@ sync_fail_code: resd 1                     ; which .fail exit node_sync_multi to
 section .data
 align 16
 ua: db NODE_UA_STRING   ; user-agent from version.inc (length derived via %strlen)
+
+; ---- the services we advertise in our own `version` --------------------------
+; NODE_NETWORK(1) | NODE_WITNESS(8) by default. daemon/main.c ORs in
+; NODE_P2P_V2 (1<<11) at boot when -v2transport is on, exactly as Core sets
+; g_local_services in init.cpp -- a peer has no other way to learn that we
+; will accept a BIP324 handshake. It lives here rather than in C because
+; bitcoind.asm is linked into targets that do not link the config, and those
+; must keep working with the plain default.
+global node_services
+node_services: dq 9
 
 ; ---- last-seen peer `version` payload, captured (not parsed) by both
 ; node_handshake and node_accept_handshake the moment they see a "version"
