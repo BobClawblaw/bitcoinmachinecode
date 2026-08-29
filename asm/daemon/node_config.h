@@ -122,9 +122,12 @@ typedef struct {
     char alertnotify[512];
     char startupnotify[512];
     char shutdownnotify[512];
-    char walletnotify[512];
     long maxtxfee_sat;               /* -maxtxfee, satoshis (0 = no cap)                  */
     char asmap[512];                 /* -asmap: AS map file; empty = /16 bucketing        */
+    int  maxsendbuffer_kb;           /* -maxsendbuffer: n*1000 bytes (Core default 1000)  */
+    int  zmq_hwm[5];                 /* -zmqpub<topic>hwm, in the order of the topics
+                                      * below: hashblock, hashtx, rawblock, rawtx,
+                                      * sequence. Core default 1000.                      */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
