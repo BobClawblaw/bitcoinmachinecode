@@ -182,6 +182,9 @@ typedef struct {
     int  checklevel;             /* Core -checklevel: 0..4 (def 3)           */
     long stopatheight;           /* Core -stopatheight: stop at this height,
                                   * 0 = run forever (def 0)                  */
+    /* ---- BIP324 v2 encrypted transport (Core -v2transport) ---- */
+    int  v2transport;            /* accept inbound v2 and attempt it outbound;
+                                  * def 1, as in Core                        */
 } node_config_t;
 
 extern node_config_t g_cfg;
