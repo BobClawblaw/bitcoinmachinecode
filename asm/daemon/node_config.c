@@ -168,6 +168,7 @@ static void set_defaults(void){
     g_cfg.rpccookie             = 1;
     g_cfg.permitbaremultisig    = 1;
     g_cfg.v2transport           = 1;
+    g_cfg.walletpassfile[0]     = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
     g_cfg.pidfile[0]            = 0;
@@ -472,6 +473,8 @@ long node_config_load(const char* path){
             g_cfg.permitbaremultisig = iv?1:0; applied++; }
         else if(!strcmp(key,"v2transport")){
             g_cfg.v2transport = iv?1:0; applied++; }
+        else if(!strcmp(key,"walletpassfile")){
+            snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
         else if(!strcmp(key,"networkactive")){
             g_cfg.networkactive = iv?1:0; applied++; }
         else if(!strcmp(key,"forcednsseed")){
