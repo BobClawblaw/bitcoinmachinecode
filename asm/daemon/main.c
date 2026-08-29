@@ -1388,6 +1388,55 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     return fd;
 }
 
+/* ---- refuse to run one chain's node against another chain's archive ------
+ * Until 2026-08-29 the ONLY thing separating chains was directory layout:
+ * mainnet uses the datadir itself, every other chain a subdirectory of it
+ * (chainparams_datadir). Nothing verified that an archive already on disk
+ * belonged to the chain being started.
+ *
+ * That is thinner than it looks. Every frame is written [len][magic] with the
+ * chain's network magic, but nothing ever compares that magic on the way back
+ * in -- it is written and never read. So pointing -datadir at another chain's
+ * directory (say <base>/regtest while running mainnet) appended mainnet
+ * blocks to a regtest archive without a word of complaint, and -datadir,
+ * added the same day, makes that easier to do by accident.
+ *
+ * Block 0's hash is the cheapest possible check and it is unambiguous: it is
+ * already sitting in index.dat record 0, so this costs one 32-byte read and
+ * no parsing. An EMPTY archive is fine -- that is a fresh datadir, which is
+ * exactly how a new chain legitimately starts.
+ *
+ * Refusing to start is the right failure. Continuing would interleave two
+ * chains' blocks in one file, which no later check could untangle. */
+static int chain_archive_matches(void* store_buf){
+    int  fd  = *(int*)((char*)store_buf + 8);    /* idx_fd  */
+    long len = *(long*)((char*)store_buf + 16);  /* idx_len */
+    if (fd < 0 || len < 48) return 1;            /* empty archive: nothing to contradict */
+    unsigned char have[32];
+    if (lseek(fd, 0, SEEK_SET) < 0 || read(fd, have, 32) != 32){
+        fprintf(stderr, "[boot] cannot read block 0 from index.dat -- refusing to start "
+                        "rather than guess which chain this archive belongs to\n");
+        return 0;
+    }
+    const unsigned char* want = g_chainp->genesis_hash;
+    if (!want) return 1;
+    if (!memcmp(have, want, 32)) return 1;
+    char hh[65], wh[65];
+    for (int i = 0; i < 32; i++){                /* display order */
+        snprintf(hh + i*2, 3, "%02x", have[31-i]);
+        snprintf(wh + i*2, 3, "%02x", want[31-i]);
+    }
+    fprintf(stderr,
+        "[boot] WRONG CHAIN FOR THIS DATADIR -- refusing to start.\n"
+        "[boot]   chain=%s expects genesis %s\n"
+        "[boot]   this archive's block 0 is  %s\n"
+        "[boot] Running on would append %s blocks to another chain's archive, which\n"
+        "[boot] nothing could untangle afterwards. Point -datadir at the right\n"
+        "[boot] directory, or use an empty one.\n",
+        g_chainp->name, wh, hh, g_chainp->name);
+    return 0;
+}
+
 /* Anchor a peer's locator to our CURRENT stored tip hash (zero if empty). */
 static void anchor_locator(unsigned char loc[32]){
     /* Anchor the locator to the stored tip's HASH read straight from the index
@@ -5225,6 +5274,13 @@ int main(int argc, char** argv){
         store_reload(store_buf);            /* load the persisted chain from disk */
         fprintf(stderr,"[boot] chain archive loaded: tip=%d (%.2fs)\n",
                 *(int*)(store_buf+24), phase_elapsed(&load_pt));
+        /* Does this archive belong to the chain we were told to run? Checked
+         * HERE and not right after store_init: store_init opens index.dat but
+         * does not populate idx_len, so a check there sees length 0 and
+         * concludes "empty archive, nothing to contradict" every single time.
+         * The first cut of this guard did exactly that and silently passed a
+         * regtest archive to a mainnet node. */
+        if(!chain_archive_matches(store_buf)) return 1;
         /* Core -checkblocks/-checklevel. Read-only, and deliberately BEFORE
          * anything opens the archive for writing. It reports problems and does
          * not act on them: archive_verify_and_repair is the only thing allowed
