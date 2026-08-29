@@ -397,10 +397,10 @@ than trusted:
 | surface | state |
 | --- | --- |
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
-| **Config options** | **~73 / 163 (45%).** Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
+| **Config options** | **~74 / 163 (45%)** — `v2transport` closed 08-29. Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
-| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport: crypto and framing complete and pinned to the official vectors, not yet wired into the peer loop. Erlay absent.** |
+| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE and live on both directions, proven against Bitcoin Core v31.99. Erlay absent.** |
 
 *Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
 authentication** plus a constant-time credential compare; `bantime` with
@@ -435,11 +435,7 @@ tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
 list this node does not have. All three stay on the warning list.
 
-*Remaining, in the order worth doing it:* BIP324 v2 transport — the ciphers,
-the packet format and the handshake state machine are done and pinned to the
-official BIP324 vectors (76 decode, 256 encode branches, 7 end-to-end packet
-vectors); what is left is wiring it into the peer loop with v1 fallback, which
-is the part that changes live behaviour. Then signet; `reindex` and
+*Remaining, in the order worth doing it:* signet; `reindex` and
 `persistmempool`; `whitelist`/`whitebind` peer permissions; the RPC surface
 (`rpcauth`, `rpcallowip`, `rpcbind`, `server`, `rest`) — lower urgency now
 that cookie auth exists and the listener cannot leave loopback; then Erlay.

@@ -61,13 +61,29 @@ say "== 2. Core dials us over BIP324 =="
 HOLD=5 "$D/accept" $MINE_V2 > "$D/o2" 2>&1 &
 sleep 1; "$CLI" -datadir="$D" addnode "127.0.0.1:$MINE_V2" onetry true >/dev/null 2>&1
 sleep 3
-THEIRS=$("$CLI" -datadir="$D" getpeerinfo 2>/dev/null | grep -A2 "$MINE_V2" | grep session_id | grep -o '[0-9a-f]\{64\}')
-TYPE=$("$CLI" -datadir="$D" getpeerinfo 2>/dev/null | grep -A3 "$MINE_V2" | grep -o '"v[12]"' | head -1)
+# Parse the JSON rather than grepping around it -- a -A/-B window silently
+# returns nothing when the field order shifts, and an empty expectation then
+# "matches" whatever we produced.
+read -r THEIRS TYPE <<<"$("$CLI" -datadir="$D" getpeerinfo 2>/dev/null | python3 -c '
+import json,sys
+try: peers = json.load(sys.stdin)
+except Exception: print(""); sys.exit()
+for p in peers:
+    if p.get("addr","").endswith(":'"$MINE_V2"'"):
+        print(p.get("session_id",""), p.get("transport_protocol_type",""))
+        break
+else: print("")
+')"
 wait
 MINE=$(grep -o 'our session_id: [0-9a-f]*' "$D/o2" | awk '{print $3}')
 grep -q "^PASS" "$D/o2" && ok "version received over v2" || { bad "inbound v2"; cat "$D/o2"; }
-[ -n "$MINE" ] && [ "$MINE" = "$THEIRS" ] && ok "session id matches Core byte for byte ($TYPE)" \
-    || bad "session id mismatch: ours=$MINE core=$THEIRS"
+if [ -z "$MINE" ] || [ -z "${THEIRS:-}" ]; then
+    bad "could not read both session ids (ours='$MINE' core='${THEIRS:-}')"
+elif [ "$MINE" = "$THEIRS" ]; then
+    ok "session id matches Core byte for byte (transport=${TYPE:-?})"
+else
+    bad "session id MISMATCH: ours=$MINE core=$THEIRS"
+fi
 
 say "== 3. Core dials us with v2 disabled =="
 HOLD=3 "$D/accept" $MINE_V1 > "$D/o3" 2>&1 &
