@@ -56,6 +56,24 @@ extern g_peer_wants_addrv2
     extern node_serve_block_by_hash
 section .data
 align 16
+
+; ---------------------------------------------------------------------------
+; Protocol-violation hook (audit 2026-08-29 finding 7).
+;
+; peer_misbehaving() existed with a 100-point threshold, a shared ban list and
+; /32 auto-ban -- and ZERO call sites, so a peer could send malformed message
+; after malformed message and the node kept talking to it. This is the first
+; real caller.
+;
+; A function pointer rather than an extern for the same reason as the v2
+; dispatch in bitcoin_net.asm: this object is linked into targets that do not
+; link the daemon, and an undefined symbol would break all of them. NULL means
+; "nobody registered", and the loop just drops the connection as before.
+; ---------------------------------------------------------------------------
+global g_serve_violation_hook
+g_serve_violation_hook: dq 0      ; void (*)(const char* reason)
+viol_oversize: db "oversized message announcement", 0
+
 pl_buf:    times (8<<20) db 0     ; receive buffer
 sb_buf:    times (8<<20) db 0     ; single block buffer
 hp_buf:    times (2000*81+8) db 0 ; headers page buffer
@@ -323,7 +341,7 @@ node_serve_loop:
     lea  r8,  [s_plen]
     call p2p_read
     test rax, rax
-    jle  .done
+    jle  .check_viol
     mov  byte [s_cmd+11], 0
 
     ; ---- dispatch ----
@@ -1382,6 +1400,26 @@ node_serve_loop:
     ; This lets the node serve + keep current continuously instead of exiting
     ; after a fixed iteration budget.
     jmp  .outer
+; A -3 from p2p_read means the peer announced a message above
+; P2P_MAX_MSG -- a protocol violation, not an ordinary disconnect. Score it
+; before dropping, so a peer that does it repeatedly earns a ban instead of
+; simply reconnecting. Anything else falls through unchanged.
+.check_viol:
+    cmp  rax, -3
+    jne  .done
+    mov  r13, rax                 ; preserve the return value across the call
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .viol_done
+    lea  rdi, [viol_oversize]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16                 ; C callee: align explicitly (see net.asm)
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+.viol_done:
+    mov  rax, r13
 .done:
     mov  rax, [s_served]
     add  rsp, 0x58
