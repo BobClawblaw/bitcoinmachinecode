@@ -120,6 +120,32 @@ int nodecfg_hex32_be(const char* str, unsigned char out[32]){
     return 1;
 }
 
+/* Core options this node does not implement. Listed explicitly rather than
+ * inferred, so adding support means deleting a line here and the warning
+ * stops -- and so the list itself is a readable statement of the gap. */
+static const char* const k_unimplemented[] = {
+    "whitelist","whitebind","whitelistrelay","whitelistforcerelay",
+    "asmap","v2transport","txreconciliation","natpmp","upnp",
+    "peerbloomfilters","peerblockfilters","maxsendbuffer",
+    "rpcauth","rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
+    "rpcservertimeout","rest","server",
+    "reindex","reindex-chainstate","loadblock","blocksdir","blocksxor",
+    "persistmempool","persistmempoolv1","dbbatchsize","prevoutfetchthreads",
+    "uacomment","bytespersigop","maxtxfee","maxapsfee",
+    "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
+    "zmqpubhashblockhwm","zmqpubhashtxhwm","zmqpubrawblockhwm",
+    "zmqpubrawtxhwm","zmqpubsequencehwm",
+    "walletnotify",
+    "settings","includeconf","allowignoredconf",
+    "fixedseeds",
+    NULL
+};
+int nodecfg_unimplemented(const char* key){
+    for (int i = 0; k_unimplemented[i]; i++)
+        if (!strcmp(key, k_unimplemented[i])) return 1;
+    return 0;
+}
+
 static void set_defaults(void){
     g_cfg.max_connections       = 200;   /* Core v31 default */
     g_cfg.max_outbound          = 8;
@@ -145,6 +171,12 @@ static void set_defaults(void){
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
     g_cfg.pidfile[0]            = 0;
+    g_cfg.blocknotify[0]        = 0;
+    g_cfg.alertnotify[0]        = 0;
+    g_cfg.startupnotify[0]      = 0;
+    g_cfg.shutdownnotify[0]     = 0;
+    g_cfg.walletnotify[0]       = 0;
+    g_cfg.maxtxfee_sat          = 0;
     g_cfg.rpccookiefile[0]      = 0;
     memset(g_cfg.minchainwork, 0, 32);
     g_cfg.have_minchainwork     = 0;
@@ -304,7 +336,7 @@ long node_config_load(const char* path){
         fprintf(stderr,"[config] no config file at %s -- using compiled defaults\n", path);
         return 0;
     }
-    long applied = 0; int bad = 0;
+    long applied = 0; int bad = 0; int unimpl = 0;
     /* -connect implies -dnsseed=0 and -listen=0 in Core, but only when those
      * were not set explicitly. The implication therefore has to run AFTER the
      * whole file is read: `listen=1` may appear on a line BELOW `connect=`,
@@ -441,6 +473,20 @@ long node_config_load(const char* path){
             g_cfg.forcednsseed = iv?1:0; applied++; }
         else if(!strcmp(key,"pid")){
             snprintf(g_cfg.pidfile,sizeof g_cfg.pidfile,"%s",val); applied++; }
+        else if(!strcmp(key,"blocknotify")){
+            snprintf(g_cfg.blocknotify,sizeof g_cfg.blocknotify,"%s",val); applied++; }
+        else if(!strcmp(key,"alertnotify")){
+            snprintf(g_cfg.alertnotify,sizeof g_cfg.alertnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"startupnotify")){
+            snprintf(g_cfg.startupnotify,sizeof g_cfg.startupnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"shutdownnotify")){
+            snprintf(g_cfg.shutdownnotify,sizeof g_cfg.shutdownnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"walletnotify")){
+            snprintf(g_cfg.walletnotify,sizeof g_cfg.walletnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"maxtxfee")){
+            /* Core takes BTC; stored in satoshis like every other fee here */
+            double b = atof(val); if(b >= 0) g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5);
+            applied++; }
         else if(!strcmp(key,"rpccookiefile")){
             snprintf(g_cfg.rpccookiefile,sizeof g_cfg.rpccookiefile,"%s",val); applied++; }
         else if(!strcmp(key,"minimumchainwork")){
@@ -588,9 +634,24 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"bmc.utxobulkgapblocks")) { t=clamp_int(iv,0,1000000,key,&bad);if(t>=0){g_cfg.utxo_bulk_gap_blocks=t;applied++;} }
         else if(!strcmp(key,"bmc.utxocompactthreshold")){ t=clamp_int(iv,2,4096,key,&bad); if(t>=0){g_cfg.utxo_compact_threshold=t;applied++;} }
         /* anything else (rpcport, rpcuser, dbcache, ...) belongs to another
-         * consumer of this shared file -- ignore rather than warn. */
+         * consumer of this shared file -- ignore rather than warn.
+         *
+         * EXCEPT a Core option this node does not implement. Silently
+         * accepting one is the failure mode this whole config surface keeps
+         * hitting: `whitelist=rpc` has been sitting in the live conf doing
+         * nothing, and `externalip` was parsed-but-unread for weeks. An
+         * operator who sets a real Core option deserves to be told it has no
+         * effect here, rather than discovering it from behaviour. */
+        else if(nodecfg_unimplemented(key)){
+            fprintf(stderr,"[config] %s= is a Bitcoin Core option this node does "
+                           "not implement -- it has NO EFFECT\n", key);
+            unimpl++;
+        }
     }
     fclose(f);
+    if(unimpl)
+        fprintf(stderr,"[config] %d Core option(s) in this file are NOT implemented here "
+                       "and were ignored (each named above)\n", unimpl);
 
     /* -connect's implications, applied once the whole file has been seen. */
     if(g_cfg.connect_only){
