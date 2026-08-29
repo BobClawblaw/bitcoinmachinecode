@@ -154,6 +154,22 @@ int main(void){
     ck("garbage refused",  chainparams_select("florin") == 0);
     ck("a refused select leaves the previous chain in force", g_chainp->id == CHAIN_MAIN);
 
+    printf("== genesis hashes differ per chain (what the datadir guard rests on) ==\n");
+    /* chain_archive_matches() in main.c refuses to start when block 0 of an
+     * existing archive is not this chain's genesis. That guard is only as
+     * good as the hashes actually differing, so pin it here. */
+    { unsigned char mainh[32], regh[32], t4h[32];
+      ck("select(main)", chainparams_select("main") == 1);
+      memcpy(mainh, g_chainp->genesis_hash, 32);
+      ck("select(regtest)", chainparams_select("regtest") == 1);
+      memcpy(regh, g_chainp->genesis_hash, 32);
+      ck("select(testnet4)", chainparams_select("testnet4") == 1);
+      memcpy(t4h, g_chainp->genesis_hash, 32);
+      ck("main and regtest genesis differ",   memcmp(mainh, regh, 32) != 0);
+      ck("main and testnet4 genesis differ",  memcmp(mainh, t4h, 32) != 0);
+      ck("regtest and testnet4 genesis differ", memcmp(regh, t4h, 32) != 0);
+      chainparams_select("main"); }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }
