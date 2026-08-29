@@ -930,6 +930,34 @@ int ctl_is_banned(const char* ip){
 #define MISBEHAVIOR_SLOTS 64
 static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
 
+/* ---- protocol-violation reporting from the asm serve loop ----------------
+ * (audit 2026-08-29 finding 7)
+ *
+ * peer_misbehaving() has existed for a while with a 100-point threshold, /32
+ * auto-ban and lowest-score eviction -- and, until now, ZERO call sites. The
+ * comment "a peer could send malformed message after malformed message and
+ * the node would keep talking to it" was literally true.
+ *
+ * bitcoin_serve.asm calls back here when p2p_read reports -3, an announced
+ * message length above P2P_MAX_MSG. No conforming implementation produces
+ * that -- Core treats an oversized header as fatal for the connection -- so
+ * it is scored at the full threshold and the peer is banned rather than
+ * merely dropped.
+ *
+ * HONEST LIMITATION: g_misbehavior is a process-local array and the serve
+ * loop runs in a forked child, so scores do NOT accumulate across
+ * connections. What makes this bite anyway is that crossing the threshold
+ * calls ctl_ban_add(), which writes the SHARED, file-backed ban list that
+ * both the dial path and the inbound accept path consult. So a single
+ * violation bans the peer for real; repeat offences across reconnects are not
+ * tracked, and that remains a gap worth closing separately. */
+static char g_cur_peer_ip[64];
+extern void (*g_serve_violation_hook)(const char*);
+static void serve_violation_report(const char* reason){
+    if(!g_cur_peer_ip[0]) return;
+    peer_misbehaving(g_cur_peer_ip, 100, reason ? reason : "protocol violation");
+}
+
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
@@ -4865,6 +4893,13 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                         }
                         v2res = v2 == 1 ? "v2" : "v1";
                     }
+                    /* record who this is and arm the violation callback
+                     * before any peer bytes are dispatched */
+                    { const char* q = strrchr(peerdesc, ':');
+                      size_t n = q ? (size_t)(q - peerdesc) : strlen(peerdesc);
+                      if(n >= sizeof g_cur_peer_ip) n = sizeof g_cur_peer_ip - 1;
+                      memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
+                    g_serve_violation_hook = serve_violation_report;
                     int hok = node_accept_handshake(c);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
