@@ -110,6 +110,12 @@ typedef struct {
     int  coinstatsindex;             /* -coinstatsindex   (default 1: keep current behaviour) */
     char rpccookiefile[256];         /* -rpccookiefile; empty = <datadir>/.cookie          */
     int  rpccookie;                  /* derived: emit and accept a cookie (default 1)      */
+    /* ---- batch two ------------------------------------------------------ */
+    int  permitbaremultisig;         /* -permitbaremultisig (Core default 1)              */
+    int  networkactive;              /* -networkactive (Core default 1): start with the
+                                      * network on, or dead until setnetworkactive        */
+    int  forcednsseed;               /* -forcednsseed: query the seeds even with peers    */
+    char pidfile[256];               /* -pid: write our pid here (empty = none)           */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
