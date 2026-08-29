@@ -124,6 +124,7 @@ typedef struct {
     char shutdownnotify[512];
     char walletnotify[512];
     long maxtxfee_sat;               /* -maxtxfee, satoshis (0 = no cap)                  */
+    char asmap[512];                 /* -asmap: AS map file; empty = /16 bucketing        */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */

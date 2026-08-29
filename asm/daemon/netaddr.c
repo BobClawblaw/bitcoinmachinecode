@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include "netaddr.h"
+#include "asmap.h"   /* -asmap: AS-level bucketing */
 #include "../base32.h"
 extern void sha3_256(unsigned char out[32], const void* data, unsigned long len);
 
@@ -159,6 +160,21 @@ int bmc_addr_is_routable(const bmc_addr_t* a){
 unsigned long long bmc_addr_group(const bmc_addr_t* a){
     unsigned long long g = (unsigned long long)a->net << 56;
     const unsigned char* b = a->addr;
+    /* -asmap: bucket by AUTONOMOUS SYSTEM when a map is loaded. A /16 assumes
+     * an attacker cannot cheaply get addresses across many /16s, but one
+     * hosting provider routinely announces dozens of unrelated /16s from a
+     * single AS -- so /16 counts them as diverse when they are not, and the
+     * per-netgroup cap that is supposed to bound one party's share of the
+     * book does not bound them at all. An ASN counts them as one.
+     *
+     * Falls back to the /16 (or /32 for v6) silently when no map is loaded,
+     * so this is additive: a node without -asmap behaves exactly as before.
+     * The 0x415300 tag ("AS") keeps AS-derived groups from colliding with
+     * prefix-derived ones. */
+    if (asmap_active() && (a->net == BMC_NET_IPV4 || a->net == BMC_NET_IPV6 || a->net == BMC_NET_CJDNS)){
+        unsigned asn = asmap_lookup_net(a->net, a->addr, a->len);
+        if (asn) return g | 0x415300ULL << 32 | asn;
+    }
     switch (a->net){
     case BMC_NET_IPV4: return g | ((unsigned long long)b[0] << 8) | b[1];
     case BMC_NET_IPV6: case BMC_NET_CJDNS: return g | ((unsigned long long)b[0] << 24) | ((unsigned long long)b[1] << 16) | ((unsigned long long)b[2] << 8) | b[3];

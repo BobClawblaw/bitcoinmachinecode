@@ -11,6 +11,7 @@
  * values true for THIS node, not the oracle's numbers.
  */
 #include "rpc_node.h"
+#include "daemon/asmap.h"   /* mapped_as, when -asmap is loaded */
 #include "mempool_entry.h"
 #include "version_gen.h"
 #include <string.h>
@@ -270,6 +271,101 @@ static int cmd_getnodeaddresses(const rj_val* params, rj_val** res, long* ec, co
     *res = arr;
     return 1;
 }
+/* getorphantxs ( verbosity ) -- what is sitting in the orphan pool.
+ *
+ * The pool lives in the download worker; the parent reads the snapshot that
+ * worker publishes into shared memory (see node_status_t.orphans). That
+ * snapshot deliberately carries no transaction bytes, so:
+ *   verbosity 0 -> array of txids            (Core-compatible)
+ *   verbosity 1 -> objects with details      (a subset of Core's fields)
+ *   verbosity 2 -> Core adds "hex"; REFUSED here rather than silently
+ *                  returning verbosity-1 output, because a caller asking for
+ *                  hex and getting none without being told is worse than an
+ *                  error that says why.
+ *
+ * Fields Core has that this does not: wtxid, vsize, weight, expiration, and
+ * `from` (the peers that sent it). `parents` -- how many inputs we are still
+ * missing -- is ours, and is the thing you actually want when asking why a
+ * transaction is stuck. */
+static int cmd_getorphantxs(const rj_val* params, rj_val** res, long* ec, const char** em){
+    long verbosity = 0;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 && params->items[0]->typ == RJ_NUM)
+        verbosity = atol(params->items[0]->str);
+    if (verbosity < 0 || verbosity > 2){
+        *ec = -8; *em = "verbosity must be 0, 1 or 2"; return 0; }
+    if (verbosity == 2){
+        *ec = -8;
+        *em = "verbosity 2 (transaction hex) is not available: the orphan pool lives in "
+              "the download worker and only a compact snapshot is shared with the RPC "
+              "server. Use verbosity 1.";
+        return 0;
+    }
+    rj_val* arr = rj_arr();
+    if (g_status){
+        int n = g_status->n_orphans;
+        if (n > RPC_MAX_ORPHANS) n = RPC_MAX_ORPHANS;
+        long long now_ms = (long long)time(NULL) * 1000;
+        for (int i = 0; i < n; i++){
+            char hx[65];
+            for (int b = 0; b < 32; b++)
+                snprintf(hx + b*2, 3, "%02x", g_status->orphans[i].txid[31-b]);  /* display order */
+            if (verbosity == 0){ rj_arr_push(arr, rj_str(hx)); continue; }
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "txid",    rj_str(hx));
+            rj_obj_set(o, "bytes",   rj_numf("%u", g_status->orphans[i].len));
+            rj_obj_set(o, "parents", rj_numf("%u", g_status->orphans[i].nparent));
+            { long long age = now_ms - g_status->orphans[i].t_ms;
+              rj_obj_set(o, "age_ms", rj_numf("%lld", age < 0 ? 0 : age)); }
+            rj_arr_push(arr, o);
+        }
+    }
+    *res = arr;
+    return 1;
+}
+
+/* getrawaddrman -- dump the address book itself.
+ *
+ * Core keys each entry by "<bucket>/<position>" in its new/tried tables. This
+ * node's book is ONE FLAT TABLE (see getaddrmaninfo, which reports the same
+ * divergence): there are no buckets to report, so entries are keyed
+ * "0/<index>" under `tried`, and `new` is an empty object. Inventing bucket
+ * numbers to match Core's shape would be worse than saying so.
+ *
+ * `source` and `source_network` are OMITTED rather than faked: Core records
+ * which peer relayed each address to it and this book does not store that, so
+ * there is no honest value to put there.
+ *
+ * `mapped_as` appears only when -asmap is loaded, exactly as in Core -- and
+ * it is the same lookup the bucketing uses, so this doubles as a way to see
+ * what the AS grouping is actually doing. */
+static int cmd_getrawaddrman(rj_val** res){
+    ab_late_open();
+    long n = (g_ab && g_ab_count) ? g_ab_count(g_ab) : 0;
+    rj_val* tried = rj_obj();
+    if (g_ab && g_ab_get) for (long i = 0; i < n; i++){
+        ab2_rec_t r;
+        if (g_ab_get(g_ab, i, &r) != 1) continue;
+        rj_val* e = rj_obj();
+        char addr[96]; bmc_addr_to_string(addr, sizeof addr, &r.a);
+        rj_obj_set(e, "address", rj_str(addr));
+        rj_obj_set(e, "port",    rj_numf("%u", (unsigned)r.a.port));
+        rj_obj_set(e, "network", rj_str(bmc_net_name(r.a.net)));
+        rj_obj_set(e, "services", rj_numf("%llu", (unsigned long long)r.services));
+        rj_obj_set(e, "time",     rj_numf("%u", (unsigned)r.last_seen));
+        if (asmap_active()){
+            unsigned as = asmap_lookup_net(r.a.net, r.a.addr, r.a.len);
+            if (as) rj_obj_set(e, "mapped_as", rj_numf("%u", as));
+        }
+        char key[32]; snprintf(key, sizeof key, "0/%ld", i);
+        rj_obj_set(tried, key, e);
+    }
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "new", rj_obj());          /* no new/tried split in this book */
+    rj_obj_set(o, "tried", tried);
+    *res = o;
+    return 1;
+}
+
 /* getaddrmaninfo -- Core reports new/tried/total per network. This node's
  * address book has no new/tried distinction (one flat table), so every
  * record counts as `tried` (they are addresses we have recorded, and the
@@ -1853,7 +1949,7 @@ static const char* const NODE_METHODS[] = {
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
-    "getnettotals", "getnodeaddresses", "getaddrmaninfo", "listbanned",
+    "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
@@ -1898,6 +1994,8 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getnettotals"))       return cmd_getnettotals(res);
     if (!strcmp(m, "getnodeaddresses"))   return cmd_getnodeaddresses(params, res, ec, em);
     if (!strcmp(m, "getaddrmaninfo"))     return cmd_getaddrmaninfo(res);
+    if (!strcmp(m, "getrawaddrman"))      return cmd_getrawaddrman(res);
+    if (!strcmp(m, "getorphantxs"))       return cmd_getorphantxs(params, res, ec, em);
     if (!strcmp(m, "listbanned"))         return cmd_listbanned(res);
     if (!strcmp(m, "getaddednodeinfo")){
         int rc = cmd_getaddednodeinfo(params, res);

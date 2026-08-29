@@ -396,6 +396,25 @@ static void resolve_all(rctx_t* ctxs, int nthreads, req_t* reqs, long n){
     }
     g_gstart[g_ngroups] = n;
     g_tot_inputs += (unsigned long long)n; g_tot_groups += (unsigned long long)g_ngroups;
+    /* ALSO MEASURED AND REJECTED (2026-08-29): a two-phase resolve -- locate
+     * every parent in the txid index first, sort those lookups into physical
+     * (height, offset) order, then read the archive as a forward sweep. It is
+     * the textbook fix for seek-bound random reads and it measured 3.32 blk/s
+     * against 3.74 for this code at the same height (848k): 0.89x, WORSE.
+     *
+     * Two reasons, both visible in iostat:
+     *   - Sorting cannot create adjacency here. A block has ~4,580 distinct
+     *     parents scattered over a 1.13 TB archive, so even perfectly sorted
+     *     the average gap between consecutive reads is ~246 MB. The seeks get
+     *     ordered, not eliminated -- and on NVMe there is no rotational
+     *     latency for that ordering to amortise. It is a spinning-disk
+     *     optimisation applied to flash.
+     *   - The barrier between phases COST concurrency: queue depth fell from
+     *     ~7.3 to 1.41, because phase one must finish before phase two starts
+     *     and the threads then drain unevenly.
+     * The output was byte-identical, so it was correct -- just slower. Do not
+     * retry without a device where seek ORDER actually matters.
+     */
     /* MEASURED AND REJECTED (2026-08-29): batching madvise(WILLNEED) over every
      * distinct parent before the workers start does raise the queue depth
      * exactly as intended -- aqu-sz 7.5 -> ~500 -- and makes throughput WORSE.

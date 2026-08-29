@@ -38,6 +38,8 @@ extern void   mpool_policy_init(void* pol, unsigned long long relay_fee_rate,
                                 unsigned max_desc, unsigned max_desc_bytes,
                                 unsigned rbf_enabled);
 extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+extern void mpool_policy_set_baremultisig(void*, unsigned);
+static int test_bare_multisig(void);   /* defined below main */
 extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char* tx, unsigned long txlen,
                                const unsigned char txid[32], void* utxo);
@@ -97,8 +99,86 @@ int main(void){
                  SCEN3_NSTEPS, SCEN3_STEP_TX, SCEN3_STEP_TXID, SCEN3_STEP_KIND,
                  SCEN3_STEP_EXPECT, SCEN3_STEP_ARG);
 
+    failures += test_bare_multisig();
+
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
+}
+
+
+/* ---- -permitbaremultisig, through the REAL acceptance path ---------------
+ * The option was already covered at the config layer and at the setter, but
+ * not where it matters: the actual REJECTION. standard_checks() is static
+ * behind mpol_add_core, so the only honest way to assert it is to build a
+ * transaction with a bare multisig output and push it through
+ * mpool_policy_add twice -- once with the option on, once off -- and require
+ * the verdict to differ.
+ *
+ * Note this scenario deliberately does NOT set -acceptnonstdtxn, unlike the
+ * fee/graph scenarios above: standardness is precisely what is under test. */
+static int test_bare_multisig(void){
+    int bad = 0;
+    printf("== permitbaremultisig: the rejection itself ==\n");
+
+    /* a 1-of-1 bare multisig: OP_1 <33-byte pubkey> OP_1 OP_CHECKMULTISIG */
+    unsigned char spk[37];
+    spk[0] = 0x51; spk[1] = 0x21;
+    for (int i = 0; i < 33; i++) spk[2+i] = (unsigned char)(0x02 + (i & 1));  /* plausible compressed key */
+    spk[35] = 0x51; spk[36] = 0xae;
+
+    unsigned char prev[32]; memset(prev, 0x11, 32);
+
+    /* build the raw tx by hand: 1 input (empty scriptSig), 1 bare-multisig output */
+    unsigned char tx[256]; unsigned long n = 0;
+    tx[n++]=0x02; tx[n++]=0x00; tx[n++]=0x00; tx[n++]=0x00;      /* version 2 */
+    tx[n++]=0x01;                                                 /* 1 input   */
+    memcpy(tx+n, prev, 32); n += 32;
+    tx[n++]=0x00; tx[n++]=0x00; tx[n++]=0x00; tx[n++]=0x00;      /* vout 0    */
+    tx[n++]=0x00;                                                 /* empty scriptSig (push-only) */
+    tx[n++]=0xff; tx[n++]=0xff; tx[n++]=0xff; tx[n++]=0xff;      /* sequence  */
+    tx[n++]=0x01;                                                 /* 1 output  */
+    { unsigned long long v = 100000ULL;                           /* well above dust */
+      for (int i = 0; i < 8; i++) tx[n++] = (unsigned char)(v >> (8*i)); }
+    tx[n++] = (unsigned char)sizeof spk;
+    memcpy(tx+n, spk, sizeof spk); n += sizeof spk;
+    tx[n++]=0x00; tx[n++]=0x00; tx[n++]=0x00; tx[n++]=0x00;      /* locktime  */
+
+    unsigned char txid[32]; memset(txid, 0x22, 32);
+
+    for (int permit = 1; permit >= 0; permit--){
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+        mpool_policy_set_baremultisig(pol, (unsigned)permit);
+        mpool_policy_state_init(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        /* fund it generously so the fee is never the reason for a rejection */
+        utxo_put(ux, prev, 0, 1000000ULL, 0, 0, (const unsigned char*)"\x51", 1);
+
+        long rv = mpool_policy_add(pol, stbuf, mp, tx, n, txid, ux);
+        const char* why = mpool_policy_reason(pol);
+        /* this API returns 1 for accepted and 0 for rejected -- NOT a negative
+         * errno. Checking rv >= 0 makes both outcomes look like success, which
+         * is how the first cut of this test "passed" the accept case while
+         * proving nothing. */
+        if (permit){
+            if (rv == 1){ printf("  ok  permitbaremultisig=1 ACCEPTS a bare multisig output\n"); }
+            else { printf("  FAIL permitbaremultisig=1 rejected it: %s\n", why ? why : "?"); bad++; }
+        } else {
+            if (rv == 0 && why && strcmp(why, "bare-multisig") == 0){
+                printf("  ok  permitbaremultisig=0 REJECTS it, with reason \"bare-multisig\"\n");
+            } else if (rv == 0){
+                printf("  FAIL rejected, but for the wrong reason: %s\n", why ? why : "?"); bad++;
+            } else { printf("  FAIL permitbaremultisig=0 still accepted it (rv=%ld)\n", rv); bad++; }
+        }
+    }
+    return bad;
 }
 
 /* ---- run one scenario ---- */

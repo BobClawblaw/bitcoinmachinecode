@@ -44,6 +44,8 @@
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 #include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
 #include "notify.h"      /* Core -*notify hooks */
+#include "torcontrol.h"  /* inbound: our own onion service */
+#include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
 
@@ -398,6 +400,47 @@ static int build_inmem_hash_index(void){
     }
     fprintf(stderr,"[inmem idx] indexed %d stored heights (tip %d)\n", hashed, tip);
     return 0;
+}
+
+/* The onion service's target. Core binds 127.0.0.1:<port+1> and tags anything
+ * arriving there as an incoming Tor connection -- classification by ACCEPTING
+ * SOCKET, never by source address, because tor forwards from 127.0.0.1 and a
+ * source-address heuristic cannot tell an onion peer from a local one.
+ *
+ * Loopback-only and deliberately NOT bindable elsewhere: this socket exists
+ * for tor to connect to. Core additionally marks its onion bind
+ * BF_DONT_ADVERTISE so the loopback address is never gossiped as ours; here
+ * the equivalent is that addr_self never sees this listener at all. */
+static int lsock_onion(int want_port, int* got_port){
+    int l = socket(AF_INET,SOCK_STREAM,0);
+    if(l < 0) return -1;
+    int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
+    struct sockaddr_in a; memset(&a,0,sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    /* Core's default is chain default port + 1, so try that first for
+     * familiarity. But nothing REQUIRES a particular local port: ADD_ONION
+     * tells tor where to forward, so any free loopback port works. Rather
+     * than fail when the preferred one is taken -- a smoke test hit exactly
+     * that, port+1 landing on the configured rpcport -- fall back to an
+     * ephemeral port and tell tor the one we actually got. */
+    a.sin_port = htons((unsigned short)want_port);
+    if(bind(l,(struct sockaddr*)&a,sizeof a) < 0){
+        fprintf(stderr,"[tor] 127.0.0.1:%d is taken (%s) -- using an ephemeral port instead\n",
+                want_port, strerror(errno));
+        a.sin_port = 0;
+        if(bind(l,(struct sockaddr*)&a,sizeof a) < 0){
+            fprintf(stderr,"[tor] onion listener bind failed: %s\n", strerror(errno));
+            close(l); return -1;
+        }
+    }
+    socklen_t al = sizeof a;
+    if(getsockname(l,(struct sockaddr*)&a,&al) != 0){ close(l); return -1; }
+    if(listen(l,8)<0){
+        fprintf(stderr,"[tor] onion listener listen failed: %s\n", strerror(errno));
+        close(l); return -1;
+    }
+    if(got_port) *got_port = ntohs(a.sin_port);
+    return l;
 }
 
 static int lsock(int port){
@@ -3042,6 +3085,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       /* -discover=0, or an -onlynet that names only anonymity networks,
        * means this node must not learn or announce its clearnet address at
        * all: that address is exactly what running behind Tor hides. */
+      { extern void txrelay_set_status(void*); txrelay_set_status(g_node_status); }
       int may = g_cfg.listen && dialer_may_announce_clearnet();
       addrself_init((unsigned short)g_cfg.port, may);
       /* -externalip: the operator naming the reachable address directly */
@@ -3826,6 +3870,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && txsub_worker_ready()){
                 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
                 if(acc>0){
                     extern long mpool_count(void*);
                     fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
@@ -4422,7 +4467,61 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     }
 }
 
-static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6){
+
+/* ---- inbound over Tor ----------------------------------------------------
+ * Three things have to line up: a loopback socket for tor to forward to, an
+ * onion service pointing at it, and a control connection held open for the
+ * lifetime of the process.
+ *
+ * That last one is not optional. ADD_ONION without the Detach flag ties the
+ * service to the control connection, so closing it destroys the service. That
+ * is the behaviour we want -- a dead node should not leave a reachable
+ * address behind -- but it means the torctl_t is deliberately never closed.
+ *
+ * The virtual port is the CHAIN DEFAULT, not our local port: Core notes that
+ * using anything else fingerprints the node, since a peer dialling the onion
+ * sees the port. The local target may be any free loopback port; Core uses
+ * default+1 and so do we. */
+static torctl_t g_torctl = { .fd = -1 };
+
+static int tor_onion_listener(int port){
+    if(!g_cfg.listen)      return -1;   /* not accepting inbound at all */
+    if(!g_cfg.listenonion) { fprintf(stderr,"[tor] listenonion=0 -- no onion service\n"); return -1; }
+
+    /* Core's default is the CHAIN default port + 1 (mainnet 8334), not our
+     * configured port + 1 -- those differ whenever port= is set, and using
+     * ours collided with rpcport in testing. */
+    int target_port = g_chainp->default_port + 1;
+    int lo = lsock_onion(target_port, &target_port);
+    if(lo < 0) return -1;
+
+    char ctrl_ip[64] = "127.0.0.1"; int ctrl_port = 9051;
+    if(g_cfg.torcontrol[0]){
+        const char* c = strrchr(g_cfg.torcontrol, ':');
+        if(c){ long n = (long)(c - g_cfg.torcontrol);
+               if(n > 0 && n < (long)sizeof ctrl_ip){ memcpy(ctrl_ip, g_cfg.torcontrol, (size_t)n); ctrl_ip[n]=0; }
+               ctrl_port = atoi(c+1); }
+        else snprintf(ctrl_ip, sizeof ctrl_ip, "%s", g_cfg.torcontrol);
+    }
+    char target[64]; snprintf(target, sizeof target, "127.0.0.1:%d", target_port);
+    if(!torctl_add_onion(&g_torctl, ctrl_ip, ctrl_port,
+                         g_cfg.torpassword[0] ? g_cfg.torpassword : NULL, NULL,
+                         g_chainp->default_port, target, "onion_v3_private_key", 20000)){
+        fprintf(stderr,"[tor] no onion service: %s\n", g_torctl.err[0] ? g_torctl.err : "unknown");
+        fprintf(stderr,"[tor] (outbound onion is unaffected; only INBOUND needs the control port)\n");
+        close(lo);
+        return -1;
+    }
+    fprintf(stderr,"[tor] onion service %s:%d -> %s (key onion_v3_private_key)\n",
+            g_torctl.onion, g_chainp->default_port, target);
+    { extern int addrself_set_onion(const char*, unsigned short);
+      if(addrself_set_onion(g_torctl.onion, (unsigned short)g_chainp->default_port))
+          fprintf(stderr,"[tor] announcing %s:%d to onion peers\n",
+                  g_torctl.onion, g_chainp->default_port); }
+    return lo;
+}
+
+static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
      * The sole non-`-connect` caller passes `catchup_seeds` -- the six DNS
@@ -4464,7 +4563,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
      * negative fd and returns revents==0 for it, so the accept branch below
      * is naturally dead in outbound-only mode -- no separate code path. */
-    struct pollfd pfds[MUX_MAX_OUT+2];
+    struct pollfd pfds[MUX_MAX_OUT+3];   /* v4 + v6 + onion listeners, then legs */
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
@@ -4473,6 +4572,16 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * and poll() ignores a negative fd, so this is dead weight then */
         int v6slot = nfds;
         pfds[nfds].fd=l6;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* the onion service's loopback target; -1 when listenonion is off or
+         * tor is unreachable, and poll() ignores a negative fd */
+        int onionslot = nfds;
+        pfds[nfds].fd=lo;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* WHERE THE LEGS BEGIN, derived rather than written down. This used to
+         * be a hardcoded 2, and when the IPv6 listener took pfds[1] the leg
+         * loop kept starting at 1 -- every leg then read the PREVIOUS leg's
+         * revents. Deriving it means adding a listener cannot reintroduce
+         * that, which is the only reason this variable exists. */
+        const int legs_start = nfds;
         for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
         if(g_dl_worker_exited && !g_shutdown_requested){
             int st = (int)g_dl_worker_status;
@@ -4517,19 +4626,35 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * Either listener can be ready; the v6 one carries cjdns peers. */
         int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
         int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
-        if(ready_v4 || ready_v6){
+        int ready_on = (lo >= 0 && (pfds[onionslot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
+        if(ready_v4 || ready_v6 || ready_on){
             struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c;
             char peerdesc[80];
-            if(ready_v4){
+            if(ready_on){
+                /* Arrived on the onion service's loopback target, so it IS an
+                 * onion peer -- established by WHICH SOCKET accepted it, not
+                 * by looking at the source address, which is always
+                 * 127.0.0.1 here and would be indistinguishable from a local
+                 * connection. This is Core's rule (net.cpp: inbound_onion is
+                 * a membership test on the onion bind list).
+                 *
+                 * The peer's real address is unknowable by construction --
+                 * that is what the onion service provides -- so it is neither
+                 * ban-checked by address nor eligible for address-based
+                 * whitelisting. Core makes the same exemption explicitly. */
+                c = accept(lo,(struct sockaddr*)&ca,&cal);
+                snprintf(peerdesc, sizeof peerdesc, "onion-inbound");
+                if(c >= 0) fprintf(stderr,"[serve] inbound over onion (via the local tor service)\n");
+            } else if(ready_v4){
                 c = accept(l,(struct sockaddr*)&ca,&cal);
                 snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
                 /* A ban has to cover INBOUND too. ctl_is_banned guarded only
                  * the dial path, so a banned peer could simply connect to us
                  * and be served -- which makes setban look enforced while it
                  * is half enforced. */
-                if(c >= 0){
+                if(c >= 0 && !ready_on){
                     char bip[64]; snprintf(bip, sizeof bip, "%s", inet_ntoa(ca.sin_addr));
                     if(ctl_is_banned(bip)){
                         fprintf(stderr,"[serve] refused inbound from banned %s\n", peerdesc);
@@ -4609,7 +4734,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * This started at 1 and was NOT shifted when the v6 slot was
          * inserted, so every leg read the PREVIOUS leg's revents and the
          * last leg's was never examined (2026-08-28 pre-deploy review). */
-        int poll_idx=2;
+        int poll_idx=legs_start;
         long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
@@ -4776,6 +4901,22 @@ int main(int argc, char** argv){
         if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
         if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
         if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
+    }
+    /* -asmap AFTER the per-chain chdir. A relative path must resolve against
+     * the directory the node actually runs in; loading it earlier looked for
+     * regtest's map in the BASE datadir and silently fell back to /16, which
+     * is exactly the "configured but not in effect" failure this config
+     * surface keeps producing. Still before anything buckets an address --
+     * the group key changes meaning once a map is loaded. */
+    if (g_cfg.asmap[0]){
+        if (asmap_load(g_cfg.asmap))
+            fprintf(stderr,"[config] asmap: %s (%lu bytes) -- bucketing peers by AS, not /16\n",
+                    g_cfg.asmap, asmap_size());
+        else
+            fprintf(stderr,"[config] asmap: %s could not be loaded -- falling back to /16 bucketing\n",
+                    g_cfg.asmap);
+    }
+    {
         fprintf(stderr, "[boot] chain=%s datadir=%s port=%d dnsseed=%d\n",
                 g_chainp->name, effdir, g_cfg.port, g_cfg.dnsseed);
     }
@@ -5289,7 +5430,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1);
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -5312,7 +5453,7 @@ int main(int argc, char** argv){
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
-        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1);
+        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
     }
     return 2;
 }
