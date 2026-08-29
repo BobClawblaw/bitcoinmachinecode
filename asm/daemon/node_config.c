@@ -82,6 +82,7 @@ node_config_t g_cfg = {
     .coinstatsindex        = 1,      /* only lets an operator turn them OFF   */
     .rpccookie             = 1,      /* Core's default auth method            */
     .permitbaremultisig    = 1,      /* Core DEFAULT_PERMIT_BAREMULTISIG      */
+    .v2transport           = 1,      /* Core DEFAULT_V2_TRANSPORT             */
     .networkactive         = 1,      /* Core -networkactive default: on       */
     .forcednsseed          = 0,      /* Core -forcednsseed default: off       */
     .connect_only          = 0,
@@ -125,7 +126,7 @@ int nodecfg_hex32_be(const char* str, unsigned char out[32]){
  * stops -- and so the list itself is a readable statement of the gap. */
 static const char* const k_unimplemented[] = {
     "whitelist","whitebind","whitelistrelay","whitelistforcerelay",
-    "v2transport","txreconciliation","natpmp","upnp","bytespersigop",
+    "txreconciliation","natpmp","upnp","bytespersigop",
     "peerbloomfilters","peerblockfilters",
     "rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
@@ -166,6 +167,7 @@ static void set_defaults(void){
     g_cfg.coinstatsindex        = 1;
     g_cfg.rpccookie             = 1;
     g_cfg.permitbaremultisig    = 1;
+    g_cfg.v2transport           = 1;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
     g_cfg.pidfile[0]            = 0;
@@ -468,6 +470,8 @@ long node_config_load(const char* path){
             g_cfg.coinstatsindex = iv?1:0; applied++; }
         else if(!strcmp(key,"permitbaremultisig")){
             g_cfg.permitbaremultisig = iv?1:0; applied++; }
+        else if(!strcmp(key,"v2transport")){
+            g_cfg.v2transport = iv?1:0; applied++; }
         else if(!strcmp(key,"networkactive")){
             g_cfg.networkactive = iv?1:0; applied++; }
         else if(!strcmp(key,"forcednsseed")){

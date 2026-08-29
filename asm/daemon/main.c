@@ -47,6 +47,7 @@
 #include "torcontrol.h"  /* inbound: our own onion service */
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
@@ -566,6 +567,8 @@ static long outbound_catchup(long max_blocks){
         if(fd<0) continue;
         struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        /* this path speaks v1 only; clear any flag a recycled fd may carry */
+        bmc_v2_close(fd);
         if(node_handshake(fd)!=1 || !peer_has_witness(host)){ close(fd); continue; }
         static unsigned char loc[32];
         /* Anchor from the STORED TIP index record (index-hash read, robust to a
@@ -816,6 +819,10 @@ static int serve_loop(int fd, int lfd){
 #define MAX_BLOCK_RELAY_ONLY       8         /* ceiling; g_cfg picks the live count */
 #define CFG_INBOUND_LIMIT() \
     (g_cfg.max_connections - g_cfg.max_outbound - g_cfg.max_block_relay_only - g_cfg.max_feeler)
+/* BIP324 v2 transport. Off means the node behaves exactly as it did before
+ * this existed: p2p_read/p2p_write never register an fd, so their dispatch
+ * falls straight through to v1. */
+#define CFG_V2TRANSPORT() (g_cfg.v2transport)
 #define CFG_BRO_N() \
     (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
 /* Array capacity for outbound legs. The TARGET is g_cfg.max_outbound
@@ -1339,18 +1346,32 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * the proxied dial too. */
     const char* pwhy = "";
     int proxied = dialer_proxy_configured();
-    int fd;
-    if(proxied){
-        bmc_addr_t pa; memset(&pa,0,sizeof pa);
-        pa.net = BMC_NET_IPV4; pa.len = 4; memcpy(pa.addr, &ip, 4);
-        pa.port = (unsigned short)out_port;
-        fd = dialer_connect(&pa, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &pwhy);
-    } else fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+    int fd = -1;
     int hk = 0;
-    if(fd>=0){
-        struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-        hk = node_handshake(fd);
+    const char* v2res = "v1";
+    /* Try BIP324 first, then fall back by REDIALLING. An initiator cannot
+     * fall back in place the way a responder can: it has already put 64
+     * random bytes on the wire, and a v1 peer rejects those as a bad network
+     * magic and hangs up. So a failed v2 attempt costs one extra connection
+     * against a v1-only peer, and nothing at all against a v2 peer. */
+    for(int attempt = 0; attempt < 2; attempt++){
+        if(proxied){
+            bmc_addr_t pa; memset(&pa,0,sizeof pa);
+            pa.net = BMC_NET_IPV4; pa.len = 4; memcpy(pa.addr, &ip, 4);
+            pa.port = (unsigned short)out_port;
+            fd = dialer_connect(&pa, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &pwhy);
+        } else fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+        if(fd < 0) break;
+        { struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); }
+        if(attempt == 0 && CFG_V2TRANSPORT()){
+            int v2 = bmc_v2_handshake(fd, 1, 5000);
+            if(v2 == 1){ v2res = "v2"; break; }
+            close(fd); fd = -1;
+            continue;                       /* redial and speak v1 outright */
+        }
+        break;
     }
+    if(fd>=0) hk = node_handshake(fd);
 
     alarm(0);
     int fired = mux_sync_budget_fired;
@@ -1374,9 +1395,10 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         } else {
             snprintf(g_dial_fail,sizeof g_dial_fail,"peer lacks NODE_WITNESS");
         }
-        close(fd);
+        bmc_v2_close(fd); close(fd);
         return -1;
     }
+    fprintf(stderr,"[dial] %s connected over %s\n", host, v2res);
     /* the peer's version told us how it sees US -- feed the self-address
      * tally (daemon/addr_self.c) */
     { extern void addrself_note_peer_view(const unsigned char*, long);
@@ -1625,7 +1647,7 @@ static long do_outbound_sync(int i){
          * dead-slot path re-dials it, rate-limited. */
         g_sync_fail_streak[i]++;
         if(g_sync_fail_streak[i] >= 3){
-            close(mux_out_fd[i]);
+            bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]);
             mux_out_fd[i] = -1;
             g_sync_fail_streak[i] = 0;
         }
@@ -1677,7 +1699,7 @@ static long do_outbound_sync(int i){
  * reused in the poll loop; on failure the slot stays dead (fd -1) and is retried
  * on a later rotation. */ 
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
-    if(mux_out_fd[i]>=0){ close(mux_out_fd[i]); mux_out_fd[i]=-1; }
+    if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
      * This is the ONE place outbound legs are established, so gating here
      * gates every reconnect -- a toggle that only dropped the current legs
@@ -2124,6 +2146,7 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
     if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
@@ -3576,7 +3599,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     /* Core drops every connection when the network goes down;
                      * anything less would leave the node still talking. */
                     for(int i = 0; i < mux_n_out; i++)
-                        if(mux_out_fd[i] >= 0){ close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+                        if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
                     fprintf(stderr,"[ctl] network DISABLED: dropped all outbound legs\n");
                 } else {
                     fprintf(stderr,"[ctl] network enabled\n");
@@ -3599,7 +3622,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                               (!want[0] && num == (long long)i);
                     if(!hit) continue;
                     fprintf(stderr,"[ctl] disconnecting %s (leg %d)\n", mux_out_host[i], i);
-                    close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
                     if(g_node_status) g_node_status->peers[i].used = 0;
                     result = 1; break;
                 }
@@ -3693,7 +3716,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
                                 if(ctl_ban_covers(arg, ip)){
                                     fprintf(stderr,"[ctl] ban %s drops live leg %s\n", arg, mux_out_host[i]);
-                                    close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
                                     g_node_status->peers[i].used = 0;
                                 }
                             }
@@ -4794,11 +4817,29 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
+                    /* BIP324 first, if enabled. A v1 peer is detected in-band
+                     * -- it opens with magic + "version" + five NULs, and any
+                     * mismatch in those 16 bytes proves v2 -- and detection
+                     * PEEKS, so a v1 peer's version message is left on the
+                     * socket for the v1 path below. Once a session is up,
+                     * node_accept_handshake and the whole serve loop run
+                     * UNCHANGED: p2p_read/p2p_write route by file descriptor.
+                     * This runs in the child, so a failure cannot affect the
+                     * parent or any other peer. */
+                    const char* v2res = "v1";
+                    if(CFG_V2TRANSPORT()){
+                        int v2 = bmc_v2_handshake(c, 0, 8000);
+                        if(v2 < 0){
+                            fprintf(stderr,"[serve] inbound %s v2 handshake failed -- dropping\n", peerdesc);
+                            close(c); _exit(0);
+                        }
+                        v2res = v2 == 1 ? "v2" : "v1";
+                    }
                     int hok = node_accept_handshake(c);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
-                    fprintf(stderr,"[serve] inbound %s %s (pid %d) %s\n", peerdesc,
-                            hok==1?"connected":"handshake failed", getpid(), pv);
+                    fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
+                            hok==1?"connected":"handshake failed", v2res, getpid(), pv);
                     if(hok==1)
                         node_serve_loop(c, node_log_open(g_logpath), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
@@ -4921,6 +4962,16 @@ int main(int argc, char** argv){
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
       node_config_log(); }
+    /* Advertise NODE_P2P_V2 once the config is known, as Core does in
+     * init.cpp. A peer has no other way to learn that we will accept a
+     * BIP324 handshake, and nothing on the wire reveals it. */
+    { extern unsigned long long node_services;
+      if(CFG_V2TRANSPORT()){
+          node_services |= BMC_NODE_P2P_V2;
+          fprintf(stderr,"[net] BIP324 v2 transport enabled (services=0x%llx)\n", node_services);
+      } else {
+          fprintf(stderr,"[net] BIP324 v2 transport disabled by config -- v1 only\n");
+      } }
     /* Chain selection (daemon/chainparams.c). bitcoin.conf lives at -- and
      * was just read from -- the BASE datadir; each non-main chain gets its
      * own SUBDIRECTORY of it (Core's layout: <datadir>/regtest), so chains
