@@ -355,6 +355,18 @@ extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap
  * Mirrors the format block at the top of bitcoin_store.asm -- if that layout
  * ever changes, this must change with it. */
 #define ARCHIVE_FRAME_LEN 8
+/* NOT A CHAIN DISCRIMINATOR, despite looking like one (2026-08-29).
+ * The store writes this SAME constant into every frame on every chain --
+ * store state +36 is fixed at the mainnet value and chainparams_select only
+ * sets net_magic, the WIRE message-start. Verified by reading the bytes of a
+ * regtest archive: its frames carry 0xd9b4bef9, not regtest's 0xdab5bffa.
+ *
+ * So this check catches a truncated, overwritten or spliced archive, which is
+ * what it is for -- it cannot tell you the archive belongs to another chain.
+ * That job is chain_archive_matches() in daemon/main.c, which compares block
+ * 0 against the chain's genesis hash. Making the frame magic per-chain would
+ * change the on-disk format and invalidate every existing non-mainnet
+ * archive, for a property the genesis check already provides. */
 #define ARCHIVE_MAGIC     0xd9b4bef9u
 
 long archive_check(long nblocks, int level){
