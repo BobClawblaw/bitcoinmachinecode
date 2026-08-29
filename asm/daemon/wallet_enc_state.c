@@ -100,6 +100,9 @@ int wenc_encrypt(const char* mn, const char* mn_pass, const char* wallet_pass, l
     static char payload[WENC_MNMAX*2];
     long pl = snprintf(payload, sizeof payload, "%s\n%s", mn, mn_pass ? mn_pass : "");
     long n = wcrypt_seal(wallet_pass, wplen, (const u8*)payload, pl, seal, sizeof seal);
+    /* kept only until the container has been verified below, then wiped */
+    static char payload_check[WENC_MNMAX*2];
+    memcpy(payload_check, payload, (size_t)(pl < (long)sizeof payload_check ? pl : (long)sizeof payload_check));
     memset(payload, 0, sizeof payload);
     if (n < 0) return 0;
     char p[600]; wenc_path(p, sizeof p);
@@ -109,9 +112,44 @@ int wenc_encrypt(const char* mn, const char* mn_pass, const char* wallet_pass, l
     if (write(fd, seal, n) != n || fsync(fd) != 0){ close(fd); return 0; }
     close(fd);
     if (rename(tmp, p) != 0) return 0;
-    /* remove the plaintext store (both candidate locations) */
+
+    /* VERIFY BEFORE DESTROYING (audit follow-up 2026-08-29).
+     *
+     * The plaintext store used to be unlinked the moment the container was
+     * renamed into place, on the strength of the write having returned
+     * success. That is the wrong order: everything after the rename -- a
+     * corrupt seal, an unreadable file, a passphrase that does not actually
+     * open what we just wrote -- would leave the operator with no wallet at
+     * all, because the only readable copy had already been removed.
+     *
+     * So the container is re-opened from disk and unsealed with the same
+     * passphrase, and the recovered payload compared against what went in.
+     * Only if that round-trips is the plaintext store removed. If it does
+     * not, the container is discarded and the plaintext store is left exactly
+     * where it was: the caller sees a failure and still has a wallet. */
+    { static u8 back[8192]; static char got[WENC_MNMAX*2];
+      int ok = 0;
+      int vfd = open(p, O_RDONLY);
+      if (vfd >= 0){
+          long bn = (long)read(vfd, back, sizeof back);
+          close(vfd);
+          if (bn == n && !memcmp(back, seal, (size_t)n)){
+              long gl = wcrypt_open(wallet_pass, wplen, back, bn, (u8*)got, sizeof got);
+              if (gl == pl && !memcmp(got, payload_check, (size_t)pl)) ok = 1;
+          }
+      }
+      memset(got, 0, sizeof got);
+      memset(back, 0, sizeof back);
+      if (!ok){
+          unlink(p);                       /* discard the unverified container */
+          memset(payload_check, 0, sizeof payload_check);
+          return 0;                        /* plaintext store deliberately kept */
+      } }
+
+    /* verified -- now the plaintext store can go (both candidate locations) */
     { char d1[600]; snprintf(d1, sizeof d1, "%s/bmcwallet.dat", g_enc_dir[0]?g_enc_dir:"."); unlink(d1);
       unlink("bmcwallet.dat"); }
+    memset(payload_check, 0, sizeof payload_check);
     memcpy(g_blob, seal, n); g_bloblen = n;
     g_encrypted = 1; g_unlocked = 0;
     memset(g_seed, 0, sizeof g_seed);
