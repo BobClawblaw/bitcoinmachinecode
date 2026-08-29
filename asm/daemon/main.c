@@ -1127,8 +1127,20 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * chain default (node_config.c keeps the host bare and the port beside
      * it). 0 = nothing configured for this host. */
     { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
-    /* a literal IPv4 (with or without ":port") is resolved here without DNS;
-     * anything else is a name the resolver must answer */
+    /* A literal IPv4 (with or without ":port") needs no resolver at all, so
+     * the DNS gate below must not refuse it. Parse it HERE but DIAL IT IN THE
+     * BUDGETED PATH below: the first cut of this fix (2026-08-29) dialled it
+     * right here, which stepped outside the SIGALRM dial budget -- a
+     * trickling peer held the dial 46s against a 20s budget -- and flattened
+     * the connect errno to a bare "connect failed". test_dial_budget caught
+     * both; a shortcut around a bound is not a shortcut. */
+    unsigned lit_ip = 0; int have_lit = 0;
+    { bmc_addr_t lit;
+      if(bmc_addr_from_string_port(&lit, host, (unsigned short)out_port) && lit.net == BMC_NET_IPV4){
+          if(lit.port) out_port = lit.port;
+          memcpy(&lit_ip, lit.addr, 4);       /* network order, like sin_addr.s_addr */
+          have_lit = 1;
+      } }
     /* By here the address was not a literal of any network, so it is a name
      * -- and an anonymity-network name must reach its transport, never DNS. */
     if(strstr(host,".onion") || strstr(host,".i2p")){
@@ -1141,10 +1153,14 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * the resolver exactly which peers this node is about to contact, which
      * is precisely the correlation a proxy exists to prevent. Core does the
      * same with its name_proxy. */
-    if(dialer_dns_blocked()){
+    /* Only a NAME needs this: an IPv4 literal was already handled above and
+     * needs no resolver, so blocking DNS must not block it. And dns=0 with
+     * NO proxy has nowhere to send a name -- refuse it with that reason
+     * rather than a confusing proxy error. (2026-08-29 pre-deploy review.) */
+    if(!have_lit && dialer_dns_blocked()){
         const char* why = "";
         int nfd = dialer_connect_name(host, out_port, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
-        if(nfd < 0){ snprintf(g_dial_fail,sizeof g_dial_fail,"name via proxy: %.60s", why); return -1; }
+        if(nfd < 0){ snprintf(g_dial_fail,sizeof g_dial_fail,"cannot dial the name \"%.40s\": %.50s", host, why); return -1; }
         struct timeval tv; tv.tv_sec=30; tv.tv_usec=0; setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
         if(node_handshake(nfd)!=1 || !peer_has_witness(host)){ close(nfd); snprintf(g_dial_fail,sizeof g_dial_fail,"handshake failed (via proxy)"); return -1; }
         { extern void addrself_note_peer_view(const unsigned char*, long);
@@ -1153,19 +1169,17 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
         return nfd;
     }
-    char hbare[128]; snprintf(hbare, sizeof hbare, "%s", host);
-    { bmc_addr_t v4;
-      if (bmc_addr_from_string_port(&v4, host, (unsigned short)out_port) && v4.net == BMC_NET_IPV4){
-          out_port = v4.port;
-          bmc_addr_to_string(hbare, sizeof hbare, &v4);
-      } }
-    struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(hbare,NULL,&h,&res)!=0){
-        snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
-        return -1;
+    unsigned ip;
+    if(have_lit) ip = lit_ip;                 /* already parsed; the resolver never sees it */
+    else {
+        struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+        if(getaddrinfo(host,NULL,&h,&res)!=0){
+            snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
+            return -1;
+        }
+        ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+        freeaddrinfo(res);
     }
-    unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
-    freeaddrinfo(res);
 
     /* Arm the dial budget around BOTH the blocking connect and the handshake.
      * SA_RESTART is deliberately left clear (memset) so the signal makes the
@@ -1177,7 +1191,18 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     mux_sync_budget_fired = 0;
     alarm(OUTBOUND_DIAL_BUDGET_SECS);
 
-    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+    /* Through the proxy when one is configured -- a raw connect here would go
+     * direct and defeat it. Inside the alarm either way, so the budget bounds
+     * the proxied dial too. */
+    const char* pwhy = "";
+    int proxied = dialer_proxy_configured();
+    int fd;
+    if(proxied){
+        bmc_addr_t pa; memset(&pa,0,sizeof pa);
+        pa.net = BMC_NET_IPV4; pa.len = 4; memcpy(pa.addr, &ip, 4);
+        pa.port = (unsigned short)out_port;
+        fd = dialer_connect(&pa, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &pwhy);
+    } else fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
     int hk = 0;
     if(fd>=0){
         struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -1189,7 +1214,11 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     mux_sync_budget_fired = saved_fired;
     sigaction(SIGALRM,&old,NULL);
 
-    if(fd<0){ dial_fail_errno("connect", fd); return -1; }
+    if(fd<0){
+        if(proxied) snprintf(g_dial_fail,sizeof g_dial_fail,"ipv4 dial via proxy: %.60s", pwhy);
+        else dial_fail_errno("connect", fd);
+        return -1;
+    }
     if(fired || hk!=1 || !peer_has_witness(host)){
         if(fired){
             snprintf(g_dial_fail,sizeof g_dial_fail,"dial budget %ds exceeded",
@@ -1571,7 +1600,15 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
  * speaks dotted-quad, so config entries are resolved at the boundary rather
  * than each consumer having to cope with hostnames. Returns 1 on success. */
 static int dl_resolve1(const char* host, char out[64]){
-    /* never resolve behind a proxy: the caller dials the NAME instead */
+    /* A literal needs no resolver, so it leaks nothing and must not be
+     * refused: dropping it here removed the operator's own addnode=/connect=
+     * from BOTH the book and the catch-up pool, and with the DNS seeds also
+     * skipped behind a proxy that left a node with no bootstrap source at
+     * all. Parse it before the gate. (2026-08-29 pre-deploy review.) */
+    { bmc_addr_t lit;
+      if(bmc_addr_from_string(&lit, host) && lit.net == BMC_NET_IPV4){
+          bmc_addr_to_string(out, 64, &lit); return 1; } }
+    /* a NAME behind a proxy is resolved BY the proxy at dial time, not here */
     if(dialer_dns_blocked()) return 0;
     struct addrinfo h,*res=0; memset(&h,0,sizeof h);
     h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
@@ -2142,6 +2179,7 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
     int nc=0;
     for(int k=0;k<ntry;k++){
         int i=from+k;
+        if(dialer_proxy_configured()){ cfd[nc++]=-1; continue; }   /* would bypass the proxy */
         int pport = 0; unsigned ip = pool_ipv4(pool[i], &pport);
         if(!ip){ cfd[nc++]=-1; continue; }        /* not a dialable IPv4 candidate */
         int fd=socket(AF_INET,SOCK_STREAM,0);
@@ -2928,6 +2966,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
        * all: that address is exactly what running behind Tor hides. */
       int may = g_cfg.listen && dialer_may_announce_clearnet();
       addrself_init((unsigned short)g_cfg.port, may);
+      /* -externalip: the operator naming the reachable address directly */
+      if (may && g_cfg.externalip[0]){
+          bmc_addr_t ex;
+          extern int addrself_set_external(const unsigned char*);
+          if (bmc_addr_from_string(&ex, g_cfg.externalip) && ex.net == BMC_NET_IPV4 && addrself_set_external(ex.addr))
+              fprintf(stderr,"[addrself] announcing the configured externalip %s:%u\n", g_cfg.externalip, (unsigned)g_cfg.port);
+          else
+              fprintf(stderr,"[config] externalip=%s is not a usable IPv4 address -- ignoring\n", g_cfg.externalip);
+      }
       if (g_cfg.listen && !may)
           fprintf(stderr,"[addrself] not announcing our address: %s\n",
                   g_cfg.discover ? "onlynet excludes clearnet" : "discover=0"); }
@@ -3153,6 +3200,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         int nc=0;
         for(int i=0;i<ntry && nc<64;i++){
             unsigned ip;
+            /* With a proxy configured this raw non-blocking connect would
+             * go DIRECT, defeating the proxy for every IPv4 peer. Leave those
+             * to the sequential path, which dials through the dialer.
+             * (2026-08-29 pre-deploy review.) */
+            if(dialer_proxy_configured()){ cfd[nc++]=-1; continue; }
             int spport = 0;
             ip = pool_ipv4(srcpool[i], &spport);
             if(!ip){
@@ -3786,6 +3838,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(bro_fd[b] >= 0) continue;
             if((rot % 16) != 0) break;             /* rate-limit re-dials */
             for(int ci=0; ci<nsrc; ci++){
+                if(dialer_proxy_configured()) continue;            /* would bypass the proxy */
                 unsigned cip = pool_ipv4(srcpool[ci], NULL); if(!cip) continue;
                 int clash=0;
                 for(int k=0;k<mux_n_out;k++){

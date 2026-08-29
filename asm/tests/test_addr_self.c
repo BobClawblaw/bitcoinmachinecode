@@ -18,6 +18,7 @@ extern void addrself_init(unsigned short listen_port, int listen_enabled);
 extern void addrself_note_peer_view(const u8* payload, long len);
 extern long addrself_build(u8 out[64], long now);
 extern long addrself_build_v2(u8 out[64], long now);
+extern int  addrself_set_external(const unsigned char ip4[4]);
 extern long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds);
 
 static int fails = 0;
@@ -95,6 +96,17 @@ int main(void){
     { u8 b[64]; long n = addrself_build_v2(b, 0x65535300L);
       static const u8 CORE[] = { 0x01, 0x00,0x53,0x53,0x65, 0x09, 0x01, 0x04, 203,0,113,77, 0x20,0x8c };
       ck("addrself_build_v2 == Core serialize_v2 bytes", n == (long)sizeof CORE && memcmp(b, CORE, n) == 0); }
+
+    printf("\n== -externalip: the operator names the address, no peer votes needed ==\n");
+    { /* the override on top of the learned address: a DIFFERENT address, and
+       * it must reach both announcement forms */
+      u8 ext[4] = { 198, 51, 100, 200 };
+      ck("addrself_set_external accepts an IPv4", addrself_set_external(ext) == 1);
+      u8 b[64]; long n = addrself_build(b, 0x65535300L);
+      ck("the announcement carries the configured address", n == 31 && !memcmp(b + 25, ext, 4));
+      u8 b2[64]; long n2 = addrself_build_v2(b2, 0x65535300L);
+      ck("and so does the addrv2 form", n2 == 14 && !memcmp(b2 + 8, ext, 4));
+      addrself_set_external(pub); }   /* restore, so the cadence check below is unchanged */
 
     printf("\n== cadence: an immediate re-announce is a no-op ==\n");
     { int fds[1] = { sp[0] };
