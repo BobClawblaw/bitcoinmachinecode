@@ -92,6 +92,69 @@ static const char* find_header(const char* headers, size_t hlen,
     return NULL;
 }
 
+/* ---- RPC cookie authentication (Core's default) --------------------------
+ * A password in the config file is a long-lived shared secret that every
+ * client needs a copy of. Core's default instead writes a fresh random
+ * credential to <datadir>/.cookie at 0600 on every start and deletes it on
+ * exit, so a local client reads it from the filesystem and nothing durable
+ * has to be distributed. This node had no such option: the plaintext
+ * password was the ONLY way in.
+ *
+ * Format is Core's exactly -- "__cookie__:<64 hex>" with no trailing newline
+ * -- so bitcoin-cli and any Core-compatible tooling authenticate unchanged. */
+#define RPC_COOKIE_USER "__cookie__"
+static char g_cookie_pass[65];          /* 64 hex + NUL; empty = no cookie */
+static char g_cookie_path[512];
+
+/* Compare in time independent of WHERE the mismatch is. The previous
+ * comparison returned early on a length mismatch and used memcmp, so both
+ * the length and a matching prefix were observable. The listener is
+ * loopback-only, which makes this low severity, not a non-issue. */
+static int ct_eq(const unsigned char* a, size_t alen,
+                 const char* b, size_t blen) {
+    unsigned diff = (unsigned)(alen ^ blen);
+    size_t n = alen < blen ? alen : blen;
+    for (size_t i = 0; i < n; i++) diff |= (unsigned)(a[i] ^ (unsigned char)b[i]);
+    /* fold the tail of the longer side in so the loop count depends only on
+     * the shorter length, never on where the bytes stop matching */
+    for (size_t i = n; i < alen; i++) diff |= (unsigned)a[i];
+    for (size_t i = n; i < blen; i++) diff |= (unsigned)(unsigned char)b[i];
+    return diff == 0;
+}
+
+/* Write <path> with a fresh credential at 0600. 1 on success. */
+int rpc_cookie_write(const char* path) {
+    if (!path || !*path) return 0;
+    unsigned char r[32];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t got = read(fd, r, sizeof r);
+    close(fd);
+    if (got != (ssize_t)sizeof r) return 0;
+    static const char* H = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) { g_cookie_pass[i*2] = H[r[i] >> 4]; g_cookie_pass[i*2+1] = H[r[i] & 15]; }
+    g_cookie_pass[64] = 0;
+    /* O_EXCL would refuse to start after an unclean shutdown left a stale
+     * cookie, so replace it -- but create at 0600 from the outset rather
+     * than chmod'ing afterwards, which would leave a readable window. */
+    unlink(path);
+    int cf = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (cf < 0) { g_cookie_pass[0] = 0; return 0; }
+    char line[128];
+    int n = snprintf(line, sizeof line, "%s:%s", RPC_COOKIE_USER, g_cookie_pass);
+    int ok = (write(cf, line, (size_t)n) == n);
+    close(cf);
+    if (!ok) { unlink(path); g_cookie_pass[0] = 0; return 0; }
+    snprintf(g_cookie_path, sizeof g_cookie_path, "%s", path);
+    return 1;
+}
+
+void rpc_cookie_remove(void) {
+    if (g_cookie_path[0]) unlink(g_cookie_path);
+    g_cookie_path[0] = 0;
+    memset(g_cookie_pass, 0, sizeof g_cookie_pass);
+}
+
 /* Verify Authorization: Basic <user:pass> against the configured credentials. */
 static int auth_ok(const char* headers, size_t hlen,
                    const char* user, const char* pass) {
@@ -110,13 +173,30 @@ static int auth_ok(const char* headers, size_t hlen,
     if (colon) {
         size_t ulen = (size_t)(colon - decoded);
         size_t plen = declen - ulen - 1;
-        size_t eu = strlen(user), ep = strlen(pass);
-        if (ulen == eu && plen == ep &&
-            memcmp(decoded, user, eu) == 0 && memcmp(colon + 1, pass, ep) == 0)
-            ok = 1;
+        /* the configured user/pass, and -- when one was emitted -- the
+         * cookie. Both arms run so acceptance does not leak which matched. */
+        int by_pass   = ct_eq(decoded, ulen, user, strlen(user)) &
+                        ct_eq(colon + 1, plen, pass, strlen(pass));
+        int by_cookie = g_cookie_pass[0] &&
+                        (ct_eq(decoded, ulen, RPC_COOKIE_USER, strlen(RPC_COOKIE_USER)) &
+                         ct_eq(colon + 1, plen, g_cookie_pass, strlen(g_cookie_pass)));
+        /* an empty configured password must never authenticate an empty one */
+        if (!*pass) by_pass = 0;
+        ok = (by_pass | by_cookie);
     }
     free(decoded);
     return ok;
+}
+
+
+/* Test hook: auth_ok is static because nothing outside this file should be
+ * making authentication decisions. tests/test_core_parity.c needs to assert
+ * that the cookie is accepted and a wrong one is not, which is exactly an
+ * authentication decision -- so it gets a named door rather than the header
+ * being widened for everyone. */
+int rpc_auth_ok_for_test(const char* hdrs, unsigned long hlen,
+                         const char* user, const char* pass){
+    return auth_ok(hdrs, (size_t)hlen, user, pass);
 }
 
 /* Deep-copy an rj_val via the serializer round-trip. */

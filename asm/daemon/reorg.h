@@ -134,4 +134,11 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
  * `peer` is only used for logging. */
 long reorg_probe_peer(int fd, void* st, const char* peer);
 
+/* -minimumchainwork: the floor a candidate chain must clear. Set once at
+ * boot from config or the chain default; all-zero means no floor. */
+void reorg_set_min_chain_work(const unsigned char be32[32]);
+int  reorg_work_meets_minimum(const unsigned char work[16]);
+int  reorg_min_chain_work_set(void);
+int  reorg_min_chain_work_unrepresentable(void);
+
 #endif /* REORG_H */
