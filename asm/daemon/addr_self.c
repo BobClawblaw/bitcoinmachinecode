@@ -55,6 +55,18 @@ void addrself_init(unsigned short listen_port, int listen_enabled){
     g_port = listen_port;
     g_enabled = listen_enabled;
 }
+/* Core -externalip: announce THIS address instead of one learned from peers.
+ * An operator behind a NAT or a port-forward knows the reachable address and
+ * this node cannot deduce it. Setting it also skips the two-agreeing-peers
+ * wait, because the operator has already answered the question that wait
+ * exists to answer. (2026-08-29: the key was parsed and documented but never
+ * read -- a setting that does nothing is worse than one that is absent.) */
+int addrself_set_external(const unsigned char ip4[4]){
+    if (!ip4) return 0;
+    memcpy(g_ip, ip4, 4);
+    g_confident = 1;
+    return 1;
+}
 
 /* Feed one captured peer version payload (the raw bytes node_handshake
  * snapshots). addr_recv sits at offset 20: services(8) ip(16) port(2); the

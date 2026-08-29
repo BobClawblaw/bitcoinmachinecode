@@ -26,21 +26,55 @@ int main(void){
     else { printf("FAIL: defaults wrong (conns=%d out=%d dbcache=%d)\n",
                   g_cfg.max_connections,g_cfg.max_outbound,g_cfg.dbcache_mb); failures++; }
 
-    /* 2. the REAL repo config -- must parse, and honour Core keys already in it */
-    /* The config of THIS checkout, not a hardcoded absolute path into the main
-     * one -- the verdict below must not depend on another tree's working copy. */
-    long n = node_config_load(tt_src("../config/bitcoin.conf"));
-    printf("  real bitcoin.conf applied %ld setting(s)\n", n);
-    if (g_cfg.max_connections==256)
-        printf("PASS: honoured maxconnections=256 from the real file\n");
-    else { printf("FAIL: maxconnections=%d, expected 256\n", g_cfg.max_connections); failures++; }
-    if (g_cfg.dbcache_mb==4096)
-        printf("PASS: honoured Core's dbcache=4096 from the real file\n");
-    else { printf("FAIL: dbcache_mb=%d, expected 4096\n", g_cfg.dbcache_mb); failures++; }
+    /* 2. the repo's SAMPLE config -- the tracked one. config/bitcoin.conf is
+     * an operator file (rpcpassword) and is gitignored since 2026-08-29, so a
+     * test that read it passed only on a machine that happened to have one.
+     * The sample is every key at its default, ALL COMMENTED OUT, so the right
+     * assertion is that it parses and changes nothing. */
+    long n = node_config_load(tt_src("../config/bitcoin.sample.conf"));
+    printf("  bitcoin.sample.conf applied %ld setting(s)\n", n);
+    if (n == 0) printf("PASS: the sample config is fully commented out (applies nothing)\n");
+    else { printf("FAIL: the sample config applied %ld setting(s); it must be all defaults, commented\n", n); failures++; }
+    { /* and every key it documents must be one the parser knows: an
+       * uncommented copy has to apply them all */
+      FILE* f = fopen(tt_src("../config/bitcoin.sample.conf"), "r");
+      FILE* o = fopen("uncommented.conf", "w");
+      char line[512]; long keys = 0;
+      if (f && o){
+          while (fgets(line, sizeof line, f)){
+              if (line[0] != '#' || !strchr(line, '=')) continue;
+              const char* eq = strchr(line, '=');
+              if (eq == line + 1) continue;                 /* "#=" is not a key */
+              int alpha = 1;
+              for (const char* c = line + 1; c < eq; c++) if (!(*c >= 'a' && *c <= 'z') && !(*c >= '0' && *c <= '9') && *c != '_') alpha = 0;
+              if (!alpha) continue;
+              if (!strncmp(line+1, "rpc", 3)) continue;     /* read by the RPC server, not this parser */
+              /* an empty value (e.g. "#proxy=" or "#proxy=   # comment")
+               * legitimately applies nothing, so only keys that carry a
+               * value can be expected to count */
+              const char* v = eq + 1;
+              while (*v == ' ' || *v == '\t') v++;
+              if (*v == '\n' || *v == 0 || *v == '#'){ fputs(line + 1, o); continue; }
+              fputs(line + 1, o); keys++;
+          }
+      }
+      if (f) fclose(f); if (o) fclose(o);
+      long applied = node_config_load("uncommented.conf");
+      printf("  sample documents %ld parser keys; uncommenting applied %ld\n", keys, applied);
+      if (keys > 30 && applied >= keys)
+          printf("PASS: the documented keys are keys the parser actually knows\n");
+      else { printf("FAIL: %ld of %ld documented keys were not applied\n", keys - applied, keys); failures++; }
+      unlink("uncommented.conf"); }
+    /* dbcache still scales the memtable -- with its own file now that the
+     * operator's config is no longer read here */
+    { FILE* d = fopen("dbcache.conf", "w"); if (d){ fputs("dbcache=4096\n", d); fclose(d); } }
+    node_config_load("dbcache.conf");
     if (g_cfg.utxo_bulk_slots_log2 > 22)
         printf("PASS: dbcache=4096 scaled the memtable up (2^%d slots, %dMB blob)\n",
                g_cfg.utxo_bulk_slots_log2, g_cfg.utxo_bulk_blob_mb);
     else { printf("FAIL: dbcache did not scale sizing (2^%d)\n", g_cfg.utxo_bulk_slots_log2); failures++; }
+    unlink("dbcache.conf");
+    node_config_load("/nonexistent/reset.conf");
 
     /* 3. out-of-range values are rejected, not applied */
     wr("bmc_t1.conf", "maxconnections=2\nbmc.peerminusable=0\nbmc.peerpool=-5\n");

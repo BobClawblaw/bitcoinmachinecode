@@ -71,6 +71,28 @@ int dialer_init(void){
 /* tests drive the predicates with different g_cfg values; the latch has to
  * be releasable for that, and nothing else calls this. */
 int dialer_reset_for_test(void){ g_ready = 0; g_i2p_ok = 0; g_onion_ip[0] = 0; g_proxy_ip[0] = 0; return 0; }
+/* 8 random bytes from the kernel, hex, as SOCKS5 user and password: tor puts
+ * each distinct pair on its own circuit. A counter would be guessable and
+ * would reset in every forked child, so two peers could share a circuit. */
+int dialer_isolation_creds(char* u, long ucap, char* p, long pcap){
+    unsigned char r[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return 0;
+    long n = read(fd, r, sizeof r); close(fd);
+    if (n != (long)sizeof r || ucap < 17 || pcap < 17) return 0;
+    static const char* H = "0123456789abcdef";
+    for (int i = 0; i < 8; i++){ u[i*2] = H[r[i] >> 4]; u[i*2+1] = H[r[i] & 15]; }
+    u[16] = 0;
+    for (int i = 0; i < 8; i++){ p[i*2] = H[r[8+i] >> 4]; p[i*2+1] = H[r[8+i] & 15]; }
+    p[16] = 0;
+    return 1;
+}
+/* 1 when a SOCKS5 proxy is configured for clearnet: the raw-socket dial
+ * paths must stand down, or they would go direct and defeat it. */
+int dialer_proxy_configured(void){
+    if (!g_ready) dialer_init();
+    return g_proxy_ip[0] != 0;
+}
 int dialer_dns_blocked(void){
     if (!g_ready) dialer_init();
     if (!g_cfg.dns) return 1;                    /* the operator said so */
@@ -132,21 +154,10 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
          * peers could share a circuit -- read from the kernel instead.
          * (2026-08-28 pre-deploy review.) */
         char u[40], p[40];
-        { unsigned char r[16];
-          int rf = open("/dev/urandom", O_RDONLY);
-          if (rf < 0 || read(rf, r, sizeof r) != (long)sizeof r){
-              /* never fall back to a predictable value: without randomness
-               * we cannot isolate, so say so and use no credentials */
-              if (rf >= 0) close(rf);
-              *why = "cannot read /dev/urandom for stream isolation";
-              return -1;
-          }
-          close(rf);
-          static const char* H = "0123456789abcdef";
-          for (int i = 0; i < 8; i++){ u[i*2] = H[r[i] >> 4]; u[i*2+1] = H[r[i] & 15]; }
-          u[16] = 0;
-          for (int i = 0; i < 8; i++){ p[i*2] = H[r[8+i] >> 4]; p[i*2+1] = H[r[8+i] & 15]; }
-          p[16] = 0; }
+        if (!dialer_isolation_creds(u, sizeof u, p, sizeof p)){
+            /* never fall back to a predictable value: without randomness we
+             * cannot isolate, so fail the dial rather than share a circuit */
+            *why = "cannot read /dev/urandom for stream isolation"; return -1; }
         int rep = 0;
         int fd = socks5_connect(g_onion_ip, g_onion_port, host, a->port ? a->port : 8333,
                                 g_cfg.proxyrandomize ? u : NULL, g_cfg.proxyrandomize ? p : NULL,
@@ -160,8 +171,13 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
         return fd; }
     case BMC_NET_IPV4: {
         if (g_proxy_ip[0]){
+            /* isolation applies to EVERY proxied connection, not just onion:
+             * Core randomises credentials for all of them */
+            char u[40], p[40]; int have = dialer_isolation_creds(u, sizeof u, p, sizeof p);
+            if (!have){ *why = "cannot read /dev/urandom for stream isolation"; return -1; }
             int rep = 0;
-            int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port, NULL, NULL, timeout_ms, &rep);
+            int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port,
+                                    g_cfg.proxyrandomize ? u : NULL, g_cfg.proxyrandomize ? p : NULL, timeout_ms, &rep);
             if (fd < 0){ snprintf(err, sizeof err, "socks5 rc=%d rep=%d", fd, rep); *why = err; }
             return fd;
         }

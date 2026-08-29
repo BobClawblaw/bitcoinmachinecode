@@ -26,6 +26,11 @@ int  dialer_net_reachable(int net);
  * the resolver exactly which peers this node is about to contact, which is
  * the correlation running behind Tor exists to prevent. */
 int  dialer_dns_blocked(void);
+/* 1 when a clearnet SOCKS5 proxy is set: the raw-socket dial paths must stand
+ * down or they would go direct and defeat it */
+int  dialer_proxy_configured(void);
+/* random per-connection SOCKS5 credentials (stream isolation); 0 on failure */
+int  dialer_isolation_creds(char* u, long ucap, char* p, long pcap);
 /* connect to a NAME through the configured proxy (SOCKS5 ATYP DOMAINNAME:
  * the proxy resolves it). -1 if no proxy is configured. */
 int  dialer_connect_name(const char* host, int port, int timeout_ms, const char** why);
