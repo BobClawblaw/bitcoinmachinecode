@@ -5042,7 +5042,13 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
-      node_config_log(); }
+      node_config_log();
+      /* Join the config to the passphrase module HERE. Neither side may
+       * reference the other: node_config.o is linked into targets with no
+       * wallet, and wallet_pass.o is linked (via RPCLIBS) into 31 targets
+       * with no config. main.c is the only place that has both -- pushing the
+       * value across here is what keeps both link sets independent. */
+      wallet_pass_set_file(g_cfg.walletpassfile); }
     /* Advertise NODE_P2P_V2 once the config is known, as Core does in
      * init.cpp. A peer has no other way to learn that we will accept a
      * BIP324 handshake, and nothing on the wire reveals it. */
