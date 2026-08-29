@@ -4483,6 +4483,14 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         else     fprintf(stderr,"[boot] could not write -pid=%s: %s\n", g_cfg.pidfile, strerror(errno));
     }
     if (g_cfg.startupnotify[0]) notify_run(g_cfg.startupnotify, "", "startupnotify");
+    /* -rpcauth: hashed credentials, so a fixed password need not sit in the
+     * config in plaintext. A malformed entry is REPORTED, never dropped. */
+    for (int i = 0; i < g_cfg.n_rpcauth; i++){
+        if (!rpc_auth_add(g_cfg.rpcauth[i]))
+            fprintf(stderr,"[rpc] rpcauth entry %d is malformed (want user:salt$hash) -- ignored\n", i + 1);
+    }
+    if (rpc_auth_count())
+        fprintf(stderr,"[rpc] %d rpcauth credential(s) loaded\n", rpc_auth_count());
     if (g_cfg.rpccookie){
         const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
         if (rpc_cookie_write(cpath))
