@@ -540,7 +540,9 @@ static int cmd_getmempoolinfo(rj_val** res){
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
-    rj_obj_set(o, "permitbaremultisig", rj_bool(1));       /* standard relay policy */
+    /* the real policy value, not a literal: reporting a setting the
+     * operator cannot change was the honesty gap the audit called out */
+    rj_obj_set(o, "permitbaremultisig", rj_bool(g_status ? g_status->permit_bare_multisig : 1));  /* standard relay policy */
     rj_obj_set(o, "maxdatacarriersize", rj_numf("%d", 100000));
     /* Master-only cluster-mempool fields (limitclustercount/size, optimal) are
      * deliberately omitted -- bleeding-edge, no released Core has them. */
