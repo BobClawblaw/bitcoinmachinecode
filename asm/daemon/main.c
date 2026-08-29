@@ -3598,6 +3598,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
+    long long next_zmq_poll_ms  = 0;   /* audit finding 8: throttle subscriber servicing */
     int last_seen_tip = *(int*)(store_buf+24);   /* new-block announcement baseline (boot tip, so the catch-up burst is announced too) */
     /* STAGE B: next allowed fork probe (see the probe block in the rotation
      * below). Starts armed so a node booting onto a store that is already on
@@ -4297,7 +4298,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* Drain transactions staged by the serve children (and by this
          * worker's own sendrawtransaction path) and service subscriber
          * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
-        if (zmqpub_active()){ zmqpub_poll(); zmqn_drain(); }
+        /* audit finding 8: do not walk the subscriber list on every pass of
+         * this loop. zmqpub_poll services accepts and subscription frames for
+         * every connected subscriber, and a peer that dribbles greeting bytes
+         * keeps it returning with data still pending -- so 32 subscribers
+         * become a per-iteration tax on a loop whose actual job is block
+         * download.
+         *
+         * Rate-limited rather than gated on a catch-up flag, because that is
+         * the honest shape of the fix: subscriber handshakes are
+         * latency-tolerant (nobody notices 200 ms to finish subscribing),
+         * whereas inventing a batch-state predicate would add a second source
+         * of truth about what the downloader is doing.
+         *
+         * PUBLISHING IS UNAFFECTED -- zmqpub_notify still fires from its own
+         * call sites the moment a block or transaction lands. Only the
+         * accept/subscribe servicing is throttled. */
+        if (zmqpub_active() && now_ms >= next_zmq_poll_ms){
+            zmqpub_poll(); zmqn_drain();
+            next_zmq_poll_ms = now_ms + 200;
+        }
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
