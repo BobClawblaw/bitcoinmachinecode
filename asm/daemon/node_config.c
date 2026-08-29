@@ -67,6 +67,14 @@ node_config_t g_cfg = {
     .datacarriersize       = 100000, /* Core v31 -datacarriersize default    */
     .acceptnonstdtxn       = 0,      /* Core -acceptnonstdtxn default        */
     .dnsseed               = 1,      /* Core -dnsseed default: on            */
+    /* Core DEFAULT_PROXYRANDOMIZE = true: random SOCKS5 credentials per
+     * connection, so tor gives each its own circuit. Documented as
+     * "default 1" in node_config.h and never actually defaulted until
+     * 2026-08-28 -- which left stream isolation OFF for exactly the
+     * operator who configured nothing but a proxy. */
+    .proxyrandomize        = 1,
+    .i2pacceptincoming     = 1,      /* Core -i2pacceptincoming default: on  */
+    .listenonion           = 1,      /* Core -listenonion default: on        */
     .connect_only          = 0,
     .n_seednode            = 0,
     .n_addnode             = 0,
@@ -89,6 +97,9 @@ static void set_defaults(void){
     g_cfg.maxpool               = 2048;
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
+    g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
+    g_cfg.i2pacceptincoming     = 1;
+    g_cfg.listenonion           = 1;
     g_cfg.utxo_bulk_slots_log2  = 22;
     g_cfg.utxo_bulk_blob_mb     = 1024;
     g_cfg.utxo_bulk_gap_blocks  = 50000L;
