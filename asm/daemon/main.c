@@ -210,6 +210,7 @@ extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_st
  * in the download worker ONLY; the ring is what lets the serve children
  * contribute the transactions they accept. */
 extern int  zmqpub_add(const char* topic, const char* addr);
+extern int  zmqpub_start(void);
 extern int  zmqpub_active(void);
 extern void zmqpub_poll(void);
 extern void txit_boot(void* store_buf);                                       /* daemon/tx_index_tail.c */
@@ -3205,6 +3206,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
     if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
     if (g_cfg.zmq_rawtx[0])     zmqpub_add("rawtx",     g_cfg.zmq_rawtx);
+    /* Subscriber servicing runs on its own thread from here on, so no hot
+     * loop in this worker ever walks the subscriber list (audit finding 8).
+     * Non-fatal: if the thread cannot start, publishing still works and the
+     * failure is logged -- only new subscribers would fail to connect. */
+    { extern int zmqpub_start(void);
+      if (zmqpub_active()) zmqpub_start(); }
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
@@ -3598,7 +3605,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
-    long long next_zmq_poll_ms  = 0;   /* audit finding 8: throttle subscriber servicing */
     int last_seen_tip = *(int*)(store_buf+24);   /* new-block announcement baseline (boot tip, so the catch-up burst is announced too) */
     /* STAGE B: next allowed fork probe (see the probe block in the rotation
      * below). Starts armed so a node booting onto a store that is already on
@@ -4298,26 +4304,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* Drain transactions staged by the serve children (and by this
          * worker's own sendrawtransaction path) and service subscriber
          * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
-        /* audit finding 8: do not walk the subscriber list on every pass of
-         * this loop. zmqpub_poll services accepts and subscription frames for
-         * every connected subscriber, and a peer that dribbles greeting bytes
-         * keeps it returning with data still pending -- so 32 subscribers
-         * become a per-iteration tax on a loop whose actual job is block
-         * download.
-         *
-         * Rate-limited rather than gated on a catch-up flag, because that is
-         * the honest shape of the fix: subscriber handshakes are
-         * latency-tolerant (nobody notices 200 ms to finish subscribing),
-         * whereas inventing a batch-state predicate would add a second source
-         * of truth about what the downloader is doing.
-         *
-         * PUBLISHING IS UNAFFECTED -- zmqpub_notify still fires from its own
-         * call sites the moment a block or transaction lands. Only the
-         * accept/subscribe servicing is throttled. */
-        if (zmqpub_active() && now_ms >= next_zmq_poll_ms){
-            zmqpub_poll(); zmqn_drain();
-            next_zmq_poll_ms = now_ms + 200;
-        }
+        /* audit finding 8: subscriber servicing has its own thread now
+         * (daemon/zmq_pub.c), so this loop -- whose job is block download --
+         * no longer walks the subscriber list at all. Only the staged-tx
+         * drain remains, which is a cheap no-op when ZMQ is unconfigured.
+         * This is the shape Core has for free: libzmq services subscribers on
+         * its own I/O thread and Core's hot paths never touch them. */
+        if (zmqpub_active()) zmqn_drain();
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
