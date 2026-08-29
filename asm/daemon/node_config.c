@@ -125,17 +125,15 @@ int nodecfg_hex32_be(const char* str, unsigned char out[32]){
  * stops -- and so the list itself is a readable statement of the gap. */
 static const char* const k_unimplemented[] = {
     "whitelist","whitebind","whitelistrelay","whitelistforcerelay",
-    "v2transport","txreconciliation","natpmp","upnp",
-    "peerbloomfilters","peerblockfilters","maxsendbuffer",
+    "v2transport","txreconciliation","natpmp","upnp","bytespersigop",
+    "peerbloomfilters","peerblockfilters",
     "rpcauth","rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
     "reindex","reindex-chainstate","loadblock","blocksdir","blocksxor",
     "persistmempool","persistmempoolv1","dbbatchsize","prevoutfetchthreads",
-    "uacomment","bytespersigop","maxtxfee","maxapsfee",
+    "uacomment","maxtxfee","maxapsfee",
     "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
-    "zmqpubhashblockhwm","zmqpubhashtxhwm","zmqpubrawblockhwm",
-    "zmqpubrawtxhwm","zmqpubsequencehwm",
-    "walletnotify",
+        "walletnotify",
     "settings","includeconf","allowignoredconf",
     "fixedseeds",
     NULL
@@ -175,9 +173,10 @@ static void set_defaults(void){
     g_cfg.alertnotify[0]        = 0;
     g_cfg.startupnotify[0]      = 0;
     g_cfg.shutdownnotify[0]     = 0;
-    g_cfg.walletnotify[0]       = 0;
     g_cfg.maxtxfee_sat          = 0;
     g_cfg.asmap[0]              = 0;
+    g_cfg.maxsendbuffer_kb      = 1000;   /* Core -maxsendbuffer default */
+    for (int i = 0; i < 5; i++) g_cfg.zmq_hwm[i] = 1000;
     g_cfg.rpccookiefile[0]      = 0;
     memset(g_cfg.minchainwork, 0, 32);
     g_cfg.have_minchainwork     = 0;
@@ -474,6 +473,13 @@ long node_config_load(const char* path){
             g_cfg.forcednsseed = iv?1:0; applied++; }
         else if(!strcmp(key,"pid")){
             snprintf(g_cfg.pidfile,sizeof g_cfg.pidfile,"%s",val); applied++; }
+        else if(!strcmp(key,"maxsendbuffer")){
+            t=clamp_int(iv,1,1000000,key,&bad); if(t>=0){ g_cfg.maxsendbuffer_kb=t; applied++; } }
+        else if(!strcmp(key,"zmqpubhashblockhwm")){ t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[0]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubhashtxhwm")){    t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[1]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubrawblockhwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[2]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubrawtxhwm")){     t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[3]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubsequencehwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[4]=t;applied++;} }
         else if(!strcmp(key,"asmap")){
             snprintf(g_cfg.asmap,sizeof g_cfg.asmap,"%s",val); applied++; }
         else if(!strcmp(key,"blocknotify")){
@@ -484,8 +490,6 @@ long node_config_load(const char* path){
             snprintf(g_cfg.startupnotify,sizeof g_cfg.startupnotify,"%s",val); applied++; }
         else if(!strcmp(key,"shutdownnotify")){
             snprintf(g_cfg.shutdownnotify,sizeof g_cfg.shutdownnotify,"%s",val); applied++; }
-        else if(!strcmp(key,"walletnotify")){
-            snprintf(g_cfg.walletnotify,sizeof g_cfg.walletnotify,"%s",val); applied++; }
         else if(!strcmp(key,"maxtxfee")){
             /* Core takes BTC; stored in satoshis like every other fee here */
             double b = atof(val); if(b >= 0) g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5);

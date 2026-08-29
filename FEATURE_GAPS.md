@@ -387,6 +387,68 @@ regtest AND testnet4, nBits schedule enforcement, `bumpfee`/`psbtbumpfee`,
 and `gettxout` (which had been answering `null` — i.e. "spent" — for every
 outpoint on the live node).
 
+
+**Update 2026-08-29.** A security + parity audit, then three days of closing
+what it found. Every finding is fixed and deployed (`am`, `an`, `ao`).
+
+*Measured, not estimated.* Both sides were re-extracted from source rather
+than trusted:
+
+| surface | state |
+| --- | --- |
+| **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
+| **Config options** | **~73 / 163 (45%).** Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
+| **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
+| **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
+| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport and Erlay absent.** |
+
+*Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
+authentication** plus a constant-time credential compare; `bantime` with
+automatic misbehaviour scoring **and ban enforcement on inbound**, which had
+been outbound-only; `-datadir`/`-conf`; operator control of both indexes;
+`permitbaremultisig` as a real gate; `networkactive`; `forcednsseed`; `pid`;
+four `-*notify` hooks; **inbound Tor** end to end; **`asmap`** AS-level
+bucketing; `maxreceivebuffer` (which had been parsed and read *nowhere*);
+`maxsendbuffer`; the five ZMQ high-water marks.
+
+*The systemic fix matters more than any single option.* There is now an
+explicit list of Core options this node does **not** implement, and each one
+present in the config is named at startup:
+
+```
+[config] whitelist= is a Bitcoin Core option this node does not implement -- it has NO EFFECT
+```
+
+That retires a failure mode this codebase reproduced repeatedly: `externalip`
+parsed and never read, `permitbaremultisig` *reported* by `getmempoolinfo`
+while nothing could set it, `whitelist=rpc` sitting in the live config doing
+nothing, `maxreceivebuffer` and `walletnotify` both parsed and inert. A test
+asserts the list and the implementation move together in **both** directions.
+
+*Deliberately not done, and why.* `bytespersigop` needs Core's
+`max(weight, sigop_cost x bytes_per_sigop)` at fee-check time, but this
+node's `vsize` comes from weight alone and the sigop cost is recorded after
+acceptance — implementing it means restructuring when that cost is computed,
+and a half-wired fee policy is worse than an absent option.
+`persistmempool`'s machinery (`mempool_dump_write`/`read`) is written and
+tested but called from nowhere; wiring the save path touches shutdown, which
+must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
+list this node does not have. All three stay on the warning list.
+
+*Remaining, in the order worth doing it:* BIP324 v2 transport (the only major
+protocol gap, and a multi-session piece on its own); signet; `reindex` and
+`persistmempool`; `whitelist`/`whitebind` peer permissions; the RPC surface
+(`rpcauth`, `rpcallowip`, `rpcbind`, `server`, `rest`) — lower urgency now
+that cookie auth exists and the listener cannot leave loopback; then Erlay.
+
+*A caveat on the headline number.* 45% badly understates the node. It
+implements every public RPC, all five BIP155 networks, package relay, compact
+blocks, BIP157/158, wallet encryption, pruning, and a consensus layer verified
+block-by-block against the real chain. What it lacks is mostly
+**operator-facing configurability** plus two protocol features. RPC parity is
+essentially complete while config parity is under half — a node can be nearly
+complete functionally and still look half-finished by option count.
+
 ## How this list is checked (2026-08-28)
 
 Claims here were audited against evidence rather than against each other,
