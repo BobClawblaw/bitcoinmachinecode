@@ -104,6 +104,7 @@ static const char* const SEEDS_T4[] = {
 
 static const chainparams_t PARAMS_MAIN = {
     .id = CHAIN_MAIN, .name = "main",
+    .min_chain_work_hex = "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
     .magic = 0xd9b4bef9u,            /* f9 be b4 d9 on the wire            */
     .default_port = 8333, .default_rpc_port = 8332,
     .genesis = GENESIS_MAIN, .genesis_len = 285,
@@ -122,6 +123,7 @@ static const chainparams_t PARAMS_MAIN = {
 
 static const chainparams_t PARAMS_REGTEST = {
     .id = CHAIN_REGTEST, .name = "regtest",
+    .min_chain_work_hex = "",          /* Core: uint256{} -- no floor on regtest */
     .magic = 0xdab5bffau,            /* fa bf b5 da on the wire            */
     .default_port = 18444, .default_rpc_port = 18443,
     .genesis = genesis_reg, .genesis_len = 285,
@@ -140,6 +142,7 @@ static const chainparams_t PARAMS_REGTEST = {
 
 static const chainparams_t PARAMS_TESTNET4 = {
     .id = CHAIN_TESTNET4, .name = "testnet4",
+    .min_chain_work_hex = "00000000000000000000000000000000000000000000000000000b463ea0a4b8",
     .magic = 0x283f161cu,            /* 1c 16 3f 28 on the wire            */
     .default_port = 48333, .default_rpc_port = 48332,
     .genesis = GENESIS_T4, .genesis_len = 261,

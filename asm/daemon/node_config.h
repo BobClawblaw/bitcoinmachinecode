@@ -98,6 +98,18 @@ typedef struct {
     int  discover;
     char externalip[80];         /* Core -externalip: announce THIS instead   */
     int  onion_only_announce;    /* derived: onlynet excludes clearnet        */
+    /* ---- 2026-08-29: Core parity, tier one ------------------------------
+     * Each of these is WIRED, not merely parsed. A setting that is accepted
+     * and then ignored is worse than one that is absent -- that was the
+     * externalip defect earlier today, and the rule now holds for the whole
+     * config surface. */
+    unsigned char minchainwork[32];  /* -minimumchainwork, big-endian; all-zero = no floor */
+    int  have_minchainwork;          /* 0 when neither config nor chain default set one   */
+    long bantime;                    /* -bantime seconds (Core default 86400)             */
+    int  blockfilterindex;           /* -blockfilterindex (default 1: keep current behaviour) */
+    int  coinstatsindex;             /* -coinstatsindex   (default 1: keep current behaviour) */
+    char rpccookiefile[256];         /* -rpccookiefile; empty = <datadir>/.cookie          */
+    int  rpccookie;                  /* derived: emit and accept a cookie (default 1)      */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
@@ -179,5 +191,11 @@ int node_config_is_manual(const char* ip);
  * pointing this node at a scratch peer impossible, and it failed SILENTLY
  * (the entry was dropped and the node then sat at tip=0 with peers=0/0). */
 int node_config_peer_port(const char* host);
+
+/* hex -> 32 big-endian bytes, right-aligned (Core's uint256 spelling) */
+int nodecfg_hex32_be(const char* s, unsigned char out[32]);
+
+/* -conf=<path>: overrides the datadir search in node_config_path(). */
+void node_config_set_conf_path(const char* path);
 
 #endif

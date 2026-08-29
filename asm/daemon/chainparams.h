@@ -52,6 +52,11 @@ typedef struct {
     unsigned char p2sh_version;      /* base58Prefixes[SCRIPT_ADDRESS] */
     unsigned char wif_version;       /* base58Prefixes[SECRET_KEY] */
     const char*  bech32_hrp;
+    /* Core consensus.nMinimumChainWork, as its uint256 hex. The floor a
+     * header chain must clear before this node will commit work to it --
+     * the defence against a peer feeding an enormous low-difficulty chain.
+     * Empty/all-zero on regtest, exactly as Core leaves it. */
+    const char*  min_chain_work_hex;
     /* BIP32 extended-key version bytes. Core uses one pair for mainnet and
      * ANOTHER for every test chain, and its descriptor parser rejects the
      * wrong one outright -- an xpub handed to a regtest node is "not valid".

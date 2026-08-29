@@ -834,6 +834,74 @@ int ctl_is_banned(const char* ip){
     return 0;
 }
 
+/* ---- automatic banning (Core's Misbehaving()) -----------------------------
+ * setban/listbanned/clearbanned already existed, but NOTHING drove them: a
+ * peer could send malformed message after malformed message and the node
+ * would keep talking to it. Core scores misbehaviour and bans at 100 points.
+ *
+ * The ban list lives in shared status memory and is read by every process
+ * (ctl_is_banned), so an automatic ban is written the same way a manual one
+ * is. Scores, by contrast, are per-process and deliberately NOT shared: a
+ * score is a local heuristic about one connection, and losing it on a fork
+ * is harmless, while sharing it would need locking on a hot path. */
+#define MISBEHAVIOR_BAN_THRESHOLD 100
+#define MISBEHAVIOR_SLOTS 64
+static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
+
+/* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
+int ctl_ban_add(const char* subnet, long long until){
+    if(!g_node_status || !subnet || !*subnet) return 0;
+    int slot = -1;
+    for(int i = 0; i < RPC_MAX_BANS; i++){
+        if(g_node_status->bans[i].until &&
+           !strcmp((const char*)g_node_status->bans[i].subnet, subnet)) return 0;  /* already */
+        if(!g_node_status->bans[i].until && slot < 0) slot = i;
+    }
+    if(slot < 0) return 0;                       /* list full: no silent evict */
+    snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", subnet);
+    g_node_status->bans[slot].created = (long long)time(NULL);
+    __sync_synchronize();
+    g_node_status->bans[slot].until = until;     /* published last */
+    return 1;
+}
+
+/* Score a peer for a protocol violation. Returns 1 if this call banned it,
+ * in which case the caller should drop the connection. */
+int peer_misbehaving(const char* ip, int points, const char* reason){
+    if(!ip || !*ip || points <= 0) return 0;
+    int slot = -1, free_slot = -1;
+    for(int i = 0; i < MISBEHAVIOR_SLOTS; i++){
+        if(g_misbehavior[i].ip[0] && !strcmp(g_misbehavior[i].ip, ip)){ slot = i; break; }
+        if(!g_misbehavior[i].ip[0] && free_slot < 0) free_slot = i;
+    }
+    if(slot < 0){
+        /* table full: forget the lowest scorer rather than ignore this one */
+        if(free_slot < 0){
+            int lo = 0;
+            for(int i = 1; i < MISBEHAVIOR_SLOTS; i++)
+                if(g_misbehavior[i].score < g_misbehavior[lo].score) lo = i;
+            free_slot = lo;
+        }
+        slot = free_slot;
+        snprintf(g_misbehavior[slot].ip, sizeof g_misbehavior[slot].ip, "%s", ip);
+        g_misbehavior[slot].score = 0;
+    }
+    g_misbehavior[slot].score += points;
+    int total = g_misbehavior[slot].score;
+    if(total < MISBEHAVIOR_BAN_THRESHOLD){
+        fprintf(stderr,"[ban] %s misbehaving +%d (%d/%d): %s\n",
+                ip, points, total, MISBEHAVIOR_BAN_THRESHOLD, reason ? reason : "?");
+        return 0;
+    }
+    long long until = (long long)time(NULL) + (g_cfg.bantime > 0 ? g_cfg.bantime : 86400);
+    char subnet[80]; snprintf(subnet, sizeof subnet, "%s/32", ip);
+    ctl_ban_add(subnet, until);
+    g_misbehavior[slot].score = 0;               /* banned; start clean */
+    fprintf(stderr,"[ban] %s reached %d points (%s) -- banned for %lds\n",
+            ip, total, reason ? reason : "?", g_cfg.bantime > 0 ? g_cfg.bantime : 86400);
+    return 1;
+}
+
 /* strip ":port" so a ban on the address matches a leg recorded as ip:port */
 static void ctl_ip_only(const char* hostport, char* out, size_t cap){
     snprintf(out, cap, "%s", hostport ? hostport : "");
@@ -3037,7 +3105,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * is adopted instantly on every clean boot. Seeded HERE, before the
          * catch-up loop starts writing, which is what makes the walk's
          * quiescence requirement hold by construction. */
-        {
+        /* -coinstatsindex: the index has always run unconditionally. An
+         * operator who does not want the write amplification had no way to
+         * say so; now they do, and getindexinfo stops advertising an index
+         * that is deliberately off. */
+        if (!g_cfg.coinstatsindex)
+            fprintf(stderr,"[dl] coinstatsindex=0 -- not maintaining the coin statistics index\n");
+        else {
             typedef void (*coin_fn)(const unsigned char*, unsigned int,
                                     unsigned long long, unsigned long long,
                                     unsigned long long, const unsigned char*,
@@ -3956,7 +4030,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         txit_on_block(store_buf, zh, zb, bl);
                         /* filter index tail: adopt/append (cheap probe when
                          * the backfill has not closed in yet) */
-                        bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                        if (g_cfg.blockfilterindex)
+                            bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
                         /* address index (extension): ADDs from the block,
                          * DELs/TOUCHes from its undo records */
                         axt_on_block(store_buf, zh, zb, bl);
@@ -4305,6 +4380,17 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         return;
     }
     fprintf(stderr, "[rpc] JSON-RPC server on 127.0.0.1:%d (live-node + chain, user=%s)\n", actual, user);
+    /* -rpccookiefile, else <datadir>/.cookie -- Core's default auth method.
+     * The daemon has already chdir'd into the (per-chain) datadir, so the
+     * bare relative name lands in the right place on every chain. */
+    if (g_cfg.rpccookie){
+        const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
+        if (rpc_cookie_write(cpath))
+            fprintf(stderr, "[rpc] cookie authentication enabled (%s, mode 0600)\n", cpath);
+        else
+            fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
+                            "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
+    }
 }
 
 static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6){
@@ -4372,6 +4458,8 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
             }
+            /* a dead node must not leave a usable credential on disk */
+            rpc_cookie_remove();
             _exit(0);
         }
         int pr=poll(pfds, nfds, 300);
@@ -4403,6 +4491,17 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             if(ready_v4){
                 c = accept(l,(struct sockaddr*)&ca,&cal);
                 snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
+                /* A ban has to cover INBOUND too. ctl_is_banned guarded only
+                 * the dial path, so a banned peer could simply connect to us
+                 * and be served -- which makes setban look enforced while it
+                 * is half enforced. */
+                if(c >= 0){
+                    char bip[64]; snprintf(bip, sizeof bip, "%s", inet_ntoa(ca.sin_addr));
+                    if(ctl_is_banned(bip)){
+                        fprintf(stderr,"[serve] refused inbound from banned %s\n", peerdesc);
+                        close(c); c = -1;
+                    }
+                }
             } else {
                 c = accept(l6,(struct sockaddr*)&ca6,&cal6);
                 bmc_addr_t pa; memset(&pa, 0, sizeof pa);
@@ -4536,8 +4635,36 @@ int main(int argc, char** argv){
             __DATE__, __TIME__, argc>=2?argv[1]:"?");
         fputs(_b, stderr); fflush(stderr);
     }
-    if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }
-    const char* mode = argv[1]; const char* dir = argv[2];
+    /* ---- -datadir= / -conf= (Core's spelling) -----------------------------
+     * The datadir was positional and the config file was found by searching
+     * relative to it, so every other node tool's habit -- `-datadir=`,
+     * `-conf=` -- simply did not work here. Both are accepted now, anywhere
+     * on the command line, and the positional form still works so nothing
+     * that already runs this binary changes.
+     *
+     * Flags are stripped out first; what remains keeps the old positional
+     * meaning, so `bitcoind -datadir=/x serve` and `bitcoind serve /x` are
+     * the same invocation. */
+    const char* flag_datadir = NULL; const char* flag_conf = NULL;
+    { static char* pos[16]; int np = 0;
+      for(int i = 0; i < argc; i++){
+          if(i > 0 && !strncmp(argv[i], "-datadir=", 9)){ flag_datadir = argv[i] + 9; continue; }
+          if(i > 0 && !strncmp(argv[i], "-conf=", 6)){    flag_conf    = argv[i] + 6; continue; }
+          if(np < 16) pos[np++] = argv[i];
+      }
+      argv = pos; argc = np; }
+    if(flag_conf){
+        node_config_set_conf_path(flag_conf);
+        if(access(flag_conf, R_OK) != 0){
+            fprintf(stderr,"[boot] -conf=%s is not readable: %s\n", flag_conf, strerror(errno));
+            return 2;
+        }
+    }
+    if(argc < 2 || (argc < 3 && !flag_datadir)){
+        fprintf(stderr,"usage: %s [-datadir=<dir>] [-conf=<file>] sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]);
+        return 2; }
+    const char* mode = argv[1];
+    const char* dir = flag_datadir ? flag_datadir : argv[2];
     /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
      * right directory regardless of the caller's cwd (soak analysis found a
      * caller-relative chdir silently opened the wrong store when the node was
@@ -4587,7 +4714,26 @@ int main(int argc, char** argv){
       fprintf(stderr,"[config] pow  : nBits schedule enforcement ON"
                      " (no_retarget=%d min_diff=%d bip94=%d powlimit=%08x)\n",
               g_chainp->pow_no_retargeting, g_chainp->allow_min_difficulty,
-              g_chainp->enforce_bip94, g_chainp->pow_limit_bits); }
+              g_chainp->enforce_bip94, g_chainp->pow_limit_bits);
+      /* -minimumchainwork: config wins, else the chain's own Core value.
+       * Announce it for the same reason as the nBits line above -- an inert
+       * floor and an enforced one look identical from accepted blocks. */
+      { unsigned char mw[32]; const char* src;
+        if (g_cfg.have_minchainwork){ memcpy(mw, g_cfg.minchainwork, 32); src = "config"; }
+        else { memset(mw, 0, 32);
+               if (g_chainp->min_chain_work_hex && g_chainp->min_chain_work_hex[0])
+                   nodecfg_hex32_be(g_chainp->min_chain_work_hex, mw);
+               src = "chain default"; }
+        reorg_set_min_chain_work(mw);
+        if (reorg_min_chain_work_unrepresentable())
+            fprintf(stderr,"[config] work : minimumchainwork EXCEEDS this node's 128-bit "
+                           "work accumulator -- every chain will be refused. Lower it.\n");
+        else if (reorg_min_chain_work_set()){
+            char hx[65]; for(int i=0;i<32;i++) snprintf(hx+i*2,3,"%02x",mw[i]);
+            fprintf(stderr,"[config] work : minimumchainwork=%s (%s)\n", hx, src);
+        } else
+            fprintf(stderr,"[config] work : minimumchainwork not set -- no low-work floor\n");
+      } }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
     chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
     if(g_chainp->id != CHAIN_MAIN){
