@@ -68,6 +68,34 @@ int dialer_init(void){
                     g_have_v6 ? "" : " -- but this host has no IPv6, so it is not");
     return g_i2p_ok + (g_onion_ip[0] ? 1 : 0) + (g_cfg.cjdnsreachable ? 1 : 0);
 }
+/* tests drive the predicates with different g_cfg values; the latch has to
+ * be releasable for that, and nothing else calls this. */
+int dialer_reset_for_test(void){ g_ready = 0; g_i2p_ok = 0; g_onion_ip[0] = 0; g_proxy_ip[0] = 0; return 0; }
+int dialer_dns_blocked(void){
+    if (!g_ready) dialer_init();
+    if (!g_cfg.dns) return 1;                    /* the operator said so */
+    if (g_proxy_ip[0]) return 1;                 /* the proxy resolves, not us */
+    /* -onlynet naming only anonymity networks makes a clearnet DNS lookup a
+     * query for peers we would never dial */
+    if (g_cfg.n_onlynet > 0 && !onlynet_allows(BMC_NET_IPV4) && !onlynet_allows(BMC_NET_IPV6)) return 1;
+    return 0;
+}
+int dialer_may_announce_clearnet(void){
+    if (!g_ready) dialer_init();
+    if (!g_cfg.discover) return 0;
+    if (g_cfg.n_onlynet > 0 && !onlynet_allows(BMC_NET_IPV4) && !onlynet_allows(BMC_NET_IPV6)) return 0;
+    return 1;
+}
+int dialer_connect_name(const char* host, int port, int timeout_ms, const char** why){
+    static char err[192];
+    const char* dummy; if (!why) why = &dummy;
+    if (!g_ready) dialer_init();
+    if (!g_proxy_ip[0]){ *why = "no proxy configured for name resolution"; return -1; }
+    int rep = 0;
+    int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, port, NULL, NULL, timeout_ms, &rep);
+    if (fd < 0){ snprintf(err, sizeof err, "socks5(name) rc=%d rep=%d", fd, rep); *why = err; }
+    return fd;
+}
 int dialer_net_reachable(int net){
     if (!onlynet_allows(net)) return 0;
     switch (net){
