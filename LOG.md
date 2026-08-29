@@ -7,6 +7,55 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-29 -- the pre-deploy review that stopped a zero-peer node
+
+The Tor/I2P/CJDNS work was merged, gated at 208 suites, pushed, and about to
+be deployed to the live node. A three-lens adversarial review of the diff
+found seven defects first. Two of them would have taken the production node
+to ZERO OUTBOUND PEERS on the next restart, and the whole test suite was
+green because nothing covered the path they were on.
+
+THE DIAL POOL STOPPED PARSING. Its entries became "host:port" when the port
+had to survive the trip from the version-2 book. Three consumers still read
+them with inet_pton() on a bare host: the worker's boot parallel dial, the
+feeler/block-relay picker, and dlc_probe_round. A reviewer proved it by
+compiling a harness against the REAL peers.dat: inet_pton and getaddrinfo
+fail on all 64 pool entries. The node would have logged "connected 0/8
+peer(s)", skipped its boot catch-up entirely ("no live peers"), and fallen
+back to a serial 20-second-per-peer walk inside the single-threaded worker
+loop -- stalling block sync, tx relay and the RPC IPC for minutes at a time
+while sitting at no peers. There is now one pool_ipv4()/pool_split() pair
+that every consumer uses, and validation/bookdial_regtest_e2e.sh covers the
+book -> pool -> dial path that had no test at all.
+
+THE POLL INDEX WAS NOT SHIFTED. Inserting the IPv6 listener at pfds[1] left
+`int poll_idx=1` alone, so every outbound leg read the PREVIOUS leg's
+revents and the last leg's was never examined: a peer hanging up would be
+attributed to its neighbour. One line, and only a reader looking for it
+would find it.
+
+Also fixed, each from the same review: a pool slot of 64 bytes silently
+truncated every onion entry to "<onion>:" (68 needed, now 80); -listen=0 did
+not gate the new IPv6 listener, so a node told not to accept inbound would
+bind [::] anyway; -proxy applied to IPv4 only, so IPv6 and CJDNS quietly
+went direct for an operator who set a proxy expecting everything to use it;
+proxyrandomize was documented "default 1" and never actually defaulted,
+leaving Tor stream isolation OFF for exactly the operator who configured
+nothing else, and the credentials it would have used were a guessable
+counter that RESETS IN EVERY FORKED CHILD (now 8 random bytes from
+/dev/urandom, and a dial that cannot read randomness fails rather than
+silently sharing a circuit); the self-announcement pushed this node's
+clearnet IPv4 down onion and i2p legs, which links the two and is precisely
+what those networks are for (Core's GetLocal has the same guard); and an
+anonymity-network name could still reach the system resolver, where a DNS
+lookup for a .onion deanonymises both ends.
+
+The lesson is the one from the addrv2 review a day earlier, sharper: a
+change that touches a shared representation -- here, what a "pool entry"
+is -- breaks consumers that no test exercises, and the suite's greenness
+says nothing about them. Both times the review found a defect worse than
+the gap the work set out to close.
+
 ## 2026-08-28 -- every network a peer can live on: the address model, phase 1
 
 FEATURE_GAPS has said "Tor / I2P / onion support -- zero hits" since the

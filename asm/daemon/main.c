@@ -762,6 +762,12 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 /* per-leg BIP155 verdict from the handshake: 1 = the peer sent sendaddrv2,
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
+/* each leg's BMC_NET_*, derived from its host string. We announce ONE
+ * address -- this node's clearnet IPv4 -- and telling an onion or i2p peer
+ * that address links the two, which is exactly what running over those
+ * networks is meant to prevent. Core's GetLocal has the same guard.
+ * (2026-08-28 pre-deploy review.) */
+static unsigned char mux_out_net[MUX_MAX_OUT];
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
 static int   mux_n_out = 0;
@@ -1119,6 +1125,13 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
     /* a literal IPv4 (with or without ":port") is resolved here without DNS;
      * anything else is a name the resolver must answer */
+    /* By here the address was not a literal of any network, so it is a name
+     * -- and an anonymity-network name must reach its transport, never DNS. */
+    if(strstr(host,".onion") || strstr(host,".i2p")){
+        snprintf(g_dial_fail,sizeof g_dial_fail,"%s peer needs its transport configured",
+                 strstr(host,".onion") ? "onion" : "i2p");
+        return -1;
+    }
     char hbare[128]; snprintf(hbare, sizeof hbare, "%s", host);
     { bmc_addr_t v4;
       if (bmc_addr_from_string_port(&v4, host, (unsigned short)out_port) && v4.net == BMC_NET_IPV4){
@@ -1616,10 +1629,37 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
  * Deliberately a plain newline-separated IP text file: it is tiny, trivially
  * inspectable, and a corrupt/missing one degrades to exactly the old
  * behaviour (probe the book) rather than breaking startup. */
+/* A pool slot must hold the LONGEST entry. The pool carries "host:port"
+ * since the port had to survive the trip from the book, and an onion name is
+ * 62 chars -- "<onion>:65535" is 68, so the old 64 truncated every Tor peer
+ * to "<onion>:", undialable and still burning a slot. */
+#define DL_POOL_SLOT 80
+/* The pool's entries are "host:port" ("[v6]:port" for IPv6/CJDNS). Every
+ * consumer that used to inet_pton() a bare host MUST split first -- three of
+ * them did not, and the node came up with zero outbound legs and skipped its
+ * boot catch-up on every restart (2026-08-28 pre-deploy review, caught
+ * before this reached the live node). */
+static int pool_split(const char* entry, char* host, long cap, int* port){
+    bmc_addr_t a;
+    if(!bmc_addr_from_string_port(&a, entry, 0)){
+        snprintf(host, (size_t)cap, "%s", entry);      /* a DNS name: leave it whole */
+        return 0;
+    }
+    bmc_addr_to_string(host, cap, &a);
+    if(port && a.port) *port = a.port;
+    return 1;
+}
+/* the IPv4 of a pool entry (0 if it is not a dialable v4), and its port */
+static unsigned pool_ipv4(const char* entry, int* port){
+    bmc_addr_t a;
+    if(!bmc_addr_from_string_port(&a, entry, 0) || a.net != BMC_NET_IPV4) return 0;
+    if(port && a.port) *port = a.port;
+    unsigned ip; memcpy(&ip, a.addr, 4); return ip;
+}
 #define DL_GOODPEERS_FILE "peers.good"
 #define DL_GOODPEERS_MAX  256
 
-static int dl_load_good_peers(char out[][64], int cap){
+static int dl_load_good_peers(char out[][DL_POOL_SLOT], int cap){
     FILE* f = fopen(DL_GOODPEERS_FILE, "r");
     if(!f) return 0;
     int n=0; char line[128];
@@ -1647,7 +1687,7 @@ static void dl_save_good_peers(char peers[][64], int n){
     fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
 }
 
-static int dl_pool_from_book(void* ab, char out[][64], int nitems){
+static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
     (void)ab;
     /* Walk the whole version-2 book and keep the addresses this node can
      * DIAL today. Until the SOCKS5/SAM/IPv6 transports land only IPv4 is
@@ -1672,7 +1712,7 @@ static int dl_pool_from_book(void* ab, char out[][64], int nitems){
          * real port and the chain default is only a fallback for names.
          * Dropping it here sent every dial to the default port -- which is
          * right for most mainnet peers and wrong for everyone else. */
-        if(bmc_addr_to_string_port(out[got], 64, &r.a) <= 0) continue;
+        if(bmc_addr_to_string_port(out[got], DL_POOL_SLOT, &r.a) <= 0) continue;
         got++;
     }
     return got;
@@ -2064,14 +2104,15 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
  * per round to match its proven behavior (trying the WHOLE pool at once in
  * one round measurably tanks the success rate -- observed 1/140 live).
  * Returns how many were promoted this round. */
-static int dlc_probe_round(char pool[][64], int from, int ntry,
+static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
                            char live[][64], int* nlive, int cap, int wait_ms){
     if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
     static int cfd[MUX_MAX_OUT*3];
     int nc=0;
     for(int k=0;k<ntry;k++){
         int i=from+k;
-        unsigned ip; if(inet_pton(AF_INET,pool[i],&ip)!=1){ cfd[nc++]=-1; continue; }
+        int pport = 0; unsigned ip = pool_ipv4(pool[i], &pport);
+        if(!ip){ cfd[nc++]=-1; continue; }        /* not a dialable IPv4 candidate */
         int fd=socket(AF_INET,SOCK_STREAM,0);
         if(fd<0){ cfd[nc++]=-1; continue; }
         int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
@@ -2217,7 +2258,7 @@ static long dl_catchup(const char* dir, int min_workers){
     long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
 
-    static char pool[DLC_MAXPOOL][64];
+    static char pool[DLC_MAXPOOL][DL_POOL_SLOT];
     int npool = 0, ngood = 0, nadd = 0;
     if(g_cfg.connect_only){
         /* Core -connect: the pool IS the configured list. Nothing from the
@@ -2244,7 +2285,7 @@ static long dl_catchup(const char* dir, int min_workers){
         ngood = dl_load_good_peers(pool+npool, DLC_MAXPOOL-npool);
         npool += ngood;
         {
-            static char book[DLC_MAXPOOL][64];
+            static char book[DLC_MAXPOOL][DL_POOL_SLOT];
             int nbook = dl_pool_from_book(ab, book, DLC_MAXPOOL);
             for(int i=0;i<nbook && npool<DLC_MAXPOOL;i++){
                 int dup=0;
@@ -2267,7 +2308,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * exists for the same reason), and everything downstream of this
      * (dlc_headers, dlc_worker) deliberately only dials CONFIRMED entries,
      * so under-populating `live[]` here directly costs catch-up depth. */
-    static char live[DLC_MAXPOOL][64]; int nlive=0;
+    static char live[DLC_MAXPOOL][DL_POOL_SLOT]; int nlive=0;
     {
         /* Target a deep live pool: workers*3 was sized before peers could be
          * banned, and left no headroom -- evicting duds then starved the
@@ -2508,7 +2549,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * crash reading unmapped memory right after the loop exits looks like.
      * Must run BEFORE stats (and friends) are unmapped. */
     {
-        static char good[64][64]; int ngood=0;
+        static char good[64][DL_POOL_SLOT]; int ngood=0;
         for(int w=0; w<nw && ngood<64; w++){
             if(stats[w].blocks<=0) continue;
             const char* ip=(const char*)stats[w].peer;
@@ -2990,7 +3031,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     } else {
         fprintf(stderr,"[boot] address book unavailable; falling back to seed list\n");
     }
-    static char dle[64][64];
+    static char dle[64][DL_POOL_SLOT];
     int npool = dl_pool_from_book(ab, dle, 64);
     fprintf(stderr,"[boot] %d public peer candidate(s) in pool\n", npool);
     /* srcpool is the ADDRESS BOOK pool, and it is what every dial in this
@@ -3074,8 +3115,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         int nc=0;
         for(int i=0;i<ntry && nc<64;i++){
             unsigned ip;
-            if(inet_pton(AF_INET,srcpool[i],&ip)!=1){
+            int spport = 0;
+            ip = pool_ipv4(srcpool[i], &spport);
+            if(!ip){
                 struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+                /* never hand an anonymity-network name to the system
+                 * resolver: a DNS lookup for a .onion deanonymises both ends.
+                 * Those are dialled through their transport, not here. */
+                if(strstr(srcpool[i],".onion") || strstr(srcpool[i],".i2p")){ cfd[nc++]=-1; continue; }
                 if(getaddrinfo(srcpool[i],NULL,&h,&res)!=0){ cfd[nc++]=-1; continue; }
                 ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr; freeaddrinfo(res);
             }
@@ -3083,7 +3130,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(fd<0){ cfd[nc++]=-1; continue; }
             int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
             struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
-            sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)out_port);
+            sa.sin_addr.s_addr=ip;
+            sa.sin_port=(unsigned short)htons((unsigned short)(spport ? spport : out_port));
             int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
             if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
             /* stash the original flags so we can clear O_NONBLOCK after promote */
@@ -3669,8 +3717,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern long txrelay_announce(const int* fds, int nfds);
             txrelay_announce(mux_out_fd, mux_n_out);
         }
-        { extern long addrself_maybe_announce(const int*, const unsigned char*, int);
-          addrself_maybe_announce(mux_out_fd, mux_out_wants_v2, mux_n_out); }
+        { extern long addrself_maybe_announce_nets(const int*, const unsigned char*, const unsigned char*, int);
+          for(int k=0;k<mux_n_out && k<MUX_MAX_OUT;k++){
+              bmc_addr_t la;
+              mux_out_net[k] = bmc_addr_from_string(&la, mux_out_host[k]) ? la.net : BMC_NET_IPV4;
+          }
+          addrself_maybe_announce_nets(mux_out_fd, mux_out_wants_v2, mux_out_net, mux_n_out); }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would
@@ -3693,7 +3745,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(bro_fd[b] >= 0) continue;
             if((rot % 16) != 0) break;             /* rate-limit re-dials */
             for(int ci=0; ci<nsrc; ci++){
-                unsigned cip; if(inet_pton(AF_INET,srcpool[ci],&cip)!=1) continue;
+                unsigned cip = pool_ipv4(srcpool[ci], NULL); if(!cip) continue;
                 int clash=0;
                 for(int k=0;k<mux_n_out;k++){
                     unsigned oip; if(inet_pton(AF_INET,mux_out_host[k],&oip)!=1) continue;
@@ -4171,7 +4223,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * looked like in production and why it is wrong. Seeds stay as the
      * emergency fallback they are documented to be: used only when the book
      * yields nothing, which is a genuinely fresh node. */
-    static char mux_dle[64][64];
+    static char mux_dle[64][DL_POOL_SLOT];
     const char* bookpool[64]; int nbook = 0;
     if(!g_cfg.connect_only && addr_book()){
         int np = dl_pool_from_book(NULL, mux_dle, 64);
@@ -4326,7 +4378,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * (it sent data we should react to). Round-robin spreads the load so
          * idle peers each get polled roughly once per mux_n_out iterations. */
         rot++;
-        int poll_idx=1;                                  /* pfds[0] is the listener */
+        /* pfds[0] = IPv4 listener, pfds[1] = IPv6 listener, legs from 2.
+         * This started at 1 and was NOT shifted when the v6 slot was
+         * inserted, so every leg read the PREVIOUS leg's revents and the
+         * last leg's was never examined (2026-08-28 pre-deploy review). */
+        int poll_idx=2;
         long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
@@ -4952,7 +5008,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, lsock_v6(port));
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1);
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -4975,7 +5031,7 @@ int main(int argc, char** argv){
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
-        return serve_mux(port, peer, nwant, 1, out_port, l, lsock_v6(port));
+        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1);
     }
     return 2;
 }
