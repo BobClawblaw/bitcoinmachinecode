@@ -123,6 +123,8 @@ typedef struct {
     char startupnotify[512];
     char shutdownnotify[512];
     long maxtxfee_sat;               /* -maxtxfee, satoshis (0 = no cap)                  */
+    char rpcauth[8][256];            /* -rpcauth, repeatable: user:salt$hash */
+    int  n_rpcauth;
     char asmap[512];                 /* -asmap: AS map file; empty = /16 bucketing        */
     int  maxsendbuffer_kb;           /* -maxsendbuffer: n*1000 bytes (Core default 1000)  */
     int  zmq_hwm[5];                 /* -zmqpub<topic>hwm, in the order of the topics
