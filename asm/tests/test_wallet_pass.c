@@ -17,9 +17,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "../daemon/wallet_pass.h"
-#include "../daemon/node_config.h"
-
-extern node_config_t g_cfg;
 
 static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
@@ -46,7 +43,7 @@ int main(void){
     char got[256];
 
     unsetenv("BMC_WALLET_PASS");
-    memset(&g_cfg, 0, sizeof g_cfg);
+    wallet_pass_set_file(0);
 
     printf("== no source configured ==\n");
     ck("nothing configured yields no passphrase", try_load(got, sizeof got) == 0);
@@ -58,7 +55,7 @@ int main(void){
 
     printf("== a properly protected file is accepted ==\n");
     write_pass(PF, "s3cret-from-file\n", 0640);
-    snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", PF);
+    wallet_pass_set_file(PF);
     ck("mode 0640 is accepted", try_load(got, sizeof got) == 1);
     ck("  and the trailing newline is stripped", !strcmp(got, "s3cret-from-file"));
     write_pass(PF, "tight\n", 0600);
@@ -83,7 +80,7 @@ int main(void){
     ck("  0640 still accepted after all those refusals", try_load(got, sizeof got) == 1);
 
     printf("== a relative path is refused ==\n");
-    snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "wallet.pass");
+    wallet_pass_set_file("wallet.pass");
     ck("relative walletpassfile is refused", try_load(got, sizeof got) == 0);
 
     printf("== a file inside the datadir is refused ==\n");
@@ -92,14 +89,14 @@ int main(void){
       char inside[4600];
       snprintf(inside, sizeof inside, "%s/wp_inside.pass", cwd);
       write_pass(inside, "colocated\n", 0600);
-      snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", inside);
+      wallet_pass_set_file(inside);
       ck("a 0600 file inside the datadir is still refused", try_load(got, sizeof got) == 0);
       printf("        (correct modes are not enough -- a datadir backup carries it)\n");
       unlink(inside); }
 
     printf("== an empty or missing file yields nothing ==\n");
     write_pass(PF, "", 0600);
-    snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", PF);
+    wallet_pass_set_file(PF);
     ck("an empty file is not a passphrase", try_load(got, sizeof got) == 0);
     unlink(PF);
     ck("a missing file is not a passphrase", try_load(got, sizeof got) == 0);

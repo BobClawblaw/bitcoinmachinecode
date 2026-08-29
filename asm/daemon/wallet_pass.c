@@ -37,9 +37,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "wallet_pass.h"
-#include "node_config.h"
 
-extern node_config_t g_cfg;
+/* Deliberately NOT read out of g_cfg. rpc_wallet_ops.o calls into here and is
+ * part of RPCLIBS, which 31 targets link WITHOUT node_config.o -- reaching
+ * for the config here makes every one of them fail to link. The config pushes
+ * the path in instead, so this module has no external dependencies at all. */
+static char g_passfile[256];
+
+void wallet_pass_set_file(const char* path){
+    if (!path) { g_passfile[0] = 0; return; }
+    snprintf(g_passfile, sizeof g_passfile, "%s", path);
+}
 
 static int read_secret_file(const char* path, char* out, int cap, const char** why){
     struct stat sb;
@@ -69,8 +77,8 @@ int wallet_pass_load(char* out, int cap, const char** why){
     const char* env = getenv("BMC_WALLET_PASS");
     if (env && env[0]){ snprintf(out, (size_t)cap, "%s", env); return 1; }
 
-    const char* pf = g_cfg.walletpassfile;
-    if (!pf || !pf[0]) return 0;
+    const char* pf = g_passfile;
+    if (!pf[0]) return 0;
 
     if (pf[0] != '/'){
         fprintf(stderr, "[wallet] walletpassfile must be an absolute path -- ignoring \"%s\"\n", pf);
