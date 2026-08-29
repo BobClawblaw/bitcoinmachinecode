@@ -114,8 +114,27 @@ static int zp_bind(const char* addr){
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
     sa.sin_port = htons((unsigned short)port);
-    if (!strcmp(host, "*")) sa.sin_addr.s_addr = INADDR_ANY;
-    else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1){ close(fd); return -1; }
+    /* SECURITY (audit 2026-08-29 finding 8): `*` is REFUSED, not expanded to
+     * INADDR_ANY.
+     *
+     * Core accepts it, but on a node like this one it silently publishes every
+     * block and transaction to the whole LAN -- and the operator who typed
+     * `tcp://*:28332` copied it from a tutorial and got a listener far wider
+     * than intended. There is no authentication on a ZMQ publisher: whoever
+     * connects, subscribes.
+     *
+     * Requiring an explicit interface costs one word in the config and makes
+     * the blast radius something the operator chose rather than inherited.
+     * 0.0.0.0 still works for anyone who genuinely wants every interface --
+     * this refuses the ambiguous spelling, not the capability. */
+    if (!strcmp(host, "*")){
+        fprintf(stderr, "[zmq] refusing \"%s\": bind to an explicit interface "
+                        "(127.0.0.1 for local subscribers, 0.0.0.0 only if you "
+                        "really mean every interface -- there is no auth on a "
+                        "ZMQ publisher)\n", addr);
+        close(fd); return -1;
+    }
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1){ close(fd); return -1; }
     if (bind(fd, (struct sockaddr*)&sa, sizeof sa) != 0){ close(fd); return -1; }
     if (listen(fd, 8) != 0){ close(fd); return -1; }
     zp_nonblock(fd);
