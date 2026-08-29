@@ -7,6 +7,7 @@
  * (daemon/addrgather.c's addr parser, daemon/build_utxo.c's missing rule).
  * Unknown keys are ignored, so the file stays shared with the RPC daemon.
  */
+#include "wallet_pass.h"
 #include <stdio.h>
 #include "log_ts.h"
 #include <stdlib.h>
@@ -474,7 +475,8 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"v2transport")){
             g_cfg.v2transport = iv?1:0; applied++; }
         else if(!strcmp(key,"walletpassfile")){
-            snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
+            snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val);
+            wallet_pass_set_file(g_cfg.walletpassfile); applied++; }
         else if(!strcmp(key,"networkactive")){
             g_cfg.networkactive = iv?1:0; applied++; }
         else if(!strcmp(key,"forcednsseed")){

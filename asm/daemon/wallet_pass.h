@@ -4,6 +4,10 @@
 #ifndef BMC_WALLET_PASS_H
 #define BMC_WALLET_PASS_H
 
+/* Set the passphrase file path (absolute, outside the datadir). Called by the
+ * config loader; empty or NULL disables the file source. */
+void wallet_pass_set_file(const char* path);
+
 /* Load the passphrase into out[cap]. Returns 1 if one was found, 0 if not.
  * *why (optional) is set to a short explanation on refusal, for logging --
  * a passphrase file that is silently ignored is worse than none at all,
