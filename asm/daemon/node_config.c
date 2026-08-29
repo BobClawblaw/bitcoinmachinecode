@@ -127,7 +127,7 @@ static const char* const k_unimplemented[] = {
     "whitelist","whitebind","whitelistrelay","whitelistforcerelay",
     "v2transport","txreconciliation","natpmp","upnp","bytespersigop",
     "peerbloomfilters","peerblockfilters",
-    "rpcauth","rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
+    "rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
     "reindex","reindex-chainstate","loadblock","blocksdir","blocksxor",
     "persistmempool","persistmempoolv1","dbbatchsize","prevoutfetchthreads",
@@ -175,6 +175,7 @@ static void set_defaults(void){
     g_cfg.shutdownnotify[0]     = 0;
     g_cfg.maxtxfee_sat          = 0;
     g_cfg.asmap[0]              = 0;
+    g_cfg.n_rpcauth             = 0;
     g_cfg.maxsendbuffer_kb      = 1000;   /* Core -maxsendbuffer default */
     for (int i = 0; i < 5; i++) g_cfg.zmq_hwm[i] = 1000;
     g_cfg.rpccookiefile[0]      = 0;
@@ -480,6 +481,11 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"zmqpubrawblockhwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[2]=t;applied++;} }
         else if(!strcmp(key,"zmqpubrawtxhwm")){     t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[3]=t;applied++;} }
         else if(!strcmp(key,"zmqpubsequencehwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[4]=t;applied++;} }
+        else if(!strcmp(key,"rpcauth")){    /* repeatable, like onlynet */
+            if (g_cfg.n_rpcauth < 8){
+                snprintf(g_cfg.rpcauth[g_cfg.n_rpcauth], 256, "%s", val);
+                g_cfg.n_rpcauth++; applied++;
+            } else fprintf(stderr,"[config] at most 8 rpcauth entries -- ignoring %s\n", val); }
         else if(!strcmp(key,"asmap")){
             snprintf(g_cfg.asmap,sizeof g_cfg.asmap,"%s",val); applied++; }
         else if(!strcmp(key,"blocknotify")){
