@@ -247,6 +247,41 @@ int main(void){
       ck("  nor blocknotify",         nodecfg_unimplemented("blocknotify") == 0);
       ck("another consumer's key is not flagged", nodecfg_unimplemented("dbcache") == 0); }
 
+    printf("== 9. batch A: buffers, hwm, persistmempool ==\n");
+    { const char* tmp = "test_parityA.conf";
+      FILE* f = fopen(tmp, "w");
+      fputs("maxreceivebuffer=2000\n"
+            "maxsendbuffer=3000\n"
+            "zmqpubrawblockhwm=250\n"
+            "zmqpubsequencehwm=7\n", f);
+      fclose(f);
+      node_config_load(tmp);
+      ck("maxreceivebuffer applied", g_cfg.maxrecvbuffer_kb == 2000);
+      ck("maxsendbuffer applied",    g_cfg.maxsendbuffer_kb == 3000);
+      ck("zmqpubrawblockhwm applied", g_cfg.zmq_hwm[2] == 250);
+      ck("zmqpubsequencehwm applied", g_cfg.zmq_hwm[4] == 7);
+      unlink(tmp); }
+
+    printf("== 9b. the warning list tracks what is actually implemented ==\n");
+    { extern int nodecfg_unimplemented(const char*);
+      ck("maxsendbuffer no longer flagged",   nodecfg_unimplemented("maxsendbuffer") == 0);
+      /* NOT implemented: mempool_dump_write/read exist and are tested, but
+       * nothing calls them, and wiring the save path touches shutdown, which
+       * must stay fast for the SIGKILL window. Flagged until it is real. */
+      ck("persistmempool IS still flagged (machinery exists, unwired)",
+         nodecfg_unimplemented("persistmempool") == 1);
+      ck("the zmq hwms no longer flagged",    nodecfg_unimplemented("zmqpubrawtxhwm") == 0);
+      /* deferred on purpose: implementing it means moving when sigop cost is
+       * computed, and a half-wired fee policy is worse than an absent one */
+      ck("bytespersigop IS still flagged (deferred, not done)",
+         nodecfg_unimplemented("bytespersigop") == 1);
+      ck("persistmempoolv1 still flagged",    nodecfg_unimplemented("persistmempoolv1") == 1);
+      /* walletnotify was PARSED into a config field, never used, and its own
+       * strcmp branch ran before the unimplemented check -- so it was silently
+       * accepted rather than warned. The key is gone; it must warn now. */
+      ck("walletnotify is flagged (its inert key was removed)",
+         nodecfg_unimplemented("walletnotify") == 1); }
+
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;

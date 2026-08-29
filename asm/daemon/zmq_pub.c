@@ -77,6 +77,21 @@ static const char* const ZP_TOPICS[ZP_NTOPIC] =
     { "hashblock", "hashtx", "rawblock", "rawtx", "sequence" };
 static int  g_topic_ep[ZP_NTOPIC] = { -1, -1, -1, -1, -1 };
 static u32  g_topic_seq[ZP_NTOPIC];
+/* Core -zmqpub<topic>hwm: how much a slow subscriber may fall behind before
+ * messages are dropped rather than queued. Core counts MESSAGES in its own
+ * queue; this publisher has no user-space queue -- it writes the socket
+ * directly and already drops on EAGAIN -- so the kernel send buffer IS the
+ * queue, and the high-water mark sizes it. Same property (a slow subscriber
+ * costs bounded memory and never blocks the node), different unit, stated
+ * here rather than silently reinterpreted. 0 leaves the system default. */
+static int g_topic_hwm[ZP_NTOPIC];
+void zmq_pub_set_hwm(const int* hwm5){
+    if (!hwm5) return;
+    for (int i = 0; i < ZP_NTOPIC && i < 5; i++) g_topic_hwm[i] = hwm5[i];
+}
+/* a conservative per-message estimate: a rawblock is far larger, but the
+ * point is a bound, and oversizing the buffer would defeat the option */
+#define ZP_HWM_MSG_BYTES 256
 
 static void zp_nonblock(int fd){
     int fl = fcntl(fd, F_GETFL, 0);
@@ -262,6 +277,16 @@ void zmqpub_poll(void){
         zp_endpoint* e = &g_ep[i];
         for (;;){
             int c = accept(e->listen_fd, NULL, NULL);
+            /* size this subscriber's queue from the topic's high-water mark */
+            if (c >= 0){
+                int hw = 0;
+                for (int t = 0; t < ZP_NTOPIC; t++)
+                    if (g_topic_ep[t] >= 0 && g_topic_hwm[t] > hw) hw = g_topic_hwm[t];
+                if (hw > 0){
+                    int v = hw * ZP_HWM_MSG_BYTES;
+                    setsockopt(c, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+                }
+            }
             if (c < 0) break;
             if (e->nsubs >= ZP_MAX_SUBS){ close(c); continue; }
             zp_nonblock(c);

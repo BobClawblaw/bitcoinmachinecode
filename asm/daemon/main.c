@@ -411,6 +411,30 @@ static int build_inmem_hash_index(void){
  * for tor to connect to. Core additionally marks its onion bind
  * BF_DONT_ADVERTISE so the loopback address is never gossiped as ours; here
  * the equivalent is that addr_self never sees this listener at all. */
+/* Core -maxreceivebuffer / -maxsendbuffer, both in units of 1000 bytes.
+ *
+ * -maxreceivebuffer was PARSED AND READ NOWHERE: the option existed in the
+ * config surface and did nothing, which is the defect this codebase keeps
+ * reproducing. Both are applied here, to every peer socket in both
+ * directions, so a peer cannot make this node buffer without bound.
+ *
+ * Core enforces its limits in userspace against its own message queues; this
+ * node has no such queue -- it reads and writes the socket directly -- so the
+ * kernel's own buffer IS the queue and the setting sizes it. Stated rather
+ * than pretended: the effect is the same bound on memory per peer, reached by
+ * a different mechanism. */
+static void peer_sock_buffers(int fd){
+    if (fd < 0) return;
+    if (g_cfg.maxrecvbuffer_kb > 0){
+        int v = g_cfg.maxrecvbuffer_kb * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
+    }
+    if (g_cfg.maxsendbuffer_kb > 0){
+        int v = g_cfg.maxsendbuffer_kb * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+    }
+}
+
 static int lsock_onion(int want_port, int* got_port){
     int l = socket(AF_INET,SOCK_STREAM,0);
     if(l < 0) return -1;
@@ -1338,6 +1362,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         else dial_fail_errno("connect", fd);
         return -1;
     }
+    peer_sock_buffers(fd);
     if(fired || hk!=1 || !peer_has_witness(host)){
         if(fired){
             snprintf(g_dial_fail,sizeof g_dial_fail,"dial budget %ds exceeded",
@@ -3086,6 +3111,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
        * means this node must not learn or announce its clearnet address at
        * all: that address is exactly what running behind Tor hides. */
       { extern void txrelay_set_status(void*); txrelay_set_status(g_node_status); }
+      { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
       int may = g_cfg.listen && dialer_may_announce_clearnet();
       addrself_init((unsigned short)g_cfg.port, may);
       /* -externalip: the operator naming the reachable address directly */
@@ -4674,6 +4700,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * the child inherits a current one and its own top-up is a
              * no-op. Without this each child re-scans everything appended
              * since boot, and says so in the log once per connection. */
+            if(c>=0) peer_sock_buffers(c);
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window */
