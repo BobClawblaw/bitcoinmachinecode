@@ -943,8 +943,8 @@ tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDI
 # Protocol-violation reporting from the asm serve loop (audit finding 7).
 # The framer's message-size bound (audit finding 6).
 # The daemon's wallet passphrase source (audit finding 2).
-tests/test_wallet_pass: tests/test_wallet_pass.c daemon/wallet_pass.c daemon/wallet_pass.h daemon/node_config.c daemon/node_config.h
-	$(CC) -O2 -o $@ tests/test_wallet_pass.c daemon/wallet_pass.c daemon/node_config.c
+tests/test_wallet_pass: tests/test_wallet_pass.c daemon/wallet_pass.c daemon/wallet_pass.h
+	$(CC) -O2 -o $@ tests/test_wallet_pass.c daemon/wallet_pass.c
 
 tests/test_p2p_msgsize: tests/test_p2p_msgsize.c bitcoin_net.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 -o $@ tests/test_p2p_msgsize.c bitcoin_net.o bitcoin_hash.o sha256.o
@@ -1844,7 +1844,7 @@ RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
 # path), bitcoin_idx.o (hash->height), bitcoin_tx.o (tx_txid), bitcoin_chainwork.o
 # (block_work/chainwork_add fallback when chainwork.dat is absent).
 RPCCHAIN := rpc_chain.o bitcoin_pow_rules.o block_filter.o bip32_ckdpub.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
-RPCLIBS := wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
+RPCLIBS := daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
 
 # rpc_wallet_ops.o -- the rest of Core's Wallet category (labels, wallet
 # inventory, output locks, signmessage, descriptor reporting, and the
