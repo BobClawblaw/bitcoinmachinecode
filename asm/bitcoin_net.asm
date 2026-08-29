@@ -343,12 +343,30 @@ p2p_write:
     cmp  edi, V2_FD_MAX
     jae  .v1
     mov  eax, edi
-    cmp  byte [g_v2_active + rax], 0
+    ; RIP-relative, not absolute: several test targets link this object into a
+    ; PIE binary, and an absolute R_X86_64_32S reloc against .data cannot be
+    ; used there ("recompile with -fPIE"). r10 is caller-saved and is not an
+    ; argument register, so borrowing it disturbs nothing.
+    lea  r10, [rel g_v2_active]
+    cmp  byte [r10 + rax], 0
     je   .v1
-    mov  rax, [g_v2_hook_write]
+    mov  rax, [rel g_v2_hook_write]
     test rax, rax
     je   .v1
-    jmp  rax                    ; tail call: identical ABI, identical return
+    ; The hook is a C function, and this entry is reached at BOTH stack
+    ; parities (the auditor calls p2p_read/p2p_write multi-entry). A tail jmp
+    ; would hand C whatever alignment we happened to arrive with, and C may
+    ; spill SSE registers to the stack. So align explicitly and make a real
+    ; call: rsp is forced to 0 mod 16, the call pushes 8, and the callee sees
+    ; the 8 that SysV promises it. Arguments are already in place and rax is
+    ; the return value, so nothing else moves.
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    ret
 .v1:
     push rbp
     mov  rbp, rsp
@@ -429,12 +447,30 @@ p2p_read:
     cmp  edi, V2_FD_MAX
     jae  .v1
     mov  eax, edi
-    cmp  byte [g_v2_active + rax], 0
+    ; RIP-relative, not absolute: several test targets link this object into a
+    ; PIE binary, and an absolute R_X86_64_32S reloc against .data cannot be
+    ; used there ("recompile with -fPIE"). r10 is caller-saved and is not an
+    ; argument register, so borrowing it disturbs nothing.
+    lea  r10, [rel g_v2_active]
+    cmp  byte [r10 + rax], 0
     je   .v1
-    mov  rax, [g_v2_hook_read]
+    mov  rax, [rel g_v2_hook_read]
     test rax, rax
     je   .v1
-    jmp  rax                    ; tail call: identical ABI, identical return
+    ; The hook is a C function, and this entry is reached at BOTH stack
+    ; parities (the auditor calls p2p_read/p2p_write multi-entry). A tail jmp
+    ; would hand C whatever alignment we happened to arrive with, and C may
+    ; spill SSE registers to the stack. So align explicitly and make a real
+    ; call: rsp is forced to 0 mod 16, the call pushes 8, and the callee sees
+    ; the 8 that SysV promises it. Arguments are already in place and rax is
+    ; the return value, so nothing else moves.
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    ret
 .v1:
     push rbp
     mov  rbp, rsp
