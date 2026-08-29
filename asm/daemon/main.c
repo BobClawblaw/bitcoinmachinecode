@@ -4388,7 +4388,7 @@ int main(int argc, char** argv){
         snprintf(g_logpath, sizeof g_logpath, "logs/bitcoind.%s.log", g_chainp->name);
     mkdir("logs", 0755);
     int lfd = node_log_open(g_logpath);
-    node_log_str(lfd, 0, "[boot] node start (serve mode / download worker)", 51);
+    node_log_str(lfd, 0, "[boot] node start (serve mode / download worker)", 50);
     pthread_t _progmt;
     if(pthread_create(&_progmt, NULL, boot_utxo_progress, (void*)(long)lfd) == 0)
         pthread_detach(_progmt);
