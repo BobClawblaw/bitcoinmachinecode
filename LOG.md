@@ -7,6 +7,46 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-08-29 -- a sample config, and what a proxy actually has to change
+
+config/bitcoin.sample.conf now lists EVERY key this node reads, commented
+out, at the value used when the key is absent -- so an uncommented line only
+matters if you changed it. It is checked both ways against the parser: no
+key the parser accepts is undocumented, and no key is documented that the
+parser ignores. The defaults were read out of a compiled g_cfg rather than
+transcribed, which caught one wrong claim before it shipped: dbcache is
+1024 here, not Core's 450.
+
+config/bitcoin.conf is now gitignored and untracked. It carries rpcuser and
+rpcpassword; the sample is the tracked one. (The credential that was in the
+repo is still in its HISTORY -- purging that is a force-push and the
+operator's call.)
+
+WHAT A PROXY HAD TO CHANGE, and did not. Setting -proxy routed CONNECTIONS
+through the proxy while the node kept resolving peer hostnames with the
+system resolver: a plaintext DNS query naming every peer it was about to
+contact, from the same host, at the same moment. That is the correlation
+running behind Tor exists to prevent, and it was intact. With a proxy set
+this node now:
+  - hands the NAME to the proxy (SOCKS5 ATYP DOMAINNAME) instead of
+    resolving it, on every dial path: outbound_connect, the parallel boot
+    dial, addnode/connect resolution;
+  - does not query the DNS seeds at all, and says so with what to do
+    instead (they are DNS names; asking would announce "a Bitcoin node runs
+    here" to the resolver even though every later connection is proxied);
+  - refuses to resolve a .onion or .b32.i2p name under any configuration --
+    a DNS lookup for one deanonymises both ends.
+New keys, Core's names and defaults: -dns (1), -discover (1), -externalip.
+-discover=0, or an -onlynet naming only anonymity networks, now stops the
+node learning OR announcing its clearnet address at all.
+
+Proven live rather than argued: on testnet4 with proxy= set the node logs
+"not querying the DNS seeds: a proxy is configured" and a seed dial goes
+out as "name via proxy: socks5(name)"; with no proxy the same node logs
+"seed.testnet4.bitcoin.sprovoost.nl -> +22 peers (dns)" as before.
+tests/test_privacy_dns pins the six predicates that decide this, including
+that a default node is unaffected.
+
 ## 2026-08-29 -- the pre-deploy review that stopped a zero-peer node
 
 The Tor/I2P/CJDNS work was merged, gated at 208 suites, pushed, and about to
