@@ -83,6 +83,15 @@ extern long store_chainwork_truncate(void* st, long target_height);
 
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 
+/* ---- operator alerts (Core -alertnotify) ---------------------------------
+ * reorg.c raises; it does not decide what an alert MEANS or how to deliver
+ * one, so it takes a callback rather than reaching for the config. main()
+ * installs one that runs the -alertnotify command. */
+static void (*g_alert_fn)(const char*);
+void reorg_set_alert_fn(void (*fn)(const char*)){ g_alert_fn = fn; }
+void reorg_alert(const char* msg){ if (g_alert_fn && msg) g_alert_fn(msg); }
+
+
 
 
 extern int  pow_check(const unsigned char hdr[80]);
@@ -592,6 +601,7 @@ long reorg_analyze(void* st, reorg_cand_t* c){
             char cwb[40]; work_str(cwb, c->cand_work);
             fprintf(stderr, "[reorg] REFUSED: candidate work=%s is below -minimumchainwork; "
                             "not reorganising onto a low-work chain\n", cwb);
+            reorg_alert("low-work-chain-refused");
             return 1;
         }
         return 2;
@@ -687,6 +697,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         fprintf(stderr, "[reorg] disconnecting height %ld hash=%s..\n", h, hs);
         if (!utxo_live_unapply_block(blkbuf, (uint64_t)len, h)){
             fprintf(stderr, "[reorg] FATAL: unapply failed at height %ld -- UTXO set is now PARTIALLY rewound and must be rebuilt from the archive\n", h);
+        reorg_alert("utxo-partially-rewound-rebuild-required");
             if (locked) flock(lfd, LOCK_UN);
             hdr_fd_close();
             return -1;

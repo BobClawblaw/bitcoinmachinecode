@@ -141,4 +141,8 @@ int  reorg_work_meets_minimum(const unsigned char work[16]);
 int  reorg_min_chain_work_set(void);
 int  reorg_min_chain_work_unrepresentable(void);
 
+/* -alertnotify: reorg raises an alert, main() decides how to deliver it. */
+void reorg_set_alert_fn(void (*fn)(const char*));
+void reorg_alert(const char* msg);
+
 #endif /* REORG_H */
