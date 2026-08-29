@@ -41,7 +41,8 @@
  */
 #include <string.h>
 #include <stdio.h>
-#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
+#include "log_ts.h"
+#include "../rpc_node.h"   /* the orphan mirror lives in the shared status block */   /* timestamped fprintf(stderr), like every other daemon line */
 #include <stdlib.h>
 #include <poll.h>
 #include <time.h>
@@ -180,6 +181,32 @@ typedef struct {
     long long t_ms;
 } txr_orphan_t;
 static txr_orphan_t txr_orph[TXR_ORPHAN_MAX];
+
+/* ---- orphan mirror for getorphantxs --------------------------------------
+ * This pool is process-local to the download worker and is touched from one
+ * thread (txrelay_poll_leg is driven sequentially per leg), so publishing a
+ * snapshot needs no lock. Only republish when something actually changed --
+ * a generation counter, not a timer, so the RPC never shows a stale pool and
+ * the copy does not run on every poll for nothing. */
+static void*         txr_status;
+static unsigned long txr_orph_gen, txr_orph_gen_pub = (unsigned long)-1;
+void txrelay_set_status(void* st){ txr_status = st; }
+void txrelay_publish_orphans(void){
+    if (!txr_status || txr_orph_gen == txr_orph_gen_pub) return;
+    node_status_t* ns = (node_status_t*)txr_status;
+    int n = 0;
+    for (int i = 0; i < TXR_ORPHAN_MAX && n < RPC_MAX_ORPHANS; i++){
+        if (!txr_orph[i].buf) continue;
+        memcpy((void*)ns->orphans[n].txid, txr_orph[i].txid, 32);
+        ns->orphans[n].len     = txr_orph[i].len;
+        ns->orphans[n].nparent = txr_orph[i].nparent;
+        ns->orphans[n].t_ms    = txr_orph[i].t_ms;
+        n++;
+    }
+    __sync_synchronize();
+    ns->n_orphans = n;                 /* count published last */
+    txr_orph_gen_pub = txr_orph_gen;
+}
 static unsigned txr_orph_bytes;
 static long txr_orph_parked, txr_orph_resolved, txr_orph_dropped;   /* counters for the caller's log */
 
@@ -266,11 +293,13 @@ static u32 txr_tx_parents(const u8* tx, unsigned long len, u8 out[][32], u32 cap
 }
 
 static void txr_orphan_free(txr_orphan_t* o){
+    txr_orph_gen++;
     if (o->buf){ free(o->buf); txr_orph_bytes -= o->len; }
     memset(o, 0, sizeof *o);
 }
 
 static void txr_orphan_add(const u8 txid[32], const u8* tx, unsigned long len){
+    txr_orph_gen++;
     if (len == 0 || len > (TXR_ORPHAN_BYTES / 4)) return;   /* one tx may not hog the pool */
     for (int i = 0; i < TXR_ORPHAN_MAX; i++)
         if (txr_orph[i].buf && !memcmp(txr_orph[i].txid, txid, 32)) return;   /* already parked */

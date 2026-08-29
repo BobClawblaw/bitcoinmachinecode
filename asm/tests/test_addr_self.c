@@ -18,6 +18,8 @@ extern void addrself_init(unsigned short listen_port, int listen_enabled);
 extern void addrself_note_peer_view(const u8* payload, long len);
 extern long addrself_build(u8 out[64], long now);
 extern long addrself_build_v2(u8 out[64], long now);
+extern int  addrself_set_onion(const char* onion_str, unsigned short port);
+extern long addrself_build_v2_onion(u8 out[64], long now);
 extern int  addrself_set_external(const unsigned char ip4[4]);
 extern long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds);
 
@@ -114,6 +116,27 @@ int main(void){
     { int fl = fcntl(sp[1], F_GETFL, 0); fcntl(sp[1], F_SETFL, fl | O_NONBLOCK);
       u8 junk[8];
       ck("no wire bytes", read(sp[1], junk, sizeof junk) <= 0); }
+
+    printf("== onion self-address (inbound Tor) ==\n");
+    /* a real v3 service id: Core's own p2p_addrv2_relay.py example */
+    { const char* ON = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+      ck("a valid v3 onion is accepted", addrself_set_onion(ON, 8333) == 1);
+      ck("a malformed onion is REFUSED (the checksum is validated, not assumed)",
+         addrself_set_onion("notanonion.onion", 8333) == 0);
+      ck("  and a truncated one too", addrself_set_onion("aaaa.onion", 8333) == 0);
+
+      u8 b[64]; long n = addrself_build_v2_onion(b, 0x65535300L);
+      ck("the onion record is built", n > 0);
+      /* count(1) time(4) services(1) netid(1) len(1) addr(32) port(2) = 42 */
+      ck("  and is exactly the BIP155 onion shape", n == 42);
+      ck("  count is 1",                b[0] == 1);
+      ck("  network id is 4 (TORV3)",   b[6] == 4);
+      ck("  address length is 32",      b[7] == 32);
+      ck("  port is big-endian 8333",   b[40] == 0x20 && b[41] == 0x8d);
+      /* the 32 bytes must be the DECODED pubkey, not the base32 text */
+      int looks_like_text = 1;
+      for (int i = 0; i < 32; i++) if (b[8+i] < 'a' || b[8+i] > 'z') { looks_like_text = 0; break; }
+      ck("  the address is the decoded pubkey, not the base32 string", !looks_like_text); }
 
     close(sp[0]); close(sp[1]); close(sq[0]); close(sq[1]);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

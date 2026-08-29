@@ -149,6 +149,21 @@ typedef struct {
      * reported a hardcoded 1 while nothing could change the policy. */
     volatile int                permit_bare_multisig;
 
+    /* ---- orphan pool mirror (getorphantxs) ----
+     * The pool itself lives in the DOWNLOAD WORKER (daemon/tx_relay.c) and
+     * the RPC server runs in the parent, so the parent cannot read it
+     * directly. A compact snapshot is published here instead: enough for
+     * verbosity 0 and 1, deliberately WITHOUT the transaction bytes, which
+     * would be 256 x 100KB and have no business in a status block. */
+#define RPC_MAX_ORPHANS 256
+    volatile int                n_orphans;
+    struct {
+        unsigned char txid[32];
+        unsigned      len;        /* serialized size in bytes */
+        unsigned      nparent;    /* missing parents we are waiting on */
+        long long     t_ms;       /* when it entered the pool */
+    } orphans[RPC_MAX_ORPHANS];
+
     /* ==== ban list ====
      * Lives in shared memory rather than behind the channel because BOTH
      * sides need it: the parent serves listbanned straight out of it, and
