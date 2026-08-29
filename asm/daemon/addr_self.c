@@ -123,7 +123,15 @@ long addrself_build_v2(u8 out[64], long now){
 /* Announce to every live leg when confident and due (first time, then every
  * 24h). Cheap no-op otherwise; called once per worker rotation. wants_v2[i]
  * is that leg's handshake verdict (1 = it sent sendaddrv2); NULL = all v1. */
-long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds){
+/* PRIVACY (2026-08-28 pre-deploy review). We announce ONE address: this
+ * node's clearnet IPv4. Since the transports landed, a leg can be onion or
+ * i2p -- and telling an onion peer our clearnet IPv4 links the two, which is
+ * precisely what running over Tor is meant to prevent. Core's GetLocal has
+ * the same guard: "don't advertise our privacy-network address to other
+ * networks and don't advertise our other-network address to privacy
+ * networks". `nets[i]` is each leg's BMC_NET_*; a NULL array means every leg
+ * is clearnet (the callers that predate the transports). */
+long addrself_maybe_announce_nets(const int* fds, const u8* wants_v2, const u8* nets, int nfds){
     if (!g_enabled || !g_confident) return 0;
     long now = (long)time(NULL);
     if (g_last_announce && now - g_last_announce < ASELF_PERIOD_S) return 0;
@@ -133,6 +141,8 @@ long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds){
     long sent = 0;
     for (int i = 0; i < nfds; i++){
         if (fds[i] < 0) continue;
+        /* our address is IPv4: announce it only on clearnet legs */
+        if (nets && nets[i] != 1 /* BMC_NET_IPV4 */ && nets[i] != 2 /* IPV6 */) continue;
         int v2 = wants_v2 && wants_v2[i];
         long w = v2 ? p2p_write(fds[i], "addrv2", 6, msg2, (unsigned)n2)
                     : p2p_write(fds[i], "addr",   4, msg,  (unsigned)n);
@@ -144,4 +154,9 @@ long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds){
                 g_ip[0], g_ip[1], g_ip[2], g_ip[3], g_port, sent);
     }
     return sent;
+}
+
+/* the pre-transport signature, for callers that have no per-leg networks */
+long addrself_maybe_announce(const int* fds, const u8* wants_v2, int nfds){
+    return addrself_maybe_announce_nets(fds, wants_v2, NULL, nfds);
 }

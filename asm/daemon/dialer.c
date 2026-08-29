@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include "dialer.h"
@@ -97,9 +98,27 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
         if (!g_onion_ip[0]){ *why = "no tor proxy configured (-proxy / -onion)"; return -1; }
         /* per-connection credentials = stream isolation: tor gives each
          * distinct user/pass its own circuit (Core's -proxyrandomize) */
-        char u[32], p[8] = "x";
-        static unsigned long ctr;
-        snprintf(u, sizeof u, "bmc-%lu", (unsigned long)(++ctr));
+        /* Core uses RANDOM credentials per connection (-proxyrandomize):
+         * tor gives each distinct user/pass its own circuit. An incrementing
+         * counter is guessable AND resets in every forked child, so two
+         * peers could share a circuit -- read from the kernel instead.
+         * (2026-08-28 pre-deploy review.) */
+        char u[40], p[40];
+        { unsigned char r[16];
+          int rf = open("/dev/urandom", O_RDONLY);
+          if (rf < 0 || read(rf, r, sizeof r) != (long)sizeof r){
+              /* never fall back to a predictable value: without randomness
+               * we cannot isolate, so say so and use no credentials */
+              if (rf >= 0) close(rf);
+              *why = "cannot read /dev/urandom for stream isolation";
+              return -1;
+          }
+          close(rf);
+          static const char* H = "0123456789abcdef";
+          for (int i = 0; i < 8; i++){ u[i*2] = H[r[i] >> 4]; u[i*2+1] = H[r[i] & 15]; }
+          u[16] = 0;
+          for (int i = 0; i < 8; i++){ p[i*2] = H[r[8+i] >> 4]; p[i*2+1] = H[r[8+i] & 15]; }
+          p[16] = 0; }
         int rep = 0;
         int fd = socks5_connect(g_onion_ip, g_onion_port, host, a->port ? a->port : 8333,
                                 g_cfg.proxyrandomize ? u : NULL, g_cfg.proxyrandomize ? p : NULL,
@@ -123,6 +142,16 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
         if (fd < 0) *why = "connect failed";
         return fd; }
     case BMC_NET_IPV6: case BMC_NET_CJDNS: {
+        /* Core parses a bare -proxy into the proxy for EVERY network
+         * (init.cpp) and ConnectNode selects by network, so an operator who
+         * sets -proxy expecting all traffic to leave through it must not
+         * have IPv6/CJDNS quietly go direct. */
+        if (g_proxy_ip[0]){
+            int rep2 = 0;
+            int pfd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port, NULL, NULL, timeout_ms, &rep2);
+            if (pfd < 0){ snprintf(err, sizeof err, "socks5 rc=%d rep=%d", pfd, rep2); *why = err; }
+            return pfd;
+        }
         if (!g_have_v6){ *why = "no IPv6 stack on this host"; return -1; }
         if (a->net == BMC_NET_CJDNS && !g_cfg.cjdnsreachable){
             *why = "cjdns not enabled (-cjdnsreachable)"; return -1; }
