@@ -400,7 +400,7 @@ than trusted:
 | **Config options** | **~73 / 163 (45%).** Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
-| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport and Erlay absent.** |
+| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport: crypto and framing complete and pinned to the official vectors, not yet wired into the peer loop. Erlay absent.** |
 
 *Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
 authentication** plus a constant-time credential compare; `bantime` with
@@ -435,8 +435,11 @@ tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
 list this node does not have. All three stay on the warning list.
 
-*Remaining, in the order worth doing it:* BIP324 v2 transport (the only major
-protocol gap, and a multi-session piece on its own); signet; `reindex` and
+*Remaining, in the order worth doing it:* BIP324 v2 transport — the ciphers,
+the packet format and the handshake state machine are done and pinned to the
+official BIP324 vectors (76 decode, 256 encode branches, 7 end-to-end packet
+vectors); what is left is wiring it into the peer loop with v1 fallback, which
+is the part that changes live behaviour. Then signet; `reindex` and
 `persistmempool`; `whitelist`/`whitebind` peer permissions; the RPC surface
 (`rpcauth`, `rpcallowip`, `rpcbind`, `server`, `rest`) — lower urgency now
 that cookie auth exists and the listener cannot leave loopback; then Erlay.
