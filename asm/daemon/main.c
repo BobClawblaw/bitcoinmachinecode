@@ -2884,8 +2884,18 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             undo_set_coin_observer(csi_on_remove);
             long ah = utxo_live_applied_height();
-            if (!csi_boot(ah))
-                csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+            if (!csi_boot(ah)){
+                /* Defer the coinstats full-walk seed while in deferred-boot
+                 * mode: it re-walks the whole UTXO (a ~6h recount that also
+                 * defeats the recount-defer) and segfaults on this archive.
+                 * coinstatsindex only backs gettxoutsetinfo (display-only);
+                 * the catch-up's csi observers still build it incrementally
+                 * for newly-applied blocks, and nothing in download/serving
+                 * needs it. */
+                extern volatile unsigned char g_utxo_defer_recount;
+                if(!g_utxo_defer_recount)
+                    csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+            }
         }
     }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
