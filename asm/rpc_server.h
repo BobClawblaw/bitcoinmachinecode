@@ -49,4 +49,12 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
 /* Stop the server and join its accept thread. Safe to call once. */
 void rpc_server_stop(void);
 
+/* ---- cookie authentication (Core's default) ----------------------------
+ * rpc_cookie_write() drops a fresh "__cookie__:<64 hex>" credential at
+ * `path` with 0600 permissions and starts accepting it alongside the
+ * configured rpcuser/rpcpassword. rpc_cookie_remove() deletes it; call it
+ * on shutdown so a dead node leaves no usable credential behind. */
+int  rpc_cookie_write(const char* path);
+void rpc_cookie_remove(void);
+
 #endif /* RPC_SERVER_H */

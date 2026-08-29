@@ -77,6 +77,10 @@ node_config_t g_cfg = {
     .discover              = 1,      /* Core -discover default: on           */
     .i2pacceptincoming     = 1,      /* Core -i2pacceptincoming default: on  */
     .listenonion           = 1,      /* Core -listenonion default: on        */
+    .bantime               = 86400,  /* Core -bantime default: 24h           */
+    .blockfilterindex      = 1,      /* both indexes already run; the knob    */
+    .coinstatsindex        = 1,      /* only lets an operator turn them OFF   */
+    .rpccookie             = 1,      /* Core's default auth method            */
     .connect_only          = 0,
     .n_seednode            = 0,
     .n_addnode             = 0,
@@ -86,6 +90,32 @@ node_config_t g_cfg = {
     .checklevel            = 3,      /* Core -checklevel default             */
     .stopatheight          = 0,      /* Core -stopatheight default: no stop  */
 };
+
+/* "0000..0abc" -> 32 big-endian bytes, right-aligned, exactly how Core spells
+ * nMinimumChainWork. Returns 0 on any non-hex character or on more than 64
+ * digits, so a typo is reported instead of silently truncated. */
+int nodecfg_hex32_be(const char* str, unsigned char out[32]){
+    if(!str) return 0;
+    while(*str==' '||*str=='\t') str++;
+    if(str[0]=='0'&&(str[1]=='x'||str[1]=='X')) str+=2;
+    long n=0;
+    while(str[n] && str[n]!=' ' && str[n]!='\t' && str[n]!='\r' && str[n]!='\n') n++;
+    if(n==0 || n>64) return 0;
+    for(long i=0;i<n;i++){
+        char c=str[i];
+        if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) return 0;
+    }
+    memset(out,0,32);
+    long bi=31, i=n;
+    while(i>0 && bi>=0){
+        int hi=0, lo;
+        char c1=str[--i];
+        lo=(c1<='9')?c1-'0':((c1|32)-'a'+10);
+        if(i>0){ char c0=str[--i]; hi=(c0<='9')?c0-'0':((c0|32)-'a'+10); }
+        out[bi--]=(unsigned char)((hi<<4)|lo);
+    }
+    return 1;
+}
 
 static void set_defaults(void){
     g_cfg.max_connections       = 200;   /* Core v31 default */
@@ -104,6 +134,13 @@ static void set_defaults(void){
     g_cfg.discover              = 1;
     g_cfg.i2pacceptincoming     = 1;
     g_cfg.listenonion           = 1;
+    g_cfg.bantime               = 86400;
+    g_cfg.blockfilterindex      = 1;
+    g_cfg.coinstatsindex        = 1;
+    g_cfg.rpccookie             = 1;
+    g_cfg.rpccookiefile[0]      = 0;
+    memset(g_cfg.minchainwork, 0, 32);
+    g_cfg.have_minchainwork     = 0;
     g_cfg.utxo_bulk_slots_log2  = 22;
     g_cfg.utxo_bulk_blob_mb     = 1024;
     g_cfg.utxo_bulk_gap_blocks  = 50000L;
@@ -236,7 +273,15 @@ static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
     return v;
 }
 
+/* -conf=<path>, set by main() before any load. Highest precedence: an
+ * operator who names a file must get that file or a clear failure, never a
+ * silent fallback to a different one. */
+static char g_conf_override[512];
+void node_config_set_conf_path(const char* path){
+    snprintf(g_conf_override, sizeof g_conf_override, "%s", path ? path : "");
+}
 const char* node_config_path(const char* datadir, char* buf, unsigned long cap){
+    if(g_conf_override[0]){ snprintf(buf, cap, "%s", g_conf_override); return buf; }
     const char* env = getenv("BITCOIN_CONF");
     if(env && *env){ snprintf(buf, cap, "%s", env); return buf; }
     snprintf(buf, cap, "%s/bitcoin.conf", datadir);
@@ -373,6 +418,25 @@ long node_config_load(const char* path){
             snprintf(g_cfg.torpassword,sizeof g_cfg.torpassword,"%s",val); applied++; }
         else if(!strcmp(key,"listenonion")){
             g_cfg.listenonion = iv?1:0; applied++; }
+        else if(!strcmp(key,"bantime")){      /* Core -bantime, seconds      */
+            { long bv = atol(val); if(bv > 0) g_cfg.bantime = bv; } applied++; }
+        else if(!strcmp(key,"blockfilterindex")){
+            /* Core takes "basic"/"0"/"1"; "basic" is the only index type
+             * that exists in Core either, so treat it as on. */
+            g_cfg.blockfilterindex = (!strcmp(val,"basic") || iv) ? 1 : 0; applied++; }
+        else if(!strcmp(key,"coinstatsindex")){
+            g_cfg.coinstatsindex = iv?1:0; applied++; }
+        else if(!strcmp(key,"rpccookiefile")){
+            snprintf(g_cfg.rpccookiefile,sizeof g_cfg.rpccookiefile,"%s",val); applied++; }
+        else if(!strcmp(key,"minimumchainwork")){
+            /* 64 hex digits, big-endian, exactly Core's uint256 spelling.
+             * Shorter input is right-aligned so "0" and a full hash both
+             * mean what an operator expects. */
+            if(nodecfg_hex32_be(val, g_cfg.minchainwork)){
+                g_cfg.have_minchainwork = 1; applied++;
+            } else {
+                fprintf(stderr,"[config] minimumchainwork=%s is not a hex number -- ignoring\n", val);
+            } }
         else if(!strcmp(key,"i2psam")){       /* Core -i2psam=ip:port       */
             snprintf(g_cfg.i2psam,sizeof g_cfg.i2psam,"%s",val); applied++; }
         else if(!strcmp(key,"i2pacceptincoming")){
