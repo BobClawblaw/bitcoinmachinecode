@@ -43,6 +43,7 @@
 #include "utxo_walk.h"   /* utxo_walk_read_varint, for tx-count in [block] stored logs */
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 #include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
+#include "notify.h"      /* Core -*notify hooks */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
 
@@ -820,6 +821,13 @@ static int ctl_ban_covers(const char* entry, const char* ip){
 }
 
 /* 1 if this address is currently banned. Called before every dial. */
+/* -alertnotify delivery. Named and non-static so reorg can be handed it
+ * without reorg.c learning about the config. */
+void bmc_alert_deliver(const char* msg){
+    fprintf(stderr,"[alert] %s\n", msg ? msg : "?");
+    if (g_cfg.alertnotify[0]) notify_run(g_cfg.alertnotify, msg, "alertnotify");
+}
+
 int ctl_is_banned(const char* ip){
     if(!g_node_status) return 0;
     long long now = (long long)time(NULL);
@@ -4037,6 +4045,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         /* address index (extension): ADDs from the block,
                          * DELs/TOUCHes from its undo records */
                         axt_on_block(store_buf, zh, zb, bl);
+                        /* -blocknotify: after the indexes have taken the
+                         * block, so a hook that queries us sees it. */
+                        if (g_cfg.blocknotify[0]){
+                            unsigned char bh[32]; char hx[65];
+                            block_hash(bh, zb);
+                            for (int _i = 0; _i < 32; _i++)
+                                snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
+                            notify_run(g_cfg.blocknotify, hx, "blocknotify");
+                        }
                         /* mempool reconciliation (Core removeForBlock):
                          * confirmed txs leave pool+policy graph, txs
                          * CONFLICTING with this block's spends leave with
@@ -4394,6 +4411,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
                  fprintf(stderr,"[boot] pid %d written to %s\n", (int)getpid(), g_cfg.pidfile); }
         else     fprintf(stderr,"[boot] could not write -pid=%s: %s\n", g_cfg.pidfile, strerror(errno));
     }
+    if (g_cfg.startupnotify[0]) notify_run(g_cfg.startupnotify, "", "startupnotify");
     if (g_cfg.rpccookie){
         const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
         if (rpc_cookie_write(cpath))
@@ -4469,6 +4487,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
             }
+            /* run BEFORE the credential and pidfile go, so a hook that
+             * wants to read either still can */
+            if(g_cfg.shutdownnotify[0]) notify_run(g_cfg.shutdownnotify, "", "shutdownnotify");
             /* a dead node must not leave a usable credential on disk, nor a
              * pidfile pointing at a pid that is about to be reused */
             rpc_cookie_remove();
@@ -4738,6 +4759,8 @@ int main(int argc, char** argv){
                    nodecfg_hex32_be(g_chainp->min_chain_work_hex, mw);
                src = "chain default"; }
         reorg_set_min_chain_work(mw);
+        { extern void bmc_alert_deliver(const char*);
+          reorg_set_alert_fn(bmc_alert_deliver); }
         if (reorg_min_chain_work_unrepresentable())
             fprintf(stderr,"[config] work : minimumchainwork EXCEEDS this node's 128-bit "
                            "work accumulator -- every chain will be refused. Lower it.\n");

@@ -125,7 +125,7 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_poin
 # at parse time -- otherwise the prereq-check audit flags the objects as
 # linked-but-not-a-prerequisite.
 # bitcoin_pow_rules.o lives HERE ONLY: rpc_chain.o (getblocktemplate),
-# daemon/utxo_live.c and daemon/reorg.c daemon/minchainwork.c all need it, and every target that
+# daemon/utxo_live.c and daemon/reorg.c daemon/minchainwork.c daemon/notify.c all need it, and every target that
 # links DAEMONSRCS or DIALSRCS also links DAEMON_RPCOBJS -- listing it in
 # both bundles puts the object on the command line twice (multiple
 # definition of pow_retarget_bits/pow_expected_bits/pow_check_bits).
@@ -388,7 +388,7 @@ tests/test_undo_asm_diff: tests/test_undo_asm_diff.c tests/undo_log_ref.o bitcoi
 # daemon/bitcoind is: the deep asm call chain (cons_verify -> tx_parse /
 # sha256d) is documented in this Makefile as misbehaving under aggressive C
 # optimisation, and this harness sits directly on top of it.
-REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/minchainwork.c daemon/archive_verify.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
+REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/minchainwork.c daemon/notify.c daemon/archive_verify.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -747,7 +747,7 @@ tests/test_net_policy: tests/test_net_policy.c daemon/net_policy.c bitcoin_net.o
 # It still gets a rule so it is built/compiled-checked on demand rather than
 # rotting the way daemon/build_utxo did with no target at all.
 RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/block_witness.c daemon/undo_log.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c \
-    daemon/mempool_cfg.c daemon/reorg.c daemon/minchainwork.c daemon/locator_build.c daemon/archive_verify.c \
+    daemon/mempool_cfg.c daemon/reorg.c daemon/minchainwork.c daemon/notify.c daemon/locator_build.c daemon/archive_verify.c \
     daemon/node_config.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_pow_rules.o
 tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
@@ -760,7 +760,7 @@ tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 # directly (renaming its main) and therefore links the same objects the daemon
 # does, minus daemon/main.c itself (it comes in via the #include).
 DIALSRCS := tests/test_dial_budget.c daemon/utxo_live.c daemon/block_witness.c daemon/block_strip.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c \
-    daemon/upload_cap.c daemon/blk_submit.c daemon/reorg.c daemon/minchainwork.c daemon/undo_log.c daemon/locator_build.c \
+    daemon/upload_cap.c daemon/blk_submit.c daemon/reorg.c daemon/minchainwork.c daemon/notify.c daemon/undo_log.c daemon/locator_build.c \
     daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c daemon/chainparams.c \
     bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/addr_index_tail.c wallet_store.c wallet_msgsign.c
@@ -1828,8 +1828,8 @@ daemon/bitcoin_rpcd: daemon/bitcoin_rpcd.c rpc_server.o rpc_net.o rpc_commands.o
 # expanded when the rule is READ, so $(RPCLIBS) above its definition expands
 # to nothing -- the link still works (recipes expand at run time) but the
 # rule silently depends on none of it. prereq-check catches exactly this.
-tests/test_core_parity: tests/test_core_parity.c daemon/node_config.c daemon/chainparams.c daemon/minchainwork.c rpc_server.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_hash.o sha256.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS)
-	$(CC) -no-pie -O2 -o $@ tests/test_core_parity.c daemon/node_config.c daemon/chainparams.c daemon/minchainwork.c rpc_server.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS) -lpthread
+tests/test_core_parity: tests/test_core_parity.c daemon/node_config.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_hash.o sha256.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS)
+	$(CC) -no-pie -O2 -o $@ tests/test_core_parity.c daemon/node_config.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS) -lpthread
 
 tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o daemon/bitcoin_cli daemon/bitcoin_rpcd $(RPCLIBS)
 	$(CC) -no-pie -O2 -o $@ tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o $(RPCLIBS) -lpthread
@@ -2012,11 +2012,11 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # (tap_merkle_root writing its loop counter onto its own saved r12) and the
 # base58check_encode save-area overrun of 2026-08-23. DAEMONOBJS is defined
 # once, above, near its first use (tests/test_bitcoind) -- see the note there.
-# STAGE B adds daemon/reorg.c daemon/minchainwork.c (fork choice / reorg engine), daemon/undo_log.c
+# STAGE B adds daemon/reorg.c daemon/minchainwork.c daemon/notify.c (fork choice / reorg engine), daemon/undo_log.c
 # (per-block undo data, now wired into the live apply path) and
 # daemon/locator_build.c (the real multi-hash block locator), plus
 # bitcoin_chainwork.o for the cumulative-work primitives they run on.
-DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/block_witness.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/reorg.c daemon/minchainwork.c \
+DAEMONSRCS := daemon/main.c daemon/utxo_live.c daemon/block_witness.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/reorg.c daemon/minchainwork.c daemon/notify.c \
     daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
     daemon/net_policy.c daemon/node_config.c daemon/chainparams.c daemon/mempool_cfg.c daemon/upload_cap.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/blk_submit.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/serve_cfilters.c daemon/serve_addr.c daemon/addr_index_tail.c daemon/block_strip.c wallet_store.c \
     bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \

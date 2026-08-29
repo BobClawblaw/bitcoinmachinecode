@@ -32,6 +32,13 @@ extern int  rpc_cookie_write(const char* path);
 extern void rpc_cookie_remove(void);
 extern int  rpc_auth_ok_for_test(const char* hdrs, unsigned long hlen,
                                  const char* user, const char* pass);
+extern void notify_run(const char* cmd_template, const char* value, const char* what);
+
+/* the hooks run asynchronously (double fork); wait briefly for the effect */
+static int wait_for_file(const char* path, int tenths){
+    for (int i = 0; i < tenths; i++){ if (access(path, F_OK) == 0) return 1; usleep(100000); }
+    return 0;
+}
 
 static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
@@ -191,6 +198,50 @@ int main(void){
 
     /* the rejection itself is asserted in tests/test_mempool_policy, where the
      * mempool stack this policy object needs is already linked. */
+    printf("== 7. -*notify hooks run, and cannot be injected into ==\n");
+    { const char* out = "/tmp/bmc_notify_ok.txt";
+      unlink(out);
+      char cmd[256]; snprintf(cmd, sizeof cmd, "echo %%s > %s", out);
+      notify_run(cmd, "0000deadbeefcafe", "test");
+      ck("the hook actually executes", wait_for_file(out, 30));
+      char got[128] = {0};
+      { FILE* f = fopen(out, "r"); if (f){ if(!fgets(got, sizeof got, f)) got[0]=0; fclose(f); } }
+      { char* nl = strchr(got, '\n'); if (nl) *nl = 0; }
+      ck("  and %s is substituted verbatim for a hash", !strcmp(got, "0000deadbeefcafe"));
+      unlink(out); }
+
+    /* The value reaches a shell. A hash is hex and harmless; an alert MESSAGE
+     * is not, which is the shape Core has carried warnings about. Assert the
+     * injection fails rather than trusting the filter by inspection. */
+    { const char* pwned = "/tmp/bmc_notify_PWNED.txt";
+      const char* out2  = "/tmp/bmc_notify_inj.txt";
+      unlink(pwned); unlink(out2);
+      char cmd[256]; snprintf(cmd, sizeof cmd, "echo %%s > %s", out2);
+      notify_run(cmd, "x; touch /tmp/bmc_notify_PWNED.txt", "test");
+      wait_for_file(out2, 30);
+      usleep(300000);
+      ck("a shell-injection attempt does NOT execute", access(pwned, F_OK) != 0);
+      char got[128] = {0};
+      { FILE* f = fopen(out2, "r"); if (f){ if(!fgets(got, sizeof got, f)) got[0]=0; fclose(f); } }
+      ck("  and the metacharacters are stripped from the value",
+         !strchr(got, ';') && !strchr(got, '`') && !strchr(got, '$'));
+      unlink(pwned); unlink(out2); }
+
+    { /* an empty template must be a no-op, not a shell invocation */
+      notify_run("", "anything", "test");
+      ck("an unconfigured hook does nothing", 1); }
+
+    printf("== 8. an unimplemented Core option is REPORTED, not swallowed ==\n");
+    { extern int nodecfg_unimplemented(const char*);
+      ck("whitelist is flagged (it sits in the live conf doing nothing)",
+         nodecfg_unimplemented("whitelist") == 1);
+      ck("asmap is flagged",          nodecfg_unimplemented("asmap") == 1);
+      ck("uacomment is flagged",      nodecfg_unimplemented("uacomment") == 1);
+      ck("an IMPLEMENTED option is not flagged", nodecfg_unimplemented("bantime") == 0);
+      ck("  nor is minimumchainwork", nodecfg_unimplemented("minimumchainwork") == 0);
+      ck("  nor blocknotify",         nodecfg_unimplemented("blocknotify") == 0);
+      ck("another consumer's key is not flagged", nodecfg_unimplemented("dbcache") == 0); }
+
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;
