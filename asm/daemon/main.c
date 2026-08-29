@@ -48,6 +48,7 @@
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
+#include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
@@ -4494,12 +4495,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           struct stat wsb;
           if (stat(cand[wi], &wsb) != 0) continue;
           wpass[0] = 0;
-          { const char* sec = getenv("BMC_WALLET_PASS");
-            if (sec && sec[0]) snprintf(wpass, sizeof wpass, "%s", sec);
-            else { char pf[1064]; snprintf(pf, sizeof pf, "%s.pass", cand[wi]);
-                   FILE* f = fopen(pf, "r");
-                   if (f){ if (fgets(wpass, sizeof wpass, f)){ char* nl = strchr(wpass,'\n'); if (nl) *nl = 0; }
-                           fclose(f); } } }
+          /* audit finding 2: the passphrase comes from the environment or a
+           * root-owned file OUTSIDE the datadir -- never from <store>.pass,
+           * which put the key in the same directory (and the same backup) as
+           * the ciphertext it protects. */
+          wallet_pass_load(wpass, (int)sizeof wpass, 0);
+          wallet_pass_warn_legacy(cand[wi]);
           if (wallet_store_load(cand[wi], mn, (int)sizeof mn, wpass, (int)sizeof wpass) == 0){
               wallet_mnemonic_seed(g_wallet_seed, mn, wpass[0] ? wpass : NULL,
                                    wpass[0] ? (long)strlen(wpass) : 0);
@@ -4511,7 +4512,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
               fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
           } else {
               fprintf(stderr, "[rpc] wallet store %s present but not loadable "
-                              "(encrypted? set BMC_WALLET_PASS or %s.pass)\n", cand[wi], cand[wi]);
+                              "(encrypted? set BMC_WALLET_PASS or walletpassfile=)\n", cand[wi]);
           }
           break;
       } } } }

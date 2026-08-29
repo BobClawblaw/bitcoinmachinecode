@@ -24,6 +24,7 @@
  * listwalletdir's {wallets:[{name,warnings}]}, and abortrescan's bare false.
  */
 
+#include "daemon/wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "rpc_wallet_ops.h"
 #include "rpc_chain.h"
 /* rpc_node_mempool_rawtx (bumpfee reads the original out of the pool).
@@ -195,20 +196,12 @@ extern int  bip32_ckd_priv(unsigned char k[32], unsigned char c[32],
 static char g_hdk[WOP_MAX_HDKEYS][128];   /* xprv strings; [0] unused (the seed) */
 static int  g_hdk_n = -1;                 /* count of ADDED keys, -1 = not loaded */
 
-/* the wallet passphrase, from the environment or <store>.pass -- the same
- * lookup wop_activate does, kept in one place so the two cannot disagree
- * about which secret protects this wallet */
+/* The wallet passphrase. One lookup, shared with the boot path, so the two
+ * cannot disagree about which secret protects this wallet --
+ * daemon/wallet_pass.c. <store>.pass is deliberately NOT consulted here any
+ * more (audit 2026-08-29 finding 2). */
 static int wop_wallet_pass(char* out, size_t cap){
-    out[0] = 0;
-    const char* sec = getenv("BMC_WALLET_PASS");
-    if (sec && sec[0]){ snprintf(out, cap, "%s", sec); return 1; }
-    char pb[512]; const char* store = wop_path(WOP_WALLET_REL, pb, sizeof pb);
-    char pf[700]; snprintf(pf, sizeof pf, "%s.pass", store);
-    FILE* f = fopen(pf, "r");
-    if (!f) return 0;
-    if (fgets(out, (int)cap, f)){ char* nl = strchr(out, '\n'); if (nl) *nl = 0; }
-    fclose(f);
-    return out[0] ? 1 : 0;
+    return wallet_pass_load(out, (int)cap, 0);
 }
 
 static int wop_hdkeys_load(void){
@@ -592,16 +585,12 @@ static int wop_activate(const char* name, long* ec, const char** em){
     if (!watch){
         static char mn[768], pass[256];
         pass[0] = 0;
-        { const char* sec = getenv("BMC_WALLET_PASS");
-          if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec);
-          else { char pf[700]; snprintf(pf, sizeof pf, "%s.pass", store);
-                 FILE* f = fopen(pf, "r");
-                 if (f){ if (fgets(pass, sizeof pass, f)){ char* nl = strchr(pass, '\n'); if (nl) *nl = 0; }
-                         fclose(f); } } }
+        /* audit finding 2 -- see daemon/wallet_pass.c */
+        wallet_pass_load(pass, (int)sizeof pass, 0);
         if (wallet_store_load(store, mn, (int)sizeof mn, pass, (int)sizeof pass) != 0){
             memset(mn, 0, sizeof mn); memset(pass, 0, sizeof pass);
             snprintf(perr, sizeof perr, "Wallet file verification failed. Failed to load "
-                     "wallet store %s (encrypted? set BMC_WALLET_PASS or %s.pass)", store, store);
+                     "wallet store %s (encrypted? set BMC_WALLET_PASS or walletpassfile=)", store);
             *ec = -18; *em = perr; return 0;
         }
         static unsigned char seed[64];
@@ -1120,7 +1109,7 @@ static int cmd_addhdkey(const rj_val* params, const rpc_wallet* w,
         return wop_err(ec, em, -4,
             "addhdkey stores an extended PRIVATE key, and this node will only "
             "store one encrypted. The wallet passphrase is not available "
-            "(set BMC_WALLET_PASS or provide <wallet>.pass)");
+            "(set BMC_WALLET_PASS or walletpassfile=)");
     memset(pass, 0, sizeof pass);
 
     int n = wop_hdkeys_load();
