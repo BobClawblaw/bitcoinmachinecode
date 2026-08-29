@@ -4073,6 +4073,32 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     fprintf(stderr, "[rpc] JSON-RPC server on 127.0.0.1:%d (live-node + chain, user=%s)\n", actual, user);
 }
 
+extern volatile unsigned long long g_utxo_prog_phase, g_utxo_prog_done, g_utxo_prog_total;
+
+/* Reports the long boot-time UTXO recount to the production log every few
+ * seconds, so a user watching the log sees the node alive and progressing
+ * instead of staring at silence during the (potentially ~1h) recount. */
+static void* boot_utxo_progress(void* arg){
+    int lfd = (int)(long)arg;
+    struct timespec ts; ts.tv_sec = 3; ts.tv_nsec = 0;
+    for(;;){
+        unsigned long long ph = g_utxo_prog_phase;
+        if(ph == 2) break;              /* recount finished */
+        if(ph == 1){
+            unsigned long long done = g_utxo_prog_done, tot = g_utxo_prog_total;
+            char b[96]; int n;
+            if(tot)
+                n = snprintf(b, sizeof b, "[utxo] recount: %llu/%llu records (%llu%%)",
+                             done, tot, done*100/tot);
+            else
+                n = snprintf(b, sizeof b, "[utxo] recount: %llu records consumed", done);
+            node_log_str(lfd, 0, b, n);
+        }
+        nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
 static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
@@ -4354,6 +4380,18 @@ int main(int argc, char** argv){
      * copy-on-write, which also stops each peer mapping its own copy.
      * Non-fatal: on failure the serve path drops inbound tx rather than
      * accepting unvalidated ones, exactly as before. */
+    /* Open the production log + start a boot-progress reporter BEFORE the
+     * (potentially ~1h) pre-fork UTXO snapshot/recount, so a user watching
+     * the log sees the node alive and progressing instead of sitting silent
+     * for the whole recount. */
+    if(g_chainp->id != CHAIN_MAIN)
+        snprintf(g_logpath, sizeof g_logpath, "logs/bitcoind.%s.log", g_chainp->name);
+    mkdir("logs", 0755);
+    int lfd = node_log_open(g_logpath);
+    node_log_str(lfd, 0, "[boot] node start (serve mode / download worker)", 51);
+    pthread_t _progmt;
+    if(pthread_create(&_progmt, NULL, boot_utxo_progress, (void*)(long)lfd) == 0)
+        pthread_detach(_progmt);
     { extern int serve_txdv_preinit(void);
       phase_timer_t txdv_pt; phase_start(&txdv_pt);
       int ok = serve_txdv_preinit();
@@ -4771,7 +4809,7 @@ int main(int argc, char** argv){
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
 
-        int lfd = node_log_open(g_logpath);   /* all-asm leveled logger */
+        /* production log already opened at boot start (lfd) */
         node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly
          * (fork-based inbound serving in the parent) AND continuously download

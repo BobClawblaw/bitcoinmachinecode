@@ -2134,6 +2134,7 @@ mac_compact_read_rec:
 	mov  x2, #37                    /* key(36)+type(1) */
 	bl   mac_read_exact2
 	cbnz x0, .cpr_err
+	bl   g_utxo_prog_bump          /* +1 record consumed (boot progress) */
 	ldrb w9, [x19, #76]             /* type */
 	cmp  w9, #1
 	b.ne .cpr_dec
@@ -2292,6 +2293,36 @@ mac_lsm_recount:
 	add  x25, x25, #1
 	b    .rc_open_loop
 .rc_open_done:
+	/* boot-progress hooks: phase=1 (recount active), reset done, and total =
+	 * sum of the runs' nrec so a monitor can report % as records are read. */
+	mov  x10, #1
+	adrp x9, :got:g_utxo_prog_phase
+	ldr  x9, [x9, :got_lo12:g_utxo_prog_phase]
+	str  x10, [x9]
+	adrp x9, :got:g_utxo_prog_done
+	ldr  x9, [x9, :got_lo12:g_utxo_prog_done]
+	str  xzr, [x9]
+	adrp x9, :got:g_utxo_prog_total
+	ldr  x9, [x9, :got_lo12:g_utxo_prog_total]
+	str  xzr, [x9]
+	mov  x25, #0
+.rc_prg_loop:
+	cmp  x25, x23
+	b.hs .rc_prg_done
+	mov  x10, x25
+	movz x11, #0x0068
+	movk x11, #0x0001, lsl #16
+	mul  x10, x10, x11
+	add  x10, x10, x24
+	ldr  x11, [x10, #24]           /* slot.remaining = nrec */
+	adrp x9, :got:g_utxo_prog_total
+	ldr  x9, [x9, :got_lo12:g_utxo_prog_total]
+	ldr  x12, [x9]
+	add  x12, x12, x11
+	str  x12, [x9]
+	add  x25, x25, #1
+	b    .rc_prg_loop
+.rc_prg_done:
 	/* streaming k-way merge, count only */
 .rc_merge:
 	mov  x9, #-1
@@ -2467,6 +2498,10 @@ mac_lsm_recount:
 .rc_err_nomap:
 	mov  x0, #-1
 .rc_ret:
+	mov  x10, #2
+	adrp x9, :got:g_utxo_prog_phase
+	ldr  x9, [x9, :got_lo12:g_utxo_prog_phase]
+	str  x10, [x9]                   /* phase=2: recount finished */
 	add  sp, sp, #0x100
 	ldp  x27,x28,[sp],#16
 	ldp  x25,x26,[sp],#16
@@ -3204,3 +3239,26 @@ wal_name:
 	.section .text
 
 	.section .note.GNU-stack,"",@progbits
+
+	.bss
+	.balign 8
+	.globl g_utxo_prog_phase
+	.type  g_utxo_prog_phase, @object
+g_utxo_prog_phase: .zero 8
+	.globl g_utxo_prog_done
+	.type  g_utxo_prog_done, @object
+g_utxo_prog_done:  .zero 8
+	.globl g_utxo_prog_total
+	.type  g_utxo_prog_total, @object
+g_utxo_prog_total: .zero 8
+	.text
+	.balign 4
+	.globl g_utxo_prog_bump
+	.type  g_utxo_prog_bump, @function
+g_utxo_prog_bump:
+	adrp x9, :got:g_utxo_prog_done
+	ldr  x9, [x9, :got_lo12:g_utxo_prog_done]
+	ldr  x10, [x9]
+	add  x10, x10, #1
+	str  x10, [x9]
+	ret
