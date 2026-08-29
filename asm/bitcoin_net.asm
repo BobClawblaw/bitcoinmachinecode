@@ -64,6 +64,12 @@ net_magic: dd 0xd9b4bef9
 ; The flag is checked before the hook so the v1 path costs one compare and one
 ; branch, not an indirect call.
 ; ---------------------------------------------------------------------------
+; Core's MAX_PROTOCOL_MESSAGE_LENGTH (net.h): 4 * 1000 * 1000. Core also
+; compares against MAX_SIZE (0x02000000), but that is the larger of the two,
+; so this single bound is the effective one -- and it is the same limit the
+; BIP324 path enforces (BIP324_MAX_MESSAGE_LEN).
+P2P_MAX_MSG equ 4000000
+
 V2_FD_MAX equ 4096
 global g_v2_hook_write
 global g_v2_hook_read
@@ -509,6 +515,22 @@ p2p_read:
 
     ; --- announced length ---
     mov  eax, [rbp-0x48]
+    ; SECURITY (audit 2026-08-29 finding 6): reject an oversized announcement
+    ; before acting on it. Core rejects at exactly this point --
+    ; net.cpp: `hdr.nMessageSize > MAX_SIZE || > MAX_PROTOCOL_MESSAGE_LENGTH`
+    ; -- and the note beside that check cites the 2024-07-03 disclosure where
+    ; the missing test let a peer make a node allocate 32 MiB per connection.
+    ;
+    ; Here the damage is unbounded WORK rather than memory: callers cap their
+    ; own buffers, so a huge `announced` cannot overflow anything, but the
+    ; drain loop below reads the excess 64 bytes at a time. A peer announcing
+    ; 0xFFFFFFFF makes the forked serve child grind through ~4 GB of socket
+    ; reads, holding a connection slot for as long as it cares to feed us.
+    ;
+    ; Returns -3, distinct from -2 (truncated) so the caller can score the
+    ; peer for misbehaviour rather than treat it as an ordinary short read.
+    cmp  eax, P2P_MAX_MSG
+    ja   .oversize
     mov  [rbp-0x64], eax       ; announced
 
     ; --- tocopy = min(announced, cap) ---
@@ -583,6 +605,9 @@ p2p_read:
     mov  rax, -2
     jmp  .ret
 
+.oversize:
+    mov  rax, -3               ; announced length above P2P_MAX_MSG
+    jmp  .ret
 .eof_or_err:
     test rax, rax
     js   .err

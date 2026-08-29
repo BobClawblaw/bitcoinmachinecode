@@ -1239,6 +1239,35 @@ static void dial_fail_errno(const char* what, int rc){
     else  snprintf(g_dial_fail, sizeof g_dial_fail, "%s: rc=%d", what, rc);
 }
 
+/* Does this peer advertise NODE_P2P_V2?
+ *
+ * Core only dials v2 when it does -- net.cpp:
+ * `addrConnect.nServices & GetLocalServices() & NODE_P2P_V2` -- and that is
+ * not merely an optimisation. An initiator cannot fall back in place (it has
+ * already sent 64 random bytes a v1 peer rejects as a bad magic), so a blind
+ * attempt costs an extra TCP connection against EVERY v1-only peer. Worse,
+ * plenty of peers accept exactly one connection and simply are not there for
+ * the redial -- which is precisely how tests/test_outbound_mux caught this.
+ *
+ * The address book already carries each peer's service bits, so the question
+ * is answerable before we dial. An unknown peer answers "no" and gets a
+ * single v1 connection, exactly as before this feature existed. */
+static int peer_advertises_v2(const char* host, int out_port){
+    if(!CFG_V2TRANSPORT()) return 0;
+    bmc_addr_t a;
+    if(!bmc_addr_from_string_port(&a, host, (unsigned short)out_port)) return 0;
+    ab2_t* b = ab2_open(".", 0);
+    if(!b) return 0;
+    long i = ab2_find(b, &a);
+    int yes = 0;
+    if(i >= 0){
+        ab2_rec_t r;
+        if(ab2_get(b, i, &r)) yes = (r.services & BMC_NODE_P2P_V2) != 0;
+    }
+    ab2_close(b);
+    return yes;
+}
+
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
     g_dial_fail[0] = 0;
     /* ---- any BIP155 network (2026-08-28) ----------------------------------
@@ -1349,11 +1378,9 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     int fd = -1;
     int hk = 0;
     const char* v2res = "v1";
-    /* Try BIP324 first, then fall back by REDIALLING. An initiator cannot
-     * fall back in place the way a responder can: it has already put 64
-     * random bytes on the wire, and a v1 peer rejects those as a bad network
-     * magic and hangs up. So a failed v2 attempt costs one extra connection
-     * against a v1-only peer, and nothing at all against a v2 peer. */
+    /* Only peers that advertise NODE_P2P_V2 get a v2 dial; everyone else is
+     * one plain v1 connection, as before. See peer_advertises_v2 above. */
+    const int want_v2 = peer_advertises_v2(host, out_port);
     for(int attempt = 0; attempt < 2; attempt++){
         if(proxied){
             bmc_addr_t pa; memset(&pa,0,sizeof pa);
@@ -1363,11 +1390,14 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         } else fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
         if(fd < 0) break;
         { struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); }
-        if(attempt == 0 && CFG_V2TRANSPORT()){
+        if(attempt == 0 && want_v2){
             int v2 = bmc_v2_handshake(fd, 1, 5000);
             if(v2 == 1){ v2res = "v2"; break; }
+            /* It advertised v2 and did not deliver -- a stale book entry, or
+             * a peer that changed its mind. Redial and speak v1. */
+            fprintf(stderr,"[dial] %s advertised v2 but the handshake failed -- retrying as v1\n", host);
             close(fd); fd = -1;
-            continue;                       /* redial and speak v1 outright */
+            continue;
         }
         break;
     }
@@ -4968,7 +4998,27 @@ int main(int argc, char** argv){
     { extern unsigned long long node_services;
       if(CFG_V2TRANSPORT()){
           node_services |= BMC_NODE_P2P_V2;
-          fprintf(stderr,"[net] BIP324 v2 transport enabled (services=0x%llx)\n", node_services);
+          /* Report how many known peers we could actually dial over v2. This
+           * is not decoration: outbound v2 is gated on the address book, the
+           * book is opened by RELATIVE path, and if that ever failed the
+           * feature would go silently inert with every test still passing --
+           * which is exactly how a relative `asmap` path once disabled itself
+           * on regtest. A zero here, with a non-empty book, is the symptom. */
+          long known = 0, cap = 0;
+          { ab2_t* b = ab2_open(".", 0);
+            if(b){
+                long n = ab2_count(b);
+                for(long i = 0; i < n; i++){
+                    ab2_rec_t r;
+                    if(!ab2_get(b, i, &r)) continue;
+                    known++;
+                    if(r.services & BMC_NODE_P2P_V2) cap++;
+                }
+                ab2_close(b);
+            } }
+          fprintf(stderr,"[net] BIP324 v2 transport enabled (services=0x%llx); "
+                         "%ld of %ld known peers advertise v2\n",
+                  node_services, cap, known);
       } else {
           fprintf(stderr,"[net] BIP324 v2 transport disabled by config -- v1 only\n");
       } }
