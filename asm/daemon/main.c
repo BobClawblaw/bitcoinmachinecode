@@ -4484,7 +4484,22 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_wops_set_seed_installer(wenc_install_seed);
       char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
       if (wenc_boot(".") || wenc_boot(wd)){
-          fprintf(stderr, "[rpc] encrypted wallet adopted (locked)\n");
+          /* An encrypted wallet boots LOCKED, as Core's does. If the operator
+           * has configured a passphrase source (walletpassfile= or
+           * $BMC_WALLET_PASS) unlock it here, so moving from the weak v2 store
+           * to this container does not silently turn the wallet RPCs off --
+           * the key still lives outside the datadir either way. With no
+           * passphrase source the wallet simply stays locked until
+           * walletpassphrase, which is the correct default. */
+          extern int wenc_unlock(const char*, long, long);
+          char boot_pass[256];
+          if (wallet_pass_load(boot_pass, (int)sizeof boot_pass, 0)
+              && wenc_unlock(boot_pass, (long)strlen(boot_pass), 0) == 1){
+              fprintf(stderr, "[rpc] encrypted wallet adopted and unlocked from the configured passphrase source\n");
+          } else {
+              fprintf(stderr, "[rpc] encrypted wallet adopted (locked -- use walletpassphrase)\n");
+          }
+          memset(boot_pass, 0, sizeof boot_pass);
       } else {
     { extern int wallet_store_load(const char*, char*, int, char*, int);
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
