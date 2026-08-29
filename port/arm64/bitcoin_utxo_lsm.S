@@ -2096,6 +2096,10 @@ mac_lsm_reload_impl:
 	mov  x0, x22
 	b    .rl_ret
 .rl_recount:
+	adrp x9, :got:g_utxo_defer_recount
+	ldr  x9, [x9, :got_lo12:g_utxo_defer_recount]
+	ldrb w9, [x9]
+	cbnz w9, .rl_defer_done
 	mov  x0, x19
 	mov  x1, x20
 	mov  x2, #0
@@ -2105,6 +2109,21 @@ mac_lsm_reload_impl:
 	cmp  x0, x9
 	b.eq .rl_fail
 	str  x0, [x19, #88]
+	mov  x0, x22
+	b    .rl_ret
+.rl_defer_done:
+	/* Deferred recount: load looks-for-work are ready, but u->n (the live
+	 * count) stays at the persisted base (display-only) rather than forcing a
+	 * full ~4B-record recount before boot can serve. Correct u->n is regained
+	 * on the next flush (catch-up recomputes it) or an explicit recount. */
+	ldr  x9, [x28, #0x00]           /* has_count */
+	cbz  x9, .rl_deferd_zero
+	ldr  x9, [x28, #0x08]           /* base */
+	str  x9, [x19, #88]             /* u->n = persisted base */
+	b    .rl_deferd_ret
+.rl_deferd_zero:
+	str  xzr, [x19, #88]            /* u->n = 0 (unknown) */
+.rl_deferd_ret:
 	mov  x0, x22
 	b    .rl_ret
 .rl_fail:
@@ -3251,6 +3270,9 @@ g_utxo_prog_done:  .zero 8
 	.globl g_utxo_prog_total
 	.type  g_utxo_prog_total, @object
 g_utxo_prog_total: .zero 8
+	.globl g_utxo_defer_recount
+	.type  g_utxo_defer_recount, @object
+g_utxo_defer_recount: .byte 0
 	.text
 	.balign 4
 	.globl g_utxo_prog_bump

@@ -4392,6 +4392,12 @@ int main(int argc, char** argv){
     pthread_t _progmt;
     if(pthread_create(&_progmt, NULL, boot_utxo_progress, (void*)(long)lfd) == 0)
         pthread_detach(_progmt);
+    /* Defer the UTXO recount at boot: it would block ~hours re-scanning the
+     * whole LSM just to display u->n, which nothing in catch-up/serving reads.
+     * Lookups still load; the correct count is regained on the next flush.
+     * Stays set for the whole process (the forked download worker inherits it). */
+    { extern volatile unsigned char g_utxo_defer_recount;
+      g_utxo_defer_recount = 1; }
     { extern int serve_txdv_preinit(void);
       phase_timer_t txdv_pt; phase_start(&txdv_pt);
       int ok = serve_txdv_preinit();

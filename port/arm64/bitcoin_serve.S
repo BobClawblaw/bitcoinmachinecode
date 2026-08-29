@@ -201,6 +201,11 @@ cn_notfnd:.ascii "notfound\0"
 serve_txdv_preinit:
 	stp  x29, x30, [sp, #-16]!
 	mov  x29, sp
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
+	stp  x23, x24, [sp, #-16]!
+	stp  x25, x26, [sp, #-16]!
+	stp  x27, x28, [sp, #-16]!
 	LOADADDR x9, tx_dv_initdone
 	ldrb w9, [x9]
 	cmp  w9, #1
@@ -219,6 +224,11 @@ serve_txdv_preinit:
 .pre_done:
 	LOADADDR x9, tx_dv_ok
 	ldrb w0, [x9]
+	ldp  x27, x28, [sp], #16
+	ldp  x25, x26, [sp], #16
+	ldp  x23, x24, [sp], #16
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
 	ldp  x29, x30, [sp], #16
 	ret
 	.size serve_txdv_preinit, .-serve_txdv_preinit
