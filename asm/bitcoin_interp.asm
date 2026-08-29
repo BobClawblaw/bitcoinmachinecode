@@ -3190,3 +3190,10 @@ cms_scstrip0: resb 10008
 cms_scstrip1: resb 10008
 cms_needle: resb 600
 
+
+; SECURITY (audit 2026-08-29 finding 9): without this note the linker
+; conservatively marks the whole program's stack EXECUTABLE (PT_GNU_STACK
+; RWE). Nothing here needs a runnable stack; a single object missing the
+; note is enough to turn it on for the entire binary, which is why every
+; .asm file carries it.
+section .note.GNU-stack noalloc noexec nowrite progbits
