@@ -401,3 +401,9 @@ regtest-e2e/
 # deploy snapshots: ~31MB binaries, one per deploy, kept on the host as the
 # rollback path. They are build products, not source.
 asm/daemon/bitcoind.deploy-*
+
+# The live node config: it carries rpcuser/rpcpassword and, on a real node,
+# the operator's own addresses. config/bitcoin.sample.conf is the tracked
+# one and documents every key at its default. (2026-08-29)
+bitcoin.conf
+config/bitcoin.conf

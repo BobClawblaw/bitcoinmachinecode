@@ -86,6 +86,18 @@ typedef struct {
     int  proxyrandomize;         /* -proxyrandomize (default 1): per-connection SOCKS5 credentials */
     char onlynet[6][8];          /* -onlynet (repeatable); empty list = all networks */
     int  n_onlynet;
+    /* Core -dns: may hostnames be looked up with the system resolver? With
+     * a proxy configured, a local DNS lookup tells the resolver (and anyone
+     * on the path to it) exactly which peers this node is about to talk to,
+     * which is the leak running behind Tor is meant to close. Core routes
+     * names through the proxy instead; so do we. Default 1. */
+    int  dns;
+    /* Core -discover: learn our own address from peers / interfaces and
+     * announce it. Behind Tor this is the switch that stops the node
+     * telling the network its clearnet address. Default 1. */
+    int  discover;
+    char externalip[80];         /* Core -externalip: announce THIS instead   */
+    int  onion_only_announce;    /* derived: onlynet excludes clearnet        */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */

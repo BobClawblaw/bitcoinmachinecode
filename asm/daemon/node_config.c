@@ -73,6 +73,8 @@ node_config_t g_cfg = {
      * 2026-08-28 -- which left stream isolation OFF for exactly the
      * operator who configured nothing but a proxy. */
     .proxyrandomize        = 1,
+    .dns                   = 1,      /* Core -dns default: on                */
+    .discover              = 1,      /* Core -discover default: on           */
     .i2pacceptincoming     = 1,      /* Core -i2pacceptincoming default: on  */
     .listenonion           = 1,      /* Core -listenonion default: on        */
     .connect_only          = 0,
@@ -98,6 +100,8 @@ static void set_defaults(void){
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
     g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
+    g_cfg.dns                   = 1;
+    g_cfg.discover              = 1;
     g_cfg.i2pacceptincoming     = 1;
     g_cfg.listenonion           = 1;
     g_cfg.utxo_bulk_slots_log2  = 22;
@@ -375,6 +379,12 @@ long node_config_load(const char* path){
             g_cfg.i2pacceptincoming = iv?1:0; applied++; }
         else if(!strcmp(key,"cjdnsreachable")){
             g_cfg.cjdnsreachable = iv?1:0; applied++; }
+        else if(!strcmp(key,"dns")){          /* Core -dns                  */
+            g_cfg.dns = iv?1:0; applied++; }
+        else if(!strcmp(key,"discover")){     /* Core -discover             */
+            g_cfg.discover = iv?1:0; applied++; }
+        else if(!strcmp(key,"externalip")){   /* Core -externalip           */
+            snprintf(g_cfg.externalip,sizeof g_cfg.externalip,"%s",val); applied++; }
         else if(!strcmp(key,"proxyrandomize")){
             g_cfg.proxyrandomize = iv?1:0; applied++; }
         else if(!strcmp(key,"onlynet")){      /* Core -onlynet, repeatable  */

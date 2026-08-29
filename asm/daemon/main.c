@@ -484,6 +484,10 @@ static long outbound_catchup(long max_blocks){
         fprintf(stderr,"[catchup] dnsseed=0 -- skipping seed-based boot catch-up\n");
         return 0;
     }
+    if(dialer_dns_blocked()){
+        fprintf(stderr,"[catchup] a proxy is configured (or dns=0) -- not resolving seed names\n");
+        return 0;
+    }
     for(size_t s=0; s<nsrcs; s++){
         const char* host=srcs[s];
         struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
@@ -1132,6 +1136,23 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
                  strstr(host,".onion") ? "onion" : "i2p");
         return -1;
     }
+    /* With a proxy configured, hand the NAME to the proxy (SOCKS5 ATYP
+     * DOMAINNAME) instead of resolving it here: a local lookup would tell
+     * the resolver exactly which peers this node is about to contact, which
+     * is precisely the correlation a proxy exists to prevent. Core does the
+     * same with its name_proxy. */
+    if(dialer_dns_blocked()){
+        const char* why = "";
+        int nfd = dialer_connect_name(host, out_port, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
+        if(nfd < 0){ snprintf(g_dial_fail,sizeof g_dial_fail,"name via proxy: %.60s", why); return -1; }
+        struct timeval tv; tv.tv_sec=30; tv.tv_usec=0; setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        if(node_handshake(nfd)!=1 || !peer_has_witness(host)){ close(nfd); snprintf(g_dial_fail,sizeof g_dial_fail,"handshake failed (via proxy)"); return -1; }
+        { extern void addrself_note_peer_view(const unsigned char*, long);
+          addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
+        struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
+        setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
+        return nfd;
+    }
     char hbare[128]; snprintf(hbare, sizeof hbare, "%s", host);
     { bmc_addr_t v4;
       if (bmc_addr_from_string_port(&v4, host, (unsigned short)out_port) && v4.net == BMC_NET_IPV4){
@@ -1550,6 +1571,8 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
  * speaks dotted-quad, so config entries are resolved at the boundary rather
  * than each consumer having to cope with hostnames. Returns 1 on success. */
 static int dl_resolve1(const char* host, char out[64]){
+    /* never resolve behind a proxy: the caller dials the NAME instead */
+    if(dialer_dns_blocked()) return 0;
     struct addrinfo h,*res=0; memset(&h,0,sizeof h);
     h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(host,NULL,&h,&res)!=0 || !res) return 0;
@@ -1596,6 +1619,14 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
 
     if(!g_cfg.dnsseed){
         fprintf(stderr,"[boot] dnsseed=0 -- not querying the DNS seeds\n");
+        return total;
+    }
+    if(dialer_dns_blocked()){
+        /* the seeds are DNS names; querying them behind a proxy would leak
+         * "this host runs a Bitcoin node" to the resolver even though every
+         * later connection is proxied */
+        fprintf(stderr,"[boot] not querying the DNS seeds: a proxy is configured (or dns=0) -- "
+                       "use addnode=/connect= or a seeded peers2.dat\n");
         return total;
     }
     for(int i=0;i<pool_len && i<12;i++){
@@ -2892,7 +2923,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     }
 
     { extern void addrself_init(unsigned short, int);
-      addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
+      /* -discover=0, or an -onlynet that names only anonymity networks,
+       * means this node must not learn or announce its clearnet address at
+       * all: that address is exactly what running behind Tor hides. */
+      int may = g_cfg.listen && dialer_may_announce_clearnet();
+      addrself_init((unsigned short)g_cfg.port, may);
+      if (g_cfg.listen && !may)
+          fprintf(stderr,"[addrself] not announcing our address: %s\n",
+                  g_cfg.discover ? "onlynet excludes clearnet" : "discover=0"); }
     /* transports for the non-IPv4 networks (SOCKS5 to tor, SAM to i2pd).
      * Cheap and silent when nothing is configured. */
     dialer_init();
@@ -3123,6 +3161,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                  * resolver: a DNS lookup for a .onion deanonymises both ends.
                  * Those are dialled through their transport, not here. */
                 if(strstr(srcpool[i],".onion") || strstr(srcpool[i],".i2p")){ cfd[nc++]=-1; continue; }
+                /* behind a proxy this name must not be resolved here; the
+                 * sequential path dials it through the proxy instead */
+                if(dialer_dns_blocked()){ cfd[nc++]=-1; continue; }
                 if(getaddrinfo(srcpool[i],NULL,&h,&res)!=0){ cfd[nc++]=-1; continue; }
                 ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr; freeaddrinfo(res);
             }

@@ -20,6 +20,18 @@ int  dialer_init(void);
 /* is this network reachable at all (transport configured AND allowed by
  * -onlynet)? Core's IsReachable + g_reachable_nets. */
 int  dialer_net_reachable(int net);
+/* 1 when a hostname must NOT be resolved locally: a proxy is configured (so
+ * the proxy resolves it and the lookup never leaves as plaintext DNS), or
+ * -dns=0, or -onlynet excludes every clearnet network. A DNS lookup tells
+ * the resolver exactly which peers this node is about to contact, which is
+ * the correlation running behind Tor exists to prevent. */
+int  dialer_dns_blocked(void);
+/* connect to a NAME through the configured proxy (SOCKS5 ATYP DOMAINNAME:
+ * the proxy resolves it). -1 if no proxy is configured. */
+int  dialer_connect_name(const char* host, int port, int timeout_ms, const char** why);
+/* 1 when this node may announce its own clearnet address at all
+ * (-discover, and not onlynet-restricted to anonymity networks) */
+int  dialer_may_announce_clearnet(void);
 /* connect to `a`; returns a connected fd or -1 with *why (never NULL). */
 int  dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why);
 /* our own I2P address once a SAM session exists ("" if none) */
