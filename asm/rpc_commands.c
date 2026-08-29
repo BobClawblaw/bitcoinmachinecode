@@ -650,14 +650,37 @@ static long crt_addr_to_spk(const char* addr, unsigned char* spk){
  * parses the same BTC amount strings, and a second parser that rounded
  * differently would send a different number of satoshis than the caller
  * asked for. */
+/* Core's MAX_MONEY: 21,000,000 BTC in satoshis. Nothing above this can ever
+ * be a valid amount, so it is the natural place to stop parsing. */
+#define CRT_MAX_MONEY 2100000000000000LL
+#define CRT_MAX_WHOLE 21000000LL
+
+/* Parse a decimal BTC amount into satoshis; -1 on anything invalid.
+ *
+ * SECURITY (audit 2026-08-29 finding 5a): `whole` used to accumulate without
+ * a bound, so ~19 digits of unauthenticated JSON-RPC input overflowed a
+ * signed long long -- undefined behaviour, and in practice a wrap to a
+ * negative or arbitrary value. Callers then saw an amount that had passed
+ * "parsing" and only sometimes tripped a `<= 0` check afterwards.
+ *
+ * The bound is applied DURING accumulation, not after: checking the result
+ * cannot detect a wrap that has already happened. Core does the same thing in
+ * ParseFixedPoint, and rejects rather than saturates -- an amount that is not
+ * representable is a malformed request, not a request for the maximum. */
 static long long crt_amount_to_sat(const char* s){
     long long whole=0, frac=0; int fdig=0, seen=0;
     const char* p=s; if (*p=='-') return -1;
-    while (*p>='0'&&*p<='9'){ whole=whole*10+(*p-'0'); p++; seen=1; }
+    while (*p>='0'&&*p<='9'){
+        if (whole > CRT_MAX_WHOLE) return -1;      /* refuse before it wraps */
+        whole=whole*10+(*p-'0'); p++; seen=1;
+    }
     if (*p=='.'){ p++; while (*p>='0'&&*p<='9'){ if (fdig>=8) return -1; frac=frac*10+(*p-'0'); fdig++; p++; seen=1; } }
     if (*p || !seen) return -1;
     while (fdig<8){ frac*=10; fdig++; }
-    return whole*100000000LL + frac;
+    if (whole > CRT_MAX_WHOLE) return -1;
+    { long long sat = whole*100000000LL + frac;
+      if (sat > CRT_MAX_MONEY) return -1;          /* 21000000.00000001 etc */
+      return sat; }
 }
 
 long long rpc_amount_to_sat(const char* s){ return crt_amount_to_sat(s); }
