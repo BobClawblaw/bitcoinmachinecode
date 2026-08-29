@@ -259,7 +259,16 @@ int main(void){
         }
         big[o++]=60;                                            /* nout */
         for (int i = 0; i < 60; i++){
-            memset(big+o, 0x01, 8); o += 8;                     /* value */
+            /* 1000 sat. This used to be memset(0x01, 8) as filler, which is
+             * 0x0101010101010101 sat -- about 723 MILLION BTC per output, 60
+             * times over. That was always an invalid amount; nothing checked
+             * it until the consensus money-range check landed (Core's
+             * bad-txns-vout-toolarge), and then this tx started failing at
+             * the parse stage. The test is about the structural nin/nout cap,
+             * not about amounts, so the filler is now a legal value and the
+             * reject still comes from resolve, as intended. */
+            big[o++]=0xe8; big[o++]=0x03;
+            memset(big+o, 0, 6); o += 6;                        /* value = 1000 sat LE */
             big[o++]=25;                                        /* spk len (P2PKH size) */
             memset(big+o, 0x51, 25); o += 25;                   /* filler script */
         }
