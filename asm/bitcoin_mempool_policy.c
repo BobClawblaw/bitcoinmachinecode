@@ -164,6 +164,10 @@ typedef struct {
     uint64_t incremental_fee;  /* incrementalrelayfee, sat/kvB */
     uint64_t dust_relay_kvb;   /* -dustrelayfee, sat/kvB (Core default 3000) */
     uint64_t datacarrier_bytes;/* -datacarriersize budget (Core v31: 100000) */
+    unsigned permit_bare_multisig;/* -permitbaremultisig (Core default: 1).
+                                  * getmempoolinfo REPORTED this as always-1
+                                  * while nothing could set it -- advertising
+                                  * a policy the operator cannot change. */
 } mpol_cfg;
 
 /* ---------------- policy state layout (flat buffer, zero-init) ------------ */
@@ -243,6 +247,7 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->incremental_fee = relay_fee_rate * 1000;   /* sat/kvB */
     pol->dust_relay_kvb  = 3000;                    /* Core DUST_RELAY_TX_FEE */
     pol->datacarrier_bytes = 100000;                /* Core v31 default */
+    pol->permit_bare_multisig = 1;                  /* Core DEFAULT_PERMIT_BAREMULTISIG */
 }
 
 void mpool_policy_set_incremental(void* polv, unsigned long long satvb){
@@ -254,6 +259,12 @@ void mpool_policy_set_dust(void* polv, unsigned long long satkvb){
 }
 void mpool_policy_set_datacarrier(void* polv, unsigned long long bytes){
     ((mpol_cfg*)polv)->datacarrier_bytes = bytes;
+}
+void mpool_policy_set_baremultisig(void* polv, unsigned v){
+    ((mpol_cfg*)polv)->permit_bare_multisig = v ? 1u : 0u;
+}
+unsigned mpool_policy_get_baremultisig(const void* polv){
+    return ((const mpol_cfg*)polv)->permit_bare_multisig;
 }
 void mpool_policy_set_acceptnonstd(void* polv, unsigned v){
     ((mpol_cfg*)polv)->accept_nonstd = v ? 1u : 0u;
@@ -480,6 +491,10 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
           uint64_t sl = rd_varint(&p, end, &ok); if (!ok) return "malformed";
           int t = classify_spk(p, (unsigned long)sl);
           if (t == SPK_NONSTD) return "scriptpubkey";
+          /* -permitbaremultisig=0: Core stops relaying bare multisig outputs
+           * (they are unprunable UTXO bloat). The type stays STANDARD, so the
+           * rejection is its own reason rather than "scriptpubkey". */
+          if (t == SPK_MULTISIG && !pol->permit_bare_multisig) return "bare-multisig";
           if (t == SPK_NULLDATA){
               datacarrier_used += sl;
               if (datacarrier_used > pol->datacarrier_bytes) return "datacarrier";
