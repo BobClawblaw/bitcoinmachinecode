@@ -5,6 +5,7 @@
  * rpc_dispatch() so the server can never diverge from the client.
  */
 #include "rpc_server.h"
+#include "crypto_hkdf.h"   /* hmac_sha256, shared with BIP324 */
 #include "rpc_net.h"
 #include "rpc_json.h"
 
@@ -116,29 +117,9 @@ static const char* find_header(const char* headers, size_t hlen,
 static struct { char user[64]; char salt[64]; char hash[65]; } g_rpcauth[RPC_MAX_AUTH];
 static int g_n_rpcauth;
 
-/* HMAC-SHA256 over `msg` keyed by `key`. Built on sha256_full because that is
- * the verified primitive this project already has; the block size is 64. */
-extern void sha256_full(unsigned char out[32], const void* msg, long long len);
-static void hmac_sha256(unsigned char out[32], const unsigned char* key, size_t keylen,
-                        const unsigned char* msg, size_t msglen){
-    unsigned char k[64]; memset(k, 0, sizeof k);
-    if (keylen > 64) sha256_full(k, key, (long long)keylen);
-    else             memcpy(k, key, keylen);
-    unsigned char ipad[64], opad[64];
-    for (int i = 0; i < 64; i++){ ipad[i] = (unsigned char)(k[i] ^ 0x36); opad[i] = (unsigned char)(k[i] ^ 0x5c); }
-    /* inner: H(ipad || msg) */
-    unsigned char* inner = malloc(64 + msglen ? 64 + msglen : 64);
-    if (!inner){ memset(out, 0, 32); return; }
-    memcpy(inner, ipad, 64);
-    if (msglen) memcpy(inner + 64, msg, msglen);
-    unsigned char ih[32];
-    sha256_full(ih, inner, (long long)(64 + msglen));
-    free(inner);
-    /* outer: H(opad || inner) */
-    unsigned char outer[64 + 32];
-    memcpy(outer, opad, 64); memcpy(outer + 64, ih, 32);
-    sha256_full(out, outer, 96);
-}
+/* HMAC-SHA256 now lives in crypto_hkdf.c: BIP324's handshake needs the same
+ * primitive, and two copies of a keyed hash is the shape that ends with one
+ * of them quietly diverging. */
 
 /* Register one -rpcauth value. 1 on success, 0 if malformed (which is
  * REPORTED by the caller, never silently dropped -- an operator who mistypes
