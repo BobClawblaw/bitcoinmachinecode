@@ -116,6 +116,14 @@ typedef struct {
                                       * network on, or dead until setnetworkactive        */
     int  forcednsseed;               /* -forcednsseed: query the seeds even with peers    */
     char pidfile[256];               /* -pid: write our pid here (empty = none)           */
+    /* Core -*notify hooks. Empty = not configured. "%s" is replaced by the
+     * event's value (block hash, txid, message), sanitised -- see notify.c. */
+    char blocknotify[512];
+    char alertnotify[512];
+    char startupnotify[512];
+    char shutdownnotify[512];
+    char walletnotify[512];
+    long maxtxfee_sat;               /* -maxtxfee, satoshis (0 = no cap)                  */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
@@ -203,5 +211,9 @@ int nodecfg_hex32_be(const char* s, unsigned char out[32]);
 
 /* -conf=<path>: overrides the datadir search in node_config_path(). */
 void node_config_set_conf_path(const char* path);
+
+/* 1 when `key` is a Bitcoin Core option this node does not implement. Used to
+ * warn instead of silently accepting it. */
+int nodecfg_unimplemented(const char* key);
 
 #endif
