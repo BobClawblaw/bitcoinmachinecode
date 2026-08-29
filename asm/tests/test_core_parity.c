@@ -235,7 +235,12 @@ int main(void){
     { extern int nodecfg_unimplemented(const char*);
       ck("whitelist is flagged (it sits in the live conf doing nothing)",
          nodecfg_unimplemented("whitelist") == 1);
-      ck("asmap is flagged",          nodecfg_unimplemented("asmap") == 1);
+      /* asmap WAS on that list until it was implemented. Now it must not be:
+       * the list and the implementation have to move together, or the node
+       * starts telling operators a working option does nothing. This
+       * assertion is what makes them move together. */
+      ck("asmap is NOT flagged -- it is implemented now",
+         nodecfg_unimplemented("asmap") == 0);
       ck("uacomment is flagged",      nodecfg_unimplemented("uacomment") == 1);
       ck("an IMPLEMENTED option is not flagged", nodecfg_unimplemented("bantime") == 0);
       ck("  nor is minimumchainwork", nodecfg_unimplemented("minimumchainwork") == 0);

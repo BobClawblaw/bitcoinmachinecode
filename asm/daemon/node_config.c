@@ -125,7 +125,7 @@ int nodecfg_hex32_be(const char* str, unsigned char out[32]){
  * stops -- and so the list itself is a readable statement of the gap. */
 static const char* const k_unimplemented[] = {
     "whitelist","whitebind","whitelistrelay","whitelistforcerelay",
-    "asmap","v2transport","txreconciliation","natpmp","upnp",
+    "v2transport","txreconciliation","natpmp","upnp",
     "peerbloomfilters","peerblockfilters","maxsendbuffer",
     "rpcauth","rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
@@ -177,6 +177,7 @@ static void set_defaults(void){
     g_cfg.shutdownnotify[0]     = 0;
     g_cfg.walletnotify[0]       = 0;
     g_cfg.maxtxfee_sat          = 0;
+    g_cfg.asmap[0]              = 0;
     g_cfg.rpccookiefile[0]      = 0;
     memset(g_cfg.minchainwork, 0, 32);
     g_cfg.have_minchainwork     = 0;
@@ -473,6 +474,8 @@ long node_config_load(const char* path){
             g_cfg.forcednsseed = iv?1:0; applied++; }
         else if(!strcmp(key,"pid")){
             snprintf(g_cfg.pidfile,sizeof g_cfg.pidfile,"%s",val); applied++; }
+        else if(!strcmp(key,"asmap")){
+            snprintf(g_cfg.asmap,sizeof g_cfg.asmap,"%s",val); applied++; }
         else if(!strcmp(key,"blocknotify")){
             snprintf(g_cfg.blocknotify,sizeof g_cfg.blocknotify,"%s",val); applied++; }
         else if(!strcmp(key,"alertnotify")){
