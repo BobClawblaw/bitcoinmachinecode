@@ -1722,10 +1722,12 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         total += got;
     }
 
-    if(!g_cfg.dnsseed){
+    if(!g_cfg.dnsseed && !g_cfg.forcednsseed){
         fprintf(stderr,"[boot] dnsseed=0 -- not querying the DNS seeds\n");
         return total;
     }
+    if(g_cfg.forcednsseed && !g_cfg.dnsseed)
+        fprintf(stderr,"[boot] forcednsseed=1 overrides dnsseed=0 -- querying the seeds anyway\n");
     if(dialer_dns_blocked()){
         /* the seeds are DNS names; querying them behind a proxy would leak
          * "this host runs a Bitcoin node" to the resolver even though every
@@ -4383,6 +4385,15 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* -rpccookiefile, else <datadir>/.cookie -- Core's default auth method.
      * The daemon has already chdir'd into the (per-chain) datadir, so the
      * bare relative name lands in the right place on every chain. */
+    /* -pid: Core writes bitcoind.pid so an init script can find the process.
+     * Written after the RPC port is bound, i.e. once the node is actually
+     * up, so the file's existence means something. */
+    if (g_cfg.pidfile[0]){
+        FILE* pf = fopen(g_cfg.pidfile, "w");
+        if (pf){ fprintf(pf, "%d\n", (int)getpid()); fclose(pf);
+                 fprintf(stderr,"[boot] pid %d written to %s\n", (int)getpid(), g_cfg.pidfile); }
+        else     fprintf(stderr,"[boot] could not write -pid=%s: %s\n", g_cfg.pidfile, strerror(errno));
+    }
     if (g_cfg.rpccookie){
         const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
         if (rpc_cookie_write(cpath))
@@ -4458,8 +4469,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
             }
-            /* a dead node must not leave a usable credential on disk */
+            /* a dead node must not leave a usable credential on disk, nor a
+             * pidfile pointing at a pid that is about to be reused */
             rpc_cookie_remove();
+            if(g_cfg.pidfile[0]) unlink(g_cfg.pidfile);
             _exit(0);
         }
         int pr=poll(pfds, nfds, 300);
@@ -5209,7 +5222,12 @@ int main(int argc, char** argv){
                 * memory, and net_active == 0 means "networking disabled" --
                 * leaving it at the zero default would gate every dial and
                 * silently produce a node that never connects. */
-               g_node_status->net_active = 1; }
+               /* -networkactive=0 starts the node with networking OFF, the
+                * same state setnetworkactive false produces at runtime. */
+               g_node_status->net_active = g_cfg.networkactive ? 1 : 0;
+               g_node_status->permit_bare_multisig = g_cfg.permitbaremultisig ? 1 : 0;
+               if(!g_cfg.networkactive)
+                   fprintf(stderr,"[config] net  : networkactive=0 -- starting with networking DISABLED\n"); }
 
         /* Hand the ZMQ notification ring the shared block BEFORE the fork, so
          * the download worker AND every inbound serve child inherit the same

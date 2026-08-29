@@ -174,6 +174,23 @@ int main(void){
       const char* p = node_config_path("/some/datadir", buf, sizeof buf);
       ck("cleared, the datadir search resumes", strstr(p, "/some/datadir") != NULL); }
 
+    printf("== 6. batch two: keys wired to real behaviour ==\n");
+    { const char* tmp = "test_parity2.conf";
+      FILE* f = fopen(tmp, "w");
+      fputs("permitbaremultisig=0\n"
+            "networkactive=0\n"
+            "forcednsseed=1\n"
+            "pid=/tmp/bmc_test.pid\n", f);
+      fclose(f);
+      node_config_load(tmp);
+      ck("permitbaremultisig=0 applied", g_cfg.permitbaremultisig == 0);
+      ck("networkactive=0 applied",      g_cfg.networkactive == 0);
+      ck("forcednsseed=1 applied",       g_cfg.forcednsseed == 1);
+      ck("pid path applied",             !strcmp(g_cfg.pidfile, "/tmp/bmc_test.pid"));
+      unlink(tmp); }
+
+    /* the rejection itself is asserted in tests/test_mempool_policy, where the
+     * mempool stack this policy object needs is already linked. */
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;

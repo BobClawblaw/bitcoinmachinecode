@@ -513,6 +513,7 @@ int tx_policy_init(void){
       extern void mpool_policy_set_dust(void*, unsigned long long);
       extern void mpool_policy_set_datacarrier(void*, unsigned long long);
       extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+      extern void mpool_policy_set_baremultisig(void*, unsigned);
       if (g_cfg.incrementalrelayfee_satvb > 0)
           mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb);
       if (g_cfg.dustrelayfee_satkvb > 0)
@@ -522,7 +523,10 @@ int tx_policy_init(void){
        * enough to be honest, stated here). */
       mpool_policy_set_datacarrier(g_pol, g_cfg.datacarrier
           ? (unsigned long long)g_cfg.datacarriersize : 0ULL);
-      if (g_cfg.acceptnonstdtxn) mpool_policy_set_acceptnonstd(g_pol, 1); }
+      if (g_cfg.acceptnonstdtxn) mpool_policy_set_acceptnonstd(g_pol, 1);
+      /* -permitbaremultisig: getmempoolinfo has always REPORTED this as 1
+       * while nothing could change it. It is a real gate now. */
+      mpool_policy_set_baremultisig(g_pol, g_cfg.permitbaremultisig ? 1u : 0u); }
     if (mp_ext_polstate){
         /* shared, already mpool_policy_state_init'd once pre-fork -- adopting
          * it (NOT re-initing) is what keeps fee bookkeeping coherent across

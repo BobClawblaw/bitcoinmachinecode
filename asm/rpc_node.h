@@ -144,6 +144,11 @@ typedef struct {
      * READ on every dial attempt, not just when it changes. */
     volatile int                net_active;
 
+    /* -permitbaremultisig, published here for the same reason net_active is:
+     * getmempoolinfo runs in a process that does not link node_config, and it
+     * reported a hardcoded 1 while nothing could change the policy. */
+    volatile int                permit_bare_multisig;
+
     /* ==== ban list ====
      * Lives in shared memory rather than behind the channel because BOTH
      * sides need it: the parent serves listbanned straight out of it, and
