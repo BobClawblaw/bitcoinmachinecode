@@ -94,6 +94,9 @@ extern long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32]
  * Consensus block validation is daemon/tx_verify.c with its own bounds. */
 #define MV_MAX_IN  2048
 #define MV_MAX_OUT 4096
+/* Consensus money cap: 21,000,000 BTC in satoshis (Core's MAX_MONEY). The
+ * exact value is consensus-critical -- see consensus/amount.h. */
+#define MV_MAX_MONEY 2100000000000000ULL
 typedef struct {
     uint8_t outpoint[36];
     uint8_t scriptSig[1650]; uint32_t scriptSiglen; /* MAX_STANDARD_SCRIPTSIG (Core policy).
@@ -173,7 +176,33 @@ static int mv_parse(mv_tx_t* T){
     for (uint64_t i=0;i<nout;i++){
         if (p + 8 > end) return 0;
         uint64_t v = 0; for(int k=0;k<8;k++) v |= (uint64_t)p[k]<<(8*k); p += 8;
+        /* CONSENSUS: the money range, CVE-2010-5139. Core's CheckTransaction
+         * rejects a per-output value outside [0, MAX_MONEY] and then rejects
+         * the RUNNING TOTAL leaving the range, in that order:
+         *
+         *     if (txout.nValue < 0)         -> bad-txns-vout-negative
+         *     if (txout.nValue > MAX_MONEY) -> bad-txns-vout-toolarge
+         *     nValueOut += txout.nValue;
+         *     if (!MoneyRange(nValueOut))   -> bad-txns-txouttotal-toolarge
+         *
+         * Core's amounts are signed int64, ours are u64 read straight off the
+         * wire, so "negative" and "above MAX_MONEY" collapse into the single
+         * unsigned comparison below -- a Core-negative value is >= 2^63 here,
+         * which is far above MAX_MONEY.
+         *
+         * Both halves are needed. Per-output alone lets many outputs sum past
+         * the cap; the running total alone lets one output be absurd. And the
+         * total must be checked EVERY iteration, not once at the end: with
+         * both bounds holding after each step out_total stays <= 2*MAX_MONEY,
+         * so the u64 addition cannot wrap -- which is exactly what a
+         * check-at-the-end version would fail to prevent.
+         *
+         * This tightens validation to match Core; it cannot reject anything
+         * already in the chain, because Core enforced it when those blocks
+         * were accepted. */
+        if (v > MV_MAX_MONEY) return 0;
         T->out_total += v;
+        if (T->out_total > MV_MAX_MONEY) return 0;
         uint64_t sl = rd_cs(&p, end, &ok);
         if (!ok || sl > (uint64_t)(end - p)) return 0; p += sl;
     }
