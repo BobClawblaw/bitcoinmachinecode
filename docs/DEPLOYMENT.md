@@ -197,8 +197,8 @@ rather than a rebuild:
 
 ```sh
 cd asm
-make -k test                       # must be green; check MAKE_EXIT, not the
-                                   # wrapper's exit status (see the note below)
+make -k test 2>&1 | tee /tmp/gate.log; echo "MAKE_EXIT=$?" >> /tmp/gate.log
+make gate-log-check LOG=/tmp/gate.log   # the actual gate check -- see below
 sudo systemctl stop bmc-bitcoind   # the binary is busy while it runs;
                                    # "Text file busy" means you skipped this
 cp -a daemon/bitcoind daemon/bitcoind.deploy-$(date +%Y%m%d)a
@@ -227,11 +227,33 @@ The lines worth reading on a fresh boot:
 [rpc] JSON-RPC server on 127.0.0.1:8331
 ```
 
-**A green gate is not the same as a green wrapper.** `make -k test` returning
-non-zero is easy to miss if you wrap it; grep the log for `MAKE_EXIT`, for
-`FAIL`, and — the one that has bitten this project twice — confirm the tests
-you care about actually *ran*, since a test can be built and never invoked.
-`runlist-check` now guards that class, but the habit is still worth keeping.
+**A green gate is not the same as a green wrapper, and "no failures" is not
+the same as "it passed."** Both have burned this project, the second one as
+recently as 2026-08-30:
+
+- The *wrapper* trap: backgrounding or piping `make -k test` gives you the
+  exit status of the last thing in the pipeline, not make's. Always record
+  `MAKE_EXIT` explicitly and read that.
+- The *empty gate* trap, which is nastier. A test failing to LINK stops the
+  `test:` recipe from running at all, because a prerequisite of it failed. The
+  log then contains no `FAIL` lines and no `TESTS FAILED` — for the simple
+  reason that no test ever ran. Grepping for failure words cannot tell that
+  apart from a clean run: **a log with zero failures is exactly what a gate
+  that ran nothing looks like.**
+
+So do not grep. Run:
+
+```sh
+make gate-log-check LOG=/path/to/gate.log
+```
+
+`scripts/gate_log_audit.py` reads the `test:` recipe, and requires that make
+exited 0, that **every** gated test appears in the log as actually executed,
+and that no failure or crash markers appear. It reports which tests never ran
+by name. Its own correctness is gated by `gate-log-selftest`, which is a
+prerequisite of `test:` — it builds synthetic logs with known verdicts,
+including the two that matter most: a gate missing exactly one test at the
+end, and one missing a test from the middle.
 
 ## Operating it
 
