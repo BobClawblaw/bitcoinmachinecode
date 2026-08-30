@@ -437,8 +437,8 @@ tests/test_reorg: $(REORGSRCS) daemon/reorg.h daemon/utxo_walk.h $(REORGOBJS) $(
 # multi-signed P2WPKH tx (see tests/multi_p2wpkh_vec.h / gen_multi_p2wpkh.py).
 TXVPARSRCS := tests/test_tx_verify_parallel.c daemon/tx_verify.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
-tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c $(REORGOBJS) $(TEST_TMPDIR_H) bitcoin_pow_rules.o
-	$(CC) -no-pie -O2 -Wall -o $@ tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
+tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c $(REORGOBJS) $(TEST_TMPDIR_H) bitcoin_pow_rules.o
+	$(CC) -no-pie -O2 -Wall -o $@ tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
 # NB: filter out the real LSM objects -- this test supplies its own adversarial
 # utxo_lsm_get (single reused return buffer) to pin the transient-spk contract.
 TXVBWPSOBJS := $(filter-out bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o,$(REORGOBJS))
@@ -512,7 +512,7 @@ tests/test_tx_verify_parallel: $(TXVPARSRCS) tests/multi_p2wpkh_vec.h $(REORGOBJ
 # test_utxo_checkpoint -- utxo_live_catchup must persist a resumable
 # checkpoint periodically during a long catch-up, not just on a (rare, during
 # bulk mode) compaction or at the very end of the call.
-CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -522,7 +522,7 @@ tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_T
 # test_apply_block_rollback -- a block that fails partway through must roll
 # back everything it already committed (coinbase + any earlier-in-block tx),
 # not just the failing tx -- see rollback_partial_apply in daemon/utxo_live.c daemon/block_witness.c. bitcoin_cmpct.o
-ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -541,7 +541,7 @@ tests/test_blk_dryrun: $(DRYRUNSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPD
 # end of the call, or a stale checkpoint makes an already-durably-applied
 # block get re-verified against UTXO state it already spent -- see the
 # per-block persist_applied_height() call in daemon/utxo_live.c daemon/block_witness.c. bitcoin_cmpct.o
-CRASHRESUMESRCS := tests/test_utxo_catchup_crash_resume.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+CRASHRESUMESRCS := tests/test_utxo_catchup_crash_resume.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -552,7 +552,7 @@ tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(RE
 # without checkpoints) must heal on resume; re-applying a ghost must not
 # destroy its own repair data (the 2026-08-24 height-963915 production
 # failure, distilled). See utxo_live.c's ghost guard in apply_block_at.
-GHOSTRESUMESRCS := tests/test_utxo_ghost_resume.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+GHOSTRESUMESRCS := tests/test_utxo_ghost_resume.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -569,7 +569,7 @@ tests/test_lsm_count_drift: $(DRIFTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_
 # must stop utxo_live_catchup at the next block boundary, checkpoint
 # persisted, instead of being ignored until systemd's TimeoutStopSec SIGKILLs
 # the worker mid-block (every stop/restart did exactly that until 2026-08-22).
-SHUTDOWNSRCS := tests/test_utxo_catchup_shutdown.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+SHUTDOWNSRCS := tests/test_utxo_catchup_shutdown.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -581,7 +581,7 @@ tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS
 # 2026-08-22) must be rolled back on the next boot from N's undo records and
 # re-applied, never rejected as "already-spent". Three kill points incl. a
 # forced mac_flush inside the block; key-by-key diff vs a never-crashed run.
-CRASHRECSRCS := tests/test_utxo_crash_recovery.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+CRASHRECSRCS := tests/test_utxo_crash_recovery.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -595,7 +595,7 @@ tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS) 
 # (not half-apply), and a many-tx block with a poisoned tx buried mid-list
 # must both genuinely exercise the block-wide worker pool and still report
 # the correct failing tx.
-CROSSTXSRCS := tests/test_cross_tx_verify.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+CROSSTXSRCS := tests/test_cross_tx_verify.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -608,7 +608,7 @@ tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TES
 # realloc() relocate mid-loop must still verify every earlier-resolved
 # input's script correctly, not read corrupted/dangling memory. See the
 # test file's own header comment for full root-cause detail.
-BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
@@ -808,7 +808,7 @@ tests/test_net_policy: tests/test_net_policy.c daemon/net_policy.c bitcoin_net.o
 #   make tests/test_utxo_recover && ./tests/test_utxo_recover <datadir>
 # It still gets a rule so it is built/compiled-checked on demand rather than
 # rotting the way daemon/build_utxo did with no target at all.
-RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c \
+RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c \
     daemon/mempool_cfg.c daemon/reorg.c daemon/minchainwork.c daemon/notify.c daemon/locator_build.c daemon/archive_verify.c \
     daemon/node_config.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c \
@@ -1458,8 +1458,8 @@ tests/bip30_shim: tests/bip30_shim.c $(CONSOBJS) bitcoin_utxo.o
 # reimplementation of BIP30. See the file header and LOG.md incident #30 --
 # tests/bip30_shim above contains the rule itself, so the differential that
 # drove it validated the shim, not bitcoind.
-tests/bip30_daemon_shim: tests/bip30_daemon_shim.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) bitcoin_pow_rules.o
-	$(CC) -no-pie -O2 -Wall -o $@ tests/bip30_daemon_shim.c daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
+tests/bip30_daemon_shim: tests/bip30_daemon_shim.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) bitcoin_pow_rules.o
+	$(CC) -no-pie -O2 -Wall -o $@ tests/bip30_daemon_shim.c daemon/utxo_live.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
 
 # Smoke test for the chain-context BIP30 gate (drives tests/bip30_shim over
 # stdin; full differential vs real Core is validation/bip30_diff.py).
@@ -1474,7 +1474,7 @@ tests/test_bip30: tests/test_bip30.c bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 # defined anywhere in this file, so the rule declared NO sources at all and
 # editing any of them left the binary stale.  Defined here, and used by the
 # recipe too, so the two lists cannot drift apart again.
-REORGSRCS_NOMAIN := daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
+REORGSRCS_NOMAIN := daemon/utxo_live.c daemon/block_witness.c $(SIGNETSRCS) daemon/chainparams.c daemon/undo_log.c \
     daemon/node_config.c daemon/tx_verify.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
