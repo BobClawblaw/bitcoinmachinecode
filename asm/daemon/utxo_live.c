@@ -207,6 +207,10 @@ struct lsm_state {
  * utxo_live_init. 256 MB is ~5x the biggest tail steady-state operation can
  * produce and ~1/7th of the one that wedged a restart on 2026-08-23. */
 #define UTXO_LIVE_BULK_WAL_BYTES (256ULL<<20)
+/* Force bulk sizing when this many persisted runs need consolidating -- a big
+ * pending pre-catchup compaction overruns the small steady-state bloom buffers
+ * (utxo_lsm_compact strb crash), and bulk costs address space, not resident RAM. */
+#define UTXO_LIVE_BULK_MANIFEST_MIN 8L
 
 static void* g_utxo_table = 0;
 struct lsm_state g_utxo_lst;
@@ -1570,6 +1574,32 @@ int utxo_live_init(const char* dir){
             fprintf(stderr, "[utxo_live] WAL tail is %lluMB -- bulk-sizing the memtable despite gap=%ld (see incident #32)\n",
                     (unsigned long long)(wb.st_size >> 20), boot_gap);
             g_bulk_mode = 1;
+        }
+    }
+    /* ...and ALSO bulk when there are many PERSISTED RUNS to consolidate. The
+     * pre-catchup compaction merges every run, and compact's bloom/descriptor
+     * buffers are sized from the slot capacity -- with the small steady-state
+     * memtable, a big pending consolidation (e.g. the 200+ runs a build_utxo
+     * heal leaves behind) overruns them (utxo_lsm_compact strb segfault). Bulk
+     * sizing costs address space, not resident memory, so over-selecting is
+     * cheap (same rationale as the WAL-tail rule above). */
+    {
+        struct stat mb;
+        if (!g_bulk_mode && stat("utxo_manifest.dat", &mb) == 0){
+            int mfd = open("utxo_manifest.dat", O_RDONLY);
+            if (mfd >= 0){
+                unsigned char hdr[12];
+                if (read(mfd, hdr, 12) == 12){
+                    unsigned long mn = 0;   /* manifest_n at hdr+4 (8B LE), both v1/v2 */
+                    memcpy(&mn, hdr + 4, 8);
+                    if (mn >= UTXO_LIVE_BULK_MANIFEST_MIN){
+                        g_bulk_mode = 1;
+                        fprintf(stderr, "[utxo_live] %lu persisted run(s) to consolidate -- bulk-sizing for the pre-catchup compact (gap=%ld)\n",
+                                mn, boot_gap);
+                    }
+                }
+                close(mfd);
+            }
         }
     }
     txv_set_bulk_mode(g_bulk_mode);
