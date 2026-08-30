@@ -5231,6 +5231,19 @@ int main(int argc, char** argv){
      * operates on the cwd, so the chdir into the per-chain dir isolates all
      * of it at once. Must run before mempool_configure/store_init (their
      * files land in the per-chain dir) and before any socket (net_magic). */
+    /* A custom signet challenge must be set BEFORE selection: it determines
+     * the network magic, so selecting first would briefly install the public
+     * signet's magic and then change it under whatever had already read it. */
+    if(g_cfg.signetchallenge[0]){
+        if(!chainparams_set_signet_challenge(g_cfg.signetchallenge)){
+            fprintf(stderr, "[chain] FATAL: signetchallenge is not valid hex "
+                            "(or is empty/too long); refusing to start\n");
+            return 1;
+        }
+        if(strcmp(g_cfg.chain, "signet") != 0)
+            fprintf(stderr, "[chain] warning: signetchallenge is set but "
+                            "chain=%s -- it will be ignored\n", g_cfg.chain);
+    }
     if(!chainparams_select(g_cfg.chain)) return 1;
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
       wallet_set_chain(g_chainp->bech32_hrp, g_chainp->p2pkh_version, g_chainp->p2sh_version); }

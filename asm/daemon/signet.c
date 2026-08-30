@@ -13,17 +13,19 @@
  * tag and a 32-byte hash. */
 #define MIN_WITNESS_COMMITMENT 38
 
+int signet_is_commitment_spk(const unsigned char* s, unsigned long len){
+    return s && len >= MIN_WITNESS_COMMITMENT &&
+           s[0] == 0x6a /* OP_RETURN */ && s[1] == 0x24 &&
+           s[2] == 0xaa && s[3] == 0x21 && s[4] == 0xa9 && s[5] == 0xed;
+}
+
 int signet_commitment_index(const unsigned char* const* spks,
                             const unsigned long* spk_lens, long nout){
     int idx = -1;
     if (!spks || !spk_lens) return -1;
-    for (long o = 0; o < nout; o++){
-        const unsigned char* s = spks[o];
-        if (!s || spk_lens[o] < MIN_WITNESS_COMMITMENT) continue;
-        if (s[0] == 0x6a /* OP_RETURN */ && s[1] == 0x24 &&
-            s[2] == 0xaa && s[3] == 0x21 && s[4] == 0xa9 && s[5] == 0xed)
+    for (long o = 0; o < nout; o++)
+        if (signet_is_commitment_spk(spks[o], spk_lens[o]))
             idx = (int)o;      /* deliberately no break: the LAST one wins */
-    }
     return idx;
 }
 

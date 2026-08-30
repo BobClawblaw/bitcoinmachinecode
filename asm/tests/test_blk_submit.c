@@ -7,6 +7,19 @@
  * the tip -> duplicate; short buffer -> Block decode failed. */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
+/* blk_submit now runs the BIP325 check, which links the script verifier, and
+ * bitcoin_txval_modern.c wants this symbol. Nothing here reaches it: the
+ * signet path hands the interpreter a synthetic output directly and resolves
+ * no UTXO, and on a non-signet chain the check returns before doing anything.
+ * Aborting makes that a checked claim rather than a comment. */
+long mempool_resolve_confirmed_utxo(void* u, const unsigned char t[32],
+                                    unsigned long i, unsigned long long* v,
+                                    const unsigned char** sp, unsigned long* sl){
+    (void)u;(void)t;(void)i;(void)v;(void)sp;(void)sl;
+    fprintf(stderr, "unexpected mempool_resolve_confirmed_utxo\n"); abort();
+}
 extern long blk_submit_evaluate(const unsigned char*, unsigned long,
                                 const unsigned char*, long, char*, unsigned long);
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
