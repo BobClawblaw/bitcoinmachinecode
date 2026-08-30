@@ -2785,6 +2785,7 @@ utxo_lsm_compact:
 	bl   mac_write_exact
 	cbnz x0, .cc_err_close
 	str  xzr, [x28, #0x38]           /* true_nrec = 0 */
+	str  xzr, [x28, #0x230]          /* live = 0 (PUSH winners only) */
 	/* ================= streaming k-way merge ================= */
 .cc_merge_loop:
 	mov  x9, #-1
@@ -2885,6 +2886,15 @@ utxo_lsm_compact:
 	bl   mac_write_exact
 	cbnz x0, .cc_err_close
 .cc_wr_bloom:
+	/* live counter: count PUSH winners only (DEL records, type==1 at +76, are
+	 * tombstones and must NOT inflate total_live for the merged run) */
+	ldrb w9, [x27, #76]
+	cmp  w9, #1
+	b.eq .cc_wr_live_del
+	ldr  x9, [x28, #0x230]
+	add  x9, x9, #1
+	str  x9, [x28, #0x230]           /* live++ (live PUSH winner) */
+.cc_wr_live_del:
 	/* set 3 bloom bits */
 	mov  x0, x27
 	add  x0, x0, #40                 /* key ptr */
@@ -3088,8 +3098,8 @@ utxo_lsm_compact:
 	ldr  x10, [x28, #0x00]
 	cmp  x9, x10
 	b.ne .cc_pl_partial
-	/* full merge: persist_count = true_nrec */
-	ldr  x9, [x28, #0x38]
+	/* full merge: persist_count = live (PUSH winners), not raw nrec */
+	ldr  x9, [x28, #0x230]
 	str  x9, [x28, #0x218]            /* persist_count */
 	mov  x9, #1
 	str  x9, [x28, #0x220]            /* write_v2 = 1 */
@@ -3098,7 +3108,7 @@ utxo_lsm_compact:
 	ldr  x9, [x19, #88]
 	ldr  x10, [x28, #0x210]           /* P_old */
 	sub  x9, x9, x10
-	ldr  x10, [x28, #0x38]
+	ldr  x10, [x28, #0x230]           /* live */
 	add  x9, x9, x10
 	str  x9, [x19, #88]
 	b    .cc_pl_have
