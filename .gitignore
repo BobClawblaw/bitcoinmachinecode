@@ -407,3 +407,4 @@ asm/daemon/bitcoind.deploy-*
 # one and documents every key at its default. (2026-08-29)
 bitcoin.conf
 config/bitcoin.conf
+asm/.link-audit-cache/
