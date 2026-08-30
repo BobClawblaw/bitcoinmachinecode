@@ -59,7 +59,10 @@ import concurrent.futures, hashlib, json, os, re, subprocess, sys
 #      it as an array bound compiles one way and not the other
 #      (tests/test_taproot_bounds_fuzz.c).
 #   3. with the SIMD ISAs this tree uses: an intrinsics file cannot compile
-#      without the ISA enabled (tests/sha256_shani.c needs -msha).
+#      without the ISA enabled. The file that motivated this (a superseded
+#      SHA-NI prototype) has since been deleted, but the set is kept: the
+#      alternative is that the next intrinsics file added is silently skipped,
+#      and a skipped file's symbols are unknown.
 _INC = ['-I.', '-I', 'daemon', '-I', 'tests']
 CFLAG_SETS = [
     ['-D_GNU_SOURCE', '-O0'] + _INC,
