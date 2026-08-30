@@ -146,6 +146,12 @@ is Core's default and was already implemented and enabled.
 Git history rewrite: **declined by the operator**, correctly — the secret is
 already public, so rotation is what mattered.
 
+*Added in the addendum:* Core does not merely tolerate the absence of
+`rpcuser`/`rpcpassword` — it **prefers** it. `InitRPCAuthentication()` generates
+a cookie when `-rpcpassword` is empty, and when it is set it emits a
+`LogWarning` calling plaintext credentials "less secure" and recommending
+cookie or `rpcauth`. Removing them put this node on Core's default path.
+
 **Verified after deploy:** RPC answers over cookie auth; the removed password
 no longer authenticates.
 
@@ -499,7 +505,8 @@ this round to be worth stating.
 3. **Systemd hardening** — declined this round; `LimitCORE=0` is worth
    revisiting given Incident 1.
 4. **Parser recursion-depth counter** — defence in depth, not started.
-5. **Incident 3 fix** — committed, effect not yet observed in production.
+5. ~~**Incident 3 fix** — committed, effect not yet observed in production.~~
+   **Closed 2026-08-30 01:00 UTC** — observed live; see the addendum.
 6. **Test wiring survey** — 5 targets are built as prerequisites but never run,
    7 `test_*.c` files have no Makefile rule, 9 have a rule but sit outside the
    gate. Recorded, not triaged; each needs a judgement about whether it is
