@@ -182,6 +182,10 @@ typedef struct {
     int  checklevel;             /* Core -checklevel: 0..4 (def 3)           */
     long stopatheight;           /* Core -stopatheight: stop at this height,
                                   * 0 = run forever (def 0)                  */
+    /* ---- mempool persistence (Core -persistmempool) ---- */
+    int  persistmempool;         /* save mempool.dat at shutdown and reload it
+                                  * at boot (def 1, as in Core)             */
+
     /* ---- wallet passphrase source (audit finding 2) ---- */
     char walletpassfile[256];    /* absolute path, OUTSIDE the datadir, to a
                                   * root-owned 0640 file holding the wallet
