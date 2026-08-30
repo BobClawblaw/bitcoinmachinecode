@@ -31,15 +31,26 @@ One binary, `asm/daemon/bitcoind`, running as a fork-model daemon:
 - a forked **download worker** that owns the outbound peer legs, block
   download/keep-up, UTXO application, and the reorg machinery;
 - shared state bridged across the fork boundary by `MAP_SHARED` regions
-  allocated before it: the live-status/RPC-submission block, and (since
-  2026-08-25) the mempool and its fee-policy registry, mutated under a
-  `PTHREAD_PROCESS_SHARED` lock.
+  allocated before it: the live-status/RPC-submission block, the mempool and
+  its fee-policy registry (mutated under a `PTHREAD_PROCESS_SHARED` lock),
+  and (since 2026-08-30) the peer misbehaviour scores — those must be shared,
+  because the serve loop that detects violations runs in a forked child and a
+  process-local table could never accumulate across connections;
+- a **ZMQ servicing thread** in the download worker, when a publisher is
+  configured, so subscriber accepts and subscription frames never run on the
+  block-download path.
 
 Everything lives in one datadir: the block archive (`blk*.dat` + positional
 `index.dat`), `headers.dat`, `chainwork.dat`, the LSM UTXO store
 (`utxo.dat` WAL, `utxo_run_*.dat`, `utxo_manifest.dat`,
-`utxo_applied_height.dat`), `peers.dat`, and optionally a wallet store
-(`bmcwallet.dat` + `.txlog` journal).
+`utxo_applied_height.dat`), `peers.dat`/`peers2.dat`, and optionally a wallet
+store — either `bmcwallet.enc` (the encrypted container: 100k-iteration KDF,
+AES-256-CBC, key separation) or the older plaintext/`BMCWAL v2` store, plus a
+`.txlog` journal.
+
+The wallet **passphrase does not live in the datadir**. See `walletpassfile`
+under *Configure*: a datadir backup should never carry the key to the wallet
+it also contains.
 
 ## Prerequisites
 
@@ -79,11 +90,26 @@ listen=1                 # accept inbound peers (fork-per-connection)
 port=8332                # P2P listen/dial port; chain default if omitted
                          # (8333 main, 18444 regtest — see node_config.c)
 
-# RPC (HTTP Basic; no cookie support)
+# RPC. The COOKIE is the default credential: <datadir>/.cookie is written
+# 0600 at start, deleted on shutdown, and bitcoin-cli finds it on its own.
+# Do NOT set rpcuser/rpcpassword unless you need a fixed credential -- they
+# put a plaintext secret on disk, Core warns against them, and this project
+# removed its own after the password reached a public repository.
+# For a fixed credential use rpcauth= (salted HMAC), never rpcpassword.
 rpcport=8331             # MUST NOT collide with the P2P port (was 8332;
                          # fixed 2026-08-26, commit 6469c2f)
-rpcuser=CHOOSE_A_USER
-rpcpassword=CHOOSE_A_LONG_RANDOM_PASSWORD
+
+# BIP324 v2 encrypted transport (default 1). Accepts inbound v2 and dials v2
+# to peers advertising NODE_P2P_V2; v1 peers are detected in band and are
+# unaffected. Set 0 for v1 only.
+v2transport=1
+
+# Wallet passphrase, if the wallet is encrypted. Absolute path, OUTSIDE the
+# datadir -- a file beside the wallet travels in every backup of it. Refused
+# if world-accessible, group-writable, or inside the datadir. Intended shape:
+#   sudo install -d -m 0755 /etc/bmc
+#   sudo install -o root -g <service-group> -m 0640 secret /etc/bmc/wallet.pass
+#walletpassfile=/etc/bmc/wallet.pass
 
 # Mempool (0 = built-in 2 MiB static; >0 mmaps a shared, locked pool)
 maxmempool=300
@@ -163,6 +189,49 @@ from-genesis UTXO build with full script verification. Expect **days**, and
 expect it to be CPU-bound on signature verification for most of them. The
 `[dl] heartbeat:` log line is the pulse: tip height, live peers, live UTXO
 count, uptime.
+
+## Deploying a new build
+
+The convention is a dated snapshot per deploy, so a rollback is a file copy
+rather than a rebuild:
+
+```sh
+cd asm
+make -k test                       # must be green; check MAKE_EXIT, not the
+                                   # wrapper's exit status (see the note below)
+sudo systemctl stop bmc-bitcoind   # the binary is busy while it runs;
+                                   # "Text file busy" means you skipped this
+cp -a daemon/bitcoind daemon/bitcoind.deploy-$(date +%Y%m%d)a
+sudo systemctl start bmc-bitcoind
+```
+
+Roll back by copying the previous `bitcoind.deploy-*` snapshot over
+`daemon/bitcoind` and restarting.
+
+**Verify the restart rather than assuming it.** Boot takes a couple of minutes
+(archive reload, UTXO load) before the RPC answers. Check, in order:
+
+```sh
+systemctl is-active bmc-bitcoind
+grep -aE "BIP324|\[rpc\]|encrypted wallet" logs/bitcoind.production.log | tail
+ss -ltn | grep -E ":833|:2833"     # P2P, RPC, and any ZMQ endpoints
+bitcoin-cli -datadir=... getblockcount
+```
+
+The lines worth reading on a fresh boot:
+
+```
+[net] BIP324 v2 transport enabled (services=0x809); N of M known peers advertise v2
+[rpc] no rpcuser/rpcpassword -- using cookie authentication
+[rpc] encrypted wallet adopted and unlocked from the configured passphrase source
+[rpc] JSON-RPC server on 127.0.0.1:8331
+```
+
+**A green gate is not the same as a green wrapper.** `make -k test` returning
+non-zero is easy to miss if you wrap it; grep the log for `MAKE_EXIT`, for
+`FAIL`, and — the one that has bitten this project twice — confirm the tests
+you care about actually *ran*, since a test can be built and never invoked.
+`runlist-check` now guards that class, but the habit is still worth keeping.
 
 ## Operating it
 
