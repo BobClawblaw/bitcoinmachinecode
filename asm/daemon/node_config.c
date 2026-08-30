@@ -180,6 +180,7 @@ static void set_defaults(void){
     g_cfg.persistmempool        = 1;
     g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
+    g_cfg.signetchallenge[0]    = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
     g_cfg.pidfile[0]            = 0;
@@ -488,6 +489,8 @@ long node_config_load(const char* path){
             g_cfg.persistmempool = iv?1:0; applied++; }
         else if(!strcmp(key,"reindex-chainstate")){
             g_cfg.reindex_chainstate = iv?1:0; applied++; }
+        else if(!strcmp(key,"signetchallenge")){  /* Core: -signetchallenge */
+            snprintf(g_cfg.signetchallenge, sizeof g_cfg.signetchallenge, "%s", val); applied++; }
         else if(!strcmp(key,"walletpassfile")){
             snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
         else if(!strcmp(key,"networkactive")){

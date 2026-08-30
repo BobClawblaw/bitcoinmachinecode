@@ -32,6 +32,7 @@ extern unsigned long long script_flags_for_block(unsigned long long height, cons
 /* NULLDUMMY bit index in the flag schedule == segwit activation gate; the
  * same constant daemon/utxo_live.c uses (block_witness.h documents it). */
 #include "block_witness.h"
+#include "signet_block.h"
 
 /* (ptr,len) span per tx -- the prefix block_check_witness_commitment reads. */
 typedef struct { const u8* ptr; u64 len; } bsub_tx_t;
@@ -142,7 +143,18 @@ long blk_submit_evaluate_ex(const u8* blk, unsigned long len,
       static u8 wscratch[BSUB_MAX_TX * 32 * 2];
       if (block_check_witness_commitment(txs, ntx, sizeof(bsub_tx_t), segwit_active,
                                          wscratch, sizeof wscratch, &wreason) != 1){
-          RSN("bad-witness-merkle-match"); return 0; } }
+          RSN("bad-witness-merkle-match"); return 0; }
+
+      /* BIP325, gated on check_pow exactly as Core gates it on fCheckPOW
+       * (validation.cpp:3947). That half of the gate is not decoration: BIP23
+       * proposal mode passes fCheckPOW=0, and a proposal has no signature
+       * yet, so demanding one would reject every legitimate template
+       * proposal. A no-op on every chain but signet. */
+      if (check_pow){
+          const char* sreason = "?";
+          if (signet_check_block_chain(txs, ntx, sizeof(bsub_tx_t), blk, &sreason) != 1){
+              RSN(sreason); return 0; }
+      } }
 
     /* linkage: only a tip-extending block is evaluable in this slice */
     if (tip_hash && memcmp(blk + 4, tip_hash, 32) != 0){ RSN("inconclusive"); return 0; }
