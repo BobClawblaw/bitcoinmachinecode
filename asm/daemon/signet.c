@@ -118,3 +118,212 @@ int signet_extract_solution(const unsigned char* spk, unsigned long spk_len,
     if (!found && out_stripped && spk_len <= cap) memcpy(out_stripped, spk, spk_len);
     return found;
 }
+
+/* ======================================================================
+ * Layer 2 -- the BIP325 synthetic transactions.
+ * ====================================================================== */
+
+/* The consensus merkle and hash primitives, not private copies. Using a
+ * second implementation here would mean the thing under test is not the
+ * thing that runs. merkle_root reduces IN PLACE (bitcoin_hash.asm). */
+extern void merkle_root(unsigned char out[32], unsigned char* hashes,
+                        unsigned long n);
+extern void sha256_full(unsigned char out[32], const unsigned char* msg,
+                        long long len);
+
+void signet_txid(unsigned char out32[32], const unsigned char* tx,
+                 unsigned long txlen){
+    unsigned char h[32];
+    sha256_full(h, tx, (long long)txlen);
+    sha256_full(out32, h, 32);
+}
+
+void signet_merkle_root(unsigned char out32[32], unsigned char* leaves,
+                        unsigned long nleaves){
+    merkle_root(out32, leaves, nleaves);
+}
+
+/* ---- CompactSize. Local on purpose: this file links standalone (its test
+ * pulls in only the merkle and sha256 objects), and the readers elsewhere in
+ * the tree are all static to their own translation units. ---- */
+
+static int cs_size(unsigned long n){
+    if (n < 0xfdUL)       return 1;
+    if (n <= 0xffffUL)    return 3;
+    if (n <= 0xffffffffUL) return 5;
+    return 9;
+}
+
+static unsigned long put_cs(unsigned char* d, unsigned long n){
+    if (n < 0xfdUL){ d[0] = (unsigned char)n; return 1; }
+    if (n <= 0xffffUL){ d[0] = 0xfd; d[1] = (unsigned char)n;
+                        d[2] = (unsigned char)(n >> 8); return 3; }
+    if (n <= 0xffffffffUL){ d[0] = 0xfe;
+        for (int i = 0; i < 4; i++) d[1+i] = (unsigned char)(n >> (8*i));
+        return 5; }
+    d[0] = 0xff;
+    for (int i = 0; i < 8; i++) d[1+i] = (unsigned char)(n >> (8*i));
+    return 9;
+}
+
+/* Canonical CompactSize read. `*ok` goes 0 on truncation OR on a value spelled
+ * in more bytes than it needs -- Core's ReadCompactSize throws
+ * "non-canonical ReadCompactSize()" for exactly that, and a length prefix with
+ * several spellings is an ambiguity to refuse, not to normalise. */
+static unsigned long read_cs(const unsigned char** p, const unsigned char* end,
+                             int* ok){
+    const unsigned char* b = *p;
+    if (b >= end){ *ok = 0; return 0; }
+    unsigned char f = *b++;
+    if (f < 0xfd){ *p = b; return f; }
+    int extra = (f == 0xfd) ? 2 : (f == 0xfe ? 4 : 8);
+    if (end - b < extra){ *ok = 0; return 0; }
+    unsigned long v = 0, min;
+    for (int i = 0; i < extra; i++) v |= (unsigned long)b[i] << (8*i);
+    b += extra;
+    min = (f == 0xfd) ? 0xfdUL : (f == 0xfe ? 0x10000UL : 0x100000000UL);
+    if (v < min){ *ok = 0; return 0; }
+    *p = b;
+    return v;
+}
+
+static unsigned long w32le(unsigned char* d, unsigned int v){
+    for (int i = 0; i < 4; i++) d[i] = (unsigned char)(v >> (8*i));
+    return 4;
+}
+static unsigned long w64le(unsigned char* d, unsigned long long v){
+    for (int i = 0; i < 8; i++) d[i] = (unsigned char)(v >> (8*i));
+    return 8;
+}
+
+int signet_parse_solution(const unsigned char* sol, unsigned long sol_len,
+                          signet_solution_t* out){
+    if (!out) return -1;
+    out->script_sig = 0; out->script_sig_len = 0; out->nwit = 0;
+    if (!sol && sol_len) return -1;
+
+    const unsigned char* p = sol;
+    const unsigned char* end = sol + sol_len;
+    int ok = 1;
+
+    unsigned long ssl = read_cs(&p, end, &ok);
+    if (!ok || (unsigned long)(end - p) < ssl) return -1;
+    out->script_sig = p; out->script_sig_len = ssl;
+    p += ssl;
+
+    unsigned long n = read_cs(&p, end, &ok);
+    if (!ok) return -1;
+    if (n > SIGNET_MAX_WIT) return -1;
+    for (unsigned long i = 0; i < n; i++){
+        unsigned long l = read_cs(&p, end, &ok);
+        if (!ok || (unsigned long)(end - p) < l) return -1;
+        out->wit[i] = p; out->witlen[i] = l;
+        p += l;
+    }
+    out->nwit = n;
+
+    /* Core: `if (!v.empty()) return std::nullopt;` -- leftover bytes are a
+     * hard parse failure. Tolerating them would accept blocks Core rejects. */
+    if (p != end) return -1;
+    return 0;
+}
+
+/* block_data is always exactly 72 bytes (4 + 32 + 32 + 4), which is below
+ * OP_PUSHDATA1 (76), so CScript::operator<< always emits the one-byte direct
+ * push. Spelled as a constant with the reasoning rather than a general
+ * minimal-push routine whose other branches could never be reached or
+ * tested. */
+#define SIGNET_BLOCK_DATA_LEN 72
+
+long signet_build_to_spend(unsigned char* out, unsigned long cap,
+                           int nversion, const unsigned char prev32[32],
+                           const unsigned char signet_merkle32[32],
+                           unsigned int ntime,
+                           const unsigned char* challenge,
+                           unsigned long challenge_len){
+    if (!out || !prev32 || !signet_merkle32 || (!challenge && challenge_len))
+        return -1;
+    /* scriptSig = OP_0 <72 bytes> */
+    const unsigned long ssl = 1 + 1 + SIGNET_BLOCK_DATA_LEN;
+    unsigned long need = 4                          /* version */
+                       + 1                          /* vin count */
+                       + 36                         /* null outpoint */
+                       + cs_size(ssl) + ssl
+                       + 4                          /* sequence */
+                       + 1                          /* vout count */
+                       + 8                          /* value */
+                       + cs_size(challenge_len) + challenge_len
+                       + 4;                         /* locktime */
+    if (cap < need) return -1;
+
+    unsigned char* d = out;
+    d += w32le(d, 0);                               /* version 0 */
+    *d++ = 0x01;
+    for (int i = 0; i < 32; i++) *d++ = 0x00;       /* null prevout hash */
+    d += w32le(d, 0xffffffffu);                     /* COutPoint::NULL_INDEX */
+    d += put_cs(d, ssl);
+    *d++ = 0x00;                                    /* OP_0 */
+    *d++ = (unsigned char)SIGNET_BLOCK_DATA_LEN;    /* direct push of 72 */
+    d += w32le(d, (unsigned int)nversion);
+    for (int i = 0; i < 32; i++) *d++ = prev32[i];
+    for (int i = 0; i < 32; i++) *d++ = signet_merkle32[i];
+    d += w32le(d, ntime);
+    d += w32le(d, 0);                               /* sequence 0 */
+    *d++ = 0x01;
+    d += w64le(d, 0);                               /* value 0 */
+    d += put_cs(d, challenge_len);
+    for (unsigned long i = 0; i < challenge_len; i++) *d++ = challenge[i];
+    d += w32le(d, 0);                               /* locktime 0 */
+    return (long)(d - out);
+}
+
+long signet_build_to_sign(unsigned char* out, unsigned long cap,
+                          const unsigned char to_spend_txid32[32],
+                          const signet_solution_t* sol){
+    if (!out || !to_spend_txid32 || !sol) return -1;
+    if (sol->nwit > SIGNET_MAX_WIT) return -1;
+
+    /* CTransaction::Serialize writes the witness marker/flag iff HasWitness(),
+     * so an empty stack yields a plain legacy serialisation -- which is what
+     * the trivial-challenge (OP_TRUE, no solution) case produces. */
+    const int use_wit = sol->nwit > 0;
+    unsigned long wbytes = 0;
+    if (use_wit){
+        wbytes = cs_size(sol->nwit);
+        for (unsigned long i = 0; i < sol->nwit; i++)
+            wbytes += cs_size(sol->witlen[i]) + sol->witlen[i];
+    }
+    unsigned long need = 4
+                       + (use_wit ? 2u : 0u)
+                       + 1 + 36
+                       + cs_size(sol->script_sig_len) + sol->script_sig_len
+                       + 4
+                       + 1 + 8 + 1 + 1          /* one output: 0 / OP_RETURN */
+                       + wbytes
+                       + 4;
+    if (cap < need) return -1;
+
+    unsigned char* d = out;
+    d += w32le(d, 0);
+    if (use_wit){ *d++ = 0x00; *d++ = 0x01; }
+    *d++ = 0x01;
+    for (int i = 0; i < 32; i++) *d++ = to_spend_txid32[i];
+    d += w32le(d, 0);                               /* to_spend output 0 */
+    d += put_cs(d, sol->script_sig_len);
+    for (unsigned long i = 0; i < sol->script_sig_len; i++)
+        *d++ = sol->script_sig[i];
+    d += w32le(d, 0);                               /* sequence 0 */
+    *d++ = 0x01;
+    d += w64le(d, 0);
+    *d++ = 0x01; *d++ = 0x6a;                       /* scriptPubKey OP_RETURN */
+    if (use_wit){
+        d += put_cs(d, sol->nwit);
+        for (unsigned long i = 0; i < sol->nwit; i++){
+            d += put_cs(d, sol->witlen[i]);
+            for (unsigned long j = 0; j < sol->witlen[i]; j++)
+                *d++ = sol->wit[i][j];
+        }
+    }
+    d += w32le(d, 0);                               /* locktime 0 */
+    return (long)(d - out);
+}
