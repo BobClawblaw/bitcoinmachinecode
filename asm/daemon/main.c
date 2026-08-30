@@ -1459,6 +1459,27 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         return -1;
     }
     fprintf(stderr,"[dial] %s connected over %s\n", host, v2res);
+    /* Record what this peer ACTUALLY offers.
+     *
+     * Until now every address this node added itself was stored with a
+     * hardcoded services=1 (NODE_NETWORK), and only gossiped addresses
+     * carried real bits. That made outbound v2 inert in practice: the peers
+     * we dial are the ones we have connected to before, so they all read as
+     * services=1, peer_advertises_v2 said no every time, and the node
+     * happily reported "8341 of 14825 known peers advertise v2" while
+     * dialling v1 to every single one of them.
+     *
+     * The version message has just told us the truth, so store it. From the
+     * next dial onwards the v2 gate has something real to read. */
+    { unsigned long long svc = 0;
+      if (g_peer_version_len >= 12) memcpy(&svc, g_peer_version_payload + 4, 8);
+      if (svc){
+          bmc_addr_t pa;
+          if (bmc_addr_from_string_port(&pa, host, (unsigned short)out_port)){
+              ab2_t* b = addr_book();
+              if (b) ab2_add(b, &pa, svc, (unsigned)time(NULL));
+          }
+      } }
     /* the peer's version told us how it sees US -- feed the self-address
      * tally (daemon/addr_self.c) */
     { extern void addrself_note_peer_view(const unsigned char*, long);
