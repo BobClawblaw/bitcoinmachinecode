@@ -113,11 +113,39 @@ children** and asserts
 - 16 concurrent children leave the peer in **exactly one slot** with all 80
   points landed — the property the lock exists for.
 
-**Still open:** only one violation type is wired (oversized message
-announcement). The audit named others — duplicate-inv spam, malformed
-addr/tx/block, handshake failures. Those are now worth wiring, because the
-scores they produce will finally add up; before this change, adding callers
-would have multiplied something that did not work.
+**Closed 2026-08-30.** A second violation type is now wired, and choosing
+which was decided by reading Core's 22 `Misbehaving()` sites rather than by
+following the audit's list. Core scores **structural** violations — oversized
+inv/getdata/headers, invalid proof of work, non-continuous headers, mutated
+blocks. It does **not** score duplicate-inv spam or handshake failures, both of
+which the audit suggested; scoring those risks banning honest peers with
+quirky implementations, so they were deliberately left alone.
+
+The one Core site that applies here — oversized `inv`/`getdata` — turned out to
+sit on top of a parsing bug. The handler read the entry count as a **single
+byte** and walked `count * 36` bytes without consulting the payload length:
+
+1. any vector above 252 entries uses a multi-byte varint, which Core sends
+   routinely, so `0xfd` was read as the count and every entry was offset by
+   two — a silent misparse of **ordinary traffic**, not hostile input;
+2. a short message with a large count byte walked past what the peer sent into
+   whatever the previous, larger message left in the 8 MB receive buffer,
+   letting a peer steer `getdata` at hashes assembled from earlier traffic.
+   Not memory-unsafe — the buffer dwarfs 255×36 — but peer-influenced nonsense.
+
+`serve_inv_bounds` (C, called from the assembly) now parses the varint,
+enforces canonical `CompactSize` as Core's `ReadCompactSize` does, bounds the
+vector by the bytes actually received, and rejects above `MAX_INV_SZ` (50,000).
+Exceeding the cap is scored; short or malformed vectors are dropped **without**
+a score, because a truncated read is not necessarily malice.
+
+Two further defects were caught by testing rather than review: the test
+asserted `255` was a single-byte count (`0xff` is the 8-byte varint *marker* —
+single-byte counts stop at `0xfc`), which exposed that canonical encoding was
+unchecked; and the assembly compared `RAX` against `-1` when SysV defines only
+`EAX` for an `int` return, so the violation branch silently never matched. The
+symptom was the test reporting *"dropped it WITHOUT reporting"* — a code path
+that looked wired and was not.
 
 ---
 
@@ -201,8 +229,7 @@ accepted, and prefer a metric that counts the population actually acted upon.
 
 1. **Finding 3** — hand-written consensus assembly. Structural; needs
    continuous oracle differential and property-based fuzzing, not a patch.
-2. **Finding 7, remainder** — further violation types to wire, now that scores
-   accumulate.
+   **This is the only audit finding still open.**
 3. **Systemd hardening** — declined by the operator. `LimitCORE=0` remains
    worth revisiting: Incident 1 was a debugger reading wallet secrets from
    process memory, and a core dump is the same exposure.

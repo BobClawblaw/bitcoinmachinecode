@@ -397,10 +397,10 @@ than trusted:
 | surface | state |
 | --- | --- |
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
-| **Config options** | **~74 / 163 (45%)** — `v2transport` closed 08-29. Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
+| **Config options** | **~75 / 163 (46%)** — `v2transport` closed 08-29, `walletpassfile` added 08-30 (this node's own, no Core equivalent). Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
-| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE and live on both directions, proven against Bitcoin Core v31.99. Erlay absent.** |
+| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay absent.** |
 
 *Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
 authentication** plus a constant-time credential compare; `bantime` with
@@ -434,6 +434,28 @@ and a half-wired fee policy is worse than an absent option.
 tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
 list this node does not have. All three stay on the warning list.
+
+## Update 2026-08-30 — security audit round
+
+An independent audit (`docs/audits/SECURITY_AUDIT_2026-08-29.md`) found 11
+issues; 10 are resolved. Several were gaps this document had not listed,
+because they were absent *checks* rather than absent features:
+
+- **no consensus `MAX_MONEY` check anywhere** — output values were summed as
+  raw `u64` off the wire with no per-output or running bound (CVE-2010-5139
+  shape). Now matching Core, verified against 1,172 real mainnet transactions.
+- **no P2P message-size limit** — the framer acted on the announced length
+  unbounded, so `0xFFFFFFFF` ground a serve child through ~4 GB of reads.
+- **inbound `inv`/`getdata` counts read as a single byte**, silently
+  misparsing any vector above 252 entries — routine traffic from Core.
+- **unbounded JSON parser recursion**, reachable from any RPC body and
+  demonstrated as a stack-exhaustion crash.
+- **executable stack** (24 of 63 `.asm` files lacked `.note.GNU-stack`).
+- **misbehaviour scoring had zero call sites**, and its table could not have
+  accumulated across connections even with one.
+
+The remaining finding is structural — hand-written consensus assembly with a
+documented false-ACCEPT history — and is not closeable by a patch.
 
 *Remaining, in the order worth doing it:* signet; `reindex` and
 `persistmempool`; `whitelist`/`whitebind` peer permissions; the RPC surface
