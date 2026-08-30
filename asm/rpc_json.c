@@ -59,8 +59,10 @@ void rj_obj_set(rj_val* o, const char* key, rj_val* v) {
     o->members[o->nmembers].val = v;
     o->nmembers++;
 }
-/* Deep copy; see rpc_json.h. Recursion depth is bounded by the parser's own
- * nesting limit, so a hostile request cannot drive this past it. */
+/* Deep copy; see rpc_json.h. Bounded because the tree it walks came from
+ * p_val, which now refuses to build anything deeper than RJ_MAX_DEPTH -- so a
+ * hostile request cannot drive this past that. (This comment previously
+ * asserted the same conclusion from a limit that did not exist.) */
 rj_val* rj_clone(const rj_val* v){
     if (!v) return NULL;
     rj_val* c = NULL;
@@ -262,7 +264,10 @@ void rj_free(rj_val* v) {
 }
 
 /* ---------------- parser ---------------- */
-typedef struct { const char* p; const char* end; int err; } pctx;
+/* MAX_JSON_DEPTH matches UniValue's (univalue_read.cpp), so this parser
+ * accepts and rejects exactly the nesting Core does. */
+#define RJ_MAX_DEPTH 512
+typedef struct { const char* p; const char* end; int err; int depth; } pctx;
 
 static void p_ws(pctx* c) { while (c->p < c->end && (*c->p == ' ' || *c->p == '\t' || *c->p == '\n' || *c->p == '\r')) c->p++; }
 static rj_val* p_val(pctx* c);
@@ -353,11 +358,19 @@ static rj_val* p_val(pctx* c) {
     p_ws(c);
     if (c->p >= c->end) { c->err = 1; return NULL; }
     char ch = *c->p;
+    /* SECURITY: every '[' or '{' recurses into p_val, so nesting depth is
+     * attacker-controlled stack depth. Unbounded, "[[[[..." simply exhausts
+     * the stack and the process dies on SIGSEGV -- confirmed by core dump at
+     * 200,000 levels before this bound existed. The file previously carried a
+     * comment asserting "recursion depth is bounded by the parser's own
+     * nesting limit"; there was no such limit, which is worse than having no
+     * comment. Container depth is counted here, before recursing. */
+    if ((ch == '{' || ch == '[') && ++c->depth > RJ_MAX_DEPTH) { c->err = 1; return NULL; }
     if (ch == '"') return p_string(c);
     if (ch == '{') {
         c->p++; rj_val* o = rj_obj();
         p_ws(c);
-        if (c->p < c->end && *c->p == '}') { c->p++; return o; }
+        if (c->p < c->end && *c->p == '}') { c->p++; c->depth--; return o; }
         while (1) {
             p_ws(c);
             if (c->p >= c->end || *c->p != '"') { c->err = 1; rj_free(o); return NULL; }
@@ -373,14 +386,14 @@ static rj_val* p_val(pctx* c) {
             p_ws(c);
             if (c->p >= c->end) { c->err = 1; rj_free(o); return NULL; }
             if (*c->p == ',') { c->p++; continue; }
-            if (*c->p == '}') { c->p++; return o; }
+            if (*c->p == '}') { c->p++; c->depth--; return o; }
             c->err = 1; rj_free(o); return NULL;
         }
     }
     if (ch == '[') {
         c->p++; rj_val* a = rj_arr();
         p_ws(c);
-        if (c->p < c->end && *c->p == ']') { c->p++; return a; }
+        if (c->p < c->end && *c->p == ']') { c->p++; c->depth--; return a; }
         while (1) {
             rj_val* v = p_val(c);
             if (c->err) { rj_free(a); return NULL; }
@@ -388,7 +401,7 @@ static rj_val* p_val(pctx* c) {
             p_ws(c);
             if (c->p >= c->end) { c->err = 1; rj_free(a); return NULL; }
             if (*c->p == ',') { c->p++; continue; }
-            if (*c->p == ']') { c->p++; return a; }
+            if (*c->p == ']') { c->p++; c->depth--; return a; }
             c->err = 1; rj_free(a); return NULL;
         }
     }
@@ -401,7 +414,7 @@ static rj_val* p_val(pctx* c) {
 }
 
 rj_val* rj_parse(const char* s, size_t len) {
-    pctx c = { s, s + len, 0 };
+    pctx c = { s, s + len, 0, 0 };
     rj_val* v = p_val(&c);
     if (c.err) { if (v) rj_free(v); return NULL; }
     p_ws(&c);
