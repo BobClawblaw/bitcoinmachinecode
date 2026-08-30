@@ -400,7 +400,7 @@ than trusted:
 | **Config options** | **~75 / 163 (46%)** — `v2transport` closed 08-29, `walletpassfile` added 08-30 (this node's own, no Core equivalent). Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
-| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay absent.** |
+| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
 
 *Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
 authentication** plus a constant-time credential compare; `bantime` with
@@ -435,6 +435,41 @@ tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
 list this node does not have. All three stay on the warning list.
 
+## Update 2026-08-30 — Erlay: a deliberate stopping point
+
+BIP330 splits into negotiation (`sendtxrcncl`: version and salt exchange, and
+the rules about who may offer it to whom) and reconciliation proper
+(`reqrecon`/`sketch`/`reqsketchext`/`reconcildiff`, PinSketch set difference).
+
+**The negotiation half is implemented and tested** — `daemon/txrecon.c`, 38
+assertions, with the combined salt checked against an independent Python
+implementation of Core's `TaggedHash("Tx Relay Salting")`. It is not yet
+emitted from the handshake, so nothing appears on the wire.
+
+**The reconciliation half is deliberately NOT built**, and the reason is worth
+recording rather than leaving as an unexplained gap:
+
+> **Bitcoin Core does not implement it either.** `node/txreconciliation.cpp`
+> contains exactly four functions — `PreRegisterPeer`, `RegisterPeer`,
+> `ForgetPeer`, `IsPeerRegistered`. There are no sketches and no reconciliation
+> rounds anywhere in Core, and `net_processing.cpp` states it plainly: *"While
+> Erlay support is incomplete, it must be enabled explicitly via
+> -txreconciliation."*
+
+This project's method is differential testing against a running Core. For the
+reconciliation rounds there is no running implementation anywhere to test
+against — the only reference is `minisketch/tests/pyminisketch.py`, a Python
+model of the sketch library, which can pin the arithmetic but not the protocol
+integration.
+
+Building it would mean shipping set-reconciliation code that relays
+transactions on a live mainnet node, unproven against any peer, to speak a
+protocol no deployed node currently speaks. That is a worse trade than the gap
+it closes, so the gap stays — and stays documented, rather than being quietly
+half-filled.
+
+Revisit when Core's own Erlay progresses.
+
 ## Update 2026-08-30 — security audit round
 
 An independent audit (`docs/audits/SECURITY_AUDIT_2026-08-29.md`) found 11
@@ -460,7 +495,7 @@ documented false-ACCEPT history — and is not closeable by a patch.
 *Remaining, in the order worth doing it:* signet; `reindex` and
 `persistmempool`; `whitelist`/`whitebind` peer permissions; the RPC surface
 (`rpcauth`, `rpcallowip`, `rpcbind`, `server`, `rest`) — lower urgency now
-that cookie auth exists and the listener cannot leave loopback; then Erlay.
+that cookie auth exists and the listener cannot leave loopback.
 
 *A caveat on the headline number.* 45% badly understates the node. It
 implements every public RPC, all five BIP155 networks, package relay, compact

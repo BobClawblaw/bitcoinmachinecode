@@ -89,6 +89,13 @@ The remaining finding is structural and not closeable by a patch: this is
 hand-written consensus assembly with a documented false-ACCEPT history, and no
 amount of internal review retires that. The warning below stands.
 
+**Erlay (BIP330) is deliberately partial.** The negotiation half is
+implemented and tested; the reconciliation rounds are not built, because
+Bitcoin Core does not implement them either — there is no running
+implementation to test against, and this project verifies against Core rather
+than against its own reading of a specification. See
+[`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md).
+
 The daemon (`bmc-bitcoind`) follows the mainnet tip unattended and is verified
 continuously against a local Core node. On top of the byte-identical UTXO set
 and the RPC surface described in the 2026-08-25 note below, the work since then
