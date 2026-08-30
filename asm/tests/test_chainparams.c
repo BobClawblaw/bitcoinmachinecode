@@ -13,7 +13,9 @@
  *      boundary).
  *   5. chainparams_datadir: main = base itself, regtest = base + "/regtest"
  *      (created), so chains can never share state.
- *   6. testnet/signet are refused, unknown names are refused.
+ *   6. legacy testnet3 names are refused, unknown names are refused.
+ *      (signet USED to be refused here; it is supported as of 2026-08-30
+ *      and is covered by its own section below.)
  */
 #include <stdio.h>
 #include <string.h>
@@ -150,8 +152,11 @@ int main(void){
     printf("\n== 6: refusals ==\n");
     ck("legacy testnet3 names refused",
        chainparams_select("test") == 0 && chainparams_select("testnet") == 0);
-    ck("signet refused",   chainparams_select("signet") == 0);
+    /* signet is no longer in this list: it is supported. Selecting it is
+     * tested below; what belongs HERE is that a refused name does not
+     * disturb the chain already in force. */
     ck("garbage refused",  chainparams_select("florin") == 0);
+    ck("a signet-shaped near-miss is refused", chainparams_select("signett") == 0);
     ck("a refused select leaves the previous chain in force", g_chainp->id == CHAIN_MAIN);
 
     printf("== genesis hashes differ per chain (what the datadir guard rests on) ==\n");
@@ -169,6 +174,87 @@ int main(void){
       ck("main and testnet4 genesis differ",  memcmp(mainh, t4h, 32) != 0);
       ck("regtest and testnet4 genesis differ", memcmp(regh, t4h, 32) != 0);
       chainparams_select("main"); }
+
+    printf("== signet (BIP325) ==\n");
+    {
+        ck("select(signet)", chainparams_select("signet") == 1);
+        ck("id is CHAIN_SIGNET", g_chainp->id == CHAIN_SIGNET);
+
+        /* The genesis is DERIVED from mainnet's, so proving it against Core's
+         * asserted hash is the whole safety of that shortcut. chainparams.c
+         * refuses to select signet if this fails, so reaching here means it
+         * held -- but hash it again from the bytes rather than trusting the
+         * stored copy. */
+        unsigned char h[32];
+        sha256d(h, g_chainp->genesis, 80);
+        ck("derived signet genesis hashes to Core's asserted value",
+           memcmp(h, g_chainp->genesis_hash, 32) == 0);
+        /* 00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6,
+         * internal order, straight out of Core's assert(). */
+        static const unsigned char CORE[32] = {
+            0xf6,0x1e,0xee,0x3b,0x63,0xa3,0x80,0xa4,0x77,0xa0,0x63,0xaf,0x32,0xb2,0xbb,0xc9,
+            0x7c,0x9f,0xf9,0xf0,0x1f,0x2c,0x42,0x25,0xe9,0x73,0x98,0x81,0x08,0x00,0x00,0x00 };
+        ck("and it is the hash Core asserts", memcmp(h, CORE, 32) == 0);
+
+        /* The magic is DERIVED from the challenge, not pasted. Core: "the
+         * first 4 bytes of the sha256d of the block script" -- as a
+         * SERIALISED vector, so the CompactSize prefix is in the preimage.
+         * Dropping that prefix yields a plausible magic no peer would send,
+         * which is why this is pinned to the published value. */
+        ck("default signet magic is 0a03cf40 on the wire",
+           g_chainp->magic == 0x40cf030au);
+        ck("and it is what the derivation produces from the challenge",
+           chainparams_signet_magic(g_chainp->signet_challenge,
+                                    g_chainp->signet_challenge_len) == g_chainp->magic);
+        ck("the default challenge is the 71-byte bare CHECKMULTISIG",
+           g_chainp->signet_challenge_len == 71 &&
+           g_chainp->signet_challenge[0] == 0x51 &&
+           g_chainp->signet_challenge[70] == 0xae);
+        ck("signet keeps mainnet's port range clear", g_chainp->default_port == 38333);
+        ck("and Core's minimum chain work for the public signet",
+           g_chainp->min_chain_work_hex[0] != 0);
+
+        /* A CUSTOM signet: different challenge -> different magic, so the two
+         * networks cannot hear each other. That isolation is the point. */
+        unsigned int pub_magic = g_chainp->magic;
+        ck("a custom challenge is accepted", chainparams_set_signet_challenge("51") == 1);
+        ck("re-select(signet)", chainparams_select("signet") == 1);
+        ck("a custom signet gets a DIFFERENT magic", g_chainp->magic != pub_magic);
+        ck("its challenge is the one we set",
+           g_chainp->signet_challenge_len == 1 && g_chainp->signet_challenge[0] == 0x51);
+        ck("a custom signet has no chain-work floor (Core: uint256{})",
+           g_chainp->min_chain_work_hex[0] == 0);
+        ck("and no DNS seeds", g_chainp->n_dns_seed_hosts == 0 && g_chainp->dns_seeds == 0);
+        ck("odd-length hex is refused", chainparams_set_signet_challenge("5") == 0);
+        ck("non-hex is refused", chainparams_set_signet_challenge("zz") == 0);
+        ck("empty is refused", chainparams_set_signet_challenge("") == 0);
+
+        /* And the genesis is the same block regardless of challenge -- Core
+         * builds it from fixed parameters, so only the magic and the rules
+         * change. */
+        ck("the custom signet has the same genesis",
+           memcmp(g_chainp->genesis_hash, CORE, 32) == 0);
+    }
+
+    printf("== selecting signet does not disturb any other chain ==\n");
+    {
+        /* The failure that would matter most: signet leaking into mainnet.
+         * PARAMS_SIGNET is the one mutable params struct, so pin that
+         * selecting it and coming back leaves mainnet byte-identical. */
+        chainparams_select("main");
+        chainparams_t before = *g_chainp;
+        chainparams_select("signet");
+        chainparams_select("main");
+        ck("mainnet params are byte-identical after a signet round trip",
+           memcmp(&before, g_chainp, sizeof before) == 0);
+        ck("mainnet still has no signet challenge", g_chainp->signet_challenge == 0);
+        ck("mainnet magic is untouched", g_chainp->magic == 0xd9b4bef9u);
+        ck("regtest has no signet challenge",
+           chainparams_select("regtest") == 1 && g_chainp->signet_challenge == 0);
+        ck("testnet4 has no signet challenge",
+           chainparams_select("testnet4") == 1 && g_chainp->signet_challenge == 0);
+        chainparams_select("main");
+    }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
