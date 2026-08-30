@@ -15,6 +15,10 @@
  * Byte/last-send counters Core tracks per-socket are not tracked here (the
  * worker has no per-fd meters); getpeerinfo reports them as 0/-1. */
 #define RPC_MAX_PEERS 64
+/* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
+ * daemon/main.c, which asserts the two agree at compile time. */
+#define RPC_MISBEHAVIOR_SLOTS 64
+
 typedef struct {
     volatile int              used;         /* 1 = slot live */
     volatile int              inbound;      /* 0 outbound (all we itemize today) */
@@ -216,6 +220,24 @@ typedef struct {
         unsigned char               txid[32];          /* WIRE order           */
         unsigned char               tx[RPC_ZMQ_TXMAX];
     } zmq_ring[RPC_ZMQ_RING];
+
+    /* ---- peer misbehaviour scores (audit finding 7) ----------------------
+     * These live HERE, in the pre-fork MAP_SHARED block, for the same reason
+     * the zmq ring does: the serve loop that detects protocol violations runs
+     * in a FORKED CHILD, and a process-local table dies with it. Scores kept
+     * per-process meant a peer could misbehave once per connection forever
+     * and never reach the threshold -- the machinery looked like a defence
+     * and could not accumulate.
+     *
+     * `mis_lock` is a cross-process spinlock (0 free, 1 held) taken around
+     * slot lookup and update. Without it two children can allocate two slots
+     * for the same peer and each accumulate half the evidence, which is the
+     * quiet version of the same failure. */
+    volatile int              mis_lock;
+    struct {
+        volatile int          score;
+        char                  ip[64];
+    } misbehavior[RPC_MISBEHAVIOR_SLOTS];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).

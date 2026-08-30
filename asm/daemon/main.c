@@ -930,7 +930,24 @@ int ctl_is_banned(const char* ip){
  * is harmless, while sharing it would need locking on a hot path. */
 #define MISBEHAVIOR_BAN_THRESHOLD 100
 #define MISBEHAVIOR_SLOTS 64
+_Static_assert(MISBEHAVIOR_SLOTS == RPC_MISBEHAVIOR_SLOTS,
+              "the local and shared misbehaviour tables must be the same size");
+/* Fallback table, used only when the shared region is unavailable (test
+ * binaries that link main.c without mmapping a node_status_t, and the
+ * degraded path if the mmap failed at boot). The real one lives in shared
+ * memory -- see node_status_t.misbehavior. */
 static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
+
+/* Cross-process spinlock around the shared table. Held for a handful of
+ * string compares, never across I/O, so spinning is cheaper than any
+ * alternative and cannot deadlock a child against itself. */
+static void mis_lock_acquire(node_status_t* st){
+    while (__sync_lock_test_and_set(&st->mis_lock, 1)) {
+        struct timespec ts = { 0, 1000 * 1000 };   /* 1 ms */
+        nanosleep(&ts, NULL);
+    }
+}
+static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lock); }
 
 /* ---- protocol-violation reporting from the asm serve loop ----------------
  * (audit 2026-08-29 finding 7)
@@ -981,34 +998,52 @@ int ctl_ban_add(const char* subnet, long long until){
  * in which case the caller should drop the connection. */
 int peer_misbehaving(const char* ip, int points, const char* reason){
     if(!ip || !*ip || points <= 0) return 0;
+    /* Score into the SHARED table when we have one, so a peer that misbehaves
+     * once per connection across many forked serve children still adds up.
+     * The process-local array is the fallback for binaries with no shared
+     * region (see its comment). */
+    node_status_t* st = g_node_status;
+    if (st) mis_lock_acquire(st);
     int slot = -1, free_slot = -1;
     for(int i = 0; i < MISBEHAVIOR_SLOTS; i++){
-        if(g_misbehavior[i].ip[0] && !strcmp(g_misbehavior[i].ip, ip)){ slot = i; break; }
-        if(!g_misbehavior[i].ip[0] && free_slot < 0) free_slot = i;
+        const char* sip = st ? (const char*)st->misbehavior[i].ip : g_misbehavior[i].ip;
+        if(sip[0] && !strcmp(sip, ip)){ slot = i; break; }
+        if(!sip[0] && free_slot < 0) free_slot = i;
     }
     if(slot < 0){
         /* table full: forget the lowest scorer rather than ignore this one */
         if(free_slot < 0){
             int lo = 0;
-            for(int i = 1; i < MISBEHAVIOR_SLOTS; i++)
-                if(g_misbehavior[i].score < g_misbehavior[lo].score) lo = i;
+            for(int i = 1; i < MISBEHAVIOR_SLOTS; i++){
+                int a = st ? st->misbehavior[i].score  : g_misbehavior[i].score;
+                int b = st ? st->misbehavior[lo].score : g_misbehavior[lo].score;
+                if(a < b) lo = i;
+            }
             free_slot = lo;
         }
         slot = free_slot;
-        snprintf(g_misbehavior[slot].ip, sizeof g_misbehavior[slot].ip, "%s", ip);
-        g_misbehavior[slot].score = 0;
+        if (st){
+            snprintf((char*)st->misbehavior[slot].ip, sizeof st->misbehavior[slot].ip, "%s", ip);
+            st->misbehavior[slot].score = 0;
+        } else {
+            snprintf(g_misbehavior[slot].ip, sizeof g_misbehavior[slot].ip, "%s", ip);
+            g_misbehavior[slot].score = 0;
+        }
     }
-    g_misbehavior[slot].score += points;
-    int total = g_misbehavior[slot].score;
+    int total;
+    if (st){ st->misbehavior[slot].score += points; total = st->misbehavior[slot].score; }
+    else   { g_misbehavior[slot].score  += points; total = g_misbehavior[slot].score;  }
     if(total < MISBEHAVIOR_BAN_THRESHOLD){
+        if (st) mis_lock_release(st);
         fprintf(stderr,"[ban] %s misbehaving +%d (%d/%d): %s\n",
                 ip, points, total, MISBEHAVIOR_BAN_THRESHOLD, reason ? reason : "?");
         return 0;
     }
     long long until = (long long)time(NULL) + (g_cfg.bantime > 0 ? g_cfg.bantime : 86400);
     char subnet[80]; snprintf(subnet, sizeof subnet, "%s/32", ip);
+    if (st){ st->misbehavior[slot].score = 0; mis_lock_release(st); }  /* banned; start clean */
+    else     g_misbehavior[slot].score = 0;
     ctl_ban_add(subnet, until);
-    g_misbehavior[slot].score = 0;               /* banned; start clean */
     fprintf(stderr,"[ban] %s reached %d points (%s) -- banned for %lds\n",
             ip, total, reason ? reason : "?", g_cfg.bantime > 0 ? g_cfg.bantime : 86400);
     return 1;
