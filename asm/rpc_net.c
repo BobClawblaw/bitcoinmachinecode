@@ -134,6 +134,29 @@ long rpc_http_post(int port, const char* user, const char* pass,
     if (total < 0) { free(resp); if (errmsg && errcap) snprintf(errmsg, errcap, "read error"); return -1; }
     resp[total] = 0;
 
+    /* A reply that is not HTTP at all almost always means the client dialled
+     * a non-HTTP service -- on this node, typically the P2P listener, whose
+     * port sits one below the RPC port in the shipped config. Saying
+     * "malformed HTTP reply" there sends the operator to look at the daemon,
+     * which is fine; the port is the problem. */
+    if (total > 0 && strncmp(resp, "HTTP/", 5) != 0){
+        free(resp);
+        if (errmsg && errcap)
+            snprintf(errmsg, errcap,
+                     "port %d answered but did not speak HTTP -- is that the "
+                     "P2P port rather than the RPC port?", port);
+        return -1;
+    }
+    /* 401 is an authentication failure, not a malformed anything. */
+    if (total > 12 && !strncmp(resp + 9, "401", 3)){
+        free(resp);
+        if (errmsg && errcap)
+            snprintf(errmsg, errcap,
+                     "authentication failed (HTTP 401) on port %d -- wrong "
+                     "rpcuser/rpcpassword, or the cookie was not read", port);
+        return -1;
+    }
+
     /* Split headers/body at \r\n\r\n */
     char* sep = strstr(resp, "\r\n\r\n");
     if (!sep) { free(resp); if (errmsg && errcap) snprintf(errmsg, errcap, "malformed HTTP reply"); return -1; }
