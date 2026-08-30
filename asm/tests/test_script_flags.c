@@ -13,6 +13,8 @@
 #include <stdint.h>
 
 extern uint64_t script_flags_for_block(uint64_t height, const uint8_t hash32[32]);
+extern unsigned int sfc_chain;
+#include "../script_flags_consts.h"
 
 #include "flags_vec.h"
 
@@ -47,6 +49,50 @@ int main(void){
                    (unsigned long long)FV_HEIGHT[k], (unsigned long long)got);
         }
     }
+    /* ---- signet's own arm (sfc_chain = 3) ----------------------------------
+     * REGRESSION. signet was originally left on sfc_chain = 0, the MAINNET
+     * schedule, on the reasoning that mainnet is "already past" every fork.
+     * That reasoning is wrong: the schedule gates on HEIGHT, and signet's
+     * heights are small, so mainnet's arm judged early signet blocks
+     * pre-segwit and the node rejected real block 1 as "unexpected-witness".
+     * A real sync found it; nothing hermetic here did. */
+    {
+        static const uint8_t z[32] = {0};
+        unsigned int save = sfc_chain;
+        /* Bit numbers live in script_flags_consts.inc (nasm only); the C
+         * mirror carries heights, not bits. These four are pinned anyway by
+         * the mainnet vectors above, which would fail if any moved. */
+        const uint64_t SEGWIT = 1ULL << 4;   /* SFC_BIT_NULLDUMMY */
+        const uint64_t CSV    = 1ULL << 10;  /* SFC_BIT_CSV       */
+        const uint64_t CLTV   = 1ULL << 9;   /* SFC_BIT_CLTV      */
+        const uint64_t DERSIG = 1ULL << 2;   /* SFC_BIT_DERSIG    */
+
+        sfc_chain = 3;
+        uint64_t h1 = script_flags_for_block(1, z);
+        int ok1 = (h1 & SEGWIT) && (h1 & CSV) && (h1 & CLTV) && (h1 & DERSIG);
+        printf("%s   signet h=1 has segwit+csv+cltv+dersig       flags=0x%llx\n",
+               ok1 ? "ok  " : "FAIL", (unsigned long long)h1);
+        if (!ok1) fails++;
+
+        /* The bug, stated as a test: mainnet's arm at the same height does
+         * NOT have segwit, which is exactly why reusing it broke signet. */
+        sfc_chain = 0;
+        uint64_t m1 = script_flags_for_block(1, z);
+        int ok2 = !(m1 & SEGWIT);
+        printf("%s   mainnet h=1 does NOT (this is why 0 was wrong)\n",
+               ok2 ? "ok  " : "FAIL");
+        if (!ok2) fails++;
+
+        /* Signet buries everything at height 1, so a real signet height far
+         * up the chain must look the same. */
+        sfc_chain = 3;
+        uint64_t hi = script_flags_for_block(320000, z);
+        int ok3 = (hi == h1);
+        printf("%s   signet h=320000 identical to h=1\n", ok3 ? "ok  " : "FAIL");
+        if (!ok3) fails++;
+        sfc_chain = save;
+    }
+
     printf("\n%s (%u/%u, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED",
            FV_COUNT - fails, FV_COUNT, fails);
     return fails ? 1 : 0;

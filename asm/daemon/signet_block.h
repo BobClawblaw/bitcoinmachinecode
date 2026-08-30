@@ -20,6 +20,7 @@ typedef struct { const uint8_t* ptr; uint64_t len; } signet_txref_t;
 long signet_check_block(const void* txs, unsigned long ntx, unsigned long stride,
                         const unsigned char hdr80[80],
                         const unsigned char* challenge, unsigned long challenge_len,
+                        const unsigned char* genesis_hash32,
                         unsigned char* scratch, unsigned long cap,
                         const char** reason);
 
@@ -30,6 +31,7 @@ long signet_check_block_auto(const void* txs, unsigned long ntx,
                              const unsigned char hdr80[80],
                              const unsigned char* challenge,
                              unsigned long challenge_len,
+                             const unsigned char* genesis_hash32,
                              const char** reason);
 
 /* What block validation calls: the chain gate, in ONE place so the two call
@@ -52,6 +54,6 @@ static inline long signet_check_block_chain(const void* txs, unsigned long ntx,
     return signet_check_block_auto(txs, ntx, stride, hdr80,
                                    g_chainp->signet_challenge,
                                    (unsigned long)g_chainp->signet_challenge_len,
-                                   reason);
+                                   g_chainp->genesis_hash, reason);
 }
 #endif

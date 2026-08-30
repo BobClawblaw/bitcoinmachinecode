@@ -84,6 +84,26 @@ R_SEGWIT = rheight("SegwitHeight")
 print("regtest heights: BIP34=%d BIP66=%d BIP65=%d CSV=%d Segwit=%d"
       % (R_BIP34, R_BIP66, R_BIP65, R_CSV, R_SEGWIT))
 
+# ---- 2b2. SigNetParams heights (signet chain selection).
+#      Signet buries every deployment at height 1. That happens to make its
+#      schedule identical to regtest's for every height >= 1, but reusing
+#      regtest's would be relying on a coincidence in Core's parameters that
+#      Core is free to change; read signet's own. ----
+csn = re.search(r"class SigNetParams : public CChainParams\s*\{.*?\n\};", src, re.S)
+if not csn: sys.exit("could not find SigNetParams class body in " + SRC)
+sn = csn.group(0)
+def sheight(field):
+    m = re.search(r"consensus\.%s\s*=\s*(\d+)" % field, sn)
+    if not m: sys.exit("could not find consensus.%s in SigNetParams" % field)
+    return int(m.group(1))
+S_BIP34 = sheight("BIP34Height")
+S_BIP65 = sheight("BIP65Height")
+S_BIP66 = sheight("BIP66Height")
+S_CSV   = sheight("CSVHeight")
+S_SEGWIT = sheight("SegwitHeight")
+print("signet heights: BIP34=%d BIP66=%d BIP65=%d CSV=%d Segwit=%d"
+      % (S_BIP34, S_BIP66, S_BIP65, S_CSV, S_SEGWIT))
+
 # ---- 2c. CTestNet4Params heights (testnet4 chain selection). ----
 ct4 = re.search(r"class CTestNet4Params : public CChainParams\s*\{.*?\n\};", src, re.S)
 if not ct4: sys.exit("could not find CTestNet4Params class body in " + SRC)
@@ -164,6 +184,12 @@ lines.append("%%define SFC_T_HEIGHT_CLTV %d ; testnet4 BIP65Height" % T_BIP65)
 lines.append("%%define SFC_T_HEIGHT_CSV %d ; testnet4 CSVHeight" % T_CSV)
 lines.append("%%define SFC_T_HEIGHT_SEGWIT %d ; testnet4 SegwitHeight" % T_SEGWIT)
 lines.append("")
+lines.append("; signet (SigNetParams) -- selected at runtime via sfc_chain")
+lines.append("%%define SFC_S_HEIGHT_DERSIG %d ; signet BIP66Height" % S_BIP66)
+lines.append("%%define SFC_S_HEIGHT_CLTV %d ; signet BIP65Height" % S_BIP65)
+lines.append("%%define SFC_S_HEIGHT_CSV %d ; signet CSVHeight" % S_CSV)
+lines.append("%%define SFC_S_HEIGHT_SEGWIT %d ; signet SegwitHeight" % S_SEGWIT)
+lines.append("")
 lines.append("section .rodata")
 for label, hexhash, rawbytes, bits in exceptions:
     lines.append("; %s exception: display hash %s -> flags 0x%x" % (label, hexhash, bits))
@@ -191,6 +217,13 @@ hdr = [
     "#define SFC_HEIGHT_CLTV   %d   /* BIP65 */" % BIP65,
     "#define SFC_HEIGHT_CSV    %d" % CSV,
     "#define SFC_HEIGHT_SEGWIT %d   /* WITNESS + NULLDUMMY (BIP147) */" % SEGWIT,
+    "",
+    "/* signet (SigNetParams) */",
+    "#define SFC_S_HEIGHT_BIP34  %d" % S_BIP34,
+    "#define SFC_S_HEIGHT_DERSIG %d   /* BIP66 */" % S_BIP66,
+    "#define SFC_S_HEIGHT_CLTV   %d   /* BIP65 */" % S_BIP65,
+    "#define SFC_S_HEIGHT_CSV    %d" % S_CSV,
+    "#define SFC_S_HEIGHT_SEGWIT %d" % S_SEGWIT,
     "",
     "/* regtest (CRegTestParams) */",
     "#define SFC_R_HEIGHT_BIP34  %d" % R_BIP34,
