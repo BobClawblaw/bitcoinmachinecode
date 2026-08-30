@@ -182,6 +182,10 @@ typedef struct {
     int  checklevel;             /* Core -checklevel: 0..4 (def 3)           */
     long stopatheight;           /* Core -stopatheight: stop at this height,
                                   * 0 = run forever (def 0)                  */
+    /* ---- chainstate rebuild (Core -reindex-chainstate) ---- */
+    int  reindex_chainstate;     /* drop the UTXO set at boot so it rebuilds
+                                  * from the archive (def 0; one-shot)      */
+
     /* ---- mempool persistence (Core -persistmempool) ---- */
     int  persistmempool;         /* save mempool.dat at shutdown and reload it
                                   * at boot (def 1, as in Core)             */

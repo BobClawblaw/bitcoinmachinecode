@@ -827,6 +827,8 @@ static int serve_loop(int fd, int lfd){
 #define CFG_V2TRANSPORT() (g_cfg.v2transport)
 /* Core -persistmempool: reload mempool.dat at boot, write it at shutdown. */
 #define CFG_PERSISTMEMPOOL() (g_cfg.persistmempool)
+/* Core -reindex-chainstate: rebuild the UTXO set from the archive. One-shot. */
+#define CFG_REINDEX_CHAINSTATE() (g_cfg.reindex_chainstate)
 #define CFG_BRO_N() \
     (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
 /* Array capacity for outbound legs. The TARGET is g_cfg.max_outbound
@@ -3285,6 +3287,34 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * the UTXO set and be reported as success. Detect it (duplicate block
      * hashes are never valid on a real chain) and self-repair by truncating
      * to the last good height, letting normal sync re-download from there. */
+    /* -reindex-chainstate: drop the persisted UTXO set so it is rebuilt from
+     * the archive by the normal catch-up path. Runs BEFORE the archive scan
+     * because the scan's own repair path may also drop it, and doing it twice
+     * would be wasted work rather than harmful.
+     *
+     * ONE-SHOT. Core treats -reindex-chainstate as a request, not a mode, and
+     * so must this: a node left with the flag in bitcoin.conf would wipe and
+     * rebuild its UTXO set on EVERY restart -- hours of work, silently, with
+     * the operator seeing only a slow start. The flag is consumed by writing
+     * a marker, and refused on the next boot unless the operator removes it. */
+    if (CFG_REINDEX_CHAINSTATE()){
+        struct stat rst;
+        if (stat("reindex_chainstate.done", &rst) == 0){
+            fprintf(stderr,
+                "[reindex] reindex-chainstate is still set in the config but was "
+                "already carried out (reindex_chainstate.done exists) -- ignoring. "
+                "Remove the option, and delete that marker if you truly want another rebuild.\n");
+        } else {
+            long dropped = archive_drop_utxo_state();
+            fprintf(stderr,"[reindex] reindex-chainstate: dropped %ld UTXO state file(s); "
+                           "the set will rebuild from the archive\n", dropped);
+            FILE* mk = fopen("reindex_chainstate.done", "w");
+            if (mk){ fprintf(mk, "reindex-chainstate carried out\n"); fclose(mk); }
+            else fprintf(stderr,"[reindex] WARNING: could not write reindex_chainstate.done -- "
+                                "the rebuild would repeat on the next restart\n");
+        }
+    }
+
     int archive_ok;
     {
         /* ONE scan: it walks every index record through a ~1M-entry hash

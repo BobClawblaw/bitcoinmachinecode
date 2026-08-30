@@ -84,6 +84,7 @@ node_config_t g_cfg = {
     .permitbaremultisig    = 1,      /* Core DEFAULT_PERMIT_BAREMULTISIG      */
     .v2transport           = 1,      /* Core DEFAULT_V2_TRANSPORT             */
     .persistmempool        = 1,      /* Core DEFAULT_PERSIST_MEMPOOL          */
+    .reindex_chainstate    = 0,      /* one-shot; never a standing default    */
     .networkactive         = 1,      /* Core -networkactive default: on       */
     .forcednsseed          = 0,      /* Core -forcednsseed default: off       */
     .connect_only          = 0,
@@ -131,7 +132,14 @@ static const char* const k_unimplemented[] = {
     "peerbloomfilters","peerblockfilters",
     "rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
-    "reindex","reindex-chainstate","loadblock","blocksdir","blocksxor",
+    /* -reindex stays flagged deliberately: Core re-derives its block index by
+     * walking the blk files, and this node's index.dat would need a
+     * sequential walk with prev-hash linkage -- a mini-IBD from local files
+     * that does not exist here. Its recovery story is different
+     * (archive_verify_and_repair truncates and re-downloads), and shipping a
+     * partial rebuild under Core's name would be exactly the misleading
+     * option this list exists to prevent. -reindex-chainstate IS implemented. */
+    "reindex","loadblock","blocksdir","blocksxor",
     "persistmempoolv1","dbbatchsize","prevoutfetchthreads",
     "uacomment","maxtxfee","maxapsfee",
     "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
@@ -170,6 +178,7 @@ static void set_defaults(void){
     g_cfg.permitbaremultisig    = 1;
     g_cfg.v2transport           = 1;
     g_cfg.persistmempool        = 1;
+    g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
@@ -477,6 +486,8 @@ long node_config_load(const char* path){
             g_cfg.v2transport = iv?1:0; applied++; }
         else if(!strcmp(key,"persistmempool")){
             g_cfg.persistmempool = iv?1:0; applied++; }
+        else if(!strcmp(key,"reindex-chainstate")){
+            g_cfg.reindex_chainstate = iv?1:0; applied++; }
         else if(!strcmp(key,"walletpassfile")){
             snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
         else if(!strcmp(key,"networkactive")){
