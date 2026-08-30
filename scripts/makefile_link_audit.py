@@ -46,13 +46,26 @@ Exit 1 in --check mode if any rule is missing a file this project could supply.
 """
 import concurrent.futures, hashlib, json, os, re, subprocess, sys
 
-CFLAGS = ['-D_GNU_SOURCE', '-O0', '-I.', '-I', 'daemon', '-I', 'tests']
-# Fallback WITHOUT -D_GNU_SOURCE. Some rules deliberately compile without it,
-# and under glibc >= 2.34 that flag turns SIGSTKSZ into a sysconf() call, so a
-# file using it as an array bound compiles one way and not the other. Trying
-# both keeps such a file from being skipped -- a skipped file has unknown
-# symbols, which can hide a finding as easily as invent one.
-CFLAGS_ALT = ['-O0', '-I.', '-I', 'daemon', '-I', 'tests']
+# Flag sets tried IN ORDER; the first that compiles wins. Reading a file's
+# symbols needs only that it compile, not that it compile the way its rule
+# does -- but a file that compiles under none of these is SKIPPED, and a
+# skipped file has unknown symbols, which can hide a finding as easily as
+# invent one. So the list exists to keep that set empty, and every skip is
+# reported.
+#
+#   1. the common case.
+#   2. without -D_GNU_SOURCE: some rules deliberately omit it, and under
+#      glibc >= 2.34 it turns SIGSTKSZ into a sysconf() call, so a file using
+#      it as an array bound compiles one way and not the other
+#      (tests/test_taproot_bounds_fuzz.c).
+#   3. with the SIMD ISAs this tree uses: an intrinsics file cannot compile
+#      without the ISA enabled (tests/sha256_shani.c needs -msha).
+_INC = ['-I.', '-I', 'daemon', '-I', 'tests']
+CFLAG_SETS = [
+    ['-D_GNU_SOURCE', '-O0'] + _INC,
+    ['-O0'] + _INC,
+    ['-D_GNU_SOURCE', '-O0', '-msha', '-msse4.1', '-mssse3', '-mavx2'] + _INC,
+]
 
 def run(cmd, cwd=None, timeout=900):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
@@ -96,9 +109,11 @@ def sym_of(asmdir, path, cache_dir):
             pass
     if path.endswith('.c'):
         obj = os.path.join(cache_dir, key + '.o')
-        _, err, rc = run(['gcc'] + CFLAGS + ['-c', path, '-o', obj], cwd=asmdir)
-        if rc != 0:
-            _, err, rc = run(['gcc'] + CFLAGS_ALT + ['-c', path, '-o', obj], cwd=asmdir)
+        rc = 1
+        for flags in CFLAG_SETS:
+            _, err, rc = run(['gcc'] + flags + ['-c', path, '-o', obj], cwd=asmdir)
+            if rc == 0:
+                break
         if rc != 0:
             return None
     else:
