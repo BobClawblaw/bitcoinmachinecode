@@ -313,9 +313,12 @@ int chainparams_select(const char* name){
         }
         g_chainp = &PARAMS_SIGNET;
         net_magic = PARAMS_SIGNET.magic;
-        sfc_chain = 0;   /* signet activates every fork from height 1; the
-                          * mainnet schedule is already past all of them, so
-                          * the mainnet selector is the correct one here. */
+        /* NOT 0. The mainnet selector gates on HEIGHT, and signet's heights
+         * are small numbers, so mainnet's schedule judges early signet blocks
+         * pre-segwit and the node rejects them as "unexpected-witness". Found
+         * by running a real sync. Signet has its own arm, with its own heights
+         * read from Core. */
+        sfc_chain = 3;
         fprintf(stderr, "[chain] signet: %s challenge (%ld bytes), magic %02x %02x %02x %02x\n",
                 signet_challenge_custom ? "custom" : "default", signet_challenge_len,
                 PARAMS_SIGNET.magic & 0xff, (PARAMS_SIGNET.magic >> 8) & 0xff,

@@ -143,12 +143,28 @@ static long find_commitment(const u8* tx, u64 len, const u8** spk, u64* spk_len)
 long signet_check_block(const void* txs, unsigned long ntx, unsigned long stride,
                         const unsigned char hdr80[80],
                         const unsigned char* challenge, unsigned long challenge_len,
+                        const unsigned char* genesis_hash32,
                         unsigned char* scratch, unsigned long cap,
                         const char** reason){
     const char* dummy = 0;
     if (!reason) reason = &dummy;
     *reason = 0;
     #define TX(i) ((const signet_txref_t*)((const u8*)txs + (u64)(i)*stride))
+
+    /* Core, the FIRST thing CheckSignetBlockSolution does:
+     *   if (block.GetHash() == consensusParams.hashGenesisBlock) return true;
+     * The genesis coinbase predates segwit and carries no witness commitment,
+     * so without this it fails as "bad-signet-no-commitment" and the chain
+     * cannot start. Found by running a real sync, not by any test here: the
+     * vectors are all real MID-CHAIN blocks, and the syncing node seeds
+     * genesis directly rather than applying it, so only re-applying from
+     * height 0 reaches it. */
+    if (genesis_hash32 && hdr80){
+        extern void sha256d(u8 out[32], const void* msg, long long len);
+        u8 bh[32];
+        sha256d(bh, hdr80, 80);
+        if (memcmp(bh, genesis_hash32, 32) == 0) return 1;
+    }
 
     if (!txs || ntx == 0){ *reason = "bad-signet-no-coinbase"; return 0; }
     if (!hdr80 || !challenge || challenge_len == 0){
@@ -240,6 +256,7 @@ long signet_check_block_auto(const void* txs, unsigned long ntx,
                              const unsigned char hdr80[80],
                              const unsigned char* challenge,
                              unsigned long challenge_len,
+                             const unsigned char* genesis_hash32,
                              const char** reason){
     if (!challenge || challenge_len == 0){
         if (reason) *reason = "signet: no challenge configured";
@@ -256,5 +273,5 @@ long signet_check_block_auto(const void* txs, unsigned long ntx,
         g_sb_scratch = p; g_sb_cap = need;
     }
     return signet_check_block(txs, ntx, stride, hdr80, challenge, challenge_len,
-                              g_sb_scratch, g_sb_cap, reason);
+                              genesis_hash32, g_sb_scratch, g_sb_cap, reason);
 }
