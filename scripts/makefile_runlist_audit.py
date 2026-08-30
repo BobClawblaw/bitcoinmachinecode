@@ -31,7 +31,9 @@ MANUAL = {
     "test_nsb_range":          "no build rule; scratch probe, never integrated",
     "test_utxo_recover":       "needs a datadir whose UTXO store has SEVERAL runs to compact; "
                                "a small chain gives manifest_n=0 and the assertion cannot fire. "
-                               "Build fixed 2026-08-30; run as: tests/test_utxo_recover <datadir>",
+                               "Build fixed 2026-08-30; run as: tests/test_utxo_recover <datadir> [chain] "
+                               "-- pass the chain the fixture came from, or mainnet's "
+                               "activation heights reject every block",
 }
 
 # Non-test binaries that live in tests/ and are invoked BY other tests rather
