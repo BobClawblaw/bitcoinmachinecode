@@ -23,7 +23,15 @@
  * place, so it mutates whatever store it is given. Use a copy.
  *
  * Not in `make test` for that reason; see MANUAL in
- * scripts/makefile_runlist_audit.py. */
+ * scripts/makefile_runlist_audit.py.
+ *
+ * CHAIN. Takes the chain as a second argument because the fixture decides it,
+ * not the default. Pointed at a signet store while defaulting to mainnet, the
+ * replay rejects every block as "unexpected-witness" -- mainnet's activation
+ * schedule gates on HEIGHT, and a signet height is a small number, so real
+ * signet blocks look pre-segwit. That is the same trap that made signet
+ * itself reject block 1 (see daemon/chainparams.c), and it fails here in a
+ * way that looks like the store is broken when it is the harness. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -38,8 +46,21 @@ extern void utxo_live_set_undo_enabled(int on);
 
 static unsigned char store_buf[4096];
 
+extern int chainparams_select(const char* name);
+
 int main(int argc, char** argv){
-    if (argc < 2) { fprintf(stderr, "usage: %s <datadir>\n", argv[0]); return 2; }
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <datadir> [chain]\n"
+                        "  chain defaults to main; pass the chain the fixture\n"
+                        "  came from (signet/testnet4/regtest) or every block\n"
+                        "  is judged under mainnet's activation heights.\n", argv[0]);
+        return 2;
+    }
+    const char* chain = (argc > 2) ? argv[2] : "main";
+    if (!chainparams_select(chain)) {
+        fprintf(stderr, "unknown chain: %s\n", chain); return 2;
+    }
+    printf("chain=%s fixture=%s\n", chain, argv[1]);
     if (chdir(argv[1]) != 0) { perror("chdir"); return 2; }
 
     int failures = 0;
