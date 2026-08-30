@@ -28,6 +28,7 @@ default rel
     extern serve_getaddr
 extern g_peer_wants_addrv2
     extern idx_get
+    extern serve_inv_bounds
     extern serve_idx_topup
     extern serve_cfilters
     extern idx_put
@@ -73,6 +74,7 @@ align 16
 global g_serve_violation_hook
 g_serve_violation_hook: dq 0      ; void (*)(const char* reason)
 viol_oversize: db "oversized message announcement", 0
+viol_invsz:    db "inv/getdata vector above MAX_INV_SZ", 0
 
 pl_buf:    times (8<<20) db 0     ; receive buffer
 sb_buf:    times (8<<20) db 0     ; single block buffer
@@ -161,6 +163,8 @@ s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
 s_ptr:    dq 0
+s_ivn:    dq 0            ; inv/getdata entry count (from serve_inv_bounds)
+s_ivo:    dq 0            ; offset of the first entry
 s_p:      dq 0
 s_abound: dq 0        ; getaddr reply: loop bound (min(book,1000)), kept in MEMORY
 s_n:      dq 0
@@ -396,12 +400,36 @@ node_serve_loop:
 .do_inv:
     ; Inbound inv: for each MSG_BLOCK entry, if we don't already have it,
     ; send a getdata to fetch it (relay keep-up). inv payload:
-    ;   count(1) | (type u32 LE + hash32) x count   (36B per entry)
-    movzx rax, byte [pl_buf]
+    ;   count(varint) | (type u32 LE + hash32) x count   (36B per entry)
+    ;
+    ; The count used to be read as a SINGLE BYTE and the entries walked
+    ; without consulting s_plen. A vector above 252 entries -- which Core
+    ; sends routinely -- was therefore misparsed, and a SHORT message with a
+    ; large count byte walked into whatever the previous, larger message had
+    ; left in the 8 MB receive buffer, letting a peer steer getdata at hashes
+    ; assembled from earlier traffic. serve_inv_bounds (daemon/serve_invbounds.c)
+    ; now does the varint and the bounds; writing that in assembly would only
+    ; trade one subtle parser for another.
+    ;   rax =  1 ok, 0 malformed/short (drop), -1 over MAX_INV_SZ (score it)
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    lea  rdx, [s_ivn]
+    lea  rcx, [s_ivo]
+    call serve_inv_bounds
+    ; SysV defines only EAX for an `int` return -- the upper half of RAX is
+    ; undefined, so testing RAX here silently never matched -1. Sign-extend
+    ; before comparing.
+    movsxd rax, eax
+    cmp  rax, -1
+    je   .inv_toobig
+    test rax, rax
+    jle  .next               ; malformed or short: drop this message quietly
+    mov  rax, [s_ivn]
     mov  [s_cnt], rax
     test rax, rax
     jle  .next
-    lea  rax, [pl_buf+1]
+    lea  rax, [pl_buf]
+    add  rax, [s_ivo]
     mov  [s_ptr], rax        ; entry pointer (stable slot; survives calls)
 .inv_loop:
     mov  rax, [s_cnt]
@@ -1404,6 +1432,21 @@ node_serve_loop:
 ; P2P_MAX_MSG -- a protocol violation, not an ordinary disconnect. Score it
 ; before dropping, so a peer that does it repeatedly earns a ban instead of
 ; simply reconnecting. Anything else falls through unchanged.
+; An inv/getdata vector above MAX_INV_SZ is a protocol violation, scored the
+; way Core scores it ("inv message size = %u"). Report, then drop.
+.inv_toobig:
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .next
+    lea  rdi, [viol_invsz]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    jmp  .next
+
 .check_viol:
     cmp  rax, -3
     jne  .done

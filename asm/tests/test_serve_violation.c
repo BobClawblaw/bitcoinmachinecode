@@ -37,7 +37,13 @@ static void on_violation(const char* r){
 }
 
 /* Run one server child; the client sends `announced` as a message length.
- * Returns the child's exit code: 70 = hook fired, 71 = it did not. */
+ * Returns the child's exit code: 70 = hook fired, 71 = it did not.
+ * `cmd` selects the message type and `body`/`blen` an explicit payload. */
+static const char* g_cmd = "inv";
+static const unsigned char* g_body = 0;
+static unsigned g_blen = 0;
+static const char* g_want_reason = "oversized message announcement";
+
 static int run_case(unsigned announced, int send_payload){
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a; memset(&a, 0, sizeof a);
@@ -57,7 +63,7 @@ static int run_case(unsigned announced, int send_payload){
          * the store, so zeroed buffers are enough for this path. */
         static unsigned char st[4096], idx[4096], out[4096];
         node_serve_loop(c, -1, st, idx, out, (long)sizeof out);
-        _exit(g_fired ? (strcmp(g_reason, "oversized message announcement") ? 72 : 70) : 71);
+        _exit(g_fired ? (strcmp(g_reason, g_want_reason) ? 72 : 70) : 71);
     }
     int fd = tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port);
     if (fd < 0){ close(ls); return -1; }
@@ -66,12 +72,13 @@ static int run_case(unsigned announced, int send_payload){
 
     unsigned char h[24];
     memcpy(h, &net_magic, 4);
-    memset(h + 4, 0, 12); memcpy(h + 4, "inv", 3);
+    memset(h + 4, 0, 12); memcpy(h + 4, g_cmd, strlen(g_cmd));
     h[16] = (unsigned char)announced;         h[17] = (unsigned char)(announced >> 8);
     h[18] = (unsigned char)(announced >> 16); h[19] = (unsigned char)(announced >> 24);
     memset(h + 20, 0, 4);
     ssize_t w = write(fd, h, 24); (void)w;
-    if (send_payload && announced){
+    if (g_body && g_blen){ w = write(fd, g_body, g_blen); }
+    else if (send_payload && announced){
         unsigned char* p = calloc(1, announced);
         if (p){ w = write(fd, p, announced); free(p); }
     }
@@ -96,6 +103,39 @@ int main(void){
 
     { int rc = run_case(32, 1);
       ck("a small valid payload is not misbehaviour", rc == 71); }
+
+    printf("== an inv vector above MAX_INV_SZ is reported ==\n");
+    /* Core scores this ("inv message size = %u"). Here it also replaces a
+     * single-byte count read that misparsed any vector above 252 entries. */
+    { g_want_reason = "inv/getdata vector above MAX_INV_SZ";
+      unsigned char hdr[3];
+      hdr[0] = 0xfd; hdr[1] = 0x51; hdr[2] = 0xc3;   /* 50001, canonical */
+      g_body = hdr; g_blen = 3;
+      int rc = run_case(3, 0);
+      ck("50001 entries reports a violation", rc == 70);
+      if (rc == 72) printf("        fired with the wrong reason\n");
+      if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
+      g_body = 0; g_blen = 0; }
+
+    printf("== a legal inv is NOT a violation ==\n");
+    /* The bound must not fire on ordinary traffic; an inv of one block is the
+     * commonest message this node receives. */
+    { g_want_reason = "inv/getdata vector above MAX_INV_SZ";
+      static unsigned char one[37];
+      one[0] = 1; one[1] = 2;                      /* count 1, type MSG_BLOCK */
+      g_body = one; g_blen = 37;
+      ck("a 1-entry inv reports nothing", run_case(37, 0) == 71);
+      g_body = 0; g_blen = 0; }
+    { g_want_reason = "inv/getdata vector above MAX_INV_SZ";
+      static unsigned char big[3 + 300 * 36];
+      big[0] = 0xfd; big[1] = 300 & 0xff; big[2] = 300 >> 8;
+      for (int i = 0; i < 300; i++) big[3 + i * 36] = 2;   /* MSG_BLOCK */
+      g_body = big; g_blen = sizeof big;
+      ck("a 300-entry inv reports nothing (used to misparse above 252)",
+         run_case((unsigned)sizeof big, 0) == 71);
+      g_body = 0; g_blen = 0; }
+    g_want_reason = "oversized message announcement";
+    g_cmd = "inv";
 
     printf("== the boundary ==\n");
     { int rc = run_case(4000001u, 0);
