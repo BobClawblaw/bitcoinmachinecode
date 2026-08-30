@@ -183,6 +183,14 @@ static int run_cli(const char* portarg, ...) {
     char* argv[32]; int ac = 0;
     argv[ac++] = (char*)"daemon/bitcoin_cli";
     argv[ac++] = (char*)portarg;
+    /* Credentials are passed EXPLICITLY. They used to be implicit: the client
+     * hardcoded "bitcoin"/"bitcoin" and this harness relied on it silently.
+     * That hardcoding is gone (the client reads the datadir's config and
+     * cookie, like Core), and a test that leans on a default it never states
+     * is a test that stops meaning what it says the moment the default moves.
+     * The stub responder below does not check auth, so any pair does. */
+    argv[ac++] = (char*)"-rpcuser=bitcoin";
+    argv[ac++] = (char*)"-rpcpassword=bitcoin";
     /* consume varargs as method + params */
     va_list ap; va_start(ap, portarg);
     const char* m;

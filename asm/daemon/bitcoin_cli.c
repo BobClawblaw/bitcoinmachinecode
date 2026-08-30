@@ -19,14 +19,18 @@
  * which together are the client-side of the RPC-transport OPEN item.
  */
 #include "../rpc_net.h"
+#include "cli_conf.h"
 #include "../rpc_commands.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char* g_rpcuser  = "bitcoin";
-static const char* g_rpcpass  = "bitcoin";
-static int   g_rpcport = 8332;
+/* Overrides win over anything discovered; 0/NULL means "not given". */
+static const char* g_rpcuser  = 0;
+static const char* g_rpcpass  = 0;
+static int         g_rpcport  = 0;
+static const char* g_datadir  = 0;
+static const char* g_chain    = 0;
 
 static int parse_args(int argc, char** argv, int* start) {
     int i = 1;
@@ -35,6 +39,11 @@ static int parse_args(int argc, char** argv, int* start) {
         if (!strncmp(a, "-rpcport=", 9)) g_rpcport = atoi(a + 9);
         else if (!strncmp(a, "-rpcuser=", 9)) g_rpcuser = a + 9;
         else if (!strncmp(a, "-rpcpassword=", 13)) g_rpcpass = a + 13;
+        else if (!strncmp(a, "-datadir=", 9)) g_datadir = a + 9;
+        else if (!strncmp(a, "-chain=", 7)) g_chain = a + 7;
+        else if (!strcmp(a, "-signet"))   g_chain = "signet";
+        else if (!strcmp(a, "-testnet4")) g_chain = "testnet4";
+        else if (!strcmp(a, "-regtest"))  g_chain = "regtest";
         else if (!strncmp(a, "-rpcconnect=", 12)) { /* only loopback supported; accept + ignore host */ }
         /* bitcoin-cli ignores unknown -flags with a warning; keep it lenient. */
         i++;
@@ -49,11 +58,34 @@ int main(int argc, char** argv) {
     if (argi >= argc) {
         fprintf(stderr,
             "Bitcoin Core RPC client\n\n"
-            "usage: bitcoin_cli [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>] <method> [params...]\n\n"
+            "usage: bitcoin_cli [-datadir=<dir>] [-chain=<c>|-signet|-testnet4|-regtest]\n"
+            "                   [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]\n"
+            "                   <method> [params...]\n\n"
+            "With -datadir the port and credentials come from that datadir's\n"
+            "bitcoin.conf and .cookie, so no flags are usually needed.\n\n"
             "commands: getnewaddress getrawchangeaddress getaddressinfo validateaddress\n"
             "          listunspent gettxout getbalance decoderawtransaction\n");
         return 1;
     }
+    /* Resolve the endpoint from the datadir's config and cookie, exactly the
+     * way the daemon wrote them. Explicit flags still win. */
+    cli_conf_t conf;
+    const char* cerr = 0;
+    int have = cli_conf_resolve(g_datadir, g_chain, &conf, &cerr);
+    if (g_rpcport > 0) conf.port = g_rpcport;
+    if (g_rpcuser) { snprintf(conf.user, sizeof conf.user, "%s", g_rpcuser); have = 1; }
+    if (g_rpcpass) { snprintf(conf.pass, sizeof conf.pass, "%s", g_rpcpass); }
+    if (!have && !(g_rpcuser && g_rpcpass)) {
+        fprintf(stderr, "error: no credentials -- %s\n", cerr ? cerr : "?");
+        if (conf.cookie_path[0])
+            fprintf(stderr, "       looked for a cookie at %s\n", conf.cookie_path);
+        fprintf(stderr, "       pass -datadir=<dir>, or -rpcuser=/-rpcpassword=\n");
+        return 1;
+    }
+    g_rpcport = conf.port;
+    g_rpcuser = conf.user;
+    g_rpcpass = conf.pass;
+
     const char* method = argv[argi];
 
     /* Build params array from remaining args: strings stay strings, numeric-
