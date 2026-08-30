@@ -1497,7 +1497,7 @@ mac_flush:
 	lsl  x10, x10, #1
 	b    .fl_bb_loop
 .fl_bb2:
-	movz x11, #0x4000, lsl #16       /* BLOOM_MAX_BYTES*8 = 0x2000000 */
+	movz x11, #0x0200, lsl #16       /* BLOOM_MAX_BYTES*8 = 0x02000000 */
 	cmp  x10, x11
 	b.ls .fl_bb3
 	mov  x10, x11
@@ -2695,7 +2695,7 @@ utxo_lsm_compact:
 	lsl  x10, x10, #1
 	b    .cc_bb_loop
 .cc_bb2:
-	movz x11, #0x4000, lsl #16       /* BLOOM_MAX_BYTES*8 */
+	movz x11, #0x0200, lsl #16       /* BLOOM_MAX_BYTES*8 = 0x02000000 */
 	cmp  x10, x11
 	b.ls .cc_bb3
 	mov  x10, x11
