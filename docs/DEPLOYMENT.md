@@ -81,14 +81,19 @@ the rule since: **read the gate result in one step, act in a separate step**
 A minimal `config/bitcoin.conf` (path given to the daemon at start):
 
 ```ini
-# Chain (default main). "regtest" runs Core's regtest chain in a
-# subdirectory of the datadir — see "Regtest" below.
+# Chain (default main): main | signet | testnet4 | regtest. Anything but
+# mainnet runs in a subdirectory of the datadir — see "Regtest" and "Signet"
+# below. Legacy testnet3 ("testnet"/"test") is refused, not run.
 chain=main
+# signetchallenge=<hex>   # a CUSTOM signet. It also determines the network
+                          # magic, so a custom signet cannot hear the public
+                          # one. Omit for the public signet.
 
 # P2P
 listen=1                 # accept inbound peers (fork-per-connection)
 port=8332                # P2P listen/dial port; chain default if omitted
-                         # (8333 main, 18444 regtest — see node_config.c)
+                         # (8333 main, 38333 signet, 48333 testnet4,
+                         #  18444 regtest — see node_config.c)
 
 # RPC. The COOKIE is the default credential: <datadir>/.cookie is written
 # 0600 at start, deleted on shutdown, and bitcoin-cli finds it on its own.
@@ -254,6 +259,36 @@ by name. Its own correctness is gated by `gate-log-selftest`, which is a
 prerequisite of `test:` — it builds synthetic logs with known verdicts,
 including the two that matter most: a gate missing exactly one test at the
 end, and one missing a test from the middle.
+
+### The three build audits
+
+Each covers a class the other two structurally cannot see. All three run as
+prerequisites of `test:`, so they fail in the first seconds of a gate rather
+than mid-build.
+
+| audit | the question it answers | what it cannot see |
+|---|---|---|
+| `prereq-check` | does a recipe use a file the rule never declared as a prerequisite? | a file named in NEITHER the recipe nor the prerequisites |
+| `link-check` | does a rule link the file that DEFINES a symbol one of its sources needs? | flags: it compiles with a generic set, not each rule's own |
+| `gate-log-check` | did the gate actually run every gated test? | whether a test that ran and printed nothing was meaningful |
+
+`link-check` exists because adding signet hit the same defect four times: a
+source grew a dependency on a symbol from another file, and the rules linking
+the first were not updated to link the second. Each surfaced only as a link
+error in a full gate — minutes to run, and because a failed prerequisite stops
+the `test:` recipe entirely, the log holds no `FAIL` lines. It resolves
+symbols the way the linker will (compile each source, read `nm`, take each
+rule's expanded prerequisites as its link set) and reports what is unresolved
+**only when another file in this project defines it**, naming that file. Every
+finding therefore reads "add this file to that rule"; libc and pthread are
+unresolvable by definition and are skipped.
+
+Its value is that it reports the whole class at once. When `node_config.c`
+grew a call into `netperm.c`, it named all **46** affected rules in under a
+second, before a gate ran.
+
+Using prerequisites as the link set is sound *because* `prereq-check` enforces
+the other direction. The two audits lean on each other deliberately.
 
 ## Operating it
 
@@ -536,6 +571,43 @@ block hashes 0..N byte-identical after syncing Core's chain; `gettxoutsetinfo
 muhash` identical; a block built from **bmc's own `getblocktemplate`** is
 accepted by Core via `submitblock`; live tip-follow; and a Core wallet tx
 reaching bmc's mempool over the wire.
+
+## Signet
+
+`chain=signet` runs Core's public signet. On signet the block **signature** is
+the consensus rule in place of meaningful proof of work (BIP325), so a node
+that did not check it would accept any block anyone offered.
+
+```ini
+chain=signet
+# signetchallenge=<hex>   # only for a CUSTOM signet
+```
+
+Everything lands under `<datadir>/signet/`, on ports 38333 (P2P) and 38332
+(RPC). The lines worth reading at boot:
+
+```
+[chain] signet: default challenge (71 bytes), magic 0a 03 cf 40
+[boot] signet genesis seeded at height 0
+```
+
+The magic is **derived** from the challenge, not configured: the first four
+bytes of `sha256d(CompactSize(len) || challenge)`. That is why a custom
+signet is isolated automatically — a different challenge is a different magic,
+and the two networks cannot talk. Core also drops the minimum-chain-work floor
+and the DNS seeds for a custom signet, and so does this node; a mainnet-scale
+floor would stall a private network forever.
+
+**Verifying it is actually enforcing.** A node that syncs proves nothing on
+its own — an inert check would sync just as happily. The decisive test is to
+re-apply the same blocks under a challenge differing by one character:
+
+```sh
+# same archive, one hex character changed in signetchallenge
+[utxo_live] REJECT h=1: bad-signet-blksig
+```
+
+If that does not appear, the check is not running.
 
 ## Wallet encryption
 

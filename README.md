@@ -1063,7 +1063,8 @@ except where the node is deliberately more conservative. Parsed in
 
 | key | default | meaning |
 |---|---|---|
-| `chain` | `main` | `main` or `regtest`. `testnet`/`signet` are recognised and **refused** (the node will not start on a chain whose rules it does not implement). |
+| `chain` | `main` | `main`, `signet`, `testnet4` or `regtest`. Legacy `testnet`/`test` (testnet3) is recognised and **refused** — the node will not start on a chain whose rules it does not implement. |
+| `signetchallenge` | *(default signet)* | Hex block challenge for a CUSTOM signet. It also determines the network magic, so two signets with different challenges cannot hear each other. Core drops the chain-work floor and DNS seeds for a custom signet; so does this node. |
 | `regtest` | `0` | `regtest=1` is the boolean form of `chain=regtest`. |
 
 Each non-main chain runs in its own datadir subtree (`<datadir>/regtest/`) with
@@ -1197,8 +1198,13 @@ differential tests named.
   (Core itself refuses it for an arbitrary height; only muhash is stored by the
   index and answerable off-tip). Coinstats "extras" beyond the core fields are
   omitted, stated in the result.
-- **Only `main` and `regtest`.** `testnet` / `signet` are refused outright
-  rather than run under the wrong chain's rules.
+- **Chains: `main`, `signet`, `testnet4`, `regtest`.** Legacy `testnet`
+  (testnet3) is refused outright rather than run under the wrong chain's
+  rules. On signet the block SIGNATURE is the consensus rule in place of
+  meaningful proof of work (BIP325), and it is enforced: the node syncs the
+  public signet and holds the same chain as Core, and under a challenge
+  differing by one hex character it rejects real block 1 as
+  `bad-signet-blksig`.
 - **Not present at all** (also in `FEATURE_GAPS.md`): Tor/I2P/onion, REST
   interface, UPnP/NAT-PMP, GUI. Mining is `getblocktemplate`/`submitblock` with
   a *lower-bound* `sigops` and valid-but-not-fee-optimal tx ordering, no
