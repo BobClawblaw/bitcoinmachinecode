@@ -10,7 +10,20 @@
  *   1. recover() on a multi-run store reports >0 successful compaction rounds
  *   2. recover() again is a clean no-op (nothing left to merge), NOT a spin
  * Run count is observed via recover()'s own return, since manifest_n is
- * private to utxo_live.c. */
+ * private to utxo_live.c.
+ *
+ * FIXTURE. This needs a datadir whose UTXO store already holds SEVERAL runs,
+ * which in practice means an archive replayed deep enough to have compacted
+ * at least once (the 160k-180k stretch is what this was written against). A
+ * short chain reloads with manifest_n=0 and assertion 1 cannot fire -- it
+ * reports "recover() did nothing", which is the fixture being inadequate
+ * rather than the code being wrong.
+ *
+ * NEVER point it at the production datadir: utxo_live_recover() COMPACTS in
+ * place, so it mutates whatever store it is given. Use a copy.
+ *
+ * Not in `make test` for that reason; see MANUAL in
+ * scripts/makefile_runlist_audit.py. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

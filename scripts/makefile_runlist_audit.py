@@ -29,7 +29,9 @@ MANUAL = {
     "test_truncate_guard":     "no build rule; superseded by test_truncate_guard_prim",
     "test_truncate_guard_prim":"needs a prepared archive fixture (chdir's into a datadir)",
     "test_nsb_range":          "no build rule; scratch probe, never integrated",
-    "test_utxo_recover":       "BROKEN: does not link. Tracked, not excused -- fix or delete",
+    "test_utxo_recover":       "needs a datadir whose UTXO store has SEVERAL runs to compact; "
+                               "a small chain gives manifest_n=0 and the assertion cannot fire. "
+                               "Build fixed 2026-08-30; run as: tests/test_utxo_recover <datadir>",
 }
 
 # Non-test binaries that live in tests/ and are invoked BY other tests rather
