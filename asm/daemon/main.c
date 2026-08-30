@@ -4455,9 +4455,32 @@ static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pca
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
+    /* Start on ANY usable credential, not just rpcuser/rpcpassword.
+     *
+     * This used to bail out whenever those two were absent, which meant
+     * deleting a plaintext password from the config -- the thing the security
+     * audit asked for -- silently turned the whole RPC server off. Cookie
+     * authentication was already implemented, enabled by default and
+     * verified working; it just never got the chance to run, because the
+     * server never started.
+     *
+     * Core's behaviour is the right one: the cookie IS the default
+     * credential, and rpcuser/rpcpassword are the legacy alternative. So the
+     * server starts if a cookie will be emitted, or an rpcauth entry exists,
+     * or a user/password pair is configured -- and only refuses when there
+     * is genuinely no way to authenticate, which would otherwise be an open
+     * RPC port. */
     if (!user[0] || !pass[0]){
-        fprintf(stderr, "[rpc] no rpcuser/rpcpassword in config -- embedded RPC server disabled\n");
-        return;
+        if (!g_cfg.rpccookie && g_cfg.n_rpcauth == 0){
+            fprintf(stderr, "[rpc] no rpcuser/rpcpassword, no rpcauth and rpccookie=0 "
+                            "-- nothing could authenticate, so the embedded RPC server "
+                            "is disabled\n");
+            return;
+        }
+        fprintf(stderr, "[rpc] no rpcuser/rpcpassword -- using %s%s%s\n",
+                g_cfg.rpccookie ? "cookie authentication" : "",
+                (g_cfg.rpccookie && g_cfg.n_rpcauth) ? " and " : "",
+                g_cfg.n_rpcauth ? "rpcauth credentials" : "");
     }
     (void)dir;   /* the daemon has already chdir'd into the datadir */
     if (rpc_chain_open(NULL))
