@@ -314,4 +314,9 @@ int rpc_node_dispatch(const char* method, const rj_val* params,
  * the pool lock. Returns length or -1 (absent, or no pool in this process). */
 long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap);
 
+/* -persistmempool: the daemon's boot and shutdown hooks. Same code the
+ * savemempool/importmempool RPCs use, so the two cannot drift. */
+long rpc_node_mempool_save(const char* path);   /* txs written, or -1 */
+long rpc_node_mempool_load(const char* path);   /* txs accepted, or -1 */
+
 #endif

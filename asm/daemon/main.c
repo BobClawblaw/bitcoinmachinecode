@@ -825,6 +825,8 @@ static int serve_loop(int fd, int lfd){
  * this existed: p2p_read/p2p_write never register an fd, so their dispatch
  * falls straight through to v1. */
 #define CFG_V2TRANSPORT() (g_cfg.v2transport)
+/* Core -persistmempool: reload mempool.dat at boot, write it at shutdown. */
+#define CFG_PERSISTMEMPOOL() (g_cfg.persistmempool)
 #define CFG_BRO_N() \
     (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
 /* Array capacity for outbound legs. The TARGET is g_cfg.max_outbound
@@ -4654,6 +4656,19 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
+    /* -persistmempool: reload the dump the previous run left behind. Same
+     * code the importmempool RPC uses, so the two cannot drift apart on the
+     * format. A missing file is the ordinary case -- a fresh datadir, or a
+     * node that has never saved one -- and is not an error. */
+    if(CFG_PERSISTMEMPOOL()){
+        struct stat mst;
+        if(stat("mempool.dat", &mst) == 0){
+            long acc = rpc_node_mempool_load("mempool.dat");
+            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+        } else {
+            fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
+        }
+    }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
       rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run);
@@ -4864,6 +4879,14 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(g_shutdown_requested){
             fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), mux_n_out);
+            /* -persistmempool: dump BEFORE the worker is signalled, while the
+             * shared pool is still quiescent and nothing is evicting under
+             * the writer. */
+            if(CFG_PERSISTMEMPOOL()){
+                long w = rpc_node_mempool_save("mempool.dat");
+                if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
+                else       fprintf(stderr,"[mempool] could not save mempool.dat\n");
+            }
             if(g_dl_worker_pid>0){
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);

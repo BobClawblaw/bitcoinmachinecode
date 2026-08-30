@@ -268,11 +268,13 @@ int main(void){
     printf("== 9b. the warning list tracks what is actually implemented ==\n");
     { extern int nodecfg_unimplemented(const char*);
       ck("maxsendbuffer no longer flagged",   nodecfg_unimplemented("maxsendbuffer") == 0);
-      /* NOT implemented: mempool_dump_write/read exist and are tested, but
-       * nothing calls them, and wiring the save path touches shutdown, which
-       * must stay fast for the SIGKILL window. Flagged until it is real. */
-      ck("persistmempool IS still flagged (machinery exists, unwired)",
-         nodecfg_unimplemented("persistmempool") == 1);
+      /* Wired 2026-08-30: the dump is written in the parent's shutdown path
+       * BEFORE the worker is signalled, and reloaded at boot through the same
+       * code the importmempool RPC uses. The old note here said wiring it
+       * "touches shutdown, which must stay fast for the SIGKILL window" --
+       * still true, which is why the save happens while the pool is
+       * quiescent and before any teardown, not after. */
+      ck("persistmempool is no longer flagged", nodecfg_unimplemented("persistmempool") == 0);
       ck("the zmq hwms no longer flagged",    nodecfg_unimplemented("zmqpubrawtxhwm") == 0);
       /* deferred on purpose: implementing it means moving when sigop cost is
        * computed, and a half-wired fee policy is worse than an absent one */

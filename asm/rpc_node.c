@@ -1387,6 +1387,36 @@ extern long mempool_dump_read(const char* path,
 
 #define MPD_MAX_DUMP 200000
 
+/* The dump itself, without the RPC wrapper, so the daemon's own
+ * -persistmempool path at shutdown and the savemempool RPC cannot drift apart
+ * -- two copies of a serialiser is precisely how one of them quietly stops
+ * matching the format. Returns transactions written, or -1. */
+long rpc_node_mempool_save(const char* path){
+    if (!g_mph.mp) return -1;
+    static const unsigned char* txs[MPD_MAX_DUMP];
+    static unsigned long        lens[MPD_MAX_DUMP];
+    static long long            times[MPD_MAX_DUMP], deltas[MPD_MAX_DUMP];
+    long n = 0;
+    mpl();
+    unsigned long slots = mp_slot_count(g_mph.mp);
+    for (unsigned long i = 0; i < slots && n < MPD_MAX_DUMP; i++){
+        mp_ent e;
+        if (mp_slot(g_mph.mp, i, &e) != 1) continue;
+        txs[n]    = e.tx;
+        lens[n]   = e.len;
+        times[n]  = g_mph.time_of ? (long long)g_mph.time_of(e.txid) : 0;
+        deltas[n] = (long long)pri_delta_of(e.txid);
+        n++;
+    }
+    /* Written under the pool lock ON PURPOSE: the entry pointers above are
+     * into the shared blob, and releasing first would let an eviction move
+     * the bytes out from under the writer. */
+    long w = mempool_dump_write(path ? path : "mempool.dat",
+                                txs, lens, times, deltas, n, NULL, NULL, 0);
+    mpu();
+    return w;
+}
+
 static int cmd_savemempool(rj_val** res, long* ec, const char** em){
     if (!g_mph.mp){ *ec = -4; *em = "no mempool is attached to this RPC server"; return 0; }
     static const unsigned char* txs[MPD_MAX_DUMP];
@@ -1447,6 +1477,22 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     pthread_mutex_unlock(&g_submit_lock);
     if (ok) c->accepted++; else c->rejected++;
     return 0;                       /* a rejected entry is not a file error */
+}
+
+/* The load half, likewise shared with the boot path. Returns transactions
+ * ACCEPTED, or -1 if the file could not be read at all. A dump that is
+ * missing is not an error -- a node that has never saved one, or a fresh
+ * datadir, is the ordinary case. */
+long rpc_node_mempool_load(const char* path){
+    if (!g_status_rw) return -1;
+    mpd_import_ctx c = {0, 0};
+    char err[160]; err[0] = 0;
+    long r = mempool_dump_read(path ? path : "mempool.dat",
+                               mpd_import_one, &c, err, sizeof err);
+    if (r < 0) return -1;
+    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld\n",
+            path ? path : "mempool.dat", c.accepted, c.rejected, r);
+    return c.accepted;
 }
 
 static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
