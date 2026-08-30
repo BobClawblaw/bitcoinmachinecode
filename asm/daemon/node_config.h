@@ -191,6 +191,11 @@ typedef struct {
                                   * at boot (def 1, as in Core)             */
 
     /* ---- wallet passphrase source (audit finding 2) ---- */
+    /* Core -signetchallenge: the block challenge script, as hex. Only
+     * meaningful with chain=signet, where it also determines the network
+     * magic -- so two signets with different challenges cannot talk to each
+     * other. Empty = the default (public) signet. */
+    char signetchallenge[2048];
     char walletpassfile[256];    /* absolute path, OUTSIDE the datadir, to a
                                   * root-owned 0640 file holding the wallet
                                   * passphrase. Empty = none; the daemon no

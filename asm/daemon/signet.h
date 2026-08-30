@@ -21,6 +21,12 @@
  * Core's rule: the LAST output whose scriptPubKey is at least 38 bytes and
  * begins OP_RETURN 0x24 aa21a9ed. Later outputs win, which matters -- a block
  * may carry more than one and only the last is the commitment. */
+/* The commitment test itself. Exposed so a caller walking a coinbase's
+ * outputs one at a time can apply exactly the rule signet_commitment_index
+ * applies, instead of restating it -- two spellings of a consensus predicate
+ * are two things that can drift. */
+int signet_is_commitment_spk(const unsigned char* spk, unsigned long len);
+
 int signet_commitment_index(const unsigned char* const* spks,
                             const unsigned long* spk_lens, long nout);
 
