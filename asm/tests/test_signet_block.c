@@ -17,6 +17,8 @@
 #include "../daemon/signet_block.h"
 #include "signet_block_vectors.h"
 
+extern void sha256d(unsigned char out[32], const void* msg, long long len);
+
 long mempool_resolve_confirmed_utxo(void* u, const unsigned char t[32],
                                     unsigned long i, unsigned long long* v,
                                     const unsigned char** s, unsigned long* l){
@@ -53,7 +55,7 @@ static long check(const signet_block_vec_t* V, unsigned char* b,
         refs[t].len = V->len[t];
     }
     return signet_check_block(refs, (unsigned long)V->ntx, sizeof refs[0],
-                              b, chal, chalen, scratch, sizeof scratch, reason);
+                              b, chal, chalen, 0, scratch, sizeof scratch, reason);
 }
 
 int main(void){
@@ -138,15 +140,67 @@ int main(void){
     {
         const signet_block_vec_t* V = &SIGNET_BLOCK_VEC[0];
         unhex(V->raw, blk, sizeof blk);
-        ok(signet_check_block(refs, 0, sizeof refs[0], blk, chal, chalen,
+        ok(signet_check_block(refs, 0, sizeof refs[0], blk, chal, chalen, 0,
                               scratch, sizeof scratch, &reason) == 0 &&
            reason && !strcmp(reason, "bad-signet-no-coinbase"),
            "a block with no transactions is rejected");
         ok(check(V, blk, chal, 0, &reason) == -1,
            "no configured challenge is an internal error, not a verdict");
-        long r = signet_check_block(refs, 1, sizeof refs[0], blk, chal, chalen,
+        long r = signet_check_block(refs, 1, sizeof refs[0], blk, chal, chalen, 0,
                                     scratch, 4096, &reason);
         ok(r == -1, "too little scratch is an internal error, not a verdict");
+    }
+
+    printf("== the genesis block is exempt, as Core exempts it ==\n");
+    {
+        /* Core's CheckSignetBlockSolution opens with
+         *   if (block.GetHash() == consensusParams.hashGenesisBlock) return true;
+         * The signet genesis coinbase predates segwit and carries NO witness
+         * commitment, so without the exemption it fails as
+         * "bad-signet-no-commitment" and the chain cannot start at all.
+         *
+         * This was a REAL BUG, found by running a sync rather than by any
+         * test: every vector here is a real mid-chain block, and a syncing
+         * node seeds genesis directly instead of applying it, so only
+         * re-applying from height 0 reaches the case. */
+        const signet_block_vec_t* V = &SIGNET_BLOCK_VEC[0];
+        unhex(V->raw, blk, sizeof blk);
+        for (int t = 0; t < V->ntx; t++){
+            refs[t].ptr = blk + V->off[t]; refs[t].len = V->len[t];
+        }
+        /* Pretend this block's own hash is the genesis hash: the exemption
+         * must then accept it whatever its solution says. Using the block's
+         * real hash keeps the test honest about WHAT is compared. */
+        unsigned char bh[32];
+        sha256d(bh, blk, 80);
+        ok(signet_check_block(refs, (unsigned long)V->ntx, sizeof refs[0], blk,
+                              chal, chalen, bh, scratch, sizeof scratch,
+                              &reason) == 1,
+           "a block whose hash IS the genesis hash is accepted unconditionally");
+
+        /* And a DIFFERENT genesis hash must not exempt it -- otherwise the
+         * comparison is not doing anything. */
+        unsigned char other[32]; memcpy(other, bh, 32); other[0] ^= 0x01;
+        ok(signet_check_block(refs, (unsigned long)V->ntx, sizeof refs[0], blk,
+                              chal, chalen, other, scratch, sizeof scratch,
+                              &reason) == 1,
+           "a non-genesis block still validates normally (this one is valid)");
+
+        /* The decisive pair: break the commitment so the block CANNOT pass,
+         * then show the exemption is the only thing that saves it. */
+        unsigned char* cb = blk + V->off[0];
+        for (unsigned long i = 0; i + 4 < V->len[0]; i++)
+            if (cb[i]==0xaa && cb[i+1]==0x21 && cb[i+2]==0xa9 && cb[i+3]==0xed)
+                cb[i+1] ^= 0xff;
+        sha256d(bh, blk, 80);   /* header unchanged, so this is the same hash */
+        ok(signet_check_block(refs, (unsigned long)V->ntx, sizeof refs[0], blk,
+                              chal, chalen, other, scratch, sizeof scratch,
+                              &reason) == 0,
+           "with no commitment and no exemption it is rejected");
+        ok(signet_check_block(refs, (unsigned long)V->ntx, sizeof refs[0], blk,
+                              chal, chalen, bh, scratch, sizeof scratch,
+                              &reason) == 1,
+           "and the SAME block is accepted when its hash is the genesis hash");
     }
 
     printf("\n%s (%d failure%s)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED",
