@@ -48,6 +48,7 @@
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "netperm.h"   /* -whitelist peer permissions */
+#include "subnet.h"    /* one CIDR matcher, shared with the ban list */
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
@@ -881,24 +882,15 @@ static int  g_ctl_n_addnode = 0;
  * realistically bans. A subnet form this cannot express is REFUSED at
  * setban rather than silently stored and never enforced -- a ban that does
  * not ban is worse than an error. */
+/* Was a dotted-decimal STRING comparison, which rejected every prefix that
+ * was not a whole number of octets (/28, /12, /20 matched nothing) and did
+ * not handle IPv6 at all -- so `setban 2001:db8::/32` was accepted, stored,
+ * listed by listbanned, and never matched a peer. A ban that silently does
+ * nothing is worse than a refused one: the operator believes the peer is
+ * gone. daemon/subnet.c is the one implementation now, shared with the
+ * -whitelist matcher that needed the same rule. */
 static int ctl_ban_covers(const char* entry, const char* ip){
-    const char* slash = strchr(entry, '/');
-    if(!slash) return strcmp(entry, ip) == 0;
-    int bits = atoi(slash + 1);
-    int octets = bits / 8;
-    if(octets <= 0 || octets > 4 || (bits % 8) != 0) return 0;
-    /* compare the first `octets` dotted components */
-    const char *a = entry, *b = ip;
-    for(int i = 0; i < octets; i++){
-        const char* ae = strchr(a, '.'); const char* be = strchr(b, '.');
-        size_t alen = ae ? (size_t)(ae - a) : strlen(a);
-        size_t blen = be ? (size_t)(be - b) : strlen(b);
-        if(i == octets - 1 && !ae) alen = (size_t)(slash - a);
-        if(alen != blen || strncmp(a, b, alen) != 0) return 0;
-        if(!ae || !be) return i == octets - 1;
-        a = ae + 1; b = be + 1;
-    }
-    return 1;
+    return subnet_covers_str(entry, ip);
 }
 
 /* 1 if this address is currently banned. Called before every dial. */
