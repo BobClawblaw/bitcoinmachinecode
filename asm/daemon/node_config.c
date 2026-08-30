@@ -83,6 +83,7 @@ node_config_t g_cfg = {
     .rpccookie             = 1,      /* Core's default auth method            */
     .permitbaremultisig    = 1,      /* Core DEFAULT_PERMIT_BAREMULTISIG      */
     .v2transport           = 1,      /* Core DEFAULT_V2_TRANSPORT             */
+    .persistmempool        = 1,      /* Core DEFAULT_PERSIST_MEMPOOL          */
     .networkactive         = 1,      /* Core -networkactive default: on       */
     .forcednsseed          = 0,      /* Core -forcednsseed default: off       */
     .connect_only          = 0,
@@ -131,7 +132,7 @@ static const char* const k_unimplemented[] = {
     "rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
     "reindex","reindex-chainstate","loadblock","blocksdir","blocksxor",
-    "persistmempool","persistmempoolv1","dbbatchsize","prevoutfetchthreads",
+    "persistmempoolv1","dbbatchsize","prevoutfetchthreads",
     "uacomment","maxtxfee","maxapsfee",
     "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
         "walletnotify",
@@ -168,6 +169,7 @@ static void set_defaults(void){
     g_cfg.rpccookie             = 1;
     g_cfg.permitbaremultisig    = 1;
     g_cfg.v2transport           = 1;
+    g_cfg.persistmempool        = 1;
     g_cfg.walletpassfile[0]     = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
@@ -473,6 +475,8 @@ long node_config_load(const char* path){
             g_cfg.permitbaremultisig = iv?1:0; applied++; }
         else if(!strcmp(key,"v2transport")){
             g_cfg.v2transport = iv?1:0; applied++; }
+        else if(!strcmp(key,"persistmempool")){
+            g_cfg.persistmempool = iv?1:0; applied++; }
         else if(!strcmp(key,"walletpassfile")){
             snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
         else if(!strcmp(key,"networkactive")){
