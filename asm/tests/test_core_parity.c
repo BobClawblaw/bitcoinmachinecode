@@ -236,8 +236,14 @@ int main(void){
 
     printf("== 8. an unimplemented Core option is REPORTED, not swallowed ==\n");
     { extern int nodecfg_unimplemented(const char*);
-      ck("whitelist is flagged (it sits in the live conf doing nothing)",
-         nodecfg_unimplemented("whitelist") == 1);
+      /* whitelist is IMPLEMENTED as of 2026-08-30 -- noban only, see
+       * daemon/netperm.c and tests/test_netperm.c. It must NOT be flagged, or
+       * the node warns that a working option does nothing. whitebind is a
+       * separate option and is still honestly flagged. */
+      ck("whitelist is NOT flagged (it is implemented: noban)",
+         nodecfg_unimplemented("whitelist") == 0);
+      ck("whitebind is still flagged (it is not implemented)",
+         nodecfg_unimplemented("whitebind") == 1);
       /* asmap WAS on that list until it was implemented. Now it must not be:
        * the list and the implementation have to move together, or the node
        * starts telling operators a working option does nothing. This

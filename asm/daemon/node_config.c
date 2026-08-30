@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "node_config.h"
+#include "netperm.h"
 
 /* STATICALLY initialised to the compiled defaults.
  *
@@ -127,7 +128,11 @@ int nodecfg_hex32_be(const char* str, unsigned char out[32]){
  * inferred, so adding support means deleting a line here and the warning
  * stops -- and so the list itself is a readable statement of the gap. */
 static const char* const k_unimplemented[] = {
-    "whitelist","whitebind","whitelistrelay","whitelistforcerelay",
+    /* `whitelist` is IMPLEMENTED (noban only) -- see daemon/netperm.c. The
+     * three below are not: whitebind needs a second listener carrying its own
+     * permissions, and whitelistrelay/whitelistforcerelay are relay
+     * permissions with no enforcement point here yet. */
+    "whitebind","whitelistrelay","whitelistforcerelay",
     "txreconciliation","natpmp","upnp","bytespersigop",
     "peerbloomfilters","peerblockfilters",
     "rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
@@ -489,6 +494,11 @@ long node_config_load(const char* path){
             g_cfg.persistmempool = iv?1:0; applied++; }
         else if(!strcmp(key,"reindex-chainstate")){
             g_cfg.reindex_chainstate = iv?1:0; applied++; }
+        else if(!strcmp(key,"whitelist")){    /* Core: peer permissions */
+            const char* nperr = 0;
+            if(netperm_add(val, &nperr)) applied++;
+            else { fprintf(stderr,"[config] whitelist=%s rejected: %s\n",
+                           val, nperr ? nperr : "?"); bad++; } }
         else if(!strcmp(key,"signetchallenge")){  /* Core: -signetchallenge */
             snprintf(g_cfg.signetchallenge, sizeof g_cfg.signetchallenge, "%s", val); applied++; }
         else if(!strcmp(key,"walletpassfile")){

@@ -47,6 +47,7 @@
 #include "torcontrol.h"  /* inbound: our own onion service */
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "netperm.h"   /* -whitelist peer permissions */
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
@@ -1002,6 +1003,15 @@ int ctl_ban_add(const char* subnet, long long until){
  * in which case the caller should drop the connection. */
 int peer_misbehaving(const char* ip, int points, const char* reason){
     if(!ip || !*ip || points <= 0) return 0;
+    /* Core: a peer with NetPermissionFlags::NoBan is never disconnected or
+     * discouraged for misbehaviour. Checked BEFORE scoring, not just before
+     * banning -- a score that can never reach the threshold is bookkeeping
+     * that would evict a real offender from the table. */
+    if(netperm_for(ip) & NP_NOBAN){
+        fprintf(stderr,"[ban] %s misbehaving +%d: %s -- NOT scored (whitelist noban)\n",
+                ip, points, reason ? reason : "?");
+        return 0;
+    }
     /* Score into the SHARED table when we have one, so a peer that misbehaves
      * once per connection across many forked serve children still adds up.
      * The process-local array is the fallback for binaries with no shared
@@ -5243,6 +5253,14 @@ int main(int argc, char** argv){
         if(strcmp(g_cfg.chain, "signet") != 0)
             fprintf(stderr, "[chain] warning: signetchallenge is set but "
                             "chain=%s -- it will be ignored\n", g_cfg.chain);
+    }
+    if(netperm_count() > 0){
+        fprintf(stderr, "[config] whitelist: %d entr%s, granting noban\n",
+                netperm_count(), netperm_count() == 1 ? "y" : "ies");
+        if(netperm_has_implicit())
+            fprintf(stderr, "[config] whitelist: an entry gave no explicit "
+                            "permissions -- Core would grant its implicit set; "
+                            "this node enforces ONLY noban\n");
     }
     if(!chainparams_select(g_cfg.chain)) return 1;
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
