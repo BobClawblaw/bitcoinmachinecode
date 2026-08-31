@@ -76,6 +76,23 @@ int main(void){
         n = mk_segwit(tx, 2, 10, 3600);
         ok(txacc_witness_standard(0, tx, n) == 0, "3,600-byte witnessScript is the limit, allowed");
         /* not P2WSH: the same stacks under P2WPKH shape are not judged */
+        /* ---- taproot (Core IsWitnessStandard v1 branch, verbatim) ---- */
+        g_prev_spklen = 34; g_prev_spk[0]=0x51; g_prev_spk[1]=0x20; memset(g_prev_spk+2, 0x77, 32);
+        n = mk_segwit(tx, 0, 0, 64);                       /* key path: 1 item, no rule */
+        ok(!txacc_witness_standard(0, tx, n), "taproot key path accepted");
+        n = mk_segwit(tx, 1, 64, 10); tx[n-4-10] = 0x50;   /* last item starts 0x50: annex */
+        ok(txacc_witness_standard(0, tx, n) != 0, "annex is nonstandard");
+        n = mk_segwit(tx, 1, 64, 0);                       /* empty control block */
+        ok(txacc_witness_standard(0, tx, n) != 0, "empty control block refused");
+        n = mk_segwit(tx, 2, 81, 33); tx[n-4-33] = 0xc0;   /* tapscript, 81B item below script */
+        ok(txacc_witness_standard(0, tx, n) != 0, "tapscript stack item > 80 refused");
+        n = mk_segwit(tx, 2, 80, 33); tx[n-4-33] = 0xc1;   /* 80B at the cap; c1 is still leaf 0xc0 */
+        ok(!txacc_witness_standard(0, tx, n), "80-byte tapscript item at the cap accepted");
+        n = mk_segwit(tx, 2, 81, 33); tx[n-4-33] = 0xc2;   /* NOT the tapscript leaf: no cap */
+        ok(!txacc_witness_standard(0, tx, n), "non-tapscript leaf: items uncapped");
+        n = mk_segwit(tx, 1, 200, 33); tx[n-4-33] = 0xc0;  /* the SCRIPT itself is uncapped */
+        ok(!txacc_witness_standard(0, tx, n), "tapscript script size uncapped");
+
         g_prev_spklen = 22; g_prev_spk[0]=0x00; g_prev_spk[1]=0x14; memset(g_prev_spk+2, 0x77, 20);
         n = mk_segwit(tx, 101, 1, 200);
         ok(txacc_witness_standard(0, tx, n) == 0, "P2WPKH prevout: P2WSH limits do not apply");
