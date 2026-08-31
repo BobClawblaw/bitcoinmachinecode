@@ -176,7 +176,7 @@ static int inbound_getdata(int port, int h){
 }
 
 static long blkfile_size(const char* dir){
-    char p[512]; snprintf(p,sizeof p,"%s/blk00000.dat",dir);
+    char p[512]; snprintf(p,sizeof p,"%s/main/blk00000.dat",dir);
     struct stat st; if(stat(p,&st)!=0) return -1; return (long)st.st_size;
 }
 
