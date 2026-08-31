@@ -2803,6 +2803,11 @@ mac_ow_buf:  resb MAC_OWBUF
 mac_compact_defer_unlink:  resq 1
 mac_compact_defer_publish: resq 1
 mac_flush_hook:            resq 1
+; utxo_lsm_compact_range's arguments, parked here so the range entry can share
+; utxo_lsm_compact's body: lo = first manifest index of the batch, k = run
+; count (0 = the classic "oldest min(n,64)" batch). See .cc_bs_default.
+mac_cr_lo:                 resq 1
+mac_cr_k:                  resq 1
 section .text
 
 global utxo_lsm_set_defer_unlink
@@ -3405,7 +3410,23 @@ utxo_lsm_walk:
 ;   publish leaves the old manifest+old runs fully intact and correct.
 ; ============================================================================
 global utxo_lsm_compact
+; utxo_lsm_compact_range(lst, lo, k): merge manifest entries [lo, lo+k) into
+; one run that takes index lo. Leveled compaction's entry (daemon/utxo_live.c
+; picks lo/k by size ratio): lo == 0 is the classic base merge; lo > 0 must
+; end at the newest run, and then tombstones are KEPT in the output -- they
+; still cancel puts in the runs below. Returns like utxo_lsm_compact; a bad
+; range (k < 2, k > COMPACT_MAX_RUNS, past the end, or in the middle) is a
+; no-op returning 0.
+global utxo_lsm_compact_range
+utxo_lsm_compact_range:
+    mov  [rel mac_cr_lo], rsi
+    mov  [rel mac_cr_k], rdx
+    jmp  utxo_lsm_compact.cc_entry
+
 utxo_lsm_compact:
+    mov  qword [rel mac_cr_lo], 0
+    mov  qword [rel mac_cr_k], 0
+.cc_entry:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -3415,12 +3436,38 @@ utxo_lsm_compact:
     push r15
     sub  rsp, 0x400
     mov  r12, rdi                   ; lst
-
     mov  rax, [r12+120]              ; manifest_n
     cmp  rax, 2
     jb   .cc_noop                     ; 0 or 1 runs -> nothing to compact
     mov  [rbp-0x210], rax             ; original manifest_n (for the full-merge test)
-
+    mov  qword [rbp-0x240], 0         ; lo: first manifest index of the batch
+    mov  qword [rbp-0x248], 0         ; keep_dels: 1 iff older runs exist below the batch
+    mov  rcx, [rel mac_cr_k]
+    test rcx, rcx
+    jz   .cc_bs_default
+    ; explicit range: 2 <= k <= COMPACT_MAX_RUNS, inside the manifest, and
+    ; anchored at the oldest run (lo == 0) or ending at the newest (lo+k == n).
+    ; A merge in the middle would put a fresh-gen run below older survivors
+    ; and break the manifest's gen-ascending order that get() relies on.
+    cmp  rcx, 2
+    jb   .cc_noop
+    cmp  rcx, COMPACT_MAX_RUNS
+    ja   .cc_noop
+    mov  rdx, [rel mac_cr_lo]
+    add  rdx, rcx
+    cmp  rdx, rax
+    ja   .cc_noop
+    cmp  qword [rel mac_cr_lo], 0
+    je   .cc_bs_range_ok
+    cmp  rdx, rax
+    jne  .cc_noop
+    mov  qword [rbp-0x248], 1         ; runs below the batch: tombstones must survive
+.cc_bs_range_ok:
+    mov  rdx, [rel mac_cr_lo]
+    mov  [rbp-0x240], rdx
+    mov  rax, rcx
+    jmp  .cc_bs_ok
+.cc_bs_default:
     mov  rcx, COMPACT_MAX_RUNS
     cmp  rax, rcx
     jbe  .cc_bs_ok
@@ -3450,8 +3497,9 @@ utxo_lsm_compact:
     cmp  rax, r14
     jae  .cc_open_done
 
-    ; manifest entry i -> gen, run_no
+    ; manifest entry lo+i -> gen, run_no
     mov  rcx, rax
+    add  rcx, [rbp-0x240]
     shl  rcx, 4
     mov  rdx, [r12+104]
     add  rdx, rcx
@@ -3729,10 +3777,17 @@ utxo_lsm_compact:
     call mac_memcpy
     pop  rax
 
-    ; ---- emit the winner if it's a PUSH (DEL is always safe to drop) ----
+    ; ---- emit the winner: a PUSH always; a DEL only when older runs exist
+    ; below the batch (keep_dels), where it still cancels their puts. A batch
+    ; anchored at the oldest run has nothing below it, so DEL is dropped. ----
     movzx eax, byte [rax+76]                  ; type
     cmp  eax, 1
+    je   .cc_wr_emit
+    cmp  qword [rbp-0x248], 0
+    je   .cc_wr_skip
+    cmp  eax, 2
     jne  .cc_wr_skip
+.cc_wr_emit:
 
     ; ---- sparse index sampling: sample every SPARSE_STRIDEth EMITTED
     ; record's (key, file_offset), checked BEFORE true_nrec's increment
@@ -3773,6 +3828,8 @@ utxo_lsm_compact:
     test rax, rax
     jnz  .cc_err_close
     mov  rdx, [rbp-0xB0]
+    cmp  byte [rdx+76], 1
+    jne  .cc_wr_bloom                            ; DEL: key+type only, exactly as mac_flush writes it
     mov  rdi, [rbp-0x58]
     ; value(8)+slen(2)+height(4)+is_coinbase(1) = 15 contiguous bytes, same
     ; order as the on-disk PUSH record (see mac_compact_read_rec's header
@@ -3975,14 +4032,21 @@ utxo_lsm_compact:
     ;      test compaction merges everything, leaving zero survivors and
     ;      thus no ordering to get wrong. ----
     mov  rdi, [r12+104]                    ; manifest_buf
+    mov  rcx, [rbp-0x240]                  ; the merged entry takes the batch's first index (lo)
+    shl  rcx, 4
+    add  rdi, rcx
     mov  rax, [rbp-0x68]                    ; out_gen
     mov  [rdi], rax
     mov  rax, [rbp-0x60]                     ; out_run_no
     mov  [rdi+8], rax
 
     mov  rax, [r12+120]                   ; manifest_n
-    mov  [rbp-0x78], r14                    ; src index, starts at batch_size
-    mov  qword [rbp-0x90], 1                  ; dst index, starts at 1 (0 is the merged entry, just written above)
+    mov  rdx, r14
+    add  rdx, [rbp-0x240]
+    mov  [rbp-0x78], rdx                    ; src index, starts at lo + batch_size
+    mov  rdx, [rbp-0x240]
+    inc  rdx
+    mov  [rbp-0x90], rdx                    ; dst index, starts at lo + 1 (lo is the merged entry)
 .cc_shift_loop:
     mov  rdx, [rbp-0x78]
     cmp  rdx, rax
