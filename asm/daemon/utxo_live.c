@@ -196,18 +196,28 @@ struct lsm_state g_utxo_lst;
  * the manifest), so it runs in a forked child now while apply continues.
  *
  * The one shared thing is the MANIFEST, and the protocol is:
- *   - the child publishes it exactly as before (tmp + fsync + rename) but
- *     DEFERS unlinking its input runs (mac_compact_defer_unlink): the parent
- *     still holds the old manifest and may open those runs by name;
- *   - the parent adopts on exit: re-reads the manifest file, bumps the reader
- *     cache epoch, THEN unlinks the inputs the new manifest no longer names;
- *   - mac_flush -- the only other manifest writer, triggered inside the asm
- *     put where C cannot see it -- calls a hook first, and the hook waits for
- *     a running child. Two manifest writers can never overlap.
- * Crash safety is unchanged: a parent that dies mid-child leaves a child that
- * finishes an atomic rename plus orphaned inputs (already tolerated); a child
+ *   - the child merges with unlink AND publish deferred
+ *     (utxo_lsm_set_defer_unlink/_publish): it writes its result manifest to
+ *     utxo_manifest.child and leaves its input runs on disk. The parent still
+ *     holds the old manifest and may open those runs by name; unlinking under
+ *     it would turn a lookup into a false miss;
+ *   - the parent keeps applying AND flushing meanwhile (a flush publishes the
+ *     manifest itself; the run numbers/gens the child uses were reserved
+ *     before it forked, so they cannot collide);
+ *   - on exit the parent adopts (lsm_manifest_adopt_child): [child's entries]
+ *     + [runs flushed since fork], live counter healed by the persisted
+ *     base's movement (the file's count is RUNS-ONLY, the running one also
+ *     has the WAL tail -- the inline compaction's own rule), publishes,
+ *     bumps the reader-cache epoch, THEN unlinks the inputs;
+ *   - mac_flush calls a hook first (utxo_lsm_set_flush_hook); the hook
+ *     adopts a finished child promptly so a flush never has to wait.
+ * Crash safety: a parent that dies mid-child leaves the manifest untouched
+ * (inputs present, the child's output an orphan); a child that dies leaves
+ * one orphan run. Orphans are swept at boot (lsm_manifest_sweep_orphans),
+ * before any writer exists. Shutdown kills the child; the merge is redone.
  * that dies leaves the manifest untouched and one orphan output run. */
 extern void utxo_lsm_set_defer_unlink(long on);
+extern void utxo_lsm_set_defer_publish(long on);
 extern void utxo_lsm_set_flush_hook(void (*fn)(void));
 extern void lsm_mm_invalidate_all(void);
 static pid_t   g_cmp_pid = 0;
@@ -218,6 +228,8 @@ static long    g_cmp_height = 0;
 static void (*g_cmp_prev_sigchld)(int) = 0;
 static int     g_cmp_fallbacks = 0;
 static u64     g_cmp_old_base = ~0ULL;   /* persisted runs-only live count at fork time */
+static int     g_cmp_is_full = 0;        /* the k inputs were the whole manifest at fork */
+static u64     g_cmp_child_run = 0;      /* run_no reserved for the child's output */
 
 static void unlink_run(u64 run_no){
     char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)run_no); unlink(n);
@@ -231,28 +243,26 @@ static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
     if (WIFEXITED(st) && WEXITSTATUS(st) == 0){
-        u64 new_base = ~0ULL;
-        if (lsm_manifest_read(&g_utxo_lst, &new_base) != 0){
-            /* keep the old in-memory manifest: its runs are all still on disk
-             * (unlink was deferred), so this process stays consistent; the
-             * next reload will pick the new manifest up. */
-            fprintf(stderr, "[utxo_live] background compaction finished but the manifest is unreadable -- keeping the old run set in memory\n");
+        u64 nbase = ~0ULL;
+        if (lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase) != 0){
+            /* keep the old manifest: its runs are all still on disk (unlink
+             * was deferred), so this process stays consistent. The child's
+             * output is an orphan; drop it now rather than at next boot. */
+            unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
+            fprintf(stderr, "[utxo_live] background compaction finished in %.1fs but its manifest did not reconcile with ours -- discarded (run %lu), old run set kept\n",
+                    secs, (unsigned long)g_cmp_child_run);
         } else {
             lsm_mm_invalidate_all();
-            /* total_live in memory = runs + WAL tail; the file holds runs only.
-             * A full merge re-derives the runs-only base exactly, so heal the
-             * running counter by the base's movement, as compaction does
-             * inline (bitcoin_utxo_lsm.asm, "decide the live-count field"). */
-            if (new_base != ~0ULL && g_cmp_old_base != ~0ULL)
-                g_utxo_lst.total_live += new_base - g_cmp_old_base;
             int gone = 0;
             for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
-            fprintf(stderr, "[utxo_live] background compaction done in %.1fs: manifest_n %lu -> %lu, %d input run(s) unlinked (started at height %ld; apply never waited)\n",
-                    secs, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, gone, g_cmp_height);
+            long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
+            fprintf(stderr, "[utxo_live] background compaction done in %.1fs: manifest_n %lu -> %lu (%d merged into run %lu, %ld flushed meanwhile), %d input run(s) unlinked (started at height %ld; apply never waited)\n",
+                    secs, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, g_cmp_nin, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_height);
         }
     } else {
-        fprintf(stderr, "[utxo_live] background compaction FAILED after %.1fs (%s %d) -- manifest unchanged, its partial run is an orphan\n",
-                secs, WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+        unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
+        fprintf(stderr, "[utxo_live] background compaction FAILED after %.1fs (%s %d) -- manifest unchanged, partial run %lu removed\n",
+                secs, WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st), (unsigned long)g_cmp_child_run);
     }
     g_cmp_pid = 0;
     if (g_cmp_prev_sigchld) signal(SIGCHLD, g_cmp_prev_sigchld);
@@ -262,18 +272,10 @@ static void compact_poll(void){
     int st; pid_t r = waitpid(g_cmp_pid, &st, WNOHANG);
     if (r == g_cmp_pid) compact_adopt(st);
 }
-static void compact_wait(void){
-    if (!g_cmp_pid) return;
-    int st; while (waitpid(g_cmp_pid, &st, 0) < 0 && errno == EINTR) {}
-    compact_adopt(st);
-}
-/* mac_flush's gate: a flush is about to rewrite the manifest. */
-static void compact_flush_hook(void){
-    if (g_cmp_pid){
-        fprintf(stderr, "[utxo_live] flush due while background compaction pid %d runs -- waiting for it first\n", (int)g_cmp_pid);
-        compact_wait();
-    }
-}
+/* mac_flush's gate: a flush is about to rewrite the manifest. It no longer
+ * waits for anything -- run numbers are reserved, adoption reconciles -- it
+ * just adopts a finished child first so the flush builds on the merged set. */
+static void compact_flush_hook(void){ compact_poll(); }
 static int compact_start_async(long height, const char* why){
     if (g_cmp_pid) return 0;
     if (g_utxo_lst.manifest_n < (u64)utxo_live_compact_threshold()) return 0;
@@ -300,9 +302,14 @@ static int compact_start_async(long height, const char* why){
          * atexit, nothing but the merge. */
         utxo_lsm_set_flush_hook(0);
         utxo_lsm_set_defer_unlink(1);
+        utxo_lsm_set_defer_publish(1);
         long cr = utxo_lsm_compact(&g_utxo_lst);
         _exit(cr > 0 ? 0 : 2);
     }
+    /* reserve the child's output number and generation: it uses the values
+     * it inherited; our next flush must skip them. */
+    g_cmp_child_run = g_utxo_lst.next_run_no; g_utxo_lst.next_run_no++; g_utxo_lst.next_gen++;
+    g_cmp_is_full = ((u64)g_cmp_nin == g_utxo_lst.manifest_n);
     g_cmp_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_cmp_t0);
     fprintf(stderr, "[utxo_live] compaction of %d run(s) started in background pid %d (%s at height %ld) -- apply continues\n",
             g_cmp_nin, (int)p, why, height);
@@ -1792,6 +1799,12 @@ int utxo_live_init(const char* dir){
     }
 
     g_applied_height = read_applied_height();
+    /* reload succeeded: the in-memory manifest is the truth, so sweep run files
+     * it does not name (publish-before-unlink crash leftovers, abandoned
+     * background merges). Guarded: refuses unless file and memory agree. */
+    { int sw = lsm_manifest_sweep_orphans(&g_utxo_lst);
+      if (sw > 0) fprintf(stderr, "[utxo_live] init: swept %d orphan file(s) the manifest does not name\n", sw);
+      else if (sw < 0) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- manifest file and memory disagree\n"); }
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
             dir, g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
             have_prior_state ? "reload" : "fresh",
