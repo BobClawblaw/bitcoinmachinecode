@@ -206,7 +206,7 @@ static void txr_recon_expire(void){
  * drops were evictions once nothing expired by TTL any more). */
 #define TXR_ORPHAN_MAX       2048
 #define TXR_ORPHAN_BYTES     (8u << 20)
-#define TXR_ORPHAN_TTL_MS    120000
+#define TXR_ORPHAN_TTL_MS    300000    /* 5 min: deep chains resolve slower than 2 min; 2048 slots absorb the residency */
 #define TXR_ORPHAN_PARENTS   8          /* parent txids remembered per orphan */
 typedef struct {
     u8* buf; u32 len;
@@ -822,6 +822,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             static u8 gd[1 + TXR_MAX_REQ*36];
             unsigned want = 0;
             for (unsigned long i = 0; i < n && want < TXR_MAX_REQ; i++){
+                if (outstanding + (int)want >= 100) break;     /* Core's per-peer in-flight cap */
                 const u8* e = pl + cc + i*36;
                 if (e + 36 > pl + plen) break;
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 |
