@@ -62,6 +62,7 @@ extern long utxo_lsm_count(void* lst);
  * declaration here truncated it to 32 bits. */
 extern long utxo_lsm_walk(void* lst, void* u, void* cb, void* ctx);
 extern long utxo_lsm_compact(void* lst);
+extern long utxo_lsm_compact_range(void* lst, unsigned long lo, unsigned long k);
 extern void utxo_lsm_close(void* lst);
 
 /* ---- STAGE B: per-block undo data (daemon/undo_log.c) --------------------
@@ -276,13 +277,29 @@ static void compact_poll(void){
  * waits for anything -- run numbers are reserved, adoption reconciles -- it
  * just adopts a finished child first so the flush builds on the merged set. */
 static void compact_flush_hook(void){ compact_poll(); }
+/* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
+ * from the run files themselves. Returns k, sets *lo. */
+static long compact_pick_now(long* lo){
+    long n = (long)g_utxo_lst.manifest_n;
+    if (n < 2) return 0;
+    static u64 sizes[256];
+    if (n > 256) n = 256;
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (long i = 0; i < n; i++){
+        u64 r; memcpy(&r, e + i*16 + 8, 8);
+        char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)r);
+        struct stat sb; sizes[i] = stat(nm, &sb) == 0 ? (u64)sb.st_size : 0;
+    }
+    return lsm_compact_pick(sizes, n, utxo_live_compact_threshold(), 64, lo);
+}
+static long g_cmp_lo = 0;
 static int compact_start_async(long height, const char* why){
     if (g_cmp_pid) return 0;
-    if (g_utxo_lst.manifest_n < (u64)utxo_live_compact_threshold()) return 0;
-    /* The merge folds the OLDEST min(manifest_n, 64) runs -- index 0 upward. */
-    g_cmp_nin = (int)(g_utxo_lst.manifest_n < 64 ? g_utxo_lst.manifest_n : 64);
+    long lo = 0, k = compact_pick_now(&lo);
+    if (k == 0) return 0;
+    g_cmp_nin = (int)k; g_cmp_lo = lo;
     const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
-    for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + i*16 + 8, 8);
+    for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + (lo + i)*16 + 8, 8);
     g_cmp_n_before = g_utxo_lst.manifest_n; g_cmp_height = height;
     g_cmp_old_base = lsm_manifest_persisted_live();
     /* SIGCHLD is SIG_IGN in the download worker (children auto-reap), which
@@ -293,7 +310,7 @@ static int compact_start_async(long height, const char* why){
         signal(SIGCHLD, g_cmp_prev_sigchld);
         g_cmp_fallbacks++;
         fprintf(stderr, "[utxo_live] fork for background compaction failed (%s) -- compacting inline\n", strerror(errno));
-        long cr = utxo_lsm_compact(&g_utxo_lst);
+        long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
         fprintf(stderr, "[utxo_live] %s compact at height %ld: manifest_n=%lu -> result=%ld\n", why, height, (unsigned long)g_utxo_lst.manifest_n, cr);
         return 1;
     }
@@ -303,16 +320,17 @@ static int compact_start_async(long height, const char* why){
         utxo_lsm_set_flush_hook(0);
         utxo_lsm_set_defer_unlink(1);
         utxo_lsm_set_defer_publish(1);
-        long cr = utxo_lsm_compact(&g_utxo_lst);
+        long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
         _exit(cr > 0 ? 0 : 2);
     }
     /* reserve the child's output number and generation: it uses the values
      * it inherited; our next flush must skip them. */
     g_cmp_child_run = g_utxo_lst.next_run_no; g_utxo_lst.next_run_no++; g_utxo_lst.next_gen++;
-    g_cmp_is_full = ((u64)g_cmp_nin == g_utxo_lst.manifest_n);
+    g_cmp_is_full = (lo == 0 && (u64)g_cmp_nin == g_utxo_lst.manifest_n);
     g_cmp_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_cmp_t0);
-    fprintf(stderr, "[utxo_live] compaction of %d run(s) started in background pid %d (%s at height %ld) -- apply continues\n",
-            g_cmp_nin, (int)p, why, height);
+    fprintf(stderr, "[utxo_live] compaction of %d run(s) [%ld..%ld) of %lu started in background pid %d (%s at height %ld; %s) -- apply continues\n",
+            g_cmp_nin, lo, lo + k, (unsigned long)g_utxo_lst.manifest_n, (int)p, why, height,
+            g_cmp_is_full ? "full merge" : lo == 0 ? "oldest runs" : "newest runs, tombstones kept");
     return 1;
 }
 /* For the daemon's shutdown path: a child mid-merge is killed, not awaited --
@@ -1804,10 +1822,11 @@ int utxo_live_init(const char* dir){
      * steady-state catch-up uses (UTXO_LIVE_COMPACT_THRESHOLD). Bounded by
      * manifest_cap iterations so a compact() that stops making progress
      * (e.g. every remaining run already merged) can't spin forever. */
-    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && guard < UTXO_LIVE_MANIFEST_CAP; guard++){
+    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
         u64 before = g_utxo_lst.manifest_n;
-        if (before < 2) break;
-        long cr = utxo_lsm_compact(&g_utxo_lst);
+        long lo = 0, k = compact_pick_now(&lo);
+        if (k == 0) break;
+        long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
         fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
         if (g_utxo_lst.manifest_n >= before) break; /* no progress -- stop rather than loop */
