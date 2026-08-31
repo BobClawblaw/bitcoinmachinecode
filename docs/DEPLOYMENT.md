@@ -793,3 +793,38 @@ surgically with `tests/tool_utxo_del` (appends an ordinary WAL tombstone;
 remove `coinstats.dat` alongside so the index re-seeds) and then verified
 muhash-identical to the oracle. Mainnet was never affected (its hash was in
 the list from the start).
+
+## Policy parity vs Core v30/v31, round two (2026-08-31, later)
+
+Verified live against the local Core v31 node (`/home/svc/bitcoin`, mainnet,
+txindex): **production's whole UTXO set is muhash-identical to Core at height
+964914** -- the first mainnet oracle comparison since 963967.
+
+New policy enforcement (all in the mempool accept path, before script
+verification, Core's PreChecks order; `tests/test_policy_v31` and new
+`test_mempool_policy` scenarios pin them):
+
+- `MAX_TX_LEGACY_SIGOPS` (2,500, v30) over input scriptSigs + output
+  scriptPubKeys ("bad-txns-legacy-sigops");
+- `MAX_STANDARD_TX_SIGOPS_COST` (16,000) using the accurate BIP141 walker
+  ("bad-txns-too-many-sigops");
+- `bytespersigop` (20): fee floors judge a sigop-dense tx at
+  max(vsize, sigop_cost x 5) vbytes;
+- IsWitnessStandard for P2WSH: <= 100 stack items, <= 80 bytes each,
+  witnessScript <= 3,600 ("bad-witness-nonstandard"); tapscript judged
+  conservatively (annexed inputs skipped);
+- **cluster limits** (v31's too-large-cluster): the connected component a tx
+  joins may not exceed 64 transactions / 101 kvB, found by a bounded BFS at
+  admission -- catches wide shapes (64 independent parents + one child) that
+  ancestor/descendant counts alone admit.
+
+Also: mempool reload orphan tuning (orphan TTL 5 min, per-leg in-flight cap
+100), `bitcoin_cli` client timeouts (10 s connect, 60 s read/write), gettxout
+retries briefly instead of erroring while the worker is busy, and the per-tx
+"reject (policy)" line is muted like the txval one.
+
+**Archive re-layout tool**: `tests/tool_archive_relayout <archive> <out>` reads
+index.dat, rewrites every frame in height order (128 MiB rotation), writes a
+matching index, verifies every block hash, and leaves the swap to the
+operator. Clears the "NOT laid out monotonically" boot warning so truncation
+and pruning can run. Run it offline (daemon stopped).
