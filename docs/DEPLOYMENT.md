@@ -828,3 +828,11 @@ index.dat, rewrites every frame in height order (128 MiB rotation), writes a
 matching index, verifies every block hash, and leaves the swap to the
 operator. Clears the "NOT laid out monotonically" boot warning so truncation
 and pruning can run. Run it offline (daemon stopped).
+
+## Log rotation (2026-08-31)
+
+`bmc-logrotate.timer` (systemd, every 15 min) runs logrotate against
+`config/logrotate-bmc.conf` -- the repo-tracked config whose `size` value
+(2M by default) is THE knob. `copytruncate` keeps systemd's append fd valid;
+60 compressed rotations are kept in `logs/`. The 84.7 MB log that prompted
+this was rotated on install.
