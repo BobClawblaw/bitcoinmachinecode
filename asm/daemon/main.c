@@ -4150,7 +4150,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
-                    if(result==1) fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs\n", relayed, mux_n_out);
+                    /* every mempool.dat reload streams through this channel:
+                     * 4,470 lines in two minutes after deploy j. One line per
+                     * 5 s; the count rides along. */
+                    if(result==1){
+                        static long srt_last, srt_muted;
+                        long now_s = (long)time(NULL);
+                        if(now_s - srt_last >= 5){
+                            fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs%s\n",
+                                    relayed, mux_n_out,
+                                    srt_muted ? " (repeats muted; +N shows in the tx_accept summary)" : "");
+                            srt_last = now_s; srt_muted = 1;
+                        }
+                    }
                 }
             } else { result=-4; snprintf(reason,sizeof reason,"mempool init failed"); }
             snprintf((char*)g_node_status->tx_submit_reason, sizeof g_node_status->tx_submit_reason, "%s", reason);
@@ -5418,7 +5430,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
                             hok==1?"connected":"handshake failed", v2res, getpid(), pv);
                     if(hok==1)
-                        node_serve_loop(c, node_log_open(g_logpath), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+                        node_serve_loop(c, (mkdir("logs", 0755), node_log_open(g_logpath)), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
                 }
                 close(c);
@@ -5704,7 +5716,9 @@ int main(int argc, char** argv){
      * never interleave with the mainnet log. */
     mkdir("logs", 0755);
     if(g_chainp->id != CHAIN_MAIN)
-        snprintf(g_logpath, sizeof g_logpath, "logs/bitcoind.%s.log", g_chainp->name);
+        ;   /* logs/bitcoind.log inside the CHAIN's directory -- per-chain by
+             * location now that every chain (main included) has its own
+             * subdirectory; the old bitcoind.<chain>.log suffix is redundant */
     /* `dir` is the EFFECTIVE (per-chain) datadir from here on: the forked
      * download worker re-chdir()s into it and utxo_live opens its files
      * there -- on the first regtest boot the worker's chdir(absp) put the
@@ -5730,7 +5744,7 @@ int main(int argc, char** argv){
         /* Connect to a built-in loopback fake peer (forked in-process), exactly
          * like the verified tests/test_bitcoind_sync harness, so the IBD
          * exchange matches node_sync cadence. */
-        int lfd = node_log_open(g_logpath);   /* all-asm leveled logger */
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (sync mode)", 22);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -5764,7 +5778,7 @@ int main(int argc, char** argv){
          * a re-derived-hash guard, and store_appends into the block store. */
         static unsigned char hstb[256];
         if(hst_init(hstb)!=1){ fprintf(stderr,"hst_init failed\n"); return 1; }
-        int lfd = node_log_open(g_logpath);
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
         node_log_str(lfd, 0, "node start (ibd mode)", 21);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -5792,7 +5806,7 @@ int main(int argc, char** argv){
          * mines after we synchronized. Logs tip growth each pass. This is the
          * live synchronization loop over the verified asm IB D core. */
         store_reload(store_buf);            /* continue from persisted tip */
-        int lfd = node_log_open(g_logpath);
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
         node_log_str(lfd, 0, "node start (follow mode)", 23);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -5894,7 +5908,7 @@ int main(int argc, char** argv){
             printf("[server-test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
             exit((ok0&&okh)?0:2);
         }else{
-            int lfd=node_log_open(g_logpath);
+            int lfd=(mkdir("logs", 0755), node_log_open(g_logpath));
             close(sv[1]);
             int svo=serve_loop(sv[0], lfd);
             int st; waitpid(pid,&st,0); close(sv[0]);
@@ -6120,7 +6134,7 @@ int main(int argc, char** argv){
         build_hash_index();                 /* hash->height for O(1) getdata serving */
         fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
 
-        int lfd = node_log_open(g_logpath);   /* all-asm leveled logger */
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly
          * (fork-based inbound serving in the parent) AND continuously download
@@ -6218,7 +6232,7 @@ int main(int argc, char** argv){
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
-        int lfd = node_log_open(g_logpath);
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         wb_listen_open();
