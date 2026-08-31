@@ -405,3 +405,9 @@ asm/daemon/bitcoind.deploy-*
 # ARM port build artifacts (this branch)
 scratch_daemon/
 port/arm64/daemon_out/
+# The live node config: it carries rpcuser/rpcpassword and, on a real node,
+# the operator's own addresses. config/bitcoin.sample.conf is the tracked
+# one and documents every key at its default. (2026-08-29)
+bitcoin.conf
+config/bitcoin.conf
+asm/.link-audit-cache/

@@ -34,24 +34,67 @@ different* section below.
 
 ## Where to look
 
+Every document except this one lives under [`docs/`](docs/) — see
+[`docs/README.md`](docs/README.md) for the full index.
+
 | document | what it is |
 |---|---|
-| **`ASSESSMENT.md`** | **An honest assessment of capability and speed vs Bitcoin Core.** Read this before believing any performance claim, including the ones in this README. |
-| `FEATURE_GAPS.md` | What this node does **not** implement, kept deliberately unflattering. |
-| `LOG.md` | Narrative of every defect found, including the wrong diagnoses and how they were overturned. |
-| `PERF_SCOPE.md` | Profiles, benchmarks, and the methodology behind each number — including which numbers are contaminated and why. |
-| `PLAN_SCRIPT_VERIFY.md` | The consensus-verification plan, and a one-line-per-wall table of every block that stopped the replay. |
-| `CHAIN_AHEAD_CENSUS.md` | Survey of the un-replayed chain against verifier limits, with an appended record of what it got right and wrong. |
-| `ENGINEERING_RULES.md` | The rules this project imposes on itself, each one earned by a specific failure. |
-| `docs/PARITY_PLAN.md` | Method-by-method RPC parity state: what is implemented, how each method was verified, and what is deliberately absent. |
-| `DEPLOYMENT.md` | How to run the daemon, prefaced by the reasons you should not. |
+| **[`docs/devlog/ASSESSMENT.md`](docs/devlog/ASSESSMENT.md)** | **An honest assessment of capability and speed vs Bitcoin Core.** Read this before believing any performance claim, including the ones in this README. |
+| [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md) | What this node does **not** implement, kept deliberately unflattering. |
+| [`docs/audits/`](docs/audits/) | External security audits and this project's written responses — including the mistakes made while remediating. |
+| [`docs/devlog/LOG.md`](docs/devlog/LOG.md) | Narrative of every defect found, including the wrong diagnoses and how they were overturned. |
+| [`docs/devlog/PERF_SCOPE.md`](docs/devlog/PERF_SCOPE.md) | Profiles, benchmarks, and the methodology behind each number — including which numbers are contaminated and why. |
+| [`docs/devlog/PLAN_SCRIPT_VERIFY.md`](docs/devlog/PLAN_SCRIPT_VERIFY.md) | The consensus-verification plan, and a one-line-per-wall table of every block that stopped the replay. |
+| [`docs/devlog/CHAIN_AHEAD_CENSUS.md`](docs/devlog/CHAIN_AHEAD_CENSUS.md) | Survey of the un-replayed chain against verifier limits, with an appended record of what it got right and wrong. |
+| [`docs/ENGINEERING_RULES.md`](docs/ENGINEERING_RULES.md) | The rules this project imposes on itself, each one earned by a specific failure. |
+| [`docs/PARITY_PLAN.md`](docs/PARITY_PLAN.md) | Method-by-method RPC parity state: what is implemented, how each method was verified, and what is deliberately absent. |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | How to run the daemon, prefaced by the reasons you should not. |
 | `worklog/` | Dated terse action logs. |
 
 ## Status
 
-**Current state (2026-08-27). A live full node on mainnet with the Core RPC
+**Current state (2026-08-30). A live full node on mainnet with the Core RPC
 surface, all three optional indexes, a Core-style mempool, wallet-at-rest
-encryption, and a regtest mode proven block-for-block against Bitcoin Core.**
+encryption, BIP324 v2 encrypted transport, and a regtest mode proven
+block-for-block against Bitcoin Core.**
+
+Gate at this revision: **265 test binaries, 1,368 assertions, zero failures**,
+plus `abi-check` over 1,194 call sites, `prereq-check` over 354 Makefile rules,
+and `runlist-check` confirming every test is either gated or declared manual
+with a reason.
+
+### Since 2026-08-29
+
+**BIP324 v2 encrypted transport — live on mainnet.** Both directions, verified
+against Bitcoin Core v31.99 with byte-identical session IDs, and v1 fallback
+that leaves a v1 peer's first message untouched. Pinned by the official BIP324
+vectors: 76/76 ElligatorSwift decode, 256/256 reverse-map branch cases, 7/7
+end-to-end packet vectors. Outbound is gated on the peer advertising
+`NODE_P2P_V2`, as Core does.
+
+**An independent security audit was run against the tree, and answered.** Ten
+of its eleven findings are resolved; the responses in [`docs/audits/`](docs/audits/)
+record what each fix was verified *against* — real Core, 1,172 real mainnet
+transactions, ThreadSanitizer, the deployed binary's own ELF headers — and the
+three mistakes made while remediating, including one that briefly disabled the
+RPC server and one that leaked a wallet mnemonic into a debugger backtrace.
+
+Notable fixes from that round: a missing consensus `MAX_MONEY` check
+(CVE-2010-5139 shape), an unbounded JSON parser recursion that could be driven
+to a stack-exhaustion crash, an inbound `inv` count read as a single byte
+(silently misparsing any vector above 252 entries), an executable stack, and a
+wallet passphrase stored beside the wallet it protected.
+
+The remaining finding is structural and not closeable by a patch: this is
+hand-written consensus assembly with a documented false-ACCEPT history, and no
+amount of internal review retires that. The warning below stands.
+
+**Erlay (BIP330) is deliberately partial.** The negotiation half is
+implemented and tested; the reconciliation rounds are not built, because
+Bitcoin Core does not implement them either — there is no running
+implementation to test against, and this project verifies against Core rather
+than against its own reading of a specification. See
+[`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md).
 
 The daemon (`bmc-bitcoind`) follows the mainnet tip unattended and is verified
 continuously against a local Core node. On top of the byte-identical UTXO set
@@ -1020,7 +1063,8 @@ except where the node is deliberately more conservative. Parsed in
 
 | key | default | meaning |
 |---|---|---|
-| `chain` | `main` | `main` or `regtest`. `testnet`/`signet` are recognised and **refused** (the node will not start on a chain whose rules it does not implement). |
+| `chain` | `main` | `main`, `signet`, `testnet4` or `regtest`. Legacy `testnet`/`test` (testnet3) is recognised and **refused** — the node will not start on a chain whose rules it does not implement. |
+| `signetchallenge` | *(default signet)* | Hex block challenge for a CUSTOM signet. It also determines the network magic, so two signets with different challenges cannot hear each other. Core drops the chain-work floor and DNS seeds for a custom signet; so does this node. |
 | `regtest` | `0` | `regtest=1` is the boolean form of `chain=regtest`. |
 
 Each non-main chain runs in its own datadir subtree (`<datadir>/regtest/`) with
@@ -1076,11 +1120,25 @@ datadir root. See *Storing the chain*.
 | key | default | meaning |
 |---|---|---|
 | `signer` | — | external signer command (Core `-signer` / HWI). |
-| `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` / `zmqpubsequence` | — | ZMQ publisher endpoints (`tcp://…`), one per topic. |
+| `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` / `zmqpubsequence` | — | ZMQ publisher endpoints (`tcp://…`), one per topic. `tcp://*` is **refused**: a ZMQ publisher has no authentication, so the bind address is the whole access-control decision. Name an interface (`127.0.0.1`, or `0.0.0.0` if you mean it). |
+| `v2transport` | `1` | Accept inbound BIP324 v2 connections, and dial v2 to peers advertising `NODE_P2P_V2`. Off means v1 only. |
+| `walletpassfile` | — | Absolute path, **outside the datadir**, to a file holding the wallet passphrase. Refused if world-accessible, group-writable, or inside the datadir. |
 
-RPC credentials (`rpcuser`, `rpcpassword`, `rpcport`) are read from the same
-file by the embedded RPC server; `rpcport` defaults to `8332` (main) / `18443`
-(regtest).
+### RPC authentication
+
+`rpcport` defaults to `8332` (main) / `18443` (regtest) and the listener is
+loopback-only.
+
+**The cookie is the default credential.** `<datadir>/.cookie` is written 0600
+at startup, deleted on shutdown, and is what `bitcoin-cli` picks up
+automatically — no configuration needed.
+
+`rpcauth` (salted HMAC) is the right choice for a fixed credential.
+`rpcuser`/`rpcpassword` still work but store the secret in plaintext on disk;
+Core warns against them for that reason, and so does this node's own audit
+response. The server starts on **any** of the three and refuses to start only
+when none is available, since a listener nothing can authenticate against is
+worse than no listener.
 
 ## Exactly like Core vs. deliberately different
 
@@ -1140,8 +1198,13 @@ differential tests named.
   (Core itself refuses it for an arbitrary height; only muhash is stored by the
   index and answerable off-tip). Coinstats "extras" beyond the core fields are
   omitted, stated in the result.
-- **Only `main` and `regtest`.** `testnet` / `signet` are refused outright
-  rather than run under the wrong chain's rules.
+- **Chains: `main`, `signet`, `testnet4`, `regtest`.** Legacy `testnet`
+  (testnet3) is refused outright rather than run under the wrong chain's
+  rules. On signet the block SIGNATURE is the consensus rule in place of
+  meaningful proof of work (BIP325), and it is enforced: the node syncs the
+  public signet and holds the same chain as Core, and under a challenge
+  differing by one hex character it rejects real block 1 as
+  `bad-signet-blksig`.
 - **Not present at all** (also in `FEATURE_GAPS.md`): Tor/I2P/onion, REST
   interface, UPnP/NAT-PMP, GUI. Mining is `getblocktemplate`/`submitblock` with
   a *lower-bound* `sigops` and valid-but-not-fee-optimal tx ordering, no

@@ -96,6 +96,88 @@ static int txi_open_ro(void){
     return 1;
 }
 
+/* ---- persistent archive mappings ---------------------------------------
+ * store_map_at keeps ONE mapped block file per store state. Prevout parents
+ * are scattered across the whole archive, so consecutive lookups almost never
+ * land in the same file and that cache misses essentially every time: strace
+ * over 20 blocks counted 33,432 munmap / 33,492 mmap / 33,406 open -- about
+ * 1,670 full open+fstat+mmap+madvise+munmap+close cycles PER BLOCK, one per
+ * prevout.
+ *
+ * The cost is not the syscalls, it is the lock. mmap and munmap take
+ * mmap_lock for WRITE, so every resolver thread serialises against every
+ * other one, and each munmap additionally shoots down TLBs across all cores.
+ * That is why raising BFI_THREADS from 8 to 64 changed nothing -- the threads
+ * were queueing on mmap_lock, not waiting on the device.
+ *
+ * So map each blk file ONCE and never unmap it. 8,414 files x 128MB is ~1TB
+ * of address space and the VA budget is 128TB; resident memory is unchanged
+ * because these are file pages the kernel reclaims on its own. After this the
+ * fault path takes mmap_lock only for READ and the threads stop colliding. */
+#define MAXBLKF 65536
+static u8*   g_fbase[MAXBLKF];
+static size_t g_flen[MAXBLKF];
+static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER;
+static const u8* g_idxmap; static u64 g_idxlen;
+static int g_map_random = 1;
+
+/* map (or grow) blk<fno>.dat so that at least `need` bytes are addressable */
+static const u8* blkfile(unsigned fno, u64 need){
+    if (fno >= MAXBLKF) return NULL;
+    u8* b = __atomic_load_n(&g_fbase[fno], __ATOMIC_ACQUIRE);
+    if (b && need <= g_flen[fno]) return b;
+    pthread_mutex_lock(&g_fmu);
+    b = g_fbase[fno];
+    if (!b || need > g_flen[fno]){
+        char nm[24]; snprintf(nm, sizeof nm, "blk%05u.dat", fno);
+        int fd = open(nm, O_RDONLY);
+        if (fd >= 0){
+            struct stat sb;
+            if (fstat(fd, &sb) == 0 && (u64)sb.st_size >= need){
+                void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (m != MAP_FAILED){
+                    if (g_map_random) madvise(m, (size_t)sb.st_size, MADV_RANDOM);
+                    /* the tip file grows while we run: replace, never unmap the
+                     * old one -- another thread may still hold a pointer into it */
+                    g_flen[fno] = (size_t)sb.st_size;
+                    __atomic_store_n(&g_fbase[fno], (u8*)m, __ATOMIC_RELEASE);
+                    b = m;
+                }
+            }
+            close(fd);
+        }
+    }
+    pthread_mutex_unlock(&g_fmu);
+    return b;
+}
+
+/* height -> block payload, straight out of the persistent mapping.
+ * index.dat: 48-byte positional records, [32..35] file_no u32,
+ * [36..43] data_pos u64 (the [len][magic] frame), [44..47] data_size u32. */
+static const u8* block_at(u64 h, u64* blen){
+    if (!g_idxmap || (h + 1) * 48 > g_idxlen) return NULL;
+    const u8* r = g_idxmap + h * 48;
+    u32 fno = (u32)r[32] | ((u32)r[33]<<8) | ((u32)r[34]<<16) | ((u32)r[35]<<24);
+    u64 pos = 0; for (int i = 0; i < 8; i++) pos |= (u64)r[36+i] << (8*i);
+    u32 sz  = (u32)r[44] | ((u32)r[45]<<8) | ((u32)r[46]<<16) | ((u32)r[47]<<24);
+    const u8* base = blkfile(fno, pos + 8 + sz);
+    if (!base) return NULL;
+    *blen = sz;
+    return base + pos + 8;                 /* skip the [len][magic] frame */
+}
+
+static int idx_open_ro(void){
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size < 48){ close(fd); return 0; }
+    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return 0;
+    g_idxmap = m; g_idxlen = (u64)sb.st_size;
+    return 1;
+}
+
 static void* g_st;
 static u8* g_blockbuf2;                     /* parent-tx block reads */
 static u8* g_scratch;
@@ -154,10 +236,9 @@ static const u8* txi_find(rctx_t* rc, const u8 txid_wire[32], unsigned long* txl
         for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
         for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
         for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
-        u64 mo[2];
-        const u8* blk = store_map_at(rc->st, hh, mo);
+        u64 blen = 0;
+        const u8* blk = block_at(hh, &blen);
         if (!blk) continue;
-        u64 blen = mo[0];
         if (blen < 81 || (u64)off + ln > blen || ln > BLOCKBUF) continue;
         u8 got[32];
         if (tx_txid(got, blk + off, ln, rc->scratch, BLOCKBUF) != 1) continue;
@@ -173,10 +254,9 @@ static const u8* txi_find(rctx_t* rc, const u8 txid_wire[32], unsigned long* txl
         for (int b = 0; b < 4; b++) hh  |= (u32)r[8+b]  << (8*b);
         for (int b = 0; b < 4; b++) off |= (u32)r[12+b] << (8*b);
         for (int b = 0; b < 4; b++) ln  |= (u32)r[16+b] << (8*b);
-        u64 mo[2];
-        const u8* blk = store_map_at(rc->st, hh, mo);
+        u64 blen = 0;
+        const u8* blk = block_at(hh, &blen);
         if (!blk) continue;
-        u64 blen = mo[0];
         if (blen < 81 || (u64)off + ln > blen || ln > BLOCKBUF) continue;
         u8 got[32];
         if (tx_txid(got, blk + off, ln, rc->scratch, BLOCKBUF) != 1) continue;
@@ -186,6 +266,7 @@ static const u8* txi_find(rctx_t* rc, const u8 txid_wire[32], unsigned long* txl
     }
     return NULL;
 }
+
 
 /* small LRU of resolved parent txs (consolidations drain one parent) */
 static const u8* parent_tx(rctx_t* c, const u8 txid[32], unsigned long* len){
@@ -238,19 +319,53 @@ typedef struct {
 
 static void resolve_all(rctx_t* ctxs, int nthreads, req_t* reqs, long n);
 
+/* ---- resolve one PARENT, not one input ----------------------------------
+ * Two things were wrong with resolving each input independently.
+ *
+ * Inputs that spend the SAME parent transaction -- a consolidation draining
+ * one funder, an exchange batch, any tx with several inputs from one payer --
+ * each repeated the whole lookup: sparse binary search, record scan, archive
+ * read, and a double-SHA256 over the parent to verify it. Only the per-thread
+ * cache saved any of that.
+ *
+ * And the striping (i += nthreads) handed consecutive inputs to DIFFERENT
+ * threads. Those are exactly the inputs most likely to share a parent, and
+ * the caches are per-thread, so the one access pattern with real locality was
+ * split across caches that cannot see each other.
+ *
+ * Grouping by txid fixes both at once: each distinct parent is located, read
+ * and verified exactly once, and the members then differ only in which output
+ * they take -- pure pointer arithmetic over bytes already in hand. */
+static req_t* g_sortreqs;
+static int cmp_by_txid(const void* a, const void* b){
+    long ia = *(const long*)a, ib = *(const long*)b;
+    int c = memcmp(g_sortreqs[ia].op, g_sortreqs[ib].op, 32);
+    if (c) return c;
+    return (ia > ib) - (ia < ib);            /* stable: keeps output order */
+}
+static long* g_order;                        /* req indices, sorted by txid */
+static long* g_gstart;                       /* group i = order[gstart[i]..) */
+static long  g_ngroups, g_ordercap;
+static unsigned long long g_tot_inputs, g_tot_groups;   /* dedup accounting */
+
 static void* resolve_worker(void* v){
     worker_arg_t* w = (worker_arg_t*)v;
-    for (long i = w->id; i < w->n; i += w->nthreads){
-        req_t* r = &w->reqs[i];
+    for (long g = w->id; g < g_ngroups; g += w->nthreads){
+        long b = g_gstart[g], e = g_gstart[g+1];
+        req_t* first = &w->reqs[g_order[b]];
         unsigned long ptl;
-        const u8* ptx = parent_tx(w->ctx, r->op, &ptl);
-        const u8* spk; unsigned long slen;
-        if (!ptx || !tx_output_spk_fwd(ptx, ptl, r->vout, &spk, &slen)) continue;
-        r->spk = malloc(slen ? slen : 1);
-        if (!r->spk) continue;
-        memcpy(r->spk, spk, slen);
-        r->spklen = slen;
-        r->ok = 1;
+        const u8* ptx = parent_tx(w->ctx, first->op, &ptl);   /* ONCE per parent */
+        if (!ptx) continue;
+        for (long k = b; k < e; k++){
+            req_t* r = &w->reqs[g_order[k]];
+            const u8* spk; unsigned long slen;
+            if (!tx_output_spk_fwd(ptx, ptl, r->vout, &spk, &slen)) continue;
+            r->spk = malloc(slen ? slen : 1);
+            if (!r->spk) continue;
+            memcpy(r->spk, spk, slen);
+            r->spklen = slen;
+            r->ok = 1;
+        }
     }
     return NULL;
 }
@@ -261,6 +376,53 @@ static void* resolve_worker(void* v){
  * lifetime rules trivial. */
 static void resolve_all(rctx_t* ctxs, int nthreads, req_t* reqs, long n){
     if (n <= 0) return;
+    /* group the requests by parent txid so each parent is resolved once */
+    if (n + 1 > g_ordercap){
+        long c = n + 1024;
+        long* o = realloc(g_order, (size_t)c * sizeof *o);
+        long* gs = realloc(g_gstart, (size_t)(c + 1) * sizeof *gs);
+        if (!o || !gs){ free(o); free(gs); g_order = NULL; g_gstart = NULL; g_ordercap = 0; return; }
+        g_order = o; g_gstart = gs; g_ordercap = c;
+    }
+    for (long i = 0; i < n; i++) g_order[i] = i;
+    g_sortreqs = reqs;
+    qsort(g_order, (size_t)n, sizeof *g_order, cmp_by_txid);
+    g_ngroups = 0;
+    for (long i = 0; i < n; ){
+        g_gstart[g_ngroups++] = i;
+        long j = i + 1;
+        while (j < n && !memcmp(reqs[g_order[i]].op, reqs[g_order[j]].op, 32)) j++;
+        i = j;
+    }
+    g_gstart[g_ngroups] = n;
+    g_tot_inputs += (unsigned long long)n; g_tot_groups += (unsigned long long)g_ngroups;
+    /* ALSO MEASURED AND REJECTED (2026-08-29): a two-phase resolve -- locate
+     * every parent in the txid index first, sort those lookups into physical
+     * (height, offset) order, then read the archive as a forward sweep. It is
+     * the textbook fix for seek-bound random reads and it measured 3.32 blk/s
+     * against 3.74 for this code at the same height (848k): 0.89x, WORSE.
+     *
+     * Two reasons, both visible in iostat:
+     *   - Sorting cannot create adjacency here. A block has ~4,580 distinct
+     *     parents scattered over a 1.13 TB archive, so even perfectly sorted
+     *     the average gap between consecutive reads is ~246 MB. The seeks get
+     *     ordered, not eliminated -- and on NVMe there is no rotational
+     *     latency for that ordering to amortise. It is a spinning-disk
+     *     optimisation applied to flash.
+     *   - The barrier between phases COST concurrency: queue depth fell from
+     *     ~7.3 to 1.41, because phase one must finish before phase two starts
+     *     and the threads then drain unevenly.
+     * The output was byte-identical, so it was correct -- just slower. Do not
+     * retry without a device where seek ORDER actually matters.
+     */
+    /* MEASURED AND REJECTED (2026-08-29): batching madvise(WILLNEED) over every
+     * distinct parent before the workers start does raise the queue depth
+     * exactly as intended -- aqu-sz 7.5 -> ~500 -- and makes throughput WORSE.
+     * Over 1000 blocks it ran 5.67 blk/s against 7.51 and 8.87 for the plain
+     * build. The device delivers 12-17k reads/s whether the queue holds 7
+     * requests or 533, so depth was never the constraint and the madvise
+     * calls were pure added cost. Do not reintroduce this without a quiet
+     * machine and a number that survives a drift control. */
     if (nthreads <= 1){
         worker_arg_t a = { &ctxs[0], reqs, n, 0, 1 };
         resolve_worker(&a);
@@ -321,10 +483,15 @@ int main(int argc, char** argv){
     store_rd_init(store_buf);
     g_st = store_buf;
     store_map_init(g_st);      /* the mapping cache txi_find reads through */
-    /* This workload reads ONE transaction out of a block picked at random
-     * from the whole archive, so the kernel's readahead is pure waste --
-     * measured at ~45KB pulled in per 250 bytes used. */
+    /* MADV_RANDOM stays on for the ARCHIVE. The original reasoning counted
+     * BYTES saved, which is the wrong axis for a latency-bound workload --
+     * but measuring it the other way agreed anyway: off ran 92.68s against
+     * 53.75s. Applying the same MADV_RANDOM to the TXID INDEX, by contrast,
+     * was 2.2x SLOWER (67.26s vs 30.51s): a lookup there walks a <=256-record
+     * run, so readahead amortises the next fault instead of wasting it. Two
+     * mappings, opposite answers -- neither is guessable from byte counts. */
     store_map_random(1);
+    if (!idx_open_ro()){ fprintf(stderr, "index.dat required\n"); return 1; }
     long tip = *(int*)(store_buf + 24);
     if (to_h < 0 || to_h > tip) to_h = tip;
 
@@ -542,6 +709,7 @@ int main(int argc, char** argv){
                     h, to_h, (long long)(time(NULL) - t0));
     }
     fprintf(stderr, "[bfilter] DONE: %ld filters, %llds\n", bfi_count(), (long long)(time(NULL) - t0));
+    fprintf(stderr, "[bfilter] prevouts: %llu inputs -> %llu distinct parents (%.2fx dedup)\n", g_tot_inputs, g_tot_groups, g_tot_groups ? (double)g_tot_inputs/(double)g_tot_groups : 0.0);
     return 0;
 }
 

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "node_config.h"
+#include "netperm.h"
 
 /* STATICALLY initialised to the compiled defaults.
  *
@@ -67,6 +68,26 @@ node_config_t g_cfg = {
     .datacarriersize       = 100000, /* Core v31 -datacarriersize default    */
     .acceptnonstdtxn       = 0,      /* Core -acceptnonstdtxn default        */
     .dnsseed               = 1,      /* Core -dnsseed default: on            */
+    /* Core DEFAULT_PROXYRANDOMIZE = true: random SOCKS5 credentials per
+     * connection, so tor gives each its own circuit. Documented as
+     * "default 1" in node_config.h and never actually defaulted until
+     * 2026-08-28 -- which left stream isolation OFF for exactly the
+     * operator who configured nothing but a proxy. */
+    .proxyrandomize        = 1,
+    .dns                   = 1,      /* Core -dns default: on                */
+    .discover              = 1,      /* Core -discover default: on           */
+    .i2pacceptincoming     = 1,      /* Core -i2pacceptincoming default: on  */
+    .listenonion           = 1,      /* Core -listenonion default: on        */
+    .bantime               = 86400,  /* Core -bantime default: 24h           */
+    .blockfilterindex      = 1,      /* both indexes already run; the knob    */
+    .coinstatsindex        = 1,      /* only lets an operator turn them OFF   */
+    .rpccookie             = 1,      /* Core's default auth method            */
+    .permitbaremultisig    = 1,      /* Core DEFAULT_PERMIT_BAREMULTISIG      */
+    .v2transport           = 1,      /* Core DEFAULT_V2_TRANSPORT             */
+    .persistmempool        = 1,      /* Core DEFAULT_PERSIST_MEMPOOL          */
+    .reindex_chainstate    = 0,      /* one-shot; never a standing default    */
+    .networkactive         = 1,      /* Core -networkactive default: on       */
+    .forcednsseed          = 0,      /* Core -forcednsseed default: off       */
     .connect_only          = 0,
     .n_seednode            = 0,
     .n_addnode             = 0,
@@ -76,6 +97,68 @@ node_config_t g_cfg = {
     .checklevel            = 3,      /* Core -checklevel default             */
     .stopatheight          = 0,      /* Core -stopatheight default: no stop  */
 };
+
+/* "0000..0abc" -> 32 big-endian bytes, right-aligned, exactly how Core spells
+ * nMinimumChainWork. Returns 0 on any non-hex character or on more than 64
+ * digits, so a typo is reported instead of silently truncated. */
+int nodecfg_hex32_be(const char* str, unsigned char out[32]){
+    if(!str) return 0;
+    while(*str==' '||*str=='\t') str++;
+    if(str[0]=='0'&&(str[1]=='x'||str[1]=='X')) str+=2;
+    long n=0;
+    while(str[n] && str[n]!=' ' && str[n]!='\t' && str[n]!='\r' && str[n]!='\n') n++;
+    if(n==0 || n>64) return 0;
+    for(long i=0;i<n;i++){
+        char c=str[i];
+        if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) return 0;
+    }
+    memset(out,0,32);
+    long bi=31, i=n;
+    while(i>0 && bi>=0){
+        int hi=0, lo;
+        char c1=str[--i];
+        lo=(c1<='9')?c1-'0':((c1|32)-'a'+10);
+        if(i>0){ char c0=str[--i]; hi=(c0<='9')?c0-'0':((c0|32)-'a'+10); }
+        out[bi--]=(unsigned char)((hi<<4)|lo);
+    }
+    return 1;
+}
+
+/* Core options this node does not implement. Listed explicitly rather than
+ * inferred, so adding support means deleting a line here and the warning
+ * stops -- and so the list itself is a readable statement of the gap. */
+static const char* const k_unimplemented[] = {
+    /* `whitelist` is IMPLEMENTED (noban only) -- see daemon/netperm.c. The
+     * three below are not: whitebind needs a second listener carrying its own
+     * permissions, and whitelistrelay/whitelistforcerelay are relay
+     * permissions with no enforcement point here yet. */
+    "whitebind","whitelistrelay","whitelistforcerelay",
+    "txreconciliation","natpmp","upnp","bytespersigop",
+    "peerbloomfilters","peerblockfilters",
+    /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
+    "rpcthreads","rpcworkqueue",
+    "rpcservertimeout","rest","server",
+    /* -reindex stays flagged deliberately: Core re-derives its block index by
+     * walking the blk files, and this node's index.dat would need a
+     * sequential walk with prev-hash linkage -- a mini-IBD from local files
+     * that does not exist here. Its recovery story is different
+     * (archive_verify_and_repair truncates and re-downloads), and shipping a
+     * partial rebuild under Core's name would be exactly the misleading
+     * option this list exists to prevent. -reindex-chainstate IS implemented. */
+    "reindex","loadblock","blocksdir","blocksxor",
+    "persistmempoolv1","dbbatchsize","prevoutfetchthreads",
+    "uacomment","maxtxfee","maxapsfee",
+    "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
+        "walletnotify",
+    "settings","includeconf","allowignoredconf",
+    "fixedseeds",
+    NULL
+};
+int nodecfg_unimplemented(const char* key){
+    for (int i = 0; k_unimplemented[i]; i++)
+        if (!strcmp(key, k_unimplemented[i])) return 1;
+    return 0;
+}
 
 static void set_defaults(void){
     g_cfg.max_connections       = 200;   /* Core v31 default */
@@ -89,6 +172,38 @@ static void set_defaults(void){
     g_cfg.maxpool               = 2048;
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
+    g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
+    g_cfg.dns                   = 1;
+    g_cfg.discover              = 1;
+    g_cfg.i2pacceptincoming     = 1;
+    g_cfg.listenonion           = 1;
+    g_cfg.bantime               = 86400;
+    g_cfg.blockfilterindex      = 1;
+    g_cfg.coinstatsindex        = 1;
+    g_cfg.rpccookie             = 1;
+    g_cfg.permitbaremultisig    = 1;
+    g_cfg.v2transport           = 1;
+    g_cfg.persistmempool        = 1;
+    g_cfg.reindex_chainstate    = 0;
+    g_cfg.walletpassfile[0]     = 0;
+    g_cfg.signetchallenge[0]    = 0;
+    g_cfg.rpcbind[0]            = 0;
+    g_cfg.n_rpcallowip          = 0;
+    g_cfg.networkactive         = 1;
+    g_cfg.forcednsseed          = 0;
+    g_cfg.pidfile[0]            = 0;
+    g_cfg.blocknotify[0]        = 0;
+    g_cfg.alertnotify[0]        = 0;
+    g_cfg.startupnotify[0]      = 0;
+    g_cfg.shutdownnotify[0]     = 0;
+    g_cfg.maxtxfee_sat          = 0;
+    g_cfg.asmap[0]              = 0;
+    g_cfg.n_rpcauth             = 0;
+    g_cfg.maxsendbuffer_kb      = 1000;   /* Core -maxsendbuffer default */
+    for (int i = 0; i < 5; i++) g_cfg.zmq_hwm[i] = 1000;
+    g_cfg.rpccookiefile[0]      = 0;
+    memset(g_cfg.minchainwork, 0, 32);
+    g_cfg.have_minchainwork     = 0;
     g_cfg.utxo_bulk_slots_log2  = 22;
     g_cfg.utxo_bulk_blob_mb     = 1024;
     g_cfg.utxo_bulk_gap_blocks  = 50000L;
@@ -221,7 +336,15 @@ static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
     return v;
 }
 
+/* -conf=<path>, set by main() before any load. Highest precedence: an
+ * operator who names a file must get that file or a clear failure, never a
+ * silent fallback to a different one. */
+static char g_conf_override[512];
+void node_config_set_conf_path(const char* path){
+    snprintf(g_conf_override, sizeof g_conf_override, "%s", path ? path : "");
+}
 const char* node_config_path(const char* datadir, char* buf, unsigned long cap){
+    if(g_conf_override[0]){ snprintf(buf, cap, "%s", g_conf_override); return buf; }
     const char* env = getenv("BITCOIN_CONF");
     if(env && *env){ snprintf(buf, cap, "%s", env); return buf; }
     snprintf(buf, cap, "%s/bitcoin.conf", datadir);
@@ -237,7 +360,7 @@ long node_config_load(const char* path){
         fprintf(stderr,"[config] no config file at %s -- using compiled defaults\n", path);
         return 0;
     }
-    long applied = 0; int bad = 0;
+    long applied = 0; int bad = 0; int unimpl = 0;
     /* -connect implies -dnsseed=0 and -listen=0 in Core, but only when those
      * were not set explicitly. The implication therefore has to run AFTER the
      * whole file is read: `listen=1` may appear on a line BELOW `connect=`,
@@ -347,6 +470,111 @@ long node_config_load(const char* path){
             t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.acceptnonstdtxn=t;applied++;} }
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
             t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
+        /* ---- anonymity networks (2026-08-28) ---- */
+        else if(!strcmp(key,"proxy")){        /* Core -proxy=ip:port        */
+            snprintf(g_cfg.proxy,sizeof g_cfg.proxy,"%s",val); applied++; }
+        else if(!strcmp(key,"onion")){        /* Core -onion=ip:port        */
+            snprintf(g_cfg.onion_proxy,sizeof g_cfg.onion_proxy,"%s",val); applied++; }
+        else if(!strcmp(key,"torcontrol")){   /* Core -torcontrol=ip:port   */
+            snprintf(g_cfg.torcontrol,sizeof g_cfg.torcontrol,"%s",val); applied++; }
+        else if(!strcmp(key,"torpassword")){
+            snprintf(g_cfg.torpassword,sizeof g_cfg.torpassword,"%s",val); applied++; }
+        else if(!strcmp(key,"listenonion")){
+            g_cfg.listenonion = iv?1:0; applied++; }
+        else if(!strcmp(key,"bantime")){      /* Core -bantime, seconds      */
+            { long bv = atol(val); if(bv > 0) g_cfg.bantime = bv; } applied++; }
+        else if(!strcmp(key,"blockfilterindex")){
+            /* Core takes "basic"/"0"/"1"; "basic" is the only index type
+             * that exists in Core either, so treat it as on. */
+            g_cfg.blockfilterindex = (!strcmp(val,"basic") || iv) ? 1 : 0; applied++; }
+        else if(!strcmp(key,"coinstatsindex")){
+            g_cfg.coinstatsindex = iv?1:0; applied++; }
+        else if(!strcmp(key,"permitbaremultisig")){
+            g_cfg.permitbaremultisig = iv?1:0; applied++; }
+        else if(!strcmp(key,"v2transport")){
+            g_cfg.v2transport = iv?1:0; applied++; }
+        else if(!strcmp(key,"persistmempool")){
+            g_cfg.persistmempool = iv?1:0; applied++; }
+        else if(!strcmp(key,"reindex-chainstate")){
+            g_cfg.reindex_chainstate = iv?1:0; applied++; }
+        else if(!strcmp(key,"rpcallowip")){   /* Core: HTTP allow list */
+            if(g_cfg.n_rpcallowip >= 16){
+                fprintf(stderr,"[config] rpcallowip: at most 16 entries -- ignoring %s\n", val); bad++; }
+            else { snprintf(g_cfg.rpcallowip[g_cfg.n_rpcallowip], 64, "%s", val);
+                   g_cfg.n_rpcallowip++; applied++; } }
+        else if(!strcmp(key,"rpcbind")){      /* Core: RPC listen address */
+            snprintf(g_cfg.rpcbind, sizeof g_cfg.rpcbind, "%s", val); applied++; }
+        else if(!strcmp(key,"whitelist")){    /* Core: peer permissions */
+            const char* nperr = 0;
+            if(netperm_add(val, &nperr)) applied++;
+            else { fprintf(stderr,"[config] whitelist=%s rejected: %s\n",
+                           val, nperr ? nperr : "?"); bad++; } }
+        else if(!strcmp(key,"signetchallenge")){  /* Core: -signetchallenge */
+            snprintf(g_cfg.signetchallenge, sizeof g_cfg.signetchallenge, "%s", val); applied++; }
+        else if(!strcmp(key,"walletpassfile")){
+            snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
+        else if(!strcmp(key,"networkactive")){
+            g_cfg.networkactive = iv?1:0; applied++; }
+        else if(!strcmp(key,"forcednsseed")){
+            g_cfg.forcednsseed = iv?1:0; applied++; }
+        else if(!strcmp(key,"pid")){
+            snprintf(g_cfg.pidfile,sizeof g_cfg.pidfile,"%s",val); applied++; }
+        else if(!strcmp(key,"maxsendbuffer")){
+            t=clamp_int(iv,1,1000000,key,&bad); if(t>=0){ g_cfg.maxsendbuffer_kb=t; applied++; } }
+        else if(!strcmp(key,"zmqpubhashblockhwm")){ t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[0]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubhashtxhwm")){    t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[1]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubrawblockhwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[2]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubrawtxhwm")){     t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[3]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubsequencehwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[4]=t;applied++;} }
+        else if(!strcmp(key,"rpcauth")){    /* repeatable, like onlynet */
+            if (g_cfg.n_rpcauth < 8){
+                snprintf(g_cfg.rpcauth[g_cfg.n_rpcauth], 256, "%s", val);
+                g_cfg.n_rpcauth++; applied++;
+            } else fprintf(stderr,"[config] at most 8 rpcauth entries -- ignoring %s\n", val); }
+        else if(!strcmp(key,"asmap")){
+            snprintf(g_cfg.asmap,sizeof g_cfg.asmap,"%s",val); applied++; }
+        else if(!strcmp(key,"blocknotify")){
+            snprintf(g_cfg.blocknotify,sizeof g_cfg.blocknotify,"%s",val); applied++; }
+        else if(!strcmp(key,"alertnotify")){
+            snprintf(g_cfg.alertnotify,sizeof g_cfg.alertnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"startupnotify")){
+            snprintf(g_cfg.startupnotify,sizeof g_cfg.startupnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"shutdownnotify")){
+            snprintf(g_cfg.shutdownnotify,sizeof g_cfg.shutdownnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"maxtxfee")){
+            /* Core takes BTC; stored in satoshis like every other fee here */
+            double b = atof(val); if(b >= 0) g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5);
+            applied++; }
+        else if(!strcmp(key,"rpccookiefile")){
+            snprintf(g_cfg.rpccookiefile,sizeof g_cfg.rpccookiefile,"%s",val); applied++; }
+        else if(!strcmp(key,"minimumchainwork")){
+            /* 64 hex digits, big-endian, exactly Core's uint256 spelling.
+             * Shorter input is right-aligned so "0" and a full hash both
+             * mean what an operator expects. */
+            if(nodecfg_hex32_be(val, g_cfg.minchainwork)){
+                g_cfg.have_minchainwork = 1; applied++;
+            } else {
+                fprintf(stderr,"[config] minimumchainwork=%s is not a hex number -- ignoring\n", val);
+            } }
+        else if(!strcmp(key,"i2psam")){       /* Core -i2psam=ip:port       */
+            snprintf(g_cfg.i2psam,sizeof g_cfg.i2psam,"%s",val); applied++; }
+        else if(!strcmp(key,"i2pacceptincoming")){
+            g_cfg.i2pacceptincoming = iv?1:0; applied++; }
+        else if(!strcmp(key,"cjdnsreachable")){
+            g_cfg.cjdnsreachable = iv?1:0; applied++; }
+        else if(!strcmp(key,"dns")){          /* Core -dns                  */
+            g_cfg.dns = iv?1:0; applied++; }
+        else if(!strcmp(key,"discover")){     /* Core -discover             */
+            g_cfg.discover = iv?1:0; applied++; }
+        else if(!strcmp(key,"externalip")){   /* Core -externalip           */
+            snprintf(g_cfg.externalip,sizeof g_cfg.externalip,"%s",val); applied++; }
+        else if(!strcmp(key,"proxyrandomize")){
+            g_cfg.proxyrandomize = iv?1:0; applied++; }
+        else if(!strcmp(key,"onlynet")){      /* Core -onlynet, repeatable  */
+            if(g_cfg.n_onlynet < 6){
+                snprintf(g_cfg.onlynet[g_cfg.n_onlynet],8,"%s",val);
+                g_cfg.n_onlynet++; applied++;
+            } else fprintf(stderr,"[config] onlynet: at most 6 networks\n"); }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
         else if(!strcmp(key,"prune")){
@@ -464,9 +692,24 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"bmc.utxobulkgapblocks")) { t=clamp_int(iv,0,1000000,key,&bad);if(t>=0){g_cfg.utxo_bulk_gap_blocks=t;applied++;} }
         else if(!strcmp(key,"bmc.utxocompactthreshold")){ t=clamp_int(iv,2,4096,key,&bad); if(t>=0){g_cfg.utxo_compact_threshold=t;applied++;} }
         /* anything else (rpcport, rpcuser, dbcache, ...) belongs to another
-         * consumer of this shared file -- ignore rather than warn. */
+         * consumer of this shared file -- ignore rather than warn.
+         *
+         * EXCEPT a Core option this node does not implement. Silently
+         * accepting one is the failure mode this whole config surface keeps
+         * hitting: `whitelist=rpc` has been sitting in the live conf doing
+         * nothing, and `externalip` was parsed-but-unread for weeks. An
+         * operator who sets a real Core option deserves to be told it has no
+         * effect here, rather than discovering it from behaviour. */
+        else if(nodecfg_unimplemented(key)){
+            fprintf(stderr,"[config] %s= is a Bitcoin Core option this node does "
+                           "not implement -- it has NO EFFECT\n", key);
+            unimpl++;
+        }
     }
     fclose(f);
+    if(unimpl)
+        fprintf(stderr,"[config] %d Core option(s) in this file are NOT implemented here "
+                       "and were ignored (each named above)\n", unimpl);
 
     /* -connect's implications, applied once the whole file has been seen. */
     if(g_cfg.connect_only){

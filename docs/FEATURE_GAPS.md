@@ -185,6 +185,36 @@ The last four landed 2026-08-27 and are listed first:
   `getblocktemplate` mined and ACCEPTED by Core, live tip-follow, wallet tx
   relayed into bmc's mempool. `tests/test_chainparams` (29 checks).
 
+- **Chain selection — signet (BIP325)** *(closed 2026-08-30)* —
+  `chain=signet`, plus `signetchallenge=` for a custom signet. The genesis is
+  derived from mainnet's and PROVEN against Core's asserted hash at selection
+  time; the network magic is DERIVED (`sha256d(CompactSize(len) || challenge)`
+  → `0a03cf40`), not pasted, so a custom challenge yields a different magic and
+  the two networks cannot hear each other.
+
+  On signet the block SIGNATURE replaces meaningful proof of work, so it is
+  the one rule that cannot be approximated. It runs through the SAME
+  interpreter and secp256k1 as mainnet script (`daemon/signet*.c`), gated at
+  both full-block sites through one inline so they cannot drift, and on
+  `check_pow` in `blk_submit` exactly as Core gates on `fCheckPOW` (BIP23
+  proposal mode has no signature yet).
+
+  Evidence: a live sync of the public signet holding the same chain as Core
+  (hashes identical at heights 1/1000/5000/9000/9201, UTXO set built, zero
+  rejects); 18 real blocks verified through this node's own interpreter, with
+  the vectors anchored to the miner's real signatures (the generator refuses
+  to emit one whose sighash the block's own signature does not verify
+  against); and — the part a sync alone cannot show — under a challenge
+  differing by ONE HEX CHARACTER the same blocks are rejected as
+  `bad-signet-blksig`, so the check is what decides.
+
+  Two bugs surfaced only by running it, neither reachable from any hermetic
+  test: the genesis block was rejected (Core exempts it; its coinbase predates
+  segwit and carries no witness commitment, and a syncing node seeds genesis
+  rather than applying it), and signet was left on MAINNET's fork-activation
+  schedule — which gates on HEIGHT, so real block 1 was judged pre-segwit and
+  rejected as `unexpected-witness`. `tests/test_signet_{solution,txs,verify,block}`.
+
 REMAINING gaps, precisely (this is the real backlog).
 
 **Re-verified 2026-08-27 against the code, not against this document.** The
@@ -372,10 +402,11 @@ tables and the writers themselves.
   a FOOTPRINT item, not a correctness one: an earlier note here called it
   non-thread-safe and pending — it has been thread-local, `section .tbss`,
   Initial-Exec, since the incident-#13 work.)
-- **testnet / signet** — REFUSED by design (`daemon/chainparams.c` rejects
-  `chain=test`/`signet` loudly rather than run the wrong rules). Supported:
-  **main, regtest and testnet4** — testnet4's whole chain synced with a
-  byte-identical muhash vs Core.
+- **legacy testnet (testnet3)** — REFUSED by design (`daemon/chainparams.c`
+  rejects `chain=test`/`testnet` loudly rather than run the wrong rules; say
+  `chain=testnet4`). Supported: **main, signet, testnet4 and regtest** —
+  testnet4's whole chain synced with a byte-identical muhash vs Core, and
+  signet closed 2026-08-30 (below).
 - **Tor/I2P/onion, REST interface, UPnP/NAT-PMP, Bitcoin-Qt GUI** — absent by
   design (not gaps for an asm/daemon consensus project).
 
@@ -386,6 +417,132 @@ templates, exact sigops, BIP23 proposal mode, longpoll), chain selection for
 regtest AND testnet4, nBits schedule enforcement, `bumpfee`/`psbtbumpfee`,
 and `gettxout` (which had been answering `null` — i.e. "spent" — for every
 outpoint on the live node).
+
+
+**Update 2026-08-29.** A security + parity audit, then three days of closing
+what it found. Every finding is fixed and deployed (`am`, `an`, `ao`).
+
+*Measured, not estimated.* Both sides were re-extracted from source rather
+than trusted:
+
+| surface | state |
+| --- | --- |
+| **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
+| **Config options** | **~75 / 163 (46%)** — `v2transport` closed 08-29, `walletpassfile` added 08-30 (this node's own, no Core equivalent). Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
+| **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
+| **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
+| **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
+
+*Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
+authentication** plus a constant-time credential compare; `bantime` with
+automatic misbehaviour scoring **and ban enforcement on inbound**, which had
+been outbound-only; `-datadir`/`-conf`; operator control of both indexes;
+`permitbaremultisig` as a real gate; `networkactive`; `forcednsseed`; `pid`;
+four `-*notify` hooks; **inbound Tor** end to end; **`asmap`** AS-level
+bucketing; `maxreceivebuffer` (which had been parsed and read *nowhere*);
+`maxsendbuffer`; the five ZMQ high-water marks.
+
+*The systemic fix matters more than any single option.* There is now an
+explicit list of Core options this node does **not** implement, and each one
+present in the config is named at startup:
+
+```
+[config] whitebind= is a Bitcoin Core option this node does not implement -- it has NO EFFECT
+```
+
+That retires a failure mode this codebase reproduced repeatedly: `externalip`
+parsed and never read, `permitbaremultisig` *reported* by `getmempoolinfo`
+while nothing could set it, `whitelist=rpc` sitting in the live config doing
+nothing, `maxreceivebuffer` and `walletnotify` both parsed and inert. A test
+asserts the list and the implementation move together in **both** directions.
+
+*(`whitelist` was the example here until 2026-08-30, when it stopped being
+true: it is implemented now — `noban` only, and every other Core permission
+token is a startup error naming the token rather than an accepted no-op. The
+example moved to `whitebind`, which is still genuinely unimplemented. An
+example that has quietly become false is the same defect this section is
+about.)*
+
+*Deliberately not done, and why.* `bytespersigop` needs Core's
+`max(weight, sigop_cost x bytes_per_sigop)` at fee-check time, but this
+node's `vsize` comes from weight alone and the sigop cost is recorded after
+acceptance — implementing it means restructuring when that cost is computed,
+and a half-wired fee policy is worse than an absent option.
+`persistmempool`'s machinery (`mempool_dump_write`/`read`) is written and
+tested but called from nowhere; wiring the save path touches shutdown, which
+must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
+list this node does not have. All three stay on the warning list.
+
+## Update 2026-08-30 — Erlay: a deliberate stopping point
+
+BIP330 splits into negotiation (`sendtxrcncl`: version and salt exchange, and
+the rules about who may offer it to whom) and reconciliation proper
+(`reqrecon`/`sketch`/`reqsketchext`/`reconcildiff`, PinSketch set difference).
+
+**The negotiation half is implemented and tested** — `daemon/txrecon.c`, 38
+assertions, with the combined salt checked against an independent Python
+implementation of Core's `TaggedHash("Tx Relay Salting")`. It is not yet
+emitted from the handshake, so nothing appears on the wire.
+
+**The reconciliation half is deliberately NOT built**, and the reason is worth
+recording rather than leaving as an unexplained gap:
+
+> **Bitcoin Core does not implement it either.** `node/txreconciliation.cpp`
+> contains exactly four functions — `PreRegisterPeer`, `RegisterPeer`,
+> `ForgetPeer`, `IsPeerRegistered`. There are no sketches and no reconciliation
+> rounds anywhere in Core, and `net_processing.cpp` states it plainly: *"While
+> Erlay support is incomplete, it must be enabled explicitly via
+> -txreconciliation."*
+
+This project's method is differential testing against a running Core. For the
+reconciliation rounds there is no running implementation anywhere to test
+against — the only reference is `minisketch/tests/pyminisketch.py`, a Python
+model of the sketch library, which can pin the arithmetic but not the protocol
+integration.
+
+Building it would mean shipping set-reconciliation code that relays
+transactions on a live mainnet node, unproven against any peer, to speak a
+protocol no deployed node currently speaks. That is a worse trade than the gap
+it closes, so the gap stays — and stays documented, rather than being quietly
+half-filled.
+
+Revisit when Core's own Erlay progresses.
+
+## Update 2026-08-30 — security audit round
+
+An independent audit (`docs/audits/SECURITY_AUDIT_2026-08-29.md`) found 11
+issues; 10 are resolved. Several were gaps this document had not listed,
+because they were absent *checks* rather than absent features:
+
+- **no consensus `MAX_MONEY` check anywhere** — output values were summed as
+  raw `u64` off the wire with no per-output or running bound (CVE-2010-5139
+  shape). Now matching Core, verified against 1,172 real mainnet transactions.
+- **no P2P message-size limit** — the framer acted on the announced length
+  unbounded, so `0xFFFFFFFF` ground a serve child through ~4 GB of reads.
+- **inbound `inv`/`getdata` counts read as a single byte**, silently
+  misparsing any vector above 252 entries — routine traffic from Core.
+- **unbounded JSON parser recursion**, reachable from any RPC body and
+  demonstrated as a stack-exhaustion crash.
+- **executable stack** (24 of 63 `.asm` files lacked `.note.GNU-stack`).
+- **misbehaviour scoring had zero call sites**, and its table could not have
+  accumulated across connections even with one.
+
+The remaining finding is structural — hand-written consensus assembly with a
+documented false-ACCEPT history — and is not closeable by a patch.
+
+*Remaining, in the order worth doing it:* `reindex` and `persistmempool`;
+`whitebind` (a second listener carrying its own permissions — `whitelist`
+itself is done, noban only); the RPC surface (`rpcauth`, `rpcallowip`,
+`rpcbind`, `server`, `rest`) — lower urgency now that cookie auth exists and
+the listener cannot leave loopback. **Signet closed 2026-08-30.**
+
+*A caveat on the headline number.* 45% badly understates the node. It
+implements every public RPC, all five BIP155 networks, package relay, compact
+blocks, BIP157/158, wallet encryption, pruning, and a consensus layer verified
+block-by-block against the real chain. What it lacks is mostly
+**operator-facing configurability** plus two protocol features. RPC parity is
+essentially complete while config parity is under half — a node can be nearly
+complete functionally and still look half-finished by option count.
 
 ## How this list is checked (2026-08-28)
 
@@ -600,7 +757,9 @@ plus straightforward methods on top of it.
   gets its own datadir (`<datadir>/regtest/`) + chain-tagged logs. Proven
   block-for-block and muhash-identical against a scratch Core regtest, with a
   bmc-built `getblocktemplate` block accepted by Core. testnet/signet remain
-  REFUSED by design (only main and regtest supported). The block-archive
+  REFUSED by design (only main and regtest supported) *(as of that entry —
+  testnet4 landed later, and signet on 2026-08-30; legacy testnet3 is still
+  refused)*. The block-archive
   container marker stays mainnet's `f9beb4d9` deliberately — it is this
   project's own file format, not the wire protocol, and chains never share a
   datadir.
@@ -804,7 +963,32 @@ not just present as unused/tested-in-isolation code:
   stripped silently.
 
 Confirmed absent:
-- **Tor / I2P / onion support** — zero hits for tor/.onion/torcontrol.
+- ~~**Tor / I2P / onion support** — zero hits for tor/.onion/torcontrol.~~ —
+  **IN PROGRESS 2026-08-28, phase 1 of 4 landed:** a generic BIP155 address
+  type (`daemon/netaddr.c`, with SHA3-256 and RFC 4648 base32 for onion v3 /
+  b32.i2p names), a version-2 address book for every network
+  (`daemon/addrbook.c`, migrated from the IPv4-only `peers.dat`), ingest and
+  getaddr replies for all networks, real per-network RPC fields, and Core's
+  `addpeeraddress`. Proven against Core: it accepts our onion/i2p/cjdns
+  entries into its own addrman. **Phases 2-3 also landed 2026-08-28: this
+  node now DIALS BITCOIN PEERS OVER TOR AND I2P.** `daemon/socks5.c`
+  (Core's netbase Socks5 byte for byte), `daemon/torcontrol.c` (ADD_ONION
+  ED25519-V3, key persisted as Core names it), `daemon/i2psam.c` (SAM 3.1)
+  and `daemon/dialer.c` (per-network routing, `-onlynet`, stream isolation).
+  Proven with Bitcoin Core behind its own onion service on the real tor:
+  Core reports us as an inbound peer with `"network": "onion"` and a
+  completed handshake; and with a real remote I2P stream. **Phase 4 also
+  landed 2026-08-28: IPv6 sockets (`daemon/net6.c`, v6-only listener beside
+  the IPv4 one) and therefore CJDNS.** Proven against a real cjdroute with
+  its tun up: Core binds its P2P port to our `fc00::/8` address, this node
+  dials it, and Core reports the peer as `"network": "cjdns"` with a
+  completed handshake; without `-cjdnsreachable` the peer is refused, as in
+  Core. **All five BIP155 networks are now storable, relayable and
+  dialable.** Remaining, and stated: no inbound onion service of our own
+  (`-listenonion` parses but this node does not yet ADD_ONION for itself --
+  `daemon/torcontrol.c` exists and is tested, it is not yet called at boot),
+  and I2P inbound (`STREAM ACCEPT`) is implemented but not yet wired to the
+  serve loop.
 - ~~**ZMQ notification interface**~~ — **REAL since 2026-08-26**:
   `hashblock`/`hashtx`/`rawblock`/`rawtx` publish over a hand-written ZMTP
   3.1 PUB socket (`daemon/zmq_notify.c`, `daemon/zmq_pub.c`), with

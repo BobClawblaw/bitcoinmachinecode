@@ -82,6 +82,18 @@ extern long store_chainwork_reload(void* st);
 extern long store_chainwork_truncate(void* st, long target_height);
 
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+
+/* ---- operator alerts (Core -alertnotify) ---------------------------------
+ * reorg.c raises; it does not decide what an alert MEANS or how to deliver
+ * one, so it takes a callback rather than reaching for the config. main()
+ * installs one that runs the -alertnotify command. */
+static void (*g_alert_fn)(const char*);
+void reorg_set_alert_fn(void (*fn)(const char*)){ g_alert_fn = fn; }
+void reorg_alert(const char* msg){ if (g_alert_fn && msg) g_alert_fn(msg); }
+
+
+
+
 extern int  pow_check(const unsigned char hdr[80]);
 extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
 extern long locator_build(void* store_buf, unsigned char* out_hashes); /* [REORG_LOCATOR_MAX*32] */
@@ -581,7 +593,20 @@ long reorg_analyze(void* st, reorg_cand_t* c){
     fprintf(stderr, "[reorg] detected competing chain at height %ld, work=%s vs ours=%s (our tip=%ld, candidate adds %ld blocks)\n",
             c->fork_height, cw, ow, tip, c->n - c->first_new);
 
-    return chainwork_cmp(c->cand_work, c->our_work) > 0 ? 2 : 1;
+    /* Heavier than ours is necessary but not sufficient: a candidate that
+     * does not clear -minimumchainwork is a low-work chain we refuse to
+     * commit to, however it compares to our tip. */
+    if (chainwork_cmp(c->cand_work, c->our_work) > 0){
+        if (!reorg_work_meets_minimum(c->cand_work)){
+            char cwb[40]; work_str(cwb, c->cand_work);
+            fprintf(stderr, "[reorg] REFUSED: candidate work=%s is below -minimumchainwork; "
+                            "not reorganising onto a low-work chain\n", cwb);
+            reorg_alert("low-work-chain-refused");
+            return 1;
+        }
+        return 2;
+    }
+    return 1;
 }
 
 /* ===========================================================================
@@ -672,6 +697,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         fprintf(stderr, "[reorg] disconnecting height %ld hash=%s..\n", h, hs);
         if (!utxo_live_unapply_block(blkbuf, (uint64_t)len, h)){
             fprintf(stderr, "[reorg] FATAL: unapply failed at height %ld -- UTXO set is now PARTIALLY rewound and must be rebuilt from the archive\n", h);
+        reorg_alert("utxo-partially-rewound-rebuild-required");
             if (locked) flock(lfd, LOCK_UN);
             hdr_fd_close();
             return -1;

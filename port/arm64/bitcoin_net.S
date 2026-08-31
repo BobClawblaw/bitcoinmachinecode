@@ -256,6 +256,26 @@ p2p_frame:
 	.global p2p_write
 	.type p2p_write, %function
 p2p_write:
+	/* BIP324 v2 dispatch; falls through to v1 untouched when no v2 module
+	 * (see x86: one cmp + one branch on the hot v1 path). Args x0..x4 are
+	 * already the hook's (fd, cmd, cmdlen, payload, plen). */
+	cmp  x0, #V2_FD_MAX
+	b.hs .p2p_write_v1
+	adrp x9, :got:g_v2_active
+	ldr  x9, [x9, :got_lo12:g_v2_active]
+	ldrb w10, [x9, x0]
+	cbz  w10, .p2p_write_v1
+	adrp x9, :got:g_v2_hook_write
+	ldr  x9, [x9, :got_lo12:g_v2_hook_write]
+	cbz  x9, .p2p_write_v1
+	/* Real call, not a tail call: preserve the link + caller FP. sp is
+	 * already 16-aligned at entry (AAPCS64), and the stp keeps it aligned,
+	 * so the C callee sees the parity it expects. x0..x4 are the args. */
+	stp  x29, x30, [sp, #-16]!
+	blr  x9
+	ldp  x29, x30, [sp], #16
+	ret
+.p2p_write_v1:
 	stp x29, x30, [sp, #-16]!
 	stp x19, x20, [sp, #-16]!
 	stp x21, x22, [sp, #-16]!
@@ -326,6 +346,22 @@ p2p_write:
 	.global p2p_read
 	.type p2p_read, %function
 p2p_read:
+	/* BIP324 v2 dispatch; falls through to v1 untouched (args x0..x4 are
+	 * already the hook's (fd, cmd_out, payload, cap, plen_out)). */
+	cmp  x0, #V2_FD_MAX
+	b.hs .p2p_read_v1
+	adrp x9, :got:g_v2_active
+	ldr  x9, [x9, :got_lo12:g_v2_active]
+	ldrb w10, [x9, x0]
+	cbz  w10, .p2p_read_v1
+	adrp x9, :got:g_v2_hook_read
+	ldr  x9, [x9, :got_lo12:g_v2_hook_read]
+	cbz  x9, .p2p_read_v1
+	stp  x29, x30, [sp, #-16]!
+	blr  x9
+	ldp  x29, x30, [sp], #16
+	ret
+.p2p_read_v1:
 	stp x29, x30, [sp, #-16]!
 	stp x19, x20, [sp, #-16]!
 	stp x21, x22, [sp, #-16]!
@@ -361,6 +397,15 @@ p2p_read:
 .PRCMDEND:
 	ldr w24, [sp, #16]
 	str w24, [sp, #24]              /* announced */
+	/* SECURITY (audit finding 6): reject an oversized announcement before
+	 * acting on it -- Core rejects at exactly this point (net.cpp: a length
+	 * over MAX_PROTOCOL_MESSAGE_LENGTH = 4,000,000). Without it a peer could
+	 * announce 0xFFFFFFFF and make the drain loop below grind ~4 GB off the
+	 * socket before the caller's cap saved us. */
+	movz w10, #0x3D, lsl #16       /* P2P_MAX_MSG = 4,000,000 = 0x3D0900 */
+	movk w10, #0x0900
+	cmp  w24, w10
+	b.hi .PRBADSZ
 	cmp w24, w22
 	b.ls .PRS1
 	mov w24, w22
@@ -408,6 +453,9 @@ p2p_read:
 .PRTRUNC:
 	mov x0, #-2
 	b .PRRET
+.PRBADSZ:
+	mov x0, #-1                      /* protocol error: oversized announcement */
+	b .PRRET
 .PREOF:
 	mov x0, #0
 .PRRET:
@@ -427,5 +475,32 @@ p2p_read:
 net_magic:
 	.word 0xd9b4bef9
 	.size net_magic, 4
+
+	/* ---- BIP324 v2 transport dispatch (see x86 bitcoin_net.asm) ----
+	 * p2p_read/p2p_write are called from ~60 files, so v2 is keyed by fd:
+	 * g_v2_active[fd] is set once a v2 handshake completes, and the hooks are
+	 * filled by the v2 module. A build never linking the v2 module leaves the
+	 * hooks NULL and the table zero, so v1 behaviour is untouched (one cmp +
+	 * branch on the hot path). */
+	V2_FD_MAX = 4096
+	.section .data
+	.align 3
+	.global g_v2_hook_write
+	.type g_v2_hook_write, %object
+g_v2_hook_write:
+	.quad 0                      /* long (*)(int fd, const char* cmd, u32 cmdlen, const void* payload, u32 plen) */
+	.size g_v2_hook_write, 8
+	.global g_v2_hook_read
+	.type g_v2_hook_read, %object
+g_v2_hook_read:
+	.quad 0                      /* int (*)(int fd, char cmd_out[12], void* payload, u32 cap, u32* plen_out) */
+	.size g_v2_hook_read, 8
+	.section .bss
+	.align 0
+	.global g_v2_active
+	.type g_v2_active, %object
+g_v2_active:
+	.space V2_FD_MAX             /* 1 byte per fd (0=v1, non-zero=v2) */
+	.size g_v2_active, V2_FD_MAX
 
 	.section .note.GNU-stack,"",%progbits

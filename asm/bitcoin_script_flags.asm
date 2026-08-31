@@ -35,7 +35,7 @@
 ; ----------------------------------------------------------------------------
 ; sfc_chain -- runtime chain selector: 0 = mainnet (the static default, so
 ; every caller that never selects a chain gets exactly the old behaviour),
-; 1 = regtest, 2 = testnet4. Written once by chainparams_select()
+; 1 = regtest, 2 = testnet4, 3 = signet. Written once by chainparams_select()
 ; (daemon/chainparams.c)
 ; before any block is verified, never again -- the unsynchronized read below
 ; is safe. Regtest's buried heights come from the same generator run
@@ -61,6 +61,8 @@ script_flags_for_block:
     je    .mainnet
     cmp   dword [sfc_chain], 2
     je    .testnet4
+    cmp   dword [sfc_chain], 3
+    je    .signet
     jmp   .regtest
 .mainnet:
 
@@ -121,6 +123,35 @@ script_flags_for_block:
     ret
 
 ; ---- regtest: same base flags, no exceptions, CRegTestParams heights ----
+; Signet buries every deployment at height 1 (SigNetParams). That makes this
+; arm numerically identical to .regtest today -- but it is written out rather
+; than aliased, because the equality is a coincidence in Core's parameters,
+; not a rule, and signet is a live network whose heights Core can change
+; independently of regtest's. Reusing regtest's selector here was a real bug:
+; it left signet on MAINNET's schedule, where segwit does not activate until
+; height 481824, so every early signet block was judged pre-segwit and
+; rejected as "unexpected-witness". Caught by an actual sync, not by a test.
+.signet:
+    mov   rax, (1<<SFC_BIT_P2SH) | (1<<SFC_BIT_WITNESS) | (1<<SFC_BIT_TAPROOT)
+    cmp   rbx, SFC_S_HEIGHT_DERSIG
+    jb    .s_skip_dersig
+    or    rax, (1<<SFC_BIT_DERSIG)
+.s_skip_dersig:
+    cmp   rbx, SFC_S_HEIGHT_CLTV
+    jb    .s_skip_cltv
+    or    rax, (1<<SFC_BIT_CLTV)
+.s_skip_cltv:
+    cmp   rbx, SFC_S_HEIGHT_CSV
+    jb    .s_skip_csv
+    or    rax, (1<<SFC_BIT_CSV)
+.s_skip_csv:
+    cmp   rbx, SFC_S_HEIGHT_SEGWIT
+    jb    .s_skip_segwit
+    or    rax, (1<<SFC_BIT_NULLDUMMY)
+.s_skip_segwit:
+    pop   rbx
+    ret
+
 .regtest:
     mov   rax, (1<<SFC_BIT_P2SH) | (1<<SFC_BIT_WITNESS) | (1<<SFC_BIT_TAPROOT)
     cmp   rbx, SFC_R_HEIGHT_DERSIG
@@ -163,3 +194,10 @@ script_flags_for_block:
 .t_skip_segwit:
     pop   rbx
     ret
+
+; SECURITY (audit 2026-08-29 finding 9): without this note the linker
+; conservatively marks the whole program's stack EXECUTABLE (PT_GNU_STACK
+; RWE). Nothing here needs a runnable stack; a single object missing the
+; note is enough to turn it on for the entire binary, which is why every
+; .asm file carries it.
+section .note.GNU-stack noalloc noexec nowrite progbits

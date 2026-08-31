@@ -1639,4 +1639,14 @@ node_announce_tip:
 	ret
 	.size node_announce_tip, .-node_announce_tip
 
+/* serve-violation hook (x86 bitcoin_serve.asm): NULL by default, filled by
+ * daemon/main.c to log/act when a peer violates a serve-side rule. */
+	.section .data
+	.align 3
+	.global g_serve_violation_hook
+	.type g_serve_violation_hook, %object
+g_serve_violation_hook:
+	.quad 0
+	.size g_serve_violation_hook, 8
+
 	.section .note.GNU-stack,"",%progbits

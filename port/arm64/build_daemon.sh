@@ -27,8 +27,13 @@ DAEMONSRCS="../../asm/daemon/main.c ../../asm/daemon/utxo_live.c ../../asm/daemo
 RPCSRCS="../../asm/rpc_server.c ../../asm/rpc_commands.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c ../../asm/block_filter.c ../../asm/utxo_snapshot.c ../../asm/rpc_signer.c ../../asm/bip32_ckdpub.c ../../asm/rpc_json.c ../../asm/rpc_net.c ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c ../../asm/wallet_labels.c ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c ../../asm/bitcoin_aes.c ../../asm/wallet_txlog.c ../../asm/wallet_bnb.c"
 
 OBJBUNDLE="$DAEMONOBJS"
+# ---- 3. NEWSRCS: C files added by main since the ARM build was written ----
+# (all arch-neutral C: addrbook, netaddr/net6, asmap, dialer/proxies, netperm,
+#  rpc_acl, notify, signet, reorg-min-work, subnet, torcontrol, v2transport,
+#  txrecon, wallet_pass + the BIP324/crypto primitives they pull in)
+NEWSRCS="../../asm/daemon/addrbook.c ../../asm/daemon/asmap.c ../../asm/daemon/dialer.c ../../asm/daemon/i2psam.c ../../asm/daemon/minchainwork.c ../../asm/daemon/net6.c ../../asm/daemon/netaddr.c ../../asm/daemon/netperm.c ../../asm/daemon/notify.c ../../asm/daemon/serve_addr.c ../../asm/daemon/serve_invbounds.c ../../asm/daemon/signet.c ../../asm/daemon/signet_block.c ../../asm/daemon/signet_verify.c ../../asm/daemon/socks5.c ../../asm/daemon/subnet.c ../../asm/daemon/torcontrol.c ../../asm/daemon/txrecon.c ../../asm/daemon/v2transport.c ../../asm/daemon/wallet_pass.c ../../asm/base32.c ../../asm/bitcoin_sha3.c ../../asm/crypto_chacha20.c ../../asm/crypto_hkdf.c ../../asm/crypto_poly1305.c ../../asm/crypto_ellswift.c ../../asm/crypto_ellswift_ecdh.c ../../asm/crypto_ellswift_enc.c ../../asm/crypto_fe_sqrt.c ../../asm/crypto_bip324.c ../../asm/crypto_bip324_fs.c ../../asm/crypto_bip324_transport.c ../../asm/daemon/rpc_acl.c ../../asm/daemon/cli_conf.c"
 gcc -no-pie -O2 -lpthread -I../../asm -I../../asm/daemon -I../.. \
-    -o daemon_out/bitcoind $DAEMONSRCS $RPCSRCS ../../asm/wallet_core.c \
+    -o daemon_out/bitcoind $DAEMONSRCS $RPCSRCS $NEWSRCS ../../asm/wallet_core.c \
     $(for m in $OBJBUNDLE; do echo "${m}.o"; done) 2>> "$LOG"
 RC=$?
 echo "=== LINK RC=$RC ===" >> "$LOG"

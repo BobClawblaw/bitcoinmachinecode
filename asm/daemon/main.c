@@ -43,7 +43,15 @@
 #include "utxo_walk.h"   /* utxo_walk_read_varint, for tx-count in [block] stored logs */
 #include "../version_gen.h"  /* GENERATED from version.inc: our wire identity (protocol/UA/version) */
 #include "reorg.h"       /* STAGE B: fork choice / chain reorganisation */
+#include "notify.h"      /* Core -*notify hooks */
+#include "torcontrol.h"  /* inbound: our own onion service */
+#include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "netperm.h"   /* -whitelist peer permissions */
+#include "subnet.h"    /* one CIDR matcher, shared with the ban list */
+#include "rpc_acl.h"   /* -rpcallowip / -rpcbind */
+#include "v2transport.h"  /* BIP324 v2 encrypted transport */
+#include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
 
 /* The node log path, chain-tagged so an aggregated view can never confuse
@@ -170,6 +178,21 @@ extern void node_log_str(int fd, int kind, const char* s, long len);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
 extern int  amr_init(void* ab);
+/* ---- address book, version 2 (daemon/addrbook.c, peers2.dat): every BIP155
+ * network. The legacy amr_* (peers.dat, IPv4 only) is migrated on first open
+ * and no longer written. addr_book() is the worker's read-write handle
+ * (daemon/addr_ingest.c). */
+#include "netaddr.h"
+#include "addrbook.h"
+#include "dialer.h"
+#include "net6.h"
+extern ab2_t* addr_book(void);
+static int book_add_ipv4(unsigned ip_netorder, int port){
+    bmc_addr_t a; memset(&a, 0, sizeof a);
+    a.net = BMC_NET_IPV4; a.len = 4; memcpy(a.addr, &ip_netorder, 4); a.port = (unsigned short)port;
+    ab2_t* b = addr_book(); if(!b) return -1;
+    return ab2_add(b, &a, 1, (unsigned)time(NULL));
+}
 extern long amr_count(void* ab);
 extern int  amr_get_i(void* ab, long i, void* out);
 extern long p2p_addr_v1(void* out, const void* src, long n);
@@ -197,6 +220,7 @@ extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_st
  * in the download worker ONLY; the ring is what lets the serve children
  * contribute the transactions they accept. */
 extern int  zmqpub_add(const char* topic, const char* addr);
+extern int  zmqpub_start(void);
 extern int  zmqpub_active(void);
 extern void zmqpub_poll(void);
 extern void txit_boot(void* store_buf);                                       /* daemon/tx_index_tail.c */
@@ -391,6 +415,71 @@ static int build_inmem_hash_index(void){
     return 0;
 }
 
+/* The onion service's target. Core binds 127.0.0.1:<port+1> and tags anything
+ * arriving there as an incoming Tor connection -- classification by ACCEPTING
+ * SOCKET, never by source address, because tor forwards from 127.0.0.1 and a
+ * source-address heuristic cannot tell an onion peer from a local one.
+ *
+ * Loopback-only and deliberately NOT bindable elsewhere: this socket exists
+ * for tor to connect to. Core additionally marks its onion bind
+ * BF_DONT_ADVERTISE so the loopback address is never gossiped as ours; here
+ * the equivalent is that addr_self never sees this listener at all. */
+/* Core -maxreceivebuffer / -maxsendbuffer, both in units of 1000 bytes.
+ *
+ * -maxreceivebuffer was PARSED AND READ NOWHERE: the option existed in the
+ * config surface and did nothing, which is the defect this codebase keeps
+ * reproducing. Both are applied here, to every peer socket in both
+ * directions, so a peer cannot make this node buffer without bound.
+ *
+ * Core enforces its limits in userspace against its own message queues; this
+ * node has no such queue -- it reads and writes the socket directly -- so the
+ * kernel's own buffer IS the queue and the setting sizes it. Stated rather
+ * than pretended: the effect is the same bound on memory per peer, reached by
+ * a different mechanism. */
+static void peer_sock_buffers(int fd){
+    if (fd < 0) return;
+    if (g_cfg.maxrecvbuffer_kb > 0){
+        int v = g_cfg.maxrecvbuffer_kb * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
+    }
+    if (g_cfg.maxsendbuffer_kb > 0){
+        int v = g_cfg.maxsendbuffer_kb * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+    }
+}
+
+static int lsock_onion(int want_port, int* got_port){
+    int l = socket(AF_INET,SOCK_STREAM,0);
+    if(l < 0) return -1;
+    int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
+    struct sockaddr_in a; memset(&a,0,sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    /* Core's default is chain default port + 1, so try that first for
+     * familiarity. But nothing REQUIRES a particular local port: ADD_ONION
+     * tells tor where to forward, so any free loopback port works. Rather
+     * than fail when the preferred one is taken -- a smoke test hit exactly
+     * that, port+1 landing on the configured rpcport -- fall back to an
+     * ephemeral port and tell tor the one we actually got. */
+    a.sin_port = htons((unsigned short)want_port);
+    if(bind(l,(struct sockaddr*)&a,sizeof a) < 0){
+        fprintf(stderr,"[tor] 127.0.0.1:%d is taken (%s) -- using an ephemeral port instead\n",
+                want_port, strerror(errno));
+        a.sin_port = 0;
+        if(bind(l,(struct sockaddr*)&a,sizeof a) < 0){
+            fprintf(stderr,"[tor] onion listener bind failed: %s\n", strerror(errno));
+            close(l); return -1;
+        }
+    }
+    socklen_t al = sizeof a;
+    if(getsockname(l,(struct sockaddr*)&a,&al) != 0){ close(l); return -1; }
+    if(listen(l,8)<0){
+        fprintf(stderr,"[tor] onion listener listen failed: %s\n", strerror(errno));
+        close(l); return -1;
+    }
+    if(got_port) *got_port = ntohs(a.sin_port);
+    return l;
+}
+
 static int lsock(int port){
     int l = socket(AF_INET,SOCK_STREAM,0);
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port);
@@ -407,6 +496,24 @@ static int lsock(int port){
     int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     if(bind(l,(struct sockaddr*)&a,sizeof a)<0){ fprintf(stderr,"[net] bind failed: %s\n", strerror(errno)); return -1; }
     if(listen(l,8)<0){ fprintf(stderr,"[net] listen failed: %s\n", strerror(errno)); return -1; }
+    return l;
+}
+/* The IPv6 half of the listener (2026-08-28). Separate socket, v6-only, so
+ * it cannot collide with the IPv4 one above; -1 when the host has no IPv6,
+ * which is not an error -- the node simply serves v4 only. A CJDNS peer
+ * reaches us here, on the fc00::/8 address of the tun interface. */
+static int lsock_v6(int port){
+    unsigned char any[16]; memset(any, 0, 16);
+    const unsigned char* bindaddr = NULL;
+    if(g_cfg.bind_addr[0]){
+        bmc_addr_t b;
+        if(bmc_addr_from_string(&b, g_cfg.bind_addr) && (b.net == BMC_NET_IPV6 || b.net == BMC_NET_CJDNS)){
+            memcpy(any, b.addr, 16); bindaddr = any;
+        } else return -1;            /* bind= names a v4 address: no v6 listener */
+    }
+    int l = lsock6(bindaddr, port, 8);
+    if(l >= 0) fprintf(stderr,"[net] listening on IPv6 %s:%d (cjdns peers arrive here)\n",
+                       bindaddr ? g_cfg.bind_addr : "[::]", port);
     return l;
 }
 
@@ -458,6 +565,10 @@ static long outbound_catchup(long max_blocks){
         fprintf(stderr,"[catchup] dnsseed=0 -- skipping seed-based boot catch-up\n");
         return 0;
     }
+    if(dialer_dns_blocked()){
+        fprintf(stderr,"[catchup] a proxy is configured (or dns=0) -- not resolving seed names\n");
+        return 0;
+    }
     for(size_t s=0; s<nsrcs; s++){
         const char* host=srcs[s];
         struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
@@ -468,6 +579,8 @@ static long outbound_catchup(long max_blocks){
         if(fd<0) continue;
         struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        /* this path speaks v1 only; clear any flag a recycled fd may carry */
+        bmc_v2_close(fd);
         if(node_handshake(fd)!=1 || !peer_has_witness(host)){ close(fd); continue; }
         static unsigned char loc[32];
         /* Anchor from the STORED TIP index record (index-hash read, robust to a
@@ -590,24 +703,11 @@ static int serve_loop(int fd, int lfd){
         if(memcmp(cmd,"ping",4)==0){
             p2p_write(fd,"pong",4, pl, (plen>=8)?8:0);   /* echo nonce */
         } else if(memcmp(cmd,"getaddr",7)==0){
-            /* A connected peer asked us for our address book. Reply with an
-             * `addr` message built from peers.dat via the asm address manager
-             * (amr_* + p2p_addr_v1). This is the addr-relay half of recursive
-             * peer discovery -- answering makes the network treat us as a real
-             * full client and reciprocate. */
-            static unsigned char ab[64];
-            if(amr_init(ab)==1){
-                static unsigned char rec[18]; long cnt = amr_count(ab);
-                long n= cnt>1000?1000:cnt;           /* cap a single addr msg */
-                static unsigned char src[1000*18];
-                long have=0;
-                for(long i=0;i<n;i++){ if(amr_get_i(ab,i,rec)==1) memcpy(src+have*18,rec,18), have++; }
-                if(have>0){
-                    static unsigned char ah[1000*30+4];
-                    long L = p2p_addr_v1(ah, src, have);
-                    p2p_write(fd,"addr",4, ah, (unsigned)L);
-                }
-            }
+            /* the same reply the asm serve loop gives (daemon/serve_addr.c,
+             * from the version-2 book); this test-mode loop never learns the
+             * peer's BIP155 preference, so legacy addr */
+            extern long serve_getaddr(int, int);
+            serve_getaddr(fd, 0);
         } else if(memcmp(cmd,"getdata",7)==0){
             /* payload: count varint then per item: [type int32 LE][hash32].
              * The wire inventory `type` is a 4-byte little-endian int32
@@ -731,6 +831,14 @@ static int serve_loop(int fd, int lfd){
 #define MAX_BLOCK_RELAY_ONLY       8         /* ceiling; g_cfg picks the live count */
 #define CFG_INBOUND_LIMIT() \
     (g_cfg.max_connections - g_cfg.max_outbound - g_cfg.max_block_relay_only - g_cfg.max_feeler)
+/* BIP324 v2 transport. Off means the node behaves exactly as it did before
+ * this existed: p2p_read/p2p_write never register an fd, so their dispatch
+ * falls straight through to v1. */
+#define CFG_V2TRANSPORT() (g_cfg.v2transport)
+/* Core -persistmempool: reload mempool.dat at boot, write it at shutdown. */
+#define CFG_PERSISTMEMPOOL() (g_cfg.persistmempool)
+/* Core -reindex-chainstate: rebuild the UTXO set from the archive. One-shot. */
+#define CFG_REINDEX_CHAINSTATE() (g_cfg.reindex_chainstate)
 #define CFG_BRO_N() \
     (g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY)
 /* Array capacity for outbound legs. The TARGET is g_cfg.max_outbound
@@ -749,6 +857,12 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 /* per-leg BIP155 verdict from the handshake: 1 = the peer sent sendaddrv2,
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
+/* each leg's BMC_NET_*, derived from its host string. We announce ONE
+ * address -- this node's clearnet IPv4 -- and telling an onion or i2p peer
+ * that address links the two, which is exactly what running over those
+ * networks is meant to prevent. Core's GetLocal has the same guard.
+ * (2026-08-28 pre-deploy review.) */
+static unsigned char mux_out_net[MUX_MAX_OUT];
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][64];
 static int   mux_n_out = 0;
@@ -776,27 +890,25 @@ static int  g_ctl_n_addnode = 0;
  * realistically bans. A subnet form this cannot express is REFUSED at
  * setban rather than silently stored and never enforced -- a ban that does
  * not ban is worse than an error. */
+/* Was a dotted-decimal STRING comparison, which rejected every prefix that
+ * was not a whole number of octets (/28, /12, /20 matched nothing) and did
+ * not handle IPv6 at all -- so `setban 2001:db8::/32` was accepted, stored,
+ * listed by listbanned, and never matched a peer. A ban that silently does
+ * nothing is worse than a refused one: the operator believes the peer is
+ * gone. daemon/subnet.c is the one implementation now, shared with the
+ * -whitelist matcher that needed the same rule. */
 static int ctl_ban_covers(const char* entry, const char* ip){
-    const char* slash = strchr(entry, '/');
-    if(!slash) return strcmp(entry, ip) == 0;
-    int bits = atoi(slash + 1);
-    int octets = bits / 8;
-    if(octets <= 0 || octets > 4 || (bits % 8) != 0) return 0;
-    /* compare the first `octets` dotted components */
-    const char *a = entry, *b = ip;
-    for(int i = 0; i < octets; i++){
-        const char* ae = strchr(a, '.'); const char* be = strchr(b, '.');
-        size_t alen = ae ? (size_t)(ae - a) : strlen(a);
-        size_t blen = be ? (size_t)(be - b) : strlen(b);
-        if(i == octets - 1 && !ae) alen = (size_t)(slash - a);
-        if(alen != blen || strncmp(a, b, alen) != 0) return 0;
-        if(!ae || !be) return i == octets - 1;
-        a = ae + 1; b = be + 1;
-    }
-    return 1;
+    return subnet_covers_str(entry, ip);
 }
 
 /* 1 if this address is currently banned. Called before every dial. */
+/* -alertnotify delivery. Named and non-static so reorg can be handed it
+ * without reorg.c learning about the config. */
+void bmc_alert_deliver(const char* msg){
+    fprintf(stderr,"[alert] %s\n", msg ? msg : "?");
+    if (g_cfg.alertnotify[0]) notify_run(g_cfg.alertnotify, msg, "alertnotify");
+}
+
 int ctl_is_banned(const char* ip){
     if(!g_node_status) return 0;
     long long now = (long long)time(NULL);
@@ -809,6 +921,146 @@ int ctl_is_banned(const char* ip){
         if(ctl_ban_covers((const char*)g_node_status->bans[i].subnet, ip)) return 1;
     }
     return 0;
+}
+
+/* ---- automatic banning (Core's Misbehaving()) -----------------------------
+ * setban/listbanned/clearbanned already existed, but NOTHING drove them: a
+ * peer could send malformed message after malformed message and the node
+ * would keep talking to it. Core scores misbehaviour and bans at 100 points.
+ *
+ * The ban list lives in shared status memory and is read by every process
+ * (ctl_is_banned), so an automatic ban is written the same way a manual one
+ * is. Scores, by contrast, are per-process and deliberately NOT shared: a
+ * score is a local heuristic about one connection, and losing it on a fork
+ * is harmless, while sharing it would need locking on a hot path. */
+#define MISBEHAVIOR_BAN_THRESHOLD 100
+#define MISBEHAVIOR_SLOTS 64
+_Static_assert(MISBEHAVIOR_SLOTS == RPC_MISBEHAVIOR_SLOTS,
+              "the local and shared misbehaviour tables must be the same size");
+/* Fallback table, used only when the shared region is unavailable (test
+ * binaries that link main.c without mmapping a node_status_t, and the
+ * degraded path if the mmap failed at boot). The real one lives in shared
+ * memory -- see node_status_t.misbehavior. */
+static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
+
+/* Cross-process spinlock around the shared table. Held for a handful of
+ * string compares, never across I/O, so spinning is cheaper than any
+ * alternative and cannot deadlock a child against itself. */
+static void mis_lock_acquire(node_status_t* st){
+    while (__sync_lock_test_and_set(&st->mis_lock, 1)) {
+        struct timespec ts = { 0, 1000 * 1000 };   /* 1 ms */
+        nanosleep(&ts, NULL);
+    }
+}
+static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lock); }
+
+/* ---- protocol-violation reporting from the asm serve loop ----------------
+ * (audit 2026-08-29 finding 7)
+ *
+ * peer_misbehaving() has existed for a while with a 100-point threshold, /32
+ * auto-ban and lowest-score eviction -- and, until now, ZERO call sites. The
+ * comment "a peer could send malformed message after malformed message and
+ * the node would keep talking to it" was literally true.
+ *
+ * bitcoin_serve.asm calls back here when p2p_read reports -3, an announced
+ * message length above P2P_MAX_MSG. No conforming implementation produces
+ * that -- Core treats an oversized header as fatal for the connection -- so
+ * it is scored at the full threshold and the peer is banned rather than
+ * merely dropped.
+ *
+ * HONEST LIMITATION: g_misbehavior is a process-local array and the serve
+ * loop runs in a forked child, so scores do NOT accumulate across
+ * connections. What makes this bite anyway is that crossing the threshold
+ * calls ctl_ban_add(), which writes the SHARED, file-backed ban list that
+ * both the dial path and the inbound accept path consult. So a single
+ * violation bans the peer for real; repeat offences across reconnects are not
+ * tracked, and that remains a gap worth closing separately. */
+static char g_cur_peer_ip[64];
+extern void (*g_serve_violation_hook)(const char*);
+static void serve_violation_report(const char* reason){
+    if(!g_cur_peer_ip[0]) return;
+    peer_misbehaving(g_cur_peer_ip, 100, reason ? reason : "protocol violation");
+}
+
+/* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
+int ctl_ban_add(const char* subnet, long long until){
+    if(!g_node_status || !subnet || !*subnet) return 0;
+    int slot = -1;
+    for(int i = 0; i < RPC_MAX_BANS; i++){
+        if(g_node_status->bans[i].until &&
+           !strcmp((const char*)g_node_status->bans[i].subnet, subnet)) return 0;  /* already */
+        if(!g_node_status->bans[i].until && slot < 0) slot = i;
+    }
+    if(slot < 0) return 0;                       /* list full: no silent evict */
+    snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", subnet);
+    g_node_status->bans[slot].created = (long long)time(NULL);
+    __sync_synchronize();
+    g_node_status->bans[slot].until = until;     /* published last */
+    return 1;
+}
+
+/* Score a peer for a protocol violation. Returns 1 if this call banned it,
+ * in which case the caller should drop the connection. */
+int peer_misbehaving(const char* ip, int points, const char* reason){
+    if(!ip || !*ip || points <= 0) return 0;
+    /* Core: a peer with NetPermissionFlags::NoBan is never disconnected or
+     * discouraged for misbehaviour. Checked BEFORE scoring, not just before
+     * banning -- a score that can never reach the threshold is bookkeeping
+     * that would evict a real offender from the table. */
+    if(netperm_for(ip) & NP_NOBAN){
+        fprintf(stderr,"[ban] %s misbehaving +%d: %s -- NOT scored (whitelist noban)\n",
+                ip, points, reason ? reason : "?");
+        return 0;
+    }
+    /* Score into the SHARED table when we have one, so a peer that misbehaves
+     * once per connection across many forked serve children still adds up.
+     * The process-local array is the fallback for binaries with no shared
+     * region (see its comment). */
+    node_status_t* st = g_node_status;
+    if (st) mis_lock_acquire(st);
+    int slot = -1, free_slot = -1;
+    for(int i = 0; i < MISBEHAVIOR_SLOTS; i++){
+        const char* sip = st ? (const char*)st->misbehavior[i].ip : g_misbehavior[i].ip;
+        if(sip[0] && !strcmp(sip, ip)){ slot = i; break; }
+        if(!sip[0] && free_slot < 0) free_slot = i;
+    }
+    if(slot < 0){
+        /* table full: forget the lowest scorer rather than ignore this one */
+        if(free_slot < 0){
+            int lo = 0;
+            for(int i = 1; i < MISBEHAVIOR_SLOTS; i++){
+                int a = st ? st->misbehavior[i].score  : g_misbehavior[i].score;
+                int b = st ? st->misbehavior[lo].score : g_misbehavior[lo].score;
+                if(a < b) lo = i;
+            }
+            free_slot = lo;
+        }
+        slot = free_slot;
+        if (st){
+            snprintf((char*)st->misbehavior[slot].ip, sizeof st->misbehavior[slot].ip, "%s", ip);
+            st->misbehavior[slot].score = 0;
+        } else {
+            snprintf(g_misbehavior[slot].ip, sizeof g_misbehavior[slot].ip, "%s", ip);
+            g_misbehavior[slot].score = 0;
+        }
+    }
+    int total;
+    if (st){ st->misbehavior[slot].score += points; total = st->misbehavior[slot].score; }
+    else   { g_misbehavior[slot].score  += points; total = g_misbehavior[slot].score;  }
+    if(total < MISBEHAVIOR_BAN_THRESHOLD){
+        if (st) mis_lock_release(st);
+        fprintf(stderr,"[ban] %s misbehaving +%d (%d/%d): %s\n",
+                ip, points, total, MISBEHAVIOR_BAN_THRESHOLD, reason ? reason : "?");
+        return 0;
+    }
+    long long until = (long long)time(NULL) + (g_cfg.bantime > 0 ? g_cfg.bantime : 86400);
+    char subnet[80]; snprintf(subnet, sizeof subnet, "%s/32", ip);
+    if (st){ st->misbehavior[slot].score = 0; mis_lock_release(st); }  /* banned; start clean */
+    else     g_misbehavior[slot].score = 0;
+    ctl_ban_add(subnet, until);
+    fprintf(stderr,"[ban] %s reached %d points (%s) -- banned for %lds\n",
+            ip, total, reason ? reason : "?", g_cfg.bantime > 0 ? g_cfg.bantime : 86400);
+    return 1;
 }
 
 /* strip ":port" so a ban on the address matches a leg recorded as ip:port */
@@ -1066,19 +1318,126 @@ static void dial_fail_errno(const char* what, int rc){
     else  snprintf(g_dial_fail, sizeof g_dial_fail, "%s: rc=%d", what, rc);
 }
 
+/* Does this peer advertise NODE_P2P_V2?
+ *
+ * Core only dials v2 when it does -- net.cpp:
+ * `addrConnect.nServices & GetLocalServices() & NODE_P2P_V2` -- and that is
+ * not merely an optimisation. An initiator cannot fall back in place (it has
+ * already sent 64 random bytes a v1 peer rejects as a bad magic), so a blind
+ * attempt costs an extra TCP connection against EVERY v1-only peer. Worse,
+ * plenty of peers accept exactly one connection and simply are not there for
+ * the redial -- which is precisely how tests/test_outbound_mux caught this.
+ *
+ * The address book already carries each peer's service bits, so the question
+ * is answerable before we dial. An unknown peer answers "no" and gets a
+ * single v1 connection, exactly as before this feature existed. */
+static int peer_advertises_v2(const char* host, int out_port){
+    if(!CFG_V2TRANSPORT()) return 0;
+    bmc_addr_t a;
+    if(!bmc_addr_from_string_port(&a, host, (unsigned short)out_port)) return 0;
+    ab2_t* b = ab2_open(".", 0);
+    if(!b) return 0;
+    long i = ab2_find(b, &a);
+    int yes = 0;
+    if(i >= 0){
+        ab2_rec_t r;
+        if(ab2_get(b, i, &r)) yes = (r.services & BMC_NODE_P2P_V2) != 0;
+    }
+    ab2_close(b);
+    return yes;
+}
+
 static int outbound_connect(const char* host, int rcv_ms, int out_port){
     g_dial_fail[0] = 0;
+    /* ---- any BIP155 network (2026-08-28) ----------------------------------
+     * A host that parses as a Tor/I2P/CJDNS/IPv6 address goes to its
+     * transport (daemon/dialer.c); anything else is the IPv4 path below,
+     * unchanged, including DNS names (seeds, addnode=, connect=), which only
+     * the resolver can turn into an address. */
+    { bmc_addr_t da;
+      /* accepts "1.2.3.4", "1.2.3.4:8333", "[fc00::1]:8333", "<56>.onion:8333"
+       * and the bare forms; a DNS name falls through to the resolver below */
+      if (bmc_addr_from_string_port(&da, host, (unsigned short)out_port)){
+          { int cp = node_config_peer_port(host); if(cp) da.port = (unsigned short)cp; }
+          if (da.net != BMC_NET_IPV4){
+              const char* why = "";
+              if (!dialer_net_reachable(da.net)){
+                  snprintf(g_dial_fail, sizeof g_dial_fail, "%s unreachable: no transport configured", bmc_net_name(da.net));
+                  return -1;
+              }
+              int dfd = dialer_connect(&da, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
+              if (dfd < 0){ snprintf(g_dial_fail, sizeof g_dial_fail, "%s dial: %.60s", bmc_net_name(da.net), why); return -1; }
+              struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;   /* onion/i2p round trips are slow */
+              setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+              if (node_handshake(dfd) != 1 || !peer_has_witness(host)){
+                  snprintf(g_dial_fail, sizeof g_dial_fail, "%s handshake failed", bmc_net_name(da.net));
+                  close(dfd); return -1;
+              }
+              { extern void addrself_note_peer_view(const unsigned char*, long);
+                addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
+              struct timeval t2; t2.tv_sec = rcv_ms/1000; t2.tv_usec = (rcv_ms%1000)*1000;
+              setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &t2, sizeof t2);
+              fprintf(stderr, "[dial] %s connected via %s transport\n", host, bmc_net_name(da.net));
+              return dfd;
+          }
+      } }
     /* a named peer configured as "host:port" is dialled on ITS port, not the
      * chain default (node_config.c keeps the host bare and the port beside
      * it). 0 = nothing configured for this host. */
     { int cp = node_config_peer_port(host); if(cp) out_port = cp; }
-    struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-    if(getaddrinfo(host,NULL,&h,&res)!=0){
-        snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
+    /* A literal IPv4 (with or without ":port") needs no resolver at all, so
+     * the DNS gate below must not refuse it. Parse it HERE but DIAL IT IN THE
+     * BUDGETED PATH below: the first cut of this fix (2026-08-29) dialled it
+     * right here, which stepped outside the SIGALRM dial budget -- a
+     * trickling peer held the dial 46s against a 20s budget -- and flattened
+     * the connect errno to a bare "connect failed". test_dial_budget caught
+     * both; a shortcut around a bound is not a shortcut. */
+    unsigned lit_ip = 0; int have_lit = 0;
+    { bmc_addr_t lit;
+      if(bmc_addr_from_string_port(&lit, host, (unsigned short)out_port) && lit.net == BMC_NET_IPV4){
+          if(lit.port) out_port = lit.port;
+          memcpy(&lit_ip, lit.addr, 4);       /* network order, like sin_addr.s_addr */
+          have_lit = 1;
+      } }
+    /* By here the address was not a literal of any network, so it is a name
+     * -- and an anonymity-network name must reach its transport, never DNS. */
+    if(strstr(host,".onion") || strstr(host,".i2p")){
+        snprintf(g_dial_fail,sizeof g_dial_fail,"%s peer needs its transport configured",
+                 strstr(host,".onion") ? "onion" : "i2p");
         return -1;
     }
-    unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
-    freeaddrinfo(res);
+    /* With a proxy configured, hand the NAME to the proxy (SOCKS5 ATYP
+     * DOMAINNAME) instead of resolving it here: a local lookup would tell
+     * the resolver exactly which peers this node is about to contact, which
+     * is precisely the correlation a proxy exists to prevent. Core does the
+     * same with its name_proxy. */
+    /* Only a NAME needs this: an IPv4 literal was already handled above and
+     * needs no resolver, so blocking DNS must not block it. And dns=0 with
+     * NO proxy has nowhere to send a name -- refuse it with that reason
+     * rather than a confusing proxy error. (2026-08-29 pre-deploy review.) */
+    if(!have_lit && dialer_dns_blocked()){
+        const char* why = "";
+        int nfd = dialer_connect_name(host, out_port, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
+        if(nfd < 0){ snprintf(g_dial_fail,sizeof g_dial_fail,"cannot dial the name \"%.40s\": %.50s", host, why); return -1; }
+        struct timeval tv; tv.tv_sec=30; tv.tv_usec=0; setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        if(node_handshake(nfd)!=1 || !peer_has_witness(host)){ close(nfd); snprintf(g_dial_fail,sizeof g_dial_fail,"handshake failed (via proxy)"); return -1; }
+        { extern void addrself_note_peer_view(const unsigned char*, long);
+          addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
+        struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
+        setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
+        return nfd;
+    }
+    unsigned ip;
+    if(have_lit) ip = lit_ip;                 /* already parsed; the resolver never sees it */
+    else {
+        struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+        if(getaddrinfo(host,NULL,&h,&res)!=0){
+            snprintf(g_dial_fail,sizeof g_dial_fail,"getaddrinfo failed");
+            return -1;
+        }
+        ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+        freeaddrinfo(res);
+    }
 
     /* Arm the dial budget around BOTH the blocking connect and the handshake.
      * SA_RESTART is deliberately left clear (memset) so the signal makes the
@@ -1090,19 +1449,50 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     mux_sync_budget_fired = 0;
     alarm(OUTBOUND_DIAL_BUDGET_SECS);
 
-    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+    /* Through the proxy when one is configured -- a raw connect here would go
+     * direct and defeat it. Inside the alarm either way, so the budget bounds
+     * the proxied dial too. */
+    const char* pwhy = "";
+    int proxied = dialer_proxy_configured();
+    int fd = -1;
     int hk = 0;
-    if(fd>=0){
-        struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-        hk = node_handshake(fd);
+    const char* v2res = "v1";
+    /* Only peers that advertise NODE_P2P_V2 get a v2 dial; everyone else is
+     * one plain v1 connection, as before. See peer_advertises_v2 above. */
+    const int want_v2 = peer_advertises_v2(host, out_port);
+    for(int attempt = 0; attempt < 2; attempt++){
+        if(proxied){
+            bmc_addr_t pa; memset(&pa,0,sizeof pa);
+            pa.net = BMC_NET_IPV4; pa.len = 4; memcpy(pa.addr, &ip, 4);
+            pa.port = (unsigned short)out_port;
+            fd = dialer_connect(&pa, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &pwhy);
+        } else fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+        if(fd < 0) break;
+        { struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); }
+        if(attempt == 0 && want_v2){
+            int v2 = bmc_v2_handshake(fd, 1, 5000);
+            if(v2 == 1){ v2res = "v2"; break; }
+            /* It advertised v2 and did not deliver -- a stale book entry, or
+             * a peer that changed its mind. Redial and speak v1. */
+            fprintf(stderr,"[dial] %s advertised v2 but the handshake failed -- retrying as v1\n", host);
+            close(fd); fd = -1;
+            continue;
+        }
+        break;
     }
+    if(fd>=0) hk = node_handshake(fd);
 
     alarm(0);
     int fired = mux_sync_budget_fired;
     mux_sync_budget_fired = saved_fired;
     sigaction(SIGALRM,&old,NULL);
 
-    if(fd<0){ dial_fail_errno("connect", fd); return -1; }
+    if(fd<0){
+        if(proxied) snprintf(g_dial_fail,sizeof g_dial_fail,"ipv4 dial via proxy: %.60s", pwhy);
+        else dial_fail_errno("connect", fd);
+        return -1;
+    }
+    peer_sock_buffers(fd);
     if(fired || hk!=1 || !peer_has_witness(host)){
         if(fired){
             snprintf(g_dial_fail,sizeof g_dial_fail,"dial budget %ds exceeded",
@@ -1114,9 +1504,31 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
         } else {
             snprintf(g_dial_fail,sizeof g_dial_fail,"peer lacks NODE_WITNESS");
         }
-        close(fd);
+        bmc_v2_close(fd); close(fd);
         return -1;
     }
+    fprintf(stderr,"[dial] %s connected over %s\n", host, v2res);
+    /* Record what this peer ACTUALLY offers.
+     *
+     * Until now every address this node added itself was stored with a
+     * hardcoded services=1 (NODE_NETWORK), and only gossiped addresses
+     * carried real bits. That made outbound v2 inert in practice: the peers
+     * we dial are the ones we have connected to before, so they all read as
+     * services=1, peer_advertises_v2 said no every time, and the node
+     * happily reported "8341 of 14825 known peers advertise v2" while
+     * dialling v1 to every single one of them.
+     *
+     * The version message has just told us the truth, so store it. From the
+     * next dial onwards the v2 gate has something real to read. */
+    { unsigned long long svc = 0;
+      if (g_peer_version_len >= 12) memcpy(&svc, g_peer_version_payload + 4, 8);
+      if (svc){
+          bmc_addr_t pa;
+          if (bmc_addr_from_string_port(&pa, host, (unsigned short)out_port)){
+              ab2_t* b = addr_book();
+              if (b) ab2_add(b, &pa, svc, (unsigned)time(NULL));
+          }
+      } }
     /* the peer's version told us how it sees US -- feed the self-address
      * tally (daemon/addr_self.c) */
     { extern void addrself_note_peer_view(const unsigned char*, long);
@@ -1126,6 +1538,55 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
     return fd;
+}
+
+/* ---- refuse to run one chain's node against another chain's archive ------
+ * Until 2026-08-29 the ONLY thing separating chains was directory layout:
+ * mainnet uses the datadir itself, every other chain a subdirectory of it
+ * (chainparams_datadir). Nothing verified that an archive already on disk
+ * belonged to the chain being started.
+ *
+ * That is thinner than it looks. Every frame is written [len][magic] with the
+ * chain's network magic, but nothing ever compares that magic on the way back
+ * in -- it is written and never read. So pointing -datadir at another chain's
+ * directory (say <base>/regtest while running mainnet) appended mainnet
+ * blocks to a regtest archive without a word of complaint, and -datadir,
+ * added the same day, makes that easier to do by accident.
+ *
+ * Block 0's hash is the cheapest possible check and it is unambiguous: it is
+ * already sitting in index.dat record 0, so this costs one 32-byte read and
+ * no parsing. An EMPTY archive is fine -- that is a fresh datadir, which is
+ * exactly how a new chain legitimately starts.
+ *
+ * Refusing to start is the right failure. Continuing would interleave two
+ * chains' blocks in one file, which no later check could untangle. */
+static int chain_archive_matches(void* store_buf){
+    int  fd  = *(int*)((char*)store_buf + 8);    /* idx_fd  */
+    long len = *(long*)((char*)store_buf + 16);  /* idx_len */
+    if (fd < 0 || len < 48) return 1;            /* empty archive: nothing to contradict */
+    unsigned char have[32];
+    if (lseek(fd, 0, SEEK_SET) < 0 || read(fd, have, 32) != 32){
+        fprintf(stderr, "[boot] cannot read block 0 from index.dat -- refusing to start "
+                        "rather than guess which chain this archive belongs to\n");
+        return 0;
+    }
+    const unsigned char* want = g_chainp->genesis_hash;
+    if (!want) return 1;
+    if (!memcmp(have, want, 32)) return 1;
+    char hh[65], wh[65];
+    for (int i = 0; i < 32; i++){                /* display order */
+        snprintf(hh + i*2, 3, "%02x", have[31-i]);
+        snprintf(wh + i*2, 3, "%02x", want[31-i]);
+    }
+    fprintf(stderr,
+        "[boot] WRONG CHAIN FOR THIS DATADIR -- refusing to start.\n"
+        "[boot]   chain=%s expects genesis %s\n"
+        "[boot]   this archive's block 0 is  %s\n"
+        "[boot] Running on would append %s blocks to another chain's archive, which\n"
+        "[boot] nothing could untangle afterwards. Point -datadir at the right\n"
+        "[boot] directory, or use an empty one.\n",
+        g_chainp->name, wh, hh, g_chainp->name);
+    return 0;
 }
 
 /* Anchor a peer's locator to our CURRENT stored tip hash (zero if empty). */
@@ -1316,7 +1777,7 @@ static long do_outbound_sync(int i){
          * dead-slot path re-dials it, rate-limited. */
         g_sync_fail_streak[i]++;
         if(g_sync_fail_streak[i] >= 3){
-            close(mux_out_fd[i]);
+            bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]);
             mux_out_fd[i] = -1;
             g_sync_fail_streak[i] = 0;
         }
@@ -1368,7 +1829,7 @@ static long do_outbound_sync(int i){
  * reused in the poll loop; on failure the slot stays dead (fd -1) and is retried
  * on a later rotation. */ 
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
-    if(mux_out_fd[i]>=0){ close(mux_out_fd[i]); mux_out_fd[i]=-1; }
+    if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
      * This is the ONE place outbound legs are established, so gating here
      * gates every reconnect -- a toggle that only dropped the current legs
@@ -1484,6 +1945,16 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
  * speaks dotted-quad, so config entries are resolved at the boundary rather
  * than each consumer having to cope with hostnames. Returns 1 on success. */
 static int dl_resolve1(const char* host, char out[64]){
+    /* A literal needs no resolver, so it leaks nothing and must not be
+     * refused: dropping it here removed the operator's own addnode=/connect=
+     * from BOTH the book and the catch-up pool, and with the DNS seeds also
+     * skipped behind a proxy that left a node with no bootstrap source at
+     * all. Parse it before the gate. (2026-08-29 pre-deploy review.) */
+    { bmc_addr_t lit;
+      if(bmc_addr_from_string(&lit, host) && lit.net == BMC_NET_IPV4){
+          bmc_addr_to_string(out, 64, &lit); return 1; } }
+    /* a NAME behind a proxy is resolved BY the proxy at dial time, not here */
+    if(dialer_dns_blocked()) return 0;
     struct addrinfo h,*res=0; memset(&h,0,sizeof h);
     h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
     if(getaddrinfo(host,NULL,&h,&res)!=0 || !res) return 0;
@@ -1512,7 +1983,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         if(!dl_resolve1(g_cfg.addnode[i], ipd)){
             fprintf(stderr,"[boot] addnode=%s did not resolve\n", g_cfg.addnode[i]); continue; }
         if(inet_pton(AF_INET,ipd,&ip)!=1) continue;
-        if(amr_add(ab,ip,(unsigned short)htons((unsigned short)g_chainp->default_port),1,(unsigned)time(NULL))>0) total++;
+        if(book_add_ipv4(ip, g_chainp->default_port)>0) total++;
         fprintf(stderr,"[boot] addnode %s -> %s\n", g_cfg.addnode[i], ipd);
     }
 
@@ -1528,8 +1999,18 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         total += got;
     }
 
-    if(!g_cfg.dnsseed){
+    if(!g_cfg.dnsseed && !g_cfg.forcednsseed){
         fprintf(stderr,"[boot] dnsseed=0 -- not querying the DNS seeds\n");
+        return total;
+    }
+    if(g_cfg.forcednsseed && !g_cfg.dnsseed)
+        fprintf(stderr,"[boot] forcednsseed=1 overrides dnsseed=0 -- querying the seeds anyway\n");
+    if(dialer_dns_blocked()){
+        /* the seeds are DNS names; querying them behind a proxy would leak
+         * "this host runs a Bitcoin node" to the resolver even though every
+         * later connection is proxied */
+        fprintf(stderr,"[boot] not querying the DNS seeds: a proxy is configured (or dns=0) -- "
+                       "use addnode=/connect= or a seeded peers2.dat\n");
         return total;
     }
     for(int i=0;i<pool_len && i<12;i++){
@@ -1539,7 +2020,7 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
             for(struct addrinfo* ai=res; ai && got<64; ai=ai->ai_next){
                 struct sockaddr_in* sa=(struct sockaddr_in*)ai->ai_addr;
                 unsigned ip=sa->sin_addr.s_addr;
-                if(ip && amr_add(ab,ip,(unsigned short)htons((unsigned short)g_chainp->default_port),1,(unsigned)time(NULL))>0) got++;
+                if(ip && book_add_ipv4(ip, g_chainp->default_port)>0) got++;
             }
             freeaddrinfo(res);
         }
@@ -1563,10 +2044,37 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
  * Deliberately a plain newline-separated IP text file: it is tiny, trivially
  * inspectable, and a corrupt/missing one degrades to exactly the old
  * behaviour (probe the book) rather than breaking startup. */
+/* A pool slot must hold the LONGEST entry. The pool carries "host:port"
+ * since the port had to survive the trip from the book, and an onion name is
+ * 62 chars -- "<onion>:65535" is 68, so the old 64 truncated every Tor peer
+ * to "<onion>:", undialable and still burning a slot. */
+#define DL_POOL_SLOT 80
+/* The pool's entries are "host:port" ("[v6]:port" for IPv6/CJDNS). Every
+ * consumer that used to inet_pton() a bare host MUST split first -- three of
+ * them did not, and the node came up with zero outbound legs and skipped its
+ * boot catch-up on every restart (2026-08-28 pre-deploy review, caught
+ * before this reached the live node). */
+static int pool_split(const char* entry, char* host, long cap, int* port){
+    bmc_addr_t a;
+    if(!bmc_addr_from_string_port(&a, entry, 0)){
+        snprintf(host, (size_t)cap, "%s", entry);      /* a DNS name: leave it whole */
+        return 0;
+    }
+    bmc_addr_to_string(host, cap, &a);
+    if(port && a.port) *port = a.port;
+    return 1;
+}
+/* the IPv4 of a pool entry (0 if it is not a dialable v4), and its port */
+static unsigned pool_ipv4(const char* entry, int* port){
+    bmc_addr_t a;
+    if(!bmc_addr_from_string_port(&a, entry, 0) || a.net != BMC_NET_IPV4) return 0;
+    if(port && a.port) *port = a.port;
+    unsigned ip; memcpy(&ip, a.addr, 4); return ip;
+}
 #define DL_GOODPEERS_FILE "peers.good"
 #define DL_GOODPEERS_MAX  256
 
-static int dl_load_good_peers(char out[][64], int cap){
+static int dl_load_good_peers(char out[][DL_POOL_SLOT], int cap){
     FILE* f = fopen(DL_GOODPEERS_FILE, "r");
     if(!f) return 0;
     int n=0; char line[128];
@@ -1594,37 +2102,32 @@ static void dl_save_good_peers(char peers[][64], int n){
     fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
 }
 
-static int dl_pool_from_book(void* ab, char out[][64], int nitems){
-    long cnt=amr_count(ab); if(cnt<=0) return 0;
-    unsigned char rec[18]; int got=0;
-    /* iterate the WHOLE book (not just the first `nitems`) and keep plausible
-     * PUBLIC IPv4s, so stale/special-range garbage from prior runs never crowds
-     * the download pool. */
+static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
+    (void)ab;
+    /* Walk the whole version-2 book and keep the addresses this node can
+     * DIAL today. Until the SOCKS5/SAM/IPv6 transports land only IPv4 is
+     * dialable; a non-IPv4 entry is kept in the book (and served to peers)
+     * but not put in the pool. bmc_addr_is_routable already excludes the
+     * special ranges the old loop filtered by hand. */
+    ab2_t* b = addr_book(); if(!b) return 0;
+    long cnt = ab2_count(b); int got = 0;
     for(long i=0;i<cnt && got<nitems;i++){
-        if(amr_get_i(ab,i,rec)!=1) continue;
-        /* amr stores the ip as the 4 bytes passed to amr_add -- which we passed
-         * in NETWORK (big-endian) order (sin_addr.s_addr). The "u32 LE" in the
-         * asm comment is literal movement of those bytes, not an LE reorder.
-         * Reading with *(unsigned*) on an LE CPU would byte-swap and yield
-         * wrong/unreachable IPs (e.g. 97.158.36.82 for the real 82.36.158.97).
-         * Decode explicitly BIG-endian from the record bytes instead. */
-        unsigned ip = ((unsigned)rec[0]<<24)|((unsigned)rec[1]<<16)|((unsigned)rec[2]<<8)|(unsigned)rec[3];
-        unsigned a=(ip>>24)&0xff,b=(ip>>16)&0xff,c=(ip>>8)&0xff,d=ip&0xff;
-        /* skip special/reserved ranges that can't be a reachable peer:
-         * 0.0.0.0/8, 10/8 & 172.16/12 & 192.168/16 (RFC1918 -- could be peers
-         * but our resolver gives public ones; skip to be safe), 169.254/16
-         * link-local, 224-239 multicast, 240+ reserved, broadcast, and
-         * 255.127.0.0-style garbage seen in stale books. */
-        if(a==0) continue;
-        if(a==10) continue;
-        if(a==172 && b>=16 && b<=31) continue;
-        if(a==192 && b==168) continue;
-        if(a==169 && b==254) continue;
-        if(a==127) continue;
-        if(a>=224) continue;                     /* multicast + reserved + 255.x */
-        if(b==0&&c==0&&d==0) continue;
-        if(a==255&&b==255&&c==255&&d==255) continue;
-        snprintf(out[got],64,"%u.%u.%u.%u",a,b,c,d);
+        ab2_rec_t r; if(!ab2_get(b, i, &r)) continue;
+        /* every network this node can actually reach right now: IPv4 always,
+         * onion/i2p when their transports are configured (daemon/dialer.c).
+         * An address we cannot dial stays in the book and is still served to
+         * peers -- it just never enters the pool. */
+        if(!dialer_net_reachable(r.a.net)) continue;
+        if(!bmc_addr_is_routable(&r.a)) continue;
+        /* the caller's slots are 64 bytes; an IPv4 needs 16. Take the string
+         * only if it was actually produced -- a slot left empty would be
+         * dialled as "" and, worse, still counted, suppressing the seed
+         * fallback (2026-08-28 review, caught before deploy). */
+        /* host:port ([v6]:port for IPv6/CJDNS): the book records the peer's
+         * real port and the chain default is only a fallback for names.
+         * Dropping it here sent every dial to the default port -- which is
+         * right for most mainnet peers and wrong for everyone else. */
+        if(bmc_addr_to_string_port(out[got], DL_POOL_SLOT, &r.a) <= 0) continue;
         got++;
     }
     return got;
@@ -1773,6 +2276,7 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
     if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
     if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
@@ -2016,14 +2520,16 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
  * per round to match its proven behavior (trying the WHOLE pool at once in
  * one round measurably tanks the success rate -- observed 1/140 live).
  * Returns how many were promoted this round. */
-static int dlc_probe_round(char pool[][64], int from, int ntry,
+static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
                            char live[][64], int* nlive, int cap, int wait_ms){
     if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
     static int cfd[MUX_MAX_OUT*3];
     int nc=0;
     for(int k=0;k<ntry;k++){
         int i=from+k;
-        unsigned ip; if(inet_pton(AF_INET,pool[i],&ip)!=1){ cfd[nc++]=-1; continue; }
+        if(dialer_proxy_configured()){ cfd[nc++]=-1; continue; }   /* would bypass the proxy */
+        int pport = 0; unsigned ip = pool_ipv4(pool[i], &pport);
+        if(!ip){ cfd[nc++]=-1; continue; }        /* not a dialable IPv4 candidate */
         int fd=socket(AF_INET,SOCK_STREAM,0);
         if(fd<0){ cfd[nc++]=-1; continue; }
         int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
@@ -2164,12 +2670,12 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
 
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
-    static unsigned char ab[64];
-    if(amr_init(ab)!=1){ fprintf(stderr,"[dlc] amr_init failed\n"); return 0; }
+    ab2_t* ab = addr_book();
+    if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
     long disc=dl_bootstrap(ab, (const char**)g_seed_hosts, g_n_seed_hosts);
-    fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)amr_count(ab));
+    fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
 
-    static char pool[DLC_MAXPOOL][64];
+    static char pool[DLC_MAXPOOL][DL_POOL_SLOT];
     int npool = 0, ngood = 0, nadd = 0;
     if(g_cfg.connect_only){
         /* Core -connect: the pool IS the configured list. Nothing from the
@@ -2196,7 +2702,7 @@ static long dl_catchup(const char* dir, int min_workers){
         ngood = dl_load_good_peers(pool+npool, DLC_MAXPOOL-npool);
         npool += ngood;
         {
-            static char book[DLC_MAXPOOL][64];
+            static char book[DLC_MAXPOOL][DL_POOL_SLOT];
             int nbook = dl_pool_from_book(ab, book, DLC_MAXPOOL);
             for(int i=0;i<nbook && npool<DLC_MAXPOOL;i++){
                 int dup=0;
@@ -2219,7 +2725,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * exists for the same reason), and everything downstream of this
      * (dlc_headers, dlc_worker) deliberately only dials CONFIRMED entries,
      * so under-populating `live[]` here directly costs catch-up depth. */
-    static char live[DLC_MAXPOOL][64]; int nlive=0;
+    static char live[DLC_MAXPOOL][DL_POOL_SLOT]; int nlive=0;
     {
         /* Target a deep live pool: workers*3 was sized before peers could be
          * banned, and left no headroom -- evicting duds then starved the
@@ -2460,7 +2966,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * crash reading unmapped memory right after the loop exits looks like.
      * Must run BEFORE stats (and friends) are unmapped. */
     {
-        static char good[64][64]; int ngood=0;
+        static char good[64][DL_POOL_SLOT]; int ngood=0;
         for(int w=0; w<nw && ngood<64; w++){
             if(stats[w].blocks<=0) continue;
             const char* ip=(const char*)stats[w].peer;
@@ -2770,6 +3276,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
     if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
     if (g_cfg.zmq_rawtx[0])     zmqpub_add("rawtx",     g_cfg.zmq_rawtx);
+    /* Subscriber servicing runs on its own thread from here on, so no hot
+     * loop in this worker ever walks the subscriber list (audit finding 8).
+     * Non-fatal: if the thread cannot start, publishing still works and the
+     * failure is logged -- only new subscribers would fail to connect. */
+    { extern int zmqpub_start(void);
+      if (zmqpub_active()) zmqpub_start(); }
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
@@ -2785,6 +3297,34 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * the UTXO set and be reported as success. Detect it (duplicate block
      * hashes are never valid on a real chain) and self-repair by truncating
      * to the last good height, letting normal sync re-download from there. */
+    /* -reindex-chainstate: drop the persisted UTXO set so it is rebuilt from
+     * the archive by the normal catch-up path. Runs BEFORE the archive scan
+     * because the scan's own repair path may also drop it, and doing it twice
+     * would be wasted work rather than harmful.
+     *
+     * ONE-SHOT. Core treats -reindex-chainstate as a request, not a mode, and
+     * so must this: a node left with the flag in bitcoin.conf would wipe and
+     * rebuild its UTXO set on EVERY restart -- hours of work, silently, with
+     * the operator seeing only a slow start. The flag is consumed by writing
+     * a marker, and refused on the next boot unless the operator removes it. */
+    if (CFG_REINDEX_CHAINSTATE()){
+        struct stat rst;
+        if (stat("reindex_chainstate.done", &rst) == 0){
+            fprintf(stderr,
+                "[reindex] reindex-chainstate is still set in the config but was "
+                "already carried out (reindex_chainstate.done exists) -- ignoring. "
+                "Remove the option, and delete that marker if you truly want another rebuild.\n");
+        } else {
+            long dropped = archive_drop_utxo_state();
+            fprintf(stderr,"[reindex] reindex-chainstate: dropped %ld UTXO state file(s); "
+                           "the set will rebuild from the archive\n", dropped);
+            FILE* mk = fopen("reindex_chainstate.done", "w");
+            if (mk){ fprintf(mk, "reindex-chainstate carried out\n"); fclose(mk); }
+            else fprintf(stderr,"[reindex] WARNING: could not write reindex_chainstate.done -- "
+                                "the rebuild would repeat on the next restart\n");
+        }
+    }
+
     int archive_ok;
     {
         /* ONE scan: it walks every index record through a ~1M-entry hash
@@ -2803,7 +3343,28 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     }
 
     { extern void addrself_init(unsigned short, int);
-      addrself_init((unsigned short)g_cfg.port, g_cfg.listen); }
+      /* -discover=0, or an -onlynet that names only anonymity networks,
+       * means this node must not learn or announce its clearnet address at
+       * all: that address is exactly what running behind Tor hides. */
+      { extern void txrelay_set_status(void*); txrelay_set_status(g_node_status); }
+      { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
+      int may = g_cfg.listen && dialer_may_announce_clearnet();
+      addrself_init((unsigned short)g_cfg.port, may);
+      /* -externalip: the operator naming the reachable address directly */
+      if (may && g_cfg.externalip[0]){
+          bmc_addr_t ex;
+          extern int addrself_set_external(const unsigned char*);
+          if (bmc_addr_from_string(&ex, g_cfg.externalip) && ex.net == BMC_NET_IPV4 && addrself_set_external(ex.addr))
+              fprintf(stderr,"[addrself] announcing the configured externalip %s:%u\n", g_cfg.externalip, (unsigned)g_cfg.port);
+          else
+              fprintf(stderr,"[config] externalip=%s is not a usable IPv4 address -- ignoring\n", g_cfg.externalip);
+      }
+      if (g_cfg.listen && !may)
+          fprintf(stderr,"[addrself] not announcing our address: %s\n",
+                  g_cfg.discover ? "onlynet excludes clearnet" : "discover=0"); }
+    /* transports for the non-IPv4 networks (SOCKS5 to tor, SAM to i2pd).
+     * Cheap and silent when nothing is configured. */
+    dialer_init();
     { extern long undo_replay(long, bfi_undo_cb_t, void*);
       bfi_set_undo_replay(undo_replay);
       /* the address index consumes the same undo stream (spent prevout
@@ -2860,7 +3421,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * is adopted instantly on every clean boot. Seeded HERE, before the
          * catch-up loop starts writing, which is what makes the walk's
          * quiescence requirement hold by construction. */
-        {
+        /* -coinstatsindex: the index has always run unconditionally. An
+         * operator who does not want the write amplification had no way to
+         * say so; now they do, and getindexinfo stops advertising an index
+         * that is deliberately off. */
+        if (!g_cfg.coinstatsindex)
+            fprintf(stderr,"[dl] coinstatsindex=0 -- not maintaining the coin statistics index\n");
+        else {
             typedef void (*coin_fn)(const unsigned char*, unsigned int,
                                     unsigned long long, unsigned long long,
                                     unsigned long long, const unsigned char*,
@@ -2942,14 +3509,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * seed-DNS hostname to its A-records (real, current node IPs), fold the
      * distinct v4 endpoints into the persisted amr book (peers.dat), then dial
      * up to 8 of those DISCOVERED peers for download. */
-    static unsigned char ab[64];
-    if(amr_init(ab)==1){
+    ab2_t* ab = addr_book();
+    if(ab){
         long disc = dl_bootstrap(ab, peers, pool_len);
-        fprintf(stderr,"[boot] discovered +%ld peers (peers.dat now %ld)\n", disc, (long)amr_count(ab));
+        fprintf(stderr,"[boot] discovered +%ld peers (peers2.dat now %ld)\n", disc, (long)ab2_count(ab));
     } else {
-        fprintf(stderr,"[boot] amr_init failed; falling back to seed list\n");
+        fprintf(stderr,"[boot] address book unavailable; falling back to seed list\n");
     }
-    static char dle[64][64];
+    static char dle[64][DL_POOL_SLOT];
     int npool = dl_pool_from_book(ab, dle, 64);
     fprintf(stderr,"[boot] %d public peer candidate(s) in pool\n", npool);
     /* srcpool is the ADDRESS BOOK pool, and it is what every dial in this
@@ -3033,8 +3600,22 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         int nc=0;
         for(int i=0;i<ntry && nc<64;i++){
             unsigned ip;
-            if(inet_pton(AF_INET,srcpool[i],&ip)!=1){
+            /* With a proxy configured this raw non-blocking connect would
+             * go DIRECT, defeating the proxy for every IPv4 peer. Leave those
+             * to the sequential path, which dials through the dialer.
+             * (2026-08-29 pre-deploy review.) */
+            if(dialer_proxy_configured()){ cfd[nc++]=-1; continue; }
+            int spport = 0;
+            ip = pool_ipv4(srcpool[i], &spport);
+            if(!ip){
                 struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
+                /* never hand an anonymity-network name to the system
+                 * resolver: a DNS lookup for a .onion deanonymises both ends.
+                 * Those are dialled through their transport, not here. */
+                if(strstr(srcpool[i],".onion") || strstr(srcpool[i],".i2p")){ cfd[nc++]=-1; continue; }
+                /* behind a proxy this name must not be resolved here; the
+                 * sequential path dials it through the proxy instead */
+                if(dialer_dns_blocked()){ cfd[nc++]=-1; continue; }
                 if(getaddrinfo(srcpool[i],NULL,&h,&res)!=0){ cfd[nc++]=-1; continue; }
                 ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr; freeaddrinfo(res);
             }
@@ -3042,7 +3623,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(fd<0){ cfd[nc++]=-1; continue; }
             int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
             struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
-            sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)out_port);
+            sa.sin_addr.s_addr=ip;
+            sa.sin_port=(unsigned short)htons((unsigned short)(spport ? spport : out_port));
             int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
             if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
             /* stash the original flags so we can clear O_NONBLOCK after promote */
@@ -3191,7 +3773,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     /* Core drops every connection when the network goes down;
                      * anything less would leave the node still talking. */
                     for(int i = 0; i < mux_n_out; i++)
-                        if(mux_out_fd[i] >= 0){ close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+                        if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
                     fprintf(stderr,"[ctl] network DISABLED: dropped all outbound legs\n");
                 } else {
                     fprintf(stderr,"[ctl] network enabled\n");
@@ -3214,7 +3796,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                               (!want[0] && num == (long long)i);
                     if(!hit) continue;
                     fprintf(stderr,"[ctl] disconnecting %s (leg %d)\n", mux_out_host[i], i);
-                    close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
                     if(g_node_status) g_node_status->peers[i].used = 0;
                     result = 1; break;
                 }
@@ -3240,6 +3822,35 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = -1;
                     snprintf(reason, sizeof reason,
                              "the runtime addnode list is full (%d)", CTL_MAX_ADDNODE);
+                }
+            } else if(op == RPC_CTL_ADDPEERADDRESS){
+                /* one address into the version-2 book (any BIP155 network);
+                 * the worker is the book's only writer, which is why this
+                 * crosses the channel instead of the RPC thread writing */
+                bmc_addr_t a;
+                /* port 0 is legal and is I2P's canonical form (Core's
+                 * I2P_SAM31_PORT is 0), so the ctl argument carries the port
+                 * separately after the last ':' and 0 is accepted */
+                char host[128]; long pnum = -1;
+                { const char* c = strrchr(arg, ':');
+                  host[0] = 0;
+                  if (c && c > arg){
+                      long hl = c - arg;
+                      const char* hs = arg;
+                      if (arg[0] == '[' && c[-1] == ']'){ hs = arg + 1; hl -= 2; }   /* [v6]:port */
+                      if (hl > 0 && (size_t)hl < sizeof host){
+                          memcpy(host, hs, (size_t)hl); host[hl] = 0; pnum = atol(c + 1); }
+                  } }
+                if(!host[0] || pnum < 0 || pnum > 65535 || !bmc_addr_from_string(&a, host)){
+                    result = -8; snprintf(reason, sizeof reason, "Invalid address");
+                } else if(!bmc_addr_is_routable(&a)){
+                    result = 0;                                /* Core: not added, success=false */
+                } else {
+                    a.port = (unsigned short)pnum;
+                    ab2_t* b = addr_book();
+                    int rc = b ? ab2_add(b, &a, 1, (unsigned)time(NULL)) : -1;
+                    result = rc == 1 ? 1 : 0;
+                    if(rc == 1) fprintf(stderr,"[ctl] addpeeraddress: %s -> book (%s)\n", arg, bmc_net_name(a.net));
                 }
             } else if(op == RPC_CTL_SETBAN){
                 if(num == 0){                                  /* remove */
@@ -3279,7 +3890,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
                                 if(ctl_ban_covers(arg, ip)){
                                     fprintf(stderr,"[ctl] ban %s drops live leg %s\n", arg, mux_out_host[i]);
-                                    close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
                                     g_node_status->peers[i].used = 0;
                                 }
                             }
@@ -3531,6 +4142,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && txsub_worker_ready()){
                 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
                 if(acc>0){
                     extern long mpool_count(void*);
                     fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
@@ -3599,8 +4211,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern long txrelay_announce(const int* fds, int nfds);
             txrelay_announce(mux_out_fd, mux_n_out);
         }
-        { extern long addrself_maybe_announce(const int*, const unsigned char*, int);
-          addrself_maybe_announce(mux_out_fd, mux_out_wants_v2, mux_n_out); }
+        { extern long addrself_maybe_announce_nets(const int*, const unsigned char*, const unsigned char*, int);
+          for(int k=0;k<mux_n_out && k<MUX_MAX_OUT;k++){
+              bmc_addr_t la;
+              mux_out_net[k] = bmc_addr_from_string(&la, mux_out_host[k]) ? la.net : BMC_NET_IPV4;
+          }
+          addrself_maybe_announce_nets(mux_out_fd, mux_out_wants_v2, mux_out_net, mux_n_out); }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would
@@ -3623,7 +4239,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(bro_fd[b] >= 0) continue;
             if((rot % 16) != 0) break;             /* rate-limit re-dials */
             for(int ci=0; ci<nsrc; ci++){
-                unsigned cip; if(inet_pton(AF_INET,srcpool[ci],&cip)!=1) continue;
+                if(dialer_proxy_configured()) continue;            /* would bypass the proxy */
+                unsigned cip = pool_ipv4(srcpool[ci], NULL); if(!cip) continue;
                 int clash=0;
                 for(int k=0;k<mux_n_out;k++){
                     unsigned oip; if(inet_pton(AF_INET,mux_out_host[k],&oip)!=1) continue;
@@ -3740,10 +4357,20 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         txit_on_block(store_buf, zh, zb, bl);
                         /* filter index tail: adopt/append (cheap probe when
                          * the backfill has not closed in yet) */
-                        bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                        if (g_cfg.blockfilterindex)
+                            bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
                         /* address index (extension): ADDs from the block,
                          * DELs/TOUCHes from its undo records */
                         axt_on_block(store_buf, zh, zb, bl);
+                        /* -blocknotify: after the indexes have taken the
+                         * block, so a hook that queries us sees it. */
+                        if (g_cfg.blocknotify[0]){
+                            unsigned char bh[32]; char hx[65];
+                            block_hash(bh, zb);
+                            for (int _i = 0; _i < 32; _i++)
+                                snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
+                            notify_run(g_cfg.blocknotify, hx, "blocknotify");
+                        }
                         /* mempool reconciliation (Core removeForBlock):
                          * confirmed txs leave pool+policy graph, txs
                          * CONFLICTING with this block's spends leave with
@@ -3785,7 +4412,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* Drain transactions staged by the serve children (and by this
          * worker's own sendrawtransaction path) and service subscriber
          * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
-        if (zmqpub_active()){ zmqpub_poll(); zmqn_drain(); }
+        /* audit finding 8: subscriber servicing has its own thread now
+         * (daemon/zmq_pub.c), so this loop -- whose job is block download --
+         * no longer walks the subscriber list at all. Only the staged-tx
+         * drain remains, which is a cheap no-op when ZMQ is unconfigured.
+         * This is the shape Core has for free: libzmq services subscribers on
+         * its own I/O thread and Core's hot paths never touch them. */
+        if (zmqpub_active()) zmqn_drain();
         if(now_ms >= next_heartbeat_ms){
             int live_peers=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) live_peers++;
             char upbuf[UPTIME_BUF];
@@ -3930,9 +4563,32 @@ static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pca
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
+    /* Start on ANY usable credential, not just rpcuser/rpcpassword.
+     *
+     * This used to bail out whenever those two were absent, which meant
+     * deleting a plaintext password from the config -- the thing the security
+     * audit asked for -- silently turned the whole RPC server off. Cookie
+     * authentication was already implemented, enabled by default and
+     * verified working; it just never got the chance to run, because the
+     * server never started.
+     *
+     * Core's behaviour is the right one: the cookie IS the default
+     * credential, and rpcuser/rpcpassword are the legacy alternative. So the
+     * server starts if a cookie will be emitted, or an rpcauth entry exists,
+     * or a user/password pair is configured -- and only refuses when there
+     * is genuinely no way to authenticate, which would otherwise be an open
+     * RPC port. */
     if (!user[0] || !pass[0]){
-        fprintf(stderr, "[rpc] no rpcuser/rpcpassword in config -- embedded RPC server disabled\n");
-        return;
+        if (!g_cfg.rpccookie && g_cfg.n_rpcauth == 0){
+            fprintf(stderr, "[rpc] no rpcuser/rpcpassword, no rpcauth and rpccookie=0 "
+                            "-- nothing could authenticate, so the embedded RPC server "
+                            "is disabled\n");
+            return;
+        }
+        fprintf(stderr, "[rpc] no rpcuser/rpcpassword -- using %s%s%s\n",
+                g_cfg.rpccookie ? "cookie authentication" : "",
+                (g_cfg.rpccookie && g_cfg.n_rpcauth) ? " and " : "",
+                g_cfg.n_rpcauth ? "rpcauth credentials" : "");
     }
     (void)dir;   /* the daemon has already chdir'd into the datadir */
     if (rpc_chain_open(NULL))
@@ -3972,7 +4628,22 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_wops_set_seed_installer(wenc_install_seed);
       char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
       if (wenc_boot(".") || wenc_boot(wd)){
-          fprintf(stderr, "[rpc] encrypted wallet adopted (locked)\n");
+          /* An encrypted wallet boots LOCKED, as Core's does. If the operator
+           * has configured a passphrase source (walletpassfile= or
+           * $BMC_WALLET_PASS) unlock it here, so moving from the weak v2 store
+           * to this container does not silently turn the wallet RPCs off --
+           * the key still lives outside the datadir either way. With no
+           * passphrase source the wallet simply stays locked until
+           * walletpassphrase, which is the correct default. */
+          extern int wenc_unlock(const char*, long, long);
+          char boot_pass[256];
+          if (wallet_pass_load(boot_pass, (int)sizeof boot_pass, 0)
+              && wenc_unlock(boot_pass, (long)strlen(boot_pass), 0) == 1){
+              fprintf(stderr, "[rpc] encrypted wallet adopted and unlocked from the configured passphrase source\n");
+          } else {
+              fprintf(stderr, "[rpc] encrypted wallet adopted (locked -- use walletpassphrase)\n");
+          }
+          memset(boot_pass, 0, sizeof boot_pass);
       } else {
     { extern int wallet_store_load(const char*, char*, int, char*, int);
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
@@ -3983,12 +4654,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           struct stat wsb;
           if (stat(cand[wi], &wsb) != 0) continue;
           wpass[0] = 0;
-          { const char* sec = getenv("BMC_WALLET_PASS");
-            if (sec && sec[0]) snprintf(wpass, sizeof wpass, "%s", sec);
-            else { char pf[1064]; snprintf(pf, sizeof pf, "%s.pass", cand[wi]);
-                   FILE* f = fopen(pf, "r");
-                   if (f){ if (fgets(wpass, sizeof wpass, f)){ char* nl = strchr(wpass,'\n'); if (nl) *nl = 0; }
-                           fclose(f); } } }
+          /* audit finding 2: the passphrase comes from the environment or a
+           * root-owned file OUTSIDE the datadir -- never from <store>.pass,
+           * which put the key in the same directory (and the same backup) as
+           * the ciphertext it protects. */
+          wallet_pass_load(wpass, (int)sizeof wpass, 0);
+          wallet_pass_warn_legacy(cand[wi]);
           if (wallet_store_load(cand[wi], mn, (int)sizeof mn, wpass, (int)sizeof wpass) == 0){
               wallet_mnemonic_seed(g_wallet_seed, mn, wpass[0] ? wpass : NULL,
                                    wpass[0] ? (long)strlen(wpass) : 0);
@@ -4000,7 +4671,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
               fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
           } else {
               fprintf(stderr, "[rpc] wallet store %s present but not loadable "
-                              "(encrypted? set BMC_WALLET_PASS or %s.pass)\n", cand[wi], cand[wi]);
+                              "(encrypted? set BMC_WALLET_PASS or walletpassfile=)\n", cand[wi]);
           }
           break;
       } } } }
@@ -4035,6 +4706,19 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
+    /* -persistmempool: reload the dump the previous run left behind. Same
+     * code the importmempool RPC uses, so the two cannot drift apart on the
+     * format. A missing file is the ordinary case -- a fresh datadir, or a
+     * node that has never saved one -- and is not an error. */
+    if(CFG_PERSISTMEMPOOL()){
+        struct stat mst;
+        if(stat("mempool.dat", &mst) == 0){
+            long acc = rpc_node_mempool_load("mempool.dat");
+            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+        } else {
+            fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
+        }
+    }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
       rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run);
@@ -4055,11 +4739,12 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * Its own handle, opened here: the download worker runs in the FORKED
      * child and its handle is not reachable from the parent's RPC thread.
      * amr_* re-reads peers.dat per call, so two handles see the same file. */
-    { static unsigned char rpc_ab[64];
-      if (!g_cfg.connect_only && amr_init(rpc_ab) == 1)
-          rpc_node_set_addrbook(rpc_ab, amr_count,
-                                (int (*)(void*, long, unsigned char*))amr_get_i);
-      else
+    { extern void rpc_node_set_addrbook_dir(const char*);
+      /* always: even with connect= the book is real (addpeeraddress writes
+       * it, getnodeaddresses reads it); the old gate hid it behind
+       * connect_only for no reason that survives the v2 book */
+      rpc_node_set_addrbook_dir(".");
+      if (0)
           fprintf(stderr, "[rpc] address book unavailable; "
                           "getnodeaddresses/getaddrmaninfo will report empty\n"); }
     /* the external signer command, when the operator configured one */
@@ -4081,13 +4766,69 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     { static unsigned char rescan_buf[4*1024*1024];   /* one max-size block */
       rpc_wops_set_scanner(rpc_chain_read_block_at, rescan_buf, (long)sizeof rescan_buf,
                            rpc_chain_tip_height); }
-    rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
+    /* Core InitHTTPAllowList: 127.0.0.0/8 and ::1 are always allowed, then
+     * each -rpcallowip. A malformed subnet is fatal there and here -- an ACL
+     * typo that silently allows LESS is a support call; one that silently
+     * allows MORE is an incident, and refusing avoids having to work out
+     * which happened. */
+    rpc_acl_reset();
+    for(int i = 0; i < g_cfg.n_rpcallowip; i++){
+        if(!rpc_acl_add(g_cfg.rpcallowip[i])){
+            fprintf(stderr, "[rpc] FATAL: rpcallowip=%s is not a valid address "
+                            "or subnet -- refusing to start\n", g_cfg.rpcallowip[i]);
+            exit(1);
+        }
+    }
+    const char* bindaddr = g_cfg.rpcbind;
+    if(bindaddr[0] && rpc_acl_configured() == 0){
+        /* Core httpserver.cpp:225, verbatim in intent. */
+        fprintf(stderr, "[rpc] Option -rpcbind was ignored because -rpcallowip "
+                        "was not specified, refusing to allow everyone to connect\n");
+        bindaddr = "";
+    }
+    if(rpc_acl_configured() > 0)
+        fprintf(stderr, "[rpc] allow list: loopback + %d configured subnet(s); "
+                        "binding %s\n", rpc_acl_configured(),
+                        bindaddr[0] ? bindaddr : "127.0.0.1 (loopback)");
+
+    rpc_server_cfg cfg = {0}; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
+    cfg.bind_addr = bindaddr; cfg.allows = rpc_acl_allows;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
         return;
     }
-    fprintf(stderr, "[rpc] JSON-RPC server on 127.0.0.1:%d (live-node + chain, user=%s)\n", actual, user);
+    fprintf(stderr, "[rpc] JSON-RPC server on %s:%d (live-node + chain, user=%s)\n",
+            bindaddr[0] ? bindaddr : "127.0.0.1", actual, user);
+    /* -rpccookiefile, else <datadir>/.cookie -- Core's default auth method.
+     * The daemon has already chdir'd into the (per-chain) datadir, so the
+     * bare relative name lands in the right place on every chain. */
+    /* -pid: Core writes bitcoind.pid so an init script can find the process.
+     * Written after the RPC port is bound, i.e. once the node is actually
+     * up, so the file's existence means something. */
+    if (g_cfg.pidfile[0]){
+        FILE* pf = fopen(g_cfg.pidfile, "w");
+        if (pf){ fprintf(pf, "%d\n", (int)getpid()); fclose(pf);
+                 fprintf(stderr,"[boot] pid %d written to %s\n", (int)getpid(), g_cfg.pidfile); }
+        else     fprintf(stderr,"[boot] could not write -pid=%s: %s\n", g_cfg.pidfile, strerror(errno));
+    }
+    if (g_cfg.startupnotify[0]) notify_run(g_cfg.startupnotify, "", "startupnotify");
+    /* -rpcauth: hashed credentials, so a fixed password need not sit in the
+     * config in plaintext. A malformed entry is REPORTED, never dropped. */
+    for (int i = 0; i < g_cfg.n_rpcauth; i++){
+        if (!rpc_auth_add(g_cfg.rpcauth[i]))
+            fprintf(stderr,"[rpc] rpcauth entry %d is malformed (want user:salt$hash) -- ignored\n", i + 1);
+    }
+    if (rpc_auth_count())
+        fprintf(stderr,"[rpc] %d rpcauth credential(s) loaded\n", rpc_auth_count());
+    if (g_cfg.rpccookie){
+        const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
+        if (rpc_cookie_write(cpath))
+            fprintf(stderr, "[rpc] cookie authentication enabled (%s, mode 0600)\n", cpath);
+        else
+            fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
+                            "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
+    }
 }
 
 extern volatile unsigned long long g_utxo_prog_phase, g_utxo_prog_done, g_utxo_prog_total;
@@ -4116,7 +4857,60 @@ static void* boot_utxo_progress(void* arg){
     return 0;
 }
 
-static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l){
+/* ---- inbound over Tor ----------------------------------------------------
+ * Three things have to line up: a loopback socket for tor to forward to, an
+ * onion service pointing at it, and a control connection held open for the
+ * lifetime of the process.
+ *
+ * That last one is not optional. ADD_ONION without the Detach flag ties the
+ * service to the control connection, so closing it destroys the service. That
+ * is the behaviour we want -- a dead node should not leave a reachable
+ * address behind -- but it means the torctl_t is deliberately never closed.
+ *
+ * The virtual port is the CHAIN DEFAULT, not our local port: Core notes that
+ * using anything else fingerprints the node, since a peer dialling the onion
+ * sees the port. The local target may be any free loopback port; Core uses
+ * default+1 and so do we. */
+static torctl_t g_torctl = { .fd = -1 };
+
+static int tor_onion_listener(int port){
+    if(!g_cfg.listen)      return -1;   /* not accepting inbound at all */
+    if(!g_cfg.listenonion) { fprintf(stderr,"[tor] listenonion=0 -- no onion service\n"); return -1; }
+
+    /* Core's default is the CHAIN default port + 1 (mainnet 8334), not our
+     * configured port + 1 -- those differ whenever port= is set, and using
+     * ours collided with rpcport in testing. */
+    int target_port = g_chainp->default_port + 1;
+    int lo = lsock_onion(target_port, &target_port);
+    if(lo < 0) return -1;
+
+    char ctrl_ip[64] = "127.0.0.1"; int ctrl_port = 9051;
+    if(g_cfg.torcontrol[0]){
+        const char* c = strrchr(g_cfg.torcontrol, ':');
+        if(c){ long n = (long)(c - g_cfg.torcontrol);
+               if(n > 0 && n < (long)sizeof ctrl_ip){ memcpy(ctrl_ip, g_cfg.torcontrol, (size_t)n); ctrl_ip[n]=0; }
+               ctrl_port = atoi(c+1); }
+        else snprintf(ctrl_ip, sizeof ctrl_ip, "%s", g_cfg.torcontrol);
+    }
+    char target[64]; snprintf(target, sizeof target, "127.0.0.1:%d", target_port);
+    if(!torctl_add_onion(&g_torctl, ctrl_ip, ctrl_port,
+                         g_cfg.torpassword[0] ? g_cfg.torpassword : NULL, NULL,
+                         g_chainp->default_port, target, "onion_v3_private_key", 20000)){
+        fprintf(stderr,"[tor] no onion service: %s\n", g_torctl.err[0] ? g_torctl.err : "unknown");
+        fprintf(stderr,"[tor] (outbound onion is unaffected; only INBOUND needs the control port)\n");
+        close(lo);
+        return -1;
+    }
+    fprintf(stderr,"[tor] onion service %s:%d -> %s (key onion_v3_private_key)\n",
+            g_torctl.onion, g_chainp->default_port, target);
+    { extern int addrself_set_onion(const char*, unsigned short);
+      if(addrself_set_onion(g_torctl.onion, (unsigned short)g_chainp->default_port))
+          fprintf(stderr,"[tor] announcing %s:%d to onion peers\n",
+                  g_torctl.onion, g_chainp->default_port); }
+    return lo;
+}
+
+static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
      * The sole non-`-connect` caller passes `catchup_seeds` -- the six DNS
@@ -4126,11 +4920,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * looked like in production and why it is wrong. Seeds stay as the
      * emergency fallback they are documented to be: used only when the book
      * yields nothing, which is a genuinely fresh node. */
-    static unsigned char mux_ab[64];
-    static char mux_dle[64][64];
+    static char mux_dle[64][DL_POOL_SLOT];
     const char* bookpool[64]; int nbook = 0;
-    if(!g_cfg.connect_only && amr_init(mux_ab)==1){
-        int np = dl_pool_from_book(mux_ab, mux_dle, 64);
+    if(!g_cfg.connect_only && addr_book()){
+        int np = dl_pool_from_book(NULL, mux_dle, 64);
         for(int i=0;i<np && nbook<64;i++) bookpool[nbook++] = mux_dle[i];
     }
     if(nbook > 0){
@@ -4159,11 +4952,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
      * negative fd and returns revents==0 for it, so the accept branch below
      * is naturally dead in outbound-only mode -- no separate code path. */
-    struct pollfd pfds[MUX_MAX_OUT+1];
+    struct pollfd pfds[MUX_MAX_OUT+3];   /* v4 + v6 + onion listeners, then legs */
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
         pfds[nfds].fd=l;     pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* the IPv6 listener sits beside it; -1 when the host has no IPv6,
+         * and poll() ignores a negative fd, so this is dead weight then */
+        int v6slot = nfds;
+        pfds[nfds].fd=l6;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* the onion service's loopback target; -1 when listenonion is off or
+         * tor is unreachable, and poll() ignores a negative fd */
+        int onionslot = nfds;
+        pfds[nfds].fd=lo;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* WHERE THE LEGS BEGIN, derived rather than written down. This used to
+         * be a hardcoded 2, and when the IPv6 listener took pfds[1] the leg
+         * loop kept starting at 1 -- every leg then read the PREVIOUS leg's
+         * revents. Deriving it means adding a listener cannot reintroduce
+         * that, which is the only reason this variable exists. */
+        const int legs_start = nfds;
         for(int i=0;i<mux_n_out;i++){ if(mux_out_fd[i]<0) continue; pfds[nfds].fd=mux_out_fd[i]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++; }
         if(g_dl_worker_exited && !g_shutdown_requested){
             int st = (int)g_dl_worker_status;
@@ -4174,10 +4981,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         if(g_shutdown_requested){
             fprintf(stderr,"[serve] shutting down (signal %d): tip=%d outbound_legs=%d\n",
                     (int)g_shutdown_requested, *(int*)(store_buf+24), mux_n_out);
+            /* -persistmempool: dump BEFORE the worker is signalled, while the
+             * shared pool is still quiescent and nothing is evicting under
+             * the writer. */
+            if(CFG_PERSISTMEMPOOL()){
+                long w = rpc_node_mempool_save("mempool.dat");
+                if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
+                else       fprintf(stderr,"[mempool] could not save mempool.dat\n");
+            }
             if(g_dl_worker_pid>0){
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
             }
+            /* run BEFORE the credential and pidfile go, so a hook that
+             * wants to read either still can */
+            if(g_cfg.shutdownnotify[0]) notify_run(g_cfg.shutdownnotify, "", "shutdownnotify");
+            /* a dead node must not leave a usable credential on disk, nor a
+             * pidfile pointing at a pid that is about to be reused */
+            rpc_cookie_remove();
+            if(g_cfg.pidfile[0]) unlink(g_cfg.pidfile);
             _exit(0);
         }
         int pr=poll(pfds, nfds, 300);
@@ -4197,14 +5019,59 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
           long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
                            nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
           if(nms >= next_expiry_ms){ next_expiry_ms = nms + 60000L; mempool_expire_now(); } }
-        /* inbound accept -> fork a serve child (unchanged semantics) */
-        if(pfds[0].revents&(POLLIN|POLLHUP|POLLERR)){
+        /* inbound accept -> fork a serve child (unchanged semantics).
+         * Either listener can be ready; the v6 one carries cjdns peers. */
+        int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
+        int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
+        int ready_on = (lo >= 0 && (pfds[onionslot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
+        if(ready_v4 || ready_v6 || ready_on){
+            struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
-            int c=accept(l,(struct sockaddr*)&ca,&cal);
+            int c;
+            char peerdesc[80];
+            if(ready_on){
+                /* Arrived on the onion service's loopback target, so it IS an
+                 * onion peer -- established by WHICH SOCKET accepted it, not
+                 * by looking at the source address, which is always
+                 * 127.0.0.1 here and would be indistinguishable from a local
+                 * connection. This is Core's rule (net.cpp: inbound_onion is
+                 * a membership test on the onion bind list).
+                 *
+                 * The peer's real address is unknowable by construction --
+                 * that is what the onion service provides -- so it is neither
+                 * ban-checked by address nor eligible for address-based
+                 * whitelisting. Core makes the same exemption explicitly. */
+                c = accept(lo,(struct sockaddr*)&ca,&cal);
+                snprintf(peerdesc, sizeof peerdesc, "onion-inbound");
+                if(c >= 0) fprintf(stderr,"[serve] inbound over onion (via the local tor service)\n");
+            } else if(ready_v4){
+                c = accept(l,(struct sockaddr*)&ca,&cal);
+                snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
+                /* A ban has to cover INBOUND too. ctl_is_banned guarded only
+                 * the dial path, so a banned peer could simply connect to us
+                 * and be served -- which makes setban look enforced while it
+                 * is half enforced. */
+                if(c >= 0 && !ready_on){
+                    char bip[64]; snprintf(bip, sizeof bip, "%s", inet_ntoa(ca.sin_addr));
+                    if(ctl_is_banned(bip)){
+                        fprintf(stderr,"[serve] refused inbound from banned %s\n", peerdesc);
+                        close(c); c = -1;
+                    }
+                }
+            } else {
+                c = accept(l6,(struct sockaddr*)&ca6,&cal6);
+                bmc_addr_t pa; memset(&pa, 0, sizeof pa);
+                pa.len = 16; memcpy(pa.addr, &ca6.sin6_addr, 16);
+                pa.net = (pa.addr[0] == 0xfc) ? BMC_NET_CJDNS : BMC_NET_IPV6;
+                pa.port = ntohs(ca6.sin6_port);
+                bmc_addr_to_string_port(peerdesc, sizeof peerdesc, &pa);
+                if(c >= 0) fprintf(stderr,"[serve] inbound %s (%s)\n", peerdesc, bmc_net_name(pa.net));
+            }
             /* Fold new heights into the PARENT's index before forking, so
              * the child inherits a current one and its own top-up is a
              * no-op. Without this each child re-scans everything appended
              * since boot, and says so in the log once per connection. */
+            if(c>=0) peer_sock_buffers(c);
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window */
@@ -4227,8 +5094,6 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 c = -1;
             }
             if(c>=0){
-                char ipbuf[INET_ADDRSTRLEN]; ipbuf[0]=0;
-                inet_ntop(AF_INET,&ca.sin_addr,ipbuf,sizeof ipbuf);
                 /* Refresh our in-memory store extent from the on-disk archive
                  * so this (and each forked child) serves blocks the download
                  * WORKER appended since boot -- serving reads block bytes fresh
@@ -4243,18 +5108,44 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
+                    /* BIP324 first, if enabled. A v1 peer is detected in-band
+                     * -- it opens with magic + "version" + five NULs, and any
+                     * mismatch in those 16 bytes proves v2 -- and detection
+                     * PEEKS, so a v1 peer's version message is left on the
+                     * socket for the v1 path below. Once a session is up,
+                     * node_accept_handshake and the whole serve loop run
+                     * UNCHANGED: p2p_read/p2p_write route by file descriptor.
+                     * This runs in the child, so a failure cannot affect the
+                     * parent or any other peer. */
+                    const char* v2res = "v1";
+                    if(CFG_V2TRANSPORT()){
+                        int v2 = bmc_v2_handshake(c, 0, 8000);
+                        if(v2 < 0){
+                            fprintf(stderr,"[serve] inbound %s v2 handshake failed -- dropping\n", peerdesc);
+                            close(c); _exit(0);
+                        }
+                        v2res = v2 == 1 ? "v2" : "v1";
+                    }
+                    /* record who this is and arm the violation callback
+                     * before any peer bytes are dispatched */
+                    { const char* q = strrchr(peerdesc, ':');
+                      size_t n = q ? (size_t)(q - peerdesc) : strlen(peerdesc);
+                      if(n >= sizeof g_cur_peer_ip) n = sizeof g_cur_peer_ip - 1;
+                      memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
+                    g_serve_violation_hook = serve_violation_report;
                     int hok = node_accept_handshake(c);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
-                    fprintf(stderr,"[serve] inbound %s:%d %s (pid %d) %s\n", ipbuf,
-                            ntohs(ca.sin_port), hok==1?"connected":"handshake failed", getpid(), pv);
+                    close(l6 >= 0 ? l6 : l);
+                    fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
+                            hok==1?"connected":"handshake failed", v2res, getpid(), pv);
                     if(hok==1)
                         node_serve_loop(c, node_log_open(g_logpath), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
                 }
                 close(c);
                 if(w > 0){ g_inbound_n++; upl_track(w); }
-                fprintf(stderr,"[serve] inbound %s:%d accepted -> child pid %d (%d/%d inbound)\n",
-                        ipbuf, ntohs(ca.sin_port), w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
+                fprintf(stderr,"[serve] inbound %s accepted -> child pid %d (%d/%d inbound)\n",
+                        peerdesc, w, (int)g_inbound_n, CFG_INBOUND_LIMIT());
             }
         }
         /* outbound: on rotation, pull from each peer (periodic getheaders-from-
@@ -4262,7 +5153,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * (it sent data we should react to). Round-robin spreads the load so
          * idle peers each get polled roughly once per mux_n_out iterations. */
         rot++;
-        int poll_idx=1;                                  /* pfds[0] is the listener */
+        /* pfds[0] = IPv4 listener, pfds[1] = IPv6 listener, legs from 2.
+         * This started at 1 and was NOT shifted when the v6 slot was
+         * inserted, so every leg read the PREVIOUS leg's revents and the
+         * last leg's was never examined (2026-08-28 pre-deploy review). */
+        int poll_idx=legs_start;
         long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
@@ -4322,8 +5217,36 @@ int main(int argc, char** argv){
             __DATE__, __TIME__, argc>=2?argv[1]:"?");
         fputs(_b, stderr); fflush(stderr);
     }
-    if(argc < 3){ fprintf(stderr,"usage: %s sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]); return 2; }
-    const char* mode = argv[1]; const char* dir = argv[2];
+    /* ---- -datadir= / -conf= (Core's spelling) -----------------------------
+     * The datadir was positional and the config file was found by searching
+     * relative to it, so every other node tool's habit -- `-datadir=`,
+     * `-conf=` -- simply did not work here. Both are accepted now, anywhere
+     * on the command line, and the positional form still works so nothing
+     * that already runs this binary changes.
+     *
+     * Flags are stripped out first; what remains keeps the old positional
+     * meaning, so `bitcoind -datadir=/x serve` and `bitcoind serve /x` are
+     * the same invocation. */
+    const char* flag_datadir = NULL; const char* flag_conf = NULL;
+    { static char* pos[16]; int np = 0;
+      for(int i = 0; i < argc; i++){
+          if(i > 0 && !strncmp(argv[i], "-datadir=", 9)){ flag_datadir = argv[i] + 9; continue; }
+          if(i > 0 && !strncmp(argv[i], "-conf=", 6)){    flag_conf    = argv[i] + 6; continue; }
+          if(np < 16) pos[np++] = argv[i];
+      }
+      argv = pos; argc = np; }
+    if(flag_conf){
+        node_config_set_conf_path(flag_conf);
+        if(access(flag_conf, R_OK) != 0){
+            fprintf(stderr,"[boot] -conf=%s is not readable: %s\n", flag_conf, strerror(errno));
+            return 2;
+        }
+    }
+    if(argc < 2 || (argc < 3 && !flag_datadir)){
+        fprintf(stderr,"usage: %s [-datadir=<dir>] [-conf=<file>] sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]);
+        return 2; }
+    const char* mode = argv[1];
+    const char* dir = flag_datadir ? flag_datadir : argv[2];
     /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
      * right directory regardless of the caller's cwd (soak analysis found a
      * caller-relative chdir silently opened the wrong store when the node was
@@ -4336,7 +5259,43 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
-      node_config_log(); }
+      node_config_log();
+      /* Join the config to the passphrase module HERE. Neither side may
+       * reference the other: node_config.o is linked into targets with no
+       * wallet, and wallet_pass.o is linked (via RPCLIBS) into 31 targets
+       * with no config. main.c is the only place that has both -- pushing the
+       * value across here is what keeps both link sets independent. */
+      wallet_pass_set_file(g_cfg.walletpassfile); }
+    /* Advertise NODE_P2P_V2 once the config is known, as Core does in
+     * init.cpp. A peer has no other way to learn that we will accept a
+     * BIP324 handshake, and nothing on the wire reveals it. */
+    { extern unsigned long long node_services;
+      if(CFG_V2TRANSPORT()){
+          node_services |= BMC_NODE_P2P_V2;
+          /* Report how many known peers we could actually dial over v2. This
+           * is not decoration: outbound v2 is gated on the address book, the
+           * book is opened by RELATIVE path, and if that ever failed the
+           * feature would go silently inert with every test still passing --
+           * which is exactly how a relative `asmap` path once disabled itself
+           * on regtest. A zero here, with a non-empty book, is the symptom. */
+          long known = 0, cap = 0;
+          { ab2_t* b = ab2_open(".", 0);
+            if(b){
+                long n = ab2_count(b);
+                for(long i = 0; i < n; i++){
+                    ab2_rec_t r;
+                    if(!ab2_get(b, i, &r)) continue;
+                    known++;
+                    if(r.services & BMC_NODE_P2P_V2) cap++;
+                }
+                ab2_close(b);
+            } }
+          fprintf(stderr,"[net] BIP324 v2 transport enabled (services=0x%llx); "
+                         "%ld of %ld known peers advertise v2\n",
+                  node_services, cap, known);
+      } else {
+          fprintf(stderr,"[net] BIP324 v2 transport disabled by config -- v1 only\n");
+      } }
     /* Chain selection (daemon/chainparams.c). bitcoin.conf lives at -- and
      * was just read from -- the BASE datadir; each non-main chain gets its
      * own SUBDIRECTORY of it (Core's layout: <datadir>/regtest), so chains
@@ -4344,6 +5303,27 @@ int main(int argc, char** argv){
      * operates on the cwd, so the chdir into the per-chain dir isolates all
      * of it at once. Must run before mempool_configure/store_init (their
      * files land in the per-chain dir) and before any socket (net_magic). */
+    /* A custom signet challenge must be set BEFORE selection: it determines
+     * the network magic, so selecting first would briefly install the public
+     * signet's magic and then change it under whatever had already read it. */
+    if(g_cfg.signetchallenge[0]){
+        if(!chainparams_set_signet_challenge(g_cfg.signetchallenge)){
+            fprintf(stderr, "[chain] FATAL: signetchallenge is not valid hex "
+                            "(or is empty/too long); refusing to start\n");
+            return 1;
+        }
+        if(strcmp(g_cfg.chain, "signet") != 0)
+            fprintf(stderr, "[chain] warning: signetchallenge is set but "
+                            "chain=%s -- it will be ignored\n", g_cfg.chain);
+    }
+    if(netperm_count() > 0){
+        fprintf(stderr, "[config] whitelist: %d entr%s, granting noban\n",
+                netperm_count(), netperm_count() == 1 ? "y" : "ies");
+        if(netperm_has_implicit())
+            fprintf(stderr, "[config] whitelist: an entry gave no explicit "
+                            "permissions -- Core would grant its implicit set; "
+                            "this node enforces ONLY noban\n");
+    }
     if(!chainparams_select(g_cfg.chain)) return 1;
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
       wallet_set_chain(g_chainp->bech32_hrp, g_chainp->p2pkh_version, g_chainp->p2sh_version); }
@@ -4373,13 +5353,50 @@ int main(int argc, char** argv){
       fprintf(stderr,"[config] pow  : nBits schedule enforcement ON"
                      " (no_retarget=%d min_diff=%d bip94=%d powlimit=%08x)\n",
               g_chainp->pow_no_retargeting, g_chainp->allow_min_difficulty,
-              g_chainp->enforce_bip94, g_chainp->pow_limit_bits); }
+              g_chainp->enforce_bip94, g_chainp->pow_limit_bits);
+      /* -minimumchainwork: config wins, else the chain's own Core value.
+       * Announce it for the same reason as the nBits line above -- an inert
+       * floor and an enforced one look identical from accepted blocks. */
+      { unsigned char mw[32]; const char* src;
+        if (g_cfg.have_minchainwork){ memcpy(mw, g_cfg.minchainwork, 32); src = "config"; }
+        else { memset(mw, 0, 32);
+               if (g_chainp->min_chain_work_hex && g_chainp->min_chain_work_hex[0])
+                   nodecfg_hex32_be(g_chainp->min_chain_work_hex, mw);
+               src = "chain default"; }
+        reorg_set_min_chain_work(mw);
+        { extern void bmc_alert_deliver(const char*);
+          reorg_set_alert_fn(bmc_alert_deliver); }
+        if (reorg_min_chain_work_unrepresentable())
+            fprintf(stderr,"[config] work : minimumchainwork EXCEEDS this node's 128-bit "
+                           "work accumulator -- every chain will be refused. Lower it.\n");
+        else if (reorg_min_chain_work_set()){
+            char hx[65]; for(int i=0;i<32;i++) snprintf(hx+i*2,3,"%02x",mw[i]);
+            fprintf(stderr,"[config] work : minimumchainwork=%s (%s)\n", hx, src);
+        } else
+            fprintf(stderr,"[config] work : minimumchainwork not set -- no low-work floor\n");
+      } }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
     chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
     if(g_chainp->id != CHAIN_MAIN){
         if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
         if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
         if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
+    }
+    /* -asmap AFTER the per-chain chdir. A relative path must resolve against
+     * the directory the node actually runs in; loading it earlier looked for
+     * regtest's map in the BASE datadir and silently fell back to /16, which
+     * is exactly the "configured but not in effect" failure this config
+     * surface keeps producing. Still before anything buckets an address --
+     * the group key changes meaning once a map is loaded. */
+    if (g_cfg.asmap[0]){
+        if (asmap_load(g_cfg.asmap))
+            fprintf(stderr,"[config] asmap: %s (%lu bytes) -- bucketing peers by AS, not /16\n",
+                    g_cfg.asmap, asmap_size());
+        else
+            fprintf(stderr,"[config] asmap: %s could not be loaded -- falling back to /16 bucketing\n",
+                    g_cfg.asmap);
+    }
+    {
         fprintf(stderr, "[boot] chain=%s datadir=%s port=%d dnsseed=%d\n",
                 g_chainp->name, effdir, g_cfg.port, g_cfg.dnsseed);
     }
@@ -4671,6 +5688,13 @@ int main(int argc, char** argv){
         store_reload(store_buf);            /* load the persisted chain from disk */
         fprintf(stderr,"[boot] chain archive loaded: tip=%d (%.2fs)\n",
                 *(int*)(store_buf+24), phase_elapsed(&load_pt));
+        /* Does this archive belong to the chain we were told to run? Checked
+         * HERE and not right after store_init: store_init opens index.dat but
+         * does not populate idx_len, so a check there sees length 0 and
+         * concludes "empty archive, nothing to contradict" every single time.
+         * The first cut of this guard did exactly that and silently passed a
+         * regtest archive to a mainnet node. */
+        if(!chain_archive_matches(store_buf)) return 1;
         /* Core -checkblocks/-checklevel. Read-only, and deliberately BEFORE
          * anything opens the archive for writing. It reports problems and does
          * not act on them: archive_verify_and_repair is the only thing allowed
@@ -4867,7 +5891,12 @@ int main(int argc, char** argv){
                 * memory, and net_active == 0 means "networking disabled" --
                 * leaving it at the zero default would gate every dial and
                 * silently produce a node that never connects. */
-               g_node_status->net_active = 1; }
+               /* -networkactive=0 starts the node with networking OFF, the
+                * same state setnetworkactive false produces at runtime. */
+               g_node_status->net_active = g_cfg.networkactive ? 1 : 0;
+               g_node_status->permit_bare_multisig = g_cfg.permitbaremultisig ? 1 : 0;
+               if(!g_cfg.networkactive)
+                   fprintf(stderr,"[config] net  : networkactive=0 -- starting with networking DISABLED\n"); }
 
         /* Hand the ZMQ notification ring the shared block BEFORE the fork, so
          * the download worker AND every inbound serve child inherit the same
@@ -4906,7 +5935,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l);
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -4929,7 +5958,7 @@ int main(int argc, char** argv){
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
-        return serve_mux(port, peer, nwant, 1, out_port, l);
+        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
     }
     return 2;
 }

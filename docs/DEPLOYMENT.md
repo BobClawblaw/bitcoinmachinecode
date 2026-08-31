@@ -31,15 +31,26 @@ One binary, `asm/daemon/bitcoind`, running as a fork-model daemon:
 - a forked **download worker** that owns the outbound peer legs, block
   download/keep-up, UTXO application, and the reorg machinery;
 - shared state bridged across the fork boundary by `MAP_SHARED` regions
-  allocated before it: the live-status/RPC-submission block, and (since
-  2026-08-25) the mempool and its fee-policy registry, mutated under a
-  `PTHREAD_PROCESS_SHARED` lock.
+  allocated before it: the live-status/RPC-submission block, the mempool and
+  its fee-policy registry (mutated under a `PTHREAD_PROCESS_SHARED` lock),
+  and (since 2026-08-30) the peer misbehaviour scores — those must be shared,
+  because the serve loop that detects violations runs in a forked child and a
+  process-local table could never accumulate across connections;
+- a **ZMQ servicing thread** in the download worker, when a publisher is
+  configured, so subscriber accepts and subscription frames never run on the
+  block-download path.
 
 Everything lives in one datadir: the block archive (`blk*.dat` + positional
 `index.dat`), `headers.dat`, `chainwork.dat`, the LSM UTXO store
 (`utxo.dat` WAL, `utxo_run_*.dat`, `utxo_manifest.dat`,
-`utxo_applied_height.dat`), `peers.dat`, and optionally a wallet store
-(`bmcwallet.dat` + `.txlog` journal).
+`utxo_applied_height.dat`), `peers.dat`/`peers2.dat`, and optionally a wallet
+store — either `bmcwallet.enc` (the encrypted container: 100k-iteration KDF,
+AES-256-CBC, key separation) or the older plaintext/`BMCWAL v2` store, plus a
+`.txlog` journal.
+
+The wallet **passphrase does not live in the datadir**. See `walletpassfile`
+under *Configure*: a datadir backup should never carry the key to the wallet
+it also contains.
 
 ## Prerequisites
 
@@ -70,20 +81,40 @@ the rule since: **read the gate result in one step, act in a separate step**
 A minimal `config/bitcoin.conf` (path given to the daemon at start):
 
 ```ini
-# Chain (default main). "regtest" runs Core's regtest chain in a
-# subdirectory of the datadir — see "Regtest" below.
+# Chain (default main): main | signet | testnet4 | regtest. Anything but
+# mainnet runs in a subdirectory of the datadir — see "Regtest" and "Signet"
+# below. Legacy testnet3 ("testnet"/"test") is refused, not run.
 chain=main
+# signetchallenge=<hex>   # a CUSTOM signet. It also determines the network
+                          # magic, so a custom signet cannot hear the public
+                          # one. Omit for the public signet.
 
 # P2P
 listen=1                 # accept inbound peers (fork-per-connection)
 port=8332                # P2P listen/dial port; chain default if omitted
-                         # (8333 main, 18444 regtest — see node_config.c)
+                         # (8333 main, 38333 signet, 48333 testnet4,
+                         #  18444 regtest — see node_config.c)
 
-# RPC (HTTP Basic; no cookie support)
+# RPC. The COOKIE is the default credential: <datadir>/.cookie is written
+# 0600 at start, deleted on shutdown, and bitcoin-cli finds it on its own.
+# Do NOT set rpcuser/rpcpassword unless you need a fixed credential -- they
+# put a plaintext secret on disk, Core warns against them, and this project
+# removed its own after the password reached a public repository.
+# For a fixed credential use rpcauth= (salted HMAC), never rpcpassword.
 rpcport=8331             # MUST NOT collide with the P2P port (was 8332;
                          # fixed 2026-08-26, commit 6469c2f)
-rpcuser=CHOOSE_A_USER
-rpcpassword=CHOOSE_A_LONG_RANDOM_PASSWORD
+
+# BIP324 v2 encrypted transport (default 1). Accepts inbound v2 and dials v2
+# to peers advertising NODE_P2P_V2; v1 peers are detected in band and are
+# unaffected. Set 0 for v1 only.
+v2transport=1
+
+# Wallet passphrase, if the wallet is encrypted. Absolute path, OUTSIDE the
+# datadir -- a file beside the wallet travels in every backup of it. Refused
+# if world-accessible, group-writable, or inside the datadir. Intended shape:
+#   sudo install -d -m 0755 /etc/bmc
+#   sudo install -o root -g <service-group> -m 0640 secret /etc/bmc/wallet.pass
+#walletpassfile=/etc/bmc/wallet.pass
 
 # Mempool (0 = built-in 2 MiB static; >0 mmaps a shared, locked pool)
 maxmempool=300
@@ -163,6 +194,101 @@ from-genesis UTXO build with full script verification. Expect **days**, and
 expect it to be CPU-bound on signature verification for most of them. The
 `[dl] heartbeat:` log line is the pulse: tip height, live peers, live UTXO
 count, uptime.
+
+## Deploying a new build
+
+The convention is a dated snapshot per deploy, so a rollback is a file copy
+rather than a rebuild:
+
+```sh
+cd asm
+make -k test 2>&1 | tee /tmp/gate.log; echo "MAKE_EXIT=$?" >> /tmp/gate.log
+make gate-log-check LOG=/tmp/gate.log   # the actual gate check -- see below
+sudo systemctl stop bmc-bitcoind   # the binary is busy while it runs;
+                                   # "Text file busy" means you skipped this
+cp -a daemon/bitcoind daemon/bitcoind.deploy-$(date +%Y%m%d)a
+sudo systemctl start bmc-bitcoind
+```
+
+Roll back by copying the previous `bitcoind.deploy-*` snapshot over
+`daemon/bitcoind` and restarting.
+
+**Verify the restart rather than assuming it.** Boot takes a couple of minutes
+(archive reload, UTXO load) before the RPC answers. Check, in order:
+
+```sh
+systemctl is-active bmc-bitcoind
+grep -aE "BIP324|\[rpc\]|encrypted wallet" logs/bitcoind.production.log | tail
+ss -ltn | grep -E ":833|:2833"     # P2P, RPC, and any ZMQ endpoints
+bitcoin-cli -datadir=... getblockcount
+```
+
+The lines worth reading on a fresh boot:
+
+```
+[net] BIP324 v2 transport enabled (services=0x809); N of M known peers advertise v2
+[rpc] no rpcuser/rpcpassword -- using cookie authentication
+[rpc] encrypted wallet adopted and unlocked from the configured passphrase source
+[rpc] JSON-RPC server on 127.0.0.1:8331
+```
+
+**A green gate is not the same as a green wrapper, and "no failures" is not
+the same as "it passed."** Both have burned this project, the second one as
+recently as 2026-08-30:
+
+- The *wrapper* trap: backgrounding or piping `make -k test` gives you the
+  exit status of the last thing in the pipeline, not make's. Always record
+  `MAKE_EXIT` explicitly and read that.
+- The *empty gate* trap, which is nastier. A test failing to LINK stops the
+  `test:` recipe from running at all, because a prerequisite of it failed. The
+  log then contains no `FAIL` lines and no `TESTS FAILED` — for the simple
+  reason that no test ever ran. Grepping for failure words cannot tell that
+  apart from a clean run: **a log with zero failures is exactly what a gate
+  that ran nothing looks like.**
+
+So do not grep. Run:
+
+```sh
+make gate-log-check LOG=/path/to/gate.log
+```
+
+`scripts/gate_log_audit.py` reads the `test:` recipe, and requires that make
+exited 0, that **every** gated test appears in the log as actually executed,
+and that no failure or crash markers appear. It reports which tests never ran
+by name. Its own correctness is gated by `gate-log-selftest`, which is a
+prerequisite of `test:` — it builds synthetic logs with known verdicts,
+including the two that matter most: a gate missing exactly one test at the
+end, and one missing a test from the middle.
+
+### The three build audits
+
+Each covers a class the other two structurally cannot see. All three run as
+prerequisites of `test:`, so they fail in the first seconds of a gate rather
+than mid-build.
+
+| audit | the question it answers | what it cannot see |
+|---|---|---|
+| `prereq-check` | does a recipe use a file the rule never declared as a prerequisite? | a file named in NEITHER the recipe nor the prerequisites |
+| `link-check` | does a rule link the file that DEFINES a symbol one of its sources needs? | flags: it compiles with a generic set, not each rule's own |
+| `gate-log-check` | did the gate actually run every gated test? | whether a test that ran and printed nothing was meaningful |
+
+`link-check` exists because adding signet hit the same defect four times: a
+source grew a dependency on a symbol from another file, and the rules linking
+the first were not updated to link the second. Each surfaced only as a link
+error in a full gate — minutes to run, and because a failed prerequisite stops
+the `test:` recipe entirely, the log holds no `FAIL` lines. It resolves
+symbols the way the linker will (compile each source, read `nm`, take each
+rule's expanded prerequisites as its link set) and reports what is unresolved
+**only when another file in this project defines it**, naming that file. Every
+finding therefore reads "add this file to that rule"; libc and pthread are
+unresolvable by definition and are skipped.
+
+Its value is that it reports the whole class at once. When `node_config.c`
+grew a call into `netperm.c`, it named all **46** affected rules in under a
+second, before a gate ran.
+
+Using prerequisites as the link set is sound *because* `prereq-check` enforces
+the other direction. The two audits lean on each other deliberately.
 
 ## Operating it
 
@@ -445,6 +571,43 @@ block hashes 0..N byte-identical after syncing Core's chain; `gettxoutsetinfo
 muhash` identical; a block built from **bmc's own `getblocktemplate`** is
 accepted by Core via `submitblock`; live tip-follow; and a Core wallet tx
 reaching bmc's mempool over the wire.
+
+## Signet
+
+`chain=signet` runs Core's public signet. On signet the block **signature** is
+the consensus rule in place of meaningful proof of work (BIP325), so a node
+that did not check it would accept any block anyone offered.
+
+```ini
+chain=signet
+# signetchallenge=<hex>   # only for a CUSTOM signet
+```
+
+Everything lands under `<datadir>/signet/`, on ports 38333 (P2P) and 38332
+(RPC). The lines worth reading at boot:
+
+```
+[chain] signet: default challenge (71 bytes), magic 0a 03 cf 40
+[boot] signet genesis seeded at height 0
+```
+
+The magic is **derived** from the challenge, not configured: the first four
+bytes of `sha256d(CompactSize(len) || challenge)`. That is why a custom
+signet is isolated automatically — a different challenge is a different magic,
+and the two networks cannot talk. Core also drops the minimum-chain-work floor
+and the DNS seeds for a custom signet, and so does this node; a mainnet-scale
+floor would stall a private network forever.
+
+**Verifying it is actually enforcing.** A node that syncs proves nothing on
+its own — an inert check would sync just as happily. The decisive test is to
+re-apply the same blocks under a challenge differing by one character:
+
+```sh
+# same archive, one hex character changed in signetchallenge
+[utxo_live] REJECT h=1: bad-signet-blksig
+```
+
+If that does not appear, the check is not running.
 
 ## Wallet encryption
 

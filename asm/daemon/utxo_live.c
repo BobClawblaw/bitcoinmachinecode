@@ -134,6 +134,7 @@ typedef struct {
 } block_tx_t;
 #include <stddef.h>
 #include "block_witness.h"
+#include "signet_block.h"
 #include "bip30_consts.h"
 /* block_witness.c reads only the (ptr, len) prefix of block_tx_t, by stride. */
 _Static_assert(offsetof(block_tx_t, ptr) == 0 && offsetof(block_tx_t, len) == 8, "block_tx_t prefix must match bw_txref_t");
@@ -960,6 +961,22 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (wr != 1) {
             fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
             g_last_reject = "bad-witness-merkle-match";
+            return 0;
+        }
+    }
+
+    /* ---- BIP325: on signet the block SIGNATURE replaces meaningful proof of
+     * work, so this is the rule that makes a block expensive to produce.
+     * Core checks it in CheckBlock (validation.cpp:3947). A no-op on every
+     * other chain -- signet_check_block_chain returns 1 before touching
+     * anything unless CHAIN_SIGNET is selected. ---- */
+    {
+        const char* sreason = "?";
+        long sr = signet_check_block_chain(txs, ntx, sizeof(block_tx_t),
+                                           blockbuf, &sreason);
+        if (sr != 1) {
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, sreason);
+            g_last_reject = "bad-signet-blksig";
             return 0;
         }
     }

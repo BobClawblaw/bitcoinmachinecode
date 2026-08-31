@@ -7,7 +7,7 @@
 ; entirely in machine code:
 ;
 ;   ping       -> pong (echo up to 8-byte nonce)
-;   getaddr    -> addr (address book via amr_* + p2p_addr_v1)
+;   getaddr    -> addr / addrv2 (daemon/serve_addr.c, from the v2 book)
 ;   getdata    -> block (hash looked up O(1) via bitcoin_idx, served via
 ;                        node_serve_block; MSG_BLOCK wire type check at +0)
 ;   getheaders -> headers (locator resolved via the hash index; 2000x81B page)
@@ -25,13 +25,10 @@
 default rel
     extern p2p_read
     extern p2p_write
-    extern amr_init
-    extern amr_count
-    extern amr_get_i
-    extern p2p_addr_v1
-extern p2p_addr_v2
+    extern serve_getaddr
 extern g_peer_wants_addrv2
     extern idx_get
+    extern serve_inv_bounds
     extern serve_idx_topup
     extern serve_cfilters
     extern idx_put
@@ -60,6 +57,25 @@ extern g_peer_wants_addrv2
     extern node_serve_block_by_hash
 section .data
 align 16
+
+; ---------------------------------------------------------------------------
+; Protocol-violation hook (audit 2026-08-29 finding 7).
+;
+; peer_misbehaving() existed with a 100-point threshold, a shared ban list and
+; /32 auto-ban -- and ZERO call sites, so a peer could send malformed message
+; after malformed message and the node kept talking to it. This is the first
+; real caller.
+;
+; A function pointer rather than an extern for the same reason as the v2
+; dispatch in bitcoin_net.asm: this object is linked into targets that do not
+; link the daemon, and an undefined symbol would break all of them. NULL means
+; "nobody registered", and the loop just drops the connection as before.
+; ---------------------------------------------------------------------------
+global g_serve_violation_hook
+g_serve_violation_hook: dq 0      ; void (*)(const char* reason)
+viol_oversize: db "oversized message announcement", 0
+viol_invsz:    db "inv/getdata vector above MAX_INV_SZ", 0
+
 pl_buf:    times (8<<20) db 0     ; receive buffer
 sb_buf:    times (8<<20) db 0     ; single block buffer
 hp_buf:    times (2000*81+8) db 0 ; headers page buffer
@@ -147,6 +163,8 @@ s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
 s_ptr:    dq 0
+s_ivn:    dq 0            ; inv/getdata entry count (from serve_inv_bounds)
+s_ivo:    dq 0            ; offset of the first entry
 s_p:      dq 0
 s_abound: dq 0        ; getaddr reply: loop bound (min(book,1000)), kept in MEMORY
 s_n:      dq 0
@@ -327,7 +345,7 @@ node_serve_loop:
     lea  r8,  [s_plen]
     call p2p_read
     test rax, rax
-    jle  .done
+    jle  .check_viol
     mov  byte [s_cmd+11], 0
 
     ; ---- dispatch ----
@@ -382,12 +400,36 @@ node_serve_loop:
 .do_inv:
     ; Inbound inv: for each MSG_BLOCK entry, if we don't already have it,
     ; send a getdata to fetch it (relay keep-up). inv payload:
-    ;   count(1) | (type u32 LE + hash32) x count   (36B per entry)
-    movzx rax, byte [pl_buf]
+    ;   count(varint) | (type u32 LE + hash32) x count   (36B per entry)
+    ;
+    ; The count used to be read as a SINGLE BYTE and the entries walked
+    ; without consulting s_plen. A vector above 252 entries -- which Core
+    ; sends routinely -- was therefore misparsed, and a SHORT message with a
+    ; large count byte walked into whatever the previous, larger message had
+    ; left in the 8 MB receive buffer, letting a peer steer getdata at hashes
+    ; assembled from earlier traffic. serve_inv_bounds (daemon/serve_invbounds.c)
+    ; now does the varint and the bounds; writing that in assembly would only
+    ; trade one subtle parser for another.
+    ;   rax =  1 ok, 0 malformed/short (drop), -1 over MAX_INV_SZ (score it)
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    lea  rdx, [s_ivn]
+    lea  rcx, [s_ivo]
+    call serve_inv_bounds
+    ; SysV defines only EAX for an `int` return -- the upper half of RAX is
+    ; undefined, so testing RAX here silently never matched -1. Sign-extend
+    ; before comparing.
+    movsxd rax, eax
+    cmp  rax, -1
+    je   .inv_toobig
+    test rax, rax
+    jle  .next               ; malformed or short: drop this message quietly
+    mov  rax, [s_ivn]
     mov  [s_cnt], rax
     test rax, rax
     jle  .next
-    lea  rax, [pl_buf+1]
+    lea  rax, [pl_buf]
+    add  rax, [s_ivo]
     mov  [s_ptr], rax        ; entry pointer (stable slot; survives calls)
 .inv_loop:
     mov  rax, [s_cnt]
@@ -609,86 +651,16 @@ node_serve_loop:
     cmp  dword [s_cmd+4], 0x00726464 ; "ddr\0"
     jne  .next
     ; Core answers getaddr ONCE per connection and ignores repeats
-    ; (m_getaddr_recvd: "reduce resource waste"); a peer re-asking every
-    ; second would otherwise cost an open + up to 1000 lseek/read pairs +
-    ; a 30 KB write each time.
+    ; (m_getaddr_recvd: "reduce resource waste").
     cmp  byte [s_addrsent], 0
     jne  .next
     mov  byte [s_addrsent], 1
-    ; ---- addr reply ----
-    ; REWRITTEN 2026-08-28. This handler had never answered anyone: the loop
-    ; below kept its bound in rdx, which is also amr_get_i's out-pointer
-    ; argument, so after the first record the bound was a buffer address and
-    ; the loop walked off the end of the book for millions of iterations
-    ; (hermetic trace: records 0,18,36 read, then 54,72,90,... forever). With
-    ; a real-sized book it would then have overrun src_buf and ah_buf. The
-    ; old amr_init check was `jz` on a routine that returns 1 or -1, and the
-    ; fd it opened was never closed. Bound and counters now live in memory.
-    lea  rdi, [amr_ab]
-    call amr_init
-    cmp  rax, 1
-    jne  .next
-    lea  rdi, [amr_ab]
-    call amr_count
-    test rax, rax
-    jle  .addr_close             ; empty/unreadable book: Core sends nothing either
-    cmp  rax, 1000               ; MAX_ADDR_TO_SEND, and the size of src_buf/ah_buf
-    jbe  .acnt
-    mov  rax, 1000
-.acnt:
-    mov  [s_abound], rax
-    mov  qword [s_p], 0          ; have
-    mov  qword [s_cnt], 0        ; i
-.aloop:
-    mov  rcx, [s_cnt]
-    cmp  rcx, [s_abound]
-    jae  .adone
-    mov  rax, [s_p]
-    lea  r9,  [rax + rax*8]      ; have*9
-    shl  r9,  1                  ; have*18
-    lea  rdx, [src_buf + r9]     ; dst = src_buf + have*18
-    lea  rdi, [amr_ab]
-    mov  rsi, rcx
-    call amr_get_i
-    cmp  rax, 1
-    jne  .anext
-    inc  qword [s_p]
-.anext:
-    inc  qword [s_cnt]
-    jmp  .aloop
-.adone:
-    mov  rdx, [s_p]
-    test rdx, rdx
-    jz   .addr_close
-    ; Encoding follows the peer's handshake: BIP155 `addrv2` if it sent
-    ; sendaddrv2 before verack (Core sends only addrv2 to such a peer),
-    ; else the legacy `addr`.
-    cmp  qword [g_peer_wants_addrv2], 0
-    jne  .addr_v2
-    lea  rdi, [ah_buf]
-    lea  rsi, [src_buf]
-    call p2p_addr_v1
-    mov  r8d, eax                ; payload length (p2p_write arg5 = r8)
+    ; The reply is built in C from the version-2 book (daemon/serve_addr.c,
+    ; every BIP155 network) -- this loop used to read the legacy IPv4-only
+    ; book here. serve_getaddr(fd, wants_v2)
     mov  rdi, r12
-    lea  rsi, [cn_addr]
-    mov  rdx, 4
-    lea  rcx, [ah_buf]
-    call p2p_write
-    jmp  .addr_close
-.addr_v2:
-    lea  rdi, [ah_buf]
-    lea  rsi, [src_buf]
-    call p2p_addr_v2
-    mov  r8d, eax
-    mov  rdi, r12
-    lea  rsi, [cn_addrv2]
-    mov  rdx, 6
-    lea  rcx, [ah_buf]
-    call p2p_write
-.addr_close:
-    mov  rdi, [amr_ab]           ; close the book fd (one open per getaddr, never closed before)
-    mov  eax, 3
-    syscall
+    mov  rsi, [g_peer_wants_addrv2]
+    call serve_getaddr
     jmp  .next
 
 .maybe_getdata:
@@ -1456,6 +1428,41 @@ node_serve_loop:
     ; This lets the node serve + keep current continuously instead of exiting
     ; after a fixed iteration budget.
     jmp  .outer
+; A -3 from p2p_read means the peer announced a message above
+; P2P_MAX_MSG -- a protocol violation, not an ordinary disconnect. Score it
+; before dropping, so a peer that does it repeatedly earns a ban instead of
+; simply reconnecting. Anything else falls through unchanged.
+; An inv/getdata vector above MAX_INV_SZ is a protocol violation, scored the
+; way Core scores it ("inv message size = %u"). Report, then drop.
+.inv_toobig:
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .next
+    lea  rdi, [viol_invsz]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    jmp  .next
+
+.check_viol:
+    cmp  rax, -3
+    jne  .done
+    mov  r13, rax                 ; preserve the return value across the call
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .viol_done
+    lea  rdi, [viol_oversize]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16                 ; C callee: align explicitly (see net.asm)
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+.viol_done:
+    mov  rax, r13
 .done:
     mov  rax, [s_served]
     add  rsp, 0x58

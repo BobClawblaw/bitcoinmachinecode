@@ -15,6 +15,10 @@
  * Byte/last-send counters Core tracks per-socket are not tracked here (the
  * worker has no per-fd meters); getpeerinfo reports them as 0/-1. */
 #define RPC_MAX_PEERS 64
+/* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
+ * daemon/main.c, which asserts the two agree at compile time. */
+#define RPC_MISBEHAVIOR_SLOTS 64
+
 typedef struct {
     volatile int              used;         /* 1 = slot live */
     volatile int              inbound;      /* 0 outbound (all we itemize today) */
@@ -56,6 +60,7 @@ typedef struct {
 #define RPC_CTL_CLEARBANNED    4
 #define RPC_CTL_SETNETACTIVE   5   /* ctl_num = 0/1 */
 #define RPC_CTL_PING           6
+#define RPC_CTL_ADDPEERADDRESS 7   /* ctl_arg = "host:port" (any BIP155 network), ctl_num = tried */
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
@@ -143,6 +148,26 @@ typedef struct {
      * READ on every dial attempt, not just when it changes. */
     volatile int                net_active;
 
+    /* -permitbaremultisig, published here for the same reason net_active is:
+     * getmempoolinfo runs in a process that does not link node_config, and it
+     * reported a hardcoded 1 while nothing could change the policy. */
+    volatile int                permit_bare_multisig;
+
+    /* ---- orphan pool mirror (getorphantxs) ----
+     * The pool itself lives in the DOWNLOAD WORKER (daemon/tx_relay.c) and
+     * the RPC server runs in the parent, so the parent cannot read it
+     * directly. A compact snapshot is published here instead: enough for
+     * verbosity 0 and 1, deliberately WITHOUT the transaction bytes, which
+     * would be 256 x 100KB and have no business in a status block. */
+#define RPC_MAX_ORPHANS 256
+    volatile int                n_orphans;
+    struct {
+        unsigned char txid[32];
+        unsigned      len;        /* serialized size in bytes */
+        unsigned      nparent;    /* missing parents we are waiting on */
+        long long     t_ms;       /* when it entered the pool */
+    } orphans[RPC_MAX_ORPHANS];
+
     /* ==== ban list ====
      * Lives in shared memory rather than behind the channel because BOTH
      * sides need it: the parent serves listbanned straight out of it, and
@@ -195,6 +220,24 @@ typedef struct {
         unsigned char               txid[32];          /* WIRE order           */
         unsigned char               tx[RPC_ZMQ_TXMAX];
     } zmq_ring[RPC_ZMQ_RING];
+
+    /* ---- peer misbehaviour scores (audit finding 7) ----------------------
+     * These live HERE, in the pre-fork MAP_SHARED block, for the same reason
+     * the zmq ring does: the serve loop that detects protocol violations runs
+     * in a FORKED CHILD, and a process-local table dies with it. Scores kept
+     * per-process meant a peer could misbehave once per connection forever
+     * and never reach the threshold -- the machinery looked like a defence
+     * and could not accumulate.
+     *
+     * `mis_lock` is a cross-process spinlock (0 free, 1 held) taken around
+     * slot lookup and update. Without it two children can allocate two slots
+     * for the same peer and each accumulate half the evidence, which is the
+     * quiet version of the same failure. */
+    volatile int              mis_lock;
+    struct {
+        volatile int          score;
+        char                  ip[64];
+    } misbehavior[RPC_MISBEHAVIOR_SLOTS];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
@@ -234,11 +277,13 @@ typedef struct {
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 
-/* Hand the RPC layer the persistent address book (bitcoin_addrmgr.asm), so
+/* Hand the RPC layer the persistent address book (daemon/addrbook.c v2), so
  * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
  * pointers for the same no-link-fanout reason as the mempool hooks. */
+#include "daemon/addrbook.h"
 void rpc_node_set_addrbook(void* ab, long (*count)(void*),
-                           int (*get_i)(void*, long, unsigned char*));
+                           int (*get)(void*, long, ab2_rec_t*));
+void rpc_node_set_addrbook_dir(const char* dir);
 
 /* Hand the RPC layer the operator's addnode= list (node_config's
  * g_cfg.addnode / n_addnode), so getaddednodeinfo reports the real
@@ -268,5 +313,10 @@ int rpc_node_dispatch(const char* method, const rj_val* params,
 /* bumpfee (rpc_wallet_ops.c): raw bytes of one mempool tx, copied out under
  * the pool lock. Returns length or -1 (absent, or no pool in this process). */
 long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* out, unsigned long cap);
+
+/* -persistmempool: the daemon's boot and shutdown hooks. Same code the
+ * savemempool/importmempool RPCs use, so the two cannot drift. */
+long rpc_node_mempool_save(const char* path);   /* txs written, or -1 */
+long rpc_node_mempool_load(const char* path);   /* txs accepted, or -1 */
 
 #endif

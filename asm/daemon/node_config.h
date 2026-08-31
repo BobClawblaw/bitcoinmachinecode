@@ -74,6 +74,62 @@ typedef struct {
     char zmq_rawblock[64];
     char zmq_rawtx[64];
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
+    /* ---- anonymity networks (2026-08-28). Core's names and defaults. ---- */
+    char proxy[64];              /* -proxy=ip:port   SOCKS5 for every network that has no more specific proxy */
+    char onion_proxy[64];        /* -onion=ip:port   SOCKS5 for .onion (default: proxy) */
+    char torcontrol[64];         /* -torcontrol=ip:port (default 127.0.0.1:9051) */
+    char torpassword[128];       /* -torpassword (else cookie auth) */
+    int  listenonion;            /* -listenonion: create an onion service (default 1 when torcontrol is reachable) */
+    char i2psam[64];             /* -i2psam=ip:port  SAM bridge; empty = i2p disabled */
+    int  i2pacceptincoming;      /* -i2pacceptincoming (default 1) */
+    int  cjdnsreachable;         /* -cjdnsreachable */
+    int  proxyrandomize;         /* -proxyrandomize (default 1): per-connection SOCKS5 credentials */
+    char onlynet[6][8];          /* -onlynet (repeatable); empty list = all networks */
+    int  n_onlynet;
+    /* Core -dns: may hostnames be looked up with the system resolver? With
+     * a proxy configured, a local DNS lookup tells the resolver (and anyone
+     * on the path to it) exactly which peers this node is about to talk to,
+     * which is the leak running behind Tor is meant to close. Core routes
+     * names through the proxy instead; so do we. Default 1. */
+    int  dns;
+    /* Core -discover: learn our own address from peers / interfaces and
+     * announce it. Behind Tor this is the switch that stops the node
+     * telling the network its clearnet address. Default 1. */
+    int  discover;
+    char externalip[80];         /* Core -externalip: announce THIS instead   */
+    int  onion_only_announce;    /* derived: onlynet excludes clearnet        */
+    /* ---- 2026-08-29: Core parity, tier one ------------------------------
+     * Each of these is WIRED, not merely parsed. A setting that is accepted
+     * and then ignored is worse than one that is absent -- that was the
+     * externalip defect earlier today, and the rule now holds for the whole
+     * config surface. */
+    unsigned char minchainwork[32];  /* -minimumchainwork, big-endian; all-zero = no floor */
+    int  have_minchainwork;          /* 0 when neither config nor chain default set one   */
+    long bantime;                    /* -bantime seconds (Core default 86400)             */
+    int  blockfilterindex;           /* -blockfilterindex (default 1: keep current behaviour) */
+    int  coinstatsindex;             /* -coinstatsindex   (default 1: keep current behaviour) */
+    char rpccookiefile[256];         /* -rpccookiefile; empty = <datadir>/.cookie          */
+    int  rpccookie;                  /* derived: emit and accept a cookie (default 1)      */
+    /* ---- batch two ------------------------------------------------------ */
+    int  permitbaremultisig;         /* -permitbaremultisig (Core default 1)              */
+    int  networkactive;              /* -networkactive (Core default 1): start with the
+                                      * network on, or dead until setnetworkactive        */
+    int  forcednsseed;               /* -forcednsseed: query the seeds even with peers    */
+    char pidfile[256];               /* -pid: write our pid here (empty = none)           */
+    /* Core -*notify hooks. Empty = not configured. "%s" is replaced by the
+     * event's value (block hash, txid, message), sanitised -- see notify.c. */
+    char blocknotify[512];
+    char alertnotify[512];
+    char startupnotify[512];
+    char shutdownnotify[512];
+    long maxtxfee_sat;               /* -maxtxfee, satoshis (0 = no cap)                  */
+    char rpcauth[8][256];            /* -rpcauth, repeatable: user:salt$hash */
+    int  n_rpcauth;
+    char asmap[512];                 /* -asmap: AS map file; empty = /16 bucketing        */
+    int  maxsendbuffer_kb;           /* -maxsendbuffer: n*1000 bytes (Core default 1000)  */
+    int  zmq_hwm[5];                 /* -zmqpub<topic>hwm, in the order of the topics
+                                      * below: hashblock, hashtx, rawblock, rawtx,
+                                      * sequence. Core default 1000.                      */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
@@ -126,6 +182,33 @@ typedef struct {
     int  checklevel;             /* Core -checklevel: 0..4 (def 3)           */
     long stopatheight;           /* Core -stopatheight: stop at this height,
                                   * 0 = run forever (def 0)                  */
+    /* ---- chainstate rebuild (Core -reindex-chainstate) ---- */
+    int  reindex_chainstate;     /* drop the UTXO set at boot so it rebuilds
+                                  * from the archive (def 0; one-shot)      */
+
+    /* ---- mempool persistence (Core -persistmempool) ---- */
+    int  persistmempool;         /* save mempool.dat at shutdown and reload it
+                                  * at boot (def 1, as in Core)             */
+
+    /* ---- wallet passphrase source (audit finding 2) ---- */
+    /* Core -signetchallenge: the block challenge script, as hex. Only
+     * meaningful with chain=signet, where it also determines the network
+     * magic -- so two signets with different challenges cannot talk to each
+     * other. Empty = the default (public) signet. */
+    /* Core -rpcbind / -rpcallowip. rpcbind is IGNORED unless at least one
+     * rpcallowip is given, exactly as Core does -- see daemon/rpc_acl.h. */
+    char rpcbind[64];
+    char rpcallowip[16][64];
+    int  n_rpcallowip;
+    char signetchallenge[2048];
+    char walletpassfile[256];    /* absolute path, OUTSIDE the datadir, to a
+                                  * root-owned 0640 file holding the wallet
+                                  * passphrase. Empty = none; the daemon no
+                                  * longer reads <store>.pass.              */
+
+    /* ---- BIP324 v2 encrypted transport (Core -v2transport) ---- */
+    int  v2transport;            /* accept inbound v2 and attempt it outbound;
+                                  * def 1, as in Core                        */
 } node_config_t;
 
 extern node_config_t g_cfg;
@@ -155,5 +238,15 @@ int node_config_is_manual(const char* ip);
  * pointing this node at a scratch peer impossible, and it failed SILENTLY
  * (the entry was dropped and the node then sat at tip=0 with peers=0/0). */
 int node_config_peer_port(const char* host);
+
+/* hex -> 32 big-endian bytes, right-aligned (Core's uint256 spelling) */
+int nodecfg_hex32_be(const char* s, unsigned char out[32]);
+
+/* -conf=<path>: overrides the datadir search in node_config_path(). */
+void node_config_set_conf_path(const char* path);
+
+/* 1 when `key` is a Bitcoin Core option this node does not implement. Used to
+ * warn instead of silently accepting it. */
+int nodecfg_unimplemented(const char* key);
 
 #endif

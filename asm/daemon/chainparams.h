@@ -33,6 +33,7 @@
 #define CHAIN_MAIN     0
 #define CHAIN_REGTEST  1
 #define CHAIN_TESTNET4 2
+#define CHAIN_SIGNET   3
 
 typedef struct {
     int          id;                 /* CHAIN_* */
@@ -52,6 +53,11 @@ typedef struct {
     unsigned char p2sh_version;      /* base58Prefixes[SCRIPT_ADDRESS] */
     unsigned char wif_version;       /* base58Prefixes[SECRET_KEY] */
     const char*  bech32_hrp;
+    /* Core consensus.nMinimumChainWork, as its uint256 hex. The floor a
+     * header chain must clear before this node will commit work to it --
+     * the defence against a peer feeding an enormous low-difficulty chain.
+     * Empty/all-zero on regtest, exactly as Core leaves it. */
+    const char*  min_chain_work_hex;
     /* BIP32 extended-key version bytes. Core uses one pair for mainnet and
      * ANOTHER for every test chain, and its descriptor parser rejects the
      * wrong one outright -- an xpub handed to a regtest node is "not valid".
@@ -71,17 +77,41 @@ typedef struct {
      * for chains with none (regtest). */
     const char* const* dns_seed_hosts;
     int          n_dns_seed_hosts;
+    /* BIP325. NULL on every chain but signet. The block SIGNATURE stands in
+     * for meaningful proof of work here, so a signet whose challenge is not
+     * set is not a chain this node can validate at all -- which is why
+     * selection fails rather than defaulting to something. */
+    const unsigned char* signet_challenge;
+    long                 signet_challenge_len;
 } chainparams_t;
 
 /* The selected chain. Statically CHAIN_MAIN. */
 extern const chainparams_t* g_chainp;
 
 /* Select by Core's -chain= name ("main", "regtest" or "testnet4";
- * "test"/"testnet" (ambiguous, testnet3) and "signet" are recognised and
- * REFUSED loudly rather than half-supported). Returns 1 ok,
- * 0 unknown/unsupported. Also writes the two asm globals. Call before any
+ * "test"/"testnet" (ambiguous, testnet3) is recognised and REFUSED loudly
+ * rather than half-supported). Returns 1 ok, 0 unknown/unsupported. Also writes the two asm globals. Call before any
  * network or block activity; calling twice with the same name is harmless. */
 int chainparams_select(const char* name);
+
+/* Set a CUSTOM signet challenge (Core's -signetchallenge), as hex. Call
+ * BEFORE chainparams_select("signet"); with no call, the default signet's
+ * challenge is used. Returns 1 ok, 0 on malformed or over-long hex.
+ *
+ * The challenge is not cosmetic: the network MAGIC is derived from it
+ * (Core: the first 4 bytes of the sha256d of the serialised challenge), so
+ * two signets with different challenges cannot even talk to each other --
+ * which is exactly the isolation a custom signet wants. Core also drops the
+ * minimum-chain-work floor and the DNS seeds for a custom signet, because
+ * neither means anything on a network only its operator knows about; this
+ * does the same. */
+int chainparams_set_signet_challenge(const char* hex);
+
+/* The magic Core derives for a given challenge: first 4 bytes of
+ * sha256d(CompactSize(len) || challenge), as the little-endian dword. Exposed
+ * because it is worth testing directly against Core's published value rather
+ * than only through a successful handshake. */
+unsigned int chainparams_signet_magic(const unsigned char* challenge, long len);
 
 /* Core's datadir layout: mainnet lives at the datadir root, every other
  * chain in a subdirectory named after it ("<datadir>/regtest"). Writes the

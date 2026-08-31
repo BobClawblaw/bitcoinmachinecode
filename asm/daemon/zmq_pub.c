@@ -31,6 +31,7 @@
  * that it happened.
  */
 #include <stdio.h>
+#include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -40,6 +41,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 
 typedef unsigned char u8;
 typedef unsigned int  u32;
@@ -70,12 +75,61 @@ typedef struct {
 static zp_endpoint g_ep[ZP_MAX_ENDPOINTS];
 static int g_nep = 0;
 
+/* ---------------------------------------------------------------------------
+ * SUBSCRIBER SERVICING RUNS ON ITS OWN THREAD (audit 2026-08-29 finding 8).
+ *
+ * Core does not have this problem: it links libzmq, whose background I/O
+ * thread does every accept, subscription frame and delivery, so none of it
+ * ever touches Core's validation or download paths. `zmq_poll` appears
+ * nowhere in Core's source.
+ *
+ * This node speaks ZMTP itself, so that work has to live somewhere. It used
+ * to live in the download worker's hot loop, which is what the audit flagged:
+ * a subscriber that dribbles greeting bytes keeps the poll returning with data
+ * pending, and 32 subscribers become a per-iteration tax on block catch-up.
+ *
+ * It now runs here, on a dedicated thread that blocks in poll() and idles at
+ * zero cost -- the same shape as libzmq's I/O thread.
+ *
+ * WHAT THE LOCK PROTECTS. The servicing thread accepts subscribers and
+ * COMPACTS the array when they disconnect; the publishing thread walks that
+ * same array and closes subscribers whose send fails. Without the lock the
+ * compaction moves entries out from under an in-progress walk, and both sides
+ * can close the same fd -- which, once the number is reused, means writing
+ * block data into an unrelated socket. Every read or write of subs/nsubs is
+ * therefore under g_lock. The endpoint list itself (g_ep, g_nep, listen_fd) is
+ * built once by zmqpub_add before the thread starts and is read-only after.
+ * ------------------------------------------------------------------------ */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t       g_thread;
+static int             g_thread_up = 0;
+/* atomic, not volatile: `volatile` orders nothing between threads and is not
+ * a synchronisation primitive -- ThreadSanitizer flags the plain read/write
+ * pair as a data race, correctly. It happens to work on x86 today, which is
+ * exactly the kind of thing that stops being true on another target. */
+static atomic_int      g_stop;
+
 /* topic -> endpoint index, -1 when that topic is not published */
 #define ZP_NTOPIC 5
 static const char* const ZP_TOPICS[ZP_NTOPIC] =
     { "hashblock", "hashtx", "rawblock", "rawtx", "sequence" };
 static int  g_topic_ep[ZP_NTOPIC] = { -1, -1, -1, -1, -1 };
 static u32  g_topic_seq[ZP_NTOPIC];
+/* Core -zmqpub<topic>hwm: how much a slow subscriber may fall behind before
+ * messages are dropped rather than queued. Core counts MESSAGES in its own
+ * queue; this publisher has no user-space queue -- it writes the socket
+ * directly and already drops on EAGAIN -- so the kernel send buffer IS the
+ * queue, and the high-water mark sizes it. Same property (a slow subscriber
+ * costs bounded memory and never blocks the node), different unit, stated
+ * here rather than silently reinterpreted. 0 leaves the system default. */
+static int g_topic_hwm[ZP_NTOPIC];
+void zmq_pub_set_hwm(const int* hwm5){
+    if (!hwm5) return;
+    for (int i = 0; i < ZP_NTOPIC && i < 5; i++) g_topic_hwm[i] = hwm5[i];
+}
+/* a conservative per-message estimate: a rawblock is far larger, but the
+ * point is a bound, and oversizing the buffer would defeat the option */
+#define ZP_HWM_MSG_BYTES 256
 
 static void zp_nonblock(int fd){
     int fl = fcntl(fd, F_GETFL, 0);
@@ -98,8 +152,27 @@ static int zp_bind(const char* addr){
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
     sa.sin_port = htons((unsigned short)port);
-    if (!strcmp(host, "*")) sa.sin_addr.s_addr = INADDR_ANY;
-    else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1){ close(fd); return -1; }
+    /* SECURITY (audit 2026-08-29 finding 8): `*` is REFUSED, not expanded to
+     * INADDR_ANY.
+     *
+     * Core accepts it, but on a node like this one it silently publishes every
+     * block and transaction to the whole LAN -- and the operator who typed
+     * `tcp://*:28332` copied it from a tutorial and got a listener far wider
+     * than intended. There is no authentication on a ZMQ publisher: whoever
+     * connects, subscribes.
+     *
+     * Requiring an explicit interface costs one word in the config and makes
+     * the blast radius something the operator chose rather than inherited.
+     * 0.0.0.0 still works for anyone who genuinely wants every interface --
+     * this refuses the ambiguous spelling, not the capability. */
+    if (!strcmp(host, "*")){
+        fprintf(stderr, "[zmq] refusing \"%s\": bind to an explicit interface "
+                        "(127.0.0.1 for local subscribers, 0.0.0.0 only if you "
+                        "really mean every interface -- there is no auth on a "
+                        "ZMQ publisher)\n", addr);
+        close(fd); return -1;
+    }
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1){ close(fd); return -1; }
     if (bind(fd, (struct sockaddr*)&sa, sizeof sa) != 0){ close(fd); return -1; }
     if (listen(fd, 8) != 0){ close(fd); return -1; }
     zp_nonblock(fd);
@@ -256,11 +329,22 @@ static void zp_consume(zp_sub* s){
 
 /* Accept new subscribers and service their handshakes. Cheap and
  * non-blocking; called from the worker loop. */
-void zmqpub_poll(void){
+/* Caller must hold g_lock. */
+static void zp_poll_locked(void){
     for (int i = 0; i < g_nep; i++){
         zp_endpoint* e = &g_ep[i];
         for (;;){
             int c = accept(e->listen_fd, NULL, NULL);
+            /* size this subscriber's queue from the topic's high-water mark */
+            if (c >= 0){
+                int hw = 0;
+                for (int t = 0; t < ZP_NTOPIC; t++)
+                    if (g_topic_ep[t] >= 0 && g_topic_hwm[t] > hw) hw = g_topic_hwm[t];
+                if (hw > 0){
+                    int v = hw * ZP_HWM_MSG_BYTES;
+                    setsockopt(c, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+                }
+            }
             if (c < 0) break;
             if (e->nsubs >= ZP_MAX_SUBS){ close(c); continue; }
             zp_nonblock(c);
@@ -289,13 +373,76 @@ void zmqpub_poll(void){
     }
 }
 
+void zmqpub_poll(void){
+    pthread_mutex_lock(&g_lock);
+    zp_poll_locked();
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* The servicing thread. Blocks in poll() on the listeners and the current
+ * subscribers, so an idle publisher costs nothing. The fd set is snapshotted
+ * under the lock and poll()ed outside it -- an fd closed in between simply
+ * reports POLLNVAL, and the real work re-derives state under the lock, so the
+ * snapshot is only ever a wake-up hint. */
+static void* zp_thread_main(void* arg){
+    (void)arg;
+    while (!atomic_load(&g_stop)){
+        struct pollfd pf[ZP_MAX_ENDPOINTS * (ZP_MAX_SUBS + 1)];
+        int n = 0;
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < g_nep && n < (int)(sizeof pf / sizeof pf[0]); i++){
+            if (g_ep[i].listen_fd >= 0){
+                pf[n].fd = g_ep[i].listen_fd; pf[n].events = POLLIN; pf[n].revents = 0; n++;
+            }
+            for (int k = 0; k < g_ep[i].nsubs && n < (int)(sizeof pf / sizeof pf[0]); k++)
+                if (g_ep[i].subs[k].fd >= 0){
+                    pf[n].fd = g_ep[i].subs[k].fd; pf[n].events = POLLIN; pf[n].revents = 0; n++;
+                }
+        }
+        pthread_mutex_unlock(&g_lock);
+
+        if (n == 0){
+            struct timespec ts = { 0, 100 * 1000 * 1000 };   /* nothing to watch yet */
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        int r = poll(pf, (nfds_t)n, 200);
+        if (r < 0 && errno != EINTR) break;
+        if (r > 0) zmqpub_poll();
+    }
+    return NULL;
+}
+
+/* Start the servicing thread. Idempotent; safe to call after every
+ * zmqpub_add. Returns 1 if the thread is running. */
+int zmqpub_start(void){
+    if (g_thread_up) return 1;
+    if (g_nep == 0) return 0;
+    atomic_store(&g_stop, 0);
+    if (pthread_create(&g_thread, NULL, zp_thread_main, NULL) != 0){
+        fprintf(stderr, "[zmq] could not start the subscriber thread -- "
+                        "publishing still works, subscribers will not connect\n");
+        return 0;
+    }
+    g_thread_up = 1;
+    return 1;
+}
+
+static void zp_stop_thread(void){
+    if (!g_thread_up) return;
+    atomic_store(&g_stop, 1);
+    pthread_join(g_thread, NULL);
+    g_thread_up = 0;
+}
+
 /* Publish [topic][body][seq u32 LE] to every subscriber of `topic`. */
 void zmqpub_notify(const char* topic, const void* body, unsigned long blen){
     int t = -1;
     for (int i = 0; i < ZP_NTOPIC; i++) if (!strcmp(topic, ZP_TOPICS[i])) t = i;
     if (t < 0 || g_topic_ep[t] < 0) return;
     zp_endpoint* e = &g_ep[g_topic_ep[t]];
-    if (e->nsubs == 0){ g_topic_seq[t]++; return; }
+    /* nsubs is read under the lock below; the sequence number belongs to the
+     * publisher alone, so it is bumped either way. */
 
     size_t tl = strlen(topic);
     u8 h1[9], h2[9], h3[9];
@@ -306,6 +453,7 @@ void zmqpub_notify(const char* topic, const void* body, unsigned long blen){
     u8 seqb[4];
     for (int i = 0; i < 4; i++) seqb[i] = (u8)(seq >> (8 * i));   /* little-endian */
 
+    pthread_mutex_lock(&g_lock);
     for (int k = 0; k < e->nsubs; k++){
         zp_sub* s = &e->subs[k];
         if (s->fd < 0 || s->state != 2 || !zp_wants(s, topic)) continue;
@@ -323,9 +471,12 @@ void zmqpub_notify(const char* topic, const void* body, unsigned long blen){
             close(s->fd); s->fd = -1;
         }
     }
+    pthread_mutex_unlock(&g_lock);
 }
 
 void zmqpub_close(void){
+    zp_stop_thread();          /* before any fd goes away under it */
+    pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nep; i++){
         for (int k = 0; k < g_ep[i].nsubs; k++)
             if (g_ep[i].subs[k].fd >= 0) close(g_ep[i].subs[k].fd);
@@ -333,4 +484,5 @@ void zmqpub_close(void){
     }
     g_nep = 0;
     for (int i = 0; i < ZP_NTOPIC; i++) g_topic_ep[i] = -1;
+    pthread_mutex_unlock(&g_lock);
 }

@@ -47,6 +47,39 @@ section .data
 global net_magic
 net_magic: dd 0xd9b4bef9
 
+; ---------------------------------------------------------------------------
+; BIP324 v2 transport dispatch.
+;
+; p2p_read/p2p_write are called from roughly sixty files and several hundred
+; call sites, so v2 cannot be plumbed through by giving every caller a
+; transport handle. Instead the dispatch lives HERE, keyed by file
+; descriptor: an fd that has completed a v2 handshake is flagged in
+; g_v2_active, and the two hooks below are filled in by the v2 module.
+;
+; A build that never links the v2 module leaves the hooks NULL and the table
+; zero, so p2p_read/p2p_write behave exactly as they always have -- no link
+; dependency is created, which is why this is a table in this object rather
+; than a C wrapper that would have to be added to sixty link lines.
+;
+; The flag is checked before the hook so the v1 path costs one compare and one
+; branch, not an indirect call.
+; ---------------------------------------------------------------------------
+; Core's MAX_PROTOCOL_MESSAGE_LENGTH (net.h): 4 * 1000 * 1000. Core also
+; compares against MAX_SIZE (0x02000000), but that is the larger of the two,
+; so this single bound is the effective one -- and it is the same limit the
+; BIP324 path enforces (BIP324_MAX_MESSAGE_LEN).
+P2P_MAX_MSG equ 4000000
+
+V2_FD_MAX equ 4096
+global g_v2_hook_write
+global g_v2_hook_read
+global g_v2_active
+g_v2_hook_write: dq 0          ; long (*)(int fd, const char* cmd, u32 cmdlen,
+                               ;         const void* payload, u32 plen)
+g_v2_hook_read:  dq 0          ; int  (*)(int fd, char cmd_out[12], void* payload,
+                               ;         u32 cap, u32* plen_out)
+g_v2_active: times V2_FD_MAX db 0
+
 section .text
 
 ; ============================================================================
@@ -312,6 +345,35 @@ p2p_frame:
 ; ============================================================================
 global p2p_write
 p2p_write:
+    ; v2 dispatch (see g_v2_active above); falls through to v1 untouched
+    cmp  edi, V2_FD_MAX
+    jae  .v1
+    mov  eax, edi
+    ; RIP-relative, not absolute: several test targets link this object into a
+    ; PIE binary, and an absolute R_X86_64_32S reloc against .data cannot be
+    ; used there ("recompile with -fPIE"). r10 is caller-saved and is not an
+    ; argument register, so borrowing it disturbs nothing.
+    lea  r10, [rel g_v2_active]
+    cmp  byte [r10 + rax], 0
+    je   .v1
+    mov  rax, [rel g_v2_hook_write]
+    test rax, rax
+    je   .v1
+    ; The hook is a C function, and this entry is reached at BOTH stack
+    ; parities (the auditor calls p2p_read/p2p_write multi-entry). A tail jmp
+    ; would hand C whatever alignment we happened to arrive with, and C may
+    ; spill SSE registers to the stack. So align explicitly and make a real
+    ; call: rsp is forced to 0 mod 16, the call pushes 8, and the callee sees
+    ; the 8 that SysV promises it. Arguments are already in place and rax is
+    ; the return value, so nothing else moves.
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.v1:
     push rbp
     mov  rbp, rsp
     push r12
@@ -387,6 +449,35 @@ p2p_write:
 ; ============================================================================
 global p2p_read
 p2p_read:
+    ; v2 dispatch (see g_v2_active above); falls through to v1 untouched
+    cmp  edi, V2_FD_MAX
+    jae  .v1
+    mov  eax, edi
+    ; RIP-relative, not absolute: several test targets link this object into a
+    ; PIE binary, and an absolute R_X86_64_32S reloc against .data cannot be
+    ; used there ("recompile with -fPIE"). r10 is caller-saved and is not an
+    ; argument register, so borrowing it disturbs nothing.
+    lea  r10, [rel g_v2_active]
+    cmp  byte [r10 + rax], 0
+    je   .v1
+    mov  rax, [rel g_v2_hook_read]
+    test rax, rax
+    je   .v1
+    ; The hook is a C function, and this entry is reached at BOTH stack
+    ; parities (the auditor calls p2p_read/p2p_write multi-entry). A tail jmp
+    ; would hand C whatever alignment we happened to arrive with, and C may
+    ; spill SSE registers to the stack. So align explicitly and make a real
+    ; call: rsp is forced to 0 mod 16, the call pushes 8, and the callee sees
+    ; the 8 that SysV promises it. Arguments are already in place and rax is
+    ; the return value, so nothing else moves.
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    ret
+.v1:
     push rbp
     mov  rbp, rsp
     push r12
@@ -424,6 +515,22 @@ p2p_read:
 
     ; --- announced length ---
     mov  eax, [rbp-0x48]
+    ; SECURITY (audit 2026-08-29 finding 6): reject an oversized announcement
+    ; before acting on it. Core rejects at exactly this point --
+    ; net.cpp: `hdr.nMessageSize > MAX_SIZE || > MAX_PROTOCOL_MESSAGE_LENGTH`
+    ; -- and the note beside that check cites the 2024-07-03 disclosure where
+    ; the missing test let a peer make a node allocate 32 MiB per connection.
+    ;
+    ; Here the damage is unbounded WORK rather than memory: callers cap their
+    ; own buffers, so a huge `announced` cannot overflow anything, but the
+    ; drain loop below reads the excess 64 bytes at a time. A peer announcing
+    ; 0xFFFFFFFF makes the forked serve child grind through ~4 GB of socket
+    ; reads, holding a connection slot for as long as it cares to feed us.
+    ;
+    ; Returns -3, distinct from -2 (truncated) so the caller can score the
+    ; peer for misbehaviour rather than treat it as an ordinary short read.
+    cmp  eax, P2P_MAX_MSG
+    ja   .oversize
     mov  [rbp-0x64], eax       ; announced
 
     ; --- tocopy = min(announced, cap) ---
@@ -498,6 +605,9 @@ p2p_read:
     mov  rax, -2
     jmp  .ret
 
+.oversize:
+    mov  rax, -3               ; announced length above P2P_MAX_MSG
+    jmp  .ret
 .eof_or_err:
     test rax, rax
     js   .err

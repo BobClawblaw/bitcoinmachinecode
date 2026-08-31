@@ -94,8 +94,11 @@ node_make_version:
 	movz w1, #0x1180
 	movk w1, #0x1, lsl #16
 	str  w1, [x19, #0]
-	/* services = NODE_NETWORK(1)|NODE_WITNESS(8) = 9 */
-	mov  x2, #9
+	/* services -- see node_services in .data (NODE_NETWORK(1)|NODE_WITNESS(8)
+	 * default; daemon/main.c ORs in NODE_P2P_V2 at boot when -v2transport on) */
+	adrp x2, :got:node_services
+	ldr  x2, [x2, :got_lo12:node_services]
+	ldr  x2, [x2]
 	str  x2, [x19, #4]
 	/* timestamp 1700000000 = 0x6553F100 */
 	movz x3, #0xF100
@@ -1914,5 +1917,18 @@ _sendaddrv2:	.ascii "sendaddrv2\0"
 _wtxidrelay:	.ascii "wtxidrelay\0"
 _sendcmpct:	.ascii "sendcmpct\0"
 ua_str:		.ascii "/BitcoinMachineCode:0.0.1/"
+
+/* ---- the services we advertise in our own `version` ----
+ * NODE_NETWORK(1)|NODE_WITNESS(8) by default. daemon/main.c ORs in
+ * NODE_P2P_V2 (1<<11) at boot when -v2transport is on (like Core's
+ * g_local_services in init.cpp). Lives here so bitcoind.asm/S is linkable
+ * into targets that don't link the config. */
+	.section .data
+	.align 3
+	.global node_services
+	.type node_services, %object
+node_services:
+	.quad 9
+	.size node_services, 8
 
 	.section .note.GNU-stack,"",%progbits
