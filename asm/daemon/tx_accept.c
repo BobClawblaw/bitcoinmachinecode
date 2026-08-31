@@ -564,6 +564,7 @@ static void txacc_note_sigops(void* mp_area, const u8 txid[32], const u8* tx, un
     mp_unlock();
 }
 
+static void txacc_note_confirmed(const unsigned char* txid);   /* defined with the recently-confirmed set below */
 int tx_policy_init(void){
     /* config-driven where Core exposes the knob (defaults match Core's own);
      * falls back to the compiled defaults if the config layer is absent (a
@@ -576,6 +577,8 @@ int tx_policy_init(void){
     unsigned dscb = g_cfg.limitdescendantsize_kvb>0? (unsigned)(g_cfg.limitdescendantsize_kvb*1000): TXACC_MAX_DESC_BYTES;
     unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
     mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
+    { extern void mpool_policy_set_confirmed_hook(void (*)(const unsigned char*));
+      mpool_policy_set_confirmed_hook(txacc_note_confirmed); }
     { extern void mpool_policy_set_incremental(void*, unsigned long long);
       extern void mpool_policy_set_dust(void*, unsigned long long);
       extern void mpool_policy_set_datacarrier(void*, unsigned long long);
@@ -642,9 +645,27 @@ int tx_policy_init(void){
  * is still visible without the flood. The sendrawtransaction path
  * (tx_accept_validate_reason) keeps full per-tx logging: user-submitted
  * transactions are rare and each one matters. */
+/* ---- recently confirmed (Core's m_recent_confirmed_transactions) ----------
+ * A transaction delivered over p2p AFTER the block carrying it was applied
+ * fails input resolution ("already-spent") and used to be parked as an orphan
+ * -- a slot wasted for two minutes and a parent request the peer cannot
+ * satisfy. Block connect records every txid the block carried in this rolling
+ * set; the relay path answers "already known" (-27) for them. 64K entries of
+ * an 8-byte prefix covers ~25 recent blocks' worth of transactions. */
+#define TXACC_RECENT_CONF (1u << 16)
+static u8 g_recent_conf[TXACC_RECENT_CONF][8];
+static unsigned g_recent_conf_w;
+static void txacc_note_confirmed(const unsigned char* txid){
+    memcpy(g_recent_conf[g_recent_conf_w % TXACC_RECENT_CONF], txid, 8); g_recent_conf_w++;
+}
+static int txacc_recently_confirmed(const u8* txid){
+    unsigned n = g_recent_conf_w < TXACC_RECENT_CONF ? g_recent_conf_w : TXACC_RECENT_CONF;
+    for (unsigned i = 0; i < n; i++) if (!memcmp(g_recent_conf[i], txid, 8)) return 1;
+    return 0;
+}
 #define TXACC_LOG_WINDOW_SECS 30
 static struct {
-    long acc, rej_missing, rej_invalid, rej_policy;
+    long acc, rej_missing, rej_invalid, rej_policy, known_conf;
     long t0;
     char last_invalid[96];
 } g_alog;
@@ -652,14 +673,14 @@ static void txacc_log_tick(void* mp_area){
     long now = (long)time(NULL);
     if (!g_alog.t0){ g_alog.t0 = now; return; }
     if (now - g_alog.t0 < TXACC_LOG_WINDOW_SECS) return;
-    if (g_alog.acc || g_alog.rej_missing || g_alog.rej_invalid || g_alog.rej_policy)
-        fprintf(stderr, "[tx_accept] last %lds: +%ld accepted (mempool %ld) | rejected: %ld missing-inputs, %ld invalid%s%s%s, %ld policy\n",
+    if (g_alog.acc || g_alog.rej_missing || g_alog.rej_invalid || g_alog.rej_policy || g_alog.known_conf)
+        fprintf(stderr, "[tx_accept] last %lds: +%ld accepted (mempool %ld) | rejected: %ld missing-inputs, %ld invalid%s%s%s, %ld policy | %ld already confirmed\n",
                 now - g_alog.t0, g_alog.acc, mpool_count(mp_area),
                 g_alog.rej_missing, g_alog.rej_invalid,
                 g_alog.last_invalid[0] ? " (last: \"" : "",
                 g_alog.last_invalid[0] ? g_alog.last_invalid : "",
                 g_alog.last_invalid[0] ? "\")" : "",
-                g_alog.rej_policy);
+                g_alog.rej_policy, g_alog.known_conf);
     memset(&g_alog, 0, sizeof g_alog);
     g_alog.t0 = now;
 }
@@ -732,6 +753,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
                             unsigned long txlen){
     if (!g_ready || !g_pol_ready) return -26;
     txacc_log_tick(mp_area);
+    if (txacc_recently_confirmed(txid)){ g_alog.known_conf++; return -27; }   /* already in a block: not an orphan */
     void* placeholder_utxo = (void*)1;
     {
         const char* r = 0;

@@ -16,6 +16,8 @@
  *      losing it would eventually cost the connection.
  */
 #include <stdio.h>
+#include <errno.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../daemon/node_config.h"
@@ -41,6 +43,9 @@ extern int  tx_policy_init(void);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
+extern long txrelay_stats(long*, long*, long*, long*, long*, long*);
+extern long txrelay_notfound_count(void);
+extern long tx_accept_block_connect(void* mp_area, const unsigned char* block, unsigned long blen);
 #include "../daemon/addrbook.h"
 static long book_count(void){ ab2_t* b = ab2_open(".", 0); long n = ab2_count(b); ab2_close(b); return n; }
 static int  book_has(const char* hp, unsigned char* port_bytes){
@@ -201,8 +206,12 @@ int main(void){
     msend_t cpf_seed2 = cpf_seed;
     cpf_seed2.name = "p2pkh_1p1c_seed2"; cpf_seed2.txid = cpf_tid2;
 
-    const msend_t* seeds5[5] = { s, s2, &chain_seed, &cpf_seed, &cpf_seed2 };
-    seed_utxos(seeds5, 5);
+    static u8 cpf_tid3[32]; memset(cpf_tid3, 0xC3, 32);
+    msend_t cpf_seed3 = cpf_seed; cpf_seed3.name = "p2pkh_notfound_seed"; cpf_seed3.txid = cpf_tid3;
+    static u8 cpf_tid4[32]; memset(cpf_tid4, 0xC4, 32);
+    msend_t cpf_seed4 = cpf_seed; cpf_seed4.name = "p2pkh_confirmed_seed"; cpf_seed4.txid = cpf_tid4;
+    const msend_t* seeds7[7] = { s, s2, &chain_seed, &cpf_seed, &cpf_seed2, &cpf_seed3, &cpf_seed4 };
+    seed_utxos(seeds7, 7);
     (void)seeds;
     tx_accept_set_tip(500);
 
@@ -569,6 +578,88 @@ int main(void){
     }
 
     close(sp[0]); close(sp[1]);
+    /* scenarios 12/13 get their own leg: earlier cases closed sp[] */
+    int spX[2]; ck("leg pair for 12/13", socketpair(AF_UNIX, SOCK_STREAM, 0, spX) == 0);
+    printf("\n== 12: notfound for a requested parent must not poison the request ring ==\n");
+    {
+        drain_peer(spX[1]);
+        static u8 p12[4096], c12[4096];
+        unsigned long long tval[1] = { 10000000ull }; unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
+        long pn = wallet_send_tx(p12, sizeof p12, (u8(*)[32])cpf_tid3, tidx, tval, 1,
+                                 to_h, 10000000ull - 1000ull, 1000ull, cpf_priv, 0);
+        ck("parent signed (normal fee)", pn > 0);
+        u8 pid[32]; tx_txid(pid, p12, (unsigned long)pn, tb, sizeof tb);
+        unsigned long long cval[1] = { 10000000ull - 1000ull };
+        long cn = wallet_send_tx(c12, sizeof c12, (u8(*)[32])pid, tidx, cval, 1,
+                                 to_h, 10000000ull - 2000ull, 1000ull, cpf_dpriv, 0);
+        ck("child signed", cn > 0);
+        u8 cid[32]; tx_txid(cid, c12, (unsigned long)cn, tb, sizeof tb);
+        unsigned long ml = 0;
+        p2p_write(spX[1], "tx", 2, c12, (unsigned)cn);
+        ck("child alone parked", txrelay_poll_leg(spX[0], mp_area, 200) == 0);
+        char cmd[13]; static u8 pl[4096];
+        int plen = read_msg(spX[1], cmd, pl, sizeof pl);
+        ck("leg asked for the parent", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, pid, 32));
+        p2p_write(spX[1], "notfound", 8, pl, 37);          /* too fresh for the peer to serve */
+        long nf0 = txrelay_notfound_count();
+        txrelay_poll_leg(spX[0], mp_area, 200);
+        ck("notfound counted", txrelay_notfound_count() == nf0 + 1);
+        ck("nothing else sent", no_bytes_pending(spX[1]));
+        send_inv1(spX[1], pid);                              /* a moment later the peer announces it */
+        txrelay_poll_leg(spX[0], mp_area, 200);
+        plen = read_msg(spX[1], cmd, pl, sizeof pl);
+        ck("parent requested AGAIN after the notfound (ring entry cleared)", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, pid, 32));
+        p2p_write(spX[1], "tx", 2, p12, (unsigned)pn);
+        long acc = txrelay_poll_leg(spX[0], mp_area, 200);
+        ck("parent accepted and the parked child resolved", acc == 2);
+        ck("child pooled", mpool_get(mp_area, cid, &ml) != NULL);
+    }
+
+    printf("\n== 13: a transaction that already confirmed is 'known', not an orphan ==\n");
+    {
+        drain_peer(spX[1]);
+        static u8 t13[4096];
+        unsigned long long tval[1] = { 10000000ull }; unsigned long tidx[1] = { 0 };
+        u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
+        long tn = wallet_send_tx(t13, sizeof t13, (u8(*)[32])cpf_tid4, tidx, tval, 1,
+                                 to_h, 10000000ull - 1000ull, 1000ull, cpf_priv, 0);
+        ck("tx signed", tn > 0);
+        u8 tid[32]; tx_txid(tid, t13, (unsigned long)tn, tb, sizeof tb);
+        static u8 blk[8192]; memset(blk, 0, 80); int o = 80; blk[o++] = 2;   /* header + 2 txs */
+        u8 cb[64]; int c = 0;                                   /* a canonical coinbase */
+        memcpy(cb + c, "\x01\x00\x00\x00", 4); c += 4;             /* version */
+        cb[c++] = 1; memset(cb + c, 0, 32); c += 32;                 /* vin: null prevout */
+        memset(cb + c, 0xff, 4); c += 4;                            /* index */
+        cb[c++] = 2; cb[c++] = 0x51; cb[c++] = 0x51;                  /* scriptsig */
+        memset(cb + c, 0xff, 4); c += 4;                            /* sequence */
+        cb[c++] = 1; memset(cb + c, 0, 8); c += 8;                  /* vout: value 0 */
+        cb[c++] = 1; cb[c++] = 0x51;                                /* spk */
+        memset(cb + c, 0, 4); c += 4;                               /* locktime */
+        memcpy(blk + o, cb, (size_t)c); o += c;
+        memcpy(blk + o, t13, (size_t)tn); o += (int)tn;
+        long parked0, resolved0, dropped0, a, b, held0;
+        txrelay_stats(&parked0, &resolved0, &dropped0, &a, &b, &held0);
+        { extern long tx_parse(unsigned char* info, const unsigned char* p, unsigned long len);
+          unsigned char info[64]; long r1 = tx_parse(info, cb, (unsigned long)c); unsigned long l1 = 0; if (r1 == 1) memcpy(&l1, info, 8);
+          long r2 = tx_parse(info, t13, (unsigned long)tn); unsigned long l2 = 0; if (r2 == 1) memcpy(&l2, info, 8);
+          printf("      tx_parse: coinbase r=%ld len=%lu (built %d); tx r=%ld len=%lu (built %ld)\n", r1, l1, c, r2, l2, tn); }
+        long bc = tx_accept_block_connect(mp_area, blk, (unsigned long)o);
+        printf("      block_connect returned %ld\n", bc);
+        ck("block connect ran", bc >= 0);
+        p2p_write(spX[1], "tx", 2, t13, (unsigned)tn);        /* the same tx from a slow peer */
+        long acc = txrelay_poll_leg(spX[0], mp_area, 200);
+        long parked1, resolved1, dropped1, held1;
+        txrelay_stats(&parked1, &resolved1, &dropped1, &a, &b, &held1);
+        unsigned long ml = 0;
+        printf("      p2p delivery: acc=%ld pooled=%d\n", acc, mpool_get(mp_area, tid, &ml) != NULL);
+        ck("not accepted (it is in a block)", acc == 0 && mpool_get(mp_area, tid, &ml) == NULL);
+        ck("NOT parked as an orphan", parked1 == parked0);
+        ck("no parent request went out", no_bytes_pending(spX[1]));
+    }
+
+    close(spX[0]); close(spX[1]);
+
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
