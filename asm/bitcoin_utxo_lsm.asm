@@ -1826,6 +1826,18 @@ mac_flush:
     sub  rsp, 0x300
     mov  r12, rdi           ; lst
     mov  r13, rsi            ; u
+    ; background-compaction gate: see mac_flush_hook. r12/r13 are callee-saved
+    ; in the C hook. mac_flush is entered from asm callers with rsp%16 == 0
+    ; (abi-check: "entry 0"), so the frame is aligned here by accident of the
+    ; prologue; align explicitly and restore from rbp so a future caller with
+    ; the other parity cannot break the one call that leaves assembly.
+    mov  rax, [rel mac_flush_hook]
+    test rax, rax
+    jz   .mf_nohook
+    and  rsp, -16
+    call rax
+    lea  rsp, [rbp-0x328]                    ; 5 pushes + 0x300 frame
+.mf_nohook:
 
     mov  rdi, r12
     call mac_calc_desc_cap
@@ -2768,7 +2780,31 @@ section .bss
 mac_ow_fd:   resq 1
 mac_ow_fill: resq 1
 mac_ow_buf:  resb MAC_OWBUF
+; ---- background compaction support (2026-08-31) --------------------------
+; mac_compact_defer_unlink: when non-zero, utxo_lsm_compact publishes the new
+;   manifest as usual but leaves its INPUT run files on disk. A forked child
+;   compacting on the parent's behalf sets this: the parent still holds the
+;   old manifest in memory and may open those runs by name until it adopts
+;   the new one, and unlinking under it would turn a lookup into a false
+;   miss. The parent unlinks them itself after adopting. Orphaned runs are
+;   already tolerated by design (a crash between publish and unlink).
+; mac_flush_hook: called by mac_flush BEFORE it touches anything. mac_flush is
+;   the only other manifest writer, and it is triggered from inside
+;   utxo_lsm_put, where C cannot intercept it; the parent's hook waits for a
+;   running compaction child so two writers never race on the manifest.
+mac_compact_defer_unlink: resq 1
+mac_flush_hook:           resq 1
 section .text
+
+global utxo_lsm_set_defer_unlink
+utxo_lsm_set_defer_unlink:
+    mov  [rel mac_compact_defer_unlink], rdi
+    ret
+global utxo_lsm_set_flush_hook
+utxo_lsm_set_flush_hook:
+    mov  [rel mac_flush_hook], rdi
+    ret
+
 
 mac_out_begin:
     mov  [rel mac_ow_fd], rdi
@@ -4104,6 +4140,8 @@ utxo_lsm_compact:
     mov  rdi, [rdx]                          ; input fd
     mov  eax, 3
     syscall
+    cmp  qword [rel mac_compact_defer_unlink], 0
+    jne  .cc_unlink_next                     ; deferred: the adopting parent unlinks
     lea  rdi, [rbp-0x140]
     mov  rdx, [rbp-0x78]
     imul rdx, rdx, COMPACT_SLOT_SIZE
@@ -4113,6 +4151,7 @@ utxo_lsm_compact:
     lea  rdi, [rbp-0x140]
     mov  eax, 87                                  ; unlink
     syscall
+.cc_unlink_next:
     inc  qword [rbp-0x78]
     jmp  .cc_unlink_loop
 .cc_unlink_done:
