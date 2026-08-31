@@ -242,8 +242,11 @@ int main(void){
        * separate option and is still honestly flagged. */
       ck("whitelist is NOT flagged (it is implemented: noban)",
          nodecfg_unimplemented("whitelist") == 0);
-      ck("whitebind is still flagged (it is not implemented)",
-         nodecfg_unimplemented("whitebind") == 1);
+      /* whitebind implemented 2026-08-31: its own listener per entry, and the
+       * permissions come from WHICH socket accepted the peer -- the same rule
+       * the onion listener already uses. */
+      ck("whitebind is NOT flagged (implemented)",
+         nodecfg_unimplemented("whitebind") == 0);
       /* rpcallowip/rpcbind implemented 2026-08-30 (daemon/rpc_acl.c). Core
        * supports both with its own guardrail -- the allow list always keeps
        * loopback, and rpcbind is ignored without rpcallowip -- so the default

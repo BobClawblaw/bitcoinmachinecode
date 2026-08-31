@@ -132,7 +132,8 @@ static const char* const k_unimplemented[] = {
      * three below are not: whitebind needs a second listener carrying its own
      * permissions, and whitelistrelay/whitelistforcerelay are relay
      * permissions with no enforcement point here yet. */
-    "whitebind","whitelistrelay","whitelistforcerelay",
+    /* whitebind is IMPLEMENTED (daemon/netperm.c + main.c's accept loop). */
+    "whitelistrelay","whitelistforcerelay",
     "txreconciliation","natpmp","upnp","bytespersigop",
     "peerbloomfilters","peerblockfilters",
     /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
@@ -497,6 +498,11 @@ long node_config_load(const char* path){
             g_cfg.persistmempool = iv?1:0; applied++; }
         else if(!strcmp(key,"reindex-chainstate")){
             g_cfg.reindex_chainstate = iv?1:0; applied++; }
+        else if(!strcmp(key,"whitebind")){    /* Core: permissions by listener */
+            const char* wberr = 0;
+            if(netperm_whitebind_add(val, &wberr)) applied++;
+            else { fprintf(stderr,"[config] whitebind=%s rejected: %s\n",
+                           val, wberr ? wberr : "?"); bad++; } }
         else if(!strcmp(key,"rpcallowip")){   /* Core: HTTP allow list */
             if(g_cfg.n_rpcallowip >= 16){
                 fprintf(stderr,"[config] rpcallowip: at most 16 entries -- ignoring %s\n", val); bad++; }

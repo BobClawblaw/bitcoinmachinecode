@@ -106,6 +106,40 @@ int main(void){
     netperm_reset();
     ok(netperm_for("127.0.0.1") == 0, "no entries means no permissions");
 
+    printf("== whitebind: permissions by LISTENER, not by peer address ==\n");
+    {
+        const char* e = 0;
+        ok(netperm_whitebind_add("noban@127.0.0.1:38333", &e), "noban@127.0.0.1:38333 is accepted");
+        ok(netperm_whitebind_count() == 1, "and stored");
+        ok(!strcmp(netperm_whitebind_addr(0), "127.0.0.1"), "the address is parsed off");
+        ok(netperm_whitebind_port(0) == 38333, "so is the port");
+        ok(netperm_whitebind_flags(0) & NP_NOBAN, "and it grants noban");
+
+        /* The fd mapping is the whole mechanism: a peer's permissions come
+         * from the socket that accepted it, which is how a peer whose address
+         * you cannot predict gets them at all. */
+        netperm_bind_fd(7, NP_NOBAN);
+        ok(netperm_for_fd(7) & NP_NOBAN, "a bound listener fd grants its flags");
+        ok(netperm_for_fd(8) == 0, "an unrelated fd grants nothing");
+        ok(netperm_for_fd(-1) == 0, "and -1 is not a listener");
+
+        /* A bare address with no port would be ambiguous with the main
+         * listener, and sharing that socket would grant every inbound peer
+         * these permissions. Core requires the port; so does this. */
+        ok(!netperm_whitebind_add("noban@127.0.0.1", &e) && e && strstr(e, "port"),
+           "an entry without a port is refused, saying so");
+        ok(!netperm_whitebind_add("noban@127.0.0.1:0", &e), "port 0 is refused");
+        ok(!netperm_whitebind_add("noban@127.0.0.1:70000", &e), "a port over 65535 is refused");
+        ok(!netperm_whitebind_add("noban@nothost:8333", &e), "a hostname is refused");
+        ok(!netperm_whitebind_add("mempool@127.0.0.1:8333", &e),
+           "a permission this node does not enforce is refused here too");
+        ok(!netperm_whitebind_add("", &e), "empty is refused");
+
+        /* An implicit entry grants noban, same as whitelist. */
+        ok(netperm_whitebind_add("127.0.0.2:8333", &e), "a bare addr:port is accepted");
+        ok(netperm_whitebind_flags(1) & NP_NOBAN, "and grants noban");
+    }
+
     printf("\n%s (%d failure%s)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED",
            fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
