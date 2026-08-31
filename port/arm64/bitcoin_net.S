@@ -267,6 +267,7 @@ p2p_write:
 	cbz  w10, .p2p_write_v1
 	adrp x9, :got:g_v2_hook_write
 	ldr  x9, [x9, :got_lo12:g_v2_hook_write]
+	ldr  x9, [x9]                    /* deref: load the fn pointer from the global */
 	cbz  x9, .p2p_write_v1
 	/* Real call, not a tail call: preserve the link + caller FP. sp is
 	 * already 16-aligned at entry (AAPCS64), and the stp keeps it aligned,
@@ -356,6 +357,7 @@ p2p_read:
 	cbz  w10, .p2p_read_v1
 	adrp x9, :got:g_v2_hook_read
 	ldr  x9, [x9, :got_lo12:g_v2_hook_read]
+	ldr  x9, [x9]                    /* deref: load the fn pointer from the global */
 	cbz  x9, .p2p_read_v1
 	stp  x29, x30, [sp, #-16]!
 	blr  x9
