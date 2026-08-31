@@ -508,6 +508,120 @@ static long txacc_sigop_cost(void* mp_area, const u8* tx, unsigned long txlen){
     return cost;
 }
 
+/* ---- Core v30/v31 sigop and witness standardness (policy, mempool-only) ----
+ * Checked BEFORE script verification, like Core's PreChecks: the transaction
+ * never needs to be executable for these verdicts.
+ *   - MAX_TX_LEGACY_SIGOPS (2,500, v30): legacy-counted sigops across all
+ *     input scriptSigs and output scriptPubKeys;
+ *   - MAX_STANDARD_TX_SIGOPS_COST (16,000): the accurate BIP141 cost the
+ *     sigop walker already computes (needs prevouts);
+ *   - IsWitnessStandard: P2WSH witness stack <= 100 items of <= 80 bytes
+ *     with a witnessScript <= 3,600; tapscript script-path stack elements
+ *     <= 80 bytes (annex handling is conservative: annexed inputs are not
+ *     judged). Non-static: tests/test_policy_v31.c drives them directly. */
+long txacc_legacy_sigops(const u8* tx, unsigned long txlen){
+    extern long script_sigops(const u8* script, unsigned long len);
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (txlen < 10) return -1;
+    p += 4;
+    int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
+    if (segwit) p += 2;
+    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc) return -1;
+    long total = 0;
+    for (u64 i = 0; i < nin; i++){
+        if ((unsigned long)(end - p) < 36) return -1;
+        p += 36;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return -1;
+        total += script_sigops(p, (unsigned long)sl);
+        p += sl;
+        if ((unsigned long)(end - p) < 4) return -1;
+        p += 4;
+    }
+    u64 nout = txacc_varint(&p, end, &cc); if (!cc) return -1;
+    for (u64 i = 0; i < nout; i++){
+        if ((unsigned long)(end - p) < 8) return -1;
+        p += 8;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return -1;
+        total += script_sigops(p, (unsigned long)sl);
+        p += sl;
+    }
+    return total;
+}
+const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long txlen){
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (txlen < 10) return 0;
+    p += 4;
+    int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
+    if (!segwit) return 0;
+    p += 2;
+    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc || nin == 0 || nin > 512) return 0;
+    struct { const u8* prev; u32 idx; const u8* ss; unsigned long ssl; } in[512];
+    for (u64 i = 0; i < nin; i++){
+        if ((unsigned long)(end - p) < 36) return 0;
+        in[i].prev = p; memcpy(&in[i].idx, p+32, 4); p += 36;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return 0;
+        in[i].ss = p; in[i].ssl = (unsigned long)sl; p += sl;
+        if ((unsigned long)(end - p) < 4) return 0;
+        p += 4;
+    }
+    u64 nout = txacc_varint(&p, end, &cc); if (!cc) return 0;
+    for (u64 i = 0; i < nout; i++){
+        if ((unsigned long)(end - p) < 8) return 0;
+        p += 8;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return 0;
+        p += sl;
+    }
+    for (u64 i = 0; i < nin; i++){
+        u64 nitem = txacc_varint(&p, end, &cc); if (!cc) return 0;
+        unsigned long len_last = 0, max_excl_last = 0;
+        u8 last_first = 0;
+        for (u64 k = 0; k < nitem; k++){
+            u64 il = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < il) return 0;
+            if (k + 1 < nitem && (unsigned long)il > max_excl_last)  max_excl_last  = (unsigned long)il;
+            if (k + 1 == nitem){ len_last = (unsigned long)il; last_first = il ? p[0] : 0; }
+            p += il;
+        }
+        if (nitem == 0) continue;
+        u64 v; unsigned long h, cb, spkl; const u8* spk;
+        if (!txacc_resolve_verify(mp_area, in[i].prev, in[i].idx, &v, &h, &cb, &spk, &spkl))
+            continue;                        /* unresolvable inputs fail later anyway */
+        int is_p2sh = (spkl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87);
+        const u8* ws = spk; unsigned long wsl = spkl;
+        if (is_p2sh && in[i].ssl){
+            const u8* red = 0; unsigned long redl = 0;
+            if (sgc_last_push(in[i].ss, in[i].ssl, &red, &redl) && red){ ws = red; wsl = redl; }
+        }
+        if (wsl == 34 && ws[0] == 0x00 && ws[1] == 0x20){            /* P2WSH */
+            if (len_last > 3600)    return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_SCRIPT_SIZE */
+            if (nitem - 1 > 100)    return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_STACK_ITEMS */
+            if (max_excl_last > 80) return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_STACK_ITEM_SIZE */
+        } else if (!is_p2sh && spkl == 34 && spk[0] == 0x51 && spk[1] == 0x20){   /* P2TR */
+            if (last_first == 0x50) continue;      /* annex present: judged conservatively as fine */
+            if (nitem >= 2){
+                /* script path: elements below script+control are capped at 80.
+                 * max_excl_last still includes the control block (2nd-to-last),
+                 * which is 33..193 bytes -- exclude it by recomputing against
+                 * the cap only when there are >= 3 items. Conservative: with
+                 * exactly 2 items (script+control) nothing to judge. */
+                if (nitem >= 3 && max_excl_last > 193) return "bad-witness-nonstandard";
+            }
+        }
+    }
+    return 0;
+}
+/* the pre-script policy gate; returns NULL ok / reason. Also parks the sigop
+ * cost for the policy layer's bytespersigop-adjusted feerate. */
+static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long txlen){
+    extern void mpool_policy_set_pending_sigops(unsigned long long);
+    long lc = txacc_legacy_sigops(tx, txlen);
+    if (lc > 2500) return "bad-txns-legacy-sigops";              /* MAX_TX_LEGACY_SIGOPS, Core v30 */
+    long sc = txacc_sigop_cost(mp_area, tx, txlen);
+    if (sc > 16000) return "bad-txns-too-many-sigops";           /* MAX_STANDARD_TX_SIGOPS_COST */
+    const char* wr = txacc_witness_standard(mp_area, tx, txlen);
+    if (wr) return wr;
+    mpool_policy_set_pending_sigops(sc > 0 ? (unsigned long long)sc : 0ULL);
+    return 0;
+}
 /* One entry for all three accept paths. Returns 1 ok, else 0 with *rout. */
 static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                                const char** rout){
@@ -689,6 +803,8 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     if (!g_ready || !g_pol_ready) return 0;
     txacc_log_tick(mp_area);
     void* placeholder_utxo = (void*)1; /* never dereferenced: mempool_resolve_confirmed_utxo ignores it */
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre) return 0; }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -755,6 +871,8 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     txacc_log_tick(mp_area);
     if (txacc_recently_confirmed(txid)){ g_alog.known_conf++; return -27; }   /* already in a block: not an orphan */
     void* placeholder_utxo = (void*)1;
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre){ g_alog.rej_policy++; return -26; } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -791,6 +909,8 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (reason && rcap) reason[0] = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -820,7 +940,13 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (padd != 1){
         const char* r = mpool_policy_reason(g_pol);
         if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
-        fprintf(stderr, "[tx_accept] reject (policy): %s\n", r ? r : "");
+        { static long pol_last, pol_muted;              /* same 1-per-5s mute as the txval line */
+          long now = (long)time(NULL);
+          if (now - pol_last >= 5){
+              fprintf(stderr, "[tx_accept] reject (policy): %s%s\n", r ? r : "",
+                      pol_muted ? " (repeats muted; the 30s summary counts them)" : "");
+              pol_last = now; pol_muted = 1;
+          } }
         if (r && strstr(r, "already")) return -27;
         if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
         return -26;
@@ -849,6 +975,8 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (fee_out) *fee_out = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
