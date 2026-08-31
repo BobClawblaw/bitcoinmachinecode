@@ -307,7 +307,7 @@ static int connect_peer(const char* host,unsigned char* rbuf){
                     if(strncmp(cmd,"version",7)==0&&!sv){ p2p_write(fd,"verack",6,rbuf,0); sv=1; }
                     else if(strncmp(cmd,"verack",6)==0) gv=1;
                 }
-                if(sv&&gv){ fprintf(stderr,"  [peer %s fd=%d]\n",ph,fd); return fd; }
+                if(sv&&gv){ fprintf(stderr,"  [peer %s fd=%d]\n",ph,fd); g_npeer++; return fd; }
                 fd_close(fd);
             }
             g_npeer++;
