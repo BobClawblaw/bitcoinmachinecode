@@ -1529,7 +1529,7 @@ long utxo_live_compact_threshold(void){
     long t = g_cfg.utxo_compact_threshold > 0 ? g_cfg.utxo_compact_threshold
                                               : UTXO_LIVE_COMPACT_THRESHOLD;
     if (g_bulk_mode) t *= 4;
-    if (t > UTXO_LIVE_MANIFEST_CAP / 2) t = UTXO_LIVE_MANIFEST_CAP / 2;
+    if (t > 64) t = 64;   /* COMPACT_MAX_RUNS: a merge folds at most 64 runs */
     if (t < 2) t = 2;
     return t;
 }
