@@ -929,13 +929,10 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
              * "5007 accepted, 0 rejected"). One line per 5 s; the 30 s
              * summary carries the count. Real invalidity stays per-tx. */
             if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))){
-                static long mi_last; static long mi_muted;
-                long now = (long)time(NULL);
-                if (now - mi_last >= 5){
-                    fprintf(stderr, "[tx_accept] reject (txval): %s%s\n", r,
-                            mi_muted ? " (repeats muted; the 30s summary counts them)" : "");
-                    mi_last = now; mi_muted = 1;
-                } 
+                /* no per-event line at all: with steady mainnet churn the
+                 * 5s mute still guaranteed a line every 5 seconds forever
+                 * (2026-08-31, operator: "wtf is that spam"). The 30s
+                 * summary's missing-inputs count is the record. */
                 return -25;
             }
             fprintf(stderr, "[tx_accept] reject (txval): %s\n", r ? r : "");
@@ -948,9 +945,9 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (padd != 1){
         const char* r = mpool_policy_reason(g_pol);
         if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
-        { static long pol_last, pol_muted;              /* same 1-per-5s mute as the txval line */
+        { static long pol_last, pol_muted;              /* 1/min: informative but not a metronome */
           long now = (long)time(NULL);
-          if (now - pol_last >= 5){
+          if (now - pol_last >= 60){
               fprintf(stderr, "[tx_accept] reject (policy): %s%s\n", r ? r : "",
                       pol_muted ? " (repeats muted; the 30s summary counts them)" : "");
               pol_last = now; pol_muted = 1;
