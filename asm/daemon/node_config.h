@@ -143,8 +143,8 @@ typedef struct {
     long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
     /* mempool policy limits (Core exposes each of these). Fees are stored in
      * sat/vByte (Core's config is BTC/kvB; parsed at the boundary). */
-    long minrelaytxfee_satvb;    /* Core -minrelaytxfee (default 1 sat/vB)   */
-    long incrementalrelayfee_satvb; /* Core -incrementalrelayfee (default 1) */
+    long minrelaytxfee_satkvb;    /* Core -minrelaytxfee, sat/kvB (Core v30 default 100 = 0.1 sat/vB) */
+    long incrementalrelayfee_satkvb; /* Core -incrementalrelayfee, sat/kvB (default 100)          */
     long limitancestorcount;     /* Core -limitancestorcount (default 25)    */
     long limitancestorsize_kvb;  /* Core -limitancestorsize (kvB, default 101)*/
     long limitdescendantcount;   /* Core -limitdescendantcount (default 25)  */

@@ -100,7 +100,7 @@ static unsigned long long FUND = 1000000ull;
 
 static void world(int nonstd){
     memset(stbuf, 0, sizeof stbuf);
-    mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+    mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
     mpool_policy_set_acceptnonstd(pol, nonstd ? 1 : 0);
     mpool_policy_state_init(stbuf, 256);
     mpool_init(mp, 4096, mblob, sizeof mblob);
