@@ -4886,6 +4886,13 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    /* getnetworkinfo tells the truth about the transports: reachability from
+     * the dialer, our i2p destination, and (once the tor listener is up,
+     * below in tor_onion_listener) the onion hostname. */
+    { extern int dialer_net_reachable(int);
+      extern const char* dialer_i2p_b32(void);
+      extern void rpc_node_set_net_hooks(int (*)(int), const char* (*)(void));
+      rpc_node_set_net_hooks(dialer_net_reachable, dialer_i2p_b32); }
     /* Wallet bootstrap: if the CLI's own wallet store is present in the
      * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
      * CLI's own resolution order) and hand the RPC layer the seed --
@@ -5134,7 +5141,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
 static torctl_t g_torctl = { .fd = -1 };
 
 static int tor_onion_listener(int port){
-    if(!g_cfg.listen)      return -1;   /* not accepting inbound at all */
+    if(!g_cfg.listen){ fprintf(stderr,"[tor] listen=0 -- no onion service\n"); return -1; }
     if(!g_cfg.listenonion) { fprintf(stderr,"[tor] listenonion=0 -- no onion service\n"); return -1; }
 
     /* Core's default is the CHAIN default port + 1 (mainnet 8334), not our
@@ -5167,6 +5174,8 @@ static int tor_onion_listener(int port){
       if(addrself_set_onion(g_torctl.onion, (unsigned short)g_chainp->default_port))
           fprintf(stderr,"[tor] announcing %s:%d to onion peers\n",
                   g_torctl.onion, g_chainp->default_port); }
+    { extern void rpc_node_set_onion_local(const char*, int);
+      rpc_node_set_onion_local(g_torctl.onion, g_chainp->default_port); }
     return lo;
 }
 

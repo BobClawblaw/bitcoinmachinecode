@@ -284,6 +284,12 @@ void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 void rpc_node_set_addrbook(void* ab, long (*count)(void*),
                            int (*get)(void*, long, ab2_rec_t*));
 void rpc_node_set_addrbook_dir(const char* dir);
+/* live network state for getnetworkinfo: reachability probe (BMC_NET_* id ->
+ * 0/1) and our i2p b32 destination, both owned by daemon/dialer.c; the onion
+ * hostname once the tor listener is up. All optional -- unset means the
+ * pre-transport defaults (ipv4/ipv6 only, no localaddresses). */
+void rpc_node_set_net_hooks(int (*reachable)(int), const char* (*i2p_b32)(void));
+void rpc_node_set_onion_local(const char* onion, int port);
 
 /* Hand the RPC layer the operator's addnode= list (node_config's
  * g_cfg.addnode / n_addnode), so getaddednodeinfo reports the real

@@ -57,6 +57,24 @@ static int cmd_getconnectioncount(rj_val** res){
     return 1;
 }
 
+/* live network state (see rpc_node.h): hooks into daemon/dialer.c, set by
+ * main.c so standalone links of this file carry no dialer dependency. */
+static int         (*g_net_reachable_fn)(int);
+static const char* (*g_i2p_b32_fn)(void);
+static char g_onion_local[80]; static int g_onion_local_port;
+void rpc_node_set_net_hooks(int (*reachable)(int), const char* (*i2p_b32)(void)){
+    g_net_reachable_fn = reachable; g_i2p_b32_fn = i2p_b32;
+}
+void rpc_node_set_onion_local(const char* onion, int port){
+    snprintf(g_onion_local, sizeof g_onion_local, "%s", onion ? onion : "");
+    g_onion_local_port = port;
+}
+/* BMC_NET_* ids (daemon/netaddr.h) without the include: 1 ipv4, 2 ipv6,
+ * 4 torv3, 5 i2p, 6 cjdns */
+static int net_reach(int bmc_id, int dflt){
+    return g_net_reachable_fn ? (g_net_reachable_fn(bmc_id) ? 1 : 0) : dflt;
+}
+
 /* one entry of getnetworkinfo.networks */
 static rj_val* net_entry(const char* name, int reachable){
     rj_val* o = rj_obj();
@@ -93,15 +111,31 @@ static int cmd_getnetworkinfo(rj_val** res){
     rj_obj_set(o, "connections_in", rj_numf("%d", n_in));
     rj_obj_set(o, "connections_out", rj_numf("%d", n_out));
     { rj_val* nets = rj_arr();
-      rj_arr_push(nets, net_entry("ipv4", 1));
-      rj_arr_push(nets, net_entry("ipv6", 1));
-      rj_arr_push(nets, net_entry("onion", 0));
-      rj_arr_push(nets, net_entry("i2p", 0));
-      rj_arr_push(nets, net_entry("cjdns", 0));
+      rj_arr_push(nets, net_entry("ipv4",  net_reach(1, 1)));
+      rj_arr_push(nets, net_entry("ipv6",  net_reach(2, 1)));
+      rj_arr_push(nets, net_entry("onion", net_reach(4, 0)));
+      rj_arr_push(nets, net_entry("i2p",   net_reach(5, 0)));
+      rj_arr_push(nets, net_entry("cjdns", net_reach(6, 0)));
       rj_obj_set(o, "networks", nets); }
     rj_obj_set(o, "relayfee", rj_numf("%.8f", 0.00001000));
     rj_obj_set(o, "incrementalfee", rj_numf("%.8f", 0.00001000));
-    rj_obj_set(o, "localaddresses", rj_arr());
+    { rj_val* la = rj_arr();
+      if (g_onion_local[0]){
+          rj_val* e = rj_obj();
+          rj_obj_set(e, "address", rj_str(g_onion_local));
+          rj_obj_set(e, "port", rj_numf("%d", g_onion_local_port));
+          rj_obj_set(e, "score", rj_numf("%d", 1));
+          rj_arr_push(la, e);
+      }
+      { const char* b32 = g_i2p_b32_fn ? g_i2p_b32_fn() : 0;
+        if (b32 && b32[0]){
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "address", rj_str(b32));
+            rj_obj_set(e, "port", rj_numf("%d", 0));   /* Core lists i2p with port 0 */
+            rj_obj_set(e, "score", rj_numf("%d", 1));
+            rj_arr_push(la, e);
+        } }
+      rj_obj_set(o, "localaddresses", la); }
     rj_obj_set(o, "warnings", rj_arr());
     *res = o;
     return 1;
