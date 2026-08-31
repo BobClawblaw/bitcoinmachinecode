@@ -48,8 +48,8 @@ int main(void){
     { extern int nodecfg_unimplemented(const char*);
       ck("reindex-chainstate is no longer flagged unimplemented",
          nodecfg_unimplemented("reindex-chainstate") == 0);
-      ck("  but bare -reindex still is (block-index rebuild is not implemented)",
-         nodecfg_unimplemented("reindex") == 1); }
+      ck("reindex is implemented now (daemon/archive_reindex.c): not flagged",
+         nodecfg_unimplemented("reindex") == 0); }
 
     printf("== the drop removes every UTXO artefact, not just the height file ==\n");
     /* Removing utxo_applied_height.dat alone silently reintroduces corruption:

@@ -49,7 +49,7 @@ testnet4, signet (public or custom) and regtest.
 - Pruning (`prune=<MiB>`), with whole-file-granular deletion and a refusal to
   delete anything below a sync hole.
 - Startup verification (`checkblocks`/`checklevel`) at Core's defaults;
-  `reindex-chainstate`.
+  `reindex` and `reindex-chainstate`.
 
 **Mempool (Core policy)**
 
@@ -371,9 +371,9 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 
 - **Storage format.** Blocks live in the project's own framed archive and
   the UTXO set in a custom LSM store, not `blk*.dat` + LevelDB. Core
-  datadirs are not interchangeable with this node's. `-reindex` does not
-  exist; archive repair truncates and re-downloads instead
-  (`reindex-chainstate` is supported).
+  datadirs are not interchangeable with this node's. `reindex=1` rebuilds
+  the block index from the archive files and `reindex-chainstate=1` the UTXO
+  set, each as a one-shot request.
 - **Mempool eviction is per-leaf.** `TrimToSize` evicts the lowest-feerate
   leaf transaction and works inward, where Core evicts by linearization
   chunk. Sibling eviction is not implemented.

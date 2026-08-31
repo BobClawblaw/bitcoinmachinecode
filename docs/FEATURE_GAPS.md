@@ -530,7 +530,7 @@ because they were absent *checks* rather than absent features:
 The remaining finding is structural — hand-written consensus assembly with a
 documented false-ACCEPT history — and is not closeable by a patch.
 
-*Remaining, in the order worth doing it:* `reindex` and `persistmempool`;
+*Remaining, in the order worth doing it:* (`reindex` and `persistmempool` are implemented);
 `whitebind` (a second listener carrying its own permissions — `whitelist`
 itself is done, noban only); the RPC surface (`rpcauth`, `rpcallowip`,
 `rpcbind`, `server`, `rest`) — lower urgency now that cookie auth exists and

@@ -46,7 +46,8 @@
 #include "notify.h"      /* Core -*notify hooks */
 #include "torcontrol.h"  /* inbound: our own onion service */
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
-#include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "node_config.h"
+#include "archive_reindex.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "netperm.h"   /* -whitelist peer permissions */
 #include "subnet.h"    /* one CIDR matcher, shared with the ban list */
 #include "rpc_acl.h"   /* -rpcallowip / -rpcbind */
@@ -5767,6 +5768,41 @@ int main(int argc, char** argv){
      * UTXO store and chainwork in the BASE dir while the archive lived in
      * regtest/, splitting one chain's state across two dirs. absp keeps the
      * BASE for the config path (bitcoin.conf stays shared at the root). */
+    /* Core -reindex: rebuild index.dat, headers.dat and chainwork.dat from the
+     * blk files (daemon/archive_reindex.c), then drop the chain state and the
+     * height-positional indexes so they rebuild against the new heights.
+     * ONE-SHOT, exactly like -reindex-chainstate: a request, not a mode. Runs
+     * BEFORE store_init so the store opens the rebuilt index, and after the
+     * chdir into the per-chain directory, where the files live. */
+    if(g_cfg.reindex){
+        struct stat rst;
+        if(stat("reindex.done", &rst) == 0){
+            fprintf(stderr,"[reindex] reindex=1 is still set in the config but was already carried out "
+                           "(reindex.done exists) -- ignoring. Remove the option, and delete that marker "
+                           "if you truly want another rebuild.\n");
+        } else {
+            extern unsigned int net_magic;
+            archive_reindex_stats rs; char rerr[256] = {0};
+            fprintf(stderr,"[reindex] rebuilding the block index from the blk files...\n");
+            if(archive_reindex(".", g_chainp->genesis_hash, net_magic, &rs, rerr, sizeof rerr) != 0){
+                fprintf(stderr,"[reindex] FAILED: %s -- nothing was replaced; not starting\n", rerr);
+                return 1;
+            }
+            fprintf(stderr,"[reindex] rebuilt: tip=%ld from %ld frame(s) in %ld file(s); %ld duplicate(s), "
+                           "%ld orphan(s), %ld stale fork block(s), %ld bad-PoW frame(s), %ld junk byte(s)%s\n",
+                    rs.tip, rs.frames, rs.files, rs.duplicates, rs.orphans, rs.stale, rs.bad_pow, rs.junk_bytes,
+                    rs.tip_reappended ? "; tip frame re-appended for append safety" : "");
+            { long dropped = archive_drop_utxo_state();
+              fprintf(stderr,"[reindex] dropped %ld UTXO state file(s); the set will rebuild from the archive\n", dropped); }
+            { const char* dz[] = {"txindex.dat","txindex.tail","addr_index.dat","bfilters.dat","bfilters.idx","coinstats.dat",0};
+              int nd = 0; for(int i = 0; dz[i]; i++) if(unlink(dz[i]) == 0) nd++;
+              if(nd) fprintf(stderr,"[reindex] removed %d height-positional index file(s); filters and coinstats rebuild "
+                                    "on their own, txindex needs build_tx_index\n", nd); }
+            FILE* mk = fopen("reindex.done", "w");
+            if(mk){ fprintf(mk, "reindex carried out\n"); fclose(mk); }
+            else fprintf(stderr,"[reindex] WARNING: could not write reindex.done -- the rebuild would repeat on the next restart\n");
+        }
+    }
     dir = effdir;
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
