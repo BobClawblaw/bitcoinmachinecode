@@ -738,6 +738,16 @@ Operational notes:
   the next announcer is asked. Case 14. The heartbeat gained a second line:
   `orphan drops: N ttl, N evicted, N rejected | parents requested N, notfound
   N, re-requested after timeout N`.
+- **Per-peer request tracking** (Core's TxRequestTracker, simplified): every
+  announcement remembers up to 4 announcing legs; a request unanswered for 5 s
+  is retried on a DIFFERENT leg (an untried announcer first, else any other
+  live leg -- any peer serves getdata from its mempool), a `notfound` fails
+  over immediately, a dead leg is dropped and the next candidate tried, and an
+  entry gives up after 4 requests (a later inv recreates it). Entries clear on
+  arrival by both txid and wtxid. Before this, a lost request simply waited up
+  to 60 s for the same tx to be announced again -- for a parked orphan's
+  parent, usually never. Heartbeat: `retried on another peer N (gave up N, in
+  flight N)`. `test_tx_relay` case 16.
 - **The orphanage is sized against Core v31's reservations** (404k weight units
   and a 3,000-announcement score per peer): 2,048 slots / 8 MB, up from 256 /
   2 MB, which sat pinned at capacity after every restart and made eviction the

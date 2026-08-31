@@ -49,6 +49,8 @@ extern long txrelay_notfound_count(void);
 extern void txrelay_test_set_req_ttl_ms(long long ms);
 extern int  txrelay_replies_pending(int fd);
 extern void txrelay_test_set_pending_ttl_ms(long long ms);
+extern void txrelay_test_set_retry_ms(long long ms);
+extern void txrelay_stats3(long*, long*, long*);
 extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
 extern long tx_accept_block_connect(void* mp_area, const unsigned char* block, unsigned long blen);
 #include "../daemon/addrbook.h"
@@ -705,6 +707,52 @@ int main(void){
         u8 nf[37]; nf[0]=1; nf[1]=1; nf[2]=0; nf[3]=0; nf[4]=0x40; memcpy(nf+5, g2, 32);
         p2p_write(spX[1], "notfound", 8, nf, 37); txrelay_poll_leg(spX[0], mp_area, 50);
         ck("the reply (here a notfound) clears it", !txrelay_replies_pending(spX[0]));
+    }
+    printf("\n== 16: an unanswered request is retried on a DIFFERENT leg ==\n");
+    {
+        close(sp[0]); close(sp[1]);                          /* the early cases' leg must not catch retries */
+        int spY[2], spZ[2];
+        ck("leg pairs for 16", socketpair(AF_UNIX, SOCK_STREAM, 0, spY) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, spZ) == 0);
+        txrelay_poll_leg(spY[0], mp_area, 10); txrelay_poll_leg(spZ[0], mp_area, 10);   /* register both legs */
+        /* burn out stale want entries from the earlier cases */
+        txrelay_test_set_retry_ms(1);
+        for (int r = 0; r < 8; r++){ struct timespec t0 = {0, 10*1000*1000}; nanosleep(&t0, NULL);
+            txrelay_poll_leg(spY[0], mp_area, 5); txrelay_poll_leg(spZ[0], mp_area, 5);
+            drain_peer(spY[1]); drain_peer(spZ[1]); }
+        { long a, b, wa0c; txrelay_stats3(&a, &b, &wa0c); ck("stale entries burned out", wa0c == 0); }
+        txrelay_test_set_retry_ms(5000);
+        char cmd[13]; static u8 pl[4096];
+        long ro0, gu0, wa0; txrelay_stats3(&ro0, &gu0, &wa0);
+        u8 g1[32]; memset(g1, 0xE1, 32);
+        send_inv1(spY[1], g1); txrelay_poll_leg(spY[0], mp_area, 50);
+        int plen = read_msg(spY[1], cmd, pl, sizeof pl);
+        ck("requested from the announcer", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, g1, 32));
+        txrelay_test_set_retry_ms(40);
+        { struct timespec t0 = {0, 60*1000*1000}; nanosleep(&t0, NULL); }
+        txrelay_poll_leg(spZ[0], mp_area, 10);              /* any poll drives the retry */
+        plen = read_msg(spZ[1], cmd, pl, sizeof pl);
+        ck("timed out: retried on the OTHER leg", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, g1, 32));
+        long ro1, gu1, wa1; txrelay_stats3(&ro1, &gu1, &wa1);
+        ck("counted as a retry on another peer", ro1 > ro0);
+        /* let it give up: both legs tried, no candidates left */
+        { struct timespec t0 = {0, 60*1000*1000}; nanosleep(&t0, NULL); }
+        struct timespec half = {0, 550*1000*1000}; nanosleep(&half, NULL);   /* pass the 500 ms driver throttle */
+        txrelay_poll_leg(spY[0], mp_area, 10); drain_peer(spY[1]); drain_peer(spZ[1]);
+        long ro2, gu2, wa2;
+        for (int r = 0; r < 6; r++){ nanosleep(&half, NULL); txrelay_poll_leg(spY[0], mp_area, 10); drain_peer(spY[1]); drain_peer(spZ[1]); txrelay_stats3(&ro2, &gu2, &wa2); if (gu2 > gu0) break; }
+        txrelay_stats3(&ro2, &gu2, &wa2);
+        ck("bounded: gave up after exhausting candidates", gu2 > gu0);
+        printf("\n== 16b: notfound fails over immediately ==\n");
+        txrelay_test_set_retry_ms(5000);
+        u8 g2[32]; memset(g2, 0xE2, 32);
+        send_inv1(spY[1], g2); txrelay_poll_leg(spY[0], mp_area, 50);
+        plen = read_msg(spY[1], cmd, pl, sizeof pl);
+        ck("requested from the announcer", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, g2, 32));
+        u8 nf[37]; memcpy(nf, pl, 37); nf[0] = 1;
+        p2p_write(spY[1], "notfound", 8, nf, 37); txrelay_poll_leg(spY[0], mp_area, 50);
+        plen = read_msg(spZ[1], cmd, pl, sizeof pl);
+        ck("the notfound moved the request to the other leg at once", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, g2, 32));
+        close(spY[0]); close(spY[1]); close(spZ[0]); close(spZ[1]);
     }
     close(spX[0]); close(spX[1]);
 

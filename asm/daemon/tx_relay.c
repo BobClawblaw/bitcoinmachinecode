@@ -629,12 +629,166 @@ void txrelay_note_sync_deferred(void){ txr_sync_deferred++; }
 long txrelay_sync_deferred_count(void){ return txr_sync_deferred; }
 void txrelay_test_set_pending_ttl_ms(long long ms){ txr_pend_ttl_ms = ms; }
 
+/* ---- per-peer request tracking (Core's TxRequestTracker, simplified) ------
+ * Every announcement is remembered with WHO announced it (up to 4 legs). A
+ * request that is not answered within TXR_REQ_RETRY_MS is retried on a
+ * DIFFERENT leg -- an announcer not yet tried, else any other live leg (any
+ * peer with the tx in its mempool serves getdata) -- and a notfound fails
+ * over immediately. Before this, a lost or refused request simply waited for
+ * the next announcement of the same tx, which for a parked orphan's parent
+ * usually never came: production 2026-08-31 logged ~1,500 re-requests-after-
+ * timeout per 10 minutes with 690 orphans dropping on TTL. Bounded: at most
+ * TXR_WANT_TRIES requests per tx, then the entry is dropped (a later inv
+ * recreates it). Entries clear on arrival -- keyed by txid AND wtxid, since
+ * BIP339 peers announce by wtxid (sha256d of the full serialization). */
+#define TXR_WANT_MAX    4096
+#define TXR_WANT_PEERS  4
+#define TXR_WANT_TRIES  4
+#define TXR_REQ_RETRY_MS_DEF 5000
+typedef struct {
+    u8  hash[32];
+    u32 rtype;                  /* the getdata type to use (WITNESS_TX or WTX) */
+    int fds[TXR_WANT_PEERS];    /* announcers */
+    u8  nfd, tries, inflight, used, ntried;
+    int req_fd;                 /* where the in-flight request went */
+    int tried_fd[6];            /* every fd this entry was ever requested from */
+    long long t_req, t_seen;
+} txr_want_t;
+static txr_want_t txr_want_tab[TXR_WANT_MAX];
+static long long txr_req_retry_ms = TXR_REQ_RETRY_MS_DEF;
+static long long txr_retry_last;            /* driver throttle (below) */
+static long txr_retry_other, txr_want_gaveup;
+void txrelay_test_set_retry_ms(long long ms){ txr_req_retry_ms = ms; txr_retry_last = 0; }
+/* legs learned from the polls themselves; "live" = polled within 5 s */
+#define TXR_LEG_MAX 16
+static struct { int fd; long long t; } txr_legs[TXR_LEG_MAX];
+static void txr_note_leg(int fd){
+    long long now = txr_now_ms(); int free_i = -1;
+    for (int i = 0; i < TXR_LEG_MAX; i++){
+        if (txr_legs[i].fd == fd){ txr_legs[i].t = now; return; }
+        if (free_i < 0 && now - txr_legs[i].t > 5000) free_i = i;
+    }
+    if (free_i >= 0){ txr_legs[free_i].fd = fd; txr_legs[free_i].t = now; }
+}
+static txr_want_t* txr_want_find(const u8* h){
+    for (int i = 0; i < TXR_WANT_MAX; i++)
+        if (txr_want_tab[i].used && !memcmp(txr_want_tab[i].hash, h, 32)) return &txr_want_tab[i];
+    return 0;
+}
+static void txr_want_clear(const u8* h){
+    txr_want_t* w = txr_want_find(h);
+    if (w) memset(w, 0, sizeof *w);
+}
+static void txr_want_note(const u8* h, u32 rtype, int fd, int requested){
+    txr_want_t* w = txr_want_find(h);
+    if (!w){
+        int slot = -1; long long oldest = 0;
+        for (int i = 0; i < TXR_WANT_MAX; i++){
+            if (!txr_want_tab[i].used){ slot = i; break; }
+            if (slot < 0 || txr_want_tab[i].t_seen < oldest || i == 0){ if (i == 0 || txr_want_tab[i].t_seen < oldest){ oldest = txr_want_tab[i].t_seen; slot = i; } }
+        }
+        w = &txr_want_tab[slot]; memset(w, 0, sizeof *w);
+        memcpy(w->hash, h, 32); w->rtype = rtype; w->used = 1;
+    }
+    w->t_seen = txr_now_ms();
+    int have = 0;
+    for (int i = 0; i < w->nfd; i++) if (w->fds[i] == fd) have = 1;
+    if (!have && w->nfd < TXR_WANT_PEERS) w->fds[w->nfd++] = fd;
+    if (requested){
+        w->req_fd = fd; w->t_req = txr_now_ms(); w->inflight = 1;
+        if (w->tries < 255) w->tries++;
+        if (w->ntried < 6) w->tried_fd[w->ntried++] = fd;
+    }
+}
+static int txr_want_tried(const txr_want_t* w, int fd){
+    for (int i = 0; i < w->ntried; i++) if (w->tried_fd[i] == fd) return 1;
+    return 0;
+}
+static void txr_leg_dead(int fd){
+    for (int i = 0; i < TXR_LEG_MAX; i++) if (txr_legs[i].fd == fd){ txr_legs[i].fd = 0; txr_legs[i].t = 0; }
+}
+static int txr_leg_alive(int fd){
+    for (int i = 0; i < TXR_LEG_MAX; i++)
+        if (txr_legs[i].fd == fd && txr_now_ms() - txr_legs[i].t <= 5000) return 1;
+    return 0;
+}
+/* an announcer this entry has not asked yet, else any other live leg it has
+ * not asked yet */
+static int txr_want_pick(txr_want_t* w){
+    for (int i = 0; i < w->nfd; i++)
+        if (!txr_want_tried(w, w->fds[i]) && txr_leg_alive(w->fds[i])) return w->fds[i];
+    for (int i = 0; i < TXR_LEG_MAX; i++)
+        if (txr_legs[i].fd > 0 && !txr_want_tried(w, txr_legs[i].fd) &&
+            txr_now_ms() - txr_legs[i].t <= 5000) return txr_legs[i].fd;
+    return -1;
+}
+/* fail over now (timeout or notfound), walking candidates until a write
+ * lands: a dead leg is dropped from the registry and the next one is tried,
+ * so a stale fd never eats the entry. Drop the entry when candidates or the
+ * try budget run out -- a later announcement recreates it. */
+static void txr_want_failover(txr_want_t* w){
+    for (;;){
+        if (w->tries >= TXR_WANT_TRIES){ txr_want_gaveup++; memset(w, 0, sizeof *w); return; }
+        int fd = txr_want_pick(w);
+        if (fd < 0){ txr_want_gaveup++; memset(w, 0, sizeof *w); return; }
+        if (w->ntried < 6) w->tried_fd[w->ntried++] = fd;
+        u8 gd[37]; gd[0] = 1;
+        gd[1] = (u8)w->rtype; gd[2] = (u8)(w->rtype >> 8); gd[3] = (u8)(w->rtype >> 16); gd[4] = (u8)(w->rtype >> 24);
+        memcpy(gd + 5, w->hash, 32);
+        if (p2p_write(fd, "getdata", 7, gd, 37) > 0){
+            txr_ring_del(w->hash); txr_ring_add(w->hash);   /* refresh the dedup window */
+            w->req_fd = fd; w->t_req = txr_now_ms(); w->inflight = 1; w->tries++;
+            txr_retry_other++;
+            return;
+        }
+        txr_leg_dead(fd);                                   /* try the next candidate */
+    }
+}
+/* the retry driver: runs from any leg's poll, at most twice a second */
+static void txr_retry_timeouts(void* mp){
+    long long now = txr_now_ms();
+    long long gap = txr_req_retry_ms / 2 < 500 ? txr_req_retry_ms / 2 : 500;
+    if (now - txr_retry_last < gap) return;
+    txr_retry_last = now;
+    for (int i = 0; i < TXR_WANT_MAX; i++){
+        txr_want_t* w = &txr_want_tab[i];
+        if (!w->used || !w->inflight) continue;
+        if (now - w->t_req < txr_req_retry_ms) continue;
+        unsigned long got_len;
+        if (w->rtype == TXR_MSG_WITNESS_TX && mpool_get(mp, w->hash, &got_len)){ memset(w, 0, sizeof *w); continue; }
+        txr_want_failover(w);
+    }
+}
+/* test-only introspection */
+void txrelay_debug_dump(void){
+    long long now = txr_now_ms();
+    fprintf(stderr, "[txr-dump] legs:");
+    for (int i = 0; i < TXR_LEG_MAX; i++) if (txr_legs[i].fd) fprintf(stderr, " %d(age %lldms)", txr_legs[i].fd, now - txr_legs[i].t);
+    fprintf(stderr, "\n");
+    for (int i = 0; i < TXR_WANT_MAX; i++){
+        txr_want_t* w = &txr_want_tab[i];
+        if (!w->used) continue;
+        fprintf(stderr, "[txr-dump] want %02x.. req_fd=%d inflight=%d tries=%d ntried=%d age_req=%lldms announcers:", w->hash[0], w->req_fd, w->inflight, w->tries, w->ntried, now - w->t_req);
+        for (int k = 0; k < w->nfd; k++) fprintf(stderr, " %d", w->fds[k]);
+        fprintf(stderr, "\n");
+    }
+}
+void txrelay_stats3(long* retried_other, long* gaveup, long* active){
+    long n = 0;                 /* requests IN FLIGHT (announcement-only memory is not counted) */
+    for (int i = 0; i < TXR_WANT_MAX; i++) if (txr_want_tab[i].used && txr_want_tab[i].inflight) n++;
+    if (retried_other) *retried_other = txr_retry_other;
+    if (gaveup) *gaveup = txr_want_gaveup;
+    if (active) *active = n;
+}
+
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
     static u8 pl[TXR_PAYLOAD_CAP];
     static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
     char cmd[12];
     unsigned plen;
     long accepted = 0;
+    txr_note_leg(fd);
+    txr_retry_timeouts(mp);
     int outstanding = txr_pend_get(fd);  /* getdata entries awaiting replies, carried from the last poll */
     txr_orphan_expire();
     txr_recon_expire();
@@ -679,6 +833,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 else if (type == TXR_MSG_WTX) req_type = TXR_MSG_WTX;    /* wtxid: the getdata echoes it */
                 else continue;
                 unsigned long got_len;
+                txr_want_note(e + 4, req_type, fd, 0);           /* remember the announcer either way */
                 if (txr_ring_has(e + 4)) continue;     /* recently requested */
                 /* pool-dedup only makes sense for a txid announcement; a
                  * wtxid keys differently, so a wtxid we already hold may be
@@ -689,6 +844,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 o[2] = (u8)(req_type >> 16); o[3] = (u8)(req_type >> 24);
                 memcpy(o + 4, e + 4, 32);
                 txr_ring_add(e + 4);
+                txr_want_note(e + 4, req_type, fd, 1);
                 want++;
             }
             if (want){
@@ -702,6 +858,9 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (outstanding > 0) outstanding--;
             u8 txid[32];
             if (plen >= 60 && tx_txid(txid, pl, plen, scratch, sizeof scratch) == 1){
+                { extern void sha256d(u8 out[32], const void* p, unsigned long n);
+                  u8 wtxid[32]; sha256d(wtxid, pl, plen);       /* BIP339 announcements key by this */
+                  txr_want_clear(txid); txr_want_clear(wtxid); }
                 long r = tx_accept_validate_p2p(mp, txid, pl, plen);
                 if (r == 1){
                     accepted++;
@@ -739,6 +898,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                         o[2] = 0; o[3] = (u8)(TXR_MSG_WITNESS_TX >> 24);
                         memcpy(o + 4, par[k], 32);
                         txr_ring_add(par[k]);
+                        txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 1);
                         want++;
                     }
                     if (want){
@@ -791,6 +951,8 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 | (unsigned)e[2]<<16 | (unsigned)e[3]<<24;
                 if (type == TXR_MSG_TX || type == TXR_MSG_WITNESS_TX || type == TXR_MSG_WTX){
                     txr_ring_del(e + 4); txr_notfound_seen++;
+                    { txr_want_t* w = txr_want_find(e + 4);       /* this peer cannot serve it: ask another NOW */
+                      if (w && w->inflight && w->req_fd == fd) txr_want_failover(w); }
                 }
             }
             continue;
