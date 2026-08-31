@@ -5667,9 +5667,15 @@ int main(int argc, char** argv){
             fprintf(stderr,"[config] work : minimumchainwork not set -- no low-work floor\n");
       } }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
-    chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
+    chainparams_datadir(absp, effdir, sizeof effdir);   /* <datadir>/<chain>, main included (2026-08-31) */
+    /* EVERY chain chdirs into its own directory now. The old != CHAIN_MAIN
+     * guard left main's PARENT at the datadir root after the layout change:
+     * the worker used effdir and found data/main/, but the parent wrote the
+     * RPC cookie to data/.cookie and looked for mempool.dat one level up --
+     * caught on the first migrated boot (cookie "enabled" yet unreadable to
+     * the CLI, and the 10k-entry mempool.dat silently not reloaded). */
+    if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
     if(g_chainp->id != CHAIN_MAIN){
-        if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
         if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
         if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
     }
