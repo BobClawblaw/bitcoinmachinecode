@@ -446,6 +446,16 @@ Recovery:
   sweeps orphan run files and re-applies. No operator action.
 - **Missing archive blocks.** The node fills gaps and the tail itself
   (`[boot] checking for archive gaps / missing blocks...`).
+- **Corrupt or lost block index.** Set `reindex=1` in `bitcoin.conf` and
+  start. Before opening the archive the node rebuilds `index.dat`,
+  `headers.dat` and `chainwork.dat` from the `blk*.dat` frames alone --
+  every block on disk is re-linked from genesis by prev-hash, the best
+  chain by cumulative work wins, and duplicates, orphans, stale forks and
+  frames that fail their own proof of work are left out -- then drops the
+  UTXO set and the height-positional indexes so they rebuild. The previous
+  index files stay as `*.pre-reindex`. The key is one-shot (`reindex.done`
+  marks it done); remove it afterwards. The log line to expect is
+  `[reindex] rebuilt: tip=<h> from <n> frame(s) in <f> file(s); ...`.
 - **Reorg rehearsal.** `asm/tests/reorg_drill <datadir-COPY> --depth N`
   disconnects and reconnects the last N blocks on a copy and requires the
   UTXO walk and tip hash to return to their prior values. It refuses the
