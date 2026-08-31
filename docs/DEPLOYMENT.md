@@ -179,9 +179,11 @@ After=network-online.target
 WorkingDirectory=/path/to/repo/asm
 ExecStart=/path/to/repo/asm/daemon/bitcoind serve /path/to/datadir
 Restart=on-failure
-# Give shutdown time: a flush or compaction can legitimately run long, and a
-# SIGKILL mid-write is exactly how incidents #45 (counter drift) and the
-# original resume-REJECT class were born. The daemon honours SIGTERM.
+# Give shutdown time: a flush can legitimately run long, and a SIGKILL
+# mid-write is exactly how incidents #45 (counter drift) and the original
+# resume-REJECT class were born. The daemon honours SIGTERM. (Compaction no
+# longer holds shutdown up: it runs in a forked child that is killed on stop;
+# its partial output is swept at the next boot and the merge redone.)
 TimeoutStopSec=300
 
 [Install]
@@ -639,3 +641,41 @@ answers `getblockchaininfo`, `getblocktemplate '{"rules":["segwit"]}'`,
 
 Do that diff. This project's entire epistemology is that a claim without an
 oracle comparison is a hope, and that applies to your deployment of it too.
+
+## Catch-up performance (2026-08-31)
+
+Five changes, each benchmarked before/after (numbers in the commit messages
+`a9a2709`, `ff11807`, `a499003`, `cff3a38` and the leveled-compaction commit):
+
+| What | Before -> after | Knob |
+|---|---|---|
+| Compaction I/O buffering | 10.6 s -> 1.7 s per merge of 3M records | -- |
+| Parallel download while running | 1903 s -> 245 s to 10k blocks | `bmc.bootcatchup=0` skips only the boot run |
+| Background compaction | apply stalled for the whole merge (163-326 s on production) -> never waits | -- |
+| Checkpoint batching in catch-up | 46 s -> 17 s (NVMe), 62 s -> 16 s (HDD) for 15k blocks | -- (64 blocks / 2 s far from the tip; per block near it) |
+| Leveled compaction | 22.5x -> 5.3x write amplification on a 500 MB set | `bmc.utxocompactthreshold` (default 12) |
+
+Operational notes:
+
+- **Background compaction** forks a child per merge. It appears as a second
+  `bitcoind` process with the same command line for the duration; killing it
+  is harmless (the merge is redone), but do not run a *second daemon* on the
+  datadir -- match processes by `/proc/PID/exe`, not by name, when checking.
+  Log lines: `compaction of N run(s) [lo..hi) of M started in background pid P`
+  and `background compaction done in Xs: manifest_n A -> B (... flushed
+  meanwhile)`. A merge whose result cannot be reconciled is discarded and
+  logged; nothing is lost.
+- **Checkpoint batching** widens the crash window during catch-up from one
+  block to at most 64. Boot recovery rolls the ghost run back from the undo
+  files before anything else looks at the set (`RECOVERY: rolled back N ghost
+  block(s)`), then re-applies. This is the same path a one-block ghost always
+  took; `tests/test_utxo_ckpt_batch` crashes a child mid-batch to prove it.
+- **`bmc.utxocompactthreshold`** is the number of runs that triggers a
+  compaction (it was parsed and ignored before 2026-08-31). Which runs get
+  merged is decided by size ratio: fresh runs fold into a medium one, the base
+  is rewritten only when everything above it has grown to a quarter of its
+  size. Lowering the threshold makes lookups consult fewer runs at the cost of
+  more frequent small merges; the base rewrite cadence does not change.
+- Orphan run files (a crash between a merge's publish and its unlink, or an
+  abandoned background merge) are swept at boot: `init: swept N orphan
+  file(s)`. The sweep refuses to act unless the manifest file matches memory.
