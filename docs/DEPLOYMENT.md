@@ -889,3 +889,18 @@ reads index-committed frames, so a concurrent append is simply not captured
 and the daemon re-fetches the missing tail on its next boot. Scratch on the
 same NVMe (`data/main-relayout`, 1.1T); the swap happens inside the deploy-m
 stop window; the old blk files are the rollback until the new boot verifies.
+
+## 2026-08-31 (night): anonymity networks live + truthful getnetworkinfo (deploy n)
+
+Tor/I2P/CJDNS were already coded and gated; this round wired production to
+the local daemons (onion=127.0.0.1:9050, torcontrol=9051, i2psam=7656,
+cjdnsreachable=1) and fixed getnetworkinfo, which hardcoded onion/i2p/cjdns
+as unreachable and never listed localaddresses. It now reports the dialer's
+real per-network reachability, the onion service hostname and the i2p b32
+destination (`06cad5b`). The onion service is ephemeral ADD_ONION with a
+persisted key: it exists only while the daemon's tor-control connection is
+open, and creating it takes minutes -- early in a boot the loopback 8334
+listener plus the established 9051 connection are the evidence, not the log.
+cjdroute is hand-run: `sudo cjdroute < /storage/cjdns-rt/cjdroute.conf`.
+
+Console logs are now `logs/<chain>/bitcoin.<chain>.log` for every chain.
