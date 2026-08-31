@@ -63,7 +63,7 @@ static long mk_tx(u8* out, u8 in_tag, u64 invalue, u64 fee, int pad){
 int main(void){
     static u8 pol[128], st[1<<20];
     memset(st, 0, sizeof st);
-    mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+    mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
     /* fixtures are synthetic, deliberately non-standard txs: run under
      * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
      * keeps exercising fee/graph mechanics, not IsStandardTx. */

@@ -679,3 +679,26 @@ Operational notes:
 - Orphan run files (a crash between a merge's publish and its unlink, or an
   abandoned background merge) are swept at boot: `init: swept N orphan
   file(s)`. The sweep refuses to act unless the manifest file matches memory.
+
+## Relay floors, mempool reload and RPC availability (2026-08-31)
+
+- **Relay fee floor follows Core v30.** `minrelaytxfee` and `incrementalrelayfee`
+  now default to `0.000001` BTC/kvB (0.1 sat/vB), Core's
+  `DEFAULT_MIN_RELAY_TX_FEE{100}`. The old default (1 sat/vB, Core <= v29) made
+  this node refuse every transaction its peers relay between 0.1 and 1 sat/vB:
+  the parents were rejected on fee, their children arrived as orphans that
+  could never resolve, and production logged ~99,000 parked / ~98,300 dropped
+  orphans in six hours with only ~1.5 tx/s accepted. Found by feeding a parked
+  orphan's chain root (from a Core signet node's mempool) to our
+  `testmempoolaccept`: "min relay fee not met" at exactly 0.1 sat/vB. Internally
+  the floors are kept in sat/kvB (integer sat/vB could not express 0.1).
+- **RPC comes up before the mempool reload.** `mempool.dat` used to be replayed
+  before the RPC server started, one transaction per download-worker rotation
+  (~2 tx/s): 13 minutes dark for 353 saved transactions on deploy `a`, longer
+  on `b`. The worker now services a stream of submissions without returning to
+  its rotation between them, and the reload runs after the RPC listener is up
+  (`getrawmempool` is briefly partial, as in Core).
+- **The reload is order-independent.** The dump is written in pool order, not
+  parent-before-child; entries rejected for missing inputs are retried in
+  passes until nothing more is admitted (`loaded mempool.dat: ... (N waited
+  for a parent, M of them then accepted)`).

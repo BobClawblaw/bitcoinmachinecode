@@ -240,7 +240,7 @@ int main(void){
     ck("mempool size 0", r && S(r,"size") && !strcmp(S(r,"size"), "0"));
     ck("mempool maxmempool 300MB", r && S(r,"maxmempool") && !strcmp(S(r,"maxmempool"), "300000000"));
     ck("mempool minrelaytxfee (Core field name, not minrelayfee)",
-       r && S(r,"minrelaytxfee") && !strcmp(S(r,"minrelaytxfee"), "0.00001000") && S(r,"minrelayfee")==NULL);
+       r && S(r,"minrelaytxfee") && !strcmp(S(r,"minrelaytxfee"), "0.00000100") && S(r,"minrelayfee")==NULL);
     ck("mempool permitbaremultisig present", r && S(r,"permitbaremultisig") != NULL);
     ck("mempool maxdatacarriersize present", r && S(r,"maxdatacarriersize") && !strcmp(S(r,"maxdatacarriersize"),"100000"));
     rj_free(r);
@@ -396,7 +396,7 @@ int main(void){
                            unsigned char*, unsigned long);
         static unsigned char polcfg[128];
         static unsigned char polstate[1<<22];
-        mpool_policy_init(polcfg, 1, 25, 101000, 25, 101000, 1);
+        mpool_policy_init(polcfg, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
         if (mpool_policy_state_size(4096) > sizeof polstate){ ck("polstate fits", 0); }
         mpool_policy_state_init(polstate, 4096);
 

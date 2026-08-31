@@ -93,7 +93,7 @@ static void world(int nonstd){
     /* Core's default ancestor/descendant limits, deliberately generous: a
      * rejection in these cases must come from TRUC, not from running into
      * the ordinary chain limits. */
-    mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+    mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
     mpool_policy_set_acceptnonstd(pol, nonstd ? 1 : 0);
     mpool_policy_state_init(stbuf, 256);
     mpool_init(mp, 4096, mblob, sizeof mblob);

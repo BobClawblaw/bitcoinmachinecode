@@ -532,7 +532,7 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
  * ~101KB ancestor/descendant byte budgets at 25 count each, BIP125 RBF
  * enabled. Not tuned/load-tested against real mainnet traffic yet -- a
  * reasonable, documented starting point (task #49). */
-#define TXACC_RELAY_FEE_RATE   1ULL
+#define TXACC_RELAY_FEE_RATE   100ULL   /* sat/kvB: Core v30 DEFAULT_MIN_RELAY_TX_FEE (0.1 sat/vB) */
 #define TXACC_MAX_ANC          25u
 #define TXACC_MAX_ANC_BYTES    101000u
 #define TXACC_MAX_DESC         25u
@@ -569,7 +569,7 @@ int tx_policy_init(void){
      * falls back to the compiled defaults if the config layer is absent (a
      * standalone test that never calls node_config_load). */
     extern node_config_t g_cfg;
-    unsigned long long relay = g_cfg.minrelaytxfee_satvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satvb : TXACC_RELAY_FEE_RATE;
+    unsigned long long relay = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : TXACC_RELAY_FEE_RATE;   /* sat/kvB */
     unsigned anc  = g_cfg.limitancestorcount   > 0 ? (unsigned)g_cfg.limitancestorcount   : TXACC_MAX_ANC;
     unsigned ancb = g_cfg.limitancestorsize_kvb> 0 ? (unsigned)(g_cfg.limitancestorsize_kvb*1000) : TXACC_MAX_ANC_BYTES;
     unsigned dsc  = g_cfg.limitdescendantcount > 0 ? (unsigned)g_cfg.limitdescendantcount : TXACC_MAX_DESC;
@@ -581,8 +581,8 @@ int tx_policy_init(void){
       extern void mpool_policy_set_datacarrier(void*, unsigned long long);
       extern void mpool_policy_set_acceptnonstd(void*, unsigned);
       extern void mpool_policy_set_baremultisig(void*, unsigned);
-      if (g_cfg.incrementalrelayfee_satvb > 0)
-          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb);
+      if (g_cfg.incrementalrelayfee_satkvb > 0)
+          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satkvb);   /* sat/kvB */
       if (g_cfg.dustrelayfee_satkvb > 0)
           mpool_policy_set_dust(g_pol, (unsigned long long)g_cfg.dustrelayfee_satkvb);
       /* datacarrier=0 == a zero budget: every OP_RETURN output rejected as

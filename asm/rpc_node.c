@@ -304,7 +304,8 @@ static int cmd_getorphantxs(const rj_val* params, rj_val** res, long* ec, const 
     if (g_status){
         int n = g_status->n_orphans;
         if (n > RPC_MAX_ORPHANS) n = RPC_MAX_ORPHANS;
-        long long now_ms = (long long)time(NULL) * 1000;
+        long long now_ms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);   /* the worker stamps t_ms on this clock */
+                            now_ms = (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
         for (int i = 0; i < n; i++){
             char hx[65];
             for (int b = 0; b < 32; b++)
@@ -517,7 +518,14 @@ static int cmd_net_unsupported(const char* msg, long* ec, const char** em){
  * no pool injected (standalone rpcd, static fallback) they still report the
  * empty pool, exactly as before. */
 #define MEMPOOL_MAXBYTES   300000000LL     /* 300 MB default (config default) */
-#define MEMPOOL_MINFEE_BTC 0.00001000      /* min relay fee, BTC/kvB */
+/* The configured relay floors, sat/kvB; main.c sets them from bitcoin.conf
+ * (rpc_node_set_relay_floors). Defaults are Core v30's: 100 = 0.1 sat/vB. */
+static unsigned long long g_minrelay_satkvb = 100, g_incremental_satkvb = 100;
+void rpc_node_set_relay_floors(unsigned long long minrelay_satkvb, unsigned long long incremental_satkvb){
+    if (minrelay_satkvb) g_minrelay_satkvb = minrelay_satkvb;
+    if (incremental_satkvb) g_incremental_satkvb = incremental_satkvb;
+}
+#define MEMPOOL_MINFEE_BTC ((double)g_minrelay_satkvb / 1e8)      /* min relay fee, BTC/kvB */
 
 static rpc_mempool_hooks g_mph;      /* zeroed = no pool injected */
 
@@ -634,7 +642,7 @@ static int cmd_getmempoolinfo(rj_val** res){
       double eff = dyn_btc > MEMPOOL_MINFEE_BTC ? dyn_btc : MEMPOOL_MINFEE_BTC;
       rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", eff)); }
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
-    rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
     /* the real policy value, not a literal: reporting a setting the
      * operator cannot change was the honesty gap the audit called out */
@@ -1450,7 +1458,14 @@ static int cmd_savemempool(rj_val** res, long* ec, const char** em){
     return 1;
 }
 
-typedef struct { long accepted, rejected; } mpd_import_ctx;
+typedef struct {
+    long accepted, rejected;
+    /* entries rejected for MISSING INPUTS are kept for retry passes: the dump
+     * is written in pool order, not parent-before-child, so a child ahead of
+     * its parent fails on the first pass and succeeds once the parent is in. */
+    unsigned char** retry; unsigned long* retry_len; long nretry, retry_cap;
+    int collecting;
+} mpd_import_ctx;
 static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
                           long long t, long long d){
     (void)t; (void)d;   /* entry time and fee delta are not restorable here --
@@ -1474,9 +1489,42 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SRT_POLL_US;
     }
+    int missing = !ok && strstr((const char*)st->tx_submit_reason, "missing") != NULL;
     pthread_mutex_unlock(&g_submit_lock);
-    if (ok) c->accepted++; else c->rejected++;
+    if (ok) c->accepted++;
+    else if (missing && c->collecting){
+        if (c->nretry == c->retry_cap){
+            long ncap = c->retry_cap ? c->retry_cap * 2 : 64;
+            unsigned char** nr = realloc(c->retry, (size_t)ncap * sizeof *nr);
+            unsigned long* nl = realloc(c->retry_len, (size_t)ncap * sizeof *nl);
+            if (!nr || !nl){ free(nr); free(nl); c->rejected++; return 0; }
+            c->retry = nr; c->retry_len = nl; c->retry_cap = ncap;
+        }
+        unsigned char* cp = malloc(len);
+        if (!cp){ c->rejected++; return 0; }
+        memcpy(cp, tx, len); c->retry[c->nretry] = cp; c->retry_len[c->nretry] = len; c->nretry++;
+    } else c->rejected++;
     return 0;                       /* a rejected entry is not a file error */
+}
+/* Re-offer the missing-input rejects until a pass admits nothing more. Each
+ * pass can only shrink the list, so this terminates; in practice 1-2 passes. */
+static long mpd_retry_passes(mpd_import_ctx* c){
+    long passes = 0, gained = 0;
+    c->collecting = 0;
+    while (c->nretry){
+        long n = c->nretry, before = c->accepted;
+        unsigned char** list = c->retry; unsigned long* lens = c->retry_len;
+        c->retry = 0; c->retry_len = 0; c->nretry = c->retry_cap = 0; c->collecting = 1;
+        long rej0 = c->rejected;
+        for (long i = 0; i < n; i++){ mpd_import_one(c, list[i], lens[i], 0, 0); free(list[i]); }
+        free(list); free(lens);
+        passes++; gained += c->accepted - before;
+        c->collecting = 0;
+        if (c->accepted == before){ c->rejected = rej0 + c->nretry; break; }   /* no progress: the rest are real rejects */
+    }
+    for (long i = 0; i < c->nretry; i++) free(c->retry[i]);
+    free(c->retry); free(c->retry_len); c->retry = 0; c->retry_len = 0; c->nretry = 0;
+    return passes ? gained : 0;
 }
 
 /* The load half, likewise shared with the boot path. Returns transactions
@@ -1485,13 +1533,15 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
  * datadir, is the ordinary case. */
 long rpc_node_mempool_load(const char* path){
     if (!g_status_rw) return -1;
-    mpd_import_ctx c = {0, 0};
+    mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
     long r = mempool_dump_read(path ? path : "mempool.dat",
                                mpd_import_one, &c, err, sizeof err);
-    if (r < 0) return -1;
-    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld\n",
-            path ? path : "mempool.dat", c.accepted, c.rejected, r);
+    if (r < 0){ mpd_retry_passes(&c); return -1; }
+    long deferred = c.nretry;
+    long gained = mpd_retry_passes(&c);
+    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted)\n",
+            path ? path : "mempool.dat", c.accepted, c.rejected, r, deferred, gained);
     return c.accepted;
 }
 
@@ -1502,9 +1552,10 @@ static int cmd_importmempool(const rj_val* params, rj_val** res, long* ec, const
     if (!path || !path[0]){ *ec = -8; *em = "filepath is required"; return 0; }
     if (!g_status_rw){
         *ec = -4; *em = "no download worker is attached, so nothing can admit these transactions"; return 0; }
-    mpd_import_ctx c = {0, 0};
+    mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
     long r = mempool_dump_read(path, mpd_import_one, &c, err, sizeof err);
+    mpd_retry_passes(&c);
     if (r < 0){ static char m[200]; snprintf(m, sizeof m, "Unable to import mempool: %s", err[0]?err:"malformed file");
                 *ec = -1; *em = m; return 0; }
     fprintf(stderr, "[rpc] importmempool %s: %ld accepted, %ld rejected of %ld\n",
