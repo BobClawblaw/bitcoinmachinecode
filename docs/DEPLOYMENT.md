@@ -856,3 +856,36 @@ systemctl start bmc-bitcoind
 The unit's ExecStart still passes the datadir root; the cookie moves to
 `data/main/.cookie` (bitcoin_cli resolves it); log rotation matches
 `logs/*/ *.log` via config/logrotate-bmc.conf.
+
+## 2026-08-31 (evening): relay/policy tail + mainnet archive re-layout
+
+Commit `6b1d07c`, full gate green (gate_tail1, 286 tests), deploy `m`.
+
+**Per-peer notfound memory** (`tx_relay.c`): a peer's notfound for a tx is
+remembered for 10 minutes (fd + 8-byte txid prefix, 512-slot ring). The
+failover picker and the orphan parent fetch skip such peers instead of
+re-asking for an answer already given; a fresh announcement from the same
+peer is still honoured (a new claim, as in Core). Test: relay case 17.
+
+**Taproot witness standardness now matches Core verbatim** (`tx_accept.c`):
+annexed spends are REJECTED (the old code accepted them "conservatively" --
+a real accept/reject divergence), an empty control block is refused, and for
+tapscript leaves (control[0] & 0xfe == 0xc0) stack items below script+control
+are capped at 80 bytes. Key-path spends and non-tapscript leaves are not
+judged. Seven new gated cases.
+
+**Cluster measured post-eviction** (`bitcoin_mempool_policy.c`): the 64/101kvB
+cluster walk skips members of the RBF eviction set, so a replacement is
+judged against the diagram it creates -- thinning a full cluster is no longer
+refused for the very size it frees. Gated RBF scenario proves it.
+
+**Testing trap for the suite's okv() macro**: it evaluates its condition
+TWICE (printf + count). A call with side effects inside okv() prints "ok"
+and still counts a failure -- hoist the call, pass a variable.
+
+**Mainnet archive re-layout**: same height-order rewrite the signet archive
+got (tool_archive_relayout), run HOT against the live daemon -- the tool only
+reads index-committed frames, so a concurrent append is simply not captured
+and the daemon re-fetches the missing tail on its next boot. Scratch on the
+same NVMe (`data/main-relayout`, 1.1T); the swap happens inside the deploy-m
+stop window; the old blk files are the rollback until the new boot verifies.
