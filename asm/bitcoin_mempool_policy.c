@@ -215,6 +215,12 @@ static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)s
 
 /* an optional "forget this txid" callback (daemon/mempool_cfg.c clears its
  * arrival-time table with it); NULL in the standalone tests */
+/* bytespersigop (Core DEFAULT_BYTES_PER_SIGOP 20): a sigop-dense transaction
+ * pays fees as if it were max(vsize, sigop_cost*5) vbytes. The accept caller
+ * computes the cost BEFORE admission and parks it here for the next
+ * mpol_accept; consumed once. */
+static uint64_t mpol_pending_sigops;
+void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_sigops = cost_x4; }
 static void (*g_forget_cb)(const unsigned char txid[32]) = 0;
 void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb = fn; }
 
@@ -857,6 +863,9 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     { uint64_t eff_fee   = g_pkg_vsize ? g_pkg_fee   : fee;
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
       /* min relay floor over VSIZE (Core "min relay fee not met") */
+      /* sigop-adjusted virtual size (Core GetVirtualTransactionSize with
+       * bytespersigop=20): max(vsize, sigop_cost*5) */
+      { uint64_t sv = mpol_pending_sigops * 5; if (sv > eff_vsize) eff_vsize = sv; mpol_pending_sigops = 0; }
       if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
@@ -984,6 +993,50 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     uint64_t anc_bytes = vsize;
     for (uint32_t k=0;k<n_anc;k++) anc_bytes += t[anc_list[k]].size;
 
+    /* Core v31 accepts by CLUSTER: the connected component this tx joins may
+     * not exceed 64 transactions / 101 kvB (too-large-cluster). Our
+     * ancestor/descendant limits miss wide shapes (64 independent parents,
+     * one child = cluster 65 with anc_cnt 64). BFS over the union of the
+     * parents' clusters, bounded: the walk stops the moment it exceeds the
+     * limits. Children are found by scanning parent links, the same pattern
+     * collect_descendant_txids uses; the visited set caps at 65 nodes. */
+    if (n_par > 0){
+        enum { CLUSTER_LIMIT = 64, CLUSTER_SIZE_LIMIT = 101000 };
+        mpol_node* t = mpol_nodes_base(st);
+        uint32_t nn = *(uint32_t*)((char*)st+16);
+        uint32_t seen[CLUSTER_LIMIT + 1]; int nseen = 0;
+        uint32_t bfs[CLUSTER_LIMIT + 1]; int sp = 0;
+        uint64_t cl_bytes = 0; int too_big = 0;
+        /* seed from EVERY in-pool parent, not the MPOL_MAX_PARENTS(24)-capped
+         * par_idx: a 64-input child is exactly the wide shape this exists
+         * to refuse */
+        for (int i = 0; i < n_in && !too_big; i++){
+            int p = find_node(st, prev[i]);
+            if (p < 0) continue;
+            uint32_t pi = (uint32_t)p; int dup = 0;
+            for (int q = 0; q < nseen; q++) if (seen[q] == pi){ dup = 1; break; }
+            if (dup) continue;
+            if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
+            seen[nseen++] = pi; bfs[sp++] = pi; cl_bytes += t[pi].size;
+        }
+        while (sp > 0 && !too_big){
+            uint32_t cur = bfs[--sp];
+            for (uint32_t i = 0; i < nn && !too_big; i++){
+                int linked = 0;
+                for (uint32_t k = 0; k < t[i].n_parents; k++) if (t[i].parent[k] == cur){ linked = 1; break; }
+                if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (t[cur].parent[k] == i){ linked = 1; break; }
+                if (!linked) continue;
+                int dup = 0;
+                for (int q = 0; q < nseen; q++) if (seen[q] == i){ dup = 1; break; }
+                if (dup) continue;
+                if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
+                seen[nseen++] = (uint32_t)i; bfs[sp++] = (uint32_t)i; cl_bytes += t[i].size;
+            }
+        }
+        if (too_big || (uint64_t)nseen + 1 > CLUSTER_LIMIT || cl_bytes + vsize > CLUSTER_SIZE_LIMIT){
+            _mpol_last_reason = "too-large-cluster"; return 0;
+        }
+    }
     if (anc_cnt > pol->max_anc){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
     if (anc_bytes > pol->max_anc_bytes){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
     for (uint32_t k=0;k<n_anc;k++){
