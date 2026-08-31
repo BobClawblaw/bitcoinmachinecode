@@ -47,6 +47,8 @@ extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
 extern long txrelay_stats(long*, long*, long*, long*, long*, long*);
 extern long txrelay_notfound_count(void);
 extern void txrelay_test_set_req_ttl_ms(long long ms);
+extern int  txrelay_replies_pending(int fd);
+extern void txrelay_test_set_pending_ttl_ms(long long ms);
 extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
 extern long tx_accept_block_connect(void* mp_area, const unsigned char* block, unsigned long blen);
 #include "../daemon/addrbook.h"
@@ -680,6 +682,29 @@ int main(void){
         long rf1; txrelay_stats2(&a,&b,&c,&d,&e,&rf1);
         ck("...and counted as a re-request after timeout", rf1 == rf0 + 1);
         txrelay_test_set_req_ttl_ms(60000);
+    }
+    printf("\n== 15: replies owed to a leg are remembered, so the sync pass can wait ==\n");
+    {
+        drain_peer(spX[1]);
+        /* case 14 left a request outstanding on purpose; let it expire first */
+        txrelay_test_set_pending_ttl_ms(1); { struct timespec t0 = {0, 5*1000*1000}; nanosleep(&t0, NULL); }
+        ck("an old unanswered request has expired: nothing pending at rest", !txrelay_replies_pending(spX[0]));
+        txrelay_test_set_pending_ttl_ms(1500);
+        u8 ghost[32]; memset(ghost, 0xD5, 32);
+        send_inv1(spX[1], ghost); txrelay_poll_leg(spX[0], mp_area, 50);
+        drain_peer(spX[1]);
+        ck("a getdata with no reply yet: pending", txrelay_replies_pending(spX[0]));
+        ck("a second poll keeps waiting for it (carried across polls)", txrelay_poll_leg(spX[0], mp_area, 50) == 0 && txrelay_replies_pending(spX[0]));
+        txrelay_test_set_pending_ttl_ms(50);
+        struct timespec ts = {0, 80*1000*1000}; nanosleep(&ts, NULL);
+        ck("...but gives up after the pending TTL", !txrelay_replies_pending(spX[0]));
+        txrelay_test_set_pending_ttl_ms(1500);
+        u8 g2[32]; memset(g2, 0xD6, 32);
+        send_inv1(spX[1], g2); txrelay_poll_leg(spX[0], mp_area, 50); drain_peer(spX[1]);
+        ck("pending again after a new request", txrelay_replies_pending(spX[0]));
+        u8 nf[37]; nf[0]=1; nf[1]=1; nf[2]=0; nf[3]=0; nf[4]=0x40; memcpy(nf+5, g2, 32);
+        p2p_write(spX[1], "notfound", 8, nf, 37); txrelay_poll_leg(spX[0], mp_area, 50);
+        ck("the reply (here a notfound) clears it", !txrelay_replies_pending(spX[0]));
     }
     close(spX[0]); close(spX[1]);
 
