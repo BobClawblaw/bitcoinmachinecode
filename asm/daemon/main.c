@@ -978,10 +978,52 @@ static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
 /* Cross-process spinlock around the shared table. Held for a handful of
  * string compares, never across I/O, so spinning is cheaper than any
  * alternative and cannot deadlock a child against itself. */
+/* The misbehaviour table's cross-process lock.
+ *
+ * It used to be an UNBOUNDED spin on a 0/1 flag with no record of who held it:
+ *
+ *     while (__sync_lock_test_and_set(&st->mis_lock, 1)) nanosleep(1ms);
+ *
+ * This daemon forks a serve child per inbound connection, and every one of
+ * them scores misbehaviour into this shared table. If any holder DIES while
+ * holding it -- the OOM killer, a crash, an operator's kill -9 -- the flag
+ * stays 1 forever and every surviving process wedges permanently the next time
+ * it scores a peer. There is no recovery short of a restart, and nothing says
+ * what happened.
+ *
+ * That is not hypothetical: it happened on 2026-08-31, when a stale co-resident
+ * daemon was SIGKILLed and the survivor stopped applying blocks on the spot,
+ * silently, while still answering RPC.
+ *
+ * So the lock now HOLDS THE OWNER'S PID instead of 1 (0 = free), and a waiter
+ * that has spun for ~2s checks whether that pid still exists. If it does not,
+ * it reclaims the lock and says so. Stealing is safe here in a way it would
+ * not be for a general lock: the protected data is a fixed 64-slot array of
+ * {score, ip} with no pointers and no allocation, so the worst case of a
+ * reclaim mid-update is one garbled misbehaviour score -- a heuristic that is
+ * already approximate -- rather than a corrupted structure.
+ *
+ * The pid fits: mis_lock is an int and this is Linux, where pid_max is well
+ * under INT_MAX. */
 static void mis_lock_acquire(node_status_t* st){
-    while (__sync_lock_test_and_set(&st->mis_lock, 1)) {
+    const int me = (int)getpid();
+    for (int spins = 0; ; spins++) {
+        if (st->mis_lock == 0 &&
+            __sync_bool_compare_and_swap(&st->mis_lock, 0, me)) return;
         struct timespec ts = { 0, 1000 * 1000 };   /* 1 ms */
         nanosleep(&ts, NULL);
+        if (spins >= 2000) {                        /* ~2s of contention */
+            int owner = st->mis_lock;
+            if (owner != 0 && owner != me &&
+                kill((pid_t)owner, 0) != 0 && errno == ESRCH) {
+                if (__sync_bool_compare_and_swap(&st->mis_lock, owner, me)) {
+                    fprintf(stderr, "[ban] misbehaviour lock was held by dead "
+                                    "pid %d -- reclaimed\n", owner);
+                    return;
+                }
+            }
+            spins = 0;                              /* live holder: keep waiting */
+        }
     }
 }
 static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lock); }
@@ -1009,6 +1051,11 @@ static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lo
  * tracked, and that remains a gap worth closing separately. */
 static char g_cur_peer_ip[64];
 extern void (*g_serve_violation_hook)(const char*);
+/* Declared, because it is DEFINED below this call. Without it C assumes
+ * `int peer_misbehaving()` with unspecified arguments -- which happens to work
+ * for these types under the SysV ABI, which is exactly why the warning had
+ * been ignored. It is a warning about a real missing prototype. */
+int peer_misbehaving(const char* ip, int points, const char* reason);
 static void serve_violation_report(const char* reason){
     if(!g_cur_peer_ip[0]) return;
     peer_misbehaving(g_cur_peer_ip, 100, reason ? reason : "protocol violation");
