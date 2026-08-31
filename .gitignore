@@ -409,3 +409,4 @@ asm/daemon/bitcoind.live
 bitcoin.conf
 config/bitcoin.conf
 asm/.link-audit-cache/
+asm/tests/tool_*
