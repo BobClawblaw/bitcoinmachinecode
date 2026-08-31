@@ -61,6 +61,12 @@ typedef struct {
                                     link dependency, it is compiled into many
                                     tools that never select a chain).        */
     int  listen;                 /* Core -listen                             */
+    /* bmc.bootcatchup: run the parallel downloader (dl_catchup) synchronously
+     * at boot when the archive is behind the header chain. Default 1. 0 skips
+     * it, leaving the running worker's far-behind trigger to do the same job
+     * later -- which is what the trigger's live test needs, and what an
+     * operator wants when a fast restart matters more than a full archive. */
+    int  boot_catchup;
     int  addrindex;              /* EXTENSION (no Core equivalent): live
                                     address index, daemon/addr_index_tail.c.
                                     Default 0; must be on before IBD.        */
