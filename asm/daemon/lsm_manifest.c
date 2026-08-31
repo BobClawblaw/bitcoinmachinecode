@@ -94,14 +94,17 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
     if (cn < 1){ free(c); return -1; }
     const unsigned char* cur = (const unsigned char*)lst->manifest_buf;
     /* the child's manifest = [merged] + the non-input runs it saw at fork:
-     * the merged run must be new to us, every other entry must still be
-     * ours, and no input may survive in it. */
-    uint64_t merged; memcpy(&merged, c + 8, 8);
-    int bad = in_list(cur, lst->manifest_n, merged) || in_inputs(inputs, k, merged);
-    for (uint64_t i = 1; i < cn && !bad; i++){
+        /* the merged run is the one child entry we do not know; every other
+     * entry must be ours, and none may be an input. (Leveled: the merged
+     * run sits wherever the batch began, not necessarily at index 0.) */
+    int unknown = 0, bad = 0; uint64_t merged = 0;
+    for (uint64_t i = 0; i < cn && !bad; i++){
         uint64_t r; memcpy(&r, c + i*16 + 8, 8);
-        if (!in_list(cur, lst->manifest_n, r) || in_inputs(inputs, k, r)) bad = 1;
+        if (in_inputs(inputs, k, r)) bad = 1;
+        else if (!in_list(cur, lst->manifest_n, r)){ unknown++; merged = r; }
     }
+    if (unknown != 1) bad = 1;
+    (void)merged;
     for (int i = 0; i < k && !bad; i++) if (!in_list(cur, lst->manifest_n, inputs[i])) bad = 1;
     if (bad){ free(c); return -1; }
     /* union: child's list, then whatever we flushed since fork (in our order) */
@@ -164,4 +167,13 @@ int lsm_manifest_sweep_orphans(const struct lsm_state* lst){
     }
     closedir(d);
     return gone;
+}
+
+long lsm_compact_pick(const uint64_t* sizes, long n, long threshold, long max_k, long* lo){
+    if (n < 2 || n < threshold) return 0;
+    long l = n - 1; uint64_t acc = sizes[l];
+    while (l > 0 && sizes[l-1] <= (uint64_t)LSM_COMPACT_RATIO * acc){ acc += sizes[l-1]; l--; }
+    if (n - l > max_k) l = n - max_k;
+    if (n - l < 2) return 0;
+    *lo = l; return n - l;
 }

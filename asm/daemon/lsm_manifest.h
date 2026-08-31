@@ -43,4 +43,16 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
  * match lst's in-memory entries byte for byte, else nothing is touched and -1
  * is returned -- a sweep against an unloaded state would delete the store. */
 int lsm_manifest_sweep_orphans(const struct lsm_state* lst);
+/* Leveled compaction's choice. sizes[i] = bytes of manifest entry i (oldest
+ * first). Walking from the newest run backwards, a run joins the batch while
+ * it is at most LSM_COMPACT_RATIO times everything newer than it combined;
+ * the first run that dwarfs the rest stops the walk. So small fresh runs fold
+ * into a medium one, the medium joins once the smalls catch up to a quarter
+ * of it, and the base is rewritten only when everything above it has grown
+ * to a quarter of the base -- write amplification ~ratio per level instead
+ * of ~base/flush. Returns k (0 = nothing to do) and *lo. Never more than
+ * max_k runs (the asm's slot cap), never fewer than 2; below `threshold`
+ * runs nothing is picked. */
+#define LSM_COMPACT_RATIO 4
+long lsm_compact_pick(const uint64_t* sizes, long n, long threshold, long max_k, long* lo);
 #endif
