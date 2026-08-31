@@ -188,6 +188,7 @@ static void set_defaults(void){
     g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
     g_cfg.signetchallenge[0]    = 0;
+    g_cfg.boot_catchup          = 1;
     g_cfg.rpcbind[0]            = 0;
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
@@ -581,6 +582,7 @@ long node_config_load(const char* path){
                 snprintf(g_cfg.onlynet[g_cfg.n_onlynet],8,"%s",val);
                 g_cfg.n_onlynet++; applied++;
             } else fprintf(stderr,"[config] onlynet: at most 6 networks\n"); }
+        else if(!strcmp(key,"bmc.bootcatchup")){ g_cfg.boot_catchup = iv ? 1 : 0; applied++; }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
         else if(!strcmp(key,"prune")){

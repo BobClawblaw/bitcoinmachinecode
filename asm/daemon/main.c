@@ -3407,6 +3407,36 @@ static int txsub_package(char* msg, unsigned long mcap){
     return committed;
 }
 
+/* ---- far-behind trigger for the RUNNING node ---------------------------------
+ * dl_catchup (headers-first + a pool of chunk workers) used to run only at
+ * boot. A node that falls far behind while running -- a long outage, a slow
+ * link, a boot that skipped it -- was left to the worker's legs, which fetch
+ * one block per round trip on one peer at a time (~6 blocks/s measured on
+ * signet, against ~50 for the parallel path on the same segment).
+ *
+ * The decision is a pure function so it can be tested without a network:
+ *   - the best height any live outbound peer announced is at least
+ *     DL_PARALLEL_GAP blocks past the archive tip (peers' start_height is
+ *     what they claimed at handshake; a lying peer costs one wasted run of a
+ *     downloader that verifies every block anyway);
+ *   - the node is not apply-bound (backlog under DL_APPLY_FIRST_BACKLOG --
+ *     otherwise downloading more is pointless, see APPLY FIRST);
+ *   - at least DL_PARALLEL_REARM_S since the last run, so a peer set that
+ *     keeps announcing heights it cannot serve does not spin us.
+ * dl_catchup is synchronous and holds the worker for its duration; the legs
+ * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
+#define DL_PARALLEL_GAP      2000L
+#define DL_PARALLEL_REARM_S  600L
+static int g_catchup_workers = 16;
+static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
+                                    long apply_backlog, long long now_s, long long last_run_s){
+    if(best_peer_height <= 0 || archive_tip < 0) return 0;
+    if(best_peer_height - archive_tip < DL_PARALLEL_GAP) return 0;
+    if(apply_backlog > DL_APPLY_FIRST_BACKLOG) return 0;
+    if(last_run_s && now_s - last_run_s < DL_PARALLEL_REARM_S) return 0;
+    return 1;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -3868,6 +3898,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * full interval. */
     long long next_reorg_probe_ms = 0;
     int apply_first_prev = 0;
+    long long dl_parallel_last_s = 0;
     for(;;){
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
@@ -4269,6 +4300,24 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(ah >= 0) apply_backlog = (long)(*(int*)(store_buf+24)) - ah;
         }
         int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
+        {
+            long best = 0;
+            if(g_node_status)
+                for(int i=0;i<mux_n_out && i<RPC_MAX_PEERS;i++)
+                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > best)
+                        best = g_node_status->peers[i].start_height;
+            long atip = (long)(*(int*)(store_buf+24));
+            long long nows = (long long)time(NULL);
+            if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
+                fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
+                        atip, best, best-atip, g_catchup_workers);
+                dl_parallel_last_s = nows;
+                long got = dl_catchup(dir, g_catchup_workers);
+                store_reload(store_buf);
+                fprintf(stderr,"[dl] parallel downloader wrote %ld block(s); archive now %d\n", got, *(int*)(store_buf+24));
+                continue;                  /* re-evaluate: apply-first will take over */
+            }
+        }
         if(apply_first != apply_first_prev){
             fprintf(stderr, apply_first
                 ? "[dl] %ld blocks on disk ahead of the UTXO set -- applying before syncing legs\n"
@@ -6013,7 +6062,9 @@ int main(int argc, char** argv){
          * same time). Self-throttling: a caught-up node returns almost
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
-        long caught = dl_catchup(dir, catchup_workers);
+        g_catchup_workers = catchup_workers;   /* the running worker re-uses it */
+        long caught = g_cfg.boot_catchup ? dl_catchup(dir, catchup_workers) : 0;
+        if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
                 caught, phase_elapsed(&catchup_pt));
         if(caught>0){
