@@ -14,6 +14,7 @@
  * validation/gen_taproot_vectors.py + asm/tests/test_taproot_sighash.c).
  */
 #include <stdint.h>
+#include "bitcoin_taproot_ctx.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -729,30 +730,8 @@ int tapscript_checksig_annex(const uint8_t* sig, int siglen, const uint8_t* pubk
  * ctx points at a taproot_checksig_ctx (below). Publen is 0 for 'empty pubkey'
  * (CHECKSIGADD null entry); siglen 0 means 'no signature'.
  */
-typedef struct {
-    const uint8_t* tx;    int64_t txlen;
-    int64_t n_in;
-    const uint8_t* prevouts;
-    const uint8_t* amounts;
-    const uint8_t* spks;
-    int64_t num_inputs;
-    const uint8_t* tapleaf;   /* 32 bytes */
-    uint32_t codesep_pos;
-    const uint8_t* annex;     /* optional witness annex, or NULL */
-    uint64_t annexlen;
-    /* BIP342 sigops/witness-size validation-weight budget (Core's
-     * VALIDATION_WEIGHT_PER_SIGOP_PASSED / VALIDATION_WEIGHT_OFFSET, both
-     * 50, script/script.h). The caller (taproot_verify_input) initializes
-     * this to ser_size(full original witness) + 50, then this function
-     * decrements it by 50 on every invocation with a non-empty signature --
-     * the asm interpreter's interp_checksig/interp_checksig_add already
-     * gate the call itself on siglen!=0, so every actual call here is
-     * exactly Core's qualifying "success = !sig.empty()" case. Going
-     * negative fails the whole tapscript, matching Core's
-     * EvalChecksigTapscript exactly. Mutated in place: this ctx is
-     * per-verify-call, never shared/reused, so no locking needed. */
-    int64_t weight_left;
-} taproot_checksig_ctx;
+/* taproot_checksig_ctx now lives in bitcoin_taproot_ctx.h, shared with the
+ * tests that construct it -- see the note there. */
 
 uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
                              const uint8_t* pub, size_t publen,
@@ -769,16 +748,48 @@ uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
      * outside the interpreter). */
     const struct { const uint8_t* p; size_t n; uint64_t codesep_pos; }* sl = slice;
     uint32_t codesep_pos = sl ? (uint32_t)sl->codesep_pos : c->codesep_pos;
-    if (siglen == 0) return 0;                     /* no signature provided */
-    c->weight_left -= 50;
-    if (c->weight_left < 0) return 0;               /* BIP342 validation-weight budget exceeded */
-    if (publen != 32) return 0;                    /* x-only pubkey required */
+    /* BIP342, in Core's order (EvalChecksigTapscript). `success` is simply
+     * "a signature was supplied"; the pubkey-size rules are evaluated
+     * REGARDLESS of it, which is why the empty-signature case cannot return
+     * early here. */
+    int success = (siglen != 0);
+    if (success) {
+        c->weight_left -= 50;
+        if (c->weight_left < 0) { c->hard_fail = 1; return 0; }  /* budget exceeded */
+    }
+
+    if (publen == 0) {
+        /* Core: SCRIPT_ERR_PUBKEYTYPE -- the script is invalid, not false. */
+        c->hard_fail = 1;
+        return 0;
+    }
+
+    if (publen != 32) {
+        /* UNKNOWN PUBLIC KEY TYPE, and this is the taproot upgrade path, not
+         * an error: BIP342 says verification SUCCEEDS if the signature is
+         * non-empty. Core only rejects it under
+         * SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE, which is a POLICY
+         * flag and is absent from block validation.
+         *
+         * Rejecting here was a FALSE REJECT that stalled a real signet sync
+         * at height 109788, on a `OP_1 OP_CHECKSIG` tapscript whose pubkey is
+         * the 1-byte value 0x01. Found by running the chain; no test here
+         * covered a non-32-byte tapscript pubkey. */
+        return success ? 1 : 0;
+    }
+
+    if (!success) return 0;                        /* empty sig: push false */
+
     int r = tapscript_checksig_annex(sig, (int)siglen, pub,
                                      c->tx, c->txlen, c->n_in,
                                      c->prevouts, c->amounts, c->spks,
                                      c->num_inputs, c->tapleaf,
                                      codesep_pos, c->annex, c->annexlen, NULL);
-    return (uint64_t)r;
+    /* A non-empty signature that does not verify is an ERROR in Core, not a
+     * false result -- CheckSchnorrSignature failing returns false from
+     * EvalChecksigTapscript. */
+    if (!r) { c->hard_fail = 1; return 0; }
+    return 1;
 }
 
 /* ============================================================================
@@ -1071,7 +1082,11 @@ int taproot_verify_input(const uint8_t* spk,
     for (uint32_t i = 0; i < nwit; i++) weight_left += cs_size(witlen[i]) + (int64_t)witlen[i];
     weight_left += 50;
 
-    taproot_checksig_ctx ctx;
+    /* ZERO-INITIALISED. It is filled field by field below, so a field added
+     * later (hard_fail was) would otherwise hold stack garbage -- and this one
+     * decides whether a block is valid. The same omission in rpc_server_cfg
+     * caused undefined behaviour earlier today. */
+    taproot_checksig_ctx ctx = {0};
     ctx.tx = tx; ctx.txlen = txlen; ctx.n_in = n_in;
     ctx.prevouts = prevouts; ctx.amounts = amounts; ctx.spks = spks;
     ctx.num_inputs = num_inputs; ctx.tapleaf = leaf_hash; ctx.codesep_pos = 0xffffffffu;
@@ -1125,6 +1140,9 @@ int taproot_verify_input(const uint8_t* spk,
     st.checksig_fn  = taproot_checksig_fn;
 
     if (!script_eval(&st)) { *reason = "p2tr tapscript execution failed"; return 0; }
+    /* A checksig that set hard_fail invalidates the script even if the stack
+     * happens to end truthy -- see taproot_checksig_ctx.hard_fail. */
+    if (ctx.hard_fail) { *reason = "p2tr tapscript checksig invalid"; return 0; }
     /* script_eval returning 1 already means the interpreter's own
      * SIGVERSION_TAPSCRIPT-specific cleanstack/empty-result rule (exactly
      * one truthy element left) passed -- nothing further to check here. */
