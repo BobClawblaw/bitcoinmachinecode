@@ -97,8 +97,8 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
 #define TRUC_ANCESTOR_LIMIT    2
 #define TRUC_DESCENDANT_LIMIT  2
 #define MPOL_PKG_MAX     128      /* descendant-set walk bound: desc_cnt is
-                                   * capped at max_desc (25) by admission, so
-                                   * 128 is comfortable headroom */
+                                   * capped at max_desc (64 by default) by admission,
+                                   * so 128 is comfortable headroom */
 
 /* ---- package effective-feerate context ----------------------------------
  * Set for the duration of ONE package submission, by the worker, which is
@@ -1306,6 +1306,11 @@ extern int tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long
                    unsigned char* scratch, unsigned long scratch_cap)
     __attribute__((weak));
 
+/* Every txid a connected block carries is reported here (tx_accept keeps a
+ * rolling set of them: a tx that arrives over p2p after it confirmed is
+ * "already known", not an orphan -- Core's m_recent_confirmed_transactions). */
+static void (*mpol_confirmed_hook)(const unsigned char*) = 0;
+void mpool_policy_set_confirmed_hook(void (*fn)(const unsigned char*)){ mpol_confirmed_hook = fn; }
 long mpool_policy_block_connect(void* st, void* mp,
                                 const unsigned char* block, unsigned long blen){
     if (!tx_parse || !tx_txid) return -1;
@@ -1324,6 +1329,7 @@ long mpool_policy_block_connect(void* st, void* mp,
         unsigned char txid[32];
         /* a txid we could not compute must not be used to evict anything */
         if (tx_txid(txid, p, (unsigned long)txlen, scratch, sizeof scratch) != 1) return removed;
+        if (mpol_confirmed_hook) mpol_confirmed_hook(txid);
         if (j > 0){
             /* the confirmed tx leaves alone; txs CONFLICTING with its spends
              * leave with their descendants */
