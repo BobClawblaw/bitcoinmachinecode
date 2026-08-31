@@ -836,3 +836,23 @@ and pruning can run. Run it offline (daemon stopped).
 (2M by default) is THE knob. `copytruncate` keeps systemd's append fd valid;
 60 compressed rotations are kept in `logs/`. The 84.7 MB log that prompted
 this was rotated on install.
+
+## Datadir layout (2026-08-31): every chain in its own subdirectory
+
+`chainparams_datadir` now returns `<datadir>/<chain>` for EVERY chain --
+`data/main/`, `data/signet/`, ... -- instead of Core's mainnet-at-the-root.
+No block files live at the datadir top level any more. The daemon's own
+leveled log is `<chaindir>/logs/bitcoind.log` (per-chain by location; the old
+`.chain.` suffix is gone), and the repo `logs/` directory houses the
+service-level logs per chain (`logs/main/bitcoind.production.log`, signet
+consoles under `logs/signet/`). Migration for an existing mainnet datadir,
+BEFORE first boot of a build with this:
+
+```
+systemctl stop bmc-bitcoind
+cd /storage/bitcoinmachinecode/data && mkdir -p main && mv $(ls | grep -v '^main$') main/
+systemctl start bmc-bitcoind
+```
+The unit's ExecStart still passes the datadir root; the cookie moves to
+`data/main/.cookie` (bitcoin_cli resolves it); log rotation matches
+`logs/*/ *.log` via config/logrotate-bmc.conf.

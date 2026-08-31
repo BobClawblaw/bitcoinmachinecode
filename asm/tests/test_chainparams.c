@@ -138,7 +138,9 @@ int main(void){
     { char out[256];
       mkdir("/tmp/bmc-cp-test", 0755);   /* parent for the subdir mkdir */
       chainparams_datadir("/tmp/bmc-cp-test", out, sizeof out);
-      ck("main datadir is the base itself", !strcmp(out, "/tmp/bmc-cp-test"));
+      struct stat sbm;
+      ck("main datadir is base/main and was created (every chain in its own subdir)",
+         !strcmp(out, "/tmp/bmc-cp-test/main") && stat(out, &sbm) == 0 && S_ISDIR(sbm.st_mode));
       chainparams_select("regtest");
       chainparams_datadir("/tmp/bmc-cp-test", out, sizeof out);
       struct stat sb;

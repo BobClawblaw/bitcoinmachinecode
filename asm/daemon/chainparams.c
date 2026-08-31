@@ -338,11 +338,14 @@ int chainparams_select(const char* name){
 }
 
 const char* chainparams_datadir(const char* base, char* out, long cap){
-    if (g_chainp->id == CHAIN_MAIN)
-        snprintf(out, (size_t)cap, "%s", base);
-    else {
-        snprintf(out, (size_t)cap, "%s/%s", base, g_chainp->name);
-        mkdir(out, 0755);   /* EEXIST is the normal case */
-    }
+    /* EVERY chain gets its own subdirectory, main included (2026-08-31).
+     * Core keeps mainnet at the datadir root; that layout left mainnet's
+     * 8,000+ block files strewn across the datadir top level with the
+     * shared bits, and one mis-set -chain wrote into another chain's
+     * files. base/<name> for all of them, uniformly. Existing mainnet
+     * datadirs migrate by `mkdir main && mv` before the first boot of a
+     * build with this (docs/DEPLOYMENT.md "Datadir layout"). */
+    snprintf(out, (size_t)cap, "%s/%s", base, g_chainp->name);
+    mkdir(out, 0755);   /* EEXIST is the normal case */
     return out;
 }
