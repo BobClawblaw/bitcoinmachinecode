@@ -8,6 +8,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <errno.h>
+#include <poll.h>
+#include <fcntl.h>
 
 /* ---------------- base64 (RFC 4648) for HTTP Basic auth ---------------- */
 static void base64_encode(const char* in, size_t n, char* out) {
@@ -77,7 +81,21 @@ static int sock_connect_loopback(int port) {
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr*)&a, sizeof a) < 0) { close(fd); return -1; }
+    /* client-side timeouts (2026-08-31): a stuck server used to hang the CLI
+     * forever -- a timeout-less bitcoin_cli deadlocked a whole diagnostic
+     * sweep. 10 s to connect, 60 s per read/write. */
+    { struct timeval tv = { 60, 0 };
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+    { int fl = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+      int cr = connect(fd, (struct sockaddr*)&a, sizeof a);
+      if (cr < 0 && errno == EINPROGRESS){
+          struct pollfd pf = { fd, POLLOUT, 0 };
+          if (poll(&pf, 1, 10000) <= 0){ close(fd); return -1; }
+          int se = 0; socklen_t sl = sizeof se;
+          if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &se, &sl) != 0 || se != 0){ close(fd); return -1; }
+      } else if (cr < 0){ close(fd); return -1; }
+      fcntl(fd, F_SETFL, fl); }
     return fd;
 }
 
