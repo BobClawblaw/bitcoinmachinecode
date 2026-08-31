@@ -49,6 +49,7 @@
 #include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "netperm.h"   /* -whitelist peer permissions */
 #include "subnet.h"    /* one CIDR matcher, shared with the ban list */
+#include "rpc_acl.h"   /* -rpcallowip / -rpcbind */
 #include "v2transport.h"  /* BIP324 v2 encrypted transport */
 #include "wallet_pass.h"   /* wallet passphrase source (audit finding 2) */
 #include "chainparams.h" /* runtime chain selection (main / regtest)   */
@@ -4748,13 +4749,40 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     { static unsigned char rescan_buf[4*1024*1024];   /* one max-size block */
       rpc_wops_set_scanner(rpc_chain_read_block_at, rescan_buf, (long)sizeof rescan_buf,
                            rpc_chain_tip_height); }
-    rpc_server_cfg cfg; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
+    /* Core InitHTTPAllowList: 127.0.0.0/8 and ::1 are always allowed, then
+     * each -rpcallowip. A malformed subnet is fatal there and here -- an ACL
+     * typo that silently allows LESS is a support call; one that silently
+     * allows MORE is an incident, and refusing avoids having to work out
+     * which happened. */
+    rpc_acl_reset();
+    for(int i = 0; i < g_cfg.n_rpcallowip; i++){
+        if(!rpc_acl_add(g_cfg.rpcallowip[i])){
+            fprintf(stderr, "[rpc] FATAL: rpcallowip=%s is not a valid address "
+                            "or subnet -- refusing to start\n", g_cfg.rpcallowip[i]);
+            exit(1);
+        }
+    }
+    const char* bindaddr = g_cfg.rpcbind;
+    if(bindaddr[0] && rpc_acl_configured() == 0){
+        /* Core httpserver.cpp:225, verbatim in intent. */
+        fprintf(stderr, "[rpc] Option -rpcbind was ignored because -rpcallowip "
+                        "was not specified, refusing to allow everyone to connect\n");
+        bindaddr = "";
+    }
+    if(rpc_acl_configured() > 0)
+        fprintf(stderr, "[rpc] allow list: loopback + %d configured subnet(s); "
+                        "binding %s\n", rpc_acl_configured(),
+                        bindaddr[0] ? bindaddr : "127.0.0.1 (loopback)");
+
+    rpc_server_cfg cfg = {0}; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
+    cfg.bind_addr = bindaddr; cfg.allows = rpc_acl_allows;
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
         return;
     }
-    fprintf(stderr, "[rpc] JSON-RPC server on 127.0.0.1:%d (live-node + chain, user=%s)\n", actual, user);
+    fprintf(stderr, "[rpc] JSON-RPC server on %s:%d (live-node + chain, user=%s)\n",
+            bindaddr[0] ? bindaddr : "127.0.0.1", actual, user);
     /* -rpccookiefile, else <datadir>/.cookie -- Core's default auth method.
      * The daemon has already chdir'd into the (per-chain) datadir, so the
      * bare relative name lands in the right place on every chain. */
