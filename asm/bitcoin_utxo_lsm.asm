@@ -245,7 +245,20 @@ COMPACT_MAX_RUNS   equ 64
 ; type(1)+pad(3) value(8) slen(2) height(4) is_coinbase(1)+pad(1) rec_v2(8)
 ; script(up to SCRIPT_MAX_BYTES) -- see mac_compact_read_rec's own header
 ; comment for the exact byte offsets (grown 2026-08-19, Stage D: was 96).
-COMPACT_SLOT_SIZE  equ 104 + SCRIPT_MAX_BYTES
+; READ-AHEAD BUFFER, inline in the slot (2026-08-31). mac_compact_read_rec used
+; to pull every record with THREE read(2) syscalls -- key+type (37), value
+; block (15 or 10), script -- so a merge over a 5 GB set ran at ~50 MB/s on an
+; HDD and on NVMe alike: it was syscall-bound, not disk-bound. Production paid
+; 163-326 s of apply stall per compaction of its 13 GB set; a signet bulk
+; catch-up spent 44% of wall-clock in it. Each slot now owns COMPACT_RDBUF
+; bytes and refills with one read(2) per 256 KB. The slots are compaction's
+; (and the recount's) own fresh anonymous mmap, so the extra bytes cost the
+; caller nothing and start zeroed: fill = pos = 0 means "empty".
+COMPACT_RDBUF      equ 262144
+SLOT_RD_FILL       equ 104 + SCRIPT_MAX_BYTES        ; bytes valid in the buffer
+SLOT_RD_POS        equ SLOT_RD_FILL + 8              ; bytes consumed
+SLOT_RD_BUF        equ SLOT_RD_FILL + 16             ; the buffer itself
+COMPACT_SLOT_SIZE  equ SLOT_RD_BUF + COMPACT_RDBUF
 COMPACT_SLOTS_BYTES equ COMPACT_MAX_RUNS * COMPACT_SLOT_SIZE
 COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES
 
@@ -2670,6 +2683,155 @@ mac_lsm_reload_impl:
 ;   and so the merge-write in utxo_lsm_compact can still emit them as one
 ;   contiguous range, matching the file format exactly.
 ; ============================================================================
+; ----------------------------------------------------------------------------
+; mac_slot_read(slot=rdi, dst=rsi, len=rdx) -> rax 0 ok / -1
+;   Exactly mac_read_exact2's contract (a short or zero read is an error),
+;   served from the slot's inline read-ahead buffer, refilled 256 KB at a
+;   time from the slot's fd. Only ever advances the fd sequentially, which is
+;   the only way the record stream is read; the run header and the bloom skip
+;   happen BEFORE the first record and go straight to the fd, so the buffer
+;   is empty when they run. Reading ahead past the last record (into the
+;   sparse-index trailer) is harmless: nothing reads an input fd after the
+;   merge. Clobbers rax, rcx, rdx, rsi, r8-r11; preserves rdi and the
+;   callee-saved set.
+; ----------------------------------------------------------------------------
+mac_slot_read:
+    push rdi
+.sr_loop:
+    test rdx, rdx
+    jz   .sr_ok
+    mov  r8, [rdi+SLOT_RD_FILL]
+    mov  r9, [rdi+SLOT_RD_POS]
+    sub  r8, r9                          ; avail
+    jnz  .sr_have
+    ; refill
+    push rsi
+    push rdx
+    mov  r10, rdi
+    mov  rdi, [r10]                      ; fd
+    lea  rsi, [r10+SLOT_RD_BUF]
+    mov  rdx, COMPACT_RDBUF
+    xor  eax, eax                        ; read
+    syscall
+    mov  rdi, r10
+    pop  rdx
+    pop  rsi
+    test rax, rax
+    jle  .sr_bad
+    mov  [rdi+SLOT_RD_FILL], rax
+    mov  qword [rdi+SLOT_RD_POS], 0
+    jmp  .sr_loop
+.sr_have:
+    mov  rcx, r8
+    cmp  rcx, rdx
+    jbe  .sr_n
+    mov  rcx, rdx
+.sr_n:
+    add  [rdi+SLOT_RD_POS], rcx
+    sub  rdx, rcx
+    lea  r10, [rdi+SLOT_RD_BUF]
+    add  r10, r9                         ; src = buf + pos
+    mov  r11, rdi                        ; keep slot
+    mov  rdi, rsi                        ; dst
+    mov  rsi, r10                        ; src
+    rep  movsb                           ; rdi = dst+n, rsi = src+n
+    mov  rsi, rdi                        ; next dst
+    mov  rdi, r11                        ; slot
+    jmp  .sr_loop
+.sr_ok:
+    xor  eax, eax
+    pop  rdi
+    ret
+.sr_bad:
+    mov  rax, -1
+    pop  rdi
+    ret
+
+; ----------------------------------------------------------------------------
+; Buffered writer for the compaction's OUTPUT run (2026-08-31). The merge
+; loop used to issue three write(2) calls per record; they now land in a 1 MB
+; buffer that is written with one syscall when full. Everything AFTER the
+; merge loop -- the header patches at fixed offsets and the sparse-index
+; append -- goes straight through mac_write_exact as before, and the loop's
+; exit flushes this buffer FIRST, so those writes see a complete file.
+;
+; One writer at a time: compaction runs in the download worker, and no other
+; code path in that process opens a run for writing while it runs. The state
+; is process-global on purpose; a per-connection child never compacts.
+;   mac_out_begin(fd=rdi)                       arm for this output fd
+;   mac_out_write(rsi=src, rdx=len) -> 0/-1     rdi ignored (call-compatible
+;                                               with mac_write_exact's args)
+;   mac_out_flush() -> 0/-1                     write out whatever is held
+; ----------------------------------------------------------------------------
+MAC_OWBUF equ 1048576
+section .bss
+mac_ow_fd:   resq 1
+mac_ow_fill: resq 1
+mac_ow_buf:  resb MAC_OWBUF
+section .text
+
+mac_out_begin:
+    mov  [rel mac_ow_fd], rdi
+    mov  qword [rel mac_ow_fill], 0
+    ret
+
+mac_out_flush:
+    mov  rdx, [rel mac_ow_fill]
+    test rdx, rdx
+    jz   .of_ok
+    mov  rdi, [rel mac_ow_fd]
+    lea  rsi, [rel mac_ow_buf]
+    mov  qword [rel mac_ow_fill], 0
+    jmp  mac_write_exact                 ; tail call: its rax is our rax
+.of_ok:
+    xor  eax, eax
+    ret
+
+; mac_out_tell() -> rax = logical write position (fd offset + buffered bytes), or -1
+mac_out_tell:
+    mov  rdi, [rel mac_ow_fd]
+    xor  esi, esi
+    mov  edx, 1                          ; SEEK_CUR
+    mov  eax, 8                          ; lseek
+    syscall
+    test rax, rax
+    js   .ot_ret
+    add  rax, [rel mac_ow_fill]
+.ot_ret:
+    ret
+
+mac_out_write:
+    mov  r8, [rel mac_ow_fill]
+    lea  r9, [r8+rdx]
+    cmp  r9, MAC_OWBUF
+    ja   .ow_spill
+.ow_copy:
+    lea  rdi, [rel mac_ow_buf]
+    add  rdi, r8
+    mov  rcx, rdx
+    rep  movsb
+    mov  [rel mac_ow_fill], r9
+    xor  eax, eax
+    ret
+.ow_spill:
+    push rsi
+    push rdx
+    call mac_out_flush
+    pop  rdx
+    pop  rsi
+    test rax, rax
+    jnz  .ow_bad
+    cmp  rdx, MAC_OWBUF
+    jae  .ow_direct                      ; larger than the buffer: write through
+    xor  r8d, r8d                        ; buffer is empty now
+    mov  r9, rdx
+    jmp  .ow_copy
+.ow_direct:
+    mov  rdi, [rel mac_ow_fd]
+    jmp  mac_write_exact
+.ow_bad:
+    ret
+
 mac_compact_read_rec:
     push rbp
     mov  rbp, rsp
@@ -2679,10 +2841,10 @@ mac_compact_read_rec:
     sub  rsp, 0x10
     mov  r12, rdi                  ; slot base
     mov  rbx, [r12]                 ; fd
-    mov  rdi, rbx
+    mov  rdi, r12                    ; slot: buffered read (see mac_slot_read)
     lea  rsi, [r12+40]
     mov  rdx, 37                     ; key(36)+type(1)
-    call mac_read_exact2
+    call mac_slot_read
     test rax, rax
     jnz  .cr_err
     movzx eax, byte [r12+76]           ; type
@@ -2693,10 +2855,10 @@ mac_compact_read_rec:
     jz   .cr_read_old
 
     ; ---- new shape: value(8)+slen(2)+height(4)+is_coinbase(1) = 15 ----
-    mov  rdi, rbx
+    mov  rdi, r12
     lea  rsi, [r12+80]
     mov  rdx, 15
-    call mac_read_exact2
+    call mac_slot_read
     test rax, rax
     jnz  .cr_err
     movzx eax, word [r12+88]              ; slen
@@ -2706,10 +2868,10 @@ mac_compact_read_rec:
     ; ---- old shape: value(8)+slen(2) = 10; height/is_coinbase unavailable,
     ; explicitly zeroed (they land at the SAME slot offsets the new shape
     ; uses, just never populated by this read). ----
-    mov  rdi, rbx
+    mov  rdi, r12
     lea  rsi, [r12+80]
     mov  rdx, 10
-    call mac_read_exact2
+    call mac_slot_read
     test rax, rax
     jnz  .cr_err
     movzx eax, word [r12+88]              ; slen
@@ -2718,10 +2880,10 @@ mac_compact_read_rec:
 .cr_have_slen:
     test eax, eax
     jz   .cr_dec
-    mov  rdi, rbx
+    mov  rdi, r12
     lea  rsi, [r12+104]
     mov  rdx, rax
-    call mac_read_exact2
+    call mac_slot_read
     test rax, rax
     jnz  .cr_err
 .cr_dec:
@@ -3450,6 +3612,8 @@ utxo_lsm_compact:
     test rax, rax
     jnz  .cc_err_close
 
+    mov  rdi, [rbp-0x58]
+    call mac_out_begin                        ; per-record writes below are buffered
     mov  qword [rbp-0x70], 0                  ; true_nrec
 
     ; ================= streaming k-way merge =================
@@ -3530,11 +3694,13 @@ utxo_lsm_compact:
     mov  rax, [rbp-0x70]                ; true_nrec (pre-increment)
     test rax, (SPARSE_STRIDE-1)
     jnz  .cc_sp_nosample
-    mov  rdi, [rbp-0x58]                 ; out_fd
-    xor  esi, esi
-    mov  edx, 1                            ; SEEK_CUR
-    mov  eax, 8                              ; lseek
-    syscall
+    ; The offset MUST come through the buffered writer. lseek(SEEK_CUR) here
+    ; reports what has reached the file, which with a write buffer lags the
+    ; records already emitted by up to a megabyte -- every sparse entry would
+    ; point up to 1 MB too early. Found by byte-comparing old vs new output
+    ; (35,675 differing bytes, all in the sparse index), not by any test; the
+    ; sparse-offset invariant test exists because of it.
+    call mac_out_tell                    ; = file position + bytes buffered
     test rax, rax
     js   .cc_err_close
     mov  rbx, rax                              ; this record's file offset
@@ -3554,7 +3720,7 @@ utxo_lsm_compact:
     mov  rdi, [rbp-0x58]
     lea  rsi, [rdx+40]                          ; key+type, 37 bytes
     mov  rdx, 37
-    call mac_write_exact
+    call mac_out_write
     test rax, rax
     jnz  .cc_err_close
     mov  rdx, [rbp-0xB0]
@@ -3567,7 +3733,7 @@ utxo_lsm_compact:
     ; can't manufacture height/coinbase data that was never captured.
     lea  rsi, [rdx+80]                            ; value+slen+height+is_coinbase, 15 bytes
     mov  rdx, 15
-    call mac_write_exact
+    call mac_out_write
     test rax, rax
     jnz  .cc_err_close
     mov  rdx, [rbp-0xB0]
@@ -3577,7 +3743,7 @@ utxo_lsm_compact:
     mov  rdi, [rbp-0x58]
     lea  rsi, [rdx+104]                            ; script (moved from +96)
     mov  rdx, r15
-    call mac_write_exact
+    call mac_out_write
     test rax, rax
     jnz  .cc_err_close
 .cc_wr_bloom:
@@ -3655,6 +3821,9 @@ utxo_lsm_compact:
     ; bytes, not the old format's 28, since sparse_off/sparse_n now sit
     ; between bloom_bits and the bloom bytes themselves) and nrec (offset
     ; 12, unchanged -- still inside the common MAGIC/gen/nrec prefix) ----
+    call mac_out_flush                   ; every buffered record hits the file
+    test rax, rax                        ; BEFORE the header is patched
+    jnz  .cc_err_close
     mov  rdi, [rbp-0x58]
     mov  esi, 44
     xor  edx, edx

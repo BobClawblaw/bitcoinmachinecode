@@ -38,15 +38,15 @@ int main(void){
     ok(g_cfg.utxo_compact_threshold == 20, "parsed as 20");
     ok(utxo_live_compact_threshold() == 20, "and the threshold actually used is 20");
     utxo_live_test_set_bulk_mode(1);
-    ok(utxo_live_compact_threshold() == 80, "80 in bulk");
+    ok(utxo_live_compact_threshold() == 64, "20 x4 would be 80; capped at 64 in bulk (COMPACT_MAX_RUNS)");
 
     printf("== bounds ==\n");
     wr("t.conf", "bmc.utxocompactthreshold=100\n");
     node_config_load("t.conf");
     utxo_live_test_set_bulk_mode(1);
-    ok(utxo_live_compact_threshold() == 128, "bulk x4 is capped at half the manifest cap (256/2)");
+    ok(utxo_live_compact_threshold() == 64, "bulk x4 is capped at COMPACT_MAX_RUNS (64), the most one merge folds");
     utxo_live_test_set_bulk_mode(0);
-    ok(utxo_live_compact_threshold() == 100, "steady-state 100 is under the cap and used as-is");
+    ok(utxo_live_compact_threshold() == 64, "and steady-state 100 is capped the same way");
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails, fails==1?"":"s");
     return fails ? 1 : 0;
 }
