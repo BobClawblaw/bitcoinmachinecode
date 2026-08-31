@@ -264,6 +264,7 @@ COMPACT_SCRATCH_BYTES equ COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES
 
 manifest_name:     db "utxo_manifest.dat", 0
 manifest_tmp_name:  db "utxo_manifest.tmp", 0
+manifest_child_name: db "utxo_manifest.child", 0   ; background child's deferred publish
 dot_name:           db ".", 0
 wal_name:            db "utxo.dat", 0
 
@@ -2792,13 +2793,25 @@ mac_ow_buf:  resb MAC_OWBUF
 ;   the only other manifest writer, and it is triggered from inside
 ;   utxo_lsm_put, where C cannot intercept it; the parent's hook waits for a
 ;   running compaction child so two writers never race on the manifest.
-mac_compact_defer_unlink: resq 1
-mac_flush_hook:           resq 1
+; mac_compact_defer_publish: when non-zero, utxo_lsm_compact writes the new
+;   manifest bytes to utxo_manifest.child instead of publishing them -- no
+;   rename over utxo_manifest.dat, no dir fsync. The forked child sets this
+;   too: the parent keeps flushing (and publishing) while the child merges,
+;   then merges the child's manifest with the runs it flushed meanwhile and
+;   publishes the union itself (daemon/lsm_manifest.c, adopt_child). The
+;   child's in-memory lsm_state is discarded with the child.
+mac_compact_defer_unlink:  resq 1
+mac_compact_defer_publish: resq 1
+mac_flush_hook:            resq 1
 section .text
 
 global utxo_lsm_set_defer_unlink
 utxo_lsm_set_defer_unlink:
     mov  [rel mac_compact_defer_unlink], rdi
+    ret
+global utxo_lsm_set_defer_publish
+utxo_lsm_set_defer_publish:
+    mov  [rel mac_compact_defer_publish], rdi
     ret
 global utxo_lsm_set_flush_hook
 utxo_lsm_set_flush_hook:
@@ -4064,7 +4077,13 @@ utxo_lsm_compact:
 .cc_pl_have:
 
     ; ---- publish manifest: tmp file + fsync + rename + dir fsync ----
+    ; (deferred publish: same bytes to utxo_manifest.child, then stop before
+    ; the rename -- see mac_compact_defer_publish)
     lea  rdi, [rel manifest_tmp_name]
+    cmp  qword [rel mac_compact_defer_publish], 0
+    je   .cc_pub_name
+    lea  rdi, [rel manifest_child_name]
+.cc_pub_name:
     mov  esi, 1 | 0x40 | 0x200
     mov  edx, 0o644
     mov  eax, 2
@@ -4102,6 +4121,8 @@ utxo_lsm_compact:
     mov  rdi, rbx
     mov  eax, 3
     syscall
+    cmp  qword [rel mac_compact_defer_publish], 0
+    jne  .cc_dirsync_skip                   ; deferred: the parent publishes
 
     lea  rdi, [rel manifest_tmp_name]
     lea  rsi, [rel manifest_name]
