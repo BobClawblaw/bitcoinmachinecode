@@ -795,8 +795,22 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
             if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+            /* missing-inputs is ORDINARY: out-of-order relay, and every
+             * mempool.dat reload's first pass (7,243 lines in 40 s after
+             * deploy `h` -- it read like a meltdown while the reload ended
+             * "5007 accepted, 0 rejected"). One line per 5 s; the 30 s
+             * summary carries the count. Real invalidity stays per-tx. */
+            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))){
+                static long mi_last; static long mi_muted;
+                long now = (long)time(NULL);
+                if (now - mi_last >= 5){
+                    fprintf(stderr, "[tx_accept] reject (txval): %s%s\n", r,
+                            mi_muted ? " (repeats muted; the 30s summary counts them)" : "");
+                    mi_last = now; mi_muted = 1;
+                } 
+                return -25;
+            }
             fprintf(stderr, "[tx_accept] reject (txval): %s\n", r ? r : "");
-            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
             return -26;
         }
     }
