@@ -295,8 +295,8 @@ int main(void){
       ck("the zmq hwms no longer flagged",    nodecfg_unimplemented("zmqpubrawtxhwm") == 0);
       /* deferred on purpose: implementing it means moving when sigop cost is
        * computed, and a half-wired fee policy is worse than an absent one */
-      ck("bytespersigop IS still flagged (deferred, not done)",
-         nodecfg_unimplemented("bytespersigop") == 1);
+      ck("bytespersigop is NO LONGER flagged (implemented: sigop-adjusted feerate knob)",
+         nodecfg_unimplemented("bytespersigop") == 0);
       ck("persistmempoolv1 still flagged",    nodecfg_unimplemented("persistmempoolv1") == 1);
       /* walletnotify was PARSED into a config field, never used, and its own
        * strcmp branch ran before the unimplemented check -- so it was silently
