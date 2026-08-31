@@ -101,6 +101,84 @@ int main(void){
 
     failures += test_bare_multisig();
 
+#define okv(c, msg) do{ printf("  %s %s\n", (c)?"ok ":"FAIL", (msg)); if(!(c)) failures++; }while(0)
+    printf("== Core v31 cluster limits (too-large-cluster) ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);  /* anc/desc limits out of the way */
+        mpool_policy_state_init(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        /* 64 INDEPENDENT parents (cluster of 1 each), then one child spending
+         * all 64: anc_cnt 64 passes the old limits, the cluster of 65 must not */
+        static unsigned char ptxid[64][32];
+        unsigned char spk[2] = { 0x51, 0x00 };            /* tiny anyone-can-spend-ish */
+        for (int i = 0; i < 64; i++){
+            unsigned char prev[32]; memset(prev, 0x60 + (i & 15), 32); prev[0] = (unsigned char)i;
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx[128]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+            tx[n++]=1; { unsigned long long v = 900000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x21+i, 20); n+=20;
+            memset(tx+n, 0, 4); n+=4;
+            memset(ptxid[i], 0x90, 32); ptxid[i][0] = (unsigned char)i;   /* synthetic txid: the pool stores what we pass */
+            long r = mpool_policy_add(pol, stbuf, mp, tx, n, ptxid[i], ux);
+            if (r != 1){ printf("      parent %d rejected: %s\n", i, mpool_policy_reason(pol)); }
+            if (r != 1){ okv(0, "all 64 independent parents accepted"); break; }
+            if (i == 63) okv(1, "all 64 independent parents accepted");
+        }
+        unsigned char ctx[64*41 + 64]; unsigned long n = 0;
+        ctx[n++]=2;ctx[n++]=0;ctx[n++]=0;ctx[n++]=0;
+        ctx[n++]=64;
+        for (int i = 0; i < 64; i++){ memcpy(ctx+n, ptxid[i], 32); n+=32; memset(ctx+n, 0, 4); n+=4; ctx[n++]=0; memset(ctx+n,0xff,4); n+=4; }
+        ctx[n++]=1; { unsigned long long v = 64*900000ULL - 100000ULL; for (int b=0;b<8;b++) ctx[n++]=(unsigned char)(v>>(8*b)); }
+        ctx[n++]=22; ctx[n++]=0x00; ctx[n++]=0x14; memset(ctx+n, 0x77, 20); n+=20;
+        memset(ctx+n, 0, 4); n+=4;
+        unsigned char ctid[32]; memset(ctid, 0x9F, 32);
+        long r = mpool_policy_add(pol, stbuf, mp, ctx, n, ctid, ux);
+        okv(r != 1, "a child joining 64 independent parents is refused");
+        okv(r != 1 && strstr(mpool_policy_reason(pol), "too-large-cluster") != NULL, "...as too-large-cluster (anc/desc limits alone would have let it in)");
+    }
+    printf("== bytespersigop: sigop-dense feerate (Core DEFAULT_BYTES_PER_SIGOP 20) ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);   /* 1 sat/vB floor */
+        mpool_policy_state_init(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        unsigned char prev[32]; memset(prev, 0x7A, 32);
+        unsigned char spk[2] = { 0x51, 0x00 };
+        utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+        unsigned char tx[128]; unsigned long n = 0;
+        tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+        tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+        tx[n++]=1; { unsigned long long v = 1000000ULL - 200ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+        tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x88, 20); n+=20;
+        memset(tx+n, 0, 4); n+=4;                                   /* ~60 vB paying 200 sat: 3.3 sat/vB */
+        unsigned char tid[32]; memset(tid, 0x7B, 32);
+        extern void mpool_policy_set_pending_sigops(unsigned long long);
+        mpool_policy_set_pending_sigops(80);                        /* 80 x4-units -> eff vsize max(60, 400) = 400 -> 0.5 sat/vB */
+        long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+        okv(r != 1 && strstr(mpool_policy_reason(pol), "min relay fee") != NULL,
+           "sigop-dense: fee judged against max(vsize, sigops*5) and refused");
+        mpool_policy_set_pending_sigops(0);
+        r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+        okv(r == 1, "the same tx without the sigop load is fine at 3.3 sat/vB");
+    }
+
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }
