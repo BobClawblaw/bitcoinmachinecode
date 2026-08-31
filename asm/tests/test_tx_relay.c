@@ -16,6 +16,7 @@
  *      losing it would eventually cost the connection.
  */
 #include <stdio.h>
+#include <time.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <stdlib.h>
@@ -45,6 +46,8 @@ extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, 
 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
 extern long txrelay_stats(long*, long*, long*, long*, long*, long*);
 extern long txrelay_notfound_count(void);
+extern void txrelay_test_set_req_ttl_ms(long long ms);
+extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
 extern long tx_accept_block_connect(void* mp_area, const unsigned char* block, unsigned long blen);
 #include "../daemon/addrbook.h"
 static long book_count(void){ ab2_t* b = ab2_open(".", 0); long n = ab2_count(b); ab2_close(b); return n; }
@@ -658,6 +661,26 @@ int main(void){
         ck("no parent request went out", no_bytes_pending(spX[1]));
     }
 
+    printf("\n== 14: a request that got no reply is forgotten after the TTL and re-issued ==\n");
+    {
+        drain_peer(spX[1]);
+        u8 ghost[32]; memset(ghost, 0xD4, 32);              /* announced, never delivered */
+        char cmd[13]; static u8 pl[4096];
+        send_inv1(spX[1], ghost); txrelay_poll_leg(spX[0], mp_area, 200);
+        int plen = read_msg(spX[1], cmd, pl, sizeof pl);
+        ck("first announcement requested", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, ghost, 32));
+        send_inv1(spX[1], ghost); txrelay_poll_leg(spX[0], mp_area, 200);
+        ck("re-announced within the TTL: not requested again (in flight)", no_bytes_pending(spX[1]));
+        txrelay_test_set_req_ttl_ms(50);
+        struct timespec ts = {0, 80*1000*1000}; nanosleep(&ts, NULL);
+        long a,b,c,d,e,rf0; txrelay_stats2(&a,&b,&c,&d,&e,&rf0);
+        send_inv1(spX[1], ghost); txrelay_poll_leg(spX[0], mp_area, 200);
+        plen = read_msg(spX[1], cmd, pl, sizeof pl);
+        ck("after the TTL the same announcement is requested again", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, ghost, 32));
+        long rf1; txrelay_stats2(&a,&b,&c,&d,&e,&rf1);
+        ck("...and counted as a re-request after timeout", rf1 == rf0 + 1);
+        txrelay_test_set_req_ttl_ms(60000);
+    }
     close(spX[0]); close(spX[1]);
 
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);

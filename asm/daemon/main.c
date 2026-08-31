@@ -4694,7 +4694,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               if(txrelay_stats(&pk,&rs,&dr,&ok,&fl,&held))
                   fprintf(stderr,"[txrelay] orphans: %ld held, %ld parked, %ld resolved, "
                                  "%ld dropped; 1p1c: %ld accepted, %ld failed\n",
-                          held, pk, rs, dr, ok, fl); }
+                          held, pk, rs, dr, ok, fl);
+              { extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
+                long t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf; txrelay_stats2(&t_ttl,&t_ev,&t_rj,&t_pr,&t_nf,&t_rf);
+                if (dr || t_pr)
+                    fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld\n",
+                            t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf); } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
