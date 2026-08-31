@@ -2388,17 +2388,43 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 /* try ONE candidate for the header phase: connect+handshake+node_ibd_headers.
  * Returns added-header-count (>=0) on a completed exchange, -1 if the
  * candidate couldn't even be reached/handshaked. */
+/* Why a header try failed, so the loop below can SAY so. Every step used to
+ * return a bare -1, and dlc_headers then fell back to whatever headers.dat
+ * already held -- silently. The consequence was invisible for days: on
+ * 2026-08-31 production's boot log read "[dlc] archive already complete
+ * through 964471" while the chain was at 964,8xx, and a fresh signet node
+ * read "complete through 0" with 190k blocks to fetch. The parallel boot
+ * downloader had been dead since the address book started carrying ports. */
+/* The ONE parser for a pool/live entry: "ip[:port]" (what dlc_probe_round
+ * and the address book produce). Both dlc sites used inet_pton() on the raw
+ * string, which rejects the ":port" suffix -- tests/test_dlc_peer_parse pins
+ * this so it cannot quietly regress to that again. 1 ok / 0 unparseable. */
+static int dlc_parse_peer(const char* cand, unsigned* ip, int* port){
+    int p = 0; unsigned a = pool_ipv4(cand, &p);
+    if(!a) return 0;
+    *ip = a; *port = p;
+    return 1;
+}
+enum { DLC_HT_PARSE = 1, DLC_HT_CONNECT, DLC_HT_HANDSHAKE, DLC_HT_WITNESS, DLC_HT_FETCH };
+static const char* const dlc_ht_name[] = { "?", "unparseable address", "connect", "handshake", "no NODE_WITNESS", "headers fetch" };
 static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
-                            unsigned char* hdrbuf, size_t hdrbuf_sz){
-    unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) return -1;
-    int cport = node_config_peer_port(cand);
+                            unsigned char* hdrbuf, size_t hdrbuf_sz, int* why){
+    /* Pool entries are "ip[:port]" -- the same form dlc_probe_round parses
+     * with pool_ipv4. This used to be inet_pton(cand), which rejects the
+     * ":port" suffix outright, so once the book carried ports EVERY candidate
+     * failed here before a single connect. */
+    int pport = 0; unsigned ip = 0;
+    if(!dlc_parse_peer(cand, &ip, &pport)){ *why = DLC_HT_PARSE; return -1; }
+    int cport = pport ? pport : node_config_peer_port(cand);
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
-    if(fd<0) return -1;
+    if(fd<0){ *why = DLC_HT_CONNECT; return -1; }
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
-    if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
+    if(node_handshake(fd)!=1){ close(fd); *why = DLC_HT_HANDSHAKE; return -1; }
+    if(!peer_has_witness(cand)){ close(fd); *why = DLC_HT_WITNESS; return -1; }
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
+    if(added<0){ *why = DLC_HT_FETCH; return -1; }
     return added;
 }
 
@@ -2429,10 +2455,11 @@ static long dlc_headers(char live[][64], int nlive){
         if(hst_get_at(hst,(unsigned long long)(have-1),rec)==1) memcpy(loc, rec+80, 32);
     }
     static unsigned char hdrbuf[2<<20];
-    int tried=0;
+    int tried=0, failed=0, whys[8]={0};
     for(int i=0;i<nlive && tried<DLC_HDR_TRY_PEERS; i++){
-        long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf);
-        if(added<0) continue;
+        int why=0;
+        long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
+        if(added<0){ failed++; if(why>=0 && why<8) whys[why]++; continue; }
         tried++;
         /* a genuine peer failure/hiccup can return exactly 0 added headers
          * with nothing wrong at the protocol level (unified_ibd.c's own
@@ -2443,6 +2470,16 @@ static long dlc_headers(char live[][64], int nlive){
          * already at its tip, which is legitimate success. */
         if(added>0){ fprintf(stderr,"[dlc] headers +%ld from %s (total %ld)\n", added, live[i], hst_count(hst)); return hst_count(hst); }
         if(added==0 && have>0){ fprintf(stderr,"[dlc] headers: already current per %s (total %ld)\n", live[i], hst_count(hst)); return hst_count(hst); }
+    }
+    /* Nothing added and nothing confirmed current: the boot downloader is
+     * about to be told the archive is "complete" through whatever headers.dat
+     * held. That is only true if the header chain is actually current, and we
+     * have just failed to check. Say so, with the reasons, every time. */
+    if(failed){
+        char buf[256]; int n=0;
+        for(int k=1;k<6;k++) if(whys[k]) n+=snprintf(buf+n, sizeof buf-(size_t)n, "%s%d x %s", n?", ":"", whys[k], dlc_ht_name[k]);
+        fprintf(stderr,"[dlc] headers: %d candidate(s) tried, %d succeeded, %d FAILED (%s) -- header chain held at %ld; boot catch-up cannot see past it\n",
+                failed+tried, tried, failed, buf, have);
     }
     return have>0 ? have : -1;
 }
@@ -2531,13 +2568,15 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     int idx=(slot+a)%nlive;
                     if(banned[idx]) continue;   /* already proved itself useless this run */
                     const char* cand=live[idx];
-                    unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) continue;
+                    int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
                     /* claim this peer for exclusive use FIRST -- a real peer
                      * IP is only worth as much as its own bandwidth, so two
                      * workers sharing one starves both instead of using a
                      * second distinct peer that's sitting idle. */
                     if(!__sync_bool_compare_and_swap(&claimed[idx],0,1)) continue;
-                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
+                    /* the entry's own port when it has one; the chain default is only a
+                     * fallback for bare addresses (same rule as the header tries) */
+                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cp2 ? cp2 : g_chainp->default_port)));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
