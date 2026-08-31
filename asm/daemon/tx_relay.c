@@ -126,6 +126,34 @@ static void txr_ring_del(const u8* txid){
 }
 static long txr_notfound_seen;              /* counter for the stats line */
 
+/* ---- per-peer notfound memory ---------------------------------------------
+ * A notfound is this peer saying it cannot serve THAT transaction. The
+ * failover asks someone else immediately (below), but once the want entry
+ * is gone nothing remembered the refusal: the next announcement -- or the
+ * next parked orphan naming it as a parent -- happily asked the same peer
+ * again, burning a 5 s retry round on an answer already given. Remember
+ * (peer, tx) pairs for ten minutes; the picker and the parent fetch skip
+ * them. Keyed by fd + 8-byte prefix like the request ring; an fd reused by
+ * a NEW peer inside the window costs at worst one skipped candidate. */
+#define TXR_NF_MAX    512
+#define TXR_NF_TTL_MS 600000
+static struct { int fd; u8 h8[8]; long long t; } txr_nf_mem[TXR_NF_MAX];
+static unsigned txr_nf_w;
+static long long txr_nf_ttl_ms = TXR_NF_TTL_MS;
+static void txr_nf_note(int fd, const u8* h){
+    txr_nf_mem[txr_nf_w % TXR_NF_MAX].fd = fd;
+    memcpy(txr_nf_mem[txr_nf_w % TXR_NF_MAX].h8, h, 8);
+    txr_nf_mem[txr_nf_w % TXR_NF_MAX].t = txr_now_ms();
+    txr_nf_w++;
+}
+static int txr_nf_has(int fd, const u8* h){
+    for (int i = 0; i < TXR_NF_MAX; i++)
+        if (txr_nf_mem[i].fd == fd && !memcmp(txr_nf_mem[i].h8, h, 8) &&
+            txr_now_ms() - txr_nf_mem[i].t < txr_nf_ttl_ms) return 1;
+    return 0;
+}
+void txrelay_test_set_nf_ttl_ms(long long ms){ txr_nf_ttl_ms = ms; }
+
 /* ---- reconsiderable set (Core's m_lazy_recent_rejects_reconsiderable) ----
  * A transaction rejected ONLY because it did not clear a fee floor is the
  * one reject a CPFP child can overturn, so it must not be treated like any
@@ -716,9 +744,11 @@ static int txr_leg_alive(int fd){
  * not asked yet */
 static int txr_want_pick(txr_want_t* w){
     for (int i = 0; i < w->nfd; i++)
-        if (!txr_want_tried(w, w->fds[i]) && txr_leg_alive(w->fds[i])) return w->fds[i];
+        if (!txr_want_tried(w, w->fds[i]) && !txr_nf_has(w->fds[i], w->hash) &&
+            txr_leg_alive(w->fds[i])) return w->fds[i];
     for (int i = 0; i < TXR_LEG_MAX; i++)
         if (txr_legs[i].fd > 0 && !txr_want_tried(w, txr_legs[i].fd) &&
+            !txr_nf_has(txr_legs[i].fd, w->hash) &&
             txr_now_ms() - txr_legs[i].t <= 5000) return txr_legs[i].fd;
     return -1;
 }
@@ -894,6 +924,15 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                          * that 1p1c is built on */
                         if (txr_ring_has(par[k]) && !txr_recon_allow_refetch(par[k])) continue;
                         if (mpool_get(mp, par[k], &got_len)) continue;
+                        if (txr_nf_has(fd, par[k])){
+                            /* THIS peer already notfounded that parent: do
+                             * not ask it again -- route the request to
+                             * another leg through the want table instead. */
+                            txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 0);
+                            { txr_want_t* w = txr_want_find(par[k]);
+                              if (w && !w->inflight){ txr_parent_req++; txr_want_failover(w); } }
+                            continue;
+                        }
                         u8* o = gd + 1 + want*36;
                         o[0] = (u8)(TXR_MSG_WITNESS_TX);       o[1] = 0;
                         o[2] = 0; o[3] = (u8)(TXR_MSG_WITNESS_TX >> 24);
@@ -952,6 +991,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 | (unsigned)e[2]<<16 | (unsigned)e[3]<<24;
                 if (type == TXR_MSG_TX || type == TXR_MSG_WITNESS_TX || type == TXR_MSG_WTX){
                     txr_ring_del(e + 4); txr_notfound_seen++;
+                    txr_nf_note(fd, e + 4);                   /* never ask this peer for it again */
                     { txr_want_t* w = txr_want_find(e + 4);       /* this peer cannot serve it: ask another NOW */
                       if (w && w->inflight && w->req_fd == fd) txr_want_failover(w); }
                 }

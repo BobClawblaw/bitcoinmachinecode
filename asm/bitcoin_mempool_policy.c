@@ -999,7 +999,13 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * one child = cluster 65 with anc_cnt 64). BFS over the union of the
      * parents' clusters, bounded: the walk stops the moment it exceeds the
      * limits. Children are found by scanning parent links, the same pattern
-     * collect_descendant_txids uses; the visited set caps at 65 nodes. */
+     * collect_descendant_txids uses; the visited set caps at 65 nodes.
+     * An RBF replacement is measured against the cluster AS IT WILL BE:
+     * members of the eviction set (the conflicts and their descendants,
+     * removed if this tx is accepted) are invisible to the walk -- Core's
+     * cluster check likewise runs on the post-replacement diagram. Before
+     * this, a replacement joining a full cluster it was itself thinning
+     * was refused for the size it was about to free. */
     if (n_par > 0){
         enum { CLUSTER_LIMIT = 64, CLUSTER_SIZE_LIMIT = 101000 };
         mpol_node* t = mpol_nodes_base(st);
@@ -1007,12 +1013,16 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         uint32_t seen[CLUSTER_LIMIT + 1]; int nseen = 0;
         uint32_t bfs[CLUSTER_LIMIT + 1]; int sp = 0;
         uint64_t cl_bytes = 0; int too_big = 0;
+        #define MPOL_CL_EVICTED(ix) ({ int _ev = 0; \
+            for (int _e = 0; _e < n_evict; _e++) \
+                if (!memcmp(t[ix].txid, evict_set[_e], 32)){ _ev = 1; break; } _ev; })
         /* seed from EVERY in-pool parent, not the MPOL_MAX_PARENTS(24)-capped
          * par_idx: a 64-input child is exactly the wide shape this exists
          * to refuse */
         for (int i = 0; i < n_in && !too_big; i++){
             int p = find_node(st, prev[i]);
             if (p < 0) continue;
+            if (MPOL_CL_EVICTED((uint32_t)p)) continue;  /* cannot happen (a tx may not spend what it evicts) -- belt */
             uint32_t pi = (uint32_t)p; int dup = 0;
             for (int q = 0; q < nseen; q++) if (seen[q] == pi){ dup = 1; break; }
             if (dup) continue;
@@ -1026,6 +1036,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 for (uint32_t k = 0; k < t[i].n_parents; k++) if (t[i].parent[k] == cur){ linked = 1; break; }
                 if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (t[cur].parent[k] == i){ linked = 1; break; }
                 if (!linked) continue;
+                if (MPOL_CL_EVICTED(i)) continue;        /* leaves the pool if this tx is accepted */
                 int dup = 0;
                 for (int q = 0; q < nseen; q++) if (seen[q] == i){ dup = 1; break; }
                 if (dup) continue;
@@ -1036,6 +1047,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         if (too_big || (uint64_t)nseen + 1 > CLUSTER_LIMIT || cl_bytes + vsize > CLUSTER_SIZE_LIMIT){
             _mpol_last_reason = "too-large-cluster"; return 0;
         }
+        #undef MPOL_CL_EVICTED
     }
     if (anc_cnt > pol->max_anc){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
     if (anc_bytes > pol->max_anc_bytes){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }

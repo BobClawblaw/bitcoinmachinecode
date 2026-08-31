@@ -50,6 +50,7 @@ extern void txrelay_test_set_req_ttl_ms(long long ms);
 extern int  txrelay_replies_pending(int fd);
 extern void txrelay_test_set_pending_ttl_ms(long long ms);
 extern void txrelay_test_set_retry_ms(long long ms);
+extern void txrelay_test_set_nf_ttl_ms(long long ms);
 extern void txrelay_stats3(long*, long*, long*);
 extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
 extern long tx_accept_block_connect(void* mp_area, const unsigned char* block, unsigned long blen);
@@ -753,6 +754,45 @@ int main(void){
         plen = read_msg(spZ[1], cmd, pl, sizeof pl);
         ck("the notfound moved the request to the other leg at once", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, g2, 32));
         close(spY[0]); close(spY[1]); close(spZ[0]); close(spZ[1]);
+    }
+    printf("\n== 17: a notfound is REMEMBERED per peer ==\n");
+    {
+        int spP[2], spQ[2];
+        ck("leg pairs for 17", socketpair(AF_UNIX, SOCK_STREAM, 0, spP) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, spQ) == 0);
+        txrelay_poll_leg(spP[0], mp_area, 10); txrelay_poll_leg(spQ[0], mp_area, 10);
+        char cmd[13]; static u8 pl[4096];
+        u8 g5[32]; memset(g5, 0xE5, 32);
+        send_inv1(spP[1], g5); send_inv1(spQ[1], g5);       /* both announce */
+        txrelay_poll_leg(spP[0], mp_area, 50); txrelay_poll_leg(spQ[0], mp_area, 50);
+        int plen = read_msg(spP[1], cmd, pl, sizeof pl);
+        ck("requested from the first announcer", plen == 37 && !strcmp(cmd, "getdata"));
+        u8 nf[37]; memcpy(nf, pl, 37);                      /* payload is exactly count+entry */
+        p2p_write(spP[1], "notfound", 8, nf, 37); txrelay_poll_leg(spP[0], mp_area, 50);
+        plen = read_msg(spQ[1], cmd, pl, sizeof pl);
+        ck("failed over to the second announcer", plen == 37 && !strcmp(cmd, "getdata") && !memcmp(pl + 5, g5, 32));
+        p2p_write(spQ[1], "notfound", 8, nf, 37); txrelay_poll_leg(spQ[0], mp_area, 50);
+        /* both peers have refused g5; the entry gave up. A re-announcement
+         * from P recreates it and P (fresh claim) may be asked -- but the
+         * failover after P's next notfound must NOT go back to Q, whose
+         * refusal is remembered. */
+        drain_peer(spP[1]); drain_peer(spQ[1]);
+        send_inv1(spP[1], g5); txrelay_poll_leg(spP[0], mp_area, 50);
+        plen = read_msg(spP[1], cmd, pl, sizeof pl);
+        ck("re-announcement re-requested from its sender", plen == 37 && !strcmp(cmd, "getdata"));
+        p2p_write(spP[1], "notfound", 8, nf, 37); txrelay_poll_leg(spP[0], mp_area, 50);
+        ck("...but the remembered notfound kept Q out of the failover", no_bytes_pending(spQ[1]));
+        /* and the memory expires */
+        txrelay_test_set_nf_ttl_ms(1);
+        struct timespec t0 = {0, 5*1000*1000}; nanosleep(&t0, NULL);
+        drain_peer(spP[1]); drain_peer(spQ[1]);
+        send_inv1(spP[1], g5); txrelay_poll_leg(spP[0], mp_area, 50);
+        plen = read_msg(spP[1], cmd, pl, sizeof pl);
+        ck("after TTL: P asked again", plen == 37 && !strcmp(cmd, "getdata"));
+        p2p_write(spP[1], "notfound", 8, nf, 37); txrelay_poll_leg(spP[0], mp_area, 50);
+        plen = read_msg(spQ[1], cmd, pl, sizeof pl);
+        ck("after TTL: Q asked again too", plen == 37 && !strcmp(cmd, "getdata"));
+        txrelay_test_set_nf_ttl_ms(600000);
+        close(spP[0]); close(spP[1]); close(spQ[0]); close(spQ[1]);
     }
     close(spX[0]); close(spX[1]);
 
