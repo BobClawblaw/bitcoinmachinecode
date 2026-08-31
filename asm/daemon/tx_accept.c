@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <stdint.h>
 #include "log_ts.h"
@@ -97,8 +100,47 @@ void tx_accept_set_tip(long tip){ g_next_height = tip + 1; }
  * down -- relay/serving of blocks and everything else keeps working. */
 int tx_dispatch_init(void){
     if (g_resolver){ g_ready = 1; return 1; }   /* live resolver: no snapshot */
+
+    /* SIZE THE SNAPSHOT TO THE WAL IT MUST HOLD, not to a constant.
+     *
+     * This replays utxo.dat -- the writer's current, unflushed WAL generation
+     * -- into a private memtable. TXACC_SLOTS_LOG2 (2^16) is right for the
+     * steady-state generation the writer keeps small precisely so this stays
+     * cheap. It is wrong the moment the writer has been in BULK mode: a
+     * far-behind catch-up lets the generation grow to ~500k live entries,
+     * and if the process dies mid-catch-up (a crash, or a kill), that is the
+     * WAL the next boot finds.
+     *
+     * Observed 2026-08-31 (signet, 81.5 MB WAL): the 2^16 table jammed solid
+     * after 65,536 puts, the replay returned -2 -- which the old check
+     * `r != -1` treated as READY -- and the recount that follows then looked
+     * up ~8.7M run-resident keys, each absent from the jammed table, each
+     * probe a full 65,536-slot lap: 99.9% CPU, no I/O, indefinitely. The
+     * node never got past "[boot] tx-validation snapshot". Had it finished,
+     * the snapshot would have been missing 7/8 of the set.
+     *
+     * Records are at least DEL_SIZE (44) bytes, so wal_bytes/44 bounds the
+     * entries from above; size for 3/4 fill and round to a power of two,
+     * never below the steady-state size. Scripts live in the blob and are a
+     * subset of the WAL's bytes, so the WAL size bounds that too. The
+     * bulk-shaped worst case is ~200 MB of table + the WAL again for the
+     * blob, inherited copy-on-write by children -- acceptable, and it only
+     * ever happens when the writer itself is already holding a 1 GB blob. */
     unsigned long slots = 1UL << TXACC_SLOTS_LOG2;
     u64 blob_cap = TXACC_BLOB_BYTES;
+    long wal_bytes = -1;
+    { struct stat st; if (stat("utxo.dat", &st) == 0) wal_bytes = (long)st.st_size; }
+    if (wal_bytes > 0){
+        u64 max_entries = (u64)wal_bytes / 44 + 1;
+        u64 want = max_entries * 4 / 3 + 1;
+        while (slots < want && slots < (1UL << 24)) slots <<= 1;
+        if ((u64)wal_bytes + (16UL<<20) > blob_cap) blob_cap = (u64)wal_bytes + (16UL<<20);
+    }
+    if (slots > (1UL << TXACC_SLOTS_LOG2))
+        fprintf(stderr, "[tx_accept] WAL is %ld bytes -- sizing the validation snapshot at 2^%d slots, "
+                        "%llu MB blob (the writer was bulk-sized when it last wrote)\n",
+                wal_bytes, __builtin_ctzl(slots), (unsigned long long)(blob_cap >> 20));
+
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
     u64 tomb_cap         = op_threshold;
@@ -131,8 +173,33 @@ int tx_dispatch_init(void){
      * daemon/utxo_live.c's own init logic and its header comment for the
      * bug this exact assumption caused there before it was fixed). */
     long r = utxo_lsm_reload(&g_lst, g_table);
-    g_ready = (r != -1);
-    if (!g_ready) fprintf(stderr, "[tx_accept] utxo_lsm_reload failed\n");
+    /* ANY negative return is a failure. -2 is "memtable too small for the WAL
+     * tail" (incident #32), and `r != -1` used to count it as ready -- which
+     * means a snapshot known to be missing entries would have been served. */
+    g_ready = (r >= 0);
+    if (!g_ready){
+        fprintf(stderr, "[tx_accept] utxo_lsm_reload failed (%ld)%s\n", r,
+                r == -2 ? " -- memtable too small for the WAL tail" : "");
+        return 0;
+    }
+    /* Cross-check against the WRITER's own live count, persisted in the first
+     * qword of its memtable map. The replay must reproduce it exactly; if it
+     * does not, this snapshot is wrong and must not validate anyone's
+     * transactions. Absent map (first boot) -> nothing to check against. */
+    { int fd = open("utxo_lsm_table.map", O_RDONLY);
+      if (fd >= 0){
+          unsigned long long writer_n = 0;
+          if (read(fd, &writer_n, 8) == 8){
+              extern long utxo_count(void*);
+              long mine = utxo_count(g_table);
+              if ((unsigned long long)mine != writer_n){
+                  fprintf(stderr, "[tx_accept] snapshot replayed %ld live entries but the writer "
+                                  "holds %llu -- REFUSING to serve a wrong snapshot\n", mine, writer_n);
+                  g_ready = 0;
+              }
+          }
+          close(fd);
+      } }
     return g_ready;
 }
 
@@ -632,6 +699,14 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
 /* The two -- and only two -- policy verdicts a package may overturn, in
  * Core's words. Exported so the relay drain and the submitpackage path
  * cannot drift apart on what "reconsiderable" means. */
+/* Live entries in the validation snapshot, or -1 before/without one. For the
+ * test that pins tx_dispatch_init's sizing against a WAL larger than the
+ * steady-state table. */
+long txacc_snapshot_count(void){
+    extern long utxo_count(void*);
+    return (g_ready && g_table) ? utxo_count(g_table) : -1;
+}
+
 int txacc_fee_reconsiderable(const char* reason){
     return reason && (!strcmp(reason, "min relay fee not met") ||
                       !strcmp(reason, "mempool min fee not met"));

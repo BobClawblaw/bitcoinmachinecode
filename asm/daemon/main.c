@@ -91,6 +91,10 @@ static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap fa
  * leg returns in milliseconds and does not hold the rotation. Kept well above a
  * single leg's per-pass round-trip cost. */
 #define DL_BUDGET_SECS 60.0
+/* Blocks the archive may run ahead of the applied UTXO height before the
+ * download worker stops syncing legs and applies instead. At the tip the
+ * backlog is 0-2; a from-scratch or long-gap restart is tens of thousands. */
+#define DL_APPLY_FIRST_BACKLOG 500L
 /* STAGE B: minimum gap between fork probes across all outbound legs. A probe
  * is one extra getheaders round trip on an already-idle leg, so this only has
  * to be short enough to notice a competing chain promptly (a mainnet reorg is
@@ -1363,7 +1367,32 @@ static void handle_shutdown_signal(int sig){
  * do_outbound_sync_bounded, where it used to live) because outbound_connect
  * below now arms the same budget around its dial, and needs it in scope. */
 static volatile sig_atomic_t mux_sync_budget_fired = 0;
-static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
+/* The socket the budgeted pass is reading. The handler SHUTS IT DOWN.
+ *
+ * Setting a flag was not enough, and this is a live-node bug found on
+ * 2026-08-31: a far-behind signet worker sat in ONE leg's node_sync for 47
+ * minutes, downloading at 500 KB/s, while UTXO catch-up, the heartbeat and
+ * every other leg starved. mux_sync_budget_fired was 1 in the live process --
+ * the alarm HAD fired, once, at 60s. Its only effect was EINTR on the blocked
+ * read, which fd_read_full reports as -1, and node_sync_multi (since incident
+ * #33) RETRIES on -1 because -1 also means a 3s SO_RCVTIMEO tick from a peer
+ * with sparse chatter. alarm() is one-shot, so after that single swallowed
+ * EINTR nothing ever interrupts the pass again. Two fixes that were each
+ * right alone and incompatible together.
+ *
+ * shutdown(2) is async-signal-safe and makes the pending read return 0 --
+ * EOF -- which every layer already treats as "connection genuinely done"
+ * (fd_read_full short-returns, p2p_read reports .eof_or_err, node_sync_multi
+ * returns). The caller then sees the flag and re-dials the leg, which it
+ * already did on budget expiry; the peer loses nothing but a half-read frame
+ * we were going to discard anyway. */
+static volatile int mux_budget_fd = -1;
+static void mux_budget_alarm(int sig){
+    (void)sig;
+    mux_sync_budget_fired = 1;
+    int fd = mux_budget_fd;
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+}
 
 /* Wall-clock budget for ONE dial (blocking connect + handshake). SO_RCVTIMEO
  * alone is NOT sufficient here and this is a real production hang, not a
@@ -1968,9 +1997,11 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
     memset(&sa,0,sizeof sa); sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
     sigaction(SIGALRM,&sa,&old);
     mux_sync_budget_fired = 0;
+    mux_budget_fd = mux_out_fd[i];
     alarm((unsigned)MUX_SYNC_BUDGET_SECS < 1 ? 1 : (unsigned)MUX_SYNC_BUDGET_SECS);
     long n = do_outbound_sync(i);
     alarm(0);                                   /* disarm; return 0 leftover already fired */
+    mux_budget_fd = -1;
     sigaction(SIGALRM,&old,NULL);
     if(mux_sync_budget_fired){
         /* The budget alarm interrupted node_sync. The leg's socket may hold a
@@ -3797,6 +3828,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * a losing branch notices on its first idle rotation rather than after a
      * full interval. */
     long long next_reorg_probe_ms = 0;
+    int apply_first_prev = 0;
     for(;;){
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
@@ -4176,6 +4208,34 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         long long now_ms = 0;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
         int did=0;
+        /* APPLY FIRST WHEN FAR BEHIND. The rotation below syncs every leg for
+         * up to DL_BUDGET_SECS each before the UTXO catch-up step gets a turn
+         * -- ~10 minutes with 7 legs and re-dials. That is the right order at
+         * the tip, where every rotation fetches a block or two and applies
+         * them. It is exactly wrong when the ARCHIVE is already far ahead of
+         * the applied height: the blocks are on disk, downloading more helps
+         * nothing, and the only useful work is apply -- which sat waiting for
+         * a rotation to finish (2026-08-31, signet: 106k blocks on disk,
+         * applied height frozen for the whole rotation).
+         *
+         * So when the backlog exceeds DL_APPLY_FIRST_BACKLOG the legs are NOT
+         * synced this rotation: they keep their cheap liveness poll and the
+         * tx-relay drain (which answers the peer's pings, so idle legs stay
+         * connected), and the loop goes straight to catch-up. Normal
+         * behaviour resumes the moment the backlog is under the threshold,
+         * which at the tip is always. */
+        long apply_backlog = 0;
+        if(utxo_live_ok){
+            long ah = utxo_live_applied_height();
+            if(ah >= 0) apply_backlog = (long)(*(int*)(store_buf+24)) - ah;
+        }
+        int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
+        if(apply_first != apply_first_prev){
+            fprintf(stderr, apply_first
+                ? "[dl] %ld blocks on disk ahead of the UTXO set -- applying before syncing legs\n"
+                : "[dl] UTXO backlog %ld -- resuming normal leg rotation\n", apply_backlog);
+            apply_first_prev = apply_first;
+        }
         for(int i=0;i<mux_n_out;i++){
             if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
             if(mux_out_fd[i]<0){
@@ -4227,14 +4287,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             i, mux_out_host[i], acc, mpool_count(txsub_pool()));
                 }
             }
+            if(apply_first) continue;        /* see APPLY FIRST above */
             /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
             sigaction(SIGALRM,&sa,&old);
             mux_sync_budget_fired=0;
+            mux_budget_fd = mux_out_fd[i];
             alarm((unsigned)DL_BUDGET_SECS);
             long n = do_outbound_sync(i);
-            alarm(0); sigaction(SIGALRM,&old,NULL);
+            alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&old,NULL);
             if(mux_sync_budget_fired){
                 fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
                         i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
@@ -4263,9 +4325,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 psa.sa_handler=mux_budget_alarm; sigemptyset(&psa.sa_mask);
                 sigaction(SIGALRM,&psa,&pold);
                 mux_sync_budget_fired=0;
+                mux_budget_fd = mux_out_fd[i];
                 alarm((unsigned)DL_BUDGET_SECS);
                 long pr = reorg_probe_peer(mux_out_fd[i], store_buf, mux_out_host[i]);
-                alarm(0); sigaction(SIGALRM,&pold,NULL);
+                alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&pold,NULL);
                 if(mux_sync_budget_fired){
                     fprintf(stderr,"[reorg] probe of %s exceeded %gs budget; re-dialing\n", mux_out_host[i], DL_BUDGET_SECS);
                     mux_next_peer(i, srcpool, nsrc, out_port);
