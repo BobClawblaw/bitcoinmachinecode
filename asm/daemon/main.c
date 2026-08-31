@@ -4703,9 +4703,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               { extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
                 long t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf; txrelay_stats2(&t_ttl,&t_ev,&t_rj,&t_pr,&t_nf,&t_rf);
                 extern long txrelay_sync_deferred_count(void);
+                extern void txrelay_stats3(long*,long*,long*);
+                long t_ro, t_gu, t_wa; txrelay_stats3(&t_ro, &t_gu, &t_wa);
                 if (dr || t_pr)
-                    fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld, sync passes deferred for pending replies %ld\n",
-                            t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf, txrelay_sync_deferred_count()); } }
+                    fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld, retried on another peer %ld (gave up %ld, in flight %ld), sync deferred %ld\n",
+                            t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf, t_ro, t_gu, t_wa, txrelay_sync_deferred_count()); } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
