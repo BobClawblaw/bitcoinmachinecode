@@ -134,22 +134,7 @@ struct script_state {
 };
 extern int script_eval(struct script_state* st);
 
-/* checksig context for the interpreter (from bitcoin_taproot_sighash.c) --
- * must mirror that file's struct exactly, field-for-field, including the
- * annex/weight_left fields added 2026-08-21 for script-path dispatch
- * (taproot_verify_input): this is a plain C struct passed by pointer, so a
- * stale/short local copy here would make taproot_checksig_fn read past the
- * end of whatever a caller here allocates -- garbage stack memory, not a
- * compile error. */
-typedef struct {
-    const uint8_t* tx; int64_t txlen; int64_t n_in;
-    const uint8_t* prevouts; const uint8_t* amounts; const uint8_t* spks;
-    int64_t num_inputs; const uint8_t* tapleaf; uint32_t codesep_pos;
-    const uint8_t* annex; uint64_t annexlen;
-    int64_t weight_left;
-} taproot_checksig_ctx;
-extern uint64_t taproot_checksig_fn(void*, const uint8_t*, size_t,
-                                    const uint8_t*, size_t, const void*);
+#include "../bitcoin_taproot_ctx.h"   /* ONE definition; see the note there */
 
 /* Run a tapscript through the ASM interpreter with the taproot checksig_fn wired.
  * init: hex stack elements bottom-to-top (index 0 = bottom). */
@@ -172,7 +157,7 @@ static int interp_tapspend(const tspend_t* s, const uint8_t* tapleaf,
         ((uint32_t*)rec)[0]=(uint32_t)n;
         memcpy(rec+ELEM_DATA_OFF, buf, n);
     }
-    taproot_checksig_ctx cctx;
+    taproot_checksig_ctx cctx = {0};   /* see the note at the struct: it grows fields */
     cctx.tx = s->tx; cctx.txlen = s->txlen; cctx.n_in = s->index;
     cctx.prevouts = s->prevouts; cctx.amounts = s->amounts; cctx.spks = s->spks;
     cctx.num_inputs = s->numin; cctx.tapleaf = tapleaf; cctx.codesep_pos = 0xffffffff;
@@ -189,7 +174,13 @@ static int interp_tapspend(const tspend_t* s, const uint8_t* tapleaf,
     st.work = NULL; st.work_cap = 0;
     st.error_out = &gerr; gerr = 0;
     st.checksig_ctx = &cctx; st.checksig_fn = (void*)(size_t)taproot_checksig_fn;
-    return script_eval(&st);
+    int r = script_eval(&st);
+    /* Mirror the production caller (taproot_verify_input): a checksig that set
+     * hard_fail invalidates the script even when the stack ends truthy. A
+     * harness that skipped this would report the empty-pubkey case as passing
+     * while the node rejected the block, which is the wrong way round. */
+    if (cctx.hard_fail) return 0;
+    return r;
 }
 
 /* OP_CHECKSIG tapscript: script <pk> CHECKSIG, witness [sig] */
@@ -239,6 +230,38 @@ static void run_interp_tapspend(void){
         const char* init1[1] = { h1 }; int linit1[1] = { s->siglen };
         r = interp_tapspend(s, taproot_vecs[6].leaf, sc, n, init1, linit1, 1);
         ckb("interp: CHECKSIGADD 1-of-2 fails (needs 2)", r==0);
+    }
+
+    /* BIP342 pubkey-size rules. A REAL signet block (109788) stalled this
+     * node's sync on the middle case: its tapscript is `OP_1 OP_CHECKSIG`,
+     * whose pubkey is the 1-byte value 0x01 -- an UNKNOWN public key type,
+     * which BIP342 says verifies successfully when the signature is
+     * non-empty. Rejecting it was a false reject, and no test here covered a
+     * non-32-byte tapscript pubkey. */
+    {
+        const tspend_t* s = &taproot_spends[5];
+        char sighex[136]; char* q=sighex;
+        for(int i=0;i<s->siglen;i++){ sprintf(q,"%02x",s->sig[i]); q+=2; }
+        const char* init[1] = { sighex }; int linit[1] = { s->siglen };
+
+        /* OP_1 OP_CHECKSIG -- exactly the script from signet 109788. */
+        uint8_t sc_unk[2] = { 0x51, 0xac };
+        int r = interp_tapspend(s, taproot_vecs[5].leaf, sc_unk, 2, init, linit, 1);
+        ckb("interp: unknown pubkey type (1 byte) + sig SUCCEEDS (BIP342 upgrade path)", r==1);
+
+        /* Same script, empty signature: success is "a signature was supplied",
+         * so this pushes false rather than erroring. */
+        const char* none[1] = { "" }; int lnone[1] = { 0 };
+        r = interp_tapspend(s, taproot_vecs[5].leaf, sc_unk, 2, none, lnone, 1);
+        ckb("interp: unknown pubkey type with EMPTY sig is false", r==0);
+
+        /* An EMPTY pubkey is a hard error in Core (SCRIPT_ERR_PUBKEYTYPE),
+         * not a false result. `OP_0 OP_CHECKSIG OP_DROP OP_1` would end with a
+         * truthy stack if the failure were merely false, so this is the case
+         * that distinguishes the two -- and the one hard_fail exists for. */
+        uint8_t sc_empty[4] = { 0x00, 0xac, 0x75, 0x51 };  /* OP_0 CHECKSIG DROP 1 */
+        r = interp_tapspend(s, taproot_vecs[5].leaf, sc_empty, 4, init, linit, 1);
+        ckb("interp: EMPTY pubkey fails the script even when the stack ends truthy", r==0);
     }
 }
 
