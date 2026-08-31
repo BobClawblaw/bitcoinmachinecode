@@ -573,11 +573,12 @@ const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long tx
     }
     for (u64 i = 0; i < nin; i++){
         u64 nitem = txacc_varint(&p, end, &cc); if (!cc) return 0;
-        unsigned long len_last = 0, max_excl_last = 0;
+        unsigned long len_last = 0, max_excl_last = 0, max_excl_last2 = 0;
         u8 last_first = 0;
         for (u64 k = 0; k < nitem; k++){
             u64 il = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < il) return 0;
             if (k + 1 < nitem && (unsigned long)il > max_excl_last)  max_excl_last  = (unsigned long)il;
+            if (k + 2 < nitem && (unsigned long)il > max_excl_last2) max_excl_last2 = (unsigned long)il;
             if (k + 1 == nitem){ len_last = (unsigned long)il; last_first = il ? p[0] : 0; }
             p += il;
         }
@@ -596,14 +597,21 @@ const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long tx
             if (nitem - 1 > 100)    return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_STACK_ITEMS */
             if (max_excl_last > 80) return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_STACK_ITEM_SIZE */
         } else if (!is_p2sh && spkl == 34 && spk[0] == 0x51 && spk[1] == 0x20){   /* P2TR */
-            if (last_first == 0x50) continue;      /* annex present: judged conservatively as fine */
+            /* Core policy.cpp IsWitnessStandard, taproot branch, verbatim:
+             * an annex (>= 2 items, last non-empty and starting 0x50) is
+             * nonstandard while no semantics are defined for it; a script
+             * path (>= 2 items after that) pops control block and script,
+             * and IF the leaf is tapscript (control[0] & 0xfe == 0xc0)
+             * every REMAINING item is capped at 80 bytes
+             * (MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE). Key path: no rule.
+             * Zero items is consensus-invalid; Core refuses it here too. */
+            if (nitem == 0) return "bad-witness-nonstandard";
+            if (nitem >= 2 && len_last > 0 && last_first == 0x50)
+                return "bad-witness-nonstandard";               /* annex */
             if (nitem >= 2){
-                /* script path: elements below script+control are capped at 80.
-                 * max_excl_last still includes the control block (2nd-to-last),
-                 * which is 33..193 bytes -- exclude it by recomputing against
-                 * the cap only when there are >= 3 items. Conservative: with
-                 * exactly 2 items (script+control) nothing to judge. */
-                if (nitem >= 3 && max_excl_last > 193) return "bad-witness-nonstandard";
+                if (len_last == 0) return "bad-witness-nonstandard"; /* empty control block */
+                if ((last_first & 0xfe) == 0xc0 && max_excl_last2 > 80)
+                    return "bad-witness-nonstandard";
             }
         }
     }
