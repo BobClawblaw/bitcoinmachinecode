@@ -460,8 +460,8 @@ int main(void){
     }
 
     /* ---- 1p1c package relay -------------------------------------------
-     * The parent pays 50 sat on ~192 vB -- far under the 1 sat/vB relay
-     * floor -- so on its own it is rejected, and before 1p1c the child was
+     * The parent pays 10 sat on ~192 vB -- under the 0.1 sat/vB relay floor
+     * (Core v30 default; it was 50 sat under the old 1 sat/vB floor) -- so on its own it is rejected, and before 1p1c the child was
      * then an orphan forever no matter what it paid. The child pays 5000
      * sat, which lifts the PAIR over the floor. Both orderings are tested,
      * because they take different paths: child-first finds the child
@@ -474,14 +474,14 @@ int main(void){
         unsigned long long tval[1] = { 10000000ull };
         unsigned long tidx[1] = { 0 };
         u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
-        /* fee 50 sat: below the floor for any tx of this size */
+        /* fee 10 sat: below the 0.1 sat/vB floor for any tx of this size */
         long pn = wallet_send_tx(ptx, sizeof ptx, (u8(*)[32])cpf_tid, tidx, tval, 1,
-                                 to_h, 10000000ull - 50ull, 50ull, cpf_priv, 0);
+                                 to_h, 10000000ull - 10ull, 10ull, cpf_priv, 0);
         ck("low-fee parent signed", pn > 0);
         u8 pid[32]; tx_txid(pid, ptx, (unsigned long)pn, tb, sizeof tb);
-        unsigned long long cval[1] = { 10000000ull - 50ull };
+        unsigned long long cval[1] = { 10000000ull - 10ull };   /* the parent's output after its 10-sat fee */
         long cn = wallet_send_tx(ctx9, sizeof ctx9, (u8(*)[32])pid, tidx, cval, 1,
-                                 to_h, 10000000ull - 50ull - 5000ull, 5000ull, cpf_dpriv, 0);
+                                 to_h, 10000000ull - 10ull - 5000ull, 5000ull, cpf_dpriv, 0);
         ck("fee-paying child signed", cn > 0);
         u8 cid[32]; tx_txid(cid, ctx9, (unsigned long)cn, tb, sizeof tb);
         unsigned long ml = 0;
@@ -510,11 +510,11 @@ int main(void){
         unsigned long tidx[1] = { 0 };
         u8 to_h[20]; wallet_key_h160(to_h, cpf_dpriv);
         long pn = wallet_send_tx(ptx, sizeof ptx, (u8(*)[32])cpf_tid2, tidx, tval, 1,
-                                 to_h, 10000000ull - 50ull, 50ull, cpf_priv, 0);
+                                 to_h, 10000000ull - 10ull, 10ull, cpf_priv, 0);
         u8 pid[32]; tx_txid(pid, ptx, (unsigned long)pn, tb, sizeof tb);
-        unsigned long long cval[1] = { 10000000ull - 50ull };
+        unsigned long long cval[1] = { 10000000ull - 10ull };   /* the parent's output after its 10-sat fee */
         long cn = wallet_send_tx(ctx10, sizeof ctx10, (u8(*)[32])pid, tidx, cval, 1,
-                                 to_h, 10000000ull - 50ull - 5000ull, 5000ull, cpf_dpriv, 0);
+                                 to_h, 10000000ull - 10ull - 5000ull, 5000ull, cpf_dpriv, 0);
         u8 cid[32]; tx_txid(cid, ctx10, (unsigned long)cn, tb, sizeof tb);
         unsigned long ml = 0;
 
@@ -558,7 +558,7 @@ int main(void){
         u8 to_h[20]; wallet_key_h160(to_h, chain_dpriv);
         u8 lone_tid[32]; memset(lone_tid, 0xC3, 32);
         long n = wallet_send_tx(solo, sizeof solo, (u8(*)[32])lone_tid, tidx, tval, 1,
-                                to_h, 10000000ull - 50ull, 50ull, cpf_priv, 0);
+                                to_h, 10000000ull - 10ull, 10ull, cpf_priv, 0);
         ck("lone under-payer signed", n > 0);
         u8 lid[32]; tx_txid(lid, solo, (unsigned long)n, tb, sizeof tb);
         p2p_write(sp[1], "tx", 2, solo, (unsigned)n);

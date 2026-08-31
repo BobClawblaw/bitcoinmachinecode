@@ -100,7 +100,7 @@ int main(void){
     static u8 ux[40 + 256*48 + 8]; static u8 ublob[1<<15];
     #define RESET(nonstd) do{ \
         memset(st,0,sizeof st); \
-        mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1); \
+        mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1); \
         if (nonstd) mpool_policy_set_acceptnonstd(pol, 1); \
         mpool_policy_state_init(st, 512); \
         mpool_init(mp, 256, mblob, sizeof mblob); \
@@ -197,7 +197,7 @@ int main(void){
     { /* tiny blob: fits parent+child+standalone (~200B), not a 4th */
       static u8 tmblob[260];   /* fits three ~82B txs, not a fourth */
       memset(st,0,sizeof st);
-      mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+      mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
       mpool_policy_set_acceptnonstd(pol, 1);
       mpool_policy_state_init(st, 512);
       mpool_init(mp, 256, tmblob + 0, sizeof tmblob);   /* small pool */
@@ -352,7 +352,7 @@ int main(void){
 
     printf("\n== 4b: classic signaling when fullrbf is OFF ==\n");
     RESET(1);
-    { mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 0);   /* fullrbf OFF */
+    { mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 0);   /* fullrbf OFF */
       mpool_policy_set_acceptnonstd(pol, 1);
       txout_t oS = { .v=1000000-500, .spk=SPK_WPKH, .spklen=22 };
       u8 f1[32], s1[32];

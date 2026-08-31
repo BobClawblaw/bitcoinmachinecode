@@ -1101,8 +1101,8 @@ datadir root. See *Storing the chain*.
 |---|---|---|
 | `maxmempool` | `300` | mempool byte budget, MB. Full pool → feerate eviction. |
 | `mempoolexpiry` | `336` | drop txs older than this, hours. |
-| `minrelaytxfee` | `0.00001` | relay/mempool floor, BTC/kvB. |
-| `incrementalrelayfee` | `0.00001` | RBF / dynamic-minfee increment, BTC/kvB. |
+| `minrelaytxfee` | `0.000001` | relay/mempool floor, BTC/kvB (Core v30 default: 0.1 sat/vB). |
+| `incrementalrelayfee` | `0.000001` | RBF / dynamic-minfee increment, BTC/kvB (Core v30 default). |
 | `limitancestorcount` | `25` | max in-mempool ancestors. |
 | `limitancestorsize` | `101` | max ancestor set, kvB. |
 | `limitdescendantcount` | `25` | max in-mempool descendants. |

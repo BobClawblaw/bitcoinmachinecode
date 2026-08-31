@@ -154,7 +154,7 @@ static const char* _mpol_last_reason = "accepted";
 
 /* ---------------- config (pol): caller fills via mpool_policy_init --------- */
 typedef struct {
-    uint64_t relay_fee_rate;   /* min relay feerate, sat per vbyte (int) */
+    uint64_t relay_fee_rate;   /* min relay feerate, sat per kvB (Core v30 default 100 = 0.1 sat/vB) */
     uint32_t max_anc, max_anc_bytes;    /* counts; vsize budgets */
     uint32_t max_desc, max_desc_bytes;
     uint32_t rbf_enabled;      /* == Core mempoolfullrbf: replacement allowed
@@ -244,15 +244,15 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->max_desc_bytes  = max_desc_bytes;
     pol->rbf_enabled     = rbf_enabled;
     pol->accept_nonstd   = 0;
-    pol->incremental_fee = relay_fee_rate * 1000;   /* sat/kvB */
+    pol->incremental_fee = relay_fee_rate;          /* sat/kvB, same unit */
     pol->dust_relay_kvb  = 3000;                    /* Core DUST_RELAY_TX_FEE */
     pol->datacarrier_bytes = 100000;                /* Core v31 default */
     pol->permit_bare_multisig = 1;                  /* Core DEFAULT_PERMIT_BAREMULTISIG */
 }
 
-void mpool_policy_set_incremental(void* polv, unsigned long long satvb){
+void mpool_policy_set_incremental(void* polv, unsigned long long satkvb){
     mpol_cfg* pol = (mpol_cfg*)polv;
-    if (satvb > 0) pol->incremental_fee = satvb * 1000;
+    if (satkvb > 0) pol->incremental_fee = satkvb;
 }
 void mpool_policy_set_dust(void* polv, unsigned long long satkvb){
     ((mpol_cfg*)polv)->dust_relay_kvb = satkvb;
@@ -857,7 +857,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     { uint64_t eff_fee   = g_pkg_vsize ? g_pkg_fee   : fee;
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
       /* min relay floor over VSIZE (Core "min relay fee not met") */
-      if (eff_fee < eff_vsize * pol->relay_fee_rate){
+      if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
       uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);

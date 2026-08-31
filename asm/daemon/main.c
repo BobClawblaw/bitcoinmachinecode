@@ -3425,6 +3425,7 @@ static int txsub_package(char* msg, unsigned long mcap){
  *     keeps announcing heights it cannot serve does not spin us.
  * dl_catchup is synchronous and holds the worker for its duration; the legs
  * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
+#define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
 static int g_catchup_workers = 16;
@@ -4101,8 +4102,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         /* sendrawtransaction: pick up a staged submission from the RPC parent,
          * validate + mempool-accept + relay to peer legs, then ack the seq. */
-        if(g_node_status && g_node_status->tx_submit_seq != txsub_last_seq){
-            txsub_last_seq = g_node_status->tx_submit_seq;
+        /* Transaction submissions (sendrawtransaction, testmempoolaccept, and the
+         * boot-time mempool.dat reload) arrive one at a time through the shared
+         * region and are acked here. A submitter waits for the ack before sending
+         * the next, so servicing ONE per rotation made a stream crawl at the
+         * rotation period: deploy `a` on 2026-08-31 needed 13 minutes to reload
+         * 353 saved transactions, with RPC dark the whole time. After an ack,
+         * linger briefly for a follow-up; a reload then streams at tx_accept
+         * speed, and an idle node pays at most TXSUB_FOLLOW_MS once. */
+        if(g_node_status){
+            int follow = 0;
+            for(;;){
+                if(g_node_status->tx_submit_seq == txsub_last_seq){
+                    if(follow <= 0 || g_shutdown_requested) break;
+                    struct timespec ts = {0, 500*1000}; nanosleep(&ts, NULL); follow--;
+                    continue;
+                }
+                txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
@@ -4141,6 +4157,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             g_node_status->tx_submit_result = result;
             __sync_synchronize();
             g_node_status->tx_submit_ack = txsub_last_seq;
+                follow = TXSUB_FOLLOW_MS * 2;           /* 0.5 ms polls */
+            }
         }
         /* submitblock channel: evaluate against the chain state this worker
          * owns (daemon/blk_submit.c). This slice never connects a block --
@@ -4942,19 +4960,6 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
-    /* -persistmempool: reload the dump the previous run left behind. Same
-     * code the importmempool RPC uses, so the two cannot drift apart on the
-     * format. A missing file is the ordinary case -- a fresh datadir, or a
-     * node that has never saved one -- and is not an error. */
-    if(CFG_PERSISTMEMPOOL()){
-        struct stat mst;
-        if(stat("mempool.dat", &mst) == 0){
-            long acc = rpc_node_mempool_load("mempool.dat");
-            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
-        } else {
-            fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
-        }
-    }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
       rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run);
@@ -5007,6 +5012,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * typo that silently allows LESS is a support call; one that silently
      * allows MORE is an incident, and refusing avoids having to work out
      * which happened. */
+    { extern void rpc_node_set_relay_floors(unsigned long long, unsigned long long);
+      rpc_node_set_relay_floors((unsigned long long)g_cfg.minrelaytxfee_satkvb,
+                                (unsigned long long)g_cfg.incrementalrelayfee_satkvb); }
     rpc_acl_reset();
     for(int i = 0; i < g_cfg.n_rpcallowip; i++){
         if(!rpc_acl_add(g_cfg.rpcallowip[i])){
@@ -5064,6 +5072,22 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         else
             fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
                             "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
+    }
+    /* -persistmempool: reload the dump the previous run left behind. Same
+     * code the importmempool RPC uses, so the two cannot drift apart on the
+     * format. A missing file is the ordinary case -- a fresh datadir, or a
+     * node that has never saved one -- and is not an error. Runs AFTER the RPC
+     * server is listening (2026-08-31): it used to gate it, and a reload of a
+     * few hundred transactions kept RPC dark for 13 minutes. The RPC thread
+     * answers meanwhile; getrawmempool is briefly partial, as in Core. */
+    if(CFG_PERSISTMEMPOOL()){
+        struct stat mst;
+        if(stat("mempool.dat", &mst) == 0){
+            long acc = rpc_node_mempool_load("mempool.dat");
+            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+        } else {
+            fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
+        }
     }
 }
 

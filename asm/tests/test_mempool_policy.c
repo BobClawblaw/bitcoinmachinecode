@@ -153,7 +153,7 @@ static int test_bare_multisig(void){
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
-        mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+        mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
         mpool_policy_set_baremultisig(pol, (unsigned)permit);
         mpool_policy_state_init(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
@@ -196,7 +196,7 @@ static int run_scenario(int si,
     static unsigned char pol[128];
     static unsigned char stbuf[1<<20];
     memset(stbuf, 0, sizeof stbuf);
-    mpool_policy_init(pol, 1, max_anc, max_anc_bytes, max_desc, max_desc_bytes, rbf);
+    mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, max_anc, max_anc_bytes, max_desc, max_desc_bytes, rbf);
     /* fixtures are synthetic, deliberately non-standard txs: run under
      * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
      * keeps exercising fee/graph mechanics, not IsStandardTx. */

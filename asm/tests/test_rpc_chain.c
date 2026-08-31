@@ -948,7 +948,7 @@ int main(void){
         static unsigned char mp[40 + 4096*48 + 8], mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8], ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
-        mpool_policy_init(pol, 1, 25, 101000, 25, 101000, 1);
+        mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
         /* the CPFP fixtures below are synthetic ~61-byte legacy txs --
          * deliberately non-standard (tx-size-small, empty scriptSig); run
          * under Core's own regtest escape hatch (-acceptnonstdtxn) so this

@@ -92,7 +92,7 @@ int main(void){
     static unsigned char mblob[1<<20];
     static unsigned char ux[40 + 4096*48 + 8];
     static unsigned char ublob[1<<16];
-    mpool_policy_init(pol, 1, 25, 100000, 25, 100000, 1);
+    mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 100000, 25, 100000, 1);
     mpool_policy_state_init(stbuf, 256);
     mpool_init(mpbuf, 4096, mblob, sizeof mblob);
     utxo_init(ux, 4096, ublob, sizeof ublob);
