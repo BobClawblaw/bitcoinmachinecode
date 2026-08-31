@@ -904,3 +904,24 @@ listener plus the established 9051 connection are the evidence, not the log.
 cjdroute is hand-run: `sudo cjdroute < /storage/cjdns-rt/cjdroute.conf`.
 
 Console logs are now `logs/<chain>/bitcoin.<chain>.log` for every chain.
+
+## 2026-08-31 (late): quiet-log series (deploys o, p, q)
+
+Three rounds against console-log noise, each gated and deployed alone:
+- **o** `69675cf`: the 5-second mutes were metronomes -- steady mainnet churn
+  always has a missing-inputs reject in any 5 s window, so "one line per 5 s
+  at most" meant one line every 5 s forever. missing-inputs now logs nothing
+  per event (the 30 s `tx_accept` summary is the record); policy rejects
+  1/min; `sendrawtransaction accepted` 1/5 min.
+- **p** `5fd0782`: ZMQ notification ring 16 -> 64 slots (404 KB payload each,
+  ~26 MB of the MAP_SHARED block; 256 would be 103 MB) and the overrun report
+  at most once a minute -- its total is cumulative anyway. A mempool.dat
+  reload still laps the ring (thousands of accepts in seconds while the
+  worker is the one accepting); that loss is reported, and matters only to a
+  ZMQ subscriber, which must resync via RPC on sequence gaps as with Core.
+- **q** `3991c92`: the per-leg `[txrelay:N] +N tx accepted` line (~35/min)
+  became one `[txrelay] last 60s` line with the per-leg breakdown.
+
+Result: ~60 lines/min -> ~17 lines/min of real events (heartbeat, summaries,
+dial/leg churn, tor/i2p/cjdns state). The `size 2M` rotation now covers
+hours instead of minutes.
