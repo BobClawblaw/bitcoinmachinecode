@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -138,16 +139,8 @@ extern void block_hash(u8 out[32], const u8 hdr[80]);
 #define UTXO_UNDO_PRUNE_SCAN 20000
 
 /* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (168 bytes). */
-struct lsm_state {
-    long log_fd, idx_fd;
-    u64 log_len, ckpt_log_off, ckpt_n;
-    u64 op_count, op_threshold, fill_threshold;
-    void* tomb_buf; u64 tomb_cap, tomb_n, total_live, next_gen;
-    void* manifest_buf; u64 manifest_cap, manifest_n;
-    void* scratch_buf; u64 scratch_cap;
-    u64 next_run_no;
-    void* tomb_hash_buf; u64 tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
-};
+#include "lsm_state.h"
+#include "lsm_manifest.h"
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536
 
@@ -193,7 +186,139 @@ long utxo_live_compact_threshold(void);
 #define UTXO_LIVE_BULK_WAL_BYTES (256ULL<<20)
 
 static void* g_utxo_table = 0;
+
 struct lsm_state g_utxo_lst;
+/* ---- compaction in the background ------------------------------------------
+ * Compaction rewrites the whole live set -- 13 GB on production -- and used to
+ * run inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
+ * 2026-08-31, invisible only because tip-following resumed afterwards. It
+ * touches nothing the applier mutates (immutable runs in, one run out, then
+ * the manifest), so it runs in a forked child now while apply continues.
+ *
+ * The one shared thing is the MANIFEST, and the protocol is:
+ *   - the child publishes it exactly as before (tmp + fsync + rename) but
+ *     DEFERS unlinking its input runs (mac_compact_defer_unlink): the parent
+ *     still holds the old manifest and may open those runs by name;
+ *   - the parent adopts on exit: re-reads the manifest file, bumps the reader
+ *     cache epoch, THEN unlinks the inputs the new manifest no longer names;
+ *   - mac_flush -- the only other manifest writer, triggered inside the asm
+ *     put where C cannot see it -- calls a hook first, and the hook waits for
+ *     a running child. Two manifest writers can never overlap.
+ * Crash safety is unchanged: a parent that dies mid-child leaves a child that
+ * finishes an atomic rename plus orphaned inputs (already tolerated); a child
+ * that dies leaves the manifest untouched and one orphan output run. */
+extern void utxo_lsm_set_defer_unlink(long on);
+extern void utxo_lsm_set_flush_hook(void (*fn)(void));
+extern void lsm_mm_invalidate_all(void);
+static pid_t   g_cmp_pid = 0;
+static struct timespec g_cmp_t0;
+static u64     g_cmp_inputs[64]; static int g_cmp_nin = 0;
+static u64     g_cmp_n_before = 0;
+static long    g_cmp_height = 0;
+static void (*g_cmp_prev_sigchld)(int) = 0;
+static int     g_cmp_fallbacks = 0;
+static u64     g_cmp_old_base = ~0ULL;   /* persisted runs-only live count at fork time */
+
+static void unlink_run(u64 run_no){
+    char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)run_no); unlink(n);
+}
+static int manifest_names(u64 run_no){
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
+    return 0;
+}
+static void compact_adopt(int st){
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0){
+        u64 new_base = ~0ULL;
+        if (lsm_manifest_read(&g_utxo_lst, &new_base) != 0){
+            /* keep the old in-memory manifest: its runs are all still on disk
+             * (unlink was deferred), so this process stays consistent; the
+             * next reload will pick the new manifest up. */
+            fprintf(stderr, "[utxo_live] background compaction finished but the manifest is unreadable -- keeping the old run set in memory\n");
+        } else {
+            lsm_mm_invalidate_all();
+            /* total_live in memory = runs + WAL tail; the file holds runs only.
+             * A full merge re-derives the runs-only base exactly, so heal the
+             * running counter by the base's movement, as compaction does
+             * inline (bitcoin_utxo_lsm.asm, "decide the live-count field"). */
+            if (new_base != ~0ULL && g_cmp_old_base != ~0ULL)
+                g_utxo_lst.total_live += new_base - g_cmp_old_base;
+            int gone = 0;
+            for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
+            fprintf(stderr, "[utxo_live] background compaction done in %.1fs: manifest_n %lu -> %lu, %d input run(s) unlinked (started at height %ld; apply never waited)\n",
+                    secs, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, gone, g_cmp_height);
+        }
+    } else {
+        fprintf(stderr, "[utxo_live] background compaction FAILED after %.1fs (%s %d) -- manifest unchanged, its partial run is an orphan\n",
+                secs, WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+    }
+    g_cmp_pid = 0;
+    if (g_cmp_prev_sigchld) signal(SIGCHLD, g_cmp_prev_sigchld);
+}
+static void compact_poll(void){
+    if (!g_cmp_pid) return;
+    int st; pid_t r = waitpid(g_cmp_pid, &st, WNOHANG);
+    if (r == g_cmp_pid) compact_adopt(st);
+}
+static void compact_wait(void){
+    if (!g_cmp_pid) return;
+    int st; while (waitpid(g_cmp_pid, &st, 0) < 0 && errno == EINTR) {}
+    compact_adopt(st);
+}
+/* mac_flush's gate: a flush is about to rewrite the manifest. */
+static void compact_flush_hook(void){
+    if (g_cmp_pid){
+        fprintf(stderr, "[utxo_live] flush due while background compaction pid %d runs -- waiting for it first\n", (int)g_cmp_pid);
+        compact_wait();
+    }
+}
+static int compact_start_async(long height, const char* why){
+    if (g_cmp_pid) return 0;
+    if (g_utxo_lst.manifest_n < (u64)utxo_live_compact_threshold()) return 0;
+    /* The merge folds the OLDEST min(manifest_n, 64) runs -- index 0 upward. */
+    g_cmp_nin = (int)(g_utxo_lst.manifest_n < 64 ? g_utxo_lst.manifest_n : 64);
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + i*16 + 8, 8);
+    g_cmp_n_before = g_utxo_lst.manifest_n; g_cmp_height = height;
+    g_cmp_old_base = lsm_manifest_persisted_live();
+    /* SIGCHLD is SIG_IGN in the download worker (children auto-reap), which
+     * would make waitpid lose the exit status; take it back for our child. */
+    g_cmp_prev_sigchld = signal(SIGCHLD, SIG_DFL);
+    pid_t p = fork();
+    if (p < 0){
+        signal(SIGCHLD, g_cmp_prev_sigchld);
+        g_cmp_fallbacks++;
+        fprintf(stderr, "[utxo_live] fork for background compaction failed (%s) -- compacting inline\n", strerror(errno));
+        long cr = utxo_lsm_compact(&g_utxo_lst);
+        fprintf(stderr, "[utxo_live] %s compact at height %ld: manifest_n=%lu -> result=%ld\n", why, height, (unsigned long)g_utxo_lst.manifest_n, cr);
+        return 1;
+    }
+    if (p == 0){
+        /* child: no stdio (a parent thread may hold its lock at fork), no
+         * atexit, nothing but the merge. */
+        utxo_lsm_set_flush_hook(0);
+        utxo_lsm_set_defer_unlink(1);
+        long cr = utxo_lsm_compact(&g_utxo_lst);
+        _exit(cr > 0 ? 0 : 2);
+    }
+    g_cmp_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_cmp_t0);
+    fprintf(stderr, "[utxo_live] compaction of %d run(s) started in background pid %d (%s at height %ld) -- apply continues\n",
+            g_cmp_nin, (int)p, why, height);
+    return 1;
+}
+/* For the daemon's shutdown path: a child mid-merge is killed, not awaited --
+ * shutdown has a 90 s budget and the merge is redone next boot for free. */
+void utxo_live_compact_shutdown(void){
+    if (!g_cmp_pid) return;
+    kill(g_cmp_pid, SIGKILL);
+    int st; while (waitpid(g_cmp_pid, &st, 0) < 0 && errno == EINTR) {}
+    fprintf(stderr, "[utxo_live] shutdown: killed background compaction pid %d (its partial run is an orphan)\n", (int)g_cmp_pid);
+    g_cmp_pid = 0;
+}
+/* How many compactions have run in this process (for tests/status). */
+int utxo_live_compaction_running(void){ return g_cmp_pid != 0; }
 static long  g_applied_height = -1;
 /* Height whose block is currently being applied -- the key undo records are
  * filed under. Set by apply_block_at before any walk begins. */
@@ -1614,6 +1739,7 @@ int utxo_live_init(const char* dir){
     g_utxo_lst.tomb_buf = tomb_buf; g_utxo_lst.tomb_cap = tomb_cap;
     g_utxo_lst.manifest_buf = manifest_buf; g_utxo_lst.manifest_cap = manifest_cap;
     g_utxo_lst.scratch_buf = scratch_buf; g_utxo_lst.scratch_cap = scratch_cap;
+    utxo_lsm_set_flush_hook(compact_flush_hook);   /* see "compaction in the background" */
 
     /* Prior state can exist WITHOUT a manifest: utxo_manifest.dat is only
      * ever created at the first flush, but puts/dels before that point are
@@ -1806,11 +1932,8 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
-        if (g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold()) {
-            long cr = utxo_lsm_compact(&g_utxo_lst);
-            fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
-                    h, g_utxo_lst.manifest_n, cr);
-        }
+        compact_poll();                                   /* adopt a finished background merge */
+        compact_start_async(h, "mid-catchup");
     }
     /* Caught up while bulk-sized: drop the flush thresholds back to
      * steady-state so the current WAL generation stops growing to bulk size.
@@ -1873,10 +1996,8 @@ long utxo_live_catchup(void* store_buf){
         if (!persist_applied_height(g_applied_height)) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
-        if (g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && !shutdown_requested()) {
-            long cr = utxo_lsm_compact(&g_utxo_lst);
-            fprintf(stderr, "[utxo_live] compact manifest_n=%lu -> result=%ld\n", g_utxo_lst.manifest_n, cr);
-        }
+        compact_poll();
+        if (!shutdown_requested()) compact_start_async(g_applied_height, "post-catchup");
     }
     return applied;
 }
@@ -1976,6 +2097,7 @@ long utxo_live_resolve(const u8 txid[32], unsigned long index,
 }
 
 void utxo_live_close(void){
+    utxo_live_compact_shutdown();
     utxo_lsm_close(&g_utxo_lst);
     g_recovery_checked = 0;
 }
