@@ -91,6 +91,10 @@ static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap fa
  * leg returns in milliseconds and does not hold the rotation. Kept well above a
  * single leg's per-pass round-trip cost. */
 #define DL_BUDGET_SECS 60.0
+/* Blocks the archive may run ahead of the applied UTXO height before the
+ * download worker stops syncing legs and applies instead. At the tip the
+ * backlog is 0-2; a from-scratch or long-gap restart is tens of thousands. */
+#define DL_APPLY_FIRST_BACKLOG 500L
 /* STAGE B: minimum gap between fork probes across all outbound legs. A probe
  * is one extra getheaders round trip on an already-idle leg, so this only has
  * to be short enough to notice a competing chain promptly (a mainnet reorg is
@@ -498,6 +502,45 @@ static int lsock(int port){
     if(listen(l,8)<0){ fprintf(stderr,"[net] listen failed: %s\n", strerror(errno)); return -1; }
     return l;
 }
+/* -whitebind listeners. One socket per entry, bound to the exact address and
+ * port the operator named -- NOT sharing the main listener, because a peer's
+ * permissions here come from which socket accepted it, and a shared socket
+ * would grant them to everyone.
+ *
+ * Failure to bind one is FATAL rather than a warning. An operator who wrote
+ * whitebind expects those peers to be unbannable; silently not listening
+ * there would look identical to listening and would fail only when a
+ * misbehaviour score eventually disconnected a peer that was supposed to be
+ * exempt -- long after the cause. */
+static int g_wb_fd[NETPERM_MAX_BIND];
+static int g_wb_n;
+
+static void wb_listen_open(void){
+    g_wb_n = 0;
+    for(int i = 0; i < netperm_whitebind_count(); i++){
+        const char* addr = netperm_whitebind_addr(i);
+        int port = netperm_whitebind_port(i);
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if(fd < 0){ fprintf(stderr,"[net] FATAL: whitebind socket: %s\n", strerror(errno)); exit(1); }
+        struct sockaddr_in a; memset(&a,0,sizeof a);
+        a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
+        if(inet_pton(AF_INET, addr, &a.sin_addr) != 1){
+            fprintf(stderr,"[net] FATAL: whitebind address %s is not valid\n", addr); exit(1); }
+        int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if(bind(fd,(struct sockaddr*)&a,sizeof a) < 0){
+            fprintf(stderr,"[net] FATAL: whitebind %s:%d: %s\n", addr, port, strerror(errno));
+            exit(1);
+        }
+        if(listen(fd,8) < 0){
+            fprintf(stderr,"[net] FATAL: whitebind listen %s:%d: %s\n", addr, port, strerror(errno));
+            exit(1);
+        }
+        netperm_bind_fd(fd, netperm_whitebind_flags(i));
+        g_wb_fd[g_wb_n++] = fd;
+        fprintf(stderr,"[net] whitebind listening on %s:%d (grants noban)\n", addr, port);
+    }
+}
+
 /* The IPv6 half of the listener (2026-08-28). Separate socket, v6-only, so
  * it cannot collide with the IPv4 one above; -1 when the host has no IPv6,
  * which is not an error -- the node simply serves v4 only. A CJDNS peer
@@ -946,10 +989,52 @@ static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
 /* Cross-process spinlock around the shared table. Held for a handful of
  * string compares, never across I/O, so spinning is cheaper than any
  * alternative and cannot deadlock a child against itself. */
+/* The misbehaviour table's cross-process lock.
+ *
+ * It used to be an UNBOUNDED spin on a 0/1 flag with no record of who held it:
+ *
+ *     while (__sync_lock_test_and_set(&st->mis_lock, 1)) nanosleep(1ms);
+ *
+ * This daemon forks a serve child per inbound connection, and every one of
+ * them scores misbehaviour into this shared table. If any holder DIES while
+ * holding it -- the OOM killer, a crash, an operator's kill -9 -- the flag
+ * stays 1 forever and every surviving process wedges permanently the next time
+ * it scores a peer. There is no recovery short of a restart, and nothing says
+ * what happened.
+ *
+ * That is not hypothetical: it happened on 2026-08-31, when a stale co-resident
+ * daemon was SIGKILLed and the survivor stopped applying blocks on the spot,
+ * silently, while still answering RPC.
+ *
+ * So the lock now HOLDS THE OWNER'S PID instead of 1 (0 = free), and a waiter
+ * that has spun for ~2s checks whether that pid still exists. If it does not,
+ * it reclaims the lock and says so. Stealing is safe here in a way it would
+ * not be for a general lock: the protected data is a fixed 64-slot array of
+ * {score, ip} with no pointers and no allocation, so the worst case of a
+ * reclaim mid-update is one garbled misbehaviour score -- a heuristic that is
+ * already approximate -- rather than a corrupted structure.
+ *
+ * The pid fits: mis_lock is an int and this is Linux, where pid_max is well
+ * under INT_MAX. */
 static void mis_lock_acquire(node_status_t* st){
-    while (__sync_lock_test_and_set(&st->mis_lock, 1)) {
+    const int me = (int)getpid();
+    for (int spins = 0; ; spins++) {
+        if (st->mis_lock == 0 &&
+            __sync_bool_compare_and_swap(&st->mis_lock, 0, me)) return;
         struct timespec ts = { 0, 1000 * 1000 };   /* 1 ms */
         nanosleep(&ts, NULL);
+        if (spins >= 2000) {                        /* ~2s of contention */
+            int owner = st->mis_lock;
+            if (owner != 0 && owner != me &&
+                kill((pid_t)owner, 0) != 0 && errno == ESRCH) {
+                if (__sync_bool_compare_and_swap(&st->mis_lock, owner, me)) {
+                    fprintf(stderr, "[ban] misbehaviour lock was held by dead "
+                                    "pid %d -- reclaimed\n", owner);
+                    return;
+                }
+            }
+            spins = 0;                              /* live holder: keep waiting */
+        }
     }
 }
 static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lock); }
@@ -977,6 +1062,11 @@ static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lo
  * tracked, and that remains a gap worth closing separately. */
 static char g_cur_peer_ip[64];
 extern void (*g_serve_violation_hook)(const char*);
+/* Declared, because it is DEFINED below this call. Without it C assumes
+ * `int peer_misbehaving()` with unspecified arguments -- which happens to work
+ * for these types under the SysV ABI, which is exactly why the warning had
+ * been ignored. It is a warning about a real missing prototype. */
+int peer_misbehaving(const char* ip, int points, const char* reason);
 static void serve_violation_report(const char* reason){
     if(!g_cur_peer_ip[0]) return;
     peer_misbehaving(g_cur_peer_ip, 100, reason ? reason : "protocol violation");
@@ -1001,15 +1091,24 @@ int ctl_ban_add(const char* subnet, long long until){
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
  * in which case the caller should drop the connection. */
+/* Permissions granted by the listener this connection arrived on (-whitebind).
+ * Set in the forked child before it serves, so it is per-connection without
+ * any shared table: the node forks per inbound connection, exactly as the
+ * onion path already establishes "this is an onion peer" from which socket
+ * accepted it. Zero in the parent and on every non-whitebind connection. */
+unsigned g_conn_perms = 0;
+
 int peer_misbehaving(const char* ip, int points, const char* reason){
     if(!ip || !*ip || points <= 0) return 0;
     /* Core: a peer with NetPermissionFlags::NoBan is never disconnected or
      * discouraged for misbehaviour. Checked BEFORE scoring, not just before
      * banning -- a score that can never reach the threshold is bookkeeping
      * that would evict a real offender from the table. */
-    if(netperm_for(ip) & NP_NOBAN){
-        fprintf(stderr,"[ban] %s misbehaving +%d: %s -- NOT scored (whitelist noban)\n",
-                ip, points, reason ? reason : "?");
+    unsigned perms = netperm_for(ip) | g_conn_perms;
+    if(perms & NP_NOBAN){
+        fprintf(stderr,"[ban] %s misbehaving +%d: %s -- NOT scored (%s noban)\n",
+                ip, points, reason ? reason : "?",
+                (g_conn_perms & NP_NOBAN) ? "whitebind" : "whitelist");
         return 0;
     }
     /* Score into the SHARED table when we have one, so a peer that misbehaves
@@ -1275,7 +1374,32 @@ static void handle_shutdown_signal(int sig){
  * do_outbound_sync_bounded, where it used to live) because outbound_connect
  * below now arms the same budget around its dial, and needs it in scope. */
 static volatile sig_atomic_t mux_sync_budget_fired = 0;
-static void mux_budget_alarm(int sig){ (void)sig; mux_sync_budget_fired = 1; }
+/* The socket the budgeted pass is reading. The handler SHUTS IT DOWN.
+ *
+ * Setting a flag was not enough, and this is a live-node bug found on
+ * 2026-08-31: a far-behind signet worker sat in ONE leg's node_sync for 47
+ * minutes, downloading at 500 KB/s, while UTXO catch-up, the heartbeat and
+ * every other leg starved. mux_sync_budget_fired was 1 in the live process --
+ * the alarm HAD fired, once, at 60s. Its only effect was EINTR on the blocked
+ * read, which fd_read_full reports as -1, and node_sync_multi (since incident
+ * #33) RETRIES on -1 because -1 also means a 3s SO_RCVTIMEO tick from a peer
+ * with sparse chatter. alarm() is one-shot, so after that single swallowed
+ * EINTR nothing ever interrupts the pass again. Two fixes that were each
+ * right alone and incompatible together.
+ *
+ * shutdown(2) is async-signal-safe and makes the pending read return 0 --
+ * EOF -- which every layer already treats as "connection genuinely done"
+ * (fd_read_full short-returns, p2p_read reports .eof_or_err, node_sync_multi
+ * returns). The caller then sees the flag and re-dials the leg, which it
+ * already did on budget expiry; the peer loses nothing but a half-read frame
+ * we were going to discard anyway. */
+static volatile int mux_budget_fd = -1;
+static void mux_budget_alarm(int sig){
+    (void)sig;
+    mux_sync_budget_fired = 1;
+    int fd = mux_budget_fd;
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+}
 
 /* Wall-clock budget for ONE dial (blocking connect + handshake). SO_RCVTIMEO
  * alone is NOT sufficient here and this is a real production hang, not a
@@ -1880,9 +2004,11 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
     memset(&sa,0,sizeof sa); sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
     sigaction(SIGALRM,&sa,&old);
     mux_sync_budget_fired = 0;
+    mux_budget_fd = mux_out_fd[i];
     alarm((unsigned)MUX_SYNC_BUDGET_SECS < 1 ? 1 : (unsigned)MUX_SYNC_BUDGET_SECS);
     long n = do_outbound_sync(i);
     alarm(0);                                   /* disarm; return 0 leftover already fired */
+    mux_budget_fd = -1;
     sigaction(SIGALRM,&old,NULL);
     if(mux_sync_budget_fired){
         /* The budget alarm interrupted node_sync. The leg's socket may hold a
@@ -2269,17 +2395,43 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 /* try ONE candidate for the header phase: connect+handshake+node_ibd_headers.
  * Returns added-header-count (>=0) on a completed exchange, -1 if the
  * candidate couldn't even be reached/handshaked. */
+/* Why a header try failed, so the loop below can SAY so. Every step used to
+ * return a bare -1, and dlc_headers then fell back to whatever headers.dat
+ * already held -- silently. The consequence was invisible for days: on
+ * 2026-08-31 production's boot log read "[dlc] archive already complete
+ * through 964471" while the chain was at 964,8xx, and a fresh signet node
+ * read "complete through 0" with 190k blocks to fetch. The parallel boot
+ * downloader had been dead since the address book started carrying ports. */
+/* The ONE parser for a pool/live entry: "ip[:port]" (what dlc_probe_round
+ * and the address book produce). Both dlc sites used inet_pton() on the raw
+ * string, which rejects the ":port" suffix -- tests/test_dlc_peer_parse pins
+ * this so it cannot quietly regress to that again. 1 ok / 0 unparseable. */
+static int dlc_parse_peer(const char* cand, unsigned* ip, int* port){
+    int p = 0; unsigned a = pool_ipv4(cand, &p);
+    if(!a) return 0;
+    *ip = a; *port = p;
+    return 1;
+}
+enum { DLC_HT_PARSE = 1, DLC_HT_CONNECT, DLC_HT_HANDSHAKE, DLC_HT_WITNESS, DLC_HT_FETCH };
+static const char* const dlc_ht_name[] = { "?", "unparseable address", "connect", "handshake", "no NODE_WITNESS", "headers fetch" };
 static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
-                            unsigned char* hdrbuf, size_t hdrbuf_sz){
-    unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) return -1;
-    int cport = node_config_peer_port(cand);
+                            unsigned char* hdrbuf, size_t hdrbuf_sz, int* why){
+    /* Pool entries are "ip[:port]" -- the same form dlc_probe_round parses
+     * with pool_ipv4. This used to be inet_pton(cand), which rejects the
+     * ":port" suffix outright, so once the book carried ports EVERY candidate
+     * failed here before a single connect. */
+    int pport = 0; unsigned ip = 0;
+    if(!dlc_parse_peer(cand, &ip, &pport)){ *why = DLC_HT_PARSE; return -1; }
+    int cport = pport ? pport : node_config_peer_port(cand);
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
-    if(fd<0) return -1;
+    if(fd<0){ *why = DLC_HT_CONNECT; return -1; }
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
-    if(node_handshake(fd)!=1 || !peer_has_witness(cand)){ close(fd); return -1; }
+    if(node_handshake(fd)!=1){ close(fd); *why = DLC_HT_HANDSHAKE; return -1; }
+    if(!peer_has_witness(cand)){ close(fd); *why = DLC_HT_WITNESS; return -1; }
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
+    if(added<0){ *why = DLC_HT_FETCH; return -1; }
     return added;
 }
 
@@ -2310,10 +2462,11 @@ static long dlc_headers(char live[][64], int nlive){
         if(hst_get_at(hst,(unsigned long long)(have-1),rec)==1) memcpy(loc, rec+80, 32);
     }
     static unsigned char hdrbuf[2<<20];
-    int tried=0;
+    int tried=0, failed=0, whys[8]={0};
     for(int i=0;i<nlive && tried<DLC_HDR_TRY_PEERS; i++){
-        long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf);
-        if(added<0) continue;
+        int why=0;
+        long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
+        if(added<0){ failed++; if(why>=0 && why<8) whys[why]++; continue; }
         tried++;
         /* a genuine peer failure/hiccup can return exactly 0 added headers
          * with nothing wrong at the protocol level (unified_ibd.c's own
@@ -2324,6 +2477,16 @@ static long dlc_headers(char live[][64], int nlive){
          * already at its tip, which is legitimate success. */
         if(added>0){ fprintf(stderr,"[dlc] headers +%ld from %s (total %ld)\n", added, live[i], hst_count(hst)); return hst_count(hst); }
         if(added==0 && have>0){ fprintf(stderr,"[dlc] headers: already current per %s (total %ld)\n", live[i], hst_count(hst)); return hst_count(hst); }
+    }
+    /* Nothing added and nothing confirmed current: the boot downloader is
+     * about to be told the archive is "complete" through whatever headers.dat
+     * held. That is only true if the header chain is actually current, and we
+     * have just failed to check. Say so, with the reasons, every time. */
+    if(failed){
+        char buf[256]; int n=0;
+        for(int k=1;k<6;k++) if(whys[k]) n+=snprintf(buf+n, sizeof buf-(size_t)n, "%s%d x %s", n?", ":"", whys[k], dlc_ht_name[k]);
+        fprintf(stderr,"[dlc] headers: %d candidate(s) tried, %d succeeded, %d FAILED (%s) -- header chain held at %ld; boot catch-up cannot see past it\n",
+                failed+tried, tried, failed, buf, have);
     }
     return have>0 ? have : -1;
 }
@@ -2412,13 +2575,15 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     int idx=(slot+a)%nlive;
                     if(banned[idx]) continue;   /* already proved itself useless this run */
                     const char* cand=live[idx];
-                    unsigned ip; if(inet_pton(AF_INET,cand,&ip)!=1) continue;
+                    int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
                     /* claim this peer for exclusive use FIRST -- a real peer
                      * IP is only worth as much as its own bandwidth, so two
                      * workers sharing one starves both instead of using a
                      * second distinct peer that's sitting idle. */
                     if(!__sync_bool_compare_and_swap(&claimed[idx],0,1)) continue;
-                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
+                    /* the entry's own port when it has one; the chain default is only a
+                     * fallback for bare addresses (same rule as the header tries) */
+                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cp2 ? cp2 : g_chainp->default_port)));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
@@ -3249,6 +3414,37 @@ static int txsub_package(char* msg, unsigned long mcap){
     return committed;
 }
 
+/* ---- far-behind trigger for the RUNNING node ---------------------------------
+ * dl_catchup (headers-first + a pool of chunk workers) used to run only at
+ * boot. A node that falls far behind while running -- a long outage, a slow
+ * link, a boot that skipped it -- was left to the worker's legs, which fetch
+ * one block per round trip on one peer at a time (~6 blocks/s measured on
+ * signet, against ~50 for the parallel path on the same segment).
+ *
+ * The decision is a pure function so it can be tested without a network:
+ *   - the best height any live outbound peer announced is at least
+ *     DL_PARALLEL_GAP blocks past the archive tip (peers' start_height is
+ *     what they claimed at handshake; a lying peer costs one wasted run of a
+ *     downloader that verifies every block anyway);
+ *   - the node is not apply-bound (backlog under DL_APPLY_FIRST_BACKLOG --
+ *     otherwise downloading more is pointless, see APPLY FIRST);
+ *   - at least DL_PARALLEL_REARM_S since the last run, so a peer set that
+ *     keeps announcing heights it cannot serve does not spin us.
+ * dl_catchup is synchronous and holds the worker for its duration; the legs
+ * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
+#define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
+#define DL_PARALLEL_GAP      2000L
+#define DL_PARALLEL_REARM_S  600L
+static int g_catchup_workers = 16;
+static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
+                                    long apply_backlog, long long now_s, long long last_run_s){
+    if(best_peer_height <= 0 || archive_tip < 0) return 0;
+    if(best_peer_height - archive_tip < DL_PARALLEL_GAP) return 0;
+    if(apply_backlog > DL_APPLY_FIRST_BACKLOG) return 0;
+    if(last_run_s && now_s - last_run_s < DL_PARALLEL_REARM_S) return 0;
+    return 1;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -3413,6 +3609,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * removed at the 2026-08-27 policy-parity merge as subsumed;
          * utxo_live.c keeps the (now unregistered) g_mined_cb plumbing. */
 
+        /* Ghost-run repair BEFORE the coinstats index reads the set as truth
+         * (it adopts its persisted state at the checkpoint height, or seeds
+         * from a walk; either must see the repaired set). Catch-up used to do
+         * this on its first call -- after the index had already looked. */
+        { extern long utxo_live_recover_at_boot(void*);
+          if (utxo_live_recover_at_boot(store_buf) < 0)
+              fprintf(stderr, "[dl] WARNING: ghost-run repair failed at boot -- catch-up will refuse to apply\n"); }
         /* ---- coinstats index: continuous gettxoutsetinfo + a standing
          * cryptographic parity instrument. Observers feed it every coin
          * add/remove on the apply and reorg paths; it persists at the same
@@ -3719,6 +3922,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * a losing branch notices on its first idle rotation rather than after a
      * full interval. */
     long long next_reorg_probe_ms = 0;
+    int apply_first_prev = 0;
+    long long dl_parallel_last_s = 0;
     for(;;){
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
@@ -3914,8 +4119,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         /* sendrawtransaction: pick up a staged submission from the RPC parent,
          * validate + mempool-accept + relay to peer legs, then ack the seq. */
-        if(g_node_status && g_node_status->tx_submit_seq != txsub_last_seq){
-            txsub_last_seq = g_node_status->tx_submit_seq;
+        /* Transaction submissions (sendrawtransaction, testmempoolaccept, and the
+         * boot-time mempool.dat reload) arrive one at a time through the shared
+         * region and are acked here. A submitter waits for the ack before sending
+         * the next, so servicing ONE per rotation made a stream crawl at the
+         * rotation period: deploy `a` on 2026-08-31 needed 13 minutes to reload
+         * 353 saved transactions, with RPC dark the whole time. After an ack,
+         * linger briefly for a follow-up; a reload then streams at tx_accept
+         * speed, and an idle node pays at most TXSUB_FOLLOW_MS once. */
+        if(g_node_status){
+            int follow = 0;
+            for(;;){
+                if(g_node_status->tx_submit_seq == txsub_last_seq){
+                    if(follow <= 0 || g_shutdown_requested) break;
+                    struct timespec ts = {0, 500*1000}; nanosleep(&ts, NULL); follow--;
+                    continue;
+                }
+                txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
@@ -3947,13 +4167,27 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = txsub_accept_and_relay(txsub_pool(),
                                  (const unsigned char*)g_node_status->tx_submit_buf, tlen,
                                  mux_out_fd, mux_n_out, reason, sizeof reason, &relayed);
-                    if(result==1) fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs\n", relayed, mux_n_out);
+                    /* every mempool.dat reload streams through this channel:
+                     * 4,470 lines in two minutes after deploy j. One line per
+                     * 5 s; the count rides along. */
+                    if(result==1){
+                        static long srt_last, srt_muted;
+                        long now_s = (long)time(NULL);
+                        if(now_s - srt_last >= 300){   /* 1/5min: reload streams made 1/5s a metronome */
+                            fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs%s\n",
+                                    relayed, mux_n_out,
+                                    srt_muted ? " (repeats muted; +N shows in the tx_accept summary)" : "");
+                            srt_last = now_s; srt_muted = 1;
+                        }
+                    }
                 }
             } else { result=-4; snprintf(reason,sizeof reason,"mempool init failed"); }
             snprintf((char*)g_node_status->tx_submit_reason, sizeof g_node_status->tx_submit_reason, "%s", reason);
             g_node_status->tx_submit_result = result;
             __sync_synchronize();
             g_node_status->tx_submit_ack = txsub_last_seq;
+                follow = TXSUB_FOLLOW_MS * 2;           /* 0.5 ms polls */
+            }
         }
         /* submitblock channel: evaluate against the chain state this worker
          * owns (daemon/blk_submit.c). This slice never connects a block --
@@ -4098,6 +4332,52 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         long long now_ms = 0;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
         int did=0;
+        /* APPLY FIRST WHEN FAR BEHIND. The rotation below syncs every leg for
+         * up to DL_BUDGET_SECS each before the UTXO catch-up step gets a turn
+         * -- ~10 minutes with 7 legs and re-dials. That is the right order at
+         * the tip, where every rotation fetches a block or two and applies
+         * them. It is exactly wrong when the ARCHIVE is already far ahead of
+         * the applied height: the blocks are on disk, downloading more helps
+         * nothing, and the only useful work is apply -- which sat waiting for
+         * a rotation to finish (2026-08-31, signet: 106k blocks on disk,
+         * applied height frozen for the whole rotation).
+         *
+         * So when the backlog exceeds DL_APPLY_FIRST_BACKLOG the legs are NOT
+         * synced this rotation: they keep their cheap liveness poll and the
+         * tx-relay drain (which answers the peer's pings, so idle legs stay
+         * connected), and the loop goes straight to catch-up. Normal
+         * behaviour resumes the moment the backlog is under the threshold,
+         * which at the tip is always. */
+        long apply_backlog = 0;
+        if(utxo_live_ok){
+            long ah = utxo_live_applied_height();
+            if(ah >= 0) apply_backlog = (long)(*(int*)(store_buf+24)) - ah;
+        }
+        int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
+        {
+            long best = 0;
+            if(g_node_status)
+                for(int i=0;i<mux_n_out && i<RPC_MAX_PEERS;i++)
+                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > best)
+                        best = g_node_status->peers[i].start_height;
+            long atip = (long)(*(int*)(store_buf+24));
+            long long nows = (long long)time(NULL);
+            if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
+                fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
+                        atip, best, best-atip, g_catchup_workers);
+                dl_parallel_last_s = nows;
+                long got = dl_catchup(dir, g_catchup_workers);
+                store_reload(store_buf);
+                fprintf(stderr,"[dl] parallel downloader wrote %ld block(s); archive now %d\n", got, *(int*)(store_buf+24));
+                continue;                  /* re-evaluate: apply-first will take over */
+            }
+        }
+        if(apply_first != apply_first_prev){
+            fprintf(stderr, apply_first
+                ? "[dl] %ld blocks on disk ahead of the UTXO set -- applying before syncing legs\n"
+                : "[dl] UTXO backlog %ld -- resuming normal leg rotation\n", apply_backlog);
+            apply_first_prev = apply_first;
+        }
         for(int i=0;i<mux_n_out;i++){
             if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
             if(mux_out_fd[i]<0){
@@ -4144,19 +4424,45 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
                 if(acc>0){
-                    extern long mpool_count(void*);
-                    fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
-                            i, mux_out_host[i], acc, mpool_count(txsub_pool()));
+                    /* per-leg attribution, ONE line a minute for all legs:
+                     * the per-poll line was ~35 lines/min of the log with
+                     * nothing the 30s tx_accept summary did not already
+                     * total (2026-08-31 quiet rounds). */
+                    static long leg_acc[MUX_MAX_OUT]; static long leg_last; static long leg_total;
+                    if(i >= 0 && i < MUX_MAX_OUT) leg_acc[i] += acc;
+                    leg_total += acc;
+                    long now_s = (long)time(NULL);
+                    if(leg_last == 0) leg_last = now_s;
+                    if(now_s - leg_last >= 60){
+                        extern long mpool_count(void*);
+                        char parts[MUX_MAX_OUT*40]; int pn = 0; parts[0] = 0;
+                        for(int k = 0; k < MUX_MAX_OUT && k < mux_n_out; k++){
+                            if(leg_acc[k] <= 0) continue;
+                            pn += snprintf(parts + pn, sizeof parts - (size_t)pn, "%s%d:%s +%ld",
+                                           pn ? ", " : "", k, mux_out_host[k], leg_acc[k]);
+                            if((size_t)pn >= sizeof parts - 1) break;
+                        }
+                        fprintf(stderr,"[txrelay] last %lds: +%ld tx accepted via legs [%s] (mempool %ld)\n",
+                                now_s - leg_last, leg_total, parts, mpool_count(txsub_pool()));
+                        memset(leg_acc, 0, sizeof leg_acc); leg_total = 0; leg_last = now_s;
+                    }
                 }
             }
+            if(apply_first) continue;        /* see APPLY FIRST above */
+            /* A sync pass on this leg would feed any reply still owed to the
+             * relay layer into .drain's discard. Skip it while replies are
+             * pending (bounded: the relay layer forgets after 1.5 s). */
+            { extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
+              if(mux_out_fd[i]>=0 && txrelay_replies_pending(mux_out_fd[i])){ txrelay_note_sync_deferred(); continue; } }
             /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
             sigaction(SIGALRM,&sa,&old);
             mux_sync_budget_fired=0;
+            mux_budget_fd = mux_out_fd[i];
             alarm((unsigned)DL_BUDGET_SECS);
             long n = do_outbound_sync(i);
-            alarm(0); sigaction(SIGALRM,&old,NULL);
+            alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&old,NULL);
             if(mux_sync_budget_fired){
                 fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
                         i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
@@ -4185,9 +4491,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 psa.sa_handler=mux_budget_alarm; sigemptyset(&psa.sa_mask);
                 sigaction(SIGALRM,&psa,&pold);
                 mux_sync_budget_fired=0;
+                mux_budget_fd = mux_out_fd[i];
                 alarm((unsigned)DL_BUDGET_SECS);
                 long pr = reorg_probe_peer(mux_out_fd[i], store_buf, mux_out_host[i]);
-                alarm(0); sigaction(SIGALRM,&pold,NULL);
+                alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&pold,NULL);
                 if(mux_sync_budget_fired){
                     fprintf(stderr,"[reorg] probe of %s exceeded %gs budget; re-dialing\n", mux_out_host[i], DL_BUDGET_SECS);
                     mux_next_peer(i, srcpool, nsrc, out_port);
@@ -4440,7 +4747,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               if(txrelay_stats(&pk,&rs,&dr,&ok,&fl,&held))
                   fprintf(stderr,"[txrelay] orphans: %ld held, %ld parked, %ld resolved, "
                                  "%ld dropped; 1p1c: %ld accepted, %ld failed\n",
-                          held, pk, rs, dr, ok, fl); }
+                          held, pk, rs, dr, ok, fl);
+              { extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
+                long t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf; txrelay_stats2(&t_ttl,&t_ev,&t_rj,&t_pr,&t_nf,&t_rf);
+                extern long txrelay_sync_deferred_count(void);
+                extern void txrelay_stats3(long*,long*,long*);
+                long t_ro, t_gu, t_wa; txrelay_stats3(&t_ro, &t_gu, &t_wa);
+                if (dr || t_pr)
+                    fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld, retried on another peer %ld (gave up %ld, in flight %ld), sync deferred %ld\n",
+                            t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf, t_ro, t_gu, t_wa, txrelay_sync_deferred_count()); } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
@@ -4607,6 +4922,13 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    /* getnetworkinfo tells the truth about the transports: reachability from
+     * the dialer, our i2p destination, and (once the tor listener is up,
+     * below in tor_onion_listener) the onion hostname. */
+    { extern int dialer_net_reachable(int);
+      extern const char* dialer_i2p_b32(void);
+      extern void rpc_node_set_net_hooks(int (*)(int), const char* (*)(void));
+      rpc_node_set_net_hooks(dialer_net_reachable, dialer_i2p_b32); }
     /* Wallet bootstrap: if the CLI's own wallet store is present in the
      * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
      * CLI's own resolution order) and hand the RPC layer the seed --
@@ -4706,19 +5028,6 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
-    /* -persistmempool: reload the dump the previous run left behind. Same
-     * code the importmempool RPC uses, so the two cannot drift apart on the
-     * format. A missing file is the ordinary case -- a fresh datadir, or a
-     * node that has never saved one -- and is not an error. */
-    if(CFG_PERSISTMEMPOOL()){
-        struct stat mst;
-        if(stat("mempool.dat", &mst) == 0){
-            long acc = rpc_node_mempool_load("mempool.dat");
-            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
-        } else {
-            fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
-        }
-    }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
       rpc_chain_set_utxosetinfo((long (*)(int, void*, char*, unsigned long))utxo_setinfo_rpc_run);
@@ -4771,6 +5080,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * typo that silently allows LESS is a support call; one that silently
      * allows MORE is an incident, and refusing avoids having to work out
      * which happened. */
+    { extern void rpc_node_set_relay_floors(unsigned long long, unsigned long long);
+      rpc_node_set_relay_floors((unsigned long long)g_cfg.minrelaytxfee_satkvb,
+                                (unsigned long long)g_cfg.incrementalrelayfee_satkvb); }
     rpc_acl_reset();
     for(int i = 0; i < g_cfg.n_rpcallowip; i++){
         if(!rpc_acl_add(g_cfg.rpcallowip[i])){
@@ -4829,6 +5141,22 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
             fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
                             "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
     }
+    /* -persistmempool: reload the dump the previous run left behind. Same
+     * code the importmempool RPC uses, so the two cannot drift apart on the
+     * format. A missing file is the ordinary case -- a fresh datadir, or a
+     * node that has never saved one -- and is not an error. Runs AFTER the RPC
+     * server is listening (2026-08-31): it used to gate it, and a reload of a
+     * few hundred transactions kept RPC dark for 13 minutes. The RPC thread
+     * answers meanwhile; getrawmempool is briefly partial, as in Core. */
+    if(CFG_PERSISTMEMPOOL()){
+        struct stat mst;
+        if(stat("mempool.dat", &mst) == 0){
+            long acc = rpc_node_mempool_load("mempool.dat");
+            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+        } else {
+            fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
+        }
+    }
 }
 
 extern volatile unsigned long long g_utxo_prog_phase, g_utxo_prog_done, g_utxo_prog_total;
@@ -4874,7 +5202,7 @@ static void* boot_utxo_progress(void* arg){
 static torctl_t g_torctl = { .fd = -1 };
 
 static int tor_onion_listener(int port){
-    if(!g_cfg.listen)      return -1;   /* not accepting inbound at all */
+    if(!g_cfg.listen){ fprintf(stderr,"[tor] listen=0 -- no onion service\n"); return -1; }
     if(!g_cfg.listenonion) { fprintf(stderr,"[tor] listenonion=0 -- no onion service\n"); return -1; }
 
     /* Core's default is the CHAIN default port + 1 (mainnet 8334), not our
@@ -4907,6 +5235,8 @@ static int tor_onion_listener(int port){
       if(addrself_set_onion(g_torctl.onion, (unsigned short)g_chainp->default_port))
           fprintf(stderr,"[tor] announcing %s:%d to onion peers\n",
                   g_torctl.onion, g_chainp->default_port); }
+    { extern void rpc_node_set_onion_local(const char*, int);
+      rpc_node_set_onion_local(g_torctl.onion, g_chainp->default_port); }
     return lo;
 }
 
@@ -4952,7 +5282,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
      * negative fd and returns revents==0 for it, so the accept branch below
      * is naturally dead in outbound-only mode -- no separate code path. */
-    struct pollfd pfds[MUX_MAX_OUT+3];   /* v4 + v6 + onion listeners, then legs */
+    /* +NETPERM_MAX_BIND for the -whitebind listeners, which sit after the
+     * onion slot and before the legs. The leg offset is DERIVED below, so
+     * adding these cannot reintroduce the off-by-one that once made every leg
+     * read the previous leg's revents. */
+    struct pollfd pfds[MUX_MAX_OUT+3+NETPERM_MAX_BIND];
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
@@ -4965,6 +5299,12 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * tor is unreachable, and poll() ignores a negative fd */
         int onionslot = nfds;
         pfds[nfds].fd=lo;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* -whitebind listeners: peers arriving here carry that entry's
+         * permissions, decided by WHICH socket accepted them. */
+        int wbslot = nfds;
+        for(int wi = 0; wi < g_wb_n; wi++){
+            pfds[nfds].fd=g_wb_fd[wi]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        }
         /* WHERE THE LEGS BEGIN, derived rather than written down. This used to
          * be a hardcoded 2, and when the IPv6 listener took pfds[1] the leg
          * loop kept starting at 1 -- every leg then read the PREVIOUS leg's
@@ -5024,12 +5364,27 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
         int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
         int ready_on = (lo >= 0 && (pfds[onionslot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
-        if(ready_v4 || ready_v6 || ready_on){
+        int wb_ready = -1;                       /* index into g_wb_fd, or -1 */
+        for(int wi = 0; wi < g_wb_n; wi++)
+            if(pfds[wbslot+wi].revents & (POLLIN|POLLHUP|POLLERR)){ wb_ready = wi; break; }
+        if(ready_v4 || ready_v6 || ready_on || wb_ready >= 0){
             struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c;
             char peerdesc[80];
-            if(ready_on){
+            unsigned accepted_perms = 0;
+            if(wb_ready >= 0){
+                /* Same rule as the onion listener above: the property comes
+                 * from the socket, not the source address. That is what makes
+                 * whitebind usable for a peer whose address you cannot
+                 * predict. */
+                int wfd = g_wb_fd[wb_ready];
+                c = accept(wfd,(struct sockaddr*)&ca,&cal);
+                accepted_perms = netperm_for_fd(wfd);
+                snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
+                if(c >= 0)
+                    fprintf(stderr,"[serve] inbound on whitebind listener from %s (noban)\n", peerdesc);
+            } else if(ready_on){
                 /* Arrived on the onion service's loopback target, so it IS an
                  * onion peer -- established by WHICH SOCKET accepted it, not
                  * by looking at the source address, which is always
@@ -5108,6 +5463,12 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
+                    /* This child serves exactly one peer, so the permissions
+                     * its listener granted are simply this process's. No
+                     * shared table, no fd keying, nothing to clean up when the
+                     * connection ends. */
+                    g_conn_perms = accepted_perms;
+                    for(int wi = 0; wi < g_wb_n; wi++) close(g_wb_fd[wi]);
                     /* BIP324 first, if enabled. A v1 peer is detected in-band
                      * -- it opens with magic + "version" + five NULs, and any
                      * mismatch in those 16 bytes proves v2 -- and detection
@@ -5139,7 +5500,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
                             hok==1?"connected":"handshake failed", v2res, getpid(), pv);
                     if(hok==1)
-                        node_serve_loop(c, node_log_open(g_logpath), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+                        node_serve_loop(c, (mkdir("logs", 0755), node_log_open(g_logpath)), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
                     close(c); _exit(0);
                 }
                 close(c);
@@ -5376,9 +5737,15 @@ int main(int argc, char** argv){
             fprintf(stderr,"[config] work : minimumchainwork not set -- no low-work floor\n");
       } }
     static char effdir[4200];                    /* the PER-CHAIN datadir */
-    chainparams_datadir(absp, effdir, sizeof effdir);   /* == absp on main */
+    chainparams_datadir(absp, effdir, sizeof effdir);   /* <datadir>/<chain>, main included (2026-08-31) */
+    /* EVERY chain chdirs into its own directory now. The old != CHAIN_MAIN
+     * guard left main's PARENT at the datadir root after the layout change:
+     * the worker used effdir and found data/main/, but the parent wrote the
+     * RPC cookie to data/.cookie and looked for mempool.dat one level up --
+     * caught on the first migrated boot (cookie "enabled" yet unreadable to
+     * the CLI, and the 10k-entry mempool.dat silently not reloaded). */
+    if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
     if(g_chainp->id != CHAIN_MAIN){
-        if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
         if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
         if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
     }
@@ -5443,7 +5810,9 @@ int main(int argc, char** argv){
      * never interleave with the mainnet log. */
     mkdir("logs", 0755);
     if(g_chainp->id != CHAIN_MAIN)
-        snprintf(g_logpath, sizeof g_logpath, "logs/bitcoind.%s.log", g_chainp->name);
+        ;   /* logs/bitcoind.log inside the CHAIN's directory -- per-chain by
+             * location now that every chain (main included) has its own
+             * subdirectory; the old bitcoind.<chain>.log suffix is redundant */
     /* `dir` is the EFFECTIVE (per-chain) datadir from here on: the forked
      * download worker re-chdir()s into it and utxo_live opens its files
      * there -- on the first regtest boot the worker's chdir(absp) put the
@@ -5469,7 +5838,7 @@ int main(int argc, char** argv){
         /* Connect to a built-in loopback fake peer (forked in-process), exactly
          * like the verified tests/test_bitcoind_sync harness, so the IBD
          * exchange matches node_sync cadence. */
-        int lfd = node_log_open(g_logpath);   /* all-asm leveled logger */
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));   /* all-asm leveled logger */
         node_log_str(lfd, 0, "node start (sync mode)", 22);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -5503,7 +5872,7 @@ int main(int argc, char** argv){
          * a re-derived-hash guard, and store_appends into the block store. */
         static unsigned char hstb[256];
         if(hst_init(hstb)!=1){ fprintf(stderr,"hst_init failed\n"); return 1; }
-        int lfd = node_log_open(g_logpath);
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
         node_log_str(lfd, 0, "node start (ibd mode)", 21);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -5531,7 +5900,7 @@ int main(int argc, char** argv){
          * mines after we synchronized. Logs tip growth each pass. This is the
          * live synchronization loop over the verified asm IB D core. */
         store_reload(store_buf);            /* continue from persisted tip */
-        int lfd = node_log_open(g_logpath);
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
         node_log_str(lfd, 0, "node start (follow mode)", 23);
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -5633,7 +6002,7 @@ int main(int argc, char** argv){
             printf("[server-test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
             exit((ok0&&okh)?0:2);
         }else{
-            int lfd=node_log_open(g_logpath);
+            int lfd=(mkdir("logs", 0755), node_log_open(g_logpath));
             close(sv[1]);
             int svo=serve_loop(sv[0], lfd);
             int st; waitpid(pid,&st,0); close(sv[0]);
@@ -5722,6 +6091,7 @@ int main(int argc, char** argv){
          * binding and refusing every connection, which is what the flag
          * actually means. */
         int l = g_cfg.listen ? lsock(port) : -1;
+        wb_listen_open();
         if(!g_cfg.listen) fprintf(stderr,"[boot] listen=0 -- not accepting inbound connections\n");
         /* Only a listener we ASKED for and failed to get is fatal. Under
          * listen=0 the -1 is the intended result, and this check used to
@@ -5844,7 +6214,9 @@ int main(int argc, char** argv){
          * same time). Self-throttling: a caught-up node returns almost
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
-        long caught = dl_catchup(dir, catchup_workers);
+        g_catchup_workers = catchup_workers;   /* the running worker re-uses it */
+        long caught = g_cfg.boot_catchup ? dl_catchup(dir, catchup_workers) : 0;
+        if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
                 caught, phase_elapsed(&catchup_pt));
         if(caught>0){
@@ -5954,9 +6326,10 @@ int main(int argc, char** argv){
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
-        int lfd = node_log_open(g_logpath);
+        int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
+        wb_listen_open();
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
         return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
     }

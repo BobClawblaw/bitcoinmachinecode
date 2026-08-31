@@ -401,6 +401,7 @@ regtest-e2e/
 # deploy snapshots: ~31MB binaries, one per deploy, kept on the host as the
 # rollback path. They are build products, not source.
 asm/daemon/bitcoind.deploy-*
+asm/daemon/bitcoind.live
 
 # ARM port build artifacts (this branch)
 scratch_daemon/
@@ -411,3 +412,7 @@ port/arm64/daemon_out/
 bitcoin.conf
 config/bitcoin.conf
 asm/.link-audit-cache/
+asm/tests/tool_*
+# per-chain live confs carry rpc credentials, like config/bitcoin.conf
+config/bitcoin.testnet4.conf
+config/bitcoin.regtest.conf

@@ -24,9 +24,11 @@
  * every inbound child once that's wired up).
  */
 #include "genesis_skip.h"
+#include "chainparams.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -61,6 +63,7 @@ extern long utxo_lsm_count(void* lst);
  * declaration here truncated it to 32 bits. */
 extern long utxo_lsm_walk(void* lst, void* u, void* cb, void* ctx);
 extern long utxo_lsm_compact(void* lst);
+extern long utxo_lsm_compact_range(void* lst, unsigned long lo, unsigned long k);
 extern void utxo_lsm_close(void* lst);
 
 /* ARM PORT (see bitcoin_utxo_lsm.S reload path): utxo_lsm_reload() /
@@ -156,16 +159,8 @@ extern void block_hash(u8 out[32], const u8 hdr[80]);
 #define UTXO_UNDO_PRUNE_SCAN 20000
 
 /* Must mirror bitcoin_utxo_lsm.asm's state struct exactly (168 bytes). */
-struct lsm_state {
-    long log_fd, idx_fd;
-    u64 log_len, ckpt_log_off, ckpt_n;
-    u64 op_count, op_threshold, fill_threshold;
-    void* tomb_buf; u64 tomb_cap, tomb_n, total_live, next_gen;
-    void* manifest_buf; u64 manifest_cap, manifest_n;
-    void* scratch_buf; u64 scratch_cap;
-    u64 next_run_no;
-    void* tomb_hash_buf; u64 tomb_hash_mask; /* LSM-owned, see bitcoin_utxo_lsm.asm */
-};
+#include "lsm_state.h"
+#include "lsm_manifest.h"
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536
 
@@ -177,7 +172,8 @@ struct lsm_state {
 #define UTXO_LIVE_MANIFEST_CAP  256
 /* compact once manifest_n crosses this -- bounds .do_tx's per-lookup
  * disk-run scan cost, not just disk-space hygiene (see file header). */
-#define UTXO_LIVE_COMPACT_THRESHOLD 12
+#define UTXO_LIVE_COMPACT_THRESHOLD 12   /* default for bmc.utxocompactthreshold */
+long utxo_live_compact_threshold(void);
 
 /* ---- BULK (far-behind) memtable sizing ---------------------------------
  * The steady-state sizing above is deliberately small so a per-inbound-child
@@ -214,7 +210,165 @@ struct lsm_state {
 #define UTXO_LIVE_BULK_MANIFEST_MIN 8L
 
 static void* g_utxo_table = 0;
+
 struct lsm_state g_utxo_lst;
+/* ---- compaction in the background ------------------------------------------
+ * Compaction rewrites the whole live set -- 13 GB on production -- and used to
+ * run inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
+ * 2026-08-31, invisible only because tip-following resumed afterwards. It
+ * touches nothing the applier mutates (immutable runs in, one run out, then
+ * the manifest), so it runs in a forked child now while apply continues.
+ *
+ * The one shared thing is the MANIFEST, and the protocol is:
+ *   - the child merges with unlink AND publish deferred
+ *     (utxo_lsm_set_defer_unlink/_publish): it writes its result manifest to
+ *     utxo_manifest.child and leaves its input runs on disk. The parent still
+ *     holds the old manifest and may open those runs by name; unlinking under
+ *     it would turn a lookup into a false miss;
+ *   - the parent keeps applying AND flushing meanwhile (a flush publishes the
+ *     manifest itself; the run numbers/gens the child uses were reserved
+ *     before it forked, so they cannot collide);
+ *   - on exit the parent adopts (lsm_manifest_adopt_child): [child's entries]
+ *     + [runs flushed since fork], live counter healed by the persisted
+ *     base's movement (the file's count is RUNS-ONLY, the running one also
+ *     has the WAL tail -- the inline compaction's own rule), publishes,
+ *     bumps the reader-cache epoch, THEN unlinks the inputs;
+ *   - mac_flush calls a hook first (utxo_lsm_set_flush_hook); the hook
+ *     adopts a finished child promptly so a flush never has to wait.
+ * Crash safety: a parent that dies mid-child leaves the manifest untouched
+ * (inputs present, the child's output an orphan); a child that dies leaves
+ * one orphan run. Orphans are swept at boot (lsm_manifest_sweep_orphans),
+ * before any writer exists. Shutdown kills the child; the merge is redone.
+ * that dies leaves the manifest untouched and one orphan output run. */
+extern void utxo_lsm_set_defer_unlink(long on);
+extern void utxo_lsm_set_defer_publish(long on);
+extern void utxo_lsm_set_flush_hook(void (*fn)(void));
+extern void lsm_mm_invalidate_all(void);
+static pid_t   g_cmp_pid = 0;
+static struct timespec g_cmp_t0;
+static u64     g_cmp_inputs[64]; static int g_cmp_nin = 0;
+static u64     g_cmp_n_before = 0;
+static long    g_cmp_height = 0;
+static void (*g_cmp_prev_sigchld)(int) = 0;
+static int     g_cmp_fallbacks = 0;
+static u64     g_cmp_old_base = ~0ULL;   /* persisted runs-only live count at fork time */
+static int     g_cmp_is_full = 0;        /* the k inputs were the whole manifest at fork */
+static u64     g_cmp_child_run = 0;      /* run_no reserved for the child's output */
+
+static void unlink_run(u64 run_no){
+    char n[64]; snprintf(n, sizeof n, "utxo_run_%06u.dat", (unsigned)run_no); unlink(n);
+}
+static int manifest_names(u64 run_no){
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
+    return 0;
+}
+static void compact_adopt(int st){
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0){
+        u64 nbase = ~0ULL;
+        if (lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase) != 0){
+            /* keep the old manifest: its runs are all still on disk (unlink
+             * was deferred), so this process stays consistent. The child's
+             * output is an orphan; drop it now rather than at next boot. */
+            unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
+            fprintf(stderr, "[utxo_live] background compaction finished in %.1fs but its manifest did not reconcile with ours -- discarded (run %lu), old run set kept\n",
+                    secs, (unsigned long)g_cmp_child_run);
+        } else {
+            lsm_mm_invalidate_all();
+            int gone = 0;
+            for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
+            long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
+            fprintf(stderr, "[utxo_live] background compaction done in %.1fs: manifest_n %lu -> %lu (%d merged into run %lu, %ld flushed meanwhile), %d input run(s) unlinked (started at height %ld; apply never waited)\n",
+                    secs, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, g_cmp_nin, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_height);
+        }
+    } else {
+        unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
+        fprintf(stderr, "[utxo_live] background compaction FAILED after %.1fs (%s %d) -- manifest unchanged, partial run %lu removed\n",
+                secs, WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st), (unsigned long)g_cmp_child_run);
+    }
+    g_cmp_pid = 0;
+    if (g_cmp_prev_sigchld) signal(SIGCHLD, g_cmp_prev_sigchld);
+}
+static void compact_poll(void){
+    if (!g_cmp_pid) return;
+    int st; pid_t r = waitpid(g_cmp_pid, &st, WNOHANG);
+    if (r == g_cmp_pid) compact_adopt(st);
+}
+/* mac_flush's gate: a flush is about to rewrite the manifest. It no longer
+ * waits for anything -- run numbers are reserved, adoption reconciles -- it
+ * just adopts a finished child first so the flush builds on the merged set. */
+static void compact_flush_hook(void){ compact_poll(); }
+/* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
+ * from the run files themselves. Returns k, sets *lo. */
+static long compact_pick_now(long* lo){
+    long n = (long)g_utxo_lst.manifest_n;
+    if (n < 2) return 0;
+    static u64 sizes[256];
+    if (n > 256) n = 256;
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (long i = 0; i < n; i++){
+        u64 r; memcpy(&r, e + i*16 + 8, 8);
+        char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)r);
+        struct stat sb; sizes[i] = stat(nm, &sb) == 0 ? (u64)sb.st_size : 0;
+    }
+    return lsm_compact_pick(sizes, n, utxo_live_compact_threshold(), 64, lo);
+}
+static long g_cmp_lo = 0;
+static int compact_start_async(long height, const char* why){
+    if (g_cmp_pid) return 0;
+    long lo = 0, k = compact_pick_now(&lo);
+    if (k == 0) return 0;
+    g_cmp_nin = (int)k; g_cmp_lo = lo;
+    const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
+    for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + (lo + i)*16 + 8, 8);
+    g_cmp_n_before = g_utxo_lst.manifest_n; g_cmp_height = height;
+    g_cmp_old_base = lsm_manifest_persisted_live();
+    /* SIGCHLD is SIG_IGN in the download worker (children auto-reap), which
+     * would make waitpid lose the exit status; take it back for our child. */
+    g_cmp_prev_sigchld = signal(SIGCHLD, SIG_DFL);
+    pid_t p = fork();
+    if (p < 0){
+        signal(SIGCHLD, g_cmp_prev_sigchld);
+        g_cmp_fallbacks++;
+        fprintf(stderr, "[utxo_live] fork for background compaction failed (%s) -- compacting inline\n", strerror(errno));
+        long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
+        UTXO_LSM_BARRIER();   /* ARM: compact may clobber callee-saved regs */
+        fprintf(stderr, "[utxo_live] %s compact at height %ld: manifest_n=%lu -> result=%ld\n", why, height, (unsigned long)g_utxo_lst.manifest_n, cr);
+        return 1;
+    }
+    if (p == 0){
+        /* child: no stdio (a parent thread may hold its lock at fork), no
+         * atexit, nothing but the merge. */
+        utxo_lsm_set_flush_hook(0);
+        utxo_lsm_set_defer_unlink(1);
+        utxo_lsm_set_defer_publish(1);
+        long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
+        UTXO_LSM_BARRIER();   /* ARM: compact may clobber callee-saved regs (child reads cr after) */
+        _exit(cr > 0 ? 0 : 2);
+    }
+    /* reserve the child's output number and generation: it uses the values
+     * it inherited; our next flush must skip them. */
+    g_cmp_child_run = g_utxo_lst.next_run_no; g_utxo_lst.next_run_no++; g_utxo_lst.next_gen++;
+    g_cmp_is_full = (lo == 0 && (u64)g_cmp_nin == g_utxo_lst.manifest_n);
+    g_cmp_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_cmp_t0);
+    fprintf(stderr, "[utxo_live] compaction of %d run(s) [%ld..%ld) of %lu started in background pid %d (%s at height %ld; %s) -- apply continues\n",
+            g_cmp_nin, lo, lo + k, (unsigned long)g_utxo_lst.manifest_n, (int)p, why, height,
+            g_cmp_is_full ? "full merge" : lo == 0 ? "oldest runs" : "newest runs, tombstones kept");
+    return 1;
+}
+/* For the daemon's shutdown path: a child mid-merge is killed, not awaited --
+ * shutdown has a 90 s budget and the merge is redone next boot for free. */
+void utxo_live_compact_shutdown(void){
+    if (!g_cmp_pid) return;
+    kill(g_cmp_pid, SIGKILL);
+    int st; while (waitpid(g_cmp_pid, &st, 0) < 0 && errno == EINTR) {}
+    fprintf(stderr, "[utxo_live] shutdown: killed background compaction pid %d (its partial run is an orphan)\n", (int)g_cmp_pid);
+    g_cmp_pid = 0;
+}
+/* How many compactions have run in this process (for tests/status). */
+int utxo_live_compaction_running(void){ return g_cmp_pid != 0; }
 static long  g_applied_height = -1;
 /* Height whose block is currently being applied -- the key undo records are
  * filed under. Set by apply_block_at before any walk begins. */
@@ -298,6 +452,7 @@ static inline int shutdown_requested(void){ return g_shutdown_flag && *g_shutdow
 /* One-shot per process lifetime (reset by init/close): has the
  * partially-applied-block check run yet? */
 static int g_recovery_checked = 0;
+static long g_recovery_result = 0;   /* utxo_live_recover_partial_block's verdict, once */
 
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -901,6 +1056,11 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * failing, 2026-08-22). Only reachable at all because the archive now
      * stores real genesis at index 0 as of the same day. */
     if (bmc_is_genesis_block((long)g_apply_height, blk_hash)) return 1;
+    /* a CUSTOM signet's genesis hash is derived from its challenge and is in
+     * no static list; ask the active chain params too (real header type --
+     * a hand-mirrored struct head is how offsets rot) */
+    { if (g_apply_height == 0 && g_chainp && g_chainp->genesis_hash &&
+          !memcmp(blk_hash, g_chainp->genesis_hash, 32)) return 1; }
 
     /* nBits schedule (see the block comment above apply_block_inner). The
      * check runs for the dry-run too -- submitblock and GBT proposal answer
@@ -1447,6 +1607,20 @@ long utxo_live_recover_partial_block(void* store_buf){
             rolled, lo, hi);
     return 1;
 }
+/* Boot hook (daemon/main.c): run the ghost-run repair BEFORE anything reads
+ * the set as truth. The coinstats index adopts its persisted state at the
+ * checkpoint height, or seeds itself from a walk -- both must see the
+ * repaired set, and the rollback's own restore/delete callbacks notify the
+ * index, which is right only if the index has not yet loaded. Catch-up used
+ * to do this on its first call, after the index had already looked; with
+ * batched checkpoints (below) a ghost run after a crash is the common case,
+ * not a rarity. Idempotent; catch-up keeps its own check as the fallback. */
+long utxo_live_recover_at_boot(void* store_buf){
+    if (g_recovery_checked) return g_recovery_result;
+    g_recovery_checked = 1;
+    g_recovery_result = utxo_live_recover_partial_block(store_buf);
+    return g_recovery_result;
+}
 
 /* utxo_live_unapply_block(buf, len, height) -> 1 clean / 0 failed.
  * Caller MUST have run utxo_live_can_unapply over the whole range first --
@@ -1549,6 +1723,35 @@ static long utxo_live_index_tip(void){
 /* Set while the memtable is bulk-sized, until catch-up downshifts it. */
 static int g_bulk_mode = 0;
 
+/* How many runs the manifest may hold before a compaction merges them.
+ *
+ * Until 2026-08-31 this was the UTXO_LIVE_COMPACT_THRESHOLD macro, and
+ * bmc.utxocompactthreshold -- parsed by node_config.c and printed at every boot
+ * as "compact_at=N" -- was never read by anything. An option that is accepted,
+ * printed and inert is the exact failure this codebase has shipped repeatedly;
+ * it is wired now.
+ *
+ * BULK MODE COMPACTS LESS OFTEN, by a factor of four. A compaction rewrites
+ * the ENTIRE live set (one big run; the merge folds the new ones into it),
+ * through three read syscalls and several write syscalls per record -- about
+ * 50 MB/s whatever the disk. Measured on signet mid catch-up: 15 compactions
+ * an hour, ~105 s each, 44% of wall-clock spent rewriting a 5 GB set instead
+ * of applying blocks. Every run carries a Bloom filter, so a lookup that
+ * misses costs one filter probe per extra run; while far behind that is far
+ * cheaper than the rewrites. Steady state is unchanged. */
+/* Test hook: g_bulk_mode is decided from the store at init, which a unit test
+ * of the threshold arithmetic has no business setting up. */
+void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+
+long utxo_live_compact_threshold(void){
+    long t = g_cfg.utxo_compact_threshold > 0 ? g_cfg.utxo_compact_threshold
+                                              : UTXO_LIVE_COMPACT_THRESHOLD;
+    if (g_bulk_mode) t *= 4;
+    if (t > 64) t = 64;   /* COMPACT_MAX_RUNS: a merge folds at most 64 runs */
+    if (t < 2) t = 2;
+    return t;
+}
+
 /* tx_verify.c's own parallel-verify dispatch: it must not fork() workers
  * while THIS process's memtable (and therefore its RSS) is bulk-sized and
  * still growing, since fork()'s copy-on-write cost scales with the parent's
@@ -1624,11 +1827,11 @@ int utxo_live_init(const char* dir){
     unsigned long slots = g_bulk_mode ? (1UL << g_cfg.utxo_bulk_slots_log2)
                                       : (1UL << UTXO_LIVE_SLOTS_LOG2);
     u64 blob_cap = g_bulk_mode ? ((u64)g_cfg.utxo_bulk_blob_mb << 20) : UTXO_LIVE_BLOB_BYTES;
-    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB\n",
+    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB compact_at=%ld\n",
             g_bulk_mode ? "BULK -- far behind, batch-sized memtable" : "steady-state",
             boot_applied, boot_tip, boot_gap,
             g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
-            (unsigned long long)(blob_cap >> 20));
+            (unsigned long long)(blob_cap >> 20), utxo_live_compact_threshold());
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
     u64 tomb_cap         = op_threshold;
@@ -1655,6 +1858,7 @@ int utxo_live_init(const char* dir){
     g_utxo_lst.tomb_buf = tomb_buf; g_utxo_lst.tomb_cap = tomb_cap;
     g_utxo_lst.manifest_buf = manifest_buf; g_utxo_lst.manifest_cap = manifest_cap;
     g_utxo_lst.scratch_buf = scratch_buf; g_utxo_lst.scratch_cap = scratch_cap;
+    utxo_lsm_set_flush_hook(compact_flush_hook);   /* see "compaction in the background" */
 
     /* Prior state can exist WITHOUT a manifest: utxo_manifest.dat is only
      * ever created at the first flush, but puts/dels before that point are
@@ -1698,10 +1902,11 @@ int utxo_live_init(const char* dir){
      * steady-state catch-up uses (UTXO_LIVE_COMPACT_THRESHOLD). Bounded by
      * manifest_cap iterations so a compact() that stops making progress
      * (e.g. every remaining run already merged) can't spin forever. */
-    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && guard < UTXO_LIVE_MANIFEST_CAP; guard++){
+    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
         u64 before = g_utxo_lst.manifest_n;
-        if (before < 2) break;
-        long cr = utxo_lsm_compact(&g_utxo_lst);
+        long lo = 0, k = compact_pick_now(&lo);
+        if (k == 0) break;   /* (subsumes the old before<2 guard: pick returns 0 for n<2) */
+        long cr = utxo_lsm_compact_range(&g_utxo_lst, (unsigned long)lo, (unsigned long)k);
         UTXO_LSM_BARRIER();   /* compact/reload may clobber callee-saved regs (ARM) */
         fprintf(stderr, "[utxo_live] init: pre-catchup compact manifest_n=%lu -> %lu (result=%ld)\n",
                 (unsigned long)before, (unsigned long)g_utxo_lst.manifest_n, cr);
@@ -1709,6 +1914,12 @@ int utxo_live_init(const char* dir){
     }
 
     g_applied_height = read_applied_height();
+    /* reload succeeded: the in-memory manifest is the truth, so sweep run files
+     * it does not name (publish-before-unlink crash leftovers, abandoned
+     * background merges). Guarded: refuses unless file and memory agree. */
+    { int sw = lsm_manifest_sweep_orphans(&g_utxo_lst);
+      if (sw > 0) fprintf(stderr, "[utxo_live] init: swept %d orphan file(s) the manifest does not name\n", sw);
+      else if (sw < 0) fprintf(stderr, "[utxo_live] init: orphan sweep skipped -- manifest file and memory disagree\n"); }
     fprintf(stderr, "[utxo_live] init dir=%s slots=2^%d %s applied_height=%ld manifest_n=%lu live=%ld\n",
             dir, g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
             have_prior_state ? "reload" : "fresh",
@@ -1723,6 +1934,42 @@ int utxo_live_init(const char* dir){
  * read (store_reload + one height comparison) when already caught up.
  * Returns the number of newly-applied heights (>=0), or -1 on a fatal
  * error (I/O or memtable-capacity failure -- see live_on_output). */
+/* ---- checkpoint batching during catch-up (2026-08-31) ----------------------
+ * persist_applied_height is tmp+fsync+rename+dirfsync plus the coinstats
+ * commit: 1.9 ms per block on the production NVMe against a ~3 ms apply --
+ * measured 2026-08-31, a third to a half of bulk catch-up. Far from the
+ * archive tip the checkpoint now lands every UTXO_CKPT_BATCH_BLOCKS blocks or
+ * 2 s, whichever first; within UTXO_CKPT_NEAR_TIP of the tip, and always at
+ * the live tip, it stays per block. The crash window this opens is exactly
+ * the multi-block ghost run utxo_live_recover_partial_block already heals
+ * (descending rollback from the undo files), so the batch must stay well
+ * inside UTXO_UNDO_WINDOW: every ghost needs its undo file. Loop exits and
+ * utxo_live_close flush a pending checkpoint. Core's shape, for reference:
+ * the UTXO batch and the best-block pointer are one atomic write, issued at
+ * dbcache pressure, not per block. */
+#define UTXO_CKPT_BATCH_BLOCKS 64      /* < UTXO_UNDO_WINDOW (200) */
+#define UTXO_CKPT_BATCH_MS     2000
+#define UTXO_CKPT_NEAR_TIP     64
+static long      g_ckpt_since = 0;      /* applied blocks not yet covered by a checkpoint */
+static long long g_ckpt_last_ms = 0;
+static long      g_test_ckpt_batch = -1;   /* test knob: -1 default, 0 per-block, n = batch n even at the tip */
+void utxo_live_test_set_ckpt_batch(long n){ g_test_ckpt_batch = n; }
+static long long mono_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
+/* Pure so tests/test_utxo_ckpt_batch pins it without a chain. */
+int utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, long long last_ms, long forced){
+    long batch = forced >= 0 ? forced : UTXO_CKPT_BATCH_BLOCKS;
+    if (batch <= 0) return 1;
+    if (forced < 0 && tip - h < UTXO_CKPT_NEAR_TIP) return 1;
+    if (unpersisted >= batch) return 1;
+    if (now_ms - last_ms >= UTXO_CKPT_BATCH_MS) return 1;
+    return 0;
+}
+static int ckpt_now(void){
+    if (!persist_applied_height(g_applied_height)) return 0;
+    g_ckpt_since = 0; g_ckpt_last_ms = mono_ms();
+    return 1;
+}
+
 long utxo_live_catchup(void* store_buf){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     store_reload(store_buf);
@@ -1734,10 +1981,11 @@ long utxo_live_catchup(void* store_buf){
      * fail on its own already-spent inputs. Roll N back before touching
      * anything else (see utxo_live_recover_partial_block). Runs before the
      * tip check so a caught-up node still repairs itself. */
-    if (!g_recovery_checked) {
+    if (!g_recovery_checked) {          /* normally already done by utxo_live_recover_at_boot */
         g_recovery_checked = 1;
-        if (utxo_live_recover_partial_block(store_buf) < 0) return -1;
+        g_recovery_result = utxo_live_recover_partial_block(store_buf);
     }
+    if (g_recovery_result < 0) return -1;
     if (tip < 0 || tip <= g_applied_height) return 0;
 
     static u8 blockbuf[8<<20];
@@ -1785,13 +2033,23 @@ long utxo_live_catchup(void* store_buf){
          * "missing/already-spent" -- because that block (and however many
          * after it) had already been durably applied before the crash, just
          * never checkpointed. See tests/test_utxo_catchup_crash_resume.c.
-         * The applied-height durability point closes the unbounded-drift
-         * crash window. NOTE (2026-08-28): batching this fsync was tried and
-         * REVERTED -- it made the persisted applied_height lag the actually
-         * applied LSM, so a restart re-applied already-applied blocks and
-         * false-rejected their coinbases with bad-txns-BIP30. Per-block
-         * persistence is load-bearing for applied-height == LSM coherence. */
-        if (!persist_applied_height(g_applied_height)) {
+         * fsync-per-block is not the throughput risk it looks like: bulk
+         * catch-up is already far slower than one fsync per block (observed
+         * production rate tops out around a few thousand blocks/sec even in
+         * the cheap early-chain stretch, and drops to single digits/sec once
+         * blocks carry real transaction volume), so this adds a small,
+         * bounded fraction of total replay time in exchange for closing an
+         * unbounded-drift crash window. NOTE (2026-08-28): a naive version of
+         * this batching was tried and REVERTED on the ARM port -- it let the
+         * persisted applied_height lag the applied LSM, so restarts re-applied
+         * already-applied blocks and false-rejected their coinbases with
+         * bad-txns-BIP30. THIS version is safe for a different reason: the
+         * batch (<= 64 blocks, always well inside UTXO_UNDO_WINDOW) is healed
+         * by the multi-block ghost-run boot recovery (utxo_live_recover_partial_block)
+         * -- un-checkpointed but durably applied blocks roll back from their
+         * undo files instead of re-applying. */
+        g_ckpt_since++;
+        if (utxo_live_ckpt_due(h, tip, g_ckpt_since, mono_ms(), g_ckpt_last_ms, g_test_ckpt_batch) && !ckpt_now()) {
             /* STOP, don't continue (2026-08-25). The old comment claimed
              * continuing was "safe, puts/dels are idempotent" -- false since
              * Stage D verifies before applying: every un-checkpointed block
@@ -1848,12 +2106,8 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
-        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
-            long cr = utxo_lsm_compact(&g_utxo_lst);
-            UTXO_LSM_BARRIER();   /* ARM: reload/compact may clobber callee-saved regs */
-            fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
-                    h, g_utxo_lst.manifest_n, cr);
-        }
+        compact_poll();                                   /* adopt a finished background merge */
+        compact_start_async(h, "mid-catchup");            /* inline-fallback path carries its own ARM barrier */
     }
     /* Caught up while bulk-sized: drop the flush thresholds back to
      * steady-state so the current WAL generation stops growing to bulk size.
@@ -1863,6 +2117,8 @@ long utxo_live_catchup(void* store_buf){
      * threshold and flushes naturally, which also resets the WAL. Lowering a
      * threshold under buffers sized for a bigger one is safe; the reverse
      * would not be. */
+    if (g_ckpt_since && !ckpt_now())          /* loop exit of any kind: land the pending batch */
+        fprintf(stderr, "[utxo_live] WARNING: failed to persist the batched checkpoint at height %ld\n", g_applied_height);
     if (g_bulk_mode && g_applied_height >= tip) {
         unsigned long ss = 1UL << UTXO_LIVE_SLOTS_LOG2;
         g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;
@@ -1917,11 +2173,8 @@ long utxo_live_catchup(void* store_buf){
         if (!persist_applied_height(g_applied_height)) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
-        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && !shutdown_requested()) {
-            long cr = utxo_lsm_compact(&g_utxo_lst);
-            UTXO_LSM_BARRIER();   /* ARM: reload/compact may clobber callee-saved regs */
-            fprintf(stderr, "[utxo_live] compact manifest_n=%lu -> result=%ld\n", g_utxo_lst.manifest_n, cr);
-        }
+        compact_poll();
+        if (!shutdown_requested()) compact_start_async(g_applied_height, "post-catchup");
     }
     return applied;
 }
@@ -2026,6 +2279,8 @@ long utxo_live_resolve(const u8 txid[32], unsigned long index,
 }
 
 void utxo_live_close(void){
+    if (g_ckpt_since) ckpt_now();            /* a clean close mid-batch persists */
+    utxo_live_compact_shutdown();
     utxo_lsm_close(&g_utxo_lst);
     UTXO_LSM_BARRIER();   /* ARM: close may clobber callee-saved regs */
     g_recovery_checked = 0;

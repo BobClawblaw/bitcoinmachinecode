@@ -606,6 +606,14 @@ timeout and can hang for minutes on a black-holed peer). Self-throttling: a
 node that's already caught up returns from `dl_catchup` almost instantly (pure
 disk reads, no network), so it's safe to run unconditionally on every boot.
 
+Since 2026-08-31 the same downloader also runs for a node that falls far behind
+while RUNNING (a long outage, a slow link): the download worker hands the gap to
+`dl_catchup` whenever a live peer announces a tip >= 2000 blocks past the
+archive and the node is not apply-bound (`dl_should_parallel_fetch`,
+`tests/test_parallel_trigger`), re-armed at most every 10 minutes. Measured on
+signet: 1903 s -> 245 s to the first 10,000 blocks. `bmc.bootcatchup=0` skips
+the boot-time run (the runtime trigger still covers the gap).
+
 **`index.dat` scans, in asm (`asm/bitcoin_idxscan.asm`):** `dl_catchup` reruns
 its archive-gap scan every status tick and every worker chunk-claim, so this
 logic used to be reimplemented separately in C at each of the 4 call sites
@@ -1093,11 +1101,11 @@ datadir root. See *Storing the chain*.
 |---|---|---|
 | `maxmempool` | `300` | mempool byte budget, MB. Full pool → feerate eviction. |
 | `mempoolexpiry` | `336` | drop txs older than this, hours. |
-| `minrelaytxfee` | `0.00001` | relay/mempool floor, BTC/kvB. |
-| `incrementalrelayfee` | `0.00001` | RBF / dynamic-minfee increment, BTC/kvB. |
-| `limitancestorcount` | `25` | max in-mempool ancestors. |
+| `minrelaytxfee` | `0.000001` | relay/mempool floor, BTC/kvB (Core v30 default: 0.1 sat/vB). |
+| `incrementalrelayfee` | `0.000001` | RBF / dynamic-minfee increment, BTC/kvB (Core v30 default). |
+| `limitancestorcount` | `64` | max in-mempool ancestors. Core v31 accepts by cluster (64 txs / 101 kvB) and keeps 25 only for wallet coin selection; 64 admits the same chains. |
 | `limitancestorsize` | `101` | max ancestor set, kvB. |
-| `limitdescendantcount` | `25` | max in-mempool descendants. |
+| `limitdescendantcount` | `64` | max in-mempool descendants (see above). |
 | `limitdescendantsize` | `101` | max descendant set, kvB. |
 | `mempoolfullrbf` | `1` | allow full-RBF replacement. |
 
@@ -1114,6 +1122,8 @@ datadir root. See *Storing the chain*.
 | `stopatheight` | `0` (off) | stop syncing at this height. |
 | `txindex` | `0` | maintain the full transaction index tail. |
 | `maxuploadtarget` | `0` (none) | upload budget, MB. |
+| `bmc.utxocompactthreshold` | `12` | runs in the UTXO manifest that trigger a compaction (x4 in bulk catch-up). Which runs merge is decided by size ratio (leveled); see `docs/DEPLOYMENT.md`. |
+| `bmc.bootcatchup` | `1` | run the parallel block downloader at boot. `0` skips it; the runtime trigger still runs it when the node falls >= 2000 blocks behind. |
 
 **Other**
 
@@ -1245,7 +1255,7 @@ bitcoinmachinecode/
 |   +-- bitcoin_script.asm     # der_parse_sig + verify_p2pkh (end-to-end P2PKH validate)
 |   +-- bitcoin_utxo.asm       # in-memory UTXO set (prevout value/script); also the LSM store's memtable engine
 |   +-- bitcoin_utxo_store.asm # WAL utxo.dat + idx checkpoint; also the LSM store's per-generation WAL engine
-|   +-- bitcoin_utxo_lsm.asm   # CHAIN-SCALE persistent UTXO: bounded memtable + sorted Bloom-filtered runs + compaction
+|   +-- bitcoin_utxo_lsm.asm   # CHAIN-SCALE persistent UTXO: bounded memtable + sorted Bloom-filtered runs + leveled compaction (runs in a forked child)
 |   +-- bech32.asm             # BIP173/350 bech32/bech32m address codec
 |   +-- bitcoin_bip32.asm      # BIP32 master/CKD/derive_path + xprv/xpub
 |   +-- bitcoin_bip39.asm      # BIP39 mnemonic<->seed (PBKDF2-HMAC-SHA512)

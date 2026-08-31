@@ -64,10 +64,13 @@ typedef struct {
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
- * 16 slots is generous: the worker drains every rotation, so a slot lives for
- * milliseconds. Slot payload matches the sendrawtransaction bound, so any
- * transaction this node will accept also fits the ring. */
-#define RPC_ZMQ_RING           16
+ * 16 slots looked generous -- the worker drains every rotation -- but a
+ * mempool.dat reload streams hundreds of accepts per second while the worker
+ * is busy doing the accepting, and production lapped a 16-slot ring by
+ * thousands (2026-08-31). 64 slots is ~26MB of the MAP_SHARED block
+ * (404KB payload each) and rides out the bursts; overrun past that is
+ * counted and reported, which is all a lossy PUB feed owes anyone. */
+#define RPC_ZMQ_RING           64
 #define RPC_ZMQ_TXMAX          RPC_TXSUBMIT_MAX
 
 typedef struct {
@@ -284,6 +287,12 @@ void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 void rpc_node_set_addrbook(void* ab, long (*count)(void*),
                            int (*get)(void*, long, ab2_rec_t*));
 void rpc_node_set_addrbook_dir(const char* dir);
+/* live network state for getnetworkinfo: reachability probe (BMC_NET_* id ->
+ * 0/1) and our i2p b32 destination, both owned by daemon/dialer.c; the onion
+ * hostname once the tor listener is up. All optional -- unset means the
+ * pre-transport defaults (ipv4/ipv6 only, no localaddresses). */
+void rpc_node_set_net_hooks(int (*reachable)(int), const char* (*i2p_b32)(void));
+void rpc_node_set_onion_local(const char* onion, int port);
 
 /* Hand the RPC layer the operator's addnode= list (node_config's
  * g_cfg.addnode / n_addnode), so getaddednodeinfo reports the real

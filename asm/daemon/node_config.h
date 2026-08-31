@@ -61,6 +61,12 @@ typedef struct {
                                     link dependency, it is compiled into many
                                     tools that never select a chain).        */
     int  listen;                 /* Core -listen                             */
+    /* bmc.bootcatchup: run the parallel downloader (dl_catchup) synchronously
+     * at boot when the archive is behind the header chain. Default 1. 0 skips
+     * it, leaving the running worker's far-behind trigger to do the same job
+     * later -- which is what the trigger's live test needs, and what an
+     * operator wants when a fast restart matters more than a full archive. */
+    int  boot_catchup;
     int  addrindex;              /* EXTENSION (no Core equivalent): live
                                     address index, daemon/addr_index_tail.c.
                                     Default 0; must be on before IBD.        */
@@ -137,8 +143,8 @@ typedef struct {
     long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
     /* mempool policy limits (Core exposes each of these). Fees are stored in
      * sat/vByte (Core's config is BTC/kvB; parsed at the boundary). */
-    long minrelaytxfee_satvb;    /* Core -minrelaytxfee (default 1 sat/vB)   */
-    long incrementalrelayfee_satvb; /* Core -incrementalrelayfee (default 1) */
+    long minrelaytxfee_satkvb;    /* Core -minrelaytxfee, sat/kvB (Core v30 default 100 = 0.1 sat/vB) */
+    long incrementalrelayfee_satkvb; /* Core -incrementalrelayfee, sat/kvB (default 100)          */
     long limitancestorcount;     /* Core -limitancestorcount (default 25)    */
     long limitancestorsize_kvb;  /* Core -limitancestorsize (kvB, default 101)*/
     long limitdescendantcount;   /* Core -limitdescendantcount (default 25)  */

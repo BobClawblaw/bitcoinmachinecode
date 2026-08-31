@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <stdint.h>
 #include "log_ts.h"
@@ -97,8 +100,47 @@ void tx_accept_set_tip(long tip){ g_next_height = tip + 1; }
  * down -- relay/serving of blocks and everything else keeps working. */
 int tx_dispatch_init(void){
     if (g_resolver){ g_ready = 1; return 1; }   /* live resolver: no snapshot */
+
+    /* SIZE THE SNAPSHOT TO THE WAL IT MUST HOLD, not to a constant.
+     *
+     * This replays utxo.dat -- the writer's current, unflushed WAL generation
+     * -- into a private memtable. TXACC_SLOTS_LOG2 (2^16) is right for the
+     * steady-state generation the writer keeps small precisely so this stays
+     * cheap. It is wrong the moment the writer has been in BULK mode: a
+     * far-behind catch-up lets the generation grow to ~500k live entries,
+     * and if the process dies mid-catch-up (a crash, or a kill), that is the
+     * WAL the next boot finds.
+     *
+     * Observed 2026-08-31 (signet, 81.5 MB WAL): the 2^16 table jammed solid
+     * after 65,536 puts, the replay returned -2 -- which the old check
+     * `r != -1` treated as READY -- and the recount that follows then looked
+     * up ~8.7M run-resident keys, each absent from the jammed table, each
+     * probe a full 65,536-slot lap: 99.9% CPU, no I/O, indefinitely. The
+     * node never got past "[boot] tx-validation snapshot". Had it finished,
+     * the snapshot would have been missing 7/8 of the set.
+     *
+     * Records are at least DEL_SIZE (44) bytes, so wal_bytes/44 bounds the
+     * entries from above; size for 3/4 fill and round to a power of two,
+     * never below the steady-state size. Scripts live in the blob and are a
+     * subset of the WAL's bytes, so the WAL size bounds that too. The
+     * bulk-shaped worst case is ~200 MB of table + the WAL again for the
+     * blob, inherited copy-on-write by children -- acceptable, and it only
+     * ever happens when the writer itself is already holding a 1 GB blob. */
     unsigned long slots = 1UL << TXACC_SLOTS_LOG2;
     u64 blob_cap = TXACC_BLOB_BYTES;
+    long wal_bytes = -1;
+    { struct stat st; if (stat("utxo.dat", &st) == 0) wal_bytes = (long)st.st_size; }
+    if (wal_bytes > 0){
+        u64 max_entries = (u64)wal_bytes / 44 + 1;
+        u64 want = max_entries * 4 / 3 + 1;
+        while (slots < want && slots < (1UL << 24)) slots <<= 1;
+        if ((u64)wal_bytes + (16UL<<20) > blob_cap) blob_cap = (u64)wal_bytes + (16UL<<20);
+    }
+    if (slots > (1UL << TXACC_SLOTS_LOG2))
+        fprintf(stderr, "[tx_accept] WAL is %ld bytes -- sizing the validation snapshot at 2^%d slots, "
+                        "%llu MB blob (the writer was bulk-sized when it last wrote)\n",
+                wal_bytes, __builtin_ctzl(slots), (unsigned long long)(blob_cap >> 20));
+
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
     u64 tomb_cap         = op_threshold;
@@ -131,8 +173,33 @@ int tx_dispatch_init(void){
      * daemon/utxo_live.c's own init logic and its header comment for the
      * bug this exact assumption caused there before it was fixed). */
     long r = utxo_lsm_reload(&g_lst, g_table);
-    g_ready = (r != -1);
-    if (!g_ready) fprintf(stderr, "[tx_accept] utxo_lsm_reload failed\n");
+    /* ANY negative return is a failure. -2 is "memtable too small for the WAL
+     * tail" (incident #32), and `r != -1` used to count it as ready -- which
+     * means a snapshot known to be missing entries would have been served. */
+    g_ready = (r >= 0);
+    if (!g_ready){
+        fprintf(stderr, "[tx_accept] utxo_lsm_reload failed (%ld)%s\n", r,
+                r == -2 ? " -- memtable too small for the WAL tail" : "");
+        return 0;
+    }
+    /* Cross-check against the WRITER's own live count, persisted in the first
+     * qword of its memtable map. The replay must reproduce it exactly; if it
+     * does not, this snapshot is wrong and must not validate anyone's
+     * transactions. Absent map (first boot) -> nothing to check against. */
+    { int fd = open("utxo_lsm_table.map", O_RDONLY);
+      if (fd >= 0){
+          unsigned long long writer_n = 0;
+          if (read(fd, &writer_n, 8) == 8){
+              extern long utxo_count(void*);
+              long mine = utxo_count(g_table);
+              if ((unsigned long long)mine != writer_n){
+                  fprintf(stderr, "[tx_accept] snapshot replayed %ld live entries but the writer "
+                                  "holds %llu -- REFUSING to serve a wrong snapshot\n", mine, writer_n);
+                  g_ready = 0;
+              }
+          }
+          close(fd);
+      } }
     return g_ready;
 }
 
@@ -441,6 +508,128 @@ static long txacc_sigop_cost(void* mp_area, const u8* tx, unsigned long txlen){
     return cost;
 }
 
+/* ---- Core v30/v31 sigop and witness standardness (policy, mempool-only) ----
+ * Checked BEFORE script verification, like Core's PreChecks: the transaction
+ * never needs to be executable for these verdicts.
+ *   - MAX_TX_LEGACY_SIGOPS (2,500, v30): legacy-counted sigops across all
+ *     input scriptSigs and output scriptPubKeys;
+ *   - MAX_STANDARD_TX_SIGOPS_COST (16,000): the accurate BIP141 cost the
+ *     sigop walker already computes (needs prevouts);
+ *   - IsWitnessStandard: P2WSH witness stack <= 100 items of <= 80 bytes
+ *     with a witnessScript <= 3,600; tapscript script-path stack elements
+ *     <= 80 bytes (annex handling is conservative: annexed inputs are not
+ *     judged). Non-static: tests/test_policy_v31.c drives them directly. */
+long txacc_legacy_sigops(const u8* tx, unsigned long txlen){
+    extern long script_sigops(const u8* script, unsigned long len);
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (txlen < 10) return -1;
+    p += 4;
+    int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
+    if (segwit) p += 2;
+    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc) return -1;
+    long total = 0;
+    for (u64 i = 0; i < nin; i++){
+        if ((unsigned long)(end - p) < 36) return -1;
+        p += 36;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return -1;
+        total += script_sigops(p, (unsigned long)sl);
+        p += sl;
+        if ((unsigned long)(end - p) < 4) return -1;
+        p += 4;
+    }
+    u64 nout = txacc_varint(&p, end, &cc); if (!cc) return -1;
+    for (u64 i = 0; i < nout; i++){
+        if ((unsigned long)(end - p) < 8) return -1;
+        p += 8;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return -1;
+        total += script_sigops(p, (unsigned long)sl);
+        p += sl;
+    }
+    return total;
+}
+const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long txlen){
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (txlen < 10) return 0;
+    p += 4;
+    int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
+    if (!segwit) return 0;
+    p += 2;
+    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc || nin == 0 || nin > 512) return 0;
+    struct { const u8* prev; u32 idx; const u8* ss; unsigned long ssl; } in[512];
+    for (u64 i = 0; i < nin; i++){
+        if ((unsigned long)(end - p) < 36) return 0;
+        in[i].prev = p; memcpy(&in[i].idx, p+32, 4); p += 36;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return 0;
+        in[i].ss = p; in[i].ssl = (unsigned long)sl; p += sl;
+        if ((unsigned long)(end - p) < 4) return 0;
+        p += 4;
+    }
+    u64 nout = txacc_varint(&p, end, &cc); if (!cc) return 0;
+    for (u64 i = 0; i < nout; i++){
+        if ((unsigned long)(end - p) < 8) return 0;
+        p += 8;
+        u64 sl = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < sl) return 0;
+        p += sl;
+    }
+    for (u64 i = 0; i < nin; i++){
+        u64 nitem = txacc_varint(&p, end, &cc); if (!cc) return 0;
+        unsigned long len_last = 0, max_excl_last = 0, max_excl_last2 = 0;
+        u8 last_first = 0;
+        for (u64 k = 0; k < nitem; k++){
+            u64 il = txacc_varint(&p, end, &cc); if (!cc || (u64)(end-p) < il) return 0;
+            if (k + 1 < nitem && (unsigned long)il > max_excl_last)  max_excl_last  = (unsigned long)il;
+            if (k + 2 < nitem && (unsigned long)il > max_excl_last2) max_excl_last2 = (unsigned long)il;
+            if (k + 1 == nitem){ len_last = (unsigned long)il; last_first = il ? p[0] : 0; }
+            p += il;
+        }
+        if (nitem == 0) continue;
+        u64 v; unsigned long h, cb, spkl; const u8* spk;
+        if (!txacc_resolve_verify(mp_area, in[i].prev, in[i].idx, &v, &h, &cb, &spk, &spkl))
+            continue;                        /* unresolvable inputs fail later anyway */
+        int is_p2sh = (spkl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87);
+        const u8* ws = spk; unsigned long wsl = spkl;
+        if (is_p2sh && in[i].ssl){
+            const u8* red = 0; unsigned long redl = 0;
+            if (sgc_last_push(in[i].ss, in[i].ssl, &red, &redl) && red){ ws = red; wsl = redl; }
+        }
+        if (wsl == 34 && ws[0] == 0x00 && ws[1] == 0x20){            /* P2WSH */
+            if (len_last > 3600)    return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_SCRIPT_SIZE */
+            if (nitem - 1 > 100)    return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_STACK_ITEMS */
+            if (max_excl_last > 80) return "bad-witness-nonstandard";  /* MAX_STANDARD_P2WSH_STACK_ITEM_SIZE */
+        } else if (!is_p2sh && spkl == 34 && spk[0] == 0x51 && spk[1] == 0x20){   /* P2TR */
+            /* Core policy.cpp IsWitnessStandard, taproot branch, verbatim:
+             * an annex (>= 2 items, last non-empty and starting 0x50) is
+             * nonstandard while no semantics are defined for it; a script
+             * path (>= 2 items after that) pops control block and script,
+             * and IF the leaf is tapscript (control[0] & 0xfe == 0xc0)
+             * every REMAINING item is capped at 80 bytes
+             * (MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE). Key path: no rule.
+             * Zero items is consensus-invalid; Core refuses it here too. */
+            if (nitem == 0) return "bad-witness-nonstandard";
+            if (nitem >= 2 && len_last > 0 && last_first == 0x50)
+                return "bad-witness-nonstandard";               /* annex */
+            if (nitem >= 2){
+                if (len_last == 0) return "bad-witness-nonstandard"; /* empty control block */
+                if ((last_first & 0xfe) == 0xc0 && max_excl_last2 > 80)
+                    return "bad-witness-nonstandard";
+            }
+        }
+    }
+    return 0;
+}
+/* the pre-script policy gate; returns NULL ok / reason. Also parks the sigop
+ * cost for the policy layer's bytespersigop-adjusted feerate. */
+static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long txlen){
+    extern void mpool_policy_set_pending_sigops(unsigned long long);
+    long lc = txacc_legacy_sigops(tx, txlen);
+    if (lc > 2500) return "bad-txns-legacy-sigops";              /* MAX_TX_LEGACY_SIGOPS, Core v30 */
+    long sc = txacc_sigop_cost(mp_area, tx, txlen);
+    if (sc > 16000) return "bad-txns-too-many-sigops";           /* MAX_STANDARD_TX_SIGOPS_COST */
+    const char* wr = txacc_witness_standard(mp_area, tx, txlen);
+    if (wr) return wr;
+    mpool_policy_set_pending_sigops(sc > 0 ? (unsigned long long)sc : 0ULL);
+    return 0;
+}
 /* One entry for all three accept paths. Returns 1 ok, else 0 with *rout. */
 static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
                                const char** rout){
@@ -465,7 +654,7 @@ static int txacc_script_verify(void* mp_area, const u8* tx, unsigned long txlen,
  * ~101KB ancestor/descendant byte budgets at 25 count each, BIP125 RBF
  * enabled. Not tuned/load-tested against real mainnet traffic yet -- a
  * reasonable, documented starting point (task #49). */
-#define TXACC_RELAY_FEE_RATE   1ULL
+#define TXACC_RELAY_FEE_RATE   100ULL   /* sat/kvB: Core v30 DEFAULT_MIN_RELAY_TX_FEE (0.1 sat/vB) */
 #define TXACC_MAX_ANC          25u
 #define TXACC_MAX_ANC_BYTES    101000u
 #define TXACC_MAX_DESC         25u
@@ -497,25 +686,28 @@ static void txacc_note_sigops(void* mp_area, const u8 txid[32], const u8* tx, un
     mp_unlock();
 }
 
+static void txacc_note_confirmed(const unsigned char* txid);   /* defined with the recently-confirmed set below */
 int tx_policy_init(void){
     /* config-driven where Core exposes the knob (defaults match Core's own);
      * falls back to the compiled defaults if the config layer is absent (a
      * standalone test that never calls node_config_load). */
     extern node_config_t g_cfg;
-    unsigned long long relay = g_cfg.minrelaytxfee_satvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satvb : TXACC_RELAY_FEE_RATE;
+    unsigned long long relay = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : TXACC_RELAY_FEE_RATE;   /* sat/kvB */
     unsigned anc  = g_cfg.limitancestorcount   > 0 ? (unsigned)g_cfg.limitancestorcount   : TXACC_MAX_ANC;
     unsigned ancb = g_cfg.limitancestorsize_kvb> 0 ? (unsigned)(g_cfg.limitancestorsize_kvb*1000) : TXACC_MAX_ANC_BYTES;
     unsigned dsc  = g_cfg.limitdescendantcount > 0 ? (unsigned)g_cfg.limitdescendantcount : TXACC_MAX_DESC;
     unsigned dscb = g_cfg.limitdescendantsize_kvb>0? (unsigned)(g_cfg.limitdescendantsize_kvb*1000): TXACC_MAX_DESC_BYTES;
     unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
     mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
+    { extern void mpool_policy_set_confirmed_hook(void (*)(const unsigned char*));
+      mpool_policy_set_confirmed_hook(txacc_note_confirmed); }
     { extern void mpool_policy_set_incremental(void*, unsigned long long);
       extern void mpool_policy_set_dust(void*, unsigned long long);
       extern void mpool_policy_set_datacarrier(void*, unsigned long long);
       extern void mpool_policy_set_acceptnonstd(void*, unsigned);
       extern void mpool_policy_set_baremultisig(void*, unsigned);
-      if (g_cfg.incrementalrelayfee_satvb > 0)
-          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satvb);
+      if (g_cfg.incrementalrelayfee_satkvb > 0)
+          mpool_policy_set_incremental(g_pol, (unsigned long long)g_cfg.incrementalrelayfee_satkvb);   /* sat/kvB */
       if (g_cfg.dustrelayfee_satkvb > 0)
           mpool_policy_set_dust(g_pol, (unsigned long long)g_cfg.dustrelayfee_satkvb);
       /* datacarrier=0 == a zero budget: every OP_RETURN output rejected as
@@ -575,9 +767,27 @@ int tx_policy_init(void){
  * is still visible without the flood. The sendrawtransaction path
  * (tx_accept_validate_reason) keeps full per-tx logging: user-submitted
  * transactions are rare and each one matters. */
+/* ---- recently confirmed (Core's m_recent_confirmed_transactions) ----------
+ * A transaction delivered over p2p AFTER the block carrying it was applied
+ * fails input resolution ("already-spent") and used to be parked as an orphan
+ * -- a slot wasted for two minutes and a parent request the peer cannot
+ * satisfy. Block connect records every txid the block carried in this rolling
+ * set; the relay path answers "already known" (-27) for them. 64K entries of
+ * an 8-byte prefix covers ~25 recent blocks' worth of transactions. */
+#define TXACC_RECENT_CONF (1u << 16)
+static u8 g_recent_conf[TXACC_RECENT_CONF][8];
+static unsigned g_recent_conf_w;
+static void txacc_note_confirmed(const unsigned char* txid){
+    memcpy(g_recent_conf[g_recent_conf_w % TXACC_RECENT_CONF], txid, 8); g_recent_conf_w++;
+}
+static int txacc_recently_confirmed(const u8* txid){
+    unsigned n = g_recent_conf_w < TXACC_RECENT_CONF ? g_recent_conf_w : TXACC_RECENT_CONF;
+    for (unsigned i = 0; i < n; i++) if (!memcmp(g_recent_conf[i], txid, 8)) return 1;
+    return 0;
+}
 #define TXACC_LOG_WINDOW_SECS 30
 static struct {
-    long acc, rej_missing, rej_invalid, rej_policy;
+    long acc, rej_missing, rej_invalid, rej_policy, known_conf;
     long t0;
     char last_invalid[96];
 } g_alog;
@@ -585,14 +795,14 @@ static void txacc_log_tick(void* mp_area){
     long now = (long)time(NULL);
     if (!g_alog.t0){ g_alog.t0 = now; return; }
     if (now - g_alog.t0 < TXACC_LOG_WINDOW_SECS) return;
-    if (g_alog.acc || g_alog.rej_missing || g_alog.rej_invalid || g_alog.rej_policy)
-        fprintf(stderr, "[tx_accept] last %lds: +%ld accepted (mempool %ld) | rejected: %ld missing-inputs, %ld invalid%s%s%s, %ld policy\n",
+    if (g_alog.acc || g_alog.rej_missing || g_alog.rej_invalid || g_alog.rej_policy || g_alog.known_conf)
+        fprintf(stderr, "[tx_accept] last %lds: +%ld accepted (mempool %ld) | rejected: %ld missing-inputs, %ld invalid%s%s%s, %ld policy | %ld already confirmed\n",
                 now - g_alog.t0, g_alog.acc, mpool_count(mp_area),
                 g_alog.rej_missing, g_alog.rej_invalid,
                 g_alog.last_invalid[0] ? " (last: \"" : "",
                 g_alog.last_invalid[0] ? g_alog.last_invalid : "",
                 g_alog.last_invalid[0] ? "\")" : "",
-                g_alog.rej_policy);
+                g_alog.rej_policy, g_alog.known_conf);
     memset(&g_alog, 0, sizeof g_alog);
     g_alog.t0 = now;
 }
@@ -601,6 +811,8 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     if (!g_ready || !g_pol_ready) return 0;
     txacc_log_tick(mp_area);
     void* placeholder_utxo = (void*)1; /* never dereferenced: mempool_resolve_confirmed_utxo ignores it */
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre) return 0; }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -632,6 +844,14 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
 /* The two -- and only two -- policy verdicts a package may overturn, in
  * Core's words. Exported so the relay drain and the submitpackage path
  * cannot drift apart on what "reconsiderable" means. */
+/* Live entries in the validation snapshot, or -1 before/without one. For the
+ * test that pins tx_dispatch_init's sizing against a WAL larger than the
+ * steady-state table. */
+long txacc_snapshot_count(void){
+    extern long utxo_count(void*);
+    return (g_ready && g_table) ? utxo_count(g_table) : -1;
+}
+
 int txacc_fee_reconsiderable(const char* reason){
     return reason && (!strcmp(reason, "min relay fee not met") ||
                       !strcmp(reason, "mempool min fee not met"));
@@ -657,7 +877,10 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
                             unsigned long txlen){
     if (!g_ready || !g_pol_ready) return -26;
     txacc_log_tick(mp_area);
+    if (txacc_recently_confirmed(txid)){ g_alog.known_conf++; return -27; }   /* already in a block: not an orphan */
     void* placeholder_utxo = (void*)1;
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre){ g_alog.rej_policy++; return -26; } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
@@ -694,12 +917,25 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (reason && rcap) reason[0] = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){
             if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "mandatory-script-verify-flag-failed");
+            /* missing-inputs is ORDINARY: out-of-order relay, and every
+             * mempool.dat reload's first pass (7,243 lines in 40 s after
+             * deploy `h` -- it read like a meltdown while the reload ended
+             * "5007 accepted, 0 rejected"). One line per 5 s; the 30 s
+             * summary carries the count. Real invalidity stays per-tx. */
+            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))){
+                /* no per-event line at all: with steady mainnet churn the
+                 * 5s mute still guaranteed a line every 5 seconds forever
+                 * (2026-08-31, operator: "wtf is that spam"). The 30s
+                 * summary's missing-inputs count is the record. */
+                return -25;
+            }
             fprintf(stderr, "[tx_accept] reject (txval): %s\n", r ? r : "");
-            if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
             return -26;
         }
     }
@@ -709,7 +945,13 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (padd != 1){
         const char* r = mpool_policy_reason(g_pol);
         if (reason && rcap) snprintf(reason, rcap, "%s", r ? r : "policy rejected");
-        fprintf(stderr, "[tx_accept] reject (policy): %s\n", r ? r : "");
+        { static long pol_last, pol_muted;              /* 1/min: informative but not a metronome */
+          long now = (long)time(NULL);
+          if (now - pol_last >= 60){
+              fprintf(stderr, "[tx_accept] reject (policy): %s%s\n", r ? r : "",
+                      pol_muted ? " (repeats muted; the 30s summary counts them)" : "");
+              pol_last = now; pol_muted = 1;
+          } }
         if (r && strstr(r, "already")) return -27;
         if (r && (strstr(r, "missing") || strstr(r, "inputs-spent"))) return -25;
         return -26;
@@ -738,6 +980,8 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     if (fee_out) *fee_out = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
+    { const char* pre = txacc_prechecks(mp_area, tx, txlen);
+      if (pre){ if (reason && rcap) snprintf(reason, rcap, "%s", pre); return -26; } }
     {
         const char* r = 0;
         if (!txacc_script_verify(mp_area, tx, txlen, &r)){

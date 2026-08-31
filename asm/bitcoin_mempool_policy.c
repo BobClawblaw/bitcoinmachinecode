@@ -97,8 +97,8 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
 #define TRUC_ANCESTOR_LIMIT    2
 #define TRUC_DESCENDANT_LIMIT  2
 #define MPOL_PKG_MAX     128      /* descendant-set walk bound: desc_cnt is
-                                   * capped at max_desc (25) by admission, so
-                                   * 128 is comfortable headroom */
+                                   * capped at max_desc (64 by default) by admission,
+                                   * so 128 is comfortable headroom */
 
 /* ---- package effective-feerate context ----------------------------------
  * Set for the duration of ONE package submission, by the worker, which is
@@ -154,7 +154,7 @@ static const char* _mpol_last_reason = "accepted";
 
 /* ---------------- config (pol): caller fills via mpool_policy_init --------- */
 typedef struct {
-    uint64_t relay_fee_rate;   /* min relay feerate, sat per vbyte (int) */
+    uint64_t relay_fee_rate;   /* min relay feerate, sat per kvB (Core v30 default 100 = 0.1 sat/vB) */
     uint32_t max_anc, max_anc_bytes;    /* counts; vsize budgets */
     uint32_t max_desc, max_desc_bytes;
     uint32_t rbf_enabled;      /* == Core mempoolfullrbf: replacement allowed
@@ -215,6 +215,12 @@ static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)s
 
 /* an optional "forget this txid" callback (daemon/mempool_cfg.c clears its
  * arrival-time table with it); NULL in the standalone tests */
+/* bytespersigop (Core DEFAULT_BYTES_PER_SIGOP 20): a sigop-dense transaction
+ * pays fees as if it were max(vsize, sigop_cost*5) vbytes. The accept caller
+ * computes the cost BEFORE admission and parks it here for the next
+ * mpol_accept; consumed once. */
+static uint64_t mpol_pending_sigops;
+void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_sigops = cost_x4; }
 static void (*g_forget_cb)(const unsigned char txid[32]) = 0;
 void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb = fn; }
 
@@ -244,15 +250,15 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->max_desc_bytes  = max_desc_bytes;
     pol->rbf_enabled     = rbf_enabled;
     pol->accept_nonstd   = 0;
-    pol->incremental_fee = relay_fee_rate * 1000;   /* sat/kvB */
+    pol->incremental_fee = relay_fee_rate;          /* sat/kvB, same unit */
     pol->dust_relay_kvb  = 3000;                    /* Core DUST_RELAY_TX_FEE */
     pol->datacarrier_bytes = 100000;                /* Core v31 default */
     pol->permit_bare_multisig = 1;                  /* Core DEFAULT_PERMIT_BAREMULTISIG */
 }
 
-void mpool_policy_set_incremental(void* polv, unsigned long long satvb){
+void mpool_policy_set_incremental(void* polv, unsigned long long satkvb){
     mpol_cfg* pol = (mpol_cfg*)polv;
-    if (satvb > 0) pol->incremental_fee = satvb * 1000;
+    if (satkvb > 0) pol->incremental_fee = satkvb;
 }
 void mpool_policy_set_dust(void* polv, unsigned long long satkvb){
     ((mpol_cfg*)polv)->dust_relay_kvb = satkvb;
@@ -857,7 +863,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     { uint64_t eff_fee   = g_pkg_vsize ? g_pkg_fee   : fee;
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
       /* min relay floor over VSIZE (Core "min relay fee not met") */
-      if (eff_fee < eff_vsize * pol->relay_fee_rate){
+      /* sigop-adjusted virtual size (Core GetVirtualTransactionSize with
+       * bytespersigop=20): max(vsize, sigop_cost*5) */
+      { uint64_t sv = mpol_pending_sigops * 5; if (sv > eff_vsize) eff_vsize = sv; mpol_pending_sigops = 0; }
+      if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
       uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
@@ -984,6 +993,62 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     uint64_t anc_bytes = vsize;
     for (uint32_t k=0;k<n_anc;k++) anc_bytes += t[anc_list[k]].size;
 
+    /* Core v31 accepts by CLUSTER: the connected component this tx joins may
+     * not exceed 64 transactions / 101 kvB (too-large-cluster). Our
+     * ancestor/descendant limits miss wide shapes (64 independent parents,
+     * one child = cluster 65 with anc_cnt 64). BFS over the union of the
+     * parents' clusters, bounded: the walk stops the moment it exceeds the
+     * limits. Children are found by scanning parent links, the same pattern
+     * collect_descendant_txids uses; the visited set caps at 65 nodes.
+     * An RBF replacement is measured against the cluster AS IT WILL BE:
+     * members of the eviction set (the conflicts and their descendants,
+     * removed if this tx is accepted) are invisible to the walk -- Core's
+     * cluster check likewise runs on the post-replacement diagram. Before
+     * this, a replacement joining a full cluster it was itself thinning
+     * was refused for the size it was about to free. */
+    if (n_par > 0){
+        enum { CLUSTER_LIMIT = 64, CLUSTER_SIZE_LIMIT = 101000 };
+        mpol_node* t = mpol_nodes_base(st);
+        uint32_t nn = *(uint32_t*)((char*)st+16);
+        uint32_t seen[CLUSTER_LIMIT + 1]; int nseen = 0;
+        uint32_t bfs[CLUSTER_LIMIT + 1]; int sp = 0;
+        uint64_t cl_bytes = 0; int too_big = 0;
+        #define MPOL_CL_EVICTED(ix) ({ int _ev = 0; \
+            for (int _e = 0; _e < n_evict; _e++) \
+                if (!memcmp(t[ix].txid, evict_set[_e], 32)){ _ev = 1; break; } _ev; })
+        /* seed from EVERY in-pool parent, not the MPOL_MAX_PARENTS(24)-capped
+         * par_idx: a 64-input child is exactly the wide shape this exists
+         * to refuse */
+        for (int i = 0; i < n_in && !too_big; i++){
+            int p = find_node(st, prev[i]);
+            if (p < 0) continue;
+            if (MPOL_CL_EVICTED((uint32_t)p)) continue;  /* cannot happen (a tx may not spend what it evicts) -- belt */
+            uint32_t pi = (uint32_t)p; int dup = 0;
+            for (int q = 0; q < nseen; q++) if (seen[q] == pi){ dup = 1; break; }
+            if (dup) continue;
+            if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
+            seen[nseen++] = pi; bfs[sp++] = pi; cl_bytes += t[pi].size;
+        }
+        while (sp > 0 && !too_big){
+            uint32_t cur = bfs[--sp];
+            for (uint32_t i = 0; i < nn && !too_big; i++){
+                int linked = 0;
+                for (uint32_t k = 0; k < t[i].n_parents; k++) if (t[i].parent[k] == cur){ linked = 1; break; }
+                if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (t[cur].parent[k] == i){ linked = 1; break; }
+                if (!linked) continue;
+                if (MPOL_CL_EVICTED(i)) continue;        /* leaves the pool if this tx is accepted */
+                int dup = 0;
+                for (int q = 0; q < nseen; q++) if (seen[q] == i){ dup = 1; break; }
+                if (dup) continue;
+                if (nseen >= CLUSTER_LIMIT){ too_big = 1; break; }
+                seen[nseen++] = (uint32_t)i; bfs[sp++] = (uint32_t)i; cl_bytes += t[i].size;
+            }
+        }
+        if (too_big || (uint64_t)nseen + 1 > CLUSTER_LIMIT || cl_bytes + vsize > CLUSTER_SIZE_LIMIT){
+            _mpol_last_reason = "too-large-cluster"; return 0;
+        }
+        #undef MPOL_CL_EVICTED
+    }
     if (anc_cnt > pol->max_anc){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
     if (anc_bytes > pol->max_anc_bytes){ _mpol_last_reason = "too-long-mempool-chain"; return 0; }
     for (uint32_t k=0;k<n_anc;k++){
@@ -1306,6 +1371,11 @@ extern int tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long
                    unsigned char* scratch, unsigned long scratch_cap)
     __attribute__((weak));
 
+/* Every txid a connected block carries is reported here (tx_accept keeps a
+ * rolling set of them: a tx that arrives over p2p after it confirmed is
+ * "already known", not an orphan -- Core's m_recent_confirmed_transactions). */
+static void (*mpol_confirmed_hook)(const unsigned char*) = 0;
+void mpool_policy_set_confirmed_hook(void (*fn)(const unsigned char*)){ mpol_confirmed_hook = fn; }
 long mpool_policy_block_connect(void* st, void* mp,
                                 const unsigned char* block, unsigned long blen){
     if (!tx_parse || !tx_txid) return -1;
@@ -1324,6 +1394,7 @@ long mpool_policy_block_connect(void* st, void* mp,
         unsigned char txid[32];
         /* a txid we could not compute must not be used to evict anything */
         if (tx_txid(txid, p, (unsigned long)txlen, scratch, sizeof scratch) != 1) return removed;
+        if (mpol_confirmed_hook) mpol_confirmed_hook(txid);
         if (j > 0){
             /* the confirmed tx leaves alone; txs CONFLICTING with its spends
              * leave with their descendants */

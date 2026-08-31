@@ -41,7 +41,7 @@ int main(void){
 
     printf("== THE BUG: rpcport from the config, not a hardcoded 8332 ==\n");
     wr("bitcoin.conf", "rpcport=8331\nport=8332\nchain=main\n");
-    wr(".cookie", "__cookie__:secret\n");
+    mk("main"); wr("main/.cookie", "__cookie__:secret\n");   /* main lives in its own subdir now */
     ok(cli_conf_resolve(DIR, 0, &c, &err) == 1, "resolves");
     ok(c.port == 8331, "port is the configured 8331, NOT the P2P port 8332");
     ok(c.from_cookie && !strcmp(c.user, "__cookie__") && !strcmp(c.pass, "secret"),
@@ -77,7 +77,7 @@ int main(void){
     { char sub[512]; snprintf(sub, sizeof sub, "%s/data", DIR); mkdir(sub, 0755);
       snprintf(sub, sizeof sub, "%s/config", DIR); mkdir(sub, 0755); }
     wr("config/bitcoin.conf", "rpcport=7777\n");
-    wr("data/.cookie", "__cookie__:d\n");
+    mk("data/main"); wr("data/main/.cookie", "__cookie__:d\n");   /* main subdir layout */
     { char dd[512]; snprintf(dd, sizeof dd, "%s/data", DIR);
       ok(cli_conf_resolve(dd, 0, &c, &err) == 1 && c.port == 7777,
          "<datadir>/../config/bitcoin.conf is consulted"); }

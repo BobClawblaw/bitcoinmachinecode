@@ -61,8 +61,16 @@ int zmqn_drain(void){
     if (head - g_zn_cursor > RPC_ZMQ_RING){
         unsigned long long lost = head - g_zn_cursor - RPC_ZMQ_RING;
         st->zmq_lost += lost;
-        fprintf(stderr, "[zmq] notification ring overrun: %llu transaction(s) not published "
-                        "(total %llu)\n", lost, st->zmq_lost);
+        /* 1/min: during a mempool reload this fired several times a second,
+         * and the cumulative total makes per-event lines redundant. */
+        { static long ovr_last; static int ovr_muted;
+          long now = (long)time(NULL);
+          if (now - ovr_last >= 60){
+              fprintf(stderr, "[zmq] notification ring overrun: %llu transaction(s) not published "
+                              "(total %llu)%s\n", lost, st->zmq_lost,
+                              ovr_muted ? " (repeats muted; the total is cumulative)" : "");
+              ovr_last = now; ovr_muted = 1;
+          } }
         g_zn_cursor = head - RPC_ZMQ_RING;
     }
 

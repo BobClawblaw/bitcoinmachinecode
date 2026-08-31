@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include "../daemon/chainparams.h"
+#include "../daemon/genesis_skip.h"
 #include "../script_flags_consts.h"
 
 typedef unsigned char u8;
@@ -137,7 +138,9 @@ int main(void){
     { char out[256];
       mkdir("/tmp/bmc-cp-test", 0755);   /* parent for the subdir mkdir */
       chainparams_datadir("/tmp/bmc-cp-test", out, sizeof out);
-      ck("main datadir is the base itself", !strcmp(out, "/tmp/bmc-cp-test"));
+      struct stat sbm;
+      ck("main datadir is base/main and was created (every chain in its own subdir)",
+         !strcmp(out, "/tmp/bmc-cp-test/main") && stat(out, &sbm) == 0 && S_ISDIR(sbm.st_mode));
       chainparams_select("regtest");
       chainparams_datadir("/tmp/bmc-cp-test", out, sizeof out);
       struct stat sb;
@@ -170,9 +173,22 @@ int main(void){
       memcpy(regh, g_chainp->genesis_hash, 32);
       ck("select(testnet4)", chainparams_select("testnet4") == 1);
       memcpy(t4h, g_chainp->genesis_hash, 32);
+      unsigned char sigh[32];
+      ck("select(signet)", chainparams_select("signet") == 1);
+      memcpy(sigh, g_chainp->genesis_hash, 32);
       ck("main and regtest genesis differ",   memcmp(mainh, regh, 32) != 0);
       ck("main and testnet4 genesis differ",  memcmp(mainh, t4h, 32) != 0);
       ck("regtest and testnet4 genesis differ", memcmp(regh, t4h, 32) != 0);
+      ck("signet genesis differs from all",   memcmp(sigh, mainh, 32) != 0 && memcmp(sigh, regh, 32) != 0 && memcmp(sigh, t4h, 32) != 0);
+      /* Core stores NO chain's genesis coinbase; every real genesis must be
+       * recognised by the skip. Signet was MISSING until 2026-08-31: its
+       * nodes carried an extra 50 BTC output, found only when the whole set
+       * was compared against a Core oracle's gettxoutsetinfo. */
+      ck("skip knows main's genesis",     bmc_is_genesis_block(0, mainh));
+      ck("skip knows regtest's genesis",  bmc_is_genesis_block(0, regh));
+      ck("skip knows testnet4's genesis", bmc_is_genesis_block(0, t4h));
+      ck("skip knows signet's genesis",   bmc_is_genesis_block(0, sigh));
+      ck("...but only at height 0",       !bmc_is_genesis_block(1, mainh));
       chainparams_select("main"); }
 
     printf("== signet (BIP325) ==\n");

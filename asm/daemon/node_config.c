@@ -56,11 +56,11 @@ node_config_t g_cfg = {
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
     .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
-    .minrelaytxfee_satvb   = 1,      /* Core -minrelaytxfee 0.00001 BTC/kvB  */
-    .incrementalrelayfee_satvb = 1,  /* Core -incrementalrelayfee default    */
-    .limitancestorcount    = 25,     /* Core -limitancestorcount default     */
+    .minrelaytxfee_satkvb  = 100,    /* Core -minrelaytxfee 0.000001 BTC/kvB (v30: 0.1 sat/vB) */
+    .incrementalrelayfee_satkvb = 100, /* Core -incrementalrelayfee default (v30)             */
+    .limitancestorcount    = 64,     /* Core v31 accepts by CLUSTER (64 txs / 101 kvB); 25 is only the wallet default now */
     .limitancestorsize_kvb = 101,    /* Core -limitancestorsize default (kvB)*/
-    .limitdescendantcount  = 25,     /* Core -limitdescendantcount default   */
+    .limitdescendantcount  = 64,     /* same: a chain of up to 64 is one cluster of 64   */
     .limitdescendantsize_kvb = 101,  /* Core -limitdescendantsize default    */
     .mempoolfullrbf        = 1,      /* Core -mempoolfullrbf default (v28+)  */
     .dustrelayfee_satkvb   = 3000,   /* Core DUST_RELAY_TX_FEE               */
@@ -132,7 +132,8 @@ static const char* const k_unimplemented[] = {
      * three below are not: whitebind needs a second listener carrying its own
      * permissions, and whitelistrelay/whitelistforcerelay are relay
      * permissions with no enforcement point here yet. */
-    "whitebind","whitelistrelay","whitelistforcerelay",
+    /* whitebind is IMPLEMENTED (daemon/netperm.c + main.c's accept loop). */
+    "whitelistrelay","whitelistforcerelay",
     "txreconciliation","natpmp","upnp","bytespersigop",
     "peerbloomfilters","peerblockfilters",
     /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
@@ -187,6 +188,7 @@ static void set_defaults(void){
     g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
     g_cfg.signetchallenge[0]    = 0;
+    g_cfg.boot_catchup          = 1;
     g_cfg.rpcbind[0]            = 0;
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
@@ -223,11 +225,11 @@ static void set_defaults(void){
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
     g_cfg.maxuploadtarget_mb    = 0;
-    g_cfg.minrelaytxfee_satvb   = 1;
-    g_cfg.incrementalrelayfee_satvb = 1;
-    g_cfg.limitancestorcount    = 25;
+    g_cfg.minrelaytxfee_satkvb  = 100;
+    g_cfg.incrementalrelayfee_satkvb = 100;
+    g_cfg.limitancestorcount    = 64;
     g_cfg.limitancestorsize_kvb = 101;
-    g_cfg.limitdescendantcount  = 25;
+    g_cfg.limitdescendantcount  = 64;
     g_cfg.limitdescendantsize_kvb = 101;
     g_cfg.mempoolfullrbf        = 1;
     g_cfg.dustrelayfee_satkvb   = 3000;
@@ -439,14 +441,16 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
             t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
         /* mempool policy limits (Core limit-count/size, relay fees, mempoolfullrbf).
-         * The two fees are BTC/kvB in Core's config; convert to sat/vByte:
-         * sat/vB = round(BTC/kvB * 1e8 / 1000) = round(BTC/kvB * 1e5). */
+         * The two fees are BTC/kvB in Core's config; keep them in sat/kvB
+         * (round(BTC/kvB * 1e8)). Integer sat/vB could not represent Core's
+         * v30 default of 0.1 sat/vB -- which is how this node kept refusing
+         * everything between 0.1 and 1 sat/vB that its peers relay. */
         else if(!strcmp(key,"minrelaytxfee") || !strcmp(key,"incrementalrelayfee")){
             double btc = atof(val);
-            long satvb = (long)(btc * 1e5 + 0.5);
-            if(satvb < 0) satvb = 0;
-            if(!strcmp(key,"minrelaytxfee"))      g_cfg.minrelaytxfee_satvb = satvb;
-            else                                  g_cfg.incrementalrelayfee_satvb = satvb;
+            long satkvb = (long)(btc * 1e8 + 0.5);
+            if(satkvb < 0) satkvb = 0;
+            if(!strcmp(key,"minrelaytxfee"))      g_cfg.minrelaytxfee_satkvb = satkvb;
+            else                                  g_cfg.incrementalrelayfee_satkvb = satkvb;
             applied++; }
         else if(!strcmp(key,"limitancestorcount")){
             t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitancestorcount=t; applied++; } }
@@ -497,6 +501,11 @@ long node_config_load(const char* path){
             g_cfg.persistmempool = iv?1:0; applied++; }
         else if(!strcmp(key,"reindex-chainstate")){
             g_cfg.reindex_chainstate = iv?1:0; applied++; }
+        else if(!strcmp(key,"whitebind")){    /* Core: permissions by listener */
+            const char* wberr = 0;
+            if(netperm_whitebind_add(val, &wberr)) applied++;
+            else { fprintf(stderr,"[config] whitebind=%s rejected: %s\n",
+                           val, wberr ? wberr : "?"); bad++; } }
         else if(!strcmp(key,"rpcallowip")){   /* Core: HTTP allow list */
             if(g_cfg.n_rpcallowip >= 16){
                 fprintf(stderr,"[config] rpcallowip: at most 16 entries -- ignoring %s\n", val); bad++; }
@@ -575,6 +584,7 @@ long node_config_load(const char* path){
                 snprintf(g_cfg.onlynet[g_cfg.n_onlynet],8,"%s",val);
                 g_cfg.n_onlynet++; applied++;
             } else fprintf(stderr,"[config] onlynet: at most 6 networks\n"); }
+        else if(!strcmp(key,"bmc.bootcatchup")){ g_cfg.boot_catchup = iv ? 1 : 0; applied++; }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
         else if(!strcmp(key,"prune")){
@@ -757,7 +767,7 @@ void node_config_log(void){
     fprintf(stderr,"[config] pool : maxmempool=%ldMB mempoolexpiry=%ldh maxuploadtarget=%ldMB\n",
             g_cfg.maxmempool_mb, g_cfg.mempoolexpiry_h, g_cfg.maxuploadtarget_mb);
     fprintf(stderr,"[config] mpol : minrelay=%ld inc=%ld sat/vB, anc=%ld/%ldkvB desc=%ld/%ldkvB fullrbf=%d\n",
-            g_cfg.minrelaytxfee_satvb, g_cfg.incrementalrelayfee_satvb,
+            g_cfg.minrelaytxfee_satkvb, g_cfg.incrementalrelayfee_satkvb,
             g_cfg.limitancestorcount, g_cfg.limitancestorsize_kvb,
             g_cfg.limitdescendantcount, g_cfg.limitdescendantsize_kvb, g_cfg.mempoolfullrbf);
     fprintf(stderr,"[config] res  : par=%d (%s) maxreceivebuffer=%d*1000B\n",

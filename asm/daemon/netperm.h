@@ -46,4 +46,35 @@ int netperm_has_implicit(void);
 /* Drop every entry. For tests; the daemon configures once at boot. */
 void netperm_reset(void);
 
+
+/* ---------------------------------------------------------------- whitebind
+ * Core -whitebind=[permissions@]<addr>:<port>: bind an ADDITIONAL listener and
+ * grant every peer that arrives on it those permissions.
+ *
+ * The distinction from -whitelist is the whole point: whitelist grants by the
+ * PEER's address, whitebind by WHICH SOCKET accepted the connection. This node
+ * already establishes one property that way -- a peer accepted on the onion
+ * service's loopback target IS an onion peer, because its source address is
+ * always 127.0.0.1 and tells you nothing. whitebind is the same shape, and is
+ * the only way to grant permissions to a peer whose address you cannot
+ * predict (behind NAT, or reaching you over a tunnel).
+ *
+ * Same permission scope as -whitelist: `noban` is enforced, every other Core
+ * token is a startup error naming it. */
+#define NETPERM_MAX_BIND 8
+
+/* Parse and store one -whitebind. 1 stored, 0 rejected (*err set). */
+int netperm_whitebind_add(const char* spec, const char** err);
+
+int netperm_whitebind_count(void);
+/* Listener i: its bind address (printable), port, and granted flags. */
+const char* netperm_whitebind_addr(int i);
+int         netperm_whitebind_port(int i);
+unsigned    netperm_whitebind_flags(int i);
+
+/* Record that a listening fd grants `flags`, then look it up on accept. -1
+ * clears. Keyed by fd because that is what the accept loop holds. */
+void     netperm_bind_fd(int fd, unsigned flags);
+unsigned netperm_for_fd(int fd);
+
 #endif
