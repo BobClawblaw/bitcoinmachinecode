@@ -1290,6 +1290,10 @@ tests/bench_lsm_compact: tests/bench_lsm_compact.c $(UTXOLSMOBJS)
 tests/bench_lsm_leveled: tests/bench_lsm_leveled.c daemon/lsm_manifest.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 -I daemon -o $@ tests/bench_lsm_leveled.c daemon/lsm_manifest.c $(UTXOLSMOBJS)
 
+# Manual repair tool: delete one outpoint from a UTXO LSM store (see its header). Not a test.
+tests/tool_utxo_del: tests/tool_utxo_del.c $(UTXOLSMOBJS)
+	$(CC) -no-pie -O2 -I daemon -o $@ tests/tool_utxo_del.c $(UTXOLSMOBJS)
+
 # ---- UTXO set hash / gettxoutsetinfo (ASSESSMENT.md 4, FEATURE_GAPS.md) ----
 # MuHash3072, byte-compatible with Core's, plus the per-coin filter and
 # serialization that turn our LSM set into a figure comparable with

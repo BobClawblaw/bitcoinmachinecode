@@ -24,6 +24,7 @@
  * every inbound child once that's wired up).
  */
 #include "genesis_skip.h"
+#include "chainparams.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1008,6 +1009,11 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * failing, 2026-08-22). Only reachable at all because the archive now
      * stores real genesis at index 0 as of the same day. */
     if (bmc_is_genesis_block((long)g_apply_height, blk_hash)) return 1;
+    /* a CUSTOM signet's genesis hash is derived from its challenge and is in
+     * no static list; ask the active chain params too (real header type --
+     * a hand-mirrored struct head is how offsets rot) */
+    { if (g_apply_height == 0 && g_chainp && g_chainp->genesis_hash &&
+          !memcmp(blk_hash, g_chainp->genesis_hash, 32)) return 1; }
 
     /* nBits schedule (see the block comment above apply_block_inner). The
      * check runs for the dry-run too -- submitblock and GBT proposal answer
