@@ -292,6 +292,22 @@ second, before a gate ran.
 Using prerequisites as the link set is sound *because* `prereq-check` enforces
 the other direction. The two audits lean on each other deliberately.
 
+
+**Since 2026-08-31 the unit runs a pinned snapshot, not the tree binary.**
+`ExecStart` points at `asm/daemon/bitcoind.live`, a symlink to the current
+`bitcoind.deploy-YYYYMMDD<letter>` snapshot. A rebuild in the tree therefore
+changes nothing until you relink; a plain `systemctl restart` always boots the
+snapshot it booted last time. Deploy = build, snapshot, relink, restart:
+
+```
+cd /storage/bitcoinmachinecode/asm
+make daemon/bitcoind
+cp -a daemon/bitcoind daemon/bitcoind.deploy-$(date +%Y%m%d)x     # pick the next letter
+ln -sfn bitcoind.deploy-$(date +%Y%m%d)x daemon/bitcoind.live
+sudo systemctl restart bmc-bitcoind
+```
+Rollback is `ln -sfn <previous snapshot> daemon/bitcoind.live` + restart.
+
 ## Operating it
 
 - **Deploy sequence.** The systemd unit executes `asm/daemon/bitcoind` from
@@ -702,3 +718,30 @@ Operational notes:
   parent-before-child; entries rejected for missing inputs are retried in
   passes until nothing more is admitted (`loaded mempool.dat: ... (N waited
   for a parent, M of them then accepted)`).
+
+## Relay: orphans, confirmed transactions, chain limits (2026-08-31, later)
+
+- **`notfound` clears the request ring.** A parked orphan's parent is requested
+  from the announcing peer; if that peer answers `notfound` (Core will not serve
+  a transaction it has not announced to us until it is 2 minutes old), the
+  parent's txid used to stay in the "recently requested" ring and every later
+  announcement of it was ignored -- the child expired. Production after the
+  fee-floor fix still showed 6,324 parked / 538 resolved / 5,530 dropped in an
+  hour. The ring entry is now dropped on `notfound`; `test_tx_relay` case 12
+  replays request -> notfound -> inv -> request again.
+- **Recently confirmed transactions are "already known".** Block connect records
+  every txid the block carried (64K rolling); a copy arriving over p2p
+  afterwards is answered -27 instead of being parked as an orphan and having
+  its parents requested. Counted as `already confirmed` in the `[tx_accept]`
+  summary line. Case 13.
+- **Chain limits follow Core v31.** Core now accepts by *cluster* (64
+  transactions / 101 kvB) and keeps `-limitancestorcount` (25) only for wallet
+  coin selection. Our defaults for `limitancestorcount`/`limitdescendantcount`
+  are 64 so a chain the network relays is not refused at 26. Wide trees are
+  admitted slightly more permissively than Core's cluster count (a known gap;
+  it affects only this node's own mempool, not consensus).
+- **Boot warning "block data is NOT laid out monotonically"** is pre-existing
+  and expected on any archive filled by the parallel downloader (chunks land
+  out of order in the blk files). It is informational: only archive truncation
+  and pruning refuse to run on such a layout. Fixing it means rewriting the
+  block files in height order -- a maintenance tool, not a runtime change.

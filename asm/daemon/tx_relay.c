@@ -96,6 +96,19 @@ static void txr_ring_add(const u8* txid){
     memcpy(txr_ring[txr_ring_w % TXR_RING], txid, 8);
     txr_ring_w++;
 }
+/* A `notfound` for something we asked for: forget that we asked, so the
+ * next announcement (or the next orphan wanting it as a parent) requests it
+ * again. Core does the same by dropping the in-flight entry. Without this,
+ * an orphan whose parent was too fresh for the peer to serve (Core will not
+ * hand out a tx it has not announced to us unless it is 2 minutes old) could
+ * never be resolved: the ring suppressed every later fetch and the child
+ * expired -- production 2026-08-31: 6,324 parked, 538 resolved, 5,530 dropped
+ * in one hour AFTER the fee-floor fix. */
+static void txr_ring_del(const u8* txid){
+    for (unsigned i = 0; i < TXR_RING; i++)
+        if (!memcmp(txr_ring[i], txid, 8)) memset(txr_ring[i], 0xff, 8);   /* never a real prefix in practice */
+}
+static long txr_notfound_seen;              /* counter for the stats line */
 
 /* ---- reconsiderable set (Core's m_lazy_recent_rejects_reconsiderable) ----
  * A transaction rejected ONLY because it did not clear a fee floor is the
@@ -711,6 +724,16 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
         }
         if (!memcmp(cmd, "notfound", 9)){
             if (outstanding > 0) outstanding = 0;      /* stop waiting */
+            unsigned cc;
+            unsigned long n = txr_varint(pl, pl + plen, &cc);
+            for (unsigned long i = 0; cc && i < n; i++){
+                const u8* e = pl + cc + i*36;
+                if (e + 36 > pl + plen) break;
+                unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 | (unsigned)e[2]<<16 | (unsigned)e[3]<<24;
+                if (type == TXR_MSG_TX || type == TXR_MSG_WITNESS_TX || type == TXR_MSG_WTX){
+                    txr_ring_del(e + 4); txr_notfound_seen++;
+                }
+            }
             continue;
         }
         if (!memcmp(cmd, "addr", 5) || !memcmp(cmd, "addrv2", 7)){
@@ -730,6 +753,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
  * nothing ever read them, so the orphan pool's behaviour was invisible in
  * the log -- a pool that was silently dropping everything would have looked
  * exactly like a quiet one. Returns non-zero if anything is worth printing. */
+long txrelay_notfound_count(void){ return txr_notfound_seen; }
 long txrelay_stats(long* parked, long* resolved, long* dropped,
                    long* p1c_ok, long* p1c_fail, long* orphans_held){
     long held = 0;
