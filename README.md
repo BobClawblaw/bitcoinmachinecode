@@ -1103,9 +1103,9 @@ datadir root. See *Storing the chain*.
 | `mempoolexpiry` | `336` | drop txs older than this, hours. |
 | `minrelaytxfee` | `0.000001` | relay/mempool floor, BTC/kvB (Core v30 default: 0.1 sat/vB). |
 | `incrementalrelayfee` | `0.000001` | RBF / dynamic-minfee increment, BTC/kvB (Core v30 default). |
-| `limitancestorcount` | `25` | max in-mempool ancestors. |
+| `limitancestorcount` | `64` | max in-mempool ancestors. Core v31 accepts by cluster (64 txs / 101 kvB) and keeps 25 only for wallet coin selection; 64 admits the same chains. |
 | `limitancestorsize` | `101` | max ancestor set, kvB. |
-| `limitdescendantcount` | `25` | max in-mempool descendants. |
+| `limitdescendantcount` | `64` | max in-mempool descendants (see above). |
 | `limitdescendantsize` | `101` | max descendant set, kvB. |
 | `mempoolfullrbf` | `1` | allow full-RBF replacement. |
 
