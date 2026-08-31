@@ -58,7 +58,7 @@
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
  * (all under the per-chain datadir's own logs/). Set at boot right after
  * chainparams_select; the static default covers every tool-mode caller. */
-static char g_logpath[64] = "logs/bitcoind.log";
+static char g_logpath[256] = "logs/bitcoind.log";   /* debuglogfile= overrides (0 = /dev/null) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
@@ -4921,6 +4921,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * walletpassphrase/walletlock flip the live RPC seed at runtime, and the
      * mnemonic provider lets encryptwallet seal the loaded wallet. If an
      * ENCRYPTED store exists, adopt it locked and skip the plaintext load. */
+    if(g_cfg.disablewallet){
+        fprintf(stderr, "[rpc] wallet disabled (disablewallet=1) -- wallet RPCs report no wallet\n");
+    } else
     { extern void wenc_set_seed_installer(void (*)(const unsigned char*));
       extern void wenc_set_mnemonic_provider(int (*)(char*, long, char*, long));
       extern void rpc_wops_set_seed_installer(void (*)(const unsigned char*));
@@ -5063,6 +5066,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * typo that silently allows LESS is a support call; one that silently
      * allows MORE is an incident, and refusing avoids having to work out
      * which happened. */
+    { extern void mpool_policy_set_bytespersigop(unsigned long long);
+      mpool_policy_set_bytespersigop((unsigned long long)g_cfg.bytespersigop); }
     { extern void rpc_node_set_relay_floors(unsigned long long, unsigned long long);
       rpc_node_set_relay_floors((unsigned long long)g_cfg.minrelaytxfee_satkvb,
                                 (unsigned long long)g_cfg.incrementalrelayfee_satkvb); }
@@ -5578,6 +5583,9 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      if(g_cfg.debuglogfile[0])
+          snprintf(g_logpath, sizeof g_logpath, "%s",
+                   !strcmp(g_cfg.debuglogfile, "0") ? "/dev/null" : g_cfg.debuglogfile);
       node_config_log();
       /* Join the config to the passphrase module HERE. Neither side may
        * reference the other: node_config.o is linked into targets with no
