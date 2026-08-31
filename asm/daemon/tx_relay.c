@@ -588,13 +588,49 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
  * node_sync_multi on the same fd. `max_ms` bounds the wait for getdata
  * replies; with nothing buffered and nothing requested the cost is one
  * poll(2) returning empty. Returns the number of transactions accepted. */
+/* ---- replies still owed to us, per leg ------------------------------------
+ * A getdata's reply can arrive after this poll's wait expires. The very next
+ * thing the worker does on that fd is the header-sync pass, whose drain
+ * discards every message that is not a header or block -- so a parent fetched
+ * for a parked orphan from any peer slower than the wait was eaten every
+ * time (production 2026-08-31: 822 parents requested, 65 notfound, 37
+ * resolved). Remember what is outstanding per fd, carry it into the next
+ * poll so it keeps waiting, and let the worker ask (txrelay_replies_pending)
+ * before it runs a sync pass on that leg. Bounded: an entry expires after
+ * TXR_PEND_TTL_MS so a peer that never answers cannot stall the sync. */
+#define TXR_PEND_MAX    64
+#define TXR_PEND_TTL_MS 1500
+static struct { int fd; int n; long long t; } txr_pend[TXR_PEND_MAX];
+static long long txr_pend_ttl_ms = TXR_PEND_TTL_MS;
+static long txr_sync_deferred;
+static int txr_pend_get(int fd){
+    for (int i = 0; i < TXR_PEND_MAX; i++)
+        if (txr_pend[i].fd == fd && txr_pend[i].n > 0){
+            if (txr_now_ms() - txr_pend[i].t < txr_pend_ttl_ms) return txr_pend[i].n;
+            txr_pend[i].n = 0;                          /* gave up on that peer */
+        }
+    return 0;
+}
+static void txr_pend_set(int fd, int n){
+    int free_i = -1;
+    for (int i = 0; i < TXR_PEND_MAX; i++){
+        if (txr_pend[i].fd == fd){ txr_pend[i].n = n; txr_pend[i].t = txr_now_ms(); return; }
+        if (free_i < 0 && txr_pend[i].n == 0) free_i = i;
+    }
+    if (free_i >= 0){ txr_pend[free_i].fd = fd; txr_pend[free_i].n = n; txr_pend[free_i].t = txr_now_ms(); }
+}
+int txrelay_replies_pending(int fd){ return txr_pend_get(fd) > 0; }
+void txrelay_note_sync_deferred(void){ txr_sync_deferred++; }
+long txrelay_sync_deferred_count(void){ return txr_sync_deferred; }
+void txrelay_test_set_pending_ttl_ms(long long ms){ txr_pend_ttl_ms = ms; }
+
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
     static u8 pl[TXR_PAYLOAD_CAP];
     static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
     char cmd[12];
     unsigned plen;
     long accepted = 0;
-    int outstanding = 0;                 /* getdata entries awaiting replies */
+    int outstanding = txr_pend_get(fd);  /* getdata entries awaiting replies, carried from the last poll */
     txr_orphan_expire();
     txr_recon_expire();
     long long deadline = txr_now_ms() + max_ms;
@@ -764,6 +800,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
          * apply. A `block` push lost here is re-fetched by the next
          * headers-driven pass. */
     }
+    txr_pend_set(fd, outstanding);
     return accepted;
 }
 

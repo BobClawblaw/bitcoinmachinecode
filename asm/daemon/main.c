@@ -4401,6 +4401,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 }
             }
             if(apply_first) continue;        /* see APPLY FIRST above */
+            /* A sync pass on this leg would feed any reply still owed to the
+             * relay layer into .drain's discard. Skip it while replies are
+             * pending (bounded: the relay layer forgets after 1.5 s). */
+            { extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
+              if(mux_out_fd[i]>=0 && txrelay_replies_pending(mux_out_fd[i])){ txrelay_note_sync_deferred(); continue; } }
             /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
@@ -4697,9 +4702,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                           held, pk, rs, dr, ok, fl);
               { extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
                 long t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf; txrelay_stats2(&t_ttl,&t_ev,&t_rj,&t_pr,&t_nf,&t_rf);
+                extern long txrelay_sync_deferred_count(void);
                 if (dr || t_pr)
-                    fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld\n",
-                            t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf); } }
+                    fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld, sync passes deferred for pending replies %ld\n",
+                            t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf, txrelay_sync_deferred_count()); } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */

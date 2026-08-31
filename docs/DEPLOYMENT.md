@@ -738,6 +738,15 @@ Operational notes:
   the next announcer is asked. Case 14. The heartbeat gained a second line:
   `orphan drops: N ttl, N evicted, N rejected | parents requested N, notfound
   N, re-requested after timeout N`.
+- **The sync pass waits for replies the relay layer is owed.** The relay poll
+  waited at most 250 ms for a getdata reply; anything slower sat in the socket
+  buffer and the header-sync pass that runs next on the same fd discarded it
+  unexamined (`.drain`). Every parent fetched for a parked orphan from a peer
+  slower than that was lost -- production 2026-08-31: 822 parents requested,
+  65 notfound, 37 resolved. Outstanding requests are now remembered per leg
+  (carried into the next poll, expiring after 1.5 s) and the worker skips that
+  leg's sync pass while replies are pending; the heartbeat line counts `sync
+  passes deferred for pending replies`. Case 15.
 - **Recently confirmed transactions are "already known".** Block connect records
   every txid the block carried (64K rolling); a copy arriving over p2p
   afterwards is answered -27 instead of being parked as an orphan and having
