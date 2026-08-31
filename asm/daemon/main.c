@@ -3601,6 +3601,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * removed at the 2026-08-27 policy-parity merge as subsumed;
          * utxo_live.c keeps the (now unregistered) g_mined_cb plumbing. */
 
+        /* Ghost-run repair BEFORE the coinstats index reads the set as truth
+         * (it adopts its persisted state at the checkpoint height, or seeds
+         * from a walk; either must see the repaired set). Catch-up used to do
+         * this on its first call -- after the index had already looked. */
+        { extern long utxo_live_recover_at_boot(void*);
+          if (utxo_live_recover_at_boot(store_buf) < 0)
+              fprintf(stderr, "[dl] WARNING: ghost-run repair failed at boot -- catch-up will refuse to apply\n"); }
         /* ---- coinstats index: continuous gettxoutsetinfo + a standing
          * cryptographic parity instrument. Observers feed it every coin
          * add/remove on the apply and reorg paths; it persists at the same
