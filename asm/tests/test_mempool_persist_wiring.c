@@ -69,7 +69,7 @@ int main(void){
     ck("  and it is no longer on the unimplemented list",
        nodecfg_unimplemented("persistmempool") == 0);
     ck("  a key that really is unimplemented still warns",
-       nodecfg_unimplemented("bytespersigop") == 1);
+       nodecfg_unimplemented("txreconciliation") == 1);   /* bytespersigop is implemented now */
 
     printf("== a dump round-trips through the save and load paths ==\n");
     /* Two transactions with distinguishable lengths, times and fee deltas, so

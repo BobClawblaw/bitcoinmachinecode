@@ -134,7 +134,7 @@ static const char* const k_unimplemented[] = {
      * permissions with no enforcement point here yet. */
     /* whitebind is IMPLEMENTED (daemon/netperm.c + main.c's accept loop). */
     "whitelistrelay","whitelistforcerelay",
-    "txreconciliation","natpmp","upnp","bytespersigop",
+    "txreconciliation","natpmp","upnp",
     "peerbloomfilters","peerblockfilters",
     /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
     "rpcthreads","rpcworkqueue",
@@ -184,6 +184,9 @@ static void set_defaults(void){
     g_cfg.rpccookie             = 1;
     g_cfg.permitbaremultisig    = 1;
     g_cfg.v2transport           = 1;
+    g_cfg.bytespersigop         = 20;    /* Core DEFAULT_BYTES_PER_SIGOP */
+    g_cfg.disablewallet         = 0;
+    g_cfg.debuglogfile[0]       = 0;
     g_cfg.persistmempool        = 1;
     g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
@@ -420,6 +423,16 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"testnet4")){     /* Core: -testnet4 (bool form) */
             t=clamp_int(iv,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4"); applied++; } }
+        else if(!strcmp(key,"signet")){       /* Core: -signet (bool form) */
+            t=clamp_int(iv,0,1,key,&bad);
+            if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"signet"); applied++; } }
+        else if(!strcmp(key,"bytespersigop")){ /* Core: -bytespersigop=<n> */
+            t=clamp_int(iv,1,100000,key,&bad);
+            if(!bad){ g_cfg.bytespersigop=t; applied++; } }
+        else if(!strcmp(key,"disablewallet")){ /* Core: -disablewallet */
+            g_cfg.disablewallet = iv?1:0; applied++; }
+        else if(!strcmp(key,"debuglogfile")){ /* Core: -debuglogfile=<file>, 0 = none */
+            snprintf(g_cfg.debuglogfile,sizeof g_cfg.debuglogfile,"%s",val); applied++; }
         else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
             char tmp[64]; snprintf(tmp,sizeof tmp,"%s",val);
             char* colon = strrchr(tmp,':');

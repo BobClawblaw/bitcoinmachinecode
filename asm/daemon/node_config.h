@@ -215,6 +215,12 @@ typedef struct {
     /* ---- BIP324 v2 encrypted transport (Core -v2transport) ---- */
     int  v2transport;            /* accept inbound v2 and attempt it outbound;
                                   * def 1, as in Core                        */
+    int  bytespersigop;          /* Core -bytespersigop (def 20): feerate is
+                                  * judged against max(vsize, sigops*this/4) */
+    int  disablewallet;          /* Core -disablewallet: do not load a wallet  */
+    char debuglogfile[256];      /* Core -debuglogfile: the daemon's own log
+                                  * (def logs/bitcoind.log in the chain dir;
+                                  * "0" = no file log)                       */
 } node_config_t;
 
 extern node_config_t g_cfg;
