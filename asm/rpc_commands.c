@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <malloc.h>
@@ -546,9 +547,16 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
                          &value, &height, &is_coinbase, &script, &slen);
         if (r != 1) r = 0;
     } else if (g_txo_query) {
-        /* out of process: ask the download worker, which owns the live set */
-        r = g_txo_query(txid_wire, (unsigned)vout, &value, &height, &is_coinbase,
-                        spkbuf, sizeof spkbuf, &slen);
+        /* out of process: ask the download worker, which owns the live set.
+         * The worker can be mid-rotation; a brief retry turns most transient
+         * "did not answer" refusals into answers (2026-08-31: a diagnostic
+         * read every busy refusal as "output absent"). */
+        r = -1;
+        for (int att = 0; att < 3 && r < 0; att++){
+            if (att){ struct timespec ts = {0, 150*1000*1000}; nanosleep(&ts, NULL); }
+            r = g_txo_query(txid_wire, (unsigned)vout, &value, &height, &is_coinbase,
+                            spkbuf, sizeof spkbuf, &slen);
+        }
         if (r == 1) script = spkbuf;
     } else {
         r = -1;
