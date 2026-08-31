@@ -144,6 +144,7 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
 
 int lsm_manifest_sweep_orphans(const struct lsm_state* lst){
     unsigned char* e; uint64_t n, live;
+    if (access(LSM_MANIFEST_FILE, F_OK) != 0) return 0;      /* fresh store: nothing published yet, nothing to sweep */
     if (read_raw(LSM_MANIFEST_FILE, &e, &n, &live) != 0) return -1;
     int same = (n == lst->manifest_n) && (n == 0 || memcmp(e, lst->manifest_buf, (size_t)n * 16) == 0);
     free(e);

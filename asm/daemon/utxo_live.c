@@ -409,6 +409,7 @@ static inline int shutdown_requested(void){ return g_shutdown_flag && *g_shutdow
 /* One-shot per process lifetime (reset by init/close): has the
  * partially-applied-block check run yet? */
 static int g_recovery_checked = 0;
+static long g_recovery_result = 0;   /* utxo_live_recover_partial_block's verdict, once */
 
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -1535,6 +1536,20 @@ long utxo_live_recover_partial_block(void* store_buf){
             rolled, lo, hi);
     return 1;
 }
+/* Boot hook (daemon/main.c): run the ghost-run repair BEFORE anything reads
+ * the set as truth. The coinstats index adopts its persisted state at the
+ * checkpoint height, or seeds itself from a walk -- both must see the
+ * repaired set, and the rollback's own restore/delete callbacks notify the
+ * index, which is right only if the index has not yet loaded. Catch-up used
+ * to do this on its first call, after the index had already looked; with
+ * batched checkpoints (below) a ghost run after a crash is the common case,
+ * not a rarity. Idempotent; catch-up keeps its own check as the fallback. */
+long utxo_live_recover_at_boot(void* store_buf){
+    if (g_recovery_checked) return g_recovery_result;
+    g_recovery_checked = 1;
+    g_recovery_result = utxo_live_recover_partial_block(store_buf);
+    return g_recovery_result;
+}
 
 /* utxo_live_unapply_block(buf, len, height) -> 1 clean / 0 failed.
  * Caller MUST have run utxo_live_can_unapply over the whole range first --
@@ -1819,6 +1834,42 @@ int utxo_live_init(const char* dir){
  * read (store_reload + one height comparison) when already caught up.
  * Returns the number of newly-applied heights (>=0), or -1 on a fatal
  * error (I/O or memtable-capacity failure -- see live_on_output). */
+/* ---- checkpoint batching during catch-up (2026-08-31) ----------------------
+ * persist_applied_height is tmp+fsync+rename+dirfsync plus the coinstats
+ * commit: 1.9 ms per block on the production NVMe against a ~3 ms apply --
+ * measured 2026-08-31, a third to a half of bulk catch-up. Far from the
+ * archive tip the checkpoint now lands every UTXO_CKPT_BATCH_BLOCKS blocks or
+ * 2 s, whichever first; within UTXO_CKPT_NEAR_TIP of the tip, and always at
+ * the live tip, it stays per block. The crash window this opens is exactly
+ * the multi-block ghost run utxo_live_recover_partial_block already heals
+ * (descending rollback from the undo files), so the batch must stay well
+ * inside UTXO_UNDO_WINDOW: every ghost needs its undo file. Loop exits and
+ * utxo_live_close flush a pending checkpoint. Core's shape, for reference:
+ * the UTXO batch and the best-block pointer are one atomic write, issued at
+ * dbcache pressure, not per block. */
+#define UTXO_CKPT_BATCH_BLOCKS 64      /* < UTXO_UNDO_WINDOW (200) */
+#define UTXO_CKPT_BATCH_MS     2000
+#define UTXO_CKPT_NEAR_TIP     64
+static long      g_ckpt_since = 0;      /* applied blocks not yet covered by a checkpoint */
+static long long g_ckpt_last_ms = 0;
+static long      g_test_ckpt_batch = -1;   /* test knob: -1 default, 0 per-block, n = batch n even at the tip */
+void utxo_live_test_set_ckpt_batch(long n){ g_test_ckpt_batch = n; }
+static long long mono_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
+/* Pure so tests/test_utxo_ckpt_batch pins it without a chain. */
+int utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, long long last_ms, long forced){
+    long batch = forced >= 0 ? forced : UTXO_CKPT_BATCH_BLOCKS;
+    if (batch <= 0) return 1;
+    if (forced < 0 && tip - h < UTXO_CKPT_NEAR_TIP) return 1;
+    if (unpersisted >= batch) return 1;
+    if (now_ms - last_ms >= UTXO_CKPT_BATCH_MS) return 1;
+    return 0;
+}
+static int ckpt_now(void){
+    if (!persist_applied_height(g_applied_height)) return 0;
+    g_ckpt_since = 0; g_ckpt_last_ms = mono_ms();
+    return 1;
+}
+
 long utxo_live_catchup(void* store_buf){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     store_reload(store_buf);
@@ -1830,10 +1881,11 @@ long utxo_live_catchup(void* store_buf){
      * fail on its own already-spent inputs. Roll N back before touching
      * anything else (see utxo_live_recover_partial_block). Runs before the
      * tip check so a caught-up node still repairs itself. */
-    if (!g_recovery_checked) {
+    if (!g_recovery_checked) {          /* normally already done by utxo_live_recover_at_boot */
         g_recovery_checked = 1;
-        if (utxo_live_recover_partial_block(store_buf) < 0) return -1;
+        g_recovery_result = utxo_live_recover_partial_block(store_buf);
     }
+    if (g_recovery_result < 0) return -1;
     if (tip < 0 || tip <= g_applied_height) return 0;
 
     static u8 blockbuf[8<<20];
@@ -1888,7 +1940,8 @@ long utxo_live_catchup(void* store_buf){
          * blocks carry real transaction volume), so this adds a small,
          * bounded fraction of total replay time in exchange for closing an
          * unbounded-drift crash window. */
-        if (!persist_applied_height(g_applied_height)) {
+        g_ckpt_since++;
+        if (utxo_live_ckpt_due(h, tip, g_ckpt_since, mono_ms(), g_ckpt_last_ms, g_test_ckpt_batch) && !ckpt_now()) {
             /* STOP, don't continue (2026-08-25). The old comment claimed
              * continuing was "safe, puts/dels are idempotent" -- false since
              * Stage D verifies before applying: every un-checkpointed block
@@ -1956,6 +2009,8 @@ long utxo_live_catchup(void* store_buf){
      * threshold and flushes naturally, which also resets the WAL. Lowering a
      * threshold under buffers sized for a bigger one is safe; the reverse
      * would not be. */
+    if (g_ckpt_since && !ckpt_now())          /* loop exit of any kind: land the pending batch */
+        fprintf(stderr, "[utxo_live] WARNING: failed to persist the batched checkpoint at height %ld\n", g_applied_height);
     if (g_bulk_mode && g_applied_height >= tip) {
         unsigned long ss = 1UL << UTXO_LIVE_SLOTS_LOG2;
         g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;
@@ -2110,6 +2165,7 @@ long utxo_live_resolve(const u8 txid[32], unsigned long index,
 }
 
 void utxo_live_close(void){
+    if (g_ckpt_since) ckpt_now();            /* a clean close mid-batch persists */
     utxo_live_compact_shutdown();
     utxo_lsm_close(&g_utxo_lst);
     g_recovery_checked = 0;
