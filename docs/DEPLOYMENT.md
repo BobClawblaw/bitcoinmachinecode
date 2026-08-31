@@ -778,3 +778,18 @@ Operational notes:
   out of order in the blk files). It is informational: only archive truncation
   and pruning refuse to run on such a layout. Fixing it means rewriting the
   block files in height order -- a maintenance tool, not a runtime change.
+
+## Genesis coinbase incident (2026-08-31)
+
+Core stores NO chain's genesis coinbase in its chainstate. `genesis_skip.h`
+enforced that for mainnet/regtest/testnet4 but predated signet, so a signet
+node built by the live catch-up carried the genesis coinbase as a spendable
+50 BTC UTXO -- found as "one extra output, exactly 50 BTC" the first time the
+whole set was compared against a Core oracle's `gettxoutsetinfo` at an
+identical tip. Fixed: signet's hash in the skip list, plus the ACTIVE chain's
+derived genesis hash (covers custom signet challenges) checked in the apply
+path; `test_chainparams` pins all four. The affected datadir was repaired
+surgically with `tests/tool_utxo_del` (appends an ordinary WAL tombstone;
+remove `coinstats.dat` alongside so the index re-seeds) and then verified
+muhash-identical to the oracle. Mainnet was never affected (its hash was in
+the list from the start).
