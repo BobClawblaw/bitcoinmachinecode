@@ -4407,9 +4407,28 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
                 if(acc>0){
-                    extern long mpool_count(void*);
-                    fprintf(stderr,"[txrelay:%d] %s: +%ld tx accepted (mempool %ld)\n",
-                            i, mux_out_host[i], acc, mpool_count(txsub_pool()));
+                    /* per-leg attribution, ONE line a minute for all legs:
+                     * the per-poll line was ~35 lines/min of the log with
+                     * nothing the 30s tx_accept summary did not already
+                     * total (2026-08-31 quiet rounds). */
+                    static long leg_acc[MUX_MAX_OUT]; static long leg_last; static long leg_total;
+                    if(i >= 0 && i < MUX_MAX_OUT) leg_acc[i] += acc;
+                    leg_total += acc;
+                    long now_s = (long)time(NULL);
+                    if(leg_last == 0) leg_last = now_s;
+                    if(now_s - leg_last >= 60){
+                        extern long mpool_count(void*);
+                        char parts[MUX_MAX_OUT*40]; int pn = 0; parts[0] = 0;
+                        for(int k = 0; k < MUX_MAX_OUT && k < mux_n_out; k++){
+                            if(leg_acc[k] <= 0) continue;
+                            pn += snprintf(parts + pn, sizeof parts - (size_t)pn, "%s%d:%s +%ld",
+                                           pn ? ", " : "", k, mux_out_host[k], leg_acc[k]);
+                            if((size_t)pn >= sizeof parts - 1) break;
+                        }
+                        fprintf(stderr,"[txrelay] last %lds: +%ld tx accepted via legs [%s] (mempool %ld)\n",
+                                now_s - leg_last, leg_total, parts, mpool_count(txsub_pool()));
+                        memset(leg_acc, 0, sizeof leg_acc); leg_total = 0; leg_last = now_s;
+                    }
                 }
             }
             if(apply_first) continue;        /* see APPLY FIRST above */
