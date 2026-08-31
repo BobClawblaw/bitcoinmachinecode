@@ -491,6 +491,45 @@ static int lsock(int port){
     if(listen(l,8)<0){ fprintf(stderr,"[net] listen failed: %s\n", strerror(errno)); return -1; }
     return l;
 }
+/* -whitebind listeners. One socket per entry, bound to the exact address and
+ * port the operator named -- NOT sharing the main listener, because a peer's
+ * permissions here come from which socket accepted it, and a shared socket
+ * would grant them to everyone.
+ *
+ * Failure to bind one is FATAL rather than a warning. An operator who wrote
+ * whitebind expects those peers to be unbannable; silently not listening
+ * there would look identical to listening and would fail only when a
+ * misbehaviour score eventually disconnected a peer that was supposed to be
+ * exempt -- long after the cause. */
+static int g_wb_fd[NETPERM_MAX_BIND];
+static int g_wb_n;
+
+static void wb_listen_open(void){
+    g_wb_n = 0;
+    for(int i = 0; i < netperm_whitebind_count(); i++){
+        const char* addr = netperm_whitebind_addr(i);
+        int port = netperm_whitebind_port(i);
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if(fd < 0){ fprintf(stderr,"[net] FATAL: whitebind socket: %s\n", strerror(errno)); exit(1); }
+        struct sockaddr_in a; memset(&a,0,sizeof a);
+        a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
+        if(inet_pton(AF_INET, addr, &a.sin_addr) != 1){
+            fprintf(stderr,"[net] FATAL: whitebind address %s is not valid\n", addr); exit(1); }
+        int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if(bind(fd,(struct sockaddr*)&a,sizeof a) < 0){
+            fprintf(stderr,"[net] FATAL: whitebind %s:%d: %s\n", addr, port, strerror(errno));
+            exit(1);
+        }
+        if(listen(fd,8) < 0){
+            fprintf(stderr,"[net] FATAL: whitebind listen %s:%d: %s\n", addr, port, strerror(errno));
+            exit(1);
+        }
+        netperm_bind_fd(fd, netperm_whitebind_flags(i));
+        g_wb_fd[g_wb_n++] = fd;
+        fprintf(stderr,"[net] whitebind listening on %s:%d (grants noban)\n", addr, port);
+    }
+}
+
 /* The IPv6 half of the listener (2026-08-28). Separate socket, v6-only, so
  * it cannot collide with the IPv4 one above; -1 when the host has no IPv6,
  * which is not an error -- the node simply serves v4 only. A CJDNS peer
@@ -994,15 +1033,24 @@ int ctl_ban_add(const char* subnet, long long until){
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
  * in which case the caller should drop the connection. */
+/* Permissions granted by the listener this connection arrived on (-whitebind).
+ * Set in the forked child before it serves, so it is per-connection without
+ * any shared table: the node forks per inbound connection, exactly as the
+ * onion path already establishes "this is an onion peer" from which socket
+ * accepted it. Zero in the parent and on every non-whitebind connection. */
+unsigned g_conn_perms = 0;
+
 int peer_misbehaving(const char* ip, int points, const char* reason){
     if(!ip || !*ip || points <= 0) return 0;
     /* Core: a peer with NetPermissionFlags::NoBan is never disconnected or
      * discouraged for misbehaviour. Checked BEFORE scoring, not just before
      * banning -- a score that can never reach the threshold is bookkeeping
      * that would evict a real offender from the table. */
-    if(netperm_for(ip) & NP_NOBAN){
-        fprintf(stderr,"[ban] %s misbehaving +%d: %s -- NOT scored (whitelist noban)\n",
-                ip, points, reason ? reason : "?");
+    unsigned perms = netperm_for(ip) | g_conn_perms;
+    if(perms & NP_NOBAN){
+        fprintf(stderr,"[ban] %s misbehaving +%d: %s -- NOT scored (%s noban)\n",
+                ip, points, reason ? reason : "?",
+                (g_conn_perms & NP_NOBAN) ? "whitebind" : "whitelist");
         return 0;
     }
     /* Score into the SHARED table when we have one, so a peer that misbehaves
@@ -4910,7 +4958,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     /* pfds[0] is the listener, and is -1 when listen=0. poll() ignores a
      * negative fd and returns revents==0 for it, so the accept branch below
      * is naturally dead in outbound-only mode -- no separate code path. */
-    struct pollfd pfds[MUX_MAX_OUT+3];   /* v4 + v6 + onion listeners, then legs */
+    /* +NETPERM_MAX_BIND for the -whitebind listeners, which sit after the
+     * onion slot and before the legs. The leg offset is DERIVED below, so
+     * adding these cannot reintroduce the off-by-one that once made every leg
+     * read the previous leg's revents. */
+    struct pollfd pfds[MUX_MAX_OUT+3+NETPERM_MAX_BIND];
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
@@ -4923,6 +4975,12 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * tor is unreachable, and poll() ignores a negative fd */
         int onionslot = nfds;
         pfds[nfds].fd=lo;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* -whitebind listeners: peers arriving here carry that entry's
+         * permissions, decided by WHICH socket accepted them. */
+        int wbslot = nfds;
+        for(int wi = 0; wi < g_wb_n; wi++){
+            pfds[nfds].fd=g_wb_fd[wi]; pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        }
         /* WHERE THE LEGS BEGIN, derived rather than written down. This used to
          * be a hardcoded 2, and when the IPv6 listener took pfds[1] the leg
          * loop kept starting at 1 -- every leg then read the PREVIOUS leg's
@@ -4982,12 +5040,27 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
         int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
         int ready_on = (lo >= 0 && (pfds[onionslot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
-        if(ready_v4 || ready_v6 || ready_on){
+        int wb_ready = -1;                       /* index into g_wb_fd, or -1 */
+        for(int wi = 0; wi < g_wb_n; wi++)
+            if(pfds[wbslot+wi].revents & (POLLIN|POLLHUP|POLLERR)){ wb_ready = wi; break; }
+        if(ready_v4 || ready_v6 || ready_on || wb_ready >= 0){
             struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c;
             char peerdesc[80];
-            if(ready_on){
+            unsigned accepted_perms = 0;
+            if(wb_ready >= 0){
+                /* Same rule as the onion listener above: the property comes
+                 * from the socket, not the source address. That is what makes
+                 * whitebind usable for a peer whose address you cannot
+                 * predict. */
+                int wfd = g_wb_fd[wb_ready];
+                c = accept(wfd,(struct sockaddr*)&ca,&cal);
+                accepted_perms = netperm_for_fd(wfd);
+                snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
+                if(c >= 0)
+                    fprintf(stderr,"[serve] inbound on whitebind listener from %s (noban)\n", peerdesc);
+            } else if(ready_on){
                 /* Arrived on the onion service's loopback target, so it IS an
                  * onion peer -- established by WHICH SOCKET accepted it, not
                  * by looking at the source address, which is always
@@ -5066,6 +5139,12 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
+                    /* This child serves exactly one peer, so the permissions
+                     * its listener granted are simply this process's. No
+                     * shared table, no fd keying, nothing to clean up when the
+                     * connection ends. */
+                    g_conn_perms = accepted_perms;
+                    for(int wi = 0; wi < g_wb_n; wi++) close(g_wb_fd[wi]);
                     /* BIP324 first, if enabled. A v1 peer is detected in-band
                      * -- it opens with magic + "version" + five NULs, and any
                      * mismatch in those 16 bytes proves v2 -- and detection
@@ -5662,6 +5741,7 @@ int main(int argc, char** argv){
          * binding and refusing every connection, which is what the flag
          * actually means. */
         int l = g_cfg.listen ? lsock(port) : -1;
+        wb_listen_open();
         if(!g_cfg.listen) fprintf(stderr,"[boot] listen=0 -- not accepting inbound connections\n");
         /* Only a listener we ASKED for and failed to get is fatal. Under
          * listen=0 the -1 is the intended result, and this check used to
@@ -5897,6 +5977,7 @@ int main(int argc, char** argv){
         int lfd = node_log_open(g_logpath);
         node_log_str(lfd, 0, "serve-test outbound mux", 22);
         int l = lsock(port);
+        wb_listen_open();
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
         return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
     }
