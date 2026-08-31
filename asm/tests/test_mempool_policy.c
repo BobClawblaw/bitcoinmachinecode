@@ -146,6 +146,64 @@ int main(void){
         okv(r != 1, "a child joining 64 independent parents is refused");
         okv(r != 1 && strstr(mpool_policy_reason(pol), "too-large-cluster") != NULL, "...as too-large-cluster (anc/desc limits alone would have let it in)");
     }
+    printf("== cluster limit is measured POST-eviction for a replacement ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
+        mpool_policy_state_init(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        /* 63 independent parents, one child C spending all of them: a
+         * cluster of exactly 64, at the limit */
+        static unsigned char ptxid[63][32];
+        unsigned char spk[2] = { 0x51, 0x00 };
+        int all_ok = 1;
+        for (int i = 0; i < 63; i++){
+            unsigned char prev[32]; memset(prev, 0xA0 + (i & 15), 32); prev[0] = (unsigned char)i;
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx[128]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+            tx[n++]=1; { unsigned long long v = 900000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x31+i, 20); n+=20;
+            memset(tx+n, 0, 4); n+=4;
+            memset(ptxid[i], 0xB0, 32); ptxid[i][0] = (unsigned char)i;
+            if (mpool_policy_add(pol, stbuf, mp, tx, n, ptxid[i], ux) != 1) all_ok = 0;
+        }
+        okv(all_ok, "63 independent parents accepted");
+        static unsigned char ctx[63*41 + 64]; unsigned long n = 0;
+        ctx[n++]=2;ctx[n++]=0;ctx[n++]=0;ctx[n++]=0;
+        ctx[n++]=63;
+        for (int i = 0; i < 63; i++){ memcpy(ctx+n, ptxid[i], 32); n+=32; memset(ctx+n, 0, 4); n+=4; ctx[n++]=0;
+            ctx[n]=1; ctx[n+1]=0; ctx[n+2]=0; ctx[n+3]=0; n+=4; }        /* sequence 1: BIP125 signaling */
+        ctx[n++]=1; { unsigned long long v = 63*900000ULL - 50000ULL; for (int b=0;b<8;b++) ctx[n++]=(unsigned char)(v>>(8*b)); }
+        ctx[n++]=22; ctx[n++]=0x00; ctx[n++]=0x14; memset(ctx+n, 0x78, 20); n+=20;
+        memset(ctx+n, 0, 4); n+=4;
+        unsigned char ctid[32]; memset(ctid, 0xBF, 32);
+        { long rC = mpool_policy_add(pol, stbuf, mp, ctx, n, ctid, ux);   /* okv double-evaluates: never call inside it */
+          okv(rC == 1, "child C joins them: cluster of exactly 64 accepted"); }
+        /* C' double-spends one of C's inputs -> conflicts with C, evicting
+         * it. The cluster C' joins is parent[0] ALONE once C is gone; the
+         * old walk still counted C and the 62 parents behind it and refused
+         * a replacement that was thinning the very cluster it joined. */
+        unsigned char rtx[128]; n = 0;
+        rtx[n++]=2;rtx[n++]=0;rtx[n++]=0;rtx[n++]=0;
+        rtx[n++]=1; memcpy(rtx+n, ptxid[0], 32); n+=32; memset(rtx+n, 0, 4); n+=4; rtx[n++]=0;
+        rtx[n]=1; rtx[n+1]=0; rtx[n+2]=0; rtx[n+3]=0; n+=4;
+        rtx[n++]=1; { unsigned long long v = 100000ULL; for (int b=0;b<8;b++) rtx[n++]=(unsigned char)(v>>(8*b)); }
+        rtx[n++]=22; rtx[n++]=0x00; rtx[n++]=0x14; memset(rtx+n, 0x79, 20); n+=20;
+        memset(rtx+n, 0, 4); n+=4;
+        unsigned char rtid[32]; memset(rtid, 0xC5, 32);
+        long r = mpool_policy_add(pol, stbuf, mp, rtx, n, rtid, ux);
+        if (r != 1) printf("      replacement rejected: %s\n", mpool_policy_reason(pol));
+        okv(r == 1, "replacement is measured against the POST-eviction cluster");
+    }
     printf("== bytespersigop: sigop-dense feerate (Core DEFAULT_BYTES_PER_SIGOP 20) ==\n");
     {
         static unsigned char pol[128];
