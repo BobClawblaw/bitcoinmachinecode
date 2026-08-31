@@ -109,11 +109,9 @@ int cli_conf_resolve(const char* datadir, const char* chain_override,
     }
     if (conf_lookup(datadir, "rpccookiefile", v, sizeof v))
         snprintf(out->cookie_path, sizeof out->cookie_path, "%s", v);
-    else if (!strcmp(out->chain, "main") || !strcmp(out->chain, "mainnet"))
-        snprintf(out->cookie_path, sizeof out->cookie_path, "%s/.cookie", datadir);
     else
-        snprintf(out->cookie_path, sizeof out->cookie_path, "%s/%s/.cookie",
-                 datadir, out->chain);
+        snprintf(out->cookie_path, sizeof out->cookie_path, "%s/%s/.cookie", datadir,
+                 !strcmp(out->chain, "mainnet") ? "main" : out->chain);   /* every chain in its own subdir, main included */
 
     if (read_cookie(out->cookie_path, out)) return 1;
     *err = "no rpcuser/rpcpassword and no readable cookie";
