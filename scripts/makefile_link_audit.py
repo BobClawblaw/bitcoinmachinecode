@@ -110,6 +110,23 @@ def sym_of(asmdir, path, cache_dir):
             return set(d['def']), set(d['undef'])
         except Exception:
             pass
+    if path.endswith('.a'):
+        # Read what the archive ACTUALLY defines. The previous version granted
+        # a rule containing any .a every symbol in the project ("a .a can
+        # supply anything"), which exempted every rule that links RPCLIBS --
+        # and RPCLIBS ends in addrbook.a. daemon/bitcoin_rpcd broke exactly
+        # that way and this audit reported OK. Undefined symbols INSIDE the
+        # archive are ignored: members satisfy each other, and the linker
+        # reports what they cannot.
+        out, _, rc = run(['nm', '--no-sort', full])
+        if rc != 0:
+            return None
+        dfn = set()
+        for ln in out.splitlines():
+            parts = ln.split()
+            if len(parts) >= 2 and parts[-2] in 'TDBRSGVWi':
+                dfn.add(parts[-1])
+        return dfn, set()
     if path.endswith('.c'):
         obj = os.path.join(cache_dir, key + '.o')
         rc = 1
@@ -198,9 +215,9 @@ def main():
     files = set()
     for pre in rules.values():
         for p in pre:
-            if p.endswith(('.c', '.o')):
+            if p.endswith(('.c', '.o', '.a')):
                 files.add(p)
-    for pat in ('*.c', 'daemon/*.c', 'tests/*.c', '*.o'):
+    for pat in ('*.c', 'daemon/*.c', 'tests/*.c', '*.o', '*.a'):
         for f in glob.glob(os.path.join(asmdir, pat)):
             files.add(os.path.relpath(f, asmdir))
     files = sorted(f for f in files if os.path.exists(os.path.join(asmdir, f)))
@@ -229,8 +246,6 @@ def main():
         if len(linked) < 2: continue
         have = set()
         for p in linked: have |= syms[p][0]
-        # a .a in the prerequisites can supply anything; do not guess
-        if any(p.endswith('.a') for p in pre): have |= set(provider)
         need = {}
         for p in linked:
             for s in syms[p][1] - have:

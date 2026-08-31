@@ -32,11 +32,23 @@
 #include "rpc_commands.h"
 
 /* Server configuration. */
+/* ZERO-INITIALISE THIS: `rpc_server_cfg cfg = {0};`. It has grown fields
+ * (bind_addr, allows) and will grow more; a caller that assigns members one
+ * at a time leaves any newer field as garbage, and `allows` is a function
+ * pointer. That is exactly how adding these two fields broke
+ * daemon/bitcoin_rpcd, which had set four members and named no others. */
 typedef struct {
     int  port;                  /* listen port; 0 = ephemeral (fill actual) */
     const char* user;           /* rpcuser */
     const char* pass;           /* rpcpassword */
     const rpc_wallet* wallet;   /* wallet state the requests resolve against */
+    /* Core -rpcbind. NULL/empty keeps the loopback-only bind, which is both
+     * the default and what you get when no -rpcallowip was configured. */
+    const char* bind_addr;
+    /* Core's HTTP allow list. NULL means loopback-only, enforced by the
+     * default ACL rather than by the bind alone -- binding narrowly and
+     * checking nothing would leave the ACL a comment. */
+    int (*allows)(const char* ip);
 } rpc_server_cfg;
 
 /* Start the HTTP JSON-RPC server: bind+listen on loopback, spawn an accept
