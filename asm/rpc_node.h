@@ -64,10 +64,13 @@ typedef struct {
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
- * 16 slots is generous: the worker drains every rotation, so a slot lives for
- * milliseconds. Slot payload matches the sendrawtransaction bound, so any
- * transaction this node will accept also fits the ring. */
-#define RPC_ZMQ_RING           16
+ * 16 slots looked generous -- the worker drains every rotation -- but a
+ * mempool.dat reload streams hundreds of accepts per second while the worker
+ * is busy doing the accepting, and production lapped a 16-slot ring by
+ * thousands (2026-08-31). 64 slots is ~26MB of the MAP_SHARED block
+ * (404KB payload each) and rides out the bursts; overrun past that is
+ * counted and reported, which is all a lossy PUB feed owes anyone. */
+#define RPC_ZMQ_RING           64
 #define RPC_ZMQ_TXMAX          RPC_TXSUBMIT_MAX
 
 typedef struct {
