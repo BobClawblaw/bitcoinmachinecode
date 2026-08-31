@@ -729,6 +729,15 @@ Operational notes:
   fee-floor fix still showed 6,324 parked / 538 resolved / 5,530 dropped in an
   hour. The ring entry is now dropped on `notfound`; `test_tx_relay` case 12
   replays request -> notfound -> inv -> request again.
+- **A request is forgotten after 60 s.** The "recently requested" ring used to
+  keep an entry until 4,096 later requests pushed it out (~14 minutes at 5
+  tx/s). A getdata whose reply never came -- the leg dropped and re-dialed,
+  the peer ignored it -- therefore blocked every later announcement of that
+  transaction, and every child announced meanwhile died as an orphan. Entries
+  now carry a timestamp and expire after Core's `GETDATA_TX_INTERVAL` (60 s);
+  the next announcer is asked. Case 14. The heartbeat gained a second line:
+  `orphan drops: N ttl, N evicted, N rejected | parents requested N, notfound
+  N, re-requested after timeout N`.
 - **Recently confirmed transactions are "already known".** Block connect records
   every txid the block carried (64K rolling); a copy arriving over p2p
   afterwards is answered -27 instead of being parked as an orphan and having

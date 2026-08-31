@@ -84,18 +84,34 @@ extern int  txacc_fee_reconsiderable(const char* reason);
  * re-announced. Deliberately NOT a permanent set: entries age out by
  * wrap-around, so a tx whose reply was lost becomes requestable again. */
 #define TXR_RING 4096
+#define TXR_REQ_TTL_MS 60000            /* Core's GETDATA_TX_INTERVAL: a request is forgotten after 60 s */
 static u8  txr_ring[TXR_RING][8];
+static long long txr_ring_t[TXR_RING];
 static unsigned txr_ring_w;
-
+static long long txr_req_ttl_ms = TXR_REQ_TTL_MS;
+static long txr_req_refetch;            /* announcements re-requested because the earlier request timed out */
+static long long txr_now_ms(void);
+/* "Did we request this recently?" -- recently meaning within the request
+ * TTL. Without the TTL a getdata whose reply never came (the leg dropped and
+ * re-dialed, the peer ignored it) blocked every later announcement of that
+ * tx until 4,096 other requests aged the entry out (~14 minutes at 5 tx/s),
+ * and every child announced meanwhile died as an orphan. Core forgets a
+ * request after 60 s and asks the next announcer. */
 static int txr_ring_has(const u8* txid){
     for (unsigned i = 0; i < TXR_RING; i++)
-        if (!memcmp(txr_ring[i], txid, 8)) return 1;
+        if (!memcmp(txr_ring[i], txid, 8)){
+            if (txr_now_ms() - txr_ring_t[i] < txr_req_ttl_ms) return 1;
+            txr_req_refetch++;
+            return 0;                                   /* timed out: ask again */
+        }
     return 0;
 }
 static void txr_ring_add(const u8* txid){
     memcpy(txr_ring[txr_ring_w % TXR_RING], txid, 8);
+    txr_ring_t[txr_ring_w % TXR_RING] = txr_now_ms();
     txr_ring_w++;
 }
+void txrelay_test_set_req_ttl_ms(long long ms){ txr_req_ttl_ms = ms; }   /* tests shrink the 60 s */
 /* A `notfound` for something we asked for: forget that we asked, so the
  * next announcement (or the next orphan wanting it as a parent) requests it
  * again. Core does the same by dropping the in-flight entry. Without this,
@@ -222,6 +238,7 @@ void txrelay_publish_orphans(void){
 }
 static unsigned txr_orph_bytes;
 static long txr_orph_parked, txr_orph_resolved, txr_orph_dropped;   /* counters for the caller's log */
+static long txr_drop_ttl, txr_drop_evict, txr_drop_reject, txr_parent_req;   /* why they dropped; how many parents we asked for */
 
 /* ---- announce queue ------------------------------------------------------
  * A relay-received transaction we accepted should propagate onward: queue
@@ -337,7 +354,7 @@ static void txr_orphan_add(const u8 txid[32], const u8* tx, unsigned long len){
             return;
         }
         if (oldi < 0) return;
-        txr_orphan_free(&txr_orph[oldi]); txr_orph_dropped++;
+        txr_orphan_free(&txr_orph[oldi]); txr_orph_dropped++; txr_drop_evict++;
     }
 }
 
@@ -371,7 +388,7 @@ static long txr_orphan_resolve(void* mp, const u8 accepted[32]){
              * leave it for the TTL; a definitive non-missing reject frees it.
              * -28 is NOT definitive -- a fee-only reject is the verdict a
              * descendant can still overturn, so that child stays parked. */
-            if (rr != -25 && rr != -28){ txr_orphan_free(o); txr_orph_dropped++; }
+            if (rr != -25 && rr != -28){ txr_orphan_free(o); txr_orph_dropped++; txr_drop_reject++; }
         }
     }
     return got;
@@ -493,7 +510,7 @@ static void txr_orphan_expire(void){
     long long now = txr_now_ms();
     for (int i = 0; i < TXR_ORPHAN_MAX; i++)
         if (txr_orph[i].buf && now - txr_orph[i].t_ms > TXR_ORPHAN_TTL_MS){
-            txr_orphan_free(&txr_orph[i]); txr_orph_dropped++;
+            txr_orphan_free(&txr_orph[i]); txr_orph_dropped++; txr_drop_ttl++;
         }
 }
 
@@ -685,8 +702,9 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                     }
                     if (want){
                         gd[0] = (u8)want;
-                        if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) > 0)
-                            outstanding += (int)want;
+                        if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) > 0){
+                            outstanding += (int)want; txr_parent_req += (long)want;
+                        }
                     }
                 }
                 /* other rejects are counted in tx_accept's own summary */
@@ -754,6 +772,11 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
  * the log -- a pool that was silently dropping everything would have looked
  * exactly like a quiet one. Returns non-zero if anything is worth printing. */
 long txrelay_notfound_count(void){ return txr_notfound_seen; }
+/* The second stats line: why orphans dropped, and how the parent fetching went. */
+void txrelay_stats2(long* ttl, long* evict, long* reject, long* parent_req, long* notfound, long* refetch){
+    if (ttl) *ttl = txr_drop_ttl; if (evict) *evict = txr_drop_evict; if (reject) *reject = txr_drop_reject;
+    if (parent_req) *parent_req = txr_parent_req; if (notfound) *notfound = txr_notfound_seen; if (refetch) *refetch = txr_req_refetch;
+}
 long txrelay_stats(long* parked, long* resolved, long* dropped,
                    long* p1c_ok, long* p1c_fail, long* orphans_held){
     long held = 0;
