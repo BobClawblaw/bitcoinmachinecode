@@ -159,7 +159,8 @@ struct lsm_state {
 #define UTXO_LIVE_MANIFEST_CAP  256
 /* compact once manifest_n crosses this -- bounds .do_tx's per-lookup
  * disk-run scan cost, not just disk-space hygiene (see file header). */
-#define UTXO_LIVE_COMPACT_THRESHOLD 12
+#define UTXO_LIVE_COMPACT_THRESHOLD 12   /* default for bmc.utxocompactthreshold */
+long utxo_live_compact_threshold(void);
 
 /* ---- BULK (far-behind) memtable sizing ---------------------------------
  * The steady-state sizing above is deliberately small so a per-inbound-child
@@ -1504,6 +1505,35 @@ static long utxo_live_index_tip(void){
 /* Set while the memtable is bulk-sized, until catch-up downshifts it. */
 static int g_bulk_mode = 0;
 
+/* How many runs the manifest may hold before a compaction merges them.
+ *
+ * Until 2026-08-31 this was the UTXO_LIVE_COMPACT_THRESHOLD macro, and
+ * bmc.utxocompactthreshold -- parsed by node_config.c and printed at every boot
+ * as "compact_at=N" -- was never read by anything. An option that is accepted,
+ * printed and inert is the exact failure this codebase has shipped repeatedly;
+ * it is wired now.
+ *
+ * BULK MODE COMPACTS LESS OFTEN, by a factor of four. A compaction rewrites
+ * the ENTIRE live set (one big run; the merge folds the new ones into it),
+ * through three read syscalls and several write syscalls per record -- about
+ * 50 MB/s whatever the disk. Measured on signet mid catch-up: 15 compactions
+ * an hour, ~105 s each, 44% of wall-clock spent rewriting a 5 GB set instead
+ * of applying blocks. Every run carries a Bloom filter, so a lookup that
+ * misses costs one filter probe per extra run; while far behind that is far
+ * cheaper than the rewrites. Steady state is unchanged. */
+/* Test hook: g_bulk_mode is decided from the store at init, which a unit test
+ * of the threshold arithmetic has no business setting up. */
+void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+
+long utxo_live_compact_threshold(void){
+    long t = g_cfg.utxo_compact_threshold > 0 ? g_cfg.utxo_compact_threshold
+                                              : UTXO_LIVE_COMPACT_THRESHOLD;
+    if (g_bulk_mode) t *= 4;
+    if (t > UTXO_LIVE_MANIFEST_CAP / 2) t = UTXO_LIVE_MANIFEST_CAP / 2;
+    if (t < 2) t = 2;
+    return t;
+}
+
 /* tx_verify.c's own parallel-verify dispatch: it must not fork() workers
  * while THIS process's memtable (and therefore its RSS) is bulk-sized and
  * still growing, since fork()'s copy-on-write cost scales with the parent's
@@ -1553,11 +1583,11 @@ int utxo_live_init(const char* dir){
     unsigned long slots = g_bulk_mode ? (1UL << g_cfg.utxo_bulk_slots_log2)
                                       : (1UL << UTXO_LIVE_SLOTS_LOG2);
     u64 blob_cap = g_bulk_mode ? ((u64)g_cfg.utxo_bulk_blob_mb << 20) : UTXO_LIVE_BLOB_BYTES;
-    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB\n",
+    fprintf(stderr, "[utxo_live] sizing: %s (applied=%ld tip=%ld gap=%ld) slots=2^%d blob=%lluMB compact_at=%ld\n",
             g_bulk_mode ? "BULK -- far behind, batch-sized memtable" : "steady-state",
             boot_applied, boot_tip, boot_gap,
             g_bulk_mode ? g_cfg.utxo_bulk_slots_log2 : UTXO_LIVE_SLOTS_LOG2,
-            (unsigned long long)(blob_cap >> 20));
+            (unsigned long long)(blob_cap >> 20), utxo_live_compact_threshold());
     u64 fill_threshold = (u64)slots * 3 / 4;
     u64 op_threshold    = (u64)slots * 2;
     u64 tomb_cap         = op_threshold;
@@ -1626,7 +1656,7 @@ int utxo_live_init(const char* dir){
      * steady-state catch-up uses (UTXO_LIVE_COMPACT_THRESHOLD). Bounded by
      * manifest_cap iterations so a compact() that stops making progress
      * (e.g. every remaining run already merged) can't spin forever. */
-    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && guard < UTXO_LIVE_MANIFEST_CAP; guard++){
+    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && guard < UTXO_LIVE_MANIFEST_CAP; guard++){
         u64 before = g_utxo_lst.manifest_n;
         if (before < 2) break;
         long cr = utxo_lsm_compact(&g_utxo_lst);
@@ -1776,7 +1806,7 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
-        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD) {
+        if (g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold()) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] mid-catchup compact at height %ld: manifest_n=%lu -> result=%ld\n",
                     h, g_utxo_lst.manifest_n, cr);
@@ -1843,7 +1873,7 @@ long utxo_live_catchup(void* store_buf){
         if (!persist_applied_height(g_applied_height)) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
-        if (g_utxo_lst.manifest_n >= UTXO_LIVE_COMPACT_THRESHOLD && !shutdown_requested()) {
+        if (g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && !shutdown_requested()) {
             long cr = utxo_lsm_compact(&g_utxo_lst);
             fprintf(stderr, "[utxo_live] compact manifest_n=%lu -> result=%ld\n", g_utxo_lst.manifest_n, cr);
         }
