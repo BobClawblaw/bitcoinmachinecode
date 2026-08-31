@@ -738,6 +738,11 @@ Operational notes:
   the next announcer is asked. Case 14. The heartbeat gained a second line:
   `orphan drops: N ttl, N evicted, N rejected | parents requested N, notfound
   N, re-requested after timeout N`.
+- **The orphanage is sized against Core v31's reservations** (404k weight units
+  and a 3,000-announcement score per peer): 2,048 slots / 8 MB, up from 256 /
+  2 MB, which sat pinned at capacity after every restart and made eviction the
+  dominant drop cause once nothing expired by TTL. `getorphantxs` still shows
+  at most 256 entries (the shared snapshot's size).
 - **The sync pass waits for replies the relay layer is owed.** The relay poll
   waited at most 250 ms for a getdata reply; anything slower sat in the socket
   buffer and the header-sync pass that runs next on the same fd discarded it

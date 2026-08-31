@@ -199,8 +199,13 @@ static void txr_recon_expire(void){
  * (MSG_WITNESS_TX, same reasoning as every other fetch here). On every
  * accepted transaction the pool is re-swept, so multi-level chains resolve
  * in cascade. */
-#define TXR_ORPHAN_MAX       256
-#define TXR_ORPHAN_BYTES     (2u << 20)
+/* Sized against Core v31's orphanage reservations: 404,000 weight units per
+ * peer (~101 kvB) and a 3,000-announcement latency score per peer -- with 8
+ * outbound legs that is ~800 kvB / 24k announcements. 256 slots / 2 MB pinned
+ * at capacity after every restart (production 2026-08-31: 1,198 of 1,209
+ * drops were evictions once nothing expired by TTL any more). */
+#define TXR_ORPHAN_MAX       2048
+#define TXR_ORPHAN_BYTES     (8u << 20)
 #define TXR_ORPHAN_TTL_MS    120000
 #define TXR_ORPHAN_PARENTS   8          /* parent txids remembered per orphan */
 typedef struct {
