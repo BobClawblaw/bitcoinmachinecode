@@ -42,6 +42,7 @@ static int  g_listen_fd = -1;
 static volatile int g_run = 0;
 static pthread_t    g_thread;
 static const rpc_wallet* g_wallet;
+static int (*g_allows)(const char*);
 static const char* g_user;
 static const char* g_pass;
 
@@ -607,6 +608,19 @@ static void* server_thread(void* arg) {
         struct sockaddr_in cli; socklen_t cl = sizeof cli;
         int c = accept(g_listen_fd, (struct sockaddr*)&cli, &cl);
         if (c < 0) continue;
+        /* Core InitHTTPAllowList: the ACL is checked on every connection, not
+         * inferred from the bind address. A node bound to 0.0.0.0 with a
+         * narrow allow list must still refuse everyone else. */
+        if (g_allows){
+            char ip[64] = {0};
+            inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof ip);
+            if (!g_allows(ip)){
+                fprintf(stderr, "[rpc] refused connection from %s "
+                                "(not in -rpcallowip)\n", ip);
+                close(c);
+                continue;
+            }
+        }
         service_conn(c);
     }
     return NULL;
@@ -617,6 +631,7 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     g_user = cfg->user;
     g_pass = cfg->pass;
     g_wallet = cfg->wallet;
+    g_allows = cfg->allows;
 
     /* never die from a peer closing a socket mid-write (SIGPIPE) */
     signal(SIGPIPE, SIG_IGN);
@@ -631,7 +646,16 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)cfg->port);
+    /* Core -rpcbind. Loopback unless an address is configured AND the caller
+     * satisfied Core's rule that -rpcbind without -rpcallowip is ignored. */
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (cfg->bind_addr && cfg->bind_addr[0]){
+        if (inet_pton(AF_INET, cfg->bind_addr, &a.sin_addr) != 1){
+            snprintf(errmsg, errcap, "rpcbind=%s is not a valid IPv4 address",
+                     cfg->bind_addr);
+            close(g_listen_fd); g_listen_fd = -1; return -1;
+        }
+    }
     if (bind(g_listen_fd, (struct sockaddr*)&a, sizeof a) < 0) {
         if (errmsg && errcap) snprintf(errmsg, errcap, "bind() failed on port %d", cfg->port);
         close(g_listen_fd); g_listen_fd = -1;
