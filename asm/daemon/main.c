@@ -4156,7 +4156,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     if(result==1){
                         static long srt_last, srt_muted;
                         long now_s = (long)time(NULL);
-                        if(now_s - srt_last >= 5){
+                        if(now_s - srt_last >= 300){   /* 1/5min: reload streams made 1/5s a metronome */
                             fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs%s\n",
                                     relayed, mux_n_out,
                                     srt_muted ? " (repeats muted; +N shows in the tx_accept summary)" : "");
