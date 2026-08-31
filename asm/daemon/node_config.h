@@ -218,6 +218,8 @@ typedef struct {
     int  bytespersigop;          /* Core -bytespersigop (def 20): feerate is
                                   * judged against max(vsize, sigops*this/4) */
     int  disablewallet;          /* Core -disablewallet: do not load a wallet  */
+    int  reindex;                /* Core -reindex: ONE-SHOT rebuild of the block
+                                  * index from the blk files (archive_reindex.c) */
     char debuglogfile[256];      /* Core -debuglogfile: the daemon's own log
                                   * (def logs/bitcoind.log in the chain dir;
                                   * "0" = no file log)                       */
