@@ -244,6 +244,14 @@ int main(void){
          nodecfg_unimplemented("whitelist") == 0);
       ck("whitebind is still flagged (it is not implemented)",
          nodecfg_unimplemented("whitebind") == 1);
+      /* rpcallowip/rpcbind implemented 2026-08-30 (daemon/rpc_acl.c). Core
+       * supports both with its own guardrail -- the allow list always keeps
+       * loopback, and rpcbind is ignored without rpcallowip -- so the default
+       * posture is unchanged and the options are no longer a gap. */
+      ck("rpcallowip is NOT flagged (implemented)",
+         nodecfg_unimplemented("rpcallowip") == 0);
+      ck("rpcbind is NOT flagged (implemented)",
+         nodecfg_unimplemented("rpcbind") == 0);
       /* asmap WAS on that list until it was implemented. Now it must not be:
        * the list and the implementation have to move together, or the node
        * starts telling operators a working option does nothing. This

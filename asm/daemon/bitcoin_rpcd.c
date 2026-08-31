@@ -245,7 +245,11 @@ int main(int argc, char** argv) {
             fprintf(stderr, "bitcoin_rpcd: no block archive in datadir (blockchain-query RPCs will report -28)\n");
     }
 
-    rpc_server_cfg cfg;
+    /* ZERO-INITIALISED. The struct grows fields (bind_addr, allows), and a
+     * caller that sets members one by one leaves the new ones as garbage --
+     * for `allows` that is a garbage FUNCTION POINTER. Adding a field must not
+     * be able to break a caller that never mentioned it. */
+    rpc_server_cfg cfg = {0};
     cfg.port = port;
     cfg.user = user;
     cfg.pass = pass;

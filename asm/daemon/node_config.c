@@ -135,7 +135,8 @@ static const char* const k_unimplemented[] = {
     "whitebind","whitelistrelay","whitelistforcerelay",
     "txreconciliation","natpmp","upnp","bytespersigop",
     "peerbloomfilters","peerblockfilters",
-    "rpcallowip","rpcbind","rpcthreads","rpcworkqueue",
+    /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
+    "rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
     /* -reindex stays flagged deliberately: Core re-derives its block index by
      * walking the blk files, and this node's index.dat would need a
@@ -186,6 +187,8 @@ static void set_defaults(void){
     g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
     g_cfg.signetchallenge[0]    = 0;
+    g_cfg.rpcbind[0]            = 0;
+    g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
     g_cfg.pidfile[0]            = 0;
@@ -494,6 +497,13 @@ long node_config_load(const char* path){
             g_cfg.persistmempool = iv?1:0; applied++; }
         else if(!strcmp(key,"reindex-chainstate")){
             g_cfg.reindex_chainstate = iv?1:0; applied++; }
+        else if(!strcmp(key,"rpcallowip")){   /* Core: HTTP allow list */
+            if(g_cfg.n_rpcallowip >= 16){
+                fprintf(stderr,"[config] rpcallowip: at most 16 entries -- ignoring %s\n", val); bad++; }
+            else { snprintf(g_cfg.rpcallowip[g_cfg.n_rpcallowip], 64, "%s", val);
+                   g_cfg.n_rpcallowip++; applied++; } }
+        else if(!strcmp(key,"rpcbind")){      /* Core: RPC listen address */
+            snprintf(g_cfg.rpcbind, sizeof g_cfg.rpcbind, "%s", val); applied++; }
         else if(!strcmp(key,"whitelist")){    /* Core: peer permissions */
             const char* nperr = 0;
             if(netperm_add(val, &nperr)) applied++;
