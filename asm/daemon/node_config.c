@@ -139,14 +139,11 @@ static const char* const k_unimplemented[] = {
     /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
     "rpcthreads","rpcworkqueue",
     "rpcservertimeout","rest","server",
-    /* -reindex stays flagged deliberately: Core re-derives its block index by
-     * walking the blk files, and this node's index.dat would need a
-     * sequential walk with prev-hash linkage -- a mini-IBD from local files
-     * that does not exist here. Its recovery story is different
-     * (archive_verify_and_repair truncates and re-downloads), and shipping a
-     * partial rebuild under Core's name would be exactly the misleading
-     * option this list exists to prevent. -reindex-chainstate IS implemented. */
-    "reindex","loadblock","blocksdir","blocksxor",
+    /* -reindex and -reindex-chainstate are IMPLEMENTED (daemon/archive_reindex.c
+     * rebuilds the block index from the blk files; main.c drops the chain
+     * state). loadblock/blocksdir/blocksxor describe Core's block files,
+     * which this node does not use. */
+    "loadblock","blocksdir","blocksxor",
     "persistmempoolv1","dbbatchsize","prevoutfetchthreads",
     "uacomment","maxtxfee","maxapsfee",
     "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
@@ -186,6 +183,7 @@ static void set_defaults(void){
     g_cfg.v2transport           = 1;
     g_cfg.bytespersigop         = 20;    /* Core DEFAULT_BYTES_PER_SIGOP */
     g_cfg.disablewallet         = 0;
+    g_cfg.reindex               = 0;
     g_cfg.debuglogfile[0]       = 0;
     g_cfg.persistmempool        = 1;
     g_cfg.reindex_chainstate    = 0;
@@ -431,6 +429,8 @@ long node_config_load(const char* path){
             if(!bad){ g_cfg.bytespersigop=t; applied++; } }
         else if(!strcmp(key,"disablewallet")){ /* Core: -disablewallet */
             g_cfg.disablewallet = iv?1:0; applied++; }
+        else if(!strcmp(key,"reindex")){       /* Core -reindex (one-shot, see main.c) */
+            g_cfg.reindex = iv?1:0; applied++; }
         else if(!strcmp(key,"debuglogfile")){ /* Core: -debuglogfile=<file>, 0 = none */
             snprintf(g_cfg.debuglogfile,sizeof g_cfg.debuglogfile,"%s",val); applied++; }
         else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */
