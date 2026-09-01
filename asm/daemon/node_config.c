@@ -172,7 +172,6 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"unsafesqlitesync",   "no sqlite"},
     {"walletrejectlongchains","the mempool's cluster limits bound unconfirmed chains"},
     {"walletcrosschain",   "one chain per datadir"},
-    {"acceptstalefeeestimates","fee estimates are not persisted across restarts"},
     {"privatebroadcast",   "no private broadcast"},
     {"txsendrate",         "no private broadcast"},
     {"deprecatedrpc",      "no deprecated-RPC toggles"},
@@ -224,6 +223,7 @@ static void set_defaults(void){
     g_cfg.keypool = 1000; g_cfg.walletnotify[0] = 0; g_cfg.n_wallet_names = 0;
     snprintf(g_cfg.addresstype, sizeof g_cfg.addresstype, "bech32"); g_cfg.changetype[0] = 0;
     g_cfg.maxtipage = 86400; g_cfg.inboundrelaypercent = 50; g_cfg.whitelistrelay = 1; g_cfg.whitelistforcerelay = 0;
+    g_cfg.whitelistrelay_explicit = 0; g_cfg.maxmempool_explicit = 0; g_cfg.acceptstalefeeestimates = 0;
     g_cfg.peerbloomfilters = 0; g_cfg.peerblockfilters = 0; g_cfg.fixedseeds = 1; g_cfg.n_signetseednode = 0;
     g_cfg.txreconciliation = 0;
     g_cfg.logips = 0; g_cfg.logtimestamps = 1; g_cfg.logtimemicros = 0; g_cfg.logthreadnames = 0;
@@ -515,7 +515,7 @@ long node_config_load(const char* path){
              * much a single peer can make us buffer for one message. */
             t=clamp_int(iv,64,262144,key,&bad); if(t>=0){ g_cfg.maxrecvbuffer_kb=t; applied++; } }
         else if(!strcmp(key,"maxmempool")){    /* Core: MB */
-            t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; applied++; } }
+            t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; g_cfg.maxmempool_explicit=1; applied++; } }
         else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
             t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
         /* mempool policy limits (Core limit-count/size, relay fees, mempoolfullrbf).
@@ -851,7 +851,8 @@ long node_config_load(const char* path){
             else { g_cfg.maxtipage = lv; applied++; } }
         else if(!strcmp(key,"inboundrelaypercent")){
             t=clamp_int(iv,0,100,key,&bad); if(t>=0){ g_cfg.inboundrelaypercent=t; applied++; } }
-        else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = iv?1:0; applied++; }
+        else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = iv?1:0; g_cfg.whitelistrelay_explicit = 1; applied++; }
+        else if(!strcmp(key,"acceptstalefeeestimates")){ g_cfg.acceptstalefeeestimates = iv?1:0; applied++; }
         else if(!strcmp(key,"whitelistforcerelay")){ g_cfg.whitelistforcerelay = iv?1:0; applied++; }
         else if(!strcmp(key,"peerbloomfilters")){
             g_cfg.peerbloomfilters = iv?1:0;
@@ -936,6 +937,19 @@ long node_config_load(const char* path){
 
     /* -whitelistrelay / -whitelistforcerelay: the permissions implicit
      * whitelist entries carry (recomputed now, after every line is read) */
+    /* Core init.cpp parameter interactions, same log lines:
+     *   -blocksonly=1 -> -whitelistrelay=0 (unless set) and -maxmempool=5 (unless set)
+     *   -whitelistforcerelay=1 -> -whitelistrelay=1 */
+    if(!g_include_depth){
+        if(g_cfg.blocksonly){
+            if(!g_cfg.whitelistrelay_explicit && g_cfg.whitelistrelay){ g_cfg.whitelistrelay = 0;
+                fprintf(stderr,"[config] parameter interaction: -blocksonly=1 -> setting -whitelistrelay=0\n"); }
+            if(!g_cfg.maxmempool_explicit && g_cfg.maxmempool_mb != 5){ g_cfg.maxmempool_mb = 5;
+                fprintf(stderr,"[config] parameter interaction: -blocksonly=1 -> setting -maxmempool=5\n"); }
+        }
+        if(g_cfg.whitelistforcerelay && !g_cfg.whitelistrelay && !g_cfg.whitelistrelay_explicit){ g_cfg.whitelistrelay = 1;   /* SoftSet: an explicit 0 stands */
+            fprintf(stderr,"[config] parameter interaction: -whitelistforcerelay=1 -> setting -whitelistrelay=1\n"); }
+    }
     if(!g_include_depth) netperm_set_implicit_defaults(g_cfg.whitelistrelay, g_cfg.whitelistforcerelay);
     /* -signetseednode: seed nodes that apply only when the chain is signet
      * (Core keeps them separate so a shared file can carry both). */
@@ -1031,3 +1045,6 @@ void node_config_log(void){
             g_cfg.maxtipage, g_cfg.inboundrelaypercent, g_cfg.whitelistrelay, g_cfg.whitelistforcerelay,
             g_cfg.peerblockfilters, g_cfg.n_uacomment);
 }
+
+/* -acceptstalefeeestimates for daemon/mempool_cfg.c (weakly bound there). */
+int node_config_accept_stale_fee(void){ return g_cfg.acceptstalefeeestimates; }

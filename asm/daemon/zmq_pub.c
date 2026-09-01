@@ -43,6 +43,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <pthread.h>
+#include "../bmc_thread.h"
 #include <stdatomic.h>
 #include <time.h>
 
@@ -419,7 +420,7 @@ int zmqpub_start(void){
     if (g_thread_up) return 1;
     if (g_nep == 0) return 0;
     atomic_store(&g_stop, 0);
-    if (pthread_create(&g_thread, NULL, zp_thread_main, NULL) != 0){
+    if (bmc_pthread_create(&g_thread, zp_thread_main, NULL) != 0){
         fprintf(stderr, "[zmq] could not start the subscriber thread -- "
                         "publishing still works, subscribers will not connect\n");
         return 0;

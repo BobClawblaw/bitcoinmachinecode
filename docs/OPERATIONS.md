@@ -123,9 +123,17 @@ node without RPC. A fresh non-main chain directory self-seeds its genesis.
   `::1` are always allowed); otherwise the log says `Option -rpcbind was
   ignored because -rpcallowip was not specified`. A malformed `rpcallowip`
   is fatal.
-- **Peer permissions.** `whitelist=[perms@]<subnet>` grants `noban` (the
-  only permission implemented); `whitebind=` attaches permissions to an
-  extra listener. `whitelistrelay`/`whitelistforcerelay` are not implemented.
+- **Peer permissions (2026-09-01).** `whitelist=[perms@]<subnet>` and
+  `whitebind=[perms@]addr:port` grant Core's `noban`, `relay`, `forcerelay`,
+  `mempool`, `download`, `addr` (and `in`); a bare entry gets Core's implicit
+  set (noban, mempool, relay per `whitelistrelay`, forcerelay per
+  `whitelistforcerelay`). `bloomfilter` and `out` are refused at start-up
+  with the reason. `blocksonly=1` refuses transactions from every peer
+  without `relay` (disconnect, not scored, Core's log words), sends fRelay=0
+  and no feefilter, and reports `localrelay:false`; `inboundrelaypercent`
+  caps the inbound peers that negotiate tx relay (only relaying peers count).
+  `getpeerinfo` now itemizes inbound peers (slots 64..127 of the shared
+  table) with `permissions` and a truthful `relaytxes`.
 
 ### Wallet passphrase source
 

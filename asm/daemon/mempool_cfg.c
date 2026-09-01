@@ -76,6 +76,7 @@ void*         mp_ext_feeest   = 0;  /* shared fee estimator (daemon/fee_estimato
 extern unsigned long fest_state_size(unsigned long) __attribute__((weak));
 extern int  fest_init(void*, unsigned long) __attribute__((weak));
 extern int  fest_read_file(void*, const char*, long) __attribute__((weak));
+extern int  node_config_accept_stale_fee(void) __attribute__((weak));   /* -acceptstalefeeestimates */
 __attribute__((weak)) void fest_on_forget(const unsigned char* txid){ (void)txid; }
 unsigned long mp_ext_polstate_n = 0;
 
@@ -176,7 +177,7 @@ int mempool_configure(void){
         void* fe = mmap(0, fsz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (fe != MAP_FAILED && fest_init(fe, slots * 2)){
             mp_ext_feeest = fe;
-            int rr = fest_read_file ? fest_read_file(fe, "fee_estimates.dat", 60) : 0;
+            int rr = fest_read_file ? fest_read_file(fe, "fee_estimates.dat", (node_config_accept_stale_fee && node_config_accept_stale_fee()) ? -1 : 60) : 0;
             fprintf(stderr,"[feeest] estimator %s (%lu MB shared)%s\n",
                     rr == 1 ? "seeded from fee_estimates.dat" : rr == -1 ? "started fresh: fee_estimates.dat older than 60h, not used"
                     : rr == -2 ? "started fresh: fee_estimates.dat unreadable (non-fatal)" : "started fresh (no fee_estimates.dat)",

@@ -15,6 +15,7 @@
 #include "mempool_entry.h"
 #include "version_gen.h"
 #include <signal.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include "daemon/log_ts.h"
@@ -34,6 +35,9 @@ void rpc_node_set_status(const node_status_t* st){ g_status = st; }
 static char g_user_agent[256];
 void rpc_node_set_user_agent(const char* ua){ snprintf(g_user_agent, sizeof g_user_agent, "%s", ua ? ua : ""); }
 void rpc_node_set_status_rw(node_status_t* st){ g_status_rw = st; if (!g_status) g_status = st; }
+/* getnetworkinfo localrelay: false under -blocksonly (Core: !ignore_incoming_txs) */
+static int g_localrelay = 1;
+void rpc_node_set_localrelay(int on){ g_localrelay = on ? 1 : 0; }
 
 /* txid of a raw tx (BIP141: hash of the no-witness serialization); worker
  * recomputes independently for the mempool. */
@@ -106,7 +110,7 @@ static int cmd_getnetworkinfo(rj_val** res){
     { rj_val* names = rj_arr(); rj_arr_push(names, rj_str("NETWORK"));
       rj_arr_push(names, rj_str("WITNESS"));
       rj_obj_set(o, "localservicesnames", names); }
-    rj_obj_set(o, "localrelay", rj_bool(1));
+    rj_obj_set(o, "localrelay", rj_bool(g_localrelay));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
     /* the REAL toggle state, not a constant: setnetworkactive changes it and
      * getnetworkinfo must reflect that, or the two disagree about whether
@@ -168,13 +172,14 @@ static int cmd_getpeerinfo(rj_val** res){
         for (int i = 0; i < RPC_MAX_PEERS; i++){
             const rpc_peer_t* p = &g_status->peers[i];
             if (!p->used) continue;
+            if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) continue;   /* a serve child that died with its slot */
             rj_val* o = rj_obj();
             rj_obj_set(o, "id", rj_numf("%d", id++));
             rj_obj_set(o, "addr", rj_str(p->addr));
             { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)p->services);
               rj_obj_set(o, "services", rj_str(h)); }
             { rj_val* sn = rj_arr(); services_names(p->services, sn); rj_obj_set(o, "servicesnames", sn); }
-            rj_obj_set(o, "relaytxes", rj_bool(1));
+            rj_obj_set(o, "relaytxes", rj_bool(p->relaytxes));
             rj_obj_set(o, "lastsend", rj_numf("%lld", (long long)p->last_send));
             rj_obj_set(o, "lastrecv", rj_numf("%lld", (long long)p->last_recv));
             rj_obj_set(o, "bytessent", rj_numf("%lld", (long long)p->bytes_sent));
@@ -184,6 +189,15 @@ static int cmd_getpeerinfo(rj_val** res){
             rj_obj_set(o, "version", rj_numf("%u", p->proto));
             rj_obj_set(o, "subver", rj_str(p->subver));
             rj_obj_set(o, "inbound", rj_bool(p->inbound));
+            { /* Core NetPermissions::ToStrings order (net_permissions.cpp) */
+              rj_val* pa = rj_arr(); unsigned f = p->perms;
+              if (f & (1u<<0)) rj_arr_push(pa, rj_str("noban"));
+              if (f & (1u<<2)) rj_arr_push(pa, rj_str("forcerelay"));
+              if (f & (1u<<1)) rj_arr_push(pa, rj_str("relay"));
+              if (f & (1u<<3)) rj_arr_push(pa, rj_str("mempool"));
+              if (f & (1u<<4)) rj_arr_push(pa, rj_str("download"));
+              if (f & (1u<<5)) rj_arr_push(pa, rj_str("addr"));
+              rj_obj_set(o, "permissions", pa); }
             rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
             rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
             rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));

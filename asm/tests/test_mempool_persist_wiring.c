@@ -134,7 +134,7 @@ int main(void){
       if (f){
           fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
           char* src = malloc((size_t)n + 1); size_t got = fread(src, 1, (size_t)n, f); src[got] = 0; fclose(f);
-          const char* boot = strstr(src, "rpc_node_set_shutdown_flag(&g_shutdown_requested); }\n            if(pthread_create(&g_mempool_reload_thread");
+          const char* boot = strstr(src, "rpc_node_set_shutdown_flag(&g_shutdown_requested); }\n            if(bmc_pthread_create(&g_mempool_reload_thread");
           ck("reload yields to SIGTERM in the serve process: the hook is installed right before the reload thread starts", boot != NULL);
           ck("the reload runs on a thread, not inline in the boot path", strstr(src, "static void* mempool_reload_thread(void* arg)") != NULL
              && strstr(src, "            long acc = rpc_node_mempool_load(\"mempool.dat\");\n            if(acc < 0)") == NULL);
