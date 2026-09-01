@@ -218,11 +218,19 @@ To do (in this order):
    window, triggers the reject → `utxo_live_recover()` → retry path, and
    walk-counts. `tests/test_lsm_flush_sparse` already builds the run; it
    needs the recover step and a `del` in the last block.
-2. **Make recovery honest**: `utxo_live_recover()` must only run when the
-   failure IS a full manifest (`manifest_n == manifest_cap`), and after any
-   recovery the node must compare `utxo_live_walk_count()` against the
-   counter and refuse to continue on a mismatch. A REJECT that names a
-   missing input is a consensus disagreement, not a housekeeping problem.
+2. **Make recovery honest** -- DONE, `874c1a8` (2026-09-01 23:30 UTC, gate
+   green twice: 310 gated tests on the branch and again on `main`). Every
+   catch-up failure is classified (consensus reject / store error /
+   archive); `daemon/main.c` compacts only when
+   `utxo_live_recovery_applicable()` reports a store error with a full
+   manifest; a consensus reject backs off and retries from the checkpoint
+   without touching the runs and the log names it; after any compaction
+   `utxo_live_verify_after_recovery()` walks the set and requires
+   walk == counter == pre-recovery count, else UTXO tracking HALTS for the
+   process (sticky; heartbeat shows `[UTXO HALTED ...]`).
+   `tests/test_utxo_recover_gate` covers all three outcomes. NOT YET
+   DEPLOYED to the live daemon (still on `ag`); deploy = relink + restart at
+   a quiet moment.
 3. **Repair the live set**:
    DONE (surgical, see above); the muhash match is the proof. A from-genesis
    rebuild on `bc098fd`+ remains the independent confirmation if wanted.
