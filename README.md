@@ -313,8 +313,9 @@ log echoes the resolved values.
 ## Networks: Tor, I2P, CJDNS, IPv6
 
 - **IPv4 and IPv6** need no configuration. With `listen=1` the node opens a
-  v6-only listener beside the IPv4 one and dials IPv6 peers whenever the host
-  has IPv6 connectivity. Restrict with `onlynet`.
+  v6-only listener beside the IPv4 one and dials IPv6 peers when the host has
+  a global IPv6 route (probed at startup; a link-local or ULA-only host dials
+  none, and the boot log says so). Restrict with `onlynet`.
 - **Tor.** Reaching `.onion` peers needs a SOCKS5 port (`onion=127.0.0.1:9050`
   or `proxy=`). With `listenonion=1` and a reachable `torcontrol` port the
   node creates its own ephemeral v3 onion service (ED25519 key persisted in
