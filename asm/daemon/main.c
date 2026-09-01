@@ -4713,7 +4713,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
-            { extern void fest_shutdown_flush(void); fest_shutdown_flush(); }   /* fee_estimates.dat (Core Flush()) */
+            /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
+             * harnesses that link this file do not carry daemon/fee_hooks.c */
+            { extern void fest_shutdown_flush(void) __attribute__((weak));
+              if (fest_shutdown_flush) fest_shutdown_flush(); }
             _exit(0);
         }
         long long now_ms = 0;
