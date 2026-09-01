@@ -183,16 +183,53 @@ void descr_ms_ctx(const descr_t* d, long idx, int with_priv, descr_msuser_t* u, 
 }
 
 /* ---- key expressions -------------------------------------------------- */
-static int parse_path_elems(const char* s, size_t n, unsigned* path, int* plen, int* ranged, int* range_hard,
-                            int* apostrophe, int allow_range, char* err, unsigned long errcap){
-    /* s = "/a/b'/.../STAR" (STAR = the range marker) -- s[0] is '/' */
-    size_t i = 0; *plen = 0; *ranged = 0; *range_hard = 0;
+/* one path element "N", "Nh", "N'" -> value with the hardened bit; 1 ok / 0 err */
+static int parse_path_num(const char* s, size_t cl, int* apostrophe, unsigned* out, char* err, unsigned long errcap){
+    if (cl == 0) ERR("Key path value is not a valid uint32");
+    int hard = 0; char last = s[cl-1];
+    if (last == '\'' || last == 'h' || last == 'H'){ hard = 1; cl--; if (last == '\'') *apostrophe = 1; else *apostrophe = 0; }
+    if (cl == 0) ERR("Key path value is not a valid uint32");
+    unsigned long long v = 0;
+    for (size_t q = 0; q < cl; q++){
+        if (s[q] < '0' || s[q] > '9'){ char t[48]; size_t m = cl < 40 ? cl : 40; memcpy(t, s, m); t[m]=0; ERR("Key path value '%s' is not a valid uint32", t); }
+        v = v * 10 + (unsigned)(s[q]-'0'); if (v > 0xffffffffULL) ERR("Key path value %llu is out of range", v);
+    }
+    if (v > 0x7fffffffULL) ERR("Key path value %llu is out of range", v);
+    *out = (unsigned)v | (hard ? 0x80000000u : 0);
+    return 1;
+}
+static int parse_path_elems_mp(const char* s, size_t n, unsigned* path, int* plen, int* ranged, int* range_hard,
+                               int* apostrophe, int allow_range, int allow_mp, int* mp_pos, int* mp_n, unsigned* mp_vals,
+                               char* err, unsigned long errcap){
+    /* s = "/a/b'/<c;d>/.../STAR" (STAR = the range marker) -- s[0] is '/' */
+    size_t i = 0; *plen = 0; *ranged = 0; *range_hard = 0; *mp_pos = -1; *mp_n = 0;
     while (i < n){
         if (s[i] != '/') ERR("Key path value is not a valid uint32");
         i++;
         size_t j = i; while (j < n && s[j] != '/') j++;
         size_t cl = j - i;
         if (cl == 0) ERR("Key path value is not a valid uint32");
+        if (s[i] == '<' && s[j-1] == '>'){                       /* BIP389 multipath element */
+            if (!allow_mp){ char t[64]; size_t m = cl < 60 ? cl : 60; memcpy(t, s+i, m); t[m]=0; ERR("Key path value '%s' specifies multipath in a section where multipath is not allowed", t); }
+            if (*mp_pos >= 0) ERR("Multiple multipath key path specifiers found");
+            size_t a = i + 1, e = j - 1; int cnt = 0;
+            if (a >= e) ERR("Multipath key path specifiers must have at least two items");      /* "<>" */
+            while (a <= e){
+                size_t b = a; while (b < e && s[b] != ';') b++;
+                if (cnt >= DESCR_MP_MAX) ERR("Multipath key path specifier has too many items");
+                if (b == a) ERR("Key path value '' is not a valid uint32");
+                unsigned v; if (!parse_path_num(s + a, b - a, apostrophe, &v, err, errcap)) return 0;
+                for (int q = 0; q < cnt; q++) if (mp_vals[q] == v) ERR("Duplicated key path value %u in multipath specifier", v & 0x7fffffffu);
+                mp_vals[cnt++] = v;
+                if (b >= e) break;
+                a = b + 1;
+                if (a >= e) ERR("Key path value '' is not a valid uint32");
+            }
+            if (cnt < 2) ERR("Multipath key path specifiers must have at least two items");
+            if (*plen >= DESCR_MAX_PATH) ERR("Key path too deep");
+            *mp_pos = *plen; *mp_n = cnt; path[(*plen)++] = mp_vals[0];
+            i = j; continue;
+        }
         int hard = 0;
         char last = s[j-1];
         if (last == '\'' || last == 'h' || last == 'H'){ hard = 1; cl--; if (last == '\'') *apostrophe = 1; else *apostrophe = 0; }
@@ -212,6 +249,11 @@ static int parse_path_elems(const char* s, size_t n, unsigned* path, int* plen, 
         i = j;
     }
     return 1;
+}
+static int parse_path_elems(const char* s, size_t n, unsigned* path, int* plen, int* ranged, int* range_hard,
+                            int* apostrophe, int allow_range, char* err, unsigned long errcap){
+    int mp = -1, mn = 0; unsigned mv[DESCR_MP_MAX];
+    return parse_path_elems_mp(s, n, path, plen, ranged, range_hard, apostrophe, allow_range, 0, &mp, &mn, mv, err, errcap);
 }
 
 static int parse_key(const char* s, size_t n, int ctx_tr, int allow_range, descr_key_t* k, char* err, unsigned long errcap){
@@ -284,8 +326,8 @@ static int parse_key(const char* s, size_t n, int ctx_tr, int allow_range, descr
     if (!ok) ERR("key '%s' is not valid", key);
     if (j < n){
         if (k->kind == DK_HEX || k->kind == DK_WIF) ERR("Key path is not allowed for a non-extended key");   /* Core: "... is not valid" -- kept specific */
-        if (!parse_path_elems(s + j, n - j, k->path, &k->pathlen, &k->ranged, &k->range_hard, &k->apostrophe, allow_range, err, errcap)) return 0;
-    }
+        if (!parse_path_elems_mp(s + j, n - j, k->path, &k->pathlen, &k->ranged, &k->range_hard, &k->apostrophe, allow_range, 1, &k->mp_pos, &k->mp_n, k->mp_vals, err, errcap)) return 0;
+    } else k->mp_pos = -1;
     return 1;
 }
 
@@ -310,7 +352,7 @@ static int add_key(descr_t* d, const char* s, size_t n, int ctx, char* err, unsi
         const char* rest = s + close + 1; size_t rl = n - close - 1;
         int slot = d->nk++;                                   /* the aggregate's own slot, reserved first */
         descr_key_t* k = &d->keys[slot]; memset(k, 0, sizeof *k);
-        k->kind = DK_MUSIG; k->compressed = 1; k->tr_ctx = 1; k->apostrophe = 1;
+        k->kind = DK_MUSIG; k->compressed = 1; k->tr_ctx = 1; k->apostrophe = 1; k->mp_pos = -1;
         const char* as[DESCR_MUSIG_MAX + 1]; size_t al[DESCR_MUSIG_MAX + 1];
         int na = il == 0 ? 0 : split_args(in, il, as, al, DESCR_MUSIG_MAX + 1);
         if (na < 0) ERRN("musig(): too many participants");
@@ -333,11 +375,18 @@ static int add_key(descr_t* d, const char* s, size_t n, int ctx, char* err, unsi
             if (!all_bip32) ERRN("musig(): derivation requires all participants to be xpubs or xprvs");
             if (any_ranged) ERRN("musig(): Cannot have ranged participant keys if musig() also has derivation");
             int rg = 0, rh = 0, ap = 1;
-            if (!parse_path_elems(rest, rl, k->path, &k->pathlen, &rg, &rh, &ap, 1, err, errcap)){ char t[512]; snprintf(t, sizeof t, "%s", err); snprintf(err, errcap, "musig(): %s", t); return -1; }
+            if (!parse_path_elems_mp(rest, rl, k->path, &k->pathlen, &rg, &rh, &ap, 1, 1, &k->mp_pos, &k->mp_n, k->mp_vals, err, errcap)){ char t[512]; snprintf(t, sizeof t, "%s", err); snprintf(err, errcap, "musig(): %s", t); return -1; }
             if (rh) ERRN("musig(): Cannot have hardened child derivation");
             for (int i = 0; i < k->pathlen; i++) if (k->path[i] & 0x80000000u) ERRN("musig(): cannot have hardened derivation steps");
+            for (int i = 0; i < k->mp_n; i++) if (k->mp_vals[i] & 0x80000000u) ERRN("musig(): cannot have hardened derivation steps");
             k->ranged = rg;
         }
+        { /* BIP389 in musig(): participants may be multipath (equal lengths) unless the aggregate's own path is */
+          int pm = 0, mism = 0;
+          for (int q = 0; q < k->musig_n; q++){ int m = d->keys[k->musig_parts[q]].mp_n; if (m > 1){ if (pm && m != pm) mism = 1; pm = m; } }
+          if (mism) ERRN("musig(): Multipath derivation paths have mismatched lengths");
+          if (pm && k->mp_n > 1) ERRN("musig(): Cannot have multipath participant keys if musig() is also multipath");
+          if (pm) k->mp_n = pm; }
         k->musig_parts_ranged = any_ranged; k->has_priv = any_priv;
         if (k->ranged || any_ranged) d->ranged = 1;
         if (any_priv) d->has_priv = 1;
@@ -386,7 +435,8 @@ static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err,
         int t = fn[0]=='w' ? DN_WPKH : fn[2]=='h' ? DN_PKH : DN_PK;
         if (t == DN_WPKH && ctx != CTX_TOP && ctx != CTX_SH) ERRN("Can only have wpkh() at top level or inside sh()");
         int nd = new_node(d, t, err, errcap); if (nd < 0) return -1;
-        int k = add_key(d, in, il, ctx, err, errcap); if (k < 0) return -1;
+        int k = add_key(d, in, il, ctx, err, errcap);
+        if (k < 0){ char t2[1400]; snprintf(t2, sizeof t2, "%s", err); snprintf(err, errcap, "%s(): %s", fn, t2); return -1; }   /* Core prefixes the key error */
         if (t == DN_WPKH && !d->keys[k].compressed) ERRN("Uncompressed keys are not allowed");
         d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1; return nd;
     }
@@ -415,6 +465,7 @@ static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err,
             if (!d->keys[k].compressed) anyuncomp = 1;
             d->nodes[nd].keys[d->nodes[nd].nkeys++] = k;
         }
+        { int pm = 0; for (int q = 0; q < d->nodes[nd].nkeys; q++){ int m = d->keys[d->nodes[nd].keys[q]].mp_n; if (m > 1){ if (pm && m != pm) ERRN("%s(): Multipath derivation paths have mismatched lengths", fn); pm = m; } } }
         if (!tap && ctx == CTX_TOP && na - 1 > 3) ERRN("Cannot have %d pubkeys in bare multisig: only at most 3 pubkeys", na - 1);
         if (!tap && ctx == CTX_SH){
             /* Core: the redeemScript must fit 520 bytes */
@@ -446,7 +497,11 @@ static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err,
         int k = add_key(d, as[0], al[0], CTX_TR, err, errcap);
         if (k < 0){ char t[1400]; snprintf(t, sizeof t, "%s", err); snprintf(err, errcap, "tr(): %s", t); return -1; }   /* Core prefixes the key error */
         d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1;
-        if (na == 2){ int t = parse_tree(d, as[1], al[1], err, errcap); if (t < 0) return -1; d->nodes[nd].child[0] = t; }
+        if (na == 2){ int k0 = d->nk; int t = parse_tree(d, as[1], al[1], err, errcap); if (t < 0) return -1; d->nodes[nd].child[0] = t;
+            int mx = d->keys[k].mp_n > 1 ? d->keys[k].mp_n : 1;
+            for (int q = k0; q < d->nk; q++) if (d->keys[q].mp_n > mx) mx = d->keys[q].mp_n;
+            for (int q = k0; q < d->nk; q++){ int m = d->keys[q].mp_n; if (m > 1 && m != mx) ERRN("tr(): Multipath subscripts have mismatched lengths"); }
+            if (d->keys[k].mp_n > 1 && d->keys[k].mp_n != mx) ERRN("tr(): Multipath internal key mismatches multipath subscripts lengths"); }
         return nd;
     }
     if (!strcmp(fn, "rawtr")){
@@ -515,6 +570,7 @@ static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err,
             }
             int nd = new_node(d, DN_MINISCRIPT, err, errcap); if (nd < 0) return -1;
             d->nodes[nd].ms_root = root;
+            { int pm = 0; for (int q = 0; q < d->nk; q++){ int m = d->keys[q].mp_n; if (m > 1){ if (pm && m != pm) ERRN("Miniscript: Multipath derivation paths have mismatched lengths"); pm = m; } } }
             return nd;
         }
     }
@@ -538,7 +594,16 @@ int descr_parse(const char* text, descr_t* d, char* err, unsigned long errcap){
     int r = parse_script(d, d->text, cl, CTX_TOP, err, errcap);
     if (r < 0) return 0;
     d->root = r;
+    /* BIP389: the expansion count; every key path already holds expansion 0 */
+    d->mp_n = 1; d->mp_sel = 0;
+    for (int q = 0; q < d->nk; q++) if (d->keys[q].mp_n > d->mp_n) d->mp_n = d->keys[q].mp_n;
     return 1;
+}
+int descr_multipath_n(const descr_t* d){ return d->mp_n > 1 ? d->mp_n : 1; }
+int descr_multipath_select(descr_t* d, int sel){
+    if (sel < 0 || sel >= descr_multipath_n(d)) return 0;
+    for (int q = 0; q < d->nk; q++){ descr_key_t* k = &d->keys[q]; if (k->mp_n > 1 && k->mp_pos >= 0 && k->mp_pos < k->pathlen) k->path[k->mp_pos] = k->mp_vals[sel]; }
+    d->mp_sel = sel; return 1;
 }
 
 /* ---- derivation ------------------------------------------------------- */
@@ -788,17 +853,30 @@ int descr_has_address(const descr_t* d){
 }
 
 /* ---- to string -------------------------------------------------------- */
-typedef struct { char* p; unsigned long cap, n; int ovf; } sb_t;
+typedef struct { char* p; unsigned long cap, n; int ovf; int mpform; } sb_t;
 static void sb_put(sb_t* b, const char* s){ unsigned long l = strlen(s); if (b->n + l + 1 > b->cap){ b->ovf = 1; return; } memcpy(b->p + b->n, s, l + 1); b->n += l; }
 static void sb_path(sb_t* b, const unsigned* path, int n, int apostrophe){
     for (int i = 0; i < n; i++){ char t[24]; snprintf(t, sizeof t, "/%u%s", path[i] & 0x7fffffffu, (path[i] & 0x80000000u) ? (apostrophe ? "'" : "h") : ""); sb_put(b, t); }
+}
+/* the key's derivation path; in multipath form the placeholder prints as <a;b;...> */
+static int g_print_mp;   /* descr_to_string_multipath in progress: keys printed through the miniscript printer show <a;b> too */
+static void sb_kpath(sb_t* b, const descr_key_t* k){
+    for (int i = 0; i < k->pathlen; i++){
+        char t[24 * DESCR_MP_MAX + 4];
+        if ((b->mpform || g_print_mp) && k->mp_n > 1 && i == k->mp_pos){
+            int o = 0; o += snprintf(t + o, sizeof t - (size_t)o, "/<");
+            for (int q = 0; q < k->mp_n; q++) o += snprintf(t + o, sizeof t - (size_t)o, "%s%u%s", q ? ";" : "", k->mp_vals[q] & 0x7fffffffu, (k->mp_vals[q] & 0x80000000u) ? (k->apostrophe ? "'" : "h") : "");
+            snprintf(t + o, sizeof t - (size_t)o, ">");
+        } else snprintf(t, sizeof t, "/%u%s", k->path[i] & 0x7fffffffu, (k->path[i] & 0x80000000u) ? (k->apostrophe ? "'" : "h") : "");
+        sb_put(b, t);
+    }
 }
 static void sb_key(sb_t* b, const descr_t* d, const descr_key_t* k, int with_priv){
     if (k->kind == DK_MUSIG){
         sb_put(b, "musig(");
         for (int i = 0; i < k->musig_n; i++){ if (i) sb_put(b, ","); sb_key(b, d, &d->keys[k->musig_parts[i]], with_priv); }
         sb_put(b, ")");
-        sb_path(b, k->path, k->pathlen, k->apostrophe);
+        sb_kpath(b, k);
         if (k->ranged) sb_put(b, "/*");
         return;
     }
@@ -825,11 +903,11 @@ static void sb_key(sb_t* b, const descr_t* d, const descr_key_t* k, int with_pri
         else memcpy(ser+45,k->pub,33);
         base58check_encode(t, ser, 78); sb_put(b, t);
     }
-    sb_path(b, k->path, k->pathlen, k->apostrophe);
+    sb_kpath(b, k);
     if (k->ranged) sb_put(b, k->range_hard ? (k->apostrophe ? "/*'" : "/*h") : "/*");
 }
 static void sb_key_to(const descr_t* d, int ki, int with_priv, char* out, unsigned long cap){
-    sb_t b = { out, cap, 0, 0 }; out[0] = 0;
+    sb_t b = { out, cap, 0, 0, 0 }; out[0] = 0;
     if (ki < 0 || ki >= d->nk) return;
     sb_key(&b, d, &d->keys[ki], with_priv);
     if (b.ovf) out[0] = 0;
@@ -864,7 +942,13 @@ static void sb_node(sb_t* b, const descr_t* d, int ni, int with_priv){
 }
 int descr_to_string(const descr_t* d, int with_priv, char* out, unsigned long cap){
     if (d->root < 0 || cap == 0) return 0;
-    sb_t b = { out, cap, 0, 0 }; out[0] = 0;
+    sb_t b = { out, cap, 0, 0, 0 }; out[0] = 0;
     sb_node(&b, d, d->root, with_priv);
+    return !b.ovf;
+}
+int descr_to_string_multipath(const descr_t* d, int with_priv, char* out, unsigned long cap){
+    if (d->root < 0 || cap == 0) return 0;
+    sb_t b = { out, cap, 0, 0, 1 }; out[0] = 0;
+    g_print_mp = 1; sb_node(&b, d, d->root, with_priv); g_print_mp = 0;
     return !b.ovf;
 }

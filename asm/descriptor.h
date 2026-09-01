@@ -19,6 +19,7 @@
 
 enum { DK_HEX = 0, DK_WIF = 1, DK_XPUB = 2, DK_XPRV = 3, DK_MUSIG = 4 };
 #define DESCR_MUSIG_MAX 32
+#define DESCR_MP_MAX    8     /* items in one multipath specifier <a;b;...> (BIP389) */
 typedef struct {
     int kind;
     int has_priv;                 /* WIF or xprv: descr_key_priv_at works */
@@ -39,6 +40,9 @@ typedef struct {
      * them is ranged. The musig()'s own derivation lives in path/ranged above
      * (a synthetic xpub over the aggregate, unhardened steps only). */
     int musig_n; int musig_parts[DESCR_MUSIG_MAX]; int musig_parts_ranged;
+    /* BIP389 multipath: path[mp_pos] is a placeholder holding mp_vals[d->mp_sel]
+     * (descr_multipath_select rewrites it); mp_n = 0 when the key has none */
+    int mp_pos, mp_n; unsigned mp_vals[DESCR_MP_MAX];
 } descr_key_t;
 
 enum { DN_PK = 1, DN_PKH, DN_WPKH, DN_COMBO, DN_MULTI, DN_SORTEDMULTI, DN_MULTI_A, DN_SORTEDMULTI_A,
@@ -64,6 +68,7 @@ typedef struct {
     descr_key_t  keys[DESCR_MAX_KEYS];   int nk;
     int root;
     int ranged, has_priv, has_hardened_range;
+    int mp_n, mp_sel;             /* multipath expansions (0/1 = none) and the one selected into the key paths */
     unsigned char raw[DESCR_MAX_SPK]; int rawlen;   /* addr()/raw() script */
     char checksum[9];             /* computed over the text (without #...) */
     int had_checksum;             /* the input carried one (and it matched) */
@@ -98,6 +103,16 @@ int  descr_key_priv_at(const descr_t* d, int key, long idx, unsigned char priv[3
 int  descr_inner_script_at(const descr_t* d, long idx, unsigned char* out, int cap, int* which /* 1 sh, 2 wsh, 3 sh(wsh) */);
 /* 1 if the top-level expansion has a single address (Core ExtractDestination) */
 int  descr_has_address(const descr_t* d);
+/* BIP389 multipath (2026-09-01): a descriptor with /<a;b;...> derivation steps
+ * parses as ONE descr_t whose key paths hold expansion `mp_sel` (0 after
+ * parse); descr_multipath_n is the expansion count (1 when there is none)
+ * and descr_multipath_select rewrites every key path to expansion `sel`
+ * (-1 = none; 1 ok / 0 out of range). Every derivation/expansion/printing
+ * function then sees that single-path descriptor. descr_to_string_multipath
+ * prints the original multipath form. */
+int  descr_multipath_n(const descr_t* d);
+int  descr_multipath_select(descr_t* d, int sel);
+int  descr_to_string_multipath(const descr_t* d, int with_priv, char* out, unsigned long cap);
 
 /* ---- miniscript access (the PSBT signer) ----
  * The miniscript view of a descriptor's pool, and the key context that
