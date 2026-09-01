@@ -205,6 +205,12 @@ I2P destination.
   `zmqpubsequence` is not supported and is refused.
 - `txindex=1` has no effect on the daemon: the index is built offline
   (`daemon/build_tx_index <datadir>`) and used when `txindex.dat` exists.
+- **txospenderindex** (2026-09-01): same pattern — `daemon/build_txospender_index
+  <datadir> [from] [to]` writes `txospender.dat` (~35 GB for mainnet; run it
+  while the node is idle, it reads the whole archive once), the daemon then
+  keeps `txospender.tail` current and `gettxspendingprevout` answers
+  confirmed spends. Absent file = index off, exactly as Core without the
+  option.
   `blockfilterindex` and `coinstatsindex` are on; the keys only turn them off.
 - `assumevalid=<hash>` skips script evaluation for blocks at and below that
   block (PoW, merkle, structure and every UTXO check still run); the height is
