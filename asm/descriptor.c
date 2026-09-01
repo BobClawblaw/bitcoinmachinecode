@@ -32,20 +32,22 @@ extern int  bip32_xonly_tweak_add(const u8 x[32], const u8 t[32], u8 out_x[32]);
  * RPC-side engine that must link into any thread) */
 static void tagged_hash(u8 out[32], const char* tag, const u8* a, unsigned long alen, const u8* b, unsigned long blen){
     u8 th[32]; sha256_full(th, tag, strlen(tag));
-    u8 buf[64 + 2 + 1400 + 32];
+    u8* buf = malloc(64 + alen + blen + 1); if (!buf){ memset(out, 0, 32); return; }
     unsigned long n = 0;
     memcpy(buf, th, 32); memcpy(buf + 32, th, 32); n = 64;
-    if (alen + blen > sizeof buf - 64) alen = sizeof buf - 64 - blen;
     memcpy(buf + n, a, alen); n += alen;
     if (b && blen){ memcpy(buf + n, b, blen); n += blen; }
     sha256_full(out, buf, n);
+    free(buf);
 }
 static long tap_leaf_hash(u8 out[32], u8 leaf_version, const u8* script, uint64_t slen){
-    u8 pre[3]; int pl = 0; pre[pl++] = leaf_version;
+    u8 pre[4]; int pl = 0; pre[pl++] = leaf_version;   /* [4]: a leaf of 253+ bytes needs the 0xfd form (miniscript leaves can) */
     if (slen < 0xfd) pre[pl++] = (u8)slen; else { pre[pl++] = 0xfd; pre[pl++] = (u8)slen; pre[pl++] = (u8)(slen >> 8); }
-    u8 tmp[4 + 1400]; if (slen > 1400) return 0;
+    if (slen > 65535) return 0;
+    u8* tmp = malloc(4 + (size_t)slen); if (!tmp) return 0;
     memcpy(tmp, pre, (size_t)pl); memcpy(tmp + pl, script, (size_t)slen);
     tagged_hash(out, "TapLeaf", tmp, (unsigned long)(pl + slen), NULL, 0);
+    free(tmp);
     return 1;
 }
 static long tap_branch_hash(u8 out[32], const u8* a, const u8* b){
@@ -132,6 +134,48 @@ static int push_num(u8* out, int o, int cap, int v){
     while (x){ b[n++] = (u8)(x & 0xff); x >>= 8; }
     if (b[n-1] & 0x80) b[n++] = 0;
     return push_data(out, o, cap, b, n);
+}
+
+/* ---- miniscript key context ------------------------------------------- */
+static int add_key(descr_t* d, const char* s, size_t n, int ctx, char* err, unsigned long errcap);
+static int key_pub_at(const descr_key_t* k, long idx, u8 pub[65], int* publen);
+static int key_bytes(const descr_t* d, int ki, long idx, int xonly, u8 out[65], int* n);
+static void sb_key_to(const descr_t* d, int ki, int with_priv, char* out, unsigned long cap);
+static int dms_key_from_str(void* u, const char* s, size_t n, int* key, char* err, size_t errcap){
+    descr_msuser_t* m = (descr_msuser_t*)u;
+    int k = add_key((descr_t*)m->d, s, n, m->tr ? 3 /* CTX_TR */ : 2 /* CTX_WSH */, err, errcap);
+    if (k < 0){ m->key_err = 1; return 0; }
+    *key = k; return 1;
+}
+static int dms_key_from_bytes(void* u, const u8* b, size_t n, int* key){ (void)u; (void)b; (void)n; (void)key; return 0; }
+static int dms_key_from_hash(void* u, const u8 h[20], int* key){ (void)u; (void)h; (void)key; return 0; }
+static int dms_key_bytes(void* u, int key, u8 out[33], int* n){
+    descr_msuser_t* m = (descr_msuser_t*)u; u8 kb[65]; int kl;
+    if (!key_bytes(m->d, key, m->idx, m->tr, kb, &kl)) return 0;
+    if (kl > 33) return 0;
+    memcpy(out, kb, (size_t)kl); *n = kl; return 1;
+}
+static int dms_key_hash(void* u, int key, u8 out[20]){ u8 kb[33]; int n; if (!dms_key_bytes(u, key, kb, &n)) return 0; hash160(out, kb, n); return 1; }
+static int dms_key_to_str(void* u, int key, char* out, size_t cap){ descr_msuser_t* m = (descr_msuser_t*)u; sb_key_to(m->d, key, m->with_priv, out, cap); return out[0] != 0; }
+/* Core's KeyParser::KeyCompare: the pubkeys at index 0 */
+static int dms_key_cmp(void* u, int a, int b){
+    descr_msuser_t* m = (descr_msuser_t*)u; u8 pa[65], pb[65]; int la = 0, lb = 0;
+    int oa = key_bytes(m->d, a, 0, 0, pa, &la), ob = key_bytes(m->d, b, 0, 0, pb, &lb);
+    if (!oa || !ob) return a - b;
+    int c = memcmp(pa, pb, (size_t)(la < lb ? la : lb)); if (c) return c; return la - lb;
+}
+void descr_ms_tree(const descr_t* d, ms_tree_t* out){
+    memset(out, 0, sizeof *out);
+    out->nodes = (ms_node_t*)d->msnodes; out->nn = d->msnn; out->ncap = MS_DESC_NODES;
+    out->subs = (int32_t*)d->mssubs; out->ns = d->msns; out->scap = MS_DESC_SUBS;
+    out->keys = (int32_t*)d->mskeys; out->nk = d->msnk; out->kcap = MS_DESC_KEYS;
+    out->growable = 0; out->tapscript = d->ms_tapscript;
+}
+void descr_ms_ctx(const descr_t* d, long idx, int with_priv, descr_msuser_t* u, ms_ctx_t* ctx){
+    memset(u, 0, sizeof *u); u->d = d; u->idx = idx; u->tr = d->ms_tapscript; u->with_priv = with_priv;
+    memset(ctx, 0, sizeof *ctx); ctx->user = u;
+    ctx->key_from_str = dms_key_from_str; ctx->key_from_bytes = dms_key_from_bytes; ctx->key_from_hash = dms_key_from_hash;
+    ctx->key_bytes = dms_key_bytes; ctx->key_hash = dms_key_hash; ctx->key_to_str = dms_key_to_str; ctx->key_cmp = dms_key_cmp;
 }
 
 /* ---- key expressions -------------------------------------------------- */
@@ -387,8 +431,44 @@ static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err,
         int nd = new_node(d, DN_RAW, err, errcap); return nd;
     }
     if (!strcmp(fn, "musig")) ERRN("musig() is not supported by this node");
+    /* Miniscript (Core: tried for any expression no named function took;
+     * outside wsh()/tr() a successful parse is itself the error). The keys
+     * are parsed in the P2WSH rules unless this is a tr() leaf. */
+    {
+        int tap = (ctx == CTX_TR);
+        if (d->msnn == 0) d->ms_tapscript = tap;
+        else if (d->ms_tapscript != tap) ERRN("Descriptor mixes P2WSH and tapscript miniscripts");
+        ms_tree_t mt; descr_ms_tree(d, &mt);
+        descr_msuser_t mu; ms_ctx_t mctx; descr_ms_ctx(d, 0, 0, &mu, &mctx);
+        mu.tr = tap; mu.err = err; mu.errcap = errcap;
+        char kerr[256]; kerr[0] = 0;
+        int root = ms_parse(&mt, &mctx, s, n, kerr, sizeof kerr);
+        d->msnn = mt.nn; d->msns = mt.ns; d->msnk = mt.nk;
+        if (mu.key_err) ERRN("%s", kerr);
+        if (root >= 0){
+            if (ctx != CTX_WSH && ctx != CTX_TR) ERRN("Miniscript expressions can only be used in wsh or tr.");
+            if (!ms_is_sane(&mt, root) || ms_is_not_satisfiable(&mt, root)){
+                int ins = ms_find_insane_sub(&mt, root); if (ins < 0) ins = root;
+                char* txt = malloc(4096); if (!txt) ERRN("out of memory");
+                if (!ms_to_string(&mt, &mctx, ins, txt, 4096)) snprintf(txt, 4096, "<miniscript>");
+                const char* why;
+                if (!ms_is_valid(&mt, ins)) why = " is invalid";
+                else if (!ms_is_sane(&mt, root)){
+                    if (!ms_is_nonmalleable(&mt, ins)) why = " is not sane: malleable witnesses exist";
+                    else if (ins == root && !ms_needs_signature(&mt, ins)) why = " is not sane: witnesses without signature exist";
+                    else if (!ms_check_timelocks_mix(&mt, ins)) why = " is not sane: contains mixes of timelocks expressed in blocks and seconds";
+                    else if (!ms_check_duplicate_key(&mt, ins)) why = " is not sane: contains duplicate public keys";
+                    else if (!ms_valid_satisfactions(&mt, ins)) why = " is not sane: needs witnesses that may exceed resource limits";
+                    else why = " is not sane";
+                } else why = " is not satisfiable";
+                snprintf(err, errcap, "%s%s", txt, why); free(txt); return -1;
+            }
+            int nd = new_node(d, DN_MINISCRIPT, err, errcap); if (nd < 0) return -1;
+            d->nodes[nd].ms_root = root;
+            return nd;
+        }
+    }
     { char t[64]; size_t m = p < 48 ? p : 48; memcpy(t, s, m); t[m] = 0;
-      /* miniscript fragments are refused by name, not half-parsed */
       ERRN("'%s' is not a valid descriptor function", t); }
 }
 
@@ -446,7 +526,7 @@ int descr_key_priv_at(const descr_t* d, int key, long idx, u8 priv[32], int* com
 }
 
 /* ---- script construction ---------------------------------------------- */
-#define SCRIPT_CAP 1400
+#define SCRIPT_CAP 40000   /* a tapscript leaf may be a 999-key multi_a; buffers this size live on the heap */
 /* pubkey bytes of key `ki` at idx, x-only when in tr context */
 static int key_bytes(const descr_t* d, int ki, long idx, int xonly, u8 out[65], int* n){
     u8 pub[65]; int pl;
@@ -497,9 +577,34 @@ static int node_script(const descr_t* d, int ni, long idx, int tr, u8* out, int 
         }
         o = push_num(out, o, cap, n->k); if (o < 0 || o + 1 > cap) return -1;
         out[o++] = 0x9c; return o; }                     /* NUMEQUAL */
+    case DN_MINISCRIPT: {
+        ms_tree_t mt; descr_ms_tree(d, &mt);
+        descr_msuser_t mu; ms_ctx_t mctx; descr_ms_ctx(d, idx, 0, &mu, &mctx); mu.tr = tr;
+        int l = ms_to_script(&mt, &mctx, n->ms_root, out, (size_t)cap);
+        if (l < 0){ if (!g_err[0]) snprintf(g_err, sizeof g_err, "Key derivation failed"); return -1; }
+        return l; }
     default:
         snprintf(g_err, sizeof g_err, "Descriptor node cannot be a script"); return -1;
     }
+}
+int descr_ms_root(const descr_t* d, long idx, const u8* leaf, int leaflen){
+    if (d->root < 0) return -1;
+    const descr_node_t* r = &d->nodes[d->root];
+    if (r->type == DN_SH && r->child[0] >= 0 && d->nodes[r->child[0]].type == DN_WSH) r = &d->nodes[r->child[0]];
+    if (r->type == DN_WSH){ const descr_node_t* c = &d->nodes[r->child[0]]; return c->type == DN_MINISCRIPT ? c->ms_root : -1; }
+    if (r->type != DN_TR || r->child[0] < 0 || !leaf) return -1;
+    /* walk the tree for the leaf whose script matches */
+    int stack[256]; int sp = 0; stack[sp++] = r->child[0];
+    while (sp){
+        const descr_node_t* n = &d->nodes[stack[--sp]];
+        if (n->type == DN_BRANCH){ if (sp + 2 <= 256){ stack[sp++] = n->child[0]; stack[sp++] = n->child[1]; } continue; }
+        if (n->type != DN_MINISCRIPT) continue;
+        u8* sc = malloc(SCRIPT_CAP); if (!sc) return -1;
+        int sl = node_script(d, (int)(n - d->nodes), idx, 1, sc, SCRIPT_CAP);
+        int hit = (sl == leaflen && !memcmp(sc, leaf, (size_t)sl)); free(sc);
+        if (hit) return n->ms_root;
+    }
+    return -1;
 }
 /* merkle root of a tap tree rooted at ni; 1 ok */
 static int tree_hash(const descr_t* d, int ni, long idx, u8 out[32], int depth){
@@ -510,9 +615,11 @@ static int tree_hash(const descr_t* d, int ni, long idx, u8 out[32], int depth){
         if (!tree_hash(d, n->child[0], idx, l, depth + 1) || !tree_hash(d, n->child[1], idx, r, depth + 1)) return 0;
         tap_branch_hash(out, l, r); return 1;
     }
-    u8 sc[SCRIPT_CAP]; int sl = node_script(d, ni, idx, 1, sc, SCRIPT_CAP);
-    if (sl < 0) return 0;
-    if (tap_leaf_hash(out, 0xc0, sc, (uint64_t)sl) != 1){ snprintf(g_err, sizeof g_err, "tapleaf hash failed"); return 0; }
+    u8* sc = malloc(SCRIPT_CAP); if (!sc){ snprintf(g_err, sizeof g_err, "out of memory"); return 0; }
+    int sl = node_script(d, ni, idx, 1, sc, SCRIPT_CAP);
+    if (sl < 0){ free(sc); return 0; }
+    int ok = tap_leaf_hash(out, 0xc0, sc, (uint64_t)sl) == 1; free(sc);
+    if (!ok){ snprintf(g_err, sizeof g_err, "tapleaf hash failed"); return 0; }
     return 1;
 }
 /* scriptPubKey of the wrapper/leaf node ni at the top level */
@@ -520,18 +627,21 @@ static int spk_of(const descr_t* d, int ni, long idx, u8* out, int cap){
     const descr_node_t* n = &d->nodes[ni];
     switch (n->type){
     case DN_SH: {
-        u8 sc[SCRIPT_CAP]; int sl;
+        u8* sc = malloc(SCRIPT_CAP); if (!sc){ snprintf(g_err, sizeof g_err, "out of memory"); return -1; }
+        int sl;
         int ct = d->nodes[n->child[0]].type;
         if (ct == DN_WSH || ct == DN_WPKH){ sl = spk_of(d, n->child[0], idx, sc, SCRIPT_CAP); }
         else { sl = node_script(d, n->child[0], idx, 0, sc, SCRIPT_CAP); }
-        if (sl < 0) return -1;
-        if (sl > 520){ snprintf(g_err, sizeof g_err, "P2SH script is too large, %d bytes is larger than 520 bytes", sl); return -1; }
-        u8 h[20]; hash160(h, sc, sl);
+        if (sl < 0){ free(sc); return -1; }
+        if (sl > 520){ snprintf(g_err, sizeof g_err, "P2SH script is too large, %d bytes is larger than 520 bytes", sl); free(sc); return -1; }
+        u8 h[20]; hash160(h, sc, sl); free(sc);
         if (cap < 23) return -1;
         out[0]=0xa9; out[1]=0x14; memcpy(out+2, h, 20); out[22]=0x87; return 23; }
-    case DN_WSH: { u8 sc[SCRIPT_CAP]; int sl = node_script(d, n->child[0], idx, 0, sc, SCRIPT_CAP);
-        if (sl < 0) return -1;
-        u8 h[32]; sha256_full(h, sc, (unsigned long)sl);
+    case DN_WSH: {
+        u8* sc = malloc(SCRIPT_CAP); if (!sc){ snprintf(g_err, sizeof g_err, "out of memory"); return -1; }
+        int sl = node_script(d, n->child[0], idx, 0, sc, SCRIPT_CAP);
+        if (sl < 0){ free(sc); return -1; }
+        u8 h[32]; sha256_full(h, sc, (unsigned long)sl); free(sc);
         if (cap < 34) return -1;
         out[0]=0x00; out[1]=0x20; memcpy(out+2, h, 32); return 34; }
     case DN_TR: { u8 ik[65]; int il; if (!key_bytes(d, n->keys[0], idx, 1, ik, &il)) return -1;
@@ -627,9 +737,22 @@ static void sb_key(sb_t* b, const descr_key_t* k, int with_priv){
     sb_path(b, k->path, k->pathlen, k->apostrophe);
     if (k->ranged) sb_put(b, k->range_hard ? (k->apostrophe ? "/*'" : "/*h") : "/*");
 }
+static void sb_key_to(const descr_t* d, int ki, int with_priv, char* out, unsigned long cap){
+    sb_t b = { out, cap, 0, 0 }; out[0] = 0;
+    if (ki < 0 || ki >= d->nk) return;
+    sb_key(&b, &d->keys[ki], with_priv);
+    if (b.ovf) out[0] = 0;
+}
 static void sb_node(sb_t* b, const descr_t* d, int ni, int with_priv){
     const descr_node_t* n = &d->nodes[ni];
-    static const char* NAMES[] = { "", "pk", "pkh", "wpkh", "combo", "multi", "sortedmulti", "multi_a", "sortedmulti_a", "sh", "wsh", "tr", "addr", "raw", "rawtr", "" };
+    static const char* NAMES[] = { "", "pk", "pkh", "wpkh", "combo", "multi", "sortedmulti", "multi_a", "sortedmulti_a", "sh", "wsh", "tr", "addr", "raw", "rawtr", "", "" };
+    if (n->type == DN_MINISCRIPT){
+        ms_tree_t mt; descr_ms_tree(d, &mt);
+        descr_msuser_t mu; ms_ctx_t mctx; descr_ms_ctx(d, 0, with_priv, &mu, &mctx);
+        char* txt = malloc(65536); if (!txt){ b->ovf = 1; return; }
+        if (!ms_to_string(&mt, &mctx, n->ms_root, txt, 65536)) b->ovf = 1; else sb_put(b, txt);
+        free(txt); return;
+    }
     if (n->type == DN_BRANCH){ sb_put(b, "{"); sb_node(b, d, n->child[0], with_priv); sb_put(b, ","); sb_node(b, d, n->child[1], with_priv); sb_put(b, "}"); return; }
     sb_put(b, NAMES[n->type]); sb_put(b, "(");
     switch (n->type){
