@@ -532,6 +532,26 @@ int main(void){
           ck("a public-key-only descriptor leaves the input unsigned", dr && S(dr, "complete") && S(dr, "complete")[0] == '0');
           rj_free(dr); }
         expect_err_any("a malformed descriptor is refused", "descriptorprocesspsbt", "[\"cHNidP8=\", [\"wpkh(notakey)\"]]", -5);
+        /* wsh(multi(2,K1,K2)): the witnessScript comes from the descriptor (2026-09-01) */
+        { unsigned char dk2[32]; for (int i = 0; i < 32; i++) dk2[i] = (unsigned char)(0x91 + i);
+          unsigned char dpub2[33]; scalar_to_pubkey(dpub2, dk2);
+          unsigned char pay2[34]; pay2[0] = 0x80; memcpy(pay2+1, dk2, 32); pay2[33] = 1; char wif2[64]; base58check_encode(wif2, pay2, 34);
+          unsigned char ws[71]; int o = 0; ws[o++] = 0x52; ws[o++] = 33; memcpy(ws+o, dpub, 33); o += 33; ws[o++] = 33; memcpy(ws+o, dpub2, 33); o += 33; ws[o++] = 0x52; ws[o++] = 0xae;
+          extern void sha256_full(unsigned char out[32], const void* msg, unsigned long len);
+          unsigned char wsh[32]; sha256_full(wsh, ws, (unsigned long)o); char wshh[65]; hexify(wshh, wsh, 32);
+          char wspk2[80]; snprintf(wspk2, sizeof wspk2, "0020%s", wshh);
+          MK_PSBT(ps64, wspk2);
+          char ph1[67], ph2[67]; hexify(ph1, dpub, 33); hexify(ph2, dpub2, 33);
+          snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, wif, wif2);
+          dr = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("wsh(multi(2,WIF,WIF)) input signs to completion with the descriptor's witnessScript", dr && S(dr, "complete") && S(dr, "complete")[0] == '1');
+          if (!dr) printf("    (%ld: %s)\n", ec, em ? em : "");
+          rj_free(dr);
+          /* only one of the two keys: partial, not complete */
+          snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, wif, ph2);
+          dr = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("...with one private key it stays incomplete", dr && S(dr, "complete") && S(dr, "complete")[0] == '0');
+          rj_free(dr); }
         #undef MK_PSBT
     }
 

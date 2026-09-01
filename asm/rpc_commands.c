@@ -1292,7 +1292,136 @@ static int srw_hashtype(const char* s){
     return base|acp;
 }
 typedef struct { unsigned char txid_wire[32]; unsigned long vout; unsigned char spk[64]; unsigned long spklen;
-                 unsigned long long amount; unsigned char redeem[128]; unsigned long redeemlen; } srw_prev_t;
+                 unsigned long long amount; unsigned char redeem[128]; unsigned long redeemlen;
+                 unsigned char wscript[1024]; unsigned long wscriptlen; } srw_prev_t;
+
+/* ---- CHECKMULTISIG / taproot signing helpers (2026-09-01) ------------------
+ * The raw signer used to sign P2PKH, P2WPKH and P2SH-P2WPKH only. It now
+ * also signs: legacy P2SH multisig (redeemScript = OP_k <pubs> OP_n
+ * OP_CHECKMULTISIG), P2WSH and P2SH-P2WSH (witnessScript = the same template
+ * or a single <pub> OP_CHECKSIG), and P2TR key-path spends whose internal
+ * key is a given key with no script tree (tr(KEY)) -- the BIP341 tweak is
+ * TapTweak(P), the signing key P's private key tweaked, the signature BIP340
+ * (bip340_sign.c). Signatures for a multisig are emitted in the script's key
+ * order, at most k; fewer than k leaves the input incomplete. */
+extern void sha256_full(unsigned char out[32], const void* msg, unsigned long len);
+extern int  bip32_pubkey_decompress(const unsigned char pub33[33], unsigned char out65[65]);
+extern int  bip32_xonly_tweak_add(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32]);
+extern int  bip340_sign(unsigned char sig[64], const unsigned char* msg, unsigned long msglen, const unsigned char priv_be[32], const unsigned char aux[32]);
+extern int  bip340_tweak_privkey(unsigned char out_priv[32], const unsigned char priv_be[32], const unsigned char tweak[32]);
+extern int  wallet_ecdsa_sign(unsigned long long out_r[4], unsigned long long out_s[4], const unsigned char z[32], const unsigned char priv[32]);
+extern int  der_signature_export(unsigned char* out, const unsigned long long r[4], const unsigned long long s[4]);
+/* OP_k <pub>... OP_n OP_CHECKMULTISIG -> k, the key pointers/lengths, n; -1 if not that template */
+static int srw_parse_multisig(const unsigned char* sc, unsigned long sl, int* k, const unsigned char* keys[20], int keylen[20]){
+    if (sl < 4 || sc[sl-1] != 0xae) return -1;
+    if (sc[0] < 0x51 || sc[0] > 0x60) return -1;
+    int kk = sc[0] - 0x50;
+    unsigned long tail; int n;
+    if (sc[sl-2] >= 0x51 && sc[sl-2] <= 0x60){ n = sc[sl-2] - 0x50; tail = 2; }
+    else if (sl >= 5 && sc[sl-3] == 0x01 && sc[sl-2] >= 17 && sc[sl-2] <= 20){ n = sc[sl-2]; tail = 3; }
+    else return -1;
+    unsigned long q = 1; int cnt = 0;
+    while (q < sl - tail){
+        unsigned l = sc[q];
+        if ((l != 33 && l != 65) || q + 1 + l > sl - tail || cnt >= 20) return -1;
+        keys[cnt] = sc + q + 1; keylen[cnt] = (int)l; cnt++; q += 1 + l;
+    }
+    if (cnt != n || kk < 1 || kk > n) return -1;
+    *k = kk; return n;
+}
+/* the held key matching a script key (compressed or uncompressed), or -1 */
+static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigned long* witlen, int* wititems,
+                                const unsigned char* tx, const unsigned char hp[32], const unsigned char hs[32],
+                                const unsigned char outpoint36[36], unsigned seq, const unsigned char ho[32], unsigned long locktime, int hashtype,
+                                unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys);
+static int srw_key_index(const unsigned char* key, int klen, unsigned char (*kpub)[33], const int* ncomp, int nkeys){
+    for (int h = 0; h < nkeys; h++){
+        if (klen == 33){ if (ncomp[h] && !memcmp(key, kpub[h], 33)) return h; }
+        else { unsigned char u[65]; if (!ncomp[h] && bip32_pubkey_decompress(kpub[h], u) && !memcmp(key, u, 65)) return h; }
+    }
+    return -1;
+}
+/* DER signature + hashtype byte for sighash z under held key h */
+static int srw_ecdsa(unsigned char* der, const unsigned char z[32], const unsigned char priv[32], int hashtype){
+    unsigned long long r[4], sv[4]; wallet_ecdsa_sign(r, sv, z, priv);
+    int dl = der_signature_export(der, r, sv); der[dl++] = (unsigned char)hashtype; return dl;
+}
+/* the signatures we can produce for a multisig script (key order, at most k); returns how many */
+static int srw_multisig_sigs(unsigned char (*sigs)[80], int* siglens, int k, const unsigned char* keys[], const int* keylen, int n,
+                             const unsigned char z[32], unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys, int hashtype){
+    int got = 0;
+    for (int i = 0; i < n && got < k; i++){
+        int h = srw_key_index(keys[i], keylen[i], kpub, ncomp, nkeys);
+        if (h < 0) continue;
+        siglens[got] = srw_ecdsa(sigs[got], z, kpriv[h], hashtype); got++;
+    }
+    return got;
+}
+/* push data with a minimal length prefix (< 0x4c, else OP_PUSHDATA1/2) */
+static unsigned long srw_push(unsigned char* o, const unsigned char* d, unsigned long n){
+    unsigned long w = 0;
+    if (n < 0x4c) o[w++] = (unsigned char)n;
+    else if (n <= 0xff){ o[w++] = 0x4c; o[w++] = (unsigned char)n; }
+    else { o[w++] = 0x4d; o[w++] = (unsigned char)n; o[w++] = (unsigned char)(n >> 8); }
+    memcpy(o + w, d, n); return w + n;
+}
+/* BIP341 key-path sighash (ext_flag 0, no annex) for input i. prev_of[j] is
+ * the prevtx of input j (all needed unless ANYONECANPAY). 1 ok / 0 missing data. */
+static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigned long txlen,
+                           unsigned long i, unsigned long n_in, const unsigned char* const* outpoints, const unsigned* seqs,
+                           srw_prev_t* const* prev_of, unsigned long out_start, unsigned long out_end,
+                           unsigned long locktime, int hashtype){
+    int base = hashtype & 3, acp = hashtype & 0x80;
+    if (hashtype != 0 && !(base == 1 || base == 2 || base == 3)) return 0;   /* DEFAULT, ALL, NONE, SINGLE (+ACP) */
+    unsigned char* msg = malloc(300 + txlen); if (!msg) return 0; unsigned long m = 0;
+    msg[m++] = 0x00;                                   /* epoch */
+    msg[m++] = (unsigned char)hashtype;
+    memcpy(msg + m, tx, 4); m += 4;                    /* nVersion */
+    msg[m++] = (unsigned char)locktime; msg[m++] = (unsigned char)(locktime >> 8); msg[m++] = (unsigned char)(locktime >> 16); msg[m++] = (unsigned char)(locktime >> 24);
+    if (!acp){
+        for (unsigned long j = 0; j < n_in; j++) if (!prev_of[j]){ free(msg); return 0; }
+        unsigned char* b = malloc(n_in * 36 + 64 * n_in + 16); if (!b){ free(msg); return 0; }
+        unsigned long bl = 0;
+        for (unsigned long j = 0; j < n_in; j++){ memcpy(b + bl, outpoints[j], 36); bl += 36; }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_prevouts */
+        bl = 0; for (unsigned long j = 0; j < n_in; j++){ unsigned long long a = prev_of[j]->amount; for (int q = 0; q < 8; q++) b[bl++] = (unsigned char)(a >> (8*q)); }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_amounts */
+        bl = 0; for (unsigned long j = 0; j < n_in; j++){ bl += crt_varint(b + bl, prev_of[j]->spklen); memcpy(b + bl, prev_of[j]->spk, prev_of[j]->spklen); bl += prev_of[j]->spklen; }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_scriptpubkeys */
+        bl = 0; for (unsigned long j = 0; j < n_in; j++){ unsigned sq = seqs[j]; b[bl++] = (unsigned char)sq; b[bl++] = (unsigned char)(sq >> 8); b[bl++] = (unsigned char)(sq >> 16); b[bl++] = (unsigned char)(sq >> 24); }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_sequences */
+        free(b);
+    }
+    unsigned long cc; unsigned long n_out = srw_varint(tx + out_start, &cc);
+    const unsigned char* outs = tx + out_start + cc; unsigned long outs_len = out_end - (out_start + cc);
+    if (base != 2 && base != 3){ sha256_full(msg + m, outs, outs_len); m += 32; }   /* sha_outputs */
+    msg[m++] = 0x00;                                   /* spend_type: ext_flag 0, no annex */
+    if (acp){
+        if (!prev_of[i]){ free(msg); return 0; }
+        memcpy(msg + m, outpoints[i], 36); m += 36;
+        unsigned long long a = prev_of[i]->amount; for (int q = 0; q < 8; q++) msg[m++] = (unsigned char)(a >> (8*q));
+        m += crt_varint(msg + m, prev_of[i]->spklen); memcpy(msg + m, prev_of[i]->spk, prev_of[i]->spklen); m += prev_of[i]->spklen;
+        unsigned sq = seqs[i]; msg[m++] = (unsigned char)sq; msg[m++] = (unsigned char)(sq >> 8); msg[m++] = (unsigned char)(sq >> 16); msg[m++] = (unsigned char)(sq >> 24);
+    } else { msg[m++] = (unsigned char)i; msg[m++] = (unsigned char)(i >> 8); msg[m++] = (unsigned char)(i >> 16); msg[m++] = (unsigned char)(i >> 24); }
+    if (base == 3){                                    /* SINGLE: sha256 of this input's output */
+        if (i >= n_out){ free(msg); return 0; }
+        const unsigned char* q = outs; unsigned long left = outs_len;
+        for (unsigned long oi = 0; ; oi++){
+            if (left < 9){ free(msg); return 0; }
+            unsigned long c2; unsigned long sl = srw_varint(q + 8, &c2); unsigned long olen = 8 + c2 + sl;
+            if (olen > left){ free(msg); return 0; }
+            if (oi == i){ sha256_full(msg + m, q, olen); m += 32; break; }
+            q += olen; left -= olen;
+        }
+    }
+    /* TaggedHash("TapSighash", msg) */
+    unsigned char th[32]; sha256_full(th, "TapSighash", 10);
+    unsigned char* pre = malloc(64 + m); if (!pre){ free(msg); return 0; }
+    memcpy(pre, th, 32); memcpy(pre + 32, th, 32); memcpy(pre + 64, msg, m);
+    sha256_full(z, pre, 64 + m);
+    free(pre); free(msg);
+    return 1;
+}
 
 /* BIP143 segwit-v0 sighash. hp/hs/ho are the caller-selected hashPrevouts /
  * hashSequence / hashOutputs (zeroed per the SIGHASH type). */
@@ -1315,6 +1444,31 @@ static void srw_bip143(unsigned char z[32], const unsigned char ver4[4],
     sha256d(z,pre,n); free(pre);
 }
 
+/* sign a P2WSH input: witnessScript = CHECKMULTISIG template (witness: <> sigs... ws)
+ * or <pub> OP_CHECKSIG (witness: sig ws). NULL on success, else the error. */
+static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigned long* witlen, int* wititems,
+                                const unsigned char* tx, const unsigned char hp[32], const unsigned char hs[32],
+                                const unsigned char outpoint36[36], unsigned seq, const unsigned char ho[32], unsigned long locktime, int hashtype,
+                                unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys){
+    const unsigned char* ws=P->wscript; unsigned long wl=P->wscriptlen;
+    unsigned char z[32]; srw_bip143(z, tx, hp, hs, outpoint36, ws, wl, P->amount, seq, ho, locktime, hashtype);
+    unsigned long o=0;
+    if (wl==35 && ws[0]==33 && ws[34]==0xac){                                   /* <pub> CHECKSIG */
+        int h=srw_key_index(ws+1,33,kpub,ncomp,nkeys); if (h<0) return "Keys not provided for this input";
+        unsigned char der[80]; int dl=srw_ecdsa(der,z,kpriv[h],hashtype);
+        wit[o++]=(unsigned char)dl; memcpy(wit+o,der,(size_t)dl); o+=dl;
+        o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=2; return NULL;   /* witness items are varint-prefixed, not script pushes */
+    }
+    int k; const unsigned char* keys[20]; int kl[20]; int n=srw_parse_multisig(ws,wl,&k,keys,kl);
+    if (n<0) return "Unsupported witnessScript (CHECKMULTISIG or <pub> CHECKSIG only)";
+    unsigned char sigs[20][80]; int sls[20];
+    int got=srw_multisig_sigs(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype);
+    wit[o++]=0x00;                                                              /* the empty dummy element */
+    for (int q=0;q<got;q++){ wit[o++]=(unsigned char)sls[q]; memcpy(wit+o,sigs[q],(size_t)sls[q]); o+=sls[q]; }
+    o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=2+got;
+    if (got<k){ static char mbuf[64]; snprintf(mbuf,sizeof mbuf,"Missing signatures: have %d of %d",got,k); return mbuf; }
+    return NULL;
+}
 static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_STR || params->items[1]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected hexstring and privkeys array"; return 0; }
@@ -1350,10 +1504,13 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
             rj_val* am=rj_obj_get(e,"amount"); P->amount = (am&&am->typ==RJ_NUM)? (unsigned long long)crt_amount_to_sat(am->str) : 0;
             rj_val* rs=rj_obj_get(e,"redeemScript"); P->redeemlen=0;
             if (rs&&rs->typ==RJ_STR){ size_t rl=strlen(rs->str); if (!(rl&1)&&rl/2<=128){ P->redeemlen=(unsigned long)(rl/2); hex_to_bytes(P->redeem,rs->str,rl); } }
+            rj_val* ws=rj_obj_get(e,"witnessScript"); P->wscriptlen=0;
+            if (ws&&ws->typ==RJ_STR){ size_t wl=strlen(ws->str); if (!(wl&1)&&wl/2<=sizeof P->wscript){ P->wscriptlen=(unsigned long)(wl/2); hex_to_bytes(P->wscript,ws->str,wl); } }
             nprev++;
         }
     }
     int hashtype = (params->nitems>=4 && params->items[3]->typ==RJ_STR) ? srw_hashtype(params->items[3]->str) : 0x01;
+    int ht_explicit = (params->nitems>=4 && params->items[3]->typ==RJ_STR);   /* taproot signs SIGHASH_DEFAULT unless one was asked for */
     if (hashtype<0){ *ec=-8; *em="Invalid sighash param"; return 0; }
 
     /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
@@ -1382,8 +1539,15 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     const unsigned char* bip_ho = (ht_base==1) ? hashOutputs : zero32;
 
     /* --- sign each input --- */
-    static unsigned char ss[10000][256]; unsigned long sslen[10000];      /* scriptSig per input */
-    static unsigned char witbuf[10000][256]; unsigned long witlen[10000]; int wititems[10000]; /* witness serialized (count+items) */
+    static unsigned char ss[10000][1400]; unsigned long sslen[10000];      /* scriptSig per input (a 3-sig P2SH multisig is ~330 bytes) */
+    static unsigned char witbuf[10000][1400]; unsigned long witlen[10000]; int wititems[10000]; /* witness serialized (count+items) */
+    /* prevtx of every input, for the taproot sighash (which commits to all spent outputs) */
+    static srw_prev_t* prev_of[10000];
+    for (unsigned long i=0;i<n_in;i++){
+        prev_of[i]=NULL;
+        unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
+        for (int k=0;k<nprev;k++) if (prev[k].vout==vo && !memcmp(prev[k].txid_wire,in_outpoint[i],32)){ prev_of[i]=&prev[k]; break; }
+    }
     int any_segwit=0, complete=1;
     rj_val* errors=rj_arr();
     unsigned char* pre=malloc((size_t)txlen+8192); if (!pre){ *ec=-7; *em="oom"; return 0; }
@@ -1425,8 +1589,52 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
                         witbuf[i][o++]=33; memcpy(witbuf[i]+o,kpub[found],33); o+=33; witlen[i]=o; wititems[i]=2; any_segwit=1;
                         /* scriptSig = push(redeemScript) */
                         ss[i][0]=(unsigned char)P->redeemlen; memcpy(ss[i]+1,P->redeem,P->redeemlen); sslen[i]=1+P->redeemlen; } }
+            } else if (sl==23 && spk[0]==0xa9&&spk[1]==0x14&&spk[22]==0x87 && P->redeemlen>0){     /* P2SH: P2SH-P2WSH or legacy multisig */
+                unsigned char rh[20]; hash160(rh,P->redeem,P->redeemlen);
+                if (memcmp(rh,spk+2,20)){ err="redeemScript does not match scriptPubKey"; }
+                else if (P->redeemlen==34 && P->redeem[0]==0x00 && P->redeem[1]==0x20){                 /* P2SH-P2WSH */
+                    if (!P->wscriptlen) err="witnessScript needed for P2SH-P2WSH";
+                    else { unsigned char wh[32]; sha256_full(wh,P->wscript,P->wscriptlen);
+                        if (memcmp(wh,P->redeem+2,32)) err="witnessScript does not match redeemScript";
+                        else { err=srw_sign_wsh(P, witbuf[i], &witlen[i], &wititems[i], tx, bip_hp, bip_hs, in_outpoint[i], in_seq[i], bip_ho, locktime, hashtype, kpriv, kpub, ncomp, nkeys);
+                               if (!err || strstr(err,"Missing signatures")){ sslen[i]=srw_push(ss[i],P->redeem,P->redeemlen); any_segwit=1; } } }
+                } else {                                                                                  /* legacy P2SH multisig */
+                    int k; const unsigned char* keys[20]; int kl[20]; int n=srw_parse_multisig(P->redeem,P->redeemlen,&k,keys,kl);
+                    if (n<0) err="Unsupported redeemScript (CHECKMULTISIG, P2WPKH or P2WSH only)";
+                    else if (!legacy_sighash(z,tx,txlen,i,P->redeem,P->redeemlen,hashtype,pre,(unsigned long)txlen+8192)) err="sighash failed";
+                    else { unsigned char sigs[20][80]; int sls[20];
+                        int got=srw_multisig_sigs(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype);
+                        unsigned long o=0; ss[i][o++]=0x00;                                             /* CHECKMULTISIG's dummy */
+                        for (int q=0;q<got;q++) o+=srw_push(ss[i]+o,sigs[q],(unsigned long)sls[q]);
+                        o+=srw_push(ss[i]+o,P->redeem,P->redeemlen); sslen[i]=o;
+                        if (got<k){ static char mbuf[64]; snprintf(mbuf,sizeof mbuf,"Missing signatures: have %d of %d",got,k); err=mbuf; } }
+                }
+            } else if (sl==34 && spk[0]==0x00 && spk[1]==0x20){                                          /* P2WSH */
+                if (!P->wscriptlen) err="witnessScript needed for P2WSH";
+                else { unsigned char wh[32]; sha256_full(wh,P->wscript,P->wscriptlen);
+                    if (memcmp(wh,spk+2,32)) err="witnessScript does not match scriptPubKey";
+                    else { err=srw_sign_wsh(P, witbuf[i], &witlen[i], &wititems[i], tx, bip_hp, bip_hs, in_outpoint[i], in_seq[i], bip_ho, locktime, hashtype, kpriv, kpub, ncomp, nkeys);
+                           if (!err || strstr(err,"Missing signatures")) any_segwit=1; } }
+            } else if (sl==34 && spk[0]==0x51 && spk[1]==0x20){                                          /* P2TR key path, tr(KEY) with no tree */
+                unsigned char tweak[32];
+                for (int k=0;k<nkeys;k++){
+                    if (!ncomp[k]) continue;
+                    unsigned char th[32]; sha256_full(th,"TapTweak",8); unsigned char tb[96]; memcpy(tb,th,32); memcpy(tb+32,th,32); memcpy(tb+64,kpub[k]+1,32);
+                    unsigned char t[32]; sha256_full(t,tb,96);
+                    unsigned char q[32]; if (bip32_xonly_tweak_add(kpub[k]+1,t,q) && !memcmp(q,spk+2,32)){ found=k; memcpy(tweak,t,32); break; }
+                }
+                if (found<0) err="Keys not provided for this input (a P2TR key path needs the internal key of tr(KEY) with no script tree)";
+                else { int tht = ht_explicit ? hashtype : 0x00;
+                    if (!srw_tap_sighash(z,tx,txlen,i,n_in,(const unsigned char* const*)in_outpoint,in_seq,prev_of,out_start,out_end,locktime,tht))
+                        err="P2TR sighash needs scriptPubKey and amount for every input";
+                    else { unsigned char dq[32], aux[32], sig[65];
+                        if (!bip340_tweak_privkey(dq,kpriv[found],tweak)) err="taproot tweak failed";
+                        else { unsigned char ab[64]; memcpy(ab,z,32); memcpy(ab+32,dq,32); sha256d(aux,ab,64);   /* deterministic aux, as the ECDSA nonce is */
+                            if (!bip340_sign(sig,z,32,dq,aux)) err="schnorr signing failed";
+                            else { int sl2=64; if (tht!=0){ sig[64]=(unsigned char)tht; sl2=65; }
+                                unsigned long o=0; witbuf[i][o++]=(unsigned char)sl2; memcpy(witbuf[i]+o,sig,(size_t)sl2); o+=sl2; witlen[i]=o; wititems[i]=1; any_segwit=1; } } } }
             } else {
-                err="Unsupported script type (P2WSH/P2SH-multisig/P2TR signing not yet implemented)";
+                err="Unsupported script type (bare multisig / P2TR script-path signing not implemented)";
             }
         }
         if (err){
@@ -2697,6 +2905,14 @@ static int dpp_signer(rj_val* fwd, void* vctx, long* ec, const char** em, rj_val
                     if (il > 0 && which == 1 && !rj_obj_get(e, "redeemScript")){
                         char* h = malloc((size_t)il * 2 + 1);
                         if (h){ bin_to_hex(h, inner, (size_t)il); rj_obj_set(e, "redeemScript", rj_str(h)); free(h); }
+                    }
+                    if (il > 0 && (which == 2 || which == 3) && !rj_obj_get(e, "witnessScript")){
+                        char* h = malloc((size_t)il * 2 + 1);
+                        if (h){ bin_to_hex(h, inner, (size_t)il); rj_obj_set(e, "witnessScript", rj_str(h)); free(h); }
+                        if (which == 3 && !rj_obj_get(e, "redeemScript")){          /* sh(wsh(...)): redeemScript = 0 <sha256(ws)> */
+                            unsigned char rd[34]; rd[0] = 0x00; rd[1] = 0x20; sha256_full(rd + 2, inner, (unsigned long)il);
+                            char rh[69]; bin_to_hex(rh, rd, 34); rj_obj_set(e, "redeemScript", rj_str(rh));
+                        }
                     }
                 }
             }
