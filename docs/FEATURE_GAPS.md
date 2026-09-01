@@ -948,6 +948,23 @@ Missing:
   leaves other than pk/multi_a are signed by the miniscript satisfier and
   `musig()` keys parse, expand and update -- see the Miniscript / musig()
   update below.)*
+  **PSBT v2 (BIP370) 2026-09-01 (late):** every PSBT RPC accepts version 2 —
+  the unsigned tx is synthesized from `tx_version`, the per-input previous
+  txid/index/sequence, the required locktimes folded as Core's
+  `ComputeTimeLock` does, and the per-output amount/script; results come
+  back in the caller's version with Core's serialization order (a v2 Core
+  produced round-trips byte-identical); `createpsbt`/`converttopsbt`/
+  `walletcreatefundedpsbt` default to v2 like Core master and take
+  `psbt_version`; `decodepsbt` prints the v2 globals and per-input/output
+  fields, plus `witness_utxo`/`non_witness_utxo`/`fee` and the
+  redeem/witness/final scripts as Core's objects (it had printed hex
+  strings); `combinepsbt` is sequence-blind for v2 and refuses mixed
+  versions, `joinpsbts` refuses v2, every validation error carries Core's
+  text. `validation/psbt_v2_core_diff.py` (scratch regtest Core): Core's v2
+  decoded and signed by us, finalized and mined by Core, and the reverse,
+  for five script kinds, creator/converter bytes identical, an injected
+  height locktime, combine bytes: 75/75, full `decodepsbt` JSON identical.
+  `tests/test_psbt_v2` 35 checks.
 - ~~**Descriptor wallets**~~ — **`importdescriptors` is REAL** since the
   wallet-management merge; watch-only descriptors are tracked and rescanned.
   *(This paragraph claimed `createwalletdescriptor` and `addhdkey` were
