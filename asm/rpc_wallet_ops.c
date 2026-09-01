@@ -1722,6 +1722,17 @@ static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
         const rj_val* q = reqs->items[i];
         const rj_val* dv = q->typ == RJ_OBJ ? rj_obj_get((rj_val*)q, "desc") : NULL;
         char norm[340]; char err[192]; int is_range = 0;
+        /* BIP389: a multipath descriptor imports as one descriptor per expansion
+         * (Core: the first path receives, the second is change) */
+        static char mpx[8][340]; int nmp = 1;
+        if (dv && dv->typ == RJ_STR && strchr(dv->str, '<')){
+            extern int rpc_desc_multipath_expand(const char* in, char (*out)[340], int cap, char* err, unsigned long errcap);
+            nmp = rpc_desc_multipath_expand(dv->str, mpx, 8, err, sizeof err);
+            if (nmp <= 0){ rj_obj_set(r, "success", rj_bool(0)); rj_val* e = rj_obj(); rj_obj_set(e, "code", rj_numf("%d", -5)); rj_obj_set(e, "message", rj_str(err)); rj_obj_set(r, "error", e); rj_arr_push(arr, r); continue; }
+        }
+        for (int mp = 0; mp < nmp; mp++){
+        const char* dtext = nmp > 1 ? mpx[mp] : dv->str;
+        if (mp > 0){ r = rj_obj(); }
         if (!dv || dv->typ != RJ_STR){
             rj_obj_set(r, "success", rj_bool(0));
             rj_val* e = rj_obj();
@@ -1730,7 +1741,7 @@ static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
             rj_obj_set(r, "error", e);
             rj_arr_push(arr, r); continue;
         }
-        if (!rpc_desc_normalize(dv->str, norm, sizeof norm, &is_range, err, sizeof err)){
+        if (!rpc_desc_normalize(dtext, norm, sizeof norm, &is_range, err, sizeof err)){
             rj_obj_set(r, "success", rj_bool(0));
             rj_val* e = rj_obj();
             rj_obj_set(e, "code", rj_numf("%d", -5));
@@ -1770,7 +1781,8 @@ static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
         rj_arr_push(wa, rj_str("run rescanblockchain to discover this descriptor's "
                                "history (this node does not rescan on import)"));
         rj_obj_set(r, "warnings", wa);
-        rj_arr_push(arr, r);
+        if (mp == 0) rj_arr_push(arr, r); else rj_free(r);   /* Core answers one result per request */
+        }   /* expansions */
     }
     if (added){ wop_descs_save(); g_wk_n = -1; wop_records_invalidate(); }
     *res = arr;
