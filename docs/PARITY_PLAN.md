@@ -228,16 +228,16 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       objects; -8/-5 error parity shared with getmempoolentry.
 
 ### T5 — Fee estimation
-- [x] estimatesmartfee -- Core's CONTRACT (arg validation with Core-exact -8
-      messages incl the conf_target [1,1008] range and estimate_mode list;
-      blocks clamps to >= 2, oracle-verified; fresh node returns
-      {"errors":["Insufficient data or no feerate found"],"blocks":N}) over
-      OUR estimator: the tx-accept policy layer's EMA of accepted feerates
-      (shared state, read under mp_lock), floored at min relay fee. The
-      NUMBER is honestly ours -- Core's bucket tracker needs confirmed-block
-      history we don't keep. economical/conservative accepted (case-insens.)
-      but return the same EMA (one estimator). Deploy batched (build-side).
-- [x] estimaterawfee (hidden/debug RPC -- low value, deferred)  **[IN PROGRESS 2026-09-01 (Core-faithful CBlockPolicyEstimator port on feat/feeest; estimatesmartfee moves onto it too)]**
+- [x] estimatesmartfee -- 2026-09-01: Core's CBlockPolicyEstimator ported
+      (daemon/fee_estimator.c: three horizons, feerate buckets, confirmed-
+      block history fed from admission + block connect + removals,
+      fee_estimates.dat), so the NUMBER is now Core's number: economical vs
+      conservative differ, "blocks" follows MaxUsableEstimate (a fresh node
+      answers 0, like Core), feerate = max(estimate, mempool min fee,
+      minrelay). Byte-identical to Core on validation/feeest_core_diff.sh.
+      (Before: Core's contract over an accepted-feerate EMA.)
+- [x] estimaterawfee -- 2026-09-01: Core's per-horizon pass/fail bucket
+      report with Core's field names and rounding, same differential.
 
 ### T6 — Wallet-state RPCs on the RPC surface
 - [x] listtransactions + gettransaction + getwalletinfo — journal-backed
