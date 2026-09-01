@@ -2597,6 +2597,24 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
     return *start_h <= true_end;
 }
 
+/* Does the header at position `have` (the first one a peer just appended)
+ * extend the header we asked from (`loc`, our previous tip)? A getheaders
+ * answer that starts anywhere else is not a continuation of our chain. */
+static int dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
+    unsigned char rec[112];
+    if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
+    if(hst_get_at(hst, (unsigned long long)have, rec) != 1) return 0;
+    return memcmp(rec + 4, loc, 32) == 0;                     /* header[4..36) = hashPrevBlock */
+}
+/* drop everything appended past `have`: headers.dat is the store's backing
+ * file (112-byte records), so truncate it and reload */
+static void dlc_headers_rollback(unsigned char* hst, long have){
+    if(truncate("headers.dat", (off_t)have * 112) != 0)
+        fprintf(stderr,"[dlc] could not roll headers.dat back to %ld record(s): %s\n", have, strerror(errno));
+    hst_init(hst);
+    hst_reload(hst);
+}
+
 /* extend headers.dat as far as a discovered peer will serve, resuming from
  * whatever's already on disk (a real locator from the last stored hash) so
  * repeat boots only pull the delta instead of refetching from genesis every
@@ -2639,9 +2657,23 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
     if(node_handshake(fd)!=1){ close(fd); *why = DLC_HT_HANDSHAKE; return -1; }
     if(!peer_has_witness(cand)){ close(fd); *why = DLC_HT_WITNESS; return -1; }
+    long have0 = hst_count(hst);
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
     if(added<0){ *why = DLC_HT_FETCH; return -1; }
+    if(added>0 && !dlc_headers_connect_ok(hst, have0, loc)){
+        /* INCIDENT 2026-09-01 11:19: our getheaders carries a single-hash
+         * locator (the tip). A peer that has not seen that block yet answers
+         * from GENESIS, and node_ibd_headers appended all 966,658 of them as
+         * heights 965030.. -- headers.dat and index.dat doubled, the boot
+         * catch-up then "filled the holes" by re-downloading early blocks
+         * under fake heights into the tail slack of blk00000..41. Nothing a
+         * peer sends is a continuation unless its first header's prev-hash
+         * IS our tip. Roll the store back and treat the peer as failed. */
+        fprintf(stderr,"[dlc] headers from %s do not connect to our tip -- discarding %ld header(s)\n", cand, added);
+        dlc_headers_rollback(hst, have0);
+        *why = DLC_HT_FETCH; return -1;
+    }
     return added;
 }
 
