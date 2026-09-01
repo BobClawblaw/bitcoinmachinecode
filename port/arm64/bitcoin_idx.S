@@ -222,8 +222,15 @@ idx_count:
     .size idx_count,.-idx_count
 
 /* ---------- idx_build_from_file(idx=x0, path=x1) -> 0 / -1 ----------
+ * Bulk-loads idx from a positional index.dat (48-byte records: presence =
+ * first 4 bytes non-zero, hash stored in WIRE (raw sha256d) order at
+ * rec[0..31]) and idx_puts each present record's hash UNCHANGED -- the serve
+ * loop looks up with the hash as it arrives on the p2p wire, so the table
+ * must be keyed the same way. (Port of x86 f80d09e: the loader used to
+ * byte-reverse every record "into wire order" on the belief that the file
+ * held DISPLAY order, keying the table backwards from every consumer.)
  * persistents: x19 idx, x20 fd, x21 total records (n), x22 pos, x23 full-records.
- * loop counter i in stack [sp+#0x28]; le[32] at [sp+#0x40]. */
+ * loop counter i in stack [sp+#0x28]. */
     .global idx_build_from_file
     .type idx_build_from_file,%function
 idx_build_from_file:
@@ -288,23 +295,15 @@ idx_build_from_file:
     add  x14,x14,x9           /* record ptr */
     ldr  w5,[x14]
     cbz  w5,.ibf_nextrec      /* hole: skip */
-    /* byte-reverse 32B display hash into le[32]@sp+0x40 */
-    mov  x10,#0
-.ibf_rev:
-    cmp  x10,#32
-    b.ge .ibf_revdone
-    mov  x11,#31
-    sub  x11,x11,x10
-    ldrb w6,[x14,x11]
-    add  x7,sp,#0x40
-    strb w6,[x7,x10]
-    add  x10,x10,#1
-    b    .ibf_rev
-.ibf_revdone:
+    /* NO byte reversal: index.dat holds WIRE (raw sha256d) order -- verified
+     * against the production archive (record 0 = genesis as 6fe28c0a..., the
+     * exact reverse of its display form). x86 f80d09e. idx_put receives the
+     * record hash as stored; x14 is re-derived at the top of every iteration,
+     * so handing it across idx_put is safe. */
     ldr  x8,[sp,#0x60]
     add  x24,x22,x8           /* height = pos + i */
     mov  x0,x19
-    add  x1,sp,#0x40          /* le hash */
+    mov  x1,x14               /* record hash, as stored (wire order) */
     mov  x2,x24
     bl   idx_put
 .ibf_nextrec:
