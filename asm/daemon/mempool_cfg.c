@@ -71,6 +71,12 @@ unsigned long mp_ext_slots   = 0;
 unsigned long mp_ext_blobcap = 0;
 unsigned long mp_ext_inited  = 0;   /* 1 => mpool_init already ran (skip in asm) */
 void*         mp_ext_polstate = 0;  /* shared policy state (tx_accept.c) */
+void*         mp_ext_feeest   = 0;  /* shared fee estimator (daemon/fee_estimator.c), NULL if absent */
+/* fee-estimator glue, WEAK here (see daemon/fee_hooks.c) */
+extern unsigned long fest_state_size(unsigned long) __attribute__((weak));
+extern int  fest_init(void*, unsigned long) __attribute__((weak));
+extern int  fest_read_file(void*, const char*, long) __attribute__((weak));
+__attribute__((weak)) void fest_on_forget(const unsigned char* txid){ (void)txid; }
 unsigned long mp_ext_polstate_n = 0;
 
 static pthread_mutex_t* g_mp_mutex = 0;   /* in its own shared page */
@@ -162,6 +168,22 @@ int mempool_configure(void){
      * accumulate ghosts of txs the pool no longer holds. */
     mpool_policy_set_forget_cb(mempool_forget);
 
+    /* Shared fee estimator (Core CBlockPolicyEstimator): sized for the pool's
+     * slots, seeded from fee_estimates.dat when the file is younger than
+     * Core's MAX_FILE_AGE (60 h). Only when the estimator is linked. */
+    if (fest_state_size && fest_init){
+        unsigned long fsz = fest_state_size(slots * 2);
+        void* fe = mmap(0, fsz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if (fe != MAP_FAILED && fest_init(fe, slots * 2)){
+            mp_ext_feeest = fe;
+            int rr = fest_read_file ? fest_read_file(fe, "fee_estimates.dat", 60) : 0;
+            fprintf(stderr,"[feeest] estimator %s (%lu MB shared)%s\n",
+                    rr == 1 ? "seeded from fee_estimates.dat" : rr == -1 ? "started fresh: fee_estimates.dat older than 60h, not used"
+                    : rr == -2 ? "started fresh: fee_estimates.dat unreadable (non-fatal)" : "started fresh (no fee_estimates.dat)",
+                    fsz >> 20, "");
+        } else if (fe != MAP_FAILED) munmap(fe, fsz);
+    }
+
     g_seen_mask = slots - 1;
     g_seen = (mp_seen_t*)mmap(0, sizeof(mp_seen_t)*slots, PROT_READ|PROT_WRITE,
                               MAP_SHARED|MAP_ANONYMOUS, -1, 0);
@@ -201,6 +223,7 @@ void mempool_note_accept(const unsigned char txid[32]){
 
 /* Clear one arrival-time entry (the policy layer's removal hook). */
 static void mempool_forget(const unsigned char txid[32]){
+    fest_on_forget(txid);              /* fee estimation: left the pool unconfirmed (or was booked as mined just before) */
     if(!g_seen) return;
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
