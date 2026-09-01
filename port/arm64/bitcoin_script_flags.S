@@ -18,9 +18,55 @@ SFC_EXC_TAPROOT_HASH:
 
     .global script_flags_for_block
     .type script_flags_for_block,%function
+/* flags for the uniform non-mainnet chains: base + 4 buried heights (each
+ * flag set when height >= H). x2=height; heights are macro immediates. */
+    .macro SFC4 hd, hc, hv, hs
+    mov  x0, #1
+    orr  x0, x0, #(1<<11)
+    orr  x0, x0, #(1<<17)
+    mov  x10, #\hd
+    cmp  x2, x10
+    b.lo 99f
+    orr  x0, x0, #(1<<2)
+99: mov  x10, #\hc
+    cmp  x2, x10
+    b.lo 99f
+    orr  x0, x0, #(1<<9)
+99: mov  x10, #\hv
+    cmp  x2, x10
+    b.lo 99f
+    orr  x0, x0, #(1<<10)
+99: mov  x10, #\hs
+    cmp  x2, x10
+    b.lo 99f
+    orr  x0, x0, #(1<<4)
+99: ret
+    .endm
 script_flags_for_block:
     /* x0=height x1=hash32 ; height kept in x2 (leaf, x9-x17 scratch noisy) */
     mov  x2,x0
+
+    /* ---- chain dispatch (sfc_chain: 0 mainnet default, 1 regtest,
+     * 2 testnet4, 3 signet -- written once by chainparams_select) ---- */
+    adrp x9, sfc_chain
+    add  x9, x9, :lo12:sfc_chain
+    ldr  w9, [x9]
+    cbz  w9, .mainnet
+    cmp  w9, #2
+    b.eq .t4
+    cmp  w9, #3
+    b.eq .signet
+    /* regtest: every soft fork buried at height 1 (segwit at 0) -- all four
+     * active from genesis, no exception hashes (different genesis) */
+    SFC4 1, 1, 1, 0
+.t4:
+    /* testnet4: all four buried at height 1, no exceptions */
+    SFC4 1, 1, 1, 1
+.signet:
+    /* signet: same schedule as testnet4 (its own selector -- reusing
+     * regtest's left signet on MAINNET's schedule once; x86 incident) */
+    SFC4 1, 1, 1, 1
+.mainnet:
 
     /* ---- exception 1: BIP16 hash ---- */
     adrp x4, SFC_EXC_BIP16_HASH
