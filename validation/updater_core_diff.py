@@ -147,7 +147,11 @@ def main():
                     if not r1: continue
                     r2 = core.call("w2", "walletprocesspsbt", r1["psbt"])
                     fin = core.call(None, "finalizepsbt", r2["psbt"])
-                    if not fin.get("complete"): print("      core walletprocesspsbt:", json.dumps({k: v for k, v in r2.items() if k != "psbt"})[:300]); print("      ours half (Core decode):", json.dumps(core.call(None, "decodepsbt", r1["psbt"])["inputs"][0])[:2500])
+                    if not fin.get("complete"):
+                        print("      core walletprocesspsbt:", json.dumps({k: v for k, v in r2.items() if k != "psbt"})[:300])
+                        dd0 = core.call(None, "decodepsbt", r1["psbt"])["inputs"][0]
+                        print("      ours half keys:", sorted(dd0.keys()))
+                        for kk in ("taproot_script_path_sigs", "taproot_internal_key", "taproot_merkle_root"): print(f"      {kk}:", json.dumps(dd0.get(kk))[:500])
                 else:
                     r1 = core.call("w2", "walletprocesspsbt", psbt, True, "DEFAULT", True, False)
                     ck(lab + ": Core half (incomplete)", not r1.get("complete"), json.dumps(r1)[:200])

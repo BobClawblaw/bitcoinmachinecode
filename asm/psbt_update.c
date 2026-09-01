@@ -206,9 +206,9 @@ long psbt_update_bytes_from_descs(const u8* buf, long blen, pu_desc_t* dv, int n
     if (blen < 5 || memcmp(buf, "psbt\xff", 5)) return -1;
     long p = 5;
     static kv_t gkv[PU_MAXKV]; int gn = parse_map(buf, blen, &p, gkv, PU_MAXKV);
-    const kv_t* utx = find_kv(gkv, gn, 0x00); if (!utx) return NULL;
+    const kv_t* utx = find_kv(gkv, gn, 0x00); if (!utx) return -1;
     static tin_t ins[PU_MAXIO]; static tout_t outs[PU_MAXIO]; int n_in, n_out;
-    if (!walk_tx(utx->v, utx->vl, ins, PU_MAXIO, &n_in, outs, PU_MAXIO, &n_out)) return NULL;
+    if (!walk_tx(utx->v, utx->vl, ins, PU_MAXIO, &n_in, outs, PU_MAXIO, &n_out)) return -1;
     static kv_t ikv[PU_MAXIO][PU_MAXKV]; static int in_n[PU_MAXIO];
     static kv_t okv[PU_MAXIO][PU_MAXKV]; static int out_n[PU_MAXIO];
     for (int i = 0; i < n_in; i++) in_n[i] = parse_map(buf, blen, &p, ikv[i], PU_MAXKV);
@@ -220,8 +220,14 @@ long psbt_update_bytes_from_descs(const u8* buf, long blen, pu_desc_t* dv, int n
         if (!input_spk(ikv[i], in_n[i], ins[i].op, &spk, &sl, &value)) continue;
         descr_t* d; long idx; if (!match_desc(dv, nd, spk, sl, &d, &idx)) continue;
         /* Core's signer step puts a witness_utxo on every witness input it touches
-         * (SignPSBTInput: "If we have a witness signature, put a witness UTXO") */
+         * (SignPSBTInput: "If we have a witness signature, put a witness UTXO") --
+         * including nested segwit, where the witness program hides inside sh(...) */
         int is_wit = (sl == 22 && spk[0] == 0x00 && spk[1] == 0x14) || (sl == 34 && (spk[0] == 0x00 || spk[0] == 0x51) && spk[1] == 0x20);
+        if (!is_wit && sl == 23 && spk[0] == 0xa9){
+            u8 inner[1400]; int which = 0; int il = descr_inner_script_at(d, idx, inner, (int)sizeof inner, &which);
+            if (which == 3) is_wit = 1;                                                          /* sh(wsh(...)) */
+            if (which == 1 && il >= 4 && ((il == 22 && inner[0] == 0x00 && inner[1] == 0x14) || (il == 34 && inner[0] == 0x00 && inner[1] == 0x20))) is_wit = 1;   /* sh(wpkh) */
+        }
         if (is_wit && value && !find_kv(ikv[i], in_n[i], 0x01) && sl < 200){
             u8 wu[8 + 9 + 200]; unsigned long o = 0; memcpy(wu, value, 8); o = 8; o += wr_varint(wu + o, sl); memcpy(wu + o, spk, sl); o += sl;
             u8 k1 = 0x01; if (add_kv(ikv[i], &in_n[i], &k1, 1, wu, o)) changed = 1;
