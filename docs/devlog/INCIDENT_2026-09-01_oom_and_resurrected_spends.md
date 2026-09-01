@@ -17,7 +17,7 @@ fully explained below with the evidence; neither is fixed in the store yet.
 | UTXO defect | At every height ≥ 539,017 our set = Core's set + exactly 2,596 outpoints. Zero outpoints missing. Sum of the extras = the `gettxoutsetinfo` amount delta to the satoshi. |
 | Origin | Eight `FATAL: apply_block failed → in-place recovery (compact)` rounds during today's from-genesis rebuild, 13:37–14:23 UTC, at heights 428471 … 539017. Each round lost the spends of the one block applied just before the failure. |
 | Underlying bug | Deploy `y` = commit `b3d47a9` (13:29, buffered memtable flush) left the sparse-index samples on the pre-buffer file offset. Fixed for lookups in `bc098fd` (14:23). The damage done by the eight recoveries in between was never assessed. |
-| State now | Daemon (deploy `ag`) and scratch oracle both at tip; mismatch reproduces at 965080. Data to repair or rebuild is on disk (below). |
+| State now | **REPAIRED 21:23 UTC and PROVEN 21:28**: the 2,596 outpoints were deleted offline (`daemon/utxo_repair_del`), the coinstats state re-seeded from a full walk, and `gettxoutsetinfo muhash` at height 965085 is `7b3938df…8c44` on both nodes, 165,721,328 txouts, 20,078,163.63377124 BTC. The blind recovery path is still in place (to-do below). |
 
 ## Part 1 — the host outage
 
@@ -199,6 +199,17 @@ Done tonight:
    dumps in `/storage/bmc-diff-{ours,core}.{txt,sorted}` (50 GB — delete
    when the repair is proven).
 
+3. **Surgical repair, applied 21:21–21:28 UTC.** `daemon/utxo_repair_del.c`
+   (new): stop the daemon, `utxo_lsm_reload` the store read-write, verify every
+   key with `utxo_lsm_get` (2,596 present, 0 missing, sum 5,589.97458543 BTC),
+   `utxo_lsm_del` each, `utxo_store_wal_drain`, verify all gone. Live count
+   165,723,924 → 165,721,328 at applied height 965085 = Core's txouts at
+   965085. `coinstats.dat` retired so the index re-seeded from a walk
+   (4 min 40 s). Result at 965085, both nodes:
+   `muhash 7b3938df2364a51dadf52f41fc453027116188f89fb642e7607f58a9ff808c44`,
+   txouts 165,721,328, total_amount 20,078,163.63377124. Pre-repair copies of
+   the store's metadata files are in `/storage/bmc-diff-work/pre-repair/`.
+
 To do (in this order):
 
 1. **Repro, then root-cause the lost tombstones**: a test that fills a
@@ -212,18 +223,9 @@ To do (in this order):
    recovery the node must compare `utxo_live_walk_count()` against the
    counter and refuse to continue on a mismatch. A REJECT that names a
    missing input is a consensus disagreement, not a housekeeping problem.
-3. **Repair the live set**: two options, operator's call.
-   - Surgical: delete the 2,596 known outpoints from the store (a one-off
-     tool over `extras2.keys` at a quiet moment, then `gettxoutsetinfo
-     muhash` vs the oracle at the same height). Minutes.
-   - Rebuild: drop the UTXO state and replay from genesis on the current
-     binary (`bc098fd`+ has no known flush defect). ~4 h at today's rate;
-     produces an independent proof rather than a patch.
-   The surgical repair is only sound if nothing else diverged; the
-   count-bisection above says the diff is exactly 2,596 at every checked
-   height, and the corrected set-diff found zero missing coins, so the
-   patch would be exact — but a muhash match after it is the proof, not the
-   arithmetic.
+3. **Repair the live set**:
+   DONE (surgical, see above); the muhash match is the proof. A from-genesis
+   rebuild on `bc098fd`+ remains the independent confirmation if wanted.
 4. Delete the untracked `daemon/utxo_dump_keys` binary or make it a real
    tool with a Makefile rule; the `.c` is useful (offline read-only walk).
 
@@ -264,9 +266,8 @@ To do (in this order):
 
 ## Operator notes
 
-- The daemon is up on `ag` and tracking the tip, but its UTXO set is known
-  wrong by 2,596 coins until step 3 above is done. Do not use its
-  `gettxoutsetinfo` as a reference until then.
+- The daemon is up on `ag`, tracking the tip, and its UTXO set is
+  muhash-identical to Core again as of 965085.
 - `bitcoind.service` (production Core) is down since the reset and is the
   user's to start.
 - `/storage/bmc-diff-work/` and `/storage/bmc-diff-*` hold ~62 GB of
