@@ -252,7 +252,7 @@ static int cmd_getnewaddr(const char* method, const rj_val* params, const rpc_wa
         int ai = is_change ? 0 : 1;
         if ((int)params->nitems > ai && params->items[ai]->typ == RJ_STR && params->items[ai]->str[0]) tname = params->items[ai]->str;
     }
-    int t = WOT_BECH32;
+    int t = rpc_wops_default_type(is_change);       /* -addresstype / -changetype */
     static char msg[160];
     if (tname){
         t = rpc_wops_type_from_name(tname);
