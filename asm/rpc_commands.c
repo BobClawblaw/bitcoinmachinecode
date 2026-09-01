@@ -904,6 +904,22 @@ static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed)
 static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, unsigned long n){
     char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
 }
+/* MuSig2 (BIP373) in decodepsbt, Core's field names: musig2_participant_pubkeys
+ * [{aggregate_pubkey, participant_pubkeys[]}], musig2_pubnonces /
+ * musig2_partial_sigs [{participant_pubkey, aggregate_pubkey, [leaf_hash],
+ * pubnonce|partial_sig}] */
+static rj_val* psbt_arr_at(rj_val* o, const char* name){ rj_val* a=rj_obj_get(o,name); if(!a){ a=rj_arr(); rj_obj_set(o,name,a); a=rj_obj_get(o,name); } return a; }
+static void psbt_musig_participants(rj_val* o, const unsigned char* agg, const unsigned char* val, unsigned long vl){
+    rj_val* e=rj_obj(); psbt_field_hex(e,"aggregate_pubkey",agg,33);
+    rj_val* parts=rj_arr(); for (unsigned long q=0;q+33<=vl;q+=33){ char h[67]; bin_to_hex(h,val+q,33); rj_arr_push(parts,rj_str(h)); }
+    rj_obj_set(e,"participant_pubkeys",parts); rj_arr_push(psbt_arr_at(o,"musig2_participant_pubkeys"),e);
+}
+static void psbt_musig_signer_field(rj_val* o, unsigned char type, const unsigned char* key, unsigned long kl, const unsigned char* val, unsigned long vl){
+    rj_val* e=rj_obj(); psbt_field_hex(e,"participant_pubkey",key+1,33); psbt_field_hex(e,"aggregate_pubkey",key+34,33);
+    if (kl==99) psbt_field_hex(e,"leaf_hash",key+67,32);
+    psbt_field_hex(e,type==0x1b?"pubnonce":"partial_sig",val,vl);
+    rj_arr_push(psbt_arr_at(o,type==0x1b?"musig2_pubnonces":"musig2_partial_sigs"),e);
+}
 static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params,0,ec,em); if (!b64) return 0;
     static unsigned char buf[200000]; long blen=0;
@@ -938,6 +954,12 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
                     case 0x04: psbt_field_hex(io,"redeem_script",val,vl); break;
                     case 0x05: psbt_field_hex(io,"witness_script",val,vl); break;
                     case 0x07: psbt_field_hex(io,"final_scriptSig",val,vl); break;
+                    case 0x13: psbt_field_hex(io,"taproot_key_path_sig",val,vl); break;
+                    case 0x17: psbt_field_hex(io,"taproot_internal_key",val,vl); break;
+                    case 0x18: psbt_field_hex(io,"taproot_merkle_root",val,vl); break;
+                    /* MuSig2 (BIP373), Core's decodepsbt shapes */
+                    case 0x1a: if (kl==34 && vl%33==0) psbt_musig_participants(io,key+1,val,vl); break;
+                    case 0x1b: case 0x1c: if ((kl==67||kl==99) && vl==(key[0]==0x1b?66:32)) psbt_musig_signer_field(io,key[0],key,kl,val,vl); break;
                     default: break; } }
         }
         rj_arr_push(ins,io);
@@ -950,6 +972,7 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
             const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
             if (kl>=1){ switch (key[0]){ case 0x00: psbt_field_hex(oo,"redeem_script",val,vl); break;
                                          case 0x01: psbt_field_hex(oo,"witness_script",val,vl); break;
+                                         case 0x08: if (kl==34 && vl%33==0) psbt_musig_participants(oo,key+1,val,vl); break;
                                          default: break; } }
         }
         rj_arr_push(outs,oo);
@@ -2420,6 +2443,13 @@ static int fin_build(const psbt_kv* kv, int n, const unsigned char* spk, unsigne
                      unsigned char* ss, unsigned long* sslen,
                      unsigned char* wit, unsigned long* witlen){
     *sslen = 0; *witlen = 0;
+    /* P2TR key path with PSBT_IN_TAP_KEY_SIG (a MuSig2 aggregate lands here): witness = [sig] */
+    if (spklen == 34 && spk[0] == 0x51 && spk[1] == 0x20){
+        const psbt_kv* ks = fin_find(kv, n, 0x13);
+        if (!ks || (ks->vl != 64 && ks->vl != 65)) return 0;
+        wit[0] = 0x01; wit[1] = (unsigned char)ks->vl; memcpy(wit + 2, ks->v, ks->vl); *witlen = 2 + ks->vl;
+        return 1;
+    }
     if (fin_count(kv, n, 0x02) != 1) return 0;        /* exactly one partial sig */
     const psbt_kv* ps = fin_find(kv, n, 0x02);
     if (!ps || ps->kl != 34 || ps->vl < 9 || ps->vl > 73) return 0;  /* 0x02||pub33 */
@@ -2686,8 +2716,252 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
  * path, so the two cannot drift in what they hand back. `fwd` is the
  * signrawtransaction argument list [hex, prevtxs, sighashtype?]. */
 typedef int (*psbt_signer_fn)(rj_val* fwd, void* ctx, long* ec, const char** em, rj_val** sres);
+/* ==== MuSig2 (BIP327 crypto, BIP373 PSBT fields) =========================
+ * Everything MuSig2 in the PSBT signer lives between these markers.
+ *
+ * Fields: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS 0x1a (key = agg33, value =
+ * participants 33*n), PSBT_IN_MUSIG2_PUB_NONCE 0x1b and
+ * PSBT_IN_MUSIG2_PARTIAL_SIG 0x1c (key = part33 || agg33 [|| leaf_hash],
+ * value = 66-byte pubnonce / 32-byte partial sig), PSBT_OUT_MUSIG2_
+ * PARTICIPANT_PUBKEYS 0x08. As in Core, 0x1a is keyed by the UNTWEAKED
+ * aggregate while 0x1b/0x1c are keyed by the key that is actually in the
+ * script (after BIP32 derivation of the synthetic xpub and the taproot
+ * tweak) -- "plain_pub" below.
+ *
+ * Flow (Core's SignMuSig2, key path only -- leaf scripts are not signed
+ * here): for every aggregate on a P2TR input: if every participant's
+ * partial signature is present, aggregate into the BIP340 signature and
+ * set PSBT_IN_TAP_KEY_SIG; else, for every participant whose private key
+ * this signer holds: with every pubnonce present and our secret nonce for
+ * this session still in memory, produce our partial signature; with our
+ * pubnonce absent, generate a nonce (getrandom + BIP327 derivation from
+ * the key, the aggregate and the sighash) and publish it. Secret nonces
+ * live only in this process, keyed by Core's session id (aggregate ||
+ * participant || sighash || pubnonce), and are erased the moment they are
+ * used -- a PSBT never carries one, and a lost session simply means that
+ * participant restarts round 1. */
+#include "musig2.h"
+#include <sys/random.h>
+extern int  bip32_ckdpub_step_pub(const unsigned char Kpar[33], const unsigned char ccpar[32], unsigned index, unsigned char Kout[33], unsigned char ccout[32]);
+extern void hmac_sha512(unsigned char out[64], const void* key, long long keylen, const void* data, long long datalen);
+typedef int (*psbt_keyfn)(void* sctx, const unsigned char pub33[33], unsigned char priv[32]);
+
+#define MU_SESSIONS 64
+typedef struct { unsigned char id[32]; unsigned char secnonce[97]; int used; } mu_sess_t;
+static mu_sess_t g_mu_sess[MU_SESSIONS]; static int g_mu_sess_next = 0;
+static void mu_session_id(unsigned char id[32], const unsigned char plain[33], const unsigned char part[33],
+                          const unsigned char sighash[32], const unsigned char pubnonce[66]){
+    unsigned char b[33+33+32+66]; memcpy(b, plain, 33); memcpy(b+33, part, 33); memcpy(b+66, sighash, 32); memcpy(b+98, pubnonce, 66);
+    sha256_full(id, b, sizeof b);
+}
+static void mu_session_put(const unsigned char id[32], const unsigned char secnonce[97]){
+    mu_sess_t* e = &g_mu_sess[g_mu_sess_next]; g_mu_sess_next = (g_mu_sess_next + 1) % MU_SESSIONS;
+    memcpy(e->id, id, 32); memcpy(e->secnonce, secnonce, 97); e->used = 1;
+}
+static mu_sess_t* mu_session_get(const unsigned char id[32]){
+    for (int i = 0; i < MU_SESSIONS; i++) if (g_mu_sess[i].used && !memcmp(g_mu_sess[i].id, id, 32)) return &g_mu_sess[i];
+    return NULL;
+}
+static void mu_session_erase(mu_sess_t* e){ memset(e, 0, sizeof *e); }
+/* exported for tests: forget every session (simulates a restart) */
+void rpc_musig2_forget_sessions(void){ memset(g_mu_sess, 0, sizeof g_mu_sess); g_mu_sess_next = 0; }
+
+static unsigned long mu_rd_varint(const unsigned char* p, unsigned long* cc){ return srw_varint(p, cc); }
+/* value + scriptPubKey of an input's witness_utxo; 0 if absent */
+static int mu_witness_utxo(const psbt_kv* kv, int n, unsigned long long* amount, const unsigned char** spk, unsigned long* spklen){
+    const psbt_kv* wu = fin_find(kv, n, 0x01);
+    if (!wu || wu->vl < 9) return 0;
+    unsigned long long a = 0; for (int k = 0; k < 8; k++) a |= (unsigned long long)wu->v[k] << (8*k);
+    unsigned long cc; unsigned long sl = mu_rd_varint(wu->v + 8, &cc);
+    if (8 + cc + sl > wu->vl) return 0;
+    *amount = a; *spk = wu->v + 8 + cc; *spklen = sl; return 1;
+}
+static void mu_taptweak(unsigned char t[32], const unsigned char x[32], const unsigned char* root){
+    unsigned char th[32]; sha256_full(th, "TapTweak", 8);
+    unsigned char b[128]; memcpy(b, th, 32); memcpy(b+32, th, 32); memcpy(b+64, x, 32); unsigned long n = 96;
+    if (root){ memcpy(b+96, root, 32); n = 128; }
+    sha256_full(t, b, n);
+}
+/* BIP32 unhardened derivation of the synthetic musig() xpub along `path`,
+ * applying each step's scalar as a plain tweak to the key aggregation.
+ * -> 1 ok / 0 hardened step or derivation failure. */
+static int mu_apply_derivation(musig2_keyagg_t* ka, const unsigned char agg33[33], const unsigned* path, int plen){
+    static const unsigned char MUSIG_CC[32] = { 0x86,0x80,0x87,0xca,0x02,0xa6,0xf9,0x74,0xc4,0x59,0x89,0x24,0xc3,0x6b,0x57,0x76,
+                                                0x2d,0x32,0xcb,0x45,0x71,0x71,0x67,0xe3,0x00,0x62,0x2c,0x71,0x67,0xe3,0x89,0x65 };
+    unsigned char K[33], cc[32]; memcpy(K, agg33, 33); memcpy(cc, MUSIG_CC, 32);
+    for (int i = 0; i < plen; i++){
+        if (path[i] >= 0x80000000u) return 0;
+        unsigned char data[37]; memcpy(data, K, 33);
+        data[33] = (unsigned char)(path[i] >> 24); data[34] = (unsigned char)(path[i] >> 16); data[35] = (unsigned char)(path[i] >> 8); data[36] = (unsigned char)path[i];
+        unsigned char I[64]; hmac_sha512(I, cc, 32, data, 37);
+        if (!musig2_tweak(ka, I, 0)) return 0;
+        unsigned char K2[33], cc2[32];
+        if (bip32_ckdpub_step_pub(K, cc, path[i], K2, cc2) != 1) return 0;
+        memcpy(K, K2, 33); memcpy(cc, cc2, 32);
+    }
+    return 1;
+}
+#define MU_MAX_PART MUSIG2_MAX_KEYS
+#define MU_EXTRA 4
+static unsigned char g_mu_kbuf[FIN_MAXIO][MU_EXTRA][100]; static unsigned char g_mu_vbuf[FIN_MAXIO][MU_EXTRA][80]; static int g_mu_extra_n[FIN_MAXIO];
+static int mu_append(psbt_kv* kv, int* n, int i, const unsigned char* k, unsigned long kl, const unsigned char* v, unsigned long vl){
+    if (*n >= FIN_MAXKV || g_mu_extra_n[i] >= MU_EXTRA || kl > 100 || vl > 80) return 0;
+    int e = g_mu_extra_n[i]++;
+    memcpy(g_mu_kbuf[i][e], k, kl); memcpy(g_mu_vbuf[i][e], v, vl);
+    kv[*n].k = g_mu_kbuf[i][e]; kv[*n].kl = kl; kv[*n].v = g_mu_vbuf[i][e]; kv[*n].vl = vl; (*n)++;
+    return 1;
+}
+/* One aggregate on one input. Returns 1 when it produced the final
+ * signature (wit = [sig]), 0 otherwise (nonce/partial-sig rounds or nothing
+ * to do). */
+static int mu_process_aggregate(psbt_kv* kv, int* kn, int i, const psbt_kv* agg_kv,
+                                const unsigned char* utx, unsigned long utxl, crt_in_t* uin, int n_in,
+                                unsigned long ost, unsigned long oen, srw_prev_t* const* prev_of, int tht,
+                                psbt_keyfn keyfn, void* sctx, unsigned char* wit, unsigned long* witlen){
+    const unsigned char* agg33 = agg_kv->k + 1;
+    int np = (int)(agg_kv->vl / 33); if (np < 1 || np > MU_MAX_PART || agg_kv->vl % 33) return 0;
+    unsigned char parts[MU_MAX_PART][33]; for (int p = 0; p < np; p++) memcpy(parts[p], agg_kv->v + 33*p, 33);
+    musig2_keyagg_t ka; if (!musig2_key_agg(&ka, parts, np)) return 0;
+    unsigned char plain_agg[33]; musig2_agg_plain(plain_agg, &ka);
+    if (memcmp(plain_agg, agg33, 33)) return 0;                      /* the field's aggregate must be the participants' */
+    unsigned long long amount; const unsigned char* spk; unsigned long spklen;
+    if (!mu_witness_utxo(kv, *kn, &amount, &spk, &spklen)) return 0;
+    if (spklen != 34 || spk[0] != 0x51 || spk[1] != 0x20) return 0;  /* key path of a P2TR output only */
+    const psbt_kv* ik = fin_find(kv, *kn, 0x17); const psbt_kv* mr = fin_find(kv, *kn, 0x18);
+    if (ik && ik->vl != 32) return 0;
+    if (mr && mr->vl != 32) return 0;
+    const unsigned char* script_x = ik ? ik->v : spk + 2;          /* the key the aggregate must reach before the taptweak */
+    unsigned char ax[32]; musig2_agg_xonly(ax, &ka);
+    if (memcmp(ax, script_x, 32)){
+        /* derived aggregate: find the tap bip32 derivation of script_x whose fingerprint is ours */
+        unsigned char fp[20]; hash160(fp, agg33, 33);
+        int done = 0;
+        for (int q = 0; q < *kn && !done; q++){
+            if (kv[q].kl != 33 || kv[q].k[0] != 0x16 || memcmp(kv[q].k + 1, script_x, 32)) continue;
+            unsigned long cc; unsigned long nl = mu_rd_varint(kv[q].v, &cc); unsigned long o = cc + 32 * nl;
+            if (o + 4 > kv[q].vl || memcmp(kv[q].v + o, fp, 4)) continue;
+            o += 4; int plen = (int)((kv[q].vl - o) / 4); if (plen < 1 || plen > 32) continue;
+            unsigned path[32]; for (int t = 0; t < plen; t++){ const unsigned char* z = kv[q].v + o + 4*t; path[t] = (unsigned)z[0] | ((unsigned)z[1]<<8) | ((unsigned)z[2]<<16) | ((unsigned)z[3]<<24); }
+            if (!mu_apply_derivation(&ka, agg33, path, plen)) return 0;
+            musig2_agg_xonly(ax, &ka);
+            if (memcmp(ax, script_x, 32)) return 0;
+            done = 1;
+        }
+        if (!done) return 0;
+    }
+    if (ik){                                                          /* taproot tweak (BIP341), x-only */
+        unsigned char t[32]; mu_taptweak(t, script_x, mr ? mr->v : NULL);
+        if (!musig2_tweak(&ka, t, 1)) return 0;
+        musig2_agg_xonly(ax, &ka);
+        if (memcmp(ax, spk + 2, 32)) return 0;                        /* must land on the output key */
+    }
+    unsigned char plain[33]; musig2_agg_plain(plain, &ka);          /* the 0x1b/0x1c "aggregate_pubkey" */
+
+    /* collect pubnonces / partial sigs for (plain, no leaf) in participant order */
+    unsigned char pn[MU_MAX_PART][66]; int has_pn[MU_MAX_PART]; int n_pn = 0;
+    unsigned char ps[MU_MAX_PART][32]; int has_ps[MU_MAX_PART]; int n_ps = 0;
+    for (int p = 0; p < np; p++){
+        has_pn[p] = has_ps[p] = 0;
+        for (int q = 0; q < *kn; q++){
+            if (kv[q].kl != 67 || memcmp(kv[q].k + 1, parts[p], 33) || memcmp(kv[q].k + 34, plain, 33)) continue;
+            if (kv[q].k[0] == 0x1b && kv[q].vl == 66 && !has_pn[p]){ memcpy(pn[p], kv[q].v, 66); has_pn[p] = 1; n_pn++; }
+            if (kv[q].k[0] == 0x1c && kv[q].vl == 32 && !has_ps[p]){ memcpy(ps[p], kv[q].v, 32); has_ps[p] = 1; n_ps++; }
+        }
+    }
+    /* sighash (BIP341 key path, SIGHASH_DEFAULT unless one was asked for) */
+    unsigned char z[32];
+    { const unsigned char* ops[FIN_MAXIO]; unsigned seqs[FIN_MAXIO];
+      for (int j = 0; j < n_in; j++){ ops[j] = uin[j].op; seqs[j] = uin[j].seq; }
+      unsigned long locktime = (unsigned long)utx[utxl-4] | ((unsigned long)utx[utxl-3]<<8) | ((unsigned long)utx[utxl-2]<<16) | ((unsigned long)utx[utxl-1]<<24);
+      if (!srw_tap_sighash(z, utx, utxl, (unsigned long)i, (unsigned long)n_in, ops, seqs, prev_of, ost, oen, locktime, tht)) return 0; }
+
+    if (n_ps == np && n_pn == np){                                    /* round 3: aggregate */
+        unsigned char aggnonce[66]; if (!musig2_nonce_agg(aggnonce, pn, np)) return 0;
+        musig2_session_t ss; if (!musig2_session(&ss, &ka, aggnonce, z, 32)) return 0;
+        unsigned char sig[65]; if (!musig2_partial_sig_agg(sig, &ss, &ka, ps, np)) return 0;
+        unsigned long sl = 64; if (tht){ sig[64] = (unsigned char)tht; sl = 65; }
+        unsigned char k13 = 0x13;
+        if (!fin_find(kv, *kn, 0x13)) mu_append(kv, kn, i, &k13, 1, sig, sl);
+        wit[0] = 0x01; wit[1] = (unsigned char)sl; memcpy(wit + 2, sig, sl); *witlen = 2 + sl;
+        return 1;
+    }
+    if (!keyfn) return 0;
+    for (int p = 0; p < np; p++){
+        unsigned char priv[32];
+        if (has_ps[p] || !keyfn(sctx, parts[p], priv)) continue;
+        if (n_pn == np){                                              /* round 2: our partial signature */
+            unsigned char id[32]; mu_session_id(id, plain, parts[p], z, pn[p]);
+            mu_sess_t* se = mu_session_get(id); if (!se) continue;      /* not our nonce, or a session this process never had */
+            unsigned char aggnonce[66]; if (!musig2_nonce_agg(aggnonce, pn, np)) continue;
+            musig2_session_t ss; if (!musig2_session(&ss, &ka, aggnonce, z, 32)) continue;
+            unsigned char psig[32]; int ok = musig2_partial_sign(psig, se->secnonce, priv, &ka, &ss);
+            mu_session_erase(se);                                     /* never twice with the same nonce */
+            if (!ok) continue;
+            unsigned char k[67]; k[0] = 0x1c; memcpy(k+1, parts[p], 33); memcpy(k+34, plain, 33);
+            mu_append(kv, kn, i, k, 67, psig, 32);
+        } else if (!has_pn[p]){                                       /* round 1: our nonce */
+            unsigned char rnd[32]; if (getrandom(rnd, 32, 0) != 32) continue;
+            unsigned char aggx[32]; musig2_keyagg_t k0; if (!musig2_key_agg(&k0, parts, np)) continue; musig2_agg_xonly(aggx, &k0);
+            unsigned char sec[97], pub[66];
+            if (!musig2_nonce_gen(sec, pub, rnd, priv, parts[p], aggx, z, 32, NULL, 0)) continue;
+            unsigned char id[32]; mu_session_id(id, plain, parts[p], z, pub); mu_session_put(id, sec);
+            memset(sec, 0, sizeof sec);
+            unsigned char k[67]; k[0] = 0x1b; memcpy(k+1, parts[p], 33); memcpy(k+34, plain, 33);
+            mu_append(kv, kn, i, k, 67, pub, 66);
+        }
+        memset(priv, 0, 32);
+    }
+    return 0;
+}
+/* The stage: runs over every input before the raw signer is delegated to.
+ * mu_witlen[i] != 0 marks an input this stage finished (wit = [sig]). */
+static void psbt_musig_stage(psbt_kv (*ikv)[FIN_MAXKV], int* in_n, int n_in,
+                             const unsigned char* utx, unsigned long utxl, crt_in_t* uin,
+                             unsigned long ost, unsigned long oen, const char* sht,
+                             psbt_keyfn keyfn, void* sctx,
+                             unsigned char (*mu_wit)[80], unsigned long* mu_witlen){
+    int any = 0;
+    for (int i = 0; i < n_in; i++){ mu_witlen[i] = 0; g_mu_extra_n[i] = 0; if (fin_find(ikv[i], in_n[i], 0x1a)) any = 1; }
+    if (!any) return;
+    int tht = 0;
+    if (sht){ int h = srw_hashtype(sht); if (h < 0) return; tht = h; }
+    static srw_prev_t prev[FIN_MAXIO]; static srw_prev_t* prev_of[FIN_MAXIO];
+    for (int j = 0; j < n_in; j++){
+        prev_of[j] = NULL; unsigned long long a; const unsigned char* spk; unsigned long sl;
+        if (!mu_witness_utxo(ikv[j], in_n[j], &a, &spk, &sl) || sl > sizeof prev[j].spk) continue;
+        memset(&prev[j], 0, sizeof prev[j]); prev[j].amount = a; memcpy(prev[j].spk, spk, sl); prev[j].spklen = sl; prev_of[j] = &prev[j];
+    }
+    for (int i = 0; i < n_in; i++){
+        for (int q = 0; q < in_n[i]; q++){
+            const psbt_kv* a = &ikv[i][q];
+            if (a->kl != 34 || a->k[0] != 0x1a) continue;
+            if (mu_process_aggregate(ikv[i], &in_n[i], i, a, utx, utxl, uin, n_in, ost, oen, prev_of, tht, keyfn, sctx, mu_wit[i], &mu_witlen[i])) break;
+        }
+    }
+}
+/* network serialization of utx with the given final scriptSigs/witnesses */
+static char* mu_extract_hex(const unsigned char* utx, unsigned long utxl, crt_in_t* uin, int n_in, unsigned long ost, unsigned long oen,
+                            unsigned char (*fss)[256], const unsigned long* fsslen, unsigned char (*fwit)[256], const unsigned long* fwitlen){
+    int any_wit = 0; for (int i = 0; i < n_in; i++) if (fwitlen[i] > 1) any_wit = 1;
+    unsigned char* out = malloc(utxl + 16 + (unsigned long)n_in * 600); if (!out) return NULL; long o = 0;
+    memcpy(out, utx, 4); o = 4;
+    if (any_wit){ out[o++] = 0x00; out[o++] = 0x01; }
+    o += crt_varint(out + o, (unsigned long long)n_in);
+    for (int i = 0; i < n_in; i++){
+        memcpy(out + o, uin[i].op, 36); o += 36;
+        o += crt_varint(out + o, (unsigned long long)fsslen[i]); memcpy(out + o, fss[i], fsslen[i]); o += (long)fsslen[i];
+        unsigned sq = uin[i].seq; out[o++]=(unsigned char)sq; out[o++]=(unsigned char)(sq>>8); out[o++]=(unsigned char)(sq>>16); out[o++]=(unsigned char)(sq>>24);
+    }
+    memcpy(out + o, utx + ost, oen - ost); o += (long)(oen - ost);
+    if (any_wit) for (int i = 0; i < n_in; i++){ if (fwitlen[i]){ memcpy(out + o, fwit[i], fwitlen[i]); o += (long)fwitlen[i]; } else out[o++] = 0x00; }
+    memcpy(out + o, utx + utxl - 4, 4); o += 4;
+    char* hx = malloc((size_t)o*2+1); if (hx) bin_to_hex(hx, out, (size_t)o);
+    free(out); return hx;
+}
+/* ==== end MuSig2 ========================================================= */
+
 static int psbt_process(const char* b64, int sign, const char* sht, int finalize,
-                        psbt_signer_fn signer, void* sctx,
+                        psbt_signer_fn signer, void* sctx, psbt_keyfn keyfn,
                         long* ec, const char** em, rj_val** result){
 
     static unsigned char buf[200000]; long blen = 0;
@@ -2722,6 +2996,11 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
         *result = r;
         return 1;
     }
+
+    /* MuSig2 (BIP327/BIP373): nonces, partial signatures, or the final
+     * key-path signature for aggregates this signer participates in */
+    static unsigned char mu_wit[FIN_MAXIO][80]; static unsigned long mu_witlen[FIN_MAXIO];
+    psbt_musig_stage(ikv, in_n, n_in, utx, utxl, uin, ost, oen, sht, keyfn, sctx, mu_wit, mu_witlen);
 
     /* prevtxs from the PSBT's own utxo fields (witness_utxo first, else
      * index the non-witness parent at the outpoint's vout); an input with
@@ -2792,6 +3071,26 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     rj_val* scomp = rj_obj_get(sres, "complete");
     int complete = scomp && scomp->str && scomp->str[0]=='1';
     if (!shex || !shex->str){ rj_free(sres); *ec = -22; *em = "signing produced no transaction"; return 0; }
+    if (!complete){
+        /* the delegate reports the MuSig2-finished inputs as "keys not
+         * provided"; if those are its only complaints the PSBT is complete */
+        rj_val* errs = rj_obj_get(sres, "errors"); int only_musig = errs && errs->typ == RJ_ARR && errs->nitems > 0;
+        for (unsigned long q = 0; only_musig && q < errs->nitems; q++){
+            rj_val* tv = rj_obj_get(errs->items[q], "txid"); rj_val* vv = rj_obj_get(errs->items[q], "vout");
+            int hit = 0;
+            if (tv && tv->str && vv && vv->str){
+                unsigned char disp[32]; unsigned long vo = strtoul(vv->str, NULL, 10);
+                if (hex_to_bytes(disp, tv->str, 64))
+                    for (int i = 0; i < n_in && !hit; i++){
+                        unsigned long iv = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) | ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+                        int same = 1; for (int k2 = 0; k2 < 32; k2++) if (uin[i].op[k2] != disp[31-k2]){ same = 0; break; }
+                        if (same && iv == vo && mu_witlen[i]) hit = 1;
+                    }
+            }
+            if (!hit) only_musig = 0;
+        }
+        if (only_musig) complete = 1;
+    }
 
     /* splice the signed inputs back into the PSBT */
     static unsigned char sbuf[200000];
@@ -2809,6 +3108,10 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     static unsigned char psig_v[FIN_MAXIO][80]; static unsigned long psig_vl[FIN_MAXIO];
     for (int i = 0; i < n_in; i++){
         fsslen[i] = fwitlen[i] = psig_kl[i] = psig_vl[i] = 0;
+        if (mu_witlen[i]){                     /* MuSig2 finished this input: witness = [sig] */
+            if (finalize){ memcpy(fwit[i], mu_wit[i], mu_witlen[i]); fwitlen[i] = mu_witlen[i]; }
+            continue;
+        }
         int signed_i = (sin[i].sslen > 0) || (sin[i].witlen > 0 && sin[i].witems > 0);
         if (!signed_i) continue;
         if (finalize){
@@ -2849,7 +3152,7 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
         int finalized = fsslen[i] || fwitlen[i];
         for (int k2 = 0; k2 < in_n[i] && kn < FIN_MAXKV; k2++){
             unsigned char t = ikv[i][k2].kl ? ikv[i][k2].k[0] : 0xff;
-            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08))
+            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08||(t>=0x13&&t<=0x1c)))
                 continue;
             keep[kn++] = ikv[i][k2];
         }
@@ -2870,7 +3173,12 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     rj_val* r = rj_obj();
     rj_obj_set(r, "psbt", rj_str(b));
     rj_obj_set(r, "complete", rj_bool(complete));
-    if (complete && finalize) rj_obj_set(r, "hex", rj_str(shex->str));
+    if (complete && finalize){
+        int any_mu = 0; for (int i = 0; i < n_in; i++) if (mu_witlen[i]) any_mu = 1;
+        if (!any_mu) rj_obj_set(r, "hex", rj_str(shex->str));
+        else { char* hx = mu_extract_hex(utx, utxl, uin, n_in, ost, oen, fss, fsslen, fwit, fwitlen);
+               if (hx){ rj_obj_set(r, "hex", rj_str(hx)); free(hx); } }
+    }
     free(b);
     rj_free(sres);
     *result = r;
@@ -2880,6 +3188,26 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
 static int wallet_psbt_signer(rj_val* fwd, void* ctx, long* ec, const char** em, rj_val** sres){
     return cmd_signrawtransactionwithwallet(fwd, (const rpc_wallet*)ctx, ec, em, sres);
 }
+/* MuSig2 key oracle for the wallet: the same window of HD keys the wallet
+ * signer hands to the raw signer, plus the imported HD keys */
+static int wallet_musig_keyfn(void* vctx, const unsigned char pub33[33], unsigned char priv[32]){
+    const rpc_wallet* w = (const rpc_wallet*)vctx; if (!w || !w->seed) return 0;
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < SRWW_WINDOW; i++) for (int chain = 0; chain <= 1; chain++){
+            unsigned idx[5]; rpc_wops_type_path(t, i, chain, idx);
+            unsigned char k[32], c[32], pub[33];
+            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+            scalar_to_pubkey(pub, k);
+            if (!memcmp(pub, pub33, 33)){ memcpy(priv, k, 32); return 1; }
+        }
+    }
+    { extern int rpc_wops_hdkey_privkeys(unsigned char (*out)[32], int cap, unsigned window);
+      static unsigned char hk[256][32]; int nh = rpc_wops_hdkey_privkeys(hk, 256, SRWW_WINDOW);
+      for (int i = 0; i < nh; i++){ unsigned char pub[33]; scalar_to_pubkey(pub, hk[i]); if (!memcmp(pub, pub33, 33)){ memcpy(priv, hk[i], 32); return 1; } } }
+    return 0;
+}
 int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
                               long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
@@ -2888,7 +3216,7 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
     if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
-    return psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, ec, em, result);
+    return psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, ec, em, result);
 }
 
 /* ==== descriptorprocesspsbt ==============================================
@@ -2958,6 +3286,22 @@ static int dpp_signer(rj_val* fwd, void* vctx, long* ec, const char** em, rj_val
     rj_free(f2);
     return rc;
 }
+/* MuSig2 key oracle for descriptorprocesspsbt: any key of any supplied
+ * descriptor, at any index of its range (a participant's key is handed in
+ * as its own descriptor, e.g. tr(<xprv>/0/*) or pk(<WIF>)) */
+static int dpp_musig_keyfn(void* vctx, const unsigned char pub33[33], unsigned char priv[32]){
+    dpp_ctx_t* c = (dpp_ctx_t*)vctx;
+    for (int di = 0; di < c->n; di++){
+        descr_t* d = c->v[di].d;
+        for (long idx = c->v[di].lo; idx <= c->v[di].hi; idx++)
+            for (int k = 0; k < d->nk; k++){
+                unsigned char pub[65]; int pl = 0;
+                if (!descr_key_pub_at(d, k, idx, pub, &pl) || pl != 33 || memcmp(pub, pub33, 33)) continue;
+                int comp = 1; if (descr_key_priv_at(d, k, idx, priv, &comp)) return 1;
+            }
+    }
+    return 0;
+}
 #define DPP_MAX_DESCS 16
 int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
@@ -2987,7 +3331,7 @@ int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** e
         dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
     }
     dpp_ctx_t ctx = { dv, nd };
-    return psbt_process(b64, 1, sht, finalize, dpp_signer, &ctx, ec, em, result);
+    return psbt_process(b64, 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, ec, em, result);
 }
 
 /* The wallet/util subset rpc_commands.c dispatches itself. At file scope
