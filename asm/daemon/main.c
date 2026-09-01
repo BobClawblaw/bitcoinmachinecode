@@ -4783,6 +4783,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
+            /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
+             * harnesses that link this file do not carry daemon/fee_hooks.c */
+            { extern void fest_shutdown_flush(void); fest_shutdown_flush(); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -5151,10 +5154,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * mpool_del callback (it also cleans the policy
                          * graph and counts conflicts) -- that callback path
                          * was removed at the 2026-08-27 policy-parity merge. */
-                        { extern long tx_accept_block_connect(void*, const unsigned char*, unsigned long);
+                        { extern long tx_accept_block_connect_h(void*, const unsigned char*, unsigned long, long);
+                          extern void tx_accept_set_tip_time(long, long);
                           extern void* mp_ext_area;
+                          /* fee estimation's "chainstate is current": this block's time */
+                          { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
                           if (txsub_worker_ready() && mp_ext_area){
-                              long mr = tx_accept_block_connect(mp_ext_area, zb, (unsigned long)bl);
+                              long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
                               if (mr > 0)
                                   fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
                           } }
@@ -5534,7 +5540,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the
      * static per-process fallback is in play (maxmempool=0). */
-    { extern void* mp_ext_area; extern void* mp_ext_polstate;
+    { extern void* mp_ext_area; extern void* mp_ext_polstate; extern void* mp_ext_feeest;
       extern unsigned long mp_ext_blobcap;
       extern void mp_lock(void); extern void mp_unlock(void);
       extern long mempool_time_of(const unsigned char*);
@@ -5557,7 +5563,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           /* main.c's existing extern types the length as long; the hooks
            * member says unsigned long -- ABI-identical on x86-64 SysV. */
           .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d,
-          .min_fee = mpool_policy_min_fee };
+          .min_fee = mpool_policy_min_fee,
+          .feeest = mp_ext_feeest,
+          .min_relay_satkvb = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : 100ULL };
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
