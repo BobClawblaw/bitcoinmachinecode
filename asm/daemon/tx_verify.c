@@ -1148,6 +1148,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
      * the spk pool for this block, so pool->buf is stable for the whole
      * verification pass. */
     const u8* spk = spk_pool->buf + in->spk_off;
+    if (!g_txv_script_checks) return 1;   /* assumevalid: the block-connect batch path skips evaluation too (missed on the first cut, 2026-09-01 13:10) */
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
         /* Phase B. tapdesc/tap_pool were filled by Phase 1.5, strictly
