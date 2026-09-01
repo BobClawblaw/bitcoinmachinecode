@@ -206,7 +206,12 @@ I2P destination.
 - `txindex=1` has no effect on the daemon: the index is built offline
   (`daemon/build_tx_index <datadir>`) and used when `txindex.dat` exists.
   `blockfilterindex` and `coinstatsindex` are on; the keys only turn them off.
-- `assumevalid` is parsed and ignored: every script in every block is verified.
+- `assumevalid=<hash>` skips script evaluation for blocks at and below that
+  block (PoW, merkle, structure and every UTXO check still run); the height is
+  resolved from the archive at boot (`[utxo_live] assumevalid: block found at
+  height N`). Unset = the chain's built-in block (Core v31: mainnet 938343,
+  testnet4 123613, signet 293175; regtest none). `assumevalid=0` evaluates
+  every script of every block.
 - `pid=<file>` writes the pid once the RPC port is bound. `blocknotify`,
   `alertnotify`, `startupnotify`, `shutdownnotify` run a shell command with
   `%s` sanitised to `[A-Za-z0-9._:/-]`.

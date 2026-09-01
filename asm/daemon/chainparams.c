@@ -138,6 +138,7 @@ static const chainparams_t PARAMS_MAIN = {
     .p2pkh_version = 0x00, .p2sh_version = 0x05, .wif_version = 0x80,
     .bech32_hrp = "bc",
     .xpub_version = 0x0488B21Eu, .xprv_version = 0x0488ADE4u,
+    .assumevalid = "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",   /* Core v31.99 defaultAssumeValid, height 938343 */
     .dns_seeds = 1,
     .allow_min_difficulty = 0,
     .enforce_bip94 = 0,
@@ -175,6 +176,7 @@ static const chainparams_t PARAMS_TESTNET4 = {
     .pow_no_retargeting = 0, .pow_limit_bits = 0x1d00ffffu,
     .p2pkh_version = 0x6f, .p2sh_version = 0xc4, .wif_version = 0xef,
     .bech32_hrp = "tb",
+    .assumevalid = "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",   /* Core v31.99, height 123613 */
     .xpub_version = 0x043587CFu, .xprv_version = 0x04358394u,
     .dns_seeds = 1,
     .allow_min_difficulty = 1,       /* fPowAllowMinDifficultyBlocks       */
@@ -197,6 +199,7 @@ static chainparams_t PARAMS_SIGNET = {
     .pow_no_retargeting = 0, .pow_limit_bits = 0x1e0377aeu,
     .p2pkh_version = 0x6f, .p2sh_version = 0xc4, .wif_version = 0xef,
     .bech32_hrp = "tb",
+    .assumevalid = "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329",   /* Core v31.99 default signet, height 293175 */
     .xpub_version = 0x043587CFu, .xprv_version = 0x04358394u,
     .dns_seeds = 1,
     .allow_min_difficulty = 0,       /* Core signet: false                  */
