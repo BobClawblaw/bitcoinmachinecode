@@ -21,6 +21,7 @@ typedef struct {
     skey_t* keys; int n;
     unsigned char (*kpriv)[32]; unsigned char (*kpub)[33]; const int* ncomp; int nkeys;
     const unsigned char (*pubs)[33]; int npubs;
+    const ms_psig_t* psigs; int npsigs;
     const u8* z; int hashtype; unsigned seq; unsigned long locktime;
     const ms_preimages_t* pre;
 } sctx_t;
@@ -63,7 +64,11 @@ static int s_key_cmp(void* u, int a, int b){ sctx_t* c = u; return memcmp(c->key
 
 static int s_sign(void* u, int key, u8* sig, size_t* siglen, size_t cap){
     sctx_t* c = u; skey_t* k = &c->keys[key];
-    if (!k->have_priv) return MS_AVAIL_NO;
+    if (!k->have_priv){
+        if (c->tap) for (int q = 0; q < c->npsigs; q++)
+            if (!memcmp(c->psigs[q].x, k->pub + 1, 32) && c->psigs[q].sl > 0 && (size_t)c->psigs[q].sl <= cap){ memcpy(sig, c->psigs[q].sig, (size_t)c->psigs[q].sl); *siglen = (size_t)c->psigs[q].sl; return MS_AVAIL_YES; }
+        return MS_AVAIL_NO;
+    }
     if (c->tap){
         if (cap < 65) return MS_AVAIL_NO;
         u8 aux[32] = { 0 };
@@ -98,12 +103,12 @@ static int s_preimage(void* u, int frag, const u8* hash, u8 out[32]){
 
 static int sign_common(int tap, const u8* script, size_t sl, const u8 z[32], int hashtype, unsigned seq, unsigned long locktime,
                        unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys,
-                       const unsigned char (*pubs)[33], int npubs, const ms_preimages_t* pre,
+                       const unsigned char (*pubs)[33], int npubs, const ms_psig_t* psigs, int npsigs, const ms_preimages_t* pre,
                        u8* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err){
     static skey_t keys[SK_MAX];            /* the raw signer is single-threaded (its own buffers are static too) */
     sctx_t c; memset(&c, 0, sizeof c);
     c.tap = tap; c.keys = keys; c.n = 0; c.kpriv = kpriv; c.kpub = kpub; c.ncomp = ncomp; c.nkeys = nkeys;
-    c.z = z; c.hashtype = hashtype; c.seq = seq; c.locktime = locktime; c.pre = pre; c.pubs = pubs; c.npubs = npubs;
+    c.z = z; c.hashtype = hashtype; c.seq = seq; c.locktime = locktime; c.pre = pre; c.pubs = pubs; c.npubs = npubs; c.psigs = psigs; c.npsigs = npsigs;
     ms_ctx_t ctx; memset(&ctx, 0, sizeof ctx); ctx.user = &c;
     ctx.key_from_str = s_key_from_str; ctx.key_from_bytes = s_key_from_bytes; ctx.key_from_hash = s_key_from_hash;
     ctx.key_bytes = s_key_bytes; ctx.key_hash = s_key_hash; ctx.key_to_str = s_key_to_str; ctx.key_cmp = s_key_cmp;
@@ -116,7 +121,7 @@ static int sign_common(int tap, const u8* script, size_t sl, const u8 z[32], int
     int ok = 0;
     if (av != MS_AVAIL_YES){
         /* say why, the way Core's PSBT analysis would */
-        int any_key = 0; for (int i = 0; i < c.n; i++) if (c.keys[i].have_priv) any_key = 1;
+        int any_key = npsigs > 0; for (int i = 0; i < c.n; i++) if (c.keys[i].have_priv) any_key = 1;
         *err = !any_key ? "Keys not provided for this input" : "Missing signatures, preimages or unmet timelocks for this miniscript input";
     } else if (w.len > witcap){ *err = "witness too large"; }
     else { memcpy(wit, w.buf, w.len); *witlen = w.len; *wititems = w.nelems; ok = 1; }
@@ -127,12 +132,12 @@ int ms_sign_witness_v0(const u8* ws, size_t wl, const u8 z[32], int hashtype, un
                        unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys,
                        const unsigned char (*pubs)[33], int npubs, const ms_preimages_t* pre,
                        u8* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err){
-    return sign_common(0, ws, wl, z, hashtype, seq, locktime, kpriv, kpub, ncomp, nkeys, pubs, npubs, pre, wit, witcap, witlen, wititems, err);
+    return sign_common(0, ws, wl, z, hashtype, seq, locktime, kpriv, kpub, ncomp, nkeys, pubs, npubs, NULL, 0, pre, wit, witcap, witlen, wititems, err);
 }
 int ms_sign_witness_tapleaf(const u8* leaf, size_t ll, const u8 z[32], int hashtype, unsigned seq, unsigned long locktime,
                             unsigned char (*kpriv)[32], unsigned char (*kpub)[33], int nkeys,
-                            const unsigned char (*pubs)[33], int npubs, const ms_preimages_t* pre,
+                            const unsigned char (*pubs)[33], int npubs, const ms_psig_t* psigs, int npsigs, const ms_preimages_t* pre,
                             u8* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err){
     static int ones[SK_MAX]; for (int i = 0; i < nkeys && i < SK_MAX; i++) ones[i] = 1;
-    return sign_common(1, leaf, ll, z, hashtype, seq, locktime, kpriv, kpub, ones, nkeys, pubs, npubs, pre, wit, witcap, witlen, wititems, err);
+    return sign_common(1, leaf, ll, z, hashtype, seq, locktime, kpriv, kpub, ones, nkeys, pubs, npubs, psigs, npsigs, pre, wit, witcap, witlen, wititems, err);
 }
