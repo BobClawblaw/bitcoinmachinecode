@@ -456,7 +456,11 @@ p2p_read:
 	mov x0, #-2
 	b .PRRET
 .PRBADSZ:
-	mov x0, #-1                      /* protocol error: oversized announcement */
+	mov x0, #-3                      /* oversized announcement: DISTINCT from -2
+	                                  * (truncated) so the caller can score the
+	                                  * peer for misbehaviour (x86 mov rax,-3;
+	                                  * the serve loop's violation hook keys on
+	                                  * exactly this value) */
 	b .PRRET
 .PREOF:
 	mov x0, #0
