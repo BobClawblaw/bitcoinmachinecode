@@ -26,7 +26,7 @@ extern void sha256d(u8 out[32], const void* p, unsigned long n);
 static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
 
-#define MAGIC 0xdab5bffau                 /* regtest message-start as the store's dword */
+#define MAGIC BMC_FRAME_MAGIC             /* the store writes ONE magic on every chain */
 #define BITS  0x207fffffu                 /* regtest: every hash passes */
 #define NBLK  12
 #define BODY  20                          /* fake transaction bytes after the header */
