@@ -5493,7 +5493,49 @@ static int tor_onion_listener(int port){
     return lo;
 }
 
-static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo){
+/* ---- inbound over I2P ----------------------------------------------------
+ * Core's i2p.cpp: an inbound I2P connection is a SAM "STREAM ACCEPT" on our
+ * session -- a blocking request that completes when a peer connects, at
+ * which point THAT SAM socket carries the peer's bytes. There is no
+ * listening socket to poll, so an acceptor thread sits in STREAM ACCEPT and
+ * hands each completed stream (fd + the caller's .b32.i2p) to the serve loop
+ * over a pipe, which the loop polls beside its listeners. The stream then
+ * takes the same inbound path as a TCP or onion accept: capacity check,
+ * fork, handshake. Its network is i2p by construction (the socket came from
+ * SAM), exactly as an onion inbound is onion by which listener accepted it.
+ * The session itself belongs to the dialer (dialer_init, before the worker
+ * fork), and SAM lets any number of stream sockets reference it. */
+typedef struct { int fd; char b32[80]; } i2p_inbound_t;
+static int g_i2p_pipe[2] = {-1, -1};
+static void* i2p_accept_thread(void* arg){
+    (void)arg;
+    extern int dialer_i2p_accept(char* peer_b32, long cap, int timeout_ms);
+    for(;;){
+        if(g_shutdown_requested) break;
+        char b32[80]; b32[0] = 0;
+        int fd = dialer_i2p_accept(b32, sizeof b32, 600000);   /* no caller in 10 min: re-arm */
+        if(fd < 0){ if(g_shutdown_requested) break; sleep(5); continue; }   /* a SAM hiccup: back off, re-arm */
+        i2p_inbound_t m; m.fd = fd; snprintf(m.b32, sizeof m.b32, "%s", b32);
+        if(write(g_i2p_pipe[1], &m, sizeof m) != (ssize_t)sizeof m) close(fd);
+    }
+    return NULL;
+}
+/* returns the pipe's read end for the serve loop to poll, or -1 when
+ * inbound I2P is off (listen=0, i2pacceptincoming=0, or no SAM session) */
+static int i2p_inbound_start(void){
+    extern int dialer_i2p_ready(void);
+    extern const char* dialer_i2p_b32(void);
+    if(!g_cfg.listen || !g_cfg.i2pacceptincoming || !dialer_i2p_ready()) return -1;
+    if(pipe(g_i2p_pipe) != 0) return -1;
+    pthread_t th;
+    if(pthread_create(&th, NULL, i2p_accept_thread, NULL) != 0){
+        close(g_i2p_pipe[0]); close(g_i2p_pipe[1]); g_i2p_pipe[0] = g_i2p_pipe[1] = -1; return -1; }
+    pthread_detach(th);
+    fprintf(stderr,"[i2p] accepting inbound streams on %s (SAM STREAM ACCEPT)\n", dialer_i2p_b32());
+    return g_i2p_pipe[0];
+}
+
+static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo, int li2p){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
      * The sole non-`-connect` caller passes `catchup_seeds` -- the six DNS
@@ -5539,7 +5581,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * onion slot and before the legs. The leg offset is DERIVED below, so
      * adding these cannot reintroduce the off-by-one that once made every leg
      * read the previous leg's revents. */
-    struct pollfd pfds[MUX_MAX_OUT+3+NETPERM_MAX_BIND];
+    struct pollfd pfds[MUX_MAX_OUT+4+NETPERM_MAX_BIND];   /* +1: the I2P acceptor pipe */
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
@@ -5552,6 +5594,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * tor is unreachable, and poll() ignores a negative fd */
         int onionslot = nfds;
         pfds[nfds].fd=lo;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* the I2P acceptor thread's pipe; -1 when inbound I2P is off */
+        int i2pslot = nfds;
+        pfds[nfds].fd=li2p;  pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         /* -whitebind listeners: peers arriving here carry that entry's
          * permissions, decided by WHICH socket accepted them. */
         int wbslot = nfds;
@@ -5618,10 +5663,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
         int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
         int ready_on = (lo >= 0 && (pfds[onionslot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
+        int ready_i2p = (li2p >= 0 && (pfds[i2pslot].revents & POLLIN) != 0);
         int wb_ready = -1;                       /* index into g_wb_fd, or -1 */
         for(int wi = 0; wi < g_wb_n; wi++)
             if(pfds[wbslot+wi].revents & (POLLIN|POLLHUP|POLLERR)){ wb_ready = wi; break; }
-        if(ready_v4 || ready_v6 || ready_on || wb_ready >= 0){
+        if(ready_v4 || ready_v6 || ready_on || ready_i2p || wb_ready >= 0){
             struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c;
@@ -5638,6 +5684,16 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
                 if(c >= 0)
                     fprintf(stderr,"[serve] inbound on whitebind listener from %s (noban)\n", peerdesc);
+            } else if(ready_i2p){
+                /* Handed over by the SAM acceptor thread: the socket is the
+                 * SAM stream itself, past STREAM STATUS RESULT=OK, carrying
+                 * the peer's raw bytes from here on. */
+                i2p_inbound_t m;
+                if(read(li2p, &m, sizeof m) == (ssize_t)sizeof m){
+                    c = m.fd;
+                    snprintf(peerdesc, sizeof peerdesc, "%s:0", m.b32);
+                    fprintf(stderr,"[serve] inbound over i2p from %s\n", m.b32);
+                } else c = -1;
             } else if(ready_on){
                 /* Arrived on the onion service's loopback target, so it IS an
                  * onion peer -- established by WHICH SOCKET accepted it, not
@@ -6580,7 +6636,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port), i2p_inbound_start());
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -6604,7 +6660,7 @@ int main(int argc, char** argv){
         int l = lsock(port);
         wb_listen_open();
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
-        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
+        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port), i2p_inbound_start());
     }
     return 2;
 }

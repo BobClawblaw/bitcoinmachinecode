@@ -330,8 +330,8 @@ log echoes the resolved values.
   `onion=127.0.0.1:9050`, `onlynet=onion`, `discover=0`.
 - **I2P.** `i2psam=127.0.0.1:7656` points at a router's SAM 3.1 bridge. The
   node keeps one destination across restarts (`i2p_private_key` in the
-  datadir) and dials I2P peers through it. Inbound I2P streams are not
-  accepted.
+  datadir), dials I2P peers through it and, with `listen=1`, accepts inbound
+  I2P streams on that destination (`i2pacceptincoming=0` turns that off).
 - **CJDNS.** A CJDNS address is an `fc00::/8` IPv6 address on `cjdroute`'s
   tun interface, so it needs working IPv6 on the host. The node cannot detect
   the interface; set `cjdnsreachable=1` to enable dialing and accepting CJDNS
@@ -395,15 +395,18 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   vectors); miniscript and `musig()` are refused by name.
   `descriptorprocesspsbt` signs P2PKH, P2WPKH and P2SH-P2WPKH inputs from the
   keys a descriptor carries and leaves other script forms unsigned.
-- **Mining.** `getblocktemplate` reports a lower-bound `sigops` and orders
-  transactions validly but not fee-optimally; BIP23 proposal mode and any
-  stratum/pool interface are absent.
+- **Mining.** `getblocktemplate` fills the block with whole linearization
+  chunks in feerate order (Core v31's cluster-mempool block assembly; a chunk
+  that does not fit skips its cluster) and reports a lower-bound `sigops`;
+  a stratum/pool interface is absent.
 - **Erlay (BIP330).** The `sendtxrcncl` negotiation is implemented and
-  tested but not emitted on the wire; reconciliation rounds are not built.
+  tested but not emitted on the wire. Reconciliation rounds are not built;
+  Bitcoin Core itself ships only the negotiation (its `-txreconciliation` is
+  off by default and its message processing has no `reqrecon`/`sketch`).
 - **Not implemented:** REST interface, UPnP/NAT-PMP, BIP37 bloom filters
   (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
   `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
-  inbound I2P, `walletnotify`, `maxtxfee` enforcement, `uacomment`,
+  `walletnotify`, `maxtxfee` enforcement, `uacomment`,
   `rpcthreads`/`rpcworkqueue`, `includeconf`/`settings`. Each unimplemented
   Core option is named in the startup log when set.
 - **Chains.** Legacy testnet3 (`testnet=1`, `chain=test`) is refused.

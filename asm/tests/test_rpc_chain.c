@@ -1016,6 +1016,54 @@ int main(void){
         ck_str("cpfp coinbasevalue = subsidy + 7000 fees", S(r,"coinbasevalue"), "5000007000");
         rj_free(r);
 
+        /* ---- chunk order: sibling cluster + a standalone (Core v31) ----
+         * P2 (fee 500) has two children: C2 (fee 3000) and D2 (fee 2000),
+         * plus a standalone S (fee 1600), all ~61 B. The cluster {P2,C2,D2}
+         * linearizes as chunk {P2,C2} (3500/122 ~ 28.7 sat/B) then D2
+         * (2000/61 ~ 32.8) -- which pays MORE than the chunk before it, so
+         * the two merge into one chunk {P2,C2,D2} (5500/183 ~ 30.1). S at
+         * 26.2 comes after the whole merged chunk. Slot order is S first. */
+        {
+            unsigned char prevP2[32]; memset(prevP2, 0xCC, 32);
+            unsigned char prevS[32];  memset(prevS,  0xDD, 32);
+            utxo_put(ux, prevP2, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+            utxo_put(ux, prevS,  0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+            /* P2: one input, TWO outputs (49750 each: fee 500) */
+            unsigned char txP2[96]; unsigned char idP2[32]; unsigned long lP2;
+            { unsigned char* q = txP2;
+              memcpy(q, "\x01\x00\x00\x00", 4); q += 4;
+              *q++ = 1; memcpy(q, prevP2, 32); q += 32; unsigned v_ = 0; memcpy(q, &v_, 4); q += 4;
+              *q++ = 0; memcpy(q, "\xff\xff\xff\xff", 4); q += 4;
+              *q++ = 2; unsigned long long a_ = 49750ULL; memcpy(q, &a_, 8); q += 8; *q++ = 1; *q++ = 0x51;
+              memcpy(q, &a_, 8); q += 8; *q++ = 1; *q++ = 0x51;
+              memcpy(q, "\x00\x00\x00\x00", 4); q += 4;
+              lP2 = (unsigned long)(q - txP2); sha256d(idP2, txP2, lP2); }
+            unsigned char txC2[64], txD2[64], txS[64]; unsigned char idC2[32], idD2[32], idS[32];
+            MKTX(txS,  idS,  prevS, 0, 98400ULL);   /* fee 1600 */
+            MKTX(txC2, idC2, idP2,  0, 46750ULL);   /* fee 3000, spends P2:0 */
+            MKTX(txD2, idD2, idP2,  1, 47750ULL);   /* fee 2000, spends P2:1 */
+            ck("chunk: S accepted",  mpool_policy_add(pol, stbuf, mp, txS,  61,  idS,  ux) == 1);
+            ck("chunk: P2 accepted", mpool_policy_add(pol, stbuf, mp, txP2, lP2, idP2, ux) == 1);
+            ck("chunk: C2 accepted", mpool_policy_add(pol, stbuf, mp, txC2, 61,  idC2, ux) == 1);
+            ck("chunk: D2 accepted", mpool_policy_add(pol, stbuf, mp, txD2, 61,  idD2, ux) == 1);
+            r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+            rj_val* tx7 = G(r, "transactions");
+            ck("chunk order: sibling cluster + standalone: all 7 selected", tx7 && tx7->typ == RJ_ARR && tx7->nitems == 7);
+            if (tx7 && tx7->nitems == 7){
+                char h[7][65]; const unsigned char* ids[7] = { idP, idC, idM, idP2, idC2, idD2, idS };
+                for (int i = 0; i < 7; i++) trc_hex_rev(h[i], ids[i], 32);
+                const char* o[7]; for (int i = 0; i < 7; i++) o[i] = rj_obj_get(tx7->items[i], "txid")->str;
+                /* chunks by feerate: {P,C} 45.1 > {P2,C2,D2} 30.1 > S 26.2 > M 24.6 */
+                ck("order[0..1] = {P,C} (the 45 sat/B chunk)", !strcmp(o[0], h[0]) && !strcmp(o[1], h[1]));
+                ck("order[2] = P2 (the merged chunk starts with its parent)", !strcmp(o[2], h[3]));
+                ck("order[3..4] = C2, D2 (the children, C2 first: it made the first chunk)", !strcmp(o[3], h[4]) && !strcmp(o[4], h[5]));
+                ck("order[5] = S: a standalone at 26 sat/B comes after the WHOLE merged chunk, though D2 alone (32.8) would have led",
+                   !strcmp(o[5], h[6]));
+                ck("order[6] = M (24.6 sat/B) last", !strcmp(o[6], h[2]));
+            }
+        }
+        rj_free(r);
+
         /* ---- getrawtransaction falls back to the MEMPOOL ----------------
          * Core consults the mempool before the txid index whenever no
          * blockhash was given -- its help says "by default, this call only

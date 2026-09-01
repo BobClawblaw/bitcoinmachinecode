@@ -151,6 +151,14 @@ int dialer_net_reachable(int net){
     }
 }
 const char* dialer_i2p_b32(void){ return g_i2p_ok ? g_i2p.b32 : ""; }
+/* inbound: one SAM STREAM ACCEPT on our session (blocks up to timeout_ms;
+ * returns the stream fd, or -1). Each accepted stream is its own SAM socket,
+ * so this is called again for the next caller. */
+int dialer_i2p_accept(char* peer_b32, long cap, int timeout_ms){
+    if (!g_i2p_ok) return -1;
+    return i2psam_accept(&g_i2p, g_sam_ip, g_sam_port, peer_b32, cap, timeout_ms);
+}
+int dialer_i2p_ready(void){ return g_i2p_ok; }
 
 int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
     static char err[192];
