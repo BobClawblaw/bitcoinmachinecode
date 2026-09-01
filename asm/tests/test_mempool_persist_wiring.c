@@ -125,6 +125,24 @@ int main(void){
          r == 0 && c.n == 0);
       unlink(path); }
 
+    /* ---- the serve process's reload yields to SIGTERM and does not block
+     * the serve loop (2026-09-01: the shutdown-flag hook was installed only
+     * in the download worker; the serve's inline boot reload ignored
+     * systemd's SIGTERM for 184 s and, SIGKILLed, saved no mempool.dat) ---- */
+    { FILE* f = fopen("daemon/main.c", "r");
+      ck("daemon/main.c is readable for the structure check", f != NULL);
+      if (f){
+          fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+          char* src = malloc((size_t)n + 1); size_t got = fread(src, 1, (size_t)n, f); src[got] = 0; fclose(f);
+          const char* boot = strstr(src, "rpc_node_set_shutdown_flag(&g_shutdown_requested); }\n            if(pthread_create(&g_mempool_reload_thread");
+          ck("reload yields to SIGTERM in the serve process: the hook is installed right before the reload thread starts", boot != NULL);
+          ck("the reload runs on a thread, not inline in the boot path", strstr(src, "static void* mempool_reload_thread(void* arg)") != NULL
+             && strstr(src, "            long acc = rpc_node_mempool_load(\"mempool.dat\");\n            if(acc < 0)") == NULL);
+          const char* sd = strstr(src, "mempool_reload_join();\n            if(CFG_PERSISTMEMPOOL()){\n                long w = rpc_node_mempool_save");
+          ck("the shutdown dump waits for a still-running reload to abort first", sd != NULL);
+          free(src);
+      } }
+
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;
