@@ -57,3 +57,4 @@ Source comments cite these documents by bare filename (`see LOG.md incident
 #20`, `PERF_SCOPE.md 4.1`); each resolves to a file under `docs/`,
 `docs/devlog/` or `docs/audits/`.
 - [Incident 2026-09-01: boot header sync accepted a genesis-first answer](devlog/INCIDENT_2026-09-01_header_sync_genesis_answer.md) — root causes, damage assessment, fixes
+- [Incident 2026-09-01: set-diff OOM took the box down; 2,596 spends resurrected by blind recoveries](devlog/INCIDENT_2026-09-01_oom_and_resurrected_spends.md) — host freeze root cause, the UTXO surplus traced to eight flush-time recoveries, repair options
