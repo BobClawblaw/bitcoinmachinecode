@@ -4828,8 +4828,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * the whole live pool (up to nsrc) when nothing connects, so a
              * per-candidate log would flood exactly when the node is sickest. */
             int topup_fail = 0; char topup_why[160] = "";
+            /* ONE leg per pass, and at most a few failed dials: this loop runs
+             * inline in the worker, and an anonymity-network dial costs tens of
+             * seconds (circuit + handshake). Filling three empty slots with
+             * onion peers in one pass starved the heartbeat for three minutes
+             * (2026-09-01 01:34) and tripped the deploy guard; the next pass
+             * (8 rotations later) fills the next slot. */
+            int topup_filled = 0;
             for(int ci=0; ci<nsrc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
-                if(mux_n_out>=MUX_WANT_OUT()) break;
+                if(mux_n_out>=MUX_WANT_OUT() || topup_filled >= 1 || topup_fail >= 4) break;
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
@@ -4844,7 +4851,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
                       fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[ci], nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
                     rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
-                    mux_n_out++;
+                    mux_n_out++; topup_filled++;
                 }
                 else { if(!topup_fail++) snprintf(topup_why,sizeof topup_why,"%s: %s",
                                                   srcpool[ci], dial_fail_reason()); }
