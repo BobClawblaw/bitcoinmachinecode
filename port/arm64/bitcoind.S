@@ -866,16 +866,21 @@ node_serve_block:
 	bl   store_get_file_fd
 	cmp  x0, #0
 	b.lt .SBfail
-	mov  x1, x0                      /* fd (survives svc) */
-	/* lseek(fd, pos+8, SEEK_SET) */
-	mov  x0, x1
+	str  x0, [sp, #64]               /* fd: the lseek svc overwrites x0 with its
+	                                  * return, and x1 becomes the OFFSET arg --
+	                                  * the fd can only live on the stack across
+	                                  * the syscall (x86 keeps it in callee-saved
+	                                  * rbx; every x19-x24 here is already in
+	                                  * use). Keeping it in x1 made read() get
+	                                  * called with the offset as its fd. */
+	/* lseek(fd, pos+8, SEEK_SET) -- fd is already in x0 */
 	add  x1, x23, #8
 	mov  x2, #0
 	mov  x8, #62
 	svc  #0
 	tbnz x0, #63, .SBfail
 	/* read(fd, out_buf, size) */
-	mov  x0, x1                      /* fd (x1 preserved by svc) */
+	ldr  x0, [sp, #64]
 	mov  x1, x20
 	mov  x2, x24
 	mov  x8, #63
