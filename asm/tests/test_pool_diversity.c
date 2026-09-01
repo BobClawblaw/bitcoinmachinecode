@@ -31,8 +31,8 @@ int main(void){
     dialer_reset_for_test();                       /* the transport state latched before these were set */
     ab2_t* b = addr_book(); ok(b != 0, "book opened in a temp dir");
     char s[128]; bmc_addr_t a; int added = 0;
-    for(int i = 0; i < 200; i++){ snprintf(s, sizeof s, "%d.%d.%d.%d", 5 + i / 250, 10 + (i % 250), 20 + (i % 7), 1 + (i % 200)); if(bmc_addr_from_string_port(&a, s, 8333) && ab2_add(b, &a, 0x409, 100 + i) == 1) added++; }
-    ok(added == 200, "200 IPv4 entries added");
+    for(int i = 0; i < 600; i++){ snprintf(s, sizeof s, "%d.%d.%d.%d", 11, 1 + (i >> 7), 1 + (i & 127), 7); if(bmc_addr_from_string_port(&a, s, 8333) && ab2_add(b, &a, 0x409, 100 + i) == 1) added++; }
+    ok(added == 600, "600 IPv4 entries added");
     static const char* alpha = "abcdefghijklmnopqrstuvwxyz234567";
     int nonion = 0;
     for(int i = 0; i < 30; i++){
@@ -78,6 +78,14 @@ int main(void){
     int first_onion_after8 = -1; for(int i = 8; i < n; i++) if(net_of(pool[i]) == BMC_NET_TORV3){ first_onion_after8 = i; break; }
     ok(first_onion_after8 >= 8 && first_onion_after8 <= 12, "the rotation reaches an onion within its first few dials past the boot slots");
 
+    printf("== the 512-slot catch-up pool: floors, not proportions ==\n");
+    { static char big[512][DL_POOL_SLOT]; dl_pool_test_seed(7);
+      int nb = dl_pool_from_book(NULL, big, 512); int cb[8] = {0};
+      for(int i = 0; i < nb; i++){ int k = net_of(big[i]); if(k >= 0 && k < 8) cb[k]++; }
+      printf("  ipv4 %d ipv6 %d onion %d i2p %d cjdns %d\n", cb[BMC_NET_IPV4], cb[BMC_NET_IPV6], cb[BMC_NET_TORV3], cb[BMC_NET_I2P], cb[BMC_NET_CJDNS]);
+      ok(nb == 512, "512 entries");
+      ok(cb[BMC_NET_TORV3] == 12 && cb[BMC_NET_IPV6] == 8 && cb[BMC_NET_CJDNS] == 3, "the anonymity floors stay 12/8/3 in the big pool");
+      ok(cb[BMC_NET_IPV4] == 512 - 23, "clearnet fills the other 489 (the downloader stays fast)"); }
     printf("== it is a sample, not the head of the file ==\n");
     static char pool2[64][DL_POOL_SLOT];
     dl_pool_test_seed(999);
