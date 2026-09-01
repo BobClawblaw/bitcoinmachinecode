@@ -65,8 +65,7 @@ int main(void){
     {
         /* Each is a real Core token. Accepting any of them would mean the
          * operator believes something the node does not do. */
-        const char* recognised[] = { "mempool",
-                                     "download", "addr", "bloomfilter", 0 };
+        const char* recognised[] = { "bloomfilter", "out", 0 };   /* 2026-09-01: mempool/download/addr/in are enforced now */
         int all = 1;
         for (int i = 0; recognised[i]; i++){
             char spec[64]; snprintf(spec, sizeof spec, "%s@127.0.0.1", recognised[i]);
@@ -88,8 +87,12 @@ int main(void){
     {   /* noban alongside an unenforced one must still refuse: granting the
          * half we implement would be worse than refusing the whole line. */
         const char* e = 0;
-        ok(!netperm_add("noban,mempool@127.0.0.1", &e),
-           "noban,mempool is refused rather than half-honoured");
+        ok(!netperm_add("noban,bloomfilter@127.0.0.1", &e),
+           "noban,bloomfilter is refused rather than half-honoured");
+        e = 0; netperm_reset();
+        ok(netperm_add("noban,mempool@127.0.0.1", &e) && (netperm_for("127.0.0.1") & NP_MEMPOOL) && (netperm_for("127.0.0.1") & NP_NOBAN),
+           "noban,mempool grants both (2026-09-01: mempool is enforced)");
+        netperm_reset();
     }
 
     printf("== relay / forcerelay (2026-09-01: -whitelistrelay, -whitelistforcerelay) ==\n");
@@ -136,7 +139,7 @@ int main(void){
         /* The fd mapping is the whole mechanism: a peer's permissions come
          * from the socket that accepted it, which is how a peer whose address
          * you cannot predict gets them at all. */
-        netperm_bind_fd(7, NP_NOBAN);
+        netperm_bind_fd(7, netperm_whitebind_flags(0));
         ok(netperm_for_fd(7) & NP_NOBAN, "a bound listener fd grants its flags");
         ok(netperm_for_fd(8) == 0, "an unrelated fd grants nothing");
         ok(netperm_for_fd(-1) == 0, "and -1 is not a listener");
@@ -149,7 +152,7 @@ int main(void){
         ok(!netperm_whitebind_add("noban@127.0.0.1:0", &e), "port 0 is refused");
         ok(!netperm_whitebind_add("noban@127.0.0.1:70000", &e), "a port over 65535 is refused");
         ok(!netperm_whitebind_add("noban@nothost:8333", &e), "a hostname is refused");
-        ok(!netperm_whitebind_add("mempool@127.0.0.1:8333", &e),
+        ok(!netperm_whitebind_add("bloomfilter@127.0.0.1:8333", &e),
            "a permission this node does not enforce is refused here too");
         ok(!netperm_whitebind_add("", &e), "empty is refused");
 

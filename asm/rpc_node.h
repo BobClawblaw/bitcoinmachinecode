@@ -14,7 +14,7 @@
 /* One outbound peer, published by the download worker at connect/handshake.
  * Byte/last-send counters Core tracks per-socket are not tracked here (the
  * worker has no per-fd meters); getpeerinfo reports them as 0/-1. */
-#define RPC_MAX_PEERS 64
+#define RPC_MAX_PEERS 128   /* 0..63 outbound legs (the worker), 64..127 inbound children (2026-09-01) */
 /* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
  * daemon/main.c, which asserts the two agree at compile time. */
 #define RPC_MISBEHAVIOR_SLOTS 64
@@ -32,6 +32,12 @@ typedef struct {
     volatile long long        bytes_recv;
     volatile long long        last_send;    /* unix secs of last data sent */
     volatile long long        last_recv;    /* unix secs of last data recv */
+    /* 2026-09-01 relay policy: the peer's fRelay (Core relaytxes), its
+     * permissions (getpeerinfo "permissions"), and for an inbound slot the
+     * serve child's pid -- a dead pid means the slot is stale. */
+    volatile int              relaytxes;
+    volatile unsigned         perms;
+    volatile int              pid;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so

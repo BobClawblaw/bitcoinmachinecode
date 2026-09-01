@@ -1198,7 +1198,7 @@ that served BIP157 before this change must now set it explicitly.
 | option | Core meaning | this node |
 | --- | --- | --- |
 | `acceptnonstdtxn` | Relay and mine "non-standard" transactions (test networks only; default: 0) | implemented |
-| `acceptstalefeeestimates` | Read fee estimates even if they are stale (regtest only; default: 0) fee estimates are considered stale if the… | accepted, no effect: fee estimates are not persisted across restarts |
+| `acceptstalefeeestimates` | Read fee estimates even if they are stale (regtest only; default: 0) fee estimates are considered stale if the… | implemented 2026-09-01: reads fee_estimates.dat regardless of age |
 | `addnode` | Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). Thi… | implemented |
 | `addresstype` | What type of addresses to use ("legacy", "p2sh-segwit", "bech32", "bech32m", default: "bech32") | implemented |
 | `alertnotify` | Execute command when an alert is raised (%s in cmd is replaced by message) | implemented |
@@ -1215,7 +1215,7 @@ that served BIP157 before this change must now set it explicitly.
 | `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block reconstruction draws on the mempool only |
 | `blockreservedweight` | Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may ad… | implemented |
 | `blocksdir` | Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>) | accepted, no effect: the archive lives under <datadir>/<chain> and is not relocatable |
-| `blocksonly` | Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transaction… | implemented |
+| `blocksonly` | Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transaction… | implemented 2026-09-01: fRelay=0 in every version, tx/tx-inv from peers without `relay` is a violation (disconnect, no score), no feefilter, localrelay false, whitelistrelay->0 / maxmempool->5 interactions; RPC submissions still relay (Core). Wire-proven: validation/relay_policy_core_diff.sh |
 | `blocksxor` | Whether an XOR-key applies to blocksdir *.dat files. The created XOR-key will be zeros for an existing blocksd… | accepted, no effect: the archive is never XOR-obfuscated |
 | `blockversion` | Override block version to test forking scenarios | implemented |
 | `bytespersigop` | Equivalent bytes per sigop in transactions for relay and mining (default: 20) | implemented |
@@ -1257,7 +1257,7 @@ that served BIP157 before this change must now set it explicitly.
 | `help` | Print this help message and exit (also -h or -?) | accepted, no effect: command-line only |
 | `i2pacceptincoming` | Whether to accept inbound I2P connections (default: 1). Ignored if -i2psam is not set. Listening for inbound I… | implemented |
 | `i2psam` | I2P SAM proxy to reach I2P peers and accept I2P connections | implemented |
-| `inboundrelaypercent` | Permit a maximum percent of inbound connections to relay transactions, to limit memory utilization (0 to 100, … | implemented |
+| `inboundrelaypercent` | Permit a maximum percent of inbound connections to relay transactions, to limit memory utilization (0 to 100, … | implemented 2026-09-01: static_cast<int>(pct/100*inbound limit) full-relay inbound peers; only peers that negotiated tx relay count; the rest get fRelay=0 (Core evicts instead of refusing -- here the share is applied at handshake) |
 | `includeconf` | Specify additional configuration file, relative to the -datadir path (only useable from configuration file, no… | implemented (node_config.c) |
 | `incrementalrelayfee` | Fee rate (in BTC/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default… | implemented |
 | `keypool` | Set key pool size to <n> (default: 1000). Warning: Smaller sizes may increase the risk of losing funds when re… | accepted, no effect: the descriptor wallet derives keys on demand; there is no keypool |
@@ -1364,10 +1364,10 @@ that served BIP157 before this change must now set it explicitly.
 | `walletnotify` | Execute command when a wallet transaction changes. %s in cmd is replaced by TxID, %w is replaced by wallet nam… | implemented |
 | `walletrbf` | (DEPRECATED) Send transactions with full-RBF opt-in enabled (default: 1) | implemented |
 | `walletrejectlongchains` | Wallet will not create transactions that violate mempool chain limits (default: 1) | accepted, no effect: the mempool's cluster limits bound unconfirmed chains |
-| `whitebind` | Bind to the given address and add permission flags to the peers connecting to it. Use [host]:port notation for… | implemented |
-| `whitelist` | Add permission flags to the peers using the given IP address (e.g. 1.2.3.4) or CIDR-notated network (e.g. 1.2.… | implemented |
-| `whitelistforcerelay` | Add 'forcerelay' permission to whitelisted peers with default permissions. This will relay transactions even i… | implemented |
-| `whitelistrelay` | Add 'relay' permission to whitelisted peers with default permissions. This will accept relayed transactions ev… | implemented |
+| `whitebind` | Bind to the given address and add permission flags to the peers connecting to it. Use [host]:port notation for… | implemented: perms@addr:port; the same permission set as whitelist (2026-09-01) |
+| `whitelist` | Add permission flags to the peers using the given IP address (e.g. 1.2.3.4) or CIDR-notated network (e.g. 1.2.… | implemented 2026-09-01: noban, relay, forcerelay, mempool, download, addr, in enforced (Core NetPermissionFlags); bloomfilter/out refused with the reason; getpeerinfo `permissions` identical to Core for the same line |
+| `whitelistforcerelay` | Add 'forcerelay' permission to whitelisted peers with default permissions. This will relay transactions even i… | implemented 2026-09-01: implicit forcerelay (feefilter withheld, tx accepted even if known); onward RE-announcement of an inbound peer's tx is not done (inbound-accepted txs are not announced to legs -- pre-existing gap, see relay section) |
+| `whitelistrelay` | Add 'relay' permission to whitelisted peers with default permissions. This will accept relayed transactions ev… | implemented 2026-09-01: implicit relay; Core's SoftSet interactions with blocksonly/whitelistforcerelay |
 | `zmqpubhashblock` | Enable publish hash block in <address> | implemented |
 | `zmqpubhashblockhwm` | Set publish hash block outbound message high water mark (default: 1000) | implemented |
 | `zmqpubhashtx` | Enable publish hash transaction in <address> | implemented |

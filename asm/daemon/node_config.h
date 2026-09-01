@@ -257,6 +257,9 @@ typedef struct {
     int  inboundrelaypercent;       /* -inboundrelaypercent 0..100 (default 50)          */
     int  whitelistrelay;            /* default 1: whitelisted peers get 'relay'          */
     int  whitelistforcerelay;       /* default 0                                          */
+    int  whitelistrelay_explicit;   /* set in the file (Core SoftSetBoolArg interaction)  */
+    int  maxmempool_explicit;
+    int  acceptstalefeeestimates;   /* -acceptstalefeeestimates: read fee_estimates.dat however old (regtest tooling) */
     int  peerbloomfilters;          /* default 0; 1 is refused (BIP37 not implemented)   */
     int  peerblockfilters;          /* default 0: advertise NODE_COMPACT_FILTERS + serve BIP157 */
     int  fixedseeds;                /* default 1 (no compiled-in seeds here; accepted)   */
