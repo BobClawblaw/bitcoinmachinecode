@@ -769,6 +769,67 @@ static int tree_hash(const descr_t* d, int ni, long idx, u8 out[32], int depth){
     if (!ok){ snprintf(g_err, sizeof g_err, "tapleaf hash failed"); return 0; }
     return 1;
 }
+/* ---- tr() tree enumeration for the PSBT Updater (2026-09-01) ----------
+ * Leaves in DFS order with depth, script, leaf hash and the BIP341 control
+ * block (leaf version | output parity, internal key, merkle path from the
+ * leaf up). Also the internal x-only key, the merkle root and the output
+ * key parity. Returns the leaf count (0 = no tree), -1 on error. */
+static int tr_walk(const descr_t* d, int ni, long idx, int depth, descr_leaf_t* out, int cap, int* n, u8 hash_out[32], u8 (*path)[32], int plen){
+    const descr_node_t* nd = &d->nodes[ni];
+    if (depth > 128) return -1;
+    if (nd->type == DN_BRANCH){
+        u8 l[32], r[32];
+        /* hash both children first (each needs the other's hash as a path element) */
+        if (tr_walk(d, nd->child[0], idx, depth + 1, NULL, 0, NULL, l, NULL, 0) < 0) return -1;
+        if (tr_walk(d, nd->child[1], idx, depth + 1, NULL, 0, NULL, r, NULL, 0) < 0) return -1;
+        tap_branch_hash(hash_out, l, r);
+        if (out){
+            u8 (*p2)[32] = malloc(sizeof(u8[32]) * (size_t)(plen + 1)); if (!p2) return -1;
+            if (plen) memcpy(p2, path, sizeof(u8[32]) * (size_t)plen);
+            memcpy(p2[plen], r, 32); int a = tr_walk(d, nd->child[0], idx, depth + 1, out, cap, n, l, p2, plen + 1);
+            memcpy(p2[plen], l, 32); int b = a < 0 ? -1 : tr_walk(d, nd->child[1], idx, depth + 1, out, cap, n, r, p2, plen + 1);
+            free(p2); if (a < 0 || b < 0) return -1;
+        }
+        return 1;
+    }
+    u8* sc = malloc(SCRIPT_CAP); if (!sc) return -1;
+    int sl = node_script(d, ni, idx, 1, sc, SCRIPT_CAP);
+    if (sl < 0 || tap_leaf_hash(hash_out, 0xc0, sc, (uint64_t)sl) != 1){ free(sc); return -1; }
+    if (out){
+        if (*n >= cap || sl > (int)sizeof out[0].script){ free(sc); return -1; }
+        descr_leaf_t* L = &out[*n]; memset(L, 0, sizeof *L);
+        L->depth = depth; L->leaf_ver = 0xc0; L->slen = sl; memcpy(L->script, sc, (size_t)sl); memcpy(L->leaf_hash, hash_out, 32);
+        /* merkle path: the path array holds sibling hashes from the ROOT down; the control block wants leaf up */
+        L->npath = plen; for (int i = 0; i < plen; i++) memcpy(L->path[i], path[plen - 1 - i], 32);
+        (*n)++;
+    }
+    free(sc); return 1;
+}
+int descr_tr_leaves(const descr_t* d, long idx, descr_leaf_t* out, int cap, u8 internal32[32], u8 root32[32], int* has_root, int* odd){
+    if (d->root < 0) return -1;
+    const descr_node_t* n = &d->nodes[d->root];
+    if (n->type != DN_TR && n->type != DN_RAWTR) return -1;
+    u8 ik[65]; int il; if (!key_bytes(d, n->keys[0], idx, 1, ik, &il) || il != 32) return -1;
+    memcpy(internal32, ik, 32);
+    *has_root = 0; int cnt = 0;
+    const u8* rp = NULL;
+    if (n->type == DN_TR && n->child[0] >= 0){
+        if (tr_walk(d, n->child[0], idx, 0, out, cap, &cnt, root32, NULL, 0) < 0) return -1;
+        *has_root = 1; rp = root32;
+    }
+    /* output key parity for the control blocks */
+    u8 q[32]; int par = 0;
+    extern int bip32_xonly_tweak_add_par(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32], int* odd);
+    { u8 t[32]; u8 pre[64]; memcpy(pre, internal32, 32); if (rp){ memcpy(pre + 32, rp, 32); tagged_hash(t, "TapTweak", pre, 32, rp, 32); } else tagged_hash(t, "TapTweak", pre, 32, NULL, 0);
+      if (!bip32_xonly_tweak_add_par(internal32, t, q, &par)) return -1; }
+    if (odd) *odd = par;
+    for (int i = 0; i < cnt; i++){
+        out[i].ctrl[0] = (u8)(0xc0 | (par & 1)); memcpy(out[i].ctrl + 1, internal32, 32);
+        for (int k = 0; k < out[i].npath; k++) memcpy(out[i].ctrl + 33 + 32 * k, out[i].path[k], 32);
+        out[i].ctrl_len = 33 + 32 * out[i].npath;
+    }
+    return cnt;
+}
 /* scriptPubKey of the wrapper/leaf node ni at the top level */
 static int spk_of(const descr_t* d, int ni, long idx, u8* out, int cap){
     const descr_node_t* n = &d->nodes[ni];

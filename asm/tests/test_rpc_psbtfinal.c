@@ -349,11 +349,11 @@ int main(void){
         rj_free(f); }
       rj_free(r); }
 
-    { /* the descriptors argument is refused rather than ignored */
+    { /* the descriptors argument is honoured (2026-09-01: the Updater); a malformed descriptor is a parse error, not ignored */
       snprintf(pj, sizeof pj, "[\"%s\",[\"wpkh(%s)\"]]", psbt64, "xpub");
       rj_val* r = call("utxoupdatepsbt", pj, &ec, &em);
-      ck("supplying descriptors is an ERROR, not a silently ignored argument",
-         r == NULL && ec == -8 && em && strstr(em, "descriptors argument"));
+      ck("a malformed descriptor in the descriptors argument is an ERROR, not silently ignored",
+         r == NULL && ec == -5 && em && strstr(em, "not valid"));
       rj_free(r); }
 
     { /* fundrawtransaction is implemented now (rpc_wallet_ops.c); in this
