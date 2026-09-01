@@ -220,6 +220,8 @@ typedef struct {
     int  disablewallet;          /* Core -disablewallet: do not load a wallet  */
     int  reindex;                /* Core -reindex: ONE-SHOT rebuild of the block
                                   * index from the blk files (archive_reindex.c) */
+    char walletdir[256];         /* Core -walletdir: where wallet files live;
+                                  * empty = the chain directory                */
     char debuglogfile[256];      /* Core -debuglogfile: the daemon's own log
                                   * (def logs/bitcoind.log in the chain dir;
                                   * "0" = no file log)                       */

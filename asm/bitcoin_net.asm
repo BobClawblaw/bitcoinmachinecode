@@ -100,6 +100,24 @@ fd_write_all:
 .wa:
     cmp  rbx, r14
     jae  .done
+    ; ---- bound the write: poll({fd, POLLOUT}, 1, 10000) first. A peer that
+    ; stops reading (a dead Tor circuit, a stalled subscriber, the other end
+    ; of an IPC pair busy elsewhere) otherwise holds a blocking write() for
+    ; ever, and nothing above this function can interrupt it. SO_SNDTIMEO
+    ; covers the sockets tcp_connect_ip creates; this covers every fd.
+    ; 0 = timed out, <0 = error/EINTR: both are a failed write (-1).
+    sub  rsp, 16
+    mov  dword [rsp], r12d   ; pollfd.fd
+    mov  word  [rsp+4], 4    ; pollfd.events = POLLOUT
+    mov  word  [rsp+6], 0    ; pollfd.revents
+    mov  rdi, rsp
+    mov  esi, 1              ; nfds
+    mov  edx, 10000          ; timeout ms
+    mov  eax, 7              ; poll
+    syscall
+    add  rsp, 16
+    test rax, rax
+    jle  .fail
     mov  rdi, r12
     lea  rsi, [r13+rbx]
     mov  rdx, r14
@@ -108,6 +126,7 @@ fd_write_all:
     syscall
     test rax, rax
     jg   .ok
+.fail:
     mov  rax, -1
     jmp  .ret
 .ok:

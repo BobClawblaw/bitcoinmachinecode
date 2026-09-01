@@ -184,6 +184,7 @@ static void set_defaults(void){
     g_cfg.bytespersigop         = 20;    /* Core DEFAULT_BYTES_PER_SIGOP */
     g_cfg.disablewallet         = 0;
     g_cfg.reindex               = 0;
+    g_cfg.walletdir[0]          = 0;
     g_cfg.debuglogfile[0]       = 0;
     g_cfg.persistmempool        = 1;
     g_cfg.reindex_chainstate    = 0;
@@ -431,6 +432,8 @@ long node_config_load(const char* path){
             g_cfg.disablewallet = iv?1:0; applied++; }
         else if(!strcmp(key,"reindex")){       /* Core -reindex (one-shot, see main.c) */
             g_cfg.reindex = iv?1:0; applied++; }
+        else if(!strcmp(key,"walletdir")){     /* Core -walletdir=<dir> (absolute, or relative to the chain dir) */
+            snprintf(g_cfg.walletdir,sizeof g_cfg.walletdir,"%s",val); applied++; }
         else if(!strcmp(key,"debuglogfile")){ /* Core: -debuglogfile=<file>, 0 = none */
             snprintf(g_cfg.debuglogfile,sizeof g_cfg.debuglogfile,"%s",val); applied++; }
         else if(!strcmp(key,"bind")){         /* Core: -bind=<addr>[:<port>] */

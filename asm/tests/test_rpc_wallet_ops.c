@@ -930,6 +930,28 @@ int main(void){
       ck("createwallet w1 -> {name:w1}", rc == 1 && r && S(r,"name") && !strcmp(S(r,"name"), "w1"));
       rj_free(r); rj_free(p);
       ck("createwallet installed a fresh seed", tw_seed() != 0);
+      /* -walletdir: a named wallet is created under it, and listwalletdir sees
+       * it there. Restores w1 as the active wallet afterwards, since the
+       * checks below assume it. */
+      { extern void rpc_wops_set_walletdir(const char*);
+        char wdt[] = "/tmp/bmc_walletdir_XXXXXX"; if(!mkdtemp(wdt)){ perror("mkdtemp"); return 1; }
+        rpc_wops_set_walletdir(wdt);
+        p = P("[\"wd1\"]");
+        D("createwallet", p);
+        ck("createwallet under walletdir -> {name:wd1}", rc == 1 && r && S(r,"name") && !strcmp(S(r,"name"), "wd1"));
+        rj_free(r); rj_free(p);
+        { char b[600]; struct stat sb; snprintf(b, sizeof b, "%s/wallets/wd1/bmcwallet.dat", wdt);
+          ck("...and the store landed under walletdir/wallets/wd1/", stat(b, &sb) == 0); }
+        p = P("[]"); D("listwalletdir", p);
+        { int found = 0; rj_val* ws = (rc == 1 && r) ? rj_obj_get(r, "wallets") : 0;
+          for (unsigned long i = 0; ws && i < ws->nitems; i++){ const char* nm = S(ws->items[i], "name"); if (nm && !strcmp(nm, "wd1")) found = 1; }
+          ck("listwalletdir lists it from walletdir", found); }
+        rj_free(r); rj_free(p);
+        rpc_wops_set_walletdir("");
+        char cmd[300]; snprintf(cmd, sizeof cmd, "rm -rf %s", wdt); (void)!system(cmd);
+        p = P("[\"w1\"]"); D("loadwallet", p);
+        ck("w1 re-activated after the walletdir excursion", rc == 1);
+        rj_free(r); rj_free(p); }
       W.seed = tw_seed();
       ck("active wallet name is w1",
          rpc_wops_active_wallet_name() && !strcmp(rpc_wops_active_wallet_name(), "w1"));

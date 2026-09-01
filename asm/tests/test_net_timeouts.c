@@ -43,7 +43,24 @@ int main(void){
     printf("  read of a silent peer returned %ld after %.1f s\n", r, secs);
     ck("the read gives up (no bytes)", r < 1);
     ck("...within the 10 s bound plus margin, not forever", secs >= 9.0 && secs <= 14.0);
-    close(fd); close(l);
+    close(fd);
+    printf("== a peer that accepts and never READS ==\n");
+    /* fill its receive window and our send buffer, then keep writing: the
+     * write that can no longer make progress must give up in ~10 s, not
+     * sit in write() for ever (the 2026-09-01 00:51 worker wedge). */
+    extern long fd_write_all(int fd, const void* buf, unsigned long n);
+    fd = tcp_connect_ip(sa.sin_addr.s_addr, sa.sin_port);
+    int c = accept(l, NULL, NULL); ck("silent peer accepted us", c >= 0);
+    static unsigned char big[1 << 20];
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    long wr = 0, rc = 0; int rounds = 0;
+    for (; rounds < 64; rounds++){ rc = fd_write_all(fd, big, sizeof big); if (rc < 0) break; wr += rc; }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    secs = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+    printf("  wrote %ld bytes in %d round(s), then rc=%ld after %.1f s\n", wr, rounds, rc, secs);
+    ck("the blocked write gives up (-1)", rc < 0);
+    ck("...within the 10 s bound plus margin", secs >= 9.0 && secs <= 25.0);
+    close(fd); close(c); close(l);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

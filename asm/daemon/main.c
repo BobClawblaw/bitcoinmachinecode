@@ -3485,6 +3485,9 @@ static int txsub_package(char* msg, unsigned long mcap){
  * dl_catchup is synchronous and holds the worker for its duration; the legs
  * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
 #define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
+#define TXSUB_ROTATION_BUDGET 256    /* submissions serviced per rotation before the main loop runs again */
+#define TXSUB_ROTATION_MS     250    /* ...or this much wall time, whichever comes first */
+static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
 static int g_catchup_workers = 16;
@@ -3508,6 +3511,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * which happened on every stop/restart until 2026-08-22 and once landed
      * between a block's WAL writes and its checkpoint (height 318148). */
     utxo_live_set_shutdown_flag(&g_shutdown_requested);
+    { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
+      rpc_node_set_shutdown_flag(&g_shutdown_requested); }   /* the mempool reload must yield to SIGTERM */
     /* Reload a fresh store state rather than inherit the parent's possibly-
      * stale in-memory idx_len/pos (fork COW is not safe for a growable
      * store -- see the unified_ibd comments on re-initialising per
@@ -4171,12 +4176,24 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * speed, and an idle node pays at most TXSUB_FOLLOW_MS once. */
         if(g_node_status){
             int follow = 0;
+            /* ...but the linger must not become residence: a mempool.dat
+             * reload (thousands of entries, each acked and followed by the
+             * next within the window, plus its retry passes) kept the worker
+             * in this loop for MINUTES -- no heartbeat, no leg polling, no
+             * block sync, and every blocking dial or write it hit inside
+             * looked like a wedge (2026-08-31 21:20; 2026-09-01 00:31, 00:51,
+             * 01:10, all a few minutes after boot). Bound the stay per
+             * rotation by count and by time; the submitter tolerates a
+             * rotation gap (it waits 90 s per entry). */
+            int budget = TXSUB_ROTATION_BUDGET;
+            long long t_enter = txsub_now_ms();
             for(;;){
                 if(g_node_status->tx_submit_seq == txsub_last_seq){
                     if(follow <= 0 || g_shutdown_requested) break;
                     struct timespec ts = {0, 500*1000}; nanosleep(&ts, NULL); follow--;
                     continue;
                 }
+                if(--budget < 0 || txsub_now_ms() - t_enter > TXSUB_ROTATION_MS) break;   /* back to the main loop; next rotation continues */
                 txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
             if(g_node_status->tx_submit_pkg_n > 0){
@@ -4971,6 +4988,19 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern const char* dialer_i2p_b32(void);
       extern void rpc_node_set_net_hooks(int (*)(int), const char* (*)(void));
       rpc_node_set_net_hooks(dialer_net_reachable, dialer_i2p_b32); }
+    /* Core -walletdir: every wallet file lives there (absolute, or relative
+     * to the chain directory we are in). Created 0700 if absent; the RPC
+     * wallet layer learns it through its setter, never from node_config. */
+    if(g_cfg.walletdir[0]){
+        struct stat wsb;
+        if(stat(g_cfg.walletdir, &wsb) != 0){
+            if(mkdir(g_cfg.walletdir, 0700) == 0) fprintf(stderr, "[wallet] created walletdir %s\n", g_cfg.walletdir);
+            else fprintf(stderr, "[wallet] walletdir %s: cannot create (%s) -- wallet files will fail to open\n", g_cfg.walletdir, strerror(errno));
+        } else if(!S_ISDIR(wsb.st_mode)) fprintf(stderr, "[wallet] walletdir %s is not a directory\n", g_cfg.walletdir);
+        extern void rpc_wops_set_walletdir(const char*);
+        rpc_wops_set_walletdir(g_cfg.walletdir);
+        fprintf(stderr, "[wallet] walletdir=%s\n", g_cfg.walletdir);
+    }
     /* Wallet bootstrap: if the CLI's own wallet store is present in the
      * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
      * CLI's own resolution order) and hand the RPC layer the seed --
@@ -4994,7 +5024,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
        * unlock path uses -- one seed slot, one way to write it. */
       rpc_wops_set_seed_installer(wenc_install_seed);
       char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
-      if (wenc_boot(".") || wenc_boot(wd)){
+      if (g_cfg.walletdir[0] ? wenc_boot(g_cfg.walletdir) : (wenc_boot(".") || wenc_boot(wd))){
           /* An encrypted wallet boots LOCKED, as Core's does. If the operator
            * has configured a passphrase source (walletpassfile= or
            * $BMC_WALLET_PASS) unlock it here, so moving from the weak v2 store
@@ -5016,8 +5046,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
                                        const char* pass, long passlen);
       static char mn[768], wpass[256];
-      const char* cand[2] = { "bmcwallet.dat", "data/bmcwallet.dat" };
-      for (int wi = 0; wi < 2; wi++){
+      char wdc[512]; snprintf(wdc, sizeof wdc, "%s/bmcwallet.dat", g_cfg.walletdir[0] ? g_cfg.walletdir : ".");
+      const char* cand[3] = { g_cfg.walletdir[0] ? wdc : "bmcwallet.dat", "bmcwallet.dat", "data/bmcwallet.dat" };
+      for (int wi = (g_cfg.walletdir[0] ? 0 : 1); wi < 3; wi++){
           struct stat wsb;
           if (stat(cand[wi], &wsb) != 0) continue;
           wpass[0] = 0;
