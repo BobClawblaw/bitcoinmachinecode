@@ -35,9 +35,45 @@ SCRIPT_MAX_BYTES= 65536
 SPARSE_STRIDE   = 256
 SPARSE_ENT_SIZE = 44
 COMPACT_MAX_RUNS  = 64
-COMPACT_SLOT_SIZE = 65640          /* 104 + SCRIPT_MAX_BYTES */
-COMPACT_SLOTS_BYTES  = 4200960     /* 64 * 65640 */
-COMPACT_SCRATCH_BYTES = 8395264    /* + BLOOM_MAX_BYTES */
+/* READ-AHEAD BUFFER, inline in the slot (2026-08-31, ported from main).
+ * mac_compact_read_rec used to pull every record with THREE read(2) syscalls
+ * (key+type 37, value block 15/10, script), making compaction syscall-bound
+ * (~50 MB/s). Each slot now owns COMPACT_RDBUF bytes and refills with one
+ * read(2) per 256 KB. The slots come from a fresh anonymous mmap, so the
+ * extra bytes start zeroed: fill = pos = 0 means "empty". */
+COMPACT_RDBUF     = 262144
+SLOT_RD_FILL      = 104 + SCRIPT_MAX_BYTES      /* 65640: bytes valid in the buffer */
+SLOT_RD_POS       = SLOT_RD_FILL + 8            /* 65648: bytes consumed */
+/* SLOT_RD_BUF is the buffer's offset, so it must be SLOT_RD_POS + 8, NOT
+ * SLOT_RD_FILL + 16: the buffer starts right after the pos qword, and every
+ * read-ahead access below is built as slot + SLOT_RD_*, so the old form moved
+ * the whole buffer up one word -- reads landed 8 bytes early, fill/pos were
+ * written into the slot's own tail, and slot 63 read/wrote past the mmap
+ * (SIGSEGV on the 64-run batch in test_compact_async part 5). */
+SLOT_RD_BUF       = SLOT_RD_POS + 8             /* 65656: the buffer itself */
+COMPACT_SLOT_SIZE = SLOT_RD_BUF + COMPACT_RDBUF /* 327800 = 0x50078 */
+COMPACT_SLOTS_BYTES  = COMPACT_MAX_RUNS * COMPACT_SLOT_SIZE   /* 20979200 = 0x1401E00 */
+COMPACT_SCRATCH_BYTES = COMPACT_SLOTS_BYTES + BLOOM_MAX_BYTES /* 25173504 = 0x1801E00 */
+/* ---- utxo_lsm_compact / utxo_lsm_compact_range frame locals ----
+ * Frame map (6 callee-saved pushes + `sub sp,#0x240`, x28 = sp):
+ *   0x00 orig_manifest_n  0x08 upper_bound  0x10 bloom_bits  0x18 bloom_bytes
+ *   0x20 bits_mask  0x28 out_gen  0x30 out_run_no  0x38 true_nrec
+ *   0x40 sparse_n  0x58 best_idx  0x68/0x70 input gen/run stash
+ *   0xf8 sparse_scratch_bytes  0x200 has_count  0x208 manifest read fd
+ *   0x210 P_old  0x218 persist_count  0x220 write_v2
+ *   buffers: 0x80 winning-key snapshot (36B), 0xa0 fmt_runname path (32B),
+ *            0xc0 header staging -- BOTH the 44B run header and the 20B manifest
+ *            header -- which is ALSO mac_read_run_header's dst, so its 104B
+ *            block touches 0xc0..0xf8 (the rec_v2 qword lands on 0xf8).
+ * MAC_CR_LO / MAC_KEEP_DELS arrive with leveled compaction and must stay clear
+ * of every buffer above; 0x228/0x230 are past the last one. They first sat at
+ * 0xe8/0xf0 -- free in the pre-leveled frame, but inside the read-ahead header
+ * block: reading a run header zeroed keep_dels, so a TAIL merge dropped its
+ * tombstones and deleted keys could come back, and left lo at the header
+ * magic's top byte (=48), so the merged entry was written at manifest index 48
+ * and manifest_n became lo+1. Do not move them back without moving MAC_HDR. */
+MAC_CR_LO         = 0x228
+MAC_KEEP_DELS     = 0x230
 O_RDONLY = 0
 O_WRONLY = 1
 O_RDWR   = 2
@@ -77,8 +113,11 @@ lsm_get_scratch:
  * small local helpers
  * ------------------------------------------------------------------------- */
 
-/* mac_memcpy(dst=x0, src=x1, n=x2) -- preserves x0..x6; clobbers x7+ only. */
-mac_memcpy:
+/* mac_bmemcpy(dst=x0, src=x1, n=x2) -- LOCAL byte-copy (renamed from
+ * mac_memcpy: bitcoin_utxo_store.S owns the single canonical definition,
+ * and duplicate local symbols silently resolved to whichever object the
+ * linker kept -- x86 tolerates the dup, the ARM build must not). */
+mac_bmemcpy:
 	mov  x7, #0
 .mm_l:
 	cmp  x7, x2
@@ -847,7 +886,7 @@ utxo_lsm_del:
 	mov  x0, x11
 	mov  x1, x21
 	mov  x2, #32
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	str  w22, [x11, #32]
 	/* mac_tomb_hash_probe(lst, dst) -> slot ; *slot = old_index */
 	mov  x0, x19
@@ -992,7 +1031,7 @@ mac_run_lookup:
 	add  x0, sp, #0xd0
 	mov  x1, x21
 	mov  x2, #32
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	ldr  w9, [sp, #0x08]
 	str  w9, [sp, #0xd0+32]
 	/* bloom test: 3 seeds */
@@ -1268,7 +1307,7 @@ utxo_lsm_get:
 	add  x0, x28, #0x00             /* keybuf */
 	mov  x1, x21
 	mov  x2, #32
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	str  w22, [x28, #0x20]          /* index at keybuf+32 */
 	mov  x0, x19
 	add  x1, x28, #0x00
@@ -1356,6 +1395,14 @@ mac_flush:
 	mov  x28, sp
 	mov  x19, x0                    /* lst */
 	mov  x20, x1                    /* u */
+	/* background-compaction gate: the hook (compact_poll) adopts a finished
+	 * compaction child so two manifest writers never race. Calling C here is
+	 * legal: x19/x20/x28 are callee-saved and sp is 16-byte aligned. */
+	adrp x9, mac_flush_hook
+	ldr  x9, [x9, :lo12:mac_flush_hook]
+	cbz  x9, .mf_nohook
+	blr  x9
+.mf_nohook:
 	/* desc_cap/off_desc_b/off_bloom */
 	mov  x0, x19
 	bl   mac_calc_desc_cap
@@ -1393,7 +1440,7 @@ mac_flush:
 	mov  x0, x23
 	add  x1, x22, #8
 	mov  x2, #32
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	ldr  w11, [x22, #40]
 	str  w11, [x23, #32]            /* index */
 	mov  w11, #1
@@ -1458,7 +1505,7 @@ mac_flush:
 	mov  x0, x23
 	mov  x1, x22
 	mov  x2, #36
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	mov  w9, #2
 	strb w9, [x23, #36]              /* type = DEL */
 	ldr  x9, [x28, #0x08]
@@ -1627,7 +1674,7 @@ mac_flush:
 	add  x0, x11, x10                /* dest */
 	mov  x1, x23
 	mov  x2, #36
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	str  x24, [x0, #36]             /* file_offset */
 	ldr  x9, [x28, #0x60]
 	add  x9, x9, #1
@@ -2071,7 +2118,7 @@ mac_lsm_reload_impl:
 	mov  x0, x11
 	add  x1, x28, #0x60
 	mov  x2, #36
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	mov  x0, x19
 	mov  x1, x11
 	bl   mac_tomb_hash_probe
@@ -2140,7 +2187,88 @@ mac_lsm_reload_impl:
 	.size mac_lsm_reload_impl,.-mac_lsm_reload_impl
 
 /* ============================================================================
+ * mac_slot_read(slot=x0, dst=x1, len=x2) -> 0 ok / -1 err
+ *   Exactly mac_read_exact2's contract (a short or zero read is an error),
+ *   served from the slot's inline read-ahead buffer (SLOT_RD_BUF, fill/pos
+ *   at SLOT_RD_FILL/SLOT_RD_POS), refilled COMPACT_RDBUF at a time from the
+ *   slot's fd. Only ever advances the fd sequentially, which is the only way
+ *   the record stream is read; the run header and the bloom skip happen
+ *   BEFORE the first record and go straight to the fd, so the buffer is
+ *   empty when they run. Reading ahead past the last record (into the
+ *   sparse-index trailer) is harmless: nothing reads an input fd after the
+ *   merge. Leaf (svc only): clobbers x9-x15, preserves everything else.
+ * ========================================================================== */
+	.type mac_slot_read,%function
+mac_slot_read:
+	mov  x9, x0                     /* slot */
+	mov  x10, x1                    /* dst */
+	mov  x11, x2                    /* len remaining */
+.sr_loop:
+	cbz  x11, .sr_ok
+	movz x15, #(SLOT_RD_FILL & 0xFFFF)
+	movk x15, #(SLOT_RD_FILL >> 16), lsl #16
+	ldr  x12, [x9, x15]
+	movz x15, #(SLOT_RD_POS & 0xFFFF)
+	movk x15, #(SLOT_RD_POS >> 16), lsl #16
+	ldr  x13, [x9, x15]
+	sub  x14, x12, x13              /* avail = fill - pos */
+	cbnz x14, .sr_have
+	/* refill: one read(2) per COMPACT_RDBUF */
+	stp  x10, x11, [sp, #-16]!
+	ldr  x0, [x9]                   /* fd */
+	movz x1, #(SLOT_RD_BUF & 0xFFFF)
+	movk x1, #(SLOT_RD_BUF >> 16), lsl #16
+	add  x1, x9, x1
+	movz x2, #(COMPACT_RDBUF & 0xFFFF)
+	movk x2, #(COMPACT_RDBUF >> 16), lsl #16
+	mov  x8, #SYS_read
+	svc  #0
+	ldp  x10, x11, [sp], #16
+	cmp  x0, #0
+	b.le .sr_bad
+	movz x15, #(SLOT_RD_FILL & 0xFFFF)
+	movk x15, #(SLOT_RD_FILL >> 16), lsl #16
+	str  x0, [x9, x15]
+	movz x15, #(SLOT_RD_POS & 0xFFFF)
+	movk x15, #(SLOT_RD_POS >> 16), lsl #16
+	str  xzr, [x9, x15]
+	b    .sr_loop
+.sr_have:
+	cmp  x14, x11
+	b.ls 1f
+	mov  x14, x11                   /* n = min(avail, len) */
+1:
+	movz x15, #(SLOT_RD_POS & 0xFFFF)
+	movk x15, #(SLOT_RD_POS >> 16), lsl #16
+	ldr  x13, [x9, x15]
+	movz x15, #(SLOT_RD_BUF & 0xFFFF)
+	movk x15, #(SLOT_RD_BUF >> 16), lsl #16
+	add  x15, x9, x15
+	add  x15, x15, x13              /* src = buf + pos */
+	add  x13, x13, x14
+	movz x12, #(SLOT_RD_POS & 0xFFFF)
+	movk x12, #(SLOT_RD_POS >> 16), lsl #16
+	str  x13, [x9, x12]             /* pos += n */
+	sub  x11, x11, x14              /* len -= n */
+.sr_copy:
+	ldrb w16, [x15], #1
+	strb w16, [x10], #1
+	subs x14, x14, #1
+	b.ne .sr_copy
+	b    .sr_loop
+.sr_ok:
+	mov  x0, #0
+	ret
+.sr_bad:
+	mov  x0, #-1
+	ret
+	.size mac_slot_read,.-mac_slot_read
+
+/* ============================================================================
  * mac_compact_read_rec(slot=x0) -> 1 ok / -1 err
+ *   Reads now go through mac_slot_read (inline read-ahead): one syscall per
+ *   256 KB instead of three per record. Record fields land in the same slot
+ *   positions as before.
  * ========================================================================== */
 	.type mac_compact_read_rec,%function
 mac_compact_read_rec:
@@ -2148,10 +2276,10 @@ mac_compact_read_rec:
 	stp  x19,x20,[sp,#-16]!
 	stp  x21,x22,[sp,#-16]!
 	mov  x19, x0                    /* slot */
-	ldr  x0, [x19]                  /* fd */
+	mov  x0, x19                    /* slot: buffered read (see mac_slot_read) */
 	add  x1, x19, #40
 	mov  x2, #37                    /* key(36)+type(1) */
-	bl   mac_read_exact2
+	bl   mac_slot_read
 	cbnz x0, .cpr_err
 	bl   g_utxo_prog_bump          /* +1 record consumed (boot progress) */
 	ldrb w9, [x19, #76]             /* type */
@@ -2160,29 +2288,29 @@ mac_compact_read_rec:
 	ldr  x9, [x19, #96]             /* rec_v2 */
 	cbnz x9, .cpr_read_new
 	/* old shape: value(8)+slen(2)=10 */
-	ldr  x0, [x19]
+	mov  x0, x19
 	add  x1, x19, #80
 	mov  x2, #10
-	bl   mac_read_exact2
+	bl   mac_slot_read
 	cbnz x0, .cpr_err
 	add  x9, x19, #90
 	str  xzr, [x9]                  /* height=0 */
 	strb wzr, [x19, #94]            /* is_coinbase=0 */
 	b    .cpr_have_slen
 .cpr_read_new:
-	ldr  x0, [x19]
+	mov  x0, x19
 	add  x1, x19, #80
 	mov  x2, #15
-	bl   mac_read_exact2
+	bl   mac_slot_read
 	cbnz x0, .cpr_err
 .cpr_have_slen:
 	ldrh w9, [x19, #88]             /* slen */
 	cbz  w9, .cpr_dec
 	uxtw x10, w9
-	ldr  x0, [x19]
+	mov  x0, x19
 	add  x1, x19, #104
 	mov  x2, x10
-	bl   mac_read_exact2
+	bl   mac_slot_read
 	cbnz x0, .cpr_err
 .cpr_dec:
 	mov  x9, #1
@@ -2225,8 +2353,8 @@ mac_lsm_recount:
 	str  xzr, [x28, #0x08]          /* mmap_size */
 	cbz  x23, .rc_ret_live
 	mov  x9, x23
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16      /* COMPACT_SLOT_SIZE */
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16      /* COMPACT_SLOT_SIZE */
 	mul  x9, x9, x10
 	str  x9, [x28, #0x08]           /* mmap_size */
 	mov  x0, #0
@@ -2246,8 +2374,8 @@ mac_lsm_recount:
 	cmp  x25, x23
 	b.hs .rc_init_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x9, x9, x24
 	mov  x10, #-1
@@ -2267,8 +2395,8 @@ mac_lsm_recount:
 	ldr  x9, [x11]                  /* gen */
 	ldr  x10, [x11, #8]             /* run_no */
 	mov  x11, x25
-	movz x12, #0x0068
-	movk x12, #0x0001, lsl #16
+	movz x12, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x12, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x11, x11, x12
 	add  x26, x11, x24              /* slot base (callee-saved) */
 	str  x9, [x26, #8]              /* slot.gen */
@@ -2329,8 +2457,8 @@ mac_lsm_recount:
 	cmp  x25, x23
 	b.hs .rc_prg_done
 	mov  x10, x25
-	movz x11, #0x0068
-	movk x11, #0x0001, lsl #16
+	movz x11, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x11, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x10, x10, x11
 	add  x10, x10, x24
 	ldr  x11, [x10, #24]           /* slot.remaining = nrec */
@@ -2351,8 +2479,8 @@ mac_lsm_recount:
 	cmp  x25, x23
 	b.hs .rc_find_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x26, x9, x24                /* this slot (callee-saved) */
 	ldr  x10, [x26, #32]
@@ -2362,8 +2490,8 @@ mac_lsm_recount:
 	cmp  x10, x11
 	b.eq .rc_find_setbest
 	ldr  x10, [x28, #0x18]
-	movz x11, #0x0068
-	movk x11, #0x0001, lsl #16
+	movz x11, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x11, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x10, x10, x11
 	add  x27, x10, x24               /* best slot (callee-saved) */
 	add  x0, x26, #40
@@ -2387,14 +2515,14 @@ mac_lsm_recount:
 	mov  x10, #-1
 	cmp  x9, x10
 	b.eq .rc_merge_done
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x27, x9, x24                /* winner slot (callee-saved) */
 	add  x0, x28, #0xa0
 	add  x1, x27, #40
 	mov  x2, #36
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	ldrb w9, [x27, #76]             /* type */
 	cmp  w9, #1
 	b.ne .rc_advance
@@ -2438,8 +2566,8 @@ mac_lsm_recount:
 	cmp  x25, x23
 	b.hs .rc_adv_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x26, x9, x24                /* this slot (callee-saved) */
 	ldr  x10, [x26, #32]
@@ -2469,8 +2597,8 @@ mac_lsm_recount:
 	cmp  x25, x23
 	b.hs .rc_close_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x26, x9, x24
 	ldr  x0, [x26]
@@ -2496,8 +2624,8 @@ mac_lsm_recount:
 	cmp  x25, x23
 	b.hs .rc_errc_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x26, x9, x24
 	ldr  x0, [x26]
@@ -2571,11 +2699,213 @@ utxo_lsm_walk:
 	.size utxo_lsm_walk,.-utxo_lsm_walk
 
 /* ============================================================================
+ * Background-compaction support (2026-08-31, ported from main)
+ * ---- mac_compact_defer_unlink: when non-zero, utxo_lsm_compact publishes
+ *   the new manifest as usual but leaves its INPUT run files on disk. A
+ *   forked child compacting on the parent's behalf sets this: the parent
+ *   still holds the old manifest in memory and may open those runs by name
+ *   until it adopts the new one; the parent unlinks them itself after
+ *   adopting (daemon/utxo_live.c, compact_adopt).
+ * ---- mac_compact_defer_publish: when non-zero, utxo_lsm_compact writes the
+ *   new manifest bytes to utxo_manifest.child instead of publishing them --
+ *   no rename over utxo_manifest.dat, no dir fsync. The parent keeps
+ *   flushing (and publishing) while the child merges, then merges the
+ *   child's manifest with the runs it flushed meanwhile and publishes the
+ *   union itself (daemon/lsm_manifest.c, lsm_manifest_adopt_child).
+ * ---- mac_flush_hook: called by mac_flush BEFORE it touches anything.
+ *   mac_flush is the only other manifest writer and is triggered from
+ *   inside utxo_lsm_put, where C cannot intercept it; the parent's hook
+ *   (compact_poll) waits for a running compaction child so two writers
+ *   never race on the manifest.
+ * ---- mac_cr_lo / mac_cr_k: utxo_lsm_compact_range's arguments, parked here
+ *   so the range entry can share utxo_lsm_compact's body (see .cc_entry).
+ * ========================================================================== */
+	.global utxo_lsm_set_defer_unlink
+	.type utxo_lsm_set_defer_unlink,%function
+utxo_lsm_set_defer_unlink:
+	adrp x9, mac_compact_defer_unlink
+	str  x0, [x9, :lo12:mac_compact_defer_unlink]
+	ret
+	.size utxo_lsm_set_defer_unlink,.-utxo_lsm_set_defer_unlink
+
+	.global utxo_lsm_set_defer_publish
+	.type utxo_lsm_set_defer_publish,%function
+utxo_lsm_set_defer_publish:
+	adrp x9, mac_compact_defer_publish
+	str  x0, [x9, :lo12:mac_compact_defer_publish]
+	ret
+	.size utxo_lsm_set_defer_publish,.-utxo_lsm_set_defer_publish
+
+	.global utxo_lsm_set_flush_hook
+	.type utxo_lsm_set_flush_hook,%function
+utxo_lsm_set_flush_hook:
+	adrp x9, mac_flush_hook
+	str  x0, [x9, :lo12:mac_flush_hook]
+	ret
+	.size utxo_lsm_set_flush_hook,.-utxo_lsm_set_flush_hook
+
+/* ---------------------------------------------------------------------------
+ * Buffered writer for the compaction's OUTPUT run (2026-08-31, from main).
+ * The merge loop used to issue three write(2) calls per record; they now land
+ * in a 1 MB buffer written with one syscall when full. Everything AFTER the
+ * merge loop (header patches at fixed offsets, sparse-index append) goes
+ * straight through mac_write_exact as before; the loop's exit flushes this
+ * buffer FIRST so those writes see a complete file.
+ *
+ * One writer at a time: compaction runs in the download worker (or its forked
+ * child), and no other code path in that process opens a run for writing
+ * while it runs. State is process-global on purpose.
+ *   mac_out_begin(fd=x0)                       arm for this output fd
+ *   mac_out_write(src=x0, len=x1) -> 0/-1
+ *   mac_out_flush() -> 0/-1                    write out whatever is held
+ *   mac_out_tell() -> offset or -1             fd offset + bytes buffered
+ * --------------------------------------------------------------------------- */
+	.type mac_out_begin,%function
+mac_out_begin:
+	adrp x9, mac_ow_fd
+	str  x0, [x9, :lo12:mac_ow_fd]
+	adrp x9, mac_ow_fill
+	str  xzr, [x9, :lo12:mac_ow_fill]
+	ret
+	.size mac_out_begin,.-mac_out_begin
+
+	.type mac_out_flush,%function
+mac_out_flush:
+	stp  x29, x30, [sp, #-16]!
+	mov  x29, sp
+	adrp x9, mac_ow_fill
+	ldr  x10, [x9, :lo12:mac_ow_fill]
+	cbz  x10, .of_ok
+	adrp x11, mac_ow_fd
+	ldr  x0, [x11, :lo12:mac_ow_fd]
+	adrp x1, mac_ow_buf
+	add  x1, x1, :lo12:mac_ow_buf
+	mov  x2, x10
+	bl   mac_write_exact            /* its x0 is our result */
+	adrp x9, mac_ow_fill
+	str  xzr, [x9, :lo12:mac_ow_fill]
+	ldp  x29, x30, [sp], #16
+	ret
+.of_ok:
+	mov  x0, #0
+	ldp  x29, x30, [sp], #16
+	ret
+	.size mac_out_flush,.-mac_out_flush
+
+/* mac_out_tell() -> x0 = logical write position (fd offset + buffered bytes), or -1 */
+	.type mac_out_tell,%function
+mac_out_tell:
+	stp  x29, x30, [sp, #-16]!
+	mov  x29, sp
+	adrp x9, mac_ow_fd
+	ldr  x0, [x9, :lo12:mac_ow_fd]
+	mov  x1, #0
+	mov  x2, #1                     /* SEEK_CUR */
+	mov  x8, #SYS_lseek
+	svc  #0
+	tbz  x0, #63, 1f
+	ldp  x29, x30, [sp], #16
+	ret                             /* -1 propagates */
+1:
+	adrp x9, mac_ow_fill
+	ldr  x10, [x9, :lo12:mac_ow_fill]
+	add  x0, x0, x10
+	ldp  x29, x30, [sp], #16
+	ret
+	.size mac_out_tell,.-mac_out_tell
+
+	.type mac_out_write,%function
+mac_out_write:
+	stp  x29, x30, [sp, #-16]!      /* we bl out below: save lr (x30) */
+	mov  x14, x0                    /* src */
+	mov  x15, x1                    /* len */
+	adrp x9, mac_ow_fill
+	ldr  x10, [x9, :lo12:mac_ow_fill]
+	add  x11, x10, x15
+	movz x12, #(MAC_OWBUF & 0xFFFF)
+	movk x12, #(MAC_OWBUF >> 16), lsl #16
+	cmp  x11, x12
+	b.hi .ow_spill
+.ow_copy:
+	adrp x13, mac_ow_buf
+	add  x13, x13, :lo12:mac_ow_buf
+	add  x13, x13, x10              /* dst = buf + fill */
+.ow_copy_loop:
+	ldrb w16, [x14], #1
+	strb w16, [x13], #1
+	subs x15, x15, #1
+	b.ne .ow_copy_loop
+	adrp x9, mac_ow_fill
+	str  x11, [x9, :lo12:mac_ow_fill]
+	mov  x0, #0
+	ldp  x29, x30, [sp], #16
+	ret
+.ow_spill:
+	bl   mac_out_flush              /* x14/x15 survive: flush only uses x9-x11 */
+	cbnz x0, .ow_bad
+	movz x12, #(MAC_OWBUF & 0xFFFF)
+	movk x12, #(MAC_OWBUF >> 16), lsl #16
+	cmp  x15, x12
+	b.hs .ow_direct                 /* larger than the buffer: write through */
+	/* buffer is empty now */
+	adrp x9, mac_ow_fill
+	ldr  x10, [x9, :lo12:mac_ow_fill]  /* = 0 */
+	add  x11, x10, x15
+	b    .ow_copy
+.ow_direct:
+	adrp x9, mac_ow_fd
+	ldr  x0, [x9, :lo12:mac_ow_fd]
+	mov  x1, x14
+	mov  x2, x15
+	bl   mac_write_exact            /* clobbers x9-x11 only: x14/x15 live */
+	ldp  x29, x30, [sp], #16
+	ret
+.ow_bad:
+	mov  x0, #-1
+	ldp  x29, x30, [sp], #16
+	ret
+	.size mac_out_write,.-mac_out_write
+
+/* ============================================================================
+ * utxo_lsm_compact_range(lst=x0, lo=x1, k=x2): merge manifest entries
+ * [lo, lo+k) into one run that takes index lo. Leveled compaction's entry
+ * (daemon/utxo_live.c picks lo/k by size ratio): lo == 0 is the classic base
+ * merge; lo > 0 must end at the newest run, and then tombstones are KEPT in
+ * the output -- they still cancel puts in the runs below. Returns like
+ * utxo_lsm_compact; a bad range (k < 2, k > COMPACT_MAX_RUNS, past the end,
+ * or in the middle) is a no-op returning 0.
+ * ========================================================================== */
+	.global utxo_lsm_compact_range
+	.type utxo_lsm_compact_range,%function
+utxo_lsm_compact_range:
+	adrp x9, mac_cr_lo
+	str  x1, [x9, :lo12:mac_cr_lo]
+	adrp x9, mac_cr_k
+	str  x2, [x9, :lo12:mac_cr_k]
+	b    .cc_entry
+	/* NOTE: utxo_lsm_compact_range does NOT validate its range here -- it
+	 * parks (lo,k) in .bss and shares utxo_lsm_compact's body, which means
+	 * every callee-saved register the C compiler may be holding a live local
+	 * in (x19-x28) is clobbered by the merge. Callers in daemon/utxo_live.c
+	 * bracket the call with UTXO_LSM_BARRIER for exactly this reason; test
+	 * harnesses that bind lo/k to locals without a barrier read garbage
+	 * after the call and pass it on (see asm/tests/test_compact_leveled.c
+	 * part 5, where a stale k selects a 63-run batch). */
+	.size utxo_lsm_compact_range,.-utxo_lsm_compact_range
+
+/* ============================================================================
  * utxo_lsm_compact(lst=x0) -> 1 ok / 0 nothing-to-do / -1 err
  * ========================================================================== */
 	.global utxo_lsm_compact
 	.type utxo_lsm_compact,%function
 utxo_lsm_compact:
+	adrp x9, mac_cr_lo
+	str  xzr, [x9, :lo12:mac_cr_lo]   /* classic full batch: lo = 0, k = 0 */
+	adrp x9, mac_cr_k
+	str  xzr, [x9, :lo12:mac_cr_k]
+	/* fall through -- .cc_entry shares the body with utxo_lsm_compact_range,
+	 * which parks (lo, k) in mac_cr_lo/mac_cr_k instead of zeroing them */
+.cc_entry:
 	stp  x29,x30,[sp,#-16]!
 	mov  x29, sp
 	stp  x19,x20,[sp,#-16]!
@@ -2590,16 +2920,46 @@ utxo_lsm_compact:
 	cmp  x9, #2
 	b.lo .cc_noop
 	str  x9, [x28, #0x00]           /* original manifest_n */
-	mov  x21, #COMPACT_MAX_RUNS     /* 64 */
-	cmp  x9, x21
-	b.ls .cc_bs_ok
-	mov  x9, x21
-.cc_bs_ok:
-	mov  x21, x9                    /* batch_size */
+	str  xzr, [x28, #MAC_CR_LO]        /* lo: first manifest index of the batch */
+	str  xzr, [x28, #MAC_KEEP_DELS]    /* keep_dels: runs below the batch */
+	adrp x10, mac_cr_k
+	ldr  x10, [x10, :lo12:mac_cr_k]
+	cbz  x10, .cc_bs_default
+	/* explicit range: 2 <= k <= COMPACT_MAX_RUNS, inside the manifest, and
+	 * anchored at the oldest run (lo == 0) or ending at the newest (lo+k == n).
+	 * A merge in the middle would put a fresh-gen run below older survivors
+	 * and break the manifest's gen-ascending order that get() relies on. */
+	cmp  x10, #2
+	b.lo .cc_noop
+	mov  x11, #COMPACT_MAX_RUNS
+	cmp  x10, x11
+	b.hi .cc_noop
+	adrp x12, mac_cr_lo
+	ldr  x12, [x12, :lo12:mac_cr_lo]
+	add  x13, x12, x10              /* lo + k */
+	cmp  x13, x9
+	b.hi .cc_noop
+	cbz  x12, .cc_bs_range_ok       /* lo == 0: classic base merge */
+	cmp  x13, x9
+	b.ne .cc_noop                   /* lo > 0 must end at the newest run */
+	mov  x14, #1
+	str  x14, [x28, #MAC_KEEP_DELS] /* runs below the batch: tombstones survive */
+.cc_bs_range_ok:
+	str  x12, [x28, #MAC_CR_LO]     /* lo */
+	mov  x21, x10                   /* batch_size = k (stable for the whole fn) */
+	b    .cc_bs_have
+.cc_bs_default:
+	mov  x11, #COMPACT_MAX_RUNS
+	cmp  x9, x11
+	b.ls 1f
+	mov  x9, x11
+1:
+	mov  x21, x9                    /* batch_size = min(manifest_n, 64) */
+.cc_bs_have:
 	/* mmap COMPACT_SCRATCH_BYTES */
 	mov  x0, #0
-	movz x1, #0x1a00
-	movk x1, #0x0080, lsl #16       /* 0x801A00 */
+	movz x1, #(COMPACT_SCRATCH_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SCRATCH_BYTES >> 16), lsl #16
 	mov  x2, #3
 	mov  x3, #0x22
 	mov  x4, #-1
@@ -2616,8 +2976,11 @@ utxo_lsm_compact:
 .cc_open_loop:
 	cmp  x25, x21
 	b.hs .cc_open_done
-	mov  x10, #16
-	mul  x10, x25, x10
+	/* manifest entry lo+i -> gen, run_no */
+	ldr  x10, [x28, #MAC_CR_LO]     /* lo */
+	add  x10, x10, x25              /* lo + i */
+	mov  x13, #16
+	mul  x10, x10, x13
 	ldr  x11, [x19, #104]           /* manifest_buf */
 	add  x11, x11, x10
 	ldr  x9, [x11]                  /* gen */
@@ -2626,8 +2989,8 @@ utxo_lsm_compact:
 	str  x9, [x28, #0x70]
 	/* slot base = scratch + i*COMPACT_SLOT_SIZE */
 	mov  x11, x25
-	movz x12, #0x0068
-	movk x12, #0x0001, lsl #16
+	movz x12, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x12, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x11, x11, x12
 	add  x26, x11, x20              /* slot base (callee-saved) */
 	ldr  x9, [x28, #0x68]
@@ -2706,8 +3069,8 @@ utxo_lsm_compact:
 	sub  x10, x10, #1
 	str  x10, [x28, #0x20]           /* bits_mask */
 	/* zero bloom region at scratch + COMPACT_SLOTS_BYTES */
-	movz x9, #0x1a00
-	movk x9, #0x0040, lsl #16        /* COMPACT_SLOTS_BYTES */
+	movz x9, #(COMPACT_SLOTS_BYTES & 0xFFFF)
+	movk x9, #(COMPACT_SLOTS_BYTES >> 16), lsl #16
 	add  x12, x20, x9                /* bloom base */
 	ldr  x11, [x28, #0x18]
 	mov  x9, #0
@@ -2778,14 +3141,15 @@ utxo_lsm_compact:
 	cbnz x0, .cc_err_close
 	/* write placeholder bloom */
 	mov  x0, x22
-	movz x1, #0x1a00
-	movk x1, #0x0040, lsl #16        /* +COMPACT_SLOTS_BYTES */
+	movz x1, #(COMPACT_SLOTS_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SLOTS_BYTES >> 16), lsl #16
 	add  x1, x20, x1
 	ldr  x2, [x28, #0x18]
 	bl   mac_write_exact
 	cbnz x0, .cc_err_close
 	str  xzr, [x28, #0x38]           /* true_nrec = 0 */
-	str  xzr, [x28, #0x230]          /* live = 0 (PUSH winners only) */
+	mov  x0, x22
+	bl   mac_out_begin               /* per-record writes below are buffered */
 	/* ================= streaming k-way merge ================= */
 .cc_merge_loop:
 	mov  x9, #-1
@@ -2795,8 +3159,8 @@ utxo_lsm_compact:
 	cmp  x25, x21
 	b.hs .cc_find_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x26, x9, x20                /* this slot (callee-saved) */
 	ldr  x10, [x26, #32]
@@ -2806,8 +3170,8 @@ utxo_lsm_compact:
 	cmp  x10, x11
 	b.eq .cc_find_setbest
 	ldr  x10, [x28, #0x58]
-	movz x11, #0x0068
-	movk x11, #0x0001, lsl #16
+	movz x11, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x11, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x10, x10, x11
 	add  x27, x10, x20                /* best slot (callee-saved) */
 	add  x0, x26, #40
@@ -2831,28 +3195,37 @@ utxo_lsm_compact:
 	mov  x10, #-1
 	cmp  x9, x10
 	b.eq .cc_merge_done
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x27, x9, x20                 /* winning slot */
 	add  x0, x28, #0x80
 	add  x1, x27, #40
 	mov  x2, #36
-	bl   mac_memcpy                   /* snapshot winning key */
+	bl   mac_bmemcpy                   /* snapshot winning key */
 	ldrb w9, [x27, #76]              /* type */
+	/* emit the winner: a PUSH always; a DEL only when older runs exist below
+	 * the batch (keep_dels), where it still cancels their puts. A batch
+	 * anchored at the oldest run has nothing below it, so DEL is dropped. */
 	cmp  w9, #1
+	b.eq 1f
+	ldr  x10, [x28, #MAC_KEEP_DELS] /* keep_dels */
+	cbz  x10, .cc_wr_skip
+	cmp  w9, #2                     /* DEL */
 	b.ne .cc_wr_skip
+1:
 	/* sparse sampling by true_nrec */
 	ldr  x9, [x28, #0x38]
 	tst  x9, #(SPARSE_STRIDE-1)
 	b.ne .cc_sp_nosample
-	mov  x0, x22
-	mov  x1, #0
-	mov  x2, #1
-	mov  x8, #SYS_lseek
-	svc  #0
+	/* The offset MUST come through the buffered writer: lseek(SEEK_CUR) here
+	 * reports what has reached the file, which with a write buffer lags the
+	 * records already emitted by up to a megabyte -- every sparse entry would
+	 * point up to 1 MB too early (found on main by byte-comparing old vs new
+	 * output, 35,675 differing bytes, all in the sparse index). */
+	bl   mac_out_tell                 /* = file position + bytes buffered */
 	tbnz x0, #63, .cc_err_close
-	mov  x26, x0                      /* file offset */
+	mov  x26, x0                      /* this record's file offset */
 	/* dest = sparse_base + sparse_n*44 */
 	ldr  x9, [x28, #0x40]
 	mov  x10, #44
@@ -2860,46 +3233,42 @@ utxo_lsm_compact:
 	add  x0, x23, x10
 	add  x1, x27, #40
 	mov  x2, #36
-	bl   mac_memcpy
+	bl   mac_bmemcpy
 	str  x26, [x0, #36]              /* file_offset */
 	ldr  x9, [x28, #0x40]
 	add  x9, x9, #1
 	str  x9, [x28, #0x40]            /* sparse_n++ */
 .cc_sp_nosample:
 	/* write key+type (37 bytes) */
-	mov  x0, x22
-	add  x1, x27, #40
-	mov  x2, #37
-	bl   mac_write_exact
+	add  x0, x27, #40
+	mov  x1, #37
+	bl   mac_out_write
 	cbnz x0, .cc_err_close
-	/* write value(8)+slen(2)+height(4)+cb(1) = 15 bytes */
-	mov  x0, x22
-	add  x1, x27, #80
-	mov  x2, #15
-	bl   mac_write_exact
+	ldrb w9, [x27, #76]              /* type (re-loaded: w9 was clobbered above) */
+	cmp  w9, #1
+	b.ne .cc_wr_bloom                /* DEL: key+type only, exactly as mac_flush writes it */
+	/* value(8)+slen(2)+height(4)+is_coinbase(1) = 15 contiguous bytes, same
+	 * order as the on-disk PUSH record (height/is_coinbase are 0 for records
+	 * from old-shape input runs -- read_rec zeroed them at read time) */
+	add  x0, x27, #80
+	mov  x1, #15
+	bl   mac_out_write
 	cbnz x0, .cc_err_close
 	ldrh w9, [x27, #88]              /* slen */
 	cbz  w9, .cc_wr_bloom
-	mov  x0, x22
-	add  x1, x27, #104
-	uxtw x2, w9
-	bl   mac_write_exact
+	add  x0, x27, #104
+	uxtw x1, w9
+	bl   mac_out_write
 	cbnz x0, .cc_err_close
 .cc_wr_bloom:
-	/* live counter: count PUSH winners only (DEL records, type==1 at +76, are
-	 * tombstones and must NOT inflate total_live for the merged run) */
-	ldrb w9, [x27, #76]
-	cmp  w9, #1
-	b.eq .cc_wr_live_del
-	ldr  x9, [x28, #0x230]
-	add  x9, x9, #1
-	str  x9, [x28, #0x230]           /* live++ (live PUSH winner) */
-.cc_wr_live_del:
+	/* (no separate live counter: a full merge emits only PUSHes, so the
+	 * true_nrec persisted for one IS the runs-only live count; DELs are only
+	 * emitted under keep_dels, where persist_count comes from P_old instead) */
 	/* set 3 bloom bits */
 	mov  x0, x27
 	add  x0, x0, #40                 /* key ptr */
-	movz x1, #0x1a00
-	movk x1, #0x0040, lsl #16
+	movz x1, #(COMPACT_SLOTS_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SLOTS_BYTES >> 16), lsl #16
 	add  x2, x20, x1                 /* bloom base */
 	ldr  w3, [x28, #0x20]            /* bits_mask */
 	mov  w4, #0x9dc5
@@ -2908,8 +3277,8 @@ utxo_lsm_compact:
 	bl   mac_bloom_setbit
 	mov  x0, x27
 	add  x0, x0, #40
-	movz x1, #0x1a00
-	movk x1, #0x0040, lsl #16
+	movz x1, #(COMPACT_SLOTS_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SLOTS_BYTES >> 16), lsl #16
 	add  x2, x20, x1
 	ldr  w3, [x28, #0x20]
 	mov  w4, #0xc3d4
@@ -2918,8 +3287,8 @@ utxo_lsm_compact:
 	bl   mac_bloom_setbit
 	mov  x0, x27
 	add  x0, x0, #40
-	movz x1, #0x1a00
-	movk x1, #0x0040, lsl #16
+	movz x1, #(COMPACT_SLOTS_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SLOTS_BYTES >> 16), lsl #16
 	add  x2, x20, x1
 	ldr  w3, [x28, #0x20]
 	mov  w4, #0xe995
@@ -2936,8 +3305,8 @@ utxo_lsm_compact:
 	cmp  x25, x21
 	b.hs .cc_adv_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x26, x9, x20                /* this slot (callee-saved) */
 	ldr  x10, [x26, #32]
@@ -2962,6 +3331,8 @@ utxo_lsm_compact:
 .cc_adv_done:
 	b    .cc_merge_loop
 .cc_merge_done:
+	bl   mac_out_flush               /* every buffered record hits the file */
+	cbnz x0, .cc_err_close           /* BEFORE the header is patched */
 	/* ---- patch bloom (offset 44) and nrec (offset 12) ---- */
 	mov  x0, x22
 	mov  x1, #44
@@ -2970,8 +3341,8 @@ utxo_lsm_compact:
 	svc  #0
 	tbnz x0, #63, .cc_err_close
 	mov  x0, x22
-	movz x1, #0x1a00
-	movk x1, #0x0040, lsl #16
+	movz x1, #(COMPACT_SLOTS_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SLOTS_BYTES >> 16), lsl #16
 	add  x1, x20, x1
 	ldr  x2, [x28, #0x18]
 	bl   mac_write_exact
@@ -2982,10 +3353,17 @@ utxo_lsm_compact:
 	mov  x8, #SYS_lseek
 	svc  #0
 	tbnz x0, #63, .cc_err_close
-	ldr  x9, [x28, #0x38]
-	str  x9, [x28, #0xc0]            /* patch nrec (full 64-bit qword at 8-aligned +0xc0) */
+	ldr  x9, [x28, #0x38]            /* true_nrec */
+	str  x9, [x28, #0xcc]             /* patch nrec: the on-disk header is
+	                                   * magic(4) gen(8) nrec(8), so nrec sits
+	                                   * at +12 (staged at 0xc0+12=0xcc) --
+	                                   * writing 8 bytes from 0xc0+8 would have
+	                                   * re-written gen's high dword as zero
+	                                   * plus nrec's low dword (observed:
+	                                   * nrec field read back as
+	                                   * 0x2433555255 = MAGIC_RUN3<<32 | 0x24). */
 	mov  x0, x22
-	add  x1, x28, #0xc0
+	add  x1, x28, #0xcc
 	mov  x2, #8
 	bl   mac_write_exact
 	cbnz x0, .cc_err_close
@@ -3027,14 +3405,17 @@ utxo_lsm_compact:
 	mov  x0, x22
 	mov  x8, #SYS_close
 	svc  #0
-	/* ---- manifest: merged entry at index 0, shift survivors ---- */
+	/* ---- manifest: merged entry at index lo, shift survivors ---- */
 	ldr  x11, [x19, #104]            /* manifest_buf */
+	ldr  x13, [x28, #MAC_CR_LO]     /* lo */
+	lsl  x12, x13, #4
+	add  x11, x11, x12               /* entry = buf + lo*16 */
 	ldr  x9, [x28, #0x28]
 	str  x9, [x11]                    /* gen */
 	ldr  x9, [x28, #0x30]
 	str  x9, [x11, #8]               /* run_no */
-	mov  x25, x21                     /* src = batch_size */
-	mov  x26, #1                      /* dst = 1 */
+	add  x25, x21, x13               /* src = lo + batch_size */
+	add  x26, x13, #1                /* dst = lo + 1 (lo is the merged entry) */
 	ldr  x27, [x19, #120]             /* manifest_n */
 .cc_shift_loop:
 	cmp  x25, x27
@@ -3098,8 +3479,10 @@ utxo_lsm_compact:
 	ldr  x10, [x28, #0x00]
 	cmp  x9, x10
 	b.ne .cc_pl_partial
-	/* full merge: persist_count = live (PUSH winners), not raw nrec */
-	ldr  x9, [x28, #0x230]
+	/* full merge: persist_count = true_nrec -- a full merge emits only PUSHes
+	 * (keep_dels == 0), so the emitted-record count IS the exact runs-only
+	 * live count, authoritative and independent of any prior drift */
+	ldr  x9, [x28, #0x38]
 	str  x9, [x28, #0x218]            /* persist_count */
 	mov  x9, #1
 	str  x9, [x28, #0x220]            /* write_v2 = 1 */
@@ -3108,7 +3491,7 @@ utxo_lsm_compact:
 	ldr  x9, [x19, #88]
 	ldr  x10, [x28, #0x210]           /* P_old */
 	sub  x9, x9, x10
-	ldr  x10, [x28, #0x230]           /* live */
+	ldr  x10, [x28, #0x38]            /* true_nrec */
 	add  x9, x9, x10
 	str  x9, [x19, #88]
 	b    .cc_pl_have
@@ -3123,9 +3506,16 @@ utxo_lsm_compact:
 .cc_pl_v1:
 	str  xzr, [x28, #0x220]           /* write_v1 */
 .cc_pl_have:
-	/* ---- publish manifest ---- */
-	mov  x0, #AT_FDCWD
+	/* ---- publish manifest: tmp file + fsync + rename + dir fsync ----
+	 * (deferred publish: same bytes to utxo_manifest.child, then stop before
+	 * the rename -- see mac_compact_defer_publish) */
 	adr  x1, manifest_tmp_name
+	adrp x9, mac_compact_defer_publish
+	ldr  x9, [x9, :lo12:mac_compact_defer_publish]
+	cbz  x9, 1f
+	adr  x1, manifest_child_name
+1:
+	mov  x0, #AT_FDCWD
 	mov  x2, #(O_WRONLY|O_CREAT|O_TRUNC)
 	mov  x3, #0644
 	mov  x8, #SYS_openat
@@ -3166,6 +3556,9 @@ utxo_lsm_compact:
 	mov  x0, x24
 	mov  x8, #SYS_close
 	svc  #0
+	adrp x9, mac_compact_defer_publish
+	ldr  x9, [x9, :lo12:mac_compact_defer_publish]
+	cbnz x9, .cc_dirsync_skip        /* deferred: the parent publishes */
 	mov  x0, #AT_FDCWD
 	adr  x1, manifest_tmp_name
 	mov  x2, #AT_FDCWD
@@ -3197,11 +3590,14 @@ utxo_lsm_compact:
 	cmp  x25, x21
 	b.hs .cc_unlink_done
 	mov  x9, x25
-	movz x10, #0x0068
-	movk x10, #0x0001, lsl #16
+	movz x10, #(COMPACT_SLOT_SIZE & 0xFFFF)
+	movk x10, #(COMPACT_SLOT_SIZE >> 16), lsl #16
 	mul  x9, x9, x10
 	add  x9, x9, x20
 	ldr  x0, [x9]
+	adrp x10, mac_compact_defer_unlink
+	ldr  x10, [x10, :lo12:mac_compact_defer_unlink]
+	cbnz x10, .cc_unlink_next        /* deferred: the adopting parent unlinks */
 	mov  x8, #SYS_close
 	svc  #0
 	ldr  w1, [x9, #16]               /* run_no */
@@ -3212,13 +3608,14 @@ utxo_lsm_compact:
 	mov  x2, #0
 	mov  x8, #SYS_unlinkat
 	svc  #0
+.cc_unlink_next:
 	add  x25, x25, #1
 	b    .cc_unlink_loop
 .cc_unlink_done:
 	/* munmap scratch + sparse scratch */
 	mov  x0, x20
-	movz x1, #0x1a00
-	movk x1, #0x0080, lsl #16        /* COMPACT_SCRATCH_BYTES */
+	movz x1, #(COMPACT_SCRATCH_BYTES & 0xFFFF)
+	movk x1, #(COMPACT_SCRATCH_BYTES >> 16), lsl #16
 	mov  x8, #SYS_munmap
 	svc  #0
 	mov  x0, x23
@@ -3261,6 +3658,8 @@ manifest_name:
 	.asciz "utxo_manifest.dat"
 manifest_tmp_name:
 	.asciz "utxo_manifest.tmp"
+manifest_child_name:
+	.asciz "utxo_manifest.child"
 dot_name:
 	.asciz "."
 wal_name:
@@ -3283,6 +3682,21 @@ g_utxo_prog_total: .zero 8
 	.globl g_utxo_defer_recount
 	.type  g_utxo_defer_recount, @object
 g_utxo_defer_recount: .byte 0
+	/* background compaction (2026-08-31, ported from main): defer flags for
+	 * utxo_lsm_compact, the flush hook, compact_range's parked args, and the
+	 * 1 MB buffered output writer -- see the comment block above
+	 * utxo_lsm_set_defer_unlink. */
+	.balign 8
+mac_compact_defer_unlink: .zero 8
+mac_compact_defer_publish: .zero 8
+mac_flush_hook:            .zero 8
+mac_cr_lo:                 .zero 8
+mac_cr_k:                  .zero 8
+mac_ow_fd:                 .zero 8
+mac_ow_fill:               .zero 8
+	.balign 64
+MAC_OWBUF = 1048576
+mac_ow_buf:  .zero MAC_OWBUF
 	.text
 	.balign 4
 	.globl g_utxo_prog_bump
