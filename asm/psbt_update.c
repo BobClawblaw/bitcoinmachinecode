@@ -80,7 +80,7 @@ static int add_kv(kv_t* kv, int* n, const u8* k, unsigned long kl, const u8* v, 
 }
 /* the unsigned tx: input outpoints and output scripts */
 typedef struct { const u8* op; } tin_t;
-typedef struct { const u8* spk; unsigned long len; } tout_t;
+typedef struct { const u8* spk; unsigned long len; const u8* value; } tout_t;
 static int walk_tx(const u8* tx, unsigned long len, tin_t* ins, int icap, int* nin, tout_t* outs, int ocap, int* nout){
     if (len < 10) return 0;
     unsigned long p = 4, cc;
@@ -88,19 +88,20 @@ static int walk_tx(const u8* tx, unsigned long len, tin_t* ins, int icap, int* n
     unsigned long ni = rd_varint(tx+p, &cc); p += cc; if (ni > (unsigned long)icap) return 0;
     for (unsigned long i = 0; i < ni; i++){ if (p + 36 > len) return 0; ins[i].op = tx+p; p += 36; unsigned long sl = rd_varint(tx+p, &cc); p += cc + sl + 4; if (p > len) return 0; }
     unsigned long no = rd_varint(tx+p, &cc); p += cc; if (no > (unsigned long)ocap) return 0;
-    for (unsigned long i = 0; i < no; i++){ if (p + 9 > len) return 0; p += 8; unsigned long sl = rd_varint(tx+p, &cc); p += cc; outs[i].spk = tx+p; outs[i].len = sl; p += sl; if (p > len) return 0; }
+    for (unsigned long i = 0; i < no; i++){ if (p + 9 > len) return 0; outs[i].value = tx+p; p += 8; unsigned long sl = rd_varint(tx+p, &cc); p += cc; outs[i].spk = tx+p; outs[i].len = sl; p += sl; if (p > len) return 0; }
     *nin = (int)ni; *nout = (int)no; return 1;
 }
 /* the input's scriptPubKey: witness_utxo, else the non-witness parent's output */
-static int input_spk(const kv_t* kv, int n, const u8* op, const u8** spk, unsigned long* spklen){
+static int input_spk(const kv_t* kv, int n, const u8* op, const u8** spk, unsigned long* spklen, const u8** value){
+    *value = NULL;
     const kv_t* wu = find_kv(kv, n, 0x01);
     if (wu && wu->vl >= 9){ unsigned long cc; unsigned long sl = rd_varint(wu->v + 8, &cc); if (8 + cc + sl <= wu->vl){ *spk = wu->v + 8 + cc; *spklen = sl; return 1; } }
     const kv_t* nw = find_kv(kv, n, 0x00);
     if (!nw) return 0;
     unsigned long vout = (unsigned long)op[32] | ((unsigned long)op[33] << 8) | ((unsigned long)op[34] << 16) | ((unsigned long)op[35] << 24);
-    tin_t ti[PU_MAXIO]; tout_t to[PU_MAXIO]; int a, b;
+    static tin_t ti[PU_MAXIO]; static tout_t to[PU_MAXIO]; int a, b;
     if (!walk_tx(nw->v, nw->vl, ti, PU_MAXIO, &a, to, PU_MAXIO, &b) || vout >= (unsigned long)b) return 0;
-    *spk = to[vout].spk; *spklen = to[vout].len; return 1;
+    *spk = to[vout].spk; *spklen = to[vout].len; *value = to[vout].value; return 1;
 }
 /* key origin per Core's KeyOriginInfo: origin fingerprint+path, else the extended key's own
  * fingerprint, else hash160(pub)[0:4]; then the key's derivation path and the range index */
@@ -152,7 +153,9 @@ static int fill(kv_t* kv, int* n, descr_t* d, long idx, int side, int* changed){
         } else if (nl > 0){
             /* taproot_tree: (depth, leaf_ver, script) per leaf in DFS order */
             u8* tree = ar(4200 * 4); if (!tree) return 0; unsigned long o = 0;
-            for (int i = 0; i < nl; i++){ if (o + 2 + 9 + (unsigned long)leaves[i].slen > 4200 * 4) break; tree[o++] = (u8)leaves[i].depth; tree[o++] = (u8)leaves[i].leaf_ver; o += wr_varint(tree + o, (unsigned long long)leaves[i].slen); memcpy(tree + o, leaves[i].script, (size_t)leaves[i].slen); o += leaves[i].slen; }
+            /* Core's TaprootBuilder::GetTreeTuples lists the leaves right-most first (its Combine puts
+             * the newer node's leaves ahead of the older's); the PSBT_OUT_TAP_TREE field must match */
+            for (int i = nl - 1; i >= 0; i--){ if (o + 2 + 9 + (unsigned long)leaves[i].slen > 4200 * 4) break; tree[o++] = (u8)leaves[i].depth; tree[o++] = (u8)leaves[i].leaf_ver; o += wr_varint(tree + o, (unsigned long long)leaves[i].slen); memcpy(tree + o, leaves[i].script, (size_t)leaves[i].slen); o += leaves[i].slen; }
             u8 k3 = 0x06; added += add_kv(kv, n, &k3, 1, tree, o);
         }
         /* tap bip32 derivations: internal key (no leaf hashes) and every leaf key with its leaf hashes */
@@ -213,8 +216,19 @@ long psbt_update_bytes_from_descs(const u8* buf, long blen, pu_desc_t* dv, int n
     static u8 arena[8u << 20]; g_arena = arena; g_arena_n = 0; g_arena_cap = sizeof arena;
     int changed = 0;
     for (int i = 0; i < n_in; i++){
-        const u8* spk; unsigned long sl; if (!input_spk(ikv[i], in_n[i], ins[i].op, &spk, &sl)) continue;
+        const u8* spk; unsigned long sl; const u8* value;
+        if (!input_spk(ikv[i], in_n[i], ins[i].op, &spk, &sl, &value)) continue;
         descr_t* d; long idx; if (!match_desc(dv, nd, spk, sl, &d, &idx)) continue;
+        /* Core's signer step puts a witness_utxo on every witness input it touches
+         * (SignPSBTInput: "If we have a witness signature, put a witness UTXO") */
+        int is_wit = (sl == 22 && spk[0] == 0x00 && spk[1] == 0x14) || (sl == 34 && (spk[0] == 0x00 || spk[0] == 0x51) && spk[1] == 0x20);
+        if (is_wit && value && !find_kv(ikv[i], in_n[i], 0x01) && sl < 200){
+            u8 wu[8 + 9 + 200]; unsigned long o = 0; memcpy(wu, value, 8); o = 8; o += wr_varint(wu + o, sl); memcpy(wu + o, spk, sl); o += sl;
+            u8 k1 = 0x01; if (add_kv(ikv[i], &in_n[i], &k1, 1, wu, o)) changed = 1;
+            /* the spk pointer now aliases the arena copy; re-resolve for fill() */
+            if (!input_spk(ikv[i], in_n[i], ins[i].op, &spk, &sl, &value)) continue;
+            if (!match_desc(dv, nd, spk, sl, &d, &idx)) continue;
+        }
         fill(ikv[i], &in_n[i], d, idx, 0, &changed);
     }
     for (int i = 0; i < n_out; i++){
