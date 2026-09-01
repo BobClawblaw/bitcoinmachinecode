@@ -885,7 +885,7 @@ Missing:
   `utxoupdatepsbt`.~~ — **DONE 2026-08-26**: `walletprocesspsbt` is the PSBT
   Signer role by delegation (`rpc_wallet_ops.c`), and `finalizepsbt` /
   `utxoupdatepsbt` are real (`rpc_commands.c`). `descriptorprocesspsbt`
-  honestly refuses (no descriptor engine). `docs/PARITY_PLAN.md` T8 has the
+  signs from the keys a descriptor carries (descriptor.c, 2026-09-01). `docs/PARITY_PLAN.md` T8 has the
   per-method state.
 - ~~**Descriptor wallets**~~ — **`importdescriptors` is REAL** since the
   wallet-management merge; watch-only descriptors are tracked and rescanned.

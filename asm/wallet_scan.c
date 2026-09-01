@@ -200,6 +200,12 @@ int wscan_spk_h160(const unsigned char* spk, unsigned long len, const unsigned c
         spk[23] == 0x88 && spk[24] == 0xac){ *h = spk + 3; return 1; }              /* P2PKH  */
     if (len == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87){
         *h = spk + 2; return 1; }                                                   /* P2SH   */
+    /* P2WSH / P2TR: a 32-byte program; the key window holds its first 20
+     * bytes (rpc_desc_expand), so imported wsh()/tr() descriptors match by
+     * the same 20-byte compare. A 160-bit prefix collision with a real key
+     * hash is not a real event, and HD-seed wallets never carry one. */
+    if (len == 34 && (spk[0] == 0x00 || spk[0] == 0x51) && spk[1] == 0x20){
+        *h = spk + 2; return 1; }
     return 0;
 }
 

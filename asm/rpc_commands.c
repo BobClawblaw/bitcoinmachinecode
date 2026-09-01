@@ -2441,14 +2441,15 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
  * push-sig push-pub) and refuses others by name. bip32derivs is accepted
  * and ignored: this node adds no derivation metadata (the PSBT remains
  * valid without it; stated rather than silently half-done). */
-int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
-                              long* ec, const char** em, rj_val** result){
-    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
-    int sign = 1, finalize = 1;
-    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL) sign = params->items[1]->str[0]=='1';
-    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
-    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+/* The Signer is pluggable: walletprocesspsbt signs with the wallet's keys,
+ * descriptorprocesspsbt with the private keys the given descriptors carry.
+ * Both go through the same extract / synthesize-prevtxs / sign / splice
+ * path, so the two cannot drift in what they hand back. `fwd` is the
+ * signrawtransaction argument list [hex, prevtxs, sighashtype?]. */
+typedef int (*psbt_signer_fn)(rj_val* fwd, void* ctx, long* ec, const char** em, rj_val** sres);
+static int psbt_process(const char* b64, int sign, const char* sht, int finalize,
+                        psbt_signer_fn signer, void* sctx,
+                        long* ec, const char** em, rj_val** result){
 
     static unsigned char buf[200000]; long blen = 0;
     if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
@@ -2545,7 +2546,7 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     rj_arr_push(fwd, pv);
     if (sht) rj_arr_push(fwd, rj_str(sht));
     rj_val* sres = NULL;
-    int rc = cmd_signrawtransactionwithwallet(fwd, w, ec, em, &sres);
+    int rc = signer(fwd, sctx, ec, em, &sres);
     rj_free(fwd);
     if (!rc) return 0;
     rj_val* shex = rj_obj_get(sres, "hex");
@@ -2635,6 +2636,111 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     rj_free(sres);
     *result = r;
     return 1;
+}
+
+static int wallet_psbt_signer(rj_val* fwd, void* ctx, long* ec, const char** em, rj_val** sres){
+    return cmd_signrawtransactionwithwallet(fwd, (const rpc_wallet*)ctx, ec, em, sres);
+}
+int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
+                              long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    int sign = 1, finalize = 1;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL) sign = params->items[1]->str[0]=='1';
+    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
+    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    return psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, ec, em, result);
+}
+
+/* ==== descriptorprocesspsbt ==============================================
+ * Core's wallet-less Signer: the private keys come from the descriptors
+ * themselves (WIF keys, or xprv-derived at the index whose expansion IS an
+ * input's scriptPubKey). For every prevtx the PSBT supplied, the descriptor
+ * and index that produce its script are found by expansion, that
+ * descriptor's private keys at that index go to signrawtransactionwithkey,
+ * and a sh() descriptor's redeemScript is supplied alongside. Inputs no
+ * descriptor covers stay unsigned and the result reports complete=false,
+ * as Core does. The script forms that can be signed are the raw signer's:
+ * P2PKH, P2WPKH, P2SH-P2WPKH. */
+#include "descriptor.h"
+typedef struct { descr_t* d; long lo, hi; } dpp_desc_t;
+typedef struct { dpp_desc_t* v; int n; } dpp_ctx_t;
+static void dpp_wif(char* out, const unsigned char priv[32], int compressed){
+    unsigned char pay[34]; pay[0] = 0x80; memcpy(pay+1, priv, 32); pay[33] = 1;   /* the raw signer reads the 0x80 form on every chain */
+    base58check_encode(out, pay, compressed ? 34 : 33);
+}
+static int dpp_signer(rj_val* fwd, void* vctx, long* ec, const char** em, rj_val** sres){
+    dpp_ctx_t* c = (dpp_ctx_t*)vctx;
+    rj_val* keys = rj_arr();
+    rj_val* pv = (fwd->nitems >= 2 && fwd->items[1]->typ == RJ_ARR) ? rj_clone(fwd->items[1]) : rj_arr();
+    int nkeys = 0;
+    for (unsigned long i = 0; i < pv->nitems; i++){
+        rj_val* e = pv->items[i]; rj_val* sh = rj_obj_get(e, "scriptPubKey");
+        if (!sh || sh->typ != RJ_STR) continue;
+        unsigned char spk[128]; size_t shl = strlen(sh->str);
+        if ((shl & 1) || shl/2 > sizeof spk || !hex_to_bytes(spk, sh->str, shl)) continue;
+        int done = 0;
+        for (int di = 0; di < c->n && !done; di++){
+            descr_t* d = c->v[di].d;
+            for (long idx = c->v[di].lo; idx <= c->v[di].hi && !done; idx++){
+                descr_spk_t sp[4]; int n = descr_expand(d, idx, sp, 4);
+                for (int q = 0; q < n && !done; q++){
+                    if (sp[q].len != (int)(shl/2) || memcmp(sp[q].spk, spk, (size_t)sp[q].len)) continue;
+                    done = 1;
+                    for (int k = 0; k < d->nk && nkeys < 64; k++){
+                        unsigned char priv[32]; int comp = 1;
+                        if (!descr_key_priv_at(d, k, idx, priv, &comp)) continue;
+                        char wif[64]; dpp_wif(wif, priv, comp); rj_arr_push(keys, rj_str(wif)); nkeys++;
+                    }
+                    unsigned char inner[1400]; int which = 0;
+                    int il = descr_inner_script_at(d, idx, inner, (int)sizeof inner, &which);
+                    if (il > 0 && which == 1 && !rj_obj_get(e, "redeemScript")){
+                        char* h = malloc((size_t)il * 2 + 1);
+                        if (h){ bin_to_hex(h, inner, (size_t)il); rj_obj_set(e, "redeemScript", rj_str(h)); free(h); }
+                    }
+                }
+            }
+        }
+    }
+    rj_val* f2 = rj_arr();
+    rj_arr_push(f2, rj_str(fwd->items[0]->str));
+    rj_arr_push(f2, keys);
+    rj_arr_push(f2, pv);
+    if (fwd->nitems >= 3 && fwd->items[2]->typ == RJ_STR) rj_arr_push(f2, rj_str(fwd->items[2]->str));
+    int rc = cmd_signrawtransactionwithkey(f2, ec, em, sres);
+    rj_free(f2);
+    return rc;
+}
+#define DPP_MAX_DESCS 16
+int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    if (params->nitems < 2 || params->items[1]->typ != RJ_ARR){ *ec = -8; *em = "descriptors must be an array of descriptor strings or {desc,range} objects"; return 0; }
+    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
+    int finalize = 1;
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
+    const rj_val* da = params->items[1];
+    static descr_t descs[DPP_MAX_DESCS]; static dpp_desc_t dv[DPP_MAX_DESCS]; int nd = 0;
+    static char perr[300];
+    if (da->nitems > DPP_MAX_DESCS){ *ec = -8; *em = "Too many descriptors"; return 0; }
+    for (unsigned long i = 0; i < da->nitems; i++){
+        const rj_val* o = da->items[i]; const char* ds = NULL; long lo = 0, hi = 1000;
+        if (o->typ == RJ_STR) ds = o->str;
+        else if (o->typ == RJ_OBJ){
+            rj_val* dv0 = rj_obj_get(o, "desc"); if (dv0 && dv0->typ == RJ_STR) ds = dv0->str;
+            rj_val* rv = rj_obj_get(o, "range");
+            if (rv && rv->typ == RJ_NUM) hi = strtol(rv->str, NULL, 10);
+            else if (rv && rv->typ == RJ_ARR && rv->nitems == 2 && rv->items[0]->typ == RJ_NUM && rv->items[1]->typ == RJ_NUM){
+                lo = strtol(rv->items[0]->str, NULL, 10); hi = strtol(rv->items[1]->str, NULL, 10); }
+        }
+        if (!ds){ *ec = -8; *em = "Descriptor needs to be provided in scan object"; return 0; }
+        char e[256];
+        if (!descr_parse(ds, &descs[nd], e, sizeof e)){ snprintf(perr, sizeof perr, "%s", e); *ec = -5; *em = perr; return 0; }
+        if (!descs[nd].ranged){ lo = 0; hi = 0; }
+        if (lo < 0 || hi < lo || hi - lo > 100000){ *ec = -8; *em = "Invalid range"; return 0; }
+        dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
+    }
+    dpp_ctx_t ctx = { dv, nd };
+    return psbt_process(b64, 1, sht, finalize, dpp_signer, &ctx, ec, em, result);
 }
 
 /* The wallet/util subset rpc_commands.c dispatches itself. At file scope
@@ -2930,15 +3036,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_finalizepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "utxoupdatepsbt"))
         return cmd_utxoupdatepsbt(params, err_code, err_msg, result);
-    if (!strcmp(method, "descriptorprocesspsbt")){
-        *err_code = -1;
-        *err_msg = "this node cannot sign from descriptors: the descriptor engine "
-                   "derives addresses and scripts (deriveaddresses/getdescriptorinfo) "
-                   "but has no path from a descriptor to a spending key, so there is "
-                   "nothing to sign a PSBT with. Use signrawtransactionwithwallet on "
-                   "the extracted transaction";
-        return 0;
-    }
+    if (!strcmp(method, "descriptorprocesspsbt"))
+        return rpc_cmd_descriptorprocesspsbt(params, err_code, err_msg, result);
     /* the rest of Core's Wallet category (rpc_wallet_ops.c) -- labels, wallet
      * inventory, output locks, message signing, descriptor reporting, and the
      * lifecycle methods a single-seed wallet cannot honour. */
