@@ -1544,6 +1544,106 @@ static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* le
     return 0;
 }
 
+
+/* ---- txo-spender index reader (Core's -txospenderindex; 2026-09-01) -------
+ * Base file + unsorted tail, exactly the txid index's shape (see
+ * daemon/txosp_format.h). Every candidate is VERIFIED against the archive:
+ * the spending transaction is read at the recorded location and must carry
+ * the FULL outpoint among its inputs. */
+#include "daemon/txosp_format.h"
+static const u8* g_tsp; static u64 g_tsp_n, g_tsp_sparse_off, g_tsp_nsparse; static long g_tsp_to = -1;
+static const u8* g_tsp_tail; static u64 g_tsp_tail_sz; static long g_tsp_tail_maxh = -1;
+static void tsp_open(void){
+    if (g_tsp) return;
+    int fd = open(TSP_BASE_FILE, O_RDONLY); if (fd < 0) return;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size < TSP_HDR){ close(fd); return; }
+    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
+    if (m == MAP_FAILED) return;
+    const u8* b = m;
+    if (memcmp(b, TSP_MAGIC, 8)){ munmap(m, (size_t)sb.st_size); return; }
+    u64 n = 0, so = 0, ns = 0; u32 t = 0;
+    for (int i = 0; i < 8; i++) n  |= (u64)b[8+i]  << (8*i);
+    for (int i = 0; i < 8; i++) so |= (u64)b[16+i] << (8*i);
+    for (int i = 0; i < 8; i++) ns |= (u64)b[24+i] << (8*i);
+    for (int i = 0; i < 4; i++) t  |= (u32)b[36+i] << (8*i);
+    if (so + ns * TSP_SPARSE > (u64)sb.st_size || TSP_HDR + n * TSP_REC != so){ munmap(m, (size_t)sb.st_size); return; }
+    g_tsp = b; g_tsp_n = n; g_tsp_sparse_off = so; g_tsp_nsparse = ns; g_tsp_to = (long)t;
+    fprintf(stderr, "[txospender] %llu records, to height %ld\n", (unsigned long long)n, g_tsp_to);
+}
+static void tsp_tail_refresh(void){
+    struct stat sb;
+    if (stat(TSP_TAIL_FILE, &sb) != 0 || (u64)sb.st_size < TSP_REC){ if (g_tsp_tail){ munmap((void*)g_tsp_tail, (size_t)g_tsp_tail_sz); g_tsp_tail = NULL; g_tsp_tail_sz = 0; } return; }
+    u64 sz = (u64)sb.st_size - (u64)sb.st_size % TSP_REC;
+    if (g_tsp_tail && sz == g_tsp_tail_sz) return;
+    if (g_tsp_tail){ munmap((void*)g_tsp_tail, (size_t)g_tsp_tail_sz); g_tsp_tail = NULL; g_tsp_tail_sz = 0; }
+    int fd = open(TSP_TAIL_FILE, O_RDONLY); if (fd < 0) return;
+    void* m = mmap(NULL, (size_t)sz, PROT_READ, MAP_SHARED, fd, 0); close(fd);
+    if (m == MAP_FAILED) return;
+    g_tsp_tail = m; g_tsp_tail_sz = sz; g_tsp_tail_maxh = -1;
+    for (u64 o = 0; o + TSP_REC <= sz; o += TSP_REC){ tsp_rec r; tsp_unpack(&r, g_tsp_tail + o); if ((long)r.height > g_tsp_tail_maxh) g_tsp_tail_maxh = (long)r.height; }
+}
+/* verify: the tx at (height, off, len) spends (txid_wire, vout); on success
+ * fills the spender's txid, height, and optionally copies the tx bytes */
+static int tsp_verify_rec(const u8* r, const u8 txid_wire[32], u32 vout, u8 spender[32], long* h_out, u8* txout, long txcap, long* txlen_out){
+    static u8 scratch[4u << 20];
+    tsp_rec rec; tsp_unpack(&rec, r);
+    if (rec.vout != vout) return 0;
+    long blen = read_block((long)rec.height);
+    if (blen < 81 || (u64)rec.offset + rec.len > (u64)blen || rec.len < 10) return 0;
+    const u8* tx = g_blockbuf + rec.offset; const u8* end = tx + rec.len;
+    const u8* q = tx + 4; if (q + 2 <= end && q[0] == 0 && q[1] == 1) q += 2;
+    u64 cc, nin = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc;
+    int hit = 0;
+    for (u64 i = 0; i < nin && q + 36 <= end; i++){
+        u32 vo = (u32)q[32] | ((u32)q[33] << 8) | ((u32)q[34] << 16) | ((u32)q[35] << 24);
+        if (vo == vout && !memcmp(q, txid_wire, 32)){ hit = 1; break; }
+        q += 36; u64 sl = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc + sl + 4;
+    }
+    if (!hit) return 0;
+    if (tx_txid(spender, tx, rec.len, scratch, sizeof scratch) != 1) return 0;
+    *h_out = (long)rec.height;
+    if (txout && txlen_out){ if ((long)rec.len <= txcap){ memcpy(txout, tx, rec.len); *txlen_out = (long)rec.len; } else *txlen_out = -1; }
+    return 1;
+}
+int rpc_chain_txospender_available(void){ tsp_open(); return g_tsp != NULL; }
+/* 1 = spent by `spender` (wire txid) in block `height` whose hash is filled;
+ * 0 = no confirmed spend known (unspent, or beyond the index's coverage). */
+int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
+                                long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out){
+    (void)refresh();                                   /* the tail may name blocks newer than our cached tip */
+    tsp_open();
+    if (g_tsp && g_tsp_n){
+        const u8* recs = g_tsp + TSP_HDR; const u8* sp = g_tsp + g_tsp_sparse_off;
+        u64 lo = 0, hi = g_tsp_nsparse ? g_tsp_nsparse - 1 : 0, start = 0;
+        while (g_tsp_nsparse && lo <= hi){
+            u64 mid = lo + (hi - lo) / 2; const u8* e = sp + mid * TSP_SPARSE;
+            u32 ev = (u32)e[12] | ((u32)e[13] << 8) | ((u32)e[14] << 16) | ((u32)e[15] << 24);
+            int c = tsp_key_cmp(e, ev, txid_wire, vout);
+            if (c <= 0){ u64 off = 0; for (int i = 0; i < 8; i++) off |= (u64)e[16+i] << (8*i); start = (off - TSP_HDR) / TSP_REC; lo = mid + 1; }
+            else { if (mid == 0) break; hi = mid - 1; }
+        }
+        for (u64 i = start; i < g_tsp_n; i++){
+            const u8* r = recs + i * TSP_REC;
+            u32 rv = (u32)r[12] | ((u32)r[13] << 8) | ((u32)r[14] << 16) | ((u32)r[15] << 24);
+            int c = tsp_key_cmp(r, rv, txid_wire, vout);
+            if (c < 0) continue;
+            if (c > 0) break;
+            if (tsp_verify_rec(r, txid_wire, vout, spender_wire, height_out, txout, txcap, txlen_out)){
+                u8 rec[48]; if (read_idx_rec(*height_out, rec)) memcpy(blockhash_wire, rec, 32); else memset(blockhash_wire, 0, 32);
+                return 1; }
+        }
+    }
+    tsp_tail_refresh();
+    for (u64 o = 0; g_tsp_tail && o + TSP_REC <= g_tsp_tail_sz; o += TSP_REC){
+        const u8* r = g_tsp_tail + o;
+        if (memcmp(r, txid_wire, 12)) continue;
+        if (tsp_verify_rec(r, txid_wire, vout, spender_wire, height_out, txout, txcap, txlen_out)){
+            u8 rec[48]; if (read_idx_rec(*height_out, rec)) memcpy(blockhash_wire, rec, 32); else memset(blockhash_wire, 0, 32);
+            return 1; }
+    }
+    return 0;
+}
+
 static const char GENESIS_CB_TXID[] = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
 static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
@@ -3571,6 +3671,16 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
         rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txindex", e);
+    }
+    tsp_open();
+    if (g_tsp && (!want || !strcmp(want, "txospenderindex"))){
+        rj_val* e = rj_obj();
+        long tip = refresh();
+        tsp_tail_refresh();
+        long cov_to = g_tsp_tail_maxh > g_tsp_to ? g_tsp_tail_maxh : g_tsp_to;
+        rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
+        rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
+        rj_obj_set(o, "txospenderindex", e);
     }
     { extern long bfi_probe_count(void);
       long bn = bfi_probe_count();

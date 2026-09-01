@@ -919,6 +919,11 @@ static int gtsp_spends(const unsigned char* tx, unsigned long len,
     return 0;
 }
 
+/* the txo-spender index lives in rpc_chain.c; weak so the mempool-only test
+ * binaries that do not link the chain side still build (then: unavailable) */
+extern int rpc_chain_txospender_available(void) __attribute__((weak));
+extern int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
+                                       long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out) __attribute__((weak));
 static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                                     long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
@@ -927,6 +932,17 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     const rj_val* list = params->items[0];
     if (list->nitems == 0){
         *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
+    /* options (Core): mempool_only defaults to "true if txospenderindex
+     * unavailable, otherwise false"; return_spending_tx defaults to false */
+    int index_ok = (rpc_chain_txospender_available && rpc_chain_txospender_available()) ? 1 : 0;
+    int mempool_only = !index_ok, return_tx = 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_OBJ){
+        const rj_val* o = params->items[1];
+        rj_val* mo = rj_obj_get((rj_val*)o, "mempool_only"); rj_val* rt = rj_obj_get((rj_val*)o, "return_spending_tx");
+        if (mo){ if (mo->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } mempool_only = mo->str[0] == '1'; }
+        if (rt){ if (rt->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } return_tx = rt->str[0] == '1'; }
+    } else if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        *ec = -3; *em = "JSON value of type string is not of expected type object"; return 0; }
     /* validate the whole list before touching the pool, so a bad entry
      * cannot produce a half-answered array */
     for (size_t i = 0; i < list->nitems; i++){
@@ -941,10 +957,12 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     }
     static const char* HEXD = "0123456789abcdef";
     rj_val* arr = rj_arr();
+    int* pending = malloc(sizeof(int) * (list->nitems + 1)); int npending = 0;
+    if (!pending){ *ec = -7; *em = "oom"; return 0; }
     if (g_mph.mp) mpl();
     for (size_t i = 0; i < list->nitems; i++){
         const rj_val* e = list->items[i];
-        unsigned char want[32];
+        unsigned char want[32]; int found_mp = 0;
         gtsp_hex32_wire(rj_obj_get((rj_val*)e, "txid")->str, want);
         unsigned long vout = (unsigned long)atol(rj_obj_get((rj_val*)e, "vout")->str);
         rj_val* o = rj_obj();
@@ -963,12 +981,34 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                 }
                 hx[64] = 0;
                 rj_obj_set(o, "spendingtxid", rj_str(hx));
+                if (return_tx){ char* th = malloc(me.len * 2 + 1); if (th){ for (unsigned long b = 0; b < me.len; b++){ th[b*2] = HEXD[me.tx[b]>>4]; th[b*2+1] = HEXD[me.tx[b]&15]; } th[me.len*2] = 0; rj_obj_set(o, "spendingtx", rj_str(th)); free(th); } }
+                found_mp = 1;
                 break;
             }
         }
+        if (!found_mp && !mempool_only) pending[npending++] = (int)i;   /* the index answers these below */
         rj_arr_push(arr, o);
     }
     if (g_mph.mp) mpu();
+    if (npending){
+        /* Core: "Mempool lacks a relevant spend, and txospenderindex is unavailable." */
+        if (!index_ok || !rpc_chain_txospender_lookup){ rj_free(arr); free(pending); *ec = -1; *em = "Mempool lacks a relevant spend, and txospenderindex is unavailable."; return 0; }
+        static unsigned char txbuf[4u << 20];
+        for (int q = 0; q < npending; q++){
+            int i = pending[q]; rj_val* o = arr->items[i]; const rj_val* e = list->items[i];
+            unsigned char want[32]; gtsp_hex32_wire(rj_obj_get((rj_val*)e, "txid")->str, want);
+            unsigned vout = (unsigned)atol(rj_obj_get((rj_val*)e, "vout")->str);
+            unsigned char sp[32], bh[32]; long h = -1, tl = 0;
+            if (!rpc_chain_txospender_lookup(want, vout, sp, &h, bh, return_tx ? txbuf : NULL, (long)sizeof txbuf, &tl)) continue;
+            char hx[65];
+            for (int b = 0; b < 32; b++){ unsigned char v = sp[31-b]; hx[b*2] = HEXD[v>>4]; hx[b*2+1] = HEXD[v&15]; } hx[64] = 0;
+            rj_obj_set(o, "spendingtxid", rj_str(hx));
+            if (return_tx && tl > 0){ char* th = malloc((size_t)tl * 2 + 1); if (th){ for (long b = 0; b < tl; b++){ th[b*2] = HEXD[txbuf[b]>>4]; th[b*2+1] = HEXD[txbuf[b]&15]; } th[tl*2] = 0; rj_obj_set(o, "spendingtx", rj_str(th)); free(th); } }
+            for (int b = 0; b < 32; b++){ unsigned char v = bh[31-b]; hx[b*2] = HEXD[v>>4]; hx[b*2+1] = HEXD[v&15]; }
+            rj_obj_set(o, "blockhash", rj_str(hx));
+        }
+    }
+    free(pending);
     *res = arr;
     return 1;
 }

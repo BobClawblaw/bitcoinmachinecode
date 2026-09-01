@@ -96,6 +96,19 @@ The last four landed 2026-08-27 and are listed first:
 - **`getbalance`/`listunspent`** — answer from the wallet rescan rather than
   the (default-OFF) address index, so a funded wallet no longer reports
   `0.00000000`.
+- **txospenderindex** (Core v30+ `-txospenderindex`) — **DONE 2026-09-01**: the
+  same shape as txindex — an offline sorted base (`daemon/build_txospender_index`,
+  28-byte records keyed by spent outpoint, ~35 GB for mainnet) plus a
+  daemon-maintained tail (`daemon/txosp_tail.c`, contiguous by boot
+  backfill, watermark follows reorg truncation); every candidate is verified
+  against the archive before it is answered. `gettxspendingprevout` gains
+  Core's `options` (`mempool_only` defaults to "true if the index is
+  unavailable", `return_spending_tx`), answers confirmed spends with
+  `spendingtxid` + `blockhash`, and raises Core's "Mempool lacks a relevant
+  spend, and txospenderindex is unavailable." exactly when Core would;
+  `getindexinfo` reports it. Enabled by the presence of `txospender.dat`
+  (like txindex). `tests/test_txospender_index` runs the real builder on a
+  synthetic archive end to end (28 checks, incl. a prefix-collision reject).
 - **txindex** — offline base build + daemon-maintained incremental tail
   (`daemon/tx_index_tail.c`); `getrawtransaction <txid>` works with no block
   hash.
@@ -430,7 +443,7 @@ than trusted:
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
 | **Config options** | **~75 / 163 (46%)** — `v2transport` closed 08-29, `walletpassfile` added 08-30 (this node's own, no Core equivalent). Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
-| **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex. **txospenderindex absent.** |
+| **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex, **txospenderindex (2026-09-01)**. |
 | **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
 
 *Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
