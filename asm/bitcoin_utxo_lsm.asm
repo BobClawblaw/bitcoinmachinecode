@@ -2177,6 +2177,7 @@ mac_flush:
     pop  rsi
     test rax, rax
     js   .fl_err_close
+    add  rax, [rel mac_fl_fill]    ; + the records still in the write buffer: the LOGICAL offset
     mov  rbx, rax                  ; this record's file offset
     mov  rdx, [rbp-0x1A0]            ; sparse_n
     mov  rdi, [r12+128]
