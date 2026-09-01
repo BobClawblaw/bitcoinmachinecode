@@ -147,6 +147,36 @@ test_glv_wnaf: $(ASMDIR)/tests/test_glv_wnaf.c
 		$(ASMDIR)/secp256k1_glv_c.c -I$(ASMDIR)
 test_glv_pointmul: $(GLVOBJS) $(ASMDIR)/tests/test_glv_pointmul.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_glv_pointmul.c $(GLVOBJS) -I$(ASMDIR)
+# ecdsa suites (asm/Makefile EIVOBJS/TAPRIMSOBJS link lines, ARM objects;
+# ecdsa_verify_ref.o is the frozen pre-4.2 verifier, test-only, never in
+# DAEMONOBJS -- see ecdsa_verify_ref.S). ARM grouping note: on x86
+# point_scalar_mul_glv lives inside secp256k1_point.o, here it is a separate
+# object, so every line that pulls in an object referencing it (currently
+# secp256k1_ecdsa.o's dispatch) must add secp256k1_glv.o + secp256k1_glv_mul.o.
+EIVOBJS := secp256k1_ecdsa.o ecdsa_verify_ref.o secp256k1_glv.o \
+	secp256k1_glv_mul.o secp256k1_scalar.o secp256k1_scalar_c.o \
+	secp256k1_point.o $(ASMDIR)/secp256k1_glv_c.c secp256k1_point_ct.o \
+	secp256k1_fe.o
+test_ecdsa_inverse: $(EIVOBJS) $(ASMDIR)/tests/test_ecdsa_inverse.c \
+		$(ASMDIR)/tests/ecdsa_inverse_vec.h
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_ecdsa_inverse.c $(EIVOBJS)
+test_ecdsa_glv_switch: $(EIVOBJS) $(ASMDIR)/tests/test_ecdsa_glv_switch.c \
+		$(ASMDIR)/tests/ecdsa_inverse_vec.h
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_ecdsa_glv_switch.c $(EIVOBJS)
+test_ecdsa: secp256k1_ecdsa.o secp256k1_glv.o secp256k1_glv_mul.o \
+	secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_point.o \
+	secp256k1_point_ct.o secp256k1_fe.o $(ASMDIR)/secp256k1_glv_c.c \
+	$(ASMDIR)/tests/test_ecdsa.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_ecdsa.c secp256k1_ecdsa.o \
+		secp256k1_glv.o secp256k1_glv_mul.o secp256k1_scalar.o \
+		secp256k1_scalar_c.o secp256k1_point.o $(ASMDIR)/secp256k1_glv_c.c \
+		secp256k1_point_ct.o secp256k1_fe.o
+TAPRIMSOBJS := secp256k1_point.o $(ASMDIR)/secp256k1_glv_c.c \
+	secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
+	secp256k1_scalar_c.o sha256.o bitcoin_pubkey.o
+test_schnorr: secp256k1_schnorr.o $(TAPRIMSOBJS) $(ASMDIR)/tests/test_schnorr.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_schnorr.c secp256k1_schnorr.o \
+		$(TAPRIMSOBJS)
 test_bech32: bech32.o $(ASMDIR)/tests/test_bech32.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_bech32.c bech32.o -I$(ASMDIR)
 fuzz_bech32: fz_bech32.c bech32.o

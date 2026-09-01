@@ -11,16 +11,18 @@
  *       1<=r,s<n ; w=s^{-1} mod n (sc_inv_var, variable-time; s is public);
  *       u1=z*w u2=r*w mod n ; P=u1*G+u2*Q ; !inf ; x(P)==r mod n.
  *
- * GLV DEVIATION (documented): the x86 ecdsa_verify dispatches u2*Q through
- * bmc_ecdsa_glv_enabled() and point_scalar_mul_glv when GLV is on. GLV is a
- * VARIABLE-TIME PERFORMANCE path that itself falls back to point_scalar_mul
- * when its split's identity check fails, and the kill switch routes to
- * point_scalar_mul directly. This port thus calls the VERIFIED
- * point_scalar_mul for u2*Q directly; semantically identical, GLV deferred.
+ * GLV (matches x86): u2*Q goes through bmc_ecdsa_glv_enabled() and
+ * point_scalar_mul_glv when GLV is on (the default; BMC_ECDSA_GLV=0 routes
+ * to point_scalar_mul). GLV is a VARIABLE-TIME PERFORMANCE path that itself
+ * falls back to point_scalar_mul when its split's identity check fails. The
+ * port deferred this until point_scalar_mul_glv was gated natively
+ * (secp256k1_glv_mul.S: test_glv_pointmul 102056/102056 differential vs
+ * point_scalar_mul, x 3 seeds); the dispatch is now byte-for-byte the x86's.
  *
- * AAPCS64: args x0..x4. Calls sc_inv_var/sc_mul (scalar.S), point_scalar_mul/
- * point_scalar_mul_fixed/point_add (point.S), fe_mul/fe_sqr (fe.S) -- all
- * preserve x19+. Frame (sp-relative): s@+0 w@+32 u1@+64 u2@+96 Q@+128(8)
+ * AAPCS64: args x0..x4. Calls sc_inv_var/sc_mul (scalar.S),
+ * point_scalar_mul/point_scalar_mul_fixed/point_add (point.S),
+ * point_scalar_mul_glv (glv_mul.S), bmc_ecdsa_glv_enabled (glv_c.c),
+ * fe_mul/fe_sqr (fe.S) -- all preserve x19+ (the C call preserves by ABI). Frame (sp-relative): s@+0 w@+32 u1@+64 u2@+96 Q@+128(8)
  * P1@+192(12) P2@+288(12) P@+384(12); sub 480.
  * ========================================================================== */
 	.text
@@ -276,12 +278,26 @@ ecdsa_verify:
 	add  x0, sp, #192
 	add  x1, sp, #64
 	bl   point_scalar_mul_fixed
-	/* P2 = u2*Q : point_scalar_mul(P2@+288, Q@+128, u2@+96)
-	 * (GLV deferred -> plain verified variable-base multiply, see header) */
+	/* P2 = u2*Q : GLV endomorphism + wNAF ladder (PERF_SCOPE.md 4.3) unless
+	 * the BMC_ECDSA_GLV=0 kill switch is set; point_scalar_mul_glv itself
+	 * falls back to point_scalar_mul if the split's identity check fails.
+	 * u2 is public, so a variable-time multiply is within policy
+	 * (secp256k1_point_ct.S header). The C call clobbers only caller-saved
+	 * registers; x19-x22 (z, r, Qx, Qy) are callee-saved and every operand
+	 * below is sp-relative, like the x86 which re-derives from rbp. */
+	bl   bmc_ecdsa_glv_enabled
+	cbz  w0, .Lp2_plain
+	add  x0, sp, #288
+	add  x1, sp, #128
+	add  x2, sp, #96
+	bl   point_scalar_mul_glv
+	b    .Lp2_done
+.Lp2_plain:
 	add  x0, sp, #288
 	add  x1, sp, #128
 	add  x2, sp, #96
 	bl   point_scalar_mul
+.Lp2_done:
 	/* P = point_add(P@+384, P1@+192, P2@+288) */
 	add  x0, sp, #384
 	add  x1, sp, #192
