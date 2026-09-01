@@ -2244,7 +2244,7 @@ static unsigned long long dl_pool_rng(void){
     return dl_pool_rng_state = x;
 }
 #define DL_POOL_NNET 5
-#define DL_POOL_RESERVOIR 128
+#define DL_POOL_RESERVOIR 1024   /* per-network sample; clearnet must be able to fill a 512-slot catch-up pool */
 static int dl_pool_net_slot(int net){
     switch(net){ case BMC_NET_IPV4: return 0; case BMC_NET_IPV6: return 1; case BMC_NET_TORV3: return 2;
                  case BMC_NET_I2P: return 3; case BMC_NET_CJDNS: return 4; default: return -1; }
@@ -2264,11 +2264,21 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
         if(have[k] < DL_POOL_RESERVOIR){ res[k][have[k]++] = i; }
         else { long j = (long)(dl_pool_rng() % (unsigned long long)(n + 1)); if(j < DL_POOL_RESERVOIR) res[k][j] = i; }
     }
+    /* shuffle each sample: a reservoir smaller than the network's population
+     * holds its elements in book order, and a small deployment would then
+     * dial the head of the file forever -- the very thing this replaces */
+    for(int k = 0; k < DL_POOL_NNET; k++)
+        for(long i = have[k] - 1; i > 0; i--){ long j = (long)(dl_pool_rng() % (unsigned long long)(i + 1)); long t = res[k][i]; res[k][i] = res[k][j]; res[k][j] = t; }
     /* pass 2: quotas -- a floor for every reachable network with anything in
      * the book, the rest clearnet. Onion gets the biggest share: it is the
      * network with the most peers and the one that costs nothing to run. */
     long quota[DL_POOL_NNET] = {0};
-    long want[DL_POOL_NNET] = { 0, nitems / 8, nitems * 3 / 16, nitems / 10, nitems / 20 };   /* ipv6 8, onion 12, i2p 6, cjdns 3 of 64 */
+    /* The anonymity-network shares are FLOORS sized for the 64-slot leg
+     * pool (ipv6 8, onion 12, i2p 6, cjdns 3), not proportions: the 512-slot
+     * catch-up pool feeds a throughput-critical parallel downloader, and
+     * scaling the floors with it made a quarter of that pool Tor circuits. */
+    long want[DL_POOL_NNET] = { 0, 8, 12, 6, 3 };
+    if(nitems < 64) for(int k = 1; k < DL_POOL_NNET; k++) want[k] = want[k] * nitems / 64;
     long taken = 0;
     for(int k = 1; k < DL_POOL_NNET; k++){ quota[k] = want[k] < have[k] ? want[k] : have[k]; taken += quota[k]; }
     quota[0] = have[0] < nitems - taken ? have[0] : nitems - taken;
