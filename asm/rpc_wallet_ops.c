@@ -119,9 +119,12 @@ static int wop_name_ok(const char* n){
 
 /* forward decl: the ACTIVE wallet may scope wallet files into a subdir */
 static const char* wop_wallet_prefix(void);
+/* Core -walletdir (set by main.c via rpc_wops_set_walletdir; empty = legacy layout) */
+static char g_walletdir[256];
 
 static const char* wop_path(const char* rel, char* buf, size_t cap){
     const char* wp = wop_wallet_prefix();
+    if (g_walletdir[0]){ snprintf(buf, cap, "%s/%s%s", g_walletdir, wp, rel); return buf; }
     snprintf(buf, cap, "data/%s%s", wp, rel);
     struct stat sb;
     if (stat(buf, &sb) == 0) return buf;
@@ -362,6 +365,11 @@ static int wop_exists(const char* rel){
 /* "" for the default wallet; "wallets/<name>/" for a named one. A static
  * buffer is fine: single RPC thread, and the prefix changes only inside
  * load/create which run on that thread. */
+/* Core -walletdir: the directory every wallet file lives under. Empty =
+ * the legacy layout (the chain directory, or data/ beneath it). Set by
+ * main.c from the config so this file carries no node_config dependency. */
+void rpc_wops_set_walletdir(const char* d){ snprintf(g_walletdir, sizeof g_walletdir, "%s", d ? d : ""); }
+const char* rpc_wops_walletdir(void){ return g_walletdir; }
 static const char* wop_wallet_prefix(void){
     static char pfx[96];
     if (g_aw_state == 1 && g_aw_name[0]){
@@ -485,9 +493,10 @@ static int cmd_listwalletdir(rj_val** res){
     rj_val* arr = rj_arr();
     /* the default wallet at the legacy root path... */
     { char b[512]; struct stat sb;
-      snprintf(b, sizeof b, "data/%s", WOP_WALLET_REL);
+      if (g_walletdir[0]) snprintf(b, sizeof b, "%s/%s", g_walletdir, WOP_WALLET_REL);
+      else snprintf(b, sizeof b, "data/%s", WOP_WALLET_REL);
       int have = stat(b, &sb) == 0;
-      if (!have){ snprintf(b, sizeof b, "%s", WOP_WALLET_REL); have = stat(b, &sb) == 0; }
+      if (!have && !g_walletdir[0]){ snprintf(b, sizeof b, "%s", WOP_WALLET_REL); have = stat(b, &sb) == 0; }
       if (have){
           rj_val* e = rj_obj();
           rj_obj_set(e, "name", rj_str(WOP_WALLET_NAME));
@@ -495,8 +504,9 @@ static int cmd_listwalletdir(rj_val** res){
           rj_arr_push(arr, e);
       } }
     /* ...plus every named wallet under wallets/ (key store or watch shell) */
-    { const char* roots[2] = { "data/wallets", "wallets" };
-      for (int r = 0; r < 2; r++){
+    { char wdr[600]; snprintf(wdr, sizeof wdr, "%s/wallets", g_walletdir[0] ? g_walletdir : "data");
+      const char* roots[2] = { g_walletdir[0] ? wdr : "data/wallets", g_walletdir[0] ? wdr : "wallets" };
+      for (int r = 0; r < (g_walletdir[0] ? 1 : 2); r++){
           DIR* d = opendir(roots[r]); if (!d) continue;
           struct dirent* de;
           while ((de = readdir(d))){
@@ -542,7 +552,8 @@ static void wop_keyset_invalidate(void);
 /* Make wallets/<name>/ under whichever root wop_path would write to. */
 static int wop_wallet_mkdir(const char* name, char* dir, size_t cap){
     struct stat sb;
-    const char* root = (stat("data", &sb) == 0 && S_ISDIR(sb.st_mode)) ? "data" : ".";
+    const char* root = g_walletdir[0] ? g_walletdir
+                     : (stat("data", &sb) == 0 && S_ISDIR(sb.st_mode)) ? "data" : ".";
     char b[600];
     snprintf(b, sizeof b, "%s/wallets", root);       mkdir(b, 0700);
     snprintf(b, sizeof b, "%s/wallets/%s", root, name); mkdir(b, 0700);
@@ -552,6 +563,11 @@ static int wop_wallet_mkdir(const char* name, char* dir, size_t cap){
 }
 static int wop_named_store_path(const char* name, const char* rel, char* buf, size_t cap){
     char b[600]; struct stat sb;
+    if (g_walletdir[0]){
+        snprintf(b, sizeof b, "%s/wallets/%s/%s", g_walletdir, name, rel);
+        if (stat(b, &sb) == 0){ snprintf(buf, cap, "%s", b); return 1; }
+        return 0;
+    }
     snprintf(b, sizeof b, "data/wallets/%s/%s", name, rel);
     if (stat(b, &sb) == 0){ snprintf(buf, cap, "%s", b); return 1; }
     snprintf(b, sizeof b, "wallets/%s/%s", name, rel);
