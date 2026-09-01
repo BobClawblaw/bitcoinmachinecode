@@ -113,6 +113,7 @@ __attribute__((weak)) void fest_on_accept(const unsigned char* txid, unsigned lo
 __attribute__((weak)) void fest_on_confirmed(const unsigned char* txid){ (void)txid; }
 __attribute__((weak)) void fest_on_block_begin(long height){ (void)height; }
 __attribute__((weak)) void fest_on_block_end(void){}
+__attribute__((weak)) void fest_shutdown_flush(void){}   /* main.c calls it at worker shutdown */
 static void* g_pol_state_for_fees;   /* set once the policy state exists (tx_policy_init) */
 static void txacc_fee_note(const unsigned char* txid){
     extern long mpool_policy_entry(void*, const unsigned char*, unsigned long long*, unsigned long long*);
