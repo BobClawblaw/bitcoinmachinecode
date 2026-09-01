@@ -6731,6 +6731,15 @@ int main(int argc, char** argv){
         if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
                 caught, phase_elapsed(&catchup_pt));
+        if(g_shutdown_requested){
+            /* 2026-09-01 12:29: a stop during the boot catch-up returned here
+             * and the boot went ON -- hash index, worker, UTXO engine sized
+             * against an index the catch-up had just polluted -- and the
+             * worker's start under the pending SIGTERM left utxo.idx empty
+             * (a full UTXO rebuild followed). A stop is a stop. */
+            fprintf(stderr,"[boot] shutdown requested during the catch-up -- exiting before the worker starts\n");
+            _exit(0);
+        }
         if(caught>0){
             store_reload(store_buf);        /* our copy predates dl_catchup's writes */
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
