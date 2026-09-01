@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* daemon/archive_reindex.c -- Bitcoin Core's -reindex for this node's archive.
  *
  * Core's -reindex throws away the block index and chain state and rebuilds
@@ -145,7 +146,23 @@ int archive_reindex(const char* dir, const unsigned char genesis[32], unsigned m
             if (!sane || !rx_pow_ok(hh, rd32(fh + 8 + 72))){
                 if (sane){ st->bad_pow++; pos += 8 + len; st->frames++; continue; }   /* real frame, invalid block: skip it whole */
                 if (!lost){ lost = 1; lost_at = pos; }
-                junk++; pos++;
+                /* resync by searching for the next magic dword in bulk: a
+                 * per-byte probe would cost hours on a file that is junk from
+                 * its first byte (or one written with a different magic). */
+                { static u8 chunk[4u << 20]; u64 want = fsz - pos; if (want > sizeof chunk) want = sizeof chunk;
+                  if (want < 88 || rx_pread_all(fd, chunk, (size_t)want, pos) != 0){ junk += fsz - pos; pos = fsz; break; }
+                  u8 mg4[4] = { (u8)magic, (u8)(magic >> 8), (u8)(magic >> 16), (u8)(magic >> 24) };
+                  u64 off = 4, found = 0;
+                  while (off + 4 <= want){
+                      u8* hit = memmem(chunk + off, (size_t)(want - off), mg4, 4);
+                      if (!hit){ break; }
+                      u64 cand = pos + (u64)(hit - chunk) - 4;
+                      u32 clen = rd32(chunk + (hit - chunk) - 4);
+                      if (clen >= 80 && clen <= RX_MAX_FRAME && cand + 8 + clen <= fsz){ found = 1; junk += cand - pos; pos = cand; break; }
+                      off = (u64)(hit - chunk) + 1;
+                  }
+                  if (!found){ u64 adv = want > 8 ? want - 8 : want; junk += adv; pos += adv; }
+                }
                 continue;
             }
             if (lost){ fprintf(stderr, "[reindex] blk%05u.dat: frame boundary lost at byte %llu, resynced after %llu junk byte(s)\n", fno, lost_at, junk); lost = 0; }
