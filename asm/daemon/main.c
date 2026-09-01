@@ -226,6 +226,9 @@ extern void axt_boot(void* store_buf);                                        /*
 extern void axt_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern int  axt_active(void);
 extern int  txit_active(void);
+extern void tsp_boot(void* store_buf);                                        /* daemon/txosp_tail.c */
+extern int  tsp_active(void);
+extern void tsp_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
 typedef int (*bfi_undo_cb_t)(void*, const unsigned char*, unsigned int, unsigned long long,
@@ -388,6 +391,7 @@ static void rebuild_hash_index_after_reorg(void){
      * already-indexed (fires with tip == fork height on the mid-reorg
      * invocation; the post-reconnect invocation is a no-op) */
     { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
+    { extern void tsp_on_truncate(void*); tsp_on_truncate(store_buf); }
     { extern void axt_on_truncate(void*); axt_on_truncate(store_buf); }
     { extern void bfi_on_truncate(long); bfi_on_truncate(*(int*)(store_buf+24)); }
 }
@@ -3950,6 +3954,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * After the archive verify -- a repair may have truncated heights the
      * tail would otherwise trust. No base index => logs once and disables. */
     if(archive_ok) txit_boot(store_buf);
+    /* txo-spender index tail (Core -txospenderindex): same shape, same rules */
+    if(archive_ok) tsp_boot(store_buf);
     /* live address index (EXTENSION -- Core has no such index): only when
      * the operator asked with addrindex=1 */
     if(archive_ok && g_cfg.addrindex) axt_boot(store_buf);
@@ -5043,6 +5049,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * (idempotent by height -- a replayed height is a
                          * no-op) */
                         txit_on_block(store_buf, zh, zb, bl);
+                        tsp_on_block(store_buf, zh, zb, bl);
                         /* filter index tail: adopt/append (cheap probe when
                          * the backfill has not closed in yet) */
                         if (g_cfg.blockfilterindex)
