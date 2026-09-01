@@ -46,7 +46,8 @@
 #include "notify.h"      /* Core -*notify hooks */
 #include "torcontrol.h"  /* inbound: our own onion service */
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
-#include "node_config.h" /* durable, file-backed tuning (bitcoin.conf) */
+#include "node_config.h"
+#include "archive_reindex.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "netperm.h"   /* -whitelist peer permissions */
 #include "subnet.h"    /* one CIDR matcher, shared with the ban list */
 #include "rpc_acl.h"   /* -rpcallowip / -rpcbind */
@@ -58,7 +59,7 @@
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
  * (all under the per-chain datadir's own logs/). Set at boot right after
  * chainparams_select; the static default covers every tool-mode caller. */
-static char g_logpath[64] = "logs/bitcoind.log";
+static char g_logpath[256] = "logs/bitcoind.log";   /* debuglogfile= overrides (0 = /dev/null) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
@@ -907,7 +908,8 @@ static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
  * (2026-08-28 pre-deploy review.) */
 static unsigned char mux_out_net[MUX_MAX_OUT];
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
-static char  mux_out_host[MUX_MAX_OUT][64];
+static char  mux_out_host[MUX_MAX_OUT][128]   /* "host:port" of a v3 onion is 67 bytes; 64 truncated it and broke the top-up dedupe (2026-09-01) */;
+static int   g_in_dial_helper = 0;          /* set in a dial-helper child: no book writes, no shared-status writes */
 static int   mux_n_out = 0;
 static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
 static long long mux_out_nextretry[MUX_MAX_OUT];
@@ -1646,7 +1648,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * next dial onwards the v2 gate has something real to read. */
     { unsigned long long svc = 0;
       if (g_peer_version_len >= 12) memcpy(&svc, g_peer_version_payload + 4, 8);
-      if (svc){
+      if (svc && !g_in_dial_helper){       /* a helper child never writes the book */
           bmc_addr_t pa;
           if (bmc_addr_from_string_port(&pa, host, (unsigned short)out_port)){
               ab2_t* b = addr_book();
@@ -1952,6 +1954,119 @@ static long do_outbound_sync(int i){
  * single-seed-limited. On success the slot is re-anchored at our stored tip and
  * reused in the poll loop; on failure the slot stays dead (fd -1) and is retried
  * on a later rotation. */ 
+/* ---- async dial helper ----------------------------------------------------
+ * An anonymity-network dial (Tor rendezvous, I2P tunnel, then the version
+ * handshake) takes tens of seconds, and every dial path in this worker runs
+ * INLINE in the rotation: three consecutive onion dials starved the
+ * heartbeat for three minutes and tripped the deploy guard (2026-09-01).
+ * So those dials happen in a forked child that runs the same
+ * outbound_connect and hands the CONNECTED socket back over a socketpair
+ * with SCM_RIGHTS, together with the handshake facts the leg needs (the
+ * peer's version payload, its addrv2 preference). Onion and I2P legs are v1
+ * transport, so no cipher state has to cross the process boundary. The
+ * worker polls the channel without blocking every rotation and installs the
+ * leg exactly as the inline fill would have. Core does the same job with a
+ * thread; a child keeps this worker's single-threaded invariants. */
+#define DH_MAX 2
+typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; } dh_slot_t;
+static dh_slot_t g_dh[DH_MAX];
+static long long g_dh_timeout_ms = 120000;
+/* g_in_dial_helper is declared with the leg tables above */
+typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[256]; char why[128]; } dh_result_t;
+void dial_helper_test_set_timeout_ms(long long ms){ g_dh_timeout_ms = ms; }
+static int leg_net_of(const char* hostport){
+    bmc_addr_t a; return bmc_addr_from_string_port(&a, hostport, 0) ? (int)a.net : BMC_NET_IPV4;
+}
+static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_NET_I2P; }
+static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
+static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
+static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+static int dh_start(const char* host, int out_port){
+    int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
+    if(slot < 0) return 0;
+    int sp[2]; if(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return 0;
+    pid_t pid = fork();
+    if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
+    if(pid == 0){
+        close(sp[0]); g_in_dial_helper = 1;
+        dh_result_t r; memset(&r, 0, sizeof r);
+        int fd = outbound_connect(host, 300, out_port);
+        if(fd >= 0){
+            r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2;
+            r.vlen = g_peer_version_len > 0 && g_peer_version_len <= 256 ? g_peer_version_len : 0;
+            if(r.vlen) memcpy(r.vpayload, g_peer_version_payload, (size_t)r.vlen);
+        } else snprintf(r.why, sizeof r.why, "%s", dial_fail_reason());
+        struct iovec iov = { &r, sizeof r };
+        char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
+        struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1;
+        if(fd >= 0){
+            mh.msg_control = cbuf; mh.msg_controllen = sizeof cbuf;
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cm), &fd, sizeof fd);
+        }
+        (void)!sendmsg(sp[1], &mh, 0);
+        _exit(0);
+    }
+    close(sp[1]);
+    g_dh[slot].sp = sp[0]; g_dh[slot].pid = pid; g_dh[slot].net = leg_net_of(host); g_dh[slot].t0 = dh_now_ms();
+    snprintf(g_dh[slot].host, sizeof g_dh[slot].host, "%s", host);
+    fprintf(stderr, "[dial] %s: dialing in the background (%s)\n", host, bmc_net_name(g_dh[slot].net));
+    return 1;
+}
+/* one completed (or timed-out) helper per call: 1 = result in *out (fd_out >= 0 iff ok), 0 = nothing */
+static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
+    for(int i = 0; i < DH_MAX; i++){
+        if(g_dh[i].pid <= 0) continue;
+        struct iovec iov = { out, sizeof *out };
+        char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
+        struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1; mh.msg_control = cbuf; mh.msg_controllen = sizeof cbuf;
+        memset(out, 0, sizeof *out);
+        ssize_t n = recvmsg(g_dh[i].sp, &mh, MSG_DONTWAIT);
+        if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)){
+            if(dh_now_ms() - g_dh[i].t0 > g_dh_timeout_ms){
+                fprintf(stderr, "[dial] %s: background dial gave up after %llds\n", g_dh[i].host, g_dh_timeout_ms / 1000);
+                kill(g_dh[i].pid, SIGKILL); waitpid(g_dh[i].pid, NULL, 0);
+                close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1;
+                out->ok = 0; snprintf(out->why, sizeof out->why, "timeout"); *fd_out = -1;
+                snprintf(host_out, hcap, "%s", g_dh[i].host);
+                return 1;
+            }
+            continue;
+        }
+        *fd_out = -1;
+        if(n == (ssize_t)sizeof *out && out->ok){
+            for(struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm))
+                if(cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS){ memcpy(fd_out, CMSG_DATA(cm), sizeof(int)); break; }
+            if(*fd_out < 0) out->ok = 0;
+        } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
+        waitpid(g_dh[i].pid, NULL, 0);
+        close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1;
+        snprintf(host_out, hcap, "%s", g_dh[i].host);
+        return 1;
+    }
+    return 0;
+}
+/* install a helper-dialled leg exactly as the inline fill does */
+static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
+    if(mux_n_out >= MUX_MAX_OUT){ close(fd); return 0; }
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
+    g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
+    g_peer_wants_addrv2 = r->wants_addrv2;
+    strncpy(mux_out_host[mux_n_out], host, 127); mux_out_host[mux_n_out][127] = 0;
+    mux_out_fd[mux_n_out] = fd;
+    mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
+    mux_out_peer[mux_n_out] = 0;
+    anchor_locator(mux_out_loc[mux_n_out]);
+    mux_out_nextretry[mux_n_out] = 0;
+    { char pv[256]; format_peer_version_info(pv, sizeof pv);
+      fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2); }
+    rpc_fill_peer_slot(mux_n_out, host);
+    mux_n_out++;
+    return 1;
+}
+static int legs_on_net(int net){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_net_of(mux_out_host[k]) == net) n++; return n; }
+static int legs_anon(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_is_anon_net(leg_net_of(mux_out_host[k]))) n++; return n; }
+
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
@@ -1961,6 +2076,22 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     if(g_node_status && !g_node_status->net_active) return;
     /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
     int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    /* ...and never onto a host another live leg already holds: each leg
+     * rotates its own pointer, so two legs could land on one peer (deploy g,
+     * 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared by HOST,
+     * so a book carrying one peer under two ports still yields one leg. */
+    { char me[128];
+      for(int tries = 0; tries < pool_len; tries++){
+          ctl_ip_only(peers[p], me, sizeof me);
+          int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
+          for(int k = 0; k < mux_n_out && !held; k++){
+              if(k == i || mux_out_fd[k] < 0) continue;
+              char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
+              if(me[0] && !strcmp(me, other)) held = 1;
+          }
+          if(!held) break;
+          p = (p + 1) % (pool_len > 0 ? pool_len : 1);
+      } }
     mux_out_peer[i] = p;
     /* a banned peer is not dialed. Checked HERE for the same reason: this is
      * the only path to a new outbound leg. */
@@ -1974,7 +2105,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
                      i, peers[p], dial_fail_reason()); return; }
     mux_out_fd[i]=fd;
     mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
-    strncpy(mux_out_host[i], peers[p], 63);
+    strncpy(mux_out_host[i], peers[p], 127);
     anchor_locator(mux_out_loc[i]);
     fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d\n", i, peers[p], fd, (int)mux_out_wants_v2[i]);
 }
@@ -2228,34 +2359,101 @@ static void dl_save_good_peers(char peers[][64], int n){
     fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
 }
 
+/* The dial pool, sampled ACROSS NETWORKS. The book is appended in the order
+ * addresses were learned, so "the first 64 dialable entries" was 64 IPv4
+ * peers every time: with 2,580 onion and 409 I2P entries in the book the
+ * node never dialled either (2026-08-31). Core's addrman picks at random
+ * and diversifies by network; this does the same in two passes: a reservoir
+ * sample per reachable network, then a layout that gives every reachable
+ * network a quota and interleaves them so the rotation (mux_next_peer,
+ * feelers, top-ups all walk this pool in order) reaches an onion or I2P
+ * peer within a few dials -- while the FIRST slots stay mostly clearnet,
+ * because the boot dials are sequential and an anonymity-network circuit
+ * takes seconds to build. */
+static unsigned long long dl_pool_rng_state;
+void dl_pool_test_seed(unsigned long long s){ dl_pool_rng_state = s ? s : 1; }
+static unsigned long long dl_pool_rng(void){
+    if(!dl_pool_rng_state){
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        dl_pool_rng_state = ((unsigned long long)ts.tv_sec << 32) ^ (unsigned long long)ts.tv_nsec ^ ((unsigned long long)getpid() << 17) ^ 0x9E3779B97F4A7C15ULL;
+    }
+    unsigned long long x = dl_pool_rng_state; x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return dl_pool_rng_state = x;
+}
+#define DL_POOL_NNET 5
+#define DL_POOL_V4_WINDOW  4096   /* clearnet candidates: the first entries of the book (see dl_pool_from_book) */
+#define DL_POOL_RESERVOIR 8192   /* per-network sample: clearnet must be able to fill the largest catch-up pool (bmc.peerpool <= 8192) */
+static int dl_pool_net_slot(int net){
+    switch(net){ case BMC_NET_IPV4: return 0; case BMC_NET_IPV6: return 1; case BMC_NET_TORV3: return 2;
+                 case BMC_NET_I2P: return 3; case BMC_NET_CJDNS: return 4; default: return -1; }
+}
 static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
     (void)ab;
-    /* Walk the whole version-2 book and keep the addresses this node can
-     * DIAL today. Until the SOCKS5/SAM/IPv6 transports land only IPv4 is
-     * dialable; a non-IPv4 entry is kept in the book (and served to peers)
-     * but not put in the pool. bmc_addr_is_routable already excludes the
-     * special ranges the old loop filtered by hand. */
     ab2_t* b = addr_book(); if(!b) return 0;
-    long cnt = ab2_count(b); int got = 0;
-    for(long i=0;i<cnt && got<nitems;i++){
+    long cnt = ab2_count(b);
+    /* pass 1: a uniform random sample (reservoir) of dialable entries per network */
+    static long res[DL_POOL_NNET][DL_POOL_RESERVOIR]; long seen[DL_POOL_NNET] = {0}, have[DL_POOL_NNET] = {0};
+    for(long i = 0; i < cnt; i++){
         ab2_rec_t r; if(!ab2_get(b, i, &r)) continue;
-        /* every network this node can actually reach right now: IPv4 always,
-         * onion/i2p when their transports are configured (daemon/dialer.c).
-         * An address we cannot dial stays in the book and is still served to
-         * peers -- it just never enters the pool. */
-        if(!dialer_net_reachable(r.a.net)) continue;
+        int k = dl_pool_net_slot(r.a.net); if(k < 0) continue;
+        /* Clearnet comes from the HEAD of the book only. The book carries no
+         * tried/new distinction and gossip refreshes last_seen, so recency
+         * cannot tell a once-connected peer from an address a stranger
+         * claimed; but the head is the migrated, once-connected set and
+         * gossip appends behind it. A uniform sample over all 17k IPv4
+         * entries drew mostly dead addresses and odd ports -- one live leg in
+         * five minutes (2026-09-01 02:20). */
+        if(k == 0 && i >= DL_POOL_V4_WINDOW) continue;
+        if(!dialer_net_reachable(r.a.net)) continue;      /* stays in the book, never in the pool */
         if(!bmc_addr_is_routable(&r.a)) continue;
-        /* the caller's slots are 64 bytes; an IPv4 needs 16. Take the string
-         * only if it was actually produced -- a slot left empty would be
-         * dialled as "" and, worse, still counted, suppressing the seed
-         * fallback (2026-08-28 review, caught before deploy). */
-        /* host:port ([v6]:port for IPv6/CJDNS): the book records the peer's
-         * real port and the chain default is only a fallback for names.
-         * Dropping it here sent every dial to the default port -- which is
-         * right for most mainnet peers and wrong for everyone else. */
-        if(bmc_addr_to_string_port(out[got], DL_POOL_SLOT, &r.a) <= 0) continue;
-        got++;
+        long n = seen[k]++;
+        if(have[k] < DL_POOL_RESERVOIR){ res[k][have[k]++] = i; }
+        else { long j = (long)(dl_pool_rng() % (unsigned long long)(n + 1)); if(j < DL_POOL_RESERVOIR) res[k][j] = i; }
     }
+    /* shuffle each sample: a reservoir smaller than the network's population
+     * holds its elements in book order, and a small deployment would then
+     * dial the head of the file forever -- the very thing this replaces */
+    for(int k = 0; k < DL_POOL_NNET; k++)
+        for(long i = have[k] - 1; i > 0; i--){ long j = (long)(dl_pool_rng() % (unsigned long long)(i + 1)); long t = res[k][i]; res[k][i] = res[k][j]; res[k][j] = t; }
+    /* pass 2: quotas -- a floor for every reachable network with anything in
+     * the book, the rest clearnet. Onion gets the biggest share: it is the
+     * network with the most peers and the one that costs nothing to run. */
+    long quota[DL_POOL_NNET] = {0};
+    /* The anonymity-network shares are FLOORS sized for the 64-slot leg
+     * pool (ipv6 8, onion 12, i2p 6, cjdns 3), not proportions: the 512-slot
+     * catch-up pool feeds a throughput-critical parallel downloader, and
+     * scaling the floors with it made a quarter of that pool Tor circuits. */
+    long want[DL_POOL_NNET] = { 0, 8, 12, 6, 3 };
+    if(nitems < 64) for(int k = 1; k < DL_POOL_NNET; k++) want[k] = want[k] * nitems / 64;
+    long taken = 0;
+    for(int k = 1; k < DL_POOL_NNET; k++){ quota[k] = want[k] < have[k] ? want[k] : have[k]; taken += quota[k]; }
+    quota[0] = have[0] < nitems - taken ? have[0] : nitems - taken;
+    /* if clearnet cannot fill its share, let the others grow into the room */
+    for(int k = 1; k < DL_POOL_NNET && quota[0] + taken < nitems; k++){
+        long room = nitems - quota[0] - taken; long extra = have[k] - quota[k];
+        if(extra > room) extra = room; if(extra > 0){ quota[k] += extra; taken += extra; }
+    }
+    /* pass 3: layout. Slots 0..7 (the boot dials) are clearnet except one
+     * onion (slot 3) and one ipv6 (slot 6) when available; after that the
+     * networks are interleaved so every 4th entry is an anonymity peer. */
+    long used[DL_POOL_NNET] = {0}; int got = 0;
+    #define POOL_TAKE(k) do{ if(used[k] < quota[k]){ ab2_rec_t r; if(ab2_get(b, res[k][used[k]++], &r) && \
+        bmc_addr_to_string_port(out[got], DL_POOL_SLOT, &r.a) > 0) got++; } }while(0)
+    static const int early[8] = { 0, 0, 0, 2, 0, 0, 1, 0 };
+    static const int cycle[8] = { 0, 2, 0, 1, 0, 3, 0, 4 };
+    for(int s = 0; got < nitems && s < 8; s++){
+        int k = early[s]; if(used[k] >= quota[k]) k = 0;
+        if(used[k] >= quota[k]) break;
+        POOL_TAKE(k);
+    }
+    for(int guard = 0; got < nitems && guard < nitems * 8; guard++){
+        int k = cycle[guard % 8];
+        if(used[k] >= quota[k]){ int any = 0; for(int t = 0; t < DL_POOL_NNET; t++) if(used[t] < quota[t]){ k = t; any = 1; break; } if(!any) break; }
+        POOL_TAKE(k);
+    }
+    #undef POOL_TAKE
+    fprintf(stderr,"[pool] %d peer(s) sampled from the book: ipv4 %ld, ipv6 %ld, onion %ld, i2p %ld, cjdns %ld (book has %ld/%ld/%ld/%ld/%ld dialable)\n",
+            got, used[0], used[1], used[2], used[3], used[4], seen[0], seen[1], seen[2], seen[3], seen[4]);
     return got;
 }
 
@@ -3433,6 +3631,9 @@ static int txsub_package(char* msg, unsigned long mcap){
  * dl_catchup is synchronous and holds the worker for its duration; the legs
  * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
 #define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
+#define TXSUB_ROTATION_BUDGET 256    /* submissions serviced per rotation before the main loop runs again */
+#define TXSUB_ROTATION_MS     250    /* ...or this much wall time, whichever comes first */
+static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
 static int g_catchup_workers = 16;
@@ -3456,6 +3657,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * which happened on every stop/restart until 2026-08-22 and once landed
      * between a block's WAL writes and its checkpoint (height 318148). */
     utxo_live_set_shutdown_flag(&g_shutdown_requested);
+    { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
+      rpc_node_set_shutdown_flag(&g_shutdown_requested); }   /* the mempool reload must yield to SIGTERM */
     /* Reload a fresh store state rather than inherit the parent's possibly-
      * stale in-memory idx_len/pos (fork COW is not safe for a growable
      * store -- see the unified_ibd comments on re-initialising per
@@ -3892,7 +4095,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             { extern void addrself_note_peer_view(const unsigned char*, long);
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
-            strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
+            strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
             mux_out_fd[mux_n_out]=cfd[i];
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
@@ -4129,12 +4332,24 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * speed, and an idle node pays at most TXSUB_FOLLOW_MS once. */
         if(g_node_status){
             int follow = 0;
+            /* ...but the linger must not become residence: a mempool.dat
+             * reload (thousands of entries, each acked and followed by the
+             * next within the window, plus its retry passes) kept the worker
+             * in this loop for MINUTES -- no heartbeat, no leg polling, no
+             * block sync, and every blocking dial or write it hit inside
+             * looked like a wedge (2026-08-31 21:20; 2026-09-01 00:31, 00:51,
+             * 01:10, all a few minutes after boot). Bound the stay per
+             * rotation by count and by time; the submitter tolerates a
+             * rotation gap (it waits 90 s per entry). */
+            int budget = TXSUB_ROTATION_BUDGET;
+            long long t_enter = txsub_now_ms();
             for(;;){
                 if(g_node_status->tx_submit_seq == txsub_last_seq){
                     if(follow <= 0 || g_shutdown_requested) break;
                     struct timespec ts = {0, 500*1000}; nanosleep(&ts, NULL); follow--;
                     continue;
                 }
+                if(--budget < 0 || txsub_now_ms() - t_enter > TXSUB_ROTATION_MS) break;   /* back to the main loop; next rotation continues */
                 txsub_last_seq = g_node_status->tx_submit_seq;
             int result; char reason[128]; reason[0]=0;
             if(g_node_status->tx_submit_pkg_n > 0){
@@ -4764,19 +4979,50 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * on a variable network, so keep trying to add a leg occasionally
          * (rate-limited) instead of giving up at the initial dial. Uses the
          * proven outbound_connect path (works for reachable peers). */
-        if(mux_n_out < MUX_WANT_OUT() && (rot % 8)==0){
+        /* background dials: install whatever completed since the last rotation */
+        { dh_result_t dr; int dfd; char dhost[128];
+          while(dh_poll(&dr, &dfd, dhost, sizeof dhost)){
+              if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
+              else fprintf(stderr, "[dial] %s: background dial failed: %s\n", dhost, dr.why[0] ? dr.why : "?");
+          } }
+        /* reserved slots: at least ONE leg per reachable anonymity network,
+         * dialled in the background, on top of the clearnet legs (Core keeps
+         * an extra network-specific outbound for the same reason) */
+        if((rot % 8)==0 && g_node_status && g_node_status->net_active && mux_n_out < MUX_WANT_OUT() + 2 && mux_n_out < MUX_MAX_OUT){
+            static const int anon_nets[2] = { BMC_NET_TORV3, BMC_NET_I2P };
+            for(int an = 0; an < 2 && dh_inflight_count() < DH_MAX; an++){
+                int net = anon_nets[an];
+                if(!dialer_net_reachable(net) || legs_on_net(net) > 0 || dh_inflight_net(net)) continue;
+                for(int ci = 0; ci < nsrc; ci++){
+                    if(leg_net_of(srcpool[ci]) != net) continue;
+                    int already = 0; for(int k = 0; k < mux_n_out; k++) if(!strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
+                    if(already) continue;
+                    { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+                    if(dh_start(srcpool[ci], out_port)) break;
+                }
+            }
+        }
+        if(mux_n_out - legs_anon() < MUX_WANT_OUT() && (rot % 8)==0){
             /* ONE summary line per pass, not one per candidate: this loop walks
              * the whole live pool (up to nsrc) when nothing connects, so a
              * per-candidate log would flood exactly when the node is sickest. */
             int topup_fail = 0; char topup_why[160] = "";
-            for(int ci=0; ci<nsrc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
-                if(mux_n_out>=MUX_WANT_OUT()) break;
+            /* ONE leg per pass, and at most a few failed dials: this loop runs
+             * inline in the worker, and an anonymity-network dial costs tens of
+             * seconds (circuit + handshake). Filling three empty slots with
+             * onion peers in one pass starved the heartbeat for three minutes
+             * (2026-09-01 01:34) and tripped the deploy guard; the next pass
+             * (8 rotations later) fills the next slot. */
+            int topup_filled = 0;
+            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() < MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
+                if(topup_filled >= 1 || topup_fail >= 4) break;
+                if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
-                    strncpy(mux_out_host[mux_n_out], srcpool[ci], 63);
+                    strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
                     mux_out_fd[mux_n_out]=nfd;
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
@@ -4785,7 +5031,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
                       fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[ci], nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
                     rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
-                    mux_n_out++;
+                    mux_n_out++; topup_filled++;
                 }
                 else { if(!topup_fail++) snprintf(topup_why,sizeof topup_why,"%s: %s",
                                                   srcpool[ci], dial_fail_reason()); }
@@ -4929,6 +5175,19 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern const char* dialer_i2p_b32(void);
       extern void rpc_node_set_net_hooks(int (*)(int), const char* (*)(void));
       rpc_node_set_net_hooks(dialer_net_reachable, dialer_i2p_b32); }
+    /* Core -walletdir: every wallet file lives there (absolute, or relative
+     * to the chain directory we are in). Created 0700 if absent; the RPC
+     * wallet layer learns it through its setter, never from node_config. */
+    if(g_cfg.walletdir[0]){
+        struct stat wsb;
+        if(stat(g_cfg.walletdir, &wsb) != 0){
+            if(mkdir(g_cfg.walletdir, 0700) == 0) fprintf(stderr, "[wallet] created walletdir %s\n", g_cfg.walletdir);
+            else fprintf(stderr, "[wallet] walletdir %s: cannot create (%s) -- wallet files will fail to open\n", g_cfg.walletdir, strerror(errno));
+        } else if(!S_ISDIR(wsb.st_mode)) fprintf(stderr, "[wallet] walletdir %s is not a directory\n", g_cfg.walletdir);
+        extern void rpc_wops_set_walletdir(const char*);
+        rpc_wops_set_walletdir(g_cfg.walletdir);
+        fprintf(stderr, "[wallet] walletdir=%s\n", g_cfg.walletdir);
+    }
     /* Wallet bootstrap: if the CLI's own wallet store is present in the
      * datadir, load it (BMC_WALLET_PASS env or <store>.pass file, exactly the
      * CLI's own resolution order) and hand the RPC layer the seed --
@@ -4938,6 +5197,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * walletpassphrase/walletlock flip the live RPC seed at runtime, and the
      * mnemonic provider lets encryptwallet seal the loaded wallet. If an
      * ENCRYPTED store exists, adopt it locked and skip the plaintext load. */
+    if(g_cfg.disablewallet){
+        fprintf(stderr, "[rpc] wallet disabled (disablewallet=1) -- wallet RPCs report no wallet\n");
+    } else
     { extern void wenc_set_seed_installer(void (*)(const unsigned char*));
       extern void wenc_set_mnemonic_provider(int (*)(char*, long, char*, long));
       extern void rpc_wops_set_seed_installer(void (*)(const unsigned char*));
@@ -4949,7 +5211,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
        * unlock path uses -- one seed slot, one way to write it. */
       rpc_wops_set_seed_installer(wenc_install_seed);
       char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
-      if (wenc_boot(".") || wenc_boot(wd)){
+      if (g_cfg.walletdir[0] ? wenc_boot(g_cfg.walletdir) : (wenc_boot(".") || wenc_boot(wd))){
           /* An encrypted wallet boots LOCKED, as Core's does. If the operator
            * has configured a passphrase source (walletpassfile= or
            * $BMC_WALLET_PASS) unlock it here, so moving from the weak v2 store
@@ -4971,8 +5233,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
                                        const char* pass, long passlen);
       static char mn[768], wpass[256];
-      const char* cand[2] = { "bmcwallet.dat", "data/bmcwallet.dat" };
-      for (int wi = 0; wi < 2; wi++){
+      char wdc[512]; snprintf(wdc, sizeof wdc, "%s/bmcwallet.dat", g_cfg.walletdir[0] ? g_cfg.walletdir : ".");
+      const char* cand[3] = { g_cfg.walletdir[0] ? wdc : "bmcwallet.dat", "bmcwallet.dat", "data/bmcwallet.dat" };
+      for (int wi = (g_cfg.walletdir[0] ? 0 : 1); wi < 3; wi++){
           struct stat wsb;
           if (stat(cand[wi], &wsb) != 0) continue;
           wpass[0] = 0;
@@ -5080,6 +5343,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * typo that silently allows LESS is a support call; one that silently
      * allows MORE is an incident, and refusing avoids having to work out
      * which happened. */
+    { extern void mpool_policy_set_bytespersigop(unsigned long long);
+      mpool_policy_set_bytespersigop((unsigned long long)g_cfg.bytespersigop); }
     { extern void rpc_node_set_relay_floors(unsigned long long, unsigned long long);
       rpc_node_set_relay_floors((unsigned long long)g_cfg.minrelaytxfee_satkvb,
                                 (unsigned long long)g_cfg.incrementalrelayfee_satkvb); }
@@ -5269,7 +5534,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     for(int i=0;i<nwant && i<pool_len && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
-        strncpy(mux_out_host[mux_n_out], peers[i], 63);
+        strncpy(mux_out_host[mux_n_out], peers[i], 127);
         mux_out_fd[mux_n_out]=fd;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
@@ -5620,6 +5885,9 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      if(g_cfg.debuglogfile[0])
+          snprintf(g_logpath, sizeof g_logpath, "%s",
+                   !strcmp(g_cfg.debuglogfile, "0") ? "/dev/null" : g_cfg.debuglogfile);
       node_config_log();
       /* Join the config to the passphrase module HERE. Neither side may
        * reference the other: node_config.o is linked into targets with no
@@ -5819,6 +6087,40 @@ int main(int argc, char** argv){
      * UTXO store and chainwork in the BASE dir while the archive lived in
      * regtest/, splitting one chain's state across two dirs. absp keeps the
      * BASE for the config path (bitcoin.conf stays shared at the root). */
+    /* Core -reindex: rebuild index.dat, headers.dat and chainwork.dat from the
+     * blk files (daemon/archive_reindex.c), then drop the chain state and the
+     * height-positional indexes so they rebuild against the new heights.
+     * ONE-SHOT, exactly like -reindex-chainstate: a request, not a mode. Runs
+     * BEFORE store_init so the store opens the rebuilt index, and after the
+     * chdir into the per-chain directory, where the files live. */
+    if(g_cfg.reindex){
+        struct stat rst;
+        if(stat("reindex.done", &rst) == 0){
+            fprintf(stderr,"[reindex] reindex=1 is still set in the config but was already carried out "
+                           "(reindex.done exists) -- ignoring. Remove the option, and delete that marker "
+                           "if you truly want another rebuild.\n");
+        } else {
+            archive_reindex_stats rs; char rerr[256] = {0};
+            fprintf(stderr,"[reindex] rebuilding the block index from the blk files...\n");
+            if(archive_reindex(".", g_chainp->genesis_hash, BMC_FRAME_MAGIC, &rs, rerr, sizeof rerr) != 0){
+                fprintf(stderr,"[reindex] FAILED: %s -- nothing was replaced; not starting\n", rerr);
+                return 1;
+            }
+            fprintf(stderr,"[reindex] rebuilt: tip=%ld from %ld frame(s) in %ld file(s); %ld duplicate(s), "
+                           "%ld orphan(s), %ld stale fork block(s), %ld bad-PoW frame(s), %ld junk byte(s)%s\n",
+                    rs.tip, rs.frames, rs.files, rs.duplicates, rs.orphans, rs.stale, rs.bad_pow, rs.junk_bytes,
+                    rs.tip_reappended ? "; tip frame re-appended for append safety" : "");
+            { long dropped = archive_drop_utxo_state();
+              fprintf(stderr,"[reindex] dropped %ld UTXO state file(s); the set will rebuild from the archive\n", dropped); }
+            { const char* dz[] = {"txindex.dat","txindex.tail","addr_index.dat","bfilters.dat","bfilters.idx","coinstats.dat",0};
+              int nd = 0; for(int i = 0; dz[i]; i++) if(unlink(dz[i]) == 0) nd++;
+              if(nd) fprintf(stderr,"[reindex] removed %d height-positional index file(s); filters and coinstats rebuild "
+                                    "on their own, txindex needs build_tx_index\n", nd); }
+            FILE* mk = fopen("reindex.done", "w");
+            if(mk){ fprintf(mk, "reindex carried out\n"); fclose(mk); }
+            else fprintf(stderr,"[reindex] WARNING: could not write reindex.done -- the rebuild would repeat on the next restart\n");
+        }
+    }
     dir = effdir;
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the

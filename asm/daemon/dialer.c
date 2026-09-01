@@ -16,7 +16,8 @@
 extern int tcp_connect_ip(unsigned ip_netorder, unsigned short port_be);
 
 static int      g_ready;
-static int      g_have_v6;      /* an AF_INET6 socket can be created here */
+static int      g_have_v6;
+static int      g_have_v6_global;   /* ...and a global route exists, not just the stack */
 static i2psam_t g_i2p;
 static int      g_i2p_ok;
 static char     g_sam_ip[64]; static int g_sam_port;
@@ -46,6 +47,22 @@ int dialer_init(void){
     { int t = socket(AF_INET6, SOCK_STREAM, 0);
       if (t >= 0){ g_have_v6 = 1; close(t); }
       else log_fprintf(stderr, "[dial] no IPv6 on this host: ipv6 and cjdns peers are unreachable\n"); }
+    /* A v6 socket proves the stack, not a route. Global IPv6 peers need a
+     * default route: a UDP connect() to a public address (no packet is
+     * sent) fails with ENETUNREACH without one, and a host with only a ULA
+     * or a cjdns tun otherwise wasted a 10 s connect timeout on every IPv6
+     * candidate (2026-09-01). CJDNS keeps working off the tun interface. */
+    g_have_v6_global = 0;
+    if (g_have_v6){
+        int u = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (u >= 0){
+            struct sockaddr_in6 sa; memset(&sa, 0, sizeof sa); sa.sin6_family = AF_INET6; sa.sin6_port = htons(53);
+            inet_pton(AF_INET6, "2001:4860:4860::8888", &sa.sin6_addr);
+            if (connect(u, (struct sockaddr*)&sa, sizeof sa) == 0) g_have_v6_global = 1;
+            close(u);
+        }
+        if (!g_have_v6_global) log_fprintf(stderr, "[dial] no global IPv6 route on this host: ipv6 peers are unreachable (cjdns unaffected)\n");
+    }
     split_hostport(g_cfg.proxy, g_proxy_ip, sizeof g_proxy_ip, &g_proxy_port);
     /* Core: -onion defaults to -proxy; "0" disables onion entirely */
     if (!split_hostport(g_cfg.onion_proxy, g_onion_ip, sizeof g_onion_ip, &g_onion_port)){
@@ -119,10 +136,11 @@ int dialer_connect_name(const char* host, int port, int timeout_ms, const char**
     return fd;
 }
 int dialer_net_reachable(int net){
+    if (!g_ready) dialer_init();       /* answer from the configured transports, not from unset flags */
     if (!onlynet_allows(net)) return 0;
     switch (net){
     case BMC_NET_IPV4:  return 1;
-    case BMC_NET_IPV6:  return g_have_v6;
+    case BMC_NET_IPV6:  return g_have_v6_global;
     case BMC_NET_TORV3: return g_onion_ip[0] != 0;
     case BMC_NET_I2P:   return g_i2p_ok;
     /* CJDNS is an fc00::/8 address on a tun interface: it needs the IPv6

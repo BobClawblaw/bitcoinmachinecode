@@ -220,7 +220,9 @@ static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)s
  * computes the cost BEFORE admission and parks it here for the next
  * mpol_accept; consumed once. */
 static uint64_t mpol_pending_sigops;
+static uint64_t mpol_bytes_per_sigop = 20;          /* Core DEFAULT_BYTES_PER_SIGOP */
 void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_sigops = cost_x4; }
+void mpool_policy_set_bytespersigop(unsigned long long n){ mpol_bytes_per_sigop = n ? n : 20; }
 static void (*g_forget_cb)(const unsigned char txid[32]) = 0;
 void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb = fn; }
 
@@ -865,7 +867,8 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
       /* min relay floor over VSIZE (Core "min relay fee not met") */
       /* sigop-adjusted virtual size (Core GetVirtualTransactionSize with
        * bytespersigop=20): max(vsize, sigop_cost*5) */
-      { uint64_t sv = mpol_pending_sigops * 5; if (sv > eff_vsize) eff_vsize = sv; mpol_pending_sigops = 0; }
+      { uint64_t sv = mpol_pending_sigops * mpol_bytes_per_sigop / 4;   /* cost is x4 units; Core: sigops*bytespersigop/WITNESS_SCALE_FACTOR */
+        if (sv > eff_vsize) eff_vsize = sv; mpol_pending_sigops = 0; }
       if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */

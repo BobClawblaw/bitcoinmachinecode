@@ -100,6 +100,24 @@ fd_write_all:
 .wa:
     cmp  rbx, r14
     jae  .done
+    ; ---- bound the write: poll({fd, POLLOUT}, 1, 10000) first. A peer that
+    ; stops reading (a dead Tor circuit, a stalled subscriber, the other end
+    ; of an IPC pair busy elsewhere) otherwise holds a blocking write() for
+    ; ever, and nothing above this function can interrupt it. SO_SNDTIMEO
+    ; covers the sockets tcp_connect_ip creates; this covers every fd.
+    ; 0 = timed out, <0 = error/EINTR: both are a failed write (-1).
+    sub  rsp, 16
+    mov  dword [rsp], r12d   ; pollfd.fd
+    mov  word  [rsp+4], 4    ; pollfd.events = POLLOUT
+    mov  word  [rsp+6], 0    ; pollfd.revents
+    mov  rdi, rsp
+    mov  esi, 1              ; nfds
+    mov  edx, 10000          ; timeout ms
+    mov  eax, 7              ; poll
+    syscall
+    add  rsp, 16
+    test rax, rax
+    jle  .fail
     mov  rdi, r12
     lea  rsi, [r13+rbx]
     mov  rdx, r14
@@ -108,6 +126,7 @@ fd_write_all:
     syscall
     test rax, rax
     jg   .ok
+.fail:
     mov  rax, -1
     jmp  .ret
 .ok:
@@ -216,12 +235,28 @@ tcp_connect_ip:
     mov  rdi, rbx           ; fd
     mov  esi, 1             ; SOL_SOCKET
     mov  edx, 20            ; SO_RCVTIMEO
-    lea  rcx, [rsp]         ; &timeval
+    lea  r10, [rsp]         ; &timeval -- syscall arg4 is R10, not RCX (RCX is clobbered by SYSCALL)
+    mov  r8, 16             ; optlen
+    mov  eax, 54            ; setsockopt
+    syscall
+    ; ---- and SO_SNDTIMEO (21) with the same 10s: on Linux it bounds the
+    ; blocking connect() below. Without it a peer that swallows SYNs (a
+    ; blackholed address, a host behind a dropped route) holds connect() for
+    ; the kernel's full retry schedule -- about two minutes -- and every dial
+    ; site that is not inside the SIGALRM dial budget wedges the download
+    ; worker for that long per address: heartbeat silent, zero outbound
+    ; peers, SIGTERM unanswered (2026-08-31 21:20 and 2026-09-01 00:31,
+    ; both worker backtraces ending in tcp_connect_ip). A bounded connect
+    ; fails with EINPROGRESS, which every caller treats as a failed dial.
+    mov  rdi, rbx           ; fd
+    mov  esi, 1             ; SOL_SOCKET
+    mov  edx, 21            ; SO_SNDTIMEO
+    lea  r10, [rsp]         ; &timeval (still {10,0}); R10 = syscall arg4
     mov  r8, 16             ; optlen
     mov  eax, 54            ; setsockopt
     syscall
     add  rsp, 0x20
-    ; (ignore setsockopt errors; the read-timeout is best-effort)
+    ; (ignore setsockopt errors; the timeouts are best-effort)
     ; sockaddr_in on stack (16 bytes) BELOW save area
     sub  rsp, 0x40            ; rsp = rbp-0x40 ; sockaddr at rbp-0x40..-0x31
     xor  eax, eax
