@@ -149,7 +149,7 @@ grep -q "transaction sent in violation of protocol" "$WORK/bmc-A.log" && ok "...
 R=$(probe inv "$TX_INV" 4); case "$R" in EOF*) ok "a tx inv from a stranger -> disconnected ($R)";; *) fail "tx inv: $R";; esac
 R=$(probe mempool "" 4); case "$R" in EOF*) ok "a mempool request without the permission -> disconnected ($R)";; *) fail "mempool msg: $R";; esac
 grep -q "misbehaving" "$WORK/bmc-A.log" && fail "policy violations were SCORED (Core only disconnects)" || ok "policy violations disconnect without a misbehaviour score"
-grep -q "feefilter" "$WORK/bmc-A.log" && true; ok "(feefilter not sent under blocksonly: no `feefilter` outbound line expected)"
+grep -q "feefilter" "$WORK/bmc-A.log" && true; ok "(feefilter not sent under blocksonly: no feefilter outbound line expected)"
 stop_all
 
 echo "== run B: blocksonly=1 + whitelist=relay@127.0.0.1 =="
