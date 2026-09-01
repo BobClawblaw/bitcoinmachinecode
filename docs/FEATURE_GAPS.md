@@ -944,8 +944,10 @@ Missing:
   the wallet derives leaf keys named by a bip32 origin under its own
   fingerprint. Core's VerifyScript judges every form
   (`validation/signer_core_diff.sh`: 18/18 incl. the negative cases);
-  `tests/test_rpc_psbt_taproot` pins the PSBT plumbing. Still open: leaves
-  other than pk/multi_a (the miniscript satisfier), and `musig()` keys.
+  `tests/test_rpc_psbt_taproot` pins the PSBT plumbing. *(2026-09-01, later:
+  leaves other than pk/multi_a are signed by the miniscript satisfier and
+  `musig()` keys parse, expand and update -- see the Miniscript / musig()
+  update below.)*
 - ~~**Descriptor wallets**~~ — **`importdescriptors` is REAL** since the
   wallet-management merge; watch-only descriptors are tracked and rescanned.
   *(This paragraph claimed `createwalletdescriptor` and `addhdkey` were
@@ -1359,3 +1361,72 @@ that served BIP157 before this change must now set it explicitly.
 | `zmqpubrawtxhwm` | Set publish raw transaction outbound message high water mark (default: 1000) | implemented |
 | `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | implemented |
 | `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | implemented |
+## Update 2026-09-01 — Miniscript and `musig()` descriptors
+
+Closed: **Miniscript** (`asm/miniscript.c/.h`, Core's `script/miniscript.h`
+in C). The textual grammar with every wrapper and sugar form, the B/V/K/W
+type system with z/o/n/d/u, e/f/s/m, x and the g/h/i/j/k timelock
+properties, script size, ops (+ the CHECKMULTISIG worst case), stack size
+(P2WSH witness items / tapscript execution depth), witness size, script
+emission, script decoding (DecomposeScript's minimal-push and decomposed-
+VERIFY rules) and the satisfier with Core's InputStack algebra. The engine
+uses a flat node pool and explicit stacks -- nothing recurses -- because
+the daemon's threads have ~150 KB of stack and a valid tapscript
+miniscript can be thousands of nodes deep. `descriptor.c` accepts it inside
+`wsh()` and as `tr()` leaves with Core's sanity errors verbatim
+(`... is not sane: malleable witnesses exist`, `is invalid`, `is not
+satisfiable`, timelock mix, duplicate keys, resource limits) and the
+"only in wsh or tr" rule. The raw signer (`signrawtransactionwithkey`,
+and through it `walletprocesspsbt` / `descriptorprocesspsbt`) hands any
+witnessScript that is not CHECKSIG/CHECKMULTISIG, and any tapscript leaf
+that is not pk()/multi_a(), to the satisfier (`miniscript_sign.c`): keys
+held, the PSBT's `PSBT_IN_*_PREIMAGES`, the tx's nSequence/nLockTime as
+BIP68/BIP65 judge them, other signers' `TAP_SCRIPT_SIG` partials. Evidence:
+`tests/test_miniscript` -- all 97 literal vectors of Core's
+`miniscript_tests.cpp` in BOTH contexts plus the programmatic ones (21-key
+multi_a, 99/110/200-key and_b chains, 998/999-deep stack-limit chains),
+with every satisfaction run through this node's own interpreter under nine
+locktime/sequence contexts (44,921 checks); `tests/test_descriptor_vectors`
+carries Core's 11 miniscript error strings and 13 Check() vectors;
+`validation/miniscript_core_diff.py` -- a scratch regtest Core: 58
+descriptors, `getdescriptorinfo` and `deriveaddresses` byte-identical in
+private and public forms, then 41 funded spends built by Core
+(`createpsbt` v0 + `utxoupdatepsbt`), signed by `descriptorprocesspsbt` with
+only the granted keys and judged by `testmempoolaccept` + mining: 36
+positive (P2WSH and sh(wsh) fragments, older/after, all four hash
+challenges, a ranged tprv, seven tapscript leaves) mined, 5 negatives
+incomplete here and unfinalizable by Core. RESULT 436/436 (with the musig
+session below).
+
+Closed: **`musig()` descriptors** (BIP390). `musig(KEY,...)[/path][/*]` as
+the key of `tr()`/`rawtr()` and inside their leaves' `pk()`/`multi_a()`,
+with Core's `ParsePubkey` rules and messages; the aggregate is
+`musig2_key_agg` over the participants SORTED as Core's
+`MuSigPubkeyProvider` sorts them (Core v31.99 sorts -- `musig2.h`'s
+"written order" note was wrong; Core's own vectors settle it); the
+musig()'s derivation is BIP32 CKDpub over the synthetic xpub.
+`descriptorprocesspsbt` performs the Updater step Core's `UpdatePSBTInput`
+performs: `PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS` keyed by the underived
+aggregate, `PSBT_IN_TAP_INTERNAL_KEY`, `PSBT_IN_TAP_BIP32_DERIVATION` for the
+derived aggregate (fingerprint hash160(aggregate)[0..4] + the musig() path)
+and for every participant (origin, or the xpub's own fingerprint, or a
+bare key's hash160 prefix). Evidence: Core's nine non-multipath musig()
+Check() vectors (public form, private reprint, scriptPubKeys at three
+indices) and eight error strings in `tests/test_descriptor_vectors`; three
+MuSig2 sessions in `validation/miniscript_core_diff.py` (part 3) where two
+Core wallets and this node are the participants and the funded PSBT's
+musig/taproot fields are STRIPPED before this node sees it -- its Updater
+must recreate them: Core's `decodepsbt` of our PSBT shows the identical
+participants and internal key, the rounds complete, Core finalizes to the
+same transaction and mines it.
+
+Still open, by measurement: **multipath** `/<a;b>/*` key expressions (Core's
+multipath musig()/miniscript vectors use them; this engine has no multipath
+at all -- a separate item); **PSBT v2** in the signer (`psbt_process` takes
+v0 only; master Core's `createpsbt` defaults to v2 -- ask for
+`psbt_version=0`); `descriptorprocesspsbt` does not synthesize
+`tap_leaf_script`/control blocks for a tr() descriptor's leaves the way
+Core's Updater does (they must already be in the PSBT, as
+`utxoupdatepsbt` puts them); partial-signature EXTRACTION (`finalize=false`)
+for miniscript inputs stays limited to the P2WPKH/P2PKH/taproot forms.
+
