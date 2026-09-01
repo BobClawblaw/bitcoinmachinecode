@@ -1403,7 +1403,7 @@ static int cmd_getprioritisedtransactions(rj_val** res){
  * daemon (which has the worker + peer legs); the standalone bitcoin_rpcd has no
  * worker, so g_status_rw is NULL and this reports the node as unavailable. */
 #define SRT_WAIT_MS   90000     /* worker pickup can wait behind a 60s leg sync */
-#define SRT_POLL_US   3000
+#define SRT_POLL_US   500       /* was 3000: a 10k-entry mempool.dat reload took ~20 min at the submitter's poll rate (2026-09-01) */
 
 /* ==== savemempool / importmempool -- Core's mempool.dat ====================
  * The pool is shared memory the parent can read directly under the same lock

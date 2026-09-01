@@ -393,8 +393,13 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   trees, rawtr, addr and raw over hex, x-only, WIF and xpub/xprv keys with
   origins, paths and ranges (proven byte-identical to Core on its own test
   vectors); miniscript and `musig()` are refused by name.
-  `descriptorprocesspsbt` signs P2PKH, P2WPKH and P2SH-P2WPKH inputs from the
-  keys a descriptor carries and leaves other script forms unsigned.
+  `descriptorprocesspsbt` signs from the keys a descriptor carries.
+  `signrawtransactionwithkey` and the descriptor signer cover P2PKH, P2WPKH,
+  P2SH-P2WPKH, P2SH multisig, P2WSH and P2SH-P2WSH (CHECKMULTISIG or a single
+  CHECKSIG witnessScript) and P2TR key-path spends of `tr(KEY)`; taproot
+  script-path spends are not signed. BIP340 signing is in C and proven on
+  Core's test vectors; every signed form is checked against Core's script
+  engine by `validation/signer_core_diff.sh`.
 - **Mining.** `getblocktemplate` fills the block with whole linearization
   chunks in feerate order (Core v31's cluster-mempool block assembly; a chunk
   that does not fit skips its cluster) and reports a lower-bound `sigops`;
