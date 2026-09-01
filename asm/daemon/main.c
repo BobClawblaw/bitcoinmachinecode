@@ -4929,8 +4929,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 } else {
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
-                    dl_header_mirror_topup(store_buf);   /* keep the derived header mirror at the archive tip */
                 }
+                dl_header_mirror_topup(store_buf);   /* keep the derived header mirror at the archive tip, whichever path appended */
                 /* ZMQ hashblock/rawblock + the txid-index tail, from this
                  * same choke point for the same reason the log line is: it
                  * fires no matter which path appended the block.
