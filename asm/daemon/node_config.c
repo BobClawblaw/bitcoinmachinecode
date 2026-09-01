@@ -179,6 +179,7 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"rpcdoccheck",        "debug-only"},
     {"test",               "debug-only"},
     {"txospenderindex",    "not built yet (tracked in FEATURE_GAPS)"},
+    {"fastprune",          "debug-only pruning knob; this node prunes by its own MiB budget"},
     {"testnet",            "testnet3 is refused by design; use testnet4=1"},
     {"version",            "command-line only"},
     {"help",               "command-line only"},

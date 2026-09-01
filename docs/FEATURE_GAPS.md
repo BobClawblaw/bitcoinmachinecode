@@ -441,7 +441,7 @@ than trusted:
 | surface | state |
 | --- | --- |
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
-| **Config options** | **133 / 181 implemented, 47 accepted without effect (each named with its reason at start-up), 1 not recognised** — see the 2026-09-01 config-surface update below for the full table. |
+| **Config options** | **133 / 181 implemented, 48 accepted without effect (each named with its reason at start-up), 0 not recognised** — see the 2026-09-01 config-surface update below for the full table. |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex, **txospenderindex (2026-09-01)**. |
 | **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
@@ -1111,7 +1111,7 @@ states, and nothing else: **implemented** (parsed, with Core's semantics
 behind it), **accepted, no effect** (parsed, named at every start-up with the
 reason it is inert here — the table `k_noeffect` in node_config.c is the
 same list), or **not recognised** (ignored silently, as Core ignores unknown
-keys). Counts: 133 implemented, 47 accepted without effect, 1 not recognised.
+keys). Counts: 133 implemented, 48 accepted without effect, 0 not recognised.
 
 Landed today (branch `feat/config-surface`): `uacomment` (runtime user agent,
 on the wire and in `getnetworkinfo`), `blockmaxweight` / `blockreservedweight`
@@ -1200,7 +1200,7 @@ that served BIP157 before this change must now set it explicitly.
 | `dustrelayfee` | Fee rate (in BTC/kvB) used to define dust, the value of an output such that it will cost more than its value i… | implemented |
 | `externalip` | Specify your own public address | implemented |
 | `fallbackfee` | A fee rate (in BTC/kvB) that will be used when fee estimation has insufficient data. 0 to entirely disable the… | implemented |
-| `fastprune` | Use smaller block files and lower minimum prune height for testing purposes | not recognised (ignored silently, as Core ignores unknown keys) |
+| `fastprune` | Use smaller block files and lower minimum prune height for testing purposes | accepted, no effect: debug-only pruning knob; this node prunes by its own MiB budget |
 | `fixedseeds` | Allow fixed seeds if DNS seeds don't provide peers (default: 1) | accepted, no effect: no compiled-in seed list: DNS seeds, seednode= and peers.dat only |
 | `forcednsseed` | Always query for peer addresses via DNS lookup (default: 0) | implemented |
 | `help` | Print this help message and exit (also -h or -?) | accepted, no effect: command-line only |
