@@ -271,8 +271,20 @@ int main(void){
     wr("bmc_t21.conf", "txindex=1\nassumevalid=00000000000000000008a89e854d57e5667df88f1cdef6fea2db3d5eeb8ea9c1\nmaxconnections=77\n");
     node_config_load("bmc_t21.conf");
     if (g_cfg.max_connections==77)
-        printf("PASS: txindex/assumevalid warn without disturbing the parse\n");
+        printf("PASS: txindex warns without disturbing the parse\n");
     else { printf("FAIL: parse disturbed (conns=%d)\n", g_cfg.max_connections); failures++; }
+    /* assumevalid is honoured when set (2026-09-01): stored in wire order */
+    if (g_cfg.assumevalid_mode==1 && g_cfg.assumevalid[31]==0x00 && g_cfg.assumevalid[0]==0xc1 && g_cfg.assumevalid[1]==0xa9)
+        printf("PASS: assumevalid parsed into wire order\n");
+    else { printf("FAIL: assumevalid not parsed (mode=%d b0=%02x)\n", g_cfg.assumevalid_mode, g_cfg.assumevalid[0]); failures++; }
+    wr("bmc_t22.conf", "assumevalid=0\n");
+    node_config_load("bmc_t22.conf");
+    if (g_cfg.assumevalid_mode==2) printf("PASS: assumevalid=0 evaluates every script\n");
+    else { printf("FAIL: assumevalid=0 not honoured (mode=%d)\n", g_cfg.assumevalid_mode); failures++; }
+    wr("bmc_t23.conf", "assumevalid=notahash\n");
+    node_config_load("bmc_t23.conf");
+    if (g_cfg.assumevalid_mode==0) printf("PASS: a malformed assumevalid is ignored (chain default stays)\n");
+    else { printf("FAIL: malformed assumevalid accepted (mode=%d)\n", g_cfg.assumevalid_mode); failures++; }
 
     /* The fixtures used to be written into the repo dir by absolute path -- into
      * the MAIN checkout, even from a worktree -- and were removed only on this
