@@ -154,6 +154,12 @@ extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
+extern long utxo_live_recovery_applicable(void);         /* daemon/utxo_live.c: incident 2026-09-01 */
+extern long utxo_live_verify_after_recovery(long count_before);
+extern long utxo_live_halted(void);
+extern long utxo_live_last_fail_kind(void);
+extern const char* utxo_live_fail_kind_name(long k);
+extern const char* utxo_live_last_reject(void);
 /* Clamp the DISPLAYED live-UTXO count at 0. Backstop only: the count itself
  * is now kept accurate across restarts by the manifest persist/restore in
  * bitcoin_utxo_lsm.asm (this replaced the WAL-tail-only reload seed that let
@@ -5162,14 +5168,43 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);
             if(ar < 0){
-                fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld -- attempting in-place recovery\n",
-                        utxo_live_applied_height());
-                long rounds = utxo_live_recover();
-                ar = utxo_live_catchup(store_buf);
+                /* Incident 2026-09-01: recovery is no longer blind. Compaction
+                 * runs ONLY when utxo_live says the failure is a store error
+                 * with a full manifest; a consensus reject or any other
+                 * failure backs off and retries WITHOUT touching the runs
+                 * (the block is re-applied from the checkpoint; if the
+                 * archive is repaired meanwhile it will pass, otherwise it
+                 * fails the same way and stays DEGRADED -- visibly). After a
+                 * compaction the whole set is walked and must equal the
+                 * pre-recovery count, or UTXO tracking halts for good. */
+                long rounds = -1;
+                if(utxo_live_recovery_applicable()){
+                    long count_before = utxo_live_count();
+                    fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld with a full manifest -- compacting in place (pre-recovery count %ld)\n",
+                            utxo_live_applied_height(), count_before);
+                    rounds = utxo_live_recover();
+                    if(!utxo_live_verify_after_recovery(count_before)){
+                        utxo_live_ok = 0;
+                        fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: the set is inconsistent after recovery. "
+                                       "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
+                                utxo_live_applied_height());
+                        ar = -1;
+                    } else {
+                        ar = utxo_live_catchup(store_buf);
+                    }
+                } else {
+                    fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld: %s%s%s -- recovery refused (not a full manifest); will retry from the checkpoint\n",
+                            utxo_live_applied_height() + 1,
+                            utxo_live_fail_kind_name(utxo_live_last_fail_kind()),
+                            utxo_live_last_fail_kind() == 1 ? ": " : "",
+                            utxo_live_last_fail_kind() == 1 ? utxo_live_last_reject() : "");
+                }
                 if(ar >= 0){
                     utxo_fail_streak = 0;
-                    fprintf(stderr,"[dl] utxo recovery SUCCEEDED (%ld compaction round(s)) -- tracking continues at height %ld\n",
+                    fprintf(stderr,"[dl] utxo recovery SUCCEEDED (%ld compaction round(s), post-recovery walk verified) -- tracking continues at height %ld\n",
                             rounds, utxo_live_applied_height());
+                } else if(!utxo_live_ok){
+                    /* halted: no backoff, no retry -- the heartbeat carries the marker */
                 } else {
                     if(utxo_fail_streak < 30) utxo_fail_streak++;
                     long shift = utxo_fail_streak - 1; if(shift > 6) shift = 6;
@@ -5316,7 +5351,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     *(int*)(store_buf+24), live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf,
-                    utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
+                    utxo_live_halted() ? "  [UTXO HALTED -- inconsistent after recovery; drop and rebuild]"
+                    : utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
                         upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
