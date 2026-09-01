@@ -1976,6 +1976,12 @@ long utxo_live_catchup(void* store_buf){
     static u8 blockbuf[8<<20];
     long applied = 0;
     time_t last_progress_log = 0;   /* 0 => the first block prints immediately (restart-visible) */
+    /* rate + ETA on the progress tick (2026-09-01): instantaneous rate over
+     * the last tick interval, session-average rate since this call began
+     * (the ETA uses the average -- flush pauses make the instantaneous
+     * figure swing 0..80 blk/s), ETA as DD:HH:MM:SS of the remaining gap. */
+    long long cu_t0 = mono_ms(), cu_last_ms = cu_t0;
+    long cu_h0 = g_applied_height, cu_last_h = g_applied_height;
     for (long h = g_applied_height + 1; h <= tip; h++){
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         if (len < 81) {
@@ -2069,8 +2075,16 @@ long utxo_live_catchup(void* store_buf){
         {
             time_t now = time(NULL);
             if (now - last_progress_log >= 30 || h % 20000 == 0) {
-                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
-                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
+                long long nowms = mono_ms();
+                double inst = nowms > cu_last_ms ? (double)(h - cu_last_h) * 1000.0 / (double)(nowms - cu_last_ms) : 0.0;
+                double avg  = nowms > cu_t0     ? (double)(h - cu_h0)     * 1000.0 / (double)(nowms - cu_t0)     : 0.0;
+                long rem = tip - h, eta = avg > 0.0 ? (long)((double)rem / avg) : -1;
+                char etabuf[32];
+                if (eta >= 0) snprintf(etabuf, sizeof etabuf, "%02ld:%02ld:%02ld:%02ld", eta / 86400, (eta / 3600) % 24, (eta / 60) % 60, eta % 60);
+                else          snprintf(etabuf, sizeof etabuf, "--:--:--:--");
+                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%) %.1f blk/s (avg %.1f) eta %s\n",
+                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0, inst, avg, etabuf);
+                cu_last_ms = nowms; cu_last_h = h;
                 last_progress_log = now;
             }
         }
