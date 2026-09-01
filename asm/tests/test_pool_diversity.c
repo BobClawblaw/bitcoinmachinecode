@@ -33,6 +33,8 @@ int main(void){
     char s[128]; bmc_addr_t a; int added = 0;
     for(int i = 0; i < 600; i++){ snprintf(s, sizeof s, "%d.%d.%d.%d", 11, 1 + (i >> 7), 1 + (i & 127), 7); if(bmc_addr_from_string_port(&a, s, 8333) && ab2_add(b, &a, 0x409, 100 + i) == 1) added++; }
     ok(added == 600, "600 IPv4 entries added");
+    { int extra = 0; for(int i = 600; i < 4300; i++){ snprintf(s, sizeof s, "%d.%d.%d.%d", i < 4096 ? 11 : 22, 1 + (i >> 7) % 250, 1 + (i & 127), 9); if(bmc_addr_from_string_port(&a, s, 8333) && ab2_add(b, &a, 0x409, 100 + i) == 1) extra++; }
+      ok(extra == 3700, "3700 more IPv4 entries: the book now has 4300, the last 204 with a 22. prefix beyond the head window"); }
     static const char* alpha = "abcdefghijklmnopqrstuvwxyz234567";
     int nonion = 0;
     for(int i = 0; i < 30; i++){
@@ -67,14 +69,18 @@ int main(void){
     for(int i = 0; i < n; i++){ int k = net_of(pool[i]); if(k >= 0 && k < 8) c[k]++; for(int j = 0; j < i; j++) if(!strcmp(pool[i], pool[j])) dup++; }
     printf("  ipv4 %d ipv6 %d onion %d i2p %d cjdns %d\n", c[BMC_NET_IPV4], c[BMC_NET_IPV6], c[BMC_NET_TORV3], c[BMC_NET_I2P], c[BMC_NET_CJDNS]);
     ok(dup == 0, "no duplicates");
+    int r6 = dialer_net_reachable(BMC_NET_IPV6), exp6 = r6 ? 8 : 0;
+    printf("  (global IPv6 route on this host: %s)\n", r6 ? "yes" : "no -- ipv6 quota expected 0");
     ok(c[BMC_NET_TORV3] == 12, "onion quota: 12 of 64");
-    ok(c[BMC_NET_IPV6] == 8, "ipv6 quota: 8 of 64");
+    ok(c[BMC_NET_IPV6] == exp6, "ipv6 quota: 8 of 64 when a global route exists, else none");
     ok(c[BMC_NET_CJDNS] == 3, "cjdns quota: 3 of 64");
     ok(c[BMC_NET_I2P] == 0, "i2p: none -- its transport is not configured, so nothing in the pool");
-    ok(c[BMC_NET_IPV4] == 64 - 23, "clearnet fills the rest (41)");
-    ok(net_of(pool[3]) == BMC_NET_TORV3 && net_of(pool[6]) == BMC_NET_IPV6, "boot slots: an onion at 3 and an ipv6 at 6");
-    int early_v4 = 0; for(int i = 0; i < 8; i++) if(i != 3 && i != 6 && net_of(pool[i]) == BMC_NET_IPV4) early_v4++;
-    ok(early_v4 == 6, "...and the other six boot slots are clearnet (sequential dials stay fast)");
+    ok(c[BMC_NET_IPV4] == 64 - 15 - exp6, "clearnet fills the rest");
+    ok(net_of(pool[3]) == BMC_NET_TORV3 && (!r6 || net_of(pool[6]) == BMC_NET_IPV6), "boot slots: an onion at 3 (and an ipv6 at 6 when reachable)");
+    int early_v4 = 0; for(int i = 0; i < 8; i++) if(i != 3 && !(r6 && i == 6) && net_of(pool[i]) == BMC_NET_IPV4) early_v4++;
+    ok(early_v4 == (r6 ? 6 : 7), "...and the other boot slots are clearnet (sequential dials stay fast)");
+    int beyond = 0; for(int i = 0; i < n; i++) if(!strncmp(pool[i], "22.", 3)) beyond++;
+    ok(beyond == 0, "no clearnet entry from beyond the head window (gossip tail)");
     int first_onion_after8 = -1; for(int i = 8; i < n; i++) if(net_of(pool[i]) == BMC_NET_TORV3){ first_onion_after8 = i; break; }
     ok(first_onion_after8 >= 8 && first_onion_after8 <= 12, "the rotation reaches an onion within its first few dials past the boot slots");
 
@@ -84,8 +90,8 @@ int main(void){
       for(int i = 0; i < nb; i++){ int k = net_of(big[i]); if(k >= 0 && k < 8) cb[k]++; }
       printf("  ipv4 %d ipv6 %d onion %d i2p %d cjdns %d\n", cb[BMC_NET_IPV4], cb[BMC_NET_IPV6], cb[BMC_NET_TORV3], cb[BMC_NET_I2P], cb[BMC_NET_CJDNS]);
       ok(nb == 512, "512 entries");
-      ok(cb[BMC_NET_TORV3] == 12 && cb[BMC_NET_IPV6] == 8 && cb[BMC_NET_CJDNS] == 3, "the anonymity floors stay 12/8/3 in the big pool");
-      ok(cb[BMC_NET_IPV4] == 512 - 23, "clearnet fills the other 489 (the downloader stays fast)"); }
+      ok(cb[BMC_NET_TORV3] == 12 && cb[BMC_NET_IPV6] == exp6 && cb[BMC_NET_CJDNS] == 3, "the anonymity floors stay 12/(8|0)/3 in the big pool");
+      ok(cb[BMC_NET_IPV4] == 512 - 15 - exp6, "clearnet fills the rest (the downloader stays fast)"); }
     printf("== it is a sample, not the head of the file ==\n");
     static char pool2[64][DL_POOL_SLOT];
     dl_pool_test_seed(999);
@@ -93,7 +99,7 @@ int main(void){
     int same = 0; for(int i = 0; i < n && i < n2; i++) if(!strcmp(pool[i], pool2[i])) same++;
     ok(n2 == 64 && same < 64, "a different seed gives a different pool");
     int head = 0; for(int i = 0; i < n; i++) if(net_of(pool[i]) == BMC_NET_IPV4){ unsigned q0 = 0; sscanf(pool[i], "%u.", &q0); (void)q0; head++; }
-    ok(head == 41, "every clearnet entry is a parseable ipv4");
+    ok(head == 64 - 15 - exp6, "every clearnet entry is a parseable ipv4");
 
     printf("== nothing reachable but clearnet ==\n");
     g_cfg.onion_proxy[0] = 0; g_cfg.cjdnsreachable = 0; dialer_reset_for_test();

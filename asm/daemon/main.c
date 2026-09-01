@@ -2244,6 +2244,7 @@ static unsigned long long dl_pool_rng(void){
     return dl_pool_rng_state = x;
 }
 #define DL_POOL_NNET 5
+#define DL_POOL_V4_WINDOW  4096   /* clearnet candidates: the first entries of the book (see dl_pool_from_book) */
 #define DL_POOL_RESERVOIR 8192   /* per-network sample: clearnet must be able to fill the largest catch-up pool (bmc.peerpool <= 8192) */
 static int dl_pool_net_slot(int net){
     switch(net){ case BMC_NET_IPV4: return 0; case BMC_NET_IPV6: return 1; case BMC_NET_TORV3: return 2;
@@ -2258,6 +2259,14 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
     for(long i = 0; i < cnt; i++){
         ab2_rec_t r; if(!ab2_get(b, i, &r)) continue;
         int k = dl_pool_net_slot(r.a.net); if(k < 0) continue;
+        /* Clearnet comes from the HEAD of the book only. The book carries no
+         * tried/new distinction and gossip refreshes last_seen, so recency
+         * cannot tell a once-connected peer from an address a stranger
+         * claimed; but the head is the migrated, once-connected set and
+         * gossip appends behind it. A uniform sample over all 17k IPv4
+         * entries drew mostly dead addresses and odd ports -- one live leg in
+         * five minutes (2026-09-01 02:20). */
+        if(k == 0 && i >= DL_POOL_V4_WINDOW) continue;
         if(!dialer_net_reachable(r.a.net)) continue;      /* stays in the book, never in the pool */
         if(!bmc_addr_is_routable(&r.a)) continue;
         long n = seen[k]++;
