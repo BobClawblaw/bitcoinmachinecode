@@ -158,6 +158,8 @@ int main(void){
 
     long ec; const char* em; rj_val* r; int rc;
     #define D(m, p) (r = NULL, ec = 0, em = NULL, rc = rpc_wops_dispatch((m), (p), &W, &r, &ec, &em))
+    /* methods rpc_commands.c owns (getnewaddress) go through the full dispatcher */
+    #define DX(m, p) (r = NULL, ec = 0, em = NULL, rc = rpc_dispatch((m), (p), &W, &r, &ec, &em))
 
     /* ---- every advertised method is owned, and nothing else is ---- */
     ck("known_method(setlabel)", rpc_wops_known_method("setlabel") == 1);
@@ -485,9 +487,36 @@ int main(void){
         rj_free(r); rj_free(p1); }
       { rj_val* p1 = P("[\"bech32m\"]");
         D("createwalletdescriptor", p1);
-        ck("createwalletdescriptor bech32m -> refused with the SPECIFIC reason",
-           rc == 0 && ec == -4 && em && strstr(em, "derives only wpkh"));
-        rj_free(r); rj_free(p1); }
+        ck("createwalletdescriptor bech32m -> activated: {descs:[tr(...), tr(...)]} (2026-09-01)",
+           rc == 1 && r && rj_obj_get(r, "descs") && rj_obj_get(r, "descs")->nitems == 2 &&
+           !strncmp(rj_obj_get(r, "descs")->items[0]->str, "tr([", 4) && strstr(rj_obj_get(r, "descs")->items[0]->str, "/86h/0h/0h/0/0]"));
+        rj_free(r); rj_free(p1);
+        p1 = P("[\"bech32m\"]");
+        D("createwalletdescriptor", p1);
+        ck("...a second time -> Descriptor already exists (-4)", rc == 0 && ec == -4 && em && !strcmp(em, "Descriptor already exists"));
+        rj_free(r); rj_free(p1);
+        /* it is now listed, and getnewaddress hands out the descriptor's own address */
+        D("listdescriptors", NULL);
+        { rj_val* ds = r ? rj_obj_get(r, "descriptors") : NULL; int ntr = 0; char tr0[400] = "";
+          if (ds) for (unsigned long i = 0; i < ds->nitems; i++){ rj_val* d = rj_obj_get(ds->items[i], "desc"); if (d && !strncmp(d->str, "tr(", 3)){ ntr++; if (!tr0[0]) snprintf(tr0, sizeof tr0, "%s", d->str); } }
+          ck("listdescriptors now carries the two tr() descriptors beside the two wpkh()", ds && ds->nitems == 4 && ntr == 2);
+          rj_free(r);
+          rj_val* p2 = P("[\"\", \"bech32m\"]"); DX("getnewaddress", p2);
+          char a[128] = ""; if (rc == 1 && r && r->typ == RJ_STR) snprintf(a, sizeof a, "%s", r->str);
+          ck("getnewaddress bech32m -> a bc1p address", !strncmp(a, "bc1p", 4));
+          extern int rpc_desc_address_at(const char*, long, char*, long, char*, unsigned long);
+          char da[128] = {0}, derr[128];
+          ck("...equal to deriveaddresses of the listed tr() descriptor", a[0] && rpc_desc_address_at(tr0, 0, da, sizeof da, derr, sizeof derr) && !strcmp(da, a));
+          rj_free(r); rj_free(p2); }
+        { rj_val* p3 = P("[\"\", \"legacy\"]"); DX("getnewaddress", p3);
+          ck("getnewaddress legacy before createwalletdescriptor -> No legacy addresses available (-4)", rc == 0 && ec == -4 && em && strstr(em, "No legacy addresses"));
+          rj_free(r); rj_free(p3); }
+        { rj_val* p4 = P("[\"p2sh-segwit\"]"); D("createwalletdescriptor", p4);
+          ck("createwalletdescriptor p2sh-segwit -> sh(wpkh([../49h/..]))", rc == 1 && r && rj_obj_get(r, "descs") && !strncmp(rj_obj_get(r, "descs")->items[0]->str, "sh(wpkh([", 9));
+          rj_free(r); rj_free(p4);
+          rj_val* p5 = P("[\"\", \"p2sh-segwit\"]"); DX("getnewaddress", p5);
+          ck("getnewaddress p2sh-segwit -> a 3... address", rc == 1 && r && r->typ == RJ_STR && r->str[0] == '3');
+          rj_free(r); rj_free(p5); } }
       D("createwalletdescriptor", NULL);
       ck("createwalletdescriptor with no type -> -8", rc == 0 && ec == -8);
       rj_free(r);
