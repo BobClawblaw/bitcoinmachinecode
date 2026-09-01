@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/uio.h>
 #include <stdint.h>
 
 typedef unsigned char u8;
@@ -72,11 +73,38 @@ static void undo_path(char out[64], long height){
  * `height` here is the CONSUMING block's height (the undo file this record
  * is appended to); `utxo_height` is the spent UTXO's OWN original creation
  * height, captured separately -- see this file's header comment. */
+/* The undo file of the block being applied stays open across the block
+ * (2026-09-01): open/write/write/close per spent input was four syscalls
+ * per input on the live replay. The writes are still immediate (O_APPEND,
+ * one writev per record), so what is on disk at any instant is exactly
+ * what it was before -- only the open/close pair moved to the block
+ * boundary. undo_close_current() is called by the apply loop after every
+ * block and by undo_discard/prune before unlinking the same height. */
+static int  g_undo_fd = -1;
+static long g_undo_fd_height = -1;
+void undo_close_current(void){
+    if (g_undo_fd >= 0) close(g_undo_fd);
+    g_undo_fd = -1; g_undo_fd_height = -1;
+}
+static int undo_fd_for(long height){
+    if (g_undo_fd >= 0 && g_undo_fd_height == height) return g_undo_fd;
+    undo_close_current();
+    char path[64]; undo_path(path, height);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return -1;
+    g_undo_fd = fd; g_undo_fd_height = height;
+    return fd;
+}
+static int undo_unlink(long height){
+    if (g_undo_fd_height == height) undo_close_current();
+    char path[64]; undo_path(path, height);
+    return unlink(path);
+}
+
 long undo_append_record(long height, const u8 txid[32], u32 index, u64 value,
                          u32 utxo_height, u8 is_coinbase,
                          const u8* script, u16 slen){
-    char path[64]; undo_path(path, height);
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd = undo_fd_for(height);
     if (fd < 0) return -1;
 
     u8 hdr[UNDO_HEADER_BYTES];
@@ -87,14 +115,11 @@ long undo_append_record(long height, const u8 txid[32], u32 index, u64 value,
     hdr[48] = is_coinbase;
     memcpy(hdr+49, &slen, 2);
 
-    long ok = 1;
-    if (write(fd, hdr, UNDO_HEADER_BYTES) != UNDO_HEADER_BYTES) ok = -1;
-    if (ok == 1 && slen > 0) {
-        long w = write(fd, script, slen);
-        if (w != (long)slen) ok = -1;
-    }
-    close(fd);
-    return ok;
+    struct iovec iov[2] = { { hdr, UNDO_HEADER_BYTES }, { (void*)script, slen } };
+    long want = UNDO_HEADER_BYTES + (long)slen;
+    long w = writev(fd, iov, slen > 0 ? 2 : 1);
+    if (w != want) { undo_close_current(); return -1; }
+    return 1;
 }
 
 typedef struct {
@@ -227,8 +252,7 @@ long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn){
  * undo_append_record opens with O_APPEND, so a stale file left in place
  * would be silently PREPENDED to the new block's records). */
 long undo_discard(long height){
-    char path[64]; undo_path(path, height);
-    return unlink(path) == 0 ? 1 : 0;
+    return undo_unlink(height) == 0 ? 1 : 0;
 }
 
 /* undo_prune_from(from_height, tip_height, window, max_scan)
@@ -252,8 +276,7 @@ long undo_prune_from(long from_height, long tip_height, long window, long max_sc
     long end = from_height + max_scan;
     if (end > keep_from) end = keep_from;
     for (long h = from_height; h < end; h++){
-        char path[64]; undo_path(path, h);
-        unlink(path);
+        undo_unlink(h);
     }
     return end > from_height ? end : from_height;
 }
@@ -272,8 +295,7 @@ long undo_prune(long tip_height, long window){
     if (keep_from < 0) keep_from = 0;
     long removed = 0;
     for (long h = 0; h < keep_from; h++){
-        char path[64]; undo_path(path, h);
-        if (unlink(path) == 0) removed++;
+        if (undo_unlink(h) == 0) removed++;
     }
     return removed;
 }

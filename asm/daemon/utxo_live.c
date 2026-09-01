@@ -516,7 +516,10 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
     g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
 }
 
+extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
+    /* the height claims every op through h is in the WAL: land the buffer first */
+    if (utxo_store_wal_drain(&g_utxo_lst) != 0) return 0;
     u8 buf[12];
     u32 magic = UTXO_APPLIED_HEIGHT_MAGIC;
     memcpy(buf, &magic, 4);
@@ -1253,7 +1256,23 @@ long utxo_live_dryrun_block(const u8* blockbuf, u64 blocklen, long height){
     return r;
 }
 
+extern void undo_close_current(void);
+static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
+/* Block boundary = WAL drain + undo file close (2026-09-01): the WAL is
+ * buffered in the store (one write per block instead of one per record)
+ * and the block's undo file stays open across its inputs. Both land here,
+ * success or failure, so everything after this point -- the checkpoint, a
+ * rollback, the next block's undo file -- sees a complete on-disk record. */
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
+    int r = apply_block_at_inner(blockbuf, blocklen, height);
+    undo_close_current();
+    if (utxo_store_wal_drain(&g_utxo_lst) != 0) {
+        fprintf(stderr, "[utxo_live] FATAL: WAL drain failed after height %ld\n", height);
+        return 0;
+    }
+    return r;
+}
+static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
     { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
       tx_verify_set_script_checks(on);

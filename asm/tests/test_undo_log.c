@@ -223,6 +223,25 @@ int main(void){
         cki("re-pruning the same window removes nothing more", removed2, 0);
     }
 
+    /* 2026-09-01: the undo file of a height stays open across its appends;
+     * a discard of that same height must close it, so a later re-append
+     * (a rolled-back block applied again) writes a NEW file, not the
+     * unlinked inode. */
+    {
+        extern long undo_discard(long height);
+        extern void undo_close_current(void);
+        u8 tx1[32], tx2[32]; memset(tx1, 0xA1, 32); memset(tx2, 0xA2, 32);
+        u8 sc[3] = { 0x51, 0x52, 0x53 };
+        cki("append h=777 (fd stays open)", undo_append_record(777, tx1, 0, 1, 0, 0, sc, 3), 1);
+        cki("discard h=777 while its fd is cached", undo_discard(777), 1);
+        cki("re-append h=777 after the discard", undo_append_record(777, tx2, 5, 2, 0, 0, sc, 3), 1);
+        undo_close_current();
+        undo_rec_t recs[4]; long n = undo_load(777, recs, 4);
+        cki("the re-created file holds only the new record", n, 1);
+        cki("...and it is the second one", n == 1 && memcmp(recs[0].txid, tx2, 32) == 0 && recs[0].index == 5, 1);
+        undo_discard(777);
+    }
+
     /* cleanup */
     for (long h = 0; h <= 250; h++){
         char p[64]; snprintf(p, sizeof p, "undo_%ld.dat", h);
