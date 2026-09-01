@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* tests/test_descriptor_vectors.c -- the descriptor engine against Core's
  * own descriptor_tests.cpp vectors: 43 descriptors (every non-miniscript,
  * non-musig case), each in private and public form, expanded at every
@@ -8,6 +9,7 @@
 #include <stdlib.h>
 #include "../descriptor.h"
 #include "desc_vectors.h"
+#include "desc_mp_vectors.h"
 static int fails = 0, checks = 0;
 static void ck(const char* l, int c){ checks++; if (!c){ printf("  FAIL %s\n", l); fails++; } }
 static void hex(char* o, const unsigned char* b, int n){ for (int i=0;i<n;i++) sprintf(o+2*i,"%02x",b[i]); o[2*n]=0; }
@@ -220,6 +222,56 @@ int main(void){
         BAD("tr(musig(" XPRV1 "," XPUB2 ")/1'/*)", "musig(): cannot have hardened derivation steps");
         BAD("tr(musig(" XPRV1 "," XPUB2 ")/1/*')", "musig(): Cannot have hardened child derivation");
         BAD("tr(musig(04a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd5b8dec5235a0fa8722476c7709c02559e3aa73aa03918ba2d492eea75abea235," XPUB2 "))", "musig(): Uncompressed keys are not allowed");
+    }
+
+    /* ---- BIP389 multipath: Core's CheckMultipath cases (2026-09-01) ----
+     * parse the multipath text, expand into N single-path descriptors,
+     * each printing exactly as Core's expanded private/public forms and
+     * yielding Core's scriptPubKeys at every index; the multipath form
+     * prints back; the unparsable cases fail with Core's error texts. */
+    {
+        static descr_t d; char err[512]; char s2[1500];
+        for (int i = 0; i < MP_NVECS; i++){
+            const mp_vec_t* v = &MP_VECS[i];
+            for (int form = 0; form < 2; form++){
+                const char* text = form ? v->pub : v->prv;
+                char lab[64]; snprintf(lab, sizeof lab, "mp vec %d %s", i, form ? "pub" : "prv");
+                if (!descr_parse(text, &d, err, sizeof err)){ printf("  FAIL %s: parse: %s\n", lab, err); fails++; checks++; continue; }
+                ck(lab, descr_multipath_n(&d) == v->n);
+                { descr_to_string_multipath(&d, 0, s2, sizeof s2); char want[1500]; snprintf(want, sizeof want, "%s", v->pub); strip_cs(want);
+                  if (strcmp(s2, want)){ printf("  FAIL %s multipath print:\n    got  %s\n    want %s\n", lab, s2, want); fails++; } checks++; }
+                for (int sel = 0; sel < v->n; sel++){
+                    /* Core's CheckMultipath: one flag set for all expansions, or one per expansion ("{HARDENED, DEFAULT}") */
+                    int hard_pub = 0;
+                    if (form){ const char* f = v->flags; int ncomma = 0; for (const char* c = f; *c; c++) if (*c == ',') ncomma++;
+                        if (ncomma + 1 == v->n){ int k2 = 0; const char* seg = f; for (const char* c = f; ; c++){ if (*c == ',' || *c == 0){ if (k2 == sel){ hard_pub = memmem(seg, (size_t)(c - seg), "HARDENED", 8) != NULL; break; } k2++; seg = c + 1; } if (!*c) break; } }
+                        else hard_pub = strstr(f, "HARDENED") != NULL; }
+                    ck("select", descr_multipath_select(&d, sel));
+                    descr_to_string(&d, 0, s2, sizeof s2);
+                    if (strcmp(s2, v->exp_pub[sel])){ printf("  FAIL %s exp %d pub:\n    got  %s\n    want %s\n", lab, sel, s2, v->exp_pub[sel]); fails++; } checks++;
+                    if (!form){ descr_to_string(&d, 1, s2, sizeof s2);
+                        if (strcmp(s2, v->exp_prv[sel])){ printf("  FAIL %s exp %d prv:\n    got  %s\n    want %s\n", lab, sel, s2, v->exp_prv[sel]); fails++; } checks++; }
+                    for (int j = 0; j < v->nidx[sel]; j++){
+                        descr_spk_t sp[4]; int n = descr_expand(&d, j, sp, 4);
+                        if (hard_pub){ if (!(n == -1 && strstr(descr_last_error(), "without private keys"))){ printf("  FAIL %s exp %d idx %d: hardened pub form expanded (n=%d, %s)\n", lab, sel, j, n, descr_last_error()); fails++; } checks++; continue; }
+                        if (n != v->nspk[sel][j]){ printf("  FAIL %s exp %d idx %d: %d spk(s), Core has %d (%s)\n", lab, sel, j, n, v->nspk[sel][j], descr_last_error()); fails++; checks++; continue; }
+                        for (int q = 0; q < n; q++){ char h[1100]; hex(h, sp[q].spk, sp[q].len); checks++;
+                            if (strcmp(h, v->spk[sel][j][q])){ printf("  FAIL %s exp %d idx %d spk %d:\n    got  %s\n    want %s\n", lab, sel, j, q, h, v->spk[sel][j][q]); fails++; } }
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < MP_NUNP; i++){
+            const mp_unp_t* u = &MP_UNP[i];
+            int ok = !descr_parse(u->prv, &d, err, sizeof err);
+            char lab[64]; snprintf(lab, sizeof lab, "mp unparsable %d", i);
+            if (!ok){ printf("  FAIL %s: parsed: %s\n", lab, u->prv); fails++; }
+            else if (strcmp(err, u->err)){ printf("  FAIL %s error text:\n    got  %s\n    want %s\n", lab, err, u->err); fails++; }
+            checks++;
+            ok = !descr_parse(u->pub, &d, err, sizeof err);
+            if (!ok || strcmp(err, u->err)){ printf("  FAIL %s (pub) error: got '%s'\n", lab, ok ? err : "(parsed)"); fails++; }
+            checks++;
+        }
     }
     printf("\n%s (%d failures, %d checks)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails, checks);
     return fails ? 1 : 0;
