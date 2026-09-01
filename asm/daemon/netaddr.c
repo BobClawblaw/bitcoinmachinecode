@@ -117,7 +117,18 @@ int bmc_addr_from_string_port(bmc_addr_t* a, const char* s, unsigned short def_p
         else strcpy(host, s);
     }
     if (!bmc_addr_from_string(a, host)) return 0;
-    if (pstr){ long p = atol(pstr); if (p <= 0 || p > 65535) return 0; a->port = (unsigned short)p; }
+    if (pstr){
+        long p = atol(pstr);
+        /* port 0 is what an I2P address carries (Core's convention: the
+         * destination, not a port, names the service); for every other
+         * network it is invalid. Refusing it for I2P made every
+         * "<b32>.b32.i2p:0" pool entry unparseable, so leg_net_of() fell
+         * back to IPv4 and the reserved-slot chooser never saw an I2P
+         * candidate while the inline re-dial tried them as clearnet. */
+        if (p < 0 || p > 65535) return 0;
+        if (p == 0 && a->net != BMC_NET_I2P) return 0;
+        a->port = (unsigned short)p;
+    }
     else a->port = def_port;
     return 1;
 }
