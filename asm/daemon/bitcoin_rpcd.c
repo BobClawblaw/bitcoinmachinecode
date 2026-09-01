@@ -19,6 +19,7 @@
 #include "../rpc_chain.h"
 
 #include <stdio.h>
+#include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
