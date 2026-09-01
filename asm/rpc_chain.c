@@ -616,7 +616,7 @@ char* rpc_chain_script_asm(const unsigned char* sc, unsigned long n, int sighash
 rj_val* rpc_chain_script_json_noaddr(const unsigned char* sc, unsigned long n){
     rj_val* o = rj_obj();
     char* a = script_asm(sc, n, 0); rj_obj_set(o, "asm", rj_str(a ? a : "")); free(a);
-    { char* di = desc_inner_of(sc, n); char* dc = desc_with_checksum(di); if (dc){ rj_obj_set(o, "desc", rj_str(dc)); free(dc); } free(di); }
+    /* no "desc": Core's decodepsbt calls the ScriptToUniv overload without a provider for these */
     char* h = malloc(n*2 + 1); if (h){ hex_of(h, sc, n); rj_obj_set(o, "hex", rj_str(h)); free(h); }
     rj_obj_set(o, "type", rj_str(script_type(sc, n)));
     return o;
