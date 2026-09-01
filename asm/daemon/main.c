@@ -902,6 +902,7 @@ static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_net[MUX_MAX_OUT];
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][128]   /* "host:port" of a v3 onion is 67 bytes; 64 truncated it and broke the top-up dedupe (2026-09-01) */;
+static int   g_in_dial_helper = 0;          /* set in a dial-helper child: no book writes, no shared-status writes */
 static int   mux_n_out = 0;
 static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
 static long long mux_out_nextretry[MUX_MAX_OUT];
@@ -1640,7 +1641,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
      * next dial onwards the v2 gate has something real to read. */
     { unsigned long long svc = 0;
       if (g_peer_version_len >= 12) memcpy(&svc, g_peer_version_payload + 4, 8);
-      if (svc){
+      if (svc && !g_in_dial_helper){       /* a helper child never writes the book */
           bmc_addr_t pa;
           if (bmc_addr_from_string_port(&pa, host, (unsigned short)out_port)){
               ab2_t* b = addr_book();
@@ -1946,6 +1947,119 @@ static long do_outbound_sync(int i){
  * single-seed-limited. On success the slot is re-anchored at our stored tip and
  * reused in the poll loop; on failure the slot stays dead (fd -1) and is retried
  * on a later rotation. */ 
+/* ---- async dial helper ----------------------------------------------------
+ * An anonymity-network dial (Tor rendezvous, I2P tunnel, then the version
+ * handshake) takes tens of seconds, and every dial path in this worker runs
+ * INLINE in the rotation: three consecutive onion dials starved the
+ * heartbeat for three minutes and tripped the deploy guard (2026-09-01).
+ * So those dials happen in a forked child that runs the same
+ * outbound_connect and hands the CONNECTED socket back over a socketpair
+ * with SCM_RIGHTS, together with the handshake facts the leg needs (the
+ * peer's version payload, its addrv2 preference). Onion and I2P legs are v1
+ * transport, so no cipher state has to cross the process boundary. The
+ * worker polls the channel without blocking every rotation and installs the
+ * leg exactly as the inline fill would have. Core does the same job with a
+ * thread; a child keeps this worker's single-threaded invariants. */
+#define DH_MAX 2
+typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; } dh_slot_t;
+static dh_slot_t g_dh[DH_MAX];
+static long long g_dh_timeout_ms = 120000;
+/* g_in_dial_helper is declared with the leg tables above */
+typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[256]; char why[128]; } dh_result_t;
+void dial_helper_test_set_timeout_ms(long long ms){ g_dh_timeout_ms = ms; }
+static int leg_net_of(const char* hostport){
+    bmc_addr_t a; return bmc_addr_from_string_port(&a, hostport, 0) ? (int)a.net : BMC_NET_IPV4;
+}
+static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_NET_I2P; }
+static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
+static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
+static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+static int dh_start(const char* host, int out_port){
+    int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
+    if(slot < 0) return 0;
+    int sp[2]; if(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return 0;
+    pid_t pid = fork();
+    if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
+    if(pid == 0){
+        close(sp[0]); g_in_dial_helper = 1;
+        dh_result_t r; memset(&r, 0, sizeof r);
+        int fd = outbound_connect(host, 300, out_port);
+        if(fd >= 0){
+            r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2;
+            r.vlen = g_peer_version_len > 0 && g_peer_version_len <= 256 ? g_peer_version_len : 0;
+            if(r.vlen) memcpy(r.vpayload, g_peer_version_payload, (size_t)r.vlen);
+        } else snprintf(r.why, sizeof r.why, "%s", dial_fail_reason());
+        struct iovec iov = { &r, sizeof r };
+        char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
+        struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1;
+        if(fd >= 0){
+            mh.msg_control = cbuf; mh.msg_controllen = sizeof cbuf;
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cm), &fd, sizeof fd);
+        }
+        (void)!sendmsg(sp[1], &mh, 0);
+        _exit(0);
+    }
+    close(sp[1]);
+    g_dh[slot].sp = sp[0]; g_dh[slot].pid = pid; g_dh[slot].net = leg_net_of(host); g_dh[slot].t0 = dh_now_ms();
+    snprintf(g_dh[slot].host, sizeof g_dh[slot].host, "%s", host);
+    fprintf(stderr, "[dial] %s: dialing in the background (%s)\n", host, bmc_net_name(g_dh[slot].net));
+    return 1;
+}
+/* one completed (or timed-out) helper per call: 1 = result in *out (fd_out >= 0 iff ok), 0 = nothing */
+static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
+    for(int i = 0; i < DH_MAX; i++){
+        if(g_dh[i].pid <= 0) continue;
+        struct iovec iov = { out, sizeof *out };
+        char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
+        struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1; mh.msg_control = cbuf; mh.msg_controllen = sizeof cbuf;
+        memset(out, 0, sizeof *out);
+        ssize_t n = recvmsg(g_dh[i].sp, &mh, MSG_DONTWAIT);
+        if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)){
+            if(dh_now_ms() - g_dh[i].t0 > g_dh_timeout_ms){
+                fprintf(stderr, "[dial] %s: background dial gave up after %llds\n", g_dh[i].host, g_dh_timeout_ms / 1000);
+                kill(g_dh[i].pid, SIGKILL); waitpid(g_dh[i].pid, NULL, 0);
+                close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1;
+                out->ok = 0; snprintf(out->why, sizeof out->why, "timeout"); *fd_out = -1;
+                snprintf(host_out, hcap, "%s", g_dh[i].host);
+                return 1;
+            }
+            continue;
+        }
+        *fd_out = -1;
+        if(n == (ssize_t)sizeof *out && out->ok){
+            for(struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm))
+                if(cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS){ memcpy(fd_out, CMSG_DATA(cm), sizeof(int)); break; }
+            if(*fd_out < 0) out->ok = 0;
+        } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
+        waitpid(g_dh[i].pid, NULL, 0);
+        close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1;
+        snprintf(host_out, hcap, "%s", g_dh[i].host);
+        return 1;
+    }
+    return 0;
+}
+/* install a helper-dialled leg exactly as the inline fill does */
+static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
+    if(mux_n_out >= MUX_MAX_OUT){ close(fd); return 0; }
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
+    g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
+    g_peer_wants_addrv2 = r->wants_addrv2;
+    strncpy(mux_out_host[mux_n_out], host, 127); mux_out_host[mux_n_out][127] = 0;
+    mux_out_fd[mux_n_out] = fd;
+    mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
+    mux_out_peer[mux_n_out] = 0;
+    anchor_locator(mux_out_loc[mux_n_out]);
+    mux_out_nextretry[mux_n_out] = 0;
+    { char pv[256]; format_peer_version_info(pv, sizeof pv);
+      fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2); }
+    rpc_fill_peer_slot(mux_n_out, host);
+    mux_n_out++;
+    return 1;
+}
+static int legs_on_net(int net){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_net_of(mux_out_host[k]) == net) n++; return n; }
+static int legs_anon(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_is_anon_net(leg_net_of(mux_out_host[k]))) n++; return n; }
+
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
@@ -1962,7 +2076,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     { char me[128];
       for(int tries = 0; tries < pool_len; tries++){
           ctl_ip_only(peers[p], me, sizeof me);
-          int held = 0;
+          int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
           for(int k = 0; k < mux_n_out && !held; k++){
               if(k == i || mux_out_fd[k] < 0) continue;
               char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
@@ -4848,7 +4962,30 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * on a variable network, so keep trying to add a leg occasionally
          * (rate-limited) instead of giving up at the initial dial. Uses the
          * proven outbound_connect path (works for reachable peers). */
-        if(mux_n_out < MUX_WANT_OUT() && (rot % 8)==0){
+        /* background dials: install whatever completed since the last rotation */
+        { dh_result_t dr; int dfd; char dhost[128];
+          while(dh_poll(&dr, &dfd, dhost, sizeof dhost)){
+              if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
+              else fprintf(stderr, "[dial] %s: background dial failed: %s\n", dhost, dr.why[0] ? dr.why : "?");
+          } }
+        /* reserved slots: at least ONE leg per reachable anonymity network,
+         * dialled in the background, on top of the clearnet legs (Core keeps
+         * an extra network-specific outbound for the same reason) */
+        if((rot % 8)==0 && g_node_status && g_node_status->net_active && mux_n_out < MUX_WANT_OUT() + 2 && mux_n_out < MUX_MAX_OUT){
+            static const int anon_nets[2] = { BMC_NET_TORV3, BMC_NET_I2P };
+            for(int an = 0; an < 2 && dh_inflight_count() < DH_MAX; an++){
+                int net = anon_nets[an];
+                if(!dialer_net_reachable(net) || legs_on_net(net) > 0 || dh_inflight_net(net)) continue;
+                for(int ci = 0; ci < nsrc; ci++){
+                    if(leg_net_of(srcpool[ci]) != net) continue;
+                    int already = 0; for(int k = 0; k < mux_n_out; k++) if(!strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
+                    if(already) continue;
+                    { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+                    if(dh_start(srcpool[ci], out_port)) break;
+                }
+            }
+        }
+        if(mux_n_out - legs_anon() < MUX_WANT_OUT() && (rot % 8)==0){
             /* ONE summary line per pass, not one per candidate: this loop walks
              * the whole live pool (up to nsrc) when nothing connects, so a
              * per-candidate log would flood exactly when the node is sickest. */
@@ -4860,8 +4997,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * (2026-09-01 01:34) and tripped the deploy guard; the next pass
              * (8 rotations later) fills the next slot. */
             int topup_filled = 0;
-            for(int ci=0; ci<nsrc && mux_n_out<MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
-                if(mux_n_out>=MUX_WANT_OUT() || topup_filled >= 1 || topup_fail >= 4) break;
+            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() < MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
+                if(topup_filled >= 1 || topup_fail >= 4) break;
+                if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
