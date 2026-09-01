@@ -28,5 +28,7 @@ archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
 long archive_prune_file_granular(long target_height);
 int  archive_verify_and_repair(void* store_buf, int repair);
 long archive_drop_utxo_state(void);
+/* boot self-heal: trim empty index records past the tip and over-long headers/chainwork (incident 2026-09-01) */
+long archive_trim_derived_tails(void);
 
 #endif
