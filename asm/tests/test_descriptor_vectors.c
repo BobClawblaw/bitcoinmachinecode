@@ -162,6 +162,65 @@ int main(void){
             if (strcmp(s, V[i].prv)){ printf("  FAIL %s private form reprint:\n    got  %s\n    want %s\n", lab, s, V[i].prv); fails++; } checks++;
         }
     }
+
+    printf("== Core's musig() descriptor cases (BIP390; descriptor_tests.cpp) ==\n");
+    {
+        #define XPRV1 "xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc"
+        #define XPUB1 "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL"
+        #define XPUB2 "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y"
+        typedef struct { const char* prv; const char* pub; const char* spk[3]; int pub_expands; } muv_t;
+        static const muv_t V[] = {
+          {"rawtr(musig(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66))",
+           "rawtr(musig(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66))",
+           {"5120789d937bade6673538f3e28d8368dda4d0512f94da44cf477a505716d26a1575", "", ""}, 1},
+          {"tr(musig(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66))",
+           "tr(musig(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66))",
+           {"512079e6c3e628c9bfbce91de6b7fb28e2aec7713d377cf260ab599dcbc40e542312", "", ""}, 1},
+          {"rawtr(musig(" XPRV1 "/0/*," XPUB2 "/0/*))", "rawtr(musig(" XPUB1 "/0/*," XPUB2 "/0/*))",
+           {"5120754ccfd18ed4051de3b1144b6145cad4b2999387338dfb85ec392f2963ceaa3a", "5120be80016576d2691ccc4077bc91d7ece4db34667d6e84829d5e08480cd4bc0b78", "5120b7139e2f8b92570ad96c40c3b5e6557a5194e288a96df6f29980523365239d58"}, 1},
+          {"rawtr(musig(" XPRV1 "," XPUB2 ")/0/*)", "rawtr(musig(" XPUB1 "," XPUB2 ")/0/*)",
+           {"51209508c08832f3bb9d5e8baf8cb5cfa3669902e2f2da19acea63ff47b93faa9bfc", "51205ca1102663025a83dd9b5dbc214762c5a6309af00d48167d2d6483808525a298", "51207dbed1b89c338df6a1ae137f133a19cae6e03d481196ee6f1a5c7d1aeb56b166"}, 1},
+          {"rawtr(musig(" XPRV1 "/0," XPUB2 ")/1)", "rawtr(musig(" XPUB1 "/0," XPUB2 ")/1)",
+           {"51200e355f2bc9e754268e12bbd337499c2f7ffafc3101c41792709007b25a862532", "", ""}, 1},
+          {"tr(musig(" XPRV1 "," XPUB2 ")/0/*,pk(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S))", "tr(musig(" XPUB1 "," XPUB2 ")/0/*,pk(f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9))",
+           {"51201d377b637b5c73f670f5c8a96a2c0bb0d1a682a1fca6aba91fe673501a189782", "51208950c83b117a6c208d5205ffefcf75b187b32512eb7f0d8577db8d9102833036", "5120a49a477c61df73691b77fcd563a80a15ea67bb9c75470310ce5c0f25918db60d"}, 1},
+          {"tr(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S,pk(musig(" XPRV1 "," XPUB2 ")/0/*))", "tr(f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9,pk(musig(" XPUB1 "," XPUB2 ")/0/*))",
+           {"512068983d461174afc90c26f3b2821d8a9ced9534586a756763b68371a404635cc8", "5120368e2d864115181bdc8bb5dc8684be8d0760d5c33315570d71a21afce4afd43e", "512097a1e6270b33ad85744677418bae5f59ea9136027223bc6e282c47c167b471d5"}, 1},
+          {"tr(musig(" XPRV1 "/1," XPRV1 "/1)/2)", "tr(musig(" XPUB1 "/1," XPUB1 "/1)/2)",
+           {"5120a17ceacd6422bd5ffd9f165807b254b7d68ad39f179cc4f11545a6835227e97c", "", ""}, 1},
+          {"rawtr(musig(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/2147483647'/0," XPUB2 ")/1)",
+           "rawtr(musig(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/2147483647'/0," XPUB2 ")/1)",
+           {"5120ebf2bcce516ef6567a9001ce6e5dc43a02bb62d37b51d86d773fa96dcd3a8d4c", "", ""}, 0},
+        };
+        for (size_t i = 0; i < sizeof V / sizeof V[0]; i++){
+            char lab[64]; snprintf(lab, sizeof lab, "musig vec %zu", i);
+            int r = descr_parse(V[i].prv, &d, err, sizeof err);
+            if (!r){ printf("  FAIL %s prv parse: %s\n", lab, err); fails++; checks++; continue; }
+            char s[3000]; descr_to_string(&d, 0, s, sizeof s);
+            if (strcmp(s, V[i].pub)){ printf("  FAIL %s public form:\n    got  %s\n    want %s\n", lab, s, V[i].pub); fails++; } checks++;
+            descr_to_string(&d, 1, s, sizeof s);
+            if (strcmp(s, V[i].prv)){ printf("  FAIL %s private reprint:\n    got  %s\n    want %s\n", lab, s, V[i].prv); fails++; } checks++;
+            for (int ix = 0; ix < 3 && V[i].spk[ix][0]; ix++){
+                descr_spk_t sp[4]; int n = descr_expand(&d, ix, sp, 4); char hx[200]; if (n == 1) hex(hx, sp[0].spk, sp[0].len); else hx[0] = 0;
+                if (n != 1 || strcmp(hx, V[i].spk[ix])){ printf("  FAIL %s prv spk[%d]: got %s (%s) want %s\n", lab, ix, hx, descr_last_error(), V[i].spk[ix]); fails++; } checks++;
+            }
+            r = descr_parse(V[i].pub, &d, err, sizeof err);
+            if (!r){ printf("  FAIL %s pub parse: %s\n", lab, err); fails++; checks++; continue; }
+            if (V[i].pub_expands) for (int ix = 0; ix < 3 && V[i].spk[ix][0]; ix++){
+                descr_spk_t sp[4]; int n = descr_expand(&d, ix, sp, 4); char hx[200]; if (n == 1) hex(hx, sp[0].spk, sp[0].len); else hx[0] = 0;
+                if (n != 1 || strcmp(hx, V[i].spk[ix])){ printf("  FAIL %s pub spk[%d]: got %s (%s)\n", lab, ix, hx, descr_last_error()); fails++; } checks++;
+            }
+        }
+        /* Core's error strings */
+        BAD("wsh(pk(musig(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659)))", "musig() is only allowed in tr() and rawtr()");
+        BAD("tr(musig(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S,musig(03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659)))", "Too many ')' in musig() expression");
+        BAD("tr(musig())", "musig(): Must contain key expressions");
+        BAD("tr(musig(" XPRV1 "/0/*," XPUB2 ")/1)", "musig(): Cannot have ranged participant keys if musig() also has derivation");
+        BAD("tr(musig(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S," XPUB2 ")/1)", "musig(): derivation requires all participants to be xpubs or xprvs");
+        BAD("tr(musig(" XPRV1 "," XPUB2 ")/1'/*)", "musig(): cannot have hardened derivation steps");
+        BAD("tr(musig(" XPRV1 "," XPUB2 ")/1/*')", "musig(): Cannot have hardened child derivation");
+        BAD("tr(musig(04a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd5b8dec5235a0fa8722476c7709c02559e3aa73aa03918ba2d492eea75abea235," XPUB2 "))", "musig(): Uncompressed keys are not allowed");
+    }
     printf("\n%s (%d failures, %d checks)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails, checks);
     return fails ? 1 : 0;
 }

@@ -17,7 +17,8 @@
 #define DESCR_NODE_KEYS 32
 #define DESCR_MAX_SPK   520
 
-enum { DK_HEX = 0, DK_WIF = 1, DK_XPUB = 2, DK_XPRV = 3 };
+enum { DK_HEX = 0, DK_WIF = 1, DK_XPUB = 2, DK_XPRV = 3, DK_MUSIG = 4 };
+#define DESCR_MUSIG_MAX 32
 typedef struct {
     int kind;
     int has_priv;                 /* WIF or xprv: descr_key_priv_at works */
@@ -33,6 +34,11 @@ typedef struct {
     int ranged, range_hard;       /* trailing range marker, hardened or not */
     int apostrophe;               /* hardened marker style: 1 = ', 0 = h */
     int has_origin; unsigned char origin_fp[4]; unsigned origin[DESCR_MAX_PATH]; int origin_len;
+    /* DK_MUSIG (BIP390): the participants (indices into descr_t.keys, in the
+     * written order; aggregation sorts them as Core does), and whether any of
+     * them is ranged. The musig()'s own derivation lives in path/ranged above
+     * (a synthetic xpub over the aggregate, unhardened steps only). */
+    int musig_n; int musig_parts[DESCR_MUSIG_MAX]; int musig_parts_ranged;
 } descr_key_t;
 
 enum { DN_PK = 1, DN_PKH, DN_WPKH, DN_COMBO, DN_MULTI, DN_SORTEDMULTI, DN_MULTI_A, DN_SORTEDMULTI_A,
@@ -103,4 +109,16 @@ void descr_ms_ctx(const descr_t* d, long idx, int with_priv, descr_msuser_t* u, 
 /* the miniscript root of the top-level wsh(), or of the single tr() leaf
  * whose script equals leaf[0..leaflen) at idx; -1 if none */
 int  descr_ms_root(const descr_t* d, long idx, const unsigned char* leaf, int leaflen);
+
+/* ---- musig() (BIP390) ----
+ * For key `key` (must be DK_MUSIG) at range index idx: the untweaked,
+ * underived aggregate (33 bytes), the participants sorted as Core sorts them
+ * (what PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS carries), the derived key the
+ * script uses (33 bytes; equal to the aggregate without derivation) and the
+ * derivation path applied to the synthetic xpub (the range index appended
+ * when the musig() is ranged). 1 ok / 0 not a musig key or derivation failed. */
+int  descr_musig_info(const descr_t* d, int key, long idx, unsigned char agg33[33],
+                      unsigned char (*parts)[33], int* nparts, unsigned char derived33[33], unsigned* path, int* plen);
+/* the key index of a top-level tr()/rawtr() internal key, -1 otherwise */
+int  descr_top_key(const descr_t* d);
 #endif

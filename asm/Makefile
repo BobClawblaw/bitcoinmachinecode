@@ -1980,7 +1980,7 @@ rpc_wallet_ops.o: rpc_wallet_ops.c rpc_wallet_ops.h rpc_commands.h rpc_chain.h r
 # importdescriptors, and rpc_commands.c's descriptorprocesspsbt all parse and
 # expand through it. Proven against Core's descriptor_tests.cpp vectors by
 # tests/test_descriptor_vectors.
-descriptor.o: descriptor.c descriptor.h miniscript.h
+descriptor.o: descriptor.c descriptor.h miniscript.h musig2.h
 	$(CC) -no-pie -O2 -c -o $@ descriptor.c
 
 # miniscript.o -- Miniscript (Core script/miniscript.h in C): parser, type
@@ -2153,10 +2153,10 @@ tests/test_reindex: tests/test_reindex.c daemon/archive_reindex.c daemon/archive
 # public forms, expanded at every index Core lists and compared byte-for-byte
 # to Core's scriptPubKeys; Core's public-form strings, checksums, descriptor
 # ids, and parse-error rules.
-tests/test_descriptor_vectors: tests/test_descriptor_vectors.c tests/desc_vectors.h descriptor.c descriptor.h miniscript.c miniscript.h bip32_ckdpub.c \
-    wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) bitcoin_script.o bitcoin_tx.o
-	$(CC) -no-pie -O2 -I. -o $@ tests/test_descriptor_vectors.c descriptor.c miniscript.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c \
-	    daemon/wallet_pass.c $(WALLETPRIMS) bitcoin_script.o bitcoin_tx.o -lpthread
+tests/test_descriptor_vectors: tests/test_descriptor_vectors.c tests/desc_vectors.h descriptor.c descriptor.h miniscript.c miniscript.h musig2.c musig2.h bip32_ckdpub.c \
+    wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
+	$(CC) -no-pie -O2 -I. -o $@ tests/test_descriptor_vectors.c descriptor.c miniscript.c musig2.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c \
+	    daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o -lpthread
 
 # The miniscript engine against Core's miniscript_tests.cpp (both contexts,
 # script/type/limit figures, decode round trips) and its satisfier against

@@ -3697,6 +3697,77 @@ static int dpp_musig_keyfn(void* vctx, const unsigned char pub33[33], unsigned c
     }
     return 0;
 }
+/* descriptorprocesspsbt's Updater step for musig() (2026-09-01): for every
+ * input whose witness_utxo is a tr(musig(...)) / rawtr(musig(...)) expansion
+ * of one of the descriptors, add what Core's UpdatePSBTInput adds and the
+ * MuSig2 signer consumes: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS (0x1a, keyed by
+ * the untweaked, underived aggregate; the sorted participants), a
+ * PSBT_IN_TAP_BIP32_DERIVATION (0x16) for the derived key with fingerprint
+ * hash160(aggregate)[0..4] and the musig() path (only when there is one),
+ * and PSBT_IN_TAP_INTERNAL_KEY (0x17) for tr(). Fields already present are
+ * left alone. Returns a malloc'd base64 PSBT, or NULL when nothing changed. */
+static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd){
+    static unsigned char buf[200000]; long blen = 0;
+    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)) return NULL;
+    long p = 5;
+    static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
+    const psbt_kv* utxk = fin_find(gkv, gn, 0x00); if (!utxk) return NULL;
+    static crt_in_t uin[FIN_MAXIO]; int n_in, sw; unsigned long ost, oen;
+    if (!crt_walk(utxk->v, utxk->vl, uin, FIN_MAXIO, &n_in, &ost, &oen, &sw)) return NULL;
+    static psbt_kv ikv[FIN_MAXIO][FIN_MAXKV]; static int in_n[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++) in_n[i] = psbt_parse_map(buf, blen, &p, ikv[i], FIN_MAXKV);
+    unsigned long n_out; { unsigned long cc; n_out = srw_varint(utxk->v + ost, &cc); }
+    static psbt_kv okv[FIN_MAXIO][FIN_MAXKV]; static int out_n[FIN_MAXIO];
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++) out_n[i] = psbt_parse_map(buf, blen, &p, okv[i], FIN_MAXKV);
+    /* new field storage: at most one aggregate per input */
+    static unsigned char k1a[FIN_MAXIO][34], v1a[FIN_MAXIO][33 * MUSIG2_MAX_KEYS], k16[FIN_MAXIO][33], v16[FIN_MAXIO][1 + 4 + 4 * 40], k17[FIN_MAXIO], v17[FIN_MAXIO][32];
+    int changed = 0;
+    for (int i = 0; i < n_in; i++){
+        unsigned long long amount; const unsigned char* spk; unsigned long spklen;
+        if (!mu_witness_utxo(ikv[i], in_n[i], &amount, &spk, &spklen)) continue;
+        if (spklen != 34 || spk[0] != 0x51 || spk[1] != 0x20) continue;
+        if (fin_find(ikv[i], in_n[i], 0x1a)) continue;                        /* already updated */
+        for (int di = 0; di < nd; di++){
+            descr_t* d = dv[di].d; int kx = descr_top_key(d);
+            if (kx < 0 || d->keys[kx].kind != DK_MUSIG) continue;
+            int is_tr = d->nodes[d->root].type == DN_TR;
+            if (is_tr && d->nodes[d->root].child[0] >= 0) continue;           /* key-path musig with a script tree: not updated here */
+            int hit = 0;
+            for (long idx = dv[di].lo; idx <= dv[di].hi && !hit; idx++){
+                descr_spk_t sp[4]; if (descr_expand(d, idx, sp, 4) != 1 || sp[0].len != 34 || memcmp(sp[0].spk, spk, 34)) continue;
+                unsigned char agg[33], parts[MUSIG2_MAX_KEYS][33], der[33]; int np = 0, plen = 0; unsigned path[40];
+                if (!descr_musig_info(d, kx, idx, agg, parts, &np, der, path, &plen)) break;
+                hit = 1;
+                k1a[i][0] = 0x1a; memcpy(k1a[i] + 1, agg, 33); memcpy(v1a[i], parts, (size_t)np * 33);
+                if (in_n[i] + 3 > FIN_MAXKV) break;
+                ikv[i][in_n[i]].k = k1a[i]; ikv[i][in_n[i]].kl = 34; ikv[i][in_n[i]].v = v1a[i]; ikv[i][in_n[i]].vl = (unsigned long)np * 33; in_n[i]++;
+                if (plen > 0){
+                    k16[i][0] = 0x16; memcpy(k16[i] + 1, der + 1, 32);
+                    unsigned char fp[20]; hash160(fp, agg, 33);
+                    v16[i][0] = 0; memcpy(v16[i] + 1, fp, 4);
+                    for (int t = 0; t < plen; t++){ unsigned char* z = v16[i] + 5 + 4 * t; z[0] = (unsigned char)path[t]; z[1] = (unsigned char)(path[t] >> 8); z[2] = (unsigned char)(path[t] >> 16); z[3] = (unsigned char)(path[t] >> 24); }
+                    int dup = 0; for (int q = 0; q < in_n[i]; q++) if (ikv[i][q].kl == 33 && ikv[i][q].k[0] == 0x16 && !memcmp(ikv[i][q].k + 1, der + 1, 32)) dup = 1;
+                    if (!dup){ ikv[i][in_n[i]].k = k16[i]; ikv[i][in_n[i]].kl = 33; ikv[i][in_n[i]].v = v16[i]; ikv[i][in_n[i]].vl = 5 + 4 * (unsigned long)plen; in_n[i]++; }
+                }
+                if (is_tr && !fin_find(ikv[i], in_n[i], 0x17)){
+                    k17[i] = 0x17; memcpy(v17[i], der + 1, 32);
+                    ikv[i][in_n[i]].k = &k17[i]; ikv[i][in_n[i]].kl = 1; ikv[i][in_n[i]].v = v17[i]; ikv[i][in_n[i]].vl = 32; in_n[i]++;
+                }
+                changed = 1;
+            }
+            if (hit) break;
+        }
+    }
+    if (!changed) return NULL;
+    static unsigned char out[220000]; long o = 0;
+    memcpy(out, "psbt\xff", 5); o = 5;
+    o += psbt_ser_map(out + o, gkv, gn);
+    for (int i = 0; i < n_in; i++) o += psbt_ser_map(out + o, ikv[i], in_n[i]);
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++) o += psbt_ser_map(out + o, okv[i], out_n[i]);
+    char* b = malloc((size_t)((o + 2) / 3) * 4 + 1); if (!b) return NULL;
+    crt_b64(b, out, o);
+    return b;
+}
 #define DPP_MAX_DESCS 16
 int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
@@ -3726,7 +3797,10 @@ int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** e
         dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
     }
     dpp_ctx_t ctx = { dv, nd };
-    return psbt_process(b64, 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, ec, em, result);
+    char* upd = dpp_musig_update(b64, dv, nd);          /* the Updater role for musig() descriptors (BIP390/BIP373) */
+    int rc = psbt_process(upd ? upd : b64, 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, ec, em, result);
+    free(upd);
+    return rc;
 }
 
 /* The wallet/util subset rpc_commands.c dispatches itself. At file scope
