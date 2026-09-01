@@ -1,5 +1,5 @@
 /* tests/test_lsm_flush_sparse.c -- one flush of many more records than two
- * sparse-index strides (SPARSE_STRIDE = 256), every record small enough that
+ * sparse-index strides (SPARSE_STRIDE, 256 at the time; 64 since 2026-09-01), every record small enough that
  * the whole run still sits in mac_flush's 1 MB write buffer while the sparse
  * index samples its offsets.
  *
@@ -55,7 +55,7 @@ int main(void){
     lst.scratch_cap = (u64)(SLOTS + 512) * 128 + 4 * 1024 * 1024 + 65536; lst.scratch_buf = malloc(lst.scratch_cap);
     ck("lsm_init", utxo_lsm_init(&lst) == 1);
     unsigned char script[48]; for (int j = 0; j < 48; j++) script[j] = (unsigned char)(0x80 + j);
-    printf("== %d records (%d sparse strides), one flush, every key looked up through the run ==\n", NREC, NREC / 256);
+    printf("== %d records (%d sparse strides), one flush, every key looked up through the run ==\n", NREC, NREC / 64);
     for (unsigned i = 0; i < NREC; i++) {
         unsigned char t[32]; make_txid(t, i);
         if (utxo_lsm_put(&lst, u, t, i & 3, 1000ULL + i, 10 + i, i & 1, script, 20 + (i % 20)) != 1) { printf("FAIL put %u\n", i); return 1; }
