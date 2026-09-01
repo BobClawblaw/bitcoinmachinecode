@@ -284,9 +284,16 @@ ibd: ibd.c $(IBDOBJS)
 # resumable LSM-backed downloader: ibd.c networking/cons + build_utxo.c LSM path
 # (bitcoin_utxo_lsm.o + utxo_lsm_mm.o). Resumes at archive tip+1 via
 # utxo_lsm_reload. Handles utxo_lsm_put's .full (2) with flush+retry.
-IBDLSMOBJS = $(IBDOBJS) bitcoin_utxo_lsm.o utxo_lsm_mm.o
+IBDLSMOBJS = $(IBDOBJS) bitcoin_utxo_lsm.o utxo_lsm_mm.o \
+            secp256k1_glv_c.o secp256k1_glv.o secp256k1_glv_mul.o \
+            bitcoin_sighash_all_ext.o
 ibd_lsm: ibd_lsm.c $(IBDLSMOBJS)
 	@$(CC) $(CFLAGS) -o ibd_lsm ibd_lsm.c $(IBDLSMOBJS)
+# offline re-apply of an ALREADY-ARCHIVED block window to the persisted LSM
+# (store_get_at + pread; no network, no store_append). Backfills holes left by
+# pre-fix runs (965009..965014 added=0) -- see ibd_backfill.c header.
+ibd_backfill: ibd_backfill.c $(IBDLSMOBJS)
+	@$(CC) $(CFLAGS) -o ibd_backfill ibd_backfill.c $(IBDLSMOBJS)
 # multi-client (<=16 parallel peers) resumable downloader: poll() mux over the
 # client pool + x86 startup banner + [catchup]/[dl] logging (log parity with x86).
 ibd_par: ibd_par.c $(IBDLSMOBJS)

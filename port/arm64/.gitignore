@@ -75,5 +75,7 @@ t_full_old
 t_repro
 ibd
 ibd_lsm
+ibd_backfill
+ibd_par
 build_utxo
 live_blocks
