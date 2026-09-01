@@ -3624,8 +3624,8 @@ static int txsub_package(char* msg, unsigned long mcap){
  * dl_catchup is synchronous and holds the worker for its duration; the legs
  * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
 #define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
-#define TXSUB_ROTATION_BUDGET 256    /* submissions serviced per rotation before the main loop runs again */
-#define TXSUB_ROTATION_MS     250    /* ...or this much wall time, whichever comes first */
+#define TXSUB_ROTATION_BUDGET 2048   /* submissions serviced per rotation before the main loop runs again */
+#define TXSUB_ROTATION_MS     1000   /* ...or this much wall time, whichever comes first */
 static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
@@ -5104,6 +5104,24 @@ static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pca
     return 1;
 }
 
+/* -persistmempool reload on its own thread (see serve_start_rpc). */
+static pthread_t g_mempool_reload_thread;
+static volatile int g_mempool_reload_started;
+static void* mempool_reload_thread(void* arg){
+    (void)arg;
+    extern long rpc_node_mempool_load(const char* path);
+    long acc = rpc_node_mempool_load("mempool.dat");
+    if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+    return NULL;
+}
+/* Called from the shutdown path before the dump: a reload still running
+ * aborts on the flag within milliseconds (mpd_import_one polls it every
+ * 3 ms and then drains the file without waiting), and the dump must not
+ * race its last submission. */
+static void mempool_reload_join(void){
+    if(g_mempool_reload_started){ pthread_join(g_mempool_reload_thread, NULL); g_mempool_reload_started = 0; }
+}
+
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
@@ -5399,8 +5417,20 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     if(CFG_PERSISTMEMPOOL()){
         struct stat mst;
         if(stat("mempool.dat", &mst) == 0){
-            long acc = rpc_node_mempool_load("mempool.dat");
-            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+            /* The reload must yield to SIGTERM in THIS process, not only in
+             * the worker: the hook was installed in the worker alone, so the
+             * serve parent ignored systemd's SIGTERM until two 90 s
+             * validation timeouts aborted the import (184 s on 2026-09-01
+             * 08:22; SIGKILLed by the deploy escalation at 08:38, with no
+             * mempool.dat saved). And it runs on a thread: inline, it kept
+             * the serve loop -- inbound accept, the legs, the shutdown
+             * check -- from starting for the 10-20 minutes a ten-thousand-
+             * entry dump takes at the worker's rotation budget. */
+            { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
+              rpc_node_set_shutdown_flag(&g_shutdown_requested); }
+            if(pthread_create(&g_mempool_reload_thread, NULL, mempool_reload_thread, NULL) == 0)
+                g_mempool_reload_started = 1;
+            else mempool_reload_thread(NULL);
         } else {
             fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
         }
@@ -5547,6 +5577,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             /* -persistmempool: dump BEFORE the worker is signalled, while the
              * shared pool is still quiescent and nothing is evicting under
              * the writer. */
+            mempool_reload_join();
             if(CFG_PERSISTMEMPOOL()){
                 long w = rpc_node_mempool_save("mempool.dat");
                 if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
