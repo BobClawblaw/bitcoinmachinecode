@@ -16,6 +16,8 @@
 	.extern p2p_read
 	.extern p2p_write
 	.extern serve_inv_bounds
+	.extern serve_getaddr
+	.extern g_peer_wants_addrv2
 	.extern amr_init
 	.extern amr_count
 	.extern amr_get_i
@@ -655,100 +657,25 @@ node_serve_loop:
 	movk w10, #0x0072, lsl #16        /* "ddr\0" */
 	cmp  w9, w10
 	b.ne .next
-	/* Core answers getaddr ONCE per connection (m_getaddr_recvd) */
+	/* Core answers getaddr ONCE per connection and ignores repeats
+	 * (m_getaddr_recvd: "reduce resource waste") */
 	LOADADDR x9, s_addrsent
 	ldrb w9, [x9]
 	cbnz w9, .next
 	LOADADDR x9, s_addrsent
 	mov  w10, #1
 	strb w10, [x9]
-	/* open + count the address book */
-	LOADADDR x0, amr_ab
-	bl   amr_init
-	cmp  x0, #1
-	b.ne .next                        /* amr_init returns 1 or -1; only 1 opens */
-	LOADADDR x0, amr_ab
-	bl   amr_count
-	cmp  x0, #0
-	b.le .LGA_close                   /* empty book: Core sends nothing either */
-	cmp  x0, #1000                    /* MAX_ADDR_TO_SEND = size of src_buf/ah_buf */
-	b.ls .LGA_bound
-	mov  x0, #1000
-.LGA_bound:
-	LOADADDR x9, s_abound
-	str  x0, [x9]                     /* bound live in MEMORY (never clobbered) */
-	LOADADDR x9, s_p
-	str  xzr, [x9]                    /* have = 0 */
-	LOADADDR x9, s_cnt
-	str  xzr, [x9]                    /* i = 0 */
-.LGA_aloop:
-	LOADADDR x9, s_abound
-	ldr  x9, [x9]
-	LOADADDR x10, s_cnt
-	ldr  x10, [x10]                   /* i */
-	cmp  x10, x9
-	b.hs .LGA_adone
-	LOADADDR x0, amr_ab
-	mov  x1, x10                      /* i */
-	LOADADDR x9, s_p
-	ldr  x9, [x9]                     /* have */
-	mov  x2, x9
-	mov  x3, #18
-	mul  x2, x2, x3
-	LOADADDR x9, src_buf
-	add  x2, x9, x2                   /* dst = src_buf + have*18 */
-	bl   amr_get_i
-	/* amr_get_i clobbered scratch; reload counters from memory */
-	LOADADDR x9, s_p
-	ldr  x9, [x9]                     /* have */
-	LOADADDR x10, s_cnt
-	ldr  x10, [x10]                   /* i */
-	cmp  x0, #1
-	b.ne .LGA_nocopy
-	add  x9, x9, #1                   /* have++ */
-	LOADADDR x11, s_p
-	str  x9, [x11]
-.LGA_nocopy:
-	add  x10, x10, #1                 /* i++ */
-	LOADADDR x11, s_cnt
-	str  x10, [x11]
-	b    .LGA_aloop
-.LGA_adone:
-	LOADADDR x9, s_p
-	ldr  x9, [x9]
-	cbz  x9, .LGA_close
-	/* BIP155: addrv2 if the peer asked in handshake, else legacy addr */
-	LOADADDR x10, g_peer_wants_addrv2
-	ldr  x10, [x10]
-	cbnz x10, .LGA_v2
-	LOADADDR x0, ah_buf
-	LOADADDR x1, src_buf
-	mov  x2, x9
-	bl   p2p_addr_v1
-	mov  x4, x0                       /* payload len */
-	mov  x0, x19
-	LOADADDR x1, cn_addr
-	mov  x2, #4
-	LOADADDR x3, ah_buf
-	bl   p2p_write
-	b    .LGA_close
-.LGA_v2:
-	LOADADDR x0, ah_buf
-	LOADADDR x1, src_buf
-	mov  x2, x9
-	bl   p2p_addr_v2
-	mov  x4, x0
-	mov  x0, x19
-	LOADADDR x1, cn_addrv2
-	mov  x2, #6
-	LOADADDR x3, ah_buf
-	bl   p2p_write
-.LGA_close:
-	LOADADDR x9, amr_ab
-	ldr  x0, [x9]                     /* book fd (one open per getaddr) */
-	mov  x8, #57                      /* close */
-	svc  #0
+	/* The reply is built in C from the version-2 book (daemon/serve_addr.c,
+	 * every BIP155 network) -- this loop used to read the legacy IPv4-only
+	 * peers.dat book, which the negotiation tests never populate (x86
+	 * parity: the asm serve.asm was rewritten the same way). */
+	mov  x0, x19                      /* fd */
+	adrp x1, g_peer_wants_addrv2
+	add  x1, x1, :lo12:g_peer_wants_addrv2
+	ldr  w1, [x1]
+	bl   serve_getaddr
 	b    .next
+
 
 .maybe_getdata:
 	LOADADDR x9, s_cmd
