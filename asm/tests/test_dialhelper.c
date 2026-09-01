@@ -83,6 +83,27 @@ int main(void){
     for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r, &fd, h, sizeof h); usleep(50000); }
     ok(dh_inflight_count() == 0, "both drained");
 
+    printf("== 4. the reserved-slot chooser rotates through the network's candidates ==\n");
+    { const char* pool[5] = {
+          "fdtfjxpnlcqbbhlch7qixrmpfc3ocfwjj4bjs4lp4j54shhn7hvyxyyd.onion:8333",
+          "1.2.3.4:8333",
+          "fnslq4qq7nyyo2apypq4toakk2ueudetenjsmcyqe27bsg5dtx4udsad.onion:8333",
+          "qpjbnsqyxjppaiejqfbrepb7rrv6pvwx2qianvuhkcuwsk5qon27gjid.onion:8333",
+          "37bwoizdeha4fl2f3mylqfyzwqtaiebsmjlvwejwbtomywhgieca.b32.i2p:0" };
+      int a = dh_reserved_pick(0, BMC_NET_TORV3, pool, 5);
+      int b = dh_reserved_pick(0, BMC_NET_TORV3, pool, 5);
+      int c = dh_reserved_pick(0, BMC_NET_TORV3, pool, 5);
+      int d = dh_reserved_pick(0, BMC_NET_TORV3, pool, 5);
+      ok(a == 0 && b == 2 && c == 3 && d == 0, "successive picks walk the onion entries and wrap (0, 2, 3, 0) -- never the same dead address twice in a row");
+      /* a host a live leg holds is skipped */
+      int slot = mux_n_out; snprintf(mux_out_host[slot], sizeof mux_out_host[slot], "%s", pool[2]); mux_out_fd[slot] = 0; mux_n_out = slot + 1;
+      int e = dh_reserved_pick(0, BMC_NET_TORV3, pool, 5);
+      ok(e == 3, "...and skips the onion a live leg already holds");
+      mux_out_fd[slot] = -1; mux_n_out = slot;
+      ok(dh_reserved_pick(1, BMC_NET_I2P, pool, 5) == 4, "the i2p cursor is independent");
+      ok(dh_reserved_pick(0, BMC_NET_CJDNS, pool, 5) == -1, "no candidate of a network the pool lacks");
+      ok(dh_reserved_pick(0, BMC_NET_TORV3, pool, 0) == -1, "an empty pool"); }
+
     kill(fp, SIGKILL); waitpid(fp, NULL, 0); close(l);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
