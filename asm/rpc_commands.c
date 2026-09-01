@@ -1863,6 +1863,9 @@ static const char* srw_sign_tap_script(const srw_prev_t* P, const unsigned char*
             memcpy(sigs[a], P->tap_psig[q].sig, (size_t)P->tap_psig[q].sl); sl[a] = P->tap_psig[q].sl; got++; break;
         }
     }
+    if (got == 0) return "Keys not provided for this input";   /* nothing signed and nothing carried: no partial witness to keep
+                                                                * (a 0-of-k "partial" from one leaf must not shadow a real partial
+                                                                * from another leaf in the PSBT layer's signing rounds) */
     unsigned long o = 0; int items = 0;
     if (nk == 1 && kth == 1){ if (sl[0]){ wit[o++] = (unsigned char)sl[0]; memcpy(wit+o, sigs[0], sl[0]); o += sl[0]; items++; } }
     else { for (int a = nk - 1; a >= 0; a--){ wit[o++] = (unsigned char)sl[a]; if (sl[a]){ memcpy(wit+o, sigs[a], sl[a]); o += sl[a]; } items++; } }

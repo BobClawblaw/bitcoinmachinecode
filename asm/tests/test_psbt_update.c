@@ -190,6 +190,21 @@ int main(void){
           r = call("descriptorprocesspsbt", pj, &ec, &em);
           ck("x1 completes the leaf with x0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
           if (r) rj_free(r); free(half); } }
+
+    printf("== 10. two-leaf tree {pk(x2), multi_a(2,x0,x1)} with a NUMS internal key: x0's partial lands ==\n");
+    { const char* NUMS = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+      char dtext[400]; snprintf(dtext, sizeof dtext, "tr(%s,{pk(%s),multi_a(2,%s,%s)})", NUMS, xh[2], xh[0], xh[1]);
+      static descr_t dd; char err[256]; static descr_spk_t sp[4];
+      ck("parse", descr_parse(dtext, &dd, err, sizeof err)); ck("expand", descr_expand(&dd, 0, sp, 4) == 1);
+      static u8 utx5[400]; long ul5 = mk_utx(utx5, sp[0].spk, sp[0].len); mk_psbt(ps64, utx5, ul5, sp[0].spk, sp[0].len);
+      snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,{pk(%s),multi_a(2,%s,%s)})\"], \"DEFAULT\", true, false]", ps64, NUMS, xh[2], wif[0], xh[1]);
+      r = call("descriptorprocesspsbt", pj, &ec, &em);
+      ck("x0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      d = r && S(r, "psbt") ? decode(S(r, "psbt")) : NULL; i0 = in0(d);
+      { rj_val* sp2 = i0 ? rj_obj_get(i0, "taproot_script_path_sigs") : NULL;
+        ck("...taproot_script_path_sigs carries x0's partial for the multi_a leaf", sp2 && sp2->nitems >= 1 && S(sp2->items[0], "pubkey") && !strcmp(S(sp2->items[0], "pubkey"), xh[0]));
+        if (!sp2) { long jl = 0; char* js = i0 ? rj_write_alloc(i0, 0, &jl) : NULL; printf("    (input: %.900s)\n", js ? js : "-"); free(js); } }
+      if (d) rj_free(d); if (r) rj_free(r); }
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }
