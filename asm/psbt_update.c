@@ -135,7 +135,12 @@ static int script_has_xonly(const u8* sc, int sl, const u8 x[32]){
 static int fill(kv_t* kv, int* n, descr_t* d, long idx, int side, int* changed){
     int t = d->nodes[d->root].type;
     u8 tmp[4200]; int added = 0;
-    if (t == DN_TR || t == DN_RAWTR){
+    if (t == DN_RAWTR){
+        /* rawtr(): the key IS the output key -- no internal key, no tree; the
+         * musig() updater (rpc_commands.c) owns the participant fields */
+        return 1;
+    }
+    if (t == DN_TR){
         static descr_leaf_t leaves[128]; u8 internal[32], root[32]; int has_root = 0, odd = 0;
         int nl = descr_tr_leaves(d, idx, leaves, 128, internal, root, &has_root, &odd);
         if (nl < 0) return 0;
