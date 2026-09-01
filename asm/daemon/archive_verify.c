@@ -30,6 +30,7 @@
  * a tradeoff worth taking. We log exactly what is being discarded first.
  */
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -795,4 +796,50 @@ int archive_verify_and_repair(void* store_buf, int repair){
     store_reload(store_buf);
     fprintf(stderr, "[archive] repair complete: archive truncated to height %ld\n", keep);
     return 0;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * BOOT SELF-HEAL OF THE DERIVED FILES (incident 2026-09-01)
+ *
+ * index.dat's length IS the tip (height = records - 1), so a run of all-zero
+ * records at its very end is never a real state: the tip is by definition a
+ * stored block. Such a tail is what a boot catch-up leaves behind when it
+ * extended the index toward a header count it should never have believed
+ * (966,657 hole records on 2026-09-01). headers.dat and chainwork.dat are
+ * derived from the archive too and must not outrun it. Trims all three to
+ * the last stored block and says so. Returns the number of files trimmed, or
+ * -1 if a truncation failed. Read-only when the files are consistent. */
+long archive_trim_derived_tails(void){
+    struct stat st;
+    if (stat("index.dat", &st) != 0) return 0;
+    long n = (long)(st.st_size / 48);
+    if (n <= 0) return 0;
+    FILE* f = fopen("index.dat", "rb"); if (!f) return -1;
+    long last = n - 1; unsigned char rec[48];
+    while (last >= 0){
+        if (fseek(f, last * 48, SEEK_SET) != 0 || fread(rec, 1, 48, f) != 48) break;
+        int zero = 1; for (int i = 0; i < 48; i++) if (rec[i]){ zero = 0; break; }
+        if (!zero) break;
+        last--;
+    }
+    fclose(f);
+    if (last < 0) return 0;                       /* nothing stored at all: not ours to judge */
+    long trimmed = 0;
+    if (last < n - 1){
+        if (truncate("index.dat", (off_t)(last + 1) * 48) != 0) return -1;
+        fprintf(stderr, "[boot] index.dat carried %ld empty record(s) past the tip (height %ld) -- trimmed\n", n - 1 - last, last);
+        trimmed++; n = last + 1;
+    }
+    if (stat("headers.dat", &st) == 0 && st.st_size > (off_t)n * 112){
+        if (truncate("headers.dat", (off_t)n * 112) != 0) return -1;
+        fprintf(stderr, "[boot] headers.dat ran %ld record(s) past the archive tip -- trimmed to %ld\n", (long)(st.st_size / 112) - n, n);
+        trimmed++;
+    }
+    if (stat("chainwork.dat", &st) == 0 && st.st_size > (off_t)n * 16){
+        if (truncate("chainwork.dat", (off_t)n * 16) != 0) return -1;
+        fprintf(stderr, "[boot] chainwork.dat ran %ld record(s) past the archive tip -- trimmed to %ld\n", (long)(st.st_size / 16) - n, n);
+        trimmed++;
+    }
+    return trimmed;
 }

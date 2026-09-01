@@ -120,6 +120,8 @@ int main(void){
       dlc_headers_rollback(hst, 1);
       ok(hst_count(hst) == 1, "rollback drops the appended header: the store is back at 1");
       { struct stat st; ok(stat("headers.dat", &st) == 0 && st.st_size == 112, "...and headers.dat is back to 112 bytes"); }
+      ok(dlc_headers_sane(0, 5000000), "a fresh store may take the whole chain");
+      ok(dlc_headers_sane(965018, 100000) && !dlc_headers_sane(965018, 100001), "a non-empty store refuses more than DLC_HDR_SANE_MAX headers from one answer");
       if (cwd0[0]) (void)!chdir(cwd0); }
 
     kill(fp, SIGKILL); waitpid(fp, NULL, 0); close(l);
