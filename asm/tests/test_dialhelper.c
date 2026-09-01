@@ -104,6 +104,24 @@ int main(void){
       ok(dh_reserved_pick(0, BMC_NET_CJDNS, pool, 5) == -1, "no candidate of a network the pool lacks");
       ok(dh_reserved_pick(0, BMC_NET_TORV3, pool, 0) == -1, "an empty pool"); }
 
+    printf("== 5. a getheaders answer that does not connect to our tip is discarded (incident 2026-09-01) ==\n");
+    { char td[] = "/tmp/bmc_hdrs_XXXXXX"; if (!mkdtemp(td)){ perror("mkdtemp"); return 1; }
+      char cwd0[512]; if (!getcwd(cwd0, sizeof cwd0)) cwd0[0] = 0;
+      if (chdir(td) != 0){ perror("chdir"); return 1; }
+      static unsigned char hst[4096]; hst_init(hst);
+      /* two chained headers: h0, h1 (prev = hash(h0)) */
+      unsigned char h0[80], h1[80], hh0[32], hh1[32]; memset(h0, 0, 80); h0[0] = 1; block_hash(hh0, h0);
+      memset(h1, 0, 80); h1[0] = 1; memcpy(h1 + 4, hh0, 32); block_hash(hh1, h1);
+      ok(hst_append(hst, h0, hh0) >= 0 && hst_append(hst, h1, hh1) >= 0 && hst_count(hst) == 2, "two chained headers appended (store on disk: headers.dat)");
+      ok(dlc_headers_connect_ok(hst, 1, hh0), "the header at position 1 connects to the tip we asked from");
+      unsigned char other[32]; memset(other, 0xab, 32);
+      ok(!dlc_headers_connect_ok(hst, 1, other), "...and NOT to some other hash (a genesis-first answer)");
+      ok(dlc_headers_connect_ok(hst, 0, other), "a fresh store accepts anything (nothing to connect to)");
+      dlc_headers_rollback(hst, 1);
+      ok(hst_count(hst) == 1, "rollback drops the appended header: the store is back at 1");
+      { struct stat st; ok(stat("headers.dat", &st) == 0 && st.st_size == 112, "...and headers.dat is back to 112 bytes"); }
+      if (cwd0[0]) (void)!chdir(cwd0); }
+
     kill(fp, SIGKILL); waitpid(fp, NULL, 0); close(l);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
