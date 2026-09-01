@@ -105,7 +105,13 @@ static unsigned cf_put_varint(u8* p, unsigned long long v){
 }
 
 /* kind: 0 getcfilters, 1 getcfheaders, 2 getcfcheckpt */
+/* -peerblockfilters (Core default 0): serve BIP157 only when asked to, and
+ * advertise NODE_COMPACT_FILTERS only then (main.c ORs the bit in). Set
+ * before the serve children fork, so every child inherits it. */
+int g_cf_serving = 1;   /* tests and tools keep serving; the daemon sets Core's default (0) from the config */
+void serve_cfilters_set_enabled(int on){ g_cf_serving = on ? 1 : 0; }
 int serve_cfilters(int fd, int kind, const u8* pl, unsigned long plen){
+    if (!g_cf_serving) return 0;                 /* Core: the request is ignored */
     if (!pl) return 0;
     /* getcfilters/getcfheaders: type(1) + start(4) + stop_hash(32) = 37
      * getcfcheckpt:             type(1) + stop_hash(32)            = 33 */

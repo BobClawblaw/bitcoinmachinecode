@@ -369,6 +369,16 @@ static int wop_exists(const char* rel){
  * the legacy layout (the chain directory, or data/ beneath it). Set by
  * main.c from the config so this file carries no node_config dependency. */
 void rpc_wops_set_walletdir(const char* d){ snprintf(g_walletdir, sizeof g_walletdir, "%s", d ? d : ""); }
+static rpc_wops_defaults g_wdef = { WOT_BECH32, -1, 6, 1, 1, 1000, 0, 10000, 10000, 0, 0, 1 };
+static int g_wdef_set = 0;   /* 0 = pre-config behaviour (min-relay fallback when the estimator is empty) */
+void rpc_wops_set_defaults(const rpc_wops_defaults* d){ if (d){ g_wdef = *d; g_wdef_set = 1; } }
+int rpc_wops_default_type(int is_change){
+    if (!is_change) return g_wdef.addresstype;
+    if (g_wdef.changetype >= 0) return g_wdef.changetype;
+    /* Core's rule when -changetype is unset: legacy wallets make legacy
+     * change, everything else bech32 (the "implementation detail") */
+    return g_wdef.addresstype == WOT_LEGACY ? WOT_LEGACY : WOT_BECH32;
+}
 const char* rpc_wops_walletdir(void){ return g_walletdir; }
 static const char* wop_wallet_prefix(void){
     static char pfx[96];
@@ -2396,6 +2406,8 @@ static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
     for (long i = 0; i < n && m < cap; i++){
         if (recs[i].kind != 0) continue;
         if (wop_confs(recs[i].height) < minconf) continue;
+        /* -spendzeroconfchange=0: our own unconfirmed change stays put */
+        if (!g_wdef.spendzeroconfchange && WOT_CHAIN(recs[i].branch) == 1 && wop_confs(recs[i].height) < 1) continue;
         /* Spent later? Matched on the OUTPOINT the spend record carries --
          * (prev_txid, vout) -- not on a heuristic over value and key. Two
          * equal-valued receives at the same index to the same key would
@@ -2434,7 +2446,7 @@ static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
 
 static unsigned long long wf_feerate_sat_kvb(int conf_target){
     rj_val* p = rj_arr();
-    rj_arr_push(p, rj_numf("%d", conf_target > 0 ? conf_target : 6));
+    rj_arr_push(p, rj_numf("%d", conf_target > 0 ? conf_target : g_wdef.txconfirmtarget));
     rj_val* r = NULL; long ec; const char* em;
     rpc_wallet dummy; memset(&dummy, 0, sizeof dummy);
     unsigned long long rate = 0;
@@ -2456,7 +2468,17 @@ static unsigned long long wf_feerate_sat_kvb(int conf_target){
     }
     if (r) rj_free(r);
     rj_free(p);
+    if (rate == 0){
+        /* no estimate: Core uses -fallbackfee, and with it disabled (its
+         * default) refuses to guess. Before the config reached this file the
+         * wallet fell back to the minimum relay rate; that stays the
+         * behaviour of a wallet nobody configured (tests, tools). */
+        if (!g_wdef_set) rate = WF_MIN_RELAY_SAT_KVB;
+        else if (g_wdef.fallbackfee_satkvb > 0) rate = (unsigned long long)g_wdef.fallbackfee_satkvb;
+        else return 0;                                  /* caller: "Fee estimation failed..." */
+    }
     if (rate < WF_MIN_RELAY_SAT_KVB) rate = WF_MIN_RELAY_SAT_KVB;
+    if (g_wdef.mintxfee_satkvb > 0 && rate < (unsigned long long)g_wdef.mintxfee_satkvb) rate = (unsigned long long)g_wdef.mintxfee_satkvb;   /* -mintxfee */
     return rate;
 }
 
@@ -2479,11 +2501,22 @@ static int wf_select(wf_coin* coins, int ncoins, unsigned long long target,
                      long out_wu, unsigned long long feerate_kvb,
                      int* pick, unsigned long long* fee_out,
                      unsigned long long* change_out){
-    /* sort largest first */
+    /* sort largest first -- or SMALLEST first when the rate is at or below
+     * -consolidatefeerate: Core lets a cheap transaction carry more inputs
+     * than it strictly needs so the UTXO pool shrinks while it is cheap */
+    int consolidate = g_wdef.consolidatefeerate_satkvb > 0 && feerate_kvb <= (unsigned long long)g_wdef.consolidatefeerate_satkvb;
     for (int i = 1; i < ncoins; i++){
         wf_coin k = coins[i]; int j = i - 1;
-        while (j >= 0 && coins[j].value < k.value){ coins[j+1] = coins[j]; j--; }
+        while (j >= 0 && (consolidate ? coins[j].value > k.value : coins[j].value < k.value)){ coins[j+1] = coins[j]; j--; }
         coins[j+1] = k;
+    }
+    /* -discardfee: change that would be dust at that rate (Core's
+     * GetDustThreshold over a P2WPKH output + its ~68 vB spend) is given to
+     * the miner instead of creating an output nobody would spend */
+    unsigned long long dust = WF_DUST_SAT;
+    if (g_wdef.discardfee_satkvb > 0){
+        unsigned long long d = ((31ULL + 68ULL) * (unsigned long long)g_wdef.discardfee_satkvb + 999) / 1000;
+        if (d > dust) dust = d;
     }
     unsigned long long sum = 0;
     int n = 0;
@@ -2497,7 +2530,7 @@ static int wf_select(wf_coin* coins, int ncoins, unsigned long long target,
         unsigned long long fee = ((unsigned long long)wf_vsize(wu) * feerate_kvb + 999) / 1000;
         if (sum < target + fee) continue;
         unsigned long long change = sum - target - fee;
-        if (change < WF_DUST_SAT){
+        if (change < dust){
             /* drop the change output: recompute the fee without it and give
              * the remainder to the miner rather than creating dust */
             long wu2 = WF_OVERHEAD_WU + (long)n * (WF_IN_BASE_WU + WF_IN_WIT_WU) + out_wu;
@@ -2532,7 +2565,8 @@ static long wf_build_unsigned(unsigned char* o, const wf_coin* coins, const int*
         unsigned int vo = coins[pick[i]].vout;
         for (int k=0;k<4;k++) o[p++] = (unsigned char)(vo >> (8*k));
         o[p++] = 0x00;                                              /* empty scriptSig */
-        for (int k=0;k<4;k++) o[p++] = (unsigned char)(0xfffffffdu >> (8*k)); /* RBF */
+        { unsigned int seq = g_wdef.walletrbf ? 0xfffffffdu : 0xfffffffeu;        /* -walletrbf */
+          for (int k=0;k<4;k++) o[p++] = (unsigned char)(seq >> (8*k)); }
     }
     p += wf_vi(o + p, (unsigned long long)nout);
     for (int i = 0; i < nout; i++){
@@ -2590,6 +2624,9 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
     long out_wu = 0;
     for (int i = 0; i < nout; i++){ target += outs[i].value; out_wu += wf_out_wu(outs[i].spklen); }
     unsigned long long rate = wf_feerate_sat_kvb(conf_target);
+    if (rate == 0)
+        return wop_err(ec, em, -4, "Fee estimation failed. Fallbackfee is disabled. Please either enable "
+                                   "fallbackfee or specify a fee rate.");          /* Core's text */
     int pick[WF_MAX_IN];
     unsigned long long fee = 0, change = 0;
     /* ---- Branch-and-Bound first (Core SelectCoinsBnB; wallet_bnb.c) ----
@@ -2635,6 +2672,25 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
     }
     if (nin < 0)
         nin = wf_select(coins, nc, target, out_wu, rate, pick, &fee, &change);
+    /* -avoidpartialspends / -maxapsfee: once a destination is being spent
+     * from, spend EVERYTHING that sits on it -- if the extra inputs cost at
+     * most maxapsfee (Core: 0 by default, -1 = regardless of cost). Only the
+     * change-making path can absorb extra inputs; a changeless BnB pick is
+     * left alone (extending it would need a change output). */
+    if (nin > 0 && change > 0 && (g_wdef.avoidpartialspends || g_wdef.maxapsfee_sat != 0) && nin < WF_MAX_IN){
+        unsigned long long extra_fee = 0, extra_val = 0; int added = 0;
+        for (int i = 0; i < nc && nin + added < WF_MAX_IN; i++){
+            int picked = 0; for (int k = 0; k < nin + added; k++) if (pick[k] == i){ picked = 1; break; }
+            if (picked) continue;
+            int same = 0; for (int k = 0; k < nin; k++) if (!memcmp(coins[pick[k]].h160, coins[i].h160, 20)){ same = 1; break; }
+            if (!same) continue;
+            unsigned long long f1 = ((unsigned long long)wf_vsize(WF_IN_BASE_WU + WF_IN_WIT_WU) * rate + 999) / 1000;
+            if (g_wdef.maxapsfee_sat >= 0 && extra_fee + f1 > (unsigned long long)g_wdef.maxapsfee_sat && !g_wdef.avoidpartialspends) break;
+            if (g_wdef.maxapsfee_sat >= 0 && g_wdef.avoidpartialspends && extra_fee + f1 > (unsigned long long)g_wdef.maxapsfee_sat && g_wdef.maxapsfee_sat > 0) break;
+            pick[nin + added++] = i; extra_fee += f1; extra_val += coins[i].value;
+        }
+        if (added){ nin += added; fee += extra_fee; change += extra_val - extra_fee; }
+    }
     if (nin < 0){
         unsigned long long have = 0;
         for (int i = 0; i < nc; i++) have += coins[i].value;
@@ -2726,6 +2782,20 @@ static int wf_sign(const rpc_wallet* w, const char* hex, rj_val* prevtxs,
 static int wf_send(const rpc_wallet* w, const char* signed_hex, char** txid_out,
                    long* ec, const char** em){
     *txid_out = NULL;
+    if (!g_wdef.walletbroadcast){
+        /* -walletbroadcast=0: the transaction is built and signed but never
+         * handed to the mempool; the caller gets its txid (Core keeps it as
+         * an unbroadcast wallet tx) */
+        extern int tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
+        size_t hl = strlen(signed_hex); unsigned char* raw = malloc(hl / 2 + 1); unsigned char* scratch = malloc(hl / 2 + 64);
+        if (!raw || !scratch){ free(raw); free(scratch); return wop_err(ec, em, -7, "out of memory"); }
+        for (size_t i = 0; i + 1 < hl; i += 2){ unsigned v; sscanf(signed_hex + i, "%2x", &v); raw[i/2] = (unsigned char)v; }
+        unsigned char id[32]; tx_txid(id, raw, hl / 2, scratch, hl / 2 + 64);
+        char* hx = malloc(65); for (int b = 0; b < 32; b++) snprintf(hx + b*2, 3, "%02x", id[31-b]); hx[64] = 0;
+        free(raw); free(scratch);
+        *txid_out = hx;
+        return 1;
+    }
     rj_val* p = rj_arr();
     rj_arr_push(p, rj_str(signed_hex));
     rj_val* r = NULL;
@@ -3882,6 +3952,57 @@ int rpc_wops_own_coin_spk(const void* wseed, const unsigned char txid_wire[32], 
         } else if (t == WOT_LEGACY){ spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, k->h160, 20); spk[23]=0x88; spk[24]=0xac; *spklen = 25; }
         else { spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, k->h160, 20); *spklen = 22; }
         return 1;
+    }
+    return 0;
+}
+
+/* ---- -walletnotify support (2026-09-01) ---------------------------------
+ * Does this transaction concern the wallet? An input spending one of our
+ * coins (by outpoint, via the scan records) or an output paying one of our
+ * keys (by scriptPubKey shape per output type). A minimal parser: version,
+ * optional segwit marker, inputs, outputs; witnesses are not needed. */
+static unsigned long wn_varint(const unsigned char* p, unsigned long n, unsigned long* v){
+    if (n < 1) return 0;
+    if (p[0] < 0xfd){ *v = p[0]; return 1; }
+    if (p[0] == 0xfd){ if (n < 3) return 0; *v = p[1] | (p[2] << 8); return 3; }
+    if (p[0] == 0xfe){ if (n < 5) return 0; *v = p[1] | (p[2]<<8) | ((unsigned long)p[3]<<16) | ((unsigned long)p[4]<<24); return 5; }
+    return 0;
+}
+static int wn_spk_is_ours(const wscan_key* keys, int nk, const unsigned char* spk, unsigned long sl){
+    for (int i = 0; i < nk; i++){
+        int t = WOT_TYPE(keys[i].branch);
+        if (t == WOT_BECH32 && sl == 22 && spk[0] == 0x00 && spk[1] == 0x14 && !memcmp(spk+2, keys[i].h160, 20)) return 1;
+        if (t == WOT_LEGACY && sl == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 && !memcmp(spk+3, keys[i].h160, 20)) return 1;
+        if (t == WOT_P2SH_SEGWIT && sl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && !memcmp(spk+2, keys[i].h160, 20)) return 1;
+        if (t == WOT_BECH32M && sl == 34 && spk[0] == 0x51 && spk[1] == 0x20 && !memcmp(spk+2, keys[i].h160, 20)) return 1;
+    }
+    return 0;
+}
+int rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, unsigned long len){
+    if (!w || !w->seed || !tx || len < 10) return 0;
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return 0;
+    unsigned long p = 4, v, n;
+    if (p + 2 <= len && tx[p] == 0x00 && tx[p+1] == 0x01) p += 2;          /* segwit marker+flag */
+    if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+    unsigned long nin = v;
+    for (unsigned long i = 0; i < nin; i++){
+        if (p + 36 > len) return 0;
+        unsigned int vout = tx[p+32] | (tx[p+33]<<8) | ((unsigned)tx[p+34]<<16) | ((unsigned)tx[p+35]<<24);
+        unsigned long long cv; unsigned char h[20];
+        if (rpc_wops_own_coin(w->seed, tx + p, vout, &cv, h)) return 1;
+        p += 36;
+        if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+        if (p + v + 4 > len) return 0; p += v + 4;
+    }
+    if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+    unsigned long nout = v;
+    for (unsigned long i = 0; i < nout; i++){
+        if (p + 8 > len) return 0; p += 8;
+        if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+        if (p + v > len) return 0;
+        if (wn_spk_is_ours(keys, nk, tx + p, v)) return 1;
+        p += v;
     }
     return 0;
 }

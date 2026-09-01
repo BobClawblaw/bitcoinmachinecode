@@ -49,7 +49,24 @@ typedef struct {
      * default ACL rather than by the bind alone -- binding narrowly and
      * checking nothing would leave the ACL a comment. */
     int (*allows)(const char* ip);
+    /* 2026-09-01 (Core -rpcthreads/-rpcworkqueue/-rpcservertimeout): 0 =
+     * Core's defaults (16 / 64 / 30 s). Handlers still execute one at a
+     * time (g_exec_lock); the pool bounds how many CLIENTS are being read,
+     * and the queue how many wait beyond that -- past it Core answers 503. */
+    int threads;
+    int workqueue;
+    int timeout_s;
 } rpc_server_cfg;
+
+/* -rpcwhitelist=<user>:<m1>,<m2>,... (repeatable; entries for one user are
+ * intersected) and -rpcwhitelistdefault. Core: once any whitelist exists,
+ * users without one may call nothing unless rpcwhitelistdefault=0. */
+int  rpc_whitelist_add(const char* spec);
+void rpc_whitelist_set_default(int deny_unlisted);   /* -1 = Core's rule */
+void rpc_whitelist_clear(void);
+int  rpc_whitelist_allows(const char* user, const char* method);
+/* -rpccookieperms: 0 owner (0600), 1 group (0640), 2 all (0644). */
+void rpc_cookie_set_perms(int perms);
 
 /* Start the HTTP JSON-RPC server: bind+listen on loopback, spawn an accept
  * thread, and serve connections until rpc_server_stop(). `wallet` must outlive

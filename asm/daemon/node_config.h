@@ -226,9 +226,65 @@ typedef struct {
                                   * (def logs/bitcoind.log in the chain dir;
                                   * "0" = no file log)                       */
     unsigned char assumevalid[32]; int assumevalid_mode;   /* 0 = the chain default (Core defaultAssumeValid), 1 = this hash (wire order), 2 = assumevalid=0: evaluate every script */
+
+    /* ---- 2026-09-01: Core v31.99 option-surface completion (Core names,
+     * units and defaults; the RPC libraries receive these through setters
+     * from main.c, never by including this header) ---- */
+    char uacomment[4][64];          /* -uacomment (repeatable, SAFE_CHARS_UA_COMMENT) */
+    int  n_uacomment;
+    int  blockmaxweight;            /* -blockmaxweight (4000..4000000, default 4000000) */
+    int  blockreservedweight;       /* -blockreservedweight (default 8000, >= 2000)      */
+    long blockmintxfee_satkvb;      /* -blockmintxfee BTC/kvB -> sat/kvB (default 1)     */
+    int  blockversion;              /* -blockversion: 0 = the node's own (0x20000000)    */
+    int  printpriority;             /* -printpriority: log the fee rate of template txs  */
+    long mintxfee_satkvb;           /* -mintxfee (default 0.00001 BTC/kvB = 1000)        */
+    long fallbackfee_satkvb;        /* -fallbackfee (default 0 = disabled)               */
+    long discardfee_satkvb;         /* -discardfee (default 0.0001 = 10000)              */
+    long consolidatefeerate_satkvb; /* -consolidatefeerate (default 0.0001 = 10000)      */
+    long maxapsfee_sat;             /* -maxapsfee, absolute sat (default 0; -1 = always) */
+    int  avoidpartialspends;        /* default 0 */
+    int  spendzeroconfchange;       /* default 1 */
+    int  walletrbf;                 /* default 1 */
+    int  txconfirmtarget;           /* default 6 (1..1008) */
+    int  walletbroadcast;           /* default 1 */
+    int  keypool;                   /* accepted; no keypool in a descriptor-derived wallet */
+    char walletnotify[512];         /* -walletnotify=<cmd>, %s = txid */
+    char wallet_names[8][64];       /* -wallet=<name> (repeatable): loaded at start-up */
+    int  n_wallet_names;
+    char addresstype[16];           /* -addresstype: legacy | p2sh-segwit | bech32 | bech32m (default bech32) */
+    char changetype[16];            /* -changetype: same set; empty = Core's rule (legacy if addresstype=legacy, else bech32) */
+    long maxtipage;                 /* -maxtipage seconds (default 86400): IBD if the tip is older */
+    int  inboundrelaypercent;       /* -inboundrelaypercent 0..100 (default 50)          */
+    int  whitelistrelay;            /* default 1: whitelisted peers get 'relay'          */
+    int  whitelistforcerelay;       /* default 0                                          */
+    int  peerbloomfilters;          /* default 0; 1 is refused (BIP37 not implemented)   */
+    int  peerblockfilters;          /* default 0: advertise NODE_COMPACT_FILTERS + serve BIP157 */
+    int  fixedseeds;                /* default 1 (no compiled-in seeds here; accepted)   */
+    char signetseednode[4][80];     /* -signetseednode (repeatable): seednode when chain=signet */
+    int  n_signetseednode;
+    int  txreconciliation;          /* accepted; Erlay is a deliberate stop              */
+    int  logips, logtimestamps, logtimemicros, logthreadnames, logsourcelocations;
+    int  shrinkdebugfile;           /* default 1: truncate a >10 MB log to its last 200 KB at start-up */
+    int  printtoconsole;
+    char loglevel[24];
+    int  rpcthreads;                /* default 16 (>= 1)  */
+    int  rpcworkqueue;              /* default 64 (>= 1)  */
+    int  rpcservertimeout;          /* default 30 s (>= 1) */
+    char rpcwhitelist[16][512];     /* -rpcwhitelist=<user>:<m1>,<m2> (repeatable) */
+    int  n_rpcwhitelist;
+    int  rpcwhitelistdefault;       /* -1 = unset (Core: 1 when any whitelist exists) */
+    int  rpccookieperms;            /* 0 owner (0600), 1 group (0640), 2 all (0644) */
+    int  limitclustercount;         /* -limitclustercount (default 64)   */
+    int  limitclustersize_kvb;      /* -limitclustersize  (default 101)  */
+    int  checkblockindex, checkmempool, checkaddrman, capturemessages, stopafterblockimport;
+    long long mocktime;             /* -mocktime (accepted; see FEATURE_GAPS)            */
+    char includeconf[8][256];       /* -includeconf (repeatable; main file only)        */
+    int  n_includeconf;
 } node_config_t;
 
 extern node_config_t g_cfg;
+/* Core option this node accepts without effect: reason string, or NULL. */
+const char* nodecfg_noeffect_reason(const char* key);
 
 /* Fill g_cfg with compiled defaults, then overlay <path> if it exists.
  * Returns the number of keys applied from the file (0 if absent/empty).
