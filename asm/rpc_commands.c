@@ -904,6 +904,64 @@ static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed)
 static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, unsigned long n){
     char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
 }
+static void psbt_path_str(char* out, unsigned long cap, const unsigned char* p, unsigned long n){
+    /* Core's WriteHDKeypath: "m" then "/<i>" with an h suffix for hardened */
+    unsigned long o = 0; o += (unsigned long)snprintf(out + o, cap - o, "m");
+    for (unsigned long i = 0; i + 4 <= n && o + 16 < cap; i += 4){
+        unsigned v = (unsigned)p[i] | ((unsigned)p[i+1]<<8) | ((unsigned)p[i+2]<<16) | ((unsigned)p[i+3]<<24);
+        o += (unsigned long)snprintf(out + o, cap - o, "/%u%s", v & 0x7fffffffu, (v & 0x80000000u) ? "h" : "");
+    }
+}
+static rj_val* psbt_hexval(const unsigned char* v, unsigned long n){ char* h = malloc(n*2+1); if (!h) return rj_str(""); bin_to_hex(h, v, n); rj_val* r = rj_str(h); free(h); return r; }
+static rj_val* psbt_obj_arr(rj_val* o, const char* name){ rj_val* a = rj_obj_get(o, name); if (!a){ a = rj_arr(); rj_obj_set(o, name, a); } return a; }
+/* decodepsbt input/output taproot + partial-signature fields, Core's names
+ * (rpc/rawtransaction.cpp decodepsbt). Returns 1 if the key was consumed. */
+static int psbt_decode_common(rj_val* o, const unsigned char* key, unsigned long kl, const unsigned char* val, unsigned long vl, int is_input){
+    unsigned char t = key[0];
+    if (is_input){
+        if (t == 0x02 && kl >= 34){ rj_val* ps = rj_obj_get(o, "partial_signatures"); if (!ps){ ps = rj_obj(); rj_obj_set(o, "partial_signatures", ps); }
+            char kh[140]; bin_to_hex(kh, key+1, kl-1); rj_obj_set(ps, kh, psbt_hexval(val, vl)); return 1; }
+        if (t == 0x03 && vl == 4){ unsigned v = (unsigned)val[0] | ((unsigned)val[1]<<8); const char* nm = NULL;
+            switch (v){ case 0: nm = "DEFAULT"; break; case 1: nm = "ALL"; break; case 2: nm = "NONE"; break; case 3: nm = "SINGLE"; break;
+                        case 0x81: nm = "ALL|ANYONECANPAY"; break; case 0x82: nm = "NONE|ANYONECANPAY"; break; case 0x83: nm = "SINGLE|ANYONECANPAY"; break; default: break; }
+            if (nm) rj_obj_set(o, "sighash", rj_str(nm)); return 1; }
+        if (t == 0x06 && kl >= 34 && vl >= 4){ rj_val* a = psbt_obj_arr(o, "bip32_derivs"); rj_val* d = rj_obj();
+            rj_obj_set(d, "pubkey", psbt_hexval(key+1, kl-1)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val, 4));
+            char ps[512]; psbt_path_str(ps, sizeof ps, val+4, vl-4); rj_obj_set(d, "path", rj_str(ps)); rj_arr_push(a, d); return 1; }
+        if (t == 0x08){ rj_val* a = rj_arr(); const unsigned char* q = val; unsigned long cc; unsigned long cnt = srw_varint(q, &cc); q += cc;
+            for (unsigned long z = 0; z < cnt && (unsigned long)(q - val) < vl; z++){ unsigned long l = srw_varint(q, &cc); q += cc; if ((unsigned long)(q - val) + l > vl) break; rj_arr_push(a, psbt_hexval(q, l)); q += l; }
+            rj_obj_set(o, "final_scriptwitness", a); return 1; }
+        if (t == 0x13 && (vl == 64 || vl == 65)){ rj_obj_set(o, "taproot_key_path_sig", psbt_hexval(val, vl)); return 1; }
+        if (t == 0x14 && kl == 65){ rj_val* a = psbt_obj_arr(o, "taproot_script_path_sigs"); rj_val* d = rj_obj();
+            rj_obj_set(d, "pubkey", psbt_hexval(key+1, 32)); rj_obj_set(d, "leaf_hash", psbt_hexval(key+33, 32)); rj_obj_set(d, "sig", psbt_hexval(val, vl)); rj_arr_push(a, d); return 1; }
+        if (t == 0x15 && kl >= 34 && vl >= 1){ rj_val* a = psbt_obj_arr(o, "taproot_scripts"); rj_val* d = NULL;
+            /* Core groups control blocks by (script, leaf_ver) */
+            for (unsigned long z = 0; z < a->nitems; z++){ rj_val* e = a->items[z]; rj_val* sc = rj_obj_get(e, "script"); rj_val* lv = rj_obj_get(e, "leaf_ver");
+                if (sc && sc->str && strlen(sc->str) == (vl-1)*2 && lv && (unsigned)strtoul(lv->str, 0, 10) == val[vl-1]){ char* h = malloc(vl*2); bin_to_hex(h, val, vl-1); int same = !strcmp(h, sc->str); free(h); if (same){ d = e; break; } } }
+            if (!d){ d = rj_obj(); rj_obj_set(d, "script", psbt_hexval(val, vl-1)); rj_obj_set(d, "leaf_ver", rj_numf("%u", (unsigned)val[vl-1])); rj_obj_set(d, "control_blocks", rj_arr()); rj_arr_push(a, d); }
+            rj_arr_push(rj_obj_get(d, "control_blocks"), psbt_hexval(key+1, kl-1)); return 1; }
+        if (t == 0x17 && vl == 32){ rj_obj_set(o, "taproot_internal_key", psbt_hexval(val, 32)); return 1; }
+        if (t == 0x18 && vl == 32){ rj_obj_set(o, "taproot_merkle_root", psbt_hexval(val, 32)); return 1; }
+    } else {
+        if (t == 0x02 && kl >= 34 && vl >= 4){ rj_val* a = psbt_obj_arr(o, "bip32_derivs"); rj_val* d = rj_obj();
+            rj_obj_set(d, "pubkey", psbt_hexval(key+1, kl-1)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val, 4));
+            char ps[512]; psbt_path_str(ps, sizeof ps, val+4, vl-4); rj_obj_set(d, "path", rj_str(ps)); rj_arr_push(a, d); return 1; }
+        if (t == 0x05 && vl == 32){ rj_obj_set(o, "taproot_internal_key", psbt_hexval(val, 32)); return 1; }
+        if (t == 0x06){ rj_val* a = rj_arr(); const unsigned char* q = val;
+            while ((unsigned long)(q - val) + 2 < vl){ unsigned char depth = q[0], lv = q[1]; unsigned long cc; unsigned long l = srw_varint(q+2, &cc); q += 2 + cc; if ((unsigned long)(q - val) + l > vl) break;
+                rj_val* d = rj_obj(); rj_obj_set(d, "depth", rj_numf("%u", depth)); rj_obj_set(d, "leaf_ver", rj_numf("%u", lv)); rj_obj_set(d, "script", psbt_hexval(q, l)); rj_arr_push(a, d); q += l; }
+            rj_obj_set(o, "taproot_tree", a); return 1; }
+    }
+    /* taproot bip32 derivs share a shape on both sides: 0x16 (input) / 0x07 (output) */
+    if (((is_input && t == 0x16) || (!is_input && t == 0x07)) && kl == 33){
+        unsigned long cc; unsigned long nlh = srw_varint(val, &cc); unsigned long q = cc + nlh * 32; if (q + 4 > vl) return 1;
+        rj_val* a = psbt_obj_arr(o, "taproot_bip32_derivs"); rj_val* d = rj_obj();
+        rj_obj_set(d, "pubkey", psbt_hexval(key+1, 32)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val+q, 4));
+        char ps[512]; psbt_path_str(ps, sizeof ps, val+q+4, vl-q-4); rj_obj_set(d, "path", rj_str(ps));
+        rj_val* lh = rj_arr(); for (unsigned long z = 0; z < nlh; z++) rj_arr_push(lh, psbt_hexval(val+cc+z*32, 32)); rj_obj_set(d, "leaf_hashes", lh);
+        rj_arr_push(a, d); return 1; }
+    return 0;
+}
 static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params,0,ec,em); if (!b64) return 0;
     static unsigned char buf[200000]; long blen=0;
@@ -938,7 +996,7 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
                     case 0x04: psbt_field_hex(io,"redeem_script",val,vl); break;
                     case 0x05: psbt_field_hex(io,"witness_script",val,vl); break;
                     case 0x07: psbt_field_hex(io,"final_scriptSig",val,vl); break;
-                    default: break; } }
+                    default: psbt_decode_common(io,key,kl,val,vl,1); break; } }
         }
         rj_arr_push(ins,io);
     }
@@ -950,7 +1008,7 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
             const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
             if (kl>=1){ switch (key[0]){ case 0x00: psbt_field_hex(oo,"redeem_script",val,vl); break;
                                          case 0x01: psbt_field_hex(oo,"witness_script",val,vl); break;
-                                         default: break; } }
+                                         default: psbt_decode_common(oo,key,kl,val,vl,0); break; } }
         }
         rj_arr_push(outs,oo);
     }
@@ -1302,6 +1360,7 @@ static int srw_wif(const char* wif, unsigned char priv[32], int* comp){
 /* parse SIGHASH type string -> byte; default ALL. -1 on error. */
 static int srw_hashtype(const char* s){
     if (!s) return 0x01;
+    if (!strcmp(s,"DEFAULT")) return 0x100;   /* Core: SIGHASH_DEFAULT -- ALL for ECDSA, the 64-byte default for taproot */
     int base=0, acp=0; const char* bar=strchr(s,'|');
     size_t bl = bar ? (size_t)(bar-s) : strlen(s);
     if (bl==3 && !strncmp(s,"ALL",3)) base=1;
@@ -1313,7 +1372,18 @@ static int srw_hashtype(const char* s){
 }
 typedef struct { unsigned char txid_wire[32]; unsigned long vout; unsigned char spk[64]; unsigned long spklen;
                  unsigned long long amount; unsigned char redeem[128]; unsigned long redeemlen;
-                 unsigned char wscript[1024]; unsigned long wscriptlen; } srw_prev_t;
+                 unsigned char wscript[1024]; unsigned long wscriptlen;
+                 /* taproot (2026-09-01): a script-path leaf + its control block, and/or the
+                  * key-path tweak inputs. Fed by the PSBT layer through the prevtx object's
+                  * internal keys tapLeafScript/tapControlBlock/tapMerkleRoot/tapInternalKey. */
+                 unsigned char tapleaf[1024]; unsigned long tapleaflen;
+                 unsigned char tapctrl[33+32*16]; unsigned long tapctrllen;
+                 unsigned char tapmerkle[32]; int has_merkle;
+                 unsigned char tapinternal[32]; int has_internal;
+                 /* partial signatures already in the PSBT (TAP_SCRIPT_SIG / TAP_KEY_SIG), carried
+                  * into the witness for the keys this call does not hold */
+                 struct { unsigned char x[32], lh[32], sig[65]; int sl; } tap_psig[32]; int n_tap_psig;
+                 unsigned char tap_keysig[65]; int tap_keysig_len; } srw_prev_t;
 
 /* ---- CHECKMULTISIG / taproot signing helpers (2026-09-01) ------------------
  * The raw signer used to sign P2PKH, P2WPKH and P2SH-P2WPKH only. It now
@@ -1354,6 +1424,101 @@ static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigne
                                 const unsigned char* tx, const unsigned char hp[32], const unsigned char hs[32],
                                 const unsigned char outpoint36[36], unsigned seq, const unsigned char ho[32], unsigned long locktime, int hashtype,
                                 unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys);
+static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigned long txlen,
+                           unsigned long i, unsigned long n_in, const unsigned char* const* outpoints, const unsigned* seqs,
+                           srw_prev_t* const* prev_of, unsigned long out_start, unsigned long out_end,
+                           unsigned long locktime, int hashtype, const unsigned char* leafhash);
+/* ---- taproot script path (2026-09-01) --------------------------------------
+ * The leaf forms this node signs on its own: pk(KEY) -> <x> CHECKSIG, and
+ * multi_a(k, K1..Kn) -> <x1> CHECKSIG <x2> CHECKSIGADD .. <k> NUMEQUAL. Any
+ * other leaf is left to the miniscript satisfier (separate workstream). */
+#define SRW_TAP_MAXKEYS 32
+static int srw_tap_leaf_keys(const unsigned char* sc, unsigned long n, unsigned char (*keys)[32], int* k_of){
+    /* returns the key count (>0) and the threshold in *k_of; 0 = not a form we sign */
+    int nk = 0; unsigned long p = 0;
+    if (n == 34 && sc[0] == 0x20 && sc[33] == 0xac){ memcpy(keys[0], sc+1, 32); *k_of = 1; return 1; }
+    while (p + 34 <= n && nk < SRW_TAP_MAXKEYS && sc[p] == 0x20){
+        unsigned char op = sc[p+33];
+        if (nk == 0 ? op != 0xac : op != 0xba) return 0;
+        memcpy(keys[nk++], sc+p+1, 32); p += 34;
+    }
+    if (nk < 1 || p >= n) return 0;
+    int k;
+    if (sc[p] >= 0x51 && sc[p] <= 0x60){ k = sc[p] - 0x50; p++; }
+    else if (sc[p] == 0x01 && p + 1 < n){ k = sc[p+1]; p += 2; }
+    else return 0;
+    if (p + 1 != n || sc[p] != 0x9c || k < 1 || k > nk) return 0;
+    *k_of = k; return nk;
+}
+static void srw_tapleaf_hash(unsigned char out[32], unsigned char ver, const unsigned char* sc, unsigned long n){
+    unsigned char th[32]; sha256_full(th, "TapLeaf", 7);
+    unsigned char* b = malloc(64 + 1 + 9 + n); unsigned long m = 0;
+    memcpy(b, th, 32); m += 32; memcpy(b + m, th, 32); m += 32; b[m++] = ver;
+    m += crt_varint(b + m, n); memcpy(b + m, sc, n); m += n;
+    sha256_full(out, b, m); free(b);
+}
+static void srw_tapbranch(unsigned char out[32], const unsigned char* a, const unsigned char* b){
+    unsigned char th[32]; sha256_full(th, "TapBranch", 9);
+    unsigned char buf[128]; memcpy(buf, th, 32); memcpy(buf+32, th, 32);
+    if (memcmp(a, b, 32) <= 0){ memcpy(buf+64, a, 32); memcpy(buf+96, b, 32); } else { memcpy(buf+64, b, 32); memcpy(buf+96, a, 32); }
+    sha256_full(out, buf, 128);
+}
+static void srw_taptweak(unsigned char t[32], const unsigned char* xonly, const unsigned char* root /* NULL = no tree */){
+    unsigned char th[32]; sha256_full(th, "TapTweak", 8);
+    unsigned char tb[128]; memcpy(tb, th, 32); memcpy(tb+32, th, 32); memcpy(tb+64, xonly, 32);
+    if (root){ memcpy(tb+96, root, 32); sha256_full(t, tb, 128); } else sha256_full(t, tb, 96);
+}
+/* Sign one P2TR script-path input. Builds the witness [sig..., script, control]
+ * (multi_a: one slot per key, empty where we hold no key, at most k filled),
+ * even when incomplete, so the PSBT layer can extract partial signatures.
+ * Returns NULL or an error string ("Missing signatures: ..." is partial). */
+static const char* srw_sign_tap_script(const srw_prev_t* P, const unsigned char* spk, unsigned char* wit, unsigned long* witlen, int* wititems,
+                                       const unsigned char* tx, unsigned long txlen, unsigned long i, unsigned long n_in,
+                                       const unsigned char* const* outpoints, const unsigned* seqs, srw_prev_t* const* prev_of,
+                                       unsigned long out_start, unsigned long out_end, unsigned long locktime, int tht,
+                                       unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys){
+    const unsigned char* ctrl = P->tapctrl; unsigned long cl = P->tapctrllen;
+    unsigned char ver = ctrl[0] & 0xfe;
+    unsigned char lh[32]; srw_tapleaf_hash(lh, ver, P->tapleaf, P->tapleaflen);
+    unsigned char k[32]; memcpy(k, lh, 32);
+    for (unsigned long q = 33; q + 32 <= cl; q += 32) srw_tapbranch(k, k, ctrl + q);
+    unsigned char t[32], qx[32]; srw_taptweak(t, ctrl + 1, k);
+    if (!bip32_xonly_tweak_add(ctrl + 1, t, qx) || memcmp(qx, spk + 2, 32)) return "tapControlBlock does not commit to this scriptPubKey";
+    unsigned char keys[SRW_TAP_MAXKEYS][32]; int kth = 0;
+    int nk = srw_tap_leaf_keys(P->tapleaf, P->tapleaflen, keys, &kth);
+    if (nk <= 0) return "P2TR script-path: only pk() and multi_a() leaves are signed on this node";
+    unsigned char z[32];
+    if (!srw_tap_sighash(z, tx, txlen, i, n_in, outpoints, seqs, prev_of, out_start, out_end, locktime, tht, lh))
+        return "P2TR sighash needs scriptPubKey and amount for every input";
+    static unsigned char sigs[SRW_TAP_MAXKEYS][65]; int sl[SRW_TAP_MAXKEYS]; int got = 0;
+    for (int a = 0; a < nk; a++){
+        sl[a] = 0;
+        if (got >= kth) continue;
+        for (int b = 0; b < nkeys; b++){
+            if (!ncomp[b] || memcmp(kpub[b] + 1, keys[a], 32)) continue;
+            unsigned char aux[32], ab[64]; memcpy(ab, z, 32); memcpy(ab+32, kpriv[b], 32); sha256d(aux, ab, 64);
+            if (!bip340_sign(sigs[a], z, 32, kpriv[b], aux)) return "schnorr signing failed";
+            sl[a] = 64; if (tht != 0){ sigs[a][64] = (unsigned char)tht; sl[a] = 65; }
+            got++; break;
+        }
+    }
+    for (int a = 0; a < nk && got < kth; a++){                       /* slots we could not sign: partials from the PSBT */
+        if (sl[a]) continue;
+        for (int q = 0; q < P->n_tap_psig; q++){
+            if (memcmp(P->tap_psig[q].x, keys[a], 32) || memcmp(P->tap_psig[q].lh, lh, 32)) continue;
+            memcpy(sigs[a], P->tap_psig[q].sig, (size_t)P->tap_psig[q].sl); sl[a] = P->tap_psig[q].sl; got++; break;
+        }
+    }
+    unsigned long o = 0; int items = 0;
+    if (nk == 1 && kth == 1){ if (sl[0]){ wit[o++] = (unsigned char)sl[0]; memcpy(wit+o, sigs[0], sl[0]); o += sl[0]; items++; } }
+    else { for (int a = nk - 1; a >= 0; a--){ wit[o++] = (unsigned char)sl[a]; if (sl[a]){ memcpy(wit+o, sigs[a], sl[a]); o += sl[a]; } items++; } }
+    o += crt_varint(wit + o, P->tapleaflen); memcpy(wit + o, P->tapleaf, P->tapleaflen); o += P->tapleaflen; items++;
+    o += crt_varint(wit + o, cl); memcpy(wit + o, ctrl, cl); o += cl; items++;
+    *witlen = o; *wititems = items;
+    if (got < kth){ static char mbuf[64]; snprintf(mbuf, sizeof mbuf, "Missing signatures: have %d of %d", got, kth); return mbuf; }
+    return NULL;
+}
+
 static int srw_key_index(const unsigned char* key, int klen, unsigned char (*kpub)[33], const int* ncomp, int nkeys){
     for (int h = 0; h < nkeys; h++){
         if (klen == 33){ if (ncomp[h] && !memcmp(key, kpub[h], 33)) return h; }
@@ -1390,7 +1555,7 @@ static unsigned long srw_push(unsigned char* o, const unsigned char* d, unsigned
 static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigned long txlen,
                            unsigned long i, unsigned long n_in, const unsigned char* const* outpoints, const unsigned* seqs,
                            srw_prev_t* const* prev_of, unsigned long out_start, unsigned long out_end,
-                           unsigned long locktime, int hashtype){
+                           unsigned long locktime, int hashtype, const unsigned char* leafhash /* NULL = key path */){
     int base = hashtype & 3, acp = hashtype & 0x80;
     if (hashtype != 0 && !(base == 1 || base == 2 || base == 3)) return 0;   /* DEFAULT, ALL, NONE, SINGLE (+ACP) */
     unsigned char* msg = malloc(300 + txlen); if (!msg) return 0; unsigned long m = 0;
@@ -1415,7 +1580,7 @@ static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigne
     unsigned long cc; unsigned long n_out = srw_varint(tx + out_start, &cc);
     const unsigned char* outs = tx + out_start + cc; unsigned long outs_len = out_end - (out_start + cc);
     if (base != 2 && base != 3){ sha256_full(msg + m, outs, outs_len); m += 32; }   /* sha_outputs */
-    msg[m++] = 0x00;                                   /* spend_type: ext_flag 0, no annex */
+    msg[m++] = leafhash ? 0x02 : 0x00;                 /* spend_type: ext_flag (1 = tapscript) * 2 + annex (never) */
     if (acp){
         if (!prev_of[i]){ free(msg); return 0; }
         memcpy(msg + m, outpoints[i], 36); m += 36;
@@ -1433,6 +1598,11 @@ static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigne
             if (oi == i){ sha256_full(msg + m, q, olen); m += 32; break; }
             q += olen; left -= olen;
         }
+    }
+    if (leafhash){                                     /* BIP342 extension: tapleaf_hash, key_version, codesep_pos */
+        memcpy(msg + m, leafhash, 32); m += 32;
+        msg[m++] = 0x00;
+        msg[m++] = 0xff; msg[m++] = 0xff; msg[m++] = 0xff; msg[m++] = 0xff;
     }
     /* TaggedHash("TapSighash", msg) */
     unsigned char th[32]; sha256_full(th, "TapSighash", 10);
@@ -1531,12 +1701,29 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
             if (rs&&rs->typ==RJ_STR){ size_t rl=strlen(rs->str); if (!(rl&1)&&rl/2<=128){ P->redeemlen=(unsigned long)(rl/2); hex_to_bytes(P->redeem,rs->str,rl); } }
             rj_val* ws=rj_obj_get(e,"witnessScript"); P->wscriptlen=0;
             if (ws&&ws->typ==RJ_STR){ size_t wl=strlen(ws->str); if (!(wl&1)&&wl/2<=sizeof P->wscript){ P->wscriptlen=(unsigned long)(wl/2); hex_to_bytes(P->wscript,ws->str,wl); } }
+            P->tapleaflen=0; P->tapctrllen=0; P->has_merkle=0; P->has_internal=0;
+            { rj_val* tl=rj_obj_get(e,"tapLeafScript"); rj_val* tc=rj_obj_get(e,"tapControlBlock");
+              if (tl&&tl->typ==RJ_STR&&tc&&tc->typ==RJ_STR){ size_t a=strlen(tl->str), b=strlen(tc->str);
+                  if (!(a&1)&&a/2<=sizeof P->tapleaf&&!(b&1)&&b/2>=33&&b/2<=sizeof P->tapctrl&&((b/2-33)%32)==0
+                      &&hex_to_bytes(P->tapleaf,tl->str,a)&&hex_to_bytes(P->tapctrl,tc->str,b)){ P->tapleaflen=a/2; P->tapctrllen=b/2; } }
+              rj_val* tm=rj_obj_get(e,"tapMerkleRoot"); if (tm&&tm->typ==RJ_STR&&strlen(tm->str)==64&&hex_to_bytes(P->tapmerkle,tm->str,64)) P->has_merkle=1;
+              rj_val* ti=rj_obj_get(e,"tapInternalKey"); if (ti&&ti->typ==RJ_STR&&strlen(ti->str)==64&&hex_to_bytes(P->tapinternal,ti->str,64)) P->has_internal=1;
+              P->n_tap_psig=0; P->tap_keysig_len=0;
+              rj_val* tp=rj_obj_get(e,"tapPartialSigs");
+              if (tp&&tp->typ==RJ_ARR){ for (unsigned long q=0;q<tp->nitems&&P->n_tap_psig<32;q++){ rj_val* d=tp->items[q]; if (d->typ!=RJ_OBJ) continue;
+                  rj_val* px=rj_obj_get(d,"pubkey"); rj_val* pl=rj_obj_get(d,"leaf_hash"); rj_val* pg=rj_obj_get(d,"sig");
+                  if (!px||!pl||!pg||px->typ!=RJ_STR||pl->typ!=RJ_STR||pg->typ!=RJ_STR||strlen(px->str)!=64||strlen(pl->str)!=64) continue;
+                  size_t gl=strlen(pg->str); if (gl!=128&&gl!=130) continue;
+                  int n2=P->n_tap_psig; if (!hex_to_bytes(P->tap_psig[n2].x,px->str,64)||!hex_to_bytes(P->tap_psig[n2].lh,pl->str,64)||!hex_to_bytes(P->tap_psig[n2].sig,pg->str,gl)) continue;
+                  P->tap_psig[n2].sl=(int)(gl/2); P->n_tap_psig++; } }
+              rj_val* tk=rj_obj_get(e,"tapKeySig"); if (tk&&tk->typ==RJ_STR&&(strlen(tk->str)==128||strlen(tk->str)==130)&&hex_to_bytes(P->tap_keysig,tk->str,strlen(tk->str))) P->tap_keysig_len=(int)(strlen(tk->str)/2); }
             nprev++;
         }
     }
     int hashtype = (params->nitems>=4 && params->items[3]->typ==RJ_STR) ? srw_hashtype(params->items[3]->str) : 0x01;
     int ht_explicit = (params->nitems>=4 && params->items[3]->typ==RJ_STR);   /* taproot signs SIGHASH_DEFAULT unless one was asked for */
     if (hashtype<0){ *ec=-8; *em="Invalid sighash param"; return 0; }
+    if (hashtype==0x100){ hashtype=0x01; ht_explicit=0; }                     /* "DEFAULT": ALL for ECDSA, no hashtype byte for taproot */
 
     /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
     unsigned long p=4, cc; unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
@@ -1565,7 +1752,7 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
 
     /* --- sign each input --- */
     static unsigned char ss[10000][1400]; unsigned long sslen[10000];      /* scriptSig per input (a 3-sig P2SH multisig is ~330 bytes) */
-    static unsigned char witbuf[10000][1400]; unsigned long witlen[10000]; int wititems[10000]; /* witness serialized (count+items) */
+    static unsigned char witbuf[10000][2200]; unsigned long witlen[10000]; int wititems[10000]; /* witness serialized (count+items) */
     /* prevtx of every input, for the taproot sighash (which commits to all spent outputs) */
     static srw_prev_t* prev_of[10000];
     for (unsigned long i=0;i<n_in;i++){
@@ -1640,17 +1827,25 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
                     if (memcmp(wh,spk+2,32)) err="witnessScript does not match scriptPubKey";
                     else { err=srw_sign_wsh(P, witbuf[i], &witlen[i], &wititems[i], tx, bip_hp, bip_hs, in_outpoint[i], in_seq[i], bip_ho, locktime, hashtype, kpriv, kpub, ncomp, nkeys);
                            if (!err || strstr(err,"Missing signatures")) any_segwit=1; } }
-            } else if (sl==34 && spk[0]==0x51 && spk[1]==0x20){                                          /* P2TR key path, tr(KEY) with no tree */
+            } else if (sl==34 && spk[0]==0x51 && spk[1]==0x20 && P->tapleaflen){                        /* P2TR script path: a leaf + control block were supplied */
+                int tht = ht_explicit ? hashtype : 0x00;
+                err=srw_sign_tap_script(P, spk, witbuf[i], &witlen[i], &wititems[i], tx, txlen, i, n_in, (const unsigned char* const*)in_outpoint, in_seq, prev_of, out_start, out_end, locktime, tht, kpriv, kpub, ncomp, nkeys);
+                if (!err || strstr(err,"Missing signatures")) any_segwit=1;
+            } else if (sl==34 && spk[0]==0x51 && spk[1]==0x20){                                          /* P2TR key path: tr(KEY) with no tree, or with the merkle root supplied */
                 unsigned char tweak[32];
                 for (int k=0;k<nkeys;k++){
                     if (!ncomp[k]) continue;
-                    unsigned char th[32]; sha256_full(th,"TapTweak",8); unsigned char tb[96]; memcpy(tb,th,32); memcpy(tb+32,th,32); memcpy(tb+64,kpub[k]+1,32);
-                    unsigned char t[32]; sha256_full(t,tb,96);
+                    if (P->has_internal && memcmp(kpub[k]+1,P->tapinternal,32)) continue;
+                    unsigned char t[32]; srw_taptweak(t,kpub[k]+1,P->has_merkle?P->tapmerkle:NULL);
                     unsigned char q[32]; if (bip32_xonly_tweak_add(kpub[k]+1,t,q) && !memcmp(q,spk+2,32)){ found=k; memcpy(tweak,t,32); break; }
                 }
-                if (found<0) err="Keys not provided for this input (a P2TR key path needs the internal key of tr(KEY) with no script tree)";
+                if (found<0 && P->tap_keysig_len){                                                    /* already signed by another signer: carry it */
+                    unsigned long o=0; witbuf[i][o++]=(unsigned char)P->tap_keysig_len; memcpy(witbuf[i]+o,P->tap_keysig,(size_t)P->tap_keysig_len); o+=P->tap_keysig_len;
+                    witlen[i]=o; wititems[i]=1; any_segwit=1; }
+                else if (found<0) err=P->has_merkle ? "Keys not provided for this input (a P2TR key path with a script tree needs its internal key)"
+                                               : "Keys not provided for this input (a P2TR key path needs the internal key of tr(KEY) with no script tree)";
                 else { int tht = ht_explicit ? hashtype : 0x00;
-                    if (!srw_tap_sighash(z,tx,txlen,i,n_in,(const unsigned char* const*)in_outpoint,in_seq,prev_of,out_start,out_end,locktime,tht))
+                    if (!srw_tap_sighash(z,tx,txlen,i,n_in,(const unsigned char* const*)in_outpoint,in_seq,prev_of,out_start,out_end,locktime,tht,NULL))
                         err="P2TR sighash needs scriptPubKey and amount for every input";
                     else { unsigned char dq[32], aux[32], sig[65];
                         if (!bip340_tweak_privkey(dq,kpriv[found],tweak)) err="taproot tweak failed";
@@ -2027,6 +2222,31 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
       int nh = rpc_wops_hdkey_privkeys(hk, (int)(sizeof hk / sizeof hk[0]), SRWW_WINDOW);
       for (int i = 0; i < nh; i++){ char wif[64]; srww_wif(wif, hk[i]); rj_arr_push(keys, rj_str(wif)); }
       memset(hk, 0, sizeof hk); }
+    /* ...and every key a PSBT's taproot bip32 origin names under OUR master
+     * fingerprint (walletprocesspsbt forwards them as prevtx.tapBip32): a
+     * script-path leaf key at an arbitrary path that no rescan window covers. */
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR){
+        extern int rpc_wops_master_fp(const void* seed, char out[9]);
+        extern int bip32_derive_path(unsigned char k[32], unsigned char c[32], const unsigned char* seed, long seedlen, const unsigned* indexes, long n);
+        char myfp[9]; if (!rpc_wops_master_fp(w->seed, myfp)) myfp[0] = 0;
+        const rj_val* pv = params->items[1]; int added = 0;
+        for (unsigned long i = 0; i < pv->nitems && added < 64; i++){
+            const rj_val* e = pv->items[i]; if (e->typ != RJ_OBJ) continue;
+            rj_val* tb = rj_obj_get(e, "tapBip32"); if (!tb || tb->typ != RJ_ARR) continue;
+            for (unsigned long q = 0; q < tb->nitems && added < 64; q++){
+                rj_val* d = tb->items[q]; if (d->typ != RJ_OBJ) continue;
+                rj_val* fp = rj_obj_get(d, "fingerprint"); rj_val* pa = rj_obj_get(d, "path");
+                if (!fp || fp->typ != RJ_STR || !myfp[0] || strcmp(fp->str, myfp) || !pa || pa->typ != RJ_ARR || pa->nitems > 32) continue;
+                unsigned path[32]; int n = 0;
+                for (unsigned long z = 0; z < pa->nitems; z++){ if (pa->items[z]->typ != RJ_NUM) break; path[n++] = (unsigned)strtoul(pa->items[z]->str, 0, 10); }
+                if ((unsigned long)n != pa->nitems) continue;
+                unsigned char k[32], c[32];
+                if (bip32_derive_path(k, c, w->seed, 64, path, n) != 1) continue;
+                char wif[64]; srww_wif(wif, k); rj_arr_push(keys, rj_str(wif)); added++;
+                memset(k, 0, 32); memset(c, 0, 32);
+            }
+        }
+    }
     rj_val* fwd = rj_arr();
     rj_arr_push(fwd, rj_str(params->items[0]->str));
     rj_arr_push(fwd, keys);
@@ -2723,6 +2943,49 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
         return 1;
     }
 
+    /* taproot fields per input (2026-09-01): leaves (0x15), bip32 origins
+     * (0x16), internal key (0x17), merkle root (0x18). Signing runs in
+     * ROUNDS: round 0 offers every input its key path (internal key + root),
+     * round r>=1 offers leaf r-1; each input keeps the first round that
+     * signed it (a complete signature beats a partial one). The rounds are
+     * re-assembled into one transaction below. */
+    typedef struct { const unsigned char* leaf[8]; unsigned long leaflen[8]; const unsigned char* ctrl[8]; unsigned long ctrllen[8]; int nleaf;
+                     const unsigned char* internal; const unsigned char* merkle;
+                     struct { unsigned char fp[4]; unsigned path[32]; int n; } deriv[8]; int nderiv;
+                     const unsigned char* keysig; unsigned long keysiglen;
+                     const unsigned char* psig_k[32]; const unsigned char* psig_v[32]; unsigned long psig_vl[32]; int npsig; } ptap_t;
+    static ptap_t ptap[FIN_MAXIO]; int max_leaf = 0;
+    for (int i = 0; i < n_in; i++){
+        ptap_t* T = &ptap[i]; memset(T, 0, sizeof *T);
+        for (int k2 = 0; k2 < in_n[i]; k2++){
+            const psbt_kv* kv = &ikv[i][k2]; if (!kv->kl) continue;
+            switch (kv->k[0]){
+            case 0x15: if (kv->kl >= 34 && ((kv->kl - 34) % 32) == 0 && kv->vl >= 2 && T->nleaf < 8){
+                           T->ctrl[T->nleaf] = kv->k + 1; T->ctrllen[T->nleaf] = kv->kl - 1;
+                           T->leaf[T->nleaf] = kv->v; T->leaflen[T->nleaf] = kv->vl - 1; T->nleaf++; } break;
+            case 0x16: if (kv->kl == 33 && T->nderiv < 8){
+                           unsigned long cc; unsigned long nlh = srw_varint(kv->v, &cc); unsigned long q = cc + nlh * 32;
+                           if (q + 4 <= kv->vl && ((kv->vl - q - 4) % 4) == 0 && (kv->vl - q - 4) / 4 <= 32){
+                               memcpy(T->deriv[T->nderiv].fp, kv->v + q, 4); q += 4; int n = 0;
+                               while (q + 4 <= kv->vl){ T->deriv[T->nderiv].path[n++] = (unsigned)kv->v[q] | ((unsigned)kv->v[q+1]<<8) | ((unsigned)kv->v[q+2]<<16) | ((unsigned)kv->v[q+3]<<24); q += 4; }
+                               T->deriv[T->nderiv].n = n; T->nderiv++; } } break;
+            case 0x17: if (kv->vl == 32) T->internal = kv->v; break;
+            case 0x18: if (kv->vl == 32) T->merkle = kv->v; break;
+            case 0x13: if (kv->vl == 64 || kv->vl == 65){ T->keysig = kv->v; T->keysiglen = kv->vl; } break;
+            case 0x14: if (kv->kl == 65 && (kv->vl == 64 || kv->vl == 65) && T->npsig < 32){ T->psig_k[T->npsig] = kv->k + 1; T->psig_v[T->npsig] = kv->v; T->psig_vl[T->npsig] = kv->vl; T->npsig++; } break;
+            default: break;
+            }
+        }
+        if (T->nleaf > max_leaf) max_leaf = T->nleaf;
+    }
+    static unsigned char in_spk[FIN_MAXIO][128]; static unsigned long in_spklen[FIN_MAXIO];
+    static unsigned char rec_ss[FIN_MAXIO][4096]; static unsigned long rec_sslen[FIN_MAXIO];
+    static unsigned char rec_wit[FIN_MAXIO][4096]; static unsigned long rec_witlen[FIN_MAXIO]; static unsigned rec_witems[FIN_MAXIO];
+    static int rec_state[FIN_MAXIO];   /* 0 unsigned, 1 partial, 2 complete */
+    for (int i = 0; i < n_in; i++){ in_spklen[i] = 0; rec_sslen[i] = rec_witlen[i] = 0; rec_witems[i] = 0; rec_state[i] = 0; }
+    rj_val* sres = NULL;
+    for (int round = 0; round <= max_leaf; round++){
+    if (sres){ rj_free(sres); sres = NULL; }
     /* prevtxs from the PSBT's own utxo fields (witness_utxo first, else
      * index the non-witness parent at the outpoint's vout); an input with
      * neither is left to the delegate's wallet-coin synthesis */
@@ -2772,6 +3035,24 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
           if (sh){ bin_to_hex(sh, spk, spklen); rj_obj_set(e, "scriptPubKey", rj_str(sh)); free(sh); } }
         { char am[32]; rpc_amounts((long long)amount, am, sizeof am);
           rj_obj_set(e, "amount", rj_numf("%s", am)); }
+        if (spklen <= sizeof in_spk[i]){ memcpy(in_spk[i], spk, spklen); in_spklen[i] = spklen; }
+        { const ptap_t* T = &ptap[i]; char hx[2*(33+32*16)+1];
+          if (T->internal){ bin_to_hex(hx, T->internal, 32); rj_obj_set(e, "tapInternalKey", rj_str(hx)); }
+          if (T->merkle){ bin_to_hex(hx, T->merkle, 32); rj_obj_set(e, "tapMerkleRoot", rj_str(hx)); }
+          if (round >= 1 && round - 1 < T->nleaf && T->leaflen[round-1] <= 1024){
+              char* lh = malloc(T->leaflen[round-1]*2+1);
+              if (lh){ bin_to_hex(lh, T->leaf[round-1], T->leaflen[round-1]); rj_obj_set(e, "tapLeafScript", rj_str(lh)); free(lh); }
+              bin_to_hex(hx, T->ctrl[round-1], T->ctrllen[round-1]); rj_obj_set(e, "tapControlBlock", rj_str(hx)); }
+          if (T->keysig){ char kh[131]; bin_to_hex(kh, T->keysig, T->keysiglen); rj_obj_set(e, "tapKeySig", rj_str(kh)); }
+          if (T->npsig){ rj_val* arr = rj_arr();
+              for (int q = 0; q < T->npsig; q++){ rj_val* d = rj_obj(); char h1[65], h2[65], h3[131]; bin_to_hex(h1, T->psig_k[q], 32); bin_to_hex(h2, T->psig_k[q] + 32, 32); bin_to_hex(h3, T->psig_v[q], T->psig_vl[q]);
+                  rj_obj_set(d, "pubkey", rj_str(h1)); rj_obj_set(d, "leaf_hash", rj_str(h2)); rj_obj_set(d, "sig", rj_str(h3)); rj_arr_push(arr, d); }
+              rj_obj_set(e, "tapPartialSigs", arr); }
+          if (T->nderiv){ rj_val* arr = rj_arr();
+              for (int q = 0; q < T->nderiv; q++){ rj_val* d = rj_obj(); char fp[9]; bin_to_hex(fp, T->deriv[q].fp, 4); rj_obj_set(d, "fingerprint", rj_str(fp));
+                  rj_val* pa = rj_arr(); for (int z = 0; z < T->deriv[q].n; z++) rj_arr_push(pa, rj_numf("%u", T->deriv[q].path[z]));
+                  rj_obj_set(d, "path", pa); rj_arr_push(arr, d); }
+              rj_obj_set(e, "tapBip32", arr); } }
         rj_arr_push(pv, e);
     }
 
@@ -2784,36 +3065,102 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     free(uhex);
     rj_arr_push(fwd, pv);
     if (sht) rj_arr_push(fwd, rj_str(sht));
-    rj_val* sres = NULL;
     int rc = signer(fwd, sctx, ec, em, &sres);
     rj_free(fwd);
     if (!rc) return 0;
-    rj_val* shex = rj_obj_get(sres, "hex");
-    rj_val* scomp = rj_obj_get(sres, "complete");
-    int complete = scomp && scomp->str && scomp->str[0]=='1';
-    if (!shex || !shex->str){ rj_free(sres); *ec = -22; *em = "signing produced no transaction"; return 0; }
+    rj_val* rhex = rj_obj_get(sres, "hex");
+    if (!rhex || !rhex->str){ rj_free(sres); *ec = -22; *em = "signing produced no transaction"; return 0; }
+    /* record what this round signed, per input */
+    { static unsigned char rbuf[200000]; unsigned long rhl = strlen(rhex->str);
+      if ((rhl & 1) || rhl/2 > sizeof rbuf || !hex_to_bytes(rbuf, rhex->str, rhl)){ rj_free(sres); *ec = -22; *em = "TX decode failed"; return 0; }
+      static crt_in_t rin[FIN_MAXIO]; int rn, rsw; unsigned long rost, roen;
+      if (!crt_walk(rbuf, rhl/2, rin, FIN_MAXIO, &rn, &rost, &roen, &rsw) || rn != n_in){ rj_free(sres); *ec = -22; *em = "signed transaction shape mismatch"; return 0; }
+      rj_val* errs = rj_obj_get(sres, "errors");
+      for (int i = 0; i < n_in; i++){
+          int signed_i = (rin[i].sslen > 0) || (rin[i].witlen > 0 && rin[i].witems > 0);
+          if (!signed_i) continue;
+          int partial = 0, failed = 0;
+          if (errs && errs->typ == RJ_ARR){
+              char tid[65]; for (int k2 = 0; k2 < 32; k2++){ static const char* H = "0123456789abcdef"; unsigned char b2 = uin[i].op[31-k2]; tid[k2*2] = H[b2>>4]; tid[k2*2+1] = H[b2&15]; } tid[64] = 0;
+              unsigned long vo = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) | ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+              for (unsigned long q = 0; q < errs->nitems; q++){
+                  rj_val* eo = errs->items[q]; rj_val* et = rj_obj_get(eo, "txid"); rj_val* ev = rj_obj_get(eo, "vout"); rj_val* ee = rj_obj_get(eo, "error");
+                  if (!et || !ev || et->typ != RJ_STR || strcmp(et->str, tid) || strtoul(ev->str, 0, 10) != vo) continue;
+                  if (ee && ee->str && strstr(ee->str, "Missing signatures")) partial = 1; else failed = 1;
+              }
+          }
+          if (failed) continue;
+          int st = partial ? 1 : 2;
+          if (st <= rec_state[i]) continue;
+          if (rin[i].sslen > sizeof rec_ss[i] || rin[i].witlen > sizeof rec_wit[i]) continue;
+          memcpy(rec_ss[i], rin[i].ss, rin[i].sslen); rec_sslen[i] = rin[i].sslen;
+          memcpy(rec_wit[i], rin[i].wit, rin[i].witlen); rec_witlen[i] = rin[i].witlen; rec_witems[i] = rin[i].witems;
+          rec_state[i] = st;
+      }
+    }
+    { int all = 1; for (int i = 0; i < n_in; i++) if (rec_state[i] != 2) all = 0; if (all) break; }
+    }   /* rounds */
+    if (!sres){ *ec = -22; *em = "signing produced no transaction"; return 0; }
 
-    /* splice the signed inputs back into the PSBT */
-    static unsigned char sbuf[200000];
-    unsigned long shl = strlen(shex->str);
-    if ((shl & 1) || shl/2 > sizeof sbuf || !hex_to_bytes(sbuf, shex->str, shl)){
-        rj_free(sres); *ec = -22; *em = "TX decode failed"; return 0; }
+    /* re-assemble one transaction from the per-input records */
+    static unsigned char sbuf[200000]; unsigned long shl = 0;
+    int complete = 1, anywit = 0;
+    for (int i = 0; i < n_in; i++){ if (rec_state[i] != 2) complete = 0; if (rec_witlen[i]) anywit = 1; }
+    { unsigned long o = 0; memcpy(sbuf + o, utx, 4); o += 4;
+      if (anywit){ sbuf[o++] = 0x00; sbuf[o++] = 0x01; }
+      o += crt_varint(sbuf + o, (unsigned long long)n_in);
+      for (int i = 0; i < n_in; i++){
+          if (o + 36 + 9 + rec_sslen[i] + 4 > sizeof sbuf){ rj_free(sres); *ec = -22; *em = "transaction too large"; return 0; }
+          memcpy(sbuf + o, uin[i].op, 36); o += 36;
+          o += crt_varint(sbuf + o, rec_sslen[i]); memcpy(sbuf + o, rec_ss[i], rec_sslen[i]); o += rec_sslen[i];
+          unsigned sq = uin[i].seq; sbuf[o++] = (unsigned char)sq; sbuf[o++] = (unsigned char)(sq>>8); sbuf[o++] = (unsigned char)(sq>>16); sbuf[o++] = (unsigned char)(sq>>24);
+      }
+      if (o + (oen - ost) + 4 > sizeof sbuf){ rj_free(sres); *ec = -22; *em = "transaction too large"; return 0; }
+      memcpy(sbuf + o, utx + ost, oen - ost); o += oen - ost;
+      if (anywit){ for (int i = 0; i < n_in; i++){
+          if (o + rec_witlen[i] + 1 > sizeof sbuf){ rj_free(sres); *ec = -22; *em = "transaction too large"; return 0; }
+          if (rec_witlen[i]){ memcpy(sbuf + o, rec_wit[i], rec_witlen[i]); o += rec_witlen[i]; } else sbuf[o++] = 0x00; } }
+      memcpy(sbuf + o, utx + utxl - 4, 4); o += 4;
+      shl = o * 2; }
+    static char shexbuf[400001]; bin_to_hex(shexbuf, sbuf, shl/2);
     static crt_in_t sin[FIN_MAXIO];
     int sn, ssw; unsigned long sost, soen;
     if (!crt_walk(sbuf, shl/2, sin, FIN_MAXIO, &sn, &sost, &soen, &ssw) || sn != n_in){
         rj_free(sres); *ec = -22; *em = "signed transaction shape mismatch"; return 0; }
 
-    static unsigned char fss[FIN_MAXIO][256]; static unsigned long fsslen[FIN_MAXIO];
-    static unsigned char fwit[FIN_MAXIO][256]; static unsigned long fwitlen[FIN_MAXIO];
-    static unsigned char psig_k[FIN_MAXIO][67]; static unsigned long psig_kl[FIN_MAXIO];
-    static unsigned char psig_v[FIN_MAXIO][80]; static unsigned long psig_vl[FIN_MAXIO];
+    static unsigned char fss[FIN_MAXIO][4096]; static unsigned long fsslen[FIN_MAXIO];
+    static unsigned char fwit[FIN_MAXIO][4096]; static unsigned long fwitlen[FIN_MAXIO];
+    #define PX_MAX (SRW_TAP_MAXKEYS + 2)
+    static unsigned char px_k[FIN_MAXIO][PX_MAX][67]; static unsigned long px_kl[FIN_MAXIO][PX_MAX];
+    static unsigned char px_v[FIN_MAXIO][PX_MAX][80]; static unsigned long px_vl[FIN_MAXIO][PX_MAX]; static int px_n[FIN_MAXIO];
     for (int i = 0; i < n_in; i++){
-        fsslen[i] = fwitlen[i] = psig_kl[i] = psig_vl[i] = 0;
+        fsslen[i] = fwitlen[i] = 0; px_n[i] = 0;
         int signed_i = (sin[i].sslen > 0) || (sin[i].witlen > 0 && sin[i].witems > 0);
         if (!signed_i) continue;
-        if (finalize){
-            if (sin[i].sslen > 0 && sin[i].sslen <= 256){ memcpy(fss[i], sin[i].ss, sin[i].sslen); fsslen[i] = sin[i].sslen; }
-            if (sin[i].witlen > 0 && sin[i].witlen <= 256){ memcpy(fwit[i], sin[i].wit, sin[i].witlen); fwitlen[i] = sin[i].witlen; }
+        int is_p2tr = in_spklen[i] == 34 && in_spk[i][0] == 0x51 && in_spk[i][1] == 0x20;
+        if (finalize && rec_state[i] == 2){
+            if (sin[i].sslen > 0 && sin[i].sslen <= sizeof fss[i]){ memcpy(fss[i], sin[i].ss, sin[i].sslen); fsslen[i] = sin[i].sslen; }
+            if (sin[i].witlen > 0 && sin[i].witlen <= sizeof fwit[i]){ memcpy(fwit[i], sin[i].wit, sin[i].witlen); fwitlen[i] = sin[i].witlen; }
+        } else if (is_p2tr){
+            /* taproot partials: key path -> PSBT_IN_TAP_KEY_SIG (0x13); script
+             * path -> one PSBT_IN_TAP_SCRIPT_SIG (0x14 | xonly | leafhash) per
+             * signature present in the witness [sigs..., script, control] */
+            const unsigned char* it[SRW_TAP_MAXKEYS + 2]; unsigned long il[SRW_TAP_MAXKEYS + 2]; int nit = 0;
+            { const unsigned char* q = sin[i].wit; unsigned long cc; unsigned long cnt = srw_varint(q, &cc); q += cc;
+              for (unsigned long z = 0; z < cnt && nit < SRW_TAP_MAXKEYS + 2; z++){ il[nit] = srw_varint(q, &cc); q += cc; it[nit] = q; q += il[nit]; nit++; } }
+            if (nit == 1 && (il[0] == 64 || il[0] == 65)){
+                px_k[i][0][0] = 0x13; px_kl[i][0] = 1; memcpy(px_v[i][0], it[0], il[0]); px_vl[i][0] = il[0]; px_n[i] = 1;
+            } else if (nit >= 3 && il[nit-1] >= 33){
+                unsigned char keys[SRW_TAP_MAXKEYS][32]; int kth = 0;
+                int nk = srw_tap_leaf_keys(it[nit-2], il[nit-2], keys, &kth);
+                unsigned char lh[32]; srw_tapleaf_hash(lh, it[nit-1][0] & 0xfe, it[nit-2], il[nit-2]);
+                for (int a = 0; a < nk && px_n[i] < PX_MAX; a++){
+                    int idx = (nk == 1 && kth == 1) ? 0 : (nk - 1 - a);
+                    if (idx >= nit - 2 || (il[idx] != 64 && il[idx] != 65)) continue;
+                    int n2 = px_n[i]; px_k[i][n2][0] = 0x14; memcpy(px_k[i][n2]+1, keys[a], 32); memcpy(px_k[i][n2]+33, lh, 32); px_kl[i][n2] = 65;
+                    memcpy(px_v[i][n2], it[idx], il[idx]); px_vl[i][n2] = il[idx]; px_n[i]++;
+                }
+            }
         } else {
             /* PARTIAL_SIG extraction: P2WPKH witness [sig, pub] or P2PKH
              * scriptSig push(sig) push(pub) */
@@ -2831,13 +3178,18 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
                 if (1 + sigl < sin[i].sslen){ publ = q[1+sigl]; pub = q + 2 + sigl; }
             }
             if (!sig || !pub || sigl > 79 || (publ != 33 && publ != 65)){
+                /* a partially signed multisig under finalize=true: nothing
+                 * final to write and no per-key partial this node can name
+                 * without verifying each signature -- the input is left as
+                 * supplied and the result says complete=false */
+                if (rec_state[i] == 1 && finalize) continue;
                 rj_free(sres); *ec = -8;
                 *em = "finalize=false: partial-signature extraction is supported only for "
-                      "P2WPKH and P2PKH inputs on this node";
+                      "P2WPKH, P2PKH and P2TR inputs on this node";
                 return 0;
             }
-            psig_k[i][0] = 0x02; memcpy(psig_k[i]+1, pub, publ); psig_kl[i] = 1 + publ;
-            memcpy(psig_v[i], sig, sigl); psig_vl[i] = sigl;
+            px_k[i][0][0] = 0x02; memcpy(px_k[i][0]+1, pub, publ); px_kl[i][0] = 1 + publ;
+            memcpy(px_v[i][0], sig, sigl); px_vl[i][0] = sigl; px_n[i] = 1;
         }
     }
 
@@ -2849,15 +3201,17 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
         int finalized = fsslen[i] || fwitlen[i];
         for (int k2 = 0; k2 < in_n[i] && kn < FIN_MAXKV; k2++){
             unsigned char t = ikv[i][k2].kl ? ikv[i][k2].k[0] : 0xff;
-            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08))
+            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08||(t>=0x13&&t<=0x18)))
                 continue;
+            /* a partial we produce replaces the same key already present */
+            { int dup = 0; for (int q = 0; q < px_n[i]; q++) if (ikv[i][k2].kl == px_kl[i][q] && !memcmp(ikv[i][k2].k, px_k[i][q], px_kl[i][q])) dup = 1; if (dup) continue; }
             keep[kn++] = ikv[i][k2];
         }
-        psbt_kv extra[3]; int en = 0;
-        unsigned char k7 = 0x07, k8 = 0x08;
+        static psbt_kv extra[PX_MAX + 2]; int en = 0;
+        static unsigned char k7 = 0x07, k8 = 0x08;
         if (fsslen[i]){ extra[en].k=&k7; extra[en].kl=1; extra[en].v=fss[i]; extra[en].vl=fsslen[i]; en++; }
         if (fwitlen[i]){ extra[en].k=&k8; extra[en].kl=1; extra[en].v=fwit[i]; extra[en].vl=fwitlen[i]; en++; }
-        if (psig_kl[i]){ extra[en].k=psig_k[i]; extra[en].kl=psig_kl[i]; extra[en].v=psig_v[i]; extra[en].vl=psig_vl[i]; en++; }
+        for (int q = 0; q < px_n[i]; q++){ extra[en].k=px_k[i][q]; extra[en].kl=px_kl[i][q]; extra[en].v=px_v[i][q]; extra[en].vl=px_vl[i][q]; en++; }
         for (int k2 = 0; k2 < en && kn < FIN_MAXKV; k2++) keep[kn++] = extra[k2];
         o += psbt_ser_map(out + o, keep, kn);
     }
@@ -2870,7 +3224,7 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     rj_val* r = rj_obj();
     rj_obj_set(r, "psbt", rj_str(b));
     rj_obj_set(r, "complete", rj_bool(complete));
-    if (complete && finalize) rj_obj_set(r, "hex", rj_str(shex->str));
+    if (complete && finalize) rj_obj_set(r, "hex", rj_str(shexbuf));
     free(b);
     rj_free(sres);
     *result = r;

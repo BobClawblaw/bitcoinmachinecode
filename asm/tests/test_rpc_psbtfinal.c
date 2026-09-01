@@ -551,6 +551,8 @@ int main(void){
           snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, wif, ph2);
           dr = call("descriptorprocesspsbt", pj, &ec, &em);
           ck("...with one private key it stays incomplete", dr && S(dr, "complete") && S(dr, "complete")[0] == '0');
+          if (!dr) printf("    (%ld: %s)\n", ec, em ? em : "");
+          else if (S(dr, "complete")) printf("    (complete=%s)\n", S(dr, "complete"));
           rj_free(dr); }
         #undef MK_PSBT
     }

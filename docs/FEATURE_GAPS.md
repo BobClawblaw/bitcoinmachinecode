@@ -886,7 +886,21 @@ Missing:
   Signer role by delegation (`rpc_wallet_ops.c`), and `finalizepsbt` /
   `utxoupdatepsbt` are real (`rpc_commands.c`). `descriptorprocesspsbt`
   signs from the keys a descriptor carries (descriptor.c, 2026-09-01). `docs/PARITY_PLAN.md` T8 has the
-  per-method state.
+  per-method state. **Taproot (BIP371) 2026-09-01 (late):** the PSBT input
+  fields `PSBT_IN_TAP_KEY_SIG/SCRIPT_SIG/LEAF_SCRIPT/BIP32_DERIVATION/
+  INTERNAL_KEY/MERKLE_ROOT` and the output-side internal key / tree /
+  derivations are parsed, serialized and named in `decodepsbt` exactly as
+  Core does (plus `partial_signatures`, `sighash`, `bip32_derivs`,
+  `final_scriptwitness`, which `decodepsbt` had also been omitting). The
+  signer signs the key path of a `tr()` WITH a tree (internal key + merkle
+  root) and the script path of `pk()` / `multi_a()` leaves; a PSBT with
+  several leaves is signed in rounds (key path, then each leaf), partial
+  `TAP_SCRIPT_SIG`s from another signer are carried into the witness, and
+  the wallet derives leaf keys named by a bip32 origin under its own
+  fingerprint. Core's VerifyScript judges every form
+  (`validation/signer_core_diff.sh`: 18/18 incl. the negative cases);
+  `tests/test_rpc_psbt_taproot` pins the PSBT plumbing. Still open: leaves
+  other than pk/multi_a (the miniscript satisfier), and `musig()` keys.
 - ~~**Descriptor wallets**~~ — **`importdescriptors` is REAL** since the
   wallet-management merge; watch-only descriptors are tracked and rescanned.
   *(This paragraph claimed `createwalletdescriptor` and `addhdkey` were
