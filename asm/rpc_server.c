@@ -46,6 +46,56 @@ static int (*g_allows)(const char*);
 static const char* g_user;
 static const char* g_pass;
 
+/* ---- -rpcthreads / -rpcworkqueue / -rpcservertimeout (2026-09-01) ---- */
+static int g_threads = 16, g_workqueue = 64, g_timeout_s = 30;
+#define RPC_QUEUE_CAP 4096
+static int g_q[RPC_QUEUE_CAP]; static int g_q_head, g_q_tail, g_q_n;
+static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_workers[256]; static int g_n_workers;
+
+/* ---- -rpcwhitelist / -rpcwhitelistdefault ---- */
+#define RPC_WL_MAX 16
+static struct { char user[64]; char methods[448]; } g_wl[RPC_WL_MAX];
+static int g_wl_n; static int g_wl_default = -1;
+int rpc_whitelist_add(const char* spec){
+    if (!spec) return 0;
+    const char* c = strchr(spec, ':');
+    if (!c || c == spec || g_wl_n >= RPC_WL_MAX || (size_t)(c - spec) >= 64 || strlen(c + 1) >= 448) return 0;
+    memcpy(g_wl[g_wl_n].user, spec, (size_t)(c - spec)); g_wl[g_wl_n].user[c - spec] = 0;
+    snprintf(g_wl[g_wl_n].methods, sizeof g_wl[g_wl_n].methods, "%s", c + 1);
+    g_wl_n++;
+    return 1;
+}
+void rpc_whitelist_set_default(int d){ g_wl_default = d; }
+void rpc_whitelist_clear(void){ g_wl_n = 0; g_wl_default = -1; }
+static int wl_entry_has(const char* list, const char* method){
+    size_t ml = strlen(method);
+    for (const char* p = list; p && *p; ){
+        const char* e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n == ml && !memcmp(p, method, ml)) return 1;
+        p = e ? e + 1 : NULL;
+    }
+    return 0;
+}
+int rpc_whitelist_allows(const char* user, const char* method){
+    if (g_wl_n == 0) return 1;
+    int seen = 0;
+    for (int i = 0; i < g_wl_n; i++){
+        if (strcmp(g_wl[i].user, user ? user : "")) continue;
+        seen = 1;
+        if (!wl_entry_has(g_wl[i].methods, method)) return 0;   /* entries intersect */
+    }
+    if (seen) return 1;
+    /* no whitelist for this user: Core denies unless rpcwhitelistdefault=0 */
+    return g_wl_default == 0;
+}
+
+/* ---- -rpccookieperms ---- */
+static int g_cookie_perms = 0;
+void rpc_cookie_set_perms(int p){ g_cookie_perms = p < 0 ? 0 : (p > 2 ? 2 : p); }
+
 /* ---------------- base64 decode (RFC 4648) for Basic auth ---------------- */
 static int b64val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -182,7 +232,7 @@ int rpc_cookie_write(const char* path) {
      * cookie, so replace it -- but create at 0600 from the outset rather
      * than chmod'ing afterwards, which would leave a readable window. */
     unlink(path);
-    int cf = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int cf = open(path, O_WRONLY | O_CREAT | O_TRUNC, g_cookie_perms == 2 ? 0644 : (g_cookie_perms == 1 ? 0640 : 0600));
     if (cf < 0) { g_cookie_pass[0] = 0; return 0; }
     char line[128];
     int n = snprintf(line, sizeof line, "%s:%s", RPC_COOKIE_USER, g_cookie_pass);
@@ -200,8 +250,10 @@ void rpc_cookie_remove(void) {
 }
 
 /* Verify Authorization: Basic <user:pass> against the configured credentials. */
+static char g_last_auth_user[64];   /* who auth_ok accepted (rpcwhitelist keys on it); one connection at a time per worker */
 static int auth_ok(const char* headers, size_t hlen,
                    const char* user, const char* pass) {
+    g_last_auth_user[0] = 0;
     const char* auth = find_header(headers, hlen, "Authorization", 13);
     if (!auth) return 0;
     if (strncmp(auth, "Basic ", 6) != 0) return 0;
@@ -241,6 +293,8 @@ static int auth_ok(const char* headers, size_t hlen,
                        ct_eq((const unsigned char*)hex, 64, g_rpcauth[i].hash, 64);
         }
         ok = (by_pass | by_cookie | by_auth);
+        if (ok){ size_t n = ulen < sizeof g_last_auth_user - 1 ? ulen : sizeof g_last_auth_user - 1;
+                 memcpy(g_last_auth_user, decoded, n); g_last_auth_user[n] = 0; }
     }
     free(decoded);
     return ok;
@@ -325,6 +379,21 @@ static const char* status_text(int s) {
 }
 
 /* Dispatch a parsed JSON-RPC request object and write the exact HTTP reply. */
+static int wl_forbidden(const char* user, const char* body, size_t blen){
+    /* -rpcwhitelist: Core answers HTTP 403 with an empty body when the
+     * authenticated user may not call the method. Checked on the raw body
+     * before parsing so a forbidden call never reaches the dispatcher. */
+    if (g_wl_n == 0) return 0;
+    rj_val* req = rj_parse(body, blen);
+    if (!req) return 0;
+    int forbid = 0;
+    if (req->typ == RJ_OBJ){
+        rj_val* m = rj_obj_get(req, "method");
+        if (m && m->typ == RJ_STR && m->str && !rpc_whitelist_allows(user, m->str)) forbid = 1;
+    }
+    rj_free(req);
+    return forbid;
+}
 static void handle_request(int cfd, const char* body, size_t blen) {
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
@@ -501,6 +570,9 @@ static int lp_extract_prev(const char* body, size_t blen, unsigned char out[32])
 }
 
 static void service_conn(int cfd) {
+    { struct timeval tv = { g_timeout_s, 0 };            /* -rpcservertimeout */
+      setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
     size_t cap = 262144;
     char* buf = malloc(cap);
     if (!buf) { close(cfd); return; }
@@ -573,6 +645,11 @@ static void service_conn(int cfd) {
         write(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
     }
 
+    { char user[64]; snprintf(user, sizeof user, "%s", g_last_auth_user);
+      if (wl_forbidden(user, body, blen)){
+          const char* e = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+          write(cfd, e, strlen(e)); free(buf); close(cfd); return;
+      } }
     /* longpoll: a getblocktemplate carrying a longpollid waits OFF-THREAD
      * (see the block comment above lp_waiter) */
     { int is_lp = 0;
@@ -621,9 +698,31 @@ static void* server_thread(void* arg) {
                 continue;
             }
         }
-        service_conn(c);
+        /* -rpcworkqueue: hand the connection to the pool; past the queue
+         * depth Core answers 503 "Work queue depth exceeded" */
+        pthread_mutex_lock(&g_q_lock);
+        if (g_q_n >= g_workqueue || g_q_n >= RPC_QUEUE_CAP){
+            pthread_mutex_unlock(&g_q_lock);
+            const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 25\r\n\r\nWork queue depth exceeded";
+            write(c, e, strlen(e)); close(c);
+            continue;
+        }
+        g_q[g_q_tail] = c; g_q_tail = (g_q_tail + 1) % RPC_QUEUE_CAP; g_q_n++;
+        pthread_cond_signal(&g_q_cond);
+        pthread_mutex_unlock(&g_q_lock);
     }
     return NULL;
+}
+static void* worker_thread(void* arg){
+    (void)arg;
+    for (;;){
+        pthread_mutex_lock(&g_q_lock);
+        while (g_q_n == 0 && g_run) pthread_cond_wait(&g_q_cond, &g_q_lock);
+        if (g_q_n == 0 && !g_run){ pthread_mutex_unlock(&g_q_lock); return NULL; }
+        int c = g_q[g_q_head]; g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--;
+        pthread_mutex_unlock(&g_q_lock);
+        service_conn(c);
+    }
 }
 
 int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
@@ -670,9 +769,18 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     getsockname(g_listen_fd, (struct sockaddr*)&a, &al);
     if (actual_port) *actual_port = ntohs(a.sin_port);
 
+    g_threads   = cfg->threads   > 0 ? (cfg->threads > 256 ? 256 : cfg->threads) : 16;
+    g_workqueue = cfg->workqueue > 0 ? (cfg->workqueue > RPC_QUEUE_CAP ? RPC_QUEUE_CAP : cfg->workqueue) : 64;
+    g_timeout_s = cfg->timeout_s > 0 ? cfg->timeout_s : 30;
+    g_q_head = g_q_tail = g_q_n = 0;
     g_run = 1;
-    if (bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {
+    g_n_workers = 0;
+    for (int i = 0; i < g_threads; i++)
+        if (bmc_pthread_create(&g_workers[g_n_workers], worker_thread, NULL) == 0) g_n_workers++;
+    if (g_n_workers == 0 || bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {
         if (errmsg && errcap) snprintf(errmsg, errcap, "pthread_create failed");
+        g_run = 0; pthread_cond_broadcast(&g_q_cond);
+        for (int i = 0; i < g_n_workers; i++) pthread_join(g_workers[i], NULL);
         close(g_listen_fd); g_listen_fd = -1;
         return -1;
     }
@@ -686,4 +794,9 @@ void rpc_server_stop(void) {
     close(g_listen_fd);
     g_listen_fd = -1;
     pthread_join(g_thread, NULL);
+    pthread_mutex_lock(&g_q_lock); pthread_cond_broadcast(&g_q_cond); pthread_mutex_unlock(&g_q_lock);
+    for (int i = 0; i < g_n_workers; i++) pthread_join(g_workers[i], NULL);
+    g_n_workers = 0;
+    /* connections still queued are closed unanswered (Core does the same on shutdown) */
+    while (g_q_n > 0){ close(g_q[g_q_head]); g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--; }
 }
