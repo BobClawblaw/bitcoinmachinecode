@@ -150,6 +150,8 @@ write_varint:
  * script_op_len(x0=pos, x1=end) -> x0 = byte length of one script unit, 0 if
  * malformed / would overrun. Mirrors Core GetScriptOp.
  * ========================================================================== */
+	.global script_op_len
+	.type script_op_len, %function
 script_op_len:
 	cmp  x0, x1
 	b.hs 3f
