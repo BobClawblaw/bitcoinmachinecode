@@ -186,6 +186,60 @@ int main(void){
         ck("with A only the leaf stays unsatisfied: complete=false", r && comp && comp->str[0] == '0');
         rj_free(r);
     }
+    printf("== 6. musig(): descriptorprocesspsbt is the Updater too -- participants/derivation fields, then the rounds ==\n");
+    for (int variant = 0; variant < 2; variant++){
+        /* variant 0: tr(musig(A,B)) -- we hold both keys: fields, two pubnonces, then the rounds run to a key-path signature
+         * variant 1: tr(musig(xprv,xpub)/0/*) -- derivation: the bip32 field appears; we hold one key: one pubnonce, never complete */
+        char mdesc[700];
+        if (variant == 0) snprintf(mdesc, sizeof mdesc, "tr(musig(%s,%s))", W1, W2);
+        else snprintf(mdesc, sizeof mdesc, "tr(musig(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y)/0/*)");
+        static descr_t d; char err[256];
+        ck(variant ? "tr(musig(xprv,xpub)/0/*) parses" : "tr(musig(A,B)) parses", descr_parse(mdesc, &d, err, sizeof err));
+        long idx = variant ? 3 : 0;
+        descr_spk_t sp[4]; int nsp = descr_expand(&d, idx, sp, 4);
+        ck("...and expands to a P2TR output", nsp == 1 && sp[0].len == 34 && sp[0].spk[0] == 0x51);
+        static u8 psbt[4000]; size_t o = 0; static u8 utx[400]; int ul = unhex(UNSIGNED, utx, sizeof utx);
+        memcpy(psbt + o, "psbt\xff", 5); o += 5;
+        psbt[o++] = 1; psbt[o++] = 0x00; psbt[o++] = (u8)ul; memcpy(psbt + o, utx, (size_t)ul); o += (size_t)ul; psbt[o++] = 0;
+        psbt[o++] = 1; psbt[o++] = 0x01; psbt[o++] = (u8)(8 + 1 + 34);
+        unsigned long long amt = 100000000ULL; for (int i = 0; i < 8; i++) psbt[o++] = (u8)(amt >> (8*i));
+        psbt[o++] = 34; memcpy(psbt + o, sp[0].spk, 34); o += 34;
+        psbt[o++] = 0; psbt[o++] = 0;
+        static char pb[8000]; b64(pb, psbt, o);
+        snprintf(params, sizeof params, "[\"%s\",[{\"desc\":\"%s\",\"range\":[0,5]}]]", pb, mdesc);
+        r = call("descriptorprocesspsbt", params, &ec, &em);
+        ck("round 1 answers", r != NULL); if (!r) printf("  rpc error %ld: %s\n", ec, em ? em : "");
+        rj_val* p1 = r ? rj_obj_get(r, "psbt") : NULL;
+        if (p1 && p1->typ == RJ_STR){
+            char dp[9000]; snprintf(dp, sizeof dp, "[\"%s\"]", p1->str);
+            rj_val* dec = call("decodepsbt", dp, &ec, &em);
+            rj_val* ins = dec ? rj_obj_get(dec, "inputs") : NULL; rj_val* in0 = ins && ins->typ == RJ_ARR && ins->nitems ? ins->items[0] : NULL;
+            rj_val* mp = in0 ? rj_obj_get(in0, "musig2_participant_pubkeys") : NULL;
+            rj_val* pn = in0 ? rj_obj_get(in0, "musig2_pubnonces") : NULL;
+            rj_val* ik = in0 ? rj_obj_get(in0, "taproot_internal_key") : NULL;
+            rj_val* bd = in0 ? rj_obj_get(in0, "taproot_bip32_derivs") : NULL;
+            ck("the PSBT now carries one musig2 aggregate with 2 participants", mp && mp->typ == RJ_ARR && mp->nitems == 1 && rj_obj_get(mp->items[0], "participant_pubkeys") && rj_obj_get(mp->items[0], "participant_pubkeys")->nitems == 2);
+            ck("...the taproot internal key", ik && ik->typ == RJ_STR && strlen(ik->str) == 64);
+            if (variant) ck("...a taproot bip32 derivation for the derived aggregate", bd && bd->typ == RJ_ARR && bd->nitems >= 1);
+            ck(variant ? "...and our one pubnonce (the xpub participant is not ours)" : "...and our two pubnonces (round 1 done for both keys we hold)", pn && pn->typ == RJ_ARR && pn->nitems == (variant ? 1 : 2));
+            if (!(mp && pn)) { long L = 0; char* js = rj_write_alloc(in0 ? in0 : dec, 0, &L); printf("  decoded input: %.600s\n", js ? js : "null"); free(js); }
+            rj_free(dec);
+        }
+        if (variant){ rj_free(r); continue; }
+        /* keep processing until the key-path signature is aggregated */
+        int done = 0; char cur[9000]; if (p1 && p1->typ == RJ_STR) snprintf(cur, sizeof cur, "%s", p1->str); else cur[0] = 0;
+        rj_free(r);
+        for (int round = 2; round <= 4 && cur[0] && !done; round++){
+            snprintf(params, sizeof params, "[\"%s\",[{\"desc\":\"%s\",\"range\":[0,5]}]]", cur, mdesc);
+            r = call("descriptorprocesspsbt", params, &ec, &em);
+            comp = r ? rj_obj_get(r, "complete") : NULL; hex = r ? rj_obj_get(r, "hex") : NULL; rj_val* pp = r ? rj_obj_get(r, "psbt") : NULL;
+            if (comp && comp->str[0] == '1' && hex && hex->typ == RJ_STR){ done = 1; items = witness_items(hex->str, lens, 16);
+                ck("the key-path spend completes: one 64-byte BIP340 signature", items == 1 && lens[0] == 64); }
+            if (pp && pp->typ == RJ_STR) snprintf(cur, sizeof cur, "%s", pp->str); else cur[0] = 0;
+            rj_free(r);
+        }
+        ck("musig() key path signed within three rounds by a signer holding both keys", done);
+    }
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

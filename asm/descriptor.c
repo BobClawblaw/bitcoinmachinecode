@@ -26,6 +26,10 @@ extern int  bip32_ckdpub_step_pub(const u8 Kpar[33], const u8 ccpar[32], unsigne
 extern int  bip32_pubkey_decompress(const u8 pub33[33], u8 out65[65]);
 extern int  pubkey_parse(const u8* pub, unsigned long publen, uint64_t qx[4], uint64_t qy[4]);
 extern int  bip32_xonly_tweak_add(const u8 x[32], const u8 t[32], u8 out_x[32]);
+#include "musig2.h"
+/* BIP390: the chaincode of the synthetic xpub a musig() derives from */
+static const u8 MUSIG_CC[32] = { 0x86,0x80,0x87,0xca,0x02,0xa6,0xf9,0x74,0xc4,0x59,0x89,0x24,0xc3,0x6b,0x57,0x76,
+                                 0x2d,0x32,0xcb,0x45,0x71,0x71,0x67,0xe3,0x00,0x62,0x2c,0x71,0x67,0xe3,0x89,0x65 };
 
 /* BIP340 tagged hashes in plain C (the consensus taproot kernel keeps its
  * scratch in thread-local storage, which is the wrong dependency for an
@@ -138,7 +142,7 @@ static int push_num(u8* out, int o, int cap, int v){
 
 /* ---- miniscript key context ------------------------------------------- */
 static int add_key(descr_t* d, const char* s, size_t n, int ctx, char* err, unsigned long errcap);
-static int key_pub_at(const descr_key_t* k, long idx, u8 pub[65], int* publen);
+static int key_pub_at(const descr_t* d, const descr_key_t* k, long idx, u8 pub[65], int* publen);
 static int key_bytes(const descr_t* d, int ki, long idx, int xonly, u8 out[65], int* n);
 static void sb_key_to(const descr_t* d, int ki, int with_priv, char* out, unsigned long cap);
 static int dms_key_from_str(void* u, const char* s, size_t n, int* key, char* err, size_t errcap){
@@ -295,6 +299,50 @@ static int new_node(descr_t* d, int type, char* err, unsigned long errcap){
 }
 static int add_key(descr_t* d, const char* s, size_t n, int ctx, char* err, unsigned long errcap){
     if (d->nk >= DESCR_MAX_KEYS) ERRN("Too many keys in descriptor");
+    if (n >= 6 && !memcmp(s, "musig(", 6)){
+        /* BIP390 musig(KEY,...)[/path][/ *] -- Core's ParsePubkey rules and messages */
+        if (ctx != CTX_TR) ERRN("musig() is only allowed in tr() and rawtr()");
+        size_t close = 0; int nclose = 0;
+        for (size_t i = 0; i < n; i++) if (s[i] == ')'){ if (!nclose) close = i; nclose++; }
+        if (nclose > 1) ERRN("Too many ')' in musig() expression");
+        if (nclose == 0) ERRN("Invalid musig() expression");
+        const char* in = s + 6; size_t il = close - 6;
+        const char* rest = s + close + 1; size_t rl = n - close - 1;
+        int slot = d->nk++;                                   /* the aggregate's own slot, reserved first */
+        descr_key_t* k = &d->keys[slot]; memset(k, 0, sizeof *k);
+        k->kind = DK_MUSIG; k->compressed = 1; k->tr_ctx = 1; k->apostrophe = 1;
+        const char* as[DESCR_MUSIG_MAX + 1]; size_t al[DESCR_MUSIG_MAX + 1];
+        int na = il == 0 ? 0 : split_args(in, il, as, al, DESCR_MUSIG_MAX + 1);
+        if (na < 0) ERRN("musig(): too many participants");
+        if (na == 0) ERRN("musig(): Must contain key expressions");
+        int all_bip32 = 1, any_ranged = 0, any_priv = 0;
+        for (int q = 0; q < na; q++){
+            if (al[q] >= 6 && !memcmp(as[q], "musig(", 6)) ERRN("musig(): musig() is only allowed in tr() and rawtr()");
+            char e2[512];
+            int pk = add_key(d, as[q], al[q], CTX_WSH, e2, sizeof e2);   /* a participant: a compressed key, ranges allowed, no x-only */
+            if (pk < 0) ERRN("musig(): %s", e2);
+            descr_key_t* p = &d->keys[pk]; p->tr_ctx = 0;
+            if (p->kind != DK_XPUB && p->kind != DK_XPRV) all_bip32 = 0;
+            if (p->ranged) any_ranged = 1;
+            if (p->has_priv) any_priv = 1;
+            k = &d->keys[slot]; k->musig_parts[k->musig_n++] = pk;
+        }
+        k = &d->keys[slot];
+        if (rl){
+            if (rest[0] != '/') ERRN("Invalid musig() expression");
+            if (!all_bip32) ERRN("musig(): derivation requires all participants to be xpubs or xprvs");
+            if (any_ranged) ERRN("musig(): Cannot have ranged participant keys if musig() also has derivation");
+            int rg = 0, rh = 0, ap = 1;
+            if (!parse_path_elems(rest, rl, k->path, &k->pathlen, &rg, &rh, &ap, 1, err, errcap)){ char t[512]; snprintf(t, sizeof t, "%s", err); snprintf(err, errcap, "musig(): %s", t); return -1; }
+            if (rh) ERRN("musig(): Cannot have hardened child derivation");
+            for (int i = 0; i < k->pathlen; i++) if (k->path[i] & 0x80000000u) ERRN("musig(): cannot have hardened derivation steps");
+            k->ranged = rg;
+        }
+        k->musig_parts_ranged = any_ranged; k->has_priv = any_priv;
+        if (k->ranged || any_ranged) d->ranged = 1;
+        if (any_priv) d->has_priv = 1;
+        return slot;
+    }
     descr_key_t* k = &d->keys[d->nk];
     if (!parse_key(s, n, ctx == CTX_TR, 1, k, err, errcap)) return -1;
     if (ctx != CTX_TOP && ctx != CTX_SH && !k->compressed) ERRN("Uncompressed keys are not allowed");
@@ -494,7 +542,39 @@ int descr_parse(const char* text, descr_t* d, char* err, unsigned long errcap){
 }
 
 /* ---- derivation ------------------------------------------------------- */
-static int key_pub_at(const descr_key_t* k, long idx, u8 pub[65], int* publen){
+static int musig_cmp33(const void* a, const void* b){ return memcmp(a, b, 33); }
+/* the aggregate of a DK_MUSIG key at idx: agg33 (untweaked, underived), the sorted participants, the derived key */
+static int musig_derive(const descr_t* d, const descr_key_t* k, long idx, u8 agg33[33], u8 (*parts)[33], int* np, u8 derived[33], unsigned* path, int* plen){
+    u8 pk[DESCR_MUSIG_MAX][33]; int n = k->musig_n;
+    for (int i = 0; i < n; i++){
+        u8 pub[65]; int pl;
+        if (!key_pub_at(d, &d->keys[k->musig_parts[i]], idx, pub, &pl)) return 0;
+        if (pl != 33) return 0;
+        memcpy(pk[i], pub, 33);
+    }
+    qsort(pk, (size_t)n, 33, musig_cmp33);                    /* Core sorts the participants before KeyAgg */
+    musig2_keyagg_t* ka = malloc(sizeof *ka); if (!ka) return 0;
+    if (!musig2_key_agg(ka, (const u8 (*)[33])pk, n)){ free(ka); snprintf(g_err, sizeof g_err, "musig(): key aggregation failed"); return 0; }
+    musig2_agg_plain(agg33, ka); free(ka);
+    if (parts){ memcpy(parts, pk, (size_t)n * 33); } if (np) *np = n;
+    u8 K[33], cc[32]; memcpy(K, agg33, 33); memcpy(cc, MUSIG_CC, 32);
+    int pl2 = 0;
+    for (int i = 0; i < k->pathlen; i++){ u8 K2[33], c2[32]; if (bip32_ckdpub_step_pub(K, cc, k->path[i], K2, c2) != 1) return 0; memcpy(K, K2, 33); memcpy(cc, c2, 32); if (path) path[pl2] = k->path[i]; pl2++; }
+    if (k->ranged){ if (idx < 0 || idx > 0x7fffffffL) return 0; u8 K2[33], c2[32]; if (bip32_ckdpub_step_pub(K, cc, (unsigned)idx, K2, c2) != 1) return 0; memcpy(K, K2, 33); if (path) path[pl2] = (unsigned)idx; pl2++; }
+    memcpy(derived, K, 33); if (plen) *plen = pl2;
+    return 1;
+}
+int descr_musig_info(const descr_t* d, int key, long idx, u8 agg33[33], u8 (*parts)[33], int* nparts, u8 derived33[33], unsigned* path, int* plen){
+    if (key < 0 || key >= d->nk || d->keys[key].kind != DK_MUSIG) return 0;
+    return musig_derive(d, &d->keys[key], idx, agg33, parts, nparts, derived33, path, plen);
+}
+int descr_top_key(const descr_t* d){
+    if (d->root < 0) return -1;
+    const descr_node_t* n = &d->nodes[d->root];
+    return (n->type == DN_TR || n->type == DN_RAWTR) ? n->keys[0] : -1;
+}
+static int key_pub_at(const descr_t* d, const descr_key_t* k, long idx, u8 pub[65], int* publen){
+    if (k->kind == DK_MUSIG){ u8 agg[33]; if (!musig_derive(d, k, idx, agg, NULL, NULL, pub, NULL, NULL)) return 0; *publen = 33; return 1; }
     if (k->kind == DK_HEX || k->kind == DK_WIF){ memcpy(pub, k->pub, (size_t)k->publen); *publen = k->publen; return 1; }
     if (k->ranged && (idx < 0 || idx > 0x7fffffffL)) return 0;
     if (k->kind == DK_XPUB){
@@ -513,12 +593,12 @@ static int key_pub_at(const descr_key_t* k, long idx, u8 pub[65], int* publen){
 }
 int descr_key_pub_at(const descr_t* d, int key, long idx, u8 pub[65], int* publen){
     if (key < 0 || key >= d->nk) return 0;
-    return key_pub_at(&d->keys[key], idx, pub, publen);
+    return key_pub_at(d, &d->keys[key], idx, pub, publen);
 }
 int descr_key_priv_at(const descr_t* d, int key, long idx, u8 priv[32], int* compressed){
     if (key < 0 || key >= d->nk) return 0;
     const descr_key_t* k = &d->keys[key];
-    if (!k->has_priv) return 0;
+    if (!k->has_priv || k->kind == DK_MUSIG) return 0;    /* an aggregate has no private key; its participants are keys of their own */
     if (compressed) *compressed = k->compressed;
     if (k->kind == DK_WIF){ memcpy(priv, k->priv, 32); return 1; }
     u8 kk[32], cc[32]; memcpy(kk, k->xkey, 32); memcpy(cc, k->cc, 32);
@@ -532,7 +612,7 @@ int descr_key_priv_at(const descr_t* d, int key, long idx, u8 priv[32], int* com
 /* pubkey bytes of key `ki` at idx, x-only when in tr context */
 static int key_bytes(const descr_t* d, int ki, long idx, int xonly, u8 out[65], int* n){
     u8 pub[65]; int pl;
-    if (!key_pub_at(&d->keys[ki], idx, pub, &pl)){ if (!g_err[0]) snprintf(g_err, sizeof g_err, "Key derivation failed"); return 0; }
+    if (!key_pub_at(d, &d->keys[ki], idx, pub, &pl)){ if (!g_err[0]) snprintf(g_err, sizeof g_err, "Key derivation failed"); return 0; }
     if (xonly){
         if (pl == 32){ memcpy(out, pub, 32); *n = 32; return 1; }
         if (pl == 65){ snprintf(g_err, sizeof g_err, "Uncompressed keys are not allowed"); return 0; }
@@ -713,7 +793,15 @@ static void sb_put(sb_t* b, const char* s){ unsigned long l = strlen(s); if (b->
 static void sb_path(sb_t* b, const unsigned* path, int n, int apostrophe){
     for (int i = 0; i < n; i++){ char t[24]; snprintf(t, sizeof t, "/%u%s", path[i] & 0x7fffffffu, (path[i] & 0x80000000u) ? (apostrophe ? "'" : "h") : ""); sb_put(b, t); }
 }
-static void sb_key(sb_t* b, const descr_key_t* k, int with_priv){
+static void sb_key(sb_t* b, const descr_t* d, const descr_key_t* k, int with_priv){
+    if (k->kind == DK_MUSIG){
+        sb_put(b, "musig(");
+        for (int i = 0; i < k->musig_n; i++){ if (i) sb_put(b, ","); sb_key(b, d, &d->keys[k->musig_parts[i]], with_priv); }
+        sb_put(b, ")");
+        sb_path(b, k->path, k->pathlen, k->apostrophe);
+        if (k->ranged) sb_put(b, "/*");
+        return;
+    }
     if (k->has_origin){ char t[16]; hex_encode(t, k->origin_fp, 4); sb_put(b, "["); sb_put(b, t); sb_path(b, k->origin, k->origin_len, k->apostrophe); sb_put(b, "]"); }
     char t[200];
     if (k->kind == DK_HEX || (k->kind == DK_WIF && !with_priv)){
@@ -743,7 +831,7 @@ static void sb_key(sb_t* b, const descr_key_t* k, int with_priv){
 static void sb_key_to(const descr_t* d, int ki, int with_priv, char* out, unsigned long cap){
     sb_t b = { out, cap, 0, 0 }; out[0] = 0;
     if (ki < 0 || ki >= d->nk) return;
-    sb_key(&b, &d->keys[ki], with_priv);
+    sb_key(&b, d, &d->keys[ki], with_priv);
     if (b.ovf) out[0] = 0;
 }
 static void sb_node(sb_t* b, const descr_t* d, int ni, int with_priv){
@@ -760,17 +848,17 @@ static void sb_node(sb_t* b, const descr_t* d, int ni, int with_priv){
     sb_put(b, NAMES[n->type]); sb_put(b, "(");
     switch (n->type){
     case DN_SH: case DN_WSH: sb_node(b, d, n->child[0], with_priv); break;
-    case DN_TR: sb_key(b, &d->keys[n->keys[0]], with_priv); if (n->child[0] >= 0){ sb_put(b, ","); sb_node(b, d, n->child[0], with_priv); } break;
+    case DN_TR: sb_key(b, d, &d->keys[n->keys[0]], with_priv); if (n->child[0] >= 0){ sb_put(b, ","); sb_node(b, d, n->child[0], with_priv); } break;
     case DN_MULTI: case DN_SORTEDMULTI: case DN_MULTI_A: case DN_SORTEDMULTI_A: {
         char t[16]; snprintf(t, sizeof t, "%d", n->k); sb_put(b, t);
-        for (int q = 0; q < n->nkeys; q++){ sb_put(b, ","); sb_key(b, &d->keys[n->keys[q]], with_priv); } break; }
+        for (int q = 0; q < n->nkeys; q++){ sb_put(b, ","); sb_key(b, d, &d->keys[n->keys[q]], with_priv); } break; }
     case DN_ADDR: case DN_RAW: {
         if (n->type == DN_RAW){ char* h = malloc((size_t)d->rawlen * 2 + 1); if (h){ hex_encode(h, d->raw, d->rawlen); sb_put(b, h); free(h); } }
         else { /* re-render the address from the script */
             extern int wallet_script_to_address(char* out, long cap, const u8* script, long slen);
             char a[128]; if (wallet_script_to_address(a, sizeof a, d->raw, d->rawlen) > 0) sb_put(b, a); }
         break; }
-    default: sb_key(b, &d->keys[n->keys[0]], with_priv); break;
+    default: sb_key(b, d, &d->keys[n->keys[0]], with_priv); break;
     }
     sb_put(b, ")");
 }
