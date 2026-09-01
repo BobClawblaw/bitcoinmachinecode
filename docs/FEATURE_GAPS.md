@@ -1070,3 +1070,34 @@ feature names across `asm/` and `asm/daemon/`, cross-referencing against
 Bitcoin Core's real source (`/storage/bitcoin-core-source`) where a direct
 comparison was useful. Every gap cites what was actually found, not general
 Bitcoin-protocol assumptions.
+
+## Update 2026-09-01 — MuSig2 (BIP327 / BIP373)
+
+Closed: MuSig2 signing. `asm/musig2.c` is BIP327 in plain C over the node's
+own secp256k1 kernels (KeyAgg with the second-key rule, plain and x-only
+tweaks, NonceGen, NonceAgg, partial Sign with self-verify, PartialSigVerify,
+PartialSigAgg), proven on libsecp256k1's copy of the BIP vectors -- every
+group, including the failing cases (`tests/test_musig2`, 57 checks). The
+PSBT signer speaks BIP373: `PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS` / `PUB_NONCE`
+/ `PARTIAL_SIG` and `PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS`, with Core's
+`decodepsbt` shapes, and runs Core's `SignMuSig2` order for P2TR key-path
+aggregates (direct, derived through the synthetic xpub with chaincode
+`868087ca…8965`, or taproot-tweaked): nonce round, partial-signature round,
+aggregation into `PSBT_IN_TAP_KEY_SIG`, which `finalizepsbt` turns into the
+witness. Secret nonces live in an in-process session table keyed as Core's
+`MuSig2SessionID` and are erased on use. Evidence:
+`validation/musig_core_diff.py` -- Core regtest wallets as two of three
+participants, this node as the third through `descriptorprocesspsbt`,
+`combinepsbt` between rounds, Core's `finalizepsbt` + `testmempoolaccept` +
+its own aggregation of the same partial signatures (identical transaction)
++ a mined block as judges, `decodepsbt` compared field-by-field on every
+intermediate PSBT, five patterns (`tr(musig(keys/*))`, `rawtr(...)`, derived
+`musig(...)/<0;1>/*` under both, `ALL|ANYONECANPAY`): 110/110.
+
+Still open: **`musig()` in descriptors** (BIP390) -- `descriptor.c` refuses
+it by name; the parser/expander hook it needs is specified in `musig2.h`
+(the miniscript workstream owns descriptor.c). **MuSig2 inside tapscript
+leaves** (`tr(H, pk(musig(...)))`): the signer handles key-path aggregates
+only; the same rounds keyed by leaf hash are a small extension once
+script-path signing exists. The wallet's own key oracle for MuSig2 covers
+its HD window (the same keys it hands the raw signer) and imported HD keys.

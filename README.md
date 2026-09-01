@@ -398,7 +398,8 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   and expands pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh, tr with script
   trees, rawtr, addr and raw over hex, x-only, WIF and xpub/xprv keys with
   origins, paths and ranges (proven byte-identical to Core on its own test
-  vectors); miniscript and `musig()` are refused by name.
+  vectors); miniscript and `musig()` descriptors are refused by name (the
+  MuSig2 *signing* is in: see below).
   `descriptorprocesspsbt` signs from the keys a descriptor carries.
   `signrawtransactionwithkey` and the descriptor signer cover P2PKH, P2WPKH,
   P2SH-P2WPKH, P2SH multisig, P2WSH and P2SH-P2WSH (CHECKMULTISIG or a single
@@ -409,7 +410,18 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   (leaf scripts, control blocks, internal key, merkle root, bip32 origins
   with leaf hashes, key-path and script-path partial signatures); the signer
   tries the key path first and then each leaf, carries partials other
-  signers left, and `decodepsbt` names every field as Core does. BIP340
+  signers left, and `decodepsbt` names every field as Core does.
+  **MuSig2** (BIP327 in C, `musig2.c`,
+  proven on the BIP's vectors; BIP373 PSBT fields): `walletprocesspsbt` /
+  `descriptorprocesspsbt` run Core's rounds for any P2TR key-path aggregate
+  the PSBT names -- direct, BIP32-derived via the synthetic xpub, or
+  taproot-tweaked -- publishing our pubnonce, then our partial signature,
+  then the aggregated signature; `decodepsbt` prints the `musig2_*` fields
+  with Core's names; secret nonces never leave the process and are erased
+  on use. Proven by `validation/musig_core_diff.py`: 3-of-3 sessions with
+  two Core wallets and this node as the third signer, judged by Core's
+  `finalizepsbt`, `testmempoolaccept` and a mined block (110/110).
+  BIP340
   signing is in C and proven on Core's test vectors; every signed form is
   checked against Core's script engine by `validation/signer_core_diff.sh`.
 - **Mining.** `getblocktemplate` fills the block with whole linearization
