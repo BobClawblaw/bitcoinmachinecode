@@ -246,7 +246,8 @@ static int rd_varint(const unsigned char*p, unsigned long n, unsigned long long*
         ((unsigned long long)p[3]<<16)|((unsigned long long)p[4]<<24); return 5; }
     else { if(n<9)return -1; unsigned long long v=0; for(int i=7;i>=0;i--) v=(v<<8)|p[1+i]; *out=v; return 9; }
 }
-static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin, unsigned long* nout){
+static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin, unsigned long* nout,
+                    unsigned long* wstart /* OUT: offset of the witness section, 0 if none */){
     if(n<4+1+1) return -1;
     unsigned long o=4;
     /* BIP144 segwit serialization: version(4) marker(0x00) flag(0x01) ... and a
@@ -254,6 +255,7 @@ static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin,
      * this every real mainnet tx past tx0 mis-walks (the marker reads as an
      * empty vin and the flag as a vout count). */
     int segwit = 0;
+    if(wstart) *wstart = 0;
     if(o+2<=n && tx[o]==0x00 && tx[o+1]==0x01){ segwit=1; o+=2; }
     unsigned long long ni; int v=rd_varint(tx+o,n-o,&ni); if(v<0)return -1; o+=v;
     unsigned long long nin_=ni, i;
@@ -277,6 +279,7 @@ static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin,
          * counts and the length varints themselves, so every real mainnet tx
          * walked one byte short on the coinbase and descended into garbage
          * right after tx1 ("tx2 MALFORMED" on every downloaded block). */
+        if(wstart) *wstart = o;
         for(i=0;i<nin_;i++){
             unsigned long long nitems; v=rd_varint(tx+o,n-o,&nitems); if(v<0)return -1;
             o+=v;
@@ -292,9 +295,25 @@ static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin,
     *nin=nin_; *nout=nout_;
     return (long)o;
 }
+/* txid = sha256d over the serialization WITHOUT marker/flag/witness (BIP141).
+ * ibd_lsm used to hash the FULL serialization, which is the WTXID -- every
+ * segwit output it added was keyed so its own spends could never resolve. */
+static void txid_of(const unsigned char* tx, unsigned long tl, unsigned long wstart,
+                    unsigned char out[32]){
+    if (wstart == 0){ sha256d(out, tx, tl); return; }
+    static unsigned char core[1<<22];
+    unsigned long corelen = 4 + (wstart - 6) + 4;
+    memcpy(core, tx, 4);
+    memcpy(core+4, tx+6, wstart-6);
+    memcpy(core+4+(wstart-6), tx+tl-4, 4);
+    sha256d(out, core, corelen);
+}
 static int tx_in(const unsigned char*tx, unsigned long n, unsigned long idx,
                  uint8_t* prevhash, unsigned long* previndex, uint8_t* scriptsig, unsigned long* ssl){
     unsigned long o=4;
+    /* BIP144: skip marker(0x00)+flag(0x01) like tx_walk -- without this the
+     * marker reads as ni=0 and every segwit input is skipped (no dels!). */
+    if(o+2<=n && tx[o]==0x00 && tx[o+1]==0x01) o+=2;
     unsigned long long ni; int v=rd_varint(tx+o,n-o,&ni); if(v<0)return -1; o+=v;
     if(idx>=ni) return -1;
     unsigned long i;
@@ -319,6 +338,10 @@ static int tx_in(const unsigned char*tx, unsigned long n, unsigned long idx,
 static int tx_out(const unsigned char*tx, unsigned long n, unsigned long idx,
                   unsigned long long* value, const uint8_t** script, unsigned long* sl){
     unsigned long o=4;
+    /* BIP144: skip marker(0x00)+flag(0x01) like tx_walk -- without this the
+     * marker reads as ni=0 and the flag as vout count=1, so "vout 0" becomes
+     * 8 bytes of the first prevhash (garbage value/script keyed at idx=0). */
+    if(o+2<=n && tx[o]==0x00 && tx[o+1]==0x01) o+=2;
     unsigned long long ni; int v=rd_varint(tx+o,n-o,&ni); if(v<0)return -1; o+=v;
     unsigned long long no;
     { unsigned long i; for(i=0;i<ni;i++){ if(o+36+4>n)return -1; o+=36; unsigned long long sl_; v=rd_varint(tx+o,n-o,&sl_); if(v<0)return -1; o+=v; if(o+sl_+4>n)return -1; o+=sl_+4; } }
@@ -485,8 +508,8 @@ int main(int argc, char** argv){
             int bad=0;
             long miss_logged=0, miss_total=0;   /* per-block missing-prevout rate limit */
             for(unsigned long ti=0; ti<nt; ti++){
-                unsigned long nin,nout;
-                long tl=tx_walk(blk+toff,(unsigned long)blklen-toff,&nin,&nout);
+                unsigned long nin,nout,ws=0;
+                long tl=tx_walk(blk+toff,(unsigned long)blklen-toff,&nin,&nout,&ws);
                 if(tl<0){ fprintf(stderr,"h%ld tx%lu MALFORMED\n",h,ti); bad=1; break; }
                 unsigned char* txo=blk+toff;
                 ntx++;
@@ -494,7 +517,7 @@ int main(int argc, char** argv){
                 if(ti==0){
                     for(v=0;v<nout;v++){ unsigned long long val; const uint8_t*sp; unsigned long spl;
                         if(tx_out(txo,tl,v,&val,&sp,&spl)==0 && spl>0){
-                            uint8_t txid[32]; sha256d(txid,txo,tl);
+                            uint8_t txid[32]; txid_of(txo,tl,ws,txid);
                             long pr=lsm_put(txid,v,val,(uint64_t)h,1,sp,spl);
                             if(pr==1) added++; else if(pr==0) put_dup++; else { fprintf(stderr,"h%ld PUT ERR\n",h); bad=1; break; }
                         } }
@@ -519,7 +542,7 @@ int main(int argc, char** argv){
                     }
                     for(v=0;v<nout;v++){ unsigned long long val; const uint8_t*sp; unsigned long spl;
                         if(tx_out(txo,tl,v,&val,&sp,&spl)==0 && spl>0){
-                            uint8_t txid[32]; sha256d(txid,txo,tl);
+                            uint8_t txid[32]; txid_of(txo,tl,ws,txid);
                             long pr=lsm_put(txid,v,val,(uint64_t)h,0,sp,spl);
                             if(pr==1) added++; else if(pr==0) put_dup++; else { fprintf(stderr,"h%ld PUT ERR\n",h); bad=1; break; }
                         } }
