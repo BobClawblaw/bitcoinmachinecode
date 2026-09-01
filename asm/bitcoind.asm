@@ -326,6 +326,17 @@ node_accept_handshake:
     lea  rdi, [rel g_peer_version_payload]
     lea  rsi, [rbp-0x300]
     rep  movsb
+    ; relay policy hook (C): decides fRelay for THIS peer from its version + permissions
+    mov  rax, [rel g_accept_version_hook]
+    test rax, rax
+    jz   .no_avh
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16                ; C callee: align explicitly
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+.no_avh:
     ; build our version reply
     lea  rdi, [rbp-0x600]
     call node_make_version
@@ -2123,6 +2134,11 @@ ua: db NODE_UA_STRING   ; user-agent from version.inc (length derived via %strle
 global node_ua_buf
 global node_ua_len
 global node_relay_flag
+; called by node_accept_handshake after the peer's version is captured and
+; BEFORE ours is built: main.c sets node_relay_flag / feefilter for this peer
+; from the relay policy (2026-09-01). 0 = no hook.
+global g_accept_version_hook
+g_accept_version_hook: dq 0
 align 16
 node_ua_buf: db NODE_UA_STRING
              times (256 - NODE_UA_LEN) db 0
