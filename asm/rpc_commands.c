@@ -3583,13 +3583,33 @@ static char* mu_extract_hex(const unsigned char* utx, unsigned long utxl, crt_in
 }
 /* ==== end MuSig2 ========================================================= */
 
+static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd);
 static int psbt_process(const char* b64, int sign, const char* sht, int finalize,
                         psbt_signer_fn signer, void* sctx, psbt_keyfn keyfn,
+                        dpp_desc_t* upd_dv, int upd_nd,
                         long* ec, const char** em, rj_val** result){
 
     static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
     if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
     if (vm.locktime_conflict){ *ec = -22; *em = "PSBT cannot be made into a valid transaction"; return 0; }
+    if (upd_nd > 0){
+        /* ==== Updater (psbt_update.c) on the v0-shaped buffer: scripts, bip32
+         * origins, taproot leaves/control blocks/derivs; then the musig()
+         * updater (BIP390/BIP373), which speaks v0 base64 -- shim through it.
+         * The caller's version (vm) is preserved on output. */
+        static unsigned char ub[400000];
+        long un = psbt_update_bytes_from_descs(buf, blen, (pu_desc_t*)upd_dv, upd_nd, ub, sizeof ub);
+        if (un > 0){ memcpy(buf, ub, (size_t)un); blen = un; }
+        char* v0b = malloc((size_t)((blen + 2) / 3) * 4 + 1);
+        if (v0b){
+            crt_b64(v0b, buf, blen);
+            char* mu = dpp_musig_update(v0b, upd_dv, upd_nd);
+            if (mu){ long nl = 0; static unsigned char mb[400000];
+                     if (crt_b64dec(mu, mb, sizeof mb, &nl) && nl >= 5 && !memcmp(mb, "psbt\xff", 5)){ memcpy(buf, mb, (size_t)nl); blen = nl; }
+                     free(mu); }
+            free(v0b);
+        }
+    }
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
@@ -4010,7 +4030,7 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
     if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
     /* ==== Updater from the wallet's own descriptors (listdescriptors): scripts, origins, taproot fields ==== */
-    char* upd = NULL;
+    static dpp_desc_t* g_wupd_dv; static int g_wupd_nd; g_wupd_nd = 0;
     { rj_val* ld = NULL; long e2 = 0; const char* m2 = NULL; rj_val* np = rj_arr();
       if (rpc_wops_dispatch("listdescriptors", np, w, &ld, &e2, &m2) && ld){
           rj_val* arr = rj_obj_get(ld, "descriptors");
@@ -4023,11 +4043,10 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
               if (wdescs[wnd].ranged){ hi = 1000; if (rg && rg->typ == RJ_ARR && rg->nitems == 2){ lo = strtol(rg->items[0]->str, NULL, 10); hi = strtol(rg->items[1]->str, NULL, 10); } if (hi - lo > 5000) hi = lo + 5000; }
               wdv[wnd].d = &wdescs[wnd]; wdv[wnd].lo = lo; wdv[wnd].hi = hi; wnd++;
           }
-          if (wnd) upd = psbt_update_from_descs(b64, (pu_desc_t*)wdv, wnd);
+          g_wupd_dv = wdv; g_wupd_nd = wnd;
       }
       if (ld) rj_free(ld); rj_free(np); }
-    int rc = psbt_process(upd ? upd : b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, ec, em, result);
-    free(upd);
+    int rc = psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, g_wupd_dv, g_wupd_nd, ec, em, result);
     return rc;
 }
 
@@ -4254,10 +4273,8 @@ int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** e
     if (!dpp_load_descs(params->items[1], descs, dv, DPP_MAX_DESCS, &nd, ec, em)) return 0;
     dpp_ctx_t ctx = { dv, nd };
     /* ==== Updater (psbt_update.c): scripts, bip32 origins, taproot leaves/control blocks/derivs ==== */
-    char* upd0 = psbt_update_from_descs(b64, (pu_desc_t*)dv, nd);
-    char* upd = dpp_musig_update(upd0 ? upd0 : b64, dv, nd);          /* the Updater role for musig() descriptors (BIP390/BIP373) */
-    int rc = psbt_process(upd ? upd : (upd0 ? upd0 : b64), 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, ec, em, result);
-    free(upd); free(upd0);
+    /* the Updater runs inside psbt_process, on the v0-shaped buffer, version preserved */
+    int rc = psbt_process(b64, 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, dv, nd, ec, em, result);
     return rc;
 }
 

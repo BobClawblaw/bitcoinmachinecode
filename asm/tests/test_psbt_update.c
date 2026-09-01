@@ -28,6 +28,7 @@ static int fails = 0, checks = 0;
 static void ck(const char* w, int c){ checks++; if (c) printf("ok  : %s\n", w); else { printf("FAIL: %s\n", w); fails++; } }
 static void hexs(char* o, const u8* b, int n){ for (int i = 0; i < n; i++) sprintf(o + 2*i, "%02x", b[i]); o[2*n] = 0; }
 static const char* S(rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o, k) : NULL; return v ? v->str : NULL; }
+static const char* SH(rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o, k) : NULL; if (!v) return NULL; if (v->typ == RJ_OBJ){ rj_val* h = rj_obj_get(v, "hex"); return h ? h->str : NULL; } return v->str; }
 static rj_val* call(const char* m, const char* pj, long* ec, const char** em){ rj_val* p = rj_parse(pj, strlen(pj)); rj_val* r = NULL; rpc_wallet w; memset(&w, 0, sizeof w); *ec = 0; *em = NULL; int ok = rpc_dispatch(m, p, &w, &r, ec, em); rj_free(p); if (!ok){ if (r) rj_free(r); return NULL; } return r; }
 static long vi(u8* o, unsigned long v){ if (v < 0xfd){ o[0] = (u8)v; return 1; } o[0] = 0xfd; o[1] = (u8)v; o[2] = (u8)(v >> 8); return 3; }
 static long kv(u8* o, const u8* k, unsigned long kl, const u8* v, unsigned long vl){ long n = 0; n += vi(o+n, kl); memcpy(o+n, k, kl); n += kl; n += vi(o+n, vl); memcpy(o+n, v, vl); n += vl; return n; }
@@ -108,15 +109,15 @@ int main(void){
       snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"], \"ALL\", true, false]", ps64, ph[0], ph[1]);
       r = call("descriptorprocesspsbt", pj, &ec, &em); d = r && S(r, "psbt") ? decode(S(r, "psbt")) : NULL; i0 = in0(d);
       char wsh_hex[160]; hexs(wsh_hex, ws, o);
-      ck("witness_script filled", i0 && S(i0, "witness_script") && !strcmp(S(i0, "witness_script"), wsh_hex)); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("witness_script filled", i0 && SH(i0, "witness_script") && !strcmp(SH(i0, "witness_script"), wsh_hex)); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       rj_val* dv = i0 ? rj_obj_get(i0, "bip32_derivs") : NULL; u8 h[20]; char fp[9]; hash160(h, pub[0], 33); hexs(fp, h, 4);
       ck("bip32_derivs for both keys with hash160 fingerprints", dv && dv->nitems == 2 && S(dv->items[0], "master_fingerprint") && (!strcmp(S(dv->items[0], "master_fingerprint"), fp) || !strcmp(S(dv->items[1], "master_fingerprint"), fp)));
-      rj_val* o0 = out0(d); ck("the change-like output gets witness_script + bip32_derivs too", o0 && S(o0, "witness_script") && rj_obj_get(o0, "bip32_derivs") && rj_obj_get(o0, "bip32_derivs")->nitems == 2);
+      rj_val* o0 = out0(d); ck("the change-like output gets witness_script + bip32_derivs too", o0 && SH(o0, "witness_script") && rj_obj_get(o0, "bip32_derivs") && rj_obj_get(o0, "bip32_derivs")->nitems == 2);
       if (d) rj_free(d); if (r) rj_free(r);
       printf("== 6. utxoupdatepsbt with descriptors adds the same ==\n");
       snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, ph[0], ph[1]);
       r = call("utxoupdatepsbt", pj, &ec, &em); d = r && r->str ? decode(r->str) : NULL; i0 = in0(d);
-      ck("utxoupdatepsbt(descriptors): witness_script + bip32_derivs", i0 && S(i0, "witness_script") && rj_obj_get(i0, "bip32_derivs")); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("utxoupdatepsbt(descriptors): witness_script + bip32_derivs", i0 && SH(i0, "witness_script") && rj_obj_get(i0, "bip32_derivs")); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       if (d) rj_free(d); if (r) rj_free(r); }
 
     printf("== 4. an xpub with an origin: fingerprint + full path incl. the index ==\n");
@@ -164,7 +165,7 @@ int main(void){
       d = half ? decode(half) : NULL; i0 = in0(d);
       { rj_val* ps = i0 ? rj_obj_get(i0, "partial_signatures") : NULL;
         ck("...partial_signatures carries K1's signature (the satisfier's own)", ps && rj_obj_get(ps, ph[1]) && !rj_obj_get(ps, ph[0]));
-        ck("...witness_script from the Updater", i0 && S(i0, "witness_script")); }
+        ck("...witness_script from the Updater", i0 && SH(i0, "witness_script")); }
       if (d) rj_free(d);
       if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(and_v(v:pk(%s),pk(%s)))\"]]", half, wif[0], ph[1]);
           r = call("descriptorprocesspsbt", pj, &ec, &em);
