@@ -901,7 +901,7 @@ static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
  * (2026-08-28 pre-deploy review.) */
 static unsigned char mux_out_net[MUX_MAX_OUT];
 static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
-static char  mux_out_host[MUX_MAX_OUT][64];
+static char  mux_out_host[MUX_MAX_OUT][128]   /* "host:port" of a v3 onion is 67 bytes; 64 truncated it and broke the top-up dedupe (2026-09-01) */;
 static int   mux_n_out = 0;
 static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
 static long long mux_out_nextretry[MUX_MAX_OUT];
@@ -1968,7 +1968,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
                      i, peers[p], dial_fail_reason()); return; }
     mux_out_fd[i]=fd;
     mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
-    strncpy(mux_out_host[i], peers[p], 63);
+    strncpy(mux_out_host[i], peers[p], 127);
     anchor_locator(mux_out_loc[i]);
     fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d\n", i, peers[p], fd, (int)mux_out_wants_v2[i]);
 }
@@ -2244,7 +2244,7 @@ static unsigned long long dl_pool_rng(void){
     return dl_pool_rng_state = x;
 }
 #define DL_POOL_NNET 5
-#define DL_POOL_RESERVOIR 1024   /* per-network sample; clearnet must be able to fill a 512-slot catch-up pool */
+#define DL_POOL_RESERVOIR 8192   /* per-network sample: clearnet must be able to fill the largest catch-up pool (bmc.peerpool <= 8192) */
 static int dl_pool_net_slot(int net){
     switch(net){ case BMC_NET_IPV4: return 0; case BMC_NET_IPV6: return 1; case BMC_NET_TORV3: return 2;
                  case BMC_NET_I2P: return 3; case BMC_NET_CJDNS: return 4; default: return -1; }
@@ -3939,7 +3939,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             { extern void addrself_note_peer_view(const unsigned char*, long);
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
-            strncpy(mux_out_host[mux_n_out], srcpool[i], 63);
+            strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
             mux_out_fd[mux_n_out]=cfd[i];
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
@@ -4842,7 +4842,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(already) continue;
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
-                    strncpy(mux_out_host[mux_n_out], srcpool[ci], 63);
+                    strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
                     mux_out_fd[mux_n_out]=nfd;
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
@@ -5329,7 +5329,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     for(int i=0;i<nwant && i<pool_len && i<MUX_MAX_OUT;i++){
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
-        strncpy(mux_out_host[mux_n_out], peers[i], 63);
+        strncpy(mux_out_host[mux_n_out], peers[i], 127);
         mux_out_fd[mux_n_out]=fd;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
