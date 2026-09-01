@@ -12,6 +12,7 @@
  *   appends discovered peers to ./peers.dat
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
