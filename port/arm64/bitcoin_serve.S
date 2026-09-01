@@ -15,6 +15,7 @@
 
 	.extern p2p_read
 	.extern p2p_write
+	.extern serve_inv_bounds
 	.extern amr_init
 	.extern amr_count
 	.extern amr_get_i
@@ -93,6 +94,8 @@ s_fh:        .zero 8
 s_cmd:       .zero 16
 s_cnt:       .zero 8
 s_ptr:       .zero 8
+s_ivn:       .zero 8                    /* inv entry count (serve_inv_bounds) */
+s_ivo:       .zero 8                    /* offset of the first entry */
 s_nf:        .zero 8                    /* notfound entries accumulated for THIS getdata */
 s_p:         .zero 8
 s_addrsent:  .zero 1        /* getaddr answered once per conn (Core: m_getaddr_recvd) */
@@ -122,6 +125,8 @@ cn_head:   .ascii "headers\0"
 cn_inv:    .ascii "inv\0"
 cn_tx:     .ascii "tx\0"
 cn_getdata:.ascii "getdata\0"
+viol_oversize: .ascii "oversized message announcement\0"
+viol_invsz:    .ascii "inv/getdata vector above MAX_INV_SZ\0"
 cn_getbtxn:.ascii "getblocktxn\0"
 cn_btxn:   .ascii "blocktxn\0"
 cn_cmpct:  .ascii "cmpctblock\0"
@@ -356,7 +361,7 @@ node_serve_loop:
 	LOADADDR x4, s_plen
 	bl   p2p_read
 	cmp  x0, #0
-	b.le .done
+	b.le .check_viol
 	LOADADDR x9, s_cmd
 	add  x9, x9, #11
 	strb wzr, [x9]                    /* s_cmd[11]=0 */
@@ -401,7 +406,7 @@ node_serve_loop:
 	cmp  w23, w24
 	b.eq .do_tx
 	mov  w24, #0x6f6c
-	movk w24, #0x6362, lsl #16        /* "bloc" */
+	movk w24, #0x636f, lsl #16        /* "bloc" (0x636f6c62 LE, "block" cmd[0..3]) */
 	cmp  w23, w24
 	b.eq .do_block
 	mov  w24, #0x6573
@@ -438,15 +443,32 @@ node_serve_loop:
 	b    .next
 
 .do_inv:
-	LOADADDR x9, pl_buf
-	ldrb w9, [x9]                     /* count */
+	/* serve_inv_bounds (daemon/serve_invbounds.c) parses the varint count
+	 * and enforces MAX_INV_SZ (Core 50000); writing that parser in asm would
+	 * only trade one subtle parser for another (x86 does the same).
+	 *   w0 =  1 ok, 0 malformed/short (drop quietly),
+	 *       -1 over MAX_INV_SZ: a protocol violation, score it. */
+	LOADADDR x0, pl_buf
+	LOADADDR x1, s_plen
+	ldr  x1, [x1]
+	LOADADDR x2, s_ivn
+	LOADADDR x3, s_ivo
+	bl   serve_inv_bounds
+	cmp  w0, #-1
+	b.eq .inv_toobig
+	cmp  w0, #0
+	b.le .next                       /* malformed or short: drop quietly */
+	LOADADDR x9, s_ivn
+	ldr  x9, [x9]
 	LOADADDR x10, s_cnt
 	str  x9, [x10]
 	cbz  x9, .next
 	LOADADDR x10, s_ptr
 	LOADADDR x11, pl_buf
-	add  x11, x11, #1
-	str  x11, [x10]                   /* s_ptr = pl_buf+1 */
+	LOADADDR x12, s_ivo
+	ldr  x12, [x12]
+	add  x11, x11, x12
+	str  x11, [x10]                  /* s_ptr = pl_buf + s_ivo (past the varint) */
 .LSV_inv_loop:
 	LOADADDR x9, s_cnt
 	ldr  x9, [x9]
@@ -491,6 +513,15 @@ node_serve_loop:
 	sub  x9, x9, #1
 	str  x9, [x10]
 	b    .LSV_inv_loop
+/* inv/getdata vector above MAX_INV_SZ: score it the way Core does
+ * ("inv message size = %u"), then drop the message (x86 .inv_toobig). */
+.inv_toobig:
+	LOADADDR x9, g_serve_violation_hook
+	ldr  x9, [x9]
+	cbz  x9, .next
+	LOADADDR x0, viol_invsz
+	blr  x9
+	b    .next
 
 .do_tx:
 	LOADADDR x9, s_plen
@@ -962,14 +993,14 @@ node_serve_loop:
 .maybe_getheaders:
 	LOADADDR x9, s_cmd
 	ldr  w9, [x9, #3]
-	mov  w10, #0x6561
-	movk w10, #0x6468, lsl #16        /* "head" at cmd[3] */
+	mov  w10, #0x6568
+	movk w10, #0x6461, lsl #16        /* "head" at cmd[3] (0x64616568 LE) */
 	cmp  w9, w10
 	b.ne .next
 	LOADADDR x9, s_cmd
 	ldr  w9, [x9, #7]
-	mov  w10, #0x7365
-	movk w10, #0x0072, lsl #16        /* "ers\0" at cmd[7] */
+	mov  w10, #0x7265
+	movk w10, #0x0073, lsl #16        /* "ers\0" at cmd[7] (0x00737265 LE) */
 	cmp  w9, w10
 	b.ne .next
 	LOADADDR x9, s_plen
@@ -1148,8 +1179,8 @@ node_serve_loop:
 	b.eq .do_getblocktxn
 	LOADADDR x9, s_cmd
 	ldr  w9, [x9, #4]
-	mov  w10, #0x636f
-	movk w10, #0x6b6c, lsl #16        /* "lock" at cmd[4] */
+	mov  w10, #0x6f6c
+	movk w10, #0x6b63, lsl #16        /* "lock" at cmd[4] (0x6b636f6c LE) */
 	cmp  w9, w10
 	b.ne .next
 	LOADADDR x9, s_plen
@@ -1357,8 +1388,8 @@ node_serve_loop:
 .maybe_feefilter:
 	LOADADDR x9, s_cmd
 	ldr  w9, [x9, #4]
-	mov  w10, #0x746c
-	movk w10, #0x0069, lsl #16        /* "ilt\0" */
+	mov  w10, #0x6c69
+	movk w10, #0x0074, lsl #16        /* "ilt\0" at cmd[4] (0x00746c69 LE) */
 	cmp  w9, w10
 	b.ne .next
 	LOADADDR x9, s_plen
@@ -1530,6 +1561,20 @@ node_serve_loop:
 	str  x11, [x10]
 .tw_done:
 	b    .outer
+/* A -3 from p2p_read means the peer announced a message above P2P_MAX_MSG --
+ * a protocol violation, not an ordinary disconnect. Score it before dropping
+ * so a peer that does it repeatedly earns a ban (x86 .check_viol). Any other
+ * <=0 just exits the loop. The hook is a C function pointer: sp is still
+ * 16-aligned here (96-byte reservation on top of the 64-byte save area). */
+.check_viol:
+	cmp  x0, #-3
+	b.ne .done
+	LOADADDR x9, g_serve_violation_hook
+	ldr  x9, [x9]
+	cbz  x9, .done
+	LOADADDR x0, viol_oversize
+	blr  x9
+	b    .done
 .done:
 	LOADADDR x9, s_served
 	ldr  x0, [x9]
