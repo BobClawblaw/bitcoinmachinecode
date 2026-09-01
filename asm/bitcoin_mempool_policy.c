@@ -1589,6 +1589,18 @@ static int mpe_seen(unsigned char set[][32], int n, const unsigned char* txid){
  * witness portions need them); the GBT template reads it back through
  * mpool_policy_entry_info. Caller holds mp_lock. (mining-polish graft,
  * re-attached at the 2026-08-27 policy-parity merge.) */
+/* fee estimation (daemon/fee_estimator.c): Core tracks a tx only when it
+ * has no in-mempool parents and was not submitted as part of a package. */
+long mpool_policy_n_parents(void* st, const unsigned char txid[32]){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return -1;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    for (uint32_t i = n; i > 0; i--)
+        if (!memcmp(t[i-1].txid, txid, 32)) return (long)t[i-1].n_parents;
+    return -1;
+}
+int mpol_in_package_context(void){ return g_pkg_n > 0; }
+
 long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
     mpol_node* t = mpol_nodes_base(st);
