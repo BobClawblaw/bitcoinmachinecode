@@ -387,8 +387,11 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   an extension with no Core equivalent.
 - **ZMQ `sequence` topic** is refused by configuration rather than
   published; the other four topics are supported.
-- **Wallet.** `createwalletdescriptor` answers only for the address type the
-  wallet holds (bech32). Descriptors are otherwise general: the engine parses
+- **Wallet.** The seed wallet always carries bech32 (wpkh); `createwalletdescriptor`
+  adds legacy (pkh, 44'), p2sh-segwit (sh(wpkh), 49') and bech32m (tr, 86'),
+  after which `getnewaddress`/`getrawchangeaddress` accept that address type,
+  the rescan window covers those keys and the wallet signs for them (P2PKH,
+  P2SH-P2WPKH, P2TR key path). Descriptors are otherwise general: the engine parses
   and expands pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh, tr with script
   trees, rawtr, addr and raw over hex, x-only, WIF and xpub/xprv keys with
   origins, paths and ranges (proven byte-identical to Core on its own test

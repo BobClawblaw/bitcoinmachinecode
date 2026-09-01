@@ -142,6 +142,36 @@ int main(void){
       ck("derived the wallet's receive key hash160", wallet_h160(0,0,h)==1);
       hexify(hh,h,20);
 
+      /* the wallet's other output types (2026-09-01): once active, the wallet
+       * signs for its legacy (44'), p2sh-segwit (49') and bech32m (86')
+       * keys too -- P2PKH, P2SH-P2WPKH (redeemScript from the key) and the
+       * P2TR key path (BIP341 tweak of the 86' key). */
+      { extern void rpc_wops_set_active_types_for_test(int mask);
+        extern void rpc_wops_type_path(int t, unsigned i, int chain, unsigned idx[5]);
+        extern int  rpc_wops_type_spk(int t, const unsigned char pub[33], unsigned char spk[34], unsigned long* spklen, unsigned char h20[20]);
+        rpc_wops_set_active_types_for_test(0xf);
+        const char* names[3] = { "legacy", "p2sh-segwit", "bech32m" };
+        for (int t = 1; t <= 3; t++){
+            unsigned idx[5]; rpc_wops_type_path(t, 0, 0, idx);
+            unsigned char k[32], c[32], pub[33], spk[34], h20[20]; unsigned long sl;
+            ck("derived the wallet's key for the type", bip32_derive_path(k, c, WSEED, 64, idx, 5) == 1);
+            scalar_to_pubkey(pub, k);
+            ck("...and its scriptPubKey", rpc_wops_type_spk(t, pub, spk, &sl, h20));
+            char spkh[80]; hexify(spkh, spk, (int)sl);
+            char extra[80] = ""; if (t == 2){ unsigned char kh[20]; hash160(kh, pub, 33); char khh[41]; hexify(khh, kh, 20); snprintf(extra, sizeof extra, ",\"redeemScript\":\"0014%s\"", khh); }
+            char pv[400], pj[1400];
+            snprintf(pv, sizeof pv, "{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"%s\",\"amount\":1.0%s}", spkh, extra);
+            snprintf(pj, sizeof pj, "[\"%s\",[%s]]", UNSIGNED, pv);
+            rj_val* p = rj_parse(pj, strlen(pj)); rj_val* r = NULL; long ec; const char* em;
+            int rc = rpc_dispatch("signrawtransactionwithwallet", p, &ww, &r, &ec, &em);
+            rj_val* comp = r ? rj_obj_get(r, "complete") : NULL;
+            char label[120]; snprintf(label, sizeof label, "the wallet signs its %s coin to completion", names[t-1]);
+            ck(label, rc == 1 && comp && comp->str[0] == '1');
+            if (!(rc == 1 && comp && comp->str[0] == '1') && r && rj_obj_get(r, "errors")) printf("     (%s)\n", rj_obj_get(rj_obj_get(r, "errors")->items[0], "error")->str);
+            rj_free(r); rj_free(p);
+        }
+        rpc_wops_set_active_types_for_test(1); }
+
       /* a P2WPKH prevout the wallet owns -> signs to completion */
       { char pv[400], pj[1400];
         snprintf(pv,sizeof pv,

@@ -1025,10 +1025,10 @@ static int wop_master_fp(const unsigned char seed[64], char out[9]){
     return 1;
 }
 
-static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){
+static rj_val* wop_desc_entry_t(const unsigned char seed[64], int t, int is_change){
     char mfp[9];
     if (!wop_master_fp(seed, mfp)) return NULL;
-    unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, 0, (unsigned)is_change};
+    unsigned idx[5]; rpc_wops_type_path(t, 0, is_change, idx);
     unsigned char k[32], c[32], pub[33];
     if (bip32_derive_path(k, c, seed, 64, idx, 5) != 1) return NULL;
     scalar_to_pubkey(pub, k);
@@ -1037,7 +1037,11 @@ static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){
     for (int i = 0; i < 33; i++){ pubhex[i*2] = H[pub[i]>>4]; pubhex[i*2+1] = H[pub[i]&15]; }
     pubhex[66] = 0;
     char inner[256];
-    snprintf(inner, sizeof inner, "wpkh([%s/84h/0h/0h/0/%d]%s)", mfp, is_change, pubhex);
+    unsigned purpose = idx[0] & 0x7fffffffu;
+    if (t == WOT_LEGACY)           snprintf(inner, sizeof inner, "pkh([%s/%uh/0h/0h/0/%d]%s)", mfp, purpose, is_change, pubhex);
+    else if (t == WOT_P2SH_SEGWIT) snprintf(inner, sizeof inner, "sh(wpkh([%s/%uh/0h/0h/0/%d]%s))", mfp, purpose, is_change, pubhex);
+    else if (t == WOT_BECH32M)     snprintf(inner, sizeof inner, "tr([%s/%uh/0h/0h/0/%d]%s)", mfp, purpose, is_change, pubhex + 2);   /* x-only, as Core prints tr() keys */
+    else                           snprintf(inner, sizeof inner, "wpkh([%s/%uh/0h/0h/0/%d]%s)", mfp, purpose, is_change, pubhex);
     char cks[9];
     char desc[288];
     if (rpc_chain_desc_checksum(inner, cks)) snprintf(desc, sizeof desc, "%s#%s", inner, cks);
@@ -1050,6 +1054,8 @@ static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){
     rj_obj_set(e, "active", rj_bool(1));
     rj_obj_set(e, "internal", rj_bool(is_change));
     return e;
+}
+static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){ return wop_desc_entry_t(seed, WOT_BECH32, is_change);
 }
 
 static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
@@ -1084,9 +1090,13 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
     }
     if (!w || !w->seed) return wop_err(ec, em, -4, "No wallet is loaded");
     rj_val* arr = rj_arr();
-    for (int ch = 0; ch <= 1; ch++){
-        rj_val* e = wop_desc_entry(w->seed, ch);
-        if (e) rj_arr_push(arr, e);
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (int ch = 0; ch <= 1; ch++){
+            rj_val* e = wop_desc_entry_t(w->seed, t, ch);
+            if (e) rj_arr_push(arr, e);
+        }
     }
     rj_val* o = rj_obj();
     rj_obj_set(o, "wallet_name", rj_str(rpc_wops_active_wallet_name()));
@@ -1270,7 +1280,7 @@ static int cmd_migratewallet(const rj_val* params, long* ec, const char** em){
  * see funds paid to it. Refusing is the honest answer until the scan and the
  * address path learn those script types. */
 static int cmd_createwalletdescriptor(const rj_val* params, const rpc_wallet* w,
-                                      long* ec, const char** em){
+                                      long* ec, const char** em, rj_val** res){
     const char* type = wop_str_arg(params, 0);
     if (!type || !type[0])
         return wop_err(ec, em, -8, "createwalletdescriptor requires an address type");
@@ -1288,19 +1298,25 @@ static int cmd_createwalletdescriptor(const rj_val* params, const rpc_wallet* w,
                 "watch-only wallet. Use importdescriptors instead.");
         return wop_err(ec, em, -4, "No wallet is loaded");
     }
-    if (!strcmp(type, "bech32"))
-        /* True for the seed AND for every added key: addhdkey puts a key
-         * straight into the derivation window, so its wpkh descriptors exist
-         * from that moment -- there is no separate materialisation step for
-         * this call to perform. gethdkeys lists them; listdescriptors shows
-         * the seed's. */
-        return wop_err(ec, em, -4, "Descriptor already exists");
-    snprintf(msg, sizeof msg,
-             "this wallet derives only wpkh (bech32) keys: its rescan matches "
-             "P2WPKH scripts and getnewaddress hands out bech32 addresses, so a "
-             "'%s' descriptor would never be recognised or used. bech32 already "
-             "exists; see listdescriptors.", type);
-    return wop_err(ec, em, -4, msg);
+    /* bech32 is always present (for the seed AND every addhdkey key, which
+     * join the derivation window the moment they are added); the other three
+     * are activated here (2026-09-01): their descriptors join listdescriptors,
+     * their keys join the rescan window, getnewaddress can hand them out and
+     * the wallet signs for them (P2PKH / P2SH-P2WPKH / P2TR key path). */
+    int t = rpc_wops_type_from_name(type);
+    if (t < 0) { snprintf(msg, sizeof msg, "Unknown address type '%s'", type); return wop_err(ec, em, -5, msg); }
+    int r = rpc_wops_activate_type(t);
+    if (r == 0) return wop_err(ec, em, -4, "Descriptor already exists");
+    if (r < 0)  return wop_err(ec, em, -4, "could not record the new descriptor in the wallet directory");
+    /* Core: {"descs": [<external>, <internal>]} */
+    rj_val* descs = rj_arr();
+    for (int ch = 0; ch <= 1; ch++){
+        rj_val* e = wop_desc_entry_t(w->seed, t, ch);
+        if (e){ rj_val* d = rj_obj_get(e, "desc"); if (d) rj_arr_push(descs, rj_str(d->str)); rj_free(e); }
+    }
+    rj_val* o = rj_obj(); rj_obj_set(o, "descs", descs);
+    *res = o;
+    return 1;
 }
 
 static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
@@ -1314,8 +1330,9 @@ static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
     long ranges[WOP_MAX_DESCS], nexts[WOP_MAX_DESCS];
     int nd = 0;
     if (w && w->seed){
-        for (int ch = 0; ch <= 1 && nd < WOP_MAX_DESCS; ch++){
-            rj_val* e = wop_desc_entry(w->seed, ch);
+        int mask = rpc_wops_active_types();
+        for (int t = 0; t < 4; t++) for (int ch = 0; (mask & (1 << t)) && ch <= 1 && nd < WOP_MAX_DESCS; ch++){
+            rj_val* e = wop_desc_entry_t(w->seed, t, ch);
             if (!e) continue;
             rj_val* d = rj_obj_get(e, "desc");
             if (d && d->str){
@@ -1546,7 +1563,7 @@ void rpc_wops_set_scanner(long (*read_block)(long, unsigned char*, long),
  * per added key keeps the matcher (searched once per output of every
  * transaction in the chain) from growing by an order of magnitude. */
 #define WOP_HDK_WINDOW 100
-#define WOP_KEYSET_CAP (WOP_SCAN_KEYS*2 + WOP_MAX_HDKEYS*WOP_HDK_WINDOW*2)
+#define WOP_KEYSET_CAP (WOP_SCAN_KEYS*2*4 + WOP_MAX_HDKEYS*WOP_HDK_WINDOW*2)   /* x4: one window per output type */
 
 extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
                               const unsigned char* seed, long seedlen,
@@ -1627,16 +1644,23 @@ static int wop_keyset_cached(const rpc_wallet* w, const wscan_key** out){
 int wop_keyset(const rpc_wallet* w, wscan_key* keys, int cap){
     if (!w || !w->seed) return 0;
     int n = 0;
-    for (unsigned i = 0; i < WOP_SCAN_KEYS && n + 2 <= cap; i++){
-        for (int b = 0; b <= 1; b++){
-            unsigned path[5] = {0x80000000u|84u, 0x80000000u, 0x80000000u, i, (unsigned)b};
-            unsigned char k[32], c[32], pub[33];
-            if (bip32_derive_path(k, c, w->seed, 64, path, 5) != 1) continue;
-            scalar_to_pubkey(pub, k);
-            hash160(keys[n].h160, pub, 33);
-            keys[n].keyidx = i; keys[n].branch = (unsigned char)b;
-            keys[n].hdkey = 0;                     /* 0 = the wallet's own seed */
-            n++;
+    /* every ACTIVE output type gets its own window over its own purpose path;
+     * the 20 bytes stored are what the chain scan matches: the key hash for
+     * pkh/wpkh, the script hash for sh(wpkh), the first 20 of Q for tr */
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < WOP_SCAN_KEYS && n + 2 <= cap; i++){
+            for (int b = 0; b <= 1; b++){
+                unsigned path[5]; rpc_wops_type_path(t, i, b, path);
+                unsigned char k[32], c[32], pub[33], spk[34]; unsigned long sl;
+                if (bip32_derive_path(k, c, w->seed, 64, path, 5) != 1) continue;
+                scalar_to_pubkey(pub, k);
+                if (!rpc_wops_type_spk(t, pub, spk, &sl, keys[n].h160)) continue;
+                keys[n].keyidx = i; keys[n].branch = WOT_BRANCH(t, b);
+                keys[n].hdkey = 0;                     /* 0 = the wallet's own seed */
+                n++;
+            }
         }
     }
     /* ...then every key ADDED by addhdkey. They join the same window, so the
@@ -1778,6 +1802,31 @@ static int wop_rec_h160(const wscan_key* keys, int nk, const wscan_rec* r, unsig
 
 /* The wallet's own P2WPKH address for a key, as getnewaddress renders it. */
 extern long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]);
+extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
+/* the address of a key-window entry, by its output type: the stored 20 bytes
+ * are the key hash (wpkh/pkh) or script hash (sh) directly; a tr entry holds
+ * only the first 20 bytes of Q, so it is re-derived from the cached seed */
+static int wop_key_address(const wscan_key* k, char* out, long cap){
+    int t = WOT_TYPE(k->branch); unsigned char spk[34]; unsigned long sl = 0;
+    if (t == WOT_BECH32){ spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, k->h160, 20); sl = 22; }
+    else if (t == WOT_LEGACY){ spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, k->h160, 20); spk[23]=0x88; spk[24]=0xac; sl = 25; }
+    else if (t == WOT_P2SH_SEGWIT){ spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2, k->h160, 20); spk[22]=0x87; sl = 23; }
+    else {
+        if (k->hdkey != 0) return -1;
+        unsigned path[5]; rpc_wops_type_path(t, k->keyidx, WOT_CHAIN(k->branch), path);
+        unsigned char kk[32], cc[32], pub[33], h20[20];
+        if (bip32_derive_path(kk, cc, g_ks_seed, 64, path, 5) != 1) return -1;
+        scalar_to_pubkey(pub, kk);
+        if (!rpc_wops_type_spk(t, pub, spk, &sl, h20)) return -1;
+    }
+    out[0] = 0;
+    return wallet_script_to_address(out, cap, spk, (long)sl) > 0 ? (int)strlen(out) : -1;
+}
+static const wscan_key* wop_rec_key(const wscan_key* keys, int nk, const wscan_rec* r){
+    for (int i = 0; i < nk; i++)
+        if (keys[i].hdkey == r->hdkey && keys[i].keyidx == r->keyidx && keys[i].branch == r->branch) return &keys[i];
+    return NULL;
+}
 
 #define WOP_MAXREC 200000
 static wscan_rec* g_wop_recs;
@@ -1874,8 +1923,21 @@ int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
         c->height = recs[i].height;
         c->is_coinbase = recs[i].is_coinbase ? 1 : 0;
         c->branch = recs[i].branch;
-        memset(c->h160, 0, 20);
-        if (keys) wop_rec_h160(keys, nk, &recs[i], c->h160);
+        memset(c->h160, 0, 20); c->spklen = 0; c->redeemlen = 0;
+        if (keys && wop_rec_h160(keys, nk, &recs[i], c->h160)){
+            int t = WOT_TYPE(c->branch);
+            if (t == WOT_BECH32M){                       /* the window holds 20 of Q's 32 bytes: re-derive */
+                unsigned path[5]; rpc_wops_type_path(t, recs[i].keyidx, WOT_CHAIN(c->branch), path);
+                unsigned char kk[32], cc[32], pub[33], h20[20];
+                if (recs[i].hdkey == 0 && bip32_derive_path(kk, cc, w.seed, 64, path, 5) == 1){ scalar_to_pubkey(pub, kk); rpc_wops_type_spk(t, pub, c->spk, &c->spklen, h20); }
+            } else if (t == WOT_LEGACY){ c->spk[0]=0x76;c->spk[1]=0xa9;c->spk[2]=0x14;memcpy(c->spk+3,c->h160,20);c->spk[23]=0x88;c->spk[24]=0xac; c->spklen=25; }
+            else if (t == WOT_P2SH_SEGWIT){ c->spk[0]=0xa9;c->spk[1]=0x14;memcpy(c->spk+2,c->h160,20);c->spk[22]=0x87; c->spklen=23;
+                /* redeemScript = 0 <hash160(pub)> from the key at this index */
+                unsigned path[5]; rpc_wops_type_path(t, recs[i].keyidx, WOT_CHAIN(c->branch), path);
+                unsigned char kk[32], cc[32], pub[33], kh[20];
+                if (recs[i].hdkey == 0 && bip32_derive_path(kk, cc, w.seed, 64, path, 5) == 1){ scalar_to_pubkey(pub, kk); hash160(kh, pub, 33); c->redeem[0]=0x00; c->redeem[1]=0x14; memcpy(c->redeem+2, kh, 20); c->redeemlen = 22; } }
+            else { c->spk[0]=0x00; c->spk[1]=0x14; memcpy(c->spk+2, c->h160, 20); c->spklen = 22; }
+        }
         m++;
     }
     return m;
@@ -2040,7 +2102,7 @@ static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
                 recs[r].branch == keys[i].branch) seen = 1;
         if (!seen && !include_empty) continue;
         char addr[96];
-        if (wallet_p2wpkh_address(addr, sizeof addr, keys[i].h160) < 0) continue;
+        if (wop_key_address(&keys[i], addr, sizeof addr) < 0) continue;
         rj_val* txids = rj_arr();
         unsigned long long total = wop_received_h160(keys[i].h160, minconf, keys, nk, txids);
         if (!total && !include_empty){ rj_free(txids); continue; }
@@ -2133,7 +2195,7 @@ static int cmd_listaddressgroupings(const rpc_wallet* w, long* ec, const char** 
         }
         if (!seen) continue;
         char addr[96];
-        if (wallet_p2wpkh_address(addr, sizeof addr, keys[i].h160) < 0) continue;
+        if (wop_key_address(&keys[i], addr, sizeof addr) < 0) continue;
         rj_val* e = rj_arr();
         rj_arr_push(e, rj_str(addr));
         { char am[32]; rpc_amounts((long long)bal, am, sizeof am);
@@ -2174,10 +2236,10 @@ static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
     static const char* HEX = "0123456789abcdef";
     for (long r = 0; r < n; r++){
         if ((long)recs[r].height <= since) continue;
-        unsigned char h[20];
-        if (!wop_rec_h160(keys, nk, &recs[r], h)) continue;
+        const wscan_key* rk = wop_rec_key(keys, nk, &recs[r]);
+        if (!rk) continue;
         char addr[96];
-        if (wallet_p2wpkh_address(addr, sizeof addr, h) < 0) continue;
+        if (wop_key_address(rk, addr, sizeof addr) < 0) continue;
         rj_val* e = rj_obj();
         rj_obj_set(e, "address", rj_str(addr));
         rj_obj_set(e, "category", rj_str(recs[r].kind == 0 ? "receive" : "send"));
@@ -3666,7 +3728,7 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "exportwatchonlywallet"))
         return cmd_exportwatchonlywallet(params, w, ec, em, res);
     if (!strcmp(m, "createwalletdescriptor"))
-        return cmd_createwalletdescriptor(params, w, ec, em);
+        return cmd_createwalletdescriptor(params, w, ec, em, res);
     if (!strcmp(m, "importprunedfunds"))
         return cmd_importprunedfunds(params, w, ec, em, res);
     if (!strcmp(m, "removeprunedfunds"))
@@ -3731,4 +3793,94 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "psbtbumpfee")) return cmd_bumpfee_common(params, w, ec, em, res, 1);
 
     return -1;   /* unreachable while WOP_METHODS and this ladder agree */
+}
+
+
+/* ==== output types (2026-09-01) ============================================
+ * See rpc_wallet_ops.h. The active set is a line-per-type file in the wallet
+ * directory (wallet.types); bech32 needs no line. */
+#define WOP_TYPES_REL "wallet.types"
+static int g_wot_mask = -1;
+const char* rpc_wops_type_name(int t){ return t==WOT_LEGACY?"legacy" : t==WOT_P2SH_SEGWIT?"p2sh-segwit" : t==WOT_BECH32M?"bech32m" : "bech32"; }
+int rpc_wops_type_from_name(const char* s){
+    if (!s) return -1;
+    if (!strcmp(s, "bech32")) return WOT_BECH32;
+    if (!strcmp(s, "legacy")) return WOT_LEGACY;
+    if (!strcmp(s, "p2sh-segwit")) return WOT_P2SH_SEGWIT;
+    if (!strcmp(s, "bech32m")) return WOT_BECH32M;
+    return -1;
+}
+int rpc_wops_active_types(void){
+    if (g_wot_mask >= 0) return g_wot_mask;
+    g_wot_mask = 1 << WOT_BECH32;
+    char pb[512]; FILE* f = fopen(wop_path(WOP_TYPES_REL, pb, sizeof pb), "r");
+    if (f){
+        char line[64];
+        while (fgets(line, sizeof line, f)){ line[strcspn(line, "\r\n")] = 0; int t = rpc_wops_type_from_name(line); if (t >= 0) g_wot_mask |= 1 << t; }
+        fclose(f);
+    }
+    return g_wot_mask;
+}
+int rpc_wops_activate_type(int t){
+    if (t < 0 || t > 3) return -1;
+    if (rpc_wops_active_types() & (1 << t)) return 0;
+    char pb[512]; FILE* f = fopen(wop_path(WOP_TYPES_REL, pb, sizeof pb), "a");
+    if (!f) return -1;
+    fprintf(f, "%s\n", rpc_wops_type_name(t)); fclose(f);
+    g_wot_mask |= 1 << t;
+    wop_keyset_invalidate();
+    return 1;
+}
+void rpc_wops_set_active_types_for_test(int mask){ g_wot_mask = mask | 1; wop_keyset_invalidate(); }
+void rpc_wops_type_path(int t, unsigned i, int chain, unsigned idx[5]){
+    unsigned purpose = t==WOT_LEGACY?44u : t==WOT_P2SH_SEGWIT?49u : t==WOT_BECH32M?86u : 84u;
+    idx[0] = 0x80000000u | purpose; idx[1] = 0x80000000u; idx[2] = 0x80000000u; idx[3] = i; idx[4] = (unsigned)chain;
+}
+int rpc_wops_type_spk(int t, const unsigned char pub[33], unsigned char spk[34], unsigned long* spklen, unsigned char h20[20]){
+    unsigned char h[20]; hash160(h, pub, 33);
+    switch (t){
+    case WOT_LEGACY:
+        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, h, 20); spk[23]=0x88; spk[24]=0xac; *spklen = 25; memcpy(h20, h, 20); return 1;
+    case WOT_P2SH_SEGWIT: {
+        unsigned char rd[22] = {0x00, 0x14}; memcpy(rd+2, h, 20); unsigned char sh[20]; hash160(sh, rd, 22);
+        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2, sh, 20); spk[22]=0x87; *spklen = 23; memcpy(h20, sh, 20); return 1; }
+    case WOT_BECH32M: {
+        extern void sha256_full(unsigned char out[32], const void* msg, unsigned long len);
+        extern int  bip32_xonly_tweak_add(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32]);
+        unsigned char th[32]; sha256_full(th, "TapTweak", 8);
+        unsigned char tb[96]; memcpy(tb, th, 32); memcpy(tb+32, th, 32); memcpy(tb+64, pub+1, 32);
+        unsigned char tw[32]; sha256_full(tw, tb, 96);
+        unsigned char q[32]; if (!bip32_xonly_tweak_add(pub+1, tw, q)) return 0;
+        spk[0]=0x51; spk[1]=0x20; memcpy(spk+2, q, 32); *spklen = 34; memcpy(h20, q, 20); return 1; }
+    default:
+        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h, 20); *spklen = 22; memcpy(h20, h, 20); return 1;
+    }
+}
+int rpc_wops_own_coin_spk(const void* wseed, const unsigned char txid_wire[32], unsigned int vout,
+                          unsigned long long* value_out, unsigned char spk[34], unsigned long* spklen,
+                          unsigned char redeem[22], unsigned long* redeemlen){
+    rpc_wallet w; memset(&w, 0, sizeof w); w.seed = (const unsigned char*)wseed;
+    const wscan_key* keys; int nk = wop_keyset_cached(&w, &keys);
+    if (!keys) return 0;
+    wscan_rec* recs; long n = wop_records(&recs);
+    for (long i = 0; i < n; i++){
+        if (recs[i].kind != 0) continue;
+        if (recs[i].vout != vout || memcmp(recs[i].txid, txid_wire, 32)) continue;
+        const wscan_key* k = wop_rec_key(keys, nk, &recs[i]);
+        if (!k) return 0;
+        *value_out = recs[i].value; *redeemlen = 0;
+        int t = WOT_TYPE(k->branch);
+        if (t == WOT_BECH32M || t == WOT_P2SH_SEGWIT){
+            if (k->hdkey != 0) return 0;
+            unsigned path[5]; rpc_wops_type_path(t, k->keyidx, WOT_CHAIN(k->branch), path);
+            unsigned char kk[32], cc[32], pub[33], h20[20];
+            if (bip32_derive_path(kk, cc, w.seed, 64, path, 5) != 1) return 0;
+            scalar_to_pubkey(pub, kk);
+            if (!rpc_wops_type_spk(t, pub, spk, spklen, h20)) return 0;
+            if (t == WOT_P2SH_SEGWIT){ unsigned char kh[20]; hash160(kh, pub, 33); redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2, kh, 20); *redeemlen = 22; }
+        } else if (t == WOT_LEGACY){ spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, k->h160, 20); spk[23]=0x88; spk[24]=0xac; *spklen = 25; }
+        else { spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, k->h160, 20); *spklen = 22; }
+        return 1;
+    }
+    return 0;
 }
