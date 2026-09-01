@@ -119,6 +119,7 @@ int dialer_connect_name(const char* host, int port, int timeout_ms, const char**
     return fd;
 }
 int dialer_net_reachable(int net){
+    if (!g_ready) dialer_init();       /* answer from the configured transports, not from unset flags */
     if (!onlynet_allows(net)) return 0;
     switch (net){
     case BMC_NET_IPV4:  return 1;
