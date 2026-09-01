@@ -2222,34 +2222,82 @@ static void dl_save_good_peers(char peers[][64], int n){
     fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
 }
 
+/* The dial pool, sampled ACROSS NETWORKS. The book is appended in the order
+ * addresses were learned, so "the first 64 dialable entries" was 64 IPv4
+ * peers every time: with 2,580 onion and 409 I2P entries in the book the
+ * node never dialled either (2026-08-31). Core's addrman picks at random
+ * and diversifies by network; this does the same in two passes: a reservoir
+ * sample per reachable network, then a layout that gives every reachable
+ * network a quota and interleaves them so the rotation (mux_next_peer,
+ * feelers, top-ups all walk this pool in order) reaches an onion or I2P
+ * peer within a few dials -- while the FIRST slots stay mostly clearnet,
+ * because the boot dials are sequential and an anonymity-network circuit
+ * takes seconds to build. */
+static unsigned long long dl_pool_rng_state;
+void dl_pool_test_seed(unsigned long long s){ dl_pool_rng_state = s ? s : 1; }
+static unsigned long long dl_pool_rng(void){
+    if(!dl_pool_rng_state){
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        dl_pool_rng_state = ((unsigned long long)ts.tv_sec << 32) ^ (unsigned long long)ts.tv_nsec ^ ((unsigned long long)getpid() << 17) ^ 0x9E3779B97F4A7C15ULL;
+    }
+    unsigned long long x = dl_pool_rng_state; x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return dl_pool_rng_state = x;
+}
+#define DL_POOL_NNET 5
+#define DL_POOL_RESERVOIR 128
+static int dl_pool_net_slot(int net){
+    switch(net){ case BMC_NET_IPV4: return 0; case BMC_NET_IPV6: return 1; case BMC_NET_TORV3: return 2;
+                 case BMC_NET_I2P: return 3; case BMC_NET_CJDNS: return 4; default: return -1; }
+}
 static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
     (void)ab;
-    /* Walk the whole version-2 book and keep the addresses this node can
-     * DIAL today. Until the SOCKS5/SAM/IPv6 transports land only IPv4 is
-     * dialable; a non-IPv4 entry is kept in the book (and served to peers)
-     * but not put in the pool. bmc_addr_is_routable already excludes the
-     * special ranges the old loop filtered by hand. */
     ab2_t* b = addr_book(); if(!b) return 0;
-    long cnt = ab2_count(b); int got = 0;
-    for(long i=0;i<cnt && got<nitems;i++){
+    long cnt = ab2_count(b);
+    /* pass 1: a uniform random sample (reservoir) of dialable entries per network */
+    static long res[DL_POOL_NNET][DL_POOL_RESERVOIR]; long seen[DL_POOL_NNET] = {0}, have[DL_POOL_NNET] = {0};
+    for(long i = 0; i < cnt; i++){
         ab2_rec_t r; if(!ab2_get(b, i, &r)) continue;
-        /* every network this node can actually reach right now: IPv4 always,
-         * onion/i2p when their transports are configured (daemon/dialer.c).
-         * An address we cannot dial stays in the book and is still served to
-         * peers -- it just never enters the pool. */
-        if(!dialer_net_reachable(r.a.net)) continue;
+        int k = dl_pool_net_slot(r.a.net); if(k < 0) continue;
+        if(!dialer_net_reachable(r.a.net)) continue;      /* stays in the book, never in the pool */
         if(!bmc_addr_is_routable(&r.a)) continue;
-        /* the caller's slots are 64 bytes; an IPv4 needs 16. Take the string
-         * only if it was actually produced -- a slot left empty would be
-         * dialled as "" and, worse, still counted, suppressing the seed
-         * fallback (2026-08-28 review, caught before deploy). */
-        /* host:port ([v6]:port for IPv6/CJDNS): the book records the peer's
-         * real port and the chain default is only a fallback for names.
-         * Dropping it here sent every dial to the default port -- which is
-         * right for most mainnet peers and wrong for everyone else. */
-        if(bmc_addr_to_string_port(out[got], DL_POOL_SLOT, &r.a) <= 0) continue;
-        got++;
+        long n = seen[k]++;
+        if(have[k] < DL_POOL_RESERVOIR){ res[k][have[k]++] = i; }
+        else { long j = (long)(dl_pool_rng() % (unsigned long long)(n + 1)); if(j < DL_POOL_RESERVOIR) res[k][j] = i; }
     }
+    /* pass 2: quotas -- a floor for every reachable network with anything in
+     * the book, the rest clearnet. Onion gets the biggest share: it is the
+     * network with the most peers and the one that costs nothing to run. */
+    long quota[DL_POOL_NNET] = {0};
+    long want[DL_POOL_NNET] = { 0, nitems / 8, nitems * 3 / 16, nitems / 10, nitems / 20 };   /* ipv6 8, onion 12, i2p 6, cjdns 3 of 64 */
+    long taken = 0;
+    for(int k = 1; k < DL_POOL_NNET; k++){ quota[k] = want[k] < have[k] ? want[k] : have[k]; taken += quota[k]; }
+    quota[0] = have[0] < nitems - taken ? have[0] : nitems - taken;
+    /* if clearnet cannot fill its share, let the others grow into the room */
+    for(int k = 1; k < DL_POOL_NNET && quota[0] + taken < nitems; k++){
+        long room = nitems - quota[0] - taken; long extra = have[k] - quota[k];
+        if(extra > room) extra = room; if(extra > 0){ quota[k] += extra; taken += extra; }
+    }
+    /* pass 3: layout. Slots 0..7 (the boot dials) are clearnet except one
+     * onion (slot 3) and one ipv6 (slot 6) when available; after that the
+     * networks are interleaved so every 4th entry is an anonymity peer. */
+    long used[DL_POOL_NNET] = {0}; int got = 0;
+    #define POOL_TAKE(k) do{ if(used[k] < quota[k]){ ab2_rec_t r; if(ab2_get(b, res[k][used[k]++], &r) && \
+        bmc_addr_to_string_port(out[got], DL_POOL_SLOT, &r.a) > 0) got++; } }while(0)
+    static const int early[8] = { 0, 0, 0, 2, 0, 0, 1, 0 };
+    static const int cycle[8] = { 0, 2, 0, 1, 0, 3, 0, 4 };
+    for(int s = 0; got < nitems && s < 8; s++){
+        int k = early[s]; if(used[k] >= quota[k]) k = 0;
+        if(used[k] >= quota[k]) break;
+        POOL_TAKE(k);
+    }
+    for(int guard = 0; got < nitems && guard < nitems * 8; guard++){
+        int k = cycle[guard % 8];
+        if(used[k] >= quota[k]){ int any = 0; for(int t = 0; t < DL_POOL_NNET; t++) if(used[t] < quota[t]){ k = t; any = 1; break; } if(!any) break; }
+        POOL_TAKE(k);
+    }
+    #undef POOL_TAKE
+    fprintf(stderr,"[pool] %d peer(s) sampled from the book: ipv4 %ld, ipv6 %ld, onion %ld, i2p %ld, cjdns %ld (book has %ld/%ld/%ld/%ld/%ld dialable)\n",
+            got, used[0], used[1], used[2], used[3], used[4], seen[0], seen[1], seen[2], seen[3], seen[4]);
     return got;
 }
 

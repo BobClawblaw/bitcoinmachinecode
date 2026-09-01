@@ -181,7 +181,8 @@ v2transport=1              # BIP324 encrypted transport, default on
   `<chaindir>/i2p_private_key`; boot line `[dial] i2p session up via SAM
   <ip:port>, our address <b32>.b32.i2p`. I2P is outbound only; inbound I2P
   streams are not accepted.
-- **CJDNS.** Needs a running `cjdroute` and IPv6 on the host; boot line
+- **CJDNS.** Needs a running `cjdroute` (a systemd unit in the reference
+  deployment; the node's unit is ordered after it) and IPv6 on the host; boot line
   `[dial] cjdns reachable (fc00::/8 over IPv6)`. Inbound cjdns peers arrive
   on the IPv6 listener. Without IPv6: `[dial] no IPv6 on this host: ipv6 and
   cjdns peers are unreachable`.
