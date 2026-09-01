@@ -21,6 +21,7 @@
 
 /* ---- extern wallet_core command layer (from asm/wallet_core.c) ---- */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
+#include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
@@ -240,13 +241,31 @@ static const char* spk_type(int t) {
 }
 
 /* ---- getnewaddress / getrawchangeaddress ---- */
-static int cmd_getnewaddr(const char* method, const rpc_wallet* w, rj_val** result) {
+/* getnewaddress ( "label" "address_type" ) / getrawchangeaddress ( "address_type" ):
+ * bech32 by default; legacy / p2sh-segwit / bech32m once createwalletdescriptor
+ * activated them (Core: an inactive type is "No <type> addresses available"). */
+static int cmd_getnewaddr(const char* method, const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
     if (!w->seed) { return 0; }
-    char addr[96];
-    long n = !strcmp(method, "getrawchangeaddress")
-        ? wallet_derive_p2wpkh_change(addr, 96, w->seed, 0)
-        : wallet_derive_p2wpkh_address(addr, 96, w->seed, 0);
-    if (n < 0) return 0;
+    int is_change = !strcmp(method, "getrawchangeaddress");
+    const char* tname = NULL;
+    if (params && params->typ == RJ_ARR){
+        int ai = is_change ? 0 : 1;
+        if ((int)params->nitems > ai && params->items[ai]->typ == RJ_STR && params->items[ai]->str[0]) tname = params->items[ai]->str;
+    }
+    int t = WOT_BECH32;
+    static char msg[160];
+    if (tname){
+        t = rpc_wops_type_from_name(tname);
+        if (t < 0){ snprintf(msg, sizeof msg, "Unknown address type '%s'", tname); *ec = -5; *em = msg; return 0; }
+        if (!(rpc_wops_active_types() & (1 << t))){ snprintf(msg, sizeof msg, "Error: No %s addresses available for this wallet", tname); *ec = -4; *em = msg; return 0; }
+    }
+    unsigned idx[5]; rpc_wops_type_path(t, 0, is_change, idx);
+    unsigned char k[32], c[32], pub[33], spk[34], h20[20]; unsigned long sl;
+    if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) return 0;
+    scalar_to_pubkey(pub, k);
+    if (!rpc_wops_type_spk(t, pub, spk, &sl, h20)) return 0;
+    char addr[96]; addr[0] = 0;
+    if (wallet_script_to_address(addr, sizeof addr, spk, (long)sl) <= 0 || !addr[0]) return 0;
     *result = rj_str(addr);
     return 1;
 }
@@ -432,13 +451,14 @@ static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, 
         }
         long tip = rpc_chain_tip_height();
         for (int i = 0; i < n; i++) {
-            unsigned char spk[22]; spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, coins[i].h160, 20);
+            unsigned char spk[34]; unsigned long spkl = coins[i].spklen;
+            if (spkl) memcpy(spk, coins[i].spk, spkl); else { spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, coins[i].h160, 20); spkl = 22; }
             char txidhex[65]; unsigned char disp[32];
             for (int k = 0; k < 32; k++) disp[k] = coins[i].txid[31-k];
             bin_to_hex(txidhex, disp, 32);
-            char scripthex[70]; bin_to_hex(scripthex, spk, 22);
+            char scripthex[70]; bin_to_hex(scripthex, spk, spkl);
             char addr[96]; addr[0] = 0;
-            wallet_script_to_address(addr, sizeof addr, spk, 22);
+            wallet_script_to_address(addr, sizeof addr, spk, (long)spkl);
             char amt[24]; rpc_amounts((long long)coins[i].value, amt, sizeof amt);
             int confs = tip >= 0 ? (int)(tip - (long)coins[i].height + 1) : 0;
             int mature = wallet_coin_mature(&coins[i], tip);
@@ -1480,9 +1500,14 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     if (!hex_to_bytes(tx,txhex,thl)){ *ec=-22; *em="TX decode failed"; return 0; }
     /* --- keys --- */
     const rj_val* pk=params->items[1];
-    int nk=(int)pk->nitems; if (nk>64) nk=64;
-    unsigned char kpriv[64][32]; unsigned char kpub[64][33]; unsigned char kh[64][20]; int ncomp[64]; int nkeys=0;
-    for (int i=0;i<(int)pk->nitems && nkeys<64;i++){
+    /* 512 keys: the wallet signer hands over its whole window for every
+     * active output type (4 types x 2 chains x SRWW_WINDOW); the old cap of
+     * 64 silently dropped the 49'/86' keys. Static: the RPC thread's stack
+     * is small (see project_tls_thread_stacks). */
+    #define SRW_MAX_KEYS 512
+    int nk=(int)pk->nitems; if (nk>SRW_MAX_KEYS) nk=SRW_MAX_KEYS;
+    static unsigned char kpriv[SRW_MAX_KEYS][32]; static unsigned char kpub[SRW_MAX_KEYS][33]; static unsigned char kh[SRW_MAX_KEYS][20]; static int ncomp[SRW_MAX_KEYS]; int nkeys=0;
+    for (int i=0;i<(int)pk->nitems && nkeys<SRW_MAX_KEYS;i++){
         if (pk->items[i]->typ!=RJ_STR) continue;
         int comp=1; if (!srw_wif(pk->items[i]->str,kpriv[nkeys],&comp)){ *ec=-8; *em="Invalid private key"; return 0; }
         scalar_to_pubkey(kpub[nkeys],kpriv[nkeys]); wallet_key_h160(kh[nkeys],kpriv[nkeys]); ncomp[nkeys]=comp; nkeys++;
@@ -1980,15 +2005,19 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
      * sighashtype), so the caller's arg 1 is prevtxs and arg 2 is the
      * sighash type; they shift by one here. */
     rj_val* keys = rj_arr();
-    for (unsigned i = 0; i < SRWW_WINDOW; i++){
-        for (int chain = 0; chain <= 1; chain++){
-            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
-            unsigned char k[32], c[32]; char wif[64];
-            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
-            srww_wif(wif, k);
-            rj_arr_push(keys, rj_str(wif));
+    { int mask = rpc_wops_active_types();
+      for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < SRWW_WINDOW; i++){
+            for (int chain = 0; chain <= 1; chain++){
+                unsigned idx[5]; rpc_wops_type_path(t, i, chain, idx);
+                unsigned char k[32], c[32]; char wif[64];
+                if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+                srww_wif(wif, k);
+                rj_arr_push(keys, rj_str(wif));
+            }
         }
-    }
+      } }
     /* ...and every key addhdkey contributed. A wallet that WATCHES an added
      * key's outputs (they are in the rescan window) but cannot sign for them
      * would report coins as spendable and then fail at signing -- worse than
@@ -2018,15 +2047,16 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
                 unsigned long tl = (unsigned long)(hl2/2), q = 4, cc2;
                 if (tl > 6 && txb[4] == 0x00 && txb[5] == 0x01) q = 6;
                 unsigned long ni = srw_varint(txb + q, &cc2); q += cc2;
-                extern int rpc_wops_own_coin(const void*, const unsigned char*, unsigned int,
-                                             unsigned long long*, unsigned char*);
+                extern int rpc_wops_own_coin_spk(const void*, const unsigned char*, unsigned int,
+                                                 unsigned long long*, unsigned char*, unsigned long*,
+                                                 unsigned char*, unsigned long*);
                 for (unsigned long i = 0; i < ni && ni <= 10000; i++){
                     if (q + 36 > tl) break;
                     const unsigned char* op = txb + q;
                     unsigned int vo = (unsigned int)op[32] | ((unsigned int)op[33]<<8) |
                                       ((unsigned int)op[34]<<16) | ((unsigned int)op[35]<<24);
-                    unsigned long long val; unsigned char h160[20];
-                    if (rpc_wops_own_coin(w->seed, op, vo, &val, h160)){
+                    unsigned long long val; unsigned char cspk[34], crd[22]; unsigned long cspkl = 0, crdl = 0;
+                    if (rpc_wops_own_coin_spk(w->seed, op, vo, &val, cspk, &cspkl, crd, &crdl)){
                         /* skip if the caller already supplied this outpoint */
                         char tid[65];
                         for (int k = 0; k < 32; k++){
@@ -2046,10 +2076,9 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
                             rj_val* e = rj_obj();
                             rj_obj_set(e, "txid", rj_str(tid));
                             rj_obj_set(e, "vout", rj_numf("%u", vo));
-                            { char spkh[48]; unsigned char spk[22];
-                              spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h160, 20);
-                              bin_to_hex(spkh, spk, 22);
+                            { char spkh[72]; bin_to_hex(spkh, cspk, cspkl);
                               rj_obj_set(e, "scriptPubKey", rj_str(spkh)); }
+                            if (crdl){ char rdh[48]; bin_to_hex(rdh, crd, crdl); rj_obj_set(e, "redeemScript", rj_str(rdh)); }
                             { char am[32]; rpc_amounts((long long)val, am, sizeof am);
                               rj_obj_set(e, "amount", rj_numf("%s", am)); }
                             rj_arr_push(pv, e);
@@ -2084,15 +2113,17 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
  * not-ours input. */
 
 static int simraw_is_ours_spk(const rpc_wallet* w, const unsigned char* spk, unsigned long spklen){
-    if (spklen != 22 || spk[0] != 0x00 || spk[1] != 0x14) return 0;   /* P2WPKH only */
-    for (unsigned i = 0; i < SRWW_WINDOW; i++){
-        for (int chain = 0; chain <= 1; chain++){
-            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
-            unsigned char k[32], c[32], pub[33], h[20];
-            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
-            scalar_to_pubkey(pub, k);
-            hash160(h, pub, 33);
-            if (!memcmp(h, spk + 2, 20)) return 1;
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < SRWW_WINDOW; i++){
+            for (int chain = 0; chain <= 1; chain++){
+                unsigned idx[5]; rpc_wops_type_path(t, i, chain, idx);
+                unsigned char k[32], c[32], pub[33], ospk[34], h20[20]; unsigned long ol;
+                if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+                scalar_to_pubkey(pub, k);
+                if (rpc_wops_type_spk(t, pub, ospk, &ol, h20) && ol == spklen && !memcmp(ospk, spk, ol)) return 1;
+            }
         }
     }
     return 0;
@@ -3179,7 +3210,7 @@ int rpc_dispatch(const char* method, const rj_val* params,
             }
             *err_code = 32603; *err_msg = "wallet seed not configured"; return 0;
         }
-        return cmd_getnewaddr(method, w, result);
+        return cmd_getnewaddr(method, params, w, err_code, err_msg, result);
     }
     if (!strcmp(method, "validateaddress") || !strcmp(method, "getaddressinfo"))
         return cmd_validate(method, params, err_code, err_msg, result);
