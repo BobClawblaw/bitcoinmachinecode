@@ -666,9 +666,10 @@ actual outpoint.
 - Change below 294 sat (P2WPKH dust) is dropped into the fee rather than
   created — an output that costs more to spend than it is worth. Change goes
   to `m/84'/0'/0'/0/1`, exactly what `getrawchangeaddress` hands out.
-- The fee rate comes from the node's own `estimatesmartfee` (the EMA over
-  accepted transactions), floored at the 1000 sat/kvB minimum relay rate
-  when the estimator has no data — a floor, not an invented confidence.
+- The fee rate comes from the node's own `estimatesmartfee` (since
+  2026-09-01 Core's block-policy estimator, not an EMA), floored at the
+  1000 sat/kvB minimum relay rate when the estimator has no data — a floor,
+  not an invented confidence.
 - **Locked outputs are excluded from selection.** The test locks the
   wallet's only coin and asserts funding then fails rather than spending a
   coin the operator reserved.

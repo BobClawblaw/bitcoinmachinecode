@@ -93,6 +93,39 @@ void tx_accept_set_resolver(txacc_resolver_t fn){ g_resolver = fn; }
  * maturity cannot be judged without a tip. Fail closed, loudly rare. */
 static long g_next_height = 0;
 void tx_accept_set_tip(long tip){ g_next_height = tip + 1; }
+/* Fee estimation's "chainstate is current" (Core IsCurrentForFeeEstimation):
+ * the tip's block time within MAX_FEE_ESTIMATION_TIP_AGE (3 h) and the tip
+ * no more than one block behind the best header. The worker feeds the tip
+ * time from each connected block; -1 for best_header means "unknown"
+ * (the tip-age test alone then decides). */
+static long g_tip_time = 0, g_best_header = -1;
+void tx_accept_set_tip_time(long tip_time, long best_header){ g_tip_time = tip_time; g_best_header = best_header; }
+int tx_accept_chainstate_current(void){
+    long tip = g_next_height - 1;
+    if (g_tip_time <= 0) return 0;
+    if (g_tip_time < (long)time(NULL) - 3L * 3600L) return 0;
+    if (g_best_header >= 0 && tip < g_best_header - 1) return 0;
+    return 1;
+}
+/* fee-estimator hooks -- WEAK no-ops here; daemon/fee_hooks.c's strong
+ * definitions win in the daemon (see that file). */
+__attribute__((weak)) void fest_on_accept(const unsigned char* txid, unsigned long long fee, unsigned long long vsize, long height, int valid){ (void)txid; (void)fee; (void)vsize; (void)height; (void)valid; }
+__attribute__((weak)) void fest_on_confirmed(const unsigned char* txid){ (void)txid; }
+__attribute__((weak)) void fest_on_block_begin(long height){ (void)height; }
+__attribute__((weak)) void fest_on_block_end(void){}
+__attribute__((weak)) void fest_shutdown_flush(void){}   /* main.c calls it at worker shutdown */
+static void* g_pol_state_for_fees;   /* set once the policy state exists (tx_policy_init) */
+static void txacc_fee_note(const unsigned char* txid){
+    extern long mpool_policy_entry(void*, const unsigned char*, unsigned long long*, unsigned long long*);
+    extern long mpool_policy_n_parents(void*, const unsigned char*);
+    extern int  mpol_in_package_context(void);
+    unsigned long long fee = 0, vsize = 0;
+    if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1) return;
+    int valid = tx_accept_chainstate_current()
+             && mpool_policy_n_parents(g_pol_state_for_fees, txid) == 0
+             && !mpol_in_package_context();
+    fest_on_accept(txid, fee, vsize, g_next_height - 1, valid);
+}
 
 /* tx_dispatch_init(void) -> 1 ok / 0 failed. Called once per connection,
  * at node_serve_loop entry. A failure here disables tx validation for this
@@ -699,6 +732,7 @@ int tx_policy_init(void){
     unsigned dscb = g_cfg.limitdescendantsize_kvb>0? (unsigned)(g_cfg.limitdescendantsize_kvb*1000): TXACC_MAX_DESC_BYTES;
     unsigned rbf  = g_cfg.mempoolfullrbf ? 1u : 0u;
     mpool_policy_init(g_pol, relay, anc, ancb, dsc, dscb, rbf);
+    g_pol_state_for_fees = g_pol_state;
     { extern void mpool_policy_set_confirmed_hook(void (*)(const unsigned char*));
       mpool_policy_set_confirmed_hook(txacc_note_confirmed); }
     { extern void mpool_policy_set_incremental(void*, unsigned long long);
@@ -779,6 +813,7 @@ static u8 g_recent_conf[TXACC_RECENT_CONF][8];
 static unsigned g_recent_conf_w;
 static void txacc_note_confirmed(const unsigned char* txid){
     memcpy(g_recent_conf[g_recent_conf_w % TXACC_RECENT_CONF], txid, 8); g_recent_conf_w++;
+    fest_on_confirmed(txid);                       /* fee estimation: confirmed in the block being connected */
 }
 static int txacc_recently_confirmed(const u8* txid){
     unsigned n = g_recent_conf_w < TXACC_RECENT_CONF ? g_recent_conf_w : TXACC_RECENT_CONF;
@@ -826,6 +861,7 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     }
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
         g_alog.rej_policy++;
@@ -892,6 +928,7 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
         g_alog.rej_policy++;
@@ -941,6 +978,7 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock();
     long padd = mpool_policy_add(g_pol, g_pol_state, mp_area, tx, txlen, txid, placeholder_utxo);
+    if (padd == 1) txacc_fee_note(txid);           /* fee estimation, under the same lock */
     mp_unlock();
     if (padd != 1){
         const char* r = mpool_policy_reason(g_pol);
@@ -1009,14 +1047,23 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
  * decay gate), called from main.c's new-block choke point with the raw
  * block bytes. Holds the cross-process pool lock. No-op until the shared
  * pool + policy state exist. */
-long tx_accept_block_connect(void* mp_area, const unsigned char* block,
-                             unsigned long blen){
+long tx_accept_block_connect_h(void* mp_area, const unsigned char* block,
+                               unsigned long blen, long height){
     extern long mpool_policy_block_connect(void*, void*, const unsigned char*, unsigned long);
     if (!g_pol_ready || !g_pol_state || !mp_area) return 0;
     mp_lock();
+    /* fee estimation: roll the block counters first; the policy's confirmed
+     * hook then books each mined tx (txacc_note_confirmed), and the forget
+     * callback books conflicts as "left unconfirmed" */
+    fest_on_block_begin(height);
     long r = mpool_policy_block_connect(g_pol_state, mp_area, block, blen);
+    fest_on_block_end();
     mp_unlock();
     return r;
+}
+long tx_accept_block_connect(void* mp_area, const unsigned char* block,
+                             unsigned long blen){
+    return tx_accept_block_connect_h(mp_area, block, blen, g_next_height);
 }
 
 /* serve_idx_topup: WEAK default. bitcoin_serve.asm calls this at the top of
