@@ -14,6 +14,7 @@
 #include "daemon/asmap.h"   /* mapped_as, when -asmap is loaded */
 #include "mempool_entry.h"
 #include "version_gen.h"
+#include <signal.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
@@ -1499,12 +1500,21 @@ typedef struct {
      * its parent fails on the first pass and succeeds once the parent is in. */
     unsigned char** retry; unsigned long* retry_len; long nretry, retry_cap;
     int collecting;
+    int aborted;            /* shutdown requested, or the worker stopped answering */
+    int consec_timeouts;    /* entries in a row that drew no ack at all */
+    const char* abort_why;
 } mpd_import_ctx;
+/* The parent's shutdown flag (main.c installs it): a reload that waits 90 s
+ * per entry for a worker that is gone would otherwise hold SIGTERM off for
+ * hours -- the 2026-09-01 01:07 "deactivating" stall. */
+static const volatile sig_atomic_t* g_mpd_shutdown_flag;
+void rpc_node_set_shutdown_flag(const volatile sig_atomic_t* f){ g_mpd_shutdown_flag = f; }
 static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
                           long long t, long long d){
     (void)t; (void)d;   /* entry time and fee delta are not restorable here --
                          * see the divergence note at the call site */
     mpd_import_ctx* c = (mpd_import_ctx*)vctx;
+    { mpd_import_ctx* c0 = (mpd_import_ctx*)vctx; if (c0->aborted){ c0->rejected++; return 0; } }   /* aborted: drain the rest without waiting */
     if (!g_status_rw) return -1;
     node_status_t* st = g_status_rw;
     pthread_mutex_lock(&g_submit_lock);
@@ -1517,12 +1527,15 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     unsigned long long myseq = st->tx_submit_seq + 1;
     __sync_synchronize();
     st->tx_submit_seq = myseq;
-    int waited = 0, ok = 0;
+    int waited = 0, ok = 0, acked = 0;
     while (waited < SRT_WAIT_MS*1000){
-        if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); break; }
+        if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); acked = 1; break; }
+        if (g_mpd_shutdown_flag && *g_mpd_shutdown_flag){ c->aborted = 1; c->abort_why = "shutdown requested"; break; }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SRT_POLL_US;
     }
+    if (acked) c->consec_timeouts = 0;
+    else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
     int missing = !ok && strstr((const char*)st->tx_submit_reason, "missing") != NULL;
     pthread_mutex_unlock(&g_submit_lock);
     if (ok) c->accepted++;

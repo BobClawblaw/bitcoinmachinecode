@@ -1504,9 +1504,11 @@ static unsigned long wsl_crc(const char* s, long n){
  * torn lines are skipped exactly as the tool-side reader philosophy demands
  * -- a torn record is absent data, not data. Returns records found. */
 static int wsl_read(wsl_rec_t* recs, int cap){
-    const char* candidates[2] = { "bmcwallet.dat.txlog", "data/bmcwallet.dat.txlog" };
+    extern const char* rpc_wops_walletdir(void);
+    char wdl[600]; snprintf(wdl, sizeof wdl, "%s/bmcwallet.dat.txlog", rpc_wops_walletdir()[0] ? rpc_wops_walletdir() : ".");
+    const char* candidates[3] = { wdl, "bmcwallet.dat.txlog", "data/bmcwallet.dat.txlog" };
     FILE* f = 0;
-    for (int i=0;i<2 && !f;i++) f = fopen(candidates[i], "r");
+    for (int i=0;i<3 && !f;i++) f = fopen(candidates[i], "r");
     if (!f) return 0;
     char line[600]; int n = 0;
     while (n < cap && fgets(line, sizeof line, f)){

@@ -93,11 +93,11 @@ int main(void){
       else { printf("FAIL: node would have zero inbound slots (outbound %d, max %d)\n", outb, g_cfg.max_connections); failures++; } }
 
     /* 5b. Core knobs added for config parity */
-    wr("bmc_t5.conf", "signet=1\nbytespersigop=50\ndisablewallet=1\ndebuglogfile=/tmp/bmc-test.log\n");
+    wr("bmc_t5.conf", "signet=1\nbytespersigop=50\ndisablewallet=1\ndebuglogfile=/tmp/bmc-test.log\nwalletdir=/tmp/bmc-wallets\n");
     node_config_load("bmc_t5.conf");
     if (!strcmp(g_cfg.chain,"signet") && g_cfg.bytespersigop==50 && g_cfg.disablewallet==1 &&
-        !strcmp(g_cfg.debuglogfile,"/tmp/bmc-test.log"))
-        printf("PASS: signet=1 / bytespersigop / disablewallet / debuglogfile applied\n");
+        !strcmp(g_cfg.debuglogfile,"/tmp/bmc-test.log") && !strcmp(g_cfg.walletdir,"/tmp/bmc-wallets"))
+        printf("PASS: signet=1 / bytespersigop / disablewallet / debuglogfile / walletdir applied\n");
     else { printf("FAIL: parity knobs (chain=%s bps=%d dw=%d log=%s)\n", g_cfg.chain, g_cfg.bytespersigop,
                   g_cfg.disablewallet, g_cfg.debuglogfile); failures++; }
     wr("bmc_t6.conf", "bytespersigop=0\n");
