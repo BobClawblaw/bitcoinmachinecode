@@ -179,8 +179,12 @@ v2transport=1              # BIP324 encrypted transport, default on
   onion needs only `onion=`/`proxy=`.
 - **I2P.** `i2psam=` opens a SAM session with a destination persisted in
   `<chaindir>/i2p_private_key`; boot line `[dial] i2p session up via SAM
-  <ip:port>, our address <b32>.b32.i2p`. I2P is outbound only; inbound I2P
-  streams are not accepted.
+  <ip:port>, our address <b32>.b32.i2p`. With `listen=1` an acceptor thread
+  sits in SAM `STREAM ACCEPT` on that session and inbound I2P streams reach the
+  serve loop like any other inbound peer; boot line `[i2p] accepting inbound
+  streams on <b32>.b32.i2p`, per-peer line `[serve] inbound over i2p from
+  <b32>`. `i2pacceptincoming=0` turns that off. A router that reports itself
+  firewalled cannot publish a leaseset, so no inbound will arrive until it can.
 - **CJDNS.** Needs a running `cjdroute` (a systemd unit in the reference
   deployment; the node's unit is ordered after it) and IPv6 on the host; boot line
   `[dial] cjdns reachable (fc00::/8 over IPv6)`. Inbound cjdns peers arrive
