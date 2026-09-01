@@ -872,6 +872,75 @@ static int serve_loop(int fd, int lfd){
 #define MAX_BLOCK_RELAY_ONLY       8         /* ceiling; g_cfg picks the live count */
 #define CFG_INBOUND_LIMIT() \
     (g_cfg.max_connections - g_cfg.max_outbound - g_cfg.max_block_relay_only - g_cfg.max_feeler)
+
+/* -shrinkdebugfile (2026-09-01): Core truncates a debug.log over 10 MB to
+ * its last 200 KB at start-up. This node's own leveled log is g_logpath;
+ * the stderr stream systemd appends is that unit's file, not ours. */
+static void log_shrink(const char* path){
+    struct stat sb;
+    if (!path || !*path || !strcmp(path, "/dev/null") || stat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) return;
+    if (sb.st_size <= 10L * 1000 * 1000) return;
+    FILE* f = fopen(path, "rb"); if (!f) return;
+    static char tail[200000];
+    fseek(f, -(long)sizeof tail, SEEK_END);
+    size_t n = fread(tail, 1, sizeof tail, f); fclose(f);
+    f = fopen(path, "wb"); if (!f) return;
+    fwrite(tail, 1, n, f); fclose(f);
+    fprintf(stderr, "[boot] shrinkdebugfile: %s was %ld bytes -- kept the last %zu\n", path, (long)sb.st_size, n);
+}
+/* -walletnotify (2026-09-01): run the command with %s = txid for every
+ * transaction that concerns the wallet -- on mempool acceptance (txsub and
+ * the relay legs) and again when it confirms (walletnotify_block). */
+static long wn_varint(const unsigned char* p, long n, unsigned long long* v){
+    if (n < 1) return 0;
+    if (p[0] < 0xfd){ *v = p[0]; return 1; }
+    if (p[0] == 0xfd){ if (n < 3) return 0; *v = p[1] | (p[2] << 8); return 3; }
+    if (p[0] == 0xfe){ if (n < 5) return 0; *v = p[1] | (p[2]<<8) | ((unsigned long long)p[3]<<16) | ((unsigned long long)p[4]<<24); return 5; }
+    if (n < 9) return 0; *v = 0; for (int i = 0; i < 8; i++) *v |= (unsigned long long)p[1+i] << (8*i); return 9;
+}
+/* serialized length of the tx at p (segwit-aware); 0 if malformed */
+static long wn_tx_len(const unsigned char* p, long n){
+    long q = 4; unsigned long long v; long k; int segwit = 0;
+    if (q + 2 <= n && p[q] == 0x00 && p[q+1] == 0x01){ segwit = 1; q += 2; }
+    if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k; unsigned long long nin = v;
+    for (unsigned long long i = 0; i < nin; i++){
+        q += 36; if (q > n) return 0;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k + (long)v + 4; if (q > n) return 0;
+    }
+    if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k; unsigned long long nout = v;
+    for (unsigned long long i = 0; i < nout; i++){
+        q += 8; if (q > n) return 0;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k + (long)v; if (q > n) return 0;
+    }
+    if (segwit) for (unsigned long long i = 0; i < nin; i++){
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k;
+        for (unsigned long long j = 0; j < v; j++){ unsigned long long l;
+            if (!(k = wn_varint(p + q, n - q, &l))) return 0; q += k + (long)l; if (q > n) return 0; }
+    }
+    q += 4;
+    return q <= n ? q : 0;
+}
+static void walletnotify_tx(const unsigned char* tx, long len){
+    if (!g_cfg.walletnotify[0] || !g_rpc_wallet.seed || len < 10) return;
+    if (!rpc_wops_tx_touches_wallet(&g_rpc_wallet, tx, (unsigned long)len)) return;
+    extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
+    unsigned char id[32]; unsigned char* scratch = malloc((size_t)len + 64); if (!scratch) return;
+    tx_txid(id, tx, (unsigned long)len, scratch, (unsigned long)len + 64); free(scratch);
+    char hx[65]; for (int b = 0; b < 32; b++) snprintf(hx + b*2, 3, "%02x", id[31-b]);
+    notify_run(g_cfg.walletnotify, hx, "walletnotify");
+}
+static void walletnotify_block(const unsigned char* blk, long blen){
+    if (blen < 81) return;
+    unsigned long long ntx; long p = 80, k = wn_varint(blk + p, blen - p, &ntx);
+    if (!k) return; p += k;
+    for (unsigned long long i = 0; i < ntx && p < blen; i++){
+        long tl = wn_tx_len(blk + p, blen - p);
+        if (tl <= 0) return;
+        walletnotify_tx(blk + p, tl);
+        p += tl;
+    }
+}
+static void txr_walletnotify_hook(const unsigned char* txid, const unsigned char* tx, unsigned long len){ (void)txid; walletnotify_tx(tx, (long)len); }
 /* BIP324 v2 transport. Off means the node behaves exactly as it did before
  * this existed: p2p_read/p2p_write never register an fd, so their dispatch
  * falls straight through to v1. */
@@ -3755,6 +3824,7 @@ static int txsub_package(char* msg, unsigned long mcap){
                                         mux_out_fd, mux_n_out, r, sizeof r, &relayed);
         if (rc == 1){
             st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            walletnotify_tx(txs[i], (long)lens[i]);
             /* whatever THIS member displaced by RBF, folded into the
              * package-wide union Core reports at the top level. Read
              * immediately: the next member's accept overwrites it. */
@@ -5066,6 +5136,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
                             notify_run(g_cfg.blocknotify, hx, "blocknotify");
                         }
+                        /* -walletnotify: one run per transaction in this block
+                         * that spends or pays this wallet (Core fires it on
+                         * confirmation as well as on mempool arrival) */
+                        if (g_cfg.walletnotify[0] && g_rpc_wallet.seed) walletnotify_block(zb, (long)bl);
                         /* mempool reconciliation (Core removeForBlock):
                          * confirmed txs leave pool+policy graph, txs
                          * CONFLICTING with this block's spends leave with
@@ -5364,6 +5438,16 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* Core -walletdir: every wallet file lives there (absolute, or relative
      * to the chain directory we are in). Created 0700 if absent; the RPC
      * wallet layer learns it through its setter, never from node_config. */
+    /* wallet policy defaults from the config (2026-09-01) -- independent of walletdir */
+    { rpc_wops_defaults wd;
+      wd.addresstype = rpc_wops_type_from_name(g_cfg.addresstype); if(wd.addresstype < 0) wd.addresstype = WOT_BECH32;
+      wd.changetype  = g_cfg.changetype[0] ? rpc_wops_type_from_name(g_cfg.changetype) : -1;
+      wd.txconfirmtarget = g_cfg.txconfirmtarget; wd.walletrbf = g_cfg.walletrbf; wd.walletbroadcast = g_cfg.walletbroadcast;
+      wd.mintxfee_satkvb = g_cfg.mintxfee_satkvb; wd.fallbackfee_satkvb = g_cfg.fallbackfee_satkvb;
+      wd.discardfee_satkvb = g_cfg.discardfee_satkvb; wd.consolidatefeerate_satkvb = g_cfg.consolidatefeerate_satkvb;
+      wd.maxapsfee_sat = g_cfg.maxapsfee_sat; wd.avoidpartialspends = g_cfg.avoidpartialspends;
+      wd.spendzeroconfchange = g_cfg.spendzeroconfchange;
+      rpc_wops_set_defaults(&wd); }
     if(g_cfg.walletdir[0]){
         struct stat wsb;
         if(stat(g_cfg.walletdir, &wsb) != 0){
@@ -5508,6 +5592,24 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* the external signer command, when the operator configured one */
     { extern void rpc_signer_set_cmd(const char*);
       rpc_signer_set_cmd(g_cfg.signer[0] ? g_cfg.signer : NULL); }
+    { extern void rpc_chain_set_gbt_policy(long, long, long, int, int);
+      extern void rpc_chain_set_maxtipage(long);
+      rpc_chain_set_gbt_policy(g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb,
+                               g_cfg.blockversion, g_cfg.printpriority);
+      rpc_chain_set_maxtipage(g_cfg.maxtipage); }
+    { extern void (*txr_on_accept)(const unsigned char*, const unsigned char*, unsigned long);
+      txr_on_accept = g_cfg.walletnotify[0] ? txr_walletnotify_hook : 0; }
+    /* -wallet=<name>: Core loads every named wallet at start-up. This node
+     * serves ONE active wallet, so the first name is loaded and the rest are
+     * named as skipped (loadwallet switches between them at run time). */
+    for(int wi = 0; wi < g_cfg.n_wallet_names; wi++){
+        if(wi > 0){ fprintf(stderr,"[wallet] wallet=%s: not loaded -- this node serves one active wallet at a time (loadwallet switches)\n", g_cfg.wallet_names[wi]); continue; }
+        rj_val* p = rj_arr(); rj_arr_push(p, rj_str(g_cfg.wallet_names[wi]));
+        rj_val* r = NULL; long ec = 0; const char* em = NULL;
+        int ok = rpc_dispatch("loadwallet", p, &g_rpc_wallet, &r, &ec, &em);
+        fprintf(stderr,"[wallet] wallet=%s: %s%s\n", g_cfg.wallet_names[wi], ok == 1 ? "loaded" : "NOT loaded: ", ok == 1 ? "" : (em ? em : "?"));
+        if(r) rj_free(r); rj_free(p);
+    }
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);
@@ -5556,6 +5658,16 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
 
     rpc_server_cfg cfg = {0}; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     cfg.bind_addr = bindaddr; cfg.allows = rpc_acl_allows;
+    cfg.threads = g_cfg.rpcthreads; cfg.workqueue = g_cfg.rpcworkqueue; cfg.timeout_s = g_cfg.rpcservertimeout;
+    rpc_cookie_set_perms(g_cfg.rpccookieperms);
+    rpc_whitelist_clear();
+    for(int wi = 0; wi < g_cfg.n_rpcwhitelist; wi++)
+        if(!rpc_whitelist_add(g_cfg.rpcwhitelist[wi]))
+            fprintf(stderr,"[rpc] rpcwhitelist=%s rejected (expected <user>:<rpc1>,<rpc2>,...)\n", g_cfg.rpcwhitelist[wi]);
+    rpc_whitelist_set_default(g_cfg.rpcwhitelistdefault);
+    if(g_cfg.n_rpcwhitelist)
+        fprintf(stderr,"[rpc] %d rpcwhitelist entr%s; users without one may call %s\n", g_cfg.n_rpcwhitelist,
+                g_cfg.n_rpcwhitelist == 1 ? "y" : "ies", g_cfg.rpcwhitelistdefault == 0 ? "anything" : "nothing (rpcwhitelistdefault)");
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
@@ -5963,6 +6075,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                      * shared table, no fd keying, nothing to clean up when the
                      * connection ends. */
                     g_conn_perms = accepted_perms;
+                    /* -inboundrelaypercent: past that share of the inbound
+                     * budget we answer with fRelay=0, as Core does, so the
+                     * peer sends us no transactions (blocks and addrs still
+                     * flow). Counted over all inbound connections, which is
+                     * Core's count of relaying inbound peers when every
+                     * earlier peer relays. */
+                    { extern unsigned char node_relay_flag;
+                      long lim = CFG_INBOUND_LIMIT();
+                      node_relay_flag = (lim > 0 && (long)g_inbound_n * 100 > lim * g_cfg.inboundrelaypercent) ? 0 : 1; }
                     for(int wi = 0; wi < g_wb_n; wi++) close(g_wb_fd[wi]);
                     /* BIP324 first, if enabled. A v1 peer is detected in-band
                      * -- it opens with magic + "version" + five NULs, and any
@@ -6115,6 +6236,10 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      /* -logtimestamps/-logtimemicros/-logthreadnames/-logsourcelocations take
+       * effect from the config echo onward (weak globals in log_ts.h) */
+      g_log_timestamps = g_cfg.logtimestamps; g_log_timemicros = g_cfg.logtimemicros;
+      g_log_threadnames = g_cfg.logthreadnames; g_log_sourcelocations = g_cfg.logsourcelocations;
       if(g_cfg.debuglogfile[0])
           snprintf(g_logpath, sizeof g_logpath, "%s",
                    !strcmp(g_cfg.debuglogfile, "0") ? "/dev/null" : g_cfg.debuglogfile);
@@ -6125,10 +6250,30 @@ int main(int argc, char** argv){
        * with no config. main.c is the only place that has both -- pushing the
        * value across here is what keeps both link sets independent. */
       wallet_pass_set_file(g_cfg.walletpassfile); }
+    /* ---- 2026-09-01 option-surface completion: push the config into the
+     * subsystems that own each behaviour (none of them include node_config.h) */
+    if(g_cfg.shrinkdebugfile) log_shrink(g_logpath);
+    { /* -uacomment: Core renders "/Name:ver(c1; c2)/" */
+      extern unsigned char node_ua_buf[256]; extern unsigned long long node_ua_len;
+      char ua[256]; int n = snprintf(ua, sizeof ua, "%s", NODE_UA_STRING);
+      if(g_cfg.n_uacomment && n > 1 && ua[n-1] == '/'){
+          n--; ua[n] = 0;                                   /* drop the closing slash */
+          n += snprintf(ua + n, sizeof ua - n, "(");
+          for(int i = 0; i < g_cfg.n_uacomment && n < (int)sizeof ua - 4; i++)
+              n += snprintf(ua + n, sizeof ua - n, "%s%s", i ? "; " : "", g_cfg.uacomment[i]);
+          if(n > (int)sizeof ua - 3) n = (int)sizeof ua - 3;
+          n += snprintf(ua + n, sizeof ua - n, ")/");
+      }
+      if(n > 255) n = 255;
+      memcpy(node_ua_buf, ua, (size_t)n); node_ua_len = (unsigned long long)n;
+      rpc_node_set_user_agent(ua);
+      if(g_cfg.n_uacomment) fprintf(stderr,"[boot] user agent: %s\n", ua); }
+    { extern void serve_cfilters_set_enabled(int); serve_cfilters_set_enabled(g_cfg.peerblockfilters); }
     /* Advertise NODE_P2P_V2 once the config is known, as Core does in
      * init.cpp. A peer has no other way to learn that we will accept a
      * BIP324 handshake, and nothing on the wire reveals it. */
     { extern unsigned long long node_services;
+      if(g_cfg.peerblockfilters) node_services |= (1ULL << 6);   /* NODE_COMPACT_FILTERS: -peerblockfilters */
       if(CFG_V2TRANSPORT()){
           node_services |= BMC_NODE_P2P_V2;
           /* Report how many known peers we could actually dial over v2. This

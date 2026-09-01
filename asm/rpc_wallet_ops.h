@@ -102,4 +102,29 @@ int rpc_wops_wallet_coins(const void* wallet_seed, rpc_wops_coin* out, int cap);
 
 /* master key fingerprint as 8 hex chars (2026-09-01: taproot PSBT derivation matching) */
 int rpc_wops_master_fp(const void* seed, char out[9]);
+
+/* ---- wallet policy defaults from the config (2026-09-01, Core names) ----
+ * Injected by main.c; this file never includes node_config.h. Until the
+ * setter runs the wallet behaves as before (bech32, target 6, RBF on,
+ * broadcast on, min-relay fallback when the estimator has no data). */
+typedef struct {
+    int  addresstype;                 /* WOT_* for getnewaddress            */
+    int  changetype;                  /* WOT_* for change, -1 = Core's rule */
+    int  txconfirmtarget;             /* default conf_target                */
+    int  walletrbf;                   /* default sequence: RBF or final     */
+    int  walletbroadcast;             /* 0 = build+sign but never broadcast */
+    long mintxfee_satkvb;             /* floor for created transactions      */
+    long fallbackfee_satkvb;          /* 0 = disabled: estimation failure is an error (Core) */
+    long discardfee_satkvb;           /* change below dust at this rate is given to the miner */
+    long consolidatefeerate_satkvb;   /* at or below this rate: spend small coins first     */
+    long maxapsfee_sat;               /* extra absolute fee tolerated for partial-spend avoidance; -1 = always */
+    int  avoidpartialspends;          /* group coins by destination           */
+    int  spendzeroconfchange;         /* 0 = unconfirmed change is not spendable */
+} rpc_wops_defaults;
+void rpc_wops_set_defaults(const rpc_wops_defaults* d);
+int  rpc_wops_default_type(int is_change);
+/* 1 if any input spends a coin this wallet holds or any output pays one of
+ * its keys (the -walletnotify test); 0 otherwise. */
+int  rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, unsigned long len);
+
 #endif

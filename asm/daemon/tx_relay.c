@@ -57,6 +57,8 @@ extern long tx_accept_validate(void* mp, const u8 txid[32], const u8* tx, unsign
 extern long tx_accept_validate_p2p(void* mp, const u8 txid[32], const u8* tx,
                                    unsigned long len);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* scratch, unsigned long scratchcap);
+/* -walletnotify hook (2026-09-01): main.c installs it; NULL = nothing */
+void (*txr_on_accept)(const u8* txid, const u8* tx, unsigned long len) = 0;
 /* package validation, shared verbatim with the submitpackage RPC path so a
  * package that arrives over the wire and one that arrives over RPC are held
  * to exactly the same rules */
@@ -895,6 +897,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 long r = tx_accept_validate_p2p(mp, txid, pl, plen);
                 if (r == 1){
                     accepted++;
+                    if (txr_on_accept) txr_on_accept(txid, pl, plen);   /* -walletnotify */
                     txr_ann_add(txid, fd);
                     accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */
                 } else if (r == -28){

@@ -1039,6 +1039,8 @@ __attribute__((weak)) int serve_cfilters(int fd, int kind,
                                          const unsigned char* pl, unsigned long plen){
     (void)fd; (void)kind; (void)pl; (void)plen; return 0;
 }
+/* the -peerblockfilters gate that goes with the stub above (2026-09-01) */
+__attribute__((weak)) void serve_cfilters_set_enabled(int on){ (void)on; }
 __attribute__((weak)) long serve_getaddr(int fd, int wants_v2){
     (void)fd; (void)wants_v2; return 0;
 }

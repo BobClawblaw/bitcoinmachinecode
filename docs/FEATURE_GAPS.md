@@ -441,7 +441,7 @@ than trusted:
 | surface | state |
 | --- | --- |
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
-| **Config options** | **~75 / 163 (46%)** — `v2transport` closed 08-29, `walletpassfile` added 08-30 (this node's own, no Core equivalent). Of the ~90 missing, ~40 are not applicable (18 wallet — this node has its own format; 16 debug/test; 4 block creation — it does not mine; IPC). |
+| **Config options** | **133 / 181 implemented, 48 accepted without effect (each named with its reason at start-up), 0 not recognised** — see the 2026-09-01 config-surface update below for the full table. |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex, **txospenderindex (2026-09-01)**. |
 | **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
@@ -1101,3 +1101,229 @@ leaves** (`tr(H, pk(musig(...)))`): the signer handles key-path aggregates
 only; the same rounds keyed by leaf hash are a small extension once
 script-path signing exists. The wallet's own key oracle for MuSig2 covers
 its HD window (the same keys it hands the raw signer) and imported HD keys.
+
+## Update 2026-09-01 — config surface: every Core v31.99 option classified
+
+Method: `bitcoind -help-debug` of the scratch Core build (181 options) against
+every parse site here (`daemon/node_config.c`, `daemon/main.c` for the RPC
+credentials/port/prune, the command line for `-datadir`/`-conf`). Three
+states, and nothing else: **implemented** (parsed, with Core's semantics
+behind it), **accepted, no effect** (parsed, named at every start-up with the
+reason it is inert here — the table `k_noeffect` in node_config.c is the
+same list), or **not recognised** (ignored silently, as Core ignores unknown
+keys). Counts: 133 implemented, 48 accepted without effect, 0 not recognised.
+
+Landed today (branch `feat/config-surface`): `uacomment` (runtime user agent,
+on the wire and in `getnetworkinfo`), `blockmaxweight` / `blockreservedweight`
+/ `blockmintxfee` / `blockversion` / `printpriority` (template budget, fee
+floor and version), `maxtipage` (IBD flag), `addresstype` / `changetype`,
+`txconfirmtarget`, `walletrbf`, `walletbroadcast`, `mintxfee` / `fallbackfee`
+(estimation failure is Core's error when it is 0) / `discardfee` /
+`consolidatefeerate` / `avoidpartialspends` / `maxapsfee` /
+`spendzeroconfchange`, `wallet=` (start-up load; one active wallet here),
+`walletnotify` (mempool arrival and confirmation), `rpcthreads` /
+`rpcworkqueue` (503 past the depth) / `rpcservertimeout`, `rpcwhitelist` /
+`rpcwhitelistdefault` (HTTP 403), `rpccookieperms`, `includeconf`,
+`logtimestamps` / `logtimemicros` / `logthreadnames` / `logsourcelocations` /
+`shrinkdebugfile`, `peerblockfilters` (NODE_COMPACT_FILTERS + serving, Core's
+default 0), `inboundrelaypercent` (fRelay=0 past the share),
+`whitelistrelay` / `whitelistforcerelay` (permission flags; `relay@` and
+`forcerelay@` are now accepted in `whitelist=`), `signetseednode`,
+`limitclustercount` / `limitclustersize` (mapped onto the ancestor and
+descendant limits), `keypool` / `fixedseeds` / `txreconciliation` (accepted).
+Evidence: `tests/test_node_config`, `tests/test_rpc_whitelist`,
+`tests/test_netperm`, and `validation/config_surface_core_diff.sh` — the
+same option on a scratch regtest Core and on this node, compared on the
+observable it changes (subversion on the wire, address type, IBD flag,
+template contents and version, HTTP status, cookie mode, log prefix): 18/18.
+
+Known partial: `whitelistrelay`/`whitelistforcerelay` set the permission
+bits but nothing enforces them yet (`blocksonly` itself is parsed and not
+enforced, so `relay` is trivially satisfied; `forcerelay` re-announcement
+is not done). `inboundrelaypercent` counts all inbound connections rather
+than relaying ones. `peerblockfilters` follows Core's default of 0: a node
+that served BIP157 before this change must now set it explicitly.
+
+| option | Core meaning | this node |
+| --- | --- | --- |
+| `acceptnonstdtxn` | Relay and mine "non-standard" transactions (test networks only; default: 0) | implemented |
+| `acceptstalefeeestimates` | Read fee estimates even if they are stale (regtest only; default: 0) fee estimates are considered stale if the… | accepted, no effect: fee estimates are not persisted across restarts |
+| `addnode` | Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). Thi… | implemented |
+| `addresstype` | What type of addresses to use ("legacy", "p2sh-segwit", "bech32", "bech32m", default: "bech32") | implemented |
+| `alertnotify` | Execute command when an alert is raised (%s in cmd is replaced by message) | implemented |
+| `allowignoredconf` | For backwards compatibility, treat an unused bitcoin.conf file in the datadir as a warning, not an error. | accepted, no effect: -conf is always honoured |
+| `asmap` | Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datad… | implemented |
+| `assumevalid` | If this block is in the chain assume that it and its ancestors are valid and potentially skip their script ver… | implemented |
+| `avoidpartialspends` | Group outputs by address, selecting many (possibly all) or none, instead of selecting on a per-output basis. P… | implemented |
+| `bantime` | Default duration (in seconds) of manually configured bans (default: 86400) | implemented |
+| `bind` |  | implemented |
+| `blockfilterindex` | Maintain an index of compact filters by block (default: 0, values: basic). If <type> is not supplied or if <ty… | implemented |
+| `blockmaxweight` | Set maximum BIP141 block weight (default: 4000000) | implemented |
+| `blockmintxfee` | Set lowest fee rate (in BTC/kvB) for transactions to be included in block creation. (default: 0.00000001) | implemented |
+| `blocknotify` | Execute command when the best block changes (%s in cmd is replaced by block hash) | implemented |
+| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block reconstruction draws on the mempool only |
+| `blockreservedweight` | Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may ad… | implemented |
+| `blocksdir` | Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>) | accepted, no effect: the archive lives under <datadir>/<chain> and is not relocatable |
+| `blocksonly` | Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transaction… | implemented |
+| `blocksxor` | Whether an XOR-key applies to blocksdir *.dat files. The created XOR-key will be zeros for an existing blocksd… | accepted, no effect: the archive is never XOR-obfuscated |
+| `blockversion` | Override block version to test forking scenarios | implemented |
+| `bytespersigop` | Equivalent bytes per sigop in transactions for relay and mining (default: 20) | implemented |
+| `capturemessages` | Capture all P2P messages to disk | accepted, no effect: no P2P message capture |
+| `chain` | Use the chain <chain> (default: main). Allowed values: main, test, testnet4, signet, regtest | implemented |
+| `changetype` | What type of change to use ("legacy", "p2sh-segwit", "bech32", "bech32m"). Default is "legacy" when -addressty… | implemented |
+| `checkaddrman` | Run addrman consistency checks every <n> operations. Use 0 to disable. (default: 0) | accepted, no effect: address-book invariants are checked in the test suite, not on a timer |
+| `checkblockindex` | Do a consistency check for the block tree, chainstate, and other validation data structures every <n> operatio… | accepted, no effect: index invariants are checked at boot (archive self-heal) and in the test suite, not on a timer |
+| `checkblocks` | How many blocks to check at startup (default: 6, 0 = all) | implemented |
+| `checklevel` | How thorough the block verification of -checkblocks is: level 0 reads the blocks from disk, level 1 verifies b… | implemented |
+| `checkmempool` | Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: 0, regtest: 1) | accepted, no effect: mempool invariants are checked in the test suite, not on a timer |
+| `cjdnsreachable` | If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS ne… | implemented |
+| `coinstatsindex` | Maintain coinstats index used by the gettxoutsetinfo RPC (default: 0) | implemented |
+| `conf` | Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useabl… | implemented (command line) |
+| `connect` | Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the… | implemented |
+| `consolidatefeerate` | The maximum feerate (in BTC/kvB) at which transaction building may use more inputs than strictly necessary so … | implemented |
+| `daemon` | Run in the background as a daemon and accept commands (default: 0) | accepted, no effect: a systemd unit (or the shell) backgrounds the process |
+| `daemonwait` | Wait for initialization to be finished before exiting. This implies -daemon (default: 0) | accepted, no effect: a systemd unit (or the shell) backgrounds the process |
+| `datacarrier` | Relay and mine data carrier transactions (default: 1) | implemented |
+| `datacarriersize` | Relay and mine transactions whose data-carrying raw scriptPubKeys in aggregate are of this size or less, allow… | implemented |
+| `datadir` | Specify data directory | implemented (command line) |
+| `dbbatchsize` | Maximum database write batch size in bytes (default: 33554432) | accepted, no effect: no LevelDB |
+| `dbcache` | Maximum database cache size <n> MiB (minimum 4, default: 1024). Make sure you have enough RAM. In addition, un… | implemented |
+| `debug` | Output debug and trace logging (default: -nodebug, supplying <category> is optional). If <category> is not sup… | accepted, no effect: no log categories |
+| `debugexclude` | Exclude debug and trace logging for a category. Can be used in conjunction with -debug=1 to output debug and t… | accepted, no effect: no log categories |
+| `debuglogfile` | Specify location of debug log file (default: debug.log). Relative paths will be prefixed by a net-specific dat… | implemented |
+| `deprecatedrpc` | Allows deprecated RPC method(s) to be used | accepted, no effect: no deprecated-RPC toggles |
+| `disablewallet` | Do not load the wallet and disable wallet RPC calls | implemented |
+| `discardfee` | The fee rate (in BTC/kvB) that indicates your tolerance for discarding change by adding it to the fee (default… | implemented |
+| `discover` | Discover own IP addresses (default: 1 when listening and no -externalip or -proxy) | implemented |
+| `dns` | Allow DNS lookups for -addnode, -seednode and -connect (default: 1) | implemented |
+| `dnsseed` | Query for peer addresses via DNS lookup, if low on addresses (default: 1 unless -connect used or -maxconnectio… | implemented |
+| `dustrelayfee` | Fee rate (in BTC/kvB) used to define dust, the value of an output such that it will cost more than its value i… | implemented |
+| `externalip` | Specify your own public address | implemented |
+| `fallbackfee` | A fee rate (in BTC/kvB) that will be used when fee estimation has insufficient data. 0 to entirely disable the… | implemented |
+| `fastprune` | Use smaller block files and lower minimum prune height for testing purposes | accepted, no effect: debug-only pruning knob; this node prunes by its own MiB budget |
+| `fixedseeds` | Allow fixed seeds if DNS seeds don't provide peers (default: 1) | accepted, no effect: no compiled-in seed list: DNS seeds, seednode= and peers.dat only |
+| `forcednsseed` | Always query for peer addresses via DNS lookup (default: 0) | implemented |
+| `help` | Print this help message and exit (also -h or -?) | accepted, no effect: command-line only |
+| `i2pacceptincoming` | Whether to accept inbound I2P connections (default: 1). Ignored if -i2psam is not set. Listening for inbound I… | implemented |
+| `i2psam` | I2P SAM proxy to reach I2P peers and accept I2P connections | implemented |
+| `inboundrelaypercent` | Permit a maximum percent of inbound connections to relay transactions, to limit memory utilization (0 to 100, … | implemented |
+| `includeconf` | Specify additional configuration file, relative to the -datadir path (only useable from configuration file, no… | implemented (node_config.c) |
+| `incrementalrelayfee` | Fee rate (in BTC/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default… | implemented |
+| `keypool` | Set key pool size to <n> (default: 1000). Warning: Smaller sizes may increase the risk of losing funds when re… | accepted, no effect: the descriptor wallet derives keys on demand; there is no keypool |
+| `limitancestorcount` | Deprecated setting to not accept transactions if number of in-mempool ancestors is <n> or more (default: 25); … | implemented |
+| `limitclustercount` | Do not accept transactions into mempool which are directly or indirectly connected to <n> or more other unconf… | implemented |
+| `limitclustersize` | Do not accept transactions whose virtual size with all in-mempool connected transactions exceeds <n> kilobytes… | implemented |
+| `limitdescendantcount` | Deprecated setting to not accept transactions if any ancestor would have <n> or more in-mempool descendants (d… | implemented |
+| `listen` | Accept connections from outside (default: 1 if no -proxy, -connect or -maxconnections=0) | implemented |
+| `listenonion` | Automatically create Tor onion service (default: 1) | implemented |
+| `loadblock` | Imports blocks from an external file on startup. Obfuscated blocks are not supported. | accepted, no effect: the block archive is this node's own format (index.dat + blk files); Core blk*.dat files are not imported |
+| `logips` | Include IP addresses in log output (default: 0) | accepted, no effect: peer addresses are always logged |
+| `loglevel` |  | accepted, no effect: no per-category log levels |
+| `loglevelalways` | Always prepend a category and level (default: 0) | accepted, no effect: no per-category log levels |
+| `logratelimit` | Apply rate limiting to unconditional logging to mitigate disk-filling attacks (default: 1) | accepted, no effect: no log rate limiting |
+| `logsourcelocations` | Prepend debug output with name of the originating source location (source file, line number and function name)… | implemented |
+| `logthreadnames` | Prepend debug output with name of the originating thread (default: 0) | implemented |
+| `logtimemicros` | Add microsecond precision to debug timestamps (default: 0) | implemented |
+| `logtimestamps` | Prepend debug output with timestamp (default: 1) | implemented |
+| `maxapsfee` | Spend up to this amount in additional (absolute) fees (in BTC) if it allows the use of partial spend avoidance… | implemented |
+| `maxconnections` | Maintain at most <n> automatic connections to peers (default: 200). 11 slots of these are reserved for outgoin… | implemented |
+| `maxmempool` | Keep the transaction memory pool below <n> megabytes (default: 300) | implemented |
+| `maxreceivebuffer` | Maximum per-connection receive buffer, <n>*1000 bytes (default: 5000) | implemented |
+| `maxsendbuffer` | Maximum per-connection memory usage for the send buffer, <n>*1000 bytes (default: 1000) | implemented |
+| `maxsigcachesize` | Limit sum of signature cache and script execution cache sizes to <n> MiB (default: 32) | accepted, no effect: no signature cache: each block's scripts are verified once by the parallel verifier |
+| `maxtipage` | Maximum tip age in seconds to consider node in initial block download (default: 86400) | implemented |
+| `maxtxfee` | Maximum total fees (in BTC) to use in a single wallet transaction; setting this too low may abort large transa… | implemented |
+| `maxuploadtarget` | Tries to keep outbound traffic under the given target per 24h. Limit does not apply to peers with 'download' p… | implemented |
+| `mempoolexpiry` | Do not keep transactions in the mempool longer than <n> hours (default: 336) | implemented |
+| `minimumchainwork` | Minimum work assumed to exist on a valid chain in hex (default: 0000000000000000000000000000000000000001128750… | implemented |
+| `minrelaytxfee` | Fees (in BTC/kvB) smaller than this are considered zero fee for relaying, mining and transaction creation (def… | implemented |
+| `mintxfee` | Fee rates (in BTC/kvB) smaller than this are considered zero fee for transaction creation (default: 0.00001) | implemented |
+| `mocktime` | Replace actual time with UNIX epoch time (default: 0) | accepted, no effect: no mock clock: regtest tests drive time through block timestamps |
+| `natpmp` | Use PCP or NAT-PMP to map the listening port (default: 1) | accepted, no effect: no NAT-PMP/UPnP port mapping by design |
+| `networkactive` | Enable all P2P network activity (default: 1). Can be changed by the setnetworkactive RPC command | implemented |
+| `onion` | Use separate SOCKS5 proxy to reach peers via Tor onion services, set -noonion to disable (default: -proxy). Ma… | implemented |
+| `onlynet` | Make automatic outbound connections only to network <net> (ipv4, ipv6, onion, i2p, cjdns). Inbound and manual … | implemented |
+| `par` | Set the number of script verification threads (0 = auto, up to 15, <0 = leave that many cores free, default: 0… | implemented |
+| `peerblockfilters` | Serve compact block filters to peers per BIP 157 (default: 0) | implemented |
+| `peerbloomfilters` | Support filtering of blocks and transaction with bloom filters (default: 0) | accepted, no effect: BIP37 bloom filtering is not implemented; NODE_BLOOM is never advertised (Core's default is 0 too) |
+| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | implemented |
+| `permitbaremultisig` | Relay transactions creating non-P2SH multisig outputs (default: 1) | implemented |
+| `persistmempool` | Whether to save the mempool on shutdown and load on restart (default: 1) | implemented |
+| `persistmempoolv1` | Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy for… | accepted, no effect: mempool.dat is written in the current format only |
+| `pid` | Specify pid file. Relative paths will be prefixed by a net-specific datadir location. (default: bitcoind.pid) | implemented |
+| `port` | Listen for connections on <port> (default: 8333, testnet3: 18333, testnet4: 48333, signet: 38333, regtest: 184… | implemented |
+| `prevoutfetchthreads` | Set the number of threads used to prefetch block input prevouts from the chainstate database (0 disables, up t… | accepted, no effect: prevouts come from the in-process UTXO set |
+| `printpriority` | Log transaction fee rate in BTC/kvB when mining blocks (default: 0) | implemented |
+| `printtoconsole` | Send trace/debug info to console (default: 1 when no -daemon. To disable logging to file, set -nodebuglogfile) | accepted, no effect: stderr IS the log (systemd appends it to the log file) |
+| `privatebroadcast` | Broadcast transactions submitted via sendrawtransaction RPC using short-lived connections through the Tor or I… | accepted, no effect: no private broadcast |
+| `proxy` |  | implemented |
+| `proxyrandomize` | Randomize credentials for every proxy connection. This enables Tor stream isolation (default: 1) | implemented |
+| `prune` | Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC … | implemented |
+| `regtest` | Enter regression test mode, which uses a special chain in which blocks can be solved instantly. This is intend… | implemented |
+| `reindex` | If enabled, wipe chain state and block index, and rebuild them from blk*.dat files on disk. Also wipe and rebu… | implemented |
+| `rest` | Accept public REST requests (default: 0) | accepted, no effect: no REST interface by design |
+| `rpcallowip` | Allow JSON-RPC connections from specified source. Valid values for <ip> are a single IP (e.g. 1.2.3.4), a netw… | implemented |
+| `rpcauth` | Username and HMAC-SHA-256 hashed password for JSON-RPC connections. The field <userpw> comes in the format: <U… | implemented |
+| `rpcbind` |  | implemented |
+| `rpccookiefile` | Location of the auth cookie. Relative paths will be prefixed by a net-specific datadir location. (default: dat… | implemented |
+| `rpccookieperms` | Set permissions on the RPC auth cookie file so that it is readable by [owner\|group\|all] (default: owner [via u… | implemented |
+| `rpcdoccheck` | Throw a non-fatal error at runtime if the documentation for an RPC is incorrect (default: 0) | accepted, no effect: debug-only |
+| `rpcpassword` | Password for JSON-RPC connections | implemented (daemon/main.c (RPC server)) |
+| `rpcport` | Listen for JSON-RPC connections on <port> (default: 8332, testnet3: 18332, testnet4: 48332, signet: 38332, reg… | implemented (daemon/main.c (RPC server)) |
+| `rpcservertimeout` | Timeout during HTTP requests (default: 30) | implemented |
+| `rpcthreads` | Set the number of threads to service RPC calls (default: 16) | implemented |
+| `rpcuser` | Username for JSON-RPC connections | implemented (daemon/main.c (RPC server)) |
+| `rpcwhitelist` | Set a whitelist to filter incoming RPC calls for a specific user. The field <whitelist> comes in the format: <… | implemented |
+| `rpcwhitelistdefault` | Sets default behavior for rpc whitelisting. Unless rpcwhitelistdefault is set to 0, if any -rpcwhitelist is se… | implemented |
+| `rpcworkqueue` | Set the maximum depth of the work queue to service RPC calls (default: 64) | implemented |
+| `seednode` | Connect to a node to retrieve peer addresses, and disconnect. This option can be specified multiple times to c… | implemented |
+| `server` | Accept command line and JSON-RPC commands | accepted, no effect: the JSON-RPC server is always on |
+| `settings` | Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and n… | accepted, no effect: no settings.json: values set over RPC are not persisted |
+| `shrinkdebugfile` | Shrink debug log file on client startup (default: 1 when no -debug) | implemented |
+| `shutdownnotify` | Execute command immediately before beginning shutdown. The need for shutdown may be urgent, so be careful not … | implemented |
+| `signer` | External signing tool, see doc/external-signer.md | implemented |
+| `signet` | Use the signet chain. Equivalent to -chain=signet. Note that the network is defined by the -signetchallenge pa… | implemented |
+| `signetchallenge` | Blocks must satisfy the given script to be considered valid (only for signet networks; defaults to the global … | implemented |
+| `signetseednode` | Specify a seed node for the signet network, in the hostname[:port] format, e.g. sig.net:1234 (may be used mult… | implemented |
+| `spendzeroconfchange` | Spend unconfirmed change when sending transactions (default: 1) | implemented |
+| `startupnotify` | Execute command on startup. | implemented |
+| `stopafterblockimport` | Stop running after importing blocks from disk (default: 0) | accepted, no effect: no block import step |
+| `stopatheight` | Stop running after reaching the given height in the main chain (default: 0). Blocks after target height may be… | implemented |
+| `test` | Pass a test-only option. Options include : addrman (use deterministic addrman), reindex_after_failure_noninter… | accepted, no effect: debug-only |
+| `testactivationheight` |  | accepted, no effect: regtest deployments are active from genesis here |
+| `testnet` | Use the testnet3 chain. Equivalent to -chain=test. Support for testnet3 is deprecated and will be removed in a… | accepted, no effect: testnet3 is refused by design; use testnet4=1 |
+| `testnet4` | Use the testnet4 chain. Equivalent to -chain=testnet4. | implemented |
+| `timeout` | Specify socket connection timeout in milliseconds. If an initial attempt to connect is unsuccessful after this… | implemented |
+| `torcontrol` |  | implemented |
+| `torpassword` | Tor control port password (default: empty) | implemented |
+| `txconfirmtarget` | Include enough fee so transactions begin confirmation on average within n blocks (default: 6) | implemented |
+| `txindex` | Maintain a full transaction index, used by the getrawtransaction rpc call (default: 0) | implemented |
+| `txospenderindex` | Maintain a transaction output spender index, used by the gettxspendingprevout rpc call (default: 0) | accepted, no effect: not built yet (tracked in FEATURE_GAPS) |
+| `txreconciliation` | Enable transaction reconciliations per BIP 330 (default: 0) | accepted, no effect: Erlay: BIP330 negotiation is built but reconciliation is a deliberate stop |
+| `txsendrate` | Set the maximum ongoing rate for sending transactions to (inbound) peers (default: 14 tx/s) | accepted, no effect: no private broadcast |
+| `uacomment` | Append comment to the user agent string | implemented |
+| `unsafesqlitesync` | Set SQLite synchronous=OFF to disable waiting for the database to sync to disk. This is unsafe and can cause d… | accepted, no effect: no sqlite |
+| `v2transport` | Support v2 transport (default: 1) | implemented |
+| `vbparams` |  | accepted, no effect: regtest deployments are active from genesis here |
+| `version` | Print version and exit | accepted, no effect: command-line only |
+| `wallet` | Specify wallet path to load at startup. Can be used multiple times to load multiple wallets. Path is to a dire… | implemented |
+| `walletbroadcast` | Make the wallet broadcast transactions (default: 1) | implemented |
+| `walletcrosschain` | Allow reusing wallet files across chains (default: 0) | accepted, no effect: one chain per datadir |
+| `walletdir` | Specify directory to hold wallets (default: <datadir>/wallets if it exists, otherwise <datadir>) | implemented |
+| `walletnotify` | Execute command when a wallet transaction changes. %s in cmd is replaced by TxID, %w is replaced by wallet nam… | implemented |
+| `walletrbf` | (DEPRECATED) Send transactions with full-RBF opt-in enabled (default: 1) | implemented |
+| `walletrejectlongchains` | Wallet will not create transactions that violate mempool chain limits (default: 1) | accepted, no effect: the mempool's cluster limits bound unconfirmed chains |
+| `whitebind` | Bind to the given address and add permission flags to the peers connecting to it. Use [host]:port notation for… | implemented |
+| `whitelist` | Add permission flags to the peers using the given IP address (e.g. 1.2.3.4) or CIDR-notated network (e.g. 1.2.… | implemented |
+| `whitelistforcerelay` | Add 'forcerelay' permission to whitelisted peers with default permissions. This will relay transactions even i… | implemented |
+| `whitelistrelay` | Add 'relay' permission to whitelisted peers with default permissions. This will accept relayed transactions ev… | implemented |
+| `zmqpubhashblock` | Enable publish hash block in <address> | implemented |
+| `zmqpubhashblockhwm` | Set publish hash block outbound message high water mark (default: 1000) | implemented |
+| `zmqpubhashtx` | Enable publish hash transaction in <address> | implemented |
+| `zmqpubhashtxhwm` | Set publish hash transaction outbound message high water mark (default: 1000) | implemented |
+| `zmqpubrawblock` | Enable publish raw block in <address> | implemented |
+| `zmqpubrawblockhwm` | Set publish raw block outbound message high water mark (default: 1000) | implemented |
+| `zmqpubrawtx` | Enable publish raw transaction in <address> | implemented |
+| `zmqpubrawtxhwm` | Set publish raw transaction outbound message high water mark (default: 1000) | implemented |
+| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | implemented |
+| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | implemented |

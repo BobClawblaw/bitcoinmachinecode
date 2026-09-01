@@ -248,6 +248,7 @@ typedef struct {
  * The const setter keeps status reads read-only; the writable variant is for
  * sendrawtransaction, which stages into the submission channel above. */
 void rpc_node_set_status(const node_status_t* st);
+void rpc_node_set_user_agent(const char* ua);   /* -uacomment: getnetworkinfo subversion */
 void rpc_node_set_status_rw(node_status_t* st);
 
 /* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED

@@ -24,6 +24,11 @@
 #define NETPERM_H
 
 #define NP_NOBAN      (1u << 0)   /* Core NetPermissionFlags::NoBan   */
+#define NP_RELAY      (1u << 1)   /* Core Relay: accept relayed txs even in -blocksonly (2026-09-01) */
+#define NP_FORCERELAY (1u << 2)   /* Core ForceRelay: relay a tx even if already in the mempool    */
+/* -whitelistrelay / -whitelistforcerelay: the permissions an entry WITHOUT
+ * an explicit perms@ list gets (Core: relay by default, forcerelay off). */
+void netperm_set_implicit_defaults(int relay, int forcerelay);
 
 /* Add one -whitelist entry: "[perms@]addr[/prefixlen]", where addr is IPv4 or
  * IPv6. Returns 1 stored, 0 rejected (*err set to a reason for the caller to
