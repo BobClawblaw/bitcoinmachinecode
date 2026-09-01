@@ -228,7 +228,11 @@ section .text
 
 ; ---- sparse index (added after Phase 2 shipped without one -- see
 ; mac_read_run_header's header comment for the full backward-compat story) ----
-SPARSE_STRIDE    equ 256             ; sample every Nth sorted record (index 0 always sampled)
+SPARSE_STRIDE    equ 64              ; sample every Nth sorted record (index 0 always sampled)
+                                      ; 256 -> 64 on 2026-09-01: the forward scan after the sparse
+                                      ; search was 10% of the live replay (lsm_run_lookup_mm); 44 B
+                                      ; per 64 records is ~0.7 B/record of index. Readers use the
+                                      ; header's sparse_n, so old runs keep working unchanged.
 SPARSE_ENT_SIZE  equ 44              ; key(36) + file_offset(8) per sparse entry
 
 ; ---- compaction (Phase 2) constants ----
@@ -283,6 +287,7 @@ extern utxo_store_init_ro
 extern utxo_store_put
 extern utxo_store_del
 extern utxo_store_reload
+extern utxo_store_wal_drain
 extern utxo_store_close
 
 ; ============================================================================
@@ -1887,6 +1892,12 @@ mac_flush:
     call rax
     lea  rsp, [rbp-0x328]                    ; 5 pushes + 0x300 frame
 .mf_nohook:
+    ; the flush ends by truncating the WAL: every buffered byte must be in the file before
+    ; anything here can fail and leave the WAL as the only copy of the memtable
+    mov  rdi, r12
+    call utxo_store_wal_drain
+    cmp  rax, -1
+    je   .fl_err
 
     mov  rdi, r12
     call mac_calc_desc_cap
