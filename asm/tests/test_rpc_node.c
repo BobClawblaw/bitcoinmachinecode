@@ -1242,6 +1242,31 @@ int main(void){
     }
     rj_free(r);
 
+    /* ---- mempool.dat reload: parents-first ordering (2026-09-01) ----
+     * A dump written in pool order can list a child before its parent; the
+     * loader now orders entries so every in-dump parent is offered first. */
+    {
+        typedef struct { unsigned char* tx; unsigned long len; long long t, d; unsigned char txid[32]; } ent_t;
+        extern long mpd_order_parents_first(const ent_t* v, long n, long* order);
+        static unsigned char sc[4096];
+        /* A: spends an outside coin; B spends A:0; C spends B:0; D independent */
+        static unsigned char A[128], B[128], C[128], D[128]; ent_t e[4]; long la, lb, lc, ld;
+        unsigned char outside[32]; memset(outside, 0x77, 32);
+        /* minimal legacy tx builder: version, 1 input (prev, vout 0), empty scriptSig, seq, 1 output, locktime */
+        #define MKTX(buf, prev, tag, lenvar) do{ unsigned char* p = buf; *p++=1;*p++=0;*p++=0;*p++=(tag); *p++=1; memcpy(p, prev, 32); p+=32; *p++=0;*p++=0;*p++=0;*p++=0; *p++=0; *p++=0xff;*p++=0xff;*p++=0xff;*p++=0xff; *p++=1; memset(p, (tag), 8); p+=8; *p++=1; *p++=0x51; *p++=0;*p++=0;*p++=0;*p++=0; lenvar = p - buf; }while(0)
+        MKTX(A, outside, 0x0a, la); e[2].tx = A; e[2].len = la; tx_txid(e[2].txid, A, la, sc, sizeof sc);
+        MKTX(B, e[2].txid, 0x0b, lb); e[1].tx = B; e[1].len = lb; tx_txid(e[1].txid, B, lb, sc, sizeof sc);
+        MKTX(C, e[1].txid, 0x0c, lc); e[0].tx = C; e[0].len = lc; tx_txid(e[0].txid, C, lc, sc, sizeof sc);
+        MKTX(D, outside, 0x0d, ld); e[3].tx = D; e[3].len = ld; tx_txid(e[3].txid, D, ld, sc, sizeof sc);
+        long order[4] = {-1,-1,-1,-1};
+        long placed = mpd_order_parents_first(e, 4, order);
+        int pos[4]; for (int i = 0; i < 4; i++) pos[i] = -1; for (int k = 0; k < 4; k++) if (order[k] >= 0 && order[k] < 4) pos[order[k]] = k;
+        ck("reload order: every entry placed", placed == 4 && pos[0] >= 0 && pos[1] >= 0 && pos[2] >= 0 && pos[3] >= 0);
+        ck("reload order: A (parent) before B before C (file order was C,B,A)", pos[2] < pos[1] && pos[1] < pos[0]);
+        ck("reload order: independent entries keep file order among the ready ones (A before D)", pos[2] < pos[3]);
+        #undef MKTX
+    }
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }
