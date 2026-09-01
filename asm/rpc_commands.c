@@ -1714,7 +1714,9 @@ typedef struct { unsigned char txid_wire[32]; unsigned long vout; unsigned char 
                  struct { unsigned char x[32], lh[32], sig[65]; int sl; } tap_psig[32]; int n_tap_psig;
                  unsigned char tap_keysig[65]; int tap_keysig_len;
                  ms_preimages_t pre;                                      /* PSBT hash preimages (miniscript satisfier) */
-                 unsigned char pubs[64][33]; int npubs; } srw_prev_t;     /* pubkeys known without a key: pk_h() resolution */
+                 unsigned char pubs[64][33]; int npubs;
+                 /* PARTIAL_SIGs (0x02) carried from the PSBT for P2WSH / P2SH multisig and miniscript inputs */
+                 struct { unsigned char pub[33]; unsigned char sig[80]; int sl; } v0_psig[32]; int n_v0_psig; } srw_prev_t;     /* pubkeys known without a key: pk_h() resolution */
 
 /* ---- CHECKMULTISIG / taproot signing helpers (2026-09-01) ------------------
  * The raw signer used to sign P2PKH, P2WPKH and P2SH-P2WPKH only. It now
@@ -1764,6 +1766,9 @@ static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigne
  * multi_a(k, K1..Kn) -> <x1> CHECKSIG <x2> CHECKSIGADD .. <k> NUMEQUAL. Any
  * other leaf is left to the miniscript satisfier (separate workstream). */
 #define SRW_TAP_MAXKEYS 32
+typedef struct { unsigned char pub[33]; int publen; unsigned char sig[80]; int sl; unsigned char lh[32]; int has_lh; } srw_rec_t;
+#define SRW_RECS 8
+static srw_rec_t* g_srw_rec; static int* g_srw_nrec;   /* the current input's record sink (the raw signer is single-threaded) */
 static int srw_tap_leaf_keys(const unsigned char* sc, unsigned long n, unsigned char (*keys)[32], int* k_of){
     /* returns the key count (>0) and the threshold in *k_of; 0 = not a form we sign */
     int nk = 0; unsigned long p = 0;
@@ -1827,8 +1832,10 @@ static const char* srw_sign_tap_script(const srw_prev_t* P, const unsigned char*
         for (int q = 0; q < P->n_tap_psig && nps < 32; q++) if (!memcmp(P->tap_psig[q].lh, lh, 32)){ ps[nps].x = P->tap_psig[q].x; ps[nps].sig = P->tap_psig[q].sig; ps[nps].sl = P->tap_psig[q].sl; nps++; }
         const char* merr = NULL; unsigned long ml = 0; int mi = 0;
         unsigned long need = 3 + P->tapleaflen + 3 + cl; if (need + 64 > SRW_WITCAP) return "P2TR leaf too large for this node's witness buffer";
+        static ms_sigrec_t mr[SRW_RECS]; int nmr = 0;
         int r = ms_sign_witness_tapleaf(P->tapleaf, P->tapleaflen, z, tht, seqs[i], locktime, kpriv, kpub, nkeys,
-                                        (const unsigned char (*)[33])P->pubs, P->npubs, ps, nps, &P->pre, wit, SRW_WITCAP - need, &ml, &mi, &merr);
+                                        (const unsigned char (*)[33])P->pubs, P->npubs, ps, nps, &P->pre, mr, SRW_RECS, &nmr, wit, SRW_WITCAP - need, &ml, &mi, &merr);
+        if (g_srw_rec && g_srw_nrec){ for (int q = 0; q < nmr && *g_srw_nrec < SRW_RECS; q++){ srw_rec_t* rr = &g_srw_rec[*g_srw_nrec]; memcpy(rr->pub, mr[q].pub, (size_t)mr[q].publen); rr->publen = mr[q].publen; memcpy(rr->sig, mr[q].sig, (size_t)mr[q].sl); rr->sl = mr[q].sl; memcpy(rr->lh, lh, 32); rr->has_lh = 1; (*g_srw_nrec)++; } }
         if (r == 0) return "P2TR script-path: pk(), multi_a() and miniscript leaves are signed on this node; this leaf is none of those";
         if (r == -1) return merr;
         unsigned long o = ml;
@@ -1886,6 +1893,26 @@ static int srw_multisig_sigs(unsigned char (*sigs)[80], int* siglens, int k, con
         int h = srw_key_index(keys[i], keylen[i], kpub, ncomp, nkeys);
         if (h < 0) continue;
         siglens[got] = srw_ecdsa(sigs[got], z, kpriv[h], hashtype); got++;
+    }
+    return got;
+}
+/* the same, merging PARTIAL_SIGs the PSBT carries for keys we do not hold, in script order;
+ * rec[]/nrec receive (pubkey, sig) for every signature placed (2026-09-01) */
+static int srw_multisig_sigs2(unsigned char (*sigs)[80], int* siglens, int k, const unsigned char* keys[], const int* keylen, int n,
+                              const unsigned char z[32], unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys, int hashtype,
+                              const srw_prev_t* P, srw_rec_t* rec, int reccap, int* nrec){
+    int got = 0;
+    for (int i = 0; i < n && got < k; i++){
+        int h = srw_key_index(keys[i], keylen[i], kpub, ncomp, nkeys);
+        if (h >= 0){ siglens[got] = srw_ecdsa(sigs[got], z, kpriv[h], hashtype); }
+        else {
+            int found = -1;
+            if (keylen[i] == 33) for (int q = 0; q < P->n_v0_psig; q++) if (!memcmp(P->v0_psig[q].pub, keys[i], 33)){ found = q; break; }
+            if (found < 0) continue;
+            memcpy(sigs[got], P->v0_psig[found].sig, (size_t)P->v0_psig[found].sl); siglens[got] = P->v0_psig[found].sl;
+        }
+        if (rec && *nrec < reccap && keylen[i] == 33){ srw_rec_t* r = &rec[*nrec]; memcpy(r->pub, keys[i], 33); r->publen = 33; memcpy(r->sig, sigs[got], (size_t)siglens[got]); r->sl = siglens[got]; r->has_lh = 0; (*nrec)++; }
+        got++;
     }
     return got;
 }
@@ -1999,15 +2026,18 @@ static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigne
     int k; const unsigned char* keys[20]; int kl[20]; int n=srw_parse_multisig(ws,wl,&k,keys,kl);
     if (n<0){
         /* miniscript (2026-09-01): the satisfier builds the witness from the keys we hold, the
-         * PSBT's preimages and the tx's timelock fields; the witnessScript is appended here */
+         * PSBT's preimages, partial signatures and the tx's timelock fields; the witnessScript is appended here */
         const char* merr=NULL; unsigned long ml=0; int mi=0;
-        int r=ms_sign_witness_v0(ws,wl,z,hashtype,seq,locktime,kpriv,kpub,ncomp,nkeys,(const unsigned char (*)[33])P->pubs,P->npubs,&P->pre,wit,SRW_WITCAP-(3+wl),&ml,&mi,&merr);
+        ms_psig_t ps[32]; int nps=0; for (int q=0;q<P->n_v0_psig&&nps<32;q++){ ps[nps].x=P->v0_psig[q].pub; ps[nps].sig=P->v0_psig[q].sig; ps[nps].sl=P->v0_psig[q].sl; nps++; }
+        static ms_sigrec_t mr[SRW_RECS]; int nmr=0;
+        int r=ms_sign_witness_v0(ws,wl,z,hashtype,seq,locktime,kpriv,kpub,ncomp,nkeys,(const unsigned char (*)[33])P->pubs,P->npubs,ps,nps,&P->pre,mr,SRW_RECS,&nmr,wit,SRW_WITCAP-(3+wl),&ml,&mi,&merr);
+        if (g_srw_rec && g_srw_nrec){ for (int q=0;q<nmr&&*g_srw_nrec<SRW_RECS;q++){ srw_rec_t* rr=&g_srw_rec[*g_srw_nrec]; memcpy(rr->pub,mr[q].pub,(size_t)mr[q].publen); rr->publen=mr[q].publen; memcpy(rr->sig,mr[q].sig,(size_t)mr[q].sl); rr->sl=mr[q].sl; rr->has_lh=0; (*g_srw_nrec)++; } }
         if (r==1){ o=ml; o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=mi+1; return NULL; }
         if (r==-1) return merr;
         return "Unsupported witnessScript (CHECKMULTISIG, <pub> CHECKSIG or miniscript only)";
     }
     unsigned char sigs[20][80]; int sls[20];
-    int got=srw_multisig_sigs(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype);
+    int got=srw_multisig_sigs2(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype,P,g_srw_rec,g_srw_rec?SRW_RECS:0,g_srw_nrec?g_srw_nrec:&(int){0});
     wit[o++]=0x00;                                                              /* the empty dummy element */
     for (int q=0;q<got;q++){ wit[o++]=(unsigned char)sls[q]; memcpy(wit+o,sigs[q],(size_t)sls[q]); o+=sls[q]; }
     o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=2+got;
@@ -2071,6 +2101,14 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
                   size_t gl=strlen(pg->str); if (gl!=128&&gl!=130) continue;
                   int n2=P->n_tap_psig; if (!hex_to_bytes(P->tap_psig[n2].x,px->str,64)||!hex_to_bytes(P->tap_psig[n2].lh,pl->str,64)||!hex_to_bytes(P->tap_psig[n2].sig,pg->str,gl)) continue;
                   P->tap_psig[n2].sl=(int)(gl/2); P->n_tap_psig++; } }
+              P->n_v0_psig=0;
+              { rj_val* ps0=rj_obj_get(e,"partialSigs");
+                if (ps0&&ps0->typ==RJ_ARR){ for (unsigned long q=0;q<ps0->nitems&&P->n_v0_psig<32;q++){ rj_val* d=ps0->items[q]; if (d->typ!=RJ_OBJ) continue;
+                    rj_val* px=rj_obj_get(d,"pubkey"); rj_val* pg=rj_obj_get(d,"sig");
+                    if (!px||!pg||px->typ!=RJ_STR||pg->typ!=RJ_STR||strlen(px->str)!=66) continue;
+                    size_t gl=strlen(pg->str); if (gl<16||gl>160||(gl&1)) continue;
+                    int n2=P->n_v0_psig; if (!hex_to_bytes(P->v0_psig[n2].pub,px->str,66)||!hex_to_bytes(P->v0_psig[n2].sig,pg->str,gl)) continue;
+                    P->v0_psig[n2].sl=(int)(gl/2); P->n_v0_psig++; } } }
               rj_val* tk=rj_obj_get(e,"tapKeySig"); if (tk&&tk->typ==RJ_STR&&(strlen(tk->str)==128||strlen(tk->str)==130)&&hex_to_bytes(P->tap_keysig,tk->str,strlen(tk->str))) P->tap_keysig_len=(int)(strlen(tk->str)/2); }
             /* "preimages": [{"hash":hex20|hex32,"preimage":hex32},...] -- what a PSBT's
              * PSBT_IN_*_PREIMAGES fields carry, for miniscript hash challenges */
@@ -2126,6 +2164,9 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     /* --- sign each input --- */
     static unsigned char ss[10000][1400]; unsigned long sslen[10000];      /* scriptSig per input (a 3-sig P2SH multisig is ~330 bytes) */
     static unsigned char witbuf[10000][SRW_WITCAP]; unsigned long witlen[10000]; int wititems[10000]; /* witness items (the count goes in front at assembly) */
+    /* the signatures placed per input (own or carried), for the PSBT's partial-signature fields */
+    static srw_rec_t srec[10000][SRW_RECS]; static int nsrec[10000];
+    for (unsigned long i=0;i<n_in;i++) nsrec[i]=0;
     /* prevtx of every input, for the taproot sighash (which commits to all spent outputs) */
     static srw_prev_t* prev_of[10000];
     for (unsigned long i=0;i<n_in;i++){
@@ -2137,6 +2178,7 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     rj_val* errors=rj_arr();
     unsigned char* pre=malloc((size_t)txlen+8192); if (!pre){ *ec=-7; *em="oom"; return 0; }
     for (unsigned long i=0;i<n_in;i++){
+        g_srw_rec=srec[i]; g_srw_nrec=&nsrec[i];   /* signature records for this input (PSBT partials) */
         sslen[i]=0; witlen[i]=0; wititems[i]=0;
         /* match prevout */
         srw_prev_t* P=NULL; unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
@@ -2188,7 +2230,7 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
                     if (n<0) err="Unsupported redeemScript (CHECKMULTISIG, P2WPKH or P2WSH only)";
                     else if (!legacy_sighash(z,tx,txlen,i,P->redeem,P->redeemlen,hashtype,pre,(unsigned long)txlen+8192)) err="sighash failed";
                     else { unsigned char sigs[20][80]; int sls[20];
-                        int got=srw_multisig_sigs(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype);
+                        int got=srw_multisig_sigs2(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype,P,(srw_rec_t*)srec[i],SRW_RECS,&nsrec[i]);
                         unsigned long o=0; ss[i][o++]=0x00;                                             /* CHECKMULTISIG's dummy */
                         for (int q=0;q<got;q++) o+=srw_push(ss[i]+o,sigs[q],(unsigned long)sls[q]);
                         o+=srw_push(ss[i]+o,P->redeem,P->redeemlen); sslen[i]=o;
@@ -2268,6 +2310,18 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     rj_obj_set(o,"hex",rj_str(hex)); free(hex);
     rj_obj_set(o,"complete",rj_bool(complete));
     if (errors->nitems>0) rj_obj_set(o,"errors",errors); else rj_free(errors);
+    /* "_sigs" (internal, consumed by the PSBT layer): every signature placed per input, keyed by
+     * pubkey (33-byte for ECDSA, x-only + leaf_hash for tapscript) -- the PARTIAL_SIG / TAP_SCRIPT_SIG fields */
+    { rj_val* sa=rj_arr(); int any=0;
+      for (unsigned long i=0;i<n_in;i++) for (int q=0;q<nsrec[i];q++){
+          rj_val* e=rj_obj(); char idh[65]; unsigned char disp[32]; for(int b=0;b<32;b++) disp[b]=in_outpoint[i][31-b]; bin_to_hex(idh,disp,32);
+          unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
+          rj_obj_set(e,"txid",rj_str(idh)); rj_obj_set(e,"vout",rj_numf("%lu",vo));
+          char ph[67]; bin_to_hex(ph,srec[i][q].pub,(size_t)srec[i][q].publen); rj_obj_set(e,"pubkey",rj_str(ph));
+          char sh[161]; bin_to_hex(sh,srec[i][q].sig,(size_t)srec[i][q].sl); rj_obj_set(e,"sig",rj_str(sh));
+          if (srec[i][q].has_lh){ char lh[65]; bin_to_hex(lh,srec[i][q].lh,32); rj_obj_set(e,"leaf_hash",rj_str(lh)); }
+          rj_arr_push(sa,e); any=1; }
+      if (any) rj_obj_set(o,"_sigs",sa); else rj_free(sa); }
     *result=o;
     return 1;
 }
@@ -3610,7 +3664,11 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     static unsigned char rec_ss[FIN_MAXIO][4096]; static unsigned long rec_sslen[FIN_MAXIO];
     static unsigned char rec_wit[FIN_MAXIO][4096]; static unsigned long rec_witlen[FIN_MAXIO]; static unsigned rec_witems[FIN_MAXIO];
     static int rec_state[FIN_MAXIO];   /* 0 unsigned, 1 partial, 2 complete */
-    for (int i = 0; i < n_in; i++){ in_spklen[i] = 0; rec_sslen[i] = rec_witlen[i] = 0; rec_witems[i] = 0; rec_state[i] = 0; }
+    /* signatures the delegate placed (its "_sigs"): PARTIAL_SIG (0x02|pub33) or TAP_SCRIPT_SIG (0x14|x|leafhash) */
+    #define SG_MAX 8
+    static unsigned char sg_k[FIN_MAXIO][SG_MAX][67]; static unsigned long sg_kl[FIN_MAXIO][SG_MAX];
+    static unsigned char sg_v[FIN_MAXIO][SG_MAX][80]; static unsigned long sg_vl[FIN_MAXIO][SG_MAX]; static int sg_n[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++){ in_spklen[i] = 0; rec_sslen[i] = rec_witlen[i] = 0; rec_witems[i] = 0; rec_state[i] = 0; sg_n[i] = 0; }
     /* inputs the MuSig2 stage finished are complete before any round: their
      * witness is the aggregated key-path signature, and the delegate's
      * "keys not provided" for them is ignored by the per-input record */
@@ -3677,6 +3735,13 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
               if (lh){ bin_to_hex(lh, T->leaf[round-1], T->leaflen[round-1]); rj_obj_set(e, "tapLeafScript", rj_str(lh)); free(lh); }
               bin_to_hex(hx, T->ctrl[round-1], T->ctrllen[round-1]); rj_obj_set(e, "tapControlBlock", rj_str(hx)); }
           if (T->keysig){ char kh[131]; bin_to_hex(kh, T->keysig, T->keysiglen); rj_obj_set(e, "tapKeySig", rj_str(kh)); }
+          { rj_val* arr = NULL;   /* PARTIAL_SIG (0x02 | pub33) entries: carried into multisig / miniscript witnesses */
+            for (int k2 = 0; k2 < in_n[i]; k2++){ const psbt_kv* kv = &ikv[i][k2];
+                if (kv->kl != 34 || kv->k[0] != 0x02 || kv->vl < 8 || kv->vl > 80) continue;
+                if (!arr) arr = rj_arr();
+                rj_val* d = rj_obj(); char h1[67], h2[161]; bin_to_hex(h1, kv->k + 1, 33); bin_to_hex(h2, kv->v, kv->vl);
+                rj_obj_set(d, "pubkey", rj_str(h1)); rj_obj_set(d, "sig", rj_str(h2)); rj_arr_push(arr, d); }
+            if (arr) rj_obj_set(e, "partialSigs", arr); }
           if (T->npsig){ rj_val* arr = rj_arr();
               for (int q = 0; q < T->npsig; q++){ rj_val* d = rj_obj(); char h1[65], h2[65], h3[131]; bin_to_hex(h1, T->psig_k[q], 32); bin_to_hex(h2, T->psig_k[q] + 32, 32); bin_to_hex(h3, T->psig_v[q], T->psig_vl[q]);
                   rj_obj_set(d, "pubkey", rj_str(h1)); rj_obj_set(d, "leaf_hash", rj_str(h2)); rj_obj_set(d, "sig", rj_str(h3)); rj_arr_push(arr, d); }
@@ -3722,12 +3787,33 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     if (!rc) return 0;
     rj_val* rhex = rj_obj_get(sres, "hex");
     if (!rhex || !rhex->str){ rj_free(sres); *ec = -22; *em = "signing produced no transaction"; return 0; }
+    if (getenv("PSBT_DEBUG")){ long jl = 0; char* js = rj_write_alloc(sres, 0, &jl); fprintf(stderr, "[psbt_debug] round %d signer result: %.1500s\n", round, js ? js : "?"); free(js); }
     /* record what this round signed, per input */
     { static unsigned char rbuf[200000]; unsigned long rhl = strlen(rhex->str);
       if ((rhl & 1) || rhl/2 > sizeof rbuf || !hex_to_bytes(rbuf, rhex->str, rhl)){ rj_free(sres); *ec = -22; *em = "TX decode failed"; return 0; }
       static crt_in_t rin[FIN_MAXIO]; int rn, rsw; unsigned long rost, roen;
       if (!crt_walk(rbuf, rhl/2, rin, FIN_MAXIO, &rn, &rost, &roen, &rsw) || rn != n_in){ rj_free(sres); *ec = -22; *em = "signed transaction shape mismatch"; return 0; }
       rj_val* errs = rj_obj_get(sres, "errors");
+      { rj_val* sa = rj_obj_get(sres, "_sigs");
+        for (unsigned long q = 0; sa && sa->typ == RJ_ARR && q < sa->nitems; q++){
+            rj_val* e = sa->items[q]; rj_val* et = rj_obj_get(e, "txid"); rj_val* ev = rj_obj_get(e, "vout"); rj_val* ep = rj_obj_get(e, "pubkey"); rj_val* es = rj_obj_get(e, "sig"); rj_val* el = rj_obj_get(e, "leaf_hash");
+            if (!et || !ev || !ep || !es || et->typ != RJ_STR || ep->typ != RJ_STR || es->typ != RJ_STR) continue;
+            for (int i = 0; i < n_in; i++){
+                char tid[65]; for (int k2 = 0; k2 < 32; k2++){ static const char* H = "0123456789abcdef"; unsigned char b2 = uin[i].op[31-k2]; tid[k2*2] = H[b2>>4]; tid[k2*2+1] = H[b2&15]; } tid[64] = 0;
+                unsigned long vo = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) | ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+                if (strcmp(et->str, tid) || strtoul(ev->str, 0, 10) != vo) continue;
+                if (sg_n[i] >= SG_MAX) break;
+                unsigned char key[67]; unsigned long kl = 0; size_t pl = strlen(ep->str), sl = strlen(es->str);
+                if (el && el->typ == RJ_STR && pl == 64 && strlen(el->str) == 64){ key[0] = 0x14; if (!hex_to_bytes(key+1, ep->str, 64) || !hex_to_bytes(key+33, el->str, 64)) break; kl = 65; }
+                else if (pl == 66){ key[0] = 0x02; if (!hex_to_bytes(key+1, ep->str, 66)) break; kl = 34; }
+                else break;
+                if ((sl & 1) || sl/2 > 80) break;
+                int dup = 0; for (int z = 0; z < sg_n[i]; z++) if (sg_kl[i][z] == kl && !memcmp(sg_k[i][z], key, kl)) dup = 1;
+                if (dup) break;
+                memcpy(sg_k[i][sg_n[i]], key, kl); sg_kl[i][sg_n[i]] = kl; hex_to_bytes(sg_v[i][sg_n[i]], es->str, sl); sg_vl[i][sg_n[i]] = sl/2; sg_n[i]++;
+                break;
+            }
+        } }
       for (int i = 0; i < n_in; i++){
           int signed_i = (rin[i].sslen > 0) || (rin[i].witlen > 0 && rin[i].witems > 0);
           if (!signed_i) continue;
@@ -3858,6 +3944,16 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
             /* a partial we produce replaces the same key already present */
             { int dup = 0; for (int q = 0; q < px_n[i]; q++) if (ikv[i][k2].kl == px_kl[i][q] && !memcmp(ikv[i][k2].k, px_k[i][q], px_kl[i][q])) dup = 1; if (dup) continue; }
             keep[kn++] = ikv[i][k2];
+        }
+        if (!finalized){   /* the delegate's own signatures become PARTIAL_SIG / TAP_SCRIPT_SIG entries */
+            for (int q = 0; q < sg_n[i] && px_n[i] < PX_MAX; q++){
+                int dup = 0; for (int z = 0; z < px_n[i]; z++) if (px_kl[i][z] == sg_kl[i][q] && !memcmp(px_k[i][z], sg_k[i][q], sg_kl[i][q])) dup = 1;
+                if (dup) continue;
+                memcpy(px_k[i][px_n[i]], sg_k[i][q], sg_kl[i][q]); px_kl[i][px_n[i]] = sg_kl[i][q];
+                memcpy(px_v[i][px_n[i]], sg_v[i][q], sg_vl[i][q]); px_vl[i][px_n[i]] = sg_vl[i][q]; px_n[i]++;
+            }
+            /* ...and replace the same keys already in the map (a partial from a previous pass) */
+            int kn2 = 0; for (int z = 0; z < kn; z++){ int rep = 0; for (int q = 0; q < px_n[i]; q++) if (keep[z].kl == px_kl[i][q] && !memcmp(keep[z].k, px_k[i][q], px_kl[i][q])) rep = 1; if (!rep) keep[kn2++] = keep[z]; } kn = kn2;
         }
         static psbt_kv extra[PX_MAX + 2]; int en = 0;
         static unsigned char k7 = 0x07, k8 = 0x08;
