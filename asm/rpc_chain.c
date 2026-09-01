@@ -2276,6 +2276,17 @@ static int cmd_getdescriptorinfo_impl(const rj_val* params, rj_val** res, long* 
     rj_obj_set(o,"isrange", rj_bool(d->ranged));
     rj_obj_set(o,"issolvable", rj_bool(t != DN_RAW && t != DN_ADDR));   /* addr()/raw() carry no key */
     rj_obj_set(o,"hasprivatekeys", rj_bool(d->has_priv));
+    if (descr_multipath_n(d) > 1){                                       /* BIP389: "descriptor" is the first expansion; all of them here */
+        rj_val* arr = rj_arr();
+        for (int sel = 0; sel < descr_multipath_n(d); sel++){
+            descr_multipath_select(d, sel);
+            if (!descr_to_string(d, 0, pub, sizeof pub)) continue;
+            char c2[9]; descr_checksum(pub, c2); snprintf(full, sizeof full, "%s#%s", pub, c2);
+            rj_arr_push(arr, rj_str(full));
+        }
+        descr_multipath_select(d, 0);
+        rj_obj_set(o,"multipath_expansion", arr);
+    }
     *res = o;
     return 1;
 }
@@ -2304,14 +2315,20 @@ static int cmd_deriveaddresses_impl(const rj_val* params, rj_val** res, long* ec
         if (end<begin){ *ec=-8; *em="Range specified as [begin,end] must not have begin after end"; return 0; }
         if (end-begin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
     }
-    rj_val* arr = rj_arr();
     long lo = d->ranged?begin:0, hi = d->ranged?end:0;
-    for (long i=lo; i<=hi; i++){
-        char addr[128];
-        if (!rpcdesc_address_at(d, i, addr, sizeof addr, ec, em)){ rj_free(arr); return 0; }
-        rj_arr_push(arr, rj_str(addr));
+    int nmp = descr_multipath_n(d);
+    rj_val* outer = nmp > 1 ? rj_arr() : NULL;                           /* BIP389: one address list per expansion, in specifier order */
+    for (int sel = 0; sel < nmp; sel++){
+        if (nmp > 1) descr_multipath_select(d, sel);
+        rj_val* arr = rj_arr();
+        for (long i=lo; i<=hi; i++){
+            char addr[128];
+            if (!rpcdesc_address_at(d, i, addr, sizeof addr, ec, em)){ rj_free(arr); if (outer) rj_free(outer); return 0; }
+            rj_arr_push(arr, rj_str(addr));
+        }
+        if (outer) rj_arr_push(outer, arr); else { *res = arr; return 1; }
     }
-    *res = arr;
+    *res = outer;
     return 1;
 }
 static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -2349,6 +2366,21 @@ static int rpc_desc_normalize_impl(const char* in, char* out, long cap, int* is_
     if ((long)snprintf(out, (size_t)cap, "%s#%s", d->text, d->checksum) >= cap){
         snprintf(err,errcap,"Descriptor too long"); return 0; }
     return 1;
+}
+/* BIP389 for importdescriptors: the number of expansions of `in` (1 when it is
+ * not multipath), writing each expansion's public form + checksum into out[]
+ * (up to cap). 0 with err on a parse error. */
+int rpc_desc_multipath_expand(const char* in, char (*out)[340], int cap, char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); free(d); return 0; }
+    int n = descr_multipath_n(d); if (n > cap) n = cap;
+    for (int sel = 0; sel < n; sel++){
+        char pub[1500]; descr_multipath_select(d, sel);
+        if (!descr_to_string(d, 0, pub, sizeof pub) || strlen(pub) + 10 > 340){ snprintf(err,errcap,"Descriptor too long"); free(d); return 0; }
+        char c2[9]; descr_checksum(pub, c2); snprintf(out[sel], 340, "%s#%s", pub, c2);
+    }
+    free(d); return n;
 }
 rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
                        char* err, unsigned long errcap){
@@ -3885,6 +3917,8 @@ static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlen
         { char e[256]; if (!descr_parse(core, &d, e, sizeof e)){ snprintf(perr,sizeof perr,"%s",e); *ec=-5; *em=perr; return 0; } }
         long lo = 0, hi = 0;
         if (d.ranged){ lo = rbegin; hi = (rend >= 0) ? rend : 1000; }   /* Core's default range */
+        for (int sel = 0; sel < descr_multipath_n(&d); sel++){          /* BIP389: every expansion is scanned */
+        descr_multipath_select(&d, sel);
         for (long i = lo; i <= hi; i++){
             descr_spk_t sp[4]; int n = descr_expand(&d, i, sp, 4);   /* combo: all four forms are scanned */
             if (n < 0){ snprintf(perr,sizeof perr,"%s", descr_last_error()); *ec=-5; *em=perr; return 0; }
@@ -3894,6 +3928,7 @@ static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlen
                 memcpy(targets[ntgt], sp[q].spk, (size_t)sp[q].len); tlens[ntgt] = (u32)sp[q].len; ntgt++;
             }
         }
+        }   /* expansions */
     }
     *ntgt_io = ntgt;
     return 1;

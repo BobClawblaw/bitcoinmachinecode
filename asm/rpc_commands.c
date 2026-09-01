@@ -3190,14 +3190,17 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
  * derivations. That is not implemented, so supplying it is an ERROR rather
  * than an argument quietly ignored -- a caller who passed descriptors and
  * got a PSBT back without them would reasonably believe they were applied. */
+#include "descriptor.h"
+#include "psbt_update.h"
+typedef struct { descr_t* d; long lo, hi; } dpp_desc_t;
+static int dpp_load_descs(const rj_val* da, descr_t* descs, dpp_desc_t* dv, int cap, int* nd_out, long* ec, const char** em);
 static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    /* descriptors (2026-09-01): after the UTXO fill below, the Updater adds the
+     * scripts / origins / taproot fields those descriptors provide */
+    static descr_t udescs[16]; static dpp_desc_t udv[16]; int und = 0;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR && params->items[1]->nitems > 0){
-        *ec = -8;
-        *em = "the descriptors argument is not implemented by this node: it would add "
-              "redeem/witness scripts and BIP32 derivations to the PSBT. Call without "
-              "descriptors to fill witness UTXOs from the UTXO set";
-        return 0;
+        if (!dpp_load_descs(params->items[1], udescs, udv, 16, &und, ec, em)) return 0;
     }
     static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
     if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
@@ -3253,6 +3256,11 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
     }
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
+    if (und){   /* the Updater (psbt_update.c) works on the v0-shaped buffer, before the caller's version is emitted */
+        static unsigned char out2[240000];
+        long o2 = psbt_update_bytes_from_descs(out, o, (pu_desc_t*)udv, und, out2, sizeof out2);
+        if (o2 > 0 && o2 <= (long)sizeof out){ memcpy(out, out2, (size_t)o2); o = o2; }
+    }
     char* b = psbt_b64_out(out, o, &vm); if (!b){ *ec=-7; *em="oom"; return 0; }
     *result = rj_str(b); free(b);
     return 1;
@@ -3826,7 +3834,7 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
                  * final to write and no per-key partial this node can name
                  * without verifying each signature -- the input is left as
                  * supplied and the result says complete=false */
-                if (rec_state[i] == 1 && finalize) continue;
+                if (rec_state[i] == 1) continue;   /* partial multisig/miniscript: the Updater's fields stay, no per-key partial is named (see _sigs below) */
                 rj_free(sres); *ec = -8;
                 *em = "finalize=false: partial-signature extraction is supported only for "
                       "P2WPKH, P2PKH and P2TR inputs on this node";
@@ -3905,7 +3913,26 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
     if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
-    return psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, ec, em, result);
+    /* ==== Updater from the wallet's own descriptors (listdescriptors): scripts, origins, taproot fields ==== */
+    char* upd = NULL;
+    { rj_val* ld = NULL; long e2 = 0; const char* m2 = NULL; rj_val* np = rj_arr();
+      if (rpc_wops_dispatch("listdescriptors", np, w, &ld, &e2, &m2) && ld){
+          rj_val* arr = rj_obj_get(ld, "descriptors");
+          static descr_t wdescs[16]; static dpp_desc_t wdv[16]; int wnd = 0;
+          for (unsigned long i = 0; arr && i < arr->nitems && wnd < 16; i++){
+              rj_val* e = arr->items[i]; rj_val* ds = rj_obj_get(e, "desc"); rj_val* rg = rj_obj_get(e, "range");
+              if (!ds || ds->typ != RJ_STR) continue;
+              char err[256]; if (!descr_parse(ds->str, &wdescs[wnd], err, sizeof err)) continue;
+              long lo = 0, hi = 0;
+              if (wdescs[wnd].ranged){ hi = 1000; if (rg && rg->typ == RJ_ARR && rg->nitems == 2){ lo = strtol(rg->items[0]->str, NULL, 10); hi = strtol(rg->items[1]->str, NULL, 10); } if (hi - lo > 5000) hi = lo + 5000; }
+              wdv[wnd].d = &wdescs[wnd]; wdv[wnd].lo = lo; wdv[wnd].hi = hi; wnd++;
+          }
+          if (wnd) upd = psbt_update_from_descs(b64, (pu_desc_t*)wdv, wnd);
+      }
+      if (ld) rj_free(ld); rj_free(np); }
+    int rc = psbt_process(upd ? upd : b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, ec, em, result);
+    free(upd);
+    return rc;
 }
 
 /* ==== descriptorprocesspsbt ==============================================
@@ -3919,7 +3946,7 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
  * as Core does. The script forms that can be signed are the raw signer's:
  * P2PKH, P2WPKH, P2SH-P2WPKH. */
 #include "descriptor.h"
-typedef struct { descr_t* d; long lo, hi; } dpp_desc_t;
+#include "psbt_update.h"
 typedef struct { dpp_desc_t* v; int n; } dpp_ctx_t;
 static void dpp_wif(char* out, const unsigned char priv[32], int compressed){
     unsigned char pay[34]; pay[0] = 0x80; memcpy(pay+1, priv, 32); pay[33] = 1;   /* the raw signer reads the 0x80 form on every chain */
@@ -4090,16 +4117,11 @@ static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd){
     return b;
 }
 #define DPP_MAX_DESCS 16
-int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
-    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
-    if (params->nitems < 2 || params->items[1]->typ != RJ_ARR){ *ec = -8; *em = "descriptors must be an array of descriptor strings or {desc,range} objects"; return 0; }
-    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
-    int finalize = 1;
-    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
-    const rj_val* da = params->items[1];
-    static descr_t descs[DPP_MAX_DESCS]; static dpp_desc_t dv[DPP_MAX_DESCS]; int nd = 0;
+/* the descriptors argument -> parsed descriptors with ranges; a multipath descriptor expands to one entry per path */
+static int dpp_load_descs(const rj_val* da, descr_t* descs, dpp_desc_t* dv, int cap, int* nd_out, long* ec, const char** em){
+    int nd = 0;
     static char perr[300];
-    if (da->nitems > DPP_MAX_DESCS){ *ec = -8; *em = "Too many descriptors"; return 0; }
+    if ((int)da->nitems > cap){ *ec = -8; *em = "Too many descriptors"; return 0; }
     for (unsigned long i = 0; i < da->nitems; i++){
         const rj_val* o = da->items[i]; const char* ds = NULL; long lo = 0, hi = 1000;
         if (o->typ == RJ_STR) ds = o->str;
@@ -4112,15 +4134,34 @@ int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** e
         }
         if (!ds){ *ec = -8; *em = "Descriptor needs to be provided in scan object"; return 0; }
         char e[256];
+        if (nd >= cap){ *ec = -8; *em = "Too many descriptors"; return 0; }
         if (!descr_parse(ds, &descs[nd], e, sizeof e)){ snprintf(perr, sizeof perr, "%s", e); *ec = -5; *em = perr; return 0; }
         if (!descs[nd].ranged){ lo = 0; hi = 0; }
         if (lo < 0 || hi < lo || hi - lo > 100000){ *ec = -8; *em = "Invalid range"; return 0; }
         dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
+        /* BIP389: every further expansion is a descriptor of its own */
+        for (int sel = 1; sel < descr_multipath_n(&descs[nd-1]); sel++){
+            if (nd >= cap){ *ec = -8; *em = "Too many descriptors"; return 0; }
+            descs[nd] = descs[nd-1]; descr_multipath_select(&descs[nd], sel);
+            dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
+        }
     }
+    *nd_out = nd; return 1;
+}
+int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    if (params->nitems < 2 || params->items[1]->typ != RJ_ARR){ *ec = -8; *em = "descriptors must be an array of descriptor strings or {desc,range} objects"; return 0; }
+    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
+    int finalize = 1;
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
+    static descr_t descs[DPP_MAX_DESCS]; static dpp_desc_t dv[DPP_MAX_DESCS]; int nd = 0;
+    if (!dpp_load_descs(params->items[1], descs, dv, DPP_MAX_DESCS, &nd, ec, em)) return 0;
     dpp_ctx_t ctx = { dv, nd };
-    char* upd = dpp_musig_update(b64, dv, nd);          /* the Updater role for musig() descriptors (BIP390/BIP373) */
-    int rc = psbt_process(upd ? upd : b64, 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, ec, em, result);
-    free(upd);
+    /* ==== Updater (psbt_update.c): scripts, bip32 origins, taproot leaves/control blocks/derivs ==== */
+    char* upd0 = psbt_update_from_descs(b64, (pu_desc_t*)dv, nd);
+    char* upd = dpp_musig_update(upd0 ? upd0 : b64, dv, nd);          /* the Updater role for musig() descriptors (BIP390/BIP373) */
+    int rc = psbt_process(upd ? upd : (upd0 ? upd0 : b64), 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, ec, em, result);
+    free(upd); free(upd0);
     return rc;
 }
 

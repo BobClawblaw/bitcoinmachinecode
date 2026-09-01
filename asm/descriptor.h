@@ -110,6 +110,10 @@ int  descr_has_address(const descr_t* d);
  * (-1 = none; 1 ok / 0 out of range). Every derivation/expansion/printing
  * function then sees that single-path descriptor. descr_to_string_multipath
  * prints the original multipath form. */
+/* tr() tree leaves for the PSBT Updater (BIP371 fields) */
+typedef struct { int depth, leaf_ver, slen, npath, ctrl_len; unsigned char script[1400]; unsigned char leaf_hash[32];
+                 unsigned char path[128][32]; unsigned char ctrl[33 + 32 * 128]; } descr_leaf_t;
+int  descr_tr_leaves(const descr_t* d, long idx, descr_leaf_t* out, int cap, unsigned char internal32[32], unsigned char root32[32], int* has_root, int* odd);
 int  descr_multipath_n(const descr_t* d);
 int  descr_multipath_select(descr_t* d, int sel);
 int  descr_to_string_multipath(const descr_t* d, int with_priv, char* out, unsigned long cap);
