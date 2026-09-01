@@ -19,9 +19,14 @@ below is landed on `arm-port` and pushed; details in `worklog/2026-09-01.md`.
       369bc2a 17561e6 2561264 272c999 27e280c
 
 ## Open (next sessions, evidence in the worklog)
-- [ ] verify_p2pkh/der_parse_sig/be_to_limbs port into bitcoin_script.S
-      (~133 instrs; blocks test_p2pkh, test_send, test_txval,
-      test_wrpc_{send,sign}, test_e2e_sighash).
+- [x] verify_p2pkh/der_parse_sig/be_to_limbs port into bitcoin_script.S --
+      test_p2pkh/txval/send/wrpc_send/wrpc_sign/e2e_sighash all PASS
+      (daeb44a; bring-up caught the s-marker strip-invariant and the varint
+      cursor-in-x1 return contract).
+- [x] serve getaddr: now calls serve_getaddr over the v2 book (7b22e29);
+      test_addrv2_serve PASSES. Sweep harness: wallet_cli/bitcoin_rpcd/
+      bitcoin_cli special builds + scratch daemon/ real dir + the
+      relative-symlink fix (all overlay targets absolute now).
 - [ ] Interpreter/store segfaults: test_dersig_encoding (stack_push copy loop,
       len=0xffffffff via the toalt path), test_interp_legacy_spend (done+44),
       test_archive_truncate_nonmonotonic (main+528: some asm callee clobbers
@@ -29,15 +34,15 @@ below is landed on `arm-port` and pushed; details in `worklog/2026-09-01.md`.
       test_utxo_lsm, test_utxo_setinfo, test_multisig_opcount. Systematic tool
       needed: AArch64 port of scripts/abi_callee_saved_audit.py (the x86 one is
       NASM-specific; my objdump heuristic is not sound enough to gate fixes).
-- [ ] Serve getaddr replies nothing (test_addrv2_serve); keepup does not serve
-      a pushed block (test_keepup). Likely one shared root post-serve-fixes.
-- [ ] signet chain flags: test_chainparams (4 fails), test_script_flags
-      (signet h=1 flags=0x20801 missing bits).
-- [ ] daemon-lifecycle tests (test_rpc_server/test_rpc_transport) with the
-      scratch ./daemon symlink now provided; test_node_config "0 of 0
-      documented keys" — input resolution from the scratch cwd.
-- [ ] 6. IBD smoke (ibd_lsm/ibd_par) against the 2026-08-31 leveled compaction
-      + defer_publish/unlink; record heights/compaction numbers.
+- [ ] test_keepup: pushed block not served byte-exact (the .do_block chain
+      gate or the serve-side store read; gdb multi-inferior capture pending).
+- [x] signet chain flags: 4-way sfc_chain dispatch restored (f2877e2);
+      test_chainparams + test_script_flags PASS.
+- [x] daemon-lifecycle tests: bitcoin_rpcd + bitcoin_cli now special-built;
+      test_rpc_server + test_rpc_transport PASS.
+- [x] 6. IBD smoke done (fa4f769 8238256): resume-at-tip vs the LAN oracle,
+      3 real blocks applied, persistence MATCH; tx_walk segwit fix; LSM hole
+      965009..965014 needs backfill (lift the G_force_start clamp).
 - [ ] env-only (documented, no action): bench_checkblock/bench_hashidx/
       bench_idxscan/bench_taproot_block need production data files;
       test_net_timeouts needs >600s.

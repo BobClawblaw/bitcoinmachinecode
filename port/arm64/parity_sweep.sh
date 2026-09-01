@@ -388,6 +388,45 @@ if [ ! -x "$OUT/wallet_cli" ]; then
     bitcoin_sighash_all_ext.o secp256k1_glv.o secp256k1_glv_mul.o 2>> "$OUT/build.log" \
   || echo -e "build-fail\tSPECIAL:wallet_cli\tsee build.log" >> "$OUT/results.tsv"
 fi
+# daemon/bitcoin_rpcd: the RPC daemon binary (test_rpc_server execs it as
+# ./daemon/bitcoin_rpcd with TEST_RPC_PORT=0). Link = the daemon bundle with
+# bitcoin_rpcd.c swapped for main.c (build_daemon.sh's lists, minus main).
+# daemon/bitcoin_cli: daemon/bitcoin_cli.c + cli_conf.c + rpc_net/commands/json
+# + RPCLIBS (test_rpc_server shells out to it).
+if [ ! -x "$OUT/bitcoin_cli" ]; then
+  gcc -no-pie -O2 -I../../asm -o "$OUT/bitcoin_cli" \
+    ../../asm/daemon/bitcoin_cli.c ../../asm/daemon/cli_conf.c \
+    ../../asm/rpc_net.c ../../asm/rpc_commands.c ../../asm/rpc_json.c \
+    ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c \
+    ../../asm/rpc_signer.c ../../asm/daemon/bfilter_index.c \
+    ../../asm/daemon/addr_index_tail.c ../../asm/wallet_labels.c \
+    ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c \
+    ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c \
+    ../../asm/bitcoin_aes.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c \
+    ../../asm/block_filter.c ../../asm/bip32_ckdpub.c \
+    ../../asm/daemon/wallet_pass.c ../../asm/wallet_core.c ../../asm/wallet_msgsign.c \
+    ../../asm/wallet_store.c ../../asm/wallet_bnb.c ../../asm/wallet_txlog.c \
+    secp256k1_fe.o secp256k1_point.o ../../asm/secp256k1_glv_c.c secp256k1_point_ct.o \
+    secp256k1_scalar.o ../../asm/secp256k1_scalar_c.c secp256k1_ecdsa.o \
+    bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
+    bitcoin_sighash_all_ext.o secp256k1_glv.o secp256k1_glv_mul.o \
+    bitcoin_hash.o sha256.o ripemd160.o bitcoin_bip39.o sha512.o bitcoin_hmac.o \
+    bitcoin_bip32.o bech32.o bitcoin_utxo.o bitcoin_script.o \
+    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o \
+    bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o \
+    bitcoin_chainwork.o parity_out/addrbook.a 2>> "$OUT/build.log" \
+  || echo -e "build-fail\tSPECIAL:bitcoin_cli\tsee build.log" >> "$OUT/results.tsv"
+fi
+if [ ! -x "$OUT/bitcoin_rpcd" ]; then
+  DS="../../asm/daemon/utxo_live.c ../../asm/daemon/block_witness.c ../../asm/daemon/tx_accept.c ../../asm/daemon/zmq_notify.c ../../asm/daemon/zmq_pub.c ../../asm/daemon/reorg.c ../../asm/daemon/undo_log.c ../../asm/daemon/locator_build.c ../../asm/daemon/archive_verify.c ../../asm/daemon/addr_ingest.c ../../asm/daemon/net_policy.c ../../asm/daemon/node_config.c ../../asm/daemon/chainparams.c ../../asm/daemon/mempool_cfg.c ../../asm/daemon/upload_cap.c ../../asm/daemon/tx_submit.c ../../asm/daemon/tx_relay.c ../../asm/daemon/tx_index_tail.c ../../asm/daemon/blk_submit.c ../../asm/daemon/utxo_setinfo_rpc.c ../../asm/daemon/coinstats_index.c ../../asm/daemon/addr_self.c ../../asm/daemon/bfilter_index.c ../../asm/daemon/block_strip.c ../../asm/wallet_store.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c ../../asm/bitcoin_txval_modern.c ../../asm/bitcoin_segwit.c ../../asm/bitcoin_taproot_sighash.c ../../asm/daemon/tx_verify.c ../../asm/bitcoin_scriptverify.c ../../asm/bitcoin_witness_v0.c ../../asm/daemon/serve_cfilters.c ../../asm/wallet_msgsign.c"
+  RS="../../asm/rpc_server.c ../../asm/rpc_commands.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c ../../asm/block_filter.c ../../asm/utxo_snapshot.c ../../asm/rpc_signer.c ../../asm/bip32_ckdpub.c ../../asm/rpc_json.c ../../asm/rpc_net.c ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c ../../asm/daemon/addr_index_tail.c ../../asm/wallet_labels.c ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c ../../asm/bitcoin_aes.c ../../asm/wallet_txlog.c ../../asm/wallet_bnb.c"
+  NS="../../asm/daemon/addrbook.c ../../asm/daemon/asmap.c ../../asm/daemon/dialer.c ../../asm/daemon/i2psam.c ../../asm/daemon/minchainwork.c ../../asm/daemon/net6.c ../../asm/daemon/netaddr.c ../../asm/daemon/netperm.c ../../asm/daemon/notify.c ../../asm/daemon/serve_addr.c ../../asm/daemon/serve_invbounds.c ../../asm/daemon/signet.c ../../asm/daemon/signet_block.c ../../asm/daemon/signet_verify.c ../../asm/daemon/socks5.c ../../asm/daemon/subnet.c ../../asm/daemon/torcontrol.c ../../asm/daemon/txrecon.c ../../asm/daemon/v2transport.c ../../asm/daemon/wallet_pass.c ../../asm/base32.c ../../asm/bitcoin_sha3.c ../../asm/crypto_chacha20.c ../../asm/crypto_hkdf.c ../../asm/crypto_poly1305.c ../../asm/crypto_ellswift.c ../../asm/crypto_ellswift_ecdh.c ../../asm/crypto_ellswift_enc.c ../../asm/crypto_fe_sqrt.c ../../asm/crypto_bip324.c ../../asm/crypto_bip324_fs.c ../../asm/crypto_bip324_transport.c ../../asm/daemon/rpc_acl.c ../../asm/daemon/cli_conf.c ../../asm/daemon/lsm_manifest.c ../../asm/daemon/archive_reindex.c"
+  OB="sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_sigops.o bitcoin_cmpct.o bitcoin_idxscan.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o ../../asm/secp256k1_glv_c.c secp256k1_point_ct.o secp256k1_glv.o secp256k1_glv_mul.o secp256k1_fe.o secp256k1_scalar.o ../../asm/secp256k1_scalar_c.c ripemd160.o bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o bitcoin_strip_witness.o bitcoin_store_ext.o bech32.o bitcoin_bip32.o bitcoin_bip39.o bitcoin_hmac.o sha512.o bitcoin_keys.o bitcoin_sighash_all_ext.o"
+  gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
+    -o "$OUT/bitcoin_rpcd" ../../asm/daemon/bitcoin_rpcd.c $DS $RS $NS ../../asm/wallet_core.c \
+    $(for m in $OB; do echo "$m"; done) 2>> "$OUT/build.log" \
+  || echo -e "build-fail\tSPECIAL:bitcoin_rpcd\tsee build.log" >> "$OUT/results.tsv"
+fi
 [ -f ecdsa_verify_ref.o ] || gcc -march=armv8.2-a+sha2 -c -o ecdsa_verify_ref.o ecdsa_verify_ref.S 2>> "$OUT/build.log"
 [ -f parity_support/bench_abi_guard.o ] || gcc -c -o parity_support/bench_abi_guard.o parity_support/bench_abi_guard.S 2>> "$OUT/build.log"
 
@@ -421,6 +460,8 @@ run_inv() {  # name kind args index
     mkdir -p "$scratch/daemon"
     ln -sf "$REPO/port/arm64/daemon_out/bitcoind" "$scratch/daemon/bitcoind"
     [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$scratch/daemon/wallet_cli"
+    [ -x "$AB/$OUT/bitcoin_rpcd" ] && ln -sf "$AB/$OUT/bitcoin_rpcd" "$scratch/daemon/bitcoin_rpcd"
+    [ -x "$AB/$OUT/bitcoin_cli" ] && ln -sf "$AB/$OUT/bitcoin_cli" "$scratch/daemon/bitcoin_cli"
     # ./daemon/bitcoind arg remap -> the ARM daemon
     local args2="${args//.\/daemon\/bitcoind/$REPO/port/arm64/daemon_out/bitcoind}"
     ( cd "$scratch" && timeout "$TMO" "$bin" $args2 > out.txt 2>&1 )
