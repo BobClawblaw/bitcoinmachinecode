@@ -9,6 +9,7 @@
  * Usage: discover <peers.txt> [per-seed-wait-sec] [verbose]
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>

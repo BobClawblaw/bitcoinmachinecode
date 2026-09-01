@@ -59,6 +59,7 @@
 #include "version_gen.h"
 
 #include <stdio.h>
+#include "daemon/log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>

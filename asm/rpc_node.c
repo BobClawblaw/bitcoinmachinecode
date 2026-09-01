@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
+#include "daemon/log_ts.h"
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
                         * which silently corrupted their return values */
 #include <pthread.h>

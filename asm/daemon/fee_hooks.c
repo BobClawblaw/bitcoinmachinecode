@@ -12,6 +12,7 @@
  * these strong definitions win in the daemon. */
 #include "fee_estimator.h"
 #include <stdio.h>
+#include "log_ts.h"
 #include <time.h>
 
 extern void* mp_ext_feeest;                     /* daemon/mempool_cfg.c */
