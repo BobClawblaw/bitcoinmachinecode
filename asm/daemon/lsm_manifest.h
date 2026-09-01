@@ -55,4 +55,6 @@ int lsm_manifest_sweep_orphans(const struct lsm_state* lst);
  * runs nothing is picked. */
 #define LSM_COMPACT_RATIO 4
 long lsm_compact_pick(const uint64_t* sizes, long n, long threshold, long max_k, long* lo);
+/* same, with a byte budget over the runs' total (0 = off): above it the count threshold is 2 */
+long lsm_compact_pick_budget(const uint64_t* sizes, long n, long threshold, long max_k, uint64_t budget, long* lo);
 #endif

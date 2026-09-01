@@ -280,6 +280,18 @@ static void compact_poll(void){
 static void compact_flush_hook(void){ compact_poll(); }
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
  * from the run files themselves. Returns k, sets *lo. */
+/* Byte budget for the mapped run files: 45% of MemTotal by default (the
+ * memtable mapping, the flush scratch and the rest of the box need the
+ * other half), overridable for tests. 0 = off. */
+static u64 g_run_budget = ~0ULL;
+u64 utxo_live_run_budget(void){
+    if (g_run_budget != ~0ULL) return g_run_budget;
+    u64 kb = 0; FILE* f = fopen("/proc/meminfo", "r");
+    if (f){ char line[128]; while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemTotal:", 9)){ kb = strtoull(line + 9, NULL, 10); break; } fclose(f); }
+    g_run_budget = kb ? kb * 1024 / 100 * 45 : 0;
+    return g_run_budget;
+}
+void utxo_live_set_run_budget(unsigned long long bytes){ g_run_budget = bytes; }
 static long compact_pick_now(long* lo){
     long n = (long)g_utxo_lst.manifest_n;
     if (n < 2) return 0;
@@ -291,7 +303,15 @@ static long compact_pick_now(long* lo){
         char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)r);
         struct stat sb; sizes[i] = stat(nm, &sb) == 0 ? (u64)sb.st_size : 0;
     }
-    return lsm_compact_pick(sizes, n, utxo_live_compact_threshold(), 64, lo);
+    u64 budget = utxo_live_run_budget();
+    long k = lsm_compact_pick_budget(sizes, n, utxo_live_compact_threshold(), 64, budget, lo);
+    if (k && n < utxo_live_compact_threshold()){
+        static long announced = -1; u64 total = 0; for (long i = 0; i < n; i++) total += sizes[i];
+        if (announced != n){ announced = n;
+            fprintf(stderr, "[utxo_live] run files total %.1f GB > budget %.1f GB (45%% of RAM) -- compacting %ld of %ld runs below the count threshold\n",
+                    (double)total / 1e9, (double)budget / 1e9, k, n); }
+    }
+    return k;
 }
 static long g_cmp_lo = 0;
 static int compact_start_async(long height, const char* why){

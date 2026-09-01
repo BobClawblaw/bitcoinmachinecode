@@ -169,6 +169,20 @@ int lsm_manifest_sweep_orphans(const struct lsm_state* lst){
     return gone;
 }
 
+/* Byte budget (2026-09-01): the mapped run files must stay inside the page
+ * cache next to the memtable, or every lookup faults from disk (the live
+ * replay fell to 2-5 blocks/s at 10 runs / 30 GB on a 63 GB box while the
+ * bulk count threshold sat at 48). When the runs' total exceeds `budget`
+ * bytes the pick behaves as if the count threshold were 2: the newest
+ * similar-size runs merge now, and repeated merges fold the set back under
+ * the budget. budget = 0 disables the rule. */
+long lsm_compact_pick_budget(const uint64_t* sizes, long n, long threshold, long max_k, uint64_t budget, long* lo){
+    if (budget && n >= 2){
+        uint64_t total = 0; for (long i = 0; i < n; i++) total += sizes[i];
+        if (total > budget) threshold = 2;
+    }
+    return lsm_compact_pick(sizes, n, threshold, max_k, lo);
+}
 long lsm_compact_pick(const uint64_t* sizes, long n, long threshold, long max_k, long* lo){
     if (n < 2 || n < threshold) return 0;
     long l = n - 1; uint64_t acc = sizes[l];
