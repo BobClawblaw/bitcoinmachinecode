@@ -63,7 +63,7 @@ int main(void){
      * This exact base64 was validated LIVE by Core's decodepsbt (psbt_version 0,
      * correct tx/inputs/outputs). Structure: 70736274ff | 0100 <txlen> <tx> | 00
      * (end global) | 00 (input map) | 00 (output map). --- */
-    { long ec; const char* em; const char* pj = "[[{\"txid\":\"" T "\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}]]";
+    { long ec; const char* em; const char* pj = "[[{\"txid\":\"" T "\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],0,true,2,0]";   /* psbt_version 0: Core master defaults to 2 */
       rj_val* params = rj_parse(pj, strlen(pj));
       rj_val* res=NULL; rpc_wallet w; memset(&w,0,sizeof w);
       rpc_dispatch("createpsbt", params, &w, &res, &ec, &em);
@@ -76,7 +76,7 @@ int main(void){
     /* --- converttopsbt: an unsigned raw tx -> the same PSBTv0 as createpsbt;
      * a signed tx errors without permitsigdata (Core-exact message). --- */
     { long ec; const char* em; rpc_wallet w; memset(&w,0,sizeof w);
-      const char* raw = "[\"020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000\"]";
+      const char* raw = "[\"020000000167452301efcdab8967452301efcdab8967452301efcdab899807f6e5d4c2b1a30000000000fdffffff01a0860100000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000\",false,null,0]";
       rj_val* p1=rj_parse(raw,strlen(raw)); rj_val* r1=NULL; rpc_dispatch("converttopsbt",p1,&w,&r1,&ec,&em);
       ck("converttopsbt(unsigned) == createpsbt PSBT", r1 && r1->typ==RJ_STR && !strcmp(r1->str,
          "cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAAAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA"));
@@ -98,7 +98,7 @@ int main(void){
       const char* P2 = "cHNidP8BAFUCAAAAAWdFIwHvzauJZ0UjAe/Nq4lnRSMB782riZgH9uXUwrGjAkAAAAD9////AaCGAQAAAAAAGXapFPxyUKIR3t3HDuWic43l8HgXNRzviKwAAAAAAAAA";
       char pj2[512]; snprintf(pj2,sizeof pj2,"[[\"%s\",\"%s\"]]",P,P2);
       rj_val* p3=rj_parse(pj2,strlen(pj2)); rj_val* r3=NULL; long e3; const char* m3; int rc3=rpc_dispatch("combinepsbt",p3,&w,&r3,&e3,&m3);
-      ck("combinepsbt(different txs) errors -8", rc3==0 && e3==-8 && m3 && strstr(m3,"same transaction"));
+      ck("combinepsbt(different txs) errors -8 (Core: \"PSBTs not compatible (different transactions)\")", rc3==0 && e3==-8 && m3 && strstr(m3,"not compatible"));
       rj_free(r3); rj_free(p3); }
 
     /* --- decodepsbt round-trip (our createpsbt PSBT -> our decodepsbt),
