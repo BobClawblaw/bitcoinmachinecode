@@ -1130,6 +1130,105 @@ static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lo
  * tracked, and that remains a gap worth closing separately. */
 static char g_cur_peer_ip[64];
 extern void (*g_serve_violation_hook)(const char*);
+#include "relay_policy.h"
+#include "../bmc_thread.h"   /* 2026-09-01: the mempool-reload and i2p-accept threads ran on glibc-default stacks; with ~12 MB of static TLS that is a few KB of real stack, and the one-write logging buffer (8 KB) overflowed it the moment a reused datadir had a mempool.dat to reload (fault addr == rsp in log_vfprintf_at, reproduced by validation/relay_policy_core_diff.sh run B twice) */
+extern unsigned g_conn_perms;                     /* whitebind permissions of this child (defined below) */
+/* ---- relay policy per inbound connection (2026-09-01; daemon/relay_policy.c)
+ * The serve child sets these once the peer's version is in hand (the asm
+ * handshake calls g_accept_version_hook between capturing the peer's
+ * version and building ours), and the serve loop's C gates read them. */
+extern void (*g_accept_version_hook)(void);      /* bitcoind.asm node_accept_handshake */
+extern unsigned char node_relay_flag;            /* bitcoind.asm: fRelay byte of OUR version */
+extern unsigned char g_serve_send_feefilter;     /* bitcoin_serve.asm: send `feefilter` at connect */
+static unsigned g_conn_perms_all;                /* whitelist | whitebind, this connection */
+static int      g_peer_relays_txs = 1;           /* the peer's version fRelay */
+static int      g_inbound_slot = -1;             /* our entry in the shared peer table */
+/* inbound peers that negotiated tx relay in both directions (the share Core
+ * counts: m_relays_txs on inbound peers), read from the shared table */
+static long inbound_relaying_now(void){
+    if(!g_node_status) return 0;
+    long n = 0;
+    for(int i = MUX_MAX_OUT; i < RPC_MAX_PEERS; i++){
+        const rpc_peer_t* q = &g_node_status->peers[i];
+        if(!q->used || !q->inbound || !q->relaytxes) continue;
+        if(q->pid > 0 && kill((pid_t)q->pid, 0) != 0 && errno == ESRCH) continue;
+        n++;
+    }
+    return n;
+}
+static void serve_on_peer_version(void){
+    unsigned perms = netperm_for(g_cur_peer_ip) | g_conn_perms;
+    g_conn_perms_all = perms;
+    int fr = rp_version_frelay(g_peer_version_payload, g_peer_version_len);
+    g_peer_relays_txs = fr != 0;
+    int exhausted = rp_inbound_share_exhausted(inbound_relaying_now(), CFG_INBOUND_LIMIT(), g_cfg.inboundrelaypercent);
+    node_relay_flag = (unsigned char)rp_our_frelay(perms, RP_CONN_INBOUND, exhausted);
+    g_serve_send_feefilter = (unsigned char)rp_send_feefilter(perms);
+}
+/* the serve loop's gates (bitcoin_serve.asm calls these): 0 go on, 1 drop
+ * the message quietly, -1 protocol violation (the loop disconnects) */
+int serve_tx_gate(void){
+    if(rp_reject_incoming_txs(g_conn_perms_all, RP_CONN_INBOUND)) return -1;   /* Core: "transaction sent in violation of protocol" */
+    if(!node_relay_flag) return 1;                                              /* we asked for no relay (inbound share): not relaying */
+    return 0;
+}
+int serve_inv_gate(const unsigned char* pl, long plen){
+    extern int serve_inv_bounds(const unsigned char*, long, unsigned long long*, long*);
+    unsigned long long n = 0; long off = 0;
+    if(serve_inv_bounds(pl, plen, &n, &off) != 1) return 0;
+    for(unsigned long long i = 0; i < n; i++){
+        const unsigned char* e = pl + off + i*36;
+        unsigned t = (unsigned)e[0] | ((unsigned)e[1]<<8) | ((unsigned)e[2]<<16) | ((unsigned)e[3]<<24);
+        if(t == 1 || t == 5 || t == 0x40000001u){                                /* MSG_TX / MSG_WTX / MSG_WITNESS_TX */
+            if(rp_reject_incoming_txs(g_conn_perms_all, RP_CONN_INBOUND)) return -1;
+            return 0;
+        }
+    }
+    return 0;
+}
+/* `mempool` (BIP35): Core answers only with NODE_BLOOM (never advertised
+ * here) or the `mempool` permission, and disconnects anyone else unless
+ * noban. The reply is one inv(MSG_TX) per pool entry, MAX_INV_SZ per message. */
+int serve_mempool_msg(int fd, void* mp){
+    if(!(g_conn_perms_all & NP_MEMPOOL)) return (g_conn_perms_all & NP_NOBAN) ? 1 : -1;
+    if(!mp) return 1;
+    unsigned char* m = (unsigned char*)mp;
+    unsigned long long mask; memcpy(&mask, m+8, 8);
+    static unsigned char inv[3 + 50000*36]; unsigned n = 0; long sent = 0;
+    for(unsigned long long i = 0; i <= mask; i++){
+        unsigned char* sl = m + 40 + i*48;
+        unsigned long long len; memcpy(&len, sl, 8);
+        if(len == 0xFFFFFFFFFFFFFFFFULL) continue;
+        unsigned char* e = inv + 3 + n*36; e[0]=1; e[1]=0; e[2]=0; e[3]=0; memcpy(e+4, sl+8, 32); n++;
+        if(n == 50000){ inv[0]=0xfd; inv[1]=(unsigned char)n; inv[2]=(unsigned char)(n>>8); p2p_write(fd, "inv", 3, inv, 3 + n*36); sent += n; n = 0; }
+    }
+    if(n){ if(n < 0xfd){ inv[2]=(unsigned char)n; p2p_write(fd, "inv", 3, inv+2, 1 + n*36); }
+           else { inv[0]=0xfd; inv[1]=(unsigned char)n; inv[2]=(unsigned char)(n>>8); p2p_write(fd, "inv", 3, inv, 3 + n*36); } sent += n; }
+    fprintf(stderr,"[serve] mempool request from %s (mempool permission): %ld inv entries\n", g_cur_peer_ip, sent);
+    return 1;
+}
+/* a relay-policy violation: Core disconnects without scoring (fDisconnect) */
+void serve_policy_disconnect_log(const char* reason){
+    fprintf(stderr,"[serve] %s: %s -- disconnecting\n", g_cur_peer_ip[0] ? g_cur_peer_ip : "peer", reason ? reason : "protocol violation");
+}
+/* claim a shared peer-table slot for this inbound child (64..127; a dead
+ * child's slot is reused) and publish what getpeerinfo shows */
+static void rpc_fill_peer_slot(int slot, const char* host);
+static int inbound_slot_claim(const char* peerdesc){
+    if(!g_node_status) return -1;
+    for(int i = RPC_MAX_PEERS - 1; i >= MUX_MAX_OUT; i--){
+        rpc_peer_t* q = &g_node_status->peers[i];
+        if(q->used && q->inbound && q->pid > 0 && kill((pid_t)q->pid, 0) != 0 && errno == ESRCH)
+            __sync_bool_compare_and_swap(&q->used, 1, 0);
+        if(q->used) continue;
+        if(!__sync_bool_compare_and_swap(&q->used, 0, 1)) continue;
+        rpc_fill_peer_slot(i, peerdesc);
+        q->inbound = 1; q->pid = (int)getpid(); q->perms = g_conn_perms_all;
+        q->relaytxes = node_relay_flag && g_peer_relays_txs;
+        return i;
+    }
+    return -1;
+}
 /* Declared, because it is DEFINED below this call. Without it C assumes
  * `int peer_misbehaving()` with unspecified arguments -- which happens to work
  * for these types under the SysV ABI, which is exactly why the warning had
@@ -1903,6 +2002,8 @@ static void rpc_fill_peer_slot(int slot, const char* host){
             unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
         }
     }
+    { extern int rp_version_frelay(const unsigned char*, long);
+      pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
     pr->used = 1;   /* publish last: readers see a fully-formed slot */
 }
 
@@ -4374,6 +4475,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
             long long nows = (long long)time(NULL);
             for(int i=0;i<RPC_MAX_PEERS;i++){
+                if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
                 if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
                 /* per-socket byte + last-activity meters from the kernel: no
                  * asm changes, no double counting -- TCP_INFO is authoritative
@@ -4881,6 +4983,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && txsub_worker_ready()){
                 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                if(acc == -2){
+                    /* Core: "transaction sent in violation of protocol" -- we told
+                     * this peer fRelay=0 (-blocksonly) and it relayed anyway */
+                    fprintf(stderr,"[mux:%d] %s sent transactions in -blocksonly: violation, disconnecting\n", i, mux_out_host[i]);
+                    mux_next_peer(i, peers, pool_len, out_port);
+                    mux_out_nextretry[i] = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC) + REDIAL_BACKOFF_MS;
+                    continue;
+                }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
                 if(acc>0){
                     /* per-leg attribution, ONE line a minute for all legs:
@@ -5034,7 +5144,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_cfg.max_feeler > 0 && now_ms >= next_feeler_ms && nsrc > 0){
             next_feeler_ms = now_ms + g_cfg.feeler_interval_ms;
             int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
+            unsigned char saved_relay = node_relay_flag; node_relay_flag = 0;   /* Core: feelers get fRelay=0 */
             int alive = net_feeler_probe(srcpool[pick]);
+            node_relay_flag = saved_relay;
             fprintf(stderr,"[net] feeler %s -> %s\n", srcpool[pick], alive?"alive":"dead");
         }
 
@@ -5733,7 +5845,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
              * entry dump takes at the worker's rotation budget. */
             { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
               rpc_node_set_shutdown_flag(&g_shutdown_requested); }
-            if(pthread_create(&g_mempool_reload_thread, NULL, mempool_reload_thread, NULL) == 0)
+            if(bmc_pthread_create(&g_mempool_reload_thread, mempool_reload_thread, NULL) == 0)
                 g_mempool_reload_started = 1;
             else mempool_reload_thread(NULL);
         } else {
@@ -5833,7 +5945,7 @@ static int i2p_inbound_start(void){
     if(!g_cfg.listen || !g_cfg.i2pacceptincoming || !dialer_i2p_ready()) return -1;
     if(pipe(g_i2p_pipe) != 0) return -1;
     pthread_t th;
-    if(pthread_create(&th, NULL, i2p_accept_thread, NULL) != 0){
+    if(bmc_pthread_create(&th, i2p_accept_thread, NULL) != 0){
         close(g_i2p_pipe[0]); close(g_i2p_pipe[1]); g_i2p_pipe[0] = g_i2p_pipe[1] = -1; return -1; }
     pthread_detach(th);
     fprintf(stderr,"[i2p] accepting inbound streams on %s (SAM STREAM ACCEPT)\n", dialer_i2p_b32());
@@ -6044,8 +6156,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             if(c>=0) peer_sock_buffers(c);
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
-                /* over -maxuploadtarget for this 24h window */
-                close(c); c = -1;
+                /* over -maxuploadtarget for this 24h window -- unless the
+                 * peer has the `download` permission (Core: served regardless) */
+                char ipb[64]; const char* q = strrchr(peerdesc, ':'); size_t n = q ? (size_t)(q - peerdesc) : strlen(peerdesc);
+                if(n >= sizeof ipb) n = sizeof ipb - 1; memcpy(ipb, peerdesc, n); ipb[n] = 0;
+                if(!(netperm_for(ipb) & NP_DOWNLOAD)){ close(c); c = -1; }
             }
             if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
                 /* At capacity: accept and close immediately so the connection
@@ -6089,9 +6204,8 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                      * flow). Counted over all inbound connections, which is
                      * Core's count of relaying inbound peers when every
                      * earlier peer relays. */
-                    { extern unsigned char node_relay_flag;
-                      long lim = CFG_INBOUND_LIMIT();
-                      node_relay_flag = (lim > 0 && (long)g_inbound_n * 100 > lim * g_cfg.inboundrelaypercent) ? 0 : 1; }
+                    /* decided per peer once its version is in hand (relay policy, share) */
+                    g_accept_version_hook = serve_on_peer_version;
                     for(int wi = 0; wi < g_wb_n; wi++) close(g_wb_fd[wi]);
                     /* BIP324 first, if enabled. A v1 peer is detected in-band
                      * -- it opens with magic + "version" + five NULs, and any
@@ -6119,12 +6233,14 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
                     int hok = node_accept_handshake(c);
+                    if(hok==1) g_inbound_slot = inbound_slot_claim(peerdesc);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
                             hok==1?"connected":"handshake failed", v2res, getpid(), pv);
                     if(hok==1)
                         node_serve_loop(c, (mkdir("logs", 0755), node_log_open(g_logpath)), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+                    if(g_inbound_slot >= 0 && g_node_status) g_node_status->peers[g_inbound_slot].used = 0;
                     close(c); _exit(0);
                 }
                 close(c);
@@ -6244,6 +6360,15 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      { extern int (*g_serve_tx_gate)(void); extern int (*g_serve_inv_gate)(const unsigned char*, long);
+        extern int (*g_serve_mempool_hook)(int, void*); extern void (*g_serve_policy_log)(const char*);
+        g_serve_tx_gate = serve_tx_gate; g_serve_inv_gate = serve_inv_gate;
+        g_serve_mempool_hook = serve_mempool_msg; g_serve_policy_log = serve_policy_disconnect_log; }
+      { extern void rp_set_blocksonly(int); extern void rpc_node_set_localrelay(int);
+        rp_set_blocksonly(g_cfg.blocksonly);
+        node_relay_flag = g_cfg.blocksonly ? 0 : 1;          /* fRelay of every version we send (per-peer overrides in the serve child) */
+        rpc_node_set_localrelay(!g_cfg.blocksonly);
+        if(g_cfg.blocksonly) fprintf(stderr,"[config] -blocksonly: no tx relay from peers (relay permission excepted); RPC submissions still relay\n"); }
       /* -logtimestamps/-logtimemicros/-logthreadnames/-logsourcelocations take
        * effect from the config echo onward (weak globals in log_ts.h) */
       g_log_timestamps = g_cfg.logtimestamps; g_log_timemicros = g_cfg.logtimemicros;
