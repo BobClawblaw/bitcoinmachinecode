@@ -3,8 +3,8 @@
 Bitcoin Machine Code (`bmc`) is a full validating Bitcoin node for Linux
 x86-64, written in hand-authored NASM assembly with a C orchestration layer.
 Every line of assembly and C in the tree is AI-authored. It downloads and
-verifies the chain from genesis with full script verification (no
-`assumevalid`), maintains a chain-scale UTXO set that matches Bitcoin Core's
+verifies the chain from genesis (with Core's `assumevalid` default;
+`assumevalid=0` evaluates every script), maintains a chain-scale UTXO set that matches Bitcoin Core's
 chainstate entry for entry, runs a Core-style mempool and transaction relay,
 serves Bitcoin Core's JSON-RPC surface, maintains the optional `txindex`,
 `coinstatsindex` and `blockfilterindex` indexes, and includes an HD wallet
@@ -30,8 +30,10 @@ testnet4, signet (public or custom) and regtest.
 - Script-verification flags are generated from Bitcoin Core's own source
   (`validation/gen_script_flags.py`), including the historical exception
   blocks matched by hash.
-- `assumevalid` is parsed and deliberately ignored: every signature in every
-  block is verified.
+- `assumevalid` follows Core: the chain's built-in assumed-valid block (mainnet
+  938343 in Core v31) unless overridden; script evaluation is skipped at and
+  below it, every other check runs. `assumevalid=0` evaluates every signature
+  in every block.
 - Signet (BIP325) block-signature enforcement through the same script
   interpreter used for transactions.
 - Reorg handling with cumulative-work fork choice, an undo log, and crash
@@ -379,7 +381,8 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 - **Mempool eviction is per-leaf.** `TrimToSize` evicts the lowest-feerate
   leaf transaction and works inward, where Core evicts by linearization
   chunk. Sibling eviction is not implemented.
-- **`assumevalid` is ignored.** Every block is fully script-verified.
+- **`assumevalid`** uses Core v31's built-in block (938343 on mainnet); newer
+  Core releases move it, this node's table is updated with the oracle.
 - **`gettxoutsetinfo` defaults to `muhash`**; `hash_serialized_3` is refused,
   and the coinstats "extras" beyond the core fields are omitted (stated in
   the result).

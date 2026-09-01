@@ -212,6 +212,8 @@ static void set_defaults(void){
     g_cfg.utxo_bulk_blob_mb     = 1024;
     g_cfg.utxo_bulk_gap_blocks  = 50000L;
     g_cfg.utxo_compact_threshold= 12;
+    g_cfg.assumevalid_mode      = 0;        /* the chain default (Core defaultAssumeValid) */
+    memset(g_cfg.assumevalid, 0, 32);
     g_cfg.dbcache_mb            = 1024;     /* Core v31 default (MiB) */
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
@@ -332,6 +334,7 @@ int node_config_is_manual(const char* ip){
  * not trusted input: a typo that sets min_usable_peers to 0 or maxpool to -1
  * should not be able to reproduce the peer-starvation stall that a bad
  * eviction threshold caused on 2026-08-18. */
+static int hexval(int c){ return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1; }
 static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
     if(v < lo || v > hi){
         fprintf(stderr,"[config] %s=%d out of range [%d,%d] -- ignoring\n", key, v, lo, hi);
@@ -634,19 +637,26 @@ long node_config_load(const char* path){
                                   "automatically when txindex.dat is present; this daemon "
                                   "does not build or update it\n"); }
         else if(!strcmp(key,"assumevalid")){
-            /* This string was STALE and said the opposite of the truth: it
-             * claimed block connection performs no script verification,
-             * describing the node as it was before Stage D wired
-             * tx_verify_block_connect_all into utxo_live.c's apply path.
-             * Nobody updated it when that landed, and it is exactly the sort
-             * of confident, specific, wrong explanation that a reader (or a
-             * later session) takes at face value -- this one did, on
-             * 2026-08-28, and briefly "corrected" the docs to match it.
-             * Fixed with the reason that is actually true. */
-            fprintf(stderr,"[config] assumevalid IGNORED -- this node verifies every input script in "
-                           "every block it connects (tx_verify_block_connect_all, ahead of any UTXO "
-                           "write), which is the whole point of it; assumevalid exists to SKIP that, "
-                           "so it is declined rather than unimplemented\n"); }
+            /* Core's -assumevalid: script evaluation is skipped for blocks
+             * that are ancestors of this block; PoW, merkle, structure and
+             * every UTXO check still run. Honoured ONLY when set explicitly
+             * (2026-09-01); with no value this node verifies every script of
+             * every block, which stays the default and the README's promise.
+             * "0" disables it, as in Core. */
+            const char* v = val;
+            if(!v || !*v || !strcmp(v,"0")){ g_cfg.assumevalid_mode = 2; applied++;
+                fprintf(stderr,"[config] assumevalid=0: every script of every block is evaluated (Core's default skips them below its built-in block)\n"); }
+            else if(strlen(v)==64){
+                int okh = 1;
+                for(int q=0;q<32;q++){
+                    int hi = hexval(v[2*q]), lo = hexval(v[2*q+1]);
+                    if(hi<0||lo<0){ okh=0; break; }
+                    g_cfg.assumevalid[31-q] = (unsigned char)((hi<<4)|lo);   /* display order -> wire order */
+                }
+                if(okh){ g_cfg.assumevalid_mode = 1; applied++;
+                         fprintf(stderr,"[config] assumevalid=%s: script evaluation is skipped for blocks at or below it (Core semantics); every other consensus check still runs\n", v); }
+                else { fprintf(stderr,"[config] assumevalid: not a 64-hex block hash -- ignored\n"); bad++; }
+            } else { fprintf(stderr,"[config] assumevalid: not a 64-hex block hash -- ignored\n"); bad++; } }
 
         else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
             g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }

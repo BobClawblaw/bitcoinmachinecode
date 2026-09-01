@@ -559,9 +559,20 @@ static void t1_tapin(void* ctx, u64 k, const u8** outpoint, u64* value,
     *spklen   = g_txv_in[k].spklen;
 }
 
+/* Script evaluation switch (Core's -assumevalid, 2026-09-01): when off, every
+ * structural, consensus and UTXO check still runs -- only the signature/script
+ * EVALUATION of an input is skipped, exactly what Core skips for blocks below
+ * its assumevalid block. Default on; utxo_live.c turns it off per block while
+ * applying at or below the operator's assumevalid height, and never for a
+ * submitblock dry run. Read by worker threads: a plain int is enough. */
+int g_txv_script_checks = 1;
+void tx_verify_set_script_checks(int on){ g_txv_script_checks = on ? 1 : 0; }
+int  tx_verify_script_checks(void){ return g_txv_script_checks; }
+
 static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long flags,
                           u8* sv_work, unsigned long sv_workcap, const char** reason){
     txv_rawin_t* in = &g_txv_in[i];
+    if (!g_txv_script_checks) return 1;   /* assumevalid: below the assumed-valid block, no script evaluation */
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
         /* Phase B. g_t1_tap/g_t1_tap_pool were filled by pass 1c below,

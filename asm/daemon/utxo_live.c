@@ -349,6 +349,41 @@ static long  g_applied_height = -1;
 /* Height whose block is currently being applied -- the key undo records are
  * filed under. Set by apply_block_at before any walk begins. */
 static long  g_apply_height = -1;
+/* -assumevalid (2026-09-01): the height of the operator's assumed-valid block,
+ * resolved from the archive index at init (-1 = none). While applying a block
+ * at or below it, tx_verify's script EVALUATION is switched off -- everything
+ * else (PoW, merkle, structure, every UTXO check) runs unchanged, exactly
+ * Core's semantics. A submitblock dry run always evaluates scripts. */
+extern void tx_verify_set_script_checks(int on);
+static long g_assumevalid_height = -1;
+static int  g_av_announced_end = 0;
+extern const chainparams_t* g_chainp;
+static void utxo_live_resolve_assumevalid(void){
+    g_assumevalid_height = -1;
+    unsigned char want[32];
+    if (g_cfg.assumevalid_mode == 2) return;                       /* assumevalid=0 */
+    if (g_cfg.assumevalid_mode == 1) memcpy(want, g_cfg.assumevalid, 32);
+    else {                                                          /* the chain default, as Core ships it */
+        if (!g_chainp || !g_chainp->assumevalid) return;
+        const char* hx = g_chainp->assumevalid;
+        for (int q = 0; q < 32; q++){
+            int hi = hx[2*q], lo = hx[2*q+1];
+            hi = hi>='0'&&hi<='9'?hi-'0':hi>='a'&&hi<='f'?hi-'a'+10:hi-'A'+10;
+            lo = lo>='0'&&lo<='9'?lo-'0':lo>='a'&&lo<='f'?lo-'a'+10:lo-'A'+10;
+            want[31-q] = (unsigned char)((hi<<4)|lo);
+        }
+    }
+    FILE* f = fopen("index.dat", "rb"); if (!f) return;
+    unsigned char rec[48]; long h = 0;
+    while (fread(rec, 1, 48, f) == 48){ if (!memcmp(rec, want, 32)){ g_assumevalid_height = h; break; } h++; }
+    fclose(f);
+    if (g_assumevalid_height >= 0)
+        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld -- script evaluation skipped through it, resumed above\n", g_assumevalid_height);
+    else
+        fprintf(stderr, "[utxo_live] assumevalid: block not in the archive -- every script is evaluated\n");
+}
+
+
 
 /* Mined-transaction callback: the serve worker registers a hook that removes
  * each just-CONFIRMED txid from the shared mempool, so getblocktemplate can
@@ -1211,6 +1246,7 @@ long utxo_live_dryrun_block(const u8* blockbuf, u64 blocklen, long height){
     long saved = g_apply_height;
     g_apply_height = height;
     g_dry_run = 1;
+    tx_verify_set_script_checks(1);           /* a proposal is never assumed valid */
     int r = apply_block_inner(blockbuf, blocklen);
     g_dry_run = 0;
     g_apply_height = saved;
@@ -1219,6 +1255,10 @@ long utxo_live_dryrun_block(const u8* blockbuf, u64 blocklen, long height){
 
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
+    { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
+      tx_verify_set_script_checks(on);
+      if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;
+          fprintf(stderr, "[utxo_live] assumevalid: above height %ld -- script evaluation resumed\n", g_assumevalid_height); } }
     /* GHOST GUARD (closes the multi-block WAL-vs-checkpoint window, 2026-08-25):
      * an undo_<h>.dat here can only mean h was applied -- partially or fully --
      * by a previous process whose checkpoint never landed (a clean apply +
@@ -1713,6 +1753,7 @@ long utxo_live_compact_threshold(void){
 extern void txv_set_bulk_mode(int on);
 
 int utxo_live_init(const char* dir){
+    utxo_live_resolve_assumevalid();
     g_recovery_checked = 0;
     g_test_input_count = 0;
     /* Pick the memtable size from how far behind we actually are. */

@@ -225,6 +225,7 @@ typedef struct {
     char debuglogfile[256];      /* Core -debuglogfile: the daemon's own log
                                   * (def logs/bitcoind.log in the chain dir;
                                   * "0" = no file log)                       */
+    unsigned char assumevalid[32]; int assumevalid_mode;   /* 0 = the chain default (Core defaultAssumeValid), 1 = this hash (wire order), 2 = assumevalid=0: evaluate every script */
 } node_config_t;
 
 extern node_config_t g_cfg;

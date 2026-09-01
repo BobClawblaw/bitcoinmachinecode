@@ -153,6 +153,16 @@ int main(void){
         }
     }
     ck("corrupted-input tx: REJECTED with the right reason, 20/20 consistent runs", all_consistent);
+    /* assumevalid (2026-09-01): with script evaluation switched off the same
+     * corrupted signature passes block connection (every structural and UTXO
+     * check still ran); switched back on it is rejected again. */
+    { extern void tx_verify_set_script_checks(int on);
+      const char* r3 = "?"; tx_verify_set_script_checks(0);
+      long r0 = tx_verify_block_connect(badtx, (u64)badlen, 600000, blockhash, &g_lst, g_table, &r3);
+      ck("script checks OFF: the bad signature is not evaluated -> accepted", r0 == 1);
+      tx_verify_set_script_checks(1);
+      r3 = "?"; long r1 = tx_verify_block_connect(badtx, (u64)badlen, 600000, blockhash, &g_lst, g_table, &r3);
+      ck("script checks ON again: rejected with the right reason", r1 == 0 && !strcmp(r3, "p2wpkh signature invalid")); }
 
     utxo_lsm_close(&g_lst);
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
