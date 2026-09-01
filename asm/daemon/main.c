@@ -2704,7 +2704,7 @@ static long dl_header_mirror_topup(unsigned char* store){
     long have = hst_count(hst); long tip = store_get_tip(store); long n = 0;
     if(have <= 0 || tip < 0) return 0;               /* an empty mirror is seeded with genesis by dlc_headers */
     for(long h = have; h <= tip; h++){
-        unsigned char hb[128];
+        static unsigned char hb[4u<<20];   /* store_read_at returns the WHOLE block (a 128-byte stack buffer SEGV-looped the q boot) */
         if(store_read_at(store, (unsigned long)h, hb, sizeof hb) < 80) break;
         unsigned char bh[32]; block_hash(bh, hb);
         if(hst_append(hst, hb, bh) < 0) break;
