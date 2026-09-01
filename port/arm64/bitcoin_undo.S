@@ -36,8 +36,8 @@ replay_script:
 
 /* ---------- undo_path_build(out=x0, height=x1) -- "undo_<h>.dat" internal ---------- */
 undo_path_build:
-	mov  w2, #0x6f64
-	movk w2, #0x6e75, lsl #16   /* 0x6e756f64 = "undo" LE */
+	mov  w2, #0x6e75
+	movk w2, #0x6f64, lsl #16   /* 0x6f646e75 = "undo" LE ('u'=0x75 first byte) */
 	str  w2, [x0]
 	mov  w2, #0x5f
 	strb w2, [x0,#4]
@@ -68,8 +68,8 @@ undo_path_build:
 	add  x3, x3, #1
 	cbnz x2, .pb_emit
 	add  sp, sp, #32
-	mov  w8, #0x7461
-	movk w8, #0x642e, lsl #16   /* ".dat" LE */
+	mov  w8, #0x642e
+	movk w8, #0x7461, lsl #16   /* 0x7461642e = ".dat" LE ('.'=0x2e first byte) */
 	str  w8, [x3]
 	strb wzr, [x3,#4]
 	ret
