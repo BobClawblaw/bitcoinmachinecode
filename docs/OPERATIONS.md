@@ -378,6 +378,7 @@ service line appears a few minutes after start.
 | `[dl] heartbeat: tip=.. peers=a/b txouts=.. uptime=..` | the pulse; tip should track the network |
 | `[tx_accept] last 30s: +N accepted (mempool M) \| rejected: N missing-inputs, N invalid, N policy \| N already confirmed` | relay summary; missing-inputs rejects are normal churn |
 | `[txrelay] last 60s ...`, `[txrelay] orphans: ...` | relay and orphan-pool counters |
+| `[pool] N peer(s) sampled from the book: ipv4 a, ipv6 b, onion c, i2p d, cjdns e (...)` | the dial pool's per-network composition at boot; anonymity networks appear only when their transport is configured |
 | `[mempool] block <h>: removed N pool tx (confirmed/conflicted)` | a block connected |
 | `compaction of N run(s) ... started in background pid P` / `background compaction done in Xs` | UTXO maintenance |
 | `RECOVERY: rolled back N ghost block(s)`, `rolled back ghost application`, `init: swept N orphan file(s)` | healthy crash recovery at boot |
@@ -396,6 +397,13 @@ written; call again between blocks or stop the daemon for an authoritative
 value. `gettxout` retries briefly while the worker is busy.
 
 ### Wallet
+
+Wallet files live in the chain directory by default; `walletdir=<dir>`
+(absolute, or relative to the chain directory) moves them -- the default
+wallet's store and journal, the key and scan records, and every named
+wallet under `<walletdir>/wallets/<name>/`. The directory is created 0700 if
+absent. Keeping it outside the datadir keeps wallet keys out of chain
+backups; the passphrase file must still live elsewhere again.
 
 With `bmcwallet.enc` present the wallet boots locked unless a passphrase
 source is configured. `walletpassphrase "<pass>" <seconds>` unlocks it for
