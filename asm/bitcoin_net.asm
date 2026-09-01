@@ -216,12 +216,28 @@ tcp_connect_ip:
     mov  rdi, rbx           ; fd
     mov  esi, 1             ; SOL_SOCKET
     mov  edx, 20            ; SO_RCVTIMEO
-    lea  rcx, [rsp]         ; &timeval
+    lea  r10, [rsp]         ; &timeval -- syscall arg4 is R10, not RCX (RCX is clobbered by SYSCALL)
+    mov  r8, 16             ; optlen
+    mov  eax, 54            ; setsockopt
+    syscall
+    ; ---- and SO_SNDTIMEO (21) with the same 10s: on Linux it bounds the
+    ; blocking connect() below. Without it a peer that swallows SYNs (a
+    ; blackholed address, a host behind a dropped route) holds connect() for
+    ; the kernel's full retry schedule -- about two minutes -- and every dial
+    ; site that is not inside the SIGALRM dial budget wedges the download
+    ; worker for that long per address: heartbeat silent, zero outbound
+    ; peers, SIGTERM unanswered (2026-08-31 21:20 and 2026-09-01 00:31,
+    ; both worker backtraces ending in tcp_connect_ip). A bounded connect
+    ; fails with EINPROGRESS, which every caller treats as a failed dial.
+    mov  rdi, rbx           ; fd
+    mov  esi, 1             ; SOL_SOCKET
+    mov  edx, 21            ; SO_SNDTIMEO
+    lea  r10, [rsp]         ; &timeval (still {10,0}); R10 = syscall arg4
     mov  r8, 16             ; optlen
     mov  eax, 54            ; setsockopt
     syscall
     add  rsp, 0x20
-    ; (ignore setsockopt errors; the read-timeout is best-effort)
+    ; (ignore setsockopt errors; the timeouts are best-effort)
     ; sockaddr_in on stack (16 bytes) BELOW save area
     sub  rsp, 0x40            ; rsp = rbp-0x40 ; sockaddr at rbp-0x40..-0x31
     xor  eax, eax
