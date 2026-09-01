@@ -229,7 +229,7 @@ static int parse_key(const char* s, size_t n, int ctx_tr, int allow_range, descr
     size_t j = i; while (j < n && s[j] != '/') j++;
     size_t kl = j - i; const char* kb = s + i;
     if (kl == 0) ERR("No key provided");
-    char key[256]; if (kl >= sizeof key) ERR("Key too long");
+    char key[1400]; if (kl >= sizeof key) ERR("Key too long");
     memcpy(key, kb, kl); key[kl] = 0;
     int ok = 0;
     /* hex pubkey */
@@ -237,6 +237,7 @@ static int parse_key(const char* s, size_t n, int ctx_tr, int allow_range, descr
         int good = 1; for (size_t q = 0; q < kl; q++) if (hex1(key[q]) < 0) good = 0;
         if (good){
             u8 b[65]; int bl = hex_decode(key, kl, b, 65);
+            if (kl == 130 && (b[0] == 0x06 || b[0] == 0x07)) ERR("Hybrid public keys are not allowed");
             if (kl == 64){ memcpy(k->pub, b, 32); k->publen = 32; k->xonly = 1; k->compressed = 1;
                            u8 c[33]; c[0] = 0x02; memcpy(c+1, b, 32); uint64_t qx[4], qy[4];
                            if (!pubkey_parse(c, 33, qx, qy)) ERR("Pubkey '%s' is invalid", key); }
@@ -394,7 +395,8 @@ static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err,
         int na = split_args(in, il, as, al, 3);
         if (na < 1 || na > 2) ERRN("tr(): must have a key and optionally a tree");
         int nd = new_node(d, DN_TR, err, errcap); if (nd < 0) return -1;
-        int k = add_key(d, as[0], al[0], CTX_TR, err, errcap); if (k < 0) return -1;
+        int k = add_key(d, as[0], al[0], CTX_TR, err, errcap);
+        if (k < 0){ char t[1400]; snprintf(t, sizeof t, "%s", err); snprintf(err, errcap, "tr(): %s", t); return -1; }   /* Core prefixes the key error */
         d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1;
         if (na == 2){ int t = parse_tree(d, as[1], al[1], err, errcap); if (t < 0) return -1; d->nodes[nd].child[0] = t; }
         return nd;
@@ -715,7 +717,8 @@ static void sb_key(sb_t* b, const descr_key_t* k, int with_priv){
     if (k->has_origin){ char t[16]; hex_encode(t, k->origin_fp, 4); sb_put(b, "["); sb_put(b, t); sb_path(b, k->origin, k->origin_len, k->apostrophe); sb_put(b, "]"); }
     char t[200];
     if (k->kind == DK_HEX || (k->kind == DK_WIF && !with_priv)){
-        if (k->tr_ctx && k->publen == 33) hex_encode(t, k->pub + 1, 32);   /* Core prints tr() keys x-only */
+        /* Core prints a WIF key under tr() x-only; a hex key prints as it was given */
+        if (k->tr_ctx && k->kind == DK_WIF && k->publen == 33) hex_encode(t, k->pub + 1, 32);
         else hex_encode(t, k->pub, k->publen);
         sb_put(b, t);
     } else if (k->kind == DK_WIF){
