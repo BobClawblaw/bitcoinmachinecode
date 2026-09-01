@@ -48,6 +48,7 @@
  *   a partially-trusted state.
  */
 #include <stdio.h>
+#include <time.h>
 #include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
@@ -212,11 +213,35 @@ static long csi_load(void){
  * MuHash; paid only when no valid persisted state exists. */
 extern long utxo_lsm_walk(void* lst, void* u, void* cb, void* ctx);
 
+/* progress wrapper for the seed walk (2026-09-01, "coinstats not showing any
+ * updates for a long time"): a full mainnet walk folds ~166M coins into the
+ * muhash over several minutes -- say so every 20M. */
+static struct { void* st; long n, next, total; time_t t0; } g_csi_walkprog;
+static void csi_walk_add_prog(void* st, const u8 key36[36], unsigned long value,
+                              unsigned long code, const u8* script, unsigned long slen){
+    utxo_stats_add(st, key36, value, code, script, slen);
+    if (++g_csi_walkprog.n >= g_csi_walkprog.next){
+        long secs = (long)(time(NULL) - g_csi_walkprog.t0); if (secs < 1) secs = 1;
+        if (g_csi_walkprog.total > 0)
+            fprintf(stderr, "[coinstats] seed walk: %ldM of ~%ldM coins (%.0f%%, %.1fM/s)\n",
+                    g_csi_walkprog.n / 1000000, g_csi_walkprog.total / 1000000,
+                    100.0 * (double)g_csi_walkprog.n / (double)g_csi_walkprog.total,
+                    (double)g_csi_walkprog.n / 1e6 / (double)secs);
+        else
+            fprintf(stderr, "[coinstats] seed walk: %ldM coins (%.1fM/s)\n",
+                    g_csi_walkprog.n / 1000000, (double)g_csi_walkprog.n / 1e6 / (double)secs);
+        g_csi_walkprog.next += 20000000;
+    }
+}
+extern long utxo_lsm_count(void* lst);
 int csi_seed_from_walk(void* lst, void* u, long height){
     utxo_stats_init(g_csi.num, 1, 0);
     utxo_stats_init(g_csi.den, 1, 0);
-    fprintf(stderr, "[coinstats] seeding from a full walk at height %ld (minutes; one-time)\n", height);
-    long n = utxo_lsm_walk(lst, u, (void*)utxo_stats_add, g_csi.num);
+    g_csi_walkprog.n = 0; g_csi_walkprog.next = 20000000; g_csi_walkprog.t0 = time(NULL);
+    g_csi_walkprog.total = utxo_lsm_count(lst);
+    fprintf(stderr, "[coinstats] seeding from a full walk at height %ld (~%ldM coins; one-time)\n",
+            height, g_csi_walkprog.total > 0 ? g_csi_walkprog.total / 1000000 : -1);
+    long n = utxo_lsm_walk(lst, u, (void*)csi_walk_add_prog, g_csi.num);
     if (n < 0){ fprintf(stderr, "[coinstats] seed walk failed\n"); g_csi.valid = 0; return 0; }
     g_csi.valid = 1;
     csi_commit(height);
