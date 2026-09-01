@@ -373,6 +373,21 @@ if [ ! -f "$OUT/addrbook.a" ]; then
   ar rcs "$OUT/addrbook.a" /tmp/par_ab/*.o 2>> "$OUT/build.log" || \
     echo -e "build-fail\tSPECIAL:addrbook.a\tar failed" >> "$OUT/results.tsv"
 fi
+# daemon/wallet_cli: x86 builds it from daemon/wallet_cli.c + the wallet C +
+# WALLETPRIMS + bitcoin_script.o -- all arch-neutral C + port objects. The
+# e2e sighash test execs it as ./daemon/wallet_cli from the scratch dir.
+if [ ! -x "$OUT/wallet_cli" ]; then
+  gcc -no-pie -O2 -I../../asm -o "$OUT/wallet_cli" \
+    ../../asm/daemon/wallet_cli.c ../../asm/wallet_core.c ../../asm/wallet_store.c \
+    ../../asm/wallet_book.c ../../asm/wallet_txlog.c ../../asm/wallet_msgsign.c \
+    secp256k1_fe.o secp256k1_point.o ../../asm/secp256k1_glv_c.c secp256k1_point_ct.o \
+    secp256k1_scalar.o ../../asm/secp256k1_scalar_c.c secp256k1_ecdsa.o \
+    bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
+    bitcoin_hash.o sha256.o ripemd160.o bitcoin_bip39.o sha512.o bitcoin_hmac.o \
+    bitcoin_bip32.o bech32.o bitcoin_utxo.o bitcoin_script.o \
+    bitcoin_sighash_all_ext.o secp256k1_glv.o secp256k1_glv_mul.o 2>> "$OUT/build.log" \
+  || echo -e "build-fail\tSPECIAL:wallet_cli\tsee build.log" >> "$OUT/results.tsv"
+fi
 [ -f ecdsa_verify_ref.o ] || gcc -march=armv8.2-a+sha2 -c -o ecdsa_verify_ref.o ecdsa_verify_ref.S 2>> "$OUT/build.log"
 [ -f parity_support/bench_abi_guard.o ] || gcc -c -o parity_support/bench_abi_guard.o parity_support/bench_abi_guard.S 2>> "$OUT/build.log"
 
@@ -393,13 +408,19 @@ run_inv() {  # name kind args index
         [ -x "$f" ] && is_elf "$f" && continue
         ln -s "$f" "$scratch/tests/" 2>> "$OUT/build.log"
     done
-    # overlay every binary we built (helpers the tests exec)
-    for f in "$OUT"/test_* "$OUT"/bench_* "$OUT"/*_shim "$OUT"/smoke_* "$OUT"/run_batch "$OUT"/fakepeer_*; do
+    # overlay every binary we built (helpers the tests exec). Targets must be
+    # ABSOLUTE: $OUT is relative to port/arm64 and the symlink is resolved
+    # from the scratch cwd in /tmp, where "parity_out/..." does not exist.
+    AB="$REPO/port/arm64"
+    for f in "$AB/$OUT"/test_* "$AB/$OUT"/bench_* "$AB/$OUT"/*_shim "$AB/$OUT"/smoke_* "$AB/$OUT"/run_batch "$AB/$OUT"/fakepeer_*; do
         [ -f "$f" ] && [ -x "$f" ] && ln -sf "$f" "$scratch/tests/$(basename "$f")"
     done
-    # tests that spawn/inspect the daemon expect ./daemon/bitcoind (the x86
-    # suite runs from asm/, where daemon/bitcoind is a build product)
-    ln -sfn "$REPO/port/arm64/daemon_out" "$scratch/daemon" 2>> "$OUT/build.log"
+    # tests that spawn/inspect the daemon expect ./daemon/bitcoind and
+    # ./daemon/wallet_cli (the x86 suite runs from asm/, where daemon/ holds
+    # those build products)
+    mkdir -p "$scratch/daemon"
+    ln -sf "$REPO/port/arm64/daemon_out/bitcoind" "$scratch/daemon/bitcoind"
+    [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$scratch/daemon/wallet_cli"
     # ./daemon/bitcoind arg remap -> the ARM daemon
     local args2="${args//.\/daemon\/bitcoind/$REPO/port/arm64/daemon_out/bitcoind}"
     ( cd "$scratch" && timeout "$TMO" "$bin" $args2 > out.txt 2>&1 )
