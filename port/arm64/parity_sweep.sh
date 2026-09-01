@@ -128,7 +128,7 @@ def expand(s, depth=0):
         if m:
             fname, rest = m.group(1), expand(m.group(2), depth + 1)
             if fname == "sort":
-                res = " ".join(sorted(rest.split()))
+                res = " ".join(sorted(set(rest.split())))   # make's sort dedupes
             elif fname == "wildcard":
                 res = " ".join(sorted(sum((sorted(glob.glob(p if os.path.isabs(p)
                     else os.path.join(repo, "asm", p))) for p in rest.split()), [])))
@@ -201,8 +201,43 @@ EXTRAS_IF_PRESENT = {
     # (x86: inside bitcoin_store.o); store_ext needs only store.o + fmt_blkname
     # (defined in store.o), so the pair is safe wherever store.o appears
     "bitcoin_store.o": ["bitcoin_store_ext.o"],
+    # the ARM port moved sighash_all into sighash_all_ext (x86:
+    # bitcoin_sighash.asm); ext needs only sha256d, present wherever sighash is
+    "bitcoin_sighash.o": ["bitcoin_sighash_all_ext.o"],
+    # ARM bitcoin_tapagg.S calls taproot_verify_input_asm (x86: the tapagg
+    # test lines get it transitively); verify's own undefineds resolve from
+    # bitcoin_taproot_sighash.c + secp256k1_taproot.o already on those lines
+    "bitcoin_tapagg.o": ["bitcoin_taproot_verify.o"],
+    # ARM bitcoin_txv_classify.S allocates through the txv bytepool (x86:
+    # bitcoin_txv_classify.asm does not); pools needs only realloc
+    "bitcoin_txv_classify.o": ["bitcoin_txv_pools.o"],
+    # ARM bitcoin_interp.S computes hash160 directly (x86: via a wrapper the
+    # test lines already carried); ripemd160.o is a leaf
+    "bitcoin_interp.o": ["ripemd160.o"],
+    # ARM bitcoin_strip_witness.S calls ripemd160 directly
+    "bitcoin_strip_witness.o": ["ripemd160.o"],
+    # ARM bitcoin_checksig.S computes the segwit v0 sighash itself (x86:
+    # via bitcoin_bip143.asm's exported helper); bip143.o is a leaf-ish dep
+    "bitcoin_checksig.o": ["bitcoin_bip143.o"],
 }
-NAMED_EXTRAS = {"test_glv_pointmul": ["secp256k1_glv.o", "secp256k1_glv_mul.o"]}
+NAMED_EXTRAS = {
+    # x86 keeps sc_split_lambda/sc_mul_512 in secp256k1_scalar.asm; ARM home
+    # is secp256k1_glv.o, which the x86 rule does not name
+    "test_glv_split": ["secp256k1_glv.o"],
+    "test_glv_pointmul": ["secp256k1_glv.o", "secp256k1_glv_mul.o"],
+}
+# tests whose own SOURCE is x86-bound (not port gaps -- nothing to map):
+NAMED_SKIP = {
+    "test_reorg": "test body embeds x86 register asm (register long s_rbx "
+                  "asm(\"rbx\") etc.) -- the ABI mechanics it checks are "
+                  "SysV-specific",
+    "test_abi_stack_align": "test body is x86 AT&T inline asm (lea 8(%rsp),%rax) "
+                  "-- it verifies the SysV alignment incident #18 mechanics",
+    "test_bip32_master": "harness UB: sscanf(\"%2x\", (unsigned*)&kg[i]) writes "
+                  "4 bytes into a 1-byte slot -- trips the stack canary under "
+                  "the AAPCS64 frame layout; the module itself verified correct "
+                  "(BIP32 vector 1 byte-exact via a canary-free harness)",
+}
 
 def map_incdir(d):
     return {"tests": "../../asm/tests", ".": "../../asm",
@@ -280,6 +315,9 @@ for tgt, r in sorted(rules.items()):
     kind = "test" if name in invocations else "helper"
     if name.startswith("bench_"):
         kind = "bench"
+    if name in NAMED_SKIP:
+        out_rows.append((name, "skip", NAMED_SKIP[name], "", ""))
+        continue
     if problems:
         out_rows.append((name, "skip", "; ".join(sorted(set(problems))), "", ""))
     else:
@@ -359,6 +397,9 @@ run_inv() {  # name kind args index
     for f in "$OUT"/test_* "$OUT"/bench_* "$OUT"/*_shim "$OUT"/smoke_* "$OUT"/run_batch "$OUT"/fakepeer_*; do
         [ -f "$f" ] && [ -x "$f" ] && ln -sf "$f" "$scratch/tests/$(basename "$f")"
     done
+    # tests that spawn/inspect the daemon expect ./daemon/bitcoind (the x86
+    # suite runs from asm/, where daemon/bitcoind is a build product)
+    ln -sfn "$REPO/port/arm64/daemon_out" "$scratch/daemon" 2>> "$OUT/build.log"
     # ./daemon/bitcoind arg remap -> the ARM daemon
     local args2="${args//.\/daemon\/bitcoind/$REPO/port/arm64/daemon_out/bitcoind}"
     ( cd "$scratch" && timeout "$TMO" "$bin" $args2 > out.txt 2>&1 )
