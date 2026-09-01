@@ -100,4 +100,6 @@ int  rpc_wops_own_coin_spk(const void* wseed, const unsigned char txid_wire[32],
 
 int rpc_wops_wallet_coins(const void* wallet_seed, rpc_wops_coin* out, int cap);
 
+/* master key fingerprint as 8 hex chars (2026-09-01: taproot PSBT derivation matching) */
+int rpc_wops_master_fp(const void* seed, char out[9]);
 #endif

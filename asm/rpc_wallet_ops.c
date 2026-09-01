@@ -1024,6 +1024,7 @@ static int wop_master_fp(const unsigned char seed[64], char out[9]){
     snprintf(out, 9, "%02x%02x%02x%02x", h[0], h[1], h[2], h[3]);
     return 1;
 }
+int rpc_wops_master_fp(const void* seed, char out[9]){ return wop_master_fp((const unsigned char*)seed, out); }
 
 static rj_val* wop_desc_entry_t(const unsigned char seed[64], int t, int is_change){
     char mfp[9];

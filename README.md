@@ -402,10 +402,16 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   `descriptorprocesspsbt` signs from the keys a descriptor carries.
   `signrawtransactionwithkey` and the descriptor signer cover P2PKH, P2WPKH,
   P2SH-P2WPKH, P2SH multisig, P2WSH and P2SH-P2WSH (CHECKMULTISIG or a single
-  CHECKSIG witnessScript) and P2TR key-path spends of `tr(KEY)`; taproot
-  script-path spends are not signed. BIP340 signing is in C and proven on
-  Core's test vectors; every signed form is checked against Core's script
-  engine by `validation/signer_core_diff.sh`.
+  CHECKSIG witnessScript), P2TR key-path spends of `tr(KEY)` and of
+  `tr(KEY,{...})` (internal key + merkle root), and P2TR script-path spends
+  of `pk()` and `multi_a()` leaves (leaf + control block; other leaf forms
+  wait for the miniscript satisfier). PSBTs carry the BIP371 taproot fields
+  (leaf scripts, control blocks, internal key, merkle root, bip32 origins
+  with leaf hashes, key-path and script-path partial signatures); the signer
+  tries the key path first and then each leaf, carries partials other
+  signers left, and `decodepsbt` names every field as Core does. BIP340
+  signing is in C and proven on Core's test vectors; every signed form is
+  checked against Core's script engine by `validation/signer_core_diff.sh`.
 - **Mining.** `getblocktemplate` fills the block with whole linearization
   chunks in feerate order (Core v31's cluster-mempool block assembly; a chunk
   that does not fit skips its cluster) and reports a lower-bound `sigops`;

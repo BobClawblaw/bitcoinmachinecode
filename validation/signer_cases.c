@@ -59,5 +59,34 @@ int main(void){
     run("p2tr-keypath-all", keys1, prev, "ALL");
     run("p2tr-keypath-single-acp", keys1, prev, "SINGLE|ANYONECANPAY");
     run("p2tr-keypath-wrongkey", "[\"" "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1" "\"]", prev, NULL);
+
+    /* P2TR script path (2026-09-01): internal key = key 2; leaf A = pk(x0),
+     * leaf B = multi_a(2, x0, x1); tree {A, B}. Core verifies the control
+     * block (with the output-key parity bit) and the tapscript witness. */
+    { extern int bip32_xonly_tweak_add_par(const u8*, const u8*, u8*, int*);
+      u8 la[34]; la[0]=0x20; memcpy(la+1,pub[0]+1,32); la[33]=0xac;
+      u8 lb[70]; int lo=0; lb[lo++]=0x20; memcpy(lb+lo,pub[0]+1,32); lo+=32; lb[lo++]=0xac; lb[lo++]=0x20; memcpy(lb+lo,pub[1]+1,32); lo+=32; lb[lo++]=0xba; lb[lo++]=0x52; lb[lo++]=0x9c;
+      u8 tl[32]; sha256_full(tl,"TapLeaf",7);
+      u8 ha[32], hb[32];
+      { u8 b[64+1+1+34]; memcpy(b,tl,32); memcpy(b+32,tl,32); b[64]=0xc0; b[65]=34; memcpy(b+66,la,34); sha256_full(ha,b,66+34); }
+      { u8 b[64+1+1+70]; memcpy(b,tl,32); memcpy(b+32,tl,32); b[64]=0xc0; b[65]=(u8)lo; memcpy(b+66,lb,lo); sha256_full(hb,b,66+lo); }
+      u8 tbr[32]; sha256_full(tbr,"TapBranch",9); u8 root[32];
+      { u8 b[128]; memcpy(b,tbr,32); memcpy(b+32,tbr,32); if (memcmp(ha,hb,32)<=0){ memcpy(b+64,ha,32); memcpy(b+96,hb,32);} else { memcpy(b+64,hb,32); memcpy(b+96,ha,32);} sha256_full(root,b,128); }
+      u8 tt[32]; { u8 b[128]; memcpy(b,th,32); memcpy(b+32,th,32); memcpy(b+64,pub[2]+1,32); memcpy(b+96,root,32); sha256_full(tt,b,128); }
+      u8 Q[32]; int odd=0; bip32_xonly_tweak_add_par(pub[2]+1,tt,Q,&odd); char Qh[65]; hexs(Qh,Q,32);
+      u8 ca[65]; ca[0]=(u8)(0xc0|odd); memcpy(ca+1,pub[2]+1,32); memcpy(ca+33,hb,32);   /* control for A: sibling = B */
+      u8 cb[65]; cb[0]=(u8)(0xc0|odd); memcpy(cb+1,pub[2]+1,32); memcpy(cb+33,ha,32);
+      char lah[80], lbh[160], cah[140], cbh[140], rooth[65], ikh[65]; hexs(lah,la,34); hexs(lbh,lb,lo); hexs(cah,ca,65); hexs(cbh,cb,65); hexs(rooth,root,32); hexs(ikh,pub[2]+1,32);
+      snprintf(prev,sizeof prev,"{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"5120%s\",\"amount\":1.0,\"tapLeafScript\":\"%s\",\"tapControlBlock\":\"%s\"}",Qh,lah,cah);
+      run("p2tr-scriptpath-pk", keys1, prev, NULL);
+      run("p2tr-scriptpath-pk-all", keys1, prev, "ALL");
+      run("p2tr-scriptpath-pk-wrongkey", "[\"" "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1" "\"]", prev, NULL);
+      snprintf(prev,sizeof prev,"{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"5120%s\",\"amount\":1.0,\"tapLeafScript\":\"%s\",\"tapControlBlock\":\"%s\"}",Qh,lbh,cbh);
+      run("p2tr-scriptpath-multi_a-2of2", keys2, prev, NULL);
+      run("p2tr-scriptpath-multi_a-partial", keys1, prev, NULL);
+      snprintf(prev,sizeof prev,"{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"5120%s\",\"amount\":1.0,\"tapMerkleRoot\":\"%s\",\"tapInternalKey\":\"%s\"}",Qh,rooth,ikh);
+      run("p2tr-keypath-with-tree", keys3, prev, NULL);
+      snprintf(prev,sizeof prev,"{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"5120%s\",\"amount\":1.0}",Qh);
+      run("p2tr-keypath-with-tree-noroot", keys3, prev, NULL); }
     return 0;
 }
