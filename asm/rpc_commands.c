@@ -1510,10 +1510,26 @@ static const char* srw_sign_tap_script(const srw_prev_t* P, const unsigned char*
     if (!bip32_xonly_tweak_add(ctrl + 1, t, qx) || memcmp(qx, spk + 2, 32)) return "tapControlBlock does not commit to this scriptPubKey";
     unsigned char keys[SRW_TAP_MAXKEYS][32]; int kth = 0;
     int nk = srw_tap_leaf_keys(P->tapleaf, P->tapleaflen, keys, &kth);
-    if (nk <= 0) return "P2TR script-path: only pk() and multi_a() leaves are signed on this node";
     unsigned char z[32];
     if (!srw_tap_sighash(z, tx, txlen, i, n_in, outpoints, seqs, prev_of, out_start, out_end, locktime, tht, lh))
         return "P2TR sighash needs scriptPubKey and amount for every input";
+    if (nk <= 0){
+        /* any other leaf is a miniscript (2026-09-01): the satisfier signs with the keys we hold,
+         * the partial signatures the PSBT carries for this leaf, its preimages and the tx's timelocks */
+        ms_psig_t ps[32]; int nps = 0;
+        for (int q = 0; q < P->n_tap_psig && nps < 32; q++) if (!memcmp(P->tap_psig[q].lh, lh, 32)){ ps[nps].x = P->tap_psig[q].x; ps[nps].sig = P->tap_psig[q].sig; ps[nps].sl = P->tap_psig[q].sl; nps++; }
+        const char* merr = NULL; unsigned long ml = 0; int mi = 0;
+        unsigned long need = 3 + P->tapleaflen + 3 + cl; if (need + 64 > SRW_WITCAP) return "P2TR leaf too large for this node's witness buffer";
+        int r = ms_sign_witness_tapleaf(P->tapleaf, P->tapleaflen, z, tht, seqs[i], locktime, kpriv, kpub, nkeys,
+                                        (const unsigned char (*)[33])P->pubs, P->npubs, ps, nps, &P->pre, wit, SRW_WITCAP - need, &ml, &mi, &merr);
+        if (r == 0) return "P2TR script-path: pk(), multi_a() and miniscript leaves are signed on this node; this leaf is none of those";
+        if (r == -1) return merr;
+        unsigned long o = ml;
+        o += crt_varint(wit + o, P->tapleaflen); memcpy(wit + o, P->tapleaf, P->tapleaflen); o += P->tapleaflen;
+        o += crt_varint(wit + o, cl); memcpy(wit + o, ctrl, cl); o += cl;
+        *witlen = o; *wititems = mi + 2;
+        return NULL;
+    }
     static unsigned char sigs[SRW_TAP_MAXKEYS][65]; int sl[SRW_TAP_MAXKEYS]; int got = 0;
     for (int a = 0; a < nk; a++){
         sl[a] = 0;
