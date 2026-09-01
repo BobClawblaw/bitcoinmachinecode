@@ -211,7 +211,7 @@ extern int  net_feeler_probe(const char* ip_str);                             /*
 extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
-extern long store_get_tip(void* st);
+extern long store_get_tip(void* st, long out_meta[3]);   /* -> 1 ok / -1 empty; a one-arg call SEGVs (2026-09-01 r boot) */
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
 /* ZMQ notifications: publisher (daemon/zmq_pub.c) + the cross-process
  * staging ring (daemon/zmq_notify.c). The publisher owns sockets and so runs
@@ -2701,7 +2701,7 @@ static long dl_header_mirror_topup(unsigned char* store){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
     if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
-    long have = hst_count(hst); long tip = store_get_tip(store); long n = 0;
+    long have = hst_count(hst); long tip = *(int*)(store + 24); long n = 0;   /* store tip lives at +24 (store_get_tip takes (st, out_meta[3]), not one arg) */
     if(have <= 0 || tip < 0) return 0;               /* an empty mirror is seeded with genesis by dlc_headers */
     for(long h = have; h <= tip; h++){
         static unsigned char hb[4u<<20];   /* store_read_at returns the WHOLE block (a 128-byte stack buffer SEGV-looped the q boot) */
