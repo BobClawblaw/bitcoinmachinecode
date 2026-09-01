@@ -23,6 +23,13 @@ static np_entry_t g_np[NP_MAX_ENTRIES];
 static int        g_np_n;
 
 int netperm_count(void){ return g_np_n; }
+static unsigned g_implicit_flags = NP_NOBAN | NP_RELAY;   /* Core: whitelistrelay=1, whitelistforcerelay=0 */
+void netperm_set_implicit_defaults(int relay, int forcerelay){
+    g_implicit_flags = NP_NOBAN | (relay ? NP_RELAY : 0) | (forcerelay ? (NP_FORCERELAY | NP_RELAY) : 0);
+    /* entries already parsed without an explicit perms@ list follow the new
+     * defaults (whitelistrelay= may sit below whitelist= in the file) */
+    for (int i = 0; i < g_np_n; i++) if (g_np[i].implicit) g_np[i].flags = g_implicit_flags;
+}
 
 int netperm_add(const char* spec, const char** err){
     static const char* dummy;
@@ -35,7 +42,7 @@ int netperm_add(const char* spec, const char** err){
     if (strlen(spec) >= sizeof buf){ *err = "too long"; return 0; }
     snprintf(buf, sizeof buf, "%s", spec);
 
-    unsigned flags = NP_NOBAN;
+    unsigned flags = g_implicit_flags;
     int implicit = 1;
     char* at = strrchr(buf, '@');       /* rightmost: IPv6 has no '@' */
     char* addrpart = buf;
@@ -148,7 +155,7 @@ void netperm_reset(void){ g_np_n = 0; }
 static int parse_perms(const char* s, unsigned* flags, const char** err);
 
 static const char* const k_known[] = {
-    "bloomfilter", "relay", "forcerelay", "download", "mempool", "addr",
+    "bloomfilter", "download", "mempool", "addr",
     "in", "out", 0
 };
 
@@ -160,6 +167,8 @@ static int parse_perms(const char* s, unsigned* flags, const char** err){
     char* save = 0;
     for (char* t = strtok_r(buf, ",", &save); t; t = strtok_r(0, ",", &save)){
         if (!strcmp(t, "noban")){ *flags |= NP_NOBAN; continue; }
+        if (!strcmp(t, "relay")){ *flags |= NP_RELAY; continue; }
+        if (!strcmp(t, "forcerelay")){ *flags |= NP_FORCERELAY | NP_RELAY; continue; }   /* Core: forcerelay implies relay */
         for (int i = 0; k_known[i]; i++)
             if (!strcmp(t, k_known[i])){
                 /* Recognised by Core, not enforced here. Saying so is the
