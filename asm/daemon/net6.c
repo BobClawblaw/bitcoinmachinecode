@@ -15,6 +15,10 @@ int tcp_connect_ip6(const unsigned char addr[16], unsigned short port){
      * stops replying must not wedge the caller for ever */
     struct timeval tv = { 10, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    /* and the connect itself: a blackholed IPv6 address otherwise holds the
+     * blocking connect() for the kernel's SYN retry schedule (~2 min) --
+     * see tcp_connect_ip in bitcoin_net.asm for the incident */
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     struct sockaddr_in6 sa; memset(&sa, 0, sizeof sa);
     sa.sin6_family = AF_INET6;
     sa.sin6_port = htons(port);
