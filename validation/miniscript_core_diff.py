@@ -60,9 +60,10 @@ class Core:
         for _ in range(60):
             try: self.call(None, "getblockcount"); break
             except Exception: time.sleep(1)
-    def call(self, wallet, method, *args):
+    def call(self, wallet, method, *args, named=False):
         cmd = [f"{CORE}/bitcoin-cli", "-regtest", f"-datadir={self.tmp}", f"-rpcport={RPCPORT}", "-rpcuser=u", "-rpcpassword=p"]
         if wallet: cmd.append(f"-rpcwallet={wallet}")
+        if named: cmd.append("-named")
         cmd.append(method)
         for a in args: cmd.append(a if isinstance(a, str) else json.dumps(a))
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -159,6 +160,17 @@ CORPUS = [
     D("tr tree two leaves", f"tr({NUMS},{{and_v(v:pk({A}),older(2)),pk({B})}})", "B"),
     D("tr tree ms leaf spend", f"tr({NUMS},{{and_v(v:pk({A}),older(2)),multi_a(2,{B},{C})}})", "A", seq=2),
     D("tr NEG leaf older unmet", f"tr({NUMS},and_v(v:pk({A}),older(2)))", "A", seq=None, complete=False),
+    # musig() (BIP390): descriptor parity only here; the signing session is part 3
+    D("musig rawtr", f"rawtr(musig({A},{B},{C}))", spend=False),
+    D("musig tr", f"tr(musig({A},{B},{C}))", spend=False),
+    D("musig tr + leaf", f"tr(musig({A},{B}),pk({C}))", spend=False),
+    D("musig in a leaf", f"tr({NUMS},pk(musig({A},{B})))", spend=False),
+    D("musig ranged participants", f"rawtr(musig({TPRV}/0/*,{TPRV}/1/*))", spend=False),
+    D("musig derived aggregate", f"tr(musig({TPRV}/0,{TPRV}/1)/2/*)", spend=False),
+    D("musig fixed derivation", f"rawtr(musig({TPRV},{TPRV}/1)/5)", spend=False),
+    D("musig in multi_a leaf", f"tr({NUMS},multi_a(1,musig({A},{B}),{C}))", spend=False),
+    D("INVALID musig outside tr", f"wsh(pk(musig({A},{B})))", spend=False),
+    D("INVALID musig ranged + derivation", f"tr(musig({TPRV}/0/*,{TPRV})/1)", spend=False),
 ]
 
 # ---- helpers ----
@@ -218,6 +230,89 @@ def add_preimages(psbt_b64, hashes):
         t = {H_RMD: 0x0a, H_SHA: 0x0b, H_H160: 0x0c, H_H256: 0x0d}[h]
         inp.append((bytes([t]) + hb, PRE))
     return base64.b64encode(psbt_ser(maps)).decode()
+
+PRIVKEY_RE = re.compile(r"^tr\((.+?)/.+\)#.{8}$")
+PUBKEY_RE = re.compile(r"^tr\((\[.+?\].+?)/.+\)#.{8}$")
+ORIGIN_PATH_RE = re.compile(r"^\[\w{8}(/.*)\].*$")
+def strip_musig_fields(psbt_b64):
+    b = base64.b64decode(psbt_b64); maps = psbt_maps(b)
+    maps[1] = [(k, v) for (k, v) in maps[1] if k[0] not in (0x1a, 0x16, 0x17, 0x18)]
+    return base64.b64encode(psbt_ser(maps)).decode()
+def musig_fields(dec, idx=0):
+    i = dec["inputs"][idx]; out = {}
+    for f in ("musig2_participant_pubkeys", "musig2_pubnonces", "musig2_partial_sigs"):
+        if f in i: out[f] = sorted(json.dumps(x, sort_keys=True) for x in i[f])
+    for f in ("taproot_internal_key", "taproot_merkle_root"):
+        if f in i: out[f] = i[f]
+    return out
+_wnum = [0]
+def musig_session(core, ours, mine_addr, pattern):
+    label = f"musig {pattern}"
+    wallets, keys = [], []
+    for _ in range(3):
+        name = f"ms_musig_{_wnum[0]}"; _wnum[0] += 1
+        core.call(None, "createwallet", name); wallets.append(name)
+        priv = pub = None
+        for d in core.call(name, "listdescriptors", True)["descriptors"]:
+            if d["desc"].startswith("tr("): priv = PRIVKEY_RE.search(d["desc"]).group(1); break
+        for d in core.call(name, "listdescriptors")["descriptors"]:
+            if d["desc"].startswith("tr("): pub = PUBKEY_RE.search(d["desc"]).group(1); priv += ORIGIN_PATH_RE.search(pub).group(1); break
+        keys.append((priv, pub))
+    for i in (0, 1):
+        desc = pattern
+        for j, (priv, pub) in enumerate(keys): desc = desc.replace(f"${j}", priv if j == i else pub)
+        res = core.call(wallets[i], "importdescriptors", [{"desc": desc + "#" + cs(desc), "active": True, "timestamp": "now"}])
+        ck(f"{label}: Core wallet {i} imports the descriptor", res[0]["success"], json.dumps(res)[:200])
+    ours_desc = pattern; norm_desc = pattern
+    for j, (priv, pub) in enumerate(keys): ours_desc = ours_desc.replace(f"${j}", priv if j == 2 else pub); norm_desc = norm_desc.replace(f"${j}", pub)
+    # descriptor parity: the descriptor our node signs with, and the all-public (origin) form the address comes from
+    for what, dd in (("our participant descriptor", ours_desc), ("the public descriptor", norm_desc)):
+        ci, ce = core.try_call(None, "getdescriptorinfo", dd); oi, oe = ours.try_call("getdescriptorinfo", [dd])
+        ck(f"{label}: getdescriptorinfo of {what} matches Core", ci is not None and oi is not None and all(ci.get(k) == oi.get(k) for k in ("descriptor", "checksum", "isrange", "issolvable", "hasprivatekeys")), f"core={json.dumps(ci)[:200] if ci else ce} ours={json.dumps(oi)[:200] if oi else oe}")
+    addr = core.call(wallets[0], "getnewaddress", "", "bech32m")
+    ck(f"{label}: both Core wallets derive the same aggregate address", addr == core.call(wallets[1], "getnewaddress", "", "bech32m"))
+    ci = core.call(None, "getdescriptorinfo", norm_desc)
+    ca = core.call(None, "deriveaddresses", ci["descriptor"], [0, 0]); oa = ours.call("deriveaddresses", [ci["descriptor"], [0, 0]])
+    ck(f"{label}: deriveaddresses of the public descriptor: Core == ours == the wallets' address", ca == oa and oa[0] == addr, f"core={ca} ours={oa} wallet={addr}")
+    core.call("w", "sendtoaddress", addr, 2); core.call("w", "generatetoaddress", 1, mine_addr)
+    utxo = core.call(wallets[0], "listunspent")[0]
+    dest = core.call("w", "getnewaddress")
+    psbt = core.call(wallets[0], "walletcreatefundedpsbt", f"inputs={json.dumps([{'txid': utxo['txid'], 'vout': utxo['vout']}])}", f"outputs={json.dumps([{dest: 1}])}",
+                     'options={"changePosition":1,"change_type":"bech32m"}', "psbt_version=0", named=True)["psbt"]
+    core_dec = core.call(None, "decodepsbt", psbt)
+    stripped = strip_musig_fields(psbt)
+    ck(f"{label}: the stripped PSBT has no musig fields", "musig2_participant_pubkeys" not in core.call(None, "decodepsbt", stripped)["inputs"][0])
+    ours_descs = [{"desc": ours_desc, "range": [0, 5]}]
+    def ours_process(p): return ours.call("descriptorprocesspsbt", [p, ours_descs])
+    def core_process(w, p): return core.call(w, "walletprocesspsbt", p)
+    r1o = ours_process(stripped)
+    d1 = core.call(None, "decodepsbt", r1o["psbt"])
+    want = musig_fields(core_dec); want.pop("musig2_pubnonces", None)
+    got = musig_fields(d1); got_nonces = got.pop("musig2_pubnonces", None)
+    ck(f"{label}: our Updater recreated Core's musig2 participants + taproot internal key exactly", want == got, f"core={json.dumps(want)[:300]} ours={json.dumps(got)[:300]}")
+    ck(f"{label}: Core's decodepsbt of our PSBT shows our one pubnonce", got_nonces is not None and len(got_nonces) == 1)
+    if "taproot_bip32_derivs" in core_dec["inputs"][0]:
+        ours_bd = d1["inputs"][0].get("taproot_bip32_derivs", []); core_bd = core_dec["inputs"][0]["taproot_bip32_derivs"]
+        agg_fp = [x for x in core_bd if x.get("master_fingerprint") and x not in ours_bd]
+        ck(f"{label}: our taproot_bip32_derivs carry the aggregate's derivation (Core's entry present)", any(x in ours_bd for x in core_bd), f"core={json.dumps(core_bd)[:300]} ours={json.dumps(ours_bd)[:300]}")
+    r1 = [core_process(wallets[0], psbt), core_process(wallets[1], psbt), r1o]
+    comb1 = core.call(None, "combinepsbt", [r["psbt"] for r in r1])
+    dc1 = core.call(None, "decodepsbt", comb1)
+    ck(f"{label}: round 1 -- 3 pubnonces after Core's combine", len(dc1["inputs"][0].get("musig2_pubnonces", [])) == 3)
+    r2 = [core_process(wallets[0], comb1), core_process(wallets[1], comb1), ours_process(comb1)]
+    comb2 = core.call(None, "combinepsbt", [r["psbt"] for r in r2])
+    dc2 = core.call(None, "decodepsbt", comb2)
+    ck(f"{label}: round 2 -- 3 partial signatures after Core's combine", len(dc2["inputs"][0].get("musig2_partial_sigs", [])) == 3)
+    r3 = ours_process(comb2)
+    ck(f"{label}: round 3 -- our node aggregates: complete", r3.get("complete") and "hex" in r3, json.dumps(r3)[:200])
+    if r3.get("complete"):
+        fin = core.call(None, "finalizepsbt", r3["psbt"])
+        ck(f"{label}: Core finalizes our PSBT to the same transaction", fin.get("complete") and fin.get("hex") == r3["hex"])
+        tma = core.call(None, "testmempoolaccept", [r3["hex"]], 0)[0]
+        ck(f"{label}: Core testmempoolaccept", tma.get("allowed") is True, json.dumps(tma))
+        if tma.get("allowed"):
+            txid = core.call(None, "sendrawtransaction", r3["hex"], 0); core.call("w", "generatetoaddress", 1, mine_addr)
+            ck(f"{label}: mined", core.call(None, "getrawtransaction", txid, True).get("confirmations", 0) >= 1)
 
 def main():
     global core, TPUB
@@ -295,6 +390,10 @@ def main():
             # Core's own decode of our finalized PSBT agrees it is final
             dec = core.call(None, "decodepsbt", res["psbt"])
             ck(lab + ": Core decodepsbt sees final_scriptwitness", "final_scriptwitness" in dec["inputs"][0], json.dumps(dec["inputs"][0])[:200])
+        print("== part 3: MuSig2 session -- Core wallets 0 and 1, this node as participant 2 with a tr(musig()) descriptor; the funded PSBT's musig fields are STRIPPED so this node's Updater must recreate them ==")
+        musig_session(core, ours, mine_addr, "tr(musig($0,$1,$2)/0/*)")
+        musig_session(core, ours, mine_addr, "rawtr(musig($0,$1,$2)/0/*)")
+        musig_session(core, ours, mine_addr, "tr(musig($0/0/*,$1/1/*,$2/2/*))")
     finally:
         try: ours.close()
         except Exception: pass

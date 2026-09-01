@@ -399,15 +399,25 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   and expands pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh, tr with script
   trees, rawtr, addr and raw over hex, x-only, WIF and xpub/xprv keys with
   origins, paths and ranges (proven byte-identical to Core on its own test
-  vectors); miniscript and `musig()` descriptors are refused by name (the
-  MuSig2 *signing* is in: see below).
+  vectors). **Miniscript** (`miniscript.c`, Core's script/miniscript.h in C:
+  parser, type system, resource limits, script emission and decoding, the
+  non-malleable satisfier) is accepted inside `wsh()` and as `tr()` leaves
+  with Core's sanity errors verbatim, proven on all 97 of Core's
+  miniscript_tests.cpp vectors in both contexts against this node's own
+  interpreter (`tests/test_miniscript`, 44,921 checks) and on a 48-descriptor
+  regtest differential where Core mines every witness this node signs
+  (`validation/miniscript_core_diff.py`). **`musig()`** (BIP390) keys of
+  `tr()`/`rawtr()` and their leaves aggregate, derive and print as Core's do
+  (Core's own vectors), and `descriptorprocesspsbt` is their Updater as well
+  as their signer.
   `descriptorprocesspsbt` signs from the keys a descriptor carries.
   `signrawtransactionwithkey` and the descriptor signer cover P2PKH, P2WPKH,
-  P2SH-P2WPKH, P2SH multisig, P2WSH and P2SH-P2WSH (CHECKMULTISIG or a single
-  CHECKSIG witnessScript), P2TR key-path spends of `tr(KEY)` and of
-  `tr(KEY,{...})` (internal key + merkle root), and P2TR script-path spends
-  of `pk()` and `multi_a()` leaves (leaf + control block; other leaf forms
-  wait for the miniscript satisfier). PSBTs carry the BIP371 taproot fields
+  P2SH-P2WPKH, P2SH multisig, P2WSH and P2SH-P2WSH (CHECKMULTISIG, a single
+  CHECKSIG, or any miniscript witnessScript -- the satisfier signs with the
+  keys held, the PSBT's preimages and the tx's timelocks), P2TR key-path
+  spends of `tr(KEY)` and of `tr(KEY,{...})` (internal key + merkle root),
+  and P2TR script-path spends of `pk()`, `multi_a()` and miniscript leaves
+  (leaf + control block). PSBTs carry the BIP371 taproot fields
   (leaf scripts, control blocks, internal key, merkle root, bip32 origins
   with leaf hashes, key-path and script-path partial signatures); the signer
   tries the key path first and then each leaf, carries partials other
