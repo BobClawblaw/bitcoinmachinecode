@@ -2034,199 +2034,64 @@ static int desc_checksum(const char* span, char out[9]){
 }
 
 /* ---- descriptor engine: getdescriptorinfo + deriveaddresses ----------------
- * Core rpc/output_script.cpp + descriptor.cpp. getdescriptorinfo parses a
- * descriptor, validates its checksum, and reports isrange/issolvable/
- * hasprivatekeys. deriveaddresses does BIP32 public derivation (CKDpub, in
- * bip32_ckdpub.c, verified byte-for-byte against Core) and builds addresses.
- *
- * Supported key material: an xpub (mainnet) or a raw compressed/uncompressed
- * pubkey. Supported output functions for address derivation: pkh, wpkh,
- * sh(wpkh(...)). pk()/tr()/combo() parse and checksum in getdescriptorinfo but
- * deriveaddresses reports them as not having a single corresponding address
- * (pk) or as unsupported (tr/combo) rather than fabricating one. */
-extern int bip32_ckdpub_derive(const char* xpub, const unsigned* path, int n, u8 out[33]);
-extern int bip32_xpub_parse(const char* xpub, u8 pub33[33], u8 cc32[32]);
-extern int pubkey_parse(const u8* pub, unsigned long publen, u64 qx[4], u64 qy[4]);
+ * Core rpc/output_script.cpp over descriptor.c, this node's port of Core's
+ * descriptor.cpp: pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh wrappers,
+ * tr with script trees (multi_a/sortedmulti_a leaves), rawtr, addr, raw;
+ * hex, x-only, WIF, xpub/xprv keys with origins, paths and ranges. Expansion
+ * is byte-identical to Core on its own descriptor_tests.cpp vectors
+ * (tests/test_descriptor_vectors). Miniscript and musig() are refused by
+ * name. */
+#include "descriptor.h"
+extern int wscan_spk_h160(const unsigned char* spk, unsigned long len, const unsigned char** h);
 
-enum { DSC_PKH=0, DSC_WPKH=1, DSC_SHWPKH=2, DSC_PK=3, DSC_COMBO=4, DSC_TR=5, DSC_ADDR=6, DSC_RAW=7, DSC_UNK=-1 };
-typedef struct {
-    int  script;
-    char key[160];       /* xpub or hex pubkey; or the address text for addr() */
-    int  keytype;        /* 0 raw-pubkey, 1 xpub, 2 has-private, 3 addr, 4 raw, -1 bad */
-    unsigned path[32];
-    int  pathlen;        /* fixed components (before any '*') */
-    int  ranged;         /* trailing slash-star present */
-    int  hardened;       /* any hardened path element */
-    u8   rawpub[65];     /* decoded raw pubkey (keytype 0) */
-    int  rawlen;
-    u8   spk[520];       /* scriptPubKey for addr()/raw() */
-    int  spklen;
-} desc_t;
-
-/* Parse the descriptor core string (checksum already stripped) into d.
- * Returns 1 on success; 0 with *ec / *em set on a parse/validation error. */
-static int desc_parse_core(const char* core, desc_t* d, long* ec, const char** em){
-    static char perr[192];
-    memset(d, 0, sizeof *d); d->keytype = -1;
-    size_t L = strlen(core);
-    const char* inner; size_t ilen;
-    if (!strncmp(core,"pkh(",4) && core[L-1]==')'){ d->script=DSC_PKH; inner=core+4; ilen=L-5; }
-    else if (!strncmp(core,"wpkh(",5) && core[L-1]==')'){ d->script=DSC_WPKH; inner=core+5; ilen=L-6; }
-    else if (!strncmp(core,"sh(wpkh(",8) && L>=10 && core[L-1]==')' && core[L-2]==')'){ d->script=DSC_SHWPKH; inner=core+8; ilen=L-10; }
-    else if (!strncmp(core,"pk(",3) && core[L-1]==')'){ d->script=DSC_PK; inner=core+3; ilen=L-4; }
-    else if (!strncmp(core,"combo(",6) && core[L-1]==')'){ d->script=DSC_COMBO; inner=core+6; ilen=L-7; }
-    else if (!strncmp(core,"tr(",3) && core[L-1]==')'){ d->script=DSC_TR; inner=core+3; ilen=L-4; }
-    else if (!strncmp(core,"addr(",5) && core[L-1]==')'){ d->script=DSC_ADDR; inner=core+5; ilen=L-6; }
-    else if (!strncmp(core,"raw(",4) && core[L-1]==')'){ d->script=DSC_RAW; inner=core+4; ilen=L-5; }
-    else { snprintf(perr, sizeof perr, "'%s' is not a valid descriptor function", core);
-           *ec=-5; *em=perr; return 0; }   /* Core's exact message shape */
-
-    /* addr()/raw(): the content is an address or a raw hex script, not a key. */
-    if (d->script==DSC_ADDR){
-        char a[160]; if (ilen>=sizeof a){ *ec=-5; *em="Address too long"; return 0; }
-        memcpy(a,inner,ilen); a[ilen]=0;
-        int type=0; unsigned char ver=0, h160[20], prog[32];
-        if (!wallet_validate_address(a,&type,&ver,h160,prog)){ snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0; }
-        int sl=0;
-        switch (type){
-            case 1: d->spk[0]=0x76;d->spk[1]=0xa9;d->spk[2]=0x14;memcpy(d->spk+3,h160,20);d->spk[23]=0x88;d->spk[24]=0xac;sl=25; break;  /* P2PKH */
-            case 2: d->spk[0]=0x00;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);sl=22; break;                                                 /* P2WPKH */
-            case 3: d->spk[0]=0xa9;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);d->spk[22]=0x87;sl=23; break;                                  /* P2SH */
-            case 4: d->spk[0]=0x00;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2WSH */
-            case 5: d->spk[0]=0x51;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2TR */
-            default: snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0;
-        }
-        d->spklen=sl; snprintf(d->key,sizeof d->key,"%s",a); d->keytype=3; return 1;
-    }
-    if (d->script==DSC_RAW){
-        if ((ilen&1) || ilen/2>520){ *ec=-5; *em="Raw script invalid"; return 0; }
-        d->spklen=(int)(ilen/2);
-        for (int i=0;i<d->spklen;i++){ int hi=hex1(inner[i*2]), lo=hex1(inner[i*2+1]); if(hi<0||lo<0){ *ec=-5; *em="Raw script must be hex"; return 0; } d->spk[i]=(u8)((hi<<4)|lo); }
-        d->keytype=4; return 1;
-    }
-
-    char key[256];
-    if (ilen >= sizeof key){ *ec=-5; *em="Descriptor too long"; return 0; }
-    memcpy(key, inner, ilen); key[ilen]=0;
-    char* p = key;
-    if (*p == '['){                                   /* skip [origin] */
-        char* rb = strchr(p, ']');
-        if (!rb){ *ec=-5; *em="key origin start '[' with no matching ']'"; return 0; }
-        p = rb + 1;
-    }
-    /* keybody up to first '/' */
-    char* slash = strchr(p, '/');
-    size_t kb = slash ? (size_t)(slash - p) : strlen(p);
-    if (kb == 0 || kb >= sizeof d->key){ *ec=-5; *em="Invalid key"; return 0; }
-    memcpy(d->key, p, kb); d->key[kb]=0;
-
-    if (!strncmp(d->key,"xpub",4)){
-        u8 pub[33], cc[32];
-        if (!bip32_xpub_parse(d->key, pub, cc)){
-            snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
-        d->keytype = 1;
-    } else if (!strncmp(d->key,"xprv",4) || !strncmp(d->key,"tprv",4) || !strncmp(d->key,"tpub",4)){
-        d->keytype = 2;                               /* recognized; derivation unsupported */
-    } else {                                          /* raw hex pubkey */
-        size_t hl = strlen(d->key); int ok = (hl==66||hl==130) && !(hl&1);
-        for (size_t i=0; ok && i<hl; i++) if (hex1(d->key[i])<0) ok=0;
-        if (ok){
-            d->rawlen = (int)(hl/2);
-            for (int i=0;i<d->rawlen;i++) d->rawpub[i]=(u8)((hex1(d->key[i*2])<<4)|hex1(d->key[i*2+1]));
-            u64 qx[4], qy[4];
-            if (!pubkey_parse(d->rawpub,(unsigned long)d->rawlen,qx,qy)){
-                snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
-            d->keytype = 0;
-        } else { snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
-    }
-    /* path components */
-    if (slash){
-        char* q = slash;
-        while (*q == '/'){
-            q++;
-            char comp[32]; int ci=0;
-            while (*q && *q!='/' && ci<31) comp[ci++]=*q++;
-            comp[ci]=0;
-            if (!strcmp(comp,"*")){ d->ranged=1; if (*q=='/'){ *ec=-5; *em="'*' must be the last path element"; return 0; } break; }
-            int hard=0; size_t cl=strlen(comp);
-            if (cl && (comp[cl-1]=='\''||comp[cl-1]=='h'||comp[cl-1]=='H')){ hard=1; comp[cl-1]=0; cl--; }
-            if (cl==0){ *ec=-5; *em="Invalid path element"; return 0; }
-            unsigned v=0; for (size_t i=0;i<cl;i++){ if(comp[i]<'0'||comp[i]>'9'){ *ec=-5; *em="Invalid path element"; return 0; } v=v*10+(unsigned)(comp[i]-'0'); }
-            if (d->pathlen>=32){ *ec=-5; *em="Path too deep"; return 0; }
-            if (hard){ d->hardened=1; v|=0x80000000u; }
-            d->path[d->pathlen++]=v;
-        }
-    }
-    if (d->keytype==1 && d->hardened){ *ec=-5; *em="Cannot derive a hardened child from an xpub"; return 0; }
+/* parse for an RPC: Core's exact checksum messages; deriveaddresses REQUIRES
+ * a checksum, getdescriptorinfo verifies one when present */
+static int rpcdesc_parse(const char* in, int need_checksum, descr_t* d, long* ec, const char** em){
+    static char perr[256];
+    if (need_checksum && !strchr(in, '#')){ *ec=-5; *em="Missing checksum"; return 0; }
+    char err[256];
+    if (!descr_parse(in, d, err, sizeof err)){ snprintf(perr, sizeof perr, "%s", err); *ec=-5; *em=perr; return 0; }
+    return 1;
+}
+/* the single address at range index idx (Core ExtractDestination: bare pk,
+ * bare multisig and combo have none) */
+static int rpcdesc_address_at(const descr_t* d, long idx, char* out, long cap, long* ec, const char** em){
+    static char perr[256];
+    descr_spk_t sp[4]; int n = descr_expand(d, idx, sp, 4);
+    if (n < 0){ const char* e = descr_last_error(); snprintf(perr, sizeof perr, "%s", e[0] ? e : "Key derivation failed"); *ec=-5; *em=perr; return 0; }
+    if (n != 1 || !descr_has_address(d)){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
+    out[0]=0;
+    if (wallet_script_to_address(out, cap, sp[0].spk, sp[0].len) <= 0 || !out[0]){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
     return 1;
 }
 
-/* build the address for a derived/raw compressed-or-uncompressed pubkey into
- * out (>=128); returns 1 on success, 0 with *ec / *em on a no-address type. */
-static int desc_addr_for_pub(int script, const u8* pub, int publen, char* out, long cap, long* ec, const char** em){
-    u8 h[20]; hash160(h, pub, (long long)publen);
-    if (script==DSC_PKH){ u8 s[25]={0x76,0xa9,0x14}; memcpy(s+3,h,20); s[23]=0x88; s[24]=0xac; wallet_script_to_address(out,cap,s,25); return 1; }
-    if (script==DSC_WPKH){ if(publen!=33){ *ec=-5; *em="Uncompressed key not allowed for wpkh"; return 0; } u8 s[22]={0x00,0x14}; memcpy(s+2,h,20); wallet_script_to_address(out,cap,s,22); return 1; }
-    if (script==DSC_SHWPKH){ if(publen!=33){ *ec=-5; *em="Uncompressed key not allowed for wpkh"; return 0; } u8 rd[22]={0x00,0x14}; memcpy(rd+2,h,20); u8 rh[20]; hash160(rh,rd,22); u8 s[23]={0xa9,0x14}; memcpy(s+2,rh,20); s[22]=0x87; wallet_script_to_address(out,cap,s,23); return 1; }
-    if (script==DSC_PK){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
-    *ec=-5; *em="Descriptor derivation for this function is not supported"; return 0;
-}
-
-/* derive the compressed pubkey at range index `idx` (ignored when !ranged). */
-static int desc_pub_at(const desc_t* d, long idx, u8 pub[65], int* publen){
-    if (d->keytype==0){ memcpy(pub, d->rawpub, d->rawlen); *publen=d->rawlen; return 1; }
-    if (d->keytype==1){
-        unsigned path[33]; int n=d->pathlen;
-        for (int i=0;i<n;i++) path[i]=d->path[i];
-        if (d->ranged){ if (idx<0 || idx>0x7fffffffL) return 0; path[n++]=(unsigned)idx; }
-        u8 c[33]; if (!bip32_ckdpub_derive(d->key, path, n, c)) return 0;
-        memcpy(pub,c,33); *publen=33; return 1;
-    }
-    return 0;   /* keytype 2 (private) derivation unsupported */
-}
-
-static int cmd_getdescriptorinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+static int cmd_getdescriptorinfo_impl(const rj_val* params, rj_val** res, long* ec, const char** em, descr_t* d){
     const char* in = rpc_param_str(params, 0, ec, em); if (!in) return 0;
-    static char perr[192];
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    char cks[9]; if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
-    if (hash){
-        const char* prov = hash+1;
-        if (strlen(prov)!=8 || strcmp(prov,cks)){
-            snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", prov, cks);
-            *ec=-5; *em=perr; return 0; }
-    }
-    desc_t d;
-    if (!desc_parse_core(core, &d, ec, em)) return 0;
-    char full[340]; snprintf(full,sizeof full,"%s#%s", core, cks);
+    if (!rpcdesc_parse(in, 0, d, ec, em)) return 0;
+    /* "descriptor": the public form with ITS checksum; "checksum": the
+     * checksum of the descriptor as given (Core reports both) */
+    static char pub[1500], full[1520];
+    if (!descr_to_string(d, 0, pub, sizeof pub)){ *ec=-5; *em="Descriptor too long"; return 0; }
+    char pcs[9]; descr_checksum(pub, pcs);
+    snprintf(full, sizeof full, "%s#%s", pub, pcs);
+    int t = d->nodes[d->root].type;
     rj_val* o = rj_obj();
     rj_obj_set(o,"descriptor", rj_str(full));
-    rj_obj_set(o,"checksum", rj_str(cks));
-    rj_obj_set(o,"isrange", rj_bool(d.ranged));
-    rj_obj_set(o,"issolvable", rj_bool(d.script != DSC_RAW && d.script != DSC_ADDR));  /* addr()/raw() carry no key */
-    rj_obj_set(o,"hasprivatekeys", rj_bool(d.keytype==2));
+    rj_obj_set(o,"checksum", rj_str(d->checksum));
+    rj_obj_set(o,"isrange", rj_bool(d->ranged));
+    rj_obj_set(o,"issolvable", rj_bool(t != DN_RAW && t != DN_ADDR));   /* addr()/raw() carry no key */
+    rj_obj_set(o,"hasprivatekeys", rj_bool(d->has_priv));
     *res = o;
     return 1;
 }
+static int cmd_getdescriptorinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    descr_t* d = malloc(sizeof *d); if (!d){ *ec=-7; *em="oom"; return 0; }
+    int r = cmd_getdescriptorinfo_impl(params, res, ec, em, d); free(d); return r;
+}
 
-static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
+static int cmd_deriveaddresses_impl(const rj_val* params, rj_val** res, long* ec, const char** em, descr_t* d){
     const char* in = rpc_param_str(params, 0, ec, em); if (!in) return 0;
-    static char perr[192];
-    const char* hash = strchr(in, '#');
-    if (!hash){ *ec=-5; *em="Missing checksum"; return 0; }
-    size_t cl = (size_t)(hash-in);
-    char core[320]; if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    char cks[9]; if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
-    const char* prov = hash+1;
-    if (strlen(prov)!=8 || strcmp(prov,cks)){
-        snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", prov, cks);
-        *ec=-5; *em=perr; return 0; }
-    desc_t d;
-    if (!desc_parse_core(core, &d, ec, em)) return 0;
+    if (!rpcdesc_parse(in, 1, d, ec, em)) return 0;
 
     /* range argument (params[1]): int N -> [0,N]; [a,b] -> [a,b]; inclusive. */
     long begin=0, end=0; int have_range=0;
@@ -2237,115 +2102,104 @@ static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, con
             have_range=1; begin=(long)strtoll(r->items[0]->str,NULL,10); end=(long)strtoll(r->items[1]->str,NULL,10); }
         else if (r->typ!=RJ_NULL){ *ec=-8; *em="Invalid range"; return 0; }
     }
-    if (d.ranged && !have_range){ *ec=-8; *em="Range must be specified for a ranged descriptor"; return 0; }
-    if (!d.ranged && have_range){ *ec=-8; *em="Range should not be specified for an un-ranged descriptor"; return 0; }
+    if (d->ranged && !have_range){ *ec=-8; *em="Range must be specified for a ranged descriptor"; return 0; }
+    if (!d->ranged && have_range){ *ec=-8; *em="Range should not be specified for an un-ranged descriptor"; return 0; }
     if (have_range){
         if (begin<0 || end<0){ *ec=-8; *em="Range should be greater or equal than 0"; return 0; }
         if (end<begin){ *ec=-8; *em="Range specified as [begin,end] must not have begin after end"; return 0; }
         if (end-begin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
     }
-    if (d.keytype==2){ *ec=-5; *em="Address derivation from extended private keys is not supported"; return 0; }
-
-    /* addr()/raw(): the address is the descriptor's own script's address. */
-    if (d.script==DSC_ADDR || d.script==DSC_RAW){
-        char addr[128]; addr[0]=0;
-        if (wallet_script_to_address(addr, sizeof addr, d.spk, d.spklen) <= 0 || !addr[0]){
-            *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
-        rj_val* arr = rj_arr(); rj_arr_push(arr, rj_str(addr));
-        *res = arr; return 1;
-    }
-
     rj_val* arr = rj_arr();
-    long lo = d.ranged?begin:0, hi = d.ranged?end:0;
+    long lo = d->ranged?begin:0, hi = d->ranged?end:0;
     for (long i=lo; i<=hi; i++){
-        u8 pub[65]; int pl=0;
-        if (!desc_pub_at(&d, i, pub, &pl)){ rj_free(arr); *ec=-5; *em="Key derivation failed"; return 0; }
-        char addr[128]; addr[0]=0;
-        if (!desc_addr_for_pub(d.script, pub, pl, addr, sizeof addr, ec, em)){ rj_free(arr); return 0; }
+        char addr[128];
+        if (!rpcdesc_address_at(d, i, addr, sizeof addr, ec, em)){ rj_free(arr); return 0; }
         rj_arr_push(arr, rj_str(addr));
     }
     *res = arr;
     return 1;
 }
+static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
+    descr_t* d = malloc(sizeof *d); if (!d){ *ec=-7; *em="oom"; return 0; }
+    int r = cmd_deriveaddresses_impl(params, res, ec, em, d); free(d); return r;
+}
 
 /* ---- exported descriptor API (wallet management) ---------------------------
- * rpc_wallet_ops.c's importdescriptors / watch-only wallets need the SAME
- * parse + CKDpub derivation this file already proved against Core, without a
- * second engine growing next to it. Three narrow entry points:
+ * rpc_wallet_ops.c's importdescriptors / watch-only wallets use the SAME
+ * engine, without a second one growing next to it. Three entry points:
  *
  *   rpc_desc_normalize  checksum-verify (or append) and classify;
- *   rpc_desc_expand     h160s to SCAN for over an index range -- the key hash
- *                       for pkh/wpkh, the P2SH SCRIPT hash for sh(wpkh), i.e.
- *                       exactly the 20 bytes that appear in the scriptPubKey
- *                       (wallet_scan.c matches P2WPKH/P2PKH/P2SH by that hash);
+ *   rpc_desc_expand     the 20 bytes to SCAN for over an index range -- the
+ *                       key hash for pkh/wpkh, the script hash for sh(...),
+ *                       the first 20 bytes of the 32-byte program for
+ *                       wsh(...)/tr(...) (wallet_scan.c matches every one of
+ *                       those forms by that 20-byte compare);
  *   rpc_desc_address_at the address at one index, byte-identical to what
  *                       deriveaddresses answers (same code path).
  *
- * Script types reported: 0 pkh, 1 wpkh, 2 sh(wpkh). Everything else that
- * parses (pk/tr/combo/addr/raw) is refused for wallet use with a reason --
- * a watch-only wallet must only claim scripts it can actually recognize in
- * the chain scan. */
-int rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
-                       char* err, unsigned long errcap){
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    char cks[9];
-    if (!desc_checksum(core, cks)){ snprintf(err,errcap,"Invalid characters in descriptor"); return 0; }
-    if (hash && (strlen(hash+1)!=8 || strcmp(hash+1,cks))){
-        snprintf(err,errcap,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
-        return 0; }
-    desc_t d; long ec2; const char* em2;
-    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
-    if (d.keytype==2){ snprintf(err,errcap,"private-key descriptors are not supported for import"); return 0; }
-    if (!(d.script==DSC_PKH || d.script==DSC_WPKH || d.script==DSC_SHWPKH)){
-        snprintf(err,errcap,"only pkh/wpkh/sh(wpkh) descriptors can be imported for watching"); return 0; }
-    if (is_range) *is_range = d.ranged;
-    if ((long)snprintf(out, (size_t)cap, "%s#%s", core, cks) >= cap){
+ * Script types reported: 0 pkh, 1 wpkh, 2 sh(...), 3 wsh(...), 4 tr(...),
+ * 5 addr/raw. Descriptors whose expansion has no single address (bare pk,
+ * bare multisig, combo) are refused for wallet use with a reason -- a
+ * watch-only wallet must only claim scripts it can recognize in the chain
+ * scan; private-key descriptors are refused because this wallet holds no
+ * imported keys. */
+static int rpc_desc_normalize_impl(const char* in, char* out, long cap, int* is_range,
+                       char* err, unsigned long errcap, descr_t* d){
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); return 0; }
+    if (d->has_priv){ snprintf(err,errcap,"private-key descriptors are not supported for import"); return 0; }
+    if (!descr_has_address(d)){
+        snprintf(err,errcap,"only descriptors with one address per index (pkh, wpkh, sh, wsh, tr, addr) can be imported for watching"); return 0; }
+    if (is_range) *is_range = d->ranged;
+    if ((long)snprintf(out, (size_t)cap, "%s#%s", d->text, d->checksum) >= cap){
         snprintf(err,errcap,"Descriptor too long"); return 0; }
     return 1;
 }
+rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
+                       char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
+    int r = rpc_desc_normalize_impl(in, out, cap, is_range, err, errcap, d); free(d); return r;
+}
 
-long rpc_desc_expand(const char* in, long start, long count,
+static long rpc_desc_expand_impl(const char* in, long start, long count,
                      unsigned char (*h160s)[20], long cap, int* script_type,
-                     char* err, unsigned long errcap){
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return -1; }
-    memcpy(core, in, cl); core[cl]=0;
-    desc_t d; long ec2; const char* em2;
-    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return -1; }
-    if (script_type)
-        *script_type = d.script==DSC_PKH ? 0 : d.script==DSC_WPKH ? 1 : 2;
-    if (!d.ranged){ start = 0; count = 1; }
+                     char* err, unsigned long errcap, descr_t* d){
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); return -1; }
+    if (!d->ranged){ start = 0; count = 1; }
     long n = 0;
     for (long i = start; i < start+count && n < cap; i++, n++){
-        u8 pub[65]; int pl=0;
-        if (!desc_pub_at(&d, i, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return -1; }
-        if (d.script!=DSC_PKH && pl!=33){ snprintf(err,errcap,"Uncompressed key not allowed for wpkh"); return -1; }
-        u8 kh[20]; hash160(kh, pub, pl);
-        if (d.script==DSC_SHWPKH){
-            u8 rd[22]={0x00,0x14}; memcpy(rd+2,kh,20);
-            hash160(h160s[n], rd, 22);           /* the P2SH script hash */
-        } else memcpy(h160s[n], kh, 20);
+        descr_spk_t sp[4]; int k = descr_expand(d, i, sp, 4);
+        if (k != 1){ snprintf(err,errcap,"%s", k < 0 ? descr_last_error() : "Descriptor does not have a corresponding address"); return -1; }
+        const unsigned char* h;
+        if (!wscan_spk_h160(sp[0].spk, (unsigned long)sp[0].len, &h)){ snprintf(err,errcap,"Descriptor script cannot be scanned for"); return -1; }
+        memcpy(h160s[n], h, 20);
+        if (script_type && n == 0){
+            int t = d->nodes[d->root].type;
+            *script_type = t==DN_PKH ? 0 : t==DN_WPKH ? 1 : t==DN_SH ? 2 : t==DN_WSH ? 3 : (t==DN_TR||t==DN_RAWTR) ? 4 : 5;
+        }
     }
     return n;
 }
+rpc_desc_expand(const char* in, long start, long count,
+                     unsigned char (*h160s)[20], long cap, int* script_type,
+                     char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return -1; }
+    long r = rpc_desc_expand_impl(in, start, count, h160s, cap, script_type, err, errcap, d); free(d); return r;
+}
 
-int rpc_desc_address_at(const char* in, long idx, char* out, long cap,
-                        char* err, unsigned long errcap){
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    desc_t d; long ec2; const char* em2;
-    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
-    u8 pub[65]; int pl=0;
-    if (!desc_pub_at(&d, idx, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return 0; }
-    if (!desc_addr_for_pub(d.script, pub, pl, out, cap, &ec2, &em2)){
-        snprintf(err,errcap,"%s", em2); return 0; }
+static int rpc_desc_address_at_impl(const char* in, long idx, char* out, long cap,
+                        char* err, unsigned long errcap, descr_t* d){
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); return 0; }
+    long ec2; const char* em2;
+    if (!rpcdesc_address_at(d, idx, out, cap, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
     return 1;
+}
+rpc_desc_address_at(const char* in, long idx, char* out, long cap,
+                        char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
+    int r = rpc_desc_address_at_impl(in, idx, out, cap, err, errcap, d); free(d); return r;
 }
 
 static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -3784,41 +3638,12 @@ void rpc_chain_set_utxoscan(long (*run)(const unsigned char*, const unsigned int
 }
 #define SCAN_MAX_TARGETS 4096
 #define SCAN_MAX_HITS    32768
-/* spk for descriptor d at index i (i ignored for un-ranged). 1 ok / 0 fail. */
-static int desc_spk_at(const desc_t* d, long i, u8 spk[128], u32* spklen,
-                       long* ec, const char** em){
-    if (d->script==DSC_ADDR || d->script==DSC_RAW){
-        if (d->spklen > 128){ *ec=-5; *em="Descriptor script too large"; return 0; }
-        memcpy(spk, d->spk, d->spklen); *spklen = (u32)d->spklen; return 1;
-    }
-    u8 pub[65]; int pl=0;
-    if (!desc_pub_at(d, i, pub, &pl)){ *ec=-5; *em="Key derivation failed"; return 0; }
-    u8 h[20];
-    switch (d->script){
-    case DSC_PKH:
-        hash160(h, pub, pl);
-        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3,h,20); spk[23]=0x88; spk[24]=0xac;
-        *spklen=25; return 1;
-    case DSC_WPKH:
-        hash160(h, pub, pl);
-        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2,h,20); *spklen=22; return 1;
-    case DSC_SHWPKH: {
-        u8 redeem[22]; hash160(h, pub, pl);
-        redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2,h,20);
-        hash160(h, redeem, 22);
-        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2,h,20); spk[22]=0x87; *spklen=23; return 1; }
-    case DSC_PK:
-        spk[0]=(u8)pl; memcpy(spk+1,pub,(size_t)pl); spk[1+pl]=0xac; *spklen=(u32)(pl+2); return 1;
-    default:
-        *ec=-5; *em="Descriptor type not scannable"; return 0;
-    }
-}
 /* Expand scanobjects (descriptor strings or {desc,range}) into concrete
  * scriptPubKeys. Shared by scantxoutset, scanblocks and
  * getdescriptoractivity so the three cannot drift in what they accept. */
 static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlens,
                                int cap, int* ntgt_io, long* ec, const char** em){
-    static char perr[192];
+    static char perr[320];
     int ntgt = *ntgt_io;
     for (unsigned long oi = 0; oi < objs->nitems; oi++){
         const rj_val* ob = objs->items[oi];
@@ -3851,14 +3676,18 @@ static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlen
               if (strlen(hash+1)!=8 || strcmp(hash+1,cks)){
                   snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
                   *ec=-5; *em=perr; return 0; } } }
-        desc_t d;
-        if (!desc_parse_core(core, &d, ec, em)) return 0;
+        static descr_t d;   /* ~45 KB: not on the RPC thread's stack; the dispatcher is single-threaded */
+        { char e[256]; if (!descr_parse(core, &d, e, sizeof e)){ snprintf(perr,sizeof perr,"%s",e); *ec=-5; *em=perr; return 0; } }
         long lo = 0, hi = 0;
         if (d.ranged){ lo = rbegin; hi = (rend >= 0) ? rend : 1000; }   /* Core's default range */
         for (long i = lo; i <= hi; i++){
-            if (ntgt >= cap){ *ec=-8; *em="Too many scan targets"; return 0; }
-            if (!desc_spk_at(&d, i, targets[ntgt], &tlens[ntgt], ec, em)) return 0;
-            ntgt++;
+            descr_spk_t sp[4]; int n = descr_expand(&d, i, sp, 4);   /* combo: all four forms are scanned */
+            if (n < 0){ snprintf(perr,sizeof perr,"%s", descr_last_error()); *ec=-5; *em=perr; return 0; }
+            for (int q = 0; q < n; q++){
+                if (ntgt >= cap){ *ec=-8; *em="Too many scan targets"; return 0; }
+                if (sp[q].len > 128){ *ec=-5; *em="Descriptor script too large"; return 0; }
+                memcpy(targets[ntgt], sp[q].spk, (size_t)sp[q].len); tlens[ntgt] = (u32)sp[q].len; ntgt++;
+            }
         }
     }
     *ntgt_io = ntgt;

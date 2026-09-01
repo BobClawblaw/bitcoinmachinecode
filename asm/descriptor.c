@@ -1,0 +1,656 @@
+/* descriptor.c -- output script descriptors, Core's descriptor.cpp in C.
+ *
+ * Parsing is a recursive descent over the descriptor text with the same
+ * context rules Core enforces (what may appear at top level, inside sh(),
+ * inside wsh(), inside tr()), the same key rules (uncompressed keys only
+ * where legacy scripts allow them, x-only keys inside tr()), and the same
+ * limits (3 keys in bare multisig, 20 in CHECKMULTISIG, 520-byte P2SH
+ * redeem scripts). Expansion produces Core's exact scriptPubKeys, proven
+ * against 43 of Core's own descriptor_tests.cpp vectors
+ * (tests/test_descriptor_vectors.c); the miniscript and musig() forms are
+ * refused by name rather than half-parsed. */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "descriptor.h"
+
+typedef unsigned char u8;
+extern void hash160(u8 out[20], const void* in, long long len);
+extern void sha256_full(u8 out[32], const void* msg, unsigned long len);
+extern int  wallet_base58check_decode(u8* out, long cap, long* outlen, const char* str);
+extern void base58check_encode(char* out, const u8* payload, long long paylen);
+extern void scalar_to_pubkey(u8 pub[33], const u8 k[32]);
+extern int  bip32_ckd_priv(u8 k[32], u8 c[32], const u8 kpar[32], const u8 cpar[32], unsigned index);
+extern int  bip32_ckdpub_step_pub(const u8 Kpar[33], const u8 ccpar[32], unsigned index, u8 Kout[33], u8 ccout[32]);
+extern int  bip32_pubkey_decompress(const u8 pub33[33], u8 out65[65]);
+extern int  pubkey_parse(const u8* pub, unsigned long publen, uint64_t qx[4], uint64_t qy[4]);
+extern int  bip32_xonly_tweak_add(const u8 x[32], const u8 t[32], u8 out_x[32]);
+
+/* BIP340 tagged hashes in plain C (the consensus taproot kernel keeps its
+ * scratch in thread-local storage, which is the wrong dependency for an
+ * RPC-side engine that must link into any thread) */
+static void tagged_hash(u8 out[32], const char* tag, const u8* a, unsigned long alen, const u8* b, unsigned long blen){
+    u8 th[32]; sha256_full(th, tag, strlen(tag));
+    u8 buf[64 + 2 + 1400 + 32];
+    unsigned long n = 0;
+    memcpy(buf, th, 32); memcpy(buf + 32, th, 32); n = 64;
+    if (alen + blen > sizeof buf - 64) alen = sizeof buf - 64 - blen;
+    memcpy(buf + n, a, alen); n += alen;
+    if (b && blen){ memcpy(buf + n, b, blen); n += blen; }
+    sha256_full(out, buf, n);
+}
+static long tap_leaf_hash(u8 out[32], u8 leaf_version, const u8* script, uint64_t slen){
+    u8 pre[3]; int pl = 0; pre[pl++] = leaf_version;
+    if (slen < 0xfd) pre[pl++] = (u8)slen; else { pre[pl++] = 0xfd; pre[pl++] = (u8)slen; pre[pl++] = (u8)(slen >> 8); }
+    u8 tmp[4 + 1400]; if (slen > 1400) return 0;
+    memcpy(tmp, pre, (size_t)pl); memcpy(tmp + pl, script, (size_t)slen);
+    tagged_hash(out, "TapLeaf", tmp, (unsigned long)(pl + slen), NULL, 0);
+    return 1;
+}
+static long tap_branch_hash(u8 out[32], const u8* a, const u8* b){
+    if (memcmp(a, b, 32) <= 0) tagged_hash(out, "TapBranch", a, 32, b, 32);
+    else                       tagged_hash(out, "TapBranch", b, 32, a, 32);
+    return 1;
+}
+/* 1 on success (parity is not needed for a scriptPubKey), 0 on failure */
+static long taproot_tweak_pubkey(u8* out_x, const u8* internal_x, const u8* merkle_root){
+    u8 t[32];
+    tagged_hash(t, "TapTweak", internal_x, 32, merkle_root, merkle_root ? 32 : 0);
+    return bip32_xonly_tweak_add(internal_x, t, out_x) ? 1 : 0;
+}
+extern int  wallet_validate_address(const char* str, int* type_, u8* version, u8 h160[20], u8 prog32[32]);
+
+static char g_err[256];
+const char* descr_last_error(void){ return g_err; }
+#define ERR(...) do{ snprintf(err, errcap, __VA_ARGS__); return 0; }while(0)
+#define ERRN(...) do{ snprintf(err, errcap, __VA_ARGS__); return -1; }while(0)
+
+/* ---- checksum (BIP380) ------------------------------------------------- */
+static uint64_t polymod(uint64_t c, int val){
+    u8 c0 = (u8)(c >> 35);
+    c = ((c & 0x7ffffffffULL) << 5) ^ (uint64_t)val;
+    if (c0 & 1)  c ^= 0xf5dee51989ULL;
+    if (c0 & 2)  c ^= 0xa9fdca3312ULL;
+    if (c0 & 4)  c ^= 0x1bab10e32dULL;
+    if (c0 & 8)  c ^= 0x3706b1677aULL;
+    if (c0 & 16) c ^= 0x644d626ffdULL;
+    return c;
+}
+int descr_checksum(const char* span, char out[9]){
+    static const char* IN =
+        "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+    static const char* CK = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    uint64_t c = 1; int cls = 0, clscount = 0;
+    for (const char* p = span; *p; p++){
+        const char* q = strchr(IN, *p); if (!q) return 0;
+        int pos = (int)(q - IN);
+        c = polymod(c, pos & 31);
+        cls = cls * 3 + (pos >> 5);
+        if (++clscount == 3){ c = polymod(c, cls); cls = 0; clscount = 0; }
+    }
+    if (clscount > 0) c = polymod(c, cls);
+    for (int j = 0; j < 8; ++j) c = polymod(c, 0);
+    c ^= 1;
+    for (int j = 0; j < 8; ++j) out[j] = CK[(c >> (5 * (7 - j))) & 31];
+    out[8] = 0;
+    return 1;
+}
+
+/* ---- small helpers ---------------------------------------------------- */
+static int hex1(int c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
+static int hex_decode(const char* s, size_t n, u8* out, size_t cap){
+    if (n & 1 || n/2 > cap) return -1;
+    for (size_t i = 0; i < n/2; i++){ int h = hex1(s[2*i]), l = hex1(s[2*i+1]); if (h<0||l<0) return -1; out[i] = (u8)((h<<4)|l); }
+    return (int)(n/2);
+}
+static void hex_encode(char* out, const u8* b, int n){ static const char* H="0123456789abcdef"; for (int i=0;i<n;i++){ out[2*i]=H[b[i]>>4]; out[2*i+1]=H[b[i]&15]; } out[2*n]=0; }
+/* split s[0..n) at top-level commas (not inside () {} []); returns count */
+static int split_args(const char* s, size_t n, const char** as, size_t* al, int cap){
+    int depth = 0, cnt = 0; size_t start = 0;
+    for (size_t i = 0; i <= n; i++){
+        char c = i < n ? s[i] : ',';
+        if (i < n && (c=='('||c=='{'||c=='[')) depth++;
+        else if (i < n && (c==')'||c=='}'||c==']')) depth--;
+        else if (c == ',' && depth == 0){
+            if (cnt >= cap) return -1;
+            as[cnt] = s + start; al[cnt] = i - start; cnt++; start = i + 1;
+        }
+    }
+    return cnt;
+}
+static int push_data(u8* out, int o, int cap, const u8* d, int n){
+    if (n < 0x4c){ if (o + 1 + n > cap) return -1; out[o++] = (u8)n; }
+    else if (n <= 0xff){ if (o + 2 + n > cap) return -1; out[o++] = 0x4c; out[o++] = (u8)n; }
+    else { if (o + 3 + n > cap) return -1; out[o++] = 0x4d; out[o++] = (u8)n; out[o++] = (u8)(n>>8); }
+    memcpy(out + o, d, (size_t)n); return o + n;
+}
+static int push_num(u8* out, int o, int cap, int v){
+    if (v == 0){ if (o+1>cap) return -1; out[o++] = 0x00; return o; }
+    if (v >= 1 && v <= 16){ if (o+1>cap) return -1; out[o++] = (u8)(0x50 + v); return o; }
+    u8 b[4]; int n = 0; int x = v;
+    while (x){ b[n++] = (u8)(x & 0xff); x >>= 8; }
+    if (b[n-1] & 0x80) b[n++] = 0;
+    return push_data(out, o, cap, b, n);
+}
+
+/* ---- key expressions -------------------------------------------------- */
+static int parse_path_elems(const char* s, size_t n, unsigned* path, int* plen, int* ranged, int* range_hard,
+                            int* apostrophe, int allow_range, char* err, unsigned long errcap){
+    /* s = "/a/b'/.../STAR" (STAR = the range marker) -- s[0] is '/' */
+    size_t i = 0; *plen = 0; *ranged = 0; *range_hard = 0;
+    while (i < n){
+        if (s[i] != '/') ERR("Key path value is not a valid uint32");
+        i++;
+        size_t j = i; while (j < n && s[j] != '/') j++;
+        size_t cl = j - i;
+        if (cl == 0) ERR("Key path value is not a valid uint32");
+        int hard = 0;
+        char last = s[j-1];
+        if (last == '\'' || last == 'h' || last == 'H'){ hard = 1; cl--; if (last == '\'') *apostrophe = 1; else *apostrophe = 0; }
+        if (cl == 1 && s[i] == '*'){
+            if (!allow_range) ERR("Key path value '*' is not a valid uint32");
+            if (j != n) ERR("'*' must be the last path element");   /* Core: Multipath/range must be last */
+            *ranged = 1; *range_hard = hard; return 1;
+        }
+        unsigned long long v = 0;
+        for (size_t q = 0; q < cl; q++){
+            if (s[i+q] < '0' || s[i+q] > '9'){ char t[48]; size_t m = cl < 40 ? cl : 40; memcpy(t, s+i, m); t[m]=0; ERR("Key path value '%s' is not a valid uint32", t); }
+            v = v * 10 + (unsigned)(s[i+q]-'0'); if (v > 0xffffffffULL) ERR("Key path value %llu is out of range", v);
+        }
+        if (v > 0x7fffffffULL) ERR("Key path value %llu is out of range", v);
+        if (*plen >= DESCR_MAX_PATH) ERR("Key path too deep");
+        path[(*plen)++] = (unsigned)v | (hard ? 0x80000000u : 0);
+        i = j;
+    }
+    return 1;
+}
+
+static int parse_key(const char* s, size_t n, int ctx_tr, int allow_range, descr_key_t* k, char* err, unsigned long errcap){
+    memset(k, 0, sizeof *k); k->apostrophe = 1;
+    size_t i = 0;
+    if (n && s[0] == '['){
+        size_t rb = 1; while (rb < n && s[rb] != ']') rb++;
+        if (rb >= n) ERR("Key origin start '[' with no matching ']'");
+        /* [fp/path] */
+        if (rb - 1 < 8) ERR("Fingerprint is not 4 bytes (%zu characters instead of 8 characters)", rb - 1 < 8 ? rb - 1 : 8);
+        if (hex_decode(s + 1, 8, k->origin_fp, 4) != 4) ERR("Fingerprint '%.8s' is not hex", s + 1);
+        int rg, rh;
+        if (rb - 9 > 0){
+            if (s[9] != '/') ERR("Fingerprint is not 4 bytes (%zu characters instead of 8 characters)", rb - 1);
+            if (!parse_path_elems(s + 9, rb - 9, k->origin, &k->origin_len, &rg, &rh, &k->apostrophe, 0, err, errcap)) return 0;
+        }
+        k->has_origin = 1; i = rb + 1;
+    }
+    size_t j = i; while (j < n && s[j] != '/') j++;
+    size_t kl = j - i; const char* kb = s + i;
+    if (kl == 0) ERR("No key provided");
+    char key[256]; if (kl >= sizeof key) ERR("Key too long");
+    memcpy(key, kb, kl); key[kl] = 0;
+    int ok = 0;
+    /* hex pubkey */
+    if (kl == 66 || kl == 130 || (kl == 64 && ctx_tr)){
+        int good = 1; for (size_t q = 0; q < kl; q++) if (hex1(key[q]) < 0) good = 0;
+        if (good){
+            u8 b[65]; int bl = hex_decode(key, kl, b, 65);
+            if (kl == 64){ memcpy(k->pub, b, 32); k->publen = 32; k->xonly = 1; k->compressed = 1;
+                           u8 c[33]; c[0] = 0x02; memcpy(c+1, b, 32); uint64_t qx[4], qy[4];
+                           if (!pubkey_parse(c, 33, qx, qy)) ERR("Pubkey '%s' is invalid", key); }
+            else { uint64_t qx[4], qy[4];
+                   if (!pubkey_parse(b, (unsigned long)bl, qx, qy)) ERR("Pubkey '%s' is invalid", key);
+                   memcpy(k->pub, b, (size_t)bl); k->publen = bl; k->compressed = (bl == 33); }
+            k->kind = DK_HEX; ok = 1;
+        }
+    }
+    if (!ok){
+        u8 dec[128]; long dl = 0;
+        if (wallet_base58check_decode(dec, sizeof dec, &dl, key)){
+            if (dl == 78 && ((dec[0]==0x04&&dec[1]==0x88&&dec[2]==0xB2&&dec[3]==0x1E) || (dec[0]==0x04&&dec[1]==0x88&&dec[2]==0xAD&&dec[3]==0xE4) ||
+                             (dec[0]==0x04&&dec[1]==0x35&&dec[2]==0x87&&dec[3]==0xCF) || (dec[0]==0x04&&dec[1]==0x35&&dec[2]==0x83&&dec[3]==0x94))){
+                int priv = (dec[3]==0xE4 || dec[3]==0x94);
+                memcpy(k->ver, dec, 4); k->depth = dec[4]; memcpy(k->parentfp, dec+5, 4);
+                k->child = ((unsigned)dec[9]<<24)|((unsigned)dec[10]<<16)|((unsigned)dec[11]<<8)|dec[12];
+                memcpy(k->cc, dec+13, 32);
+                k->testnet = (dec[1] == 0x35);
+                if (priv){
+                    if (dec[45] != 0) ERR("key '%s' is not valid", key);
+                    memcpy(k->xkey, dec+46, 32); k->kind = DK_XPRV; k->has_priv = 1;
+                    scalar_to_pubkey(k->pub, k->xkey); k->publen = 33;
+                } else {
+                    uint64_t qx[4], qy[4];
+                    if ((dec[45] != 0x02 && dec[45] != 0x03) || !pubkey_parse(dec+45, 33, qx, qy)) ERR("key '%s' is not valid", key);
+                    memcpy(k->pub, dec+45, 33); k->publen = 33; k->kind = DK_XPUB;
+                }
+                k->compressed = 1; ok = 1;
+            } else if ((dl == 33 || dl == 34) && (dec[0] == 0x80 || dec[0] == 0xef)){
+                if (dl == 34 && dec[33] != 0x01) ERR("key '%s' is not valid", key);
+                memcpy(k->priv, dec+1, 32); k->compressed = (dl == 34); k->testnet = (dec[0] == 0xef);
+                k->kind = DK_WIF; k->has_priv = 1;
+                scalar_to_pubkey(k->pub, k->priv); k->publen = 33;
+                if (!k->compressed){ u8 u[65]; if (!bip32_pubkey_decompress(k->pub, u)) ERR("key '%s' is not valid", key); memcpy(k->pub, u, 65); k->publen = 65; }
+                ok = 1;
+            }
+        }
+    }
+    if (!ok) ERR("key '%s' is not valid", key);
+    if (j < n){
+        if (k->kind == DK_HEX || k->kind == DK_WIF) ERR("Key path is not allowed for a non-extended key");   /* Core: "... is not valid" -- kept specific */
+        if (!parse_path_elems(s + j, n - j, k->path, &k->pathlen, &k->ranged, &k->range_hard, &k->apostrophe, allow_range, err, errcap)) return 0;
+    }
+    return 1;
+}
+
+/* ---- script expressions ----------------------------------------------- */
+enum { CTX_TOP = 0, CTX_SH = 1, CTX_WSH = 2, CTX_TR = 3 };
+
+static int new_node(descr_t* d, int type, char* err, unsigned long errcap){
+    if (d->nn >= DESCR_MAX_NODES) ERRN("Descriptor too complex");
+    descr_node_t* n = &d->nodes[d->nn]; memset(n, 0, sizeof *n); n->type = type; n->child[0] = n->child[1] = -1;
+    return d->nn++;
+}
+static int add_key(descr_t* d, const char* s, size_t n, int ctx, char* err, unsigned long errcap){
+    if (d->nk >= DESCR_MAX_KEYS) ERRN("Too many keys in descriptor");
+    descr_key_t* k = &d->keys[d->nk];
+    if (!parse_key(s, n, ctx == CTX_TR, 1, k, err, errcap)) return -1;
+    if (ctx != CTX_TOP && ctx != CTX_SH && !k->compressed) ERRN("Uncompressed keys are not allowed");
+    k->tr_ctx = (ctx == CTX_TR);
+    if (k->ranged) d->ranged = 1;
+    if (k->ranged && k->range_hard) d->has_hardened_range = 1;
+    if (k->has_priv) d->has_priv = 1;
+    return d->nk++;
+}
+
+static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err, unsigned long errcap);
+
+static int parse_tree(descr_t* d, const char* s, size_t n, char* err, unsigned long errcap){
+    if (n && s[0] == '{'){
+        if (s[n-1] != '}') ERRN("tr(): tree not closed with '}'");
+        const char* as[3]; size_t al[3];
+        int na = split_args(s + 1, n - 2, as, al, 3);
+        if (na != 2) ERRN("tr(): a branch must have exactly two children");
+        int b = new_node(d, DN_BRANCH, err, errcap); if (b < 0) return -1;
+        int l = parse_tree(d, as[0], al[0], err, errcap); if (l < 0) return -1;
+        int r = parse_tree(d, as[1], al[1], err, errcap); if (r < 0) return -1;
+        d->nodes[b].child[0] = l; d->nodes[b].child[1] = r;
+        return b;
+    }
+    return parse_script(d, s, n, CTX_TR, err, errcap);
+}
+
+static int parse_script(descr_t* d, const char* s, size_t n, int ctx, char* err, unsigned long errcap){
+    size_t p = 0; while (p < n && s[p] != '(') p++;
+    if (p == 0 || p >= n || s[n-1] != ')'){
+        char t[64]; size_t m = n < 48 ? n : 48; memcpy(t, s, m); t[m] = 0;
+        if (ctx == CTX_TR) ERRN("'%s' is not a valid descriptor function", t);
+        ERRN("'%s' is not a valid descriptor function", t);
+    }
+    char fn[24]; if (p >= sizeof fn) { char t[64]; size_t m = n < 48 ? n : 48; memcpy(t, s, m); t[m]=0; ERRN("'%s' is not a valid descriptor function", t); }
+    memcpy(fn, s, p); fn[p] = 0;
+    const char* in = s + p + 1; size_t il = n - p - 2;
+    const char* as[DESCR_NODE_KEYS + 2]; size_t al[DESCR_NODE_KEYS + 2];
+
+    if (!strcmp(fn, "pk") || !strcmp(fn, "pkh") || !strcmp(fn, "wpkh")){
+        int t = fn[0]=='w' ? DN_WPKH : fn[2]=='h' ? DN_PKH : DN_PK;
+        if (t == DN_WPKH && ctx != CTX_TOP && ctx != CTX_SH) ERRN("Can only have wpkh() at top level or inside sh()");
+        int nd = new_node(d, t, err, errcap); if (nd < 0) return -1;
+        int k = add_key(d, in, il, ctx, err, errcap); if (k < 0) return -1;
+        if (t == DN_WPKH && !d->keys[k].compressed) ERRN("Uncompressed keys are not allowed");
+        d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1; return nd;
+    }
+    if (!strcmp(fn, "combo")){
+        if (ctx != CTX_TOP) ERRN("Can only have combo() at top level");
+        int nd = new_node(d, DN_COMBO, err, errcap); if (nd < 0) return -1;
+        int k = add_key(d, in, il, ctx, err, errcap); if (k < 0) return -1;
+        d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1; return nd;
+    }
+    if (!strcmp(fn, "multi") || !strcmp(fn, "sortedmulti") || !strcmp(fn, "multi_a") || !strcmp(fn, "sortedmulti_a")){
+        int tap = strstr(fn, "_a") != NULL, sorted = fn[0] == 's';
+        if (tap && ctx != CTX_TR) ERRN("Can only have %s() inside tr()", fn);
+        if (!tap && ctx == CTX_TR) ERRN("Can only have %s() at top level, in sh(), or in wsh()", fn);
+        int na = split_args(in, il, as, al, DESCR_NODE_KEYS + 2);
+        if (na < 2) ERRN("Multi threshold and at least one key required");
+        if (na - 1 > DESCR_NODE_KEYS) ERRN("Cannot have %d keys in multisig; must have between 1 and %d keys, inclusive", na - 1, tap ? DESCR_NODE_KEYS : 20);
+        long thr = 0; for (size_t q = 0; q < al[0]; q++){ if (as[0][q] < '0' || as[0][q] > '9') ERRN("Multi threshold '%.*s' is not valid", (int)al[0], as[0]); thr = thr*10 + (as[0][q]-'0'); if (thr > 100000) break; }
+        if (thr < 1) ERRN("Multisig threshold cannot be %ld, must be at least 1", thr);
+        if (thr > na - 1) ERRN("Multisig threshold cannot be larger than the number of keys; threshold is %ld but only %d keys specified", thr, na - 1);
+        if (!tap && na - 1 > 20) ERRN("Cannot have %d keys in multisig; must have between 1 and 20 keys, inclusive", na - 1);
+        int nd = new_node(d, tap ? (sorted ? DN_SORTEDMULTI_A : DN_MULTI_A) : (sorted ? DN_SORTEDMULTI : DN_MULTI), err, errcap); if (nd < 0) return -1;
+        d->nodes[nd].k = (int)thr;
+        int anyuncomp = 0;
+        for (int q = 1; q < na; q++){
+            int k = add_key(d, as[q], al[q], ctx, err, errcap); if (k < 0) return -1;
+            if (!d->keys[k].compressed) anyuncomp = 1;
+            d->nodes[nd].keys[d->nodes[nd].nkeys++] = k;
+        }
+        if (!tap && ctx == CTX_TOP && na - 1 > 3) ERRN("Cannot have %d pubkeys in bare multisig: only at most 3 pubkeys", na - 1);
+        if (!tap && ctx == CTX_SH){
+            /* Core: the redeemScript must fit 520 bytes */
+            int sz = 3; for (int q = 0; q < d->nodes[nd].nkeys; q++) sz += 1 + d->keys[d->nodes[nd].keys[q]].publen;
+            if (sz > 520) ERRN("P2SH script is too large, %d bytes is larger than 520 bytes", sz);
+        }
+        (void)anyuncomp;
+        return nd;
+    }
+    if (!strcmp(fn, "sh")){
+        if (ctx != CTX_TOP) ERRN("Can only have sh() at top level");
+        int nd = new_node(d, DN_SH, err, errcap); if (nd < 0) return -1;
+        int c = parse_script(d, in, il, CTX_SH, err, errcap); if (c < 0) return -1;
+        d->nodes[nd].child[0] = c; return nd;
+    }
+    if (!strcmp(fn, "wsh")){
+        if (ctx != CTX_TOP && ctx != CTX_SH) ERRN("Can only have wsh() at top level or inside sh()");
+        int nd = new_node(d, DN_WSH, err, errcap); if (nd < 0) return -1;
+        int c = parse_script(d, in, il, CTX_WSH, err, errcap); if (c < 0) return -1;
+        int ct = d->nodes[c].type;
+        if (ct == DN_WPKH || ct == DN_WSH || ct == DN_SH) ERRN("Can only have %s() at top level%s", ct==DN_WPKH?"wpkh":ct==DN_WSH?"wsh":"sh", ct==DN_SH?"":" or inside sh()");
+        d->nodes[nd].child[0] = c; return nd;
+    }
+    if (!strcmp(fn, "tr")){
+        if (ctx != CTX_TOP) ERRN("Can only have tr at top level");
+        int na = split_args(in, il, as, al, 3);
+        if (na < 1 || na > 2) ERRN("tr(): must have a key and optionally a tree");
+        int nd = new_node(d, DN_TR, err, errcap); if (nd < 0) return -1;
+        int k = add_key(d, as[0], al[0], CTX_TR, err, errcap); if (k < 0) return -1;
+        d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1;
+        if (na == 2){ int t = parse_tree(d, as[1], al[1], err, errcap); if (t < 0) return -1; d->nodes[nd].child[0] = t; }
+        return nd;
+    }
+    if (!strcmp(fn, "rawtr")){
+        if (ctx != CTX_TOP) ERRN("Can only have rawtr at top level");
+        int nd = new_node(d, DN_RAWTR, err, errcap); if (nd < 0) return -1;
+        int k = add_key(d, in, il, CTX_TR, err, errcap); if (k < 0) return -1;
+        d->nodes[nd].keys[0] = k; d->nodes[nd].nkeys = 1; return nd;
+    }
+    if (!strcmp(fn, "addr")){
+        if (ctx != CTX_TOP) ERRN("Can only have addr() at top level");
+        char a[160]; if (il >= sizeof a) ERRN("Address too long");
+        memcpy(a, in, il); a[il] = 0;
+        int type = 0; u8 ver = 0, h160[20], prog[32];
+        if (!wallet_validate_address(a, &type, &ver, h160, prog)) ERRN("Address is not valid");
+        u8* sp = d->raw; int sl = 0;
+        switch (type){
+            case 1: sp[0]=0x76;sp[1]=0xa9;sp[2]=0x14;memcpy(sp+3,h160,20);sp[23]=0x88;sp[24]=0xac;sl=25; break;
+            case 2: sp[0]=0x00;sp[1]=0x14;memcpy(sp+2,h160,20);sl=22; break;
+            case 3: sp[0]=0xa9;sp[1]=0x14;memcpy(sp+2,h160,20);sp[22]=0x87;sl=23; break;
+            case 4: sp[0]=0x00;sp[1]=0x20;memcpy(sp+2,prog,32);sl=34; break;
+            case 5: sp[0]=0x51;sp[1]=0x20;memcpy(sp+2,prog,32);sl=34; break;
+            default: ERRN("Address is not valid");
+        }
+        d->rawlen = sl;
+        int nd = new_node(d, DN_ADDR, err, errcap); return nd;
+    }
+    if (!strcmp(fn, "raw")){
+        if (ctx != CTX_TOP) ERRN("Can only have raw() at top level");
+        int l = hex_decode(in, il, d->raw, DESCR_MAX_SPK);
+        if (l < 0) ERRN("Raw script is not hex");
+        d->rawlen = l;
+        int nd = new_node(d, DN_RAW, err, errcap); return nd;
+    }
+    if (!strcmp(fn, "musig")) ERRN("musig() is not supported by this node");
+    { char t[64]; size_t m = p < 48 ? p : 48; memcpy(t, s, m); t[m] = 0;
+      /* miniscript fragments are refused by name, not half-parsed */
+      ERRN("'%s' is not a valid descriptor function", t); }
+}
+
+int descr_parse(const char* text, descr_t* d, char* err, unsigned long errcap){
+    memset(d, 0, sizeof *d); d->root = -1;
+    const char* hash = strchr(text, '#');
+    size_t cl = hash ? (size_t)(hash - text) : strlen(text);
+    if (cl >= sizeof d->text) ERR("Descriptor too long");
+    memcpy(d->text, text, cl); d->text[cl] = 0;
+    if (!descr_checksum(d->text, d->checksum)) ERR("Invalid characters in descriptor");
+    if (hash){
+        if (strlen(hash + 1) != 8) ERR("Expected 8 character checksum, not %zu characters", strlen(hash + 1));
+        if (strcmp(hash + 1, d->checksum)) ERR("Provided checksum '%s' does not match computed checksum '%s'", hash + 1, d->checksum);
+        d->had_checksum = 1;
+    }
+    if (cl == 0) ERR("'' is not a valid descriptor function");
+    int r = parse_script(d, d->text, cl, CTX_TOP, err, errcap);
+    if (r < 0) return 0;
+    d->root = r;
+    return 1;
+}
+
+/* ---- derivation ------------------------------------------------------- */
+static int key_pub_at(const descr_key_t* k, long idx, u8 pub[65], int* publen){
+    if (k->kind == DK_HEX || k->kind == DK_WIF){ memcpy(pub, k->pub, (size_t)k->publen); *publen = k->publen; return 1; }
+    if (k->ranged && (idx < 0 || idx > 0x7fffffffL)) return 0;
+    if (k->kind == DK_XPUB){
+        int hard = k->ranged && k->range_hard;
+        for (int i = 0; i < k->pathlen; i++) if (k->path[i] & 0x80000000u) hard = 1;
+        if (hard){ snprintf(g_err, sizeof g_err, "Cannot derive script without private keys"); return 0; }
+        u8 K[33], cc[32]; memcpy(K, k->pub, 33); memcpy(cc, k->cc, 32);
+        for (int i = 0; i < k->pathlen; i++){ u8 Kn[33], cn[32]; if (!bip32_ckdpub_step_pub(K, cc, k->path[i], Kn, cn)) return 0; memcpy(K, Kn, 33); memcpy(cc, cn, 32); }
+        if (k->ranged){ u8 Kn[33], cn[32]; if (!bip32_ckdpub_step_pub(K, cc, (unsigned)idx, Kn, cn)) return 0; memcpy(K, Kn, 33); }
+        memcpy(pub, K, 33); *publen = 33; return 1;
+    }
+    u8 kk[32], cc[32]; memcpy(kk, k->xkey, 32); memcpy(cc, k->cc, 32);
+    for (int i = 0; i < k->pathlen; i++){ u8 kn[32], cn[32]; if (bip32_ckd_priv(kn, cn, kk, cc, k->path[i]) != 1) return 0; memcpy(kk, kn, 32); memcpy(cc, cn, 32); }
+    if (k->ranged){ u8 kn[32], cn[32]; unsigned ix = (unsigned)idx | (k->range_hard ? 0x80000000u : 0); if (bip32_ckd_priv(kn, cn, kk, cc, ix) != 1) return 0; memcpy(kk, kn, 32); }
+    scalar_to_pubkey(pub, kk); *publen = 33; return 1;
+}
+int descr_key_pub_at(const descr_t* d, int key, long idx, u8 pub[65], int* publen){
+    if (key < 0 || key >= d->nk) return 0;
+    return key_pub_at(&d->keys[key], idx, pub, publen);
+}
+int descr_key_priv_at(const descr_t* d, int key, long idx, u8 priv[32], int* compressed){
+    if (key < 0 || key >= d->nk) return 0;
+    const descr_key_t* k = &d->keys[key];
+    if (!k->has_priv) return 0;
+    if (compressed) *compressed = k->compressed;
+    if (k->kind == DK_WIF){ memcpy(priv, k->priv, 32); return 1; }
+    u8 kk[32], cc[32]; memcpy(kk, k->xkey, 32); memcpy(cc, k->cc, 32);
+    for (int i = 0; i < k->pathlen; i++){ u8 kn[32], cn[32]; if (bip32_ckd_priv(kn, cn, kk, cc, k->path[i]) != 1) return 0; memcpy(kk, kn, 32); memcpy(cc, cn, 32); }
+    if (k->ranged){ if (idx < 0 || idx > 0x7fffffffL) return 0; u8 kn[32], cn[32]; unsigned ix = (unsigned)idx | (k->range_hard ? 0x80000000u : 0); if (bip32_ckd_priv(kn, cn, kk, cc, ix) != 1) return 0; memcpy(kk, kn, 32); }
+    memcpy(priv, kk, 32); return 1;
+}
+
+/* ---- script construction ---------------------------------------------- */
+#define SCRIPT_CAP 1400
+/* pubkey bytes of key `ki` at idx, x-only when in tr context */
+static int key_bytes(const descr_t* d, int ki, long idx, int xonly, u8 out[65], int* n){
+    u8 pub[65]; int pl;
+    if (!key_pub_at(&d->keys[ki], idx, pub, &pl)){ if (!g_err[0]) snprintf(g_err, sizeof g_err, "Key derivation failed"); return 0; }
+    if (xonly){
+        if (pl == 32){ memcpy(out, pub, 32); *n = 32; return 1; }
+        if (pl == 65){ snprintf(g_err, sizeof g_err, "Uncompressed keys are not allowed"); return 0; }
+        memcpy(out, pub + 1, 32); *n = 32; return 1;
+    }
+    if (pl == 32){ out[0] = 0x02; memcpy(out + 1, pub, 32); *n = 33; return 1; }   /* x-only outside tr: even-Y form (Core does the same for XOnlyPubKey::GetEvenCorrespondingCPubKey) */
+    memcpy(out, pub, (size_t)pl); *n = pl; return 1;
+}
+static int cmp_key(const void* a, const void* b){
+    const u8* x = a; const u8* y = b; int lx = x[0], ly = y[0];
+    int m = lx < ly ? lx : ly; int c = memcmp(x + 1, y + 1, (size_t)m);
+    return c ? c : lx - ly;
+}
+/* the script for node ni (a leaf-level script: pk/pkh/wpkh/multi*/
+static int node_script(const descr_t* d, int ni, long idx, int tr, u8* out, int cap){
+    const descr_node_t* n = &d->nodes[ni];
+    int o = 0;
+    switch (n->type){
+    case DN_PK: { u8 kb[65]; int kl; if (!key_bytes(d, n->keys[0], idx, tr, kb, &kl)) return -1;
+        o = push_data(out, o, cap, kb, kl); if (o < 0) return -1; out[o++] = 0xac; return o; }
+    case DN_PKH: { u8 kb[65]; int kl, h[20]; if (!key_bytes(d, n->keys[0], idx, tr, kb, &kl)) return -1;
+        u8 hh[20]; hash160(hh, kb, kl); (void)h;
+        if (o + 25 > cap) return -1;
+        out[o++]=0x76; out[o++]=0xa9; out[o++]=0x14; memcpy(out+o, hh, 20); o+=20; out[o++]=0x88; out[o++]=0xac; return o; }
+    case DN_WPKH: { u8 kb[65]; int kl; if (!key_bytes(d, n->keys[0], idx, 0, kb, &kl)) return -1;
+        if (kl != 33){ snprintf(g_err, sizeof g_err, "Uncompressed keys are not allowed"); return -1; }
+        u8 hh[20]; hash160(hh, kb, kl); if (o + 22 > cap) return -1;
+        out[o++]=0x00; out[o++]=0x14; memcpy(out+o, hh, 20); return o + 20; }
+    case DN_MULTI: case DN_SORTEDMULTI: {
+        u8 keys[DESCR_NODE_KEYS][66]; int nk = n->nkeys;
+        for (int q = 0; q < nk; q++){ int kl; if (!key_bytes(d, n->keys[q], idx, 0, keys[q] + 1, &kl)) return -1; keys[q][0] = (u8)kl; }
+        if (n->type == DN_SORTEDMULTI) qsort(keys, (size_t)nk, 66, cmp_key);
+        o = push_num(out, o, cap, n->k); if (o < 0) return -1;
+        for (int q = 0; q < nk; q++){ o = push_data(out, o, cap, keys[q] + 1, keys[q][0]); if (o < 0) return -1; }
+        o = push_num(out, o, cap, nk); if (o < 0 || o + 1 > cap) return -1;
+        out[o++] = 0xae; return o; }
+    case DN_MULTI_A: case DN_SORTEDMULTI_A: {
+        u8 keys[DESCR_NODE_KEYS][33]; int nk = n->nkeys;
+        for (int q = 0; q < nk; q++){ int kl; if (!key_bytes(d, n->keys[q], idx, 1, keys[q] + 1, &kl)) return -1; keys[q][0] = 32; }
+        if (n->type == DN_SORTEDMULTI_A) qsort(keys, (size_t)nk, 33, cmp_key);
+        for (int q = 0; q < nk; q++){
+            o = push_data(out, o, cap, keys[q] + 1, 32); if (o < 0 || o + 1 > cap) return -1;
+            out[o++] = q == 0 ? 0xac : 0xba;            /* CHECKSIG, then CHECKSIGADD */
+        }
+        o = push_num(out, o, cap, n->k); if (o < 0 || o + 1 > cap) return -1;
+        out[o++] = 0x9c; return o; }                     /* NUMEQUAL */
+    default:
+        snprintf(g_err, sizeof g_err, "Descriptor node cannot be a script"); return -1;
+    }
+}
+/* merkle root of a tap tree rooted at ni; 1 ok */
+static int tree_hash(const descr_t* d, int ni, long idx, u8 out[32], int depth){
+    if (depth > 128){ snprintf(g_err, sizeof g_err, "tr() tree too deep"); return 0; }
+    const descr_node_t* n = &d->nodes[ni];
+    if (n->type == DN_BRANCH){
+        u8 l[32], r[32];
+        if (!tree_hash(d, n->child[0], idx, l, depth + 1) || !tree_hash(d, n->child[1], idx, r, depth + 1)) return 0;
+        tap_branch_hash(out, l, r); return 1;
+    }
+    u8 sc[SCRIPT_CAP]; int sl = node_script(d, ni, idx, 1, sc, SCRIPT_CAP);
+    if (sl < 0) return 0;
+    if (tap_leaf_hash(out, 0xc0, sc, (uint64_t)sl) != 1){ snprintf(g_err, sizeof g_err, "tapleaf hash failed"); return 0; }
+    return 1;
+}
+/* scriptPubKey of the wrapper/leaf node ni at the top level */
+static int spk_of(const descr_t* d, int ni, long idx, u8* out, int cap){
+    const descr_node_t* n = &d->nodes[ni];
+    switch (n->type){
+    case DN_SH: {
+        u8 sc[SCRIPT_CAP]; int sl;
+        int ct = d->nodes[n->child[0]].type;
+        if (ct == DN_WSH || ct == DN_WPKH){ sl = spk_of(d, n->child[0], idx, sc, SCRIPT_CAP); }
+        else { sl = node_script(d, n->child[0], idx, 0, sc, SCRIPT_CAP); }
+        if (sl < 0) return -1;
+        if (sl > 520){ snprintf(g_err, sizeof g_err, "P2SH script is too large, %d bytes is larger than 520 bytes", sl); return -1; }
+        u8 h[20]; hash160(h, sc, sl);
+        if (cap < 23) return -1;
+        out[0]=0xa9; out[1]=0x14; memcpy(out+2, h, 20); out[22]=0x87; return 23; }
+    case DN_WSH: { u8 sc[SCRIPT_CAP]; int sl = node_script(d, n->child[0], idx, 0, sc, SCRIPT_CAP);
+        if (sl < 0) return -1;
+        u8 h[32]; sha256_full(h, sc, (unsigned long)sl);
+        if (cap < 34) return -1;
+        out[0]=0x00; out[1]=0x20; memcpy(out+2, h, 32); return 34; }
+    case DN_TR: { u8 ik[65]; int il; if (!key_bytes(d, n->keys[0], idx, 1, ik, &il)) return -1;
+        u8 root[32]; const u8* rp = NULL;
+        if (n->child[0] >= 0){ if (!tree_hash(d, n->child[0], idx, root, 0)) return -1; rp = root; }
+        u8 q[32]; if (taproot_tweak_pubkey(q, ik, rp) < 1){ snprintf(g_err, sizeof g_err, "taproot tweak failed"); return -1; }
+        if (cap < 34) return -1;
+        out[0]=0x51; out[1]=0x20; memcpy(out+2, q, 32); return 34; }
+    case DN_RAWTR: { u8 ik[65]; int il; if (!key_bytes(d, n->keys[0], idx, 1, ik, &il)) return -1;
+        if (cap < 34) return -1;
+        out[0]=0x51; out[1]=0x20; memcpy(out+2, ik, 32); return 34; }
+    case DN_ADDR: case DN_RAW:
+        if (cap < d->rawlen) return -1;
+        memcpy(out, d->raw, (size_t)d->rawlen); return d->rawlen;
+    default: return node_script(d, ni, idx, 0, out, cap);
+    }
+}
+int descr_expand(const descr_t* d, long idx, descr_spk_t* out, int cap){
+    g_err[0] = 0;
+    if (d->root < 0 || cap < 1){ snprintf(g_err, sizeof g_err, "Descriptor not parsed"); return -1; }
+    const descr_node_t* n = &d->nodes[d->root];
+    if (n->type == DN_COMBO){
+        u8 kb[65]; int kl; if (!key_bytes(d, n->keys[0], idx, 0, kb, &kl)) return -1;
+        int c = 0; u8 h[20]; hash160(h, kb, kl);
+        if (cap < 2) return -1;
+        { int o = push_data(out[c].spk, 0, DESCR_MAX_SPK, kb, kl); out[c].spk[o++] = 0xac; out[c].len = o; c++; }
+        { u8* s = out[c].spk; s[0]=0x76;s[1]=0xa9;s[2]=0x14;memcpy(s+3,h,20);s[23]=0x88;s[24]=0xac; out[c].len=25; c++; }
+        if (kl == 33 && cap >= 4){
+            { u8* s = out[c].spk; s[0]=0x00;s[1]=0x14;memcpy(s+2,h,20); out[c].len=22; c++; }
+            { u8 rd[22]={0x00,0x14}; memcpy(rd+2,h,20); u8 rh[20]; hash160(rh, rd, 22);
+              u8* s = out[c].spk; s[0]=0xa9;s[1]=0x14;memcpy(s+2,rh,20);s[22]=0x87; out[c].len=23; c++; }
+        }
+        return c;
+    }
+    int l = spk_of(d, d->root, idx, out[0].spk, DESCR_MAX_SPK);
+    if (l < 0){ if (!g_err[0]) snprintf(g_err, sizeof g_err, "Key derivation failed"); return -1; }
+    out[0].len = l; return 1;
+}
+int descr_inner_script_at(const descr_t* d, long idx, u8* out, int cap, int* which){
+    if (d->root < 0) return 0;
+    const descr_node_t* n = &d->nodes[d->root];
+    if (n->type == DN_SH){
+        int c = n->child[0]; int ct = d->nodes[c].type;
+        if (ct == DN_WSH){ int l = node_script(d, d->nodes[c].child[0], idx, 0, out, cap); if (l < 0) return 0; *which = 3; return l; }
+        int l = (ct == DN_WPKH) ? spk_of(d, c, idx, out, cap) : node_script(d, c, idx, 0, out, cap);
+        if (l < 0) return 0;
+        *which = 1; return l;
+    }
+    if (n->type == DN_WSH){ int l = node_script(d, n->child[0], idx, 0, out, cap); if (l < 0) return 0; *which = 2; return l; }
+    return 0;
+}
+int descr_has_address(const descr_t* d){
+    if (d->root < 0) return 0;
+    int t = d->nodes[d->root].type;
+    if (t == DN_PK || t == DN_COMBO || t == DN_MULTI || t == DN_SORTEDMULTI) return 0;
+    if (t == DN_RAW){   /* only standard forms have a destination */
+        int l = d->rawlen; const u8* s = d->raw;
+        return (l==25&&s[0]==0x76&&s[1]==0xa9&&s[2]==0x14&&s[23]==0x88&&s[24]==0xac) || (l==23&&s[0]==0xa9&&s[1]==0x14&&s[22]==0x87) ||
+               (l==22&&s[0]==0x00&&s[1]==0x14) || (l==34&&(s[0]==0x00||s[0]==0x51)&&s[1]==0x20);
+    }
+    return 1;
+}
+
+/* ---- to string -------------------------------------------------------- */
+typedef struct { char* p; unsigned long cap, n; int ovf; } sb_t;
+static void sb_put(sb_t* b, const char* s){ unsigned long l = strlen(s); if (b->n + l + 1 > b->cap){ b->ovf = 1; return; } memcpy(b->p + b->n, s, l + 1); b->n += l; }
+static void sb_path(sb_t* b, const unsigned* path, int n, int apostrophe){
+    for (int i = 0; i < n; i++){ char t[24]; snprintf(t, sizeof t, "/%u%s", path[i] & 0x7fffffffu, (path[i] & 0x80000000u) ? (apostrophe ? "'" : "h") : ""); sb_put(b, t); }
+}
+static void sb_key(sb_t* b, const descr_key_t* k, int with_priv){
+    if (k->has_origin){ char t[16]; hex_encode(t, k->origin_fp, 4); sb_put(b, "["); sb_put(b, t); sb_path(b, k->origin, k->origin_len, k->apostrophe); sb_put(b, "]"); }
+    char t[200];
+    if (k->kind == DK_HEX || (k->kind == DK_WIF && !with_priv)){
+        if (k->tr_ctx && k->publen == 33) hex_encode(t, k->pub + 1, 32);   /* Core prints tr() keys x-only */
+        else hex_encode(t, k->pub, k->publen);
+        sb_put(b, t);
+    } else if (k->kind == DK_WIF){
+        if (with_priv){
+            u8 pay[34]; pay[0] = k->testnet ? 0xef : 0x80; memcpy(pay+1, k->priv, 32); pay[33] = 1;
+            base58check_encode(t, pay, k->compressed ? 34 : 33); sb_put(b, t);
+        } else {
+            hex_encode(t, k->pub, k->publen); sb_put(b, t);
+        }
+    } else {
+        u8 ser[78]; int priv = (k->kind == DK_XPRV) && with_priv;
+        ser[0]=0x04; ser[1]=k->testnet?0x35:0x88; ser[2]=k->testnet?(priv?0x83:0x87):(priv?0xAD:0xB2); ser[3]=k->testnet?(priv?0x94:0xCF):(priv?0xE4:0x1E);
+        ser[4]=k->depth; memcpy(ser+5,k->parentfp,4); ser[9]=(u8)(k->child>>24); ser[10]=(u8)(k->child>>16); ser[11]=(u8)(k->child>>8); ser[12]=(u8)k->child;
+        memcpy(ser+13,k->cc,32);
+        if (priv){ ser[45]=0; memcpy(ser+46,k->xkey,32); }
+        else memcpy(ser+45,k->pub,33);
+        base58check_encode(t, ser, 78); sb_put(b, t);
+    }
+    sb_path(b, k->path, k->pathlen, k->apostrophe);
+    if (k->ranged) sb_put(b, k->range_hard ? (k->apostrophe ? "/*'" : "/*h") : "/*");
+}
+static void sb_node(sb_t* b, const descr_t* d, int ni, int with_priv){
+    const descr_node_t* n = &d->nodes[ni];
+    static const char* NAMES[] = { "", "pk", "pkh", "wpkh", "combo", "multi", "sortedmulti", "multi_a", "sortedmulti_a", "sh", "wsh", "tr", "addr", "raw", "rawtr", "" };
+    if (n->type == DN_BRANCH){ sb_put(b, "{"); sb_node(b, d, n->child[0], with_priv); sb_put(b, ","); sb_node(b, d, n->child[1], with_priv); sb_put(b, "}"); return; }
+    sb_put(b, NAMES[n->type]); sb_put(b, "(");
+    switch (n->type){
+    case DN_SH: case DN_WSH: sb_node(b, d, n->child[0], with_priv); break;
+    case DN_TR: sb_key(b, &d->keys[n->keys[0]], with_priv); if (n->child[0] >= 0){ sb_put(b, ","); sb_node(b, d, n->child[0], with_priv); } break;
+    case DN_MULTI: case DN_SORTEDMULTI: case DN_MULTI_A: case DN_SORTEDMULTI_A: {
+        char t[16]; snprintf(t, sizeof t, "%d", n->k); sb_put(b, t);
+        for (int q = 0; q < n->nkeys; q++){ sb_put(b, ","); sb_key(b, &d->keys[n->keys[q]], with_priv); } break; }
+    case DN_ADDR: case DN_RAW: {
+        if (n->type == DN_RAW){ char* h = malloc((size_t)d->rawlen * 2 + 1); if (h){ hex_encode(h, d->raw, d->rawlen); sb_put(b, h); free(h); } }
+        else { /* re-render the address from the script */
+            extern int wallet_script_to_address(char* out, long cap, const u8* script, long slen);
+            char a[128]; if (wallet_script_to_address(a, sizeof a, d->raw, d->rawlen) > 0) sb_put(b, a); }
+        break; }
+    default: sb_key(b, &d->keys[n->keys[0]], with_priv); break;
+    }
+    sb_put(b, ")");
+}
+int descr_to_string(const descr_t* d, int with_priv, char* out, unsigned long cap){
+    if (d->root < 0 || cap == 0) return 0;
+    sb_t b = { out, cap, 0, 0 }; out[0] = 0;
+    sb_node(&b, d, d->root, with_priv);
+    return !b.ovf;
+}

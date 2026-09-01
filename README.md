@@ -387,9 +387,14 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   an extension with no Core equivalent.
 - **ZMQ `sequence` topic** is refused by configuration rather than
   published; the other four topics are supported.
-- **Wallet.** There is no general descriptor engine; `descriptorprocesspsbt`
-  refuses rather than guessing, and `createwalletdescriptor` answers only for
-  the address type the wallet holds.
+- **Wallet.** `createwalletdescriptor` answers only for the address type the
+  wallet holds (bech32). Descriptors are otherwise general: the engine parses
+  and expands pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh, tr with script
+  trees, rawtr, addr and raw over hex, x-only, WIF and xpub/xprv keys with
+  origins, paths and ranges (proven byte-identical to Core on its own test
+  vectors); miniscript and `musig()` are refused by name.
+  `descriptorprocesspsbt` signs P2PKH, P2WPKH and P2SH-P2WPKH inputs from the
+  keys a descriptor carries and leaves other script forms unsigned.
 - **Mining.** `getblocktemplate` reports a lower-bound `sigops` and orders
   transactions validly but not fee-optimally; BIP23 proposal mode and any
   stratum/pool interface are absent.
