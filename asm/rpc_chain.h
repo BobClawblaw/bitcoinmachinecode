@@ -122,4 +122,8 @@ void rpc_chain_set_utxoscan(long (*run)(const unsigned char* spks, const unsigne
 int rpc_chain_txospender_available(void);
 int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
                                 long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out);
+/* ScriptToUniv(include_hex, include_address) + inferred desc, as decoderawtransaction renders a vout */
+rj_val* rpc_chain_script_pubkey_json(const unsigned char* sc, unsigned long n);
+rj_val* rpc_chain_script_json_noaddr(const unsigned char* sc, unsigned long n);
+char* rpc_chain_script_asm(const unsigned char* sc, unsigned long n, int sighash);
 #endif /* RPC_CHAIN_H */

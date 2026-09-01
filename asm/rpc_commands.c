@@ -1295,14 +1295,32 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
     rj_obj_set(o,"proprietary",rj_arr());
     rj_obj_set(o,"unknown",rj_obj());
     rj_val* ins=rj_arr();
+    long long total_in = 0; int have_all_utxos = 1;                 /* Core: "fee" when every input's UTXO is known */
+    static crt_in_t d_uin[PSBT_MAXIO]; int d_nin = 0; { int sw; unsigned long os, oe; if (!utx || !crt_walk(utx, utxlen, d_uin, PSBT_MAXIO, &d_nin, &os, &oe, &sw)) d_nin = 0; }
     for (long i=0;i<n_in && p<blen;i++){
-        rj_val* io=rj_obj();
+        rj_val* io=rj_obj(); long long in_val = -1;
         while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
             const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
             if (kl>=1){ switch (key[0]){
-                    case 0x04: psbt_field_hex(io,"redeem_script",val,vl); break;
-                    case 0x05: psbt_field_hex(io,"witness_script",val,vl); break;
-                    case 0x07: psbt_field_hex(io,"final_scriptSig",val,vl); break;
+                    case 0x00: { rj_val* t2=NULL; long e3; const char* m3;
+                        if (rpc_chain_decode_rawtx(val,(long)vl,&t2,&e3,&m3)){ rj_obj_set(io,"non_witness_utxo",t2);
+                            /* this input's prevout value from the parent's vout[n] */
+                            if (i < d_nin && in_val < 0){ unsigned long vo = (unsigned long)d_uin[i].op[32] | ((unsigned long)d_uin[i].op[33]<<8) | ((unsigned long)d_uin[i].op[34]<<16) | ((unsigned long)d_uin[i].op[35]<<24);
+                                unsigned long q = 4; if (vl > 6 && val[4]==0 && val[5]==1) q = 6; unsigned long c2; unsigned long ni = srw_varint(val+q,&c2); q += c2;
+                                for (unsigned long k = 0; k < ni && q < vl; k++){ q += 36; unsigned long sl = srw_varint(val+q,&c2); q += c2 + sl + 4; }
+                                unsigned long no = srw_varint(val+q,&c2); q += c2;
+                                for (unsigned long k = 0; k < no && q + 8 <= vl; k++){ long long v = 0; for (int b = 0; b < 8; b++) v |= ((long long)val[q+b]) << (8*b); unsigned long sl = srw_varint(val+q+8,&c2); if (k == vo) in_val = v; q += 8 + c2 + sl; } } }
+                        break; }
+                    case 0x01: if (vl >= 9){ long long v = 0; for (int b = 0; b < 8; b++) v |= ((long long)val[b]) << (8*b);
+                        unsigned long c2; unsigned long sl = srw_varint(val+8,&c2);
+                        if (8 + c2 + sl <= vl){ rj_val* wo = rj_obj(); char am[32]; rpc_amounts(v, am, sizeof am); rj_obj_set(wo,"amount",rj_numf("%s",am));
+                            rj_obj_set(wo,"scriptPubKey",rpc_chain_script_pubkey_json(val+8+c2, sl)); rj_obj_set(io,"witness_utxo",wo); in_val = v; } }
+                        break;
+                    case 0x04: rj_obj_set(io,"redeem_script",rpc_chain_script_json_noaddr(val,vl)); break;      /* Core: ScriptToUniv object */
+                    case 0x05: rj_obj_set(io,"witness_script",rpc_chain_script_json_noaddr(val,vl)); break;
+                    case 0x07: { rj_val* fo = rj_obj(); char* a = rpc_chain_script_asm(val, vl, 1); rj_obj_set(fo,"asm",rj_str(a ? a : "")); free(a);
+                                 char* hx = malloc(vl*2+1); if (hx){ bin_to_hex(hx,val,vl); rj_obj_set(fo,"hex",rj_str(hx)); free(hx); }
+                                 rj_obj_set(io,"final_scriptSig",fo); break; }
                     case 0x0e: if (vl==32){ char hx[65]; for (int b=0;b<32;b++) sprintf(hx+2*b,"%02x",val[31-b]); rj_obj_set(io,"previous_txid",rj_str(hx)); } break;
                     case 0x0f: if (vl==4) rj_obj_set(io,"previous_vout",rj_numf("%u",psbt_rd32(val))); break;
                     case 0x10: if (vl==4) rj_obj_set(io,"sequence",rj_numf("%u",psbt_rd32(val))); break;
@@ -1313,6 +1331,7 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
                     case 0x1b: case 0x1c: if ((kl==67||kl==99) && vl==(key[0]==0x1b?66:32)) psbt_musig_signer_field(io,key[0],key,kl,val,vl); break;
                     default: psbt_decode_common(io,key,kl,val,vl,1); break; } }
         }
+        if (in_val < 0) have_all_utxos = 0; else total_in += in_val;
         rj_arr_push(ins,io);
     }
     rj_obj_set(o,"inputs",ins);
@@ -1327,14 +1346,21 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
         }
         while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
             const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
-            if (kl>=1){ switch (key[0]){ case 0x00: psbt_field_hex(oo,"redeem_script",val,vl); break;
-                                         case 0x01: psbt_field_hex(oo,"witness_script",val,vl); break;
+            if (kl>=1){ switch (key[0]){ case 0x00: rj_obj_set(oo,"redeem_script",rpc_chain_script_json_noaddr(val,vl)); break;
+                                         case 0x01: rj_obj_set(oo,"witness_script",rpc_chain_script_json_noaddr(val,vl)); break;
                                          case 0x08: if (kl==34 && vl%33==0) psbt_musig_participants(oo,key+1,val,vl); break;
                                          default: psbt_decode_common(oo,key,kl,val,vl,0); break; } }
         }
         rj_arr_push(outs,oo);
     }
     rj_obj_set(o,"outputs",outs);
+    if (have_all_utxos && n_in > 0 && utx){                          /* Core: fee = inputs - outputs, only when every UTXO is known */
+        long long out_sum = 0; unsigned long cc; long q = 4; unsigned long ni = srw_varint(utx+q,&cc); q += cc;
+        for (unsigned long k = 0; k < ni; k++){ q += 36; unsigned long sl = srw_varint(utx+q,&cc); q += cc + sl + 4; }
+        unsigned long no = srw_varint(utx+q,&cc); q += cc;
+        for (unsigned long k = 0; k < no; k++){ long long v = 0; for (int b = 0; b < 8; b++) v |= ((long long)utx[q+b]) << (8*b); out_sum += v; q += 8; unsigned long sl = srw_varint(utx+q,&cc); q += cc + sl; }
+        char am[32]; rpc_amounts(total_in - out_sum, am, sizeof am); rj_obj_set(o,"fee",rj_numf("%s",am));
+    }
     if (txo && psbtver >= 2) rj_free(txo);
     *result=o;
     return 1;
