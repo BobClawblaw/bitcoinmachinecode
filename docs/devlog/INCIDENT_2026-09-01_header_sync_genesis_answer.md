@@ -80,6 +80,12 @@ The failure needs a header peer that does not know our (stale) mirror tip. Boot 
 
 Two of the four repair builds crashed on contracts that the C side had wrong (`store_read_at` reads a whole block; `store_get_tip` takes two arguments — the one-arg extern had never been used). Both are now declared correctly and commented at the call sites. The archive itself was never at risk during these boots (the self-heal runs before the store opens; the crashes were in the top-up, after the trim and before any network write).
 
+## Collateral: the UTXO set was lost at the `t` stop and is being rebuilt
+
+At 12:29:25, stopping the `t` boot, `utxo.idx` was left **empty** (0 bytes). Mechanism: the catch-up now returned on SIGTERM (fix 5), but the boot code after it went on — hash index, worker start, UTXO engine sizing against the index the catch-up had just polluted to 1.93M records — and the worker's checkpoint writer, which **truncates `utxo.idx` and rewrites it** (`bitcoin_utxo_store.asm`), was interrupted between the two by the pending stop. The next boot found no usable checkpoint and started a full replay from genesis (`[utxo_live] init … fresh applied_height=-1`), which is proven to produce a Core-identical set but takes hours; transaction acceptance is blind (every input "missing") until it catches up. No backup of the UTXO state exists (the 08-28 backup holds the wallet only).
+
+Fixes: the boot now exits as soon as a stop is seen after the catch-up (`[boot] shutdown requested during the catch-up -- exiting before the worker starts`, commit below) — deployed **after** the rebuild completes, since a restart mid-rebuild would risk the same window. Still open: the checkpoint writer should write `utxo.idx.tmp` and rename, so no stop can ever leave an empty checkpoint (this is the long-known "SIGKILL/checkpoint window"; it is now the top of the list).
+
 ## Operator notes
 
 - The permission layer blocked the assistant's attempt to `truncate` the two derived files by hand; the repair therefore shipped as the product's own boot self-heal (fix 4), which is the better outcome. `incident-20260901/` (next to the datadir) keeps the three corrupted files as evidence.
