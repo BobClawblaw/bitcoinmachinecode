@@ -1644,6 +1644,68 @@ typedef struct {
  * hours -- the 2026-09-01 01:07 "deactivating" stall. */
 static const volatile sig_atomic_t* g_mpd_shutdown_flag;
 void rpc_node_set_shutdown_flag(const volatile sig_atomic_t* f){ g_mpd_shutdown_flag = f; }
+#define MPD_POLL_US 200      /* reload ack poll: 3 ms per entry was 30 s of pure waiting on a 10k dump */
+/* ---- parents-first ordering (2026-09-01) --------------------------------
+ * mempool.dat is written in pool order, not parent-before-child, so on a
+ * real dump about half the entries were rejected once for a missing input
+ * and re-offered in retry passes (8018 entries: 4203 waited). Collect the
+ * dump first, then emit every entry after the in-dump parents it spends
+ * (Kahn's algorithm, file order preserved among the ready ones). */
+typedef struct { unsigned char* tx; unsigned long len; long long t, d; unsigned char txid[32]; } mpd_ent;
+typedef struct { mpd_ent* v; long n, cap; int oom; } mpd_collect_ctx;
+static int mpd_collect_sink(void* vctx, const unsigned char* tx, unsigned long len, long long t, long long d){
+    mpd_collect_ctx* c = (mpd_collect_ctx*)vctx;
+    if (c->n == c->cap){ long nc = c->cap ? c->cap * 2 : 256; mpd_ent* nv = realloc(c->v, (size_t)nc * sizeof *nv); if (!nv){ c->oom = 1; return -1; } c->v = nv; c->cap = nc; }
+    unsigned char* cp = malloc(len); if (!cp){ c->oom = 1; return -1; }
+    memcpy(cp, tx, len);
+    static unsigned char scratch[2000*81 + 8];
+    mpd_ent* e = &c->v[c->n]; e->tx = cp; e->len = len; e->t = t; e->d = d;
+    if (!tx_txid(e->txid, cp, len, scratch, sizeof scratch)) memset(e->txid, 0, 32);
+    c->n++; return 0;
+}
+/* every prevout txid of `tx`: cb(ctx, txid_wire) per input */
+static void mpd_each_prevout(const unsigned char* tx, unsigned long len, void (*cb)(void*, const unsigned char*), void* ctx){
+    if (len < 10) return;
+    unsigned long p = 4; if (len > 6 && tx[4] == 0x00 && tx[5] == 0x01) p = 6;
+    unsigned long cc; unsigned long n_in = mp_varint(tx + p, &cc); p += cc;
+    if (n_in == 0 || n_in > 100000) return;
+    for (unsigned long i = 0; i < n_in; i++){
+        if (p + 36 > len) return;
+        cb(ctx, tx + p); p += 36;
+        unsigned long ssl = mp_varint(tx + p, &cc); p += cc + ssl + 4;
+        if (p > len) return;
+    }
+}
+typedef struct { const mpd_ent* v; long n; const long* slot; unsigned long mask; long* indeg; long self; long* children; long* child_head; long* child_next; long nchild; } mpd_topo_ctx;
+static long mpd_find(const mpd_topo_ctx* T, const unsigned char* txid){
+    unsigned long h = 0; for (int i = 0; i < 8; i++) h = (h << 8) | txid[i];
+    for (unsigned long k = h & T->mask;; k = (k + 1) & T->mask){ long s = T->slot[k]; if (s < 0) return -1; if (!memcmp(T->v[s].txid, txid, 32)) return s; }
+}
+static void mpd_topo_edge(void* vctx, const unsigned char* prev){
+    mpd_topo_ctx* T = (mpd_topo_ctx*)vctx; long p = mpd_find(T, prev);
+    if (p < 0 || p == T->self) return;
+    T->indeg[T->self]++;
+    T->children[T->nchild] = T->self; T->child_next[T->nchild] = T->child_head[p]; T->child_head[p] = T->nchild; T->nchild++;
+}
+/* fills order[0..n) with entry indexes, parents before children; returns the
+ * number placed (entries in a cycle -- impossible for valid txs -- go last) */
+long mpd_order_parents_first(const mpd_ent* v, long n, long* order){
+    unsigned long cap = 1; while (cap < (unsigned long)n * 2) cap <<= 1;
+    long* slot = malloc(cap * sizeof *slot); long* indeg = calloc((size_t)n, sizeof *indeg);
+    long total_in = 0; for (long i = 0; i < n; i++){ /* upper bound on edges: count inputs */ unsigned long p = 4; if (v[i].len > 6 && v[i].tx[4] == 0 && v[i].tx[5] == 1) p = 6; unsigned long cc; total_in += (long)mp_varint(v[i].tx + p, &cc); }
+    long* children = malloc((size_t)(total_in + 1) * sizeof *children); long* child_next = malloc((size_t)(total_in + 1) * sizeof *child_next); long* child_head = malloc((size_t)n * sizeof *child_head);
+    if (!slot || !indeg || !children || !child_next || !child_head){ free(slot); free(indeg); free(children); free(child_next); free(child_head); for (long i = 0; i < n; i++) order[i] = i; return n; }
+    for (unsigned long k = 0; k < cap; k++) slot[k] = -1;
+    for (long i = 0; i < n; i++){ unsigned long h = 0; for (int b = 0; b < 8; b++) h = (h << 8) | v[i].txid[b]; unsigned long k = h & (cap - 1); while (slot[k] >= 0) k = (k + 1) & (cap - 1); slot[k] = i; child_head[i] = -1; }
+    mpd_topo_ctx T = { v, n, slot, cap - 1, indeg, 0, children, child_head, child_next, 0 };
+    for (long i = 0; i < n; i++){ T.self = i; mpd_each_prevout(v[i].tx, v[i].len, mpd_topo_edge, &T); }
+    long placed = 0, head = 0; long* q = order;
+    for (long i = 0; i < n; i++) if (indeg[i] == 0) q[placed++] = i;
+    while (head < placed){ long u = q[head++]; for (long e = child_head[u]; e >= 0; e = child_next[e]){ long c = children[e]; if (--indeg[c] == 0) q[placed++] = c; } }
+    if (placed < n) for (long i = 0; i < n; i++) if (indeg[i] > 0){ q[placed++] = i; indeg[i] = 0; }
+    free(slot); free(indeg); free(children); free(child_next); free(child_head);
+    return placed;
+}
 static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
                           long long t, long long d){
     (void)t; (void)d;   /* entry time and fee delta are not restorable here --
@@ -1666,8 +1728,8 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     while (waited < SRT_WAIT_MS*1000){
         if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); acked = 1; break; }
         if (g_mpd_shutdown_flag && *g_mpd_shutdown_flag){ c->aborted = 1; c->abort_why = "shutdown requested"; break; }
-        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
-        waited += SRT_POLL_US;
+        struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
+        waited += MPD_POLL_US;
     }
     if (acked) c->consec_timeouts = 0;
     else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
@@ -1717,9 +1779,13 @@ long rpc_node_mempool_load(const char* path){
     if (!g_status_rw) return -1;
     mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
-    long r = mempool_dump_read(path ? path : "mempool.dat",
-                               mpd_import_one, &c, err, sizeof err);
-    if (r < 0){ mpd_retry_passes(&c); return -1; }
+    mpd_collect_ctx col; memset(&col, 0, sizeof col);
+    long r = mempool_dump_read(path ? path : "mempool.dat", mpd_collect_sink, &col, err, sizeof err);
+    if (r < 0 || col.oom){ for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); return -1; }
+    long* order = malloc((size_t)(col.n + 1) * sizeof *order);
+    if (order) mpd_order_parents_first(col.v, col.n, order);
+    for (long k = 0; k < col.n; k++){ long i = order ? order[k] : k; mpd_import_one(&c, col.v[i].tx, col.v[i].len, col.v[i].t, col.v[i].d); }
+    for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
     fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted)\n",
