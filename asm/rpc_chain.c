@@ -993,16 +993,26 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         { u8* m = (u8*)g_gbt_mph.mp; unsigned long long mask; memcpy(&mask, m+8, 8);
           for (unsigned long i = 0; i <= mask && n < GBT_MAX_TX; i++){
               gbt_ent e; if (gbt_slot(g_gbt_mph.mp, i, &e) == 1) ents[n++] = e; } }
-        /* ---- ancestor-package greedy selection (Core addPackageTxs) ----
-         * Repeatedly pick the candidate whose ANCESTOR PACKAGE (its not-yet-
-         * selected in-pool ancestors + itself) has the highest package
-         * feerate; emit that package parents-first; repeat. CPFP falls out:
-         * a high-fee child lifts its cheap parent's package score. Weight
-         * and sigop budgets are Core's (4M weight / 80k cost, minus the
-         * 4000-weight / 400-sigop coinbase reservation); an over-budget
-         * package is skipped and selection continues. Tie-break: smaller
-         * txid (Core tie-breaks inside its modified-set comparator; the
-         * ordering difference is score-equal, documented divergence). */
+        /* ---- chunk selection (Core v31 cluster mempool: BlockAssembler over
+         * the linearization) ----
+         * Each cluster (connected component of the spend graph) is
+         * linearized -- ancestor-set greedy, a later chunk that pays more
+         * than the one before it merged into it -- into chunks of
+         * non-increasing feerate. The block is filled with WHOLE chunks in
+         * feerate order across clusters, parents-first inside a chunk. A
+         * chunk that does not fit is skipped together with the rest of its
+         * cluster (later chunks depend on it) and selection continues with
+         * other clusters' chunks: Core's BlockBuilder::Skip. Ancestor-
+         * package greedy (Core's addPackageTxs before v31) scored a package
+         * by its ancestor set alone and skipped per package; the chunk view
+         * is what lifts a cheap parent by the chunk it ends up in, and what
+         * keeps a skipped cluster's descendants out. Weight and sigop budgets
+         * are Core's (4M weight / 80k cost, minus the 4000-weight / 400-sigop
+         * coinbase reservation). Tie-break among equal feerates: the cluster
+         * seen first (slot order), then the smaller txid -- Core's exact tie
+         * order is not part of the protocol. Clusters wider than
+         * GBT_CLUSTER_MAX are linearized without the merge step (each
+         * ancestor set is its own chunk), which is the pre-v31 order. */
         static mp_entry_info infs[GBT_MAX_TX];
         static unsigned char have_inf[GBT_MAX_TX];
         static unsigned long long tfee[GBT_MAX_TX], tsize[GBT_MAX_TX];
@@ -1021,61 +1031,108 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
                         ? (long)infs[i].sigop_cost
                         : (g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0);
         }
+        /* ancestor index lists (self excluded), resolved once; an entry
+         * whose ancestor is not in the registry is left out (registry-stale) */
+        static int anc_idx[GBT_MAX_TX][MPE_MAX_SET]; static int anc_n[GBT_MAX_TX];
+        static unsigned char usable[GBT_MAX_TX];
+        for (long i = 0; i < n; i++){
+            anc_n[i] = 0; usable[i] = have_inf[i];
+            if (!have_inf[i]) continue;
+            for (int a = 0; a < infs[i].n_anc; a++){
+                if (!memcmp(infs[i].anc[a], ents[i].txid, 32)) continue;
+                long j = -1;
+                for (long m = 0; m < n; m++) if (!memcmp(ents[m].txid, infs[i].anc[a], 32)){ j = m; break; }
+                if (j < 0){ usable[i] = 0; break; }
+                anc_idx[i][anc_n[i]++] = (int)j;
+            }
+        }
+        /* clusters: union-find over ancestor links */
+        static int uf[GBT_MAX_TX];
+        for (long i = 0; i < n; i++) uf[i] = (int)i;
+        #define UF_FIND(x) ({ int r_ = (x); while (uf[r_] != r_) r_ = uf[r_]; int q_ = (x); while (uf[q_] != r_){ int t_ = uf[q_]; uf[q_] = r_; q_ = t_; } r_; })
+        for (long i = 0; i < n; i++){
+            if (!usable[i]) continue;
+            for (int a = 0; a < anc_n[i]; a++){ int ra = UF_FIND(anc_idx[i][a]), ri = UF_FIND((int)i); if (ra != ri) uf[ra] = ri; }
+        }
+        /* group members by cluster root (stable in slot order) */
+        static int byroot[GBT_MAX_TX]; long nb = 0;
+        static int root_of[GBT_MAX_TX];
+        for (long i = 0; i < n; i++){ if (!usable[i]) continue; root_of[i] = UF_FIND((int)i); byroot[nb++] = (int)i; }
+        /* insertion sort by root (n <= 4000; clusters are small in practice) */
+        for (long i = 1; i < nb; i++){ int v = byroot[i]; long j = i - 1; while (j >= 0 && root_of[byroot[j]] > root_of[v]){ byroot[j+1] = byroot[j]; j--; } byroot[j+1] = v; }
+        /* chunks: contiguous member runs in cmem; merging two adjacent chunks
+         * of one cluster is a run extension */
+        #define GBT_CLUSTER_MAX 512
+        typedef struct { int start, cnt; unsigned long long fee, size; long long w, s; int cluster, seq; } gbt_chunk;
+        static gbt_chunk chunks[GBT_MAX_TX]; long nch = 0;
+        static int cmem[GBT_MAX_TX]; long ncm = 0;
+        static unsigned char done[GBT_MAX_TX];
+        for (long i = 0; i < n; i++) done[i] = 0;
+        long gi = 0; int cluster_no = 0;
+        while (gi < nb){
+            long gj = gi; while (gj < nb && root_of[byroot[gj]] == root_of[byroot[gi]]) gj++;
+            long msz = gj - gi; const int* mem = &byroot[gi];
+            int merge = msz <= GBT_CLUSTER_MAX;
+            long first_chunk = nch;
+            for (long left = msz; left > 0; ){
+                /* the undone member whose undone ancestor set has the best feerate */
+                int best = -1; unsigned long long bf = 0, bs = 1;
+                for (long m = 0; m < msz; m++){
+                    int t = mem[m]; if (done[t]) continue;
+                    unsigned long long f = tfee[t], z = tsize[t];
+                    for (int a = 0; a < anc_n[t]; a++) if (!done[anc_idx[t][a]]){ f += tfee[anc_idx[t][a]]; z += tsize[anc_idx[t][a]]; }
+                    if (z == 0) z = 1;
+                    int better = (best < 0) || ((unsigned __int128)f * bs > (unsigned __int128)bf * z) ||
+                                 ((unsigned __int128)f * bs == (unsigned __int128)bf * z && memcmp(ents[t].txid, ents[best].txid, 32) < 0);
+                    if (better){ best = t; bf = f; bs = z; }
+                }
+                if (best < 0) break;
+                gbt_chunk* c = &chunks[nch]; c->start = (int)ncm; c->cnt = 0; c->fee = 0; c->size = 0; c->w = 0; c->s = 0; c->cluster = cluster_no; c->seq = (int)(nch - first_chunk);
+                /* members: undone ancestors + best, parents-first (ascending ancestor count is a topological order inside an ancestor set) */
+                int set[MPE_MAX_SET + 1]; int ns = 0;
+                for (int a = 0; a < anc_n[best]; a++) if (!done[anc_idx[best][a]]) set[ns++] = anc_idx[best][a];
+                set[ns++] = best;
+                for (int x = 0; x < ns; x++) for (int y = x + 1; y < ns; y++) if (anc_n[set[y]] < anc_n[set[x]]){ int t_ = set[x]; set[x] = set[y]; set[y] = t_; }
+                for (int x = 0; x < ns; x++){ int t = set[x]; done[t] = 1; cmem[ncm++] = t; c->cnt++; c->fee += tfee[t]; c->size += tsize[t]; c->w += tweight[t]; c->s += tsig[t]; left--; }
+                nch++;
+                /* merge backwards while this chunk pays more than the one before it */
+                while (merge && nch - first_chunk >= 2){
+                    gbt_chunk* pv = &chunks[nch-2]; gbt_chunk* cu = &chunks[nch-1];
+                    if ((unsigned __int128)cu->fee * pv->size > (unsigned __int128)pv->fee * cu->size){
+                        pv->cnt += cu->cnt; pv->fee += cu->fee; pv->size += cu->size; pv->w += cu->w; pv->s += cu->s; nch--;
+                    } else break;
+                }
+            }
+            cluster_no++; gi = gj;
+        }
+        /* chunk order across clusters: feerate descending; ties by cluster (slot order) then sequence */
+        static int corder[GBT_MAX_TX];
+        for (long i = 0; i < nch; i++) corder[i] = (int)i;
+        for (long i = 1; i < nch; i++){
+            int v = corder[i]; long j = i - 1;
+            while (j >= 0){
+                const gbt_chunk* A = &chunks[corder[j]]; const gbt_chunk* B = &chunks[v];
+                int a_before = ((unsigned __int128)A->fee * B->size > (unsigned __int128)B->fee * A->size) ||
+                               ((unsigned __int128)A->fee * B->size == (unsigned __int128)B->fee * A->size &&
+                                (A->cluster < B->cluster || (A->cluster == B->cluster && A->seq < B->seq)));
+                if (a_before) break;
+                corder[j+1] = corder[j]; j--;
+            }
+            corder[j+1] = v;
+        }
         long emitted_n = 0;
         long long budget_w = 4000000 - 4000, budget_s = 80000 - 400;
         long long used_w = 0, used_s = 0;
-        for (long round = 0; round < n; round++){
-            long best = -1;
-            unsigned long long bf = 0, bs = 1;
-            for (long i = 0; i < n; i++){
-                if (emitted[i] || skipped[i] || !have_inf[i]) continue;
-                /* package = ancestors (incl self) minus already-emitted */
-                unsigned long long pf = infs[i].anc_fee, ps = infs[i].anc_size;
-                int unresolved = 0;
-                for (int a = 0; a < infs[i].n_anc; a++){
-                    if (!memcmp(infs[i].anc[a], ents[i].txid, 32)) continue;   /* self */
-                    long j = -1;
-                    for (long m = 0; m < n; m++)
-                        if (!memcmp(ents[m].txid, infs[i].anc[a], 32)){ j = m; break; }
-                    if (j < 0){ unresolved = 1; break; }       /* registry-stale */
-                    if (emitted[j]){ pf -= tfee[j]; ps -= tsize[j]; }
-                    else if (skipped[j]){ unresolved = 1; break; }
-                }
-                if (unresolved){ skipped[i] = 1; continue; }
-                if (ps == 0) ps = 1;
-                /* pf/ps > bf/bs  <=>  pf*bs > bf*ps (fits: fee<2^40, size<2^24) */
-                int better = (best < 0) || (pf * bs > bf * ps) ||
-                             (pf * bs == bf * ps && memcmp(ents[i].txid, ents[best].txid, 32) < 0);
-                if (better){ best = i; bf = pf; bs = ps; }
-            }
-            if (best < 0) break;
-            /* collect the package as candidate indexes */
-            int pkg[MPE_MAX_SET]; int np = 0;
-            long long ww = 0, ss = 0;
-            for (int a = 0; a < infs[best].n_anc && np < MPE_MAX_SET; a++){
-                long j = -1;
-                for (long m = 0; m < n; m++)
-                    if (!memcmp(ents[m].txid, infs[best].anc[a], 32)){ j = m; break; }
-                if (j < 0 || emitted[j]) continue;
-                pkg[np++] = (int)j; ww += tweight[j]; ss += tsig[j];
-            }
-            if (np == 0){ skipped[best] = 1; continue; }
-            if (used_w + ww > budget_w || used_s + ss > budget_s){
-                skipped[best] = 1;                   /* try lighter packages */
-                continue;
-            }
-            /* parents-first inside the package: a child's ancestor set is a
-             * strict superset of its parent's, so ascending n_anc is a valid
-             * topological order */
-            for (int a = 0; a < np; a++)
-                for (int b = a + 1; b < np; b++)
-                    if (infs[pkg[b]].n_anc < infs[pkg[a]].n_anc){ int t_ = pkg[a]; pkg[a] = pkg[b]; pkg[b] = t_; }
-            for (int a = 0; a < np; a++){
-                emitted[pkg[a]] = 1;
-                order[emitted_n++] = pkg[a];
-            }
-            used_w += ww; used_s += ss;
+        static unsigned char cluster_skipped[GBT_MAX_TX];
+        for (int i = 0; i < cluster_no; i++) cluster_skipped[i] = 0;
+        for (long ci = 0; ci < nch; ci++){
+            const gbt_chunk* c = &chunks[corder[ci]];
+            if (cluster_skipped[c->cluster]) continue;
+            if (used_w + c->w > budget_w || used_s + c->s > budget_s){ cluster_skipped[c->cluster] = 1; continue; }
+            for (int k = 0; k < c->cnt; k++){ emitted[cmem[c->start + k]] = 1; order[emitted_n++] = cmem[c->start + k]; }
+            used_w += c->w; used_s += c->s;
         }
+        #undef UF_FIND
         /* render in order; depends[] are 1-based indices into this array */
         for (long oi = 0; oi < emitted_n; oi++){
             long i = order[oi];
