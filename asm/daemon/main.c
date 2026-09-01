@@ -1974,6 +1974,25 @@ static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_N
 static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
 static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
 static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+/* The next candidate of `net` for a reserved-slot dial: a rotating cursor
+ * per network, so a failed background dial is followed by the NEXT address
+ * rather than the same one every pass (deploy l on 2026-09-01 re-dialled
+ * one dead onion every 5 s for the whole watch). Hosts a live leg already
+ * holds and banned IPs are skipped. Returns the pool index, or -1. */
+static int g_dh_cursor[2];
+static int dh_reserved_pick(int an, int net, const char* srcpool[], int nsrc){
+    if(nsrc <= 0 || an < 0 || an > 1) return -1;
+    for(int step = 0; step < nsrc; step++){
+        int ci = (g_dh_cursor[an] + step) % nsrc;
+        if(leg_net_of(srcpool[ci]) != net) continue;
+        int already = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
+        if(already) continue;
+        { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+        g_dh_cursor[an] = (ci + 1) % nsrc;
+        return ci;
+    }
+    return -1;
+}
 static int dh_start(const char* host, int out_port){
     int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
     if(slot < 0) return 0;
@@ -4976,13 +4995,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             for(int an = 0; an < 2 && dh_inflight_count() < DH_MAX; an++){
                 int net = anon_nets[an];
                 if(!dialer_net_reachable(net) || legs_on_net(net) > 0 || dh_inflight_net(net)) continue;
-                for(int ci = 0; ci < nsrc; ci++){
-                    if(leg_net_of(srcpool[ci]) != net) continue;
-                    int already = 0; for(int k = 0; k < mux_n_out; k++) if(!strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
-                    if(already) continue;
-                    { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
-                    if(dh_start(srcpool[ci], out_port)) break;
-                }
+                int ci = dh_reserved_pick(an, net, srcpool, nsrc);
+                if(ci >= 0) dh_start(srcpool[ci], out_port);
             }
         }
         if(mux_n_out - legs_anon() < MUX_WANT_OUT() && (rot % 8)==0){

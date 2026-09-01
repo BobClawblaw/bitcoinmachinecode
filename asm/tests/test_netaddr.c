@@ -32,6 +32,13 @@ int main(void){
     ck("fd00:: (ULA, not cjdns) is ipv6 and unroutable", bmc_addr_from_string(&a, "fd00::1") && a.net == BMC_NET_IPV6 && !bmc_addr_is_routable(&a));
     ck("garbage rejected", !bmc_addr_from_string(&a, "not.an.address") && !bmc_addr_from_string(&a, "pg6mm.onion"));
     ck("host:port", bmc_addr_from_string_port(&a, "1.2.3.4:8333", 1) && a.port == 8333);
+    /* port 0 is an I2P address's port (Core's convention) and nobody else's:
+     * refusing it left every "<b32>.b32.i2p:0" pool entry unparseable, so
+     * leg_net_of() fell back to IPv4 (2026-09-01) */
+    ck("i2p:0 parses as I2P with port 0",
+       bmc_addr_from_string_port(&a, "c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p:0", 1) && a.net == BMC_NET_I2P && a.port == 0);
+    ck("ipv4:0 is still refused", !bmc_addr_from_string_port(&a, "1.2.3.4:0", 1));
+    ck("onion:0 is still refused", !bmc_addr_from_string_port(&a, "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:0", 1));
     ck("[v6]:port", bmc_addr_from_string_port(&a, "[2001:db8::1]:8334", 1) && a.net == BMC_NET_IPV6 && a.port == 8334);
     ck("bare v6 gets the default port", bmc_addr_from_string_port(&a, "2001:db8::1", 7) && a.port == 7);
     ck("onion:port", bmc_addr_from_string_port(&a, "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8335", 1) && a.net == BMC_NET_TORV3 && a.port == 8335);
