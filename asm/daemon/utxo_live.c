@@ -288,7 +288,10 @@ u64 utxo_live_run_budget(void){
     if (g_run_budget != ~0ULL) return g_run_budget;
     u64 kb = 0; FILE* f = fopen("/proc/meminfo", "r");
     if (f){ char line[128]; while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemTotal:", 9)){ kb = strtoull(line + 9, NULL, 10); break; } fclose(f); }
-    g_run_budget = kb ? kb * 1024 / 100 * 45 : 0;
+    /* 35%, not 45%: on the 63 GB box the worker itself holds ~16 GB of anonymous
+     * flush scratch plus the file-backed memtable, and at 25.7 GB of runs (4 runs)
+     * lookups were already faulting from disk (2026-09-01 18:09, 3-12 blk/s). */
+    g_run_budget = kb ? kb * 1024 / 100 * 35 : 0;
     return g_run_budget;
 }
 void utxo_live_set_run_budget(unsigned long long bytes){ g_run_budget = bytes; }
@@ -308,7 +311,7 @@ static long compact_pick_now(long* lo){
     if (k && n < utxo_live_compact_threshold()){
         static long announced = -1; u64 total = 0; for (long i = 0; i < n; i++) total += sizes[i];
         if (announced != n){ announced = n;
-            fprintf(stderr, "[utxo_live] run files total %.1f GB > budget %.1f GB (45%% of RAM) -- compacting %ld of %ld runs below the count threshold\n",
+            fprintf(stderr, "[utxo_live] run files total %.1f GB > budget %.1f GB (35%% of RAM) -- compacting %ld of %ld runs below the count threshold\n",
                     (double)total / 1e9, (double)budget / 1e9, k, n); }
     }
     return k;
