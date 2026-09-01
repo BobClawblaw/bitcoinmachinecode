@@ -831,6 +831,65 @@ long archive_trim_derived_tails(void){
         fprintf(stderr, "[boot] index.dat carried %ld empty record(s) past the tip (height %ld) -- trimmed\n", n - 1 - last, last);
         trimmed++; n = last + 1;
     }
+    /* Records that do not CONTINUE THE CHAIN. chainwork.dat is written as
+     * blocks are applied, so every height it covers was validated; anything
+     * the index holds above that is only trustworthy if each block's header
+     * links to the record below it (and hashes to its own record). The
+     * incident's junk (real early blocks recorded at fake heights) fails at
+     * the first such record: block 1's prev-hash is genesis, not 965029. */
+    long cw = (stat("chainwork.dat", &st) == 0) ? (long)(st.st_size / 16) : 0;
+    if (cw >= 1 && n > cw){
+        f = fopen("index.dat", "rb"); if (!f) return -1;
+        unsigned char prev_hash[32], r2[48];
+        long h = cw - 1;
+        if (fseek(f, h * 48, SEEK_SET) != 0 || fread(r2, 1, 48, f) != 48){ fclose(f); return -1; }
+        memcpy(prev_hash, r2, 32);
+        long good = h;                            /* highest height proven to continue the chain */
+        while (good + 1 < n){
+            if (fseek(f, (good + 1) * 48, SEEK_SET) != 0 || fread(r2, 1, 48, f) != 48) break;
+            int zero = 1; for (int i = 0; i < 48; i++) if (r2[i]){ zero = 0; break; }
+            if (zero) break;
+            unsigned int fno; unsigned long long pos; unsigned int size;
+            memcpy(&fno, r2 + 32, 4); memcpy(&pos, r2 + 36, 8); memcpy(&size, r2 + 44, 4);
+            if (size < 80) break;
+            char fn[64]; snprintf(fn, sizeof fn, "blk%05u.dat", fno);
+            FILE* bf = fopen(fn, "rb"); if (!bf) break;
+            unsigned char hdr[80]; int okr = (fseek(bf, (long)(pos + ARCHIVE_FRAME_LEN), SEEK_SET) == 0 && fread(hdr, 1, 80, bf) == 80);
+            fclose(bf);
+            if (!okr) break;
+            unsigned char bh[32]; block_hash(bh, hdr);
+            if (memcmp(bh, r2, 32) != 0 || memcmp(hdr + 4, prev_hash, 32) != 0) break;
+            memcpy(prev_hash, bh, 32); good++;
+        }
+        fclose(f);
+        if (good + 1 < n){
+            if (truncate("index.dat", (off_t)(good + 1) * 48) != 0) return -1;
+            fprintf(stderr, "[boot] index.dat carried %ld record(s) beyond the linked chain (height %ld does not continue height %ld) -- trimmed\n",
+                    n - (good + 1), good + 1, good);
+            trimmed++; n = good + 1;
+        }
+    }
+    /* the header mirror must agree with the index height by height; cut it at
+     * the first disagreement (the daemon re-derives the rest from the blocks) */
+    if (stat("headers.dat", &st) == 0 && st.st_size >= 112){
+        long hn = (long)(st.st_size / 112); long lim = hn < n ? hn : n;
+        FILE* fi = fopen("index.dat", "rb"); FILE* fh = fopen("headers.dat", "rb");
+        if (fi && fh){
+            long bad = -1; unsigned char ir[48], hr[112];
+            for (long h = 0; h < lim; h++){
+                if (fread(ir, 1, 48, fi) != 48 || fread(hr, 1, 112, fh) != 112) break;
+                int zero = 1; for (int i = 0; i < 32; i++) if (ir[i]){ zero = 0; break; }
+                if (zero) continue;                /* a hole in the index says nothing about the mirror */
+                if (memcmp(ir, hr + 80, 32) != 0){ bad = h; break; }
+            }
+            fclose(fi); fclose(fh);
+            if (bad >= 0){
+                if (truncate("headers.dat", (off_t)bad * 112) != 0) return -1;
+                fprintf(stderr, "[boot] headers.dat diverged from the archive at position %ld -- trimmed (re-derived from the blocks at boot)\n", bad);
+                trimmed++;
+            }
+        } else { if (fi) fclose(fi); if (fh) fclose(fh); }
+    }
     if (stat("headers.dat", &st) == 0 && st.st_size > (off_t)n * 112){
         if (truncate("headers.dat", (off_t)n * 112) != 0) return -1;
         fprintf(stderr, "[boot] headers.dat ran %ld record(s) past the archive tip -- trimmed to %ld\n", (long)(st.st_size / 112) - n, n);
