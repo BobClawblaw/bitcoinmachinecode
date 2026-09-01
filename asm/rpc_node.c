@@ -1254,7 +1254,12 @@ static rj_val* fee_btc_per_kvb(unsigned long long satkvb){
     return rj_numf("%llu.%08llu", satkvb / 100000000ULL, satkvb % 100000000ULL);   /* ValueFromAmount */
 }
 static rj_val* fee_dbl(double v){ return rj_numf("%.16g", v); }   /* UniValue: setprecision(16) */
-static double fee_round(double v){ return v < 0 ? -(double)(unsigned long long)(-v + 0.5) : (double)(unsigned long long)(v + 0.5); }  /* C round() */
+/* C round(): half away from zero. Beyond 2^53 a double has no fraction to
+ * round (the INF bucket bound is 1e99 -- a cast would overflow to 0). */
+static double fee_round(double v){
+    if (v >= 9007199254740992.0 || v <= -9007199254740992.0) return v;
+    return v < 0 ? -(double)(unsigned long long)(-v + 0.5) : (double)(unsigned long long)(v + 0.5);
+}
 
 static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, const char** em){
     const void* fe = g_mph.feeest;

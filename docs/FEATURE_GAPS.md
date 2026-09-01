@@ -44,8 +44,9 @@ the full mempool tranche (`getmempoolinfo`/`getrawmempool`/`getmempoolentry`/
 `getmempoolancestors`/`getmempooldescendants`/`prioritisetransaction`/
 `getprioritisedtransactions`) over a mempool made genuinely coherent — one
 MAP_SHARED, cross-process-locked pool replacing the per-process
-copy-on-write copies; `estimatesmartfee` (Core's contract over our own
-accepted-feerate EMA, stated as such); mining's `getblocktemplate`
+copy-on-write copies; `estimatesmartfee` (*until 2026-09-01* Core's contract
+over our own accepted-feerate EMA — since then Core's CBlockPolicyEstimator
+itself, see the fee-estimation update below); mining's `getblocktemplate`
 (frame diffed against Core at the same tip; retarget reproduces 8/8 real
 historical boundaries) and `submitblock` end-to-end (8 MB transport, 4 MB
 worker channel, BIP22 strings, connect gated on a dry run of the real apply
@@ -520,6 +521,37 @@ it closes, so the gap stays — and stays documented, rather than being quietly
 half-filled.
 
 Revisit when Core's own Erlay progresses.
+
+## Update 2026-09-01 — fee estimation is Core's estimator, not an EMA
+
+`estimatesmartfee` used to answer Core's *contract* over this node's own
+accepted-feerate EMA, and `estimaterawfee` did not exist. Both now run on a
+C port of Core's `CBlockPolicyEstimator` (`asm/daemon/fee_estimator.c`,
+v31.99's `policy/fees/block_policy_estimator.cpp`): the three
+TxConfirmStats horizons (short 12×1 decay .962, medium 24×2 .9952, long
+42×24 .99931), the 100…1e7 sat/kvB ×1.05 feerate buckets, transactions
+tracked from admission (only when the chainstate is current — tip within
+3 h — with no in-mempool parents and not part of a package, exactly Core's
+`validForFeeEstimation`) to the block that confirms them, every other
+removal booked as a failure for the periods it outlived, the same
+`EstimateMedianVal` walk, the 60 % / 85 % / 95 % smart-fee ladder with the
+conservative variant, `MaxUsableEstimate` (so a fresh node answers
+`blocks: 0` like Core), and `fee_estimates.dat` (own format, Core's content;
+hourly + shutdown flush with `FlushUnconfirmed`; ignored when older than
+60 h). The estimator is one MAP_SHARED region beside the mempool under its
+process-shared lock, so the download worker, the serve parent and the RPC
+readers agree. `estimaterawfee conf_target [threshold]` returns Core's
+per-horizon `feerate/decay/scale/pass/fail/errors` with Core's rounding.
+Evidence: `asm/tests/test_fee_estimator` ports Core's
+`policyestimator_tests` scenario with the same expectations at the same
+block numbers; `validation/feeest_core_diff.sh` runs this node against a
+regtest Core over P2P with a fixed feerate/confirmation schedule and demands
+byte-identical `estimatesmartfee` and `estimaterawfee` output at several
+checkpoints (result recorded in `worklog/2026-09-01.md`). Not carried over:
+Core's `-acceptstalefeeestimates` knob (the 60 h cut-off is fixed) and the
+"tip at least best-header−1" half of `IsCurrentForFeeEstimation` (the
+worker does not see the header count at the block-connect site; the 3 h
+tip-age test stands in).
 
 ## Update 2026-08-30 — security audit round
 

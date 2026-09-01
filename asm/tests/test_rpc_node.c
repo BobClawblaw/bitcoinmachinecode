@@ -622,6 +622,18 @@ int main(void){
             rc=rpc_node_dispatch("estimaterawfee",fp,&r,&e8,&m8);
             ck("erf non-numeric threshold -> -3", rc==0 && e8==-3);
             rj_free(r); rj_free(fp);
+            /* Core prints the INF bucket bound as 1e+99 (UniValue setprecision(16)).
+             * Park 8 unconfirmed txs in the INF bucket (>= 1e7 sat/kvB) for one block:
+             * at target 1 the top range then fails (0 of them confirmed) and the fail
+             * range's end is the INF bound. */
+            for (int k=0;k<8;k++){ unsigned char t[32]; memset(t,0x99,32); t[0]=(unsigned char)k; fest_process_transaction(fe, t, 2000000000ULL, 100, 60, 1); }
+            fest_block_begin(fe, 61); fest_block_end(fe);
+            fp=rj_parse("[1, 1.0]",8); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&ec,&em);
+            { rj_val* sh=r?rj_obj_get(r,"short"):0; rj_val* fl=sh?rj_obj_get(sh,"fail"):0;
+              ck("erf(1, 1.0).short.fail.endrange prints 1e+99 like Core", fl && S(fl,"endrange") && !strcmp(S(fl,"endrange"),"1e+99"));
+              if (fl) printf("  (erf(1,1.0).short.fail = %s..%s)\n", S(fl,"startrange"), S(fl,"endrange")); }
+            rj_free(r); rj_free(fp);
             fp=rj_parse("[2, 0.5]",8); r=NULL;
             rc=rpc_node_dispatch("estimaterawfee",fp,&r,&ec,&em);
             ck("erf(2, 0.5) answers on all three horizons", rc==1 && r && rj_obj_get(r,"short") && rj_obj_get(r,"medium") && rj_obj_get(r,"long"));
