@@ -32,6 +32,7 @@
  * service holding a spendable key.
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
