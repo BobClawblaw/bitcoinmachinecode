@@ -70,8 +70,9 @@ testnet4, signet (public or custom) and regtest.
 - Mempool admission runs the consensus verifier (legacy + full taproot)
   against the confirmed set plus in-mempool parents.
 - `mempool.dat` persistence in Core's format (`persistmempool`,
-  `savemempool`, `importmempool`); `estimatesmartfee` over the node's own
-  accepted-feerate estimator.
+  `savemempool`, `importmempool`); `estimatesmartfee`/`estimaterawfee` on a
+  port of Core's block-policy fee estimator (three horizons, feerate
+  buckets, `fee_estimates.dat`), byte-identical to Core on regtest.
 
 **P2P and relay**
 
