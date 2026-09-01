@@ -2600,6 +2600,8 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 /* Does the header at position `have` (the first one a peer just appended)
  * extend the header we asked from (`loc`, our previous tip)? A getheaders
  * answer that starts anywhere else is not a continuation of our chain. */
+#define DLC_HDR_SANE_MAX 100000L
+static int dlc_headers_sane(long have0, long added){ return have0 <= 0 || added <= DLC_HDR_SANE_MAX; }
 static int dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
@@ -2661,6 +2663,13 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
     close(fd);
     if(added<0){ *why = DLC_HT_FETCH; return -1; }
+    if(added>0 && !dlc_headers_sane(have0, added)){
+        /* a bound on what one boot sync may add: a node a year offline is
+         * ~52k blocks behind; 966,669 in one answer was the incident */
+        fprintf(stderr,"[dlc] %s offered %ld header(s) on top of %ld -- far beyond any plausible gap (limit %ld); discarding\n", cand, added, have0, DLC_HDR_SANE_MAX);
+        dlc_headers_rollback(hst, have0);
+        *why = DLC_HT_FETCH; return -1;
+    }
     if(added>0 && !dlc_headers_connect_ok(hst, have0, loc)){
         /* INCIDENT 2026-09-01 11:19: our getheaders carries a single-hash
          * locator (the tip). A peer that has not seen that block yet answers
@@ -2682,9 +2691,33 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
  * connect-phase timeout, so trying an UNCONFIRMED candidate here would carry
  * the same hang risk documented on dlc_worker; deliberately no fallback to
  * raw pool entries. */
+/* headers.dat is DERIVED from the archive: append the header of every stored
+ * block the mirror lacks, from the blocks themselves. The worker's leg sync
+ * stored blocks without touching the mirror, so every boot used to ask peers
+ * from a stale point (12 blocks stale on 2026-09-01), and a peer that did not
+ * know that block answered from genesis. Stops at the first hole; the peer
+ * sync takes over from there. Returns headers appended. */
+static long dl_header_mirror_topup(unsigned char* store){
+    static unsigned char hst[4096]; hst_init(hst);
+    struct stat hs;
+    if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
+    long have = hst_count(hst); long tip = store_get_tip(store); long n = 0;
+    if(have <= 0 || tip < 0) return 0;               /* an empty mirror is seeded with genesis by dlc_headers */
+    for(long h = have; h <= tip; h++){
+        unsigned char hb[128];
+        if(store_read_at(store, (unsigned long)h, hb, sizeof hb) < 80) break;
+        unsigned char bh[32]; block_hash(bh, hb);
+        if(hst_append(hst, hb, bh) < 0) break;
+        n++;
+    }
+    if(n) fprintf(stderr,"[dl] header mirror +%ld from the archive (now %ld, archive tip %ld)\n", n, hst_count(hst), tip);
+    return n;
+}
+
 static long dlc_headers(char live[][64], int nlive){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
+    dl_header_mirror_topup(store_buf);
     if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
     long have = hst_count(hst);
     if(have==0){
@@ -3242,6 +3275,16 @@ static long dl_catchup(const char* dir, int min_workers){
     int alive=nw;
     while(alive>0){
         struct timespec ts={10,0}; nanosleep(&ts,NULL);
+        if(g_shutdown_requested){
+            /* incident 2026-09-01: this loop ignored SIGTERM and the stop hung
+             * until a SIGKILL. Workers inherit the flag-only handler, so they
+             * are told, given a moment, then killed. */
+            fprintf(stderr,"[dlc] shutdown requested -- stopping %d worker(s)\n", alive);
+            for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
+            { struct timespec g={1,0}; nanosleep(&g,NULL); }
+            for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+            alive=0; break;
+        }
         alive=0;
         for(int w=0;w<nw;w++){
             if(kids[w]==0) continue;
@@ -4886,6 +4929,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 } else {
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
+                    dl_header_mirror_topup(store_buf);   /* keep the derived header mirror at the archive tip */
                 }
                 /* ZMQ hashblock/rawblock + the txid-index tail, from this
                  * same choke point for the same reason the log line is: it
@@ -6195,6 +6239,11 @@ int main(int argc, char** argv){
         }
     }
     dir = effdir;
+    /* derived files must not outrun the archive (incident 2026-09-01): trim
+     * an empty index tail and over-long headers/chainwork before the store
+     * reads its tip from index.dat's length */
+    { long tr = archive_trim_derived_tails();
+      if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
