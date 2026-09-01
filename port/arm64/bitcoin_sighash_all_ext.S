@@ -97,7 +97,9 @@
 	ret
 .Lpv_fail:
 	mov  x0, #0
-	mov  x2, x0
+	/* x2 stays wherever the walk got to (x86 .pv_fail leaves rdi as-is):
+	 * zeroing the cursor here sent txcur=NULL for a truncated varint prefix
+	 * and the next raw copy dereferenced it (test_interp_legacy_spend). */
 	ret
 	.size .Lsh_parse_varint, .-.Lsh_parse_varint
 

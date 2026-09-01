@@ -2040,7 +2040,10 @@ interp_push_bool:
 	mov  w3,#1
 1:	strb w3,[x10]
 	mov  x2,x10
-	mov  x3,x9		/* len 0/1 */
+	/* w3 already holds the NORMALIZED len 0/1 (x86: "rcx = 0 or 1"). The
+	 * draft passed the raw bool arg here (mov x3,x9): any caller garbage in
+	 * the upper bits reached stack_push as len -- len=0xffffffff copied 4GB
+	 * in the copy loop and SIGSEGV'd (test_dersig_encoding). */
 	mov  x0,x25
 	mov  x1,x26
 	bl   stack_push

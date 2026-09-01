@@ -1918,7 +1918,12 @@ mac_lsm_reload_impl:
 	stp  x23,x24,[sp,#-16]!
 	stp  x25,x26,[sp,#-16]!
 	stp  x27,x28,[sp,#-16]!
-	sub  sp, sp, #0x80
+	sub  sp, sp, #0x200
+	/* 0x200 (x86 parity), NOT 0x80: the WAL-replay loop stages 49-byte PUSH
+	 * bodies / 36-byte DEL keys at [x28,#0x60] -- a 0x80 frame made the body
+	 * tail (value/height/slen at +0x80..0x91) overwrite the x27/x28 save
+	 * slots pushed above, and the epilogue handed main the record's VALUE as
+	 * its lst pointer (the test_utxo_lsm SIGSEGV in mac_tomb_hash_probe). */
 	mov  x28, sp
 	mov  x19, x0                    /* lst */
 	mov  x20, x1                    /* u */
@@ -2176,7 +2181,7 @@ mac_lsm_reload_impl:
 .rl_fail:
 	mov  x0, #-1
 .rl_ret:
-	add  sp, sp, #0x80
+	add  sp, sp, #0x200
 	ldp  x27,x28,[sp],#16
 	ldp  x25,x26,[sp],#16
 	ldp  x23,x24,[sp],#16

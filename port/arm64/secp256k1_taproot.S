@@ -125,9 +125,9 @@ tap_branch_hash:
     /* msg = sorted(a,b) at tap_preimg+64 */
     mov  x0,x20                 /* a */
     mov  x1,x21                 /* b */
-    bl   __tb_cmp             /* x22 = 1 if b<a (b first), 0 if a<=b (a first) */
-    /* __tb_cmp returns x22 = order (0 -> a first, 1 -> b first) */
-    cbnz x22,.Lbr_bfirst
+    bl   __tb_cmp             /* x0 = 1 if b<a (b first), 0 if a<=b (a first) */
+    /* __tb_cmp returns x0 = order (0 -> a first, 1 -> b first) */
+    cbnz x0,.Lbr_bfirst
     /* a first */
     TLS_ADDR x0, tap_preimg, x9
     add  x0,x0,#64
@@ -168,11 +168,13 @@ tap_branch_hash:
     ret
     .size tap_branch_hash,.-tap_branch_hash
 
-/* __tb_cmp(a=x0,b=x1) -> x22 = 1 if b<a (b first), 0 if a<=b (a first) */
+/* __tb_cmp(a=x0,b=x1) -> x0 = 1 if b<a (b first), 0 if a<=b (a first)
+ * Returns in x0 (standard): the x22 return of the draft made this helper an
+ * unsaved callee-saved clobber for every -O2 C or asm caller. */
     .type __tb_cmp,%function
 __tb_cmp:
     mov  x3,#0
-    mov  x22,#0
+    mov  x0,#0
 .Ltbc:
     cmp  x3,#32
     b.hs .Ltbc_d
@@ -184,7 +186,7 @@ __tb_cmp:
     add  x3,x3,#1
     b    .Ltbc
 .Ltbc_b:
-    mov  x22,#1
+    mov  x0,#1
 .Ltbc_d:
     ret
     .size __tb_cmp,.-__tb_cmp

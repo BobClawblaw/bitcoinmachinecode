@@ -325,6 +325,8 @@ store_truncate_to:
 	.type store_truncate_index_only, %function
 store_truncate_index_only:
 	stp  x29, x30, [sp, #-16]!
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
 	mov  x19, x0                       /* st */
 	mov  x20, x1                       /* target_height */
 	ldr  w9, [x19, #24]
@@ -366,6 +368,8 @@ store_truncate_index_only:
 .Ltio_err:
 	mov  x0, #-1
 .Ltio_ret:
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
 	ldp  x29, x30, [sp], #16
 	ret
 	.size store_truncate_index_only, .-store_truncate_index_only
