@@ -82,6 +82,16 @@ g_serve_violation_hook: dq 0      ; void (*)(const char* reason)
 ; our `feefilter` to this peer (-blocksonly, or a forcerelay peer)
 global g_serve_send_feefilter
 g_serve_send_feefilter: db 1
+; relay-policy hooks (main.c installs them at boot; 0 = no policy, the
+; pre-2026-09-01 behaviour -- which is what the standalone serve tests get)
+global g_serve_tx_gate
+g_serve_tx_gate: dq 0             ; int (*)(void): 0 accept, 1 drop, -1 violation
+global g_serve_inv_gate
+g_serve_inv_gate: dq 0            ; int (*)(const u8* pl, long plen)
+global g_serve_mempool_hook
+g_serve_mempool_hook: dq 0        ; int (*)(int fd, void* mp): 1 handled, -1 violation
+global g_serve_policy_log
+g_serve_policy_log: dq 0          ; void (*)(const char* reason)
 viol_oversize: db "oversized message announcement", 0
 viol_invsz:    db "inv/getdata vector above MAX_INV_SZ", 0
 
@@ -399,9 +409,17 @@ node_serve_loop:
     jne  .next
     ; serve_mempool_msg(fd, mp): 1 handled/ignored, -1 violation (no `mempool`
     ; permission and not noban: Core disconnects)
+    mov  rax, [g_serve_mempool_hook]
+    test rax, rax
+    jz   .next
     mov  rdi, r12
     mov  rsi, [mp_cur]
-    call serve_mempool_msg
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
     movsxd rax, eax
     cmp  rax, -1
     je   .viol_mempool_go
@@ -417,10 +435,13 @@ node_serve_loop:
 .viol_disconnect:
     ; Core: fDisconnect, no misbehaviour score (net_processing "in violation
     ; of protocol" paths) -- log through C, then drop the connection
+    mov  rax, [g_serve_policy_log]
+    test rax, rax
+    jz   .done
     push rbp
     mov  rbp, rsp
     and  rsp, -16
-    call serve_policy_disconnect_log
+    call rax
     mov  rsp, rbp
     pop  rbp
     jmp  .done
@@ -474,12 +495,21 @@ node_serve_loop:
     jle  .next               ; malformed or short: drop this message quietly
     ; relay policy: a tx inv from a peer that may not send us txs (-blocksonly
     ; without the relay permission) is a protocol violation (Core)
+    mov  rax, [g_serve_inv_gate]
+    test rax, rax
+    jz   .inv_gate_ok
     lea  rdi, [pl_buf]
     mov  rsi, [s_plen]
-    call serve_inv_gate
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
     movsxd rax, eax
     cmp  rax, -1
     je   .viol_invtx_go
+.inv_gate_ok:
     mov  rax, [s_ivn]
     mov  [s_cnt], rax
     test rax, rax
@@ -592,12 +622,21 @@ node_serve_loop:
     ; inbound tx: compute its BIP141 txid and store it in the mempool so we can
     ; relay it (answer later getdata(MSG_TX)). tx at pl_buf, len = s_plen.
     ; relay policy first: -1 violation (disconnect), 1 drop quietly, 0 go on
-    call serve_tx_gate
+    mov  rax, [g_serve_tx_gate]
+    test rax, rax
+    jz   .tx_gate_ok
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
     movsxd rax, eax
     cmp  rax, -1
     je   .viol_txrelay_go
     test rax, rax
     jnz  .next
+.tx_gate_ok:
     mov  rax, [s_plen]
     cmp  rax, 10            ; version(4)+1in+1out+locktime(4) min
     jb   .next

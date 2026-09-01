@@ -6360,6 +6360,10 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      { extern int (*g_serve_tx_gate)(void); extern int (*g_serve_inv_gate)(const unsigned char*, long);
+        extern int (*g_serve_mempool_hook)(int, void*); extern void (*g_serve_policy_log)(const char*);
+        g_serve_tx_gate = serve_tx_gate; g_serve_inv_gate = serve_inv_gate;
+        g_serve_mempool_hook = serve_mempool_msg; g_serve_policy_log = serve_policy_disconnect_log; }
       { extern void rp_set_blocksonly(int); extern void rpc_node_set_localrelay(int);
         rp_set_blocksonly(g_cfg.blocksonly);
         node_relay_flag = g_cfg.blocksonly ? 0 : 1;          /* fRelay of every version we send (per-peer overrides in the serve child) */
