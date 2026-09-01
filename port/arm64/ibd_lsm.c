@@ -249,6 +249,12 @@ static int rd_varint(const unsigned char*p, unsigned long n, unsigned long long*
 static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin, unsigned long* nout){
     if(n<4+1+1) return -1;
     unsigned long o=4;
+    /* BIP144 segwit serialization: version(4) marker(0x00) flag(0x01) ... and a
+     * witness stack per input after the outputs, before the locktime. Without
+     * this every real mainnet tx past tx0 mis-walks (the marker reads as an
+     * empty vin and the flag as a vout count). */
+    int segwit = 0;
+    if(o+2<=n && tx[o]==0x00 && tx[o+1]==0x01){ segwit=1; o+=2; }
     unsigned long long ni; int v=rd_varint(tx+o,n-o,&ni); if(v<0)return -1; o+=v;
     unsigned long long nin_=ni, i;
     for(i=0;i<nin_;i++){
@@ -264,6 +270,23 @@ static long tx_walk(const unsigned char*tx, unsigned long n, unsigned long* nin,
         if(o+8>n) return -1; o+=8;
         unsigned long long sl; v=rd_varint(tx+o,n-o,&sl); if(v<0)return -1; o+=v;
         if(o+sl>n) return -1; o+=sl;
+    }
+    if(segwit){
+        /* one witness section: per INPUT a varint item count, then per item a
+         * varint length + that many bytes. The old code skipped the item
+         * counts and the length varints themselves, so every real mainnet tx
+         * walked one byte short on the coinbase and descended into garbage
+         * right after tx1 ("tx2 MALFORMED" on every downloaded block). */
+        for(i=0;i<nin_;i++){
+            unsigned long long nitems; v=rd_varint(tx+o,n-o,&nitems); if(v<0)return -1;
+            o+=v;
+            unsigned long long k;
+            for(k=0;k<nitems;k++){
+                unsigned long long sl; v=rd_varint(tx+o,n-o,&sl); if(v<0)return -1;
+                o+=v; o+=sl;
+                if(o>n) return -1;
+            }
+        }
     }
     if(o+4>n) return -1; o+=4;
     *nin=nin_; *nout=nout_;
