@@ -9,7 +9,7 @@ LOG=daemon_out/build.log
 : > "$LOG"
 
 # ---- 1. DAEMONOBJS: build each asm object natively (.S port, else x86 C) ----
-DAEMONOBJS="sha256 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_tx bitcoin_cons bitcoin_store bitcoind node_log bitcoin_headers bitcoin_addrmgr bitcoin_idx bitcoin_serve bitcoin_mempool bitcoin_sigops bitcoin_cmpct bitcoin_idxscan bitcoin_utxo_lsm utxo_lsm_mm bitcoin_utxo_store bitcoin_utxo bitcoin_store_fast secp256k1_schnorr secp256k1_taproot bitcoin_script bitcoin_sighash bitcoin_pubkey secp256k1_ecdsa secp256k1_point secp256k1_glv_c secp256k1_point_ct secp256k1_fe secp256k1_scalar secp256k1_scalar_c ripemd160 bitcoin_addr bitcoin_chainwork bitcoin_interp bitcoin_scriptcodec bitcoin_script_flags sha1 bitcoin_utxo_stats bitcoin_muhash bitcoin_strip_witness bitcoin_store_ext bech32 bitcoin_bip32 bitcoin_bip39 bitcoin_hmac sha512 bitcoin_keys bitcoin_sighash_all_ext"
+DAEMONOBJS="sha256 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_tx bitcoin_cons bitcoin_store bitcoind node_log bitcoin_headers bitcoin_addrmgr bitcoin_idx bitcoin_serve bitcoin_mempool bitcoin_sigops bitcoin_cmpct bitcoin_idxscan bitcoin_utxo_lsm utxo_lsm_mm bitcoin_utxo_store bitcoin_utxo bitcoin_store_fast secp256k1_schnorr secp256k1_taproot bitcoin_script bitcoin_sighash bitcoin_pubkey secp256k1_ecdsa secp256k1_point secp256k1_glv_c secp256k1_point_ct secp256k1_glv secp256k1_glv_mul secp256k1_fe secp256k1_scalar secp256k1_scalar_c ripemd160 bitcoin_addr bitcoin_chainwork bitcoin_interp bitcoin_scriptcodec bitcoin_script_flags sha1 bitcoin_utxo_stats bitcoin_muhash bitcoin_strip_witness bitcoin_store_ext bech32 bitcoin_bip32 bitcoin_bip39 bitcoin_hmac sha512 bitcoin_keys bitcoin_sighash_all_ext"
 FAIL=0
 for m in $DAEMONOBJS; do
     src=""

@@ -7,7 +7,7 @@ CC     := gcc
 CFLAGS := -no-pie -O2
 ASMDIR := ../../asm
 
-MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness bitcoind bitcoin_serve bitcoin_scriptverify_drv bitcoin_witness_v0_drv bitcoin_store_ext bitcoin_sighash_all_ext bitcoin_txv_parse bitcoin_txv_classify bitcoin_segwit_classify bitcoin_txv_pools bitcoin_checksig bitcoin_bip143 bitcoin_multisig bitcoin_idx bitcoin_utxo_stats bitcoin_muhash
+MODULES := sha256 sha1 sha512 ripemd160 bitcoin_hash bitcoin_net bitcoin_p2p bitcoin_headers bitcoin_tx bitcoin_store bitcoin_store_fast bitcoin_bip341 bitcoin_taproot_verify bitcoin_tapagg bitcoin_txv_dispatch bitcoin_cli bitcoin_pubkey bitcoin_cons bitcoin_sighash bech32 secp256k1_fe secp256k1_scalar secp256k1_point secp256k1_point_ct secp256k1_glv secp256k1_glv_mul secp256k1_ecdsa secp256k1_schnorr bitcoin_utxo bitcoin_utxo_store bitcoin_utxo_lsm bitcoin_undo bitcoin_sigops bitcoin_strip_witness bitcoind bitcoin_serve bitcoin_scriptverify_drv bitcoin_witness_v0_drv bitcoin_store_ext bitcoin_sighash_all_ext bitcoin_txv_parse bitcoin_txv_classify bitcoin_segwit_classify bitcoin_txv_pools bitcoin_checksig bitcoin_bip143 bitcoin_multisig bitcoin_idx bitcoin_utxo_stats bitcoin_muhash
 
 .PHONY: all test-all harness so fuzz clean
 
@@ -132,6 +132,21 @@ test_scalar: secp256k1_scalar.o $(ASMDIR)/tests/test_scalar.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_scalar.c secp256k1_scalar.o -I$(ASMDIR)
 test_point: secp256k1_point.o secp256k1_fe.o $(ASMDIR)/tests/test_point.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_point.c secp256k1_point.o secp256k1_fe.o -I$(ASMDIR)
+# GLV (the x86 rules link secp256k1_glv_c.o; the C has no arch-dependent
+# pieces, so the port compiles it straight off ../../asm). glv_mul provides
+# point_scalar_mul_glv; glv provides sc_split_lambda/sc_mul_512.
+GLVOBJS := secp256k1_point.o secp256k1_glv.o secp256k1_glv_mul.o \
+	$(ASMDIR)/secp256k1_glv_c.c secp256k1_scalar.o secp256k1_scalar_c.o \
+	secp256k1_point_ct.o secp256k1_fe.o
+test_glv_split: secp256k1_glv.o secp256k1_scalar.o secp256k1_scalar_c.o \
+		$(ASMDIR)/tests/test_glv_split.c $(ASMDIR)/tests/glv_split_vec.h
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_glv_split.c secp256k1_glv.o \
+		secp256k1_scalar.o secp256k1_scalar_c.o -I$(ASMDIR)
+test_glv_wnaf: $(ASMDIR)/tests/test_glv_wnaf.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_glv_wnaf.c \
+		$(ASMDIR)/secp256k1_glv_c.c -I$(ASMDIR)
+test_glv_pointmul: $(GLVOBJS) $(ASMDIR)/tests/test_glv_pointmul.c
+	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_glv_pointmul.c $(GLVOBJS) -I$(ASMDIR)
 test_bech32: bech32.o $(ASMDIR)/tests/test_bech32.c
 	$(CC) $(CFLAGS) -o $@ $(ASMDIR)/tests/test_bech32.c bech32.o -I$(ASMDIR)
 fuzz_bech32: fz_bech32.c bech32.o
