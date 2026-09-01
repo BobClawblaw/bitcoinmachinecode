@@ -922,6 +922,33 @@ Core's BytesToKeySHA512AES KDF (proven byte-identical to OpenSSL), the live
 RPC seed gated behind an unlock timer.
 
 Missing:
+- **Multipath descriptors (BIP389) + the PSBT Updater + partial signatures**
+  — **DONE 2026-09-01 (late):** `/<a;b;...>` derivation steps parse with
+  Core's rules and error texts everywhere keys appear (multi, tr subscripts
+  and internal key, miniscript, musig participants); one `descr_t` holds all
+  expansions (`descr_multipath_select`); `getdescriptorinfo` reports
+  `multipath_expansion`, `deriveaddresses` answers one list per expansion,
+  `scantxoutset` scans all of them, `importdescriptors` imports one
+  descriptor per path, `descriptorprocesspsbt` treats each expansion as a
+  descriptor. The Updater role is real (`psbt_update.c`, run inside
+  `psbt_process` on the v0-shaped buffer, version preserved): scripts,
+  bip32 origins (Core's fingerprint rules), and for `tr()` every leaf as
+  `tap_leaf_script` with its control block, derivations with leaf hashes,
+  internal key, merkle root, output-side tree (Core's right-most-first
+  order), and `witness_utxo` materialised for (nested) segwit inputs;
+  `utxoupdatepsbt`'s descriptors argument works and `walletprocesspsbt`
+  updates from the wallet's own descriptors. Partial signatures now flow
+  BOTH ways for multisig and miniscript inputs (P2WSH and tapscript): the
+  signer's placed signatures become `partial_signatures` /
+  `taproot_script_path_sigs` under `finalize=false`, and partials already
+  in the PSBT are merged into witnesses (a 0-of-k attempt is "keys not
+  provided", never an empty partial). Evidence: Core's 12 CheckMultipath +
+  14 unparsable vectors (`test_descriptor_vectors` 720 checks),
+  `tests/test_psbt_update` (40), and `validation/updater_core_diff.py` —
+  getdescriptorinfo/deriveaddresses byte-for-byte, Core's own
+  `utxoupdatepsbt(descriptors)` output field-for-field, and two-signer
+  hand-offs in both orders judged by Core's finalizer: **145/145**;
+  miniscript 436/436 and musig 110/110 differentials re-run green.
 - **PSBT (BIP174)** — ~~absent, zero hits anywhere~~ **substantially present
   since 2026-08-25**: `createpsbt`, `decodepsbt`, `converttopsbt`,
   `combinepsbt`, `joinpsbts` (all oracle-verified, several byte-identical)
