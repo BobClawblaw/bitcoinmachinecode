@@ -103,7 +103,7 @@ testnet4, signet (public or custom) and regtest.
 - At-rest encryption (`encryptwallet`, `walletpassphrase`,
   `walletpassphrasechange`, `walletlock`) using AES-256-CBC under Core's
   `BytesToKeySHA512AES` key derivation.
-- PSBT: `createpsbt`, `decodepsbt`, `converttopsbt`, `combinepsbt`,
+- PSBT (v0 and v2/BIP370, Core-ordered bytes, Core master's v2 default): `createpsbt`, `decodepsbt`, `converttopsbt`, `combinepsbt`,
   `joinpsbts`, `analyzepsbt`, `finalizepsbt`, `utxoupdatepsbt`,
   `walletprocesspsbt`.
 - Descriptors and watch-only: `importdescriptors`, `listdescriptors`,
