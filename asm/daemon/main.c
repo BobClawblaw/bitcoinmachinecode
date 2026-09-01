@@ -1131,6 +1131,7 @@ static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lo
 static char g_cur_peer_ip[64];
 extern void (*g_serve_violation_hook)(const char*);
 #include "relay_policy.h"
+#include "../bmc_thread.h"   /* 2026-09-01: the mempool-reload and i2p-accept threads ran on glibc-default stacks; with ~12 MB of static TLS that is a few KB of real stack, and the one-write logging buffer (8 KB) overflowed it the moment a reused datadir had a mempool.dat to reload (fault addr == rsp in log_vfprintf_at, reproduced by validation/relay_policy_core_diff.sh run B twice) */
 extern unsigned g_conn_perms;                     /* whitebind permissions of this child (defined below) */
 /* ---- relay policy per inbound connection (2026-09-01; daemon/relay_policy.c)
  * The serve child sets these once the peer's version is in hand (the asm
@@ -5844,7 +5845,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
              * entry dump takes at the worker's rotation budget. */
             { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
               rpc_node_set_shutdown_flag(&g_shutdown_requested); }
-            if(pthread_create(&g_mempool_reload_thread, NULL, mempool_reload_thread, NULL) == 0)
+            if(bmc_pthread_create(&g_mempool_reload_thread, mempool_reload_thread, NULL) == 0)
                 g_mempool_reload_started = 1;
             else mempool_reload_thread(NULL);
         } else {
@@ -5944,7 +5945,7 @@ static int i2p_inbound_start(void){
     if(!g_cfg.listen || !g_cfg.i2pacceptincoming || !dialer_i2p_ready()) return -1;
     if(pipe(g_i2p_pipe) != 0) return -1;
     pthread_t th;
-    if(pthread_create(&th, NULL, i2p_accept_thread, NULL) != 0){
+    if(bmc_pthread_create(&th, i2p_accept_thread, NULL) != 0){
         close(g_i2p_pipe[0]); close(g_i2p_pipe[1]); g_i2p_pipe[0] = g_i2p_pipe[1] = -1; return -1; }
     pthread_detach(th);
     fprintf(stderr,"[i2p] accepting inbound streams on %s (SAM STREAM ACCEPT)\n", dialer_i2p_b32());
