@@ -29,6 +29,11 @@ default rel
 extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
+extern node_relay_flag
+extern serve_tx_gate
+extern serve_inv_gate
+extern serve_mempool_msg
+extern serve_policy_disconnect_log
     extern serve_idx_topup
     extern serve_cfilters
     extern idx_put
@@ -73,6 +78,10 @@ align 16
 ; ---------------------------------------------------------------------------
 global g_serve_violation_hook
 g_serve_violation_hook: dq 0      ; void (*)(const char* reason)
+; relay policy (2026-09-01, main.c serve_on_peer_version): 0 = do not send
+; our `feefilter` to this peer (-blocksonly, or a forcerelay peer)
+global g_serve_send_feefilter
+g_serve_send_feefilter: db 1
 viol_oversize: db "oversized message announcement", 0
 viol_invsz:    db "inv/getdata vector above MAX_INV_SZ", 0
 
@@ -94,6 +103,9 @@ cn_btxn:   db "blocktxn",0
 cn_cmpct:  db "cmpctblock",0
 cn_sendhd: db "sendheaders",0
 cn_feeflt: db "feefilter",0
+viol_txrelay: db "transaction sent in violation of protocol",0          ; Core net_processing.cpp
+viol_invtx:   db "transaction inv sent in violation of protocol",0
+viol_mempool: db "mempool request with bloom filters disabled",0
 ; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
 align 16
 bt_buf:    times (8<<20) db 0     ; compact-block output buffer
@@ -319,6 +331,8 @@ node_serve_loop:
     mov  eax, [r14+24]           ; tip height (st[24])
     mov  [s_lasttip], rax
     ; feefilter_send(fd) -- 8-byte int64 LE min-relay-feerate (s_myfee)
+    cmp  byte [g_serve_send_feefilter], 0
+    je   .ff_skip                ; -blocksonly / forcerelay peer: Core sends none
     lea  rax, [hp_buf]
     mov  rdx, [s_myfee]
     mov  [hp_buf], rdx
@@ -329,6 +343,7 @@ node_serve_loop:
     mov  r8d, 8
     call p2p_write
     mov  byte [s_feesent], 1
+.ff_skip:
 
     ; r15 was written at entry and is no longer used as an iteration counter
     ; (see `.done` -- the loop is now unbounded, terminating only on connection
@@ -375,7 +390,40 @@ node_serve_loop:
     je   .maybe_feefilter
     cmp  dword [s_cmd], 0x69787477   ; "wtxi" (wtxidrelay) -- a handshake-only
     je   .done                       ;   message; after verack Core disconnects
+    cmp  dword [s_cmd], 0x706d656d   ; "memp" (mempool, BIP35)
+    je   .maybe_mempool
     jmp  .next
+
+.maybe_mempool:
+    cmp  dword [s_cmd+4], 0x006c6f6f ; "ool\0"
+    jne  .next
+    ; serve_mempool_msg(fd, mp): 1 handled/ignored, -1 violation (no `mempool`
+    ; permission and not noban: Core disconnects)
+    mov  rdi, r12
+    mov  rsi, [mp_cur]
+    call serve_mempool_msg
+    movsxd rax, eax
+    cmp  rax, -1
+    je   .viol_mempool_go
+    jmp  .next
+.viol_mempool_go:
+    lea  rdi, [viol_mempool]
+    jmp  .viol_disconnect
+.viol_invtx_go:
+    lea  rdi, [viol_invtx]
+    jmp  .viol_disconnect
+.viol_txrelay_go:
+    lea  rdi, [viol_txrelay]
+.viol_disconnect:
+    ; Core: fDisconnect, no misbehaviour score (net_processing "in violation
+    ; of protocol" paths) -- log through C, then drop the connection
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call serve_policy_disconnect_log
+    mov  rsp, rbp
+    pop  rbp
+    jmp  .done
 
 .do_verack:
     jmp  .next
@@ -424,6 +472,14 @@ node_serve_loop:
     je   .inv_toobig
     test rax, rax
     jle  .next               ; malformed or short: drop this message quietly
+    ; relay policy: a tx inv from a peer that may not send us txs (-blocksonly
+    ; without the relay permission) is a protocol violation (Core)
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    call serve_inv_gate
+    movsxd rax, eax
+    cmp  rax, -1
+    je   .viol_invtx_go
     mov  rax, [s_ivn]
     mov  [s_cnt], rax
     test rax, rax
@@ -437,8 +493,59 @@ node_serve_loop:
     jle  .next
     mov  rbx, [s_ptr]
     mov  r9d, [rbx]          ; type
-    cmp  r9d, 2              ; MSG_BLOCK only (skip tx inv for now)
-    jne  .inv_next
+    cmp  r9d, 2              ; MSG_BLOCK
+    je   .inv_block
+    cmp  r9d, 1              ; MSG_TX  (2026-09-01: inbound peers' announcements are fetched
+    je   .inv_txann          ;          when relay policy allows -- serve_inv_gate ran above)
+    cmp  r9d, 5              ; MSG_WTX (BIP339)
+    je   .inv_txann
+    jmp  .inv_next
+.inv_txann:
+    cmp  byte [node_relay_flag], 0
+    je   .inv_next           ; we asked this peer for no relay (fRelay=0): ignore, do not fetch
+    cmp  byte [tx_dv_ok], 1
+    jne  .inv_next           ; no validation this connection: nothing to accept it into
+    cmp  r9d, 1
+    jne  .inv_txann_req      ; a wtxid cannot be looked up by txid: just ask
+    ; already in the pool? mpool_get(mp_cur, hash, &s_fh)
+    mov  [s_ptr], rbx
+    mov  rdi, [mp_cur]
+    lea  rsi, [rbx+4]
+    lea  rdx, [s_fh]
+    call mpool_get
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jnz  .inv_next
+.inv_txann_req:
+    ; getdata: [1][type][hash]; MSG_TX is asked for as MSG_WITNESS_TX (0x40000001),
+    ; MSG_WTX echoed (the getdata carries the wtxid)
+    mov  byte  [src_buf], 1
+    mov  dword [src_buf+1], 0x40000001
+    cmp  r9d, 5
+    jne  .inv_txann_type_ok
+    mov  dword [src_buf+1], 5
+.inv_txann_type_ok:
+    mov  rdx, 32
+    lea  rdi, [src_buf+5]
+    lea  rsi, [rbx+4]
+    push rbx
+    push rbx                 ; padding: keep RSP 16-byte aligned
+    call memcpy_len
+    pop  rbx
+    pop  rbx
+    mov  [s_ptr], rbx
+    mov  rdi, r12
+    lea  rsi, [cn_getdata]
+    mov  rdx, 7
+    lea  rcx, [src_buf]
+    mov  r8d, 37
+    push rbx
+    push rbx
+    call p2p_write
+    pop  rbx
+    pop  rbx
+    jmp  .inv_next
+.inv_block:
     ; have it? idx_get(ht_idx, rbx+4, &s_fh)
     mov  [s_ptr], rbx
     mov  rdi, [s_htidx]
@@ -484,6 +591,13 @@ node_serve_loop:
 .do_tx:
     ; inbound tx: compute its BIP141 txid and store it in the mempool so we can
     ; relay it (answer later getdata(MSG_TX)). tx at pl_buf, len = s_plen.
+    ; relay policy first: -1 violation (disconnect), 1 drop quietly, 0 go on
+    call serve_tx_gate
+    movsxd rax, eax
+    cmp  rax, -1
+    je   .viol_txrelay_go
+    test rax, rax
+    jnz  .next
     mov  rax, [s_plen]
     cmp  rax, 10            ; version(4)+1in+1out+locktime(4) min
     jb   .next
