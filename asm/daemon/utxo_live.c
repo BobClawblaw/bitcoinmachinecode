@@ -1908,7 +1908,8 @@ int utxo_live_init(const char* dir){
      * steady-state catch-up uses (UTXO_LIVE_COMPACT_THRESHOLD). Bounded by
      * manifest_cap iterations so a compact() that stops making progress
      * (e.g. every remaining run already merged) can't spin forever. */
-    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
+    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= 2 && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
+        /* count threshold OR byte budget (2026-09-01): compact_pick_now applies both */
         u64 before = g_utxo_lst.manifest_n;
         long lo = 0, k = compact_pick_now(&lo);
         if (k == 0) break;

@@ -20,9 +20,10 @@
  * origin `[...]` are errors. Each KEY is a plain 33-byte key or a BIP32
  * (xpub[/path]) key WITHOUT its own `/ *` (star child) or `/<a;b>` when the musig() itself
  * carries derivation. Two shapes:
- *   1. musig(K1,...,Kn)            -> agg = musig2_key_agg(K1..Kn) (keys in
- *      the WRITTEN order; the BIP sorts nothing -- the descriptor writer
- *      chooses the order, and the aggregate depends on it), x-only = the
+ *   1. musig(K1,...,Kn)            -> agg = musig2_key_agg(K1..Kn) (keys SORTED
+ *      lexicographically first, as Core's MuSigPubkeyProvider does before
+ *      KeyAgg -- settled by Core's descriptor vectors on 2026-09-01; the
+ *      written order does not matter), x-only = the
  *      32-byte xbytes(Q) used as the tr() key.
  *   2. musig(K1,...,Kn)/NUM/... then the star child or /<a;b> -> the aggregate becomes a
  *      SYNTHETIC xpub: depth 0, fingerprint 0, child 0, chaincode
