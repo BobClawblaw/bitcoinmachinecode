@@ -6,10 +6,12 @@
  * monitoring node must not be disconnected or banned for tripping a
  * misbehaviour heuristic.
  *
- * WHAT THIS NODE HONOURS, AND WHY THE REST IS REFUSED. Only `noban` is
- * enforced here. Every other flag Core defines needs an enforcement point
- * that either does not exist in this node (bloomfilter -- BIP37 is not
- * implemented, BIP157/158 is) or has not been wired yet. Accepting those
+ * WHAT THIS NODE HONOURS, AND WHY THE REST IS REFUSED (2026-09-01):
+ * noban, relay, forcerelay, mempool, download and addr are enforced --
+ * see daemon/relay_policy.c for where each one bites. `bloomfilter` needs
+ * BIP37, which this node does not implement, and `out` would apply the
+ * entry to the peers we dial, which this node does not do (whitelist is
+ * inbound-only here, Core's default direction); both are refused. Accepting those
  * tokens and doing nothing with them is the exact failure this codebase has
  * reproduced repeatedly -- `whitelist=rpc` sat in the live config for weeks
  * doing nothing, and `externalip` and `permitbaremultisig` before it. So an
@@ -23,9 +25,16 @@
 #ifndef NETPERM_H
 #define NETPERM_H
 
-#define NP_NOBAN      (1u << 0)   /* Core NetPermissionFlags::NoBan   */
+#define NP_NOBAN      (1u << 0)   /* Core NetPermissionFlags::NoBan (implies download) */
 #define NP_RELAY      (1u << 1)   /* Core Relay: accept relayed txs even in -blocksonly (2026-09-01) */
 #define NP_FORCERELAY (1u << 2)   /* Core ForceRelay: relay a tx even if already in the mempool    */
+#define NP_MEMPOOL    (1u << 3)   /* Core Mempool: may send us `mempool` (we never advertise NODE_BLOOM) */
+#define NP_DOWNLOAD   (1u << 4)   /* Core Download: served past -maxuploadtarget (noban implies it)     */
+#define NP_ADDR       (1u << 5)   /* Core Addr: unlimited addr gossip / uncached getaddr (see netperm.c) */
+/* Core's NetPermissions::ToStrings order: bloomfilter, noban, forcerelay,
+ * relay, mempool, download, addr. Fills `out` with up to `cap` static
+ * strings, returns the count (getpeerinfo "permissions"). */
+int netperm_names(unsigned flags, const char** out, int cap);
 /* -whitelistrelay / -whitelistforcerelay: the permissions an entry WITHOUT
  * an explicit perms@ list gets (Core: relay by default, forcerelay off). */
 void netperm_set_implicit_defaults(int relay, int forcerelay);
