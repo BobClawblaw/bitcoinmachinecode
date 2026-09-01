@@ -572,7 +572,7 @@ int main(void){
       expect_err("gdi bad checksum", "getdescriptorinfo", p, -5,
                  "Provided checksum '00000000' does not match computed checksum 'wvk84d79'");
       /* invalid key rejected */
-      expect_err("gdi invalid key", "getdescriptorinfo", "[\"wpkh(notakey)\"]", -5, "key 'notakey' is not valid");
+      expect_err("gdi invalid key", "getdescriptorinfo", "[\"wpkh(notakey)\"]", -5, "wpkh(): key 'notakey' is not valid");
 
       /* deriveaddresses: wpkh ranged [0,2] -> Core's addresses */
       snprintf(p, sizeof p, "[\"wpkh(%s/0/*)#wvk84d79\", [0,2]]", XP);

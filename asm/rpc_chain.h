@@ -126,4 +126,6 @@ int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout
 rj_val* rpc_chain_script_pubkey_json(const unsigned char* sc, unsigned long n);
 rj_val* rpc_chain_script_json_noaddr(const unsigned char* sc, unsigned long n);
 char* rpc_chain_script_asm(const unsigned char* sc, unsigned long n, int sighash);
+/* BIP389 multipath: expansions of a descriptor as public form + checksum (1 when none); 0 with err on a parse error */
+int rpc_desc_multipath_expand(const char* in, char (*out)[340], int cap, char* err, unsigned long errcap);
 #endif /* RPC_CHAIN_H */
