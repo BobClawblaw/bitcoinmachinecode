@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 /* Link stub: mpool_policy_add resolves confirmed prevouts through this. Any
  * outpoint not found in the policy's own outreg resolves to a 100000-sat
@@ -522,30 +523,22 @@ int main(void){
           ck("ancestors miss -> -5", rc==0 && e5==-5 && m5 && !strcmp(m5,"Transaction not in mempool"));
           rj_free(r); rj_free(ap); }
 
-        /* ---- estimatesmartfee: Core's contract over OUR EMA estimator.
-         * The two policy adds above fed the EMA real samples (fee 10000 over
-         * 82 bytes -> ~121951 sat/kB first sample; EMA converges toward it),
-         * so the feerate is a genuine policy-computed number. ---- */
-        { extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
-          { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+        /* ---- estimatesmartfee / estimaterawfee: Core rpc/fees.cpp over the
+         * CBlockPolicyEstimator port (daemon/fee_estimator.c). Without an
+         * estimator the answer is a fresh Core's: "Insufficient data", blocks
+         * 0. With one fed Core's own policyestimator_tests scenario, the
+         * JSON carries Core's field names and the target semantics. ---- */
+        { { rpc_mempool_hooks h; memset(&h,0,sizeof h);
             h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
             h.get = mpool_get; h.polstate = polstate;
             h.pol_entry_info = mpool_policy_entry_info;
-            h.estimate = mpool_policy_estimate;
             rpc_node_set_mempool(&h); }
           rj_val* fp=rj_parse("[6]",3); r=NULL;
           rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
-          ck("esf(6) dispatched with feerate+blocks", rc==1 && r && S(r,"feerate") && S(r,"blocks") && !strcmp(S(r,"blocks"),"6"));
-          ck("esf(6) no errors array", r && rj_obj_get(r,"errors")==NULL);
-          { unsigned long long spk=0, n=0; mpool_policy_estimate(polstate,&spk,&n);
-            char want[32]; snprintf(want,sizeof want,"%llu.%08llu",
-                (spk<1000?1000ULL:spk)/100000000ULL, (spk<1000?1000ULL:spk)%100000000ULL);
-            ck("esf(6) feerate == policy EMA (floored)", n>0 && S(r,"feerate") && !strcmp(S(r,"feerate"),want)); }
-          rj_free(r); rj_free(fp);
-          /* conf_target 1 -> blocks clamps to 2 (oracle-verified) */
-          fp=rj_parse("[1]",3); r=NULL;
-          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
-          ck("esf(1) -> blocks 2", rc==1 && r && S(r,"blocks") && !strcmp(S(r,"blocks"),"2"));
+          { rj_val* errs = r?rj_obj_get(r,"errors"):NULL;
+            ck("esf(6) without an estimator -> errors[Insufficient data...], blocks 0 (fresh Core)", rc==1 && errs && errs->typ==RJ_ARR
+               && errs->nitems==1 && errs->items[0]->str && !strcmp(errs->items[0]->str,"Insufficient data or no feerate found")
+               && S(r,"blocks") && !strcmp(S(r,"blocks"),"0") && rj_obj_get(r,"feerate")==NULL); }
           rj_free(r); rj_free(fp);
           /* argument errors, Core-exact */
           fp=rj_parse("[0]",3); r=NULL; long e8; const char* m8;
@@ -556,29 +549,84 @@ int main(void){
           rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
           ck("esf(1009) -> -8", rc==0 && e8==-8);
           rj_free(r); rj_free(fp);
+          fp=rj_parse("[\"6\"]",5); r=NULL;
+          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
+          ck("esf(\"6\") -> -3 type error", rc==0 && e8==-3 && m8 && !strcmp(m8,"JSON value of type string is not of expected type number"));
+          rj_free(r); rj_free(fp);
           fp=rj_parse("[6, \"bogus\"]",12); r=NULL;
           rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
           ck("esf bad mode -> -8 Core message", rc==0 && e8==-8 && m8 && strstr(m8,"Invalid estimate_mode parameter"));
           rj_free(r); rj_free(fp);
-          fp=rj_parse("[6, \"ECONOMICAL\"]",17); r=NULL;
-          rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
-          ck("esf ECONOMICAL accepted (case-insensitive)", rc==1 && r && S(r,"feerate"));
-          rj_free(r); rj_free(fp);
-          /* fresh estimator -> Core's insufficient-data shape */
-          { static unsigned char fresh[1<<22];
-            extern void mpool_policy_state_init(void*, unsigned long);
-            mpool_policy_state_init(fresh, 4096);
-            rpc_mempool_hooks h; memset(&h,0,sizeof h);
-            h.mp = pool; h.polstate = fresh; h.estimate = mpool_policy_estimate;
-            rpc_node_set_mempool(&h);
+
+          /* a real estimator, fed Core's test scenario (10 feerates x 4 txs per
+           * block, the j-th feerate confirming after j+1 blocks) for 60 blocks */
+          { extern unsigned long fest_state_size(unsigned long); extern int fest_init(void*, unsigned long);
+            extern void fest_process_transaction(void*, const unsigned char*, unsigned long long, unsigned long long, unsigned, int);
+            extern int fest_block_begin(void*, unsigned); extern int fest_block_tx(void*, const unsigned char*); extern void fest_block_end(void*);
+            static unsigned char festbuf[1<<20]; void* fe = malloc(fest_state_size(4096)); fest_init(fe, 4096); (void)festbuf;
+            static unsigned char pend[10][2048][32]; static int np[10]; memset(np,0,sizeof np);
+            for (unsigned bn = 0; bn < 60; bn++){
+                for (int j=0;j<10;j++) for (int k=0;k<4;k++){ unsigned char t[32]; memset(t,0,32); t[0]=(unsigned char)bn; t[1]=(unsigned char)(bn>>8); t[2]=(unsigned char)j; t[3]=(unsigned char)k; t[31]=0x55;
+                    fest_process_transaction(fe, t, 2000ULL*(j+1), 188, bn, 1); memcpy(pend[j][np[j]++], t, 32); }
+                fest_block_begin(fe, bn+1);
+                for (unsigned h2=0; h2<=bn%10; h2++){ int j=9-(int)h2; while (np[j]) fest_block_tx(fe, pend[j][--np[j]]); }
+                fest_block_end(fe);
+            }
+            { extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
+              rpc_mempool_hooks h; memset(&h,0,sizeof h);
+              h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count; h.get = mpool_get; h.polstate = polstate;
+              h.pol_entry_info = mpool_policy_entry_info; h.feeest = fe; h.min_relay_satkvb = 100;
+              rpc_node_set_mempool(&h); }
             fp=rj_parse("[6]",3); r=NULL;
             rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
-            rj_val* errs = r?rj_obj_get(r,"errors"):NULL;
-            ck("esf fresh estimator -> errors[Insufficient data...]", rc==1 && errs && errs->typ==RJ_ARR
-               && errs->nitems==1 && errs->items[0]->str
-               && !strcmp(errs->items[0]->str,"Insufficient data or no feerate found"));
-            ck("esf fresh -> no feerate field", r && rj_obj_get(r,"feerate")==NULL);
-            rj_free(r); rj_free(fp); }
+            ck("esf(6) with data: feerate + blocks 6, no errors", rc==1 && r && S(r,"feerate") && S(r,"blocks") && !strcmp(S(r,"blocks"),"6") && rj_obj_get(r,"errors")==NULL);
+            if (r && S(r,"feerate")) printf("  (esf(6) = %s BTC/kvB)\n", S(r,"feerate"));
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[1]",3); r=NULL;
+            rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
+            ck("esf(1) -> blocks 2 (Core clamps 1 to 2)", rc==1 && r && S(r,"blocks") && !strcmp(S(r,"blocks"),"2"));
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[6, \"ECONOMICAL\"]",17); r=NULL;
+            rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&ec,&em);
+            ck("esf ECONOMICAL accepted (case-insensitive)", rc==1 && r && S(r,"feerate"));
+            rj_free(r); rj_free(fp);
+            { rj_val* a=rj_parse("[6, \"economical\"]",17); rj_val* c=rj_parse("[6, \"conservative\"]",19); rj_val *ra=NULL,*rc2=NULL;
+              rpc_node_dispatch("estimatesmartfee",a,&ra,&ec,&em); rpc_node_dispatch("estimatesmartfee",c,&rc2,&ec,&em);
+              ck("conservative feerate >= economical", ra && rc2 && S(ra,"feerate") && S(rc2,"feerate") && strcmp(S(rc2,"feerate"),S(ra,"feerate"))>=0);
+              rj_free(ra); rj_free(rc2); rj_free(a); rj_free(c); }
+            /* estimaterawfee: Core's per-horizon shape */
+            fp=rj_parse("[6]",3); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&ec,&em);
+            { rj_val *sh=r?rj_obj_get(r,"short"):0, *md=r?rj_obj_get(r,"medium"):0, *lg=r?rj_obj_get(r,"long"):0;
+              ck("erf(6): short/medium/long objects", rc==1 && sh && md && lg);
+              ck("erf(6).medium: feerate, decay 0.9952, scale 2, pass bucket with Core's six fields", md && S(md,"feerate") && S(md,"decay") && !strcmp(S(md,"decay"),"0.9952")
+                 && S(md,"scale") && !strcmp(S(md,"scale"),"2") && rj_obj_get(md,"pass") && S(rj_obj_get(md,"pass"),"startrange") && S(rj_obj_get(md,"pass"),"endrange")
+                 && S(rj_obj_get(md,"pass"),"withintarget") && S(rj_obj_get(md,"pass"),"totalconfirmed") && S(rj_obj_get(md,"pass"),"inmempool") && S(rj_obj_get(md,"pass"),"leftmempool"));
+              ck("erf(6).short: decay 0.962 scale 1; long: decay 0.99931 scale 24", sh && S(sh,"decay") && !strcmp(S(sh,"decay"),"0.962") && S(sh,"scale") && !strcmp(S(sh,"scale"),"1")
+                 && lg && S(lg,"decay") && !strcmp(S(lg,"decay"),"0.99931") && S(lg,"scale") && !strcmp(S(lg,"scale"),"24"));
+              if (md && rj_obj_get(md,"pass")) printf("  (erf(6).medium pass %s..%s within %s of %s)\n", S(rj_obj_get(md,"pass"),"startrange"), S(rj_obj_get(md,"pass"),"endrange"), S(rj_obj_get(md,"pass"),"withintarget"), S(rj_obj_get(md,"pass"),"totalconfirmed")); }
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[13]",4); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&ec,&em);
+            ck("erf(13): no short horizon (tracks 12), medium + long present", rc==1 && r && !rj_obj_get(r,"short") && rj_obj_get(r,"medium") && rj_obj_get(r,"long"));
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[49]",4); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&ec,&em);
+            ck("erf(49): only long", rc==1 && r && !rj_obj_get(r,"short") && !rj_obj_get(r,"medium") && rj_obj_get(r,"long"));
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[6, 1.5]",8); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&e8,&m8);
+            ck("erf threshold 1.5 -> -8 Invalid threshold", rc==0 && e8==-8 && m8 && !strcmp(m8,"Invalid threshold"));
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[6, \"x\"]",8); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&e8,&m8);
+            ck("erf non-numeric threshold -> -3", rc==0 && e8==-3);
+            rj_free(r); rj_free(fp);
+            fp=rj_parse("[2, 0.5]",8); r=NULL;
+            rc=rpc_node_dispatch("estimaterawfee",fp,&r,&ec,&em);
+            ck("erf(2, 0.5) answers on all three horizons", rc==1 && r && rj_obj_get(r,"short") && rj_obj_get(r,"medium") && rj_obj_get(r,"long"));
+            rj_free(r); rj_free(fp);
+            free(fe); }
           /* restore the populated hooks for any later checks */
           { extern long mpool_policy_entry(void*, const unsigned char*,
                                            unsigned long long*, unsigned long long*);

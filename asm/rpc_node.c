@@ -1220,53 +1220,140 @@ static int cmd_getmempooldescendants(const rj_val* params, rj_val** res, long* e
     return cmd_mpe_relatives(params, res, ec, em, 1);
 }
 
-/* estimatesmartfee conf_target ("estimate_mode") -- Core rpc/fees.cpp shape
- * and argument validation, over THIS node's estimator. Core's estimator is a
- * confirmed-block bucket tracker; ours is the tx-accept policy layer's EMA of
- * accepted feerates (sat/kB, bitcoin_mempool_policy.c) -- an honest,
- * DIFFERENT estimator, so the NUMBER is ours, only the contract is Core's:
- *   - conf_target outside [1,1008] -> -8, Core's exact message.
- *   - estimate_mode other than unset/economical/conservative (any case) ->
- *     -8, Core's exact message. Both modes return the same EMA (one
- *     estimator; the economical/conservative split is meaningless for it).
- *   - no samples yet -> {"errors":["Insufficient data or no feerate found"],
- *     "blocks":N} exactly like a fresh Core node.
- *   - otherwise {"feerate": BTC/kvB, "blocks": N}, floored at the min relay
- *     fee, with N = the target clamped to >= 2 (Core's minimum horizon --
- *     estimatesmartfee 1 answers with "blocks": 2, verified on the oracle). */
+/* ==== fee estimation: estimatesmartfee / estimaterawfee =================
+ * Core rpc/fees.cpp over daemon/fee_estimator.c (the CBlockPolicyEstimator
+ * port). The estimator lives in the mempool hooks' `feeest` region; the
+ * functions are WEAK externs so rpc_node.o keeps its no-link-fanout
+ * property (test binaries without fee_estimator.c see NULL and answer the
+ * way a fresh estimator does: "Insufficient data", blocks 0). */
+#include "daemon/fee_estimator.h"
+extern unsigned long long fest_estimate_smart(const void*, int, int, int*, fest_result_t*) __attribute__((weak));
+extern unsigned long long fest_estimate_raw(const void*, int, double, int, fest_result_t*) __attribute__((weak));
+extern unsigned fest_highest_target(const void*, int) __attribute__((weak));
+
+static const char* rj_type_name(const rj_val* v){
+    if (!v) return "null";
+    switch (v->typ){ case RJ_NULL: return "null"; case RJ_BOOL: return "bool"; case RJ_NUM: return "number";
+                     case RJ_STR: return "string"; case RJ_ARR: return "array"; case RJ_OBJ: return "object"; default: return "null"; }
+}
+/* Core ParseConfirmTarget: "Invalid conf_target, must be between 1 and <max>" */
+static int fee_parse_target(const rj_val* params, unsigned max_target, long* ec, const char** em, int* out){
+    static char msg[96];
+    const rj_val* v = (params && params->typ == RJ_ARR && params->nitems >= 1) ? params->items[0] : 0;
+    if (!v || v->typ != RJ_NUM){
+        snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(v));
+        *ec = -3; *em = msg; return 0; }
+    long t = atol(v->str);
+    if (t < 1 || (unsigned long)t > max_target){
+        snprintf(msg, sizeof msg, "Invalid conf_target, must be between 1 and %u", max_target);
+        *ec = -8; *em = msg; return 0; }
+    *out = (int)t;
+    return 1;
+}
+static rj_val* fee_btc_per_kvb(unsigned long long satkvb){
+    return rj_numf("%llu.%08llu", satkvb / 100000000ULL, satkvb % 100000000ULL);   /* ValueFromAmount */
+}
+static rj_val* fee_dbl(double v){ return rj_numf("%.16g", v); }   /* UniValue: setprecision(16) */
+static double fee_round(double v){ return v < 0 ? -(double)(unsigned long long)(-v + 0.5) : (double)(unsigned long long)(v + 0.5); }  /* C round() */
+
 static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, const char** em){
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
-        params->items[0]->typ != RJ_NUM){
-        *ec = -3; *em = "JSON value of type null is not of expected type number"; return 0; }
-    long target = atol(params->items[0]->str);
-    if (target < 1 || target > 1008){
-        *ec = -8; *em = "Invalid conf_target, must be between 1 and 1008"; return 0; }
-    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR){
-        const char* m = params->items[1]->str; char lo[16]; size_t i=0;
-        for (; m[i] && i+1<sizeof lo; i++) lo[i] = (char)(m[i]>='A'&&m[i]<='Z' ? m[i]+32 : m[i]);
-        lo[i]=0;
-        if (strcmp(lo,"unset") && strcmp(lo,"economical") && strcmp(lo,"conservative")){
+    const void* fe = g_mph.feeest;
+    unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
+    int target = 0;
+    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    int conservative = 0;
+    if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        const rj_val* mv = params->items[1];
+        if (mv->typ != RJ_STR){ *ec = -3; *em = "JSON value is not a string as expected"; return 0; }
+        /* FeeModeFromString: case-insensitive over unset/economical/conservative */
+        char lo[16]; size_t i = 0;
+        for (; mv->str[i] && i + 1 < sizeof lo; i++) lo[i] = (char)(mv->str[i] >= 'A' && mv->str[i] <= 'Z' ? mv->str[i] + 32 : mv->str[i]);
+        lo[i] = 0;
+        if (mv->str[i] || (strcmp(lo, "unset") && strcmp(lo, "economical") && strcmp(lo, "conservative"))){
             *ec = -8; *em = "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"";
             return 0; }
+        conservative = !strcmp(lo, "conservative");
     }
-    long blocks = target < 2 ? 2 : target;
-    rj_val* o = rj_obj();
-    unsigned long long satperkb=0, samples=0; int have=0;
-    if (g_mph.polstate && g_mph.estimate){
+    int returned = 0; unsigned long long feerate = 0;
+    if (fe && fest_estimate_smart){
         mpl();
-        have = (int)g_mph.estimate(g_mph.polstate, &satperkb, &samples);
+        feerate = fest_estimate_smart(fe, target, conservative, &returned, 0);
         mpu();
     }
-    if (!have || samples == 0){
+    rj_val* o = rj_obj();
+    if (feerate != 0){
+        /* max(estimate, mempool min fee, min relay feerate) */
+        unsigned long long minpool = 0;
+        if (g_mph.polstate && g_mph.min_fee){ mpl(); minpool = g_mph.min_fee(g_mph.polstate); mpu(); }
+        unsigned long long minrelay = g_mph.min_relay_satkvb ? g_mph.min_relay_satkvb : 100ULL;
+        if (minpool > feerate) feerate = minpool;
+        if (minrelay > feerate) feerate = minrelay;
+        rj_obj_set(o, "feerate", fee_btc_per_kvb(feerate));
+    } else {
         rj_val* errs = rj_arr();
         rj_arr_push(errs, rj_str("Insufficient data or no feerate found"));
         rj_obj_set(o, "errors", errs);
-    } else {
-        unsigned long long floor_satkvb = 1000;   /* min relay fee, 0.00001 BTC/kvB */
-        if (satperkb < floor_satkvb) satperkb = floor_satkvb;
-        rj_obj_set(o, "feerate", rj_numf("%llu.%08llu", satperkb/100000000ULL, satperkb%100000000ULL));
     }
-    rj_obj_set(o, "blocks", rj_numf("%ld", blocks));
+    rj_obj_set(o, "blocks", rj_numf("%d", returned));
+    *res = o;
+    return 1;
+}
+
+static rj_val* fee_bucket_obj(const fest_bucket_t* b){
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "startrange", fee_dbl(fee_round(b->start)));
+    rj_obj_set(o, "endrange", fee_dbl(fee_round(b->end)));
+    rj_obj_set(o, "withintarget", fee_dbl(fee_round(b->within_target * 100.0) / 100.0));
+    rj_obj_set(o, "totalconfirmed", fee_dbl(fee_round(b->total_confirmed * 100.0) / 100.0));
+    rj_obj_set(o, "inmempool", fee_dbl(fee_round(b->in_mempool * 100.0) / 100.0));
+    rj_obj_set(o, "leftmempool", fee_dbl(fee_round(b->left_mempool * 100.0) / 100.0));
+    return o;
+}
+/* estimaterawfee conf_target (threshold=0.95): one object per horizon that
+ * tracks the target -- feerate/decay/scale/pass[/fail], or on no answer
+ * decay/scale/fail/errors -- with Core's rounding (rpc/fees.cpp). */
+static int cmd_estimaterawfee(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const void* fe = g_mph.feeest;
+    unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
+    int target = 0;
+    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    double threshold = 0.95;
+    if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        const rj_val* tv = params->items[1];
+        if (tv->typ != RJ_NUM){
+            static char msg[96]; snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(tv));
+            *ec = -3; *em = msg; return 0; }
+        threshold = atof(tv->str);
+    }
+    if (threshold < 0 || threshold > 1){ *ec = -8; *em = "Invalid threshold"; return 0; }
+    static const char* const names[3] = { "short", "medium", "long" };
+    static const unsigned defaults[3] = { 12u, 48u, 1008u };
+    rj_val* o = rj_obj();
+    for (int h = 0; h < 3; h++){
+        unsigned hi = (fe && fest_highest_target) ? fest_highest_target(fe, h) : defaults[h];
+        if ((unsigned)target > hi) continue;
+        fest_result_t r; memset(&r, 0, sizeof r);
+        r.pass.start = r.pass.end = r.fail.start = r.fail.end = -1;
+        unsigned long long feerate = 0;
+        if (fe && fest_estimate_raw){ mpl(); feerate = fest_estimate_raw(fe, target, threshold, h, &r); mpu(); }
+        else { r.decay = h == 0 ? 0.962 : h == 1 ? 0.9952 : 0.99931; r.scale = h == 0 ? 1 : h == 1 ? 2 : 24; }
+        rj_val* ho = rj_obj();
+        if (feerate != 0){
+            rj_obj_set(ho, "feerate", fee_btc_per_kvb(feerate));
+            rj_obj_set(ho, "decay", fee_dbl(r.decay));
+            rj_obj_set(ho, "scale", rj_numf("%u", r.scale));
+            rj_obj_set(ho, "pass", fee_bucket_obj(&r.pass));
+            if (r.fail.start != -1) rj_obj_set(ho, "fail", fee_bucket_obj(&r.fail));
+        } else {
+            rj_obj_set(ho, "decay", fee_dbl(r.decay));
+            rj_obj_set(ho, "scale", rj_numf("%u", r.scale));
+            rj_obj_set(ho, "fail", fee_bucket_obj(&r.fail));
+            rj_val* errs = rj_arr();
+            rj_arr_push(errs, rj_str("Insufficient data or no feerate found which meets threshold"));
+            rj_obj_set(ho, "errors", errs);
+        }
+        rj_obj_set(o, names[h], ho);
+    }
     *res = o;
     return 1;
 }
@@ -2136,7 +2223,7 @@ static const char* const NODE_METHODS[] = {
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
-    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "estimaterawfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
 
 const char* rpc_node_method_at(int i){
@@ -2200,6 +2287,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
     if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);
     if (!strcmp(m, "estimatesmartfee"))   return cmd_estimatesmartfee(params, res, ec, em);
+    if (!strcmp(m, "estimaterawfee"))     return cmd_estimaterawfee(params, res, ec, em);
     if (!strcmp(m, "prioritisetransaction"))      return cmd_prioritisetransaction(params, res, ec, em);
     if (!strcmp(m, "getprioritisedtransactions")) return cmd_getprioritisedtransactions(res);
     if (!strcmp(m, "submitblock"))        return cmd_submitblock(params, res, ec, em);
