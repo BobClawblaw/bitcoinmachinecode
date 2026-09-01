@@ -65,7 +65,7 @@ int main(void){
     {
         /* Each is a real Core token. Accepting any of them would mean the
          * operator believes something the node does not do. */
-        const char* recognised[] = { "mempool", "relay", "forcerelay",
+        const char* recognised[] = { "mempool",
                                      "download", "addr", "bloomfilter", 0 };
         int all = 1;
         for (int i = 0; recognised[i]; i++){
@@ -91,6 +91,24 @@ int main(void){
         ok(!netperm_add("noban,mempool@127.0.0.1", &e),
            "noban,mempool is refused rather than half-honoured");
     }
+
+    printf("== relay / forcerelay (2026-09-01: -whitelistrelay, -whitelistforcerelay) ==\n");
+    netperm_reset(); netperm_set_implicit_defaults(1, 0);           /* Core's defaults */
+    ok(add("relay@10.1.1.1") && (netperm_for("10.1.1.1") & NP_RELAY) && !(netperm_for("10.1.1.1") & NP_FORCERELAY),
+       "relay@ grants relay, not forcerelay");
+    ok(add("forcerelay@10.1.1.2") && (netperm_for("10.1.1.2") & NP_FORCERELAY) && (netperm_for("10.1.1.2") & NP_RELAY),
+       "forcerelay@ grants forcerelay AND relay (Core: forcerelay implies relay)");
+    ok(add("noban@10.1.1.3") && !(netperm_for("10.1.1.3") & NP_RELAY),
+       "an explicit noban@ list grants only what it names");
+    ok(add("10.1.1.4") && (netperm_for("10.1.1.4") & NP_NOBAN) && (netperm_for("10.1.1.4") & NP_RELAY) && !(netperm_for("10.1.1.4") & NP_FORCERELAY),
+       "an implicit entry gets noban+relay with Core's defaults (whitelistrelay=1, forcerelay=0)");
+    netperm_set_implicit_defaults(0, 0);
+    ok(!(netperm_for("10.1.1.4") & NP_RELAY) && (netperm_for("10.1.1.1") & NP_RELAY),
+       "whitelistrelay=0 strips relay from implicit entries only (explicit relay@ keeps it)");
+    netperm_set_implicit_defaults(1, 1);
+    ok((netperm_for("10.1.1.4") & NP_FORCERELAY) && (netperm_for("10.1.1.4") & NP_RELAY),
+       "whitelistforcerelay=1 gives implicit entries forcerelay+relay");
+    netperm_set_implicit_defaults(1, 0);
 
     printf("== malformed input is refused, not guessed at ==\n");
     netperm_reset();

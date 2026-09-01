@@ -115,6 +115,20 @@ static void default_stop(void){ kill(getpid(), SIGTERM); }
 static void (*g_stop_fn)(void) = default_stop;
 void rpc_chain_set_stop_handler(void (*fn)(void)){ g_stop_fn = fn ? fn : default_stop; }
 void rpc_chain_set_prune_mib(long mib){ g_prune_mib = mib; }
+/* -blockmaxweight/-blockreservedweight/-blockmintxfee/-blockversion/-printpriority
+ * and -maxtipage: injected by main.c from the config (this file never includes
+ * node_config.h). Defaults are Core's. */
+static long g_gbt_maxweight = 4000000, g_gbt_reserved = 8000, g_gbt_minfee_satkvb = 1;
+static int  g_gbt_version = 0, g_gbt_printpriority = 0;
+static long g_maxtipage = 86400;
+void rpc_chain_set_gbt_policy(long maxweight, long reserved, long minfee_satkvb, int version, int printpriority){
+    if (maxweight < 4000) maxweight = 4000; if (maxweight > 4000000) maxweight = 4000000;
+    if (reserved < 2000) reserved = 2000; if (reserved > maxweight) reserved = maxweight;
+    g_gbt_maxweight = maxweight; g_gbt_reserved = reserved;
+    g_gbt_minfee_satkvb = minfee_satkvb < 0 ? 0 : minfee_satkvb;
+    g_gbt_version = version; g_gbt_printpriority = printpriority;
+}
+void rpc_chain_set_maxtipage(long seconds){ g_maxtipage = seconds < 0 ? 0 : seconds; }
 
 #define ST_IDX_FD(st)     (*(long*)((u8*)(st)+8))
 #define ST_TIP(st)        (*(int*)((u8*)(st)+24))
@@ -968,7 +982,7 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
     rj_val* o = rj_obj();
     { rj_val* caps = rj_arr(); rj_arr_push(caps, rj_str("proposal"));
       rj_obj_set(o, "capabilities", caps); }
-    rj_obj_set(o, "version", rj_numf("%d", 536870912));      /* 0x20000000 */
+    rj_obj_set(o, "version", rj_numf("%d", g_gbt_version ? g_gbt_version : 536870912));  /* 0x20000000 unless -blockversion */
     { rj_val* rls = rj_arr();
       rj_arr_push(rls, rj_str("csv")); rj_arr_push(rls, rj_str("!segwit"));
       rj_arr_push(rls, rj_str("taproot"));
@@ -1121,7 +1135,10 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
             corder[j+1] = v;
         }
         long emitted_n = 0;
-        long long budget_w = 4000000 - 4000, budget_s = 80000 - 400;
+        /* Core: MAX_BLOCK_WEIGHT - reserved (the coinbase and header the
+         * miner adds); -blockmaxweight caps the template lower. Sigops keep
+         * the same proportional reserve. */
+        long long budget_w = g_gbt_maxweight - g_gbt_reserved, budget_s = 80000 - (80000LL * g_gbt_reserved) / 4000000;
         long long used_w = 0, used_s = 0;
         static unsigned char cluster_skipped[GBT_MAX_TX];
         for (int i = 0; i < cluster_no; i++) cluster_skipped[i] = 0;
@@ -1129,6 +1146,13 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
             const gbt_chunk* c = &chunks[corder[ci]];
             if (cluster_skipped[c->cluster]) continue;
             if (used_w + c->w > budget_w || used_s + c->s > budget_s){ cluster_skipped[c->cluster] = 1; continue; }
+            /* -blockmintxfee: a chunk paying below it is left out (Core's
+             * BlockAssembler stops at the first package under the floor) */
+            if (c->size && (unsigned __int128)c->fee * 1000 < (unsigned __int128)g_gbt_minfee_satkvb * c->size){ cluster_skipped[c->cluster] = 1; continue; }
+            if (g_gbt_printpriority)
+                fprintf(stderr, "[gbt] chunk of %d tx: fee %llu sat, %llu vB, %.8f BTC/kvB\n", c->cnt,
+                        (unsigned long long)c->fee, (unsigned long long)c->size,
+                        c->size ? (double)c->fee / (double)c->size * 1000.0 / 1e8 : 0.0);
             for (int k = 0; k < c->cnt; k++){ emitted[cmem[c->start + k]] = 1; order[emitted_n++] = cmem[c->start + k]; }
             used_w += c->w; used_s += c->s;
         }
@@ -1389,7 +1413,7 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
     if (prog > 1.0) prog = 1.0;
     rj_obj_set(o, "verificationprogress", rj_double(prog));
-    rj_obj_set(o, "initialblockdownload", rj_bool((time_t)t < time(NULL) - 24*3600));
+    rj_obj_set(o, "initialblockdownload", rj_bool((time_t)t < time(NULL) - g_maxtipage));   /* -maxtipage */
     u8 cw[16]; if (chainwork_at(tip, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
     rj_obj_set(o, "size_on_disk", rj_numf("%lld", size_on_disk()));
     int pruned = g_prune_mib != 0 || ST_PRUNE_H(g_st) > 0;

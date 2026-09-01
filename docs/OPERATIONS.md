@@ -586,3 +586,39 @@ Outside the chain directory: `<datadir>/bitcoin.conf` or
 `<repo>/config/bitcoin.conf`; `<repo>/logs/<chain>/bitcoin.<chain>.log`;
 `<repo>/asm/daemon/bitcoind.live` and `bitcoind.deploy-*`;
 `<repo>/config/logrotate-bmc.conf`.
+
+## Config options added 2026-09-01 (Core names, Core defaults)
+
+`config/bitcoin.sample.conf` documents every key. Of note for operators:
+
+- `uacomment=<text>` (repeatable) appears in the user agent on the wire and in
+  `getnetworkinfo`; `( ) / \ ; :` and control characters are refused.
+- `peerblockfilters=1` is now required to serve BIP157 filters and to
+  advertise `NODE_COMPACT_FILTERS` — Core's default is 0 and this node follows
+  it. `blockfilterindex=` still controls whether the index is maintained.
+- `rpcwhitelist=<user>:<m1>,<m2>` locks an RPC user to a method list (HTTP
+  403 otherwise); once any whitelist exists, users without one may call
+  nothing unless `rpcwhitelistdefault=0`. `rpcthreads`/`rpcworkqueue` size the
+  HTTP server (503 "Work queue depth exceeded" past the queue);
+  `rpcservertimeout` bounds a slow client. `rpccookieperms=group|all` widens
+  the cookie file's mode (0640 / 0644).
+- Wallet: `addresstype`/`changetype` pick what `getnewaddress` and change
+  use (a type must be activated with `createwalletdescriptor` first);
+  `fallbackfee` is 0 by default, so with no fee estimate a send fails with
+  Core's "Fee estimation failed. Fallbackfee is disabled..." — set it (BTC/kvB)
+  on a fresh node. `walletbroadcast=0` returns txids without broadcasting.
+  `walletnotify=<cmd>` runs with `%s` = txid on mempool arrival and on
+  confirmation. `wallet=<name>` loads a named wallet at start-up (one active
+  wallet at a time; further names are logged as skipped).
+- Mining: `blockmaxweight`, `blockreservedweight`, `blockmintxfee`
+  (BTC/kvB), `blockversion`, `printpriority` shape `getblocktemplate`.
+- Logging: `logtimestamps=0`, `logtimemicros=1`, `logthreadnames=1`,
+  `logsourcelocations=1` change the stderr prefix from the point the config
+  is read; `shrinkdebugfile` (default 1) truncates a `debuglogfile` over
+  10 MB to its last 200 KB at start-up.
+- `includeconf=<file>` (relative to the main file's directory) is read after
+  it; an included file may not include another.
+- Core options that are accepted WITHOUT effect are each named at start-up
+  with the reason (`[config] <key>= is a Bitcoin Core option that has NO
+  EFFECT here: ...`); the full classification of all 181 Core options is in
+  `docs/FEATURE_GAPS.md`.

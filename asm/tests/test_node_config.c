@@ -291,6 +291,74 @@ int main(void){
      * success path. They now live in the private working directory, which goes
      * away on every exit path including a crash. */
 
+    /* ---- 2026-09-01: option-surface completion ---- */
+    wr("cs1.conf",
+       "uacomment=hello\nuacomment=bad(paren)\nuacomment=second one\n"
+       "blockmaxweight=3000000\nblockreservedweight=4000\nblockmintxfee=0.00001\nblockversion=536870913\nprintpriority=1\n"
+       "mintxfee=0.00002\nfallbackfee=0.0002\ndiscardfee=0.00005\nconsolidatefeerate=0.00003\nmaxapsfee=-1\n"
+       "avoidpartialspends=1\nspendzeroconfchange=0\nwalletrbf=0\ntxconfirmtarget=3\nwalletbroadcast=0\nkeypool=50\n"
+       "walletnotify=/bin/true %s\nwallet=alpha\nwallet=beta\nwallet=has/slash\naddresstype=legacy\nchangetype=bech32m\n"
+       "maxtipage=3600\ninboundrelaypercent=25\nwhitelistrelay=0\nwhitelistforcerelay=1\npeerblockfilters=1\nfixedseeds=0\n"
+       "logtimestamps=0\nlogtimemicros=1\nlogthreadnames=1\nlogsourcelocations=1\nshrinkdebugfile=0\n"
+       "rpcthreads=4\nrpcworkqueue=8\nrpcservertimeout=5\nrpcwhitelist=alice:getblockcount,getbestblockhash\nrpcwhitelist=nocolon\n"
+       "rpcwhitelistdefault=0\nrpccookieperms=group\nlimitclustercount=30\nlimitclustersize=50\n"
+       "addresstype=nonsense\ntxconfirmtarget=5000\nblockmaxweight=1\n");
+    node_config_load("cs1.conf");
+    if (g_cfg.n_uacomment==2 && !strcmp(g_cfg.uacomment[0],"hello") && !strcmp(g_cfg.uacomment[1],"second one"))
+        printf("PASS: uacomment: two safe comments kept, the one with parentheses refused\n");
+    else { printf("FAIL: uacomment (n=%d)\n", g_cfg.n_uacomment); failures++; }
+    if (g_cfg.blockmaxweight==3000000 && g_cfg.blockreservedweight==4000 && g_cfg.blockmintxfee_satkvb==1000 && g_cfg.blockversion==536870913 && g_cfg.printpriority==1)
+        printf("PASS: mining options parsed (blockmintxfee 0.00001 BTC/kvB = 1000 sat/kvB); blockmaxweight=1 refused\n");
+    else { printf("FAIL: mining options (%d %d %ld %d)\n", g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb, g_cfg.blockversion); failures++; }
+    if (g_cfg.mintxfee_satkvb==2000 && g_cfg.fallbackfee_satkvb==20000 && g_cfg.discardfee_satkvb==5000 && g_cfg.consolidatefeerate_satkvb==3000 && g_cfg.maxapsfee_sat==-1)
+        printf("PASS: wallet fee options in sat/kvB; maxapsfee=-1 means always\n");
+    else { printf("FAIL: wallet fees (%ld %ld %ld %ld %ld)\n", g_cfg.mintxfee_satkvb, g_cfg.fallbackfee_satkvb, g_cfg.discardfee_satkvb, g_cfg.consolidatefeerate_satkvb, g_cfg.maxapsfee_sat); failures++; }
+    if (g_cfg.avoidpartialspends==1 && g_cfg.spendzeroconfchange==0 && g_cfg.walletrbf==0 && g_cfg.txconfirmtarget==3 && g_cfg.walletbroadcast==0 && g_cfg.keypool==50)
+        printf("PASS: wallet bools/ints; txconfirmtarget=5000 (over 1008) refused, 3 kept\n");
+    else { printf("FAIL: wallet bools (%d %d %d %d %d %d)\n", g_cfg.avoidpartialspends, g_cfg.spendzeroconfchange, g_cfg.walletrbf, g_cfg.txconfirmtarget, g_cfg.walletbroadcast, g_cfg.keypool); failures++; }
+    if (!strcmp(g_cfg.walletnotify, "/bin/true %s") && g_cfg.n_wallet_names==2 && !strcmp(g_cfg.wallet_names[1],"beta"))
+        printf("PASS: walletnotify kept; wallet= names collected, a path refused\n");
+    else { printf("FAIL: walletnotify/wallet (%s n=%d)\n", g_cfg.walletnotify, g_cfg.n_wallet_names); failures++; }
+    if (!strcmp(g_cfg.addresstype,"legacy") && !strcmp(g_cfg.changetype,"bech32m"))
+        printf("PASS: addresstype/changetype validated (nonsense refused, legacy kept)\n");
+    else { printf("FAIL: address types (%s/%s)\n", g_cfg.addresstype, g_cfg.changetype); failures++; }
+    if (g_cfg.maxtipage==3600 && g_cfg.inboundrelaypercent==25 && g_cfg.whitelistrelay==0 && g_cfg.whitelistforcerelay==1 && g_cfg.peerblockfilters==1 && g_cfg.fixedseeds==0)
+        printf("PASS: peer options parsed\n");
+    else { printf("FAIL: peer options\n"); failures++; }
+    if (g_cfg.logtimestamps==0 && g_cfg.logtimemicros==1 && g_cfg.logthreadnames==1 && g_cfg.logsourcelocations==1 && g_cfg.shrinkdebugfile==0)
+        printf("PASS: logging options parsed\n");
+    else { printf("FAIL: logging options\n"); failures++; }
+    if (g_cfg.rpcthreads==4 && g_cfg.rpcworkqueue==8 && g_cfg.rpcservertimeout==5 && g_cfg.n_rpcwhitelist==1 && g_cfg.rpcwhitelistdefault==0 && g_cfg.rpccookieperms==1)
+        printf("PASS: rpc server options; a whitelist without ':' refused\n");
+    else { printf("FAIL: rpc options (%d %d %d n=%d d=%d p=%d)\n", g_cfg.rpcthreads, g_cfg.rpcworkqueue, g_cfg.rpcservertimeout, g_cfg.n_rpcwhitelist, g_cfg.rpcwhitelistdefault, g_cfg.rpccookieperms); failures++; }
+    if (g_cfg.limitclustercount==30 && g_cfg.limitancestorcount==30 && g_cfg.limitdescendantcount==30 && g_cfg.limitclustersize_kvb==50 && g_cfg.limitancestorsize_kvb==50)
+        printf("PASS: limitclustercount/size map onto the ancestor and descendant limits\n");
+    else { printf("FAIL: cluster limits\n"); failures++; }
+    /* includeconf: relative to the main file, once, not from an included file */
+    wr("inc_main.conf", "maxconnections=77\nincludeconf=inc_a.conf\n");
+    wr("inc_a.conf", "maxconnections=88\ndbcache=2048\nincludeconf=inc_b.conf\n");
+    wr("inc_b.conf", "maxconnections=99\n");
+    node_config_load("inc_main.conf");
+    if (g_cfg.max_connections==88 && g_cfg.dbcache_mb==2048)
+        printf("PASS: includeconf read after the main file (its value wins), nested includeconf ignored\n");
+    else { printf("FAIL: includeconf (conns=%d dbcache=%d)\n", g_cfg.max_connections, g_cfg.dbcache_mb); failures++; }
+    /* signetseednode applies only on signet */
+    wr("sig1.conf", "signetseednode=1.2.3.4:38333\nchain=signet\n");
+    node_config_load("sig1.conf");
+    int sig_ok = g_cfg.n_seednode==1 && !strcmp(g_cfg.seednode[0],"1.2.3.4:38333");
+    wr("sig2.conf", "signetseednode=1.2.3.4:38333\nchain=main\n");
+    node_config_load("sig2.conf");
+    if (sig_ok && g_cfg.n_seednode==0) printf("PASS: signetseednode becomes a seednode on signet only\n");
+    else { printf("FAIL: signetseednode (signet ok=%d main n=%d)\n", sig_ok, g_cfg.n_seednode); failures++; }
+    /* no-effect Core options are recognised with a reason */
+    if (nodecfg_noeffect_reason("mocktime") && nodecfg_noeffect_reason("rest") && !nodecfg_noeffect_reason("uacomment") && !nodecfg_noeffect_reason("dbcache"))
+        printf("PASS: no-effect table names mocktime/rest, not implemented keys\n");
+    else { printf("FAIL: no-effect table\n"); failures++; }
+    node_config_load("/nonexistent/reset.conf");
+    if (g_cfg.blockmaxweight==4000000 && g_cfg.txconfirmtarget==6 && g_cfg.walletrbf==1 && g_cfg.rpcthreads==16 && g_cfg.maxtipage==86400 && !strcmp(g_cfg.addresstype,"bech32") && g_cfg.n_uacomment==0)
+        printf("PASS: Core defaults restored on reload\n");
+    else { printf("FAIL: defaults after reload\n"); failures++; }
+
     printf("\n");
     node_config_log();
     if (failures) printf("\nFAILURES: %d\n", failures);

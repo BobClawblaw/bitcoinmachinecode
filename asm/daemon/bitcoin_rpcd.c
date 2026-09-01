@@ -254,6 +254,19 @@ int main(int argc, char** argv) {
     cfg.user = user;
     cfg.pass = pass;
     cfg.wallet = &g_wallet;
+    /* test hooks for the 2026-09-01 server options (the daemon reads them
+     * from bitcoin.conf; this tool has no config file) */
+    { const char* e;
+      if ((e = getenv("TEST_RPC_THREADS")) && *e)   cfg.threads   = atoi(e);
+      if ((e = getenv("TEST_RPC_WORKQUEUE")) && *e) cfg.workqueue = atoi(e);
+      if ((e = getenv("TEST_RPC_TIMEOUT")) && *e)   cfg.timeout_s = atoi(e);
+      if ((e = getenv("TEST_RPC_WHITELIST")) && *e){          /* "user:m1,m2;user2:m3" */
+          char buf[1024]; snprintf(buf, sizeof buf, "%s", e);
+          char* save = NULL;
+          for (char* t = strtok_r(buf, ";", &save); t; t = strtok_r(NULL, ";", &save))
+              if (!rpc_whitelist_add(t)) fprintf(stderr, "bitcoin_rpcd: bad TEST_RPC_WHITELIST entry %s\n", t);
+      }
+      if ((e = getenv("TEST_RPC_WHITELIST_DEFAULT")) && *e) rpc_whitelist_set_default(atoi(e)); }
 
     int actual = 0;
     char errmsg[256];
