@@ -976,6 +976,39 @@ static int bip30_enforced(long height, const u8 hash32[32])
 static const char* g_last_reject = "";
 const char* utxo_live_last_reject(void){ return g_last_reject; }
 
+/* ---- failure classification + honest recovery (incident 2026-09-01) ----
+ * utxo_live_catchup() used to fail with a bare -1 and daemon/main.c treated
+ * EVERY failure as "manifest full": compact in place, retry, and call the
+ * retry's success proof that the failure was benign. On 2026-09-01 eight
+ * consensus REJECTs ("input references a missing/already-spent UTXO", caused
+ * by b3d47a9's sparse-index offsets) were "recovered" that way, and each
+ * round silently lost the spends of the block applied just before the
+ * failure: 2,596 spent coins resurrected, muhash parity broken from height
+ * 539,017 to the tip. So:
+ *   - every failure is CLASSIFIED (consensus reject / store error / other);
+ *   - utxo_live_recovery_applicable() admits compaction ONLY for a store
+ *     error with a genuinely full manifest -- the one condition compaction
+ *     actually cures;
+ *   - utxo_live_verify_after_recovery(count_before) walks the whole set and
+ *     requires walk == counter == the pre-recovery count. A mismatch HALTS
+ *     UTXO tracking for the life of the process (utxo_live_halted()); the
+ *     operator drops and rebuilds. Continuing on an inconsistent set is how
+ *     the damage became permanent last time. */
+#define UTXO_FAIL_NONE   0
+#define UTXO_FAIL_REJECT 1   /* verification refused the block: utxo_live_last_reject() names it */
+#define UTXO_FAIL_STORE  2   /* a put/del/flush/WAL step returned an error */
+#define UTXO_FAIL_OTHER  3   /* hole/short block, partial-block recovery failure */
+static int  g_last_fail_kind = UTXO_FAIL_NONE;
+static long g_last_fail_height = -1;
+static int  g_halted = 0;
+long utxo_live_last_fail_kind(void){ return g_last_fail_kind; }
+long utxo_live_last_fail_height(void){ return g_last_fail_height; }
+long utxo_live_halted(void){ return g_halted; }
+const char* utxo_live_fail_kind_name(long k){
+    return k == UTXO_FAIL_REJECT ? "consensus-reject" : k == UTXO_FAIL_STORE ? "store-error"
+         : k == UTXO_FAIL_OTHER ? "archive/recovery" : "none";
+}
+
 /* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
  * The RPC server runs in the serve PARENT and has no handle on this state --
  * the download worker (this process) owns it. Called ONLY from the worker's
@@ -1291,7 +1324,15 @@ static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     undo_close_current();
     if (utxo_store_wal_drain(&g_utxo_lst) != 0) {
         fprintf(stderr, "[utxo_live] FATAL: WAL drain failed after height %ld\n", height);
+        g_last_fail_kind = UTXO_FAIL_STORE; g_last_fail_height = height;
         return 0;
+    }
+    if (!r) {
+        /* apply_block_inner clears g_last_reject at entry and sets it on
+         * every verification refusal; a failure with it still empty came
+         * from the store (put/del -1, table full) -- see live_on_input/output. */
+        g_last_fail_kind = g_last_reject[0] ? UTXO_FAIL_REJECT : UTXO_FAIL_STORE;
+        g_last_fail_height = height;
     }
     return r;
 }
@@ -1994,8 +2035,10 @@ long utxo_live_catchup(void* store_buf){
         g_recovery_checked = 1;
         g_recovery_result = utxo_live_recover_partial_block(store_buf);
     }
-    if (g_recovery_result < 0) return -1;
+    if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; return -1; }
+    if (g_halted) return -1;          /* utxo_live_verify_after_recovery() found the set inconsistent */
     if (tip < 0 || tip <= g_applied_height) return 0;
+    g_last_fail_kind = UTXO_FAIL_NONE;
 
     static u8 blockbuf[8<<20];
     long applied = 0;
@@ -2010,6 +2053,7 @@ long utxo_live_catchup(void* store_buf){
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         if (len < 81) {
             fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
+            g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
             break;
         }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
@@ -2218,6 +2262,46 @@ long utxo_live_recover(void){
         rounds++;
     }
     return rounds;
+}
+
+/* Is compaction the right answer to the last failure? Only for a store
+ * error with a full manifest (mac_flush refuses to add a run once manifest_n
+ * reaches manifest_cap, and every later put/del fails). Anything else --
+ * a consensus reject above all -- is NOT cured by merging runs, and merging
+ * runs under a failure we do not understand is exactly what lost 2,596
+ * spends on 2026-09-01. Logs its verdict either way so the operator sees
+ * WHY the node did or did not compact. */
+long utxo_live_recovery_applicable(void){
+    unsigned long n = (unsigned long)g_utxo_lst.manifest_n, cap = (unsigned long)g_utxo_lst.manifest_cap;
+    if (g_last_fail_kind == UTXO_FAIL_STORE && cap && n >= cap){
+        fprintf(stderr, "[utxo_live] recovery applicable: store error at height %ld with a FULL manifest (%lu/%lu runs)\n",
+                g_last_fail_height, n, cap);
+        return 1;
+    }
+    fprintf(stderr, "[utxo_live] recovery REFUSED: failure at height %ld is %s (%s), manifest %lu/%lu -- compaction would not cure it\n",
+            g_last_fail_height, utxo_live_fail_kind_name(g_last_fail_kind),
+            g_last_fail_kind == UTXO_FAIL_REJECT ? g_last_reject : "-", n, cap);
+    return 0;
+}
+
+/* After a recovery compaction: the set must be exactly what it was before
+ * (the failed block was rolled back before recovery ran), by the ground-
+ * truth walk, and the O(1) counter must agree. Any other outcome means the
+ * merge changed the set -- halt, loudly, permanently for this process. */
+long utxo_live_walk_count(void);
+long utxo_live_verify_after_recovery(long count_before){
+    if (g_halted){ fprintf(stderr, "[utxo_live] post-recovery check: already HALTED -- stays halted\n"); return 0; }
+    long walk = utxo_live_walk_count();
+    long counter = utxo_lsm_count(&g_utxo_lst);
+    if (walk >= 0 && walk == count_before && counter == count_before){
+        fprintf(stderr, "[utxo_live] post-recovery check OK: walk=%ld == counter=%ld == pre-recovery count\n", walk, counter);
+        return 1;
+    }
+    g_halted = 1;
+    fprintf(stderr, "[utxo_live] POST-RECOVERY CHECK FAILED: walk=%ld counter=%ld pre-recovery=%ld -- the compaction changed the set. "
+                    "UTXO tracking HALTED for this process; operator: drop and rebuild the UTXO state (archive_drop_utxo_state), do not trust gettxoutsetinfo until then\n",
+            walk, counter, count_before);
+    return 0;
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }
