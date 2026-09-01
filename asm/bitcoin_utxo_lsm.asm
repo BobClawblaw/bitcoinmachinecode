@@ -287,6 +287,66 @@ extern utxo_store_close
 
 ; ============================================================================
 ; small local helpers
+
+; ============================================================================
+; mac_fl_write(fd=rdi, src=rsi, len=rdx) -> rax 0 ok / nonzero error
+;   Same contract as mac_write_exact, but appends to mac_fl_buf and only
+;   writes when the buffer would overflow (a record larger than the buffer
+;   goes straight out after a drain). Single-threaded: mac_flush runs in the
+;   writer alone.
+; mac_fl_drain(fd=rdi) -> rax 0 ok / nonzero error: write out what is buffered.
+; ============================================================================
+mac_fl_write:
+    push rbx
+    push r12
+    push r13
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  rbx, rdx
+    mov  rax, [rel mac_fl_fill]
+    add  rax, rbx
+    cmp  rax, MAC_FLBUF
+    jbe  .flw_append
+    mov  rdi, r12
+    call mac_fl_drain
+    test rax, rax
+    jnz  .flw_done
+    cmp  rbx, MAC_FLBUF
+    jbe  .flw_append
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, rbx
+    call mac_write_exact
+    jmp  .flw_done
+.flw_append:
+    lea  rdi, [rel mac_fl_buf]
+    add  rdi, [rel mac_fl_fill]
+    mov  rsi, r13
+    mov  rdx, rbx
+    call mac_memcpy
+    add  [rel mac_fl_fill], rbx
+    xor  eax, eax
+.flw_done:
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+mac_fl_drain:
+    push rbx
+    mov  rbx, [rel mac_fl_fill]
+    test rbx, rbx
+    jz   .fld_empty
+    lea  rsi, [rel mac_fl_buf]
+    mov  rdx, rbx
+    call mac_write_exact            ; rdi = fd (unchanged)
+    mov  qword [rel mac_fl_fill], 0
+    pop  rbx
+    ret
+.fld_empty:
+    xor  eax, eax
+    pop  rbx
+    ret
+
 ; ============================================================================
 
 ; mac_memcpy(dst=rdi, src=rsi, n=rdx) -- preserves nothing special, trivial
@@ -2062,6 +2122,7 @@ mac_flush:
     test rax, rax
     jl   .fl_err
     mov  [rbp-0x88], rax             ; fd
+    mov  qword [rel mac_fl_fill], 0  ; fresh record buffer for this run
 
     mov  dword [rbp-0x100], MAGIC_RUN3     ; new PUSH record shape (Stage D)
     mov  rax, [r12+96]                ; next_gen
@@ -2132,7 +2193,7 @@ mac_flush:
 .fl_wr_nosample:
     push rsi
     mov  rdx, 37
-    call mac_write_exact
+    call mac_fl_write
     pop  rsi
     test rax, rax
     jnz  .fl_err_close
@@ -2148,7 +2209,7 @@ mac_flush:
     push rsi
     mov  rsi, rax
     mov  rdx, 15
-    call mac_write_exact
+    call mac_fl_write
     pop  rsi
     test rax, rax
     jnz  .fl_err_close
@@ -2160,7 +2221,7 @@ mac_flush:
     push rsi
     mov  rsi, r9
     mov  rdx, r14
-    call mac_write_exact
+    call mac_fl_write
     pop  rsi
     test rax, rax
     jnz  .fl_err_close
@@ -2168,6 +2229,11 @@ mac_flush:
     inc  qword [rbp-0x80]
     jmp  .fl_wr_loop
 .fl_wr_done:
+    ; drain the buffered records BEFORE the SEEK_CUR below reads the offset
+    mov  rdi, [rbp-0x88]
+    call mac_fl_drain
+    test rax, rax
+    jnz  .fl_err_close
     ; ---- write the sparse index right after the last record, then seek
     ; back to patch sparse_off/sparse_n into the header -- the same seek-
     ; back-and-patch shape this file's own compaction write path already
@@ -2781,6 +2847,15 @@ section .bss
 mac_ow_fd:   resq 1
 mac_ow_fill: resq 1
 mac_ow_buf:  resb MAC_OWBUF
+; ---- mac_flush's buffered record writer (2026-09-01) --------------------
+; mac_flush wrote every record with three tiny write()s (37-byte key +
+; offset, 15-byte value/height/slen, script): ~90M syscalls per 30M-record
+; flush, a 100 s stall in the replay. Records now accumulate here and go
+; out 1 MB at a time; the buffer is drained before anything positional
+; (the SEEK_CUR that locates the sparse index, the header patch, fsync).
+MAC_FLBUF equ 1048576
+mac_fl_fill: resq 1
+mac_fl_buf:  resb MAC_FLBUF
 ; ---- background compaction support (2026-08-31) --------------------------
 ; mac_compact_defer_unlink: when non-zero, utxo_lsm_compact publishes the new
 ;   manifest as usual but leaves its INPUT run files on disk. A forked child
