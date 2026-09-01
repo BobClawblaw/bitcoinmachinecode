@@ -1955,6 +1955,22 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     if(g_node_status && !g_node_status->net_active) return;
     /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
     int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    /* ...and never onto a host another live leg already holds: each leg
+     * rotates its own pointer, so two legs could land on one peer (deploy g,
+     * 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared by HOST,
+     * so a book carrying one peer under two ports still yields one leg. */
+    { char me[128];
+      for(int tries = 0; tries < pool_len; tries++){
+          ctl_ip_only(peers[p], me, sizeof me);
+          int held = 0;
+          for(int k = 0; k < mux_n_out && !held; k++){
+              if(k == i || mux_out_fd[k] < 0) continue;
+              char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
+              if(me[0] && !strcmp(me, other)) held = 1;
+          }
+          if(!held) break;
+          p = (p + 1) % (pool_len > 0 ? pool_len : 1);
+      } }
     mux_out_peer[i] = p;
     /* a banned peer is not dialed. Checked HERE for the same reason: this is
      * the only path to a new outbound leg. */
