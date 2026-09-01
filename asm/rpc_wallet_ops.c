@@ -3069,7 +3069,16 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
     char* hex; rj_val* pv; unsigned long long fee; int cp;
     if (!wf_fund(w, outs, nout, 6, &hex, &pv, &fee, &cp, ec, em)) return 0;
     rj_free(pv);
-    rj_val* p = rj_arr(); rj_arr_push(p, rj_str(hex));
+    /* options.psbt_version (Core: default 2, 0 or 2) -- the options object is
+     * any object argument after the outputs */
+    long pver = 2;
+    if (params && params->typ == RJ_ARR){ int seen_outs = 0;
+        for (size_t i = 0; i < params->nitems; i++){ const rj_val* a = params->items[i];
+            if (a == outs_arg){ seen_outs = 1; continue; }
+            if (seen_outs && a->typ == RJ_OBJ){ rj_val* v = rj_obj_get((rj_val*)a, "psbt_version");
+                if (v && v->typ == RJ_NUM){ pver = strtol(v->str, 0, 10);
+                    if (pver != 0 && pver != 2){ free(hex); return wop_err(ec, em, -8, "The PSBT version can only be 2 or 0"); } } } } }
+    rj_val* p = rj_arr(); rj_arr_push(p, rj_str(hex)); rj_arr_push(p, rj_bool(0)); rj_arr_push(p, rj_null()); rj_arr_push(p, rj_numf("%ld", pver));
     rj_val* r = NULL;
     int rc = rpc_dispatch("converttopsbt", p, w, &r, ec, em);
     rj_free(p);

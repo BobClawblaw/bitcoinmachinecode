@@ -830,10 +830,18 @@ static char* psbt_wrap_unsigned(const unsigned char* tx, long n, size_t nin, siz
     char* b64=malloc((size_t)((p+2)/3)*4 + 1); if (!b64) return NULL;
     crt_b64(b64, psbt, p); return b64;
 }
+static void psbt_wr32(unsigned char* p, unsigned v);
+static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em);
+static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
     if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
-    char* b64=psbt_wrap_unsigned(tx,n,nin,nout); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
+        long v = strtol(params->items[4]->str, 0, 10);
+        if (v < 1 || v > 0x7fffffffL){ *ec = -8; *em = "Invalid parameter, version must be between 1 and 2147483647"; return 0; }
+        psbt_wr32(tx, (unsigned)v); }
+    int ver; if (!psbt_version_arg(params, 5, &ver, ec, em)) return 0;
+    char* b64=psbt_wrap_version(tx,n,nin,nout,ver); if (!b64){ *ec=-7; *em="oom"; return 0; }
     *result=rj_str(b64); free(b64);
     return 1;
 }
@@ -875,7 +883,8 @@ static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj
     /* locktime: last 4 bytes of the tx (witness, if any, sits before locktime) */
     utx[u++]=raw[txlen-4];utx[u++]=raw[txlen-3];utx[u++]=raw[txlen-2];utx[u++]=raw[txlen-1];
     if (had_sig && !permitsig){ *ec=-22; *em="Inputs must not have scriptSigs and scriptWitnesses"; return 0; }
-    char* b64=psbt_wrap_unsigned(utx,u,(size_t)n_in,(size_t)n_out); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    int ver; if (!psbt_version_arg(params, 3, &ver, ec, em)) return 0;
+    char* b64=psbt_wrap_version(utx,u,(size_t)n_in,(size_t)n_out,ver); if (!b64){ *ec=-7; *em="oom"; return 0; }
     *result=rj_str(b64); free(b64);
     return 1;
 }
@@ -904,6 +913,282 @@ static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed)
 static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, unsigned long n){
     char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
 }
+typedef struct { const unsigned char* k; unsigned long kl; const unsigned char* v; unsigned long vl; } psbt_kv;
+static int psbt_parse_map(const unsigned char* buf, long blen, long* pp, psbt_kv* kvs, int cap){
+    int n=0; long p=*pp;
+    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if(kl==0){ *pp=p; return n; }
+        const unsigned char* k=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* v=buf+p; p+=vl;
+        if(n<cap){ kvs[n].k=k;kvs[n].kl=kl;kvs[n].v=v;kvs[n].vl=vl;n++; }
+    }
+    *pp=p; return n;
+}
+static int psbt_union(psbt_kv* dst, int dn, int dcap, const psbt_kv* src, int sn){
+    for(int i=0;i<sn && dn<dcap;i++){
+        int dup=0; for(int j=0;j<dn;j++) if(dst[j].kl==src[i].kl && !memcmp(dst[j].k,src[i].k,src[i].kl)){ dup=1; break; }
+        if(!dup) dst[dn++]=src[i];
+    }
+    return dn;
+}
+static long psbt_ser_map(unsigned char* out, const psbt_kv* kvs, int n){
+    long o=0;
+    for(int i=0;i<n;i++){ o+=crt_varint(out+o,(unsigned long long)kvs[i].kl); memcpy(out+o,kvs[i].k,kvs[i].kl); o+=kvs[i].kl;
+        o+=crt_varint(out+o,(unsigned long long)kvs[i].vl); memcpy(out+o,kvs[i].v,kvs[i].vl); o+=kvs[i].vl; }
+    out[o++]=0x00; return o;
+}
+#define PSBT_MAXP 16
+#define PSBT_MAXKV 128
+#define PSBT_MAXIO 1000
+typedef struct {
+    const unsigned char* op;      /* 36-byte outpoint */
+    const unsigned char* ss;  unsigned long sslen;   /* scriptSig */
+    const unsigned char* wit; unsigned long witlen;  /* serialized witness stack */
+    unsigned witems;
+    unsigned seq;
+} crt_in_t;
+static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, int cap, int* n_in_out, unsigned long* out_start, unsigned long* out_end, int* segwit_out);
+
+/* ==== PSBT v2 (BIP370), 2026-09-01 ============================================
+ * Every PSBT RPC works on a v0-SHAPED buffer: the global map begins with the
+ * unsigned transaction, real (v0) or SYNTHESIZED from the v2 fields
+ * (tx_version, per-input previous txid/index/sequence, required locktimes
+ * folded per BIP370, per-output amount/script). The v2 per-input and
+ * per-output keys stay inside their maps untouched, so every role that
+ * copies "other" keys through keeps them, and psbt_v2_emit turns the result
+ * back into the caller's version: strips the unsigned tx, re-adds the v2
+ * globals, fills the v2 input/output keys a Creator implies, and sorts every
+ * map by key -- Core's serialization order -- so a v2 that Core produced
+ * comes back byte-identical. The validation messages are Core's
+ * (psbt.h), prefixed "TX decode failed " the way DecodeBase64PSBT's caller
+ * reports them. */
+typedef struct {
+    int version;                       /* 0 or 2 */
+    unsigned tx_version;
+    int has_fallback; unsigned fallback_locktime;
+    int has_mod; unsigned char mod;
+    int created;                       /* built from a tx here: sequences are written (Core's constructor sets them) */
+    int locktime_conflict;             /* inputs' required locktimes cannot be satisfied together */
+    unsigned long n_in, n_out;
+} psbt_v2meta;
+static char g_psbt_errbuf[192];
+static const char* psbt_v2_fail(const char* what){ snprintf(g_psbt_errbuf, sizeof g_psbt_errbuf, "TX decode failed %s", what); return g_psbt_errbuf; }
+static unsigned psbt_rd32(const unsigned char* p){ return (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24); }
+static void psbt_wr32(unsigned char* p, unsigned v){ p[0]=(unsigned char)v; p[1]=(unsigned char)(v>>8); p[2]=(unsigned char)(v>>16); p[3]=(unsigned char)(v>>24); }
+static int psbt_kv_cmp(const void* a, const void* b){
+    const psbt_kv* x = a; const psbt_kv* y = b;
+    unsigned long n = x->kl < y->kl ? x->kl : y->kl;
+    int c = memcmp(x->k, y->k, n); if (c) return c;
+    return x->kl < y->kl ? -1 : x->kl > y->kl ? 1 : 0;
+}
+/* Any PSBT -> v0-shaped buffer. Returns the length, or -1 with *err set. */
+static long psbt_v2_normalize(const unsigned char* in, long inlen, unsigned char* out, long cap, psbt_v2meta* m, const char** err){
+    memset(m, 0, sizeof *m);
+    if (inlen < 5 || memcmp(in, "psbt\xff", 5)){ *err = "TX decode failed"; return -1; }
+    long p = 5; static psbt_kv g[PSBT_MAXKV]; int gn = psbt_parse_map(in, inlen, &p, g, PSBT_MAXKV);
+    long maps_start = p;
+    const unsigned char* utx = NULL; unsigned long utxl = 0;
+    int f_txver = 0, f_fb = 0, f_in = 0, f_out = 0, f_ver = 0, f_mod = 0; unsigned ver = 0, txver = 0, fb = 0; unsigned long cin = 0, cout = 0; unsigned char mod = 0;
+    for (int i = 0; i < gn; i++){
+        if (g[i].kl != 1) continue;
+        switch (g[i].k[0]){
+        case 0x00: utx = g[i].v; utxl = g[i].vl; break;
+        case 0x02: if (g[i].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } txver = psbt_rd32(g[i].v); f_txver = 1; break;
+        case 0x03: if (g[i].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } fb = psbt_rd32(g[i].v); f_fb = 1; break;
+        case 0x04: { unsigned long cc; cin = srw_varint(g[i].v, &cc); if (cc != g[i].vl){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } f_in = 1; } break;
+        case 0x05: { unsigned long cc; cout = srw_varint(g[i].v, &cc); if (cc != g[i].vl){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } f_out = 1; } break;
+        case 0x06: if (g[i].vl != 1){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } mod = g[i].v[0]; f_mod = 1; break;
+        case 0xfb: if (g[i].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } ver = psbt_rd32(g[i].v); f_ver = 1;
+                   if (ver > 2){ *err = psbt_v2_fail("Unsupported version number"); return -1; } break;
+        default: break;
+        }
+    }
+    (void)f_ver;
+    if (ver == 0){
+        if (!utx){ *err = psbt_v2_fail("No unsigned transaction was provided"); return -1; }
+        if (f_txver){ *err = psbt_v2_fail("PSBT_GLOBAL_TX_VERSION is not allowed in PSBTv0"); return -1; }
+        if (f_fb){ *err = psbt_v2_fail("PSBT_GLOBAL_FALLBACK_LOCKTIME is not allowed in PSBTv0"); return -1; }
+        if (f_in){ *err = psbt_v2_fail("PSBT_GLOBAL_INPUT_COUNT is not allowed in PSBTv0"); return -1; }
+        if (f_out){ *err = psbt_v2_fail("PSBT_GLOBAL_OUTPUT_COUNT is not allowed in PSBTv0"); return -1; }
+        if (f_mod){ *err = psbt_v2_fail("PSBT_GLOBAL_TX_MODIFIABLE is not allowed in PSBTv0"); return -1; }
+        if (inlen > cap){ *err = "TX decode failed"; return -1; }
+        memcpy(out, in, (size_t)inlen);
+        m->version = 0; m->tx_version = psbt_rd32(utx);
+        { unsigned long cc; long q = 4; m->n_in = srw_varint(utx + q, &cc); q += cc;
+          for (unsigned long k = 0; k < m->n_in && (unsigned long)q < utxl; k++){ q += 36; unsigned long sl = srw_varint(utx + q, &cc); q += cc + sl + 4; }
+          m->n_out = (unsigned long)q < utxl ? srw_varint(utx + q, &cc) : 0; }
+        return inlen;
+    }
+    if (ver == 1){ *err = psbt_v2_fail("There is no PSBT version 1"); return -1; }
+    if (!f_txver){ *err = psbt_v2_fail("PSBT_GLOBAL_TX_VERSION is required in PSBTv2"); return -1; }
+    if (!f_in){ *err = psbt_v2_fail("PSBT_GLOBAL_INPUT_COUNT is required in PSBTv2"); return -1; }
+    if (!f_out){ *err = psbt_v2_fail("PSBT_GLOBAL_OUTPUT_COUNT is required in PSBTv2"); return -1; }
+    if (utx){ *err = psbt_v2_fail("PSBT_GLOBAL_UNSIGNED_TX is not allowed in PSBTv2"); return -1; }
+    if (cin > PSBT_MAXIO || cout > PSBT_MAXIO){ *err = "TX decode failed PSBT too large"; return -1; }
+    m->version = 2; m->tx_version = txver; m->has_fallback = f_fb; m->fallback_locktime = fb; m->has_mod = f_mod; m->mod = mod; m->n_in = cin; m->n_out = cout;
+    /* inputs: previous txid/index required; sequence, required locktimes optional */
+    static unsigned char tx[200000]; long t = 0;
+    psbt_wr32(tx + t, txver); t += 4;
+    t += crt_varint(tx + t, cin);
+    int have_time = 1, have_height = 1; unsigned time_lock = 0, height_lock = 0;
+    for (unsigned long i = 0; i < cin; i++){
+        static psbt_kv kv[PSBT_MAXKV]; int n = psbt_parse_map(in, inlen, &p, kv, PSBT_MAXKV);
+        const unsigned char* ptxid = NULL; int f_idx = 0; unsigned idx = 0, seq = 0xffffffffu; int f_tl = 0, f_hl = 0; unsigned tl = 0, hl = 0;
+        for (int j = 0; j < n; j++){
+            if (kv[j].kl != 1) continue;
+            switch (kv[j].k[0]){
+            case 0x0e: if (kv[j].vl != 32){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } ptxid = kv[j].v; break;
+            case 0x0f: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } idx = psbt_rd32(kv[j].v); f_idx = 1; break;
+            case 0x10: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } seq = psbt_rd32(kv[j].v); break;
+            case 0x11: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } tl = psbt_rd32(kv[j].v); f_tl = 1;
+                       if (tl < 500000000u){ *err = psbt_v2_fail("Required time based locktime is invalid (less than 500000000)"); return -1; } break;
+            case 0x12: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } hl = psbt_rd32(kv[j].v); f_hl = 1;
+                       if (hl >= 500000000u){ *err = psbt_v2_fail("Required height based locktime is invalid (greater than or equal to 500000000)"); return -1; }
+                       if (hl == 0){ *err = psbt_v2_fail("Required height based locktime is invalid (0)"); return -1; } break;
+            default: break;
+            }
+        }
+        if (!ptxid){ *err = psbt_v2_fail("Previous TXID is required in PSBTv2"); return -1; }
+        if (!f_idx){ *err = psbt_v2_fail("Previous output's index is required in PSBTv2"); return -1; }
+        /* BIP370 locktime fold (Core ComputeTimeLock) */
+        if (f_tl && !f_hl){ have_height = 0; if (!have_time) m->locktime_conflict = 1; }
+        else if (!f_tl && f_hl){ have_time = 0; if (!have_height) m->locktime_conflict = 1; }
+        if (f_tl && have_time && tl > time_lock) time_lock = tl;
+        if (f_hl && have_height && hl > height_lock) height_lock = hl;
+        if (t + 41 > (long)sizeof tx){ *err = "TX decode failed PSBT too large"; return -1; }
+        memcpy(tx + t, ptxid, 32); t += 32; psbt_wr32(tx + t, idx); t += 4; tx[t++] = 0x00; psbt_wr32(tx + t, seq); t += 4;
+    }
+    t += crt_varint(tx + t, cout);
+    for (unsigned long i = 0; i < cout; i++){
+        static psbt_kv kv[PSBT_MAXKV]; int n = psbt_parse_map(in, inlen, &p, kv, PSBT_MAXKV);
+        const unsigned char* amt = NULL; const unsigned char* sc = NULL; unsigned long scl = 0; int f_sc = 0;
+        for (int j = 0; j < n; j++){
+            if (kv[j].kl != 1) continue;
+            if (kv[j].k[0] == 0x03){ if (kv[j].vl != 8){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } amt = kv[j].v; }
+            else if (kv[j].k[0] == 0x04){ sc = kv[j].v; scl = kv[j].vl; f_sc = 1; }
+        }
+        if (!amt){ *err = psbt_v2_fail("Output amount is required in PSBTv2"); return -1; }
+        if (!f_sc){ *err = psbt_v2_fail("Output script is required in PSBTv2"); return -1; }
+        if (t + 17 + (long)scl > (long)sizeof tx){ *err = "TX decode failed PSBT too large"; return -1; }
+        memcpy(tx + t, amt, 8); t += 8; t += crt_varint(tx + t, scl); if (scl) memcpy(tx + t, sc, scl); t += scl;
+    }
+    unsigned locktime = 0;
+    if (!m->locktime_conflict){
+        if (have_height && height_lock > 0) locktime = height_lock;
+        else if (have_time && time_lock > 0) locktime = time_lock;
+        else locktime = f_fb ? fb : 0;
+    }
+    psbt_wr32(tx + t, locktime); t += 4;
+    /* write: magic | global [unsigned tx, then every other global key except the v2 ones] | the maps verbatim */
+    long o = 0;
+    if (5 + 12 + t + (inlen - maps_start) + 64 > cap){ *err = "TX decode failed PSBT too large"; return -1; }
+    memcpy(out, "psbt\xff", 5); o = 5;
+    out[o++] = 0x01; out[o++] = 0x00; o += crt_varint(out + o, (unsigned long long)t); memcpy(out + o, tx, (size_t)t); o += t;
+    for (int i = 0; i < gn; i++){
+        if (g[i].kl == 1 && (g[i].k[0] == 0x00 || (g[i].k[0] >= 0x02 && g[i].k[0] <= 0x06) || g[i].k[0] == 0xfb)) continue;
+        if (o + 20 + (long)g[i].kl + (long)g[i].vl > cap){ *err = "TX decode failed PSBT too large"; return -1; }
+        o += crt_varint(out + o, g[i].kl); memcpy(out + o, g[i].k, g[i].kl); o += g[i].kl;
+        o += crt_varint(out + o, g[i].vl); memcpy(out + o, g[i].v, g[i].vl); o += g[i].vl;
+    }
+    out[o++] = 0x00;
+    memcpy(out + o, in + maps_start, (size_t)(inlen - maps_start)); o += inlen - maps_start;
+    return o;
+}
+/* v0-shaped buffer -> the caller's version. Returns the length or -1. */
+static long psbt_v2_emit(const unsigned char* v0, long v0len, unsigned char* out, long cap, const psbt_v2meta* m){
+    if (m->version != 2){ if (v0len > cap) return -1; memcpy(out, v0, (size_t)v0len); return v0len; }
+    long p = 5; static psbt_kv g[PSBT_MAXKV + 8]; int gn = psbt_parse_map(v0, v0len, &p, g, PSBT_MAXKV);
+    const unsigned char* utx = NULL; unsigned long utxl = 0;
+    for (int i = 0; i < gn; i++) if (g[i].kl == 1 && g[i].k[0] == 0x00){ utx = g[i].v; utxl = g[i].vl; }
+    if (!utx) return -1;
+    static crt_in_t uin[PSBT_MAXIO]; int n_in, sw; unsigned long ost, oen;
+    if (!crt_walk(utx, utxl, uin, PSBT_MAXIO, &n_in, &ost, &oen, &sw)) return -1;
+    unsigned long n_out; unsigned long cc; n_out = srw_varint(utx + ost, &cc);
+    /* globals: drop the unsigned tx and any stale v2 globals, add the current ones, sort */
+    static unsigned char kb[8][2], vb[8][9]; int kn = 0; static psbt_kv add[8]; int an = 0;
+    static psbt_kv gg[PSBT_MAXKV + 8]; int ggn = 0;
+    for (int i = 0; i < gn; i++){ if (g[i].kl == 1 && (g[i].k[0] == 0x00 || (g[i].k[0] >= 0x02 && g[i].k[0] <= 0x06) || g[i].k[0] == 0xfb)) continue; gg[ggn++] = g[i]; }
+    #define PSBT_ADD1(T, VAL, VL) do{ kb[kn][0] = (T); add[an].k = kb[kn]; add[an].kl = 1; memcpy(vb[kn], (VAL), (VL)); add[an].v = vb[kn]; add[an].vl = (VL); an++; kn++; }while(0)
+    { unsigned char v4[4]; psbt_wr32(v4, m->tx_version ? m->tx_version : psbt_rd32(utx)); PSBT_ADD1(0x02, v4, 4); }
+    if (m->has_fallback){ unsigned char v4[4]; psbt_wr32(v4, m->fallback_locktime); PSBT_ADD1(0x03, v4, 4); }
+    { unsigned char cs[9]; long l = crt_varint(cs, (unsigned long long)n_in); PSBT_ADD1(0x04, cs, (unsigned long)l); }
+    { unsigned char cs[9]; long l = crt_varint(cs, (unsigned long long)n_out); PSBT_ADD1(0x05, cs, (unsigned long)l); }
+    if (m->has_mod){ PSBT_ADD1(0x06, &m->mod, 1); }
+    { unsigned char v4[4]; psbt_wr32(v4, 2); PSBT_ADD1(0xfb, v4, 4); }
+    for (int i = 0; i < an; i++) gg[ggn++] = add[i];
+    qsort(gg, (size_t)ggn, sizeof(psbt_kv), psbt_kv_cmp);
+    long o = 0; memcpy(out, "psbt\xff", 5); o = 5;
+    o += psbt_ser_map(out + o, gg, ggn);
+    /* inputs: fill previous txid/index (+sequence for a PSBT created here), sort */
+    static const unsigned char K0E = 0x0e, K0F = 0x0f, K10 = 0x10, K03 = 0x03, K04 = 0x04;
+    for (int i = 0; i < n_in; i++){
+        static psbt_kv kv[PSBT_MAXKV + 3]; int n = psbt_parse_map(v0, v0len, &p, kv, PSBT_MAXKV);
+        int has_e = 0, has_f = 0, has_s = 0;
+        for (int j = 0; j < n; j++) if (kv[j].kl == 1){ if (kv[j].k[0] == 0x0e) has_e = 1; else if (kv[j].k[0] == 0x0f) has_f = 1; else if (kv[j].k[0] == 0x10) has_s = 1; }
+        if (!has_e){ kv[n].k = &K0E; kv[n].kl = 1; kv[n].v = uin[i].op; kv[n].vl = 32; n++; }
+        if (!has_f){ kv[n].k = &K0F; kv[n].kl = 1; kv[n].v = uin[i].op + 32; kv[n].vl = 4; n++; }
+        if (!has_s && m->created){ kv[n].k = &K10; kv[n].kl = 1; kv[n].v = uin[i].op + 37; kv[n].vl = 4; n++; }   /* empty scriptSig: the sequence follows the 1-byte length */
+        qsort(kv, (size_t)n, sizeof(psbt_kv), psbt_kv_cmp);
+        if (o + 40 > cap) return -1;
+        o += psbt_ser_map(out + o, kv, n);
+    }
+    { const unsigned char* q = utx + ost + cc;
+      for (unsigned long i = 0; i < n_out; i++){
+        static psbt_kv kv[PSBT_MAXKV + 3]; int n = psbt_parse_map(v0, v0len, &p, kv, PSBT_MAXKV);
+        const unsigned char* amt = q; unsigned long c2; unsigned long sl = srw_varint(q + 8, &c2); const unsigned char* sc = q + 8 + c2; q += 8 + c2 + sl;
+        int has_a = 0, has_sc = 0;
+        for (int j = 0; j < n; j++) if (kv[j].kl == 1){ if (kv[j].k[0] == 0x03) has_a = 1; else if (kv[j].k[0] == 0x04) has_sc = 1; }
+        if (!has_a){ kv[n].k = &K03; kv[n].kl = 1; kv[n].v = amt; kv[n].vl = 8; n++; }
+        if (!has_sc){ kv[n].k = &K04; kv[n].kl = 1; kv[n].v = sc; kv[n].vl = sl; n++; }
+        qsort(kv, (size_t)n, sizeof(psbt_kv), psbt_kv_cmp);
+        if (o + 40 + (long)sl > cap) return -1;
+        o += psbt_ser_map(out + o, kv, n);
+      } }
+    return o;
+}
+/* Core's GetUniqueID for v2 hashes the unsigned tx with every sequence zeroed */
+static int psbt_same_tx_seqblind(const unsigned char* a, const unsigned char* b, unsigned long len){
+    static unsigned char ca[200000], cb[200000]; if (len > sizeof ca) return 0;
+    memcpy(ca, a, len); memcpy(cb, b, len);
+    for (int w = 0; w < 2; w++){ unsigned char* t = w ? cb : ca; unsigned long cc; long q = 4; unsigned long n_in = srw_varint(t + q, &cc); q += cc;
+        for (unsigned long k = 0; k < n_in && (unsigned long)q + 41 <= len; k++){ q += 36; unsigned long sl = srw_varint(t + q, &cc); q += cc + sl; memset(t + q, 0, 4); q += 4; } }
+    return memcmp(ca, cb, len) == 0;
+}
+/* decode + normalize a base64 PSBT into `out`; 0 with ec/em on failure */
+static int psbt_load(const char* b64, unsigned char* out, long cap, long* outlen, psbt_v2meta* m, long* ec, const char** em){
+    static unsigned char raw[400000]; long rl = 0;
+    if (!crt_b64dec(b64, raw, sizeof raw, &rl) || rl < 5 || memcmp(raw, "psbt\xff", 5)){ *ec = -22; *em = "TX decode failed"; return 0; }
+    const char* err = NULL; long n = psbt_v2_normalize(raw, rl, out, cap, m, &err);
+    if (n < 0){ *ec = -22; *em = err ? err : "TX decode failed"; return 0; }
+    *outlen = n; return 1;
+}
+/* v0-shaped bytes -> base64 in the caller's version (malloc'd) */
+static char* psbt_b64_out(const unsigned char* v0, long v0len, const psbt_v2meta* m){
+    static unsigned char ob[440000]; long n = psbt_v2_emit(v0, v0len, ob, sizeof ob, m);
+    if (n < 0) return NULL;
+    char* b = malloc((size_t)((n + 2) / 3) * 4 + 1); if (!b) return NULL;
+    crt_b64(b, ob, n); return b;
+}
+/* psbt_version argument (Core: default 2, only 0 or 2) at `idx` */
+static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em){
+    *ver = 2;
+    if (params && params->typ == RJ_ARR && params->nitems > idx && params->items[idx]->typ != RJ_NULL){
+        if (params->items[idx]->typ != RJ_NUM){ *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
+        long v = strtol(params->items[idx]->str, 0, 10);
+        if (v != 0 && v != 2){ *ec = -8; *em = "The PSBT version can only be 2 or 0"; return 0; }
+        *ver = (int)v;
+    }
+    return 1;
+}
+/* wrap an unsigned tx as a PSBT of the requested version (Core's Creator) */
+static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver){
+    char* b64 = psbt_wrap_unsigned(tx, n, nin, nout); if (!b64 || ver != 2) return b64;
+    static unsigned char v0[400000]; long v0l = 0;
+    if (!crt_b64dec(b64, v0, sizeof v0, &v0l)){ free(b64); return NULL; }
+    free(b64);
+    psbt_v2meta m; memset(&m, 0, sizeof m); m.version = 2; m.tx_version = psbt_rd32(tx);
+    m.has_fallback = 1; m.fallback_locktime = psbt_rd32(tx + n - 4); m.created = 1;
+    return psbt_b64_out(v0, v0l, &m);
+}
+
 static void psbt_path_str(char* out, unsigned long cap, const unsigned char* p, unsigned long n){
     /* Core's WriteHDKeypath: "m" then "/<i>" with an h suffix for hardened */
     unsigned long o = 0; o += (unsigned long)snprintf(out + o, cap - o, "m");
@@ -980,26 +1265,32 @@ static void psbt_musig_signer_field(rj_val* o, unsigned char type, const unsigne
 }
 static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params,0,ec,em); if (!b64) return 0;
-    static unsigned char buf[200000]; long blen=0;
-    if (!crt_b64dec(b64,buf,sizeof buf,&blen) || blen<5 || memcmp(buf,"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
-    long p=5; const unsigned char* utx=NULL; unsigned long utxlen=0; int psbtver=0;
+    static unsigned char buf[400000]; long blen=0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
+    long p=5; const unsigned char* utx=NULL; unsigned long utxlen=0; int psbtver=vm.version;
     while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
         const unsigned char* key=buf+p; p+=kl;
         unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
         if (kl>=1 && key[0]==0x00){ utx=val; utxlen=vl; }
-        else if (kl>=1 && key[0]==0xfb){ psbtver=(int)val[0]; }
     }
     rj_val* o=rj_obj();
-    long n_in=0, n_out=0;
+    long n_in=0, n_out=0; rj_val* txo=NULL;
     if (utx){
-        rj_val* txo=NULL; long e2; const char* m2;
+        long e2; const char* m2;
         if (rpc_chain_decode_rawtx(utx,(long)utxlen,&txo,&e2,&m2)){
             rj_val* vin=rj_obj_get(txo,"vin"); rj_val* vout=rj_obj_get(txo,"vout");
             n_in = vin?(long)vin->nitems:0; n_out = vout?(long)vout->nitems:0;
-            rj_obj_set(o,"tx",txo);
+            if (psbtver < 2) rj_obj_set(o,"tx",txo);                /* Core: the decoded tx only for v0 */
         }
     }
     rj_obj_set(o,"global_xpubs",rj_arr());
+    if (psbtver >= 2){                                              /* Core's PSBTv2 globals, in its order */
+        rj_obj_set(o,"tx_version",rj_numf("%u",vm.tx_version));
+        if (vm.has_fallback) rj_obj_set(o,"fallback_locktime",rj_numf("%u",vm.fallback_locktime));
+        rj_obj_set(o,"input_count",rj_numf("%lu",vm.n_in));
+        rj_obj_set(o,"output_count",rj_numf("%lu",vm.n_out));
+        if (vm.has_mod){ rj_obj_set(o,"inputs_modifiable",rj_bool(vm.mod&1)); rj_obj_set(o,"outputs_modifiable",rj_bool((vm.mod>>1)&1)); rj_obj_set(o,"has_sighash_single",rj_bool((vm.mod>>2)&1)); }
+    }
     rj_obj_set(o,"psbt_version",rj_numf("%d",psbtver));
     rj_obj_set(o,"proprietary",rj_arr());
     rj_obj_set(o,"unknown",rj_obj());
@@ -1012,6 +1303,11 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
                     case 0x04: psbt_field_hex(io,"redeem_script",val,vl); break;
                     case 0x05: psbt_field_hex(io,"witness_script",val,vl); break;
                     case 0x07: psbt_field_hex(io,"final_scriptSig",val,vl); break;
+                    case 0x0e: if (vl==32){ char hx[65]; for (int b=0;b<32;b++) sprintf(hx+2*b,"%02x",val[31-b]); rj_obj_set(io,"previous_txid",rj_str(hx)); } break;
+                    case 0x0f: if (vl==4) rj_obj_set(io,"previous_vout",rj_numf("%u",psbt_rd32(val))); break;
+                    case 0x10: if (vl==4) rj_obj_set(io,"sequence",rj_numf("%u",psbt_rd32(val))); break;
+                    case 0x11: if (vl==4) rj_obj_set(io,"time_locktime",rj_numf("%u",psbt_rd32(val))); break;
+                    case 0x12: if (vl==4) rj_obj_set(io,"height_locktime",rj_numf("%u",psbt_rd32(val))); break;
                     /* MuSig2 (BIP373), Core's decodepsbt shapes */
                     case 0x1a: if (kl==34 && vl%33==0) psbt_musig_participants(io,key+1,val,vl); break;
                     case 0x1b: case 0x1c: if ((kl==67||kl==99) && vl==(key[0]==0x1b?66:32)) psbt_musig_signer_field(io,key[0],key,kl,val,vl); break;
@@ -1021,8 +1317,14 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
     }
     rj_obj_set(o,"inputs",ins);
     rj_val* outs=rj_arr();
+    rj_val* dvout = txo ? rj_obj_get(txo,"vout") : NULL;
     for (long i=0;i<n_out && p<blen;i++){
         rj_val* oo=rj_obj();
+        if (psbtver >= 2 && dvout && (unsigned long)i < dvout->nitems){        /* Core: amount + ScriptToUniv(script) */
+            rj_val* dv = dvout->items[i]; rj_val* val_ = rj_obj_get(dv,"value"); rj_val* spk = rj_obj_get(dv,"scriptPubKey");
+            if (val_) rj_obj_set(oo,"amount",rj_clone(val_));
+            if (spk) rj_obj_set(oo,"script",rj_clone(spk));
+        }
         while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
             const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
             if (kl>=1){ switch (key[0]){ case 0x00: psbt_field_hex(oo,"redeem_script",val,vl); break;
@@ -1033,6 +1335,7 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
         rj_arr_push(outs,oo);
     }
     rj_obj_set(o,"outputs",outs);
+    if (txo && psbtver >= 2) rj_free(txo);
     *result=o;
     return 1;
 }
@@ -1040,31 +1343,6 @@ static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_va
 /* combinepsbt (Core rpc/rawtransaction.cpp): merge PSBTs for the SAME unsigned
  * tx by unioning each map's key-value pairs (dedup by key; first occurrence
  * wins). Returns the merged base64 PSBT. */
-typedef struct { const unsigned char* k; unsigned long kl; const unsigned char* v; unsigned long vl; } psbt_kv;
-static int psbt_parse_map(const unsigned char* buf, long blen, long* pp, psbt_kv* kvs, int cap){
-    int n=0; long p=*pp;
-    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if(kl==0){ *pp=p; return n; }
-        const unsigned char* k=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* v=buf+p; p+=vl;
-        if(n<cap){ kvs[n].k=k;kvs[n].kl=kl;kvs[n].v=v;kvs[n].vl=vl;n++; }
-    }
-    *pp=p; return n;
-}
-static int psbt_union(psbt_kv* dst, int dn, int dcap, const psbt_kv* src, int sn){
-    for(int i=0;i<sn && dn<dcap;i++){
-        int dup=0; for(int j=0;j<dn;j++) if(dst[j].kl==src[i].kl && !memcmp(dst[j].k,src[i].k,src[i].kl)){ dup=1; break; }
-        if(!dup) dst[dn++]=src[i];
-    }
-    return dn;
-}
-static long psbt_ser_map(unsigned char* out, const psbt_kv* kvs, int n){
-    long o=0;
-    for(int i=0;i<n;i++){ o+=crt_varint(out+o,(unsigned long long)kvs[i].kl); memcpy(out+o,kvs[i].k,kvs[i].kl); o+=kvs[i].kl;
-        o+=crt_varint(out+o,(unsigned long long)kvs[i].vl); memcpy(out+o,kvs[i].v,kvs[i].vl); o+=kvs[i].vl; }
-    out[o++]=0x00; return o;
-}
-#define PSBT_MAXP 16
-#define PSBT_MAXKV 128
-#define PSBT_MAXIO 1000
 static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_ARR||params->items[0]->nitems<1){
         *ec=-8; *em="Invalid parameter, expected an array of base64 PSBTs"; return 0; }
@@ -1075,14 +1353,17 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
     static psbt_kv ikv[PSBT_MAXIO][PSBT_MAXKV]; static int in_n[PSBT_MAXIO];
     static psbt_kv okv[PSBT_MAXIO][PSBT_MAXKV]; static int out_n[PSBT_MAXIO];
     long n_in=-1, n_out=-1;
+    psbt_v2meta vm0; memset(&vm0, 0, sizeof vm0);
     for (int pi=0; pi<np; pi++){
         if (arr->items[pi]->typ!=RJ_STR){ *ec=-22; *em="TX decode failed"; return 0; }
-        if (!crt_b64dec(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi]) || blens[pi]<5 || memcmp(bufs[pi],"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+        psbt_v2meta vm;
+        if (!psbt_load(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi], &vm, ec, em)) return 0;
+        if (pi == 0) vm0 = vm; else if (vm.version != vm0.version){ *ec=-8; *em="PSBTs not compatible (different transactions)"; return 0; }
         long p=5;
         psbt_kv g[PSBT_MAXKV]; int g_n=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
         const unsigned char* utx=NULL; unsigned long utxl=0;
         for (int j=0;j<g_n;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
-        if (!utx){ *ec=-22; *em="Only PSBTv0 (with an unsigned tx) can be combined"; return 0; }
+        if (!utx){ *ec=-22; *em="TX decode failed"; return 0; }
         if (!utx0){ utx0=utx; utx0len=utxl;
             unsigned long cc; long q=4; n_in=(long)srw_varint(utx+q,&cc); q+=cc;
             for (long k=0;k<n_in;k++){ q+=36; unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl+4; }
@@ -1090,7 +1371,7 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
             if (n_in>PSBT_MAXIO||n_out>PSBT_MAXIO){ *ec=-22; *em="PSBT too large to combine"; return 0; }
             for (long k=0;k<n_in;k++) in_n[k]=0;
             for (long k=0;k<n_out;k++) out_n[k]=0;
-        } else if (utxl!=utx0len || memcmp(utx,utx0,utxl)){ *ec=-8; *em="PSBTs do not refer to the same transactions."; return 0; }
+        } else if (utxl!=utx0len || (vm0.version < 2 ? memcmp(utx,utx0,utxl) != 0 : !psbt_same_tx_seqblind(utx,utx0,utxl))){ *ec=-8; *em="PSBTs not compatible (different transactions)"; return 0; }
         gn=psbt_union(gkv,gn,PSBT_MAXKV,g,g_n);
         for (long k=0;k<n_in;k++){ psbt_kv m[PSBT_MAXKV]; int mn=psbt_parse_map(bufs[pi],blens[pi],&p,m,PSBT_MAXKV); in_n[k]=psbt_union(ikv[k],in_n[k],PSBT_MAXKV,m,mn); }
         for (long k=0;k<n_out;k++){ psbt_kv m[PSBT_MAXKV]; int mn=psbt_parse_map(bufs[pi],blens[pi],&p,m,PSBT_MAXKV); out_n[k]=psbt_union(okv[k],out_n[k],PSBT_MAXKV,m,mn); }
@@ -1100,8 +1381,8 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
     n+=psbt_ser_map(out+n,gkv,gn);
     for (long k=0;k<n_in;k++)  n+=psbt_ser_map(out+n,ikv[k],in_n[k]);
     for (long k=0;k<n_out;k++) n+=psbt_ser_map(out+n,okv[k],out_n[k]);
-    char* b64=malloc((size_t)((n+2)/3)*4+1); if(!b64){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b64,out,n); *result=rj_str(b64); free(b64);
+    char* b64=psbt_b64_out(out,n,&vm0); if(!b64){ *ec=-7; *em="oom"; return 0; }
+    *result=rj_str(b64); free(b64);
     return 1;
 }
 
@@ -1121,11 +1402,12 @@ static int cmd_joinpsbts(const rj_val* params, long* ec, const char** em, rj_val
     static psbt_kv omaps[PSBT_MAXIO][PSBT_MAXKV]; static int omaps_n[PSBT_MAXIO]; long tot_o=0;
     for (int pi=0; pi<np; pi++){
         if (arr->items[pi]->typ!=RJ_STR){ *ec=-22; *em="TX decode failed"; return 0; }
-        if (!crt_b64dec(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi]) || blens[pi]<5 || memcmp(bufs[pi],"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+        { psbt_v2meta vm; if (!psbt_load(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi], &vm, ec, em)) return 0;
+          if (vm.version >= 2){ *ec=-8; *em="joinpsbts only operates on version 0 PSBTs"; return 0; } }
         long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
         const unsigned char* utx=NULL; unsigned long utxl=0;
         for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
-        if (!utx){ *ec=-22; *em="Only PSBTv0 (with an unsigned tx) can be joined"; return 0; }
+        if (!utx){ *ec=-22; *em="TX decode failed"; return 0; }
         /* parse this tx's inputs/outputs */
         unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
         for (unsigned long k=0;k<n_in;k++){
@@ -1196,14 +1478,13 @@ static void apsbt_hex(char* dst, const unsigned char* b, int n){ for(int i=0;i<n
 static int cmd_analyzepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_STR){
         *ec=-8; *em="Invalid parameters, expected a PSBT string"; return 0; }
-    static unsigned char buf[400000]; long blen;
-    if (!crt_b64dec(params->items[0]->str, buf, sizeof buf, &blen) || blen<5 || memcmp(buf,"psbt\xff",5)!=0){
-        *ec=-22; *em="TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen; psbt_v2meta vm;
+    if (!psbt_load(params->items[0]->str, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
     long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(buf,blen,&p,g,PSBT_MAXKV);
     const unsigned char* utx=NULL;
     for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; break; }
     rj_val* out=rj_obj();
-    if (!utx){ rj_obj_set(out,"error",rj_str("PSBT cannot be made into a valid transaction")); *result=out; return 1; }
+    if (!utx || vm.locktime_conflict){ rj_obj_set(out,"error",rj_str("PSBT cannot be made into a valid transaction")); *result=out; return 1; }
 
     unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
     #define APSBT_MAXIN 5000
@@ -2491,13 +2772,7 @@ static int cmd_simulaterawtransaction(const rj_val* params, const rpc_wallet* w,
  * the merger, and silently keeping one would hand back a transaction missing
  * signatures that the caller supplied -- so it errors and points at
  * combinepsbt, which merges properly at the PSBT level. */
-typedef struct {
-    const unsigned char* op;      /* 36-byte outpoint */
-    const unsigned char* ss;  unsigned long sslen;   /* scriptSig */
-    const unsigned char* wit; unsigned long witlen;  /* serialized witness stack */
-    unsigned witems;
-    unsigned seq;
-} crt_in_t;
+
 
 /* Walk a raw tx into inputs + the outputs/locktime tail. 0 on malformed. */
 static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, int cap,
@@ -2766,13 +3041,13 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
     int extract = 1;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL)
         extract = params->items[1]->str[0] == '1';
-    static unsigned char buf[200000]; long blen = 0;
-    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
-        *ec = -22; *em = "TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
+    if (vm.locktime_conflict){ *ec = -22; *em = "PSBT cannot be made into a valid transaction"; return 0; }
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
-    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be finalized"; return 0; }
+    if (!utxk){ *ec = -22; *em = "TX decode failed"; return 0; }
     const unsigned char* utx = utxk->v; unsigned long utxl = utxk->vl;
 
     /* walk the unsigned tx for the outpoints and the outputs/locktime tail */
@@ -2868,8 +3143,7 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
     }
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
-    char* b = malloc((size_t)((o+2)/3)*4+1); if (!b){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b, out, o);
+    char* b = psbt_b64_out(out, o, &vm); if (!b){ *ec=-7; *em="oom"; return 0; }
     rj_val* r = rj_obj();
     rj_obj_set(r, "psbt", rj_str(b));
     rj_obj_set(r, "complete", rj_bool(complete));
@@ -2899,13 +3173,12 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
               "descriptors to fill witness UTXOs from the UTXO set";
         return 0;
     }
-    static unsigned char buf[200000]; long blen = 0;
-    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
-        *ec = -22; *em = "TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
-    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be updated"; return 0; }
+    if (!utxk){ *ec = -22; *em = "TX decode failed"; return 0; }
     static crt_in_t uin[FIN_MAXIO];
     int n_in, sw; unsigned long ost, oen;
     if (!crt_walk(utxk->v, utxk->vl, uin, FIN_MAXIO, &n_in, &ost, &oen, &sw)){
@@ -2954,8 +3227,7 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
     }
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
-    char* b = malloc((size_t)((o+2)/3)*4+1); if (!b){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b, out, o);
+    char* b = psbt_b64_out(out, o, &vm); if (!b){ *ec=-7; *em="oom"; return 0; }
     *result = rj_str(b); free(b);
     return 1;
 }
@@ -3227,13 +3499,13 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
                         psbt_signer_fn signer, void* sctx, psbt_keyfn keyfn,
                         long* ec, const char** em, rj_val** result){
 
-    static unsigned char buf[200000]; long blen = 0;
-    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
-        *ec = -22; *em = "TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
+    if (vm.locktime_conflict){ *ec = -22; *em = "PSBT cannot be made into a valid transaction"; return 0; }
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
-    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be processed"; return 0; }
+    if (!utxk){ *ec = -22; *em = "TX decode failed"; return 0; }
     const unsigned char* utx = utxk->v; unsigned long utxl = utxk->vl;
 
     static crt_in_t uin[FIN_MAXIO];
@@ -3564,9 +3836,8 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
 
-    char* b = malloc((size_t)((o+2)/3)*4+1);
+    char* b = psbt_b64_out(out, o, &vm);
     if (!b){ rj_free(sres); *ec=-7; *em="oom"; return 0; }
-    crt_b64(b, out, o);
     rj_val* r = rj_obj();
     rj_obj_set(r, "psbt", rj_str(b));
     rj_obj_set(r, "complete", rj_bool(complete));
