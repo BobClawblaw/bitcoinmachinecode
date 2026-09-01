@@ -1971,7 +1971,7 @@ RPCLIBS := daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wa
 # lifecycle methods a single-seed wallet cannot honour). wallet_labels.o is
 # its address->label store; see that file for why wallet_book.c (label->
 # address, the CLI's nickname book) could not be reused.
-rpc_wallet_ops.o: rpc_wallet_ops.c rpc_wallet_ops.h rpc_commands.h rpc_chain.h rpc_json.h \
+rpc_wallet_ops.o: rpc_wallet_ops.c rpc_wallet_ops.h rpc_commands.h rpc_chain.h rpc_json.h descriptor.h miniscript.h musig2.h \
     wallet_scan.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_wallet_ops.c
 
@@ -2022,7 +2022,7 @@ rpc_net.o: rpc_net.c rpc_net.h rpc_json.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_net.c
 rpc_commands.o: rpc_commands.c rpc_commands.h rpc_json.h rpc_node.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_commands.c
-rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h \
+rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h \
     rpc_node.h script_flags_consts.h block_filter.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_chain.c
 rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h
@@ -2230,7 +2230,7 @@ wallet_scan_hash.o: wallet_scan_hash.c
 
 # BIP158 basic filters, validated byte-for-byte against Bitcoin Core's own
 # filters for two real mainnet blocks (fixtures frozen from the oracle).
-rpc_signer.o: rpc_signer.c rpc_signer.h rpc_json.h
+rpc_signer.o: rpc_signer.c rpc_signer.h rpc_json.h descriptor.h miniscript.h musig2.h
 	$(CC) -no-pie -O2 -c -o $@ rpc_signer.c
 
 block_filter.o: block_filter.c block_filter.h

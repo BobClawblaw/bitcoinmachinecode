@@ -3721,6 +3721,7 @@ static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd){
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++) out_n[i] = psbt_parse_map(buf, blen, &p, okv[i], FIN_MAXKV);
     /* new field storage: at most one aggregate per input */
     static unsigned char k1a[FIN_MAXIO][34], v1a[FIN_MAXIO][33 * MUSIG2_MAX_KEYS], k16[FIN_MAXIO][33], v16[FIN_MAXIO][1 + 4 + 4 * 40], k17[FIN_MAXIO], v17[FIN_MAXIO][32];
+    static unsigned char k16p[FIN_MAXIO][MUSIG2_MAX_KEYS][33], v16p[FIN_MAXIO][MUSIG2_MAX_KEYS][5 + 4 * (DESCR_MAX_PATH * 2 + 1)];
     int changed = 0;
     for (int i = 0; i < n_in; i++){
         unsigned long long amount; const unsigned char* spk; unsigned long spklen;
@@ -3752,6 +3753,29 @@ static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd){
                 if (is_tr && !fin_find(ikv[i], in_n[i], 0x17)){
                     k17[i] = 0x17; memcpy(v17[i], der + 1, 32);
                     ikv[i][in_n[i]].k = &k17[i]; ikv[i][in_n[i]].kl = 1; ikv[i][in_n[i]].v = v17[i]; ikv[i][in_n[i]].vl = 32; in_n[i]++;
+                }
+                /* one TAP_BIP32_DERIVATION per participant, as Core's UpdatePSBTInput writes them: the
+                 * key's origin when it has one, else the xpub's own fingerprint + path, else the bare
+                 * key's hash160 prefix with an empty path -- what lets every signer find its key */
+                const descr_key_t* mk = &d->keys[kx];
+                for (int q = 0; q < mk->musig_n && in_n[i] + 1 <= FIN_MAXKV; q++){
+                    const descr_key_t* pkey = &d->keys[mk->musig_parts[q]];
+                    unsigned char ppub[65]; int ppl = 0;
+                    if (!descr_key_pub_at(d, mk->musig_parts[q], idx, ppub, &ppl) || ppl != 33) continue;
+                    unsigned char* kk = k16p[i][q]; unsigned char* vv = v16p[i][q];
+                    kk[0] = 0x16; memcpy(kk + 1, ppub + 1, 32);
+                    int dup = 0; for (int z = 0; z < in_n[i]; z++) if (ikv[i][z].kl == 33 && ikv[i][z].k[0] == 0x16 && !memcmp(ikv[i][z].k + 1, ppub + 1, 32)) dup = 1;
+                    if (dup) continue;
+                    unsigned pp[DESCR_MAX_PATH * 2 + 1]; int pn = 0;
+                    vv[0] = 0;
+                    if (pkey->has_origin){ memcpy(vv + 1, pkey->origin_fp, 4); for (int z = 0; z < pkey->origin_len && pn < DESCR_MAX_PATH * 2; z++) pp[pn++] = pkey->origin[z]; }
+                    else { unsigned char h[20]; hash160(h, pkey->pub, (pkey->kind == DK_XPUB || pkey->kind == DK_XPRV) ? 33 : pkey->publen); memcpy(vv + 1, h, 4); }
+                    if (pkey->kind == DK_XPUB || pkey->kind == DK_XPRV){
+                        for (int z = 0; z < pkey->pathlen && pn < DESCR_MAX_PATH * 2; z++) pp[pn++] = pkey->path[z];
+                        if (pkey->ranged && pn < DESCR_MAX_PATH * 2) pp[pn++] = (unsigned)idx | (pkey->range_hard ? 0x80000000u : 0);
+                    }
+                    for (int z = 0; z < pn; z++){ unsigned char* w = vv + 5 + 4 * z; w[0] = (unsigned char)pp[z]; w[1] = (unsigned char)(pp[z] >> 8); w[2] = (unsigned char)(pp[z] >> 16); w[3] = (unsigned char)(pp[z] >> 24); }
+                    ikv[i][in_n[i]].k = kk; ikv[i][in_n[i]].kl = 33; ikv[i][in_n[i]].v = vv; ikv[i][in_n[i]].vl = 5 + 4 * (unsigned long)pn; in_n[i]++;
                 }
                 changed = 1;
             }
