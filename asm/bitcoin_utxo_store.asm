@@ -101,6 +101,7 @@ IDX_HDR   equ 20              ; utxo.idx header: magic(4)+log_off(8)+n(8)
 
 logname: db "utxo.dat",0
 idxname: db "utxo.idx",0
+idxtmp:  db "utxo.idx.tmp",0   ; the checkpoint is written here and renamed over utxo.idx (2026-09-01)
 
 ; external in-memory UTXO primitives (bitcoin_utxo.asm)
 extern utxo_put
@@ -540,15 +541,22 @@ utxo_store_sync:
     sub  rsp, 0x100
     mov  r12, rdi
     mov  r13, rsi
-    ; open utxo.idx O_WRONLY|O_CREAT|O_TRUNC 0644
-    lea  rdi, [rel idxname]
+    ; open utxo.idx.tmp O_WRONLY|O_CREAT|O_TRUNC 0644. The checkpoint used to
+    ; truncate utxo.idx in place and rewrite it; a stop between the two left
+    ; an EMPTY checkpoint and the next boot replayed the UTXO set from
+    ; genesis (2026-09-01 12:29). Now the whole file is written and fsynced
+    ; under a temporary name and rename()d over utxo.idx: readers see the
+    ; old checkpoint or the new one, never a torn one. st->idx_fd (opened at
+    ; init) is only ever fsynced/closed, never written, so the stale inode it
+    ; keeps after the rename is harmless.
+    lea  rdi, [rel idxtmp]
     mov  esi, 1 | 0x40 | 0x200
     mov  edx, 0o644
     mov  eax, 2
     syscall
     test rax, rax
     jl   .fail
-    mov  r14, rax           ; idx fd
+    mov  r14, rax           ; tmp checkpoint fd
     ; header @ rbp-0x60: magic(4) log_off(8) n(8) = 20 bytes
     mov  dword [rbp-0x60], MAGIC_IDX
     mov  rax, [r12+16]
@@ -673,11 +681,18 @@ utxo_store_sync:
     mov  [r12+24], rax      ; ckpt_log_off = log_len
     mov  rax, [r13]
     mov  [r12+32], rax      ; ckpt_n = n
-    ; fsync idx then log
+    ; fsync the tmp checkpoint, then the log
     mov  rdi, r14
     call mac_fsync
     mov  rdi, [r12]
     call mac_fsync
+    ; rename(utxo.idx.tmp, utxo.idx): the atomic publish
+    lea  rdi, [rel idxtmp]
+    lea  rsi, [rel idxname]
+    mov  eax, 82
+    syscall
+    test rax, rax
+    jl   .fclose
     mov  rdi, r14
     mov  eax, 3
     syscall
@@ -693,6 +708,9 @@ utxo_store_sync:
 .fclose:
     mov  rdi, r14
     mov  eax, 3
+    syscall
+    lea  rdi, [rel idxtmp]  ; a failed checkpoint leaves no tmp behind
+    mov  eax, 87
     syscall
 .fail:
     mov  rax, -1

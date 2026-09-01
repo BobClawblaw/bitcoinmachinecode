@@ -14,6 +14,7 @@
  *   on-disk framing: utxo.dat PUSH/DEL record bytes, utxo.idx checkpoint bytes.
  */
 #include <stdio.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -138,6 +139,12 @@ int main(void) {
         ck("store_put D0 new (coinbase, h=300)", utxo_store_put(&st, g_ux, tD, 0, 7777ULL, 300, 1, scrD, 8), 1);
         /* sync -> checkpoint captures {A0, C0, D0} at current log_len */
         ck("store_sync", utxo_store_sync(&st, g_ux), 1);
+        /* the checkpoint is published atomically (2026-09-01): written as
+         * utxo.idx.tmp, fsynced, renamed over utxo.idx -- so no stop can
+         * leave an empty utxo.idx behind. After a sync the tmp is gone and
+         * utxo.idx carries a header. */
+        { struct stat sb; ck("no utxo.idx.tmp left after a checkpoint", stat("utxo.idx.tmp", &sb) != 0, 1);
+          ck("utxo.idx published (>= header)", stat("utxo.idx", &sb) == 0 && sb.st_size >= 20, 1); }
         ck("ckpt_log_off advanced", st.log_len > 0, 1);
         ck("ckpt_n 3", st.ckpt_n, 3);
         /* a crash-tail op AFTER the checkpoint: put E, spend A0 */
