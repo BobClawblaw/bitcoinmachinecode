@@ -33,12 +33,16 @@ int ms_sign_witness_v0(const unsigned char* ws, size_t wl, const unsigned char z
                        const ms_preimages_t* pre,
                        unsigned char* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err);
 
+/* a BIP340 signature another signer left in the PSBT (TAP_SCRIPT_SIG) for this leaf */
+typedef struct { const unsigned char* x; const unsigned char* sig; int sl; } ms_psig_t;
 /* Tapscript leaf: same contract with the BIP341 leaf sighash z; hashtype 0
- * gives 64-byte signatures. Keys are matched x-only. */
+ * gives 64-byte signatures. Keys are matched x-only; keys we do not hold
+ * are "available" when the PSBT carries a partial signature for them. */
 int ms_sign_witness_tapleaf(const unsigned char* leaf, size_t ll, const unsigned char z[32], int hashtype,
                             unsigned seq, unsigned long locktime,
                             unsigned char (*kpriv)[32], unsigned char (*kpub)[33], int nkeys,
                             const unsigned char (*pubs)[33], int npubs,
+                            const ms_psig_t* psigs, int npsigs,
                             const ms_preimages_t* pre,
                             unsigned char* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err);
 #endif
