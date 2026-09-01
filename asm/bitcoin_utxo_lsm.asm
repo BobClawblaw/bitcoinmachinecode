@@ -744,46 +744,34 @@ mac_read_run_header:
 
 ; mac_copy_rec(dst=rdi, src=rsi) -- copies a fixed 64-byte descriptor.
 ; Preserves rdi,rsi,rcx.
+; Clobbers rax only. Eight qword moves: the byte loop this replaced was 70%
+; of the flush's CPU (2026-09-01 perf on the live replay -- the merge sort
+; calls this O(n log n) times per flush).
 mac_copy_rec:
-    push rdi
-    push rsi
-    push rcx
-    xor  ecx, ecx
-.cl:
-    cmp  ecx, 64
-    jae  .cd
-    mov  al, [rsi+rcx]
-    mov  [rdi+rcx], al
-    inc  ecx
-    jmp  .cl
-.cd:
-    pop  rcx
-    pop  rsi
-    pop  rdi
+%assign _cr 0
+%rep 8
+    mov  rax, [rsi+_cr]
+    mov  [rdi+_cr], rax
+%assign _cr _cr+8
+%endrep
     ret
 
 ; mac_bloom_h(key=rdi(36B), seed=esi) -> eax = FNV-1a-style 32-bit hash.
 ; Preserves rdi,rdx,rcx,rbx (esi untouched throughout).
+; Fully unrolled (36 fixed bytes; the loop was 12% of the flush's CPU).
 mac_bloom_h:
     push rbx
-    push rcx
     push rdx
-    push rdi
     mov  ebx, esi
-    xor  ecx, ecx
-.bh:
-    cmp  ecx, 36
-    jae  .bhd
-    movzx edx, byte [rdi+rcx]
+%assign _bh 0
+%rep 36
+    movzx edx, byte [rdi+_bh]
     xor  ebx, edx
     imul ebx, ebx, 16777619
-    inc  ecx
-    jmp  .bh
-.bhd:
+%assign _bh _bh+1
+%endrep
     mov  eax, ebx
-    pop  rdi
     pop  rdx
-    pop  rcx
     pop  rbx
     ret
 
