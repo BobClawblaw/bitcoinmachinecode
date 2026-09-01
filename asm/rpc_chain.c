@@ -608,6 +608,19 @@ static rj_val* script_pubkey_json_x(const u8* s, size_t n, int want_desc){
     rj_obj_set(o, "type", rj_str(type));
     return o;
 }
+/* exported for decodepsbt (witness_utxo.scriptPubKey), the tx-output shape with desc */
+rj_val* rpc_chain_script_pubkey_json(const unsigned char* sc, unsigned long n){ return script_pubkey_json_x(sc, (size_t)n, 1); }
+/* ScriptToAsmStr(script, attempt_sighash_decode) -- decodepsbt final_scriptSig */
+char* rpc_chain_script_asm(const unsigned char* sc, unsigned long n, int sighash){ return script_asm(sc, (size_t)n, sighash); }
+/* ScriptToUniv(include_hex=true, include_address=false): decodepsbt's redeem_script / witness_script */
+rj_val* rpc_chain_script_json_noaddr(const unsigned char* sc, unsigned long n){
+    rj_val* o = rj_obj();
+    char* a = script_asm(sc, n, 0); rj_obj_set(o, "asm", rj_str(a ? a : "")); free(a);
+    { char* di = desc_inner_of(sc, n); char* dc = desc_with_checksum(di); if (dc){ rj_obj_set(o, "desc", rj_str(dc)); free(dc); } free(di); }
+    char* h = malloc(n*2 + 1); if (h){ hex_of(h, sc, n); rj_obj_set(o, "hex", rj_str(h)); free(h); }
+    rj_obj_set(o, "type", rj_str(script_type(sc, n)));
+    return o;
+}
 
 /* ---- TxToUniv (core_io.cpp), include_hex=true, no undo data ---- */
 static rj_val* amount_json(u64 sats){ return rj_numf("%llu.%08llu", sats / 100000000ULL, sats % 100000000ULL); }
