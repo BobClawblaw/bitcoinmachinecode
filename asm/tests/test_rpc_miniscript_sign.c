@@ -143,6 +143,49 @@ int main(void){
       if (!(items == 3 && lens[1] == 32)) printf("  items=%d lens=%d,%d,%d\n", items, lens[0], lens[1], lens[2]);
       rj_free(r);
     }
+    printf("== 5. a tapscript miniscript leaf: descriptorprocesspsbt over a PSBT with tap_leaf_script + internal key ==\n");
+    {
+        static const char* NUMS = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+        char tdesc[512]; snprintf(tdesc, sizeof tdesc, "tr(%s,and_v(v:pk(%s),pk(%s)))", NUMS, W1, W2);
+        static descr_t d; char err[256];
+        ck("tr(NUMS, and_v(v:pk(A),pk(B))) parses", descr_parse(tdesc, &d, err, sizeof err));
+        int msroot = -1; for (int i = 0; i < d.nn; i++) if (d.nodes[i].type == DN_MINISCRIPT) msroot = d.nodes[i].ms_root;
+        ck("...with a miniscript leaf", msroot >= 0);
+        ms_tree_t mt; descr_ms_tree(&d, &mt); descr_msuser_t mu; ms_ctx_t mctx; descr_ms_ctx(&d, 0, 0, &mu, &mctx);
+        static u8 leaf[400]; int ll = msroot >= 0 ? ms_to_script(&mt, &mctx, msroot, leaf, sizeof leaf) : -1;
+        ck("...whose script is the leaf", ll > 0);
+        descr_spk_t sp[4]; int nsp = descr_expand(&d, 0, sp, 4);
+        ck("...and a P2TR scriptPubKey", nsp == 1 && sp[0].len == 34 && sp[0].spk[0] == 0x51);
+        u8 ctrl[33]; ctrl[0] = 0xc0; unhex(NUMS, ctrl + 1, 32);
+        static u8 psbt[4000]; size_t o = 0; static u8 utx[400]; int ul = unhex(UNSIGNED, utx, sizeof utx);
+        memcpy(psbt + o, "psbt\xff", 5); o += 5;
+        psbt[o++] = 1; psbt[o++] = 0x00; psbt[o++] = (u8)ul; memcpy(psbt + o, utx, (size_t)ul); o += (size_t)ul; psbt[o++] = 0;
+        psbt[o++] = 1; psbt[o++] = 0x01; psbt[o++] = (u8)(8 + 1 + 34);
+        unsigned long long amt = 100000000ULL; for (int i = 0; i < 8; i++) psbt[o++] = (u8)(amt >> (8*i));
+        psbt[o++] = 34; memcpy(psbt + o, sp[0].spk, 34); o += 34;
+        psbt[o++] = 34; psbt[o++] = 0x15; memcpy(psbt + o, ctrl, 33); o += 33;           /* TAP_LEAF_SCRIPT: key = 0x15 || control block */
+        psbt[o++] = (u8)(ll + 1); memcpy(psbt + o, leaf, (size_t)ll); o += (size_t)ll; psbt[o++] = 0xc0;   /* value = script || leaf version */
+        psbt[o++] = 1; psbt[o++] = 0x17; psbt[o++] = 32; unhex(NUMS, psbt + o, 32); o += 32;   /* TAP_INTERNAL_KEY */
+        psbt[o++] = 0; psbt[o++] = 0;
+        static char pb[8000]; b64(pb, psbt, o);
+        snprintf(params, sizeof params, "[\"%s\",[\"%s\"]]", pb, tdesc);
+        r = call("descriptorprocesspsbt", params, &ec, &em);
+        comp = r ? rj_obj_get(r, "complete") : NULL; hex = r ? rj_obj_get(r, "hex") : NULL;
+        ck("descriptorprocesspsbt signs the miniscript leaf: complete=true", comp && comp->str[0] == '1');
+        if (!r) printf("  rpc error %ld: %s\n", ec, em ? em : "");
+        items = hex && hex->typ == RJ_STR ? witness_items(hex->str, lens, 16) : -1;
+        /* and_v(v:pk(A),pk(B)): A's signature on top -> bottom-first: sigB, sigA, leaf, control (64-byte DEFAULT sigs) */
+        ck("witness = sigB, sigA (64 bytes each), the leaf script, the control block", items == 4 && lens[0] == 64 && lens[1] == 64 && lens[2] == ll && lens[3] == 33);
+        if (!(items == 4 && lens[0] == 64)) printf("  items=%d lens=%d,%d,%d,%d\n", items, lens[0], lens[1], lens[2], lens[3]);
+        rj_free(r);
+        /* only A: the leaf cannot be satisfied -> incomplete, no crash */
+        char tdesc_a[512]; snprintf(tdesc_a, sizeof tdesc_a, "tr(%s,and_v(v:pk(%s),pk(%s)))", NUMS, W1, PUB2);
+        snprintf(params, sizeof params, "[\"%s\",[\"%s\"]]", pb, tdesc_a);
+        r = call("descriptorprocesspsbt", params, &ec, &em);
+        comp = r ? rj_obj_get(r, "complete") : NULL;
+        ck("with A only the leaf stays unsatisfied: complete=false", r && comp && comp->str[0] == '0');
+        rj_free(r);
+    }
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }
