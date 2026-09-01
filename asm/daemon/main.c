@@ -2601,8 +2601,8 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
  * extend the header we asked from (`loc`, our previous tip)? A getheaders
  * answer that starts anywhere else is not a continuation of our chain. */
 #define DLC_HDR_SANE_MAX 100000L
-static int dlc_headers_sane(long have0, long added){ return have0 <= 0 || added <= DLC_HDR_SANE_MAX; }
-static int dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
+static int __attribute__((unused)) dlc_headers_sane(long have0, long added){ return have0 <= 0 || added <= DLC_HDR_SANE_MAX; }
+static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
     if(hst_get_at(hst, (unsigned long long)have, rec) != 1) return 0;
@@ -2615,6 +2615,114 @@ static void dlc_headers_rollback(unsigned char* hst, long have){
         fprintf(stderr,"[dlc] could not roll headers.dat back to %ld record(s): %s\n", have, strerror(errno));
     hst_init(hst);
     hst_reload(hst);
+}
+
+/* ---- boot header fetch, in C (incident 2026-09-01) --------------------------
+ * The asm node_ibd_headers took a single-hash locator, appended every page
+ * a peer sent without checking that the first one continued the block it
+ * asked from, and its return value did not report what it appended (5033
+ * for a 961,640-header reply; 0 for the next). Two peers in a row answered
+ * from GENESIS on the 12:23 boot -- a peer a block behind does not know our
+ * newest hash, and a one-hash locator gives it nothing else to match. This
+ * fetch does what Core does: an exponential locator (the last 10 headers,
+ * then doubling steps back to genesis), one page at a time, and every page
+ * is checked before it is stored:
+ *   - the page's first header must extend a header WE HOLD (our tip, or an
+ *     earlier locator point -- a peer behind us answers from the last block
+ *     it knows);
+ *   - headers that overlap what we hold must be IDENTICAL (a peer on a fork
+ *     is refused, not merged);
+ *   - every header links to the previous one and carries no transactions;
+ *   - no more than DLC_HDR_SANE_MAX are accepted from one peer (a node a year
+ *     offline is ~52k behind; the incident's reply was 966,669).
+ * Appends go through hst_append; on any refusal the store is rolled back to
+ * where this fetch started. Returns headers appended, or -1. */
+#define DLC_HDR_PAGE 2000
+#define DLC_HDR_LOCATOR_MAX 40
+static int dlc_locator_build(unsigned char* hst, unsigned char* loc_out /* MAX*32 */, long* heights /* MAX */){
+    long have = hst_count(hst); int n = 0;
+    if(have <= 0) return 0;
+    long h = have - 1, step = 1;
+    while(h >= 0 && n < DLC_HDR_LOCATOR_MAX){
+        unsigned char rec[112];
+        if(hst_get_at(hst, (unsigned long long)h, rec) != 1) break;
+        memcpy(loc_out + n * 32, rec + 80, 32); heights[n] = h; n++;
+        if(n >= 10) step *= 2;
+        if(h == 0) break;
+        h -= step; if(h < 0) h = 0;
+    }
+    return n;
+}
+static unsigned long dlc_varint(const unsigned char* p, unsigned long avail, unsigned long* used){
+    if(avail < 1){ *used = 0; return 0; }
+    if(p[0] < 0xfd){ *used = 1; return p[0]; }
+    if(p[0] == 0xfd){ if(avail < 3){ *used = 0; return 0; } *used = 3; return (unsigned long)p[1] | ((unsigned long)p[2] << 8); }
+    *used = 0; return 0;                       /* a headers count never needs more */
+}
+static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
+    long have0 = hst_count(hst), added = 0;
+    static unsigned char page[DLC_HDR_PAGE * 81 + 16];
+    static unsigned char msg[2 << 20];
+    unsigned char stop[32]; memset(stop, 0, 32);
+    for(int round = 0; round < 1000; round++){
+        unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
+        int nl = dlc_locator_build(hst, loc, lh);
+        if(nl <= 0) return -1;
+        long plen = p2p_getheaders(page, loc, nl, stop);
+        if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
+        /* the reply: skip anything else the peer says first (inv, ping, ...) */
+        unsigned mlen = 0; char cmd[12]; int got = 0;
+        for(int k = 0; k < 40 && !got; k++){
+            int r = p2p_read(fd, cmd, msg, sizeof msg, &mlen);
+            if(r <= 0) break;
+            if(!strncmp(cmd, "headers", 12)) got = 1;
+            else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
+        }
+        if(!got){ if(added) break; return -1; }
+        unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
+        if(!used || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) break;   /* malformed: stop here */
+        if(cnt == 0) break;
+        /* where does this page attach? the first header's prev must be one of
+         * the hashes we asked with */
+        const unsigned char* first = msg + used;
+        int at = -1; for(int q = 0; q < nl; q++) if(!memcmp(first + 4, loc + q * 32, 32)){ at = q; break; }
+        if(at < 0){
+            fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\\n", cand, cnt);
+            dlc_headers_rollback(hst, have0); return -1;
+        }
+        long pos = lh[at] + 1;                    /* the height this page's first header would have */
+        long have = hst_count(hst);
+        unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
+        unsigned long i = 0;
+        for(; i < cnt; i++){
+            const unsigned char* h = first + i * 81;
+            if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
+            if(memcmp(h + 4, prev, 32) != 0){
+                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\\n", cand, i);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+            unsigned char bh[32]; block_hash(bh, h);
+            if(pos + (long)i < have){
+                /* overlap with what we hold: must be the same block */
+                unsigned char rec[112];
+                if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
+                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\\n", cand, pos + (long)i);
+                    dlc_headers_rollback(hst, have0); return -1;
+                }
+            } else {
+                if(added + 1 > DLC_HDR_SANE_MAX){
+                    fprintf(stderr,"[dlc] %s offered more than %ld header(s) beyond %ld -- far beyond any plausible gap; discarding\\n", cand, DLC_HDR_SANE_MAX, have0);
+                    dlc_headers_rollback(hst, have0); return -1;
+                }
+                if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
+                added++;
+            }
+            memcpy(prev, bh, 32);
+        }
+        if(i < cnt) break;                        /* a non-empty txn_count: stop taking this peer's pages */
+        if(cnt < DLC_HDR_PAGE) break;             /* a short page is the peer's tip */
+    }
+    return added;
 }
 
 /* extend headers.dat as far as a discovered peer will serve, resuming from
@@ -2659,30 +2767,10 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
     if(node_handshake(fd)!=1){ close(fd); *why = DLC_HT_HANDSHAKE; return -1; }
     if(!peer_has_witness(cand)){ close(fd); *why = DLC_HT_WITNESS; return -1; }
-    long have0 = hst_count(hst);
-    long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
+    (void)loc; (void)hdrbuf; (void)hdrbuf_sz;
+    long added = dlc_fetch_headers(fd, hst, cand);
     close(fd);
     if(added<0){ *why = DLC_HT_FETCH; return -1; }
-    if(added>0 && !dlc_headers_sane(have0, added)){
-        /* a bound on what one boot sync may add: a node a year offline is
-         * ~52k blocks behind; 966,669 in one answer was the incident */
-        fprintf(stderr,"[dlc] %s offered %ld header(s) on top of %ld -- far beyond any plausible gap (limit %ld); discarding\n", cand, added, have0, DLC_HDR_SANE_MAX);
-        dlc_headers_rollback(hst, have0);
-        *why = DLC_HT_FETCH; return -1;
-    }
-    if(added>0 && !dlc_headers_connect_ok(hst, have0, loc)){
-        /* INCIDENT 2026-09-01 11:19: our getheaders carries a single-hash
-         * locator (the tip). A peer that has not seen that block yet answers
-         * from GENESIS, and node_ibd_headers appended all 966,658 of them as
-         * heights 965030.. -- headers.dat and index.dat doubled, the boot
-         * catch-up then "filled the holes" by re-downloading early blocks
-         * under fake heights into the tail slack of blk00000..41. Nothing a
-         * peer sends is a continuation unless its first header's prev-hash
-         * IS our tip. Roll the store back and treat the peer as failed. */
-        fprintf(stderr,"[dlc] headers from %s do not connect to our tip -- discarding %ld header(s)\n", cand, added);
-        dlc_headers_rollback(hst, have0);
-        *why = DLC_HT_FETCH; return -1;
-    }
     return added;
 }
 
