@@ -3,6 +3,11 @@
 #ifndef ARCHIVE_REINDEX_H
 #define ARCHIVE_REINDEX_H
 
+/* The frame magic bitcoin_store.asm writes in front of every block, on EVERY
+ * chain: a store-format constant (mainnet's message-start), not the network
+ * magic. Pass this, never net_magic. */
+#define BMC_FRAME_MAGIC 0xd9b4bef9u
+
 typedef struct {
     long tip;              /* height of the rebuilt active chain */
     long files;            /* blk files scanned */
