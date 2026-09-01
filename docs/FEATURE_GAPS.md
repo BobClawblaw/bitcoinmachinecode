@@ -1330,7 +1330,7 @@ that served BIP157 before this change must now set it explicitly.
 | `torpassword` | Tor control port password (default: empty) | implemented |
 | `txconfirmtarget` | Include enough fee so transactions begin confirmation on average within n blocks (default: 6) | implemented |
 | `txindex` | Maintain a full transaction index, used by the getrawtransaction rpc call (default: 0) | implemented |
-| `txospenderindex` | Maintain a transaction output spender index, used by the gettxspendingprevout rpc call (default: 0) | accepted, no effect: not built yet (tracked in FEATURE_GAPS) |
+| `txospenderindex` | Maintain a transaction output spender index, used by the gettxspendingprevout rpc call (default: 0) | implemented 2026-09-01 — the index is enabled by the presence of `txospender.dat` (offline base + live tail), the key is accepted and changes nothing |
 | `txreconciliation` | Enable transaction reconciliations per BIP 330 (default: 0) | accepted, no effect: Erlay: BIP330 negotiation is built but reconciliation is a deliberate stop |
 | `txsendrate` | Set the maximum ongoing rate for sending transactions to (inbound) peers (default: 14 tx/s) | accepted, no effect: no private broadcast |
 | `uacomment` | Append comment to the user agent string | implemented |

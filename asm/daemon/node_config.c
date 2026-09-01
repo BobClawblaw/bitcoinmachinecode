@@ -178,7 +178,7 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"deprecatedrpc",      "no deprecated-RPC toggles"},
     {"rpcdoccheck",        "debug-only"},
     {"test",               "debug-only"},
-    {"txospenderindex",    "not built yet (tracked in FEATURE_GAPS)"},
+    {"txospenderindex",    "the index is on whenever txospender.dat exists (build it with daemon/build_txospender_index); the key itself changes nothing"},
     {"fastprune",          "debug-only pruning knob; this node prunes by its own MiB budget"},
     {"testnet",            "testnet3 is refused by design; use testnet4=1"},
     {"version",            "command-line only"},
