@@ -454,7 +454,9 @@ Recovery:
   frames that fail their own proof of work are left out -- then drops the
   UTXO set and the height-positional indexes so they rebuild. The previous
   index files stay as `*.pre-reindex`. The key is one-shot (`reindex.done`
-  marks it done); remove it afterwards. The log line to expect is
+  marks it done); remove it afterwards. The rebuild itself takes seconds
+  (an archive of 150,000 blocks in 93 files rebuilds in about five); the
+  UTXO rebuild that follows is the long part. The log line to expect is
   `[reindex] rebuilt: tip=<h> from <n> frame(s) in <f> file(s); ...`.
 - **Reorg rehearsal.** `asm/tests/reorg_drill <datadir-COPY> --depth N`
   disconnects and reconnects the last N blocks on a copy and requires the

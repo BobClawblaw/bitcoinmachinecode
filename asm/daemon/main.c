@@ -5781,10 +5781,9 @@ int main(int argc, char** argv){
                            "(reindex.done exists) -- ignoring. Remove the option, and delete that marker "
                            "if you truly want another rebuild.\n");
         } else {
-            extern unsigned int net_magic;
             archive_reindex_stats rs; char rerr[256] = {0};
             fprintf(stderr,"[reindex] rebuilding the block index from the blk files...\n");
-            if(archive_reindex(".", g_chainp->genesis_hash, net_magic, &rs, rerr, sizeof rerr) != 0){
+            if(archive_reindex(".", g_chainp->genesis_hash, BMC_FRAME_MAGIC, &rs, rerr, sizeof rerr) != 0){
                 fprintf(stderr,"[reindex] FAILED: %s -- nothing was replaced; not starting\n", rerr);
                 return 1;
             }
