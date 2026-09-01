@@ -29,6 +29,9 @@ static node_status_t*       g_status_rw;     /* writable handle for submission *
 static pthread_mutex_t      g_submit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void rpc_node_set_status(const node_status_t* st){ g_status = st; }
+/* -uacomment: the runtime user agent main.c built (getnetworkinfo subversion). */
+static char g_user_agent[256];
+void rpc_node_set_user_agent(const char* ua){ snprintf(g_user_agent, sizeof g_user_agent, "%s", ua ? ua : ""); }
 void rpc_node_set_status_rw(node_status_t* st){ g_status_rw = st; if (!g_status) g_status = st; }
 
 /* txid of a raw tx (BIP141: hash of the no-witness serialization); worker
@@ -95,7 +98,7 @@ static int cmd_getnetworkinfo(rj_val** res){
 
     rj_val* o = rj_obj();
     rj_obj_set(o, "version", rj_numf("%ld", node_client_version()));
-    rj_obj_set(o, "subversion", rj_str(NODE_UA_STRING));
+    rj_obj_set(o, "subversion", rj_str(g_user_agent[0] ? g_user_agent : NODE_UA_STRING));
     rj_obj_set(o, "protocolversion", rj_numf("%d", NODE_PROTOCOL_VER));
     { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)NODE_LOCAL_SERVICES);
       rj_obj_set(o, "localservices", rj_str(h)); }
