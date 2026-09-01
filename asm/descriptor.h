@@ -10,6 +10,7 @@
  * so a descriptor that carries its own keys can sign. */
 #ifndef BMC_DESCRIPTOR_H
 #define BMC_DESCRIPTOR_H
+#include "miniscript.h"
 #define DESCR_MAX_NODES 96
 #define DESCR_MAX_KEYS  64
 #define DESCR_MAX_PATH  32
@@ -35,13 +36,22 @@ typedef struct {
 } descr_key_t;
 
 enum { DN_PK = 1, DN_PKH, DN_WPKH, DN_COMBO, DN_MULTI, DN_SORTEDMULTI, DN_MULTI_A, DN_SORTEDMULTI_A,
-       DN_SH, DN_WSH, DN_TR, DN_ADDR, DN_RAW, DN_RAWTR, DN_BRANCH };
+       DN_SH, DN_WSH, DN_TR, DN_ADDR, DN_RAW, DN_RAWTR, DN_BRANCH, DN_MINISCRIPT };
 typedef struct {
     int type;
     int k;                        /* multi threshold */
     int nkeys; int keys[DESCR_NODE_KEYS];   /* indices into descr_t.keys; tr: keys[0] = internal key */
     int child[2];                 /* sh/wsh: child[0]; tr: child[0] = tree root or -1; branch: both */
+    int ms_root;                  /* DN_MINISCRIPT: root index in the descriptor's miniscript pool */
 } descr_node_t;
+
+/* A descriptor's miniscript pool (wsh(<miniscript>) and every tr() leaf that
+ * is a miniscript share it; keys are descr_t.keys indices). Bounded: a
+ * P2WSH miniscript is at most 3600 script bytes; a tapscript one is
+ * accepted up to these pools ("Descriptor too complex" beyond). */
+#define MS_DESC_NODES 4096
+#define MS_DESC_SUBS  4096
+#define MS_DESC_KEYS  4096
 
 typedef struct {
     descr_node_t nodes[DESCR_MAX_NODES]; int nn;
@@ -52,6 +62,11 @@ typedef struct {
     char checksum[9];             /* computed over the text (without #...) */
     int had_checksum;             /* the input carried one (and it matched) */
     char text[1400];              /* the input without its checksum */
+    int ms_tapscript;             /* the pool's context: 1 under tr() */
+    int32_t msnn, msns, msnk;
+    ms_node_t msnodes[MS_DESC_NODES];
+    int32_t   mssubs[MS_DESC_SUBS];
+    int32_t   mskeys[MS_DESC_KEYS];
 } descr_t;
 
 typedef struct { unsigned char spk[DESCR_MAX_SPK]; int len; } descr_spk_t;
@@ -77,4 +92,15 @@ int  descr_key_priv_at(const descr_t* d, int key, long idx, unsigned char priv[3
 int  descr_inner_script_at(const descr_t* d, long idx, unsigned char* out, int cap, int* which /* 1 sh, 2 wsh, 3 sh(wsh) */);
 /* 1 if the top-level expansion has a single address (Core ExtractDestination) */
 int  descr_has_address(const descr_t* d);
+
+/* ---- miniscript access (the PSBT signer) ----
+ * The miniscript view of a descriptor's pool, and the key context that
+ * derives/prints its keys at range index idx (tr = x-only keys). Both point
+ * INTO d; keep d alive while using them. */
+typedef struct { const descr_t* d; long idx; int tr; int with_priv; char* err; unsigned long errcap; int key_err; } descr_msuser_t;
+void descr_ms_tree(const descr_t* d, ms_tree_t* out);
+void descr_ms_ctx(const descr_t* d, long idx, int with_priv, descr_msuser_t* u, ms_ctx_t* ctx);
+/* the miniscript root of the top-level wsh(), or of the single tr() leaf
+ * whose script equals leaf[0..leaflen) at idx; -1 if none */
+int  descr_ms_root(const descr_t* d, long idx, const unsigned char* leaf, int leaflen);
 #endif
