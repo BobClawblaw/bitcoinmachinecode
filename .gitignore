@@ -416,3 +416,4 @@ asm/tests/tool_*
 # per-chain live confs carry rpc credentials, like config/bitcoin.conf
 config/bitcoin.testnet4.conf
 config/bitcoin.regtest.conf
+port/arm64/parity_out/
