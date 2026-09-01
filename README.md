@@ -117,7 +117,7 @@ testnet4, signet (public or custom) and regtest.
 - Bitcoin Core's JSON-RPC method set (155 methods; only `rpc.discover` is
   absent), with Core's result shapes, error codes and messages. See
   [`docs/RPC_LIVE_NODE.md`](docs/RPC_LIVE_NODE.md).
-- `txindex`, `coinstatsindex` (incremental MuHash, so `gettxoutsetinfo`
+- `txindex, txospenderindex`, `coinstatsindex` (incremental MuHash, so `gettxoutsetinfo`
   answers without a UTXO walk) and `blockfilterindex` (BIP158 basic filters
   plus the filter-header chain), all tip-following; `getindexinfo`.
 - `addrindex` (an extension with no Core equivalent): `getaddressbalance`
