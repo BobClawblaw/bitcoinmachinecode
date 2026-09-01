@@ -132,6 +132,63 @@ int main(void){
       if (!r) printf("    (%ld: %s)\n", ec, em ? em : ""); if (dv && dv->nitems) printf("    (path %s)\n", S(dv->items[0], "path") ? S(dv->items[0], "path") : "-");
       if (d) rj_free(d); if (r) rj_free(r); }
 
+
+    printf("== 7. partial signatures: wsh(multi) signed by K0 then K1 (finalize=false carry) ==\n");
+    { u8 ws[71]; int o = 0; ws[o++] = 0x52; ws[o++] = 33; memcpy(ws+o, pub[0], 33); o += 33; ws[o++] = 33; memcpy(ws+o, pub[1], 33); o += 33; ws[o++] = 0x52; ws[o++] = 0xae;
+      u8 wsh[32]; sha256_full(wsh, ws, (unsigned long)o); u8 wspk[34]; wspk[0] = 0; wspk[1] = 0x20; memcpy(wspk+2, wsh, 32);
+      static u8 utx2[400]; long ul2 = mk_utx(utx2, wspk, 34); mk_psbt(ps64, utx2, ul2, wspk, 34);
+      snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"], \"ALL\", true, false]", ps64, wif[0], ph[1]);
+      r = call("descriptorprocesspsbt", pj, &ec, &em);
+      ck("K0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      char* half = r && S(r, "psbt") ? strdup(S(r, "psbt")) : NULL; if (r) rj_free(r);
+      d = half ? decode(half) : NULL; i0 = in0(d);
+      { rj_val* ps = i0 ? rj_obj_get(i0, "partial_signatures") : NULL;
+        { long jl = 0; char* js = ps ? rj_write_alloc(ps, 0, &jl) : NULL; printf("    (partial_signatures: %s)\n", js ? js : "(none)"); free(js); }
+        ck("...partial_signatures carries exactly K0's signature", ps && rj_obj_get(ps, ph[0]) && !rj_obj_get(ps, ph[1]));
+        ck("...no final fields", i0 && !rj_obj_get(i0, "final_scriptwitness")); }
+      if (d) rj_free(d);
+      if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", half, ph[0], wif[1]);
+          r = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("K1 completes it using K0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          if (r) rj_free(r); free(half); } }
+
+    printf("== 8. partial signatures: wsh(and_v(v:pk(K0),pk(K1))) miniscript, K1 first then K0 ==\n");
+    { char dtext[300]; snprintf(dtext, sizeof dtext, "wsh(and_v(v:pk(%s),pk(%s)))", ph[0], ph[1]);
+      static descr_t dd; char err[256]; static descr_spk_t sp[4];
+      ck("parse", descr_parse(dtext, &dd, err, sizeof err)); ck("expand", descr_expand(&dd, 0, sp, 4) == 1);
+      static u8 utx3[400]; long ul3 = mk_utx(utx3, sp[0].spk, sp[0].len); mk_psbt(ps64, utx3, ul3, sp[0].spk, sp[0].len);
+      snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(and_v(v:pk(%s),pk(%s)))\"], \"ALL\", true, false]", ps64, ph[0], wif[1]);
+      r = call("descriptorprocesspsbt", pj, &ec, &em);
+      ck("K1 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      char* half = r && S(r, "psbt") ? strdup(S(r, "psbt")) : NULL; if (r) rj_free(r);
+      d = half ? decode(half) : NULL; i0 = in0(d);
+      { rj_val* ps = i0 ? rj_obj_get(i0, "partial_signatures") : NULL;
+        ck("...partial_signatures carries K1's signature (the satisfier's own)", ps && rj_obj_get(ps, ph[1]) && !rj_obj_get(ps, ph[0]));
+        ck("...witness_script from the Updater", i0 && S(i0, "witness_script")); }
+      if (d) rj_free(d);
+      if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(and_v(v:pk(%s),pk(%s)))\"]]", half, wif[0], ph[1]);
+          r = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("K0 completes the miniscript input with K1's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          if (r) rj_free(r); free(half); } }
+
+    printf("== 9. tapscript miniscript leaf: tr(K2,and_v(v:pk(x0),pk(x1))), x0 first then x1 ==\n");
+    { char dtext[300]; snprintf(dtext, sizeof dtext, "tr(%s,and_v(v:pk(%s),pk(%s)))", xh[2], xh[0], xh[1]);
+      static descr_t dd; char err[256]; static descr_spk_t sp[4];
+      ck("parse", descr_parse(dtext, &dd, err, sizeof err)); ck("expand", descr_expand(&dd, 0, sp, 4) == 1);
+      static u8 utx4[400]; long ul4 = mk_utx(utx4, sp[0].spk, sp[0].len); mk_psbt(ps64, utx4, ul4, sp[0].spk, sp[0].len);
+      snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,and_v(v:pk(%s),pk(%s)))\"], \"DEFAULT\", true, false]", ps64, xh[2], wif[0], xh[1]);
+      r = call("descriptorprocesspsbt", pj, &ec, &em);
+      ck("x0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      char* half = r && S(r, "psbt") ? strdup(S(r, "psbt")) : NULL; if (r) rj_free(r);
+      d = half ? decode(half) : NULL; i0 = in0(d);
+      { rj_val* sp2 = i0 ? rj_obj_get(i0, "taproot_script_path_sigs") : NULL;
+        ck("...taproot_script_path_sigs carries x0's signature with the leaf hash", sp2 && sp2->nitems == 1 && S(sp2->items[0], "pubkey") && !strcmp(S(sp2->items[0], "pubkey"), xh[0]) && S(sp2->items[0], "leaf_hash"));
+        ck("...the Updater put the leaf and control block in", i0 && rj_obj_get(i0, "taproot_scripts")); }
+      if (d) rj_free(d);
+      if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,and_v(v:pk(%s),pk(%s)))\"]]", half, xh[2], xh[0], wif[1]);
+          r = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("x1 completes the leaf with x0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          if (r) rj_free(r); free(half); } }
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

@@ -20,6 +20,12 @@ typedef struct {
     unsigned char pre[MS_PRE_MAX][32];
 } ms_preimages_t;
 
+/* a signature another signer left in the PSBT: TAP_SCRIPT_SIG for a leaf (x = 32-byte
+ * x-only key) or PARTIAL_SIG for a P2WSH input (x = 33-byte compressed key) */
+typedef struct { const unsigned char* x; const unsigned char* sig; int sl; } ms_psig_t;
+/* every signature the satisfier placed (ours, or carried): what the PSBT's partial
+ * signature fields get when the caller does not finalize */
+typedef struct { unsigned char pub[33]; int publen; unsigned char sig[80]; int sl; } ms_sigrec_t;
 /* P2WSH: witnessScript ws[0..wl), BIP143 sighash z for it, hashtype byte,
  * this input's nSequence and the tx nLockTime, the signer's key table
  * (compressed pubkeys; ncomp[k] = 1 compressed), the preimages.
@@ -30,11 +36,11 @@ int ms_sign_witness_v0(const unsigned char* ws, size_t wl, const unsigned char z
                        unsigned seq, unsigned long locktime,
                        unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys,
                        const unsigned char (*pubs)[33], int npubs,          /* pubkeys known without a private key (pk_h resolution) */
+                       const ms_psig_t* psigs, int npsigs,                  /* PARTIAL_SIGs carried from the PSBT (33-byte keys) */
                        const ms_preimages_t* pre,
+                       ms_sigrec_t* recs, int reccap, int* nrecs,           /* signatures placed (NULL = not wanted) */
                        unsigned char* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err);
 
-/* a BIP340 signature another signer left in the PSBT (TAP_SCRIPT_SIG) for this leaf */
-typedef struct { const unsigned char* x; const unsigned char* sig; int sl; } ms_psig_t;
 /* Tapscript leaf: same contract with the BIP341 leaf sighash z; hashtype 0
  * gives 64-byte signatures. Keys are matched x-only; keys we do not hold
  * are "available" when the PSBT carries a partial signature for them. */
@@ -44,5 +50,6 @@ int ms_sign_witness_tapleaf(const unsigned char* leaf, size_t ll, const unsigned
                             const unsigned char (*pubs)[33], int npubs,
                             const ms_psig_t* psigs, int npsigs,
                             const ms_preimages_t* pre,
+                            ms_sigrec_t* recs, int reccap, int* nrecs,
                             unsigned char* wit, unsigned long witcap, unsigned long* witlen, int* wititems, const char** err);
 #endif
