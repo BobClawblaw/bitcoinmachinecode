@@ -20,7 +20,8 @@
 	.type fd_write_all, %function
 fd_write_all:
 	stp x19, x20, [sp, #-16]!
-	stp x21, xzr, [sp, #-16]!
+	stp x21, x22, [sp, #-16]!
+	sub sp, sp, #32                  /* pollfd@0..7, timespec@16..31 */
 	mov x19, x0
 	mov x20, x1
 	mov x21, x2
@@ -28,6 +29,25 @@ fd_write_all:
 .WAL:
 	cmp x12, x21
 	b.hs .WADONE
+	/* ---- bound the write: ppoll({fd, POLLOUT}, 1, {10s,0}, NULL) first
+	 * (x86 parity; aarch64 has no plain poll -- 73 IS ppoll). A peer that
+	 * stops reading otherwise holds a blocking write() for ever.
+	 * NULL timeout or error: both are a failed write (-1). */
+	str x19, [sp, #0]                /* pollfd.fd */
+	mov w1, #4                      /* POLLOUT */
+	strh w1, [sp, #4]
+	strh wzr, [sp, #6]
+	mov x2, #10                     /* timespec {10, 0} */
+	str x2, [sp, #16]
+	str xzr, [sp, #24]
+	mov x0, sp                      /* fds */
+	mov x1, #1                      /* nfds */
+	add x2, sp, #16                 /* &timeout */
+	mov x3, xzr                     /* sigmask */
+	mov x8, #73                     /* ppoll */
+	svc #0
+	cmp x0, #1
+	b.lt .WAFAIL
 	mov x0, x19
 	add x1, x20, x12
 	sub x2, x21, x12
@@ -35,6 +55,7 @@ fd_write_all:
 	svc #0
 	cmp x0, #0
 	b.gt .WAOK
+.WAFAIL:
 	mov x0, #-1
 	b .WARET
 .WAOK:
@@ -43,7 +64,8 @@ fd_write_all:
 .WADONE:
 	mov x0, x12
 .WARET:
-	ldp x21, xzr, [sp], #16
+	add sp, sp, #32
+	ldp x21, x22, [sp], #16
 	ldp x19, x20, [sp], #16
 	ret
 	.size fd_write_all, .-fd_write_all
@@ -121,6 +143,17 @@ tcp_connect_ip:
 	mov x0, x21
 	mov x1, #1
 	mov x2, #20
+	mov x3, sp
+	mov x4, #16
+	mov x8, #208
+	svc #0
+	/* ---- and SO_SNDTIMEO (21) with the same 10s: on Linux it bounds the
+	 * blocking connect() below (the x86 2026-08-31 worker-wedge fix); without
+	 * it a blackholed address holds connect() for the kernel's two-minute
+	 * SYN schedule. Also bounds every later write on this socket. */
+	mov x0, x21
+	mov x1, #1
+	mov x2, #21
 	mov x3, sp
 	mov x4, #16
 	mov x8, #208
