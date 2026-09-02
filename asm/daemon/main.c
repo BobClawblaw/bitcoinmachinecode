@@ -5178,7 +5178,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                  * compaction the whole set is walked and must equal the
                  * pre-recovery count, or UTXO tracking halts for good. */
                 long rounds = -1;
-                if(utxo_live_recovery_applicable()){
+                if(utxo_live_halted()){
+                    /* a spend found its coin absent right after verification resolved
+                     * it: the store is lying and nothing downstream can be trusted */
+                    utxo_live_ok = 0;
+                    fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: store lookup inconsistency during apply (incident 2026-09-01 class). "
+                                   "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
+                            utxo_live_applied_height());
+                } else if(utxo_live_recovery_applicable()){
                     long count_before = utxo_live_count();
                     fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld with a full manifest -- compacting in place (pre-recovery count %ld)\n",
                             utxo_live_applied_height(), count_before);
