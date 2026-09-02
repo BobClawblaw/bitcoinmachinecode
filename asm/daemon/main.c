@@ -1144,6 +1144,7 @@ static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lo
 static char g_cur_peer_ip[64];
 extern void (*g_serve_violation_hook)(const char*);
 #include "relay_policy.h"
+#include "private_broadcast.h"
 #include "../bmc_thread.h"   /* 2026-09-01: the mempool-reload and i2p-accept threads ran on glibc-default stacks; with ~12 MB of static TLS that is a few KB of real stack, and the one-write logging buffer (8 KB) overflowed it the moment a reused datadir had a mempool.dat to reload (fault addr == rsp in log_vfprintf_at, reproduced by validation/relay_policy_core_diff.sh run B twice) */
 extern unsigned g_conn_perms;                     /* whitebind permissions of this child (defined below) */
 /* ---- relay policy per inbound connection (2026-09-01; daemon/relay_policy.c)
@@ -1250,6 +1251,20 @@ int peer_misbehaving(const char* ip, int points, const char* reason);
 static void serve_violation_report(const char* reason){
     if(!g_cur_peer_ip[0]) return;
     peer_misbehaving(g_cur_peer_ip, 100, reason ? reason : "protocol violation");
+}
+/* audit 2026-09-02 N3: the download worker's legs report by fd (tx_relay.c
+ * declares this weak; the daemon supplies it). Map the fd to its leg's
+ * "host:port", strip the port, and score it like a serve-side violation. */
+void txr_report_violation_fd(int fd, const char* reason){
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] != fd) continue;
+        char host[128]; snprintf(host, sizeof host, "%s", mux_out_host[k]);
+        if(host[0] == '['){ char* e = strchr(host, ']'); if(e) *e = 0; memmove(host, host + 1, strlen(host)); }
+        else { char* c = strrchr(host, ':'); if(c && c == strchr(host, ':')) *c = 0; }   /* exactly one ':' = host:port; a bare IPv6 has several and no port */
+        if(!host[0]) return;
+        peer_misbehaving(host, 100, reason ? reason : "protocol violation");
+        return;
+    }
 }
 
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
@@ -2212,6 +2227,146 @@ static int dh_start(const char* host, int out_port){
     fprintf(stderr, "[dial] %s: dialing in the background (%s)\n", host, bmc_net_name(g_dh[slot].net));
     return 1;
 }
+/* ---- -privatebroadcast (Core v30): the worker's side -----------------------
+ * The queue and the wire exchange are daemon/private_broadcast.c. Here: which
+ * network and which address, one forked helper child per connection (the same
+ * shape as the background dials above -- the child dials, runs the whole
+ * inv/getdata/tx/ping/pong conversation and reports over a socketpair, so
+ * the rotation loop never blocks on Tor), the reattempt clock, the "received
+ * back from the network" check, the RPC snapshot and the abort op. */
+static unsigned long long dl_pool_rng(void);
+static void* txsub_pool(void);
+static int   txsub_worker_ready(void);
+extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32], unsigned long* out_len);
+typedef struct { int rc; char why[128]; } pbh_result_t;
+typedef struct { pid_t pid; int sp; int tx_index; int peer_slot; long long t0; char host[96]; } pbh_slot_t;
+static pbh_slot_t g_pbh[PB_MAX_CONNECTIONS];
+static long      g_pb_num_to_open = 0;          /* Core CConnman::PrivateBroadcast::m_num_to_open */
+static long long g_pb_next_reattempt_s = 0;
+static int       g_pb_dirty = 1;
+static long      g_pb_sent = 0, g_pb_confirmed = 0, g_pb_received_back = 0, g_pb_given_up = 0;
+static long long pb_wall_s(void){ return (long long)time(NULL); }
+static int pbh_inflight(void){ int n = 0; for(int i = 0; i < PB_MAX_CONNECTIONS; i++) if(g_pbh[i].pid > 0) n++; return n; }
+static int pb_reachable_now(void){ return dialer_net_reachable(BMC_NET_TORV3) || dialer_net_reachable(BMC_NET_I2P); }
+/* a random routable address of `net` from the book, not a live leg, not banned */
+static int pb_pick_addr(int net, bmc_addr_t* out){
+    ab2_t* b = addr_book(); if(!b) return 0;
+    long cnt = ab2_count(b), n = 0, chosen = -1;
+    for(long i = 0; i < cnt; i++){
+        ab2_rec_t r; if(!ab2_get(b, i, &r)) continue;
+        if((int)r.a.net != net || !bmc_addr_is_routable(&r.a)) continue;
+        n++;
+        if((long)(dl_pool_rng() % (unsigned long long)n) == 0) chosen = i;   /* reservoir of one */
+    }
+    if(chosen < 0) return 0;
+    ab2_rec_t r; if(!ab2_get(b, chosen, &r)) return 0;
+    char hp[128]; if(!bmc_addr_to_string_port(hp, sizeof hp, &r.a)) return 0;
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], hp)) return 0;
+    { char ip[128]; ctl_ip_only(hp, ip, sizeof ip); if(ctl_is_banned(ip)) return 0; }
+    *out = r.a; return 1;
+}
+static int pbh_start(int tx_index, int peer_slot, const bmc_addr_t* a, const char* hp){
+    const pb_tx_t* t = pb_queue_at(tx_index); if(!t) return 0;
+    int slot = -1; for(int i = 0; i < PB_MAX_CONNECTIONS; i++) if(g_pbh[i].pid <= 0){ slot = i; break; }
+    if(slot < 0) return 0;
+    int sp[2]; if(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return 0;
+    pid_t pid = fork();
+    if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
+    if(pid == 0){
+        close(sp[0]); g_in_dial_helper = 1;
+        pbh_result_t r; memset(&r, 0, sizeof r);
+        const char* why = "";
+        int fd = dialer_connect_private(a, 60000, &why);
+        if(fd < 0){ r.rc = -1; snprintf(r.why, sizeof r.why, "dial: %s", why); }
+        else { r.rc = pb_exchange(fd, t->tx, t->len, t->txid, PB_CONN_LIFETIME_S, r.why, sizeof r.why); close(fd); }
+        (void)!write(sp[1], &r, sizeof r);
+        _exit(0);
+    }
+    close(sp[1]);
+    g_pbh[slot].pid = pid; g_pbh[slot].sp = sp[0]; g_pbh[slot].tx_index = tx_index; g_pbh[slot].peer_slot = peer_slot; g_pbh[slot].t0 = pb_wall_s();
+    snprintf(g_pbh[slot].host, sizeof g_pbh[slot].host, "%s", hp);
+    fprintf(stderr, "[privbcast] connecting to %s (%s) to deliver one transaction\n", hp, bmc_net_name(a->net));
+    return 1;
+}
+static void pbh_poll(void){
+    for(int i = 0; i < PB_MAX_CONNECTIONS; i++){
+        if(g_pbh[i].pid <= 0) continue;
+        pbh_result_t r; memset(&r, 0, sizeof r);
+        ssize_t n = recv(g_pbh[i].sp, &r, sizeof r, MSG_DONTWAIT);
+        if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)){
+            if(pb_wall_s() - g_pbh[i].t0 > PB_CONN_LIFETIME_S + 90){
+                kill(g_pbh[i].pid, SIGKILL); r.rc = 0; snprintf(r.why, sizeof r.why, "helper gave up");
+            } else continue;
+        } else if(n != (ssize_t)sizeof r){ r.rc = 0; snprintf(r.why, sizeof r.why, "helper exited without a result"); }
+        waitpid(g_pbh[i].pid, NULL, 0); close(g_pbh[i].sp); g_pbh[i].pid = 0; g_pbh[i].sp = -1;
+        if(r.rc == 2){ pb_queue_mark_received(g_pbh[i].tx_index, g_pbh[i].peer_slot, pb_wall_s()); g_pb_sent++; g_pb_confirmed++;
+            fprintf(stderr, "[privbcast] %s acknowledged the transaction (pong)\n", g_pbh[i].host); }
+        else if(r.rc == 1){ g_pb_sent++; fprintf(stderr, "[privbcast] %s took the transaction but sent no pong (%s)\n", g_pbh[i].host, r.why[0] ? r.why : "timeout"); }
+        else {
+            /* Core: a private connection that closes without confirming asks for one more */
+            pb_queue_unpick(g_pbh[i].tx_index, g_pbh[i].peer_slot);
+            if(pb_queue_at(g_pbh[i].tx_index)) g_pb_num_to_open++;
+            fprintf(stderr, "[privbcast] %s: %s -- will try another peer\n", g_pbh[i].host, r.why[0] ? r.why : "failed");
+        }
+        g_pb_dirty = 1;
+    }
+}
+static void pb_publish(void){
+    if(!g_node_status) return;
+    pb_queue_snapshot((char*)g_node_status->pb_info, RPC_PB_INFO_CAP);
+    __sync_synchronize(); g_node_status->pb_info_seq++;
+    g_pb_dirty = 0;
+}
+/* one rotation of the driver: open what is owed, poll what is running,
+ * notice what came back, reattempt what went stale, publish the snapshot */
+static void pb_rotation(void){
+    if(!g_cfg.privatebroadcast || !g_node_status) return;
+    pbh_poll();
+    /* received back from the network? our own submission never entered the
+     * mempool, so a queued txid that is now in the pool arrived via a peer */
+    if(txsub_worker_ready()){
+        for(int i = 0; i < PB_MAX_TX; i++){
+            const pb_tx_t* t = pb_queue_at(i); if(!t) continue;
+            unsigned long l = 0;
+            if(mpool_get(txsub_pool(), t->txid, &l)){
+                long acks = pb_queue_remove(t->txid); g_pb_received_back++; g_pb_dirty = 1;
+                if(acks >= 0 && acks < PB_NUM_PER_TX){ g_pb_num_to_open -= PB_NUM_PER_TX - acks; if(g_pb_num_to_open < 0) g_pb_num_to_open = 0; }
+                fprintf(stderr, "[privbcast] received our privately broadcast transaction back from the network (%ld peer(s) had acknowledged it) -- stopping\n", acks);
+            }
+        }
+    }
+    if(!pb_queue_has_pending()) g_pb_num_to_open = 0;
+    /* Core ReattemptPrivateBroadcast: every 2-3 min, stale entries are re-tested
+     * against the mempool and re-broadcast, or dropped with the reason */
+    long long now = pb_wall_s();
+    if(g_pb_next_reattempt_s == 0) g_pb_next_reattempt_s = now + PB_REATTEMPT_MIN_S + (long long)(dl_pool_rng() % PB_REATTEMPT_JITTER_S);
+    if(now >= g_pb_next_reattempt_s && txsub_worker_ready()){
+        int st[PB_MAX_TX]; int ns = pb_queue_stale(now, st, PB_MAX_TX);
+        for(int k = 0; k < ns; k++){
+            const pb_tx_t* t = pb_queue_at(st[k]); if(!t) continue;
+            extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*);
+            char reason[128]; reason[0] = 0; unsigned long long fee = 0;
+            long ok = tx_accept_test_reason(txsub_pool(), t->txid, t->tx, t->len, reason, sizeof reason, &fee);
+            if(ok == 1){ g_pb_num_to_open++; fprintf(stderr, "[privbcast] reattempting broadcast of a stale transaction (%d peer(s) so far)\n", t->npeers); }
+            else { fprintf(stderr, "[privbcast] giving up broadcast attempts: %s\n", reason[0] ? reason : "no longer acceptable"); pb_queue_remove(t->txid); g_pb_given_up++; }
+            g_pb_dirty = 1;
+        }
+        g_pb_next_reattempt_s = now + PB_REATTEMPT_MIN_S + (long long)(dl_pool_rng() % PB_REATTEMPT_JITTER_S);
+    }
+    /* open what is owed */
+    int bad = 0;
+    while(g_pb_num_to_open > 0 && pbh_inflight() < PB_MAX_CONNECTIONS && pb_queue_has_pending() && bad < 8){
+        int net = dialer_pb_pick_network();
+        if(!net){ static long said; if(now - said > 300){ said = now; fprintf(stderr, "[privbcast] cannot open connections: neither Tor nor I2P is reachable\n"); } break; }
+        bmc_addr_t a; if(!pb_pick_addr(net, &a)){ bad++; continue; }
+        char hp[128]; bmc_addr_to_string_port(hp, sizeof hp, &a);
+        int slot = -1; int ti = pb_queue_pick(hp, now, &slot);
+        if(ti < 0) break;
+        if(!pbh_start(ti, slot, &a, hp)){ pb_queue_unpick(ti, slot); break; }
+        g_pb_num_to_open--; g_pb_dirty = 1;
+    }
+    if(g_pb_dirty) pb_publish();
+}
 /* one completed (or timed-out) helper per call: 1 = result in *out (fd_out >= 0 iff ok), 0 = nothing */
 static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
     for(int i = 0; i < DH_MAX; i++){
@@ -2439,8 +2594,9 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
         if(!dl_resolve1(g_cfg.addnode[i], ipd)){
             fprintf(stderr,"[boot] addnode=%s did not resolve\n", g_cfg.addnode[i]); continue; }
         if(inet_pton(AF_INET,ipd,&ip)!=1) continue;
-        if(book_add_ipv4(ip, g_chainp->default_port)>0) total++;
-        fprintf(stderr,"[boot] addnode %s -> %s\n", g_cfg.addnode[i], ipd);
+        { unsigned short ap = g_cfg.addnode_port[i] ? g_cfg.addnode_port[i] : g_chainp->default_port;   /* Core: addnode=host:port keeps its port */
+          if(book_add_ipv4(ip, ap)>0) total++;
+          fprintf(stderr,"[boot] addnode %s -> %s:%u\n", g_cfg.addnode[i], ipd, (unsigned)ap); }
     }
 
     /* Core -seednode: ask for addresses, then drop the connection. Distinct
@@ -3133,7 +3289,9 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
                     if(!__sync_bool_compare_and_swap(&claimed[idx],0,1)) continue;
                     /* the entry's own port when it has one; the chain default is only a
                      * fallback for bare addresses (same rule as the header tries) */
-                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cp2 ? cp2 : g_chainp->default_port)));
+                    { int cpc = cp2 ? cp2 : node_config_peer_port(cand); if(!cpc) cpc = g_chainp->default_port;   /* addnode=host:port keeps its port here too */
+                      cp2 = cpc; }
+                    int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
@@ -3249,7 +3407,8 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
         if(fd<0){ cfd[nc++]=-1; continue; }
         int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
         struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
-        sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)g_chainp->default_port);
+        { int cp = pport ? pport : node_config_peer_port(pool[i]);   /* addnode=host:port / connect=host:port keep their port */
+          sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)(cp ? cp : g_chainp->default_port)); }
         int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
         if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
         cfd[nc++]=fd;
@@ -4127,6 +4286,30 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     /* transports for the non-IPv4 networks (SOCKS5 to tor, SAM to i2pd).
      * Cheap and silent when nothing is configured. */
     dialer_init();
+    /* -privatebroadcast (Core v30 init.cpp): refuse to run it without a way to
+     * reach Tor or I2P, or alongside connect= (it must dial random peers); warn
+     * when proxyrandomize=0 would let circuits be correlated. */
+    if (g_cfg.privatebroadcast){
+        int tor = dialer_net_reachable(BMC_NET_TORV3), i2p = dialer_net_reachable(BMC_NET_I2P);
+        if (!tor && !i2p && !g_cfg.listenonion){
+            fprintf(stderr, "[config] FATAL: private broadcast of own transactions requested (privatebroadcast=1), but none of Tor or I2P networks is reachable -- set onion=/proxy= or i2psam=, or drop the option\n");
+            exit(1);
+        }
+        if (g_cfg.n_connect > 0)
+            /* Core refuses this pairing because its private dials go through the
+             * same connection budget connect= restricts. Ours dial the address
+             * book directly, so the pairing works here; it is still worth a
+             * loud note because the operator has restricted this node's peers
+             * on purpose and private broadcast will talk to peers outside that
+             * list. */
+            fprintf(stderr, "[config] WARNING: privatebroadcast=1 with connect= (Core refuses this pairing): private broadcast connections go to randomly chosen Tor/I2P peers from the address book, outside the connect= list\n");
+        if (!g_cfg.proxyrandomize)
+            fprintf(stderr, "[config] WARNING: privatebroadcast=1 with proxyrandomize=0: Tor circuits for private broadcast connections may be correlated to other connections over Tor; set proxyrandomize=1 for maximum privacy\n");
+        pb_queue_init();
+        fprintf(stderr, "[privbcast] enabled: sendrawtransaction goes out over %s%s%sshort-lived connections, %d per transaction, and stays out of the mempool until heard back\n",
+                tor ? "tor " : "", i2p ? "i2p " : "", (tor && dialer_proxy_configured()) ? "clearnet-via-proxy " : "", PB_NUM_PER_TX);
+    }
+    if (g_node_status){ g_node_status->pb_enabled = g_cfg.privatebroadcast ? 1 : 0; g_node_status->pb_reachable = pb_reachable_now() ? 1 : 0; g_node_status->pb_info[0] = 0; }
     { extern long undo_replay(long, bfi_undo_cb_t, void*);
       bfi_set_undo_replay(undo_replay);
       /* the address index consumes the same undo stream (spent prevout
@@ -4541,7 +4724,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             char arg[128];
             snprintf(arg, sizeof arg, "%s", (const char*)g_node_status->ctl_arg);
             int result = 0; char reason[128]; reason[0] = 0;
-            if(op == RPC_CTL_SETNETACTIVE){
+            g_node_status->ctl_out[0] = 0;
+            if(op == RPC_CTL_PB_ABORT){
+                unsigned char id[32]; int okhex = strlen(arg) == 64;
+                for(int i = 0; okhex && i < 32; i++){ unsigned v; if(sscanf(arg + i*2, "%2x", &v) != 1){ okhex = 0; break; } id[31 - i] = (unsigned char)v; }
+                if(!okhex){ result = -8; snprintf(reason, sizeof reason, "id must be a 64-character hex txid or wtxid"); }
+                else {
+                    static unsigned char rt[PB_MAX_TX][32], rw[PB_MAX_TX][32];
+                    long n = pb_queue_abort(id, rt, rw, PB_MAX_TX);
+                    long o = 0; static const char* HX = "0123456789abcdef";
+                    for(long k = 0; k < n && k < PB_MAX_TX && o + 132 < (long)sizeof g_node_status->ctl_out; k++){
+                        char* out = (char*)g_node_status->ctl_out;
+                        for(int i = 0; i < 32; i++){ out[o++] = HX[rt[k][31-i] >> 4]; out[o++] = HX[rt[k][31-i] & 15]; }
+                        out[o++] = ' ';
+                        for(int i = 0; i < 32; i++){ out[o++] = HX[rw[k][31-i] >> 4]; out[o++] = HX[rw[k][31-i] & 15]; }
+                        out[o++] = '\n'; out[o] = 0;
+                    }
+                    result = (int)n; pb_publish();
+                    if(n > 0) fprintf(stderr, "[privbcast] aborted %ld queued transaction(s) on request\n", n);
+                }
+            } else if(op == RPC_CTL_SETNETACTIVE){
                 g_node_status->net_active = num ? 1 : 0;
                 if(!num){
                     /* Core drops every connection when the network goes down;
@@ -4743,6 +4945,29 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                      reason, sizeof reason, &fee);
                     }
                     g_node_status->tx_submit_fee = fee;
+                }
+                else if(g_node_status->tx_submit_private){
+                    g_node_status->tx_submit_private = 0;
+                    if(!g_cfg.privatebroadcast){ result = -1; snprintf(reason, sizeof reason, "private broadcast is not enabled"); }
+                    else if(!pb_reachable_now()){ result = -1; snprintf(reason, sizeof reason, "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable"); }
+                    else {
+                        /* Core BroadcastTransaction(NO_MEMPOOL_PRIVATE_BROADCAST): test-accept
+                         * first (its rejection is the RPC's), then queue -- never the mempool */
+                        extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*);
+                        extern int tx_txid(unsigned char[32], const unsigned char*, unsigned long, unsigned char*, unsigned long);
+                        static unsigned char pscratch[2000*81 + 8]; unsigned char tid[32]; unsigned long long fee = 0;
+                        if(!tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, pscratch, sizeof pscratch)){ result = -22; snprintf(reason, sizeof reason, "TX decode failed"); }
+                        else {
+                            result = (int)tx_accept_test_reason(txsub_pool(), tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, reason, sizeof reason, &fee);
+                            if(result == 1){
+                                int ar = pb_queue_add((const unsigned char*)g_node_status->tx_submit_buf, tlen, pb_wall_s());
+                                if(ar == 1){ g_pb_num_to_open += PB_NUM_PER_TX; pb_publish();   /* the RPC's next getprivatebroadcastinfo must already see it */
+                                    fprintf(stderr, "[privbcast] queued a transaction for private broadcast (%d connections requested; not in the mempool)\n", PB_NUM_PER_TX); }
+                                else if(ar == 0){ /* already queued: Core ignores the duplicate request */ }
+                                else { result = -1; snprintf(reason, sizeof reason, "private broadcast queue is full (cap=%d)", PB_MAX_TX); }
+                            }
+                        }
+                    }
                 }
                 else { int relayed=0;
                     result = txsub_accept_and_relay(txsub_pool(),
@@ -5172,6 +5397,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             node_relay_flag = saved_relay;
             fprintf(stderr,"[net] feeler %s -> %s\n", srcpool[pick], alive?"alive":"dead");
         }
+        pb_rotation();
 
         if(reorg_ok) reorg_chainwork_sync(store_buf, 0);
         /* A catch-up failure is RECOVERABLE, not terminal. It used to set

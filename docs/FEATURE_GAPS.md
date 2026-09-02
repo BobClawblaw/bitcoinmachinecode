@@ -1333,7 +1333,7 @@ that served BIP157 before this change must now set it explicitly.
 | `prevoutfetchthreads` | Set the number of threads used to prefetch block input prevouts from the chainstate database (0 disables, up t… | accepted, no effect: prevouts come from the in-process UTXO set |
 | `printpriority` | Log transaction fee rate in BTC/kvB when mining blocks (default: 0) | implemented |
 | `printtoconsole` | Send trace/debug info to console (default: 1 when no -daemon. To disable logging to file, set -nodebuglogfile) | accepted, no effect: stderr IS the log (systemd appends it to the log file) |
-| `privatebroadcast` | Broadcast transactions submitted via sendrawtransaction RPC using short-lived connections through the Tor or I… | accepted, no effect: no private broadcast |
+| `privatebroadcast` | Broadcast transactions submitted via sendrawtransaction RPC using short-lived connections through the Tor or I… | implemented 2026-09-02: sendrawtransaction is validated and queued, three short-lived anonymous connections over Tor/I2P (or clearnet through the Tor proxy) deliver it, the tx stays out of the mempool until heard back; getprivatebroadcastinfo / abortprivatebroadcast; see the 2026-09-02 update |
 | `proxy` |  | implemented |
 | `proxyrandomize` | Randomize credentials for every proxy connection. This enables Tor stream isolation (default: 1) | implemented |
 | `prune` | Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC … | implemented |
@@ -1378,7 +1378,7 @@ that served BIP157 before this change must now set it explicitly.
 | `txindex` | Maintain a full transaction index, used by the getrawtransaction rpc call (default: 0) | implemented |
 | `txospenderindex` | Maintain a transaction output spender index, used by the gettxspendingprevout rpc call (default: 0) | implemented 2026-09-01 — the index is enabled by the presence of `txospender.dat` (offline base + live tail), the key is accepted and changes nothing |
 | `txreconciliation` | Enable transaction reconciliations per BIP 330 (default: 0) | accepted, no effect: Erlay: BIP330 negotiation is built but reconciliation is a deliberate stop |
-| `txsendrate` | Set the maximum ongoing rate for sending transactions to (inbound) peers (default: 14 tx/s) | accepted, no effect: no private broadcast |
+| `txsendrate` | Set the maximum ongoing rate for sending transactions to (inbound) peers (default: 14 tx/s) | accepted, no effect: no inbound tx send-rate limiter (debug-only in Core) |
 | `uacomment` | Append comment to the user agent string | implemented |
 | `unsafesqlitesync` | Set SQLite synchronous=OFF to disable waiting for the database to sync to disk. This is unsafe and can cause d… | accepted, no effect: no sqlite |
 | `v2transport` | Support v2 transport (default: 1) | implemented |
@@ -1474,3 +1474,111 @@ Core's Updater does (they must already be in the PSBT, as
 `utxoupdatepsbt` puts them); partial-signature EXTRACTION (`finalize=false`)
 for miniscript inputs stays limited to the P2WPKH/P2PKH/taproot forms.
 
+## Update 2026-09-02 — private broadcast (Core v30 `-privatebroadcast`)
+
+Implemented and proven against a real Core on regtest
+(`validation/private_broadcast_regtest_e2e.sh`, 24 checks). With
+`privatebroadcast=1`, `sendrawtransaction` test-accepts the transaction and
+QUEUES it (`daemon/private_broadcast.c`) instead of admitting it to the
+mempool; the download worker owes three connections per transaction and
+opens each in a forked helper child (the same shape as its background
+dials): a random reachable network among tor, i2p and clearnet-through-the-
+tor-proxy, a random routable address of that network from the book, a fresh
+transient I2P session or random SOCKS5 credentials per connection, then
+Core's exact conversation — an anonymous `version` (services 0, time 0,
+zero addresses, height 0, relay 0, user agent `/pynode:0.0.1/`), `verack`,
+one `inv`, the peer's `getdata` for exactly that inv, the `tx`, a `ping`,
+and the `pong` as the receipt; nothing else is ever sent (no pong, no
+sendaddrv2/wtxidrelay echoes). The transaction leaves the queue when it
+comes back from the network over an ordinary peer; stale entries are
+re-tested every 2–3 minutes and re-broadcast or dropped with the reason.
+`getprivatebroadcastinfo` and `abortprivatebroadcast` are Core's shapes;
+both refuse with Core's text when the option is off. Boot refuses the option
+without Tor or I2P reachability (Core's words) and warns on
+`proxyrandomize=0`.
+
+What Core proved on the wire: its `getpeerinfo` shows our connections as
+`/pynode:0.0.1/`, services `0000000000000000`, `relaytxes` false; its
+mempool gains the transaction; the SOCKS5 stub standing in for Tor saw
+three connections with three distinct credential pairs (stream isolation);
+the transaction returned to our node over the normal leg and the queue
+emptied.
+
+Divergences, on purpose:
+- Core refuses `-privatebroadcast` together with `-connect`; this node WARNS
+  instead. Core's private dials share the connection budget `connect=`
+  restricts; ours come from the address book regardless, so the pairing
+  works — the warning says the private connections go outside the
+  `connect=` list.
+- Private connections are not itemised in `getpeerinfo` (they live in
+  helper children for seconds); Core lists them with
+  `connection_type: private_broadcast`.
+- The queue holds 64 transactions (Core: 10,000) and 8 concurrent
+  connections (Core: 64) — a personal node's numbers.
+- v1 transport only for the private connections (Core uses v2 when the
+  peer advertises it).
+
+Observed about Core v31.99 while testing, recorded because it will confuse
+the next person: after accepting a transaction from an inbound peer Core
+sometimes held its announcement to our (inbound-to-Core) leg for 60–120 s
+until another transaction bumped its inbound tx-send-rate bucket; once
+bumped, both went out in one `inv`. The harness waits 90 s and then sends
+one Core wallet transaction as the bump, saying so.
+
+Also fixed on the way: `addnode=host:port` now keeps its port in the boot
+book fold-in, the liveness probe and the download worker's re-dial (it
+silently dialled the chain default before).
+
+## Update 2026-09-02 — audit finding N4: the legacy wallet-file scheme is gone from the write paths
+
+Two wallet stores existed. The descriptor wallet's container (`bmcwallet.enc`,
+`BMCWENC1`, daemon/wallet_crypter.c: Core's BytesToKeySHA512AES with 100,000
+iterations, random salt, AES-256-CBC) has been the live wallet's since
+2026-08-27. The OLDER store in `asm/wallet_store.c` — the CLI's mnemonic file
+(`BMCWAL v2`) and addhdkey's extra-xprv blob (`BMCHDK v1`) — kept its own
+scheme: PBKDF2-HMAC-SHA512 at 2,048 iterations with an EMPTY salt, a custom
+CTR cipher keyed from the same bytes, and a custom tag. It predates the
+crypter and nothing ever routed it through the strong container, so
+`wallet_cli init <passphrase>` and `addhdkey` still wrote the weak shape
+(audit 2026-09-02, N4).
+
+Now: both write the strong container — `BMCWAL v3` / `format=wcrypt` lines
+holding the hex of a `wcrypt_seal` blob — and never the legacy shape again.
+Legacy files still open (read-only code kept for exactly that), and a
+successful open rewrites the file upgraded, atomically (tmp + rename, 0600),
+with a `[wallet] … upgraded legacy …` line. `tests/test_wallet_store` proves
+it against genuine legacy fixtures written by the pre-change code:
+right/wrong passphrase, the in-place upgrade, the second open through the
+strong path, the secret blob likewise, and that no `.tmp` is left behind.
+
+## Update 2026-09-02 — audit N3/N5/N6/N7/N11 remediation
+
+See the remediation record at the end of `docs/audits/SECURITY_AUDIT_2026-09-02.md`.
+In short: three more misbehaviour classes are scored (parse failures, never
+policy or consensus rejects -- the self-partition argument is in the asm
+comment at `.do_block`); the service runs under a systemd sandbox with core
+dumps off; log rotation actually works now (it never had) and runs as the
+service user from a root-owned config; the build's hardening is explicit and
+every shipped tool is linked `BIND_NOW`; `-Werror` is blocked by 433 existing
+warnings (209 incompatible-pointer-types) -- **open item: a warning-cleanup
+pass, then `-Werror`**.
+
+## Update 2026-09-02 (later) — audit N1 evidence, N8 closed, manual wallet decryption
+
+- **N1:** the audit quoted two Makefile comments about harnesses pinned below
+  -O2. Both quoted harnesses have in fact been -O2 since 2026-08-23; the two
+  rules still pinned (`test_sigops` -O1, `pverify` -O1) were rebuilt at -O2:
+  the test passes and pverify's verdicts are identical to the -O1 build over
+  three real block ranges. Pins lifted, comments corrected. The structural
+  point stands (hand asm, no root-cause narrative for the historical
+  mis-parse), but there is no longer a rule in the tree that *avoids* -O2.
+- **N8:** `config/bmcwallet.testnet4.pass` deleted; it was never tracked. The
+  testnet4 wallet is provably empty (see `docs/PARITY_ATTESTATION.md` for
+  the mainnet side; the testnet4 scan is in the worklog).
+- **Manual wallet decryption:** `wallet_cli` now asks for the passphrase
+  (echo off) when nothing supplied it and the wallet is encrypted, reads it
+  from a pipe when stdin is not a terminal, and `init` asks twice and stores
+  no `.pass` file for a typed passphrase. `bitcoin_cli` gained Core's
+  `-stdinwalletpassphrase` and `-stdin`. Pinned by `tests/test_cli_prompt`
+  (a real pty). Parity attestation heights are now published in
+  `docs/PARITY_ATTESTATION.md` (audit recommendation 8).

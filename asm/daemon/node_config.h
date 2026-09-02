@@ -90,6 +90,7 @@ typedef struct {
     int  i2pacceptincoming;      /* -i2pacceptincoming (default 1) */
     int  cjdnsreachable;         /* -cjdnsreachable */
     int  proxyrandomize;         /* -proxyrandomize (default 1): per-connection SOCKS5 credentials */
+    int  privatebroadcast;       /* -privatebroadcast (Core v30, default 0): sendrawtransaction goes out over short-lived Tor/I2P connections, not the mempool */
     char onlynet[6][8];          /* -onlynet (repeatable); empty list = all networks */
     int  n_onlynet;
     /* Core -dns: may hostnames be looked up with the system resolver? With
