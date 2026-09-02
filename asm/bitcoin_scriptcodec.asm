@@ -43,7 +43,7 @@ global snum_overflow
 snum_overflow: resq 1
 
 ; vfExec condition stack
-align 16
+alignb 16                 ; alignb, not align: this is .tbss, padding bytes cannot be "initialized" (nasm -w+other)
 vfexec:     resb 1024
 vfexec_sp:  resq 1
 global vfexec, vfexec_sp

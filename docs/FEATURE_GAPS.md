@@ -1592,7 +1592,8 @@ compiled with `-Wall` at all, hiding 27 more). All were fixed at the root
 say what the code does, dead helpers removed), never with pragmas or blanket
 casts, and `WARNFLAGS := -Wall -Werror` is now appended to every C compile in
 the Makefile. The classes and what they turned out to be are recorded in
-`worklog/2026-09-02.md`. **Not** covered: nasm's six warning kinds (22 lines:
-`.tbss` initialisation in bitcoin_scriptcodec.asm, RIP-relative displacement
-notes in bitcoin_idx*.asm, three number-overflow notes) -- those are the next
-cleanup, after which `NASMFLAGS` gets `-Werror` too.
+`worklog/2026-09-02.md`. nasm followed the same day: `NASMFLAGS := -f elf64 -I. -Werror`. Its ten
+warning sites hid four real defects, one of them consensus-relevant: the
+CHECKSEQUENCEVERIFY disable-flag test used a sign-extended immediate and
+turned enforced 5-byte operands into NOPs (`tests/test_csv_disable_flag`).
+Details in `worklog/2026-09-02.md`.

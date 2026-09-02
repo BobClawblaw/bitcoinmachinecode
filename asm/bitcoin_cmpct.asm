@@ -197,7 +197,12 @@ bip152_shortid:
     mov  rsi, [rbp-64]
     mov  rdx, r15          ; msg = wtxid
     call siphash24_uint256
-    and  rax, 0xffffffffffff
+    ; low 48 bits. NOT `and rax, 0xffffffffffff`: that immediate does not fit
+    ; a sign-extended imm32, nasm truncated it to -1 and the AND was a no-op
+    ; (2026-09-02, nasm -w+number-overflow). Harmless only because the six
+    ; byte stores below drop the high bytes anyway.
+    shl  rax, 16
+    shr  rax, 16
     ; write 6-byte LE
     mov  rcx, rax
     mov  byte [r12],   cl
@@ -239,8 +244,13 @@ varint_put:
     jb   .v1
     cmp  rsi, 0xffff
     jbe  .v3
-    cmp  rsi, 0xffffffff
-    jbe  .v5
+    ; "fits 32 bits?" -- NOT `cmp rsi, 0xffffffff`: that imm32 sign-extends to
+    ; -1, so `jbe` was always taken and the 9-byte form was unreachable
+    ; (values >= 2^32 were silently emitted as 0xfe + their low 32 bits).
+    ; 2026-09-02. rax is free here: every exit sets it to the byte count.
+    mov  rax, rsi
+    shr  rax, 32
+    jz   .v5
     mov  byte [rdi], 0xff
     mov  [rdi+1], rsi
     mov  rax, 9

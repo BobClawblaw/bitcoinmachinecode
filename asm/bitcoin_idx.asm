@@ -370,7 +370,7 @@ idx_build_from_file:
     jge  .afterscan
     mov  rax, rcx
     imul rax, 48
-    lea  rax, [rel idxbuild_buf + rax]            ; record ptr
+    lea  rax, [idxbuild_buf + rax]                ; record ptr (absolute base+index: no RIP form with an index register; byte-identical to the old `rel` spelling)
     mov  edx, [rax]
     test edx, edx
     jz   .nextrec                                  ; hole, skip

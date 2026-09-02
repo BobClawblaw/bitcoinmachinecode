@@ -319,7 +319,11 @@ write_varint:
     jbe   .wv_1
     cmp   rax, 0xffff
     jbe   .wv_2
-    cmp   rax, 0xffffffff
+    ; not `cmp rax, 0xffffffff` (imm32 sign-extends to -1: the 8-byte form
+    ; was unreachable, values >= 2^32 emitted as 0xfe + low 32 bits). rbx is
+    ; saved on entry and otherwise unused here.
+    mov   rbx, 0xffffffff
+    cmp   rax, rbx
     jbe   .wv_4
     jmp   .wv_8
 .wv_1:
