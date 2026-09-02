@@ -1245,6 +1245,20 @@ static void serve_violation_report(const char* reason){
     if(!g_cur_peer_ip[0]) return;
     peer_misbehaving(g_cur_peer_ip, 100, reason ? reason : "protocol violation");
 }
+/* audit 2026-09-02 N3: the download worker's legs report by fd (tx_relay.c
+ * declares this weak; the daemon supplies it). Map the fd to its leg's
+ * "host:port", strip the port, and score it like a serve-side violation. */
+void txr_report_violation_fd(int fd, const char* reason){
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] != fd) continue;
+        char host[128]; snprintf(host, sizeof host, "%s", mux_out_host[k]);
+        if(host[0] == '['){ char* e = strchr(host, ']'); if(e) *e = 0; memmove(host, host + 1, strlen(host)); }
+        else { char* c = strrchr(host, ':'); if(c && c == strchr(host, ':')) *c = 0; }   /* exactly one ':' = host:port; a bare IPv6 has several and no port */
+        if(!host[0]) return;
+        peer_misbehaving(host, 100, reason ? reason : "protocol violation");
+        return;
+    }
+}
 
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){

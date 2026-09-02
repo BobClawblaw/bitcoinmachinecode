@@ -117,6 +117,28 @@ int main(void){
       if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
       g_body = 0; g_blen = 0; }
 
+    printf("== parse failures are reported (audit 2026-09-02 N3) ==\n");
+    { g_cmd = "tx"; g_want_reason = "malformed tx payload (parse failure)";
+      static const unsigned char five[5] = {1,0,0,0,0};
+      g_body = five; g_blen = 5;
+      int rc = run_case(5, 0);
+      ck("a 5-byte `tx` (too short to be one) reports a violation", rc == 70);
+      if (rc == 72) printf("        fired with the wrong reason\n");
+      if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
+      static const unsigned char junk[12] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+      g_body = junk; g_blen = 12;
+      rc = run_case(12, 0);
+      ck("a 12-byte `tx` that does not parse reports a violation", rc == 70);
+      if (rc == 72) printf("        fired with the wrong reason\n");
+      if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
+      g_cmd = "block"; g_want_reason = "malformed block payload (shorter than a header)";
+      static const unsigned char forty[40] = {0};
+      g_body = forty; g_blen = 40;
+      rc = run_case(40, 0);
+      ck("a 40-byte `block` (shorter than a header) reports a violation", rc == 70);
+      if (rc == 72) printf("        fired with the wrong reason\n");
+      if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
+      g_body = 0; g_blen = 0; g_cmd = "inv"; g_want_reason = "oversized message announcement"; }
     printf("== a legal inv is NOT a violation ==\n");
     /* The bound must not fire on ordinary traffic; an inv of one block is the
      * commonest message this node receives. */
