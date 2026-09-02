@@ -31,6 +31,21 @@ static const char* g_rpcpass  = 0;
 static int         g_rpcport  = 0;
 static const char* g_datadir  = 0;
 static const char* g_chain    = 0;
+static int         g_stdinpass = 0;   /* -stdinwalletpassphrase: first stdin line = wallet passphrase, FIRST param */
+static int         g_stdin     = 0;   /* -stdin: remaining params from stdin, one per line, until EOF */
+#include <termios.h>
+#include <unistd.h>
+/* one line from stdin, echo off when stdin is a terminal (Core's behaviour
+ * for -stdinwalletpassphrase); trailing newline stripped */
+static void read_stdin_line(char* out, int cap, int secret) {
+    out[0] = 0;
+    struct termios old; int tty = secret && isatty(0) && tcgetattr(0, &old) == 0;
+    if (tty) { struct termios raw = old; raw.c_lflag &= ~(tcflag_t)ECHO; tcsetattr(0, TCSAFLUSH, &raw); fprintf(stderr, "Wallet passphrase: "); fflush(stderr); }
+    if (!fgets(out, cap, stdin)) out[0] = 0;
+    if (tty) { tcsetattr(0, TCSAFLUSH, &old); fputc('\n', stderr); }
+    size_t l = strlen(out);
+    while (l && (out[l-1] == '\n' || out[l-1] == '\r')) out[--l] = 0;
+}
 
 static int parse_args(int argc, char** argv, int* start) {
     int i = 1;
@@ -45,6 +60,8 @@ static int parse_args(int argc, char** argv, int* start) {
         else if (!strcmp(a, "-testnet4")) g_chain = "testnet4";
         else if (!strcmp(a, "-regtest"))  g_chain = "regtest";
         else if (!strncmp(a, "-rpcconnect=", 12)) { /* only loopback supported; accept + ignore host */ }
+        else if (!strcmp(a, "-stdinwalletpassphrase")) g_stdinpass = 1;
+        else if (!strcmp(a, "-stdin")) g_stdin = 1;
         /* bitcoin-cli ignores unknown -flags with a warning; keep it lenient. */
         i++;
     }
@@ -60,7 +77,12 @@ int main(int argc, char** argv) {
             "Bitcoin Core RPC client\n\n"
             "usage: bitcoin_cli [-datadir=<dir>] [-chain=<c>|-signet|-testnet4|-regtest]\n"
             "                   [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]\n"
-            "                   <method> [params...]\n\n"
+            "                   [-stdinwalletpassphrase] [-stdin] <method> [params...]\n\n"
+            "-stdinwalletpassphrase reads the wallet passphrase as the first line of\n"
+            "standard input (echo off on a terminal) and passes it as the first\n"
+            "parameter, so it never appears on the command line, in `ps`, or in the\n"
+            "shell history:   bitcoin_cli -stdinwalletpassphrase walletpassphrase 60\n"
+            "-stdin reads the remaining parameters from standard input, one per line.\n\n"
             "With -datadir the port and credentials come from that datadir's\n"
             "bitcoin.conf and .cookie, so no flags are usually needed.\n\n"
             "commands: getnewaddress getrawchangeaddress getaddressinfo validateaddress\n"
@@ -92,17 +114,28 @@ int main(int argc, char** argv) {
      * looking args become JSON numbers (matching bitcoin-cli's RPCConvertValues
      * heuristic for the commands that take numbers on the wire). */
     rj_val* params = rj_arr();
-    for (int i = argi + 1; i < argc; i++) {
-        const char* s = argv[i];
-        int numeric = (*s == '-' || (*s >= '0' && *s <= '9'));
-        if (numeric) { for (const char* p = s + (s[0] == '-'); *p; p++) if (*p < '0' || *p > '9') { numeric = 0; break; } }
-        rj_arr_push(params, numeric ? (rj_val*)rj_numf("%s", s) : (rj_val*)rj_str(s));
+    char secret[1024] = {0};
+    if (g_stdinpass) {                       /* Core: the passphrase is the FIRST parameter */
+        read_stdin_line(secret, sizeof secret, 1);
+        rj_arr_push(params, (rj_val*)rj_str(secret));
+    }
+#define CLI_PUSH_ARG(s) do { const char* s_ = (s); int numeric = (*s_ == '-' || (*s_ >= '0' && *s_ <= '9')); \
+        if (numeric) { for (const char* p = s_ + (s_[0] == '-'); *p; p++) if (*p < '0' || *p > '9') { numeric = 0; break; } } \
+        rj_arr_push(params, numeric ? (rj_val*)rj_numf("%s", s_) : (rj_val*)rj_str(s_)); } while (0)
+    for (int i = argi + 1; i < argc; i++) CLI_PUSH_ARG(argv[i]);
+    if (g_stdin) {                           /* Core: extra params, one per line, until EOF */
+        char line[4096];
+        for (;;) { read_stdin_line(line, sizeof line, 0); if (line[0]) CLI_PUSH_ARG(line); if (feof(stdin) || ferror(stdin)) break; }
     }
 
     rj_val* req = rpc_request_build(method, params, 1);
     char body[32768];
     long bodylen = rj_write(body, sizeof body, req, 0);
     rj_free(req);
+    memset(secret, 0, sizeof secret);
+    if (getenv("BMC_CLI_DRYRUN")) {          /* test seam: print the request, send nothing */
+        fwrite(body, 1, (size_t)bodylen, stdout); putchar('\n'); return 0;
+    }
 
     char resp[65536];
     char errmsg[256];

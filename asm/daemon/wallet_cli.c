@@ -603,6 +603,48 @@ static int cmd_abook(int argc, char** argv) {
  * pairs both halves, and it is root/owner-only (0600). This is a DEV
  * convenience; later this single function is where prod would read from a
  * secrets manager/env. */
+#include <termios.h>
+#include <unistd.h>
+/* Interactive passphrase entry (2026-09-02). When nothing supplied the
+ * passphrase (argument, BMC_WALLET_PASS, <wallet>.pass) and the wallet turns
+ * out to be encrypted, ASK: echo off on a terminal (via /dev/tty, so it works
+ * even with stdout redirected), one line from stdin otherwise (so a pipe can
+ * feed it without the passphrase ever appearing in argv, `ps`, or shell
+ * history). Returns 1 with out[] filled, 0 if nothing usable was entered. */
+static int secret_prompt(const char* what, char* out, int cap) {
+    out[0] = 0;
+    if (isatty(0)) {
+        FILE* tty = fopen("/dev/tty", "r+");
+        if (!tty) return 0;
+        int fd = fileno(tty);
+        struct termios old, raw; int have = tcgetattr(fd, &old) == 0;
+        fprintf(tty, "Passphrase for %s: ", what); fflush(tty);
+        if (have) { raw = old; raw.c_lflag &= ~(tcflag_t)ECHO; tcsetattr(fd, TCSAFLUSH, &raw); }
+        char* r = fgets(out, cap, tty);
+        if (have) tcsetattr(fd, TCSAFLUSH, &old);
+        fputc('\n', tty); fclose(tty);
+        if (!r) { out[0] = 0; return 0; }
+    } else {
+        if (!fgets(out, cap, stdin)) { out[0] = 0; return 0; }
+    }
+    size_t l = strlen(out);
+    while (l && (out[l-1] == '\n' || out[l-1] == '\r')) out[--l] = 0;
+    return out[0] != 0;
+}
+/* Load with whatever passphrase we already have (may be none: plaintext
+ * wallets need none). If that fails and nothing was supplied, ask once and
+ * retry. A supplied-but-wrong passphrase is reported, not re-prompted. */
+static int load_with_prompt(const char* who, const char* path, char* mn, int mcap, char* pass, int pcap) {
+    if (wallet_store_load(path, mn, mcap, pass, pcap) == 0) return 0;
+    if (pass[0]) { fprintf(stderr, "%s: cannot load wallet %s (wrong passphrase?)\n", who, path); return 1; }
+    if (!secret_prompt(path, pass, pcap)) {
+        fprintf(stderr, "%s: cannot load wallet %s (encrypted: enter the passphrase at the prompt, pipe it on stdin, set BMC_WALLET_PASS, or use <wallet>.pass)\n", who, path);
+        return 1;
+    }
+    if (wallet_store_load(path, mn, mcap, pass, pcap) == 0) return 0;
+    fprintf(stderr, "%s: cannot load wallet %s (wrong passphrase)\n", who, path);
+    return 1;
+}
 static const char* passfile_for(const char* wallet_path) {
     static char pf[512];
     snprintf(pf, sizeof pf, "%s.pass", wallet_path);
@@ -638,6 +680,20 @@ static int cmd_init(int argc, char** argv) {
      *   wallet_cli init [passphrase] [path]   (path defaults to data/bmcwallet.dat) */
     const char* pass = (argc >= 3) ? argv[2] : NULL;
     const char* path = (argc >= 4) ? argv[3] : default_wallet_path();
+    /* 2026-09-02: no passphrase argument and a terminal on stdin -> ask for
+     * one, twice, echo off; a passphrase entered this way is NOT persisted
+     * in a .pass file (that is the point of typing it). Enter nothing to
+     * create a plaintext wallet, as before. Non-interactive callers keep
+     * the old behaviour exactly. */
+    char typed[256] = {0}, again[256] = {0}; int prompted = 0;
+    if (!pass && isatty(0)) {
+        if (secret_prompt("the new wallet (empty = plaintext)", typed, (int)sizeof typed)) {
+            if (!secret_prompt("the new wallet, again", again, (int)sizeof again) || strcmp(typed, again)) {
+                fprintf(stderr, "init: passphrases do not match -- nothing written\n"); return 1;
+            }
+            pass = typed; prompted = 1;
+        }
+    }
     char mn[256];
     if (!wallet_mnemonic_generate(mn)) {
         fprintf(stderr, "init: cannot read /dev/urandom\n");
@@ -648,12 +704,13 @@ static int cmd_init(int argc, char** argv) {
         return 1;
     }
     /* persist the secret (dev convenience) in a separate 0600 .pass file */
-    if (pass && pass[0]) passfile_write(path, pass);
+    if (pass && pass[0] && !prompted) passfile_write(path, pass);
     char addr[64];
     seed_address(mn, pass, addr, (int)sizeof addr, NULL);
     printf("wallet:   %s\n", path);
     printf("mnemonic: %s\n", mn);
-    if (pass) printf("passphrase: %s\n", pass);
+    if (pass && prompted) printf("passphrase: (entered at the prompt; not stored anywhere -- remember it)\n");
+    else if (pass) printf("passphrase: %s\n", pass);
     printf("m/44'/0'/0'/0/0: %s\n", addr);
     printf("(recoverable: wallet_cli load %s / getaddress <i> to re-derive)\n", path);
     return 0;
@@ -669,10 +726,7 @@ static int cmd_load(int argc, char** argv) {
      * or the local dev <wallet>.pass file. */
     if (cli_pass && cli_pass[0]) snprintf(pass, sizeof pass, "%s", cli_pass);
     else if (!passfile_read(path, pass, (int)sizeof pass)) pass[0] = 0;
-    if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "load: cannot load wallet %s (v2-encrypted? supply the passphrase; or use init)\n", path);
-        return 1;
-    }
+    if (load_with_prompt("load", path, mn, (int)sizeof mn, pass, (int)sizeof pass)) return 1;
     unsigned char seed[64];
     char addr[64];
     if (!seed_address(mn, pass, addr, (int)sizeof addr, seed)) {
@@ -700,10 +754,7 @@ static int cmd_getaddress(int argc, char** argv) {
         if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec);
         else if (!passfile_read(path, pass, (int)sizeof pass)) pass[0] = 0;
     }
-    if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "getaddress: cannot load wallet %s (encrypted? set BMC_WALLET_PASS or use <wallet>.pass)\n", path);
-        return 1;
-    }
+    if (load_with_prompt("getaddress", path, mn, (int)sizeof mn, pass, (int)sizeof pass)) return 1;
     unsigned char seed[64];
     long pl = pass[0] ? (long)strlen(pass) : 0;
     wallet_mnemonic_seed(seed, mn, pass[0] ? pass : NULL, pl);
@@ -727,10 +778,7 @@ static int cmd_getprivkey(int argc, char** argv) {
         if (sec && sec[0]) snprintf(pass, sizeof pass, "%s", sec);
         else if (!passfile_read(path, pass, (int)sizeof pass)) pass[0] = 0;
     }
-    if (wallet_store_load(path, mn, (int)sizeof mn, pass, (int)sizeof pass)) {
-        fprintf(stderr, "getprivkey: cannot load wallet %s (encrypted? set BMC_WALLET_PASS or use <wallet>.pass)\n", path);
-        return 1;
-    }
+    if (load_with_prompt("getprivkey", path, mn, (int)sizeof mn, pass, (int)sizeof pass)) return 1;
     unsigned char seed[64];
     long pl = pass[0] ? (long)strlen(pass) : 0;
     wallet_mnemonic_seed(seed, mn, pass[0] ? pass : NULL, pl);

@@ -1562,3 +1562,23 @@ service user from a root-owned config; the build's hardening is explicit and
 every shipped tool is linked `BIND_NOW`; `-Werror` is blocked by 433 existing
 warnings (209 incompatible-pointer-types) -- **open item: a warning-cleanup
 pass, then `-Werror`**.
+
+## Update 2026-09-02 (later) — audit N1 evidence, N8 closed, manual wallet decryption
+
+- **N1:** the audit quoted two Makefile comments about harnesses pinned below
+  -O2. Both quoted harnesses have in fact been -O2 since 2026-08-23; the two
+  rules still pinned (`test_sigops` -O1, `pverify` -O1) were rebuilt at -O2:
+  the test passes and pverify's verdicts are identical to the -O1 build over
+  three real block ranges. Pins lifted, comments corrected. The structural
+  point stands (hand asm, no root-cause narrative for the historical
+  mis-parse), but there is no longer a rule in the tree that *avoids* -O2.
+- **N8:** `config/bmcwallet.testnet4.pass` deleted; it was never tracked. The
+  testnet4 wallet is provably empty (see `docs/PARITY_ATTESTATION.md` for
+  the mainnet side; the testnet4 scan is in the worklog).
+- **Manual wallet decryption:** `wallet_cli` now asks for the passphrase
+  (echo off) when nothing supplied it and the wallet is encrypted, reads it
+  from a pipe when stdin is not a terminal, and `init` asks twice and stores
+  no `.pass` file for a typed passphrase. `bitcoin_cli` gained Core's
+  `-stdinwalletpassphrase` and `-stdin`. Pinned by `tests/test_cli_prompt`
+  (a real pty). Parity attestation heights are now published in
+  `docs/PARITY_ATTESTATION.md` (audit recommendation 8).
