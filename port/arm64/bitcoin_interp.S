@@ -125,7 +125,11 @@ interp_memeq:
 	.equ SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY,(1<<9)
 	.equ SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,(1<<10)
 	.equ SCRIPT_VERIFY_MINIMALIF,(1<<13)
-	.equ SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS,(1<<18)
+	.equ SCRIPT_VERIFY_NULLFAIL,(1<<14)          /* BIP146: a failing NON-EMPTY signature is an error, not false */
+	.equ SCRIPT_VERIFY_CONST_SCRIPTCODE,(1<<16)  /* a signature found in the scriptCode (legacy FindAndDelete) is an error */
+	.equ SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS,(1<<19) /* Core bit 19 (18 is DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
+	                                          * the port had 18 until 2026-09-02 -- nothing ever set it, so it was
+	                                          * harmless, but it is the WRONG BIT and now it would collide. */
 	.equ SE_OK,0
 	.equ SE_UNKNOWN_ERROR,1
 	.equ SE_EVAL_FALSE,2
@@ -150,13 +154,18 @@ interp_memeq:
 	.equ SE_UNBALANCED_CONDITIONAL,20
 	.equ SE_NEGATIVE_LOCKTIME,21
 	.equ SE_UNSATISFIED_LOCKTIME,22
+	.equ SE_SIG_HASHTYPE,23
 	.equ SE_SIG_DER,24
 	.equ SE_MINIMALDATA,25
+	.equ SE_SIG_HIGH_S,27
+	.equ SE_PUBKEYTYPE,29
 	.equ SE_CLEANSTACK,30
 	.equ SE_MINIMALIF,31
+	.equ SE_SIG_NULLFAIL,32
 	.equ SE_DISCOURAGE_OP_SUCCESS,36
 	.equ SE_TAPSCRIPT_CHECKMULTISIG,50
 	.equ SE_TAPSCRIPT_MINIMALIF,51
+	.equ SE_SIG_FINDANDDELETE,54
 	.equ OP_1NEGATE,0x4f
 	.equ OP_RESERVED,0x50
 	.equ OP_1,0x51
@@ -293,6 +302,21 @@ interp_memeq:
 	.macro RDLEN d, rec	/* d := u32 len of elem record @rec */
 	ldr \d, [\rec]
 	.endm
+
+/* SNUM_MAX n: x2 = maxsize for scriptnum_decode, PLUS bit 8 when MINIMALDATA
+ * is set (Core passes fRequireMinimal to every CScriptNum read, and a
+ * non-minimal encoding is SCRIPT_ERR_SCRIPTNUM, not a silent widening). state
+ * in x20; clobbers x9 (free at all 12 sites -- it is caller-saved scratch and
+ * scriptnum_decode takes it via TLS_ADDR anyway). 2026-09-02, the randomized
+ * differential vs Core found MINIMALDATA enforcing only the 4-byte SIZE. */
+.macro SNUM_MAX n
+	mov  x2, #\n
+	ldr  x9, [x20, #56]
+	tst  x9, #SCRIPT_VERIFY_MINIMALDATA
+	b.eq .Lsnum_nomin\@
+	orr  x2, x2, #0x100
+.Lsnum_nomin\@:
+.endm
 
 .macro LAddr rd, sym
 	adrp \rd, \sym
@@ -721,7 +745,8 @@ script_eval:
 	cmp  w3,#1
 	b.eq .if_minif_ok
 .wif_minif:
-	mov  w0,#SE_MINIMALDATA
+	mov  w0,#SE_MINIMALIF		/* was SE_MINIMALDATA (wrong code, same verdict)
+					 * until 2026-09-02; Core answers MINIMALIF here */
 	b    .err_ret0
 .if_minif_ok:
 	ldr  w2,[x21]
@@ -1088,9 +1113,12 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	mov  x19,x0		/* n */
+	ldr  x3,[sp,#SL_SNUMOVF]
+	ldr  w3,[x3]
+	cbnz x3,.snum_fail
 	CSTK
 	bl   stack_pop
 	tbnz x19,#63,.pk_fail
@@ -1311,7 +1339,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
 	ldr  w3,[x3]
@@ -1399,7 +1427,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
 	ldr  w3,[x3]
@@ -1413,7 +1441,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
 	ldr  w3,[x3]
@@ -1537,7 +1565,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	mov  x23,x0		/* val */
 	ldr  x3,[sp,#SL_SNUMOVF]
@@ -1551,7 +1579,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	mov  x22,x0		/* min */
 	ldr  x3,[sp,#SL_SNUMOVF]
@@ -1565,7 +1593,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	mov  x19,x0		/* max */
 	ldr  x3,[sp,#SL_SNUMOVF]
@@ -1697,7 +1725,29 @@ script_eval:
 	bl   interp_checksig
 	cmp  x0,#-1
 	b.eq .err_sigder
+	cmp  x0,#-2
+	b.eq .err_pubkeytype
+	cmp  x0,#-3
+	b.eq .err_highs
+	cmp  x0,#-4
+	b.eq .err_hashtype
+	cmp  x0,#-5
+	b.eq .err_findanddelete		/* the C checker: CONST_SCRIPTCODE found the
+					 * signature's push inside the scriptCode */
 	mov  x23,x0		/* success */
+	/* BIP146 NULLFAIL (2026-09-02, the verify differential vs Core): under
+	 * the flag a failing signature that is NOT empty is an ERROR, not the
+	 * pushed false. Core: "Signature must be zero for failed CHECK(MULTI)SIG
+	 * operation". */
+	cbnz x23,.chk_nullfail_ok
+	ldr  x2,[x20,#56]
+	tst  x2,#SCRIPT_VERIFY_NULLFAIL
+	b.eq .chk_nullfail_ok
+	CSTK
+	bl   stack_second_ptr		/* the signature element */
+	ldr  w2,[x0]
+	cbnz w2,.err_nullfail
+.chk_nullfail_ok:
 	CSTK
 	bl   stack_pop
 	CSTK
@@ -1726,6 +1776,21 @@ script_eval:
 .err_sigder:
 	mov  w0,#SE_SIG_DER
 	b    .err_ret0
+.err_pubkeytype:
+	mov  w0,#SE_PUBKEYTYPE
+	b    .err_ret0
+.err_highs:
+	mov  w0,#SE_SIG_HIGH_S
+	b    .err_ret0
+.err_hashtype:
+	mov  w0,#SE_SIG_HASHTYPE
+	b    .err_ret0
+.err_nullfail:
+	mov  w0,#SE_SIG_NULLFAIL
+	b    .err_ret0
+.err_findanddelete:
+	mov  w0,#SE_SIG_FINDANDDELETE
+	b    .err_ret0
 
 .op_checksigadd:
 	ldr  w2,[x20,#48]
@@ -1745,7 +1810,7 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	ldr  x3,[sp,#SL_SNUMOVF]
 	ldr  w3,[x3]
@@ -1819,8 +1884,11 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#5
+	SNUM_MAX 5
 	bl   scriptnum_decode
+	ldr  x3,[sp,#SL_SNUMOVF]
+	ldr  w3,[x3]
+	cbnz x3,.snum_fail
 	tbz  x0,#63,.cltv_nn
 	mov  w0,#SE_NEGATIVE_LOCKTIME
 	b    .err_ret0
@@ -1867,12 +1935,25 @@ script_eval:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#5
+	SNUM_MAX 5
 	bl   scriptnum_decode
+	ldr  x3,[sp,#SL_SNUMOVF]
+	ldr  w3,[x3]
+	cbnz x3,.snum_fail
 	tbz  x0,#63,.csv_nn
 	mov  w0,#SE_NEGATIVE_LOCKTIME
 	b    .err_ret0
 .csv_nn:
+	/* Disable flag (bit 31) on the SCRIPT's own operand -> NOP. Core masks the
+	 * operand with SEQUENCE_LOCKTIME_DISABLE_FLAG (1<<31 as int64), so bits
+	 * 32-63 must NOT take part. x86 had `test rax, 0x80000000`, whose imm32
+	 * sign-extends to 0xFFFFFFFF80000000 -- a 5-byte operand with bits 32-39
+	 * set and bit 31 clear read as "disabled" -> NOP -> ACCEPTED where Core
+	 * enforces (consensus false-accept, fixed 2026-09-02, pinned by
+	 * tests/test_csv_disable_flag). AArch64 ANDS takes a 64-bit logical
+	 * immediate, so #0x80000000 here is the ALREADY-CORRECT bit-31-only test
+	 * -- it is x86's `test eax, 0x80000000`, not x86's bug. Pinned by the
+	 * same test on this side. */
 	tst  x0,#0x80000000
 	b.ne .next_op		/* disable flag on script operand -> NOP */
 	mov  x23,x0		/* scriptSequence */
@@ -2052,8 +2133,20 @@ interp_push_bool:
 	ret
 .size interp_push_bool,.-interp_push_bool
 
-	/* interp_sig_encoding_ok(sig_elem=x0) -> x0=1 ok / 0 -> SCRIPT_ERR_SIG_DER */
+	/* interp_sig_encoding_ok(sig_elem=x0) -> x0 = 1 ok / 0 SCRIPT_ERR_SIG_DER
+	 * / -1 SCRIPT_ERR_SIG_HIGH_S / -2 SCRIPT_ERR_SIG_HASHTYPE: the LOW_S and
+	 * STRICTENC-hashtype arms of Core's CheckSignatureEncoding, which run AFTER
+	 * the strict-DER one and were missing here (2026-09-02, the verify
+	 * differential with Core-made signatures). Leaf: touches only x0..x8 and
+	 * x12/x13, so x19..x28 -- the callers' live state, frame and loop counters
+	 * -- survive exactly as r12..r15 did on x86. */
+	/* -- it CALLS der_sig_strict now, so it is no longer a leaf: x86 tail-jumped
+	 * into it and could keep returning through rax; here `bl` steals x30, and a
+	 * frameless `ret` then returns to the instruction after the bl -- a 3-instruction
+	 * self-loop (spotted by test_interp_core_vectors hanging, 2026-09-02). Save
+	 * x29/x30 and exit through one place. */
 interp_sig_encoding_ok:
+	stp  x29,x30,[sp,#-16]!
 	ldr  w2,[x20,#48]
 	cmp  w2,#SIGVERSION_TAPSCRIPT
 	b.eq .sigenc_ok
@@ -2063,14 +2156,112 @@ interp_sig_encoding_ok:
 	ldr  w1,[x0]		/* siglen u32 */
 	cbz  w1,.sigenc_ok
 	add  x0,x0,#ELEM_DATA_OFF
-	b    der_sig_strict	/* tail; its 0/1 is our 0/1 */
+	mov  x12,x0		/* sig bytes / siglen across the DER call: on x86 they
+					 * sit in rdi/rsi which the leaf leaves alone; here x0
+					 * IS the return register, so they need a home */
+	mov  x13,x1
+	bl   der_sig_strict
+	cbnz x0,.sigenc_low_s
+	mov  x0,xzr		/* -> SCRIPT_ERR_SIG_DER */
+	b    .sigenc_ret
+.sigenc_low_s:
+	ldr  x2,[x20,#56]
+	tst  x2,#SCRIPT_VERIFY_LOW_S
+	b.eq .sigenc_ht
+	/* S: lenR = sig[3], lenS = sig[5+lenR], S at sig[6+lenR]. Strict DER is
+	 * already established, so a 33-byte S has a 0x00 pad ahead of a >=0x80
+	 * byte (hence > 2^248: high), a shorter S is below 2^248 (low), and a
+	 * 32-byte S compares against N/2 byte by byte -- all equal IS N/2 = low. */
+	ldrb w2,[x12,#3]		/* lenR */
+	add  x3,x2,#5
+	ldrb w3,[x12,x3]		/* lenS */
+	cmp  w3,#33
+	b.eq .sigenc_highs
+	cmp  w3,#32
+	b.lt .sigenc_ht
+	add  x4,x12,#6
+	add  x4,x4,x2		/* S, 32 bytes big-endian */
+	LAddr x5, half_order_n
+	mov  x6,xzr
+.sigenc_cmp:
+	ldrb w7,[x4,x6]
+	ldrb w8,[x5,x6]
+	cmp  w7,w8
+	b.lo .sigenc_ht		/* S < N/2: low */
+	b.hi .sigenc_highs	/* S > N/2: high */
+	add  x6,x6,#1
+	cmp  x6,#32
+	b.lt .sigenc_cmp
+.sigenc_ht:
+	ldr  x2,[x20,#56]
+	tst  x2,#SCRIPT_VERIFY_STRICTENC
+	b.eq .sigenc_ok
+	sub  x3,x13,#1
+	ldrb w2,[x12,x3]		/* hashtype byte */
+	and  w2,w2,#0x7f		/* drop ANYONECANPAY */
+	cmp  w2,#1
+	b.lt .sigenc_badht
+	cmp  w2,#3
+	b.hi .sigenc_badht
 .sigenc_ok:
 	mov  w0,#1
+	b    .sigenc_ret
+.sigenc_highs:
+	mov  x0,#-1		/* FULL 64-bit: mov w0 would zero-extend and the
+					 * caller's cmp x0,#-1 would read a positive +4294967295 */
+	b    .sigenc_ret
+.sigenc_badht:
+	mov  x0,#-2
+.sigenc_ret:
+	ldp  x29,x30,[sp],#16
 	ret
 	.size interp_sig_encoding_ok,.-interp_sig_encoding_ok
 
-	/* interp_checksig() -> 0/1, or -1 on SCRIPT_ERR_SIG_DER.
-	 * sig = sp-2, pub = sp-1 . C callback at state+96, ctx state+88. */
+	.section .rodata
+	.balign 8
+/* secp256k1 group order / 2, big-endian: the LOW_S bound (BIP62, Core's
+ * IsLowDERSignature). Read-only, kept next to its only reader. */
+half_order_n:
+	.byte 0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+	.byte 0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+	.text
+
+	/* interp_pubkey_encoding_ok(publen=x0, pubdata=x1) -> x0 = 1 ok / 0 = the
+	 * script must fail with SCRIPT_ERR_PUBKEYTYPE. Core's CheckPubKeyEncoding:
+	 * under STRICTENC the key is 33 bytes starting 02/03, or 65 starting 04
+	 * (IsCompressedOrUncompressedPubKey). Runs BEFORE the empty-signature
+	 * shortcut, in Core's order (2026-09-02: STRICTENC scripts with a malformed
+	 * key passed here where Core errors PUBKEYTYPE). Leaf: x0..x2 only. */
+interp_pubkey_encoding_ok:
+	ldr  x2,[x20,#56]
+	tst  x2,#SCRIPT_VERIFY_STRICTENC
+	b.eq .pke_ok
+	cmp  x0,#33
+	b.ne .pke_65
+	ldrb w2,[x1]
+	cmp  w2,#2
+	b.eq .pke_ok
+	cmp  w2,#3
+	b.eq .pke_ok
+	b    .pke_bad
+.pke_65:
+	cmp  x0,#65
+	b.ne .pke_bad
+	ldrb w2,[x1]
+	cmp  w2,#4
+	b.eq .pke_ok
+.pke_bad:
+	mov  w0,#0
+	ret
+.pke_ok:
+	mov  w0,#1
+	ret
+	.size interp_pubkey_encoding_ok,.-interp_pubkey_encoding_ok
+
+	/* interp_checksig() -> 0/1, or -1 SIG_DER / -2 PUBKEYTYPE / -3 SIG_HIGH_S /
+	 * -4 SIG_HASHTYPE / -5 SIG_FINDANDDELETE (the last one arrives from the C
+	 * checker under CONST_SCRIPTCODE). script_eval maps each to its
+	 * SCRIPT_ERR_*. sig = sp-2, pub = sp-1. C callback at state+96, ctx +88. */
 interp_checksig:
 	stp  x29,x30,[sp,#-16]!
 	stp  x19,x20,[sp,#-16]!
@@ -2087,19 +2278,56 @@ interp_checksig:
 	bl   stack_second_ptr
 	mov  x21,x0		/* sig elem */
 	ldr  w19,[x21]		/* siglen */
-	cbz  w19,.cs_false
-	ldr  x0,[x20,#96]
-	cbz  x0,.cs_false
+	/* Core's order at the top of EvalChecksigPreTapscript (2026-09-02, the
+	 * differential): SIGNATURE encoding (an empty sig passes it), then PUBLIC
+	 * KEY encoding (STRICTENC), THEN the empty-sig -> false shortcut. The
+	 * BIP66/DERSIG failure is a hard script ERROR (SCRIPT_ERR_SIG_DER), not a
+	 * false -- with a mere false, `<sig> <pk> CHECKSIG OP_NOT` would still
+	 * ACCEPT a signature Core rejects. interp_sig_encoding_ok answers
+	 * 1 / 0 DER / -1 HIGH_S / -2 hashtype; this re-maps to the CHECKSIG
+	 * contract (-1 DER, -2 PUBKEYTYPE, -3 HIGH_S, -4 HASHTYPE) and the C
+	 * checker's -5 (SIG_FINDANDDELETE) reaches script_eval untouched. */
 	mov  x0,x21
 	bl   interp_sig_encoding_ok
-	cbnz x0,.cs_enc_ok
+	cmp  x0,#1
+	b.eq .cs_enc_ok
+	cmp  x0,#-1
+	b.eq .cs_enc_highs
+	cmp  x0,#-2
+	b.eq .cs_enc_badht
 	mov  x0,#-1                     /* FULL 64-bit -1: script_eval compares
 	                                 * cmp x0,#-1 (the x86 returns rax=-1);
 	                                 * a w0 write zero-extends and the SIG_DER
 	                                 * error read as checksig-TRUE, accepting
 	                                 * non-strict signatures post-activation */
 	b    .cs_end
+.cs_enc_highs:
+	mov  x0,#-3
+	b    .cs_end
+.cs_enc_badht:
+	mov  x0,#-4
+	b    .cs_end
 .cs_enc_ok:
+	mov  x0,x22		/* publen */
+	mov  x1,x23		/* pubdata */
+	bl   interp_pubkey_encoding_ok
+	cbnz x0,.cs_pubenc_ok
+	mov  x0,#-2		/* SCRIPT_ERR_PUBKEYTYPE (script_eval maps it) */
+	b    .cs_end
+.cs_pubenc_ok:
+	/* Empty signature -> false. EXCEPT under CONST_SCRIPTCODE (2026-09-02):
+	 * Core runs FindAndDelete of the signature's push -- OP_0 for an empty one,
+	 * which CAN legitimately occur in a scriptCode -- against the scriptCode
+	 * BEFORE the checker, and finding it is SIG_FINDANDDELETE. That search
+	 * lives in the C callback, so with the flag set the callback must see the
+	 * empty signature too (it returns false for it after the search). */
+	cbnz w19,.cs_call
+	ldr  x0,[x20,#56]
+	tst  x0,#SCRIPT_VERIFY_CONST_SCRIPTCODE
+	b.eq .cs_false
+.cs_call:
+	ldr  x0,[x20,#96]
+	cbz  x0,.cs_false
 	TLS_ADDR x12, interp_slice
 	ldr  x11,[x24,#SL_BECH]
 	str  x11,[x12]
@@ -2177,7 +2405,9 @@ interp_checksig_add:
 	.size interp_checksig_add,.-interp_checksig_add
 
 	/* interp_checkmultisig() -> x0=1 ok / 0 (error in interp_err)
-	 * Stack: ... dummy sig1..sigm m pub1..pubn n . Uses cms_* globals. */
+	 * Stack: ... dummy sig1..sigm m pub1..pubn n . Uses cms_* globals.
+	 * Frame slots: 0x20 cur_src len, 0x28 cur_src ptr, 0x30 deferred NULLDUMMY,
+	 * 0x38 sp value, 0x40 nSigs, 0x48 nKeys. */
 interp_checkmultisig:
 	stp  x29,x30,[sp,#-16]!
 	stp  x19,x20,[sp,#-16]!
@@ -2186,6 +2416,9 @@ interp_checkmultisig:
 	stp  x25,x26,[sp,#-16]!
 	stp  x27,x28,[sp,#-16]!
 	sub  sp,sp,#0x50
+	str  xzr,[sp,#0x30]		/* deferred BIP147 NULLDUMMY: Core raises it AFTER
+					 * the signature loop, so a SIG_DER/PUBKEYTYPE from the
+					 * loop takes precedence (2026-09-02 differential) */
 	ldr  x2,[x24,#SL_IERR]
 	str  xzr,[x2]
 	/* cache sp value */
@@ -2202,9 +2435,12 @@ interp_checkmultisig:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	mov  w19,w0		/* nKeys */
+	TLS_ADDR x3, snum_overflow
+	ldr  w3,[x3]
+	cbnz w3,.cms_err_snum
 	tbnz w19,#31,.err_pubcount
 	cmp  w19,#20
 	b.gt .err_pubcount
@@ -2236,9 +2472,12 @@ interp_checkmultisig:
 	add  x3,x21,#ELEM_DATA_OFF
 	mov  x0,x2
 	mov  x1,x3
-	mov  x2,#4
+	SNUM_MAX 4
 	bl   scriptnum_decode
 	mov  w22,w0		/* nSigs */
+	TLS_ADDR x3, snum_overflow
+	ldr  w3,[x3]
+	cbnz w3,.cms_err_snum
 	str  w22,[sp,#0x40]	/* persist nSigs (w22 reused later as vPub ptr) */
 	tbnz w22,#31,.err_sigcount
 	ldr  w9,[sp,#0x48]
@@ -2264,7 +2503,10 @@ interp_checkmultisig:
 		ldr  x1,[x20]		/* elems (x1 clobbered by earlier stack_elem_ptr bl!) */
 		bl   stack_elem_ptr
 	ldr  w2,[x0]
-	cbnz w2,.err_nulldummy
+	cbz  w2,.cms_dummy_ok
+	mov  w2,#1
+	str  x2,[sp,#0x30]		/* remember it; raised after the loop (and after
+					 * NULLFAIL), exactly where Core gets to it */
 .cms_dummy_ok:
 	/* ---- collect keys[] into cms_keyrefs ---- */
 	mov  x25,#0
@@ -2340,9 +2582,20 @@ interp_checkmultisig:
 	mov  x1,#10008
 	ldr  x2,[sp,#0x28]
 	ldr  x3,[sp,#0x20]
+	str  x3,[sp,#0x18]		/* src len BEFORE this strip */
 	TLS_ADDR x4, cms_needle
 	mov  x5,x26
 	bl   script_find_and_delete
+	/* CONST_SCRIPTCODE (2026-09-02): shorter than the source means the signature
+	 * WAS in the scriptCode -> SIG_FINDANDDELETE, raised while stripping,
+	 * before the loop. That is where Core raises it. */
+	ldr  x8,[sp,#0x18]
+	cmp  x0,x8
+	b.ge .cms_strip_nofind
+	ldr  x9,[x20,#56]
+	tst  x9,#SCRIPT_VERIFY_CONST_SCRIPTCODE
+	b.ne .cms_err_findanddelete
+.cms_strip_nofind:
 	str  x27,[sp,#0x28]
 	str  x0,[sp,#0x20]
 	add  x25,x25,#1
@@ -2371,12 +2624,25 @@ interp_checkmultisig:
 	ldr  x22,[x7]			/* vPub elem */
 	mov  x0,x21
 	bl   interp_sig_encoding_ok
-	cbnz x0,.enc_ok
-	mov  w0,#SE_SIG_DER
-	ldr  x2,[x24,#SL_IERR]
-	str  w0,[x2]
-	b    .err_exit
+	cmp  x0,#1
+	b.eq .enc_ok
+	cmp  x0,#-1
+	b.eq .cms_err_highs
+	cmp  x0,#-2
+	b.eq .cms_err_hashtype
+	b    .cms_err_sigder
 .enc_ok:
+	/* Core's CheckPubKeyEncoding per key/sig pair (STRICTENC), 2026-09-02 --
+	 * the multisig arm had the sig-encoding check but never the pubkey one. */
+	ldr  w0,[x22]		/* publen: 32-BIT load. `ldr x0` would OR the first four
+					 * key bytes into the top half and every real key would read
+					 * as neither 33 nor 65 -> PUBKEYTYPE (found by
+					 * test_verify_core_vectors' p2sh bad-cb-parity vector) */
+	add  x1,x22,#ELEM_DATA_OFF
+	bl   interp_pubkey_encoding_ok
+	cbnz x0,.enc_pub_ok
+	b    .cms_err_pubkeytype
+.enc_pub_ok:
 	ldr  x23,[x20,#88]		/* ctx */
 	mov  x0,x23
 	add  x1,x21,#ELEM_DATA_OFF
@@ -2398,11 +2664,42 @@ interp_checkmultisig:
 	b.gt .cms_fail
 	b    .cms_loop
 .cms_end:
+	ldr  x2,[sp,#0x30]		/* deferred BIP147 NULLDUMMY (see the check above) */
+	cbnz x2,.err_nulldummy
 	cmp  w27,#0
 	b.ne .cms_fail
 	mov  w26,#1
 	b    .cms_finish
 .cms_fail:
+	/* BIP146 NULLFAIL first (Core's order: the sig loop, then NULLFAIL over the
+	 * signatures still on the stack, then the pops, then NULLDUMMY on the
+	 * dummy). 2026-09-02. */
+	ldr  x2,[x20,#56]
+	tst  x2,#SCRIPT_VERIFY_NULLFAIL
+	b.eq .cms_nullfail_done
+	mov  x28,xzr		/* j */
+.cms_nullfail_loop:
+	ldr  w2,[sp,#0x40]		/* nSigs */
+	cmp  w28,w2
+	b.ge .cms_nullfail_done
+	ldr  w2,[sp,#0x48]		/* nKeys */
+	add  w2,w2,#3
+	add  w2,w2,w28		/* k = nKeys+3+j, 1-based from the top */
+	ldr  w3,[sp,#0x38]		/* sp value */
+	sub  w3,w3,w2
+	sxtw x3,w3
+	add  x0,x20,#8
+	ldr  x1,[x20]
+	mov  x2,x3
+	bl   stack_elem_ptr
+	ldr  w2,[x0]
+	cbnz w2,.cms_err_nullfail
+.cms_nullfail_next:
+	add  x28,x28,#1
+	b    .cms_nullfail_loop
+.cms_nullfail_done:
+	ldr  x2,[sp,#0x30]		/* deferred BIP147 NULLDUMMY */
+	cbnz x2,.err_nulldummy
 	mov  w26,#0
 .cms_finish:
 	ldr  w2,[sp,#0x48]	/* nKeys */
@@ -2435,6 +2732,27 @@ interp_checkmultisig:
 	b    .err_set
 .err_nulldummy:
 	mov  w0,#SE_SIG_NULLDUMMY
+	b    .err_set
+.cms_err_sigder:
+	mov  w0,#SE_SIG_DER
+	b    .err_set
+.cms_err_snum:
+	mov  w0,#SE_SCRIPTNUM
+	b    .err_set
+.cms_err_pubkeytype:
+	mov  w0,#SE_PUBKEYTYPE
+	b    .err_set
+.cms_err_highs:
+	mov  w0,#SE_SIG_HIGH_S
+	b    .err_set
+.cms_err_hashtype:
+	mov  w0,#SE_SIG_HASHTYPE
+	b    .err_set
+.cms_err_findanddelete:
+	mov  w0,#SE_SIG_FINDANDDELETE
+	b    .err_set
+.cms_err_nullfail:
+	mov  w0,#SE_SIG_NULLFAIL
 	b    .err_set
 .err_set:
 	ldr  x2,[x24,#SL_IERR]
