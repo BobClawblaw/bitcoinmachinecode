@@ -1628,3 +1628,16 @@ now match exactly. `tests/test_verify_core_vectors` keeps 71 of the Core-signed
 spends in the gate. Not covered: tapscript at the EvalScript level with
 execution data (the whole-input path covers it end to end instead), and
 MuSig2/PSBT flows (a different layer).
+
+## Update 2026-09-02 — fresh-install acceptance test: two findings before the first 100k headers
+
+`validation/fresh_install_ibd.sh` (clone from GitHub, README build, minimal
+configuration, unattended sync, muhash against Core at the tip) found, within
+its first minutes: (1) the quick start's configuration copy is invisible to a
+daemon whose datadir is not `<repo>/data` -- the daemon then runs on compiled
+defaults; (2) the header-sync guard added after the 2026-09-01 incident capped
+the number of headers per session at 100,000 and rolled the session back,
+so a node syncing from genesis could never pass 100k headers. The guard now
+limits how deep below our tip an answer may attach (the incident's case),
+not how many headers follow. The run continues from a fresh clone of the
+fixed tree; `phase.log` / `progress.log` / `RESULT` in the run directory.
